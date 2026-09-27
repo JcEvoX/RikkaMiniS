@@ -4227,6 +4227,22 @@ fun ChatScreen(
                     reverseLayout = false,
                 )
                 MinisMarkdownTextToolbarHost(markdownToolbar)
+                // iOS-style selection handle dots, one at each endpoint.
+                //
+                // [T-fix-toolbar-handle-overlap] Source order here is load-
+                // bearing: each of these hosts renders its own Popup, and a
+                // Popup added later gets a window stacked ON TOP for touch
+                // dispatch. The handle hit box (HANDLE_HIT_SIZE_DP = 56dp)
+                // can intersect the toolbar rect — when it did, the handle
+                // window sat above the toolbar and swallowed the tap, so
+                // "Copy" silently did nothing while the selection stayed up.
+                // Keep the handles FIRST and the toolbar LAST: whichever way
+                // the geometry lands, a tap on a visible button reaches it.
+                MinisSelectionHandlesHost(
+                    controller = selectionController,
+                    listState = listState,
+                    reverseLayout = false,
+                )
                 // MinisTextKit floating toolbar — driven by selectionController.
                 MinisSelectionToolbarHost(
                     controller = selectionController,
@@ -4268,12 +4284,6 @@ fun ChatScreen(
                             keyboardController?.show()
                         },
                     ),
-                )
-                // iOS-style selection handle dots, one at each endpoint.
-                MinisSelectionHandlesHost(
-                    controller = selectionController,
-                    listState = listState,
-                    reverseLayout = false,
                 )
                 } // Box (selection scope)
                 } // CompositionLocalProvider
