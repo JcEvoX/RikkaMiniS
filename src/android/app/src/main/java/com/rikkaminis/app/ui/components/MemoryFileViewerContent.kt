@@ -68,8 +68,15 @@ public fun MemoryFileViewerContent(
         lineHeight = 18.sp,
         color = ChatColors.primaryText,
     ),
+    // [perf/memory-chunk-once] Callers that already split the same text (the
+    // Settings editor needs the chunk list to build its edit window) hand it
+    // in; without this every 200 KB–1 MB file was walked twice on the main
+    // thread. Null = split it here, exactly as before.
+    precomputedChunks: List<String>? = null,
 ) {
-    val chunks = remember(text) { chunkText(text) }
+    val chunks = remember(text, precomputedChunks) {
+        precomputedChunks ?: chunkText(text)
+    }
 
     if (chunks.isEmpty()) {
         if (emptyText != null) {
