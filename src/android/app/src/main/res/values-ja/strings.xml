@@ -1456,6 +1456,8 @@
     <string name="chat_stream_degraded_notice">パフォーマンス保護: ストリーミング中は簡易表示</string>
     <string name="chat_resume_crash_warning">前回、ストリーミング中にこのアプリが応答しなくなりました。それでも再開するにはタップしてください。</string>
     <string name="chat_message_large_export_fail">書き出しに失敗しました</string>
+    <string name="chat_tool_pills_folded">%1$d 件のツール呼び出しを展開</string>
+    <string name="chat_tool_pills_collapse">折りたたむ</string>
     <string name="crash_freq_email_body">クラッシュログのzipを添付しました。端末モデル、RikkaMinisのバージョン、タイムスタンプが含まれています。</string>
     <string name="crash_freq_pick_files_title">最近のクラッシュが複数検出されました — 以下のログを開発者に共有しますか？</string>
     <string name="crash_freq_pick_continue">続行</string>
