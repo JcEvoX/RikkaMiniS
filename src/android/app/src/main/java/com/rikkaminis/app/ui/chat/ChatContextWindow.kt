@@ -19,12 +19,22 @@ import org.json.JSONObject
 /** Keep at least this many newest complete turns when hard-trimming (verbatim from VM companion). */
 internal const val MIN_CONTEXT_TURNS_TO_KEEP = 6
 
-/** Offload candidate descriptor (verbatim from the old VM private nested class). */
+/**
+ * Offload candidate descriptor.
+ *
+ * [perf/offload-convergence] No longer carries the payload's byte count. The
+ * scan creates a candidate for *every* eligible part in the unprotected
+ * history on *every* pass (4,180 candidates over three days of device logs,
+ * ~37% of which are never offloaded because the loop breaks as soon as the
+ * target is reached), and that count is obtained by materialising the part's
+ * text — see [offloadPayloadBytes]. The only consumer,
+ * [ContextOffload.stub], runs for parts that are actually stubbed and holds
+ * the part itself, so the number is computed there instead.
+ */
 private data class OffloadCandidate(
     val msgIdx: Int,
     val partIdx: Int,
     val tokens: Int,
-    val bytes: Int,
     val toolId: String,
     val toolName: String,
 )
@@ -127,6 +137,27 @@ internal val OFFLOAD_PROTECTED_TOOLS = setOf("memory_get")
 internal fun isProtectedToolResult(toolName: String?): Boolean =
     toolName != null && toolName in OFFLOAD_PROTECTED_TOOLS
 
+/**
+ * [perf/offload-convergence] Byte count of the payload a candidate vacates.
+ *
+ * Byte-for-byte the expression the scan used to evaluate inline while building
+ * the candidate list; it now runs only for candidates that are actually being
+ * stubbed. `toByteArray()` materialises a full UTF-8 copy of the part's text,
+ * so evaluating it per candidate meant copying every large tool output in the
+ * unprotected history on every pass — including the ones ranked below the
+ * target line that the loop never reaches. (The scan itself stays O(parts):
+ * ranking is by `tokens`, which is a `length` read.)
+ */
+private fun offloadPayloadBytes(part: AgentContentPart): Int = when (part) {
+    is AgentContentPart.ToolResult -> part.content.toByteArray(Charsets.UTF_8).size +
+        (part.imageData?.size ?: 0)
+    is AgentContentPart.ImageData -> part.data.size
+    // Neither kind can be a candidate (see [isOffloadEligible]); the arms exist
+    // so this stays a total function over the sealed type.
+    is AgentContentPart.ToolUse -> 0
+    is AgentContentPart.Text -> 0
+}
+
     /**
      * Walk [agentHistory], identify large tool outputs in the older
      * (non-protected) message range, and offload the highest-token ones to
@@ -183,20 +214,8 @@ internal fun ChatViewModel.offloadContextIfNeeded(
     val pct = (effectiveTokens.toLong() * 100 / contextWindow.coerceAtLeast(1)).toInt()
     val remaining = contextWindow - beforeTokens
 
-    AppLogger.info(ChatViewModel.TAG, "━━━ Context Offload Triggered ━━━")
-    AppLogger.info(ChatViewModel.TAG, "  Window: $contextWindow tokens")
-    AppLogger.info(ChatViewModel.TAG, "  Before: $beforeTokens tokens ($pct% of window, ~$remaining remaining)")
-    if (force) {
-        AppLogger.info(ChatViewModel.TAG, "  Mode: FORCE — offloading all eligible candidates")
-    } else {
-        AppLogger.info(ChatViewModel.TAG, "  Threshold: ${policy.offloadThreshold} → Target: $targetTokens")
-        AppLogger.info(ChatViewModel.TAG, "  Need to free: ~${beforeTokens - targetTokens} tokens")
-    }
-    AppLogger.info(ChatViewModel.TAG, "  Agent history: ${agentHistory.size} messages")
-
     val protectedCount = minOf(4, agentHistory.size)
     val candidateUpper = agentHistory.size - protectedCount
-    AppLogger.info(ChatViewModel.TAG, "  Scanning messages 0..<$candidateUpper (last $protectedCount protected)")
 
     val candidates = mutableListOf<OffloadCandidate>()
     var skippedAlreadyOffloaded = 0
@@ -229,9 +248,7 @@ internal fun ChatViewModel.offloadContextIfNeeded(
                         continue
                     }
                     val tokens = countPartTokens(part)
-                    val bytes = part.content.toByteArray(Charsets.UTF_8).size +
-                        (part.imageData?.size ?: 0)
-                    candidates.add(OffloadCandidate(msgIdx, partIdx, tokens, bytes, part.id, part.name))
+                    candidates.add(OffloadCandidate(msgIdx, partIdx, tokens, part.id, part.name))
                 }
                 // [fix/offload-payload-stub] ToolUse parts are deliberately NOT
                 // offload candidates any more — see [isOffloadEligible] for the
@@ -249,7 +266,7 @@ internal fun ChatViewModel.offloadContextIfNeeded(
                     val tokens = countPartTokens(part)
                         // Synthesize a tool id since bare images don't carry one.
                     val synthId = "img${msgIdx}_$partIdx"
-                    candidates.add(OffloadCandidate(msgIdx, partIdx, tokens, part.data.size, synthId, "image"))
+                    candidates.add(OffloadCandidate(msgIdx, partIdx, tokens, synthId, "image"))
                 }
                 is AgentContentPart.Text -> Unit
             }
@@ -258,8 +275,52 @@ internal fun ChatViewModel.offloadContextIfNeeded(
 
     candidates.sortByDescending { it.tokens }
     val totalCandidateTokens = candidates.sumOf { it.tokens }
-    AppLogger.info(ChatViewModel.TAG, "  Candidates: ${candidates.size} parts (~$totalCandidateTokens tokens total)")
-    AppLogger.info(ChatViewModel.TAG, "  Skipped: $skippedAlreadyOffloaded already offloaded, $skippedTooSmall too small, $skippedPayloadParts tool-call payloads (never offloaded), $skippedProtected protected tool results")
+    // [perf/offload-convergence] The nine-line preamble explains a pass that
+    // actually acted. A pass whose candidate list came back empty has nothing
+    // to explain, so it states the same facts in one line — still greppable
+    // (`grep 'Context Offload'`), still naming the window, the usage, the scan
+    // range and every skip counter. Measured over three days of device logs
+    // (316 passes): 39 (12%) found no candidates, and each wrote 9 lines to
+    // say "nothing to do". Passes that do have candidates are unchanged.
+    //
+    // The preamble therefore moves after the scan: it can only be skipped once
+    // the candidate list is known, and every value it prints was already
+    // computed before the scan (no behaviour depends on when it is written).
+    if (candidates.isEmpty()) {
+        // Every value the preamble would have printed is still printed, so the
+        // pass is quieter rather than less informative. The budget half is
+        // conditional because the preamble prints a threshold→target pair
+        // normally and a FORCE mode note otherwise.
+        val budgetLine = if (force) {
+            "mode: FORCE → target: 0"
+        } else {
+            "threshold: ${policy.offloadThreshold} → target: $targetTokens, " +
+                "need to free ~${beforeTokens - targetTokens}"
+        }
+        AppLogger.info(
+            ChatViewModel.TAG,
+            "  Context Offload: nothing to offload — window=$contextWindow, " +
+                "before=$beforeTokens ($pct% of window, ~$remaining remaining), $budgetLine, " +
+                "history=${agentHistory.size} messages, " +
+                "scanned 0..<$candidateUpper (last $protectedCount protected), " +
+                "skipped: $skippedAlreadyOffloaded already offloaded / $skippedTooSmall too small / " +
+                "$skippedPayloadParts tool-call payloads / $skippedProtected protected tool results",
+        )
+    } else {
+        AppLogger.info(ChatViewModel.TAG, "━━━ Context Offload Triggered ━━━")
+        AppLogger.info(ChatViewModel.TAG, "  Window: $contextWindow tokens")
+        AppLogger.info(ChatViewModel.TAG, "  Before: $beforeTokens tokens ($pct% of window, ~$remaining remaining)")
+        if (force) {
+            AppLogger.info(ChatViewModel.TAG, "  Mode: FORCE — offloading all eligible candidates")
+        } else {
+            AppLogger.info(ChatViewModel.TAG, "  Threshold: ${policy.offloadThreshold} → Target: $targetTokens")
+            AppLogger.info(ChatViewModel.TAG, "  Need to free: ~${beforeTokens - targetTokens} tokens")
+        }
+        AppLogger.info(ChatViewModel.TAG, "  Agent history: ${agentHistory.size} messages")
+        AppLogger.info(ChatViewModel.TAG, "  Scanning messages 0..<$candidateUpper (last $protectedCount protected)")
+        AppLogger.info(ChatViewModel.TAG, "  Candidates: ${candidates.size} parts (~$totalCandidateTokens tokens total)")
+        AppLogger.info(ChatViewModel.TAG, "  Skipped: $skippedAlreadyOffloaded already offloaded, $skippedTooSmall too small, $skippedPayloadParts tool-call payloads (never offloaded), $skippedProtected protected tool results")
+    }
 
     var offloadedCount = 0
     var freedTokens = 0
@@ -270,6 +331,9 @@ internal fun ChatViewModel.offloadContextIfNeeded(
         val msg = agentHistory[candidate.msgIdx]
         val parts = msg.contentParts.toMutableList()
         val part = parts[candidate.partIdx]
+        // [perf/offload-convergence] Sized here rather than on the candidate:
+        // this loop only reaches parts that are actually being stubbed.
+        val bytes = offloadPayloadBytes(part)
         var linuxPath = ""
 
         val newPart: AgentContentPart? = when (part) {
@@ -290,7 +354,7 @@ internal fun ChatViewModel.offloadContextIfNeeded(
                     } else ""
                 } ?: ""
                 if (linuxPath.isEmpty()) linuxPath = imgPath
-                val stub = ContextOffload.stub(candidate.tokens, candidate.bytes, linuxPath)
+                val stub = ContextOffload.stub(candidate.tokens, bytes, linuxPath)
                 part.copy(content = stub, imageData = null, imageMimeType = null)
             }
             is AgentContentPart.ToolUse -> {
@@ -319,7 +383,7 @@ internal fun ChatViewModel.offloadContextIfNeeded(
                     // Bare ImageData has no toolUseId pairing — replace with a
                     // text part carrying the stub. Mirrors iOS line 7653.
                 AgentContentPart.Text(
-                    ContextOffload.stub(candidate.tokens, candidate.bytes, linuxPath),
+                    ContextOffload.stub(candidate.tokens, bytes, linuxPath),
                 )
             }
             is AgentContentPart.Text -> null
@@ -335,7 +399,7 @@ internal fun ChatViewModel.offloadContextIfNeeded(
         val afterPct = (currentTokens.toLong() * 100 / contextWindow.coerceAtLeast(1)).toInt()
         AppLogger.info(
             ChatViewModel.TAG,
-            "  ✂ Offloaded #$offloadedCount: [${candidate.toolName}] id:${candidate.toolId.take(8)} ~${candidate.tokens} tokens (${candidate.bytes} bytes) → $linuxPath [now $currentTokens ($afterPct%)]",
+            "  ✂ Offloaded #$offloadedCount: [${candidate.toolName}] id:${candidate.toolId.take(8)} ~${candidate.tokens} tokens (${bytes} bytes) → $linuxPath [now $currentTokens ($afterPct%)]",
         )
 }
 
