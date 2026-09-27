@@ -1557,6 +1557,18 @@
     <string name="runtime_limits_shell_output_desc">单条命令保留的输出上限，超出部分截断并标记。默认 128。</string>
     <string name="runtime_limits_shell_timeout">终端：默认超时（秒）</string>
     <string name="runtime_limits_shell_timeout_desc">调用未自带超时参数时，shell 命令的默认超时（显式传参的调用仍用自带值，上限 900 秒）。默认 900。</string>
+    <string name="runtime_limits_section_sandbox">沙箱生命周期</string>
+    <string name="runtime_limits_guest_tmp_age">沙箱 /tmp：清理年龄</string>
+    <string name="runtime_limits_guest_tmp_age_desc">沙箱 /tmp 清理器可删除条目的最小年龄。沙箱 /tmp 占内存（tmpfs），窗口越长，临时数据驻留内存越久。</string>
+    <string name="runtime_limits_sweep_interval">沙箱：扫描间隔</string>
+    <string name="runtime_limits_sweep_interval_desc">空闲 shell 回收与沙箱 /tmp 清理的间隔。</string>
+    <string name="runtime_limits_stall_guard">Shell：无进展判定</string>
+    <string name="runtime_limits_stall_guard_desc">命令在此期间既无输出也无 CPU 占用，即视为挂起并中止；0 表示禁用该保护。</string>
+    <string name="runtime_limits_shell_idle">Shell：空闲回收</string>
+    <string name="runtime_limits_shell_idle_desc">空闲超过该时长即回收 shell，释放其 PRoot 占用。</string>
+    <string name="runtime_limits_heavy_gate">沙箱：重活闸门等待</string>
+    <string name="runtime_limits_heavy_gate_desc">重活命令等待全局重活闸门的最长时间，超时则报告另一重活仍在运行。</string>
+    <string name="runtime_limits_sandbox_footer">这些窗口用于防止内存压力，默认值与之前的固定值一致。</string>
     <string name="runtime_limits_media_footer">调高图片上限可让更高质量图片进入模型，代价是请求体积变大。</string>
 
     <!-- [fix/render-ui F-275/F-276/F-277] user-facing strings that

@@ -1532,6 +1532,18 @@
     <string name="runtime_limits_shell_output_desc">명령당 유지되는 출력 상한. 초과분은 표시와 함께 잘립니다. 기본 128.</string>
     <string name="runtime_limits_shell_timeout">셸: 기본 시간초과(초)</string>
     <string name="runtime_limits_shell_timeout_desc">호출이 자체 시간초과를 넘기지 않을 때의 기본 시간초과(명시적으로 전달된 값은 그대로, 상한 900초). 기본 900.</string>
+    <string name="runtime_limits_section_sandbox">샌드박스 수명 주기</string>
+    <string name="runtime_limits_guest_tmp_age">게스트 /tmp: 정리 기준</string>
+    <string name="runtime_limits_guest_tmp_age_desc">게스트 /tmp 정리기가 항목을 삭제할 수 있는 최소 경과 시간입니다. 게스트 /tmp 는 메모리 기반(tmpfs)이라 길게 잡을수록 임시 데이터가 메모리에 더 오래 남습니다.</string>
+    <string name="runtime_limits_sweep_interval">샌드박스: 정리 주기</string>
+    <string name="runtime_limits_sweep_interval_desc">유휴 shell 회수와 게스트 /tmp 정리를 수행하는 주기입니다.</string>
+    <string name="runtime_limits_stall_guard">Shell: 정지 감시 시간</string>
+    <string name="runtime_limits_stall_guard_desc">이 시간 동안 출력도 CPU 사용도 없는 명령은 멈춘 것으로 보고 중단합니다. 0 이면 감시를 끕니다.</string>
+    <string name="runtime_limits_shell_idle">Shell: 유휴 회수 시간</string>
+    <string name="runtime_limits_shell_idle_desc">이 시간 이상 유휴한 shell 을 회수해 PRoot 사용량을 반환합니다.</string>
+    <string name="runtime_limits_heavy_gate">샌드박스: 헤비 게이트 대기</string>
+    <string name="runtime_limits_heavy_gate_desc">무거운 명령이 전역 헤비 게이트를 기다리는 최대 시간입니다. 초과하면 다른 무거운 명령이 실행 중이라고 보고합니다.</string>
+    <string name="runtime_limits_sandbox_footer">이 시간들은 메모리 압박을 막기 위한 것입니다. 기본값은 이전의 고정값과 같습니다.</string>
     <string name="runtime_limits_media_footer">이미지 상한을 올리면 더 좋은 화질로 모델에 전달되지만 요청이 커집니다.</string>
 
     <!-- [fix/render-ui F-275/F-276/F-277] user-facing strings that

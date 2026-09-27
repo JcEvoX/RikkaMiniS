@@ -414,6 +414,41 @@ internal object ConfigBuiltins {
             prefs = limits, key = L.KEY_SHELL_TIMEOUT_SEC,
             defaultValue = L.SHELL_TIMEOUT_DEFAULT_SEC, minValue = L.SHELL_TIMEOUT_MIN_SEC, maxValue = L.SHELL_TIMEOUT_MAX_SEC,
         ))
+        r.register(PrefsIntField(
+            path = "runtime.guestTmpMaxAgeMin",
+            displayName = "Sandbox: /tmp sweep age (min)",
+            description = "Minimum age before the guest /tmp sweeper may delete an entry. Guest /tmp is RAM-backed, so a longer window keeps transient data in memory longer. Default 60.",
+            prefs = limits, key = L.KEY_GUEST_TMP_MAX_AGE_MIN,
+            defaultValue = L.GUEST_TMP_MAX_AGE_DEFAULT_MIN, minValue = L.GUEST_TMP_MAX_AGE_MIN_MIN, maxValue = L.GUEST_TMP_MAX_AGE_MAX_MIN,
+        ))
+        r.register(PrefsIntField(
+            path = "runtime.guestTmpSweepIntervalSec",
+            displayName = "Sandbox: sweep cadence (s)",
+            description = "How often idle shells are recycled and guest /tmp is pruned. Default 60.",
+            prefs = limits, key = L.KEY_GUEST_TMP_SWEEP_INTERVAL_SEC,
+            defaultValue = L.GUEST_TMP_SWEEP_INTERVAL_DEFAULT_SEC, minValue = L.GUEST_TMP_SWEEP_INTERVAL_MIN_SEC, maxValue = L.GUEST_TMP_SWEEP_INTERVAL_MAX_SEC,
+        ))
+        r.register(PrefsIntField(
+            path = "runtime.stallNoProgressSec",
+            displayName = "Shell: stall guard window (s)",
+            description = "A command with no output and no CPU for this long is treated as hung and aborted. 0 disables the guard. Default 180.",
+            prefs = limits, key = L.KEY_STALL_NO_PROGRESS_SEC,
+            defaultValue = L.STALL_NO_PROGRESS_DEFAULT_SEC, minValue = L.STALL_NO_PROGRESS_MIN_SEC, maxValue = L.STALL_NO_PROGRESS_MAX_SEC,
+        ))
+        r.register(PrefsIntField(
+            path = "runtime.shellIdleTimeoutMin",
+            displayName = "Shell: idle recycle window (min)",
+            description = "A shell idle this long is recycled to release its PRoot footprint. Default 10.",
+            prefs = limits, key = L.KEY_SHELL_IDLE_TIMEOUT_MIN,
+            defaultValue = L.SHELL_IDLE_TIMEOUT_DEFAULT_MIN, minValue = L.SHELL_IDLE_TIMEOUT_MIN_MIN, maxValue = L.SHELL_IDLE_TIMEOUT_MAX_MIN,
+        ))
+        r.register(PrefsIntField(
+            path = "runtime.heavyGateTimeoutSec",
+            displayName = "Sandbox: heavy gate wait (s)",
+            description = "How long a heavy command waits for the global heavy-command gate before reporting that another heavy command is still running. Default 600.",
+            prefs = limits, key = L.KEY_HEAVY_GATE_TIMEOUT_SEC,
+            defaultValue = L.HEAVY_GATE_TIMEOUT_DEFAULT_SEC, minValue = L.HEAVY_GATE_TIMEOUT_MIN_SEC, maxValue = L.HEAVY_GATE_TIMEOUT_MAX_SEC,
+        ))
     }
 
     // -- Master switch surface (read-only via the registry; UI toggles it) --

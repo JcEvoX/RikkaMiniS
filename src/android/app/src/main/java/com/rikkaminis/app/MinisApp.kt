@@ -862,7 +862,7 @@ class MinisApp : Application(), ImageLoaderFactory {
                 } catch (t: Throwable) {
                     Log.w("MinisApp", "recycleIdleShells failed: ${t.message}")
                 }
-                kotlinx.coroutines.delay(com.rikkaminis.app.sandbox.ExecutionCoordinator.IDLE_SWEEP_INTERVAL_MS)
+                kotlinx.coroutines.delay(com.rikkaminis.app.sandbox.ExecutionCoordinator.idleSweepIntervalMs())
             }
         }
 

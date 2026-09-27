@@ -1,6 +1,8 @@
 
 package com.rikkaminis.app.sandbox
 
+import com.rikkaminis.app.data.AgentRuntimeLimitsPrefs
+
 // ──────────────────────────────────────────────────────────────────────────
 // [fix/memory-hardening-stall] Stall-guard pure helpers (JVM-testable).
 // ──────────────────────────────────────────────────────────────────────────
@@ -9,12 +11,16 @@ package com.rikkaminis.app.sandbox
  * A command that produces no output AND burns no CPU anywhere in its process
  * tree for this long is treated as hung (spin, blocked read, stuck network
  * wait) and aborted — see `PersistentShell.executeCommand(stallAfterMs)`.
- * 180s sits far below the 900s default timeout (a hang used to hold the agent's
- * turn for 15 minutes) and far above any legitimate quiet phase of a working
- * command. Measured context: `rg` under PRoot hung twice on 2026-09-13 and was
- * only stopped by the user tapping interrupt.
+ * [feat/runtime-sandbox-knobs] The window is now user-tunable
+ * ([AgentRuntimeLimitsPrefs.stallNoProgressSec], default 180 s — the literal
+ * that used to live here; 0 disables the guard). 180 s sits far below the
+ * default 900 s command timeout (a hang used to hold the agent's turn for
+ * 15 minutes) and far above any legitimate quiet phase of a working command.
+ * Measured context: `rg` under PRoot hung twice on 2026-09-13 and was only
+ * stopped by the user tapping interrupt.
  */
-internal const val STALL_NO_PROGRESS_MS = 180_000L
+internal fun stallNoProgressMs(): Long =
+    AgentRuntimeLimitsPrefs.stallNoProgressSec() * 1000L
 
 /** Grace given to the stage-1 SIGINT before the hard kill. */
 internal const val STALL_INT_GRACE_MS = 5_000L

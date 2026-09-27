@@ -9,8 +9,9 @@ import org.junit.Test
 /**
  * JVM tests for the stall-guard pure helpers in [PersistentShellStall] — the
  * policy that kills a command which shows no output AND no CPU progress for
- * [STALL_NO_PROGRESS_MS] (2026-09-13: `rg` hung twice in the PRoot sandbox and
- * was only stopped by the user tapping interrupt).
+ * a user-tunable window (default 180 s = [AgentRuntimeLimitsPrefs.STALL_NO_PROGRESS_DEFAULT_SEC];
+ * 2026-09-13: `rg` hung twice in the PRoot sandbox and was only stopped by the
+ * user tapping interrupt).
  *
  * [PersistentShell] itself depends on Android (Context, ProcessBuilder, PTY),
  * so the process/PTY orchestration is verified by inspection; everything with a
@@ -154,7 +155,7 @@ class PersistentShellStallTest {
 
     @Test
     fun `stall message states the window and tells the agent what to do`() {
-        val msg = stallMessage(STALL_NO_PROGRESS_MS)
+        val msg = stallMessage(180_000L)
         assertTrue(msg.contains("180s"))
         assertTrue(msg.contains("interrupted"))
         assertTrue(msg.contains("timeout"))

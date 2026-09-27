@@ -151,6 +151,13 @@ class AgentRuntimeLimitsPrefsTest {
         assertEquals(80, p.BROWSER_SCREENSHOT_Q_DEFAULT)         // BrowserUseManager.SCREENSHOT_QUALITY
         assertEquals(128, p.SHELL_OUTPUT_KB_DEFAULT)             // PersistentShell.MAX_OUTPUT_CHARS ÷ 1024
         assertEquals(900, p.SHELL_TIMEOUT_DEFAULT_SEC)           // ChatShellExecution effective default (optInt fallback)
+        // [feat/runtime-sandbox-knobs] Sandbox lifecycle — every default is
+        // byte-identical to the literal that used to live in its consumer:
+        assertEquals(60, p.GUEST_TMP_MAX_AGE_DEFAULT_MIN)        // ExecutionCoordinator.GUEST_TMP_MAX_AGE_MS (1 h)
+        assertEquals(60, p.GUEST_TMP_SWEEP_INTERVAL_DEFAULT_SEC) // ExecutionCoordinator.IDLE_SWEEP_INTERVAL_MS (60 s)
+        assertEquals(180, p.STALL_NO_PROGRESS_DEFAULT_SEC)       // PersistentShellStall.STALL_NO_PROGRESS_MS (180_000)
+        assertEquals(10, p.SHELL_IDLE_TIMEOUT_DEFAULT_MIN)       // ExecutionCoordinator.SHELL_IDLE_TIMEOUT_MS (10 min)
+        assertEquals(600, p.HEAVY_GATE_TIMEOUT_DEFAULT_SEC)      // ExecutionCoordinator.HEAVY_GATE_TIMEOUT_MS (600_000)
     }
 
     @Test
@@ -176,5 +183,11 @@ class AgentRuntimeLimitsPrefsTest {
         assertEquals(p.BROWSER_SCREENSHOT_Q_DEFAULT, p.browserScreenshotQuality())
         assertEquals(p.SHELL_OUTPUT_KB_DEFAULT, p.shellOutputKb())
         assertEquals(p.SHELL_TIMEOUT_DEFAULT_SEC, p.shellTimeoutSec())
+        // [feat/runtime-sandbox-knobs]
+        assertEquals(p.GUEST_TMP_MAX_AGE_DEFAULT_MIN, p.guestTmpMaxAgeMin())
+        assertEquals(p.GUEST_TMP_SWEEP_INTERVAL_DEFAULT_SEC, p.guestTmpSweepIntervalSec())
+        assertEquals(p.STALL_NO_PROGRESS_DEFAULT_SEC, p.stallNoProgressSec())
+        assertEquals(p.SHELL_IDLE_TIMEOUT_DEFAULT_MIN, p.shellIdleTimeoutMin())
+        assertEquals(p.HEAVY_GATE_TIMEOUT_DEFAULT_SEC, p.heavyGateTimeoutSec())
     }
 }
