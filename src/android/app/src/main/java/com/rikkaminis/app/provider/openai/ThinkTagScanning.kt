@@ -67,6 +67,13 @@ internal data class ThinkTagScanResult(
  * This is a pure scanner — it does not mutate any state. Callers are
  * responsible for updating their own state from the result.
  *
+ * When [insideTag] is false, an ORPHAN close token (a `</thinking>` whose
+ * opener never arrived) is CONSUMED AND DROPPED rather than emitted as
+ * visible text. Gateways that inline the model's reasoning into `content`
+ * routinely strip the opener and leave the closer behind, so the token is a
+ * wire artifact — never body text. Note the boundary: only the token is
+ * dropped, not the text that precedes it (see the ponytail note below).
+ *
  * Fast path: when no tag is found, only the trailing partial-tag-prefix
  * (e.g. `<th` of `<thinking>`) is kept buffered — plain text streams
  * through immediately without accumulating (streaming UX must not lag).
@@ -100,6 +107,29 @@ internal fun scanThinkTags(
         return best
     }
 
+    /**
+     * Longest tail of [bufLower] that is a prefix of some PRIMARY close token
+     * (`</thinking>`, `[/think]`, …) — the orphan-close counterpart of
+     * [maxOpenTagPrefixLen]. A closer split across SSE chunks (`</thin` +
+     * `king>`) must not leak its head into the body either. altClose is
+     * deliberately excluded: `<response>` is ordinary prose far more often
+     * than it is a terminator (a pinned test asserts it never opens a region).
+     */
+    fun maxCloseTagPrefixLen(): Int {
+        var best = 0
+        for (fmt in formats) {
+            val close = fmt.close.lowercase()
+            val maxLen = minOf(close.length - 1, bufLower.length)
+            for (len in maxLen downTo 1) {
+                if (close.startsWith(bufLower.substring(bufLower.length - len))) {
+                    if (len > best) best = len
+                    break
+                }
+            }
+        }
+        return best
+    }
+
     while (i < buffer.length) {
         if (!tagActive) {
             // Search for the EARLIEST open tag in the whole (remaining) buffer,
@@ -110,15 +140,38 @@ internal fun scanThinkTags(
             // the visible body.
             var bestFmt: ThinkTagDef? = null
             var bestIdx = -1
+            var bestLen = 0
+            var bestIsOrphanClose = false
             for (fmt in formats) {
                 val openLower = fmt.open.lowercase()
                 val idx = bufLower.indexOf(openLower, i)
                 if (idx != -1 && (bestIdx == -1 || idx < bestIdx)) {
                     bestIdx = idx
                     bestFmt = fmt
+                    bestLen = openLower.length
+                    bestIsOrphanClose = false
+                }
+                // Orphan close: some gateways inline the model's reasoning into
+                // `content` but strip the OPENER, leaving a bare `</thinking>`
+                // (measured on gpt-6-luna via llmhost.net — 10 closers, 0
+                // openers across one session; the token reached both the
+                // transcript and the DB). Competes with open tags by index.
+                val closeLower = fmt.close.lowercase()
+                val cIdx = bufLower.indexOf(closeLower, i)
+                if (cIdx != -1 && (bestIdx == -1 || cIdx < bestIdx)) {
+                    bestIdx = cIdx
+                    bestFmt = fmt
+                    bestLen = closeLower.length
+                    bestIsOrphanClose = true
                 }
             }
-            if (bestFmt != null) {
+            if (bestIdx != -1 && bestIsOrphanClose) {
+                // ponytail: drops the artifact token only, never the run before it | 天花板: that run stays
+                // in the body (its deltas were already streamed as visible — a scanner cannot retract them)
+                // 升级触发: 用户仍报「思考文本挤在正文」→ 需落库/重建期启发式接管
+                visibleBuilder.append(buffer, i, bestIdx)
+                i = bestIdx + bestLen
+            } else if (bestFmt != null) {
                 // Found a real open tag: emit the preceding visible text, enter
                 // the thinking region, and CONSUME the open tag. Continue the
                 // loop so a region closed in this same buffer (e.g.
@@ -131,9 +184,9 @@ internal fun scanThinkTags(
                 activeFormat = bestFmt
                 i = bestIdx + openLen
             } else {
-                // No open tag anywhere ahead: emit everything except a possible
-                // open-tag PREFIX at the tail (kept buffered across chunks).
-                val prefixLen = maxOpenTagPrefixLen()
+                // No marker anywhere ahead: emit everything except a possible
+                // open/close-tag PREFIX at the tail (kept buffered across chunks).
+                val prefixLen = maxOf(maxOpenTagPrefixLen(), maxCloseTagPrefixLen())
                 val keepFrom = buffer.length - prefixLen
                 visibleBuilder.append(buffer, i, keepFrom)
                 val remaining = buffer.substring(keepFrom)
