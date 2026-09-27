@@ -341,6 +341,12 @@ internal fun ChatInputArea(
     val attachments by viewModel.attachments.collectAsState()
     var showMoveSheet by remember { mutableStateOf(false) }
     var showAttachMenu by remember { mutableStateOf(false) }
+    // [fix/ime-overlay-focus-coverage] MoveToSessionSheet owns its own window
+    // (ModalBottomSheet) and restores focus to the composer on dismiss — the same
+    // IME pop-back loop ChatScreen guards for its overlays. Shared implementation
+    // (ImeOverlayGuard.kt) so the two hosts don't drift; this flag is local to
+    // ChatInputArea, so the guard is invoked here rather than in ChatScreen.
+    DismissImeWhileOverlayOpen(showMoveSheet)
     // Mirrors `inputText` for the BasicTextField but tracks selection so we
     // can position the cursor (e.g. AFTER the leading "/" when the slash
     // button inserts it) — a plain String overload would reset cursor to 0
