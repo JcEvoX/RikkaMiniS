@@ -720,8 +720,20 @@ fun MinisSelectionToolbarHost(
             controller.handleAnchor(SelectionController.Handle.End)?.x
         else -> null
     } ?: controller.handlesCenterX()
-    val positionProvider = remember(anchor, viewportBounds, centerX) {
-        FloatingSelectionToolbarPositionProvider(anchor, viewportBounds, centerX)
+    // [T-fix-toolbar-handle-overlap] Hand the positioning logic the real
+    // obstacle size: the endpoint handles are Popups HANDLE_HIT_SIZE_DP
+    // tall, so the "below the anchor" fallback has to clear that, not the
+    // 14dp dot the raw 48px gap was sized for.
+    val handleClearancePx = with(androidx.compose.ui.platform.LocalDensity.current) {
+        HANDLE_HIT_SIZE_DP.roundToPx()
+    }
+    val positionProvider = remember(anchor, viewportBounds, centerX, handleClearancePx) {
+        FloatingSelectionToolbarPositionProvider(
+            anchor = anchor,
+            viewport = viewportBounds,
+            preferredCenterX = centerX,
+            handleClearancePx = handleClearancePx,
+        )
     }
     val clipboard = LocalClipboardManager.current
     val haptics = androidx.compose.ui.platform.LocalHapticFeedback.current
@@ -862,6 +874,17 @@ private class FloatingSelectionToolbarPositionProvider(
     private val anchor: IntRect,
     private val viewport: androidx.compose.ui.geometry.Rect?,
     private val preferredCenterX: Float?,
+    /**
+     * [T-fix-toolbar-handle-overlap] How much vertical room the "below the
+     * anchor" fallback must leave free, in px. This is NOT cosmetic: each
+     * selection endpoint is its own Popup whose hit box is
+     * [HANDLE_HIT_SIZE_DP] (56dp) tall, hung from the line bottom. The
+     * plain [gap] below was a raw 48px — measured against the 14dp dot —
+     * so on any density above ~0.86 the bar landed *inside* the handle's
+     * window and lost the tap to it. Pass the box height so the fallback
+     * clears the whole window; 0 keeps the old behaviour.
+     */
+    private val handleClearancePx: Int = 0,
 ) : PopupPositionProvider {
     override fun calculatePosition(
         anchorBounds: IntRect,
@@ -904,7 +927,14 @@ private class FloatingSelectionToolbarPositionProvider(
         val y = if (aboveY >= viewTop) {
             aboveY
         } else {
-            (anchor.bottom + gap).coerceIn(viewTop, maxY)
+            // [T-fix-toolbar-handle-overlap] The "below" fallback has to clear
+            // the whole handle WINDOW, not just the visible 14dp dot: each
+            // endpoint handle is a Popup whose hit box is HANDLE_HIT_SIZE_DP
+            // tall and hangs from the line bottom. A bare `gap` under-clears
+            // it on any realistic density (48px < 56dp once density > 0.86),
+            // which used to park the bar inside the handle window — the
+            // handle then received the touch and the button appeared dead.
+            (anchor.bottom + gap + handleClearancePx).coerceIn(viewTop, maxY)
         }
         return IntOffset(x, y.coerceIn(viewTop, maxY))
     }
