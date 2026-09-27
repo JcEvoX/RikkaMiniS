@@ -232,7 +232,46 @@ class ChatViewModelMessageParserTest {
         assertEquals(false, rows[2].malformed)
     }
 
-    @Test fun `parseRows empty input returns empty`() {
-        assertEquals(emptyList<ParsedRow>(), parseRows(emptyList()))
+    // ── [T-think-tag-orphan-close] persisted-text cleanup ──────────────────
+
+    private fun roleEntity(id: String, role: String, partsJson: String) = MessageEntity(
+        id = id,
+        sessionId = "s1",
+        role = role,
+        partsJson = partsJson,
+        createdAt = 1_000L,
+        sortOrder = 0,
+    )
+
+    @Test fun `parseRows drops orphan think closers from assistant rows`() {
+        val partsJson = JSONArray().put(textPart("**final audit**</thinking>")).toString()
+        val rows = parseRows(listOf(roleEntity("m1", "assistant", partsJson)))
+        assertEquals(listOf(ParsedPart.Text("**final audit**")), rows[0].parts)
+    }
+
+    @Test fun `parseRows leaves non-assistant rows byte-identical`() {
+        // A user row carries tool output, where a quoted token is evidence.
+        val quoted = "**final audit**</thinking>"
+        val partsJson = JSONArray().put(textPart(quoted)).toString()
+        val rows = parseRows(listOf(roleEntity("m1", "user", partsJson)))
+        assertEquals(listOf(ParsedPart.Text(quoted)), rows[0].parts)
+    }
+
+    @Test fun `parseRows keeps deliberate quotations in assistant rows`() {
+        val quoted = "the gateway leaves a bare `</thinking>` behind"
+        val partsJson = JSONArray().put(textPart(quoted)).toString()
+        val rows = parseRows(listOf(roleEntity("m1", "assistant", partsJson)))
+        assertEquals(listOf(ParsedPart.Text(quoted)), rows[0].parts)
+    }
+
+    @Test fun `parseRows keeps tool and media parts untouched`() {
+        val partsJson = JSONArray()
+            .put(textPart("**audit**</thinking>"))
+            .put(partJson("toolUse", JSONObject().put("toolUseId", "t1").put("name", "shell")))
+            .toString()
+        val rows = parseRows(listOf(roleEntity("m1", "assistant", partsJson)))
+        assertEquals(2, rows[0].parts.size)
+        assertEquals(ParsedPart.Text("**audit**"), rows[0].parts[0])
+        assertTrue(rows[0].parts[1] is ParsedPart.ToolUse)
     }
 }

@@ -53,6 +53,7 @@ import com.rikkaminis.app.R
 import com.rikkaminis.app.config.ChatActionSpec
 import com.rikkaminis.app.data.db.ChatSessionEntity
 import com.rikkaminis.app.data.repository.ChatRepository
+import com.rikkaminis.app.provider.openai.stripOrphanThinkClosers
 import com.rikkaminis.app.service.SessionActivityTracker
 import com.rikkaminis.app.service.SessionBadgeStore
 import com.rikkaminis.app.ui.components.MinisAlertDialog
@@ -553,7 +554,12 @@ private fun DrawerSessionRow(
             // ponytail: 空预览用空格占位，不新增文案键 | 天花板: 行高恒定但空行
             // 无信息量 | 升级触发: 产品要求空预览显示「正在处理…」类提示（需新 i18n 键）
             Text(
-                text = session.lastMessage?.takeIf { it.isNotBlank() } ?: " ",
+                // [T-think-tag-orphan-close] The preview column keeps its own
+                // copy of the assistant text, written before the scanner
+                // dropped orphan closers — clean it here too (same rule as the
+                // transcript; see stripOrphanThinkClosers).
+                text = session.lastMessage?.let { stripOrphanThinkClosers(it) }
+                    ?.takeIf { it.isNotBlank() } ?: " ",
                 fontSize = 12.sp,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 maxLines = 1,

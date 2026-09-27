@@ -67,6 +67,13 @@ internal data class ThinkTagScanResult(
  * This is a pure scanner — it does not mutate any state. Callers are
  * responsible for updating their own state from the result.
  *
+ * When [insideTag] is false, an ORPHAN close token (a `</thinking>` whose
+ * opener never arrived) is CONSUMED AND DROPPED rather than emitted as
+ * visible text. Gateways that inline the model's reasoning into `content`
+ * routinely strip the opener and leave the closer behind, so the token is a
+ * wire artifact — never body text. Note the boundary: only the token is
+ * dropped, not the text that precedes it (see the ponytail note below).
+ *
  * Fast path: when no tag is found, only the trailing partial-tag-prefix
  * (e.g. `<th` of `<thinking>`) is kept buffered — plain text streams
  * through immediately without accumulating (streaming UX must not lag).
@@ -100,6 +107,29 @@ internal fun scanThinkTags(
         return best
     }
 
+    /**
+     * Longest tail of [bufLower] that is a prefix of some PRIMARY close token
+     * (`</thinking>`, `[/think]`, …) — the orphan-close counterpart of
+     * [maxOpenTagPrefixLen]. A closer split across SSE chunks (`</thin` +
+     * `king>`) must not leak its head into the body either. altClose is
+     * deliberately excluded: `<response>` is ordinary prose far more often
+     * than it is a terminator (a pinned test asserts it never opens a region).
+     */
+    fun maxCloseTagPrefixLen(): Int {
+        var best = 0
+        for (fmt in formats) {
+            val close = fmt.close.lowercase()
+            val maxLen = minOf(close.length - 1, bufLower.length)
+            for (len in maxLen downTo 1) {
+                if (close.startsWith(bufLower.substring(bufLower.length - len))) {
+                    if (len > best) best = len
+                    break
+                }
+            }
+        }
+        return best
+    }
+
     while (i < buffer.length) {
         if (!tagActive) {
             // Search for the EARLIEST open tag in the whole (remaining) buffer,
@@ -110,15 +140,38 @@ internal fun scanThinkTags(
             // the visible body.
             var bestFmt: ThinkTagDef? = null
             var bestIdx = -1
+            var bestLen = 0
+            var bestIsOrphanClose = false
             for (fmt in formats) {
                 val openLower = fmt.open.lowercase()
                 val idx = bufLower.indexOf(openLower, i)
                 if (idx != -1 && (bestIdx == -1 || idx < bestIdx)) {
                     bestIdx = idx
                     bestFmt = fmt
+                    bestLen = openLower.length
+                    bestIsOrphanClose = false
+                }
+                // Orphan close: some gateways inline the model's reasoning into
+                // `content` but strip the OPENER, leaving a bare `</thinking>`
+                // (measured on gpt-6-luna via llmhost.net — 10 closers, 0
+                // openers across one session; the token reached both the
+                // transcript and the DB). Competes with open tags by index.
+                val closeLower = fmt.close.lowercase()
+                val cIdx = bufLower.indexOf(closeLower, i)
+                if (cIdx != -1 && (bestIdx == -1 || cIdx < bestIdx)) {
+                    bestIdx = cIdx
+                    bestFmt = fmt
+                    bestLen = closeLower.length
+                    bestIsOrphanClose = true
                 }
             }
-            if (bestFmt != null) {
+            if (bestIdx != -1 && bestIsOrphanClose) {
+                // ponytail: drops the artifact token only, never the run before it | 天花板: that run stays
+                // in the body (its deltas were already streamed as visible — a scanner cannot retract them)
+                // 升级触发: 用户仍报「思考文本挤在正文」→ 需落库/重建期启发式接管
+                visibleBuilder.append(buffer, i, bestIdx)
+                i = bestIdx + bestLen
+            } else if (bestFmt != null) {
                 // Found a real open tag: emit the preceding visible text, enter
                 // the thinking region, and CONSUME the open tag. Continue the
                 // loop so a region closed in this same buffer (e.g.
@@ -131,9 +184,9 @@ internal fun scanThinkTags(
                 activeFormat = bestFmt
                 i = bestIdx + openLen
             } else {
-                // No open tag anywhere ahead: emit everything except a possible
-                // open-tag PREFIX at the tail (kept buffered across chunks).
-                val prefixLen = maxOpenTagPrefixLen()
+                // No marker anywhere ahead: emit everything except a possible
+                // open/close-tag PREFIX at the tail (kept buffered across chunks).
+                val prefixLen = maxOf(maxOpenTagPrefixLen(), maxCloseTagPrefixLen())
                 val keepFrom = buffer.length - prefixLen
                 visibleBuilder.append(buffer, i, keepFrom)
                 val remaining = buffer.substring(keepFrom)
@@ -190,6 +243,80 @@ internal fun scanThinkTags(
     }
 
     return ThinkTagScanResult(visibleBuilder.toString(), thinkingBuilder.toString(), "", false, null)
+}
+
+/**
+ * Offline twin of [scanThinkTags]'s orphan-close rule, for text that is
+ * ALREADY PERSISTED — no streaming, no caller state, no think-region
+ * extraction (everything except the artifact token is returned byte-identical).
+ *
+ * Why it exists: rows written before the scanner learned to drop orphan
+ * closers still carry a bare `</thinking>` in the body (measured 2026-09-27,
+ * session 9068927b: 5 assistant rows / 10 tokens, gpt-6-luna via
+ * llmhost.net). Cleaning at the read boundary fixes every reader at once —
+ * UI transcript, LLM history, drawer preview — without rewriting the table
+ * (no migration, idempotent, stored bytes stay auditable).
+ *
+ * Two guards, both taken from the same measurement, keep it from mangling
+ * deliberate text:
+ *  - ORPHAN only: a closer whose opener appeared earlier in the SAME text is
+ *    kept. A provider without think-tag extraction can persist a visible
+ *    `<thinking>…</thinking>` region, and that pair is body text, not
+ *    artifact.
+ *  - CODE SPANS are skipped: 0/10 artifacts were inside code, while every
+ *    deliberate quotation of the token in the same corpus (`` `</thinking>` ``
+ *    in prose) was inside backticks. Backtick parity covers inline spans and
+ *    fenced blocks alike.
+ *
+ * Known boundary: a bare (unbackticked) prose mention of the token is
+ * indistinguishable from the artifact and IS dropped — accepted, both are
+ * cosmetic and the alternative is leaving the reported bug in place.
+ */
+internal fun stripOrphanThinkClosers(text: String): String {
+    if (text.isEmpty()) return text
+    val lower = text.lowercase()
+    // Cheap pre-filter: every close token in THINK_TAG_FORMATS starts with one
+    // of these two prefixes, so the per-character pass is skipped for the
+    // overwhelming majority of rows (this runs on every session load).
+    if (lower.indexOf("</") == -1 && lower.indexOf("[/") == -1) return text
+    val out = StringBuilder(text.length)
+    var ticks = 0
+    var openersSeen = 0
+    var i = 0
+    while (i < text.length) {
+        val c = text[i]
+        if (c == '`') {
+            ticks++
+            out.append(c)
+            i++
+            continue
+        }
+        var matched = false
+        if (ticks % 2 == 0) {
+            for (fmt in THINK_TAG_FORMATS) {
+                val open = fmt.open.lowercase()
+                if (open.isNotEmpty() && lower.startsWith(open, i)) {
+                    openersSeen++
+                    out.append(text, i, i + open.length)
+                    i += open.length
+                    matched = true
+                    break
+                }
+                val close = fmt.close.lowercase()
+                if (close.isNotEmpty() && lower.startsWith(close, i)) {
+                    if (openersSeen > 0) out.append(text, i, i + close.length)
+                    i += close.length
+                    matched = true
+                    break
+                }
+            }
+        }
+        if (!matched) {
+            out.append(c)
+            i++
+        }
+    }
+    return out.toString()
 }
 
 // -- End of think-tag extraction --

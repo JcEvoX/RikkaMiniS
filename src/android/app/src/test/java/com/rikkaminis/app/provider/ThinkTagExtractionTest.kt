@@ -7,6 +7,7 @@ import com.rikkaminis.app.provider.openai.OpenAIProvider
 import com.rikkaminis.app.provider.openai.THINK_TAG_FORMATS
 import com.rikkaminis.app.provider.openai.ThinkTagDef
 import com.rikkaminis.app.provider.openai.scanThinkTags
+import com.rikkaminis.app.provider.openai.stripOrphanThinkClosers
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.MockResponse
@@ -383,6 +384,134 @@ class ThinkTagExtractionTest {
         // the "thinking leaked into body" case is covered.
         assertTrue(opens.contains("<Thought>"))
         assertTrue(opens.contains("<analysis>"))
+    }
+
+    // -- Orphan close tokens (gateway stripped the opener) --
+
+    @Test
+    fun `orphan close tag is dropped from visible output`() {
+        // Real capture (2026-09-27, session 9068927b, gpt-6-luna via
+        // llmhost.net): the gateway inlines the model's action-phrase run into
+        // `content` and strips the OPENER, leaving a bare closer. The token is
+        // a wire artifact: it must never reach the body or the DB (10 of these
+        // were persisted in that one session).
+        val acc = ScanAccumulator()
+        acc.append("完整差异核对。**Running the mechanical audit on today's main changes**</thinking>")
+        val (visible, thinking) = acc.flush()
+        assertEquals("完整差异核对。**Running the mechanical audit on today's main changes**", visible)
+        assertEquals("", thinking)
+    }
+
+    @Test
+    fun `orphan close tag split across chunks is dropped`() {
+        // Same relay: the closer itself can be split by SSE chunking.
+        val acc = ScanAccumulator()
+        acc.append("artifacts</thin")
+        acc.append("king>next chunk")
+        val (visible, thinking) = acc.flush()
+        assertEquals("artifactsnext chunk", visible)
+        assertEquals("", thinking)
+    }
+
+    @Test
+    fun `no known opener is consumed by an orphan close`() {
+        // The run itself stays visible — a scanner cannot retract deltas that
+        // already streamed. Pinned so a future "hide the run" heuristic is a
+        // deliberate change, not an accident.
+        val acc = ScanAccumulator()
+        acc.append("**Planning final audit**</thinking>使用工具")
+        val (visible, thinking) = acc.flush()
+        assertEquals("**Planning final audit**使用工具", visible)
+        assertEquals("", thinking)
+    }
+
+    @Test
+    fun `orphan close does not break a later real region`() {
+        val acc = ScanAccumulator()
+        acc.append("前</thinking>中间<thinking>秘密</thinking>后")
+        val (visible, thinking) = acc.flush()
+        assertEquals("前中间后", visible)
+        assertEquals("秘密", thinking)
+    }
+
+    @Test
+    fun `every primary close alias is dropped when orphaned`() {
+        for (closer in listOf("</thinking>", "</think>", "</reasoning>", "[/think]", "[/reasoning]", "</analysis>")) {
+            val acc = ScanAccumulator()
+            acc.append("文本${closer}尾")
+            val (visible, thinking) = acc.flush()
+            assertEquals("closer=$closer", "文本尾", visible)
+            assertEquals("closer=$closer", "", thinking)
+        }
+    }
+
+    @Test
+    fun `orphan altClose response stays visible`() {
+        // `<response>` is excluded from orphan handling on purpose: it is
+        // ordinary prose far more often than a stray terminator.
+        val acc = ScanAccumulator()
+        acc.append("keep <response> this")
+        val (visible, thinking) = acc.flush()
+        assertEquals("keep <response> this", visible)
+        assertEquals("", thinking)
+    }
+
+    // -- Offline twin: persisted-text cleanup (B1) --
+
+    @Test
+    fun `orphan closer is dropped from persisted text`() {
+        // Real capture (session 9068927b, gpt-6-luna): the closer is the last
+        // thing in the row and no opener ever arrived.
+        val persisted = "**Final audit of the merge**</thinking>"
+        assertEquals("**Final audit of the merge**", stripOrphanThinkClosers(persisted))
+        assertEquals("完整差异核对。**Running the mechanical audit**", stripOrphanThinkClosers("完整差异核对。**Running the mechanical audit**</thinking>"))
+    }
+
+    @Test
+    fun `every occurrence of the artifact is dropped`() {
+        // The 3,832-char row carried 6 of them (a paused attempt replayed).
+        val persisted = "a**one**</thinking>b**two**</thinking>c**three**</thinking>"
+        assertEquals("a**one**b**two**c**three**", stripOrphanThinkClosers(persisted))
+    }
+
+    @Test
+    fun `closer inside a code span is preserved`() {
+        // Deliberate quotation: the corpus shows every mention of the token in
+        // prose/code is backticked, and 0/10 artifacts were.
+        val prose = "the relay only leaves a bare `</thinking>` behind"
+        assertEquals(prose, stripOrphanThinkClosers(prose))
+        val fenced = "```\nrow = \"text</thinking>\"\n```"
+        assertEquals(fenced, stripOrphanThinkClosers(fenced))
+    }
+
+    @Test
+    fun `closer whose opener is present is preserved`() {
+        // A provider without think-tag extraction can persist a visible region;
+        // that pair is body text, not a wire artifact.
+        val paired = "before <thinking>inline region</thinking> after"
+        assertEquals(paired, stripOrphanThinkClosers(paired))
+    }
+
+    @Test
+    fun `orphan before a paired region is dropped, the pair survives`() {
+        assertEquals(
+            "a<thinking>kept</thinking>b",
+            stripOrphanThinkClosers("a</thinking><thinking>kept</thinking>b"),
+        )
+    }
+
+    @Test
+    fun `plain text is untouched byte for byte`() {
+        for (s in listOf("", "no tags here", "<div>a</div>", "a < b && c > d", "</notathinktag>")) {
+            assertEquals(s, stripOrphanThinkClosers(s))
+        }
+    }
+
+    @Test
+    fun `case insensitive and bracket aliases are dropped when orphaned`() {
+        for (t in listOf("</THINKING>", "</Think>", "</Reasoning>", "[/think]", "[/reasoning]", "</Thought>", "</analysis>")) {
+            assertEquals("closer=$t", "x", stripOrphanThinkClosers("x$t"))
+        }
     }
 
     // -- Integration: relay merges reasoning into content (all models) --

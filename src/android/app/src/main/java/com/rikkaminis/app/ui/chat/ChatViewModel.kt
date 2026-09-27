@@ -3909,7 +3909,7 @@ class ChatViewModel(
             Log.w(TAG, msg)
         }
     internal fun MessageEntity.toLLMMessage(): LLMMessage {
-        val parts = parsePartsJson(partsJson)
+        val parts = parsePartsJson(partsJson).stripOrphanThinkClosersForRole(role)
         val malformed = parts.isEmpty() && partsJson.isNotBlank()
         return buildSingleLlmMessage(this, partsJson, parts, malformed, mediaStore.mediaBaseDir)
     }

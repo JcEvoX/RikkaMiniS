@@ -1,6 +1,7 @@
 package com.rikkaminis.app.ui.chat
 
 import com.rikkaminis.app.data.db.MessageEntity
+import com.rikkaminis.app.provider.openai.stripOrphanThinkClosers
 import org.json.JSONArray
 
 /**
@@ -111,6 +112,36 @@ fun parsePartsJson(partsJson: String): List<ParsedPart> =
     tryParsePartsJson(partsJson) ?: emptyList()
 
 /**
+ * [T-think-tag-orphan-close] Drop wire-artifact think closers from PERSISTED
+ * assistant text before either consumer sees it — [ChatViewModel.buildChatMessages]
+ * (UI transcript) and [ChatViewModel.buildLlmMessages] (LLM history) both read
+ * these parts, so cleaning at this boundary fixes read AND send in one place.
+ *
+ * Assistant rows only: a user row carries tool output, where a `</thinking>`
+ * inside command stdout is evidence, not an artifact. The stored row is never
+ * rewritten — the strip runs on every read, so it is idempotent and needs no
+ * migration (rule + its two guards: [stripOrphanThinkClosers]).
+ */
+internal fun List<ParsedPart>.stripOrphanThinkClosersForRole(role: String): List<ParsedPart> {
+    if (role != "assistant") return this
+    var changed = false
+    val cleaned = map { part ->
+        if (part is ParsedPart.Text) {
+            val value = stripOrphanThinkClosers(part.value)
+            if (value != part.value) {
+                changed = true
+                ParsedPart.Text(value)
+            } else {
+                part
+            }
+        } else {
+            part
+        }
+    }
+    return if (changed) cleaned else this
+}
+
+/**
  * Parse a batch of [MessageEntity] rows into [ParsedRow]s, parsing each
  * entity's `partsJson` exactly once.
  */
@@ -119,7 +150,7 @@ fun parseRows(rows: List<MessageEntity>): List<ParsedRow> {
         val result = tryParsePartsJson(entity.partsJson)
         ParsedRow(
             entity = entity,
-            parts = result ?: emptyList(),
+            parts = result?.stripOrphanThinkClosersForRole(entity.role) ?: emptyList(),
             sourceChars = entity.partsJson.length,
             malformed = result == null && entity.partsJson.isNotBlank(),
         )
