@@ -1152,6 +1152,8 @@
     <string name="chat_message_large_export">导出为文件</string>
     <string name="chat_message_large_export_ok">已导出</string>
     <string name="chat_message_large_export_fail">导出失败</string>
+    <string name="chat_tool_pills_folded">展开另外 %1$d 个工具调用</string>
+    <string name="chat_tool_pills_collapse">收起</string>
     <!-- T-android-update-check-403-hint — friendly update-check failure hints -->
     <!-- T-android-crash-freq-share -->
     <string name="crash_freq_dialog_dismiss">暂不分享</string>
