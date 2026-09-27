@@ -477,6 +477,10 @@ fun MemoryFileEditScreen(
                     text = fullBase,
                     listState = listState,
                     modifier = Modifier.weight(1f),
+                    // [perf/memory-chunk-once] Hand the viewer the chunks this
+                    // screen already split for its edit window; without this the
+                    // 200 KB–1 MB file was walked a second time on the main thread.
+                    precomputedChunks = chunks,
                 )
             }
 
