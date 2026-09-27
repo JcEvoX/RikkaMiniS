@@ -245,4 +245,78 @@ internal fun scanThinkTags(
     return ThinkTagScanResult(visibleBuilder.toString(), thinkingBuilder.toString(), "", false, null)
 }
 
+/**
+ * Offline twin of [scanThinkTags]'s orphan-close rule, for text that is
+ * ALREADY PERSISTED — no streaming, no caller state, no think-region
+ * extraction (everything except the artifact token is returned byte-identical).
+ *
+ * Why it exists: rows written before the scanner learned to drop orphan
+ * closers still carry a bare `</thinking>` in the body (measured 2026-09-27,
+ * session 9068927b: 5 assistant rows / 10 tokens, gpt-6-luna via
+ * llmhost.net). Cleaning at the read boundary fixes every reader at once —
+ * UI transcript, LLM history, drawer preview — without rewriting the table
+ * (no migration, idempotent, stored bytes stay auditable).
+ *
+ * Two guards, both taken from the same measurement, keep it from mangling
+ * deliberate text:
+ *  - ORPHAN only: a closer whose opener appeared earlier in the SAME text is
+ *    kept. A provider without think-tag extraction can persist a visible
+ *    `<thinking>…</thinking>` region, and that pair is body text, not
+ *    artifact.
+ *  - CODE SPANS are skipped: 0/10 artifacts were inside code, while every
+ *    deliberate quotation of the token in the same corpus (`` `</thinking>` ``
+ *    in prose) was inside backticks. Backtick parity covers inline spans and
+ *    fenced blocks alike.
+ *
+ * Known boundary: a bare (unbackticked) prose mention of the token is
+ * indistinguishable from the artifact and IS dropped — accepted, both are
+ * cosmetic and the alternative is leaving the reported bug in place.
+ */
+internal fun stripOrphanThinkClosers(text: String): String {
+    if (text.isEmpty()) return text
+    val lower = text.lowercase()
+    // Cheap pre-filter: every close token in THINK_TAG_FORMATS starts with one
+    // of these two prefixes, so the per-character pass is skipped for the
+    // overwhelming majority of rows (this runs on every session load).
+    if (lower.indexOf("</") == -1 && lower.indexOf("[/") == -1) return text
+    val out = StringBuilder(text.length)
+    var ticks = 0
+    var openersSeen = 0
+    var i = 0
+    while (i < text.length) {
+        val c = text[i]
+        if (c == '`') {
+            ticks++
+            out.append(c)
+            i++
+            continue
+        }
+        var matched = false
+        if (ticks % 2 == 0) {
+            for (fmt in THINK_TAG_FORMATS) {
+                val open = fmt.open.lowercase()
+                if (open.isNotEmpty() && lower.startsWith(open, i)) {
+                    openersSeen++
+                    out.append(text, i, i + open.length)
+                    i += open.length
+                    matched = true
+                    break
+                }
+                val close = fmt.close.lowercase()
+                if (close.isNotEmpty() && lower.startsWith(close, i)) {
+                    if (openersSeen > 0) out.append(text, i, i + close.length)
+                    i += close.length
+                    matched = true
+                    break
+                }
+            }
+        }
+        if (!matched) {
+            out.append(c)
+            i++
+        }
+    }
+    return out.toString()
+}
+
 // -- End of think-tag extraction --

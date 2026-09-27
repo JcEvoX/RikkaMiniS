@@ -7,6 +7,7 @@ import com.rikkaminis.app.provider.openai.OpenAIProvider
 import com.rikkaminis.app.provider.openai.THINK_TAG_FORMATS
 import com.rikkaminis.app.provider.openai.ThinkTagDef
 import com.rikkaminis.app.provider.openai.scanThinkTags
+import com.rikkaminis.app.provider.openai.stripOrphanThinkClosers
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.MockResponse
@@ -453,6 +454,64 @@ class ThinkTagExtractionTest {
         val (visible, thinking) = acc.flush()
         assertEquals("keep <response> this", visible)
         assertEquals("", thinking)
+    }
+
+    // -- Offline twin: persisted-text cleanup (B1) --
+
+    @Test
+    fun `orphan closer is dropped from persisted text`() {
+        // Real capture (session 9068927b, gpt-6-luna): the closer is the last
+        // thing in the row and no opener ever arrived.
+        val persisted = "**Final audit of the merge**</thinking>"
+        assertEquals("**Final audit of the merge**", stripOrphanThinkClosers(persisted))
+        assertEquals("完整差异核对。**Running the mechanical audit**", stripOrphanThinkClosers("完整差异核对。**Running the mechanical audit**</thinking>"))
+    }
+
+    @Test
+    fun `every occurrence of the artifact is dropped`() {
+        // The 3,832-char row carried 6 of them (a paused attempt replayed).
+        val persisted = "a**one**</thinking>b**two**</thinking>c**three**</thinking>"
+        assertEquals("a**one**b**two**c**three**", stripOrphanThinkClosers(persisted))
+    }
+
+    @Test
+    fun `closer inside a code span is preserved`() {
+        // Deliberate quotation: the corpus shows every mention of the token in
+        // prose/code is backticked, and 0/10 artifacts were.
+        val prose = "the relay only leaves a bare `</thinking>` behind"
+        assertEquals(prose, stripOrphanThinkClosers(prose))
+        val fenced = "```\nrow = \"text</thinking>\"\n```"
+        assertEquals(fenced, stripOrphanThinkClosers(fenced))
+    }
+
+    @Test
+    fun `closer whose opener is present is preserved`() {
+        // A provider without think-tag extraction can persist a visible region;
+        // that pair is body text, not a wire artifact.
+        val paired = "before <thinking>inline region</thinking> after"
+        assertEquals(paired, stripOrphanThinkClosers(paired))
+    }
+
+    @Test
+    fun `orphan before a paired region is dropped, the pair survives`() {
+        assertEquals(
+            "a<thinking>kept</thinking>b",
+            stripOrphanThinkClosers("a</thinking><thinking>kept</thinking>b"),
+        )
+    }
+
+    @Test
+    fun `plain text is untouched byte for byte`() {
+        for (s in listOf("", "no tags here", "<div>a</div>", "a < b && c > d", "</notathinktag>")) {
+            assertEquals(s, stripOrphanThinkClosers(s))
+        }
+    }
+
+    @Test
+    fun `case insensitive and bracket aliases are dropped when orphaned`() {
+        for (t in listOf("</THINKING>", "</Think>", "</Reasoning>", "[/think]", "[/reasoning]", "</Thought>", "</analysis>")) {
+            assertEquals("closer=$t", "x", stripOrphanThinkClosers("x$t"))
+        }
     }
 
     // -- Integration: relay merges reasoning into content (all models) --
