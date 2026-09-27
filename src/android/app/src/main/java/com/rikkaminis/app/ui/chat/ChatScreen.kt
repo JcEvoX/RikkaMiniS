@@ -1666,6 +1666,7 @@ fun ChatScreen(
     }
     var htmlPreviewFallbackTitle by remember { mutableStateOf("") }
     var htmlPreviewFullscreen by remember { mutableStateOf(false) }
+
     val appCtx = context.applicationContext
     val openHtmlPreview = remember<(java.io.File, String) -> Unit>(appCtx) {
         { file, title ->
@@ -1731,6 +1732,45 @@ fun ChatScreen(
     // T-pwa-2: long-press on an HTML attachment chip opens the
     // "Add to Home Screen" sheet for that attachment.
     var webAppSheetTarget by remember { mutableStateOf<InputAttachment?>(null) }
+
+    // [fix/ime-auto-popup-on-overlay-close] Overlays that own their own window
+    // (ModalBottomSheet / Dialog) install a focus restorer: they record the
+    // focused node when they open and hand focus back when they dismiss. The
+    // composer's TextField requests the IME the moment it regains focus, so an
+    // overlay opened while the keyboard was up pops the keyboard back up on
+    // dismiss — the reported "open a tool to watch it run, close it, and the
+    // keyboard appears" loop. Clearing the composer focus the instant an
+    // overlay opens leaves nothing for the restorer to hand back. The history
+    // drawer does the same thing for its own case (see its guard on
+    // historyDrawerState.targetValue below, which clears focus as the drawer
+    // opens so its rows are never covered by the keyboard).
+    //
+    // [fix/ime-overlay-focus-coverage] This block sits after the preview states
+    // (gallery / fullscreen video / add-to-home sheet) so the set below can be
+    // every window-owning overlay whose visibility state is in scope here —
+    // those three plus the offload permission dialog, which is driven by
+    // OffloadPermissionManager.pendingRequest rather than a local flag.
+    // MoveToSessionSheet's flag lives in ChatInputArea, which calls the same
+    // guard next to it.
+    //
+    // ponytail: 覆盖层集合手工枚举，没有注册表 | 升级触发: 任何覆盖层关闭后键盘弹出 →
+    // 把它的可见性状态提升到本函数顶层加进 anyOverlayOpen，或就地调用
+    // DismissImeWhileOverlayOpen（ChatInputArea 的做法）| 天花板: 未列入下方表达式的新
+    // 覆盖层、以及未经本处处理的其他宿主，关闭后仍可能弹回键盘；
+    // pendingNonTextSelection 是 model picker 块内的子对话框，picker 一开本守卫已生效。
+    val toolDetailIdForIme by viewModel.selectedToolDetailId.collectAsState()
+    val pendingOffloadRequest by OffloadPermissionManager.pendingRequest.collectAsState()
+    val anyOverlayOpen = showModelPicker || showThinkingLevelSheet ||
+        showInputHistorySheet || showSkillsSheet || showMcpsSheet ||
+        showTokenUsageSheet || showExportFormatSheet || showClearChatDialog ||
+        showEnhancedCacheDialog || showContextExhaustedDialog ||
+        showMemorySheet || showBrowserSheet ||
+        toolDetailIdForIme != null || editingSession != null ||
+        previewUrl != null || htmlPreviewHolder != null ||
+        previewImageGallery != null || previewVideoFile != null ||
+        webAppSheetTarget != null || pendingOffloadRequest != null
+    DismissImeWhileOverlayOpen(anyOverlayOpen)
+
     // [23c-2] Render-time link resolution cache — markdown text blocks query
     // this during composition to grey out missing-file links without re-walking
     // the filesystem on every recomposition. Cleared when the message list
