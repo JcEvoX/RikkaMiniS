@@ -4,8 +4,8 @@
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
 - 合并范围：2026-08-03 ～ 2026-09-27，共 56 天
-- 条目总数：1364（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：1808136 / 总行数：25835
+- 条目总数：1386（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：1837040 / 总行数：26108
 
 ---
 
@@ -25828,6 +25828,279 @@ backlog 存量盘点（09-25，应问分析）：1079 行 ~36 条未关项，净
 **装包验证点（真机）**：①覆盖层（工具详情/图片预览/全屏视频/加入桌面/移动会话/offload 权限框）关闭后键盘不再弹回；②**点击输入框仍能弹键盘**（manifest `stateAlwaysHidden` 是全局改动 = 最大回归面）；③进出会话、回前台的键盘行为正常；④新抽的 `DismissImeWhileOverlayOpen` 两处宿主行为一致。
 
 **工具坑**：`verify_branch.sh` 显式 base 用分支名在私有克隆里报「基线无法解析」（clone 只建 HEAD 那个本地分支，main 只在 origin/main）→ 传完整 sha `37c188ecf09c...` 通过（复发记忆里那条坑）。
+
+<!-- 2026-09-27 14:44:54 -->
+## dev-history 三件套重建 + 推送（09-27，任务「更新一下文档」，今日第二次——14:40 曾有一轮同日重
+
+# dev-history 三件套重建 + 推送（09-27，任务「更新一下文档」，今日第二次——14:40 曾有一轮同日重建落档，本轮为仓库同步）
+
+三个回归测试前置全绿（test_sanitize 35 shapes / test_rebuild / test_sagas 全 PASS）→ rebuild（56 天，**1348→1364 条**，dropped 75）→ sanitize（main 233 处 + INDEX 29 处替换，probe 复扫 NONE）→ SAGAS（23 saga，1364 条；orphans 95→**99**=7%、multi4=81，口径未漂移）→ 结构校验（fences **60** 偶数 / anchors 1364 == header / outOrder 0）+ SAGAS 脱敏 probe CLEAN（已 clean 无需二次替换）。
+
+**仓库同步**：rkm 克隆 HEAD 停在 2ad79408（旧分支 checkout），fetch 确认远端 main 已前进 37c188ec→**aeffcef9**（IME 分支已由别处合并）→ `checkout -B main origin/main` → 分支 `docs/dev-history-0927` @ **e3a8d589**（3 文件 +301/−42），gh_sync.sh push 成功 + ls-remote 机械核实逐字符一致。**docs/ 不触发 CI，无 dispatch 需求**。**未合并，分支停在远端（合并权在用户）**。
+
+**登记**：今日 09-27 上午的 IME 双分支（fix/ime-overlay-focus-coverage → main aeffcef9）与 runtime-sandbox-knobs（37c188ec）均已由别处会话合并进 main，远端已清理（上一会话工作，非本轮）。本分支基于 aeffcef9，合并时零冲突预期（只动 docs/dev-history/ 三件）。
+
+<!-- 2026-09-27 15:52:30 -->
+## 2026-09-27 15:52:30
+
+<!-- 2026-09-27 17:18:02 -->
+## 两问题核查（思考标签泄漏 + 选择框复制失灵）→ /var/minis/shared/work/leak-0927/REPORT.md（09-27，基线 aeffcef9，未改代码）
+
+
+**任务**：用户报两个问题（① 像 `…defects</thinking>` 这样的内部文本「露出来」，且发生在正在跑的会话里；② 长按自动选择弹出的选项框里点「复制」有时候失效），「两个一起查」。
+
+**问题 1 实跑证据（可复用）**：新建沙箱探针 `/var/minis/shared/work/leak-0927/`（src/ThinkTagScanning.kt 真源码 sha256 `21d7b6b0…`，src/Probe.kt 状态机逐行照抄 OpenAIProvider.kt 2635-2641/1266-1272/1329-1336，`nice /opt/kotlinc/bin/kotlinc … -include-runtime -d out/probe.jar` → `java -jar out/probe.jar`）→ **10 用例 5 泄漏**：成对标签（含跨 chunk、`[think]`、`<THOUGHT>` 大小写）全部正确剥掉；**孤儿闭合标签（`</thinking>`/`</think>`/`</reasoning>`）原样进 visible 通道**（用户贴的那段逐字节复现）。机制：`scanThinkTags` 在 `insideTag=false` 时只找**开**标签，`</thinking>` 不含 `<thinking>` 子串 → 找不到 → 放行。**闸门覆盖面**：全仓 `scanThinkTags` 只有 1 个调用点（OpenAIProvider.kt:2637，content 通道）；`reasoning_content` → ThinkingDelta（1240-1265）**不扫描**；anthropic/gemini/xai/openrouter 无标签处理。**诚实边界**：证明的是「现有闸门拦不住」，不是「一定来自 content 通道」——待用户回答「在哪儿看到的」（气泡/思考面板/复制结果/抽屉预览）。建议最小修法：scanThinkTags 增加孤儿闭合标签识别 + 半标签跨 chunk 缓冲（~20 行 + 扩 ThinkTagExtractionTest.kt），P1。
+
+**问题 2 结论（根因未定，先装仪表）**：两条并行选择实现都在 ChatScreen 挂着——Compose SelectionContainer→MinisMarkdownTextToolbar（ChatScreen:3512，复制= `onCopyRequested?.invoke(); hide()`，MinisMarkdownTextToolbar.kt:236-237，**无 toast**）；MinisTextKit→MinisSelectionToolbarHost（ChatScreen:4231，复制= `selectedPlainText()` 非空才写，MinisTextKitGesture.kt:779-787，空则不 toast 直接 clearSelection）。三可疑机制：①**按钮集合会变**（复制 Markdown/富文本挂在 `state.originatingMarkdown != null`，:257，该缓存 SideEffect 异步填；工具栏按选区中点居中 → 2→4 按钮时「复制」横移；手势版注释自己写了这个 recompose race :800-806）②`selectedPlainText()` 端点 shard 未注册时返回 ""（MinisTextKitSelection.kt:782/928，工具栏传默认空 documentRegistry）→ 静默 no-op ③弹层每帧 withFrameNanos 重定位（:655-667），只对拖拽冻结（:393-401）未对 tap 冻结。**建议第一步：失败分支加日志+toast（instrumentation），复现一次定位，别先猜着改**。P1。
+
+<!-- 2026-09-27 17:29:02 -->
+## ★ 复制按钮失效定案：手柄弹窗压住工具栏弹窗（09-27，用户给出特定场景后收敛）
+
+
+**用户补充的场景**（决定性）：失效只在「**最前端的光标（选区起点手柄）与复制按钮重叠**」时发生 —— 特定、可复现。这条把上一轮三个候选（按钮横移 / 空选区 / 弹层每帧重定位）收敛成**一个**：跨 Popup **窗口 z 顺序**问题。
+
+**证据链（代码级，几何可算）**：①手柄 = 每端点一个独立 Popup，内容盒 `HANDLE_HIT_SIZE_DP=56.dp`（可见点仅 14dp），窗口顶边 = 行底、向下延伸（MinisTextKitGesture.kt:367-372 + HandlePositionProvider:576+）；②工具栏 = 另一 Popup，`FloatingSelectionToolbarPositionProvider`（:861+）：上方放得下 `anchor.top-h-48`，**放不下翻到下方 `anchor.bottom+48`**（anchor = 选区末字符 bounding box，MinisTextKitSelection.kt:611-632）；③**那个 48 是裸 px**（注释只为避开 14dp≈37px 的圆点），而它实际要避开的窗口是 **56dp≈150px** = **单位混用**，任何 density>0.86 的设备上 48px<56dp，工具栏顶部必落进命中盒 ≈39dp 深；④**z 顺序**：ChatScreen.kt 工具栏 popup 在 :4231、手柄 popup 在 :4273 → **手柄后创建 = 在上层** → 重叠区 tap 被手柄窗口吃掉。**对照证据**：MinisMarkdownTextToolbarHost 在 :4229，Compose 自带手柄画在主窗口（不是窗口）→ 那套系统无此病，解释了为什么只有自绘这套中招。**触发条件**：选区末字符靠近可视区顶部（走下方分支）+ 短选区（工具栏横跨起点手柄 x）→ 「前端光标与复制按钮重叠」这一格。
+
+**修法（已定，等用户拍板）**：A 主修 = 把 `MinisSelectionToolbarHost` 挪到手柄 host 之后（ChatScreen :4231↔:4273 调换，1 行位移 + 载重注释）→ 工具栏在最上层，覆盖所有重叠几何；代价 = 被盖住的手柄那一小块拖不动。B 配套 = 下方分支间隙从裸 48 改为 `HANDLE_HIT_SIZE_DP.toPx()+margin`，让重叠不再发生（A 变兜底）。C 彻底 = 手柄从 Popup 改主窗口 overlay（对齐 Compose 做法），重构、登记不修。判级 **P1**，建议 A+B。
+
+**问题 1（思考标签泄漏）判级下调为 P2 登记不修**：用户说「偶发、频率相当低」且发生面未确认。升级触发 = 再撞上 + 确认面（气泡/思考面板/复制结果/抽屉预览）。补丁已备（scanThinkTags 加 orphan close 识别 + 半标签跨 chunk 缓冲 + 扩 ThinkTagExtractionTest.kt），届时成本低。报告已同步更新：/var/minis/shared/work/leak-0927/REPORT.md。
+
+<!-- 2026-09-27 17:48:06 -->
+## 复制按钮失效修复落地 → 分支 fix/selection-toolbar-handle-overlap @ 8a76278d（09-27，用户「就按你说的来吧」，未合并）
+
+
+**改动**（2 文件 +49/−9，基 main aeffcef9）：**A** ChatScreen.kt —— `MinisSelectionHandlesHost` 提到 `MinisSelectionToolbarHost` **之前**（Popup 后创建者在上层，源顺序载重 + 注释）；**B** MinisTextKitGesture.kt —— `FloatingSelectionToolbarPositionProvider` 新增 `handleClearancePx`，下方分支 `anchor.bottom + gap + handleClearancePx`，调用点用 `LocalDensity` + `HANDLE_HIT_SIZE_DP.roundToPx()` 传入；「优先上方」分支逐位未动。
+
+**独立证据 = 对照臂装置** `/var/minis/shared/work/toolbar-overlap-0927/`（**值得复用**：`extract.py` 用正则把顶层 Kotlin 类从真源码逐字抽出来 → 修前取 `git show main:<file>`、修后取工作树 → 类名替换、去 private、补 import → 配最小 Compose 桩（IntRect/IntSize/IntOffset/Offset/Rect/LayoutDirection/PopupPositionProvider）+ 场景矩阵 Main.kt）→ `SUMMARY prefix overlaps=3 fixed overlaps=0 above-branch diffs=0`：修前下方分支 3 个几何场景工具栏矩形与手柄窗口矩形相交（tap 被吃），修后 0，上方分支逐位相同。
+
+**★ 装置自身坑（复发型）**：首版桩的 `IntRect` 写成普通 `class`（无 equals）→ harness 里 `pre != fix` 退化成**引用比较** → 报「above-branch diffs=3」**假红**，而打印坐标逐字相同。改 `data class` 复跑 = 0。**教训：凡对照臂读出「有差异」，先确认比较语义/桩的值语义，再看差异本身**（与「先读门的实现再谈假阳性」同族）。
+
+**机械门**：verify_branch.sh 20/20（scan 20、scan_debt 1 标记 0 no-trigger、i18n AUTO-SKIP、CI 四项全中）；冲突标记 0；括号按类型对称（ChatScreen `(`+1`)`+1、Gesture `{`+1`}`+1 `(`+4`)`+4）。CI run **36309839199 completed/success @ 8a76278d**（workflow_dispatch，head_sha 逐字符一致）= **停止节点，未合并（合并权在用户）**。
+
+**装包验证点（真机）**：①选中靠近可视区顶部的文字让起点手柄与「复制」按钮重叠 → 点复制应生效；②多行选区（同走下方分支）应生效；③不重叠区域手柄照旧可拖；④「添加到输入框」/「复制 Markdown」同时受益；⑤视觉仅下方分支工具栏远约 56dp，上方分支无变化。**问题 1（思考标签泄漏）仍为 P2 登记不修**（用户：偶发、频率低；升级触发=再撞上+确认面）。
+
+<!-- 2026-09-27 17:48:25 -->
+## 核查 fix/selection-toolbar-handle-overlap（09-27，用户「检查一下云端正在跑的那个分支」= CI in_progress 的那个）
+
+**核查对象**：远端 `fix/selection-toolbar-handle-overlap` @ `8a76278d16e4`（1 commit，2 文件 +49/−9，基 main aeffcef9），CI run **36309839199 completed/success @ 8a76278d16e4 逐字符一致**。改动 = ①ChatScreen 三个 Popup 宿主调换顺序（Handles 提前、Toolbar 最后 = 最上层）；②`FloatingSelectionToolbarPositionProvider` 新增 `handleClearancePx`（默认 0），下方分支 `anchor.bottom+gap` → `+gap+56dp`。
+
+**机械项全过**：verify_branch.sh exit 0 —— 工作树 clean、冲突 0、scan **20/20**、four-way ✅、i18n AUTO-SKIP（无 strings.xml）、scan_debt 1 标记 / **0 no-trigger**、CI VERIFIED。项 2 调用点：6 符号逐个 grep 无遗漏（`FloatingSelectionToolbarPositionProvider` 仅 1 个构造点 :731；`handleClearancePx` 5 命中全在链路内；`HANDLE_HIT_SIZE_DP` 单一常量源）。
+
+**★ 项 7 独立证据 = 新装置 `/var/minis/shared/work/check-0927/geom/`（对照臂，值得复用模板）**：extract.py 用 `git show origin/main:<file>` vs 工作树抽取 `FloatingSelectionToolbarPositionProvider` 类，只去 private + 改名，打印 class sha256（pre `c7359cd8c9b114f4` / post `985a41f5190bcd68`）；桩 = compose-ui-unit 4 类型（IntRect/IntSize/IntOffset/LayoutDirection/PopupPositionProvider/Rect）。**8/8 断言全过**：密度 2.75 手柄带 [200,354]，pre.y=**248 落在带内**（bug 几何复现）、post.y=**402 清开**（+154px=56dp@2.75）；上方分支 832/832、空 anchor 112/112 逐值不变（回归保护）；带顶偏移 −40..40px 下 pre 11/11 重叠、post 0/11（假设稳健）；密度扫描首次重叠 density=1.0（与注释 ~0.86 取整边界一致）。**抽取器坑**：结束条件若写 `depth==0 and len(body)>1` 会在构造函数跨行时第 2 行提前 break（只抽出 2 行）→ 必须加 `started` 标志（见到第一个 `{` 后才判 depth==0）。
+
+**诚实边界（未闭环）**：①**A 的 z 序无沙箱证据**——「后声明的 Popup 在上层」是机制假设，沙箱无 Android SDK 不能证 Compose 运行时层级；支持证据仅用户观测方向 + 同屏 Compose 内置工具栏（手柄画主窗口）无此症状 → 需真机验证（长按选择靠顶的短选区 → 点复制应生效）。②**F 残留边界**：视口高 <~450px 时 `coerceIn(viewTop,maxY)` 仍把工具栏夹回手柄带（pre 同样重叠，非回归）。③**未覆盖候选机制**：`Copy` 在 `selectedPlainText()` 空时**静默无 toast 但清选区**（:791-800）→ 提供区分判据：**选区消失但没复制 = 这条；选区不消失 = tap 被吞（本修复目标）**。④按钮集合横移候选已淡化（Copy/CopyMarkdown/CopyRichText 现无条件渲染）。
+
+**结论**：机械项与 B 的算术证据齐，A 的机制证据缺 → **不宣布「可合并」**；停在分支上，合并权在用户。回报落 `/var/minis/shared/work/check-0927/REPORT.md`。
+
+<!-- 2026-09-27 17:55 -->
+
+<!-- 2026-09-27 17:52:26 -->
+## 合并 fix/selection-toolbar-handle-overlap → main = 0d7be26e（09-27，用户「既然没有什么问题，那就合并吧」+「合并触发后就不用等了」）
+
+**分支**：`fix/selection-toolbar-handle-overlap` @ `8a76278d16e4`（1 commit，2 文件 +49/−9，基 aeffcef9）。改动 = ①ChatScreen 三个 Popup 宿主调换顺序（Handles 提前、Toolbar 最后 = 最上层）；②`FloatingSelectionToolbarPositionProvider` 新增 `handleClearancePx`（默认 0），下方分支 `anchor.bottom+gap` → `+gap+56dp`。
+
+**合并收口**：私有克隆 `check-0927/rkm`（git clone 正常，但 `gh_sync.sh clone` 那次静默失败无落地——set -e 下 git clone 报错被 `>/dev/null` 吞，add_row 仍打 OK，**exit 0 不可信**；直接用 git clone 可见错误）→ 设 git 身份（`***OWNER*** <***OWNER***@users.noreply.github.com>`，新克隆必做，否则 merge 报 Committer identity unknown）→ `--no-ff` merge = **0d7be26e**（零冲突）→ 合并树与分支 tip `git diff` **空**（逐字节一致）+ 冲突标记 0 + 合并树 scan **20/20** + four-way ✅ → push `aeffcef9..0d7be26e`（gh_sync.sh push exit 0）→ ls-remote 逐字符一致 → API DELETE 远端分支 **204**。远端只剩 main = 0d7be26e 与 `docs/dev-history-0927` @ e3a8d589（别处会话推的文档三件，**未合并，待用户决定**）。**release CI run 36310708393 @ 0d7be26e push 自动触发（in_progress）——用户拍板「合并触发后就不用等了」，未等结论。**
+
+**★ 用户决策纪律的实例（缺口该不该处理）**：核查发现 A（z 序）无沙箱证据（假设链 = 声明顺序 → Popup 挂载顺序 → Android ViewGroup 逆序分派 → tap 归属；沙箱无 SDK 只能证第一段）。用户问「这个有没有必要处理」→ 按修复门判据给结论 **不处理**：**最坏兑现 = 假设错 → A 变 no-op → 症状维持原样 = 最坏等于现状**，不产生新坏结果。它不是缺陷，是**验证债务**，有天然偿还渠道（装包验一次，成本≈0）。四种处理里撤 A（用窄视口复发风险换注释纯度）、建装置（沙箱证不了，装置比例失调）、改注释（收益≈0）全是过头反应；正确 = 不管 + 写清真机验证点。**升级触发 = 真机仍复现 → 那时才做 B-only 对照包分离 A/B。** 另附判据：单臂只能验「症状未复现」，验不出 A/B 谁在起作用，**事后不得把 A 标成「已验证」**。
+
+<!-- 2026-09-27 18:05 -->
+
+<!-- 2026-09-27 17:55:53 -->
+## 合并 docs/dev-history-0927 → main = 7a5f54b9（09-27，用户「那也顺便处理了吧」）
+
+**核查（纯文档，按影响面配比装置）**：三个回归测试 test_rebuild / test_sanitize / test_sagas **全 PASS**；**条目数对账口径**（易踩）：header「条目总数 1364」== **parseable anchor** 数（正则 `^<!--\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s*-->`），不是所有 `^<!-- 2026-` 行数（后者 1531，多出的 168 条是源数据固有形态 `<!-- 2026-08-08 02:30 -->` 缺秒/`12:0x`，脚本注释明确按「正文」处理）；unique 时间戳 1354（3 个时间戳重复共 10 条）也不是 header 口径。**别用自己的正则臆断 header 数字**。fences 56 偶数；行首真冲突标记 0（正文里出现的 `<<<<<<<` 是描述文字，须用 `^` 锚定区分）；精确密钥扫描（`sk-[A-Za-z0-9]{32,}|hf_|ghp_|github_pat_|rnd_|AKIA|AIza`）clean——注意 `sk-thinking-level-and-ui-stuck.md` 会被宽松的 `sk-[A-Za-z0-9_-]{20,}` 误报（字符类含 `-` 是误报源）。
+
+**逐行走查**：删除行 42 行**全部**过目（全是统计旧值替换：1348→1364、55→56 天、各主题条数 +1/+2、跨度日期）；新增 304 行前缀分布全为预期形态（`+**` 70 / `+| ` 42 / `+- ` 38 / `+<!--` 19 / `+##` 19 …），仅 2 条非列表行（INDEX 描述行 + 条目正文）属正常；脱敏生效可见（`***OWNER***`、`com.***.***.dockbin`）。
+
+**合并收口**：`--no-ff` merge = **7a5f54b9**（零冲突）→ **双侧精确对账**：`git diff <branch_tip> HEAD -- docs/` **空**（docs 与分支 tip 逐字节一致）+ `git diff <prev_main> HEAD` **只列 docs 三文件**（src 侧与 0d7be26e 完全一致）→ push `0d7be26e..7a5f54b9`（gh_sync push OK）→ ls-remote 逐字符一致 → API DELETE 分支 **204** → 远端只剩 main = 7a5f54b9 → **push 后 runs 列表无新增**（确认 docs/ 不在 build-apk.yml paths，未触发 CI）。**装包验证点**：无（纯归档文档，不进 APK）。
+
+<!-- 2026-09-27 18:20 -->
+
+<!-- 2026-09-27 17:57:10 -->
+## 09-27 今日修改审计收口
+
+对 `main` 8dcb82e8→aeffcef9 做全套核查：24 文件 +838/−53，工作树干净、冲突 0、scan 20/20、i18n 1488 keys×7 CLEAN、four-way CLEAN，release CI run 36300853398 在 aeffcef9 completed/success 且 head_sha 一致。runtime-sandbox-knobs 独立 JVM 装置 4/4，源码 hash 对账一致；IME 覆盖层枚举缺口已补齐（image/video/webapp/offload pending + ChatInputArea MoveToSessionSheet），但 `stateAlwaysHidden` 的真实键盘行为仍需真机三点验证。未合并 `docs/dev-history-0927` @ e3a8d589：3 个 md +301/−42，1364 entries/56 天，结构、三项回归、独立脱敏均通过；docs-only 不触发 APK CI。未发现 P0/P1 代码缺陷。
+
+<!-- 2026-09-27 18:24:35 -->
+## 09-27 当日修改最终收口审计
+
+远端 `main=7a5f54b9`，由代码合并 `0d7be26e` + 档案合并组成；代码线对基线的机械核查 20/20、four-way CLEAN、i18n 1488×7 CLEAN、CI run 36310708393 绑定 `0d7be26e` 且 completed/success。runtime knobs JVM 4/4、选择工具栏几何对照 8/8；档案三项回归全 PASS，1364 anchors 与 header 对齐、脱敏/冲突干净。未发现 P0/P1；IME 键盘三点与选择框真实点击仍是待装包行为验证，不把静态/沙箱证据冒充真机闭环。最终树核实为源码等价于 `0d7be26e`、docs 等价于 `e3a8d589`，远端分支已收口。
+
+<!-- 2026-09-27 18:46:20 -->
+## 「工具调用框消失／被挤掉」定案：不是丢块，是重进时的消息合并（09-27）
+
+
+**结论**：工具块在数据层、重建层、渲染层**全部完整**，不存在「整批丢框」的路径。用户看到的「框被挤没」= **重进会话时多轮 assistant 行被合并成一条气泡**的呈现后果。
+
+**决定性证据（18:00:02 重进那一刻，session=9068927b）**：
+```
+17:59:48.042  cancelStream invoked          ← 用户按暂停
+18:00:02.799  db.query.end          count=118
+18:00:02.854  toChatMessages.end    count=2      ← 118 行 → 仅 2 条消息
+18:00:02.856  toLLMMessage.end      count=118  totalPartsChars=1612117
+18:00:02.765  lazyColumn.firstLayout totalItems=2 visibleItems=2
+```
+CLI 直读同一会话：`total:192 count:50` → **25 assistant + 25 user 交替**，第一条 user 才是真实输入（"检查一下今天的修改"），其余 24 条 user 全是 tool_result 行。
+
+**机制**：单回合长 agent 循环 → `ChatTranscriptRebuild` 的 `mapNotNull` 丢弃纯 tool_result 的 user 行（text 空）→ 25 条 assistant 行**全部变连续** → 末尾 coalesce 合并成**一条**消息（`prev.copy(id=msg.id)`，`content=prev+"\n\n"+msg`，`toolBlocks` 拼接后按 `it.id` 去重保留最后出现）。UI 从 25 段变 2 个 item。
+
+**已证伪清单（11 条，全部排除）**：
+1. 写盘漏斗 `capPartsJsonForRow`（`ChatRepository.kt:1071-1114`，阈值 `MAX_MESSAGE_PARTS_JSON_BYTES=500_000`）：**今日最大 partsLen=123641（123KB）**，`grep -l "Content truncated" minis-*.log` **全日志 0 命中** → 从未触发（它是唯一能把整行 parts_json 压成单个 text part、整批抹掉 toolUse 的路径）
+2. malformed 解析失败（`failed to parse partsJson`）：0 真实命中（唯一命中是案发会话自查命令文本）
+3. `ToolBlockMonotonicGuard`：只钳状态不改集合（`next.map{}`），全天 `ToolMonotonic` 真实触发 0 次
+4. 折叠卡片 `AssistantToolRunGroup`（多工具折成一行摘要）：唯一构造点 `legacy/LegacyFlatChatBuilder.kt:186` = 死路径；`ChatScreen` 里 `buildFlatChatItems` 只有 import+注释，无真实调用（aggregate 路径 early-return）
+5. `LargeContentGuard`：`shouldCollapse = !isStreaming && len > 32_000`，只包 **text 块**，不碰 `tool_use`
+6. `silent auto-compact`：只做 `neutralizeCompactArtifacts`（删分隔卡行 + 清灰化）+ `applyCompactGreyedRange` 加灰化标记，**不删消息、不改 content/blocks**
+7. 侧信道替换语义（`ChatFlatItems.kt:683-688` `m.copy(toolBlocks = delta.toolBlocks)`）：21 个 `updateAssistantMessage` 调用点全部传累积的 `allToolBlocks`
+8. 残留 delta 覆盖：`_streamingById` 会话重载即清空（`ChatSessionLifecycle.kt:1257`）
+9. 序列化/解析字段名：写读均为 `toolUseId`（`ChatTurnPartsJson.kt:56` / `ChatViewModelMessageParser.kt:65`）
+10. 聚合渲染路径：`AssistantMessageItem` 携完整 `ChatMessage`，`messageMarkdown` 只供 Copy Markdown
+11. 合并去重误删：样本 5 个 `toolUseId` 互不相同；thinking/text 块 id 均带 entity.id 前缀，无跨行撞车
+
+**附带发现（值得登记）**：
+- `[Compact] silent auto-compact: N UI bubbles folded (history entries: M); no divider, no graying` —— 18:21/18:23/18:30/18:37 共 4 次（4/10/16/16 个气泡），**静默折叠且不留任何视觉提示**（无分隔线、无灰化）
+- `[Compact] Phase2.5 self-heal: orphaned lcmId=97756a1a → newAnchor=6a5c7de4 → uiIdx=1 insertIdx=2`：重进时压缩锚点孤立、自愈重插，`boundaryIdx=2` 而消息总数=2 → **整个转录都落在压缩区**
+- `updatePersistedAssistantTurn` / `assistant row refreshed` 全天**无真实日志行**（仅案发会话自查命令文本）；`persist-begin blocks=N` → `persist assistant done (dbId=…)` 每轮 dbId 均不同
+- 注释矛盾未定论：`ChatAssistantMessageUI.kt:439` 称 `AssistantMessageView` "currently unreferenced"，`ChatScreen.kt:4057` 称 "the ONLY assistant row type" —— 实际 `ChatScreen:4055` 在调用它，439 那条是漂移注释
+
+**未闭环的诚实边界**：沙箱无设备，无法渲染验证合并后那条消息的视觉形态。数据链路已验完整；若用户仍认为框「完全找不到」，再建 JVM 装置跑 `buildChatMessagesTranscript` 用真实 118 行形态验证。
+
+<!-- 2026-09-27 19:11:20 -->
+## §3.1「工具框消失」结案（09-27 晚，用户两张截图 + 设备实测）→ 真凶是思考文本落进正文
+
+
+**结论翻转**：不是丢块，也**不是**重进时的消息合并主因 —— 是**模型的动作/思考文本被打进 message content**，把 pill 顶出视野。
+
+**用户截图（19:07 提供，会话 9068927b）直接证据**：pill 在渲染 —— 屏1 顶部 3 个绿图标 pill（`确认最终 main 审计范围` / `确认最终 CI 与分支状态` / `确认档案分支最终状态与回归`，对应 DB 第 115 行）+ 屏2 一个 `回看刚才未完成的审计进度 0.1s`（第 116 行）。屏2 结构：正文 → `继续` 按钮 → `✨ RikkaMinis` → `深度思考 70` → pill → `深度思考 69`。
+
+**设备实测体量**（`[Perf][LongCtx] step=lazyColumn.firstItem.placed size=`，会话 9068927b）：运行中最新项 25,390→**29,261px**（一条 LazyColumn item！），18:00:03 重载后 **992×34,976px** ≈ 15 屏；18:00:21 起新项从 136px 长起来。→ **「重进后被合并」不是前后差异**（live 也是一条巨泡），合并只是放大器。
+
+**真凶数据**（`minis-sessions-cli messages --full` 全 192 行）：assistant 96 行，**5 行含泄漏标记，共 4,556 字符 = 全部 assistant 文本(12,148)的 37.5%**；**`<thinking>` 开标签 0 次，`</thinking>` 闭标签 10 次**。最大一行（17:59）**3,832 字符 = 18:00 合并气泡全文(5,760)的 66%**；结构 = 正文 + 一串 `**Running the mechanical audit…****Executing full static gates…**` 粗体英文动作短语 + 孤儿 `</thinking>`，且整段重复两遍（暂停后重跑）。→ 这正是用户说的「思考的跳出来放出来挤在一起 / 把工具框挤没」。**§3.1 与 §3.2 是同一问题**，判级 P2→**P1**（用户两次报告 + 已持久化 + 触发路径明确）。
+
+**机制待钉死（两个候选，补丁不同）**：①`<thinking>` 开标签跨 SSE chunk 被劈开 → scanner 没进 tag 模式 → 整段思考进可见/落库正文（前一会话探针已证「scanThinkTags 只找开标签 + 无跨 chunk 半标签缓冲」）；②provider 根本不发开标签、只留 `</thinking>`（那修法要变成「孤儿闭标签 + 前置段识别」）。**debug 日志只记长度不记原文**（`SSE delta: contentLen=… rcLen=…`），所以要用 `minis-model-use` 跑一次真实调用看原始返回。
+
+**新取证能力（重要，可复用）**：Shizuku **已就绪**→ `android-shizuku-cli exec "screencap -p /data/local/tmp/s.png"` + `exec "base64 -w0 …"` 拉到沙箱解码即可看图；`exec "uiautomator dump /data/local/tmp/ui.xml"` 拿渲染层节点树（实测：pill 标签 + `0.0s` 时长 + `深度思考` + `9K` 全是 text 节点）。**以后「需要真机看渲染」不再只能靠用户截图**。注意 uiautomator 与 CLI 查询都受 `created_at` 分钟粒度影响、**同分钟内行序不稳**（同一 offset 两次取到不同行），定位行要按内容/长度匹配，别用 index。
+
+**顺带**：debug 版 modelservice 日志 2 个（24MB+29MB）+ 主 worker 日志 29MB，行格式 `[HH:MM:SS.mmm] [DEBUG] [OpenAIProvider] [T321] SSE delta: contentLen=… rcLen=… rLen=… toolCalls=…`。
+
+<!-- 2026-09-27 19:47:35 -->
+## 修「思考泄漏」孤儿闭标签 → 分支 fix/thinktag-orphan-close @ df8bdf90（09-27，用户「修吧」，未合并）
+
+
+**结论：机制定案 —— 不是「开标签被 chunk 劈开」**（扫描器早就有跨 chunk 半标签缓冲 `maxOpenTagPrefixLen()`，且已有测试 `buffers partial open tag across chunks` 钉住）。真机制 = **relay 把模型的思考/动作短语链写进 `content`、同时把开标签剥掉，只留孤儿闭标签**（gpt-6-luna via llmhost.net；实测 17:57 thinking=MAX / 17:58 OFF）。全 192 行证据：**`</thinking>` 10 次、任何格式的开标签 0 次**；泄漏行边界＝`…完整差异核对。**Running the mechanical audit…****Executing…**</thinking>`（短语紧贴正文、无标签、无换行）；5 行泄漏 / 4,556 字符 = assistant 文本的 37.5%；最大行 3,832 字符，**整段重复两遍**（暂停后重跑）。
+
+**改动（2 文件 +127/−4）**：`ThinkTagScanning.kt` —— ①`!tagActive` 分支新增**孤儿闭标签识别**（与开标签按 index 竞争，最早者赢；命中即丢弃 token、不进 tag 态）；②新增 `maxCloseTagPrefixLen()`，尾部前缀缓冲改为 `maxOf(开,闭)`（闭标签被劈开也不漏头）；③altClose `<response>` **刻意排除**（正文里比终结符常见，已有 pinned 测试）；④ponytail 三段标记边界。测试 `ThinkTagExtractionTest.kt` +6 例（真捕获串 / 跨 chunk 闭标签 / 别名遍历 / 不许吞前置文本的 pin / 后续真区间不被破坏 / `<response>` 不误伤）。
+
+**证据（修前/修后对照，真源码 + 真泄漏串）**：装置 `/var/minis/shared/work/thinktag-fix-0927/`（old/ = `git show main:` sha `21d7b6b0…`；new/ = 工作树 sha `13521b98…`；probe/Main.kt 状态机逐行照抄 OpenAIProvider 2635-2641/2645-2649/1266-1272/1329-1336）→ **修前 failures=10（孤儿闭标签 10 例全 FAIL，`文本</thinking>尾` 原样进 visible）、修后 failures=0（16/16 PASS）**，成对区间/跨 chunk/altClose/纯文本回归全绿。机械门：scan **20/20**、four-way ✅ CLEAN、i18n AUTO-SKIP、scan_debt **1 标记 / 0 no-trigger**、括号配平 88/88、377/377、工作树 clean。**分支 CI run 36316077876 completed/success @ df8bdf909980**（workflow_dispatch，head_sha 逐字符一致，ls-remote 一致）= **停止节点，未合并（合并权在用户）**。
+
+**诚实边界（必须记住）**：①本改动**只丢 token，不丢它前面的粗体链**——那条链的 delta 在闭标签到达前就已作为 visible 流出/落库，**流式扫描器无法撤回**；要压掉它只能做**落库/重建期启发式**（把闭标签前的粗体链接管成 thinking 段），属改行为、会误伤正文粗体叙述，已按 ponytail 写升级触发，未做。②**存量行不会被修好**：修的是扫描器，DB 里那 10 个 token 仍在（需 Part B 顺带规范化）。③真机未验证（沙箱无设备）——装包后新流不再出现 `</thinking>` 即闭环。
+
+**同族核查（值得复用）**：`scanThinkTags` 全仓唯一调用点 OpenAIProvider.kt:2637（content 通道）；`reasoning_content`→ThinkingDelta **不扫描**（1240-1265）；anthropic/gemini/xai/openrouter 无标签处理——即本修复面只覆盖 chat-completions content 通道。
+
+<!-- 2026-09-27 19:58:19 -->
+## 「Part B 需不需要样本」的实测回答：捞不到第二例（09-27，用户追问理解是否正确）
+
+
+**做法**：主动去捞语料（不等）。`minis-sessions-cli list --limit 40` → 逐会话 `messages --full` 分页 → 正则 `</think(?:ing)?>` 统计。共 **40 会话 / 4,640 行**。
+
+**结果（打脸式）**：命中 **42 行 / 82 token / 6 会话**，但用「含反引号或 len<1200 视为代码/自指噪声」过滤后 → **41 行是自指污染**（我自己的报告、测试夹具、harness 输出、tool_result 里的分析文本），**疑似真实产出行仅 1 行**。即：**跨 40 个会话找不到真实的第二例泄漏**。
+
+**原会话 9068927b 精确复核**（192 行）：含闭标签 **5 行 / 10 token** —— 17:01 len=221 tokens=1、17:03 len=191 tokens=1、17:33 len=62 tokens=1（**无**相邻粗体链）、17:59 len=3832 tokens=6（含反引号）、18:16 len=250 tokens=1。即 **4/5 行**闭标签前是 `****` 相邻粗体链，**1/5 行不符合**。
+
+**★ 过滤器偏置（装置教训，同族复发）**：我那条「含反引号=噪声」的判据把 **17:59 那行 3832 字符的原始泄漏行也一起滤掉了**（因为该行正文里含代码块）→ 跨会话扫描才得出「真实行 0」的假象。**凡过滤器给出「全无/全有」结论，先确认过滤器口径是否把目标本身排除了**。
+
+**结论（Part B 拆两半）**：
+- **B1 清历史 token**（把已落库的 10 个孤儿闭标签洗掉）：判据确定、零判断成分、**不需要样本** → 独立小改，可做。
+- **B2 粗体链接管进思考块**：证据基础 = **1 会话 / 1 relay（gpt-6-luna via llmhost.net）/ 5 行，其中 1/5 不符合特征形态**，而正文粗体叙述本身极常见 → **误伤率无法界定** → 登记不做。**升级触发 = 下次真实撞上（别的模型/relay），那时才有第二个样本**。不是「等以后攒」，是「现在捞不到」。
+
+<!-- 2026-09-27 20:00:07 -->
+## 合并 fix/thinktag-orphan-close → main = 02a935a2（09-27，用户「没问题就合并，有问题就修」）
+
+
+**核查 8 项全过 → 合并**。分支 1 commit / 2 文件 +127/−4（基 7a5f54b9）：`scanThinkTags` 在 `insideTag=false` 时把**孤儿闭合标签**（`</thinking>` 等，开标签被网关剥掉）消费丢弃（原来原样进正文+落库），新增 `maxCloseTagPrefixLen()` 处理跨 chunk 劈开的闭合标签，`altClose`（`<response>`）故意排除。
+
+**机械门**：冲突标记 0；scan **20/20**（分支树 + 合并树各一次）；scan_debt 1 标记 / 0 no-trigger（三段齐全）；i18n AUTO-SKIP（仅 2 个 .kt）；four-way CLEAN；CI run 36316077876 completed/**success** @ df8bdf90 逐字符一致（workflow_dispatch）。
+
+**★ 独立证据（对照臂 + 真数据回放，值得复用的做法）**：装置 `/var/minis/shared/work/check-0927/ttk-probe/`（自写 Main.kt 探针 = 真 scanThinkTags + 逐行照抄 OpenAIProvider 状态机 :2635-2641/:1266-1272/:1329-1336，25 用例 + 文件回放模式）。源码 sha256 双对账（old `21d7b6b0…` == `git show 7a5f54b9:`；new `13521b98…` == `git show HEAD:`）。**OLD 14 fails / NEW 0 fails**；6 条回归两臂全 PASS。**真数据回放**：从会话 ***UUID*** 抓 192 条消息 → 5 行含 closer（4,556 字符 / 10 closer，与台账逐字对齐）→ OLD 5/5 行泄漏、NEW 0 泄漏，字符差 **精确 11 × closer 数**（221−210、3832−3766=66=6×11）= 只删 token 不误伤正文。
+
+**★ 装置自身的坑（新）**：①我自写用例 8 期望值手算错（`</thin` + `kingx` 拼接 = `</thinkingx`，我误写成 `</thinkkingx`）→ 报 FAIL —— **两臂输出相同的 FAIL 应立刻怀疑期望值而非代码**；②kotlinc 命令行 `fun main()` 加 args 后需同步签名，否则静默用错入口。
+
+**合并收口**：`--no-ff` merge（ort 零冲突）= **02a935a2**；合并树 vs 分支树 `git diff` **空**；vs 7a5f54b9 只 2 文件；双祖先 `--is-ancestor` YES；push `7a5f54b9..02a935a2`（gh_sync exit 0）→ ls-remote 逐字符一致；API DELETE 分支 **204**（远端只剩 main）；release CI run **36316937999** @ 02a935a2 push 自动触发 → completed/**success**（API 直查 head_sha 一致）。
+
+**诚实边界（未闭环）**：只删 token，**不删 reasoning run**（正文里 `**Running the mechanical audit…**` 动作短语仍留 —— delta 已按可见流下发，扫描器撤不回）；ponytail 已写天花板 + 升级触发（「用户仍报思考文本挤在正文」→ 需落库/重建期启发式接管），本次**有意不动**（opener 被剥后无确定信号区分 reasoning/正文，启发式误吞风险 > 收益）。真机未验证（沙箱无 Android 运行时）。报告：/var/minis/shared/work/check-0927/REPORT-thinktag-orphan-close.md
+
+<!-- 2026-09-27 20:32:46 -->
+## B1 落地：清洗已落库的孤儿闭标签 → 分支 fix/persisted-think-closers @ 7a17a75d（09-27，用户「做吧」，未合并）
+
+
+**背景**：Part A（`df8bdf90`）只管新流；旧行仍带 token。用户拍板做 B1。**Part A 已由别处会话检查后合并进 main（`02a935a2`）**，本分支基于新 main。
+
+**实现（6 文件 +214/−5）**：①`ThinkTagScanning.kt` 新增 `stripOrphanThinkClosers(text)` —— **离线双胞胎**（无流式状态、除 token 外逐字节不变），复用同一份 `THINK_TAG_FORMATS`（标签表单一来源）；②`ChatViewModelMessageParser.kt` 新增 `List<ParsedPart>.stripOrphanThinkClosersForRole(role)`，**只对 assistant 行生效**（user 行载的是工具输出，里面的 token 是证据不是 artifact）；③`parseRows` + `ChatViewModel.toLLMMessage` 双接线 —— `ParsedPart` 是 UI 与 LLM 历史**共用**的解析产物（文件头注释明写），一处挂钩同时覆盖「显示」和「发给模型」；④抽屉预览列（`sessions.last_message` 是自己的一份副本）在渲染处同样过一遍。
+
+**判据来自测量不是猜**（真实 5 行 10 token）：**10/10 紧接粗体、0/10 在代码段内**、4/10 在文末；而语料里每一处**刻意引用**（`</thinking>` 写在反引号里）都在代码段内。→ 规则 = **孤儿（同文本内无开标签）+ 非代码段**。零迁移、幂等、库里的字节保持可审计（不改表）。已知边界：**裸的（无反引号）散文提及会被当成 artifact 删掉**——两者都是外观问题，留下 artifact 才是被报的 bug。
+
+**证据**：①装置 `/var/minis/shared/work/thinktag-b1-0927/`（夹具从**真实会话**导出：5 条真 artifact 行 → 10 token 全清；2 条真引用行**逐字节不变**；成对区间对照保留）→ 8/8 PASS；②**两个变异各杀对应夹具**：去掉代码段守护 → 真引用行 FAIL、去掉孤儿守护 → 成对区间 FAIL，且源码 sha 未变（变异只作用于副本）；③门：scan 20/20、four-way CLEAN、scan_debt 3 标记 / 0 无三段、i18n AUTO-SKIP；④**新预检装置**：沙箱 kotlinc 编译**真解析器源码 + 真测试文件**（Maven Central 拉 json/junit/hamcrest + MessageEntity 桩）→ **JUnit 23/23 全过**。
+
+**★ 第一次 CI 红（36318024951）＝ 测试文件缺 import**（`Unresolved reference 'stripOrphanThinkClosers'`：该测试文件用的是**显式导入**，不是同包）。教训＝**搬运新符号后必须机械核对 import 覆盖**（记忆里已有这条，我还是踩了）。修法：补 import + amend（`7a17a75d`）→ **gh_sync.sh push 不支持 --force** → 用 API DELETE 远端分支（204）再重推。第二次 CI run **36318467662 completed/success @ 7a17a75d**（head_sha 逐字符一致）= **停止节点，未合并（合并权在用户）**。
+
+**装包验证点**：重进「更新后工具调用消失」那个会话 → 旧气泡正文与抽屉预览里**不再出现 `</thinking>`**；但**那面粗体文字墙照旧**（B2 未做，登记待真样本）。
+
+**可复用**：预检环境 `/var/minis/shared/work/thinktag-b1-0927/jvmcheck/`（3 个 jar + MessageEntity 桩 + 编译运行命令）——**下次改解析器/数据类前，先在这里编译真测试文件，别拿 CI 当第一道关卡**。
+
+<!-- 2026-09-27 20:34:27 -->
+## 核查分支 fix/persisted-think-closers @ 7a17a75d（09-27，用户「检查云端正在跑的那个」，未合并）
+
+
+**对象**：另一会话已在旧 tip 50bf8259 上补修（唯一差异 = 补 `import stripOrphanThinkClosers`；50bf8259 的 CI run 36318024951 **failure** 在步骤 15「Run unit tests」= 测试文件用符号未 import），amend 后 tip = **7a17a75d**（1 commit，6 文件 +214/−5）。
+
+**8 项核查全过**：机械项 exit 0（scan 20/20、four-way CLEAN、scan_debt 3 标记/0 no-trigger、i18n AUTO-SKIP、冲突 0、工作树 clean）；项 2 调用点 grep 无漏（`parseRows` 生产唯一调用点 `ChatSessionLifecycle.kt:1090` 同时喂 buildChatMessages + buildLlmMessages → 一处挂钩覆盖显示+发送；`toLLMMessage()` 4 调用点全覆盖；`buildSingleLlmMessage` 消费 `parts` 参数，重新解析不构成绕过）；**CI run 36318467662 completed/success @ 7a17a75d**（三源一致：远端 tip = 本地 HEAD = head_sha 逐字符）。报告 `/var/minis/shared/work/check-b1-close/REPORT.md`。
+
+**★ 独立证据（真数据回放，装置 `/var/minis/shared/work/check-b1-close/`）**：从会话 9068927b 分页抓全部 192 条 → 96 条 assistant 行；真源码 4 文件 sha256 == `git show HEAD:` 逐字符；`passes=25 failures=1`。观测值：5 行命中、`tokens 10 -> 0`、字符差 **110 = 11×10**（221→210/191→180/62→51/3832→3766/250→239），其余 **91/96 行 byte-identical**；接线：真 `parseRows` 输出 assistant 清理 / user 原样 / ToolUse 存活 / 空输入空（4/4 PASS）。
+
+**三条 P2 发现（不阻塞）**：
+1. **`lowercase()` 索引偏移可误删正文**：`stripOrphanThinkClosers` 把 `lower` 与 `text` 当同一坐标系；实测 `"İ".lowercase().length == 2` → `in=[İ</thinking>x] out=[İ<]`（吃掉正文尾部）。**触发面已量化 = 全 Unicode 仅 1 个码点**（`U+0130 len 1 -> 2`，`Scan.java` 扫 0..0x10FFFF）。修法一行：`text.regionMatches(i, tag, 0, tag.length, ignoreCase = true)`（顺带消除每行 lowercase 全量拷贝）。升级触发 = 真实撞上。
+2. **夹带删除既有测试**：`parseRows empty input returns empty`（diff:266-267）被删，新 4 例未覆盖空列表。本装置已补该覆盖（PASS）。
+3. **第三消费面未覆盖（范围外）**：`ChatExporter.extractPlainText`（文本导出仍带 artifact，而同函数已清洗 `<user-attached-files>`）、`ConversationHistoryTool:154`、`ChatRepository.extractTextForOffload`。
+
+**装置教训**：python 写 manifest 用 `"".join(lines)` 少了换行 → 探针只读到 1 行，报「corpus totals tokens=1」假红；**断言里的聚合期望值要连同生成端一起核对**。
+
+<!-- 2026-09-27 20:42:41 -->
+## 合并 fix/persisted-think-closers → main = efac6f86（09-27，用户「合并了吧」+「触发了就不用等了」）
+
+
+**合并收口**：`--no-ff` merge（ort 零冲突）= **efac6f86**；合并树 vs 分支 tip `git diff` **空**；vs main(02a935a2) = 6 文件 +214/−5（与核查结论一致）；push `02a935a2..efac6f86`（gh_sync exit 0）→ ls-remote 逐字符一致；API DELETE 分支 **204**（远端只剩 main）；release CI run **36319865437** @ efac6f86 push 自动触发 → in_progress，用户拍板不等待。装包验证点：重进含孤儿闭标签的旧会话 → 气泡/抽屉预览/发给模型的历史不再出现 `</thinking>`；B2 粗体链照旧（backlog §41 三条已登记）。git merge 输出的 diffstat（341 insertions）是显示形态问题，以 `git diff 02a935a2 HEAD` 为准（+214/−5）。
+
+<!-- 2026-09-27 20:57:25 -->
+## 审计对象：02a935a2 + efac6f86（思考标签孤儿闭标签 Part A + Part B）
+
+# 最近两次合并审计 + 文档更新收口（09-27，用户「检查最近两次修改 + 更新文档」）
+
+- 机械门：scan.sh **20/20 PASS exit 0**；接线核查 `parseRows` 生产唯一调用点 ChatSessionLifecycle.kt:1090；`stripOrphanThinkClosers` 三挂点全通（Parser:153 parseRows / ChatViewModel:3912 LLM 历史 / ChatHistoryDrawer:561 抽屉预览）；release CI run **36319865437 @ efac6f86 completed/success**（bridge 复查 4 次等到结论）。**无 P0/P1**。
+- **P2-1 İ 坐标脱移（latent）**：`stripOrphanThinkClosers` 用 `lower=text.lowercase()` 匹配 + `text` 截取，U+0130 lowercase 长度 1→2（len 13 vs 14），Python 复刻回放 `"İ</thinking>x"` → `"İ<"` 吃掉正文。`scanThinkTags` 的 bufLower 同模式但改动前已存在。修法一行 `regionMatches(ignoreCase=true)`。登记不修，触发 = 真实撞上。
+- **P2-2 夹带删测试**：分支删了 `parseRows empty input returns empty`，新 4 例未覆盖 emptyList（行为本身无 bug，前次装置已验 PASS）。恢复一行。
+- **P2-3 覆盖缺口**：清洗只挂「显示+LLM 历史+抽屉预览」；`ChatExporter.extractPlainText`、`ChatRepository.extractTextForOffload`（导出/offload 文本）仍带 token。S=5 读者 k=2。登记不修，升级触发 = 用户导出后仍见 token。
+- P3×3：无关开标签致孤儿保留 / 思考区跨 part 拆分 / 反引号奇偶计数 vs fenced block。报告：/var/minis/shared/work/check-0927/REPORT-latest-two-merges.md。
+
+## 文档三件套重建 + 推送
+- rebuild **1382 条**（dropped 75，前次 1364 → +18 新条目），SAGAS 23 sagas / orphans 104 / multi4 81。
+- **脱敏探针误报根治**：sanitize 验证报 `token-prefix(1)` —— 命中是笔记文件名 `sk-thinking-level-and-ui-stuck`（条目里正拿它当误报示例），**字符类含 `-` 是已知误报源**。修法：sanitize_dev_history.py 探针正文 `[A-Za-z0-9_-]{20,}` → `[A-Za-z0-9_]{20,}`（清单里真实 token 形态正文均无 `-`）。test_sanitize 复跑 PASS，main + SAGAS 复扫 **NONE clean**。结构性校验全过（fences 62 偶、anchors 1382 == header、outOrder 0）。
+- **流程坑（复发）**：rebuild 后忘了拷贝到 rkm 克隆 → `git status -- docs` 空差点误判「无差异」；mount（重建产物）与克隆（提交源）是两个落点，先 cp 再看 diff。
+- 分支 `docs/dev-history-0927b` @ **265ef350**（3 文件 +327/−26）push OK，ls-remote 逐字符一致。docs/ 不触发 CI。**未合并（合并权在用户）**。
+
+<!-- 2026-09-27 22:54:26 -->
+## 第一档确定性修复完成（09-27）
+
+用户批准修复第一档三项：①§41-1 `stripOrphanThinkClosers` 去掉 `lowercase()` 坐标错位，改用原文 `regionMatches(ignoreCase=true)`；②恢复 `parseRows(emptyList())` 回归测试；③将 `softprops/action-gh-release@v3` 固定到 peeled commit SHA `efb35369e0ad2afab669f228072c1b0d510eae64`。分支 `fix/deterministic-tier1-cleanups`，commit `8369a9dfbe9c22c01a05ee78cd4c97e613742054`，CI run `36326700243` completed/success，head_sha 与本地/远端逐字符一致；按停止节点规则未合并 main。独立 JVM 真源码+真会话回放 26/26 PASS：96 条 assistant 行中 5 条命中、10 个 closer 清零、91 条逐字节不变；修前 Unicode 夹具失败、修后通过；静态 scan 20/20。
+
+<!-- 2026-09-27 23:00:49 -->
+## 合并 fix/deterministic-tier1-cleanups → main（09-27）
+
+用户同意「没问题就合并，有问题修」；合入 `fix/deterministic-tier1-cleanups` @ `8369a9dfbe9c` 到 main，`--no-ff` merge = `c10f567522f75b62fd18c3d3a5f14a4db6aab92e`。分支 CI run `36326700243` 在目标 SHA completed/success；合并前 scan 20/20、独立真实源码/会话回放探针 26/26，源码 SHA 与探针副本一致；核查确认 workflow 改 pinned `softprops/action-gh-release` 为 `efb35369…`，raw 文件可取且 `git ls-remote v3^{}` 一致。推送后远端 main 精确等于 `c10f5675…`，工作树 clean；main release CI run `36327819384` 已触发，用户要求触发后不用等待，故结论未等 CI 完成。远端 feature 分支保留（未额外执行删除）。
+
+<!-- 2026-09-27 23:04:00 -->
+## 独立确定性修复池
+
+用户同意把“根因已钉死、修法窄、几乎无次生风险”的第一档修复从普通 backlog 分离，统一攒在 `/var/minis/shared/deterministic-fix-queue.md`。backlog 保留发现与原始判定；独立池记录 DF 编号、修法、安全性、独立证据、分支/CI 状态。第一批为 §41-1 Unicode 索引、§41-2 空输入测试、§39-2 Action SHA pin，分支 CI 绿等待合并。第一档不等同于 P1 严重度。
 
 ---
 
