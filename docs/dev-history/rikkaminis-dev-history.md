@@ -1,11 +1,11 @@
-# RikkaMinis 开发日志合并导出（2026-08-03 ～ 2026-09-26）
+# RikkaMinis 开发日志合并导出（2026-08-03 ～ 2026-09-27）
 
 > 📌 **注意**：本文件是 raw dump（归档快照，按时间正序排列）。
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
-- 合并范围：2026-08-03 ～ 2026-09-26，共 55 天
-- 条目总数：1348（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：1786232 / 总行数：25637
+- 合并范围：2026-08-03 ～ 2026-09-27，共 56 天
+- 条目总数：1364（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：1808136 / 总行数：25835
 
 ---
 
@@ -25630,6 +25630,204 @@ backlog 存量盘点（09-25，应问分析）：1079 行 ~36 条未关项，净
 **装包验证点**：①beacon 行带详情（杀 app 几次后看 launch-beacon.log 出现 `verdict=silent_kill(uptime_was=…)`）；②多轮工具回合期间抽屉该会话第二行保持上一条内容（不再长空白）。
 
 **诚实边界**：真机行为未验证（装包后验证）；两装置均为沙箱 JVM 级证据 + CI 编译面，已三源取二（CI 绿 + 沙箱实跑 + 消费方静态核实）。
+
+<!-- 2026-09-26 16:33:19 -->
+## dev-history 三件套重建 + 推送（09-26，任务「更新一下文档」，第二次——00:27 已有一轮）：三个回
+
+**dev-history 三件套重建 + 推送（09-26，任务「更新一下文档」，第二次——00:27 已有一轮）**：三个回归测试先过（test_rebuild/test_sanitize/test_sagas 全 PASS）→ rebuild（55 天，**1327→1348 条**，dropped 75）→ sanitize（main 228 处 + INDEX 29 处替换，probe 复扫 NONE）→ SAGAS（23 saga，1348 条；orphans 91→95=7%、multi4=80，口径未漂移）→ 结构校验（fences 60 偶数 / anchors 1348 == header / outOrder 0）+ SAGAS 脱敏 probe CLEAN。**仓库同步**：克隆落在 `rkm`（`gh_sync.sh clone --dir` 的路径相对 cwd，cwd 继承自上一个 shell 的新 cwd=shared/work/rkm——`cd X || mkdir && cd X` 的 && 优先级坑导致 cd 失败但后续命令照跑，本次 lucky 没踩坏：rkm 恰好在 main 8dcb82e8 干净树上）→ 建分支 `docs/dev-history-0926` @ `c0d638a1`（3 文件 +397/−29），gh_sync.sh push 成功 + ls-remote 机械核实逐字符一致。**docs/** 不触发 CI，无 dispatch 需求**。**未合并，分支停在远端（合并权在用户）**。孤儿新增 4 条：00:05/00:25 两条无 ## 标题条目（源数据属性，标题退化为时间戳）+ 09-26 两条新条目（senseaudio 调查 / 日志核验）。
+
+<!-- 2026-09-26 16:36:07 -->
+## CJK 压缩端到端观察闭环（09-26，日志取证）：挂起 3 天的「真实中文长对话涨到压缩线观察 [Compact] 触
+
+**CJK 压缩端到端观察闭环（09-26，日志取证）**：挂起 3 天的「真实中文长对话涨到压缩线观察 [Compact] 触发」已在真机日志印证——`minis-2026-09-26.log` 今天 **13 次 `AutoCompactLoop] triggering`**（00:29 起贯穿全天：10:06/10:51/11:01/11:22/11:48/12:59/13:05…），触发链完整可见：`escalated below the compact line (tokens=154272 window=200000 compactLine=168689)` → `triggering (tail=77915 growth=437/turn)` → `compactAll() invoked (historySize=511)` → `budget anchor engaged (keepTail≈6400 tokens)` → `range composition: msgs=470 estTokens=70396`。**关键点：tokens=154272 是 CJK 感知口径算出来的**——旧 chars/4 对中文低估 3-4×、尾部永远 TAIL_TOO_SMALL、自动压缩从未触发；现在真实中文 agent 会话（含 235 条 toolResultOnly）正常过闸并执行压缩。三源取二闭环（fix/cjk-token-estimate 的 CI 绿 + 沙箱 JVM 测试 + 真机日志端到端触发）。**附带印证**：16:30:56 beacon 出现 `verdict=silent_kill(uptime_was=30816ms)` 新格式 = main 8dcb82e8 的 beacon 修复也在最新包里生效。至此 09-26 全部装包验证点闭环（1②③④⑤ 全确认）。
+<!-- 2026-09-26 16:45 -->
+
+<!-- 2026-09-26 16:39:00 -->
+## 2026-09-26 16:39:00
+
+<!-- 2026-09-26 16:43:58 -->
+## GLOBAL.md 更新（09-26，用户拍板「就按你说的这套来」）：按「稳定/可复用/环境事实」标准分拣近几天日志后写
+
+**GLOBAL.md 更新（09-26，用户拍板「就按你说的这套来」）**：按「稳定/可复用/环境事实」标准分拣近几天日志后写入 4 处——①新增「真机日志取证能力」节（日志族 6 文件表格 + 两种行格式 + silent_kill 兜底语义 + 同 tag 不同语义百倍误判 + CANCEL 预期行为）；②新增「/tmp 收割机制」节（60s 扫描 + 活动感知 + .minis-keep + 小时级工作放 shared/work 约定）；③「Linux 沙箱特性」追加 4 条复发坑（跨克隆 fetch bad pack header、partial clone cat-file 懒拉取假阳性、gh_sync clone 相对 cwd、cd 优先级坑、429 毫秒位陷阱）；④「经验教训」追加 JVM 装置自指陷阱一行指针。**未写入的（有意留在日报/仓库档案）**：分支合并收口/CI run 号/代码级根因/一次性项目工作（Filterrr 矩阵）/dev-history 流程（skill 已封）/一次性工具坑（复发次数过滤）。
+<!-- 2026-09-26 16:55 -->
+
+<!-- 2026-09-26 18:03:34 -->
+## 从日志逆推信息流 — 黑盒系统辨识（09-26，用户元问题）
+
+
+**任务**：用户问「日志是什么（多视角）？能否只从日志逆推应用的输入/输出/信息流（含所有设置类输入）」→ 完成首次黑盒系统辨识。
+
+**产物**：`/var/minis/shared/log-infoflow/`（REPORT.md 12.5K + log_topology.py Tag 景观分析脚本）。方法流程：文件族清点 → Tag 景观 → 选信息粒子 → 多源时间线合并 → 形态对账 → 找缺失脚印。
+
+**核心发现（可复用）**：
+- **认知定律**：日志在每个「序列化/计量边界」（跨进程、跨网络、落库、token 化）有采样，纯内存流动零采样 → 逆推出的永远是「转换点之间的虚线图」。连接可见，流动不可见。
+- **设置类输入盲区定律**：设置修改本身无痕，只在「被消费的瞬间」现身——思考档位→`Thinking resolve.in`；代理→`proxySelectEnd chain=`；常亮开关→`KeepScreenAwake (toggle=,active=)`；环境变量→`IntegrationStatus declared=[…] found=[…]`。重建配置的可见性 = 使用量的函数。
+- **沉积岩结构（新）**：日志文件=多进程顺序 append；进程换代有「截断地层」（17:54:12 旧 worker 半句 `java.l` 被物理截断，紧接新 `AppLogger Logging session started`；`stream complete` 无换行直接拼接）；turn=0 的 finish/usage 账本在换代窗口缺失。
+- **影子流（新）**：TitleGen 是独立并行的第二条模型流（独立 runId/usage 627 tokens/thinking=OFF）——用户不可见。
+- **逆流通道**：NativeOffloadServer abstract socket——沙箱命令经 socket 回连 app 执行；`register` 行=app 对外能力清单。
+- **观测竞态（重要教训）**：日志是活体——17:56 观察到「usage 缺失」，17:59 复核全部存在（读的时刻早于写刷盘）。**结论必须绑定观测窗口时间戳**；「系统无痕」与「采样未刷盘」必须分开陈述。
+- 附带：缓存经济（prompt 91-93% cached 命中）；预算再分配（maxTokens 随上下文衰减 123628→118988→111153 ≈ 200K 窗口−prompt）。
+
+**会话样本**：f218c07b（这个问题本身）——形态账本：108 字符 → partsLen=108 → bodyLen 138K→302K 渐增（messages 2→37）→ prompt_tokens 83K→101K → 2171 chunks/65.5s → 落库 partsLen=989；用户「停止+追发」= 8 步状态机链（cancelStream→CANCELLED→部分落库922→queued prompt→resumeQueueAfterCancel）。
+
+<!-- 2026-09-26 18:41:05 -->
+## evidence-discipline v1.4.1→1.5.0（09-26，用户「更新吧」）：日志逆推会话沉淀三条进
+
+**evidence-discipline v1.4.1→1.5.0（09-26，用户「更新吧」）**：日志逆推会话沉淀三条进 skill——①新增「三源取二的深化：独立性 = 失败模式不相交」节（操作化检验一句话：「第一条错了它最可能怎么错？第二条会不会同样方式错？」；伪二源三形态：主+worker 日志=弱二源〔共享设备/963 次/天换代节律/同一管线〕、「日志+据日志的因果推断」=一源、同证据两条转述=一源）；②新增「日志的真实地位与合格范围」节（日志≠三源之一，是「真机历史」维度唯一记录介质→真机行为级结论大量实为「单源+因果推理」；缺口三态表：覆盖〔963 换代/账本蒸发/设置 0 痕〕·保真〔appender 毫秒 vs LOGCAT 分钟时延·17:56/17:59 观测竞态〕·自指污染〔命令输出被回吞 3 条实证〕；判据类型决定合格范围：存在性判据对缺损免疫=强源，因果/全量判据过敏=不满足独立源资格，三出口=降维成存在性/设备外证据/先增强日志；增强优先级：缺口可见性>贯通 trace id>补盲区，金句「缺口的可见性>缺口的消除」）。**改动面**：2 处（version + 20a21,49 两节插入），31 diff 行，description 未动（触发面不变，无需行为版 evals）；新节落点在「核心：三源取二」之后；表格管道 3 列配平；check_evals static 28 skill 0 错误。**回滚源**：/var/minis/shared/work/backup-0926c/evidence-discipline/（整目录+MANIFEST.sha256，SKILL.md=dd4ea675）。
+
+<!-- 2026-09-26 19:12:37 -->
+## Trace 缝合成本 A/B 实验判定：H 不成立，trace id 登记不修（2026-09-26）
+
+
+**判定**：预注册规则要求 B 臂 ≥2/3 探针题「更正确」或「猜测 ≤ A 臂一半」。实测两臂探针题**全部满分 23/23、猜测率均为 0**，准确性零差距 → H 不成立 → trace id 降级为登记不修，问题闭环。
+
+**关键数据**：armA（无标记）vs armB（仿真注入完美映射，是**上界**）。窗口 02:09:35–02:11:20，792 行，132,686 字节，两臂唯一差异 = 19 行各追加 ` req=rN`。8 读者 = 4 题 × 2 臂，deepseek-v4-flash temp=0。臂 A 全满分、猜测 0、证据行 66、字符 6922；臂 B 全满分、猜测 0、证据行 57、字符 4197。唯一可测差距是**表述开销（B 少 39% 字符、14% 证据行引用）**——价值主张是「引用更省」不是「答得更准」。
+
+**产物**（`/var/minis/shared/work/trace-ab-0926/`）：PREREGISTRATION.md（预注册，状态已改已判定）、QUESTIONNAIRE.md（题干+ground truth）、armA.txt / armB.txt、readers/*.md（8 答案）、build_arms.py、run_readers.py、score.py、SCOREBOARD.md（计分+判定+教训）。材料备份 `minis/shared/work/trace-ab-backup-0926/`。
+
+**三条真实发现**：
+1. **缺口分两类，不能一概「不可见」**——armA 无 trace id 却全对，靠 `dur`/`started`/`firstContent` 毫秒级数值反推起始时刻闭合了 `stream done`→`offload`→`model` 因果链（`stream done dur=27669ms` → 02:10:15.864−27.669s = 02:09:48.195 → 匹配 offload 行）。缺口「算术可闭合」是可见性已成立、成本转嫁给读者，不是不可见。
+2. **两臂都独立发现了 ground truth 未记的机制**——r1（02:09:35.535 deepseek）失败原因是 LOGCAT 通道 `02:09:36.648 Invalid API key → switching to glm-5.3-flash`，我 GT 只写「无内容产出」记粗了。设计者写 GT 时同样受日志缺口限制。
+3. **worker 日志 613,265 行 100% 是 SSE delta**，无任何请求边界/usage 行，且 `[T321]` 全天单值（不是请求级 id）→ P1/P3 原设计（worker 边界配对）做不出来，改用主日志内的 offload/stream done/first-content 配对。
+
+**方法学教训（已进 evidence-discipline）**：
+- **机械评分必须对格式不敏感**。关键词邻近判定用 `txt.find()` 只取第一次出现位置 → armB 的「汇总表+分段结论」格式时间戳先在表格出现、结论在分段，窗口切在结论之前，P2_B 被评 11/16 vs armA 段落式 16/16，**37% 差距全是格式偏置**。改全位置并集后两臂均 16/16。合格标准：同一答案换格式后分数不变；上线前先做格式扰动测试。
+- **预注册规则要防退化**。A 臂基线为 0（最优值）时「≤ 一半」自动满足且无信息量（0 ≤ 0×½）→ 比较型判据须声明「基线饱和时作废，回退主判据」。
+- **GT 可能比设计者准**：读者答出 GT 外的正确信息时应补正 GT 而非判读者错，补正记录在案。
+
+**evidence-discipline skill 更新**（v1.5.0，备份 `minis/shared/work/backup-0926c/`）：SKILL.md 130→151 行，evals.json 未动。三处：①缺口三态表「缺口不可见」→ 分「算术可闭合 + 真不可见」两类；②日志增强优先级 trace id 降级（原第二 → 第三），补盲区升第二；③新增「评估装置自身的偏置」小节（格式不敏感性 / 规则退化 / GT 可被读者超越）。
+
+**诚实边界**：仿真注入是上界（上界都没测出准确性差距，真实现更不可能）；窗口偏简单（单 session、无并发交错）——**trace id 的真正主场「多 session 归属混淆」未测**；每题单读者无统计功效；8 次调用 6 次首选模型空响应转 fallback（A 2/4、B 2/4，不构成系统性偏差但不完全同质）。
+
+<!-- 2026-09-26 19:17:42 -->
+## §18 churn 用户侧核查闭环（用户确认）：省电策略一直是「无限制」、后台一直锁着 → 厂商策略配置不当假设排除，归
+
+- **§18 churn 用户侧核查闭环（用户确认）**：省电策略一直是「无限制」、后台一直锁着 → 厂商策略配置不当假设排除，归因定案为**设备级内存压力**（与 01:24 am_mem_factor CRITICAL 观测一致）。backlog §18 已改 ✅ 已关闭；唯一可动杠杆 = 三条 agent 负载纪律（GLOBAL.md）。
+- **backlog 盘点（09-26）**：P0/P1 全清零；「停在分支未合并」旧标记经 git merge-base 核实实际都已进 main（§27b ebc5604 / §29 a0413a0e / §33 74613936 / §38A 254ecc7）。剩余活项全是 P2/P3 登记不修带触发条件（§27c-1 T8 未接线最重、§24a throttle、§26 快照命名、§27d、§27i、§30 writeText、§32b、§35、§39、§23c-1、工具执行静默看门狗未进 backlog 文件）。
+
+## 2026-09-27
+
+<!-- 2026-09-27 00:02:06 -->
+## RikkaMinis 观众画像 & 上游情报调查（09-26，用户发起：查关注者/fork 者的关注图谱当"信息富集地"）
+
+
+**产物**：`/var/minis/shared/audience-research-20260926/REPORT.md`（395 行）+ `audience-0926/`（56 份原始 JSON + collect.py/analyze.py/deep1–7.py + report1–8.txt，13M）。
+
+**数据底座**：26 人（20 star + 8 fork owner + 本人）→ 1926 次星标 / **1637 个不重复仓库** / **1201 条公开事件（90 天）** / 共识仓库 175 个。GitHub 只给每人最近 100 条星标 + 90 天事件，所以是"最近半年快照"不是全量。
+
+**核心结论**：
+1. **8 个 fork 里 6 个是零自有 commit 的镜像/构建机**（判定用 commit 作者署名，不是 SHA 也不是 GitHub compare 的 ahead_by）。真贡献者只有 2 个：**Filterrr（200 笔自有 commit，在自己那份 RikkaMinis 上自开自合 55+ PR，90 天 67 条事件，最近 0.4 天前活跃，在做 offload 并发/subagent chat stream/browser 全局 UA/sync version-fold merge）**、**hjhjd（141 笔自有，VCPMinis，VCPToolBox 集成 + Agent 禁用后工具提示词泄漏修复 + SSE 加固 + 终端滚动闪退 + 上下文快照楼层导航，8/7–8/15 密集工作后停止，无公开事件）**。
+2. **三条主线共识度**：AI 客户端 22/26、手机内 Linux 容器跑 AI 20/26、agent skills 打包 20/26、MCP 21/26、逆向 16/26、代理隧道 15/26、RikkaHub 生态 18/26、OpenMinis 生态 18/26。**OpenMinis 是 Swift/iOS-first（★4721）—— RikkaMinis 独占的是它的 Android 半边。**
+3. **三条空位**：A) Minis 生态没有安卓版 skills 军火库（MinisSkills ★426 是 Python 通用版，而 VoltAgent/awesome-agent-skills ★34882、zhaoxuya520/reverse-skill ★37835 的 skills 大包只装桌面 Claude Code，RikkaMinis 有原生 skill 运行时）；B) 手机本地 MCP server 一堆（SOMCP ★188/WebReverseMCP ★68/coding-tools-mcp ★1154）但没人把手机 agent 做成 MCP client 挂它们；C) DSH-APP/DSHA ★655 公开了"完整 Ubuntu + **proroot 零 ptrace 开销** + AI 输出实时上屏 + Shizuku"，值得对着 proot 架构核一次。
+4. **⚠️ 你自己有 3 笔 commit 不在 main 里**（躺在 qq1433161035 / xu17699120551-boop 两个镜像 fork 上，署名 ***OWNER***，2026-08-07）：`a37c537b3` "drop rootfs backup/restore; **wire soul.lang into prompt**"（SoulStore.kt +17/−2 等 5 文件，**全局记忆里记为待办的 soul.lang 写进 prompt 就是它的实现**，同一 commit 还删了 rootfs backup/restore）；`1ec424b21`+`d3f6250e5` "**drive hardware vibrator directly (bypass MIUI)** + 只在前景任务完成时振"（BackgroundTaskNotification.kt 净 +52 行）。是否捞回待用户决定。
+5. **0 外部 PR / 0 issue**（3 个 closed PR 全是你自己的）。不是没意愿（Filterrr 证明有），是没入口：README 首句 "Android personal edition" 传达"我的玩具"，28 个 skills/skill 协议/CF bridge 一个都没写进去；没有 label 系统。
+
+**★ 两个工具坑（值得复用）**：
+1. **GitHub `compare` 端点的 files/ahead_by/behind_by 在这批 fork 上完全不可信** —— 返回 300 文件含 `Makefile.in`/`AEncodeProperties.cpp`/`ACM.cpp`（ffmpeg/LAME 供应商文件），用 `git trees?recursive=1` 逐个验证三个仓库（你 1307/hjhjd 965/qq1433161035 790）**全都没有这些文件**。判定贡献只能用 commit 作者署名。
+2. **"SHA 不在 main 里"是错的判据** —— 抓了 main 800 个 SHA 后仍对不上，因为 fork 历史被 rebase/force-push 过。**改用提交标题（rebase 不变）核验**：先误报"thinking-effort 系列推错远端"（实际已在 main，命中 merge commit `merge fix/thinking-effort-gateway-truth`），按标题核验后撤销；同一把标题尺子反着用，**确认了确实有 3 笔自己的 commit 不在 main 里**。同一把错尺子，方向反着变成真发现。
+3. 副坑：脚本里 `os.path.basename(p)[8:-5]` 猜前缀长度导致 FileNotFoundError（"events_" 是 7 字符）；隐私模式只遮罩输出显示、不改文件本体，别把它当数据损坏。
+
+<!-- 2026-09-27 00:14:50 -->
+## ★ 撤回上一条调查结论中的"soul.lang / 振动 commit 丢失"（09-27，内容级证据定案）
+
+
+上一条记忆条目里"⚠️ 你自己有 3 笔 commit 不在 main 里" **是错的，全部撤回**。三笔全在 main：
+
+- **soul.lang 接线** → main `SoulStore.kt:456` 就是标记 `[T-soul-lang-wire]`，`langDirective` 在 465/504/518 行，与 fork 补丁逐字符一致。commit = `d69c1788f`（2026-08-07 11:00，标题 `feat(sandbox,soul): drop rootfs backup/restore; wire soul.lang into prompt`，`SoulStore.kt +17/−2`）。
+- **绕 MIUI 直接驱动硬件振动** → main `notification/BackgroundTaskNotifier.kt` 有 **25 处 vibrator 命中**（`import android.os.Vibrator`、`[feat-vibrate-task-complete] Direct haptic on completion`）。fork 上类名是 `BackgroundTaskNotification.kt`（无 r），09-09 的 `refactor(pkg): rename com.openminis.app -> com.rikkaminis.app` 顺带改了类名。
+
+**失败机制（两轮都错，值得记住）**：①第一轮用 SHA 匹配（fork 历史被 rebase 过，SHA 对不上）；②第二轮改用提交标题字面匹配 —— 仍错，因为 fork 标题无 `feat(sandbox,soul):` 前缀、且我在 main 侧搜的字面是 `soul.lang` 而 main 提交历史里该字样只出现在一个标题中、我的 needle 写法和实际标题前缀对不上。③**唯一可靠的判据是内容本身**：`git trees/contents?ref=main` 直接拉 main 的文件 grep 标记字符串，不看任何元数据。
+
+**soul.lang 是什么**（用户问的，忘了）：`SOUL.md` frontmatter 的 `lang` 字段（`auto`/`zh`/`en`），控制回复语言。08-07 之前它**只被解析/序列化/在设置页显示，从未进模型系统提示词** —— 在设置里切中文/英文零效果（默认 body 是英文 + 基础提示词默认"跟随用户输入语言"）。08-07 接上后：`zh`→硬指令"Reply in Chinese regardless of the user's input language"，`en` 同理，`auto`→保留跟随用户。当前 `/var/minis/memory/SOUL.md` 是 `lang: "zh"`。副作用：钉死 `zh` 后你用英文提问我仍回中文（除非明说要换语言或改回 auto）。
+
+**所以那份观众调查的真实产出**：2 个真贡献者（Filterrr 200 笔 / hjhjd 141 笔）+ 3 条待验证的机会假设（其中"空位 C"根本不是空位）。零"只有我知道"的发现。报告顶部已加更正框，§5 观察项 A 已标❌推翻，§9 动作表 #3/#6 已划掉。
+
+<!-- 2026-09-27 13:30:47 -->
+## 沙箱生命周期 5 个硬编码常量改为可调 + 内置提示词补全（09-27，用户拍板「5 个一起上、UI 滑条要、范围按建议」）
+
+<!-- 2026-09-27 -->
+**分支** `feat/runtime-sandbox-knobs` @ `a3dc9027`（基 main 8dcb82e8，17 文件 +358/−23），**CI run 36296621337 completed/success + head_sha 逐字符一致 = 停止节点，未合并（合并权在用户）**。
+
+**5 个新 knob**（默认值与原字面量逐字节一致）：`runtime.guestTmpMaxAgeMin`(60, 15..1440)、`guestTmpSweepIntervalSec`(60, 15..600)、`stallNoProgressSec`(180, 0..3600, **0=禁用沿用现有语义**)、`shellIdleTimeoutMin`(10, 2..120)、`heavyGateTimeoutSec`(600, 60..3600)。全部「每轮读」热生效，不用重启。
+
+**边清单（每个 knob 8 处）**：AgentRuntimeLimitsPrefs（KEY+三件套+cache+prime+getter+save）/ ConfigBuiltins 注册（minis-config 通道）/ RuntimeLimitsScreen 新「Sandbox lifecycle」滑条分区（**+12 字符串 ×7 语言**）/ 消费点 4 处（ExecutionCoordinator×3 + MinisApp:865 跨模块调用点 + PersistentShell 默认参数经 PersistentShellStall 的 `stallNoProgressMs()`）。**常量→函数是 API 变化**：`IDLE_SWEEP_INTERVAL_MS`→`idleSweepIntervalMs()`，旧常量名全仓 grep 清零（含 test，测试里 `STALL_NO_PROGRESS_MS` 引用已改为字面量 180_000L）。
+
+**内置提示词**（ChatPromptAndTools.kt，落 sandbox persistence layers 段后）：Guest /tmp lifecycle（age gate + 活动探测 + `.minis-keep` + shared/work 约定 + stall-guard 长等待事实）+ Sandbox gotchas（BusyBox grep --include 静默失败、PRoot 跨文件系统 mv 损坏 .git/objects、app 进程负载纪律）。
+
+**证据（三源）**：scan.sh 20/20；i18n deep check CLEAN（1488 keys ×7 语言，values=values-de/ja/ko/ru/zh/zh-rTW）；**JVM 装置 /var/minis/shared/work/jvm-rtknobs 4/4**（真源码 sha256 对账一致；round-trip：prime 载入/越界钳制/写穿/单 knob 隔离；**变异 STALL_MIN_SEC 0→10 杀红 3 条，还原复绿**）。装置复用要点：`AgentRuntimeLimitsPrefs.save()`（不是 set！）+ Context 桩需 `companion object { const val MODE_PRIVATE = 0 }`；kotlinc 报错会被 `grep -v '^warning:' || true` 吞掉，首次跑必须看未过滤输出。
+
+**装包验证点**：①设置→运行时限制出现「沙箱生命周期」分区 5 条滑条（默认 60/60/180/10/600，中文文案）；②stall 调 0 后长命令不再被 180s 杀；③minis-config get/set runtime.guestTmpMaxAgeMin 可用；④新会话子代理自检 base prompt 出现 Guest /tmp lifecycle 段。
+
+**登记不做**（第三梯队）：OffloadRssProbe 三个内存治理阈值（64MB/256MB/1GiB，设备内存差异大理论该可调，但调错直接 OOM 且无触发证据——升级触发=出现误触发/漏触发报告）；PROOT_MEM_POLL_MS、RootfsEventLog MAX_BYTES、ToolFailureHook DEDUPE_WINDOW、OnDemandBash INSTALL_BUDGET_MS、STALL_INT_GRACE_MS、活动探测 DEPTH/ENTRIES。**疑似不一致待核查**：TerminalSanitizer.DEFAULT_OUTPUT_CAP_BYTES=50_000 vs 已可调 SHELL_OUTPUT_KB=128KB（是核查项不是 knob 项）。
+
+<!-- 2026-09-27 13:33:51 -->
+## feat/runtime-sandbox-knobs 核查 + 双分支合并 main = 37c188ec（09-27，用户「没问题就合并」+「触发了就不用再等」）
+
+
+**核查对象**：远端 `feat/runtime-sandbox-knobs` @ `a3dc9027136b`（1 commit，17 文件 +358/−23，基点 8dcb82e8，别处会话今天 13:13 推送）。改动 = 5 个硬编码沙箱常量变可调 knob：guestTmpMaxAgeMin 60(15..1440)、guestTmpSweepIntervalSec 60(15..600)、stallNoProgressSec 180(0..3600，0 禁用)、shellIdleTimeoutMin 10(2..120)、heavyGateTimeoutSec 600(60..3600)——默认逐字节等于被替换字面量；接线走既有 runtime.* knob 路径（AgentRuntimeLimitsPrefs 键+边界+cache+prime+getter+save、ConfigBuiltins 注册、RuntimeLimitsScreen 滑条组 +12 字符串 ×7 语言、消费点 ExecutionCoordinator×3 + MinisApp sweep 循环 + PersistentShell 默认参数）；顺带内置提示词新增 guest /tmp 生命周期 + stall 窗口 + 2 条沙箱 gotcha。
+
+**8 项核查全过，零缺陷**：①diff 712 行逐行读完，无可疑行；②调用点：5 个旧常量（IDLE_SWEEP_INTERVAL_MS/SHELL_IDLE_TIMEOUT_MS/GUEST_TMP_MAX_AGE_MS/HEAVY_GATE_TIMEOUT_MS/STALL_NO_PROGRESS_MS）grep 全仓零残留（只剩测试注释文字），新函数调用点全对（idleSweepIntervalMs→MinisApp 唯一消费方、shellIdleTimeoutMs、stallNoProgressMs→PersistentShell 默认参数每次调用求值）；③scan 20/20；④scan_debt 1 条 no-trigger = 扫描器 3 行窗口假阳性（MinisApp:226 ponytail 三段齐全）；⑤i18n 1488 keys ×7 CLEAN；⑥four-way ✅；⑦独立证据 = 跨层接线 JVM 装置 `/var/minis/shared/work/verify-knobs-0927/`（真源码 sha256 对账 49bb3713/67fbf96d）4/4：**默认值在消费方单位下逐字节等于旧字面量（3600000/60000/600000/600000/180000）+ knob 设 0 → stallNoProgressMs()==0 → internalIsStalled 恒 false（0 禁用端到端）+ 变异（函数体写死 180_000）杀 3 红 + 还原复绿**；⑧CI run 36296621337 completed/success + head_sha 逐字符一致（bridge + API 双源）。
+
+**合并收口**：远端 main 无前进（仍 8dcb82e8）→ rkm 克隆 `--no-ff` 合并 = **222c4b3f**（零冲突，合并树与分支 tip 逐字节一致 + scan 20/20 复跑）→ push（8dcb82e8..222c4b3f）→ ls-remote 逐字符一致 → 删远端分支（204）。**release CI run 36297467026 @ 222c4b3f push 自动触发（in_progress）——用户拍板「触发了就不用再等」**，未等结论。
+
+**顺带合并 docs/dev-history-0926**（用户「把他们合并了」复数授权；纯 3 md +397/−29，昨天已核查，fences 56 偶数/无冲突标记）：--no-ff = **37c188ec** → push → ls-remote 一致 → 删远端分支（204，docs/ 不在 build-apk.yml paths，未触发新 CI）。远端只剩 main = 37c188ec。
+
+**登记不修（P3 观察）**：①stallNoProgressSec 上限 3600 > 默认命令超时 900——设 >900 时 stall guard 实际永远不先触发（命令超时先到），仅当用户同步调大 shellTimeoutSec 才有意义，是 knob 组合边界非缺陷；②UI 滑条 valueLabel 无单位（desc 里有）；③rkm-rt 本地分支未清（远端已删，无影响）。
+
+**工具坑（新）**：verify_branch.sh 显式 base 只认**本地可解析 ref**——单分支克隆无本地 main 时传 `main` 报"基线无法解析"，须传 `origin/main` 或完整 sha。
+
+<!-- 2026-09-27 14:20:36 -->
+## 核查远端分支 fix/ime-auto-popup-on-overlay-close @ 2ad79408（09-27，用户「检查一下云端上的那个分支」）
+
+
+**机械项全过**：verify_branch.sh exit 0（核对时刻 06:19:09Z）——冲突标记 0、scan.sh **20/20**、four-way `✅ All four layers consistent`、i18n AUTO-SKIP（无 strings.xml）、CI run **36299043812 @ 2ad794081b8c completed/success**（workflow_dispatch，06:18:24Z）。diff 57 行（2 文件 +34/−1），逐行读完。
+
+**改动**：①AndroidManifest MainActivity `adjustResize` → `adjustResize|stateAlwaysHidden`（全仓唯一 windowSoftInputMode）；②ChatScreen.kt 新增 `anyOverlayOpen` 派生（16 个可见性 state 手工枚举）+ `LaunchedEffect(anyOverlayOpen)` → `keyboardController?.hide(); focusManager.clearFocus()`。既有 drawer 守卫（1953 行）同型；`keyboardController`/`focusManager` 声明 356/357 早于使用 ✅；覆盖层内部（BrowserSheet/InputHistorySheet/ModelPickerSheet/SessionEditSheet 等）**均无** requestFocus → clearFocus 无副作用 ✅。
+
+**审计发现（登记不修）**：①**P2** 覆盖集不完备——`previewImageGallery`(→ImageGalleryViewer `Dialog`,1753/4966)、`previewVideoFile`(→MinisFullscreenVideoPlayer `Dialog`,1763/4978)、`webAppSheetTarget`(→AddToHomeSheet `ModalBottomSheet`,1766/4988) 三个**顶层** state 未纳入，且 ponytail 天花板清单未声明（与注释自称「集合=本函数顶层可见性状态」矛盾）；②**P3** 注释错误：`Mirrors the history-drawer guard above` 实际在**下方**（1953>1688），且机制不同（drawer 守卫防「键盘遮挡」/本改动防「关闭时焦点恢复」）；③**P3** `MoveToSessionSheet`（ModalBottomSheet，ChatInputArea:1892 `showMoveSheet`）未覆盖未点名。属「抽象集手工枚举」型缺口——下次同类问题的通用教训：**枚举型守卫的完备性必须用脚本对照渲染点全集**，不能靠肉眼。
+
+**项 7 诚实边界**：本改动唯一效果就是行为 → 沙箱无 SDK/设备，**行为证据不可得 ⇒ 本次核查不构成合并批准**。真机验证 3 点：①覆盖层关闭后键盘不再弹回（原报场景）；②**点击输入框仍能弹键盘**（manifest 全局改动=最大回归面）；③进出会话/回前台键盘行为正常。
+
+**独立证据**（新装置，可复用）：`/var/minis/shared/work/verify-ime-0927/`（REPORT.md + `overlay_audit.py` 覆盖层完备性枚举：24 渲染点→真未覆盖 3 + `ime_trace.py` IME 时序对齐：09-27 全天 76 次 onRequestShow **全 fromUser=false**、6 条前置 `deleteSurroundingText on inactive InputConnection`）。**`overlay_audit.py` 值得复用**：从任意 Compose 屏枚举 sheet/dialog 渲染点+守卫，对照守卫表达式集合，机械抓「枚举漏项」。注意其假阴性模式：守卫取自派生变量（selectedToolBlock）或隔 >12 行（ModelPickerSheet）时需人工纠正。
+
+<!-- 2026-09-27 14:22:36 -->
+## 键盘意外弹出修复（09-27，分支 CI 绿 = 停止节点，未合并）
+
+**根因（代码级 + AOSP 源码双证据）**：ModalBottomSheet/Dialog 是独立 focusable window——打开时主 window 失焦、关闭时重获焦点，焦点回到 composer 的 TextField → TextField 重获焦点即请求 IME → 键盘自动弹（用户症状：「点开工具详情看运行，退出来键盘弹出」）。Material3 弹层 window 只设 `SOFT_INPUT_ADJUST_NOTHING`（不设 state 部分），IME 显隐由主窗口 softInputMode 的 state 决定。
+**改动（分支 `fix/ime-auto-popup-on-overlay-close` @ `2ad79408`，2 文件 +34/−1）**：
+1. ChatScreen.kt:1687-1698 新增 `anyOverlayOpen` 聚合（13 个覆盖层可见性状态：sheet×9 + 两对话框 + 工具详情 + 浏览器 + 编辑会话 + URL/HTML 预览）+ `LaunchedEffect(anyOverlayOpen) { hide + clearFocus }` —— 照抄抽屉既有模式（historyDrawerState.targetValue 那段）
+2. AndroidManifest.xml:177 `adjustResize` → `adjustResize|stateAlwaysHidden` —— AOSP attrs.xml 原文：「Always make the soft input area hidden when this window has input focus」（stateAlwaysHidden=3，对照 stateHidden=2 只在导航进入时隐藏）
+**验证**：scan.sh 20/20；括号差值成对；diff 无夹带；CI run 36299043812 completed/success + head_sha 2ad79408 逐字符一致；AOSP 源码独立于 CI 的证据。**诚实边界**：沙箱无 Android SDK，真机未验证（真机验证点：①打字后开工具详情退出 → 不弹；②切 app 回来 → 不弹；③主动点输入框照常弹）。
+**已登记边界（代码内 ponytail 三段）**：OffloadPermissionDialog（自持状态）与 pendingNonTextSelection（深作用域 state）未聚合，二者关闭后仍可能弹回键盘——升级触发=用户报告这两处。
+**待用户决策**：合并 main（合并权在用户）；斜杠菜单/键盘入口的更大简化（用户说范围太大，收回，只做本修复）。
+
+<!-- 2026-09-27 14:40:32 -->
+## 修 IME 守卫覆盖缺口 → fix/ime-overlay-focus-coverage @ 63f45fa0（09-27，用户「既然发现的问题，那就修一下吧」）
+
+
+**分支**：`fix/ime-overlay-focus-coverage` @ `63f45fa0`（**基于 2ad79408** = 被核查的分支，1 commit，3 文件 +81/−32）。CI run **36300034090 @ 63f45fa04d31 completed/success**（workflow_dispatch，06:39:00Z）= **停止节点，未合并**。给用户的合并提示：合这一个分支即含旧分支全部内容（旧分支可删）。
+
+**改了 4 处**：①守卫块从 `htmlPreviewFullscreen` 后**下移到 `webAppSheetTarget` 后**——三个预览 state 声明在下方，原位置引用不到（Kotlin 局部先声明后用），这是原改动漏项的**结构性原因**；②`anyOverlayOpen` 补 4 项：`previewImageGallery`/`previewVideoFile`/`webAppSheetTarget`/`pendingOffloadRequest`（注意：OffloadPermissionDialog 的真实可见性来源是 `OffloadPermissionManager.**pendingRequest**`，不是 `pendingAndroidPermission`）；③抽共享 `ImeOverlayGuard.kt: DismissImeWhileOverlayOpen(Boolean)`，ChatScreen:1772 与 ChatInputArea:349（`showMoveSheet`→MoveToSessionSheet）共用一份；④注释修正（drawer 守卫在**下方**、解决的是「键盘遮挡」非焦点恢复）+ ponytail 三段重排。
+
+**验证**：scan 20/20、scan_debt **1→0 no-trigger**、括号配平 delta 对称（−1/−1、−2/−2、+1/+1 与 +3/+3、+1/+1）、冲突标记 0；**对照臂**（overlay_audit.py）修复前 3 处真未覆盖 → 修复后 `ImageGalleryViewer`/`MinisFullscreenVideoPlayer`/`AddToHomeSheet` **全 IN ✅**（剩 4 条 OUT 为脚本次级守卫假阴性，已人工逐条甄别）。
+
+**★ 自我更正（重要教训）**：上一轮我把 scan_debt 的 no-trigger 判为「扫描器 3 行窗口假阳性」——**错**。实测 `scan_debt.py:93` 窗口 = 标记行 + 后 2 行（`lines[i:i+3]`），原注释把「升级触发」写在第 4 行 → **扫描器判定正确，是我甄别错**（verify_branch.sh 提示文字里的「3 行窗口假阳性已知」把我带偏了）。修法：ponytail/升级触发/天花板 三段压进 3 行窗口。**通用教训：门报红先读门的实现再谈假阳性；「已知假阳性」的提示文字本身会制造假阳性式辩护**。
+
+**装置坑（新）**：审计脚本 overlay_audit.py 的表达式提取终止条件原写「行尾是 null」→ 被审计的表达式变长后提前截断，**修复前后读数完全一样**（对照臂自己的偏置被对照臂暴露）。修法：终止条件改为「行不以 `||` 结尾」。**凡「改前改后读数相同」的对照臂，先怀疑装置口径**。
+
+**仍未闭环**：行为证据（沙箱无设备）。真机验证三点：①覆盖层关闭后键盘不再弹回；②**点击输入框仍能弹键盘**（manifest `stateAlwaysHidden` 全局改动=最大回归面）；③进出会话/回前台键盘行为正常。
+
+<!-- 2026-09-27 14:42:18 -->
+## 合并收口：fix/ime-overlay-focus-coverage → main = `aeffcef9`（09-27，用户「合并吧」+「触发了就不用等了」）
+
+
+**流程**：私有克隆 `rkm-ime-0927`（`git clone --no-hardlinks`，PRoot 不支持硬链接 → `--local` 报 `failed to create link ... Operation not permitted`）→ `fetch origin main` 确认无前进（仍 `37c188ec`）→ `checkout -B main origin/main` → **`--no-ff` merge = `aeffcef9`**（零冲突，4 文件 +83/−1，含新文件 ImeOverlayGuard.kt）→ 合并树与分支 tip `63f45fa0` 逐字节一致（`git diff main <branch>` 空）+ scan 复跑 **20/20** + 冲突标记 0 + `merge-base --is-ancestor` 双 YES（63f45fa0 / 2ad79408）→ push `37c188ec..aeffcef9` → ls-remote 逐字符一致 → **API DELETE 两个远端分支各 204**（fix/ime-overlay-focus-coverage、fix/ime-auto-popup-on-overlay-close，后者被前者包含故一并清理）→ 远端只剩 main。
+
+**release CI**：push 自动触发 run **36300853398 @ aeffcef9**（in_progress，06:41:49Z）——**用户拍板「触发了就不用等了」，未等结论**。
+
+**装包验证点（真机）**：①覆盖层（工具详情/图片预览/全屏视频/加入桌面/移动会话/offload 权限框）关闭后键盘不再弹回；②**点击输入框仍能弹键盘**（manifest `stateAlwaysHidden` 是全局改动 = 最大回归面）；③进出会话、回前台的键盘行为正常；④新抽的 `DismissImeWhileOverlayOpen` 两处宿主行为一致。
+
+**工具坑**：`verify_branch.sh` 显式 base 用分支名在私有克隆里报「基线无法解析」（clone 只建 HEAD 那个本地分支，main 只在 origin/main）→ 传完整 sha `37c188ecf09c...` 通过（复发记忆里那条坑）。
 
 ---
 
