@@ -1666,6 +1666,39 @@ fun ChatScreen(
     }
     var htmlPreviewFallbackTitle by remember { mutableStateOf("") }
     var htmlPreviewFullscreen by remember { mutableStateOf(false) }
+
+    // [fix/ime-auto-popup-on-overlay-close] Overlays that own their own window
+    // (ModalBottomSheet / Dialog) install a focus restorer: they record the
+    // focused node when they open and hand focus back when they dismiss. The
+    // composer's TextField requests the IME the moment it regains focus, so an
+    // overlay opened while the keyboard was up pops the keyboard back up on
+    // dismiss — the reported "open a tool to watch it run, close it, and the
+    // keyboard appears" loop. Clearing the composer focus the instant an
+    // overlay opens leaves nothing for the restorer to hand back. Mirrors the
+    // history-drawer guard above (the LaunchedEffect on
+    // historyDrawerState.targetValue), which solves the same problem for the
+    // drawer by clearing focus as it opens.
+    //
+    // ponytail: 覆盖层集合是「本函数顶层可见的可见性状态」手工枚举，没有注册表。
+    // 天花板: OffloadPermissionDialog（自持状态）与 pendingNonTextSelection
+    // （更深作用域的局部 state）不在此列，二者关闭后仍可能弹回键盘。
+    // 升级触发: 用户报告这两处、或任何新加的覆盖层关闭后键盘弹出 → 把它的可见性
+    // 状态提升到本函数顶层并加进 anyOverlayOpen。
+    val toolDetailIdForIme by viewModel.selectedToolDetailId.collectAsState()
+    val anyOverlayOpen = showModelPicker || showThinkingLevelSheet ||
+        showInputHistorySheet || showSkillsSheet || showMcpsSheet ||
+        showTokenUsageSheet || showExportFormatSheet || showClearChatDialog ||
+        showEnhancedCacheDialog || showContextExhaustedDialog ||
+        showMemorySheet || showBrowserSheet ||
+        toolDetailIdForIme != null || editingSession != null ||
+        previewUrl != null || htmlPreviewHolder != null
+    LaunchedEffect(anyOverlayOpen) {
+        if (anyOverlayOpen) {
+            keyboardController?.hide()
+            focusManager.clearFocus()
+        }
+    }
+
     val appCtx = context.applicationContext
     val openHtmlPreview = remember<(java.io.File, String) -> Unit>(appCtx) {
         { file, title ->

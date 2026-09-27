@@ -174,7 +174,7 @@
             android:exported="true"
             android:launchMode="singleTask"
             android:theme="@style/Theme.Minis"
-            android:windowSoftInputMode="adjustResize">
+            android:windowSoftInputMode="adjustResize|stateAlwaysHidden">
             <!-- minis:// deep-link filter. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
