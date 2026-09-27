@@ -207,6 +207,10 @@ class ChatViewModelMessageParserTest {
         sortOrder = 0,
     )
 
+    @Test fun `parseRows empty input returns empty list`() {
+        assertEquals(emptyList<ParsedRow>(), parseRows(emptyList()))
+    }
+
     @Test fun `parseRows parses each entity once with correct metadata`() {
         val good = JSONArray().put(textPart("hi"))
         val rows = parseRows(

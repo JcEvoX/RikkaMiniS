@@ -508,6 +508,13 @@ class ThinkTagExtractionTest {
     }
 
     @Test
+    fun `unicode before orphan closer does not shift source indices`() {
+        // U+0130 lowercases to two code points. Matching through a separately
+        // lowercased buffer would use the wrong source index and leave `İ<`.
+        assertEquals("İx", stripOrphanThinkClosers("İ</thinking>x"))
+    }
+
+    @Test
     fun `case insensitive and bracket aliases are dropped when orphaned`() {
         for (t in listOf("</THINKING>", "</Think>", "</Reasoning>", "[/think]", "[/reasoning]", "</Thought>", "</analysis>")) {
             assertEquals("closer=$t", "x", stripOrphanThinkClosers("x$t"))
