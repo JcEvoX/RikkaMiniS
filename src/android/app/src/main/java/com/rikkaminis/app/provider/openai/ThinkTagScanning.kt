@@ -274,11 +274,12 @@ internal fun scanThinkTags(
  */
 internal fun stripOrphanThinkClosers(text: String): String {
     if (text.isEmpty()) return text
-    val lower = text.lowercase()
     // Cheap pre-filter: every close token in THINK_TAG_FORMATS starts with one
     // of these two prefixes, so the per-character pass is skipped for the
     // overwhelming majority of rows (this runs on every session load).
-    if (lower.indexOf("</") == -1 && lower.indexOf("[/") == -1) return text
+    // Keep matching against `text` below: lowercasing can expand a Unicode
+    // code point (for example `İ`), which would shift indices into the source.
+    if (text.indexOf("</") == -1 && text.indexOf("[/") == -1) return text
     val out = StringBuilder(text.length)
     var ticks = 0
     var openersSeen = 0
@@ -294,16 +295,16 @@ internal fun stripOrphanThinkClosers(text: String): String {
         var matched = false
         if (ticks % 2 == 0) {
             for (fmt in THINK_TAG_FORMATS) {
-                val open = fmt.open.lowercase()
-                if (open.isNotEmpty() && lower.startsWith(open, i)) {
+                val open = fmt.open
+                if (open.isNotEmpty() && text.regionMatches(i, open, 0, open.length, ignoreCase = true)) {
                     openersSeen++
                     out.append(text, i, i + open.length)
                     i += open.length
                     matched = true
                     break
                 }
-                val close = fmt.close.lowercase()
-                if (close.isNotEmpty() && lower.startsWith(close, i)) {
+                val close = fmt.close
+                if (close.isNotEmpty() && text.regionMatches(i, close, 0, close.length, ignoreCase = true)) {
                     if (openersSeen > 0) out.append(text, i, i + close.length)
                     i += close.length
                     matched = true

@@ -375,7 +375,7 @@ jobs:
       # tab; only `main` may replace the official download asset.
       - name: Publish to Releases
         if: github.ref == 'refs/heads/main'
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
           tag_name: android-latest
           name: "RikkaMinis Android v${{ steps.stage.outputs.version }}"
