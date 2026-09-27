@@ -239,6 +239,47 @@ object AgentRuntimeLimitsPrefs {
     // explicit value). The knob now feeds that optInt fallback directly.
     const val SHELL_TIMEOUT_DEFAULT_SEC = 900
 
+    // ── [feat/runtime-sandbox-knobs] Sandbox lifecycle knobs ─────────────
+    // Previously hard-coded literals in ExecutionCoordinator /
+    // PersistentShellStall; every default reproduces its literal exactly, so
+    // an untouched install behaves identically to the pre-panel build.
+    const val KEY_GUEST_TMP_MAX_AGE_MIN = "guestTmpMaxAgeMin"
+    const val KEY_GUEST_TMP_SWEEP_INTERVAL_SEC = "guestTmpSweepIntervalSec"
+    const val KEY_STALL_NO_PROGRESS_SEC = "stallNoProgressSec"
+    const val KEY_SHELL_IDLE_TIMEOUT_MIN = "shellIdleTimeoutMin"
+    const val KEY_HEAVY_GATE_TIMEOUT_SEC = "heavyGateTimeoutSec"
+
+    // Guest-rootfs /tmp sweep: how old an entry must be before the sweeper may
+    // delete it. Guest /tmp is a tmpfs, so raising this keeps transient data in
+    // RAM longer — the ceiling stays one day.
+    const val GUEST_TMP_MAX_AGE_MIN_MIN = 15
+    const val GUEST_TMP_MAX_AGE_MAX_MIN = 1440
+    const val GUEST_TMP_MAX_AGE_DEFAULT_MIN = 60
+
+    // Sweep cadence shared by idle-shell recycling and guest /tmp pruning
+    // (MinisApp drives its loop with this interval).
+    const val GUEST_TMP_SWEEP_INTERVAL_MIN_SEC = 15
+    const val GUEST_TMP_SWEEP_INTERVAL_MAX_SEC = 600
+    const val GUEST_TMP_SWEEP_INTERVAL_DEFAULT_SEC = 60
+
+    // No-progress window before the stall guard aborts a command. 0 disables
+    // the guard entirely (internalIsStalled treats a non-positive threshold as
+    // "no guard") — a deliberate escape hatch, not a bug.
+    const val STALL_NO_PROGRESS_MIN_SEC = 0
+    const val STALL_NO_PROGRESS_MAX_SEC = 3600
+    const val STALL_NO_PROGRESS_DEFAULT_SEC = 180
+
+    // Idle time after which a shell is recycled to release its PRoot footprint.
+    const val SHELL_IDLE_TIMEOUT_MIN_MIN = 2
+    const val SHELL_IDLE_TIMEOUT_MAX_MIN = 120
+    const val SHELL_IDLE_TIMEOUT_DEFAULT_MIN = 10
+
+    // How long a HEAVY command waits for the global heavy gate before being
+    // reported as "another heavy command is still running".
+    const val HEAVY_GATE_TIMEOUT_MIN_SEC = 60
+    const val HEAVY_GATE_TIMEOUT_MAX_SEC = 3600
+    const val HEAVY_GATE_TIMEOUT_DEFAULT_SEC = 600
+
     // ── primed cache ─────────────────────────────────────────────────────
 
     @Volatile private var cachedMaxTurns = TURNS_DEFAULT
@@ -276,6 +317,11 @@ object AgentRuntimeLimitsPrefs {
     @Volatile private var cachedBrowserScreenshotQ = BROWSER_SCREENSHOT_Q_DEFAULT
     @Volatile private var cachedShellOutputKb = SHELL_OUTPUT_KB_DEFAULT
     @Volatile private var cachedShellTimeoutSec = SHELL_TIMEOUT_DEFAULT_SEC
+    @Volatile private var cachedGuestTmpMaxAgeMin = GUEST_TMP_MAX_AGE_DEFAULT_MIN
+    @Volatile private var cachedGuestTmpSweepIntervalSec = GUEST_TMP_SWEEP_INTERVAL_DEFAULT_SEC
+    @Volatile private var cachedStallNoProgressSec = STALL_NO_PROGRESS_DEFAULT_SEC
+    @Volatile private var cachedShellIdleTimeoutMin = SHELL_IDLE_TIMEOUT_DEFAULT_MIN
+    @Volatile private var cachedHeavyGateTimeoutSec = HEAVY_GATE_TIMEOUT_DEFAULT_SEC
     @Volatile private var primed = false
 
     private fun prefs(context: Context): SharedPreferences =
@@ -350,6 +396,17 @@ object AgentRuntimeLimitsPrefs {
             .coerceIn(SHELL_OUTPUT_KB_MIN, SHELL_OUTPUT_KB_MAX)
         cachedShellTimeoutSec = p.getInt(KEY_SHELL_TIMEOUT_SEC, SHELL_TIMEOUT_DEFAULT_SEC)
             .coerceIn(SHELL_TIMEOUT_MIN_SEC, SHELL_TIMEOUT_MAX_SEC)
+        cachedGuestTmpMaxAgeMin = p.getInt(KEY_GUEST_TMP_MAX_AGE_MIN, GUEST_TMP_MAX_AGE_DEFAULT_MIN)
+            .coerceIn(GUEST_TMP_MAX_AGE_MIN_MIN, GUEST_TMP_MAX_AGE_MAX_MIN)
+        cachedGuestTmpSweepIntervalSec = p.getInt(
+            KEY_GUEST_TMP_SWEEP_INTERVAL_SEC, GUEST_TMP_SWEEP_INTERVAL_DEFAULT_SEC
+        ).coerceIn(GUEST_TMP_SWEEP_INTERVAL_MIN_SEC, GUEST_TMP_SWEEP_INTERVAL_MAX_SEC)
+        cachedStallNoProgressSec = p.getInt(KEY_STALL_NO_PROGRESS_SEC, STALL_NO_PROGRESS_DEFAULT_SEC)
+            .coerceIn(STALL_NO_PROGRESS_MIN_SEC, STALL_NO_PROGRESS_MAX_SEC)
+        cachedShellIdleTimeoutMin = p.getInt(KEY_SHELL_IDLE_TIMEOUT_MIN, SHELL_IDLE_TIMEOUT_DEFAULT_MIN)
+            .coerceIn(SHELL_IDLE_TIMEOUT_MIN_MIN, SHELL_IDLE_TIMEOUT_MAX_MIN)
+        cachedHeavyGateTimeoutSec = p.getInt(KEY_HEAVY_GATE_TIMEOUT_SEC, HEAVY_GATE_TIMEOUT_DEFAULT_SEC)
+            .coerceIn(HEAVY_GATE_TIMEOUT_MIN_SEC, HEAVY_GATE_TIMEOUT_MAX_SEC)
         primed = true
     }
 
@@ -416,6 +473,28 @@ object AgentRuntimeLimitsPrefs {
     fun shellTimeoutSec(): Int = cachedShellTimeoutSec
 
     /**
+     * [feat/runtime-sandbox-knobs] Guest /tmp sweep: minimum entry age before
+     * deletion, in minutes. Read at sweep time, so an edit applies on the next
+     * sweep without a restart.
+     */
+    fun guestTmpMaxAgeMin(): Int = cachedGuestTmpMaxAgeMin
+
+    /** [feat/runtime-sandbox-knobs] Sweep cadence for idle-shell recycling + guest /tmp pruning, in seconds. */
+    fun guestTmpSweepIntervalSec(): Int = cachedGuestTmpSweepIntervalSec
+
+    /**
+     * [feat/runtime-sandbox-knobs] No-progress window before the stall guard
+     * aborts a command, in seconds. 0 disables the guard.
+     */
+    fun stallNoProgressSec(): Int = cachedStallNoProgressSec
+
+    /** [feat/runtime-sandbox-knobs] Idle time after which a shell is recycled, in minutes. */
+    fun shellIdleTimeoutMin(): Int = cachedShellIdleTimeoutMin
+
+    /** [feat/runtime-sandbox-knobs] How long a HEAVY command waits for the global heavy gate, in seconds. */
+    fun heavyGateTimeoutSec(): Int = cachedHeavyGateTimeoutSec
+
+    /**
      * Transient auto-retry delays in seconds, derived from the retry count.
      * Historical fixed sequence was 1/2/4s for 3 retries; the derivation
      * keeps those exact values at the default count and extends the same
@@ -464,6 +543,11 @@ object AgentRuntimeLimitsPrefs {
         browserScreenshotQuality: Int? = null,
         shellOutputKb: Int? = null,
         shellTimeoutSec: Int? = null,
+        guestTmpMaxAgeMin: Int? = null,
+        guestTmpSweepIntervalSec: Int? = null,
+        stallNoProgressSec: Int? = null,
+        shellIdleTimeoutMin: Int? = null,
+        heavyGateTimeoutSec: Int? = null,
     ) {
         val p = prefs(context)
         val e = p.edit()
@@ -584,6 +668,28 @@ object AgentRuntimeLimitsPrefs {
         shellTimeoutSec?.let {
             cachedShellTimeoutSec = it.coerceIn(SHELL_TIMEOUT_MIN_SEC, SHELL_TIMEOUT_MAX_SEC)
             e.putInt(KEY_SHELL_TIMEOUT_SEC, cachedShellTimeoutSec)
+        }
+        guestTmpMaxAgeMin?.let {
+            cachedGuestTmpMaxAgeMin = it.coerceIn(GUEST_TMP_MAX_AGE_MIN_MIN, GUEST_TMP_MAX_AGE_MAX_MIN)
+            e.putInt(KEY_GUEST_TMP_MAX_AGE_MIN, cachedGuestTmpMaxAgeMin)
+        }
+        guestTmpSweepIntervalSec?.let {
+            cachedGuestTmpSweepIntervalSec = it.coerceIn(
+                GUEST_TMP_SWEEP_INTERVAL_MIN_SEC, GUEST_TMP_SWEEP_INTERVAL_MAX_SEC
+            )
+            e.putInt(KEY_GUEST_TMP_SWEEP_INTERVAL_SEC, cachedGuestTmpSweepIntervalSec)
+        }
+        stallNoProgressSec?.let {
+            cachedStallNoProgressSec = it.coerceIn(STALL_NO_PROGRESS_MIN_SEC, STALL_NO_PROGRESS_MAX_SEC)
+            e.putInt(KEY_STALL_NO_PROGRESS_SEC, cachedStallNoProgressSec)
+        }
+        shellIdleTimeoutMin?.let {
+            cachedShellIdleTimeoutMin = it.coerceIn(SHELL_IDLE_TIMEOUT_MIN_MIN, SHELL_IDLE_TIMEOUT_MAX_MIN)
+            e.putInt(KEY_SHELL_IDLE_TIMEOUT_MIN, cachedShellIdleTimeoutMin)
+        }
+        heavyGateTimeoutSec?.let {
+            cachedHeavyGateTimeoutSec = it.coerceIn(HEAVY_GATE_TIMEOUT_MIN_SEC, HEAVY_GATE_TIMEOUT_MAX_SEC)
+            e.putInt(KEY_HEAVY_GATE_TIMEOUT_SEC, cachedHeavyGateTimeoutSec)
         }
         e.apply()
     }

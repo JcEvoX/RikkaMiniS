@@ -541,9 +541,9 @@ class PersistentShell(
         /**
          * [fix/memory-hardening-stall] Abort the command when it shows no
          * progress (no output AND no CPU in its process tree) for this long.
-         * <= 0 disables the guard. See [STALL_NO_PROGRESS_MS].
+         * <= 0 disables the guard. See [stallNoProgressMs].
          */
-        stallAfterMs: Long = STALL_NO_PROGRESS_MS,
+        stallAfterMs: Long = stallNoProgressMs(),
     ): CommandResult {
         ensureStarted()
 

@@ -117,6 +117,12 @@ fun RuntimeLimitsScreen(onBack: () -> Unit) {
     var browserScreenshotQuality by remember { mutableStateOf(AgentRuntimeLimitsPrefs.browserScreenshotQuality()) }
     var shellOutputKb by remember { mutableStateOf(AgentRuntimeLimitsPrefs.shellOutputKb()) }
     var shellTimeoutSec by remember { mutableStateOf(AgentRuntimeLimitsPrefs.shellTimeoutSec()) }
+    // [feat/runtime-sandbox-knobs] Sandbox lifecycle group.
+    var guestTmpMaxAgeMin by remember { mutableStateOf(AgentRuntimeLimitsPrefs.guestTmpMaxAgeMin()) }
+    var guestTmpSweepIntervalSec by remember { mutableStateOf(AgentRuntimeLimitsPrefs.guestTmpSweepIntervalSec()) }
+    var stallNoProgressSec by remember { mutableStateOf(AgentRuntimeLimitsPrefs.stallNoProgressSec()) }
+    var shellIdleTimeoutMin by remember { mutableStateOf(AgentRuntimeLimitsPrefs.shellIdleTimeoutMin()) }
+    var heavyGateTimeoutSec by remember { mutableStateOf(AgentRuntimeLimitsPrefs.heavyGateTimeoutSec()) }
 
     // [FIX-6 / F-241] Re-read every snapshot when the backing prefs change
     // OUTSIDE this screen — `minis-config set runtime.*` (ConfigBuiltins
@@ -172,6 +178,11 @@ fun RuntimeLimitsScreen(onBack: () -> Unit) {
             browserScreenshotQuality = AgentRuntimeLimitsPrefs.browserScreenshotQuality()
             shellOutputKb = AgentRuntimeLimitsPrefs.shellOutputKb()
             shellTimeoutSec = AgentRuntimeLimitsPrefs.shellTimeoutSec()
+            guestTmpMaxAgeMin = AgentRuntimeLimitsPrefs.guestTmpMaxAgeMin()
+            guestTmpSweepIntervalSec = AgentRuntimeLimitsPrefs.guestTmpSweepIntervalSec()
+            stallNoProgressSec = AgentRuntimeLimitsPrefs.stallNoProgressSec()
+            shellIdleTimeoutMin = AgentRuntimeLimitsPrefs.shellIdleTimeoutMin()
+            heavyGateTimeoutSec = AgentRuntimeLimitsPrefs.heavyGateTimeoutSec()
         }
         val app = context.applicationContext
         val limitsPrefs = app.getSharedPreferences(AgentRuntimeLimitsPrefs.PREFS, Context.MODE_PRIVATE)
@@ -533,6 +544,59 @@ fun RuntimeLimitsScreen(onBack: () -> Unit) {
             }
             LimitsSectionFooter(stringResource(R.string.runtime_limits_media_footer))
 
+            // ── Sandbox lifecycle ────────────────────────────────────────
+            // [feat/runtime-sandbox-knobs] Formerly hard-coded literals in
+            // ExecutionCoordinator / PersistentShellStall.
+            LimitsSectionCard(title = stringResource(R.string.runtime_limits_section_sandbox)) {
+                LimitsSliderRow(
+                    title = stringResource(R.string.runtime_limits_guest_tmp_age),
+                    subtitle = stringResource(R.string.runtime_limits_guest_tmp_age_desc),
+                    valueLabel = "$guestTmpMaxAgeMin",
+                    value = guestTmpMaxAgeMin,
+                    min = AgentRuntimeLimitsPrefs.GUEST_TMP_MAX_AGE_MIN_MIN,
+                    max = AgentRuntimeLimitsPrefs.GUEST_TMP_MAX_AGE_MAX_MIN,
+                    onCommit = { guestTmpMaxAgeMin = it },
+                )
+                LimitsSliderRow(
+                    title = stringResource(R.string.runtime_limits_sweep_interval),
+                    subtitle = stringResource(R.string.runtime_limits_sweep_interval_desc),
+                    valueLabel = "$guestTmpSweepIntervalSec",
+                    value = guestTmpSweepIntervalSec,
+                    min = AgentRuntimeLimitsPrefs.GUEST_TMP_SWEEP_INTERVAL_MIN_SEC,
+                    max = AgentRuntimeLimitsPrefs.GUEST_TMP_SWEEP_INTERVAL_MAX_SEC,
+                    onCommit = { guestTmpSweepIntervalSec = it },
+                )
+                LimitsSliderRow(
+                    title = stringResource(R.string.runtime_limits_stall_guard),
+                    subtitle = stringResource(R.string.runtime_limits_stall_guard_desc),
+                    valueLabel = "$stallNoProgressSec",
+                    value = stallNoProgressSec,
+                    min = AgentRuntimeLimitsPrefs.STALL_NO_PROGRESS_MIN_SEC,
+                    max = AgentRuntimeLimitsPrefs.STALL_NO_PROGRESS_MAX_SEC,
+                    onCommit = { stallNoProgressSec = it },
+                )
+                LimitsSliderRow(
+                    title = stringResource(R.string.runtime_limits_shell_idle),
+                    subtitle = stringResource(R.string.runtime_limits_shell_idle_desc),
+                    valueLabel = "$shellIdleTimeoutMin",
+                    value = shellIdleTimeoutMin,
+                    min = AgentRuntimeLimitsPrefs.SHELL_IDLE_TIMEOUT_MIN_MIN,
+                    max = AgentRuntimeLimitsPrefs.SHELL_IDLE_TIMEOUT_MAX_MIN,
+                    onCommit = { shellIdleTimeoutMin = it },
+                )
+                LimitsSliderRow(
+                    title = stringResource(R.string.runtime_limits_heavy_gate),
+                    subtitle = stringResource(R.string.runtime_limits_heavy_gate_desc),
+                    valueLabel = "$heavyGateTimeoutSec",
+                    value = heavyGateTimeoutSec,
+                    min = AgentRuntimeLimitsPrefs.HEAVY_GATE_TIMEOUT_MIN_SEC,
+                    max = AgentRuntimeLimitsPrefs.HEAVY_GATE_TIMEOUT_MAX_SEC,
+                    onCommit = { heavyGateTimeoutSec = it },
+                    showDivider = false,
+                )
+            }
+            LimitsSectionFooter(stringResource(R.string.runtime_limits_sandbox_footer))
+
             // ── Save ─────────────────────────────────────────────────────
             Row(
                 modifier = Modifier
@@ -580,6 +644,11 @@ fun RuntimeLimitsScreen(onBack: () -> Unit) {
                             browserScreenshotQuality = browserScreenshotQuality,
                             shellOutputKb = shellOutputKb,
                             shellTimeoutSec = shellTimeoutSec,
+                            guestTmpMaxAgeMin = guestTmpMaxAgeMin,
+                            guestTmpSweepIntervalSec = guestTmpSweepIntervalSec,
+                            stallNoProgressSec = stallNoProgressSec,
+                            shellIdleTimeoutMin = shellIdleTimeoutMin,
+                            heavyGateTimeoutSec = heavyGateTimeoutSec,
                         )
                         onBack()
                     },

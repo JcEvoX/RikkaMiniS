@@ -10,6 +10,7 @@ import com.rikkaminis.app.agent.runtime.CommandFailureKind
 import com.rikkaminis.app.agent.runtime.RetryOutcome
 import com.rikkaminis.app.agent.runtime.RetryPolicy
 import com.rikkaminis.app.agent.runtime.RetrySafety
+import com.rikkaminis.app.data.AgentRuntimeLimitsPrefs
 import com.rikkaminis.app.data.repository.EnvVarRepository
 import com.rikkaminis.app.diagnostics.MemorySpikeRecorder
 import com.rikkaminis.app.logging.AppLogger
@@ -76,7 +77,8 @@ private const val CHILD_RSS_DYNAMIC_MB = 1024L
 // [memory-dynamic-budget] Heavy 命令全局串行闸超时。任何时刻最多 1 个
 // heavy 命令在跑（Semaphore(1)），防止多会话同时跑多个大任务把 memcg
 // 叠加推爆。超时说明另一 heavy 还在跑——排队而非并发叠加。
-private const val HEAVY_GATE_TIMEOUT_MS = 600_000L
+// [feat/runtime-sandbox-knobs] 超时值改为可调（heavyGateTimeoutSec，默认
+// 600 s，读点见下方 tryAcquire 处）。
 
 object ExecutionCoordinator {
 
@@ -138,9 +140,15 @@ object ExecutionCoordinator {
     //   LOCKED    ≥ 350MB  — everything rejected (old hard cap)
     // A shell idle this long is terminated to release its PRoot native
     // footprint. Generous above any agent transition gap (model thinking).
-    private const val SHELL_IDLE_TIMEOUT_MS = 10 * 60 * 1000L  // 10 min
+    // [feat/runtime-sandbox-knobs] Both windows are user-tunable now
+    // (shellIdleTimeoutMin / guestTmpSweepIntervalSec); the defaults keep the
+    // old literals (10 min / 60 s) and are read at use time, not cached here.
+    internal fun shellIdleTimeoutMs(): Long =
+        AgentRuntimeLimitsPrefs.shellIdleTimeoutMin() * 60_000L
+
     // Sweep cadence for idle shell recycling (public for MinisApp sweeper).
-    const val IDLE_SWEEP_INTERVAL_MS = 60 * 1000L              // 1 min
+    fun idleSweepIntervalMs(): Long =
+        AgentRuntimeLimitsPrefs.guestTmpSweepIntervalSec() * 1000L
 
     /**
      * [P2-guest-tmp-reclaim] Guest-rootfs temp dirs the sweeper may prune,
@@ -174,7 +182,9 @@ object ExecutionCoordinator {
      * policy and its budget live in [GuestTmpSweepPlan.kt] as
      * [internalGuestTmpNewestActivityMs] / [GUEST_TMP_KEEP_MARKER].
      */
-    private const val GUEST_TMP_MAX_AGE_MS = 60 * 60 * 1000L   // 1 h
+    // [feat/runtime-sandbox-knobs] The 1 h default is user-tunable now
+    // (guestTmpMaxAgeMin, 15..1440 min) and read at sweep time — see the
+    // cleanupProotTmp call site.
 
     // [P3-shell-auto-retry] At most 2 attempts total (original + 1 retry)
     // before a command is reported as failed. Guards against infinite retry
@@ -364,10 +374,11 @@ object ExecutionCoordinator {
         // [memory-dynamic-budget] Heavy 全局串行闸：先拿 heavyGate 再拿
         // globalConcurrency（锁序一致无死锁）。等待超时（10min）说明另一
         // heavy 还在跑——排队而非并发叠加，防止多会话大任务把 memcg 推爆。
+        val heavyGateTimeoutMs = AgentRuntimeLimitsPrefs.heavyGateTimeoutSec() * 1000L
         val heavyGateAcquired = cmdClass == CommandClass.HEAVY &&
-            heavyGate.tryAcquire(HEAVY_GATE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            heavyGate.tryAcquire(heavyGateTimeoutMs, TimeUnit.MILLISECONDS)
         if (cmdClass == CommandClass.HEAVY && !heavyGateAcquired) {
-            Log.w(TAG, "[$sessionId] Heavy gate timeout after ${HEAVY_GATE_TIMEOUT_MS}ms — another heavy command still running")
+            Log.w(TAG, "[$sessionId] Heavy gate timeout after ${heavyGateTimeoutMs}ms — another heavy command still running")
             postRecycleMemoryRecovery()
             return CommandResult(
                 "[System busy: another heavy command is still running. " +
@@ -926,7 +937,7 @@ object ExecutionCoordinator {
     }
 
     /**
-     * [P2-proot-native-leak] Recycle shells idle past SHELL_IDLE_TIMEOUT_MS.
+     * [P2-proot-native-leak] Recycle shells idle past [shellIdleTimeoutMs].
      * Long-lived PRoot shells leak native memory monotonically; terminating
      * idle ones releases their footprint. Next command re-spawns fresh.
      */
@@ -944,7 +955,7 @@ object ExecutionCoordinator {
             val shell = shells[sessionId]
             if (shell != null && shell.isBusy) continue
             val last = lastActiveMs[sessionId] ?: 0L
-            if (last != 0L && (now - last) > SHELL_IDLE_TIMEOUT_MS) {
+            if (last != 0L && (now - last) > shellIdleTimeoutMs()) {
                 Log.w(TAG, "[$sessionId] shell idle ${(now - last) / 1000}s — recycling")
                 sessionDidTerminate(sessionId)
             }
@@ -970,8 +981,8 @@ object ExecutionCoordinator {
      * `.../alpine-rootfs/var/tmp`, reached by PRoot's `-r <rootfs>` with no
      * bind mount over them — verified from [PRootKernel.buildProotCommand]'s
      * argv, which binds only /dev, /proc, /sys and the /var/minis subdir maps)
-     * accumulated without bound. See the GUEST_TMP_MAX_AGE_MS constant for the
-     * age-gated plan and the measured evidence for the threshold.
+     * accumulated without bound. See [AgentRuntimeLimitsPrefs.guestTmpMaxAgeMin]
+     * for the age-gated plan and the measured evidence for the default threshold.
      */
     fun cleanupProotTmp() {
         // [P2-guest-tmp-reclaim] Gate on isBusy, not isAlive. A shell that is
@@ -1002,7 +1013,7 @@ object ExecutionCoordinator {
             var guestRemoved = 0L
             for (relative in GUEST_TMP_DIRS) {
                 val guestTmp = File(rootfsDir, relative)
-                guestRemoved += sweepGuestTmpDir(guestTmp, GUEST_TMP_MAX_AGE_MS)
+                guestRemoved += sweepGuestTmpDir(guestTmp, AgentRuntimeLimitsPrefs.guestTmpMaxAgeMin() * 60_000L)
             }
             if (guestRemoved > 0) {
                 Log.i(TAG, "cleanupProotTmp: cleared $guestRemoved aged entries from guest tmp")
@@ -1030,7 +1041,7 @@ object ExecutionCoordinator {
      * Deletion rules (each one has a reason, none is decoration):
      *  - the directory itself is never deleted — it is part of the rootfs;
      *  - an entry younger than [maxAgeMs] is never touched (see
-     *    [GUEST_TMP_MAX_AGE_MS] for why the age gate sits on top of isBusy);
+     *    [AgentRuntimeLimitsPrefs.guestTmpMaxAgeMin] for why the age gate sits on top of isBusy);
      *  - a symlink is removed as a LINK ([java.nio.file.Files.deleteIfExists],
      *    which never follows), because `File.deleteRecursively()` lists through
      *    the link and would delete the TARGET's contents — an aged `tmp/x ->

@@ -1534,6 +1534,18 @@
     <string name="runtime_limits_shell_output_desc">單條命令保留的輸出上限，超出部分截斷並標記。預設 128。</string>
     <string name="runtime_limits_shell_timeout">終端：預設逾時（秒）</string>
     <string name="runtime_limits_shell_timeout_desc">呼叫未自帶逾時參數時，shell 命令的預設逾時（顯式傳參的呼叫仍用自帶值，上限 900 秒）。預設 900。</string>
+    <string name="runtime_limits_section_sandbox">沙箱生命週期</string>
+    <string name="runtime_limits_guest_tmp_age">沙箱 /tmp：清理年齡</string>
+    <string name="runtime_limits_guest_tmp_age_desc">沙箱 /tmp 清理器可刪除項目的最小年齡。沙箱 /tmp 佔記憶體（tmpfs），視窗越長，暫存資料駐留記憶體越久。</string>
+    <string name="runtime_limits_sweep_interval">沙箱：掃描間隔</string>
+    <string name="runtime_limits_sweep_interval_desc">閒置 shell 回收與沙箱 /tmp 清理的間隔。</string>
+    <string name="runtime_limits_stall_guard">Shell：無進展判定</string>
+    <string name="runtime_limits_stall_guard_desc">指令在此期間既無輸出也無 CPU 使用，即視為停滯並中止；0 表示停用此保護。</string>
+    <string name="runtime_limits_shell_idle">Shell：閒置回收</string>
+    <string name="runtime_limits_shell_idle_desc">閒置超過此時間即回收 shell，釋放其 PRoot 佔用。</string>
+    <string name="runtime_limits_heavy_gate">沙箱：重負載閘門等待</string>
+    <string name="runtime_limits_heavy_gate_desc">重負載指令等待全域重負載閘門的最長時間，逾時則回報另一重負載仍在執行。</string>
+    <string name="runtime_limits_sandbox_footer">這些視窗用於防止記憶體壓力，預設值與先前的固定值一致。</string>
     <string name="runtime_limits_media_footer">調高圖片上限可讓更高品質圖片進入模型，代價是請求體積變大。</string>
 
     <!-- [fix/render-ui F-275/F-276/F-277] user-facing strings that

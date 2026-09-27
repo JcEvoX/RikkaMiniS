@@ -1533,6 +1533,18 @@
     <string name="runtime_limits_shell_output_desc">Maximale Shell-Ausgabe pro Befehl; der Rest wird mit Markierung gekürzt. Standard 128.</string>
     <string name="runtime_limits_shell_timeout">Shell: Standard-Timeout (s)</string>
     <string name="runtime_limits_shell_timeout_desc">Standard-Timeout für Shell-Befehle, wenn ein Aufruf keines übergibt (explizite Werte bleiben, max. 900 s). Standard 900.</string>
+    <string name="runtime_limits_section_sandbox">Sandbox-Lebenszyklus</string>
+    <string name="runtime_limits_guest_tmp_age">Gast-/tmp: Aufräumalter</string>
+    <string name="runtime_limits_guest_tmp_age_desc">Mindestalter, bevor der Gast-/tmp-Sweeper einen Eintrag löschen darf. Gast-/tmp liegt im RAM (tmpfs); ein längeres Fenster hält temporäre Daten länger im Speicher.</string>
+    <string name="runtime_limits_sweep_interval">Sandbox: Aufräumintervall</string>
+    <string name="runtime_limits_sweep_interval_desc">Wie oft inaktive Shells recycelt und Gast-/tmp aufgeräumt wird.</string>
+    <string name="runtime_limits_stall_guard">Shell: Stall-Erkennung</string>
+    <string name="runtime_limits_stall_guard_desc">Ein Befehl ohne Ausgabe und ohne CPU-Nutzung über diese Zeit gilt als hängend und wird abgebrochen. 0 deaktiviert die Erkennung.</string>
+    <string name="runtime_limits_shell_idle">Shell: Leerlauf-Recycling</string>
+    <string name="runtime_limits_shell_idle_desc">Eine so lange inaktive Shell wird recycelt, um ihren PRoot-Speicher freizugeben.</string>
+    <string name="runtime_limits_heavy_gate">Sandbox: Heavy-Gate-Wartezeit</string>
+    <string name="runtime_limits_heavy_gate_desc">Wie lange ein Heavy-Befehl auf das globale Heavy-Gate wartet, bevor gemeldet wird, dass ein anderer Heavy-Befehl noch läuft.</string>
+    <string name="runtime_limits_sandbox_footer">Diese Fenster schützen die App vor Speicherdruck. Die Standardwerte entsprechen den früheren festen Werten.</string>
     <string name="runtime_limits_media_footer">Höhere Bildgrenzen bringen bessere Bildqualität zum Modell — auf Kosten größerer Anfragen.</string>
 
     <!-- [fix/render-ui F-275/F-276/F-277] user-facing strings that

@@ -1532,6 +1532,18 @@
     <string name="runtime_limits_shell_output_desc">1 コマンドで保持する出力上限。超過分はマーカー付きで切り詰めます。既定 128。</string>
     <string name="runtime_limits_shell_timeout">シェル：既定タイムアウト（秒）</string>
     <string name="runtime_limits_shell_timeout_desc">呼び出し側が独自のタイムアウトを渡さない場合の既定タイムアウト（明示指定時はその値、上限 900 秒）。既定 900。</string>
+    <string name="runtime_limits_section_sandbox">サンドボックスのライフサイクル</string>
+    <string name="runtime_limits_guest_tmp_age">ゲスト /tmp：掃除しきい値</string>
+    <string name="runtime_limits_guest_tmp_age_desc">ゲスト /tmp の掃除が項目を削除できる最小経過時間。ゲスト /tmp はメモリ上（tmpfs）のため、長くするほど一時データがメモリに残ります。</string>
+    <string name="runtime_limits_sweep_interval">サンドボックス：掃除間隔</string>
+    <string name="runtime_limits_sweep_interval_desc">アイドル shell の回収とゲスト /tmp の掃除を行う間隔。</string>
+    <string name="runtime_limits_stall_guard">Shell：ストール判定</string>
+    <string name="runtime_limits_stall_guard_desc">この時間、出力も CPU 使用もないコマンドはハングとみなし中止します。0 で無効化。</string>
+    <string name="runtime_limits_shell_idle">Shell：アイドル回収</string>
+    <string name="runtime_limits_shell_idle_desc">この時間アイドルの shell を回収し、PRoot の使用量を解放します。</string>
+    <string name="runtime_limits_heavy_gate">サンドボックス：ヘビーゲート待ち</string>
+    <string name="runtime_limits_heavy_gate_desc">重いコマンドがグローバルのヘビーゲートを待つ最大時間。超えると別の重いコマンドが実行中と報告します。</string>
+    <string name="runtime_limits_sandbox_footer">これらの時間はメモリ圧迫を防ぐためのものです。既定値は以前の固定値と同じです。</string>
     <string name="runtime_limits_media_footer">画像上限を上げると高画質のままモデルへ届きますが、リクエストが大きくなります。</string>
 
     <!-- [fix/render-ui F-275/F-276/F-277] user-facing strings that

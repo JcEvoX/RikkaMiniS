@@ -1486,6 +1486,18 @@
     <string name="runtime_limits_shell_output_desc">Максимум вывода, сохраняемого на команду; остаток обрезается с маркером. По умолчанию 128.</string>
     <string name="runtime_limits_shell_timeout">Shell: тайм-аут по умолчанию (с)</string>
     <string name="runtime_limits_shell_timeout_desc">Тайм-аут команд shell, когда вызов не передаёт свой (явные значения сохраняются, максимум 900 с). По умолчанию 900.</string>
+    <string name="runtime_limits_section_sandbox">Жизненный цикл песочницы</string>
+    <string name="runtime_limits_guest_tmp_age">Гостевой /tmp: возраст очистки</string>
+    <string name="runtime_limits_guest_tmp_age_desc">Минимальный возраст, после которого сборщик гостевого /tmp может удалить запись. Гостевой /tmp хранится в памяти (tmpfs), поэтому большее окно дольше удерживает временные данные в ОЗУ.</string>
+    <string name="runtime_limits_sweep_interval">Песочница: частота очистки</string>
+    <string name="runtime_limits_sweep_interval_desc">Как часто перерабатываются простаивающие shell и очищается гостевой /tmp.</string>
+    <string name="runtime_limits_stall_guard">Shell: окно обнаружения зависания</string>
+    <string name="runtime_limits_stall_guard_desc">Команда без вывода и без нагрузки CPU в течение этого времени считается зависшей и прерывается. 0 отключает защиту.</string>
+    <string name="runtime_limits_shell_idle">Shell: окно переработки простоя</string>
+    <string name="runtime_limits_shell_idle_desc">Простаивающий столько времени shell перерабатывается, чтобы освободить память PRoot.</string>
+    <string name="runtime_limits_heavy_gate">Песочница: ожидание шлюза</string>
+    <string name="runtime_limits_heavy_gate_desc">Сколько тяжёлая команда ждёт глобальный шлюз тяжёлых команд, прежде чем сообщить, что другая тяжёлая команда ещё выполняется.</string>
+    <string name="runtime_limits_sandbox_footer">Эти окна защищают приложение от нехватки памяти. Значения по умолчанию совпадают с прежними фиксированными.</string>
     <string name="runtime_limits_media_footer">Более высокие лимиты изображений пропускают лучшее качество к модели — ценой размера запроса.</string>
 
     <!-- [fix/render-ui F-275/F-276/F-277] user-facing strings that

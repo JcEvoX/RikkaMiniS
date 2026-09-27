@@ -1630,6 +1630,18 @@
     <string name="runtime_limits_shell_output_desc">Max shell output kept per command; the rest truncates with a marker. Default 128.</string>
     <string name="runtime_limits_shell_timeout">Shell: default timeout (s)</string>
     <string name="runtime_limits_shell_timeout_desc">Default timeout for shell commands when a call does not pass its own; explicit per-call values keep their own (max 900 s). Default 900.</string>
+    <string name="runtime_limits_section_sandbox">Sandbox lifecycle</string>
+    <string name="runtime_limits_guest_tmp_age">Guest /tmp: sweep age</string>
+    <string name="runtime_limits_guest_tmp_age_desc">Minimum age before the guest /tmp sweeper may delete an entry. Guest /tmp is RAM-backed, so a longer window keeps transient data in memory longer.</string>
+    <string name="runtime_limits_sweep_interval">Sandbox: sweep cadence</string>
+    <string name="runtime_limits_sweep_interval_desc">How often idle shells are recycled and guest /tmp is pruned.</string>
+    <string name="runtime_limits_stall_guard">Shell: stall guard window</string>
+    <string name="runtime_limits_stall_guard_desc">A command with no output and no CPU for this long is treated as hung and aborted. 0 disables the guard.</string>
+    <string name="runtime_limits_shell_idle">Shell: idle recycle window</string>
+    <string name="runtime_limits_shell_idle_desc">A shell idle this long is recycled to release its PRoot footprint.</string>
+    <string name="runtime_limits_heavy_gate">Sandbox: heavy gate wait</string>
+    <string name="runtime_limits_heavy_gate_desc">How long a heavy command waits for the global heavy-command gate before reporting that another heavy command is still running.</string>
+    <string name="runtime_limits_sandbox_footer">These windows protect the app from memory pressure. Defaults match the previously fixed values.</string>
     <string name="runtime_limits_media_footer">Higher image limits let better-quality pictures reach the model at the cost of request size.</string>
 
     <!-- [fix/render-ui F-275/F-276/F-277] user-facing strings that
