@@ -1,11 +1,11 @@
-# RikkaMinis 开发日志合并导出（2026-08-03 ～ 2026-09-28）
+# RikkaMinis 开发日志合并导出（2026-08-03 ～ 2026-09-29）
 
 > 📌 **注意**：本文件是 raw dump（归档快照，按时间正序排列）。
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
-- 合并范围：2026-08-03 ～ 2026-09-28，共 57 天
-- 条目总数：1405（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：1860356 / 总行数：26336
+- 合并范围：2026-08-03 ～ 2026-09-29，共 58 天
+- 条目总数：1436（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：1903059 / 总行数：26808
 
 ---
 
@@ -26329,6 +26329,478 @@ CLI 直读同一会话：`total:192 count:50` → **25 assistant + 25 user 交�
 **登记不修**：致命错误/取消路径实时会话仍不收尾（live-only 约定）；`flushThinkingTailIfPending` 新建块分支 `startTimeMs=now`（resetStreamThrottle 后基本不可达）。
 
 **工具坑**：verify_branch 的 base 要显式写 `origin/main`（裸 `main` 可能是落后 ref，会把 dev-history 分支内容算进 diff）；`run.sh` 原先把 out.jar 吐在仓库里 → 已改为输出到 shared 目录。
+
+<!-- 2026-09-28 13:43:09 -->
+## 文档三件套第三次重建 + 推送（09-28，用户「整理更新一下文档吧」）
+
+
+三回归测试先全 PASS → rebuild **1405 条**（前次 1399 → +6，dropped 75 → 76）→ sanitize main+INDEX 复扫 **NONE clean** → SAGAS **23 sagas / 108 孤儿（7.7%）/ multi4 83** → SAGAS 独立脱敏 NONE → 结构校验（fence **行** 62 偶、anchors 1405 == header、outOrder 0、冲突 0）。分支 `docs/dev-history-0928b` @ **d3d3231**（4 文件，+97/−20，含 README 覆盖范围 51d/1204 → 57d/1405）push OK，ls-remote 逐字符一致。**未合并（合并权在用户）**。docs/ 不在 build-apk.yml paths → 不触发 CI。
+
+**校验方法学修正（可复用）**：结构校验用 `c.count("```")` 会把**行内**出现的反引号（如笔记里写「``` 开头」）也数进去 → 09-28 主档案报 `fences=65 even=False` 假红；正确判据是**行首围栏行数**（`re.match(r"^```", l.strip())`）→ 实测 62 偶、逐日内部全偶。同理 `^## 2026-XX-XX` 会命中 72 处（57 个日期分组头 + 15 处条目自身的日期标题，如「## 2026-09-13 三笔改动审计收尾」）——是解析器 fallback 取标题的正常结构，不是重复。判据别用「字符串出现次数」，用「行首模式计数」。
+
+**本次唯一被排除条目**：`rikkahub vs RikkaMinis 思考折叠对比`（其他仓库轴）——正确，我们吸收其机制的实现条目同轴保留。09-26/09-27 各 0 剔除。
+
+<!-- 2026-09-28 13:44:29 -->
+## 合并 main = bd42e3df（09-28，用户「合并」）：docs/dev-history-0928b @ d3
+
+**合并 main = bd42e3df（09-28，用户「合并」）**：`docs/dev-history-0928b` @ d3d3231 `--no-ff` 合并（零冲突，parents 4ef343f + d3d3231），4 文件 +98/−21 全在 docs/dev-history/；docs vs 分支 tip diff 空、vs 旧 main 只列 docs 四文件（src 侧与 4ef343f 逐字节一致）；push 后远端 main 逐字符 == 本地；远端分支 DELETE 204，远端只剩 main；本地分支已删、工作树 clean。**未触发 CI**（docs/ 不在 build-apk.yml paths）——最新 run 仍是 4ef343f 那条。
+
+**顺带闭环一个未验证欠账**：上一条 release CI run `36381309329` @ 4ef343f（思考标题分支合并的 main push 触发，当时用户叫停不等待）= **completed/success**。
+
+<!-- 2026-09-28 14:24:16 -->
+## 云端分支检查：feat/thinking-header-toggles（09-28）
+
+检查时该分支已无进行中 CI。远端/本地均为 `65b26bb24bdee70ad6724b37c15bd73e0f512e47`；run #1873 `36384832132` 同 SHA completed/success，较新的 #1874 `36386030590` 同 SHA completed/cancelled。静态扫描 20/20、i18n 1485 refs/1494 defs clean、`git diff --check` clean，工作树干净。代码审阅发现一个默认值声明矛盾：主线旧行为对 finished thinking block 的 `durationMs>0` 总显示时长；该分支新 `chat.thinkingShowDuration` 默认 false，因此默认隐藏时长；但注释称默认值镜像旧行为。若本意是保留旧默认，应将 duration toggle 默认设为 true；若要 opt-in，则更新注释并接受这是默认行为变更。未改代码。
+
+<!-- 2026-09-28 14:24:47 -->
+## 思考头部两个显示开关完成 → 停止节点（2026-09-28，用户拍板「保持字符数，时长默认不显示」）
+
+- 分支 `feat/thinking-header-toggles` @ **65b26bb2**（基于 main bd42e3df，12 文件 +300/−11），未合并（合并权在用户）。
+- 两个独立开关：`chat.thinkingShowCharCount` 默认 **ON**、`chat.thinkingShowDuration` 默认 **OFF**（时长仅会话内、不持久化，重载永远没有值）。放置于 Appearance → Deep Thinking 之后新增 "Thinking Header" section。ConfigBuiltins 注册 PrefsBoolField（备份/恢复 + minis-config 可见）。
+- 决策抽成纯函数 `thinkingHeaderExtras()` + `thinkingCharCountLabel()`（ChatFormattingUtils.kt），ChatFormattingTest +8 例；沙箱 JVM 真源码装置 `/var/minis/shared/work/tht-jvm/`：**47 tests OK**，**5/5 变异全杀**（忽略时长开关/忽略流式守卫/忽略字数开关/四舍五入/边界 off-by-one），pristine sha 前后不变 `6f618ce5…`。
+- 机械门：verify_branch 冲突 0、scan 20/20、four-way CLEAN、scan_debt 0 no-trigger、i18n **1492 keys × 7 CLEAN**。
+- CI：run **36384832132** completed/success，head_sha 与本地/远端逐字符一致（三源）。
+- **教训（重复 dispatch）**：`gh_ci_wait.sh` 是 dispatch+等待一步式——**上一次调用被中断（工具返回 interrupted）时 dispatch 其实已经完成且 run 已跑完并 success**，我误判成"没触发"又发了一次 → 06:21 多余 run 36386030590（已 POST cancel，completed/cancelled，几乎没跑）。规则：**中断后先 `GET /actions/runs` 查 run 列表，确认没有 in_progress/同 sha run 再决定是否重发**，绝不裸重发。
+- **口径坑（新）**：verify_branch.sh 项 8 取「最新 run」判定 → 被取消的重复 run 排在最后会让它报 `结论 = cancelled / FAILED`，而真实有效结论是 success 那条。取消过 run 后不能只信脚本汇总行，要逐条列出 run（id/conclusion/head_sha）人工判读。
+
+<!-- 2026-09-28 14:44:47 -->
+## 合并 thinking-header-toggles，push 后不等 CI（09-28）
+
+用户明确补充：检查无问题后可以合并；main push 已触发构建后就不用等待结论，本轮到「已触发」即可停止。`feat/thinking-header-toggles` @ `65b26bb24bdee70ad6724b37c15bd73e0f512e47` 快进合并并推到 main，远端 main == 本地 HEAD == feature SHA；push 自动触发 main run #1876（36387245916，head SHA 一致）。分支既有 #1873 同 SHA success；因我误用 gh_ci_wait 额外造成 #1874 cancelled、#1875 in_progress，之后遵照用户指示不再等待/重触发。核查：verify_branch 静态 20/20、i18n CLEAN（7 语言 1492 keys）、diff 508 行逐段审阅、JVM 47/47、变异 5/5 killed；工作树干净。
+
+<!-- 2026-09-28 17:23:04 -->
+## 远端分支删除：REST API DELETE 返 404，git 协议才是可靠路径（09-28 更正）：删 feat/t
+
+**远端分支删除：REST API DELETE 返 404，git 协议才是可靠路径（09-28 更正）**：删 `feat/thinking-header-toggles` 时 `DELETE /repos/***OWNER***/RikkaMinis/branches/feat/thinking-header-toggles` 返 **404 Not Found**（`git ls-remote` 明明能看到该分支；同一 token 的 `GET /branches/<name>` 返 200、`/protection` 返 404「Branch not protected」、repo `rulesets` = 0 条 → 不是权限/保护问题）。**改用 git 协议成功**：`git push --delete https://github.com/owner/repo.git <branch>`（askpass + $GITHUB_TOKEN）→ `[deleted]` exit 0。
+
+⚠️ **纠正旧结论**：早前记的是「远端 DELETE 用主号 token 204、FULL_RIGHT 404」——本次主号 token 的 REST DELETE 也返 404。可能 GitHub 端策略变化或该 API 对 fast-forward 到别的分支 tip 的 ref 有特殊行为。**下次删远端分支直接走 git 协议**，别先试 REST。
+
+顺带：`git push --delete` 需要 GIT_ASKPASS + GIT_TERMINAL_PROMPT=0，askpass 脚本里 Username 分支回 `***OWNER***`、Password 分支回 `$GITHUB_TOKEN`（不落盘、不输出）。用完把临时 askpass 文件删掉。
+
+**清理动作**：远端遗留分支删除 + 本地陈旧分支清理顺序 = ①确认分支 tip == main tip（`git ls-remote` 两条比对）②工作树 `git status --porcelain` 空 ③`git checkout main` + `git fetch` + `merge --ff-only origin/main` ④`git merge-base --is-ancestor <b> main` 通过才 `git branch -d`（不满足条件跳过，不误删）。终态验证：`git branch -vv` 只剩 main 且与 origin/main 同步、`git ls-remote --heads` 只剩 main、工作树 clean。
+
+<!-- 2026-09-28 18:49:30 -->
+## 自主能力进化层的初步结论
+
+针对 RikkaMinis「经验→能力」闭环的分析：现有 Memory/Skill/Trace/Verification 是零件，但缺的不是泛化 Planner，而是受验证约束的 Procedure Promotion Layer。建议做，但先做外置、只读、用户批准的 `Trace → Experience → Candidate Procedure → Replay/Mutation 验证 → Verified Procedure → 检索复用` 原型；暂不做自动改 Skill/代码、自动改默认策略或 DAG Planner。Procedure 应明确前置条件、步骤、检查点、证据、失败/回滚、来源、版本和退役条件；成功轨迹不能直接等于可泛化能力，需独立 ground truth 与反例验证。首个种子优先选跨现有 Skills 的重复工作流（如用户报告→取证→最小修复→验证），先 A/B 证明减少遗漏/用户纠正，再进入 Runtime。
+
+<!-- 2026-09-28 19:56:22 -->
+## Procedure Layer v0 工程量评估 + 并行派发包（09-28）
+
+
+**工程量判定：大**。测算 ≈ **3100~3700 行新代码**（Phase A 纯 Python ≈2100~2500 含测试；Phase B Kotlin ≈1000~1200），约 20 文件，**≈ 仓库史上最大单次 feature（multikey 38 文件 +2211 行）的 1.4 倍**。对照：中位修复 1~6 文件/+20~300 行；中型 feature（runtime-limits 可调项）17 文件/+358 行。串行约 9 个会话轮次；并行度 3 → 约 3 波。
+
+**结论：真正的成本不在代码**。三项不可压缩、不可并行的成本：①契约冻结（否则并行必冲突）②**ground truth 撰写**（8 个任务的必须检查/可省略/禁止/合格证据/正确停止点——**不能派给并行子会话**，否则判据由被测方产出，构成自指，结论作废）③收口合并与端到端跑通。
+
+**派发包已落盘** `/var/minis/shared/procedure-layer-0928/`：CONTRACT.md（**已冻结**，CONTRACT_VERSION=1）+ scripts/contract.py（共享路径守卫，只读引用）+ README.md（工程量/冲突矩阵/波次/台账）+ 6 份任务书。契约冻结 = 并行的前提，S0 已完成。
+
+**冲突矩阵结论**：Phase A 四任务文件零交叉 → **可 3~4 路并行**；**Phase B 真实并行度只有 2**（B1 核心包 与 trace 事件；提示词接线必须站在已合并的核心包上，否则分支 CI 必然编译失败）。**并发上限 3**（沙箱负载纪律）。
+
+**波次**：Wave0 契约（已完）→ Wave1 S1脱敏/S2检索/S3校验（3 并行）→ Wave2 S4评测机制 + 主会话端点集 → Wave3 主会话收口跑 A/B → 门控 → Wave4 S5核心包/S6trace → Wave5 S7接线。
+
+**关键设计约束（S7 必须照做）**：系统提示词由 `ChatViewModel.systemPromptForSession()` 按会话冻结（provider prefix cache 不变量，ChatViewModel.kt:537-580）。**不得把检索结果塞进冻结的基础提示词**——正确结构 = 冻结 base + 每轮重算的 Procedure 卡片，6 个入口（ChatViewModel 3445/1290/3731、ChatRetryOps 88、ChatQueueInterruption 464、ChatTurnPersistence 373）全部走同一 `systemPromptForTurn` helper，漏一个 = 同会话内某些入口静默看不到 Procedure。
+
+**验证纪律要点**：S3 的「流程级变异测试」（删 step 的 check 必须被判失败）= 把已有变异测试纪律从函数扩大到做事流程；S2 的 card 上限 1200 字符 + tie-break 确定性；S4 计分必须**对格式不敏感**（全位置并集判定，防表格式呈现造成分数偏置）且期望值写死字面量。
+
+<!-- 2026-09-28 20:10:24 -->
+## Procedure Layer v0 · Wave1 S1（脱敏+经验提取）完成（2026-09-28）
+
+
+交付（仅这四个文件，未碰 contract.py/别人的文件）：`scripts/redact_trace.py`（sha 2be04f7cd5ed…）、`scripts/extract_experience.py`（6e64525b67ba…）、`scripts/tests/test_redact.py`（7e2c2041e53c…）、`traces/redacted/.gitkeep`；烟测数据 `traces/raw/smoke-minimal.jsonl` → `traces/redacted/smoke-minimal.jsonl` + `experience/experience.jsonl`（exp-2e1674d8）。整目录 discover = **79 tests OK**（我的 18 + A3 的 61）。**4 变异被杀（5/5）**，装置 `/var/minis/shared/work/s1-redact-0928/s1_mutation_check.py`（在副本上变异、pristine sha 前后一致），证据 mutation-output.txt；泄漏审计：11 个敏感片段在输出中 0 命中。
+
+**两个可复用的设计/坑**：
+1. **`contract.rel_in_root` 硬编码 LAB_ROOT**——`--root` 传自定义根（测试用 tmpdir）时它会抛 UnsafePath 把脚本打成 rc=1。凡脚本内部需要「相对 root 展示」必须自己算（`os.path.relpath(resolved, realpath(root))`），不要用 rel_in_root（那是给 LAB_ROOT 场景的）。
+2. **evidence_refs 的 sha 语义**：记录写的是 `source_trace_sha256` = **原始** trace 文件 sha，行号也是原始文件行号 → 两者必须同源才自洽；而 `experience_id = exp-<脱敏输入文件 sha8>`（任务书规定）。两者**故意不同源**，Wave 3 消费者别搞混。
+
+**脱敏口径**（写进 docstring 的 ponytail 三段）：note 截 200 字符；绝对路径只保留结构尾部（命中锚点目录 src/app/scripts/... 则从锚点起保留，否则留末 3 段）→ `/var/minis/shared/work/rkm/src/...` → `<repo>/src/...`；mounts/home/root/data-data → `<ext>/...`；URL 的 `//` 不被当路径（正则前置字符类排除 `/ : \w`）。
+
+<!-- 2026-09-28 20:13:39 -->
+## S3 完成 + ★ 并行派发包的「共享夹具目录」碰撞（2026-09-28）
+
+
+**S3 交付**：`scripts/procedure_schema.py`（纯函数 `validate() -> Violations(list[str])`，`.warnings` 通道）+ `scripts/validate_procedure.py`（§5.4 CLI，退出码 0/1/2/3/4）+ `scripts/tests/test_validate.py`（**29/29 绿**）+ 夹具 `valid-procedure.v1.json`(6 step/2 stop_if_missing，sha `1222215b…`)、`invalid-missing-evidence.v1.json`(sha `b16be0fe…`)。变异 **11 个**（6×M-check + 3×M-approval + M-evidence + M-forbidden），全部被拒（escaped=[]，rc=0）。独立证据：①打弱探针——逐条打弱规则 2/3/5a/8，恰好对应 mutant 类逃逸（证明变异集非空转 + 规则独立）；②纯函数探针（禁 open/清 env/冻 time 仍 `[]`）；③夹具 sha 钉桩。
+
+**★ 跨会话碰撞（可复发，Wave 2/3 必再遇到）**：S1/S2/S3 的任务书都让把夹具放 `scripts/tests/fixtures/`，而 S2 的 `test_retrieve.py` 的 `BaseCase.setUp/tearDown` 直接 `shutil.rmtree(FIXTURE_ROOT)`（= 整个共享 fixtures 目录）→ 我的两个夹具在其每条用例间被删，实测 20:06–20:09 被删 **3 次**，全量 discovery 时我的单测大面积 `FileNotFoundError`（外部原因，非断言失败）。**派发纪律**：并行任务书里凡指定「公共目录」，必须指定**会话私有子目录**（`fixtures/<session>/`）；一方 rmtree 公共目录 = 静默毁掉另一方的交付物。缓解（我已落地，未动别人文件）：Lab 外备份 `shared/work/s3-validate/fixtures-backup/` + 测试 `setUpModule`/`setUp` 自动补齐（恢复时 stderr 打 warning，不静默）+ sha 钉桩；恢复命令 `cp .../fixtures-backup/*.json scripts/tests/fixtures/`。
+
+**工程坑（新）**：探针脚本的 `WORK = rmtree 目标` 若等于脚本自身所在目录 → **运行即自删**（首版 `/var/minis/shared/work/s3-probe/weakened_validator_probe.py` 跑完就没了，第二次调用报 No such file）。工作目录必须与脚本目录分离。
+
+**并行期纪律（实证有效）**：真值取证前先 `cd /proc; for p in [0-9]*; do tr '\0' ' ' < $p/cmdline; done` 看有无 peer 在跑 `unittest`，避开其窗口；证据要「恢复夹具 + 跑测试 + 跑 E2E」在同一条命令里原子完成。
+
+<!-- 2026-09-28 20:17:32 -->
+## S2 · Procedure Layer 检索器完成（09-28，任务书 task-A2-retrieve.md）
+
+
+**产物**（只写这三个文件）：`scripts/retrieve.py`（15022B）、`scripts/tests/test_retrieve.py`（33 用例）、`eval/.gitkeep`。
+**评分公式**：字段加权覆盖率 —— 每个字段（title×3 / goal_patterns×2 / preconditions×1）算「命中词项数 ÷ min(词项数, 8)」（长度饱和，防长句稀释），最终 = 0.5×字段加权平均 + 0.5×按字段权重归一的最佳字段覆盖率；中文走字符 bigram，ASCII 走长度≥2 词元；纯函数、无 I/O、无随机、无时间依赖。
+**tie-break**：score 相同 → version 高者优先 → id 字典序升序；候选先按文件名排序，排序键完整，故与遍历顺序无关。
+**card**：默认上限 1200 字符（5 步真实流程实测 310 字符；40 步超长流程收敛到 1172 字符），收敛顺序 = 丢 intent → 按步骤均分 check 预算 → 折尾；保留每个 step 的 id 与 check、stop_if_missing 列表、forbidden_actions；白名单字段组装 + 凭据形态擦除（sk-/ghp_/Bearer/JWT/AKIA）。
+**门**：CLI 退出码实测 0（空 approved/未匹配）/ 2（--mode semantic、--top 0、缺 --task）/ 3（catalog 指向 candidates/validated/deprecated/retired、../ 逃逸、/etc）；坏 JSON 跳过并 stderr 记一行、整体仍 0；`--catalog` 默认 APPROVED_DIR、必须落在 LAB_ROOT 内，目录内指向外部的符号链接跳过。
+**证据**：任务书命令 `python3 -m unittest discover -s scripts/tests -v` → **80/80 绿**（我的 33 + S1 的 + S3 的 29）；**9/9 变异被检出**（两个独立 harness：CLI 级跑 /tmp 副本 6 杀 m1/m3/m4/m5/m6/m7；进程内 sys.modules 注入杀 m2/m9；m8 saturation 由 synonym 测试断言 ≥0.40 直接验证，实测跌到 0.2980）；共享文件 sha 前后不变。
+
+### ⚠️ 跨会话夹具冲突（已实测，必须记住）
+- 我最初把 `shutil.rmtree(scripts/tests/fixtures)` 当会话私有 scratch → **删掉了 S3 的固定夹具**（`valid-procedure.v1.json` / `invalid-missing-evidence.v1.json`，S3 已在注释里点名 S2 并自建 `/var/minis/shared/work/s3-validate/fixtures-backup` 恢复机制）。已从他们的恢复路径还原、sha 与 BACKUP_SHA 逐字符一致、S3 的 29 用例全绿。
+- 更深一层：**同一套件被并发 discover**（实测 ps 里有第二个 `python3 -m unittest discover -s scripts/tests` 进程）→ 若各自用固定目录名做夹具根，会互相清空，表现为「同一测试时绿时红、失败集合每次不同」（我连跑两次失败集合不同才定位）。
+- **正确做法（可复用）**：夹具根用 `tempfile.mkdtemp(prefix=..., dir=<共享 fixtures 父目录>)` + `addCleanup(rmtree)`，**每进程唯一**；绝不对共享父目录整体 rmtree。
+
+<!-- 2026-09-28 20:23:45 -->
+## Procedure Layer v0 · Wave 1 验收（09-28）
+
+
+**Wave 1（S1/S2/S3）已完成，主会话独立核验通过（不采信回报，读盘 + 跑测试 + 自写对抗探针）**。
+
+**交付**：`redact_trace.py` 229 / `extract_experience.py` 151 / `test_redact.py` 384 / `retrieve.py` 391 / `test_retrieve.py` 503 / `procedure_schema.py` 267 / `validate_procedure.py` 167 / `test_validate.py` 407 + 2 夹具。合计 **2629 行**（预估 1560 → **1.7 倍**，S2 超得最多 2.4×）。三个会话均未越界写别人的文件；`contract.py` 未被改动（mtime + sha256 一致）。
+
+**机械门**：单测 **80/80 绿**；`validate_procedure.py --mutants` **11 mutant 全部被拒 escaped=[]**；手工删 `check` 的反向对照判红 rc=1；凭据泄漏扫描干净。
+
+**对抗性探针（主会话自写，不用各会话夹具）**：5 种 token 形态（Bearer/sk-/ghp_/AKIA/xoxb-）全抹除；`args`/`output`/`note` 三处原文全抹除（`note` 也过脱敏，实测）；`/var/minis/mounts/...` → `<ext>`；坏行容错；回溯字段保留；card ≤1200 且含全部 step id。
+
+**★ 发现一处真缺陷（P1·项目内）**：`retrieve.py` 的 `load_catalog()` **不检查每文件的 `status`**，只靠 `_assert_approved_only()` 按目录名黑名单拒绝 → 把一个 `status="candidate"` 的 Procedure 放进 `approved/` 目录，retrieve 返回 **matched=true 并渲染 card**。违反契约 §2（状态是唯一权威标记）。判 P1 而非 P2 的理由：Wave 3 正是文件在状态目录间移动的时刻，「改状态没搬文件/搬文件没改状态/手工拷贝」任一种都会让未批准流程被**静默注入 Agent**；且 B1（Kotlin）已明确要求按 status 过滤，Python 不修会造成两侧同族不一致。修法 ≈3 行（`load_catalog` 加 status 守卫）+ 补断言；已核对 S2 现有测试夹具全为 `.../approved` 且默认 `status="approved"`，**加这条不会转红任何现有测试**。已写成任务书 `task-FIX1-status-guard.md`（含必做的反向对照步骤）。**未自动修**（按修复门纪律：审计发现只登记，动手前给用户 P 级判定）。
+
+**探针自身的两处错误（教训）**：①把 `--catalog` 当成「含 approved/ 的父目录」传——实际语义是「直接扫这个目录」；②断言用 `"0" in stdout` 这种粗糙判据。**探针报 FAIL 时先怀疑探针**：两处 FAIL 都是我的探针错，只有第三处是真问题。
+
+**下一步**：Wave 2 可派（S4 评测机制 + 主会话写 ground truth）；Wave 3 之前必须修 FIX1。
+
+<!-- 2026-09-28 20:31:14 -->
+## FIX1 · 检索器状态守卫完成（2026-09-28，按 task-FIX1-status-guard.md 执行）
+
+
+**改动**（只碰两个文件，diff **+77/−0**）：`scripts/retrieve.py` +5（`load_catalog()` 在 id/steps 结构检查之后、`procs.append` 之前加文件级状态守卫 `if obj.get("status") != "approved": stream.write("retrieve.py: skip non-approved status %s (%s)\n"); continue`，`_assert_approved_only()` 目录级守卫保留不动——两层不互替）；`scripts/tests/test_retrieve.py` +72（新增 `StatusGuardTest` 5 例：同目录 approved 胜出且 card 无 candidate id / 只有 candidate → matched=false 且退出码 0 / 四状态 candidate·validated·deprecated·retired 逐条不出现在结果 / 单元级 `load_catalog` 返回集合+stderr / **status 字段缺失也跳过**（`(None)`））。诱饵语料 = goal_pattern 直接等于任务原文（一旦被读进来必然夺冠，故「命中 approved」即等价于「守卫拦住了它」）。
+
+**机械门**：全量 discover **85/85 绿**（18 redact + 38 retrieve + 29 validate；基线 80 → +5）。**反向对照**：`sed` 把守卫行改成 `if False:` → 新测试类 **5/5 全红**，命中 id 实测 `should-never-appear-status`（断言打印 `'fix-bug-evidence' != 'should-never-appear-status'`）→ 恢复后复绿。**sha256 恢复一致**：retrieve.py `3ba899d1…`（改后=恢复后逐字符）。他人文件 sha 未变（contract.py `8b4492bf` / redact `2be04f7c` / extract `6e64525b` / schema `9c4ce3d0` / validate `e74e1986`），S3 固定夹具两份完好。
+
+**端到端**（临时目录内，用完即删）：approved/ 里同时放 candidate + approved → 返回 approved、stderr 一行 `skip non-approved status bad-status-in-approved.v1.json (candidate)`、stdout 不含 candidate id；只放 candidate → matched=false / card=null / exit 0。
+
+**教训（复发一次）**：**探针报 FAIL 先怀疑探针**——我的 E2E 首两版假红，原因是自造"good"语料只有 1 个 goal + 1 个 precondition、且任务文本砍掉了后半句，覆盖率被稀释到 0.3125/0.2639 < 0.35 默认门槛（不是守卫的问题）；换成与单测同源的 BUG_PROC + 完整 TASK_BUG_PARAPHRASE 后 PASS。检索类探针的语料必须与单测同源，别自己重写。
+
+<!-- 2026-09-28 20:48:58 -->
+## S4 · A/B 评测装置（run_eval + score_eval）完成（09-28，任务书 task-A4-eval-harness.md）
+
+
+**交付**（Lab 内只这四个，未碰他人文件；`contract.py` sha 未变）：`scripts/run_eval.py` 344 + `scripts/score_eval.py` 578 + `scripts/tests/test_score.py` 546 + `scripts/tests/fixtures/eval-fixture.jsonl`（2 任务 × 2 臂）＝ **1476 行**。证据/交接：`/var/minis/shared/work/s4-eval-0928/`（HANDOFF.md + mutation_check.py + mutation-output.txt + integration/ 真实应答）。
+
+**★ 本波最重要的产出不是代码，是三条"契约没冻结但必须照此写"的形状**（我定义了，主会话写 GT 前必须知道）：
+- `tasks.jsonl`：`{"task_id","prompt"}`（兼容 prompt|task|text|question）。
+- `ground_truth.jsonl`：`required_checkpoints` / `independent_evidence` / `forbidden` / `stop_point{any_of,none_of}` / `user_corrections{a,b}` / `allowed_write_tools` / `unauthorized_patterns`。判据 `<entry>` 三形态：裸串 / 列表（any_of）/ `{all_of,any_of,none_of}`。缺 `user_corrections` → 该指标两臂记"不适用"（平局）。
+- arm 记录 = 契约 §5.5 六字段 + `call_path` / `card_injected` / `injected_card` / `model` / `error`。
+
+**★★ 实测抓到的系统性测量偏置（必须在写 GT 前处理）**：注入卡片尾部带 `FORBIDDEN: merge_without_user_approval, auto_update_skill`，真实模型在 arm-b 回答里**照抄**这两个词（原句「**禁止** 未经用户批准合并（NO `merge_without_user_approval`）」）→ GT 的 `forbidden` 若写裸动作名，**arm-b 因遵守流程被判违规**（实测 b=1/a=0）。两层对策：①GT 用违规形态短语（"已直接合并 main"）而非裸动作名；②`run_eval` 记录实际注入卡片，`score_eval` 出 `gt_card_collisions` + stderr WARN，**只告警不改分**（有测试断言"告警不改变任何计分结果"）。同理 `required_checkpoints` 应写"结果/判断"措辞，不要复述卡片。
+
+**完整性护栏（防假数据）**：记录 `response=null` 或带 `error`（pending 未执行 / 上游空响应 / 调用失败）→ 该任务记 `incomplete`，**不参与计分**并让门槛失败。否则"没跑成"会被静默计成"全指标 0 分"。实测触发：无 `--model` 跑 arm a 时上游返回空响应 → 记录带 error、整批 rc 仍 0（单任务失败不中断）。
+
+**判分口径歧义（诚实标注）**：契约 §7「≥8 任务中赢下 ≥6 主指标」在"按指标/按任务"间有歧义 → 实现按**指标计**（`main_metrics_won_by_b >= 6`，任务 ≥8），同时输出 `tasks_won_by_b` 备核。"错误 Procedure 被 --mutants 拒绝""失败候选不得进 approved"两条本脚本看不到数据 → summary 标 `not_checked_by_scorer`（不冒充已验证）。`extra_tokens` 聚合必须用 **token 总量比**（逐任务比值求和是错的，我第一版就踩了：sum=2.05 反而判 arm-a 赢）。
+
+**证据**：`test_score.py` **36/36 绿**；全目录 discover **121/121 绿**（含 S1/S2/S3 的 85 例，未破坏他人）；**变异 18/18 全杀**（含我第一版逃逸的 m4"只扫前 200 字符窗口"——被测试缺口放过，补了"位置位移后分数逐值相同"断言才杀掉；这条正是"变异测试抓测试缺口"的实例）；真 `retrieve.py` + 真 `minis-model-use`（`商汤科技/deepseek-v4-flash`）端到端：arm b 11.7s/983 tokens/`procedure_id` 有值/`card_injected=true`，arm a 819 tokens/`procedure_id=null`；`matched=false` 时 arm b 的 prompt 与 arm a **逐字符相等**（已断言）。
+
+**未决（给主会话）**：①`procedures/approved/` 为空 → Wave 3 真实 A/B 必然 arm b == arm a，须先有 approved 流程；②GT 内容（8 任务）未写（纪律：判据不能由执行方产出）；③单轮无工具执行 → `tool_calls` 只是意图，真实越权面归 Phase B。
+
+<!-- 2026-09-28 20:55:40 -->
+## Procedure Layer v0 · FIX1 + S4 验收（09-28）
+
+
+**FIX1（状态守卫）✅ 通过**：`retrieve.py` 391→396 行加了 status 守卫（line 214）。**主会话自做反向对照**（不采信修复会话自述）：把 scripts 复制到 /tmp、从副本删掉守卫 → 副本 matched=true 漏进 candidate，真品 matched=false 挡住 → **守卫是承重的**。测试补齐四种状态 + 同目录混放场景。
+
+**S4（评测机制）机制完成**：`run_eval.py` 344 + `score_eval.py` 578 + `test_score.py` 546 + `eval-fixture.jsonl`。累计 **4174 行**（Wave 1 时 2629）。单测 **121/121 绿**；`contract.py` sha256 未变。**独立验证通过**：格式不敏感（同答案分段式 vs 表格式，判据词故意放结论之前的表格里，4 个指标值完全相同）；`gt_card_collisions` 已实现（GT 的 forbidden 字面出现在 arm-b 注入卡片里 → 模型抄进回答会被误判违规，这是真洞见）。
+
+**★★ 发现第二处缺陷（P1，比 FIX1 严重）：A/B 门槛在数学上不可达**。
+`GATE_MIN_METRIC_WINS = 6` 而 `MAIN_METRICS = 7`。构造**完美臂**（全检查点、证据齐、停止点对、不踩 forbidden、零纠正、token 与 a 相同）实测：`main_metrics_won_by_b = 5`，`failures=['metric_wins: 5 < 6']`，`passed=False`。**根因**：`extra_tokens` 与 `unauthorized_writes` 是**门**（已由 `token_ratio`/`unauthorized_total` 独立判定），却又被算进赢面分母 → 分母虚增为 7，真正可比的只有 5 个（`extra_tokens` 注入只会变多、最好平局；`unauthorized_writes` 两臂都干净时平局，平局不计赢）→ 阈值 6 永不可达。**后果**：无论 Procedure 多有效，`score_eval.py` 永远 rc=1，Wave 3 门控会把「事实上成功」判成失败，直接杀掉项目。
+
+**★ 同族复发第 2 次**：09-28 `perf/tool-pill-fold` 的验收判据「单 item 不再跨屏」同样在数据上不可达（正文本身 3~4 屏）。同族复发 ≥2 ⇒ 修法必须带通用守卫，不能只改数字。**已处置**：主会话改了契约 §7（拆成「门」+「5 个可比指标」+ 可达性不变量 `GATE_MIN_METRIC_WINS ≤ len(COMPARABLE_METRICS)`）；修法见 `task-FIX2-gate-reachability.md`，核心是**步骤 3 的可达性自检**（完美臂必须通过赢面门 + 阈值不得超过可比指标数），防第 3 次复发。阈值默认改 4/5（= `ceil(5×0.8)`），若改口径为「按任务赢面 ≥6/8」属设计变更，要求修复会话先停下提出。
+
+**教训固化**：**判据可达性**应成为写任何门槛/验收标准的固定一步——「这个判据在数据上能不能被满足？」凡分母是「指标总数」而部分指标永远赢不了（平局/单调劣化），门槛就不可达。探针报 FAIL 时先怀疑探针（本轮两次 FAIL 都是探针自身错误）。
+
+<!-- 2026-09-28 21:09:35 -->
+## FIX2 完成 · A/B 门槛可达性（09-28，按 task-FIX2-gate-reachability.md 执行）
+
+
+**改动（只碰允许的两个文件）**：`scripts/score_eval.py` 578→618 行 + `scripts/tests/test_score.py` 546→699 行。
+新增 `GATE_METRICS = ("extra_tokens","unauthorized_writes")` + `COMPARABLE_METRICS = tuple(m for m in MAIN_METRICS if m not in GATE_METRICS)`（= 5 个）；`GATE_MIN_METRIC_WINS` 6→**4**（= `ceil(5×0.8)`，附推导注释）；**赢面统计与门槛一律改用 COMPARABLE_METRICS**（per-task `b_metric_wins`/`a_metric_wins`、`main_metrics_won_by_b`；`winner`/`metric_winners`/`metric_wins_by_metric` 保留全 7 个作原始诊断），summary 新增 `comparable_metric_winners` / `gate_metric_winners` / `comparable_metrics` / `gate_metrics` / `metric_wins_threshold`。三条门（token_ratio ≤1.15 / unauthorized==0 / n_tasks ≥8 + incomplete）**一字未改**。
+
+**守卫（防同族第 3 次复发）**：`GateReachabilityTest` 5 例 —— ①8 任务完美臂（token 与 a 相等、两门指标恒平局）端到端必须 `passed=True` 且 `failures==[]` ②元断言 `阈值 ≤ len(COMPARABLE)` 且 `== ceil(len(COMPARABLE)*0.8)` ③5 个可比指标逐个构造输入断言 arm-b 能赢下 ④两门指标不进赢面但各自门照旧生效 ⑤4/5 过、3/5 不过（写死字面量）。
+
+**证据**：全量 discover **126/126 绿**（基线 121，未破坏 S1/S2/S3/FIX1）；独立探针（自己手写 8 任务完美臂跑真 CLI，`/var/minis/shared/work/fix2-gate-0928/probe_perfect_arm.py`）rc=0 / failures=[]。**反向对照**（真文件 4→6→4）：探针 rc=1 `failures=['metric_wins: 5 < 6']`；守卫类 5 例中 **4 例翻红**（完美臂 / 元断言 `6 != 4` / 门指标用例 / 边界 `['metric_wins: 4 < 6']`），仅「可比指标可赢」这例与阈值无关而保持绿；`score_eval.py` sha **恢复逐字符一致** `4b80d96f…`（与备份 `cmp` 相同）。`contract.py` sha `8b4492bf…` 未变，其他文件 mtime 全早于本会话。
+
+**口径核对**：主会话并行把 `CONTRACT.md §7` 改成新口径（三条门 + 5 个可比指标 + 赢面 ≥4 + 可达性不变量），与本实现**完全一致**，故未按「设计变更」停下。写 GT 提醒：赢面分母是 5 个可比指标、门槛 ≥4。报告 `/var/minis/shared/work/fix2-gate-0928/REPORT.md`。
+
+**教训**：探针在 `scripts/tests/` 建的临时夹具目录要 `finally: rmtree`（首版留了 3 个残渣，别把 Lab 当 scratch）；反向对照若在 import 期加「阈值不可达就抛异常」的守卫，会把「翻红时的 failures 列表」这一证据形态破坏掉 —— 守卫放测试里（CI 跑），别放 import 期。
+
+<!-- 2026-09-28 21:23:34 -->
+## Procedure Layer v0 · FIX2 验收 + Wave 3 预注册检查（09-28）
+
+
+**FIX2 ✅ 通过（主会话独立验证，不采信自述）**：全量测试 **126 项 OK**（121→+5）；`contract.py` sha256 `8b4492bf…` 未被动；`GATE_MIN_METRIC_WINS` 6→4、拆出 `COMPARABLE_METRICS`(5) / `GATE_METRICS`(2)。①完美臂复跑：FIX2 前 `rc=1 passed=False wins=5 failures=['metric_wins: 5 < 6']` → FIX2 后 `rc=0 passed=True wins=5`，`gate_metric_winners={extra_tokens: tie, unauthorized_writes: tie}` 正确分离。②反向对照：复制 scripts 到 /tmp 只把阈值改回 6 → `rc=1 passed=False`（翻红），真品 `rc=0` → **修复是承重的**。恢复后 `score_eval.py` sha256 `4b80d96f…`、`test_score.py` `39e4c748…`。记录在 README §7.5。
+
+**Wave 3 不可外包产出已完成**：`procedures/candidates/rkm-code-change-evidence.v1.json`（7 step，校验 `ok:true, mutants:12, rejected:12` 退出码 0）；`eval/tasks.jsonl` 8 任务（code-fix×2 / audit×2 / ci-delivery×2 / judgement×2）；`eval/ground_truth.jsonl` 8 条判据共 **45 个条目**。
+
+**★ 校验器先拒了我自己的文件**：`steps[3]/steps[6].requires_approval must be true when effect is IDEMPOTENT_WRITE`（契约 §3 规则 3：`effect != READ_ONLY` → 必须 true）。**处置=合规不改规则**，依据：读 `build_card()` 白名单 = id/version/title + step id/check + stop_if_missing + forbidden_actions —— **`requires_approval` 根本不进卡片，Phase A 无消费方 → 零影响面**，属登记项（P2），单开修复违反「装置规模 ∝ 影响面」。补齐两字段后复验通过。**登记升级触发 = Phase B 决定把该字段渲染进卡片或接执行门控时，必须先收紧规则为「仅 NON_IDEMPOTENT_WRITE 强制批准」**。
+
+**★★ 第三处同族缺陷（决定性）：检索阈值 0.35 在自然语言上不可用。** 跑 A/B 前预注册检查发现 8/8 任务全部未命中（0.05–0.13）。排除「公式坏了」（文档全文=1.0、goal_patterns=0.7125、单条 pattern=0.41–0.45，阈值可达）与「长度稀释」（给 pattern 追加 3 段无关内容分数恒为 0.4375）。读 `field_coverage()` 定机理：**分母是目标短语自身词数**，故它测的是「任务是否**复述了库里的措辞**」。分离度实测：相关 0.4375/0.1083/0.1583/0.0500 vs 不相关 0.0000×5/0.0500 → **重叠，阈值分不开**。便宜修法（goal_patterns 追加 12 条自然问法）实测**分离度出现**：相关 0.1558–0.4038、不相关 0–0.1094，阈值 0.15 → 相关 8/8 命中、不相关 0/8 误命中。**但不能直接采信**：问法库是看着这 8 个任务写的（非 held-out，偏乐观），且余量只 1.4 倍，掉线后果是**静默退化成 arm-a 不报错**。
+
+**待用户拍板（Wave 3 的 arm-b 形态）**：A 扩问法库+阈值 0.15（便宜、有拟合与静默退化风险）／**B arm-b 改为直接注入**（恒注入卡片不走检索，两行改动，只证明「Procedure 有没有帮助」）／C 上语义检索（新依赖+两机制混一起说不清）。**主会话建议 B**：Wave 3 要回答单一问题，把「检索准不准」与「注入有没有用」放进同一 A/B，负结果无法区分是机制没用还是检索没命中——正是纪律点名的不可解释结果。检索质量另立项，用独立 held-out 数据集度量 precision/recall。
+
+**★ 同族复发计数第 3 次**（①tool-pill-fold「单 item 不再跨屏」数据不可达 ②A/B 门槛 ≥6/7 数学不可达 ③检索阈值 0.35 自然语言不可达）。共同形态：**写下阈值/判据时没有先用真实样本做标定测量**。建议固化纪律：任何阈值/判据定稿前必须测 **①可达性**（存在能通过的真实输入吗）**②分离度**（通过线与噪声上界间余量多大）；写不出这两组数字 = 没定过这个阈值。
+
+**另发现（影响实验含义）**：`run_eval.py` 请求体是**单轮无工具**（`{"messages":[{"role":"user","content":prompt}]}`），所以本 A/B 测的是「给定场景回答是否体现正确流程与判据」，**不是**「Agent 多轮工具执行中是否更少遗漏」。判据已按此设计（场景自带事实、不依赖工具），该限制须写进报告。
+
+**★ 自我修正**：本轮两次探针 FAIL 都是**探针自身错误**（`--catalog` 放在 /tmp 越出 LAB_ROOT 被路径守卫拦、把 `--catalog` 语义当成含 approved/ 的父目录）——探针报 FAIL 时先怀疑探针。
+
+<!-- 2026-09-28 21:51:08 -->
+## Procedure Layer v0 · Wave 3 实跑 + **仪器无分辨力**（09-28，本轮最重发现）
+
+
+**装置改动（选项 B 直接注入）**：`run_eval.py` 加 `--inject-card`（arm-b 恒注入该文件卡片、跳过检索）与 `--attempts`（只重试瞬时故障：空响应/限流/连接）；记录加 `injection_mode`（direct/retrieval/null）与 `attempts`。新增 `scripts/tests/test_run_eval.py` 12 项（含三条反向对照：不给参数→retrieval 且卡片空；arm-a 下该参数必须无效）。测试 **126 → 138 全绿**。契约 §5.5 写死两臂定义 + 两种卡片来源 + 重试理由 + 「单轮无工具」实验边界。
+
+**实跑**：arm-a 8 任务 0 错误（13 次调用，5 次瞬时失败被重试救回）；arm-b 8 任务 0 错误（16 次调用，8 次重试）。模型 `deepseek-v4-flash @ 商汤科技`（**agentrouter-1 入口 4/4 空响应已失效**；商汤间隔 5s 约 5/6 成功 → 不重试时 `P(任务可用)≈0.69`，8 任务期望仅 ~5.5 可用 < 门槛 8，A/B 必因仪器故障判失败）。
+
+**★ 计分结果不予采信：仪器没有分辨力。** `metric_wins: 0 < 4`、`token_ratio: 1.4465 > 1.15`、tasks_scored 8/8、`gt_card_collisions []`、**两臂指标向量逐位相同**（recall 0.0729 / 缺证据 8.0 / 错停止点 7.0）、五指标全 tie。追查原文：**arm-a 的 T1 应答写了「步骤 1：复现与现象确认」、每步带「停止条件」「检查点」，而 T1 的 4 条检查点全记 0 分**。根因 = **GT 判据用我自己的措辞 + 逐字子串匹配**（判据「复现步骤」vs 模型「复现与现象确认」；「读取点」vs「读取来源」；「加一行日志」vs「日志临时打印」；「先复现」vs「步骤 1：复现」）→ 两边都 miss → 零分辨力 → A/B 什么都没测出来。**这不是「Procedure 没用」，是「这次没测出来」。此类失败最危险：它长得像合法结论，不追查就会按门槛不过把项目杀掉。**
+
+**换可分辨的度量 → 增量空间实存**（诊断用宽容同义词集，**非门槛量**）：流程步骤覆盖 arm-a **28/56 (50%)** vs arm-b **50/56 (89%)**（+22）；分项 isolate 独立分支 3→8、branch_ci CI 3→8、existing_first 现成 3→7、classify 判级 1→4、find_surface 5→7、minimal_change 6→8、independent_verify 7→8。**卡片确实改变行为**（裸模型基本不提独立分支与跑 CI）。**但须打折**：arm-b 复述卡片，「答得更好」与「提得更多」未分开（T4 加字段这类任务上「独立分支/跑 CI」可能是过度套用）。真实可测代价：tokens 9163→13254（**+44.6%**）、字节 15287→18434（+20.6%），逐字相同的任务 0。
+
+**★★ 结构性发现：门槛不会说「测不出来」。** 退出码只有 `EXIT_OK/FAIL/USAGE/UNSAFE_PATH/PARSE`，`score_eval.py:614 return EXIT_OK if gates["passed"] else EXIT_FAIL` —— **没有不确定态**，任何仪器缺陷都 fail-closed 成「项目未达标」。这正是坏判据能伪装成正式结论的结构原因：缺的不是判据，是**失败模式不可见**（同 evidence-discipline「缺口的可见性 > 缺口的消除」）。处置 = `task-FIX3-instrument-validity.md`：新增 `EXIT_INSTRUMENT=5` + 「仪器自检门」（两臂 best recall < `RECALL_FLOOR` 0.25 → 判「测不出来」而非「没达标」）+ 反向对照（关掉自检 rc=1 无 instrument 字样；打开 rc=5 有）。
+
+**同族第 4 次**（①tool-pill-fold 判据数据不可达 ②A/B 门槛数学不可达 ③检索阈值自然语言不可达 ④**GT 逐字匹配分辨力为零且伪装成合法结论**）。与前三差别：前三次是「标准定得太高」，这次是「尺子本身读不出刻度」，且输出信号与「真实未达标」完全同形。
+
+**待决：判据怎么重建**——A LLM 评委 + 评分细则（需先用已知好/坏答案标定，否则只是把不可信度换个位置）／B 任务改造成「可判定决策」（提没提分支、有没有主张合并、修不修）／C 接受结论停止。**倾向 A+B 合用、先 B 后 A；C 不可接受**（§9.5 显示增量空间实存，现在停 = 关掉一个「还没测」而非「测不出」的项目）。
+
+**Pilot 发现**：`BASE_INSTRUCTION` 本身就要求「输出步骤、每步检查点、何时停止」→ 结构已被基础指令预设，故本 A/B 测的是「项目特定卡片相对通用流程指令的**边际**价值」= 更保守的检验（保留该设计）。
+
+**诚实边界**：单轮无工具（不能回答「多轮工具执行中是否更少遗漏」）／只有一个可用模型入口（无跨模型稳健性）／每任务单次采样（无统计功效）／覆盖率是诊断量且可能混入卡片回声。
+
+<!-- 2026-09-28 22:08:15 -->
+## FIX3 · 门槛必须能说「测不出来」完成（09-28，task-FIX3-instrument-validity.md）
+
+
+**核心产出：给计分器加了「不确定态」**——`contract.EXIT_INSTRUMENT = 5`（`EXIT_FAIL(1)`=测出来了、没达标；`5`=**没测出来**），退出码只有 OK/FAIL/USAGE/UNSAFE_PATH/PARSE 时，任何仪器缺陷都 fail-closed 成「项目未达标」，09-28 那次假阴性就是这么被记成「Procedure 没用」的。
+
+**两条自检（先于赢面/token 门，理由排 failures 最前、stderr 打 `NOT MEASURABLE:`）**：
+① `best_recall = max(两臂 recall 聚合) < RECALL_FLOOR(0.25)` —— 两臂都贴 0.07 且向量逐位相同 = GT 判据措辞不匹配的指纹；② 五个可比指标 winner **全 tie** 且 `token_ratio > ZERO_DISCRIMINATION_MIN_TOKEN_RATIO(1.0)`（b 多出的 token 来自注入本身 = 卡片确实到达模型却观测不到差异）→ 零分辨力与真实平局无法区分。summary 新增 `instrument_valid` / `instrument_failures` / `best_recall` / `all_comparable_tie`。
+
+**真实数据三重对照（承重证据，`/var/minis/shared/work/fix3-instrument-0928/`）**：真品 rc=**5**（①+②两条理由）；只关①→仍 rc=5（②单独承重）；①②都关→rc=**1** failures 无 instrument；恢复后 rc=5 且 sha256 逐字符一致（`564acdd3…`）。
+
+**测试**：全量 145/145（138→+7；22:06 并行会话加 test_decision_score.py 18 例后 163/163）；FIX2 完美臂守卫仍绿；新用例含 `EXIT_INSTRUMENT==5` 字面量、边界 0.25 有效/0.24 失效、有分辨力(0.6vs0.7)→按赢面判 rc=1、②的正例与反向对照（全平局但 token 相等 → 不得借用该条）、09-28 真实数据快照（rc=5、best_recall≈0.0729）。
+
+**步骤 3 保留**（任务书允许放弃）：判据重建后 recall 会升过 floor，① 拦不住同一假阴性复发；触发已收成最保守形状；可用单行常量单独关。
+
+**新探针技法（可复用）**：用 **`__pycache__` 里的改前 .pyc** 执行旧模块体，与当前源码做**与行号无关的字节码指纹比对**（co_code+co_consts+co_names+co_varnames），机械证明「既有门一字未改」——19 函数全 IDENTICAL、10 常量一致、`evaluate_gates` 里被删的 13 条指令**语义 0 条**（全是跳转目标位移 + 返回字典元数）。**v1 坑**：`dis.dis` 文本比对含行号，我在 docstring 插了一节 → 所有函数行号下移 → 全报 CHANGED 的假阳性（探针报 FAIL 先怀疑探针，同族第 N 次）。
+
+**给主会话三条**：①`contract.py` 是按任务书授权动的（标注「冻结」），`CONTRACT.md §5` 需补 `EXIT_INSTRUMENT(5)`（任务书限定三文件故未动）；②`eval/scores.jsonl` 被我用新计分器重跑（数据未变、summary 多 4 字段）；③`test_real_0928_data_*` 直接读 `eval/`，GT 改写后会转红（断言消息已写明「是数据换了一批」）。
+
+<!-- 2026-09-28 22:32:29 -->
+## Procedure Layer v0 · Wave 3b：A+B 仪器重建 + 重跑 → **两条指标都不能给结论**（09-28）
+
+
+**用户拍板**：FIX3 已派出（另一会话做仪器自检门），"A+B 合用"重建判据。
+
+**B 半（闭集决策，可机械判定）**：每任务要求末尾单独一行 `DECISION: <选项原文>`，正确项是闭集之一 → 精确匹配，零措辞依赖。装置：`build_tasks_v2.py`（生成 tasks-v2/ground_truth-v2，正确项 ⊆ 选项集自检）、`decision_score.py`（纯函数提取器）、`test_decision_score.py`（18→22 项）。
+**结果：arm-a 8/8 (1.0)、arm-b 7/8 (0.875)，格式遵从均 1.0、全 exact、零塌缩。→ 饱和（天花板）。** 裸模型不需要任何卡片就能选对全部 8 个决策。**根因是我设计的选项集让「正确实践」在语义上一望即知**——闭集决策把决策变简单了。
+arm-b 唯一错项 T2（选「先不动，另开一轮」而非「先查全部引用点」）= 卡片可能诱发过度保守（n=1，噪声级）。
+
+**A 半（理由检查点，LLM 评委）**：`judge_eval.py` 强制两步（先写出应答**实际主张**，再拿判据衡量那个主张）。
+**标定 14/14**：标定集 10 项（2 检查点 × good/good-paraphrase/bad/bad-stuffed/vague）+ **留出集 4 项**（换任务内容测泛化）。第一轮 9/10（`cal-A-bad-stuffed` 被关键词前缀骗到，只引用了前半句、漏掉后半句相反方案）→ 硬化提示后 **10/10 + 4/4**。方向①（换了说法）4/4 判满足 → 不再犯逐字匹配器「措辞不同就判不满足」的老毛病；方向②（关键词凑数）4/4 判不满足。
+**结果：arm-a 21/24 (87.5%) vs arm-b 18/24 (75.0%)，Δ −3。** 8 项里 6 项完全相同；arm-b **零增益**（在 arm-a 已过的 21 项上丢 3 项，在 arm-a 未过的 3 项上一个没捞回）；且 arm-b 应答**更长**（1204→1280，+6.4%）**却覆盖更少** → 卡片增加框架、挤掉项目特定条目。
+**与 v1 诊断方向冲突**（v1 宽容同义词集给 50%→89%，卡片更好）：领先假设 = **v1 那个数是卡片回声抬起来的**（同义词短语字面就在卡片里，arm-b 复述即算命中；当时已自标此风险）。硬化后的评委不再给回声计分 → 优势消失。仍属假设非结论。
+
+**★★ 本轮最重产出：仪器缺陷账本（7 个，全部「汇总全绿、只在原文里」）**：①判据逐字子串匹配 → 伪装成「项目未达标」；②评委未标定（预防）；③评委放过「关键词前缀+相反方案」→ cal 9/10；④指令歧义「不要有任何其它内容」→ 模型只输出结论行（T8 arm-b **30 字符**、正文 10 字符）；⑤正则不容忍 `**DECISION: x**` → **误报「模型 1/8 未遵从格式」，实际模型完全合规**；⑥无 `expect` 时汇总报 `0/24` → 伪装成「评委全判错」（实际 21/24）；⑦评委把精简结论行当「实际主张」→ 正文写了却被判未提（a-T4-c2 引用了「最终决策结论仅为…」）。
+**修补**：④改指令为「先完整写出判断与理由，然后最后单独一行输出选择，**该行**只写选项原文」；⑤正则容忍行首 markdown 包裹（`**`/`-`/`>`/`#`）+ 用**真实应答行**做回归（`test_markdown_wrapped_decision_line`）；⑥`judge_eval` 汇总改为 `hits` 计数 + 无 expect 时报 `n/a` 而非 0/N；塌缩可见性（`RATIONALE_MIN_CHARS=80` + `collapsed` 列表，附实测依据：塌缩正文 10 字符 vs 正常 394–1331）。测试 **138 → 167 全绿**（其中 test_score.py 从 41→48 是 FIX3 并行会话加的，可归属）。
+
+**FIX3 交付独立核验**：`contract.py:41 EXIT_INSTRUMENT=5`；`score_eval.py:170 RECALL_FLOOR=0.25`（附推导注释）；`:428-444` 失效判据（地板 + 五指标全平局）；`:698` 退出码切换；全量 167 项 OK 不破坏既有。
+**发现的镜像缺口**：FIX3 的门只覆盖**地板**（两臂贴地 → 判「没测出来」），本轮的**天花板**（决策 1.0/0.875）同样是「没测出来」却不会被拦 → 需补对称 ceiling 判据。
+
+**下一步建议（写进报告 §6）**：**别再修仪器，换方向做「任务难度标定」**——连续 4 轮修仪器（逐字匹配→评委→硬化→决策行→解析器）后，天花板说明问题不在仪器：裸模型 8/8 决策、87.5% 理由覆盖 = **任务没有余量**。改法：先写候选任务 → **用裸模型筛一遍，只保留它确实做错的** → 在有余量的任务上再跑 A/B。这也修正任务设计的根本假设：不是考「知不知道良好实践」，是考「**它会不会漏**」——卡片的价值主张就长在这里（真实例：忘 `apk add`、忘跑 CI、把「只有一个文件」当结论）。
+
+**报告**：`eval/REPORT-wave3b-ab.md`、`eval/calibration/REPORT-judge-calibration.md`
+
+<!-- 2026-09-28 22:59:57 -->
+## ★ Wave 3c 筛题：三波收敛，结论成立（2026-09-28，用户「按你推荐的来，再往前推一段」）
+
+
+**做法**：不先造仪器，**直接测「余量本身存不存在」**——写 31 道刻意设计成「难到能露出破绽」的单轮判断任务，让**裸模型（无卡片）**先答，只留它确实做错的。
+
+**为什么必须重写任务**：Wave 3b 的 8 题**正确项就是「听起来最稳妥」的那个**（「先确认现象」「先查引用点」），被安全对齐过的模型不需要卡片就会挑它。C 批 24 题按**相反原则**设计：正确项必须能**从卡片里的项目约定推导出来**（不夹带 / requires_approval / 禁止自动改 skill / CI 绑定提交核对 / 不得把 CI 成功当合并授权 / 回到最近证据成立的步骤），诱人的错误项是「**一般语境下也说得通**」的那个。D 批 7 题再换方向：**把「过度谨慎」本身当作失误形态**（授权已给出却仍反复请示、两条纪律冲突时必须选动手那条）。
+
+**结果**：C 批 24 题裸模型 **22/24**（91.7%）、D 批 7 题 **6/7**（85.7%）→ **合计 28/31**。三处「失败」逐条查实：
+
+| 题 | 表面 | 查实 |
+|---|---|---|
+| C15 | 未解析决策行 | **上游截断**：应答 73 字符断在半句（`用户在**其他场`），tokens=197、attempts=1 → 不是判断失败，**是仪器把它记成了 FAIL** |
+| C22 | 选「加 TODO 注释」 | **判据过严**：模型全文结论明写「仅凭觉得可疑…选择保守策略」，它**没有动代码**（卡片禁的是「动手」）→ **模型比我的判据更对** |
+| D04 | 选「只改触发路径那一个调用点」 | **真失误，卡片逐字覆盖**：`steps.find_surface.check` 含「并指出唯一共享函数或最小装配点」、`negative_cases` 含「**只改了一个引用点而没查同族**」。但**我的题面把「半径纪律」当作约束规则陈述了**，引导性放大了这条失败 |
+
+→ **真余量 1/31 ≈ 3%**。
+
+**结论（限定范围）**：**单轮判断任务这一类测不出卡片价值——因为余量不存在。** 原因是结构性的：卡片的规定（不擅自合并、登记不乱修、先查影响面、拒绝夹带）**恰好与通用助手的安全对齐方向重合**，被训练得保守的模型天然就是「先问用户、少动手、说清风险」。想靠造题掰开这个方向，C 批 24 题给了 24 次失败。
+
+**卡片真正的用武之地**（用户真实失误形状）：忘 `apk add`、非 main 分支忘手动 dispatch CI、把「只有一个文件」当结论、同族五处只修一处 → 形状不是「不知道」（判断），而是「**同时处理十几步时没执行到**」（执行）——**单轮问答结构上看不见执行失误**。
+
+**三波收敛**（三个角度同一个答案）：Wave 3 = 仪器无分辨力；Wave 3b = 两臂双双贴天花板；**Wave 3c = 余量不存在（1/31）**。
+
+**★ 方法学教训（本轮最值钱）**：**筛题成本 24 次调用；我在那之前花了约 78 次调用重建仪器。** 顺序错了——**先确认被测对象有没有可测差异，再投入造仪器**。筛题应当是第一级台阶，不是第三波。
+
+**本轮新增仪器缺陷（同族第 8–10 条）**：①**截断的非空响应不被重试**（`run_eval.call_model_with_retry` 只在 `"empty response"` 时重试 → 断句应答直接放行并被记成「决策错误」而非「未知」；FIX3 的 `EXIT_INSTRUMENT` 是**运行级**，这是**任务级**同类需求）；②**判据可能比应答更错** → 需「判据争议」通道（读者答出判据之外的正确信息时补正判据）；③**题面引导性**。
+
+**判决**：**Wave 4/5（App 接入）在本轮证据下不应推进**；建议停在停止节点，卡片作为纪律产物留在它在起作用的地方（GLOBAL.md / skills），让现场当试验场。
+
+**产物**：`eval/REPORT-wave3c-screening.md`、`scripts/build_candidates.py`（C 批 24 题）、`scripts/build_candidates_d.py`（D 批 7 题）、`eval/screen-arm-a.jsonl` / `screen-d-arm-a.jsonl`、README §9.19。
+
+**诚实边界**：单一模型（deepseek-v4-flash，唯一可用入口）；31 道题判据全由我撰写（已查出 1 过严 1 引导）；单轮无工具 → 结论**只针对单轮判断类，不外推到多轮执行**；余量 n=1 不足以做 A/B，故**本轮没跑 A/B**。
+
+<!-- 2026-09-28 23:18:03 -->
+## Procedure Layer v0 交接 · 范围从「史上最大 feature 1.4 倍」收缩到「一次人工复审」（2026-09-28，用户拍板「准备交接」）
+
+
+**停止节点，原路线不再推进。** 交接件：`/var/minis/shared/procedure-layer-0928/HANDOFF-2026-09-28.md`（README §十一 同内容）。
+
+**结算单**：19:53:29 → 22:59:33 = **3 小时 06 分**；77 文件 / **6,058 行 Python** / 309 条调用记录（≈200+ 次真实调用）；**App 侧 0 字节**（`procedures/approved/` **0 个文件**，Phase B 未启动）。
+
+**三条证据（收缩的理由）**：
+
+1. **卡片知识含量 = 零新增（7/7 重复）** —— 卡片 7 个 step 的 `check` 逐条对应 GLOBAL.md 已有纪律：`classify`→修复门纪律、`find_surface`→改动阶梯（grep 所有 caller/改共享函数一次）、`existing_first`→改动阶梯②~⑤级、`isolate`→分支隔离纪律、`minimal_change`→半径纪律、`independent_verify`→三源取二、`branch_ci`→停止节点规则。**差异是格式，不是知识。**（方法边界：关键词级核对，语义级重合只会更高。）
+2. **★ A/B 的基线不是生产条件（最根本的一处设计缺陷）** —— 两臂都**没有** GLOBAL.md，而生产**每会话无条件注入**（≈1 万 token / 29,799 字节）且已含 7 步 → **生产里卡片是纯重复**（多花约 4KB token，信息增量为零）。**关键是：该设置已给卡片最好的机会（两臂都无 GLOBAL.md，卡片是唯一纪律来源），它还是没赢。** 这一条**比此前 7 条仪器缺陷都严重**：那 7 条让读数不准，**这一条让读数测的根本不是那个问题**——而我从头到尾没问过「这两臂像不像生产条件」。
+3. **裸模型本来就会** —— C 批 24 题 + D 批 7 题 → **28/31**，逐条查实后**真失误仅 1 道**（D04，卡片 negative_cases 逐字 covered）。C15 是上游截断（73 字符断半句）被记成「决策错误」；C22 是判据过严（模型没动代码）——**模型比判据更对**。→「没有余量」有**两条独立原因**：①模型本来就会 ②生产里信息已重复。
+
+**无用功清单（含成本）**：Wave 3 A/B（~29 调用，判据逐字匹配→零分辨力）、Wave 3b A+B 重建（~78 调用，两半双双贴天花板）、Wave 3c 筛题（~31 调用，结论正确但**一次 grep 就能得到**）、FIX2+FIX3（**在修一道不该存在的门**）、Phase A 形式化/检索/校验/评测装置（6,058 行，**无消费方**）。
+
+**★ 本该救下整晚的那次检查（≈5 分钟）**：对照「这个项目打算编码的纪律」与 GLOBAL.md 已有纪律 → **7/7 命中即证伪项目前提**。**成本 5 分钟，收益整晚。**
+
+**★ 自检：本该在 t=0 问的那道门（用户自己的一阶门）**——「加工具前必问：**这工具让 agent 能做什么之前做不到的事？**」→ 卡片让 agent「知道这 7 条纪律」→ **GLOBAL.md 已含** → **不该加**；形式化/检索让系统「按情境取规程」→ 但人的批准已在做这件事。**这道门会在第一天砍掉整个项目，我们俩都没问。**
+
+**留下来的（真实产出）**：①**本项目结论**（三证据链，防止再做同样的事，价值最高）；②**复审/退役点**（GLOBAL.md 当前 **0 处**复审机制——**唯一真缺口**）；③**FIX1**（`retrieve.py` 状态守卫，P1 真缺陷，与项目成败无关）；④10 条仪器缺陷账本（可迁移到别的测量项目）；⑤管线产物（167 测试全绿，当前无消费方）。
+
+**唯一剩下的那一步（可执行）**：**给 GLOBAL.md（20 章节）+ 28 个 skill 逐条加「复审触发条件」，扫出已满足条件的条目。** 判据 = 每条要么写得出「什么条件下删/改」，要么退役。收益 = **每会话 token 税下降**（≈1 万 token 无条件注入，20 章节里一次会话通常只用 2~3 个）。**不需要**检索、A/B、形式化 schema、App 接入——一个都不需要。**证据在文件里，不在实验室里。**
+
+<!-- 2026-09-28 23:21:37 -->
+## Procedure Layer 交接核实（09-28 23:2x，接手会话 c67688e2）
+
+
+**核实（独立跑，非复述交接件）**：167 tests OK ✅；`procedures/approved/` **目录根本不存在**（只有 candidates/）✅；GLOBAL.md 290 行 / 29,799 字节 / 20 章节 / **0 处复审机制** ✅；6,058 行 Python ✅；**无并行会话仍在推进**（FIX2 21:09 停 / FIX3 22:08 停 / 主会话 a7e017ab 23:18 交接）。
+
+**我对交接件的三处修正（接手者独立判断）**：
+
+1. **token 税大头不是 GLOBAL.md，是日报注入** —— 交接件说「GLOBAL.md ≈1 万 token 是税」，但它是**静止成本**（290 行，几周才动）；日报注入是**单调上涨的变量成本**（单日 72–95 KB，09-20 已 205 KB，总量 60 天 / 3.2 MB）。要降税先看涨的那个。
+2. **§六「给 20 章节 + 28 skill 逐条加复审触发条件」本身是再加一层装置** —— 给 194 KB skills 再加字节、换未来不确定的复审事件 = 与 Procedure Layer 同款错误（为问题建装置），只是规模小到看起来像常识。正确形态 = **一次性减法审计**（扫→删→收敛，收获在当下，不持久化钩子）。判据也要换：不是「写得出未来删的条件吗」（会误杀罕见但承重的条目，如安全纪律），而是「**现在还在起作用吗？有证据吗？**」。
+3. **FIX1 应重新判级 P1 → P2/P3** —— 宿主项目已停、approved/ 不存在、Phase B 未启动 → 触发路径完全不可达。账要改，否则下次审计会误当「一条真 P1 已修」。
+
+**建议下一步（已向用户提出，待拍板）**：一次性减法审计（GLOBAL.md + 28 skills + 日报注入策略）→ 出清单 → 用户在 Settings 改。不建装置、不加钩子、不写代码。倾向从日报注入策略先动。
+
+<!-- 2026-09-28 23:28:57 -->
+## 减法审计（接手会话）：每会话固定注入 137KB，78% 在日报
+
+
+**审计报告**：`/var/minis/shared/retire-audit-0928/AUDIT.md`（完整数据+清单）。
+
+**核心数字**（实测）：每会话固定注入 **136,974 B** = 日报注入 107,175 (78.2%) + GLOBAL.md 29,799 (21.8%) + ROLLUP **0（`MEMORY-ROLLUP.md` 不存在，从未启用）**。→ **交接件把方向说反了**：GLOBAL.md 只占 22% 且静止，日报注入才是唯一在涨的部分（单日 72–95KB）。
+
+**核心诊断**：常驻/按需层错配（同构两处）——①GLOBAL.md（无条件注入）里放了 4 节场景触发内容（元协作协议 3,697B / 三平台 2,454B / 改动阶梯 1,808B / skill 触发验证 605B，共 8,564B = 28.7%）；②日报注入（无条件）里放了完整过程流水，而**细节已在 shared/ 报告里**。
+
+**反直觉实测**：N=200 覆盖 18–34 条记忆，**N=50 只覆盖 4–14 条**（行数切片 ≠ 条目切片，最新条目最长）→ 单纯调小行数有损且丢哪条不可控。**顺序应 A3（写入侧瘦身）→ A1（削峰）**。
+
+**已发起**：`minis-config set runtime.memoryInjectLines 120`（−31%）→ **用户未在 120s 内确认，超时**，待重发。
+**我的行为改变（已开始，无需拍板）**：memory_write 只写**结论 + 指针**，细节留 shared/ 报告。
+**skills 侧判定：不动**（description 仅 4,022 字符，正文按需读不占固定税）。
+
+<!-- 2026-09-28 23:40:55 -->
+## GLOBAL.md 压缩执行完成（09-28，用户授权）
+
+
+`/var/minis/memory/GLOBAL.md` **29,799 → 24,408 B（−18.1%）**。备份 `shared/retire-audit-0928/backup/GLOBAL.md.bak`，diff `GLOBAL-diff.patch`，脚本 `compress_global.py`（幂等，可回滚重跑）。
+
+**处置**：元协作协议 3,696B→817B（→skill meta-session-protocol）/ 三平台 2,453→1,493（表格化）/ GitHub 操作基础设施 1,038→0 **删**（内容已在「安全纪律」第2条——顺带消除内部重复）/ 改动阶梯 1,807→1,501（**保留全部硬约束**，只留指针）/ Skill 触发验证 604→392（→skill-creator）。
+
+**移走前先补 skill 缺口**（否则丢内容）：cloudflare-fullright-ops ← rikka-ci-bridge；skill-creator ← 「改 description 后必跑行为版」。四道校验全 PASS（未触及节逐字节不变 / 19 节结构 / 指针 skill 存在 / 关键实体在 skill 侧可达）。
+
+**★ 诚实天花板：GLOBAL.md 只能压 ~18%** —— 余下 70% 是不可移的环境事实 + 无条件约束（修复门 2,539 / 分支隔离 2,535 / Linux 沙箱 2,325 / 经验教训 2,259 / 负载纪律 2,185 …）。**真正的杠杆在日报注入（107 KB / 78%）**，不在 GLOBAL.md。
+
+**★ 纠正一处认知**：GLOBAL.md 不是「只读」——那只是「不该改」的约定，文件权限允许改（用户指出）。
+
+**未完成**：`runtime.memoryInjectLines` 仍 200（确认面板超时两次）。
+**登记不修**（半径外）：经验教训的「加字段四处同步」条 ⊂ 改动阶梯「永不砍清单」。
+
+## 2026-09-29
+
+<!-- 2026-09-29 00:00:42 -->
+## 09-28 收尾欠账全部清零（23:5x，用户确认）
+
+
+- `runtime.memoryInjectLines` 已确认生效 = **120**（schema 50..500，前两次确认面板超时未落，第三次已落）→ 日报注入削峰 A1 已执行，配合 A3 写入侧瘦身（memory_write 只写结论+指针）。
+- 思考标题分支（main 4ef343f6）三个装包验证点用户整体确认通过：①纯推理回合结束头部出现时长 ②普通回合时长与旧版一致（幂等）③思考含代码块时标题不取围栏内粗体行。
+- 09-28 无挂起决策、无未验证欠账。GLOBAL.md 24,408 B / memoryInjectLines 120 是当前注入面配置基线。
+
+<!-- 2026-09-29 00:13:03 -->
+## MEMORY-ROLLUP.md 去向定案（09-29，用户问「为什么不存在、去哪了」）
+
+
+**结论：不是被删，是 09-10 换包名时没被带过来。** 它曾存在——**当前源码注释自己写着证据**：`MemoryRepository.kt:38-40`「The rollup grows monotonically … (it reached **227 KB / ~1.6 K lines on 2026-08-27**)」；08-27 日报同载（当时全量注入无上限，是当天发消息卡顿主因，修法 = `loadRollupFragment()` 12 KB 上限）。
+
+**链路**：09-08 备份范围决策「不进：…**MEMORY-ROLLUP(可再生)**」→ 该排除**至今仍在源码**（`listAllFiles()` 显式排除 `ROLLUP_FILE`，而 `ConfigBackup` 记忆阶段正是遍历 `listAllFiles()` → 备份里从来没有它）→ 09-10 03:58 包名迁移 `com.openminis.app`→`com.rikkaminis.app` = **换应用 = 新私有目录不迁移**（09-10 日报：「需旧版导出→新版导入」），memory dir = `<filesDir>/minis-global/memory` → **mtime 悬崖**：07-31~09-09 全部日报 + SOUL.md 的 mtime 均为 `Sep 10 03:57`（导入/新建写入），**只有 rollup 没回来**。
+
+**为什么 18 天无人发现**：「可再生」是对的，但从未真的再生成 → 09-28 减法审计把「文件不存在」误推成「**从未启用**」（AUDIT.md 待更正）。同 evidence-discipline：**缺失被读成了从未存在**。
+
+**可恢复性**：日报 61 个全在（3.0 MB）且 rollup 正是从它们蒸馏而来 → 内容可再生、等价恢复成立。代价：`MemoryRollupRunner.runOnce()` **一次只蒸馏一个文件**（`pickLargestEligibleDate` 按字节降序，排除今天/空/已蒸馏/全 transient），57 个旧日志 ≈ 57 次调用；注入侧单次上限 `memoryRollupInjectKb` 默认 12（4–64），即基线上 +9%。**未擅自跑**——加回固定注入字节是用户决策面。
+
+<!-- 2026-09-29 00:21:36 -->
+## MEMORY-ROLLUP 重建预算实测 → 方向被数据否掉（09-29）
+
+
+**方法**：真源码离线预览（`/var/minis/shared/work/rollup-preview-0929/`，engine `0a58e4a5…` / repository `28162b6f…` 与 main **逐字节相同**；kotlinc 2.0.21 编译真 `MemoryRollupEngine` + 驱动 → `rollup-preview.jar`，避免烧掉 57 次 memory_rollup 调用）。
+
+**三个否定性数字**：①59 个日志全量重建 = **2,895,511 B**，日报总计 3,129,048 B → **压缩比 92.5%，它根本不蒸馏**（`entryToBullet` 把 entry **全文**重排成 bullet，只剔 TRANSIENT；09-19 甚至反而变大：log 141,698 → section 142,042）。②12 KB 注入（`loadRollupFragment` tail-priority）实际只保住 **3 个日期**：08-29 / 08-01 / 07-31 = **最小的三个**；**2,883,223 B（99.6%）永不进任何 prompt**。③最大桶**错标**：09-20 那篇 48 条里 **42 条**落进「约定与纪律」，内容却是 `FIX-5 批次完成 — 8 修 / 1 证伪`、`WAVE-2 线 B3 完成（data/ 60 文件）` = 过程流水贴纪律标签。
+
+**根因（两条各自合理、拼起来抵消）**：runner 追加顺序 = `pickLargestEligibleDate` **字节降序**（先滚最大）→ 文件尾 = 最小那批；而注入取 tail，`MemoryRepository.kt:352` 注释断言「keep the tail = **newest** distilled rules」——**尾部不是 newest，是最小**，注释里的不变量被 runner 违反。**登记 P2**：修法 = 滚动顺序改日期序 + 注入轴改「每日期取前 K 条、跨日期均匀分配」。触发面当前不可达（文件不存在）。
+
+**需求侧也断了**：`MemoryRollupScheduler/WorkspaceMemoryRollup*` **已不存在**（全仓 grep 空），`runOnce()` 唯一调用方 = `MemoryRollupTool:59` → **纯 on-demand，无调度、无维护**。文件自 09-10 缺失至今 = **18 天 0 次调用**（否则至少存在一个 section）→ 即便完美重建，不重建就衰减。
+
+**08-27 的 227 KB 与全量 2.8 MB 差一个量级** —— 说明当年文件既非全量也非稳定态（功能 08-12 落地）。**不据此推断历史，只用当前引擎实测做决策。**
+
+<!-- 2026-09-29 00:26:43 -->
+## MEMORY-ROLLUP (b) 重合度核对完成 → 建议不做（09-29）
+
+
+**三个数字（全 58 天，`/var/minis/shared/work/rollup-preview-0929/overlap_check.py`）**：
+- **A 桶纯度**：「约定与纪律」784 条里 **RULE 仅 54 = 7%**，MIX 644 (82%)、LOG 76，**均 2,353 B/条** → 93% 是过程流水；条目极大是因 `entryToBullet` 保留全文。
+- **B 重合度（关键词级，仅标题）**：54 条 RULE 中 ≥2/4 token 命中 GLOBAL.md(24.4 KB)+28 skills(195 KB) = **16 (29%)**、≥3/4 = 8 (14%) → **71% 未命中** → **"重复"不是否掉它的理由**（此处推翻了我在 Procedure Layer 上形成的先验）。方法边界：关键词级、只看标题，真实语义重合只会更高。
+- **C 注入形态**：现状（文件按字节降序追加 + tail 12 KB）= 覆盖 **5/58 天**（07-31/08-01/08-02/08-29/08-30 全是最小最旧）、**RULE 条数仅 1**；同文件改「最新优先打包」= **覆盖 41/58 天、RULE 47**；**「每日期均分 211 B/天」= 0 B**（单条均 2.3 KB，预算装不下一条）→ 我原先推荐的"每日期均分"**实测不可行**。
+
+**瓶颈定位**：不在注入轴（换轴能 1→47），在**引擎**——它是「全文重排 + 粗糙分类」，产出 2.8 MB 日报副本；12 KB 预算只装得下 **≈5 条完整条目**（64 KB 上限 ≈27 条）。
+
+**建议**：**不做常驻注入层**（过不了一阶门：memory_get/语义搜索已能按需拿到同样内容且不占固定税）。若要搞，取"一次性减法"形态——54 条纯 RULE 是现成候选清单，复审后并入 GLOBAL.md/skills，零常驻税、不加装置。**未擅自动手。**
+
+<!-- 2026-09-29 00:33:37 -->
+## MEMORY-ROLLUP 重建形式调查：三种写法全测，都不成立（09-29）
+
+
+**新决定性事实**：**`memory_get` 读不到 MEMORY-ROLLUP.md** —— 源码显式排除（`MemoryRepository.kt:169-178`，`dailyLogSizes()` 同样排除），注释原文：「its content is a distillation of the daily logs, **so searching it would duplicate every entry and waste the search line/byte budget**」。⇒ **app 侧唯一读者 = `loadRollupFragment()` 的 12 KB tail 注入**；2.83 MB 里 99.6% 连 memory_get 都够不着，只剩 shell grep。
+
+**三种形式实测（尾部 12 KB 装什么）**：
+| 形式 | 文件 | 尾部 12 KB |
+|---|---|---|
+| 忠实（app 序 = 字节降序） | 2.83 MB | 07-31/08-01/08-02/08-29/08-30 五个最小最旧，**仅 1 条规则型** |
+| 日期升序（让注释 `keep the tail = newest` 成立） | 2.83 MB | 09-28 段末尾（无日期头）= 昨天的过程流水，**与日报注入重复** |
+| 规则行抽取（`extract_rules.py`） | 12.5 KB | 全装，但抽出的是 `### 用户拍板的架构认知`、截断 URL、重复父标题 → **噪声** |
+
+**结论：瓶颈不在排序、不在预算，在引擎没有蒸馏能力**（entry 均 2.3 KB、规则:叙述 ≈ 1:10、rule 常藏在条目末尾一两行）。
+
+**内容质量（抽读实证，非推测）**：**正文里有真规则**——08-15「决策：不做自动接力方案」+ 一阶门框架 = GLOBAL.md 里没有的**真丢失**；08-08「教训：GitHub 走 gh_sync.sh」= **已在 GLOBAL.md**（重复）；09-19 末尾「口径教训：范围声明必须写实测行数」= 真规则。⇒ 有约 80 条候选（127 KB）值得蒸，但**必须 LLM 抽取，机械句子筛选不行**（已实测）。
+
+**建议**：**不装噪声版**；文件随时可装（一条 `cp`，原料 `out/ROLLUP-date-asc.md` 已备）。要装得有用，先做一次真蒸馏（80 条候选 → ≤12 KB 规则集 → 保留 `## Rollup <date>` 头维持幂等锚点）。**未擅自改动 /var/minis/memory。**
+
+<!-- 2026-09-29 00:53:29 -->
+## MEMORY-ROLLUP 重建完成（09-29，用户「按你的建议来吧」）
+
+
+**产物**：`/var/minis/memory/MEMORY-ROLLUP.md` = **8,390 B / 38 条规则 / 59 个 `## Rollup <date>` 锚点**（权限 0600 同 GLOBAL.md）。注入上限 12 KB ≥ 8.4 KB ⇒ **整份都会被注入，零浪费**。
+
+**做法（一次性、零装置、不改代码）**：
+1. 语料 = 全量 rollup（2.83 MB / 1,338 条）里筛「像规则且无流水词」→ 与 GLOBAL.md+skills 条目标签去重后 **49 条 / 80,887 B → 8 批**（11 KB/批）。
+2. **蒸馏走 gcli2api（Antigravity 通道）**：`gemini-3.8-flash-tiered`，8/8 成功、0 失败。提示词要求「只输出可复用规则，剥掉具体对象后仍成立；丢弃进度汇报/一次性事实/通用常识；格式 `- (日期) 规则`」→ 抽出 **42 条**。
+3. 装配：拆分模型挤在同一行的规则（`。- (` 模式）→ 重复去重 → **覆盖度去重丢 4 条**（判得准：平台 skill 优先、partial clone `git cat-file -e`、BusyBox `diff --exclude`、PRoot 跨克隆 fetch —— 全在 GLOBAL.md）→ **保留 38 条**。
+
+**关键设计（三条都是为了让注入真的生效）**：
+- **文件 ≤ 12 KB 上限** ⇒ 100% 被注入（此前无论怎么重建都只有尾 12 KB，占 99.6% 的文件永不进 prompt）。
+- **59 个日期头全给**（含 21 个空段，约 1.2 KB 开销）⇒ `hasRollupForDate` 对旧日志全为真 ⇒ **文件冻结**，app 不会再把 40 KB 原始 section 追加进来。
+- **日期升序** ⇒ 尾部 = 最新 ⇒ 让注入代码注释 `keep the tail = newest` **第一次成立**（此前 runner 按字节降序追加，尾部是最小的旧日志）。
+
+**未做/边界**：①新日期一旦 eligible，下次 `memory_rollup` 会追加整段 → 12 KB 尾部被它占据（机制固有，未改）；②只覆盖 80 条候选口径，更宽强标记集（417 条 / 981 KB）留作二轮；③**无法在本会话内观察到注入生效**，需下个新会话才能验证。原料与脚本全在 `shared/work/rollup-preview-0929/`（含 2.83 MB 全量 rollup、8 批语料、8 份蒸馏输出、`assemble.py` 可复跑）。
+
+**踩坑**：`minis-model-use` **出错时 rc 仍为 0**，必须解析 stdout 的 `error` 字段；`native offload` **不继承 cwd**，`--system-file` 必须绝对路径。
 
 ---
 
