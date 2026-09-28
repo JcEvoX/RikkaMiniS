@@ -4,8 +4,8 @@
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
 - 合并范围：2026-08-03 ～ 2026-09-28，共 57 天
-- 条目总数：1399（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：1854437 / 总行数：26281
+- 条目总数：1405（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：1860356 / 总行数：26336
 
 ---
 
@@ -26274,6 +26274,61 @@ CLI 直读同一会话：`total:192 count:50` → **25 assistant + 25 user 交�
 
 `minis-mcp-cli remove memory` 已删，MCP 集成只剩 termux-dock。判据 = 一阶门：该服务器无持久化（每调用新 session 写入蒸发）+ daemon 不传 env，shell/python 读 JSONL 做同样的事，没有它就不成立的价值为零。**KG 数据保留**：/var/minis/shared/kg/memory.jsonl（24 实体/27 关系）为唯一真源，已在文件内标注服务器移除；读取用 grep/python 即可，无需 MCP。同日修复的 HF 语义记忆（1396 条）不受影响。
 <!-- 2026-09-28 10:05 -->
+
+<!-- 2026-09-28 09:55:15 -->
+## 文档三件套第二次重建 + 合并 main = 346ebf59（09-28，用户「更新文档是低风险，直接合并」）
+
+
+三回归测试（test_sanitize/test_rebuild/test_sagas）全 PASS → rebuild **1399 条**（前次 1386 → +13，dropped 75）→ sanitize main+INDEX 复扫 **NONE clean** → SAGAS 23 sagas / orphans 107 / multi4 82 → SAGAS 脱敏 NONE → 结构校验 fences 62 偶、anchors 1399 == header、outOrder 0。分支 `docs/dev-history-0928` @ `7bcd3aa`（3 文件 +262/−36）push OK → `--no-ff` merge = **346ebf59**（parents 8aaad10 + 7bcd3aa，docs vs tip 空、src 侧未变）→ push → 远端 main 逐字符 == 本地 → 分支 DELETE（主号 token 204；FULL_RIGHT token 对此 DELETE 返 404——小发现，日常用主号即可）→ docs/ 不在 build-apk.yml paths，push 后 runs 无新增（最新仍为 8aaad10 @ 01:38）= 未触发 CI 符合预期。**顺带更新两份过时账本**：deterministic-fix-queue.md 批次状态 → 已合并 c10f5675；HANDOFF-2026-09-27.md 头部加过时注记（main 演进链 + §3 项处置情况）。
+<!-- 2026-09-28 10:15 -->
+
+<!-- 2026-09-28 10:24:01 -->
+## 应用模块结构盘点（09-28，用户问「分多少模块」）
+
+- `com.rikkaminis.app` 下 31 顶层包 + 2 根文件，~543 kt 文件；按功能域聚成 4 大模块：①对话/AI 核心（agent 12 / provider 44 含 thinking 8 / data 74 / mcp 10 / network 6 / conversation 2，~150 文件）②UI（197 文件 14 子包，chat=101 最大、settings=42）③Agent 执行面（sandbox 63 含 sandbox/offload 46 / tools 14 / browser 13 / service 11 / offload 11 / speech 7 / webapp 5 / share 5 / accessibility 3 / terminal 2 / workspace 2 / power 1，~115）④系统支撑（config 20 / debug 12 / diagnostics 12 / backup 9 / logging 7 / crash 3 / deeplink 3 / shared 4 / notification 2 / i18n+util 3，~90）。
+- 头部子包：ui/chat(101) > sandbox/offload(46) > ui/settings(42) > data/db(17)，≈全 app 1/3 代码 = 历次 perf/bug 主场。15 个顶层包只有 1-3 文件（胶水级）。
+
+<!-- 2026-09-28 11:28:18 -->
+## TierFlow 兼容性实测（2026-09-28）
+
+对 https://tierflow.cn/v1/chat/completions 的实测：OpenAI SSE、tools、reasoning_content、assistant reasoning_content 回传、stream_options 均可用；TierSense 在 stream/non-stream 均返回 404。tierflow/tierflow_pro 实际为路由别名，响应曾落到 qwen3.8-flash；GLM-5.3-Flash/FlashX 输出 reasoning_content。强制思考模型在 RikkaMinis 发送 OFF/省略 reasoning_effort 时会返回 400「始终思考，请使用 low/high/max」，显式低档可用。设备日志已证实 tierflow_pro 的 OFF→400、XHIGH+reasoning_effort→正常 tool_calls。慢的主因是长 reasoning、高频 SSE delta、超大 agent 上下文，不是响应解析不兼容；诊断时优先用显式 Qwen3.8-Flash/GLM-5.3-Flash + 低思考，避免 tierflow_pro 别名和 OFF。用户粘贴的 API key 未写入记忆，已删除沙箱临时副本，需提醒用户轮换。
+
+<!-- 2026-09-28 12:45:44 -->
+## 思考折叠对照 rikkahub → 抄「实时标题 + 思考时长」（09-28，用户「能够实锤就抄」）
+
+
+**实锤结论（真实数据，非推测）**：①rikkahub 机制核实（`extractThinkingTitle` 取最后一个整行加粗 + `showThinkingTitle = loading && title != null` + `deep_thinking_seconds` 时长）；②本机真实思考文本**存在**该形态——session `9068927b` 5 条泄漏思考行（闭标签前 1500 字符为真实思考尾部）**5/5** 含动作短语（行首加粗或 `****` 拼接）；③但 rikkahub 的**整行规则在我们的拼接形态上会产出融合怪**（`**我统计子包层级****我把子包层级也数清楚**` → `A****B`），改用「尾部 4000 字符窗口 + 行首加粗 + 纯加粗运行取最新跨 / 散文行取行首跨 + 尾窗落在未闭合代码围栏则拒绝」；④**计时器缺数据底座**：`AssistantBlock` 有 startTimeMs/durationMs，但思考块创建时只给 id/kind/content，`parts_json` 不持久化 thinking（正文/思考分列）→ 时长只能会话内（与工具药丸同约定，重载回落字符数）。
+
+**改动（分支 `feat/thinking-title-and-duration` @ `4fe96bbf`，4 文件 +221/−10，CI run 36377954011 success，三源一致，未合并）**：`extractThinkingTitle()` 纯函数进 ChatFormattingUtils（复用既有 formatToolDuration）；思考头部流式中标签=标题、结束态补时长；AgentLoopEngine 2 处创建打 startTimeMs + 抽出共享 `finishThinkingBlock()`（原本两处内联 copy(toolStatus=SUCCESS)，顺带消除重复）。
+
+**证据**：真源码 JVM 套件 36/36（10 新例，2 例逐字节取自真实会话）；**6/6 变异全杀**（取首跨/去围栏守卫/去片段守卫/忽略预算/去长度上限/放宽行首）；scan 20/20；括号差值对照 main 全等；未新增字符串（i18n 零改动）。真实语料 248 助手行 → 14 行（5.7%）出标题，质量参差（模型常把行首加粗当小标题，如 `诚实边界`）。
+
+**刻意不抄**：流式自动 Preview（用户 08-18 拍板不要）、容器 N→2 折叠（与 09-28 负值判定冲突）、冻结块显示标题（会长成被 revert 的「逐行标题墙」；rikkahub 本身也只流式显示）。**思考文本命中率无法直接测量**（minis-model-use 不回 reasoning、debug 日志只记 rcLen、会话库不开放）——已写入报告诚实边界。报告 `/var/minis/shared/thinking-title-0928/REPORT.md`，装置 `/var/minis/shared/work/thinking-title-0928/`。
+
+<!-- 2026-09-28 12:50:43 -->
+## 思考标题分支核查发现（2026-09-28）
+
+核查 `feat/thinking-title-and-duration` @ `4fe96bbfa62f14ee5751c6bb7c1276005d7d45e7`：CI run 36377954011 success、head SHA 对齐；静态门 20/20，JVM 36/36，标题提取 6 个变异全杀。但合并前发现两个缺口，故未合并：①纯 reasoning 流结束路径（AgentLoopEngine:1078-1085，注释明确 reasoning-only turn）只 flush，不调用 finishThinkingBlock；UI 仅 durationMs>0 显示时长，故此合法终态没有时长（P1 候选，核心功能路径）；②extractThinkingTitle 的 fenced-code 防护只检查候选行自身是否 ```，没追踪是否处于代码围栏；真实源码 JVM 探针输入围栏内 `**fake title**`，实际提取 `fake title`（窄组合，P2）。后续应先由用户决定修复，再复核/合并。检查时 verify_branch 基线必须显式用 origin/main，普通 main ref 可能落后。
+
+<!-- 2026-09-28 13:22:35 -->
+## 思考标题分支：核查 → 修复 → 合并 main = 4ef343f6（2026-09-28，用户「没问题就合并」+「打包修」）
+
+
+**对象**：`feat/thinking-title-and-duration` @ `4fe96bbf`（思考头部实时标题 + 阶段时长）→ 本会话修两块缺口 → `4d8e1aa9` → `--no-ff` merge = **`4ef343f6`**（parents `346ebf59`+`4d8e1aa9`，合并树 vs 分支 tip 逐字节空、vs 旧 main 4 文件 +281/−10）。远端 main 逐字符一致；远端分支 API DELETE 204；main push 触发 release CI run `36381309329` @ 4ef343f6（**结论未等**，用户叫停）。
+
+**修复前核查（8 项全跑）**：CI `36377954011` success、scan 20/20、four-way CLEAN、i18n AUTO-SKIP、JVM 真实源码 36/36、变异 6/6 killed、diff 313 行无可疑行 → 但**两处功能缺口**。
+
+**缺口 1（P1，时长在常见路径缺失）**：`AgentLoopEngine` 只在 `Text`（:692）/`ToolUseStart`（:819）收尾思考块；流在思考阶段结束（reasoning-only 回合）时无人收尾 → `toolStatus != SUCCESS`、`durationMs=0` → 头部无时长。**触发面实测**：`debug-2026-09-28.modelservice.log`（逐条 SSE delta，按两个全零 role='assistant' chunk 切流）→ **460 流中 47 流（10.2%）在思考阶段结束**。脚本 `/var/minis/shared/work/thinking-title-0928/reasoning_only_scan.py`。修法：流结束路径 flush 之后补 `finishThinkingBlock`（幂等，SUCCESS 守卫）。
+
+**缺口 2（P2，围栏判定漏 parity）**：`extractThinkingTitle` 从尾部向上扫、只看候选行是否 ``` 开头 → 候选行在围栏**内部**时被当标题（开标记在其上方，向上扫先碰到候选）。真实源码对照臂：`**old**\n```\n**fake title**\n` 修复前返回 `fake title`、修复后 null；闭合围栏内粗体旧版整段拒绝（丢标题）新版取围栏外短语。修法：自上而下预计算 `insideFence[i]` 奇偶，跳过围栏内行，保留「尾部仍在未闭合围栏 → 拒绝」语义。
+
+**证据**：JVM 39/39；变异 **9/9 KILLED**（新增 m2 内层守卫/m7 尾部守卫/m8「任意围栏即拒绝」/m9 围栏永不闭合），pristine sha 前后不变；对照臂 `/tmp/fenceprobe/`；报告 `/var/minis/shared/work/check-0928/REPORT-thinking-title-and-duration.md`。
+
+**装包验证点（未验证）**：①纯推理回合结束后头部出现时长；②普通回合时长与旧版一致（幂等）；③思考含代码块时标题不取围栏内粗体行。
+
+**登记不修**：致命错误/取消路径实时会话仍不收尾（live-only 约定）；`flushThinkingTailIfPending` 新建块分支 `startTimeMs=now`（resetStreamThrottle 后基本不可达）。
+
+**工具坑**：verify_branch 的 base 要显式写 `origin/main`（裸 `main` 可能是落后 ref，会把 dev-history 分支内容算进 diff）；`run.sh` 原先把 out.jar 吐在仓库里 → 已改为输出到 shared 目录。
 
 ---
 
