@@ -1457,8 +1457,6 @@
     <string name="chat_stream_degraded_notice">Leistungsschutz: vereinfachte Darstellung während des Streamings</string>
     <string name="chat_resume_crash_warning">Beim letzten Mal wurde diese App während des Streamings nicht reagiert. Tippen Sie erneut, um trotzdem fortzufahren.</string>
     <string name="chat_message_large_export_fail">Export fehlgeschlagen</string>
-    <string name="chat_tool_pills_folded">%1$d weitere Tool-Aufrufe anzeigen</string>
-    <string name="chat_tool_pills_collapse">Einklappen</string>
     <string name="crash_freq_email_body">Crash-Log-ZIP ist angehängt. Gerätemodell, RikkaMinis-Version und Zeitstempel sind enthalten.</string>
     <string name="crash_freq_pick_files_title">Mehrere kürzliche Abstürze erkannt – Protokolle unten mit dem Entwickler teilen?</string>
     <string name="crash_freq_pick_continue">Fortfahren</string>

@@ -175,7 +175,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.staticCompositionLocalOf
@@ -432,23 +431,6 @@ internal fun AssistantMessageView(
         // rendering message.content after all tool blocks.
         val hasAnyTextBlock = message.toolBlocks.any { it.kind == "text" }
         val lastTextBlockIndex = message.toolBlocks.indexOfLast { it.kind == "text" }
-        // [T-android-tool-pill-fold] One agent turn carries every tool call it
-        // made, so a long turn composes into a pill wall (measured 992x34976 px
-        // ≈ 15 screens on session 9068927b, ~3/4 of it pills). Frozen messages
-        // past TOOL_PILL_FOLD_TRIGGER render only the first TOOL_PILL_FOLD_LIMIT
-        // pills plus one summary row; see ToolPillFoldPlan for the policy and
-        // why streaming is exempt.
-        var pillFoldExpanded by rememberSaveable("toolpillfold:${message.id}") {
-            mutableStateOf(false)
-        }
-        val pillFold = planToolPillFold(
-            isStreaming = message.isStreaming,
-            totalPills = toolPillBlocks.size,
-            expanded = pillFoldExpanded,
-        )
-        // 0-based index among tool_use blocks, advanced only for real pills so
-        // the fold's count and the loop's count can never disagree.
-        var pillIndex = -1
         message.toolBlocks.forEachIndexed { index, block ->
             when (block.kind) {
                 "thinking" -> {
@@ -508,25 +490,6 @@ internal fun AssistantMessageView(
                     // (stop/detail/rerun/copy/open-terminal) through
                     // [toolPillActions]; legacy/no-provider retains the
                     // default no-op pill.
-                    //
-                    // [T-android-tool-pill-fold] Fold bookkeeping lives in
-                    // this arm because it is also the catch-all for unknown
-                    // legacy block kinds, so the index only advances for real
-                    // tool_use blocks (same predicate as `toolPillBlocks`).
-                    // The summary row is emitted at the position of the first
-                    // folded pill, so the prose blocks around it keep their
-                    // stream order.
-                    if (block.kind == "tool_use") {
-                        pillIndex++
-                        if (pillFold.foldable && pillIndex == pillFold.limit) {
-                            ToolPillFoldRow(
-                                hiddenCount = pillFold.hiddenCount,
-                                expanded = pillFoldExpanded,
-                                onToggle = { pillFoldExpanded = !pillFoldExpanded },
-                            )
-                        }
-                        if (!pillFold.isPillVisible(pillIndex)) return@forEachIndexed
-                    }
                     val actions = toolPillActions(block)
                     if (actions != null) {
                         ToolCallPill(
@@ -578,53 +541,6 @@ internal fun AssistantMessageView(
         if (message.error != null) {
             InlineErrorBanner(error = message.error, errorDetail = message.errorDetail, onRetry = onRetry)
         }
-    }
-}
-
-/**
- * [T-android-tool-pill-fold] Summary row standing in for the tool pills an
- * aggregate assistant message does not render inline (see [ToolPillFoldPlan]).
- *
- * Deliberately reuses the tool-capsule surface (bg + hairline border +
- * rounded corner of the run-group header) so it reads as part of the tool
- * run rather than as a separate card, and it is a toggle: the same row
- * collapses the pills back once expanded. The count in the label is what
- * makes the fold honest — a folded row must never look like the whole turn.
- */
-@Composable
-private fun ToolPillFoldRow(
-    hiddenCount: Int,
-    expanded: Boolean,
-    onToggle: () -> Unit,
-) {
-    val label = if (expanded) {
-        stringResource(R.string.chat_tool_pills_collapse)
-    } else {
-        stringResource(R.string.chat_tool_pills_folded, hiddenCount)
-    }
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(vertical = 3.dp)
-            .clip(RoundedCornerShape(14.dp))
-            .background(ChatColors.toolCapsuleBg, RoundedCornerShape(14.dp))
-            .border(0.5.dp, ChatColors.toolBorder, RoundedCornerShape(14.dp))
-            .clickable(onClickLabel = label, onClick = onToggle)
-            .padding(horizontal = 12.dp, vertical = 8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(
-            imageVector = if (expanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
-            contentDescription = null,
-            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.size(16.dp),
-        )
-        Spacer(modifier = Modifier.width(6.dp))
-        Text(
-            text = label,
-            fontSize = 13.sp,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
     }
 }
 
