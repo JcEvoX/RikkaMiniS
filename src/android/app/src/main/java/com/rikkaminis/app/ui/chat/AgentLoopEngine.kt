@@ -1083,6 +1083,16 @@ internal class AgentLoopEngine(
                     // flush above is keyed on pendingChunkSb, which is empty on a
                     // pure-thinking turn.
                     flushThinkingTailIfPending(loopState, turn, turnThinking, turnTextSb)
+                    // [T-thinking-duration] Freeze the phase when the stream ends
+                    // *inside* the thinking phase: a reasoning-only turn (no text
+                    // and no tool call to hand the phase over to) or a stop
+                    // mid-thought. Neither Text nor ToolUseStart fires on those
+                    // paths, so without this the row keeps toolStatus != SUCCESS
+                    // and shows no duration, unlike the tool pills which always
+                    // stamp one. Idempotent: the SUCCESS guard leaves a block the
+                    // two sibling hooks already finished — and its earlier, correct
+                    // stamp — untouched.
+                    finishThinkingBlock(loopState, turn)
                     // T256: reset throttle bookkeeping for the next turn so the
                     // first delta of the next assistant message fires immediately
                     // rather than coalescing against this turn's stale baseline.

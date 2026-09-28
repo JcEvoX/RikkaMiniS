@@ -119,8 +119,9 @@ private val THINKING_TITLE_BOLD_RE = Regex("""\*\*(.+?)\*\*""")
  *    Here the phrase is the line-leading span, so that one wins.
  *
  * Line-leading only: an inline `**emphasis**` mid-sentence is not a title, and a
- * fenced code block (``` … ```) tail makes the block refuse instead of guessing
- * — thinking text of a coding agent often ends inside a code fence.
+ * phrase inside a fenced code block is never reported (see the parity note in
+ * the body): a tail still left inside an unterminated fence refuses outright —
+ * thinking text of a coding agent often ends inside a code fence.
  *
  * Frozen blocks are deliberately excluded by the caller (title shows while
  * streaming only, matching rikkahub, whose title is likewise gated on
@@ -139,10 +140,28 @@ internal fun extractThinkingTitle(
     // When the window starts mid-text its first line is a fragment, whose
     // "line-leading" bold span is not line-leading at all — never read it.
     val lowest = if (windowStart > 0) 1 else 0
+    // Fence parity, computed TOP-DOWN: `insideFence[i]` is true when an odd
+    // number of ``` markers precede line i. A bottom-up walk cannot answer "is
+    // this bold line inside a fence?" — the marker that opens the fence sits
+    // ABOVE the line, so the walk reaches the candidate first and reports it.
+    // Measured against this function (2026-09-28): `**old**\n```\n**fake
+    // title**\n` used to return `fake title`. Ceiling: a window that itself
+    // opens inside an unterminated fence inverts the parity — accepted, since
+    // the 4000-char budget is far longer than a fenced sample.
+    val insideFence = BooleanArray(lines.size)
+    var fenceOpen = false
+    for (i in lines.indices) {
+        insideFence[i] = fenceOpen
+        if (lines[i].trim().startsWith("```")) fenceOpen = !fenceOpen
+    }
+    // A tail still inside an unterminated fence refuses outright: for a coding
+    // agent that is a code sample, and a phrase above it may belong to the
+    // sample too. Keeps the refusal the pinned test asserts.
+    if (insideFence[lines.size - 1]) return null
     for (idx in lines.indices.reversed()) {
         if (idx < lowest) break
+        if (insideFence[idx]) continue
         val line = lines[idx].trim()
-        if (line.startsWith("```")) return null
         if (!line.startsWith("**")) continue
         val spans = THINKING_TITLE_BOLD_RE.findAll(line).map { it.groupValues[1].trim() }.toList()
         if (spans.isEmpty()) continue

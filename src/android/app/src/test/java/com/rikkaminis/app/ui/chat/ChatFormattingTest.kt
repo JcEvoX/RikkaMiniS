@@ -202,6 +202,37 @@ class ChatFormattingTest {
     }
 
     @Test
+    fun `extractThinkingTitle refuses a bold line that opens an unterminated fence`() {
+        // Review finding (2026-09-28): the fence guard only looked at the
+        // candidate's OWN line, so a bold line INSIDE an unterminated fence was
+        // reported — measured on the pre-fix function, this returned
+        // `fake title`. The opening marker sits above the candidate, so the
+        // guard needs the top-down parity to see it.
+        assertNull(extractThinkingTitle("**old phrase**\n```\n**fake title**\n"))
+    }
+
+    @Test
+    fun `extractThinkingTitle skips a closed fence and uses the phrase above it`() {
+        // Closed fence in the middle: its body is not a title, the phrase
+        // outside it is. Kills "drop the insideFence skip" (the body would win)
+        // and "any fence in the window refuses" (nothing would be returned).
+        assertEquals(
+            "old phrase",
+            extractThinkingTitle("**old phrase**\n```\n**fake title**\n```\nplain tail\n"),
+        )
+    }
+
+    @Test
+    fun `extractThinkingTitle keeps a title that follows a closed fence`() {
+        // The common coding shape: a sample, then the model's own summary line.
+        // The parity must close at the second marker, or this goes null.
+        assertEquals(
+            "real title",
+            extractThinkingTitle("```kotlin\nval x = 1\n```\n**real title**\n"),
+        )
+    }
+
+    @Test
     fun `extractThinkingTitle skips an over-long bold paragraph and keeps scanning`() {
         val long = "**" + "x".repeat(THINKING_TITLE_MAX_CHARS + 1) + "**"
         assertEquals("短标题", extractThinkingTitle("**短标题**\n$long\n"))
