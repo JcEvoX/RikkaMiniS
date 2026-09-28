@@ -171,3 +171,58 @@ internal fun extractThinkingTitle(
     }
     return null
 }
+
+// ─── Thinking header extras (length / phase duration) ────────────────────────
+
+/**
+ * Char-count label at the right edge of a thinking header (`9K`). Truncating
+ * division, unchanged from the inline expression it replaces: 12_345 reads
+ * `12K`.
+ *
+ * ponytail: 沿用旧内联表达式的截断取整，不做本地化 | 天花板: 12_000–12_999 一律显示
+ * `12K` | 升级触发: 用户反馈这个数字看起来不对。
+ */
+internal fun thinkingCharCountLabel(charCount: Int): String = when {
+    charCount >= 1000 -> "${charCount / 1000}K"
+    else -> "$charCount"
+}
+
+/**
+ * The optional right-edge extras of a thinking header row. Both are
+ * user-toggleable (Settings → Appearance → Deep Thinking), so an all-null
+ * instance is a legal state: the header then shows only its icon, label and
+ * chevron.
+ */
+internal data class ThinkingHeaderExtras(
+    val duration: String?,
+    val charCount: String?,
+)
+
+/**
+ * [T-thinking-header-toggles] Pure decision of what a thinking header shows on
+ * its right edge. Extracted from the composable so the full toggle matrix is
+ * JVM-testable without Compose.
+ *
+ * With both flags ON this reproduces the pre-toggle behaviour exactly:
+ *  • [showDuration] — only for a FINISHED block carrying a duration stamp. The
+ *    stamp is in-session only ([AssistantBlock] is not persisted), so a
+ *    reloaded conversation shows no duration even with the flag ON; that is
+ *    also why turning the char count OFF can leave the right edge empty after
+ *    a reload.
+ *  • [showCharCount] — whenever the block has content.
+ */
+internal fun thinkingHeaderExtras(
+    showDuration: Boolean,
+    showCharCount: Boolean,
+    isStreaming: Boolean,
+    durationMs: Long,
+    charCount: Int,
+): ThinkingHeaderExtras {
+    val duration = if (showDuration && !isStreaming && durationMs > 0L) {
+        formatToolDuration(durationMs)
+    } else {
+        null
+    }
+    val chars = if (showCharCount && charCount > 0) thinkingCharCountLabel(charCount) else null
+    return ThinkingHeaderExtras(duration = duration, charCount = chars)
+}

@@ -800,6 +800,30 @@ internal object ConfigBuiltins {
                 defaultValue = false,
             )
         )
+        // [T-thinking-header-toggles] The thinking header's two optional
+        // right-edge extras. Registered so backup/restore and minis-config see
+        // them like every other pref; defaults mirror the pre-toggle behaviour
+        // (length ON, duration OFF — the latter is in-session only anyway).
+        r.register(
+            PrefsBoolField(
+                path = "chat.thinkingShowCharCount",
+                displayName = "Show thinking length",
+                description = "When ON, a thinking block header shows its content length (e.g. 9K) next to the label.",
+                prefs = appearancePrefs,
+                key = com.rikkaminis.app.ui.settings.KEY_THINKING_SHOW_CHAR_COUNT,
+                defaultValue = true,
+            )
+        )
+        r.register(
+            PrefsBoolField(
+                path = "chat.thinkingShowDuration",
+                displayName = "Show thinking time",
+                description = "When ON, a finished thinking block header shows how long that reasoning phase took. The value is measured in-session only.",
+                prefs = appearancePrefs,
+                key = com.rikkaminis.app.ui.settings.KEY_THINKING_SHOW_DURATION,
+                defaultValue = false,
+            )
+        )
         // Chat action customization (Settings → Appearance → Chat Menu).
         // The action pool spans the top-right "..." menu AND the history-drawer
         // footer. Each stable key contributes two independent bool fields:

@@ -1273,6 +1273,11 @@
     <string name="appearance_section_deep_thinking">깊은 사고</string>
     <string name="appearance_auto_expand_thinking_title">스트리밍 중 생각 펼치기</string>
     <string name="appearance_auto_expand_thinking_footer">켜면 모델이 추론하는 동안 새 생각 블록이 자동으로 펼쳐지고 완료되면 접힙니다. 끄면 생각 블록이 접힌 상태로 유지됩니다 — 탭하여 읽으세요.</string>
+    <!-- [T-thinking-header-toggles] Which extras a thinking block header shows beside its title. -->
+    <string name="appearance_section_thinking_header">사고 헤더</string>
+    <string name="appearance_thinking_show_chars_title">사고 글자 수 표시</string>
+    <string name="appearance_thinking_show_duration_title">사고 소요 시간 표시</string>
+    <string name="appearance_thinking_header_footer">사고 블록 제목 옆에 표시할 항목을 선택합니다. 글자 수는 추론 텍스트의 문자 수(9K ≒ 9천 자)입니다. 소요 시간은 이 대화를 열어 둔 동안에만 측정되며 다시 열면 표시되지 않습니다.</string>
     <string name="settings_memory_global_header">기본값</string>
     <string name="settings_memory_global_footer">세션별 토글(/memory 슬래시 명령 또는 세션 메모리 시트로 설정)이 이 기본값을 재정의합니다. 이 스위치를 변경해도 기존 세션은 영향을 받지 않습니다.</string>
     <string name="settings_memory_global_enabled_title">메모리 기본 활성화</string>

@@ -265,4 +265,107 @@ class ChatFormattingTest {
         val text = "z".repeat(1000) + "**界内片段**" + "\n" + "w".repeat(THINKING_TITLE_SCAN_BUDGET - 9)
         assertNull(extractThinkingTitle(text))
     }
+
+    // ── thinkingHeaderExtras / thinkingCharCountLabel ─────────────────
+    // [T-thinking-header-toggles] The full toggle matrix, with literal
+    // expectations (never derived from the function under test).
+
+    @Test
+    fun `thinkingHeaderExtras shows both extras for a finished block with both toggles on`() {
+        val extras = thinkingHeaderExtras(
+            showDuration = true,
+            showCharCount = true,
+            isStreaming = false,
+            durationMs = 12_400L,
+            charCount = 1_700,
+        )
+        assertEquals("12s", extras.duration)
+        assertEquals("1K", extras.charCount)
+    }
+
+    @Test
+    fun `thinkingHeaderExtras drops the duration when its toggle is off`() {
+        val extras = thinkingHeaderExtras(
+            showDuration = false,
+            showCharCount = true,
+            isStreaming = false,
+            durationMs = 12_400L,
+            charCount = 1_700,
+        )
+        assertNull(extras.duration)
+        assertEquals("1K", extras.charCount)
+    }
+
+    @Test
+    fun `thinkingHeaderExtras drops the char count when its toggle is off`() {
+        val extras = thinkingHeaderExtras(
+            showDuration = true,
+            showCharCount = false,
+            isStreaming = false,
+            durationMs = 12_400L,
+            charCount = 1_700,
+        )
+        assertEquals("12s", extras.duration)
+        assertNull(extras.charCount)
+    }
+
+    @Test
+    fun `thinkingHeaderExtras shows nothing when both toggles are off`() {
+        val extras = thinkingHeaderExtras(
+            showDuration = false,
+            showCharCount = false,
+            isStreaming = false,
+            durationMs = 12_400L,
+            charCount = 1_700,
+        )
+        assertNull(extras.duration)
+        assertNull(extras.charCount)
+    }
+
+    @Test
+    fun `thinkingHeaderExtras withholds the duration while the block is streaming`() {
+        val extras = thinkingHeaderExtras(
+            showDuration = true,
+            showCharCount = true,
+            isStreaming = true,
+            durationMs = 5_000L,
+            charCount = 2_100,
+        )
+        assertNull(extras.duration)
+        assertEquals("2K", extras.charCount)
+    }
+
+    @Test
+    fun `thinkingHeaderExtras withholds an unstamped duration`() {
+        val extras = thinkingHeaderExtras(
+            showDuration = true,
+            showCharCount = false,
+            isStreaming = false,
+            durationMs = 0L,
+            charCount = 42,
+        )
+        assertNull(extras.duration)
+        assertNull(extras.charCount)
+    }
+
+    @Test
+    fun `thinkingHeaderExtras withholds the count for an empty block`() {
+        val extras = thinkingHeaderExtras(
+            showDuration = false,
+            showCharCount = true,
+            isStreaming = false,
+            durationMs = 0L,
+            charCount = 0,
+        )
+        assertNull(extras.duration)
+        assertNull(extras.charCount)
+    }
+
+    @Test
+    fun `thinkingCharCountLabel truncates thousands without rounding`() {
+        assertEquals("0", thinkingCharCountLabel(0))
+        assertEquals("999", thinkingCharCountLabel(999))
+        assertEquals("1K", thinkingCharCountLabel(1_000))
+        assertEquals("12K", thinkingCharCountLabel(12_345))
+    }
 }

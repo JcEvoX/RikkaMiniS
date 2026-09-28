@@ -37,8 +37,10 @@ import androidx.compose.material.icons.outlined.Home
 import androidx.compose.material.icons.outlined.Launch
 import androidx.compose.material.icons.outlined.LightMode
 import androidx.compose.material.icons.outlined.MoreVert
+import androidx.compose.material.icons.outlined.Numbers
 import androidx.compose.material.icons.outlined.Psychology
 import androidx.compose.material.icons.outlined.ScreenLockPortrait
+import androidx.compose.material.icons.outlined.Timer
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.material3.Icon
@@ -93,6 +95,14 @@ const val KEY_SHOW_CHAT_TITLE = "appearance.show_chat_title"  // Boolean, defaul
 // mirrors iOS `@AppStorage("chat.autoExpandThinking")` so future config sync
 // reads the same value. Read at block-mount time in ThinkingBlock.
 const val KEY_AUTO_EXPAND_THINKING = "chat.autoExpandThinking"  // Boolean, default false (thinking starts collapsed)
+// [T-thinking-header-toggles] Which extras a thinking block header shows on
+// its right edge. Independent booleans, both read at block-mount time in
+// ThinkingBlock. Length (a char count, e.g. `9K`) defaults ON — it is the
+// detail users asked to keep; the phase duration defaults OFF — it is only
+// available in-session (never persisted), so it is opt-in. Key names follow
+// the iOS `@AppStorage` dot-notation used by autoExpandThinking above.
+const val KEY_THINKING_SHOW_CHAR_COUNT = "chat.thinkingShowCharCount"  // Boolean, default true
+const val KEY_THINKING_SHOW_DURATION = "chat.thinkingShowDuration"     // Boolean, default false
 const val KEY_FONT_CHAT_INPUT = "font_chat_input"  // Int scale level -2..3
 const val KEY_FONT_MESSAGE = "font_message"        // Int scale level -2..3
 const val KEY_FONT_APP_BASE = "font_app_base"      // Int scale level -2..3
@@ -116,6 +126,17 @@ fun showChatTitleEnabled(context: Context): Boolean =
  *  model reasons, then collapses when it ends. The user taps to expand either way. */
 fun autoExpandThinkingEnabled(context: Context): Boolean =
     getAppearancePrefs(context).getBoolean(KEY_AUTO_EXPAND_THINKING, false)
+
+/** [T-thinking-header-toggles] Default ON — a thinking block header shows its
+ *  content length (e.g. `9K`) next to the label unless the user turns it off. */
+fun thinkingCharCountVisibleEnabled(context: Context): Boolean =
+    getAppearancePrefs(context).getBoolean(KEY_THINKING_SHOW_CHAR_COUNT, true)
+
+/** [T-thinking-header-toggles] Default OFF — the phase duration is opt-in: it
+ *  exists only in-session (AssistantBlock is not persisted), so a reloaded
+ *  conversation can never show it. */
+fun thinkingDurationVisibleEnabled(context: Context): Boolean =
+    getAppearancePrefs(context).getBoolean(KEY_THINKING_SHOW_DURATION, false)
 
 /** Font scale levels matching iOS: XS(-2) Small(-1) Default(0) Medium(1) Large(2) XL(3) */
 private val fontScaleLabels = listOf("XS", "Small", "Default", "Medium", "Large", "XL")
@@ -168,6 +189,8 @@ fun AppearanceScreen(
     var toolPreview by remember { mutableStateOf(prefs.getBoolean(KEY_TOOL_PREVIEW, false)) }
     var toolStatusBar by remember { mutableStateOf(prefs.getBoolean(KEY_TOOL_STATUS_BAR, true)) }
     var autoExpandThinking by remember { mutableStateOf(prefs.getBoolean(KEY_AUTO_EXPAND_THINKING, false)) }
+    var thinkingShowCharCount by remember { mutableStateOf(prefs.getBoolean(KEY_THINKING_SHOW_CHAR_COUNT, true)) }
+    var thinkingShowDuration by remember { mutableStateOf(prefs.getBoolean(KEY_THINKING_SHOW_DURATION, false)) }
     var showChatTitle by remember { mutableStateOf(prefs.getBoolean(KEY_SHOW_CHAT_TITLE, true)) }
     var chatInputLevel by remember { mutableIntStateOf(prefs.getInt(KEY_FONT_CHAT_INPUT, 0)) }
     var messageLevel by remember { mutableIntStateOf(prefs.getInt(KEY_FONT_MESSAGE, 0)) }
@@ -191,6 +214,8 @@ fun AppearanceScreen(
                 KEY_TOOL_PREVIEW -> toolPreview = prefs.getBoolean(key, false)
                 KEY_TOOL_STATUS_BAR -> toolStatusBar = prefs.getBoolean(key, true)
                 KEY_AUTO_EXPAND_THINKING -> autoExpandThinking = prefs.getBoolean(key, false)
+                KEY_THINKING_SHOW_CHAR_COUNT -> thinkingShowCharCount = prefs.getBoolean(key, true)
+                KEY_THINKING_SHOW_DURATION -> thinkingShowDuration = prefs.getBoolean(key, false)
                 KEY_SHOW_CHAT_TITLE -> showChatTitle = prefs.getBoolean(key, true)
                 KEY_FONT_CHAT_INPUT -> chatInputLevel = prefs.getInt(key, 0)
                 KEY_FONT_MESSAGE -> messageLevel = prefs.getInt(key, 0)
@@ -397,6 +422,38 @@ fun AppearanceScreen(
                 onCheckedChange = {
                     autoExpandThinking = it
                     prefs.edit().putBoolean(KEY_AUTO_EXPAND_THINKING, it).apply()
+                },
+                showDivider = false,
+            )
+        }
+
+        // [T-thinking-header-toggles] -- Thinking Header --
+        // Which extras a thinking block header shows next to its title. Length
+        // (a char count) is ON by default; the phase duration is opt-in because
+        // it only exists in-session. Both are also settable from minis-config as
+        // `chat.thinkingShowCharCount` / `chat.thinkingShowDuration`.
+        SettingsSection(
+            header = stringResource(R.string.appearance_section_thinking_header),
+            footer = stringResource(R.string.appearance_thinking_header_footer),
+        ) {
+            SettingsSwitchRow(
+                icon = Icons.Outlined.Numbers,
+                iconColor = tilePurple,
+                title = stringResource(R.string.appearance_thinking_show_chars_title),
+                checked = thinkingShowCharCount,
+                onCheckedChange = {
+                    thinkingShowCharCount = it
+                    prefs.edit().putBoolean(KEY_THINKING_SHOW_CHAR_COUNT, it).apply()
+                },
+            )
+            SettingsSwitchRow(
+                icon = Icons.Outlined.Timer,
+                iconColor = tilePurple,
+                title = stringResource(R.string.appearance_thinking_show_duration_title),
+                checked = thinkingShowDuration,
+                onCheckedChange = {
+                    thinkingShowDuration = it
+                    prefs.edit().putBoolean(KEY_THINKING_SHOW_DURATION, it).apply()
                 },
                 showDivider = false,
             )

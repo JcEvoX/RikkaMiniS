@@ -515,6 +515,11 @@
     <string name="appearance_section_deep_thinking">Deep Thinking</string>
     <string name="appearance_auto_expand_thinking_title">Expand Thinking While Streaming</string>
     <string name="appearance_auto_expand_thinking_footer">When on, a new thinking block expands automatically while the model is reasoning and collapses when it finishes. When off, thinking blocks stay collapsed — tap one to read it.</string>
+    <!-- [T-thinking-header-toggles] Which extras a thinking block header shows beside its title. -->
+    <string name="appearance_section_thinking_header">Thinking Header</string>
+    <string name="appearance_thinking_show_chars_title">Show Thinking Length</string>
+    <string name="appearance_thinking_show_duration_title">Show Thinking Time</string>
+    <string name="appearance_thinking_header_footer">Choose what a thinking block shows next to its title. Length is the reasoning text measured in characters (9K = about nine thousand); time is measured while this conversation is open and disappears once you reopen it.</string>
     <string name="appearance_section_font_size">Font Size</string>
     <string name="appearance_section_chat_menu">Chat Menu</string>
     <string name="appearance_chat_menu_summary">Show, hide and reorder the entries of the chat "…" menu</string>

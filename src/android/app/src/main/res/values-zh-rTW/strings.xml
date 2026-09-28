@@ -1077,6 +1077,11 @@
     <string name="appearance_section_deep_thinking">深度思考</string>
     <string name="appearance_auto_expand_thinking_title">流式輸出時展開思考</string>
     <string name="appearance_auto_expand_thinking_footer">開啟後，模型思考時新的思考塊會自動展開，思考結束後自動摺疊。關閉後，思考塊保持摺疊狀態——點選即可檢視。</string>
+    <!-- [T-thinking-header-toggles] Which extras a thinking block header shows beside its title. -->
+    <string name="appearance_section_thinking_header">思考標題列</string>
+    <string name="appearance_thinking_show_chars_title">顯示思考字數</string>
+    <string name="appearance_thinking_show_duration_title">顯示思考耗時</string>
+    <string name="appearance_thinking_header_footer">選擇思考區塊標題旁顯示的內容。字數是推理文字的字元數（9K 約九千字元）；耗時僅在本次工作階段內有效，重新開啟對話後即不顯示。</string>
     <string name="appearance_section_font_size">字型大小</string>
     <string name="appearance_font_size_footer">調整聊天輸入、訊息內容和應用文字的字型大小。更改立即生效。</string>
     <string name="appearance_font_scale_title">字型縮放</string>
