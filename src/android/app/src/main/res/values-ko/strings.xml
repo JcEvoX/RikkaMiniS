@@ -1456,8 +1456,6 @@
     <string name="chat_stream_degraded_notice">성능 보호: 스트리밍 중 단순화된 렌더링</string>
     <string name="chat_resume_crash_warning">지난번에 이 앱이 스트리밍 중 응답하지 않았습니다. 다시 재개하려면 탭하세요.</string>
     <string name="chat_message_large_export_fail">내보내기 실패</string>
-    <string name="chat_tool_pills_folded">도구 호출 %1$d개 더 보기</string>
-    <string name="chat_tool_pills_collapse">접기</string>
     <string name="crash_freq_email_body">충돌 로그 zip이 첨부되어 있습니다. 기기 모델, RikkaMinis 버전, 타임스탬프가 포함됩니다.</string>
     <string name="crash_freq_pick_files_title">최근 충돌이 여러 번 감지되었습니다. 아래 로그를 개발자에게 공유하시겠습니까?</string>
     <string name="crash_freq_pick_continue">계속</string>

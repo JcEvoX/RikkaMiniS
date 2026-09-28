@@ -973,8 +973,6 @@
     <string name="chat_message_large_export">Экспортировать в файл</string>
     <string name="chat_message_large_export_ok">Экспортировано</string>
     <string name="chat_message_large_export_fail">Не удалось экспортировать</string>
-    <string name="chat_tool_pills_folded">Развернуть ещё вызовов инструментов: %1$d</string>
-    <string name="chat_tool_pills_collapse">Свернуть</string>
     <string name="crash_freq_dialog_dismiss">Не сейчас</string>
     <string name="crash_freq_email_subject">Отчёт о сбое RikkaMinis %1$s</string>
     <string name="crash_freq_email_body">ZIP-архив с журналами сбоев прикреплён. Модель устройства, версия RikkaMinis и временная метка указаны внутри.</string>
