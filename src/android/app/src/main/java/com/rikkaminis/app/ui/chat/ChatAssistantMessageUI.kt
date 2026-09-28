@@ -1304,13 +1304,40 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
                 )
                 Spacer(modifier = Modifier.width(6.dp))
             }
+            // [T-thinking-title] While this block is live the header shows the
+            // model's own newest action phrase instead of the fixed label, so a
+            // collapsed header answers "what is it doing right now" at a glance.
+            // Frozen blocks keep the static label — see [extractThinkingTitle]'s
+            // KDoc for why the title is live-only in this app.
+            val thinkingTitle = remember(block.content.length, isStreaming) {
+                if (isStreaming) extractThinkingTitle(block.content) else null
+            }
             Text(
-                text = stringResource(R.string.chat_deep_thinking),
+                text = thinkingTitle ?: stringResource(R.string.chat_deep_thinking),
                 fontSize = 13.sp,
                 fontWeight = FontWeight.SemiBold,
                 color = thinkingBlue,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                // Holds the leftover width itself (the Spacer that used to do
+                // that job is gone): a long phrase ellipsizes while the duration
+                // / char count and the chevron stay pinned to the right edge.
+                // With a short label the layout is identical to before.
+                modifier = Modifier.weight(1f),
             )
-            Spacer(modifier = Modifier.weight(1f))
+            // [T-thinking-duration] In-session duration of the finished thinking
+            // phase — same live-only convention as the tool pills (neither field
+            // is persisted, so a reloaded row falls back to the char count).
+            if (block.durationMs > 0L && !isStreaming) {
+                Text(
+                    text = formatToolDuration(block.durationMs),
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Medium,
+                    fontFamily = FontFamily.Monospace,
+                    color = thinkingBlue.copy(alpha = 0.6f),
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+            }
             if (charCount > 0) {
                 Text(
                     text = charLabel,

@@ -82,3 +82,73 @@ internal fun formatToolDuration(ms: Long): String {
         }
     }
 }
+
+// ─── Thinking title (live header label) ──────────────────────────────────────
+
+/**
+ * How many chars of the END of a thinking block [extractThinkingTitle] may
+ * inspect. A live block grows on every delta (recomposition re-runs the
+ * extraction on each length change) and can reach the 100k hard cap, so the
+ * scan is bounded to the tail — where the newest action phrase lives anyway.
+ * Cost per call is O(scan budget), not O(block size).
+ */
+internal const val THINKING_TITLE_SCAN_BUDGET = 4000
+
+/**
+ * Longest phrase accepted as a title. Anything longer is prose that happened to
+ * start with `**`, not an action label — skip it and keep scanning upwards.
+ * The header ellipsizes, so this only has to keep whole paragraphs out.
+ */
+internal const val THINKING_TITLE_MAX_CHARS = 160
+
+private val THINKING_TITLE_BOLD_RE = Regex("""\*\*(.+?)\*\*""")
+
+/**
+ * Latest action phrase inside a thinking block's text, or null when there is
+ * none — used as the LIVE header label of a thinking row.
+ *
+ * Ported from rikkahub's `extractThinkingTitle` (its last line that consists of
+ * a single bold span), then adapted to this app's real data. Two shapes are
+ * observed in our own sessions (2026-09-28 samples):
+ *
+ *  • concatenated phrases on one line — `**我统计子包层级****我把子包层级也数清楚**`
+ *    (session 4a9ba4d3, 11:32). The verbatim whole-line rule returns the merged
+ *    blob `我统计子包层级****我把子包层级也数清楚`; the NEWEST span (`我把子包层级也数清楚`)
+ *    is the useful one, so a pure bold run takes its last span.
+ *  • a phrase followed by its explanation — `**Clarifying the scope first…** Before …`.
+ *    Here the phrase is the line-leading span, so that one wins.
+ *
+ * Line-leading only: an inline `**emphasis**` mid-sentence is not a title, and a
+ * fenced code block (``` … ```) tail makes the block refuse instead of guessing
+ * — thinking text of a coding agent often ends inside a code fence.
+ *
+ * Frozen blocks are deliberately excluded by the caller (title shows while
+ * streaming only, matching rikkahub, whose title is likewise gated on
+ * `loading`): a title on every row of a long transcript rebuilds the per-row
+ * title wall that the 2026-09-28 pill-fold experiment was reverted for.
+ *
+ * Pure + Android-free, so the sandbox JVM harness compiles it directly.
+ */
+internal fun extractThinkingTitle(
+    text: CharSequence,
+    scanBudget: Int = THINKING_TITLE_SCAN_BUDGET,
+): String? {
+    if (text.isEmpty()) return null
+    val windowStart = (text.length - scanBudget).coerceAtLeast(0)
+    val lines = text.subSequence(windowStart, text.length).toString().split('\n')
+    // When the window starts mid-text its first line is a fragment, whose
+    // "line-leading" bold span is not line-leading at all — never read it.
+    val lowest = if (windowStart > 0) 1 else 0
+    for (idx in lines.indices.reversed()) {
+        if (idx < lowest) break
+        val line = lines[idx].trim()
+        if (line.startsWith("```")) return null
+        if (!line.startsWith("**")) continue
+        val spans = THINKING_TITLE_BOLD_RE.findAll(line).map { it.groupValues[1].trim() }.toList()
+        if (spans.isEmpty()) continue
+        val leadingOnlyBold = THINKING_TITLE_BOLD_RE.replace(line, "").isBlank()
+        val candidate = if (leadingOnlyBold) spans.last() else spans.first()
+        if (candidate.isNotEmpty() && candidate.length <= THINKING_TITLE_MAX_CHARS) return candidate
+    }
+    return null
+}

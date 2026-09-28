@@ -157,6 +157,12 @@ internal class AgentLoopEngine(
                 kind = "thinking",
                 content = latest,
                 toolTitle = "Thinking",
+                // [T-thinking-duration] Stamped so finishThinkingBlock() can
+                // freeze the phase duration for the header. startTimeMs is a
+                // rough "first published delta" here (this path only runs when
+                // the throttle swallowed the whole phase), which is why the
+                // header falls back to the char count when the value is 0.
+                startTimeMs = System.currentTimeMillis(),
             ))
         } else {
             loopState.allToolBlocks[thinkIdx] = loopState.allToolBlocks[thinkIdx].copy(content = latest)
@@ -170,6 +176,32 @@ internal class AgentLoopEngine(
                 loopState.allToolBlocks,
             )
         }
+    }
+
+    /**
+     * [T-thinking-duration] Mark this turn's thinking block finished and freeze
+     * its duration — the thinking-phase counterpart of the tool pills, which
+     * stamp `startTimeMs` at block creation and `durationMs` when execution
+     * ends. Called from the two places the phase can end (text starts, a tool
+     * call starts); before this the same two-site `copy(toolStatus = SUCCESS)`
+     * was inlined in both, which is exactly how one site drifts from the other.
+     *
+     * Idempotent: the guard leaves an already-finished block untouched, so the
+     * second caller cannot overwrite the first duration with a later stamp.
+     */
+    private fun finishThinkingBlock(loopState: AgentLoopState, turn: Int) {
+        val thinkIdx = loopState.allToolBlocks.indexOfFirst { it.kind == "thinking" && it.id == "thinking_$turn" }
+        if (thinkIdx < 0) return
+        val block = loopState.allToolBlocks[thinkIdx]
+        if (block.toolStatus == ToolBlockStatus.SUCCESS) return
+        loopState.allToolBlocks[thinkIdx] = block.copy(
+            toolStatus = ToolBlockStatus.SUCCESS,
+            durationMs = if (block.startTimeMs > 0L) {
+                (System.currentTimeMillis() - block.startTimeMs).coerceAtLeast(0L)
+            } else {
+                0L
+            },
+        )
     }
 
     /**
@@ -643,6 +675,10 @@ internal class AgentLoopEngine(
                                 kind = "thinking",
                                 content = turnThinking.toString(),
                                 toolTitle = "Thinking",
+                                // [T-thinking-duration] Phase start for the header
+                                // duration; read the throttle's own timestamp so
+                                // the stamp matches the delta that created it.
+                                startTimeMs = thinkNowMs,
                             ))
                         } else {
                             loopState.allToolBlocks[thinkIdx] = loopState.allToolBlocks[thinkIdx].copy(content = turnThinking.toString())
@@ -653,10 +689,7 @@ internal class AgentLoopEngine(
                     }
                     is LLMStreamChunk.Text -> {
                         // Mark thinking block as done when text starts flowing
-                        val thinkIdx = loopState.allToolBlocks.indexOfFirst { it.kind == "thinking" && it.id == "thinking_$turn" }
-                        if (thinkIdx >= 0 && loopState.allToolBlocks[thinkIdx].toolStatus != ToolBlockStatus.SUCCESS) {
-                            loopState.allToolBlocks[thinkIdx] = loopState.allToolBlocks[thinkIdx].copy(toolStatus = ToolBlockStatus.SUCCESS)
-                        }
+                        finishThinkingBlock(loopState, turn)
                         // [T-android-thinking-delta-main-thread-throttle] The
                         // thinking phase is over — drain any tail the throttle
                         // skipped so the reasoning panel shows the full text.
@@ -783,10 +816,7 @@ internal class AgentLoopEngine(
                         val toolUseId = dedupeToolStartId(chunk.id)
                         android.util.Log.d("ToolChain[VM]", "[turn=$turn] ToolUseStart id=$toolUseId name=${chunk.name}")
                         // Mark thinking block as done when tool use starts
-                        val thinkIdx = loopState.allToolBlocks.indexOfFirst { it.kind == "thinking" && it.id == "thinking_$turn" }
-                        if (thinkIdx >= 0 && loopState.allToolBlocks[thinkIdx].toolStatus != ToolBlockStatus.SUCCESS) {
-                            loopState.allToolBlocks[thinkIdx] = loopState.allToolBlocks[thinkIdx].copy(toolStatus = ToolBlockStatus.SUCCESS)
-                        }
+                        finishThinkingBlock(loopState, turn)
                         // [T-android-thinking-delta-main-thread-throttle] Same as
                         // the Text branch: the thinking phase ends here, so drain
                         // the throttled tail before the tool block is appended.
