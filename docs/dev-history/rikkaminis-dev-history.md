@@ -1,11 +1,11 @@
-# RikkaMinis 开发日志合并导出（2026-08-03 ～ 2026-09-27）
+# RikkaMinis 开发日志合并导出（2026-08-03 ～ 2026-09-28）
 
 > 📌 **注意**：本文件是 raw dump（归档快照，按时间正序排列）。
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
-- 合并范围：2026-08-03 ～ 2026-09-27，共 56 天
-- 条目总数：1386（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：1837040 / 总行数：26108
+- 合并范围：2026-08-03 ～ 2026-09-28，共 57 天
+- 条目总数：1399（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：1854437 / 总行数：26281
 
 ---
 
@@ -26101,6 +26101,179 @@ CLI 直读同一会话：`total:192 count:50` → **25 assistant + 25 user 交�
 ## 独立确定性修复池
 
 用户同意把“根因已钉死、修法窄、几乎无次生风险”的第一档修复从普通 backlog 分离，统一攒在 `/var/minis/shared/deterministic-fix-queue.md`。backlog 保留发现与原始判定；独立池记录 DF 编号、修法、安全性、独立证据、分支/CI 状态。第一批为 §41-1 Unicode 索引、§41-2 空输入测试、§39-2 Action SHA pin，分支 CI 绿等待合并。第一档不等同于 P1 严重度。
+
+<!-- 2026-09-27 23:15:52 -->
+## 文档三件套第二次重建 + 合并 main = 3a36c697（09-27 深夜，用户「更新一下文档…可以直接合并」）：
+
+**文档三件套第二次重建 + 合并 main = 3a36c697（09-27 深夜，用户「更新一下文档…可以直接合并」）**：三回归测试（test_rebuild/test_sanitize/test_sagas）先全 PASS → rebuild **1386 条**（前次 1382 → +4：第一档修复/合并/独立池/本轮）dropped 75 → sanitize main(22)+INDEX(29) → SAGAS 23 sagas / orphans 105(7.6%) / multi4 81 → SAGAS 独立脱敏 probe NONE → 结构校验三文件全过（main fences 62 偶、anchors 1386 == header 1386、outOrder 0、行首冲突标记 0）+ 精确密钥扫描 8 形态 NONE。删除行逐行核对：main 侧仅 2 行统计旧值（1364→1386），INDEX 4 行、SAGAS 23 行全是统计表旧值/跨度行替换。**与旧未合并分支 265ef350 对比**：非统计性删除仅 6 行且本身也是统计行（`## 2026-09-27（26 条）`、saga 计数 75→77 等）= 新版严格涵盖旧版，故旧分支可安全废弃。分支 docs/dev-history-0927c @ 7cf1be18（3 文件 +375/−27）→ 用户授权直接合并（文档风险低、不进 APK）→ `--no-ff` merge = **3a36c697**（parents c10f5675 + 7cf1be18）→ docs vs tip 空、vs prev main 只 3 个 docs 文件 → push → **远端 main 逐字符 == 本地**、工作树 clean。docs/ 不在 build-apk.yml paths → 复查 main 最近 3 个 run 停在 c10f5675（completed/success）= 未触发 CI，符合预期。
+**分支收口（顺带）**：用户问「为什么有两个分支」→ 查清 = `fix/deterministic-tier1-cleanups`（8369a9df，**已是 c10f5675 的第二父**、分支 CI 36326700243 success，纯遗留未删）+ 我本轮删掉的已合 docs 分支。API DELETE 204；本地 `git branch --merged main` 11 条批量 `-d`；两个未合本地分支逐个取证后 `-D`：`docs/dev-history-0927b`(265ef350，被涵盖) 与 `fix/thinktag-orphan-close`(87a5d898 = amend 前版本，与已合 7a17a75d 只差测试文件 1 行 `import ...stripOrphanThinkClosers`，即第一次 CI 红的那条)。终态：**远端只剩 main @ 3a36c697，本地只剩 main，工作树 clean**。
+**教训（复发预防）**：`gh_sync.sh push` 可能把同一 ref 推两次（一次带显式 refspec、一次不带），第二次报 `cannot lock ref ... is at X but expected Y` 的 remote rejected —— **这不是失败，第一次已落盘**；判据必须回到 `git ls-remote` + `merge-base --is-ancestor` + 本地/远端 rev-parse 三方一致，不能读 git stderr 归因（本次 ls-remote 显示远端 main 精确 == 本地 merge SHA）。删分支前的通用判据：`git log -1 --format=%p <merge>` 看被删 tip 是否为主线上某 merge 的父，再看 `git diff <tip> main -- <file>` 定位真实内容差（本次 1 行 import 差即证明它是被 amend 取代的死提交）。
+
+<!-- 2026-09-27 23:51:35 -->
+## 应用性能瓶颈盘点（09-27，源码 3a36c697 + 全天日志取证，只登记未修）
+
+**已验证健康**：flatten（100–960μs/frozenHits 100%）、markdown parse（全天仅 1 条 slow）、DB 加载（3–32ms）、offload/压缩端到端、KaTeX、首帧（hangCount=0）。
+**仍存瓶颈（按证据强度）**：①流式 GC churn（单 turn 最高 +54 次 GC/释放 1294MB；普通 turn 50–400MB）——mergeStreamingOverlay/AnnotatedString 每 tick 拷贝；②超长会话巨型 LazyColumn item（实测 34,976px≈15 屏），LargeContentGuard 只限 text>32K，tool 块不受限；③rowsCompose.milestone 慢行（rows=50 距首行 95–213s、单 emit elapsed 130s）——**PerfLongCtx 计时语义未核实**，升级触发=用户报卡顿；④offload under-delivered→压缩升级循环（23 触发/8 次升级）；⑤遗留 P2：MemoryManagementScreen:351 主线程 readFile + chunkText 双算；⑥pause→重跑 turnS=0 空转循环。诚实边界：无 profiler，全为日志+静态证据。
+
+## 2026-09-28
+
+<!-- 2026-09-28 01:19:50 -->
+## 性能三分支拆分准备（09-27，用户「分三个分支，另外两个分配出去，我来分配」）
+
+
+**背景**：一次性能审计收敛出的可下刀项，用户拍板拆成三条独立分支并行，一条分支一件事。
+**基线统一**：main @ `3a36c697`。
+
+| # | 分支名 | 事项 | 任务书 | 归属 |
+|---|---|---|---|---|
+| A | `perf/memory-page-io` | Memory 页打开时主线程开销 | README §A | 本会话，已推送 |
+| B | `perf/giant-item-split` | 巨型 LazyColumn item（34,976px / compose 0.9–1s） | `/var/minis/shared/perf-0927/TASK-B-giant-item.md` | 待用户分配 |
+| C | `perf/offload-convergence` | offload 无收益重试（~900 pass/天 / 固定 9 行日志 / `bytes` 提前物化） | `/var/minis/shared/perf-0927/TASK-C-offload-convergence.md` | 待用户分配 |
+
+索引：`/var/minis/shared/perf-0927/README.md`
+
+**分支改名**：本会话原分支 `perf/stream-render-and-compact`（名字与内容不符，实为 Memory 专项）→ `git branch -m perf/memory-page-io`，推送新名 + dispatch（run 36336498793）+ API DELETE 旧名分支（204）；远端现只剩 `main` + `perf/memory-page-io`。
+
+**A 已落地**：commit `369000f0`（2 文件 +12/−1）——`MemoryFileViewerContent` 加可选参数 `precomputedChunks`，设置页传入自己已算的 chunks，消除同一份 200KB–1MB 文本被 `chunkText()` 切两遍。`scan.sh` 20/20。
+**A 未做**：`MemoryManagementScreen` 的 `readFile(fileName)` 仍在 composition 线程同步读盘；同文件注释明确「No emptyText here: an empty-state label would flash 'Empty' on every open」→ 改异步必须不引入空白闪烁，属行为变化，需单独拍板。
+
+**B 任务书要点（省接手会话重读）**：根因已钉死 = `ChatTranscriptRebuild` 的 `mapNotNull` 丢弃纯 tool_result 的 user 行 → 25 条 assistant 行变连续 → 末尾 coalesce 合并成一条（`prev.copy(id=msg.id)`，content 拼接，toolBlocks 按 id 去重）。证据 `18:00:02 toChatMessages.end count=2` vs 同刻 `db.query.end count=118`。修法按阶梯：先量化基线 → 让 `LargeContentGuard`（现只包 text 块、不看工具块）覆盖巨型聚合项 → 限工具卡数量 → 拆 item（最重，牵连 LazyColumn key/选区/BoundsTrackedBlock/自动跟随）。已核实 `AssistantToolRunGroup` 唯一构造点在 `legacy/LegacyFlatChatBuilder.kt:186` 是**死路径**，别去改。
+
+**C 任务书要点**：行号已核到 main@3a36c697 —— `ChatContextWindow.kt` 186–199 每 pass 无条件打 7 行 INFO、261–262 再 2 行、197–198 `protectedCount=minOf(4,size)`/`candidateUpper`、211 `for (msgIdx in 0 until candidateUpper)` 全量扫、**232 `part.content.toByteArray(Charsets.UTF_8).size` 为取长度物化全文拷贝**、234 进 `OffloadCandidate(..., bytes, ...)`、293/322/338 `candidate.bytes` 只在真正 offload 时被消费。→ 第 1 级「bytes 改成按需计算」= 零行为变化；第 2 级「无收益 pass 降噪」；第 3 级扫描收敛需自证不漏（漏 = 上下文溢出 = P0）。
+
+<!-- 2026-09-28 01:45:12 -->
+## 历史抽屉长按菜单「偶尔多出重命名」结案（09-28，用户报告，调查未改码）
+
+- 真相：第三个选项是「重新生成标题」（sessionlist_regenerate_title，刷新图标），用户误读为「重命名」——菜单里根本没有 rename 功能（8 语言 strings.xml 仅 pin/unpin/regenerate_title/delete）。
+- 机制（确定性，非偶然）：ChatHistoryDrawer.kt:268 `if (session.id == currentSessionId)` 条件渲染——只有长按「当前打开的会话」的行才出现第三项；其他行只有 置顶+删除。设计意图（注释原文）：onRegenerateTitle 只作用于 CURRENT 会话，挂别的行会改错会话标题。判 P3（刻意设计）。
+- 观感随机的来源：当前行仅有 secondaryContainer 高亮背景（:501）不显眼；草稿态 currentSessionId 不匹配任何行 → 全部 2 项。
+
+<!-- 2026-09-28 01:50:10 -->
+## 任务 C 完成（offload 无收益重试收敛）→ 分支 `perf/offload-convergence` @ `2b5689e`，CI `36337271291` success，未合并
+
+
+**做了什么**（`ChatContextWindow.kt`，1 文件 +87/−23）：
+- **第 1 级** `bytes` 按需计算：`OffloadCandidate` 去掉 `bytes` 字段 → 新增 `offloadPayloadBytes(part)`（表达式逐字符搬运）→ 只在卸载循环里算一次，供 `ContextOffload.stub` 与卸载日志用。消除「每次扫描 × 每个候选」的 `part.content.toByteArray(Charsets.UTF_8)` 全文拷贝。
+- **第 2 级** 空候选 pass 降噪：preamble 从「扫描前」移到「扫描后」，`candidates.isEmpty()` 时只打 1 行（含 window/before+pct+remaining/threshold→target/need-to-free/history/scan range/四个 skip 计数），有候选时 9 行逐字节不变。
+- **第 3 级（增量扫）论证后不做**：`agentHistory`（`ChatViewModel.kt:1108` mutableListOf）有 **30+ 处改动点**，三类与「记住上次扫到哪」直接冲突——①头部删除致索引左移（`trimContextHistoryWindow` 自己在 `AgentLoopEngine.kt:409` 调用，**就在 offload `:366` 同一个 loop 迭代之后**；另有 ChatTurnPersistence:331/348、AgentLoopEngine:2068/2247/2324/2367 的 removeAt）；②整表 clear+重建（ChatSessionLifecycle:1207、ChatModelRouting:181、ChatQueueInterruption:113、ChatViewModel:2574/2906/3070）；③同回合回滚 removeAt。且被跳过的扫描只是 `length` 读（唯一分配已被第 1 级拿掉）。**收益微秒级 CPU vs 漏扫=上下文溢出 P0 → 不做**。升级触发：真机 `[Perf]` 计时行落在 offload 上。
+
+**基线实测（真机日志，与任务书数字不符，按实测走）**：3 天 **326 pass**（09-26=96/09-27=131/09-28 部分=99），**39 次零候选（12%）**；候选构建 **4180**、实际卸载 **2618** → **1562 次（37.4%）物化了却没用到**；单 pass 候选数中位 2 / 均值 13.2 / 最大 216；已卸载 17.9 MB（均 7.2 KB）。任务书写「~900 pass/天、5.4k–8k 行/天、大量 pass 零候选」= 实测小一个量级 → **第 2 级收益仅 ≈104 行/天（0.1%）**，保留理由是零行为变化顺手做。
+
+**独立证据（两条机械核对，均留存在 `/var/minis/shared/work/perf-c-0928/`）**：
+- `verify_bytes.py`：从新文件抽表达式片段在旧文件里找（`part.content.toByteArray(Charsets.UTF_8).size+(part.imageData?.size?:0)` / `part.data.size` 均 OK）；`candidate.bytes` old=3→new=0；全文物化点 old=1→new=1 且在新函数内；调用点 1。failures=0。
+- `info_conservation.py`：**从 Kotlin 源抽取模板**（不手抄）+ 从真机日志解析 38 次真实空 pass → 渲染断言单行 / 含 `Context Offload` / 旧 9 行**每个非零整数**都在（含 `0..<473` 的 0 填充）。38/38 PASS，3 块因 `[LOGCAT]` 行插进 preamble 不完整而跳过。
+- 机械门：scan.sh 20/20；括号三组差值（−2/0/−2）与基线一致；冲突标记 0；scan_debt 1 标记/1 no-trigger 与改动前逐条一致（无新增债）。
+
+**脚本自身两次假红（教训）**：①渲染顺序错（先算 budgetLine 后注入 `${beforeTokens - targetTokens}`）→ 38 条全报 unsubstituted；②整行抽数字把**时间戳** `.764`/`.971` 与 `[LOGCAT]` 的 pid 当成「丢失的数值」。**装置缺陷再次伪装成被测对象的失败——判据先怀疑装置。**
+
+**流程**：`gh_sync.sh clone` 静默 exit 128（不在仓库内执行）→ 直接用 `git clone --depth 50` 到 `/var/minis/shared/work/rkm-taskC-0928`；push 后 `ls-remote` == 本地 == CI head_sha 三源一致；dispatch 后**查 runs 核实真的触发**（run 36337271291 in_progress→success，Publish 步骤 skipped = main 门控正常）。
+
+<!-- 2026-09-28 01:54:50 -->
+## 任务 B（巨型 LazyColumn item）完成 = 停止节点 → 分支 `perf/tool-pill-fold` @ `418a0da`，未合并
+
+
+**交付**：分支 `perf/tool-pill-fold` @ `418a0daf2b8c24682ab0d2a3b9bccfc268fdd1ed`（基 main `3a36c697`，10 文件 +322/−0），CI run `36337759129` **completed/success**，head_sha = 本地 HEAD = ls-remote 三源逐字符一致。**未合并（合并权在用户）**。报告 `/var/minis/shared/perf-0927/REPORT-B-tool-pill-fold.md`（索引 README 已更新）。分支名由任务书的 `perf/giant-item-split` 改为 `perf/tool-pill-fold`（实际修法不是拆 item）。
+
+**★ 口径修正 1（可复用，别再误读）：`[Perf][LongCtx]` 的 `elapsedMs` ≠ 单次耗时**，是**距同会话上一步的间隔**（`PerfLongCtx.step()`：`last = lastNsBySession ?: clickNsBySession ?: now`）。自证：18:00:03.135 `firstItem.compose elapsedMs=116` == 距上一行 `coldPrewarm.done`(03.018) 的 117ms。日志里的 893/1010/3455/138383 全是相邻日志行间隔。→ 任务书 B 里「compose elapsedMs=893–1010ms」是误读；**真正可测基线 = `sinceClickMs=790` + `size=992x34976`**。
+
+**★ 口径修正 2：高度分解 —— 34,976px 里 ~3/4 是工具药丸**：~277 张药丸（`persist-begin blocks=` 全天最大 277；partsLen 最大 123,641B ≈ 277×400B）× ~93px ≈ 25,800px ＋ 5,760 字符正文 ≈ 7.3–11.7k px ≈ 34,976 ✓。**密度校准法（新，可复用）**：`size=992x105` 是 ChatScreen 里 36dp 固定状态带 → 105/36 = **2.917 px/dp**；药丸 ≈32dp。
+→ **任务书验收判据「单 item 不再跨屏」在数据上不可达**（正文本身 3–4 屏），改述为「移除药丸墙，~35k → ~9–10k px（≈ −73%），正文完整」。
+
+**阶梯决策：停在第 2 级（折叠药丸），理由写在报告 §2**：第 1 级（让 `LargeContentGuard` 覆盖 msgitem）被否 —— guard 判据是文本长度（本例正文仅 5,760 字符，35k 的成因在药丸），且它唯一现成的折叠呈现是 `LargeContentBadge`（首 8,000 字符纯文本预览 + "Large content (5.6 KB)"）= **标签信息错误 + 不告知有 277 张卡被藏 = 静默隐藏内容**；把它做对需要的新 UI 与第 2 级是同一份，却要多藏全部药丸。第 3 级拆 item 的边代价清单（key/选区 shard/rememberMessageMarkdown/单调守卫/自动跟随/导出）与收益不成比例。
+
+**实现**：`ui/chat/ToolPillFoldPlan.kt`（新，**零 Compose/Android import 的纯决策** → 沙箱可编译可测）+ `AssistantMessageView` 块循环接入（`pillIndex` 只对 `kind=="tool_use"` 前移，与 `toolPillBlocks.size` 同谓词）+ `ToolPillFoldRow`（胶囊风格 + 数量文案 + 可点断言）+ `rememberSaveable("toolpillfold:${message.id}")`。策略：**只对冻结消息生效**（streaming 不折，与 guard 同源）、头部锚定、触发 12 / 内联 8（9–12 张的普通回合完全不变）、展开即全见。i18n：`chat_tool_pills_folded` / `_collapse` 已覆盖 7 个语言文件。
+
+**装置**（`/var/minis/shared/work/pill-fold-jvm/`，复跑 `sh mutate.sh`）：真源码 JUnit **8/8 OK**（plan.kt sha256 `71eb2507…`）+ **5 变异体全杀**（trigger 边界 / 去掉 streaming 豁免 / 忽略展开态 / isPillVisible 去掉 `!applied` / 去掉 clamp），跑完 pristine sha 逐字符不变。全区间扫描断言 `inline + hiddenCount == total`（0..40）= **不丢内容**这条性质有机械证据。门：scan.sh **20/20 exit 0**、i18n ALL CLEAN（1483 refs/1492 defs）。
+★ 过程教训：第一版扫描用例期望值我手算错（把 9–12 张也当成折叠，`expected 8 but was 9`）→ 已改成**按区间写死字面量**（≤12 全渲染 / ≥13 折到 8），避免自指。
+
+**未闭环（诚实边界）**：①沙箱无 Android 运行时 → 折叠的视觉/点击/自动跟随需**装包验证**；`ChatAssistantMessageUI.kt` 的 Compose 编译面只有 CI（纯逻辑已由 4.1 覆盖）。②**运行中的药丸墙本次有意不动**（实测 live 25,390→29,261px 持续增长）——升级触发 = 用户报「长回合运行中卡顿」且日志显示 live item 尺寸主导。③更上游的成因（单行累积 277 块的持久化口径，`persist-begin blocks=` 一路涨）属数据层，本次不碰。
+
+<!-- 2026-09-28 02:02:11 -->
+## 性能三分支核查 + 合并 main = 7990c0fc（09-28，用户「没有问题就合并」）
+
+
+**对象**：A `perf/memory-page-io` @`369000f0`（Memory 页 chunkText 双切）、B `perf/tool-pill-fold` @`418a0da`（冻结回合药丸折叠，分支名由 `perf/giant-item-split` 改）、C `perf/offload-convergence` @`2b5689e`（offload bytes 按需 + 零候选降噪）。三支基点均 = 当时的 main `3a36c697`，改动文件集零重叠。
+
+**核查（三支各跑 verify_branch.sh，判定项人工做）**：A/C 在 17:47、B 在 17:48（UTC）三份输出工作树全 clean；scan 全 20/20、four-way `✅ All four layers consistent`；B 的 i18n 深检 CLEAN（1490 keys×7）；C 的 scan_debt 1 no-trigger 经 `git show origin/main:` 对照=**改动前就有**（历史债，登记不修）；CI 三支 completed/success 且 head_sha 逐字符一致（B 初查 in_progress，17:53 复查转 success 后才合并）。
+
+**我复跑的独立证据（非引用报告）**：①A：装置 `/var/minis/shared/work/perf-a-probe-0928/` 编译真 `MemoryTextChunks.kt`（sha `d8ad8955…`）+ 仓库自带测试 → `OK (22 tests)`；探针在真 205KB 记忆文件上证明**两遍 chunkText 逐元素相同（54 chunks）**、回接==原文、单遍 5ms（收益=主线程省一次 5ms 级切分，非每帧布局）。②B：`pill-fold-jvm/mutate.sh` → **5 变异全 killed**、pristine sha 前后不变 `71eb2507…`，且装置 plan.kt/test.kt sha 与分支文件**逐字符相同**。③C：`verify_bytes.py`（old 文件的 sha = `git show origin/main` 的 `6b457448…`）`failures: 0`；`info_conservation.py` 用现存 09-27/09-28 真机日志取 **7 次真实零候选 pass**，63 行→7 行、`failures: 0`。**C 一行推演**：同消息多候选互不串扰（只替换自己 partIdx），排序不碰 agentHistory → bytes 挪到消费点是数值等价。
+
+**合并**：干净克隆 `/var/minis/shared/work/rkm-merge-0928` 按 A→B→C `--no-ff`：`c66e3c34`（树 == A tip）→ `3c72bc1a`（B 10 路径 == tip）→ **`7990c0fc`**（parents `3c72bc1a`+`2b5689e`，C 文件 == tip；三 tip 全 is-ancestor YES）；合并树 vs 旧 main = **13 文件 +421/−24 = A(12/1)+B(322/0)+C(87/23) 之和**；合并树上重跑 scan 20/20、i18n CLEAN、冲突标记 0、scan_debt 无新增。push `3a36c697..7990c0fc`，远端 main 逐字符 == 本地；远端三条分支 API DELETE **204×3**，远端只剩 main。
+
+**两处独立更正（已写进报告，未改代码）**：①任务书 B 的「compose elapsedMs=893–1010ms」是**误读**——`PerfLongCtx.kt:104` `elapsedMs=(now-lastNsBySession)/1e6` 是**相邻步间隔**（文件头注释亦写明），可测基线应为 `sinceClickMs=790`+`size=992x34976`；后续别再引用该数。②任务书验收判据「单 item 不再跨屏」数据上不可达（正文本身 3–4 屏），B 改述为「−73% 高度 + 正文完整」= 同意（判据被数据否掉时改判据比改实现诚实）。③**登记 P3**：C 之后零候选 pass 不再打 `━━━ Context Offload Triggered ━━━`，按 `Triggered` 计数 pass 的日志口径会漏（我基线量化时正用此口径）→ 下次改 `grep -c 'Context Offload'`；无代码消费方。
+
+**收尾/未闭环**：main release CI run `36338957047` head_sha=`7990c0fc8516` event=push = **绑定正确提交、已触发**；用户「触发了就不用等了」→ 结论未等（诚实记：CI 结论未验证）。真机行为（折叠可见性/展开、Memory 页等价、卸载 bytes 数值）全部**待装包验证**。A 的分支报告缺失（用户已知会该会话补写），本次把 A 的证据写进 `REPORT-merge-check-0928.md` §2A，避免"合并了没有报告的改动"。
+
+<!-- 2026-09-28 09:07:14 -->
+## B 折叠「重新设计」讨论 + 「只渲染可见部分」虚拟化路线分析（09-28）
+
+
+**用户反馈**：B 折叠生效但形态别扭——只折工具药丸、思考块留在外面；交替结构（思考→工具→思考）视觉上变成「靠近顶部一张折叠行 + 下方一串思考标题墙」。用户提出新方向：能否走「只渲染用户看到的那一部分」（item 级虚拟化）。
+
+**代码事实（7990c0fc 核实）**：
+- 聚合管线是唯一路径（ChatScreen.kt:5050-5069），**一条消息 = 一个 LazyColumn item**；LazyColumn 虚拟化到 item 即止，消息内部块（思考/药丸/正文）整条一次性 compose+measure。视图参数：`reverseLayout=false`、无 `beyondBoundsItemCount` override、`items(key, contentType)`；LongCtx 只跟踪 flatItems 最后一条（=最新消息行）。
+- B 折叠 = 减少合成清单（>12 折到 8），不改渲染粒度。
+- 巨型 item 来源：`ChatTranscriptRebuild.kt:179-204` 把连续 assistant 行**合并成一条**（tool_result user 行被 mapNotNull 丢弃 → 25 回合 assistant 行相邻 → 全部并成 1 条）；实测 992×34,976px ≈ 16 屏、另一条 19,790px。
+- 拆行 = 回到 08-25 前的 split 管线：渲染分支还在（ChatScreen:3930-3982 AssistantMarkdownBlock/Thinking/ToolRunGroup），builder 已死（legacy/LegacyFlatChatBuilder 无真实调用）。08-25 rikkahub 吸收 D 任务「item 粒度重归 MessageNode 级」是**深思熟虑的结构决定**（消灭 fragment churn、让 SIMPLE_FOLLOW 成立、冷开/滚动按钮估算归一）。
+- 可行限定：只对**冻结消息**拆行（流式拆行 = fragment churn 灾难，不做）；先答 B 任务书里的「拆 item 边上代价清单」。
+
+**性能账（分析结论）**：拆行把「打开/重进的一次性合成峰值」降到 ∝ 视口（~2k px 内容 vs 折叠后 ~10k px 量级），滚动总量不变、摊到滚动中；内存常驻下降。**无实测耗时**——elapsedMs 是步间隔不是耗时（上次误读教训）；「合成量 ∝ 像素」是内容量口径，不是时间口径。
+与折叠的关系：两者都把「打开时的合成量」压向视口；折叠=不可见的块**不合成**（点击才见），虚拟化=不可见的块**推迟合成**（滚动即见）。虚拟化不解决「思考墙难看」，折叠重设计也不解决滚动性能——互补。
+
+**设备/日志事实**：装包时间 09-28 02:13:54（v1.0.0+1866，含 B 折叠）；**两条巨型会话（9068927b / 577e86e3「TASK-B 文件路径」）装包后都未重开过**（LongCtx 无记录）→ 折叠后的巨型消息尺寸/耗时尚无真机数据；打开 577e86e3 可直接从日志拿到折叠后新高度。persist 最大 blocks=277（+3 块/回合）。」
+
+**待决定**：①先量（打开 577e86e3 读日志 / 加一次性计时埋点）②叙事折叠重设计 ③冻结消息拆行（需先提交接代价清单）。
+
+<!-- 2026-09-28 09:39:03 -->
+## 工具药丸折叠 revert 合并 main = 8aaad10（09-28，用户拍板「负值交易，按你说的来」）
+
+
+**决策链**：用户判折叠为**负值设计**（UX 损害 > 性能收益）→ A/B 实测证实 → revert B 合并（3c72bc1a）→ 用户授权「跑完直接合并，检查环节在当初合并时已完成」→ **main = 8aaad10**（merge 8aaad10eb53421e6811ac3438e048c02f968bc24，远端逐字符一致，分支已删 204）。
+
+**A/B 实测（同设备同消息，577e86e3「TASK-B 文件路径」巨型消息）**：
+- 折叠态打开：**7,089px，compose→placed 24ms**（−64% 高度，但无卡顿）
+- 未折叠（装包前 01:48）：19,790px，每 tick **47–60ms**（流式重组）
+- 重进全流程（ead0d82b，5,985px）：click→settled **353ms**，合成只占 13–34ms，大头是 mount/DB/解析
+- **结论：合成从来不是瓶颈**（几十 ms 量级，任务书「compose 0.9–1s」再证实为误读）；折叠收益≈几十 ms；**虚拟化动机同步消失**（同样只能省那几十 ms）→ 登记不修。唯一真实成本：流式中未折叠活消息每 tick 吃 ~75% 帧预算（登记 + 升级触发=用户报流式卡顿）。
+
+**revert 执行**：分支 `revert/remove-tool-pill-fold` @ `3e4abfe`（`git revert -m 1 3c72bc1a`，10 文件 −322，ToolPillFoldPlan.kt+测试删除）；折叠痕迹 grep 0 命中、scan 20/20、revert 树 vs 折叠前 main 逐字节一致；CI run `36365850098` completed/success @ 3e4abfe 逐字符一致；`--no-ff` merge → 8aaad10；push 后 main release CI run `36366749909` @ 8aaad10e push 自动触发（APK 无折叠版）。
+
+**装包验证点**：折叠行消失、恢复原始「思考→工具→思考」交错结构。
+
+**流程教训（判据漏维度）**：B 的验收判据是「高度 −73% + 正文完整」，没有「交错叙事保持可读」——负值交易能通过验收是判据漏维度。以后改用户可见结构，验收必须回答「用户阅读行为变成什么、变好还是变坏」。
+
+<!-- 2026-09-28 09:43:48 -->
+## 折叠 revert 装包验证闭环（09-28，用户确认）
+
+
+用户确认真机安装的是 `8aaad10e`（折叠 revert 合并后的 main）编译的 APK，运行没有问题。两处欠账随之闭环：
+- **release CI run `36366749909` @ `8aaad10e`**：结论未验证的机械欠账关闭——真机实装运行是比 run 页面更硬的结论证据。
+- **折叠 revert 装包验证点**（折叠行消失、恢复原始「思考→工具→思考」交错结构）：✅ 用户真机确认。
+
+仍未闭环的装包验证：思考标签孤儿闭标签修复（02a935a2+efac6f86，重进旧会话验证不再出现 `</thinking>`）、Memory 页 chunkText 单切（369000f0）、offload 降噪（2b5689e）——同一批进 main，需在装 8aaad10e 包后逐项确认（用户尚未逐条确认，只整体说「没有问题」）。
+<!-- 2026-09-28 -->
+
+<!-- 2026-09-28 09:45:02 -->
+## 口径更正（用户指出，09-28）：折叠 revert 后「3 个等拍板方向」应清零，不是挂起——①叙事折叠重设计：前提（
+
+**口径更正（用户指出，09-28）**：折叠 revert 后「3 个等拍板方向」应清零，不是挂起——①叙事折叠重设计：前提（要做折叠）已被「负值设计」拍板+回滚消灭；②先量基线高度：没有决策输入对象，为量而量，一阶门不过；③冻结消息拆行：本来就与 08-25 MessageNode 级粒度决定冲突，且无触发方（升级触发=用户报卡顿），是登记项不是拍板项。残留 = 两条带触发条件的登记不修（巨型 item 打开峰值 34,976px、流式 live tick ~75% 帧预算）。整条折叠线（动机→实现→回滚→装包验证）全链闭环，无挂起决策。
+<!-- 2026-09-28 -->
+
+<!-- 2026-09-28 09:50:08 -->
+## HF 语义记忆 + 知识图谱记忆更新（09-28，用户要求处理）
+
+
+**HF 语义记忆**：索引曾停在 09-21 14:00（1239 条），7 天新条目未入索引。增量重建（build --incremental，复用 1231 条旧向量 + 新嵌 165 条）→ **1396 条 / 8MB**，已上传 HF Dataset。搜索验证：折叠负值设计查询 top-2 命中 09-28 新条目（cos 0.516/0.512）。教训：语义索引需定期重建（skill 约定了会话启动搜索但没约束重建节奏）。
+
+**知识图谱记忆（更糟：不是没更新，是存不进去）**：memory MCP 服务器实锤**无持久化**——每次调用 spawn 新 session，create 后下次 read=0，写入全部蒸发（live 曾 0 实体）。修复尝试：`minis-mcp-cli add --env MEMORY_FILE_PATH=/var/minis/shared/kg/memory.jsonl` 写进 config 成功，但 **daemon 不传 env 给 STDIO 进程**（create 后目标文件不变、`--refresh` + shutdown 重启 daemon 均无效）→ **app 侧缺口，登记待修**。fallback（已生效）：以 `/var/minis/shared/kg/memory.jsonl` 为真源**直接程序化维护**（durable shared），更新脚本 `kg_update_0928.py`（直写路线，MCP 调用只是尽力接口）。KG 现状：**24 实体 / 27 关系**（09-21 快照 21/24 + 新增 branch_stop_node / rikkaminis_logs / jvmtest_harness 3 实体 + 15 观察 + 3 关系，覆盖 09-22~09-28：折叠线负值设计、停止节点、真机日志取证、JVM 装置纪律、三源取二深化、§18 关闭）。
+<!-- 2026-09-28 10:00 -->
+
+<!-- 2026-09-28 09:50:54 -->
+## memory MCP 服务器移除（09-28，用户拍板「日常使用中根本没发挥作用，去掉」）
+
+
+`minis-mcp-cli remove memory` 已删，MCP 集成只剩 termux-dock。判据 = 一阶门：该服务器无持久化（每调用新 session 写入蒸发）+ daemon 不传 env，shell/python 读 JSONL 做同样的事，没有它就不成立的价值为零。**KG 数据保留**：/var/minis/shared/kg/memory.jsonl（24 实体/27 关系）为唯一真源，已在文件内标注服务器移除；读取用 grep/python 即可，无需 MCP。同日修复的 HF 语义记忆（1396 条）不受影响。
+<!-- 2026-09-28 10:05 -->
 
 ---
 
