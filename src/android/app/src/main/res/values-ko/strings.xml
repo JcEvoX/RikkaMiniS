@@ -313,9 +313,9 @@
     <string name="skill_section_installed">설치됨</string>
     <string name="skill_section_footer">Skill 은 전용 지침과 워크플로로 AI 에이전트를 확장합니다. 활성화 시 시스템 프롬프트에 로드됩니다.</string>
     <string name="skill_empty_title">설치된 Skill 없음</string>
-    <string name="skill_empty_action">+ 를 눌러 SKILL.md 를 가져오거나 RikkaMinis Skills 를 탐색하세요.</string>
+    <string name="skill_empty_action">+ 를 눌러 SKILL.md 를 가져오거나 Minis Skills 를 탐색하세요.</string>
     <string name="skill_import_modal_title">스킬 가져오기</string>
-    <string name="skill_minis_skills_modal">RikkaMinis Skills</string>
+    <string name="skill_minis_skills_modal">Minis Skills</string>
     <string name="skill_delete_confirm_title">%1$s 을(를) 삭제하시겠습니까?</string>
     <string name="skill_delete_confirm_text">이 skill 과 파일이 영구적으로 제거됩니다.</string>
     <string name="skill_import_tab_url">URL</string>
@@ -352,7 +352,7 @@
     <string name="skill_detail_source_file">파일 가져오기</string>
     <string name="skill_detail_source_bundled">내장</string>
     <string name="skill_detail_source_session">세션 생성</string>
-    <string name="skills_browser_title">RikkaMinis Skills</string>
+    <string name="skills_browser_title">Minis Skills</string>
     <string name="skills_browser_import_button">이것을 가져오기</string>
     <string name="skills_browser_hud_importing">가져오는 중…</string>
     <string name="skills_browser_error_not_folder">먼저 skill 폴더를 선택하세요</string>

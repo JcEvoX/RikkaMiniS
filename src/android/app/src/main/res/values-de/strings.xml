@@ -313,9 +313,9 @@
     <string name="skill_section_installed">Installiert</string>
     <string name="skill_section_footer">Skills erweitern den KI-Agenten um spezialisierte Anweisungen und Workflows. Bei Aktivierung werden sie in den System-Prompt geladen.</string>
     <string name="skill_empty_title">Keine Skills installiert</string>
-    <string name="skill_empty_action">Auf + tippen, um SKILL.md zu importieren oder RikkaMinis Skills zu durchsuchen.</string>
+    <string name="skill_empty_action">Auf + tippen, um SKILL.md zu importieren oder Minis Skills zu durchsuchen.</string>
     <string name="skill_import_modal_title">Skill importieren</string>
-    <string name="skill_minis_skills_modal">RikkaMinis Skills</string>
+    <string name="skill_minis_skills_modal">Minis Skills</string>
     <string name="skill_delete_confirm_title">%1$s löschen?</string>
     <string name="skill_delete_confirm_text">Skill und zugehörige Dateien werden dauerhaft entfernt.</string>
     <string name="skill_import_tab_url">URL</string>
@@ -352,7 +352,7 @@
     <string name="skill_detail_source_file">Dateiimport</string>
     <string name="skill_detail_source_bundled">Integriert</string>
     <string name="skill_detail_source_session">In Sitzung erstellt</string>
-    <string name="skills_browser_title">RikkaMinis Skills</string>
+    <string name="skills_browser_title">Minis Skills</string>
     <string name="skills_browser_import_button">Diesen importieren</string>
     <string name="skills_browser_hud_importing">Importiert…</string>
     <string name="skills_browser_error_not_folder">Wählen Sie zuerst einen Skill-Ordner</string>

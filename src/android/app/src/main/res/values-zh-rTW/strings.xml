@@ -1197,9 +1197,9 @@
     <string name="skill_section_installed">已安裝</string>
     <string name="skill_section_footer">Skill 透過專門的指令和工作流擴展 AI agent。啟用後會被載入 system prompt。</string>
     <string name="skill_empty_title">未安裝 Skill</string>
-    <string name="skill_empty_action">點選 + 匯入 SKILL.md 或瀏覽 RikkaMinis Skills。</string>
+    <string name="skill_empty_action">點選 + 匯入 SKILL.md 或瀏覽 Minis Skills。</string>
     <string name="skill_import_modal_title">匯入技能</string>
-    <string name="skill_minis_skills_modal">RikkaMinis Skills</string>
+    <string name="skill_minis_skills_modal">Minis Skills</string>
     <string name="skill_delete_confirm_title">刪除 %1$s？</string>
     <string name="skill_delete_confirm_text">這將永久刪除該 skill 及其檔案。</string>
     <string name="skill_import_tab_url">URL</string>
@@ -1236,7 +1236,7 @@
     <string name="skill_detail_source_file">檔案匯入</string>
     <string name="skill_detail_source_bundled">內建</string>
     <string name="skill_detail_source_session">會話建立</string>
-    <string name="skills_browser_title">RikkaMinis Skills</string>
+    <string name="skills_browser_title">Minis Skills</string>
     <string name="skills_browser_import_button">匯入此項</string>
     <string name="skills_browser_hud_importing">匯入中…</string>
     <string name="skills_browser_error_not_folder">請先選擇一個 skill 資料夾</string>
