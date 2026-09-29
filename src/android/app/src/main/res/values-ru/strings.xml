@@ -48,7 +48,6 @@
     <string name="overlay_completion_timeout">Время истекло</string>
     <string name="bg_service_notification_title">Агент RikkaMinis активен</string>
     <string name="bg_service_notification_text">%1$s | %2$s | %3$s</string>
-    <string name="bg_service_stop_action">Остановить</string>
     <plurals name="bg_service_sessions">
         <item quantity="one">%d сессия</item>
         <item quantity="few">%d сессии</item>

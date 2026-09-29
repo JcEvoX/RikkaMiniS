@@ -49,8 +49,6 @@ class AgentForegroundService : Service() {
         private const val EXTRA_SESSION_COUNT = "session_count"
         private const val EXTRA_TOOL_STATUS = "tool_status"
 
-        private const val ACTION_STOP = "com.rikkaminis.app.STOP_AGENT_SERVICE"
-
         /**
          * Starts or updates the foreground service with current status.
          */
@@ -179,19 +177,6 @@ class AgentForegroundService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        if (intent?.action == ACTION_STOP) {
-            // T50: the notification's Stop action — also cancel every
-            // running agent loop. Without this, stopSelf() alone leaves
-            // streamJobs running until the OS reclaims the process; the
-            // user taps Stop and sees the notification go away but tools
-            // keep firing in the background. SessionActivityTracker holds
-            // the per-session cancel callbacks registered by each VM at
-            // streamJob start.
-            SessionActivityTracker.cancelAllActiveStreams()
-            stopSelf()
-            return START_NOT_STICKY
-        }
-
         val sessionCount = intent?.getIntExtra(EXTRA_SESSION_COUNT, 0) ?: 0
         val toolStatus = intent?.getStringExtra(EXTRA_TOOL_STATUS) ?: "Idle"
 
@@ -634,16 +619,6 @@ class AgentForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val stopIntent = Intent(this, AgentForegroundService::class.java).apply {
-            action = ACTION_STOP
-        }
-        val stopPendingIntent = PendingIntent.getService(
-            this,
-            1,
-            stopIntent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-
         val sessionLabel = resources.getQuantityString(
             R.plurals.bg_service_sessions, sessionCount, sessionCount,
         )
@@ -651,9 +626,14 @@ class AgentForegroundService : Service() {
         // T-bg-overlay phase 1: enrich the ongoing notification.
         // Title:   "Minis is using <Tool>"  (or session-count summary when idle/between turns)
         // Text:    one-line "<sessionLabel> · <elapsed>" so the always-visible row stays compact
-        // BigText: full status string from SessionActivityTracker.currentToolStatus when expanded
         // Progress: indeterminate while a tool is in flight (isToolRunning), hidden otherwise
         // The system Doze-friendly setOnlyAlertOnce keeps repeated rebuilds silent.
+        //
+        // Deliberately NOT expandable: no BigTextStyle, no action buttons.
+        // The expanded body was identical to the collapsed one (zero
+        // information gain) and the expand chevron it triggered only
+        // existed to reveal the Stop action — both dropped per user
+        // request. The row stays a single fixed-height line.
         val toolName = SessionActivityTracker.currentToolName.value
         val isToolRunning = SessionActivityTracker.isToolRunning.value
 
@@ -676,16 +656,10 @@ class AgentForegroundService : Service() {
             .setColor(ContextCompat.getColor(this, R.color.notification_brand_color))
             .setContentTitle(titleText)
             .setContentText(collapsedText)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(collapsedText))
             .setOngoing(true)
             .setShowWhen(false)
             .setOnlyAlertOnce(true)
             .setContentIntent(pendingIntent)
-            .addAction(
-                android.R.drawable.ic_menu_close_clear_cancel,
-                getString(R.string.bg_service_stop_action),
-                stopPendingIntent,
-            )
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
 

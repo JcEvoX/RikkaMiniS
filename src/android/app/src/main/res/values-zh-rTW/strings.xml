@@ -916,7 +916,6 @@
     <string name="overlay_dismiss">關閉</string>
     <string name="bg_service_notification_title">RikkaMinis Agent 執行中</string>
     <string name="bg_service_notification_text">%1$s | %2$s | %3$s</string>
-    <string name="bg_service_stop_action">停止</string>
     <string name="battery_opt_section_title">電池最佳化</string>
     <string name="battery_opt_section_footer">豁免後，Android 不會在任務執行中讓應用進入休眠。每次返回此頁面會重新檢查。</string>
     <string name="battery_opt_row_title">允許後臺執行</string>

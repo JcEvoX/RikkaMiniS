@@ -37,7 +37,6 @@
     <string name="bg_service_channel_description">Zeigt den Status laufender Agent-Sitzungen an.</string>
     <string name="bg_service_notification_title">RikkaMinis Agent aktiv</string>
     <string name="bg_service_notification_text">%1$s | %2$s | %3$s</string>
-    <string name="bg_service_stop_action">Stopp</string>
     <plurals name="bg_service_sessions">
         <item quantity="one">%d Sitzung</item>
         <item quantity="other">%d Sitzungen</item>

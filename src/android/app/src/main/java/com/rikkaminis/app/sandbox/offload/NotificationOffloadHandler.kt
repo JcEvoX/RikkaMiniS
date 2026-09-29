@@ -554,7 +554,11 @@ class NotificationOffloadHandler(private val context: Context) : NativeOffloadHa
 
     companion object {
         private const val TAG = "NotificationOffload"
-        private const val CHANNEL_ID = "minis_agent_notifications"
+        // Single source of truth for the android-notification channel.
+        // ScheduledNotificationReceiver (the deferred fire path) builds its
+        // notification against this same id — a separate constant there had
+        // already drifted-risk two declarations, so both read this one.
+        const val CHANNEL_ID = "minis_agent_notifications"
         private const val CHANNEL_NAME = "Agent Notifications"
         private var channelCreated = false
 
