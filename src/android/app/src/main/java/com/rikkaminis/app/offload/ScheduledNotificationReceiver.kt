@@ -8,6 +8,7 @@ import androidx.core.app.NotificationCompat
 import com.rikkaminis.app.MainActivity
 import com.rikkaminis.app.R
 import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.sandbox.offload.NotificationOffloadHandler
 
 /**
  * Fires when an `android-notification schedule` AlarmManager alarm
@@ -27,7 +28,6 @@ class ScheduledNotificationReceiver : BroadcastReceiver() {
         const val EXTRA_ID = "scheduled_notification_id"
         const val EXTRA_TITLE = "scheduled_notification_title"
         const val EXTRA_BODY = "scheduled_notification_body"
-        const val CHANNEL_ID = "minis_agent_notifications"
         private const val TAG = "ScheduledNotifReceiver"
 
         /**
@@ -91,7 +91,9 @@ class ScheduledNotificationReceiver : BroadcastReceiver() {
 
         val notifId = id.hashCode() and 0x7FFFFFFF
 
-        val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+        // Same channel id as the immediate path (NotificationOffloadHandler
+        // owns the constant AND creates the channel) — see CHANNEL_ID there.
+        val notification = NotificationCompat.Builder(context, NotificationOffloadHandler.CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentTitle(title)
             .setContentText(body)
