@@ -49,7 +49,6 @@
     <string name="overlay_completion_timeout">已超时</string>
     <string name="bg_service_notification_title">RikkaMinis Agent 运行中</string>
     <string name="bg_service_notification_text">%1$s | %2$s | %3$s</string>
-    <string name="bg_service_stop_action">停止</string>
     <plurals name="bg_service_sessions">
         <item quantity="one">%d 个会话</item>
         <item quantity="other">%d 个会话</item>
