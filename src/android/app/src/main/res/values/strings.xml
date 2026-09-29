@@ -674,9 +674,9 @@
     <string name="skill_section_installed">Installed</string>
     <string name="skill_section_footer">Skills extend the AI agent with specialized instructions and workflows. They are loaded into the system prompt when enabled.</string>
     <string name="skill_empty_title">No Skills Installed</string>
-    <string name="skill_empty_action">Tap + to import a SKILL.md, .zip, or .skill file, or browse RikkaMinis Skills.</string>
+    <string name="skill_empty_action">Tap + to import a SKILL.md, .zip, or .skill file, or browse Minis Skills.</string>
     <string name="skill_import_modal_title">Import Skill</string>
-    <string name="skill_minis_skills_modal">RikkaMinis Skills</string>
+    <string name="skill_minis_skills_modal">Minis Skills</string>
     <string name="skill_delete_confirm_title">Delete %1$s?</string>
     <string name="skill_delete_confirm_text">This will permanently remove the skill and its files.</string>
     <string name="skill_import_tab_url">URL</string>
@@ -713,7 +713,7 @@
     <string name="skill_detail_source_file">File import</string>
     <string name="skill_detail_source_bundled">Built-in</string>
     <string name="skill_detail_source_session">Session created</string>
-    <string name="skills_browser_title">RikkaMinis Skills</string>
+    <string name="skills_browser_title">Minis Skills</string>
     <string name="skills_browser_import_button">Import This</string>
     <string name="skills_browser_hud_importing">Importing…</string>
     <string name="skills_browser_error_not_folder">Select a skill folder first</string>

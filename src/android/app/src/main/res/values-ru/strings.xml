@@ -515,9 +515,9 @@
     <string name="skill_section_installed">Установлено</string>
     <string name="skill_section_footer">Навыки расширяют ИИ-агента специализированными инструкциями и рабочими процессами. Они загружаются в системный промпт при включении.</string>
     <string name="skill_empty_title">Нет установленных навыков</string>
-    <string name="skill_empty_action">Нажмите +, чтобы импортировать SKILL.md или просмотреть Навыки RikkaMinis.</string>
+    <string name="skill_empty_action">Нажмите +, чтобы импортировать SKILL.md или просмотреть Навыки Minis.</string>
     <string name="skill_import_modal_title">Импорт навыка</string>
-    <string name="skill_minis_skills_modal">Навыки RikkaMinis</string>
+    <string name="skill_minis_skills_modal">Навыки Minis</string>
     <string name="skill_delete_confirm_title">Удалить %1$s?</string>
     <string name="skill_delete_confirm_text">Это безвозвратно удалит навык и его файлы.</string>
     <string name="skill_import_tab_url">URL</string>
@@ -554,7 +554,7 @@
     <string name="skill_detail_source_file">Импорт из файла</string>
     <string name="skill_detail_source_bundled">Встроенный</string>
     <string name="skill_detail_source_session">Создан в сессии</string>
-    <string name="skills_browser_title">Навыки RikkaMinis</string>
+    <string name="skills_browser_title">Навыки Minis</string>
     <string name="skills_browser_import_button">Импортировать это</string>
     <string name="skills_browser_hud_importing">Импорт…</string>
     <string name="skills_browser_error_not_folder">Сначала выберите папку навыка</string>
