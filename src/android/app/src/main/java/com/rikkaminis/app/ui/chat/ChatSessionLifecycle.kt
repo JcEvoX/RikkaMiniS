@@ -24,6 +24,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 import androidx.lifecycle.viewModelScope
 import com.rikkaminis.app.R
+import com.rikkaminis.app.agent.InterruptedTailDetector
+import com.rikkaminis.app.agent.InterruptedTailPartKind
+import com.rikkaminis.app.agent.InterruptedTailShape
+import com.rikkaminis.app.agent.InterruptedTailSnapshot
 import com.rikkaminis.app.agent.runtime.AgentRunEvent
 import com.rikkaminis.app.agent.runtime.AgentRunPhase
 import com.rikkaminis.app.tools.AgentTraceRecorder
@@ -1279,6 +1283,9 @@ internal fun ChatViewModel.loadSession() {
         // [_canResume] flag set by [handleUserCancelledCleanup] is lost
         // across cold starts so we have to re-derive it from the DB.
         // Mirrors iOS AIChatViewModel.loadSession lines 3546-3581.
+        // The shape rule itself lives in
+        // [com.rikkaminis.app.agent.InterruptedTailDetector] (shared with the
+        // badge scan); only the liveness gate is session-specific.
         //   Case A: last entry is user with all-toolResult parts —
         //           tools completed but the next model call never fired.
         //   Case B: last entry is assistant with any tool_use parts —
@@ -1319,71 +1326,30 @@ internal fun ChatViewModel.loadSession() {
         // `sessionId`) because every tracker write uses it — a draft VM keeps
         // its `__new__` key while the tracker holds the canonical id.
         val trackerActive = SessionActivityTracker.isActive(activeSessionId)
-        if (lastEntry != null && !_isStreaming.value && !trackerActive) {
-            val isInterrupted = when (lastEntry.role) {
-                LLMMessage.Role.USER -> {
-                    val parts = lastEntry.contentParts
-                    val allToolResults = parts.isNotEmpty() &&
-                        parts.all { it is AgentContentPart.ToolResult }
-                    val isContinueReminder = parts.size == 1 &&
-                        (parts.first() as? AgentContentPart.Text)?.text
-                            ?.contains("The user stopped the previous response") == true
-                    // Case D — a user turn with NO reply after it at all.
-                    //
-                    // How it is produced: send() persists the user row BEFORE
-                    // the reply lands. If the process dies in between — Android
-                    // reclaiming a backgrounded app is the reported case — the
-                    // assistant side never reaches the store, and it cannot be
-                    // reconstructed later because persistAssistantTurn() drops
-                    // any row with no parts (the guard that stops us POSTing a
-                    // content-less assistant message back to the API). An in-app
-                    // first-turn network failure lands here too:
-                    // setInlineError() attaches the error to the last ASSISTANT
-                    // row and is a no-op when none exists, so that tail is
-                    // equally reply-less and equally stuck.
-                    //
-                    // Before this case such a tail reported canResume=false —
-                    // no PAUSED badge, no Resume banner, and retryLast()
-                    // bailing at rollbackIncompleteTurn() == null. The session
-                    // had NO recovery affordance and the user could only start a
-                    // new chat. [resume] needs no continue reminder for it: the
-                    // history already ends in the request itself, so
-                    // runAgentLoop() answers it as-is.
-                    //
-                    // Deliberately LAST: A and C describe a turn that was
-                    // mid-flight; D describes one that never started. Order
-                    // keeps their more specific semantics (and logging) intact
-                    // for tails that match both. An EMPTY user tail is NOT
-                    // recoverable — there is nothing to answer, and re-sending
-                    // it would post a content-less message the API rejects.
-                    when {
-                        allToolResults -> true
-                        isContinueReminder -> true
-                        parts.isEmpty() -> false
-                        else -> true
-                    }
-                }
-                LLMMessage.Role.ASSISTANT -> {
-                    lastEntry.contentParts.any { it is AgentContentPart.ToolUse }
-                }
-                else -> false
-            }
-            if (isInterrupted) {
-                _canResume.value = true
-                // Name the shape, not just the role: Case D (reply-less user
-                // tail) is the one that used to be invisible, so a field log
-                // has to be able to tell it from A/B/C.
-                val shape = when {
-                    lastEntry.role == LLMMessage.Role.ASSISTANT -> "B/assistant-toolUse"
-                    lastEntry.contentParts.isNotEmpty() &&
-                        lastEntry.contentParts.all { it is AgentContentPart.ToolResult } -> "A/toolResult-tail"
-                    lastEntry.contentParts.size == 1 &&
-                        (lastEntry.contentParts.first() as? AgentContentPart.Text)?.text
-                            ?.contains("The user stopped the previous response") == true -> "C/continue-reminder"
-                    else -> "D/unanswered-user-turn"
-                }
-                Log.i(ChatViewModel.TAG, "loadSession: detected interrupted agent loop, canResume=true (lastRole=${lastEntry.role} shape=$shape)")
-            }
+        val tailShape = if (lastEntry == null || _isStreaming.value || trackerActive) {
+            null
+        } else {
+            InterruptedTailDetector.classify(
+                InterruptedTailSnapshot(
+                    role = lastEntry.role.value,
+                    partKinds = lastEntry.contentParts.map { p ->
+                        when (p) {
+                            is AgentContentPart.Text -> InterruptedTailPartKind.TEXT
+                            is AgentContentPart.ToolUse -> InterruptedTailPartKind.TOOL_USE
+                            is AgentContentPart.ToolResult -> InterruptedTailPartKind.TOOL_RESULT
+                            else -> InterruptedTailPartKind.OTHER
+                        }
+                    },
+                    firstText = (lastEntry.contentParts.firstOrNull() as? AgentContentPart.Text)?.text,
+                ),
+            )
+        }
+        if (tailShape != null && tailShape != InterruptedTailShape.NONE) {
+            _canResume.value = true
+            // Name the shape, not just the role: Case D (reply-less user
+            // tail) is the one that used to be invisible, so a field log has
+            // to be able to tell it from A/B/C.
+            Log.i(ChatViewModel.TAG, "loadSession: detected interrupted agent loop, canResume=true (lastRole=${lastEntry?.role} shape=$tailShape)")
         }
         } finally {
             // T201: open the gate even on early `return@launch` (draft path,
