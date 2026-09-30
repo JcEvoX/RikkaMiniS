@@ -1571,4 +1571,28 @@
     <string name="browser_no_app_for_link">沒有可開啟此連結的應用程式。</string>
     <string name="browser_could_not_open_link">無法開啟此連結。</string>
     <string name="filepreview_pdf_render_failed_fallback">PDF 轉譯失敗</string>
+    <!-- [T-android-a11y-force-stop-recovery] + [T-android-restricted-settings] -->
+    <string name="system_permissions_a11y_restricted_header">開關點不動？（\"受限設定\"）</string>
+    <string name="system_permissions_a11y_restricted_footer">Android 會禁止從已下載的 APK 安裝的應用程式開啟無障礙開關。這是系統安全策略，不是 RikkaMinis 的故障——你的安裝沒有任何問題。允許受限設定只會重新啟用這個開關；它本身不授予任何權限，是否開啟服務仍由你決定。</string>
+    <string name="system_permissions_a11y_restricted_shizuku">透過 Shizuku 允許受限設定</string>
+    <string name="system_permissions_a11y_restricted_shizuku_sub">一鍵操作——無需離開 RikkaMinis 即可清除該標記</string>
+    <string name="system_permissions_a11y_restricted_working">處理中…</string>
+    <string name="system_permissions_a11y_restricted_failed">失敗——請使用下方手動步驟</string>
+    <string name="system_permissions_a11y_restricted_manual">允許受限設定</string>
+    <string name="system_permissions_a11y_restricted_manual_sub">應用程式資訊 → ⋮ 選單（右上角）→ 允許受限設定</string>
+    <string name="a11y_repair_dialog_title">無障礙權限已關閉</string>
+    <string name="a11y_repair_cancel">暫不處理</string>
+    <string name="a11y_repair_dialog_message_shizuku">RikkaMinis 的無障礙權限遺失了——這通常發生在應用程式被強制停止之後。Shizuku 已就緒，可以立即恢復，無需開啟系統設定。</string>
+    <string name="a11y_repair_action_repair">立即修復</string>
+    <string name="a11y_repair_dialog_message_manual">RikkaMinis 的無障礙權限遺失了——這通常發生在應用程式被強制停止之後。請在「設定 → 無障礙」中重新啟用 RikkaMinis 以繼續。</string>
+    <string name="a11y_repair_action_open_settings">開啟設定</string>
+    <string name="a11y_repair_section_header">需要處理</string>
+    <string name="a11y_repair_footer_shizuku">Android 會在應用程式被強制停止時移除無障礙授權，且不會自動恢復。Shizuku 可以直接寫回該授權。</string>
+    <string name="a11y_repair_footer_manual">Android 會在應用程式被強制停止時移除無障礙授權，且不會自動恢復。安裝並授權 Shizuku 後，以後可以一鍵修復。</string>
+    <string name="a11y_repair_row_shizuku">修復無障礙權限</string>
+    <string name="a11y_repair_row_manual">重新啟用無障礙</string>
+    <string name="a11y_repair_in_progress">修復中…</string>
+    <string name="a11y_repair_failed">修復失敗——請到設定中手動啟用</string>
+    <string name="a11y_repair_row_sub">權限已被撤銷，很可能是強制停止導致的</string>
+
 </resources>
