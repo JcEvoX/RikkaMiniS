@@ -1593,4 +1593,10 @@
     <string name="a11y_repair_failed">수리 실패 — 설정에서 직접 켜보세요</string>
     <string name="a11y_repair_row_sub">권한이 취소되었습니다. 아마도 강제 종료 때문입니다</string>
 
+    <!-- [T-android-downgrade-compat] 저장된 데이터베이스가 이 앱보다
+    최신 버전일 때 표시되는 안내 화면 문구. -->
+    <string name="newer_db_title">데이터가 더 최신 버전에서 만들어진 것입니다</string>
+    <string name="newer_db_body">현재 설치된 RikkaMinis는 이 데이터를 만든 버전보다 오래되어 데이터베이스를 안전하게 열 수 없습니다.\n\n삭제된 것은 아무것도 없습니다 — 대화 내용은 이 기기에 그대로 남아 있습니다. 더 새로운 버전의 RikkaMinis를 다시 설치하면 모든 데이터가 돌아옵니다.</string>
+    <string name="newer_db_versions">이 버전은 데이터 형식 %1$d을 지원합니다</string>
+    <string name="newer_db_exit">닫기</string>
 </resources>

@@ -1593,4 +1593,9 @@
     <string name="a11y_repair_failed">修復に失敗しました — 設定画面で有効にしてください</string>
     <string name="a11y_repair_row_sub">権限は取り消されました。おそらく強制停止が原因です</string>
 
+    <!-- [T-android-downgrade-compat] 保存数据库比当前版本新时的引导页文案。 -->
+    <string name="newer_db_title">データは新しいバージョンによるものです</string>
+    <string name="newer_db_body">インストール中の RikkaMinis は、このデータを作成したバージョンよりも古いバージョンのため、データベースを安全に開けません。\n\n何も削除されていません — 会話はこの端末上でそのまま残っています。新しいバージョンの RikkaMinis を再インストールすれば、すべてのデータが戻ります。</string>
+    <string name="newer_db_versions">このバージョンはデータ形式 %1$d をサポートします</string>
+    <string name="newer_db_exit">閉じる</string>
 </resources>
