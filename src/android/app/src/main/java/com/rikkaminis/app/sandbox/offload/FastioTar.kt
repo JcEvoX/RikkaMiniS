@@ -67,9 +67,12 @@ internal class TarCreateOutcome : EntryBudget {
 }
 
 /**
- * Write [roots] (host path + its guest path) into [sink] as a POSIX ustar
- * stream. Entry names are the guest path with its leading `/` stripped, which
- * is what GNU/busybox tar store for an absolute member argument.
+ * Write [roots] (host path + the member-name prefix it is stored under) into
+ * [sink] as a POSIX ustar stream. The prefix is the guest path AS THE USER
+ * SPELLED IT, put through [tarMemberPrefix]: `tar -cf a.tar src` stores
+ * `src/...`, which is what GNU/busybox store and what makes a third-party
+ * `tar -xf` land the tree where the caller meant. Naming members after the
+ * RESOLVED path instead nests every extraction under `dest/var/minis/...`.
  *
  * Symlinks are written AS LINKS (never followed), matching the rest of the
  * handler. Everything that is neither a regular file, a directory nor a
@@ -83,10 +86,10 @@ internal fun tarCreate(
     maxEntries: Long,
     out: TarCreateOutcome,
 ) {
-    for ((path, guestPath) in roots) {
-        val name = tarMemberName(guestPath)
+    for ((path, memberPrefix) in roots) {
+        val name = tarMemberName(memberPrefix)
         if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
-            out.errors.add("$guestPath: not found")
+            out.errors.add("$memberPrefix: not found")
             continue
         }
         if (Files.isSymbolicLink(path)) {
@@ -130,7 +133,7 @@ internal fun tarCreate(
                 },
             )
         } catch (e: Exception) {
-            out.errors.add("$guestPath: ${e.message}")
+            out.errors.add("$memberPrefix: ${e.message}")
         }
     }
     // Two zero blocks end the archive; readers stop on the first one.
@@ -182,6 +185,38 @@ private fun memberNameFor(rootName: String, root: Path, path: Path): String {
 /** A guest path as a tar member name: `tar` stores absolute arguments without the leading `/`. */
 internal fun tarMemberName(guestPath: String): String =
     guestPath.trimStart('/').ifEmpty { "." }
+
+/**
+ * The member-name prefix for one `tar -c` argument: the argument **as the user
+ * spelled it**.
+ *
+ * `tar` stores the name it was GIVEN, not the path it resolved — that is what
+ * makes a `tar -cf a.tar src` archive extract to `./src` for whoever reads it.
+ * Naming members after the resolved guest path instead yields
+ * `var/minis/workspace/src/...`, which busybox unpacks into a nested
+ * `dest/var/minis/workspace/src` tree and which no `-C` can undo (review
+ * finding F1, probe `shared/work/fix-fastio-tarname-1001/jvm`).
+ *
+ * The normalizations GNU and busybox tar both apply to an argument:
+ *   - a leading `/` is dropped (`tar: removing leading '/' from member names`);
+ *   - leading `../` sequences are dropped (`tar: removing leading '../' from
+ *     member names`). An argument that is nothing BUT `..` therefore keeps no
+ *     spelling at all; `.` is used, which extracts to the same place busybox's
+ *     stripped name would;
+ *   - a trailing `/` is dropped, because a directory entry writes its own.
+ *
+ * `./` is preserved (`./src/f1.txt`), as both readers do. An inner `..`
+ * (`a/../b`) is left as spelled, again matching both tars — note that such a
+ * member is refused by OUR extractor as `tar_slip`, so pass a normalized
+ * argument if the archive is meant to come back.
+ */
+internal fun tarMemberPrefix(raw: String): String {
+    var rest = raw.trimStart('/')
+    while (rest == ".." || rest.startsWith("../")) {
+        rest = rest.removePrefix("..").removePrefix("/")
+    }
+    return rest.trimEnd('/').ifEmpty { "." }
+}
 
 /** One header's worth of fields, before serialization. */
 internal data class TarMember(

@@ -699,7 +699,11 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
             when (val resolution = GuestPathMapper.resolve(raw, request.cwd, bindings)) {
                 is GuestPathMapper.Resolution.Denied -> denied.put(deniedEntry(raw, resolution))
                 is GuestPathMapper.Resolution.Ok -> {
-                    members.add(Paths.get(resolution.hostPath) to resolution.guestPath)
+                    // The member name is the ARGUMENT SPELLING, not the resolved
+                    // guest path: `tar -cf a.tar src` must store `src/...`, or
+                    // every third-party extraction nests under
+                    // `dest/var/minis/workspace/src` (see [tarMemberPrefix]).
+                    members.add(Paths.get(resolution.hostPath) to tarMemberPrefix(raw))
                     guestNames.put(resolution.guestPath)
                 }
             }
@@ -1099,6 +1103,10 @@ Notes:
     fifos and sockets cannot be represented and are SKIPPED — the count and up to 20 names are
     reported under "skipped_special" so an archive that lacks them says so. Hard links are not
     materialised on extract ("skipped_hardlink"): the file itself is still unpacked.
+    Member names follow the ARGUMENT as spelled (`-cf a.tar src` stores `src/...`, NOT the
+    resolved `/var/minis/workspace/src/...`), exactly as GNU/busybox do — with a leading `/`
+    and leading `../` dropped the way both of them drop them — so whoever extracts the archive
+    lands the tree where the caller meant.
   - `tar -x` is tar-slip guarded: an entry that is absolute, that climbs above the extraction
     root with `..`, or that writes THROUGH a symlink (one already on disk, or one the archive
     itself declares) is refused as "tar_slip". The whole archive is validated first, so a

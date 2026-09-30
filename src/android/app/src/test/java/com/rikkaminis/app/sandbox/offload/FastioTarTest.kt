@@ -106,6 +106,57 @@ class FastioTarTest {
         assertEquals("hello", Files.readAllBytes(dest.resolve("$tree/a.txt")).decodeToString())
     }
 
+    // ── member naming (the ARGUMENT spelling, not the resolved path) ────────
+
+    @Test
+    fun `a member prefix keeps the argument spelling`() {
+        // Expected values are GNU/busybox's own rule written out by hand: the
+        // stored name is the argument AS SPELLED, minus the two forms both tars
+        // normalize away (a leading '/', leading '../'). Naming members after
+        // the resolved path instead nests every extraction under
+        // dest/var/minis/... — review finding F1.
+        assertEquals("src", tarMemberPrefix("src"))
+        assertEquals("./src", tarMemberPrefix("./src"))
+        assertEquals("src", tarMemberPrefix("src/"))
+        assertEquals("src/sub", tarMemberPrefix("src/sub/"))
+        assertEquals("var/minis/workspace/src", tarMemberPrefix("/var/minis/workspace/src"))
+        assertEquals("x.txt", tarMemberPrefix("x.txt"))
+        assertEquals(".", tarMemberPrefix("."))
+        assertEquals(".", tarMemberPrefix(".."))
+        assertEquals("x", tarMemberPrefix("../x"))
+        assertEquals("a/b", tarMemberPrefix("../../a/b"))
+        // Not everything with dots is a `..`: these keep their spelling.
+        assertEquals("...", tarMemberPrefix("..."))
+        assertEquals("..x/y", tarMemberPrefix("..x/y"))
+        // An INNER `..` is kept, as both real tars keep it.
+        assertEquals("a/../b", tarMemberPrefix("a/../b"))
+    }
+
+    @Test
+    fun `a relative argument produces relative member names, not the resolved path`() {
+        val root = Files.createTempDirectory("fastio-tar-arg-name")
+        val tree = Files.createDirectory(root.resolve("src"))
+        Files.write(tree.resolve("f1.txt"), "F1".toByteArray())
+        val sub = Files.createDirectory(tree.resolve("sub"))
+        Files.write(sub.resolve("f3.txt"), "F3".toByteArray())
+
+        val archive = ByteArrayOutputStream()
+        tarCreate(archive, listOf(tree to tarMemberPrefix("src")), 1000L, TarCreateOutcome())
+        val bytes = archive.toByteArray()
+
+        assertEquals(
+            listOf("src/", "src/f1.txt", "src/sub/", "src/sub/f3.txt"),
+            readMembers(bytes).map { it.name },
+        )
+
+        // …so the tree lands at dest/src, not at dest/<some resolved path>.
+        val dest = root.resolve("out")
+        val extracted = TarExtractOutcome()
+        tarExtract(ByteArrayInputStream(bytes), dest, false, 1000L, extracted)
+        assertEquals("F1", Files.readAllBytes(dest.resolve("src/f1.txt")).decodeToString())
+        assertFalse(Files.exists(dest.resolve("var")))
+    }
+
     // ── name fields ─────────────────────────────────────────────────────────
 
     @Test
