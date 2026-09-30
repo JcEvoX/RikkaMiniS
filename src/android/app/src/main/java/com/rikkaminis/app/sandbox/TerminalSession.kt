@@ -167,7 +167,7 @@ class TerminalSession(private val context: Context) {
                 // Pass the proot binary path so it lands in argv[0] — critical
                 // for PRoot's option parsing (see buildTermuxArgs docs).
                 val args = buildTermuxArgs(sessionId, rootfsManager, proot)
-                val env = buildTermuxEnv(rootfsManager)
+                val env = buildTermuxEnv(rootfsManager, sessionId)
 
                 val client = TermuxSessionClient()
                 val session = com.termux.terminal.TerminalSession(
@@ -483,7 +483,7 @@ class TerminalSession(private val context: Context) {
     }
 
     /** Build the environment array for Termux TerminalSession. */
-    private fun buildTermuxEnv(rootfsManager: RootfsManager): List<String> {
+    private fun buildTermuxEnv(rootfsManager: RootfsManager, sessionId: String? = null): List<String> {
         val envMap = LinkedHashMap<String, String>()
         envMap["PROOT_TMP_DIR"] = PRootKernel.getProotTmpDir(context).absolutePath
         if (PRootKernel.nativeLibDir.isNotEmpty())
@@ -498,6 +498,13 @@ class TerminalSession(private val context: Context) {
         envMap["TZ"] = PRootKernel.posixTz()
         for ((k, v) in PRootKernel.customEnvironment) envMap[k] = v
         ExecutionCoordinator.envVarRepository?.allAsDict()?.forEach { (k, v) -> envMap[k] = v }
+        // [T-minis-fastio] The PTY's own proot `-b` table is session-scoped
+        // (buildTermuxArgs above), so an offload handler that rebuilds that
+        // table from this env var must see the SAME id — otherwise
+        // `/var/minis/workspace` resolves to the empty rootfs placeholder
+        // inside `minis-fastio` while `ls` in the same terminal shows the real
+        // session dir. Last write wins, so it is set after the user env.
+        if (!sessionId.isNullOrEmpty()) envMap["MINIS_CHAT_SESSION_ID"] = sessionId
         return envMap.map { (k, v) -> "$k=$v" }
     }
 

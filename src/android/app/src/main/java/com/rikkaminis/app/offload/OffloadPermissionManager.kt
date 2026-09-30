@@ -95,6 +95,13 @@ object OffloadPermissionManager {
         // is already authorized.
         ToolPermissionInfo("a11y_cli", "android-a11y-cli", PermissionCategory.INTEGRATIONS, PermissionLevel.NOT_ALLOWED),
         ToolPermissionInfo("shizuku_cli", "android-shizuku-cli", PermissionCategory.INTEGRATIONS, PermissionLevel.NOT_ALLOWED),
+        // [T-minis-fastio] minis-fastio's DESTRUCTIVE path only (recursive
+        // delete of real host files, no undo). Read-only `du` does not consult
+        // this gate — it grants nothing file_read does not already have.
+        // ASK_ONCE, not NOT_ALLOWED: the tool exists to be used, but a delete
+        // must be seen by the user first. showInSettings stays true so the row
+        // is visible and closable.
+        ToolPermissionInfo("fastio_rm", "minis-fastio (delete)", PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE),
     )
 
     /** Stable session-id used by NativeOffloadHandlers when calling

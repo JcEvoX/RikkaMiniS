@@ -45,6 +45,7 @@ import com.rikkaminis.app.sandbox.offload.CalendarOffloadHandler
 import com.rikkaminis.app.sandbox.offload.ClipboardOffloadHandler
 import com.rikkaminis.app.sandbox.offload.ContactsOffloadHandler
 import com.rikkaminis.app.sandbox.offload.DeviceOffloadHandler
+import com.rikkaminis.app.sandbox.offload.FastioOffloadHandler
 import com.rikkaminis.app.sandbox.offload.LocationOffloadHandler
 import com.rikkaminis.app.sandbox.offload.ModelUseOffloadHandler
 import com.rikkaminis.app.sandbox.offload.SessionsOffloadHandler
@@ -595,6 +596,11 @@ class MinisApp : Application(), ImageLoaderFactory {
         // so PATH lookup succeeds; PRoot intercepts the execve before
         // the stub runs and routes to this handler).
         NativeOffloadServer.register("minis-sessions-cli", SessionsOffloadHandler(chatRepository, this))
+        // [T-minis-fastio] minis-fastio — file-intensive primitives (du / rm -r)
+        // executed by this process on the real filesystem instead of through
+        // PRoot's ptrace boundary. Read-only `du` is ungated; `rm` goes through
+        // OffloadGate (ASK_ONCE) before touching anything.
+        NativeOffloadServer.register("minis-fastio", FastioOffloadHandler(this))
         // T322: android-shizuku-cli — privileged Android control via Shizuku.
         // The handler short-circuits with a typed error envelope when the
         // user hasn't installed / started / authorized Shizuku, so we
