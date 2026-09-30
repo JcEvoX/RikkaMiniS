@@ -35,6 +35,7 @@ import com.rikkaminis.app.deeplink.DeepLinkHandler
 
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.service.SessionActivityTracker
+import com.rikkaminis.app.ui.NewerDatabaseGuidanceScreen
 import com.rikkaminis.app.ui.navigation.AppNavigation
 import com.rikkaminis.app.ui.navigation.coldStartRestoreAllowed
 import com.rikkaminis.app.ui.navigation.Routes
@@ -220,6 +221,24 @@ class MainActivity : ComponentActivity() {
                     }
                 },
             )
+            return
+        }
+
+        // [T-android-downgrade-compat] Handle BEFORE anything that touches
+        // MinisApp's lateinit deps — every one of them was skipped (see the
+        // SHOW_NEWER_DB_GUIDANCE early return in MinisApp.onCreate), so
+        // reaching them here would throw UninitializedPropertyAccessException.
+        // Placed after the safe-mode block on purpose: safe mode has the more
+        // generic remedy (a crash burst) and already owns its screen.
+        //
+        // This is not a crash — it is a recoverable state with a specific
+        // remedy, and the database file has deliberately been left untouched.
+        // Nothing on disk was migrated or dropped: Room was never constructed.
+        if ((application as MinisApp).dbVersionDecision ==
+            com.rikkaminis.app.data.db.DatabaseVersionGuard.Decision.SHOW_NEWER_DB_GUIDANCE
+        ) {
+            android.util.Log.w("MainActivity", "database is from a newer build — showing guidance screen")
+            setContent { NewerDatabaseGuidanceScreen(onExit = { finishAndRemoveTask() }) }
             return
         }
 
