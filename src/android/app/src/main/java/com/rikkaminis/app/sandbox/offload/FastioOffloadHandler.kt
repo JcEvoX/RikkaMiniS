@@ -38,7 +38,7 @@ import java.util.regex.PatternSyntaxException
  *
  * ## Scope
  *
- * Six primitives, all defined by the same translation + guard:
+ * Seven primitives, all defined by the same translation + guard:
  *
  *   minis-fastio du <path>...              read-only: entries + apparent bytes per tree
  *   minis-fastio rm [-r] <path>...         destructive: recursive delete
@@ -46,12 +46,16 @@ import java.util.regex.PatternSyntaxException
  *   minis-fastio grep <pattern> <path>...  read-only: line search (capped matches)
  *   minis-fastio cp [-r] <src> <dst>       write: copy file or tree
  *   minis-fastio mv <src> <dst>            write: rename (copy+delete across filesystems)
+ *   minis-fastio tar -cf <a.tar> <path>...  write: pack (POSIX ustar, optional -z)
+ *   minis-fastio tar -xf <a.tar> [-C dir]   write: unpack (tar-slip guarded)
  *
  * The read-only primitives (`du` / `find` / `grep`) are NOT gated — they grant
  * nothing the agent's `file_read` does not already have. Every WRITE primitive
  * is gated by [OffloadGate] under its own permission row (ASK_ONCE by default):
- * `fastio_rm`, `fastio_cp`, `fastio_mv` — one row per write tool, so a user who
- * trusts deletion does not thereby authorise overwriting.
+ * `fastio_rm`, `fastio_cp`, `fastio_mv`, `fastio_tar` — one row per write tool,
+ * so a user who trusts deletion does not thereby authorise overwriting, and
+ * neither of them silently authorises writing an archive out (or expanding one
+ * in).
  *
  * ## Guards on the destructive / write paths
  *
@@ -79,13 +83,17 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
             // otherwise parse `-name` as a flag and `*.log` as a positional
             // path. Rewriting here leaves the parser shared by all ~46 handlers
             // untouched.
-            normalizeLongOptionSpelling(request.argv.drop(1)),
+            normalizeLongOptionSpelling(normalizeTarShorts(request.argv.drop(1))),
             // `--recursive` / `--force` / `--ignore-case` are booleans, not
             // `--key value` pairs. Without this declaration OffloadArgs consumes
             // the NEXT token as the option's value, so `rm --recursive /tmp/x`
             // lost the path and reported "missing <path>" instead of deleting
             // anything.
-            booleanFlags = setOf("recursive", "force", "ignore-case"),
+            booleanFlags = setOf(
+                "recursive", "force", "ignore-case",
+                // tar verbs: `--create`/`--gzip`/... are modes, never `--key value`.
+                "create", "extract", "gzip", "verbose",
+            ),
         )
         if (args.hasFlag("h", "help")) return NativeOffloadResult(0, HELP)
 
@@ -99,6 +107,7 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
             "grep" -> grep(paths, args, request)
             "cp" -> cp(paths, args, request)
             "mv" -> mv(paths, args, request)
+            "tar" -> tar(paths, args, request)
             else -> NativeOffloadResult(2, usage("unknown subcommand '$sub'", args))
         }
     }
@@ -604,6 +613,239 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
         return finishTransfer(entry, failed, startedNs, args)
     }
 
+    // ── tar ─────────────────────────────────────────────────────────────────
+
+    private fun tar(
+        paths: List<String>,
+        args: OffloadArgs,
+        request: NativeOffloadRequest,
+    ): NativeOffloadResult {
+        val create = args.hasFlag("create")
+        val extract = args.hasFlag("extract")
+        if (create == extract) {
+            return NativeOffloadResult(
+                2,
+                usage("tar: pass exactly one of -c (create) or -x (extract)", args),
+            )
+        }
+        unknownOption(args, TAR_OPTIONS)?.let { return NativeOffloadResult(2, usage("tar: $it", args)) }
+        missingValue(args, "file", "directory")?.let {
+            return NativeOffloadResult(2, usage("tar: -$it needs a value", args))
+        }
+
+        // Write primitive either way: creating an archive writes it, extracting
+        // writes everything inside it. One row covers both.
+        OffloadGate.enforce(TAR_TOOL_NAME, TAR_DISPLAY_NAME, args, request)?.let { return it }
+
+        val fileOption = args.get("file")
+        val archiveRaw = fileOption ?: paths.firstOrNull()
+            ?: return NativeOffloadResult(2, usage("tar: missing <archive>", args))
+        val rest = if (fileOption == null) paths.drop(1) else paths
+        val gzip = args.hasFlag("gzip", "z")
+        val force = args.hasFlag("force")
+        val bindings = bindingsFor(request)
+        val startedNs = System.nanoTime()
+
+        val archiveResolution = GuestPathMapper.resolve(archiveRaw, request.cwd, bindings)
+        if (archiveResolution is GuestPathMapper.Resolution.Denied) {
+            return finishTar(deniedEntry(archiveRaw, archiveResolution), false, startedNs, args)
+        }
+        val archive = archiveResolution as GuestPathMapper.Resolution.Ok
+        val archivePath = Paths.get(archive.hostPath)
+
+        val entry = JSONObject()
+            .put("archive", archive.guestPath)
+            .put("host", archive.hostPath)
+            .put("gzip", gzip)
+        if (archive.binding.isExternalMount && create) {
+            return finishTar(
+                entry.put("error", "external_mount").put(
+                    "detail",
+                    "'${archive.guestPath}' is a user-mounted external folder; write to it through " +
+                        "the shell so the read-only-mount guard applies",
+                ),
+                true,
+                startedNs,
+                args,
+            )
+        }
+
+        return if (create) {
+            tarCreateInto(entry, archivePath, rest, bindings, request, gzip, force, startedNs, args)
+        } else {
+            tarExtractFrom(entry, archivePath, args, bindings, request, gzip, force, startedNs)
+        }
+    }
+
+    /** `tar -c`: pack [memberRaws] into the (already resolved) archive path. */
+    private fun tarCreateInto(
+        entry: JSONObject,
+        archivePath: Path,
+        memberRaws: List<String>,
+        bindings: List<GuestPathMapper.Binding>,
+        request: NativeOffloadRequest,
+        gzip: Boolean,
+        force: Boolean,
+        startedNs: Long,
+        args: OffloadArgs,
+    ): NativeOffloadResult {
+        if (memberRaws.isEmpty()) {
+            return NativeOffloadResult(2, usage("tar: -cf needs at least one <path>", args))
+        }
+        val members = ArrayList<Pair<Path, String>>()
+        val guestNames = JSONArray()
+        val denied = JSONArray()
+        for (raw in memberRaws) {
+            when (val resolution = GuestPathMapper.resolve(raw, request.cwd, bindings)) {
+                is GuestPathMapper.Resolution.Denied -> denied.put(deniedEntry(raw, resolution))
+                is GuestPathMapper.Resolution.Ok -> {
+                    members.add(Paths.get(resolution.hostPath) to resolution.guestPath)
+                    guestNames.put(resolution.guestPath)
+                }
+            }
+        }
+        entry.put("members", guestNames)
+        if (denied.length() > 0) entry.put("denied", denied)
+        if (members.isEmpty()) {
+            return finishTar(entry.put("error", "no_members"), true, startedNs, args)
+        }
+        if (Files.exists(archivePath, LinkOption.NOFOLLOW_LINKS) && !force) {
+            return finishTar(
+                entry.put("error", "already_exists")
+                    .put("detail", "'${entry.getString("archive")}' already exists; pass --force to overwrite"),
+                true,
+                startedNs,
+                args,
+            )
+        }
+
+        val outcome = TarCreateOutcome()
+        try {
+            Files.createDirectories(archivePath.parent)
+            val raw = Files.newOutputStream(archivePath)
+            val sink = if (gzip) java.util.zip.GZIPOutputStream(raw) else raw
+            sink.use { tarCreate(it, members, tarEntryBudget(args), outcome) }
+        } catch (e: Exception) {
+            outcome.errors.add("${entry.getString("archive")}: ${e.message}")
+        }
+        entry.put("files", outcome.files)
+            .put("dirs", outcome.dirs)
+            .put("symlinks", outcome.symlinks)
+            .put("bytes", outcome.bytes)
+        if (outcome.skippedSpecial > 0) {
+            entry.put("skipped_special", outcome.skippedSpecial)
+            entry.put("skipped_names", JSONArray(outcome.skippedNames))
+        }
+        if (outcome.truncated) entry.put("truncated", true)
+        val archiveBytes = try {
+            Files.size(archivePath)
+        } catch (_: Exception) {
+            -1L
+        }
+        entry.put("archive_bytes", archiveBytes)
+        if (outcome.errors.isNotEmpty()) entry.put("errors", JSONArray(outcome.errors))
+        return finishTar(entry, outcome.errors.isNotEmpty() || denied.length() > 0, startedNs, args)
+    }
+
+    /**
+     * `tar -x`: validate the whole archive first, then extract. The two passes
+     * are what make "a hostile entry anywhere leaves the destination untouched"
+     * true — refusing halfway would still have written everything before it.
+     */
+    private fun tarExtractFrom(
+        entry: JSONObject,
+        archivePath: Path,
+        args: OffloadArgs,
+        bindings: List<GuestPathMapper.Binding>,
+        request: NativeOffloadRequest,
+        gzip: Boolean,
+        force: Boolean,
+        startedNs: Long,
+    ): NativeOffloadResult {
+        val destRaw = args.get("directory") ?: request.cwd
+        val destResolution = GuestPathMapper.resolve(destRaw, request.cwd, bindings)
+        if (destResolution is GuestPathMapper.Resolution.Denied) {
+            return finishTar(deniedEntry(destRaw, destResolution), true, startedNs, args)
+        }
+        val dest = destResolution as GuestPathMapper.Resolution.Ok
+        entry.put("dest", dest.guestPath).put("dest_host", dest.hostPath)
+        if (dest.binding.isExternalMount) {
+            return finishTar(
+                entry.put("error", "external_mount").put(
+                    "detail",
+                    "'${dest.guestPath}' is a user-mounted external folder; extract through the shell " +
+                        "so the read-only-mount guard applies",
+                ),
+                true,
+                startedNs,
+                args,
+            )
+        }
+        if (!Files.exists(archivePath, LinkOption.NOFOLLOW_LINKS)) {
+            return finishTar(entry.put("error", "not_found"), true, startedNs, args)
+        }
+        if (Files.isDirectory(archivePath, LinkOption.NOFOLLOW_LINKS)) {
+            return finishTar(
+                entry.put("error", "is_directory").put("detail", "the archive path is a directory"),
+                true,
+                startedNs,
+                args,
+            )
+        }
+
+        val destPath = Paths.get(dest.hostPath)
+        val budget = tarEntryBudget(args)
+        val validation = TarExtractOutcome()
+        val safe = try {
+            openArchive(archivePath, gzip).use { tarValidate(it, destPath, budget, validation) }
+        } catch (e: Exception) {
+            validation.errors.add("${entry.getString("archive")}: ${e.message}")
+            false
+        }
+        if (!safe) {
+            entry.put("error", "unsafe_archive").put("errors", JSONArray(validation.errors))
+            return finishTar(entry, true, startedNs, args)
+        }
+
+        val outcome = TarExtractOutcome()
+        try {
+            openArchive(archivePath, gzip).use { tarExtract(it, destPath, force, budget, outcome) }
+        } catch (e: Exception) {
+            outcome.errors.add("${entry.getString("archive")}: ${e.message}")
+        }
+        entry.put("files", outcome.files)
+            .put("dirs", outcome.dirs)
+            .put("symlinks", outcome.symlinks)
+            .put("bytes", outcome.bytes)
+        if (outcome.skippedHardlink > 0) entry.put("skipped_hardlink", outcome.skippedHardlink)
+        if (outcome.skippedSpecial > 0) entry.put("skipped_special", outcome.skippedSpecial)
+        if (outcome.paxHeaders > 0) entry.put("pax_headers", outcome.paxHeaders)
+        if (outcome.skippedNames.isNotEmpty()) entry.put("skipped_names", JSONArray(outcome.skippedNames))
+        if (outcome.truncated) entry.put("truncated", true)
+        if (outcome.errors.isNotEmpty()) entry.put("errors", JSONArray(outcome.errors))
+        return finishTar(entry, outcome.errors.isNotEmpty(), startedNs, args)
+    }
+
+    private fun openArchive(path: Path, gzip: Boolean): java.io.InputStream {
+        val raw = Files.newInputStream(path)
+        return if (gzip) java.util.zip.GZIPInputStream(raw) else raw
+    }
+
+    private fun tarEntryBudget(args: OffloadArgs): Long =
+        (args.getLong("max-entries") ?: DEFAULT_MAX_ENTRIES).coerceIn(1L, HARD_MAX_ENTRIES)
+
+    private fun finishTar(
+        entry: JSONObject,
+        failed: Boolean,
+        startedNs: Long,
+        args: OffloadArgs,
+    ): NativeOffloadResult {
+        val body = JSONObject()
+            .put("results", JSONArray().put(entry))
+            .put("elapsed_ms", (System.nanoTime() - startedNs) / 1_000_000)
+        return NativeOffloadResult(if (failed) 1 else 0, OffloadOutput.formatBody(body.toString(2), args) + "\n")
+    }
+
     /**
      * Write-path policy, applied AFTER translation and BEFORE the target is
      * resolved away. Returns `(errorCode, detail)` when the transfer must not
@@ -709,6 +951,8 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
         private const val CP_DISPLAY_NAME = "minis-fastio (copy)"
         private const val MV_TOOL_NAME = "fastio_mv"
         private const val MV_DISPLAY_NAME = "minis-fastio (move)"
+        private const val TAR_TOOL_NAME = "fastio_tar"
+        private const val TAR_DISPLAY_NAME = "minis-fastio (archive)"
 
         // ponytail: one entry budget for the whole command, not per path — a
         // walk that would run for minutes is a stuck offload worker (the pool
@@ -735,6 +979,10 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
         private val FIND_OPTIONS = setOf("name", "type", "limit", "max-entries")
         private val GREP_OPTIONS = setOf("i", "ignore-case", "limit", "max-entries")
         private val TRANSFER_OPTIONS = setOf("r", "recursive", "rf", "fr", "R", "force", "f")
+        private val TAR_OPTIONS = setOf(
+            "c", "x", "create", "extract", "f", "file", "z", "gzip", "C", "directory",
+            "v", "verbose", "force", "max-entries",
+        )
 
         /**
          * Single-dash long options an agent types out of `find`/`grep` habit,
@@ -747,6 +995,45 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
 
         private fun normalizeLongOptionSpelling(argv: List<String>): List<String> =
             argv.map { if (it in SHORT_LONG_OPTIONS) "-$it" else it }
+
+        /**
+         * Expand `tar`'s clustered short options before the shared parse
+         * (`-czf a.tar x` → `--create --gzip --file ... `), because OffloadArgs
+         * reads any `-word` as ONE flag. Only `tar` gets this: `-rf` must keep
+         * its meaning for `rm`/`cp`.
+         *
+         * `-f` is dropped rather than mapped to `--file`: its value (the
+         * archive) must stay a POSITIONAL, and `--key value` would consume it
+         * into `values`. `-C` maps to `--directory` (it also takes a value,
+         * and the directory is not a positional). An unknown letter inside a
+         * cluster leaves the whole token untouched, so the caller reports it
+         * as an unknown option instead of silently dropping it.
+         */
+        private fun normalizeTarShorts(argv: List<String>): List<String> {
+            if (argv.firstOrNull() != "tar") return argv
+            val out = ArrayList<String>(argv.size)
+            for (token in argv) {
+                if (token.length < 2 || token[0] != '-' || token.startsWith("--")) {
+                    out.add(token)
+                    continue
+                }
+                val expanded = ArrayList<String>(token.length)
+                var known = true
+                for (ch in token.substring(1)) {
+                    when (ch) {
+                        'c' -> expanded.add("--create")
+                        'x' -> expanded.add("--extract")
+                        'z' -> expanded.add("--gzip")
+                        'v' -> expanded.add("--verbose")
+                        'C' -> expanded.add("--directory")
+                        'f' -> Unit   // the archive value stays a positional
+                        else -> known = false
+                    }
+                }
+                if (known) out.addAll(expanded) else out.add(token)
+            }
+            return out
+        }
 
         private val HELP = """minis-fastio — file-intensive primitives run by the host process on the real filesystem, bypassing the PRoot syscall tax (~100-200µs/op → ~1µs/op).
 
@@ -767,8 +1054,10 @@ Usage:
   minis-fastio rm [-r] <path>...       Destructive: recursive delete (-r required for directories).
   minis-fastio cp [-r] <src> <dst>     Write: copy a file, or a tree with -r.
   minis-fastio mv <src> <dst>          Write: rename (copy+delete only across filesystems).
+  minis-fastio tar -cf <a.tar> <path>...   Write: pack into a POSIX ustar archive (-czf to gzip).
+  minis-fastio tar -xf <a.tar> [-C dir]    Write: unpack (-xzf to gunzip; -C defaults to the current directory).
   Every write primitive asks for permission first (Settings → Permissions), each under its
-  own row: minis-fastio (delete) / (copy) / (move).
+  own row: minis-fastio (delete) / (copy) / (move) / (archive).
 
 Options:
   -r, --recursive    (rm/cp) descend into directories. `-rf` / `-fr` work too; for `rm`, `-f`
@@ -780,6 +1069,9 @@ Options:
   --name GLOB        (find) match the entry NAME (shell-style glob, e.g. '*.log'). `-name` works.
   --type f|d|l       (find) only regular files / directories / symlinks. `-type` works.
   -i, --ignore-case  (grep) case-insensitive match.
+  -c, -x             (tar) create / extract. -f <archive> then names the archive; -C <dir> sets the
+                     extraction directory. Clustered forms work: -cf, -czf, -xf, -xzf.
+  -z, --gzip         (tar) gzip the archive (also accepted as the -z inside a cluster).
   --limit N          (find/grep) max hits to LIST (find default $DEFAULT_FIND_LIMIT, grep default $DEFAULT_GREP_LIMIT).
                      Totals are still counted over the whole tree.
   --max-entries N    Entry budget for the traversal (default $DEFAULT_MAX_ENTRIES); over budget → "truncated": true
@@ -801,6 +1093,22 @@ Notes:
   - `cp`/`mv` copy a symlink as a LINK (never followed), refuse to overwrite without --force,
     refuse a target inside its own source, and treat an existing directory `dst` as "copy into it"
     (`cp -r a dir` → `dir/a`), like the shell.
+  - `tar` writes POSIX ustar and is interoperable with the guest's busybox tar 1.37 in BOTH
+    directions (verified, including names too long for the 100-byte field: ustar prefix split,
+    and GNU `L` long-name entries beyond 155+100). Symlinks are stored as links; device nodes,
+    fifos and sockets cannot be represented and are SKIPPED — the count and up to 20 names are
+    reported under "skipped_special" so an archive that lacks them says so. Hard links are not
+    materialised on extract ("skipped_hardlink"): the file itself is still unpacked.
+  - `tar -x` is tar-slip guarded: an entry that is absolute, that climbs above the extraction
+    root with `..`, or that writes THROUGH a symlink (one already on disk, or one the archive
+    itself declares) is refused as "tar_slip". The whole archive is validated first, so a
+    hostile entry appearing anywhere leaves the destination untouched — nothing is written.
+    Extraction never follows a symlink to place a file; `--force` replaces the link itself.
+  - `tar -x` refuses to replace an existing FILE or symlink without --force, but always reuses an
+    existing DIRECTORY (re-extracting over a tree is the normal case).
+  - Cost model: every call pays a FIXED round trip (~40 ms, the host handler plus the guest-side
+    write/cat). On a handful of entries the guest's own tools win — reach for these primitives once
+    a tree is large (thousands of entries), where the per-entry translation tax dominates.
   - Write primitives refuse: host /dev //proc //sys, user-mounted external folders as a write
     target (`mv` also an external source, since it deletes it), bind-mount roots as the thing
     being replaced, and `cp` without -r on a directory. Nothing outside the app sandbox is reachable.

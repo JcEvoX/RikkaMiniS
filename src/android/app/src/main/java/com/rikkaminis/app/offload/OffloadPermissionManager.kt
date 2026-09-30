@@ -108,6 +108,12 @@ object OffloadPermissionManager {
         // same visibility as fastio_rm.
         ToolPermissionInfo("fastio_cp", "minis-fastio (copy)", PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE),
         ToolPermissionInfo("fastio_mv", "minis-fastio (move)", PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE),
+        // [T-minis-fastio] phase 3 — `tar` is a write primitive in BOTH
+        // directions (it writes the archive out, or writes everything inside
+        // one), so it gets its own row rather than riding on fastio_cp: a user
+        // who allowed a copy has not thereby allowed an arbitrary archive to be
+        // expanded into the sandbox.
+        ToolPermissionInfo("fastio_tar", "minis-fastio (archive)", PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE),
     )
 
     /** Stable session-id used by NativeOffloadHandlers when calling
@@ -496,6 +502,15 @@ object OffloadPermissionManager {
                         return false
                     }
                 }
+                // [phase-3] The 120 s wait used to be a black hole in the log:
+                // the agent saw nothing between "command started" and the
+                // verdict, so a held call was indistinguishable from a hang.
+                // One line before the wait and one after make the gate
+                // observable from the log alone.
+                AppLogger.info(
+                    TAG,
+                    "gate: awaiting user approval tool=$toolName session=$sessionId timeout_ms=$SYSTEM_DIALOG_TIMEOUT_MS",
+                )
                 val response = withTimeoutOrNull(SYSTEM_DIALOG_TIMEOUT_MS) {
                     suspendCancellableCoroutine<Response> { cont ->
                         pendingContinuation = cont
@@ -526,7 +541,7 @@ object OffloadPermissionManager {
                 // continuation never resumed → the runBlocking caller in
                 // OffloadGate blocked a native-offload worker thread forever
                 // (pool max 2). Timeout now returns null → treat as deny.
-                when (response) {
+                val allowed = when (response) {
                     Response.ALLOW_SESSION -> {
                         grants.add(toolName)
                         true
@@ -538,6 +553,18 @@ object OffloadPermissionManager {
                     }
                     null -> false  // timed out or cancelled: deny rather than block forever
                 }
+                AppLogger.info(
+                    TAG,
+                    "gate: user approval resolved tool=$toolName verdict=${
+                        when (response) {
+                            Response.ALLOW_SESSION -> "allow_session"
+                            Response.ALLOW_ONCE -> "allow_once"
+                            Response.DENY_SESSION -> "deny_session"
+                            null -> "timeout_or_cancelled"
+                        }
+                    }",
+                )
+                allowed
             }
         }
     }
