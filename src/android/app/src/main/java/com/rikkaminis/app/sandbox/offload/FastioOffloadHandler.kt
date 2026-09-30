@@ -142,52 +142,6 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
         return NativeOffloadResult(if (failures > 0) 1 else 0, OffloadOutput.formatBody(body.toString(2), args) + "\n")
     }
 
-    /**
-     * Sum apparent sizes over the tree without following symlinks (matching
-     * `du`'s default). Directory entries contribute their own `size()` too —
-     * that is what the guest's busybox `du -sb` reports (verified against it
-     * on tmpfs and f2fs: busybox counts directory st_size, GNU coreutils'
-     * `--apparent-size` mode does not, so a host-side GNU `du -sb` reads
-     * smaller by dirs × directory-size).
-     */
-    private fun walkForSize(root: Path, totals: WalkTotals, maxEntries: Long) {
-        try {
-            Files.walkFileTree(root, object : SimpleFileVisitor<Path>() {
-                override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult {
-                    if (charge(totals, maxEntries)) return FileVisitResult.TERMINATE
-                    totals.dirs++
-                    totals.bytes += attrs.size()
-                    return FileVisitResult.CONTINUE
-                }
-
-                override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
-                    if (charge(totals, maxEntries)) return FileVisitResult.TERMINATE
-                    totals.files++
-                    totals.bytes += attrs.size()
-                    return FileVisitResult.CONTINUE
-                }
-
-                override fun visitFileFailed(file: Path, exc: IOException): FileVisitResult {
-                    if (charge(totals, maxEntries)) return FileVisitResult.TERMINATE
-                    totals.errors.add("$file: ${exc.message}")
-                    return FileVisitResult.CONTINUE
-                }
-            })
-        } catch (e: Exception) {
-            totals.errors.add("$root: ${e.message}")
-        }
-    }
-
-    /** Returns true once the entry budget is exhausted (and flags truncation). */
-    private fun charge(totals: WalkTotals, maxEntries: Long): Boolean {
-        if (totals.visited >= maxEntries) {
-            totals.truncated = true
-            return true
-        }
-        totals.visited++
-        return false
-    }
-
     // ── rm ──────────────────────────────────────────────────────────────────
 
     private fun rm(
@@ -292,51 +246,6 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
         return null
     }
 
-    /**
-     * Post-order delete: children first, then the directory itself. Errors are
-     * collected per entry and the walk continues — a single permission failure
-     * deep in a tree must not abort the rest.
-     */
-    private fun deleteTree(root: Path, totals: WalkTotals) {
-        try {
-            Files.walkFileTree(root, object : SimpleFileVisitor<Path>() {
-                override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
-                    try {
-                        Files.delete(file)
-                        totals.files++
-                        totals.bytes += attrs.size()
-                    } catch (e: Exception) {
-                        totals.errors.add("$file: ${e.message}")
-                    }
-                    return FileVisitResult.CONTINUE
-                }
-
-                override fun postVisitDirectory(dir: Path, exc: IOException?): FileVisitResult {
-                    if (exc != null) {
-                        totals.errors.add("$dir: ${exc.message}")
-                        return FileVisitResult.CONTINUE
-                    }
-                    try {
-                        val size = Files.readAttributes(dir, BasicFileAttributes::class.java).size()
-                        Files.delete(dir)
-                        totals.dirs++
-                        totals.bytes += size
-                    } catch (e: Exception) {
-                        totals.errors.add("$dir: ${e.message}")
-                    }
-                    return FileVisitResult.CONTINUE
-                }
-
-                override fun visitFileFailed(file: Path, exc: IOException): FileVisitResult {
-                    totals.errors.add("$file: ${exc.message}")
-                    return FileVisitResult.CONTINUE
-                }
-            })
-        } catch (e: Exception) {
-            totals.errors.add("$root: ${e.message}")
-        }
-    }
-
     // ── shared plumbing ─────────────────────────────────────────────────────
 
     /**
@@ -362,15 +271,6 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
 
     private fun usage(reason: String, args: OffloadArgs): String =
         OffloadOutput.formatBody("minis-fastio: $reason\n$HELP", args) + "\n"
-
-    private class WalkTotals {
-        var files = 0L
-        var dirs = 0L
-        var bytes = 0L
-        var visited = 0L
-        var truncated = false
-        val errors = ArrayList<String>()
-    }
 
     companion object {
         private const val TOOL_NAME = "fastio_rm"
@@ -403,12 +303,117 @@ Options:
 Notes:
   - Paths are guest paths (/tmp, /var/minis/workspace, /var/minis/mounts/<name>, …) and are
     translated to the real host paths before use.
-  - `du` bytes are the apparent sizes of every entry INCLUDING directories — byte-for-byte what the
-    guest's busybox `du -sb` reports. (GNU du's --apparent-size mode omits directory st_size, so a
-    GNU `du -sb` reads smaller by dirs × directory-size.)
+  - `du` bytes are the apparent sizes of FILE entries only — directories are counted but contribute
+    no bytes. This matches the guest's PATH `du -sb`, which in this rootfs resolves to GNU coreutils
+    9.5 (file entries only). busybox `du -sb` DOES count directory st_size and reads larger by
+    dirs × directory-size — do not "fix" it back. `rm`'s freed_bytes uses the same file-only
+    accounting, so a fully deleted tree reports freed_bytes == its `du` bytes.
   - `rm` refuses: host /dev //proc //sys, user-mounted external folders, bind-mount roots,
     and directories without -r. Nothing outside the app sandbox can be reached.
   - Both subcommands report JSON on stdout; exit code 1 when any path failed.
 """
+    }
+}
+
+// ── walk engine (top-level for JVM testability; pure, no instance state) ────
+
+internal class WalkTotals {
+    var files = 0L
+    var dirs = 0L
+    var bytes = 0L
+    var visited = 0L
+    var truncated = false
+    val errors = ArrayList<String>()
+}
+
+/**
+ * Sum apparent sizes of FILE entries over the tree without following symlinks
+ * (matching `du`'s default). Directories are counted but contribute NO bytes:
+ * the guest's PATH `du -sb` resolves to GNU coreutils 9.5 in this rootfs, which
+ * reports file entries only. Do not "align" this to busybox — busybox `du -sb`
+ * DOES count directory st_size (in-sandbox fixture 2026-09-30: 5-byte file +
+ * 2 dirs → GNU du -sb = 5, busybox du -sb = 6909; every directory here reports
+ * st_size 3452). File-only accounting is also what keeps `rm`'s freed_bytes
+ * cross-checkable against `du`'s bytes for the same tree.
+ */
+internal fun walkForSize(root: Path, totals: WalkTotals, maxEntries: Long) {
+    try {
+        Files.walkFileTree(root, object : SimpleFileVisitor<Path>() {
+            override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult {
+                if (charge(totals, maxEntries)) return FileVisitResult.TERMINATE
+                totals.dirs++
+                return FileVisitResult.CONTINUE
+            }
+
+            override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                if (charge(totals, maxEntries)) return FileVisitResult.TERMINATE
+                totals.files++
+                totals.bytes += attrs.size()
+                return FileVisitResult.CONTINUE
+            }
+
+            override fun visitFileFailed(file: Path, exc: IOException): FileVisitResult {
+                if (charge(totals, maxEntries)) return FileVisitResult.TERMINATE
+                totals.errors.add("$file: ${exc.message}")
+                return FileVisitResult.CONTINUE
+            }
+        })
+    } catch (e: Exception) {
+        totals.errors.add("$root: ${e.message}")
+    }
+}
+
+/** Returns true once the entry budget is exhausted (and flags truncation). */
+internal fun charge(totals: WalkTotals, maxEntries: Long): Boolean {
+    if (totals.visited >= maxEntries) {
+        totals.truncated = true
+        return true
+    }
+    totals.visited++
+    return false
+}
+
+/**
+ * Post-order delete: children first, then the directory itself. Errors are
+ * collected per entry and the walk continues — a single permission failure
+ * deep in a tree must not abort the rest. freed_bytes counts FILE entries
+ * only (directories are freed but contribute no bytes) — same accounting
+ * as `du`, so a fully deleted tree reports freed_bytes == its `du` bytes.
+ */
+internal fun deleteTree(root: Path, totals: WalkTotals) {
+    try {
+        Files.walkFileTree(root, object : SimpleFileVisitor<Path>() {
+            override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                try {
+                    Files.delete(file)
+                    totals.files++
+                    totals.bytes += attrs.size()
+                } catch (e: Exception) {
+                    totals.errors.add("$file: ${e.message}")
+                }
+                return FileVisitResult.CONTINUE
+            }
+
+            override fun postVisitDirectory(dir: Path, exc: IOException?): FileVisitResult {
+                if (exc != null) {
+                    totals.errors.add("$dir: ${exc.message}")
+                    return FileVisitResult.CONTINUE
+                }
+                try {
+                    Files.delete(dir)
+                    totals.dirs++
+                } catch (e: Exception) {
+                    totals.errors.add("$dir: ${e.message}")
+                }
+                return FileVisitResult.CONTINUE
+            }
+
+            override fun visitFileFailed(file: Path, exc: IOException): FileVisitResult {
+                totals.errors.add("$file: ${exc.message}")
+                return FileVisitResult.CONTINUE
+            }
+        })
+    } catch (e: Exception) {
+        totals.errors.add("$root: ${e.message}")
     }
 }
