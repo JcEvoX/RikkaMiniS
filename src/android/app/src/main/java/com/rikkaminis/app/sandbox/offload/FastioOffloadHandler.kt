@@ -589,7 +589,7 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
             }
         } else {
             val outcome = MoveOutcome()
-            moveTree(srcPath, target, outcome)
+            moveTree(srcPath, target, force, outcome)
             entry.put("method", outcome.method)
             if (outcome.counted) {
                 entry.put("copied_files", outcome.files)

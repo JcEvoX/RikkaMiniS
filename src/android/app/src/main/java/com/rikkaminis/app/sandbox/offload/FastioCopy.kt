@@ -1,11 +1,14 @@
 package com.rikkaminis.app.sandbox.offload
 
 import java.io.IOException
+import java.nio.file.DirectoryNotEmptyException
+import java.nio.file.FileAlreadyExistsException
 import java.nio.file.FileVisitResult
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.SimpleFileVisitor
+import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.BasicFileAttributes
 
 /**
@@ -134,14 +137,29 @@ internal class MoveOutcome {
  * Move [src] to [dst] (target policy already settled by the caller).
  *
  * The normal path is one host `rename` — no walk, no per-entry syscall, which
- * is why `mv` is the cheapest primitive in the set. When the target lands on a
- * different filesystem (a user mount, in practice) the JVM refuses the rename
+ * is why `mv` is the cheapest primitive in the set. [force] is what makes the
+ * handler's `--force` contract real: the caller has already decided that
+ * replacing the target is what the user asked for, so the rename must carry
+ * REPLACE_EXISTING. Without it a bare `Files.move` fails with
+ * FileAlreadyExistsException and `mv --force` reports a failure for the one
+ * thing it promises to do.
+ *
+ * When the target lands on a different filesystem the JVM refuses the rename
  * with EXDEV; that falls back to copy-then-delete, which is registered as a
  * deliberately un-tested rare path rather than fitted with its own harness.
  */
-internal fun moveTree(src: Path, dst: Path, out: MoveOutcome) {
+internal fun moveTree(src: Path, dst: Path, force: Boolean, out: MoveOutcome) {
     try {
-        Files.move(src, dst)
+        if (force) Files.move(src, dst, StandardCopyOption.REPLACE_EXISTING) else Files.move(src, dst)
+        return
+    } catch (e: DirectoryNotEmptyException) {
+        // Only reachable with force: the target is a directory no rename can
+        // replace. Spelled out instead of handing over the bare Java message,
+        // which is just the path again and tells the caller nothing.
+        out.errors.add("$dst: already exists and is a non-empty directory; refusing to replace it")
+        return
+    } catch (e: FileAlreadyExistsException) {
+        out.errors.add("$dst: already exists; pass --force to overwrite")
         return
     } catch (e: Exception) {
         if (!isCrossDevice(e)) {

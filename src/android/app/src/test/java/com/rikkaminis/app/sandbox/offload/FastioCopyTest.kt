@@ -118,7 +118,7 @@ class FastioCopyTest {
         val src = Files.write(dir.resolve("a.txt"), "12345".toByteArray())
         val out = MoveOutcome()
 
-        moveTree(src, dir.resolve("b.txt"), out)
+        moveTree(src, dir.resolve("b.txt"), force = false, out = out)
 
         assertEquals("rename", out.method)
         assertFalse(out.counted)   // a rename costs no walk, so nothing was counted
@@ -136,7 +136,7 @@ class FastioCopyTest {
         Files.write(sub.resolve("b.txt"), "bb".toByteArray())
         val out = MoveOutcome()
 
-        moveTree(src, dir.resolve("dst"), out)
+        moveTree(src, dir.resolve("dst"), force = false, out = out)
 
         assertEquals("rename", out.method)
         assertFalse(Files.exists(src))
@@ -163,5 +163,65 @@ class FastioCopyTest {
         val dir = Files.createTempDirectory("fastio-inside-2")
         val src = Files.createDirectory(dir.resolve("work"))
         assertFalse(targetInsideSource(src, dir.resolve("workspace")))
+    }
+
+    // ── mv --force (the handler's overwrite contract) ───────────────────────
+    //
+    // The three below are what a bare `Files.move` gets wrong: the handler has
+    // already decided the overwrite is wanted, so the ENGINE is the only place
+    // that can lose it. Deleting REPLACE_EXISTING from `moveTree` must turn the
+    // first one red — that is the negative control for this pair.
+
+    @Test
+    fun `move with force replaces an existing target`() {
+        val dir = Files.createTempDirectory("fastio-mv-force")
+        val src = Files.write(dir.resolve("a.txt"), "new".toByteArray())
+        val dst = Files.write(dir.resolve("b.txt"), "old".toByteArray())
+        val out = MoveOutcome()
+
+        moveTree(src, dst, force = true, out = out)
+
+        assertEquals("rename", out.method)
+        assertTrue(out.errors.isEmpty())
+        assertFalse(Files.exists(src))
+        assertEquals("new", Files.readAllBytes(dst).decodeToString())
+    }
+
+    @Test
+    fun `move without force leaves the target alone and says why`() {
+        val dir = Files.createTempDirectory("fastio-mv-noforce")
+        val src = Files.write(dir.resolve("a.txt"), "new".toByteArray())
+        val dst = Files.write(dir.resolve("b.txt"), "old".toByteArray())
+        val out = MoveOutcome()
+
+        moveTree(src, dst, force = false, out = out)
+
+        assertEquals(1, out.errors.size)
+        assertTrue(
+            "the reason must be words, not the bare Java message (which is the path again)",
+            out.errors[0].endsWith("already exists; pass --force to overwrite"),
+        )
+        assertEquals("old", Files.readAllBytes(dst).decodeToString())
+        assertEquals("new", Files.readAllBytes(src).decodeToString())
+    }
+
+    @Test
+    fun `move with force onto a non-empty directory reports a readable reason`() {
+        val dir = Files.createTempDirectory("fastio-mv-nonempty")
+        val src = Files.write(dir.resolve("a.txt"), "x".toByteArray())
+        // What the handler resolves `mv --force a.txt dir` to: dir/a.txt.
+        val target = Files.createDirectory(dir.resolve("dir"))
+        val occupied = Files.createDirectory(target.resolve("a.txt"))
+        Files.write(occupied.resolve("inner.txt"), "i".toByteArray())
+        val out = MoveOutcome()
+
+        moveTree(src, occupied, force = true, out = out)
+
+        assertEquals(1, out.errors.size)
+        assertTrue(
+            "a rename cannot replace a non-empty directory; the reason must say so",
+            out.errors[0].contains("non-empty directory"),
+        )
+        assertTrue(Files.exists(src))
     }
 }

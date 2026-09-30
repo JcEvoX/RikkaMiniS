@@ -142,11 +142,17 @@ class FastioWiringTest {
         val cpGate = handler.indexOf("OffloadGate.enforce(CP_TOOL_NAME")
         val mvGate = handler.indexOf("OffloadGate.enforce(MV_TOOL_NAME")
         val copyIdx = handler.indexOf("copyTree(srcPath, target, force, outcome)")
-        val moveIdx = handler.indexOf("moveTree(srcPath, target, outcome)")
+        val moveIdx = handler.indexOf("moveTree(srcPath, target, force, outcome)")
         assertTrue("cp must gate", cpGate >= 0)
         assertTrue("mv must gate", mvGate >= 0)
         assertTrue("the copy must run after cp's gate", copyIdx > cpGate)
         assertTrue("the move must run after mv's gate", moveIdx > mvGate)
+        assertTrue(
+            "mv must hand `force` down to the engine: a rename without REPLACE_EXISTING " +
+                "fails on an existing target, so `mv --force` would report a failure for " +
+                "the one thing it promises to do",
+            moveIdx >= 0,
+        )
         assertTrue("find is read-only and must not gate", !bodyOf(handler, "find").contains("OffloadGate"))
         assertTrue("grep is read-only and must not gate", !bodyOf(handler, "grep").contains("OffloadGate"))
     }
