@@ -335,11 +335,21 @@ object AccessibilityRecoveryManager {
      * Entry point for the a11y tool path: if the grant is gone, offer to fix
      * it and report whether the caller may proceed.
      *
+     * [hasEverBeenGranted] gates the whole repair affordance here, not just in
+     * the Settings UI: a fresh install has no entry in
+     * ENABLED_ACCESSIBILITY_SERVICES either, and without the gate the first a11y
+     * tool call on a clean device would raise a "permission was revoked" repair
+     * prompt and hold the tool turn for [PROMPT_TIMEOUT_MS] over a permission
+     * the user never granted. Returning false here keeps the pre-recovery
+     * behaviour for that case — the caller fails immediately with its normal
+     * "service not running" error, no dialog and no blocking.
+     *
      * @return true if the service is usable (grant was intact, or repair
      *   succeeded); false if the caller should fail with its normal
      *   "service not running" error.
      */
     suspend fun ensureGrantOrPrompt(context: Context): Boolean {
+        if (!hasEverBeenGranted(context)) return false
         if (!isGrantRevoked(context)) return true
 
         val shizuku = ShizukuManager.isReady()
