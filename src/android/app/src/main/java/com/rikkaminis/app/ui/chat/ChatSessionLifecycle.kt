@@ -16,6 +16,7 @@ import com.rikkaminis.app.provider.LLMProvider
 import com.rikkaminis.app.sandbox.offload.ProviderExecutionGateway
 import com.rikkaminis.app.provider.ProviderFactory
 import com.rikkaminis.app.sandbox.ExecutionCoordinator
+import com.rikkaminis.app.service.SessionActivityTracker
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -23,6 +24,10 @@ import org.json.JSONArray
 import org.json.JSONObject
 import androidx.lifecycle.viewModelScope
 import com.rikkaminis.app.R
+import com.rikkaminis.app.agent.InterruptedTailDetector
+import com.rikkaminis.app.agent.InterruptedTailPartKind
+import com.rikkaminis.app.agent.InterruptedTailShape
+import com.rikkaminis.app.agent.InterruptedTailSnapshot
 import com.rikkaminis.app.agent.runtime.AgentRunEvent
 import com.rikkaminis.app.agent.runtime.AgentRunPhase
 import com.rikkaminis.app.tools.AgentTraceRecorder
@@ -1272,12 +1277,15 @@ internal fun ChatViewModel.loadSession() {
         }
 
         // Cold-start interrupt detection: an agent loop that was killed by
-        // the OS (or app force-quit) leaves agentHistory in one of three
+        // the OS (or app force-quit) leaves agentHistory in one of four
         // tell-tale shapes. Detecting any of them lets the user tap
         // Resume to pick up where the model left off — the in-memory
         // [_canResume] flag set by [handleUserCancelledCleanup] is lost
         // across cold starts so we have to re-derive it from the DB.
         // Mirrors iOS AIChatViewModel.loadSession lines 3546-3581.
+        // The shape rule itself lives in
+        // [com.rikkaminis.app.agent.InterruptedTailDetector] (shared with the
+        // badge scan); only the liveness gate is session-specific.
         //   Case A: last entry is user with all-toolResult parts —
         //           tools completed but the next model call never fired.
         //   Case B: last entry is assistant with any tool_use parts —
@@ -1285,6 +1293,8 @@ internal fun ChatViewModel.loadSession() {
         //   Case C: last entry is user with the synthetic "Continue"
         //           reminder text — text-cancel handler committed it
         //           but [resume] never re-entered the agent loop.
+        //   Case D: last entry is a PLAIN-TEXT user turn that never got a
+        //           reply at all — see below (GH#262/#263).
         //
         // [S5-resume-guard] Why this predicate deliberately does NOT also
         // check "was the last tool result known?" (audit finding §27c(2)):
@@ -1308,26 +1318,38 @@ internal fun ChatViewModel.loadSession() {
         // false premise — so adding a second check here would duplicate a
         // warning rather than supply a missing one.
         val lastEntry = agentHistory.lastOrNull()
-        if (lastEntry != null && !_isStreaming.value) {
-            val isInterrupted = when (lastEntry.role) {
-                LLMMessage.Role.USER -> {
-                    val parts = lastEntry.contentParts
-                    val allToolResults = parts.isNotEmpty() &&
-                        parts.all { it is AgentContentPart.ToolResult }
-                    val isContinueReminder = parts.size == 1 &&
-                        (parts.first() as? AgentContentPart.Text)?.text
-                            ?.contains("The user stopped the previous response") == true
-                    allToolResults || isContinueReminder
-                }
-                LLMMessage.Role.ASSISTANT -> {
-                    lastEntry.contentParts.any { it is AgentContentPart.ToolUse }
-                }
-                else -> false
-            }
-            if (isInterrupted) {
-                _canResume.value = true
-                Log.i(ChatViewModel.TAG, "loadSession: detected interrupted agent loop, canResume=true (lastRole=${lastEntry.role})")
-            }
+        // [T-android-orphan-user-tail GH#262/#263] `isActive` covers the case
+        // this VM cannot see: another VM (or the foreground service) is driving
+        // this very session, so `_isStreaming` is false HERE while a request is
+        // genuinely in flight THERE. Without it, Case D would light Resume on a
+        // turn that is merely still waiting. `activeSessionId` (not
+        // `sessionId`) because every tracker write uses it — a draft VM keeps
+        // its `__new__` key while the tracker holds the canonical id.
+        val trackerActive = SessionActivityTracker.isActive(activeSessionId)
+        val tailShape = if (lastEntry == null || _isStreaming.value || trackerActive) {
+            null
+        } else {
+            InterruptedTailDetector.classify(
+                InterruptedTailSnapshot(
+                    role = lastEntry.role.value,
+                    partKinds = lastEntry.contentParts.map { p ->
+                        when (p) {
+                            is AgentContentPart.Text -> InterruptedTailPartKind.TEXT
+                            is AgentContentPart.ToolUse -> InterruptedTailPartKind.TOOL_USE
+                            is AgentContentPart.ToolResult -> InterruptedTailPartKind.TOOL_RESULT
+                            else -> InterruptedTailPartKind.OTHER
+                        }
+                    },
+                    firstText = (lastEntry.contentParts.firstOrNull() as? AgentContentPart.Text)?.text,
+                ),
+            )
+        }
+        if (tailShape != null && tailShape != InterruptedTailShape.NONE) {
+            _canResume.value = true
+            // Name the shape, not just the role: Case D (reply-less user
+            // tail) is the one that used to be invisible, so a field log has
+            // to be able to tell it from A/B/C.
+            Log.i(ChatViewModel.TAG, "loadSession: detected interrupted agent loop, canResume=true (lastRole=${lastEntry?.role} shape=$tailShape)")
         }
         } finally {
             // T201: open the gate even on early `return@launch` (draft path,
