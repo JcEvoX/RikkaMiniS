@@ -1618,4 +1618,9 @@
     <string name="a11y_repair_failed">修复失败——请到设置中手动启用</string>
     <string name="a11y_repair_row_sub">权限已被撤销，很可能是强制停止导致的</string>
 
+    <!-- [T-android-downgrade-compat] 数据库比应用新时的引导页文案。 -->
+    <string name="newer_db_title">你的数据来自更新版本</string>
+    <string name="newer_db_body">当前安装的 RikkaMinis 比生成这些数据的版本旧，无法安全打开数据库。\n\n没有删除任何内容——你的会话仍完整保存在这台设备上。重新安装较新的 RikkaMinis 版本，数据就会回来。</string>
+    <string name="newer_db_versions">此版本支持数据格式 %1$d</string>
+    <string name="newer_db_exit">关闭</string>
 </resources>

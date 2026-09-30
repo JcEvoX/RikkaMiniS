@@ -1594,4 +1594,10 @@
     <string name="a11y_repair_failed">Reparatur fehlgeschlagen — bitte in den Einstellungen aktivieren</string>
     <string name="a11y_repair_row_sub">Die Berechtigung wurde entzogen, vermutlich durch einen App-Stop</string>
 
+    <!-- [T-android-downgrade-compat] Text der Hilfestellung, wenn die
+    Chat-Datenbank auf der Festplatte neuer als diese App ist. -->
+    <string name="newer_db_title">Deine Daten stammen aus einer neueren Version</string>
+    <string name="newer_db_body">Diese Version von RikkaMinis ist älter als der Build, der deine Daten erstellt hat, und kann die Datenbank nicht sicher öffnen.\n\nEs wurde nichts gelöscht — deine Unterhaltungen sind auf diesem Gerät vollständig erhalten. Installiere die neuere Version von RikkaMinis, und alles ist wieder da.</string>
+    <string name="newer_db_versions">Diese Version unterstützt Datenformat %1$d</string>
+    <string name="newer_db_exit">Schließen</string>
 </resources>

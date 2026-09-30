@@ -1595,4 +1595,9 @@
     <string name="a11y_repair_failed">修復失敗——請到設定中手動啟用</string>
     <string name="a11y_repair_row_sub">權限已被撤銷，很可能是強制停止導致的</string>
 
+    <!-- [T-android-downgrade-compat] 資料庫比應用新時的引導頁文案。 -->
+    <string name="newer_db_title">你的資料來自較新版本</string>
+    <string name="newer_db_body">目前安裝的 RikkaMinis 比建立這些資料的版本舊，無法安全開啟資料庫。\n\n沒有任何內容被刪除——你的對話仍完整保存在這台裝置上。重新安裝較新的 RikkaMinis 版本，資料就會回來。</string>
+    <string name="newer_db_versions">此版本支援資料格式 %1$d</string>
+    <string name="newer_db_exit">關閉</string>
 </resources>
