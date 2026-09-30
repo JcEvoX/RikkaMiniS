@@ -28,16 +28,30 @@ else
 fi
 
 # --- 2. i18n consistency ---
-#   - Orphan keys (in code but not in strings.xml) = HARD FAIL
+#   - Orphan keys (in code but not in any values/strings*.xml) = HARD FAIL
 #   - Missing translations = WARNING only (known legacy from upstream)
+#   Strings may be split across several files per res folder:
+#   values/strings_db_guard.xml keeps the database-downgrade guidance strings
+#   out of the shared strings.xml, so the default set is the UNION over
+#   strings*.xml. Reading strings.xml alone reports those keys as orphans and
+#   fails the build for resources that exist.
 echo "━━━ [2/20] i18n consistency check ━━━"
 python3 -c "
 import re, os, sys
 root = '$ROOT'
-values_dir = os.path.join(root, 'src/android/app/src/main/res/values')
-strings_xml = os.path.join(values_dir, 'strings.xml')
-with open(strings_xml) as f:
-    defined = set(re.findall(r'name=\"([a-z0-9_]+)\"', f.read()))
+res_dir = os.path.join(root, 'src/android/app/src/main/res')
+def defined_in(folder):
+    keys = set()
+    if not os.path.isdir(folder): return keys
+    for fn in sorted(os.listdir(folder)):
+        if not (fn.startswith('strings') and fn.endswith('.xml')): continue
+        with open(os.path.join(folder, fn)) as f:
+            keys.update(re.findall(r'name=\"([a-z0-9_]+)\"', f.read()))
+    return keys
+defined = defined_in(os.path.join(res_dir, 'values'))
+if not defined:
+    print('❌ no strings*.xml found under ' + os.path.join(res_dir, 'values'))
+    sys.exit(1)
 code_keys = set()
 src_dir = os.path.join(root, 'src/android/app/src/main')
 for dirpath, _, fns in os.walk(src_dir):
@@ -52,12 +66,9 @@ if orphans:
 else:
     print(f'✅ No orphan keys ({len(code_keys)} refs, {len(defined)} defs)')
     # Missing translations: warning only
-    res_dir = os.path.join(root, 'src/android/app/src/main/res')
     for loc in sorted(d for d in os.listdir(res_dir) if d.startswith('values-') and d != 'values'):
-        loc_file = os.path.join(res_dir, loc, 'strings.xml')
-        if not os.path.exists(loc_file): continue
-        with open(loc_file) as f:
-            loc_keys = set(re.findall(r'name=\"([a-z0-9_]+)\"', f.read()))
+        loc_keys = defined_in(os.path.join(res_dir, loc))
+        if not loc_keys: continue
         missing = (defined - loc_keys) & code_keys
         if missing:
             print(f'  ⚠️  {loc}: {len(missing)} active keys untranslated')

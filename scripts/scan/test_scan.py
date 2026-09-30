@@ -332,6 +332,31 @@ def test_i18n():
     )
     shutil.rmtree(root)
 
+    # Split resource files: Android allows several strings*.xml per res folder
+    # and this repo uses one (values/strings_db_guard.xml) so the
+    # database-downgrade guidance strings do not have to touch the shared
+    # strings.xml. A scanner that only reads strings.xml calls those keys
+    # orphans and fails the build for resources that exist.
+    files[os.path.join(KOTLIN_PKG, "Ui.kt")] = (
+        "package com.rikkaminis.app\n"
+        "val title = R.string.app_name\n"
+        "val hint = R.string.newer_db_title\n"
+    )
+    files[os.path.join(RES_VALUES, "strings_db_guard.xml")] = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        "<resources>\n"
+        '    <string name="newer_db_title">Your data is from a newer version</string>\n'
+        "</resources>\n"
+    )
+    root = make_tree(files)
+    code, out = run_scanner("i18n_check.py", root)
+    check(
+        "key defined in a split strings file is NOT an orphan (exit 0)",
+        code == 0,
+        f"exit={code}\n{out}",
+    )
+    shutil.rmtree(root)
+
 
 def test_enum_parse():
     print("━━━ enum_parse_safety_check ━━━")

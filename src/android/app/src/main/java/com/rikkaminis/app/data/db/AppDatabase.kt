@@ -256,6 +256,63 @@ abstract class AppDatabase : RoomDatabase() {
             }
         }
 
+        /**
+         * [T-android-downgrade-compat] There is deliberately NO downgrade
+         * migration in this file, even though Room supports them. This is a
+         * hard Room constraint, not a style choice:
+         *
+         * `MigrationManager.buildMap` walks the registered list in order, and
+         * throws `IllegalArgumentException("Invalid migration ... Migrations
+         * must be chained. Starting from migration X, expected a migration
+         * starting at version 12")` for the first migration whose `from` is
+         * neither already a known target nor the current walk head. With
+         * `version = 12` the walk tops out at 12, so `Migration(13, 12)` is
+         * rejected the moment `AppDatabase.getInstance` builds the helper —
+         * at launch, for every user, on a database that was never downgraded.
+         * Verified against the bytecode of `room-common:2.6.1`, the exact
+         * version this build pins (`MigrationManager.buildMap`,
+         * `RoomOpenHelper.buildOpenHelper`).
+         *
+         * So a downgrade pair may only be registered in the build that also
+         * contains the forward migration creating its `from` version. When
+         * the 12 → 13 bump lands, add MIGRATION_12_13 AND MIGRATION_13_12 in
+         * the same commit, and flip
+         * [com.rikkaminis.app.data.db.DatabaseVersionGuard.isHandledDowngrade]
+         * from `false` to `(onDiskVersion to codeVersion) in setOf(13 to 12)`.
+         * The unit tests `no registered downgrade starts above the database
+         * version` and `whitelisted pairs and wired downgrades are the same
+         * set` fail if either half is added without the other.
+         *
+         * The 13 → 12 reverse should then be an empty body: `ADD COLUMN` is
+         * the one schema change with a safe reverse, because
+         *
+         * - Room's generated DAOs bind by column NAME, never by position;
+         * - open-time schema validation requires every column the entity
+         *   declares, and extra columns left on disk are ignored;
+         * - the new columns are nullable with no DEFAULT, so old `INSERT`s
+         *   are unaffected.
+         *
+         * Not `DROP COLUMN` — that would genuinely delete whatever the newer
+         * build captured, so a user who downgrades to look at something and
+         * upgrades back would silently lose it, the opposite of the point.
+         * Keeping the columns costs a few dozen bytes per row and makes the
+         * round trip lossless. (`ALTER TABLE ... DROP COLUMN` also needs
+         * SQLite 3.35+ / API 34+, and does a full table rebuild below that.)
+         *
+         * The precondition for all of this: whoever writes MIGRATION_12_13
+         * must keep it purely additive (ADD COLUMN / ADD TABLE / ADD INDEX).
+         * Renames, drops, type changes and — most dangerously — changes to
+         * the MEANING of existing data have no safe automatic reverse. If the
+         * bump is anything else, skip MIGRATION_13_12 and the
+         * `isHandledDowngrade` entry, so the pre-check in
+         * [com.rikkaminis.app.data.db.DatabaseVersionGuard] takes over and
+         * shows the guidance screen instead of trusting a lossy reverse.
+         *
+         * There is no MIGRATION_12_11 either. 11 → 12 is purely additive, so a
+         * no-op reverse would be just as lossless — but the build that would
+         * actually run 12 → 11 is a v11 APK that predates this file, so nothing
+         * in this branch can help it. That is what the guidance screen is for.
+         */
         val MIGRATION_3_4 = object : Migration(3, 4) {
             override fun migrate(db: SupportSQLiteDatabase) {
                 // sessions: add iOS-parity columns
@@ -293,6 +350,9 @@ abstract class AppDatabase : RoomDatabase() {
                     AppDatabase::class.java,
                     "minis.db"
                 )
+                    // [T-android-downgrade-compat] 11 upgrades, 0 downgrades — see the
+                    // MIGRATION_3_4 doc block above for why a downgrade pair belongs
+                    // with its forward bump, not with this build.
                     .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12)
                     .build()
                     .also { INSTANCE = it }

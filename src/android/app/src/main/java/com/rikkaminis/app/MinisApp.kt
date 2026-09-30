@@ -16,6 +16,7 @@ import coil.ImageLoader
 import coil.ImageLoaderFactory
 import com.rikkaminis.app.browser.BrowserTabPool
 import com.rikkaminis.app.data.db.AppDatabase
+import com.rikkaminis.app.data.db.DatabaseVersionGuard
 import com.rikkaminis.app.data.repository.BackgroundSettingsRepository
 import com.rikkaminis.app.data.repository.ChatRepository
 import com.rikkaminis.app.ui.chat.KatexWebViewPool
@@ -77,6 +78,18 @@ class MinisApp : Application(), ImageLoaderFactory {
      * any thread (initialised in the constructor, read-only thereafter).
      */
     val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * [T-android-downgrade-compat] Outcome of the pre-Room database check in
+     * [onCreate]. Probed here and read in MainActivity so the UI can tell a
+     * recoverable "your data is newer than this build" state apart from a
+     * genuine init failure — the file has deliberately been left untouched,
+     * so upgrading reinstalls everything rather than repairing anything.
+     */
+    @Volatile
+    var dbVersionDecision: DatabaseVersionGuard.Decision =
+        DatabaseVersionGuard.Decision.PROCEED
+        private set
 
     lateinit var database: AppDatabase
         private set
@@ -427,6 +440,38 @@ class MinisApp : Application(), ImageLoaderFactory {
         // so a user trapped opening a session that hangs the UI gets
         // unstuck on the next launch.
         com.rikkaminis.app.diagnostics.HangDetector.start(this)
+
+        // [T-android-downgrade-compat] Probe the on-disk schema version BEFORE
+        // Room opens the file. If the database was written by a newer build
+        // and no downgrade migration covers the jump, Room would throw
+        // IllegalStateException at first DAO call and this process would die
+        // without ever reaching the screen — for a sideloaded build that gets
+        // rolled back on purpose, that reads as data loss rather than as a
+        // crash. Deciding here, while the file is still untouched and only
+        // ever opened read-only via SQLiteDatabase.OPEN_READONLY, guarantees
+        // that no migration and no dropAllTables can have run by the time we
+        // choose. We deliberately enable no destructive fallback: dropping
+        // would destroy the entire history.
+        dbVersionDecision = DatabaseVersionGuard.evaluate(this)
+
+        if (dbVersionDecision == DatabaseVersionGuard.Decision.SHOW_NEWER_DB_GUIDANCE) {
+            // Same degraded-mode shape as the :acra / :modelservice / safe-mode
+            // early returns above: stop before the heavy init instead of
+            // letting a Room exception propagate out of onCreate. The
+            // repositories below are all backed by this database, so they must
+            // not be built either. MainActivity reads dbVersionDecision first
+            // and shows the guidance screen, so the user sees a recoverable
+            // state with a specific remedy instead of a crash report for
+            // something that is not a bug. Upgrading reinstalls everything.
+            Log.w(
+                "MinisApp",
+                "on-disk chat schema is newer than this build " +
+                    "(code=${DatabaseVersionGuard.CODE_DB_VERSION}); skipping database and " +
+                    "repository init. The database file is left completely untouched — " +
+                    "MainActivity shows the guidance screen instead.",
+            )
+            return
+        }
 
         database = AppDatabase.getInstance(this)
         chatRepository = ChatRepository(

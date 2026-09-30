@@ -3,17 +3,44 @@
 i18n consistency check — detect orphan resource keys and missing translations.
 
 Checks:
-1. Orphan keys: referenced in code (R.string.xxx) but not defined in values/strings.xml
-   → HARD FAIL (exit 1). These are real bugs: they fail at runtime when the
-     resource lookup happens.
-2. Missing translations: keys defined in values/ but missing from a locale file
+1. Orphan keys: referenced in code (R.string.xxx) but not defined in any
+   values/strings*.xml → HARD FAIL (exit 1). These are real bugs: they fail
+   at runtime when the resource lookup happens.
+2. Missing translations: keys defined in values/ missing from a locale file
    → WARNING only (known legacy from upstream — de/ja/ko/ru/zh-rTW were never
-     fully translated; hard-failing on them would block every build).
+   fully translated; hard-failing on them would block every build).
+
+Why the union over strings*.xml: Android has always allowed splitting
+resources across several files in one res folder, and this repo uses it on
+purpose — values/strings_db_guard.xml keeps the database-downgrade guidance
+strings out of the shared strings.xml so that feature does not have to touch
+it. A scanner that only reads values/strings.xml reports those keys as
+orphans and fails the build for resources that exist.
 
 Usage: python3 scripts/scan/i18n_check.py <repo_root>
-Exit code: 0 = clean, 1 = orphan keys found
+Exit code: 0 = clean, 1 = orphan keys found (or no strings file at all)
 """
 import re, sys, os
+
+KEY_RE = re.compile(r'name="([a-z0-9_]+)"')
+CODE_KEY_RE = re.compile(r'R\.string\.([a-z0-9_]+)')
+STRINGS_GLOB = (lambda fn: fn.startswith("strings") and fn.endswith(".xml"))
+
+def keys_defined_in(folder):
+    """Union of the keys defined by every strings*.xml in one res folder."""
+    keys = set()
+    if not os.path.isdir(folder):
+        return keys
+    for fn in sorted(os.listdir(folder)):
+        if not STRINGS_GLOB(fn):
+            continue
+        with open(os.path.join(folder, fn), encoding="utf-8") as f:
+            keys.update(KEY_RE.findall(f.read()))
+    return keys
+
+def defined_files(folder):
+    return [fn for fn in sorted(os.listdir(folder)) if STRINGS_GLOB(fn)] \
+        if os.path.isdir(folder) else []
 
 def main():
     root = sys.argv[1] if len(sys.argv) > 1 else "."
@@ -21,14 +48,13 @@ def main():
 
     # --- Phase 1: Orphan keys (code references but no definition) --- HARD FAIL
     values_dir = os.path.join(root, "src/android/app/src/main/res/values")
-    strings_xml = os.path.join(values_dir, "strings.xml")
-    if not os.path.exists(strings_xml):
-        print("!! strings.xml not found at", strings_xml)
+    if not defined_files(values_dir):
+        print("!! no strings*.xml found at", values_dir)
         return 1
 
-    with open(strings_xml, encoding="utf-8") as f:
-        content = f.read()
-    defined_keys = set(re.findall(r'name="([a-z0-9_]+)"', content))
+    defined_keys = keys_defined_in(values_dir)
+    files = defined_files(values_dir)
+    print(f"   default locales read from: {', '.join(files)}")
 
     code_keys = set()
     src_dir = os.path.join(root, "src/android/app/src/main")
@@ -37,12 +63,12 @@ def main():
             if not fn.endswith(".kt"):
                 continue
             with open(os.path.join(dirpath, fn), encoding="utf-8") as f:
-                code_keys.update(re.findall(r'R\.string\.([a-z0-9_]+)', f.read()))
+                code_keys.update(CODE_KEY_RE.findall(f.read()))
 
     orphans = code_keys - defined_keys
     if orphans:
         problems += 1
-        print(f"❌ Orphan string keys (referenced in code but NOT in strings.xml):")
+        print(f"❌ Orphan string keys (referenced in code but NOT in values/strings*.xml):")
         for k in sorted(orphans):
             print(f"   R.string.{k}")
     else:
@@ -52,11 +78,10 @@ def main():
     res_dir = os.path.join(root, "src/android/app/src/main/res")
     locale_dirs = sorted(d for d in os.listdir(res_dir) if d.startswith("values-") and d != "values")
     for loc in locale_dirs:
-        loc_path = os.path.join(res_dir, loc, "strings.xml")
-        if not os.path.exists(loc_path):
-            continue
-        with open(loc_path, encoding="utf-8") as f:
-            loc_keys = set(re.findall(r'name="([a-z0-9_]+)"', f.read()))
+        loc_folder = os.path.join(res_dir, loc)
+        if not defined_files(loc_folder):
+            continue  # no strings file in this locale dir at all (e.g. values-night)
+        loc_keys = keys_defined_in(loc_folder)
         missing = (defined_keys - loc_keys) & code_keys
         if missing:
             print(f"⚠️  {loc}: {len(missing)} active keys missing translation (WARNING)")
