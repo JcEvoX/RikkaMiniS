@@ -31,7 +31,7 @@ class FastioCopyTest {
         assertEquals(0L, out.dirs)
         assertEquals(5L, out.bytes)
         assertEquals(0L, out.overwritten)
-        assertEquals("12345", Files.readString(dir.resolve("b.txt")))
+        assertEquals("12345", Files.readAllBytes(dir.resolve("b.txt")).decodeToString())
         assertTrue(out.errors.isEmpty())
     }
 
@@ -75,7 +75,7 @@ class FastioCopyTest {
         assertEquals(1, out.errors.size)
         assertEquals(0L, out.files)
         assertEquals(0L, out.overwritten)
-        assertEquals("old", Files.readString(dst))
+        assertEquals("old", Files.readAllBytes(dst).decodeToString())
     }
 
     @Test
@@ -90,7 +90,7 @@ class FastioCopyTest {
         assertEquals(1L, out.overwritten)
         assertEquals(1L, out.files)
         assertEquals(3L, out.bytes)
-        assertEquals("new", Files.readString(dst))
+        assertEquals("new", Files.readAllBytes(dst).decodeToString())
         assertTrue(out.errors.isEmpty())
     }
 
@@ -107,8 +107,8 @@ class FastioCopyTest {
 
         assertEquals(1L, out.files)     // only a.txt is new; kept.txt is not touched
         assertEquals(0L, out.dirs)      // dst already existed
-        assertEquals("a", Files.readString(dst.resolve("a.txt")))
-        assertEquals("k", Files.readString(dst.resolve("kept.txt")))
+        assertEquals("a", Files.readAllBytes(dst.resolve("a.txt")).decodeToString())
+        assertEquals("k", Files.readAllBytes(dst.resolve("kept.txt")).decodeToString())
         assertTrue(out.errors.isEmpty())
     }
 
@@ -123,7 +123,7 @@ class FastioCopyTest {
         assertEquals("rename", out.method)
         assertFalse(out.counted)   // a rename costs no walk, so nothing was counted
         assertFalse(Files.exists(src))
-        assertEquals("12345", Files.readString(dir.resolve("b.txt")))
+        assertEquals("12345", Files.readAllBytes(dir.resolve("b.txt")).decodeToString())
         assertTrue(out.errors.isEmpty())
     }
 
@@ -140,8 +140,8 @@ class FastioCopyTest {
 
         assertEquals("rename", out.method)
         assertFalse(Files.exists(src))
-        assertEquals("a", Files.readString(dir.resolve("dst/a.txt")))
-        assertEquals("bb", Files.readString(dir.resolve("dst/sub/b.txt")))
+        assertEquals("a", Files.readAllBytes(dir.resolve("dst/a.txt")).decodeToString())
+        assertEquals("bb", Files.readAllBytes(dir.resolve("dst/sub/b.txt")).decodeToString())
         assertTrue(out.errors.isEmpty())
     }
 
