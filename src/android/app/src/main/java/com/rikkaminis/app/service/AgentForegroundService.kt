@@ -118,11 +118,17 @@ class AgentForegroundService : Service() {
     /**
      * Safe mode means MinisApp.onCreate tripped over a crash burst and
      * skipped its lateinit repository init — see the onCreate comment.
-     * Read through this one helper so the init-skip states stay in one
-     * place and the two guards below stay spelled identically.
+     * [isInitSkipped] is the process-wide one-way latch MainActivity also
+     * gates on: finishClose clears _safeMode while this process has still
+     * skipped init, so a service recreated in that window must not trust
+     * isSafeMode() alone. Read through one helper so the init-skip states
+     * stay in one place and the two guards below stay spelled identically.
      */
     private fun isSafeMode(): Boolean =
         com.rikkaminis.app.crash.CrashFrequencyDetector.isSafeMode()
+
+    private fun isInitSkipped(): Boolean =
+        com.rikkaminis.app.crash.CrashFrequencyDetector.isInitSkipped()
 
     /**
      * True when MinisApp.onCreate took the database-downgrade early return
@@ -148,10 +154,10 @@ class AgentForegroundService : Service() {
         // from the very detection logic that meant to stop the crashing.
         // Skip the overlay observer and let onStartCommand satisfy the
         // FG-deadline + stopSelf.
-        if (isSafeMode() || isDbGuidanceMode()) {
+        if (isSafeMode() || isInitSkipped() || isDbGuidanceMode()) {
             Log.w(
                 TAG,
-                "app init was skipped (safeMode=${isSafeMode()}, dbGuidance=${isDbGuidanceMode()}) " +
+                "app init was skipped (safeMode=${isSafeMode()}, initSkipped=${isInitSkipped()}, dbGuidance=${isDbGuidanceMode()}) " +
                     "— skipping overlay/wake-lock bring-up",
             )
             createNotificationChannel()
@@ -180,7 +186,7 @@ class AgentForegroundService : Service() {
         // before building the repositories, so an OEM restart of this service
         // would hit the same UninitializedPropertyAccessException. A sticky
         // service can be recreated in either state, hence the shared stub.
-        if (isSafeMode() || isDbGuidanceMode()) {
+        if (isSafeMode() || isInitSkipped() || isDbGuidanceMode()) {
             try {
                 val stub = androidx.core.app.NotificationCompat.Builder(this, CHANNEL_ID)
                     .setContentTitle("RikkaMinis")

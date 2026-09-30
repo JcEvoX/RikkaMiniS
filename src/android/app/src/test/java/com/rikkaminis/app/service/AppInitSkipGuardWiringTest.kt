@@ -19,9 +19,9 @@ import java.io.File
  * `DatabaseVersionGuardTest.locateDatabaseFile` — with the expected text written
  * as literals that no production constant is allowed to supply.
  *
- * The negative control at the bottom mutates a copy of the real source and runs
- * the very same assertion on it. Without that control a vanished guard would
- * show up as a green test that no longer checks anything.
+ * The negative control mutates a copy of the real source (flips the gate
+ * verdict) and runs the very same assertions on it. Without that control a
+ * vanished guard would show up as a green test that no longer checks anything.
  */
 class AppInitSkipGuardWiringTest {
 
@@ -38,7 +38,7 @@ class AppInitSkipGuardWiringTest {
     private val stubNotification = ".setContentTitle(\"RikkaMinis\")"
     private val stubUnwind = "return START_NOT_STICKY"
 
-    private val safeModeGuard = "if (isSafeMode() || isDbGuidanceMode())"
+    private val safeModeGuard = "if (isSafeMode() || isInitSkipped() || isDbGuidanceMode())"
     private val guidanceConstant = "SHOW_NEWER_DB_GUIDANCE"
     private val repositoryAccess = "backgroundSettingsRepository"
 
@@ -210,6 +210,11 @@ class AppInitSkipGuardWiringTest {
             "safe mode must still take that same bail-out\n<body>",
             branch.contains("isSafeMode()"),
         )
+        assertTrue(
+            "the one-way init-skip latch must stay in the guard — finishClose clears " +
+                "_safeMode while this process has still skipped init\n<body>",
+            branch.contains("isInitSkipped()"),
+        )
         assertFalse(
             "the guidance/safe-mode path must not build the real notification\n<body>",
             branch.contains("buildNotification"),
@@ -274,7 +279,7 @@ class AppInitSkipGuardWiringTest {
     private fun normalize(text: String): String {
         val noComments = text
             .replace(Regex("""//[^\n]*"""), " ")
-            .replace(Regex("""/\*.*?\*""", RegexOption.DOT_MATCHES_ALL), " ")
+            .replace(Regex("""/\*.*?\*/""", RegexOption.DOT_MATCHES_ALL), " ")
         return collapse(noComments)
     }
 
