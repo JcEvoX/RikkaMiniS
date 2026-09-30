@@ -8,8 +8,10 @@ import android.graphics.Rect
 import android.os.Build
 import android.view.Display
 import android.view.accessibility.AccessibilityNodeInfo
+import com.rikkaminis.app.accessibility.AccessibilityRecoveryManager
 import com.rikkaminis.app.accessibility.MinisAccessibilityService
 import com.rikkaminis.app.accessibility.NodeRegistry
+import com.rikkaminis.app.accessibility.RestrictedSettingsManager
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.sandbox.NativeOffloadHandler
 import com.rikkaminis.app.sandbox.NativeOffloadRequest
@@ -105,6 +107,56 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
                 )
             }
         }
+        // [T-android-a11y-force-stop-recovery] A force-stop (system Settings'
+        // "Force stop", or an OEM "clear" button) makes the framework strip our
+        // component out of Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES. It
+        // never self-heals, so without this every subsequent a11y call just
+        // returns SERVICE_NOT_RUNNING and the user has no idea the grant is the
+        // problem. Detect it here — the single point every real operation
+        // passes through — and offer a repair (one-tap via Shizuku when
+        // available, otherwise a trip to Settings).
+        //
+        // `service` / `--version` are exempt for the same reason they bypass
+        // the gate above: they are how you DIAGNOSE this state, and prompting
+        // from `service status` would be circular.
+        //
+        // runBlocking matches the established pattern for permission gates in
+        // the sibling handlers (Calendar / Contacts / BrowserUse) — offload
+        // handlers are invoked off the main thread on a sandbox worker, and
+        // `handle` is not a suspend fun. The prompt self-cancels after
+        // AccessibilityRecoveryManager.PROMPT_TIMEOUT_MS so this can never
+        // block the worker indefinitely.
+        if (sub != "service" && sub != "--version") {
+            val usable = kotlinx.coroutines.runBlocking {
+                AccessibilityRecoveryManager.ensureGrantOrPrompt(context)
+            }
+            if (!usable) {
+                // [T-android-restricted-settings] Distinguish the two reasons
+                // the grant can be missing. If the OS has flagged this install
+                // (sideloaded from a downloaded APK), telling the user to
+                // "re-enable it under Settings → Accessibility" sends them to a
+                // toggle that is greyed out and cannot be moved — the actual
+                // blocker is the restricted-settings gate, so name it.
+                val restricted = RestrictedSettingsManager.isRestricted(context)
+                return err(
+                    args,
+                    "SERVICE_NOT_RUNNING",
+                    if (restricted) {
+                        "Android is blocking the accessibility toggle for this install " +
+                            "(\"Restricted setting\" — applies to apps installed from a " +
+                            "downloaded APK). Allow it via App info → ⋮ → Allow restricted " +
+                            "settings, then enable RikkaMinis under Settings → Accessibility. " +
+                            "Settings → Permissions → System Permissions has a one-tap fix " +
+                            "when Shizuku is available."
+                    } else {
+                        "Accessibility permission was revoked (this happens after a force-stop). " +
+                            "Re-enable RikkaMinis under Settings → Accessibility, or use Settings → " +
+                            "Permissions → Integrations to repair it with Shizuku."
+                    },
+                    exit = 77,
+                )
+            }
+        }
         // [T-bg-overlay phase 2 fix] Surface a11y sub-action progress to
         // SessionActivityTracker.currentToolStatus so the background
         // overlay capsule + FGS notification show what the agent is
@@ -157,11 +209,24 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
                         put("retrieveWindowContent"); put("performGestures"); put("watchEvents")
                     })
                     .put("androidVersion", android.os.Build.VERSION.SDK_INT)
+                    // [T-android-restricted-settings] `service status` is the
+                    // documented way to diagnose why the service won't start,
+                    // so report the OS-level block explicitly — otherwise the
+                    // only visible fact is running=false, which looks
+                    // identical to "the user never enabled it".
+                    .put("restrictedSettings", RestrictedSettingsManager.isRestricted(context))
                 ok(args, data)
             }
             "ping" -> {
                 if (MinisAccessibilityService.getInstance() != null)
                     NativeOffloadResult(0, "✓ Accessibility service is running\n")
+                else if (RestrictedSettingsManager.isRestricted(context))
+                    NativeOffloadResult(
+                        77,
+                        "✗ Accessibility service is not running — Android has flagged this " +
+                            "install as \"Restricted setting\" and the toggle is greyed out. " +
+                            "Allow it via App info → ⋮ → Allow restricted settings first.\n",
+                    )
                 else
                     NativeOffloadResult(77, "✗ Accessibility service is not running — go to Settings → Accessibility → RikkaMinis to enable\n")
             }

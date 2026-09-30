@@ -4,6 +4,7 @@ import android.app.LocaleManager
 import android.content.Intent
 import android.content.SharedPreferences
 import android.net.Uri
+import android.provider.Settings
 import android.os.Build
 import android.os.Bundle
 import android.os.LocaleList
@@ -24,6 +25,7 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.lifecycleScope
+import com.rikkaminis.app.accessibility.AccessibilityRecoveryManager
 import com.rikkaminis.app.offload.OffloadPermissionManager
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.launch
@@ -351,6 +353,66 @@ class MainActivity : ComponentActivity() {
                             )
                         }
                         .show()
+                }
+        }
+
+        // [T-android-a11y-force-stop-recovery] Bridge: the accessibility-grant
+        // repair prompt. Raised from the a11y tool path when the framework has
+        // stripped our component out of ENABLED_ACCESSIBILITY_SERVICES (the
+        // force-stop case). Two shapes depending on whether Shizuku can do the
+        // privileged write for us.
+        //
+        // setCancelable(true) + setOnCancelListener, unlike the settings gate
+        // above: an interrupted dialog must count as a cancel and must not
+        // wedge the waiting agent turn. Every exit path — button, back press,
+        // outside tap — resolves the continuation exactly once (respond()
+        // no-ops if already resolved, e.g. after a timeout).
+        lifecycleScope.launch {
+            AccessibilityRecoveryManager.pendingPrompt
+                .filterNotNull()
+                .collect { prompt ->
+                    val b = AlertDialog.Builder(this@MainActivity)
+                        .setTitle(getString(R.string.a11y_repair_dialog_title))
+                        .setCancelable(true)
+                        .setOnCancelListener {
+                            AccessibilityRecoveryManager.respond(
+                                AccessibilityRecoveryManager.Decision.CANCEL
+                            )
+                        }
+                        .setNegativeButton(R.string.a11y_repair_cancel) { d, _ ->
+                            d.dismiss()
+                            AccessibilityRecoveryManager.respond(
+                                AccessibilityRecoveryManager.Decision.CANCEL
+                            )
+                        }
+                    if (prompt.shizukuAvailable) {
+                        b.setMessage(getString(R.string.a11y_repair_dialog_message_shizuku))
+                            .setPositiveButton(R.string.a11y_repair_action_repair) { d, _ ->
+                                d.dismiss()
+                                AccessibilityRecoveryManager.respond(
+                                    AccessibilityRecoveryManager.Decision.REPAIR
+                                )
+                            }
+                    } else {
+                        b.setMessage(getString(R.string.a11y_repair_dialog_message_manual))
+                            .setPositiveButton(R.string.a11y_repair_action_open_settings) { d, _ ->
+                                d.dismiss()
+                                try {
+                                    startActivity(
+                                        Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
+                                            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                        }
+                                    )
+                                } catch (_: Throwable) {
+                                    // Some OEMs hide this panel; the user can
+                                    // still reach it from Settings manually.
+                                }
+                                AccessibilityRecoveryManager.respond(
+                                    AccessibilityRecoveryManager.Decision.OPEN_SETTINGS
+                                )
+                            }
+                    }
+                    b.show()
                 }
         }
 

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- [T-android-restricted-settings] Shown when Android blocks the
+         accessibility toggle for a downloaded-APK install. -->
+    <string name="system_permissions_a11y_restricted_header">Toggle greyed out? (\"Restricted setting\")</string>
+    <string name="system_permissions_a11y_restricted_footer">Android blocks the accessibility toggle for apps installed from a downloaded APK file. This is an OS security policy, not a RikkaMinis bug — nothing is wrong with your install. Allowing restricted settings only re-enables the toggle; it grants nothing on its own, and you still choose whether to turn the service on.</string>
+    <string name="system_permissions_a11y_restricted_shizuku">Allow restricted settings via Shizuku</string>
+    <string name="system_permissions_a11y_restricted_shizuku_sub">One tap — clears the flag without leaving RikkaMinis</string>
+    <string name="system_permissions_a11y_restricted_working">Allowing…</string>
+    <string name="system_permissions_a11y_restricted_failed">Failed — use the manual steps below</string>
+    <string name="system_permissions_a11y_restricted_manual">Allow restricted settings</string>
+    <string name="system_permissions_a11y_restricted_manual_sub">App info → ⋮ menu (top right) → Allow restricted settings</string>
+
+    <!-- [T-android-a11y-force-stop-recovery] Shown when a force-stop stripped
+         our component from ENABLED_ACCESSIBILITY_SERVICES. -->
+    <string name="a11y_repair_dialog_title">Accessibility turned off</string>
+    <string name="a11y_repair_cancel">Not now</string>
+    <string name="a11y_repair_dialog_message_shizuku">RikkaMinis lost its accessibility permission — this happens after the app is force-stopped. Shizuku is available, so it can be restored right now without opening Settings.</string>
+    <string name="a11y_repair_action_repair">Repair now</string>
+    <string name="a11y_repair_dialog_message_manual">RikkaMinis lost its accessibility permission — this happens after the app is force-stopped. Re-enable RikkaMinis under Settings → Accessibility to continue.</string>
+    <string name="a11y_repair_action_open_settings">Open Settings</string>
+    <string name="a11y_repair_section_header">Needs attention</string>
+    <string name="a11y_repair_footer_shizuku">Android removes the accessibility grant whenever an app is force-stopped, and does not restore it automatically. Shizuku can write it back directly.</string>
+    <string name="a11y_repair_footer_manual">Android removes the accessibility grant whenever an app is force-stopped, and does not restore it automatically. Install and authorize Shizuku to repair this in one tap in future.</string>
+    <string name="a11y_repair_row_shizuku">Repair accessibility permission</string>
+    <string name="a11y_repair_row_manual">Re-enable accessibility</string>
+    <string name="a11y_repair_in_progress">Repairing…</string>
+    <string name="a11y_repair_failed">Repair failed — try enabling it in Settings</string>
+    <string name="a11y_repair_row_sub">The permission was revoked, likely by a force-stop</string>
+</resources>

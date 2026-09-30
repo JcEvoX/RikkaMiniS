@@ -60,6 +60,13 @@ class MinisAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         _instance = this
+        // [T-android-a11y-force-stop-recovery] Latch "the grant has existed",
+        // whichever route the user took (Settings toggle, Shizuku repair, or a
+        // restore). This is the one moment we know the grant is real, and it
+        // is what lets AccessibilityRecoveryManager tell "revoked after a
+        // force-stop" apart from "never set up" — only the former should ever
+        // raise a repair prompt.
+        AccessibilityRecoveryManager.markGranted(this)
         // [T-android-a11y-miui-service-failure] Breadcrumb on (re)bind. On OEM
         // ROMs (MIUI etc.) the system kills + rebinds this service repeatedly,
         // surfacing "此服务出现故障"; a connect log lets us correlate a degraded

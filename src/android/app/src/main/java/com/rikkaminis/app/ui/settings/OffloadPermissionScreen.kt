@@ -1,5 +1,6 @@
 package com.rikkaminis.app.ui.settings
 
+import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.provider.Settings
@@ -8,6 +9,8 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.Accessibility
+import androidx.compose.material.icons.outlined.Info
+import androidx.compose.material.icons.outlined.LockOpen
 import androidx.compose.material.icons.outlined.Shield
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenuItem
@@ -19,6 +22,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -28,12 +32,15 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.rikkaminis.app.R
 import com.rikkaminis.app.accessibility.MinisAccessibilityService
+import com.rikkaminis.app.accessibility.RestrictedSettingsManager
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.offload.OffloadPermissionManager
 import com.rikkaminis.app.offload.ShizukuManager
+import com.rikkaminis.app.power.PowerOptimizationManager
 import com.rikkaminis.app.ui.components.MinisMenu
 import com.rikkaminis.app.ui.components.MinisTextButton
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import com.rikkaminis.app.ui.theme.ChatColors
 
 @Composable
@@ -59,11 +66,21 @@ fun OffloadPermissionScreen(
     val context = LocalContext.current
 
     var a11yEnabled by remember { mutableStateOf(isA11yServiceEnabled(context)) }
+    // [T-android-restricted-settings] Android 13+ refuses to arm the
+    // accessibility toggle for installs flagged as restricted; surfaced below
+    // so the "Open accessibility settings" action doesn't dead-end.
+    var a11yRestricted by remember { mutableStateOf(false) }
+    var unrestricting by remember { mutableStateOf(false) }
+    var unrestrictFailed by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
     LaunchedEffect(Unit) {
         // Re-poll once a second so coming back from system Accessibility
         // settings flips the row without a manual refresh.
         while (true) {
             a11yEnabled = isA11yServiceEnabled(context) || MinisAccessibilityService.getInstance() != null
+            // Re-probed each tick so the section disappears by itself once the
+            // user allows restricted settings and returns.
+            a11yRestricted = !a11yEnabled && RestrictedSettingsManager.isRestricted(context)
             delay(1000)
         }
     }
@@ -124,6 +141,68 @@ fun OffloadPermissionScreen(
             systemActionTitleRes = R.string.perm_a11y_open_settings,
             onSystemAction = { openAccessibilitySettings(context) },
         )
+
+        // [T-android-restricted-settings] Shown ONLY when the OS has actually
+        // flagged this install (appop ACCESS_RESTRICTED_SETTINGS ==
+        // MODE_ERRORED) and the service is still off. That is precisely the
+        // state where the "Open accessibility settings" action right above
+        // leads to a toggle the user cannot move: Android 13+ blocks the
+        // accessibility toggle for packages installed by an installer that
+        // declared PACKAGE_SOURCE_LOCAL_FILE / _DOWNLOADED_FILE, which is what
+        // a browser or file manager opening a downloaded APK does. Without
+        // this the user follows our own instruction into a dead end with no
+        // explanation — the reported HyperOS / Android 14 case.
+        //
+        // We cannot clear the flag ourselves: it is set on our own uid and
+        // clearing it needs the signature permission MANAGE_APP_OPS_MODES.
+        // That is deliberate, since the policy exists to stop a sideloaded app
+        // from talking the user into granting it screen-reading power. So the
+        // manual route is the primary affordance and stays visible even when
+        // the Shizuku one-tap shortcut is also offered.
+        if (a11yRestricted) {
+            SettingsSection(
+                header = stringResource(R.string.system_permissions_a11y_restricted_header),
+                footer = stringResource(R.string.system_permissions_a11y_restricted_footer),
+            ) {
+                if (shizukuSnap.state == ShizukuManager.State.READY) {
+                    SettingsRow(
+                        icon = Icons.Outlined.LockOpen,
+                        iconColor = ChatColors.success,
+                        title = stringResource(R.string.system_permissions_a11y_restricted_shizuku),
+                        subtitle = when {
+                            unrestricting ->
+                                stringResource(R.string.system_permissions_a11y_restricted_working)
+                            unrestrictFailed ->
+                                stringResource(R.string.system_permissions_a11y_restricted_failed)
+                            else ->
+                                stringResource(R.string.system_permissions_a11y_restricted_shizuku_sub)
+                        },
+                        onClick = {
+                            if (unrestricting) return@SettingsRow
+                            unrestricting = true
+                            unrestrictFailed = false
+                            scope.launch {
+                                val ok = RestrictedSettingsManager.clearWithShizuku(context)
+                                unrestricting = false
+                                unrestrictFailed = !ok
+                                // On success the poll above clears
+                                // a11yRestricted and this section vanishes.
+                            }
+                        },
+                    )
+                }
+                SettingsRow(
+                    icon = Icons.Outlined.Info,
+                    iconColor = Color(0xFFFF9500),
+                    title = stringResource(R.string.system_permissions_a11y_restricted_manual),
+                    subtitle = stringResource(R.string.system_permissions_a11y_restricted_manual_sub),
+                    // Lands on RikkaMinis' own App info page, where "Allow
+                    // restricted settings" lives in the overflow menu.
+                    onClick = { openAppDetailsSettings(context) },
+                    showDivider = false,
+                )
+            }
+        }
 
         IntegrationSection(
             iconVector = Icons.Outlined.Shield,
@@ -416,6 +495,14 @@ private fun openAccessibilitySettings(context: Context) {
             )
         } catch (_: Throwable) {}
     }
+}
+
+// [T-android-restricted-settings] "Allow restricted settings" lives in the
+// overflow menu of RikkaMinis' own App info page, so App info is the only route
+// the OS offers for that gate. Reuses PowerOptimizationManager's helper, which
+// already falls back to generic App info when an OEM hides the restricted page.
+private fun openAppDetailsSettings(context: Context) {
+    (context as? Activity)?.let { PowerOptimizationManager.openAppDetailsSettings(it) }
 }
 
 private fun shizukuSubtitleRes(state: ShizukuManager.State): Int = when (state) {
