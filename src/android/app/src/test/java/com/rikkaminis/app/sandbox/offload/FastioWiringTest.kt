@@ -68,6 +68,14 @@ class FastioWiringTest {
                     "PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE)",
             ),
         )
+        // Phase 3: the archive primitive is a write in BOTH directions.
+        assertTrue(
+            "tar must have its own ASK_ONCE row",
+            permission.contains(
+                "ToolPermissionInfo(\"fastio_tar\", \"minis-fastio (archive)\", " +
+                    "PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE)",
+            ),
+        )
         assertTrue(
             "the agent must be told the tool exists, or the handler is dead weight",
             prompt.contains("minis-fastio du <path>...") && prompt.contains("minis-fastio rm [-r] <path>..."),
@@ -78,6 +86,13 @@ class FastioWiringTest {
                 prompt.contains("minis-fastio grep <pattern>") &&
                 prompt.contains("minis-fastio cp [-r] <src> <dst>") &&
                 prompt.contains("minis-fastio mv <src> <dst>"),
+        )
+        assertTrue(
+            "the agent must be told about the phase-3 archive primitive too, and that its " +
+                "extract side is tar-slip guarded, or it will shell out to `tar` instead",
+            prompt.contains("minis-fastio tar -cf <a.tar> <path>...") &&
+                prompt.contains("minis-fastio tar -xf <a.tar> [-C dir]") &&
+                prompt.contains("tar-slip"),
         )
     }
 
@@ -112,7 +127,7 @@ class FastioWiringTest {
         assertTrue(
             "`--recursive` / `--force` / `--ignore-case` must be declared boolean flags, or " +
                 "OffloadArgs eats the following path as the option's value",
-            handler.contains("booleanFlags = setOf(\"recursive\", \"force\", \"ignore-case\")"),
+            handler.contains("\"recursive\", \"force\", \"ignore-case\","),
         )
     }
 
@@ -153,6 +168,17 @@ class FastioWiringTest {
                 "the one thing it promises to do",
             moveIdx >= 0,
         )
+        val tarBody = bodyOf(handler, "tar")
+        val tarGate = tarBody.indexOf("OffloadGate.enforce(TAR_TOOL_NAME")
+        assertTrue("tar must gate", tarGate >= 0)
+        assertTrue(
+            "the archive must be created after tar's gate",
+            tarBody.indexOf("tarCreateInto(") > tarGate,
+        )
+        assertTrue(
+            "the archive must be expanded after tar's gate",
+            tarBody.indexOf("tarExtractFrom(") > tarGate,
+        )
         assertTrue("find is read-only and must not gate", !bodyOf(handler, "find").contains("OffloadGate"))
         assertTrue("grep is read-only and must not gate", !bodyOf(handler, "grep").contains("OffloadGate"))
     }
@@ -172,6 +198,39 @@ class FastioWiringTest {
             "the rewrite must happen before OffloadArgs is constructed",
             handler.indexOf("normalizeLongOptionSpelling(request.argv.drop(1))") <
                 handler.indexOf("booleanFlags = setOf("),
+        )
+    }
+
+    /**
+     * `tar` needs its own expander because OffloadArgs reads any `-word` as ONE
+     * flag: `-czf out.tar src` would otherwise arrive as a flag literally named
+     * "czf", the archive would be read as a MEMBER, and the command would fail
+     * with a confusing "missing <archive>". It must stay scoped to `tar`,
+     * because `-rf` has to keep its meaning for `rm`/`cp`.
+     */
+    private fun assertTarOptionSpelling(handler: String) {
+        assertTrue(
+            "the `tar` cluster expander must exist",
+            handler.contains("private fun normalizeTarShorts("),
+        )
+        assertTrue(
+            "it must be scoped to the tar subcommand, or `rm -rf` loses its meaning",
+            handler.contains("if (argv.firstOrNull() != \"tar\") return argv"),
+        )
+        assertTrue(
+            "it must run before OffloadArgs is constructed",
+            handler.indexOf("normalizeTarShorts(request.argv.drop(1))") <
+                handler.indexOf("booleanFlags = setOf("),
+        )
+        assertTrue(
+            "`--create` / `--gzip` / `--verbose` must be boolean, or they eat the next token " +
+                "(the archive path)",
+            handler.contains("\"create\", \"extract\", \"gzip\", \"verbose\","),
+        )
+        assertTrue(
+            "`tar -f` must NOT be mapped to `--file`: its value has to stay a positional, " +
+                "and `--key value` would swallow it into `values`",
+            handler.contains("'f' -> Unit   // the archive value stays a positional"),
         )
     }
 
@@ -219,12 +278,20 @@ class FastioWiringTest {
             "minis-fastio rm [-r] <path>...",
             "minis-fastio cp [-r] <src> <dst>",
             "minis-fastio mv <src> <dst>",
+            "minis-fastio tar -cf <a.tar> <path>...",
+            "minis-fastio tar -xf <a.tar> [-C dir]",
+            "tar_slip",
             "java.util.regex",
             "user-mounted external folders",
             "bind-mount roots",
         )) {
             assertTrue("help text must mention '$expected'", handler.contains(expected))
         }
+    }
+
+    @Test
+    fun `tar clusters are expanded before parsing and only for tar`() {
+        assertTarOptionSpelling(source(handlerFile))
     }
 
     @Test
@@ -399,6 +466,64 @@ class FastioWiringTest {
             failed = true
         }
         assertTrue("the option probe must fail once `-name` is no longer rewritten", failed)
+    }
+
+    @Test
+    fun `negative control - dropping the tar permission row makes the wiring probe fail`() {
+        val original = source(permissionFile)
+        val mutated = original.replace(
+            "ToolPermissionInfo(\"fastio_tar\", \"minis-fastio (archive)\", " +
+                "PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE)",
+            "",
+        )
+        assertTrue("the tar row must exist to be removable", mutated != original)
+
+        var failed = false
+        try {
+            assertWired(source(catalogFile), source(appFile), mutated, source(promptFile))
+        } catch (_: AssertionError) {
+            failed = true
+        }
+        assertTrue("the wiring probe must fail without the tar permission row", failed)
+    }
+
+    @Test
+    fun `negative control - unscoping the tar expander makes the spelling probe fail`() {
+        val original = source(handlerFile)
+        val mutated = original.replace(
+            "if (argv.firstOrNull() != \"tar\") return argv",
+            "",
+        )
+        assertTrue("the subcommand guard must exist to be removable", mutated != original)
+
+        var failed = false
+        try {
+            assertTarOptionSpelling(mutated)
+        } catch (_: AssertionError) {
+            failed = true
+        }
+        assertTrue(
+            "the spelling probe must fail once the expander applies to every subcommand",
+            failed,
+        )
+    }
+
+    @Test
+    fun `negative control - removing tar's gate makes the write-gate probe fail`() {
+        val original = source(handlerFile)
+        val mutated = original.replace(
+            "OffloadGate.enforce(TAR_TOOL_NAME, TAR_DISPLAY_NAME, args, request)?.let { return it }",
+            "",
+        )
+        assertTrue("tar's gate line must exist to be removable", mutated != original)
+
+        var failed = false
+        try {
+            assertWriteGates(mutated)
+        } catch (_: AssertionError) {
+            failed = true
+        }
+        assertTrue("the write-gate probe must fail once tar no longer gates", failed)
     }
 
     // ── source location (same technique as DatabaseVersionGuardTest) ─────────
