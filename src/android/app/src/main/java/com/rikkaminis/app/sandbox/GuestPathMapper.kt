@@ -220,27 +220,48 @@ object GuestPathMapper {
     }
 
     /**
-     * Join [relative] under [hostBase] and prove containment on the CANONICAL
-     * paths — canonicalizing both sides is what makes symlink escapes visible
-     * (`<base>/link -> /etc` then `<base>/link/passwd` leaves the base) and
-     * keeps the comparison honest on Android's aliased storage paths
-     * (`/storage/self/primary` vs `/storage/emulated/0`).
+     * Join [relative] under [hostBase] and prove containment of the PARENT
+     * chain on the CANONICAL paths — canonicalizing the parent is what makes
+     * symlink escapes visible (`<base>/link -> /etc` then `<base>/link/passwd`
+     * leaves the base) and keeps the comparison honest on Android's aliased
+     * storage paths (`/storage/self/primary` vs `/storage/emulated/0`).
      *
-     * Returns null when the result escapes [hostBase] or cannot be
-     * canonicalized. A [relative] with a leading `/` is refused outright: the
-     * JVM's `File(base, "/x")` silently re-parents it to `<base>/x` (Java
-     * strips the separator) rather than honouring the absolute path, so
-     * accepting it would hide a caller passing a host path where a tail was
-     * expected behind a plausible-looking nonsense result.
+     * The LAST segment is deliberately left unresolved. Resolving it would
+     * follow a trailing symlink and hand the caller its TARGET, which is not
+     * what the guest asked for: guest `rm <link>` unlinks the link itself and
+     * busybox `du <link>` does not follow by default. Handing back the target
+     * turned `rm <link>` into "delete whatever the link points at" — measured
+     * on the real code path (verify-fastio-0930/RmSymlinkProbe): the file was
+     * deleted and the link survived.
+     *
+     * Returns null when the parent escapes [hostBase] or cannot be
+     * canonicalized, or when the last segment is not a plain name. A [relative]
+     * with a leading `/` is refused outright: the JVM's `File(base, "/x")`
+     * silently re-parents it to `<base>/x` (Java strips the separator) rather
+     * than honouring the absolute path, so accepting it would hide a caller
+     * passing a host path where a tail was expected behind a plausible-looking
+     * nonsense result.
      */
     fun containedHostPath(hostBase: String, relative: String): String? {
         if (relative.startsWith("/")) return null
         val base = try { File(hostBase).canonicalPath } catch (_: Exception) { return null }
         if (relative.isEmpty()) return base
-        val target = try { File(base, relative).canonicalPath } catch (_: Exception) { return null }
-        if (target == base) return base
-        if (!target.startsWith(base + File.separator)) return null
-        return target
+
+        val slash = relative.lastIndexOf('/')
+        val parentTail = if (slash < 0) "" else relative.substring(0, slash)
+        val name = if (slash < 0) relative else relative.substring(slash + 1)
+        // The last segment must be a plain name. `..`/`.` cannot survive
+        // absoluteGuestPath's normalization, so reaching here means a caller
+        // hand-built the tail — refuse instead of guessing what it meant.
+        if (name.isEmpty() || name == "." || name == "..") return null
+
+        val parent = if (parentTail.isEmpty()) {
+            base
+        } else {
+            try { File(base, parentTail).canonicalPath } catch (_: Exception) { return null }
+        }
+        if (parent != base && !parent.startsWith(base + File.separator)) return null
+        return File(parent, name).path
     }
 }
 

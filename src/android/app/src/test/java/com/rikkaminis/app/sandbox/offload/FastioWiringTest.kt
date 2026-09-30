@@ -25,6 +25,7 @@ class FastioWiringTest {
     private val appFile = "src/main/java/com/rikkaminis/app/MinisApp.kt"
     private val permissionFile = "src/main/java/com/rikkaminis/app/offload/OffloadPermissionManager.kt"
     private val handlerFile = "src/main/java/com/rikkaminis/app/sandbox/offload/FastioOffloadHandler.kt"
+    private val terminalFile = "src/main/java/com/rikkaminis/app/sandbox/TerminalSession.kt"
     private val promptFile = "src/main/java/com/rikkaminis/app/ui/chat/ChatPromptAndTools.kt"
 
     // ── the probes, as functions so a mutated copy can be run through them ──
@@ -73,6 +74,42 @@ class FastioWiringTest {
         assertTrue("the gate must run before the first delete", gateIdx < deleteIdx)
     }
 
+    /**
+     * `rm` must survive the argv shapes an agent actually types. Both checks
+     * exist because of measured failures (verify-fastio-0930/ArgsProbe): `-rf`
+     * landed as the single flag "rf" so the directory was refused, and
+     * `--recursive /tmp/x` swallowed the path because the option was not
+     * declared boolean.
+     */
+    private fun assertRmFlagHandling(handler: String) {
+        assertTrue(
+            "rm must accept the combined short flags an agent types (`rm -rf`)",
+            handler.contains("args.hasFlag(\"r\", \"recursive\", \"rf\", \"fr\", \"R\")"),
+        )
+        assertTrue(
+            "`--recursive` / `--force` must be declared boolean flags, or OffloadArgs " +
+                "eats the following path as the option's value",
+            handler.contains("booleanFlags = setOf(\"recursive\", \"force\")"),
+        )
+    }
+
+    /**
+     * The PTY builds its own session-scoped `-b` table from [sessionId], so the
+     * env var the offload handlers read must carry the SAME id. Without it
+     * `minis-fastio du /var/minis/workspace` reports an empty tree (rootfs
+     * placeholder) while `ls` in that same terminal lists the real session dir.
+     */
+    private fun assertTerminalForwardsSessionId(terminal: String) {
+        assertTrue(
+            "the terminal must pass its session id into the env builder",
+            terminal.contains("buildTermuxEnv(rootfsManager, sessionId)"),
+        )
+        assertTrue(
+            "the env builder must export MINIS_CHAT_SESSION_ID",
+            terminal.contains("envMap[\"MINIS_CHAT_SESSION_ID\"] = sessionId"),
+        )
+    }
+
     // ── probes ──────────────────────────────────────────────────────────────
 
     @Test
@@ -96,6 +133,16 @@ class FastioWiringTest {
         )) {
             assertTrue("help text must mention '$expected'", handler.contains(expected))
         }
+    }
+
+    @Test
+    fun `rm accepts the flag spellings an agent actually types`() {
+        assertRmFlagHandling(source(handlerFile))
+    }
+
+    @Test
+    fun `the interactive terminal forwards its session id to the shell`() {
+        assertTerminalForwardsSessionId(source(terminalFile))
     }
 
     // ── negative controls ───────────────────────────────────────────────────
@@ -151,6 +198,42 @@ class FastioWiringTest {
             failed = true
         }
         assertTrue("the wiring probe must fail without the catalog entry", failed)
+    }
+
+    @Test
+    fun `negative control - dropping the combined-flag spelling makes the flag probe fail`() {
+        val original = source(handlerFile)
+        val mutated = original.replace(
+            "args.hasFlag(\"r\", \"recursive\", \"rf\", \"fr\", \"R\")",
+            "args.hasFlag(\"r\", \"recursive\")",
+        )
+        assertTrue("the combined-flag list must exist to be mutated", mutated != original)
+
+        var failed = false
+        try {
+            assertRmFlagHandling(mutated)
+        } catch (_: AssertionError) {
+            failed = true
+        }
+        assertTrue("the flag probe must fail once `-rf` is no longer accepted", failed)
+    }
+
+    @Test
+    fun `negative control - dropping the terminal env injection makes the session-id probe fail`() {
+        val original = source(terminalFile)
+        val mutated = original.replace(
+            "envMap[\"MINIS_CHAT_SESSION_ID\"] = sessionId",
+            "",
+        )
+        assertTrue("the env injection must exist to be removed", mutated != original)
+
+        var failed = false
+        try {
+            assertTerminalForwardsSessionId(mutated)
+        } catch (_: AssertionError) {
+            failed = true
+        }
+        assertTrue("the session-id probe must fail once the export is gone", failed)
     }
 
     // ── source location (same technique as DatabaseVersionGuardTest) ─────────

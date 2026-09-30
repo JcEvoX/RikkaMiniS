@@ -168,6 +168,51 @@ class GuestPathMapperTest {
         }
     }
 
+    @Test
+    fun `a trailing symlink is not followed - the link itself is the target`() {
+        val tmp = Files.createTempDirectory("fastio-mapper-tail").toFile()
+        try {
+            val base = File(tmp, "base").apply { mkdirs() }
+            val realDir = File(base, "realdir").apply { mkdirs() }
+            val realFile = File(realDir, "important.txt").apply { writeText("x") }
+            Files.createSymbolicLink(File(base, "shortcut").toPath(), realFile.toPath())
+            Files.createSymbolicLink(File(base, "dirlink").toPath(), realDir.toPath())
+
+            val table = listOf(GuestPathMapper.Binding("/data", base.absolutePath))
+            val canonicalBase = base.canonicalFile
+
+            // `rm <link>` must name the LINK. Resolving the last segment would
+            // hand the caller the target and delete the real file, while the
+            // link survives — the opposite of guest `rm`, which unlinks the
+            // link itself.
+            val file = GuestPathMapper.resolve("/data/shortcut", "/", table)
+            assertEquals(
+                File(canonicalBase, "shortcut").path,
+                (file as GuestPathMapper.Resolution.Ok).hostPath,
+            )
+            assertTrue(Files.isSymbolicLink(File(file.hostPath).toPath()))
+
+            // Same for a symlinked directory: `rm -r <dirlink>` must not walk
+            // into the real tree and `du <dirlink>` must not measure it.
+            val dir = GuestPathMapper.resolve("/data/dirlink", "/", table)
+            assertEquals(
+                File(canonicalBase, "dirlink").path,
+                (dir as GuestPathMapper.Resolution.Ok).hostPath,
+            )
+            assertTrue(Files.isSymbolicLink(File(dir.hostPath).toPath()))
+
+            // A symlink in the MIDDLE of the path is still resolved — and still
+            // escape-checked. That is what the containment guard is for.
+            val inside = GuestPathMapper.resolve("/data/dirlink/important.txt", "/", table)
+            assertEquals(
+                File(realDir, "important.txt").canonicalPath,
+                (inside as GuestPathMapper.Resolution.Ok).hostPath,
+            )
+        } finally {
+            tmp.deleteRecursively()
+        }
+    }
+
     // ── binding roots (the destructive caller's extra policy) ───────────────
 
     @Test

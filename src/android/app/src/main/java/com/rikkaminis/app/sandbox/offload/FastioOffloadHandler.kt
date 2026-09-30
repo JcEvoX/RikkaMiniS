@@ -59,7 +59,14 @@ import java.nio.file.attribute.BasicFileAttributes
 class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler {
 
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
-        val args = OffloadArgs(request.argv.drop(1))
+        val args = OffloadArgs(
+            request.argv.drop(1),
+            // `--recursive` / `--force` are booleans, not `--key value` pairs.
+            // Without this declaration OffloadArgs consumes the NEXT token as
+            // the option's value, so `rm --recursive /tmp/x` lost the path and
+            // reported "missing <path>" instead of deleting anything.
+            booleanFlags = setOf("recursive", "force"),
+        )
         if (args.hasFlag("h", "help")) return NativeOffloadResult(0, HELP)
 
         val sub = args.positional.firstOrNull()
@@ -194,7 +201,12 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
         // envelope pointing at Settings → Permissions (OffloadGate builds it).
         OffloadGate.enforce(TOOL_NAME, DISPLAY_NAME, args, request)?.let { return it }
 
-        val recursive = args.hasFlag("r", "recursive")
+        // OffloadArgs does not split combined short options (`-rf` lands as one
+        // flag "rf"), and teaching the shared parser to split them would change
+        // argv handling for all ~46 handlers. Accept the combined spellings an
+        // agent actually types instead — `rm -rf` failing with "is a directory;
+        // pass -r" was the single most likely way to call this tool wrong.
+        val recursive = args.hasFlag("r", "recursive", "rf", "fr", "R")
         val bindings = bindingsFor(request)
         val startedNs = System.nanoTime()
 
@@ -382,6 +394,9 @@ Usage:
                                        Asks for permission first (Settings → Permissions).
 
 Options:
+  -r, --recursive    (rm) delete a directory tree. `-rf` / `-fr` work too; `-f`
+                     alone is accepted and ignored (a missing path is still
+                     reported as an error — POSIX `rm -f` would stay silent).
   --max-entries N    Entry budget for `du` (default $DEFAULT_MAX_ENTRIES); over budget → "truncated": true
   --compact, -q      Standard output shaping (see other minis-* tools)
 
