@@ -1570,4 +1570,28 @@
     <string name="browser_no_app_for_link">Keine App zum Öffnen dieses Links verfügbar.</string>
     <string name="browser_could_not_open_link">Dieser Link konnte nicht geöffnet werden.</string>
     <string name="filepreview_pdf_render_failed_fallback">PDF konnte nicht gerendert werden</string>
+    <!-- [T-android-a11y-force-stop-recovery] + [T-android-restricted-settings] -->
+    <string name="system_permissions_a11y_restricted_header">Schalter ausgegraut? (\"Eingeschränkte Einstellungen\")</string>
+    <string name="system_permissions_a11y_restricted_footer">Android blockt den Bedienungshilfeschalter für Apps, die aus einer heruntergeladenen APK-Datei installiert wurden. Das ist eine Sicherheitsrichtlinie des Betriebssystems, kein Fehler von RikkaMinis — mit deiner Installation ist nichts verkehrt. Eingeschränkte Einstellungen zu erlauben hebt nur die Sperre des Schalters auf; es erteilt von allein keine Berechtigung, und du entscheidest weiterhin selbst, ob der Dienst aktiviert wird.</string>
+    <string name="system_permissions_a11y_restricted_shizuku">Eingeschränkte Einstellungen über Shizuku erlauben</string>
+    <string name="system_permissions_a11y_restricted_shizuku_sub">Ein Tipp — hebt das Flag, ohne RikkaMinis zu verlassen</string>
+    <string name="system_permissions_a11y_restricted_working">Wird erlaubt…</string>
+    <string name="system_permissions_a11y_restricted_failed">Fehler — bitte die manuellen Schritte unten nutzen</string>
+    <string name="system_permissions_a11y_restricted_manual">Eingeschränkte Einstellungen erlauben</string>
+    <string name="system_permissions_a11y_restricted_manual_sub">App-Info → ⋮-Menü (oben rechts) → Eingeschränkte Einstellungen erlauben</string>
+    <string name="a11y_repair_dialog_title">Bedienungshilfe deaktiviert</string>
+    <string name="a11y_repair_cancel">Jetzt nicht</string>
+    <string name="a11y_repair_dialog_message_shizuku">RikkaMinis hat seine Bedienungshilfeberechtigung verloren — das geschieht, wenn die App gestoppt wird. Shizuku steht bereit und kann sie sofort wiederherstellen, ohne die Einstellungen zu öffnen.</string>
+    <string name="a11y_repair_action_repair">Jetzt reparieren</string>
+    <string name="a11y_repair_dialog_message_manual">RikkaMinis hat seine Bedienungshilfeberechtigung verloren — das geschieht, wenn die App gestoppt wird. Aktiviere RikkaMinis erneut unter Einstellungen → Bedienungshilfe, um fortzufahren.</string>
+    <string name="a11y_repair_action_open_settings">Einstellungen öffnen</string>
+    <string name="a11y_repair_section_header">Erfordert Aufmerksamkeit</string>
+    <string name="a11y_repair_footer_shizuku">Android entfernt die Bedienungshilfeberechtigung jedes Mal, wenn eine App gestoppt wird, und stellt sie nicht automatisch wieder her. Shizuku kann sie direkt zurück schreiben.</string>
+    <string name="a11y_repair_footer_manual">Android entfernt die Bedienungshilfeberechtigung jedes Mal, wenn eine App gestoppt wird, und stellt sie nicht automatisch wieder her. Installiere und erteile Shizuku die Berechtigung, um es künftig per Tipp zu reparieren.</string>
+    <string name="a11y_repair_row_shizuku">Bedienungshilfeberechtigung reparieren</string>
+    <string name="a11y_repair_row_manual">Bedienungshilfe erneut aktivieren</string>
+    <string name="a11y_repair_in_progress">Wird repariert…</string>
+    <string name="a11y_repair_failed">Reparatur fehlgeschlagen — bitte in den Einstellungen aktivieren</string>
+    <string name="a11y_repair_row_sub">Die Berechtigung wurde entzogen, vermutlich durch einen App-Stop</string>
+
 </resources>
