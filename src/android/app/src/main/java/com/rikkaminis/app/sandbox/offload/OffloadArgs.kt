@@ -62,6 +62,14 @@ internal class OffloadArgs(argv: List<String>, booleanFlags: Set<String> = empty
     }
 
     fun hasFlag(vararg names: String): Boolean = names.any { it in flags }
+
+    /**
+     * Flag names present that are not in [known] — for handlers that want to
+     * refuse a typo'd option instead of silently ignoring it. Read-only: the
+     * output-shaping flags every command accepts are always excluded, so a
+     * caller lists only its own options.
+     */
+    fun unknownFlags(known: Set<String>): Set<String> = flags - known - OffloadOutput.OUTPUT_FLAGS
     fun get(vararg names: String): String? = names.firstNotNullOfOrNull { values[it] }
     fun getInt(vararg names: String): Int? = get(*names)?.toIntOrNull()
     fun getLong(vararg names: String): Long? = get(*names)?.toLongOrNull()
