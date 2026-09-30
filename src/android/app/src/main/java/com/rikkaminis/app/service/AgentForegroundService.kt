@@ -115,20 +115,45 @@ class AgentForegroundService : Service() {
     private var hasCompletionPending = false
     private var wasBusy = false
 
+    /**
+     * Safe mode means MinisApp.onCreate tripped over a crash burst and
+     * skipped its lateinit repository init — see the onCreate comment.
+     * Read through this one helper so the init-skip states stay in one
+     * place and the two guards below stay spelled identically.
+     */
+    private fun isSafeMode(): Boolean =
+        com.rikkaminis.app.crash.CrashFrequencyDetector.isSafeMode()
+
+    /**
+     * True when MinisApp.onCreate took the database-downgrade early return
+     * ([com.rikkaminis.app.data.db.DatabaseVersionGuard.Decision.SHOW_NEWER_DB_GUIDANCE]).
+     * Same init-skip shape as safe mode: every lateinit repository was never
+     * built, so nothing in this service may touch them. Read the same way
+     * MainActivity does.
+     */
+    private fun isDbGuidanceMode(): Boolean =
+        (applicationContext as? MinisApp)?.dbVersionDecision ==
+            com.rikkaminis.app.data.db.DatabaseVersionGuard.Decision.SHOW_NEWER_DB_GUIDANCE
+
     override fun onCreate() {
         super.onCreate()
-        // Safe-mode bail-out. When CrashFrequencyDetector tripped in
-        // MinisApp.onCreate, the Application skipped its lateinit init
-        // for repositories — but a sticky FG service that was running
-        // pre-crash will still be re-created by the system on the next
-        // process spawn. Reading MinisApp.backgroundSettingsRepository
+        // [T-android-downgrade-compat] MinisApp.onCreate can bail out before
+        // building the lateinit repositories in two states: safe mode (a
+        // crash burst tripped CrashFrequencyDetector) and database guidance
+        // (the on-disk schema is newer than this build). A sticky FG service
+        // that was running before that spawn is still recreated by the
+        // system, and reading MinisApp.backgroundSettingsRepository
         // from ToolOverlayController.<init> here would throw
-        // UninitializedPropertyAccessException and write a second crash
-        // log, which is exactly the "detection logic recursively
-        // crashing" pattern. Skip the overlay observer and let
-        // onStartCommand satisfy the FG-deadline + stopSelf.
-        if (com.rikkaminis.app.crash.CrashFrequencyDetector.isSafeMode()) {
-            Log.w(TAG, "safe-mode ON — skipping overlay/wake-lock bring-up")
+        // UninitializedPropertyAccessException — writing a second crash log
+        // from the very detection logic that meant to stop the crashing.
+        // Skip the overlay observer and let onStartCommand satisfy the
+        // FG-deadline + stopSelf.
+        if (isSafeMode() || isDbGuidanceMode()) {
+            Log.w(
+                TAG,
+                "app init was skipped (safeMode=${isSafeMode()}, dbGuidance=${isDbGuidanceMode()}) " +
+                    "— skipping overlay/wake-lock bring-up",
+            )
             createNotificationChannel()
             return
         }
@@ -149,7 +174,13 @@ class AgentForegroundService : Service() {
         // with a stub notification, then unwind. The crash share dialog
         // owns the UX from here; running a background service in this
         // state would re-trip the lateinit access that brought us down.
-        if (com.rikkaminis.app.crash.CrashFrequencyDetector.isSafeMode()) {
+        //
+        // The database-guidance skip is the same degraded-mode shape: the
+        // on-disk schema is newer than this build, MinisApp.onCreate bailed
+        // before building the repositories, so an OEM restart of this service
+        // would hit the same UninitializedPropertyAccessException. A sticky
+        // service can be recreated in either state, hence the shared stub.
+        if (isSafeMode() || isDbGuidanceMode()) {
             try {
                 val stub = androidx.core.app.NotificationCompat.Builder(this, CHANNEL_ID)
                     .setContentTitle("RikkaMinis")
