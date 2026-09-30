@@ -107,14 +107,23 @@ class ChatRepository(
 
     /**
      * [T-android-session-paused-badge-hardkill] The interrupted-tail predicate
-     * over a raw `parts_json` string, matching ChatViewModel.loadSession's
+     * over a raw `parts_json` string, matching ChatSessionLifecycle.loadSession's
      * AgentContentPart-based logic:
      *   - role USER + ALL parts are tool_result (tools ran, next model call never
      *     fired), OR the single synthetic "Continue" reminder text part, OR
+     *   - role USER + a plain text part with no reply after it at all (Case D,
+     *     GH#262/#263), OR
      *   - role ASSISTANT + any tool_use part (model asked for tools that never ran)
      * Part type discriminator is the JSON "type" field — the @SerialName values
      * from [com.rikkaminis.app.data.model.ContentPart]: "toolUse" / "toolResult"
      * / "text" (camelCase, NOT snake_case); text payload is the "value" field.
+     *
+     * Deliberately does NOT check `SessionActivityTracker.isActive`: that
+     * liveness gate is applied by the CALLER (`MinisApp` reconciles
+     * `interruptedSessionIds() - SessionActivityTracker.activeSessions.value`),
+     * which is the same split as loadSession (predicate = tail shape,
+     * liveness = call site). Folding it in here would silently re-flag every
+     * live session as paused.
      */
     private fun isInterruptedTail(role: String, partsJson: String): Boolean {
         val arr = runCatching { org.json.JSONArray(partsJson) }.getOrNull() ?: return false
@@ -129,7 +138,16 @@ class ChatRepository(
                     arr.optJSONObject(0)?.takeIf { it.optString("type") == "text" }
                         ?.optString("value")
                         ?.contains("The user stopped the previous response") == true
-                allToolResults || isContinueReminder
+                // Case D — plain user row, no reply after it (GH#262/#263).
+                // This MUST stay in sync with loadSession's Case D: this set is
+                // the INPUT to SessionBadgeStore.reconcileInterruptedSessions,
+                // which is a set-difference op — a session missing here loses
+                // its PAUSED badge on the next foreground transition even though
+                // the chat itself still offers Resume. An EMPTY tail is not
+                // recoverable (nothing to answer), matching loadSession.
+                val isUnansweredUserTurn = types.isNotEmpty() &&
+                    !allToolResults && !isContinueReminder
+                allToolResults || isContinueReminder || isUnansweredUserTurn
             }
             "ASSISTANT" -> types.any { it == "toolUse" }
             else -> false

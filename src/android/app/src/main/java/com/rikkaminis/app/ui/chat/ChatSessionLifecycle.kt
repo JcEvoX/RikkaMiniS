@@ -16,6 +16,7 @@ import com.rikkaminis.app.provider.LLMProvider
 import com.rikkaminis.app.sandbox.offload.ProviderExecutionGateway
 import com.rikkaminis.app.provider.ProviderFactory
 import com.rikkaminis.app.sandbox.ExecutionCoordinator
+import com.rikkaminis.app.service.SessionActivityTracker
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -1272,7 +1273,7 @@ internal fun ChatViewModel.loadSession() {
         }
 
         // Cold-start interrupt detection: an agent loop that was killed by
-        // the OS (or app force-quit) leaves agentHistory in one of three
+        // the OS (or app force-quit) leaves agentHistory in one of four
         // tell-tale shapes. Detecting any of them lets the user tap
         // Resume to pick up where the model left off — the in-memory
         // [_canResume] flag set by [handleUserCancelledCleanup] is lost
@@ -1285,6 +1286,8 @@ internal fun ChatViewModel.loadSession() {
         //   Case C: last entry is user with the synthetic "Continue"
         //           reminder text — text-cancel handler committed it
         //           but [resume] never re-entered the agent loop.
+        //   Case D: last entry is a PLAIN-TEXT user turn that never got a
+        //           reply at all — see below (GH#262/#263).
         //
         // [S5-resume-guard] Why this predicate deliberately does NOT also
         // check "was the last tool result known?" (audit finding §27c(2)):
@@ -1308,7 +1311,15 @@ internal fun ChatViewModel.loadSession() {
         // false premise — so adding a second check here would duplicate a
         // warning rather than supply a missing one.
         val lastEntry = agentHistory.lastOrNull()
-        if (lastEntry != null && !_isStreaming.value) {
+        // [T-android-orphan-user-tail GH#262/#263] `isActive` covers the case
+        // this VM cannot see: another VM (or the foreground service) is driving
+        // this very session, so `_isStreaming` is false HERE while a request is
+        // genuinely in flight THERE. Without it, Case D would light Resume on a
+        // turn that is merely still waiting. `activeSessionId` (not
+        // `sessionId`) because every tracker write uses it — a draft VM keeps
+        // its `__new__` key while the tracker holds the canonical id.
+        val trackerActive = SessionActivityTracker.isActive(activeSessionId)
+        if (lastEntry != null && !_isStreaming.value && !trackerActive) {
             val isInterrupted = when (lastEntry.role) {
                 LLMMessage.Role.USER -> {
                     val parts = lastEntry.contentParts
@@ -1317,7 +1328,40 @@ internal fun ChatViewModel.loadSession() {
                     val isContinueReminder = parts.size == 1 &&
                         (parts.first() as? AgentContentPart.Text)?.text
                             ?.contains("The user stopped the previous response") == true
-                    allToolResults || isContinueReminder
+                    // Case D — a user turn with NO reply after it at all.
+                    //
+                    // How it is produced: send() persists the user row BEFORE
+                    // the reply lands. If the process dies in between — Android
+                    // reclaiming a backgrounded app is the reported case — the
+                    // assistant side never reaches the store, and it cannot be
+                    // reconstructed later because persistAssistantTurn() drops
+                    // any row with no parts (the guard that stops us POSTing a
+                    // content-less assistant message back to the API). An in-app
+                    // first-turn network failure lands here too:
+                    // setInlineError() attaches the error to the last ASSISTANT
+                    // row and is a no-op when none exists, so that tail is
+                    // equally reply-less and equally stuck.
+                    //
+                    // Before this case such a tail reported canResume=false —
+                    // no PAUSED badge, no Resume banner, and retryLast()
+                    // bailing at rollbackIncompleteTurn() == null. The session
+                    // had NO recovery affordance and the user could only start a
+                    // new chat. [resume] needs no continue reminder for it: the
+                    // history already ends in the request itself, so
+                    // runAgentLoop() answers it as-is.
+                    //
+                    // Deliberately LAST: A and C describe a turn that was
+                    // mid-flight; D describes one that never started. Order
+                    // keeps their more specific semantics (and logging) intact
+                    // for tails that match both. An EMPTY user tail is NOT
+                    // recoverable — there is nothing to answer, and re-sending
+                    // it would post a content-less message the API rejects.
+                    when {
+                        allToolResults -> true
+                        isContinueReminder -> true
+                        parts.isEmpty() -> false
+                        else -> true
+                    }
                 }
                 LLMMessage.Role.ASSISTANT -> {
                     lastEntry.contentParts.any { it is AgentContentPart.ToolUse }
@@ -1326,7 +1370,19 @@ internal fun ChatViewModel.loadSession() {
             }
             if (isInterrupted) {
                 _canResume.value = true
-                Log.i(ChatViewModel.TAG, "loadSession: detected interrupted agent loop, canResume=true (lastRole=${lastEntry.role})")
+                // Name the shape, not just the role: Case D (reply-less user
+                // tail) is the one that used to be invisible, so a field log
+                // has to be able to tell it from A/B/C.
+                val shape = when {
+                    lastEntry.role == LLMMessage.Role.ASSISTANT -> "B/assistant-toolUse"
+                    lastEntry.contentParts.isNotEmpty() &&
+                        lastEntry.contentParts.all { it is AgentContentPart.ToolResult } -> "A/toolResult-tail"
+                    lastEntry.contentParts.size == 1 &&
+                        (lastEntry.contentParts.first() as? AgentContentPart.Text)?.text
+                            ?.contains("The user stopped the previous response") == true -> "C/continue-reminder"
+                    else -> "D/unanswered-user-turn"
+                }
+                Log.i(ChatViewModel.TAG, "loadSession: detected interrupted agent loop, canResume=true (lastRole=${lastEntry.role} shape=$shape)")
             }
         }
         } finally {
