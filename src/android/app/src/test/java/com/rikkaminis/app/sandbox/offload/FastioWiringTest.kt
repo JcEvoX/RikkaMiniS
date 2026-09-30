@@ -52,9 +52,32 @@ class FastioWiringTest {
                     "PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE)",
             ),
         )
+        // Phase 2: one row per write primitive — trusting deletion must not
+        // silently authorise overwriting a different file.
+        assertTrue(
+            "cp must have its own ASK_ONCE row",
+            permission.contains(
+                "ToolPermissionInfo(\"fastio_cp\", \"minis-fastio (copy)\", " +
+                    "PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE)",
+            ),
+        )
+        assertTrue(
+            "mv must have its own ASK_ONCE row",
+            permission.contains(
+                "ToolPermissionInfo(\"fastio_mv\", \"minis-fastio (move)\", " +
+                    "PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE)",
+            ),
+        )
         assertTrue(
             "the agent must be told the tool exists, or the handler is dead weight",
             prompt.contains("minis-fastio du <path>...") && prompt.contains("minis-fastio rm [-r] <path>..."),
+        )
+        assertTrue(
+            "the agent must be told about the phase-2 primitives too, or they are dead weight",
+            prompt.contains("minis-fastio find <path>") &&
+                prompt.contains("minis-fastio grep <pattern>") &&
+                prompt.contains("minis-fastio cp [-r] <src> <dst>") &&
+                prompt.contains("minis-fastio mv <src> <dst>"),
         )
     }
 
@@ -87,9 +110,9 @@ class FastioWiringTest {
             handler.contains("args.hasFlag(\"r\", \"recursive\", \"rf\", \"fr\", \"R\")"),
         )
         assertTrue(
-            "`--recursive` / `--force` must be declared boolean flags, or OffloadArgs " +
-                "eats the following path as the option's value",
-            handler.contains("booleanFlags = setOf(\"recursive\", \"force\")"),
+            "`--recursive` / `--force` / `--ignore-case` must be declared boolean flags, or " +
+                "OffloadArgs eats the following path as the option's value",
+            handler.contains("booleanFlags = setOf(\"recursive\", \"force\", \"ignore-case\")"),
         )
     }
 
@@ -110,6 +133,54 @@ class FastioWiringTest {
         )
     }
 
+    /**
+     * The write primitives must be gated, and the read-only ones must not.
+     * `du`/`find`/`grep` grant nothing `file_read` already has, so a prompt for
+     * them would be pure friction — the same rule phase 1 pinned for `du`.
+     */
+    private fun assertWriteGates(handler: String) {
+        val cpGate = handler.indexOf("OffloadGate.enforce(CP_TOOL_NAME")
+        val mvGate = handler.indexOf("OffloadGate.enforce(MV_TOOL_NAME")
+        val copyIdx = handler.indexOf("copyTree(srcPath, target, force, outcome)")
+        val moveIdx = handler.indexOf("moveTree(srcPath, target, outcome)")
+        assertTrue("cp must gate", cpGate >= 0)
+        assertTrue("mv must gate", mvGate >= 0)
+        assertTrue("the copy must run after cp's gate", copyIdx > cpGate)
+        assertTrue("the move must run after mv's gate", moveIdx > mvGate)
+        assertTrue("find is read-only and must not gate", !bodyOf(handler, "find").contains("OffloadGate"))
+        assertTrue("grep is read-only and must not gate", !bodyOf(handler, "grep").contains("OffloadGate"))
+    }
+
+    /**
+     * `find`-style single-dash long options must be rewritten before OffloadArgs
+     * sees them: the shared parser reads any `-word` as a short FLAG, so
+     * `find /usr -name "*.log"` would otherwise set a flag called `name` and
+     * pass the glob as a positional PATH — a silently wrong result.
+     */
+    private fun assertFindOptionSpelling(handler: String) {
+        assertTrue(
+            "`-name` / `-type` / `-limit` must be rewritten to the `--` spelling",
+            handler.contains("\"-name\", \"-type\", \"-limit\", \"-max-entries\", \"-ignore-case\","),
+        )
+        assertTrue(
+            "the rewrite must happen before OffloadArgs is constructed",
+            handler.indexOf("normalizeLongOptionSpelling(request.argv.drop(1))") <
+                handler.indexOf("booleanFlags = setOf("),
+        )
+    }
+
+    /** Source text of one private member function (up to the next one / section). */
+    private fun bodyOf(handler: String, funName: String): String {
+        val start = handler.indexOf("private fun $funName(")
+        assertTrue("$funName(...) must exist", start >= 0)
+        val candidates = listOf(
+            handler.indexOf("\n    private fun ", start + 1),
+            handler.indexOf("\n    // ──", start + 1),
+        ).filter { it > 0 }
+        val end = candidates.minOrNull() ?: handler.length
+        return handler.substring(start, end)
+    }
+
     // ── probes ──────────────────────────────────────────────────────────────
 
     @Test
@@ -123,11 +194,26 @@ class FastioWiringTest {
     }
 
     @Test
-    fun `the help text documents both primitives and the refusals`() {
+    fun `write primitives gate and read-only primitives never do`() {
+        assertWriteGates(source(handlerFile))
+    }
+
+    @Test
+    fun `find-style single-dash options are rewritten before parsing`() {
+        assertFindOptionSpelling(source(handlerFile))
+    }
+
+    @Test
+    fun `the help text documents every primitive, the dialect and the refusals`() {
         val handler = source(handlerFile)
         for (expected in listOf(
             "minis-fastio du <path>...",
+            "minis-fastio find <path> [opts]",
+            "minis-fastio grep <pattern> <path>...",
             "minis-fastio rm [-r] <path>...",
+            "minis-fastio cp [-r] <src> <dst>",
+            "minis-fastio mv <src> <dst>",
+            "java.util.regex",
             "user-mounted external folders",
             "bind-mount roots",
         )) {
@@ -234,6 +320,79 @@ class FastioWiringTest {
             failed = true
         }
         assertTrue("the session-id probe must fail once the export is gone", failed)
+    }
+
+    @Test
+    fun `negative control - dropping the cp permission row makes the wiring probe fail`() {
+        val original = source(permissionFile)
+        val mutated = original.replace(
+            "ToolPermissionInfo(\"fastio_cp\", \"minis-fastio (copy)\", " +
+                "PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE)",
+            "",
+        )
+        assertTrue("the cp row must exist to be removable", mutated != original)
+
+        var failed = false
+        try {
+            assertWired(source(catalogFile), source(appFile), mutated, source(promptFile))
+        } catch (_: AssertionError) {
+            failed = true
+        }
+        assertTrue("the wiring probe must fail without the cp permission row", failed)
+    }
+
+    @Test
+    fun `negative control - ungating cp makes the write-gate probe fail`() {
+        val original = source(handlerFile)
+        val mutated = original.replace(
+            "OffloadGate.enforce(CP_TOOL_NAME, CP_DISPLAY_NAME, args, request)?.let { return it }",
+            "",
+        )
+        assertTrue("the cp gate must exist to be removable", mutated != original)
+
+        var failed = false
+        try {
+            assertWriteGates(mutated)
+        } catch (_: AssertionError) {
+            failed = true
+        }
+        assertTrue("the write-gate probe must fail once cp is ungated", failed)
+    }
+
+    @Test
+    fun `negative control - gating find makes the write-gate probe fail`() {
+        val original = source(handlerFile)
+        val mutated = original.replace(
+            "    private fun find(",
+            "    private fun find(\n        @Suppress(\"UNUSED\") gated: Boolean = OffloadGate.allow(\"x\", \"x\"),",
+        )
+        assertTrue("find(...) must exist to be mutated", mutated != original)
+
+        var failed = false
+        try {
+            assertWriteGates(mutated)
+        } catch (_: AssertionError) {
+            failed = true
+        }
+        assertTrue("the write-gate probe must fail once find gates", failed)
+    }
+
+    @Test
+    fun `negative control - dropping the -name rewrite makes the option probe fail`() {
+        val original = source(handlerFile)
+        val mutated = original.replace(
+            "\"-name\", \"-type\", \"-limit\", \"-max-entries\", \"-ignore-case\",",
+            "\"-type\", \"-limit\", \"-max-entries\", \"-ignore-case\",",
+        )
+        assertTrue("the alias list must exist to be mutated", mutated != original)
+
+        var failed = false
+        try {
+            assertFindOptionSpelling(mutated)
+        } catch (_: AssertionError) {
+            failed = true
+        }
+        assertTrue("the option probe must fail once `-name` is no longer rewritten", failed)
     }
 
     // ── source location (same technique as DatabaseVersionGuardTest) ─────────

@@ -102,6 +102,12 @@ object OffloadPermissionManager {
         // must be seen by the user first. showInSettings stays true so the row
         // is visible and closable.
         ToolPermissionInfo("fastio_rm", "minis-fastio (delete)", PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE),
+        // [T-minis-fastio] phase 2 — cp/mv overwrite real host files, so each
+        // gets its OWN row: a user who trusts deletion has not thereby agreed
+        // to let the agent replace a different file. Same ASK_ONCE posture and
+        // same visibility as fastio_rm.
+        ToolPermissionInfo("fastio_cp", "minis-fastio (copy)", PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE),
+        ToolPermissionInfo("fastio_mv", "minis-fastio (move)", PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE),
     )
 
     /** Stable session-id used by NativeOffloadHandlers when calling
