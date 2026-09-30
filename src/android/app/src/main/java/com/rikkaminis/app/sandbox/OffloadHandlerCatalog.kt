@@ -49,6 +49,9 @@ object OffloadHandlerCatalog {
         "minis-config",
         "minis-browser-use",
         "minis-sessions-cli",
+        // [T-minis-fastio] file-intensive primitives executed by the host
+        // process on the real filesystem, bypassing the PRoot syscall tax.
+        "minis-fastio",
         "android-shizuku-cli",
         // "minis-debug" is DEBUG-only, appended below.
     )

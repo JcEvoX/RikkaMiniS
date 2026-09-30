@@ -723,8 +723,14 @@ object PRootKernel {
         return cmd
     }
 
-    /** Subdirs that live under `minis-sessions/<sessionId>/` rather than the global pool. */
-    private val perSessionSubdirs = setOf("attachments", "offloads", "workspace", "browser")
+    /**
+     * Subdirs that live under `minis-sessions/<sessionId>/` rather than the
+     * global pool. Shared with [GuestPathMapper], which rebuilds the proot
+     * `-b` table for offload handlers that touch the real filesystem — one
+     * source of truth, so the two can never disagree about which subdirs are
+     * session-scoped.
+     */
+    private val perSessionSubdirs: Set<String> = GuestPathMapper.PER_SESSION_SUBDIRS.toSet()
 
     /**
      * Join [tail] under [base] after normalizing dot-segments, and return null
@@ -1060,27 +1066,4 @@ object PRootKernel {
         tmpDir.mkdirs()
         return tmpDir
     }
-}
-
-/**
- * RFC-3986-style dot-segment normalization of a relative path tail.
- * Splits on '/', drops empty and `.` segments, pops the stack on `..`.
- * Returns null when a `..` would climb above the root (i.e. the relative
- * tail resolves outside its base), otherwise the normalized segment list.
- *
- * Top-level (not a member) so it can be unit-tested with zero Android deps.
- */
-internal fun normalizeDotSegments(tail: String): List<String>? {
-    val stack = mutableListOf<String>()
-    var climbsAboveBase = false
-    for (segment in tail.split('/')) {
-        when (segment) {
-            "", "." -> Unit
-            ".." -> {
-                if (stack.isEmpty()) climbsAboveBase = true else stack.removeAt(stack.size - 1)
-            }
-            else -> stack.add(segment)
-        }
-    }
-    return if (climbsAboveBase) null else stack
 }
