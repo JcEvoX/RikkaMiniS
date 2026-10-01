@@ -76,6 +76,12 @@ import java.util.regex.PatternSyntaxException
 class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler {
 
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
+        val rawArgv = request.argv.drop(1)
+        // The subcommand is the first token. `normalizeTarShorts` already
+        // depends on that convention (its own `firstOrNull() != "tar"` guard),
+        // so this predicate is deliberately the SAME expression — the expander
+        // and the flag set below can never drift apart.
+        val isTarCommand = rawArgv.firstOrNull() == "tar"
         val args = OffloadArgs(
             // `find`-style single-dash long options (`-name`, `-type`, `-limit`)
             // are rewritten to their `--` spelling first: OffloadArgs reads any
@@ -83,17 +89,29 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
             // otherwise parse `-name` as a flag and `*.log` as a positional
             // path. Rewriting here leaves the parser shared by all ~46 handlers
             // untouched.
-            normalizeLongOptionSpelling(normalizeTarShorts(request.argv.drop(1))),
+            normalizeLongOptionSpelling(normalizeTarShorts(rawArgv)),
             // `--recursive` / `--force` / `--ignore-case` are booleans, not
             // `--key value` pairs. Without this declaration OffloadArgs consumes
             // the NEXT token as the option's value, so `rm --recursive /tmp/x`
             // lost the path and reported "missing <path>" instead of deleting
             // anything.
-            booleanFlags = setOf(
-                "recursive", "force", "ignore-case",
-                // tar verbs: `--create`/`--gzip`/... are modes, never `--key value`.
-                "create", "extract", "gzip", "verbose",
-            ),
+            //
+            // The tar verbs (`--create`/`--extract`/`--gzip`/`--verbose`) are
+            // modes too, but they are declared ONLY for `tar`. The parser turns
+            // any UNKNOWN `--key` into a `--key value` pair, so declaring them
+            // for every subcommand made `du --create btree` treat `--create` as
+            // a flag and silently walk `btree` (exit 0), where the intended
+            // behaviour is the parser's own "missing <path>" (exit 2). Scope —
+            // not acceptance — is the contract.
+            booleanFlags = if (isTarCommand) {
+                setOf(
+                    "recursive", "force", "ignore-case",
+                    // tar verbs: `--create`/`--gzip`/... are modes, never `--key value`.
+                    "create", "extract", "gzip", "verbose",
+                )
+            } else {
+                setOf("recursive", "force", "ignore-case")
+            },
         )
         if (args.hasFlag("h", "help")) return NativeOffloadResult(0, HELP)
 

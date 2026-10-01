@@ -114,7 +114,9 @@ object FileEditTool {
                 content.replaceFirst(oldString, newString)
             }
 
-            file.writeText(newContent)
+            // §30: atomic replace — writeText truncates in place, so a SIGKILL
+            // mid-write left a torn file behind (SIGKILL runs no `finally`).
+            AtomicFileWrite.write(file, newContent)
             val replacements = if (replaceAll) count else 1
             ToolExecutionResult(
                 "Edited $path ($replacements replacement(s), ${newContent.length} bytes)",

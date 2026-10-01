@@ -228,10 +228,12 @@ object SessionActivityTracker {
      * T50: per-session stream-cancel callbacks. Each ChatViewModel
      * registers its own [com.rikkaminis.app.ui.chat.ChatViewModel.cancelStream]
      * here when [setActive] is called and unregisters in [setInactive].
-     * The foreground service's notification "Stop" action calls
-     * [cancelAllActiveStreams] which iterates this map — without it the
-     * notification can only kill itself, leaving streamJobs running until
-     * the OS reclaims the process. Guarded by its own
+     *
+     * No consumer since `c409e694` removed the foreground service's
+     * notification "Stop" action — the registration side is deliberately
+     * kept as the wiring point should a stop affordance return, so a future
+     * audit should read this as a declared resume point, not as forgotten
+     * dead state. Guarded by its own
      * `synchronized(streamCancellers)` block (independent of the lock-free
      * `_activeSessions` StateFlow); the canceller is registered under that
      * lock before [setActive] returns, so a caller never observes a session
@@ -476,29 +478,6 @@ object SessionActivityTracker {
             stopService()
         } else {
             updateService()
-        }
-    }
-
-    /**
-     * Invoke every registered stream-cancel callback. Called by
-     * [AgentForegroundService] when the user taps the notification's
-     * Stop action. Each VM's cancelStream() is responsible for ending
-     * its streamJob + flipping canResume true (T13) so the user can
-     * tap Resume later.
-     *
-     * Snapshot the map before iterating — the cancellers themselves
-     * call back into [setInactive] which mutates [streamCancellers],
-     * so iterating the live map would ConcurrentModificationException.
-     */
-    fun cancelAllActiveStreams() {
-        val snapshot = synchronized(streamCancellers) { streamCancellers.values.toList() }
-        Log.d(TAG, "cancelAllActiveStreams: dispatching to ${snapshot.size} session(s)")
-        for (cancel in snapshot) {
-            try {
-                cancel()
-            } catch (e: Exception) {
-                Log.w(TAG, "stream canceller threw: ${e.message}")
-            }
         }
     }
 

@@ -127,7 +127,9 @@ object FileWriteTool {
             if (append) {
                 file.appendText(effectiveContent)
             } else {
-                file.writeText(effectiveContent)
+                // §30: a SIGKILL inside writeText's truncate-then-write window
+                // left a half-written file (no `finally` can run on SIGKILL).
+                AtomicFileWrite.write(file, effectiveContent)
             }
 
             val bytes = file.length()
