@@ -1,5 +1,6 @@
 package com.rikkaminis.app.ui.chat
 
+import android.os.SystemClock
 import android.util.Log
 import com.rikkaminis.app.conversation.ContextCompactor
 import com.rikkaminis.app.data.AgentRuntimeLimitsPrefs
@@ -34,6 +35,7 @@ import com.rikkaminis.app.tools.AgentTraceRecorder
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 // [FE-5 batch 5] Session lifecycle & compaction cluster extracted verbatim
 // from ChatViewModel as extension functions: session load/restore, context
@@ -877,44 +879,81 @@ internal suspend fun ChatViewModel.generateCompactSummary(conversationText: Stri
             thinkingLevel = ThinkingLevel.OFF,
         )
     }
-    return when (val r = sendVia(provider)) {
-        is ProviderExecutionGateway.SendResult.Success -> r.response.text
-        is ProviderExecutionGateway.SendResult.RemoteFailure,
-        is ProviderExecutionGateway.SendResult.Unavailable -> {
-            val fallbacks = buildFallbackProviders(provider)
+    // [fix/compact-quiet-first-1001] Ordering: quiet-capable members first —
+    // measured 2026-10-01 14:09 (error-snapshot-141020): the summary ask went
+    // to the ACTIVE member with ThinkingLevel.OFF; the relay model has no
+    // wire way to express OFF (declaresNoEffortTiers) and thought for 71s
+    // producing ZERO content until the gateway RST the stream. The whole
+    // compact then burned 82s per halving round with the user's chat queue
+    // behind it. A summary does not need the active member's persona, so
+    // members that cannot silence thinking go LAST; every attempt gets a
+    // 30s wall budget and the whole chain a 120s deadline (rationale on the
+    // ChatViewModel companion constants). withTimeoutOrNull swallows ONLY
+    // its own TimeoutCancellationException — a user cancel still propagates
+    // (termination path unchanged) — and an exhausted chain throws
+    // lastFailure exactly as before, so the splitter's halving retry is
+    // untouched. See ordersCompactionCandidates for the ordering logic.
+    val chain = ordersCompactionCandidates(provider, buildFallbackProviders(provider))
+    val deadlineAt = SystemClock.elapsedRealtime() + ChatViewModel.COMPACT_SUMMARY_TOTAL_BUDGET_MS
+    var lastFailure: Exception = IllegalStateException("compaction failed")
+    for ((index, step) in chain.withIndex()) {
+        val (candidate, entryId) = step
+        val budgetMs = minOf(
+            ChatViewModel.COMPACT_SUMMARY_CANDIDATE_BUDGET_MS,
+            deadlineAt - SystemClock.elapsedRealtime(),
+        )
+        if (budgetMs <= 0) {
+            lastFailure = IllegalStateException(
+                "compaction exceeded the ${ChatViewModel.COMPACT_SUMMARY_TOTAL_BUDGET_MS}ms chain budget",
+            )
             AppLogger.info(
                 ChatViewModel.TAG,
-                "[Compact] summary failed on active member ($r) — trying ${fallbacks.size} fallback candidate(s)",
+                "[Compact] summary chain budget exhausted — skipping candidate ${index + 1}/${chain.size}",
             )
-            var lastFailure: Exception = IllegalStateException("compaction failed")
-            for (candidate in fallbacks) {
-                when (val fr = sendVia(candidate.provider)) {
-                    is ProviderExecutionGateway.SendResult.Success -> {
-                        AppLogger.info(
-                            ChatViewModel.TAG,
-                            "[Compact] summary fallback SUCCESS entry=${candidate.entryId} " +
-                                "model=${candidate.provider.model.displayName}",
-                        )
-                        return fr.response.text
-                    }
-                    else -> {
-                        AppLogger.info(
-                            ChatViewModel.TAG,
-                            "[Compact] summary fallback failed entry=${candidate.entryId}: $fr",
-                        )
-                        lastFailure = when (fr) {
-                            is ProviderExecutionGateway.SendResult.RemoteFailure ->
-                                IllegalStateException("compaction failed (${fr.code}): ${fr.message}")
-                            is ProviderExecutionGateway.SendResult.Unavailable ->
-                                IllegalStateException("compaction unavailable: ${fr.reason}")
-                            else -> lastFailure
-                        }
-                    }
-                }
+            break
+        }
+        val started = SystemClock.elapsedRealtime()
+        val r = withTimeoutOrNull(budgetMs) { sendVia(candidate) }
+        val ms = SystemClock.elapsedRealtime() - started
+        val label = if (entryId != null) "entry=$entryId" else "active"
+        if (r == null) {
+            AppLogger.info(
+                ChatViewModel.TAG,
+                "[Compact] summary TIMEOUT after ${ms}ms (budget ${budgetMs}ms) " +
+                    "candidate=${index + 1}/${chain.size} ($label ${candidate.model.displayName})",
+            )
+            lastFailure = IllegalStateException(
+                "compaction summary timed out after ${budgetMs}ms on ${candidate.model.displayName}",
+            )
+            continue
+        }
+        when (r) {
+            is ProviderExecutionGateway.SendResult.Success -> {
+                AppLogger.info(
+                    ChatViewModel.TAG,
+                    "[Compact] summary ${if (entryId != null) "fallback " else ""}SUCCESS " +
+                        "candidate=${index + 1}/${chain.size} ($label ${candidate.model.displayName}) in ${ms}ms",
+                )
+                return r.response.text
             }
-            throw lastFailure
+            is ProviderExecutionGateway.SendResult.RemoteFailure -> {
+                AppLogger.info(
+                    ChatViewModel.TAG,
+                    "[Compact] summary failed on ${if (entryId != null) "fallback $label" else "active member"} " +
+                        "(${r.code}: ${r.message}) — trying next of ${chain.size - index - 1} candidate(s)",
+                )
+                lastFailure = IllegalStateException("compaction failed (${r.code}): ${r.message}")
+            }
+            is ProviderExecutionGateway.SendResult.Unavailable -> {
+                AppLogger.info(
+                    ChatViewModel.TAG,
+                    "[Compact] summary unavailable on $label (${r.reason}) — trying next of ${chain.size - index - 1} candidate(s)",
+                )
+                lastFailure = IllegalStateException("compaction unavailable: ${r.reason}")
+            }
         }
     }
+    throw lastFailure
 }
 
 internal fun ChatViewModel.loadSession() {
