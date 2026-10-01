@@ -194,10 +194,11 @@ class FastioWiringTest {
             "`-name` / `-type` / `-limit` must be rewritten to the `--` spelling",
             handler.contains("\"-name\", \"-type\", \"-limit\", \"-max-entries\", \"-ignore-case\","),
         )
+        val construct = handler.indexOf("val args = OffloadArgs(")
+        val rewrite = handler.indexOf("normalizeLongOptionSpelling(normalizeTarShorts(rawArgv))")
         assertTrue(
-            "the rewrite must happen before OffloadArgs is constructed",
-            handler.indexOf("normalizeLongOptionSpelling(request.argv.drop(1))") <
-                handler.indexOf("booleanFlags = setOf("),
+            "the rewrite must be an argument of the OffloadArgs construction",
+            construct >= 0 && construct < rewrite,
         )
     }
 
@@ -217,15 +218,28 @@ class FastioWiringTest {
             "it must be scoped to the tar subcommand, or `rm -rf` loses its meaning",
             handler.contains("if (argv.firstOrNull() != \"tar\") return argv"),
         )
+        val expander = handler.indexOf("normalizeLongOptionSpelling(normalizeTarShorts(rawArgv))")
         assertTrue(
-            "it must run before OffloadArgs is constructed",
-            handler.indexOf("normalizeTarShorts(request.argv.drop(1))") <
-                handler.indexOf("booleanFlags = setOf("),
+            "the expander must be an argument of the OffloadArgs construction",
+            handler.indexOf("val args = OffloadArgs(") < expander,
         )
         assertTrue(
             "`--create` / `--gzip` / `--verbose` must be boolean, or they eat the next token " +
                 "(the archive path)",
             handler.contains("\"create\", \"extract\", \"gzip\", \"verbose\","),
+        )
+        assertTrue(
+            "the tar verbs must stay SCOPED to `tar`: declared for every subcommand they made " +
+                "`du --create btree` treat `--create` as a flag and walk `btree` (exit 0), where the " +
+                "intended behaviour is the parser's own \"missing <path>\" (exit 2)",
+            handler.contains("val isTarCommand = rawArgv.firstOrNull() == \"tar\"") &&
+                handler.substringAfter("booleanFlags = if (isTarCommand) {")
+                    .substringAfter("} else {")
+                    .substringBefore("}")
+                    .let { branch ->
+                        !branch.contains("create") && !branch.contains("extract") &&
+                            !branch.contains("gzip") && !branch.contains("verbose")
+                    },
         )
         assertTrue(
             "`tar -f` must NOT be mapped to `--file`: its value has to stay a positional, " +
