@@ -1,7 +1,7 @@
 package com.rikkaminis.app.ui.chat
 
 import com.rikkaminis.app.data.model.LLMModel
-import com.rikkaminis.app.data.model.LLMProvider
+import com.rikkaminis.app.provider.LLMProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -146,13 +146,22 @@ class CompactQuietFirstTest {
         assertTrue(atBudgetCall < atThrow)
     }
 
-    private fun readRepoFile(relative: String): String =
-        java.io.File(System.getProperty("user.dir"), relative)
-            .let { if (it.exists()) it else java.io.File("${it.parent}/$relative") }
-            .readText()
-
-    private fun assertTrue(message: String, condition: Boolean) =
-        org.junit.Assert.assertTrue(message, condition)
+    /**
+     * Walk up from the test working directory to the repo root containing
+     * [relative]. Gradle sets user.dir to the module dir (`.../src/android/app`),
+     * so a single-level parent lookup is not enough — CI caught this shape.
+     */
+    private fun readRepoFile(relative: String): String {
+        var dir: java.io.File? = java.io.File(System.getProperty("user.dir"))
+        while (dir != null) {
+            val f = java.io.File(dir, relative)
+            if (f.exists()) return f.readText()
+            dir = dir.parentFile
+        }
+        throw java.io.FileNotFoundException(
+            "$relative not found from user.dir=${System.getProperty("user.dir")}",
+        )
+    }
 }
 
 /** Minimal LLMProvider carrying only what the ordering reads. */
