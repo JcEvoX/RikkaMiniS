@@ -395,3 +395,42 @@ internal fun ChatViewModel.unavailableGroupMembers(): List<String> {
     }
     return result
 }
+
+/**
+ * [fix/compact-quiet-first-1001] Ordered attempt chain for the compaction
+ * summary — `(provider, fallbackEntryId?)` pairs, a null entryId marks the
+ * active member. Pure ordering; budgets live at the call site
+ * (generateCompactSummary). Top-level (not a ChatViewModel extension) so JVM
+ * unit tests call it without instantiating the VM; the companion const it
+ * reads is compile-time inlined and loads no Android classes.
+ *
+ * Why: measured 2026-10-01 14:09 (error-snapshot-141020) — the summary call
+ * went out with ThinkingLevel.OFF, but the active member's model declares no
+ * effort tiers, so OFF has no wire expression and the server kept thinking:
+ * 71s of reasoning-only (3476 events, 10486 reasoning chars, ZERO content)
+ * until the gateway reset the stream (`stream was reset: CANCEL`); the first
+ * fallback then succeeded in 11s. A summary does not need the active member's
+ * persona — the fallback chain already admits swapping models — so a member
+ * known to be un-silenceable goes LAST, not first.
+ *
+ * Partition key is `declaresNoEffortTiers != true`: null (catalog never said)
+ * counts as quiet — demotion requires positive evidence, absence of evidence
+ * keeps today's behavior (the per-attempt budget still bounds it). Stable
+ * within each partition: router order (cheapest-first, cooling/dead filtered)
+ * survives; among noisy members the active one still leads.
+ *
+ * ponytail: quiet 判据只认 declaresNoEffortTiers 一个 catalog 字段 | 天花板:
+ * models.dev 漏标“实际关不掉思考”的模型不会被排后(仍被每候选 30s 预算兜住) |
+ * 升级触发: 同一未标成员在日志里反复 TIMEOUT → 加本地覆盖名单
+ */
+internal fun ordersCompactionCandidates(
+    active: LLMProvider,
+    fallbacks: List<FallbackCandidate>,
+): List<Pair<LLMProvider, String?>> {
+    val all: List<Pair<LLMProvider, String?>> =
+        listOf(active to null) + fallbacks.map { it.provider to it.entryId }
+    val (quiet, noisy) = all.partition { (provider, _) ->
+        provider.model.declaresNoEffortTiers != true
+    }
+    return (quiet + noisy).take(1 + ChatViewModel.COMPACT_SUMMARY_FALLBACK_LIMIT)
+}

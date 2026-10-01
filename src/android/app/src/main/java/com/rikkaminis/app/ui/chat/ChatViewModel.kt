@@ -342,6 +342,34 @@ class ChatViewModel(
          * the summary's distilled form. Mirrors iOS `compactKeepRecentUserTurns`.
          */
         internal const val COMPACT_KEEP_RECENT_USER_TURNS = 3
+
+        // [fix/compact-quiet-first-1001] Compaction-summary latency caps.
+        // Measured 2026-10-01 (error-snapshot-141020): the summary call on a
+        // thinking model the relay cannot silence (GLM-5.3-Flash @ tierflow,
+        // declaresNoEffortTiers=true → ThinkingLevel.OFF never reaches the
+        // server) streamed reasoning-only for 71s — 3476 SSE events, 10486
+        // reasoning chars, ZERO content chars — until the gateway reset the
+        // stream. The compact chain then burned ~82s total per round (71s
+        // doomed attempt + 11s fallback) and, with a fallback chain of 7
+        // candidates, the halving retry loop could stall a chat for minutes.
+        // Three caps, each with a measured basis:
+        //  · per-candidate wall budget: 30s — ~4× the observed quiet-success
+        //    latency (11s), stays below the ~70s gateway RST so the client
+        //    cuts before the relay does;
+        //  · fallback-chain length: a slow relay must not multiply by the
+        //    whole group — 3 candidates × 30s ≈ 90s is already long for a
+        //    background task a user cannot even see running;
+        //  · whole-operation deadline: hard stop so compaction can fail
+        //    (chat proceeds) instead of holding the send queue hostage.
+        // ponytail: budgets are latency-floor observations from one incident
+        // log set | 天花板: a genuinely slow-but-working relay member (legit
+        // 35s summary) gets cut and demoted to last-resort | 升级触发: compact
+        // failures reported on members that succeed within 30-60s → raise
+        // COMPACT_SUMMARY_CANDIDATE_BUDGET_MS or make it adaptive.
+        internal const val COMPACT_SUMMARY_CANDIDATE_BUDGET_MS = 30_000L
+        internal const val COMPACT_SUMMARY_FALLBACK_LIMIT = 3
+        internal const val COMPACT_SUMMARY_TOTAL_BUDGET_MS = 120_000L
+
         /// [T-context-limit-enforce] Minimum number of newest complete turns the
         /// hard-cap trim preserves. Smaller = more aggressive trimming (cheaper),
         /// larger = safer for the current task's context. Chosen to mirror the
