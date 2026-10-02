@@ -251,6 +251,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.outlined.Public
+import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.filled.SkipNext
 import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.automirrored.filled.NoteAdd
@@ -335,18 +336,32 @@ internal fun ChatInputArea(
     // values, so callers that don't pass them behave byte-identically.
     inputMaxLines: Int = ChatTuningPrefs.INPUT_MAX_LINES_DEFAULT,
     sendSwipeThresholdDp: Int = ChatTuningPrefs.SEND_SWIPE_THRESHOLD_DEFAULT,
+    // [feat/quick-messages] 快捷消息面板里的「管理」入口 — 跳到设置页的快捷消息管理。
+    // 默认 no-op，避免调用方未接线时按钮变成死控件（按钮本身也只在有数据时出现）。
+    onOpenQuickMessages: () -> Unit = {},
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val inputText by viewModel.inputText.collectAsState()
     val attachments by viewModel.attachments.collectAsState()
     var showMoveSheet by remember { mutableStateOf(false) }
     var showAttachMenu by remember { mutableStateOf(false) }
+    // [feat/quick-messages] 快捷消息模板库（全局单人格，无助手订阅）。store 挂在
+    // MinisApp 上，这里只订阅它的 StateFlow；app 为空（预览/测试宿主）时退化为空列表，
+    // 按钮不渲染。
+    val quickMessagesStore = remember(context) {
+        (context.applicationContext as? com.rikkaminis.app.MinisApp)?.quickMessagesStore
+    }
+    val emptyQuickMessages = remember { kotlinx.coroutines.flow.MutableStateFlow(emptyList<com.rikkaminis.app.data.QuickMessage>()) }
+    val quickMessages by (quickMessagesStore?.messages ?: emptyQuickMessages).collectAsState()
+    var showQuickMessages by remember { mutableStateOf(false) }
     // [fix/ime-overlay-focus-coverage] MoveToSessionSheet owns its own window
     // (ModalBottomSheet) and restores focus to the composer on dismiss — the same
     // IME pop-back loop ChatScreen guards for its overlays. Shared implementation
     // (ImeOverlayGuard.kt) so the two hosts don't drift; this flag is local to
     // ChatInputArea, so the guard is invoked here rather than in ChatScreen.
     DismissImeWhileOverlayOpen(showMoveSheet)
+    // [feat/quick-messages] Same IME pop-back guard for the quick-message sheet.
+    DismissImeWhileOverlayOpen(showQuickMessages)
     // Mirrors `inputText` for the BasicTextField but tracks selection so we
     // can position the cursor (e.g. AFTER the leading "/" when the slash
     // button inserts it) — a plain String overload would reset cursor to 0
@@ -1732,6 +1747,21 @@ internal fun ChatInputArea(
                             }
                         }
                     }
+                    // [feat/quick-messages] 快捷消息：一键把预置模板填进输入框（不直接发送，
+                    // 用户仍可补充上下文）。只在库里有内容时渲染，避免死控件；空库时入口在
+                    // 设置页，面板里的「管理」也能过去。
+                    if (quickMessages.isNotEmpty()) {
+                        InputCircleButton(onClick = { showQuickMessages = true }) {
+                            Icon(
+                                Icons.Outlined.Bolt,
+                                contentDescription = stringResource(R.string.quick_messages_title),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(20.dp),
+                            )
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                    }
+
                     // Solo attach key → direct button (no "+" menu).
                     val soloAttachKey = attachKeys.singleOrNull()
                     if (attachKeys.isNotEmpty()) {
@@ -1911,6 +1941,29 @@ internal fun ChatInputArea(
                     viewModel.clearShareInjectedFlag()
                     showMoveSheet = false
                     onMoveToSession(targetId)
+                },
+            )
+        }
+
+        // [feat/quick-messages] 快捷消息面板：点一条把正文追加进输入框并聚焦，
+        // 不直接发送 —— 和 XuanXing 原版 appendText 语义一致（原版也是追加）。
+        if (showQuickMessages) {
+            QuickMessagesSheet(
+                messages = quickMessages,
+                onDismiss = { showQuickMessages = false },
+                onPick = { message ->
+                    showQuickMessages = false
+                    val merged = if (inputText.isBlank()) {
+                        message.content
+                    } else {
+                        inputText.trimEnd() + "\n" + message.content
+                    }
+                    viewModel.setInputText(merged, caretOverride = merged.length)
+                    inputFocusRequester.requestFocus()
+                },
+                onManage = {
+                    showQuickMessages = false
+                    onOpenQuickMessages()
                 },
             )
         }

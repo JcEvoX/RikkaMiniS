@@ -156,6 +156,8 @@ object Routes {
     const val RUNTIME_LIMITS = "runtime_limits"
     /** [feat/advanced-features] 玄星二开「高级功能」页（默认关闭的主动行为开关）。 */
     const val ADVANCED_FEATURES = "advanced_features"
+    /** [feat/quick-messages] 玄星二开「快捷消息」模板库管理页。 */
+    const val QUICK_MESSAGES = "quick_messages"
     /** [feat/chat-tuning-panel] Chat Tuning page (reading / scrolling / composer knobs). */
     const val CHAT_TUNING = "chat_tuning"
     const val SKILLS = "skills"
@@ -659,6 +661,7 @@ fun AppNavigation(
                 onEnvVarsClick = { navController.safeNavigate(Routes.ENV_VARS) },
                 onRuntimeLimitsClick = { navController.safeNavigate(Routes.RUNTIME_LIMITS) },
                 onAdvancedFeaturesClick = { navController.safeNavigate(Routes.ADVANCED_FEATURES) },
+                onQuickMessagesClick = { navController.safeNavigate(Routes.QUICK_MESSAGES) },
                 onSkillsClick = { navController.safeNavigate(Routes.SKILLS) },
                 onMemoryClick = { navController.safeNavigate(Routes.MEMORY) },
                 onMcpClick = { navController.safeNavigate(Routes.MCP) },
@@ -1093,6 +1096,12 @@ fun AppNavigation(
         }
         composable(Routes.ADVANCED_FEATURES) {
             com.rikkaminis.app.ui.settings.AdvancedFeaturesScreen(
+                onBack = { navController.safePopBackStack() },
+            )
+        }
+        composable(Routes.QUICK_MESSAGES) {
+            com.rikkaminis.app.ui.settings.QuickMessagesScreen(
+                store = (context.applicationContext as com.rikkaminis.app.MinisApp).quickMessagesStore,
                 onBack = { navController.safePopBackStack() },
             )
         }

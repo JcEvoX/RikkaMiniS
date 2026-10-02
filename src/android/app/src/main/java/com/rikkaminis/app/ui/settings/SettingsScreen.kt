@@ -72,6 +72,8 @@ fun SettingsScreen(
     onRuntimeLimitsClick: () -> Unit = {},
     // [feat/advanced-features] 玄星二开「高级功能」页（默认关闭的主动行为开关，如持续工作）。
     onAdvancedFeaturesClick: () -> Unit = {},
+    // [feat/quick-messages] 玄星二开「快捷消息」模板库（全局单人格，无助手订阅）。
+    onQuickMessagesClick: () -> Unit = {},
     onSkillsClick: () -> Unit = {},
     onMemoryClick: () -> Unit = {},
     // [T-mcp-integration-android] MCP Integrations page, listed directly below
@@ -178,6 +180,15 @@ fun SettingsScreen(
                     title = stringResource(R.string.settings_skills),
                     subtitle = stringResource(R.string.settings_skills_subtitle),
                     onClick = onSkillsClick,
+                )
+                // [feat/quick-messages] 快捷消息模板库：与技能/MCP 并列的"提示词资产"，
+                // 会话输入框可取用（一键填入）。
+                SettingsItem(
+                    icon = Icons.Outlined.Bolt,
+                    iconColor = Color(0xFFFF9500),
+                    title = stringResource(R.string.quick_messages_entry),
+                    subtitle = stringResource(R.string.quick_messages_entry_subtitle),
+                    onClick = onQuickMessagesClick,
                 )
                 // [T-soul-md] insertion between Skills and Memory per spec.
                 SettingsItem(

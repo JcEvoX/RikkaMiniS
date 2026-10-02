@@ -1664,4 +1664,25 @@
     <string name="newer_db_body">当前安装的 RikkaMinis 比生成这些数据的版本旧，无法安全打开数据库。\n\n没有删除任何内容——你的会话仍完整保存在这台设备上。重新安装较新的 RikkaMinis 版本，数据就会回来。</string>
     <string name="newer_db_versions">此版本支持数据格式 %1$d</string>
     <string name="newer_db_exit">关闭</string>
+
+    <!-- 快捷消息：可一键填入输入框的提示词模板 -->
+    <string name="quick_messages_entry">快捷消息</string>
+    <string name="quick_messages_entry_subtitle">可一键填入输入框的常用提示词模板</string>
+    <string name="quick_messages_title">快捷消息</string>
+    <string name="quick_messages_new">新建快捷消息</string>
+    <string name="quick_messages_edit">编辑快捷消息</string>
+    <string name="quick_messages_delete_title">删除快捷消息</string>
+    <string name="quick_messages_delete_message">确定删除“%1$s”？此操作无法撤销。</string>
+    <string name="quick_messages_untitled">未命名</string>
+    <string name="quick_messages_empty_title">还没有快捷消息</string>
+    <string name="quick_messages_empty_hint">点击 + 添加一个常用提示词模板。</string>
+    <string name="quick_messages_empty_content">（空）</string>
+    <string name="quick_messages_more_actions">更多操作</string>
+    <string name="quick_messages_field_title">标题</string>
+    <string name="quick_messages_field_content">内容</string>
+    <string name="quick_messages_field_content_hint">填入输入框的提示词内容。</string>
+    <string name="quick_messages_sheet_title">快捷消息</string>
+    <string name="quick_messages_manage">管理</string>
+    <string name="quick_messages_sheet_empty">还没有快捷消息</string>
+    <string name="quick_messages_sheet_empty_hint">可在「设置 → 快捷消息」中添加模板。</string>
 </resources>

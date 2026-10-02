@@ -23,6 +23,7 @@ import com.rikkaminis.app.ui.chat.KatexWebViewPool
 import com.rikkaminis.app.ui.chat.clearMarkdownParseCachesForMemoryPressure
 import com.rikkaminis.app.data.repository.EnvVarRepository
 import com.rikkaminis.app.data.MountedFoldersStore
+import com.rikkaminis.app.data.QuickMessagesStore
 import com.rikkaminis.app.data.repository.MemoryRepository
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.data.repository.WebAppShortcutRepository
@@ -113,6 +114,9 @@ class MinisApp : Application(), ImageLoaderFactory {
     lateinit var backgroundTaskNotifier: BackgroundTaskNotifier
         private set
     lateinit var mountedFoldersStore: MountedFoldersStore
+        private set
+    // [feat/quick-messages] 玄星二开「快捷消息」模板库（全局，单人格架构下无需按助手订阅）。
+    lateinit var quickMessagesStore: QuickMessagesStore
         private set
 
     /**
@@ -538,6 +542,8 @@ class MinisApp : Application(), ImageLoaderFactory {
         // (cloud providers, unmounted SD card) are silently skipped by
         // bindMountSpecs.
         mountedFoldersStore = MountedFoldersStore(this)
+        // [feat/quick-messages] 快捷消息模板库：纯本地文件，无外部依赖，启动时读一次即可。
+        quickMessagesStore = QuickMessagesStore(this)
         // T219-5: hand the singleton to PRootKernel so applyMountedFoldersSnapshot
         // can read the live state, and wire an onChange callback so any UI CRUD
         // (add/remove/rename/toggle) re-applies the snapshot.

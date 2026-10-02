@@ -1642,4 +1642,24 @@
     <string name="reverse_workbench_open">%1$s 열기</string>
     <string name="reverse_workbench_install">%1$s 받기</string>
     <string name="reverse_workbench_hint">안내: 활성화한 뒤 해당 앱에서 서비스를 시작하세요——MT 관리자는 사이드바에서 APK MCP를 켜고 백그라운드로 유지, SOMCP는 홈 화면의 큰 시작 버튼을 누르세요(포트 8000). 모두 127.0.0.1에서만 수신하며 로컬 전용입니다.</string>
+<!-- 빠른 메시지: 입력창에 삽입하는 프롬프트 템플릿 -->
+    <string name="quick_messages_entry">빠른 메시지</string>
+    <string name="quick_messages_entry_subtitle">입력창에 바로 넣을 수 있는 프롬프트 템플릿</string>
+    <string name="quick_messages_title">빠른 메시지</string>
+    <string name="quick_messages_new">새 빠른 메시지</string>
+    <string name="quick_messages_edit">빠른 메시지 편집</string>
+    <string name="quick_messages_delete_title">빠른 메시지 삭제</string>
+    <string name="quick_messages_delete_message">\"%1$s\"을(를) 삭제할까요? 되돌릴 수 없습니다.</string>
+    <string name="quick_messages_untitled">제목 없음</string>
+    <string name="quick_messages_empty_title">빠른 메시지가 없습니다</string>
+    <string name="quick_messages_empty_hint">+를 눌러 프롬프트 템플릿을 추가하세요.</string>
+    <string name="quick_messages_empty_content">(비어 있음)</string>
+    <string name="quick_messages_more_actions">더보기</string>
+    <string name="quick_messages_field_title">제목</string>
+    <string name="quick_messages_field_content">내용</string>
+    <string name="quick_messages_field_content_hint">입력창에 삽입될 프롬프트 텍스트입니다.</string>
+    <string name="quick_messages_sheet_title">빠른 메시지</string>
+    <string name="quick_messages_manage">관리</string>
+    <string name="quick_messages_sheet_empty">빠른 메시지가 없습니다</string>
+    <string name="quick_messages_sheet_empty_hint">설정 → 빠른 메시지에서 템플릿을 추가하세요.</string>
 </resources>

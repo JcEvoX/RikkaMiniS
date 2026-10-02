@@ -351,6 +351,8 @@ fun ChatScreen(
     onOpenSession: (String) -> Unit = {},
     /** Open Settings from the chat-history drawer footer. */
     onOpenSettings: () -> Unit = {},
+    /** [feat/quick-messages] 从输入框的快捷消息面板跳到「快捷消息」管理页。 */
+    onOpenQuickMessages: () -> Unit = {},
 ) {
     val context = LocalContext.current
     val keyboardController = LocalSoftwareKeyboardController.current
@@ -4529,6 +4531,7 @@ fun ChatScreen(
                 focusManager = focusManager,
                 coroutineScope = coroutineScope,
                 inputFocusRequester = inputFocusRequester,
+                onOpenQuickMessages = onOpenQuickMessages,
             )
 
             // [T-context-exhausted-dialog] iOS 'Context Full' alert parity:

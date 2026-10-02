@@ -1740,4 +1740,25 @@
     <string name="newer_db_body">This copy of RikkaMinis is older than the build that created your data, so it cannot open it safely.\n\nNothing has been deleted — your conversations are intact on this device. Reinstall the newer version of RikkaMinis and everything will be there.</string>
     <string name="newer_db_versions">This version supports data format %1$d</string>
     <string name="newer_db_exit">Close</string>
+
+    <!-- Quick messages: reusable prompt templates inserted into the composer -->
+    <string name="quick_messages_entry">Quick messages</string>
+    <string name="quick_messages_entry_subtitle">Reusable prompt templates you can drop into the composer</string>
+    <string name="quick_messages_title">Quick messages</string>
+    <string name="quick_messages_new">New quick message</string>
+    <string name="quick_messages_edit">Edit quick message</string>
+    <string name="quick_messages_delete_title">Delete quick message</string>
+    <string name="quick_messages_delete_message">Delete \"%1$s\"? This can\'t be undone.</string>
+    <string name="quick_messages_untitled">Untitled</string>
+    <string name="quick_messages_empty_title">No quick messages yet</string>
+    <string name="quick_messages_empty_hint">Tap + to add a reusable prompt template.</string>
+    <string name="quick_messages_empty_content">(empty)</string>
+    <string name="quick_messages_more_actions">More actions</string>
+    <string name="quick_messages_field_title">Title</string>
+    <string name="quick_messages_field_content">Content</string>
+    <string name="quick_messages_field_content_hint">Prompt text inserted into the composer.</string>
+    <string name="quick_messages_sheet_title">Quick messages</string>
+    <string name="quick_messages_manage">Manage</string>
+    <string name="quick_messages_sheet_empty">No quick messages yet</string>
+    <string name="quick_messages_sheet_empty_hint">Add templates from Settings → Quick messages.</string>
 </resources>

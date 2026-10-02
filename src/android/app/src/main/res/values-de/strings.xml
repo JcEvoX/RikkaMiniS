@@ -1643,4 +1643,24 @@
     <string name="reverse_workbench_open">%1$s öffnen</string>
     <string name="reverse_workbench_install">%1$s holen</string>
     <string name="reverse_workbench_hint">Hinweis: Starte nach dem Aktivieren den Dienst in der passenden App — MT Manager: APK-MCP in der Seitenleiste aktivieren und im Hintergrund lassen; SOMCP: auf dem Startbildschirm die große Start-Schaltfläche antippen (Port 8000). Alle lauschen auf 127.0.0.1 und sind nur lokal erreichbar.</string>
+<!-- Schnellnachrichten: wiederverwendbare Prompt-Vorlagen fürs Eingabefeld -->
+    <string name="quick_messages_entry">Schnellnachrichten</string>
+    <string name="quick_messages_entry_subtitle">Wiederverwendbare Prompt-Vorlagen für das Eingabefeld</string>
+    <string name="quick_messages_title">Schnellnachrichten</string>
+    <string name="quick_messages_new">Neue Schnellnachricht</string>
+    <string name="quick_messages_edit">Schnellnachricht bearbeiten</string>
+    <string name="quick_messages_delete_title">Schnellnachricht löschen</string>
+    <string name="quick_messages_delete_message">\"%1$s\" löschen? Das kann nicht rückgängig gemacht werden.</string>
+    <string name="quick_messages_untitled">Ohne Titel</string>
+    <string name="quick_messages_empty_title">Noch keine Schnellnachrichten</string>
+    <string name="quick_messages_empty_hint">Tippe auf +, um eine wiederverwendbare Prompt-Vorlage hinzuzufügen.</string>
+    <string name="quick_messages_empty_content">(leer)</string>
+    <string name="quick_messages_more_actions">Weitere Aktionen</string>
+    <string name="quick_messages_field_title">Titel</string>
+    <string name="quick_messages_field_content">Inhalt</string>
+    <string name="quick_messages_field_content_hint">Prompt-Text, der ins Eingabefeld eingefügt wird.</string>
+    <string name="quick_messages_sheet_title">Schnellnachrichten</string>
+    <string name="quick_messages_manage">Verwalten</string>
+    <string name="quick_messages_sheet_empty">Noch keine Schnellnachrichten</string>
+    <string name="quick_messages_sheet_empty_hint">Vorlagen unter Einstellungen → Schnellnachrichten hinzufügen.</string>
 </resources>

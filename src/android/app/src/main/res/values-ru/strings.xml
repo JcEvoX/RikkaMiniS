@@ -1596,4 +1596,24 @@
     <string name="reverse_workbench_open">Открыть %1$s</string>
     <string name="reverse_workbench_install">Установить %1$s</string>
     <string name="reverse_workbench_hint">Подсказка: после включения запустите сервис в нужном приложении — MT Manager: включите APK MCP в боковой панели и оставьте в фоне; SOMCP: нажмите большую кнопку запуска на главном экране (порт 8000). Все слушают только 127.0.0.1 и доступны локально.</string>
+<!-- Быстрые сообщения: шаблоны подсказок для поля ввода -->
+    <string name="quick_messages_entry">Быстрые сообщения</string>
+    <string name="quick_messages_entry_subtitle">Шаблоны подсказок для быстрой вставки в поле ввода</string>
+    <string name="quick_messages_title">Быстрые сообщения</string>
+    <string name="quick_messages_new">Новое быстрое сообщение</string>
+    <string name="quick_messages_edit">Изменить быстрое сообщение</string>
+    <string name="quick_messages_delete_title">Удалить быстрое сообщение</string>
+    <string name="quick_messages_delete_message">Удалить «%1$s»? Это нельзя отменить.</string>
+    <string name="quick_messages_untitled">Без названия</string>
+    <string name="quick_messages_empty_title">Быстрых сообщений пока нет</string>
+    <string name="quick_messages_empty_hint">Нажмите +, чтобы добавить шаблон подсказки.</string>
+    <string name="quick_messages_empty_content">(пусто)</string>
+    <string name="quick_messages_more_actions">Ещё действия</string>
+    <string name="quick_messages_field_title">Название</string>
+    <string name="quick_messages_field_content">Содержимое</string>
+    <string name="quick_messages_field_content_hint">Текст подсказки, вставляемый в поле ввода.</string>
+    <string name="quick_messages_sheet_title">Быстрые сообщения</string>
+    <string name="quick_messages_manage">Управление</string>
+    <string name="quick_messages_sheet_empty">Быстрых сообщений пока нет</string>
+    <string name="quick_messages_sheet_empty_hint">Добавьте шаблоны в «Настройки → Быстрые сообщения».</string>
 </resources>

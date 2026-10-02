@@ -1641,4 +1641,24 @@
     <string name="reverse_workbench_open">%1$s を開く</string>
     <string name="reverse_workbench_install">%1$s を入手</string>
     <string name="reverse_workbench_hint">ヒント：有効化後は該当アプリでサービスを起動してください——MT マネージャーはサイドバーで APK MCP を有効にしてバックグラウンドに維持、SOMCP はホーム画面の大きな起動ボタンをタップ（ポート 8000）。いずれも 127.0.0.1 のみをリッスンし、ローカル専用です。</string>
+<!-- クイックメッセージ：入力欄に挿入できる定型プロンプト -->
+    <string name="quick_messages_entry">クイックメッセージ</string>
+    <string name="quick_messages_entry_subtitle">入力欄にすぐ挿入できる定型プロンプト</string>
+    <string name="quick_messages_title">クイックメッセージ</string>
+    <string name="quick_messages_new">クイックメッセージを新規作成</string>
+    <string name="quick_messages_edit">クイックメッセージを編集</string>
+    <string name="quick_messages_delete_title">クイックメッセージを削除</string>
+    <string name="quick_messages_delete_message">「%1$s」を削除しますか？元に戻せません。</string>
+    <string name="quick_messages_untitled">無題</string>
+    <string name="quick_messages_empty_title">クイックメッセージはまだありません</string>
+    <string name="quick_messages_empty_hint">＋をタップして定型プロンプトを追加します。</string>
+    <string name="quick_messages_empty_content">（空）</string>
+    <string name="quick_messages_more_actions">その他の操作</string>
+    <string name="quick_messages_field_title">タイトル</string>
+    <string name="quick_messages_field_content">内容</string>
+    <string name="quick_messages_field_content_hint">入力欄に挿入されるプロンプト本文。</string>
+    <string name="quick_messages_sheet_title">クイックメッセージ</string>
+    <string name="quick_messages_manage">管理</string>
+    <string name="quick_messages_sheet_empty">クイックメッセージはまだありません</string>
+    <string name="quick_messages_sheet_empty_hint">「設定 → クイックメッセージ」からテンプレートを追加できます。</string>
 </resources>

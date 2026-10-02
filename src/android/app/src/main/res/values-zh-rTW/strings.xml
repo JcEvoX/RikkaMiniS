@@ -1643,4 +1643,24 @@
     <string name="reverse_workbench_open">開啟 %1$s</string>
     <string name="reverse_workbench_install">安裝 %1$s</string>
     <string name="reverse_workbench_hint">提示：啟用後請到對應 App 裡啟動服務——MT 管理器在側邊欄開啟 APK MCP 並保持背景，SOMCP 在首頁點大啟動按鈕開服務（連接埠 8000）。都監聽 127.0.0.1，僅本機可用。</string>
+<!-- 快捷訊息：可一鍵填入輸入框的提示詞範本 -->
+    <string name="quick_messages_entry">快捷訊息</string>
+    <string name="quick_messages_entry_subtitle">可一鍵填入輸入框的常用提示詞範本</string>
+    <string name="quick_messages_title">快捷訊息</string>
+    <string name="quick_messages_new">新增快捷訊息</string>
+    <string name="quick_messages_edit">編輯快捷訊息</string>
+    <string name="quick_messages_delete_title">刪除快捷訊息</string>
+    <string name="quick_messages_delete_message">確定要刪除「%1$s」？此操作無法復原。</string>
+    <string name="quick_messages_untitled">未命名</string>
+    <string name="quick_messages_empty_title">還沒有快捷訊息</string>
+    <string name="quick_messages_empty_hint">點擊 + 新增一個常用提示詞範本。</string>
+    <string name="quick_messages_empty_content">（空）</string>
+    <string name="quick_messages_more_actions">更多操作</string>
+    <string name="quick_messages_field_title">標題</string>
+    <string name="quick_messages_field_content">內容</string>
+    <string name="quick_messages_field_content_hint">填入輸入框的提示詞內容。</string>
+    <string name="quick_messages_sheet_title">快捷訊息</string>
+    <string name="quick_messages_manage">管理</string>
+    <string name="quick_messages_sheet_empty">還沒有快捷訊息</string>
+    <string name="quick_messages_sheet_empty_hint">可在「設定 → 快捷訊息」中新增範本。</string>
 </resources>
