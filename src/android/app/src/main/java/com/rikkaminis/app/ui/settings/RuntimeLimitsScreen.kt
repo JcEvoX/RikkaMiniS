@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import com.rikkaminis.app.R
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -734,6 +735,70 @@ internal fun LimitsSwitchRow(
                 }
             }
             Switch(checked = checked, onCheckedChange = onCheckedChange)
+        }
+        if (showDivider) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(start = 16.dp, end = 16.dp)
+                    .height(0.5.dp)
+                    .background(MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)),
+            )
+        }
+    }
+}
+
+/**
+ * [feat/advanced-features] Tappable row with a trailing action label — used for
+ * commands that aren't a switch (e.g. "clear MT analysis cache"). Visually
+ * matches [LimitsSwitchRow] so they can sit in the same card.
+ */
+@Composable
+internal fun LimitsActionRow(
+    title: String,
+    subtitle: String?,
+    actionText: String?,
+    onClick: () -> Unit,
+    enabled: Boolean = true,
+    showDivider: Boolean = true,
+) {
+    Column {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(enabled = enabled, onClick = onClick)
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(1.dp),
+            ) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+                if (subtitle != null) {
+                    Text(
+                        text = subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            if (actionText != null) {
+                Text(
+                    text = actionText,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = if (enabled) {
+                        MaterialTheme.colorScheme.primary
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    modifier = Modifier.padding(start = 12.dp),
+                )
+            }
         }
         if (showDivider) {
             Box(
