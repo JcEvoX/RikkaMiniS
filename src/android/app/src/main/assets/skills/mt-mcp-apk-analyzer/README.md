@@ -60,9 +60,9 @@
 mt_mcp/
 ├── 📄 README.md                    # 项目说明文档
 ├── 📄 SKILL.md                     # 技能定义文件（APK分析核心）
-├── 📄 MT_MCP_使用文档.md           # MCP服务使用指南
 │
 ├── 📁 docs/                        # 📚 文档与报告中心
+│   ├── MT_MCP_使用文档.md                 # MCP服务使用指南
 │   ├── Open_Photo_Frame_汉化指南.md       # Flutter应用汉化案例
 │   ├── 签名校验问题分析.md                # APK签名校验机制分析
 │   ├── Appkey配置错误问题分析与解决方案.md  # DCloud Appkey问题方案
@@ -144,7 +144,7 @@ mt_mcp/
 | 文档 | 说明 |
 |------|------|
 | [SKILL.md](./SKILL.md) | APK分析技能完整定义 — 工具规范/分析场景/工作流模板 |
-| [MT_MCP_使用文档.md](./MT_MCP_使用文档.md) | MCP服务基础使用指南 |
+| [MT_MCP_使用文档.md](./docs/MT_MCP_使用文档.md) | MCP服务基础使用指南 |
 
 ---
 

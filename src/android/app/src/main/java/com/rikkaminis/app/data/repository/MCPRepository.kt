@@ -61,6 +61,13 @@ class MCPRepository(private val context: Context) {
             return "imported-mcp"
         }
 
+        /** [T-reverse-mcp-presets] Server ids of the three reverse-engineering
+         *  backends. Exposed so the ReverseWorkbenchCard UI can address them
+         *  without re-typing the literals (and drifting from the seed). */
+        internal const val REVERSE_MT_APK_SERVER_ID = "MTApkMcp"
+        internal const val REVERSE_SOMCP_SERVER_ID = "SOMCP"
+        internal const val REVERSE_PROXYPIN_SERVER_ID = "ProxyPinMcp"
+
         /**
          * [T-reverse-mcp-presets] Reverse-engineering MCP backends ported from
          * the 玄星/XuanXing 二开 (`custom_extracted/XuanXing`). Each is a LOCAL
@@ -77,19 +84,19 @@ class MCPRepository(private val context: Context) {
          */
         internal val DEFAULT_REVERSE_MCP_SERVERS: List<MCPServerConfig> = listOf(
             MCPServerConfig(
-                id = "MTApkMcp",
+                id = REVERSE_MT_APK_SERVER_ID,
                 note = "MT 管理器 APK MCP：APK 层操作（开包 / smali / AXML / 重签名 / 打包），默认端口 8787。需安装 MT 管理器并开启其 APK MCP 服务。",
                 enabled = false,
                 url = "http://127.0.0.1:8787/mcp",
             ),
             MCPServerConfig(
-                id = "SOMCP",
+                id = REVERSE_SOMCP_SERVER_ID,
                 note = "SOMCP · 聚合逆向 MCP：SO 层（反汇编/分析/patch/Unidbg）+ 反编译 + 脱壳 + 回编签名 + Frida + Flutter，默认端口 8000。",
                 enabled = false,
                 url = "http://127.0.0.1:8000/mcp",
             ),
             MCPServerConfig(
-                id = "ProxyPinMcp",
+                id = REVERSE_PROXYPIN_SERVER_ID,
                 note = "ProxyPin 抓包 MCP：HTTP/HTTPS 抓包与请求分析，默认端口 9010。",
                 enabled = false,
                 url = "http://127.0.0.1:9010/mcp",

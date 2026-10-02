@@ -1600,4 +1600,24 @@
     <string name="newer_db_body">目前安裝的 RikkaMinis 比建立這些資料的版本舊，無法安全開啟資料庫。\n\n沒有任何內容被刪除——你的對話仍完整保存在這台裝置上。重新安裝較新的 RikkaMinis 版本，資料就會回來。</string>
     <string name="newer_db_versions">此版本支援資料格式 %1$d</string>
     <string name="newer_db_exit">關閉</string>
+
+    <!-- [T-reverse-workbench] 逆向工作台（MCP 設定）。 -->
+    <string name="reverse_workbench_title">逆向工作台</string>
+    <string name="reverse_workbench_desc">預設 3 個本機逆向 MCP 後端（SOMCP 已整合全套逆向工具），每個可單獨開關、單獨改連接埠。不會填位址？先在對應 App 裡啟動 MCP 服務，再點「一鍵偵測並連線」。</string>
+    <string name="reverse_workbench_probe">一鍵偵測並連線（自動找連接埠）</string>
+    <string name="reverse_workbench_probing">正在偵測本機連接埠…</string>
+    <string name="reverse_workbench_probe_none">沒偵測到可用後端。請先在 MT 管理器 / SOMCP / ProxyPin 裡啟動它們的 MCP 服務再試。</string>
+    <string name="reverse_workbench_probe_ok">已偵測並連線：%1$s</string>
+    <string name="reverse_workbench_mt_title">MT 管理器 · APK 層</string>
+    <string name="reverse_workbench_mt_desc">開包 / smali / AXML / 重新簽名 / 打包</string>
+    <string name="reverse_workbench_somcp_title">SOMCP · 整合逆向</string>
+    <string name="reverse_workbench_somcp_desc">反編譯 / 脫殼 / SO 分析 / 模擬執行 / 回編簽名 / Frida 全套</string>
+    <string name="reverse_workbench_proxypin_title">ProxyPin · 抓包</string>
+    <string name="reverse_workbench_proxypin_desc">HTTP/HTTPS 抓包與請求分析</string>
+    <string name="reverse_workbench_port">連接埠</string>
+    <string name="reverse_workbench_status_on">已啟用</string>
+    <string name="reverse_workbench_status_off">未啟用</string>
+    <string name="reverse_workbench_open">開啟 %1$s</string>
+    <string name="reverse_workbench_install">安裝 %1$s</string>
+    <string name="reverse_workbench_hint">提示：啟用後請到對應 App 裡啟動服務——MT 管理器在側邊欄開啟 APK MCP 並保持背景，SOMCP 在首頁點大啟動按鈕開服務（連接埠 8000）。都監聽 127.0.0.1，僅本機可用。</string>
 </resources>

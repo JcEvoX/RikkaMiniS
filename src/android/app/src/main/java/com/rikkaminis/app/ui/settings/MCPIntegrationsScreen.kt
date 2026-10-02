@@ -97,6 +97,11 @@ fun MCPIntegrationsScreen(
             }
         },
     ) {
+        // [T-reverse-workbench] Reverse-engineering workbench: one-tap launch +
+        // port auto-detect for the three seeded local RE MCP backends. Sits
+        // above the generic server list so the backends stay discoverable.
+        ReverseWorkbenchCard(mcpRepository = mcpRepository)
+
         SettingsSection(
             header = stringResource(R.string.mcp_section_servers),
             footer = stringResource(R.string.mcp_section_footer),

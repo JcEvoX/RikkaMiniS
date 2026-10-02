@@ -1598,4 +1598,24 @@
     <string name="newer_db_body">インストール中の RikkaMinis は、このデータを作成したバージョンよりも古いバージョンのため、データベースを安全に開けません。\n\n何も削除されていません — 会話はこの端末上でそのまま残っています。新しいバージョンの RikkaMinis を再インストールすれば、すべてのデータが戻ります。</string>
     <string name="newer_db_versions">このバージョンはデータ形式 %1$d をサポートします</string>
     <string name="newer_db_exit">閉じる</string>
+
+    <!-- [T-reverse-workbench] リバース作業台（MCP 設定）。 -->
+    <string name="reverse_workbench_title">リバース作業台</string>
+    <string name="reverse_workbench_desc">ローカルのリバース用 MCP バックエンドを 3 つプリセットします（SOMCP はリバース用ツール一式を集約済み）。各バックエンドは個別にオン/オフ・ポート変更が可能。アドレスが分からない場合は、該当アプリで MCP サービスを起動してから「自動検出して接続」をタップしてください。</string>
+    <string name="reverse_workbench_probe">自動検出して接続</string>
+    <string name="reverse_workbench_probing">ローカルポートを検出中…</string>
+    <string name="reverse_workbench_probe_none">利用可能なバックエンドが見つかりません。先に MT マネージャー / SOMCP / ProxyPin で MCP サービスを起動してから再試行してください。</string>
+    <string name="reverse_workbench_probe_ok">検出して接続しました：%1$s</string>
+    <string name="reverse_workbench_mt_title">MT マネージャー · APK 層</string>
+    <string name="reverse_workbench_mt_desc">展開 / smali / AXML / 再署名 / 再パッケージ</string>
+    <string name="reverse_workbench_somcp_title">SOMCP · 統合リバース</string>
+    <string name="reverse_workbench_somcp_desc">逆コンパイル / アンパック / SO 解析 / エミュレーション / 再ビルドと署名 / Frida</string>
+    <string name="reverse_workbench_proxypin_title">ProxyPin · キャプチャ</string>
+    <string name="reverse_workbench_proxypin_desc">HTTP/HTTPS キャプチャとリクエスト解析</string>
+    <string name="reverse_workbench_port">ポート</string>
+    <string name="reverse_workbench_status_on">有効</string>
+    <string name="reverse_workbench_status_off">無効</string>
+    <string name="reverse_workbench_open">%1$s を開く</string>
+    <string name="reverse_workbench_install">%1$s を入手</string>
+    <string name="reverse_workbench_hint">ヒント：有効化後は該当アプリでサービスを起動してください——MT マネージャーはサイドバーで APK MCP を有効にしてバックグラウンドに維持、SOMCP はホーム画面の大きな起動ボタンをタップ（ポート 8000）。いずれも 127.0.0.1 のみをリッスンし、ローカル専用です。</string>
 </resources>

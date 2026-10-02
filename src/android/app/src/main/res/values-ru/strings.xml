@@ -1553,4 +1553,24 @@
     <string name="newer_db_body">Эта версия RikkaMinis старше той, которая создала ваши данные, поэтому база данных не может быть открыта безопасно.\n\nНичего не удалено — все ваши переписки сохранены на этом устройстве. Установите более новую версию RikkaMinis, и все данные будут на месте.</string>
     <string name="newer_db_versions">Эта версия поддерживает формат данных %1$d</string>
     <string name="newer_db_exit">Закрыть</string>
+
+    <!-- [T-reverse-workbench] Мастерская реверса (настройки MCP). -->
+    <string name="reverse_workbench_title">Мастерская реверса</string>
+    <string name="reverse_workbench_desc">Предустановлены 3 локальных MCP-бэкенда для реверс-инжиниринга (SOMCP уже объединяет полный набор инструментов). Каждый бэкенд можно включать отдельно и менять его порт. Не знаете адрес? Запустите MCP-сервис в нужном приложении и нажмите «Автоопределение и подключение».</string>
+    <string name="reverse_workbench_probe">Автоопределение и подключение</string>
+    <string name="reverse_workbench_probing">Проверка локальных портов…</string>
+    <string name="reverse_workbench_probe_none">Бэкенд не обнаружен. Сначала запустите MCP-сервис в MT Manager / SOMCP / ProxyPin, затем повторите.</string>
+    <string name="reverse_workbench_probe_ok">Обнаружено и подключено: %1$s</string>
+    <string name="reverse_workbench_mt_title">MT Manager · уровень APK</string>
+    <string name="reverse_workbench_mt_desc">Распаковка / smali / AXML / переподпись / перепаковка</string>
+    <string name="reverse_workbench_somcp_title">SOMCP · сводный реверс</string>
+    <string name="reverse_workbench_somcp_desc">Декомпиляция / распаковка / анализ SO / эмуляция / пересборка и подпись / Frida</string>
+    <string name="reverse_workbench_proxypin_title">ProxyPin · перехват</string>
+    <string name="reverse_workbench_proxypin_desc">Перехват HTTP/HTTPS и анализ запросов</string>
+    <string name="reverse_workbench_port">Порт</string>
+    <string name="reverse_workbench_status_on">Включено</string>
+    <string name="reverse_workbench_status_off">Отключено</string>
+    <string name="reverse_workbench_open">Открыть %1$s</string>
+    <string name="reverse_workbench_install">Установить %1$s</string>
+    <string name="reverse_workbench_hint">Подсказка: после включения запустите сервис в нужном приложении — MT Manager: включите APK MCP в боковой панели и оставьте в фоне; SOMCP: нажмите большую кнопку запуска на главном экране (порт 8000). Все слушают только 127.0.0.1 и доступны локально.</string>
 </resources>

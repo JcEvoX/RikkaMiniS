@@ -1600,4 +1600,24 @@
     <string name="newer_db_body">Diese Version von RikkaMinis ist älter als der Build, der deine Daten erstellt hat, und kann die Datenbank nicht sicher öffnen.\n\nEs wurde nichts gelöscht — deine Unterhaltungen sind auf diesem Gerät vollständig erhalten. Installiere die neuere Version von RikkaMinis, und alles ist wieder da.</string>
     <string name="newer_db_versions">Diese Version unterstützt Datenformat %1$d</string>
     <string name="newer_db_exit">Schließen</string>
+
+    <!-- [T-reverse-workbench] Reverse-Engineering-Workbench (MCP-Einstellungen). -->
+    <string name="reverse_workbench_title">Reverse-Workbench</string>
+    <string name="reverse_workbench_desc">Belegt 3 lokale MCP-Backends für Reverse-Engineering vor (SOMCP bündelt bereits das komplette Reverse-Toolset). Jedes Backend lässt sich einzeln umschalten und der Port ändern. Adresse unbekannt? Starte den MCP-Dienst in der passenden App und tippe dann auf „Automatisch erkennen und verbinden“.</string>
+    <string name="reverse_workbench_probe">Automatisch erkennen und verbinden</string>
+    <string name="reverse_workbench_probing">Lokale Ports werden geprüft…</string>
+    <string name="reverse_workbench_probe_none">Kein Backend erkannt. Starte zuerst den MCP-Dienst in MT Manager / SOMCP / ProxyPin und versuche es erneut.</string>
+    <string name="reverse_workbench_probe_ok">Erkannt und verbunden: %1$s</string>
+    <string name="reverse_workbench_mt_title">MT Manager · APK-Ebene</string>
+    <string name="reverse_workbench_mt_desc">Entpacken / Smali / AXML / Neu signieren / Neu packen</string>
+    <string name="reverse_workbench_somcp_title">SOMCP · Aggregiertes Reverse</string>
+    <string name="reverse_workbench_somcp_desc">Dekompilieren / Entpacken / SO-Analyse / Emulation / Neu bauen und signieren / Frida</string>
+    <string name="reverse_workbench_proxypin_title">ProxyPin · Mitschnitt</string>
+    <string name="reverse_workbench_proxypin_desc">HTTP/HTTPS-Mitschnitt und Analyse der Anfragen</string>
+    <string name="reverse_workbench_port">Port</string>
+    <string name="reverse_workbench_status_on">Aktiviert</string>
+    <string name="reverse_workbench_status_off">Deaktiviert</string>
+    <string name="reverse_workbench_open">%1$s öffnen</string>
+    <string name="reverse_workbench_install">%1$s holen</string>
+    <string name="reverse_workbench_hint">Hinweis: Starte nach dem Aktivieren den Dienst in der passenden App — MT Manager: APK-MCP in der Seitenleiste aktivieren und im Hintergrund lassen; SOMCP: auf dem Startbildschirm die große Start-Schaltfläche antippen (Port 8000). Alle lauschen auf 127.0.0.1 und sind nur lokal erreichbar.</string>
 </resources>
