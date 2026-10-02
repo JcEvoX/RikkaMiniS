@@ -60,6 +60,56 @@ class MCPRepository(private val context: Context) {
             }
             return "imported-mcp"
         }
+
+        /**
+         * [T-reverse-mcp-presets] Reverse-engineering MCP backends ported from
+         * the 玄星/XuanXing 二开 (`custom_extracted/XuanXing`). Each is a LOCAL
+         * HTTP MCP server on 127.0.0.1 and ships DISABLED, so a user without the
+         * matching app is never affected (no connection attempts, no traffic).
+         * The bundled RE skills (mt-mcp-apk-analyzer, ai-reverse-workflow, …)
+         * name these tool namespaces (`mt_apk_*`, `so_*`, packet capture), so
+         * seeding the endpoints keeps those skills actionable once the user
+         * enables the corresponding backend.
+         *
+         * Seeded add-if-missing by [MCPServerConfig.id]: a user's own enabled
+         * state / port edit survives every launch, and a user-created server is
+         * never touched.
+         */
+        internal val DEFAULT_REVERSE_MCP_SERVERS: List<MCPServerConfig> = listOf(
+            MCPServerConfig(
+                id = "MTApkMcp",
+                note = "MT 管理器 APK MCP：APK 层操作（开包 / smali / AXML / 重签名 / 打包），默认端口 8787。需安装 MT 管理器并开启其 APK MCP 服务。",
+                enabled = false,
+                url = "http://127.0.0.1:8787/mcp",
+            ),
+            MCPServerConfig(
+                id = "SOMCP",
+                note = "SOMCP · 聚合逆向 MCP：SO 层（反汇编/分析/patch/Unidbg）+ 反编译 + 脱壳 + 回编签名 + Frida + Flutter，默认端口 8000。",
+                enabled = false,
+                url = "http://127.0.0.1:8000/mcp",
+            ),
+            MCPServerConfig(
+                id = "ProxyPinMcp",
+                note = "ProxyPin 抓包 MCP：HTTP/HTTPS 抓包与请求分析，默认端口 9010。",
+                enabled = false,
+                url = "http://127.0.0.1:9010/mcp",
+            ),
+        )
+
+        /**
+         * [T-reverse-mcp-presets] Add any missing reverse-engineering MCP preset
+         * (see [DEFAULT_REVERSE_MCP_SERVERS]) to [current]. Add-if-missing by id:
+         * an entry the user already has (possibly renamed / enabled / port-edited)
+         * is returned untouched, and a user-created server is never removed.
+         * Mirrors the XuanXing 二开's PreferencesStore seed so the capability is
+         * present on both fresh installs and upgrades. Pure (no Android deps) so
+         * it is JVM-unit-testable — the same split [deriveFallbackName] uses.
+         */
+        internal fun seedDefaultReverseServers(current: List<MCPServerConfig>): List<MCPServerConfig> {
+            val existingIds = current.map { it.id }.toSet()
+            val missing = DEFAULT_REVERSE_MCP_SERVERS.filter { it.id !in existingIds }
+            return if (missing.isEmpty()) current else current + missing
+        }
     }
 
     /** Truncation cap for MCP notes shown in list rows / prompt fragments.
@@ -154,12 +204,17 @@ class MCPRepository(private val context: Context) {
             Log.w(TAG, "servers.json unreadable — keeping ${_servers.value.size} in-memory server(s)")
             return
         }
-        _servers.value = parsed.servers
+        // [T-reverse-mcp-presets] Backfill the reverse-engineering MCP backends
+        // before publishing, so the bundled RE skills always have their MCP
+        // endpoints available. Runs only after a successful parse — never on an
+        // unreadable file (F-227), so a hand-edit typo can't trigger a rewrite.
+        val seeded = seedDefaultReverseServers(parsed.servers)
+        _servers.value = seeded
         // [F-227] The createdAt back-fill used to run *inside* the reader, so a
         // read could silently mutate the file. Doing it here — after a
         // successful parse, and only as an explicit follow-up — keeps the
         // reader side-effect free (and unreachable from a failed parse).
-        if (parsed.needsPersist) save(parsed.servers)
+        if (parsed.needsPersist || seeded.size != parsed.servers.size) save(seeded)
     }
 
     /** Alias matching SkillRepository.reloadFromDisk() so callers read symmetrically. */
