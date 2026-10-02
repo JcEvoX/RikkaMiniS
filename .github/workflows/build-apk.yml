@@ -406,3 +406,20 @@ jobs:
           files: ${{ steps.stage.outputs.asset }}
           prerelease: false
           make_latest: "true"
+
+      # [absorbed from RikkaHub workflows] Pure-additive failure diagnostics:
+      # dumps the tail of any Gradle build log plus the runtime dependency tree
+      # when the job fails, so a red run explains itself without a re-run. Runs
+      # ONLY on failure — it cannot affect the existing success path, and adds
+      # no secrets/permissions. Kept as the last step so it observes every
+      # earlier failure.
+      - name: Build failure diagnostics
+        if: failure()
+        run: |
+          echo "=== last 150 gradle log lines ==="
+          find . -name "*.log" -path "*gradle*" 2>/dev/null | while read -r f; do
+            echo "--- $f ---"
+            tail -n 150 "$f"
+          done
+          echo "=== diagnostic: :app:dependencies --configuration releaseRuntimeClasspath ==="
+          cd src/android && ./gradlew :app:dependencies --configuration releaseRuntimeClasspath 2>&1 | tail -n 80 || true
