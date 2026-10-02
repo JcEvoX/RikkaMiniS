@@ -24,6 +24,7 @@ import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.BarChart
 import androidx.compose.material.icons.outlined.Backup
 import androidx.compose.material.icons.outlined.BatteryFull
+import androidx.compose.material.icons.outlined.Bolt
 import androidx.compose.material.icons.outlined.Code
 import androidx.compose.material.icons.outlined.Dashboard
 import androidx.compose.material.icons.outlined.Description
@@ -69,6 +70,8 @@ fun SettingsScreen(
     onEnvVarsClick: () -> Unit = {},
     // [feat/runtime-limits-panel] entry into the Runtime Limits page.
     onRuntimeLimitsClick: () -> Unit = {},
+    // [feat/advanced-features] 玄星二开「高级功能」页（默认关闭的主动行为开关，如持续工作）。
+    onAdvancedFeaturesClick: () -> Unit = {},
     onSkillsClick: () -> Unit = {},
     onMemoryClick: () -> Unit = {},
     // [T-mcp-integration-android] MCP Integrations page, listed directly below
@@ -234,6 +237,16 @@ fun SettingsScreen(
                     title = stringResource(R.string.runtime_limits_entry),
                     subtitle = stringResource(R.string.runtime_limits_entry_subtitle),
                     onClick = onRuntimeLimitsClick,
+                    showDivider = true,
+                )
+                // [feat/advanced-features] 玄星二开「高级功能」：默认关闭、会改变智能体
+                // 行为的主动开关（持续工作等），与纯数值调参的 Runtime Limits 分开。
+                SettingsItem(
+                    icon = Icons.Outlined.Bolt,
+                    iconColor = Color(0xFFFF9500),
+                    title = stringResource(R.string.advanced_features_entry),
+                    subtitle = stringResource(R.string.advanced_features_entry_subtitle),
+                    onClick = onAdvancedFeaturesClick,
                     showDivider = false,
                 )
             }

@@ -114,6 +114,16 @@
     <string name="runtime_limits_title">运行时限制</string>
     <string name="runtime_limits_entry">运行时限制</string>
     <string name="runtime_limits_entry_subtitle">会话 · 预算 · 恢复 · 超时</string>
+    <!-- [feat/advanced-features] 玄星二开「高级功能」 -->
+    <string name="advanced_features_entry">高级功能</string>
+    <string name="advanced_features_entry_subtitle">持续工作等需手动开启的智能体行为</string>
+    <string name="advanced_features_title">高级功能</string>
+    <string name="advanced_features_section_work">工作</string>
+    <string name="advanced_features_continuous_work">持续工作</string>
+    <string name="advanced_features_continuous_work_desc">当 AI 停止但本次运行已经用过工具时，自动追加一条「继续」提示，让它接着完成未做完的步骤。默认关闭。</string>
+    <string name="advanced_features_continuous_work_rounds">最大自动续轮数</string>
+    <string name="advanced_features_continuous_work_rounds_desc">每次运行自动「继续」的硬上限。回复中出现 [DONE] / [任务完成] 时提前停止。</string>
+    <string name="advanced_features_work_footer">持续工作会额外消耗 token：每次自动续轮都会再触发一轮模型调用。仅对真正执行过工具的运行生效，纯聊天永不触发。</string>
     <string name="runtime_limits_section_sessions">会话与派发</string>
     <string name="runtime_limits_section_budget">Agent 循环预算</string>
     <string name="runtime_limits_section_recovery">流恢复</string>

@@ -990,6 +990,16 @@
     <string name="runtime_limits_title">執行時限制</string>
     <string name="runtime_limits_entry">執行時限制</string>
     <string name="runtime_limits_entry_subtitle">工作階段 · 預算 · 復原 · 逾時</string>
+    <!-- [feat/advanced-features] 玄星二开「高级功能」 -->
+    <string name="advanced_features_entry">進階功能</string>
+    <string name="advanced_features_entry_subtitle">持續工作等需手動開啟的智慧體行為</string>
+    <string name="advanced_features_title">進階功能</string>
+    <string name="advanced_features_section_work">工作</string>
+    <string name="advanced_features_continuous_work">持續工作</string>
+    <string name="advanced_features_continuous_work_desc">當 AI 停止但本次執行已用過工具時，自動追加一則「繼續」提示，讓它接著完成未完成的步驟。預設關閉。</string>
+    <string name="advanced_features_continuous_work_rounds">最大自動續輪數</string>
+    <string name="advanced_features_continuous_work_rounds_desc">每次執行自動「繼續」的硬上限。回覆中出現 [DONE] / [任務完成] 時提前停止。</string>
+    <string name="advanced_features_work_footer">持續工作會額外消耗 token：每次自動續輪都會再觸發一輪模型呼叫。僅對真正執行過工具的執行生效，純聊天永不觸發。</string>
     <string name="runtime_limits_section_sessions">工作階段與派發</string>
     <string name="runtime_limits_section_budget">Agent 迴圈預算</string>
     <string name="runtime_limits_section_recovery">串流復原</string>

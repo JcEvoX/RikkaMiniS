@@ -154,6 +154,8 @@ object Routes {
     const val ENV_VARS = "env_vars"
     /** [feat/runtime-limits-panel] Runtime Limits page (agent runtime knobs). */
     const val RUNTIME_LIMITS = "runtime_limits"
+    /** [feat/advanced-features] 玄星二开「高级功能」页（默认关闭的主动行为开关）。 */
+    const val ADVANCED_FEATURES = "advanced_features"
     /** [feat/chat-tuning-panel] Chat Tuning page (reading / scrolling / composer knobs). */
     const val CHAT_TUNING = "chat_tuning"
     const val SKILLS = "skills"
@@ -656,6 +658,7 @@ fun AppNavigation(
                 onRootfsClick = { navController.safeNavigate(Routes.STORAGE) },
                 onEnvVarsClick = { navController.safeNavigate(Routes.ENV_VARS) },
                 onRuntimeLimitsClick = { navController.safeNavigate(Routes.RUNTIME_LIMITS) },
+                onAdvancedFeaturesClick = { navController.safeNavigate(Routes.ADVANCED_FEATURES) },
                 onSkillsClick = { navController.safeNavigate(Routes.SKILLS) },
                 onMemoryClick = { navController.safeNavigate(Routes.MEMORY) },
                 onMcpClick = { navController.safeNavigate(Routes.MCP) },
@@ -1085,6 +1088,11 @@ fun AppNavigation(
         }
         composable(Routes.RUNTIME_LIMITS) {
             com.rikkaminis.app.ui.settings.RuntimeLimitsScreen(
+                onBack = { navController.safePopBackStack() },
+            )
+        }
+        composable(Routes.ADVANCED_FEATURES) {
+            com.rikkaminis.app.ui.settings.AdvancedFeaturesScreen(
                 onBack = { navController.safePopBackStack() },
             )
         }

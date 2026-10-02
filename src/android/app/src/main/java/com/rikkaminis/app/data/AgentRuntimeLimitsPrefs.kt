@@ -112,6 +112,17 @@ object AgentRuntimeLimitsPrefs {
     // their stored value back.
     const val VERIFY_NUDGES_DEFAULT = 0
 
+    // ── [feat/continuous-work] 玄星二开「持续工作」 ────────────────────────
+    // AI 主动收尾但这一轮确实用工具干过活时，自动追加"继续"提示让它接着做，
+    // 最多 N 轮。默认关闭：这是会烧 token 的主动行为，必须用户显式打开。
+    const val KEY_CONTINUOUS_WORK_ENABLED = "continuousWorkEnabled"
+    const val KEY_CONTINUOUS_WORK_MAX_ROUNDS = "continuousWorkMaxRounds"
+
+    const val CONTINUOUS_WORK_ROUNDS_MIN = 1
+    const val CONTINUOUS_WORK_ROUNDS_MAX = 20
+    const val CONTINUOUS_WORK_ROUNDS_DEFAULT = 5
+    const val CONTINUOUS_WORK_ENABLED_DEFAULT = false
+
     // ── Group 4: worker network timeouts (worker-process scoped) ─────────
 
     const val KEY_GENERATION_TIMEOUT_MIN = "generationTimeoutMinutes"
@@ -294,6 +305,9 @@ object AgentRuntimeLimitsPrefs {
     @Volatile private var cachedDeterministicEmptyLimit = DET_EMPTY_DEFAULT
     @Volatile private var cachedTransientRetries = TRANSIENT_RETRIES_DEFAULT
     @Volatile private var cachedVerifyNudges = VERIFY_NUDGES_DEFAULT
+    // [feat/continuous-work]
+    @Volatile private var cachedContinuousWorkEnabled = CONTINUOUS_WORK_ENABLED_DEFAULT
+    @Volatile private var cachedContinuousWorkMaxRounds = CONTINUOUS_WORK_ROUNDS_DEFAULT
     @Volatile private var cachedGenerationTimeoutMin = GENERATION_TIMEOUT_DEFAULT_MIN
     @Volatile private var cachedFirstChunkDirectSec = FIRST_CHUNK_DIRECT_DEFAULT_SEC
     @Volatile private var cachedFirstChunkProxySec = FIRST_CHUNK_PROXY_DEFAULT_SEC
@@ -353,6 +367,10 @@ object AgentRuntimeLimitsPrefs {
             .coerceIn(TRANSIENT_RETRIES_MIN, TRANSIENT_RETRIES_MAX)
         cachedVerifyNudges = p.getInt(KEY_VERIFY_NUDGES, VERIFY_NUDGES_DEFAULT)
             .coerceIn(VERIFY_NUDGES_MIN, VERIFY_NUDGES_MAX)
+        // [feat/continuous-work]
+        cachedContinuousWorkEnabled = p.getBoolean(KEY_CONTINUOUS_WORK_ENABLED, CONTINUOUS_WORK_ENABLED_DEFAULT)
+        cachedContinuousWorkMaxRounds = p.getInt(KEY_CONTINUOUS_WORK_MAX_ROUNDS, CONTINUOUS_WORK_ROUNDS_DEFAULT)
+            .coerceIn(CONTINUOUS_WORK_ROUNDS_MIN, CONTINUOUS_WORK_ROUNDS_MAX)
         cachedGenerationTimeoutMin = p.getInt(KEY_GENERATION_TIMEOUT_MIN, GENERATION_TIMEOUT_DEFAULT_MIN)
             .coerceIn(GENERATION_TIMEOUT_MIN_MIN, GENERATION_TIMEOUT_MAX_MIN)
         cachedFirstChunkDirectSec = p.getInt(KEY_FIRST_CHUNK_DIRECT_SEC, FIRST_CHUNK_DIRECT_DEFAULT_SEC)
@@ -427,6 +445,12 @@ object AgentRuntimeLimitsPrefs {
     fun deterministicEmptyLimit(): Int = cachedDeterministicEmptyLimit
     fun transientRetries(): Int = cachedTransientRetries
     fun verifyNudges(): Int = cachedVerifyNudges
+
+    // ── [feat/continuous-work] 玄星「持续工作」 ────────────────────────────
+    /** 是否开启"AI 停下后自动追加继续提示"。 */
+    fun continuousWorkEnabled(): Boolean = cachedContinuousWorkEnabled
+    /** 自动续轮的硬上限。 */
+    fun continuousWorkMaxRounds(): Int = cachedContinuousWorkMaxRounds
 
     // ── context-free readers (worker-process scoped: read at pool sizing) ─
 
@@ -521,6 +545,9 @@ object AgentRuntimeLimitsPrefs {
         deterministicEmptyLimit: Int? = null,
         transientRetries: Int? = null,
         verifyNudges: Int? = null,
+        // [feat/continuous-work] 玄星「持续工作」
+        continuousWorkEnabled: Boolean? = null,
+        continuousWorkMaxRounds: Int? = null,
         generationTimeoutMinutes: Int? = null,
         firstChunkDirectSec: Int? = null,
         firstChunkProxySec: Int? = null,
@@ -587,6 +614,15 @@ object AgentRuntimeLimitsPrefs {
             e.putInt(KEY_TRANSIENT_RETRIES, cachedTransientRetries)
         }
         verifyNudges?.let { cachedVerifyNudges = it.coerceIn(VERIFY_NUDGES_MIN, VERIFY_NUDGES_MAX); e.putInt(KEY_VERIFY_NUDGES, cachedVerifyNudges) }
+        // [feat/continuous-work]
+        continuousWorkEnabled?.let {
+            cachedContinuousWorkEnabled = it
+            e.putBoolean(KEY_CONTINUOUS_WORK_ENABLED, cachedContinuousWorkEnabled)
+        }
+        continuousWorkMaxRounds?.let {
+            cachedContinuousWorkMaxRounds = it.coerceIn(CONTINUOUS_WORK_ROUNDS_MIN, CONTINUOUS_WORK_ROUNDS_MAX)
+            e.putInt(KEY_CONTINUOUS_WORK_MAX_ROUNDS, cachedContinuousWorkMaxRounds)
+        }
         generationTimeoutMinutes?.let {
             cachedGenerationTimeoutMin = it.coerceIn(GENERATION_TIMEOUT_MIN_MIN, GENERATION_TIMEOUT_MAX_MIN)
             e.putInt(KEY_GENERATION_TIMEOUT_MIN, cachedGenerationTimeoutMin)

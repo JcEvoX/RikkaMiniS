@@ -235,6 +235,16 @@
     <string name="runtime_limits_title">Runtime Limits</string>
     <string name="runtime_limits_entry">Runtime Limits</string>
     <string name="runtime_limits_entry_subtitle">Sessions, budgets, recovery, timeouts</string>
+    <!-- [feat/advanced-features] 玄星二开「高级功能」 -->
+    <string name="advanced_features_entry">Advanced Features</string>
+    <string name="advanced_features_entry_subtitle">Continuous work and other opt-in agent behaviors</string>
+    <string name="advanced_features_title">Advanced Features</string>
+    <string name="advanced_features_section_work">Work</string>
+    <string name="advanced_features_continuous_work">Continuous work</string>
+    <string name="advanced_features_continuous_work_desc">When the AI stops but this run already used tools, automatically send a \"continue\" prompt so it keeps working on the unfinished steps. Off by default.</string>
+    <string name="advanced_features_continuous_work_rounds">Max auto-continue rounds</string>
+    <string name="advanced_features_continuous_work_rounds_desc">Hard ceiling on automatic \"continue\" rounds per run. Stops early once the reply contains [DONE] / [任务完成].</string>
+    <string name="advanced_features_work_footer">Continuous work can burn extra tokens: each auto-continue triggers another model round. It only fires for runs that actually executed tools, never on plain chat.</string>
     <string name="runtime_limits_section_sessions">Sessions &amp; dispatch</string>
     <string name="runtime_limits_section_budget">Agent-loop budget</string>
     <string name="runtime_limits_section_recovery">Stream recovery</string>

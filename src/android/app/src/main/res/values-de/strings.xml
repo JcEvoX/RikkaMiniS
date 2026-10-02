@@ -79,6 +79,16 @@
     <string name="runtime_limits_title">Laufzeit-Limits</string>
     <string name="runtime_limits_entry">Laufzeit-Limits</string>
     <string name="runtime_limits_entry_subtitle">Sitzungen, Budgets, Wiederherstellung, Timeouts</string>
+    <!-- [feat/advanced-features] 玄星二开「高级功能」 -->
+    <string name="advanced_features_entry">Erweiterte Funktionen</string>
+    <string name="advanced_features_entry_subtitle">Dauerhaftes Arbeiten und weitere optionale Agent-Verhalten</string>
+    <string name="advanced_features_title">Erweiterte Funktionen</string>
+    <string name="advanced_features_section_work">Arbeit</string>
+    <string name="advanced_features_continuous_work">Dauerhaftes Arbeiten</string>
+    <string name="advanced_features_continuous_work_desc">Wenn die KI stoppt, dieser Lauf aber bereits Werkzeuge genutzt hat, wird automatisch ein \"Weiter\"-Hinweis gesendet, damit sie die offenen Schritte fortsetzt. Standardmäßig aus.</string>
+    <string name="advanced_features_continuous_work_rounds">Max. Auto-Fortsetzungen</string>
+    <string name="advanced_features_continuous_work_rounds_desc">Harte Obergrenze für automatische \"Weiter\"-Runden pro Lauf. Stoppt vorzeitig, sobald die Antwort [DONE] / [任务完成] enthält.</string>
+    <string name="advanced_features_work_footer">Dauerhaftes Arbeiten kann zusätzliche Token verbrauchen: Jede automatische Fortsetzung startet eine weitere Modellrunde. Es greift nur bei Läufen, die tatsächlich Werkzeuge ausgeführt haben, niemals im normalen Chat.</string>
     <string name="runtime_limits_section_sessions">Sitzungen &amp; Dispatch</string>
     <string name="runtime_limits_section_budget">Agent-Loop-Budget</string>
     <string name="runtime_limits_section_recovery">Stream-Wiederherstellung</string>

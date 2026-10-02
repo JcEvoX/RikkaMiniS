@@ -79,6 +79,16 @@
     <string name="runtime_limits_title">ランタイム制限</string>
     <string name="runtime_limits_entry">ランタイム制限</string>
     <string name="runtime_limits_entry_subtitle">セッション・予算・リカバリ・タイムアウト</string>
+    <!-- [feat/advanced-features] 玄星二开「高级功能」 -->
+    <string name="advanced_features_entry">詳細機能</string>
+    <string name="advanced_features_entry_subtitle">継続作業などのオプトイン型エージェント動作</string>
+    <string name="advanced_features_title">詳細機能</string>
+    <string name="advanced_features_section_work">作業</string>
+    <string name="advanced_features_continuous_work">継続作業</string>
+    <string name="advanced_features_continuous_work_desc">AI が停止してもこの実行でツールを使用済みの場合、自動的に「続行」プロンプトを送信し、未完了の作業を続けさせます。既定ではオフ。</string>
+    <string name="advanced_features_continuous_work_rounds">自動続行の最大回数</string>
+    <string name="advanced_features_continuous_work_rounds_desc">1 実行あたりの自動「続行」ラウンドの上限。返信に [DONE] / [任务完成] が含まれると早期終了します。</string>
+    <string name="advanced_features_work_footer">継続作業は余分なトークンを消費する可能性があります。自動続行ごとにモデルのラウンドが 1 回追加されます。実際にツールを実行した実行のみに作用し、通常のチャットでは決して発動しません。</string>
     <string name="runtime_limits_section_sessions">セッションとディスパッチ</string>
     <string name="runtime_limits_section_budget">エージェントループ予算</string>
     <string name="runtime_limits_section_recovery">ストリーム復元</string>

@@ -2236,6 +2236,43 @@ internal class AgentLoopEngine(
                     }
                 }
 
+                // [feat/continuous-work] 玄星「持续工作」端口。模型主动收尾（本轮没有
+                // 工具调用），但这一轮确实用工具干过活、且回复里没有完成标志 —— 自动追加
+                // 一条"继续"提示让它接着做，硬上限由 continuousWorkMaxRounds 兜底。默认
+                // 关闭（0/关 = 保持既有的"模型停就是停"行为）。与上面 verify nudge /
+                // residue refill 同门禁：terminalErrorSurfaced 的 run 不许被续命复活。
+                val continuousWorkMax = com.rikkaminis.app.data.AgentRuntimeLimitsPrefs.continuousWorkMaxRounds()
+                val continuousWorkGate = if (com.rikkaminis.app.data.AgentRuntimeLimitsPrefs.continuousWorkEnabled()) {
+                    continuousWorkMax
+                } else {
+                    0
+                }
+                if (ContinuousWorkPolicy.shouldContinue(
+                        ranToolThisRun = loopState.allToolBlocks.any { it.kind == "tool_use" },
+                        finalText = loopState.accumulatedText,
+                        roundsUsed = loopState.continuousWorkRounds,
+                        maxRounds = continuousWorkGate,
+                        terminalError = loopState.terminalErrorSurfaced,
+                    )
+                ) {
+                    loopState.continuousWorkRounds++
+                    AppLogger.warning(
+                        TAG_STREAM,
+                        "runAgentLoop turn=$turn no tool calls but 持续工作 enabled — auto-continue " +
+                            "${loopState.continuousWorkRounds}/$continuousWorkMax",
+                    )
+                    val continueMsg = ContinuousWorkPolicy.continuePrompt()
+                    ensureRoleAlternationBeforeUserAppend(host.agentHistory)
+                    host.agentHistory.add(
+                        LLMMessage(
+                            role = LLMMessage.Role.USER,
+                            content = continueMsg,
+                            contentParts = listOf(AgentContentPart.Text(continueMsg)),
+                        )
+                    )
+                    continue
+                }
+
                 AppLogger.info(TAG_STREAM, "runAgentLoop turn=$turn no tool calls → break (finishReason=$turnFinishReason)")
                 withContext(Dispatchers.Main) {
                     host.updateAssistantMessage(loopState.assistantId, loopState.accumulatedText, false, loopState.allToolBlocks)

@@ -79,6 +79,16 @@
     <string name="runtime_limits_title">런타임 제한</string>
     <string name="runtime_limits_entry">런타임 제한</string>
     <string name="runtime_limits_entry_subtitle">세션 · 예산 · 복구 · 타임아웃</string>
+    <!-- [feat/advanced-features] 玄星二开「高级功能」 -->
+    <string name="advanced_features_entry">고급 기능</string>
+    <string name="advanced_features_entry_subtitle">연속 작업 및 기타 선택적 에이전트 동작</string>
+    <string name="advanced_features_title">고급 기능</string>
+    <string name="advanced_features_section_work">작업</string>
+    <string name="advanced_features_continuous_work">연속 작업</string>
+    <string name="advanced_features_continuous_work_desc">AI가 멈췄지만 이 실행에서 이미 도구를 사용한 경우, 자동으로 \"계속\" 프롬프트를 보내 남은 단계를 이어서 수행합니다. 기본값은 꺼짐.</string>
+    <string name="advanced_features_continuous_work_rounds">최대 자동 계속 횟수</string>
+    <string name="advanced_features_continuous_work_rounds_desc">실행당 자동 \"계속\" 라운드의 상한. 응답에 [DONE] / [任务完成]이 포함되면 조기 종료합니다.</string>
+    <string name="advanced_features_work_footer">연속 작업은 추가 토큰을 소모할 수 있습니다. 자동 계속마다 모델 라운드가 한 번 더 실행됩니다. 실제로 도구를 실행한 실행에만 적용되며 일반 채팅에서는 절대 실행되지 않습니다.</string>
     <string name="runtime_limits_section_sessions">세션 및 디스패치</string>
     <string name="runtime_limits_section_budget">에이전트 루프 예산</string>
     <string name="runtime_limits_section_recovery">스트림 복구</string>

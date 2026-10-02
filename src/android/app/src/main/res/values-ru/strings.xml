@@ -117,6 +117,16 @@
     <string name="runtime_limits_title">Лимиты среды выполнения</string>
     <string name="runtime_limits_entry">Лимиты выполнения</string>
     <string name="runtime_limits_entry_subtitle">Сессии, бюджеты, восстановление, таймауты</string>
+    <!-- [feat/advanced-features] 玄星二开「高级功能」 -->
+    <string name="advanced_features_entry">Дополнительные функции</string>
+    <string name="advanced_features_entry_subtitle">Непрерывная работа и другое опциональное поведение агента</string>
+    <string name="advanced_features_title">Дополнительные функции</string>
+    <string name="advanced_features_section_work">Работа</string>
+    <string name="advanced_features_continuous_work">Непрерывная работа</string>
+    <string name="advanced_features_continuous_work_desc">Если ИИ останавливается, но в этом запуске уже использовались инструменты, автоматически отправляется запрос \"продолжить\", чтобы он завершил оставшиеся шаги. По умолчанию выключено.</string>
+    <string name="advanced_features_continuous_work_rounds">Макс. автопродолжений</string>
+    <string name="advanced_features_continuous_work_rounds_desc">Жёсткий предел автоматических раундов \"продолжить\" за запуск. Останавливается досрочно, если ответ содержит [DONE] / [任务完成].</string>
+    <string name="advanced_features_work_footer">Непрерывная работа может расходовать дополнительные токены: каждое автопродолжение запускает ещё один раунд модели. Срабатывает только для запусков, которые действительно выполняли инструменты, и никогда в обычном чате.</string>
     <string name="runtime_limits_section_sessions">Сессии и диспетчеризация</string>
     <string name="runtime_limits_section_budget">Бюджет цикла агента</string>
     <string name="runtime_limits_section_recovery">Восстановление потока</string>

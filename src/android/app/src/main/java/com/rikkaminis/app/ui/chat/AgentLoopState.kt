@@ -197,6 +197,13 @@ internal class AgentLoopState(
      */
     var lastTurnWasLengthWall: Boolean = false
 
+    /**
+     * [feat/continuous-work] 玄星「持续工作」：本 run 已经自动追加过几次"继续"提示。
+     * 由 ContinuousWorkPolicy.shouldContinue 与 continuousWorkMaxRounds 共同兜底，
+     * 防止模型在收尾后无休止地续命烧 token。
+     */
+    var continuousWorkRounds: Int = 0
+
     // ── [feat/verification-stop] edit/verify evidence tracking ────────────
 
     /**
