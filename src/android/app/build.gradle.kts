@@ -22,17 +22,24 @@ val appCustomization = Properties().apply {
 fun customizationValue(key: String): String =
     (appCustomization.getProperty(key) ?: "").replace("\"", "\\\"")
 
-// CI-injected build version (see .github/workflows/build-apk.yml):
-//   MINIS_VERSION_CODE       — monotonically increasing int (base + run number),
-//                              so every published build is upgrade-installable
-//                              and distinguishable by versionCode.
-//   MINIS_VERSION_NAME_SUFFIX — per-build build metadata, e.g. "+42", so
-//                                sideloaders can tell builds apart from the
-//                                version shown in the app's About page without
-//                                turning 1.0.0 into a prerelease version
-//                                (semver ignores build metadata for precedence)
+// CI-injected build version (see .github/workflows/build-apk.yml and
+// build-test-apk.yml), computed from git in CI:
+//   MINIS_VERSION_NAME — full versionName, e.g. "1.0.0.12.r3f2a1b7" (base tag +
+//                        commits since it + short SHA). Preferred now: it lets
+//                        sideloaders read WHICH commit a build came from on the
+//                        About page. Set by both workflows.
+//   MINIS_VERSION_CODE — monotonically increasing int. CI derives it as
+//                        <base> + total commit count; the base is deliberately
+//                        high so it never regresses below the versions already
+//                        published by the older "220000000 + run number" scheme
+//                        (a lower code would make the OS refuse the upgrade as a
+//                        downgrade).
+//   MINIS_VERSION_NAME_SUFFIX — legacy fallback: per-build build metadata,
+//                        e.g. "+42", appended to the hardcoded "1.0.0" line.
+//                        Still honored when MINIS_VERSION_NAME is absent.
 // Local builds fall back to the base values (22 / "1.0.0").
 val ciVersionCode: Int? = System.getenv("MINIS_VERSION_CODE")?.toIntOrNull()
+val ciVersionName: String? = System.getenv("MINIS_VERSION_NAME")?.takeIf { it.isNotBlank() }
 val ciVersionSuffix: String? = System.getenv("MINIS_VERSION_NAME_SUFFIX")
 
 // [dual-appid] Co-existence switch (experiment-first via the alt account).
@@ -63,8 +70,10 @@ android {
         minSdk = 26
         targetSdk = 35
         versionCode = ciVersionCode ?: 22
-        versionName =
-            if (ciVersionSuffix.isNullOrBlank()) "1.0.0" else "1.0.0$ciVersionSuffix"
+        // CI supplies the full git-derived name; the legacy "+<run>" suffix
+        // path is kept for local/manual builds that only set the suffix.
+        versionName = ciVersionName
+            ?: if (ciVersionSuffix.isNullOrBlank()) "1.0.0" else "1.0.0$ciVersionSuffix"
 
         // [dual-appid] Override the default-res app_name so the lab build shows
         // "RikkaMinis (Lab)" alongside the stable "RikkaMinis" on the launcher.

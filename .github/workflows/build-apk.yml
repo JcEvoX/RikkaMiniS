@@ -32,10 +32,16 @@ jobs:
       # deps/proot is a git submodule — the proot sandbox engine source. This
       # workflow builds the sandbox binary from source (see the "Build proot
       # from source" step), so the submodule must be checked out.
+      #
+      # fetch-depth: 0 + tags are REQUIRED by the "Compute version" step: the
+      # version is derived from the nearest v* tag and the commit count, and a
+      # depth-1 checkout would report 1 commit / no tags.
       - name: Checkout Code
         uses: actions/checkout@v7
         with:
           submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
 
       # Pre-build static scan gate: four-way sync, i18n orphan keys, bare
       # valueOf. Fails the build early on structural data-loss bugs that the
@@ -225,24 +231,42 @@ jobs:
       # upgrade-installs keep working. Release also sets BuildConfig.DEBUG=false,
       # so the local DebugServer (127.0.0.1:5321) is compiled out entirely.
       #
-      # The APK's version is CI-injected (see build.gradle.kts):
-      #   - MINIS_VERSION_CODE: base 220_000_000 + workflow run number —
-      #     monotonically increasing, so every published build is
-      #     upgrade-installable over the previous one AND distinguishable.
-      #   - MINIS_VERSION_NAME_SUFFIX: "+<run>" (build metadata). 1.0.0 is the
-      #     stable release line, so the per-build number must NOT be a
-      #     prerelease identifier — "-beta.<run>" made every published build a
-      #     prerelease version, which semver ranks BELOW the plain release and
-      #     which used to sort above it in our own comparator. Build metadata
-      #     is ignored by version precedence, so sideloaders can still tell
-      #     builds apart from the About page while the version stays 1.0.0.
-      # Local builds keep the hardcoded 22 / "1.0.0".
-      - name: Inject build version
+      # Version is derived from git (build.gradle.kts consumes both env vars):
+      #   versionName = <nearest v* tag, else 1.0.0>.<commits since that tag>.r<sha>
+      #                 e.g. "1.0.0.12.r3f2a1b7" — identifies the exact commit on
+      #                 the About page. Dotted with no "-": the in-app comparator
+      #                 (data/VersionCompare.kt) truncates a version at the first
+      #                 "-" and then compares dotted components numerically, so a
+      #                 dash would silently collapse the name to the base.
+      #   versionCode = 1_000_000_000 + total commit count. The high base is
+      #                 deliberate: the previous scheme shipped "220_000_000 +
+      #                 run number", so a raw commit count would sort BELOW
+      #                 already-installed builds and the OS would reject the
+      #                 upgrade as a downgrade. The base clears that floor while
+      #                 keeping the value monotonic per commit.
+      # MINIS_VERSION_NAME_SUFFIX is no longer set — the name is complete on its
+      # own. Local builds keep the hardcoded 22 / "1.0.0".
+      - name: Compute version
+        id: version
         run: |
-          VC=$((220000000 + GITHUB_RUN_NUMBER))
-          echo "MINIS_VERSION_CODE=$VC" >> "$GITHUB_ENV"
-          echo "MINIS_VERSION_NAME_SUFFIX=+$GITHUB_RUN_NUMBER" >> "$GITHUB_ENV"
-          echo "versionCode=$VC  versionNameSuffix=+$GITHUB_RUN_NUMBER"
+          BASE_TAG=$(git describe --tags --match 'v[0-9]*' --abbrev=0 2>/dev/null || echo "")
+          if [ -n "$BASE_TAG" ]; then
+            BASE_VER="${BASE_TAG#v}"
+            SINCE=$(git rev-list --count "${BASE_TAG}..HEAD")
+          else
+            BASE_VER="1.0.0"
+            SINCE=$(git rev-list --count HEAD)
+          fi
+          TOTAL=$(git rev-list --count HEAD)
+          SHORT=$(git rev-parse --short=7 HEAD)
+          VERSION_NAME="${BASE_VER}.${SINCE}.r${SHORT}"
+          VERSION_CODE=$((1000000000 + TOTAL))
+          echo "base_tag=${BASE_TAG:-<none>} since=${SINCE} total=${TOTAL}"
+          echo "version_name=$VERSION_NAME  version_code=$VERSION_CODE"
+          echo "MINIS_VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "MINIS_VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
 
       # JVM unit tests — the full suite. The test backlog that used to force a
       # scoped filter here is cleared:
@@ -343,19 +367,17 @@ jobs:
           path: src/android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
 
-      # Rename to a versioned, arch-tagged filename mirroring the official
-      # release naming (RikkaMinis-<versionName>-arm64-v8a.apk). The filename is
-      # FIXED (base version only, no -beta suffix): the rolling android-latest
-      # release must keep exactly one asset, and a suffix would make the name
-      # change every build, accumulating stale assets. The full per-build
-      # version is reported in the release body instead.
+      # Rename to a FIXED, arch-tagged filename (RikkaMinis-arm64-v8a.apk). The
+      # name is deliberately version-free: the rolling android-latest release
+      # must keep exactly one asset, and embedding the per-build version would
+      # make the name change every build, accumulating stale assets. The full
+      # per-build version (git-derived, see "Compute version") is reported in
+      # the release body and baked into the APK's versionName instead.
       - name: Stage release asset
         id: stage
         run: |
-          # Keep the base version in sync with build.gradle.kts versionName
-          # (both are the stable 1.0.0 line; CI appends +<run> build metadata).
-          VN="1.0.0${MINIS_VERSION_NAME_SUFFIX:-}"
-          VC="${MINIS_VERSION_CODE:-22}"
+          VN="${{ steps.version.outputs.version_name }}"
+          VC="${{ steps.version.outputs.version_code }}"
           OUT="RikkaMinis-arm64-v8a.apk"
           cp src/android/app/build/outputs/apk/release/app-release.apk "$OUT"
           echo "version=$VN" >> "$GITHUB_OUTPUT"

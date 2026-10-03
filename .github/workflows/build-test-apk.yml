@@ -35,10 +35,41 @@ jobs:
     steps:
       # deps/proot 是子模块；虽然 debug 构建复用已提交的预编译 .so（不重建原生库），
       # 但 checkout 仍需拉全子模块，保证仓库状态与本地一致。
+      # fetch-depth: 0 + tags 是 "Compute version" 步骤必需的：版本号取自最近 v* tag
+      # 与提交数，depth-1 的浅克隆会得到「1 个提交、无 tag」的错误值。
       - name: Checkout Code
         uses: actions/checkout@v7
         with:
           submodules: recursive
+          fetch-depth: 0
+          fetch-tags: true
+
+      # 版本号从 git 推导（与 build-apk.yml 同一套规则，build.gradle.kts 消费同名
+      # 环境变量）：versionName = <最近 v* tag，否则 1.0.0>.<距该 tag 的提交数>.r<sha>，
+      # 例如 1.0.0.12.r3f2a1b7，便于确认这个包来自哪个 commit；
+      # versionCode = 10 亿 + 总提交数（高基数保证不低于已发布版本，避免降级安装）。
+      # 注意不要用 "-"：应用内比较器会在第一个 "-" 处截断版本名。
+      - name: Compute version
+        id: version
+        run: |
+          BASE_TAG=$(git describe --tags --match 'v[0-9]*' --abbrev=0 2>/dev/null || echo "")
+          if [ -n "$BASE_TAG" ]; then
+            BASE_VER="${BASE_TAG#v}"
+            SINCE=$(git rev-list --count "${BASE_TAG}..HEAD")
+          else
+            BASE_VER="1.0.0"
+            SINCE=$(git rev-list --count HEAD)
+          fi
+          TOTAL=$(git rev-list --count HEAD)
+          SHORT=$(git rev-parse --short=7 HEAD)
+          VERSION_NAME="${BASE_VER}.${SINCE}.r${SHORT}"
+          VERSION_CODE=$((1000000000 + TOTAL))
+          echo "base_tag=${BASE_TAG:-<none>} since=${SINCE} total=${TOTAL}"
+          echo "version_name=$VERSION_NAME  version_code=$VERSION_CODE"
+          echo "MINIS_VERSION_NAME=$VERSION_NAME" >> "$GITHUB_ENV"
+          echo "MINIS_VERSION_CODE=$VERSION_CODE" >> "$GITHUB_ENV"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
 
       # 与正式流水线同一套静态扫描：四路同步、i18n 孤儿键、裸 valueOf 等。
       # 纯 Python，早失败早暴露，保持与 build-apk.yml 一致的严谨度。
@@ -85,7 +116,7 @@ jobs:
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v7
         with:
-          name: RikkaMinis-test-apk
+          name: RikkaMinis-test-${{ steps.version.outputs.version_name }}
           path: src/android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
           retention-days: 14
