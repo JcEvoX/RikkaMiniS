@@ -135,3 +135,11 @@ deps/lame-3.100/**/*.la
 deps/lame-3.100/**/*.lai
 deps/lame-3.100/**/.libs/
 deps/lame-3.100/**/.deps/
+
+# Python bytecode caches. Running the scan/diag scripts leaves __pycache__/
+# behind, and these are build byproducts that must never be committed — an
+# auto-generated .pyc was once accidentally committed (and pushed) to a
+# migration branch.
+__pycache__/
+*.pyc
+*.pyo
