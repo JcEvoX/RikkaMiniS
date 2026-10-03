@@ -1,27 +1,27 @@
 name: Build Test APK (no secrets)
 
-# 手动触发的免密钥测试打包：在 Actions 页面点 "Run workflow" 即可产出一个
+# 免密钥测试打包：推送任意分支、或在 Actions 页面点 "Run workflow"，即可产出一个
 # 可直接安装的 debug APK，仓库无需配置任何 secrets。
 #
 # 与 build-apk.yml 的分工（二者互不重叠、互不干扰）：
-#   - build-apk.yml ：正式发布流水线（push main 触发）。从源码构建 proot 原生库、
-#                     跑全量单测、用固定调试密钥签名、校验签名/产物并发布滚动
-#                     release；依赖 DEBUG_KEYSTORE_B64 等 secrets，缺失即失败。
-#   - build-test-apk.yml（本文件）：自用 / 分支测试用。纯 debug 构建，复用仓库内
-#                     已提交的预编译 .so，零 secrets 依赖；只上传 Actions artifact，
-#                     不发布 release、不覆盖任何正式产物。
+#   - build-apk.yml ：正式发布流水线（push v* 版本标签触发）。从源码构建 proot
+#                     原生库、跑全量单测、用固定调试密钥签名、校验签名/产物并发布
+#                     该标签对应的 release；依赖 DEBUG_KEYSTORE_B64 等 secrets。
+#   - build-test-apk.yml（本文件）：日常 debug 打包。任何分支推送（含 main）都走
+#                     这里；纯 debug 构建，复用仓库内已提交的预编译 .so，零 secrets
+#                     依赖；只上传 Actions artifact，不发布 release、不覆盖正式产物。
 #
 # 设计取舍（辩证吸收 RikkaHub 的“推 commit 即构建”策略，同时保留本项目的严谨约定）：
-#   - 触发条件：推送任意【非 main】分支即自动构建（含本迁移分支），改完推上去
-#     就能看到构建，无需手动点；main 交给 build-apk.yml，故 branches-ignore
-#     排除 main，避免同一次 push 双跑。
+#   - 触发条件：推送任意分支（含 main）即自动构建 debug 包。release 只认 v* 标签，
+#     而 branches 过滤只匹配分支、不匹配标签，故标签推送不会在此重复构建。
+#   - 仅仓库所有者可触发（见 jobs.build.if），杜绝他人/机器人触发。
 #   - 保留扫描门禁（scan gate）先行，和正式流水线同一套静态检查；
 #   - Gradle 构建带 3 次重试，吸收上游对 CI 网络抖动的容忍策略；
 #   - 失败时输出诊断日志，便于定位。
 on:
   push:
-    # main 由 build-apk.yml（正式发布流水线）负责，这里排除以杜绝重复构建。
-    branches-ignore: [ main ]
+    # '**' 匹配所有分支但不含标签：日常推送一律出 debug 包。
+    branches: [ '**' ]
   workflow_dispatch:
 
 # 同一 ref 的测试构建可被新的一次取消，避免排队堆积（正式流水线用另一个 group）。
@@ -32,6 +32,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    # 仅仓库所有者可触发：push 要求写权限，workflow_dispatch 则任何有写权限的协作者
+    # 都能点。显式限定触发者必须是仓库所有者。
+    if: github.triggering_actor == github.repository_owner
     steps:
       # deps/proot 是子模块；虽然 debug 构建复用已提交的预编译 .so（不重建原生库），
       # 但 checkout 仍需拉全子模块，保证仓库状态与本地一致。

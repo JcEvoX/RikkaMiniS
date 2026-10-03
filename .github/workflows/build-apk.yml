@@ -1,22 +1,19 @@
 name: Build RikkaMinis Android APK
 
+# 正式发布流水线：只在推送 v* 版本标签时触发（如 v1.1.0），产出 release APK
+# 并发起对应的 GitHub Release。日常的分支推送（含 main）一律走
+# build-test-apk.yml 的 debug 打包，不再触发本流水线，也不再滚动覆盖发布。
+#
+# workflow_dispatch 仅作「打标签前先验证」的干跑：会完整构建并上传 artifact，
+# 但不会创建 Release（发布步骤另有 tag 守卫）。
 on:
   push:
-    branches: [ main ]
-    paths:
-      - 'src/android/**'
-      - 'src/shared/**'
-      - 'deps/**'
-      - '.github/workflows/build-apk.yml'
+    tags:
+      - 'v*'
   workflow_dispatch:
 
-# [audit-RC6] Serialize overlapping builds of the SAME ref. The release path
-# replaces the rolling android-latest asset in place (same tag every build), so
-# two concurrent `main` runs could interleave and let an OLDER (lower
-# versionCode) build overwrite a NEWER one — or race each other mid-upload and
-# leave android-latest pointing at a stale/failed artifact. Grouping by ref
-# (here: every run of this workflow, keyed on the branch/tag being built) plus
-# cancel-in-progress drops the stale one so only the newest completes.
+# [audit-RC6] 同一 ref 的构建串行化：release 资产按 tag 唯一，但同一 tag 的
+# 重复触发（如重跑）仍可能并发上传；按 ref 分组 + cancel-in-progress 只保留最新。
 concurrency:
   group: build-apk-${{ github.ref }}
   cancel-in-progress: true
@@ -24,6 +21,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    # 仅仓库所有者可触发：push 事件要求写权限，workflow_dispatch 则任何有写权限的
+    # 协作者都能点。这里显式限定触发者必须是仓库所有者，杜绝他人/机器人触发发布。
+    if: github.triggering_actor == github.repository_owner
     # Needed by the "Publish to Releases" step to create/update a GitHub Release
     # and upload the APK asset. Everything else here only reads the repo.
     permissions:
@@ -367,42 +367,38 @@ jobs:
           path: src/android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
 
-      # Rename to a FIXED, arch-tagged filename (RikkaMinis-arm64-v8a.apk). The
-      # name is deliberately version-free: the rolling android-latest release
-      # must keep exactly one asset, and embedding the per-build version would
-      # make the name change every build, accumulating stale assets. The full
-      # per-build version (git-derived, see "Compute version") is reported in
-      # the release body and baked into the APK's versionName instead.
+      # Rename to a version-tagged, arch-tagged filename mirroring the reference
+      # release naming (RikkaMinis-<versionName>-arm64-v8a.apk). Each v* tag now
+      # publishes its OWN Release, so embedding the version is safe (releases no
+      # longer overwrite one shared asset) and keeps multiple downloaded copies
+      # distinguishable on disk. The version is git-derived, see "Compute version".
       - name: Stage release asset
         id: stage
         run: |
           VN="${{ steps.version.outputs.version_name }}"
           VC="${{ steps.version.outputs.version_code }}"
-          OUT="RikkaMinis-arm64-v8a.apk"
+          OUT="RikkaMinis-${VN}-arm64-v8a.apk"
           cp src/android/app/build/outputs/apk/release/app-release.apk "$OUT"
           echo "version=$VN" >> "$GITHUB_OUTPUT"
           echo "versionCode=$VC" >> "$GITHUB_OUTPUT"
           echo "asset=$OUT" >> "$GITHUB_OUTPUT"
           ls -la "$OUT"
 
-      # Publish the APK to a rolling Release so it can be downloaded directly
-      # from the repo's Releases page — same tag every build, asset replaced
-      # in place, so the download link is stable.
+      # Publish a GitHub Release for the pushed tag, so the tagged commit is
+      # downloadable straight from the Releases page.
       #
-      # IMPORTANT: publishing is gated to the default branch. Without the gate
-      # a `workflow_dispatch` run against a feature branch (used to validate
-      # branch builds in CI) would overwrite android-latest with a test
-      # build — exactly how the rolling release got polluted on 2026-08-05.
-      # Feature-branch builds still surface the APK in the run's Artifacts
-      # tab; only `main` may replace the official download asset.
+      # Gated to v* tags: a `workflow_dispatch` dry run against a branch still
+      # builds and uploads an Artifact, but never creates a Release. (This used
+      # to be gated to `refs/heads/main` back when releases rolled on every push;
+      # releases are tag-driven now — see the trigger at the top of this file.)
       - name: Publish to Releases
-        if: github.ref == 'refs/heads/main'
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         with:
-          tag_name: android-latest
-          name: "RikkaMinis Android v${{ steps.stage.outputs.version }}"
+          tag_name: ${{ github.ref_name }}
+          name: "RikkaMinis ${{ github.ref_name }}"
           body: |
-            Automated Android build — always the newest commit on `main`.
+            RikkaMinis Android 正式发布（标签 `${{ github.ref_name }}`）。
 
             - Version: `${{ steps.stage.outputs.version }}` (versionCode `${{ steps.stage.outputs.versionCode }}`)
             - Commit: ${{ github.sha }}
@@ -416,13 +412,10 @@ jobs:
 
             ## 📝 说明
 
-            - 本版是 `main` 的正式发布（滚动更新：每次 `main` 构建覆盖同一
-              release，版本号保持 1.0.0，构建号见 Version 一栏）。应用目前
-              运行稳定，无需特别的维护操作。
+            - 本版由标签 `${{ github.ref_name }}` 触发，即该标签对应的正式构建。
             - 若个别设备上遇到异常，先"强行停止"应用再重开即可，一般无需
               卸载重装（卸载会丢失本地会话/配置/密钥，操作前请先备份）。
-            - 若某次更新后核心功能异常，可回退到本页上一条 release 记录下载
-              的旧构建。
+            - 若某次更新后核心功能异常，可回退到上一条 release 记录下载的旧构建。
             - 此构建使用 debug 签名密钥（公开常量），任何人可重签同名 APK，
               请**只从本仓库 Releases 页下载**。
           files: ${{ steps.stage.outputs.asset }}
