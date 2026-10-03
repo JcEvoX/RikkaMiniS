@@ -2,18 +2,24 @@
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Android%20arm64-brightgreen.svg)](#install)
-[![Build](https://github.com/logicflow-GYW/RikkaMinis/actions/workflows/build-apk.yml/badge.svg)](https://github.com/logicflow-GYW/RikkaMinis/actions/workflows/build-apk.yml)
+[![Build](https://github.com/JcEvoX/RikkaMiniS/actions/workflows/build-apk.yml/badge.svg)](https://github.com/JcEvoX/RikkaMiniS/actions/workflows/build-apk.yml)
 
 **简体中文** · [English](README_EN.md)
 
 **你的私有、端侧 AI 智能体。**
 
-RikkaMinis 是一个个人专用的 **Android-only** 构建，杂交了两个项目：
-引擎与代码库来自 [OpenMinis](https://github.com/OpenMinis/OpenMinis)，
-UI 与交互逻辑则受 [RikkaHub](https://github.com/rikkahub/rikkahub) 启发——
+RikkaMiniS 是一个个人专用的 **Android-only** 构建，**在
+[logicflow-GYW/RikkaMinis](https://github.com/logicflow-GYW/RikkaMinis) 的基础上二次开发**；
+后者本身派生自 [OpenMinis](https://github.com/OpenMinis/OpenMinis)——引擎与代码库来自
+OpenMinis，UI 与交互逻辑则受 [RikkaHub](https://github.com/rikkahub/rikkahub) 启发——
 包括聊天历史抽屉、极简顶栏、消息流布局，以及消息流跟随、输入栏聚焦这类交互行为。
 
-它在 GitHub Actions 上构建可用的 APK 并自动发布。
+本二开在其之上，**移植了自己在另一个二开
+[JcEvoX/RikkaHuB](https://github.com/JcEvoX/RikkaHuB) 里做的一批能力**——
+逆向工作台、内置逆向技能库、快捷消息、高级功能等，详见
+[本二开新增/改动](#本二开新增改动)。
+
+它在 GitHub Actions 上构建可用的 APK 并发布。
 
 OpenMinis 核心把领先的模型——Claude、GPT、Gemini 等——带进原生移动体验，
 并给它们一台真正的计算机：设备上运行的完整 Linux Shell、浏览器自动化、
@@ -24,13 +30,64 @@ OpenMinis 核心把领先的模型——Claude、GPT、Gemini 等——带进原
 
 ---
 
+## ⚠️ 项目来源与开源声明（重要）
+
+**本仓库是基于 [logicflow-GYW/RikkaMinis](https://github.com/logicflow-GYW/RikkaMinis)
+二次开发的衍生作品**，而 RikkaMinis 又派生自
+[OpenMinis/OpenMinis](https://github.com/OpenMinis/OpenMinis)。
+
+- 直接上游：**logicflow-GYW/RikkaMinis** —— <https://github.com/logicflow-GYW/RikkaMinis>
+- 更上游：**OpenMinis/OpenMinis** —— <https://github.com/OpenMinis/OpenMinis>
+- UI 设计参照：**rikkahub/rikkahub**（AGPL-3.0）—— <https://github.com/rikkahub/rikkahub>
+- 本仓库许可证：**[GPL-3.0](LICENSE)**，继承自上游（上游因链接 GPLv2 的 PRoot
+  而以 GPLv3 分发合并作品）
+
+核心框架与绝大部分代码（聊天 / 供应商 / 模型 / MCP / 技能 / 沙箱 / 备份等）来自上述
+上游，**版权与署名归原作者所有**。本二开只在其上做增量改动，并完整保留上游的署名与
+许可证；衍生作品同样以 GPL-3.0 开源。
+
+此外，本二开的能力最初做在自己的另一个二开项目
+[JcEvoX/RikkaHuB](https://github.com/JcEvoX/RikkaHuB) 里（那是
+[rikkahub](https://github.com/rikkahub/rikkahub) 的 AGPL-3.0 二开），现在被移植到
+本仓库的底座上——因为本仓库的底座更稳定、能力更丰富。
+
+> 若上游作者对本二开有任何异议，请联系我，我会积极配合处理。
+
+---
+
+## 本二开新增/改动
+
+> 下列能力相对**直接上游** `logicflow-GYW/RikkaMinis` 是新增的，原本做在
+> [JcEvoX/RikkaHuB](https://github.com/JcEvoX/RikkaHuB) 里，现移植到本仓库。
+> 上游继承来的能力见下文[「继承自上游 RikkaMinis 的能力」](#继承自上游-rikkaminis-的能力)。
+
+- **逆向工作台。** 设置页内置卡片，预置三个**本机逆向 MCP 后端**——MT 管理器（APK 层：
+  解包 / smali / AXML / 重签 / 重打包）、SOMCP（综合逆向：反编译 / 脱壳 / SO 分析 /
+  模拟执行 / 重打包签名 / Frida）、ProxyPin（HTTP/HTTPS 抓包）。可逐个启用停用、改端口，
+  支持**一键探测端口并连接**，以及直接拉起对应应用 / 获取安装包。全部指向 `127.0.0.1`，
+  仅本机可达；默认关闭，启用后才生效。
+- **内置逆向技能库。** 打包了一批安卓逆向 / 安全分析技能文档（40+ 个技能目录，含
+  `android-reverse-engineering`、`ida-*`、`frida-scripts`、`mt-mcp-apk-analyzer`、
+  `deobfuscation-ollvm`、`devirtualization-vmp`、`unity-il2cpp-reverse`、`smali-repack` 等），
+  以及把逆向系统提示词与工作流整合进来的 `ai-reverse-workflow` 技能。
+- **快捷消息。** 全局提示词模板库：维护常用提示词，会话输入框一键填入（追加而非覆盖），
+  长模板不必反复手打。
+- **高级功能集中页。** 设置 → 高级功能，集中放置「持续工作」与「存储」相关开关；其中
+  「持续工作」在 AI 回复中断但任务未完成时自动追加「继续」，并有轮数上限防止无限消耗。
+- **MT 分析缓存清理。** 一键统计 / 清理 MT 管理器的分析缓存，并自动处理 Android 10 与
+  11+ 的存储权限差异（跳转「全部文件访问」授权）。
+
+其余能力均为上游既有实现。
+
+---
+
 ## 安装
 
-**→ [下载最新 APK](https://github.com/logicflow-GYW/RikkaMinis/releases/tag/android-latest)**
+**→ [下载最新 APK](https://github.com/JcEvoX/RikkaMiniS/releases)**
 
-每次推送到 `main` 的**代码改动**（`src/android/**`、`src/shared/**`、`deps/**`
-或 workflow 文件）都会构建一个发布版 APK 并重新发布到该链接——纯文档改动
-（README / 许可证等）不触发构建。所以这个 URL 始终指向最新构建。要求：
+正式版由**推送 `v*` 版本标签**触发（如 `v1.0.0`）：构建 release APK 并发布为该标签
+对应的 GitHub Release。日常的分支推送（含 `main`）**不会**发布正式版，只会在该次
+Actions 运行的 Artifacts 里产出一个 debug 包，供自测使用。要求：
 
 - **arm64-v8a** 设备（任意现代手机），**Android 8.0+**
 - 设备提示时允许"安装未知来源应用"
@@ -46,7 +103,11 @@ SHA-256  FC:0C:40:0D:B7:7E:C1:81:A3:35:18:C2:E8:13:6A:AE
 
 ---
 
-## 这个 fork 改了什么
+## 继承自上游 RikkaMinis 的能力
+
+> 本节内容**继承自直接上游** [logicflow-GYW/RikkaMinis](https://github.com/logicflow-GYW/RikkaMinis)，
+> 描述的是它相对 OpenMinis 的改动（本仓库直接沿用，并非本二开所加）。本二开自己新增的
+> 能力见上文[「本二开新增/改动」](#本二开新增改动)。
 
 起初这是一个纯构建 fork，但现在也携带了一小批上游没有的 Android 专属产品改动。
 
@@ -145,12 +206,14 @@ SHA-256  FC:0C:40:0D:B7:7E:C1:81:A3:35:18:C2:E8:13:6A:AE
   禁用工具，schema 见 [docs/stability/trace-schema-v2.md](docs/stability/trace-schema-v2.md)）。
   任何一条硬失败都会中止构建。
 - **iOS 源码已移除。** `src/ios/` 已删除；本树仅限 Android。
-- **自动发布。** 成功构建会把 APK 发布到 `android-latest` release。
-- **小号线（alt 构建）。** `rikkaflow/RikkaMinis` 是同一棵树的一条镜像线，
-  只差一处：构建时注入 `MINIS_APP_ID_OVERRIDE=com.rikkaminis.app.lab`，产物与
-  稳定版**同设备共存**（各自数据目录与进程名），同时也是主号那棵树处于手术中时的
-  可用构建。它跟随上游 main 自动同步（每晚或手动派发）。详见
-  [docs/ALT_ACCOUNT.md](docs/ALT_ACCOUNT.md)。
+- **标签驱动的发布。** 推送 `v*` 版本标签时构建 release APK，并发布为该标签对应的
+  GitHub Release（版本名 = 最近 `v*` 标签 + 距该标签的提交数 + 短 hash，
+  见 [build-apk.yml](.github/workflows/build-apk.yml)）。日常分支推送**不**发布正式版，
+  只产出 debug 包作为该次运行的 Artifacts。构建与发布均限定仅仓库所有者可触发。
+- **alt 构建开关仍保留。** 代码中留有注入 `MINIS_APP_ID_OVERRIDE=com.rikkaminis.app.lab`
+  来构建「小号线」的能力：产物与主号**同设备共存**（各自数据目录与进程名），也是主号
+  那棵树处于手术中时的可用构建。本仓库**不发布**该镜像线（发布它的是上游作者的
+  `rikkaflow/RikkaMinis`）。机制说明见 [docs/ALT_ACCOUNT.md](docs/ALT_ACCOUNT.md)。
 - **平台技能打进资产包。** `semantic-memory`、`github-ops`、
   `cloudflare-fullright-ops`、`skill-creator` 四个技能（含脚本）随 APK
   一起打包在 `assets/skills/`，安装即自带，无需手动安装。
@@ -262,8 +325,8 @@ token 只用于这些显式请求的鉴权。
 ## 本地构建
 
 ```sh
-git clone --recurse-submodules https://github.com/logicflow-GYW/RikkaMinis.git
-cd RikkaMinis/src/android
+git clone --recurse-submodules https://github.com/JcEvoX/RikkaMiniS.git
+cd RikkaMiniS/src/android
 ../../deps/build_proot.sh        # 从源码构建 proot 沙箱引擎
 ./gradlew assembleRelease
 ```
@@ -344,11 +407,20 @@ scripts/          二进制同步与开发者工具
 ## 致谢
 
 RikkaMinis 建立在大量开源工作之上——完整清单见
-[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。本 fork 派生自
-**[OpenMinis/OpenMinis](https://github.com/OpenMinis/OpenMinis)**，并从头构建其
-沙箱二进制：`deps/proot` 子模块（OpenMinis 的 PRoot fork，含其 native-offload
-与 W^X 扩展）在每次 CI 运行中通过 `deps/build_proot.sh` 用 NDK r28 编译。
-本仓库不提交任何预构建的沙箱二进制。
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)。
+
+**谱系** — 本项目（RikkaMiniS）是
+**[logicflow-GYW/RikkaMinis](https://github.com/logicflow-GYW/RikkaMinis)** 的
+二次开发；RikkaMinis 又派生自
+**[OpenMinis/OpenMinis](https://github.com/OpenMinis/OpenMinis)**——引擎与代码库
+是本项目的主体，UI 与交互逻辑受
+**[RikkaHub](https://github.com/rikkahub/rikkahub)** 启发。本二开新增的逆向工作台、
+内置逆向技能库、快捷消息、高级功能等能力，移植自自己的另一个二开
+**[JcEvoX/RikkaHuB](https://github.com/JcEvoX/RikkaHuB)**。感谢上述所有原作者。
+
+本仓库从头构建其沙箱二进制：`deps/proot` 子模块（OpenMinis 的 PRoot fork，含其
+native-offload 与 W^X 扩展）在每次 CI 运行中通过 `deps/build_proot.sh` 用 NDK r28
+编译。本仓库不提交任何预构建的沙箱二进制。
 
 **沙箱** — [PRoot](https://github.com/termux/proot)（GPLv2），Android 沙箱的用户态
 chroot，经由 [OpenMinis 的 fork](https://github.com/OpenMinis/proot)；
@@ -419,12 +491,16 @@ RikkaMinis 以 **[GNU General Public License v3.0](LICENSE)** 许可。
 
 ## 上游
 
-原始项目、iOS 应用、issue 与社区：
+**直接上游**（本二开所基于的树）：
+
+**→ [logicflow-GYW/RikkaMinis](https://github.com/logicflow-GYW/RikkaMinis)**
+
+**原始项目、iOS 应用、issue 与社区**：
 
 **→ [OpenMinis/OpenMinis](https://github.com/OpenMinis/OpenMinis)** ·
 [openminis.app](https://openminis.app) ·
 [Telegram](https://t.me/+2NzhOJuzRyI1YmM1)
 
-对于一般应用 bug，请检查官方上游构建是否也会出现。上游 issue 属于
-OpenMinis/OpenMinis；本 fork 的构建、APK、备份/恢复流程或 Android UI 改动
-的问题请提交到本仓库。
+对于一般应用 bug，请先检查上游构建是否也会出现。上游 issue 属于
+OpenMinis/OpenMinis 或 logicflow-GYW/RikkaMinis；本二开自己的构建、APK、
+逆向工作台 / 快捷消息等改动的问题请提交到本仓库。

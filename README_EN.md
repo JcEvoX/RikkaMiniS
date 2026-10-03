@@ -2,20 +2,27 @@
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Android%20arm64-brightgreen.svg)](#install)
-[![Build](https://github.com/logicflow-GYW/RikkaMinis/actions/workflows/build-apk.yml/badge.svg)](https://github.com/logicflow-GYW/RikkaMinis/actions/workflows/build-apk.yml)
+[![Build](https://github.com/JcEvoX/RikkaMiniS/actions/workflows/build-apk.yml/badge.svg)](https://github.com/JcEvoX/RikkaMiniS/actions/workflows/build-apk.yml)
 
 [简体中文](README.md) · **English**
 
 **Your private, on-device AI agent.**
 
-RikkaMinis is a personal **Android-only** build that hybridizes two projects:
-the engine and codebase come from [OpenMinis](https://github.com/OpenMinis/OpenMinis),
-while the UI and interaction logic are inspired by
-[RikkaHub](https://github.com/rikkahub/rikkahub) — including the chat history
-drawer, minimal top bar, message-list layout, and interaction behaviors such as
-message-list follow and input-bar focus.
+RikkaMiniS is a personal **Android-only** build, **developed as a derivative work on
+top of [logicflow-GYW/RikkaMinis](https://github.com/logicflow-GYW/RikkaMinis)**,
+which itself derives from [OpenMinis](https://github.com/OpenMinis/OpenMinis) — the
+engine and codebase come from OpenMinis, while the UI and interaction logic are
+inspired by [RikkaHub](https://github.com/rikkahub/rikkahub), including the chat
+history drawer, minimal top bar, message-list layout, and interaction behaviors such
+as message-list follow and input-bar focus.
 
-It builds a working APK on GitHub Actions and publishes it automatically.
+On top of that, this derivative work **ports over a set of capabilities originally
+built in my other derivative project
+[JcEvoX/RikkaHuB](https://github.com/JcEvoX/RikkaHuB)** — the reverse-engineering
+workbench, bundled reverse-engineering skills, quick messages, advanced features and
+more. See [What this derivative work adds](#what-this-derivative-work-adds).
+
+It builds a working APK on GitHub Actions and publishes it.
 
 The OpenMinis core brings leading models — Claude, GPT, Gemini and more — into
 a native mobile experience, and gives them a real computer to work with: a full
@@ -28,15 +35,80 @@ persistent memory, and deep system integration.
 
 ---
 
+## ⚠️ Provenance & open-source notice (important)
+
+**This repository is a derivative work based on
+[logicflow-GYW/RikkaMinis](https://github.com/logicflow-GYW/RikkaMinis)**, which
+itself derives from [OpenMinis/OpenMinis](https://github.com/OpenMinis/OpenMinis).
+
+- Direct upstream: **logicflow-GYW/RikkaMinis** — <https://github.com/logicflow-GYW/RikkaMinis>
+- Further upstream: **OpenMinis/OpenMinis** — <https://github.com/OpenMinis/OpenMinis>
+- UI design reference: **rikkahub/rikkahub** (AGPL-3.0) — <https://github.com/rikkahub/rikkahub>
+- License of this repository: **[GPL-3.0](LICENSE)**, inherited from upstream (upstream
+  distributes the combined work as GPLv3 because it links GPLv2 PRoot)
+
+The core framework and the vast majority of the code (chat / providers / models
+/ MCP / skills / sandbox / backup, etc.) come from the upstream projects above, and
+**copyright and attribution belong to the original authors**. This derivative work
+only adds incremental changes on top, keeping upstream attribution and license
+intact; derivative works are likewise released under GPL-3.0.
+
+In addition, the capabilities added here were originally built in my other
+derivative project [JcEvoX/RikkaHuB](https://github.com/JcEvoX/RikkaHuB) (an
+AGPL-3.0 derivative of [rikkahub](https://github.com/rikkahub/rikkahub)), and have
+now been ported onto this repository's base — because this base is more stable and
+better equipped.
+
+> If any upstream author objects to this derivative work, please contact me and I
+> will cooperate promptly.
+
+---
+
+## What this derivative work adds
+
+> The capabilities below are new relative to the **direct upstream**
+> `logicflow-GYW/RikkaMinis`. They were originally built in
+> [JcEvoX/RikkaHuB](https://github.com/JcEvoX/RikkaHuB) and have now been ported here.
+> Capabilities inherited from upstream are listed under
+> [Capabilities inherited from upstream RikkaMinis](#capabilities-inherited-from-upstream-rikkaminis).
+
+- **Reverse-engineering workbench.** A settings-page card presetting three
+  **on-device reverse-engineering MCP backends** — MT Manager (APK layer: unpack /
+  smali / AXML / re-sign / repack), SOMCP (aggregate reverse: decompile / unpack /
+  SO analysis / emulation / rebuild + sign / Frida) and ProxyPin (HTTP/HTTPS
+  capture). Each backend can be toggled on/off and its port edited independently,
+  with **one-tap port probing and connection**, plus a shortcut to launch the
+  matching app or fetch its installer. All endpoints point at `127.0.0.1` and are
+  local-only; everything is disabled by default until you enable it.
+- **Bundled reverse-engineering skill library.** A batch of Android
+  reverse-engineering / security-analysis skill documents (40+ skill directories,
+  including `android-reverse-engineering`, `ida-*`, `frida-scripts`,
+  `mt-mcp-apk-analyzer`, `deobfuscation-ollvm`, `devirtualization-vmp`,
+  `unity-il2cpp-reverse`, `smali-repack` and more), plus an `ai-reverse-workflow`
+  skill that folds in the reverse-engineering system prompt and workflow.
+- **Quick messages.** A global prompt-template library: keep your frequently used
+  prompts and insert them into the chat input with one tap (appended, not
+  overwritten) — no more retyping long templates.
+- **Advanced-features page.** Settings → Advanced features gathers the
+  "continuous work" and "storage" toggles; "continuous work" automatically appends
+  "continue" when the AI's reply is cut off mid-task, with a round cap to prevent
+  runaway token use.
+- **MT analysis-cache cleanup.** One-tap statistics / cleanup of MT Manager's
+  analysis cache, handling the Android 10 vs 11+ storage-permission differences
+  automatically (jumping to "All files access").
+
+Everything else is upstream's existing implementation.
+
+---
+
 ## Install
 
-**→ [Download the latest APK](https://github.com/logicflow-GYW/RikkaMinis/releases/tag/android-latest)**
+**→ [Download the latest APK](https://github.com/JcEvoX/RikkaMiniS/releases)**
 
-Every push to `main` with **code changes** (`src/android/**`,
-`src/shared/**`, `deps/**` or workflow files) builds a release APK and
-republishes it to that link — pure doc changes (README / licenses) do
-not trigger a build. So the URL always points at the latest build.
-Requirements:
+Official releases are triggered by **pushing a `v*` version tag** (e.g. `v1.0.0`):
+a release APK is built and published as the GitHub Release for that tag. Regular
+branch pushes (including `main`) do **not** publish an official release — they only
+produce a debug APK in that run's Artifacts for self-testing. Requirements:
 
 - **arm64-v8a** device (any modern phone), **Android 8.0+**
 - Enable "install from unknown sources" when your device prompts
@@ -53,7 +125,14 @@ Verify a download with `python3 scripts/apk_cert_sha256.py <apk>`.
 
 ---
 
-## What this fork changes
+## Capabilities inherited from upstream RikkaMinis
+
+> This section is **inherited from the direct upstream**
+> [logicflow-GYW/RikkaMinis](https://github.com/logicflow-GYW/RikkaMinis) and
+> describes *its* changes relative to OpenMinis (this repository simply carries them;
+> they are not additions of this derivative work). For this derivative work's own
+> additions, see [What this derivative work adds](#what-this-derivative-work-adds)
+> above.
 
 This started as a build-only fork, but it now also carries a small set of
 Android-specific product changes that are not present upstream.
@@ -195,15 +274,18 @@ See [docs/DEVELOPMENT_LIFECYCLE.md](docs/DEVELOPMENT_LIFECYCLE.md).
   [docs/stability/trace-schema-v2.md](docs/stability/trace-schema-v2.md)).
   Any hard failure aborts the build.
 - **iOS sources removed.** `src/ios/` is gone; this tree is Android only.
-- **Automatic releases.** Successful builds publish the APK to the
-  `android-latest` release.
-- **Alt line (co-installing builds).** `rikkaflow/RikkaMinis` mirrors this tree
-  with exactly one delta: its build injects
-  `MINIS_APP_ID_OVERRIDE=com.rikkaminis.app.lab`, so its APK **co-exists with the
-  stable app on the same device** (own data dir and process names) — and it stays
-  a buildable copy of the tree while this one is mid-surgery. It follows upstream
-  main automatically (nightly, or on dispatch). See
-  [docs/ALT_ACCOUNT.md](docs/ALT_ACCOUNT.md).
+- **Tag-driven releases.** Pushing a `v*` version tag builds a release APK and
+  publishes it as the GitHub Release for that tag (version name = most recent `v*`
+  tag + commits since that tag + short hash, see
+  [build-apk.yml](.github/workflows/build-apk.yml)). Regular branch pushes do **not**
+  publish an official release — they only produce a debug APK as that run's
+  Artifacts. Building and publishing are restricted to the repository owner.
+- **The alt-build switch is still present.** The code retains the ability to inject
+  `MINIS_APP_ID_OVERRIDE=com.rikkaminis.app.lab` to build the "alt line", whose APK
+  **co-exists with the stable app on the same device** (own data dir and process
+  names) — and it stays a buildable copy of the tree while this one is mid-surgery.
+  This repository does **not** publish that mirror line (the upstream author's
+  `rikkaflow/RikkaMinis` does). See [docs/ALT_ACCOUNT.md](docs/ALT_ACCOUNT.md).
 - **Platform skills shipped in assets.** `semantic-memory`,
   `github-ops`, `cloudflare-fullright-ops` and `skill-creator`
   (with their scripts) are bundled under `app/src/main/assets/skills/`,
@@ -339,8 +421,8 @@ curated collection of use cases and workflows.
 ## Building locally
 
 ```sh
-git clone --recurse-submodules https://github.com/logicflow-GYW/RikkaMinis.git
-cd RikkaMinis/src/android
+git clone --recurse-submodules https://github.com/JcEvoX/RikkaMiniS.git
+cd RikkaMiniS/src/android
 ../../deps/build_proot.sh        # build the proot sandbox engine from source
 ./gradlew assembleRelease
 ```
@@ -429,12 +511,22 @@ scripts/          Binary sync and developer tooling
 ## Acknowledgements
 
 RikkaMinis stands on a great deal of open-source work — full inventory in
-[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md). This fork is derived from
-**[OpenMinis/OpenMinis](https://github.com/OpenMinis/OpenMinis)** and builds its
-sandbox binaries from source: the `deps/proot` submodule (OpenMinis' PRoot
-fork, including its native-offload and W^X extensions) is compiled on every CI
-run via `deps/build_proot.sh` with NDK r28. No prebuilt sandbox binaries are
-committed to this repository.
+[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
+
+**Lineage** — this project (RikkaMiniS) is a derivative work based on
+**[logicflow-GYW/RikkaMinis](https://github.com/logicflow-GYW/RikkaMinis)**, which
+in turn derives from **[OpenMinis/OpenMinis](https://github.com/OpenMinis/OpenMinis)**
+— the engine and codebase are the bulk of this project, with the UI and interaction
+logic inspired by **[RikkaHub](https://github.com/rikkahub/rikkahub)**. The
+reverse-engineering workbench, bundled reverse-engineering skills, quick messages
+and advanced features added by this derivative work were ported from my other
+derivative project **[JcEvoX/RikkaHuB](https://github.com/JcEvoX/RikkaHuB)**.
+Thanks to all the original authors above.
+
+This repository builds its sandbox binaries from source: the `deps/proot` submodule
+(OpenMinis' PRoot fork, including its native-offload and W^X extensions) is compiled
+on every CI run via `deps/build_proot.sh` with NDK r28. No prebuilt sandbox binaries
+are committed to this repository.
 
 **The sandbox** — [PRoot](https://github.com/termux/proot) (GPLv2), user-space
 chroot for the Android sandbox, via [OpenMinis' fork](https://github.com/OpenMinis/proot);
@@ -510,12 +602,17 @@ licenses are listed in [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md).
 
 ## Upstream
 
-For the original project, the iOS app, issues and community:
+**Direct upstream** (the tree this derivative work is based on):
+
+**→ [logicflow-GYW/RikkaMinis](https://github.com/logicflow-GYW/RikkaMinis)**
+
+**For the original project, the iOS app, issues and community**:
 
 **→ [OpenMinis/OpenMinis](https://github.com/OpenMinis/OpenMinis)** ·
 [openminis.app](https://openminis.app) ·
 [Telegram](https://t.me/+2NzhOJuzRyI1YmM1)
 
-For general app bugs, check whether they also occur in the official upstream
-build. Upstream issues belong at OpenMinis/OpenMinis; problems with this fork's
-build, APK, backup/restore flow, or Android UI changes belong in this repository.
+For general app bugs, first check whether they also occur in an upstream build.
+Upstream issues belong at OpenMinis/OpenMinis or logicflow-GYW/RikkaMinis; problems
+with this derivative work's own build, APK, reverse-engineering workbench, quick
+messages or similar changes belong in this repository.
