@@ -11,12 +11,17 @@ name: Build Test APK (no secrets)
 #                     已提交的预编译 .so，零 secrets 依赖；只上传 Actions artifact，
 #                     不发布 release、不覆盖任何正式产物。
 #
-# 设计取舍（辩证吸收 RikkaHub 的“点一下就能出包”策略，同时保留本项目的严谨约定）：
+# 设计取舍（辩证吸收 RikkaHub 的“推 commit 即构建”策略，同时保留本项目的严谨约定）：
+#   - 触发条件：推送任意【非 main】分支即自动构建（含本迁移分支），改完推上去
+#     就能看到构建，无需手动点；main 交给 build-apk.yml，故 branches-ignore
+#     排除 main，避免同一次 push 双跑。
 #   - 保留扫描门禁（scan gate）先行，和正式流水线同一套静态检查；
-#   - 仅 workflow_dispatch 手动触发，避免与 build-apk.yml 在 push 时重复构建；
 #   - Gradle 构建带 3 次重试，吸收上游对 CI 网络抖动的容忍策略；
 #   - 失败时输出诊断日志，便于定位。
 on:
+  push:
+    # main 由 build-apk.yml（正式发布流水线）负责，这里排除以杜绝重复构建。
+    branches-ignore: [ main ]
   workflow_dispatch:
 
 # 同一 ref 的测试构建可被新的一次取消，避免排队堆积（正式流水线用另一个 group）。
