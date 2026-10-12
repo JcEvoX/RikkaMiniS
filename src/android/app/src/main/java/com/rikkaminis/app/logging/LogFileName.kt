@@ -1,6 +1,7 @@
 package com.rikkaminis.app.logging
 
 import java.io.File
+import java.io.RandomAccessFile
 
 /**
  * [T-log-single-writer] Per-process daily log file names.
@@ -63,6 +64,42 @@ internal fun highestRollIndex(names: Collection<String>, baseName: String): Int 
         mid.toIntOrNull()?.let { if (it > highest) highest = it }
     }
     return highest
+}
+
+/**
+ * [T-log-tail-heal-1012] Repair a torn tail left by an interrupted write.
+ *
+ * The daily file names are per-PROCESS but long-lived across process
+ * generations: a kill / silent_kill that lands inside a buffered write
+ * (JVM StreamEncoder flushes in 8 KB blocks) leaves a trailing fragment
+ * WITHOUT a newline, and the next process's first append glues onto it —
+ * corrupting two log lines into one. Measured 2026-10-12: 26 torn lines in
+ * the main file / 78 in the worker file, every one glued to the next
+ * process's session-start line.
+ *
+ * If [file] exists and does not end with `\n`, appends a newline plus
+ * [markerLine] so both fragments become parseable lines again. Appending,
+ * never truncating — the fragment itself may hold the only copy of that log
+ * line. Returns true when a heal was performed. Best-effort: any I/O error
+ * returns false and must never break logging.
+ *
+ * Pure JVM (no Android imports) so the tail logic is unit-testable.
+ */
+internal fun healTornTail(file: File, markerLine: String): Boolean {
+    return try {
+        if (!file.exists() || file.length() == 0L) return false
+        RandomAccessFile(file, "rw").use { raf ->
+            val len = raf.length()
+            if (len == 0L) return false
+            raf.seek(len - 1)
+            if (raf.read() == '\n'.code) return false
+            raf.seek(len)
+            raf.write(("\n$markerLine\n").toByteArray(Charsets.UTF_8))
+            true
+        }
+    } catch (_: Exception) {
+        false
+    }
 }
 
 /**

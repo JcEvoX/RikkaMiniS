@@ -449,6 +449,14 @@ object AppLogger {
      * Open (or reuse) the daily writer for [date]. Callers on the write path
      * invoke this INSIDE `synchronized(writerLock)` so the returned writer
      * cannot be closed before the caller finishes writing — see [writerLock].
+     *
+     * [T-log-tail-heal-1012] On a fresh open the file tail is checked: a
+     * torn write (multi-process shared name + 8 KB buffered encoder cut at a
+     * kill/silent_kill boundary, measured 2026-10-12: 26 main / 78 worker
+     * torn lines in one day, every one followed by the next process's
+     * session-start line) leaves a trailing fragment WITHOUT a newline, and
+     * the next append glues onto it — corrupting two log lines. Healing
+     * appends a separator so both fragments become parseable lines again.
      */
     private fun getWriter(date: String): PrintWriter {
         synchronized(writerLock) {
@@ -456,11 +464,23 @@ object AppLogger {
                 writer?.close()
                 val dir = logDir ?: throw IllegalStateException("AppLogger not initialized")
                 val file = File(dir, channelFileName("minis", date, processSuffix))
+                healTornTail(file)
                 writer = PrintWriter(FileWriter(file, true))
                 currentDate = date
             }
             return writer!!
         }
+    }
+
+    /**
+     * [T-log-tail-heal-1012] If [file] exists and does not end with `\n`,
+     * append a healing separator (newline + a marker line) so the torn
+     * fragment stops gluing onto the next process's first line. Appending
+     * (not truncating) — the fragment itself may still hold the only copy of
+     * that log line. See [healTornTail] in LogFileName.kt (pure JVM, tested).
+     */
+    private fun healTornTail(file: File) {
+        healTornTail(file, "[${timeStamp()}] [INFO] [AppLogger] --- healed torn tail (interrupted write, no trailing newline) ---")
     }
 
     /**
@@ -516,6 +536,7 @@ object AppLogger {
             }
             val dir = logDir ?: throw IllegalStateException("AppLogger not initialized")
             val file = File(dir, channelFileName("debug", date, processSuffix))
+            healTornTail(file) // [T-log-tail-heal-1012] same tear risk as the main channel
             debugWriter = PrintWriter(FileWriter(file, true))
             debugDate = date
             debugBytesWritten = file.length()
