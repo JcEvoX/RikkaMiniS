@@ -84,31 +84,50 @@ internal fun scanThinkTags(
     currentFormat: ThinkTagDef?,
     formats: List<ThinkTagDef>,
 ): ThinkTagScanResult {
-    val bufLower = buffer.lowercase()
+    // [unicode-index-shift] Never search a `buffer.lowercase()` copy: U+0130 (İ)
+    // lowercases to TWO code points ("i\u0307"), so every index taken from the
+    // lowercased string past an İ is shifted +1 — slicing the SOURCE buffer with
+    // such an index eats/corrupts text (2026-10-12 repro:
+    // "İ<thinking>abc</thinking>done" -> visible="İ<one", thinking="bc<").
+    // All searches below stay in SOURCE coordinates. Same fix family as
+    // stripOrphanThinkClosers (2026-09-27, which fixed the same pattern there).
+    fun indexOfIgnoreCase(haystack: String, needle: String, from: Int): Int {
+        if (needle.isEmpty()) return from
+        val last = haystack.length - needle.length
+        var j = from.coerceAtLeast(0)
+        while (j <= last) {
+            if (haystack.regionMatches(j, needle, 0, needle.length, ignoreCase = true)) return j
+            j++
+        }
+        return -1
+    }
+
+    /** Longest tail of [buffer] that is a prefix of [tag]. */
+    fun maxTagPrefixLen(tag: String): Int {
+        val maxLen = minOf(tag.length - 1, buffer.length)
+        for (len in maxLen downTo 1) {
+            if (buffer.regionMatches(buffer.length - len, tag, 0, len, ignoreCase = true)) return len
+        }
+        return 0
+    }
     val visibleBuilder = StringBuilder()
     val thinkingBuilder = StringBuilder()
     var i = 0
     var tagActive = insideTag
     var activeFormat = currentFormat
 
-    /** Longest tail of [bufLower] that is a prefix of some open tag. */
+    /** Longest tail of [buffer] that is a prefix of some open tag. */
     fun maxOpenTagPrefixLen(): Int {
         var best = 0
         for (fmt in formats) {
-            val open = fmt.open.lowercase()
-            val maxLen = minOf(open.length - 1, bufLower.length) // full tag is found by indexOf, never a prefix here
-            for (len in maxLen downTo 1) {
-                if (open.startsWith(bufLower.substring(bufLower.length - len))) {
-                    if (len > best) best = len
-                    break
-                }
-            }
+            val len = maxTagPrefixLen(fmt.open)
+            if (len > best) best = len
         }
         return best
     }
 
     /**
-     * Longest tail of [bufLower] that is a prefix of some PRIMARY close token
+     * Longest tail of [buffer] that is a prefix of some PRIMARY close token
      * (`</thinking>`, `[/think]`, …) — the orphan-close counterpart of
      * [maxOpenTagPrefixLen]. A closer split across SSE chunks (`</thin` +
      * `king>`) must not leak its head into the body either. altClose is
@@ -118,14 +137,8 @@ internal fun scanThinkTags(
     fun maxCloseTagPrefixLen(): Int {
         var best = 0
         for (fmt in formats) {
-            val close = fmt.close.lowercase()
-            val maxLen = minOf(close.length - 1, bufLower.length)
-            for (len in maxLen downTo 1) {
-                if (close.startsWith(bufLower.substring(bufLower.length - len))) {
-                    if (len > best) best = len
-                    break
-                }
-            }
+            val len = maxTagPrefixLen(fmt.close)
+            if (len > best) best = len
         }
         return best
     }
@@ -143,12 +156,11 @@ internal fun scanThinkTags(
             var bestLen = 0
             var bestIsOrphanClose = false
             for (fmt in formats) {
-                val openLower = fmt.open.lowercase()
-                val idx = bufLower.indexOf(openLower, i)
+                val idx = indexOfIgnoreCase(buffer, fmt.open, i)
                 if (idx != -1 && (bestIdx == -1 || idx < bestIdx)) {
                     bestIdx = idx
                     bestFmt = fmt
-                    bestLen = openLower.length
+                    bestLen = fmt.open.length
                     bestIsOrphanClose = false
                 }
                 // Orphan close: some gateways inline the model's reasoning into
@@ -156,12 +168,11 @@ internal fun scanThinkTags(
                 // (measured on gpt-6-luna via llmhost.net — 10 closers, 0
                 // openers across one session; the token reached both the
                 // transcript and the DB). Competes with open tags by index.
-                val closeLower = fmt.close.lowercase()
-                val cIdx = bufLower.indexOf(closeLower, i)
+                val cIdx = indexOfIgnoreCase(buffer, fmt.close, i)
                 if (cIdx != -1 && (bestIdx == -1 || cIdx < bestIdx)) {
                     bestIdx = cIdx
                     bestFmt = fmt
-                    bestLen = closeLower.length
+                    bestLen = fmt.close.length
                     bestIsOrphanClose = true
                 }
             }
@@ -198,11 +209,11 @@ internal fun scanThinkTags(
                 // Close candidates: primary close + altClose (e.g. <thinking>
                 // can end with either </thinking> or <response>); take the
                 // earliest.
-                val closes = listOfNotNull(fmt.close, fmt.altClose).map { it.lowercase() }
+                val closes = listOfNotNull(fmt.close, fmt.altClose)
                 var bestIdx = -1
                 var bestLen = 0
                 for (c in closes) {
-                    val idx = bufLower.indexOf(c, i)
+                    val idx = indexOfIgnoreCase(buffer, c, i)
                     if (idx != -1 && (bestIdx == -1 || idx < bestIdx)) {
                         bestIdx = idx
                         bestLen = c.length
@@ -213,13 +224,8 @@ internal fun scanThinkTags(
                     // possible close-tag prefix at the tail (any close candidate).
                     var best = 0
                     for (c in closes) {
-                        val maxLen = minOf(c.length - 1, bufLower.length)
-                        for (len in maxLen downTo 1) {
-                            if (c.startsWith(bufLower.substring(bufLower.length - len))) {
-                                if (len > best) best = len
-                                break
-                            }
-                        }
+                        val len = maxTagPrefixLen(c)
+                        if (len > best) best = len
                     }
                     val keepFrom = buffer.length - best
                     thinkingBuilder.append(buffer, i, keepFrom)
