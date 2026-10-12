@@ -38,10 +38,10 @@ PASS = 0
 FAIL = 0
 
 
-def run_scanner(script, root):
+def run_scanner(script, root, *extra):
     """Run one scanner against root; return (exit_code, combined_output)."""
     proc = subprocess.run(
-        [sys.executable, os.path.join(SCRIPT_DIR, script), root],
+        [sys.executable, os.path.join(SCRIPT_DIR, script), root, *extra],
         capture_output=True,
         text=True,
     )
@@ -1146,6 +1146,138 @@ fun rememberThing(
     check("removing the onDispose holder fails (exit != 0)", code != 0, f"exit={code}\n{out}")
     shutil.rmtree(tmp)
 
+def test_claim_release():
+    print("━━━ claim_release_guard ━━━")
+    # Ground truth = the actual 2026-10-12 regression shape: a claim that
+    # flips the flag BEFORE publishing the marker its release gate compares.
+    # Check B must catch the pre-flip order and accept the post-flip order.
+    base = KOTLIN_PKG + "/ui/chat/"
+    claim_good = make_tree({
+        base + "Good.kt": (
+            "package com.rikkaminis.app.ui.chat\n"
+            "class Good {\n"
+            "    var streamingClaimToken: Any = Any()\n"
+            "    var streamJob: Job? = null\n"
+            "    fun send() {\n"
+            "        streamingClaimToken = Any()\n"
+            "        _isStreaming.value = true\n"
+            "        val claimToken = streamingClaimToken\n"
+            "        streamJob = launch {\n"
+            "            try { loop() } finally {\n"
+            "                if (claimToken === streamingClaimToken) { _isStreaming.value = false }\n"
+            "            }\n"
+            "        }\n"
+            "    }\n"
+            "    fun sendSecond() {\n"
+            "        streamingClaimToken = Any()\n"
+            "        _isStreaming.value = true\n"
+            "    }\n"
+            "}\n"
+        ),
+    })
+    code, out = run_scanner("claim_release_guard.py", claim_good)
+    check("claim after mint passes strict mode (exit 0)", code == 0,
+          f"exit={code}\n{out}")
+    shutil.rmtree(claim_good)
+
+    claim_bad = make_tree({
+        base + "Bad.kt": (
+            "package com.rikkaminis.app.ui.chat\n"
+            "class Bad {\n"
+            "    var streamingClaimToken: Any = Any()\n"
+            "    fun send() {\n"
+            "        _isStreaming.value = true\n"
+            "        streamingClaimToken = Any()\n"
+            "        val claimToken = streamingClaimToken\n"
+            "        launch {} // uses claimToken so the family pairs up\n"
+            "        if (claimToken === streamingClaimToken) { _isStreaming.value = false }\n"
+            "    }\n"
+            "}\n"
+        ),
+    })
+    code, out = run_scanner("claim_release_guard.py", claim_bad)
+    check("pre-flip claim (the 10-12 shape) is caught (exit 1)", code == 1,
+          f"exit={code}\n{out}")
+    check("finding names the after-claim mint", "AFTER the claim" in out, out)
+    shutil.rmtree(claim_bad)
+
+    escaped_tree = make_tree({
+        base + "Esc.kt": (
+            "package com.rikkaminis.app.ui.chat\n"
+            "class Esc {\n"
+            "    var streamingClaimToken: Any = Any()\n"
+            "    fun send() {\n"
+            "        // claim-ok: pre-existing turn, marker minted by caller\n"
+            "        _isStreaming.value = true\n"
+            "        streamingClaimToken = Any()\n"
+            "        val claimToken = streamingClaimToken\n"
+            "        launch {}\n"
+            "        if (claimToken === streamingClaimToken) { _isStreaming.value = false }\n"
+            "    }\n"
+            "}\n"
+        ),
+    })
+    code, out = run_scanner("claim_release_guard.py", escaped_tree)
+    check("claim-ok escape hatch passes (exit 0)", code == 0, f"exit={code}\n{out}")
+    shutil.rmtree(escaped_tree)
+
+    # Check A: ungated sibling next to a gated one must be reported.
+    sibling_bad = make_tree({
+        base + "Sib.kt": (
+            "package com.rikkaminis.app.ui.chat\n"
+            "class Sib {\n"
+            "    var streamEpoch = 0\n"
+            "    var curEpoch = 0\n"
+            "    fun a() { if (streamEpoch === curEpoch) { _isStreaming.value = false } }\n"
+            "    fun b() { _isStreaming.value = false }\n"
+            "}\n"
+        ),
+    })
+    code, out = run_scanner("claim_release_guard.py", sibling_bad)
+    check("ungated sibling release is caught (exit 1)", code == 1,
+          f"exit={code}\n{out}")
+    shutil.rmtree(sibling_bad)
+
+    # Take-then-clear hand-off must NOT be reported.
+    handoff_ok = make_tree({
+        base + "Hand.kt": (
+            "package com.rikkaminis.app.ui.chat\n"
+            "class Hand {\n"
+            "    var pendingContinuation: Any? = null\n"
+            "    var gateEpoch = 0\n"
+            "    var curGate = 0\n"
+            "    fun respond() {\n"
+            "        val cont = pendingContinuation ?: return\n"
+            "        pendingContinuation = null\n"
+            "        _pendingRequest.value = null\n"
+            "    }\n"
+            "    fun timedOut() { if (gateEpoch === curGate) { pendingContinuation = null } }\n"
+            "}\n"
+        ),
+    })
+    code, out = run_scanner("claim_release_guard.py", handoff_ok)
+    check("atomic hand-off clears pass strict mode (exit 0)", code == 0,
+          f"exit={code}\n{out}")
+    shutil.rmtree(handoff_ok)
+
+    # Report mode must never gate: same tree, exit 0.
+    report_tree = make_tree({
+        base + "Rep.kt": (
+            "package com.rikkaminis.app.ui.chat\n"
+            "class Rep {\n"
+            "    var streamEpoch = 0\n"
+            "    var curEpoch = 0\n"
+            "    fun a() { if (streamEpoch === curEpoch) { _isStreaming.value = false } }\n"
+            "    fun b() { _isStreaming.value = false }\n"
+            "}\n"
+        ),
+    })
+    code, out = run_scanner("claim_release_guard.py", report_tree, "--report")
+    check("--report prints findings but exits 0", code == 0 and "REPORT-ONLY" in out,
+          f"exit={code}\n{out}")
+    shutil.rmtree(report_tree)
+
+
 def test_liveness_static():
     print("━━━ liveness_static_guard ━━━")
     # Self-test fixtures (clean + the A/B/C violation classes).
@@ -1174,6 +1306,7 @@ def test_real_repo():
         "prefs_listener_holder_guard.py",
         "thinking_wiring_guard.py",
         "liveness_static_guard.py",
+        "claim_release_guard.py",
     ):
         code, out = run_scanner(script, REPO_ROOT)
         check(f"{script} on real repo exits 0", code == 0, f"exit={code}\n{out[:2000]}")
@@ -1379,6 +1512,7 @@ def main():
     test_xproc_boundary()
     test_thinking_wiring()
     test_liveness_static()
+    test_claim_release()
     test_real_repo()
     print("")
     print(f"{'❌ FAILURES: ' + str(FAIL) if FAIL else '✅ ALL ' + str(PASS) + ' CASES PASS'}")
