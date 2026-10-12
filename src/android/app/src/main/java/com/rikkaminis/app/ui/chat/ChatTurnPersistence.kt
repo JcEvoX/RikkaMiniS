@@ -379,6 +379,9 @@ internal suspend fun ChatViewModel.runRerunStreamTail(
     // claim window including the system-prompt build before this call);
     // capture it here for the finally-block gate.
     val launchEpoch = streamingClaimEpoch
+    // [T-claim-token-vs-stale-finally] Capture the claim identity this job was
+    // launched under; only that turn may clear the flag or tear down run-state.
+    val claimToken = streamingClaimToken
     val launchedProvider = provider
     streamJob = viewModelScope.launch(Dispatchers.IO) {
         AppLogger.info(ChatViewModel.TAG_STREAM, "$label streamJob ENTER sid=$activeSessionId")
@@ -425,22 +428,24 @@ internal suspend fun ChatViewModel.runRerunStreamTail(
                 SessionActivityTracker.markStreamError(activeSessionId)
             } finally {
                 AppLogger.info(ChatViewModel.TAG_STREAM, "$label streamJob FINALLY enter")
-                // [audit-0907 B2] Reset queue-position state — same
-                // rationale as the send path's finally: whatever the
-                // worker reported while queued must not leak into the
-                // next run's typing indicator.
-                resetQueueWaitingAhead()
-                // [fix/zero-chunk-cancel] Same rationale for the network-wait clock.
-                resetAwaitingResponseSince()
-                // [T-android-overlay-reply-status-34599] Surface
-                // the assistant's most recent reply text to the
-                // overlay BEFORE setInactive so the post-completion
-                // overlay state (no-running, has-outcome) carries a
-                // non-null excerpt. Reading _messages here is safe:
-                // we're in the finally block of the agent loop and
-                // the stream has already flushed its last delta.
-                publishOverlayReplyExcerpt(activeSessionId)
-                SessionActivityTracker.setInactive(activeSessionId)
+                if (claimToken === streamingClaimToken) {
+                    // [audit-0907 B2] Reset queue-position state — same
+                    // rationale as the send path's finally: whatever the
+                    // worker reported while queued must not leak into the
+                    // next run's typing indicator.
+                    resetQueueWaitingAhead()
+                    // [fix/zero-chunk-cancel] Same rationale for the network-wait clock.
+                    resetAwaitingResponseSince()
+                    // [T-android-overlay-reply-status-34599] Surface
+                    // the assistant's most recent reply text to the
+                    // overlay BEFORE setInactive so the post-completion
+                    // overlay state (no-running, has-outcome) carries a
+                    // non-null excerpt. Reading _messages here is safe:
+                    // we're in the finally block of the agent loop and
+                    // the stream has already flushed its last delta.
+                    publishOverlayReplyExcerpt(activeSessionId)
+                    SessionActivityTracker.setInactive(activeSessionId)
+                }
                 SessionConcurrencyManager.releaseSlot(activeSessionId)
                 AppLogger.info(ChatViewModel.TAG_STREAM, "$label streamJob FINALLY exit")
             }
@@ -469,7 +474,7 @@ internal suspend fun ChatViewModel.runRerunStreamTail(
         // epoch at takeover and requiring THIS job's launch epoch to match
         // closes that window.
         val jobEpoch = launchEpoch
-        if (streamJob === coroutineContext[Job] && jobEpoch == streamingClaimEpoch) {
+        if (streamJob === coroutineContext[Job] && jobEpoch == streamingClaimEpoch && claimToken === streamingClaimToken) {
             AppLogger.info(ChatViewModel.TAG_STREAM, "$label _isStreaming=false (about to set)")
             _isStreaming.value = false
         } else {

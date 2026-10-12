@@ -646,6 +646,35 @@ class ChatViewModel(
     @Volatile internal var streamingClaimEpoch = -1L
 
     /**
+     * [T-claim-token-vs-stale-finally] Identity token of the turn that most
+     * recently CLAIMED the streaming state.
+     *
+     * Every entry point that starts a turn (send / retryFromMessage /
+     * rerunFromToolBlock / retryLast / resume / resumeQueueAfterCancel /
+     * switchModelAndRerun) mints a fresh token BEFORE flipping `_isStreaming`
+     * to true. A stream job captures the token it was launched under and may
+     * only clear `_isStreaming` while it still owns it.
+     *
+     * Why a token on top of [streamingClaimEpoch]: the epoch snapshot is
+     * published a few statements AFTER `_isStreaming = true` (in `send`, after
+     * the orphan-delta sweep; elsewhere after a log write), so a predecessor's
+     * finally landing inside that window still reads the OLD claim epoch and
+     * passes the epoch gate, then flips `_isStreaming` off under the brand-new
+     * turn. Field-observed 2026-10-12 14:40:12 (session b4c466fd):
+     * `send _isStreaming=false` at .815 landed after
+     * `switchModel-entry _isStreaming=true` at .809; the switch's loop kept
+     * running, a retry 2.5s later saw the false flag and started a SECOND loop
+     * (tierflow_pro and GLM-5.3-Flash interleaving turns into one session for
+     * ~11 minutes, two providers, one transcript).
+     *
+     * The token is a single atomic write that happens BEFORE the flag flips,
+     * so both interleavings are safe: stale finally first => flag cleared and
+     * then re-set by the new claim; new claim first => the stale finally sees
+     * a token mismatch and leaves the flag alone.
+     */
+    @Volatile internal var streamingClaimToken: Any = Any()
+
+    /**
      * 当前活跃回合的 epoch，供 ChatScreen 传入 [mergeStreamingOverlay] 做过滤。
      * 新回合入口递增后，旧回合的 trailing-flush / 残余 delta 因 epoch 不匹配被忽略，
      * 不再产生第二条"正在思考…"残留行。
@@ -2898,12 +2927,18 @@ class ChatViewModel(
         // Claim the streaming flag synchronously so a rapid second tap is
         // rejected by the entry guard (same rationale as retryFromMessage T145).
         AppLogger.info(TAG_STREAM, "rerunFromToolBlock _isStreaming=true (sync, sid=$activeSessionId)")
+        // [T-claim-token-vs-stale-finally] Mint the claim token BEFORE the
+        // flag flips, so a predecessor's finally landing anywhere during this
+        // claim is a no-op instead of a flip that hides the new turn's Stop
+        // button. See streamingClaimToken KDoc.
+        streamingClaimToken = Any()
         _isStreaming.value = true
         streamEpoch++
         // [T-stale-finally-vs-new-claim] Publish the claim so an older job's
         // finally can't flip _isStreaming off during the setup window.
         streamingClaimEpoch = streamEpoch
         val sendEpoch = streamingClaimEpoch
+        val claimToken = streamingClaimToken
 
         viewModelScope.launch(Dispatchers.IO) {
             var streamLaunched = false
@@ -3035,7 +3070,7 @@ class ChatViewModel(
             } finally {
                 if (!streamLaunched) {
                     // [T-stale-finally-vs-new-claim] Only clear under our own claim.
-                    if (sendEpoch == streamingClaimEpoch) {
+                    if (sendEpoch == streamingClaimEpoch && claimToken === streamingClaimToken) {
                         AppLogger.info(TAG_STREAM, "rerunFromToolBlock _isStreaming=false (setup aborted)")
                         _isStreaming.value = false
                     } else {
@@ -3134,12 +3169,18 @@ class ChatViewModel(
         // The orphaned first job's `_isStreaming = false` at completion would
         // then flip the UI to "stopped" while the second job was still running.
         AppLogger.info(TAG_STREAM, "retry _isStreaming=true (sync, sid=$activeSessionId)")
+        // [T-claim-token-vs-stale-finally] Mint the claim token BEFORE the
+        // flag flips, so a predecessor's finally landing anywhere during this
+        // claim is a no-op instead of a flip that hides the new turn's Stop
+        // button. See streamingClaimToken KDoc.
+        streamingClaimToken = Any()
         _isStreaming.value = true
         streamEpoch++
         // [T-stale-finally-vs-new-claim] Publish the claim so an older job's
         // finally can't flip _isStreaming off during the setup window.
         streamingClaimEpoch = streamEpoch
         val sendEpoch = streamingClaimEpoch
+        val claimToken = streamingClaimToken
 
         viewModelScope.launch(Dispatchers.IO) {
             // If setup throws before the inner streamJob is launched, the
@@ -3200,7 +3241,7 @@ class ChatViewModel(
             } finally {
                 if (!streamLaunched) {
                     // [T-stale-finally-vs-new-claim] Only clear under our own claim.
-                    if (sendEpoch == streamingClaimEpoch) {
+                    if (sendEpoch == streamingClaimEpoch && claimToken === streamingClaimToken) {
                         AppLogger.info(TAG_STREAM, "retry _isStreaming=false (setup aborted)")
                         _isStreaming.value = false
                     } else {
@@ -3509,6 +3550,11 @@ class ChatViewModel(
         // T145: claim _isStreaming synchronously so a rapid second tap can't
         // slip past the entry guard during DB/OAuth setup. See retryFromMessage.
         AppLogger.info(TAG_STREAM, "send _isStreaming=true (sync, sid=$activeSessionId)")
+        // [T-claim-token-vs-stale-finally] Mint the claim token BEFORE the
+        // flag flips, so a predecessor's finally landing anywhere during this
+        // claim is a no-op instead of a flip that hides the new turn's Stop
+        // button. See streamingClaimToken KDoc.
+        streamingClaimToken = Any()
         _isStreaming.value = true
 
         // [T-android-thinking-indicator-linger] Invariant sweep: a fresh send
@@ -3537,6 +3583,7 @@ class ChatViewModel(
         // finally can't flip _isStreaming off during the setup window.
         streamingClaimEpoch = streamEpoch
         val sendEpoch = streamingClaimEpoch
+        val claimToken = streamingClaimToken
 
         // T187: when the user is editing a previous message, truncate the
         // conversation from that message (inclusive) before persisting the
@@ -3689,21 +3736,31 @@ class ChatViewModel(
                         SessionActivityTracker.markStreamError(activeSessionId)
                     } finally {
                         AppLogger.info(TAG_STREAM, "send streamJob FINALLY enter")
-                        // [feat/provider-exec-concurrency] Reset queue-position
-                        // state — the run is over, whatever it showed must not
-                        // leak into the next one.
-                        resetQueueWaitingAhead()
-                        // [fix/zero-chunk-cancel] Same rationale for the network-wait clock.
-                        resetAwaitingResponseSince()
-                        // [T-android-overlay-reply-status-34599] Surface
-                        // the assistant's most recent reply text to the
-                        // overlay BEFORE setInactive so the post-completion
-                        // overlay state (no-running, has-outcome) carries a
-                        // non-null excerpt. Reading _messages here is safe:
-                        // we're in the finally block of the agent loop and
-                        // the stream has already flushed its last delta.
-                        publishOverlayReplyExcerpt(activeSessionId)
-                        SessionActivityTracker.setInactive(activeSessionId)
+                        // [T-claim-token-vs-stale-finally] Run-state teardown is
+                        // owned by the CURRENT turn only. An orphaned job's
+                        // finally landing after a newer claim would otherwise
+                        // wipe the live turn's running indicator (queue clock,
+                        // overlay excerpt, activity flag) while it still
+                        // streams — field-observed 2026-10-12 14:51 (message
+                        // area lost its running marker while content kept
+                        // arriving). releaseSlot below stays unconditional.
+                        if (claimToken === streamingClaimToken) {
+                            // [feat/provider-exec-concurrency] Reset queue-position
+                            // state — the run is over, whatever it showed must not
+                            // leak into the next one.
+                            resetQueueWaitingAhead()
+                            // [fix/zero-chunk-cancel] Same rationale for the network-wait clock.
+                            resetAwaitingResponseSince()
+                            // [T-android-overlay-reply-status-34599] Surface
+                            // the assistant's most recent reply text to the
+                            // overlay BEFORE setInactive so the post-completion
+                            // overlay state (no-running, has-outcome) carries a
+                            // non-null excerpt. Reading _messages here is safe:
+                            // we're in the finally block of the agent loop and
+                            // the stream has already flushed its last delta.
+                            publishOverlayReplyExcerpt(activeSessionId)
+                            SessionActivityTracker.setInactive(activeSessionId)
+                        }
                         SessionConcurrencyManager.releaseSlot(activeSessionId)
                         AppLogger.info(TAG_STREAM, "send streamJob FINALLY exit")
                     }
@@ -3714,18 +3771,18 @@ class ChatViewModel(
                 // [T-android-stale-streamjob-clears-isstreaming] guard — see
                 // `var streamJob` KDoc; identical pattern as runRerunStreamTail,
                 // plus the epoch gate against the claim window.
-                if (streamJob === coroutineContext[Job] && sendEpoch == streamingClaimEpoch) {
+                if (streamJob === coroutineContext[Job] && sendEpoch == streamingClaimEpoch && claimToken === streamingClaimToken) {
                     AppLogger.info(TAG_STREAM, "send _isStreaming=false (about to set)")
                     _isStreaming.value = false
                 } else {
-                    AppLogger.info(TAG_STREAM, "send _isStreaming SKIPPED (stale job; sendEpoch=$sendEpoch claimEpoch=$streamingClaimEpoch)")
+                    AppLogger.info(TAG_STREAM, "send _isStreaming SKIPPED (stale job; sendEpoch=$sendEpoch claimEpoch=$streamingClaimEpoch claimSuperseded=${claimToken !== streamingClaimToken})")
                 }
                 AppLogger.info(TAG_STREAM, "send streamJob EXIT")
             }
             } finally {
                 if (!streamLaunched) {
                     // [T-stale-finally-vs-new-claim] Only clear under our own claim.
-                    if (sendEpoch == streamingClaimEpoch) {
+                    if (sendEpoch == streamingClaimEpoch && claimToken === streamingClaimToken) {
                         AppLogger.info(TAG_STREAM, "send _isStreaming=false (setup aborted)")
                         _isStreaming.value = false
                     } else {
@@ -3932,12 +3989,14 @@ class ChatViewModel(
             val systemPrompt = baseSystemPrompt
 
             AppLogger.info(TAG_STREAM, "resume _isStreaming=true (sid=$activeSessionId)")
+            streamingClaimToken = Any()
             _isStreaming.value = true
             streamEpoch++
             // [T-stale-finally-vs-new-claim] Publish the claim so an older
             // job's finally can't flip _isStreaming off during setup.
             streamingClaimEpoch = streamEpoch
             val sendEpoch = streamingClaimEpoch
+            val claimToken = streamingClaimToken
             streamJob = launch(Dispatchers.IO) {
                 AppLogger.info(TAG_STREAM, "resume streamJob ENTER sid=$activeSessionId")
                 try {
@@ -3979,22 +4038,26 @@ class ChatViewModel(
                         reportAgentLoopError(e)
                     } finally {
                         AppLogger.info(TAG_STREAM, "resume streamJob FINALLY enter")
-                        // [audit-0907 B2] Reset queue-position state — same
-                        // rationale as the send path's finally: whatever the
-                        // worker reported while queued must not leak into the
-                        // next run's typing indicator.
-                        resetQueueWaitingAhead()
-                        // [fix/zero-chunk-cancel] Same rationale for the network-wait clock.
-                        resetAwaitingResponseSince()
-                        // [T-android-overlay-reply-status-34599] Surface
-                        // the assistant's most recent reply text to the
-                        // overlay BEFORE setInactive so the post-completion
-                        // overlay state (no-running, has-outcome) carries a
-                        // non-null excerpt. Reading _messages here is safe:
-                        // we're in the finally block of the agent loop and
-                        // the stream has already flushed its last delta.
-                        publishOverlayReplyExcerpt(activeSessionId)
-                        SessionActivityTracker.setInactive(activeSessionId)
+                        // [T-claim-token-vs-stale-finally] Only the current turn
+                        // may tear down run-state — see the send path's finally.
+                        if (claimToken === streamingClaimToken) {
+                            // [audit-0907 B2] Reset queue-position state — same
+                            // rationale as the send path's finally: whatever the
+                            // worker reported while queued must not leak into the
+                            // next run's typing indicator.
+                            resetQueueWaitingAhead()
+                            // [fix/zero-chunk-cancel] Same rationale for the network-wait clock.
+                            resetAwaitingResponseSince()
+                            // [T-android-overlay-reply-status-34599] Surface
+                            // the assistant's most recent reply text to the
+                            // overlay BEFORE setInactive so the post-completion
+                            // overlay state (no-running, has-outcome) carries a
+                            // non-null excerpt. Reading _messages here is safe:
+                            // we're in the finally block of the agent loop and
+                            // the stream has already flushed its last delta.
+                            publishOverlayReplyExcerpt(activeSessionId)
+                            SessionActivityTracker.setInactive(activeSessionId)
+                        }
                         SessionConcurrencyManager.releaseSlot(activeSessionId)
                         AppLogger.info(TAG_STREAM, "resume streamJob FINALLY exit")
                     }
@@ -4004,11 +4067,11 @@ class ChatViewModel(
                 }
                 // [T-android-stale-streamjob-clears-isstreaming] guard +
                 // epoch gate (see runRerunStreamTail).
-                if (streamJob === coroutineContext[Job] && sendEpoch == streamingClaimEpoch) {
+                if (streamJob === coroutineContext[Job] && sendEpoch == streamingClaimEpoch && claimToken === streamingClaimToken) {
                     AppLogger.info(TAG_STREAM, "resume _isStreaming=false (about to set)")
                     _isStreaming.value = false
                 } else {
-                    AppLogger.info(TAG_STREAM, "resume _isStreaming SKIPPED (stale job; sendEpoch=$sendEpoch claimEpoch=$streamingClaimEpoch)")
+                    AppLogger.info(TAG_STREAM, "resume _isStreaming SKIPPED (stale job; sendEpoch=$sendEpoch claimEpoch=$streamingClaimEpoch claimSuperseded=${claimToken !== streamingClaimToken})")
                 }
                 AppLogger.info(TAG_STREAM, "resume streamJob EXIT")
             }

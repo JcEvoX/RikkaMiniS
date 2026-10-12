@@ -473,6 +473,9 @@ internal fun ChatViewModel.resumeQueueAfterCancel() {
         // the streamJob so a concurrent send/retry tap is rejected by the
         // entry guard. Mirrors sendMessage discipline.
         AppLogger.info(ChatViewModel.TAG_STREAM, "resumeQueueAfterCancel _isStreaming=true (sync, sid=$activeSessionId)")
+        // [T-claim-token-vs-stale-finally] Mint the claim token BEFORE the flag
+        // flips — see streamingClaimToken KDoc.
+        streamingClaimToken = Any()
         _isStreaming.value = true
         streamEpoch++
         // [T-stale-finally-vs-new-claim] Publish the claim so an older job's
@@ -485,6 +488,9 @@ internal fun ChatViewModel.resumeQueueAfterCancel() {
         // finally gate compares against THIS takeover's claim even if the
         // coroutine body starts late.
         val launchEpoch = streamingClaimEpoch
+        // [T-claim-token-vs-stale-finally] Capture the claim identity this job
+        // was launched under.
+        val claimToken = streamingClaimToken
         streamJob = launch(Dispatchers.IO) {
             AppLogger.info(ChatViewModel.TAG_STREAM, "resumeQueueAfterCancel streamJob ENTER sid=$activeSessionId")
             try {
@@ -520,22 +526,24 @@ internal fun ChatViewModel.resumeQueueAfterCancel() {
                     reportAgentLoopError(e)
                 } finally {
                     AppLogger.info(ChatViewModel.TAG_STREAM, "resumeQueueAfterCancel streamJob FINALLY enter")
-                    // [audit-0907 B2] Reset queue-position state — same
-                    // rationale as the send path's finally: whatever the
-                    // worker reported while queued must not leak into the
-                    // next run's typing indicator.
-                    resetQueueWaitingAhead()
-                    // [fix/zero-chunk-cancel] Same rationale for the network-wait clock.
-                    resetAwaitingResponseSince()
-                    // [T-android-overlay-reply-status-34599] Surface
-                    // the assistant's most recent reply text to the
-                    // overlay BEFORE setInactive so the post-completion
-                    // overlay state (no-running, has-outcome) carries a
-                    // non-null excerpt. Reading _messages here is safe:
-                    // we're in the finally block of the agent loop and
-                    // the stream has already flushed its last delta.
-                    publishOverlayReplyExcerpt(activeSessionId)
-                    SessionActivityTracker.setInactive(activeSessionId)
+                    if (claimToken === streamingClaimToken) {
+                        // [audit-0907 B2] Reset queue-position state — same
+                        // rationale as the send path's finally: whatever the
+                        // worker reported while queued must not leak into the
+                        // next run's typing indicator.
+                        resetQueueWaitingAhead()
+                        // [fix/zero-chunk-cancel] Same rationale for the network-wait clock.
+                        resetAwaitingResponseSince()
+                        // [T-android-overlay-reply-status-34599] Surface
+                        // the assistant's most recent reply text to the
+                        // overlay BEFORE setInactive so the post-completion
+                        // overlay state (no-running, has-outcome) carries a
+                        // non-null excerpt. Reading _messages here is safe:
+                        // we're in the finally block of the agent loop and
+                        // the stream has already flushed its last delta.
+                        publishOverlayReplyExcerpt(activeSessionId)
+                        SessionActivityTracker.setInactive(activeSessionId)
+                    }
                     SessionConcurrencyManager.releaseSlot(activeSessionId)
                     AppLogger.info(ChatViewModel.TAG_STREAM, "resumeQueueAfterCancel streamJob FINALLY exit")
                 }
@@ -544,7 +552,7 @@ internal fun ChatViewModel.resumeQueueAfterCancel() {
             }
             // [T-android-stale-streamjob-clears-isstreaming] guard + epoch
             // gate (see runRerunStreamTail).
-            if (streamJob === coroutineContext[Job] && launchEpoch == streamingClaimEpoch) {
+            if (streamJob === coroutineContext[Job] && launchEpoch == streamingClaimEpoch && claimToken === streamingClaimToken) {
                 AppLogger.info(ChatViewModel.TAG_STREAM, "resumeQueueAfterCancel _isStreaming=false (about to set)")
                 _isStreaming.value = false
             } else {
