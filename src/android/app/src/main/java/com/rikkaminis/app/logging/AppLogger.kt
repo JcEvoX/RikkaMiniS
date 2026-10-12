@@ -75,8 +75,19 @@ object AppLogger {
     // contract as the daily writer. The debug file holds EVERY DEBUG line the
     // app produces (including the previously-muted high-volume categories) so
     // a provider failure can be diagnosed after the fact. Bounded by
-    // DEBUG_MAX_BYTES per day via rename-to-".1" rotation — bounded at 2×cap.
+    // DEBUG_MAX_BYTES per day via rename-to-".N" rotation (indices shift, so
+    // a new roll never overwrites the previous one's bytes) — bounded at
+    // (DEBUG_MAX_ROLLS + 1) × cap.
     private const val DEBUG_MAX_BYTES = 5L * 1024 * 1024
+
+    /**
+     * How many rolled `.N.log` siblings to keep per day+process. A new roll
+     * evicts only the OLDEST roll; the previous rolls' bytes survive until
+     * they age into the eviction slot (T-log-roll-1012: the old fixed `.1`
+     * name let every new roll destroy the previous roll's evidence — a
+     * 211 MB roll survived ~7 minutes on 2026-10-12).
+     */
+    private const val DEBUG_MAX_ROLLS = 3
     private var debugWriter: PrintWriter? = null
     private var debugDate: String = ""
     private var debugBytesWritten: Long = 0
@@ -126,8 +137,14 @@ object AppLogger {
         logDir = File(context.filesDir, LOG_DIR).also { it.mkdirs() }
         enabled = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
             .getBoolean(KEY_ENABLED, false)
-        pruneOldLogs()
+        // [T-log-warn-reach-1012] pruneOldLogs() may emit the "size prune
+        // deferred" WARN. That line only reaches the daily file when the
+        // async writer exists (log() enqueues; it does not write), so the
+        // prune must run AFTER startCapture() — previously it ran before and
+        // the deferral notice existed only in logcat, where our own tailer
+        // filters AppLogger-tagged lines: effectively silent.
         if (enabled) startCapture()
+        pruneOldLogs()
     }
 
     fun isEnabled(context: Context): Boolean {
@@ -438,6 +455,14 @@ object AppLogger {
      * Open (or reuse) the daily writer for [date]. Callers on the write path
      * invoke this INSIDE `synchronized(writerLock)` so the returned writer
      * cannot be closed before the caller finishes writing — see [writerLock].
+     *
+     * [T-log-tail-heal-1012] On a fresh open the file tail is checked: a
+     * torn write (multi-process shared name + 8 KB buffered encoder cut at a
+     * kill/silent_kill boundary, measured 2026-10-12: 26 main / 78 worker
+     * torn lines in one day, every one followed by the next process's
+     * session-start line) leaves a trailing fragment WITHOUT a newline, and
+     * the next append glues onto it — corrupting two log lines. Healing
+     * appends a separator so both fragments become parseable lines again.
      */
     private fun getWriter(date: String): PrintWriter {
         synchronized(writerLock) {
@@ -445,11 +470,23 @@ object AppLogger {
                 writer?.close()
                 val dir = logDir ?: throw IllegalStateException("AppLogger not initialized")
                 val file = File(dir, channelFileName("minis", date, processSuffix))
+                healTornTail(file)
                 writer = PrintWriter(FileWriter(file, true))
                 currentDate = date
             }
             return writer!!
         }
+    }
+
+    /**
+     * [T-log-tail-heal-1012] If [file] exists and does not end with `\n`,
+     * append a healing separator (newline + a marker line) so the torn
+     * fragment stops gluing onto the next process's first line. Appending
+     * (not truncating) — the fragment itself may still hold the only copy of
+     * that log line. See [healTornTail] in LogFileName.kt (pure JVM, tested).
+     */
+    private fun healTornTail(file: File) {
+        healTornTail(file, "[${timeStamp()}] [INFO] [AppLogger] --- healed torn tail (interrupted write, no trailing newline) ---")
     }
 
     /**
@@ -486,6 +523,16 @@ object AppLogger {
     /**
      * Open (or reuse) the debug-channel writer for [date], inside
      * `synchronized(writerLock)` like [getWriter].
+     *
+     * [T-log-rotation-1012] The byte counter is SEEDED FROM THE FILE, not
+     * reset to zero: the file name is shared by every process of this family
+     * for the whole day (short-lived `:modelservice` workers come and go),
+     * so a fresh process starting at 0 never reached DEBUG_MAX_BYTES — each
+     * single worker writes at most a few MB before dying, while the shared
+     * file itself grew unbounded (measured 2026-10-12: 202 MB before the
+     * first rotation ever fired). Seeding from `file.length()` makes the
+     * rotation decision track the FILE's true size regardless of how many
+     * processes have appended to it.
      */
     private fun getDebugWriter(date: String): PrintWriter {
         if (date != debugDate || debugWriter == null) {
@@ -494,18 +541,28 @@ object AppLogger {
             } catch (_: Exception) {
             }
             val dir = logDir ?: throw IllegalStateException("AppLogger not initialized")
-            debugWriter = PrintWriter(FileWriter(File(dir, channelFileName("debug", date, processSuffix)), true))
+            val file = File(dir, channelFileName("debug", date, processSuffix))
+            healTornTail(file) // [T-log-tail-heal-1012] same tear risk as the main channel
+            debugWriter = PrintWriter(FileWriter(file, true))
             debugDate = date
-            debugBytesWritten = 0
+            debugBytesWritten = file.length()
         }
         return debugWriter!!
     }
 
     /**
      * [T-logging-full-coverage] Debug-file rotation: the current debug file
-     * exceeded DEBUG_MAX_BYTES → rename it to `debug-<date>.1.log` (deleting
-     * a previous roll) and reopen fresh. Called INSIDE writerLock from the
-     * write path; the next write reopens the writer. Bounded at 2×cap per day.
+     * exceeded DEBUG_MAX_BYTES → rename it to `…<N+1>.log` (shifting indices,
+     * see [debugRollFileName]) and reopen fresh. Called INSIDE writerLock
+     * from the write path; the next write reopens the writer. Bounded at
+     * (DEBUG_MAX_ROLLS + 1) × cap per day+process.
+     *
+     * [T-log-rotation-1012] The old fixed `.1` name meant every roll DELETED
+     * the previous roll (a 211 MB roll survived ~7 minutes before being
+     * overwritten). Now indices shift: the newest roll takes the highest
+     * index, older rolls keep their bytes until they are the oldest and
+     * [DEBUG_MAX_ROLLS] is exceeded — then only the oldest roll is deleted,
+     * never the freshest evidence.
      */
     private fun rotateDebugFile(date: String) {
         try {
@@ -516,9 +573,23 @@ object AppLogger {
         if (dir != null) {
             val base = channelFileName("debug", date, processSuffix)
             val file = File(dir, base)
-            val rolled = File(dir, base.substringBeforeLast(".log") + ".1.log")
-            if (rolled.exists()) rolled.delete()
+            // -1: the not-yet-created roll takes the next free index.
+            val highest = highestRollIndex(dir.list()?.toList() ?: emptyList(), base)
+            val rolled = File(dir, debugRollFileName(base, highest + 1))
             if (!file.renameTo(rolled)) file.delete()
+            // Evict the OLDEST rolls until at most DEBUG_MAX_ROLLS remain —
+            // counting the one just created above. `(1..highest)` is already
+            // in index order; sorting by NAME would put ".10.log" before
+            // ".7.log" and delete the wrong end once a day passes 9 rotations
+            // (2026-10-12 measured ~40 at 200 MB/day). A stray missing index
+            // cannot stop the sweep — [rollEvictionIndices] takes from the
+            // sorted present set, not a contiguous run.
+            val present = (1..highest).filter { i ->
+                File(dir, debugRollFileName(base, i)).exists()
+            }
+            for (i in rollEvictionIndices(present, DEBUG_MAX_ROLLS)) {
+                File(dir, debugRollFileName(base, i)).delete()
+            }
         }
         debugWriter = null
         debugBytesWritten = 0
@@ -603,14 +674,17 @@ object AppLogger {
         val dir = logDir ?: return null
         val name = File(filename).name
         if (name != filename || name.isEmpty() || name == "." || name == "..") {
-            android.util.Log.w(TAG, "refused a non-basename log name: \"$filename\"")
+            // [T-log-warn-reach-1012] warning(), not Log.w: the raw logcat
+            // line is filtered out of the file by our own tailer (tag ==
+            // "AppLogger"), so the refusal notice never reached the file.
+            warning(TAG, "refused a non-basename log name: \"$filename\"")
             return null
         }
         val file = File(dir, name)
         val root = runCatching { dir.canonicalFile }.getOrNull() ?: return null
         val canonical = runCatching { file.canonicalFile }.getOrNull() ?: return null
         if (canonical.parentFile != root) {
-            android.util.Log.w(TAG, "refused an out-of-dir log path: ${canonical.path}")
+            warning(TAG, "refused an out-of-dir log path: ${canonical.path}")
             return null
         }
         return file
@@ -737,7 +811,16 @@ object AppLogger {
                 candidates.sumOf { it.length() }
             // One line, only on deferral: the cap is exceeded but every
             // candidate is protected. Say WHY instead of shrinking silently.
-            Log.w(
+            //
+            // [T-log-warn-reach-1012] Routed through AppLogger.warning() (not
+            // android.util.Log): the raw logcat line is filtered out of the
+            // file by our own tailer (tag == "AppLogger"), and before the
+            // writer queue exists this was the ONLY destination — the notice
+            // was effectively unreachable (measured 2026-10-12: 0 occurrences
+            // in the files during a full day above the cap). warning() both
+            // mirrors to logcat and lands in the daily file. init() runs the
+            // prune after startCapture() so the queue exists.
+            warning(
                 "AppLogger",
                 "size prune deferred: cap exceeded by ~${total / (1024L * 1024)}MB, " +
                     "${allFiles.size - candidates.size} file(s) " +

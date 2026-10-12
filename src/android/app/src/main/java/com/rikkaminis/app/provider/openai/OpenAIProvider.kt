@@ -118,6 +118,16 @@ class OpenAIProvider constructor(
 
     companion object {
         /**
+         * [T-toolinput-sample-1012] Granularity of the "→ ToolInputDelta"
+         * debug line: one per this-many chars of accumulated tool-args
+         * growth (plus the first delta). 2048 chars per line caps a huge
+         * tool call (40 KB args) at ~20 lines instead of ~hundreds of
+         * per-fragment lines, while keeping enough resolution to see
+         * progress in the file. Measured cost of the unsampled line:
+         * 251K lines / 33.5 MB per day = 74% of the worker's daily file.
+         */
+        const val TOOL_LOG_INPUT_STEP_CHARS = 2048
+        /**
          * [FIX-1 / F-186] Ceiling for a generated-image download we initiate
          * ourselves (the `url` branch of parseImageGenerationsResult). The
          * b64 branch is bounded by the response body; this one is not, so we
@@ -856,13 +866,20 @@ class OpenAIProvider constructor(
         val reader = BufferedReader(InputStreamReader(response.body!!.byteStream()))
 
         // Chat Completions: tool calls are streamed as deltas keyed by index.
-        data class ToolCallAccumulator(var id: String = "", var name: String = "", val args: StringBuilder = StringBuilder(), var started: Boolean = false)
+        // [T-toolinput-sample-1012] lastLoggedInputChars gates the per-delta
+        // "→ ToolInputDelta" debug line: one per TOOL_LOG_INPUT_STEP_CHARS of
+        // accumulated args (plus the first), instead of one per fragment.
+        // Measured 2026-10-12: 251K lines / 33.5 MB per day = 74% of the
+        // worker's daily file, for a line that only reports a length.
+        data class ToolCallAccumulator(var id: String = "", var name: String = "", val args: StringBuilder = StringBuilder(), var started: Boolean = false, var lastLoggedInputChars: Int = -1)
         val toolCallAccumulators = mutableMapOf<Int, ToolCallAccumulator>()
         // Responses API: function_call items are keyed by their item_id (fc_…). We store
         // the call_id separately because the agent loop needs the call_id to correlate
         // tool results, but the next request must echo back the item_id verbatim — so we
         // emit a combined "callId|fcId" identifier that splitResponsesAPIIds() unpacks.
-        data class ResponsesToolCallAccumulator(var callId: String = "", var name: String = "", val args: StringBuilder = StringBuilder(), var started: Boolean = false)
+        // [T-toolinput-sample-1012] lastLoggedInputChars: ToolInputDelta log
+        // sampling state, same contract as the chat-completions accumulator.
+        data class ResponsesToolCallAccumulator(var callId: String = "", var name: String = "", val args: StringBuilder = StringBuilder(), var started: Boolean = false, var lastLoggedInputChars: Int = -1)
         val responsesToolCalls = mutableMapOf<String, ResponsesToolCallAccumulator>()
         // One-shot info log the first time the Responses API streams a reasoning
         // delta — useful for confirming the Thinking pipeline is wired up when
@@ -1075,6 +1092,13 @@ class OpenAIProvider constructor(
                             if (acc != null && delta.isNotEmpty()) {
                                 acc.args.append(delta)
                                 val combined = combineResponsesAPIIds(acc.callId, itemId)
+                                // [T-toolinput-sample-1012] Sampled like the chat-completions path:
+                                // first delta + one per TOOL_LOG_INPUT_STEP_CHARS of growth.
+                                val n = acc.args.length
+                                if (acc.lastLoggedInputChars < 0 || n - acc.lastLoggedInputChars >= TOOL_LOG_INPUT_STEP_CHARS) {
+                                    acc.lastLoggedInputChars = n
+                                    android.util.Log.d("ToolChain[Provider]", "→ ToolInputDelta (Responses) id=$combined accumulated=${n}chars")
+                                }
                                 send(LLMStreamChunk.ToolInputDelta(combined, acc.args.toString()))
                             } else if (acc == null) {
                                 // Pre-T107 this branch silently dropped the entire tool call
@@ -1295,7 +1319,17 @@ class OpenAIProvider constructor(
                                 }
                                 // Emit input delta
                                 if (acc.id.isNotEmpty() && acc.args.isNotEmpty()) {
-                                    android.util.Log.d("ToolChain[Provider]", "→ ToolInputDelta id=${acc.id} accumulated=${acc.args.length}chars")
+                                    // [T-toolinput-sample-1012] Log the first delta, then once per
+                                    // TOOL_LOG_INPUT_STEP_CHARS of growth — the per-fragment line
+                                    // measured 33.5 MB/day (74% of the worker's daily file) while
+                                    // carrying only a length. ToolUseStart/ToolCallComplete keep
+                                    // their every-call lines; the flush path below covers
+                                    // mid-tool-call truncation, so no endpoint loses coverage.
+                                    val n = acc.args.length
+                                    if (acc.lastLoggedInputChars < 0 || n - acc.lastLoggedInputChars >= TOOL_LOG_INPUT_STEP_CHARS) {
+                                        acc.lastLoggedInputChars = n
+                                        android.util.Log.d("ToolChain[Provider]", "→ ToolInputDelta id=${acc.id} accumulated=${n}chars")
+                                    }
                                     send(LLMStreamChunk.ToolInputDelta(acc.id, acc.args.toString()))
                                 }
                             }
