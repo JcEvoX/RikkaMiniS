@@ -144,6 +144,161 @@ def four_way_fixture(model_extra="", entity_extra="", snap_extra="", config_extr
     }
 
 
+# ── v2 derivation fixtures: families beyond the v1 hardcode ───────────────
+
+def derived_widget_fixture(model_extra=""):
+    """A family v1 never knew: WidgetEntity ↔ Widget — derivation must pick
+    it up from data/db/ alone (no SYNC_GROUPS entry, no alias pin)."""
+    model = (
+        "package com.rikkaminis.app.data.model\n"
+        "data class Widget(\n"
+        "    val id: String,\n"
+        "    val name: String,\n"
+        + model_extra +
+        ")\n"
+    )
+    entity = (
+        "package com.rikkaminis.app.data.db\n"
+        "data class WidgetEntity(\n"
+        "    val id: String,\n"
+        "    val name: String,\n"
+        ")\n"
+    )
+    mapping = (
+        "package com.rikkaminis.app.data.db\n"
+        "import com.rikkaminis.app.data.model.Widget\n"
+        "fun toSnapshot(w: Widget): WidgetEntity =\n"
+        "    WidgetEntity(\n"
+        "        id = w.id,\n"
+        "        name = w.name,\n"
+        "    )\n"
+        "fun toProviderConfig(e: WidgetEntity): Widget =\n"
+        "    Widget(\n"
+        "        id = e.id,\n"
+        "        name = e.name,\n"
+        "    )\n"
+    )
+    return {
+        os.path.join(KOTLIN_PKG, "data/model/Widget.kt"): model,
+        os.path.join(KOTLIN_PKG, "data/db/WidgetEntity.kt"): entity,
+        os.path.join(KOTLIN_PKG, "data/db/WidgetMapping.kt"): mapping,
+    }
+
+
+def derived_alias_fixture():
+    """ModelEntry family: model/ctor arg names differ from entity columns by
+    the real FIELD_ALIASES (uuid→id, baseModel→baseModelJson,
+    overrides→overridesJson) — alias normalization must keep it GREEN."""
+    model = (
+        "package com.rikkaminis.app.data.model\n"
+        "data class ModelEntry(\n"
+        "    val uuid: String,\n"
+        "    val baseModel: String,\n"
+        "    val overrides: Int,\n"
+        "    val isCustom: Boolean,\n"
+        ")\n"
+    )
+    entity = (
+        "package com.rikkaminis.app.data.db\n"
+        "data class ProviderModelEntryEntity(\n"
+        "    val id: String,\n"
+        "    val baseModelJson: String,\n"
+        "    val overridesJson: Int,\n"
+        "    val isCustom: Boolean,\n"
+        ")\n"
+    )
+    mapping = (
+        "package com.rikkaminis.app.data.db\n"
+        "fun toSnapshot(e: ModelEntry): ProviderModelEntryEntity =\n"
+        "    ProviderModelEntryEntity(\n"
+        "        id = e.uuid,\n"
+        "        baseModelJson = e.baseModel,\n"
+        "        overridesJson = e.overrides,\n"
+        "        isCustom = e.isCustom,\n"
+        "    )\n"
+        "fun toProviderConfig(e: ProviderModelEntryEntity): ModelEntry =\n"
+        "    ModelEntry(\n"
+        "        uuid = e.id,\n"
+        "        baseModel = e.baseModelJson,\n"
+        "        overrides = e.overridesJson,\n"
+        "        isCustom = e.isCustom,\n"
+        "    )\n"
+    )
+    return {
+        os.path.join(KOTLIN_PKG, "data/model/ModelEntry.kt"): model,
+        os.path.join(KOTLIN_PKG, "data/db/ProviderModelEntryEntity.kt"): entity,
+        os.path.join(KOTLIN_PKG, "data/db/ProviderModelEntryMapping.kt"): mapping,
+    }
+
+
+def derived_orphan_fixture():
+    """An entity whose model class doesn't exist under KOTLIN — must land in
+    UNRESOLVED (visible) and NOT fail the run."""
+    orphan = (
+        "package com.rikkaminis.app.data.db\n"
+        "data class OrphanEntity(\n"
+        "    val id: String,\n"
+        ")\n"
+    )
+    return {os.path.join(KOTLIN_PKG, "data/db/OrphanEntity.kt"): orphan}
+
+
+def derived_pinned_fixture():
+    """ThinkingRule family: kind/scope/wireFormat/reasoningEcho have no 1:1
+    entity column by design — KNOWN_MISMATCH pins must print WARNING lines
+    and keep the run GREEN (exit 0)."""
+    model = (
+        "package com.rikkaminis.app.provider.thinking\n"
+        "data class ThinkingRule(\n"
+        "    val id: String,\n"
+        "    val label: String,\n"
+        "    val kind: String,\n"
+        "    val scope: String,\n"
+        "    val wireFormat: String,\n"
+        "    val reasoningEcho: String,\n"
+        ")\n"
+    )
+    entity = (
+        "package com.rikkaminis.app.data.db\n"
+        "data class ProviderThinkingRuleEntity(\n"
+        "    val id: String,\n"
+        "    val label: String,\n"
+        "    val scopeKind: String,\n"
+        "    val scopePattern: String,\n"
+        "    val wireFormatJson: String,\n"
+        "    val reasoningEchoJson: String,\n"
+        "    val sortOrder: Int,\n"
+        ")\n"
+    )
+    mapping = (
+        "package com.rikkaminis.app.provider.thinking\n"
+        "fun toEntity(r: ThinkingRule): ProviderThinkingRuleEntity =\n"
+        "    ProviderThinkingRuleEntity(\n"
+        "        id = r.id,\n"
+        "        label = r.label,\n"
+        "        scopeKind = r.kind,\n"
+        "        scopePattern = r.scope,\n"
+        "        wireFormatJson = encodeWireFormat(r.wireFormat),\n"
+        "        reasoningEchoJson = encodeEcho(r.reasoningEcho),\n"
+        "        sortOrder = 0,\n"
+        "    )\n"
+        "fun toRule(e: ProviderThinkingRuleEntity): ThinkingRule =\n"
+        "    ThinkingRule(\n"
+        "        id = e.id,\n"
+        "        label = e.label,\n"
+        "        kind = e.scopeKind,\n"
+        "        scope = e.scopePattern,\n"
+        "        wireFormat = decodeWireFormat(e.wireFormatJson),\n"
+        "        reasoningEcho = decodeEcho(e.reasoningEchoJson),\n"
+        "    )\n"
+    )
+    return {
+        os.path.join(KOTLIN_PKG, "provider/thinking/ThinkingRule.kt"): model,
+        os.path.join(KOTLIN_PKG, "data/db/ProviderThinkingRuleEntity.kt"): entity,
+        os.path.join(KOTLIN_PKG, "provider/thinking/ThinkingRuleCoding.kt"): mapping,
+    }
+
+
 I18N_CLEAN_KT = (
     "package com.rikkaminis.app\n"
     "val title = R.string.app_name\n"
@@ -293,6 +448,52 @@ def test_four_way():
         "toProviderConfig-gap caught (exit 1, 'toProviderConfig missing')",
         code == 1 and "toProviderConfig missing" in out,
         f"exit={code}\n{out}",
+    )
+    shutil.rmtree(root)
+
+
+def test_four_way_derived():
+    print("━━━ four_way_sync_check v2 (derived families) ━━━")
+
+    # (a) Non-hardcoded family with a single-side extra field → must be RED.
+    root = make_tree(derived_widget_fixture(model_extra="    val pinned: Boolean = false,\n"))
+    code, out = run_scanner("four_way_sync_check.py", root)
+    check(
+        "derived non-hardcoded family caught (exit 1, 'Entity missing')",
+        code == 1 and "Entity missing" in out and "Widget" in out,
+        f"exit={code}\n{out}",
+    )
+    shutil.rmtree(root)
+
+    # (b) Alias normalization: model/ctor arg names differ from entity
+    # columns by the real FIELD_ALIASES → must NOT be flagged (GREEN).
+    root = make_tree(derived_alias_fixture())
+    code, out = run_scanner("four_way_sync_check.py", root)
+    check(
+        "alias-normalized derived family green (exit 0)",
+        code == 0 and "ModelEntry — four-way sync check" in out,
+        f"exit={code}\n{out}",
+    )
+    shutil.rmtree(root)
+
+    # (c) Entity with no model class → UNRESOLVED (visible), exit 0.
+    root = make_tree(derived_orphan_fixture())
+    code, out = run_scanner("four_way_sync_check.py", root)
+    check(
+        "orphan entity → UNRESOLVED + exit 0",
+        code == 0 and "UNRESOLVED" in out and "OrphanEntity" in out,
+        f"exit={code}\n{out}",
+    )
+    shutil.rmtree(root)
+
+    # (d) KNOWN_MISMATCH pin: pinned fields → WARNING lines + exit 0.
+    root = make_tree(derived_pinned_fixture())
+    code, out = run_scanner("four_way_sync_check.py", root)
+    warns = out.count("KNOWN-MISMATCH (pinned, by design)")
+    check(
+        "KNOWN_MISMATCH pin → WARNING lines + exit 0",
+        code == 0 and warns >= 4 and "ThinkingRule — four-way sync check" in out,
+        f"exit={code} warns={warns}\n{out}",
     )
     shutil.rmtree(root)
 
@@ -1496,6 +1697,7 @@ def main():
     print("║  Scan Self-Test (fixture ground truth)          ║")
     print("╚══════════════════════════════════════════════════╝")
     test_four_way()
+    test_four_way_derived()
     test_i18n()
     test_enum_parse()
     test_boundary()
