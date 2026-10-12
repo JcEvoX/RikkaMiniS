@@ -137,8 +137,14 @@ object AppLogger {
         logDir = File(context.filesDir, LOG_DIR).also { it.mkdirs() }
         enabled = context.getSharedPreferences(PREF_NAME, Context.MODE_PRIVATE)
             .getBoolean(KEY_ENABLED, false)
-        pruneOldLogs()
+        // [T-log-warn-reach-1012] pruneOldLogs() may emit the "size prune
+        // deferred" WARN. That line only reaches the daily file when the
+        // async writer exists (log() enqueues; it does not write), so the
+        // prune must run AFTER startCapture() — previously it ran before and
+        // the deferral notice existed only in logcat, where our own tailer
+        // filters AppLogger-tagged lines: effectively silent.
         if (enabled) startCapture()
+        pruneOldLogs()
     }
 
     fun isEnabled(context: Context): Boolean {
@@ -668,14 +674,17 @@ object AppLogger {
         val dir = logDir ?: return null
         val name = File(filename).name
         if (name != filename || name.isEmpty() || name == "." || name == "..") {
-            android.util.Log.w(TAG, "refused a non-basename log name: \"$filename\"")
+            // [T-log-warn-reach-1012] warning(), not Log.w: the raw logcat
+            // line is filtered out of the file by our own tailer (tag ==
+            // "AppLogger"), so the refusal notice never reached the file.
+            warning(TAG, "refused a non-basename log name: \"$filename\"")
             return null
         }
         val file = File(dir, name)
         val root = runCatching { dir.canonicalFile }.getOrNull() ?: return null
         val canonical = runCatching { file.canonicalFile }.getOrNull() ?: return null
         if (canonical.parentFile != root) {
-            android.util.Log.w(TAG, "refused an out-of-dir log path: ${canonical.path}")
+            warning(TAG, "refused an out-of-dir log path: ${canonical.path}")
             return null
         }
         return file
@@ -802,7 +811,16 @@ object AppLogger {
                 candidates.sumOf { it.length() }
             // One line, only on deferral: the cap is exceeded but every
             // candidate is protected. Say WHY instead of shrinking silently.
-            Log.w(
+            //
+            // [T-log-warn-reach-1012] Routed through AppLogger.warning() (not
+            // android.util.Log): the raw logcat line is filtered out of the
+            // file by our own tailer (tag == "AppLogger"), and before the
+            // writer queue exists this was the ONLY destination — the notice
+            // was effectively unreachable (measured 2026-10-12: 0 occurrences
+            // in the files during a full day above the cap). warning() both
+            // mirrors to logcat and lands in the daily file. init() runs the
+            // prune after startCapture() so the queue exists.
+            warning(
                 "AppLogger",
                 "size prune deferred: cap exceeded by ~${total / (1024L * 1024)}MB, " +
                     "${allFiles.size - candidates.size} file(s) " +
