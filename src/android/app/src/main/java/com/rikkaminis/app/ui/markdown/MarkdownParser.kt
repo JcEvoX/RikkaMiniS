@@ -138,7 +138,11 @@ object MarkdownParser {
             val headingMatch = Regex("^(#{1,6})\\s+(.+)$").find(line)
             if (headingMatch != null) {
                 val level = headingMatch.groupValues[1].length
-                val content = headingMatch.groupValues[2].trimEnd().removeSuffix("#").trimEnd()
+                // [T5/md-trailing-hash] Closing sequence: strip a trailing run of
+                // '#' only when preceded by whitespace (CommonMark). The old
+                // removeSuffix("#") both ate content ("## C#" → "C") and left
+                // residue on space-preceded closers ("## title ##" → "title #").
+                val content = Regex("\\s+#+$").replace(headingMatch.groupValues[2].trimEnd(), "").trimEnd()
                 blocks.add(Block.Heading(level, content))
                 i++
                 continue
@@ -157,8 +161,16 @@ object MarkdownParser {
                 continue
             }
 
-            // Table (must have at least header + separator)
-            if (i + 1 < lines.size && isTableSeparator(lines[i + 1])) {
+            // Table (must have at least header + separator). [T5/md-setext-table]
+            // The separator check alone turned "Title\n---" (setext h2 in
+            // CommonMark) into an empty Table(header=["Title"]) — a pipe-less
+            // "---" matched isTableSeparator as a single-column separator row.
+            // A real table always carries a '|' in its header or separator row,
+            // so require one; otherwise fall through (paragraph + thematic
+            // break), which is the documented non-support of setext headings.
+            if (i + 1 < lines.size && isTableSeparator(lines[i + 1]) &&
+                (lines[i].contains('|') || lines[i + 1].contains('|'))
+            ) {
                 val table = parseTable(lines, i)
                 if (table != null) {
                     blocks.add(table.first)
