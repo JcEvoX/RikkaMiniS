@@ -248,7 +248,20 @@ internal fun scanThinkTags(
         }
     }
 
-    return ThinkTagScanResult(visibleBuilder.toString(), thinkingBuilder.toString(), "", false, null)
+    // [state-carry] The loop can exit with an ACTIVE region when a chunk ends
+    // exactly where the open tag was consumed (e.g. a relay delta that is
+    // exactly "<thinking>"). Hardcoding false/null here dropped the region
+    // state: the next chunk treated the thinking body as visible text and its
+    // closer was then discarded as an orphan — the whole region leaked into
+    // the reply body (2026-10-12 repro: ["<thinking>", "abc</thinking>done"]
+    // -> visible="abcdone", thinking=[]). Carry the real state out.
+    return ThinkTagScanResult(
+        visibleBuilder.toString(),
+        thinkingBuilder.toString(),
+        "",
+        tagActive,
+        if (tagActive) activeFormat else null,
+    )
 }
 
 /**
