@@ -75,8 +75,19 @@ object AppLogger {
     // contract as the daily writer. The debug file holds EVERY DEBUG line the
     // app produces (including the previously-muted high-volume categories) so
     // a provider failure can be diagnosed after the fact. Bounded by
-    // DEBUG_MAX_BYTES per day via rename-to-".1" rotation — bounded at 2×cap.
+    // DEBUG_MAX_BYTES per day via rename-to-".N" rotation (indices shift, so
+    // a new roll never overwrites the previous one's bytes) — bounded at
+    // (DEBUG_MAX_ROLLS + 1) × cap.
     private const val DEBUG_MAX_BYTES = 5L * 1024 * 1024
+
+    /**
+     * How many rolled `.N.log` siblings to keep per day+process. A new roll
+     * evicts only the OLDEST roll; the previous rolls' bytes survive until
+     * they age into the eviction slot (T-log-roll-1012: the old fixed `.1`
+     * name let every new roll destroy the previous roll's evidence — a
+     * 211 MB roll survived ~7 minutes on 2026-10-12).
+     */
+    private const val DEBUG_MAX_ROLLS = 3
     private var debugWriter: PrintWriter? = null
     private var debugDate: String = ""
     private var debugBytesWritten: Long = 0
@@ -486,6 +497,16 @@ object AppLogger {
     /**
      * Open (or reuse) the debug-channel writer for [date], inside
      * `synchronized(writerLock)` like [getWriter].
+     *
+     * [T-log-rotation-1012] The byte counter is SEEDED FROM THE FILE, not
+     * reset to zero: the file name is shared by every process of this family
+     * for the whole day (short-lived `:modelservice` workers come and go),
+     * so a fresh process starting at 0 never reached DEBUG_MAX_BYTES — each
+     * single worker writes at most a few MB before dying, while the shared
+     * file itself grew unbounded (measured 2026-10-12: 202 MB before the
+     * first rotation ever fired). Seeding from `file.length()` makes the
+     * rotation decision track the FILE's true size regardless of how many
+     * processes have appended to it.
      */
     private fun getDebugWriter(date: String): PrintWriter {
         if (date != debugDate || debugWriter == null) {
@@ -494,18 +515,27 @@ object AppLogger {
             } catch (_: Exception) {
             }
             val dir = logDir ?: throw IllegalStateException("AppLogger not initialized")
-            debugWriter = PrintWriter(FileWriter(File(dir, channelFileName("debug", date, processSuffix)), true))
+            val file = File(dir, channelFileName("debug", date, processSuffix))
+            debugWriter = PrintWriter(FileWriter(file, true))
             debugDate = date
-            debugBytesWritten = 0
+            debugBytesWritten = file.length()
         }
         return debugWriter!!
     }
 
     /**
      * [T-logging-full-coverage] Debug-file rotation: the current debug file
-     * exceeded DEBUG_MAX_BYTES → rename it to `debug-<date>.1.log` (deleting
-     * a previous roll) and reopen fresh. Called INSIDE writerLock from the
-     * write path; the next write reopens the writer. Bounded at 2×cap per day.
+     * exceeded DEBUG_MAX_BYTES → rename it to `…<N+1>.log` (shifting indices,
+     * see [debugRollFileName]) and reopen fresh. Called INSIDE writerLock
+     * from the write path; the next write reopens the writer. Bounded at
+     * (DEBUG_MAX_ROLLS + 1) × cap per day+process.
+     *
+     * [T-log-rotation-1012] The old fixed `.1` name meant every roll DELETED
+     * the previous roll (a 211 MB roll survived ~7 minutes before being
+     * overwritten). Now indices shift: the newest roll takes the highest
+     * index, older rolls keep their bytes until they are the oldest and
+     * [DEBUG_MAX_ROLLS] is exceeded — then only the oldest roll is deleted,
+     * never the freshest evidence.
      */
     private fun rotateDebugFile(date: String) {
         try {
@@ -516,9 +546,23 @@ object AppLogger {
         if (dir != null) {
             val base = channelFileName("debug", date, processSuffix)
             val file = File(dir, base)
-            val rolled = File(dir, base.substringBeforeLast(".log") + ".1.log")
-            if (rolled.exists()) rolled.delete()
+            // -1: the not-yet-created roll takes the next free index.
+            val highest = highestRollIndex(dir.list()?.toList() ?: emptyList(), base)
+            val rolled = File(dir, debugRollFileName(base, highest + 1))
             if (!file.renameTo(rolled)) file.delete()
+            // Evict the OLDEST roll only when we now hold more than the cap.
+            // Iterate from the lowest index upward so a stray missing index
+            // cannot stop the sweep.
+            val rolls = (1..highest).mapNotNull { i ->
+                File(dir, debugRollFileName(base, i)).takeIf { it.exists() }
+            }.sortedBy { it.name }
+            var excess = rolls.size - DEBUG_MAX_ROLLS
+            var cursor = 0
+            while (excess > 0 && cursor < rolls.size) {
+                rolls[cursor].delete()
+                cursor++
+                excess--
+            }
         }
         debugWriter = null
         debugBytesWritten = 0
