@@ -45,12 +45,16 @@ internal fun ChatViewModel.retryLast() {
 
         // T145: claim _isStreaming synchronously — see retryFromMessage for rationale.
         AppLogger.info(ChatViewModel.TAG_STREAM, "retryLast _isStreaming=true (sync, sid=$activeSessionId)")
+        // [T-claim-token-vs-stale-finally] Mint the claim token BEFORE the flag
+        // flips — see streamingClaimToken KDoc.
+        streamingClaimToken = Any()
         _isStreaming.value = true
         streamEpoch++
         // [T-stale-finally-vs-new-claim] Publish the claim so an older job's
         // finally can't flip _isStreaming off during the setup window.
         streamingClaimEpoch = streamEpoch
         val sendEpoch = streamingClaimEpoch
+        val claimToken = streamingClaimToken
 
         viewModelScope.launch(Dispatchers.IO) {
             var streamLaunched = false
@@ -134,22 +138,24 @@ internal fun ChatViewModel.retryLast() {
                         SessionActivityTracker.markStreamError(activeSessionId)
                     } finally {
                         AppLogger.info(ChatViewModel.TAG_STREAM, "retryLast streamJob FINALLY enter")
-                        // [audit-0907 B2] Reset queue-position state — same
-                        // rationale as the send path's finally: whatever the
-                        // worker reported while queued must not leak into the
-                        // next run's typing indicator.
-                        resetQueueWaitingAhead()
-                        // [fix/zero-chunk-cancel] Same rationale for the network-wait clock.
-                        resetAwaitingResponseSince()
-                        // [T-android-overlay-reply-status-34599] Surface
-                        // the assistant's most recent reply text to the
-                        // overlay BEFORE setInactive so the post-completion
-                        // overlay state (no-running, has-outcome) carries a
-                        // non-null excerpt. Reading _messages here is safe:
-                        // we're in the finally block of the agent loop and
-                        // the stream has already flushed its last delta.
-                        publishOverlayReplyExcerpt(activeSessionId)
-                        SessionActivityTracker.setInactive(activeSessionId)
+                        if (claimToken === streamingClaimToken) {
+                            // [audit-0907 B2] Reset queue-position state — same
+                            // rationale as the send path's finally: whatever the
+                            // worker reported while queued must not leak into the
+                            // next run's typing indicator.
+                            resetQueueWaitingAhead()
+                            // [fix/zero-chunk-cancel] Same rationale for the network-wait clock.
+                            resetAwaitingResponseSince()
+                            // [T-android-overlay-reply-status-34599] Surface
+                            // the assistant's most recent reply text to the
+                            // overlay BEFORE setInactive so the post-completion
+                            // overlay state (no-running, has-outcome) carries a
+                            // non-null excerpt. Reading _messages here is safe:
+                            // we're in the finally block of the agent loop and
+                            // the stream has already flushed its last delta.
+                            publishOverlayReplyExcerpt(activeSessionId)
+                            SessionActivityTracker.setInactive(activeSessionId)
+                        }
                         SessionConcurrencyManager.releaseSlot(activeSessionId)
                         AppLogger.info(ChatViewModel.TAG_STREAM, "retryLast streamJob FINALLY exit")
                     }
@@ -159,7 +165,7 @@ internal fun ChatViewModel.retryLast() {
                 }
                 // [T-android-stale-streamjob-clears-isstreaming] guard +
                 // epoch gate (see runRerunStreamTail).
-                if (streamJob === coroutineContext[Job] && sendEpoch == streamingClaimEpoch) {
+                if (streamJob === coroutineContext[Job] && sendEpoch == streamingClaimEpoch && claimToken === streamingClaimToken) {
                     AppLogger.info(ChatViewModel.TAG_STREAM, "retryLast _isStreaming=false (about to set)")
                     _isStreaming.value = false
                 } else {
@@ -170,7 +176,7 @@ internal fun ChatViewModel.retryLast() {
             } finally {
                 if (!streamLaunched) {
                     // [T-stale-finally-vs-new-claim] Only clear under our own claim.
-                    if (sendEpoch == streamingClaimEpoch) {
+                    if (sendEpoch == streamingClaimEpoch && claimToken === streamingClaimToken) {
                         AppLogger.info(ChatViewModel.TAG_STREAM, "retryLast _isStreaming=false (setup aborted)")
                         _isStreaming.value = false
                     } else {

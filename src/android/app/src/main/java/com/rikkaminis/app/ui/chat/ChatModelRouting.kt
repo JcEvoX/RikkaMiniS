@@ -267,6 +267,12 @@ internal fun ChatViewModel.switchModelAndRerun(label: String) {
         _error.value = null
         _canResume.value = false
         AppLogger.info(ChatViewModel.TAG_STREAM, "$label _isStreaming=true (sync, sid=$activeSessionId)")
+        // [T-claim-token-vs-stale-finally] Mint the claim token BEFORE the flag
+        // flips. This path is the one that failed in the field (2026-10-12
+        // 14:40:12): the cancel() above unwinds the predecessor while this
+        // claim is still running, and the epoch snapshot below lands too late
+        // to stop it. The token lands first and makes that finally a no-op.
+        streamingClaimToken = Any()
         _isStreaming.value = true
         streamEpoch++
         // [T-stale-finally-vs-new-claim] Publish the claim SYNCHRONOUSLY
@@ -276,12 +282,13 @@ internal fun ChatViewModel.switchModelAndRerun(label: String) {
         streamingClaimEpoch = streamEpoch
         var streamLaunched = false
         val switchEpoch = streamingClaimEpoch
+        val claimToken = streamingClaimToken
         try {
             streamLaunched = runRerunStreamTail(provider, label)
         } finally {
             if (!streamLaunched) {
                 // [T-stale-finally-vs-new-claim] Only clear under our own claim.
-                if (switchEpoch == streamingClaimEpoch) {
+                if (switchEpoch == streamingClaimEpoch && claimToken === streamingClaimToken) {
                     AppLogger.info(ChatViewModel.TAG_STREAM, "$label _isStreaming=false (setup aborted)")
                     _isStreaming.value = false
                 } else {
