@@ -577,18 +577,18 @@ object AppLogger {
             val highest = highestRollIndex(dir.list()?.toList() ?: emptyList(), base)
             val rolled = File(dir, debugRollFileName(base, highest + 1))
             if (!file.renameTo(rolled)) file.delete()
-            // Evict the OLDEST roll only when we now hold more than the cap.
-            // Iterate from the lowest index upward so a stray missing index
-            // cannot stop the sweep.
-            val rolls = (1..highest).mapNotNull { i ->
-                File(dir, debugRollFileName(base, i)).takeIf { it.exists() }
-            }.sortedBy { it.name }
-            var excess = rolls.size - DEBUG_MAX_ROLLS
-            var cursor = 0
-            while (excess > 0 && cursor < rolls.size) {
-                rolls[cursor].delete()
-                cursor++
-                excess--
+            // Evict the OLDEST rolls until at most DEBUG_MAX_ROLLS remain —
+            // counting the one just created above. `(1..highest)` is already
+            // in index order; sorting by NAME would put ".10.log" before
+            // ".7.log" and delete the wrong end once a day passes 9 rotations
+            // (2026-10-12 measured ~40 at 200 MB/day). A stray missing index
+            // cannot stop the sweep — [rollEvictionIndices] takes from the
+            // sorted present set, not a contiguous run.
+            val present = (1..highest).filter { i ->
+                File(dir, debugRollFileName(base, i)).exists()
+            }
+            for (i in rollEvictionIndices(present, DEBUG_MAX_ROLLS)) {
+                File(dir, debugRollFileName(base, i)).delete()
             }
         }
         debugWriter = null

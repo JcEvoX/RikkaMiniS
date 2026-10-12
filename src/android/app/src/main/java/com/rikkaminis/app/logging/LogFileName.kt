@@ -67,6 +67,27 @@ internal fun highestRollIndex(names: Collection<String>, baseName: String): Int 
 }
 
 /**
+ * [T-log-roll-1012] Which rolled indices to delete so that at most [maxRolls]
+ * rolls survive — counting [pendingNew], the roll the rotation in flight is
+ * about to create (1 while rotating, 0 for a sweep-only pass).
+ *
+ * Returns the LOWEST indices first: the oldest evidence goes, never the
+ * freshest. Ordering is NUMERIC, not lexicographic — a name sort puts
+ * `.10.log` before `.7.log`, so a day past 9 rotations (2026-10-12 measured
+ * ~40 rotations at 200 MB/day) would evict the wrong end, including the roll
+ * that had just been written.
+ */
+internal fun rollEvictionIndices(
+    existing: Collection<Int>,
+    maxRolls: Int,
+    pendingNew: Int = 1,
+): List<Int> {
+    val excess = existing.size + pendingNew - maxRolls
+    if (excess <= 0) return emptyList()
+    return existing.sorted().take(excess)
+}
+
+/**
  * [T-log-tail-heal-1012] Repair a torn tail left by an interrupted write.
  *
  * The daily file names are per-PROCESS but long-lived across process

@@ -87,4 +87,31 @@ class DebugRollNamingTest {
             dir.deleteRecursively()
         }
     }
+
+    // ---- rollEvictionIndices -----------------------------------------------
+
+    @Test fun `eviction drops the OLDEST indices, not the newest`() {
+        // 5 rolls exist + the one the rotation is creating = 6; cap 3 → 1,2,3 go.
+        assertEquals(listOf(1, 2, 3), rollEvictionIndices(listOf(1, 2, 3, 4, 5), maxRolls = 3))
+    }
+
+    @Test fun `eviction orders NUMERICALLY, not lexicographically`() {
+        // Pre-fix the sweep sorted by file NAME, which puts ".10.log" before
+        // ".7.log": past 9 rotations in a day it evicted 10,11,12 and kept
+        // 7,8,9 — i.e. it deleted the roll that had just been written.
+        assertEquals((1..10).toList(), rollEvictionIndices((1..12).toList(), maxRolls = 3))
+    }
+
+    @Test fun `nothing is evicted while the cap still has room`() {
+        assertEquals(emptyList<Int>(), rollEvictionIndices(listOf(1, 2), maxRolls = 3))
+        assertEquals(emptyList<Int>(), rollEvictionIndices(emptyList<Int>(), maxRolls = 3))
+    }
+
+    @Test fun `eviction leaves exactly the cap, newest kept`() {
+        val existing = (1..40).toList()
+        val doomed = rollEvictionIndices(existing, maxRolls = 3)
+        assertEquals((1..38).toList(), doomed)
+        // 39, 40 survive, plus 41 = the roll created by this rotation.
+        assertEquals(listOf(39, 40, 41), existing.filterNot { it in doomed } + 41)
+    }
 }
