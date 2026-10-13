@@ -498,6 +498,63 @@ def test_four_way_derived():
     shutil.rmtree(root)
 
 
+# ── v2.1 entity-self fixtures: positional branch + defaulted regex ────────
+# [review G2] The positional branch reads defaulted fields via
+# extract_defaulted_fields; a bare `[^=]*` ran across lines and swallowed the
+# NEXT field's `=`, mis-flagging the previous field ('key' instead of 'value').
+
+POSITIONAL_CTRL = (
+    'package com.rikkaminis.app.data.db\n'
+    'data class ProviderConfigMetaEntity(\n'
+    '    val key: String,\n'
+    '    val value: String,\n'
+    ')\n'
+)
+POSITIONAL_DEFT = (
+    'package com.rikkaminis.app.data.db\n'
+    'data class ProviderConfigMetaEntity(\n'
+    '    val key: String,\n'
+    '    val value: String = "x",\n'
+    ')\n'
+)
+POSITIONAL_CALL = (
+    'package com.rikkaminis.app.data.repository\n'
+    'import com.rikkaminis.app.data.db.ProviderConfigMetaEntity\n'
+    'fun w() = ProviderConfigMetaEntity("k")\n'
+)
+
+
+def test_four_way_entity_self():
+    print("━━━ four_way_sync_check v2.1 (entity-self positional branch) ━━━")
+
+    # (a) Positional entity, no defaults → GREEN.
+    root = make_tree({
+        os.path.join(KOTLIN_PKG, "data/db/ProviderConfigMetaEntity.kt"): POSITIONAL_CTRL,
+        os.path.join(KOTLIN_PKG, "data/repository/W.kt"): POSITIONAL_CALL,
+    })
+    code, out = run_scanner("four_way_sync_check.py", root)
+    check(
+        "entity-self positional no-default green (exit 0)",
+        code == 0,
+        f"exit={code}\n{out}",
+    )
+    shutil.rmtree(root)
+
+    # (b) Positional entity with a defaulted field → RED naming the defaulted
+    # column ('value'; the old cross-line regex mis-flagged 'key').
+    root = make_tree({
+        os.path.join(KOTLIN_PKG, "data/db/ProviderConfigMetaEntity.kt"): POSITIONAL_DEFT,
+        os.path.join(KOTLIN_PKG, "data/repository/W.kt"): POSITIONAL_CALL,
+    })
+    code, out = run_scanner("four_way_sync_check.py", root)
+    check(
+        "entity-self defaulted field caught (exit 1, names 'value')",
+        code == 1 and "['value']" in out and "['key']" not in out,
+        f"exit={code}\n{out}",
+    )
+    shutil.rmtree(root)
+
+
 def test_i18n():
     print("━━━ i18n_check ━━━")
     files = {
@@ -1698,6 +1755,7 @@ def main():
     print("╚══════════════════════════════════════════════════╝")
     test_four_way()
     test_four_way_derived()
+    test_four_way_entity_self()
     test_i18n()
     test_enum_parse()
     test_boundary()

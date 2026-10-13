@@ -184,7 +184,11 @@ def extract_defaulted_fields(src, cls_name):
     if end < 0:
         return set()
     body = src[m.end():end]
-    return set(re.findall(r"\b(?:val|var)\s+(\w+)\s*:[^=]*=\s", body))
+    # [review G2] `[^=\n]*` — a bare `[^=]*` runs across lines and swallows the
+    # NEXT field's `=`, mis-flagging the previous field as defaulted (e.g.
+    # `val key: String,\nval value: String = "x"` reported 'key' instead of
+    # 'value'), which silently voids the positional-branch gate.
+    return set(re.findall(r"\b(?:val|var)\s+(\w+)\s*:[^=\n]*=\s", body))
 
 
 def collect_ctor_sites(files, cls_name):
