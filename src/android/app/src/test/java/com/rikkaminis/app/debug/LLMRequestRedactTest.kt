@@ -35,6 +35,19 @@ class LLMRequestRedactTest {
     }
 
     @Test
+    fun `azure-style api-key header is redacted`() {
+        // [sweep-1013 D2-F5] Azure-style OpenAI-compatible gateways carry the
+        // credential in `api-key` — the spelling that was missing from the
+        // set before this fix.
+        val redacted = LLMRequestLog.redactHeaders(mapOf("api-key" to "az-secret-11"))
+        assertEquals("[redacted:12]", redacted["api-key"])
+        assertFalse(redacted.values.joinToString().contains("az-secret"))
+        // Case-insensitive on the new name too.
+        val upper = LLMRequestLog.redactHeaders(mapOf("API-KEY" to "az-secret-22"))
+        assertEquals("[redacted:12]", upper["API-KEY"])
+    }
+
+    @Test
     fun `mixed-case cookie header name is matched case-insensitively`() {
         val redacted = LLMRequestLog.redactHeaders(mapOf("CoOkIe" to "session=abc"))
         assertEquals("[redacted:11]", redacted["CoOkIe"])

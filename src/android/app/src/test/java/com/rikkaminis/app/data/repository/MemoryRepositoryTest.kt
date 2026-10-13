@@ -235,4 +235,60 @@ class MemoryRepositoryTest {
         assertTrue("ordinary daily logs must still be deletable", deleted)
         assertFalse("the daily log file must be gone", log.exists())
     }
+
+    // ── F-9: dailyLogSizeSummary / largestDailyLogBytes on empty input ──
+    // Pre-fix, dailyLogSizes() returned null only when the DIR was missing;
+    // an existing-but-filtered-empty dir (all files excluded, e.g. only
+    // SOUL.md) produced an empty list and `.first()` threw
+    // NoSuchElementException. The summary is called from the memory_rollup
+    // prompt path, so a fresh install (dir exists, no daily logs yet) hit
+    // this on first use.
+
+    @Test
+    fun dailyLogSizeSummary_emptyDirReturnsNullNotThrow() {
+        // Dir exists but has no daily logs — the exact F-9 trigger shape.
+        memoryDir.mkdirs()
+        File(memoryDir, SoulStore.FILE_NAME).writeText("persona only\n")
+
+        val repo = MemoryRepository(memoryDir)
+
+        assertEquals(
+            "empty (all-excluded) dir must yield null, not NoSuchElementException",
+            null, repo.dailyLogSizeSummary(),
+        )
+        assertEquals(
+            "largestDailyLogBytes on empty dir must be 0",
+            0L, repo.largestDailyLogBytes(),
+        )
+    }
+
+    @Test
+    fun dailyLogSizeSummary_missingDirReturnsNullNotThrow() {
+        // Control arm: dir entirely absent — the pre-existing null path.
+        val repo = MemoryRepository(memoryDir)  // not created
+
+        assertNull(repo.dailyLogSizeSummary())
+        assertEquals(0L, repo.largestDailyLogBytes())
+    }
+
+    @Test
+    fun dailyLogSizeSummary_namesLargestBySize() {
+        memoryDir.mkdirs()
+        File(memoryDir, "2026-10-12.md").writeText("x".repeat(500))
+        File(memoryDir, "2026-10-13.md").writeText("y".repeat(5000))
+        File(memoryDir, SoulStore.FILE_NAME).writeText("persona".repeat(99)) // biggest, but excluded
+
+        val repo = MemoryRepository(memoryDir)
+        val summary = repo.dailyLogSizeSummary()
+
+        assertNotNull(summary)
+        assertTrue(
+            "the largest DAILY LOG must be named, not the excluded persona file",
+            summary!!.contains("2026-10-13.md"),
+        )
+        assertFalse(
+            "SOUL.md must never be named as a daily log",
+            summary.contains(SoulStore.FILE_NAME),
+        )
+    }
 }

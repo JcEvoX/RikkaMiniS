@@ -1204,6 +1204,7 @@
     <string name="backup_done_mcp_servers">Restored %1$d MCP server(s).</string>
     <string name="backup_done_skipped">\n%1$d items were skipped:</string>
     <string name="backup_done_no_keys">\nThis backup contains no keys — imported providers need their API keys re-entered.</string>
+    <string name="backup_done_no_keys_mcp">\nThis backup contains no keys — restored MCP server(s) and environment variable(s) need their credentials re-entered.</string>
     <string name="backup_done_restart">\nSome settings take effect after restarting the app.</string>
     <string name="backup_ok">OK</string>
     <string name="backup_err_unknown">Unknown error</string>

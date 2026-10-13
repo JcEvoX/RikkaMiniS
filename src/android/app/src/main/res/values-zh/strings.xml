@@ -1043,6 +1043,7 @@
     <string name="backup_done_mcp_servers">已恢复 %1$d 个 MCP 服务器。</string>
     <string name="backup_done_skipped">\n以下 %1$d 项已跳过：</string>
     <string name="backup_done_no_keys">\n该备份不含密钥，导入的提供商需要重新填写 API 密钥。</string>
+    <string name="backup_done_no_keys_mcp">\n该备份不含密钥，已恢复的 MCP 服务器和环境变量需要重新填写凭据。</string>
     <string name="backup_done_restart">\n部分设置需要重启应用后生效。</string>
     <string name="backup_ok">好</string>
     <string name="backup_err_unknown">未知错误</string>

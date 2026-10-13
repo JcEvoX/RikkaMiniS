@@ -6302,6 +6302,11 @@ restore OK (54) ... final health STILL missing 5  ← 死循环
 - SQLite 原生默认 `PRAGMA foreign_keys = OFF`，Room 2.6.1 不覆盖 → **本 app 外键约束实际关闭，CASCADE 不生效**。
 - 佐证：`ChatRepository.deleteSession` 显式 `deleteMessages` 再 `deleteSession`（若 CASCADE 生效这行冗余）；`ProviderConfigDao.replaceAll` 注释自认 "schema-without-FK test paths"。
 
+> **⚠️ 2026-10-13 二次修正（sweep-1013 §89-D1-F2 终审）：上一段四条 bullet 全部不成立。**
+> 字节码取证（room-compiler 2.6.1 jar，非源码推断）：`DatabaseProcessor.doProcess` 逐实体检查 `foreignKeys.isEmpty()`，任一实体带 `@ForeignKey` → `Database(vo)` 的 `enableForeignKeys = true`；`SQLiteOpenHelperWriter` 生成模板 `if (db.enableForeignKeys) + "PRAGMA foreign_keys = ON"` 进**生成的 onOpen**。本仓 `MessageEntity` 带 `onDelete = CASCADE` → **FK 已开启，CASCADE 生效**。（room-runtime jar 本体无 FK 字符串属实，但生成代码在 app 侧——第一次修正错在只搜了 runtime，漏了 compiler 的生成模板。）
+> 佐证反转：`ChatRepository.deleteSession` 的显式 `deleteMessages` 不是 CASCADE 缺失的证据，而是**幂等防御**（SessionForkManager 等多条删除路径共存时的双保险）。
+> 教训升级：核 Room FK 结论必须看 **room-compiler 的生成模板**（javap `DatabaseProcessor` / `SQLiteOpenHelperWriter`），runtime jar 永远是干净的——生成代码不在里面。`PRAGMA foreign_keys` 真机实测建议（:16686 行）仍然有效，但静态证据已足够支撑"FK 开"。
+
 **修正后结论**：聊天还原真实问题是「非幂等覆盖」（会话 REPLACE 回退元数据 + 消息被截断版覆盖），降级为 🟡。备份模块**无 🔴 数据丢失 bug**，最严重是两个 🟠（同步静默上传密钥 P1-1、手动还原不更新凭据 P1-2）。
 
 **教训（可复用）**：审计 FK/CASCADE 类结论前，必须核实 Room 是否 `enableForeignKeyConstraints()`（本 app 用的是 Room 2.6.1，该 API 已不存在，FK 默认关闭）。仅凭 Entity 注解上的 `onDelete=CASCADE` 就断言级联删除会误判——CASCADE 是否生效取决于 PRAGMA，不是注解。证据优先级：库源码 > 注解 > 注释。

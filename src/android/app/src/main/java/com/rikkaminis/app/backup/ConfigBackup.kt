@@ -615,8 +615,11 @@ object ConfigBackup {
                 // the same includeSecrets gate as provider apiKeys / envVar
                 // values: without secrets keep the key names (so the server
                 // still imports and the user sees what to refill) but blank
-                // the values.
-                if (!includeSecrets) stripMcpSecretValues(obj)
+                // the values. [review G1] exportServerJSON emits the nested
+                // wrapper {"mcpServers":{"<id>":{…}}} — the entry sits one
+                // level down, so strip through stripExportedMcpSecrets (the
+                // wrapper itself has no headers/env/args/url to strip).
+                if (!includeSecrets) stripExportedMcpSecrets(obj)
                 mcpServers.put(obj)
             }
         }
@@ -1669,6 +1672,31 @@ object ConfigBackup {
      * dominate. Returns null when nothing textual survives.
      */
     /**
+     * [review G1] Strip secret-bearing values from an [exportServerJSON]
+     * document. exportServerJSON emits the importable wrapper shape
+     * `{"mcpServers":{"<id>":{…}}}` — the credential-bearing entry sits ONE
+     * level down, so this descends and strips each entry. A bare entry (no
+     * wrapper) is stripped as-is, mirroring the import side's fallback
+     * (`entry = inner?.optJSONObject(id) ?: srv`).
+     *
+     * Stripping the wrapper itself was a no-op: the wrapper has no
+     * headers/env/args/url of its own, so every secret (Authorization / env
+     * token / args token / URL query key) survived into the backup payload
+     * even with includeSecrets=false. A regression test pins the wrapper
+     * shape the export path actually passes.
+     */
+    internal fun stripExportedMcpSecrets(obj: JSONObject) {
+        val inner = obj.optJSONObject("mcpServers")
+        if (inner == null) {
+            stripMcpSecretValues(obj)
+            return
+        }
+        for (id in inner.keys().asSequence().toList()) {
+            inner.optJSONObject(id)?.let { stripMcpSecretValues(it) }
+        }
+    }
+
+    /**
      * [sweep1013-D1/F-3] Blank the secret-bearing values of an exported MCP
      * server object (self-filled `headers` / `env` maps) while KEEPING the key
      * names — the server still imports, and the user sees exactly which
@@ -1683,6 +1711,54 @@ object ConfigBackup {
                 section.put(k, "")
             }
         }
+        // [review D-3] Credential carriers beyond headers/env:
+        // 1. `args` entries of the `--token=…` / `--api-key=…` shape (stdio
+        //    servers that take the credential as a CLI flag).
+        // 2. `url` query values for sensitive keys (?key=/token=/api_key=…),
+        //    mirroring LLMRequestLog.SENSITIVE_QUERY_KEYS.
+        // Both are blanked only when they actually carry a credential shape;
+        // benign values survive so the restored entry stays wired to its
+        // command/host (only the secret needs refilling).
+        val args = obj.optJSONArray("args")
+        if (args != null) {
+            for (i in 0 until args.length()) {
+                val v = args.optString(i, "")
+                if (SECRET_ARG_RE.matches(v)) args.put(i, v.substringBefore('=') + "=")
+            }
+        }
+        val url = obj.optString("url", "")
+        if (url.contains("?")) {
+            obj.put("url", redactUrlQuery(url))
+        }
+    }
+
+    /** `--flag=value` shapes whose flag name smells like a credential.
+     *  Full-match regex — `\S.*` requires a value of >= 1 non-space char,
+     *  so `--token=` (already blanked) and `--port=8080` are untouched. */
+    private val SECRET_ARG_RE = Regex(
+        """(?i)^--(token|api[_-]?key|secret|password|access[_-]?token)\s*=\S.*""",
+    )
+
+    /** Sensitive URL query keys — same list as LLMRequestLog.SENSITIVE_QUERY_KEYS. */
+    private val SENSITIVE_QUERY_KEYS = setOf(
+        "key", "api_key", "apikey", "api-key", "token", "access_token",
+        "secret", "password", "signature", "sig", "auth", "authorization",
+    )
+
+    private fun redactUrlQuery(url: String): String {
+        val qIdx = url.indexOf('?')
+        val query = url.substring(qIdx + 1)
+        val fragIdx = query.indexOf('#')
+        val (qBody, frag) = if (fragIdx >= 0) query.substring(0, fragIdx) to query.substring(fragIdx) else query to ""
+        val redacted = qBody.split('&').joinToString("&") { pair ->
+            val eq = pair.indexOf('=')
+            if (eq > 0) {
+                val k = pair.substring(0, eq)
+                val v = pair.substring(eq + 1)
+                if (k.lowercase() in SENSITIVE_QUERY_KEYS) "$k=[redacted:${v.length}]" else pair
+            } else pair
+        }
+        return url.substring(0, qIdx + 1) + redacted + frag
     }
 
     internal fun sanitizeChatParts(partsJson: String?): String? {

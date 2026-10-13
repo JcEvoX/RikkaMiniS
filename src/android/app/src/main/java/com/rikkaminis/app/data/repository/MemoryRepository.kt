@@ -83,9 +83,10 @@ class MemoryRepository(private val memoryDir: File) {
      * largest daily log (name + size) plus the total, or null when empty.
      */
     fun dailyLogSizeSummary(): String? {
-        val sizes = dailyLogSizes() ?: return null
+        val sizes = dailyLogSizes()
+        if (sizes.isEmpty()) return null  // F-9: maxOf on empty throws
         val total = sizes.sumOf { it.second }
-        val largest = sizes.first()
+        val largest = sizes.first()  // list is sorted by size desc — first IS largest
         return "largest daily log ${largest.first} (${formatFileSize(largest.second)}), " +
             "total ${sizes.size} logs ${formatFileSize(total)}"
     }
@@ -95,10 +96,10 @@ class MemoryRepository(private val memoryDir: File) {
      * the system prompt to decide whether to suggest memory_rollup.
      */
     fun largestDailyLogBytes(): Long {
-        return dailyLogSizes()?.firstOrNull()?.second ?: 0L
+        return dailyLogSizes().firstOrNull()?.second ?: 0L
     }
 
-    private fun dailyLogSizes(): List<Pair<String, Long>>? {
+    private fun dailyLogSizes(): List<Pair<String, Long>> {
         return memoryDir.listFiles()
             ?.filter {
                 it.extension == "md" &&
@@ -112,6 +113,9 @@ class MemoryRepository(private val memoryDir: File) {
             }
             ?.map { it.name to it.length() }
             ?.sortedByDescending { it.second }
+            ?: emptyList()  // F-9: empty result, never null — callers can't
+                            // confuse "no dir" with "no logs" and both mean
+                            // "nothing to roll up"
     }
 
     // -- memory_write --

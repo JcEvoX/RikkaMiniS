@@ -413,6 +413,88 @@ class ConfigBackupPayloadTest {
         assertEquals("https://example.com/sse", server.getString("url"))
     }
 
+    // ── [review D-3] credential carriers beyond headers/env ──────────────
+
+    @Test
+    fun `stripMcpSecretValues blanks token-shaped args but keeps benign args`() {
+        val server = JSONObject()
+            .put("command", "npx")
+            .put(
+                "args",
+                JSONArray()
+                    .put("--token=ghp_literal_secret")
+                    .put("--port=8080")
+                    .put("-y")
+                    .put("--API_KEY=abc123def"),
+            )
+        ConfigBackup.stripMcpSecretValues(server)
+        val args = server.getJSONArray("args")
+        // Credential-shaped flags keep the flag name, lose the value —
+        // the restored entry still shows WHAT to refill.
+        assertEquals("--token=", args.getString(0))
+        assertEquals("--port=8080", args.getString(1))
+        assertEquals("-y", args.getString(2))
+        assertEquals("--API_KEY=", args.getString(3))
+    }
+
+    @Test
+    fun `stripMcpSecretValues redacts sensitive url query values keeps benign`() {
+        val server = JSONObject()
+            .put("url", "https://gateway.example.com/sse?key=supersecret&client=app#frag")
+        ConfigBackup.stripMcpSecretValues(server)
+        assertEquals(
+            "https://gateway.example.com/sse?key=[redacted:11]&client=app#frag",
+            server.getString("url"),
+        )
+    }
+
+    @Test
+    fun `stripMcpSecretValues leaves url without query untouched`() {
+        val server = JSONObject().put("url", "https://example.com/sse")
+        ConfigBackup.stripMcpSecretValues(server)
+        assertEquals("https://example.com/sse", server.getString("url"))
+    }
+
+    // ── [review G1] MCP export wrapper shape (stripExportedMcpSecrets) ───
+
+    @Test
+    fun `stripExportedMcpSecrets strips the nested wrapper exportServerJSON emits`() {
+        // exportServerJSON emits {"mcpServers":{"<id>":{…}}} — the entry with
+        // headers/env/args/url sits ONE level down. Stripping the wrapper
+        // itself (the old call) was a no-op: every secret survived into the
+        // backup payload even with includeSecrets=false. This pins the shape
+        // the export path actually passes.
+        val entry = JSONObject()
+            .put("url", "https://gw.example.com/sse?key=supersecret&client=app")
+            .put("headers", JSONObject().put("Authorization", "Bearer sekrit"))
+            .put("env", JSONObject().put("GITHUB_TOKEN", "ghp_sekrit"))
+            .put("args", JSONArray().put("--token=ghp_arg"))
+        val wrapper = JSONObject().put("mcpServers", JSONObject().put("ctx7", entry))
+
+        ConfigBackup.stripExportedMcpSecrets(wrapper)
+
+        val inner = wrapper.getJSONObject("mcpServers").getJSONObject("ctx7")
+        assertEquals(
+            "https://gw.example.com/sse?key=[redacted:11]&client=app",
+            inner.getString("url"),
+        )
+        assertEquals("", inner.getJSONObject("headers").getString("Authorization"))
+        assertEquals("", inner.getJSONObject("env").getString("GITHUB_TOKEN"))
+        assertEquals("--token=", inner.getJSONArray("args").getString(0))
+    }
+
+    @Test
+    fun `stripExportedMcpSecrets falls back to bare entry like the import side`() {
+        val bare = JSONObject()
+            .put("env", JSONObject().put("GITHUB_TOKEN", "ghp_sekrit"))
+            .put("headers", JSONObject().put("Authorization", "Bearer sekrit"))
+
+        ConfigBackup.stripExportedMcpSecrets(bare)
+
+        assertEquals("", bare.getJSONObject("env").getString("GITHUB_TOKEN"))
+        assertEquals("", bare.getJSONObject("headers").getString("Authorization"))
+    }
+
     // ── Skill frontmatter fallback (sweep1013-D1/F-8) ────────────────────
 
     private fun skillInfoFor(frontmatter: String, body: String): SkillInfo = object : SkillInfo {
