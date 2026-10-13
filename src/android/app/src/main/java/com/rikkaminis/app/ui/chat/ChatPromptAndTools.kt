@@ -983,6 +983,26 @@ internal fun ChatViewModel.publishStreamingDelta(
     blocks: List<AssistantBlock>,
     awaiting: Boolean,
 ) {
+    // [fix/cancel-stale-publish] Late-writer admission check. An interrupt
+    // (sendMessage → enqueuePrompt + cancelStream) finalizes the canonical row
+    // (CANCELLED tool blocks) and drains the side channel, but the loop job's
+    // cancel is cooperative and does NOT cover the per-line `onBlockUpdate`
+    // publishes, the already-dispatched Main publishes, or the throttle
+    // trailing job. Those writers land here afterwards; without this check each
+    // one re-mints a side-channel entry that `mergeStreamingOverlay` applies
+    // wholesale over the row — flipping the capsules back to a ghost RUNNING,
+    // or (when the loop had already cleared its block list) replacing them with
+    // an empty list so the capsules disappear. See [StaleStreamPublishPolicy].
+    val row = _messages.value.lastOrNull { it.id == id }
+    if (StaleStreamPublishPolicy.shouldDrop(
+            rowExists = row != null,
+            rowIsStreaming = row?.isStreaming == true,
+            hasSideChannelEntry = _streamingById.value.containsKey(id),
+        )
+    ) {
+        noteStaleStreamPublish(id)
+        return
+    }
     val st = streamFlushStates.getOrPut(id) {
         ChatViewModel.StreamFlushState().also { it.lastFlushedLen = 0 }
     }
