@@ -561,6 +561,13 @@ object ConfigBackup {
                     entry.put("fileCount", skillRepo.listSkillFiles(skill.id).size)
                 } else {
                     entry.put("body", skill.body)
+                    // [sweep1013-D1/F-8] body is frontmatter-STRIPPED by
+                    // parseSkillMd, so a body-only fallback loses every
+                    // frontmatter-only key (`subagent: true`, `max_turns`).
+                    // Carry the raw block alongside; restore re-joins them
+                    // before importFromContent re-parses. "" when the source
+                    // had none — the import side treats it as absent.
+                    entry.put("frontmatter", skill.frontmatter)
                     Log.w(
                         TAG,
                         "export: ${if (zipBytes == null) "no archive" else "archive too large (${zipBytes.size} bytes)"} " +
@@ -603,6 +610,13 @@ object ConfigBackup {
             for (server in mcpRepo.servers.value) {
                 val raw = runCatching { mcpRepo.exportServerJSON(server) }.getOrNull() ?: continue
                 val obj = runCatching { JSONObject(raw) }.getOrNull() ?: continue
+                // [sweep1013-D1/F-3] Self-filled headers/env ARE credentials
+                // (Authorization: Bearer …, X-Api-Key, GITHUB_TOKEN). They ride
+                // the same includeSecrets gate as provider apiKeys / envVar
+                // values: without secrets keep the key names (so the server
+                // still imports and the user sees what to refill) but blank
+                // the values.
+                if (!includeSecrets) stripMcpSecretValues(obj)
                 mcpServers.put(obj)
             }
         }
@@ -1225,13 +1239,23 @@ object ConfigBackup {
                     } else {
                         val body = s.optString("body", "")
                         if (body.isBlank()) null
-                        else skillRepo.importFromContent(
-                            body,
-                            SkillRepository.ImportSource.from(s.optString("importSource", "file")),
-                            s.optString("sourceURL", "").takeIf { it.isNotEmpty() },
-                            // [fix/audit-b22 / T4-L8] Same as the archive branch.
-                            s.optString("id", "").takeIf { it.isNotEmpty() },
-                        )
+                        else {
+                            // [sweep1013-D1/F-8] The export fallback carries the
+                            // raw frontmatter block alongside the stripped body.
+                            // Re-join before importFromContent re-parses, or
+                            // frontmatter-only keys (`subagent: true`) evaporate.
+                            // Blank (older backups) → body-only, as before.
+                            val frontmatter = s.optString("frontmatter", "")
+                            val content = if (frontmatter.isBlank()) body
+                                else frontmatter + "\n" + body
+                            skillRepo.importFromContent(
+                                content,
+                                SkillRepository.ImportSource.from(s.optString("importSource", "file")),
+                                s.optString("sourceURL", "").takeIf { it.isNotEmpty() },
+                                // [fix/audit-b22 / T4-L8] Same as the archive branch.
+                                s.optString("id", "").takeIf { it.isNotEmpty() },
+                            )
+                        }
                     }
                     if (imported == null) {
                         skipped.add("skill \"$name\": archive unreadable or SKILL.md invalid")
@@ -1644,6 +1668,23 @@ object ConfigBackup {
      * text / toolUse.input / toolResult.output so no part type can
      * dominate. Returns null when nothing textual survives.
      */
+    /**
+     * [sweep1013-D1/F-3] Blank the secret-bearing values of an exported MCP
+     * server object (self-filled `headers` / `env` maps) while KEEPING the key
+     * names — the server still imports, and the user sees exactly which
+     * credentials to refill. Non-secret fields (command/args/url/note/enabled)
+     * are untouched. The maps may be absent (e.g. a stdio server without env) —
+     * absent sections stay absent.
+     */
+    internal fun stripMcpSecretValues(obj: JSONObject) {
+        for (secretKey in listOf("headers", "env")) {
+            val section = obj.optJSONObject(secretKey) ?: continue
+            for (k in section.keys().asSequence().toList()) {
+                section.put(k, "")
+            }
+        }
+    }
+
     internal fun sanitizeChatParts(partsJson: String?): String? {
         if (partsJson.isNullOrBlank()) return null
         val arr = try {

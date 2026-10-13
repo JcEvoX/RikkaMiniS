@@ -72,7 +72,12 @@ interface ChatDao {
     @Query("SELECT * FROM sessions WHERE updated_at >= :cutoff ORDER BY updated_at DESC")
     suspend fun sessionsUpdatedSince(cutoff: Long): List<ChatSessionEntity>
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    // [sweep1013-D1/F-1] sessions is the parent of messages/compact_markers
+    // (both FK CASCADE). INSERT OR REPLACE in SQLite is DELETE+INSERT, so a
+    // duplicate id would cascade-wipe the session's whole history. Both call
+    // sites are "insert only when absent" (fresh UUID / getSession guard), so
+    // ABORT turns a would-be silent wipe into a visible failure instead.
+    @Insert(onConflict = OnConflictStrategy.ABORT)
     suspend fun insertSession(session: ChatSessionEntity)
 
     @Query("UPDATE sessions SET title = :title, updated_at = :updatedAt WHERE id = :id")

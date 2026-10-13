@@ -113,9 +113,15 @@ object AutoBackupManager {
     }
 
     private suspend fun runLocked(app: MinisApp) {
+        // [sweep1013-D1/F-4] Unattended backups must not ship credentials to
+        // the remote (WebDAV is pushed to without a user prompt). Without
+        // secrets the restore needs values refilled (providers/envVars/MCP
+        // headers+env) — a deliberate product-posture change; if a user ever
+        // wants secret-bearing auto-backups that must be an explicit opt-in
+        // setting, not a silent default.
         val payload = ConfigBackup.export(
                 providerRepo = app.providerRepository,
-                includeSecrets = true,
+                includeSecrets = false,
                 envVarRepo = app.envVarRepository,
                 skillRepo = app.skillRepository,
                 memoryRepo = app.memoryRepository,
