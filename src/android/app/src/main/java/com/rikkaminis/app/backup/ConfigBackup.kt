@@ -615,8 +615,11 @@ object ConfigBackup {
                 // the same includeSecrets gate as provider apiKeys / envVar
                 // values: without secrets keep the key names (so the server
                 // still imports and the user sees what to refill) but blank
-                // the values.
-                if (!includeSecrets) stripMcpSecretValues(obj)
+                // the values. [review G1] exportServerJSON emits the nested
+                // wrapper {"mcpServers":{"<id>":{…}}} — the entry sits one
+                // level down, so strip through stripExportedMcpSecrets (the
+                // wrapper itself has no headers/env/args/url to strip).
+                if (!includeSecrets) stripExportedMcpSecrets(obj)
                 mcpServers.put(obj)
             }
         }
@@ -1668,6 +1671,31 @@ object ConfigBackup {
      * text / toolUse.input / toolResult.output so no part type can
      * dominate. Returns null when nothing textual survives.
      */
+    /**
+     * [review G1] Strip secret-bearing values from an [exportServerJSON]
+     * document. exportServerJSON emits the importable wrapper shape
+     * `{"mcpServers":{"<id>":{…}}}` — the credential-bearing entry sits ONE
+     * level down, so this descends and strips each entry. A bare entry (no
+     * wrapper) is stripped as-is, mirroring the import side's fallback
+     * (`entry = inner?.optJSONObject(id) ?: srv`).
+     *
+     * Stripping the wrapper itself was a no-op: the wrapper has no
+     * headers/env/args/url of its own, so every secret (Authorization / env
+     * token / args token / URL query key) survived into the backup payload
+     * even with includeSecrets=false. A regression test pins the wrapper
+     * shape the export path actually passes.
+     */
+    internal fun stripExportedMcpSecrets(obj: JSONObject) {
+        val inner = obj.optJSONObject("mcpServers")
+        if (inner == null) {
+            stripMcpSecretValues(obj)
+            return
+        }
+        for (id in inner.keys().asSequence().toList()) {
+            inner.optJSONObject(id)?.let { stripMcpSecretValues(it) }
+        }
+    }
+
     /**
      * [sweep1013-D1/F-3] Blank the secret-bearing values of an exported MCP
      * server object (self-filled `headers` / `env` maps) while KEEPING the key

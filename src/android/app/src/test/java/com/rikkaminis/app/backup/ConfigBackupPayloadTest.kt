@@ -455,6 +455,46 @@ class ConfigBackupPayloadTest {
         assertEquals("https://example.com/sse", server.getString("url"))
     }
 
+    // ── [review G1] MCP export wrapper shape (stripExportedMcpSecrets) ───
+
+    @Test
+    fun `stripExportedMcpSecrets strips the nested wrapper exportServerJSON emits`() {
+        // exportServerJSON emits {"mcpServers":{"<id>":{…}}} — the entry with
+        // headers/env/args/url sits ONE level down. Stripping the wrapper
+        // itself (the old call) was a no-op: every secret survived into the
+        // backup payload even with includeSecrets=false. This pins the shape
+        // the export path actually passes.
+        val entry = JSONObject()
+            .put("url", "https://gw.example.com/sse?key=supersecret&client=app")
+            .put("headers", JSONObject().put("Authorization", "Bearer sekrit"))
+            .put("env", JSONObject().put("GITHUB_TOKEN", "ghp_sekrit"))
+            .put("args", JSONArray().put("--token=ghp_arg"))
+        val wrapper = JSONObject().put("mcpServers", JSONObject().put("ctx7", entry))
+
+        ConfigBackup.stripExportedMcpSecrets(wrapper)
+
+        val inner = wrapper.getJSONObject("mcpServers").getJSONObject("ctx7")
+        assertEquals(
+            "https://gw.example.com/sse?key=[redacted:11]&client=app",
+            inner.getString("url"),
+        )
+        assertEquals("", inner.getJSONObject("headers").getString("Authorization"))
+        assertEquals("", inner.getJSONObject("env").getString("GITHUB_TOKEN"))
+        assertEquals("--token=", inner.getJSONArray("args").getString(0))
+    }
+
+    @Test
+    fun `stripExportedMcpSecrets falls back to bare entry like the import side`() {
+        val bare = JSONObject()
+            .put("env", JSONObject().put("GITHUB_TOKEN", "ghp_sekrit"))
+            .put("headers", JSONObject().put("Authorization", "Bearer sekrit"))
+
+        ConfigBackup.stripExportedMcpSecrets(bare)
+
+        assertEquals("", bare.getJSONObject("env").getString("GITHUB_TOKEN"))
+        assertEquals("", bare.getJSONObject("headers").getString("Authorization"))
+    }
+
     // ── Skill frontmatter fallback (sweep1013-D1/F-8) ────────────────────
 
     private fun skillInfoFor(frontmatter: String, body: String): SkillInfo = object : SkillInfo {
