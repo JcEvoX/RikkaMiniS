@@ -1,11 +1,11 @@
-# RikkaMinis 开发日志合并导出（2026-08-03 ～ 2026-10-10）
+# RikkaMinis 开发日志合并导出（2026-08-03 ～ 2026-10-13）
 
 > 📌 **注意**：本文件是 raw dump（归档快照，按时间正序排列）。
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
-- 合并范围：2026-08-03 ～ 2026-10-10，共 69 天
-- 条目总数：1605（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：2101560 / 总行数：29163
+- 合并范围：2026-08-03 ～ 2026-10-13，共 72 天
+- 条目总数：1663（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：2168937 / 总行数：29982
 
 ---
 
@@ -6301,11 +6301,6 @@ restore OK (54) ... final health STILL missing 5  ← 死循环
 - androidx.sqlite 2.4.0 `FrameworkSQLiteOpenHelper` 零 FK 设置代码，`setForeignKeyConstraintsEnabled` 只被定义无调用方传 true。
 - SQLite 原生默认 `PRAGMA foreign_keys = OFF`，Room 2.6.1 不覆盖 → **本 app 外键约束实际关闭，CASCADE 不生效**。
 - 佐证：`ChatRepository.deleteSession` 显式 `deleteMessages` 再 `deleteSession`（若 CASCADE 生效这行冗余）；`ProviderConfigDao.replaceAll` 注释自认 "schema-without-FK test paths"。
-
-> **⚠️ 2026-10-13 二次修正（sweep-1013 §89-D1-F2 终审）：上一段四条 bullet 全部不成立。**
-> 字节码取证（room-compiler 2.6.1 jar，非源码推断）：`DatabaseProcessor.doProcess` 逐实体检查 `foreignKeys.isEmpty()`，任一实体带 `@ForeignKey` → `Database(vo)` 的 `enableForeignKeys = true`；`SQLiteOpenHelperWriter` 生成模板 `if (db.enableForeignKeys) + "PRAGMA foreign_keys = ON"` 进**生成的 onOpen**。本仓 `MessageEntity` 带 `onDelete = CASCADE` → **FK 已开启，CASCADE 生效**。（room-runtime jar 本体无 FK 字符串属实，但生成代码在 app 侧——第一次修正错在只搜了 runtime，漏了 compiler 的生成模板。）
-> 佐证反转：`ChatRepository.deleteSession` 的显式 `deleteMessages` 不是 CASCADE 缺失的证据，而是**幂等防御**（SessionForkManager 等多条删除路径共存时的双保险）。
-> 教训升级：核 Room FK 结论必须看 **room-compiler 的生成模板**（javap `DatabaseProcessor` / `SQLiteOpenHelperWriter`），runtime jar 永远是干净的——生成代码不在里面。`PRAGMA foreign_keys` 真机实测建议（:16686 行）仍然有效，但静态证据已足够支撑"FK 开"。
 
 **修正后结论**：聊天还原真实问题是「非幂等覆盖」（会话 REPLACE 回退元数据 + 消息被截断版覆盖），降级为 🟡。备份模块**无 🔴 数据丢失 bug**，最严重是两个 🟠（同步静默上传密钥 P1-1、手动还原不更新凭据 P1-2）。
 
@@ -29161,6 +29156,825 @@ Pattern-Key: sandbox-l2s-pack-symlink-broken
 
 用户已将沙盒构建的 APK 装到真机验证可用 → "沙盒=个人 APK 生产线"结论成立，迭代闭环：需求→构建→minis://链接→真机安装→反馈。
 用户对"这个应用比预期强大"的认知升级感兴趣，关注能力边界判断。
+
+<!-- 2026-10-10 14:54:11 -->
+## 记忆系统全面更新（2026-10-10 下午）
+
+
+**① 开发档案三件套**：重建 1605 条（08-03～10-10），清洗 + SAGAS 重建（24 saga / 148 orphans / multi4=88），结构核验 anchors==header==1605、fences 偶、outOrder=0。分支 `docs/dev-history-1010` @ **3c483aee**（af5bea67 档案 + 3c483aee README 数字修正）。docs-only **不 dispatch CI**（遵 10-09 用户纠正）。修正 README 三处漂移：65 天→69 天、1546 条→1605 条、8%→9% orphans。
+
+**② 云端记忆（HF Dataset）**：HF Inference **全模型 402 Payment Required**（免费额度失效）→ 嵌入后端迁到 **CF Workers AI `@cf/baai/bge-m3`（1024 维）**。索引全量重建 1629 条 / 0 失败 / 18.8MB，已上传 `***USER***/rikkaminis-memory`。检索质量实测优于旧版：中文查询 top1 真实 cos 0.62~0.78。
+- 为什么必须全量：旧索引 384 维（HF MiniLM），新 1024 维，`cosine` 的 `zip` 静默截断到 384 维 → 不报错但相似度全错。增量可复用数 = 0。
+- 已内置 auto 回退（HF 首批失败即整体切 CF）+ `SEMANTIC_EMBED_BACKEND=hf|cf` 强制 + 索引记录 `backend` 字段 + 增量按索引后端走。
+
+**③ 修掉自己引入的批量游标 bug**（两种形态，均已反向控制验证）：
+- 形态 A（我原版 `for i in range(0,total,batch)`）：range 步长创建时固定 16，HF→CF 回退把 batch 改 32 → 窗口重叠、条目重复嵌入（实测 51 批跑成 102 批，处理总条 184/100）。
+- 形态 B（中间版 while 游标但 chunk 在重试循环外）：按新步长推进 → 整段跳过条目（**入库只剩 84/100**）。
+- 修法：`while i < total` 游标 + `chunk` 放进重试循环内重切。回归测试 `/tmp/test_embed_batch.py`（4 断言 + 两路反向控制全红）。
+- 教训：**改变循环内变量的同时用它做步长** = 双重错误源；批处理要么锁死批大小，要么让切分与推进都由同一变量当次驱动。
+
+**④ 设备端技能回灌**（§75 流程）：assets/skills/semantic-memory 落后（1.3.1 / 脚本差 159 行）→ 设备端 agent 的语义搜索在 402 下必失败。分支 `fix/semantic-memory-cf-fallback-1010` @ **f508ec6e**（3 文件 +145/−47，SKILL.md 1.4.0 版本门自动重解包）。CI 已 dispatch。
+
+**⑤ 记忆层其余动作**：`memory_rollup` 蒸馏至 2026-09-30；sandbox-limits 新增 **S27（HF Inference 402）**——三源排除（三模型全 402 / whoami 正常 / CF 同样调用 200 / Dataset 读写仍正常）后归因「只有 Inference 计费面变了」，非沙箱缺陷。
+
+**⑥ 待用户处理**：KG 的 MCP 入口 `memory` **已不在 minis-mcp-cli 注册列表**（只剩 termux-dock）→ `minis-mcp-cli call memory` 报 NOT_FOUND。live KG 与备份逐条一致（21 实体，最后更新 09-21），无漂移，但 09-21 后的新事实（CF 三账号/域名/worker 地图、HF dataset、本次后端迁移）没灌。恢复需用户在 Settings → MCP 重新注册 `@modelcontextprotocol/server-memory`。
+
+<!-- 2026-10-10 14:57:27 -->
+## CI 触发判据修正：记特例会漏，要记判据（2026-10-10，用户同日第二次纠正）
+
+
+**事**：assets/skills/semantic-memory 回灌（.py/.md/.json 三个纯文本文件）后，我惯性 dispatch 了 build-apk → run #1964，用户纠正「文本更新不需要触发 CI」→ 已用 API 取消（run 38032527377）。
+
+**同族第 2 次**（10-09 docs/dev-history 档案推送后 dispatch #1961 被纠正 → 取消）。按复发回查纪律跑了 `rules_index.py check`，判定 = **召回问题**（规则早就在库：LRN-20260803-FQQ / Pattern-Key `ci.workflow.paths-filter`）。
+
+**根因（比"忘了一条规则"更值钱）**：10-09 我把教训记成了**特例**——"docs 不触发 CI"。今天改的是 assets 里的技能文件，不是 docs，所以那条特例没拦住我。**记特例 = 只覆盖触发过的那一类；记判据 = 覆盖整族。**
+
+**已落地的修正（不是口头保证）**：
+1. 扩写 `LRN-20260803-FQQ` 详情，补进第二层（该规则原本只讲**自动触发**的 paths 过滤，缺**手动 dispatch** 的判据）：dispatch 正当性来自「CI 里哪个 step 的输出会因这次改动而不同」，不来自"重要/保险/一贯如此"；落在 paths 过滤内 ≠ 有验证面。附两次反例 + 例外清单（.kt/.cpp/manifest/gradle/workflow/依赖变更 = 有真实面，该 dispatch）。
+2. 元数据 `Recurrence-Count: 1 → 3`、`Last-Seen: 2026-10-10`。
+3. `rules_index.py build` 重建索引（360 条）。
+4. **召回验证**（不是写完就算）：真实触发问法「这个改动要不要手动触发 CI 构建验证」→ 该条排第一 0.538；「改了文本文件要不要跑 build-apk」→ 0.455。抽象措辞「dispatch workflow_dispatch 判断标准」无命中——但规则已覆盖，按纪律**不续写新条目**（工具的"知识问题"判定是纯词汇匹配的已知局限）。
+
+**顺带**：file_edit 报的字节数**第三次**骗人（报 14323，实际 19116）——已按纪律 wc 核实。教训稳定：编辑后一律 shell wc/grep 复核，不信工具元数据。
+
+**沉淀建议**：这条目前只活在 skill 规则库（agent 要主动查才召回）。若希望它在 action 时强制可见，应提到 GLOBAL.md（恒定规则层）——等用户拍板。
+
+<!-- 2026-10-10 15:01:13 -->
+## 两分支合并进 main = 81be7f62（2026-10-10，用户放行「分支的话就合并吧，毕竟只是文本更新」）
+
+
+**合并**：`--no-ff` ×2 序贯合入 main。①`docs/dev-history-1010` @ `3c483aee` → `23d4b2e0`（4 文件 +961/−48，全部 docs/dev-history/）；②`fix/semantic-memory-cf-fallback-1010` @ `f508ec6e` → **`81be7f62`**（3 文件 +145/−47，全部 assets/skills/semantic-memory/）。**核查三项齐**：合并树 vs 分支树逐字节 0 差异（docs 0 行 / assets 0 行）；总增量 7 文件 +1106/−95 与两分支之和精确吻合；内容抽查（CF 回退 8 处命中 / SKILL.md 1.4.0 / 档案条目总数 1605）。push 后远端 main == 本地 HEAD 逐字符一致。两分支本地+远端已删。
+
+**CI 判据的正面样本**：main push **自动**触发 #1965（head_sha=81be7f62，event=push）——这次有真实验证面（APK 需打包新技能文件）。与今天被取消的手动 dispatch #1964 是两回事：**自动触发由 paths 决定，手动 dispatch 由验证面决定**。
+
+**浅克隆处理**：`git merge-base` 报 no merge base（`.git/shallow` 截断）→ `git fetch --deepen 150 origin main` 即恢复（merge-base = cbb9d2b4）。比 unshallow 便宜。
+
+**KG（知识图谱）现状 = 用户记忆正确，且比"废弃"更糟**：
+- 用户问「minis-mcp-cli 这个当初不是主动废弃掉了吗」→ **是**。09-28 已实锤 `memory` MCP **无持久化**（每次调用 spawn 新 session，create 后 read=0），修法 `--env MEMORY_FILE_PATH=` 写进 config 但 **daemon 不传 env 给 STDIO 进程**（app 侧缺口）→ 当时定论「以直写为真源，MCP 只是尽力接口」。
+- **但直写路线也断了**：`kg_backup.py`（恢复路径）与 `kg_update_0921.py` **两处都仍调 `minis-mcp-cli call memory`**，而该 server 已不在注册表；09-28 说的真源目录 `/var/minis/shared/kg/` **不存在**（疑 10-02 shared 大清理带走）。
+- **结论**：KG 目前是**死记忆层**——无读路径（MCP 未注册）、无写路径（脚本调死接口）。数据停在 09-21（21 实体 / 24 关系），live 与备份逐条一致无漂移。
+- **未动手**：按修复门纪律未擅自新建脚本 / 未擅自重注册 MCP。给用户两个选项：①**复活**（重注册 MCP + 修 daemon 不传 env 的 app 侧缺口 —— 那才是当初卡住的真因）；②**退役**（语义记忆 + 日记 + GLOBAL 已覆盖回忆面，KG 的实体关系网与 GLOBAL 部分重叠）。等拍板。
+- **遗留**：远端还有 `docs/dev-history-1009` @ b2ffd393（10-09 档案 1592 条）——其内容已被 1010 版严格涵盖，与 09-27 那次 265ef350 同构，可安全废弃，待用户确认。
+
+<!-- 2026-10-10 15:21:16 -->
+## 设备端修复的产物级验证（2026-10-10）：解包 APK 验真
+
+
+**方法（可复用）**：声称"设备端修好了"不能止于 CI 绿——CI 只证明 APK 打得出来，不证明 APK 里装的是新文件。第三步 = **下载 release 资产 → unzip -l 看清单 → 解包 → sha256 与仓库版本比对**。
+
+**本次证据链（三源）**：①合并树 == 分支树（0 行差异）；②CI #1965 completed/success 且 `head_sha == 81be7f62` 与本地 HEAD 逐字符一致、Publish to Releases 成功；③**android-latest 资产（RikkaMinis-arm64-v8a.apk, 14,299,161 B）解包后 assets/skills/semantic-memory/ 三文件 sha256 与仓库逐字节一致**（SKILL.md `cac3996a…` / semantic_memory.py `ba480080…` / requirements.json `35730eb0…`），SKILL.md version: 1.4.0、CF 回退代码 8 处命中。
+
+**为什么这条重要**：`SkillRepository` 的安装种子就是 assets；版本门（1.3.1 → 1.4.0 语义比较）决定设备端会不会重解包。三者缺一都不能声称"设备端已修"——尤其 assets 类改动，**构建成功 ≠ 内容正确**（构建只做文件拷贝，拷错版本也会绿）。
+
+**下载 release 资产**：`GET /releases/tags/android-latest` 取 `browser_download_url` 后 curl -L 带 Bearer；APK 内文本 assets 可直接 unzip -p 读取（无需反编译）。
+
+<!-- 2026-10-10 15:24:07 -->
+## MCP 知识图谱退役（2026-10-10，用户拍板「2」= 退役）
+
+
+**决策**：退役 KG（`@modelcontextprotocol/server-memory`），不复活。理由三条（合起来构成，单条不够）：①写路径从未打通（09-28 无持久化 + daemon 不传 env 给 STDIO 子进程，app 侧缺口；fallback 直写脚本自身也调那个已消失的接口）；②无读路径（server 不在注册表）；③回忆面已被语义记忆+日记+memory_get+GLOBAL 覆盖且重叠。
+
+**退役动作（全部已执行）**：
+1. **数据归档**：`/var/minis/shared/archive/retired-knowledge-graph-2026-10/`——memory.jsonl（21 实体/24 关系，校验与原件一致）+ kg_backup.py + kg_update_0921.py + README.md（三条理由 / 状态 / 文件说明 / 复活条件）；写 README 时明确标注两个脚本**已失效**。
+2. **删原目录** `/var/minis/shared/knowledge-graph-backup/`（归档验证在先）。
+3. **拆活引用**：`semantic-memory/SKILL.md` 的「兄弟装置：MCP 知识图谱（别混）」段改写为「已退役、别再调用」+ 指向归档——原段落是**死指针**（会让未来 agent 去调 NOT_FOUND 的接口）。
+4. **负决策登记**：backlog **§81**（含复活触发条件三件：问题真的答不了 + 先修 app 侧 env 透传 + 确认会持续读）。`scan_debt.py notes` 通过（71 段 / 0 段缺触发条件）。
+5. **版本门**：SKILL.md 1.4.0 → **1.4.1**（必须 bump，否则装了 1.4.0 的设备版本门判 1.4.0==1.4.0 不重解包，死引用留在设备上）。
+6. **仓库同步**：分支 `chore/retire-kg-skill-note-1010` @ **38e905a1**（1 文件 +18/−14）。**未 dispatch CI**——纯 SKILL.md 文本改动，Zero 验证面（正是今天用户纠正的那条判据）。
+
+**方法沉淀**：退役一个装置 = ①数据先归档校验 ②删原件 ③**拆掉所有活引用**（死指针比死装置更危险——装置死了没人调，指针会让 agent 去调）④负决策进 backlog 带复活条件 ⑤若该装置随技能打包，**必须 bump 版本**否则设备端不重解包。第③⑤两条最容易漏。
+
+**遗留**：远端 `docs/dev-history-1009` @ b2ffd393（09-10 档案 1592 条）已被合并的 1010 版严格涵盖，可安全废弃，待用户确认。
+
+<!-- 2026-10-10 15:26:08 -->
+## GLOBAL 记忆架构章节 + 远端旧分支清理（2026-10-10，用户令「加进去，并且把云端的那个删掉吧」）
+
+
+**① GLOBAL.md 新增「## 记忆架构（六层 + 两条辅助）—— 2026-10-10 定案」**（用户明确授权编辑，插在「待办登记纪律」节后）。内容 = 六层表格（层 / 位置 / 记什么 / **谁来读·何时**）：日报 · 蒸馏（ROLLUP）· 恒定（GLOBAL）· 语义（semantic-memory）· 负决策（backlog）· 环境缺陷（sandbox-limits）；两条辅助 = skill 规则库（LEARNINGS + rules_index 回查）× dev-history 档案。**核心判据写进正文**：「各有专职与**不同的读取触发方式**；混用会导致『记了但没被读到』，这是本机最常见的静默失效」。外加 KG 退役段（三理由 + 归档路径 + backlog §81 + 「不要再尝试 `minis-mcp-cli call memory`」）。文件 27210 → 29615 字节 / 221 → 238 行 / `## ` 22 个。
+
+**② 删远端分支 `docs/dev-history-1009`**（b2ffd393，10-09 的 1592 条档案，已被合并的 1010 版涵盖）→ `- [deleted]`。远端只剩 `main` + `chore/retire-kg-skill-note-1010`（KG 退役说明回灌，38e905a1，**未合并——等用户**，因 GLOBAL「合并 main 只能由用户发起」是常驻纪律，上次授权只覆盖那两个分支）。
+
+**③ 两个真教训（都已入册，不是口头）**：
+- **浅克隆假阴性**：`git merge-base --is-ancestor` 在 `--depth 1` / `.git/shallow` 截断下报「不是祖先」（实际是）→ 已登记 **sandbox-limits A18**：健康路径 = `--deepen N` 补深，或**远端裁决** `GET /compare/<sha>...<ref>`（`status: ahead` + `behind_by: 0` = 祖先）。
+- **核验与破坏性动作同批 = 核验拦不住动作**：我把祖先核验和 `push --delete` 放进**同一次 shell_execute**，核验打了 `✗ 不是祖先——需人工复核！` 删除照样跑（shell 不等判断）。事后 API 补证才确认无丢失，但顺序反了。已登记 **LEARNINGS LRN-20261010-VB7K2**（Pattern-Key `process.verify-must-gate-destructive-act`，优先级 high），`rules_index.py build` 后 learning 49→52，召回验证该条排第一（0.364）。**规则：破坏性动作单独一次调用，仅当前一次输出明确通过才发起。**
+- 附带：file_edit 字节元数据**第四次**谎报（报 15969，实际 29615）→ 每次编辑后 shell wc/grep 复核已成肌肉记忆。
+
+<!-- 2026-10-10 15:28:21 -->
+## 纯文本分支可直接合并——写入 GLOBAL 常驻纪律（2026-10-10 用户拍板「合，并把它记忆进全局记忆」）
+
+
+**合并**：`chore/retire-kg-skill-note-1010` @ `38e905a1` → main **`8cb19750`**（1 文件 +18/−14，纯 SKILL.md 文本）。核查：无冲突 · 合并树 vs 分支树 0 行差异 · 分支里 SKILL.md 与 live 源 **sha256 逐字节一致（`bd8ff2aa…`）** · 版本 1.4.1。push 后远端 main == 本地 HEAD。分支本地+远端已删，**远端只剩 main**。main push 自动触发 #1966（head_sha=8cb19750）。
+
+**新纪律（GLOBAL.md「分支隔离纪律」新增 `### 例外：纯文本分支可直接合并`，2026-10-10）**：
+- **纯文本分支不再逐次放行**——agent 可自行 `--no-ff` 合入 main + push + 删分支。
+- **判据与「CI 触发判据」同源**：指不出任何会因这次改动而不同的 CI step。涵盖 `docs/**` + `assets/skills/**` 的文本文件（SKILL.md / *.py / *.json，只被拷贝进 APK 不参与编译）。
+- **排除**：有真实验证面的改动（.kt/.cpp/manifest/gradle/workflow/依赖或 native 构建脚本）**仍须用户发起合并**。
+- **配套两条**（同一洞察在两个时点的两面）：①纯文本改动**不 dispatch CI**；②合并前仍走三项核查，但第 2 项「分支 CI 绿」对纯文本分支不适用——以"与 live 源 sha256 逐字节一致"替代作为独立证据。
+- 依据 = 用户 2026-10-10 两次指示（「分支的话就合并吧，毕竟只是文本更新」+「合，并把它记忆进全局记忆」）。
+
+**流程坑（浅克隆第三次咬，已入表 A18 的健康路径）**：合并报 `refusing to merge unrelated histories` —— 两个 `--depth 1` 各自独立无共同祖先。修法 = 对**分支**单独 `git fetch --depth 2 origin <branch>`（带上其父提交 81be7f62 即接通），比 unshallow 便宜。
+**纪律执行**：本次把「核验」与「合并+push」**分成两次调用**（上轮删分支的教训 `process.verify-must-gate-destructive-act`），核验输出明确通过后才发起动作——顺序对了。
+
+**GLOBAL.md 现状**：31098 字节 / 254 行 / 22 个 `## ` / 3 个 `### `；今日两次编辑（记忆架构章节 + 纯文本合并例外）。file_edit 字节元数据第五次谎报（报 16726，实际 31098），shell wc 复核照旧。
+
+<!-- 2026-10-10 15:28:58 -->
+## 「无验证面就不等 CI」并入 GLOBAL（2026-10-10，用户：「像这种几乎没有风险的就不用等了」）
+
+
+**事**：合并 `chore/retire-kg-skill-note-1010` → main `8cb19750` 后，我用 `delay` 轮询等 #1966 出结论；用户叫停——纯文本改动不必等。
+
+**这是同一洞察的第三个面**（前两个：不 dispatch / 可直接合并）。已补进 GLOBAL「分支隔离纪律 → 例外：纯文本分支可直接合并」的配套条，改为**三条**：
+1. **不 dispatch CI**（无验证面，白跑一轮）
+2. **也不等 CI**（新）——合并 push 完即可收工，**不要用 `delay` 轮询等结论**：无验证面的 run 等出 success 也不构成关于这次改动的任何证据，纯粹拿本次开发时间换一个与本次改动无关的读数。与 dispatch 同罪，是同一浪费的另一半。
+3. **合并前仍走三项核查**，但「分支 CI 绿」对纯文本分支不适用（本就不该有 run），以 sha256 逐字节一致替代作独立证据。
+
+**判据统一**（值得单独记住）：**一个动作（跑 CI / 等 CI / 合并）要不要做，只看「有没有东西会因此改变」**。CI 对纯文本改动的输出是恒定的（构建成功与否与 docs 无关）→ 跑它、等它都不带来信息。这不是"偷懒"，是拒绝用仪式性动作冒充验证。
+
+**GLOBAL.md 现状**：31493 字节 / 255 行 / 22 个 `## `。今日三次编辑（记忆架构章节 + 纯文本合并例外 + 不等 CI）。
+
+**仓库终态**：远端只剩 `main` = `8cb19750`；#1966 仍在跑（未等，符合新纪律）。
+
+<!-- 2026-10-10 21:51:08 -->
+## Android-AI-gateway 项目（用户 fork）
+
+
+- 仓库：/var/minis/workspace/Android-AI-gateway（fork 自 alarmedvine/Android-AI-gateway）
+- 本机无 Android SDK/Studio，Gradle 构建靠：aapt2 用 /root/android-build/tools/aapt2-arm64-pkg/aapt2（经 ~/.gradle/gradle.properties 的 android.aapt2FromMavenOverride），platform android.jar 手工放 /opt/android-sdk/platforms/android-36/，licenses 已写入
+- Gradle 8.11.1 在 ~/.gradle/wrapper/dists/gradle-8.11.1-bin/bpt9gzteqjrbo1mjrsomdt32c/gradle-8.11.1/bin，需手动 export PATH
+- 签名：release.keystore + keystore.properties 在仓库根（CN=AiGW Local Build，密码在 keystore.properties 里）；**以后出包必须用同一 keystore 才能覆盖安装**
+- 出包命令：gradle :app:assembleRelease；成品复制到 /var/minis/workspace/dist/
+- 已加功能（v1.2.0/101）：custom 供应商自定义请求头（{key} 占位符）、Responses API 协议翻译（ResponseApiTranslator）、批量导入 Key、SAF 密钥备份导入导出
+- 测试：gradle :core:test（纯 JVM）；本机手工 kotlinc+junit-console 只能编部分测试（GatewayHttpServerTest 依赖 friend-paths）
+
+<!-- 2026-10-10 23:44:58 -->
+## RikkaMinis 自动压缩/上下文超限排查（2026-10-10）
+
+
+- 日志位置：`/var/minis/logs/minis-YYYY-MM-DD.log`（主日志，含 ChatViewModel/CompactDiag/AutoCompactLoop）；`memspike-*.log` 有 `ui:send` 消息体积与 cmd 记录；`debug-*.modelservice.log` 是 provider SSE 明细但轮转很快（几十分钟就滚掉）。
+- 压缩子系统：Context Offload（工具结果→offloads 文件）→ AutoCompactLoop（compactLine/offloadLine/reserve）→ rescue compact（硬顶一次性兜底）→ storm gate（rescue 后到下次用户操作前关闭）。
+- 10-10 23:22~23:24 事故链：offload 后估算仍 411894 tok（窗口 220000）→ rescue compact 成功（23:22:30）→ 但 `dynamicMaxTokens` 用压缩前旧 input=467879 计算出 maxTokens=1024 → glm-5.3-flash 把 1024 全花在 reasoning（3942 字符）→ finishReason=length 空回复 → 防重试护栏 M3.N lengthWallEmptyHits 判定"重试只会重复计费"放弃 → 回合被静默终止。
+- 根因：maxTokens 计算用了压缩前的 stale input 估算；token 估算用 bytes÷2.2 对中文高估约 2~3 倍。
+- 用户就是该 App（com.rikkaminis.app / RikkaMinis）的开发者，源码在 /var/minis/shared/work/RikkaMinis。
+
+## 2026-10-11
+
+<!-- 2026-10-11 00:30:15 -->
+## AiGW（Android-AI-gateway）任务状态
+
+- 仓库本地副本：`/var/minis/shared/work/aigw-recovery/Android-AI-gateway`（跨会话共享目录；旧会话 workspace 里的原件已被 cp -a 恢复出来）
+- 远端：`alarmedvine/Android-AI-gateway`（用户的全权限小号），push 用环境变量 `GITHUB_TOKEN_FULL_RIGHT_1`（注意：`GITHUB_TOKEN` 和 `GITHUB_TOKEN_FULL_RIGHT` 对该仓库无 push 权）
+- 已推送 main = `1a78933`（含 80fca3f 请求头+Responses 协议、c043ab2 可用性修复、1a78933 上游日志 v1.2.2）
+- 签名：仓库根 `release.keystore` + `keystore.properties`（alias aigw），已持续覆盖升级；APK v1.2.2 (vc103) 在 `/var/minis/mounts/笔记/aigw-v1.2.2-release.apk`
+- 构建：`gradle :app:assembleRelease`，gradle 在 `/root/.gradle/wrapper/dists/gradle-8.11.1-bin/bpt9gzteqjrbo1mjrsomdt32c/gradle-8.11.1/bin/gradle`
+- v1.2.2 新增：CustomProvider 的 ProviderWireLog → 引擎 RequestLog（记录页），拉模型也入日志；详细日志开关下有脱敏请求头与请求体原文
+- 待办（下一步）：用户装 v1.2.2 后复现 Responses「超时」，从记录页拿真实状态码/响应体再修；怀疑点= Responses SSE 翻译或站点强校验头（UA: codex_cli_rs/…）未达上游
+- 参照物：RikkaMinis 自身 agentrouter 实例（ps.air-outer.com + useResponsesAPI=true）跑通了同一站点
+
+<!-- 2026-10-11 00:37:36 -->
+## 修复「上下文超限静默终止」：fix/compact-stale-context-tokens-1010（2026-10-10，用户令「就按照你说的修吧」）
+
+
+**根因（与我的初判不同，记录纠偏）**：不是本地字符估算（bytes÷2.2）偏高——`loopState.lastContextTokens` 只有一个写入源（`AgentLoopEngine.kt:1023/1029`，来自 provider usage 上报）。真凶是**回合内重写后缓存值未作废**：offload（把工具结果换成 stub）与 auto-compact（把整段折成摘要）都改变了「下一个请求实际携带的内容」，但 `lastContextTokens` 仍描述重写前的请求。两个消费者随即用它做错决定：`dynamicMaxTokens`（`remaining = window − input` → 钉在 `MIN_MAX_TOKENS=1024`）与 `isContextExhausted`（拒绝空回复重试）。
+**事故链**：23:22:30 rescue compact 成功（折 24 条）→ 但请求仍按压缩前 input=467879/window=220000 计 → maxTokens=1024 → glm-5.3-flash 把预算全烧在 reasoning（3942 字符）→ `finishReason=length` 空正文 → 23:24:03 重试闸门读同值判"重试无用" → 静默终止。同会话 23:22:07 的 offload-only 回合已在用越窗数值，只因模型恰好把 4 个工具调用塞进 1024 才没死。
+**修复**：offload/compact 块之后，`if (postOffloadTokens != null || compacted) { loopState.lastContextTokens = 0; host.setLastTurnContextTokens(0) }`（0 = 未知→重新估算；maxTokens 回到 ceiling，重试闸门不再声称越窗）。1 文件 +38 行。
+**验证**：真实生产护栏 `ChatLengthWallLogic` + 事故原始数字回放 7/7（before 臂逐字复现 `remaining=-247879 → 1024` + 拒绝重试；after 臂恢复 128000 + 放行重试；反退化臂仍拒绝显式越窗/hits=3）；scan 20/20；**CI run 38067270605 success，head_sha 4682973b 与本地逐字符一致**，step 15 单测通过、Publish 因分支正确跳过。**停在分支，未合并**（GLOBAL：代码改动合并须用户发起）。
+**过程教训（已入规则库 LRN-20261010-Q3M7 / pattern `process.structure-check-needs-parser-not-count`）**：我第一次编辑后跑了括号配平（376/376"通过"）就放心了，第二次编辑**多写一个 `}`**（把 `?.let` 提前闭合）却没重新核验 → CI #1967 在 kspReleaseKotlin 报 `Expecting 'catch' or 'finally'`。两个独立坑：①核验必须跟**最后一次**编辑；②**计数不是解析**（多一个 `}` 时计数照样相等，且注释/字符串里的括号也被算进去）。已固化：编辑后跑 `kotlinc <file> -d /tmp/x.jar 2>&1 | grep -c -i -E "expecting|must have a name"` 应为 0（unresolved 是缺 classpath 的正常噪音）。
+**登记**：backlog §82（残留变体：既无 offload 也无 compact 的回合 + provider 上报越窗值 → 仍会被钉死；附三个候选方案与复活触发条件）。
+
+<!-- 2026-10-11 00:49:07 -->
+## 分支核查+合并：fix/compact-stale-context-tokens-1010（2026-10-11 用户令
+
+# 分支核查+合并：fix/compact-stale-context-tokens-1010（2026-10-11 用户令「有问题就修，没问题就合并」+「触发了就不用等了」）
+
+- **分支**：`fix/compact-stale-context-tokens-1010` @ `4682973b`（父=main tip 8cb19750，1 文件 +38/−0：AgentLoopEngine.kt 在 in-loop offload/compact 重写后 `lastContextTokens=0` + `setLastTurnContextTokens(0)`，修 10-10 23:22 事故链——rescue compact 后 dynamicMaxTokens 仍用压缩前 input=467879/220000 → maxTokens=1024 → finish=length 空回复 → 重试门弃 → 静默死亡）。
+- **8 项核查全过**：scan 20/20、four-way ✅（两份）、scan_debt 0/0、i18n AUTO-SKIP、冲突 0、CI run 38067270605 completed/success head_sha 逐字符一致（早先 run 38066730187 @55cb7d98 failure 是旧 dispatch）。
+- **调用点甄别**：setLastTurnContextTokens 全仓 4 处（新调用 498 / usage 处 1072 / 接口 251 / wrapper 1407）；loopState.lastContextTokens 15 处全读；offload 返回语义 `return if (offloadedCount>0) currentTokens else null`（ChatContextWindow.kt:444）⇒ 非 null ⟺ 真释放了；maybeAutoCompactInLoop 返回 `folded`（anchor 或 summary 变化）⇒ 覆盖 rescue 路径 = 事故路径本身。
+- **独立证据（JVM 对照臂，/var/minis/shared/work/compact-1011-harness/）**：真实源码腿 = ContextPolicy.kt + ChatLengthWallLogic.shouldRetryEmptyLengthWall；镜像腿 = dynamicMaxTokens 算式（先用手真机日志 L1 复现 1024 校准）。修复在场 9/9 全绿；**变异负控（删修复）4 条腿红、无关腿仍绿** = 装置钉在修复点上。
+- **合并**：`--no-ff` → main **`f9c374ca`**（合并树 vs 分支树 0 行、增量 1 文件 +38 吻合、冲突 0）→ push 核验远端==本地 → 分支远端(204)+本地已删，**远端只剩 main**。main push 自动触发 build-apk（用户令不等）。
+- **登记（P3 观察，不动手）**：①清除后若无 Usage chunk（provider 不报/请求失败），`_lastTurnContextTokens` 停 0 → send 门 contextPressure()=null 放行、maybeTriggerAutoCompact 早退、growth 采样跳一轮——均有界且下次成功 turn 回灌；②offload-only 臂本可用 postOffloadTokens 更精确，作者选 0（「unknown, re-estimate」）理由成立；③修复无单测——repo 惯例承认 runAgentLoop 无 host fake 不可测（AgentLoopTier1GuardTest KDoc 原文），引擎级不变量门属装置超标，不建。
+- **流程坑（复发预防）**：浅克隆三分点 diff → `git fetch --depth 2 origin <branch>` 接通父提交；verify_branch.sh 的 base 可直接传 sha；**在克隆里建 harness/ 会触发「工作树不干净」FAIL** —— 装置放仓库外兄弟目录；`fetch --prune` 对已删远端 ref 会 fatal（浅克隆 fetch refspec 残留），改 `git update-ref -d refs/remotes/origin/<branch>`。
+
+<!-- 2026-10-11 15:15:46 -->
+## RikkaMinis 现状与稳定度调查 + 报告集产出（2026-10-11，用户令「调查现状+开发史脱水，挂载文件夹开新文件夹存放」）
+
+
+**产物**：`/var/minis/mounts/笔记/RikkaMinis现状评估-2026-10-11/`（用户指定挂载文件夹新建目录，非 RikkaMinis开发档案 子目录）——4 文档 + 4 图：README（索引）· 01-现状与稳定度评估（16.9KB）· 02-开发史脱水综述（19.5KB）· 03-数据附录与取证口径（11.1KB）· charts/（c1 提交节奏 / c2 失败归因 / c3 CI+快照 / c4 月度类型）。分析脚本与原始数据留档 `shared/work/rikka-status-1011/`（analyze_commits / analyze_beacon / classify_snapshots / make_charts.py）。
+
+**核心结论（数据支撑）**：
+- 「稳定了」成立但限定为**高强度维护下的稳定**：阶段三（09-24~10-11）非 merge 日均 8.9 条 vs 8 月 29.1；10 月 27 个 fix **P0=0**；近 3 天主日志 0 FATAL / 0 ANR、ERROR 3/2/0 全 provider 侧。
+- 10 月 62 份 error-snapshot **100% 归因外部**（provider 4xx 28 / Responses max_output_tokens 截断 21 / 流解析 8 / 网关 3 / 停滞 2），无一指向应用自身逻辑。
+- 近 14 天 14 起问题全修，压缩/上下文子系统独占 5 起（36%）= 唯一反复被咬的子系统；引擎级不变量门仍判装置超标未建。
+- main @ f9c374ca；装机 1.0.0+1968 = 分支 run#1968 @4682973b，与 main 树差异 0 行（逻辑等价，仅版本号差）。
+- 提交者构成：agent/bot 身份 ~536/1507（35.6%）；外部贡献者 haliChina 1 条 PR #5 已合并。
+- main CI 近 100 run：36 success / 0 failure（failure 全在开发分支）。
+
+**方法坑（复发预防）**：①本地克隆 `git fetch --deepen` 又报 bad pack（PRoot 老坑）→ GitHub API 16 页全量拉提交史更可靠；②`grep -c FATAL` 会把 agent 命令回显算进去（10-10 的 1 处假命中）；③错误快照逐日计数用 basename 切片会错位，必须正则提日期；④图表中文需 `apk add font-noto-cjk` + `plt.rcParams['font.sans-serif']=['Noto Sans CJK SC']`；⑤file_edit 字节元数据继续谎报（本次又差 ~7KB），shell wc 复核照旧。
+
+## 2026-10-12
+
+<!-- 2026-10-12 14:59:46 -->
+## 切模型后「等待中但按钮已停止」= switchModelAndRerun 的 claim 竞态（2026-10-12 真机实测定位）
+
+
+**症状**（用户报告）：发消息→provider 慢→切模型→界面仍显示等待/生成中，但底部按钮已回到「发送」（停止态）→用户再点重试。
+
+**日志铁证**（/var/minis/logs/minis-2026-10-12.log，会话 b4c466fd）：
+```
+14:40:12.772 switchModelAndRerun(switchModel-entry): cancelling in-flight loop, restarting on tierflow_pro
+14:40:12.801 send runAgentLoop CANCELLED
+14:40:12.809 switchModel-entry _isStreaming=true (sync, sid=b4c466fd)   ← 新 job 认领 true
+14:40:12.815 send _isStreaming=false (about to set)                    ← 旧 job 的 finally 又把 flag 抹成 false（epoch 门没拦住）
+14:40:12.820 switchModel-entry streamJob ENTER → runAgentLoop CALL      ← 新 loop 在跑，但 _isStreaming=false
+14:40:15.369 retry _isStreaming=true (sync)                            ← 用户点重试，守卫读到 false → 放进第二个 loop
+14:40:15.379 retryFromMessage streamJob ENTER                          ← streamJob 被覆盖，S1 成孤儿
+```
+**后果**：同会话出现两个并发 agent loop（provider 不同）——14:47–14:51 内 `runAgentLoop turn=15..21`(tierflow_pro) 与 `turn=0..6`(glm-5.3-flash) 交错，29 次 appendMessage 全落 b4c466fd，14:48:43 T7-D reducer 报 phase REJECTED（两 loop 抢同一 reducer）。孤儿 S1 活到 14:51:24 才退（`_isStreaming SKIPPED (stale job; current=… this=… jobEpoch=2 claimEpoch=6)`）。
+
+**根因（代码级）**：
+1. `ChatModelRouting.kt:270-280` switchModelAndRerun 把 claim（`_isStreaming=true; streamEpoch++; streamingClaimEpoch=streamEpoch`）放在 **async `viewModelScope.launch` 里**（DB resync 之后），不是同步；且 `_isStreaming=true` 先于 epoch 发布 → 被取消的旧 job 的 finally 在这个窗口内 reference 检查（streamJob 未换）+ epoch 检查（新 epoch 未发布）**双过**，把 flag 抹 false。
+2. `ChatViewModel.kt:3805-3830` cancelStream 同步清 `_isStreaming`（不等 job 真退）；`ChatTurnPersistence.kt` runRerunStreamTail `streamJob = launch()` **不 cancel 旧的**，靠 `if (_isStreaming.value) return` 守卫防重叠 → flag 被抹 false 后守卫失效，旧 loop 变孤儿继续跑。
+3. 对比：retryFromMessage / retryLast 的 KDoc 明写「曾是同一 bug，已改为同步认领」——**switchModelAndRerun 没跟着改**（同族漏改）。
+
+**UI 表现**：底部按钮（`_isStreaming`，已被旧 job 抹 false → 显示发送/停止态）与消息区流式指示（孤儿 loop 仍在写 delta / `_streamingById`）分离 → 「等待中 + 已停止」并存。
+
+**判级**：P1～P0（同会话并发 loop → 双 provider 交错写库 + 双倍 token 消耗，会话历史被混写）。修法方向：claim 移到 caller 同步执行并把 `streamingClaimEpoch = ++streamEpoch` **排在 `_isStreaming=true` 之前**。**未动手，等用户拍板**（按分支隔离纪律须开分支 + CI）。
+
+<!-- 2026-10-12 15:26:41 -->
+## 修复「切模型后流式状态被抹」竞态 → 分支 fix/streaming-claim-race-1012 @ 41f024e7（CI #1970 success）
+
+
+**根因**（真机日志 + 代码双证）：`_isStreaming` 清除权归属不清。旧 job 的 finally 用「`streamJob === 自己` + `jobEpoch == streamingClaimEpoch`」双门判断是否仍持有认领，但 epoch 快照总是在 `_isStreaming = true` **之后几条语句**才发布（send 甚至排到 orphan sweep 之后）→ 被取消的前任 job 的 finally 落在窗口内时，两道门**全过**，把全新 turn 的标志抹成 false。14:40:12.809（新认领）→ .815（旧 finally 抹 false，晚 6ms）→ 用户 14:40:15 点重试，守卫读到 false 放行 → 同会话两个 loop（tierflow_pro turn15-21 + GLM-5.3-Flash turn0-6）并发 11 分钟，29 条 appendMessage 混写同一会话，reducer 报 phase REJECTED。
+
+**同族面（用户追问「只有这里吗」的产出）**：
+- **7 个认领点**共用同一段三行序列：send / retryFromMessage / rerunFromToolBlock / retryLast / resume / resumeQueueAfterCancel / switchModelAndRerun。其中 3 个（switchModelAndRerun、resume、resumeQueueAfterCancel）的认领在 **async launch 内**（DB resync / delay(200) 之后）→ 窗口更大。
+- **UI 侧清理完全无门**：5 份 job finally 里 `resetQueueWaitingAhead` / `resetAwaitingResponseSince` / `publishOverlayReplyExcerpt` / `SessionActivityTracker.setInactive` 全是无条件 → 孤儿 job 退出时抹掉新 turn 的「运行中」标识（= 用户症状的「等待中但标识已停止」那一半）。只有 `_isStreaming` 有门。`releaseSlot` 必须保持无条件。
+- **放大器**：`streamJob = ` 有 5 个赋值点但只有 2 处 cancel（cancelStream / switchModelAndRerun）→ 标志一旦被误清，旧 loop 立刻变永久孤儿（无人能取消）。
+- **复发频率**：日志里 `SKIPPED (stale job)` 近三天每天 1 次（10-09/10-11/10-12 各 1）→ 「旧 job 在新 claim 之后收尾」的交错每天发生，多数时候门赢，14:40:12 那次门输。
+
+**修法（共享层，26 处机械改动 / 5 文件 +180/−91）**：新增 `@Volatile streamingClaimToken: Any`；7 个认领点**在 `_isStreaming = true` 之前**铸造新 token；10 道门（5 job 尾 + 4 setup-abort + 1 switchModel-abort）追加 `claimToken === streamingClaimToken`；5 处 finally 的 run-state 清理包进 `if (claimToken === streamingClaimToken)`。token 是单条原子写且先于标志翻转 → 两种交错都安全。
+
+**验证**：scan.sh 20/20、kotlinc 语法 0 错（1862 unresolved 为缺 classpath 噪音）、diff 逐 hunk 审、CI run 38216395154 = #1970 success 且 head_sha `41f024e7…` 与本地 HEAD 逐字符一致（event=workflow_dispatch，Publish 因分支跳过）。
+**诚实边界**：无单测（这些路径 ViewModel + OkHttp 绑定，仓库 KDoc 自认不可宿主测试）；残留 = switchModelAndRerun 仍在 async launch 内认领（~40ms DB resync 窗口，需人手点才可能漏，已写进 commit message）。**真机验证判据**：修复后旧 job 收尾应打 `SKIPPED … claimSuperseded=true` 而非 `about to set`。
+**状态**：停在分支，未合并（代码改动合并须用户发起）。
+
+<!-- 2026-10-12 15:36:21 -->
+## 云端分支核查+合并：fix/streaming-claim-race-1012（2026-10-12，用户令「没问题就直接合并」「触发了就不用等」）
+
+
+- **分支** `fix/streaming-claim-race-1012` @ `41f024e7`（父=main tip f9c374ca，5 文件 +180/−91，全在 ui/chat：ChatModelRouting / ChatQueueInterruption / ChatRetryOps / ChatTurnPersistence / ChatViewModel，无 strings.xml、无测试、无 workflow）：修 14:40 switchModel 竞态（14:59 日报那条）——新增 `@Volatile streamingClaimToken: Any`，**7 处 claim 点全部在 `_isStreaming=true` 之前 mint token**；10 处 gate（5 job-tail + 4 setup-abort + 1 switchModel-abort）在 epoch 门上加 `claimToken === streamingClaimToken`；5 处 run-state teardown（queue clock / network-wait clock / overlay excerpt / setInactive）改归属当前 turn（孤儿 finally 不再抹掉活 turn 的运行中指示）；`releaseSlot` 保持无条件；cancelStream 的 epoch 门未动（3886 例外甄别过：是同步用户取消，epoch 门已覆盖其场景）。
+- **核查**：verify_branch.sh 机械项 7/7 全过（scan 20/20、four-way ✅ ×2、冲突 0、scan_debt 0 no-trigger、i18n AUTO-SKIP、CI 门禁四项全中，核对时刻 07:26:20Z）；diff 507 行/25 hunk 逐行走查；7 处 mint 顺序断言（mint 行号 < flag 行号）全对；gate 完整性断言（无 token 的 epoch 比较点仅 1 处=注释行）核实。**未发现问题（0 P0/P1）**。
+- **CI**：#1970（run 38216395154）completed/success @ 41f024e7（workflow_dispatch，Publish 正确 skip）= 合并门；#1971 = main push 自动触发（有真实构建面），用户令不等。
+- **合并**：`--no-ff` → main **`e6380fea`**（合并树 vs 分支树 0 行、增量 5 文件 +180/−91 吻合、冲突 0）→ push → 远端==本地逐字符一致 → 分支本地+远端已删，远端只剩 main。
+- **残留**（commit message 已声明，登记不修）：①switchModelAndRerun 仍在 async launch 内认领（DB resync ~40ms 窗口，需人手点击才可能漏，auto 路径不落该窗口）；②无单测（路径 ViewModel+OkHttp 绑定，repo KDoc 自认不可宿主测试，证据=字段日志判据）。
+- **真机验证判据**：修复后旧 job 收尾应打 `SKIPPED … claimSuperseded=true` 而非 `about to set`。
+
+<!-- 2026-10-12 15:35 -->
+
+<!-- 2026-10-12 15:44:41 -->
+## streaming-claim-race 同族审计结论（2026-10-12，用户问「以前修的 bug 是否也有修一边漏一边」）
+
+
+**修复自身完备**：7 认领点全部 mint-before-flip、5 finally 全加 claimToken 门、releaseSlot 无条件（正确）。26 处机械改动齐。
+
+**同族扫描（全仓 33 对置位-清理，按「多认领者」筛）**：无第二个活跃同形 bug。_isCompacting 结构安全（认领被同一 flag 互斥+无同步强清）；BrowserTabPool.inUse = grace 刻意设计；BrowserUseManager._isLoading 单置位点低危；其余为设置页单认领 busy 标志。
+
+**历史修复家族回查全过**：TTFB 三副本已统一 StreamTimeouts.TTFB_TIMEOUT_MS 单源 ✅；context-window-sources SSOT 11 消费点无旁路（唯一 raw 读在 SSOT 体内）✅；namedconst 7 组异值全为同名不同域，EXIT_INVALID_ARGS 1vs2 = iOS 对齐刻意约定 ✅；auto-follow 收敛到 decideBottomScroll 单点 ✅。
+
+**新发现 → backlog §83**（P2 登记不修）：catch(Exception) 路径 reportAgentLoopError + markStreamError 不在 claimToken 门内——孤儿 job 真实异常会错挂到新 turn（横幅/❌ 通知），窗口比 finally 更窄，无实际案例。
+
+**机制认识**：scan.sh 20 道静态门覆盖常量/i18n/字段同步类，但认领-释放时序类无静态门（装置判超标未建）——这类只能靠行为审计。历史上「修一边漏一边」实锤 3 起：TTFB 修1/3 漏 9 天、加字段四处同步复发 5 次、本次 bug 本身（retryFromMessage/retryLast 早改同步认领而 switchModelAndRerun 没跟改）。
+
+<!-- 2026-10-12 16:40:56 -->
+## 第 21 道 CI 门落地：claim_release_guard（2026-10-12，用户批准后实施）
+
+
+**产物**：`scripts/scan/claim_release_guard.py`（已合 main，PR #6 @ 4fa0cb20）。scan.sh 21 门 + 自测 89 用例全过；Scan Gate(PR) CI 绿。
+
+**两条判据**（关键是判据要能区分修复前/后，而不能只看「有没有守卫文本」）：
+- Check A 兄弟门不一致：同族释放点里有的带所有权比较（epoch/token/job identity），有的没有 → 提示「修一边漏一边」。族按 key 的声明文件定界（唯一声明文件 → 跨文件同族；多声明 → 按文件分族）。原子手递形态豁免：take-or-bail（`val X = slot ?: return`）/ same-slot snapshot（`val X = <key>`）/ 保守 `key == null` 门。
+- Check B claim 先于 mint：claim 翻标志早于发布其族释放门所比较的 marker。**验收基准：修复前树（41f024e7^）B 类 7/7 全命中；修复后 0。**这是决定性验收——初版以 `= Any()` 为锚，对前后树结果相同（抓不到），后改成「marker 发布时序」才成立。
+
+**变异测试**：拆真赋值点的门 → A 类命中并指出漏出兄弟；复现 10-12 原形 → B 类命中。
+
+**白名单 4 族 13 点**（带审计理由）：BrowserUseManager `_isLoading`/`navigationDeferred`（per-tab Mutex 串行 + 回调只清自己槽）、PersistentShell `stdinWriter`（stop 拥有者主动拆）、WebAppActivity `webViewRef`（Activity 单实例主线程）。
+
+**遗留**：`catch (e: Exception)` 里 reportAgentLoopError / markStreamError 仍在门内残留（backlog §83，P2）——此门不覆盖 catch 路径（B 类只查 claim 时序）。
+
+**方法论教训**：扫描器验收必须用「修复前 vs 修复后」双树做差分，而非只看当前树输出——初版判据就是被这个方法揪出来的假门。
+
+<!-- 2026-10-12 16:46:53 -->
+## claim_release_guard 门合并状态独立复核（2026-10-12 晚，本会话）
+
+
+用户令「检查分支上那个新加的门，没问题就合并」——**该分支（ci/claim-release-guard-1012 / PR #6）已于 16:40 由前会话合并进 main @ 4fa0cb20**，远端分支已删，云端只剩 main，无需操作。
+
+本会话独立复核（非只信汇报）：
+- 合并增量 e6380fea..4fa0cb20 = 3 文件全在 scripts/scan/（+623/−22），无夹带；合并树 vs PR head f528b241 `git diff` 0 行。
+- Scan Gate (PR) run 38224724150 completed/success，head_sha 与 refs/pull/6/head 逐字符一致。
+- 本地同步 main 树 `sh scripts/scan/scan.sh` = **21/21 全过**（含 [21/21] Claim/release ownership guard）；`test_scan.py` = **ALL 89 CASES PASS**（含 claim_release_guard on real repo exits 0）。
+- main @ 4fa0cb20 无 build-apk run = **正确**：build-apk push paths 不含 `scripts/scan/**`，scan-gate.yml 只在 pull_request 触发——合并 push 本就不该触发任何 run，不必等。
+- 坑：scan.sh 是 shell 脚本，`python3 scan.sh` 会报 line 39 unterminated string（我第一次跑错）；必须 `sh scripts/scan/scan.sh`。
+
+<!-- 2026-10-12 17:18:34 -->
+## proactive-1012 三项并行派发（2026-10-12 傍晚）
+
+
+用户令「用会话子代理并行、把任务安排出去」→ 已派发 3 个 headless 会话（`minis-sessions-cli send --async`），任务书在 `/var/minis/shared/proactive-1012/tasks/`，任务板 `BOARD.md`。
+
+- T1 `***UUID***`：10-10 压缩修复验证装置→repo 单测（分支 test/compact-stale-replay-1012）
+- T2 `***UUID***`：sanitizeToolPairing PBT（分支 test/tool-pairing-pbt-1012）
+- T3 `***UUID***`：four_way_sync 枚举→推导（分支 ci/field-sync-derive-1012）
+
+冲突矩阵零交集；各自 /tmp/pf-t{N}-repo 独立 clone。每任务书含：环境事实（kotlinc 2.0.21、junit/hamcrest 路径、org.json jar、gh_sync 命令）、执行步骤、变异负控要求、报告格式、停止线（不改生产/不合并/不删分支）。
+关键纪律：分支 push 不触发 build-apk → 必须 `gh-actions-dispatch`；假绿防护 = run head_sha 必须等于 push 的 commit（git-parallel §6）。合并动作留给用户放行（分支 CI 绿=停止节点）。
+
+<!-- 2026-10-12 17:36:03 -->
+## T3 完成：four_way_sync 门升级 v2（推导族）——PR #9，Scan Gate 绿
+
+<!-- 2026-10-12 -->
+
+- 分支 `ci/field-sync-derive-1012` @ `136ede2`（父 = main 4fa0cb20），PR https://github.com/***OWNER***/RikkaMinis/pull/9，Scan Gate (PR) run **38230535278** completed/success，head_sha 与本地逐字符一致（API 直查）。**停在分支未合并**（代码文件改动合并须用户发起）。
+- 改动：仅 `scripts/scan/four_way_sync_check.py`（+330/−104）+ `test_scan.py`（+202），共 2 文件 +428/−104。scan.sh / 生产 Kotlin / T1/T2 领地零改动。
+- v2 设计：扫 `data/db/*Entity.kt` 推导族（命名约定 + FAMILY_MODEL_ALIASES 3 条已审计 pin：ProviderThinkingRuleEntity→ThinkingRule、ProviderModelEntryEntity→ModelEntry、ProviderModelGroupEntity→ModelGroup）→ 全源码找 to-DB/from-DB 构造点（跳过声明文件）→ 三类差集检查（消息保留 v1 回归锚子串）+ UNRESOLVED 清单 + 覆盖表。
+- 覆盖表：v1 checked 2 → v2 **derived 10 / checked 4 / unresolved 6**（各带原因，exit 0）。main 树 ALL CLEAN。
+- FIELD_ALIASES 5 条（credentials→credentialsJson、memberEntryIds→memberEntryIdsJson、baseModel→baseModelJson、overrides→overridesJson、uuid→id）；KNOWN_MISMATCH 4 pin（ThinkingRule kind/scope/wireFormat/reasoningEcho，transform/blob 刻意设计）→ 每次运行打 4 行 ⚠ WARNING。
+- 验证：test_scan.py **93 例全过**（89+4 新 fixture：非硬编码族红 / 别名绿 / UNRESOLVED / pin WARNING）；scan.sh **21/21**；**变异负控**（差集判定 sed 为 `if True:` → 4 失败方向 fixture 全红、绿向不受影响；恢复后 93 例全过）。
+- 真实发现：**无生产字段缺口**。
+- 报告：`/var/minis/shared/proactive-1012/reports/T3.md`。
+
+<!-- 2026-10-12 17:37:24 -->
+## T1 完成：10-10 压缩修复验证装置已搬进 repo（PR #7，零生产改动）
+
+
+任务源：`shared/proactive-1012/tasks/T1.md`（用户令「严格按 T1.md 执行不要停」）。产物 = `CompactStaleContextTokensReplayTest.kt`（206 行 / 12 测试，合并 verify-compact-fix-1010 + compact-1011-harness 两份装置）。
+
+- PR #7（***OWNER***:test/compact-stale-replay-1012 @ 520e56eb，base main）→ Scan Gate(PR) 38229172351 绿 + build-apk #1972（38229181535，workflow_dispatch）绿，head_sha 逐字符一致；job 日志 grep `CompactStaleContextTokensReplayTest > .* PASSED` = 12（执行验证做过，非只看 run 结论）。**停在分支未合并**（代码改动合并须用户发起）。
+- 变异敏感度：门改无条件 return true → 3 测试红（钉点确认）；本地 scan.sh 21/21；沙箱预飞 kotlinc 2.0.21 单次编译 + JUnitCore 12/12。
+- 报告：`shared/proactive-1012/reports/T1.md`。
+- 诚实边界：dynamicMaxTokens 算式与 tokens<=0 守卫仍是镜像（Android 耦合）；清除动作本身（AgentLoopEngine.kt:496-499）无单测（loop 内部不可宿主测试，惯例同 AgentLoopTier1GuardTest）。
+
+<!-- 2026-10-12 17:42:07 -->
+## T2 属性测试落地：ProviderToolPairingPropertyTest（PR #8，CI 全绿）
+
+<!-- 2026-10-12 17:5x -->
+
+- **产物**：`src/android/app/src/test/java/com/rikkaminis/app/provider/ProviderToolPairingPropertyTest.kt`（+356 行，分支 `test/tool-pairing-pbt-1012` @ 2baa2143，PR #8）。INV-A..INV-F 六不变量 + 手滚 LCG 生成器（无新依赖），800 畸形 + 400 幂等 + 400 良构种子，本地 0.29s。变异负控双向抓到：Pass1 失效→INV-A 红（seed=2）；Pass2 失效→INV-B 红。**未合并（等用户）**。
+- **报告**：`/var/minis/shared/proactive-1012/reports/T2.md`。
+- **坑**：①LLMMessage 依赖 LLMUsage（@Serializable）→ 沙箱编译集要补 LLMUsage.kt + kotlinx-serialization-core jar（gradle 缓存里有）；②junit jar 必须进**编译** classpath，不只是运行；③`0x9E3779B97F4A7C15L` 超 Long 范围 → 用有符号字面量 -7046029254386353131L；④PR 事件自动触发 build-apk（head_sha 是 merge sha）+ dispatch run（branch sha），核对 head_sha 时用 `?head_sha=` 过滤才不混。
+- **任务书体系**：`/var/minis/shared/proactive-1012/`（tasks/T1..T3 + context + reports）——多会话并行装置，T2 只加测试不改生产。
+
+<!-- 2026-10-12 18:14:49 -->
+## proactive-1012 三任务合并完成（2026-10-12 晚）
+
+
+用户放行后执行合并：PR #7/#8/#9 全部合入 main，顺序 #7 `206e7110` → #8 `38ad442d` → #9 `13949bb0`（tip），逐支 `merge-base --is-ancestor` 核实进树，三远端分支删除（HTTP 204），共享参考树 ff 到 `13949bb0`。
+
+- main build-apk run 38233368421（head `38ad442d`）= success，`Run unit tests (full suite)` success（两个新测试类在 CI 全量执行）；APK/签名/Publish 全 success。
+- **知识**：main tip `13949bb0` 只改 `scripts/scan/**` 不触发 build-apk（paths 过滤），属设计行为。判断「合并后 CI 该不该跑」要看 merge commit 的 diff paths，别把 valid-skip 当漏跑。
+- **坑**：stall-guard 会杀 ≥180s 无输出的 `sleep` 长轮询；等 CI 要用 shell_execute 的 `delay` 参数而不是裸 sleep。
+- T3 交付的 `four_way_sync_check v2`：10 Entity → checked 4 / UNRESOLVED 6（可见清单）；ThinkingRule 4 个刻意设计已 pin 为 WARNING。合并预演与变异负控方法可复用（独立 clone + 连续 merge + 亲自拆装置验证红）。
+- 收口报告：`/var/minis/shared/proactive-1012/reports/FINAL-closure.md`。
+
+<!-- 2026-10-12 18:55:24 -->
+## 流式 think-tag 扫描器两个活缺陷（2026-10-12 晚，主会话侦察发现 → T4 修复已派发）
+
+
+在给「下一步该弄什么」做侦察时，在 `ThinkTagScanning.kt`（main @ 13949bb0）实测复现**两个从未被测试覆盖的活缺陷**：
+- **缺陷 A（İ 索引偏移）**：`:87` `bufLower = buffer.lowercase()` 的命中索引被拿去切源串；U+0130 lowercase 1→2 码点（全 Unicode 唯一），`"İ<thinking>abc</thinking>done"` → V=`İ<one` T=`bc<`。09-27 修过 stripOrphanThinkClosers 同款模式，scanThinkTags 当时登记不修「触发=真实撞上」。
+- **缺陷 B（跨 chunk 状态丢失）**：`:245` 函数尾 return 硬编码 `false/null`；开标签恰在 buffer 末尾被消费时（relay 把 `<think>` 单独一个 delta 发）区域状态丢失 → 思考整段泄漏进正文（V=`abcdone`），纯 ASCII 无特殊字符。**从未登记**。档案 08-18/09-11 用户症状（思考跑正文）与 B 输出同形。
+- 分块不变性测试是有效探针：同一逻辑流 5 种切法输出 5 样。
+- 证据包：`/var/minis/shared/proactive-1012/evidence/tts-scan/`（original sha `efb63843`/v2 参考补丁 sha `fb6bd4d8`/41 例回归提取版/6 对照输出）。v2 已过：41 例回归 + common 语料逐字节差分 + İ/边界全修。
+- 语义边（已接受、房规一致）：ignoreCase 折叠使 `<thİnking>` phantom 匹配 `<thinking>`（与 09-27 修法同语义）。
+- T4 会话 `***UUID***`，任务书 `tasks/T4.md`；双修复同文件同函数不拆并行，两 commit（A 一个、B 一个）。
+- 方法教训沉淀：**差分驱动程序（原版 vs 修复版跑同语料 diff）+ 分块不变性**是这类流式解析器 bug 的高效探针组合；9-27 那次从「有删字符风险」到「修了」拖了 2 周，因为只有登记没有复现装置。下次同类：先写复现器再决定修不修。
+
+<!-- 2026-10-12 19:34:33 -->
+## T4 完成：think-tag 扫描器双缺陷修复（PR #10，CI 全绿，停在分支未合并）
+
+
+- 分支 `fix/thinktag-scan-integrity-1012` @ `123e2cc`（父 = main `13949bb0`），3 commits：`11e3ab6`（A：删 bufLower 改源坐标搜索 indexOfIgnoreCase/maxTagPrefixLen）→ `b41b9b1`（B：函数尾 return 携带 tagActive/activeFormat）→ `123e2cc`（新测试 ThinkTagScanIntegrityTest，17 例）。
+- 报告：`/var/minis/shared/proactive-1012/reports/T4.md`。
+- 变异矩阵：original → 12 红；a-fix-only → 6 红（boundary 红 İ 绿）；B-only → 7 红（İ 红边界绿）；fixed → 17/17。41 例纯函数提取版 + 修复版 41/41。Driver common 段逐字节一致；i 段差异仅预期 5 例。
+- CI：Scan Gate run 38241546097 + build-apk run 38241556789 双绿，head_sha 逐字符一致；job 日志 grep `ThinkTagScanIntegrityTest > .* PASSED` = 17（防假绿实证执行）。
+- Family sweep：同族真命中仅 ChatRepository.kt keywordSnippet（cosmetic，报告不修）；DebugServer/OAuthCallbackServer 为假阳性（lower 仅 startsWith 布尔用，substringAfter 在源串）。
+- **坑**：①/tmp 下编译产物（.jar）被 60s 收割机制收走（源 .kt mtime 新没事）→ 产物放 /var/minis/shared/work/ 或钉 .minis-keep，本会话重编译 3 次；②复现器 5 文件各自 `private class Acc` 同 jar redeclaration → 需改名；③证据复现器 main 类名不规律（ChunkinvKt/NoiKt 小写），跑前 unzip -l 核实；④sleep 240 轮询被 stall-guard 杀（sleep 无 CPU 进度），改短 sleep 分次；⑤写测试时闭合标签被工具输出污染成含 antml 形状、分块用例拼接笔误（`<thi`+`nk>`=`]): ` 非 `<thinking>`）——测试红先查测试自身，探针定位。
+- 测试迭代：5a 首跑 5 红，全为测试自身笔误（4 处标签污染 + 1 处拼接），修正后 17/17；扫描器行为探针全 trace 验证正确。
+
+<!-- 2026-10-12 19:44:58 -->
+## PR #10 合并完成：think-tag 扫描器双缺陷修复进 main（2026-10-12 晚，用户令「检查→没问题就合并」+「合并后不用等」）
+
+<!-- 2026-10-12 19:3x -->
+
+- **分支**：`fix/thinktag-scan-integrity-1012`（T4 会话产物）@ `123e2cc8`，3 commit（A 源坐标搜索 / B 跨 chunk 状态携带 / 测试），仅 2 文件（ThinkTagScanning.kt 89 行 + ThinkTagScanIntegrityTest.kt 204 行）。
+- **核查三项全过**：①diff 无夹带；②Scan Gate 38241546097 + build-apk 38241556789 双绿，head_sha 逐字符=123e2cc8，CI 全量单测 17 PASSED / 0 FAILED（日志 grep 实证，非只看 run 结论）；③独立证据 = 沙箱实跑 17/17 绿 + **变异负控**（同一测试对 original 基线 efb63843 → 12/17 红，İ 系与 state-carry 系全被钉住，5 个双绿均为 pass-through/phantom 守卫类）。
+- **坑**：GitHub job 日志在 job 完成前取不到（BlobNotFound 215 字节 XML）——in_progress 时别急着 grep PASSED，等 run completed 再取。
+- **合并**：merge commit `1074a399`；合并树 vs 分支 tip 0 行 diff；远端分支已删（204），云端只剩 main；共享参考树 ff 到 `1074a399`。
+- **main 自动 build-apk 38243738964**：用户明示不等（「合并后不用再等」）——分支同内容已全绿 + 合并树 0 差异，main run 是重复读数；收口时仍 in_progress，未等。
+- **遗留**：T4 会话的收口报告 `/var/minis/shared/proactive-1012/reports/T4.md` **始终未落**（reports/ 只有 T1-T3 + FINAL-closure）——分支已验证合并，报告缺口不影响产物，但 T4 会话是否正常收尾未核实。
+
+<!-- 2026-10-12 19:54:32 -->
+## 今日改动独立复核（2026-10-12 晚，用户令「再检查一遍今天的各种修改」）
+
+
+**方法**：不信日报，实际查（GitHub API 取远端历史 + 本地参考树实跑）。
+
+**结论：全部通过，无夹带、无真失败。**
+
+- **main 链**（6 merge）：`f9c374ca` → `e6380fea`(streaming-claim) → `4fa0cb20`(#6 claim-guard) → `206e7110`(#7 压缩复现) → `38ad442d`(#8 PBT) → `13949bb0`(#9 field-sync) → `1074a399`(#10 think-tag)。
+- **净增量** f9c374ca...1074a399 = 13 文件 +2051/−252，全落在 scan/ + ui/chat/ + ThinkTagScanning + 3 测试；ui/chat 5 文件 = +180/−91（与日报逐字吻合）。无 strings.xml / workflow / gradle / manifest 夹带。
+- **独立证据**（非只看 run 结论）：本地 `sh scripts/scan/scan.sh` **21/21**；`python3 scripts/scan/test_scan.py` **ALL 93 CASES PASS**；最终 main run `38243738964` @1074a399 实跑三个新测试类 —— Compact 12 + ProviderToolPairing 7 + ThinkTagScanIntegrity 17，**0 真失败**（日志里 5 个 "FAILED" 字样全是测试方法名、结果 PASSED）。
+- **关键代码抽查**：ThinkTagScanning.kt `bufLower` 已删、改 `indexOfIgnoreCase`/`maxTagPrefixLen`、函数尾 return 带 `tagActive`/`activeFormat` ✓；`streamingClaimToken` 38 处引用 / 7 处 mint ✓。
+- **两处需解释，均正常**：①13 run 中 1 个 cancelled（`38233350994` @206e7110）= build-apk `concurrency: cancel-in-progress` 设计行为（审计注释 RC6，防旧版本覆盖新版本）；②2 个 merge tree DIFF（38ad442d/13949bb0）= **顺序合并**，compare 验证 diff 内容恰好是前序任务文件（T1 CompactReplay +206；T1+T2 +356/+206），非夹带。
+- **远端只剩 main** @ 1074a399 = 本地参考树 HEAD 逐字符一致。
+
+**唯一瑕疵**：T3 报告写 `four_way_sync_check.py`「+330/−104」，实为 **+226/−104**（226+202=428 与报告总数吻合 → 单文件数字笔误）。报告是当时快照，未改，供用户决定。
+
+<!-- 2026-10-12 19:57:07 -->
+## T3 报告勘误已修正（2026-10-12 晚，用户令「不要留下尾巴，处理了吧」）
+
+
+- `/var/minis/shared/proactive-1012/reports/T3.md` 第 6 行：「+330/−104」→「+226/−104」（four_way_sync_check.py 实际增量，226+202=428 与报告总数吻合）。grep 复核：`330` 全文 0 命中，修正落盘。
+- 今日遗留清点终态：T4 报告缺口已证伪（19:34 补落）；cancelled run 与 2 个 merge tree DIFF 均为设计行为无动作；backlog §83 是刻意登记非尾巴。**今日无未处理尾巴。**
+
+<!-- 2026-10-12 20:02:08 -->
+## 「回答中途突然停止」排查结论（2026-10-12 晚，用户报其他会话）
+
+
+- 今天日志共 11–12 次真实中途取消（`runAgentLoop CANCELLED` → streamJob killed），**全部是 `cancelStream()` 主动取消，0 崩溃/0 错误/0 OOM**（今天 error-snapshot = 0）。
+- **大头 10/12 = sendMessage 抢占**（T-user-message-preempts-agent）：流式回答进行中用户发出新消息 → `ChatViewModel.sendMessage` 立即 enqueue + cancelStream 掐掉当前回答。日志特征 = `Enqueued prompt (Nch)` 紧贴 `cancelStream invoked`。
+- **「启动时新建会话」设置（KEY_LAUNCH_SESSION=2）**：MainActivity.onStart 后台→前台时自动导航到空新会话（popUpTo 弹栈），今天 4 次（15:25/15:37/17:00/19:44）——用户回 app 被弹到空会话、正看的回答停半截，观感即「突然停止」。
+- 2 次无 Enqueued prompt 的取消（15:28:34 / 15:37:12，均发生在切屏后 ~1.3s、且连带杀掉第二个 __new__ 会话的 shell）→ 疑似通知栏 Stop 的 fan-out（SessionActivityTracker.streamCancellers），未完全钉死。
+- **坑：`ChatViewModel.cancelStream` 的日志 `cancelStream invoked _isStreaming=false` 是写死字面量**（源码 ：3862，不打印真实状态），排查时被它误导过一轮——候选 1 行修（打印真实 `_isStreaming.value`），登记未修。
+
+<!-- 2026-10-12 20:07:29 -->
+## 保留装置 vs 发现装置——产出追踪未覆盖面（2026-10-12 晚，用户问「今天都是发现类但没发现多少，为什么」）
+
+
+**拆解**：今天 5 产物里 4 个是**保留装置**（T1 复现/T2 PBT/T3 门升级/claim_guard——按构造抓 0 个新 bug，价值期权式地在下次复发兑现）；只有 T4 是**发现装置**（差分探针 + 分块不变性），且命中率 2/2 全中。产出的少是分类错觉 + 靶区选择，不是装置弱。
+
+**核心公式**：发现数 = 探针判别力 × 靶区 bug 密度。判别力全部被变异负控验证过（利刃）；差别全在砍哪里——T4 指向零测试覆盖的 ThinkTagScanning.kt（一probe一个准），T2/T3 指向已扫 5 次有门的区域（没剩什么）。
+
+**密度背景**：10 月 P0=0、快照 100% 外部归因——浅层已收割完，没发现大量 bug 恰是维护有效的证据。
+
+**导航含义（立项前的靶区三问）**：①这个靶区上一次被咬是什么时候？②有没有装置覆盖过？③是子系统级还是文件级瞄准（子系统脏≠函数脏，T2 教训）？剩余 bug 集中在：并发时序（要真机日志，静态门看不见）/ 流式解析边界（SSE、markdown 渲染等同族未查）/ 外部 provider（不归你修）。
+
+**装置价值的正确表述**：装置的价值不是发现，是记忆（防复发）；发现靠探针指向装置没覆盖的地方。两者混淆是「没发现多少」失落感的来源。
+
+<!-- 2026-10-12 20:11:56 -->
+## 「三类地方能不能一起覆盖」侦察判定（2026-10-12 晚，落 backlog §84）
+
+
+流式/chunk 生产文件 × 测试交叉对比（main @ 1074a399）：**覆盖面比预期完整**——T4 修完后流式解析几乎无纯逻辑真空。已覆盖：ThinkTagScanning、StreamingMarkdownText、MarkdownStreamMerge（类名 grep 0 是假阴性，按函数覆盖）、MarkdownBlockModel、SentenceSplitter×2、Utf16Sanitizer、ToolJsonRepair、ChatStreamOffloadHandler 等。不可宿主豁免：ChatStreamDelta（VM 扩展）、Speech/TTS（系统服务）、AgentLoopEngine（惯例）。
+
+**唯一真空：MarkdownParser.kt（639 行，只测 numbered list + 内联数学）**——待用户拍板立项差分探针（方法复用 T4，成本约一个下午；触发条件 = 用户拍板或渲染错乱实例出现）。外部 provider 侧 = 刻意不建（100% 外部归因，本地无可修面）；并发时序 = 不建新装置（claim_guard 刚验收，观察桩已定）。
+
+<!-- 2026-10-12 20:25:58 -->
+## T5 派发：MarkdownParser 差分探针 + 重复派发事故（2026-10-12 晚）
+
+
+- **派发**：MarkdownParser.kt（639 行纯 Kotlin object 零 import，String→List<Block>，宿主可测；已有覆盖仅 numbered list + KaTeX 上限）→ T5 headless 会话 `0304c724`，任务书 `shared/proactive-1012/tasks/T5.md`，分支 `test/md-parser-probe-1012`（已 push）。任务书含 T4 全部环境坑（产物放 shared/work、redeclaration、stall-guard、head_sha 防假绿）+ 关键设计修正：**MarkdownParser 非流式，分块不变性不适用** → 改为构造矩阵 + 结构不变性（残留分隔符/嵌套一致/Table 行列/幂等/逐字保留）。
+- **事故（自错自纠）**：为「取会话 id」再调了一次 `send --async` = **又派发一个新会话**（is_new_session: true），造出双 T5 同任务书（同 clone 路径/分支/PR 冲突）。处置：发停止指令给第二个（`3ba02690`，20:15 后无活动，8 条消息，无 clone/push 污染），`0304c724` 继续跑。**教训：send --async 返回值里直接取 session_id，绝不为取 id 重调 send；派发类命令返回值当场读全，别用 tail 截断。**
+- 工程量评估结论：单文件零依赖 + 环境现成（T4 刚用过的 junit 路径/编译流程）+ 任务书模板现成 = 一个会话的量，主会话不值得串行烧 turn。
+
+<!-- 2026-10-12 20:38:24 -->
+## 分支审查：test/md-parser-probe-1012（T5 产物）通过
+
+# 分支审查：test/md-parser-probe-1012（T5 产物）通过
+- 分支 2 commits（fix 910ff2b6 → test 85f3535c），增量 MarkdownParser.kt +15/−3（heading 尾部# + setext-vs-table 两修复）+ 58 例新测试。独立审查：58/58 绿 + 变异负控完美（MutA 拆修复 A→3 红全对应用例；MutB 拆修复 B→1 红=setext 用例），CI run 38248821086 success @85f3535c。
+- **修复 B 口径核实**：GFM 要求分隔行必须含管道、header 行可无 → `Title\n|---|` 仍按 1 列表格是符合规范，非缺口。
+- **P2 登记**：parse 主循环每行新增 1 个 Regex 编译（:145），与既有每行编译风格一致，无触发实例，登记不修。
+- 报告：/var/minis/shared/work/review-mdparser-1012/REPORT.md；harness 在同目录 jvm/（BuildConfig+Log 需 stub 双文件，Kotlin 一文件一 package）。
+- 坑复发：file_read 带 offset 返回空 body（本会话 MarkdownParser.kt 两次），换 sed+awk 行号读法。
+
+<!-- 2026-10-12 20:40:48 -->
+## T5 完成：MarkdownParser 差分探针（PR #11，CI 绿，停在分支未合并）
+
+<!-- 2026-10-12 晚 -->
+
+- 分支 `test/md-parser-probe-1012` @ `85f3535c`（2 commits：`910ff2b` 修复 / `85f3535` 测试 58 例），PR #11（base main ← 分支），CI run `38248821086` success，head_sha 逐字符一致；job 日志 58 PASSED / 0 FAILED（防假绿做过）。
+- **两个 P1 实测缺陷**（main @ 1074a399，MarkdownParser.kt）：①heading 尾 `#` 双向缺陷——`## C#` → `C`（内容被吃）+ `## title ##` → `title #`（残留），`removeSuffix("#")` 只剥一个不看空格；②`Title\n---` → `Table(header=[Title], rows=[])`（无管道 `---` 命中 isTableSeparator 单列分隔行，setext 误判成空表）。修复：regex `\s+#+$` 空白前置才剥 + header/separator 行要求含 `|`。
+- **P2 登记 3 个**：表格 `\|` 转义被切（splitTableRow 刻意 verbatim）/ `~~~` fence 不识别 / bullet 嵌套·loose 展平。
+- 方法教训：**观察探针先行**（无断言跑全语料输出 AST）→ 从实跑抄断言字面量 → 基线红（缺陷钉住）→ 修复 → 全绿。变异负控用「基线红」等价实现，比修复后回滚更省一轮编译。
+- 坑：①junit jar 进编译 classpath（复发一次，T2 已记录）；②Kotlin `$` 模板插值 7 处需 `\$`；③**括号计数误报新样本**——正则字符类 `[^)\s]+` 里的字面 `)` 使 `(`/`)` 计数差 1，kotlinc 实际通过，再次印证计数不是解析；④grep `-o "X > [a-zA-Z ]* PASSED"` 字符类不含数字/`-` 会截断假低（43 vs 实数 58）。
+- 报告：`/var/minis/shared/proactive-1012/reports/T5.md`；探针装置：`/var/minis/shared/work/t5/probe-src/`（Probe.kt 64 语料，可复用于同类纯 parser 审计）。
+
+<!-- 2026-10-12 20:41:32 -->
+## PR 合并：test/md-parser-probe-1012 进 main（用户放行「没问题就合并」）
+
+# PR 合并：test/md-parser-probe-1012 进 main（用户放行「没问题就合并」）
+- merge commit `8637ea6`（no-ff，父 1074a399 + 85f3535c）；合并树 vs 分支 tip **空 diff**（逐字节一致）；push 核验远端 main == 本地 8637ea6；分支远端(204)+本地已删，远端只剩 main。
+- main push 自动触发 build-apk（.kt 有验证面）——分支同内容 run 38248821086 全绿 + 合并树 0 差异，main run 为重复读数，未等（先例 10-12 PR #10）。
+- **坑（复发）**：`git merge --no-ff ... | tail -2` 的输出会混入 merge 自身 diffstat（"2 files changed +483/-3" 是 merge 相对第一父的增量，不是 `git diff HEAD^2..HEAD` 的结果）——差点误判合并树不一致；核实用 `git diff <branch-tip> HEAD --stat` 空即一致。
+
+<!-- 2026-10-12 20:42:46 -->
+## T5 收口：MarkdownParser 探针完成 + 2 个 P1 修复已合并（2026-10-12 晚）
+
+
+- **产出**：64 条探针语料 + 58 例测试（MarkdownParserBlockStructureTest，468 行）+ 2 个 P1 缺陷修复（①heading 尾部 `#` 双向：`## C#` 内容被吃、`## title ##` 残留——removeSuffix 只剥一个且不看空格；②setext-vs-table 误判：`Title\n---` 被 isTableSeparator 无管道命中变空表格）+ 3 个 P2 登记不修（转义管道切分、tilde fence、bullet 嵌套展平——KDoc 未声称/刻意设计）。
+- **合并**：PR #11 → main `8637ea61`，**用户授权另一会话检查后合并**（非 T5 会话，T5 停止线未破）；分支已删，远端只剩 main。main 自动 build-apk `38250570440` 未等（分支同内容 38248821086 已绿 + head_sha 逐字符一致）。
+- **验证**：沙箱 70/70 绿（58 新 + 12 锚）+ 变异负控（未修复基线 5 红）；scan 21/21；CI 日志 grep 58 PASSED / 0 FAILED（防假绿做过）。
+- **backlog §84 闭合**：MarkdownParser 探针已执行，触发条件兑现——流式/解析边界三靶区全部收口（T4 think-tag + T5 md-parser；①并发时序/③外部 provider 维持登记不建）。
+- T5 会话 `0304c724` 正常收尾（报告 20:40 落盘完整）；重复派发事故（双会话）已在前条记录。
+- 今日 main 终态：`1074a399` → `8637ea61`（PR #11 = 今天第 7 个合并）。
+
+<!-- 2026-10-12 20:49:36 -->
+## 「T4/T5 效果好，是否继续推进」判定（2026-10-12 深夜，落 backlog §85）
+
+
+**判定：停，不建全仓盲扫装置。** 侦察数据（main @ 8637ea61）：577 生产类，无测试 import 引用差集 534——但校正后大部分是假象：①同包测试假阴性（ui/chat 79 / sandbox 51 / provider 22 个同包测试文件，同包引用不需要 import，差集严重高估）；②差集前 120 个里 26% 直接是 @Composable/@Serializable/入口类。扣掉后真「纯逻辑+零覆盖」候选是少数。
+
+**核心认识**：T4/T5 的 4 个 P1 是在「最后的真空」上取得的——流式/解析边界是最后一个「纯逻辑 + 零覆盖 + 高频」的交集，不是常态密度。效果好 ≠ 该继续；继续 = T2 模式（对已测/豁免区上装置 = 0 产出 + 装置比例违规）。**效果好带来的「再复制几个」诱惑，是同一个诱惑的第二次出现（T5 派发时警告过第一次）。**
+
+**复活条件**：①新功能引入零覆盖纯逻辑文件且在主路径；②某次 P1/P0 复现根因指向零覆盖文件 → 定向 probe 那个文件，不做盲扫。
+
+<!-- 2026-10-12 23:07:41 -->
+## NextPlayer 定制：底部导航移除 + 个人签名出包基建（2026-10-12）
+
+
+**用户需求**：fork `alarmedvine/nextplayer`（= 上游 anilbeesetti/nextplayer 干净 fork，main 与上游一致）。要求：①底部「可切换的胶囊导航」整体搬到设置页、入口页只留最右的「继续播放」按钮；②更多页「不要」；③平板/TV 的 NavigationRail 先不动；④以后改了东西能从云端下载 APK **直接覆盖安装**（= 稳定签名 + 单调 versionCode）。
+
+**已交付**（分支 `feat/minimal-home-1012` @ `cd8817bd`，PR #1，未合并=等用户）：
+- `app/.../navigation/TopLevelNavigation.kt`：删除 `NextNavigationBar` 的胶囊分支与整个 `NavigationView`（含 ~15 个 import 清理），FAB 改为 `Arrangement.End` 靠右；`showFabOnly`/`state` 参数移除。
+- `core/ui/.../components/TopLevelFab.kt`：新增 `LocalTopLevelPageSwitcher`（String key = TopLevelFabKey 常量）。
+- `MainActivity`：提供该回调（先 `while (stack.size>1) removeLastOrNull()` 弹掉当前页压入的屏幕，再 `navState.switchTo`）。
+- `feature/settings/SettingsScreen.kt`：新增 `PageRow` 枚举 + 顶部「页面」分组四行（主页/播放列表/网络/更多），经 `SettingsAction.OpenPage` 走 `LocalTopLevelPageSwitcher`。设置页入口本来就有（首页顶栏齿轮 + 各页 FAB）。
+- 构建：`app/build.gradle.kts` 新增 `personal` signingConfig（env `KEYSTORE_FILE/PASSWORD/ALIAS/KEY_PASSWORD`），versionCode/Name 支持 `-PciVersionCode/-PciVersionNameSuffix`；新增 `.github/workflows/personal-build.yaml`。
+
+**签名基建（本周起复用）**：keystore + 口令在 `/var/minis/shared/nextplayer-signing/`（README 有全套说明与恢复命令）；证书 SHA-256 `10:28:17:86:73:D5:…:79:3C`；仓库 secrets 四项已写入（KEYSTORE/KEYSTORE_PASSWORD/KEY_ALIAS/KEY_PASSWORD）。
+**稳定下载地址**：`https://github.com/alarmedvine/nextplayer/releases/download/personal-latest/nextplayer-arm64-v8a.apk`（文件名固定，永远最新一次构建；versionName `0.19.0-personal.<run>`，versionCode `100000+run`）。
+**首次安装须知**：设备当前装的是官方 0.19.0（versionCode 75，上游签名 `7948de8a`），与我们的 key 不同 → **第一次必须先卸载官方版**，之后互相覆盖安装都无需卸载。
+
+**验证（三源）**：Android Build `38266006292` @cd8817bd success（Build Project / Run Local Tests / **Lint Checks** 三步都跑过）；Personal Build `38266020538` @cd8817bd success（Decode keystore → Build signed release → Publish rolling release 全过）；**产物级验真**：下载 arm64 APK（19,056,905B）→ aapt2 读出 `versionCode=100002 / versionName=0.19.0-personal.2 / package dev.anilbeesetti.nextplayer`，并自写 v2 签名块解析脚本提取证书，与本机 keystore `keytool -exportcert` 逐字节一致。
+
+**踩坑（可复用）**：①**GitHub Actions 表达式没有算术运算符**（`${{ 100000 + github.run_number }}` 直接让整个 workflow 解析失败 → 报出 event=push 的 0s failure run，与分支过滤无关）；版本号改在 `run:` 里用 shell 算。②本机经代理下载 GitHub release 资产常 `http=000`/exit 35（TLS 抖动），`curl --http1.1 --retry 5 --retry-all-errors` 或走 `api.github.com/repos/.../releases/assets/<id>` + `Accept: application/octet-stream` 更可靠。③未使用 import 的机械检查脚本会把 `setValue`（`var x by state` 语法糖）误判为未使用——语法糖依赖不能按字面出现次数判死。
+
+**用户待定项**：§86（「更多」页是否彻底删掉）已登记 backlog，触发条件 = 用户装上手后反馈。
+
+<!-- 2026-10-12 23:10:17 -->
+## RikkaMinis 优化空间审计（10-12，用户令「分析应用还有哪些优化空间」）
+
+
+**报告**：`/var/minis/shared/work/app-opt-audit-1012/REPORT.md`（全证据链，未改产品代码）。
+
+**发现（按等级）**：
+- **P1 — debug 日志轮转实质失效**（本轮最有价值发现）：`DEBUG_MAX_BYTES=5MB` 设计上限，实际单文件涨到 **202MB** 才首次轮转。根因链：`debugBytesWritten` 计数器是进程内状态（AppLogger.kt:490-505 打开 writer 归零），但文件按同名跨进程共享（LogFileName.kt:20-40），worker 是短命进程（今日 ~720 distinct PID），单进程写满 5MB 前已死 → 轮转几乎不触发。`.1` 产物分钟级被覆盖（211MB 证据存续 ~7 分钟）。修复：计数器初始化为 `file.length()`（1行）+ roll 命名带时间戳防覆盖（~20行）。
+- **P2 — 日志行撕裂**：行首锚定口径今日 main 26 条 / worker 78 条，形态=半行+新进程首行粘连（78/78 第二段是 session-start），尾部字节真丢（`sinceH` 截断）。根因：多进程共享文件 + 8KB 缓冲边界 + SIGKILL。修复建议：启动时 tail-heal 补 `\n`。
+- **P2 — 内部 WARN 不可达文件**：`Log.w("AppLogger", "size prune deferred")`（AppLogger.kt:740）被自家 tailer 过滤（:237 过滤 tag==AppLogger）→ 设计承诺「never silently wrong」落空，实测 0 次。修复：改走自身 warning 通道。
+- **P2 — ToolInputDelta 日志放大**：`→ ToolInputDelta accumulated=NNchars`（OpenAIProvider.kt:1298）每 fragment 一行，今日 25.1 万行/33.5MB = worker 主日志 74%+。建议降采样（每 N fragment 或每 ~1KB）。
+- **P3 观察**：① firstItem.compose 的 elapsedMs 是间隔口径非耗时、受挂起污染（max 18min 是冻结窗口）；② 系统提示 ~92.6K chars，记忆注入 ≈61K（GLOBAL 16.9K 无 cap，唯 rollup 有 12KB 上限）；③ 空回合 reasoning-only 1-2 次/天（19:52 一例）；④ notification 子命令 3 条 INVALID_ARGS。
+
+**健康面**：压缩 0 真实 EXHAUSTED；ERROR 锚定 0；pin v0 + rescue 均已在 main（GitHub compare API 核验——浅克隆的 `merge-base --is-ancestor` 不可靠，会假报 NOT in main）；CI 全绿。
+
+**方法增量**：① 日志统计必须行首锚定+排除工具回显，否则回显会把计数放大千倍（同文件 grep 口径 53K vs python 行首锚定 26）；② 现场蹲守能目击轮转触发（22:25 首次、22:32 覆盖）；③ git 浅克隆下 verify 用 compare API，且本地 clone 的 branch -a 缺远端 refs。
+
+<!-- 2026-10-12 23:58:00 -->
+## NextPlayer 定制二轮交付：首页胶囊 + Debug 字样 + 体积之谜（2026-10-12，用户 A+B 拍板后全落地）
+
+
+- **首页胶囊**：`MediaPickerScreen.kt` topBar 槽内 `NextTopAppBar(...)` 之后并列加 `TopLevelPageChipsRow()`（Scaffold 内部就是 Column，两个 composable 直接并列，无需包裹重排缩进）——只在 `folderName == null && !selectionManager.isInSelectionMode`（首页非多选）显示；4 个 FilterChip（主页选中/播放列表/网络/更多），点按经 `LocalTopLevelPageSwitcher` 切页；设置页那组页面行已 `git checkout main --` 回滚。
+- **坑（复发）**：file_edit 尾部锚点 `preferences = ApplicationPreferences()` 出现 2 处命中（有多个 @Preview）——锚点要带完整函数体（MediaPickerLoadingPreview 全文）才唯一。
+- **Debug 字样根因**：`core/ui/src/debug/res/values/strings.xml` 的 app_name = "Next Player Debug"，改成 "Next Player"（源码已改，下次测试包生效；release 应用名本来就是干净的）。
+- **40MB 之谜（已解）**：用户装的 40MB = 「Android Build」测试工作流的 debug 包（arm64-debug zip 38.7MB，无 R8/资源收缩）；我们的 release 包 minify+shrinkResources 全开，arm64 仅 19MB（比官方 ~20MB 还小）；universal 54MB 是全架构合集。结论：体积问题只存在于 debug 包，装 release 即解决。
+- **交付物验真**：Personal Build run 38270017657 @ ebd4cf74 success → release `personal-latest` 刷成 **0.19.0-personal.4**（versionCode 100004），下载 arm64 APK 用 apk_v2_cert.py 验签，证书 SHA-256 = 1028178673d5b61e…8793c 与本机私钥逐字节一致。
+- **顺手修**：personal-build.yaml 的 `gh release create` 加 `--target "$GITHUB_SHA"`（rolling release 的 tag 原先指向 main 而非构建 commit，不可追溯），commit b450ea36 已推。
+- **流程坑**：TLS 抖动（unexpected eof）连挂 4 次 push —— curl 探测通后直接重试 gh_sync.sh push 成功，无需换配置；并发 dispatch 旧 run 被 cancel-in-progress 自动取消，无需手动干预。
+- 分支 `feat/minimal-home-1012` @ b450ea36，PR #1 开着；旧 debug 包（`dev.anilbeesetti.nextplayer.debug`）用户需卸载后装 release 包（包名不同不覆盖）。
+
+## 2026-10-13
+
+<!-- 2026-10-13 00:22:34 -->
+## NextPlayer fork（alarmedvine/nextplayer）运维要点
+
+<!-- 2026-10-13 -->
+- **push token**：`GITHUB_TOKEN`（主号）和 `GITHUB_TOKEN_FULL_RIGHT`（***ALT_USER***）都**无 push 权**，必须用 `GITHUB_TOKEN="$GITHUB_TOKEN_FULL_RIGHT_1"` 走 gh_sync.sh askpass。
+- **release 资产口径（2026-10-13 用户拍板）**：`personal-latest` 只留 `nextplayer-arm64-v8a.apk`，其余（arm32/universal/x86/x86_64）删掉。注意：**personal-build.yaml 仍会上传全部 5 个资产**，每次构建后需重删，除非改 workflow 的 upload 步骤。
+- **Compose 坑（复发预防）**：Scaffold 的 `topBar` 槽**不是 Column**——槽里并列多个 composable 会被全部 `place(0,0)` 叠放。并列内容（如顶栏+胶囊行）必须显式包 `Column`。实例：topBar 槽里 NextTopAppBar 后并列 TopLevelPageChipsRow()，胶囊直接盖在顶栏上（用户报"胶囊跑到顶部去了"），修复 = 包 Column（分支 feat/minimal-home-1012 @ 70666ff6）。
+- 本地克隆：`/var/minis/shared/work/nextplayer-1012/nextplayer`（分支 feat/minimal-home-1012）。
+
+<!-- 2026-10-13 00:38:36 -->
+## 更新：personal-build.yaml 已改为只 rename/upload/publish nextplayer
+
+<!-- 2026-10-13 更新 -->
+**更新**：personal-build.yaml 已改为只 rename/upload/publish `nextplayer-arm64-v8a.apk`（其余 ABI 构建后 `rm -f` 丢弃；gradle splits 未动——编译耗时占大头，ABI 拆分只省打包分钟级，不值得加验证面）。验证：#6 Personal Build success @ 5c991cb7（== 本地 HEAD），release personal-latest 只剩 arm64 一个资产（0.19.0-personal.6）。此前"每次构建后需重删"的口径作废。
+
+<!-- 2026-10-13 00:42:30 -->
+## 分支核查+合并：feat/minimal-home-1012 进 main（用户令「有问题就修，没问题就合并」）
+
+
+- **审查结论：无可疑行，未发现 bug/次生问题。** diff 741 行全读（head 400 行 + sed 尾段，file_read 上限截断后补读过），核查项全过：
+  - `TopLevelDestination.fabKey` 存在（TopLevelNavigation.kt:90，`String? = null`）→ MainActivity 的 page switcher 映射合法；
+  - `NextNavigationBar` 签名删了 `state`/`showFabOnly` 两参 → 全仓仅 MainActivity 一个调用点（named args 已同步更新）；
+  - 胶囊行用的 4 个字符串资源（home/playlists/network/more）在 core/ui strings.xml 各 1 处命中；
+  - 冲突标记 0；personal-build.yaml 的 Publish 无 main 门控属刻意设计（on:push 仅 main，workflow_dispatch 选分支构建是个人 fork 用法，P3 不动）。
+- **验证（三源取二）**：CI = Android Build run 38277113364 + Personal Build 38277117229，均 success @ 5c991cb7（== 本地 HEAD 逐字符），前者 Build Project / Run Local Tests / Lint Checks 三步全跑；独立证据 = 符号/资源实值核对（fabKey、调用点、字符串资源，非 CI 推导）。
+- **合并**：`--no-ff` → main **`b55f1bee`**（合并树 vs 分支 tip 0 行、冲突 0）→ push 核验远端==本地 → 分支远端 DELETE 204 + 本地已删 → fetch --prune 清 stale ref，远端只剩 main。
+- main push 自动触发 Personal Build 38279210434 + Android Build 38279210565（均 in_progress）——分支同内容 run 已绿 + head_sha 一致，未等（先例 10-12 PR #10/#11）；Personal Build 会把 personal-latest 刷成 merge commit 的新 release。
+- **流程坑（复发预防）**：file_read 读 741 行 diff 被字符上限截断（34K 文件 max_length 30K 只回了前 400 行且报"共 741 行"易误读成已读完）——读 diff 落盘文件时先算好字节数再分段，或直接 sed 行号读法。
+
+<!-- 2026-10-13 00:43:57 -->
+## PR #12 审查：log-rotation 分支发现 2 个真实缺陷并修复 → 合并 main ad4a4beb（2026-10-13）
+
+
+**任务**：用户令「检查刚刚还没合并的那个修改，有问题就修，没问题就合并」→ 分支 `fix/log-rotation-seams-1012`（5 commits，日志子系统：debug 轮转计数器 seed from file.length + roll 索引化命名 + 撕裂尾部 heal + 内部 WARN 可达 + ToolInputDelta 采样）。
+
+**发现（2 个，都在本次新增的 eviction 代码里）**——`rotateDebugFile` 的清理段：
+1. **字符串排序删错端**：`(1..highest).mapNotNull{...}.sortedBy { it.name }` 按**文件名**排序，`".10.log" < ".7.log"`。10-12 实测 debug 文件 200MB/天 → 修复后每 5MB 轮转 ≈ **40 次/天** → 索引 >9 必然触发：删掉的是 10,11,12（含刚写的新 roll），保留 7,8,9。
+2. **off-by-one**：`excess = rolls.size - DEBUG_MAX_ROLLS` 忽略了本次刚创建的 roll（不在 `1..highest` 枚举里）→ 稳态保留 4 个而非 3 个。
+   - 探针证据（Python 复刻）：旧逻辑 roll#11 起 kept=[7,8,9,11]（删错）；新逻辑恒为 [N-2,N-1,N] ✓。
+   - 关键：这两个缺陷**修复前不会触发**（旧代码只轮转 1 次，索引恒为 1）——是本次修复引入的次生问题。
+
+**修复**：抽纯函数 `rollEvictionIndices(existing, maxRolls, pendingNew=1)` 到 LogFileName.kt（数值排序 + 计入新 roll），AppLogger 改用它；DebugRollNamingTest 加 4 用例。
+
+**验证**：本地 JVM **16/16 绿**（原 12 + 新 4）；**变异负控双向钉住**——变异 C（改回字符串排序）2 红、变异 D（拆 off-by-one）3 红；CI **38277159013 success @ 4276747e**（step 15 单测全绿，head_sha 逐字符一致）。
+
+**顺带核验（无问题，未改）**：①ToolInputDelta 采样完备——3 条路径（Anthropic / OpenAI chat / OpenAI Responses）都改了，`send()` 未被采样（功能行为不变），VM 侧那行早已被 `BuildConfig.DEBUG` 门控；②`healTornTail` 追加而非截断 ✓；③WARN 路由无残留（全仓 0 处 `Log.*("AppLogger"`）；④`pruneOldLogs` 移到 `startCapture()` 之后正确——`log()` 只在 writeQueue 非空时 enqueue，且 tailer 过滤 `tag.startsWith("Minis.")` 防重复（新 tag = "Minis.AppLogger" 被过滤 ✓，旧 tag = "AppLogger" 也被过滤 = 原 bug 根因）。
+
+**合并**：`ad4a4beb`（--no-ff，双父 8637ea61 + 4276747e），合并树 vs 分支树 **0 差异**，6 文件 +441/-16；push 后远端 == 本地；分支本地+远端已删，远端只剩 main；**PR #12 自动识别 merged=True**。
+
+**登记**：backlog §87（P3 顺带观察：`debugRollFileName` shift 分支生产不可达；`TOOL_LOG_INPUT_STEP_CHARS` 在两个 provider 重复定义）。scan_debt 77 段 / 0 缺触发条件。
+
+**方法增量**：①审查别人的分支时，**先跑一遍本地 JVM 复刻 + 变异负控**，再读代码——变异体是发现"测试没钉住什么"的最快途径；②对新增的清理/淘汰逻辑，**写 Python 复刻探针跑多轮**比读代码更快暴露排序/边界错误（本次一眼看不出 `sortedBy { it.name }` 的问题，跑到 roll#11 立刻现形）。
+
+<!-- 2026-10-13 01:15:38 -->
+## NextPlayer §86 拍板：「更多」页保留现状
+
+
+用户确认 backlog §86 闭环：「更多」页（播放记录/打开文件/回收站）保留，仅从设置页进入，不占底部；不执行删除 `TopLevelDestination.MORE` 的预案。NextPlayer 定制无遗留待办。
+
+<!-- 2026-10-13 01:26:33 -->
+## RikkaMinis main @ad4a4beb 独立复验（2026-10-13，用户要求）
+
+
+- 三源核对：远端 main = ad4a4be = CI run 38279260922 head_sha，conclusion success，无假绿。
+- 本地真实跑（非转述）：克隆 ad4a4be，kotlinc 2.1.0 + JUnit 编译运行 5 个测试类 94 例全绿（DebugRollNaming 12 / TailHeal 4 / MdParserBlockStructure 58 / NumberedList 12 / KatexCaptureLimit 8）。
+- 变异负控：rollEvictionIndices 的 `sorted()` → `sortedDescending()`，3 例精确变红，测试真钉住修复。已 git checkout 恢复，工作树干净。
+- 沙箱环境套路（下次直接用）：PR #12 的 JVM 测试需两个本地 stub——android.util.Log（d/w/e）+ com.rikkaminis.app.BuildConfig.DEBUG；运行 classpath 必须带 /tmp/kotlinc/lib/kotlin-stdlib.jar（漏了会 91/94 ClassLoader 假红）。stub 放 /tmp/rm-stub/，不进仓库。
+- 结论：这两天两个 PR（#11 T5 差分探针、#12 轮转修复）落库版本可复现、无次生问题。
+
+<!-- 2026-10-13 08:59:32 -->
+## sweep-1013 三域并行派发（2026-10-13 上午）
+
+
+用户令「动手，用会话子代理，三个一起」（并纠正：要的是**会话子代理** = `minis-sessions-cli send`，不是进程内 spawn_agent——08:37 上一轮误用 spawn_agent ×2 全败 `v0 was cancelled`，教训）。
+
+- 任务书：`/var/minis/shared/sweep-1013/tasks/{D1,D2,D3}.md`；任务板 `BOARD.md`；报告落点 `reports/D*.md`（基线 main @ ad4a4beb）。
+- D1 数据层安全完整性 `***UUID***`｜D2 安全面认证/SSRF `***UUID***`｜D3 UI/Compose 时序（本次新写任务书）`***UUID***`。
+- 派发即验证送达：45s 后回读 messages 三份指令全在（08:56 开跑），2 分钟后三会话 23 条消息均在读码。
+- 镜头设计：D1/D2 补 1008 没用过的安全镜头（1008 是结构模式：并发/生命周期/协议）；D3 补 Compose 运行时（snapshotFlow/effect key/焦点/手势），排重表已引 1008 的「已核对无问题」段。
+- 观测：喊「抓 D1/D2/D3」读会话或看 reports/；收口清单在 BOARD.md（行号抽检 ≥5/报告 + HIGH 全核）。
+
+<!-- 2026-10-13 09:32:26 -->
+## 胶囊消失诊断 + 修复 fix/cancel-stale-publish-1013（2026-10-13）
+
+
+**用户报告**：模型执行任务正在调用工具时发消息打断，有一定概率正在调用的工具胶囊消失。
+
+**根因（已实证修复合入）**：打断路径（`sendMessage` → `enqueuePrompt` + `cancelStream`）本身正确（翻转 CANCELLED、保留胶囊）。消失是竞态：`streamJob.cancel()` 是协作式且只杀引擎 job，三类 writer 活过取消在 cleanup 定稿行**之后**落地——①`onBlockUpdate` 每行 shell 输出排一个 `viewModelScope.launch(Dispatchers.Main){updateAssistantMessage(...,true,toolBlocks)}`（几百个/工具，不是 trailingJob、不被 clearAllStreamFlushStates 清）；②引擎已过挂起点的 withContext(Main) 发布；③节流 trailing job。每个都重新 mint `_streamingById` entry，`mergeStreamingOverlay` **整体替换**行 toolBlocks → 最后一写者赢，CANCELLED 胶囊输。最坏变体：打断落在 QueueInterrupt 窄窗 → `allToolBlocks.clear()` 后迟到的 lambda 发布**空列表** → 胶囊直接消失，且队列被 inject 消费 → epoch 永不 bump → 持续消失。单调守卫防不住：prev 从刚清空的 side-channel 读（null）放行，且不防块数收缩。
+
+**修复**：`publishStreamingDelta` 入口加 `StaleStreamPublishPolicy.shouldDrop`（行存在 ∧ 行非 streaming ∧ 无 entry → 丢弃，warn 一次/id 上限 32）——同一消息 id 只被一个活 turn 流式写入、新 turn 恒新 id（addAssistantPlaceholder），所以对已定稿行的 isStreaming=true 发布按构造是 stale。分支 `fix/cancel-stale-publish-1013` @ `00fe3f9c`（1 commit，+307 行：策略 93 + 测试 160 + 接线），JVM 8/8 绿 + 变异负控双向（拆守卫 3 红 / 过度丢弃 2 红）+ scan 21/21 + CI run 38330774879 success head_sha 逐字符一致。**停在分支未合并**（.kt 有验证面，等用户）。
+
+**强佐证（写修法前查到的）**：同族竞态仓库已局部补丁 3 处（finalizeAtTurnLimit / finalizeBudgetStop / injectQueuedPromptsAsNewTurn 各自防御性 re-evict）——「同族复发 ≥2 次修共享层」的直接兑现，打断路径是第 4 处且无补丁。
+
+**流程坑（新）**：`workflow_dispatch` 被 tool 中断重发 = 两个 run（7s 间隔，同 commit）。**该 workflow 的 concurrency group `build-apk-<ref>` 是 cancel-in-progress**——新 run 入队即取消 in-progress 的那个，但状态显示滞后；基于滞后状态取消「排队的重复」会把**两个全灭**（#1983+#1984 全 cancelled）。正确顺序：先取消**新入队的**重复（旧的可能已被并发组取消），再核对只剩一个 in_progress；或全灭后直接重新 dispatch（本次：#1985 一次成功）。查 run 状态必须在 cancel 前用 API 实时查，不能信 1 分钟前的读数。
+
+**审查旁路登记**：backlog §88（打断落在 QueueInterrupt 窄窗 → 打断消息被 inject 消费后引擎死亡 → 消息永不执行；触发条件=日志出现 QueueInterrupt 后跟 cancel）。
+
+<!-- 2026-10-13 09:45:20 -->
+## 分支核查+合并：fix/cancel-stale-publish-1013 进 main（2026-10-13，用户令「检查…没问题就合并」）
+
+
+**机械项**（verify_branch.sh，exit 0，核对时刻 2026-10-13T01:42:39Z）：工作树 clean、branch_tip=worktree_HEAD=00fe3f9c、scan **21 passed, 0 failed**、scan_debt 1 标记/0 no-trigger、i18n AUTO-SKIP（diff 不含 strings.xml）、CI **run 38330774879 completed/success head_sha=00fe3f9ce6de**（build-apk.yml，workflow+sha+结论四项全中；另两个 cancelled run 38330652270/38330642183 是并发 dispatch 被并发组取消的重复，同 sha 无害）。
+
+**判断项**：
+- 项1 diff 逐行：348 行整份读完，**无可疑行**——4 文件 +307：策略 93（StaleStreamPublishPolicy 纯函数，fail-open 安全阀注释齐全）+ 测试 160（8 例含 200 行序列回放）+ 接线（publishStreamingDelta 入口守卫 + noteStaleStreamPublish warn-once/id 上限 32）。
+- 项2 调用点：publishStreamingDelta 全仓 2 处调用（ChatPromptAndTools:882 tick 闭包 / :1045 ON_RESUME flush）都走新门；noteStaleStreamPublish 仅新门调用；TAG_STREAM 在 ChatViewModel:306 有自己声明（AgentLoopEngine 那个是 private companion，不冲突）；_streamingById:555；AppLogger.warning(category,message) 签名匹配。
+- 项7 独立证据（沙箱独立 JVM 实跑，独立于 CI）：修复树 **OK (8 tests)**；变异 A 拆守卫 → 3 红（finalized-row/shouldDrop/interrupt 序列）；变异 B 过度丢弃 → 2 红（live-row/shouldDrop）——双向钉住，与开发会话报告一致。装置 `/var/minis/shared/work/verify-stale-1013/jvm/`。
+- 项7b 接线证据：行为级——拆守卫后 interrupt 序列断言（"no late writer may re-mint the overlay entry"）当场红 = 改动前 200 条迟到发布全被放行、改动后全被丢，观测值变化可见。
+
+**合并**：--no-ff → main **`7264eb5c`**（合并树 vs 分支 tip **0 差异**，冲突标记 0）→ push 核验远端==本地 → 分支远端 DELETE 204 + 本地已删，远端只剩 main。main push 自动触发 build-apk（.kt 有验证面）——分支同内容 run 已绿 + 合并树逐字节一致，未等（先例 10-11「触发了就不用等」）。
+
+**遗留**：backlog §88（QueueInterrupt 窄窗变体：打断消息被 inject 消费后引擎死亡 → 消息永不执行）仍登记未修，触发条件=日志出现 QueueInterrupt 后跟 cancel。
+
+<!-- 2026-10-13 12:58:38 -->
+## 用户偏好：「子代理」默认指会话子代理（2026-10-13，用户明确）
+
+
+用户明确：说「子代理 / sub-agent」时**默认指会话子代理** = `minis-sessions-cli send`（跨会话派发 headless 会话），**不是**进程内 `spawn_agent`。
+- 派发任务一律走 `minis-sessions-cli send --prompt "读这个文件并立刻执行：<任务书路径>" --async`，从返回值取 session_id（不要为取 id 重调 send）。
+- 派发后回读 `minis-sessions-cli messages --id <sid>` 验证指令送达（防 §76 send 竞态）。
+- 反例（本会话 08:37 教训）：误用 spawn_agent ×2 全败 `v0 was cancelled`，浪费一轮。
+
+<!-- 2026-10-13 13:12:30 -->
+## sweep-1013 收口：第二道门核实 + 三修复会话派发（2026-10-13）
+
+
+**输入**：三域审计报告齐（D1 数据层 10 条 / D2 安全面 11 条 / D3 UI 10 条，共 31 条），报告基线 main @ `ad4a4beb`。
+
+**核实（第二道门）**：抽检 20+ 处行号逐一机械核对，**0 不符**。关键实锤：
+- D2-F2 沙箱写路径无守卫（`File(base, rest)`）——用 python 模拟证实 `../../../debug_server_token` 解析到 `/data/data/com.rikkaminis.app/files/debug_server_token`（越界）。
+- 报告基线 vs 当前 main：本地 clone 已前进到 `7264eb5c`（今日 09:44 合并 `fix/cancel-stale-publish-1013`，仅动 ui/chat 4 文件）→ 不影响三域所引行号。
+
+**P 级判定（TRIAGE.md）**：31 条 = **P0 2 / P1 11 / P2 18**。
+- P0：D2-F2 沙箱写越界、D2-F3 读路径兜底越界（安全边界）。
+- P1：D1 五项（REPLACE+CASCADE / MCP 导出门控 / 自动备份去密钥 / SOUL 排除 / frontmatter 往返）、D2 两项（debug token / body 上限）、D3 四项（思考块跟随 / onBack×5 / 回弹符号 / 音频轮询 key）。
+- P2 18 条 → **backlog §89**（每条带触发条件）。
+
+**派发（用户令「用子代理把他们安排出去」）**：三个**新会话**（原审计会话只读且上下文已很大）：
+- FIX-D1 `***UUID***`（分支 fix/sweep1013-data）
+- FIX-D2 `***UUID***`（分支 fix/sweep1013-security）
+- FIX-D3 `***UUID***`（分支 fix/sweep1013-ui）
+任务书 `sweep-1013/fix-tasks/FIX-D{1,2,3}.md`；派发后 100s 回读 messages **三份全部送达**（D1 已在改 AutoBackupManager）。
+
+**沙箱/流程坑**：
+- `gh_sync.sh clone` 要求 **cwd 在 git 仓库内**（`repo_root()` 先跑）——不在仓库里直接跑会走偏，需从共享工作树目录内执行 + `--dir` 给绝对路径。
+- RikkaMinis 是**公开仓库**（未认证 API 200）→ clone 无需凭据；push 才走 `GITHUB_TOKEN` askpass。
+- 磁盘 `/var/minis` 所在分区 90% 用（剩 51G），三个全量 clone 需留意。
+
+<!-- 2026-10-13 13:32:56 -->
+## 4 项全修（R1/R2/R3/R4），无已消失项；P2 一律未修。
+
+- 4 项全修（R1/R2/R3/R4），无已消失项；P2 一律未修。
+- 分支 `fix/sweep1013-ui` @ `95f39dfa`（1 commit，7 文件 +56/−12），基线 main `7264eb5c`。
+- CI：build-apk run **38350283232 success** @ 95f39dfa（--expect 逐字符一致，curl API 实查）。**停在分支未合并**（.kt 有验证面）。
+- R1 修法 = StreamingMarkdownText f255 同构（rememberUpdatedState → snapshotFlow 读 .value）；R2 = 5 处组合期 onBack 包 LaunchedEffect（模板 ModelEntryDetailScreen:56），改后 grep 剩余 4 处全是回调内合法点；R3 = 回弹公式 `(-curOffset).coerceAtMost(...)` → `sign(delta.y) * min(abs(delta.y), abs(curOffset))`（底边情形恒等、顶边情形 2×curOffset→正确回拉）；R4 = `LaunchedEffect(isPlaying, player)` + isPlaying 探针包 try（T2-L1 同构）。
+- 验证：括号配平（2 处不配平经 git show HEAD 对照为基线既有字符串/注释字面，非本次引入）+ kotlinc 语法级编译 7 文件 0 结构错误 + grep 全量复核。
+- 报告：`/var/minis/shared/sweep-1013/reports/FIX-D3.md`；工作树 `/var/minis/shared/work/sweep1013-fix/d3`。
+- 流程坑：`gh_sync.sh clone` 静默 exit=128 无输出（git stderr 未透出），裸 git clone 秒过；`gh_ci_wait.sh` 遇 TLS UNEXPECTED_EOF（代理抖动老坑），改 curl --http1.1 --retry + head_sha 过滤查询一次成功。kotlinc 在 /opt/kotlinc（非 /tmp）。
+
+<!-- 2026-10-13 14:02:46 -->
+## sweep-1013 修复收口：三支合并 main 9f4f5766（2026-10-13）
+
+
+**用户令**：「好了，他们都完成了，你这里继续吧。」→ 读作收口授权（核实 + 合并）。
+
+**三支 → main `9f4f5766`**（三次 `--no-ff`，父链 7264eb5c → `22308ad2` data → `f63423ec` security → `9f4f5766` ui）：
+- `fix/sweep1013-data` `802be26d` CI 38350722983 success，5 文件 +149/−10
+- `fix/sweep1013-security` `23195e1b` CI 38352132542 success，5 文件 +244/−18（新测试 153 行）
+- `fix/sweep1013-ui` `95f39dfa` CI 38350283232 success，7 文件 +56/−12
+
+**合并前核查三项（全过）**：①检查 = 三份 diff 773 行逐行读完，无夹带/调试残留，冲突标记 0，注释全带 `[sweep1013-D*]` 溯源标记；②验证 = 三支 CI head_sha 与远端 HEAD 逐字符一致 + 每次 merge 的 `git diff HEAD^1 HEAD` 与该支 diff 完全吻合；③核实 = D2 引用的 `PRootKernel.safeResolveWithin`（PRootKernel.kt:745）确认是真守卫（`normalizeDotSegments` + `canonicalPath` 前缀比对，越界 null），测试攻击样本用报告原始路径、期望值全字面量（反自指）。
+
+**收尾**：push main `7264eb5c..9f4f5766`；三分支远端 DELETE 204；远端只剩 main。
+
+**新认识（重要，可复用）**：**多支合并时「分支 CI 绿 = 覆盖合并树」的推理失效**——单支 CI 只覆盖该支树，三支合并后的**并集树**没有任何单支 CI 跑过。所以 main 自动触发的 build-apk **不是重复读数**，必须等（与单支合并的先例 10-12 PR #10/#11 不同）。
+
+**产品口径变更（D1-R3，已随分支进 main，需用户知悉）**：自动备份 `includeSecrets` 由 true 改 false —— 无人值守推 WebDAV 不再带明文密钥，恢复时需重填 providers/envVars/MCP。若要保留密钥型自动备份须另立显式 opt-in 设置项。
+
+**工具坑**：`four_way_sync_check.py` 配置指向上游 openminis 包路径（`com.openminis.app`），对本 fork（`com.rikkaminis.app`）不适用——不是改动问题，别误判。
+
+<!-- 2026-10-13 14:17:02 -->
+## 两天改动审查（10-12 / 10-13，用户令「检查一下这两天进行的修改吧」）
+
+
+**窗口**：main `206e71105`（10-12 早）→ `9f4f57666`，**34 文件 +2722/−198**（11 开发提交 + 9 合并单元）。
+**报告**：`/var/minis/shared/work/review-1012-13/REPORT.md`；diff 三件套 `net.diff`/`prod.diff`/`test.diff`；装置 `jvm/`。
+
+**结论：无 P0/P1。** 1 条实质认识缺口 + 3 条 P2 + 7 项测试盲区。
+
+**★ 最有价值的发现（可复用认识）—— `four_way_sync_check.py` v2 的覆盖度与宣称不符**：
+真实树实跑 `Coverage: derived 10 entities · checked 4 · unresolved 6`（同屏打 `ALL CLEAN ✅`，exit 0）。
+- 净增只 2 个家族（ModelEntry / ThinkingRule）；v1 的 2 个 + v2 的 2 个 = 4 个被检查。
+- **`ChatSessionEntity` / `MessageEntity`（聊天核心表）仍零覆盖**（无同名 domain data class → UNRESOLVED 静默放行）。
+- 第二重缺口：`collect_ctor_sites` 取**全部构造点 named-args 并集**，故"某一条写入路径漏字段"（v1 真正在防的那类）在 v2 **永远绿**；实测多构造点实体：ChatSessionEntity 2 / MessageEntity 3 / ProviderThinkingRuleEntity 2 / ProviderConfigMetaEntity 5。
+- 教训：**扫描器改版要跑真实树看 checked/unresolved 比例，别只信 fixture 自测**（自测 93 例全绿同时覆盖只有 4/10）。
+
+**独立证据（不靠 CI）**：①think-tag 影子 harness —— 真实源码 17 测试绿 / 拆 `[state-carry]` 变异 6 红（钉住修复点）；②IosBounce 回弹公式数值对照 —— 底边 old==new（零回归）、顶边 old `+100→+200`（放大）vs new `→+70`（正确）；③`safeResolveWithin(base,"")` → `return base`（R1 守卫改造无回归）；④`test_scan.py` 93 例实跑过（CI 两 workflow 都接线）；⑤main CI run 38353999850 @9f4f57666 success（三支并集树，非重复读数）。
+
+**P2 登记（未动手）**：D-2 `TOOL_LOG_INPUT_STEP_CHARS=2048` 在 OpenAI/Anthropic 各定义一份（同语义复制，会漂移）；D-3 `stripMcpSecretValues` 只覆盖 headers/env，`args` 里的 token 不在范围；D-4 自动备份去密钥后恢复侧无提示；D-5 think-tag 防御分支失去"自愈"（原硬编码 false/null 会强制重置坏状态）。
+**测试盲区**：IosBounce（无任何测试）/ DebugServer 413 / ChatDao ABORT / SpeechOffload+ModelUse 的 fail-closed / includeSecrets=false / Compose 三处（可接受）。
+
+**次生问题核查亮点**：`REPLACE→ABORT` 的两个生产调用点都有存在性守卫（ConfigBackup `getSession==null` + try/catch 归 skipped；ChatRepository fresh UUID）→ 无新增崩溃路径；导出/导入字段集逐字段对称（chatMessages 7↔7）；skill `frontmatter` 键两侧同名且拼回语义与 `SkillRepository.frontmatter`（含 `---` 原文块）一致。
+
+<!-- 2026-10-13 16:08:15 -->
+## 债务清理批次（fix/debt-cleanup-1013，PR #13，6 commits @08f818f3c）
+
+
+**范围**：审查自报 4 条（D-1/D-2/D-3/D-4）+ backlog §89 择条 4 条（F-2/F-5/F-9/F-10），CI：scan-gate 38367123483 + build-apk 38367140843（dispatch）。
+
+**提交**：4a92e67c9 扫描器v2.1（实体自家族 10/10+DAO钉+位置参数，三臂负控）/ 9e3f5dc45 F-9空集崩溃+D-2共享常量 / 555cbf889 api-key脱敏+**F-6误报结案** / 76a9a565d **FK纠正**（见下）/ 88a4e6b01 D-3 MCP args/url凭据 / 08f818f3c D-4七语言恢复提示。
+
+**★ 可复用经验 1——Room FK 判据（推翻两次修正）**：room-**runtime** jar 永远干净（FK 代码在 room-**compiler** 生成的 `_Impl.onOpen` 里）。判据：javap `DatabaseProcessor.doProcess`（任一实体 `foreignKeys` 非空 → `enableForeignKeys=true`）+ `SQLiteOpenHelperWriter`（`if(enableForeignKeys) execSQL("PRAGMA foreign_keys = ON")` 模板）。本仓 MessageEntity 带 CASCADE → **FK 开**。dev-history:6296 已留二次修正块。教训：核 Room 行为必须看 compiler 生成模板，"runtime 里搜不到 PRAGMA"不构成证据。
+
+**★ 可复用经验 2——变异负控纪律**：先 commit 本体，再做变异，恢复用 `git checkout -- <变异路径>` 且**绝不能把未提交的本体改动和变异混在同一文件**（第一版 v2.1 因此整个丢过，从 stash/reflog 救不回，靠笔记重写）。正则 `matches()` 是全串匹配——`^--token=\S` 之类部分锚定写法会静默不匹配，负控先红再修才是正常节奏。
+
+**★ 可复用经验 3——沙箱环境伪影**：PRoot link2symlink 对每次 hardlink 生成 `.l2s.*` 哨兵文件（同 inode，~100B）→ `RootfsUsageScannerTest` 精确断言 4000 在沙箱得 4106。CI 绿 + 本地红 + 零代码交集 = 先怀疑环境。解法：断言加容差（4000..4200）并在注释写明 CI/沙箱两种取值。
+
+**流程事实**：RikkaMinis 的 CI 不自动跑分支——build-apk 只挂 main push + workflow_dispatch；scan-gate 只挂 PR。分支验证 = 开 PR（scan-gate 快检）+ 手动 dispatch build-apk。另：local.properties（sdk.dir）是本地文件，勿提交；`git log origin/main..HEAD` 是推送前核对分支内容的正确姿势。
+
+**待办**：CI 两 run 绿后合并 PR #13（等用户拍板）；D3-F5~F-10 与 D2-F7~F-11、D1-F4/F-5 维持登记。
+
+<!-- 2026-10-13 17:53:39 -->
+## PR #13（fix/debt-cleanup-1013）修复+合并收口（2026-10-13）
+
+
+**用户指令链**：「检查一下云端正在跑的那个分支」→ 审查发现 P1 → 「修吧，修好跑完之后就合并」→ 修复+CI 绿+合并，全部完成。
+
+- **G1（P1）已修**：`stripExportedMcpSecrets`（下钻 `mcpServers` 嵌套壳逐 entry strip + 扁平回退，与导入侧 fallback 对称）替换 ConfigBackup.kt 调用点；2 回归测试钉嵌套壳形状。commit `2a076041b`。
+- **G2（P3）已修**：`extract_defaulted_fields` 正则 `[^=]*`→`[^=\n]*`（跨行吞下一字段 `=` 的误判）；test_scan.py 补 `test_four_way_entity_self()` 2 fixture，全量 95 例绿。commit `205593339`。
+- **验证**：负控变异（`if (true)` 禁下钻 → 嵌套测试 FAILED / 扁平 PASSED，精确钉住）+ gradle 测试 + test_scan 95/95 + 真实树 four_way 10/10。
+- **CI**：build-apk 38376827061 + scan-gate 38376772094 双绿 @ `205593339`（scan-gate 随 PR 自动跑，build-apk 手动 dispatch）。
+- **合并**：--no-ff → main `a43c2b2c`（合并树 vs 分支 tip 空 = 逐字节一致）→ push 远端==本地 → 分支远端 DELETE + 本地删，PR #13 自动 merged。main push 自动触发 build-apk 未等（单支合并先例）。
+- **★ 可复用认识**：①「测试绿 ≠ 接线通」实锤案例——8 个单测全用扁平 entry 喂 stripMcpSecretValues，生产传的是 exportServerJSON 嵌套壳，F-3/D-3 两层"已修"全部 no-op；识别手段 = 用**真实编译产物反射对拍**两种调用形状（nested leaks=true / direct leaks=false）。②修 wrapper 型 API 的脱敏时，测试必须从**真实产出形状**（exportServerJSON 输出）出发，不能手造扁平 fixture。③backlog §90 已闭合；审查报告 `shared/work/review-debt-cleanup-1013/REPORT.md`。
 
 ---
 
