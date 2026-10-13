@@ -3,16 +3,16 @@
 > **这是档案的「主题视角」**。同一批条目，换一根轴来读：
 > - `rikkaminis-dev-history.md` — 时间轴（这天发生了什么）
 > - `rikkaminis-dev-history-INDEX.md` — 按天索引（快速跳转）
-> - **本文件** — 主题轴（这件事的完整历史，跨 69 天）
+> - **本文件** — 主题轴（这件事的完整历史，跨 72 天）
 >
 > 由 `skills/dev-history-sync/scripts/build_sagas.py` 从档案自动生成，可重复执行。
 
-- 覆盖范围：2026-08-03 ～ 2026-10-10，共 69 天
-- 条目总数：1605（源文件：rikkaminis-dev-history.md）
+- 覆盖范围：2026-08-03 ～ 2026-10-13，共 72 天
+- 条目总数：1663（源文件：rikkaminis-dev-history.md）
 - 主题数：24
-- 未归入任何主题：148 条（9%，列在文末）
-- 归入 ≥4 个主题（说明规则偏松）：88 条
-- 标 `↳` 的条目是**推断归属**：标题里没有主题词（「X 完成 / X 收尾」这类收尾条目，主题词在**上一条**里），由「12 小时内最近一条有主题的条目」继承而来，共 116 条。
+- 未归入任何主题：157 条（9%，列在文末）
+- 归入 ≥4 个主题（说明规则偏松）：89 条
+- 标 `↳` 的条目是**推断归属**：标题里没有主题词（「X 完成 / X 收尾」这类收尾条目，主题词在**上一条**里），由「12 小时内最近一条有主题的条目」继承而来，共 120 条。
 
 ### 怎么读
 
@@ -29,28 +29,28 @@
 |---|------|------|------|------|
 | 1 | 滚动跟随 / 流式跳动 | 73 | 08-05 ～ 09-28 | 观察中 |
 | 2 | 输入框 / 键盘 / 粘贴 | 29 | 08-04 ～ 09-27 | 已闭环 |
-| 3 | native 内存 / OOM / 崩溃 | 129 | 08-03 ～ 10-09 | 持续跟踪 |
-| 4 | 沙箱 / rootfs / PRoot / 终端 | 121 | 08-03 ～ 10-05 | 稳定 |
+| 3 | native 内存 / OOM / 崩溃 | 133 | 08-03 ～ 10-12 | 持续跟踪 |
+| 4 | 沙箱 / rootfs / PRoot / 终端 | 123 | 08-03 ～ 10-13 | 稳定 |
 | 5 | fastio offload / syscall 税 | 25 | 08-20 ～ 10-01 | 已合并 main |
-| 6 | 流式回答中断 / 恢复 / 取消 | 135 | 08-03 ～ 10-08 | 已闭环 |
+| 6 | 流式回答中断 / 恢复 / 取消 | 141 | 08-03 ～ 10-13 | 已闭环 |
 | 7 | 思考 / 推理泄漏 | 88 | 08-08 ～ 10-09 | 已闭环 |
-| 8 | 上下文压缩 / 记忆 / 预算 | 173 | 08-06 ～ 10-06 | 稳定 |
-| 9 | Provider / 模型组 / 负载均衡 | 121 | 08-04 ～ 10-06 | 已闭环 |
-| 10 | 备份 / 多端同步 | 121 | 08-03 ～ 10-09 | 收敛 |
-| 11 | 渲染性能 / Markdown / 长会话卡顿 | 114 | 08-05 ～ 10-07 | 已闭环 + 持续加固 |
-| 12 | 审计 / 整改（多轮） | 269 | 08-03 ～ 10-09 | 常态机制 |
-| 13 | 多会话并行协作 / 派发 / 交接 | 248 | 08-04 ～ 10-09 | 成熟 |
-| 14 | CI / 构建 / 发布流水线 | 269 | 08-03 ～ 10-10 | 稳定 |
-| 15 | 开发档案 / 记忆 / 工具链 | 139 | 08-03 ～ 10-09 | 常态维护 |
-| 16 | 会话 / 导航 / 抽屉交互 | 112 | 08-03 ～ 10-09 | 已闭环 |
+| 8 | 上下文压缩 / 记忆 / 预算 | 183 | 08-06 ～ 10-12 | 稳定 |
+| 9 | Provider / 模型组 / 负载均衡 | 123 | 08-04 ～ 10-12 | 已闭环 |
+| 10 | 备份 / 多端同步 | 126 | 08-03 ～ 10-13 | 收敛 |
+| 11 | 渲染性能 / Markdown / 长会话卡顿 | 118 | 08-05 ～ 10-12 | 已闭环 + 持续加固 |
+| 12 | 审计 / 整改（多轮） | 276 | 08-03 ～ 10-13 | 常态机制 |
+| 13 | 多会话并行协作 / 派发 / 交接 | 257 | 08-04 ～ 10-13 | 成熟 |
+| 14 | CI / 构建 / 发布流水线 | 283 | 08-03 ～ 10-13 | 稳定 |
+| 15 | 开发档案 / 记忆 / 工具链 | 143 | 08-03 ～ 10-12 | 常态维护 |
+| 16 | 会话 / 导航 / 抽屉交互 | 114 | 08-03 ～ 10-12 | 已闭环 |
 | 17 | 平台适配 / 通知 / 图标 / 权限 | 81 | 08-03 ～ 10-05 | 部分放弃 |
 | 18 | 国际化 / 文案 / 本地化 | 29 | 08-04 ～ 09-29 | 已闭环 |
-| 19 | 上游 / 生态吸收 / 开源 | 85 | 08-03 ～ 10-09 | 常态 |
-| 20 | UI 组件 / 设置页 / 交互微调 | 97 | 08-04 ～ 10-06 | 持续 |
-| 21 | Token 用量 / 成本统计 | 76 | 08-05 ～ 10-07 | 已闭环 |
-| 22 | 人格 / Soul / 提示词 / 技能体系 | 92 | 08-04 ～ 10-09 | 稳定 |
+| 19 | 上游 / 生态吸收 / 开源 | 87 | 08-03 ～ 10-13 | 常态 |
+| 20 | UI 组件 / 设置页 / 交互微调 | 99 | 08-04 ～ 10-12 | 持续 |
+| 21 | Token 用量 / 成本统计 | 78 | 08-05 ～ 10-11 | 已闭环 |
+| 22 | 人格 / Soul / 提示词 / 技能体系 | 100 | 08-04 ～ 10-13 | 稳定 |
 | 23 | 语音 / 多模态输入 | 25 | 08-03 ～ 10-09 | 低优先级维护 |
-| 24 | 被否掉的方向（决策记录） | 44 | 08-04 ～ 10-06 | 持续累积 |
+| 24 | 被否掉的方向（决策记录） | 47 | 08-04 ～ 10-12 | 持续累积 |
 
 ---
 
@@ -176,7 +176,7 @@
 
 ## 3. native 内存 / OOM / 崩溃
 
-**跨度** 2026-08-03 ～ 2026-10-09 · **129 条** · **状态** 持续跟踪（09-13 三件套已合并；SOFT 450 / HARD 1200 阈值待 1–2 周真实数据复核）
+**跨度** 2026-08-03 ～ 2026-10-12 · **133 条** · **状态** 持续跟踪（09-13 三件套已合并；SOFT 450 / HARD 1200 阈值待 1–2 周真实数据复核）
 
 **叙事**：08-09 Scudo OOM → 08-15 早三次 OOM → 08-17 native offload 泄漏实证 → 08-20~22 进程隔离五 Phase + 小号 TF-A..TF-J 十连修 → 08-25/26 「RSS 单调泄漏」被沙箱实测**推翻**（是 PRoot VSZ reserve 不是泄漏）→ 09-13 两次 SIGABRT / RSS 5.4–6.1GB，口径从 VmRSS 换 **RssAnon**（61% 信号是可回收页）+ 崩溃态取证 → 09-15 HangDetector 后台冻结假阳性。**这是全档案最长的 saga，也是唯一「调查被自己的实测推翻」的一条。**
 
@@ -311,10 +311,14 @@
 | 10-09 12:49 | 备份 OOM（512MB largeHeap 打满）根因与修复 — 2026-10-09 | 症状：真机报 写入失败: Failed to allocate a 4480 byte allocation … <1% of heap free after GC（target/growth limit 5368709… |
 | 10-09 13:23 | 分支审查完成：fix/backup-chat-eager-load-oom-1009（无次生问题，§79 登记） | 对象：fix/backup-chat-eager-load-oom-1009 @ 71f605e（远端仅此分支+main），2 commits（33c1c06 lazy 逐会话加载 → 71f605e 先过 metada… |
 | 10-09 13:32 | 备份 OOM 修复合并收口（2026-10-09） | 合并完成（用户放行「修好了，合并吧」）：三项核查齐（diff 3 文件逐行读无夹带、0 冲突标记；分支 CI 37884504189 head_sha 逐字符 = 71f605e；独立证据=影子 harness 三路对照… |
+| 10-12 20:25 | T5 派发：MarkdownParser 差分探针 + 重复派发事故（2026-10-12 晚） | 派发：MarkdownParser.kt（639 行纯 Kotlin object 零 import，String→List<Block>，宿主可测；已有覆盖仅 numbered list + KaTeX 上限）→ T5… |
+| 10-12 20:40 | T5 完成：MarkdownParser 差分探针（PR #11，CI 绿，停在分支未合并） | 分支 test/md-parser-probe-1012 @ 85f3535c（2 commits：910ff2b 修复 / 85f3535 测试 58 例），PR #11（base main ← 分支），CI run … |
+| 10-12 20:41 | ↳ PR 合并：test/md-parser-probe-1012 进 main（用户放行「没问题就合并」） | PR 合并：test/md-parser-probe-1012 进 main（用户放行「没问题就合并」） |
+| 10-12 20:42 | T5 收口：MarkdownParser 探针完成 + 2 个 P1 修复已合并（2026-10-12 晚） | 产出：64 条探针语料 + 58 例测试（MarkdownParserBlockStructureTest，468 行）+ 2 个 P1 缺陷修复（①heading 尾部 # 双向：## C# 内容被吃、## title… |
 
 ## 4. 沙箱 / rootfs / PRoot / 终端
 
-**跨度** 2026-08-03 ～ 2026-10-05 · **121 条** · **状态** 稳定（09-05 rootfs 事件日志 + apk 自动恢复已上线）
+**跨度** 2026-08-03 ～ 2026-10-13 · **123 条** · **状态** 稳定（09-05 rootfs 事件日志 + apk 自动恢复已上线）
 
 **叙事**：08-03 proot 源码构建（loader 必须独立打包）→ 08-09 终端死屏根治 + 反复开关 OOM → 08-13 PRoot 文件 IO 幽灵层 + apk 包持久化方案 3 + rootfs 占位 tar → 09-05 「沙箱重置、工具不见」三源取证（**不是重置，是 per-session 设计**）→ 09-13 apk 残留进程占锁误诊为「源慢」。**教训密度最高的一条**：沙箱里几乎每个「环境坏了」最后都归到「你误诊了现象」。
 
@@ -441,6 +445,8 @@
 | 09-30 23:59 | fastio 真机测试完成（09-30 深夜，装包=含 fastio 最新版） | 测试全绿（沙箱终端 agent 路径，PersistentShell）： |
 | 10-01 00:52 | fastio 第二期完成（10-01，分支 feat/fastio-primitives-2 @ d74a49c1，CI 绿未合并） | 停止节点已到：分支 feat/fastio-primitives-2，commits 57693ba6(主体) + d74a49c1(CI 修复)，远端 == 本地 == d74a49c1ca51 逐字符，工作树 cle… |
 | 10-05 09:42 | 任务书 D 执行完成：压缩遥测 + SUPERSEDED 条款（fix/compact-telemetry-superseded-1005，CI 进行中） | 状态：两个 commit 已推远端 + CI 已 dispatch（run 37252315441），独立会话执行任务书 D 全文。 |
+| 10-13 01:26 | RikkaMinis main @ad4a4beb 独立复验（2026-10-13，用户要求） | 三源核对：远端 main = ad4a4be = CI run 38279260922 head_sha，conclusion success，无假绿。 |
+| 10-13 16:08 | 债务清理批次（fix/debt-cleanup-1013，PR #13，6 commits @08f818f3c） | 范围：审查自报 4 条（D-1/D-2/D-3/D-4）+ backlog §89 择条 4 条（F-2/F-5/F-9/F-10），CI：scan-gate 38367123483 + build-apk 383671… |
 
 ## 5. fastio offload / syscall 税
 
@@ -478,7 +484,7 @@
 
 ## 6. 流式回答中断 / 恢复 / 取消
 
-**跨度** 2026-08-03 ～ 2026-10-08 · **135 条** · **状态** 已闭环（09-07 收口，含停止按钮竞态 + 多会话真并发真机验证）
+**跨度** 2026-08-03 ～ 2026-10-13 · **141 条** · **状态** 已闭环（09-07 收口，含停止按钮竞态 + 多会话真并发真机验证）
 
 **叙事**：08-18 「回答频繁断掉」诊断链（provider 层铁证健康）→ 08-24 首块超时 30000ms + retry 分类不对称 → 09-06 一天内连收四种形态：EOF 静默停、stream error 手动重试、content_filter→fallback、finish_reason=network_error 伪正常结束 → 09-07 预算墙第 4 形态 + provider-exec-concurrency。**「同一个用户现象 = 五种不同根因」的教科书案例**，每条都靠日志实证拆开。
 
@@ -619,6 +625,12 @@
 | 10-05 08:27 | 任务书 C 执行完成：压缩摘要截断守卫 + 吵闹候选 60s 预算（fix/compact-truncation-guard-1005，CI 绿停） | 状态：分支 CI 绿 @ tip，确定性停止节点已达成，未合并（合并权在用户）。 |
 | 10-08 19:23 | T-edit-resend-attachment-loss-1008（长按编辑重发丢附件） | 现象：用户带附件发消息 → 长按气泡「重新编辑」→ 改完重发 → 指令在、附件消失。 |
 | 10-08 23:57 | send 派发竞态诊断（D2 空历史，第 3 次撞上） | 根因（日志实锤）：minis-sessions-cli send 创建会话时，用户指令 append 到 DB 与 run 的历史加载并发——输者 runAgentLoop 以 historySize=0 启动（D2 实… |
+| 10-12 14:59 | 切模型后「等待中但按钮已停止」= switchModelAndRerun 的 claim 竞态（2026-10-12 真机实测定位） | 症状（用户报告）：发消息→provider 慢→切模型→界面仍显示等待/生成中，但底部按钮已回到「发送」（停止态）→用户再点重试。 |
+| 10-12 15:26 | 修复「切模型后流式状态被抹」竞态 → 分支 fix/streaming-claim-race-1012 @ 41f024e7（CI #1970 success） | 根因（真机日志 + 代码双证）：_isStreaming 清除权归属不清。旧 job 的 finally 用「streamJob === 自己 + jobEpoch == streamingClaimEpoch」双门判断… |
+| 10-12 15:36 | 云端分支核查+合并：fix/streaming-claim-race-1012（2026-10-12，用户令「没问题就直接合并」「触发了就不用等」） | 分支 fix/streaming-claim-race-1012 @ 41f024e7（父=main tip f9c374ca，5 文件 +180/−91，全在 ui/chat：ChatModelRouting / Ch… |
+| 10-12 20:02 | 「回答中途突然停止」排查结论（2026-10-12 晚，用户报其他会话） | 今天日志共 11–12 次真实中途取消（runAgentLoop CANCELLED → streamJob killed），全部是 cancelStream() 主动取消，0 崩溃/0 错误/0 OOM（今天 erro… |
+| 10-12 23:58 | NextPlayer 定制二轮交付：首页胶囊 + Debug 字样 + 体积之谜（2026-10-12，用户 A+B 拍板后全落地） | 首页胶囊：MediaPickerScreen.kt topBar 槽内 NextTopAppBar(...) 之后并列加 TopLevelPageChipsRow()（Scaffold 内部就是 Column，两个 co… |
+| 10-13 09:32 | 胶囊消失诊断 + 修复 fix/cancel-stale-publish-1013（2026-10-13） | 用户报告：模型执行任务正在调用工具时发消息打断，有一定概率正在调用的工具胶囊消失。 |
 
 ## 7. 思考 / 推理泄漏
 
@@ -719,7 +731,7 @@
 
 ## 8. 上下文压缩 / 记忆 / 预算
 
-**跨度** 2026-08-06 ～ 2026-10-06 · **173 条** · **状态** 稳定（09-12 差距清单收敛：D1 攒着、D3/D4/D5 归档不吸收）
+**跨度** 2026-08-06 ～ 2026-10-12 · **183 条** · **状态** 稳定（09-12 差距清单收敛：D1 攒着、D3/D4/D5 归档不吸收）
 
 **叙事**：08-05 RAG v1 实验 → 08-06 经验记忆模块（实施→审查→修复→**08-07 整体摘除**）→ 08-12 上下文压缩引擎 T5 → 08-14 切片无清洗 + summary 注入 tool_result（400 报错）→ 08-16 动态预算 → 08-18 上下文窗口来源治理 → 08-31 memory facts + 语义索引 → 09-12 A1 Prompt Cache 调查（**结论：本地已是上游超集，无需移植**）。一条「先做、再摘、再重做」的螺旋线。
 
@@ -898,10 +910,20 @@
 | 10-06 19:52 | 报告/证据：/tmp/verify-ui_runtime-page-adjust-1006.scan.log（scan | 报告/证据：/tmp/verify-ui_runtime-page-adjust-1006.scan.log（scan 20/20）、分支 CI run 37457321155 @7de88189 success（bri… |
 | 10-06 20:20 | 压缩模型 pin（sensenova-6.8-flash-lite）日志核查：今日 0 次压缩，pin 未被检验 | 结论：10-06 全天日志零压缩事件（主日志 [Compact] 遥测 0 条，对照 10-05 有 28 条 outTok 遥测；modelservice 日志 sensenova 0 命中；无会话越过压缩阈值）→ p… |
 | 10-06 20:27 | 修正：65K→50K 下降 = offload 分支生效，摘要压缩链被 TAIL_TOO_SMALL 跳过 ×5 | 用户观察核实：20:23:54 本会话（session 0c7917d1，glm-5.3-flash，window=70000）Context Offload 触发：65256 tokens(93%) → 18 个工具结… |
+| 10-10 14:54 | 记忆系统全面更新（2026-10-10 下午） | ① 开发档案三件套：重建 1605 条（08-03～10-10），清洗 + SAGAS 重建（24 saga / 148 orphans / multi4=88），结构核验 anchors==header==1605、f… |
+| 10-10 15:01 | 两分支合并进 main = 81be7f62（2026-10-10，用户放行「分支的话就合并吧，毕竟只是文本更新」） | 合并：--no-ff ×2 序贯合入 main。①docs/dev-history-1010 @ 3c483aee → 23d4b2e0（4 文件 +961/−48，全部 docs/dev-history/）；②fix/… |
+| 10-10 15:24 | MCP 知识图谱退役（2026-10-10，用户拍板「2」= 退役） | 决策：退役 KG（@modelcontextprotocol/server-memory），不复活。理由三条（合起来构成，单条不够）：①写路径从未打通（09-28 无持久化 + daemon 不传 env 给 STDIO… |
+| 10-10 15:26 | GLOBAL 记忆架构章节 + 远端旧分支清理（2026-10-10，用户令「加进去，并且把云端的那个删掉吧」） | ① GLOBAL.md 新增「## 记忆架构（六层 + 两条辅助）—— 2026-10-10 定案」（用户明确授权编辑，插在「待办登记纪律」节后）。内容 = 六层表格（层 / 位置 / 记什么 / 谁来读·何时）：日报 … |
+| 10-10 15:28 | 纯文本分支可直接合并——写入 GLOBAL 常驻纪律（2026-10-10 用户拍板「合，并把它记忆进全局记忆」） | 合并：chore/retire-kg-skill-note-1010 @ 38e905a1 → main 8cb19750（1 文件 +18/−14，纯 SKILL.md 文本）。核查：无冲突 · 合并树 vs 分支树 … |
+| 10-10 23:44 | RikkaMinis 自动压缩/上下文超限排查（2026-10-10） | 日志位置：/var/minis/logs/minis-YYYY-MM-DD.log（主日志，含 ChatViewModel/CompactDiag/AutoCompactLoop）；memspike-.log 有 ui:… |
+| 10-11 00:30 | ↳ AiGW（Android-AI-gateway）任务状态 | 仓库本地副本：/var/minis/shared/work/aigw-recovery/Android-AI-gateway（跨会话共享目录；旧会话 workspace 里的原件已被 cp -a 恢复出来） |
+| 10-11 00:37 | 修复「上下文超限静默终止」：fix/compact-stale-context-tokens-1010（2026-10-10，用户令「就按照你说的修吧」） | 根因（与我的初判不同，记录纠偏）：不是本地字符估算（bytes÷2.2）偏高——loopState.lastContextTokens 只有一个写入源（AgentLoopEngine.kt:1023/1029，来自 pr… |
+| 10-11 00:49 | 分支核查+合并：fix/compact-stale-context-tokens-1010（2026-10-11 用户令 | 分支核查+合并：fix/compact-stale-context-tokens-1010（2026-10-11 用户令「有问题就修，没问题就合并」+「触发了就不用等了」） |
+| 10-12 17:37 | T1 完成：10-10 压缩修复验证装置已搬进 repo（PR #7，零生产改动） | 任务源：shared/proactive-1012/tasks/T1.md（用户令「严格按 T1.md 执行不要停」）。产物 = CompactStaleContextTokensReplayTest.kt（206 行 … |
 
 ## 9. Provider / 模型组 / 负载均衡
 
-**跨度** 2026-08-04 ～ 2026-10-06 · **121 条** · **状态** 已闭环（09-12 收尾；负载均衡语义已在代码级核实为「生效但语义与用户预期不同」）
+**跨度** 2026-08-04 ～ 2026-10-12 · **123 条** · **状态** 已闭环（09-12 收尾；负载均衡语义已在代码级核实为「生效但语义与用户预期不同」）
 
 **叙事**：08-04 loadBalance 轮转游标不前进 → 08-08 模型组 recovery 策略 → 08-14 模型组策略重构 P1–P4 + 思考折叠（中转站）→ 08-15 模型切换无缝（cancel+restart）→ 09-04 思考字段决策键（tokenrhythm 报错）→ 09-06 负载均衡请求级改造 → 09-11 多密钥轮换 + Groq 免费档不可用 → 09-12 「负载均衡像回退模式」**第二次**被报（08-04 同款问题）。**同一现象两次立项**，说明第一次的修法没解释清语义。
 
@@ -1028,10 +1050,12 @@
 | 10-05 22:02 | 21:32 压缩失败事件还原 + ponytail 天花板命中（10-05 晚） | 时间线：20:59/21:08/21:27 三轮压缩全成功（链=1/4→3/4 fallback，active=大写 GLM-5.3-Flash XHIGH）。21:31:07 用户在 H 会话（9b689468）开 M… |
 | 10-05 23:05 | 压缩专用模型组分析（用户问「是否有必要给自动压缩专门开一个模型组/专用模型」）： | 压缩专用模型组分析（用户问「是否有必要给自动压缩专门开一个模型组/专用模型」）： |
 | 10-06 00:42 | 压缩模型钉住功能施工完成（feat/compact-model-pin-1005 @ bba87f23，CI 绿，停在分 | 压缩模型钉住功能施工完成（feat/compact-model-pin-1005 @ bba87f23，CI 绿，停在分支待用户） |
+| 10-12 17:42 | T2 属性测试落地：ProviderToolPairingPropertyTest（PR #8，CI 全绿） | 产物：src/android/app/src/test/java/com/rikkaminis/app/provider/ProviderToolPairingPropertyTest.kt（+356 行，分支 test… |
+| 10-12 18:14 | ↳ proactive-1012 三任务合并完成（2026-10-12 晚） | 用户放行后执行合并：PR #7/#8/#9 全部合入 main，顺序 #7 206e7110 → #8 38ad442d → #9 13949bb0（tip），逐支 merge-base --is-ancestor 核实… |
 
 ## 10. 备份 / 多端同步
 
-**跨度** 2026-08-03 ～ 2026-10-09 · **121 条** · **状态** 收敛（多端同步已砍除，自动备份按「资产」语义保留）
+**跨度** 2026-08-03 ～ 2026-10-13 · **126 条** · **状态** 收敛（多端同步已砍除，自动备份按「资产」语义保留）
 
 **叙事**：08-04 WebDAV 备份把 main 编译弄坏 + 导入去重 → 08-09 备份并发 OOM → 08-10 多端自动同步 → 08-11 流量审计（用户发现方案欠考虑）→ 降本 + 合并守卫 → 08-13 备份模块审计 7 项 → 08-28 方案 C 重构 → 09-08 **产品哲学定调：资产 vs 副产品** + 自动备份 A+B + auto/ 目录分离 → 09-09 多端同步砍除。**从「做」到「砍」只用了一个月，中间靠一次流量审计转弯。**
 
@@ -1158,10 +1182,15 @@
 | 10-09 01:03 | P1 批量修复合并完成（2026-10-08 晚，用户令「没问题就合并」） | 闭环：3 个并行修复会话（任务书 sweep-1008/fix-tasks/A-C.md）→ 各自分支 1 commit + CI 绿 → 用户放行 → 合并前核查三项齐（diff 逐文件 / CI head_sha 逐… |
 | 10-09 12:49 | 备份 OOM（512MB largeHeap 打满）根因与修复 — 2026-10-09 | 症状：真机报 写入失败: Failed to allocate a 4480 byte allocation … <1% of heap free after GC（target/growth limit 5368709… |
 | 10-09 13:32 | 备份 OOM 修复合并收口（2026-10-09） | 合并完成（用户放行「修好了，合并吧」）：三项核查齐（diff 3 文件逐行读无夹带、0 冲突标记；分支 CI 37884504189 head_sha 逐字符 = 71f605e；独立证据=影子 harness 三路对照… |
+| 10-10 21:51 | Android-AI-gateway 项目（用户 fork） | 仓库：/var/minis/workspace/Android-AI-gateway（fork 自 alarmedvine/Android-AI-gateway） |
+| 10-12 17:36 | T3 完成：four_way_sync 门升级 v2（推导族）——PR #9，Scan Gate 绿 | 分支 ci/field-sync-derive-1012 @ 136ede2（父 = main 4fa0cb20），PR https://github.com/OWNER/RikkaMinis/pull/9，Scan G… |
+| 10-13 13:12 | sweep-1013 收口：第二道门核实 + 三修复会话派发（2026-10-13） | 输入：三域审计报告齐（D1 数据层 10 条 / D2 安全面 11 条 / D3 UI 10 条，共 31 条），报告基线 main @ ad4a4beb。 |
+| 10-13 14:02 | sweep-1013 修复收口：三支合并 main 9f4f5766（2026-10-13） | 用户令：「好了，他们都完成了，你这里继续吧。」→ 读作收口授权（核实 + 合并）。 |
+| 10-13 14:17 | 两天改动审查（10-12 / 10-13，用户令「检查一下这两天进行的修改吧」） | 窗口：main 206e71105（10-12 早）→ 9f4f57666，34 文件 +2722/−198（11 开发提交 + 9 合并单元）。 |
 
 ## 11. 渲染性能 / Markdown / 长会话卡顿
 
-**跨度** 2026-08-05 ～ 2026-10-07 · **114 条** · **状态** 已闭环 + 持续加固（09-15 七轴 sweep：纯逻辑层零新 bug，真发现全在接线/时序边界）
+**跨度** 2026-08-05 ～ 2026-10-12 · **118 条** · **状态** 已闭环 + 持续加固（09-15 七轴 sweep：纯逻辑层零新 bug，真发现全在接线/时序边界）
 
 **叙事**：08-12 文字渲染空白 → 08-20 工具卡「正在调用」+ CPU 80% → 08-21 长会话流式渲染 CPU 满载 → 08-25 rikkahub 流畅性吸收 A–E（消息级聚合 + @Stable/@Immutable 纪律）→ 08-26 聚合路径复制失效 → 09-14 census 接错渲染器（7 分支全死）→ 09-15 markdown 解析器死循环（`#196` 类行挂死，**用户报「大文件加载不出来」**）→ 七轴 fuzz sweep。
 
@@ -1281,10 +1310,14 @@
 | 09-28 09:39 | ↳ 工具药丸折叠 revert 合并 main = 8aaad10（09-28，用户拍板「负值交易，按你说的来」） | 决策链：用户判折叠为负值设计（UX 损害 > 性能收益）→ A/B 实测证实 → revert B 合并（3c72bc1a）→ 用户授权「跑完直接合并，检查环节在当初合并时已完成」→ main = 8aaad10（mer… |
 | 09-28 09:43 | ↳ 折叠 revert 装包验证闭环（09-28，用户确认） | 用户确认真机安装的是 8aaad10e（折叠 revert 合并后的 main）编译的 APK，运行没有问题。两处欠账随之闭环： |
 | 10-07 07:45 | usage-stats-perf-1007 施工完成：SQL 聚合 + 部分索引 + off-main（分支 CI 绿，未合并） | 交付：分支 fix/usage-stats-perf-1007 @ aabd3636（2 commits：0665c6b 主改动 6 文件 +286/−119 + aabd363 测试桩补齐 3 文件 +9），CI ru… |
+| 10-12 20:25 | T5 派发：MarkdownParser 差分探针 + 重复派发事故（2026-10-12 晚） | 派发：MarkdownParser.kt（639 行纯 Kotlin object 零 import，String→List<Block>，宿主可测；已有覆盖仅 numbered list + KaTeX 上限）→ T5… |
+| 10-12 20:40 | T5 完成：MarkdownParser 差分探针（PR #11，CI 绿，停在分支未合并） | 分支 test/md-parser-probe-1012 @ 85f3535c（2 commits：910ff2b 修复 / 85f3535 测试 58 例），PR #11（base main ← 分支），CI run … |
+| 10-12 20:41 | ↳ PR 合并：test/md-parser-probe-1012 进 main（用户放行「没问题就合并」） | PR 合并：test/md-parser-probe-1012 进 main（用户放行「没问题就合并」） |
+| 10-12 20:42 | T5 收口：MarkdownParser 探针完成 + 2 个 P1 修复已合并（2026-10-12 晚） | 产出：64 条探针语料 + 58 例测试（MarkdownParserBlockStructureTest，468 行）+ 2 个 P1 缺陷修复（①heading 尾部 # 双向：## C# 内容被吃、## title… |
 
 ## 12. 审计 / 整改（多轮）
 
-**跨度** 2026-08-03 ～ 2026-10-09 · **269 条** · **状态** 常态机制（已固化为 security-audit-checklist / four-way-sync-check 等 skill）
+**跨度** 2026-08-03 ～ 2026-10-13 · **276 条** · **状态** 常态机制（已固化为 security-audit-checklist / four-way-sync-check 等 skill）
 
 **叙事**：08-05 首次全量代码审查 → 08-16 系统性审计 → 08-18 RC1–RC17 两轮整改（多会话并行）→ 08-26/27 模块审计批 → 09-02 bug-hunt 四会话 → 09-04 diff 驱动定向审计 → 09-09 全局第二轮 T1–T12 → 09-13 完善度横向扫描 → 09-14 度量存活度 → 09-15 七轴 sweep。**审计是本项目最稳定的工程节奏**：每次改动后必有一次独立审计，且审计本身产出纪律（skill）。
 
@@ -1559,10 +1592,17 @@
 | 10-09 00:08 | D3 扫描（ui/settings + backup）完成 — 12 发现（0H/5M/7L） | 报告：/var/minis/shared/sweep-1008/reports/D3.md（backups 全读 11 文件 + BackupSettingsScreen 全读 + 其余 settings grep 签名… |
 | 10-09 00:09 | D5 域扫描完成（sweep-1008） | 任务：/var/minis/shared/sweep-1008/tasks/D5.md（data+provider+conversation+service+config），报告已写 sweep-1008/reports… |
 | 10-09 00:18 | 全库四模式扫描收口（2026-10-08 晚） | 产物：/var/minis/shared/sweep-1008/{TRIAGE.md, reports/D1-D6.md}。6 域并行会话（llm-bug-audit 规则库+四结构模式）扫全库 197K 行，46 项发… |
+| 10-10 15:26 | GLOBAL 记忆架构章节 + 远端旧分支清理（2026-10-10，用户令「加进去，并且把云端的那个删掉吧」） | ① GLOBAL.md 新增「## 记忆架构（六层 + 两条辅助）—— 2026-10-10 定案」（用户明确授权编辑，插在「待办登记纪律」节后）。内容 = 六层表格（层 / 位置 / 记什么 / 谁来读·何时）：日报 … |
+| 10-12 15:44 | streaming-claim-race 同族审计结论（2026-10-12，用户问「以前修的 bug 是否也有修一边漏一边」） | 修复自身完备：7 认领点全部 mint-before-flip、5 finally 全加 claimToken 门、releaseSlot 无条件（正确）。26 处机械改动齐。 |
+| 10-12 18:55 | 流式 think-tag 扫描器两个活缺陷（2026-10-12 晚，主会话侦察发现 → T4 修复已派发） | 在给「下一步该弄什么」做侦察时，在 ThinkTagScanning.kt（main @ 13949bb0）实测复现两个从未被测试覆盖的活缺陷： |
+| 10-12 19:34 | T4 完成：think-tag 扫描器双缺陷修复（PR #10，CI 全绿，停在分支未合并） | 分支 fix/thinktag-scan-integrity-1012 @ 123e2cc（父 = main 13949bb0），3 commits：11e3ab6（A：删 bufLower 改源坐标搜索 indexOf… |
+| 10-12 19:44 | PR #10 合并完成：think-tag 扫描器双缺陷修复进 main（2026-10-12 晚，用户令「检查→没问题就合并」+「合并后不用等」） | 分支：fix/thinktag-scan-integrity-1012（T4 会话产物）@ 123e2cc8，3 commit（A 源坐标搜索 / B 跨 chunk 状态携带 / 测试），仅 2 文件（ThinkTag… |
+| 10-12 23:10 | RikkaMinis 优化空间审计（10-12，用户令「分析应用还有哪些优化空间」） | 报告：/var/minis/shared/work/app-opt-audit-1012/REPORT.md（全证据链，未改产品代码）。 |
+| 10-13 16:08 | 债务清理批次（fix/debt-cleanup-1013，PR #13，6 commits @08f818f3c） | 范围：审查自报 4 条（D-1/D-2/D-3/D-4）+ backlog §89 择条 4 条（F-2/F-5/F-9/F-10），CI：scan-gate 38367123483 + build-apk 383671… |
 
 ## 13. 多会话并行协作 / 派发 / 交接
 
-**跨度** 2026-08-04 ～ 2026-10-09 · **248 条** · **状态** 成熟（skill: task-dispatch / git-parallel-collaboration / rikkaminis-dev-methodology）
+**跨度** 2026-08-04 ～ 2026-10-13 · **257 条** · **状态** 成熟（skill: task-dispatch / git-parallel-collaboration / rikkaminis-dev-methodology）
 
 **叙事**：08-07 多对话框并发操作同一 worktree 翻车（native OOM 修复）→ 08-12 多任务并行推进模式确立 → 08-15 T1–T10 十会话派发（平衡点施工）→ 08-18 RC 整改凭编号领取 → 08-22 小号 TF-A..TF-J → 08-23 bug-hunt 五会话 → 09-13 两条纪律固化：**每会话独立 clone 绝不共享 .git** + **两分支同基各一 commit 时第二个必须 rebase**。
 
@@ -1816,10 +1856,19 @@
 | 10-09 19:13 | 症状：用户说「子代理」不指向会话子代理（spawn_agent）；且派发时「指令没发过去」。 | 症状：用户说「子代理」不指向会话子代理（spawn_agent）；且派发时「指令没发过去」。 |
 | 10-09 20:16 | 分支审查+合并收口：fix/subagent-routing-delivery-1009（2026-10-09 晚，用户令「有问题就修，没有问题的话合并」） | 对象：fix/subagent-routing-delivery-1009 @ 5862b647（1 commit，7 文件 +209/−3，基线 main cbb9d2b4）。CI run 37925446699 su… |
 | 10-09 20:21 | 子代理修复（7275bbd4）真机验证完成（2026-10-09 晚，构建 v1.0.0+1962 @20:16:52 装机） | A（frontmatter 全链路）✅：file_write 带 subagent:true 的 SKILL.md → auto-discover（20:18:21.835，与事故同时序）→ spawn_agent 直接… |
+| 10-12 17:18 | proactive-1012 三项并行派发（2026-10-12 傍晚） | 用户令「用会话子代理并行、把任务安排出去」→ 已派发 3 个 headless 会话（minis-sessions-cli send --async），任务书在 /var/minis/shared/proactive-1… |
+| 10-12 18:55 | 流式 think-tag 扫描器两个活缺陷（2026-10-12 晚，主会话侦察发现 → T4 修复已派发） | 在给「下一步该弄什么」做侦察时，在 ThinkTagScanning.kt（main @ 13949bb0）实测复现两个从未被测试覆盖的活缺陷： |
+| 10-12 20:25 | T5 派发：MarkdownParser 差分探针 + 重复派发事故（2026-10-12 晚） | 派发：MarkdownParser.kt（639 行纯 Kotlin object 零 import，String→List<Block>，宿主可测；已有覆盖仅 numbered list + KaTeX 上限）→ T5… |
+| 10-12 20:42 | T5 收口：MarkdownParser 探针完成 + 2 个 P1 修复已合并（2026-10-12 晚） | 产出：64 条探针语料 + 58 例测试（MarkdownParserBlockStructureTest，468 行）+ 2 个 P1 缺陷修复（①heading 尾部 # 双向：## C# 内容被吃、## title… |
+| 10-13 08:59 | sweep-1013 三域并行派发（2026-10-13 上午） | 用户令「动手，用会话子代理，三个一起」（并纠正：要的是会话子代理 = minis-sessions-cli send，不是进程内 spawn_agent——08:37 上一轮误用 spawn_agent ×2 全败 v0… |
+| 10-13 12:58 | 用户偏好：「子代理」默认指会话子代理（2026-10-13，用户明确） | 用户明确：说「子代理 / sub-agent」时默认指会话子代理 = minis-sessions-cli send（跨会话派发 headless 会话），不是进程内 spawn_agent。 |
+| 10-13 13:12 | sweep-1013 收口：第二道门核实 + 三修复会话派发（2026-10-13） | 输入：三域审计报告齐（D1 数据层 10 条 / D2 安全面 11 条 / D3 UI 10 条，共 31 条），报告基线 main @ ad4a4beb。 |
+| 10-13 14:02 | sweep-1013 修复收口：三支合并 main 9f4f5766（2026-10-13） | 用户令：「好了，他们都完成了，你这里继续吧。」→ 读作收口授权（核实 + 合并）。 |
+| 10-13 17:53 | PR #13（fix/debt-cleanup-1013）修复+合并收口（2026-10-13） | 用户指令链：「检查一下云端正在跑的那个分支」→ 审查发现 P1 → 「修吧，修好跑完之后就合并」→ 修复+CI 绿+合并，全部完成。 |
 
 ## 14. CI / 构建 / 发布流水线
 
-**跨度** 2026-08-03 ～ 2026-10-10 · **269 条** · **状态** 稳定（Publish 步骤已加 `if: refs/heads/main` 门控）
+**跨度** 2026-08-03 ～ 2026-10-13 · **283 条** · **状态** 稳定（Publish 步骤已加 `if: refs/heads/main` 门控）
 
 **叙事**：08-04 main 编译被 WebDAV 提交弄坏（连红 4 个 run）→ 08-05 android-latest 被分支构建污染 → workflow 门控修复 → 08-17 **CI 缓存恢复旧 native .so**（Tier 0 真 bug）→ 08-24 gh_ci_wait.sh 工具化 + 重复构建幂等守卫 → 09-10 语法门 grep 大小写坑 → 09-14 workflow_dispatch 并发竞态。**「CI 绿 ≠ 逻辑对」这条纪律就是从这条 saga 长出来的。**
 
@@ -2094,10 +2143,24 @@
 | 10-09 14:32 | docs 更新不需要触发分支 CI（用户纠正） | 实证：docs/dev-history-1009 档案推送后我惯性 dispatch 了 build-apk.yml（#1961），用户指出「文档更新不是不用触发 CI 吗」→ 已 API 取消。 |
 | 10-09 20:21 | 子代理修复（7275bbd4）真机验证完成（2026-10-09 晚，构建 v1.0.0+1962 @20:16:52 装机） | A（frontmatter 全链路）✅：file_write 带 subagent:true 的 SKILL.md → auto-discover（20:18:21.835，与事故同时序）→ spawn_agent 直接… |
 | 10-10 14:19 | 沙盒内构建 Android APK 完整配方（已验证跑通） | 无 Android Studio/Gradle，纯 CLI 工具链，全部单文件来自 Google Maven，aarch64 原生可跑： |
+| 10-10 14:57 | CI 触发判据修正：记特例会漏，要记判据（2026-10-10，用户同日第二次纠正） | 事：assets/skills/semantic-memory 回灌（.py/.md/.json 三个纯文本文件）后，我惯性 dispatch 了 build-apk → run #1964，用户纠正「文本更新不需要触发… |
+| 10-10 15:28 | 「无验证面就不等 CI」并入 GLOBAL（2026-10-10，用户：「像这种几乎没有风险的就不用等了」） | 事：合并 chore/retire-kg-skill-note-1010 → main 8cb19750 后，我用 delay 轮询等 #1966 出结论；用户叫停——纯文本改动不必等。 |
+| 10-12 15:26 | 修复「切模型后流式状态被抹」竞态 → 分支 fix/streaming-claim-race-1012 @ 41f024e7（CI #1970 success） | 根因（真机日志 + 代码双证）：_isStreaming 清除权归属不清。旧 job 的 finally 用「streamJob === 自己 + jobEpoch == streamingClaimEpoch」双门判断… |
+| 10-12 16:40 | 第 21 道 CI 门落地：claim_release_guard（2026-10-12，用户批准后实施） | 产物：scripts/scan/claim_release_guard.py（已合 main，PR #6 @ 4fa0cb20）。scan.sh 21 门 + 自测 89 用例全过；Scan Gate(PR) CI 绿。 |
+| 10-12 16:46 | claim_release_guard 门合并状态独立复核（2026-10-12 晚，本会话） | 用户令「检查分支上那个新加的门，没问题就合并」——该分支（ci/claim-release-guard-1012 / PR #6）已于 16:40 由前会话合并进 main @ 4fa0cb20，远端分支已删，云端只剩 … |
+| 10-12 17:42 | T2 属性测试落地：ProviderToolPairingPropertyTest（PR #8，CI 全绿） | 产物：src/android/app/src/test/java/com/rikkaminis/app/provider/ProviderToolPairingPropertyTest.kt（+356 行，分支 test… |
+| 10-12 18:14 | ↳ proactive-1012 三任务合并完成（2026-10-12 晚） | 用户放行后执行合并：PR #7/#8/#9 全部合入 main，顺序 #7 206e7110 → #8 38ad442d → #9 13949bb0（tip），逐支 merge-base --is-ancestor 核实… |
+| 10-12 19:34 | T4 完成：think-tag 扫描器双缺陷修复（PR #10，CI 全绿，停在分支未合并） | 分支 fix/thinktag-scan-integrity-1012 @ 123e2cc（父 = main 13949bb0），3 commits：11e3ab6（A：删 bufLower 改源坐标搜索 indexOf… |
+| 10-12 20:40 | T5 完成：MarkdownParser 差分探针（PR #11，CI 绿，停在分支未合并） | 分支 test/md-parser-probe-1012 @ 85f3535c（2 commits：910ff2b 修复 / 85f3535 测试 58 例），PR #11（base main ← 分支），CI run … |
+| 10-12 20:41 | ↳ PR 合并：test/md-parser-probe-1012 进 main（用户放行「没问题就合并」） | PR 合并：test/md-parser-probe-1012 进 main（用户放行「没问题就合并」） |
+| 10-13 00:38 | 更新：personal-build.yaml 已改为只 rename/upload/publish nextplayer | 更新：personal-build.yaml 已改为只 rename/upload/publish nextplayer-arm64-v8a.apk（其余 ABI 构建后 rm -f 丢弃；gradle splits 未… |
+| 10-13 00:42 | ↳ 分支核查+合并：feat/minimal-home-1012 进 main（用户令「有问题就修，没问题就合并」） | 审查结论：无可疑行，未发现 bug/次生问题。 diff 741 行全读（head 400 行 + sed 尾段，file_read 上限截断后补读过），核查项全过： |
+| 10-13 09:32 | 胶囊消失诊断 + 修复 fix/cancel-stale-publish-1013（2026-10-13） | 用户报告：模型执行任务正在调用工具时发消息打断，有一定概率正在调用的工具胶囊消失。 |
+| 10-13 09:45 | 分支核查+合并：fix/cancel-stale-publish-1013 进 main（2026-10-13，用户令「检查…没问题就合并」） | 机械项（verify_branch.sh，exit 0，核对时刻 2026-10-13T01:42:39Z）：工作树 clean、branch_tip=worktree_HEAD=00fe3f9c、scan 21 pas… |
 
 ## 15. 开发档案 / 记忆 / 工具链
 
-**跨度** 2026-08-03 ～ 2026-10-09 · **139 条** · **状态** 常态维护（skill: dev-history-sync，每次 dev 会话收尾同步）
+**跨度** 2026-08-03 ～ 2026-10-12 · **143 条** · **状态** 常态维护（skill: dev-history-sync，每次 dev 会话收尾同步）
 
 **叙事**：08-06 经验记忆引擎概念 → 08-08 三平台技能架构固化 → 08-14 档案首次从记忆重建 → 08-16/24/09-04/05/07/08/10/12/13/14 反复重建（**每次重建都在修解析器或脱敏规则**）→ 09-06 知识图谱 + MCP memory → 09-14 日志「可消费性」诊断 → 09-15 sanitize 头部刷新固化。**档案本身是被反复施工的产物，不是一次性导出。**
 
@@ -2242,10 +2305,14 @@
 | 10-08 21:20 | §75 技能快照回灌完成（2026-10-08） | 机制（RikkaMinis 内置技能）：assets/skills/ 是安装种子，SkillRepository.installBundledSkill（:1335）用语义版本比较做门——assets 的 SKILL.m… |
 | 10-09 14:15 | backlog 第1+2档批量修复合并收口（2026-10-09） | 分支：fix/backlog-batch-1009 @ 333a1989（基线 main b4647299），CI run 37890926335 success（05:55 dispatch → 06:09 绿，14.… |
 | 10-09 14:23 | 分支审查完成：fix/backlog-batch-1009（0 P0/P1，无次生问题，§80 登记） | 对象：fix/backlog-batch-1009 @ 333a1989（tier1+tier2 十项清账，基线 main b464729，14 文件 +90/−28）。CI run 37890926335 succes… |
+| 10-10 14:54 | 记忆系统全面更新（2026-10-10 下午） | ① 开发档案三件套：重建 1605 条（08-03～10-10），清洗 + SAGAS 重建（24 saga / 148 orphans / multi4=88），结构核验 anchors==header==1605、f… |
+| 10-10 15:24 | MCP 知识图谱退役（2026-10-10，用户拍板「2」= 退役） | 决策：退役 KG（@modelcontextprotocol/server-memory），不复活。理由三条（合起来构成，单条不够）：①写路径从未打通（09-28 无持久化 + daemon 不传 env 给 STDIO… |
+| 10-12 20:11 | 「三类地方能不能一起覆盖」侦察判定（2026-10-12 晚，落 backlog §84） | 流式/chunk 生产文件 × 测试交叉对比（main @ 1074a399）：覆盖面比预期完整——T4 修完后流式解析几乎无纯逻辑真空。已覆盖：ThinkTagScanning、StreamingMarkdownTex… |
+| 10-12 20:49 | 「T4/T5 效果好，是否继续推进」判定（2026-10-12 深夜，落 backlog §85） | 判定：停，不建全仓盲扫装置。 侦察数据（main @ 8637ea61）：577 生产类，无测试 import 引用差集 534——但校正后大部分是假象：①同包测试假阴性（ui/chat 79 / sandbox 51 … |
 
 ## 16. 会话 / 导航 / 抽屉交互
 
-**跨度** 2026-08-03 ～ 2026-10-09 · **112 条** · **状态** 已闭环（09-01 后未再复现）
+**跨度** 2026-08-03 ～ 2026-10-12 · **114 条** · **状态** 已闭环（09-01 后未再复现）
 
 **叙事**：08-03 空对话残留 → 08-04 左滑历史抽屉 + 新建对话弹窗 → 08-06 系统返回不进 SESSION_LIST + 双击返回 → 08-07 重启后进列表页而非新会话 → 08-18 RC10 深链路径穿越 → 09-01 launch-resume 导航修复 → 09-13 冷打开空白。**「打开应用后我在哪」这个问题被修了 6 次**，每次都是不同的入口（返回键 / 重启 / 深链 / 冷启）。
 
@@ -2363,6 +2430,8 @@
 | 10-06 20:20 | 压缩模型 pin（sensenova-6.8-flash-lite）日志核查：今日 0 次压缩，pin 未被检验 | 结论：10-06 全天日志零压缩事件（主日志 [Compact] 遥测 0 条，对照 10-05 有 28 条 outTok 遥测；modelservice 日志 sensenova 0 命中；无会话越过压缩阈值）→ p… |
 | 10-09 00:09 | D5 域扫描完成（sweep-1008） | 任务：/var/minis/shared/sweep-1008/tasks/D5.md（data+provider+conversation+service+config），报告已写 sweep-1008/reports… |
 | 10-09 00:40 | sweep-B 修复完成（thinking 规则缓存冷启动预热，sweep-1008 唯一 HIGH） | 任务：/var/minis/shared/sweep-1008/fix-tasks/B.md。分支 fix/sweep-p1-thinking-cache-1008 @ 4f6646f8b6ac94e0081ee7279… |
+| 10-12 20:02 | 「回答中途突然停止」排查结论（2026-10-12 晚，用户报其他会话） | 今天日志共 11–12 次真实中途取消（runAgentLoop CANCELLED → streamJob killed），全部是 cancelStream() 主动取消，0 崩溃/0 错误/0 OOM（今天 erro… |
+| 10-12 23:07 | NextPlayer 定制：底部导航移除 + 个人签名出包基建（2026-10-12） | 用户需求：fork alarmedvine/nextplayer（= 上游 anilbeesetti/nextplayer 干净 fork，main 与上游一致）。要求：①底部「可切换的胶囊导航」整体搬到设置页、入口页只… |
 
 ## 17. 平台适配 / 通知 / 图标 / 权限
 
@@ -2494,7 +2563,7 @@
 
 ## 19. 上游 / 生态吸收 / 开源
 
-**跨度** 2026-08-03 ～ 2026-10-09 · **85 条** · **状态** 常态（每轮吸收都有「不做」清单，比「做」清单更重要）
+**跨度** 2026-08-03 ～ 2026-10-13 · **87 条** · **状态** 常态（每轮吸收都有「不做」清单，比「做」清单更重要）
 
 **叙事**：08-03 OpenMinis fork 起步 → 08-04 改名 RikkaMinis（OpenMinis 核 + RikkaHub 皮）→ 08-11 上游降级三件套 → 08-25 rikkahub 流畅性吸收 A–E → 08-31 LiteLLM 成本层 + facts → 09-06 Hermes Tier-1 harness → 09-07 Operit 吸收三件 → 09-12 差距清单收敛（D3/D4/D5 归档不吸收）→ 09-14/15 生态调查报告。**「吸收」有明确门槛：只吸收能接进现有边的东西，接不进的归档。**
 
@@ -2585,10 +2654,12 @@
 | 10-06 12:25 | 对象：上游 OpenMinis v1.15-beta.1（10-01）+ beta.2（10-04）。逐项过修复门核查 | 对象：上游 OpenMinis v1.15-beta.1（10-01）+ beta.2（10-04）。逐项过修复门核查 fork 同族 @273aecc6。 |
 | 10-06 17:43 | 外部项目吸收审查：OpenDots + Raven → backlog §67 全部登记不做（10-06） | 对象：OpenDots（CopilotKit，AI 同事模板，本质 = CopilotKit Intelligence 托管服务导流壳）+ Raven（EverMind，RSI 研究 harness，本质 = 云/容器基… |
 | 10-09 22:43 | tall-1997/OpenMinis-Linux（Minis Ultra）调查结论 | 与用户同 fork 自 OpenMinis/OpenMinis，分岔点 9-02 (v1.13)。24 天 19 星（0.79/天）vs 用户 69 天 22 星（0.32/天）。 |
+| 10-10 21:51 | Android-AI-gateway 项目（用户 fork） | 仓库：/var/minis/workspace/Android-AI-gateway（fork 自 alarmedvine/Android-AI-gateway） |
+| 10-13 00:22 | NextPlayer fork（alarmedvine/nextplayer）运维要点 | push token：GITHUB_TOKEN（主号）和 GITHUB_TOKEN_FULL_RIGHT（ALT_USER）都无 push 权，必须用 GITHUB_TOKEN="$GITHUB_TOKEN_FULL_R… |
 
 ## 20. UI 组件 / 设置页 / 交互微调
 
-**跨度** 2026-08-04 ～ 2026-10-06 · **97 条** · **状态** 持续（09-12 参数化面板已合并 main）
+**跨度** 2026-08-04 ～ 2026-10-12 · **99 条** · **状态** 持续（09-12 参数化面板已合并 main）
 
 **叙事**：贯穿全程的「小改动流」：08-04 设置页去箭头 + Chat Menu 三项 + 模型组拖拽排序 → 08-05 底部工具条可配置化（含 footer 按钮失效两轮定位）→ 08-08 移除冗余返回按钮 → 08-09 提供商详情页 v2 重构 → 08-14 聊天体验微调 + 回合组折叠 → 09-12 chat-tuning-panel 参数化。**这类改动单看都不重要，但它们占了档案的相当比例——产品的手感就是这么磨出来的。**
 
@@ -2691,10 +2762,12 @@
 | 10-02 15:24 | 停止按钮杀不到压缩 P1 已修（10-02，分支 fix/compact-cancel-on-stop-1002 @ 4bc1352，CI #1908 绿停） | 改动（5 文件 +231/−8，停在分支未合并）：①compactAll 的 launch 存 compactJob，cancelStream 连带 cancel（9 处调用点全统一——语义都是"当前轮工作立刻停"，fi… |
 | 10-06 07:14 | ui/polish-1006 审查+合并 main + main CI 绿（10-06 早，「检查+有问题修+没问题合并」指令） | 对象：ui/polish-1006 @05f31a0b（2 commits：①压缩模型行删「选择…」按钮→整行点击弹框；②与 LimitsSliderRow 风格对齐〔+分隔线/−textAlign〕；③定时任务编辑页删… |
 | 10-06 14:00 | 提问卡片降级（2026-10-06 用户拍板：不立项/花架子）：用户质疑「agent 日常直接问就行，卡片是炫酷功能」。 | 提问卡片降级（2026-10-06 用户拍板：不立项/花架子）：用户质疑「agent 日常直接问就行，卡片是炫酷功能」。重过一阶门证实判定修正：纯文本提问已覆盖「追问并等待」（turn 结束问、历史持久、杀掉重问上下文成… |
+| 10-12 14:59 | 切模型后「等待中但按钮已停止」= switchModelAndRerun 的 claim 竞态（2026-10-12 真机实测定位） | 症状（用户报告）：发消息→provider 慢→切模型→界面仍显示等待/生成中，但底部按钮已回到「发送」（停止态）→用户再点重试。 |
+| 10-12 23:07 | NextPlayer 定制：底部导航移除 + 个人签名出包基建（2026-10-12） | 用户需求：fork alarmedvine/nextplayer（= 上游 anilbeesetti/nextplayer 干净 fork，main 与上游一致）。要求：①底部「可切换的胶囊导航」整体搬到设置页、入口页只… |
 
 ## 21. Token 用量 / 成本统计
 
-**跨度** 2026-08-05 ～ 2026-10-07 · **76 条** · **状态** 已闭环（09-09 实时用量 + 预算上限；09-12 parseUsage 修复合并）
+**跨度** 2026-08-05 ～ 2026-10-11 · **78 条** · **状态** 已闭环（09-09 实时用量 + 预算上限；09-12 parseUsage 修复合并）
 
 **叙事**：08-06 TokenUsageSheet 补缓存命中率 → 08-08 双重扣减 + Gemini cache 修复 → 08-25 用量统计优化 A+B → 08-31 LiteLLM 成本层 V2（JSON 价格表 + 用户可编辑）→ **09-12 parseUsage 双重扣减再次出现**（同族复发）。
 
@@ -2776,10 +2849,12 @@
 | 10-07 07:45 | usage-stats-perf-1007 施工完成：SQL 聚合 + 部分索引 + off-main（分支 CI 绿，未合并） | 交付：分支 fix/usage-stats-perf-1007 @ aabd3636（2 commits：0665c6b 主改动 6 文件 +286/−119 + aabd363 测试桩补齐 3 文件 +9），CI ru… |
 | 10-07 08:37 | fix/usage-stats-perf-1007 独立检查完成（08:25–08:40，第二双眼睛核查 @15b9a24a） | 对象：fix/usage-stats-perf-1007 @ 15b9a24a（3 commits：0665c6b1 主改动 + aabd3636 测试桩 + 15b9a24a P0 修复）。另一会话 0ba1cb89 … |
 | 10-07 08:58 | fix/usage-stats-perf-1007 合并 main 完成（2026-10-07 08:41–08:57 SGT，用户放行「攒着的攒着、没问题就合并」） | 流程：独立检查 0 阻塞 → --no-ff merge 297fa516（parents ac927148+15b9a24a；merge 树==分支树 diff 0 行；增量 10 文件 +307/−120 精确吻合）… |
+| 10-11 00:37 | 修复「上下文超限静默终止」：fix/compact-stale-context-tokens-1010（2026-10-10，用户令「就按照你说的修吧」） | 根因（与我的初判不同，记录纠偏）：不是本地字符估算（bytes÷2.2）偏高——loopState.lastContextTokens 只有一个写入源（AgentLoopEngine.kt:1023/1029，来自 pr… |
+| 10-11 00:49 | 分支核查+合并：fix/compact-stale-context-tokens-1010（2026-10-11 用户令 | 分支核查+合并：fix/compact-stale-context-tokens-1010（2026-10-11 用户令「有问题就修，没问题就合并」+「触发了就不用等了」） |
 
 ## 22. 人格 / Soul / 提示词 / 技能体系
 
-**跨度** 2026-08-04 ～ 2026-10-09 · **92 条** · **状态** 稳定（技能体系已固化为 12+ 个 skill，跨会话持久）
+**跨度** 2026-08-04 ～ 2026-10-13 · **100 条** · **状态** 稳定（技能体系已固化为 12+ 个 skill，跨会话持久）
 
 **叙事**：08-07 soul.lang 接线 → 08-08 三平台技能架构 + 内置集成显示修复 → 08-09 Soul 默认人格名对齐 → 08-18 RC 整改含技能模块 → 08-26 人格(Soul)模块审计加固 + 技能/权限模块审计 → 08-29/09-04 subagent 跨会话派发 → 09-07 规则体系对照复杂度五纪律。**「给 agent 定语言 + 定运行时 + 定验证框架」这条主线在应用内的投影。**
 
@@ -2877,6 +2952,14 @@
 | 10-09 19:56 | 分支施工完成（用户拍板「按你建议的来」，A 同族全修 + B 路由下沉 + C 根治+兜底）： | 分支施工完成（用户拍板「按你建议的来」，A 同族全修 + B 路由下沉 + C 根治+兜底）： |
 | 10-09 20:16 | 分支审查+合并收口：fix/subagent-routing-delivery-1009（2026-10-09 晚，用户令「有问题就修，没有问题的话合并」） | 对象：fix/subagent-routing-delivery-1009 @ 5862b647（1 commit，7 文件 +209/−3，基线 main cbb9d2b4）。CI run 37925446699 su… |
 | 10-09 20:21 | 子代理修复（7275bbd4）真机验证完成（2026-10-09 晚，构建 v1.0.0+1962 @20:16:52 装机） | A（frontmatter 全链路）✅：file_write 带 subagent:true 的 SKILL.md → auto-discover（20:18:21.835，与事故同时序）→ spawn_agent 直接… |
+| 10-10 14:54 | 记忆系统全面更新（2026-10-10 下午） | ① 开发档案三件套：重建 1605 条（08-03～10-10），清洗 + SAGAS 重建（24 saga / 148 orphans / multi4=88），结构核验 anchors==header==1605、f… |
+| 10-10 14:57 | CI 触发判据修正：记特例会漏，要记判据（2026-10-10，用户同日第二次纠正） | 事：assets/skills/semantic-memory 回灌（.py/.md/.json 三个纯文本文件）后，我惯性 dispatch 了 build-apk → run #1964，用户纠正「文本更新不需要触发… |
+| 10-10 15:01 | 两分支合并进 main = 81be7f62（2026-10-10，用户放行「分支的话就合并吧，毕竟只是文本更新」） | 合并：--no-ff ×2 序贯合入 main。①docs/dev-history-1010 @ 3c483aee → 23d4b2e0（4 文件 +961/−48，全部 docs/dev-history/）；②fix/… |
+| 10-10 15:24 | MCP 知识图谱退役（2026-10-10，用户拍板「2」= 退役） | 决策：退役 KG（@modelcontextprotocol/server-memory），不复活。理由三条（合起来构成，单条不够）：①写路径从未打通（09-28 无持久化 + daemon 不传 env 给 STDIO… |
+| 10-10 15:26 | GLOBAL 记忆架构章节 + 远端旧分支清理（2026-10-10，用户令「加进去，并且把云端的那个删掉吧」） | ① GLOBAL.md 新增「## 记忆架构（六层 + 两条辅助）—— 2026-10-10 定案」（用户明确授权编辑，插在「待办登记纪律」节后）。内容 = 六层表格（层 / 位置 / 记什么 / 谁来读·何时）：日报 … |
+| 10-10 15:28 | 纯文本分支可直接合并——写入 GLOBAL 常驻纪律（2026-10-10 用户拍板「合，并把它记忆进全局记忆」） | 合并：chore/retire-kg-skill-note-1010 @ 38e905a1 → main 8cb19750（1 文件 +18/−14，纯 SKILL.md 文本）。核查：无冲突 · 合并树 vs 分支树 … |
+| 10-13 12:58 | 用户偏好：「子代理」默认指会话子代理（2026-10-13，用户明确） | 用户明确：说「子代理 / sub-agent」时默认指会话子代理 = minis-sessions-cli send（跨会话派发 headless 会话），不是进程内 spawn_agent。 |
+| 10-13 13:12 | sweep-1013 收口：第二道门核实 + 三修复会话派发（2026-10-13） | 输入：三域审计报告齐（D1 数据层 10 条 / D2 安全面 11 条 / D3 UI 10 条，共 31 条），报告基线 main @ ad4a4beb。 |
 
 ## 23. 语音 / 多模态输入
 
@@ -2914,7 +2997,7 @@
 
 ## 24. 被否掉的方向（决策记录）
 
-**跨度** 2026-08-04 ～ 2026-10-06 · **44 条** · **状态** 持续累积（每条否决都带触发条件，可被未来重新打开）
+**跨度** 2026-08-04 ～ 2026-10-12 · **47 条** · **状态** 持续累积（每条否决都带触发条件，可被未来重新打开）
 
 **叙事**：08-07 多智能体协作 → **否掉** / 08-07 经验记忆模块 → **摘除** / 08-08 聊天模式 → **不加** / 08-08 灵动岛 → **砍掉** / 08-15 自动接力方案 → **不做** / 09-05 provider knobs + 连接测试 → **摘除** / 09-11 Obsidian 式插件系统 → **不做** / 09-13 图标重设计 → **放弃并回滚** / 09-14 U7 胶囊暂停 → **撤回（带触发条件）** / 09-14 U1..U11 中 8 项 → **归档不吸收**。**这份清单和「做了什么」同等重要**：它记录了边界是怎么被划出来的。
 
@@ -2964,6 +3047,9 @@
 | 09-29 00:21 | MEMORY-ROLLUP 重建预算实测 → 方向被数据否掉（09-29） | 方法：真源码离线预览（/var/minis/shared/work/rollup-preview-0929/，engine 0a58e4a5… / repository 28162b6f… 与 main 逐字节相同；ko… |
 | 09-29 00:26 | MEMORY-ROLLUP (b) 重合度核对完成 → 建议不做（09-29） | 三个数字（全 58 天，/var/minis/shared/work/rollup-preview-0929/overlap_check.py）： |
 | 10-06 17:43 | 外部项目吸收审查：OpenDots + Raven → backlog §67 全部登记不做（10-06） | 对象：OpenDots（CopilotKit，AI 同事模板，本质 = CopilotKit Intelligence 托管服务导流壳）+ Raven（EverMind，RSI 研究 harness，本质 = 云/容器基… |
+| 10-10 15:26 | GLOBAL 记忆架构章节 + 远端旧分支清理（2026-10-10，用户令「加进去，并且把云端的那个删掉吧」） | ① GLOBAL.md 新增「## 记忆架构（六层 + 两条辅助）—— 2026-10-10 定案」（用户明确授权编辑，插在「待办登记纪律」节后）。内容 = 六层表格（层 / 位置 / 记什么 / 谁来读·何时）：日报 … |
+| 10-11 00:37 | 修复「上下文超限静默终止」：fix/compact-stale-context-tokens-1010（2026-10-10，用户令「就按照你说的修吧」） | 根因（与我的初判不同，记录纠偏）：不是本地字符估算（bytes÷2.2）偏高——loopState.lastContextTokens 只有一个写入源（AgentLoopEngine.kt:1023/1029，来自 pr… |
+| 10-12 23:07 | NextPlayer 定制：底部导航移除 + 个人签名出包基建（2026-10-12） | 用户需求：fork alarmedvine/nextplayer（= 上游 anilbeesetti/nextplayer 干净 fork，main 与上游一致）。要求：①底部「可切换的胶囊导航」整体搬到设置页、入口页只… |
 
 ---
 
@@ -3122,3 +3208,12 @@
 | 10-10 12:16 | tg-tproxy 部署（2026-10-10） |
 | 10-10 12:33 | tg-tproxy 域名绑定完成（2026-10-10） |
 | 10-10 14:37 | 沙盒能力探测补充（2026-10-10 第二轮实验） |
+| 10-10 15:21 | 设备端修复的产物级验证（2026-10-10）：解包 APK 验真 |
+| 10-11 15:15 | RikkaMinis 现状与稳定度调查 + 报告集产出（2026-10-11，用户令「调查现状+开发史脱水，挂载文件夹开新文件夹存放」） |
+| 10-12 19:54 | 今日改动独立复核（2026-10-12 晚，用户令「再检查一遍今天的各种修改」） |
+| 10-12 19:57 | T3 报告勘误已修正（2026-10-12 晚，用户令「不要留下尾巴，处理了吧」） |
+| 10-12 20:07 | 保留装置 vs 发现装置——产出追踪未覆盖面（2026-10-12 晚，用户问「今天都是发现类但没发现多少，为什么」） |
+| 10-12 20:38 | 分支审查：test/md-parser-probe-1012（T5 产物）通过 |
+| 10-13 00:43 | PR #12 审查：log-rotation 分支发现 2 个真实缺陷并修复 → 合并 main ad4a4beb（2026-10-13） |
+| 10-13 01:15 | NextPlayer §86 拍板：「更多」页保留现状 |
+| 10-13 13:32 | 4 项全修（R1/R2/R3/R4），无已消失项；P2 一律未修。 |
