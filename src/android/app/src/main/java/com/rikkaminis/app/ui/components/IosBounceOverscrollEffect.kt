@@ -16,6 +16,7 @@ import androidx.compose.ui.unit.Velocity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import kotlin.math.abs
+import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.sign
 
@@ -69,7 +70,17 @@ class IosBounceOverscrollEffect(
         val curOffset = offset.value
         val sameSign = curOffset != 0f && sign(delta.y) != sign(curOffset)
         val preConsumed = if (sameSign) {
-            val correction = (-curOffset).coerceAtMost(abs(delta.y)) * sign(delta.y)
+            // [F-3 sweep1013] sign-symmetric unwind: pull back toward 0 by at
+            // most |curOffset|. The old `(-curOffset).coerceAtMost(abs(delta.y))`
+            // went NEGATIVE for top-edge overshoot (curOffset > 0) —
+            // coerceAtMost(positive) kept it negative, and × sign(delta.y)
+            // flipped it back to +curOffset, so snapTo(curOffset + correction)
+            // doubled the stretch (2×curOffset) instead of unwinding it, and
+            // preConsumed.y = +curOffset leaked the amplified delta to the
+            // inner scrollable. New form:
+            //   curOffset<0, delta.y>0 → correction = +min(|delta|,|cur|) (unchanged)
+            //   curOffset>0, delta.y<0 → correction = −min(|delta|,|cur|) → toward 0
+            val correction = sign(delta.y) * min(abs(delta.y), abs(curOffset))
             scope.launch { offset.snapTo(curOffset + correction) }
             Offset(0f, correction)
         } else {

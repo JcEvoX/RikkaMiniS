@@ -50,7 +50,9 @@ fun ProviderConnectionScreen(
 ) {
     val config by providerRepository.config.collectAsState()
     val instance = config.instances.find { it.id == instanceId } ?: run {
-        onBack()
+        // [F-2 sweep1013] composition-phase onBack() — wrap like
+        // ModelEntryDetailScreen.
+        LaunchedEffect(Unit) { onBack() }
         return
     }
 

@@ -597,7 +597,13 @@ fun SkillDetailScreen(
     val skill = skills.find { it.id == skillId }
     var deleted by remember { mutableStateOf(false) }
 
-    if (skill == null && !deleted) { onBack(); return }
+    if (skill == null && !deleted) {
+        // [F-2 sweep1013] onBack() during composition re-fires on every
+        // recomposition of this branch (double-pop risk) — wrap like
+        // ModelEntryDetailScreen.
+        LaunchedEffect(Unit) { onBack() }
+        return
+    }
     if (skill == null) return // Already deleted, just stop rendering
 
     var showDeleteDialog by remember { mutableStateOf(false) }
@@ -1136,7 +1142,12 @@ fun SkillFileViewerScreen(
 ) {
     val skills by skillRepository.skills.collectAsState()
     val skill = skills.find { it.id == skillId }
-    if (skill == null) { onBack(); return }
+    if (skill == null) {
+        // [F-2 sweep1013] composition-phase onBack() — wrap like
+        // ModelEntryDetailScreen.
+        LaunchedEffect(Unit) { onBack() }
+        return
+    }
 
     val isSkillMd = relativePath.equals("SKILL.md", ignoreCase = true)
     val fileName = relativePath.substringAfterLast('/')

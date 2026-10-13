@@ -111,7 +111,12 @@ fun ProviderDetailScreen(
     var deleted by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
-    if (instance == null && !deleted) { onBack(); return }
+    if (instance == null && !deleted) {
+        // [F-2 sweep1013] composition-phase onBack() — wrap like
+        // ModelEntryDetailScreen.
+        LaunchedEffect(Unit) { onBack() }
+        return
+    }
     if (instance == null) return
     val currentInstance = instance
 
