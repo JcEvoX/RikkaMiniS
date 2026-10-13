@@ -1361,12 +1361,7 @@ class ModelUseOffloadHandler(
      */
     private fun sessionScopedHostFile(linuxPath: String, sessionId: String?): File? {
         if (sessionId == null) return null
-        val m = Regex("^/var/minis/(attachments|offloads|workspace|browser)(/.*)?$").find(linuxPath)
-            ?: return null
-        val sub = m.groupValues[1]
-        val rest = m.groupValues[2].removePrefix("/")
-        val base = File(context.filesDir, "minis-sessions/$sessionId/$sub")
-        return if (rest.isEmpty()) base else File(base, rest)
+        return sessionScopedJoin(context.filesDir, sessionId, linuxPath)
     }
 
     /** [T-android-model-use-session-scoped-write] One-line audit of a model-use
@@ -1711,8 +1706,11 @@ class ModelUseOffloadHandler(
         val hostFile: File = sessionId?.let {
             PRootKernel.resolveSessionHostPath(it, linuxPath, context)
         } ?: PRootKernel.resolveHostPath(linuxPath)
-            ?: File(linuxPath).takeIf { it.exists() && it.isFile }
-            ?: throw ImageInputError("Image file not found at '$url'.")
+            ?: throw ImageInputError(
+                "Image file not found at '$url'. Host-absolute paths outside " +
+                    "the mounted scopes (/var/minis/*) are not readable from " +
+                    "minis-model-use.",
+            )
         if (!hostFile.exists() || !hostFile.isFile) {
             throw ImageInputError("Image file not found at '$url' (resolved to ${hostFile.absolutePath}).")
         }
@@ -1760,6 +1758,28 @@ class ModelUseOffloadHandler(
     }
 
     companion object {
+
+        /**
+         * [fix/sweep1013-security R1] Pure join for session-scoped host files,
+         * kept in the companion so the traversal guard is host-testable
+         * ([SessionScopedPathGuardTest]).
+         *
+         * Normalizes dot-segments and refuses `..` traversal / symlink
+         * escapes via [PRootKernel.safeResolveWithin] — the same guard as
+         * every other `File(base, userPath)` join. `File(base, rest)` alone
+         * (the pre-fix code) let a guest-supplied `--output` like
+         * `/var/minis/workspace/../../../debug_server_token` escape the
+         * session tree and land in host-private app storage (shared_prefs,
+         * debug token, logs, databases). Fail-closed: returns null for any
+         * path that isn't a session-scoped `/var/minis/<sub>` path or that
+         * would resolve outside the session tree.
+         */
+        internal fun sessionScopedJoin(filesDir: File, sessionId: String, linuxPath: String): File? {
+            val m = Regex("^/var/minis/(attachments|offloads|workspace|browser)(/.*)?$").find(linuxPath)
+                ?: return null
+            val base = File(filesDir, "minis-sessions/$sessionId/${m.groupValues[1]}")
+            return PRootKernel.safeResolveWithin(base, m.groupValues[2].removePrefix("/"))
+        }
         private const val TAG = "ModelUseOffload"
         private const val NO_MODELS_HINT =
             "No models available. Go to Settings > Model Groups to add models that the agent can use."

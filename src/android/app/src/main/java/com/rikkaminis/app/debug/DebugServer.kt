@@ -35,6 +35,20 @@ class DebugServer(
         private const val TAG = "DebugServer"
 
         /**
+         * [fix/sweep1013-security R4] Cap on the declared request body size.
+         * `Content-Length` arrives from the client before any validation of
+         * its value, and the reader used to allocate `CharArray(contentLength)`
+         * straight from that declaration — a single header like
+         * `Content-Length: 2147483647` from a token-holding caller (agent
+         * toolchain included) allocated ~4GB and OOM'd the main process.
+         * 8 MiB is far above any legitimate RPC payload (the biggest real
+         * bodies are JSON tool results; debug.readFile clamps to 4 MiB on the
+         * response side) and small enough that a hostile header can't hurt.
+         * Requests declaring more are rejected with 413 before allocation.
+         */
+        private const val MAX_BODY_BYTES = 8 * 1024 * 1024
+
+        /**
          * [T-android-debugserver-auth] Auth decision, kept pure for unit
          * testing. EVERY client — loopback AND LAN — must present the device
          * token. The previous model waived loopback because "adb forward is
@@ -251,8 +265,15 @@ class DebugServer(
                     sendResponse(writer, 400, rpcHandler.errorJSON(-32700, "Empty body"))
                     return
                 }
+                if (contentLength > MAX_BODY_BYTES) {
+                    sendResponse(
+                        writer, 413,
+                        rpcHandler.errorJSON(-32700, "Body too large: $contentLength bytes declared (limit $MAX_BODY_BYTES)"),
+                    )
+                    return
+                }
 
-                // Read body
+                // Read body — size already clamped by MAX_BODY_BYTES above.
                 val body = CharArray(contentLength)
                 var totalRead = 0
                 while (totalRead < contentLength) {

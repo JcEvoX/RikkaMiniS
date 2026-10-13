@@ -29,7 +29,28 @@ import java.net.SocketTimeoutException
  * Registration is guarded by `BuildConfig.DEBUG` in MinisApp.kt so the
  * Release APK contains no trace of this command.
  */
-class DebugOffloadHandler(@Suppress("UNUSED_PARAMETER") context: Context) : NativeOffloadHandler {
+class DebugOffloadHandler(private val context: Context) : NativeOffloadHandler {
+
+    /**
+     * [fix/sweep1013-security R3] Same source as [com.rikkaminis.app.debug.DebugServer]'s
+     * authToken: the per-install token persisted at `files/debug_server_token`.
+     * RC12 made DebugServer require that token from ALL clients (loopback
+     * included) but this in-repo client never followed — every `minis-debug`
+     * subcommand got 401 in debug builds (auth seam broken — fail-closed
+     * functionality wiped out).
+     * Read the same file and attach the header; when the file doesn't exist
+     * yet (server never started) send nothing and let the server's 401
+     * message guide the caller.
+     */
+    private val authToken: String? by lazy {
+        try {
+            val f = java.io.File(context.filesDir, "debug_server_token")
+            if (f.exists()) f.readText().trim().ifEmpty { null } else null
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
 
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
         val args = OffloadArgs(request.argv.drop(1), booleanFlags = BOOLEAN_FLAGS)
@@ -217,6 +238,9 @@ class DebugOffloadHandler(@Suppress("UNUSED_PARAMETER") context: Context) : Nati
                 append("Host: 127.0.0.1:$DEBUG_SERVER_PORT\r\n")
                 append("Content-Type: application/json\r\n")
                 append("Content-Length: ${bodyBytes.size}\r\n")
+                // [fix/sweep1013-security R3] DebugServer requires the per-install
+                // token from ALL clients (loopback included) since RC12.
+                if (authToken != null) append("X-Minis-Token: $authToken\r\n")
                 append("Connection: close\r\n")
                 append("\r\n")
             }.toByteArray(Charsets.UTF_8)
@@ -336,6 +360,11 @@ EXAMPLES:
 The handler talks to 127.0.0.1:$DEBUG_SERVER_PORT (DebugServer). If the server
 isn't running you'll see `debug_server_unreachable` — Release builds don't
 ship this command at all.
+
+AUTH: the server requires the per-install token from every client (loopback
+included). The handler reads it from the same file the server uses
+(`files/debug_server_token`) and sends `X-Minis-Token` automatically — no
+configuration needed.
 """
     }
 }
