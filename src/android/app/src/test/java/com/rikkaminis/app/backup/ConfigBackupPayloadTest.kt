@@ -413,6 +413,48 @@ class ConfigBackupPayloadTest {
         assertEquals("https://example.com/sse", server.getString("url"))
     }
 
+    // ── [review D-3] credential carriers beyond headers/env ──────────────
+
+    @Test
+    fun `stripMcpSecretValues blanks token-shaped args but keeps benign args`() {
+        val server = JSONObject()
+            .put("command", "npx")
+            .put(
+                "args",
+                JSONArray()
+                    .put("--token=ghp_literal_secret")
+                    .put("--port=8080")
+                    .put("-y")
+                    .put("--API_KEY=abc123def"),
+            )
+        ConfigBackup.stripMcpSecretValues(server)
+        val args = server.getJSONArray("args")
+        // Credential-shaped flags keep the flag name, lose the value —
+        // the restored entry still shows WHAT to refill.
+        assertEquals("--token=", args.getString(0))
+        assertEquals("--port=8080", args.getString(1))
+        assertEquals("-y", args.getString(2))
+        assertEquals("--API_KEY=", args.getString(3))
+    }
+
+    @Test
+    fun `stripMcpSecretValues redacts sensitive url query values keeps benign`() {
+        val server = JSONObject()
+            .put("url", "https://gateway.example.com/sse?key=supersecret&client=app#frag")
+        ConfigBackup.stripMcpSecretValues(server)
+        assertEquals(
+            "https://gateway.example.com/sse?key=[redacted:11]&client=app#frag",
+            server.getString("url"),
+        )
+    }
+
+    @Test
+    fun `stripMcpSecretValues leaves url without query untouched`() {
+        val server = JSONObject().put("url", "https://example.com/sse")
+        ConfigBackup.stripMcpSecretValues(server)
+        assertEquals("https://example.com/sse", server.getString("url"))
+    }
+
     // ── Skill frontmatter fallback (sweep1013-D1/F-8) ────────────────────
 
     private fun skillInfoFor(frontmatter: String, body: String): SkillInfo = object : SkillInfo {
