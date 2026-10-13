@@ -14,6 +14,7 @@ import com.rikkaminis.app.data.model.LLMUsage
 import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.provider.LLMProvider
 import com.rikkaminis.app.provider.ProviderBoundary
+import com.rikkaminis.app.provider.TOOL_LOG_INPUT_STEP_CHARS
 import com.rikkaminis.app.provider.causeChainSummary
 import com.rikkaminis.app.provider.asConsumerSideCancellation
 import com.rikkaminis.app.sandbox.offload.FirstChunkTimeoutPolicy
@@ -125,8 +126,11 @@ class OpenAIProvider constructor(
          * per-fragment lines, while keeping enough resolution to see
          * progress in the file. Measured cost of the unsampled line:
          * 251K lines / 33.5 MB per day = 74% of the worker's daily file.
+         *
+         * Value lives in ToolInputLogStep.kt (shared with AnthropicProvider —
+         * D-2 review note: duplicated consts drift). This companion name was
+         * removed; call sites resolve to the top-level constant.
          */
-        const val TOOL_LOG_INPUT_STEP_CHARS = 2048
         /**
          * [FIX-1 / F-186] Ceiling for a generated-image download we initiate
          * ourselves (the `url` branch of parseImageGenerationsResult). The

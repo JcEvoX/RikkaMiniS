@@ -18,6 +18,7 @@ import com.rikkaminis.app.data.model.LLMUsage
 import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.provider.ImageBudget
 import com.rikkaminis.app.provider.LLMProvider
+import com.rikkaminis.app.provider.TOOL_LOG_INPUT_STEP_CHARS
 import com.rikkaminis.app.provider.applyUserAgentOverride
 import com.rikkaminis.app.provider.extractHttpErrorMessage
 import com.rikkaminis.app.provider.safeOptString
@@ -933,12 +934,11 @@ class AnthropicProvider(
         /**
          * [T-toolinput-sample-1012] Granularity of the "→ ToolInputDelta"
          * debug line — one per this-many chars of accumulated tool-args
-         * growth (plus the first delta). Same rationale and value as
-         * OpenAIProvider.TOOL_LOG_INPUT_STEP_CHARS: the per-fragment line
-         * measured 251K lines / 33.5 MB per day (74% of the worker's daily
-         * file) while carrying only a length.
+         * growth (plus the first delta). Value lives in ToolInputLogStep.kt
+         * (shared with OpenAIProvider — D-2 review note: duplicated consts
+         * drift); the per-fragment line measured 251K lines / 33.5 MB per day
+         * (74% of the worker's daily file) while carrying only a length.
          */
-        const val TOOL_LOG_INPUT_STEP_CHARS = 2048
         /**
          * Parse the `-<major>-<minor>` (or `/<major>.<minor>`) version out of a Claude id.
          * [T-anthropic-temp-claude5-android] The minor segment is OPTIONAL and
