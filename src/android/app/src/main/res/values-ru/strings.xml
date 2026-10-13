@@ -1420,6 +1420,7 @@
     <string name="backup_done_mcp_servers">Восстановлено MCP-серверов: %1$d.</string>
     <string name="backup_done_skipped">\nПропущено элементов: %1$d:</string>
     <string name="backup_done_no_keys">\nЭта резервная копия не содержит ключей — для импортированных провайдеров необходимо повторно ввести API-ключи.</string>
+    <string name="backup_done_no_keys_mcp">\nЭта резервная копия не содержит ключей — для восстановленных MCP-серверов и переменных окружения необходимо повторно ввести учётные данные.</string>
     <string name="backup_done_restart">\nНекоторые настройки вступят в силу после перезапуска приложения.</string>
     <string name="backup_ok">ОК</string>
     <string name="backup_err_unknown">Неизвестная ошибка</string>

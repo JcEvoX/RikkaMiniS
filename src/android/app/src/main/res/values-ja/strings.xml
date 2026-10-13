@@ -1405,6 +1405,7 @@
     <string name="backup_done_mcp_servers">%1$d件のMCPサーバーを復元しました。</string>
     <string name="backup_done_skipped">\n%1$d件の項目がスキップされました:</string>
     <string name="backup_done_no_keys">\nこのバックアップにはキーが含まれていません — インポートしたプロバイダーではAPIキーの再入力が必要です。</string>
+    <string name="backup_done_no_keys_mcp">\nこのバックアップにはキーが含まれていません — 復元したMCPサーバーと環境変数では認証情報の再入力が必要です。</string>
     <string name="backup_done_restart">\n一部の設定はアプリを再起動すると有効になります。</string>
     <string name="backup_ok">OK</string>
     <string name="backup_err_unknown">不明なエラー</string>

@@ -1398,6 +1398,7 @@
     <string name="backup_done_mcp_servers">%1$d MCP-Server(s) wiederhergestellt.</string>
     <string name="backup_done_skipped">\n%1$d Elemente wurden übersprungen:</string>
     <string name="backup_done_no_keys">Dieses Backup enthält keine Schlüssel – importierte Anbieter müssen ihre API-Schlüssel erneut eingeben.</string>
+    <string name="backup_done_no_keys_mcp">Dieses Backup enthält keine Schlüssel – wiederhergestellte MCP-Server und Umgebungsvariablen benötigen neue Zugangsdaten.</string>
     <string name="backup_done_restart">Einige Einstellungen werden erst nach einem Neustart der App wirksam.</string>
     <string name="backup_ok">OK</string>
     <string name="backup_err_unknown">Unbekannter Fehler</string>

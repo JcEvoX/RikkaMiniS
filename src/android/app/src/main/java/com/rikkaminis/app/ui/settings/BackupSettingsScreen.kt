@@ -1385,6 +1385,22 @@ fun BackupSettingsScreen(
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }
+                    // [review D-4] Secret-less restores hit more than
+                    // providers: MCP headers/env/args and envVar values are
+                    // blanked too (sweep1013-D1/F-4 posture). A pure-MCP or
+                    // env-var restore from an auto backup previously showed
+                    // NO refill hint — the blanked values looked like
+                    // successful config. One line, shown whenever anything
+                    // credential-bearing was restored from a secret-less
+                    // payload.
+                    if (!report.hadSecrets && report.providersImported == 0 &&
+                        (report.mcpServersImported > 0 || report.envVarsImported > 0)
+                    ) {
+                        Text(
+                            stringResource(R.string.backup_done_no_keys_mcp),
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
                     // [fix-audit-p0-4] A fatal restore is NOT a normal one —
                     // surface the failure loudly and point at the rollback
                     // path instead of letting a half-applied config look ok.
