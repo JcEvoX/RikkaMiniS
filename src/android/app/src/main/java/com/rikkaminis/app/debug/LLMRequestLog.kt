@@ -70,8 +70,11 @@ object LLMRequestLog {
     fun clear() = entries.clear()
 
     /** Case-insensitive sensitive header names whose values must never be
-     *  emitted by the debug endpoint (they can contain API keys/tokens). */
-    private val SENSITIVE_HEADERS = setOf("authorization", "x-api-key", "cookie")
+     *  emitted by the debug endpoint (they can contain API keys/tokens).
+     *  [sweep-1013 D2-F5] `api-key` added: Azure-style OpenAI-compatible
+     *  gateways carry the credential in `api-key`, not `x-api-key` — both
+     *  spellings must be covered or a gateway switch silently un-redacts. */
+    private val SENSITIVE_HEADERS = setOf("authorization", "x-api-key", "api-key", "cookie")
 
     /** Sensitive URL query-parameter names. Values under these keys are
      *  replaced in `redactURL`. Matched case-insensitively. `key` is the
