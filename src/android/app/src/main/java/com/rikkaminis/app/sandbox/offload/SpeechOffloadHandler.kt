@@ -228,21 +228,24 @@ class SpeechOffloadHandler(private val context: Context) : NativeOffloadHandler 
 
     /**
      * Resolve a `/var/minis/...`-style Linux path to a host File via
-     * [PRootKernel]'s global bind-mount table. Per-session paths
+     * [PRootKernel]'s guarded resolvers only. Per-session paths
      * (attachments / offloads / workspace / browser) work as long as the
      * owning session is the most-recent shell to boot — last-writer-wins
      * per the kernel's documentation.
+     *
+     * [fix/sweep1013-security] Fail-closed: no `File(trimmed)` fallback.
+     * The previous `?: File(trimmed)` tail let an unresolvable absolute
+     * path (e.g. /data/data/.../databases/minis.db) read through as a raw
+     * host File — a guest → host read escape past both guards. Relative
+     * paths are rejected too (never documented; `File(rel)` on the host
+     * process resolves against an arbitrary cwd, not the guest's).
      */
     private fun resolveSourcePath(source: String, sessionId: String?): File? {
         val trimmed = source.trim()
-        if (trimmed.isEmpty()) return null
+        if (trimmed.isEmpty() || !trimmed.startsWith("/")) return null
         return try {
-            if (trimmed.startsWith("/")) {
-                sessionId?.let { PRootKernel.resolveSessionHostPath(it, trimmed, context) }
-                    ?: PRootKernel.resolveHostPath(trimmed) ?: File(trimmed)
-            } else {
-                File(trimmed)
-            }
+            sessionId?.let { PRootKernel.resolveSessionHostPath(it, trimmed, context) }
+                ?: PRootKernel.resolveHostPath(trimmed)
         } catch (e: Throwable) {
             AppLogger.warning(TAG, "resolveSourcePath('$trimmed') failed: ${e.message}")
             null
