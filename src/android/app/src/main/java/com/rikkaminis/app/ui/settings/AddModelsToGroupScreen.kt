@@ -14,6 +14,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -42,7 +43,9 @@ fun AddModelsToGroupScreen(
     val group = config.modelGroups.find { it.id == groupId }
 
     if (group == null) {
-        onBack()
+        // [F-2 sweep1013] composition-phase onBack() — wrap like
+        // ModelEntryDetailScreen.
+        LaunchedEffect(Unit) { onBack() }
         return
     }
 

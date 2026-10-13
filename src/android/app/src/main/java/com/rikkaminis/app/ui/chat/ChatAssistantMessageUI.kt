@@ -177,6 +177,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.staticCompositionLocalOf
@@ -1443,12 +1444,17 @@ internal fun ThinkingBlock(block: AssistantBlock, isStreaming: Boolean, isLast: 
                     }
                 }
             }
-            // Auto-follow: on every content growth, scroll to the new bottom.
-            // `snapshotFlow { block.content.length }` is recomposition-cheap
-            // and only ticks when the block's text actually grew.
+            // [F-1 sweep1013] `block` is a plain parameter, so the old
+            // snapshotFlow { block.content.length } registered no snapshot
+            // dependency and fired only once — the live tail froze after the
+            // first tick. rememberUpdatedState hands the closure a State whose
+            // .value tracks every recomposition, so content growth is
+            // observable again (same fix as StreamingMarkdownText f255; this
+            // is the second family occurrence).
+            val currentBlock by rememberUpdatedState(block)
             LaunchedEffect(scrollState, block.id, isStreaming) {
                 if (!isStreaming) return@LaunchedEffect
-                snapshotFlow { block.content.length }
+                snapshotFlow { currentBlock.content.length }
                     .collect {
                         if (userScrolledAway) return@collect
                         // scrollTo (not animateScrollTo) — animating fights
