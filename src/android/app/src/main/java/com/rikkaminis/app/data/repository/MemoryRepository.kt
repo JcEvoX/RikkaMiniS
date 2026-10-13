@@ -103,7 +103,12 @@ class MemoryRepository(private val memoryDir: File) {
             ?.filter {
                 it.extension == "md" &&
                     it.name != GLOBAL_FILE &&
-                    it.name != ROLLUP_FILE
+                    it.name != ROLLUP_FILE &&
+                    // Same exclusion as readRecentDailyLogs below: SOUL.md
+                    // lives in this directory but is not a daily log —
+                    // counting it could name it as "largest daily log" and
+                    // mislead the memory_rollup suggestion.
+                    it.name != SOUL_FILE
             }
             ?.map { it.name to it.length() }
             ?.sortedByDescending { it.second }
