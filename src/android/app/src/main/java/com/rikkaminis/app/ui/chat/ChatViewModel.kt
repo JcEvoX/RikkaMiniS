@@ -744,6 +744,33 @@ class ChatViewModel(
         for (id in drop) streamFlushStates.remove(id)?.trailingJob?.cancel()
     }
 
+    /**
+     * [fix/cancel-stale-publish] Message ids already reported as the target of
+     * a dropped late publish — one warning per id keeps the diagnostic
+     * reachable (the repo rule: never silently wrong) without letting a chatty
+     * tool's queued publishes flood the log. Bounded: cleared when it exceeds
+     * [STALE_PUBLISH_WARN_CAP], so a long session can't grow it unbounded.
+     */
+    private val stalePublishWarnedIds = mutableSetOf<String>()
+
+    /**
+     * [fix/cancel-stale-publish] Record that a late `isStreaming = true`
+     * publish for [id] was dropped because the row was already finalized (see
+     * [StaleStreamPublishPolicy]). Logs at most once per message id — the
+     * dropped publishes arrive in bursts (one per streamed shell line), and
+     * the count is not the signal, the fact is.
+     */
+    internal fun noteStaleStreamPublish(id: String) {
+        if (stalePublishWarnedIds.size >= STALE_PUBLISH_WARN_CAP) stalePublishWarnedIds.clear()
+        if (!stalePublishWarnedIds.add(id)) return
+        AppLogger.warning(
+            TAG_STREAM,
+            "dropped late streaming publish for finalized message id=$id " +
+                "(row isStreaming=false, no side-channel entry) — " +
+                "interrupt/teardown raced the writer",
+        )
+    }
+
     // Dual-path flush thresholds — ported from iOS. Time tiers scale with total
     // length; the newline fast-path flushes immediately on a line break once
     // enough new chars have accumulated, gated to short docs so dense
@@ -4287,6 +4314,13 @@ internal fun buildTurnPartsPure(
 // compact/revert failure chains (5+ calls typically fire within <100ms)
 // without delaying a genuinely spaced user-facing notice.
 private const val SYSINFO_COALESCE_WINDOW_MS = 200L
+
+// [fix/cancel-stale-publish] Upper bound on the warn-once set of message ids
+// whose late streaming publish was dropped (ChatViewModel.noteStaleStreamPublish).
+// Interrupts are rare relative to turns, so 32 keeps a whole session's worth of
+// ids without growing the set unboundedly; past that we start over (the
+// diagnostic value is per-incident, not cumulative).
+private const val STALE_PUBLISH_WARN_CAP = 32
 
 /** Pure: identity pass-through today; reserved for future dedup/trim rules. */
 internal fun coalesceSystemInfoBlocks(blocks: List<AssistantBlock>): List<AssistantBlock> = blocks
