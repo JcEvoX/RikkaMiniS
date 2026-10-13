@@ -29,7 +29,10 @@ class SessionScopedPathGuardTest {
     @get:Rule
     val tmp = TemporaryFolder()
 
-    private val filesDir: File get() = tmp.newFolder("files")
+    // Idempotent: safeResolveWithin only calls canonicalPath (no disk writes),
+    // so a shared `files` dir is fine; mkdirs() no-ops on the second call.
+    private val filesDir: File
+        get() = File(tmp.root, "files").apply { mkdirs() }
     private val sessionId = "371e1802-0254-4ca1-9b90-0bb4cdc74656"
 
     private fun sessionTree(): String =
