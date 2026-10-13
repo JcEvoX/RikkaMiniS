@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Four-way sync check v2 — Model ↔ Entity ↔ to-DB ↔ from-DB field consistency.
+Four-way sync check v2.1 — Model ↔ Entity ↔ to-DB ↔ from-DB field consistency.
 
 Background: Adding fields to a data class and forgetting to update any of the
 other layers causes silent data loss (GH#68 image-endpoint, ProviderInstance.pinned,
@@ -19,6 +19,15 @@ gap classes:
 Families that can't be resolved (no model data class, no constructor sites)
 are printed in an UNRESOLVED list — visible, exit 0, NOT failures. The
 coverage table makes the blind spot explicit instead of silent.
+
+v2.1 (2026-10-13, review D-1): v2's honest-UNRESOLVED design left the chat
+core tables (ChatSessionEntity / MessageEntity / …) silently unchecked —
+real-tree run printed "checked 4 · unresolved 6" next to "ALL CLEAN ✅".
+Those families are their own domain shape (no `ChatSession`/`Message` data
+class): ENTITY_SELF_FAMILIES now checks every column is written by SOME
+constructor site, with audited pins for DAO-written lifecycle columns.
+The Done line now carries the coverage counts so a "clean" can never again
+be read without its denominator.
 
 Usage: python3 scripts/scan/four_way_sync_check.py <repo_root>
 Exit code: 0 = clean (or unresolved-only), 1 = real field gaps found
@@ -94,6 +103,43 @@ KNOWN_MISMATCH = {
 # Entity-internal columns that legitimately have no model counterpart.
 LEGIT_ENTITY_ONLY = {"sortOrder"}
 
+# ── ENTITY_SELF_FAMILIES: entities checked against their OWN ctor sites ──
+# v2 left these UNRESOLVED (no `ChatSession`/`Message` domain data class
+# exists — the entity IS the domain shape). v2.1 checks every column is
+# written by SOME constructor site. The set is AUDITED-PINNED (each name has
+# a reason); an entity NOT listed and WITHOUT a domain data class still lands
+# in UNRESOLVED visibly, so a new chat-table-shaped entity can't slip through
+# silently.
+#
+# DAO_WRITTEN pins: lifecycle columns no constructor ever passes, written by
+# @Query UPDATE statements instead. Audited per entity (grepped ChatDao.kt).
+ENTITY_SELF_FAMILIES = {
+    # Chat core tables — the exact family "field saved nowhere" historically
+    # bites (session metadata, message parts/reasoning/usage columns).
+    "ChatSessionEntity",
+    "MessageEntity",
+    # Single-site entities where a dropped ctor arg would silently default.
+    "CompactMarkerEntity",
+    "ProviderAgentLoopIdEntity",
+    "ProviderConfigMetaEntity",   # positional ctor sites (KEY, value) — handled
+    "WebAppShortcutEntity",
+}
+POSITIONAL_ONLY_SITES = {
+    # ProviderConfigMetaEntity(KEY, value): every site is positional, so
+    # named-arg extraction sees 0 args. Each site assigns fields by ORDER;
+    # a no-named-args site is treated as "covers all non-defaulted fields".
+    "ProviderConfigMetaEntity",
+}
+DAO_WRITTEN = {
+    "MessageEntity": {
+        "updatedAt",          # ChatDao: UPDATE messages SET … updated_at
+        "streamInterruptCount",  # ChatDao: stream_interrupt_count = … + 1
+    },
+    "ChatSessionEntity": {
+        "updatedAt",          # ChatDao: UPDATE sessions SET updated_at
+    },
+}
+
 
 def read(path):
     with open(path, encoding="utf-8") as f:
@@ -128,12 +174,25 @@ def extract_data_class_fields(src, cls_name):
     return set(re.findall(r"\b(?:val|var)\s+(\w+)\s*:", body))
 
 
+def extract_defaulted_fields(src, cls_name):
+    """Fields of `data class <cls_name>` that declare a default (`= …`).
+    A fully positional ctor call can legally omit only these."""
+    m = re.search(r"data\s+class\s+" + re.escape(cls_name) + r"\s*\(", src)
+    if not m:
+        return set()
+    end = balanced(src, m.end() - 1, "(", ")")
+    if end < 0:
+        return set()
+    body = src[m.end():end]
+    return set(re.findall(r"\b(?:val|var)\s+(\w+)\s*:[^=]*=\s", body))
+
+
 def collect_ctor_sites(files, cls_name):
     """All `cls_name(` call sites across files, skipping the file that
     declares the class itself (the data-class header would otherwise be
     parsed as a call and default values as named args).
 
-    Returns (named_args_union, sites) where sites = [(relpath, line)].
+    Returns (named_args_union, sites) where sites = [(relpath, line, args)].
     """
     decl = re.compile(r"\bclass\s+" + re.escape(cls_name) + r"\b")
     call = re.compile(r"(?<![\w])" + re.escape(cls_name) + r"\s*\(")
@@ -147,8 +206,9 @@ def collect_ctor_sites(files, cls_name):
             if end < 0:
                 continue
             body = src[m.end():end]
-            args.update(re.findall(r"\b(\w+)\s*=\s*", body))
-            sites.append((rel, src.count("\n", 0, m.start()) + 1))
+            site_args = set(re.findall(r"\b(\w+)\s*=\s*", body))
+            args.update(site_args)
+            sites.append((rel, src.count("\n", 0, m.start()) + 1, site_args))
     return args, sites
 
 
@@ -188,9 +248,58 @@ def main():
     entities = discover_entities(DB_DIR, root)
 
     checked = []
+    entity_self_checked = []
     unresolved = []  # (entity, reason)
     for entity_name in sorted(entities):
         entity_fields = entities[entity_name]
+
+        # ── v2.1: entity-self families (no domain data class exists) ──
+        if entity_name in ENTITY_SELF_FAMILIES:
+            site_args, sites = collect_ctor_sites(files, entity_name)
+            if not sites:
+                unresolved.append(
+                    (entity_name, "entity-self family but no constructor "
+                     "site found — columns unchecked")
+                )
+                continue
+            entity_self_checked.append(entity_name)
+            dao = DAO_WRITTEN.get(entity_name, set())
+            positional = entity_name in POSITIONAL_ONLY_SITES
+            if positional:
+                # Every site assigns by ORDER — a site with zero extractable
+                # named args covers all non-defaulted fields by position.
+                entity_src = read(os.path.join(
+                    root, KOTLIN, DB_DIR, entity_name + ".kt"))
+                defaulted = extract_defaulted_fields(entity_src, entity_name)
+                site_args = entity_fields - defaulted
+                print(f"\n═══ {entity_name} — entity-self check "
+                      f"(positional ctor sites) ═══")
+            else:
+                print(f"\n═══ {entity_name} — entity-self check "
+                      f"(no domain data class) ═══")
+            print(f"  entity: {DB_DIR}/{entity_name}.kt · {len(sites)} ctor site(s)"
+                  + (f" · DAO-written pins: {sorted(dao)}" if dao else ""))
+            print(f"  Entity ({len(entity_fields)}): {sorted(entity_fields)}")
+            if not positional:
+                partial = {
+                    f: (sum(1 for _, _, a in sites if f in a), len(sites))
+                    for f in sorted(entity_fields & site_args)
+                    if sum(1 for _, _, a in sites if f in a) < len(sites)
+                }
+                for f, (n, total) in partial.items():
+                    print(f"  ℹ set by {n}/{total} site(s) (OK if the other sites "
+                          f"rely on the column default): {f}")
+            never = entity_fields - site_args - dao
+            if never:
+                problems += 1
+                print(f"  ❌ Column never written by ANY constructor site and not "
+                      f"DAO-written-pinned (saved as its default forever — if that "
+                      f"is intended, pin it in DAO_WRITTEN): {sorted(never)}")
+            else:
+                print(f"  ✅ Every column written by some constructor site "
+                      f"(or pinned DAO-written)")
+            continue
+
         model_name = entity_name[: -len("Entity")]
         model_name = FAMILY_MODEL_ALIASES.get(entity_name, model_name)
 
@@ -204,7 +313,8 @@ def main():
         if model_fields is None:
             unresolved.append(
                 (entity_name, f"no data class '{model_name}' under {KOTLIN} "
-                 "(domain shape not derivable — family unchecked)")
+                 "(domain shape not derivable — family unchecked; if the entity "
+                 "IS its own domain shape, pin it in ENTITY_SELF_FAMILIES)")
             )
             continue
 
@@ -266,6 +376,8 @@ def main():
     # ── Coverage table: the blind spot must be printed, not silent ─────────
     print(f"\n{'='*60}")
     print(f"Coverage: derived {len(entities)} entities · checked {len(checked)} "
+          f"+ entity-self {len(entity_self_checked)} "
+          f"(total {len(checked) + len(entity_self_checked)}) "
           f"· unresolved {len(unresolved)}")
     if unresolved:
         print("UNRESOLVED (visible, not failures — families NOT field-checked):")
@@ -273,7 +385,8 @@ def main():
             print(f"  - {name}: {reason}")
     if not entities:
         print("!! No Room entities found — scanner is blind on this tree.")
-    print(f"Done: {'PROBLEMS FOUND: ' + str(problems) if problems else 'ALL CLEAN ✅'}")
+    print(f"Done: {'PROBLEMS FOUND: ' + str(problems) if problems else 'ALL CLEAN ✅'} "
+          f"[checked {len(checked) + len(entity_self_checked)}/{len(entities)}]")
 
     if not entities:
         return 1  # fail loud: a tree with no derivable families is a rot signal
