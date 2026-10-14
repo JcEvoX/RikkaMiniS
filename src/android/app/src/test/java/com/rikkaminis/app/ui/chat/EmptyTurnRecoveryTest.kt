@@ -313,4 +313,86 @@ class EmptyTurnRecoveryTest {
             "$relative not found from user.dir=${System.getProperty("user.dir")}",
         )
     }
+
+    // ── [fix/rv1014-g2] AppendStandalone must bridge the USER tail ─────────
+
+    @Test
+    fun appendStandalone_bridgesUserTail_noConsecutiveUser() {
+        // History at the AppendStandalone decision: a USER statement tail and
+        // the empty assistant turn the loop just appended (last entry).
+        val history = mutableListOf(
+            userText("hi"),
+            assistant("done"),
+            userText("please continue"), // USER tail — the plan pre-condition
+            emptyAssistant,
+        )
+        EmptyTurnRecovery.appendStandaloneReminderTurn(history, EmptyTurnRecovery.REMINDER)
+        // The empty assistant is dropped; a bridge (empty ASSISTANT) is
+        // inserted before the reminder turn, so roles strictly alternate.
+        assertEquals(
+            listOf(
+                LLMMessage.Role.USER,
+                LLMMessage.Role.ASSISTANT,
+                LLMMessage.Role.USER,
+                LLMMessage.Role.ASSISTANT,
+                LLMMessage.Role.USER,
+            ),
+            history.map { it.role },
+        )
+        // The reminder turn carries the reminder in content AND parts.
+        val reminderTurn = history.last()
+        assertEquals(EmptyTurnRecovery.REMINDER, reminderTurn.content)
+        assertTrue(reminderTurn.contentParts.size == 1)
+        assertTrue((reminderTurn.contentParts.first() as AgentContentPart.Text).text == EmptyTurnRecovery.REMINDER)
+        // The bridge is a blind-content assistant row (same shape as the
+        // interruption bridge).
+        val bridge = history[3]
+        assertEquals(LLMMessage.Role.ASSISTANT, bridge.role)
+        assertTrue(bridge.content.isEmpty())
+    }
+
+    @Test
+    fun appendStandalone_noBridgeOnAssistantTail() {
+        // The function is generic: a non-USER tail gets no bridge (the plan
+        // never routes here, but the bridge is only needed for USER tails).
+        val history = mutableListOf(userText("hi"), assistant(""))
+        EmptyTurnRecovery.appendStandaloneReminderTurn(history, EmptyTurnRecovery.REMINDER)
+        assertEquals(
+            listOf(LLMMessage.Role.USER, LLMMessage.Role.ASSISTANT, LLMMessage.Role.USER),
+            history.map { it.role },
+        )
+    }
+
+    @Test
+    fun appendStandalone_defectDifferential_withoutBridge_yieldsConsecutiveUser() {
+        // Documents WHY the bridge matters: the old inline mutation (drop +
+        // blind USER append) leaves two consecutive user contents, and Gemini
+        // maps messages 1:1 with no consecutive-role merge on the request
+        // side. This mirrors the pre-fix behaviour verbatim.
+        val history = mutableListOf(
+            userText("please continue"),
+            emptyAssistant,
+        )
+        history.removeAt(history.size - 1)
+        history.add(
+            LLMMessage(
+                role = LLMMessage.Role.USER,
+                content = EmptyTurnRecovery.REMINDER,
+                contentParts = listOf(AgentContentPart.Text(EmptyTurnRecovery.REMINDER)),
+            ),
+        )
+        assertEquals(LLMMessage.Role.USER, history[0].role)
+        assertEquals(LLMMessage.Role.USER, history[1].role) // two consecutive USER — the defect
+    }
+
+    @Test
+    fun engine_appendStandalone_arm_delegatesToThePureMutation() {
+        // The loop arm must route through the shared mutation (so it stays
+        // tested) instead of inlining its own history surgery.
+        val engine = readRepoFile("src/android/app/src/main/java/com/rikkaminis/app/ui/chat/AgentLoopEngine.kt")
+        assertTrue(
+            "AppendStandalone arm must call appendStandaloneReminderTurn",
+            engine.contains("EmptyTurnRecovery.appendStandaloneReminderTurn(host.agentHistory, EmptyTurnRecovery.REMINDER)"),
+        )
+    }
 }

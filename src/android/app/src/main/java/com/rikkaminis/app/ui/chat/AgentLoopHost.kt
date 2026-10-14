@@ -179,6 +179,20 @@ internal interface AgentLoopHost {
 
     // ── run lifecycle extras ──────────────────────────────────────────────
     fun generateSessionTitleIfNeeded()
+
+    /**
+     * [fix/rv1014-g1] Semantic auto-title trigger: does the session still need
+     * a title? Replaces the positional `turn == 0` guard at the loop's two
+     * auto-title call sites — a first turn that stalls (empty round + recovery
+     * retry) reaches the decision point with turn != 0, and under the old
+     * positional condition the auto-title was skipped until the next send (or
+     * forever). Shares one criterion with [generateSessionTitleIfNeeded]'s
+     * internal "title-already-set" guard so the two can never drift; the
+     * function's own guards (in-flight / max-attempts / already-set) keep it
+     * idempotent, so repeated true reads never duplicate or overwrite a
+     * user-edited title.
+     */
+    val sessionTitleNeedsGeneration: Boolean
     suspend fun injectQueuedPromptsAsNewTurn(
         finishedAssistantId: String,
         finishedAccumulatedText: String,

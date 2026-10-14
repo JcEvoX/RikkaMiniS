@@ -1404,6 +1404,10 @@ class ChatViewModel(
         ): Flow<LLMStreamChunk> = this@ChatViewModel.streamChatTurnOffloaded(
             provider, messages, systemPrompt, maxTokens, temperature, imageParts, tools, thinkingLevel)
         override fun generateSessionTitleIfNeeded() = this@ChatViewModel.generateSessionTitleIfNeeded()
+        // [fix/rv1014-g1] Semantic auto-title trigger (shared criterion with
+        // the title-already-set guard inside generateSessionTitleIfNeeded).
+        override val sessionTitleNeedsGeneration: Boolean
+            get() = sessionTitleNeedsGenerationOf(_sessionTitle.value)
         override suspend fun injectQueuedPromptsAsNewTurn(
             finishedAssistantId: String,
             finishedAccumulatedText: String,

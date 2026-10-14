@@ -2358,16 +2358,14 @@ internal class AgentLoopEngine(
                         is EmptyTurnRecovery.Plan.AppendStandalone -> {
                             loopState.didInjectEmptyToolReminder = true
                             AppLogger.warning(TAG_STREAM, "empty turn — appending standalone reminder turn and retrying one round (turn=$turn)")
-                            // The empty assistant turn was just appended (above) — drop it.
-                            host.agentHistory.removeAt(host.agentHistory.size - 1)
-                            val reminder = EmptyTurnRecovery.REMINDER
-                            host.agentHistory.add(
-                                LLMMessage(
-                                    role = LLMMessage.Role.USER,
-                                    content = reminder,
-                                    contentParts = listOf(AgentContentPart.Text(reminder)),
-                                )
-                            )
+                            // [fix/rv1014-g2] The mutation lives in
+                            // EmptyTurnRecovery so it is JVM-testable: it drops
+                            // the empty assistant turn, bridges the USER tail
+                            // (a blind USER append yields two consecutive user
+                            // roles — Gemini maps messages 1:1 with no
+                            // consecutive-role merge on the request side),
+                            // then appends the standalone reminder turn.
+                            EmptyTurnRecovery.appendStandaloneReminderTurn(host.agentHistory, EmptyTurnRecovery.REMINDER)
                             continue
                         }
                         EmptyTurnRecovery.Plan.GiveUp -> {
@@ -2391,8 +2389,17 @@ internal class AgentLoopEngine(
                     }
                     withContext(Dispatchers.Main) { host.setInlineError(hint) }
                 }
-                // Auto-title after first exchange
-                if (turn == 0) host.generateSessionTitleIfNeeded()
+                // [fix/rv1014-g1] Auto-title: semantic condition, not
+                // positional. The old `turn == 0` guard fired the title
+                // generation only when the FIRST model round completed without
+                // recovery — but a first turn that came back empty (clean
+                // finish) goes through the recovery retry as turn 1, so by the
+                // time a clean round completed `turn == 0` was already false
+                // and the title was skipped until the next send (or forever if
+                // the user never sent again). The semantic condition fires
+                // while the title is genuinely ungenerated; the host
+                // function's own guards keep it idempotent.
+                if (host.sessionTitleNeedsGeneration) host.generateSessionTitleIfNeeded()
 
                 // [T-truncated-stream-retry] The provider signalled the model
                 // turn ended WITHOUT a server finish_reason (EOF / connection
@@ -3076,8 +3083,14 @@ internal class AgentLoopEngine(
                 dbMessageId = toolResultDbId,
             ))
 
-            // Auto-title after first exchange (mirrors iOS host.generateSessionTitleIfNeeded)
-            if (turn == 0) {
+            // [fix/rv1014-g1] Auto-title after first exchange — semantic
+            // condition (mirrors iOS host.generateSessionTitleIfNeeded). Same
+            // rationale as the no-tool path above: `turn == 0` skipped the
+            // title whenever the first round went through recovery or
+            // EOF-truncation continuation (turn already advanced); the
+            // semantic condition fires whenever the title is ungenerated and
+            // the host function's own guards keep it idempotent.
+            if (host.sessionTitleNeedsGeneration) {
                 host.generateSessionTitleIfNeeded()
             }
 
