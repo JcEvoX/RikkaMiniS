@@ -9,8 +9,8 @@ import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
+import java.time.Instant
 import java.util.Calendar
-import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 
@@ -47,10 +47,11 @@ class SessionsOffloadHandler(
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
         // argv[0] is the program name ("minis-sessions-cli"); subcommand
         // and options follow. Drop argv[0] before parsing so positional[0]
-        // is the subcommand name. `full` is declared boolean so
-        // `--full <token>` never greedily consumes the next token as a value
-        // (e.g. `--full` placed before the subcommand).
-        val args = OffloadArgs(request.argv.drop(1), booleanFlags = setOf("full"))
+        // is the subcommand name. `full` / `async` / `help` are declared
+        // boolean so `--flag <token>` never greedily consumes the next token
+        // as a value (e.g. `--async send --prompt "hi"` would otherwise
+        // swallow "send" as the value of --async and degrade to `list`).
+        val args = OffloadArgs(request.argv.drop(1), booleanFlags = setOf("full", "async", "help", "h"))
         if (args.hasFlag("h", "help")) {
             return NativeOffloadResult(0, OffloadOutput.formatBody(HELP_TEXT, args) + "\n")
         }
@@ -101,8 +102,8 @@ class SessionsOffloadHandler(
         for (m in metas) {
             val s = JSONObject()
                 .put("session_id", m.id)
-                .put("started_at", DATE_FMT.format(Date(m.startedAt)))
-                .put("last_active", DATE_FMT.format(Date(m.lastActive)))
+                .put("started_at", DATE_FMT.format(Instant.ofEpochMilli(m.startedAt)))
+                .put("last_active", DATE_FMT.format(Instant.ofEpochMilli(m.lastActive)))
                 .put("message_count", m.messageCount)
             // Optional fields — only emit when non-null so the JSON
             // matches iOS's `(optional)` shape rather than carrying
@@ -146,7 +147,7 @@ class SessionsOffloadHandler(
                     .put("session_id", m.sessionId)
                     .put("message_id", m.messageId)
                     .put("role", m.role)
-                    .put("created_at", DATE_FMT.format(Date(m.createdAt)))
+                    .put("created_at", DATE_FMT.format(Instant.ofEpochMilli(m.createdAt)))
                     .put("snippet", m.snippet),
             )
         }
@@ -205,7 +206,7 @@ class SessionsOffloadHandler(
             val obj = JSONObject()
                 .put("message_id", m.messageId)
                 .put("role", m.role)
-                .put("created_at", DATE_FMT.format(Date(m.createdAt)))
+                .put("created_at", DATE_FMT.format(Instant.ofEpochMilli(m.createdAt)))
                 .put("text", m.text)
             // Only present when the stored text exceeded the cap, so normal
             // messages serialize byte-identically to before (iOS parity).
@@ -380,9 +381,15 @@ class SessionsOffloadHandler(
         // for invalid CLI args, distinct from exit 1 for runtime errors.
         private const val EXIT_INVALID_ARGS = 2
 
-        private val DATE_FMT = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.US).apply {
-            timeZone = TimeZone.getDefault()
-        }
+        // [FIX-R16/B26b] Immutable + thread-safe formatter — the same pattern
+        // as HangDetector.DATE_FORMAT / CrashFileSender.STAMP_FMT. cmdList /
+        // cmdSearch / cmdMessages may format concurrently (any offload handler
+        // call can land on a different worker thread), and a shared
+        // SimpleDateFormat is not thread-safe — it can emit a garbled stamp
+        // exactly when the agent reads the transcript.
+        private val DATE_FMT: java.time.format.DateTimeFormatter =
+            java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm", Locale.US)
+                .withZone(java.time.ZoneId.systemDefault())
 
         private const val HELP_TEXT = """minis-sessions-cli - Query historical chat sessions and messages
 
