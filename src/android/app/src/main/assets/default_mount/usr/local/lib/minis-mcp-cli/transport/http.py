@@ -29,6 +29,27 @@ TIMEOUT_SECONDS = 300  # 5 min
 _ENV_RE = re.compile(r"\$\$?\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
 
 
+SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+SERVER_NAME_MAX = 128
+
+
+def validate_server_name(name, field="server name"):
+    """[sweep1014-D4a] Refuse-instead-of-guess guard for names that are joined
+    into file paths (oauth bridge / secret handoff). Whitelist: letters,
+    digits, '.', '_', '-'; rejects empty, overlong, '/', and the literal '..'.
+    Raises MCPError(PARSE_ERROR) naming the offending field; never truncates."""
+    if not isinstance(name, str) or not name:
+        raise MCPError("PARSE_ERROR", "%s must not be empty" % field)
+    if len(name) > SERVER_NAME_MAX:
+        raise MCPError("PARSE_ERROR", "%s too long (max %d chars)" % (field, SERVER_NAME_MAX))
+    if name == ".." or not SERVER_NAME_RE.match(name):
+        raise MCPError(
+            "PARSE_ERROR",
+            "%s contains invalid characters (allowed: letters, digits, '.', '_', '-'): %r"
+            % (field, name))
+    return name
+
+
 class MCPError(Exception):
     def __init__(self, code, message):
         super().__init__(message)
@@ -99,6 +120,7 @@ OAUTH_DIR = "/var/minis/mcp-servers/oauth"
 
 
 def _oauth_token_path(server_name):
+    validate_server_name(server_name, "server name")
     return os.path.join(OAUTH_DIR, "%s.json" % server_name)
 
 
@@ -143,6 +165,11 @@ class HTTPTransport:
         self.oauth_cfg = server.get("oauth") if isinstance(server.get("oauth"), dict) else None
         self._id = 0
         self._session_id = None
+        # [sweep1014-P3] Warm handshake: initialize once per transport, not once
+        # per tool call. list_tools/call_tool skip the handshake when this is
+        # True, so a warm daemon session costs 1 POST instead of 3 and keeps
+        # the server's session context alive across calls.
+        self._initialized = False
 
     def _next_id(self):
         self._id += 1
@@ -290,6 +317,7 @@ class HTTPTransport:
                 "clientInfo": {"name": "minis-mcp-cli", "version": "1.0.0"},
             },
         )
+        self._initialized = True
         # MCP requires a notifications/initialized after a successful init.
         try:
             self._post("notifications/initialized", notify=True)
@@ -297,16 +325,50 @@ class HTTPTransport:
             pass
         return result
 
+    def _handshake_if_needed(self):
+        """[sweep1014-P3] Only handshake when not already initialized (warm
+        reuse: 1 POST per call instead of initialize + notifications/initialized
+        + the call itself)."""
+        if not self._initialized:
+            self.initialize()
+
+    def _with_session_retry(self, fn):
+        """[sweep1014-P3] Run fn after handshaking if needed. A stale
+        Mcp-Session-Id (server restarted / session expired) surfaces as
+        HTTP 404/400 on a server that issued us a session: reset the cached
+        state, re-handshake once, and retry the call exactly once."""
+        self._handshake_if_needed()
+        try:
+            return fn()
+        except MCPError as exc:
+            stale = (
+                exc.code == "CONNECTION_ERROR"
+                and self._session_id
+                and ("HTTP 404" in (exc.message or "") or "HTTP 400" in (exc.message or ""))
+            )
+            if not stale:
+                raise
+            self._session_id = None
+            self._initialized = False
+            self.initialize()
+            return fn()
+
     def list_tools(self):
-        self.initialize()
-        result = self._post("tools/list")
-        return (result or {}).get("tools", [])
+        def _list():
+            result = self._post("tools/list")
+            return (result or {}).get("tools", [])
+        return self._with_session_retry(_list)
 
     def call_tool(self, tool, arguments):
-        self.initialize()
-        return self._post("tools/call", {"name": tool, "arguments": arguments or {}})
+        def _call():
+            return self._post("tools/call", {"name": tool, "arguments": arguments or {}})
+        return self._with_session_retry(_call)
 
     def ping(self):
-        """Round-trip initialize as a reachability check."""
+        """Fresh initialize round-trip as a reachability check. Bypasses the
+        cached-initialized fast path on purpose: a ping that short-circuits
+        would never detect a dead server."""
+        self._initialized = False
+        self._session_id = None
         self.initialize()
         return True

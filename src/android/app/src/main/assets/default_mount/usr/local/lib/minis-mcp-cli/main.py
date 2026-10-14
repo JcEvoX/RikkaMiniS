@@ -36,7 +36,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from transport.http import MCPError  # noqa: E402
+from transport.http import MCPError, validate_server_name  # noqa: E402
 from utils import config  # noqa: E402
 
 LOG_PATH = "/var/minis/mcp-servers/mcp-cli.log"
@@ -270,6 +270,21 @@ def call_daemon(request, pretty):
 
 # --- argument helpers -------------------------------------------------------
 
+def _parse_value(v):
+    """[sweep1014-D4b] key=value values are parsed as JSON literals first so
+    typed tool schemas work straight from the CLI: limit=10 → int,
+    recursive=true → bool, q=[1,2] → array, q={"a":1} → object. Anything that
+    isn't valid JSON (and the empty string) stays a plain string. To force a
+    string that looks like JSON, quote it: q='"10"' → "10". The --input '{}'
+    path is unaffected."""
+    if v == "":
+        return v
+    try:
+        return json.loads(v)
+    except ValueError:
+        return v
+
+
 def _pop_flag(args, name):
     """Remove a boolean flag; return True if present."""
     if name in args:
@@ -350,11 +365,13 @@ def cmd_call(args, pretty):
             arguments = json.loads(raw_input)
         except ValueError as exc:
             _fail("invalid --input JSON: %s" % exc, "PARSE_ERROR", name, pretty)
-    # key=value pairs override / extend the --input object.
+    # key=value pairs override / extend the --input object. Values are parsed
+    # as JSON literals first ([sweep1014-D4b]) so integer/boolean/array schema
+    # params arrive typed, not as strings.
     for token in rest:
         if "=" in token:
             k, v = token.split("=", 1)
-            arguments[k] = v
+            arguments[k] = _parse_value(v)
         else:
             _fail("unexpected argument: %s" % token, "PARSE_ERROR", name, pretty)
     result = call_daemon({"cmd": "call", "server": name, "tool": tool, "args": arguments}, pretty)
@@ -376,6 +393,10 @@ def cmd_add(args, pretty):
     name = _pop_opt(args, "--name")
     if not name:
         _fail("add requires --name", "PARSE_ERROR", None, pretty)
+    # [sweep1014-D4a] The name is joined into file paths (client-secret handoff
+    # `<oauth-dir>/<name>.secret`, oauth bridge) — whitelist it at the write
+    # path, refuse rather than guess.
+    validate_server_name(name, "--name")
     url = _pop_opt(args, "--url")
     command = _pop_opt(args, "--command")
     note = _pop_opt(args, "--note")
@@ -525,6 +546,10 @@ Commands:
   call <server> <tool> [--input '{}'] [key=value ...]
                                         Invoke a tool. --input is a JSON object;
                                         trailing key=value pairs extend/override it.
+                                        key=value values are parsed as JSON literals
+                                        first (limit=10 → int, recursive=true → bool,
+                                        q=[1,2] → array); non-JSON values stay strings.
+                                        To force a string, quote it: q='"10"'.
   add --name <n> --url <url> [--header "K: V" ...] [--note "..."]
   add --name <n> --command <cmd> [--args "..."] [--env "K=V" ...] [--note "..."]
       [--startup-timeout <seconds>]
