@@ -158,24 +158,29 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
         val limit = args.getInt("limit") ?: args.getInt("max") ?: DEFAULT_LIMIT
         val calFilter = args.get("calendar")
 
+        // [sweep1014-B25a] Query CalendarContract.Instances instead of Events:
+        // Instances auto-expands RRULE recurrences, and the BEGIN/END
+        // window-intersection selection below (same shape as doFreebusy's
+        // `DTSTART < end AND DTEND > start`) keeps multi-day and in-progress
+        // events visible. The old Events query only matched rows whose
+        // *start* fell inside the window, silently dropping those.
         val projection = arrayOf(
-            CalendarContract.Events._ID,
-            CalendarContract.Events.TITLE,
-            CalendarContract.Events.DTSTART,
-            CalendarContract.Events.DTEND,
-            CalendarContract.Events.EVENT_LOCATION,
-            CalendarContract.Events.DESCRIPTION,
-            CalendarContract.Events.ALL_DAY,
-            CalendarContract.Events.CALENDAR_ID,
-            CalendarContract.Events.CALENDAR_DISPLAY_NAME,
+            CalendarContract.Instances.EVENT_ID,
+            CalendarContract.Instances.TITLE,
+            CalendarContract.Instances.BEGIN,
+            CalendarContract.Instances.END,
+            CalendarContract.Instances.EVENT_LOCATION,
+            CalendarContract.Instances.DESCRIPTION,
+            CalendarContract.Instances.ALL_DAY,
+            CalendarContract.Instances.CALENDAR_ID,
+            CalendarContract.Instances.CALENDAR_DISPLAY_NAME,
         )
-        val selection = "${CalendarContract.Events.DTSTART} >= ? AND ${CalendarContract.Events.DTSTART} <= ?"
-        val selArgs = arrayOf(startMs.toString(), endMs.toString())
-        val sort = "${CalendarContract.Events.DTSTART} ASC"
+        val (selection, selArgs) = instancesWindowSelection(startMs, endMs)
+        val sort = "${CalendarContract.Instances.BEGIN} ASC"
 
         val cursor = try {
             context.contentResolver.query(
-                CalendarContract.Events.CONTENT_URI, projection, selection, selArgs, sort,
+                CalendarContract.Instances.CONTENT_URI, projection, selection, selArgs, sort,
             )
         } catch (e: SecurityException) {
             return NativeOffloadResult(77, providerBlockedJson("READ_CALENDAR", e, args))
@@ -256,9 +261,15 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
             ?: return NativeOffloadResult(2, "android-calendar create: --title is required\n")
         val startStr = args.get("start")
             ?: return NativeOffloadResult(2, "android-calendar create: --start is required\n")
-        val startMs = parseDate(startStr)
+        // [sweep1014-B25b] All-day events must be anchored at UTC midnight
+        // (EVENT_TIMEZONE = "UTC" below per CalendarContract docs) — parse
+        // zone-less dates in UTC, not the device zone. In UTC+8 the old
+        // local-midnight parse landed a 2026-10-14 all-day event on 10-13.
+        val isAllDay = args.hasFlag("all-day")
+        val startMs = (if (isAllDay) parseDateUtc(startStr) else parseDate(startStr))
             ?: return NativeOffloadResult(2, "android-calendar: invalid --start '$startStr'\n")
-        val endMs = args.get("end")?.let { parseDate(it) } ?: (startMs + 60 * 60 * 1000L)
+        val endMs = args.get("end")?.let { if (isAllDay) parseDateUtc(it) else parseDate(it) }
+            ?: (startMs + 60 * 60 * 1000L)
         // Notes — apple-calendar uses --notes; --description kept as alias.
         val notes = args.get("notes") ?: args.get("description")
         val alarmMinutes = args.getInt("alarm")
@@ -701,7 +712,23 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
         return OffloadOutput.formatBody(body, args) + "\n"
     }
 
-    private fun parseDate(s: String): Long? {
+    private fun parseDate(s: String): Long? =
+        parseDateInZone(s, System.currentTimeMillis(), TimeZone.getDefault())
+
+    /**
+     * [sweep1014-B25b] parseDate variant that resolves zone-less inputs
+     * against UTC instead of the device zone. All-day events must be
+     * anchored at UTC midnight (EVENT_TIMEZONE = "UTC" per CalendarContract
+     * docs); parsing "2026-10-14" with the device zone in UTC+8 produced
+     * local midnight (= 10-13T16:00Z), shifting the all-day event a day.
+     */
+    private fun parseDateUtc(s: String): Long? =
+        parseDateInZone(s, System.currentTimeMillis(), TimeZone.getTimeZone("UTC"))
+
+    /** Core date parser; [zone] only affects inputs without an explicit
+     *  offset ('Z' and ±HH:MM formats always honor their own zone).
+     *  internal + nowMs injected so it can be JVM-tested verbatim. */
+    internal fun parseDateInZone(s: String, nowMs: Long, zone: TimeZone): Long? {
         // Relative offsets (apple-calendar parity): "-7d", "-2h", "+30m".
         val rel = Regex("""^([+-]?)(\d+)([dhm])$""").matchEntire(s.trim())
         if (rel != null) {
@@ -713,7 +740,7 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
                 "m" -> 60 * 1000L
                 else -> return null
             }
-            return System.currentTimeMillis() + sign * n * unitMs
+            return nowMs + sign * n * unitMs
         }
         val formats = listOf(
             "yyyy-MM-dd'T'HH:mm:ssXXX",
@@ -725,7 +752,7 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
         for (f in formats) {
             try {
                 val sdf = SimpleDateFormat(f, Locale.US).apply {
-                    timeZone = if (f.endsWith("'Z'")) TimeZone.getTimeZone("UTC") else TimeZone.getDefault()
+                    timeZone = if (f.endsWith("'Z'")) TimeZone.getTimeZone("UTC") else zone
                 }
                 return sdf.parse(s)?.time
             } catch (_: Throwable) {}
@@ -736,6 +763,28 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
     companion object {
         private const val TAG = "CalendarOffload"
         private const val DEFAULT_LIMIT = 50
+
+        // [sweep1014-B25a] Pure window-intersection predicate for a calendar
+        // instance (or event) against the query window: the occurrence
+        // overlaps the window iff it starts before the window ends AND ends
+        // after the window starts — same shape as doFreebusy's
+        // `DTSTART < ?end AND DTEND > ?start`. Internal+pure so the
+        // semantics are JVM-testable; [instancesWindowSelection] must stay
+        // in sync with this predicate.
+        internal fun instanceOverlapsWindow(
+            instStartMs: Long,
+            instEndMs: Long,
+            winStartMs: Long,
+            winEndMs: Long,
+        ): Boolean = instStartMs < winEndMs && instEndMs > winStartMs
+
+        // [sweep1014-B25a] Selection + selectionArgs for the Instances
+        // window-intersection query. Args order is load-bearing: winEndMs
+        // binds to BEGIN's placeholder, winStartMs to END's.
+        internal fun instancesWindowSelection(winStartMs: Long, winEndMs: Long): Pair<String, Array<String>> =
+            "${CalendarContract.Instances.BEGIN} < ? AND ${CalendarContract.Instances.END} > ?" to
+                arrayOf(winEndMs.toString(), winStartMs.toString())
+
         private const val HELP = """android-calendar — list, create, update, delete events; query free/busy
                                     (mirrors apple-calendar)
 
