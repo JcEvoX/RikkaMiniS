@@ -284,8 +284,10 @@ internal fun scanThinkTags(
  *    artifact.
  *  - CODE SPANS are skipped: 0/10 artifacts were inside code, while every
  *    deliberate quotation of the token in the same corpus (`` `</thinking>` ``
- *    in prose) was inside backticks. Backtick parity covers inline spans and
- *    fenced blocks alike.
+ *    in prose) was inside backticks. Backtick parity covers inline spans;
+ *    fenced blocks are handled by line-start ``` fence detection ([B14a]) —
+ *    fence content is copied verbatim and the fence state never leaks into
+ *    inline-span parity.
  *
  * Known boundary: a bare (unbackticked) prose mention of the token is
  * indistinguishable from the artifact and IS dropped — accepted, both are
@@ -301,10 +303,45 @@ internal fun stripOrphanThinkClosers(text: String): String {
     if (text.indexOf("</") == -1 && text.indexOf("[/") == -1) return text
     val out = StringBuilder(text.length)
     var ticks = 0
+    // [B14a] Fence-aware scanning. The previous single-parity backtick counter
+    // broke on fenced blocks: a ``` opener made ticks odd ("inside code") while
+    // any single backtick inside the block flipped it even again — so an
+    // orphan `</thinking>` sitting after a fence (or quoted inside one) could
+    // be classified the wrong way. Fences now toggle by line-start ```
+    // markers; inline single-backtick spans only drive the parity check
+    // outside fences, and fence content is copied verbatim (code is never
+    // cleaned).
+    var inFence = false
     var openersSeen = 0
     var i = 0
     while (i < text.length) {
+        if (i == 0 || text[i - 1] == '\n') {
+            // CommonMark fence: at most 3 leading spaces before the ``` marker.
+            var j = i
+            var indent = 0
+            while (j < text.length && text[j] == ' ' && indent < 3) {
+                j++
+                indent++
+            }
+            if (text.regionMatches(j, "```", 0, 3)) {
+                inFence = !inFence
+                // Copy the entire fence marker line verbatim — its backticks
+                // are fence syntax, not inline-span delimiters, and must not
+                // touch the parity counter (after the closing marker the
+                // counter is already back outside any fence).
+                var end = text.indexOf('\n', i)
+                if (end == -1) end = text.length
+                out.append(text, i, end)
+                i = end
+                continue
+            }
+        }
         val c = text[i]
+        if (inFence) {
+            out.append(c)
+            i++
+            continue
+        }
         if (c == '`') {
             ticks++
             out.append(c)

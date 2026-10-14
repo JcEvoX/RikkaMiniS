@@ -135,6 +135,42 @@ class SkillRepository(private val context: Context) {
                 append(body)
             }
         }
+
+        /**
+         * [B14b] Rewrite the `name:` line inside the frontmatter block of a
+         * SKILL.md. Pure string work (no Android deps) so it is covered by JVM
+         * tests — the same split [mergeFrontmatter] uses. The previous inline
+         * full-document `replaceFirst` fired on the whole file: when the file
+         * has no frontmatter, a `name:` example line in the markdown body was
+         * silently rewritten instead of the (absent) frontmatter key.
+         *
+         * Returns the updated document, or null when there is nothing to
+         * rewrite (no frontmatter block, or a frontmatter block without a
+         * `name:` line) — callers leave the file untouched in that case.
+         */
+        internal fun renameFrontmatterName(md: String, newName: String): String? {
+            val lines = md.lines()
+            var frontmatterEnd = -1
+            if (lines.firstOrNull()?.trimStart()?.startsWith("---") == true) {
+                for (i in 1 until lines.size) {
+                    if (lines[i].trim() == "---") {
+                        frontmatterEnd = i
+                        break
+                    }
+                }
+            }
+            if (frontmatterEnd <= 0) return null
+            // Char offset just past the closing `---` line (each of the lines
+            // above it is followed by a newline because [frontmatterEnd] exists
+            // below it in the split).
+            var frontmatterEndOffset = 0
+            for (i in 0 until frontmatterEnd) frontmatterEndOffset += lines[i].length + 1
+            val head = md.substring(0, frontmatterEndOffset)
+            val tail = md.substring(frontmatterEndOffset)
+            val headUpdated = head.replaceFirst(Regex("(?m)^name:\\s*.*$"), "name: $newName")
+            if (headUpdated == head) return null
+            return headUpdated + tail
+        }
     }
 
     private val httpClient = OkHttpClient.Builder()
@@ -955,12 +991,19 @@ class SkillRepository(private val context: Context) {
         val current = _skills.value.find { it.id == skillId } ?: return null
         val file = File(File(skillsDir, skillId), "SKILL.md")
         if (!file.exists()) return null
-        val parsed = parseSkillMd(file.readText()) ?: return null
+        val raw = file.readText()
+        val parsed = parseSkillMd(raw) ?: return null
+        // [B14b] Refresh the frontmatter snapshot alongside name/description/...
+        // — SKILL.md edits (agent writeSkillFile, user) ride through here, and
+        // dropping the block from the copy() emptied the in-memory frontmatter,
+        // so SubagentSkill lost frontmatter-only keys (subagent, max_turns,
+        // allowed_tools) after the first rescan.
         val refreshed = current.copy(
             name = parsed.name,
             description = parsed.description,
             version = parsed.version,
             body = parsed.body,
+            frontmatter = SubagentSkill.extractFrontmatterBlock(raw),
             updatedAt = System.currentTimeMillis(),
         )
         db.execSQL(
@@ -983,8 +1026,15 @@ class SkillRepository(private val context: Context) {
         val file = File(File(skillsDir, skillId), "SKILL.md")
         if (file.exists()) {
             val original = file.readText()
-            val updated = original.replaceFirst(Regex("(?m)^name:\\s*.*$"), "name: $trimmed")
-            if (updated != original) file.writeText(updated)
+            // [B14b] Only rewrite the `name:` line inside the frontmatter block —
+            // the previous full-document replaceFirst fired on the whole file, so
+            // when a SKILL.md has no frontmatter a `name:` example line in the
+            // markdown body was silently rewritten. Pure string work lives in the
+            // companion so JVM tests exercise the real code (same split as
+            // [mergeFrontmatter]). null → file left untouched.
+            renameFrontmatterName(original, trimmed)?.let { updated ->
+                if (updated != original) file.writeText(updated)
+            }
         }
         val refreshed = current.copy(name = trimmed, updatedAt = System.currentTimeMillis())
         db.execSQL(

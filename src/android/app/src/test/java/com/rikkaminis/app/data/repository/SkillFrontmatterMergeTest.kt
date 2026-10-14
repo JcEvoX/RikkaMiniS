@@ -181,4 +181,48 @@ class SkillFrontmatterMergeTest {
         assertTrue("allowed_tools must survive", seeded.contains("allowed_tools: [file_read, file_write]"))
         assertTrue("body preserved", seeded.endsWith("Body."))
     }
+
+    // ── [B14b] renameFrontmatterName: frontmatter-scoped rename ──
+
+    @Test
+    fun `rename rewrites name only inside the frontmatter block`() {
+        // The previous full-document replaceFirst rewrote ANY `name:` line;
+        // here the body example line must stay untouched while the
+        // frontmatter key updates.
+        val md = """
+            ---
+            name: my-skill
+            description: does things
+            ---
+            Example document:
+
+            name: not-this-line
+        """.trimIndent()
+
+        val out = SkillRepository.renameFrontmatterName(md, "renamed")
+        assertTrue("rewrite must happen", out != null)
+        assertTrue("new name in frontmatter", out!!.startsWith("---\nname: renamed\ndescription"))
+        assertFalse("old name gone", out.contains("name: my-skill"))
+        assertTrue("body example untouched", out.contains("name: not-this-line"))
+    }
+
+    @Test
+    fun `rename with no frontmatter returns null`() {
+        // No frontmatter block: the previous code rewrote the body example
+        // line. Now nothing in the file may change.
+        val md = """
+            # A skill without frontmatter
+
+            Example:
+
+            name: x
+        """.trimIndent()
+        assertEquals(null, SkillRepository.renameFrontmatterName(md, "renamed"))
+    }
+
+    @Test
+    fun `rename with frontmatter lacking a name line returns null`() {
+        val md = "---\ndescription: only desc\n---\nBody."
+        assertEquals(null, SkillRepository.renameFrontmatterName(md, "renamed"))
+    }
 }
