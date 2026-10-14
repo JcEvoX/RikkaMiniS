@@ -350,7 +350,17 @@ internal class AgentLoopEngine(
         try {
         // [feat/runtime-limits-panel] 循环上界从 prefs 读（默认 256）。取一次局部
         // 值保证整个 run 使用同一边界（与预算快照同理由：run 内一致性）。
-        val maxTurnsThisRun = com.rikkaminis.app.data.AgentRuntimeLimitsPrefs.maxTurns()
+        // [audit-1015 BUG-03D] 与 run 实际边界同源：observeBudget.maxTurns 已按
+        // scheduled-task ceiling 钳制（min(user, ceiling.maxTurns)，见上方
+        // AgentExecutionBudget 构造），run 内 t7ConsumeAndTrace→consumeTurn
+        // 也按它拒绝。循环上界改用同一值后，两条停机路径（for 上界耗尽 /
+        // 预算拒绝）永远指向同一个数字，退出横幅与 finalizeAtTurnLimit /
+        // finalizeBudgetStop 引用的 MAX_AGENT_TURNS 不再是裸 prefs 值
+        // （ceiling=30 的定时任务 run 退出时不会误报 "256 turns"）。
+        // 无 ceiling 时两者相等，行为不变。循环边界一致性：for(turn in 0
+        // until N) 恰好 consumeTurn N 次，全部 Allowed —— 上界不会比预算更
+        // 松也不会更紧。
+        val maxTurnsThisRun = observeBudget.maxTurns
         for (turn in 0 until maxTurnsThisRun) {
             // T7-C: deadline 到达后不发新 provider/tool 请求 —— turn 循环入口检查。
             // 中断标记后走统一 finalize（BudgetExhausted 不是静默失败）。
@@ -2010,7 +2020,20 @@ internal class AgentLoopEngine(
                         // followed by a fresh `chat stream offload ->
                         // :modelservice`. 2m33s of "thinking" for an error.
                         val contextExhausted = host.isContextExhausted()
-                        if (shouldRetryEmptyLengthWall(loopState.lengthWallEmptyHits, contextExhausted)) {
+                        // [audit-1015 BUG-03A] The deterministic-empty threshold
+                        // above may already have surfaced the terminal banner
+                        // (terminalErrorSurfaced=true, the ONLY setter that
+                        // falls through to this gate — every other setter in the
+                        // turn either breaks or continues before reaching it).
+                        // Letting the retry gate fire after the banner re-bills
+                        // the full input for one more provably identical empty
+                        // request — the fuse must actually stop the run.
+                        if (shouldContinueAfterDeterministicFuse(
+                                terminalErrorSurfaced = loopState.terminalErrorSurfaced,
+                                hits = loopState.lengthWallEmptyHits,
+                                contextExhausted = contextExhausted,
+                            )
+                        ) {
                             // T9: log the wasted empty-length iteration
                             traceObserver.agentTraceRecorder.turnEnd(
                                 turn = turn,
@@ -2023,6 +2046,16 @@ internal class AgentLoopEngine(
                                 TAG_STREAM,
                                 "runAgentLoop turn=$turn finish=length with empty output (wall hit $loopState.lengthWallEmptyHits/${LENGTH_WALL_EMPTY_MAX_HITS}), continuing",
                             )
+                            // [audit-1015 BUG-03B] The just-added ASSISTANT turn
+                            // (content="" + no parts) must not ride into the
+                            // retry request: the provider filters empty
+                            // assistant messages out (contentParts+content both
+                            // empty), so the shell is invisible to the model
+                            // anyway — and consecutive empty shells accrete in
+                            // history across retries. Same three-field predicate
+                            // as the nudge paths (a shell carrying
+                            // reasoningContent is NOT blank and is kept).
+                            dropTrailingBlankAssistantShell(host.agentHistory)
                             continue
                         }
                         if (contextExhausted) {
@@ -2227,6 +2260,14 @@ internal class AgentLoopEngine(
                     // yields two consecutive user roles (Anthropic hard 400
                     // `roles must alternate` / OpenAI silent merge that
                     // swallows the tool_result pairing). Bridge first.
+                    // [audit-1015 BUG-03C] A trailing BLANK assistant shell
+                    // (empty content + no parts + no reasoning) would be
+                    // filtered out of the outgoing request by the provider's
+                    // empty-message filter, turning [..., ASSISTANT-shell,
+                    // USER-nudge] into [..., USER, USER] — the exact Anthropic
+                    // 400 the bridge below exists to prevent. Drop the blank
+                    // shell BEFORE bridging so the bridge sees the real tail.
+                    dropTrailingBlankAssistantShell(host.agentHistory)
                     ensureRoleAlternationBeforeUserAppend(host.agentHistory)
                     host.agentHistory.add(nudgeMsg)
                     continue
@@ -2282,6 +2323,11 @@ internal class AgentLoopEngine(
                         // tail is user(tool_result). A blind USER append would
                         // yield two consecutive user roles (Anthropic hard 400
                         // / OpenAI silent merge).
+                        // [audit-1015 BUG-03C] Same trailing blank-shell drop
+                        // as the verify nudge (see that block) — the provider
+                        // filters blank assistant shells out of the request,
+                        // so an undropped shell yields consecutive USER roles.
+                        dropTrailingBlankAssistantShell(host.agentHistory)
                         ensureRoleAlternationBeforeUserAppend(host.agentHistory)
                         host.agentHistory.add(nudgeMsg)
                         continue

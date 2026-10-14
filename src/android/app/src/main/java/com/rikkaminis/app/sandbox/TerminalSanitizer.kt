@@ -141,12 +141,19 @@ object TerminalSanitizer {
     // for the largest strings the app handles. These walk code points instead
     // (O(n) time, O(1) allocation) and give the exact same numbers.
 
-    /** UTF-8 encoded length of [s], in bytes. */
-    internal fun utf8Length(s: String): Int {
+    /**
+     * UTF-8 encoded length of [s], in bytes.
+     *
+     * [audit-1015 PERF-01] Takes [CharSequence] so the truncation path can
+     * measure an existing StringBuilder WITHOUT materialising a full
+     * `toString()` copy first — the per-chunk recompute used to copy the
+     * whole accumulated output every 4 KB read just to measure it.
+     */
+    internal fun utf8Length(s: CharSequence): Int {
         var bytes = 0
         var i = 0
         while (i < s.length) {
-            val cp = s.codePointAt(i)
+            val cp = Character.codePointAt(s, i)
             bytes += when {
                 cp < 0x80 -> 1
                 cp < 0x800 -> 2
