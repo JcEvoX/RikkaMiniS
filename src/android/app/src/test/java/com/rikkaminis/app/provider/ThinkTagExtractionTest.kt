@@ -485,6 +485,32 @@ class ThinkTagExtractionTest {
     }
 
     @Test
+    fun `fence-aware - backtick-quoted closer inside a fenced block is preserved`() {
+        // [B14a] The old single-parity counter read the opening ``` as ticks=3
+        // (odd, "inside code") and the quoted closer's own backticks flipped it
+        // even again — the deliberate quotation inside the fence was then
+        // classified as body text and dropped.
+        val fenced = "```bash\necho `</thinking>` > out\n```"
+        assertEquals(fenced, stripOrphanThinkClosers(fenced))
+    }
+
+    @Test
+    fun `fence-aware - odd backtick inside a fence does not shield a real artifact after it`() {
+        // A lone backtick inside the block made the old counter even at the
+        // closing fence, so a REAL orphan artifact right after the block was
+        // kept as if it were quoted code (cleanup decision inverted). Fence
+        // state must not leak into the parity check outside the fence.
+        val text = "```\ncode with a lone ` tick\n```\nthe artifact </thinking> here"
+        assertEquals("```\ncode with a lone ` tick\n```\nthe artifact  here", stripOrphanThinkClosers(text))
+    }
+
+    @Test
+    fun `fence-aware - inline spans still drive parity outside fences`() {
+        val prose = "the relay only leaves a bare `</thinking>` behind\n```\nfence with </thinking>\n```"
+        assertEquals(prose, stripOrphanThinkClosers(prose))
+    }
+
+    @Test
     fun `closer whose opener is present is preserved`() {
         // A provider without think-tag extraction can persist a visible region;
         // that pair is body text, not a wire artifact.

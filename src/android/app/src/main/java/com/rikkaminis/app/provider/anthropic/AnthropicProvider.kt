@@ -268,6 +268,10 @@ class AnthropicProvider(
         // retried instead of silently saved as complete.
         var contentChars = 0
         var sawClearFinish = false
+        // [B11] Accumulated tool-input chars, tracked separately from
+        // [contentChars] so a pure-tool turn cut mid input_json_delta still
+        // signals truncation.
+        var toolChars = 0
         // [FIX-1 / F-190] The Messages protocol splits usage across two events:
         // `message_start` carries the FULL accounting (input_tokens,
         // cache_read_input_tokens, cache_creation_input_tokens) and
@@ -344,6 +348,11 @@ class AnthropicProvider(
                                 val partial = delta.safeOptString("partial_json", "")
                                 if (partial.isNotEmpty() && currentToolId != null) {
                                     toolInputBuffer.append(partial)
+                                    // [B11] Tool input bytes count as stream activity: a
+                                    // pure-tool turn that is cut mid input_json_delta must
+                                    // still trip the truncated-Finished below instead of
+                                    // looking like a clean, empty reply.
+                                    toolChars += partial.length
                                     // [T-toolinput-sample-1012] Sampled like the OpenAI paths:
                                     // first delta + one per TOOL_LOG_INPUT_STEP_CHARS of growth
                                     // (per-fragment lines measured 74% of the worker's daily file).
@@ -424,14 +433,40 @@ class AnthropicProvider(
                     }
                 }
             }
+            // [B11] Flush a tool_use block that never got its content_block_stop
+            // before the stream ended (server closes mid input_json_delta). Without
+            // this the tool call silently vanished: failOnSilentEmptyCompletion only
+            // fires on a fully empty stream, so the agent loop saw a non-empty
+            // stream with no ToolCallComplete and exited as a clean no-tool turn.
+            // Mirrors OpenAIProvider's responses-API drain (:1384-1401, T248) —
+            // the incomplete JSON is handed to ToolJsonRepair/preflight downstream
+            // instead of dropped. currentToolId is null here on the normal path
+            // (content_block_stop already completed it), so this only fires on the
+            // orphan case.
+            if (currentToolId != null && currentToolName != null) {
+                val args = try {
+                    JSONObject(toolInputBuffer.toString())
+                } catch (_: Exception) {
+                    JSONObject()
+                }
+                com.rikkaminis.app.logging.AppLogger.warning(
+                    "AnthropicProvider",
+                    "Stream ended mid-tool-call id=$currentToolId name=$currentToolName argsLen=${toolInputBuffer.length} — flushing as ToolCallComplete (B11)",
+                )
+                send(LLMStreamChunk.ToolCallComplete(currentToolId!!, currentToolName!!, args))
+                currentToolId = null
+                currentToolName = null
+                toolInputBuffer.clear()
+            }
             // [RC2-truncated-detection] Loop exited by EOF / [DONE] before any
             // message_delta (server cut mid-stream after text/thinking deltas but
             // before the terminal event). Without this, ChatViewModel would see no
             // Finished, treat it as a clean finish, and silently save a partial
             // answer. Signal truncated so the turnTruncated retry owns it. Gated on
-            // accumulated content — a fully empty EOF is handled by
+            // accumulated content (text/thinking [contentChars] or tool input
+            // [toolChars]) — a fully empty EOF is handled by
             // failOnSilentEmptyCompletion and must not be flagged.
-            if (!sawClearFinish && contentChars > 0) {
+            if (!sawClearFinish && (contentChars > 0 || toolChars > 0)) {
                 send(LLMStreamChunk.Finished(null, truncated = true))
             }
         } catch (e: Exception) {
