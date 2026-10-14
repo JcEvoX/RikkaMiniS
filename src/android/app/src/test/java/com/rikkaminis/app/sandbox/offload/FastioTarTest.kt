@@ -305,7 +305,10 @@ class FastioTarTest {
         assertTrue(tarEntryTarget(dest, member("/etc/passwd")) is TarRefusal.Slip)
         assertTrue(tarEntryTarget(dest, member("a/../../evil.txt")) is TarRefusal.Slip)
         assertTrue(tarEntryTarget(dest, member("..")) is TarRefusal.Slip)
-        assertTrue(tarEntryTarget(dest, member(".")) is TarRefusal.Slip)
+        // audit-1014 B4a: a bare "." IS the root — legal, not slip (this used
+        // to assert Slip, which is exactly the bug: `tar -cf a.tar .` writes
+        // `./` as its first member and our own extractor refused it).
+        assertNull(tarEntryTarget(dest, member(".")))
         assertNull(tarEntryTarget(dest, member("a/../b.txt")))
         assertNull(tarEntryTarget(dest, member("dir/file.txt")))
         assertNull(tarEntryTarget(dest, member("./dir/file.txt")))
@@ -523,6 +526,75 @@ class FastioTarTest {
         putOctal(block, 148, 7, sum)
         block[155] = ' '.code.toByte()
         return block
+    }
+
+    // ── audit-1014 FIX-3: root entries are LEGAL (B4a) ──────────────────────
+
+    @Test
+    fun `root entries dot and dot-slash are not tar-slip`() {
+        // B4a: GNU/busybox `tar -cf a.tar .` writes `./` as its first member;
+        // collapsing these to null made our own extractor refuse such archives.
+        val dest = Paths.get("/tmp/f3test-dest-a")
+        assertEquals(emptyList<String>(), tarNormalizeMember("."))
+        assertEquals(emptyList<String>(), tarNormalizeMember("./"))
+        assertEquals(emptyList<String>(), tarNormalizeMember("././"))
+        val member = TarMember("./", '5', 0L, 0b111_101_101, 0L, "")
+        assertNull(tarEntryTarget(dest, member))
+        // The four tar-slip rules are untouched: every one still refused.
+        assertTrue(tarEntryTarget(dest, TarMember("/etc/passwd", '0', 0L, 0, 0L, "")) is TarRefusal.Slip)
+        assertTrue(tarEntryTarget(dest, TarMember("../x", '0', 0L, 0, 0L, "")) is TarRefusal.Slip)
+        assertTrue(tarEntryTarget(dest, TarMember("a\u0000b", '0', 0L, 0, 0L, "")) is TarRefusal.Slip)
+    }
+
+    @Test
+    fun `archive with root prefix round-trips through our own reader`() {
+        // B4a: tarCreate with memberPrefix "." (what `tar -cf a.tar .` means)
+        // must produce an archive our own extractor accepts.
+        val root = Files.createTempDirectory("fastio-tar-root")
+        val tree = Files.createDirectory(root.resolve("tree"))
+        Files.write(tree.resolve("a.txt"), "payload".toByteArray())
+        val dest = root.resolve("out")
+
+        val archive = ByteArrayOutputStream()
+        tarCreate(archive, listOf(tree to "."), 1000L, TarCreateOutcome())
+        val bytes = archive.toByteArray()
+
+        val validation = TarExtractOutcome()
+        assertTrue(
+            "archive with '.' prefix must validate (B4a): ${validation.errors}",
+            tarValidate(ByteArrayInputStream(bytes), dest, 1000L, validation),
+        )
+        val extracted = TarExtractOutcome()
+        tarExtract(ByteArrayInputStream(bytes), dest, false, 1000L, extracted)
+        assertTrue("self-extract errors: ${extracted.errors}", extracted.errors.isEmpty())
+        // memberPrefix "." stores the tree's CONTENTS at the root (what
+        // `tar -cf a.tar .` from inside the tree means), so files land
+        // directly under dest, not under dest/tree.
+        assertEquals("payload", Files.readAllBytes(dest.resolve("a.txt")).decodeToString())
+    }
+
+    // ── audit-1014 FIX-3: long symlink targets are NOT truncated (B4b) ──────
+
+    @Test
+    fun `symlink target past the linkname field survives the round trip`() {
+        // B4b: a 140-byte target is 41 past the 99-byte linkname ceiling;
+        // putText used to truncate it silently. The writer now emits a GNU 'K'
+        // record (which the reader has parsed since v1).
+        val root = Files.createTempDirectory("fastio-tar-longlink")
+        val longTarget = "x".repeat(140)
+        Files.createSymbolicLink(root.resolve("ll"), Paths.get(longTarget))
+        val dest = root.resolve("out")
+
+        val archive = ByteArrayOutputStream()
+        val created = TarCreateOutcome()
+        tarCreate(archive, listOf(root to "root"), 1000L, created)
+        assertEquals(1L, created.symlinks)
+
+        val extracted = TarExtractOutcome()
+        tarExtract(ByteArrayInputStream(archive.toByteArray()), dest, false, 1000L, extracted)
+        assertTrue("errors: ${extracted.errors}", extracted.errors.isEmpty())
+        assertEquals("full 140-byte target must come back", longTarget,
+            Files.readSymbolicLink(dest.resolve("root/ll")).toString())
     }
 
     private fun putOctal(block: ByteArray, offset: Int, length: Int, value: Long) {
