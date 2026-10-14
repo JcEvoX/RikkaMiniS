@@ -33,6 +33,12 @@ object MediaPlayerManager {
      */
     private val sessions = ConcurrentHashMap<String, Session>()
 
+    // [sweep1014-D11] Player callbacks (onCompletion/onError) fire on the
+    // player's binder/playback threads while play()/stop() mutate the map on
+    // the caller thread — all state writes and the check-then-act
+    // registration window take this lock.
+    private val lock = Any()
+
     private val audioExtensions = setOf(
         "mp3", "wav", "ogg", "flac", "aac", "m4a", "wma", "opus", "amr", "mid", "midi",
     )
@@ -91,16 +97,32 @@ object MediaPlayerManager {
 
             player.setOnCompletionListener {
                 Log.d(TAG, "Playback completed: session=$sessionId")
-                session.state = PlayerState.STOPPED
+                // [sweep1014-D11] Release the native player here — after
+                // completion it is terminal and would otherwise keep its
+                // AudioTrack/codec handles alive until GC. The entry itself is
+                // kept as lightweight metadata (filePath/mediaType/state) so
+                // status/list still report it and stop() still removes it;
+                // the state guards in pause/resume/seek keep callers off the
+                // released player. Runs on the callback thread — lock guards
+                // against concurrent state/map writes from play()/stop().
+                synchronized(lock) { releaseSession(session) }
             }
 
             player.setOnErrorListener { _, what, extra ->
                 Log.e(TAG, "MediaPlayer error: session=$sessionId what=$what extra=$extra")
-                session.state = PlayerState.STOPPED
+                synchronized(lock) { releaseSession(session) }
                 true
             }
 
-            sessions[sessionId] = session
+            // [sweep1014-D11] check-then-act backstop: two concurrent play()
+            // calls with the same sessionId can both observe no prior session,
+            // each build a player, and the later put() would overwrite the
+            // earlier one — the overwritten session loses its last reference
+            // with a live native codec and is never released. put() returns
+            // the replaced instance; release it under the same lock that
+            // guards callback terminalize.
+            val replaced = synchronized(lock) { sessions.put(sessionId, session) }
+            replaced?.let { releaseSession(it) }
 
             val durationMs = player.duration
             val durationStr = formatDuration(durationMs)
