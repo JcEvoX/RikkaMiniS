@@ -9,6 +9,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.Locale
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Manages Android TextToSpeech engine for reading assistant responses aloud.
@@ -33,11 +35,16 @@ class TextToSpeechManager : TextToSpeech.OnInitListener {
 
     // [fix/audit-b20 / T8-L5] Queue-drain bookkeeping. The pause/resume layer
     // (isPaused / togglePause / pausedAtIndex) had no caller anywhere — Android
-    // TTS has no native pause and no UI ever exposed one — so it is gone. These
-    // two counters are what actually kept `isSpeaking` accurate: utterances
-    // handed to the engine, and utterances that finished (done or error).
-    private var queuedUtterances = 0
-    private var completedUtterances = 0
+    // TTS has no native pause and no UI ever exposed one — so it is gone. The
+    // drain tracker is what keeps `isSpeaking` accurate: utterances handed to
+    // the engine, and utterances that finished (done or error).
+    // [sweep1014-B20b] Session epoch: speak()/stop() start a new epoch and
+    // every utterance id carries its epoch prefix, so callbacks from a flushed
+    // session can never corrupt the current one. The two plain Int counters
+    // also moved into the tracker as atomics — they were written on the main
+    // thread (speak) and read/written on the Binder thread (onDone/onError),
+    // with no visibility guarantee.
+    private val drain = TtsDrainTracker()
 
     /**
      * Rolling buffer of partial-streaming text that hasn't hit a sentence
@@ -98,14 +105,17 @@ class TextToSpeechManager : TextToSpeech.OnInitListener {
     fun speak(text: String) {
         if (!isInitialized || text.isBlank()) return
 
-        queuedUtterances = 1
-        completedUtterances = 0
+        // [sweep1014-B20b] Bump the epoch BEFORE enqueueing: the utterance the
+        // engine flushes still delivers onDone/onError asynchronously — with a
+        // new epoch those stale callbacks are ignored instead of corrupting
+        // this session's fresh counters.
+        val sessionEpoch = drain.newSession()
         sentenceBuffer.setLength(0)
 
         autoDetectAndSetLanguage(text)
 
         val params = buildSpeechParams()
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, generateUtteranceId())
+        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, drain.utteranceId(sessionEpoch))
         _isSpeaking.value = true
     }
 
@@ -115,11 +125,11 @@ class TextToSpeechManager : TextToSpeech.OnInitListener {
     fun speakQueued(text: String) {
         if (!isInitialized || text.isBlank()) return
 
-        queuedUtterances++
+        val utteranceId = drain.utteranceId(drain.enqueue())
         autoDetectAndSetLanguage(text)
 
         val params = buildSpeechParams()
-        tts?.speak(text, TextToSpeech.QUEUE_ADD, params, generateUtteranceId())
+        tts?.speak(text, TextToSpeech.QUEUE_ADD, params, utteranceId)
         _isSpeaking.value = true
     }
 
@@ -175,8 +185,12 @@ class TextToSpeechManager : TextToSpeech.OnInitListener {
      */
     fun stop() {
         tts?.stop()
-        queuedUtterances = 0
-        completedUtterances = 0
+        // [sweep1014-B20b] Invalidate every in-flight callback: utterances the
+        // engine flushes still deliver onDone/onError asynchronously — without
+        // the epoch bump a stale callback would push the next session's
+        // counters (isSpeaking dropped to false the moment a fresh speak()
+        // started).
+        drain.invalidate()
         sentenceBuffer.setLength(0)
         _isSpeaking.value = false
     }
@@ -186,10 +200,14 @@ class TextToSpeechManager : TextToSpeech.OnInitListener {
      * speaking flag once the queue empties. Called from both onDone and the
      * error overloads so a failed utterance still counts as finished — without
      * that, `isSpeaking` stayed true after an error.
+     *
+     * [sweep1014-B20b] Only callbacks belonging to the CURRENT session count:
+     * a flushed utterance's late onDone/onError must not advance the new
+     * session's counters (it extinguished a fresh speak() the moment it
+     * started). Stale/unknown ids are side-effect free no-ops.
      */
-    private fun onUtteranceFinished() {
-        completedUtterances++
-        if (completedUtterances >= queuedUtterances) {
+    private fun onUtteranceFinished(utteranceId: String?) {
+        if (drain.onFinished(utteranceId)) {
             _isSpeaking.value = false
         }
     }
@@ -236,28 +254,98 @@ class TextToSpeechManager : TextToSpeech.OnInitListener {
         }
     }
 
-    private fun generateUtteranceId(): String = UUID.randomUUID().toString()
-
     private fun createProgressListener(): UtteranceProgressListener =
         object : UtteranceProgressListener() {
 
             override fun onStart(utteranceId: String?) {
-                _isSpeaking.value = true
+                // [sweep1014-B20b] A stale onStart from a flushed session must
+                // not re-light the flag after stop().
+                if (drain.isCurrent(utteranceId)) {
+                    _isSpeaking.value = true
+                }
             }
 
             override fun onDone(utteranceId: String?) {
-                onUtteranceFinished()
+                onUtteranceFinished(utteranceId)
             }
 
             @Deprecated("Deprecated in API level 21")
             override fun onError(utteranceId: String?) {
                 Log.e(TAG, "TTS error for utterance: $utteranceId")
-                onUtteranceFinished()
+                onUtteranceFinished(utteranceId)
             }
 
             override fun onError(utteranceId: String?, errorCode: Int) {
                 Log.e(TAG, "TTS error for utterance $utteranceId, code: $errorCode")
-                onUtteranceFinished()
+                onUtteranceFinished(utteranceId)
             }
         }
+}
+
+/**
+ * [sweep1014-B20b] Session-scoped drain tracker for the TTS queue. speak()
+ * (QUEUE_FLUSH) and stop() start a new epoch; every utterance id carries its
+ * epoch prefix, so progress callbacks from a flushed session are recognized
+ * as stale and ignored — they used to push the fresh session's counters and
+ * extinguish `isSpeaking` the moment a new speak() started.
+ *
+ * Pure JVM-testable: no Android dependencies.
+ */
+internal class TtsDrainTracker {
+
+    private val epoch = AtomicLong(0)
+    private val queued = AtomicInteger(0)
+    private val completed = AtomicInteger(0)
+
+    /**
+     * Starts a new session (speak / QUEUE_FLUSH): resets the drain counters
+     * for the fresh queue and returns the session's epoch.
+     */
+    fun newSession(): Long {
+        val e = epoch.incrementAndGet()
+        queued.set(1)
+        completed.set(0)
+        return e
+    }
+
+    /** Adds one utterance to the CURRENT session (speakQueued / QUEUE_ADD). */
+    fun enqueue(): Long {
+        queued.incrementAndGet()
+        return epoch.get()
+    }
+
+    /** Invalidates every in-flight callback (stop / shutdown). */
+    fun invalidate() {
+        epoch.incrementAndGet()
+        queued.set(0)
+        completed.set(0)
+    }
+
+    fun utteranceId(sessionEpoch: Long): String = "$PREFIX$sessionEpoch-${UUID.randomUUID()}"
+
+    /** True when [utteranceId] belongs to the current session. */
+    fun isCurrent(utteranceId: String?): Boolean =
+        sessionEpochOf(utteranceId) == epoch.get()
+
+    /**
+     * Counts a finished (done or error) utterance. Returns true only when the
+     * callback belongs to the CURRENT session and the queue has drained —
+     * stale callbacks from a flushed session return false without touching
+     * the counters.
+     */
+    fun onFinished(utteranceId: String?): Boolean {
+        if (sessionEpochOf(utteranceId) != epoch.get()) return false
+        return completed.incrementAndGet() >= queued.get()
+    }
+
+    companion object {
+        private const val PREFIX = "tts-"
+
+        fun sessionEpochOf(utteranceId: String?): Long? =
+            utteranceId
+                ?.takeIf { it.startsWith(PREFIX) }
+                ?.removePrefix(PREFIX)
+                ?.substringBefore('-')
+                ?.toLongOrNull()
+    }
 }
