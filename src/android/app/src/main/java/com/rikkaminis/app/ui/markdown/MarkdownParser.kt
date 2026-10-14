@@ -1,5 +1,7 @@
 package com.rikkaminis.app.ui.markdown
 
+import com.rikkaminis.app.ui.chat.decodeUriPath
+
 /**
  * Lightweight markdown parser that converts raw markdown text into a list of block nodes.
  * Supports: headings, code blocks (fenced), blockquotes, bullet/numbered/task lists,
@@ -67,7 +69,7 @@ object MarkdownParser {
      */
     private fun mediaBlockFor(alt: String, url: String): Block {
         val lastSeg = url.substringAfterLast('/')
-        val decoded = runCatching { java.net.URLDecoder.decode(lastSeg, "UTF-8") }.getOrDefault(lastSeg)
+        val decoded = decodeUriPath(lastSeg)
         val ext = decoded.substringAfterLast('.', "").lowercase()
         return when (ext) {
             in nativeVideoExts -> Block.Video(alt, url)

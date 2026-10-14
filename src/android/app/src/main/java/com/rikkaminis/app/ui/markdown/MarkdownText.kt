@@ -1,6 +1,7 @@
 package com.rikkaminis.app.ui.markdown
 
 import com.rikkaminis.app.R
+import com.rikkaminis.app.ui.chat.decodeUriPath
 import androidx.compose.ui.res.stringResource
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -699,9 +700,9 @@ private fun resolveMediaFile(context: Context, url: String, sessionId: String?):
 private fun filenameFromUrl(url: String): String {
     val stripped = url.substringBefore('?')
     val last = stripped.substringAfterLast('/')
-    return try {
-        java.net.URLDecoder.decode(last, "UTF-8")
-    } catch (_: Throwable) { last }
+    // [rv1014-B1] decodeUriPath never throws and leaves `+` intact, so the
+    // try/catch around the old URLDecoder.decode is no longer needed.
+    return decodeUriPath(last)
 }
 
 /**

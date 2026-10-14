@@ -1727,7 +1727,11 @@ internal fun resolveMdMediaFile(context: Context, url: String, sessionId: String
     val stripped = url.substringBefore('?')
     val primary: File? = when {
         stripped.startsWith("minis://") -> {
-            val decoded = java.net.URLDecoder.decode(stripped.removePrefix("minis://"), "UTF-8")
+            // [rv1014-B1] decodeUriPath = URI path semantics (decodes %XX only,
+            // leaves `+` intact, never throws on bare `%`). The previous
+            // URLDecoder.decode threw IllegalArgumentException on `100%.png`
+            // during render and turned `a+b.png` into `a b.png`.
+            val decoded = decodeUriPath(stripped.removePrefix("minis://"))
             val linuxPath = "/var/minis/$decoded"
             // Prefer the session-scoped resolver when the caller supplied a
             // sessionId: the global `bindMounts` map is overwritten every time
@@ -1755,7 +1759,7 @@ internal fun resolveMdMediaFile(context: Context, url: String, sessionId: String
         android.util.Log.d("MdStream", "resolveMdMediaFile primary miss url=$url (non-minis scheme, no fallback)")
         return null
     }
-    val decoded = java.net.URLDecoder.decode(stripped.removePrefix("minis://"), "UTF-8")
+    val decoded = decodeUriPath(stripped.removePrefix("minis://"))
     val basename = decoded.substringAfterLast('/')
     val subdir = decoded.substringBefore('/', missingDelimiterValue = "").takeIf { it.isNotEmpty() } ?: "attachments"
     val root = File(context.filesDir, "minis-sessions")
@@ -1782,7 +1786,9 @@ private fun filenameFromMdUrl(url: String): String {
     // Keep '#' — it's a legitimate character in attachment filenames.
     val stripped = url.substringBefore('?')
     val last = stripped.substringAfterLast('/')
-    return try { java.net.URLDecoder.decode(last, "UTF-8") } catch (_: Throwable) { last }
+    // [rv1014-B1] decodeUriPath never throws and leaves `+` intact, so the
+    // try/catch around the old URLDecoder.decode is no longer needed.
+    return decodeUriPath(last)
 }
 
 private fun openMdMediaExternally(context: Context, file: File, mime: String) {
