@@ -100,6 +100,55 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
         }
 
         /**
+         * [fix/sweep1014-b17a] Pure decision core for restoring persisted tab
+         * state. Lives in the companion so it can be extracted verbatim for
+         * JVM testing (the file itself has Android imports and cannot compile
+         * under kotlinc alone).
+         *
+         * - [TabRestorePlan.nextTabId] resumes above the max persisted id AND
+         *   the max live tab id — starting at 0 after a restart made the first
+         *   new tab collide with saved ids (a blank tab consumed
+         *   savedURLs[0], or hit nothing when tab 0 was closed last run, and
+         *   the rest were only claimed in creation order, if ever).
+         * - Saved ids already owned by a live tab are dropped (the live tab
+         *   wins) — covers a pool re-pointed to a session whose save file
+         *   overlaps the live tab ids.
+         * - At most (maxTabs - live) tabs are restored per pass; remaining
+         *   saved entries stay in savedURLs for a later run.
+         * - selectedTabId falls back to the first existing/restored tab when
+         *   it points at an id that was closed before the last save.
+         */
+        internal data class TabRestorePlan(
+            val nextTabId: Int,
+            val restoreIds: List<Int>,
+            val droppedIds: List<Int>,
+            val selectedTabId: Int,
+        )
+
+        internal fun planTabRestore(
+            savedIds: List<Int>,
+            liveIds: List<Int>,
+            selectedTabId: Int,
+            maxTabs: Int = MAX_TABS,
+        ): TabRestorePlan {
+            val next = maxOf(savedIds.maxOrNull() ?: -1, liveIds.maxOrNull() ?: -1) + 1
+            val slots = (maxTabs - liveIds.size).coerceAtLeast(0)
+            val restore = mutableListOf<Int>()
+            val dropped = mutableListOf<Int>()
+            for (id in savedIds) {
+                if (id in liveIds) {
+                    dropped.add(id)
+                } else if (restore.size < slots) {
+                    restore.add(id)
+                }
+                // else: over the tab cap — leave the entry in savedURLs for a later run
+            }
+            val all = liveIds + restore
+            val selected = if (all.contains(selectedTabId)) selectedTabId else (all.firstOrNull() ?: selectedTabId)
+            return TabRestorePlan(next, restore, dropped, selected)
+        }
+
+        /**
          * [T-browser-implicit-tab-inuse-until-load-android] Grace window a tab
          * stays `inUse` after an implicit-tab (tab_id-less) action completes.
          * `navigate` already suspends until onPageFinished / its 30s timeout, so
@@ -220,6 +269,10 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
     private val _sessionViewportHeight = MutableStateFlow(0)
     val sessionViewportHeight: StateFlow<Int> = _sessionViewportHeight.asStateFlow()
 
+    // [fix/sweep1014-b17a] Written by loadSavedState (which may run off-main
+    // via lazy pool access from tool execution); read on Main by createTab —
+    // @Volatile for cross-thread visibility.
+    @Volatile
     private var nextTabId = 0
 
     private val evictionScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -391,7 +444,20 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
                 bytesDone = bytes ?: it.bytesDone,
             )
         }
-        _activeDownload.value = null
+        // [fix/sweep1014-b17b] Only drop the banner when nothing else is still
+        // in flight — with concurrent downloads, settling one must not hide a
+        // still-active one (there is no PAUSED state in this enum, so
+        // DOWNLOADING is the only in-flight state). Otherwise switch the
+        // banner to the remaining active download until its own progress
+        // updates take over.
+        _activeDownload.value = _downloads.value
+            .firstOrNull { it.state == DownloadState.DOWNLOADING }
+            ?.let { entry ->
+                DownloadUiState(
+                    entry.filename,
+                    if (entry.totalBytes > 0) (entry.bytesDone.toFloat() / entry.totalBytes).coerceIn(0f, 1f) else -1f,
+                )
+            }
     }
 
     /** Cancel an in-flight download; the coroutine's CancellationException
@@ -920,10 +986,13 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
         tab
     }
 
-    private fun createTab(tabs: MutableList<Tab>, url: String? = null): Tab? {
+    private fun createTab(tabs: MutableList<Tab>, url: String? = null, explicitId: Int? = null): Tab? {
         if (tabs.size >= MAX_TABS) return null
 
-        val id = nextTabId++
+        // [fix/sweep1014-b17a] explicitId: the restore path rebuilds a saved
+        // tab with its original id so the persisted selectedTabId resolves
+        // against it; normal allocation keeps using the monotonic counter.
+        val id = explicitId ?: nextTabId++
         val webView = WebView(context)
         val manager = BrowserUseManager(webView, userAgentProfile)
         if (userAgentProfile == UserAgentProfile.CUSTOM && !customUserAgentString.isNullOrEmpty()) {
@@ -1474,6 +1543,11 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
             val file = File(context.filesDir, "browser_tabs/$sid.json")
             if (!file.exists()) return
             val json = JSONObject(file.readText())
+            // [fix/sweep1014-b17a] savedURLs is session-scoped (mirrors the
+            // per-session file below) — drop entries left over from a
+            // previously pointed session so a re-pointed pool doesn't restore
+            // the old session's tabs into the new one.
+            savedURLs.clear()
             val urlsJson = json.optJSONObject("tabURLs")
             if (urlsJson != null) {
                 val keys = urlsJson.keys()
@@ -1482,6 +1556,22 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
                     savedURLs[key.toInt()] = urlsJson.getString(key)
                 }
                 _selectedTabId.value = json.optInt("selectedTabId", 0)
+            }
+            // [fix/sweep1014-b17a] Resume the id counter above every persisted
+            // id (and any live tab id) so tabs created after load never
+            // collide with the restored ones, and fix a stale selectedTabId
+            // (points at a tab closed before the last save) eagerly so the
+            // browser sheet doesn't flash a dangling selection before the
+            // rebuild runs.
+            val plan = planTabRestore(savedURLs.keys.toList(), _tabs.value.map { it.id }, _selectedTabId.value)
+            nextTabId = plan.nextTabId
+            _selectedTabId.value = plan.selectedTabId
+            // Rebuild the saved tabs so restoration no longer depends on new
+            // tabs happening to walk over the persisted ids. Async on Main —
+            // loadSavedState may run off-main (lazy pool access from tool
+            // execution) and WebView APIs are main-thread only.
+            if (savedURLs.isNotEmpty()) {
+                evictionScope.launch { withContext(Dispatchers.Main) { restoreSavedTabs() } }
             }
             // Restore session viewport override. 0/missing = no override; fall
             // back to the global custom viewport / UA profile default.
@@ -1502,6 +1592,36 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
         } catch (e: Exception) {
             Log.w(TAG, "Failed to load tab state: ${e.message}")
         }
+    }
+
+    /**
+     * [fix/sweep1014-b17a] Rebuild tabs for entries left in [savedURLs] by the
+     * previous run, keeping their original ids so the persisted selectedTabId
+     * resolves against them. Runs on Main (WebView APIs are main-thread only)
+     * — scheduled from [loadSavedState], which may be called off-main.
+     * [nextTabId] was already seeded above the max persisted/live id in
+     * [loadSavedState], so tabs created in the meantime never collide with
+     * the restored ones.
+     */
+    private fun restoreSavedTabs() {
+        val currentTabs = _tabs.value.toMutableList()
+        val plan = planTabRestore(savedURLs.keys.toList(), currentTabs.map { it.id }, _selectedTabId.value)
+        var restored = 0
+        for (id in plan.restoreIds) {
+            val url = savedURLs[id] ?: continue
+            val tab = createTab(currentTabs, url, explicitId = id) ?: break
+            savedURLs.remove(id)
+            restored++
+        }
+        for (id in plan.droppedIds) {
+            // A live tab already owns this id — the live tab wins; drop the
+            // stale entry so it stops re-persisting into the state JSON.
+            savedURLs.remove(id)
+        }
+        if (restored > 0) {
+            saveState()
+        }
+        Log.i(TAG, "Restored $restored tab(s) from saved state")
     }
 
     private fun updateTabs() {
