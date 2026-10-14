@@ -3,6 +3,7 @@ package com.rikkaminis.app.sandbox.offload
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.provider.ContactsContract
 import androidx.core.content.ContextCompat
 import com.rikkaminis.app.logging.AppLogger
@@ -33,9 +34,9 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
             return NativeOffloadResult(0, HELP_TEXT)
         }
         // T54: parse for shared --compact / -q / --quiet handling. Subcommand
-        // dispatch still uses the raw `rawArgs` because Contacts encodes
-        // positional args (id, query) in subcommand-specific positions and
-        // OffloadArgs strips flag/positional ordering away.
+        // dispatch still keys off the raw `rawArgs`; the search query reads
+        // parsedArgs.positional[1] ([sweep1014-B34]) because OffloadArgs has
+        // already consumed named values like `--max 10`.
         val parsedArgs = OffloadArgs(rawArgs)
 
         // T330: tri-state agent gate before any work or system permission ask.
@@ -157,21 +158,26 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
             ContactsContract.Contacts.CONTENT_URI, projection, null, null, sort,
         ) ?: return NativeOffloadResult(1, OffloadOutput.formatBody("android-contacts: failed to query contacts", parsedArgs) + "\n")
 
+        // [sweep1014-P10] Collect the page first, then batch-load phones +
+        // emails for all ids in one query per data kind — the old per-row
+        // readPhones/readEmails cost 2 extra Binder queries per contact
+        // (50 contacts = 101 contentResolver round-trips).
         val arr = JSONArray()
         cursor.use {
-            var n = 0
-            while (it.moveToNext() && n < max) {
-                arr.put(readContactRow(it))
-                n++
-            }
+            attachContactData(collectContactPage(it, max), arr)
         }
         return NativeOffloadResult(0, OffloadOutput.formatBody(arr.toString(2), parsedArgs) + "\n")
     }
 
     private fun doSearch(args: List<String>, parsedArgs: OffloadArgs): NativeOffloadResult {
-        val query = args.firstOrNull { !it.startsWith("-") }
+        // [sweep1014-B34] The old `args.firstOrNull { !it.startsWith("-") }`
+        // scanned the RAW args, so `search --max 10 Alice` picked "10" as the
+        // query and dropped "Alice". parsedArgs has already consumed the named
+        // value, so positional[1] is the query (positional[0] is the
+        // subcommand itself — same convention as the other offload handlers).
+        val query = searchQueryOf(parsedArgs.positional)
             ?: return NativeOffloadResult(2, "android-contacts search: missing <query>\n")
-        val max = parseMax(args, default = 20)
+        val max = parsedArgs.getInt("max", "n") ?: 20
 
         val projection = arrayOf(
             ContactsContract.Contacts._ID,
@@ -187,11 +193,7 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
 
         val arr = JSONArray()
         cursor.use {
-            var n = 0
-            while (it.moveToNext() && n < max) {
-                arr.put(readContactRow(it))
-                n++
-            }
+            attachContactData(collectContactPage(it, max), arr)
         }
         if (arr.length() == 0) {
             return NativeOffloadResult(0, OffloadOutput.formatBody("No contacts found matching '$query'.", parsedArgs) + "\n")
@@ -309,6 +311,78 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
         return arr
     }
 
+    /**
+     * One row of the contacts cursor — id, display name and whether it may
+     * have phone numbers. Pure data holder so page collection and the batch
+     * aggregation stay testable without an Android device.
+     */
+    private data class ContactRow(val id: Long, val name: String, val hasPhone: Boolean)
+
+    private fun collectContactPage(c: android.database.Cursor, max: Int): List<ContactRow> {
+        val rows = mutableListOf<ContactRow>()
+        while (c.moveToNext() && rows.size < max) {
+            rows.add(ContactRow(c.getLong(0), c.getString(1) ?: "", c.getInt(2) > 0))
+        }
+        return rows
+    }
+
+    /**
+     * [sweep1014-P10] Batch-load phones + emails for a whole page of contacts:
+     * one IN (…) query per data kind per chunk instead of two Binder
+     * round-trips per contact. Output shape is unchanged — each contact still
+     * carries phones[]/emails[] exactly as the per-row implementation emitted
+     * them (phones only when HAS_PHONE_NUMBER, values in provider order).
+     */
+    private fun attachContactData(page: List<ContactRow>, arr: JSONArray) {
+        if (page.isEmpty()) return
+        val phones = batchQueryValues(
+            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+            ContactsContract.CommonDataKinds.Phone.CONTACT_ID,
+            ContactsContract.CommonDataKinds.Phone.NUMBER,
+            page.map { it.id },
+        )
+        val emails = batchQueryValues(
+            ContactsContract.CommonDataKinds.Email.CONTENT_URI,
+            ContactsContract.CommonDataKinds.Email.CONTACT_ID,
+            ContactsContract.CommonDataKinds.Email.ADDRESS,
+            page.map { it.id },
+        )
+        for (row in page) {
+            val obj = JSONObject()
+            obj.put("id", row.id)
+            obj.put("name", row.name)
+            if (row.hasPhone) {
+                val p = phones[row.id].orEmpty()
+                if (p.isNotEmpty()) obj.put("phones", JSONArray(p))
+            }
+            val e = emails[row.id].orEmpty()
+            if (e.isNotEmpty()) obj.put("emails", JSONArray(e))
+            arr.put(obj)
+        }
+    }
+
+    private fun batchQueryValues(
+        uri: Uri,
+        idColumn: String,
+        valueColumn: String,
+        ids: List<Long>,
+    ): Map<Long, List<String>> {
+        if (ids.isEmpty()) return emptyMap()
+        val pairs = mutableListOf<Pair<Long, String>>()
+        for (chunk in ids.chunked(BATCH_CHUNK)) {
+            context.contentResolver.query(
+                uri,
+                arrayOf(idColumn, valueColumn),
+                "$idColumn IN (${inPlaceholders(chunk.size)})",
+                chunk.map { it.toString() }.toTypedArray(),
+                "$idColumn ASC",
+            )?.use { c ->
+                while (c.moveToNext()) pairs.add(c.getLong(0) to (c.getString(1) ?: ""))
+            }
+        }
+        return aggregateValues(pairs)
+    }
+
     private fun parseMax(args: List<String>, default: Int): Int {
         val i = args.indexOfFirst { it == "--max" || it == "-n" }
         if (i < 0 || i + 1 >= args.size) return default
@@ -317,6 +391,30 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
 
     companion object {
         private const val TAG = "ContactsOffload"
+        // [sweep1014-P10] SQLite's default host-parameter ceiling is 999;
+        // chunking keeps every IN (...) list well under it for any --max.
+        private const val BATCH_CHUNK = 500
+        /**
+         * [sweep1014-B34] Search query resolution: positional[0] is the
+         * subcommand itself, positional[1] is the query. Pure so the
+         * --max-swallowed-query regression stays testable off-device.
+         */
+        private fun searchQueryOf(positional: List<String>): String? = positional.getOrNull(1)
+
+        /** "?,?,…" placeholder list for an IN (…) selection. Pure. */
+        private fun inPlaceholders(count: Int): String = List(count) { "?" }.joinToString(",")
+
+        /**
+         * [sweep1014-P10] Aggregate (contactId, value) rows into
+         * contactId → values, preserving encounter order within each id.
+         * Pure so the batch aggregation stays testable off-device.
+         */
+        private fun aggregateValues(pairs: List<Pair<Long, String>>): Map<Long, List<String>> {
+            val out = LinkedHashMap<Long, MutableList<String>>()
+            for ((id, v) in pairs) out.getOrPut(id) { mutableListOf() }.add(v)
+            return out
+        }
+
         private const val HELP_TEXT = """android-contacts — read + delete device contacts (requires READ_CONTACTS, plus WRITE_CONTACTS for delete)
 
 Usage:
