@@ -13,6 +13,8 @@ import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.service.SessionActivityTracker
 import com.rikkaminis.app.service.SessionConcurrencyManager
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import java.time.LocalDate
 import java.time.LocalDateTime
@@ -55,6 +57,15 @@ object ScheduledTaskRunner {
     /** In-process single-flight gate (brief §5.2); mirrored by the persisted marker. */
     @Volatile
     private var runningTaskId: String? = null
+
+    /**
+     * [B27] Serializes the whole read-evaluate-mark-running pass: two
+     * foreground beats landing close together used to run [checkAndFireToday]
+     * concurrently — both observed the same due task between the
+     * [runningTaskId] check and its placement, and the daily task fired
+     * twice (the crash-recovery branch double-counted the same way).
+     */
+    private val checkMutex = Mutex()
 
     /** sessionId -> dispatch record for runs this process started and awaits settling. */
     private val dispatched = ConcurrentHashMap<String, Dispatch>()
@@ -104,7 +115,10 @@ object ScheduledTaskRunner {
     // Check pass
     // ------------------------------------------------------------------
 
-    internal suspend fun checkAndFireToday(app: MinisApp) {
+    // [B27] The whole read-evaluate-mark-running pass — including the fire —
+    // is atomic under checkMutex, so two concurrent foreground beats cannot
+    // both observe the same due task and fire it twice.
+    internal suspend fun checkAndFireToday(app: MinisApp) = checkMutex.withLock {
         val gate = ScheduledTasksStore.load(app)
         if (!gate.globalEnabled) return
 

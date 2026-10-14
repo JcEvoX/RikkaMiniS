@@ -23,7 +23,10 @@ import kotlin.coroutines.suspendCoroutine
  * The gate is a single global queue: at most one confirm dialog shows
  * at a time. Subsequent requests stack up so the agent can fire a
  * rapid sequence of writes and the user reviews them one by one in
- * arrival order. Each request carries a 120-second timeout — past
+ * arrival order. Each request carries a 120-second timeout that starts
+ * only when the request becomes front-of-queue (its dialog is about to
+ * be shown) — past that, the request resolves as [ConfirmOutcome.TimedOut]
+ * and any future user interaction with the (stale) dialog is a no-op. — past
  * that, the request resolves as [ConfirmOutcome.TimedOut] and any
  * future user interaction with the (stale) dialog is a no-op.
  *
@@ -35,12 +38,13 @@ object ConfigConfirmationGate {
 
     /**
      * [T-android-config-confirm-timeout] Wall-clock window per request. The
-     * timer starts the moment the change is enqueued and runs regardless of
-     * foreground/background (behavior intentionally unchanged) — so when the
-     * app is backgrounded the OLD 30s window elapsed before the user ever saw
-     * the dialog (iOS reported three back-to-back timedOut with no chance to
-     * approve). Widened to 2 minutes so a backgrounded user has time to react
-     * to the [backgroundNotifier] nudge and return. Mirrors iOS 073fb9c5.
+     * timer starts the moment the change becomes front-of-queue (pending —
+     * its dialog is about to be shown), not at enqueue time, and runs
+     * regardless of foreground/background (behavior intentionally
+     * unchanged) — so when the app is backgrounded the user has time to
+     * react to the [backgroundNotifier] nudge and return, and a request
+     * queued behind other dialogs doesn't burn its window while it waits
+     * its turn [B23]. Mirrors iOS 073fb9c5.
      */
     const val TIMEOUT_MS: Long = 120_000
 
@@ -96,12 +100,13 @@ object ConfigConfirmationGate {
             scope.launch {
                 mutex.withLock {
                     awaiters[change.id] = cont
-                    timeouts[change.id] = scope.launch {
-                        delay(TIMEOUT_MS)
-                        timeout(change.id)
-                    }
+                    // [B23] The per-request timer no longer starts at enqueue
+                    // time — it starts only when this change truly becomes
+                    // front-of-queue, so a queued request doesn't burn its
+                    // 120s window while it waits behind other dialogs.
                     if (_pending.value == null) {
                         _pending.value = change
+                        startTimeout(change.id)
                         // [T-android-config-confirm-timeout] If already
                         // backgrounded when this becomes front-of-queue, the
                         // user won't see the dialog — nudge them so they can
@@ -146,6 +151,18 @@ object ConfigConfirmationGate {
     }
 
     /**
+     * [B23] Start the per-request timeout. Called only when a change becomes
+     * front-of-queue (pending) — never at enqueue time — so a request queued
+     * behind other dialogs gets its full window once it is actually shown.
+     */
+    private fun startTimeout(id: String) {
+        timeouts[id] = scope.launch {
+            delay(TIMEOUT_MS)
+            timeout(id)
+        }
+    }
+
+    /**
      * Deliver [outcome] to whoever is awaiting [id].
      *
      * @return true when a continuation was actually resumed. false means the
@@ -155,17 +172,27 @@ object ConfigConfirmationGate {
      */
     private suspend fun resolve(id: String, outcome: ConfirmOutcome): Boolean {
         val cont: Continuation<ConfirmOutcome>?
-        val advance: Boolean
         var advancedTo: PendingConfigChange? = null
         mutex.withLock {
             cont = awaiters.remove(id)
             timeouts.remove(id)?.cancel()
             notifiedIds.remove(id)
-            advance = _pending.value?.id == id
-            if (advance) {
-                val next = queue.removeFirstOrNull()
-                _pending.value = next?.change
-                advancedTo = next?.change
+            when (val plan = planQueueAdvance(_pending.value?.id, id, queue.map { it.change.id })) {
+                is QueueAdvancePlan.Advance -> {
+                    val next = queue.removeFirstOrNull()
+                    _pending.value = next?.change
+                    advancedTo = next?.change
+                    // [B23] The newly-surfaced request's timer starts only now
+                    // (when its dialog is about to be shown) — not at enqueue.
+                    next?.let { startTimeout(it.change.id) }
+                }
+                is QueueAdvancePlan.PurgeQueued ->
+                    // [B23] A request that resolved while still queued must be
+                    // purged from the backlog — otherwise it later surfaces as
+                    // a zombie dialog when the current pending resolves, and
+                    // writes behind it queue forever.
+                    queue.removeAll { it.change.id == id }
+                QueueAdvancePlan.Noop -> Unit
             }
         }
         // The change is done — clear any pending-approval notification for it.
@@ -205,4 +232,37 @@ object ConfigConfirmationGate {
             }
         }
     }
+}
+
+/**
+ * [B23] Pure state-machine core of the gate's resolve step, extracted for
+ * JVM testing. Given the front-of-queue id and the id being resolved, decides
+ * the queue surgery:
+ *
+ *  - resolving the pending request → [QueueAdvancePlan.Advance]: pop the queue
+ *    head (if any) as the new pending — its timeout starts only now, not at
+ *    enqueue time;
+ *  - resolving a request that is still queued → [QueueAdvancePlan.PurgeQueued]:
+ *    purge it from the backlog so it can never surface later as a zombie dialog
+ *    when the current pending resolves;
+ *  - resolving an id that is neither (double resolve / already gone) →
+ *    [QueueAdvancePlan.Noop].
+ */
+internal sealed class QueueAdvancePlan {
+    /** The resolved request was front-of-queue: pop [nextId] (null = queue empty). */
+    data class Advance(val nextId: String?) : QueueAdvancePlan()
+    /** The resolved request was still queued: purge it from the backlog. */
+    object PurgeQueued : QueueAdvancePlan()
+    /** Neither pending nor queued — nothing to do. */
+    object Noop : QueueAdvancePlan()
+}
+
+internal fun planQueueAdvance(
+    pendingId: String?,
+    resolvingId: String,
+    queueIds: List<String>,
+): QueueAdvancePlan = when {
+    pendingId == resolvingId -> QueueAdvancePlan.Advance(queueIds.firstOrNull())
+    queueIds.contains(resolvingId) -> QueueAdvancePlan.PurgeQueued
+    else -> QueueAdvancePlan.Noop
 }
