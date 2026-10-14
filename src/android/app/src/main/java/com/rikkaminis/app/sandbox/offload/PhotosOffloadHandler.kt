@@ -415,7 +415,6 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
             return NativeOffloadResult(2, "android-photos album: --id <bucket_id> or --name <bucket_name> is required\n")
         }
         val limit = (args.getInt("limit") ?: args.getInt("max") ?: 50).coerceIn(1, 200)
-        val arr = JSONArray()
         val selection: String
         val selArgs: Array<String>
         if (bucketId != null) {
@@ -425,24 +424,25 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
             selection = "${MediaStore.Images.Media.BUCKET_DISPLAY_NAME} LIKE ?"
             selArgs = arrayOf("%${bucketName!!}%")
         }
-        // Inline the projection so we can pass selection — queryMedia hides
-        // selection behind the start/end filters.
-        listOf(
-            MediaStore.Images.Media.EXTERNAL_CONTENT_URI to "photo",
-            MediaStore.Video.Media.EXTERNAL_CONTENT_URI to "video",
-        ).forEach { (uri, kind) ->
-            if (arr.length() >= limit) return@forEach
-            val proj = arrayOf(
-                MediaStore.Images.Media._ID,
-                MediaStore.Images.Media.DISPLAY_NAME,
-                MediaStore.Images.Media.DATE_TAKEN,
-                MediaStore.Images.Media.SIZE,
-                MediaStore.Images.Media.MIME_TYPE,
-                MediaStore.Images.Media.BUCKET_ID,
-                MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
-            )
+        // [sweep1014-B22a-parity] Query photos and videos independently (each
+        // capped at [limit]) and merge with the shared mergeMediaLimit, same
+        // shape as handleList. The old shared-quota form (photos fill the
+        // limit first, leftover quota goes to videos) starved album videos
+        // once the album held ≥limit photos. The inline projection stays:
+        // queryMedia hides selection behind the start/end filters.
+        val proj = arrayOf(
+            MediaStore.Images.Media._ID,
+            MediaStore.Images.Media.DISPLAY_NAME,
+            MediaStore.Images.Media.DATE_TAKEN,
+            MediaStore.Images.Media.SIZE,
+            MediaStore.Images.Media.MIME_TYPE,
+            MediaStore.Images.Media.BUCKET_ID,
+            MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
+        )
+        fun queryBucket(uri: Uri, kind: String): List<MediaEntry> {
+            val out = mutableListOf<MediaEntry>()
             context.contentResolver.query(uri, proj, selection, selArgs, "${MediaStore.Images.Media.DATE_TAKEN} DESC")?.use { c ->
-                while (c.moveToNext() && arr.length() < limit) {
+                while (c.moveToNext() && out.size < limit) {
                     val p = JSONObject()
                         .put("id", c.getLong(0))
                         .put("name", c.getString(1) ?: "")
@@ -453,10 +453,15 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
                         .put("mime_type", c.getString(4) ?: "")
                         .put("bucket_id", c.getLong(5))
                         .put("bucket_name", c.getString(6) ?: "")
-                    arr.put(p)
+                    out.add(MediaEntry(dt, p))
                 }
             }
+            return out
         }
+        val photos = queryBucket(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, "photo")
+        val videos = queryBucket(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, "video")
+        val arr = JSONArray()
+        mergeMediaLimit(photos, videos, limit).forEach { arr.put(it.json) }
         AppLogger.info(TAG, "album: id=$bucketId name='$bucketName' count=${arr.length()}")
         val data = JSONObject()
             .put("media", arr)
