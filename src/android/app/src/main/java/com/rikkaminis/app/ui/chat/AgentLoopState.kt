@@ -139,7 +139,9 @@ internal class AgentLoopState(
     /**
      * [T-android-empty-after-toolresult-reminder] One-shot guard for the
      * "<system-reminder> + retry one round" recovery when the server returns
-     * an empty response right after a tool result. Fires at most once per
+     * an empty response. [port-v114 S4] broadened: fires for any nudgeable
+     * history tail (tool_result or text part), decided by EmptyTurnRecovery.
+     * Fires at most once per
      * runAgentLoop so it can never loop; if the reminder round is also empty
      * we surface a real error instead of a silent blank bubble.
      */

@@ -2317,39 +2317,62 @@ internal class AgentLoopEngine(
                     !turnTruncated
                 if (!hasVisibleContent && finishedCleanly) {
                     // [T-android-empty-after-toolresult-reminder] Special case: the
-                    // server returned an empty turn right after a tool result. The
-                    // model owes a follow-up (next tool call or a final answer) but
-                    // stalled — the user sees a blank bubble with no explanation.
-                    // Inject a one-shot <system-reminder> into that tool result and
+                    // server returned an empty turn. The model owed a follow-up
+                    // but stalled — the user sees a blank bubble with no explanation.
+                    // Inject a one-shot <system-reminder> into the history tail and
                     // retry ONE round. The guard fires at most once per run, so it
                     // can never loop; the SECOND empty falls through to the error
                     // hint below. Mirrors iOS AIChatViewModel.swift empty-after-
                     // tool-result path.
                     //
-                    // The empty assistant turn was just appended (above) — drop it
-                    // so the tool result is the last message and the model gets a
-                    // clean "continue from here" prompt on the retry.
-                    val priorIsToolResult = host.agentHistory.size >= 2 &&
-                        host.agentHistory[host.agentHistory.size - 2].contentParts.isNotEmpty() &&
-                        host.agentHistory[host.agentHistory.size - 2].contentParts.all { it is AgentContentPart.ToolResult }
-                    if (!loopState.didInjectEmptyToolReminder && priorIsToolResult) {
-                        loopState.didInjectEmptyToolReminder = true
-                        AppLogger.warning(TAG_STREAM, "empty turn after tool result — injecting <system-reminder> and retrying one round (turn=$turn)")
-                        // Remove the empty assistant turn we just added.
-                        host.agentHistory.removeAt(host.agentHistory.size - 1)
-                        // Inject the reminder into the last tool result's content.
-                        val trIdx = host.agentHistory.size - 1
-                        val trMsg = host.agentHistory[trIdx]
-                        val reminder = "\n\n<system-reminder>The previous response was empty. A tool result was just provided and you MUST continue: respond with the next tool call(s) if more work is needed, or a final text answer for the user. Do not return an empty response.</system-reminder>"
-                        val newParts = trMsg.contentParts.toMutableList()
-                        val lastTrPartIdx = newParts.indexOfLast { it is AgentContentPart.ToolResult }
-                        if (lastTrPartIdx >= 0) {
-                            val part = newParts[lastTrPartIdx] as AgentContentPart.ToolResult
-                            newParts[lastTrPartIdx] = part.copy(content = part.content + reminder)
-                            host.agentHistory[trIdx] = trMsg.copy(contentParts = newParts)
+                    // [port-v114 S4 / T-android-empty-turn-reminder-any-tail] The
+                    // placement decision (which tail part carries the reminder) is
+                    // delegated to EmptyTurnRecovery.plan(): prefer the trailing
+                    // tool_result (original behaviour, byte-identical for that
+                    // case), else a trailing TEXT part (statement / notice tails
+                    // the old all-ToolResult guard skipped — those fell through to
+                    // the error hint with no retry), else a standalone reminder
+                    // turn; an assistant tail (or an already-fired guard) gives up.
+                    val recoveryPlan = if (loopState.didInjectEmptyToolReminder) EmptyTurnRecovery.Plan.GiveUp
+                        else EmptyTurnRecovery.plan(host.agentHistory, alreadyFired = false)
+                    when (val plan = recoveryPlan) {
+                        is EmptyTurnRecovery.Plan.NudgeExistingPart -> {
+                            loopState.didInjectEmptyToolReminder = true
+                            AppLogger.warning(TAG_STREAM, "empty turn — injecting <system-reminder> into the history tail and retrying one round (turn=$turn)")
+                            // The empty assistant turn was just appended (above) — drop it
+                            // so the nudge lands on the tail being replied to and the model
+                            // gets a clean "continue from here" prompt on the retry.
+                            host.agentHistory.removeAt(host.agentHistory.size - 1)
+                            val tailMsg = host.agentHistory[plan.tailIndex]
+                            val reminder = EmptyTurnRecovery.REMINDER
+                            val newParts = tailMsg.contentParts.toMutableList()
+                            newParts[plan.partIndex] = when (val part = newParts[plan.partIndex]) {
+                                is AgentContentPart.ToolResult -> part.copy(content = part.content + reminder)
+                                is AgentContentPart.Text -> AgentContentPart.Text(part.text + reminder)
+                                else -> part
+                            }
+                            host.agentHistory[plan.tailIndex] = tailMsg.copy(contentParts = newParts)
+                            // Retry a fresh model round with the nudged history.
+                            continue
                         }
-                        // Retry a fresh model round with the nudged history.
-                        continue
+                        is EmptyTurnRecovery.Plan.AppendStandalone -> {
+                            loopState.didInjectEmptyToolReminder = true
+                            AppLogger.warning(TAG_STREAM, "empty turn — appending standalone reminder turn and retrying one round (turn=$turn)")
+                            // The empty assistant turn was just appended (above) — drop it.
+                            host.agentHistory.removeAt(host.agentHistory.size - 1)
+                            val reminder = EmptyTurnRecovery.REMINDER
+                            host.agentHistory.add(
+                                LLMMessage(
+                                    role = LLMMessage.Role.USER,
+                                    content = reminder,
+                                    contentParts = listOf(AgentContentPart.Text(reminder)),
+                                )
+                            )
+                            continue
+                        }
+                        EmptyTurnRecovery.Plan.GiveUp -> {
+                            // Fall through to the error hint below.
+                        }
                     }
                     val window = host.effectiveContextWindowTokens()
                     val usedCtx = lastUsage?.latestContextTokens ?: 0
