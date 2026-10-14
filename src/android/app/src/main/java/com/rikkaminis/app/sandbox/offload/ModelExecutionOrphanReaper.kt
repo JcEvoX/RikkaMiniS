@@ -24,6 +24,22 @@ import java.io.File
  *
  * UNKNOWN liveness, an ALIVE worker, an absent terminal, or anything outside
  * the staging root is NEVER deleted.
+ *
+ * [fix/sweep1014-d2a] Cancelled-orphan branch: a run dir with a `cancel`
+ * marker but NO terminal.json used to be skipped forever (the terminal
+ * barrier requires the worker's last write, and a worker that crashed /
+ * was killed after the client wrote `cancel` never wrote one) while the
+ * cold-start recovery policy also skips cancelled dirs
+ * ([PartialStreamRecoveryPolicy] `SKIP_CANCELLED` — the content was
+ * discarded by design, there is nothing to recover). Such a dir — request.json
+ * routinely holds MBs of Base64 image/context — was therefore permanently
+ * unreclaimable. The extra branch reaps it ONLY when the client's cancel is
+ * present (content value already discarded), the worker is not provably
+ * alive for this run, and the dir has aged past [ORPHAN_AGE_MS]. Liveness is
+ * checked with BOTH signals, skipping on either: the heartbeat file (a fresh
+ * beat proves the worker alive even where /proc is unreadable — TF-J2
+ * hidepid) and the pid probe ([ModelExecutionRunDir.probeLiveness] — the only
+ * reliable-POSITIVE signal; its DEAD on hidepid devices is not trusted here).
  */
 object ModelExecutionOrphanReaper {
 
@@ -31,6 +47,40 @@ object ModelExecutionOrphanReaper {
     private const val STAGING_ROOT = "model-exec"
     /** A run dir must be untouched this long before it's deemed an orphan. */
     private const val ORPHAN_AGE_MS = 10 * 60 * 1000L // 10 minutes
+
+    /**
+     * [fix/sweep1014-d2a] Pure decision for the cancelled-orphan reclaim
+     * branch (the run dir has NO terminal — the caller only reaches this
+     * branch after the terminal check failed). JVM-testable.
+     *
+     * SAFE only when ALL of:
+     *   - a `cancel` marker is present: the CLIENT explicitly discarded this
+     *     run's content (ChatStreamOffloadHandler / ModelExecutionDispatcher
+     *     write cancel only when the run is not terminal), and the recovery
+     *     policy already refuses to recover cancelled dirs (SKIP_CANCELLED);
+     *   - the liveness heartbeat is NOT fresh ([ModelExecutionRunDir.beatAlive]
+     *     is false) — a worker that is beating is provably alive for THIS run;
+     *   - the pid probe does not say ALIVE — the only reliable-positive
+     *     liveness signal; a probe DEAD/UNKNOWN on hidepid devices is not
+     *     trusted as proof of death, the stale beat + age carry that weight;
+     *   - the dir has aged past [ORPHAN_AGE_MS]. Any worker/client write into
+     *     the dir (stream appends, state/terminal, beat tmp+rename, the cancel
+     *     marker itself) refreshes the dir mtime, so this is a reliable
+     *     "nothing has touched this run for a while" proxy — 10 minutes past
+     *     the cancel write is far beyond any worker's finish path (the alive
+     *     path acks the cancel and writes terminal within seconds).
+     */
+    internal fun shouldReapCancelledOrphan(
+        cancelPresent: Boolean,
+        beatAlive: Boolean,
+        workerLivenessAlive: Boolean,
+        ageMs: Long,
+    ): Boolean {
+        if (!cancelPresent) return false // existing skip: no cancel → never reclaim
+        if (beatAlive) return false // worker provably alive for THIS run
+        if (workerLivenessAlive) return false // pid probe says alive
+        return ageMs >= ORPHAN_AGE_MS
+    }
 
     /**
      * Scan the staging root and delete any eligible orphan run dir. Returns
@@ -56,18 +106,40 @@ object ModelExecutionOrphanReaper {
                 Log.w(TAG, "reaper skipped non-staging path: ${child.absolutePath}")
                 continue
             }
-            // Criterion 1: terminal barrier present.
-            if (!ModelExecutionRunDir.terminalPresent(child)) continue
-            // Criterion 2: safeToDelete (terminal + worker pid DEAD / never had ref).
-            val runId = ModelExecutionDispatcher.runIdOf(child)
-            if (!ModelExecutionRunDir.safeToDelete(child, runId)) continue
-            // Criterion 3: mtime older than ORPHAN_AGE_MS.
+            // Criterion 3 first (shared by both branches): mtime older than
+            // ORPHAN_AGE_MS — no worker/client touch for a while. Checking it
+            // before the liveness probes avoids probing dirs that are too
+            // young to reap anyway (all-AND semantics, order is an optimization).
             val mtime = child.lastModified()
-            if (System.currentTimeMillis() - mtime < ORPHAN_AGE_MS) continue
+            val ageMs = System.currentTimeMillis() - mtime
+            if (ageMs < ORPHAN_AGE_MS) continue
+            val runId = ModelExecutionDispatcher.runIdOf(child)
+            val reason: String
+            if (ModelExecutionRunDir.terminalPresent(child)) {
+                // Criterion 2 (terminal branch): safeToDelete (terminal +
+                // worker pid DEAD / never had ref).
+                if (!ModelExecutionRunDir.safeToDelete(child, runId)) continue
+                reason = "terminal"
+            } else {
+                // [fix/sweep1014-d2a] Cancelled-orphan branch: no terminal,
+                // but the client's cancel is present and the worker is not
+                // provably alive — the content was discarded by the cancel
+                // semantics and the recovery policy skips cancelled dirs, so
+                // the only thing left to do is reclaim the disk.
+                val eligible = shouldReapCancelledOrphan(
+                    cancelPresent = File(child, ModelExecutionMailbox.FILE_CANCEL).isFile,
+                    beatAlive = ModelExecutionRunDir.beatAlive(child),
+                    workerLivenessAlive = ModelExecutionRunDir.probeLiveness(child, runId) ==
+                        ModelExecutionRunDir.WorkerLiveness.ALIVE,
+                    ageMs = ageMs,
+                )
+                if (!eligible) continue
+                reason = "cancelled-orphan"
+            }
             val ok = runCatching { child.deleteRecursively(); true }.getOrDefault(false)
             if (ok) {
                 deleted++
-                Log.i(TAG, "reaped orphan run dir: ${child.name} (mtime ${mtime}ms)")
+                Log.i(TAG, "reaped $reason orphan run dir: ${child.name} (mtime ${mtime}ms)")
             } else {
                 Log.w(TAG, "reaper failed to delete orphan: ${child.name}")
             }
