@@ -1796,6 +1796,19 @@ internal fun ChatViewModel.uniqueUploadFileName(dir: java.io.File, original: Str
 
 /** LLM-based title + category generation, mirrors iOS generateSessionTitleIfNeeded(). */
 
+/**
+ * [fix/rv1014-g1] Pure + JVM-testable form of the auto-title trigger: does
+ * this session still need a title? Reads the SAME criterion the internal
+ * "title-already-set" guard below uses, so the trigger and the guard can
+ * never drift. The agent loop's call sites key off this (via
+ * AgentLoopHost.sessionTitleNeedsGeneration) instead of the old positional
+ * `turn == 0` guard — a first turn that stalls (empty round + recovery
+ * retry) reaches the decision point with turn != 0, and under the old
+ * condition the auto-title was skipped until the next send (or forever).
+ */
+internal fun sessionTitleNeedsGenerationOf(title: String): Boolean =
+    title == "New Chat" || title.isEmpty()
+
 internal fun ChatViewModel.generateSessionTitleIfNeeded(force: Boolean = false) {
     // [T-android-titlegen-diag-logging] Unified "TitleGen" trail across
     // every path of this function — XIN 40454 reported sessions silently
@@ -1816,7 +1829,9 @@ internal fun ChatViewModel.generateSessionTitleIfNeeded(force: Boolean = false) 
     // Skip if title already set (not "New Chat")
     // [feat/drawer-context-menu] The manual regenerate path (drawer context
     // menu) passes force=true to bypass this guard — the auto path keeps it.
-    if (!force && _sessionTitle.value != "New Chat" && _sessionTitle.value.isNotEmpty()) {
+    // [fix/rv1014-g1] Guard criterion now shared with the loop's trigger via
+    // sessionTitleNeedsGenerationOf — same source of truth, no drift.
+    if (!force && !sessionTitleNeedsGenerationOf(_sessionTitle.value)) {
         AppLogger.info("TitleGen", "skip guard=title-already-set title='${_sessionTitle.value.take(200)}'")
         return
     }

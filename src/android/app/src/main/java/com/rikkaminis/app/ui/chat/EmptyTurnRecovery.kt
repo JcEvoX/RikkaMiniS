@@ -68,4 +68,27 @@ internal object EmptyTurnRecovery {
         // User tail with no appendable part (image-only, etc.).
         return Plan.AppendStandalone
     }
+
+    /**
+     * [fix/rv1014-g2] Performs the [Plan.AppendStandalone] mutation: drop the
+     * empty assistant turn the loop just appended, enforce role alternation
+     * (the plan pre-condition is a USER tail — a blind USER append yields two
+     * consecutive user roles, and Gemini maps messages 1:1 on the request side
+     * with no consecutive-role merge), then append the standalone reminder
+     * turn. Same bridge family every other append point uses
+     * ([ensureRoleAlternationBeforeUserAppend]).
+     *
+     * Pure + JVM-testable (no ViewModel dependencies).
+     */
+    fun appendStandaloneReminderTurn(history: MutableList<LLMMessage>, reminder: String) {
+        history.removeAt(history.size - 1)
+        ensureRoleAlternationBeforeUserAppend(history)
+        history.add(
+            LLMMessage(
+                role = LLMMessage.Role.USER,
+                content = reminder,
+                contentParts = listOf(AgentContentPart.Text(reminder)),
+            ),
+        )
+    }
 }
