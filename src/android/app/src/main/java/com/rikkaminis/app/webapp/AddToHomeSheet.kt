@@ -479,7 +479,8 @@ private fun IconOption(
     }
 }
 
-private enum class IconPreset(val imageVector: ImageVector) {
+// internal (was private) so presetGlyphKind doesn't expose a private-in-file type.
+internal enum class IconPreset(val imageVector: ImageVector) {
     Globe(Icons.Default.Public),
     Chart(Icons.Default.Insights),
     Book(Icons.Default.Book),
