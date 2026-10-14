@@ -30,6 +30,21 @@ object MCPOAuthStore {
     @Volatile
     private var prefsRef: SharedPreferences? = null
 
+    // [sweep1014-D4a] Server names are joined into file paths (bridge file,
+    // secret handoff). Whitelist: letters, digits, '.', '_', '-'; rejects
+    // empty, overlong, '/', and the literal "..". Refuse-instead-of-guess —
+    // never sanitize by truncation.
+    private val SERVER_NAME_RE = Regex("^[A-Za-z0-9._-]+$")
+    private const val SERVER_NAME_MAX = 128
+
+    /** Returns [server] when it is a safe path segment, else null. */
+    fun validateServerName(server: String): String? =
+        if (server.isNotEmpty() &&
+            server.length <= SERVER_NAME_MAX &&
+            server != ".." &&
+            SERVER_NAME_RE.matches(server)
+        ) server else null
+
     private fun prefs(context: Context): SharedPreferences =
         prefsRef ?: synchronized(this) {
             prefsRef ?: EncryptedPrefsFactory.safeCreate(context.applicationContext, FILE)
@@ -62,6 +77,13 @@ object MCPOAuthStore {
      * import leaves the file in place for the next attempt.
      */
     fun importPendingClientSecret(context: Context, server: String): String? {
+        // [sweep1014-D4a] Refuse (null + log) rather than building a path from
+        // an unsanitized name. This is called from Compose state init
+        // (MCPIntegrationsScreen), where a throw would crash composition.
+        if (validateServerName(server) == null) {
+            AppLogger.warning(TAG, "refusing secret handoff import: invalid server name '$server'")
+            return null
+        }
         val file = File(bridgeDir(context), "$server.secret")
         if (!file.exists()) return null
         val secret = runCatching { file.readText().trim() }.getOrNull()
@@ -144,12 +166,23 @@ object MCPOAuthStore {
     fun bridgeDir(context: Context): File =
         File(File(context.filesDir, "minis-global/mcp-servers"), "oauth")
 
-    private fun bridgeFile(context: Context, server: String): File =
-        File(bridgeDir(context), "$server.json")
+    private fun bridgeFile(context: Context, server: String): File {
+        // [sweep1014-D4a] Refuse-instead-of-guess: an unsanitized name never
+        // reaches the path join. materializeBridgeFile catches this and logs
+        // a clear warning; deleteBridgeFile's runCatching no-ops (nothing was
+        // ever written under an invalid name).
+        val safe = validateServerName(server)
+            ?: throw IllegalArgumentException(
+                "server name is not a safe path segment (allowed: letters, digits, '.', '_', '-'): '$server'")
+        return File(bridgeDir(context), "$safe.json")
+    }
 
     /** Write [payload] to the in-guest token bridge (atomic, 0600, best-effort). */
     fun materializeBridgeFile(context: Context, server: String, payload: BridgePayload) {
         try {
+            val safe = validateServerName(server)
+                ?: throw IllegalArgumentException(
+                    "server name is not a safe path segment (allowed: letters, digits, '.', '_', '-'): '$server'")
             val dir = bridgeDir(context).apply { mkdirs() }
             val json = JSONObject().apply {
                 put("access_token", payload.accessToken)
@@ -162,7 +195,7 @@ object MCPOAuthStore {
                 payload.resource?.takeIf { it.isNotBlank() }?.let { put("resource", it) }
             }
             val target = bridgeFile(context, server)
-            val tmp = File(dir, "$server.json.tmp")
+            val tmp = File(dir, "$safe.json.tmp")
             tmp.writeText(json.toString())
             // 0600 (owner rw only) — the file holds live bearer tokens.
             runCatching { tmp.setReadable(false, false); tmp.setWritable(false, false) }
@@ -189,9 +222,12 @@ object MCPOAuthStore {
     /** Remove the in-guest bridge file (sign out / delete / purge). */
     fun deleteBridgeFile(context: Context, server: String) {
         runCatching {
-            bridgeFile(context, server).delete()
-            File(bridgeDir(context), "$server.json.tmp").delete()
-            File(bridgeDir(context), "$server.secret").delete()
+            // [sweep1014-D4a] Invalid name → nothing was ever written under
+            // it; refuse (skip) rather than build a path.
+            val safe = validateServerName(server) ?: return
+            bridgeFile(context, safe).delete()
+            File(bridgeDir(context), "$safe.json.tmp").delete()
+            File(bridgeDir(context), "$safe.secret").delete()
         }
     }
 }
