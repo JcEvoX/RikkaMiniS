@@ -37,6 +37,16 @@ import org.json.JSONObject
  */
 
 /**
+ * [fix/sweep1014-b19] Sub-agent truncation continuation ceiling — aligned with
+ * the main loop's length-wall continuation default
+ * (AgentRuntimeLimitsPrefs.LENGTH_WALL_DEFAULT = 4). The sub-agent loop is a
+ * pure function (no prefs access), so the ceiling is a constant here; each
+ * truncated-turn continue also consumes one of config.maxTurns, which bounds
+ * the loop regardless.
+ */
+internal const val MAX_SUBAGENT_TRUNCATION_CONTINUES = 4
+
+/**
  * Write bytes to `<filesDir>/minis-sessions/<sessionId>/browser/<filename>`
  * (host dir resolved via [PRootKernel], bind-mounted to `/var/minis/browser/`
  * so the agent can read it back via file_read / file_write / minis:// URLs).
@@ -262,6 +272,13 @@ internal suspend fun runSubagentLoop(
     query: String,
     title: String,
     config: SubagentSkill.SubagentConfig,
+    // [fix/sweep1014-b19] Verification note: this parameter is deliberately
+    // NOT referenced inside the loop body — the production streamProvider
+    // (ChatPromptAndTools.executeSpawnAgentTool) closes over the same
+    // systemPrompt and already passes it to ProviderExecutionGateway.stream
+    // on every turn, so the request DOES carry it. Keep the parameter so the
+    // loop's signature stays self-describing; do not "fix" it into the
+    // lambda signature without also updating that call site.
     systemPrompt: String,
     streamProvider: suspend (messages: List<LLMMessage>) -> kotlinx.coroutines.flow.Flow<LLMStreamChunk>,
     executeSubTool: suspend (name: String, argsJson: String) -> ToolExecutionResult,
@@ -272,11 +289,22 @@ internal suspend fun runSubagentLoop(
     var turns = 0
     var lastText = ""
     var subResidueNudges = 0
+    // [fix/sweep1014-b19] Truncated-turn tracking (main loop's turnFinishReason
+    // counterpart): Finished carries both the protocol stopReason and the
+    // stream-level truncated flag (EOF / connection drop mid-stream).
+    var turnFinishReason: String? = null
+    var turnTruncated = false
+    var truncationContinues = 0
+    var truncatedAtFinish = false
     val history = mutableListOf(LLMMessage(role = LLMMessage.Role.USER, content = query))
 
     try {
         while (turns < config.maxTurns) {
             turns++
+            // [fix/sweep1014-b19] Per-turn reset: a turn without a Finished
+            // chunk must not inherit the previous turn's verdict.
+            turnFinishReason = null
+            turnTruncated = false
             val textSb = StringBuilder()
             val toolCalls = mutableListOf<SubagentToolCall>()
 
@@ -288,6 +316,12 @@ internal suspend fun runSubagentLoop(
                     is LLMStreamChunk.Text -> textSb.append(chunk.text)
                     is LLMStreamChunk.ToolCallComplete -> {
                         toolCalls.add(SubagentToolCall(chunk.id, chunk.name, chunk.args))
+                    }
+                    // [fix/sweep1014-b19] Was silently ignored — a truncated
+                    // turn read as a clean finish. Track both signals.
+                    is LLMStreamChunk.Finished -> {
+                        turnFinishReason = chunk.stopReason
+                        turnTruncated = chunk.truncated
                     }
                     else -> {}
                 }
@@ -340,6 +374,38 @@ internal suspend fun runSubagentLoop(
                         "— refilling $subResidueNudges/${ToolCallResiduePolicy.MAX_RESIDUE_REFILL_NUDGES} instead of finishing")
                     continue
                 }
+                // [fix/sweep1014-b19] Truncated sub-agent turn — was silently
+                // treated as a clean finish (sub-agent truncation looked like
+                // normal completion). Reuse the main loop's
+                // [T-length-wall-continue] policy, sub-agent shape: a
+                // non-empty truncated turn CONTINUES (assistant partial stays
+                // in history as prefill + the same lengthWallReminder the main
+                // loop injects, so the model resumes at the exact cut point);
+                // an empty truncated turn (whole budget burned producing
+                // nothing usable) does not re-bill for the same wall — it
+                // finishes but carries a truncation note instead of passing
+                // silently. Bounded by config.maxTurns (each continue consumes
+                // a turn) plus the explicit ceiling below.
+                if (TruncatedToolCallPolicy.isTruncatedFinish(turnFinishReason) || turnTruncated) {
+                    if (text.isNotBlank() && truncationContinues < MAX_SUBAGENT_TRUNCATION_CONTINUES) {
+                        truncationContinues++
+                        history.add(LLMMessage(
+                            role = LLMMessage.Role.ASSISTANT,
+                            content = text,
+                        ))
+                        ensureRoleAlternationBeforeUserAppend(history)
+                        val reminder = lengthWallReminder(text.takeLast(80))
+                        history.add(LLMMessage(
+                            role = LLMMessage.Role.USER,
+                            content = reminder,
+                            contentParts = listOf(AgentContentPart.Text(reminder)),
+                        ))
+                        log("[Subagent] turn=$turns finish=${turnFinishReason ?: "eof"} truncated " +
+                            "(${text.length} chars) — continuing ($truncationContinues/$MAX_SUBAGENT_TRUNCATION_CONTINUES)")
+                        continue
+                    }
+                    truncatedAtFinish = true
+                }
                 // Model finished naturally — no more tool calls
                 break
             }
@@ -356,7 +422,13 @@ internal suspend fun runSubagentLoop(
             // Execute tools sequentially
             for (call in toolCalls) {
                 val result = executeSubTool(call.name, call.args.toString())
+                // [fix/sweep1014-b19] Was "Error: ${result.output}" even when
+                // the sub-tool's own failure output already carries the
+                // "Error: " prefix (budget exhausted, provider errors) — the
+                // next request read "Error: Error: ...".
                 val resultContent = if (result.success) {
+                    result.output
+                } else if (result.output.startsWith("Error: ")) {
                     result.output
                 } else {
                     "Error: ${result.output}"
@@ -392,12 +464,29 @@ internal suspend fun runSubagentLoop(
     val finalText = resultSb.toString().trim()
     if (finalText.isBlank()) {
         return ToolExecutionResult(
-            "Sub-agent '$skillName' completed in $turns turn(s) with no output.",
+            "Sub-agent '$skillName' completed in $turns turn(s) with no output." +
+                // [fix/sweep1014-b19] Empty + truncated: the whole budget was
+                // burned producing nothing usable — carry the truncation note
+                // instead of passing as a clean empty completion.
+                if (truncatedAtFinish) {
+                    " The final turn was cut off at the model's output limit " +
+                        "(${turnFinishReason ?: "eof"})."
+                } else {
+                    ""
+                },
             true, toolTitle = title,
         )
     }
 
-    val summary = "Sub-agent '$skillName' completed in $turns turn(s).\n\n---\n$finalText"
+    val summary = "Sub-agent '$skillName' completed in $turns turn(s).\n\n---\n$finalText" +
+        // [fix/sweep1014-b19] The final turn was cut off at the output
+        // ceiling — never pass a truncated result as a clean completion.
+        if (truncatedAtFinish) {
+            "\n\n[Note: the sub-agent's final turn was cut off at the model's output limit " +
+                "(${turnFinishReason ?: "eof"}); the result above may be incomplete.]"
+        } else {
+            ""
+        }
     return ToolExecutionResult(summary, true, toolTitle = title)
 }
 

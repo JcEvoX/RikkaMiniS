@@ -1863,7 +1863,12 @@ class ChatViewModel(
         // launch by MinisApp); reading via a closure means the index sees
         // an up-to-date snapshot on every rescan without a manual refresh.
         FileMentionIndex(
-            filesDir = java.io.File(context.applicationContext.filesDir, "minis-global"),
+            // [fix/sweep1014-b8] Was File(filesDir, "minis-global") — Layer 1
+            // scanned minis-global/workspace/<sid>, which never exists (the
+            // per-session trees live under filesDir/minis-sessions/<sid>/),
+            // so session-local files were 100% invisible to `@`. Pass the
+            // filesDir root; FileMentionIndex resolves both layers from it.
+            filesDir = context.applicationContext.filesDir,
             mountsProvider = {
                 com.rikkaminis.app.sandbox.PRootKernel
                     .mountEntriesForIndex(context.applicationContext)

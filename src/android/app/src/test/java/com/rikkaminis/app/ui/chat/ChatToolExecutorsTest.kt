@@ -325,4 +325,197 @@ class ChatToolExecutorsTest {
         assertTrue(result.success)
         assertTrue(result.output.contains("completed in 1 turn(s) with no output"))
     }
+
+    // ── [fix/sweep1014-b19] truncated sub-agent turns ─────────────
+
+    @Test
+    fun `subagent truncated turn continues with reminder instead of finishing`() {
+        // Turn 1 cut at the output ceiling (stopReason=length): was silently
+        // treated as a clean finish. Must continue — the assistant partial
+        // stays in history as prefill + the same lengthWallReminder the main
+        // loop injects.
+        val turn2Messages = mutableListOf<List<LLMMessage>>()
+        val result = kotlinx.coroutines.runBlocking {
+            runSubagentLoop(
+                skillName = "s", query = "q", title = "t", config = config(),
+                systemPrompt = "sys",
+                streamProvider = { messages ->
+                    if (messages.size == 1) {
+                        kotlinx.coroutines.flow.flowOf(
+                            LLMStreamChunk.Text("the answer is partial"),
+                            LLMStreamChunk.Finished("length"),
+                        )
+                    } else {
+                        turn2Messages.add(messages.toList())
+                        kotlinx.coroutines.flow.flowOf(
+                            LLMStreamChunk.Text("and here is the rest"),
+                            LLMStreamChunk.Finished("end_turn"),
+                        )
+                    }
+                },
+                executeSubTool = { _, _ -> ToolExecutionResult("x", true) },
+                knownToolNames = listOf("file_read"),
+                log = {},
+            )
+        }
+        assertTrue(result.success)
+        assertTrue(result.output.contains("the answer is partial"))
+        assertTrue(result.output.contains("and here is the rest"))
+        // Continued → no truncation note on a successful completion.
+        assertFalse(result.output.contains("cut off at the model's output limit"))
+        // Turn 2 saw: user query + assistant prefill + continuation reminder.
+        assertEquals(1, turn2Messages.size)
+        val msgs = turn2Messages.first()
+        assertEquals(3, msgs.size)
+        assertEquals(LLMMessage.Role.USER, msgs[0].role)
+        assertEquals(LLMMessage.Role.ASSISTANT, msgs[1].role)
+        assertEquals("the answer is partial", msgs[1].content)
+        assertEquals(LLMMessage.Role.USER, msgs[2].role)
+        assertTrue(msgs[2].content.contains("cut off mid-sentence"))
+        assertTrue(msgs[2].content.contains("the answer is partial"))
+    }
+
+    @Test
+    fun `subagent eof truncation continues`() {
+        // Stream-level truncation (Finished.truncated=true, no stopReason)
+        // must also continue, not read as a clean finish.
+        var streamCalls = 0
+        val result = kotlinx.coroutines.runBlocking {
+            runSubagentLoop(
+                skillName = "s", query = "q", title = "t", config = config(),
+                systemPrompt = "sys",
+                streamProvider = { messages ->
+                    streamCalls++
+                    if (messages.size == 1) {
+                        kotlinx.coroutines.flow.flowOf(
+                            LLMStreamChunk.Text("partial before eof"),
+                            LLMStreamChunk.Finished(null, truncated = true),
+                        )
+                    } else {
+                        kotlinx.coroutines.flow.flowOf(
+                            LLMStreamChunk.Text("done after eof"),
+                            LLMStreamChunk.Finished("end_turn"),
+                        )
+                    }
+                },
+                executeSubTool = { _, _ -> ToolExecutionResult("x", true) },
+                knownToolNames = listOf("file_read"),
+                log = {},
+            )
+        }
+        assertEquals(2, streamCalls)
+        assertTrue(result.output.contains("partial before eof"))
+        assertTrue(result.output.contains("done after eof"))
+    }
+
+    @Test
+    fun `subagent empty truncated turn carries note instead of re-billing`() {
+        // Empty text + length: the whole budget burned producing nothing —
+        // no continuation (re-billing for the same wall), but the note is
+        // carried instead of passing as a clean empty completion.
+        val result = kotlinx.coroutines.runBlocking {
+            runSubagentLoop(
+                skillName = "s", query = "q", title = "t", config = config(),
+                systemPrompt = "sys",
+                streamProvider = { _ ->
+                    kotlinx.coroutines.flow.flowOf(
+                        LLMStreamChunk.Text("   "),
+                        LLMStreamChunk.Finished("length"),
+                    )
+                },
+                executeSubTool = { _, _ -> ToolExecutionResult("x", true) },
+                knownToolNames = listOf("file_read"),
+                log = {},
+            )
+        }
+        assertTrue(result.success)
+        assertTrue(result.output.contains("completed in 1 turn(s) with no output"))
+        assertTrue(result.output.contains("cut off at the model's output limit"))
+    }
+
+    @Test
+    fun `subagent truncation continuation is bounded by the ceiling`() {
+        // Every turn truncates with non-empty text: continues up to
+        // MAX_SUBAGENT_TRUNCATION_CONTINUES (4), then finishes with the
+        // truncation note. Each continue consumes a turn.
+        var streamCalls = 0
+        val result = kotlinx.coroutines.runBlocking {
+            runSubagentLoop(
+                skillName = "s", query = "q", title = "t",
+                config = config(maxTurns = 8), systemPrompt = "sys",
+                streamProvider = { _ ->
+                    streamCalls++
+                    kotlinx.coroutines.flow.flowOf(
+                        LLMStreamChunk.Text("part-${streamCalls}"),
+                        LLMStreamChunk.Finished("length"),
+                    )
+                },
+                executeSubTool = { _, _ -> ToolExecutionResult("x", true) },
+                knownToolNames = listOf("file_read"),
+                log = {},
+            )
+        }
+        // 4 continues + the final truncated turn.
+        assertEquals(5, streamCalls)
+        assertTrue(result.success)
+        assertTrue(result.output.contains("part-"))
+        assertTrue(result.output.contains("cut off at the model's output limit"))
+        assertTrue(result.output.contains("completed in 5 turn"))
+    }
+
+    @Test
+    fun `subagent clean finish carries no truncation note`() {
+        // Explicit clean finish (stopReason=null, truncated=false) must not
+        // trip the truncation path.
+        val result = kotlinx.coroutines.runBlocking {
+            runSubagentLoop(
+                skillName = "s", query = "q", title = "t", config = config(),
+                systemPrompt = "sys",
+                streamProvider = { _ ->
+                    kotlinx.coroutines.flow.flowOf(
+                        LLMStreamChunk.Text("clean answer"),
+                        LLMStreamChunk.Finished(null),
+                    )
+                },
+                executeSubTool = { _, _ -> ToolExecutionResult("x", true) },
+                knownToolNames = listOf("file_read"),
+                log = {},
+            )
+        }
+        assertTrue(result.success)
+        assertTrue(result.output.contains("clean answer"))
+        assertFalse(result.output.contains("cut off at the model's output limit"))
+    }
+
+    @Test
+    fun `subagent tool failure without double Error prefix`() {
+        // Sub-tool failures already carry the "Error: " prefix — the loop
+        // must not stack a second one ("Error: Error: ...").
+        val turn2Messages = mutableListOf<List<LLMMessage>>()
+        val result = kotlinx.coroutines.runBlocking {
+            runSubagentLoop(
+                skillName = "s", query = "q", title = "t", config = config(),
+                systemPrompt = "sys",
+                streamProvider = { messages ->
+                    if (messages.size == 1) {
+                        kotlinx.coroutines.flow.flowOf(
+                            LLMStreamChunk.ToolCallComplete("id1", "file_read", org.json.JSONObject()),
+                        )
+                    } else {
+                        turn2Messages.add(messages.toList())
+                        kotlinx.coroutines.flow.flowOf(LLMStreamChunk.Text("noted"))
+                    }
+                },
+                executeSubTool = { _, _ ->
+                    ToolExecutionResult("Error: Agent budget exhausted (shell_commands)", false)
+                },
+                knownToolNames = listOf("file_read"),
+                log = {},
+            )
+        }
+        assertTrue(result.success)
+        val toolResultMsg = turn2Messages.first().last { it.role == LLMMessage.Role.USER }
+        assertFalse(toolResultMsg.content.contains("Error: Error:"))
+        assertTrue(toolResultMsg.content.contains("Error: Agent budget exhausted"))
+    }
 }
