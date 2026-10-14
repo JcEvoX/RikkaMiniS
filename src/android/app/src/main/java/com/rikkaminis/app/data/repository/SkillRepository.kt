@@ -1389,6 +1389,10 @@ class SkillRepository(private val context: Context) {
      *    gated via [SkillAssetSync]'s manifest, so a script-only fix ships
      *    without anyone bumping the version string. See that file for the
      *    2026-10-14 incident this fixes.
+     *  - **row source label** — a row we can prove is our own copy (its
+     *    declaration still equals the shipped one) is adopted to
+     *    [ImportSource.BUNDLED] even when it is labelled something else, so the
+     *    payload gate above is actually reachable. See [adoptBundledRow].
      */
     private fun installBundledSkills() {
         try {
@@ -1412,7 +1416,20 @@ class SkillRepository(private val context: Context) {
 
         val parsed = parseSkillMd(content) ?: return
         val bundledVersion = parsed.version.ifBlank { "1.0.0" }
-        val existing = _skills.value.find { it.id == dirName }
+        val rowBefore = _skills.value.find { it.id == dirName }
+
+        // [fix/bundled-row-adoption] A shipped skill's row can carry a foreign
+        // source label — the maintainer device has all four labelled `file`
+        // (「文件导入」), version equal to the shipped one, on-disk SKILL.md
+        // byte-identical to the APK's. Without this the guard inside the early
+        // return below skipped exactly those installs, so the content-hash gate
+        // never ran and script-only fixes stayed in the APK. Adopt once, then
+        // the row takes the normal BUNDLED path on every later launch.
+        val existing = if (rowBefore != null && isAdoptableBundledRow(rowBefore, parsed, bundledVersion)) {
+            adoptBundledRow(rowBefore, dirName)
+        } else {
+            rowBefore
+        }
 
         // Skip if local version is same or newer. Semantic comparison, not
         // lexical — a lexical `">="` would treat "1.10.0" as older than
@@ -1457,6 +1474,40 @@ class SkillRepository(private val context: Context) {
             syncBundledSiblings(dirName)
             Log.i(TAG, "Installed bundled skill: $dirName (v$bundledVersion)")
         }
+    }
+
+    /**
+     * [fix/bundled-row-adoption] Wiring half of the adoption decision — see
+     * [SkillAssetSync.isAdoptableBundledRow] for the incident (all four shipped
+     * skills labelled `file` on the maintainer device) and for why the
+     * declaration, not the file bytes, is what gets compared.
+     */
+    private fun isAdoptableBundledRow(existing: Skill, parsed: ParsedSkill, bundledVersion: String): Boolean =
+        SkillAssetSync.isAdoptableBundledRow(
+            storedSource = existing.importSource.value,
+            bundledSource = ImportSource.BUNDLED.value,
+            stored = SkillAssetSync.Declaration(existing.name, existing.description, existing.version),
+            bundled = SkillAssetSync.Declaration(parsed.name, parsed.description, bundledVersion),
+        )
+
+    /**
+     * Relabel a row we have proven to be our own copy of a shipped skill.
+     *
+     * Only the source column moves: the declaration already equals the shipped
+     * one (that is what the caller proved) and [syncBundledSiblings] owns the
+     * payload. `updated_at` is deliberately left alone — adoption is not a
+     * content change, and stamping it would erase the row's provenance in the
+     * skills UI.
+     */
+    private fun adoptBundledRow(existing: Skill, dirName: String): Skill {
+        val adopted = existing.copy(importSource = ImportSource.BUNDLED)
+        db.execSQL(
+            "UPDATE skills SET import_source=? WHERE id=?",
+            arrayOf<Any>(adopted.importSource.value, dirName)
+        )
+        _skills.value = _skills.value.map { if (it.id == dirName) adopted else it }
+        Log.i(TAG, "Adopted mislabeled bundled skill: $dirName (source was ${existing.importSource.value})")
+        return adopted
     }
 
     /** Sidecar manifest recording the payload hash of the last extraction. */

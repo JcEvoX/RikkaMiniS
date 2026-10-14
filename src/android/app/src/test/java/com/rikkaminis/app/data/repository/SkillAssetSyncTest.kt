@@ -126,4 +126,87 @@ class SkillAssetSyncTest {
         assertNotEquals(e("a.py", "same"), e("a.py", "different"))
         assertNotEquals(e("a.py", "same"), e("b.py", "same"))
     }
+
+    // ------------------------------------------------------------------
+    // [fix/bundled-row-adoption] — the row-label gate in front of the hash
+    // gate above. Device fixture: all four shipped skills are labelled `file`
+    // while their declarations still equal the shipped ones.
+    // ------------------------------------------------------------------
+
+    /** As shipped in the APK and as still present on the device's disk. */
+    private val shippedSemanticMemory = SkillAssetSync.Declaration(
+        name = "semantic-memory",
+        description = "HF 语义记忆系统 — 用自然语言搜索历史经验（不依赖关键词）。",
+        version = "1.4.1",
+    )
+
+    @Test
+    fun adoptsForeignLabelledRowWhoseDeclarationIsStillShipped() {
+        // The maintainer device: source=file, version 1.4.1 == shipped 1.4.1,
+        // on-disk SKILL.md byte-identical to the APK's → our copy, adopt it so
+        // the payload gate becomes reachable.
+        for (foreign in listOf("file", "url", "session")) {
+            assertTrue(
+                "source=$foreign with the shipped declaration must be adopted",
+                SkillAssetSync.isAdoptableBundledRow(
+                    storedSource = foreign,
+                    bundledSource = "bundled",
+                    stored = shippedSemanticMemory,
+                    bundled = shippedSemanticMemory,
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun bundledRowIsNeverReAdopted() {
+        // Adopting an already-bundled row would rewrite the DB row on every
+        // launch and log a bogus provenance change.
+        assertFalse(
+            SkillAssetSync.isAdoptableBundledRow(
+                storedSource = "bundled",
+                bundledSource = "bundled",
+                stored = shippedSemanticMemory,
+                bundled = shippedSemanticMemory,
+            ),
+        )
+    }
+
+    @Test
+    fun refusesRowWhoseDeclarationWasEdited() {
+        // Any of the three user-editable declaration fields diverging means the
+        // row is theirs — a fork keeps its content instead of being overwritten
+        // by the next shipped payload.
+        val forked = listOf(
+            shippedSemanticMemory.copy(description = "my tuned copy"),
+            shippedSemanticMemory.copy(version = "1.5.0"),
+            shippedSemanticMemory.copy(name = "semantic-memory-mine"),
+        )
+        for (stored in forked) {
+            assertFalse(
+                "edited declaration $stored must not be adopted",
+                SkillAssetSync.isAdoptableBundledRow(
+                    storedSource = "file",
+                    bundledSource = "bundled",
+                    stored = stored,
+                    bundled = shippedSemanticMemory,
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun normalisedBundledVersionTakesPartInTheComparison() {
+        // installBundledSkill normalises a blank shipped version to "1.0.0"
+        // before writing the row, so compare the same normalised value.
+        val bundled = shippedSemanticMemory.copy(version = "1.0.0")
+        assertTrue(
+            SkillAssetSync.isAdoptableBundledRow("file", "bundled", bundled, bundled),
+        )
+        assertFalse(
+            SkillAssetSync.isAdoptableBundledRow(
+                "file", "bundled", shippedSemanticMemory, bundled,
+            ),
+        )
+    }
 }

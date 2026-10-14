@@ -89,6 +89,39 @@ internal object SkillAssetSync {
         storedHash != currentHash
 
     /**
+     * The three SKILL.md frontmatter fields a user edits when they fork a
+     * shipped skill.
+     */
+    data class Declaration(val name: String, val description: String, val version: String)
+
+    /**
+     * True when a registry row that carries a foreign source label is really
+     * *our* copy of a shipped skill, i.e. should be adopted (relabelled).
+     *
+     * Why this exists (found 2026-10-15, device-verified): [needsExtraction]'s
+     * gate sits behind an `importSource == BUNDLED` guard in
+     * [SkillRepository.installBundledSkill], and the maintainer device has all
+     * four shipped skills labelled `file` (skills UI shows 「文件导入」, row
+     * versions equal the shipped ones, on-disk SKILL.md byte-identical to the
+     * APK's). The guard therefore skipped exactly the installs the gate was
+     * written for — no manifest, no extraction, no log line — so FIX-RV-C2's
+     * script still never landed even on a build that contained it.
+     *
+     * Discriminator: the declaration is what a user edits when forking. A row
+     * whose name/description/version still equal the shipped ones is our copy
+     * that merely *looks* foreign because of how it was created or imported; a
+     * row with an edited declaration is theirs and is left untouched. Parsed
+     * values are compared rather than raw bytes so frontmatter formatting
+     * written by an older app build doesn't read as "the user forked it".
+     */
+    fun isAdoptableBundledRow(
+        storedSource: String,
+        bundledSource: String,
+        stored: Declaration,
+        bundled: Declaration,
+    ): Boolean = storedSource != bundledSource && stored == bundled
+
+    /**
      * Parse the manifest. Tolerates blank lines, stray whitespace and malformed
      * lines (dropped) — a partially written manifest only costs one redundant
      * re-extraction, which is idempotent.
