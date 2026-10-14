@@ -7,8 +7,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
-import java.io.BufferedReader
-import java.io.InputStreamReader
+import java.io.InputStream
 import java.io.PrintWriter
 import java.net.ServerSocket
 import java.net.Socket
@@ -76,6 +75,20 @@ class DebugServer(
                 diff = diff or (provided[i].code xor expectedToken[i].code)
             }
             return diff == 0
+        }
+
+        /**
+         * [fix/sweep1014-debug-backup B1] Decode a request body that was read
+         * as raw UTF-8 **bytes**. Returns null when the connection delivered
+         * fewer bytes than declared (peer hung up mid-body) — replying 400
+         * closes the HTTP exchange instead of leaving it half-open. Decoding
+         * is UTF-8 because Content-Length counts BYTES, not chars, so
+         * multi-byte content (CJK = 3 bytes/char, emoji = 4) round-trips
+         * exactly. Pure for unit testing.
+         */
+        fun decodeBody(buffer: ByteArray, totalRead: Int, declaredLength: Int): String? {
+            if (totalRead != declaredLength) return null
+            return String(buffer, 0, totalRead, Charsets.UTF_8)
         }
     }
 
@@ -157,7 +170,14 @@ class DebugServer(
         socket.use { s ->
             try {
                 s.soTimeout = 30_000
-                val reader = BufferedReader(InputStreamReader(s.getInputStream()))
+                // [fix/sweep1014-debug-backup B1] Byte-level line reader over the
+                // raw stream: request line / headers are ASCII lines, and the
+                // body that follows must be read as raw bytes from the same
+                // stream. A BufferedReader would buffer body bytes ahead of the
+                // body read (consuming them as UTF-16 chars), losing multi-byte
+                // content.
+                val input = s.getInputStream()
+                val reader = ByteLineReader(input)
                 val writer = PrintWriter(s.getOutputStream(), true)
 
                 // Read HTTP request line
@@ -273,15 +293,24 @@ class DebugServer(
                     return
                 }
 
-                // Read body — size already clamped by MAX_BODY_BYTES above.
-                val body = CharArray(contentLength)
+                // [fix/sweep1014-debug-backup B1] Read the body as raw UTF-8
+                // bytes — Content-Length counts BYTES, not chars. The old
+                // CharArray path counted UTF-16 chars, so any multi-byte body
+                // (CJK 3 bytes/char, emoji 4) "finished" early and the read
+                // kept blocking on EOF until the 30s soTimeout killed a
+                // perfectly valid request.
+                val body = ByteArray(contentLength)
                 var totalRead = 0
                 while (totalRead < contentLength) {
-                    val n = reader.read(body, totalRead, contentLength - totalRead)
+                    val n = input.read(body, totalRead, contentLength - totalRead)
                     if (n < 0) break
                     totalRead += n
                 }
-                val jsonBody = String(body, 0, totalRead)
+                val jsonBody = decodeBody(body, totalRead, contentLength)
+                if (jsonBody == null) {
+                    sendResponse(writer, 400, rpcHandler.errorJSON(-32700, "Incomplete body: read $totalRead of $contentLength bytes"))
+                    return
+                }
 
                 val responseJSON = runBlocking {
                     rpcHandler.handle(jsonBody)
@@ -290,6 +319,35 @@ class DebugServer(
                 sendResponse(writer, 200, responseJSON)
             } catch (e: Exception) {
                 Log.w(TAG, "Connection error: ${e.message}")
+            }
+        }
+    }
+
+    /**
+     * [fix/sweep1014-debug-backup B1] Reads HTTP header lines byte-by-byte
+     * from the raw socket stream. No read-ahead buffering: the bytes it
+     * consumes are exactly the line + CRLF, so the body that follows can be
+     * read byte-exact from the same stream. Header lines are ASCII by HTTP
+     * spec; the body is NOT read through this class.
+     */
+    private class ByteLineReader(private val input: InputStream) {
+        private val line = java.io.ByteArrayOutputStream()
+
+        fun readLine(): String? {
+            line.reset()
+            while (true) {
+                val b = input.read()
+                if (b < 0) {
+                    return if (line.size() == 0) null else String(line.toByteArray(), Charsets.US_ASCII)
+                }
+                if (b == '\n'.code) {
+                    var bytes = line.toByteArray()
+                    if (bytes.isNotEmpty() && bytes.last() == '\r'.code.toByte()) {
+                        bytes = bytes.copyOf(bytes.size - 1)
+                    }
+                    return String(bytes, Charsets.US_ASCII)
+                }
+                line.write(b)
             }
         }
     }

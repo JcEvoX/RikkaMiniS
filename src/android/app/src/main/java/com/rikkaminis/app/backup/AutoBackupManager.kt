@@ -25,9 +25,15 @@ import kotlinx.coroutines.launch
  * automatic copies never mix with the curated manual backups in the backup
  * root and a second device can manage the same folder (restore/fetch/delete)
  * from its own auto-backup section.
- * Credentials always ride along: the local copy stays in app-private storage
- * and the remote is the user's own server — a backup without keys can't
- * restore a thing.
+ * Credentials do NOT ride along by default: the automatic copy is built
+ * with `includeSecrets = false` [D1-R3, 2026-10-13 product decision] —
+ * an unattended push to the user's WebDAV server never carries plaintext
+ * API keys / OAuth tokens / env var values. The local copy under
+ * `filesDir/backup-autos/` is the same secret-free shape. On restore day
+ * the user re-enters providers / envVars / MCP secrets by hand (or makes a
+ * separate manual export with "include secrets" checked).
+ * [fix/sweep1014-debug-backup D3] KDoc wording aligned with the shipped
+ * behavior; behavior unchanged.
  *
  * Trigger: once per calendar day, on the first foreground transition, via
  * MinisApp's existing activity-lifecycle hook. No alarm/workmanager: if the
