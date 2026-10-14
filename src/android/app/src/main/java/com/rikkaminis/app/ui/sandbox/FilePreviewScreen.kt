@@ -96,6 +96,10 @@ import com.rikkaminis.app.ui.components.MinisTextButton
 
 private const val MAX_TEXT_PREVIEW_BYTES = 512_000 // 500 KB
 
+// [rv1014-E1] Fixed read buffer for [readCapped]: one 64 KB chunk per read()
+// syscall, no size surprises for small or huge files alike.
+private const val READ_BUFFER_BYTES = 64 * 1024
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FilePreviewScreen(
@@ -271,11 +275,13 @@ private fun TextPreview(item: FileItem) {
     LaunchedEffect(item.file) {
         withContext(Dispatchers.IO) {
             try {
-                // [sweep1014-P9] was item.file.readBytes() — the full file was
+                // [rv1014-E1] was item.file.readBytes() — the full file was
                 // read into memory before any cap applied, so a 2 GB log file
-                // OOMed the preview. readNBytes(MAX+1) caps the read itself and
-                // still yields the truncated verdict in one pass.
-                val capped = item.file.inputStream().use { it.readNBytes(MAX_TEXT_PREVIEW_BYTES + 1) }
+                // OOMed the preview. readCapped reads at most MAX+1 bytes and
+                // still yields the truncated verdict in one pass. (And it was
+                // briefly readNBytes(MAX+1) — API 33+, an uncatchable
+                // NoSuchMethodError on Android 8–12.)
+                val capped = readCapped(item.file, MAX_TEXT_PREVIEW_BYTES)
                 content = decodeUtf8Capped(capped)
                 truncated = capped.size > MAX_TEXT_PREVIEW_BYTES
             } catch (e: Exception) {
@@ -355,8 +361,8 @@ private fun MarkdownPreview(item: FileItem) {
     LaunchedEffect(item.file) {
         withContext(Dispatchers.IO) {
             try {
-                // [sweep1014-P9] capped read — see TextPreview above.
-                val capped = item.file.inputStream().use { it.readNBytes(MAX_TEXT_PREVIEW_BYTES + 1) }
+                // [rv1014-E1] capped read via readCapped — see TextPreview above.
+                val capped = readCapped(item.file, MAX_TEXT_PREVIEW_BYTES)
                 content = decodeUtf8Capped(capped)
             } catch (e: Exception) {
                 error = e.message ?: context.getString(R.string.filepreview_file_read_error)
@@ -808,8 +814,8 @@ private fun JsonPreview(item: FileItem) {
     LaunchedEffect(item.file) {
         withContext(Dispatchers.IO) {
             try {
-                // [sweep1014-P9] capped read — see TextPreview above.
-                val capped = item.file.inputStream().use { it.readNBytes(MAX_TEXT_PREVIEW_BYTES + 1) }
+                // [rv1014-E1] capped read via readCapped — see TextPreview above.
+                val capped = readCapped(item.file, MAX_TEXT_PREVIEW_BYTES)
                 truncated = capped.size > MAX_TEXT_PREVIEW_BYTES
                 val raw = decodeUtf8Capped(capped)
                 pretty = try {
@@ -1287,6 +1293,33 @@ private fun decodeUtf8Capped(bytes: ByteArray, cap: Int = MAX_TEXT_PREVIEW_BYTES
     val slice = if (truncated) bytes.copyOf(cap) else bytes
     val text = String(slice, Charsets.UTF_8)
     return if (truncated && text.endsWith('\uFFFD')) text.dropLast(1) else text
+}
+
+/**
+ * [rv1014-E1] Bounded replacement for java.io.InputStream.readNBytes, which
+ * is API 33+ — minSdk is 26 and desugaring is off, so on Android 8–12
+ * previewing any text file threw an uncatchable NoSuchMethodError (`Error`,
+ * not `Exception`).
+ *
+ * Reads at most [maxBytes] + 1 bytes into a ByteArrayOutputStream with a fixed
+ * [READ_BUFFER_BYTES] buffer, stopping as soon as the bound is reached — same
+ * semantics the call sites relied on from `readNBytes(maxBytes + 1)`: the one
+ * extra byte lets the caller derive the truncated verdict (`size > maxBytes`)
+ * in a single pass.
+ */
+private fun readCapped(file: File, maxBytes: Int): ByteArray {
+    val out = java.io.ByteArrayOutputStream(minOf(maxBytes + 1, READ_BUFFER_BYTES))
+    val buf = ByteArray(READ_BUFFER_BYTES)
+    file.inputStream().use { input ->
+        var remaining = maxBytes + 1
+        while (remaining > 0) {
+            val n = input.read(buf, 0, minOf(buf.size, remaining))
+            if (n < 0) break
+            out.write(buf, 0, n)
+            remaining -= n
+        }
+    }
+    return out.toByteArray()
 }
 
 private fun escapeHtml(s: String): String =

@@ -1555,7 +1555,15 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
         val sid = sessionId ?: return
         try {
             val file = File(context.filesDir, "browser_tabs/$sid.json")
-            if (!file.exists()) return
+            if (!file.exists()) {
+                // [rv1014-E5] No state file for the pointed session — still drop
+                // savedURLs residue from the previously pointed session (the
+                // b17a clear below only covered the file-exists branch), so a
+                // re-pointed pool doesn't carry the old session's tabs into
+                // saveState or implicit-tab restore.
+                savedURLs.clear()
+                return
+            }
             val json = JSONObject(file.readText())
             // [fix/sweep1014-b17a] savedURLs is session-scoped (mirrors the
             // per-session file below) — drop entries left over from a

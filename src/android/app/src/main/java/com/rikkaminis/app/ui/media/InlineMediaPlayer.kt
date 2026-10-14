@@ -14,12 +14,14 @@ import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -71,6 +73,13 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import java.io.File
 import kotlin.math.roundToInt
+
+// [rv1014-E4] Upper bound for the auto-sized inline video height — portrait
+// videos shouldn't dominate the chat viewport. Density-independent successor
+// of the old coerceIn(100, 800) px bound in the layoutParams write (which
+// never took effect — see the setOnPreparedListener comment in
+// InlineVideoPlayer).
+private val MAX_INLINE_VIDEO_HEIGHT = 480.dp
 
 /**
  * Inline audio player composable for embedding in chat messages.
@@ -303,6 +312,10 @@ fun InlineVideoPlayer(
     // VideoView playing off-screen and the controller's window attached
     // (WindowLeaked).
     val mediaController = remember(filePath) { android.widget.MediaController(context) }
+    // [rv1014-E4] Video aspect ratio, learned at onPrepared from the player's
+    // own videoWidth/videoHeight — intrinsic video dimensions, valid there
+    // regardless of view measurement. Null until prepared → 240dp placeholder.
+    var videoAspectRatio by remember(filePath) { mutableStateOf<Float?>(null) }
 
     Surface(
         modifier = modifier
@@ -322,23 +335,22 @@ fun InlineVideoPlayer(
                     setMediaController(mediaController)
 
                     setOnPreparedListener { mp ->
-                        // Auto-size to video dimensions. [sweep1014-B33] The
-                        // old code read this view's `width` right here, but
-                        // onPrepared fires from the player's callback before
-                        // the view has been measured → width == 0 → height
-                        // collapsed to the coerceIn lower bound, locking every
-                        // video to 100px. post{} defers the math until after
-                        // the first layout pass, when `width` is the measured
-                        // width of the 240dp placeholder row.
-                        val videoWidth = mp.videoWidth
-                        val videoHeight = mp.videoHeight
-                        if (videoWidth > 0 && videoHeight > 0) {
-                            val ratio = videoHeight.toFloat() / videoWidth
-                            post {
-                                layoutParams = layoutParams.apply {
-                                    height = (width * ratio).toInt().coerceIn(100, 800)
-                                }
-                            }
+                        // Auto-size to video dimensions. [rv1014-E4] The previous
+                        // fix computed the height inside a `layoutParams.apply{}` —
+                        // Kotlin resolves that `width` to LayoutParams.width
+                        // (MATCH_PARENT here), not the measured view width, and the
+                        // fixed .height(240.dp) constraint makes Compose's measure
+                        // policy coerce the child LP on every measure
+                        // (AndroidViewHolder.obtainMeasureSpec: min == max →
+                        // EXACTLY), so neither the old nor the new write ever
+                        // changed the displayed height (always the 240dp
+                        // placeholder). mp.videoWidth/videoHeight are the intrinsic
+                        // video dimensions — valid right here, regardless of view
+                        // measurement — so hand the ratio to Compose and let
+                        // aspectRatio derive the height from the actually-measured
+                        // width.
+                        if (mp.videoWidth > 0 && mp.videoHeight > 0) {
+                            videoAspectRatio = mp.videoWidth.toFloat() / mp.videoHeight
                         }
                         // Auto-play and surface the controller so the user sees
                         // a live first frame instead of a black surface waiting
@@ -360,9 +372,18 @@ fun InlineVideoPlayer(
                 mediaController.hide()
                 view.stopPlayback()
             },
+            // [rv1014-E4] With the aspect ratio known, Compose derives the
+            // height from the measured width (capped so portrait videos don't
+            // dominate the viewport); before the player reports dimensions,
+            // keep the 240dp placeholder the layout always showed.
             modifier = Modifier
                 .fillMaxWidth()
-                .height(240.dp),
+                .then(
+                    videoAspectRatio?.let { ratio ->
+                        Modifier.aspectRatio(ratio)
+                            .heightIn(max = MAX_INLINE_VIDEO_HEIGHT)
+                    } ?: Modifier.height(240.dp)
+                ),
         )
     }
 }
