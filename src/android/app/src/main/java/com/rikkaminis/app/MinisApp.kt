@@ -184,8 +184,33 @@ class MinisApp : Application(), ImageLoaderFactory {
         )
     }
 
+    @OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
     override fun onCreate() {
         super.onCreate()
+
+        // [T-android-content-capture-off] Opt every Compose window out of
+        // Android content capture, before any of them exists.
+        //
+        // With a content-capture service active (Pixel's Android System
+        // Intelligence enables one), Compose re-walks the whole semantics tree
+        // after UI changes to report screen content to it. Streaming replies
+        // change the UI continuously, and a Pixel 6 perf-build profile of a
+        // task put that walk (AndroidContentCaptureManager
+        // .contentCaptureChangeChecker) at 10.45% of all app CPU — about a
+        // quarter of the main thread, more than the frame work itself.
+        //
+        // Minis's own UI is unaffected: rendering, accessibility (a separate
+        // path), autofill, IME and in-app selection all stay the same. What is
+        // lost is system features that read app content through content
+        // capture (e.g. text selection in Recents, some screen-content
+        // suggestions), which also means chat text is no longer reported to
+        // that service.
+        //
+        // Set once, here, rather than paused while tasks run: in Compose 1.9.1
+        // a change check that finds the switch off returns WITHOUT clearing
+        // its pending flag, so nothing schedules another check even after the
+        // switch is turned back on. Only a switch that never flips is safe.
+        androidx.compose.ui.contentcapture.ContentCaptureManager.isEnabled = false
 
         // T287-followup: ACRA spawns a separate reporter process named
         // "<package>:acra" (declared by the library's manifest) to send
