@@ -356,6 +356,15 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
 
     fun setSession(sessionId: String) {
         this.sessionId = sessionId
+        // [audit-RC13] Pin every live tab's WebView to this chat session so
+        // minis:// subresource interception resolves files through
+        // resolveSessionHostPath (session-scoped) instead of the global
+        // cross-session fallback (BrowserUseManager previously had no
+        // session context at all — file_upload already had it via
+        // BrowserActionInput.sessionId). loadSavedState() only restores
+        // saved URLs, never creates managers, so this stamp covers every
+        // live tab; tabs created later inherit via createTab/handleNewWindow.
+        _tabs.value.forEach { it.manager.minisSessionId = sessionId }
         loadSavedState()
     }
 
@@ -995,6 +1004,9 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
         val id = explicitId ?: nextTabId++
         val webView = WebView(context)
         val manager = BrowserUseManager(webView, userAgentProfile)
+        // [audit-RC13] New tabs inherit the pool's session pin so minis://
+        // subresource interception resolves session-scoped too.
+        manager.minisSessionId = sessionId
         if (userAgentProfile == UserAgentProfile.CUSTOM && !customUserAgentString.isNullOrEmpty()) {
             manager.setUserAgent(userAgentProfile, customUserAgentString)
         }
@@ -1096,6 +1108,8 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
         val id = nextTabId++
         val newWebView = WebView(context)
         val manager = BrowserUseManager(newWebView, userAgentProfile)
+        // [audit-RC13] window.open tabs inherit the session pin too.
+        manager.minisSessionId = sessionId
         if (userAgentProfile == UserAgentProfile.CUSTOM && !customUserAgentString.isNullOrEmpty()) {
             manager.setUserAgent(userAgentProfile, customUserAgentString)
         }

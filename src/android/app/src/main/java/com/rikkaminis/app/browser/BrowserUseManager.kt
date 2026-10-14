@@ -148,6 +148,32 @@ class BrowserUseManager(
     private val _currentURL = MutableStateFlow("")
     val currentURL: StateFlow<String> = _currentURL.asStateFlow()
 
+    /**
+     * Chat session that owns this tab's WebView. Populated by
+     * [BrowserTabPool.setSession] (which receives it from the same internal
+     * call sites that stamp [BrowserActionInput.sessionId] — the CLI offload
+     * handler / ChatViewModel tool executor; NEVER parsed from model JSON).
+     * Null in the manual browser sheet (no session context) →
+     * [interceptMinisURL] falls back to the pre-existing global resolver
+     * (the manual sheet had no session pinning before this fix either).
+     */
+    @Volatile
+    var minisSessionId: String? = null
+
+    /**
+     * Last committed main-document URL for the minis:// subresource gate.
+     *
+     * Maintained ONLY on the WebView's UI thread from onPageStarted /
+     * onPageFinished (top-level navigations commit synchronously in WebView
+     *'s internal order; mid-navigation subresource races therefore read a
+     * single coherent value). Reset to null on destroy().
+     *
+     * Keep the [minisMainDocAllowsSubresource] gate fail-closed for null —
+     * fresh tabs commit only when the blank bootstrap page lands.
+     */
+    @Volatile
+    private var lastMainDocUrl: String? = null
+
     private val _pageTitle = MutableStateFlow("")
     val pageTitle: StateFlow<String> = _pageTitle.asStateFlow()
 
@@ -473,6 +499,83 @@ class BrowserUseManager(
         webView.setInitialScale(scalePct)
     }
 
+    /** Strip an arbitrary `Origin` header value down to `scheme://host[:port]`.
+     *  Scheme + authority are lowercased (RFC 3986 case-insensitivity) so
+     *  `MINIS://…` / `HTTPS://APPASSETS…` spellings normalize before any
+     *  prefix comparison; the `null` opaque-origin sentinel maps to "". */
+    private fun originOf(headerValue: String): String {
+        // `null` (sentinel for sandboxed/opaque origins) and anything that
+        // doesn't look like scheme://… carries no trustable site identity.
+        val v = headerValue.trim()
+        val schemeEnd = v.indexOf("://")
+        if (v.equals("null", ignoreCase = true) || schemeEnd <= 0) return ""
+        val rest = v.substring(schemeEnd + 3)
+        val authority = rest.substringBefore('/').substringBefore('?').substringBefore('#')
+        return "${v.substring(0, schemeEnd).lowercase()}://${authority.lowercase()}"
+    }
+
+    /** Exact-host app-assets origin check (tightened from the old loose
+     *  `startsWith("https://appassets")` prefix, which also matched
+     *  `https://appassets.evil.com`). Allows the bare origin plus path /
+     *  port suffixes only. */
+    private fun isAppAssetsOrigin(origin: String): Boolean {
+        val base = "https://appassets.androidplatform.net"
+        return origin == base || origin.startsWith("$base/") || origin.startsWith("$base:")
+    }
+
+    /**
+     * [audit-RC13] Same-origin policy gate for minis:// SUBRESOURCE loads
+     * (minisMainDocAllowsSubresource). Pure JVM-friendly: callers pass the
+     * current tab's main-document URL and the optional Origin request header
+     * (value looked up case-insensitively by the caller — Chromium may send
+     * "Origin" or "origin").
+     *
+     * When a main document IS committed, it is the sole authority: a
+     * page-supplied Origin header can never rescue a disallowed document
+     * (the header is attacker-controllable — `Origin: minis://…` sent by an
+     * https:// page must not re-open the door the main-document gate just
+     * closed). Only minis:// / appassets / about:blank main documents may
+     * reference minis:// subresources — that is the built-in preview path
+     * (minis:// page pulling minis:// attachment images). Any website main
+     * document is rejected with or without an Origin header: no-Origin
+     * subresources (<img src>, <iframe src>, <script src>) were previously
+     * waved through, which let any web page read sandbox-local minis://
+     * files (local disclosure / SSRF vector). Fail-closed.
+     *
+     * When NO main document is committed yet (subresource racing the very
+     * first navigation), fall back to an explicit Origin header naming an
+     * allowed app origin; the opaque-origin `null` sentinel and website
+     * origins reject here too.
+     */
+    internal fun minisMainDocAllowsSubresource(
+        mainDocUrl: String?,
+        originHeader: String?,
+    ): Boolean {
+        // Lowercase: scheme is case-insensitive per RFC 3986 and this gate's
+        // prefix comparisons are exact — normalize before matching. (Chromium
+        // emits normalized lowercase URLs anyway; this defends the gate
+        // against unnormalized input shapes.)
+        val doc = mainDocUrl?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+        if (doc != null) {
+            val mainOrigin = originOf(doc)
+            // The blank-tab bootstrap page (loadDataWithBaseURL(null, …))
+            // lands on about:blank; blocking it would break fresh-tab
+            // subresource loads. (Known second-order nuance: an about:blank
+            // window.open'ed by a website inherits the opener's origin —
+            // logged as a follow-up hardening candidate, out of scope here.)
+            return doc == "about:blank" ||
+                doc.startsWith("minis://") ||
+                isAppAssetsOrigin(mainOrigin)
+        }
+        // No committed main document yet — header-based fallback only.
+        // (The header is forgeable; this only covers the pre-first-commit
+        // race window, so it keeps the original semantics: any minis://
+        // origin passes — harmless, since resolution is subdir-pinned —
+        // while the appassets origin is checked against its exact host.)
+        val headerOrigin = originOf(originHeader ?: "")
+        return headerOrigin.startsWith("minis://") || isAppAssetsOrigin(headerOrigin)
+    }
+
     @SuppressLint("SetJavaScriptEnabled")
     private fun setupWebViewClient() {
         webView.webViewClient = object : SafeWebViewClient() {
@@ -516,6 +619,12 @@ class BrowserUseManager(
                 request: WebResourceRequest,
             ): Boolean {
                 val urlStr = request.url?.toString()
+                // [audit-RC13] A committed MAIN-frame navigation switches the
+                // tab's origin immediately — commit the gate's main-document
+                // here too, before the new document's own subresources fire.
+                if (request.isForMainFrame && !urlStr.isNullOrEmpty()) {
+                    lastMainDocUrl = urlStr
+                }
                 // T234: Google permanently disallows WebView for sign-in /
                 // OAuth. Hand any auth-domain navigation to Chrome Custom
                 // Tab so the user can complete login in their real Chrome
@@ -549,6 +658,10 @@ class BrowserUseManager(
                 _pageTitle.value = view.title ?: ""
                 _canGoBack.value = view.canGoBack()
                 _canGoForward.value = view.canGoForward()
+                // [audit-RC13] Final commit of the tab's main document for the
+                // minis:// subresource gate (covers redirects that never passed
+                // through a shouldOverrideUrlLoading main-frame branch).
+                if (!url.isNullOrEmpty()) lastMainDocUrl = url
                 // [audit-0916b] LOADED — this is the only path that means "the
                 // page finished loading". A main-frame onReceivedError has
                 // already completed (and cleared) the same deferred, so the
@@ -600,6 +713,10 @@ class BrowserUseManager(
 
             override fun onPageStarted(view: WebView, url: String?, favicon: Bitmap?) {
                 super.onPageStarted(view, url, favicon)
+                // [audit-RC13] Commit the main document for the minis://
+                // subresource gate BEFORE its subresources fire (onPageStarted
+                // is invoked before subresource resolution begins).
+                if (!url.isNullOrEmpty()) lastMainDocUrl = url
                 // [feat/browser-console-network-upload] A pending file chooser
                 // belongs to the page that opened it. Navigating away cancels
                 // it (answered with null) so a stale chooser can never
@@ -631,17 +748,40 @@ class BrowserUseManager(
                 if (url.scheme != "minis") return null
                 // [audit-RC13] Only serve minis:// from page-initiated loads that
                 // are either the main frame (agent navigation / top-level href)
-                // or a same-origin subresource (Origin starts with minis:// or the
-                // bundled app assets origin). A cross-origin frame with an explicit
-                // Origin header is a potential SSRF/scanning vector and must not be
-                // able to pull local workspace files through it.
+                // or a subresource of a same-app-origin main document (minis://
+                // page pulling minis:// assets, appassets preview, about:blank
+                // bootstrap). A subresource of any WEBSITE main document —
+                // with or without an Origin header (<img src> / <iframe src> /
+                // <script src> send none) — must not be able to pull local
+                // workspace files through it (SSRF / cross-session file
+                // disclosure vector). Origin is looked up case-insensitively:
+                // Chromium may hand us "Origin" or "origin".
                 if (!request.isForMainFrame) {
-                    val origin = request.requestHeaders?.get("Origin")
-                    if (!origin.isNullOrEmpty() &&
-                        !origin.startsWith("minis://") &&
-                        !origin.startsWith("https://appassets")) {
-                        return null
+                    val headers = request.requestHeaders
+                    val originHeader = headers?.entries?.firstOrNull {
+                        it.key.equals("Origin", ignoreCase = true)
+                    }?.value
+                    // null mainDoc (no committed main document yet) evaluates
+                    // fail-closed: only an explicit allowed-app Origin header
+                    // can still let it through, everything else is blocked.
+                    val mainDoc = lastMainDocUrl?.takeIf { it.isNotBlank() }
+                    if (!minisMainDocAllowsSubresource(mainDoc, originHeader)) {
+                        Log.w(TAG, "Blocked cross-origin minis:// subresource from " +
+                            "mainDoc=${mainDoc?.take(80)} origin=${originHeader?.take(60)}")
+                        val blockMsg = "Blocked: minis:// subresource requires a " +
+                            "minis://, appassets, or about:blank main document"
+                        return android.webkit.WebResourceResponse(
+                            "text/plain", "UTF-8", 403, "Forbidden",
+                            emptyMap(),
+                            blockMsg.toByteArray(Charsets.UTF_8).inputStream(),
+                        )
                     }
+                } else {
+                    // Main-frame minis:// load (agent navigation): commit it as
+                    // the tab's main document BEFORE its own subresources fire
+                    // (belt-and-braces with the onPageStarted commit — the two
+                    // write the same value in WebView's ordering).
+                    lastMainDocUrl = url.toString()
                 }
                 return interceptMinisURL(url)
             }
@@ -652,12 +792,25 @@ class BrowserUseManager(
     private fun interceptMinisURL(uri: android.net.Uri): android.webkit.WebResourceResponse? {
         try {
             // minis://workspace/foo.html → /var/minis/workspace/foo.html, then
-            // resolve to the host file via PRoot bind mounts (per-session
-            // workspace lives under filesDir/minis-sessions/<sid>/workspace/).
+            // resolve to the host file. Per-session subdirs (workspace /
+            // attachments / offloads / browser) resolve through
+            // [PRootKernel.resolveSessionHostPath] — pinned to THIS chat
+            // session's minis-sessions/<sid>/ tree (T178 pattern, same as
+            // file_upload) instead of the global fallback that returns the
+            // first same-named file across ALL sessions (cross-session
+            // disclosure). Non-session paths (minis://attachments-shared/…,
+            // minis://minis-global/…) fall through to the global resolver
+            // inside resolveSessionHostPath itself.
             val host = uri.host ?: return null
             val path = uri.path ?: ""
             val linuxPath = "/var/minis/$host$path"
-            val localFile = com.rikkaminis.app.sandbox.PRootKernel.resolveHostPath(linuxPath)
+            val localFile = minisSessionId
+                ?.let { sid ->
+                    runCatching {
+                        PRootKernel.resolveSessionHostPath(sid, linuxPath, webView.context)
+                    }.getOrNull()
+                }
+                ?: PRootKernel.resolveHostPath(linuxPath)
             if (localFile == null || !localFile.exists() || !localFile.isFile) {
                 return android.webkit.WebResourceResponse("text/plain", "UTF-8", 404, "Not Found",
                     emptyMap(), "File not found: $host$path".byteInputStream())
@@ -2454,6 +2607,11 @@ class BrowserUseManager(
             webView.loadUrl("about:blank")
             webView.removeAllViews()
             webView.settings.javaScriptEnabled = false
+            // [audit-RC13] Drop the committed main document so a recycled or
+            // destroyed WebView can never carry stale main-doc state into a
+            // new page's subresource gate. Fail-closed: null blocks until the
+            // next onPageStarted commits again.
+            lastMainDocUrl = null
             // Assign a no-op implementation instead of null — the Kotlin
             // Android SDK bindings expose webViewClient/webChromeClient as
             // non-null types (API 26+), so "= null" won't compile.
