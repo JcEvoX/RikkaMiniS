@@ -15,14 +15,20 @@ ephemeral 127.0.0.1 port and publishes it in a port file the CLI reads.
 The daemon writes nothing to stdout (stdio is redirected to /dev/null by the
 forking parent in main.py); all diagnostics go to the daemon log file. STDIO MCP
 servers are held by their proc.stdin/proc.stdout fds directly — no FIFO, no
-intermediate files. _read_reply uses a reader thread joined with a timeout
-(signal.alarm is unreliable under iSH/PRoot). Shared iOS (iSH) and Android
-(PRoot); keep both copies byte-identical.
+intermediate files. Each child gets ONE resident reader thread (started at
+spawn) that readline()s stdout and dispatches replies by msg["id"] to
+per-request queues; a timeout only abandons the waiter, never the reader, so a
+stale per-request thread can never steal a later reply (signal.alarm is
+unreliable under iSH/PRoot). Child stderr is drained into a ring buffer and
+attached to crash errors. Shared iOS (iSH) and Android (PRoot); keep both
+copies byte-identical.
 """
 
+import collections
 import json
 import logging
 import os
+import queue
 import signal
 import socket
 import subprocess
@@ -43,8 +49,114 @@ WATCHDOG_INTERVAL = 30     # TTL scan cadence
 DAEMON_EXIT_GRACE = 60     # after the pool is empty, wait this long before exit
 RPC_TIMEOUT = 300.0        # per-RPC reply timeout (matches transport modules)
 CONN_TIMEOUT = 310.0       # socket recv timeout (slightly above RPC_TIMEOUT)
+STDERR_RING_LINES = 40     # child stderr lines kept for crash context
 
 log = logging.getLogger("mcp-daemon")
+
+
+# --- resident stdio reader ---------------------------------------------------
+
+class _ReplyTimeout(Exception):
+    """Raised by _StdioReader.wait when no reply arrives within the timeout."""
+
+
+class _ChildEOF(Exception):
+    """Raised by _StdioReader.wait when the child's stdout hit EOF."""
+
+
+class _StdioReader:
+    """One resident reader thread per child process.
+
+    Reads newline-delimited JSON with readline() (never for-iter: iteration
+    pulls C-level read-ahead chunks that a later, fresh reader thread cannot
+    reliably pick up) and dispatches each reply by msg["id"] to a per-request
+    queue. A timeout only abandons the waiter — the reader keeps running, so a
+    late reply lands in its queue or is dropped, but can never be consumed by
+    a stale per-request thread racing on the same pipe. EOF fails all pending
+    waiters. Child stderr is drained on a second thread into a ring buffer so
+    crash errors can carry the last lines (stderr=PIPE without a drain thread
+    would deadlock a chatty child on a full pipe).
+    """
+
+    def __init__(self, proc):
+        self.proc = proc
+        self._pending = {}          # msg id -> queue.Queue (1-slot)
+        self._pending_lock = threading.Lock()
+        self._eof = False
+        self._stderr_lines = collections.deque(maxlen=STDERR_RING_LINES)
+        self._stderr_lock = threading.Lock()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
+
+    def _loop(self):
+        try:
+            while True:
+                raw = self.proc.stdout.readline()
+                if not raw:  # EOF
+                    break
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    msg = json.loads(raw)
+                except ValueError:
+                    continue
+                box = self._pending.get(msg.get("id"))
+                if box is not None:
+                    box.put(msg)
+                # replies with no waiter (late after a timeout, unsolicited,
+                # notifications) are dropped — same as the old reader ignoring
+                # non-matching ids
+        except (OSError, ValueError):
+            pass
+        finally:
+            with self._pending_lock:
+                pending = list(self._pending.values())
+                self._pending.clear()
+                self._eof = True
+            for box in pending:
+                box.put(None)  # EOF sentinel: fail every pending waiter
+
+    def _drain_stderr(self):
+        try:
+            while True:
+                line = self.proc.stderr.readline()
+                if not line:
+                    break
+                with self._stderr_lock:
+                    self._stderr_lines.append(line.rstrip("\n"))
+        except (OSError, ValueError):
+            pass
+
+    def wait(self, want_id, timeout):
+        """Wait for the reply to want_id. Raises _ReplyTimeout on timeout (the
+        reader keeps running) and _ChildEOF when stdout has hit EOF."""
+        box = queue.Queue()
+        with self._pending_lock:
+            if self._eof:
+                raise _ChildEOF()
+            self._pending[want_id] = box
+        try:
+            msg = box.get(timeout=timeout)
+        except queue.Empty:
+            raise _ReplyTimeout()
+        finally:
+            with self._pending_lock:
+                self._pending.pop(want_id, None)
+        if msg is None:
+            raise _ChildEOF()
+        return msg
+
+    def stderr_tail(self):
+        """Last stderr lines for crash context; empty string when none."""
+        with self._stderr_lock:
+            lines = list(self._stderr_lines)
+        if not lines:
+            return ""
+        return "\nchild stderr (last %d lines):\n%s" % (
+            len(lines), "\n".join(lines))
 
 
 # --- STDIO MCP server subprocess --------------------------------------------
@@ -59,6 +171,7 @@ class MCPServerProcess:
         self.proc = None
         self._lock = threading.Lock()
         self._id = 0
+        self._reader = None
         self.last_activity = time.time()
 
     def _next_id(self):
@@ -77,7 +190,7 @@ class MCPServerProcess:
                 [command] + list(args),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 env=env,
                 text=True,
                 bufsize=1,
@@ -87,6 +200,9 @@ class MCPServerProcess:
             raise MCPError("CONNECTION_ERROR", "command not found: %s" % command)
         except OSError as exc:
             raise MCPError("CONNECTION_ERROR", str(exc))
+        # One resident reader thread per child: dispatches by id, drains
+        # stderr, survives timeouts (unlike the old per-request thread).
+        self._reader = _StdioReader(self.proc)
         log.info("[%s] spawned pid=%s", self.name, self.proc.pid)
         self._handshake()
         log.info("[%s] initialized", self.name)
@@ -101,37 +217,27 @@ class MCPServerProcess:
             self.proc.stdin.write(json.dumps(body) + "\n")
             self.proc.stdin.flush()
         except (BrokenPipeError, ValueError, OSError):
-            raise MCPError("STDIO_CRASH", "[%s] child closed stdin" % self.name)
+            raise MCPError(
+                "STDIO_CRASH",
+                "[%s] child closed stdin%s" % (self.name, self._stderr_tail()))
         return body.get("id")
 
+    def _stderr_tail(self):
+        reader = self._reader
+        return reader.stderr_tail() if reader else ""
+
     def _read_reply(self, want_id, timeout=RPC_TIMEOUT):
-        result_box = {}
-
-        def reader():
-            try:
-                for raw in self.proc.stdout:
-                    raw = raw.strip()
-                    if not raw:
-                        continue
-                    try:
-                        msg = json.loads(raw)
-                    except ValueError:
-                        continue
-                    if msg.get("id") == want_id:
-                        result_box["msg"] = msg
-                        return
-            except (OSError, ValueError):
-                pass
-            result_box.setdefault("eof", True)
-
-        t = threading.Thread(target=reader, daemon=True)
-        t.start()
-        t.join(timeout)
-        if t.is_alive():
+        """Wait for the reply to want_id. The resident reader keeps running on
+        timeout, so this never leaves a stale thread racing on the pipe."""
+        try:
+            return self._reader.wait(want_id, timeout)
+        except _ReplyTimeout:
             raise MCPError("TIMEOUT", "[%s] no reply after %ss" % (self.name, timeout))
-        if "msg" not in result_box:
-            raise MCPError("STDIO_CRASH", "[%s] process exited before replying" % self.name)
-        return result_box["msg"]
+        except _ChildEOF:
+            raise MCPError(
+                "STDIO_CRASH",
+                "[%s] process exited before replying%s"
+                % (self.name, self._stderr_tail()))
 
     def _rpc(self, method, params=None, timeout=RPC_TIMEOUT):
         want_id = self._send(method, params)
@@ -202,6 +308,11 @@ class MCPServerProcess:
                 self.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+        reader = self._reader
+        if reader is not None:
+            # stdout EOF (or kill) ends the reader loop; join briefly so a
+            # respawn never races a lingering thread on this server's pipes.
+            reader._thread.join(timeout=2)
         log.info("[%s] stopped", self.name)
 
 
