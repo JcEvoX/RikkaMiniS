@@ -54,7 +54,17 @@ import java.util.TimeZone
  *   - `--max` is accepted as an alias for `--limit`.
  */
 class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler {
-    private val dateFormat = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US)
+    // [sweep1014-B22b] SimpleDateFormat is not thread-safe (its internal
+    // Calendar is clobbered under concurrent access) and NativeOffloadServer
+    // dispatches to this handler from a thread pool. Replace the shared
+    // instance with a thread-safe java.time formatter (minSdk 26 ≥ API 26).
+    private val dateTimeFormat =
+        java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss", Locale.US)
+
+    private fun formatDateTime(epochMs: Long): String =
+        java.time.Instant.ofEpochMilli(epochMs)
+            .atZone(java.time.ZoneId.systemDefault())
+            .format(dateTimeFormat)
 
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
         val args = OffloadArgs(request.argv.drop(1), booleanFlags = setOf("confirm"))
@@ -105,9 +115,15 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
         }
         val (startMs, endMs) = resolveDateRange(args)
         AppLogger.info(TAG, "list: type=$type limit=$limit range=${startMs?.let { formatIso(it) }}..${endMs?.let { formatIso(it) }}")
+        // [sweep1014-B22a] Query photos and videos independently (each capped
+        // at [limit]) and merge by time in memory. The old shared-quota form
+        // (limit - arr.length()) starved the video query once ≥20 photos
+        // existed, and even below the cap produced photo-first output instead
+        // of a time-ordered mix.
+        val photos = if (type == "photo" || type == "all") queryMedia(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, "photo", startMs, endMs, limit) else emptyList()
+        val videos = if (type == "video" || type == "all") queryMedia(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, "video", startMs, endMs, limit) else emptyList()
         val arr = JSONArray()
-        if (type == "photo" || type == "all") queryMedia(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, "photo", startMs, endMs, limit - arr.length(), arr)
-        if (type == "video" || type == "all") queryMedia(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, "video", startMs, endMs, limit - arr.length(), arr)
+        mergeMediaLimit(photos, videos, limit).forEach { arr.put(it.json) }
         val data = JSONObject()
             .put("media", arr)
             .put("count", arr.length())
@@ -124,8 +140,8 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
      * supply a window, and fall back to the (cheaper) implicit "all rows"
      * query when no range is set.
      */
-    private fun queryMedia(uri: Uri, kind: String, startMs: Long?, endMs: Long?, max: Int, sink: JSONArray) {
-        if (max <= 0) return
+    private fun queryMedia(uri: Uri, kind: String, startMs: Long?, endMs: Long?, max: Int): List<MediaEntry> {
+        if (max <= 0) return emptyList()
         val projection = arrayOf(
             MediaStore.Images.Media._ID,
             MediaStore.Images.Media.DISPLAY_NAME,
@@ -149,6 +165,7 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
         }
         val selection = if (selectionParts.isEmpty()) null else selectionParts.joinToString(" AND ")
         val selArgs = if (selectionArgs.isEmpty()) null else selectionArgs.toTypedArray()
+        val out = mutableListOf<MediaEntry>()
         context.contentResolver.query(uri, projection, selection, selArgs, "${MediaStore.Images.Media.DATE_TAKEN} DESC")?.use { c ->
             var n = 0
             while (c.moveToNext() && n < max) {
@@ -157,17 +174,18 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
                     .put("name", c.getString(1) ?: "")
                     .put("media_type", kind)
                 val dt = c.getLong(2)
-                if (dt > 0) p.put("date", dateFormat.format(Date(dt))).put("date_iso", formatIso(dt))
+                if (dt > 0) p.put("date", formatDateTime(dt)).put("date_iso", formatIso(dt))
                 p.put("width", c.getInt(3))
                     .put("height", c.getInt(4))
                     .put("size_bytes", c.getLong(5))
                     .put("mime_type", c.getString(6) ?: "")
                     .put("bucket_id", c.getLong(7))
                     .put("bucket_name", c.getString(8) ?: "")
-                sink.put(p)
+                out.add(MediaEntry(dt, p))
                 n++
             }
         }
+        return out
     }
 
     // ── near (T59: + --lat/--lon flags + --limit) ────────────────────────
@@ -430,7 +448,7 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
                         .put("name", c.getString(1) ?: "")
                         .put("media_type", kind)
                     val dt = c.getLong(2)
-                    if (dt > 0) p.put("date", dateFormat.format(Date(dt))).put("date_iso", formatIso(dt))
+                    if (dt > 0) p.put("date", formatDateTime(dt)).put("date_iso", formatIso(dt))
                     p.put("size_bytes", c.getLong(3))
                         .put("mime_type", c.getString(4) ?: "")
                         .put("bucket_id", c.getLong(5))
@@ -573,13 +591,22 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
         val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size, decodeOpts)
             ?: throw java.io.IOException("Failed to decode source image")
         val scale = minOf(maxEdge.toFloat() / bmp.width, maxEdge.toFloat() / bmp.height, 1f)
-        val out = if (scale < 1f) {
-            android.graphics.Bitmap.createScaledBitmap(bmp, (bmp.width * scale).toInt(), (bmp.height * scale).toInt(), true)
-        } else bmp
-        dst.outputStream().use { os ->
-            out.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, os)
+        try {
+            val out = if (scale < 1f) {
+                android.graphics.Bitmap.createScaledBitmap(bmp, (bmp.width * scale).toInt(), (bmp.height * scale).toInt(), true)
+            } else bmp
+            try {
+                dst.outputStream().use { os ->
+                    out.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, os)
+                }
+            } finally {
+                // [sweep1014-P8] Recycle the intermediate scaled bitmap.
+                if (out !== bmp) out.recycle()
+            }
+            return dst.length()
+        } finally {
+            bmp.recycle()
         }
-        return dst.length()
     }
 
     // ── import (T64) ─────────────────────────────────────────────────────
@@ -882,8 +909,8 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
         val json = JSONObject()
             .put("total_photos", count)
             .put("total_size_mb", String.format("%.1f", totalSize / 1e6))
-        if (earliest < Long.MAX_VALUE) json.put("earliest", dateFormat.format(Date(earliest)))
-        if (latest > 0) json.put("latest", dateFormat.format(Date(latest)))
+        if (earliest < Long.MAX_VALUE) json.put("earliest", formatDateTime(earliest))
+        if (latest > 0) json.put("latest", formatDateTime(latest))
         return json.toString(2)
     }
 
@@ -937,7 +964,7 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
                         .put("id", id)
                         .put("name", c.getString(1) ?: "")
                     val dt = c.getLong(2)
-                    if (dt > 0) p.put("date", dateFormat.format(Date(dt)))
+                    if (dt > 0) p.put("date", formatDateTime(dt))
                     p.put("latitude", coords[0])
                         .put("longitude", coords[1])
                         .put("distance_km", String.format("%.2f", dist))
@@ -968,6 +995,33 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
 
     companion object {
         private const val TAG = "PhotosOffload"
+
+        /** [sweep1014-B22a] One queried media row: raw sort key + output JSON. */
+        data class MediaEntry(val ts: Long, val json: JSONObject)
+
+        /**
+         * [sweep1014-B22a] Merge photo and video result lists — each already
+         * sorted by DATE_TAKEN DESC and capped at [limit] by MediaStore —
+         * into a single time-ordered list capped at [limit]. Entries with
+         * ts <= 0 (unknown date) sort after dated ones. Pure function so the
+         * quota/merge behavior is host-testable.
+         */
+        fun mergeMediaLimit(photos: List<MediaEntry>, videos: List<MediaEntry>, limit: Int): List<MediaEntry> {
+            if (limit <= 0) return emptyList()
+            val merged = ArrayList<MediaEntry>(photos.size + videos.size)
+            var i = 0
+            var j = 0
+            while (merged.size < limit && (i < photos.size || j < videos.size)) {
+                val takePhoto = when {
+                    i >= photos.size -> false
+                    j >= videos.size -> true
+                    else -> photos[i].ts >= videos[j].ts
+                }
+                if (takePhoto) { merged.add(photos[i]); i++ } else { merged.add(videos[j]); j++ }
+            }
+            return merged
+        }
+
         private const val HELP = """android-photos — query and manage device photos & videos
                               (mirrors apple-photos)
 
