@@ -4,6 +4,7 @@ import com.rikkaminis.app.R
 import com.rikkaminis.app.ui.components.MinisButton
 import com.rikkaminis.app.ui.components.MinisTextButton
 
+import android.content.ContentResolver
 import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -382,6 +383,36 @@ fun SkillsManagementScreen(
 
 // ─── Import Sheet (3 modes: URL / Paste / File) ─────────────────────────────
 
+/**
+ * [FIX-R22 B32a] Zip magic-byte sniff, shared by the import sheet
+ * (SkillImportSheet) and the detail-page update launcher (SkillDetailScreen)
+ * — the detail path used to lack any archive recognition, so picking a
+ * .zip/.skill to refresh an existing skill piped the raw bytes through
+ * readText() into garbage UTF-8 and surfaced as "Invalid SKILL.md".
+ *
+ * PK\x03\x04 = standard ZIP local file header; PK\x05\x06 is the
+ * empty-archive EOCD; PK\x07\x08 is a spanned/split archive. Accept all
+ * three so split exports from less-common zip tools don't fall into the
+ * text path. URI may not preserve the filename extension (some
+ * DocumentsProviders / share targets strip it), so magic-byte sniffing is
+ * more reliable than `.zip` / `.skill` checks. Pure — JVM-covered.
+ */
+internal fun isZipArchiveBytes(bytes: ByteArray): Boolean =
+    bytes.size >= 4 &&
+        bytes[0] == 0x50.toByte() && bytes[1] == 0x4B.toByte() &&
+        (bytes[2] == 0x03.toByte() || bytes[2] == 0x05.toByte() || bytes[2] == 0x07.toByte())
+
+/**
+ * [FIX-R22 B32a] Read the picked file's raw bytes so callers can branch on
+ * file magic; null on stream/IO failure (callers own the user-facing error).
+ */
+internal fun readUriBytes(resolver: ContentResolver, uri: Uri): ByteArray? =
+    try {
+        resolver.openInputStream(uri)?.use { it.readBytes() }
+    } catch (_: Exception) {
+        null
+    }
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun SkillImportSheet(
@@ -410,47 +441,33 @@ private fun SkillImportSheet(
             var failure: String? = null
             val imported = withContext(Dispatchers.IO) {
                 try {
-                    // [T-android-skill-import-zip] Read raw bytes so we can branch on
-                    // file magic. The previous code piped the InputStream straight
-                    // through `bufferedReader().readText()`, which corrupted any
-                    // .zip / .skill bundle into garbage UTF-8 and surfaced as
-                    // "Invalid SKILL.md content". Skills shared as bundles
-                    // (scripts/, references/, assets/) are the common case on iOS;
-                    // matching here aligns Android with iOS
-                    // `SkillsManagementView.documentPicker` + `SkillStore.importFromArchive`.
-                    val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    // [T-android-skill-import-zip] [FIX-R22 B32a] Byte read +
+                    // zip-magic sniff now live in the shared helpers
+                    // (readUriBytes / isZipArchiveBytes) so the detail-page
+                    // update launcher below reuses the same recognition
+                    // instead of a diverging copy.
+                    val bytes = readUriBytes(context.contentResolver, uri)
                     if (bytes == null) {
                         failure = "Failed to read file"
                         false
-                    } else {
-                        // PK\x03\x04 = standard ZIP local file header; PK\x05\x06 is the
-                        // empty-archive EOCD; PK\x07\x08 is a spanned/split archive. Accept
-                        // all three so split exports from less-common zip tools don't fall
-                        // into the text path. URI may not preserve the filename extension
-                        // (some DocumentsProviders / share targets strip it), so magic-byte
-                        // sniffing is more reliable than `.zip` / `.skill` checks.
-                        val isZip = bytes.size >= 4 &&
-                            bytes[0] == 0x50.toByte() && bytes[1] == 0x4B.toByte() &&
-                            (bytes[2] == 0x03.toByte() || bytes[2] == 0x05.toByte() || bytes[2] == 0x07.toByte())
-                        if (isZip) {
-                            val result = skillRepository.importFromArchive(
-                                java.io.ByteArrayInputStream(bytes),
-                            )
-                            if (result != null) {
-                                true
-                            } else {
-                                failure = "Invalid skill archive — no SKILL.md found at the root or one directory deep"
-                                false
-                            }
+                    } else if (isZipArchiveBytes(bytes)) {
+                        val result = skillRepository.importFromArchive(
+                            java.io.ByteArrayInputStream(bytes),
+                        )
+                        if (result != null) {
+                            true
                         } else {
-                            val content = String(bytes, Charsets.UTF_8)
-                            val result = skillRepository.importFromContent(content, SkillRepository.ImportSource.FILE)
-                            if (result != null) {
-                                true
-                            } else {
-                                failure = "Invalid SKILL.md content"
-                                false
-                            }
+                            failure = "Invalid skill archive — no SKILL.md found at the root or one directory deep"
+                            false
+                        }
+                    } else {
+                        val content = String(bytes, Charsets.UTF_8)
+                        val result = skillRepository.importFromContent(content, SkillRepository.ImportSource.FILE)
+                        if (result != null) {
+                            true
+                        } else {
+                            failure = "Invalid SKILL.md content"
+                            false
                         }
                     }
                 } catch (e: Exception) {
@@ -635,30 +652,77 @@ fun SkillDetailScreen(
     ) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
         updateStatus = UpdateStatus.InProgress(context.getString(R.string.skill_detail_status_reading))
-        try {
-            val content = context.contentResolver.openInputStream(uri)
-                ?.bufferedReader()?.use { it.readText() }
-            if (content.isNullOrBlank()) {
-                updateStatus = UpdateStatus.Failed(context.getString(R.string.skill_detail_error_empty))
-            } else {
-                // Re-parse the supplied SKILL.md so we can push name +
-                // description + body into the existing skill record without
-                // creating a new entry.
-                val parsed = skillRepository.parseSkillMdPublic(content)
-                if (parsed == null) {
-                    updateStatus = UpdateStatus.Failed(context.getString(R.string.skill_detail_error_invalid))
-                } else {
-                    val ok = skillRepository.update(
-                        id = skill.id,
-                        name = parsed.name,
-                        description = parsed.description,
-                        body = parsed.body,
-                    )
-                    updateStatus = if (ok) UpdateStatus.Done else UpdateStatus.Failed(context.getString(R.string.skill_detail_error_update_failed))
+        // [FIX-R22 B32a] Reading + parsing + the repository write all do disk
+        // IO; they used to run inline on the activity-result callback thread
+        // (Main), so a large update froze the screen — same fix as
+        // SkillImportSheet [T6-M5]. Read + parse on IO, apply the outcome
+        // back on Main.
+        scope.launch {
+            var failureRes: Int? = null
+            var failureMsg: String? = null
+            val ok = withContext(Dispatchers.IO) {
+                try {
+                    val bytes = readUriBytes(context.contentResolver, uri)
+                    when {
+                        bytes == null -> {
+                            failureMsg = "Failed to read file"
+                            false
+                        }
+                        // [FIX-R22 B32a] A .zip/.skill bundle used to be piped
+                        // through readText() into garbage UTF-8 and surfaced as
+                        // "Invalid SKILL.md". Route archives through the shared
+                        // magic-byte sniff + importFromArchive with the
+                        // existing skill's id as preferredId — it replaces the
+                        // record in place and extracts bundled siblings
+                        // (scripts/, references/) alongside it.
+                        isZipArchiveBytes(bytes) -> {
+                            val result = skillRepository.importFromArchive(
+                                java.io.ByteArrayInputStream(bytes),
+                                preferredId = skill.id,
+                            )
+                            if (result != null) {
+                                true
+                            } else {
+                                failureMsg = "Invalid skill archive — no SKILL.md found at the root or one directory deep"
+                                false
+                            }
+                        }
+                        else -> {
+                            val content = String(bytes, Charsets.UTF_8)
+                            if (content.isBlank()) {
+                                failureRes = R.string.skill_detail_error_empty
+                                false
+                            } else {
+                                // Re-parse the supplied SKILL.md so we can push
+                                // name + description + body into the existing
+                                // skill record without creating a new entry.
+                                val parsed = skillRepository.parseSkillMdPublic(content)
+                                if (parsed == null) {
+                                    failureRes = R.string.skill_detail_error_invalid
+                                    false
+                                } else {
+                                    skillRepository.update(
+                                        id = skill.id,
+                                        name = parsed.name,
+                                        description = parsed.description,
+                                        body = parsed.body,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    failureMsg = "Failed to read file: ${e.message ?: "unknown"}"
+                    false
                 }
             }
-        } catch (e: Exception) {
-            updateStatus = UpdateStatus.Failed("Failed to read file: ${e.message ?: "unknown"}")
+            updateStatus = if (ok) {
+                UpdateStatus.Done
+            } else if (failureRes != null) {
+                UpdateStatus.Failed(context.getString(failureRes!!))
+            } else {
+                UpdateStatus.Failed(failureMsg ?: context.getString(R.string.skill_detail_error_update_failed))
+            }
         }
     }
 
