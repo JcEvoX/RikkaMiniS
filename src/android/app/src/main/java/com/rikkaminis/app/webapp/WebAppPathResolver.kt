@@ -3,6 +3,7 @@ package com.rikkaminis.app.webapp
 import android.content.Context
 import com.rikkaminis.app.data.db.WebAppShortcutEntity
 import com.rikkaminis.app.data.repository.WebAppShortcutRepository
+import com.rikkaminis.app.data.storage.SessionFileStore
 import com.rikkaminis.app.sandbox.PRootKernel
 import java.io.File
 
@@ -13,7 +14,7 @@ import java.io.File
  * null if the file no longer exists — caller should surface a "source
  * missing" UI instead of crashing.
  *
- *   - session_attachment → `<filesDir>/sessions/<sessionId>/attachments/<htmlPath>`
+ *   - session_attachment → `<filesDir>/minis-sessions/<sessionId>/attachments/<htmlPath>`
  *     (htmlPath relative to the session's attachments dir; absolute paths
  *      under /var/minis/<sub>/ are also accepted via resolveSessionHostPath)
  *   - shared             → resolved via [PRootKernel.resolveHostPath]
@@ -83,9 +84,21 @@ object WebAppPathResolver {
             return PRootKernel.resolveSessionHostPath(sessionId, shortcut.htmlPath, context)
         }
         // Relative path — under the session's attachments dir.
+        // [sweep1014-b7a] Same root as AddToHomeSheet's write side
+        // (SessionFileStore.sessionsRoot = filesDir/minis-sessions), so
+        // shortcut bytes live inside the orphan-scan / deleteSession
+        // cleanup face instead of a detached filesDir/sessions/.
         // Canonicalize + prefix-guard: the stored htmlPath is user-influenced,
         // so reject `/`, `..`, and symlink escapes out of the attachments dir.
-        val attachmentsDir = File(context.filesDir, "sessions/$sessionId/attachments")
-        return PRootKernel.safeResolveWithin(attachmentsDir, shortcut.htmlPath)
+        val attachmentsDir = File(SessionFileStore(context).sessionsRoot, "$sessionId/attachments")
+        PRootKernel.safeResolveWithin(attachmentsDir, shortcut.htmlPath)?.let { return it }
+        // Legacy fallback (read-only): pre-minis-sessions shortcuts stored
+        // bytes under filesDir/sessions/. Keep them resolving; those dirs
+        // are outside SessionFileStore's cleanup face (registered, never
+        // written again).
+        return PRootKernel.safeResolveWithin(
+            File(context.filesDir, "sessions/$sessionId/attachments"),
+            shortcut.htmlPath,
+        )
     }
 }

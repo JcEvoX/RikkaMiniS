@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color as AGColor
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.RectF
 import android.graphics.Typeface
 import android.net.Uri
@@ -69,6 +70,7 @@ import com.rikkaminis.app.MinisApp
 import com.rikkaminis.app.R
 import com.rikkaminis.app.ui.components.sanitizeSingleLineInput
 import com.rikkaminis.app.data.repository.WebAppShortcutRepository
+import com.rikkaminis.app.data.storage.SessionFileStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -138,6 +140,20 @@ fun AddToHomeSheet(
     // before the user commits; for HostFile the file already exists so
     // we just point [copiedFile] at it.
     var copiedFile by remember { mutableStateOf<File?>(null) }
+    var pinned by remember { mutableStateOf(false) }
+
+    // [sweep1014-b7a] If the sheet closes without a successful pin, delete
+    // the ChatAttachment copy so it doesn't outlive the sheet as an orphan.
+    // HostFile points at a live host file — never deleted here.
+    val cleanupCopiedAttachment = {
+        val f = copiedFile
+        if (f != null && source is WebAppSource.ChatAttachment && !pinned) {
+            f.delete()
+            // Empty <shortcutId>/ dir cleanup; no-op when non-empty.
+            f.parentFile?.delete()
+        }
+        Unit
+    }
     var copyFailed by remember { mutableStateOf(false) }
     var parsedTitle by remember { mutableStateOf<String?>(null) }
     var webpageIconPath by remember { mutableStateOf<String?>(null) }
@@ -146,9 +162,13 @@ fun AddToHomeSheet(
         withContext(Dispatchers.IO) {
             when (source) {
                 is WebAppSource.ChatAttachment -> {
+                    // [sweep1014-b7a] Use SessionFileStore's same root
+                    // (filesDir/minis-sessions/<sid>/attachments/) so the
+                    // copy lives inside the orphan-scan / deleteSession
+                    // cleanup face instead of a detached filesDir/sessions/.
                     val attachmentsDir = File(
-                        context.filesDir,
-                        "sessions/${source.sessionId}/attachments/$shortcutId",
+                        SessionFileStore(context).sessionsRoot,
+                        "${source.sessionId}/attachments/$shortcutId",
                     )
                     attachmentsDir.mkdirs()
                     // Sanitize the ContentResolver DISPLAY_NAME: strip any
@@ -208,7 +228,10 @@ fun AddToHomeSheet(
     }
 
     ModalBottomSheet(
-        onDismissRequest = onDismiss,
+        onDismissRequest = {
+            cleanupCopiedAttachment()
+            onDismiss()
+        },
         sheetState = sheetState,
     ) {
         Column(
@@ -380,7 +403,7 @@ fun AddToHomeSheet(
                                     // htmlPath stays relative under the
                                     // session attachments dir — WebAppPathResolver's
                                     // "relative path" branch resolves it back to
-                                    // <filesDir>/sessions/<sid>/attachments/<htmlPath>.
+                                    // <filesDir>/minis-sessions/<sid>/attachments/<htmlPath>.
                                     val htmlPath = "$shortcutId/${target.name}"
                                     app.webAppShortcutRepository.create(
                                         htmlPath = htmlPath,
@@ -409,11 +432,14 @@ fun AddToHomeSheet(
                             }
                             val ok = ShortcutPinner.pin(context, entity, iconBitmap)
                             if (ok) {
+                                pinned = true
                                 Toast.makeText(
                                     context,
                                     R.string.webapp_pin_success,
                                     Toast.LENGTH_SHORT,
                                 ).show()
+                            } else {
+                                cleanupCopiedAttachment()
                             }
                             onDismiss()
                         }
@@ -462,6 +488,113 @@ private enum class IconPreset(val imageVector: ImageVector) {
     Game(Icons.Default.SportsEsports),
     Music(Icons.Default.MusicNote),
     Generic(Icons.Default.AppShortcut),
+}
+
+// internal (was private) so the preset→glyph dispatch is JVM-testable.
+internal enum class PresetGlyph { Globe, Chart, Book, AppGrid, Video, Game, Music, Generic }
+
+/**
+ * [sweep1014-b7b] Map each [IconPreset] to a distinct glyph kind.
+ * Top-level + internal so the 8-preset dispatch table is unit-testable
+ * (all 8 presets → 8 distinct glyphs, none falling back to the title glyph).
+ */
+internal fun presetGlyphKind(preset: IconPreset): PresetGlyph = when (preset) {
+    IconPreset.Globe -> PresetGlyph.Globe
+    IconPreset.Chart -> PresetGlyph.Chart
+    IconPreset.Book -> PresetGlyph.Book
+    IconPreset.App -> PresetGlyph.AppGrid
+    IconPreset.Video -> PresetGlyph.Video
+    IconPreset.Game -> PresetGlyph.Game
+    IconPreset.Music -> PresetGlyph.Music
+    IconPreset.Generic -> PresetGlyph.Generic
+}
+
+/**
+ * [sweep1014-b7b] Draw a simple white vector glyph for the chosen preset,
+ * inside the existing Paint/Canvas system (no new resource files).
+ */
+private fun drawPresetGlyph(preset: IconPreset, canvas: Canvas, size: Int) {
+    val c = size / 2f
+    val stroke = Paint().apply {
+        isAntiAlias = true
+        color = AGColor.WHITE
+        style = Paint.Style.STROKE
+        strokeWidth = size * 0.05f
+        strokeCap = Paint.Cap.ROUND
+    }
+    val fill = Paint().apply {
+        isAntiAlias = true
+        color = AGColor.WHITE
+        style = Paint.Style.FILL
+    }
+    when (presetGlyphKind(preset)) {
+        PresetGlyph.Globe -> {
+            canvas.drawCircle(c, c, size * 0.28f, stroke)
+            canvas.drawLine(c - size * 0.28f, c, c + size * 0.28f, c, stroke)
+            canvas.drawOval(
+                RectF(c - size * 0.12f, c - size * 0.28f, c + size * 0.12f, c + size * 0.28f),
+                stroke,
+            )
+        }
+        PresetGlyph.Chart -> {
+            val w = size * 0.11f
+            val bottom = c + size * 0.24f
+            canvas.drawRect(c - size * 0.22f, bottom - size * 0.20f, c - size * 0.22f + w, bottom, fill)
+            canvas.drawRect(c - w / 2f, bottom - size * 0.42f, c + w / 2f, bottom, fill)
+            canvas.drawRect(c + size * 0.22f - w, bottom - size * 0.30f, c + size * 0.22f, bottom, fill)
+        }
+        PresetGlyph.Book -> {
+            val half = size * 0.22f
+            canvas.drawRoundRect(
+                RectF(c - half, c - size * 0.26f, c + half, c + size * 0.26f),
+                size * 0.03f, size * 0.03f, stroke,
+            )
+            canvas.drawLine(c, c - size * 0.26f, c, c + size * 0.26f, stroke)
+        }
+        PresetGlyph.AppGrid -> {
+            val s = size * 0.15f
+            val off = s + size * 0.05f
+            for (ox in listOf(-off, off)) for (oy in listOf(-off, off)) {
+                canvas.drawRoundRect(
+                    RectF(c + ox - s, c + oy - s, c + ox + s, c + oy + s),
+                    size * 0.03f, size * 0.03f, fill,
+                )
+            }
+        }
+        PresetGlyph.Video -> {
+            val r = size * 0.24f
+            val tri = Path().apply {
+                moveTo(c - r * 0.7f, c - r)
+                lineTo(c + r * 0.9f, c)
+                lineTo(c - r * 0.7f, c + r)
+                close()
+            }
+            canvas.drawPath(tri, fill)
+        }
+        PresetGlyph.Game -> {
+            val a = size * 0.08f
+            val l = size * 0.20f
+            canvas.drawRect(c - l - a, c - a, c + l + a, c + a, fill)
+            canvas.drawRect(c - a, c - l - a, c + a, c + l + a, fill)
+            canvas.drawCircle(c + size * 0.30f, c - size * 0.10f, size * 0.045f, fill)
+            canvas.drawCircle(c + size * 0.30f, c + size * 0.10f, size * 0.045f, fill)
+        }
+        PresetGlyph.Music -> {
+            val headR = size * 0.09f
+            val hx = c - size * 0.08f
+            val hy = c + size * 0.16f
+            canvas.drawCircle(hx, hy, headR, fill)
+            canvas.drawLine(hx + headR, hy, hx + headR, c - size * 0.22f, stroke)
+        }
+        PresetGlyph.Generic -> {
+            val half = size * 0.26f
+            canvas.drawRoundRect(
+                RectF(c - half, c - half, c + half, c + half),
+                size * 0.08f, size * 0.08f, stroke,
+            )
+            canvas.drawCircle(c, c, size * 0.08f, fill)
+        }
+    }
 }
 
 private sealed class IconChoice {
@@ -526,7 +659,7 @@ private fun renderIconBitmap(context: Context, choice: IconChoice, title: String
             drawTitleGlyph(canvas, title, size)
         }
         is IconChoice.Preset -> {
-            drawTitleGlyph(canvas, title, size)
+            drawPresetGlyph(choice.preset, canvas, size)
         }
     }
     return bmp
