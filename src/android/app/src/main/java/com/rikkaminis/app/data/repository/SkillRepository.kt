@@ -1381,8 +1381,14 @@ class SkillRepository(private val context: Context) {
      * (semantic-memory, github-ops, cloudflare-fullright-ops) ship
      * in the app out of the box.
      *
-     * Version-gated: a skill already installed at the same-or-newer version
-     * is left untouched (preserves any user edits and skips redundant I/O).
+     * Two gates, deliberately different scopes:
+     *  - **SKILL.md / registry row** — version-gated (same-or-newer local
+     *    version is left untouched; preserves user edits and blocks silent
+     *    downgrades of a newer user-imported copy).
+     *  - **sibling payload** (`scripts/`, `*.py`, `*.pkl`, …) — content-hash
+     *    gated via [SkillAssetSync]'s manifest, so a script-only fix ships
+     *    without anyone bumping the version string. See that file for the
+     *    2026-10-14 incident this fixes.
      */
     private fun installBundledSkills() {
         try {
@@ -1411,7 +1417,15 @@ class SkillRepository(private val context: Context) {
         // Skip if local version is same or newer. Semantic comparison, not
         // lexical — a lexical `">="` would treat "1.10.0" as older than
         // "1.9.0" and re-downgrade a newer install on every launch.
-        if (existing != null && compareVersions(existing.version, bundledVersion) >= 0) return
+        // [fix/bundled-skill-asset-hash-gate] The early return only covers the
+        // SKILL.md/row update: the sibling payload is gated by a content hash
+        // inside syncBundledSiblings, so a script-only fix reaches existing
+        // installs without a version bump. Only BUNDLED-sourced rows are
+        // synced — a user-imported copy at the same version is theirs to keep.
+        if (existing != null && compareVersions(existing.version, bundledVersion) >= 0) {
+            if (existing.importSource == ImportSource.BUNDLED) syncBundledSiblings(dirName)
+            return
+        }
 
         if (existing != null) {
             val updated = existing.copy(
@@ -1425,7 +1439,7 @@ class SkillRepository(private val context: Context) {
                 arrayOf<Any>(updated.description, bundledVersion, updated.updatedAt, dirName)
             )
             writeSkillMd(updated)
-            extractBundledSiblings(dirName)
+            syncBundledSiblings(dirName)
             _skills.value = _skills.value.map { if (it.id == dirName) updated else it }
             Log.i(TAG, "Upgraded bundled skill: $dirName → v$bundledVersion")
         } else {
@@ -1440,50 +1454,110 @@ class SkillRepository(private val context: Context) {
                 // allowed_tools on disk and in memory.
                 frontmatter = SubagentSkill.extractFrontmatterBlock(content),
             )
-            extractBundledSiblings(dirName)
+            syncBundledSiblings(dirName)
             Log.i(TAG, "Installed bundled skill: $dirName (v$bundledVersion)")
         }
     }
 
+    /** Sidecar manifest recording the payload hash of the last extraction. */
+    private val bundledAssetManifest: File
+        get() = File(skillsDir, SkillAssetSync.MANIFEST_NAME)
+
     /**
-     * Recursively copy every sibling file under `assets/skills/<dirName>/`
-     * (scripts/, data/, .py, .pkl, requirements.json, …) into the skill's
-     * sandbox directory. SKILL.md is skipped at the top level because
-     * `add()` / `writeSkillMd()` already wrote it from the parsed body.
+     * Sync the sibling payload under `assets/skills/<dirName>/` (scripts/,
+     * data/, *.py, *.pkl, requirements.json, …) into the skill's sandbox
+     * directory — but only when the payload actually changed.
+     *
+     * [fix/bundled-skill-asset-hash-gate] Content-hash gated (see
+     * [SkillAssetSync]): the manifest holds the hash of what we last wrote, so
+     * a script-only fix in a new APK is picked up even when nobody bumped the
+     * SKILL.md version. Conversely, user edits to a bundled script survive
+     * every launch (and every version bump) whose payload matches the one we
+     * extracted. SKILL.md is skipped at the top level — the version-gated path
+     * (`writeSkillMd`) owns that file.
      */
-    private fun extractBundledSiblings(dirName: String) {
+    private fun syncBundledSiblings(dirName: String) {
+        val entries = collectAssetEntries("skills/$dirName", relPrefix = "", skipTopLevelMd = true)
+        val current = SkillAssetSync.payloadHash(entries)
+        val stored = readBundledAssetHashes()[dirName]
+        if (!SkillAssetSync.needsExtraction(stored, current)) return
+
         val destDir = File(skillsDir, dirName)
         destDir.mkdirs()
-        copyAssetsRecursive("skills/$dirName", destDir, skipTopLevelMd = true)
+        var written = 0
+        for (e in entries) {
+            val target = File(destDir, e.path)
+            target.parentFile?.mkdirs()
+            try {
+                target.writeBytes(e.bytes)
+                written++
+            } catch (ex: Exception) {
+                Log.w(TAG, "Failed to extract ${e.path}: ${ex.message}")
+            }
+        }
+        if (written != entries.size) {
+            // A partial extraction (disk full, kill mid-write) must not be
+            // frozen as "current": leaving the manifest untouched makes the
+            // next launch retry instead of shipping a half-written script.
+            Log.w(TAG, "Bundled sibling sync for $dirName incomplete ($written/${entries.size} files); retrying next launch")
+            return
+        }
+        recordBundledAssetHash(dirName, current)
+        Log.i(TAG, "Synced bundled siblings for $dirName ($written files, hash=${current.take(12)})")
     }
 
-    private fun copyAssetsRecursive(assetPath: String, destDir: File, skipTopLevelMd: Boolean) {
-        try {
-            val entries = context.assets.list(assetPath) ?: return
-            for (entry in entries) {
-                if (skipTopLevelMd && entry == "SKILL.md") continue
-                val childAsset = "$assetPath/$entry"
-                val childFile = File(destDir, entry)
-                // A path under assets that lists child entries is a directory.
-                val isDir = try {
-                    val sub = context.assets.list(childAsset)
-                    !(sub == null || sub.isEmpty())
-                } catch (_: Exception) { false }
-                if (isDir) {
-                    childFile.mkdirs()
-                    copyAssetsRecursive(childAsset, childFile, skipTopLevelMd = false)
-                } else {
-                    try {
-                        context.assets.open(childAsset).use { input ->
-                            childFile.outputStream().use { output -> input.copyTo(output) }
-                        }
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Failed to extract $childAsset: ${e.message}")
+    /** Read the sibling payload of a bundled skill into memory as (relPath, bytes). */
+    private fun collectAssetEntries(
+        assetPath: String,
+        relPrefix: String,
+        skipTopLevelMd: Boolean,
+    ): List<SkillAssetSync.Entry> {
+        val out = mutableListOf<SkillAssetSync.Entry>()
+        val entries = try {
+            context.assets.list(assetPath) ?: return out
+        } catch (e: Exception) {
+            Log.w(TAG, "list($assetPath): ${e.message}")
+            return out
+        }
+        for (entry in entries) {
+            if (relPrefix.isEmpty() && skipTopLevelMd && entry == "SKILL.md") continue
+            val childAsset = "$assetPath/$entry"
+            val rel = if (relPrefix.isEmpty()) entry else "$relPrefix/$entry"
+            // A path under assets that lists child entries is a directory.
+            val isDir = try {
+                val sub = context.assets.list(childAsset)
+                !(sub == null || sub.isEmpty())
+            } catch (_: Exception) { false }
+            if (isDir) {
+                out += collectAssetEntries(childAsset, relPrefix = rel, skipTopLevelMd = false)
+            } else {
+                try {
+                    context.assets.open(childAsset).use { input ->
+                        out += SkillAssetSync.Entry(rel, input.readBytes())
                     }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to read $childAsset: ${e.message}")
                 }
             }
+        }
+        return out
+    }
+
+    private fun readBundledAssetHashes(): Map<String, String> = try {
+        val f = bundledAssetManifest
+        if (f.exists()) SkillAssetSync.parseManifest(f.readText()) else emptyMap()
+    } catch (e: Exception) {
+        Log.w(TAG, "Failed to read ${SkillAssetSync.MANIFEST_NAME}: ${e.message}")
+        emptyMap()
+    }
+
+    private fun recordBundledAssetHash(dirName: String, hash: String) {
+        try {
+            val merged = readBundledAssetHashes() + (dirName to hash)
+            bundledAssetManifest.parentFile?.mkdirs()
+            bundledAssetManifest.writeText(SkillAssetSync.renderManifest(merged))
         } catch (e: Exception) {
-            Log.w(TAG, "copyAssetsRecursive($assetPath): ${e.message}")
+            Log.w(TAG, "Failed to write ${SkillAssetSync.MANIFEST_NAME}: ${e.message}")
         }
     }
 
