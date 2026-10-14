@@ -702,7 +702,7 @@ private fun filenameFromUrl(url: String): String {
     val last = stripped.substringAfterLast('/')
     // [rv1014-B1] decodeUriPath never throws and leaves `+` intact, so the
     // try/catch around the old URLDecoder.decode is no longer needed.
-    decodeUriPath(last)
+    return decodeUriPath(last)
 }
 
 /**
