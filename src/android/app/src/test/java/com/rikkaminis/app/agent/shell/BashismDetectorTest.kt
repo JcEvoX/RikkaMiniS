@@ -63,6 +63,68 @@ class BashismDetectorTest {
         assertTrue("heredoc body bashisms must be stripped", BashismDetector.detect(script).hits.isEmpty())
     }
 
+    // ── B15: the heredoc-open regex must not fire on arithmetic shifts or here-strings ──
+    //
+    // The old regex `<<-?\s*["']?(\w+)` matched `<< 16` in `$((1 << 16))` and
+    // `<<< "$payload"` (from its second `<`) as heredoc delimiters. Neither
+    // "delimiter" matches any line, so shellLayerLines used to null out every
+    // remaining line — all bashisms after the offending line were silently
+    // missed and ash then errored on the raw script.
+
+    @Test
+    fun arithShiftDoesNotHideFollowingBashisms() {
+        val script = "size=\$((1 << 16))\narr=(1 2 3)\ndiff <(sort a) <(sort b)"
+        val got = BashismDetector.detect(script).hits.map { it.ruleName }.toSet()
+        assertTrue("bashisms after \$((1 << 16)) must be detected", got.containsAll(setOf("array-def", "process-subst")))
+    }
+
+    @Test
+    fun hereStringDoesNotHideFollowingBashisms() {
+        // Unquoted here-string payload: the OLD regex matched `<< $content`
+        // from its second `<` and fabricated a delimiter, nulling every line
+        // after it. The quoted-with-$ form does NOT trip the old regex (the
+        // \w+ stalls on `$`), so this test uses the discriminating form.
+        val script = "wc -l <<< \$content\narr=(1 2 3)\nfor ((i=0;i<3;i++)); do echo \$i; done"
+        val got = BashismDetector.detect(script).hits.map { it.ruleName }.toSet()
+        assertTrue("here-string itself must be detected", got.contains("here-string"))
+        assertTrue("bashisms after <<< must be detected", got.containsAll(setOf("array-def", "c-for")))
+    }
+
+    @Test
+    fun quotedHereStringPayloadDoesNotHideFollowingBashisms() {
+        // `<<< "content"` (quoted, no $): the OLD regex matched the second `<`
+        // and took `content` as a delimiter — nulling the rest of the script.
+        val script = "wc -l <<< \"content\"\narr=(1 2 3)"
+        val got = BashismDetector.detect(script).hits.map { it.ruleName }.toSet()
+        assertTrue("bashisms after a quoted-here-string must be detected", got.contains("array-def"))
+    }
+
+    @Test
+    fun arithShiftWithAlphaOperandDoesNotOpenHeredoc() {
+        // `<< y` inside $(( )) — the regex itself matches a word delimiter here,
+        // so this is where the arithmetic-context guard does the work.
+        val script = "x=\$(( a << b ))\narr=(1 2 3)"
+        val got = BashismDetector.detect(script).hits.map { it.ruleName }.toSet()
+        assertTrue("alpha shift operand must not open a heredoc", got.contains("array-def"))
+    }
+
+    @Test
+    fun realHeredocBodyStillStrippedWithBashismsAfter() {
+        val script = "cat <<EOF\ntotal+=1\nEOF\narr=(1 2 3)"
+        val got = BashismDetector.detect(script).hits.map { it.ruleName }.toSet()
+        assertEquals("body must stay stripped, later bashism must be seen",
+            setOf("array-def"), got)
+    }
+
+    @Test
+    fun arithmeticHeredocMixOnOneLine() {
+        // Both on one line: the shift must be skipped, the heredoc must open.
+        val script = "echo \$(( x << y )); cat <<'PYEOF'\nbody+=1\nPYEOF\narr=(1 2)"
+        val got = BashismDetector.detect(script).hits.map { it.ruleName }.toSet()
+        assertEquals("shift skipped, heredoc body stripped, later bashism seen",
+            setOf("array-def"), got)
+    }
+
     @Test
     fun reminderSanitizesInjection() {
         val hit = BashismDetector.Hit(

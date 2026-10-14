@@ -1,6 +1,7 @@
 package com.rikkaminis.app.sandbox.offload
 
 import java.io.IOException
+import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.DirectoryNotEmptyException
 import java.nio.file.FileAlreadyExistsException
 import java.nio.file.FileVisitResult
@@ -140,18 +141,54 @@ internal class MoveOutcome {
  * is why `mv` is the cheapest primitive in the set. [force] is what makes the
  * handler's `--force` contract real: the caller has already decided that
  * replacing the target is what the user asked for, so the rename must carry
- * REPLACE_EXISTING. Without it a bare `Files.move` fails with
+ * REPLACE_EXISTING. Without it a bare move fails with
  * FileAlreadyExistsException and `mv --force` reports a failure for the one
  * thing it promises to do.
  *
- * When the target lands on a different filesystem the JVM refuses the rename
- * with EXDEV; that falls back to copy-then-delete, which is registered as a
- * deliberately un-tested rare path rather than fitted with its own harness.
+ * The move is attempted with ATOMIC_MOVE first (B16): a cross-device rename
+ * fails with EXDEV and surfaces as [AtomicMoveNotSupportedException], which
+ * falls back to [copyDeleteFallback] — the real move. Without ATOMIC_MOVE the
+ * JVM's own non-atomic fallback ran first and got the cross-device non-empty
+ * directory case wrong (it created the dst directory, then failed rmdir on the
+ * non-empty source with a DirectoryNotEmptyException pointing at SRC), which
+ * left a half-empty dst and made the fallback unreachable.
+ *
+ * Two same-device semantics shift with ATOMIC_MOVE (both now POSIX-aligned,
+ * nothing pinned the old behaviour): a file no longer replaces an EMPTY
+ * directory target (POSIX rename cannot), and a directory no longer replaces
+ * a file target. The readable non-empty-directory reason is preserved via the
+ * pre-check above.
  */
 internal fun moveTree(src: Path, dst: Path, force: Boolean, out: MoveOutcome) {
-    try {
-        if (force) Files.move(src, dst, StandardCopyOption.REPLACE_EXISTING) else Files.move(src, dst)
+    if (!force && Files.exists(dst, LinkOption.NOFOLLOW_LINKS)) {
+        // Defensive second line for the no-overwrite contract. Needed because
+        // the ATOMIC_MOVE rename below would silently replace an existing EMPTY
+        // directory target (POSIX rename does); same message the catch below
+        // carries for the race window.
+        out.errors.add("$dst: already exists; pass --force to overwrite")
         return
+    }
+    if (force && Files.isDirectory(dst, LinkOption.NOFOLLOW_LINKS) && !isDirEmpty(dst)) {
+        // B16 companion: a non-empty directory target can never be replaced by
+        // rename. With ATOMIC_MOVE the JDK surfaces that as a bare
+        // FileSystemException ("Is a directory" / "Directory not empty"),
+        // losing the readable reason the old non-atomic REPLACE_EXISTING path
+        // produced (DirectoryNotEmptyException) — so spell it out up front.
+        // The catch below stays for the race window.
+        out.errors.add("$dst: already exists and is a non-empty directory; refusing to replace it")
+        return
+    }
+    try {
+        if (force) {
+            Files.move(src, dst, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
+        } else {
+            Files.move(src, dst, StandardCopyOption.ATOMIC_MOVE)
+        }
+        return
+    } catch (e: AtomicMoveNotSupportedException) {
+        // Cross-device rename (EXDEV) or a filesystem that rejects the atomic
+        // flag — either way the copy+delete fallback below is the real move.
+        // Fall through deliberately.
     } catch (e: DirectoryNotEmptyException) {
         // Only reachable with force: the target is a directory no rename can
         // replace. Spelled out instead of handing over the bare Java message,
@@ -168,10 +205,28 @@ internal fun moveTree(src: Path, dst: Path, force: Boolean, out: MoveOutcome) {
         }
     }
 
+    copyDeleteFallback(src, dst, force, out)
+}
+
+/**
+ * The copy-then-delete move for cross-device (EXDEV) targets. Always merges
+ * with force: the caller has already settled the overwrite policy, and a
+ * cross-device move cannot be a rename anyway.
+ */
+internal fun copyDeleteFallback(src: Path, dst: Path, force: Boolean, out: MoveOutcome) {
     out.method = "copy+delete"
+    val dstPreExisted = Files.exists(dst, LinkOption.NOFOLLOW_LINKS)
     val copy = CopyOutcome()
     copyTree(src, dst, force = true, out = copy)
     if (copy.errors.isNotEmpty()) {
+        // Half-copied residue: when WE created dst (it did not exist before
+        // the move), remove the partial tree so a failed `mv` never leaves a
+        // half-empty directory behind. A pre-existing --force merge target
+        // keeps its original content — deleting it would destroy user data.
+        if (!dstPreExisted) {
+            val residue = WalkTotals()
+            deleteTree(dst, residue)
+        }
         out.errors.addAll(copy.errors)
         return
     }
@@ -194,6 +249,14 @@ private fun isCrossDevice(e: Exception): Boolean {
     val message = e.message?.lowercase() ?: return false
     return message.contains("cross-device") || message.contains("exdev")
 }
+
+/** Unlistable counts as non-empty: an unreadable directory is refused, not replaced. */
+private fun isDirEmpty(dir: Path): Boolean =
+    try {
+        Files.newDirectoryStream(dir).use { s -> !s.iterator().hasNext() }
+    } catch (_: Exception) {
+        false
+    }
 
 // ── path containment ────────────────────────────────────────────────────────
 
