@@ -270,17 +270,26 @@ def call_daemon(request, pretty):
 
 # --- argument helpers -------------------------------------------------------
 
+def _reject_constant(name):
+    """[rv1014-C5] NaN/Infinity/-Infinity are RFC-invalid JSON literals —
+    json.loads accepts them by default and json.dumps would emit them, which
+    strict remote JSON parsers reject. Rejecting here keeps those values as
+    plain strings (pre-D4b behavior)."""
+    raise ValueError(name)
+
+
 def _parse_value(v):
     """[sweep1014-D4b] key=value values are parsed as JSON literals first so
     typed tool schemas work straight from the CLI: limit=10 → int,
     recursive=true → bool, q=[1,2] → array, q={"a":1} → object. Anything that
     isn't valid JSON (and the empty string) stays a plain string. To force a
     string that looks like JSON, quote it: q='"10"' → "10". The --input '{}'
-    path is unaffected."""
+    path is unaffected. [rv1014-C5] NaN/Infinity stay plain strings (see
+    _reject_constant)."""
     if v == "":
         return v
     try:
-        return json.loads(v)
+        return json.loads(v, parse_constant=_reject_constant)
     except ValueError:
         return v
 
@@ -362,7 +371,9 @@ def cmd_call(args, pretty):
     arguments = {}
     if raw_input:
         try:
-            arguments = json.loads(raw_input)
+            # [rv1014-C5] Same NaN/Infinity guard as _parse_value — a literal
+            # NaN in --input would reach json.dumps and strict remote parsers.
+            arguments = json.loads(raw_input, parse_constant=_reject_constant)
         except ValueError as exc:
             _fail("invalid --input JSON: %s" % exc, "PARSE_ERROR", name, pretty)
     # key=value pairs override / extend the --input object. Values are parsed
