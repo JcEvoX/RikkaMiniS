@@ -11,7 +11,12 @@
         <exclude domain="file" path="logs/" />
         <exclude domain="file" path="sessions/" />
         <exclude domain="file" path="minis-sessions/" />
-        <exclude domain="file" path="proot/" />
+        <!-- [fix/sweep1014-debug-backup D3a] proot/ matched no directory —
+             the rootfs lives at alpine-rootfs/ (RootfsManager.kt), tokenizer
+             at jieba/, user media offloads at media/. -->
+        <exclude domain="file" path="alpine-rootfs/" />
+        <exclude domain="file" path="jieba/" />
+        <exclude domain="file" path="media/" />
         <exclude domain="file" path="share_extension/" />
         <exclude domain="file" path="minis-global/" />
         <exclude domain="file" path="debug_server_token" />
@@ -28,7 +33,12 @@
         <exclude domain="file" path="logs/" />
         <exclude domain="file" path="sessions/" />
         <exclude domain="file" path="minis-sessions/" />
-        <exclude domain="file" path="proot/" />
+        <!-- [fix/sweep1014-debug-backup D3a] proot/ matched no directory —
+             the rootfs lives at alpine-rootfs/ (RootfsManager.kt), tokenizer
+             at jieba/, user media offloads at media/. -->
+        <exclude domain="file" path="alpine-rootfs/" />
+        <exclude domain="file" path="jieba/" />
+        <exclude domain="file" path="media/" />
         <exclude domain="file" path="share_extension/" />
         <exclude domain="file" path="minis-global/" />
         <exclude domain="file" path="debug_server_token" />

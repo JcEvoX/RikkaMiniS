@@ -25,9 +25,15 @@
     <exclude domain="file" path="sessions/" />
     <exclude domain="file" path="minis-sessions/" />
 
-    <!-- Exclude rootfs — the Alpine image is large and re-downloadable
-         from the app's "Reset Rootfs" action. -->
-    <exclude domain="file" path="proot/" />
+    <!-- Exclude the Linux sandbox — the Alpine rootfs image is large and
+         re-downloadable from the app's "Reset Rootfs" action, and the
+         tokenizer model (jieba) is re-extractable. The old `proot/` name
+         matched no directory (RootfsManager extracts to alpine-rootfs/),
+         so the biggest payload on disk silently counted against the 25MB
+         cloud quota. [fix/sweep1014-debug-backup D3a] -->
+    <exclude domain="file" path="alpine-rootfs/" />
+    <exclude domain="file" path="jieba/" />
+    <exclude domain="file" path="media/" />
 
     <!-- Exclude share staging directory — transient files copied from
          other apps, no backup value. -->
