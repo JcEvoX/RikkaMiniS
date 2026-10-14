@@ -73,18 +73,22 @@ ensure_git_identity() {
 
 ensure_askpass() {
   need_env GITHUB_TOKEN
-  ASKPASS="/var/minis/workspace/.git_askpass.sh"
-  if [ ! -f "$ASKPASS" ]; then
-    cat > "$ASKPASS" <<'EOF'
+  # [fix-R12 D9] ASKPASS used to live at /var/minis/workspace/.git_askpass.sh,
+  # which sits INSIDE the workspace the agent works in — `git add -A` (the
+  # default of the `add` subcommand below) from a repo under workspace would
+  # stage and commit it. Now: /tmp, per-pid, 0700, removed on exit, and
+  # regenerated every run so no stale copy is ever reused.
+  ASKPASS="/tmp/.minis_git_askpass_$$.sh"
+  cat > "$ASKPASS" <<'EOF'
 #!/bin/sh
 case "$1" in
   *Username*) echo "x-access-token" ;;
-  *Password*) echo "$GITHUB_TOKEN" ;;
+  *Password*) echo "${GITHUB_TOKEN:-}" ;;
   *) echo "" ;;
 esac
 EOF
-    chmod +x "$ASKPASS"
-  fi
+  chmod 700 "$ASKPASS"
+  trap 'rm -f "$ASKPASS"' EXIT
   export GIT_ASKPASS="$ASKPASS"
   export GIT_TERMINAL_PROMPT=0
 }

@@ -72,6 +72,27 @@ class MinisDocumentsProvider : DocumentsProvider() {
             Document.COLUMN_FLAGS,
             Document.COLUMN_SIZE,
         )
+
+        // [fix-R12 D7] Pure helpers for id normalization / read-only mapping /
+        // canonical prefix guard — unit-testable without a Provider context.
+
+        /** Normalized document id: trims whitespace and leading/trailing slashes. */
+        internal fun normalizeDocId(documentId: String): String =
+            documentId.trim().trim('/')
+
+        /** Read-only top-level subtree for a *normalized* id, or null if writable/root. */
+        internal fun readOnlyTopOf(clean: String): String? {
+            val top = clean.substringBefore('/')
+            return if (top in READ_ONLY_TOP) top else null
+        }
+
+        /**
+         * Canonical prefix guard: target must equal root or live under
+         * root + File.separator ("shared_evil" must not pass a "shared" check).
+         */
+        internal fun isWithinRoot(rootCanonical: String, targetCanonical: String): Boolean =
+            targetCanonical == rootCanonical ||
+                targetCanonical.startsWith(rootCanonical + File.separator)
     }
 
     override fun onCreate(): Boolean = true
@@ -83,20 +104,18 @@ class MinisDocumentsProvider : DocumentsProvider() {
 
     private fun resolveDoc(documentId: String): File {
         val root = providerRoot()
-        val clean = documentId.trim().trim('/')
+        val clean = normalizeDocId(documentId)
         if (clean.isEmpty()) return root
         if (clean.contains("..")) throw FileNotFoundException("Invalid path: $documentId")
-        // [audit-P3: resolveDoc canonicalize] This refuses literal ".." but does
-        // NOT canonicalize or guard against symlink traversal. It is safe ONLY
-        // while the provider is unregistered (Manifest has no
-        // MinisDocumentsProvider entry), so a symlink in shared/memory pointing
-        // outside providerRoot cannot be read. BEFORE wiring the Manifest
-        // registration below, replace `File(root, clean)` with a
-        // canonicalize + prefix guard (canonicalPath must start with
-        // providerRoot().canonicalPath + "/", else throw FileNotFoundException) —
-        // mirror PRootKernel.safeResolveWithin. Do not ship the registration
-        // without this.
-        return File(root, clean)
+        // [fix-R12 D7] Canonicalize + prefix guard. Previously this refused only a
+        // literal ".." ([audit-P3] left canonicalization as a pre-registration
+        // obligation); now a symlink or alias resolving outside providerRoot is
+        // rejected before any file access.
+        val target = File(root, clean)
+        if (!isWithinRoot(root.canonicalPath, target.canonicalPath)) {
+            throw FileNotFoundException("Path escapes provider root: $documentId")
+        }
+        return target
     }
 
     private fun documentIdFor(file: File): String {
@@ -108,10 +127,11 @@ class MinisDocumentsProvider : DocumentsProvider() {
     }
 
     private fun flagsFor(documentId: String, file: File): Int {
-        if (documentId.isEmpty()) return 0 // root is immutable through SAF
-        val topLevel = documentId.substringBefore('/')
-        val isTop = documentId.indexOf('/') < 0
-        if (topLevel in READ_ONLY_TOP) {
+        val clean = normalizeDocId(documentId)
+        if (clean.isEmpty()) return 0 // root is immutable through SAF
+        val readOnly = readOnlyTopOf(clean)
+        if (readOnly != null) {
+            val isTop = clean.indexOf('/') < 0
             return if (isTop && file.isDirectory) Document.FLAG_DIR_PREFERS_LAST_MODIFIED else 0
         }
         // `shared/` tree is writable.
@@ -187,15 +207,17 @@ class MinisDocumentsProvider : DocumentsProvider() {
     ): ParcelFileDescriptor {
         val file = resolveDoc(documentId)
         val parcelMode = ParcelFileDescriptor.parseMode(mode)
-        // Reject writes against the read-only subtrees even if the client
-        // ignored the flags cursor — belt + suspenders for AI skills.
+        // Reject writes against the root and the read-only subtrees even if the
+        // client ignored the flags cursor — belt + suspenders for AI skills.
+        // [fix-R12 D7] The old raw substringBefore('/') turned "/memory" into
+        // top "" and slipped past this check; the normalized id closes it.
         if (parcelMode and ParcelFileDescriptor.MODE_WRITE_ONLY != 0 ||
             parcelMode and ParcelFileDescriptor.MODE_READ_WRITE != 0
         ) {
-            val top = documentId.substringBefore('/')
-            if (top in READ_ONLY_TOP) {
-                throw UnsupportedOperationException("$top is read-only")
-            }
+            val clean = normalizeDocId(documentId)
+            if (clean.isEmpty()) throw UnsupportedOperationException("Provider root is read-only")
+            val top = readOnlyTopOf(clean)
+            if (top != null) throw UnsupportedOperationException("$top is read-only")
         }
         return ParcelFileDescriptor.open(file, parcelMode)
     }
@@ -206,8 +228,12 @@ class MinisDocumentsProvider : DocumentsProvider() {
         displayName: String,
     ): String {
         val parent = resolveDoc(parentDocumentId)
-        val top = parentDocumentId.substringBefore('/').ifEmpty { parentDocumentId }
-        if (top in READ_ONLY_TOP) throw UnsupportedOperationException("$top is read-only")
+        val clean = normalizeDocId(parentDocumentId)
+        // [fix-R12 D7] "/memory" normalized to "memory": the old raw
+        // substringBefore('/') made its top "" and skipped the read-only check.
+        if (clean.isEmpty()) throw UnsupportedOperationException("Provider root is read-only")
+        val top = readOnlyTopOf(clean)
+        if (top != null) throw UnsupportedOperationException("$top is read-only")
         val safeName = displayName.replace("/", "_").replace("..", "_")
         val created = File(parent, safeName)
         val ok = if (mimeType == Document.MIME_TYPE_DIR) created.mkdirs() else created.createNewFile()
@@ -217,15 +243,22 @@ class MinisDocumentsProvider : DocumentsProvider() {
 
     override fun deleteDocument(documentId: String) {
         val file = resolveDoc(documentId)
-        val top = documentId.substringBefore('/')
-        if (top in READ_ONLY_TOP) throw UnsupportedOperationException("$top is read-only")
+        val clean = normalizeDocId(documentId)
+        // [fix-R12 D7] "" used to yield top "" → fell through to
+        // deleteRecursively() on the provider root itself; now explicitly refused.
+        if (clean.isEmpty()) throw UnsupportedOperationException("Provider root cannot be deleted")
+        val top = readOnlyTopOf(clean)
+        if (top != null) throw UnsupportedOperationException("$top is read-only")
         if (!file.deleteRecursively()) throw FileNotFoundException("Failed to delete $documentId")
     }
 
     override fun renameDocument(documentId: String, displayName: String): String {
         val file = resolveDoc(documentId)
-        val top = documentId.substringBefore('/')
-        if (top in READ_ONLY_TOP) throw UnsupportedOperationException("$top is read-only")
+        val clean = normalizeDocId(documentId)
+        // [fix-R12 D7] Same empty/leading-slash hole as deleteDocument.
+        if (clean.isEmpty()) throw UnsupportedOperationException("Provider root cannot be renamed")
+        val top = readOnlyTopOf(clean)
+        if (top != null) throw UnsupportedOperationException("$top is read-only")
         val safe = displayName.replace("/", "_").replace("..", "_")
         val target = File(file.parentFile, safe)
         if (!file.renameTo(target)) throw FileNotFoundException("Failed to rename $documentId")

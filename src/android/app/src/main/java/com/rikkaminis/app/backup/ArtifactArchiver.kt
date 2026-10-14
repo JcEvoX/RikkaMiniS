@@ -95,7 +95,10 @@ object ArtifactArchiver {
                 val rel = if (slash > 0) name.substring(slash + 1) else name
                 if (rel.isEmpty() || rel.contains("..")) continue
                 val target = File(destDir, rel)
-                if (!target.canonicalPath.startsWith(destDir.canonicalPath)) continue
+                // [fix-R12 D8] The old `startsWith(destDir.canonicalPath)` let a
+                // sibling like "shared_evil/x" pass a "shared" check. Require the
+                // canonical separator boundary (same shape as SkillRepository).
+                if (!isUnderBase(destDir.canonicalPath, target.canonicalPath)) continue
                 target.parentFile?.mkdirs()
                 zf.getInputStream(entry).use { input ->
                     target.outputStream().use { output -> input.copyTo(output) }
@@ -109,4 +112,12 @@ object ArtifactArchiver {
     /** Legacy single-destination extraction (used by tests / callers with one root). */
     fun extractZip(zipFile: File, destDir: File): Int =
         extractZipByPrefix(zipFile, emptyMap(), destDir)
+
+    /**
+     * [fix-R12 D8] Canonical prefix-boundary guard: target must equal base or
+     * live under base + File.separator ("shared_evil" must not pass a "shared" check).
+     */
+    internal fun isUnderBase(baseCanonical: String, targetCanonical: String): Boolean =
+        targetCanonical == baseCanonical ||
+            targetCanonical.startsWith(baseCanonical + File.separator)
 }
