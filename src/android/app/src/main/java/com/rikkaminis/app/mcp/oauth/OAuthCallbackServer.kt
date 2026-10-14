@@ -54,6 +54,13 @@ class OAuthCallbackServer(
                 }
                 if (!bound) {
                     Log.e(TAG, "All ports unavailable: $portsToTry")
+                    // [sweep1014-D5a] Every port failed to bind: shut the server
+                    // down (running=false + socket cleanup) and fire
+                    // onExternalCancel so the caller's in-flight wait resumes
+                    // immediately instead of hanging until the 5-minute OAuth
+                    // timeout. stop() consumes the callback once, so a later
+                    // stop() never double-fires.
+                    stop()
                     return@Thread
                 }
                 Log.d(TAG, "Listening on port $boundPort")
@@ -117,6 +124,14 @@ class OAuthCallbackServer(
                             socket.close()
 
                             if (code != null) {
+                                // [sweep1014-D5b] Consume onExternalCancel before
+                                // stopping: stop() here is called by the server
+                                // itself (the success path), so the onCode caller
+                                // never gets a chance to null it out — without
+                                // this a successful redirect also fires a phantom
+                                // cancel. External stop() calls are unaffected
+                                // and still fire onExternalCancel.
+                                onExternalCancel = null
                                 onCode(code, state)
                                 stop()
                                 return@Thread
