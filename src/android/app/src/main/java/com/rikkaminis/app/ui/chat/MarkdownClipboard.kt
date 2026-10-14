@@ -21,6 +21,38 @@ import android.content.Context
  */
 object MarkdownClipboard {
 
+    // ─── [sweep1014-P11] compiled-once patterns ───────────────────────────
+    // Every pattern below used to be written as `Regex(...)` at the point of
+    // use, so a line-by-line walk (and every inline span inside it) paid a
+    // fresh Pattern.compile — copying a long answer ran hundreds of them on
+    // the UI thread. Hoisted verbatim: not one character of any pattern
+    // changed, only when it is compiled.
+    private val HEADING_LINE = Regex("^(#{1,6})\\s+(.*)$")
+    private val FENCE_LINE = Regex("^(```|~~~)(.*)$")
+    private val UNORDERED_ITEM = Regex("^([-*+])\\s+(.*)$")
+    private val ORDERED_ITEM = Regex("^(\\d+)\\.\\s+(.*)$")
+    private val HORIZONTAL_RULE = Regex("^(-{3,}|\\*{3,}|_{3,})$")
+    private val TABLE_SEPARATOR = Regex("^\\|?\\s*:?-{3,}.*$")
+
+    private val INLINE_CODE = Regex("`([^`]+)`")
+    private val IMAGE_PLAIN = Regex("!\\[([^\\]]*)\\]\\([^)]*\\)")
+    private val IMAGE_HTML = Regex("!\\[([^\\]]*)\\]\\(([^)]+)\\)")
+    private val LINK = Regex("\\[([^\\]]+)\\]\\(([^)]+)\\)")
+
+    private val BOLD_ITALIC_STAR = Regex("\\*\\*\\*(.+?)\\*\\*\\*")
+    private val BOLD_ITALIC_UNDERSCORE = Regex("___(.+?)___")
+    private val BOLD_STAR = Regex("\\*\\*(.+?)\\*\\*")
+    private val BOLD_UNDERSCORE = Regex("__(.+?)__")
+    private val ITALIC_STAR = Regex("(?<!\\*)\\*(?!\\*)([^*\\n]+)\\*")
+    private val ITALIC_UNDERSCORE = Regex("(?<!_)_(?!_)([^_\\n]+)_")
+    private val STRIKETHROUGH = Regex("~~(.+?)~~")
+
+    // Code-span sentinel. Value-identical to the previous inline literal
+    // (which held two raw NUL bytes in this source file); written as escapes
+    // here so the file stays plain UTF-8 text.
+    private val CODE_PLACEHOLDER: String = "\u0000CODE\u0000"
+    private val CODE_SPAN = Regex(CODE_PLACEHOLDER + "(\\d+)" + CODE_PLACEHOLDER)
+
     fun copyPlain(context: Context, markdown: String, label: String = "Message") {
         val plain = markdownToPlainText(markdown)
         clipboard(context).setPrimaryClip(ClipData.newPlainText(label, plain))
@@ -65,7 +97,7 @@ object MarkdownClipboard {
                 i++; continue
             }
             // Heading
-            val heading = Regex("^(#{1,6})\\s+(.*)$").find(trimmed)
+            val heading = HEADING_LINE.find(trimmed)
             if (heading != null) {
                 out.append(stripInline(heading.groupValues[2])).append('\n')
                 i++; continue
@@ -76,24 +108,24 @@ object MarkdownClipboard {
                 i++; continue
             }
             // Unordered list
-            val ul = Regex("^([-*+])\\s+(.*)$").find(trimmed)
+            val ul = UNORDERED_ITEM.find(trimmed)
             if (ul != null) {
                 out.append("• ").append(stripInline(ul.groupValues[2])).append('\n')
                 i++; continue
             }
             // Ordered list
-            val ol = Regex("^(\\d+)\\.\\s+(.*)$").find(trimmed)
+            val ol = ORDERED_ITEM.find(trimmed)
             if (ol != null) {
                 out.append(ol.groupValues[1]).append(". ")
                     .append(stripInline(ol.groupValues[2])).append('\n')
                 i++; continue
             }
             // Horizontal rule
-            if (Regex("^(-{3,}|\\*{3,}|_{3,})$").matches(trimmed)) {
+            if (HORIZONTAL_RULE.matches(trimmed)) {
                 out.append('\n'); i++; continue
             }
             // Table separator row (|---|---|): drop entirely.
-            if (Regex("^\\|?\\s*:?-{3,}.*$").matches(trimmed) && trimmed.contains('-')) {
+            if (TABLE_SEPARATOR.matches(trimmed) && trimmed.contains('-')) {
                 i++; continue
             }
             // Generic line — strip inline markers
@@ -127,7 +159,7 @@ object MarkdownClipboard {
             val line = lines[i]
             val trimmed = line.trimStart()
             // Fenced code
-            val fenceMatch = Regex("^(```|~~~)(.*)$").find(trimmed)
+            val fenceMatch = FENCE_LINE.find(trimmed)
             if (fenceMatch != null) {
                 if (!inFence) {
                     closeList()
@@ -153,7 +185,7 @@ object MarkdownClipboard {
                 i++; continue
             }
             // Heading
-            val heading = Regex("^(#{1,6})\\s+(.*)$").find(trimmed)
+            val heading = HEADING_LINE.find(trimmed)
             if (heading != null) {
                 closeList()
                 val level = heading.groupValues[1].length
@@ -171,18 +203,18 @@ object MarkdownClipboard {
                 i++; continue
             }
             // Horizontal rule
-            if (Regex("^(-{3,}|\\*{3,}|_{3,})$").matches(trimmed)) {
+            if (HORIZONTAL_RULE.matches(trimmed)) {
                 closeList(); sb.append("<hr/>"); i++; continue
             }
             // Unordered list
-            val ul = Regex("^([-*+])\\s+(.*)$").find(trimmed)
+            val ul = UNORDERED_ITEM.find(trimmed)
             if (ul != null) {
                 if (listType != "ul") { closeList(); sb.append("<ul>"); listType = "ul" }
                 sb.append("<li>").append(inlineToHtml(ul.groupValues[2])).append("</li>")
                 i++; continue
             }
             // Ordered list
-            val ol = Regex("^(\\d+)\\.\\s+(.*)$").find(trimmed)
+            val ol = ORDERED_ITEM.find(trimmed)
             if (ol != null) {
                 if (listType != "ol") { closeList(); sb.append("<ol>"); listType = "ol" }
                 sb.append("<li>").append(inlineToHtml(ol.groupValues[2])).append("</li>")
@@ -205,57 +237,56 @@ object MarkdownClipboard {
     private fun stripInline(s: String): String {
         var t = s
         // Images: ![alt](url) → alt
-        t = Regex("!\\[([^\\]]*)\\]\\([^)]*\\)").replace(t, "$1")
+        t = IMAGE_PLAIN.replace(t, "$1")
         // Links: [text](url) → text
-        t = Regex("\\[([^\\]]+)\\]\\(([^)]+)\\)").replace(t, "$1")
+        t = LINK.replace(t, "$1")
         // Inline code: `code` → code
-        t = Regex("`([^`]+)`").replace(t, "$1")
+        t = INLINE_CODE.replace(t, "$1")
         // Bold/italic/strike — order matters: longest delimiter first.
-        t = Regex("\\*\\*\\*(.+?)\\*\\*\\*").replace(t, "$1")
-        t = Regex("___(.+?)___").replace(t, "$1")
-        t = Regex("\\*\\*(.+?)\\*\\*").replace(t, "$1")
-        t = Regex("__(.+?)__").replace(t, "$1")
-        t = Regex("(?<!\\*)\\*(?!\\*)([^*\\n]+)\\*").replace(t, "$1")
-        t = Regex("(?<!_)_(?!_)([^_\\n]+)_").replace(t, "$1")
-        t = Regex("~~(.+?)~~").replace(t, "$1")
+        t = BOLD_ITALIC_STAR.replace(t, "$1")
+        t = BOLD_ITALIC_UNDERSCORE.replace(t, "$1")
+        t = BOLD_STAR.replace(t, "$1")
+        t = BOLD_UNDERSCORE.replace(t, "$1")
+        t = ITALIC_STAR.replace(t, "$1")
+        t = ITALIC_UNDERSCORE.replace(t, "$1")
+        t = STRIKETHROUGH.replace(t, "$1")
         return t
     }
 
     /** Inline markdown → HTML, escaping non-markdown characters. */
     private fun inlineToHtml(s: String): String {
         // Pull code spans out first so their contents aren't re-escaped/processed.
-        val codePlaceholder = " CODE "
         val codes = mutableListOf<String>()
-        var work = Regex("`([^`]+)`").replace(s) { m ->
+        var work = INLINE_CODE.replace(s) { m ->
             codes.add(m.groupValues[1])
-            "$codePlaceholder${codes.size - 1}$codePlaceholder"
+            "${CODE_PLACEHOLDER}${codes.size - 1}${CODE_PLACEHOLDER}"
         }
         work = escapeHtml(work)
         // Images: ![alt](url)
-        work = Regex("!\\[([^\\]]*)\\]\\(([^)]+)\\)").replace(work) { m ->
+        work = IMAGE_HTML.replace(work) { m ->
             "<img alt=\"${m.groupValues[1]}\" src=\"${m.groupValues[2]}\"/>"
         }
         // Links: [text](url)
-        work = Regex("\\[([^\\]]+)\\]\\(([^)]+)\\)").replace(work) { m ->
+        work = LINK.replace(work) { m ->
             "<a href=\"${m.groupValues[2]}\">${m.groupValues[1]}</a>"
         }
         // Bold ***x*** / ___x___
-        work = Regex("\\*\\*\\*(.+?)\\*\\*\\*").replace(work, "<strong><em>$1</em></strong>")
-        work = Regex("___(.+?)___").replace(work, "<strong><em>$1</em></strong>")
+        work = BOLD_ITALIC_STAR.replace(work, "<strong><em>$1</em></strong>")
+        work = BOLD_ITALIC_UNDERSCORE.replace(work, "<strong><em>$1</em></strong>")
         // Bold **x**
-        work = Regex("\\*\\*(.+?)\\*\\*").replace(work, "<strong>$1</strong>")
-        work = Regex("__(.+?)__").replace(work, "<strong>$1</strong>")
+        work = BOLD_STAR.replace(work, "<strong>$1</strong>")
+        work = BOLD_UNDERSCORE.replace(work, "<strong>$1</strong>")
         // Italic *x* / _x_
-        work = Regex("(?<!\\*)\\*(?!\\*)([^*\\n]+)\\*").replace(work, "<em>$1</em>")
-        work = Regex("(?<!_)_(?!_)([^_\\n]+)_").replace(work, "<em>$1</em>")
+        work = ITALIC_STAR.replace(work, "<em>$1</em>")
+        work = ITALIC_UNDERSCORE.replace(work, "<em>$1</em>")
         // Strikethrough ~~x~~
-        work = Regex("~~(.+?)~~").replace(work, "<del>$1</del>")
+        work = STRIKETHROUGH.replace(work, "<del>$1</del>")
         // Restore code spans (and HTML-escape their inside)
         // [audit-0917] getOrNull, not codes[i]: the placeholder is the literal
         // "CODE<n>CODE", so pasted text that happens to contain "CODE0CODE"
         // (or any CODE<n>CODE) matched here and threw IndexOutOfBoundsException
         // / substituted the wrong span. Out-of-range matches are left verbatim.
-        work = Regex("$codePlaceholder(\\d+)$codePlaceholder").replace(work) { m ->
+        work = CODE_SPAN.replace(work) { m ->
             val idx = m.groupValues[1].toIntOrNull()
             val code = idx?.let { codes.getOrNull(it) }
             if (code == null) m.value else "<code>${escapeHtml(code)}</code>"

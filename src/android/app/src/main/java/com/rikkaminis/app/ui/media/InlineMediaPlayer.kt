@@ -87,6 +87,12 @@ fun InlineAudioPlayer(
     var duration by remember { mutableStateOf("0:00") }
     var position by remember { mutableStateOf("0:00") }
     var error by remember { mutableStateOf<String?>(null) }
+    // [sweep1014-B33] prepareAsync() means there is a short window where the
+    // player is still Preparing and start() would throw. A tap landing in that
+    // window is queued here and drained by the prepared listener, so a tap
+    // still starts playback exactly like the old blocking prepare() did.
+    var prepared by remember(filePath) { mutableStateOf(false) }
+    var pendingPlay by remember(filePath) { mutableStateOf(false) }
 
     val mediaPlayer = remember(filePath) { MediaPlayer() }
 
@@ -99,13 +105,27 @@ fun InlineAudioPlayer(
                 // Try as content URI
                 mediaPlayer.setDataSource(context, Uri.parse(filePath))
             }
-            mediaPlayer.prepare()
-            duration = formatDuration(mediaPlayer.duration)
-
             mediaPlayer.setOnCompletionListener {
                 isPlaying = false
                 progress = 0f
                 position = "0:00"
+            }
+            // [sweep1014-B33] Duration is only known once the player is
+            // prepared, and preparing must not block the main thread: the old
+            // synchronous prepare() stalled composition until the decoder had
+            // opened the track (and an unreadable/corrupt source blocked the
+            // UI thread for the whole timeout). prepareAsync() + this listener
+            // keeps the very same observable behaviour, just off the UI thread.
+            mediaPlayer.setOnPreparedListener { mp ->
+                duration = formatDuration(mp.duration)
+                prepared = true
+                if (pendingPlay) {
+                    pendingPlay = false
+                    try {
+                        mp.start()
+                        isPlaying = true
+                    } catch (_: Exception) {}
+                }
             }
             // [audit-0909 T10-M6] Surface playback errors explicitly. Without
             // this the player sat in the Error state while the UI still showed
@@ -117,13 +137,20 @@ fun InlineAudioPlayer(
                 error = "MediaPlayer error ($what/$extra)"
                 true
             }
+            mediaPlayer.prepareAsync()
         } catch (e: Exception) {
             error = e.message
         }
 
         onDispose {
             try {
+                // A player still Preparing (prepareAsync pending) can't be
+                // stopped — release() alone is the terminating path; calling
+                // stop() there throws IllegalStateException, which onDispose
+                // would swallow but leave the player unreleased.
                 if (mediaPlayer.isPlaying) mediaPlayer.stop()
+            } catch (_: Exception) {}
+            try {
                 mediaPlayer.release()
             } catch (_: Exception) {}
         }
@@ -170,17 +197,24 @@ fun InlineAudioPlayer(
                             // state — pause()/start() then throw
                             // IllegalStateException, which crashed the app
                             // because this callback had no guard.
-                            try {
-                                if (isPlaying) {
-                                    mediaPlayer.pause()
+                            // [sweep1014-B33] Still-Preparing taps are queued
+                            // (see pendingPlay) rather than letting start()
+                            // throw inside the (sub-second) prepare window.
+                            if (!prepared) {
+                                pendingPlay = true
+                            } else {
+                                try {
+                                    if (isPlaying) {
+                                        mediaPlayer.pause()
+                                        isPlaying = false
+                                    } else {
+                                        mediaPlayer.start()
+                                        isPlaying = true
+                                    }
+                                } catch (e: Exception) {
                                     isPlaying = false
-                                } else {
-                                    mediaPlayer.start()
-                                    isPlaying = true
+                                    error = e.message ?: "Playback failed"
                                 }
-                            } catch (e: Exception) {
-                                isPlaying = false
-                                error = e.message ?: "Playback failed"
                             }
                         },
                         modifier = Modifier
@@ -263,6 +297,12 @@ fun InlineVideoPlayer(
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
+    // [sweep1014-B33] Hoisted out of the AndroidView factory so the release
+    // hook can reach it. Before, the controller was created inline and there
+    // was no release hook at all: scrolling the message out of view left the
+    // VideoView playing off-screen and the controller's window attached
+    // (WindowLeaked).
+    val mediaController = remember(filePath) { android.widget.MediaController(context) }
 
     Surface(
         modifier = modifier
@@ -278,25 +318,33 @@ fun InlineVideoPlayer(
                     setVideoURI(uri)
 
                     // Add basic media controller
-                    val controller = android.widget.MediaController(ctx)
-                    controller.setAnchorView(this)
-                    setMediaController(controller)
+                    mediaController.setAnchorView(this)
+                    setMediaController(mediaController)
 
                     setOnPreparedListener { mp ->
-                        // Auto-size to video dimensions
+                        // Auto-size to video dimensions. [sweep1014-B33] The
+                        // old code read this view's `width` right here, but
+                        // onPrepared fires from the player's callback before
+                        // the view has been measured → width == 0 → height
+                        // collapsed to the coerceIn lower bound, locking every
+                        // video to 100px. post{} defers the math until after
+                        // the first layout pass, when `width` is the measured
+                        // width of the 240dp placeholder row.
                         val videoWidth = mp.videoWidth
                         val videoHeight = mp.videoHeight
                         if (videoWidth > 0 && videoHeight > 0) {
                             val ratio = videoHeight.toFloat() / videoWidth
-                            layoutParams = layoutParams.apply {
-                                height = (width * ratio).toInt().coerceIn(100, 800)
+                            post {
+                                layoutParams = layoutParams.apply {
+                                    height = (width * ratio).toInt().coerceIn(100, 800)
+                                }
                             }
                         }
                         // Auto-play and surface the controller so the user sees
                         // a live first frame instead of a black surface waiting
                         // for an extra tap.
                         start()
-                        controller.show(0)
+                        mediaController.show(0)
                     }
                     setOnErrorListener { _, what, extra ->
                         android.util.Log.w("InlineVideoPlayer",
@@ -304,6 +352,13 @@ fun InlineVideoPlayer(
                         false
                     }
                 }
+            },
+            // [sweep1014-B33] Terminating path for the inline player: stop the
+            // track and detach the controller window when the composable
+            // leaves composition (scroll-out, session switch, navigation).
+            onRelease = { view ->
+                mediaController.hide()
+                view.stopPlayback()
             },
             modifier = Modifier
                 .fillMaxWidth()
