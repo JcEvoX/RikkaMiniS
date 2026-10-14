@@ -31,10 +31,16 @@ object MCPOAuthStore {
     private var prefsRef: SharedPreferences? = null
 
     // [sweep1014-D4a] Server names are joined into file paths (bridge file,
-    // secret handoff). Whitelist: letters, digits, '.', '_', '-'; rejects
-    // empty, overlong, '/', and the literal "..". Refuse-instead-of-guess —
-    // never sanitize by truncation.
-    private val SERVER_NAME_RE = Regex("^[A-Za-z0-9._-]+$")
+    // secret handoff). [rv1014-C4] Path safety only requires rejecting
+    // separators, traversal and control characters — spaces / CJK are legal
+    // filenames (ext4/f2fs), and the app's own create form allows them: the
+    // old allowlist silently severed OAuth for exactly those servers (bridge
+    // never materialized, no UI hint, rename locked in edit mode). Denylist:
+    // reject empty, overlong, '/', '\', '..', and control characters;
+    // everything else passes verbatim — no encoding, because the in-guest CLI
+    // joins the raw name too, so identity is the only cross-language-safe
+    // mapping. Refuse-instead-of-guess — never sanitize by truncation.
+    private val SERVER_NAME_BAD_RE = Regex("[/\\\\\\p{Cntrl}]")
     private const val SERVER_NAME_MAX = 128
 
     /** Returns [server] when it is a safe path segment, else null. */
@@ -42,7 +48,7 @@ object MCPOAuthStore {
         if (server.isNotEmpty() &&
             server.length <= SERVER_NAME_MAX &&
             server != ".." &&
-            SERVER_NAME_RE.matches(server)
+            !SERVER_NAME_BAD_RE.containsMatchIn(server)
         ) server else null
 
     private fun prefs(context: Context): SharedPreferences =
@@ -167,22 +173,28 @@ object MCPOAuthStore {
         File(File(context.filesDir, "minis-global/mcp-servers"), "oauth")
 
     private fun bridgeFile(context: Context, server: String): File {
-        // [sweep1014-D4a] Refuse-instead-of-guess: an unsanitized name never
+        // [sweep1014-D4a] Refuse-instead-of-guess: an unsafe name never
         // reaches the path join. materializeBridgeFile catches this and logs
         // a clear warning; deleteBridgeFile's runCatching no-ops (nothing was
         // ever written under an invalid name).
         val safe = validateServerName(server)
             ?: throw IllegalArgumentException(
-                "server name is not a safe path segment (allowed: letters, digits, '.', '_', '-'): '$server'")
+                "server name is not a safe path segment (no '/', '\\', control chars, not '..'): '$server'")
         return File(bridgeDir(context), "$safe.json")
     }
 
     /** Write [payload] to the in-guest token bridge (atomic, 0600, best-effort). */
     fun materializeBridgeFile(context: Context, server: String, payload: BridgePayload) {
+        // [rv1014-C3] Validate once up front so the failure-cleanup below can
+        // use the SAME validated name — the catch branch was the only place
+        // still joining the raw (possibly unsafe) name into a path (D4a
+        // covered the main path but missed its own cleanup).
+        val safe = validateServerName(server)
         try {
-            val safe = validateServerName(server)
-                ?: throw IllegalArgumentException(
-                    "server name is not a safe path segment (allowed: letters, digits, '.', '_', '-'): '$server'")
+            if (safe == null) {
+                throw IllegalArgumentException(
+                    "server name is not a safe path segment (no '/', '\\', control chars, not '..'): '$server'")
+            }
             val dir = bridgeDir(context).apply { mkdirs() }
             val json = JSONObject().apply {
                 put("access_token", payload.accessToken)
@@ -214,7 +226,9 @@ object MCPOAuthStore {
         } catch (t: Throwable) {
             // [audit-0917] tmp holds live bearer tokens — never leave it behind
             // on a failure (e.g. the rename fallback's readText/writeText threw).
-            runCatching { File(bridgeDir(context), "$server.json.tmp").delete() }
+            // [rv1014-C3] clean up under the validated name; safe==null means
+            // nothing was ever created (throw precedes tmp), cleanup no-ops.
+            runCatching { safe?.let { File(bridgeDir(context), "$it.json.tmp").delete() } }
             AppLogger.warning(TAG, "failed to materialize OAuth bridge for '$server': ${t.message}")
         }
     }

@@ -358,6 +358,18 @@ def cmd_build():
     entries = embed_texts(entries, client)
     print(f"  成功: {len(entries)} 条（后端 {_ACTIVE_BACKEND}）")
 
+    # [rv1014-C2] 0 条守卫：HF 部分批成功后断（402/限流）+ CF 后端不可用 →
+    # embed 全失败、entries 过滤成 []。无条件写盘会把本地索引清零、远端
+    # dataset 被空 memory.jsonl 覆盖（数据破坏）。中止写入/上传，旧索引保持
+    # 不变。当前无"显式清空"入口，守卫恒拒绝 0 条（安全方向）。
+    if not entries:
+        print(
+            "❌ 0 条成功向量（embed 全失败或提取为空）——中止：不写本地索引、"
+            "不上传，旧索引保持不变。请检查嵌入后端凭据（CF_ACCOUNT_ID / "
+            "CF_API_TOKEN）或网络后重试。",
+            file=sys.stderr)
+        sys.exit(1)
+
     hf_username()
     print(f"☁️  上传到 HF Dataset: {DATASET}")
     uploaded = upload_to_hf(entries)
@@ -407,6 +419,15 @@ def cmd_build_incremental():
     good = [e for e in entries if e.get("embedding")]
     if len(good) < len(entries):
         print(f"  ⚠️ {len(entries)-len(good)} 条无向量，已丢弃")
+
+    # [rv1014-C2] 同款 0 条守卫：全部复用失败且新嵌入全失败 → good=[]，无条
+    # 件写盘会把旧索引清零、远端 dataset 被空数据覆盖。中止写入/上传。
+    if not good:
+        print(
+            "❌ 0 条有效向量（复用失败且新嵌入全失败）——中止：不写本地索引、"
+            "不上传，旧索引保持不变。请检查嵌入后端凭据或网络后重试。",
+            file=sys.stderr)
+        sys.exit(1)
 
     uploaded = upload_to_hf(good)
     if uploaded:

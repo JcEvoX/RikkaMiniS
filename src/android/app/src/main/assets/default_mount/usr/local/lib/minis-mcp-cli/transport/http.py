@@ -29,23 +29,29 @@ TIMEOUT_SECONDS = 300  # 5 min
 _ENV_RE = re.compile(r"\$\$?\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
 
 
-SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+SERVER_NAME_BAD_RE = re.compile(r"[/\\\x00-\x1f\x7f]")
 SERVER_NAME_MAX = 128
 
 
 def validate_server_name(name, field="server name"):
     """[sweep1014-D4a] Refuse-instead-of-guess guard for names that are joined
-    into file paths (oauth bridge / secret handoff). Whitelist: letters,
-    digits, '.', '_', '-'; rejects empty, overlong, '/', and the literal '..'.
-    Raises MCPError(PARSE_ERROR) naming the offending field; never truncates."""
+    into file paths (oauth bridge / secret handoff).
+
+    [rv1014-C4] Denylist aligned with the native side (MCPOAuthStore): reject
+    empty, overlong, '/', '\', '..', and control characters — spaces / CJK
+    pass verbatim. The app's own create form allows those names, and they are
+    legal filenames (ext4/f2fs); the old allowlist silently severed OAuth for
+    exactly those servers. No encoding: the native side joins the raw name
+    too, so identity is the only cross-language-safe mapping. Raises
+    MCPError(PARSE_ERROR) naming the offending field; never truncates."""
     if not isinstance(name, str) or not name:
         raise MCPError("PARSE_ERROR", "%s must not be empty" % field)
     if len(name) > SERVER_NAME_MAX:
         raise MCPError("PARSE_ERROR", "%s too long (max %d chars)" % (field, SERVER_NAME_MAX))
-    if name == ".." or not SERVER_NAME_RE.match(name):
+    if name == ".." or SERVER_NAME_BAD_RE.search(name):
         raise MCPError(
             "PARSE_ERROR",
-            "%s contains invalid characters (allowed: letters, digits, '.', '_', '-'): %r"
+            "%s contains invalid path characters (no '/', '\\', control chars, not '..'): %r"
             % (field, name))
     return name
 
