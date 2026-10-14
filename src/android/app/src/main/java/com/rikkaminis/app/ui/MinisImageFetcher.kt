@@ -9,6 +9,7 @@ import coil.fetch.SourceResult
 import coil.key.Keyer
 import coil.request.Options
 import com.rikkaminis.app.sandbox.PRootKernel
+import com.rikkaminis.app.ui.chat.decodeUriPath
 import okio.buffer
 import okio.source
 import java.io.File
@@ -30,8 +31,11 @@ class MinisImageFetcher(
     override suspend fun fetch(): FetchResult {
         // Strip minis:// prefix, drop any ?query, and percent-decode so
         // Chinese/emoji/space filenames resolve to the actual on-disk file.
+        // [sweep1014-B6] URI path semantics (decodes %XX only, keeps '+');
+        // never throws — a filename like `c++_primer.md` no longer decodes
+        // to `c  _primer.md`.
         val stripped = uri.removePrefix("minis://").substringBefore('?')
-        val decoded = java.net.URLDecoder.decode(stripped, "UTF-8")
+        val decoded = decodeUriPath(stripped)
         val linuxPath = "/var/minis/$decoded"
         val hostFile = PRootKernel.resolveHostPath(linuxPath)
             ?: throw IllegalArgumentException("Cannot resolve path: $linuxPath")
@@ -126,11 +130,7 @@ class MinisImageFetcher(
             // the chat renderer hands Coil an already-resolved File and only
             // falls back to the raw `minis://` URL when that lookup failed.
             val stripped = uri.removePrefix("minis://").substringBefore('?')
-            val decoded = try {
-                java.net.URLDecoder.decode(stripped, "UTF-8")
-            } catch (_: Throwable) {
-                stripped
-            }
+            val decoded = decodeUriPath(stripped)
             val linuxPath = "/var/minis/$decoded"
             val mtime = try {
                 PRootKernel.resolveHostPath(linuxPath)?.lastModified() ?: 0L
