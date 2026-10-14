@@ -50,6 +50,9 @@ need_env GITHUB_TOKEN
 [ -n "$ref" ] || { printf -- '--ref required (branch)\n' >&2; exit 64; }
 
 owner="${repo%%/*}"; name="${repo#*/}"
+# [fix-R12 D9] Percent-encode the branch for query params — a raw `${ref}`
+# truncates the URL when the branch contains '#', '&' or space.
+enc_ref=$(printf '%s' "$ref" | python3 -c 'import sys,urllib.parse; sys.stdout.write(urllib.parse.quote(sys.argv[1], safe=""))' "$ref")
 
 _api() { # _api <url>  → python fetches JSON body, prints to stdout
   U="$1" python3 -c 'import os,sys,urllib.request,urllib.error
@@ -86,7 +89,7 @@ if [ "$dispatch" -eq 1 ]; then
   [ -n "$wf" ] || { printf -- '--workflow required when --no-dispatch is not set\n' >&2; exit 64; }
   should_dispatch=1
   if [ -n "$expect" ]; then
-    probe_url="https://api.github.com/repos/${owner}/${name}/actions/runs?per_page=15&branch=${ref}"
+    probe_url="https://api.github.com/repos/${owner}/${name}/actions/runs?per_page=15&branch=${enc_ref}"
     probe_doc="$(_api "$probe_url")" || exit 1
     active_on_head=$(printf '%s' "$probe_doc" | python3 -c 'import json,sys
 d=json.load(sys.stdin); exp=sys.argv[1]
@@ -115,7 +118,7 @@ while :; do
     exit 2
   fi
 
-  url="https://api.github.com/repos/${owner}/${name}/actions/runs?per_page=15&branch=${ref}"
+  url="https://api.github.com/repos/${owner}/${name}/actions/runs?per_page=15&branch=${enc_ref}"
   doc="$(_api "$url")" || { exit 1; }
   # Pick: newest completed/in_progress/queued run; prefer matching --expect head_sha.
   runid=""; head=""; conclusion=""; status=""
