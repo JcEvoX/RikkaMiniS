@@ -25,7 +25,7 @@ import java.io.File
  * Subcommands:
  *   minis-model-use list [--provider <name>] [--modality <m>]
  *   minis-model-use search <query> [--provider <name>] [--modality <m>]
- *   minis-model-use run --model <id_or_name> [--input <path>] [--output <path>]
+ *   minis-model-use run --model <id_or_name> [prompt] [--input <path>] [--output <path>]
  *                       [--system <text>] [--system-file <path>]
  *                       [--max-tokens N] [--temperature F]
  *
@@ -188,7 +188,7 @@ class ModelUseOffloadHandler(
         // System prompt: --system takes precedence over --system-file
         // [audit-0917] A --system-file that cannot be read is an explicit error,
         // not a silent system-prompt drop (mirrors the --input branch below).
-        val sysFile = args.get("system-file")?.let { readLinuxPath(it, request.sessionId) }
+        val sysFile = args.get("system-file")?.let { readLinuxPath(it, request.sessionId, request.cwd) }
         if (args.get("system-file") != null && sysFile == null) {
             return NativeOffloadResult(
                 2,
@@ -197,14 +197,36 @@ class ModelUseOffloadHandler(
         }
         val explicitSystem = args.get("system") ?: sysFile
 
-        // Parse input messages: --input <path> | stdin
+        // Parse input messages: positional prompt | --input <path>
+        // [B14-fix-r14] stdin was NEVER a real channel: the native_offload
+        // protocol forwards argv/env/cwd only (no stdin pipe — the handler
+        // runs in-process inside the app, not in the shell), so a piped
+        // call like `echo 'q' | minis-model-use run --model X` used to
+        // silently send an empty-messages request (HTTP 400). The piped
+        // usage was documented in HELP/agent-prompt but never worked. Fix:
+        // accept the prompt as a positional argument (same plain-text →
+        // single user message path stdin would have taken), and fail fast
+        // with a clear message instead of sending an empty request.
+        val positionalPrompt = args.positional.getOrNull(1)
         val inputText = when {
-            args.get("input") != null -> readLinuxPath(args.get("input")!!, request.sessionId)
+            args.get("input") != null -> readLinuxPath(args.get("input")!!, request.sessionId, request.cwd)
                 ?: return NativeOffloadResult(
                     2,
                     "minis-model-use run: cannot read --input '${args.get("input")}'\n",
                 )
-            else -> ""
+            positionalPrompt != null -> positionalPrompt
+            else -> return NativeOffloadResult(
+                2,
+                JSONObject().put("error", "missing_input")
+                    .put(
+                        "message",
+                        "no input: minis-model-use does not read stdin (the native_offload protocol " +
+                            "has no stdin channel). Pass the prompt as a positional argument — " +
+                            "minis-model-use run --model <id> 'your prompt' — or write it to a file " +
+                            "and pass --input <path>.",
+                    )
+                    .toString() + "\n",
+            )
         }
         val parsed = try {
             parseMessages(inputText, request.sessionId)
@@ -1519,10 +1541,20 @@ class ModelUseOffloadHandler(
         return true
     }
 
-    private fun readLinuxPath(linuxPath: String, sessionId: String?): String? {
+    // [B14-fix-r14] Relative --input/--system-file paths are resolved against
+    // the guest's cwd — the native_offload protocol forwards the shell's cwd
+    // (NativeOffloadRequest.cwd), so a relative path inherits it instead of
+    // silently dropping onto the rootfs root. The final path still goes
+    // through the same resolveSessionHostPath/resolveHostPath guards
+    // (canonicalize + prefix checks) — a hostile cwd string gets the same
+    // containment as an agent-supplied absolute path.
+    private fun readLinuxPath(linuxPath: String, sessionId: String?, cwd: String?): String? {
+        val resolved = if (!linuxPath.startsWith("/") && !cwd.isNullOrEmpty() && cwd.startsWith("/")) {
+            if (cwd.endsWith("/")) "$cwd$linuxPath" else "$cwd/$linuxPath"
+        } else linuxPath
         val hostFile: File = sessionId?.let {
-            PRootKernel.resolveSessionHostPath(it, linuxPath, context)
-        } ?: PRootKernel.resolveHostPath(linuxPath) ?: return null
+            PRootKernel.resolveSessionHostPath(it, resolved, context)
+        } ?: PRootKernel.resolveHostPath(resolved) ?: return null
         if (!hostFile.exists() || !hostFile.isFile) return null
         return try { hostFile.readText() } catch (_: Throwable) { null }
     }
@@ -1818,10 +1850,14 @@ class ModelUseOffloadHandler(
 Usage:
   minis-model-use list [--provider <name>] [--modality <mod>]
   minis-model-use search <query> [--provider <name>] [--modality <mod>]
-  minis-model-use run --model <id_or_name> [--provider <label_or_id>]
+  minis-model-use run --model <id_or_name> [prompt] [--provider <label_or_id>]
                       [--input <path>] [--output <path>]
                       [--system <text>] [--system-file <path>]
                       [--max-tokens N] [--temperature F]
+
+  NOTE: stdin is NOT read — the native_offload protocol has no stdin
+  channel. Pass the prompt as a positional argument (run --model <id> 'text')
+  or write it to a file and pass --input <path>.
 
 Run model selection:
   --model accepts: model_id, display name, entry_id (UUID), OR the qualified
@@ -1912,9 +1948,9 @@ Examples:
   minis-model-use list --modality image_input
   minis-model-use search gemini
   minis-model-use run --model claude-sonnet-4-6 --input /var/minis/workspace/prompt.json
-  minis-model-use run --model deepseek/deepseek-v4-flash --input msgs.json   # qualified form
+  minis-model-use run --model deepseek/deepseek-v4-flash --input msgs.json   # relative: resolved against the shell's cwd
   minis-model-use run --model deepseek-v4-flash --provider deepseek --input msgs.json   # equivalent
-  echo 'What is 2+2?' | minis-model-use run --model gpt-4o
+  minis-model-use run --model gpt-4o 'What is 2+2?'
   minis-model-use run --model gemini-2.5-flash --system 'You are a poet' \
                       --input msgs.json --output /var/minis/workspace/out.txt
 """
