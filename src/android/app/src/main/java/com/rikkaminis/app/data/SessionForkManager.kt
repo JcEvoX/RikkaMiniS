@@ -32,7 +32,11 @@ import kotlinx.coroutines.withContext
  * and `media/<yyyy/MM/dd>/<sid>` — onto the duplicate (same relative layout,
  * runtime files like sockets/locks skipped), so attachment and
  * `minis://workspace` references in the copied messages resolve in the new
- * session instead of dangling as "File not found". The copy is best-effort:
+ * session instead of dangling as "File not found". [rv1014-D1] The message
+ * parts_json is remapped in the same pass (source session id → new session
+ * id) so the copied media files are actually referenced by the duplicate —
+ * verbatim parts_json would keep pointing at the source session's files,
+ * which dangle once the source is deleted. The copy is best-effort:
  * it runs on IO after the DB copy is committed, and a partial failure is
  * logged without aborting the clone.
  */
@@ -125,7 +129,15 @@ class SessionForkManager(
                 val newMsg = chatRepository.appendMessage(
                     sessionId = new.id,
                     role = msg.role,
-                    partsJson = msg.partsJson,
+                    // [rv1014-D1] Media reference paths inside parts_json embed
+                    // the SOURCE session id (MediaRef.relativePath is
+                    // "yyyy/MM/dd/<sid>/<id>.<ext>", see MediaStore.saveMedia).
+                    // Verbatim copies resolve to the source session's files —
+                    // shared while the source exists, dangling once it is
+                    // deleted — so the source id is remapped onto the
+                    // duplicate's id here, matching the media tree that
+                    // copySessionArtifacts lays out under the new session.
+                    partsJson = remapForkedPartsJson(msg.partsJson, sessionId, new.id),
                     tokenUsage = msg.tokenUsage,
                     reasoningContent = msg.reasoningContent,
                     // [F-233] appendMessage accepts 7 business fields; this copy
@@ -224,7 +236,9 @@ class SessionForkManager(
      *      `minis-sessions/<new>/<subdir>` (session-relative layout preserved);
      *   2. `media/<yyyy>/<MM>/<dd>/<src>` → `media/<yyyy>/<MM>/<dd>/<new>`
      *      (the MediaStore dated-path layout, so copied MediaRef.relativePath
-     *      entries resolve with the session id swapped).
+     *      entries resolve with the session id swapped — the swap itself is
+     *      done by [remapForkedPartsJson] when the messages are appended,
+     *      without which the copied media tree would never be referenced).
      *
      * Runtime files (Unix sockets, FIFOs, symlinks, Chromium `Singleton*`
      * locks, `*.lock` / `*.sock`) are skipped — see [isCopyableArtifactEntry].
@@ -417,3 +431,26 @@ internal fun copySessionDirTree(srcDir: File, dstDir: File): Pair<Int, List<Stri
     )
     return copied to failures
 }
+
+/**
+ * [rv1014-D1] Remap the source session id embedded in a duplicated message's
+ * media reference paths onto the duplicate's id. The only parts_json form
+ * that embeds the session id is `MediaRef.relativePath`
+ * (`yyyy/MM/dd/<sid>/<id>.<ext>`, MediaStore.saveMedia) — present in both
+ * standalone `mediaRef` parts and `toolResult.value.mediaRef`. `linuxPath` /
+ * `imageLinuxPath` are `/var/minis/...` sandbox paths without a session id
+ * (they resolve per-session via the sandbox bind mount, which
+ * copySessionArtifacts already mirrors), so a literal replace of the source
+ * id covers every present and future sid-embedded form uniformly.
+ *
+ * A blanket literal replace is safe here: session ids are random UUIDs, whose
+ * characters `[0-9a-f-]` include no JSON structural characters, so the
+ * replacement can never corrupt the JSON syntax; and a UUID appearing in user
+ * text is astronomically unlikely (and would reference source-session
+ * resources anyway, making the remap semantically right).
+ *
+ * Top-level (not a method on [SessionForkManager]) so it can be JVM-tested
+ * without Android/Room classes.
+ */
+internal fun remapForkedPartsJson(partsJson: String, sourceSessionId: String, newSessionId: String): String =
+    partsJson.replace(sourceSessionId, newSessionId)

@@ -1,6 +1,7 @@
 package com.rikkaminis.app.data
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -103,5 +104,96 @@ class KeyRouletteTest {
         val k2 = KeyRoulette.next("b1 b2", "prov-B")
         assertTrue(k1 in listOf("a1", "a2"))
         assertTrue(k2 in listOf("b1", "b2"))
+    }
+
+    // ── [rv1014-D2] legacy plaintext migration ──
+
+    /** Test-local reimplementation of the (private) production hashKey. */
+    private fun sha256Hex(k: String): String =
+        java.security.MessageDigest.getInstance("SHA-256").digest(k.toByteArray(Charsets.UTF_8))
+            .take(16).joinToString("") { "%02x".format(it) }
+
+    @Test
+    fun `sanitize migrates legacy plaintext keys to hashes preserving stamps`() {
+        val obj = org.json.JSONObject(
+            """{"p-legacy":{"sk-abc-plaintext":7,"k2":3,"0123456789abcdef0123456789abcdef":11}}""",
+        )
+
+        val sanitized = KeyRoulette.sanitizeLegacyRouletteEntries(obj)
+            ?: org.json.JSONObject()
+
+        val slice = sanitized.getJSONObject("p-legacy")
+        assertFalse("plaintext must be gone", slice.has("sk-abc-plaintext"))
+        assertFalse(slice.has("k2"))
+        // The 32-hex entry is hash-shaped — kept verbatim.
+        assertEquals(11, slice.getLong("0123456789abcdef0123456789abcdef"))
+        // Migrated plaintext keys keep their stamps under their hashes.
+        assertEquals(7, slice.getLong(sha256Hex("sk-abc-plaintext")))
+        assertEquals(3, slice.getLong(sha256Hex("k2")))
+    }
+
+    @Test
+    fun `sanitize is a no-op on an already hash-only file`() {
+        val obj = org.json.JSONObject(
+            """{"p-hash":{"0123456789abcdef0123456789abcdef":9,"abcdef0123456789abcdef0123456789":1}}""",
+        )
+        assertEquals(null, KeyRoulette.sanitizeLegacyRouletteEntries(obj))
+    }
+
+    @Test
+    fun `sanitize drops blank keys and records them`() {
+        val obj = org.json.JSONObject("""{"p-blank":{"":5,"   ":6,"sk-real":2}}""")
+        val dropped = mutableListOf<String>()
+
+        val sanitized = KeyRoulette.sanitizeLegacyRouletteEntries(obj, dropped)!!
+
+        val slice = sanitized.getJSONObject("p-blank")
+        assertFalse(slice.has(""))
+        assertFalse(slice.has("   "))
+        assertEquals(2, slice.getLong(sha256Hex("sk-real")))
+        assertTrue(dropped.contains(""))
+        assertTrue(dropped.contains("   "))
+    }
+
+    @Test
+    fun `sanitize preserves non-object provider entries verbatim`() {
+        val obj = org.json.JSONObject("""{"p-scalar":42,"p-legacy":{"sk-x":4}}""")
+        val sanitized = KeyRoulette.sanitizeLegacyRouletteEntries(obj)!!
+        assertEquals(42, sanitized.getInt("p-scalar"))
+        assertFalse(sanitized.getJSONObject("p-legacy").has("sk-x"))
+    }
+
+    @Test
+    fun `init migrates a legacy file on disk`() {
+        val dir = File.createTempFile("keyroulette", "mig").let {
+            it.delete()
+            File(it.absolutePath + ".d")
+        }.apply { mkdirs() }
+        val f = File(dir, "key_roulette.json")
+        val legacyStamps = mapOf("sk-old-a" to 100L, "sk-old-b" to 50L)
+        f.writeText(
+            """{"prov-mig-e2e":{"sk-old-a":100,"sk-old-b":50,"k1 k2":7}}""",
+        )
+
+        KeyRoulette.init(dir)
+
+        val after = f.readText()
+        assertFalse("plaintext key must not survive on disk", after.contains("sk-old-a"))
+        assertFalse(after.contains("sk-old-b"))
+        assertFalse("temp file must be cleaned up", File(dir, "key_roulette.json.tmp").exists())
+        val slice = org.json.JSONObject(after).getJSONObject("prov-mig-e2e")
+        // Stamps preserved under hashes; "k1 k2" contains whitespace so it was
+        // never a valid single slice key in the legacy writer — migrated as a
+        // single (odd) key with its stamp intact.
+        assertEquals(100L, slice.getLong(sha256Hex("sk-old-a")))
+        assertEquals(50L, slice.getLong(sha256Hex("sk-old-b")))
+        assertEquals(7L, slice.getLong(sha256Hex("k1 k2")))
+        assertEquals(3, slice.length())
+
+        // Idempotent: second init on the migrated file changes nothing.
+        val before2 = f.readText()
+        KeyRoulette.init(dir)
+        assertEquals(before2, f.readText())
+        dir.deleteRecursively()
     }
 }
