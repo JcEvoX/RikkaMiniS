@@ -4,7 +4,20 @@ import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 
-@Entity(tableName = "sessions")
+/**
+ * [T-android-moveto-perf] `updated_at` is indexed: every session listing
+ * orders by it (`ORDER BY updated_at DESC`), which without an index degrades
+ * to a full scan plus a sort as the table grows. The index name must match
+ * MIGRATION_13_14's CREATE INDEX EXACTLY — Room validates the live schema on
+ * open and aborts on any difference. Ascending, not DESC: Room's @Index
+ * cannot express a sort order and SQLite walks a B-tree in either direction.
+ */
+@Entity(
+    tableName = "sessions",
+    indices = [
+        androidx.room.Index(value = ["updated_at"], name = "index_sessions_updated_at"),
+    ],
+)
 data class ChatSessionEntity(
     @PrimaryKey val id: String,
     val title: String? = null,
