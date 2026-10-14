@@ -272,6 +272,11 @@ object PRootKernel {
     // and remove our own wrappers (vs a user/busybox binary of the same name).
     private const val GUARD_MARKER = "minis-mount-readonly-guard"
 
+    // Commands whose LAST positional argument is the write target; the earlier
+    // ones are sources (cp/mv/ln). Everything else in [installMountWriteGuards]
+    // takes every positional argument as a target, except dd (writes via `of=`).
+    private val MOUNT_GUARD_LAST_ARG_CMDS = setOf("cp", "mv", "ln")
+
     /**
      * Reference to the user-mounted folders store, set by [MinisApp] at
      * launch (the file is owned by T219-1 / worker A — we cannot touch it
@@ -403,9 +408,14 @@ object PRootKernel {
      * shell-level wrapper is tracked as T219-4 follow-up (optional).
      */
     fun isLinuxPathUnderReadOnlyMount(linuxPath: String): Boolean {
-        if (!linuxPath.startsWith(MOUNTS_LINUX_PREFIX)) return false
+        // Normalize BEFORE matching the prefix (audit-1014 B5b): the raw string
+        // could carry `.`/`//` segments (`/var/minis/./mounts/...`), which
+        // slipped past the guard while resolveHostPath's safeResolveWithin
+        // still resolved the write INTO the read-only mount.
+        val normalized = normalizeLinuxPath(linuxPath)
+        if (normalized == null || !normalized.startsWith(MOUNTS_LINUX_PREFIX)) return false
         val store = mountedFoldersStore ?: return false
-        val rest = linuxPath.removePrefix(MOUNTS_LINUX_PREFIX)
+        val rest = normalized.removePrefix(MOUNTS_LINUX_PREFIX)
         val name = rest.substringBefore('/')
         if (name.isEmpty()) return false
         val entry = store.entries.value.firstOrNull { it.name == name } ?: return false
@@ -997,6 +1007,15 @@ object PRootKernel {
      * (touch/cp/mv/tee/mkdir/rm/…). Pure shell `>` redirects are handled by the
      * OS itself — proot forwards the open(2) to the host FS, which returns EACCES
      * for a read-only mount — so those already fail truthfully.
+     *
+     * [audit-1014 B5a] the wrapper used to prefix-match EVERY positional
+     * argument, so `cp /var/minis/mounts/vault/f /var/minis/workspace/` —
+     * reading OUT of a read-only mount, perfectly legal — was refused; while
+     * conversely `dd of=<read-only path>` wrote straight past the guard
+     * (the `of=` value never matched `"$prefix"|"$prefix"/*`). The argument
+     * SELECTION is now command-specific ([mountGuardScript]); the guard
+     * semantics are unchanged — any write target under a read-only prefix
+     * still exits 1.
      */
     private fun installMountWriteGuards(context: Context, readOnlyLinuxPrefixes: List<String>) {
         val rootfs = try {
@@ -1025,29 +1044,7 @@ object PRootKernel {
 
         for (name in guardedCmds) {
             val wrapper = File(binDir, name)
-            wrapper.writeText(
-                """#!/bin/sh
-                |# $GUARD_MARKER — reject writes into read-only mounted folders.
-                |# Auto-installed by MinisApp PRootKernel (T219-4).
-                |cfg=/var/minis/.mount-readonly-prefixes
-                |if [ -f "${'$'}cfg" ]; then
-                |    for arg in "${'$'}@"; do
-                |        case "${'$'}arg" in
-                |            -*) continue;;  # skip flags
-                |        esac
-                |        while IFS= read -r prefix; do
-                |            [ -z "${'$'}prefix" ] && continue
-                |            case "${'$'}arg" in
-                |                "${'$'}prefix"|"${'$'}prefix"/*)
-                |                    echo "$name: ${'$'}arg: read-only mounted folder — writes are disabled (toggle in Settings → Mount External Folders)" >&2
-                |                    exit 1;;
-                |            esac
-                |        done < "${'$'}cfg"
-                |    done
-                |fi
-                |exec /bin/busybox $name "${'$'}@"
-                |""".trimMargin(),
-            )
+            wrapper.writeText(mountGuardScript(name))
             wrapper.setExecutable(true, false)
         }
         Log.i(
@@ -1055,6 +1052,72 @@ object PRootKernel {
             "installMountWriteGuards: installed for ${guardedCmds.size} cmds, " +
                 "readOnlyPrefixes=${readOnlyLinuxPrefixes.joinToString(",")}",
         )
+    }
+
+    /**
+     * The shell wrapper for ONE guarded command. The argument selection is
+     * command-specific (audit-1014 B5a) — three shapes by write semantics:
+     *
+     *  - cp/mv/ln: only the LAST positional argument is the write target.
+     *    The earlier ones are sources — `cp /var/minis/mounts/vault/f /tmp/`
+     *    (reading OUT of a read-only mount) must stay legal;
+     *  - dd: the write target is the value of `of=`, never a positional
+     *    argument — and `oflag=`/`ofs=` must not be confused with `of=`;
+     *  - touch/tee/mkdir/rm/rmdir: every positional argument IS a target
+     *    (tee's files are all written, rm's are all destroyed).
+     *
+     * Flags are skipped in all shapes. The guard semantics are unchanged
+     * from the every-argument version: any selected target under a
+     * read-only prefix still exits 1 — only WHICH arguments are checked got
+     * command-specific.
+     */
+    internal fun mountGuardScript(name: String): String {
+        val selection = when {
+            name in MOUNT_GUARD_LAST_ARG_CMDS -> """
+                |dest=""
+                |for arg in "${'$'}@"; do
+                |    case "${'$'}arg" in -*) continue;; esac
+                |    dest="${'$'}arg"
+                |done
+                |if [ -n "${'$'}dest" ]; then
+                |    check_prefix "${'$'}dest" || exit 1
+                |fi
+            """.trimMargin()
+            name == "dd" -> """
+                |for arg in "${'$'}@"; do
+                |    case "${'$'}arg" in
+                |        oflag=*|ofs=*) ;;
+                |        of=*) check_prefix "${'$'}{arg#of=}" || exit 1;;
+                |    esac
+                |done
+            """.trimMargin()
+            else -> """
+                |for arg in "${'$'}@"; do
+                |    case "${'$'}arg" in -*) continue;; esac
+                |    check_prefix "${'$'}arg" || exit 1
+                |done
+            """.trimMargin()
+        }
+        return """#!/bin/sh
+            |# $GUARD_MARKER — reject writes into read-only mounted folders.
+            |# Auto-installed by MinisApp PRootKernel (T219-4).
+            |cfg=/var/minis/.mount-readonly-prefixes
+            |check_prefix() {
+            |    while IFS= read -r prefix; do
+            |        [ -z "${'$'}prefix" ] && continue
+            |        case "${'$'}1" in
+            |            "${'$'}prefix"|"${'$'}prefix"/*)
+            |                echo "$name: ${'$'}1: read-only mounted folder — writes are disabled (toggle in Settings → Mount External Folders)" >&2
+            |                return 1;;
+            |        esac
+            |    done < "${'$'}cfg"
+            |    return 0
+            |}
+            |if [ -f "${'$'}cfg" ]; then
+            |$selection
+            |fi
+            |exec /bin/busybox $name "${'$'}@"
+            |""".trimMargin()
     }
 
     /**
@@ -1066,4 +1129,36 @@ object PRootKernel {
         tmpDir.mkdirs()
         return tmpDir
     }
+}
+
+/**
+ * Pure lexical normalization of a guest linux path: collapses `//`, `/./` and
+ * `seg/../` (POSIX rules — `/..` at the absolute root stays at the root).
+ * Returns null for an empty input or a relative path that climbs above its
+ * root (there is no meaningful mount check for such a string).
+ *
+ * [audit-1014 B5b] [PRootKernel.isLinuxPathUnderReadOnlyMount] used to match
+ * the mount prefix on the RAW string, so `/var/minis/./mounts/...` or
+ * `//var/minis/mounts/...` slipped past the guard while resolveHostPath's
+ * safeResolveWithin still resolved the write INTO the read-only mount — the
+ * guard was checked before the normalization that moved the path into it.
+ */
+internal fun normalizeLinuxPath(path: String): String? {
+    if (path.isEmpty()) return null
+    val absolute = path.startsWith("/")
+    val out = ArrayList<String>()
+    for (segment in path.split('/')) {
+        when (segment) {
+            "", "." -> Unit
+            ".." -> {
+                if (out.isNotEmpty()) {
+                    out.removeAt(out.size - 1)
+                } else if (!absolute) {
+                    return null
+                }
+            }
+            else -> out.add(segment)
+        }
+    }
+    return if (absolute) "/" + out.joinToString("/") else out.joinToString("/")
 }

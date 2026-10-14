@@ -448,9 +448,18 @@ private fun describe(refusal: TarRefusal): String = when (refusal) {
 
 /**
  * Split a member name into path segments, or null when the name itself is
- * illegal: absolute, containing NUL, resolving to the root, or climbing above
- * it. Pure — the same rule is applied in the validation pass and again in the
- * extraction pass, so the two can never disagree about what a name means.
+ * illegal: absolute, containing NUL, or climbing above the root. An EMPTY
+ * list means the entry IS the root itself (`.` / `./` / `././` — what GNU
+ * and busybox `tar -cf a.tar .` both write as their first member); that is
+ * legal and extracts to [dest] itself. Pure — the same rule is applied in
+ * the validation pass and again in the extraction pass, so the two can
+ * never disagree about what a name means.
+ *
+ * [audit-1014 B4a] this used to collapse a root entry to null, which
+ * [tarEntryTarget] reads as `TarRefusal.Slip` — so `tar -cf a.tar .`, whose
+ * first member is `./` (and which [tarMemberPrefix] itself produces for a
+ * `.` argument), was refused by our own extractor. The four tar-slip rules
+ * (absolute / NUL / `..` above the root / through-symlink) are untouched.
  */
 internal fun tarNormalizeMember(name: String): List<String>? {
     if (name.isEmpty()) return null
@@ -467,7 +476,8 @@ internal fun tarNormalizeMember(name: String): List<String>? {
             else -> segments.add(segment)
         }
     }
-    return segments.ifEmpty { null }
+    // Empty = the entry points at the root itself (`.`, `./`) — legal.
+    return segments
 }
 
 /**
@@ -754,6 +764,30 @@ private fun text(block: ByteArray, offset: Int, length: Int): String =
 // ── serialization ───────────────────────────────────────────────────────────
 
 private fun writeHeader(sink: OutputStream, member: TarMember) {
+    // GNU 'K' long-link record: a symlink target that does not fit the
+    // 100-byte linkname field would otherwise be SILENTLY TRUNCATED by
+    // putText below — the archive would read back with the wrong target.
+    // The reader side has parsed GNU 'K' since v1; the writer now produces
+    // the same out-of-band record it already produces for 'L' long names.
+    // The real header repeats the target truncated to the field, exactly
+    // like GNU tar. (audit-1014 B4b)
+    val longLink = if (member.linkName.toByteArray(StandardCharsets.UTF_8).size > LINKNAME_LENGTH - 1) {
+        member.linkName.toByteArray(StandardCharsets.UTF_8) + 0
+    } else null
+    if (longLink != null) {
+        val kblock = ByteArray(BLOCK_SIZE)
+        putText(kblock, NAME_OFFSET, NAME_LENGTH, "././@LongLink")
+        putInt(kblock, MODE_OFFSET, MODE_LENGTH, 0b110_100_100)
+        putInt(kblock, SIZE_OFFSET, SIZE_LENGTH, longLink.size.toLong())
+        putInt(kblock, MTIME_OFFSET, MTIME_LENGTH, member.mtimeSeconds)
+        kblock[TYPEFLAG_OFFSET] = 'K'.code.toByte()
+        putText(kblock, MAGIC_OFFSET, MAGIC_LENGTH, "ustar")
+        putFixed(kblock, VERSION_OFFSET, VERSION_LENGTH, "00")
+        finishBlock(kblock)
+        sink.write(kblock)
+        sink.write(longLink)
+        sink.write(ByteArray(((BLOCK_SIZE - (longLink.size % BLOCK_SIZE)) % BLOCK_SIZE)))
+    }
     val block = ByteArray(BLOCK_SIZE)
     val split = splitUstarName(member.name)
     if (split == null) {
