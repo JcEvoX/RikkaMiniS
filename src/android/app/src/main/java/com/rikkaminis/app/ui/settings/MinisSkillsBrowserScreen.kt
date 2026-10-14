@@ -367,6 +367,13 @@ private suspend fun importSkillFromCurrentUrl(
                     id = targetId,
                     name = parsed.name,
                     description = parsed.description,
+                    // [rv1014-E3] The other in-place update paths (refreshFromDisk,
+                    // importFromContent, importFromArchive) all refresh version
+                    // too — keep the browser refresh consistent. parseSkillMd
+                    // defaults a missing frontmatter version to "1.0.0", so a
+                    // SKILL.md without one resets the stored version to that
+                    // default (accepted: same exposure as refreshFromDisk).
+                    version = parsed.version,
                     body = parsed.body,
                 )
             }
@@ -439,6 +446,14 @@ private fun toRawGitHubUrl(url: String): String {
  * targets: prefer the record whose id equals the name slug, else the record
  * whose display name equals the incoming name (custom id case), else null —
  * the caller falls back to the slug and the repository reports "not found".
+ *
+ * [rv1014-E2] The implementation used to be a per-record OR inside one
+ * `firstOrNull`, i.e. "first match wins": when one record matched by name
+ * (id != slug) but an earlier/later record matched by id, it returned the
+ * name-match first, silently replacing the wrong skill. Now it is the
+ * two-pass lookup the KDoc always described: id == slug over all records
+ * first, then name == incomingName.
+ *
  * Pure so JVM tests cover the mapping (SkillRepository needs Android's
  * Context/SQLite and can't be unit-tested directly).
  */
@@ -447,7 +462,8 @@ internal fun resolveUpdateTargetId(
     slug: String,
     incomingName: String,
 ): String? =
-    skills.firstOrNull { (id, name) -> id == slug || name == incomingName }?.first
+    skills.firstOrNull { (id, _) -> id == slug }?.first
+        ?: skills.firstOrNull { (_, name) -> name == incomingName }?.first
 
 private fun slugify(name: String): String =
     name.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-')

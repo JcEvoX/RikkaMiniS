@@ -14,6 +14,7 @@ import android.webkit.WebView
 import androidx.compose.ui.unit.IntSize
 import com.rikkaminis.app.browser.SafeWebViewClient
 import com.rikkaminis.app.ui.markdown.internalFitCaptureSize
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -288,6 +289,12 @@ internal object KatexWebViewPool {
         // propagate as a coroutine crash.
         val ok = try {
             withTimeoutOrNull(RENDER_TIMEOUT_MS) { d.await() } != null
+        } catch (e: CancellationException) {
+            // [rv1014-E6] The caller's coroutine was cancelled while awaiting —
+            // rethrow so structured concurrency still works; swallowing it made
+            // renderInternal's withLock block run its fallback path instead of
+            // unwinding.
+            throw e
         } catch (e: Throwable) {
             android.util.Log.w(TAG, "WebView died before ready: ${e.message}")
             false
