@@ -1,11 +1,11 @@
-# RikkaMinis 开发日志合并导出（2026-08-03 ～ 2026-10-13）
+# RikkaMinis 开发日志合并导出（2026-08-03 ～ 2026-10-15）
 
 > 📌 **注意**：本文件是 raw dump（归档快照，按时间正序排列）。
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
-- 合并范围：2026-08-03 ～ 2026-10-13，共 72 天
-- 条目总数：1663（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：2168937 / 总行数：29982
+- 合并范围：2026-08-03 ～ 2026-10-15，共 74 天
+- 条目总数：1734（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：2262257 / 总行数：30916
 
 ---
 
@@ -29975,6 +29975,940 @@ Pattern-Key: sandbox-l2s-pack-symlink-broken
 - **CI**：build-apk 38376827061 + scan-gate 38376772094 双绿 @ `205593339`（scan-gate 随 PR 自动跑，build-apk 手动 dispatch）。
 - **合并**：--no-ff → main `a43c2b2c`（合并树 vs 分支 tip 空 = 逐字节一致）→ push 远端==本地 → 分支远端 DELETE + 本地删，PR #13 自动 merged。main push 自动触发 build-apk 未等（单支合并先例）。
 - **★ 可复用认识**：①「测试绿 ≠ 接线通」实锤案例——8 个单测全用扁平 entry 喂 stripMcpSecretValues，生产传的是 exportServerJSON 嵌套壳，F-3/D-3 两层"已修"全部 no-op；识别手段 = 用**真实编译产物反射对拍**两种调用形状（nested leaks=true / direct leaks=false）。②修 wrapper 型 API 的脱敏时，测试必须从**真实产出形状**（exportServerJSON 输出）出发，不能手造扁平 fixture。③backlog §90 已闭合；审查报告 `shared/work/review-debt-cleanup-1013/REPORT.md`。
+
+## 2026-10-14
+
+<!-- 2026-10-14 00:10:20 -->
+## M3/Material You 转向评估报告交付（2026-10-13 深夜）
+
+
+- 交付：`/var/minis/shared/work/m3-eval-1013/REPORT.md`（14.5KB）+ 4 张用户真机截图 + a11y 截图（`screenshots/fig1-4`、`current_chat.png`）。
+- 核心结论：RikkaMinis 组件层已全面 M3（112 文件引用 material3 / 0 M2 / 0 dynamicColor）；「转」的真差量 = 动态取色 +（可选）视觉身份选择。建议 L0 顺带修 → L1 动态取色（开关式，先默认关、试用后定默认）→ L2/L3 另议。
+- 关键数字：主题 3 文件 437 行（Theme 183 / ChatColors 179 / AccentColors 75）；ChatPalette 37 字段×明暗两套；92 文件消费 colorScheme / 35 消费 ChatColors；硬编码色 234 处中 143 处（61%）在主题文件内；45 个 *Screen.kt；compose-bom 2025.09.00→material3 1.3.2（最新 stable 1.4.0，AAR 实证含 M3 Expressive 组件）。
+- 关键发现：上游 v1.14 主色已 teal→iOS 蓝 `#528AD2`（[T-android-accent-blue-parity]，降饱和+WCAG 推理），fork pickaxe 零命中从未跟进；上游有 `InAppThemeSourceGuardTest` 守卫，fork 无且 web-preview 残留 2 处直读系统深色（`WebPreviewBottomSheet.kt:105` / `WebPreviewFullscreenScreen.kt:78`，上游同目录已清零）→ backlog §92。
+- 生态对照：rikkahub（`settings.dynamicColor && SDK>=S → dynamic*ColorScheme`）与 NextPlayer（`shouldUseDynamicTheming` 默认开）都已支持。
+- 待用户拍板 4 项（backlog §91）：①L1 做否+默认值 ②动态范围（先 ColorScheme 层）③teal 保留 vs 跟上游蓝 ④L2 时机。未改任何代码（纯评估）。
+
+<!-- 2026-10-14 00:19:48 -->
+## 上下文压缩循环诊断（backlog §93 登记）
+
+用户第 3 次遇到「上下文即将占满（~88%）」通知。日志取证：同会话 15 分钟触发 3 次压缩；链中间压缩近乎无效（191K→187K，近端工具输出受保护）；每轮 +16K~203K tokens；最深压缩地板 87015（39%），约一半是压不掉的固定注入（系统提示 ~92.6K chars + GLOBAL 31.5KB + rollup 71.7KB + 日报 ~60KB）。定性：AutoCompactLoop 设计兜底，非 bug。规避：子会话派发 + 主动 /compact。结构性修法（注入端 cap / 工具输出降采样）已登记 backlog §93 带触发条件。
+
+<!-- 2026-10-14 00:20:40 -->
+## M3/Material You 用户拍板：L1 单独做意义不大，搁置（2026-10-14）
+
+
+- 用户拍板：「如果只是加一个动态取色开关，意义不大」——L1 不单独立项，评估结论攒着（报告 `/var/minis/shared/work/m3-eval-1013/REPORT.md`）。
+- backlog §91 已改为「已拍板：搁置」，复活条件三条：①与 L3 身份换血一起做；②L2 material3 1.4.0 升级时顺路；③生态/需求变化。
+- 同意其立场：单独开关是「半件事」，动态取色的价值要和观感体系一起动才兑现。
+- 顺带发现仍有效：backlog §92（web-preview 两处直读系统深色，P2 登记）；上游主色已转蓝 #528AD2 而 fork 停在 teal（fork 注释 "matching iOS" 已过期）——这些不动代码，仅登记。
+
+<!-- 2026-10-14 00:24:00 -->
+## 2026-10-14 00:24:00
+
+<!-- 2026-10-14 09:02:57 -->
+## M3 主题线二轮：工程量分级 + 视觉模拟交付 + 用户倾向不跟上游（2026-10-14）
+
+- 用户三问：各层工程量 / 上游修改（倾向不跟）/ 改动效果。
+- 工程量分级（报告 m3-eval-1013/REPORT.md §5 为准）：L0 顺带修（2 文件 ~10 行+可选守卫测试）；L1 动态取色（5 文件+8 语言文件，核心 ~40 行，一个分支半天含真机 4 组合验证）；L2 material3 1.3.2→1.4.0（BOM 升级+弃用清理，1-2 天含试构建）；L3 整体换肤（3 主题文件重写+ChatPalette 37字段×2+45 屏+对比度重工，数天~一周）。
+- **视觉模拟已交付**：`/var/minis/shared/work/m3-eval-1013/mock/index.html` —— 现状 teal（真实色值）/ 上游蓝 #6A94CE（真实色值）/ 4 种壁纸动态色板（HSL 按 tonal palette 规律手调，示意非精确 HCT）。模拟口径：chrome 层（设置/开关/FAB/图标块）随色板变，聊天采样区（ChatPalette 气泡/代码块）固定 = L1 真实变化范围。
+- **用户倾向：主题线不跟上游**（teal 保留品牌色）——未最终定案；若定案仅顺路修 Theme.kt:20 过期注释，上游主题 commit 不采纳（Theme.kt diff 仅 47 行）。backlog §91 已补充登记。§92 web-preview 修复与跟不跟上游无关（fork 自身缺陷），维持。
+- L2 若做，是「不跟上游主题」决策的天然搭档：升 1.4.0 拿 M3 Expressive 组件/动效，等于在组件层补「现代感」而不动身份。
+
+<!-- 2026-10-14 09:13:58 -->
+## 「上游更流畅」诊断：fork 基线落后一整个 v1.14 周期（2026-10-14）
+
+- 用户问：为什么用官方 OpenMinis 时感觉比 fork 更流畅。
+- **主因（可验证）**：fork 基线 = 上游 v1.14 之前（Room db version 13 vs 上游 14；fork 自带 migration，基线约在 08-19~09-02 的上游 main）。上游 v1.14（09-29）一个周期 = src/android **678 文件 +104K/−6K**，其中 UI 层 120 文件 +22K（chat/agent/speech/settings/interface work）。官方 app 全有，fork 全没有。上游 main 仍停在 b4c0661（v1.14），未前进。
+- **结构性差距**：RikkaMinis 跑 agent 系统（agent loop/上下文组装/日志层 LogWriteQueue 等 5 个额外文件/FGS/观察者/tailer），聊天路径本来更重；且本机 agent 重活记在 app 进程组账上（cpu:/foreground，documented 重活窗口 23 kills）。OpenMinis 纯聊天 app 无此账。本机**只装 com.rikkaminis.app**，无 com.openminis.app（上游 app 非本机安装）。
+- **排除项**：fork UI 代码无流畅度回归——有自己的 perf 提交（perf/tool-pill-fold、perf/memory-page-io、StreamFollowDeadband）；IosBounce 两版都有（fork 多 F-3 回弹修复，是改进）；compose BOM 相同（2025.09.00）；fork 的 624 upstream-only / 313 differing 文件大部分是重组+自有功能，非缺功能。
+- **诚实边界**：v1.14 是 squash commit，无法精确隔离出哪几行是 perf fix；「更流畅」主观，但版本差距是客观最大变量。
+- **建议**：跟版 v1.14（过门审查流程，重点 interface/chat + sandbox advance）——与「主题线不跟上游」（teal 保留）不冲突：主题留自有，性能/界面工作跟上是白赚。接 backlog §44（GH#186 沙箱自愈）等登记项。
+
+<!-- 2026-10-14 09:27:59 -->
+## v1.14 移植 ROI 分析：条带级挑拿（2026-10-14）
+
+- **背景**：用户令「建议跟哪些 + 投入产出比」。对 v1.14（678 文件 +104K/−6K）做逐文件三态分类（fork vs 上游）：**11 可直拿 / 150 两边都改 / 472 fork 没有**——整域跟版不可能（fork ui/chat=99 文件自研架构 vs 上游 68），必须按修复条目挑。
+- **★ Tier 1 四条（每条 1 行~2 小时，纯赚）**：
+  1. **ContentCapture 关闭**（T-android-content-capture-off）：Pixel6 perf build 实测 **全 app CPU 10.45%**（流式回复触发语义树重走）；fork 全仓 0 命中；1 行开关+注释。
+  2. **资源 HUD 读表移出主线程**（T-android-resource-hud-offmain）：smaps 每 2s 主线程 = 5%；fork 仍 `sampleOnce()` 在 Main（仅加生命周期门控）；~10 行。
+  3. **工具缩略图 512px 上限**（T-android-tool-thumb-fullres-decode）：浏览器截图缩略图全分辨率 ~10MB/张×N（borrow fallback 放大）→ Scudo SIGABRT **原生 OOM**；fork 正是修前形态（fork 自己只把解码移出主线程）；~60 行+2-4 调用点。**直接对上 fork 苦战过的 native OOM。**
+  4. **sessions.updated_at 索引**（T-android-moveto-perf）：大历史下 Move-to 面板卡顿；fork ChatSessionEntity 无 @Index；1 migration。
+- **Tier 2**：StreamFollowDeadband（流式跟随小回退抑制，上游从用户报告量出 -18px/+8px 抖动；fork 有自研 glide 需先 0.5-1h 侦察暴露面）；聊天健壮性组合（EvictionGuard/SettleAfterInteractionGate/FallbackPulseGate/OrphanedRunningToolGate/EmptyTurnRecovery）；DisplayBitmapLimits 新版全量（canvas 215MB 崩溃上限）；沙箱 SeccompFallbackPolicy（backlog §44）等。
+- **Tier 3 按需**：auth OAuth 22 文件 / backup rclone 30 / provider 协议修复 50 / speech 30——功能型非流畅度。
+- **不建议**：ui/theme（自有身份）、WebViewRenderProcess（fork 更强）、ui/chat 与 ui/settings 整域（对不上 fork 架构）。
+- 流程建议：Tier 1 合一个分支 `port/v114-picks`；与「主题不跟上游」不冲突。
+
+<!-- 2026-10-14 10:01:54 -->
+## v1.14 Tier1+聊天健壮性 派发完成（4 会话，2026-10-14）
+
+- **用户令**:「Tier 1 用子代理安排出去」+「聊天健壮性组合如果工作量不大也一起打包」→ 评估后打包成 4 个会话、4 个独立分支（文件集互不相交，可并行）：
+  - **S1** `port/v114-capture-hud` = ContentCapture 关闭 + HUD 采样移出主线程（session `***UUID***`）
+  - **S2** `port/v114-thumb-ceiling` = 工具缩略图 512px 上限（session `***UUID***`）
+  - **S3** `port/v114-session-index` = sessions.updated_at 索引 + db 13→14 + 守卫（session `***UUID***`）
+  - **S4** `port/v114-chat-gates` = 聊天健壮性组合 triage+挑移植（session `***UUID***`）
+- **基线** origin/main `1cd1ff31b`；任务书 `/var/minis/shared/port-v114/tasks/S{1..4}.md`；材料 `/var/minis/shared/port-v114/materials/`；报告落 `/var/minis/shared/port-v114/reports/`。
+- **派发后 130s 回读**：4 份全部送达且已开工（S3 最快：已 clone+核对基线；S1 已验工具链；S2/S4 读技能中）。
+- **S4 预 triage 结论（我做的，供 S4 会话核对）**：FallbackPulse 高置信暴露（fork 同构 bug 形状）；Eviction 预期 N/A（fork store 无自动驱逐）；EmptyTurn 设计冲突（fork=计数止损 vs 上游=reminder 重试）→ 条件移植；Orphan/Settle 线索各异待 triage。
+- **流程**：分支 CI 绿 = 停止节点，不合并；结果等用户回来时汇报（或用户直接开会话看）。
+
+<!-- 2026-10-14 10:20:38 -->
+## S2 会话收口：port/v114-thumb-ceiling @ 4ffb437，CI run 38499083898
+
+- S2 会话收口：`port/v114-thumb-ceiling` @ `4ffb437`，CI run 38499083898 success（head_sha 逐字符一致），停在分支未合并。
+- 移植内容：DisplayBitmapLimits 加 `MAX_THUMBNAIL_EDGE_PX=512` + `sampleSizeFor` + `decodeFileBounded`（两段式解码）；5 调用点换绑（Composer 2 处显式 512 / ToolDetail 3 处默认 MAX_DISPLAY_EDGE_PX）+ 测试 5 用例移植。4 文件 +120/−7。
+- 验证：JVM 9/9 绿（stub android.graphics/coil 单次编译）+ 变异负控 512→256 恰 1 红（phone-screenshot 用例）+ CI 全量 9 条 PASSED + BUILD SUCCESSFUL。
+- 范围外发现（只报告不动手）：fork 独有 `ReadImageTool.kt:66` / `AddToHomeSheet.kt:277,:511` 也有裸 `BitmapFactory.decodeFile`，上游 diff 不含 → 非同源，留给用户拍板。
+- 流程坑（复发）：shell_execute timeout 参数上限 900s（设 1800 仍 900 截断）→ gh_ci_wait.sh 长等待要改 bridge 查询 + API 核 sha 双源收口；CI job 日志下载（zip）需 token（未认证 403 admin rights）；grep 计数 "FAILED" 全是测试名含该字且 PASSED——同 429 计数陷阱。
+- 报告：`/var/minis/shared/port-v114/reports/S2.md`。
+
+<!-- 2026-10-14 10:23:09 -->
+## S3 完成：v1.14 移植 sessions.updated_at 索引（port/v114-session-inde
+
+# S3 完成：v1.14 移植 sessions.updated_at 索引（port/v114-session-index @ cf672fe0）
+<!-- 2026-10-14 10:20 -->
+
+- 用户派发任务书 `shared/port-v114/tasks/S3.md`：fork 编号 13→14，updated_at 索引 + 迁移 + 守卫 + 守卫测试（4 文件 +95/−21）。
+- CI build-apk run 38499307871 **success** @ cf672fe0（同 sha 另一条被 concurrency 自动 cancel）。停止节点达成，**停在分支未合并**。
+- **与任务书假设的偏差（如实记录）**：fork ChatSessionEntity 本无 indices、无 folder_id 字段（上游 folder_id 是其 delegate-task 结构），故只加 updated_at 一条索引，不加 folder_id——硬加会因列不存在编译失败。
+- **drop vs no-op 决策**：12→13 反向是 no-op（created_at 索引在实体有声明）；13→14 反向必须真 DROP（updated_at 索引 pre-14 实体未声明，Room open 校验拒绝磁盘上未声明的索引）。守卫 KDoc「empty-body reverse」措辞随之修为「reverse migration (empty body where invisible / real DROP where not)」。
+- JVM 装置坑（复发 2 个）：①守卫 probe 用 `context.getDatabasePath`，Context stub 要带方法；②决策表行数计数先写 16 实为 15（改期望不等于新增行）——「期望写死字面量」纪律抓到。stub 三件套模式（Context/SQLiteDatabase+Closeable/AppLogger）在 /tmp/rkm-s3/jvmstub/，未入库。
+- 报告：`/var/minis/shared/port-v114/reports/S3.md`。
+
+<!-- 2026-10-14 10:24:34 -->
+## S1 完成：v1.14 移植 ContentCapture 关闭 + 资源 HUD off-main（port/v114
+
+# S1 完成：v1.14 移植 ContentCapture 关闭 + 资源 HUD off-main（port/v114-capture-hud @ 15d65007）
+
+**执行结果**（用户令「读任务书并立刻执行」，shared/port-v114/tasks/S1.md）：
+- 条目 A：MinisApp.onCreate 加 `@OptIn(ExperimentalComposeUiApi)` + `ContentCaptureManager.isEnabled = false`（+25 行，含上游注释块；`AgentToolSwitch.migrateLegacyIfNeeded` 未带——fork 无该类）。插入点在 ACRA/:modelservice early-return 之前（fork 分叉点之前）。
+- 条目 B：SystemResourceMonitor 五条增量（coroutines imports / smaps_rollup 读取+getMemoryInfo 回退 / companion parseTotalPssKb / @Volatile×3+@Synchronized×2 / 两处 withContext(Dispatchers.IO)）；fork `[fix/audit-s1m2]` 生命周期门控与 CPU 滚动窗口保留未动。
+- 3 文件 +137/−16；**CI build-apk run #2000 success @ 15d65007**（head_sha 逐字符）；**未合并**（停止节点纪律）。
+
+**关键做法（可复用）**：
+- 上游源码文本断言测试依赖自建 `ProductionSources` 类（fork 无）→ 按任务书改为**沙箱 python 脚本跑等价断言**（读 /tmp clone 源文件），不往 repo 加读源码装置。
+- companion 纯函数 JVM 测试：生产文件含 Android imports 无法直编 → python 按 `companion object` 边界 verbatim 抽取（866 chars）单次编译 + JUnitCore OK (3 tests)。junit jar 也要进 **kotlinc 编译** classpath（否则 unresolved reference 'junit'）。
+- **流程坑（自纠）**：`git clone` 默认分支是 main，commit 落在本地 main 后 `git checkout -b <branch> origin/main` 会把 HEAD 拉回 origin/main、分支不含 commit——先 `checkout -b` 再 commit，或 `git reset --hard <sha>` 重指。远端未污染（push 只推了分支）。
+- grep 验收误报：`isEnabled = true` 全 src 搜索会命中别的类的同名 named-arg（SystemVoiceEntries/ProviderRunConfig）——判据必须带类名前缀（`ContentCaptureManager.isEnabled = true`）。
+
+**报告**：`/var/minis/shared/port-v114/reports/S1.md`。
+
+<!-- 2026-10-14 10:36:33 -->
+## S4 完成：v1.14 聊天健壮性组合移植（port/v114-chat-gates @ a7f6e8e7，CI #2001 绿）
+
+
+**用户令**：「读这个文件并立刻执行：/var/minis/shared/port-v114/tasks/S4.md」（+一次「继续」）→ 条目制移植，停止节点 = 分支 CI 绿。
+
+**结果：5 条目 = 移植 2 / 跳过 3**（分支 2 commits，7 文件 +542/−29）
+
+- **条目 1 FallbackPulseGate 移植**：fork 与上游同构（`ChatViewModel.kt:1088` 单调计数器 + `ChatScreen.kt:2171` 裸 `LaunchedEffect(fallbackTrigger){ if (==0) return }`）→ 加 `remember(viewModel){ …value }` 基线 + `shouldPulse(current, baseline)`；6 例测试。
+- **条目 2 EmptyTurnRecovery 移植（条件成立）**：fork 的恢复只认 tool_result 尾（`AgentLoopEngine.kt:2335` `all { it is ToolResult }`），statement（用户 TEXT）尾直接落 error hint 无重试。改 plan() 驱动三臂（NudgeExistingPart / AppendStandalone / GiveUp）；与 `DETERMINISTIC_EMPTY_LIMIT` 止损不冲突（那是 finish=length 分支，本改动在 clean-finish 分支）；14 例测试。
+- **条目 3 OrphanedRunningToolGate 跳过**：上游孤儿来源（`delegateBlockOverrides`/`AgentJobRegistry`）fork 全 0 命中；DB 重建永不产 RUNNING（`ChatTranscriptRebuild.kt:116-131` result==null→SUCCESS）；取消→CANCELLED（`ChatQueueInterruption.kt:616`）、错误→`setInlineError` 清 isStreaming（`ChatInlineErrorExt.kt:41`）。P2 latent 残余：Pass 2 派发无外层 try/catch（无触发证据，不修）。
+- **条目 4 SettleAfterInteractionGate 跳过**：fork 已换成 `ChatFollowController` 请求式协议（注释明写 "no settle second call" / "retired settle-after-interaction"），`isScrollInProgress` 只作门控不作重钉触发。
+- **条目 5 EvictionGuard N/A**：`ChatViewModelStore` 无 trim/LRU/onTrimMemory（只有显式 `release()`）；`MinisApp.onTrimMemory`(:1227) 回收 shell + markdown/KaTeX 缓存，不碰 VM store。
+
+**★ 可复用提炼（移植方法论）**：上游 gate 类修复的 triage 判据应问三层——①**同构度**（fork 消费点是否同一形状：条目 1 是 → 直拿）；②**上游赖以成立的机制在 fork 是否存在**（条目 3/5：`delegateBlockOverrides`、LRU trim 在 fork 根本没有 → 上游 gate 无附着点）；③**fork 是否已用别的设计消掉了病根**（条目 4：不是修了同一个 bug，而是换掉了产生 bug 的机制）。三层任一不成立 = 跳过并留证据行号，比硬移植更值钱。
+
+**★ 装置技巧**：上游测试依赖 fork 没有的符号（`AgentCallback`、`ProductionSources`、`shouldClassifyAsEmptyTurn`）→ 不伪造 stub 撑门面，而是**删除依赖用例 + 把源 grep 守卫改指 fork 的真实文件**（复用 fork 既有的 `readRepoFile` walk-up 先例，`CompactExhaustedRescueTest.kt:251`）。上游测试的源 grep 守卫极好用：它读生产源码断言「恢复分支只动 agentHistory、不落库不进 UI」——这类契约测试比行为测试更难被未来改动绕过。
+
+**验证**：沙箱 20 例绿（FallbackPulse 6 + EmptyTurnRecovery 14）；变异负控双条（MutA `shouldPulse>=0` → 3 红；MutB text 分支改 GiveUp → 5 红）；CI build-apk #2001(id 38500532414) success @ a7f6e8e7，job 日志 grep 20 PASSED / 0 FAILED（防假绿）。**停在分支，未合并**。
+报告：`/var/minis/shared/port-v114/reports/S4.md`；装置 `/var/minis/shared/work/port-v114-s4/`。
+
+<!-- 2026-10-14 11:25:48 -->
+## v1.14 Tier1+S4 已合并 main（2026-10-14）
+
+- **结果**：4 分支（capture+hud / thumb-ceiling / session-index / chat-gates）→ 合并前核查 8 项×4 全过（含 4 套变异负控）→ merge `1cd1ff31b→d5d2be59`（4 个 no-ff merge commit: 64099635/404bf204/50c403df/d5d2be59）→ **release CI #2002 success** → 4 远端分支已删。报告 `shared/port-v114/reports/MERGE-REPORT.md`。
+- **核查要点**：零文件重叠（并行安全的先决条件在此次验证为真）；合并后复验 scan.sh 21 门 + 4 套 JVM 测试 38 例全绿；S2 合并树复验时 stub 文件已被清（/tmp/s2-jvm）——教训：**依赖他人 /tmp 装置的验证要在同一轮内完成或提前归档装置**。
+- **交付修正**：S3 报告的任务书假设有偏差（fork 无 folder_id 索引、无「追加」而是「新建 indices」）——S3 如实记录并按实际处理，这是好行为（任务书不是圣旨，与仓库现实冲突时以仓库为准 + 记录偏差）。
+- **新候选**：ReadImageTool/AddToHomeSheet 裸解码收口；AppDatabase「NO downgrade」陈旧注释修缮。
+- **真机待观察**（用户装 APK 后）：流式 CPU / HUD 占用 / 长会话内存 / Move-to 停顿。
+
+<!-- 2026-10-14 11:49:38 -->
+## 应用现状快照（2026-10-14，对照 10-06 盘点）
+
+
+- 真机：`1.0.0+2002`（#2002 release 构建，11:47 装）= main HEAD `d5d2be59f`，逐字符一致；权限健康。
+- v1.14 移植四连完成（capture+hud / thumb-ceiling / session-index / chat-gates），上游性能/健壮性关键条目清零；上游 main 仍停 v1.14（b4c0661）。
+- CI 总 2017 runs，近 100 = 83S/8F/9C（红全在分支首轮）；main 近 32 条 30 绿 0 红。近 7 天 86 commits，功能冻结+可靠性纵深模式不变。
+- 运行：0 FATAL/crash；beacon 5 条全 silent_kill 兜底语义；RSS ~240MB 与 10-06 p50 253MB 持平。唯一 ERROR = 上游 max_output_tokens 截断（非 app 缺陷）。
+- 待拍板：ReadImageTool/AddToHomeSheet 裸 decode；AppDatabase NO downgrade 陈旧注释。待真机：流式 CPU/HUD/长会话内存/Move-to。
+- backlog 84 条；主题线维持不跟上游（teal）。
+
+<!-- 2026-10-14 13:52:33 -->
+## 报告：/var/minis/shared/sweep-1014/TRIAGE.md；任务书 tasks/FIX-{1..
+
+- 报告：`/var/minis/shared/sweep-1014/TRIAGE.md`；任务书 `tasks/FIX-{1..9}.md`；报告落 `reports/`。核实基线 main @ `d5d2be59f`（浅克隆 `/var/minis/shared/work/rkm-verify-1014`）。
+- **核实结论：12 项发现 11 项实锤（16 个真缺陷），P1 主要声明（KaTeX 256MB 软件层）未证实不修**；D3b includeSecrets=用户拍板口径（只修文档）；MarkdownParser 每行正则=backlog 已登记不修维持。
+- **实锤要点**：B1 DebugServer :159 soTimeout 30s + :277 CharArray 按字符读字节长度；B2 PersistentShell :565 顶层 eval 特殊内建 + EC:219 重跑链；B3b SIG_DFL 未保存 old handler（nativeInstall 六路 sigaction 第三参 nullptr）破坏 tombstone；B4a tarNormalizeMember("./")→null→Slip 整包拒（自产自销也炸）；B5a 守卫对全部位置参数匹配（cp 只读源被拒）+ of= 写旁路；B5b startsWith 无规范化；B6 file 分支无 runCatching 组合期崩溃（StreamingMarkdownText:374 remember 内同步调）；B7a sessions/ vs minis-sessions 孤儿岛；D1a KeyRoulette:134 明文 key 作 JSON 键；D2a terminalPresent false→continue 与 SKIP_CANCELLED 互相推诿；D3a backup_rules 排除 proot/（无此目录）漏 alpine-rootfs/jieba/media。
+- **派发 9 会话**（文件集互不相交，停止节点=分支 CI 绿）：FIX-1 `0df9c7a1` shell / FIX-2 `ec7d8720` crash-cpp / FIX-3 `e81b4d14` sandbox-io / FIX-4 `6f60a52d` debug-backup / FIX-5 `13016342` ui-links / FIX-6 `8bc0b956` webapp / FIX-7 `2b2f6971` key-roulette / FIX-8 `0dae4f50` reaper / FIX-9 `9aba4b58` fileread。分支名 fix/sweep1014-*。
+- **互斥约束**：FIX-1 禁改 ExecutionCoordinator（FIX-8 的文件）；FIX-5 禁动 LAYOUT_PIXELS/LAYER_TYPE（256MB 未证实）；FIX-7 禁动 ProviderFactory（D1b 登记）；FIX-8 只动 reaper + EC:931 shutdown 一处。
+- 派发后 140s 回读：9 份全部送达且开工（msgs 6-29）。
+
+<!-- 2026-10-14 14:22:21 -->
+## FIX-7 完成：KeyRoulette 明文密钥落盘修复（fix/sweep1014-key-roulette @ 41e6a796f，CI #2004 绿）
+
+<!-- 2026-10-14 14:25 -->
+
+- 任务书 `shared/sweep-1014/tasks/FIX-7.md`；报告 `shared/sweep-1014/reports/FIX-7.md`；装置 `shared/work/sweep1014-fix/f7/`。
+- **修复**：KeyRoulette 落盘键（key_roulette.json）明文 API key → SHA-256 截 16 字节 hex。选型「哈希键全链路统一」（内存 map + 落盘 + lookup/prune 同形状）优于任务书两个备选：init 读回直接恢复 LRU 时间戳，跨冷启动语义完整；明文不落盘也不进内存。legacy 明文 JSON 读回按 `^[0-9a-f]{32}$` 守卫跳过一次（stamp 丢、密钥不丢）。
+- **验证**：JVM 7/7 绿（org.json 用 Maven jar /tmp/org-json.jar 复刻）+ 变异负控（persist 键还原明文 → 恰 3 红全在落盘路径）+ scan 21 门全绿。**CI build-apk #2004 success @ 41e6a796f（head_sha 逐字符一致）。停在分支未合并。**
+- **测试坑**：round-trip 用例初版只画一画——未画过的键落盘 stamp=0，恢复后 LRU 选它而非已画的键；期望错非 bug，改场景两键各画一次后全绿。
+- **流程坑（新）**：`git clone /本地路径` 后 origin 指向本地参考克隆——push 打到参考克隆并触发 PRoot 跨克隆 `bad pack`（参考克隆无损，rejected 未写入）。修正 = `git remote set-url origin https://github.com/***OWNER***/RikkaMinis.git` 再走 gh_sync.sh push。本地 clone 后先查 `git remote -v` 再 push。
+- **装置未入库**：KeyRouletteTest.kt 依赖外部 org-json.jar + 反射 reset 单例状态，入库会让 gradle test 缺依赖——留在 shared/work/f7/。
+
+<!-- 2026-10-14 14:28:04 -->
+## FIX-5 完成：链接解析 B6 + KaTeX 假就绪 P1b（fix/sweep1014-ui-links @ 12
+
+# FIX-5 完成：链接解析 B6 + KaTeX 假就绪 P1b（fix/sweep1014-ui-links @ 12b6354，CI #2005 绿）
+
+用户令「读 /var/minis/shared/sweep-1014/tasks/FIX-5.md 并立刻执行」。基线 main d5d2be59f。
+**报告**：`shared/sweep-1014/reports/FIX-5.md`；工作树 `/var/minis/shared/work/sweep1014-fix/f5/repo`。
+
+**修复**（7 文件 +190/−18）：
+- B6 崩溃：file:// 链接裸 % 在 Compose 组合期抛异常=闪退 → 新建 JVM-pure `UriPathDecode.kt`（只解 %XX、保留 +、裸%回退、连续 %XX 一段 UTF-8），统一切换全部 5 处同族解码点（resolver minis/file、missing-reason、image fetcher ×2）。
+- B6 distinctBy：`distinctBy{it.item}` 只置灰首次出现 → per-URL verdict 缓存，全部出现置灰且 resolve 成本不变。
+- P1b：KatexWebViewPool onRendererGone 改 `completeExceptionally`（原 complete(Unit) 让等待者 ok=true 后对死 WebView 烧 4s）；awaitReady 包 try/catch 返回 false 不传播。pending Triple(0,0,err) 语义已核实不动。
+- 硬约束全守：LAYOUT_PIXELS/SOFTWARE 层/# 保留语义/tap 手势未碰。
+
+**验证**：JVM 10/10 绿（verbatim 编译，零 stub）；变异负控（还原 URLDecoder 旧语义）恰 6 红；scan.sh 21/21；CI build-apk #2005 success，head_sha 逐字符一致。**停在分支未合并**。
+
+**流程坑（新，复发预防）**：从本地参考克隆 clone 出的 repo，origin 指向本地路径——`gh_sync.sh push` 报 `bad pack` 且推错目标，必须先 `git remote set-url origin https://github.com/...` 再推。另：BusyBox sed `\x27` 不转义；kotlinc 无顶层 `chr()`；变异脚本走 python heredoc。
+
+<!-- 2026-10-14 14:41:27 -->
+## FIX-1 完成：PersistentShell eval 特殊内建隔离（fix/sweep1014-shell @ 3e6f4824，CI #2008 绿）
+
+
+**报告**：`/var/minis/shared/sweep-1014/reports/FIX-1.md`；装置 `shared/work/sweep1014-fix/f1/`。
+**修复**：命令体改子 shell `( eval ... )`（eval 是 Special Built-in，exit/语法错误/set -e 旧形态杀死整个持久 shell → 被误判 OOM 自动重跑）；抽出顶层纯函数 `internalBuildShellCommand`；2 文件 +152/−13。applyEnvironment 本就直写顶层 export（硬约束 1 天然满足）；marker 格式/chunk-boundary/ExecutionCoordinator 零改动。
+
+**★ 任务书外的回归面（已补）**：纯子 shell 会杀掉 cwd 跨命令持久性——本会话实测 agent 的 shell_execute cwd 跨调用继承（上个 cd、新调用裸 pwd 可见），GLOBAL.md 工作流（gh_sync clone --dir 相对路径）依赖它。修法 = EXIT trap 落子 shell 最终 cwd 到 `/tmp/.minis_cwd_{marker}` + 父 shell 读回 cd；trap 未触发（SIGKILL）时文件缺失保持现 cwd。真 ash 9 场景全过（含旧形态 bug 复现、exit code 不被 trap 玷污、cd+exit 0 路径 trap 触发）。
+
+**验证**：真 ash 9 场景（BusyBox ash=guest 同款）+ JVM 8/8（PersistentShell.kt 含 Android imports 不能直编 → S1 先例 python verbatim 抽取纯函数编译）+ scan.sh 21/21 + CI #2008（id 38521755657）success head_sha 逐字符一致，job 步骤逐条核查（unit tests 全量 + scan gate 绿，防假绿）。**停止节点达成，停在分支未合并。**
+
+**自纠**：测试期望写错——wrapper 静态发射 `${RET}` 模板，`containsMatchIn("\\d+")` 静态断言必然不匹配（运行时才展开）；「期望写死字面量」纪律抓到，改断言模板字面量 + 模拟展开过 parser。
+
+<!-- 2026-10-14 14:48:42 -->
+## SWEEP-1014 第二/三轮核实与派发（2026-10-14，续第一轮 9 会话之后）
+
+
+- 报告：`shared/sweep-1014/TRIAGE-R23.md`（第一轮 TRIAGE.md）；任务书 `tasks/FIX-R{1..12}.md`；核实基线 main @ `d5d2be59f`（同一浅克隆）。
+- **核实结论：24 项中 23 项实锤，D6（UpdateChecker 断点续传）降级登记不修**——backlog §94：UpdateChecker 唯一调用方 DebugRPCHandler、DebugServer 被 BuildConfig.DEBUG 门控 → release 整链 R8 摇树剔除，无触发面（触发=有人把它接上生产调用方）。**backlog 读边契约这次真的拦下了一个修复**。
+- 实锤要点（行号见 TRIAGE-R23）：B8 @索引根路径错/沙盒路径多拼 sid；B9 记忆按行倒序注入；B10 克隆会话不拷 minis-sessions+media（报告称 filesDir 未用不实，:214 用了）；B11 Anthropic input_json_delta 不计 contentChars+无 EOF tool flush；B12/B15/B16/B17/B18/B19/B20/B21 全确认；D4/D5/P3/P4/P5/P6 确认；D7 是 :86-93 canonicalize TODO 之外的**额外**绕过面（前导 / + deleteDocument("")）；D8 缺 separator；D9 askpass 在 workspace 根（同时存在仓库 assets 与 live 双副本）。
+- **派发 12 会话**（文件集互不相交）：R1 chat-agent `01c25078`（B8+B13+B19）/ R2 memory `35bda2f3`（B9+B21）/ R3 session-term `9250aecd`（B10+B18）/ R4 providers `514390bd`（B11+B14）/ R5 mcp-stdio `f90b85b0`（B12）/ R6 mcp-http `7c2a266c`（D4+P3）/ R7 oauth `e9cfa5ef`（D5）/ R8 browser `f6b43332`（B17）/ R9 speech `12f199a4`（B20）/ R10 sandbox-low `a9433481`（B15+B16+P5）/ R11 perf `b99c09ea`（P4+P6）/ R12 security `c7d1fb05`（D7+D8+D9）。分支 fix/sweep1014-*。
+- **派发后确认全部开工**（msgs 3-50；R10-R12 慢 ~10 分钟才起，运行时排队属正常，勿误判丢失）。
+- **收口待办**：①21 会话（9+12）的分支 CI 绿核查 + 汇总；②R2/R12 完成后同步 live 技能副本（semantic_memory.py / gh_sync.sh+gh_ci_wait.sh，防 §75 漂移）；③D6 已按修复门登记（触发条件写在 TRIAGE-R23 与 backlog §94 关联）。
+- mcp-cli 源码实际路径 = `src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/`（不是仓库根 src/minis-mcp-cli，报告行号照抄会扑空）。
+
+<!-- 2026-10-14 14:55:21 -->
+## 任务书 shared/sweep-1014/tasks/FIX-4.md（用户令「读这个文件并立刻执行」）；工作树 sw
+
+- **任务书** `shared/sweep-1014/tasks/FIX-4.md`（用户令「读这个文件并立刻执行」）；工作树 `sweep1014-fix/f4/`。
+- **验证**：JVM 8/8 绿（decodeBody CJK/emoji/ASCII/incomplete + ByteLineReader + isAuthorized 契约）；变异负控 char 口径 → 恰 2 红（CJK+emoji）；XML minidom OK + proot 残留 0；scan.sh 21/21；CI build-apk run 38522827526 success @ c569a1ce5eee（head_sha 逐字符一致，API+bridge 双源）。**停在分支未合并**。
+- **装置坑**：①companion object 不能嵌 standalone object——verbatim 抽取 wrapper 用 class；②期望值写错复发（`{"msg":"你好"}`=16 字节，JSON 外壳 ASCII 10 字节漏算成 6）——期望须独立计算；③gh_ci_wait.sh 缺 --repo/--ref/--workflow 即退，改 bridge+API 双源查询更快。
+- **结果**：B1 DebugServer body 改字节路径（ByteLineReader 零预读 + decodeBody 纯函数 + incomplete→400）；D3a 排除名 proot/→alpine-rootfs/+jieba/+media/（3 处 XML）；D3 KDoc/README「凭据随包」对齐 includeSecrets=false（行为不改）。5 文件 +100/−17。诚实边界：端到端 socket 未验（需 Android 运行时），JVM 纯函数级为任务书 fallback。
+
+# FIX-4 完成：DebugServer UTF-8 边界 + 备份排除名（fix/sweep1014-debug-backup @ c569a1ce，CI #38522827526 绿）
+<!-- 2026-10-14 15:00 -->
+
+<!-- 2026-10-14 14:55:24 -->
+## FIX-9 完成：FileReadTool 流式读（fix/sweep1014-fileread @ 54ed955e，CI #38521242226 绿，停在分支）
+
+<!-- 2026-10-14 14:35 -->
+
+用户令「读任务书并立刻执行：/var/minis/shared/sweep-1014/tasks/FIX-9.md」。基线 d5d2be59f，1 文件 +144/−27。报告 `shared/sweep-1014/reports/FIX-9.md`；装置 `shared/work/sweep1014-fix/f9/jvm/`。
+**验证**：JVM 差分 440/440（33 边界 + 400 fuzz + 负 lines 错误形状 + 500k 行 112ms）——旧 readLines 实现 verbatim 对照，**输出字节级不变**；scan 21 门全绿；CI head_sha 与本地逐字符一致（bridge + API 双源）。**未合并**。
+
+**★ 对拍抓到的真 bug**：buildCappedContent 初版用 `sb.isNotEmpty()` 判分隔符——**空行丢 `\n`**（fuzz 13 例 off-by-one）+ sb==maxLength 后再追加溢出。修法：行号序判分隔 + 循环顶预算守卫。take(maxLength) 语义：分隔符 `\n` 计入 maxLength 预算、可在分隔符处截断。
+
+**装置坑（新）**：①kotlinc 在 /opt/kotlinc/bin（不在 PATH，`nice kotlinc` 静默失败）；②facade 类名 = 文件名Kt 非首个类名；③top-level object 成员在 main() 要带前缀；④API 核 sha 比对串必须用 rev-parse 全量，短 sha 恒 False；⑤负 lines 复刻 subList 错误消息需带实际下标（head: fromIndex=coerced start, toIndex=from+lines；tail: fromIndex=totalLines-lines, toIndex=totalLines）。
+
+<!-- 2026-10-14 15:01:18 -->
+## 报告：/var/minis/shared/sweep-1014/reports/FIX-8.md；装置 /var/min
+
+- 报告：`/var/minis/shared/sweep-1014/reports/FIX-8.md`；装置 `/var/minis/shared/work/sweep1014-fix/f8/`。
+- CI：build-apk run **#2009**(38521853265) success @ `0fa943a`（head_sha 逐字符，gh_ci_wait --expect 核验）；job 日志 grep 7/7 `ModelExecutionOrphanReaperTest > * PASSED`、0 真实 FAILED。**停止节点达成，停在分支未合并**。
+- **D2a（P1）**：reaper 加 cancelled-orphan 分支（cancel 存在 + 无 terminal + 不活 + 足龄 10min）——原 terminal 屏障与恢复侧 SKIP_CANCELLED 互相推诿，被取消后 worker 崩溃的 run 目录（数 MB Base64）永久滞留。不活判定双信号任一判活即跳过（beatAlive ∨ probeLiveness==ALIVE；probe 的 DEAD 在 hidepid 不可信不作死亡证据）。纯函数 `shouldReapCancelledOrphan` + 7 例测试 + 双门变异负控（拆 age 门 2 红 / 拆 cancel 门 3 红）。PartialStreamRecoveryPolicy 未动。
+- **D2b（P2）**：stale shutdown 标记（model-exec/shutdown 全仓无删除点 → shutdownRequested 永久 true + 重启 worker 首个 quiescent finish 假自杀）→ 主进程侧 `cleanupStaleShutdownMarker` 挂低频 sweeper，30min 足龄即删（最坏代价=少一次自杀）。**worker 侧读到即删（ModelExecutionService）未动，已登记**（非本任务文件集）。
+- 坑复发：clone 自参考克隆 → origin 指向本地路径，push 报 `bad pack`（PRoot 跨克隆已知坑）→ `git remote set-url origin https://github.com/...` + gh_sync.sh askpass 即解。
+- 语法级验证口径：缺 Android deps 时 kotlinc 编译大文件必然一串级联错误——对照基线**错误画像逐类计数**（30 cannot/202 unresolved 等）一致 + 0 条 expecting/unexpected token = 无结构错误。
+
+<!-- 2026-10-14 15:06:54 -->
+## 停止节点达成，停在分支未合并：fix/sweep1014-webapp @ dfd1cf29（2 commits，3 文
+
+- 停止节点达成，**停在分支未合并**：`fix/sweep1014-webapp` @ `dfd1cf29`（2 commits，3 文件 +200/−8），CI build-apk #2013 success，head_sha 逐字符一致；job 日志 3955 PASSED / 0 FAILED。
+- **FIX-6 内容**：B7a 拷贝目录改 `SessionFileStore.sessionsRoot`（minis-sessions，读写两侧同改 + 旧 `sessions/` 读侧 5 行回退 + 取消/失败 pin 清理 copiedFile，HostFile 活文件不删）；B7b `presetGlyphKind` internal 纯函数 + `drawPresetGlyph` 8 个 Paint/Canvas 白矢量图形（不引新资源）。本地 JVM 9/9 + scan 21/21。
+- 中途红一次（#2003）：internal 函数暴露 private-in-file `IconPreset` —— **可见性放宽要成对做**（function 和它的参数/返回类型），CI compileReleaseKotlin 抓到。
+- 新坑：`gh_ci_wait.sh --expect` 按完整 sha 逐字符比对（短 sha 误 drop）；`/actions/jobs/<run_id>/logs` 404，须先 `runs/<id>/jobs` 拿 job id。报告 `shared/sweep-1014/reports/FIX-6.md`。
+
+<!-- 2026-10-14 15:14:28 -->
+## 用户令：「读 /var/minis/shared/sweep-1014/tasks/FIX-2.md 并立刻执行」。B3
+
+用户令：「读 /var/minis/shared/sweep-1014/tasks/FIX-2.md 并立刻执行」。B3a（P2）+ B3b（P1）全修：crash_handler.cpp 1 文件 +105/−37。
+
+- **B3a**：删 handler 内 gmtime_r/localtime_r（tz 锁 → 崩溃时死锁抓不到崩溃），换 clock_gettime + civil_from_days 纯算术 UTC；Local: 行按任务书授权删除（已核实 CrashFrequencyDetector 只按文件名前缀+mtime 消费，不解析该行）。
+- **B3b**：install_and_save 捕获六路 old handler（debuggerd，first install wins）+ restore_and_reraise 重抛前恢复（三处早退一并改走）——墓碑链修复。
+- **验证**：harness 16/16（真实信号流 + 6 个日期 ground truth）+ 变异负控双条（A：月序数公式拆→5 红；B：restore 拆→进程死于 SIGSEGV 139，恰为旧缺陷行为）+ scan 21/21 + CI run 38522317659 @ 83ea79e91 success（head_sha 逐字符，bridge+API 双源）。**停在分支未合并**。报告 shared/sweep-1014/reports/FIX-2.md。
+- **★ 流程坑（自指死循环）**：harness 初版先 `sigaction` 装自家 handler 再 install_and_save → 保存的 old handler 是 handler 自己 → 重抛 restore 回自己 → g_in_handler 永远为 1 → 死循环卡 10 分钟。测试信号 handler 时装订顺序必须「先装 fake previous，再 install_and_save」。
+- **认识修正（自查两次）**：误以为 fork CI 不编译 .cpp（jniLibs 预编译入库）——实查 build-apk.yml 有 `Rebuild crash handler native lib from source`（NDK r28 重编 libminis_crash_handler.so，set -e fail-on-error）+ JNI 符号硬门。看到「externalNativeBuild (CMake) DISABLED」注释不等于 .cpp 没人编译，先 grep workflow 再下结论。
+
+<!-- 2026-10-14 15:33:36 -->
+## 2026-10-14 15:33:36
+
+<!-- 2026-10-14 15:35:58 -->
+## 验证：复现装置实跑旧代码 25/25 轮丢响应（server trace 证 4 条响应全发出）+ 每次超时稳定泄漏 +
+
+**验证**：复现装置实跑旧代码 25/25 轮丢响应（server trace 证 4 条响应全发出）+ 每次超时稳定泄漏 +1 读线程；新代码 0/25 丢、0 泄漏、stderr-crash 附上下文。scan 21/21；CI build-apk #2016 success @ f2e706db（head_sha 逐字符）。**停在分支未合并**。
+
+**修复**（daemon.py + transport/stdio.py 同构，+282/−63）：`_StdioReader` 常驻读线程（readline 循环弃 for-iter）+ 按 msg.id 分发 per-request Queue + EOF 置所有 pending None 哨兵 + stderr DEVNULL→PIPE 40 行环形缓冲附 crash 消息。对外契约逐字符保留（TIMEOUT/STDIO_CRASH 格式、notification 语义、_handshake 引导文案）。
+
+- **装置坑（新）**：daemon.py 硬编码 `sys.path.insert(0, "/usr/local/lib/minis-mcp-cli")` 且沙箱里存在该已安装旧副本——harness 加载源码时须把该行文本替换指向 repo 包目录，否则测的是安装副本。
+- **测试坑（新）**：fake server 在 daemon 线程里 `sys.exit(1)` 只退线程不退进程（客户端表现为 TIMEOUT 非 EOF）——模拟子进程退出必须 `os._exit(1)`。
+- 报告：`shared/sweep-1014/reports/FIX-R5.md`；装置 `shared/work/sweep1014-fix/r5/harness/`；工作树 `shared/work/sweep1014-fix/r5/repo`。
+# FIX-R5 完成：MCP stdio 常驻读线程 + stderr 环形缓冲（fix/sweep1014-mcp-stdio @ f2e706db，CI #2016 绿）
+
+<!-- 2026-10-14 15:37:40 -->
+## 报告：shared/sweep-1014/reports/FIX-R2.md；工作树 shared/work/sweep
+
+- 报告：`shared/sweep-1014/reports/FIX-R2.md`；工作树 `shared/work/sweep1014-fix/r2/`。
+- 任务书 `shared/sweep-1014/tasks/FIX-R2.md`。基线 main `d5d2be59f`，commit `b7fa97d7`。
+- **验证**：B21 python 17/17（glob 三年份 + 假 backend 回退三场景：i>0 重置整表重跑 40 条全 1024 维）；B9 JVM 6/6（verbatim 抽取 companion newestFirstPreview）+ 变异负控（旧逐行 takeLast().reversed()）恰 6 红；scan 21/21；CI build-apk #2015 success @ b7fa97d7（gh_ci_wait --no-dispatch --expect 逐字符）。**停在分支未合并**。
+- **修复**：B9 注入路径改条目级倒序（marker 切条目 → 条目 reverse → take(injectLines)），输出格式/续写提示不变；B21 semantic_memory.py glob 年份无关 `[0-9]{4}-[0-9]{2}-[0-9]{2}.md` + hf→cf 回退 `if i>0: i=0` 整表重跑保维度严格一致。mapNotNull 静默丢词登记不修（触发条件在报告）。
+- **live 待同步**：`/var/minis/skills/semantic-memory/semantic_memory.py` 由主会话收口时同步分支版本。
+- 坑（新）：file_edit 换 docstring 丢闭合 `"""` → py_compile 报下游 docstring 的 full-width 括号 SyntaxError（行号误导定位）；kotlinc 在 /opt/kotlinc/bin/；`gh_ci_wait.sh` 只有 `--no-dispatch`（无 --run/--help）。
+
+<!-- 2026-10-14 -->
+# FIX-R2 完成：memory 层 B9 注入倒序 + B21 维度混杂（fix/sweep1014-memory @ b7fa97d，CI #2015 绿）
+
+<!-- 2026-10-14 15:37:54 -->
+## 验证：JVM 13/13 绿（两纯类 CaptureEpochGuard/TtsDrainTracker 从生产文件 v
+
+**验证**：JVM 13/13 绿（两纯类 CaptureEpochGuard/TtsDrainTracker 从生产文件 verbatim 抽取 + `in` 匹配复核）；变异负控双条（MUT-A releaseIfCurrent 还原无条件 → 恰 2 红全在归属路径；MUT-B onFinished 去 epoch 检查 → 恰 3 红全在 onFinished 家族）；scan 21/21；CI build-apk #2019 success @ b3f2e4c0，head_sha 逐字符一致。**停在分支未合并。**
+- B20a：recording 共享 AtomicBoolean → CaptureEpochGuard（tryBegin 领 epoch / releaseIfCurrent 只清自己 / isCurrent 作循环条件让被取代 job 立即停读麦 / forceRelease 留给 stop/cancel/shutdown，对外语义不变，60s 成功路径 flag 释放保留）。
+- B20b：TTS 两 plain Int 计数 → TtsDrainTracker（speak/stop 开新 epoch，utteranceId 编 `tts-<epoch>-<uuid>` 前缀，flush 旧句回调被忽略，计数改 Atomic）。
+- 流程坑：index.lock 零字节残留（本会话 git 崩溃遗留）→ 清 lock 后必须先 `git status` 核对恰好 N 文件 modified + HEAD 仍基线再重提交；测试用例 `utteranceId(t.enqueue())` 参数即一次 enqueue——嵌套调用隐式计数。
+**任务书**：`shared/sweep-1014/tasks/FIX-R9.md`；报告 `shared/sweep-1014/reports/FIX-R9.md`；装置 `shared/work/sweep1014-fix/r9/jvm/`。
+用户令「读 /var/minis/shared/sweep-1014/tasks/FIX-R9.md 并立刻执行」。基线 main d5d2be59f。
+
+# FIX-R9 完成：speech 域 B20a/B20b epoch 归属修复（fix/sweep1014-speech @ b3f2e4c，CI #2019 绿）
+<!-- 2026-10-14 15:40 -->
+
+<!-- 2026-10-14 15:38:06 -->
+## 任务书 shared/sweep-1014/tasks/FIX-R7.md；报告 shared/sweep-1014/r
+
+任务书 `shared/sweep-1014/tasks/FIX-R7.md`；报告 `shared/sweep-1014/reports/FIX-R7.md`；工作树 `shared/work/sweep1014-fix/r7/`；装置 `r7/jvm/`（junit jar 复用 `review-subagent-1009/jvm/`）。
+**验证**：JVM 3/3 绿 ×3 遍（verbatim 真实类 + Log stub 全签名含 Throwable + loopback socket 测试）+ 变异负控（基线恰 2 红：bind 全失败/幻影 cancel，③外部取消保持绿）+ scan 21 门 + CI build-apk 38525717553 success @ 7aed9c4（head_sha 逐字符一致）。**停在分支未合并**。
+**修复**：D5a = bind 全失败分支直接调 stop()（既有语义恰为 running=false + 消费 onExternalCancel，controller 零改动）；D5b = 成功路径在 onCode 前 `onExternalCancel = null`。
+- 测试坑：server 异步 bind，测试连接前必须重试轮询（Connection refused = bind 未完成，非 bug）。
+- 坑（复发）：gh_ci_wait.sh 代理 TLS 抖动 exit -1 ×2 → curl --http1.1 --retry 直查 API 收口；`true` 也要带 command 参数（delay 单独用会缺参数被拒）。
+
+<!-- 2026-10-14 15:38:23 -->
+## FIX-R6 完成：MCP 温热握手 + server_name 白名单 + k=v JSON 字面量（fix/swee
+
+# FIX-R6 完成：MCP 温热握手 + server_name 白名单 + k=v JSON 字面量（fix/sweep1014-mcp-http @ 8b4bfe1，CI #2018 绿）
+
+- 分支 `fix/sweep1014-mcp-http` @ `8b4bfe1ddded258c4632d5bef05c41c8377176a6`（基线 main d5d2be59f），3 文件 +138/−15。**CI build-apk #2018 success，head_sha 逐字符一致。停在分支未合并。**
+- **修复**：P3 = HTTPTransport 加 `_initialized`（list_tools/call_tool 温热 1 POST 不再 3 连握手；404/400+有 session id → 重置重试一次；ping 保留真往返绕过缓存）；D4a = Python `validate_server_name` + Kotlin `MCPOAuthStore.validateServerName`（`^[A-Za-z0-9._-]+$` max 128 拒 `..`，refuse 而非截断；`importPendingClientSecret` 因被 Compose remember 调用故 null+log 不 throw）；D4b = `_parse_value` k=v JSON 字面量优先（10→int/true→bool/'"10"'→str），help 同步。
+- **验证**：沙箱 verify_r6.py 28/28（POST 计数/stale 重试/白名单/类型）+ Kotlin verbatim 编译 exit 0（stub 三件套 + Maven json-20240303.jar）+ validateServerName 9/9 + py_compile + scan 21/21。
+- **自引遗漏被读 daemon 调用点救回**：改造 list_tools 时丢了 `(result).get("tools")` 解包层——改接口行为前先读全部消费方（daemon `result.get("tools")`）。
+- **测试坑（复发 3 次）**：①子类 override `_post` 后 append 又调 super 再 append = 双重计数，先算条件、raise 路径才 append；②fake 忘模拟 server 发 session id → 重试守卫（`_session_id` 必须真）永远不触发，404 直接冒出——守卫按设计生效被误判为 bug；③stale 触发点写错（第一次 warm 调用就 404）。
+- **新发现 file_read offset 空体（复发）**：file_read 带 offset 返回空 body，换 `awk '{printf "%d|%s\n", NR, $0}'` 行号读法。
+- 任务书 `shared/sweep-1014/tasks/FIX-R6.md`；报告 `shared/sweep-1014/reports/FIX-R6.md`；装置 `shared/work/sweep1014-fix/r6/verify_r6.py` + `/tmp/r6-jvm/`。
+
+<!-- 2026-10-14 15:39:15 -->
+## FIX-R12 完成：D7 provider id 规范化 + D8 前缀守卫 + D9 脚本加固（fix/sweep1
+
+# FIX-R12 完成：D7 provider id 规范化 + D8 前缀守卫 + D9 脚本加固（fix/sweep1014-security @ 60538e6，CI #2024 绿）
+
+- **修复**（6 文件 +252/−37）：D7 MinisDocumentsProvider 3 个 companion 纯函数（normalizeDocId/readOnlyTopOf/isWithinRoot）+ 6 消费点全换绑 + 根目录写/删/改显式拒绝 + resolveDoc canonicalize（[audit-P3] 注册前义务清零，Manifest 未动）；D8 ArtifactArchiver isUnderBase（== base 或 startsWith(base+sep)）换绑 :98；D9 gh_sync.sh ensure_askpass 移 /tmp（per-pid、0700、trap EXIT 清理）+ gh_ci_wait.sh enc_ref 编码（:92/:121 两处裸拼 &branch=${ref} 全换绑）。
+- **验证**：沙箱 verbatim 抽取 4 纯函数编译 22 断言全绿 + CI 真跑核 job 日志（新单测 9 例全 PASSED，FAILED 计数 5 全是测试名含该字）+ D9 端到端（push/dispatch 本身就用修改后脚本跑通）。**停止节点达成，停在分支未合并**。
+- **装置坑（新）**：python 按缩进抽取 Kotlin 函数体——`src.index("internal fun")` 指向不含前导缩进的起点，用 `len(lines[0]) - len(lines[0].lstrip())` 算 fn 行缩进恒为 0（lines[0] 无前导空格）→ 表达式体函数吞进下个成员的 `}`、续行不 dedent，kotlinc 报歧义/语法错。修法 = `fn_line_indent = i - (src.rfind("\n", 0, i) + 1)`。复发预防：缩进抽取先打 repr 验证再编译。
+- **live 待同步**：`/var/minis/skills/github-ops/scripts/{gh_sync.sh,gh_ci_wait.sh}` 未动（任务书只许改仓库副本），合并后同步（详见报告 Live 同步清单）。
+- 报告：`shared/sweep-1014/reports/FIX-R12.md`；工作树 `/var/minis/shared/work/sweep1014-fix/r12/repo`。
+
+<!-- 2026-10-14 15:40 -->
+
+<!-- 2026-10-14 15:40:23 -->
+## 任务书 shared/sweep-1014/tasks/FIX-R3.md；报告 shared/sweep-1014/r
+
+任务书 `shared/sweep-1014/tasks/FIX-R3.md`；报告 `shared/sweep-1014/reports/FIX-R3.md`；工作树 `shared/work/sweep1014-fix/r3/`；JVM 装置 `/tmp/r3-jvm`（未入库，依赖 stub）。
+
+# FIX-R3 完成：duplicateSession artifacts 拷贝 B10 + 终端挂载守卫 B18（fix/sweep1014-session-term @ bea70ca0，CI #2023 绿）
+<!-- 2026-10-14 16:05 -->
+
+- **验证**：JVM 11/11 绿（verbatim 抽取顶层函数 + stub companion，kotlinc 2.0.21）+ 变异负控（排除判据翻 `return true` → 恰 5 红全在排除路径用例）+ scan.sh 21/21 + 括号配平 3 文件全平。CI build-apk #2023 success @ bea70ca0bdfe…（gh_ci_wait 全 sha + API 独立核实双源）。**停在分支未合并**。
+- **修复**（3 文件 +382/−31）：
+  - B10：duplicateSession 在 DB 提交后调 `copySessionArtifacts` —— minis-sessions/<sid>/{attachments,offloads,workspace,browser} + media/<yyyy/MM/dd>/<sid> 递归拷到新 id（Files.walkFileTree + REPLACE_EXISTING）；运行态排除（非 regular 非目录=socket/FIFO/symlink、Chromium Singleton*、*.lock/*.sock）抽顶层纯函数 `isCopyableArtifactEntry`；失败收集进 warnings 永不 abort 克隆。
+  - B18：终端 per-session mounts 改 `.also { it.mkdirs() }` + 无条件挂载（与 ExecutionCoordinator:735 agent-shell 逐字符同模式）；死码 outputBytes SharedFlow + lastTranscriptLength 删除（全仓 grep 无消费者实证），KDoc 三处改写。
+- **范围外发现**：TerminalSession.clearVersion 也无 UI 消费者（同款死码候选），未动留拍板。
+- **坑（新增 4 + 复发 1）**：①gh_ci_wait `--expect` 必须完整 40 位 sha（精确比对，短 sha 把正确 run 全 drop，白等 880s）；②file_edit 大段替换会吃掉函数尾部收尾段（stray `}` + 函数掉出类外）——old/new 锚点带完整边界，改完 grep 结构复核；③Kotlin import 放声明之后整条失效，报错点在远处使用点；④`java.nio.file.BasicFileAttributes` 在 `.attribute` 子包——production 写错包路径被 JVM 装置当场抓到（CI 前拦截）；⑤参考克隆 rkm-verify-1014 已被清理——从相邻会话 r2/repo 本地 clone + set-url origin 换 GitHub（先查 remote -v 再 push）。
+
+<!-- 2026-10-14 15:42:39 -->
+## 任务书 shared/sweep-1014/tasks/FIX-R8.md；报告 shared/sweep-1014/r
+
+任务书 `shared/sweep-1014/tasks/FIX-R8.md`；报告 `shared/sweep-1014/reports/FIX-R8.md`；装置 `shared/work/sweep1014-fix/r8/`。
+
+# FIX-R8 完成：Browser B17 tab id 恢复 + 下载横幅（fix/sweep1014-browser @ 6d353d9，CI #38527943061 绿）
+<!-- 2026-10-14 15:40 -->
+- **修复**（BrowserTabPool.kt 1 文件 +123/−3）：B17a 弃任务书策略②（自相矛盾：nextTabId=maxId+1 后 id 永远命中不了 savedURLs 键，恢复路径死掉，过不了强制的「标签页恢复」验证），选①：companion 纯函数 `planTabRestore`（nextTabId=max(saved,live)+1 + live 赢 dropped + MAX_TABS 超额保留 + selected 回退）+ loadSavedState 清 savedURLs（session-scoped，corrupt JSON 时 clear 不到达保旧行为）+ 异步 Main 重建 restoreSavedTabs + createTab 加 explicitId 参数 + nextTabId @Volatile。B17b：settleDownload 横幅按剩余 DOWNLOADING 条目切/清（任务书「PAUSED」在本枚举不存在）。
+- **验证**：JVM 7/7 绿（verbatim 抽取）+ 变异负控 A（seed+0 → 恰 5 红）/ B（去 live-wins → 恰 1 红）+ 复抽 md5 对照（生产未污染）+ scan 21/21 + CI success head_sha 逐字符。**停在分支未合并。**
+- **流程坑**：cwd 继承坑复发 2 次（脚本相对路径写产物落错 repo/，extract 后必须回查落点）；kotlinc 经 `| head` 吞退出码（报错仍打 COMPILE_OK），要用 `; echo exit=$?`；sed 变异锚点缩进先 grep 再 sed。
+
+<!-- 2026-10-14 15:43:49 -->
+## FIX-R4 完成：Anthropic mid-tool-call 丢调用 B11 + ThinkTagScanning 围栏反转 B14a + SkillRepository frontmatter B14b
+
+用户令「读 /var/minis/shared/sweep-1014/tasks/FIX-R4.md 并立刻执行」。基线 main d5d2be59f，分支 fix/sweep1014-providers @ 110877b，5 文件 +199/−7。CI build-apk #38527940475 success，head_sha 逐字符一致。**停在分支未合并**。
+
+
+- **B11**：AnthropicProvider EOF 兜底 flush（对齐 OpenAI responses-API drain T248 模式，currentToolId 未 Complete 时发 ToolCallComplete 交 ToolJsonRepair）+ toolChars 累加器（input_json_delta 计入，truncated 条件扩为 contentChars||toolChars）→ 纯工具回合中途断开也发 Finished(truncated=true)。
+- **B14a**：stripOrphanThinkClosers 重写为围栏感知（行首 ``` 切换 inFence、围栏内照抄、**标记行整行跳过**、围栏外 inline parity 照旧）。
+- **B14b**：rescanFromDisk copy() 补 frontmatter（extractFrontmatterBlock）；renameSkill 抽 companion 纯函数 renameFrontmatterName（只改 frontmatter 块内 name 行，无 frontmatter 返回 null 文件不动）。
+- **验证**：JVM 13/13 绿（verbatim 零 stub）+ 变异负控 MutA 2 红（围栏系）/ MutB 1 红（正中无 frontmatter 旧 bug）+ scan 21/21 + CI 绿。B11 不可沙箱编译（Android 依赖链），以对齐 OpenAI 既有策略 + CI 编译覆盖。
+- **负控抓出初版 bug（负控价值实证）**：围栏闭合标记的三个反引号曾落进 ticks 计数（inFence 切换后 '`' 走计数分支）→ 测试红 → 修正为标记行整行跳过。
+- 报告 `shared/sweep-1014/reports/FIX-R4.md`；工作树 `shared/work/sweep1014-fix/r4/`（9 会话齐 r1-r4）；JVM 装置 r4/jvm/ 未入库（repo 已补等价正式测试）。
+
+<!-- 2026-10-14 15:45 -->
+
+<!-- 2026-10-14 16:00:39 -->
+## 报告：shared/sweep-1014/reports/FIX-R11.md；工作树 shared/work/swee
+
+报告：`shared/sweep-1014/reports/FIX-R11.md`；工作树 `shared/work/sweep1014-fix/r11/`。
+
+# FIX-R11 完成：BPE O(N) 堆合并 + a11y 环 O(1) cap + history 惰性渲染（fix/sweep1014-perf @ 2fb43d1，CI 绿）
+
+用户令「读 FIX-R11.md 并立刻执行」。基线 main d5d2be59f。
+
+- **P4a BPETokenizer**：索引区间 + 双向链表 + rank 最小堆（Long 打包零分配），O(N) vocab lookups 替代 O(N²) sliceArray——实测 1,274,385 → 4,715 次（270×）。返回值 List<Int>→count（词表外段计 1，mapNotNull 静默丢词修复，单调性恢复）。tie-break 与旧扫描一致，stale 条目 pop 时重算丢弃。
+- **P4b**：BoundedEventRing<T>（JVM-pure 泛型）+ AtomicInteger 替代 ConcurrentLinkedQueue.size O(N) 每事件全遍历；cap/FIFO 语义不变，4 处换绑。
+- **P6**：无 query 读改尾部倒序惰性渲染（达 maxItems/maxChars 即停），输出与 eager 逐字节一致；query 路径保持 eager。header 分支 matched.isEmpty 改写为 query!=null && matchCount==0（等价）。
+- **验证**：JVM harness（真实源 verbatim + git HEAD 旧实现对拍）：P4a 500+500 fuzz 对拍/丢词修复、P4b cap+并发 smoke、P6 15 组参数逐字节一致；变异负控三变异各钉住（MUT-A rank 忽略→P4a 8 红；MUT-C 计数不增→P4b 3 红；MUT-B2 遍历反转→P6 惰性 8 红而 query 5 例绿）；scan 21/21；CI build-apk 38529738461 success @ 2fb43d1c9（head_sha 逐字符一致）。**停在分支未合并**。
+- **范围外发现**：P6 `page.isNotEmpty()` 守卫在合法参数域不可达（display 截断 421 < maxChars 下限 500，变异拆它 0 红）——防御深度保留登记，升级触发 = maxChars 下限调 <~450。
+- **环境坑**：①`sleep N` 在命令里触发 stall-guard（180s 无输出被杀，中断两次）——长等待用工具 delay 参数；②between(end="\n}") 匹配无缩进 }（object 结束），函数内缩进 } 不匹配；③verbatim 抽取须补 import；④::f 函数引用参数个数必须精确匹配（误导性 "inapplicable candidate"）。
+
+<!-- 2026-10-14 16:06:35 -->
+## FIX-3 完成：FastioTar + 只读挂载守卫（fix/sweep1014-sandbox-io @ bf01735cd，CI #2027 绿）
+
+**报告**：`/var/minis/shared/sweep-1014/reports/FIX-3.md`；装置 `/var/minis/shared/work/sweep1014-fix/f3/jvm/`（extract_f3.py 从生产源 verbatim 抽取可重跑防漂移；liverun.sh / mutate.sh）。
+**验证**：JVM 64 例绿（真 busybox tar 1.37 对拍 round-trip：`tar -cf a.tar .` 解开 + 自产 archive busybox 解包 + 140 字节 symlink 'K' 头往返）+ 沙箱实跑 20/20（读出全放行/写入全拦截）+ 四组变异负控（7/1/3/1 红各自钉住）+ scan 21/21 + **CI build-apk #2027 success @ bf01735cd**（head_sha 逐字符，job 日志 MountGuardScriptTest 9 例 + FastioTarTest 3 例跑过防假绿）。**停在分支未合并**。
+
+<!-- 2026-10-14 15:55 -->
+
+- **KDoc 内嵌套注释陷阱（★ 可复用，两轮 CI 才抓到）**：KDoc 里逐字引用 wrapper case 模式 `` `"$prefix"/*` `` —— `/*` 在 Kotlin **块注释内开启嵌套注释**（Kotlin 支持嵌套），编译器把后半文件当注释 → `Missing '}'` + `Unclosed comment`。判据：CI 报 Unclosed comment 而本地看行号对不上 = 找文件里 KDoc/注释内的 `/*` 序列。预防：引用 shell 模式时改写避免 `/*`；**PRootKernel 这类 Android 依赖文件 push 前也要跑一次 kotlinc 单文件语法级编译**（Android unresolved 可忽略，Missing }/Unclosed comment 会暴露）——这次装置只编译了抽取部分，生产源没编。
+- **private→internal 成批引用遗漏**：mountGuardScript 提 internal，同批引用的 GUARD_MARKER/MOUNT_GUARD_LAST_ARG_CMDS 忘提 → CI #2025 测试编译红。同族：改可见性要 grep 全部引用。
+- **装置 chmod 漏模拟 setExecutable**：wrapper 落盘 644，ash PATH 查找遇 EACCES **静默跳过**走真 busybox → 实跑假放行（读出全 PASS 是假象）。生产代码有 setExecutable 的，装置必须 chmod +x。
+- **shell 装置 expect 与命令分两行**：`expect 1 "desc"\n cmd` → `"$@"` 空 rc=0，命令独立执行（错误消息反而证明 wrapper 全拦对了）——装置本身的语法错误会伪装成「被测对象不工作」。
+- **B4b 二选一写清理由**：长 linkName 选写 GNU 'K' 头而非拒绝——读侧已有解析、成本与 'L' 模式相同、合法数据完整优于造失败；主 header 的 linkname 照 GNU 语义截断。
+- **B5a 分命令形状**：cp/mv/ln 只查最后非 flag 参数（源是合法读出）；dd 查 `of=` 值且排除 `oflag=`/`ofs=`；touch/tee/mkdir/rm/rmdir 全参数（语义全是目标）。守卫语义零放宽：命中只读前缀仍 exit 1。
+- 流程：`&&` 链上 python 抽取失败会**短路后续语法检查**——失败后单独补跑，别信链。
+
+<!-- 2026-10-14 16:12:32 -->
+## SWEEP-1014 第四/五轮核实与派发（2026-10-14，续前 21 会话之后）
+
+
+- 报告：`shared/sweep-1014/TRIAGE-R45.md`；任务书 `tasks/FIX-R{13..23}.md`；基线 main @ `d5d2be59f`。
+- **核实结论：23 项中 21 项实锤**。**P7 误报不修**（`response.body?.string()` 本身关闭 body，`JSONObject` 抛异常发生在已关闭之后——OkHttp string() 语义，报告的"响应体为空/解析异常泄漏连接池"两路径都不成立）。**P8 部分有误**：copyResized **已有** inJustDecodeBounds+inSampleSize（:570-576，报告称未做不实），仅 recycle 缺失属实但 API 26+ 像素在 Java 堆 → 降级顺手。**D10 = backlog F-8 已登记项**（minis:// 子资源门只挡显式 Origin），本次用户拍板升级修复。
+- 实锤要点：B22 photos type-all 饥饿（Images 先用满 limit → Video 配额 0）+SDF 并发；B23 config gate 队列中超时不 removeFirst（僵尸确认框）+入队即启动计时；B24 model-use `else -> ""` 管道 100% 空消息；B25 doList DTSTART>= 漏进行中+all-day 本地午夜配 UTC tz；B26 booleanFlags 漏 async/help（--async 吞 send）+静态 SDF；B27 scheduled 无 Mutex 双触发；B28 text/plain 无 EXTRA_STREAM 回退；D10 无 Origin fail-open（`<script src="minis://">` 可被外部页偷读本地）；D11 MediaPlayer 不 release+check-then-act 覆盖泄漏；B29 formatFileSize(null) 恒空串（AOSP if(context==null) return ""）+FileItem.from 先 exists 后 symlink；B30 星期下标 -1（SessionsShared 已有正确写法）；B31 双解码；B32 skill 更新主线程+无 zip+slugify id；B33 视频 width=0 锁 100px+无 onRelease+音频同步 prepare；B34 contacts search 吞 --max 值；B35 8KB 边界 U+FFFD；D12 注释自认无 onRelease；D13 FilePreviewHolder 进程死亡白屏；P9 readBytes 击穿 500KB cap；P10 2N+1 查询；P11 31 处 Regex。
+- **派发 11 会话**：R13 photos `fbc32a7e`（B22+P8）/ R14 modeluse `753c0c83`（B24）/ R15 calendar `6b04c6c3`（B25）/ R16 sessions-cli `f5262fb9`（B26）/ R17 browser-sec `fde0f4f4`（D10）/ R18 media `cfec6c0a`（D11）/ R19 concurrency `562ba5b6`（B23+B27+B28）/ R20 fileui `83fa5479`（B29+B31+D13+P9）/ R21 ui-misc `910723cb`（B30+B33+B35+P11）/ R22 skills-ui `c2969307`（B32+D12）/ R23 contacts `4a8bf35d`（B34+P10）。分支 fix/sweep1014-*。
+- 派发后确认全部开工（msgs 11-23）。
+- **累计状态**：5 轮 59 项发现 → 实锤 ~55，误报/登记 4（P1-KaTeX 256MB、P7-WeatherManager、P8 部分、D6-UpdateChecker R8 摇树）；**32 个修复会话**（9+12+11）在跑，全部停止节点=分支 CI 绿。
+- **收口待办**：①32 分支 CI 绿核查 + 汇总报告；②R2/R12 完成后同步 live 技能（semantic_memory.py / gh_sync.sh+gh_ci_wait.sh）；③互斥约束执行核查（FIX-1 禁改 EC / FIX-5 禁动 LAYOUT_PIXELS / FIX-7 禁动 ProviderFactory / R18 禁改 InlineMediaPlayer / R22 两处一起改 SkillImportSheet）。
+
+<!-- 2026-10-14 16:26:26 -->
+## 任务书 shared/sweep-1014/tasks/FIX-R1.md；报告 shared/sweep-1014/r
+
+任务书 `shared/sweep-1014/tasks/FIX-R1.md`；报告 `shared/sweep-1014/reports/FIX-R1.md`；工作树 `shared/work/sweep1014-fix/r1/`。
+
+# FIX-R1 完成：@-mention 会话根 + 截断静默门 + 子代理截断处理（fix/sweep1014-chat-agent @ 50b89326，CI 绿）
+
+- **修复**（6 文件 +433/−15，ChatViewModel 只动构造点）：B8 FileMentionIndex Layer1 恒空（构造点 minis-global → context.filesDir，Layer1 改扫 minis-sessions/<sid>/，linuxRoot 去 /<sid>，Layer2 随根移 minis-global/）；B13 :212 包 if(!silent)（同族 :277/:328/:343/:476/:489 窄触发登记不修）；B19 监听 Finished（复用 TruncatedToolCallPolicy + lengthWallReminder，续写上限 4，空截断带注不续写，双 Error 前缀修复）。
+- **任务书偏差（如实记录）**：B19「systemPrompt 未传入请求」不成立——ChatPromptAndTools:516 闭包已传 gateway；参数只是函数体内未引用（死参数），加验证注释防复发 triage，未改 lambda 签名（超 4 文件范围且收益零）。
+- **验证**：JVM 18/18 绿（verbatim 抽取编译）+ 变异负控双条（MutA 旧路径还原恰 4 红 / MutB 截断门拆掉恰 4 红，零交叉污染）+ scan 21/21 + CI build-apk 38532014549 success @ 50b89326（head_sha 逐字符一致）。**停在分支未合并**。
+- **装置坑（新，复发预防）**：①verbatim 抽取用大括号配平在 JSON 模板/转义字符串上易截断——改列 0 `}` 行定位（顶层函数结束于列 0）；②kotlinc /opt/kotlinc 的 coroutines-core jar 版本旧，test-jvm 1.9 报 cannot access DelayWithTimeoutDiagnostics——须用 gradle 缓存 core 1.9.0 与 test 1.9.0 同版本；③FileMentionIndex.publish 切 Main，纯 JVM 抛 missing Main dispatcher——测试用 setMain(StandardTestDispatcher()) + resetMain + advanceUntilIdle（先例 ConfigConfirmationGateNotifyTest）；④`SupervisorJob() + dispatcher` 触发 Job.plus(Job) deprecated 歧义——scope 用 Unconfined。
+
+<!-- 2026-10-14 17:06:03 -->
+## FIX-R16 完成：sessions-cli booleanFlags 漏声明 B26a + 共享 SDF B26b（
+
+# FIX-R16 完成：sessions-cli booleanFlags 漏声明 B26a + 共享 SDF B26b（fix/sweep1014-sessions-cli @ 595b4f3e，CI #2030 绿）
+
+任务书 `shared/sweep-1014/tasks/FIX-R16.md`；报告 `shared/sweep-1014/reports/FIX-R16.md`；装置 `shared/work/sweep1014-fix/r16/`（jvm harness：OffloadArgs verbatim + OffloadOutput stub，**src+test 必须同一次 kotlinc 编译**——internal 可见性按模块，分两次编译互相看不见）。
+
+**修复**（SessionsOffloadHandler.kt 1 文件 +133/−12）：
+- B26a：booleanFlags 补 `"full", "async", "help", "h"`——`--async send` 的 send 被吞成 value、子命令退化 list。OffloadArgs 本体（共享类）未动。
+- B26b：companion DATE_FMT → 不可变 `java.time.format.DateTimeFormatter`（HangDetector:170 / CrashFileReporter:58 实际修法即此，非任务书说的「每次局部新建」——先看同族实况再动手）；4 调用点 `Date(...)` → `Instant.ofEpochMilli(...)`。
+
+**验证**：JVM 7/7 绿（前后对照 + wiring 断言）+ 变异负控（MutA 回退 booleanFlags → 恰 1 红；MutB 回退 DATE_FMT → 恰 2 红）+ scan 21/21 + CI run #2030 success @ 595b4f3e（gh_ci_wait 全 sha + curl API 双源）。**停在分支未合并。**
+
+**坑（复发）**：
+- ★ **变异恢复连带丢修复（再踩）**：负控 `git checkout -- <file>` 把未 commit 的本体修复一并回滚到 HEAD → MutB 在修复前版本上跑、最终文件=HEAD，7 处修复全部蒸发靠 md5 对照发现重打。**负控之前必须先 commit 本体**——这条已在 daily log 里，本次图省事没先 commit 又踩。git 的 restore 恢复的是 HEAD 不是「本次修复」。
+- `gh_ci_wait.sh` 必须带 `--repo`（否则 exit 64）；PRoot 瞬时 `date/python3: Function not implemented`（exit -1）原样重试即好。
+- gh_sync.sh push 先推到克隆遗留的本地 origin 报 `bad pack`——`git remote set-url origin` 换 GitHub 再推（FIX-R8 同款坑第 2 次）。
+
+<!-- 2026-10-14 17:07:20 -->
+## FIX-R10 完成：B15+P1 bashism 误开 heredoc / B16 fastio mv 跨设备回退 /
+
+# FIX-R10 完成：B15+P1 bashism 误开 heredoc / B16 fastio mv 跨设备回退 / P5 pty 越界（fix/sweep1014-sandbox-low @ 2eb71c38，CI #2029 绿）
+
+- **流程坑（新）**：`gh_ci_wait.sh` 需要 `--repo owner/repo` + `--ref <branch>` + `--workflow <file>` 三参数显式给（cwd 内也不行）。
+- **B15 证据修正（重要）**：任务书里的 `<<< "$payload"`（带引号+`$`）在旧正则下**不命中**（`(\w+)` 卡在 `$`）——真正打穿的是不带引号 `<<< $content` / `<<< "content"`。只还原正则时负控 11 全绿（保留的算术守卫单独挡住算术场景）——负控必须做成「正则+守卫」整体回退，才恰 4 红（全 B15 专项）。
+- **B16 ATOMIC_MOVE 语义陷阱（可复用）**：`Files.move` 带 ATOMIC_MOVE 会丢掉 JDK REPLACE_EXISTING 的友好异常映射——file→非空目录从 DirectoryNotEmptyException 退化为裸 FileSystemException("Is a directory")。保住可读报错要前置守卫（force 且 dst 非空目录）。两个 POSIX 对齐语义变化（file 不再替换空目录、dir 不再替换 file）如实记录，无测试钉住旧行为。
+- **B16 沙箱边界**：EXDEV 不可本地复现（PRoot 下 /tmp 与 /var/minis st_dev 相同，df 显示 tmpfs vs f2fs 但设备号一致）→ 回退分支用提取的 `copyDeleteFallback` 直调测试覆盖；残留清理测试 chmod 000 驱动 visitFileFailed，根环境 Assume 跳过、CI 非根已跑通。
+- **JNI harness 双重间接（复发防）**：host 侧 jni.h C 模式 `JNIEnv = const struct JNINativeInterface_ *`，native 内 `(*env)->fn(...)`——harness 里 env 必须指向「表指针」变量（JNIEnv* = const tbl**），指向表本身必段错误（实测 `(*env)=0` 诊断出）。
+- **环境坑**：编译产物放 /tmp 会被收割机制吞（Probe3Kt.class 分钟级消失）；`fun f(label, mk: () -> T, force = true)` 不支持尾 lambda（默认值参数挡在 lambda 后）；talloc 内存报告噪声混入输出并偶发杀命令 → 长输出落盘 grep。
+- **验证**：BashismDetectorTest 12/12 + FastioCopyTest 14/14 + P5 native harness 7/7 + scan 21 门全绿；CI build-apk #2029 success @ 2eb71c38（head_sha 逐字符），job 日志 26 PASSED / 0 FAILED（含 CI 驱动的残留清理用例）。变异负控三条：B15 整体回退恰 4 红、B16 MutB/MutC 各恰 1 红。
+- 任务书 `shared/sweep-1014/tasks/FIX-R10.md`；报告 `shared/sweep-1014/reports/FIX-R10.md`；工作树 `/var/minis/shared/work/sweep1014-fix/r10/`，harness `/var/minis/shared/work/sweep1014-fix/r10-harness/`。基线 main d5d2be59f。**停在分支未合并**。
+
+<!-- 2026-10-14 17:13:27 -->
+## FIX-R15 完成：calendar B25a Instances 相交列举 + B25b all-day UTC 锚
+
+# FIX-R15 完成：calendar B25a Instances 相交列举 + B25b all-day UTC 锚定（fix/sweep1014-calendar @ e4c6e83，CI #38538412677 绿）
+
+用户令「读 /var/minis/shared/sweep-1014/tasks/FIX-R15.md 并立刻执行」。基线 main d5d2be59f，1 文件 +67/−18。CI build-apk run 38538412677 success @ e4c6e83f（head_sha 过滤查询逐字符一致）。**停在分支未合并**。
+- 报告 `shared/sweep-1014/reports/FIX-R15.md`；装置 `shared/work/sweep1014-fix/r15/`。
+- **修复**：B25a doList 从 Events `DTSTART>=? AND <=?`（跨天/进行中日程全漏 + 不展开 RRULE）改 Instances 表 + doFreebusy 同形相交 `BEGIN<?end AND END>?start`，输出字段/排序/--max 语义不变（id 用 Instances.EVENT_ID）；B25b all-day 分支 parseDateUtc（UTC 锚定，start/end 双侧），parseDate 抽 `parseDateInZone(s, nowMs, zone)` 纯函数（默认 getDefault，非 all-day 语义逐字符不变）。companion 抽 `instanceOverlapsWindow` + `instancesWindowSelection`（args 顺序承重）。
+- **验证**：JVM 9/9 绿（verbatim 行号区间抽取 + stub CalendarContract.Instances）+ 变异负控双臂（MUT-A 判据翻回旧语义 → overlapsTruthTable 红；MUT-B 旧时区行为 → allDayDateUtc 红且红值恰为 bug 特征 1791907200000）+ scan 21/21 + CI 绿。ground truth = python datetime 独立算的 1791936000000/1791907200000。
+- **坑（复发+新）**：①**python 花括号配平抽取对表达式体函数失效（新，同族 r12 变体）**——表达式体函数没有自己的 `{`，配平器把 `${...}` 字符串模板当块吞进下个成员 → 用 grep 行号区间直接抽取（774–779/784–786）；②kotlinc 管道吞退出码（复发，必须 `> log 2>&1; echo exit=$?`）；③junit jar 进 kotlinc classpath（复发）；④extract.py 相对路径 + cwd 继承坑（复发）；⑤测试期望写错被装置当场抓——`2026-10-14T00:00:00+08:00` 的时刻本来就是 10-13T16:00Z，红后先判测试错还是代码错；⑥gh_ci_wait TLS 抖动 exit -1 → curl --http1.1 --retry 直查 `runs?head_sha=` 收口。
+
+<!-- 2026-10-14 17:13:36 -->
+## 验证：JVM 23/23 绿（planQueueAdvance + decideSingleSend verbatim
+
+- **验证**：JVM 23/23 绿（planQueueAdvance + decideSingleSend verbatim 抽取，junit4 + kotlinx-coroutines 1.9.0 jar 复用 review-subagent-1009/jvm）+ 变异负控 MutA 拆 PurgeQueued 恰 4 红全在族内 / MutB 还原无 STREAM 回退恰 2 红全在回退用例 + scan 21/21 + CI #2032 success head_sha 逐字符（gh_ci_wait --repo 参数必带；TLS 抖动 exit -1 复跑即过）。**停在分支未合并**。
+- **修复**（3 文件 +145/−35）：B23 ConfigConfirmationGate 计时器改 pending 时才启动（新增 startTimeout）+ resolve 走纯函数 planQueueAdvance（PurgeQueued 分支 `queue.removeAll`，advance 为新 pending 启动计时器，删未用 advance 局部变量）；B27 ScheduledTaskRunner checkAndFireToday 完整主体包 checkMutex.withLock（表达式形式，`?: return` 经 inline withLock 非局部返回）；B28 ShareReceiverActivity handleSingleSend 走 decideSingleSend 纯函数（EXTRA_TEXT 空回退 EXTRA_STREAM，text 优先/非 text 无 STREAM Drop 均 parity）。
+- 任务书 `shared/sweep-1014/tasks/FIX-R19.md`；报告 `shared/sweep-1014/reports/FIX-R19.md`；工作树 `shared/work/sweep1014-fix/r19/`（基线 main d5d2be59f，从 rkm-verify-1014 本地 clone + set-url）。
+- **B27 装置边界**：checkAndFireToday 依赖 MinisApp/ScheduledTasksStore 不可 JVM 直跑 → 模式级测试（kotlinx-coroutines 复现无锁双 fire=2 / 有锁 100 并发恰 1）+ 生产文件结构断言（`= checkMutex.withLock {`），CI 编译覆盖本体。
+<!-- 2026-10-14 17:15 -->
+# FIX-R19 完成：确认门队列清除+计时起点 B23 / 定时任务 Mutex B27 / 分享 STREAM 回退 B28（fix/sweep1014-concurrency @ 56f63f5，CI #2032 绿）
+
+<!-- 2026-10-14 17:17:47 -->
+## FIX-R22 完成：skills-ui B32 更新路径 IO+zip parity/真实 id + D12 WebV
+
+# FIX-R22 完成：skills-ui B32 更新路径 IO+zip parity/真实 id + D12 WebView onRelease（fix/sweep1014-skills-ui @ 399a2d76，CI #2033 绿）
+
+- 任务书 `shared/sweep-1014/tasks/FIX-R22.md`；报告 `shared/sweep-1014/reports/FIX-R22.md`；工作树 `shared/work/sweep1014-fix/r22/`；JVM 装置 `r22/jvm/`（未入库，依赖 stub）。
+- **修复**（2 文件 +230/−135）：B32a = fileUpdateLauncher 重写（scope.launch + withContext(IO)，failureRes/failureMsg 双通道）+ 共享 helper 抽取 `isZipArchiveBytes`/`readUriBytes`（SkillImportSheet 内联魔数判定换绑同一 helper）+ zip 分支走 `importFromArchive(preferredId = skill.id)`（replace-in-place + scripts/ 解包）；B32b = `resolveUpdateTargetId`（id==slug 优先，否则 name==incoming，null 回退 slug）+ `parseSkillMdPublic` 全字段 update + IO 包裹 + 删死码 parseSkillName/extractBody；D12 = SafeWebViewClient hoist 出 factory + 公共桥 `releaseDeadInstance` + AndroidView `onRelease`（`===` 检查防 ref 竞态）。
+- **验证**：JVM 13/13 绿（verbatim 零 stub）+ 变异负控 A 拆 bytes[2] 检查恰 2 红 / B 拆 name 匹配恰 1 红 + scan 21/21 + 括号配平（parens −1 与 HEAD 基线同值，既有字面量）+ CI build-apk #2033 success @ 399a2d76（head_sha 逐字符一致）。**停止节点达成，停在分支未合并。**
+- **坑（复发/新）**：①`gh_sync.sh push` 直接路径调用 Permission denied → `sh` 调用；②**本地 clone 的 origin 指向参考克隆**——push 打到 rkm-verify-1014 报 bad pack，push 前 `git remote -v` 回查 + set-url 换 GitHub（r22 新增变体相：不是 fetch 坏 pack，是 push 目标错）；③gh_ci_wait 248s 处 TLS 抖动 exit -1 → 重跑即收敛，--expect 幂等复用 in-flight run。
+- **边界登记（报告内，不扩）**：①B32b 文本刷新分支不拉 scripts/（zip 分支无此边界）；②update() 无 frontmatter 参数，incoming 新增 frontmatter 键不落（既有块保留）。
+
+<!-- 2026-10-14 17:18:55 -->
+## FIX-R13 完成：photos B22a 视频饿死 + B22b DateFormat 线程安全 + P8 recy
+
+# FIX-R13 完成：photos B22a 视频饿死 + B22b DateFormat 线程安全 + P8 recycle（fix/sweep1014-photos @ ba0ef82c，CI #2037 绿）
+
+用户令「读 /var/minis/shared/sweep-1014/tasks/FIX-R13.md 并立刻执行」。基线 main d5d2be59f，分支 fix/sweep1014-photos @ ba0ef82c620717fc7f2225ef9a889250891e56c6，1 文件 +71/−17。CI build-apk #2037 success，head_sha 逐字符一致（gh_ci_wait + API 双源）。**停在分支未合并**。
+
+- **B22a**：queryMedia 改返回 List<MediaEntry>（companion `data class MediaEntry(ts,json)`）+ 纯函数 `mergeMediaLimit`（双指针归并 desc 双列表取前 limit，ts<=0 排最后，>= 平局照片先出）；handleList 两种媒体各查 limit 条后内存归并——视频不再被 shared-quota（limit-arr.length()）饿死。输出 JSON 字段/limit 语义不变。选方案①不选 Files 统一查询（OEM 表语义差异）。
+- **B22b**：minSdk=26 → java.time DateTimeFormatter 常量 + formatDateTime 助手（Instant.atZone(systemDefault) 与 SimpleDateFormat 默认时区一致），5 个共享实例调用点全换绑；parseDate/formatIso 局部新建本就安全未动。
+- **P8**：copyResized bmp+中间 scaled bitmap 在 finally recycle（out!==bmp 防重复）；既有 inSampleSize 未重做（报告原文有误，任务书已更正）。
+- **验证**：JVM 8/8 绿（verbatim 逐行校验抽取 + org.json 不透明 stub）+ 核心场景 20 照片 3 视频混排死字面量 + 变异负控「照片优先排空」恰 5 红全在归并路径 + scan 21/21 + 括号 186/186。
+- **坑（新 3）**：①**replace_all 改字面量多括号**——`format(Date(dt)))`（3 个右括号）→ `formatDateTime(dt)))` 多带一个 `)`，CI kspReleaseKotlin 报 Unexpected tokens 两处才抓到；教训：改字面量先数括号层级，别只对齐文本尾部。②companion 内嵌套 data class 外部 unresolved——抽取时提升到装置文件顶层（verbatim 行不变）。③测试数据尺度不一致（photos 20..1 vs videos 19500 scaled）→ 期望序列错测试红；混合数据先统一尺度再写死字面量。
+- **流程**：run 2034 是 run_number 不是 run_id（`/runs/2034/jobs` 404），须按 head_sha 过滤取 id；amend 后 push 被拒需 --force-with-lease。
+- 报告 `shared/sweep-1014/reports/FIX-R13.md`；装置 `shared/work/sweep1014-fix/r13/jvm/`。
+
+<!-- 2026-10-14 17:19:47 -->
+## 任务书 shared/sweep-1014/tasks/FIX-R23.md；报告 shared/sweep-1014/
+
+任务书 `shared/sweep-1014/tasks/FIX-R23.md`；报告 `shared/sweep-1014/reports/FIX-R23.md`；工作树 `shared/work/sweep1014-fix/r23/`（从 GitHub 直浅克隆——rkm-verify-1014 是 blob:none partial，本地 clone 传播报 unable to read tree）；JVM 装置 `r23/jvm/` 未入库。
+
+**修复**（ContactsOffloadHandler.kt 1 文件 +113/−15）：B34 = search query 改 `searchQueryOf(parsedArgs.positional)`（positional[0]=subcommand、[1]=query）+ max 用 `parsedArgs.getInt("max","n")?:20`（`--max=10` 等式形式顺带生效；`-n` 是 parseMax 遗留，doList 未动）；P10 = collectContactPage 收集一页 + batchQueryValues `CONTACT_ID IN (…)` 按 500-id 分块各查一次 Phone/Email + aggregateValues 纯函数聚合（n≤500 共 3 次查询，分块守住 SQLite 999 参数上限）；输出 JSON 结构逐条不变，doGet 单联系路径保留原样。
+
+**验证**：JVM 24/24 绿（verbatim 抽 OffloadArgs 全文 + companion 三纯函数 + OffloadOutput stub；负控=旧 buggy 行为给 "10"≠"Alice"）+ scan 21/21 + 括号 69/69 + CI run 38539583891 success，head_sha 逐字符一致（bridge+API 双源）。**停止节点达成，停在分支未合并。**
+
+**坑（新增 4）**：①kotlinc 带无源文件参数（只有 -d）会进 REPL 挂死 900s；②单文件重编译留旧 class 在 out/ 且 `| head` 吞编译失败退出码，java 跑旧类——rm -rf out 全量重编 + 重定向取退出码；③gh_ci_wait.sh 需要 --repo（无 --help），本会话 550s 处遇 date/python3 Function not implemented 环境故障退出，bridge+API curl 双源兜底收口；④负控调用口径：旧 buggy 代码入参是 rawArgs.drop(1)（不含 subcommand），喂全量 list 误判负控失败。
+<!-- 2026-10-14 17:30 -->
+
+# FIX-R23 完成：contacts B34 query 吞词 + P10 批量聚合（fix/sweep1014-contacts @ 31280f34，CI #2035 绿）
+
+<!-- 2026-10-14 17:20:37 -->
+## FIX-R18 完成：media D11 回调 release + play() check-then-act（fix/
+
+# FIX-R18 完成：media D11 回调 release + play() check-then-act（fix/sweep1014-media @ 406fac3，CI #2036 绿）
+
+用户令「读 /var/minis/shared/sweep-1014/tasks/FIX-R18.md 并立刻执行」。基线 main d5d2be5，分支 fix/sweep1014-media @ 406fac3，1 文件 +25/−3。CI build-apk #2036 success，head_sha 逐字符（gh_ci_wait --repo 参数必须带，之前会话没提过）。**停在分支未合并**。
+- **修复**：①onCompletion/onError → synchronized(lock){ releaseSession }（选定 release+保留条目元数据，不选置空——置空需 player 改 nullable 牵连 5 消费点，收益相同）；②play() check-then-act → put 返回非空旧实例兜底 release（不选整段 synchronized——避免持锁跨 prepare）；新增 lock 统一回调线程与调用线程状态写入。
+- **装置坑（新 3 + 复发 1）**：①**stub 计数器竞态**——t5 flaky 1/300：stub created 非 Atomic 并发 ++ 丢更新（created=1 两次都 Playing），非生产 bug；并发测试的 stub 自身要线程安全（AtomicInteger + ConcurrentHashMap.newKeySet），先隔离归因再改断言；②object 跨 iter 持久状态：sessions map 上一 iter 存活 session 被下一 iter 开头 check-release（released=2 假阳性）——每 iter 结尾 stop() 清理；③Kotlin stub listener 要 fun interface（普通 interface 不支持 lambda SAM）；④`null!!` 本身抛 NPE，fake 回调传真 stub 实例。⑤push 坑复发：本地克隆 origin 指向参考克隆 → `unpack but I can't find it / bad pack`，push 前 remote -v。
+- **验证**：JVM 7/7（verbatim 整 object 抽取 + fun interface stub 三件套，MediaPlayer stub 模拟 release 后调方法抛 ISE）+ 变异负控双条稳定（MutA 拆 put 兜底 → 恰 1 红 t5；MutB 回调不 release → 恰 2 红 t2/t3，t4/t7 不红有理由）+ debug 300 轮 0 异常 + scan 21/21。
+<!-- 2026-10-14 17:25 -->
+
+<!-- 2026-10-14 17:21:57 -->
+## FIX-R20 完成：fileui B29 大小恒空白 + B31 二次 decode + D13 静态单例 + P9
+
+# FIX-R20 完成：fileui B29 大小恒空白 + B31 二次 decode + D13 静态单例 + P9 读上限（fix/sweep1014-fileui @ bce2e21，CI #38539977894 绿）
+
+任务书 `shared/sweep-1014/tasks/FIX-R20.md`；报告 `shared/sweep-1014/reports/FIX-R20.md`；工作树 `shared/work/sweep1014-fix/r20/repo`（本地 clone 自 rkm-verify-1014 + set-url 换 GitHub）。
+- **修复**（4 文件 +247/−87）：B29 = 纯 Kotlin `formatFileSize`（1024 进制，unit cap GB）替换 `Formatter.formatFileSize(null,…)`（AOSP 首行 null→""，文件大小恒空白）+ FileItem.from 先 isSymlink 再 exists（断链软链接保留）；B31 = SKILL_FILE 删二次 URLDecoder.decode（Nav 已 %-解码一次）；D13 = 删 FilePreviewHolder 静态单例，浏览器配置/预览路径改 Routes.FILE_BROWSER/FILE_PREVIEW 查询参数，VM 用 viewModel(viewModelFactory) 绑 NavBackStackEntry（4 构造点+CHAT_FILES remember 一并迁）；P9 = 预览 readNBytes(MAX+1) 一次完成截取+truncated + ProviderImportZip copyEntryCapped（条目 2MB/总 16MB）。
+- **验证**：JVM 25/25 绿（verbatim 抽取 formatFileSize 12 断言 + Routes builder + Uri 镜像往返矩阵 6 例 + 双负控）+ scan 21/21 + 括号配平与基线一致 + CI run 38539977894 success head_sha 逐字符（gh_ci_wait --expect 完整 40 位 + API 双源）。**停在分支未合并。**
+- **坑（新）**：①`java.net.URLDecoder`（+→空格、裸 % 抛）≠ `android.net.Uri.decode`（仅 %XX）——B31 负控必须用前者忠实复现旧 bug，用后者负控恒绿假阴性；②gh_sync.sh push 推到 remote -v 当前指向——本地克隆后忘 set-url 报 bad pack 才暴露；③Kotlin 字符串不认 `\-`；④kotlinc `-d` 无 -include-runtime 时需 kotlin-stdlib.jar 进 runtime classpath；⑤多行函数抽取闭界用缩进锚（`    }`），rstrip=="}" 会被嵌套块提前终止。
+
+<!-- 2026-10-14 17:26:54 -->
+## FIX-R14 完成：model-use B24 stdin 位置 prompt 替代 + cwd 透传（fix/swe
+
+# FIX-R14 完成：model-use B24 stdin 位置 prompt 替代 + cwd 透传（fix/sweep1014-modeluse @ 4200c406，CI #2039 绿）
+
+任务书 `shared/sweep-1014/tasks/FIX-R14.md`；报告 `shared/sweep-1014/reports/FIX-R14.md`；工作树 `shared/work/sweep1014-fix/r14/`；JVM 装置 `r14/jvm/`（未入库，依赖 stub）。
+**基线** origin/main d5d2be59f；分支 `fix/sweep1014-modeluse` @ `4200c4065113c4ecce6d1c256fc1d5cc91ec98cf`，2 文件 +48/−12。CI build-apk run #2039（38540406124）success，head_sha 逐字符（bridge + API 双源）。**停止节点达成，停在分支未合并。**
+- **改层定案（三层全排除）**：①沙盒包装脚本不存在（PATH 上是 installHandlerStubs 的 stub，execve 在脚本运行前被 libproot 拦截改写为 cat tmpfile——wrapper 永不执行）；②协议层无 stdin 通道（NativeOffloadRequest 只传 argv/env/cwd，ConfigOffloadHandler:273 注释明说）；③宿主 handler 在 app 进程内收不到 shell stdin。定案 = 位置参数 prompt 替代管道（走 parseMessages 既有 plain-text 路径）+ 空输入 fail fast（missing_input，防静默 HTTP 400）+ 相对路径走协议层已有 cwd 字段透传（resolveSessionHostPath/resolveHostPath 守卫不变，--output 拦截不动）+ HELP/ChatPromptAndTools:1345 两处 stdin 承诺同步改。
+- **验证**：JVM verbatim OffloadArgs+OffloadOutput（md5 对照生产）8/8 绿 + 变异负控双条（MutA 丢 positional 收集 → 恰 7 红；MutB `|| true` 贪婪吞值 → 8/8 红）+ kotlinc 语法 0 错 + scan 21/21 + CI 双源。
+- **端到端边界**：管道沙箱实跑不可达（管道数据在协议里不传 = bug 本身；:modelservice/provider key 在宿主侧），以解析层装置 + CI 覆盖。
+- **★ 流程坑（新）**：rkm-verify-1014 参考克隆对象损坏（fsck 大量 Unknown object type，push 报 `fatal: bad object bce2e21…`；dry-run 协商通过但 pack 传输必败；unshallow 救不了——坏对象不在历史链上）。**修法 = 新完整克隆 + git diff patch + git apply + 重新 commit + 从新克隆 push**，apply 后逐字节 diff 核对。与 TLS 抖动错误形态相同（unexpected disconnect）——先 grep 完整输出找 `bad object` 行区分归因，别盲目重试。
+- **流程坑（复发 2）**：shell_execute timeout 封顶 900s（传 1600 无效）；gh_ci_wait --timeout 应给 870 以内，超时后用 --no-dispatch 复用 run 继续。
+- **流程坑（复发 3）**：gh_sync.sh gh-actions-dispatch 需要 `--repo <owner/repo> --workflow <file>` 完整参数，位置参数形式不认。
+
+<!-- 2026-10-14 17:34:54 -->
+## FIX-R21 完成：B30 日期漂移副本 + B33 播放器三面 + B35 分块解码 + P11 正则提升（fix/sweep1014-ui-misc @ b6c9cf96，CI #2040 绿）
+
+
+用户令「读 /var/minis/shared/sweep-1014/tasks/FIX-R21.md 并立刻执行」。基线 main `d5d2be59f`，4 文件 +198/−96。CI build-apk run 38540717633（#2040）success，head_sha 逐字符一致（API 按 sha 反查 run id）。**停在分支未合并。** 报告 `shared/sweep-1014/reports/FIX-R21.md`；装置 `shared/work/sweep1014-fix/r21/jvm/`（含 src/extract.py/mutate.sh）。
+
+- **B30**：MoveToSessionSheet 本地 relativeDate 副本 `weekdays[DAY_OF_WEEK - 1]`（数组长 8、[0]==""）→ 错位一天且**星期日渲染空串**；删副本改 import 共享 sessions.relativeDate（与同文件 categoryStyle 同源先例）。修完清理 Context/Calendar/Date/TimeUnit 4 个 import（**踩坑：初版 file_edit 误删了仍在用的 R/ChatSessionEntity/ChatRepository import，当场补回**）。
+- **B33③**：音频 `prepare()` → `prepareAsync()` + onPreparedListener；**新增 Preparing 窗口**用 `prepared`+`pendingPlay` 队列兜住（点一下就播语义不变），onDispose 拆两段 try 保证 Preparing 态仍 release。
+- **B33①**：视频 onPrepared 读 `this.width`（未测量=0）→ 恒被 coerceIn 锁成 100px；改 `post{}` 到首帧布局后。
+- **B33②**：AndroidView 补 `onRelease = { mediaController.hide(); view.stopPlayback() }`（controller 提升到组合作用域 `remember(filePath)`；本仓 4 处先例证明 API 可用）。
+- **B35**：readLine 逐 8KB 块 `String(buf,0,n,UTF_8)` → 跨块中文变 U+FFFD；改「收集整行字节到 ByteArrayOutputStream + 一次解码」抽纯函数 `decodeLogLine`，加 16KB 单行渲染上限 + `" …[truncated]"` 标记；新增段放 T176 KDoc 之前防 KDoc 脱钩。
+- **P11**：MarkdownClipboard 31 处热路径 `Regex(...)` → 18 个 object 顶层常量（函数体内残留 0）；哨兵字面量源码编码从**两个裸 NUL** 改 `\u0000` 转义（运行期值不变，反射读编译产物验 `0,67,79,68,69,0`）。
+- **验证**：JVM 装置 **101/101 绿**（18 条 ground truth 字面量 + 36 样本 before/after 逐字节对拍 + B35 真文件读写）；**B35 红臂**＝旧 readLine 同装置读同一文件必含 U+FFFD（缺陷可复现）；**变异负控三条**（italic lookaround / bullet 字符类 / 截断标记）分别恰 4/2/2 红且落在对应家族；scan.sh 21/21；CI step 全绿（含 Gradle Build APK + unit tests）。
+- **★ 环境坑（入 sandbox-limits A1b）**：源文件裸 NUL → grep 只回 `binary file matches`、`file` 判 `data`、`file_read` 对大文件照常返回正文但把 NUL **渲染成空格**（`"\0CODE\0"` 看成 `" CODE "` → 抄进 old_string 永远匹配不到）。**探针纠正两点错误假设**：`file_edit` 对含 NUL 文件其实**字节安全**（NUL 原样保留）；先前两次「匹配失败」全是**我 old_string 多带尾换行**（对照实验同形无 NUL 文件同样失败才定性）。处置＝python 把裸 NUL 规范成转义。
+- **流程坑**：①从相邻会话工作树本地 clone 后 origin 指向本地路径 → push 报 `bad pack`；`git remote set-url origin https://github.com/...`（不带 token）后即通（已补进注册表 A1 旁路，R6/R8 也撞过但没登记）；②装置脚本 `extract.py` 用 `OUT.glob("*.kt")` 清场把同目录 `Main.kt` 一起删了 → 变异轮报 `Could not find or load main class`（看起来像编译失败）——清场必须显式列举文件名；③file_read 带 offset 空体复发 1 次（换 awk 行号读法）。
+- **同族登记**（backlog §95，均带触发条件）：单块 UTF-8 解码两处（AddToHomeSheet/WebAppIconExtractor，单次 read 仅尾部一字符风险）· 同步 prepare() 残留三处 · 同文件全屏播放器 AndroidView 无 onRelease（Dialog 场景泄漏面小）· ChatScreen:1726 注释漂移。
+
+<!-- 2026-10-14 17:51:27 -->
+## SWEEP-1014 RikkaMinis 修复会话（FIX-R17 browser-sec）
+
+
+- 仓库：https://github.com/***OWNER***/RikkaMinis（gh 已登录）。工作树 `/var/minis/shared/work/sweep1014-fix/r17/repo`（从只读参考克隆 rkm-verify-1014 复制）。**workflow push 触发器只挂 main**，分支验证必须 `gh workflow run build-apk.yml --ref <branch>` 手动 dispatch；build-apk.yml 有 `concurrency: cancel-in-progress`，同分支重复 dispatch 会互顶。
+- **gh_ci_wait.sh 用法**：`sh /var/minis/skills/github-ops/scripts/gh_ci_wait.sh --repo ***OWNER***/RikkaMinis --ref <branch> --workflow build-apk.yml --expect <FULL sha> --timeout 2700`；sha 必须 `git rev-parse HEAD` 取真实完整值——凭短 sha 补全会导致脚本自行重复 dispatch 并把在跑 run 顶成 cancelled。输出重定向到文件，别加管道。
+- **CI 是唯一 Kotlin 编译验证面**（本地无 Android SDK）：多行字符串拼接 `"a" +\n"b".toByteArray()` 只对最后一个字面量生效（Kotlin 扩展函数绑定），会编译错——提局部变量；`onPageStarted` 签名无 `WebResourceRequest` 参数。
+- **JVM 纯函数测试装置手法**（沿用 R9 先例）：python 括号配平从生产 .kt 逐字抽取纯函数（抽后 `in` 匹配复核），kotlinc `/opt/kotlinc/bin/kotlinc` + junit/hamcrest 从 `/root/.gradle/wrapper/dists/gradle-8.14.2-bin/.../lib/` 取，运行需显式 `-cp /opt/kotlinc/lib/kotlin-stdlib.jar`。装置在 `/var/minis/shared/work/sweep1014-fix/r17/jvm/`。
+- 变异负控做两条：MUT-A fail-open 还原 4 红、MUT-B 宽前缀还原 2 红——负控前先确认每个安全断言都有正中用例。
+- FIX-R17 最终态：分支 `fix/sweep1014-browser-sec` @ d79002c，CI run #2043 success，**停分支未合并**；报告 `/var/minis/shared/sweep-1014/reports/FIX-R17.md`。
+
+<!-- 2026-10-14 18:05:04 -->
+## SWEEP-1014 收口核查完成（2026-10-14，32 分支）
+
+
+- 报告：`shared/sweep-1014/VERIFY-REPORT.md`。核查时刻 main 仍 `d5d2be59f`（未移动）。
+- **32/32 分支 CI 绿且 head_sha 逐字符一致**（31 条直接核；browser-sec #2043 success @ d79002cab == tip，#2044 同 sha 冗余重跑）。32/32 base = d5d2be59f（compare API 核验）。
+- **文件集重叠：唯一 1 处** —— browser(FIX-R8/B17) ∩ browser-sec(FIX-R17/D10) 都动 `BrowserTabPool.kt`：browser 改 `val id = nextTabId++`→explicitId（hunk -920..930），browser-sec 在 `manager=BrowserUseManager(...)` 后插入 minisSessionId（hunk -926..935）——**不同行，git 三方合并应自动融合**，语义兼容（restore 走同一 createTab）。合并顺序建议：browser 先、browser-sec 后。
+- 互斥约束抽查全过：mcp-stdio 只动 stdio 层；ui-links 未碰 LAYOUT_PIXELS（KaTeX 256MB 未证实部分没被乱修）；sandbox-io 的 tar-slip 四条真实拒绝规则全保留（只放行合法 `.`）。
+- 报告质量抽查 4 份（FIX-R20/R17/R4/FIX-2）：JVM + 变异负控（恰红定位）+ scan 21/21 + head_sha 双源 + 诚实边界，达标。FIX-R20 双负控精确复现 B31（`a+b.md`→`a b.md`、裸 % 抛异常）。
+- **待用户拍板的下一步**：32 分支合并 main。合并前建议：①合并顺序按文件重叠避让（browser 先于 browser-sec）；②合并后跑 main 的 build-apk 确认并集树绿（多支合并的并集树无单支 CI 覆盖过，须等 main run）；③R2/R12 合入后同步 live 技能（semantic_memory.py、gh_sync.sh、gh_ci_wait.sh）。
+- 真机验证未做（B6 file:// 崩溃 / D10 Origin 头 / B20 语音竞态等需装 release 包实测）。
+- 工具坑：`git fetch` 跨克隆再报 `invalid index-pack output`（PRoot bad pack header 第 3 次）——改走 API 是对的（compare API 同时给出 base_commit 与逐文件 patch，比 fetch 更省）。
+
+<!-- 2026-10-14 18:26:04 -->
+## SWEEP-1014 全量完成：32 支合入 main（2026-10-14）
+
+
+- **main = `e63608ee9`**（32 个 sweep1014 修复分支全部经 Merge API 顺序合入；main 并集树 build-apk **success** @ e63608ee9，run 38547394427）。
+- 合并序：browser → browser-sec（唯一重叠对 BrowserTabPool.kt 自动融合成功，如预判）→ 其余 29 支 → 补合 media（第一轮漏列，第二轮补上）。逐支 compare main...branch 全部 status=behind（32/32 被 main 包含）。
+- **live 技能同步完成**（防 §75 漂移）：semantic_memory.py（年化 glob ✓）、gh_sync.sh（askpass 移 /tmp ✓）、gh_ci_wait.sh——均从 main@e63608ee9 raw 拉取覆盖 `/var/minis/skills/`，旧版备份 `.bak-1014`。
+- 全程文档：`shared/sweep-1014/`{TRIAGE.md, TRIAGE-R23.md, TRIAGE-R45.md, VERIFY-REPORT.md, tasks/FIX-*.md×32, reports/FIX-*.md×32}。
+- **五轮审计总账：59 项发现 → ~55 实锤 → 32 分支全绿 → 全部合入 main**。误报/登记 4：KaTeX 256MB（未证实）、WeatherManager P7（string() 自关）、UpdateChecker D6（R8 摇树）、P8 的 inSampleSize 声明。
+- **剩余待办**（无阻塞）：真机验证未做（B6 file:// 崩溃、D10 WebView Origin、B20 语音竞态等需 release 包实测）；32 个 fix/sweep1014-* 远端分支可择机清理（已全在 main）。
+- PRoot git fetch 的 bad pack header 老坑本轮又 2 次——远端操作一律走 GitHub API（merge/compare/raw 全程零 fetch）。
+
+<!-- 2026-10-14 20:30:02 -->
+## RV-6 完成：回归审查 8 文件（2026-10-14）
+
+# RV-6 完成：回归审查 8 文件（2026-10-14）
+
+- 报告 `shared/review-1014/reports/RV-6.md`；对象 56f63f5(B23/27/28)+41e6a79(FIX-7)+cf672fe(S3 db)+bea70ca(B10)。
+- **发现 0 引入 / 2 同族 / 6 变化**。最严重：
+  - **W-1 [high]** SessionForkManager B10 media 半边不生效——拷贝消息的 MediaRef.relativePath/imageLinuxPath 内嵌**源会话 id** 且 partsJson 逐字传入无重写 → 拷到 <newSid> 的 media 永不被引用（磁盘翻倍死重），源会话删除后 media 引用照旧断链（B10 声称修复的场景仍在）；minis://workspace/attachments 半边（按当前 sid 解析）确实生效。修法 = partsJson 路径段重映射或删 media 半边。
+  - **W-2 [med]** KeyRoulette FIX-7 legacy 明文只跳过不迁移——非当前 provider 的明文 slice 永久留 key_roulette.json（persistLocked 只在 multi-key draw 时覆盖本 provider slice）；修法 = init() 一次性 sanitize 回写。
+  - **W-7 [low]** planQueueAdvance/decideSingleSend/hashKey 无入库测试（装置留工作树，FIX-R3 却入库了 SessionArtifactCopyTest——口径不一）。
+- 已核干净：planQueueAdvance 真值表 6/6（python）；B28 parity 归一后恰 3 差异格=修复场景本身；KeyRoulette 4 消费门全拿明文（hash 不出网络层）；db DDL/@Index/HANDLED_DOWNGRADES/DatabaseVersionGuardTest 全同步；MIGRATION_14_13 本 build 不可达=latent-by-design（与 13 to 12 同款）。
+- 坑（复发）：file_read 带 offset 空体又 1 次 → awk 行号读法；实证脚本旧代码重实现把 bool 当 uri 传 → 16 假差异，修正后 3 格（语义归一 None==Drop 后重跑）。
+
+<!-- 2026-10-14 20:41:25 -->
+## RV-4 回归审查完成（UI/媒体/浏览器域，16 文件）
+
+
+**发现总账：0 引入 / 3 同族 / 2 行为变化 / 2 观察项**。报告 `shared/review-1014/reports/RV-4.md`。
+
+- **W-1（high）**：`resolveMdMediaFile`（StreamingMarkdownText:1730/:1758）媒体路径裸 URLDecoder 残留（不在 FIX-5 声明的 5 处里）——渲染期（produceState 无兜底）+ 组合期（MarkdownText:764/859 remember 同步调用，FilePreviewScreen/SkillsManagement 消费方）双崩溃可达面。FIX-5 只修了链接面。
+- **W-4（med，观察）**：视频高度修复疑似 no-op——`width` 在 `layoutParams.apply{}` 内解析到 `LayoutParams.width`（内层接收者），非测量宽度；且 `fillMaxWidth().height(240.dp)` 固定约束下 Compose `obtainMeasureSpec` 把 child LP coerce 掉（Avh.kt:523-528 getLayoutParams 覆写→child LP 参与 spec，但 min==max 时被忽略）→ 视频恒 240dp，新旧写入都是 no-op，FIX 报告「锁 100px」根因判定可能有误。需真机验证。
+- **W-3**：InlineMediaPlayer 注释前提不成立——AOSP JNI 证明 `MediaPlayer.stop()` 不抛 ISE（非 OK → notify(MEDIA_ERROR)），ISE 仅 mp==NULL；两段 try 是防御性 no-op。
+- **W-5/W-6**：loadSavedState 无文件分支不清 savedURLs（跨会话残留，pre-existing partial）；awaitReady catch Throwable 吞 CancellationException。
+- **验证方法沉淀**：URLDecoder 裸 % 行为用 JDK 实证（/tmp UD.java）；`+` 语义回归面排查 = grep 全仓 URLEncoder 构造点（全用 %20，无回归面）；Compose AndroidView measure 流经 googlesource/GitHub raw 拉 androidx-main 源码核实（getLayoutParams 覆写 + obtainMeasureSpec coerce）。
+
+<!-- 2026-10-14 21:00:54 -->
+## RV-1014 回归审查（今日大改动的最后一道闸门）+ 7 支修复会话派发
+
+
+**用户口径纠正（重要）**：审查目的是**给今日大改动（106 文件 +6317/−940）做最后把关**，不是"看 CI 绿不绿"。审出来就说明有效。
+
+**规模**：7 个会话子代理按域审查（RV-1 chat/agent、RV-2 sandbox、RV-3 provider/MCP、RV-4 UI/媒体、RV-5 settings/fileui、RV-6 并发/密钥/DB、RV-7 speech+备份），报告 `shared/review-1014/reports/RV-1..7.md`，**共 44 条发现**。
+
+**分级结果**：P0 **1** · P1 12（+2 顺路）· P2 25（→ backlog §96）· 待用户拍板 2 · 已核实无需动作 4。
+
+**★ P0（真机探针决定性确认）**：`CalendarOffloadHandler.kt` `doList` 用裸 `content://com.android.calendar/instances/when` —— AOSP UriMatcher 只注册 `instances/when/*/*`，**`android-calendar list` 任何一次调用即抛 `IllegalArgumentException: Unknown URL content`**。今日 B25a 由 `Events.CONTENT_URI` 改 `Instances.CONTENT_URI` 时漏了 begin/end 两段。**核实手法（可复用）：不装新包也能验——`android-shizuku-cli exec "content query --uri <裸 URI>"` vs 带段形态，一条命令钉死 AOSP opl 注册语义。**
+
+**其他已核实的 P1 关键点**：RV-3 W-2 semantic_memory 0 条会清空索引+覆盖远端 dataset（一行守卫）；RV-5 W-1 `readNBytes`（API 33）在 minSdk 26 + 无 desugaring 下 API 26–32 必崩（Error 不被 catch(Exception) 捕获）；RV-4 W-1 媒体路径仍裸 `URLDecoder.decode`（裸 `%` 渲染期崩、`+`→空格）；RV-6 W-1 会话克隆 media 半边拷了从不重映射（死重 + 注释为假）；RV-6 W-2 KeyRoulette 存量明文 key 只跳过不迁移（今日升级用户必中）；RV-7 W-1 `releaseIfCurrent` 非原子（JVM 压测 922/39M 违例）；RV-1 W-1 空回合 recovery 后自动标题不再生成。
+
+**派发**：7 支修复会话（`fix/rv1014-*`），任务书 `shared/review-1014/fix-tasks/FIX-RV-{A..G}.md` + `COMMON.md`（通用简报：克隆/推送/CI/环境坑/停止节点=分支 CI 绿不合并）。落盘 ID 见 `fix-tasks/dispatch-ids.txt`。
+
+**方法增量**：①"聚合"= 写 `TRIAGE-REGRESSION.md` 台账（逐条 P 级 + 触发路径 + 证据 + 第二道核实记录 + 派发计划），再据此切 7 份任务书——比逐条派发更省，且给出"为什么这条修/那条不修"的可复核账；②报告读回用 `file_read` 分页（`lines:40` + `offset:41`）绕开 offload 截断；③真机探针可独立于设备装包版本（provider 语义是系统侧）。
+
+**同一用户可见：设备仍停在 `1.0.0+2002`（旧构建），未装 `+2076`。**
+
+<!-- 2026-10-14 21:21:49 -->
+## A1/A2 已修（fix/rv1014-calendar @ d13ceef，2 commits，CI 2077 suc
+
+- **A1/A2 已修（fix/rv1014-calendar @ d13ceef，2 commits，CI #2077 success，bridge 双源）**：A1 = doList Instances URI 补 begin/end 两段（appendPath Long，无注入面）；A2 = handleAlbum 两路独立查询 + 共享 mergeMediaLimit（未新造归并）。A3 = doUpdate 全天事件时区**登记不修**（正确修法需先查事件 ALL_DAY，超出「复用同一 helper」≈0 线）。
+- **真机验证（shizuku content query 实跑）**：裸 `instances/when` → `IllegalArgumentException: Unknown URL`；补段 `instances/when/0/4102444800000` → 10 行 ✓。**坑：多列 `--projection a,b` 经 shizuku exec 报 `Invalid column`（单列成功）——content 命令引号解析怪癖，非 provider 问题。**
+- **JVM 装置（jvm/ @ shared/work/rvfix-1014/A/）**：mergeMediaLimit 逐字抽取（唯一替换 json: JSONObject→String，merge 体只触 .ts）+ 旧共享配额 `oldAlbumQuota` 当变异负控 → 恰 1 红（视频饿伤断言）。junit4 跑法：`java -cp out:junit-4.13.2.jar:hamcrest-core-1.3.jar:/opt/kotlinc/lib/kotlin-stdlib.jar org.junit.runner.JUnitCore <pkg>.<Class>`。
+- **流程坑**：file_edit 大块替换时把 `selection/selArgs` 声明误删（old_string 含声明、new_string 漏写）→ 编译面没查出来，靠 git diff 逐行回读当场发现补回。**大块替换后必须 git diff 回读**，不能只看括号配平。
+
+<!-- 2026-10-14 21:25:32 -->
+## FIX-BACKUP-MEDIA 完成：D2D 换机保留附件 + 两处注释改准（fix/backup-media-d2d
+
+# FIX-BACKUP-MEDIA 完成：D2D 换机保留附件 + 两处注释改准（fix/backup-media-d2d-1014 @ 005e5942，CI #2079 绿）
+
+**用户拍板（先探针后决策）**：①备份选 C——`<device-transfer>` 不再排除 media/（D2D 无云配额，换机带附件），`<cloud-backup>` 保留排除（25MB per-app 配额，超额=整个备份被跳过）；②ContentCapture 维持关闭（HyperOS 3 实测无 content_capture 服务、无 FEATURE_CONTENT_CAPTURE 特性 → 本机 no-op；Pixel 类设备收益真实），注释补成立条件。
+
+**commit** `005e5942556dd4246f2d83a0385b2ee2de2a37d4`（3 文件 +23/−3），CI run **#2079**（38569871615）success @ 005e59425，gh_ci_wait + API 双源 head_sha 逐字符。**停在分支未合并**（.kt/res 有真实验证面）。
+
+**探针定案（可复用）**：①ContentCapture 开销前提 = 设备声明 FEATURE_CONTENT_CAPTURE（AOSP 只在该特性存在时注册服务）；本机 `dumpsys content_capture`→Can't find service + `pm list features` 无该特性 = 通道不存在，那 10% 在本机本来就没花。②改动出处 `15d6500 port-v114 S1`（v1.14 移植，非当日 sweep）。③app 自己的备份通道也不带附件：ArtifactBackupScope 扩名白名单无图片 + ChatBackupBudget `[media message elided]` + ConfigBackup strips media payloads——**今天起 D2D 是唯一保附件的通道**。④Compose 1.9.1 ContentCapture 动态开关 bug：检查器找见 false 直接返回不清 pending 标记 → 只能编译期常量。
+
+**验证**：apply.py 三处锚点 count 断言不匹配即 FATAL + ElementTree XML 语法校验 + device-transfer 节 media exclude 计数 0 / cloud-backup 1 机械核对。
+
+**边界**：API ≤30 的 backup_rules.xml 无法分路径（低版本换机仍丢附件）；D2D 实际行为取决于换机工具是否尊重 dataExtractionRules；media/ 体积未测（沙箱无挂载点）。
+
+<!-- 2026-10-14 21:27:34 -->
+## FIX-RV-C 完成：C1 reply 窗口 + C2 语义 0 条守卫 + C3/C4 OAuth 名对齐 + C5 NaN（CI #2082 绿）
+
+用户令「读 /var/minis/shared/review-1014/fix-tasks/FIX-RV-C.md 并立刻执行」。分支 `fix/rv1014-mcp-security` @ be76810c，6 文件 +186/−41。CI build-apk run 38570336317（#2082）success，head_sha 逐字符一致。**停在分支未合并。** 报告 `shared/review-1014/fix-reports/FIX-RV-C.md`；装置 `shared/work/rvfix-1014/c/{tests/,jvm/}`。
+
+<!-- 2026-10-14 21:30 -->
+
+- **C1**：daemon.py/stdio.py `_rpc` 改 register-then-send（`_StdioReader.register/cancel` + `wait(box=)`）；装置用假 stdin 在 flush() 内同步投递 reply 把抢占窗口做成确定性场景，旧序负控（生产组件复现旧调用序列）恰红。
+- **C2**：semantic_memory cmd_build + cmd_build_incremental 各加 0 条守卫（exit 1 不写索引不上传）；变异负控用 **git HEAD 版本同场景** 复现数据破坏（79 字节空索引 + upload 被调）恰红。
+- **C4**：白名单改路径危险字符拒绝清单（拒 `/`、`\`、控制字符、`..`、空、>128），Kotlin+Python 两侧对齐；选①放宽而非编码的理由=Linux 文件名对空格/CJK 本来合法、恒等映射是唯一免跨语言编码边的口径；既有空格/中文名服务器治愈。
+- **C5**：`_reject_constant`（parse_constant）接入 `_parse_value` + `--input` 双路径；**Python JSON 常量精确大小写**——小写 `nan` 本就解析失败保持字符串（旧行为已安全），真缺陷面是 `NaN`/`Infinity`/`-Infinity`（RV-3 W-5 的 `q=nan` 场景实为已安全，修照样做等价守卫）。
+
+- **★ 环境坑（新，重要）**：`/usr/local/lib/minis-mcp-cli` 有 **live 旧副本**，daemon.py import 时 `sys.path.insert(0, "/usr/local/lib/minis-mcp-cli")` 让 live 旧包赢 import 竞争——测试 verbatim-import 本仓新版 daemon.py 时，`from transport import stdio` 拿到的是 live 旧版（`_StdioReader` AttributeError）。**修法：import daemon 之前先 `import transport.stdio/http` + `from utils import config,deps` 预缓存 PKG 版进 sys.modules**，daemon 的 from-import 命中缓存。所有对本仓 daemon/main 的装置测试都要这样预导入。
+- 装置坑：①C4 抽取闭界正则——函数尾行是 `        ) server else null`（8 空格缩进 + `)`），`4 空格 + \)` 锚不中，用 `(?:        .*\n)*?        \) server else null` 非贪婪；②时序负控需等 reader 完成分发再登记（readline 内 sleep 0.05s，负控侧 sleep 0.3s 把「已丢弃」做成确定性前提）；③stdio `_read_reply` 无 timeout 参数（固定 300s），负控改用 `reader.wait(want_id, 0.8)` 有界复现。
+- P2 登记：UI 创建侧残留被拒面（`/`/`\`/控制字符/超 128 名，UI 无提示，修需 1 条 string × 7 语言）；C3/C4 端到端真机验证待下次装包顺带。
+
+<!-- 2026-10-14 21:28:21 -->
+## 用户令「读 /var/minis/shared/review-1014/fix-tasks/FIX-RV-B.md 并立
+
+用户令「读 /var/minis/shared/review-1014/fix-tasks/FIX-RV-B.md 并立刻执行」。基线 main e63608ee9，5 文件 +26/−12（2 commits：d6acfee 主体 + 230602f 补 return）。CI build-apk run #2080（38569904608）success，head_sha 逐字符一致（API 反查双源）。**停止节点达成，停在分支未合并。**
+
+**修复**（媒体/链接解码 crash 家族，9 处调用点 5 文件，全部换 `decodeUriPath`——FIX-5 引入的 URI path 语义 helper）：
+- B1：StreamingMarkdownText resolveMdMediaFile 主/fallback（fallback 处 4 空格缩进与主路径 12 空格不同，file_edit 首轮只中了 1 处）+ filenameFromMdUrl try/catch 一并删；MarkdownText filenameFromUrl 同族；ChatScreen:1915 点击路径**无需改动**（源函数修复自动闭合全部 caller）。
+- B2：ReadImageTool minis:// 路径。
+- 扫描同族：MarkdownBlockModel 3 处（46/141/152，扩展名分类 lastSeg 解码）+ MarkdownParser mediaBlockFor（该文件零 import，加 import）。换 decodeUriPath 后 runCatching/try 全删（helper 永不抛）。
+- **组合期 remember 未重构 produceState**（任务书条件项）：取证 resolveMdMediaFile 换源后整条 call graph 零可抛点——decodeUriPath 纯函数不抛 + File() 不抛 + Uri.parse 宽容 + safeResolveWithin 内部 catch IOException→null（PRootKernel.kt:757 逐行核实）。produceState 是零收益结构改动（引首帧 null 行为变化，牵连 player 创建链）。
+- **登记不修 3 处**：WebDavClient:406（+ 已预转义，语义正确）；OAuthCallbackServer:114（query 参数 form 编码，URLDecoder 是规范正确用法，且外层 per-connection catch:141 包住无 crash 面）；BrowserUseManager:374（blob 下载 payload，非媒体/链接解析路径，已包 try；备注 data: URL 规范用 percent-encoding，`+`→空格严格说也错，属潜在同族）。
+
+**验证**：JVM 14/14 绿（ground truth 手写字面量：a%20b/100%.png 不抛/a+b 完好/a%2520b 一层/中文多字节等）+ 变异负控 9 红恰红（mutant 换回 URLDecoder：含裸 %/`+` 的用例全红，5 例无该字符的绿——精确钉住）+ 括号配平 5 文件与基线一致。装置 shared/work/rvfix-1014/b/jvm/。
+
+**坑**：①**块体函数漏 return**（CI FAILED 第一轮）——`fun f(): String { ... }` 把 `return try{...}` 换成裸表达式 `decodeUriPath(last)` 不隐式返回（expression body `fun f(): String = ...` 才行），CI 报 `Missing return statement`；②fallback 缩进不同导致 replace_all 只中 1 处，全量 grep URLDecoder 复扫兜住；③kotlinc 编译测试需 junit 进 -cp（复发）；④grep 0 命中触发 sandbox-limits 召回误报（MarkdownParser.kt 无 NUL，python 核实）；⑤CI 等待被中断后先查 run 状态再决定续等（--no-dispatch 复用 run #2080，勿重复 dispatch）。
+
+<!-- 2026-10-14 21:33:30 -->
+## 用户令「读 FIX-RV-G 并立刻执行」。 基线 main e63608ee9，7 文件 +271/−15。CI bu
+
+**用户令「读 FIX-RV-G 并立刻执行」。** 基线 main `e63608ee9`，7 文件 +271/−15。CI build-apk run 38570303281（#2081）success，head_sha 逐字符一致（gh_ci_wait + API 双源）。**停在分支未合并。** 报告 `shared/review-1014/fix-reports/FIX-RV-G.md`；装置 `shared/work/rvfix-1014/g/jvm/`（含 extract.py/org.json stub）。
+
+- **G1 修法**：`turn == 0` 位置条件 → 语义条件 `AgentLoopHost.sessionTitleNeedsGeneration`（接口+适配器+两调用点），判据抽纯函数 `sessionTitleNeedsGenerationOf` 并让 `generateSessionTitleIfNeeded` 内部守卫**同改用它单源化**；幂等性由 host 函数自带三重守卫。**G2**：AppendStandalone 三行历史手术抽纯函数 `EmptyTurnRecovery.appendStandaloneReminderTurn`（带 role 桥），臂改调。
+- **验证**：JVM 26/26 绿（verbatim 抽取 round-trip + 回归序列差分断言 + 8 样本判据=旧守卫精确否定）+ 变异负控双条（Mut-A 判据坏形态恰 4 红 / Mut-B 拆桥恰 2 红，defectDifferential 预期绿）。
+- **装置坑（新）**：表达式体单函数（`= expr` 无大括号）做 brace-balanced 抽取会**吞进下一个函数**（下一个 `{` 是别人的函数体）——空行边界或逐行抽取，且 extract 前置 forbidden-dep 断言（ChatViewModel/AppLogger）当场拦住。
+- 环境注：junit jar 在 gradle-8.14.2 dists lib（`2pb3mgt1p815evrl3weanttgr` hash 路径）；LLMUsage verbatim 拷贝需 kotlinx-serialization-core-jvm jar 进 classpath（gradle caches 1.7.3）；EmptyTurnRecoveryTest 的 source-grep 测试必须**从仓库目录**跑（readRepoFile 从 user.dir 向上找）。
+
+<!-- 2026-10-14 21:34:53 -->
+## FIX-RV-E 完成：E1 API33 readNBytes 崩溃 + E2 技能更新 id + E4 视频高度 no
+
+# FIX-RV-E 完成：E1 API33 readNBytes 崩溃 + E2 技能更新 id + E4 视频高度 no-op（fix/rv1014-ui-small @ dff1ddf，CI #2083/38570624251 绿，停在分支未合并）
+
+用户令「读 /var/minis/shared/review-1014/fix-tasks/FIX-RV-E.md 并立刻执行」。基线 main `e63608ee9`（一致），5 文件 +113/−28。
+
+**修复**：
+- E1（P1）：FilePreviewScreen 三处 `readNBytes(int)`（API 33+，minSdk 26 无反糖，`Error` 拦不住）→ 自写 `readCapped`（ByteArrayOutputStream + 64KB 缓冲，max+1 语义不变）三处收敛。JVM 12/12（含 7 档 max 与 JVM readNBytes 逐字节 A/B 对拍）+ **javap 字节码 0 处 readNBytes** + MUT-E1 恰红。
+- E2（P1）：resolveUpdateTargetId 逐条 OR 首个匹配 vs KDoc「id 优先」→ 两段查找；MUT-E2 单遍 OR 恰 3 红全落 E2 家族。
+- E3：browser 刷新补 `version = parsed.version`（与 refreshFromDisk 先例一致，默认 1.0.0 边界注释写明）。
+- E4（判定无效已修好）：视频高度修复是 no-op——`layoutParams.apply{}` 内 `width` 解析到**内层接收者** `LayoutParams.width`（MATCH_PARENT），且 androidx-main `AndroidViewHolder.android.kt`（googlesource commit 0d6aedbc，本轮逐字核实）`obtainMeasureSpec: min==max → EXACTLY` coerce 掉 child LP → 新旧写入都 no-op，显示恒 240dp；**旧报告「onPrepared 时 width==0 → 锁 100px」根因叙事不成立**。修法 = `mp.videoWidth/Height`（onPrepared 时固有尺寸，与 View 测量无关）→ `Modifier.aspectRatio + heightIn(max=480.dp)`。真机验证未做。
+- E5：loadSavedState 早退分支补 `savedURLs.clear()`；E6：awaitReady 重抛 CancellationException。
+
+**登记未修**：DebugRPCHandler:391 同款 readNBytes（debug RPC 可达，半径外）；buildPrintHtml readBytes 无上限（KDoc 已明说，刻意披露）；E1/E4 真机验证（需 API<33 设备 / release 包）。
+
+**坑**：抽取器表达式体闭界锚 `?.first` 会在第一行提前断（签名行后首行就含 `?.first`）→ 锚要用最后一行的完整特征串；Kotlin 无 `"str" * n`（用 repeat）；KDoc 引用未导入类 `[InputStream.xxx]` 改纯文本防 Dokka 警告。报告 `shared/review-1014/fix-reports/FIX-RV-E.md`；装置 `shared/work/rvfix-1014/E/jvm/`。
+
+<!-- 2026-10-14 21:36:47 -->
+## FIX-RV-D 完成：D1 会话克隆 media 重映射 + D2 KeyRoulette 存量明文迁移（fix/rv
+
+# FIX-RV-D 完成：D1 会话克隆 media 重映射 + D2 KeyRoulette 存量明文迁移（fix/rv1014-fork-keys @ e39c66b，CI #2084 绿）
+
+**任务**：`shared/review-1014/fix-tasks/FIX-RV-D.md`；报告 `shared/review-1014/fix-reports/FIX-RV-D.md`；装置 `shared/work/rvfix-1014/d/jvm/`。
+
+- **D1 选择①真修**：grep 全部路径携带字段，parts_json 内嵌 srcSid 的形态**只有 MediaRef.relativePath**（`yyyy/MM/dd/<sid>/<id>.<ext>`）；linuxPath/imageLinuxPath 全是 `/var/minis/...` 沙箱路径无 sid（**RV-6 W-1 报告"imageLinuxPath 内嵌 srcSid"的说法不准**）。修法 = 顶层纯函数 `remapForkedPartsJson` 对整个 srcSid UUID 字面替换（UUID 字符不含 JSON 结构字符，统一覆盖所有现在/未来内嵌形态）；SessionForkManager:269-303（F-233 注释扩段致行号漂移，非任务书的 202-268）。
+- **D2**：KeyRoulette.init 一次性迁移——非 hash 非空白 key 用生产同款 hashKey 替换 + stamp 原样保留（下次 draw 直接命中，元数据零丢失）+ tmp 文件原子替换 + 幂等（sanitize 返回 null 跳过重写）+ 空白 key 丢弃并 println 记录（AppLogger 含 android 依赖，KeyRoulette 保持 JVM 纯净）。
+- **验证**：JVM 22/22 绿（D1 7 例入库 SessionForkMediaRemapTest + D2 5 例入库 KeyRouletteTest）+ 变异负控 8 红精确落位（MUT-A→remap 4 条 / MUT-B→迁移 4 条）+ kotlinc 0 错 + CI run #2084 success head_sha 逐字符。**停在分支未合并。**
+- **★ 流程坑（新，复发预防）**：①**纯函数抽取的恢复脚本丢 package 声明**——python 重抽片段从 KDoc 起、漏 package 行 → 函数落默认包，测试全部 unresolved；且**编译失败后 junit.log 未覆写，陈旧 "OK (22 tests)" 假绿**差点收工。教训：重抽必带 package 行（或整文件 cp + 单行变异回滚）；JUnit 收口必须显式 `echo junit-exit=$?` 且先 rm 旧日志。②out/ 在 shared/work 下凭空消失一次（out-mut 幸存，未定性）——编译+跑+类文件计数同一条命令内当场完成。③`grep -c` 计 0 的 exit 1 被缺陷召回器误判编译失败特征。
+
+<!-- 2026-10-14 21:42:27 -->
+## FIX-RV-F 完成：CaptureEpochGuard 单 CAS 槽修复（fix/rv1014-speech @ a28559bb，CI #2085 绿）
+
+
+<!-- 2026-10-14 21:45 -->
+**修复**：`ProviderSpeechRecognitionEngine.kt` `CaptureEpochGuard`——flag+epoch 合并进单个 `AtomicReference<Session?>`（Session 持 epoch token）+ `AtomicInteger` 计数器；`releaseIfCurrent` 变单次 CAS「比较并清除」。1 文件 +27/−8，调用点签名全不变。RV-7 W-1 判定成立（922/39M 违例实证）→ CAS 修法 0 违例。
+
+**★ 装置教训（可复用）：双线程 CAS 竞争压测，紧循环会硬件级饿死一方**——W 线程 tight loop `forceRelease+tryBegin` 下，C 线程 5M 轮零进展（x86 LOCK XCHG 不公平性），harness 伪影非生产属性。**修法 = 两线程循环内插 `Thread.yield()`**（W 的 stop→start 之间 + C 的 begin→release 之间各插一点——生产中这两段本就非原子相邻，插点同时放大目标窗口），C 稳定赢到 tryBegin。三轮迭代才定形：无 yield（饿死）→ 只加 yield（60s 超时未跑完）→ 插点 + repeat(64) 窗口检查 + 每 claim 计 1 次违例（`return@repeat` 只退当次 lambda，防 64 倍计数要用本地 `counted` 标记短路）→ 500k×5 轮确定性完成。
+**结果**：基线 5/5 违例（11~368/轮同量级）/ 修复 5/5 零违例 / 变异负控 3/3 复现（224/140/51）。kotlinc 直编 0 错。CI build-apk run #2085 success，head_sha 逐字符一致（--timeout 870 超时一次后 --no-dispatch 复用 run 收口）。
+**停止节点达成，停在分支未合并。** 报告 `shared/review-1014/fix-reports/FIX-RV-F.md`；装置 `shared/work/rvfix-1014/f/jvm/`（extract.py + Stress.kt，durable）。
+
+<!-- 2026-10-14 22:11:01 -->
+## RV-1014 修复批次收口：8 支全绿合入 main a7123cf82（含备份/ContentCapture 决策分
+
+# RV-1014 修复批次收口：8 支全绿合入 main `a7123cf82`（含备份/ContentCapture 决策分支）
+
+**用户令**「都完成了，检查一下，没问题就合并」。核查 → 合并 → main 并集树 CI 绿 → 清分支，全链完成。
+
+**核查结果（8/8 全过）**：tip 与报告逐字符一致 · CI 全绿（#2077–#2085）· 冲突标记 0 · **文件集两两重叠 0**（合并顺序无关）· 夹带抽查仅 1 命中且判定为非残留（`KeyRoulette.kt` println = 一次性迁移日志，与 `HangDetector.kt` println 惯例同型）。
+
+**合并**：`POST /repos/{...}/merges` 顺序合入（**端点方法是 POST 不是 PUT——PUT 返 404，token 与权限都没问题，别误判成权限故障**）。链：390136b0f → 672341f92 → 75e61fdbf → 3972755f0 → d03d37968 → f3b2e3e20 → b206bfe46 → **a7123cf82**。逐支 `compare/main...branch` ahead=0 全包含；8 支远端分支已删（`fix/rv1014-*` 全清，剩 32 支 sweep1014 存量）。
+
+**main 并集树 CI**：push 触发的 #2093 pending 期间被 gh_ci_wait 的 #2094 dispatch 顶成 cancelled（concurrency cancel-in-progress）→ **#2094（38575026136）success @ a7123cf82** = 8 支并集树的唯一覆盖。
+
+**三条自纠故事（子代理质量信号）**：①B 支第一轮 CI 红自纠（`MarkdownText.kt:706 Missing return statement`——块体函数换裸表达式不隐式返回）→ 再次印证 CI 是本地无 SDK 时唯一 Kotlin 编译验证面；②C 支发现任务书外的 P0-grade 面（incremental 索引无条件写盘 → 79 字节空索引 + upload），按数据丢失随到随修并做变异负控；③D 支**陈旧 junit.log 假绿险情**——重抽函数片段漏 `package` 行致编译失败，但编译失败不覆写日志，旧 "OK (22 tests)" 冒充新结果 → 规矩：重抽必带 package 行 + JUnit 收口先 `rm` 旧日志且显式取退出码。
+
+**报告**：`shared/review-1014/VERIFY-REPORT-FIXES.md`；七支交付报告 `fix-reports/FIX-RV-{A..G}.md` + `FIX-BACKUP-MEDIA.md`。
+
+**边界**：真机验证仍未做（需装新包实测 P0 calendar / 裸 % 渲染 / readNBytes API 26–32 / 语音竞态）。
+
+<!-- 2026-10-14 22:30:25 -->
+## RV-1014 真机验证完成（用户令「这个应用包含所有修改，开始验证」）—— 抓到一条系统性交付缺口
+
+
+**身份链（先钉死验证对象）**：设备包 `1.0.0+2094`（装于 22:12:53）sha256 `d15ea964…6604` = CI run **#2094**（38575026136，head_sha `a7123cf82`，8 支并集树）artifact `app-release.apk` 同哈希**逐字符一致**。手法：shizuku `sha256sum` 取设备 `base.apk`（`pm path` 定位）↔ GitHub API 取 run artifacts 下载对拍。**这是"设备上跑的就是那棵树"的最强证据，比 versionName 匹配硬**。
+
+**逐项结果**（报告 `shared/review-1014/VERIFY-DEVICE-1014.md`）：
+- ✅ **A1 日历 P0 真机通过**：`android-calendar list` 返回真实事件；范围过滤双向（2025 count=2 / 2026-10 count=0）。修复前必抛 Unknown URL。
+- ✅ A2 相册归并（`android-photos list` bucket 正常）、B2 `read_image minis://attachments/verify100%.png`（裸 % 文件名）读到 64×64 PNG。
+- ✅ C1/C4/C5 live 生效：MCP 脚本走 `assets/default_mount/`（**开机无条件落盘**，装包后 mtime 22:15 已刷新），与 APK 副本逐字节一致；`--name "bad/name"` 实测被拒（新版文案）。
+- ✅ 备份 D2D **产物级**：解设备 APK 内 `res/4j.xml`（自写 AXML 解析器 `axml.py`）→ cloud-backup 有 `media/` 排除、**device-transfer 无**。
+- ✅ E1 产物级：全 `classes.dex` 中 `readNBytes` 字符串引用 **0 处**（sanity：MainActivity=5 / RikkaMinis=50）；`minis-open` 打开 980KB 文本预览正常。崩溃面（API 26–32）本机不可复现。
+- ❌ **C2 在设备上未生效 ← 新发现**（见下）。
+
+**★ 系统性缺口：内置技能脚本改动被"版本门"挡住**。`SkillRepository.installBundledSkill`（:1356-1360）按 SKILL.md frontmatter version 门控，`compareVersions(existing, bundled) >= 0` 直接 return，`extractBundledSiblings()` 不跑。C2 修复改了 `semantic_memory.py` 但**没 bump SKILL.md 版本**（两侧都 1.4.1）→ 存量设备永远拿不到。即：**任何"改内置技能脚本不 bump 版本"的修复对存量用户都是死信**。旁证：其余 3 个内置技能与 APK 副本零差异，唯一差异文件就是 C2 改过的那个。已登记 backlog **§97**（待拍板：即时 bump 1.4.2 / 根治改内容哈希门控）。
+
+**边界（诚实）**：F 语音竞态未被触发（本机识别器 default/zh-CN "Language not supported"、en-US 模型未下载；早期一次撞 appops `RECORD_AUDIO: foreground` = app 在后台，非代码缺陷）；D2 数据在 app 私有 cacheDir（shell uid 读不到，run-as 仅 debuggable）；D1/G 需 UI 操作。
+
+**健康**：装包后 FATAL 0；`[ERROR]` 3 条全是本会话模型侧瞬时错误（2×Stream error + 1×`reasoning_text must be passed back`），重试收敛正常（FINALLY enter/exit + `_isStreaming=false`）。
+
+**手法沉淀**：①设备包 ↔ CI 产物哈希对拍 = 验证前的身份链标准动作；②APK 内 AXML（资源名被 R8 混淆成 `res/4j.xml`）靠**内容扫 + 自写解析器**还原结构，比读源码更硬；③"解出来的字符串 grep 命中 0"必须先做 sanity（用已知字符串验证 `strings` 有效），再下"引用不存在"的结论。
+
+<!-- 2026-10-14 23:10:41 -->
+## 根治 §97：内置技能资产落盘改内容哈希门控（fix/skill-asset-hash-gate @ 87db4a3，CI #2095 绿，停在分支未合并）
+
+
+**用户令**：选「根治」（二选一：即时 bump 版本 / 根治改内容哈希）。基线 main `a7123cf82`，3 文件 +351/−34。
+
+**修法**：拆成**两个门，各管一段** ——
+- SKILL.md / 注册表行 → **版本门不变**（它同时是"用户导入的更新副本不被静默降级"的守卫）；
+- 兄弟资产（scripts/*.py/*.pkl 等） → **内容哈希门**（新）：manifest `.bundled_asset_hashes`（skills 根目录，`dirName=<sha256>`）记录**上次我们写进去的载荷**的哈希而非 live 文件哈希 → 用户对脚本的本地改动在下一次载荷未变时依然保留。
+- 哈希口径：**排除顶层 SKILL.md**（那是版本门写的，纳入会导致"只改 frontmatter 也重写全部脚本"）；按相对路径排序（不依赖 `AssetManager.list` 顺序）；每条 `pathLen|path|byteLen|bytes` 长度定界（杜绝 `("a","bc")` vs `("ab","c")` 碰撞）。
+- 只在 `importSource == BUNDLED` 时同步（用户导入副本不动）；**写盘不完整不记录哈希**（下次启动重试，不把半截脚本冻结为"当前"）。
+
+**新增 `SkillAssetSync.kt`（纯 JVM）**：沿用 `SkillMetadataSync` 的拆分先例（SkillRepository 需 Context/AssetManager 跑不了 JVM）。
+
+**验证**：本地 kotlinc+JUnit **9/9 绿**（显式退出码，先 rm 旧 junit.log）；**变异负控 4 红 + 2 条等价变异被识别**——
+- A 去长度前缀→3 红 / B 不排序→2 红 / C2 反转 needsExtraction→1 红 / D 清单不排序→1 红 / F 去值侧 trim→1 红；
+- **E 去行侧 trim→0 红、C 补 `storedHash == null ||`→0 红**：两者都是**等价变异 = 死码**，据此**删掉了这两处冗余**（负控的第二种用途：不只验测试有效，还告诉你源码里有没用的分支）。
+- 哈希字面量用**观察探针**取（不从实现推导）；空载荷 = `e3b0c442…b855` = SHA-256 空输入公开值（独立 ground truth，非自指）。
+- CI #2095：第 15 步 Run unit tests full suite success（日志逐条 9 个 PASSED，**核过"测试真被收集"防假绿**）+ 第 18 步 Build APK success（本地无法编译的 SkillRepository Android 侧改动在此获编译验证）+ Publish → skipped（main 门控正常）。本地扫描门 21/21。
+
+**停止节点达成，停在分支未合并**（.kt 有验证面）。报告 `shared/review-1014/FIX-SKILL-ASSET-HASH.md`；装置 `shared/work/skillhash-probe/`；工作树 `shared/work/skillhash-1014`。
+
+**★ 残留证据缺口**：装包后需确认 live `semantic_memory.py` 出现 `[rv1014-C2]`（端到端生效证据）——已写进 backlog §97 的残留触发条件。
+
+**环境坑（复发）**：①**git 不吃 env 代理** —— `git fetch/clone` 报 `TLS ... unexpected eof`，而 `curl` 同刻 http=200；解法 = 显式 `-c http.proxy="$HTTPS_PROXY" -c https.proxy="$HTTPS_PROXY" -c http.version=HTTP/1.1`（并写进仓库 local config 供后续 push）。②**旧克隆增量 fetch 坏**（`cannot read existing object info` / `invalid index-pack output`）= PRoot 下已有 .git objects 读损坏，解法 = 换个目录全新 clone。③新克隆无 git 身份，commit 前先 `git config user.name/email`（复发）。
+
+<!-- 2026-10-14 23:19:21 -->
+## §97 收口：fix/skill-asset-hash-gate 合并 main 15a1f1336（用户令「没有问题就
+
+# §97 收口：fix/skill-asset-hash-gate 合并 main 15a1f1336（用户令「没有问题就合并」+「合并触发之后就不用等了」）
+
+**任务**：检查云端正在跑的分支（CI run in_progress 定位 = `fix/skill-asset-hash-gate` @ 87db4a33，run #2112）→ 8 项核查 → 合并。
+
+**改动内容**：backlog §97 根治实现——内置技能 sibling 解包门控由 SKILL.md version 比较改为**内容哈希**。3 文件 +351/−34：新增纯逻辑 `SkillAssetSync`（sha256 over 排序后的 length-delimited path|bytes 帧，sidecar manifest `.bundled_asset_hashes`，部分写入不冻结 manifest 下次重试）+ `SkillRepository.installBundledSkill` 接线（early-return 路径仅 `importSource == BUNDLED` 时走 sync；SKILL.md/registry 行仍走 version 门，保用户导入不被静默降级）+ 9 例测试。带 ponytail 标记（启动全量哈希 ~100KB，天花板 MB 级）。
+
+**核查证据（8 项全过）**：①diff 逐文件读完，无夹带；②被删函数 `extractBundledSiblings`/`copyAssetsRecursive` 均 private，callers 全在本文件且已替换；③CI #2112 success head_sha 与分支 tip 逐字符一致；④沙箱 JVM 独立验证 9/9 绿（kotlinc 完整路径 /opt/kotlinc/bin/kotlinc，junit-4.13.2 在 /opt/jvm-libs/）；⑤变异负控：删 `entries.sortedBy` → 2 红精确落位；⑥测试期望是探针字面量（空 payload hash = 真 SHA-256("") ground truth）。
+
+**合并**：`POST /repos/{…}/merges` → main **`15a1f1336c0d`**（compare branch...main behind=0 = 分支被完全包含；ahead=1 是 merge commit 本身，**别误读成合并树不一致**——containment 判据是 behind=0 不是 ahead）。远端分支 DELETE 204。main push 自动触发 CI 不等（用户令 + 分支同内容 run 已绿 + 单支合并树逐字节一致先例）。
+
+**坑**：①GitHub code search API 对新分支索引延迟（total:0 假阴性）——callers 核查靠「private 函数 + 文件内 grep」更可靠；②未认证 API 60/hr 限频来得很快，先跑一次 `rate_limit` 确认 token 认证再批量拉；③`nice kotlinc` 不在 PATH，要完整路径 `/opt/kotlinc/bin/kotlinc`。
+
+**backlog §97 已标闭合**；残留触发条件 = 下次装包后核 live semantic_memory.py 出现 `[rv1014-C2]`（端到端生效证据）。
+
+## 2026-10-15
+
+<!-- 2026-10-15 00:11:16 -->
+## §97 内容哈希门控在真机未生效——根因定性：DB 行来源不是 bundled（原本就有，非本次改出）
+
+
+**验证对象**：设备包 `1.0.0+2095`（lastUpdate 23:21:46）= CI run **#2095** = `fix/skill-asset-hash-gate` @ `87db4a333`（run #2096 = main `15a1f1336` 亦 success）。设备 base.apk sha256 `e4f9ca31…4784`；APK 内 `assets/skills/semantic-memory/semantic_memory.py` = 22419B、含 2 处 `rv1014-C2`（新脚本在内），live `/var/minis/skills/.../semantic_memory.py` = 21204B、0 处 → **未落地**。
+
+**实测（落地失败的判据）**：`/var/minis/skills/.bundled_asset_hashes` 不存在（全盘 find 无）；skills 树自 18:25 起零写入；今日 `I/W/SkillRepository` 日志只有 00:02 的 exportSkillToZip 30 条，**无** "Synced bundled siblings"/"incomplete"/"Failed to extract"/"installBundledSkills failed"；装包后 app 重启两次（pid 30224 @23:21:47、12882 @23:41:55），启动序列走到 SkillRepository 之后的步骤（ExecutionCoordinator 等）→ installBundledSkills 确实执行过。
+
+**根因（UI 直接证据，a11y 读设置页）**：内置技能的 DB 行 `importSource` 不是 `BUNDLED`：
+- semantic-memory 详情 → 版本 1.4.1、**来源「文件导入」**、上次修改 4 days ago（≈10-10）
+- cloudflare-fullright-ops 详情 → 版本 1.0.2、**来源「文件导入」**、上次修改 19 days ago（≈09-25）
+→ 新门 `if (existing.importSource == ImportSource.BUNDLED) syncBundledSiblings()` 恒假 → early return 静默跳过。其余分支都会发声（升级分支打 "Upgraded bundled skill"、首装打 "Installed bundled skill"、异常打 "installBundledSkills failed"），全未出现 → 只能是这条静默路径。
+
+**性质判定**：**原本就有，非本次改动造成**。改动在该路径上是纯增量（裸 `return` 前加一次 sync 调用），不可能压制任何原先发生的提取；症状在改前构建 +2094 上已由 22:30 真机验证记录过。但**修法不完整**：新门依赖一个它自己不校验、也不在 bug 表面上的字段（`import_source`）。4 个 SKILL.md 与 APK 内容**逐字节一致**（说明磁盘内容就是内置载荷），却带着 file 标签 → 守卫恰好漏掉最该修的行。旁证：日志窗口内（10-12~10-14）无配置恢复动作；行 updatedAt 为 10-10/09-25，早于今天。
+
+**未钉死**：file 标签的写入者（候选：首次安装时的行创建路径 / 「从文件更新…」按钮 / 更早的旧备份恢复按 "file" 兜底）。另注：`SkillRepository:418` 的提示词选技优先级也按 BUNDLED 判定，同样受影响（次要）。
+
+**手法沉淀**：① 设备包 ↔ CI run 身份链用 versionName 的 `+<run_number>` 后缀（workflow `versionNameSuffix=+$GITHUB_RUN_NUMBER`）+ 设备 APK sha256 双锚；② 读 app 私有 DB 的非侵入路径 = `am start -a VIEW -d 'minis://settings/skills'` 打开技能页 → `android-a11y-cli scroll to-text <name>` → tap 行 → dump 读「来源」标签（values-zh: 内置/文件导入/会话创建；细节：行点击用文字节点 center，行内坐标会命中上一行）；③ 判"某代码分支是否跑过"= 枚举该分支的**全部**可观测出口（日志/产物/文件 mtime），全空才能断言。
+
+<!-- 2026-10-15 00:37:28 -->
+## §97 根治二段：fix/bundled-row-adoption-1015 @ 5da7153，CI #38596976020 绿，停在分支未合并
+
+
+**修法**：真机定性（DB 行来源=file）落地为**行标签领养**——`installBundledSkill` 在版本门前，若行带外来标签但**声明（name/description/version）仍等于内置载荷**（用 parseSkillMd 解析值比较而非原始字节，容忍旧版 writeSkillMd 的 frontmatter 格式差异），则一次性领养：只改 `import_source` 列 + 内存行 + 打一条 `Adopted mislabeled bundled skill` 日志（**不动 updated_at**，领养不是内容变更，盖时间戳会抹掉行的来源痕迹）。领养后行走正常 BUNDLED 路径，哈希门自然可达。领养判据抽纯函数 `SkillAssetSync.isAdoptableBundledRow`（+`Declaration` 数据类），SkillRepository 只做接线（同 SkillMetadataSync 拆分先例）。分叉保护不变：用户改过声明（三字段任一不同）→ 不领养、内容保持。
+
+**验证**：①沙箱 JVM 13/13 绿（9 旧 + 4 新：外来标签且声明相等→领养 / 已 bundled 不重复领养 / 三字段任一被改→拒绝 / 空版本归一化参与比较；设备 fixture 用真实声明字面量）；②变异负控 3/3 精确落位（去声明比较→2 红 / 去来源检查→bundledRowIsNeverReAdopted 红 / 只比 name+version→拒绝声明被改 红）；③语法差分：SkillRepository.kt 改前后 kotlinc 错误种类集合完全一致（无新语法错误类）+ 括号配平；④CI run 38596976020 **success @ 5da7153f7**（逐字符一致），job 日志 SkillAssetSyncTest 13 条收集证据 + PASSED 行含新用例，防假绿核过。
+
+**装置**：`shared/work/bundled-adopt-1015/`（run.sh / mutate.py / syntax-diff.sh，可复用）。
+
+**★ 残留端到端验证**（需装新包，触发条件=下次装包）：装包重启后应看到 ①日志 `Adopted mislabeled bundled skill: semantic-memory (source was file)`；②`.bundled_asset_hashes` 出现且 live `semantic_memory.py` 变 22419B 含 2 处 `rv1014-C2`；③技能详情页来源从「文件导入」变「内置」。三者齐 = §97 真正闭合。
+
+**环境坑（复发）**：fetch 前先比对工作树基线与 origin/main（本次 87db4a3 树==15a1f13 树，diff 为空才安全带改动切分支）；heredoc 写 commit message 可用（`git commit -F -`）。
+
+<!-- 2026-10-15 00:42:10 -->
+## §97 根治二段合并收口：fix/bundled-row-adoption-1015 → main 4950a334（用户令「检查云端正在跑的分支，没有问题的话就合并」）
+
+
+**核查对象**：run #2097 = `fix/bundled-row-adoption-1015` @ `5da7153f7`（workflow_dispatch），核查时 in_progress、机械项阶段已 completed/success。3 文件 +168/−1（SkillAssetSync +33 / SkillRepository +53 / 测试 +83）。
+
+**8 项核查全过**：
+- 机械项：verify_branch.sh 全过，scan 21/21，scan_debt 1 标记/0 no-trigger，i18n AUTO-SKIP，CI run 38596976020 success head_sha 逐字符一致。
+- diff 214 行逐行读：adopt 判据 = `storedSource != bundledSource && stored == bundled`（声明三字段 name/description/version 用 parseSkillMd 解析值比较）；`adoptBundledRow` 只改 DB `import_source` 列 + 内存 + 日志，**不动 updated_at**（注释写明：领养不是内容变更）；版本门前接线，领养后走正常 BUNDLED 路径 → 哈希门可达。
+- 调用点：importSource 消费点全甄别（ConfigBackup 导出/导入、UI 显示、SkillRepository:418 提示词选技、:1443 哈希门）——领养后 :418/:1443 两处判定自然受益；TAG/db 均存在。
+- 独立证据：沙箱 JVM 13/13 绿（9 旧 + 4 新）；变异负控 A（去声明比较）→2 红 / B（去来源检查）→1 红，精确落位；恢复后复跑绿且源 md5 与分支 tip 一致。
+
+**合并**：POST /merges → main **4950a334c40b**（双父 15a1f1336+5da7153f7，合并树 4c5094e79b04 与分支 tip 树逐字符一致）→ 远端分支 DELETE 204。
+
+**★ 环境坑（复发， DELETE 方法走代理易失败）**：①**GitHub API DELETE 返回 000（连接层失败）而 GET 正常**——curl 加 `--http1.1` 后 204 一次成功；代理对 DELETE 或 TLS 抖动，重试+降级 HTTP/1.1 是解法。②`git fetch origin main` 后 **origin/main 追踪引用可能不更新**（FETCH_HEAD 更新了但 refs/remotes/origin/main 停在旧值）→ 合并树 vs 分支树 diff 出现假差异（3 改动文件）；核树一致性用 API 取两边 commit 的 tree sha 对比更硬。③ fetch/clone 时 `git fetch origin main` 在浅克隆上会因 no merge base 报错，先 `git fetch --unshallow`。
+
+**★ 残留端到端验证（backlog §97）**：装包重启后应看到 ①日志 `Adopted mislabeled bundled skill: semantic-memory (source was file)`；②`.bundled_asset_hashes` 出现且 live `semantic_memory.py` 变 22419B 含 2 处 `rv1014-C2`；③技能详情页来源从「文件导入」变「内置」。三者齐 = §97 真正闭合。触发条件 = 下次装新包。
+
+<!-- 2026-10-15 00:43:36 -->
+## §97 端到端闭合（2026-10-15 00:39，设备包 1.0.0+2097）
+
+
+**身份链**：versionName `1.0.0+2097` ↔ CI run **#2097**（run_number 2097）= `fix/bundled-row-adoption-1015` @ `5da7153f7` = 行标签领养提交。versionName `+<run_number>` 后缀 + run head_sha 双锚，链闭合。
+
+**三项端到端证据（全中）**：
+1. **日志**：00:39:09 启动即 4× `Adopted mislabeled bundled skill: X (source was file)`（semantic-memory / github-ops / cloudflare-fullright-ops / skill-creator）+ 4× `Synced bundled siblings`（semantic-memory 2 files hash=ee981c446dbb…）——第一段哈希门装包后曾静默（根因 = DB 行来源 `file`），领养后哈希门可达。
+2. **落盘**：`.bundled_asset_hashes` 出现（326B）；**4 项 manifest 哈希与仓库 @5da7153 载荷哈希逐字符一致**（用 SkillAssetSync.payloadHash 独立重算，JVM 探针 Probe2.kt）；11 个现场文件逐字节 == 仓库载荷；live `semantic_memory.py` 22419B 含 2 处 `[rv1014-C2]`（行 361/423）——C2 修复自 RV-1014 进 APK 以来首次真正落到设备磁盘。
+3. **UI**：技能详情页「来源」从「文件导入」→「内置」，且「上次修改」仍 4 days ago（领养不盖 updated_at，来源痕迹保留——按设计生效）。
+
+**健康**：装包后 FATAL 0。
+
+**★ §97 全链闭合**：版本门（发现）→ 内容哈希门（15a1f1336）→ 行标签领养（5da7153）→ 端到端落地。backlog §97 已登记闭合。
+**装置复用**：`shared/work/bundled-adopt-1015/`（run.sh 单测 / mutate.py 变异负控 / syntax-diff.sh 语法差分 / Probe2.kt 载荷哈希探针）。
+**手法**：①验证载荷哈希别只看 manifest——用同一实现独立重算仓库侧哈希对拍；②行标签领养不动 updated_at 的设计在 UI 得到验证（4 days ago 保留）。
 
 ---
 
