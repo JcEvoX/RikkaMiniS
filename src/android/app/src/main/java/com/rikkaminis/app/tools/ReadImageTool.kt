@@ -6,6 +6,7 @@ import android.graphics.BitmapFactory
 import com.rikkaminis.app.data.model.AgentToolDefinition
 import com.rikkaminis.app.data.model.AgentToolParam
 import com.rikkaminis.app.sandbox.PRootKernel
+import com.rikkaminis.app.ui.chat.decodeUriPath
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 
@@ -49,7 +50,11 @@ object ReadImageTool {
             }
 
             val path = if (rawPath.startsWith("minis://")) {
-                "/var/minis/" + java.net.URLDecoder.decode(rawPath.removePrefix("minis://"), "UTF-8")
+                // [rv1014-B2] decodeUriPath = URI path semantics (decodes %XX only,
+            // leaves `+` intact, never throws on bare `%`); the previous
+            // URLDecoder.decode corrupted filenames containing `+` and threw
+            // on `100%.png`-style names.
+            "/var/minis/" + decodeUriPath(rawPath.removePrefix("minis://"))
             } else rawPath
 
             val file = (

@@ -43,7 +43,7 @@ private fun mediaBlockFrom(raw: String, alt: String, url: String): MdBlock {
     // filename like `foo%23China.mp4` or `foo#China.mp4` still resolves to
     // `.mp4` instead of being swallowed by `substringBefore('#')`.
     val lastSeg = url.substringAfterLast('/')
-    val decoded = runCatching { java.net.URLDecoder.decode(lastSeg, "UTF-8") }.getOrDefault(lastSeg)
+    val decoded = decodeUriPath(lastSeg)
     val ext = decoded.substringAfterLast('.', "").lowercase()
     return when (ext) {
         in nativeVideoExts -> MdBlock.Video(raw, alt, url)
@@ -138,7 +138,7 @@ private fun splitParagraphOnInlineMedia(text: String): List<MdBlock> {
     val hasMediaExt = matches.any { m ->
         val url = m.groupValues[2]
         val lastSeg = url.substringAfterLast('/')
-        val decoded = runCatching { java.net.URLDecoder.decode(lastSeg, "UTF-8") }.getOrDefault(lastSeg)
+        val decoded = decodeUriPath(lastSeg)
         val ext = decoded.substringAfterLast('.', "").lowercase()
         ext in nativeVideoExts || ext in nativeAudioExts
     }
@@ -149,7 +149,7 @@ private fun splitParagraphOnInlineMedia(text: String): List<MdBlock> {
     for (m in matches) {
         val url = m.groupValues[2]
         val lastSeg = url.substringAfterLast('/')
-        val decoded = runCatching { java.net.URLDecoder.decode(lastSeg, "UTF-8") }.getOrDefault(lastSeg)
+        val decoded = decodeUriPath(lastSeg)
         val ext = decoded.substringAfterLast('.', "").lowercase()
         val isMedia = ext in nativeVideoExts || ext in nativeAudioExts
         if (!isMedia) continue
