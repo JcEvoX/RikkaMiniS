@@ -351,6 +351,30 @@ class SkillRepository(private val context: Context) {
         }
     }
 
+    /**
+     * [fix/audit-1015-b2b] Restore usage metadata (installedAt/updatedAt/
+     * useCount) carried by a backup. Export wrote all three but import never
+     * read them back: a restore reset useCount to 0 and re-stamped both
+     * timestamps, silently losing usage history. Only fields the backup
+     * actually carries (>0) are applied — see [SkillRestorePolicy.restoreUsage].
+     */
+    fun restoreUsageMetadata(id: String, installedAt: Long, updatedAt: Long, useCount: Double) {
+        val current = _skills.value.find { it.id == id } ?: return
+        val restored = SkillRestorePolicy.restoreUsage(
+            current = SkillRestorePolicy.Usage(current.installedAt, current.updatedAt, current.useCount),
+            backup = SkillRestorePolicy.Usage(installedAt, updatedAt, useCount),
+        )
+        db.execSQL(
+            "UPDATE skills SET installed_at=?, updated_at=?, use_count=? WHERE id=?",
+            arrayOf<Any>(restored.installedAt, restored.updatedAt, restored.useCount, id)
+        )
+        _skills.value = _skills.value.map {
+            if (it.id == id) {
+                it.copy(installedAt = restored.installedAt, updatedAt = restored.updatedAt, useCount = restored.useCount)
+            } else it
+        }
+    }
+
     // -- Session Overrides --
 
     fun isEnabledForSession(skillId: String, sessionId: String): Boolean {
@@ -566,9 +590,15 @@ class SkillRepository(private val context: Context) {
         preferredId: String? = null,
     ): Skill? {
         val parsed = parseSkillMd(content) ?: return null
-        val id = preferredId
-            ?.takeIf { it.isNotBlank() && _skills.value.any { s -> s.id == it } }
-            ?: slugify(parsed.name)
+        // [fix/audit-1015-b2c] A backup restore is a trusted, user-initiated
+        // flow: the exported id is the user's own, so any non-blank,
+        // directory-name-safe id is adopted verbatim. The old check required
+        // the skill to already exist — on a clean install `_skills` was empty,
+        // the preferred id was silently dropped, and a renamed skill came back
+        // under a fresh slugify id, breaking session_skill_overrides and
+        // /var/minis/skills/<id>/ references. Existence is still checked in
+        // the replace/add branch below.
+        val id = SkillRestorePolicy.resolveImportId(preferredId, slugify(parsed.name))
         if (id.isNotBlank() && _skills.value.any { it.id == id }) {
             // Replace existing: update in place so URL updates refresh contents.
             val current = _skills.value.first { it.id == id }
@@ -630,7 +660,17 @@ class SkillRepository(private val context: Context) {
      * bundled sibling files (scripts/, references/, assets/, etc.) are extracted
      * alongside it into `skillsDir/<id>/`.
      */
-    fun importFromArchive(input: InputStream, preferredId: String? = null): Skill? {
+    fun importFromArchive(
+        input: InputStream,
+        preferredId: String? = null,
+        // [fix/audit-1015-b2a] ConfigBackup's archive branch carries the
+        // exported importSource/sourceURL. Hard-coding FILE here rewrote every
+        // restored skill's source to "file": a URL-imported skill then failed
+        // updateFromURL's importSource != URL guard and permanently lost its
+        // online updates. Defaults keep direct zip imports unchanged.
+        source: ImportSource = ImportSource.FILE,
+        sourceURL: String? = null,
+    ): Skill? {
         val entries = try { readZipEntries(input) } catch (e: Exception) {
             Log.w(TAG, "Failed to read zip archive: ${e.message}")
             return null
@@ -646,7 +686,12 @@ class SkillRepository(private val context: Context) {
         val skillContent = try { String(skillMdEntry.data, Charsets.UTF_8) } catch (_: Exception) { return null }
         if (skillContent.isBlank()) return null
 
-        val skill = importFromContent(skillContent, ImportSource.FILE, preferredId = preferredId) ?: return null
+        val skill = importFromContent(
+            skillContent,
+            source,
+            preferredId = preferredId,
+            sourceURL = sourceURL,
+        ) ?: return null
 
         val prefix = if (skillMdEntry.name == "SKILL.md") "" else skillMdEntry.name.dropLast("SKILL.md".length)
         val skillDir = File(skillsDir, skill.id)
@@ -1450,6 +1495,20 @@ class SkillRepository(private val context: Context) {
                 version = bundledVersion,
                 body = parsed.body,
                 updatedAt = System.currentTimeMillis(),
+                // [fix/audit-1015-b2d] Refresh the frontmatter from the
+                // incoming content, mirroring the replace path in
+                // importFromContent (see [fix/subagent-frontmatter-newskill]):
+                // writeSkillMd merges against this field, and a stale block
+                // here made a version upgrade shadow frontmatter-only keys
+                // (`subagent: true`, max_turns, allowed_tools) until the next
+                // full reload. Keep the previous block when the incoming
+                // document has none. importSource is deliberately NOT touched:
+                // if the row was adopted to BUNDLED it already is; a
+                // user-imported row that reached this branch (their version is
+                // older) keeps its own source label — that is the version
+                // gate's contract, not ours to overwrite.
+                frontmatter = SubagentSkill.extractFrontmatterBlock(content)
+                    .ifBlank { existing.frontmatter },
             )
             db.execSQL(
                 "UPDATE skills SET description=?, version=?, updated_at=? WHERE id=?",

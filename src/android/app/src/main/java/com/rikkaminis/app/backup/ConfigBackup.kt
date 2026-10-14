@@ -1234,9 +1234,17 @@ object ConfigBackup {
                             // [fix/audit-b22 / T4-L8] Pass the exported id so a
                             // skill renamed since the backup is refreshed in
                             // place instead of being duplicated.
+                            // [fix/audit-1015-b2a] Same source passthrough as
+                            // the body branch below: hard-coding FILE in
+                            // importFromArchive rewrote every restored skill's
+                            // importSource to "file", and a URL-imported skill
+                            // then failed updateFromURL's importSource != URL
+                            // guard, losing its online updates for good.
                             skillRepo.importFromArchive(
                                 ByteArrayInputStream(bytes),
                                 s.optString("id", "").takeIf { it.isNotEmpty() },
+                                SkillRepository.ImportSource.from(s.optString("importSource", "file")),
+                                s.optString("sourceURL", "").takeIf { it.isNotEmpty() },
                             )
                         }
                     } else {
@@ -1268,6 +1276,19 @@ object ConfigBackup {
                     // it has to be reapplied after the content import.
                     if (!s.optBoolean("isEnabled", true)) {
                         runCatching { skillRepo.setEnabled(imported.id, false) }
+                    }
+                    // [fix/audit-1015-b2b] Export wrote installedAt/updatedAt/
+                    // useCount; import never read them back, so a restore
+                    // zeroed useCount and re-stamped both timestamps. Older
+                    // backups without these keys decode as 0 and are ignored
+                    // (restoreUsageMetadata applies only >0 values).
+                    runCatching {
+                        skillRepo.restoreUsageMetadata(
+                            id = imported.id,
+                            installedAt = s.optLong("installedAt", 0L),
+                            updatedAt = s.optLong("updatedAt", 0L),
+                            useCount = s.optDouble("useCount", 0.0),
+                        )
                     }
                     skillsImported++
                     if (archive.isEmpty()) {
