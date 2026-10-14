@@ -270,12 +270,14 @@ object PRootKernel {
 
     // Sentinel in the read-only write-guard wrapper scripts so we can recognize
     // and remove our own wrappers (vs a user/busybox binary of the same name).
-    private const val GUARD_MARKER = "minis-mount-readonly-guard"
+    // internal: the test package pins the marker ([MountGuardScriptTest]).
+    internal const val GUARD_MARKER = "minis-mount-readonly-guard"
 
     // Commands whose LAST positional argument is the write target; the earlier
     // ones are sources (cp/mv/ln). Everything else in [installMountWriteGuards]
     // takes every positional argument as a target, except dd (writes via `of=`).
-    private val MOUNT_GUARD_LAST_ARG_CMDS = setOf("cp", "mv", "ln")
+    // internal: the test package pins the shapes ([MountGuardScriptTest]).
+    internal val MOUNT_GUARD_LAST_ARG_CMDS = setOf("cp", "mv", "ln")
 
     /**
      * Reference to the user-mounted folders store, set by [MinisApp] at
