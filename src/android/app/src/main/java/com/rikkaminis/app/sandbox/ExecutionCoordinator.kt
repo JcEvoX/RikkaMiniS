@@ -1032,7 +1032,51 @@ object ExecutionCoordinator {
                 Log.i(TAG, "orphan model-exec reaper: reclaimed $reaped run dir(s)")
             }
         }
+        // [fix/sweep1014-d2b] Aged shutdown-marker cleanup (same low cadence).
+        cleanupStaleShutdownMarker(ctx)
     }
+
+    /**
+     * [fix/sweep1014-d2b] A `shutdown` marker in the model-exec staging root
+     * is written by [maybeReclaimModelService] and consumed by the
+     * :modelservice worker at each request finish — but nothing ever deleted
+     * it, so once true the worker's `shutdownRequested` observation stayed
+     * true forever: the worker's state dump and logs were permanently
+     * poisoned, and a worker restarted AFTER a previous shutdown would read
+     * the stale marker and self-reap on its first quiescent finish even
+     * though the main process was no longer asking.
+     *
+     * Cleanup is AGE-GATED and conservative: the worker consumes the marker
+     * at every request finish, so a marker that has sat for [SHUTDOWN_MARKER_STALE_MS]
+     * is consumed-or-dead garbage. Deleting an aged marker can only cost a
+     * skipped self-reap this round (the next pressure reclaim re-writes the
+     * marker), never correctness — the worker owns its death timing either way.
+     */
+    private fun cleanupStaleShutdownMarker(ctx: Context) {
+        try {
+            val marker = File(
+                File(ctx.cacheDir, "model-exec"),
+                ModelExecutionMailbox.FILE_SHUTDOWN,
+            )
+            if (!marker.isFile) return
+            val ageMs = System.currentTimeMillis() - marker.lastModified()
+            if (ageMs < SHUTDOWN_MARKER_STALE_MS) return
+            if (marker.delete()) {
+                Log.i(TAG, "cleanupProotTmp: cleared stale model-exec shutdown marker (age ${ageMs / 60_000L}min)")
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "cleanupProotTmp (shutdown marker) failed: ${t.message}")
+        }
+    }
+
+    /**
+     * [fix/sweep1014-d2b] A shutdown marker must sit this long before the
+     * stale-marker sweeper may delete it. WHY 30 min: far longer than any
+     * single model-exec request's timeout + ack window, so a worker that is
+     * still going to consume the marker has had many request finishes to do
+     * so; and far shorter than the "forever" the stale marker used to live.
+     */
+    private const val SHUTDOWN_MARKER_STALE_MS = 30 * 60_000L
 
     /**
      * [P2-guest-tmp-reclaim] Recursive, age-gated sweep of one guest temp dir
