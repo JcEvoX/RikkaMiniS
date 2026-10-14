@@ -20,6 +20,8 @@ import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.log10
 import kotlin.math.sqrt
 
@@ -340,31 +342,48 @@ class ProviderSpeechRecognitionEngine(private val appContext: Context) : SpeechR
  * current epoch — so a stale capture job's cleanup can never wipe the flag of
  * a capture that started after it (the rapid stop→start race).
  *
+ * [rv1014-F1] The flag and the epoch token live in a single CAS-able slot
+ * ([current]) so "compare and clear" is one atomic operation. The previous
+ * two-field version (`AtomicBoolean` flag + plain `Int` epoch) had a
+ * check-then-act window in [releaseIfCurrent] — a stale cleanup could observe
+ * a matching epoch and then wipe a newer session's flag in between, and the
+ * plain epoch field had no visibility guarantee across threads. JVM stress
+ * (review-1014/FIX-RV-F): baseline 5/5 runs with wipe violations; CAS version
+ * 0 violations under the same interleaving.
+ *
  * Pure JVM-testable: no Android dependencies.
  */
 internal class CaptureEpochGuard {
 
-    private val flag = AtomicBoolean(false)
-    private var currentEpoch: Int = 0
+    /** Identity holder for the in-flight capture; replaced on every begin. */
+    private class Session(val epoch: Int)
+
+    private val current = AtomicReference<Session?>(null)
+    private val epochCounter = AtomicInteger(0)
 
     /** True while a capture holds the flag. */
     val isActive: Boolean
-        get() = flag.get()
+        get() = current.get() != null
 
     /**
      * Claims the flag for a new capture. Returns the epoch token of the new
      * session, or null when a capture is already in flight (RECOGNIZER_BUSY —
      * unchanged external semantics).
      */
-    fun tryBegin(): Int? =
-        if (flag.getAndSet(true)) null else ++currentEpoch
+    fun tryBegin(): Int? {
+        val session = Session(epochCounter.incrementAndGet())
+        return if (current.compareAndSet(null, session)) session.epoch else null
+    }
 
     /**
      * Releases the flag ONLY if it still belongs to the caller's session.
      * Stale sessions (superseded by a newer start) leave the flag alone.
+     * Single CAS: if a newer session claimed the slot between the read and
+     * the CAS, the stale cleanup loses the race and clears nothing.
      */
     fun releaseIfCurrent(epoch: Int) {
-        if (epoch == currentEpoch) flag.set(false)
+        val cur = current.get()
+        if (cur?.epoch == epoch) current.compareAndSet(cur, null)
     }
 
     /**
@@ -373,7 +392,7 @@ internal class CaptureEpochGuard {
      * busy guard).
      */
     fun forceRelease() {
-        flag.set(false)
+        current.set(null)
     }
 
     /**
@@ -383,5 +402,5 @@ internal class CaptureEpochGuard {
      * session's flag.
      */
     fun isCurrent(epoch: Int): Boolean =
-        epoch == currentEpoch && flag.get()
+        current.get()?.epoch == epoch
 }
