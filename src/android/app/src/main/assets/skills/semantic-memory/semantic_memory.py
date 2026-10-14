@@ -54,8 +54,12 @@ def cosine(a, b):
     return dot/(na*nb) if na*nb else 0
 
 
-def extract_entries(glob_pattern="2026-*.md"):
-    """从 daily logs 提取经验条目（按 ## 标题分割）"""
+def extract_entries(glob_pattern="[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md"):
+    """从 daily logs 提取经验条目（按 ## 标题分割）。
+
+    glob 默认按 YYYY-MM-DD.md 精确匹配（年份无关）——硬编码 "2026-*" 会让
+    跨年后的旧年份日志静默漏采（sweep-1014 B21）。
+    """
     skip_patterns = [
         "These are memories saved by you",
         "These are memories",
@@ -148,6 +152,12 @@ def embed_texts(entries, client=None, backend=None):
                 if backend == "hf" and EMBED_BACKEND not in ("hf", "cf"):
                     print(f"  ⚠️ HF 不可用（{str(ex)[:90]}）→ 切换到 CF ({CF_EMBED_MODEL})")
                     backend, batch = "cf", CF_EMBED_BATCH
+                    if i > 0:
+                        # 维度必须严格一致：HF 384 维 vs CF 1024 维不可混用，
+                        # 前几批已按 HF 写入时必须整表重跑（sweep-1014 B21
+                        # ——只切当前批及后续会让索引维度混杂，检索时查询
+                        # 向量被 zip 截断 → 相似度全错）。旧维度结果随重跑覆盖。
+                        i = 0
                     continue
                 print(f"  ⚠️ 批次 {i // batch + 1} 失败: {ex}")
                 for e in chunk:
