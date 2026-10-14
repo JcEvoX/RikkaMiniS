@@ -248,25 +248,28 @@ class ShareReceiverActivity : ComponentActivity() {
 
     private fun handleSingleSend(intent: Intent, out: MutableList<PendingShare.Item>) {
         val type = intent.type ?: ""
-        when {
-            type == "text/plain" -> {
-                val text = intent.getStringExtra(Intent.EXTRA_TEXT)?.takeIf { it.isNotBlank() }
-                    ?: return
-                if (text.length <= INLINE_TEXT_LIMIT) {
-                    out += PendingShare.Item(PendingShare.Item.Kind.INLINE_TEXT, text)
-                } else {
-                    val name = "shared-text-${shortId()}.txt"
-                    File(SharedShareStore.sharedFileDirectory(this), name)
-                        .writeText(text, Charsets.UTF_8)
-                    out += PendingShare.Item(PendingShare.Item.Kind.ATTACHMENT, name)
-                }
+        // [B28] Resolve the send route with the pure decision function:
+        // file managers share .txt/.log files as text/plain via EXTRA_STREAM
+        // (a content:// Uri) with EXTRA_TEXT absent — fall back to the stream
+        // staging path instead of silently dropping.
+        val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+        val streamUri = getParcelableExtra<Uri>(intent, Intent.EXTRA_STREAM)
+        when (val d = decideSingleSend(type, text, streamUri != null, INLINE_TEXT_LIMIT)) {
+            is SingleSendDecision.InlineText ->
+                out += PendingShare.Item(PendingShare.Item.Kind.INLINE_TEXT, d.text)
+            is SingleSendDecision.AttachText -> {
+                val name = "shared-text-${shortId()}.txt"
+                File(SharedShareStore.sharedFileDirectory(this), name)
+                    .writeText(d.text, Charsets.UTF_8)
+                out += PendingShare.Item(PendingShare.Item.Kind.ATTACHMENT, name)
             }
-            else -> {
-                val uri = getParcelableExtra<Uri>(intent, Intent.EXTRA_STREAM) ?: return
-                copyUriToStaging(uri, type)?.let {
-                    out += PendingShare.Item(PendingShare.Item.Kind.ATTACHMENT, it)
+            is SingleSendDecision.Stream ->
+                streamUri?.let { uri ->
+                    copyUriToStaging(uri, type)?.let {
+                        out += PendingShare.Item(PendingShare.Item.Kind.ATTACHMENT, it)
+                    }
                 }
-            }
+            SingleSendDecision.Drop -> Unit
         }
     }
 
@@ -384,4 +387,37 @@ class ShareReceiverActivity : ComponentActivity() {
     ): ArrayList<T>? = if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU)
         intent.getParcelableArrayListExtra(key, T::class.java)
     else intent.getParcelableArrayListExtra(key)
+}
+
+/** [B28] Where a single ACTION_SEND goes. */
+internal sealed class SingleSendDecision {
+    /** Short inline text — prefill the composer directly. */
+    data class InlineText(val text: String) : SingleSendDecision()
+    /** Long text — stage it as a .txt attachment. */
+    data class AttachText(val text: String) : SingleSendDecision()
+    /** No usable text — stage the content:// stream (EXTRA_STREAM) instead. */
+    object Stream : SingleSendDecision()
+    /** Neither text nor stream — nothing shareable arrived. */
+    object Drop : SingleSendDecision()
+}
+
+/**
+ * [B28] Pure dispatch core of [ShareReceiverActivity] single-send handling,
+ * extracted for JVM testing. A text/plain share that carries no usable
+ * EXTRA_TEXT (file managers share .txt/.log bytes via EXTRA_STREAM with a
+ * null EXTRA_TEXT) falls back to the stream path instead of being silently
+ * dropped; the inline-vs-attach split by [inlineTextLimit] and the
+ * no-EXTRA_STREAM drop are unchanged.
+ */
+internal fun decideSingleSend(
+    type: String,
+    text: String?,
+    hasStream: Boolean,
+    inlineTextLimit: Int,
+): SingleSendDecision = when {
+    type == "text/plain" && text != null && text.isNotBlank() ->
+        if (text.length <= inlineTextLimit) SingleSendDecision.InlineText(text)
+        else SingleSendDecision.AttachText(text)
+    hasStream -> SingleSendDecision.Stream
+    else -> SingleSendDecision.Drop
 }
