@@ -20,8 +20,11 @@ import java.util.UUID
  * roots, then (if mounts are attached) external mounts.
  *
  * ### Layers
- *   1. **Session roots** — `workspace/<sid>` + `attachments/<sid>`.
- *   2. **Shared roots** — `shared/`, `skills/`, `memory/`.
+ *   1. **Session roots** — `minis-sessions/<sid>/workspace` +
+ *      `minis-sessions/<sid>/attachments` (host paths; Linux-visible as
+ *      `/var/minis/workspace` + `/var/minis/attachments`, no `<sid>` suffix).
+ *   2. **Shared roots** — `minis-global/shared/`, `minis-global/skills/`,
+ *      `minis-global/memory/` (Linux-visible as `/var/minis/<label>`).
  *   3. **Mount roots** — each entry in [mountsProvider] (e.g. SAF-attached
  *      folders). Each mount always gets a self-entry so `@<mountName>` works.
  *
@@ -43,7 +46,10 @@ class FileMentionIndex(
     private val cacheTtlMs: Long = DEFAULT_CACHE_TTL_MS,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
 ) {
-    constructor(context: Context) : this(File(context.filesDir, "minis-global"))
+    // [fix/sweep1014-b8] Was File(context.filesDir, "minis-global") — callers
+    // now pass context.filesDir and this class resolves both the session
+    // (minis-sessions/<sid>/) and global (minis-global/) trees from it.
+    constructor(context: Context) : this(context.filesDir)
 
     /**
      * Scope priorities — `order` doubles as the empty-query default sort key
@@ -116,26 +122,35 @@ class FileMentionIndex(
         _isScanning.value = true
         val collected = mutableListOf<Entry>()
         try {
-            // Layer 1: session-local roots.
+            // Layer 1: session-local roots. [fix/sweep1014-b8] The per-session
+            // trees live under filesDir/minis-sessions/<sid>/<subdir> on the
+            // host (PRootKernel.resolveSessionHostPath) and mount at
+            // /var/minis/<subdir> inside PRoot — NO <sid> suffix in the Linux
+            // path. Was minis-global/workspace/<sid> + "/$sessionId" linux
+            // root: Layer 1 never found anything, so session-local files were
+            // 100% un-mentionable via `@`.
             layerEntries(
                 sessionId = sessionId,
                 layers = listOf(
-                    File(filesDir, "workspace/$sessionId") to Scope.WORKSPACE,
-                    File(filesDir, "attachments/$sessionId") to Scope.ATTACHMENTS,
+                    File(filesDir, "minis-sessions/$sessionId/workspace") to Scope.WORKSPACE,
+                    File(filesDir, "minis-sessions/$sessionId/attachments") to Scope.ATTACHMENTS,
                 ),
-                linuxRootFor = { scope -> "/var/minis/${scope.displayLabel}/$sessionId" },
+                linuxRootFor = { scope -> "/var/minis/${scope.displayLabel}" },
             ).let { newBatch ->
                 collected += newBatch
                 publish(token, collected)
             }
 
-            // Layer 2: shared roots.
+            // Layer 2: shared roots. [fix/sweep1014-b8] Root moved with the
+            // constructor's filesDir: the global trees bind-mount from
+            // filesDir/minis-global/<subdir> (PRootKernel.registerGlobalBindMounts).
+            // Linux paths unchanged (/var/minis/<label>).
             layerEntries(
                 sessionId = sessionId,
                 layers = listOf(
-                    File(filesDir, "shared") to Scope.SHARED,
-                    File(filesDir, "skills") to Scope.SKILLS,
-                    File(filesDir, "memory") to Scope.MEMORY,
+                    File(filesDir, "minis-global/shared") to Scope.SHARED,
+                    File(filesDir, "minis-global/skills") to Scope.SKILLS,
+                    File(filesDir, "minis-global/memory") to Scope.MEMORY,
                 ),
                 linuxRootFor = { scope -> "/var/minis/${scope.displayLabel}" },
             ).let { newBatch ->

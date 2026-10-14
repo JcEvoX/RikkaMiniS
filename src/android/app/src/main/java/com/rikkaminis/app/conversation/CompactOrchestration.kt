@@ -209,7 +209,10 @@ internal fun ChatViewModel.compactAll(
     // T7-C: compaction 预算耗尽 → 跳过 compact，不改变历史
     if (!traceObserver.t7ConsumeAndTrace(AgentTraceRecorder.DIMENSION_COMPACTION_CALLS) { it.consumeCompaction() }) {
         _isCompacting.value = false
-        appendSystemInfo(context.getString(R.string.sysmsg_compact_budget_exhausted), "compact")
+        // [fix/sweep1014-b13] Was ungated — the other 7 abort branches all
+        // guard on !silent; an in-loop maybeAutoCompactInLoop(silent=true)
+        // re-emitted this card every turn once the budget was exhausted.
+        if (!silent) appendSystemInfo(context.getString(R.string.sysmsg_compact_budget_exhausted), "compact")
         return
     }
     // [fix/audit0917-b8] Stamp the auto-compact retry gate HERE — at the last
