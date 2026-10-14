@@ -1012,7 +1012,8 @@ object PRootKernel {
      * argument, so `cp /var/minis/mounts/vault/f /var/minis/workspace/` —
      * reading OUT of a read-only mount, perfectly legal — was refused; while
      * conversely `dd of=<read-only path>` wrote straight past the guard
-     * (the `of=` value never matched `"$prefix"|"$prefix"/*`). The argument
+     * (the `of=` value never matched the `"$prefix"` or `"$prefix"/…`
+     * patterns). The argument
      * SELECTION is now command-specific ([mountGuardScript]); the guard
      * semantics are unchanged — any write target under a read-only prefix
      * still exits 1.
