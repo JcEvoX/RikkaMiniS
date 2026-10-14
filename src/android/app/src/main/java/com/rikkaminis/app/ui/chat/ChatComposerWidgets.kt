@@ -271,6 +271,7 @@ import com.rikkaminis.app.data.repository.ChatRepository
 import com.rikkaminis.app.data.repository.MemoryRepository
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.ui.browser.BrowserSheet
+import com.rikkaminis.app.ui.DisplayBitmapLimits
 import com.rikkaminis.app.ui.theme.ChatColors
 import com.rikkaminis.app.ui.components.MinisTextButton
 
@@ -603,7 +604,8 @@ private fun ToolPreviewThumbnail(
                 ) {
                     val path = block.imageFilePath
                     value = if (path == null) null else withContext(Dispatchers.IO) {
-                        try { android.graphics.BitmapFactory.decodeFile(path) } catch (_: Exception) { null }
+                        // [T-android-tool-thumb-fullres-decode] thumbnail-bounded decode.
+                        DisplayBitmapLimits.decodeFileBounded(path, DisplayBitmapLimits.MAX_THUMBNAIL_EDGE_PX)
                     }
                 }
                 val bmp = bitmap
@@ -646,7 +648,8 @@ private fun ToolPreviewThumbnail(
                     // the thumb doesn't degrade to the globe placeholder.
                     val path = block.imageFilePath ?: fallbackImagePath
                     value = if (path == null) null else withContext(Dispatchers.IO) {
-                        try { android.graphics.BitmapFactory.decodeFile(path) } catch (_: Exception) { null }
+                        // [T-android-tool-thumb-fullres-decode] thumbnail-bounded decode.
+                        DisplayBitmapLimits.decodeFileBounded(path, DisplayBitmapLimits.MAX_THUMBNAIL_EDGE_PX)
                     }
                 }
                 val bitmap = liveBitmap ?: savedBitmap

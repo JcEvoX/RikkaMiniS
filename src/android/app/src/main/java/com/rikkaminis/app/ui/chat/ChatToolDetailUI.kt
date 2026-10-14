@@ -269,6 +269,7 @@ import com.rikkaminis.app.data.repository.ChatRepository
 import com.rikkaminis.app.data.repository.MemoryRepository
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.ui.browser.BrowserSheet
+import com.rikkaminis.app.ui.DisplayBitmapLimits
 import com.rikkaminis.app.ui.theme.ChatColors
 import com.rikkaminis.app.ui.components.MinisTextButton
 
@@ -843,16 +844,14 @@ internal fun ToolDetailSheet(
                         ) {
                             value = withContext(Dispatchers.IO) {
                                 block.imageFilePath?.let { path ->
-                                    try { android.graphics.BitmapFactory.decodeFile(path) } catch (_: Exception) { null }
+                                    DisplayBitmapLimits.decodeFileBounded(path)
                                 } ?: run {
                                     val blockIdx = toolBlocks.indexOfFirst { it.id == block.id }
                                     if (blockIdx <= 0) null
                                     else (blockIdx - 1 downTo 0).firstNotNullOfOrNull { i ->
                                         val prev = toolBlocks[i]
                                         if (prev.toolName == "browser_use" && prev.imageFilePath != null) {
-                                            try {
-                                                android.graphics.BitmapFactory.decodeFile(prev.imageFilePath)
-                                            } catch (_: Exception) { null }
+                                            DisplayBitmapLimits.decodeFileBounded(prev.imageFilePath)
                                         } else null
                                     }
                                 }
@@ -1053,7 +1052,7 @@ internal fun ToolDetailSheet(
                             value = if (imgPath == null) null else withContext(Dispatchers.IO) {
                                 val f = File(imgPath)
                                 if (!f.exists()) null
-                                else try { BitmapFactory.decodeFile(f.absolutePath) } catch (_: Throwable) { null }
+                                else DisplayBitmapLimits.decodeFileBounded(f.absolutePath)
                             }
                         }
                         Column(
