@@ -1,6 +1,7 @@
 package com.rikkaminis.app.data
 
 import java.io.File
+import java.security.MessageDigest
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -22,7 +23,12 @@ import java.util.concurrent.ConcurrentHashMap
  * kept sending `Bearer k1, k2, k3` → 401 (model refresh silently kept the old
  * list, voice tests failed). Add the door to this list when you add one.
  *
- * - LRU state persists to `key_roulette.json` under the app cache dir. There
+ * - LRU state persists to `key_roulette.json` under the app cache dir. The
+ *   persisted keys (and the in-memory map keys, same shape) are SHA-256
+ *   truncated hashes of the plaintext key — [sweep1014-FIX-7] — so the
+ *   plaintext never touches disk, matching the "so the plaintext never
+ *   touches disk" rule the cross-process request.json chain already follows.
+ *   There
  *   is no time-based expiry: the persisted slice is rebuilt from the
  *   provider's *current* key list on every draw, so a key removed from the
  *   stored key string drops out on the next draw, and a key that simply goes
@@ -39,6 +45,11 @@ object KeyRoulette {
 
     private val SPLIT = Regex("[\\s,]+")
     private const val FILE_NAME = "key_roulette.json"
+    // [sweep1014-FIX-7] Persisted/in-memory keys are truncated SHA-256 hex of
+    // the plaintext key. Files written before this change stored plaintext
+    // keys; the init() restore path only accepts hash-shaped keys, so legacy
+    // plaintext entries are dropped once (rotation counters lost, keys kept).
+    private val HASH_KEY = Regex("[0-9a-f]{32}")
 
     private val lastUsed = ConcurrentHashMap<String, Long>()
     // [T-provider-key-roulette] Monotonic draw counter is the true LRU key —
@@ -63,6 +74,11 @@ object KeyRoulette {
                     val ikeys = inner.keys()
                     while (ikeys.hasNext()) {
                         val k = ikeys.next()
+                        // [sweep1014-FIX-7] Only hash-shaped keys are restored;
+                        // legacy plaintext entries are skipped (their rotation
+                        // stamp is unrecoverable without the plaintext→hash
+                        // map, and dropping a stamp never drops a key).
+                        if (!HASH_KEY.matches(k)) continue
                         lastUsed.putIfAbsent("$providerId|$k", inner.optLong(k, 0L))
                     }
                 }
@@ -100,9 +116,12 @@ object KeyRoulette {
             // key — wall-clock ms collides when draws land in the same
             // millisecond (bursty retry loops), biasing rotation toward one key.
             val now = ++drawCounter
-            val stale = list.map { it to (lastUsed["$providerId|$it"] ?: 0L) }
+            // [sweep1014-FIX-7] Map keys are hashes of the plaintext key (same
+            // shape as the persisted file) so lookups, pruning and the
+            // cold-start restore all speak the same identifier.
+            val stale = list.map { it to (lastUsed["$providerId|${hashKey(it)}"] ?: 0L) }
                 .minByOrNull { it.second }?.first ?: list.first()
-            lastUsed["$providerId|$stale"] = now
+            lastUsed["$providerId|${hashKey(stale)}"] = now
             persistLocked(providerId, list)
             return stale
         }
@@ -110,6 +129,15 @@ object KeyRoulette {
 
     private fun split(key: String): List<String> =
         key.split(SPLIT).map { it.trim() }.filter { it.isNotBlank() }.distinct()
+
+    /**
+     * [sweep1014-FIX-7] SHA-256 of the plaintext key, truncated to the first
+     * 16 bytes as lowercase hex. Deterministic and collision-free for LRU
+     * purposes; the plaintext is never persisted or logged.
+     */
+    private fun hashKey(k: String): String =
+        MessageDigest.getInstance("SHA-256").digest(k.toByteArray(Charsets.UTF_8))
+            .take(16).joinToString("") { "%02x".format(it) }
 
     private fun stateFile(): File? = cacheDir?.let { File(it, FILE_NAME) }
 
@@ -122,7 +150,8 @@ object KeyRoulette {
         // Called under [lock], and the map is concurrent, so a snapshot of the
         // keys is enough.
         val prefix = "$providerId|"
-        val keep = list.toHashSet()
+        // [sweep1014-FIX-7] keep-set is hashed: the map keys are hashes now.
+        val keep = list.map { hashKey(it) }.toHashSet()
         for (existing in lastUsed.keys.toList()) {
             if (existing.startsWith(prefix) && existing.removePrefix(prefix) !in keep) {
                 lastUsed.remove(existing)
@@ -136,7 +165,7 @@ object KeyRoulette {
                 runCatching { org.json.JSONObject(it.readText()) }.getOrNull()
             } ?: org.json.JSONObject()
             val slice = org.json.JSONObject()
-            for (k in list) slice.put(k, lastUsed["$providerId|$k"] ?: 0L)
+            for (k in list) slice.put(hashKey(k), lastUsed["$providerId|${hashKey(k)}"] ?: 0L)
             // T4-L3: no pruning pass here. The slice only ever contains the
             // provider's current keys, so removed keys vanish on the next draw;
             // the previous `now - stamp < EXPIRE_MS` check compared the
