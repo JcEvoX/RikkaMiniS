@@ -5,6 +5,15 @@ import com.rikkaminis.app.data.repository.ChatRepository
 import com.rikkaminis.app.data.repository.SkillRepository
 import com.rikkaminis.app.logging.AppLogger
 import java.io.File
+import java.io.IOException
+import java.nio.file.FileVisitResult
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.SimpleFileVisitor
+import java.nio.file.StandardCopyOption
+import java.nio.file.attribute.BasicFileAttributes
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * Clone a session (or its skill/memory artifacts) into a fresh local session.
@@ -17,6 +26,15 @@ import java.io.File
  * (T-session-duplicate-compact-marker-android, iOS parity e8ac8b82) with their
  * message-id references remapped onto the duplicated messages, so the compact
  * divider/shadow is preserved on the copy.
+ *
+ * [sweep1014-B10] duplicateSession also copies the source session's on-disk
+ * artifacts — `minis-sessions/<sid>/{workspace,attachments,offloads,browser}`
+ * and `media/<yyyy/MM/dd>/<sid>` — onto the duplicate (same relative layout,
+ * runtime files like sockets/locks skipped), so attachment and
+ * `minis://workspace` references in the copied messages resolve in the new
+ * session instead of dangling as "File not found". The copy is best-effort:
+ * it runs on IO after the DB copy is committed, and a partial failure is
+ * logged without aborting the clone.
  */
 class SessionForkManager(
     private val chatRepository: ChatRepository,
@@ -25,6 +43,9 @@ class SessionForkManager(
 ) {
     companion object {
         private const val TAG = "SessionForkManager"
+
+        /** Per-session artifact subdirs (same set the sandbox binds per session). */
+        internal val ARTIFACT_SUBDIRS = listOf("attachments", "offloads", "workspace", "browser")
     }
 
     /**
@@ -178,6 +199,15 @@ class SessionForkManager(
             AppLogger.info(TAG, "duplicateSession: copied $copied/${markers.size} compact marker(s) to ${new.id}")
         }
 
+        // [sweep1014-B10] Copy the source session's on-disk artifacts onto the
+        // duplicate: minis-sessions/<sid>/{workspace,attachments,offloads,browser}
+        // and media/<yyyy/MM/dd>/<sid>. Without this, every attachment /
+        // minis://workspace reference / offload file in the copied messages
+        // dangles (File not found) in the new session. The DB copy is already
+        // committed at this point, so the artifact copy is best-effort — a
+        // partial failure is logged but never aborts the clone.
+        copySessionArtifacts(sessionId, new.id)
+
         AppLogger.info(
             TAG,
             "duplicated session $sessionId → ${new.id} (${messages.size} msgs, " +
@@ -186,6 +216,78 @@ class SessionForkManager(
         )
         return new.id
     }
+
+    /**
+     * [sweep1014-B10] Copy the source session's on-disk artifacts to the
+     * duplicate session:
+     *   1. `minis-sessions/<src>/{attachments,offloads,workspace,browser}` →
+     *      `minis-sessions/<new>/<subdir>` (session-relative layout preserved);
+     *   2. `media/<yyyy>/<MM>/<dd>/<src>` → `media/<yyyy>/<MM>/<dd>/<new>`
+     *      (the MediaStore dated-path layout, so copied MediaRef.relativePath
+     *      entries resolve with the session id swapped).
+     *
+     * Runtime files (Unix sockets, FIFOs, symlinks, Chromium `Singleton*`
+     * locks, `*.lock` / `*.sock`) are skipped — see [isCopyableArtifactEntry].
+     * Never throws: per-entry I/O failures are collected and logged as a
+     * summary warning (max 10 shown), so a partial copy can never abort the
+     * clone; the caller decides what the clone is worth.
+     */
+    private suspend fun copySessionArtifacts(sourceSessionId: String, newSessionId: String) {
+        val (totalFiles, failures) = withContext(Dispatchers.IO) {
+            var copied = 0
+            val failures = mutableListOf<String>()
+
+            // 1. Session dir tree: minis-sessions/<sid>/{subdir}.
+            val sourceBase = File(filesDir, "minis-sessions/$sourceSessionId")
+            val targetBase = File(filesDir, "minis-sessions/$newSessionId")
+            for (subdir in ARTIFACT_SUBDIRS) {
+                val src = File(sourceBase, subdir)
+                if (!src.isDirectory) continue
+                runCatching { copySessionDirTree(src, File(targetBase, subdir)) }
+                    .onSuccess { (n, failed) ->
+                        copied += n
+                        failures += failed
+                    }
+                    .onFailure { failures.add("$subdir: ${it.message}") }
+            }
+
+            // 2. Media tree: media/<yyyy>/<MM>/<dd>/<sid> — the MediaStore
+            //    dated-path layout (see MediaStore.saveMedia). Copy each date
+            //    bucket to the same structure with the new session id.
+            val mediaBase = File(filesDir, "media")
+            for (year in mediaBase.listDirsSafe()) {
+                for (month in year.listDirsSafe()) {
+                    for (day in month.listDirsSafe()) {
+                        val src = File(day, sourceSessionId)
+                        if (!src.isDirectory) continue
+                        val dst = File(File(File(mediaBase, year.name), month.name), day.name)
+                            .let { File(it, newSessionId) }
+                        runCatching { copySessionDirTree(src, dst) }
+                            .onSuccess { (n, failed) ->
+                                copied += n
+                                failures += failed
+                            }
+                            .onFailure {
+                                failures.add("media/${year.name}/${month.name}/${day.name}: ${it.message}")
+                            }
+                    }
+                }
+            }
+            copied to failures
+        }
+        if (failures.isEmpty()) {
+            AppLogger.info(TAG, "duplicateSession: copied $totalFiles artifact file(s) to $newSessionId")
+        } else {
+            AppLogger.warning(
+                TAG,
+                "duplicateSession: artifact copy to $newSessionId PARTIAL — $totalFiles file(s) copied, " +
+                    "${failures.size} failure(s): " + failures.take(10).joinToString("; "),
+            )
+        }
+    }
+
+    private fun File.listDirsSafe(): List<File> =
+        listFiles { f -> f.isDirectory }?.toList() ?: emptyList()
 
     /**
      * Clone a skill into the local library. When [skillRepository] is wired,
@@ -232,3 +334,86 @@ fun SessionForkManager(
     skillRepository = skillRepository,
     filesDir = context.filesDir,
 )
+
+/** [sweep1014-B10] Per-session artifact subdirs mirrored from the sandbox bind list. */
+internal val SESSION_ARTIFACT_SUBDIRS: List<String> =
+    com.rikkaminis.app.data.SessionForkManager.ARTIFACT_SUBDIRS
+
+/**
+ * [sweep1014-B10] Pure copy-plan decision for one entry in a session artifact
+ * tree. Excluded:
+ *  - non-regular / non-directory entries — Unix sockets, FIFOs, devices and
+ *    symlinks (the runtime offload socket, Chromium profile symlinks);
+ *  - `Singleton*` — Chromium profile runtime locks/sockets (SingletonLock /
+ *    SingletonSocket / SingletonCookie) that only make sense in the live
+ *    browser instance;
+ *  - `*.lock` / `*.sock` — runtime lock/socket files.
+ *
+ * Top-level (not a method on [SessionForkManager]) so it can be JVM-tested
+ * without Android classes.
+ */
+internal fun isCopyableArtifactEntry(name: String, isRegularFile: Boolean, isDirectory: Boolean): Boolean {
+    if (!isRegularFile && !isDirectory) return false
+    if (name.startsWith("Singleton")) return false
+    if (name.endsWith(".lock") || name.endsWith(".sock")) return false
+    return true
+}
+
+/**
+ * [sweep1014-B10] Recursively copy [srcDir] → [dstDir], skipping entries that
+ * fail [isCopyableArtifactEntry]. Returns (files copied, failures as
+ * `"entry: reason"` strings). A missing source dir yields an empty result.
+ * Per-entry I/O failures are collected into the failure list (copy continues);
+ * the only thrown error is a failing `mkdirs` of the destination root.
+ *
+ * Top-level so it can be JVM-tested without Android classes.
+ */
+internal fun copySessionDirTree(srcDir: File, dstDir: File): Pair<Int, List<String>> {
+    var copied = 0
+    val failures = mutableListOf<String>()
+    if (!srcDir.isDirectory) return copied to failures
+    val srcPath = srcDir.toPath()
+    val dstPath = dstDir.toPath()
+    Files.createDirectories(dstPath)
+    Files.walkFileTree(
+        srcPath,
+        object : SimpleFileVisitor<Path>() {
+            override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult {
+                // The root itself is always descended into (its name may be a
+                // legit subdir name like "offloads" — the exclusion list only
+                // applies to entries inside the tree).
+                if (dir != srcPath &&
+                    !isCopyableArtifactEntry(dir.fileName.toString(), attrs.isRegularFile, attrs.isDirectory)
+                ) {
+                    return FileVisitResult.SKIP_SUBTREE
+                }
+                Files.createDirectories(dstPath.resolve(srcPath.relativize(dir)))
+                return FileVisitResult.CONTINUE
+            }
+
+            override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                if (!isCopyableArtifactEntry(file.fileName.toString(), attrs.isRegularFile, attrs.isDirectory)) {
+                    return FileVisitResult.CONTINUE
+                }
+                return try {
+                    Files.copy(
+                        file,
+                        dstPath.resolve(srcPath.relativize(file)),
+                        StandardCopyOption.REPLACE_EXISTING,
+                    )
+                    copied++
+                    FileVisitResult.CONTINUE
+                } catch (t: Throwable) {
+                    failures.add("${file.fileName}: ${t.message}")
+                    FileVisitResult.CONTINUE
+                }
+            }
+
+            override fun visitFileFailed(file: Path, t: IOException): FileVisitResult {
+                failures.add("${file.fileName}: ${t.message}")
+                return FileVisitResult.CONTINUE
+            }
+        },
+    )
+    return copied to failures
+}

@@ -10,11 +10,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.io.File
@@ -29,10 +26,15 @@ import java.util.concurrent.atomic.AtomicInteger
  * stack with industry-standard ANSI/CSI/OSC parsing, TUI compatibility, and
  * mature keyboard / text-selection handling.
  *
- * Output is delivered as raw bytes through [outputBytes]; consumers that still
- * feed a legacy TerminalEmulator can continue to use this same Flow. The new
- * Termux-backed TerminalScreen (Layer 4) reads directly from the Termux
+ * The Termux-backed TerminalScreen (Layer 4) reads directly from the Termux
  * TerminalView, which is driven by the [termuxSession] below.
+ *
+ * [sweep1014-B18] The legacy raw-byte delta flow (`outputBytes`) was removed:
+ * a repo-wide grep found no consumer of it (the `outputBytes` hits in
+ * LLMProvider / ProviderRssProbe are unrelated token-usage fields), and
+ * `lastTranscriptLength` — kept "so we can emit delta bytes on text changes" —
+ * was assigned but never read. Dead code that implied a live output bridge
+ * that no longer exists.
  */
 class TerminalSession(private val context: Context) {
 
@@ -76,13 +78,6 @@ class TerminalSession(private val context: Context) {
     private val _state = MutableStateFlow(State.IDLE)
     val state: StateFlow<State> = _state.asStateFlow()
 
-    /** Raw PTY output bytes — delta stream for legacy consumers not using Termux TerminalView. */
-    private val _outputBytes = MutableSharedFlow<ByteArray>(
-        extraBufferCapacity = 64,
-        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
-    )
-    val outputBytes: SharedFlow<ByteArray> = _outputBytes.asSharedFlow()
-
     /** Counter bumped on every clearOutput() — lets UI wipe emulator state. */
     private val _clearVersion = MutableStateFlow(0)
     val clearVersion: StateFlow<Int> = _clearVersion.asStateFlow()
@@ -99,10 +94,6 @@ class TerminalSession(private val context: Context) {
 
     /** Marshals output-redraw callbacks from the emulator thread to the UI thread. */
     private val mainHandler = Handler(Looper.getMainLooper())
-
-    /** Track last transcript length so we can emit delta bytes on text changes. */
-    @Volatile
-    private var lastTranscriptLength: Int = 0
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
@@ -188,7 +179,6 @@ class TerminalSession(private val context: Context) {
                 }
 
                 termuxSession = session
-                lastTranscriptLength = 0
                 _state.value = State.RUNNING
                 liveSessions.add(WeakReference(this@TerminalSession))
                 Log.i(TAG, "Termux PTY started: cols=$cols rows=$rows sessionId=$sessionId")
@@ -202,7 +192,6 @@ class TerminalSession(private val context: Context) {
                 }
             } catch (t: Throwable) {
                 Log.e(TAG, "Failed to start Termux PTY session", t)
-                _outputBytes.emit("Error: ${t.message}\r\n".toByteArray())
                 // [audit-0917] Kill and release a PTY that was already assigned
                 // before the failure. The exception can come from the cd-write
                 // or the delay above, i.e. AFTER termuxSession was set — the
@@ -447,10 +436,15 @@ class TerminalSession(private val context: Context) {
         if (sessionId != null) {
             val sessionBase = File(context.filesDir, "minis-sessions/$sessionId")
             for (subdir in listOf("attachments", "offloads", "workspace", "browser")) {
-                val hostDir = File(sessionBase, subdir)
-                if (hostDir.exists()) {
-                    mounts["/var/minis/$subdir"] = hostDir.absolutePath
-                }
+                // [sweep1014-B18] mkdirs + mount unconditionally (mirrors
+                // ExecutionCoordinator's agent-shell bind, the same pattern).
+                // The old `if (hostDir.exists())` guard silently fell back to
+                // the global map when the session subdir had never been written
+                // (session subdirs are lazy — created on first write), so a
+                // fresh session's terminal bound /var/minis/workspace to
+                // ANOTHER session's directory.
+                val hostDir = File(sessionBase, subdir).also { it.mkdirs() }
+                mounts["/var/minis/$subdir"] = hostDir.absolutePath
             }
         }
         for ((linuxPath, hostPath) in mounts) {
@@ -509,17 +503,13 @@ class TerminalSession(private val context: Context) {
     }
 
     // ──────────────────────────────────────────────
-    //  TermuxSessionClient — callbacks → outputBytes
+    //  TermuxSessionClient — Termux callbacks
     // ──────────────────────────────────────────────
 
     /**
-     * Bridges Termux terminal events into the legacy [outputBytes] flow so
-     * existing consumers (logging, the legacy TerminalEmulator path) keep
-     * receiving output deltas.
-     *
-     * In the new TerminalScreen (Layer 4) the Termux TerminalView reads
-     * directly from the [termuxSession]; this client exists only for
-     * backward-compatible side channels.
+     * Termux terminal event callbacks. In the TerminalScreen (Layer 4) the
+     * Termux TerminalView reads directly from the [termuxSession];
+     * onTextChanged drives the view redraw (the only live output path).
      */
     private inner class TermuxSessionClient : TerminalSessionClient {
         override fun onTextChanged(changedSession: com.termux.terminal.TerminalSession) {
