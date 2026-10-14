@@ -33,6 +33,12 @@
          cloud quota. [fix/sweep1014-debug-backup D3a] -->
     <exclude domain="file" path="alpine-rootfs/" />
     <exclude domain="file" path="jieba/" />
+    <!-- [fix/backup-media-d2d-1014] media/ is USER content (chat
+         attachments), not re-downloadable — excluded only because of the
+         25MB per-app cloud quota (an oversized payload skips the whole
+         backup, chats included). fullBackupContent cannot split cloud vs
+         device transfer; see data_extraction_rules.xml for the API 31+
+         split. -->
     <exclude domain="file" path="media/" />
 
     <!-- Exclude share staging directory — transient files copied from

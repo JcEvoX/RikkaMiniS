@@ -199,6 +199,12 @@ class MinisApp : Application(), ImageLoaderFactory {
         // .contentCaptureChangeChecker) at 10.45% of all app CPU — about a
         // quarter of the main thread, more than the frame work itself.
         //
+        // The cost only exists when a content-capture service is active:
+        // AOSP registers ContentCaptureManagerService only when the device
+        // declares FEATURE_CONTENT_CAPTURE (verified on a HyperOS 3 device:
+        // no such service and no such feature — there the walk never
+        // happens and this switch is a no-op).
+        //
         // Minis's own UI is unaffected: rendering, accessibility (a separate
         // path), autofill, IME and in-app selection all stay the same. What is
         // lost is system features that read app content through content
