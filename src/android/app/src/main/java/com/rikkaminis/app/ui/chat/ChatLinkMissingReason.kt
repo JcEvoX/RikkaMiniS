@@ -31,7 +31,10 @@ enum class ChatLinkMissingReason {
  */
 internal fun chatLinkMissingReason(rawUrl: String): ChatLinkMissingReason {
     val path = rawUrl.removePrefix("minis://").substringBefore('?')
-    val decoded = runCatching { java.net.URLDecoder.decode(path, "UTF-8") }.getOrDefault(path)
+    // [sweep1014-B6] Same URI-path semantics as the resolver itself —
+    // URLDecoder's form-encoding ('+'→space) would misclassify filenames
+    // containing '+'.
+    val decoded = decodeUriPath(path)
     return if (DeepLinkPathGuard.hasUnsafeSegment(decoded)) {
         ChatLinkMissingReason.ILLEGAL_PATH
     } else {

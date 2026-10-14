@@ -373,13 +373,21 @@ private fun MdText(
     val linkRenderResolver = LocalMarkdownLinkRenderResolver.current
     val missingLinkRanges = remember(text, linkRenderResolver) {
         if (linkRenderResolver == null) emptyList<IntRange>()
-        else text.getStringAnnotations("url", 0, text.length)
-            .distinctBy { it.item }
-            .mapNotNull { ann ->
-                if (linkRenderResolver(ann.item) is ChatLinkAction.MissingFile) {
-                    ann.start until ann.end
-                } else null
-            }
+        else {
+            // [sweep1014-B6] Cache the resolve verdict per URL so repeated
+            // occurrences of the same dead link in one paragraph all get the
+            // grey style — the previous distinctBy{ it.item } kept only the
+            // first occurrence's range, leaving later duplicates clickable.
+            // Resolve cost stays at one lookup per distinct URL.
+            val verdicts = HashMap<String, Boolean>()
+            text.getStringAnnotations("url", 0, text.length)
+                .mapNotNull { ann ->
+                    val missing = verdicts.getOrPut(ann.item) {
+                        linkRenderResolver(ann.item) is ChatLinkAction.MissingFile
+                    }
+                    if (missing) ann.start until ann.end else null
+                }
+        }
     }
     val missingLinkStyle = SpanStyle(
         color = currentMdColors().link.copy(alpha = 0.4f),

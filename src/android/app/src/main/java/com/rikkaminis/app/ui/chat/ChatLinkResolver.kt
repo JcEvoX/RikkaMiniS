@@ -113,14 +113,23 @@ object ChatLinkResolver {
                 // Keep '#' — attachment filenames legitimately contain it.
                 // `minis://` URLs don't use fragments, so stripping at '#'
                 // would truncate filenames like `foo #China.mp4`.
+                // [sweep1014-B6] decodeUriPath = URI path semantics (decodes
+                // %XX only, keeps literal '+'); never throws, so a link with
+                // a bare '%' can't crash the composition.
                 val stripped = raw.removePrefix("minis://").substringBefore('?')
-                val decoded = runCatching { java.net.URLDecoder.decode(stripped, "UTF-8") }.getOrDefault(stripped)
+                val decoded = decodeUriPath(stripped)
                 val linuxPath = if (decoded.startsWith("/")) decoded else "/var/minis/$decoded"
                 lookup(linuxPath)
             }
             "file" -> {
                 val path = raw.removePrefix("file://").substringBefore('?')
-                if (path.isEmpty()) null else File(java.net.URLDecoder.decode(path, "UTF-8"))
+                // [sweep1014-B6] URLDecoder.decode threw IllegalArgumentException
+                // on malformed escapes here — synchronous inside the Compose
+                // resolver, that was an app crash for any message containing a
+                // `file:///…/100%.txt` link. decodeUriPath never throws; the
+                // runCatching is belt-and-suspenders and falls back to the raw
+                // path, letting the existing MissingFile chain handle it.
+                if (path.isEmpty()) null else runCatching { File(decodeUriPath(path)) }.getOrDefault(File(path))
             }
             null -> {
                 if (raw.startsWith("/")) lookup(raw) else null

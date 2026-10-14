@@ -197,8 +197,16 @@ internal object KatexWebViewPool {
                  * the WebView instead of reusing a dead instance.
                  */
                 override fun onRendererGone(view: WebView?) {
+                    // [sweep1014-P1b] completeExceptionally, NOT complete(Unit):
+                    // a plain Unit completion made awaitReady() report ok=true
+                    // to waiters that had already grabbed the deferred, so they
+                    // went on to evaluateJavascript on the dead WebView and
+                    // burned the full 4s timeout. Exceptional completion lets
+                    // awaitReady() see the real failure and return false.
                     isReady = false
-                    readyDeferred?.complete(Unit)
+                    readyDeferred?.completeExceptionally(
+                        IllegalStateException("renderer process was killed by the system"),
+                    )
                     readyDeferred = null
                     val current = pending
                     pending = null
@@ -274,7 +282,16 @@ internal object KatexWebViewPool {
     private suspend fun awaitReady(): Boolean {
         if (isReady) return true
         val d = readyDeferred ?: CompletableDeferred<Unit>().also { readyDeferred = it }
-        val ok = withTimeoutOrNull(RENDER_TIMEOUT_MS) { d.await() } != null
+        // [sweep1014-P1b] onRendererGone completes the deferred exceptionally —
+        // await() throws, which must surface as ok=false (caller falls back to
+        // the placeholder and the next render rebuilds the WebView), never
+        // propagate as a coroutine crash.
+        val ok = try {
+            withTimeoutOrNull(RENDER_TIMEOUT_MS) { d.await() } != null
+        } catch (e: Throwable) {
+            android.util.Log.w(TAG, "WebView died before ready: ${e.message}")
+            false
+        }
         if (!ok) android.util.Log.w(TAG, "WebView never reached ready state")
         return ok
     }
