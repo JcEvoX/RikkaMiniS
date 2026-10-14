@@ -28,6 +28,10 @@ import java.util.concurrent.ConcurrentHashMap
  *   truncated hashes of the plaintext key — [sweep1014-FIX-7] — so the
  *   plaintext never touches disk, matching the "so the plaintext never
  *   touches disk" rule the cross-process request.json chain already follows.
+ *   [rv1014-D2] Legacy files that still store plaintext slice keys are
+ *   migrated in place on the first init() after the upgrade (hash + atomic
+ *   rewrite, rotation stamps preserved), so the no-plaintext-on-disk claim
+ *   holds for pre-existing files too.
  *   There
  *   is no time-based expiry: the persisted slice is rebuilt from the
  *   provider's *current* key list on every draw, so a key removed from the
@@ -47,8 +51,8 @@ object KeyRoulette {
     private const val FILE_NAME = "key_roulette.json"
     // [sweep1014-FIX-7] Persisted/in-memory keys are truncated SHA-256 hex of
     // the plaintext key. Files written before this change stored plaintext
-    // keys; the init() restore path only accepts hash-shaped keys, so legacy
-    // plaintext entries are dropped once (rotation counters lost, keys kept).
+    // keys; init() migrates them in place ([rv1014-D2]: hash + atomic rewrite,
+    // stamps preserved) so the plaintext does not stay on disk.
     private val HASH_KEY = Regex("[0-9a-f]{32}")
 
     private val lastUsed = ConcurrentHashMap<String, Long>()
@@ -66,21 +70,37 @@ object KeyRoulette {
         runCatching {
             val raw = f.readText()
             if (raw.isBlank()) return
-            org.json.JSONObject(raw).let { obj ->
-                val keys = obj.keys()
-                while (keys.hasNext()) {
-                    val providerId = keys.next()
-                    val inner = obj.optJSONObject(providerId) ?: continue
-                    val ikeys = inner.keys()
-                    while (ikeys.hasNext()) {
-                        val k = ikeys.next()
-                        // [sweep1014-FIX-7] Only hash-shaped keys are restored;
-                        // legacy plaintext entries are skipped (their rotation
-                        // stamp is unrecoverable without the plaintext→hash
-                        // map, and dropping a stamp never drops a key).
-                        if (!HASH_KEY.matches(k)) continue
-                        lastUsed.putIfAbsent("$providerId|$k", inner.optLong(k, 0L))
-                    }
+            val obj = org.json.JSONObject(raw)
+            // [rv1014-D2] One-time migration: files written before FIX-7 store
+            // plaintext keys as slice keys. Hash the plaintext keys and
+            // rewrite the file (stamps preserved) so the plaintext does not
+            // stay on disk forever. Idempotent: an already-hash-only file
+            // needs no rewrite. The rewrite is atomic (temp file + move), so
+            // a failure leaves the original intact.
+            val dropped = mutableListOf<String>()
+            val sanitized = sanitizeLegacyRouletteEntries(obj, dropped)
+            if (sanitized != null) {
+                rewriteSanitized(f, sanitized)
+                if (dropped.isNotEmpty()) {
+                    println("KeyRoulette: migrated legacy plaintext entries in $FILE_NAME to hash keys (${dropped.size} blank/illegal key(s) dropped)")
+                }
+            }
+            // Restore stamps from the sanitized shape (hash keys) — identical
+            // stamps to the legacy file, now under the keys the draw path
+            // actually looks up.
+            val loadFrom = sanitized ?: obj
+            val keys = loadFrom.keys()
+            while (keys.hasNext()) {
+                val providerId = keys.next()
+                val inner = loadFrom.optJSONObject(providerId) ?: continue
+                val ikeys = inner.keys()
+                while (ikeys.hasNext()) {
+                    val k = ikeys.next()
+                    // [sweep1014-FIX-7] Only hash-shaped keys are restored;
+                    // with [rv1014-D2] in place this guard is a no-op on a
+                    // migrated file and only trips on a corrupt entry.
+                    if (!HASH_KEY.matches(k)) continue
+                    lastUsed.putIfAbsent("$providerId|$k", inner.optLong(k, 0L))
                 }
             }
             // Restored stamps are wall-clock epoch ms — huge vs a fresh 0-based
@@ -88,6 +108,84 @@ object KeyRoulette {
             // ordering survives the cold-start handoff.
             val maxRestored = lastUsed.values.maxOrNull() ?: 0L
             if (maxRestored > drawCounter) drawCounter = maxRestored
+        }
+    }
+
+    /**
+     * [rv1014-D2] One-time migration of a legacy `key_roulette.json`: replace
+     * plaintext slice keys with their SHA-256 truncated hashes (stamps
+     * preserved verbatim, so LRU order survives the upgrade). Returns null
+     * when the file needs no migration (all keys already hash-shaped) — the
+     * caller then skips the rewrite, making the migration idempotent.
+     *
+     * Blank/illegal keys cannot be hashed meaningfully and are dropped
+     * (collected into [droppedKeys] for logging). Entries whose value is not
+     * a JSONObject are preserved verbatim. Never throws.
+     *
+     * Internal (not private) so the migration semantics are JVM-testable;
+     * [hashKey] is the same function the draw path uses, so a migrated stamp
+     * is found by the very next draw.
+     */
+    internal fun sanitizeLegacyRouletteEntries(
+        obj: org.json.JSONObject,
+        droppedKeys: MutableList<String> = mutableListOf(),
+    ): org.json.JSONObject? {
+        var changed = false
+        val out = org.json.JSONObject()
+        val keys = obj.keys()
+        while (keys.hasNext()) {
+            val providerId = keys.next()
+            val inner = obj.optJSONObject(providerId)
+            if (inner == null) {
+                out.put(providerId, obj.opt(providerId))
+                continue
+            }
+            val outInner = org.json.JSONObject()
+            val ikeys = inner.keys()
+            while (ikeys.hasNext()) {
+                val k = ikeys.next()
+                when {
+                    HASH_KEY.matches(k) -> outInner.put(k, inner.optLong(k, 0L))
+                    k.isNotBlank() -> {
+                        outInner.put(hashKey(k), inner.optLong(k, 0L))
+                        changed = true
+                    }
+                    else -> {
+                        // Blank/illegal key: cannot hash, drop and record.
+                        droppedKeys.add(k)
+                        changed = true
+                    }
+                }
+            }
+            out.put(providerId, outInner)
+        }
+        return if (changed) out else null
+    }
+
+    /**
+     * [rv1014-D2] Atomically replace the state file with the sanitized
+     * content: write to a temp file first, then move over the original. A
+     * failure at any point leaves the original file untouched (the migration
+     * retries on the next cold start) and cleans up the temp file.
+     */
+    private fun rewriteSanitized(f: File, sanitized: org.json.JSONObject) {
+        val tmp = File(f.parentFile, "$FILE_NAME.tmp")
+        runCatching {
+            tmp.writeText(sanitized.toString())
+            try {
+                java.nio.file.Files.move(
+                    tmp.toPath(), f.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                )
+            } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
+                java.nio.file.Files.move(
+                    tmp.toPath(), f.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                )
+            }
+        }.onFailure {
+            runCatching { tmp.delete() }
         }
     }
 
