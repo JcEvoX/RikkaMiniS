@@ -74,7 +74,7 @@ object DatabaseVersionGuard {
      * apart silently: a stale copy here would either disable the guard or
      * trip it on every launch.
      */
-    const val CODE_DB_VERSION = 13
+    const val CODE_DB_VERSION = 14
 
     /** Filename must match the one passed to `Room.databaseBuilder`. */
     private const val DB_NAME = "minis.db"
@@ -102,15 +102,23 @@ object DatabaseVersionGuard {
      * undeclared index fails the open) whose empty-body reverse
      * (AppDatabase.MIGRATION_13_12) is lossless, same rendering as the
      * ADD COLUMN case.
+     *
+     * The 13 → 14 bump (port/v114-session-index, [T-android-moveto-perf])
+     * added `14 to 13`: MIGRATION_13_14 is an ADD INDEX (declared on
+     * ChatSessionEntity) whose reverse (AppDatabase.MIGRATION_14_13) is a
+     * REAL DROP INDEX — not an empty body, because a pre-14 entity does not
+     * declare this index and Room's open-time validation rejects an index it
+     * finds on disk but does not expect; the drop destroys no data (an index
+     * is derived entirely from its column) and re-upgrading recreates it.
      */
-    private val HANDLED_DOWNGRADES: Set<Pair<Int, Int>> = setOf(13 to 12)
+    private val HANDLED_DOWNGRADES: Set<Pair<Int, Int>> = setOf(13 to 12, 14 to 13)
 
     /**
      * Whether a registered downgrade migration covers this jump, in which case
      * the app can open the database normally and the guidance screen is
      * unnecessary.
      *
-     * Only versions with an explicit, verified no-op downgrade belong here.
+     * Only versions with an explicit, verified lossless downgrade belong here.
      * Anything else falls through to the guidance screen rather than being
      * optimistically opened — being wrong in that direction costs the user a
      * screen they can dismiss by upgrading; being wrong the other way costs
@@ -120,11 +128,12 @@ object DatabaseVersionGuard {
      * `@Database` version (`MigrationManager.buildMap` throws "Migrations
      * must be chained" — verified against the room-common 2.6.1 bytecode).
      * So each entry here must ship in the same commit as the forward bump
-     * that creates its `from` version, with an empty-body reverse migration
-     * in [AppDatabase]; `DatabaseVersionGuardTest` asserts the whitelist and
-     * the wired downgrades stay the same set. Any future bump that is NOT
-     * purely additive (rename / drop / data-rewrite) has no safe reverse and
-     * must NOT add an entry here.
+     * that creates its `from` version, with its reverse migration in
+     * [AppDatabase] (empty body where the schema change is invisible to an
+     * older build, a real DROP where it is not); `DatabaseVersionGuardTest`
+     * asserts the whitelist and the wired downgrades stay the same set. Any
+     * future bump that is NOT purely additive (rename / drop / data-rewrite)
+     * has no safe reverse and must NOT add an entry here.
      */
     fun isHandledDowngrade(onDiskVersion: Int, codeVersion: Int): Boolean =
         onDiskVersion to codeVersion in HANDLED_DOWNGRADES

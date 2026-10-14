@@ -14,7 +14,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         CompactMarkerEntity::class,
         WebAppShortcutEntity::class,
     ],
-    version = 13,
+    version = 14,
     exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -306,6 +306,48 @@ abstract class AppDatabase : RoomDatabase() {
         }
 
         /**
+         * [T-android-moveto-perf] Index `sessions.updated_at` — every session
+         * listing orders by this column; with no index SQLite scans the whole
+         * table and sorts, which is what made the "Move to" sheet visibly
+         * pause on large histories.
+         *
+         * The index name and column list must match what Room derives from
+         * ChatSessionEntity's @Index EXACTLY — Room validates the live schema
+         * on open and aborts with IllegalStateException on any difference. In
+         * particular this is `(updated_at)`, not `(updated_at DESC)`: Room's
+         * annotation cannot express a sort order, and SQLite reads a B-tree
+         * index in either direction anyway.
+         */
+        val MIGRATION_13_14 = object : Migration(13, 14) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE INDEX IF NOT EXISTS index_sessions_updated_at " +
+                        "ON sessions(updated_at)"
+                )
+            }
+        }
+
+        /**
+         * [T-android-moveto-perf] Downgrade counterpart of [MIGRATION_13_14].
+         * This one is NOT a no-op, unlike [MIGRATION_13_12]: a pre-14 build's
+         * entity does not declare index_sessions_updated_at, and Room's
+         * open-time validation rejects an index it finds on disk but does not
+         * expect just as firmly as one that is missing — leaving it in place
+         * would make such a build fail to start. Dropping an index destroys
+         * no data (it is derived entirely from the column), so the round trip
+         * is lossless — re-upgrading simply recreates it. MUST ship in the
+         * same commit as [MIGRATION_13_14] (Room rejects a downgrade whose
+         * `from` exceeds the @Database version) and with the matching
+         * `14 to 13` entry in
+         * [com.rikkaminis.app.data.db.DatabaseVersionGuard.HANDLED_DOWNGRADES].
+         */
+        val MIGRATION_14_13 = object : Migration(14, 13) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("DROP INDEX IF EXISTS index_sessions_updated_at")
+            }
+        }
+
+        /**
          * [T-android-downgrade-compat] There is deliberately NO downgrade
          * migration in this file, even though Room supports them. This is a
          * hard Room constraint, not a style choice:
@@ -402,7 +444,7 @@ abstract class AppDatabase : RoomDatabase() {
                     // [T-android-downgrade-compat] 11 upgrades, 0 downgrades — see the
                     // MIGRATION_3_4 doc block above for why a downgrade pair belongs
                     // with its forward bump, not with this build.
-                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_12)
+                    .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_12, MIGRATION_13_14, MIGRATION_14_13)
                     .build()
                     .also { INSTANCE = it }
             }

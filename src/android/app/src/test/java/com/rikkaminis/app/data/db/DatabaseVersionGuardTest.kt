@@ -66,11 +66,16 @@ class DatabaseVersionGuardTest {
             // downgrade covered by the wired MIGRATION_13_12 reverse ->
             // normal open, no guidance
             Row(13, 12, proceed),
+            // 13 → 14 is a plain upgrade, Room's job
+            Row(13, 14, proceed),
+            // downgrade covered by the wired MIGRATION_14_13 reverse ->
+            // normal open, no guidance
+            Row(14, 13, proceed),
             // downgrades with no registered migration -> guidance, never a crash
             Row(14, 12, guidance),
             Row(99, 12, guidance),
-            // the covered jump is specific: 13 is not the same as 14
-            Row(14, 13, guidance),
+            // the covered jump is specific: 14 to 13 is wired, 14 to 12 and
+            // 15 to 13 are not
             Row(15, 13, guidance),
             // a hypothetical future bump must not be auto-handled
             Row(16, 13, guidance),
@@ -84,7 +89,7 @@ class DatabaseVersionGuardTest {
                 DatabaseVersionGuard.decide(row.onDisk, row.code),
             )
         }
-        assertEquals("all rows executed", 14, rows.size)
+        assertEquals("all rows executed", 15, rows.size)
     }
 
     @Test
@@ -98,6 +103,7 @@ class DatabaseVersionGuardTest {
         for (code in 1..25) {
             for (onDisk in (code + 1)..(code + 25)) {
                 if (onDisk == 13 && code == 12) continue // wired: MIGRATION_13_12
+                if (onDisk == 14 && code == 13) continue // wired: MIGRATION_14_13
                 if (DatabaseVersionGuard.decide(onDisk, code) == proceed) {
                     fail(
                         "decide(onDisk=$onDisk, code=$code) unexpectedly PROCEEDed an " +
@@ -111,17 +117,21 @@ class DatabaseVersionGuardTest {
     // ───────────────────────── handled-downgrade whitelist ─────────────────
 
     @Test
-    fun `isHandledDowngrade - whitelists exactly the wired 13-to-12`() {
+    fun `isHandledDowngrade - whitelists exactly the wired downgrades`() {
         // The 12 → 13 bump wired MIGRATION_13_12 (empty-body reverse of a
-        // plain ADD INDEX declared on MessageEntity). The whitelist must name
-        // exactly that pair: the 25x25 sweep below is the guard against a
-        // half-landed or silently widened bump. See HANDLED_DOWNGRADES.
+        // plain ADD INDEX declared on MessageEntity); the 13 → 14 bump
+        // (port/v114-session-index) wired MIGRATION_14_13 (real DROP INDEX
+        // reverse of an ADD INDEX declared on ChatSessionEntity). The
+        // whitelist must name exactly those pairs: the 25x25 sweep below is
+        // the guard against a half-landed or silently widened bump. See
+        // HANDLED_DOWNGRADES.
         val hits = (0..25).flatMap { code ->
             (0..25).map { onDisk -> onDisk to code }
         }.filter { DatabaseVersionGuard.isHandledDowngrade(it.first, it.second) }
         assertEquals(
-            "the whitelist must name exactly the wired MIGRATION_13_12; got $hits",
-            setOf(13 to 12),
+            "the whitelist must name exactly the wired MIGRATION_13_12 and " +
+                "MIGRATION_14_13; got $hits",
+            setOf(13 to 12, 14 to 13),
             hits.toSet(),
         )
 
@@ -134,7 +144,7 @@ class DatabaseVersionGuardTest {
             DatabaseVersionGuard.isHandledDowngrade(11, 12))
         assertFalse("13 -> 14 is an upgrade, not a downgrade",
             DatabaseVersionGuard.isHandledDowngrade(13, 14))
-        // the covered jump is specific: 13 is not the same as 14
+        // the covered jump is specific: 14 to 13 is wired, 14 to 12 is not
         assertFalse("14 -> 12 has no wired reverse",
             DatabaseVersionGuard.isHandledDowngrade(14, 12))
     }
