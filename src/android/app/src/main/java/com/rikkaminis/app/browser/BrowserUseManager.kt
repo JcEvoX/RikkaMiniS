@@ -716,7 +716,7 @@ class BrowserUseManager(
                 // [audit-RC13] Commit the main document for the minis://
                 // subresource gate BEFORE its subresources fire (onPageStarted
                 // is invoked before subresource resolution begins).
-                if (request.isForMainFrame) lastMainDocUrl = url
+                if (!url.isNullOrEmpty()) lastMainDocUrl = url
                 // [feat/browser-console-network-upload] A pending file chooser
                 // belongs to the page that opened it. Navigating away cancels
                 // it (answered with null) so a stale chooser can never
@@ -768,11 +768,12 @@ class BrowserUseManager(
                     if (!minisMainDocAllowsSubresource(mainDoc, originHeader)) {
                         Log.w(TAG, "Blocked cross-origin minis:// subresource from " +
                             "mainDoc=${mainDoc?.take(80)} origin=${originHeader?.take(60)}")
+                        val blockMsg = "Blocked: minis:// subresource requires a " +
+                            "minis://, appassets, or about:blank main document"
                         return android.webkit.WebResourceResponse(
                             "text/plain", "UTF-8", 403, "Forbidden",
                             emptyMap(),
-                            "Blocked: minis:// subresource requires a minis://, " +
-                                "appassets, or about:blank main document".byteInputStream(),
+                            blockMsg.toByteArray(Charsets.UTF_8).inputStream(),
                         )
                     }
                 } else {
