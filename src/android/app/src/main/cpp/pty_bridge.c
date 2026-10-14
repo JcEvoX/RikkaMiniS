@@ -150,11 +150,27 @@ Java_com_rikkaminis_app_sandbox_PtyBridge_readBytes(
     JNIEnv *env, jclass clazz, jint fd, jbyteArray buf, jint off, jint len)
 {
     if (fd < 0 || len <= 0) return -EINVAL;
+    // P5: bounds-check off/len against the real array length — readBytes only
+    // checked `len <= 0`, so a hostile off/len pair reached a raw
+    // `read(fd, data + off, len)` with no native-side guard.
+    jsize bufLen = (*env)->GetArrayLength(env, buf);
+    if (off < 0 || off > bufLen || len > bufLen - off) return -EINVAL;
     jbyte *data = (*env)->GetByteArrayElements(env, buf, NULL);
     if (!data) return -ENOMEM;
-    ssize_t n = read(fd, data + off, (size_t) len);
+    ssize_t n;
+    while (1) {
+        n = read(fd, data + off, (size_t) len);
+        if (n < 0 && errno == EINTR) continue;  // retry, same as writeBytes
+        break;
+    }
     int err = (n < 0) ? errno : 0;
-    (*env)->ReleaseByteArrayElements(env, buf, data, 0);
+    if (n <= 0) {
+        // Nothing was read (error or EOF): the caller's buffer is untouched,
+        // so release with JNI_ABORT instead of copying nothing back.
+        (*env)->ReleaseByteArrayElements(env, buf, data, JNI_ABORT);
+    } else {
+        (*env)->ReleaseByteArrayElements(env, buf, data, 0);
+    }
     if (n < 0) return -err;
     return (jint) n;
 }
@@ -164,6 +180,10 @@ Java_com_rikkaminis_app_sandbox_PtyBridge_writeBytes(
     JNIEnv *env, jclass clazz, jint fd, jbyteArray buf, jint off, jint len)
 {
     if (fd < 0 || len <= 0) return -EINVAL;
+    // P5 (same family, one line): writeBytes had the same unchecked off/len
+    // feeding `data + off + written` — same guard as readBytes.
+    jsize bufLen = (*env)->GetArrayLength(env, buf);
+    if (off < 0 || off > bufLen || len > bufLen - off) return -EINVAL;
     jbyte *data = (*env)->GetByteArrayElements(env, buf, NULL);
     if (!data) return -ENOMEM;
     ssize_t written = 0;

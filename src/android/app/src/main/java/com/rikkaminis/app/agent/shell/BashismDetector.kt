@@ -45,7 +45,15 @@ object BashismDetector {
     }
 
     private const val TAG = "Bashism"
-    private val heredocOpen = Pattern.compile("<<-?\\s*[\"']?(\\w+)[\"']?")
+
+    // B15: `(?<!<)` / `(?!<)` exclude the here-string operator `<<<` — matching
+    // from its second `<` used to fabricate a delimiter out of the payload word
+    // and null out the rest of the script (every bashism after it silently
+    // missed). `[A-Za-z_]\w*` excludes pure-digit delimiters like the `<< 16`
+    // in `$((1 << 16))` — real ash heredoc delimiters start with a letter or
+    // underscore, and a digit "delimiter" never matches any line, which used to
+    // null out the whole remainder of the script the same way.
+    private val heredocOpen = Pattern.compile("(?<!<)<<(?!<)-?\\s*[\"']?([A-Za-z_]\\w*)[\"']?")
 
     @Volatile private var rules: List<Rule> = emptyList()
     @Volatile private var loaded = false
@@ -123,7 +131,14 @@ object BashismDetector {
             out.add((i + 1) to line) // opening line IS shell-layer
             val delims = ArrayList<String>()
             val m = heredocOpen.matcher(line)
-            while (m.find()) delims.add(m.group(1)!!)
+            while (m.find()) {
+                // B15: a `<<` inside `$(( … ))` is an arithmetic shift
+                // (`$(( x << y ))`), not a heredoc — treating it as one used to
+                // null out the rest of the script. Skip matches that sit inside
+                // an unclosed arithmetic expansion.
+                if (inArithmeticContext(line, m.start())) continue
+                delims.add(m.group(1)!!)
+            }
             i++
             for (delim in delims) {
                 while (i < lines.size && lines[i].trim() != delim) {
@@ -137,6 +152,20 @@ object BashismDetector {
             }
         }
         return out
+    }
+
+    /** True if [index] sits inside an unclosed `$(( … ))` arithmetic expansion on [line]. */
+    private fun inArithmeticContext(line: String, index: Int): Boolean {
+        var depth = 0
+        var i = 0
+        while (i < index) {
+            when {
+                line.startsWith("$((", i) -> { depth++; i += 3 }
+                line.startsWith("))", i) -> { if (depth > 0) depth--; i += 2 }
+                else -> i++
+            }
+        }
+        return depth > 0
     }
 
     fun detect(script: String, fuseMs: Long = 50): Result {

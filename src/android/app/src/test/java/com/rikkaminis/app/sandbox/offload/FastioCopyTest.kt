@@ -224,4 +224,57 @@ class FastioCopyTest {
         )
         assertTrue(Files.exists(src))
     }
+
+    // ── B16: cross-device (EXDEV) move via the copy+delete fallback ──────────
+    //
+    // The old code called a bare non-atomic `Files.move` first; on a
+    // cross-mount non-empty directory the JDK's internal fallback created the
+    // dst directory and then failed rmdir on the source
+    // (DirectoryNotEmptyException pointing at SRC), leaving a half-empty dst —
+    // and the fallback at the bottom of moveTree was unreachable. Deleting
+    // ATOMIC_MOVE from moveTree's first attempt must not change these two.
+
+    @Test
+    fun `copyDeleteFallback moves a tree and deletes the source`() {
+        val srcDir = Files.createTempDirectory("fastio-fallback-src")
+        val dstDir = Files.createTempDirectory("fastio-fallback-dst")
+        val sub = Files.createDirectory(srcDir.resolve("sub"))
+        Files.write(sub.resolve("a.txt"), "aa".toByteArray())
+        val out = MoveOutcome()
+
+        copyDeleteFallback(srcDir.resolve("sub"), dstDir.resolve("moved"), force = true, out = out)
+
+        assertEquals("copy+delete", out.method)
+        assertTrue(out.counted)
+        assertFalse(Files.exists(srcDir.resolve("sub")))
+        assertEquals("aa", Files.readAllBytes(dstDir.resolve("moved/a.txt")).decodeToString())
+        assertTrue(out.errors.isEmpty())
+    }
+
+    @Test
+    fun `copyDeleteFallback cleans up a half-copied target it created`() {
+        // Needs a mid-copy failure: an unreadable source subdirectory trips
+        // visitFileFailed, which is exactly the case the residue cleanup
+        // recovers from. Not reproducible as root (root reads through 000),
+        // so the assume skips there — CI's non-root runner drives this.
+        org.junit.Assume.assumeTrue(System.getProperty("user.name") != "root")
+        val srcDir = Files.createTempDirectory("fastio-fail-src")
+        val dstDir = Files.createTempDirectory("fastio-fail-dst")
+        val top = Files.createDirectory(srcDir.resolve("top"))
+        Files.write(top.resolve("a.txt"), "aa".toByteArray())
+        val locked = Files.createDirectory(top.resolve("locked"))
+        Files.write(locked.resolve("b.txt"), "bb".toByteArray())
+        Files.setPosixFilePermissions(
+            locked,
+            java.nio.file.attribute.PosixFilePermissions.fromString("---------"),
+        )
+        val out = MoveOutcome()
+
+        copyDeleteFallback(top, dstDir.resolve("moved"), force = true, out = out)
+
+        assertTrue("the unreadable subtree must make the copy fail", out.errors.isNotEmpty())
+        assertFalse("the half-copied dst must be cleaned up, not left behind",
+            Files.exists(dstDir.resolve("moved")))
+        assertTrue("the source must survive a failed move", Files.exists(top))
+    }
 }
