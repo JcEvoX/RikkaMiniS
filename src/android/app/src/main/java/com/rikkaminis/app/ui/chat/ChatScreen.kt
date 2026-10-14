@@ -2170,8 +2170,33 @@ fun ChatScreen(
                         // Fallback pulse animation (iOS: 3× red pulse on model switch)
                         val fallbackTrigger by viewModel.fallbackTrigger.collectAsState()
                         val fallbackPulseAlpha = remember { androidx.compose.animation.core.Animatable(0f) }
+                        // [port-v114 S4 / T-android-fallback-pulse-replay] Only
+                        // pulse for a fallback that happens while this screen
+                        // is on show.
+                        //
+                        // `fallbackTrigger` is a monotonic counter that is never
+                        // reset, and ChatViewModel is reused across visits to a
+                        // session, so a session that fell back during an EARLIER
+                        // turn hands us a non-zero value the moment the screen
+                        // is composed. `LaunchedEffect(key)` runs on first
+                        // composition as well as on change, so the old `== 0`
+                        // guard only suppressed sessions that had never fallen
+                        // back at all: re-entering a session that had recovered
+                        // onto a working model replayed the red pulse every
+                        // time, reading as "it is switching models again" when
+                        // nothing was happening. (The model itself was restored
+                        // correctly from the persisted binding — this was
+                        // purely the animation.)
+                        //
+                        // Baselining the counter at first composition
+                        // reproduces iOS's `.onChange(of:)` semantic. Keyed on
+                        // `viewModel` so re-binding this composable to another
+                        // session's VM re-takes the baseline.
+                        val fallbackPulseBaseline = remember(viewModel) {
+                            viewModel.fallbackTrigger.value
+                        }
                         LaunchedEffect(fallbackTrigger) {
-                            if (fallbackTrigger == 0) return@LaunchedEffect
+                            if (!shouldPulse(fallbackTrigger, fallbackPulseBaseline)) return@LaunchedEffect
                             repeat(3) {
                                 fallbackPulseAlpha.animateTo(1f, animationSpec = androidx.compose.animation.core.tween(350))
                                 fallbackPulseAlpha.animateTo(0f, animationSpec = androidx.compose.animation.core.tween(350))
