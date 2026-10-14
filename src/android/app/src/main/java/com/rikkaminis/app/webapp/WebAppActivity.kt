@@ -265,7 +265,20 @@ class WebAppActivity : ComponentActivity() {
     private fun openInMinis(sourceSessionId: String?) {
         val intent = Intent(this, MainActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-            sourceSessionId?.let { putExtra(EXTRA_TARGET_SESSION_ID, it) }
+            // [fix/audit-1015 BUG-08①] This used to put a `target_session_id`
+            // string extra — a dead letter: MainActivity has no reader for it
+            // (the only occurrence of the key in the repo was the constant
+            // itself), so "Open in Minis" always landed on whatever MainActivity
+            // happened to be showing. The app already has a first-class
+            // session deep link — minis://session/<sid> →
+            // DeepLinkAction.OpenSession → Routes.chat — handled both warm
+            // (MainActivity.onNewIntent:752 → handleDeepLink) and cold
+            // (onCreate:475 parses the launch intent's data). Route through it
+            // instead of inventing a parallel extra. Uri.encode keeps the
+            // segment safe; DeepLinkHandler reads uri.path which decodes it
+            // back. No session (source missing) → plain launch, unchanged.
+            sourceSessionId
+                ?.let { data = Uri.parse("minis://session/" + Uri.encode(it)) }
         }
         startActivity(intent)
         finish()
@@ -280,7 +293,12 @@ class WebAppActivity : ComponentActivity() {
         onWebViewReady: (WebView) -> Unit,
     ) {
         val context = LocalContext.current
-        var fullscreen by remember { mutableStateOf(initialFullscreen) }
+        // [fix/audit-1015 BUG-08②] remember now keys on initialFullscreen so a
+        // host re-run with a changed flag re-initializes. Zero-risk hardening:
+        // today WebAppHost only composes under renderHost's setContent, which
+        // restarts the composition wholesale (so the unkeyed remember already
+        // reset); the key removes the reliance on that incidental detail.
+        var fullscreen by remember(initialFullscreen) { mutableStateOf(initialFullscreen) }
         var toolbarVisible by remember { mutableStateOf(true) }
         // Bumped on each user interaction; LaunchedEffect uses it as a key
         // so the auto-hide timer restarts on every tap.
@@ -615,7 +633,10 @@ class WebAppActivity : ComponentActivity() {
     companion object {
         const val EXTRA_SHORTCUT_ID = "webapp_shortcut_id"
         const val ACTION_OPEN_WEBAPP = "com.rikkaminis.app.action.OPEN_WEBAPP"
-        const val EXTRA_TARGET_SESSION_ID = "target_session_id"
+        // [fix/audit-1015 BUG-08①] EXTRA_TARGET_SESSION_ID removed: it had no
+        // reader anywhere in the repo (grep across all sources: the constant's
+        // only consumer was the write it was created for). openInMinis now uses
+        // the existing minis://session/<sid> deep link.
         private const val ASSET_LOADER_HOST = "appassets.androidplatform.net"
         private const val AUTO_HIDE_MS = 4000L
     }

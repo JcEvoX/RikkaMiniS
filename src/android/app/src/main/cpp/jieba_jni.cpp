@@ -51,23 +51,124 @@ std::string joinPath(const std::string& dir, const std::string& file) {
     return dir + "/" + file;
 }
 
+// Forward declarations (definitions follow toStdString; the conversion pair
+// is kept adjacent to where it is applied).
+static std::string mutf8ToUtf8(const std::string& in);
+static std::string utf8ToMutf8(const std::string& in);
+
 // Convert a jstring to a std::string (UTF-8). Returns "" on null.
+//
+// [fix/audit-1015 BUG-06] JNI's GetStringUTFChars/NewStringUTF exchange
+// *Modified UTF-8* (MUTF-8), not standard UTF-8: code points above U+FFFF —
+// emoji, CJK Extension B+ — travel as CESU-8-style surrogate halves, i.e.
+// TWO 3-byte sequences (ED A0..AF 8x 8x + ED B0..BF 8x 8x) instead of one
+// 4-byte sequence. cppjieba's DecodeUTF8ToRune reads standard UTF-8, so
+// without folding each half became its own rune: 😀 was split into two
+// garbage tokens by the segmenter, and words handed back to NewStringUTF
+// carried lone surrogates (invalid Java String content). toStdString now
+// folds MUTF-8 into standard UTF-8 on the way in and toStringArray unfolds
+// on the way out (see utf8ToMutf8 below) — segmentation sees real code
+// points and every jstring we build is well-formed again. ASCII (paths,
+// plain Chinese) passes through untouched in both directions.
 std::string toStdString(JNIEnv* env, jstring s) {
     if (s == nullptr) return std::string();
     const char* chars = env->GetStringUTFChars(s, nullptr);
     if (chars == nullptr) return std::string();
-    std::string out(chars);
+    std::string out = mutf8ToUtf8(std::string(chars));
     env->ReleaseStringUTFChars(s, chars);
     return out;
 }
 
+// MUTF-8 -> standard UTF-8. Surrogate pairs (high ED A0..AF .. followed
+// immediately by low ED B0..BF ..) collapse into one 4-byte sequence; every
+// other byte passes through, so unpaired halves survive verbatim and plain
+// ASCII/CJK is a no-op. Pure function over bytes — host-testable.
+static std::string mutf8ToUtf8(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    const size_t n = in.size();
+    size_t i = 0;
+    while (i < n) {
+        const unsigned char c0 = (unsigned char)in[i];
+        if (c0 == 0xED && i + 5 < n) {
+            const unsigned char c1 = (unsigned char)in[i + 1];
+            const unsigned char c2 = (unsigned char)in[i + 2];
+            const unsigned char c3 = (unsigned char)in[i + 3];
+            const unsigned char c4 = (unsigned char)in[i + 4];
+            const unsigned char c5 = (unsigned char)in[i + 5];
+            if (c1 >= 0xA0 && c1 <= 0xAF && (c2 & 0xC0) == 0x80 &&
+                c3 == 0xED && c4 >= 0xB0 && c4 <= 0xBF && (c5 & 0xC0) == 0x80) {
+                const unsigned int hi = 0xD800u +
+                    (((unsigned int)(c1 & 0x0F) << 6) | (unsigned int)(c2 & 0x3F));
+                const unsigned int lo = 0xDC00u +
+                    (((unsigned int)(c4 & 0x0F) << 6) | (unsigned int)(c5 & 0x3F));
+                const unsigned int cp = 0x10000u +
+                    ((hi - 0xD800u) << 10) + (lo - 0xDC00u);
+                out += (char)(0xF0 | (cp >> 18));
+                out += (char)(0x80 | ((cp >> 12) & 0x3F));
+                out += (char)(0x80 | ((cp >> 6) & 0x3F));
+                out += (char)(0x80 | (cp & 0x3F));
+                i += 6;
+                continue;
+            }
+        }
+        out += in[i];
+        ++i;
+    }
+    return out;
+}
+
+// standard UTF-8 -> MUTF-8 (exact inverse): each 4-byte sequence (code point
+// >= U+10000) expands back into its surrogate pair. Pure function, host-
+// testable; mutf8ToUtf8 then utf8ToMutf8 is the identity on both MUTF-8 and
+// plain-UTF-8-with-no-above-BMP inputs.
+static std::string utf8ToMutf8(const std::string& in) {
+    std::string out;
+    out.reserve(in.size());
+    const size_t n = in.size();
+    size_t i = 0;
+    while (i < n) {
+        const unsigned char c0 = (unsigned char)in[i];
+        if (c0 >= 0xF0 && c0 <= 0xF4 && i + 3 < n &&
+            ((unsigned char)in[i + 1] & 0xC0) == 0x80 &&
+            ((unsigned char)in[i + 2] & 0xC0) == 0x80 &&
+            ((unsigned char)in[i + 3] & 0xC0) == 0x80) {
+            const unsigned int cp = ((unsigned int)(c0 & 0x07) << 18) |
+                (((unsigned char)in[i + 1] & 0x3Fu) << 12) |
+                (((unsigned char)in[i + 2] & 0x3Fu) << 6) |
+                ((unsigned char)in[i + 3] & 0x3Fu);
+            if (cp >= 0x10000u) {
+                const unsigned int v = cp - 0x10000u;
+                const unsigned int hi = 0xD800u + (v >> 10);
+                const unsigned int lo = 0xDC00u + (v & 0x3FFu);
+                out += (char)(0xE0 | (hi >> 12));
+                out += (char)(0x80 | ((hi >> 6) & 0x3F));
+                out += (char)(0x80 | (hi & 0x3F));
+                out += (char)(0xE0 | (lo >> 12));
+                out += (char)(0x80 | ((lo >> 6) & 0x3F));
+                out += (char)(0x80 | (lo & 0x3F));
+                i += 4;
+                continue;
+            }
+        }
+        out += in[i];
+        ++i;
+    }
+    return out;
+}
+
 // Build a Java String[] from a vector of UTF-8 words.
+//
+// [fix/audit-1015 BUG-06] NewStringUTF expects MUTF-8, so words are unfolded
+// back (4-byte sequence -> surrogate pair) before crossing the boundary; a
+// word that contains an above-BMP character (😀 / 𠀀) is otherwise handed to
+// the JVM as a lone surrogate, which is not a well-formed Java String.
 jobjectArray toStringArray(JNIEnv* env, const std::vector<std::string>& words) {
     jclass stringClass = env->FindClass("java/lang/String");
     jobjectArray arr = env->NewObjectArray(static_cast<jsize>(words.size()), stringClass, nullptr);
     if (arr == nullptr) return nullptr;
     for (jsize i = 0; i < static_cast<jsize>(words.size()); ++i) {
-        jstring w = env->NewStringUTF(words[i].c_str());
+        jstring w = env->NewStringUTF(utf8ToMutf8(words[i]).c_str());
         env->SetObjectArrayElement(arr, i, w);
         env->DeleteLocalRef(w);
     }
