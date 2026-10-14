@@ -13,7 +13,12 @@
         <exclude domain="file" path="minis-sessions/" />
         <!-- [fix/sweep1014-debug-backup D3a] proot/ matched no directory —
              the rootfs lives at alpine-rootfs/ (RootfsManager.kt), tokenizer
-             at jieba/, user media offloads at media/. -->
+             at jieba/. -->
+        <!-- [fix/backup-media-d2d-1014] media/ is USER content (chat
+             attachments written by saveMedia / saveMediaStreamed), not
+             re-downloadable. Excluded from cloud-backup ONLY because the
+             25MB Auto Backup quota is per-app and an oversized payload
+             skips the whole backup (chats included). -->
         <exclude domain="file" path="alpine-rootfs/" />
         <exclude domain="file" path="jieba/" />
         <exclude domain="file" path="media/" />
@@ -35,10 +40,13 @@
         <exclude domain="file" path="minis-sessions/" />
         <!-- [fix/sweep1014-debug-backup D3a] proot/ matched no directory —
              the rootfs lives at alpine-rootfs/ (RootfsManager.kt), tokenizer
-             at jieba/, user media offloads at media/. -->
+             at jieba/. -->
+        <!-- [fix/backup-media-d2d-1014] media/ is USER content (chat
+             attachments) and is deliberately NOT excluded here: device
+             transfer (D2D migration) has no cloud quota, so attachments
+             ride along on device change. -->
         <exclude domain="file" path="alpine-rootfs/" />
         <exclude domain="file" path="jieba/" />
-        <exclude domain="file" path="media/" />
         <exclude domain="file" path="share_extension/" />
         <exclude domain="file" path="minis-global/" />
         <exclude domain="file" path="debug_server_token" />
