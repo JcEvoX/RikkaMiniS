@@ -19,12 +19,51 @@ import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * MinisAccessibilityService — host-side AccessibilityService backing the
  * `android-a11y-cli` offload command. The user must enable it manually
  * under Settings → Accessibility; we never start it programmatically.
  */
+
+/**
+ * Bounded FIFO ring with O(1) size bookkeeping.
+ *
+ * [sweep1014-P4b] The previous implementation drove eviction with
+ * `ConcurrentLinkedQueue.size` — an O(N) full traversal, run twice per
+ * accessibility event on the system main thread with a 1024-node ring (an
+ * event storm paid N queue-node visits per event). An AtomicInteger counter
+ * maintained on offer/poll keeps the same cap semantics at O(1) per event:
+ * over capacity drops the OLDEST item (FIFO), snapshot order is unchanged.
+ * Offer and eviction run on the service's main thread; the counter is atomic
+ * anyway so `snapshot`/`size` from other threads always agree with the queue.
+ * JVM-pure and generic so the cap behavior is unit-testable without Android.
+ */
+private class BoundedEventRing<T>(private val cap: Int) {
+    private val queue = ConcurrentLinkedQueue<T>()
+    private val count = AtomicInteger(0)
+
+    fun offer(item: T) {
+        queue.offer(item)
+        if (count.incrementAndGet() <= cap) return
+        // Over capacity: drop the oldest. Each offer adds exactly one item, so
+        // one poll per over-capacity offer restores the invariant; the loop is
+        // defensive (e.g. against a future batched caller).
+        while (count.get() > cap) {
+            if (queue.poll() != null) count.decrementAndGet() else break
+        }
+    }
+
+    fun snapshot(): List<T> = queue.toList()
+
+    fun size(): Int = count.get()
+
+    fun clear() {
+        queue.clear()
+        count.set(0)
+    }
+}
 class MinisAccessibilityService : AccessibilityService() {
 
     companion object {
@@ -46,7 +85,7 @@ class MinisAccessibilityService : AccessibilityService() {
         val timestamp: Long,
     )
 
-    private val eventRing = ConcurrentLinkedQueue<RecordedEvent>()
+    private val eventRing = BoundedEventRing<RecordedEvent>(EVENT_RING_CAP)
     private val eventListeners = CopyOnWriteArrayList<(RecordedEvent) -> Unit>()
 
     val nodeRegistry: NodeRegistry = NodeRegistry()
@@ -86,7 +125,6 @@ class MinisAccessibilityService : AccessibilityService() {
             timestamp = System.currentTimeMillis(),
         )
         eventRing.offer(rec)
-        while (eventRing.size > EVENT_RING_CAP) eventRing.poll()
         for (listener in eventListeners) {
             try { listener(rec) } catch (_: Throwable) {}
         }
@@ -105,7 +143,7 @@ class MinisAccessibilityService : AccessibilityService() {
         AppLogger.info(TAG, "service destroyed")
     }
 
-    fun snapshotEvents(): List<RecordedEvent> = eventRing.toList()
+    fun snapshotEvents(): List<RecordedEvent> = eventRing.snapshot()
 
     fun addEventListener(listener: (RecordedEvent) -> Unit) {
         eventListeners.add(listener)

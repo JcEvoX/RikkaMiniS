@@ -74,7 +74,7 @@ object BPETokenizer {
         if (text.isEmpty()) return 0
         val vocab = encoder
         if (vocab == null) return heuristicTokenCount(text)
-        return bpeEncode(text.toByteArray(Charsets.UTF_8), vocab).size
+        return bpeEncode(text.toByteArray(Charsets.UTF_8), vocab)
     }
 
     /**
@@ -174,31 +174,94 @@ object BPETokenizer {
     /**
      * Greedy BPE: treat each byte as its own segment, repeatedly merge the
      * adjacent pair with the lowest rank that's still in the vocabulary, stop
-     * when no mergeable pair remains. Mirrors iOS `bytePairEncode`.
+     * when no mergeable pair remains. Mirrors iOS `bytePairEncode`. Returns
+     * the token COUNT (one per surviving segment).
+     *
+     * [sweep1014-P4a] Counting semantics: segments whose bytes are not in the
+     * vocabulary were previously dropped silently by a trailing `mapNotNull`
+     * — under-counting exactly the inputs the loaded vocabulary does not
+     * cover. Unknown segments now contribute 1 token each (one token per
+     * unknown unit: conservative, errs toward over-counting rather than
+     * hiding bytes). Registered here rather than logged — an unknown segment
+     * means the loaded vocabulary is incomplete, and the count staying
+     * monotone in the input length is the invariant callers rely on.
+     *
+     * [sweep1014-P4a] Performance: the previous implementation re-sliced +
+     * re-listed both segments of EVERY adjacent pair on EVERY scan pass —
+     * O(N²) byte-array copies and object allocations per call (a 10 KB
+     * message = ~10⁸ allocations). This version keeps (start, end) index
+     * ranges, merges via a doubly linked list, and pushes each pair into a
+     * rank-ordered min-heap once per content change: initial N−1 lookups +
+     * 2 lookups per merge = O(N) vocabulary lookups total (each allocating
+     * one `List<Byte>` key), instead of O(N²) copy+list per pass.
+     *
+     * Tie-breaking matches the previous left-to-right scan: the min-heap is
+     * ordered by (rank, node index), so equal ranks pop leftmost-first, the
+     * same pair a full rescan would have picked (`if (rank < minRank)` keeps
+     * the first minimum encountered). Stale heap entries (pairs whose bytes
+     * changed since they were pushed) are discarded on pop by recomputing the
+     * pair's current rank: every content change re-offers the affected pairs,
+     * so a fresh entry for the current state is always present.
      */
-    private fun bpeEncode(bytes: ByteArray, vocab: Map<List<Byte>, Int>): List<Int> {
-        if (bytes.isEmpty()) return emptyList()
-        val segments = ArrayList<IntArray>(bytes.size)
-        for (i in bytes.indices) segments.add(intArrayOf(i, i + 1))
-        while (segments.size > 1) {
-            var minRank = Int.MAX_VALUE
-            var minIdx = -1
-            for (i in 0 until segments.size - 1) {
-                val start = segments[i][0]
-                val end = segments[i + 1][1]
-                val slice = bytes.sliceArray(start until end).toList()
-                val rank = vocab[slice] ?: continue
-                if (rank < minRank) {
-                    minRank = rank
-                    minIdx = i
-                }
+    private fun bpeEncode(bytes: ByteArray, vocab: Map<List<Byte>, Int>): Int {
+        if (bytes.isEmpty()) return 0
+        val n = bytes.size
+        // Segment boundaries as index ranges — no per-segment byte copies.
+        val segStart = IntArray(n) { it }
+        val segEnd = IntArray(n) { it + 1 }
+        // Doubly linked list over segment nodes; node 0 is always the head
+        // (merges fold right-hand segments into their left neighbor).
+        val prev = IntArray(n) { it - 1 }
+        val next = IntArray(n) { if (it + 1 < n) it + 1 else -1 }
+
+        fun lookup(from: Int, until: Int): Int? = vocab[byteSliceList(bytes, from, until)]
+        // Heap entry packs (rank, nodeIdx): negative ranks order first (they
+        // sort below any non-negative rank), equal ranks tie-break by node
+        // index = leftmost, matching the old full-rescan pick.
+        fun pack(rank: Int, idx: Int): Long = (rank.toLong() shl 32) or idx.toLong()
+        val heap = java.util.PriorityQueue<Long>(n)
+        for (i in 0 until n - 1) {
+            lookup(segStart[i], segEnd[i + 1])?.let { heap.add(pack(it, i)) }
+        }
+
+        while (heap.isNotEmpty()) {
+            val entry = heap.poll()
+            val i = (entry and 0xFFFFFFFFL).toInt()
+            val j = next[i]
+            if (j < 0) continue // merged away / no right neighbor
+            // Stale check: recompute the pair's current rank. Equal means the
+            // entry still describes this pair's current bytes.
+            val cur = lookup(segStart[i], segEnd[j]) ?: continue
+            if (cur != (entry shr 32).toInt()) continue
+            // Merge j into i.
+            segEnd[i] = segEnd[j]
+            next[i] = next[j]
+            next[j] = -1
+            if (next[i] >= 0) prev[next[i]] = i
+            // The pairs touching the merged segment changed: re-offer them.
+            if (next[i] >= 0) {
+                lookup(segStart[i], segEnd[next[i]])?.let { heap.add(pack(it, i)) }
             }
-            if (minIdx < 0) break
-            segments[minIdx] = intArrayOf(segments[minIdx][0], segments[minIdx + 1][1])
-            segments.removeAt(minIdx + 1)
+            val p = prev[i]
+            if (p >= 0) {
+                lookup(segStart[p], segEnd[i])?.let { heap.add(pack(it, p)) }
+            }
         }
-        return segments.mapNotNull { seg ->
-            vocab[bytes.sliceArray(seg[0] until seg[1]).toList()]
+
+        // Every surviving segment = 1 token (vocab-covered or not — see KDoc).
+        var count = 0
+        var i = 0
+        while (i >= 0) {
+            count++
+            i = next[i]
         }
+        return count
+    }
+
+    /** Vocabulary key for `bytes[from until until]`, without a ByteArray copy. */
+    private fun byteSliceList(bytes: ByteArray, from: Int, until: Int): List<Byte> {
+        val out = ArrayList<Byte>(until - from)
+        for (k in from until until) out.add(bytes[k])
+        return out
     }
 }

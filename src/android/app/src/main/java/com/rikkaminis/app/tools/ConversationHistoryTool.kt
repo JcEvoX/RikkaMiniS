@@ -265,38 +265,71 @@ private fun intArg(obj: JSONObject, name: String, default: Int): Int? {
  * back (that is what "what did we just say" asks for), and [TranscriptPage.nextCursor]
  * addresses the page before it. Lines inside a page are ordered oldest → newest
  * so the model reads them in conversation order.
+ *
+ * [sweep1014-P6] A plain read (no query) renders LAZILY from the newest end:
+ * rendering is the expensive step (one JSONArray parse per row), and the
+ * previous code rendered EVERY row before windowing — a 6000-char read or a
+ * cursor page paid one full-conversation parse. The lazy walk stops as soon as
+ * maxItems/maxChars is exhausted, and its output is byte-identical to the
+ * eager path (same rows, same budget walk, same header). Query reads keep the
+ * eager path: the match count and match filtering need every line's fullText,
+ * and the eager result set is the tested contract.
  */
 fun buildTranscriptPage(
     rows: List<TranscriptRow>,
     args: ConversationHistoryArgs,
     sessionLabel: String,
 ): TranscriptPage {
-    val lines = rows.sortedBy { it.index }.map { renderTranscriptLine(it) }
-    val matched = args.query?.let { q -> lines.filter { it.fullText.contains(q, ignoreCase = true) } } ?: lines
-    val windowed = args.cursor?.let { c -> matched.filter { it.index < c } } ?: matched
-
-    // Walk backwards from the newest end, taking lines until a budget runs out.
     val page = ArrayList<TranscriptLine>()
     var used = 0
-    for (line in windowed.asReversed()) {
-        if (page.size >= args.maxItems) break
-        val cost = line.display.length + 1
-        if (page.isNotEmpty() && used + cost > args.maxChars) break
-        used += cost
-        page.add(line)
+    var matchCount = 0
+    var matchedLines: List<TranscriptLine> = emptyList()
+    if (args.query == null) {
+        // Lazy: newest-first walk, render only until a budget runs out.
+        val cursor = args.cursor
+        for (row in rows.sortedByDescending { it.index }) {
+            if (cursor != null && row.index >= cursor) continue
+            if (page.size >= args.maxItems) break
+            val line = renderTranscriptLine(row)
+            val cost = line.display.length + 1
+            if (page.isNotEmpty() && used + cost > args.maxChars) break
+            used += cost
+            page.add(line)
+        }
+    } else {
+        // Eager: query matching needs every rendered line's fullText.
+        val lines = rows.sortedBy { it.index }.map { renderTranscriptLine(it) }
+        val q = args.query
+        val matched = lines.filter { it.fullText.contains(q, ignoreCase = true) }
+        matchCount = matched.size
+        matchedLines = matched
+        val windowed = args.cursor?.let { c -> matched.filter { it.index < c } } ?: matched
+        for (line in windowed.asReversed()) {
+            if (page.size >= args.maxItems) break
+            val cost = line.display.length + 1
+            if (page.isNotEmpty() && used + cost > args.maxChars) break
+            used += cost
+            page.add(line)
+        }
     }
     page.reverse()
 
     val oldestInPage = page.firstOrNull()?.index
-    val nextCursor = if (oldestInPage != null && matched.any { it.index < oldestInPage }) oldestInPage else null
+    val nextCursor = when {
+        oldestInPage == null -> null
+        // Lazy path: "matched" is the whole row set, so probe rows directly
+        // (no rendering needed). Query path: probe the matched set.
+        args.query == null -> if (rows.any { it.index < oldestInPage }) oldestInPage else null
+        else -> if (matchedLines.any { it.index < oldestInPage }) oldestInPage else null
+    }
 
     val sb = StringBuilder()
     sb.append("conversation_history · session ").append(sessionLabel)
         .append(" · ").append(rows.size).append(" messages")
-    if (args.query != null) sb.append(" · ").append(matched.size).append(" match \"").append(args.query).append('"')
+    if (args.query != null) sb.append(" · ").append(matchCount).append(" match \"").append(args.query).append('"')
     when {
         rows.isEmpty() -> sb.append("\nno messages in this conversation yet.")
-        matched.isEmpty() -> sb.append("\nno message matches \"").append(args.query).append("\" (")
+        args.query != null && matchCount == 0 -> sb.append("\nno message matches \"").append(args.query).append("\" (")
             .append(rows.size).append(" messages searched).")
         page.isEmpty() -> sb.append("\nno messages older than index ").append(args.cursor)
     }
