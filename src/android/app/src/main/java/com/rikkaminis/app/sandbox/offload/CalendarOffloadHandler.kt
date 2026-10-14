@@ -179,8 +179,20 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
         val sort = "${CalendarContract.Instances.BEGIN} ASC"
 
         val cursor = try {
+            // [sweep1014-B25a-fix] CalendarProvider2's UriMatcher only registers
+            // `instances/when/#/#` (begin/end path segments, ms). The bare
+            // CONTENT_URI (`instances/when`) falls through to the matcher's
+            // default branch and the provider throws
+            // IllegalArgumentException: Unknown URL content://com.android.calendar/instances/when
+            // (verified on-device via shizuku content query). startMs/endMs
+            // are Longs from resolveDateRange and appendPath percent-encodes,
+            // so no injection surface into the URI path.
+            val instancesUri = CalendarContract.Instances.CONTENT_URI.buildUpon()
+                .appendPath(startMs.toString())
+                .appendPath(endMs.toString())
+                .build()
             context.contentResolver.query(
-                CalendarContract.Instances.CONTENT_URI, projection, selection, selArgs, sort,
+                instancesUri, projection, selection, selArgs, sort,
             )
         } catch (e: SecurityException) {
             return NativeOffloadResult(77, providerBlockedJson("READ_CALENDAR", e, args))
