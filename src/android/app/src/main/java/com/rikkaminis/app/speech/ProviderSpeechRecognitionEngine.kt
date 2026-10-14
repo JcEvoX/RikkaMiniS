@@ -58,7 +58,14 @@ class ProviderSpeechRecognitionEngine(private val appContext: Context) : SpeechR
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var captureJob: Job? = null
     private var transcribeJob: Job? = null
-    private val recording = AtomicBoolean(false)
+    // [sweep1014-B20a] Shared-flag wipe race: `recording` used to be ONE
+    // AtomicBoolean shared by every capture session. Rapid stop→start: the new
+    // start() claimed the flag (getAndSet(true) succeeded), then the OLD job's
+    // cleanup ran and set it back to false — the fresh capture's loop died on
+    // its first iteration ("No audio captured"). The guard hands each session
+    // an epoch token; a stale job's cleanup only releases the flag when it
+    // still belongs to its own session.
+    private val captureGuard = CaptureEpochGuard()
     private val cancelled = AtomicBoolean(false)
     // [fix/audit0917-b8] @Volatile: written by the engine's IO coroutine
     // (markDegraded is invoked from the transcription failure path), read from
@@ -103,7 +110,8 @@ class ProviderSpeechRecognitionEngine(private val appContext: Context) : SpeechR
             )
             return
         }
-        if (recording.getAndSet(true)) {
+        val myEpoch = captureGuard.tryBegin()
+        if (myEpoch == null) {
             listener.onError(RecognitionError.RECOGNIZER_BUSY, "A capture is already in flight.")
             return
         }
@@ -114,7 +122,7 @@ class ProviderSpeechRecognitionEngine(private val appContext: Context) : SpeechR
                 SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
             )
             if (minBuf <= 0) {
-                recording.set(false)
+                captureGuard.releaseIfCurrent(myEpoch)
                 listener.onError(RecognitionError.AUDIO_ERROR, "AudioRecord unsupported buffer size.")
                 return@launch
             }
@@ -127,13 +135,13 @@ class ProviderSpeechRecognitionEngine(private val appContext: Context) : SpeechR
                     minBuf * 4,
                 )
             } catch (e: Exception) {
-                recording.set(false)
+                captureGuard.releaseIfCurrent(myEpoch)
                 listener.onError(RecognitionError.AUDIO_ERROR, "AudioRecord init failed: ${e.message}")
                 return@launch
             }
             if (recorder.state != AudioRecord.STATE_INITIALIZED) {
                 recorder.release()
-                recording.set(false)
+                captureGuard.releaseIfCurrent(myEpoch)
                 listener.onError(RecognitionError.AUDIO_ERROR, "AudioRecord not initialized.")
                 return@launch
             }
@@ -144,7 +152,11 @@ class ProviderSpeechRecognitionEngine(private val appContext: Context) : SpeechR
             try {
                 recorder.startRecording()
                 listener.onReadyForSpeech()
-                while (recording.get() && pcm.size() < maxBytes) {
+                // [sweep1014-B20a] isCurrent (not just isActive): if a rapid
+                // stop→start handed the guard to a newer session, THIS stale
+                // job must stop reading the mic immediately instead of
+                // piggy-backing on the new session's flag.
+                while (captureGuard.isCurrent(myEpoch) && pcm.size() < maxBytes) {
                     val n = recorder.read(buf, 0, buf.size)
                     if (n <= 0) continue
                     pcm.write(buf, 0, n)
@@ -152,7 +164,7 @@ class ProviderSpeechRecognitionEngine(private val appContext: Context) : SpeechR
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "capture failed: ${e.message}", e)
-                recording.set(false)
+                captureGuard.releaseIfCurrent(myEpoch)
                 listener.onError(RecognitionError.AUDIO_ERROR, e.message)
                 return@launch
             } finally {
@@ -165,7 +177,10 @@ class ProviderSpeechRecognitionEngine(private val appContext: Context) : SpeechR
                 // "A capture is already in flight" (RECOGNIZER_BUSY) and the
                 // provider ASR engine stayed dead until the user explicitly
                 // cancelled or the process restarted.
-                recording.set(false)
+                // [sweep1014-B20a] releaseIfCurrent: only clear the flag when
+                // it still belongs to THIS session — a stale job's cleanup
+                // must not wipe a newer capture's flag (stop→start race).
+                captureGuard.releaseIfCurrent(myEpoch)
             }
 
             if (cancelled.get()) return@launch
@@ -262,14 +277,17 @@ class ProviderSpeechRecognitionEngine(private val appContext: Context) : SpeechR
     override fun stop() {
         // Flip the capture loop off; the capture coroutine then hands the take
         // to the transcription step, which delivers onFinal/onError.
-        recording.set(false)
+        // [sweep1014-B20a] Unconditional: only one capture can be in flight
+        // (the busy guard in start), so stop() is terminal for it. External
+        // semantics unchanged (immediate stop).
+        captureGuard.forceRelease()
     }
 
     override fun cancel() {
         cancelled.set(true)
-        recording.set(false)
+        captureGuard.forceRelease()
         // captureJob is intentionally NOT cancelled — the capture loop exits
-        // via the recording flag because AudioRecord.read() is a blocking call
+        // via the capture guard because AudioRecord.read() is a blocking call
         // that doesn't respond to job cancellation. Only drop the stale handle.
         transcribeJob?.cancel()
         transcribeJob = null
@@ -287,7 +305,7 @@ class ProviderSpeechRecognitionEngine(private val appContext: Context) : SpeechR
      */
     override fun shutdown() {
         cancelled.set(true)
-        recording.set(false)
+        captureGuard.forceRelease()
         transcribeJob?.cancel()
         captureJob?.cancel()
         transcribeJob = null
@@ -313,4 +331,57 @@ class ProviderSpeechRecognitionEngine(private val appContext: Context) : SpeechR
         // onRmsChanged reports, so the shared normalizer behaves identically.
         return (20 * log10(rms / 32768.0) + 50).toFloat().coerceIn(0f, 12f)
     }
+}
+
+/**
+ * [sweep1014-B20a] Epoch guard for the capture flag. Each successful
+ * [tryBegin] hands out a fresh epoch token; a session's cleanup
+ * ([releaseIfCurrent]) only clears the flag when the token still matches the
+ * current epoch — so a stale capture job's cleanup can never wipe the flag of
+ * a capture that started after it (the rapid stop→start race).
+ *
+ * Pure JVM-testable: no Android dependencies.
+ */
+internal class CaptureEpochGuard {
+
+    private val flag = AtomicBoolean(false)
+    private var currentEpoch: Int = 0
+
+    /** True while a capture holds the flag. */
+    val isActive: Boolean
+        get() = flag.get()
+
+    /**
+     * Claims the flag for a new capture. Returns the epoch token of the new
+     * session, or null when a capture is already in flight (RECOGNIZER_BUSY —
+     * unchanged external semantics).
+     */
+    fun tryBegin(): Int? =
+        if (flag.getAndSet(true)) null else ++currentEpoch
+
+    /**
+     * Releases the flag ONLY if it still belongs to the caller's session.
+     * Stale sessions (superseded by a newer start) leave the flag alone.
+     */
+    fun releaseIfCurrent(epoch: Int) {
+        if (epoch == currentEpoch) flag.set(false)
+    }
+
+    /**
+     * Unconditional release — for stop()/cancel()/shutdown(), which are
+     * terminal for whatever capture is in flight (only one can be, per the
+     * busy guard).
+     */
+    fun forceRelease() {
+        flag.set(false)
+    }
+
+    /**
+     * True when [epoch] is the current session AND it still holds the flag —
+     * the capture loop's continue condition: a superseded session stops
+     * reading the mic immediately instead of piggy-backing on the new
+     * session's flag.
+     */
+    fun isCurrent(epoch: Int): Boolean =
+        epoch == currentEpoch && flag.get()
 }
