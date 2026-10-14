@@ -68,6 +68,42 @@ class MemoryRepository(private val memoryDir: File) {
         // back into the next LLM call. Counted as UTF-8 bytes (matches
         // what the provider sees over the wire).
         private const val MAX_OUTPUT_BYTES = 30 * 1024  // 30 KB
+
+        // Canonical daily-log entry marker — the same boundaries writeMemory
+        // (`<!-- ts -->\ncontent\n\n`, appendText) and
+        // MemoryRepository.revokeEntry/replaceEntryBody (:575/:614) rely on.
+        private val TIMESTAMP_MARKER_LINE = Regex("""<!-- \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} -->[^\S\n]*\n""")
+
+        /**
+         * Newest-first line preview for an append-mode daily log [P1-append].
+         * Entries live bottom-up on disk (writeMemory appends). Splits the
+         * file into entries on the canonical timestamp markers (marker-less
+         * files count as a single entry), reverses the ENTRY order — never
+         * the lines within an entry, which is what per-line
+         * `takeLast(n).reversed()` did and what mangled multi-line entries
+         * line-by-line (sweep-1014 B9) — then takes the first [injectLines]
+         * lines of the ordered text.
+         *
+         * Returns the preview text plus the total line count of the ordered
+         * text, for the caller's "N more lines" continuation hint.
+         */
+        fun newestFirstPreview(content: String, injectLines: Int): Pair<String, Int> {
+            val starts = TIMESTAMP_MARKER_LINE.findAll(content).map { it.range.first }.toList()
+            val chunks = mutableListOf<String>()
+            if (starts.isEmpty()) {
+                chunks.add(content)
+            } else {
+                if (starts[0] > 0) chunks.add(content.substring(0, starts[0]))
+                for ((i, s) in starts.withIndex()) {
+                    val e = starts.getOrNull(i + 1) ?: content.length
+                    chunks.add(content.substring(s, e))
+                }
+            }
+            chunks.reverse()  // newest (bottom) first — entry-level reversal
+            val ordered = chunks.joinToString("\n") { it.trim('\n') }
+            val lines = ordered.lines()
+            return Pair(lines.take(injectLines).joinToString("\n"), lines.size)
+        }
     }
 
     init {
@@ -417,18 +453,20 @@ class MemoryRepository(private val memoryDir: File) {
             if (file.exists()) {
                 val content = try { file.readText() } catch (_: Exception) { "" }
                 if (content.isNotEmpty()) {
-                    val lines = content.lines()
                     // [P1-append] Entries are now appended (newest at bottom).
-                    // Reverse so system prompt gets newest-first, matching old prepend.
-                    val preview = lines.takeLast(injectLines).reversed().joinToString("\n")
+                    // Split into entries and reverse the ENTRY order so the
+                    // system prompt gets newest-first, matching old prepend —
+                    // a multi-line entry is never read backwards
+                    // (sweep-1014 B9: per-line takeLast().reversed() mangled it).
+                    val (preview, orderedLineCount) = newestFirstPreview(content, injectLines)
                     val label = when (dayOffset) {
                         0 -> "Today's"
                         1 -> "Yesterday's"
                         else -> dateStr
                     }
                     var entry = "$label daily log ($dateStr.md):\n$preview"
-                    if (lines.size > injectLines) {
-                        entry += "\n... (${lines.size - injectLines} more lines, use memory_get to search)"
+                    if (orderedLineCount > injectLines) {
+                        entry += "\n... (${orderedLineCount - injectLines} more lines, use memory_get to search)"
                     }
                     fragments.add(entry)
                 }
