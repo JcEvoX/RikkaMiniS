@@ -281,6 +281,40 @@ private fun LogsBody(
 
 // ─── Log Detail Screen ─────────────────────────────────────────────────────────
 
+// ─── [sweep1014-B35] raw log line decoding ────────────────────────────────────
+
+/**
+ * Per-line render cap for the log viewer. A pathological single-line log
+ * (no '\n' for megabytes) must not be materialised and handed to a
+ * LazyColumn row.
+ */
+internal const val MAX_LOG_LINE_BYTES = 16 * 1024
+
+/** Marker appended to a line that hit [MAX_LOG_LINE_BYTES]. */
+internal const val LOG_LINE_TRUNCATED_SUFFIX = " …[truncated]"
+
+/**
+ * Decode one raw log line as UTF-8. [raw] holds the line's bytes up to (but
+ * excluding) its terminating '\n'; [truncated] says the line hit
+ * [MAX_LOG_LINE_BYTES] and was cut short.
+ *
+ * [sweep1014-B35] Kept pure so a JVM harness can pin the boundary behaviour:
+ * the old reader decoded every 8KB chunk on its own
+ * (`String(buf, 0, n, UTF_8)`), so any multi-byte character straddling a
+ * chunk boundary — routine in the CJK message bodies this viewer exists to
+ * show — was emitted as U+FFFD on both halves. Decoding the whole line once
+ * is what makes that impossible.
+ */
+internal fun decodeLogLine(raw: ByteArray, truncated: Boolean): String {
+    val bytes = if (truncated && raw.size > MAX_LOG_LINE_BYTES) {
+        raw.copyOf(MAX_LOG_LINE_BYTES)
+    } else {
+        raw
+    }
+    val text = String(bytes, Charsets.UTF_8)
+    return if (truncated) text + LOG_LINE_TRUNCATED_SUFFIX else text
+}
+
 /**
  * T176: lazy line-index loader for the log detail viewer. The previous
  * `file.readText()` approach allocated the entire file as a single
@@ -313,26 +347,34 @@ private class LazyLogFile private constructor(
         if (index !in 0 until lineCount) return ""
         return try {
             raf.seek(lineOffsets[index])
-            // RAF.readLine reads bytes, so non-ASCII (CJK) gets mangled
-            // — log files are ASCII timestamp + UTF-8 message bodies,
-            // so read raw bytes up to the next newline and decode UTF-8.
+            // [sweep1014-B35] Collect the whole line's raw bytes first and
+            // decode UTF-8 exactly once (see decodeLogLine): RAF.readLine
+            // reads bytes, so non-ASCII (CJK) gets mangled, and decoding
+            // chunk-by-chunk mangled it a second time at chunk boundaries.
+            val raw = java.io.ByteArrayOutputStream()
             val buf = ByteArray(8 * 1024)
-            val sb = StringBuilder()
+            var truncated = false
             while (true) {
                 val n = raf.read(buf)
                 if (n <= 0) break
-                var done = false
+                var newlineAt = -1
                 for (i in 0 until n) {
                     if (buf[i] == '\n'.code.toByte()) {
-                        sb.append(String(buf, 0, i, Charsets.UTF_8))
-                        done = true
+                        newlineAt = i
                         break
                     }
                 }
-                if (done) break
-                sb.append(String(buf, 0, n, Charsets.UTF_8))
+                if (newlineAt >= 0) {
+                    raw.write(buf, 0, newlineAt)
+                    break
+                }
+                raw.write(buf, 0, n)
+                if (raw.size() >= MAX_LOG_LINE_BYTES) {
+                    truncated = true
+                    break
+                }
             }
-            sb.toString()
+            decodeLogLine(raw.toByteArray(), truncated)
         } catch (e: Exception) {
             ""
         }

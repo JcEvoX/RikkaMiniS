@@ -33,16 +33,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import android.content.Context
 import com.rikkaminis.app.R
 import com.rikkaminis.app.data.db.ChatSessionEntity
 import com.rikkaminis.app.data.repository.ChatRepository
 import com.rikkaminis.app.ui.sessions.categoryStyle
+import com.rikkaminis.app.ui.sessions.relativeDate
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.util.Calendar
-import java.util.Date
-import java.util.concurrent.TimeUnit
 
 /**
  * Bottom sheet listing all chat sessions except the current one. Tapping
@@ -168,33 +165,10 @@ private fun MoveToPickerRow(
     }
 }
 
-// ─── Local copy note ───────────────────────────────────────────────────────
-//
-// `categoryStyle` is now shared from sessions.SessionsShared.kt (single source
-// of truth). `relativeDate` is still file-private inside SessionListScreen.kt;
-// mirroring it here keeps the picker visually consistent with the main list.
-
-private fun relativeDate(context: Context, timestamp: Long): String {
-    val now = System.currentTimeMillis()
-    val diff = now - timestamp
-    val seconds = TimeUnit.MILLISECONDS.toSeconds(diff)
-    val minutes = TimeUnit.MILLISECONDS.toMinutes(diff)
-    val hours = TimeUnit.MILLISECONDS.toHours(diff)
-    if (seconds < 60) return context.getString(R.string.time_just_now)
-    if (minutes < 60) return context.getString(R.string.time_minutes_ago, minutes.toInt())
-    if (hours < 24) return context.getString(R.string.time_hours_ago, hours.toInt())
-    val dateCal = Calendar.getInstance().apply { time = Date(timestamp) }
-    val yesterdayCal = Calendar.getInstance().apply { add(Calendar.DAY_OF_YEAR, -1) }
-    if (dateCal.get(Calendar.YEAR) == yesterdayCal.get(Calendar.YEAR) &&
-        dateCal.get(Calendar.DAY_OF_YEAR) == yesterdayCal.get(Calendar.DAY_OF_YEAR)
-    ) return context.getString(R.string.time_yesterday)
-    val days = TimeUnit.MILLISECONDS.toDays(diff)
-    if (days < 7) {
-        // T172: device-locale weekday name via java.text.DateFormatSymbols.
-        val dayNames = java.text.DateFormatSymbols(java.util.Locale.getDefault()).weekdays
-        return dayNames[dateCal.get(Calendar.DAY_OF_WEEK) - 1]
-    }
-    val month = dateCal.get(Calendar.MONTH) + 1
-    val day = dateCal.get(Calendar.DAY_OF_MONTH)
-    return "$month/$day"
-}
+// [sweep1014-B30] No local `relativeDate` copy any more — it was a drift
+// clone of `sessions.SessionsShared.relativeDate` and had drifted: it indexed
+// `DateFormatSymbols.weekdays` with `get(DAY_OF_WEEK) - 1`, but that array is
+// length 8 with [0] == "" (day-of-week is 1-based), so the weekday branch
+// rendered the wrong day (an off-by-one skid, and Sunday → "" for weekdays
+// yields a blank timestamp). The shared implementation indexes with
+// `dayNames[get(DAY_OF_WEEK)]` and is the single source of truth.
