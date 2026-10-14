@@ -526,8 +526,9 @@ class PersistentShell(
     /**
      * Execute a command in the persistent shell and wait for completion.
      *
-     * Wraps the command with a unique marker to detect output boundaries:
-     *   {command}; echo "__MINIS_DONE_{marker}_EXIT_$?__"
+     * The command body runs inside an isolated subshell with a unique
+     * completion marker (see [internalBuildShellCommand]):
+     *   ( <command> ); echo "__MINIS_DONE_{marker}_EXIT_$?__"
      *
      * @return Pair of (output, exitCode)
      */
@@ -566,17 +567,10 @@ class PersistentShell(
         // delimiter so the shell performs ZERO expansion on the command body.
         // Single quotes, double quotes, backslashes, dollar signs, backticks
         // all pass through literally — no escape nesting, no quoting hell.
-        // Exit code is captured via $? immediately after eval.
-        val heredocDelimiter = "ENDOFMINISCMD_${marker}"
-        val wrappedCommand = buildString {
-            append("eval \"\$(cat <<'$heredocDelimiter'\n")
-            append(command)
-            if (!command.endsWith('\n')) append('\n')
-            append("$heredocDelimiter\n")
-            append(")\"\n")
-            append("RET=\$?\n")
-            append("echo \"__MINIS_DONE_${marker}_EXIT_\${RET}__\"\n")
-        }
+        // [fix/sweep1014-shell] The wrapping itself (subshell isolation +
+        // EXIT-trap cwd persistence) lives in the pure function
+        // [internalBuildShellCommand] so it is JVM-testable.
+        val wrappedCommand = internalBuildShellCommand(command, marker)
 
         return withContext(Dispatchers.IO) {
             val cb = CommandCallback(marker = marker, lineCallback = lineCallback)
@@ -834,6 +828,65 @@ class PersistentShell(
         pendingCallback = null
         commandCount = 0
         Log.i(TAG, "Persistent shell stopped")
+    }
+}
+
+/**
+ * Pure function: build the command line sent to the persistent shell's stdin
+ * for [command], using [marker] for the completion marker.
+ *
+ * Shape (validated against BusyBox ash, see sweep-1014 FIX-1):
+ * ```
+ * __MINIS_CWD='/tmp/.minis_cwd_{marker}'
+ * ( trap 'pwd > "$__MINIS_CWD"' EXIT
+ * eval "$(cat <<'ENDOFMINISCMD_{marker}'
+ * {command}
+ * ENDOFMINISCMD_{marker}
+ * )" )
+ * RET=$?
+ * set +e
+ * [ -f "$__MINIS_CWD" ] && cd "$(cat "$__MINIS_CWD")" 2>/dev/null
+ * rm -f "$__MINIS_CWD"
+ * echo "__MINIS_DONE_{marker}_EXIT_${RET}__"
+ * ```
+ *
+ * [fix/sweep1014-shell] The body runs inside a SUBSHELL. `eval` is a POSIX
+ * Special Built-in, so a body that calls `exit`, hits a syntax error, or arms
+ * `set -e` used to kill the WHOLE persistent shell at top level — the marker
+ * echo never ran, and ExecutionCoordinator misread the dead shell as
+ * "OOM/后台被杀" and auto-retried the command (non-idempotent side effects ×2).
+ * The subshell contains all three failure modes; the parent's `RET=$?` /
+ * `set +e` / marker lines are always reached.
+ *
+ * [fix/sweep1014-shell] Because a subshell would also contain `cd`, the
+ * EXIT trap records the body's final working directory to a marker-named
+ * file and the parent `cd`s back into it — preserving the cross-command cwd
+ * persistence that top-level execution used to provide for free. If the
+ * subshell is killed before the trap runs (SIGKILL/OOM), the file is absent
+ * and the parent keeps its current cwd — matching the "shell died and was
+ * recycled" semantics. A body that installs its own EXIT trap replaces ours
+ * and cwd persistence falls back the same way.
+ *
+ * The env broadcast ([PersistentShell.applyEnvironment]) writes top-level
+ * `export` lines directly and does NOT go through this wrapper — exports must
+ * persist in the parent shell, a subshell's would be discarded.
+ */
+internal fun internalBuildShellCommand(command: String, marker: String): String {
+    val heredocDelimiter = "ENDOFMINISCMD_${marker}"
+    val cwdFile = "/tmp/.minis_cwd_${marker}"
+    return buildString {
+        append("__MINIS_CWD='$cwdFile'\n")
+        append("( trap 'pwd > \"\$__MINIS_CWD\"' EXIT\n")
+        append("eval \"\$(cat <<'$heredocDelimiter'\n")
+        append(command)
+        if (!command.endsWith('\n')) append('\n')
+        append("$heredocDelimiter\n")
+        append(")\" )\n")
+        append("RET=\$?\n")
+        append("set +e\n")
+        append("[ -f \"\$__MINIS_CWD\" ] && cd \"\$(cat \"\$__MINIS_CWD\")\" 2>/dev/null\n")
+        append("rm -f \"\$__MINIS_CWD\"\n")
+        append("echo \"__MINIS_DONE_${marker}_EXIT_\${RET}__\"\n")
     }
 }
 
