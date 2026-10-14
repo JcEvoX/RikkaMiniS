@@ -438,4 +438,90 @@ class PersistentShellTest {
             buf.render(),
         )
     }
+
+    // ── internalBuildShellCommand [fix/sweep1014-shell] ──────────────
+
+    @Test
+    fun `buildShellCommand full shape for known input`() {
+        val cmd = internalBuildShellCommand("echo hi", "deadbeef")
+        assertEquals(
+            "__MINIS_CWD='/tmp/.minis_cwd_deadbeef'\n" +
+                "( trap 'pwd > \"\$__MINIS_CWD\"' EXIT\n" +
+                "eval \"\$(cat <<'ENDOFMINISCMD_deadbeef'\n" +
+                "echo hi\n" +
+                "ENDOFMINISCMD_deadbeef\n" +
+                ")\" )\n" +
+                "RET=\$?\n" +
+                "set +e\n" +
+                "[ -f \"\$__MINIS_CWD\" ] && cd \"\$(cat \"\$__MINIS_CWD\")\" 2>/dev/null\n" +
+                "rm -f \"\$__MINIS_CWD\"\n" +
+                "echo \"__MINIS_DONE_deadbeef_EXIT_\${RET}__\"\n",
+            cmd,
+        )
+    }
+
+    @Test
+    fun `buildShellCommand passes body through verbatim`() {
+        // No expansion, no escaping of the body: quotes, backticks, dollars
+        // must reach the heredoc literally.
+        val body = "echo 'single \"double\" `tick` \$dollar \\ backslash"
+        val cmd = internalBuildShellCommand(body, "m1")
+        assertTrue(cmd.contains("\n$body\nENDOFMINISCMD_m1\n"))
+    }
+
+    @Test
+    fun `buildShellCommand appends newline when body lacks one`() {
+        val cmd = internalBuildShellCommand("echo hi", "m1")
+        assertTrue(cmd.contains("echo hi\nENDOFMINISCMD_m1\n"))
+    }
+
+    @Test
+    fun `buildShellCommand does not double trailing newline`() {
+        val cmd = internalBuildShellCommand("echo hi\n", "m1")
+        assertTrue(cmd.contains("echo hi\nENDOFMINISCMD_m1\n"))
+        assertFalse(cmd.contains("echo hi\n\nENDOFMINISCMD_m1\n"))
+    }
+
+    @Test
+    fun `buildShellCommand empty body still produces heredoc and marker`() {
+        val cmd = internalBuildShellCommand("", "m1")
+        assertTrue(cmd.contains("<<'ENDOFMINISCMD_m1'\n\nENDOFMINISCMD_m1\n"))
+        assertTrue(cmd.endsWith("echo \"__MINIS_DONE_m1_EXIT_\${RET}__\"\n"))
+    }
+
+    @Test
+    fun `buildShellCommand cwd file is marker-unique`() {
+        val a = internalBuildShellCommand("true", "aaaa1111")
+        val b = internalBuildShellCommand("true", "bbbb2222")
+        assertTrue(a.contains("__MINIS_CWD='/tmp/.minis_cwd_aaaa1111'\n"))
+        assertTrue(b.contains("__MINIS_CWD='/tmp/.minis_cwd_bbbb2222'\n"))
+        assertFalse(a == b)
+    }
+
+    @Test
+    fun `buildShellCommand marker line matches parser contract`() {
+        // Cross-check: the trailing echo line the wrapper emits is exactly the
+        // shape internalParseMinisExitCode (readLoop) consumes. Statically the
+        // line contains the ${RET} shell template; the parser only ever sees
+        // the runtime-expanded form, so simulate the expansion with a real code.
+        val cmd = internalBuildShellCommand("echo hi", "abc123")
+        val echoed = cmd.substringAfterLast("echo \"").substringBefore("\"\n")
+        assertEquals("__MINIS_DONE_abc123_EXIT_\${RET}__", echoed)
+        assertEquals(0, internalParseMinisExitCode(echoed.replace("\${RET}", "0"), "abc123"))
+    }
+
+    @Test
+    fun `buildShellCommand isolates body in subshell before RET capture`() {
+        // Order contract: the subshell closes BEFORE `RET=$?` so the exit
+        // status captured is the subshell's, and `set +e` runs after capture
+        // so the real exit code is not clobbered by the guard reset.
+        val cmd = internalBuildShellCommand("true", "m1")
+        val closeIdx = cmd.indexOf(")\" )\n")
+        val retIdx = cmd.indexOf("RET=\$?\n")
+        val setEIdx = cmd.indexOf("set +e\n")
+        val markerIdx = cmd.indexOf("echo \"__MINIS_DONE_")
+        assertTrue(closeIdx in 0 until retIdx)
+        assertTrue(retIdx in 0 until setEIdx)
+        assertTrue(setEIdx in 0 until markerIdx)
+    }
 }
