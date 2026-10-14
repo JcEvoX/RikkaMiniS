@@ -48,6 +48,9 @@ import com.rikkaminis.app.ui.settings.ProviderDetailScreen
 import com.rikkaminis.app.ui.settings.ProviderListScreen
 import com.rikkaminis.app.ui.sandbox.FileBrowserScreen
 import com.rikkaminis.app.ui.sandbox.FileBrowserViewModel
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
 import com.rikkaminis.app.ui.sandbox.FileItem
 import com.rikkaminis.app.ui.sandbox.FilePreviewScreen
 import com.rikkaminis.app.ui.sandbox.RootfsManagementScreen
@@ -149,8 +152,35 @@ object Routes {
     const val STORAGE = "storage"
     const val SESSION_STORAGE_DETAIL = "session_storage/{sessionId}"
     const val ROOTFS_MANAGEMENT = "rootfs_management"
-    const val FILE_BROWSER = "file_browser"
-    const val FILE_PREVIEW = "file_preview"
+    // [sweep1014-D13] File-browser configuration (rootPath/rootLabel/linuxRoot/
+    // displayPrefix) travels as query params instead of the FilePreviewHolder
+    // static singleton — process death re-creates the VM from the route args,
+    // no stale/null static state. Mirrors the CHAT_FILES precedent.
+    const val FILE_BROWSER =
+        "file_browser?rootPath={rootPath}&rootLabel={rootLabel}" +
+            "&linuxRoot={linuxRoot}&displayPrefix={displayPrefix}"
+    fun fileBrowser(
+        rootPath: String,
+        rootLabel: String,
+        linuxRoot: String? = null,
+        displayPrefix: String? = null,
+    ): String {
+        fun enc(v: String) = android.net.Uri.encode(v)
+        val params = buildList {
+            add("rootPath=${enc(rootPath)}")
+            add("rootLabel=${enc(rootLabel)}")
+            if (linuxRoot != null) add("linuxRoot=${enc(linuxRoot)}")
+            if (displayPrefix != null) add("displayPrefix=${enc(displayPrefix)}")
+        }
+        return "file_browser?${params.joinToString("&")}"
+    }
+    // [sweep1014-D13] The previewed file's absolute path rides as a query
+    // param; the dialog rebuilds FileItem from it. Uri.encode emits %20 for
+    // spaces (never '+'), and the Nav framework %-decodes query values exactly
+    // once — so paths round-trip byte-for-byte (no second decode at the
+    // receiver, contrast SKILL_FILE below).
+    const val FILE_PREVIEW = "file_preview?path={path}"
+    fun filePreview(path: String) = "file_preview?path=${android.net.Uri.encode(path)}"
     const val ENV_VARS = "env_vars"
     /** [feat/runtime-limits-panel] Runtime Limits page (agent runtime knobs). */
     const val RUNTIME_LIMITS = "runtime_limits"
@@ -252,11 +282,11 @@ object Routes {
     fun addCustomModel(instanceId: String) = "add_custom_model/$instanceId"
 }
 
-/** Holder for file preview navigation state (not serializable via nav args). */
-internal object FilePreviewHolder {
-    var currentItem: FileItem? = null
-    var fileBrowserViewModel: FileBrowserViewModel? = null
-}
+// [sweep1014-D13] Former FilePreviewHolder static singleton (currentItem /
+// fileBrowserViewModel) is gone: process death left it null → blank preview /
+// dead dialog, and it pinned the VM for the process lifetime. The previewed
+// file now travels as a route query param (Routes.filePreview) and the
+// browser VM is created via viewModel() bound to the NavBackStackEntry.
 
 @Composable
 fun AppNavigation(
@@ -636,8 +666,7 @@ fun AppNavigation(
                     navController.safeNavigate(Routes.chatFiles(sessionId))
                 },
                 onPreviewAttachment = { item ->
-                    FilePreviewHolder.currentItem = item
-                    navController.safeNavigate(Routes.FILE_PREVIEW)
+                    navController.safeNavigate(Routes.filePreview(item.file.absolutePath))
                 },
                 onModelGroupsClick = { navController.safeNavigate(Routes.MODEL_GROUPS) },
                 // Chat-history drawer: open another conversation (same funnel
@@ -717,16 +746,16 @@ fun AppNavigation(
                         "memory" -> ctx.getString(com.rikkaminis.app.R.string.shared_folder_name_memory)
                         else -> folderId
                     }
-                    FilePreviewHolder.fileBrowserViewModel = FileBrowserViewModel(
-                        rootPath = hostPath,
-                        rootLabel = label,
-                        // Route reads through PRoot bind mounts so the host
-                        // dirs that back /var/minis/{shared,skills,memory}
-                        // resolve, matching how chat-files browse works.
-                        linuxRootPath = "/var/minis/$folderId",
-                        appContext = ctx.applicationContext,
+                    navController.safeNavigate(
+                        Routes.fileBrowser(
+                            rootPath = hostPath.absolutePath,
+                            rootLabel = label,
+                            // Route reads through PRoot bind mounts so the host
+                            // dirs that back /var/minis/{shared,skills,memory}
+                            // resolve, matching how chat-files browse works.
+                            linuxRoot = "/var/minis/$folderId",
+                        ),
                     )
-                    navController.safeNavigate(Routes.FILE_BROWSER)
                 },
             )
         }
@@ -755,11 +784,12 @@ fun AppNavigation(
                     val entry = mountedFoldersStore.entries.value.firstOrNull { it.id == mountId }
                     val hostPath = entry?.resolvedHostPath
                     if (hostPath != null) {
-                        FilePreviewHolder.fileBrowserViewModel = FileBrowserViewModel(
-                            rootPath = java.io.File(hostPath),
-                            rootLabel = entry.name,
+                        navController.safeNavigate(
+                            Routes.fileBrowser(
+                                rootPath = hostPath,
+                                rootLabel = entry.name,
+                            ),
                         )
-                        navController.safeNavigate(Routes.FILE_BROWSER)
                     } else {
                         // resolvedHostPath null = SAF tree from a non-externalstorage
                         // provider (cloud / Drive). Picker normally rejects these at
@@ -960,22 +990,25 @@ fun AppNavigation(
                 chatDao = chatRepository.dao,
                 onBack = { navController.safePopBackStack() },
                 onBrowseFiles = { rootPath ->
-                    // [T-android-copy-abs-path-fullpath] This browser is rooted at
-                    // the per-session host dir (filesDir/minis-sessions/<sid>),
-                    // whose immediate children (workspace/ attachments/ offloads/
-                    // browser/) are exactly the PRoot /var/minis/* subdirs. The
-                    // host listing already resolves correctly so we keep rootPath
-                    // host-based (no linuxRootPath re-routing — that would redirect
-                    // /var/minis to the global/empty placeholder dir). We only pass
-                    // displayLinuxPrefix = "/var/minis" so "Copy Absolute Path"
-                    // emits the agent-visible /var/minis/workspace/foo.py instead of
-                    // the opaque /data/user/0/.../minis-sessions/<sid>/... host path.
-                    FilePreviewHolder.fileBrowserViewModel = FileBrowserViewModel(
-                        rootPath = java.io.File(rootPath),
-                        rootLabel = "Session Files",
-                        displayLinuxPrefix = "/var/minis",
+                    navController.safeNavigate(
+                        Routes.fileBrowser(
+                            rootPath = rootPath,
+                            rootLabel = "Session Files",
+                            // [T-android-copy-abs-path-fullpath] This browser is
+                            // rooted at the per-session host dir
+                            // (filesDir/minis-sessions/<sid>), whose immediate
+                            // children (workspace/ attachments/ offloads/ browser/)
+                            // are exactly the PRoot /var/minis/* subdirs. The host
+                            // listing already resolves correctly so we keep the
+                            // root host-based (no linuxRoot re-routing — that would
+                            // redirect /var/minis to the global/empty placeholder
+                            // dir). We only pass displayPrefix = "/var/minis" so
+                            // "Copy Absolute Path" emits the agent-visible
+                            // /var/minis/workspace/foo.py instead of the opaque
+                            // /data/user/0/.../minis-sessions/<sid>/... host path.
+                            displayPrefix = "/var/minis",
+                        ),
                     )
-                    navController.safeNavigate(Routes.FILE_BROWSER)
                 },
             )
         }
@@ -986,23 +1019,48 @@ fun AppNavigation(
                 onBack = { navController.safePopBackStack() },
                 onBrowseFiles = {
                     val rootfs = RootfsManager.getInstance(context.applicationContext)
-                    FilePreviewHolder.fileBrowserViewModel = FileBrowserViewModel(
-                        rootPath = rootfs.rootfsDir,
-                        rootLabel = "/",
+                    navController.safeNavigate(
+                        Routes.fileBrowser(
+                            rootPath = rootfs.rootfsDir.absolutePath,
+                            rootLabel = "/",
+                        ),
                     )
-                    navController.safeNavigate(Routes.FILE_BROWSER)
                 },
             )
         }
 
-        composable(Routes.FILE_BROWSER) {
-            val vm = FilePreviewHolder.fileBrowserViewModel ?: return@composable
+        // [sweep1014-D13] VM is created via viewModel() bound to this
+        // NavBackStackEntry — its configuration (rootPath/rootLabel/linuxRoot/
+        // displayPrefix) rides as route query params, so process death
+        // re-creates it from the route instead of reading a stale static
+        // singleton. The old FilePreviewHolder assignment kept the VM strongly
+        // referenced for the whole process lifetime and left the screen blank
+        // after the holder was nulled.
+        composable(Routes.FILE_BROWSER) { backStackEntry ->
+            val args = backStackEntry.arguments
+            val rootPath = args?.getString("rootPath") ?: return@composable
+            val rootLabel = args?.getString("rootLabel") ?: ""
+            val linuxRoot = args?.getString("linuxRoot")
+            val displayPrefix = args?.getString("displayPrefix")
+            val context = androidx.compose.ui.platform.LocalContext.current
+            val vm: FileBrowserViewModel = viewModel(
+                factory = viewModelFactory {
+                    initializer {
+                        FileBrowserViewModel(
+                            rootPath = java.io.File(rootPath),
+                            rootLabel = rootLabel,
+                            linuxRootPath = linuxRoot,
+                            displayLinuxPrefix = displayPrefix,
+                            appContext = context.applicationContext,
+                        )
+                    }
+                },
+            )
             FileBrowserScreen(
                 viewModel = vm,
                 onBack = { navController.safePopBackStack() },
                 onPreviewFile = { item ->
-                    FilePreviewHolder.currentItem = item
-                    navController.safeNavigate(Routes.FILE_PREVIEW)
+                    navController.safeNavigate(Routes.filePreview(item.file.absolutePath))
                 },
             )
         }
@@ -1020,35 +1078,41 @@ fun AppNavigation(
             val rootfs = RootfsManager.getInstance(context.applicationContext)
             val varMinis = java.io.File(rootfs.rootfsDir, "var/minis")
             val sessionId = backStackEntry.arguments?.getString("sessionId") ?: return@composable
-            val vm = remember(rootfs.rootfsDir.absolutePath, varMinis.absolutePath, sessionId) {
-                FileBrowserViewModel(
-                    rootPath = rootfs.rootfsDir,
-                    initialPath = varMinis.takeIf { it.exists() },
-                    rootLabel = "/",
-                    // T121: route directory listings through PRootKernel bind
-                    // mounts so /var/minis/{skills,memory,shared} resolve to
-                    // their backing host dirs (filesDir/minis-global/<subdir>).
-                    // Without this the browser walks the rootfs tarball
-                    // directly and shows the empty placeholder dirs that ship
-                    // inside Alpine's var/minis/ — every subdir reads as
-                    // "Empty folder" even though the agent has files there.
-                    linuxRootPath = "/",
-                    // T147: scope per-session subdirs (attachments / workspace
-                    // / offloads / browser) to THIS chat's host dir even when
-                    // another session was the last to boot a PRoot — that
-                    // global bindMounts state is last-writer-wins and would
-                    // otherwise hide the agent's generated files for the
-                    // session the user is looking at.
-                    sessionId = sessionId,
-                    appContext = context.applicationContext,
-                )
-            }
+            // [sweep1014-D13] viewModel() bound to this NavBackStackEntry
+            // (was remember{} — a config change rebuilt the VM and lost the
+            // browsing state).
+            val vm: FileBrowserViewModel = viewModel(
+                factory = viewModelFactory {
+                    initializer {
+                        FileBrowserViewModel(
+                            rootPath = rootfs.rootfsDir,
+                            initialPath = varMinis.takeIf { it.exists() },
+                            rootLabel = "/",
+                            // T121: route directory listings through PRootKernel bind
+                            // mounts so /var/minis/{skills,memory,shared} resolve to
+                            // their backing host dirs (filesDir/minis-global/<subdir>).
+                            // Without this the browser walks the rootfs tarball
+                            // directly and shows the empty placeholder dirs that ship
+                            // inside Alpine's var/minis/ — every subdir reads as
+                            // "Empty folder" even though the agent has files there.
+                            linuxRootPath = "/",
+                            // T147: scope per-session subdirs (attachments / workspace
+                            // / offloads / browser) to THIS chat's host dir even when
+                            // another session was the last to boot a PRoot — that
+                            // global bindMounts state is last-writer-wins and would
+                            // otherwise hide the agent's generated files for the
+                            // session the user is looking at.
+                            sessionId = sessionId,
+                            appContext = context.applicationContext,
+                        )
+                    }
+                },
+            )
             FileBrowserScreen(
                 viewModel = vm,
                 onBack = { navController.safePopBackStack() },
                 onPreviewFile = { item ->
-                    FilePreviewHolder.currentItem = item
-                    navController.safeNavigate(Routes.FILE_PREVIEW)
+                    navController.safeNavigate(Routes.filePreview(item.file.absolutePath))
                 },
             )
         }
@@ -1074,7 +1138,18 @@ fun AppNavigation(
                 decorFitsSystemWindows = false,
             ),
         ) {
-            val item = FilePreviewHolder.currentItem ?: return@dialog
+            // [sweep1014-D13] Rebuild the FileItem from the route's query param
+            // (Routes.filePreview) instead of the old FilePreviewHolder static —
+            // process death previously left the holder null → dead dialog.
+            val path = it.arguments?.getString("path") ?: return@dialog
+            val file = java.io.File(path)
+            val item = FileItem.from(file) ?: FileItem(
+                file = file,
+                name = file.name,
+                isDirectory = false,
+                isSymlink = false,
+                size = 0L,
+            )
             FilePreviewScreen(
                 item = item,
                 onBack = { navController.safePopBackStack() },
@@ -1161,8 +1236,12 @@ fun AppNavigation(
             ),
         ) { backStackEntry ->
             val skillId = backStackEntry.arguments?.getString("skillId") ?: return@composable
-            val rawPath = backStackEntry.arguments?.getString("relativePath") ?: "SKILL.md"
-            val relativePath = java.net.URLDecoder.decode(rawPath, "UTF-8")
+            // [sweep1014-B31] No second decode: the Nav framework already
+            // %-decodes the route's path segment once, so the value arrives
+            // intact. The previous URLDecoder.decode(rawPath) turned a '+'
+            // in a skill filename into a space and threw on a bare '%'
+            // (IllegalArgumentException → crash on open).
+            val relativePath = backStackEntry.arguments?.getString("relativePath") ?: "SKILL.md"
             if (skillRepository != null) {
                 SkillFileViewerScreen(
                     skillId = skillId,

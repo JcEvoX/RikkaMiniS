@@ -27,6 +27,13 @@ internal object ProviderImportZip {
     private const val TAG = "ProviderImportZip"
     private val SUPPORTED_EXTS = setOf("json", "txt")
 
+    // [sweep1014-P9] Decompression bomb guard: a provider-config import zip is
+    // never anywhere near this big. Without the caps, zin.copyTo extracted an
+    // entry of unbounded size straight to disk and file.readText() slurped it
+    // into memory.
+    private const val MAX_ENTRY_BYTES = 2L * 1024 * 1024  // 2 MB per zip entry
+    private const val MAX_TOTAL_BYTES = 16L * 1024 * 1024 // 16 MB across all entries
+
     /**
      * Read the display name reported by the [Uri]'s content provider, if any.
      * Returns null on failure — callers should fall back to MIME-type sniffing.
@@ -80,6 +87,7 @@ internal object ProviderImportZip {
                 return
             }
             try {
+                var totalBytes = 0L
                 ZipInputStream(input.buffered()).use { zin ->
                     while (true) {
                         val entry = zin.nextEntry ?: break
@@ -95,8 +103,17 @@ internal object ProviderImportZip {
                                 Log.w(TAG, "rejected zip-slip entry: $rawName")
                                 continue
                             }
-                            target.parentFile?.mkdirs()
-                            target.outputStream().use { out -> zin.copyTo(out) }
+                            val entryBytes = copyEntryCapped(zin, target, totalBytes)
+                            if (entryBytes < 0) {
+                                Log.w(
+                                    TAG,
+                                    "zip exceeds size limit at entry: $rawName " +
+                                        "(caps: entry=$MAX_ENTRY_BYTES, total=$MAX_TOTAL_BYTES)",
+                                )
+                                onExtractFailed()
+                                return
+                            }
+                            totalBytes += entryBytes
                         } finally {
                             zin.closeEntry()
                         }
@@ -133,6 +150,31 @@ internal object ProviderImportZip {
         } finally {
             runCatching { stagingDir.deleteRecursively() }
         }
+    }
+
+    /**
+     * [sweep1014-P9] Copies the current zip entry into [target], capped at
+     * [MAX_ENTRY_BYTES] per entry and [MAX_TOTAL_BYTES] across the whole
+     * archive (counted against [totalSoFar]). Returns the copied byte count,
+     * or -1 when a limit is exceeded (the truncated target doesn't matter —
+     * the staging directory is torn down on every exit path).
+     */
+    private fun copyEntryCapped(zin: ZipInputStream, target: File, totalSoFar: Long): Long {
+        target.parentFile?.mkdirs()
+        var entryBytes = 0L
+        target.outputStream().use { out ->
+            val buf = ByteArray(64 * 1024)
+            while (true) {
+                val n = zin.read(buf)
+                if (n < 0) break
+                entryBytes += n
+                if (entryBytes > MAX_ENTRY_BYTES || totalSoFar + entryBytes > MAX_TOTAL_BYTES) {
+                    return -1
+                }
+                out.write(buf, 0, n)
+            }
+        }
+        return entryBytes
     }
 
     private fun shouldSkipEntry(name: String): Boolean {

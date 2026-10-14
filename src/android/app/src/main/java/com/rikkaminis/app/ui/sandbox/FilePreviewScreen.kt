@@ -271,9 +271,13 @@ private fun TextPreview(item: FileItem) {
     LaunchedEffect(item.file) {
         withContext(Dispatchers.IO) {
             try {
-                val bytes = item.file.readBytes()
-                content = decodeUtf8Capped(bytes)
-                truncated = bytes.size > MAX_TEXT_PREVIEW_BYTES
+                // [sweep1014-P9] was item.file.readBytes() — the full file was
+                // read into memory before any cap applied, so a 2 GB log file
+                // OOMed the preview. readNBytes(MAX+1) caps the read itself and
+                // still yields the truncated verdict in one pass.
+                val capped = item.file.inputStream().use { it.readNBytes(MAX_TEXT_PREVIEW_BYTES + 1) }
+                content = decodeUtf8Capped(capped)
+                truncated = capped.size > MAX_TEXT_PREVIEW_BYTES
             } catch (e: Exception) {
                 error = e.message ?: context.getString(R.string.filepreview_file_read_error)
             }
@@ -351,8 +355,9 @@ private fun MarkdownPreview(item: FileItem) {
     LaunchedEffect(item.file) {
         withContext(Dispatchers.IO) {
             try {
-                val bytes = item.file.readBytes()
-                content = decodeUtf8Capped(bytes)
+                // [sweep1014-P9] capped read — see TextPreview above.
+                val capped = item.file.inputStream().use { it.readNBytes(MAX_TEXT_PREVIEW_BYTES + 1) }
+                content = decodeUtf8Capped(capped)
             } catch (e: Exception) {
                 error = e.message ?: context.getString(R.string.filepreview_file_read_error)
                 AppLogger.warning("FilePreview", "markdown read failed for ${item.name}: ${e.message}")
@@ -803,9 +808,10 @@ private fun JsonPreview(item: FileItem) {
     LaunchedEffect(item.file) {
         withContext(Dispatchers.IO) {
             try {
-                val bytes = item.file.readBytes()
-                truncated = bytes.size > MAX_TEXT_PREVIEW_BYTES
-                val raw = decodeUtf8Capped(bytes)
+                // [sweep1014-P9] capped read — see TextPreview above.
+                val capped = item.file.inputStream().use { it.readNBytes(MAX_TEXT_PREVIEW_BYTES + 1) }
+                truncated = capped.size > MAX_TEXT_PREVIEW_BYTES
+                val raw = decodeUtf8Capped(capped)
                 pretty = try {
                     when (raw.trimStart().firstOrNull()) {
                         '{' -> org.json.JSONObject(raw).toString(2)
@@ -922,7 +928,10 @@ private fun ArchivePreview(item: FileItem) {
                                 )
                             },
                             supportingContent = if (e.isDir) null else {
-                                { Text(android.text.format.Formatter.formatFileSize(null, e.size)) }
+                                // [sweep1014-B29] was Formatter.formatFileSize(null, …) —
+                                // AOSP Formatter returns "" for a null context; use the
+                                // pure-Kotlin formatter from FileBrowserViewModel.kt.
+                                { Text(formatFileSize(e.size)) }
                             },
                         )
                         HorizontalDivider()

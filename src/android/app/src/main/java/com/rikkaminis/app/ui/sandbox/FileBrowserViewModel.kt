@@ -1,6 +1,5 @@
 package com.rikkaminis.app.ui.sandbox
 
-import android.text.format.Formatter
 import androidx.compose.runtime.Immutable
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -18,6 +17,33 @@ import java.util.Locale
 
 /** Mirrors iOS FileSortKey. */
 enum class FileSortKey { NAME, MODIFIED, SIZE, KIND }
+
+/**
+ * Pure-Kotlin file size formatting (1024-based B/KB/MB/GB).
+ *
+ * [sweep1014-B29] Replaces `android.text.format.Formatter.formatFileSize`:
+ * AOSP Formatter returns "" when its `context` argument is null, and every
+ * call site here passed null — so every file size in the file browser and
+ * preview screens rendered as blank. No Android context is needed for the
+ * binary-unit format this UI uses, so the formatting lives in a pure
+ * function (also unit-testable on the JVM).
+ */
+fun formatFileSize(bytes: Long): String {
+    if (bytes < 1024) return "$bytes B"
+    var value = bytes.toDouble()
+    var unit = 0
+    while (value >= 1024.0 && unit < 3) {
+        value /= 1024.0
+        unit += 1
+    }
+    val unitName = when (unit) {
+        1 -> "KB"
+        2 -> "MB"
+        else -> "GB"
+    }
+    val rounded = (value * 10).let { kotlin.math.round(it) } / 10.0
+    return if (rounded % 1.0 == 0.0) "${rounded.toLong()} $unitName" else "$rounded $unitName"
+}
 
 /**
  * File item model — corresponds to iOS FileItem.
@@ -57,7 +83,7 @@ data class FileItem(
         }
 
     val formattedSize: String
-        get() = Formatter.formatFileSize(null, size)
+        get() = formatFileSize(size)
 
     /** Whether this file can be previewed inline (text, image, etc.) */
     val isPreviewable: Boolean
@@ -136,8 +162,12 @@ data class FileItem(
         private val shortDateFormatter = SimpleDateFormat("MMM d, yyyy", Locale.getDefault())
 
         fun from(file: File): FileItem? {
-            if (!file.exists()) return null
+            // [sweep1014-B29] Symlink check MUST precede the exists() check:
+            // exists() follows the link, so a broken (dangling) symlink reads
+            // as nonexistent and was dropped before the isSymlink handling
+            // below ever ran. Dangling symlinks are still listable entries.
             val isSymlink = Files.isSymbolicLink(file.toPath())
+            if (!isSymlink && !file.exists()) return null
             val resolved = if (isSymlink) {
                 try {
                     Files.readSymbolicLink(file.toPath()).toFile().let { target ->
