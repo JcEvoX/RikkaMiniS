@@ -2,144 +2,90 @@ package com.rikkaminis.app.conversation
 
 import android.content.Context
 import android.content.SharedPreferences
+import org.json.JSONArray
 import org.json.JSONObject
 
 /**
- * [fix/prewindow-budget-1015] per-(providerType, baseUrl, model) 的
- * provider-usage / local-estimate 校准系数。
+ * [fix/prewindow-budget-1015] 校准的 Android 持久化壳。样本窗口逻辑与常量
+ * 单一事实源在 [CalibrationStore]（纯 Kotlin 可 JVM 测试），本对象只负责：
+ *  - 进程内单例接线（引擎循环是唯一 observe 写入方，主进程使用）；
+ *  - SharedPreferences 持久化（key 前缀 v1，结构变更整键作废重学）。
  *
- * 动机：同一份 payload，deepseek 中转（127.0.0.1:8788 本地缓存代理）与 GLM
- * 直连对 provider 上报差 4.8×（191,856 vs 920,577）。中转包装、各家
- * tokenizer、消息模板展开都系统性改变"usage 与本地估算的比值"。一个全局
- * 系数无法同时贴合两个端点，所以校准 key 刻意带 baseUrl —— 用户改一次中
- * 转地址，校准作废重学的代价（一段保守期）远小于新旧端点混用同一个系数的
- * 代价（本次事故）。
- *
- * 数据流：
- *   1. 每次成功 usage 回包，调用方在 [observe] 里带上一份
- *      [ContextEstimator] 对同一 wire 请求的本地估算；
- *   2. 偏差超出 [DISTORTION_BAND] 的读数判失真：不进样本、不作校准、不进
- *      决策（防止把别家的口供学成本地系数）；
- *   3. 合格样本进滑动窗口（最多 [WINDOW_SIZE] 个），系数 = 样本中位数；
- *   4. 系数持久化到 SharedPreferences，进程冷启动即生效。
- *
- * 未校准（样本不足）时 [ratio] 返回 1.0：宁可让本地估算偏保守（早压缩），
- * 不可偏乐观（爆窗口）。
+ * 校准 key 见 [keyFor]：providerType + baseUrl + model。带 baseUrl 是刻意的
+ * ——同一模型经中转（127.0.0.1:8788 缓存代理）与直连的记账口径差 4.8×
+ * （T321 现场），key 不带端点维度就无法区分；用户改一次中转地址校准作废
+ * 重学的代价（一段保守期）远小于新旧端点混用一个系数的代价（本次事故）。
  */
 object ContextCalibration {
 
-    /** 滑动窗口容量。太小易被单次异常污染，太大学习太慢。 */
-    const val WINDOW_SIZE = 8
-
-    /** provider 上报 / 本地估算 落在此带外判失真（本现场 4.8× 会被拦）。 */
-    const val DISTORTION_BAND = 3.0
-
-    /** 学习就绪所需最少样本数。 */
-    const val MIN_SAMPLES = 3
+    const val WINDOW_SIZE = CalibrationStore.DEFAULT_WINDOW_SIZE
+    const val MIN_SAMPLES = CalibrationStore.DEFAULT_MIN_SAMPLES
+    const val DISTORTION_BAND = CalibrationStore.DEFAULT_DISTORTION_BAND
 
     private const val PREFS = "minis_context_calibration"
     private const val KEY = "calibration_v1"
 
-    private data class Entry(val samples: ArrayDeque<Double>)
-
-    // 进程内缓存；ContextCalibration 只在主进程使用（modelservice worker 不
-    // 做预算决策），prime 一次即可。volatile 保证跨线程可见。
     @Volatile
-    private var store: HashMap<String, ArrayDeque<Double>>? = null
+    private var store: CalibrationStore? = null
 
     @Volatile
     private var prefs: SharedPreferences? = null
 
-    /** App 启动时调用一次（MinisApp.onCreate）。 */
+    /** App 启动时调用一次（MinisApp.onCreate，主进程与 worker 都调）。 */
     fun prime(context: Context) {
         val p = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         prefs = p
-        val restored = HashMap<String, ArrayDeque<Double>>()
+        val s = CalibrationStore()
         val obj = runCatching { JSONObject(p.getString(KEY, "{}") ?: "{}") }.getOrNull()
         obj?.let { json ->
+            val data = HashMap<String, List<Double>>()
             val keys = json.keys()
             while (keys.hasNext()) {
                 val k = keys.next()
                 val arr = json.optJSONArray(k) ?: continue
-                val dq = ArrayDeque<Double>()
+                val list = ArrayList<Double>(arr.length())
                 for (i in 0 until arr.length()) {
                     val v = arr.optDouble(i, Double.NaN)
-                    if (!v.isNaN()) dq.addLast(v)
+                    if (!v.isNaN()) list.add(v)
                 }
-                if (dq.isNotEmpty()) restored[k] = dq
+                if (list.isNotEmpty()) data[k] = list
             }
+            s.restore(data)
         }
-        store = restored
+        store = s
     }
 
-    /** 校准 key：providerType + baseUrl + model id。 */
     fun keyFor(providerType: String, baseUrl: String, modelId: String): String =
-        "${providerType}|${baseUrl.trimEnd('/')}|$modelId"
+        "$providerType|${baseUrl.trimEnd('/')}|$modelId"
 
-    /**
-     * 喂入一次成功读数。返回本次判定：
-     * DISTORTED（不进样本）/ LEARNING（进了样本但未就绪）/ READY（就绪）。
-     */
-    fun observe(key: String, providerUsage: Long, localEstimate: Long): ObserveResult {
-        if (providerUsage <= 0 || localEstimate <= 0) return ObserveResult.IGNORED
-        val ratio = providerUsage.toDouble() / localEstimate.toDouble()
-        if (ratio < 1.0 / DISTORTION_BAND || ratio > DISTORTION_BAND) {
-            return ObserveResult.DISTORTED
-        }
-        val s = store ?: return ObserveResult.IGNORED
-        val dq = synchronized(s) { s.getOrPut(key) { ArrayDeque() } }
-        synchronized(dq) {
-            dq.addLast(ratio)
-            while (dq.size > WINDOW_SIZE) dq.removeFirst()
-        }
-        persist()
-        return if (isReady(key)) ObserveResult.READY else ObserveResult.LEARNING
+    fun observe(key: String, providerUsage: Long, localEstimate: Long): CalibrationStore.ObserveResult {
+        val s = store ?: return CalibrationStore.ObserveResult.IGNORED
+        val result = s.observe(key, providerUsage, localEstimate)
+        if (result != CalibrationStore.ObserveResult.IGNORED &&
+            result != CalibrationStore.ObserveResult.DISTORTED
+        ) persist()
+        return result
     }
 
-    /** 当前校准系数；样本不足或未 prime 时 1.0（保守）。 */
-    fun ratio(key: String): Double {
-        val s = store ?: return 1.0
-        val dq = synchronized(s) { s[key] } ?: return 1.0
-        if (dq.size < MIN_SAMPLES) return 1.0
-        val sorted = synchronized(dq) { dq.sorted() }
-        val mid = sorted.size / 2
-        return if (sorted.size % 2 == 1) sorted[mid]
-        else (sorted[mid - 1] + sorted[mid]) / 2.0
-    }
-
-    /** 校准是否就绪（决定 UI 是否标注"本地估算"）。 */
-    fun isReady(key: String): Boolean {
-        val s = store ?: return false
-        val dq = synchronized(s) { s[key] } ?: return false
-        return synchronized(dq) { dq.size >= MIN_SAMPLES }
-    }
-
-    /** 样本数（面板/诊断用）。 */
-    fun sampleCount(key: String): Int {
-        val s = store ?: return 0
-        val dq = synchronized(s) { s[key] } ?: return 0
-        return synchronized(dq) { dq.size }
-    }
+    fun ratio(key: String): Double = store?.ratio(key) ?: 1.0
+    fun isReady(key: String): Boolean = store?.isReady(key) ?: false
+    fun sampleCount(key: String): Int = store?.sampleCount(key) ?: 0
 
     private fun persist() {
         val s = store ?: return
         val p = prefs ?: return
         val json = JSONObject()
-        synchronized(s) {
-            for ((k, dq) in s) {
-                val arr = org.json.JSONArray()
-                synchronized(dq) { dq.forEach { arr.put(it) } }
-                json.put(k, arr)
-            }
+        for ((k, samples) in s.snapshot()) {
+            val arr = JSONArray()
+            samples.forEach { arr.put(it) }
+            json.put(k, arr)
         }
         p.edit().putString(KEY, json.toString()).apply()
     }
 
-    /** 测试与换端点后强制重学。 */
+    /** 测试与诊断用：强制重学。 */
     fun resetForTest() {
-        store = HashMap()
+        store?.clear()
         prefs?.edit()?.remove(KEY)?.apply()
     }
-
-    enum class ObserveResult { IGNORED, DISTORTED, LEARNING, READY }
 }

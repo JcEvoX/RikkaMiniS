@@ -82,6 +82,15 @@ internal class AgentLoopState(
     var lastContextTokens: Int = 0
 
     /**
+     * [fix/prewindow-budget-1015] 记下 [lastContextTokens] 是哪个
+     * (providerType, baseUrl, model) 上报的。跨 provider 换模型后读数失效：
+     * 各端点记账口径可差 4.8×（T321 现场），旧读数偏小 → 输出预算虚高爆窗
+     * （预检兜住），偏大 → dynamicMaxTokens 饿死输出（空 length-wall）。引擎
+     * 在预算计算前比对 key，不匹配即视为未知（0）。
+     */
+    var lastContextTokensSourceKey: String? = null
+
+    /**
      * Accumulate tool inputs across all turns (so persist includes all, not
      * just current turn).
      */

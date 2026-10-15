@@ -54,28 +54,38 @@ object ContextEstimator {
 
     /**
      * 单条消息估算 —— 与 [ContextCompactor.estimateMessageTokens] 的差异：
-     * 计入图片 base64 上界与 reasoningContent 回显（DeepSeek 系要求逐轮
+     * (1) 与 OpenAIProvider 的 wire 序列化对齐（OpenAIProvider.kt:2070）——
+     * `contentParts` 非空时 wire 只发 parts（`content` 字段被忽略），parts
+     * 为空才发 `content` + 顶层图片/音频，二者互斥不双算；
+     * (2) 计入图片 base64 上界与 reasoningContent 回显（DeepSeek 系要求逐轮
      * 回显，这些 token 实打实占用 provider 侧窗口）。
      */
     fun estimateMessageTokensFull(message: LLMMessage): Long {
-        var total = ContextCompactor.estimateTokens(message.content)
-        message.contentParts.forEach { part ->
-            when (part) {
-                is AgentContentPart.Text -> total += ContextCompactor.estimateTokens(part.text)
-                is AgentContentPart.ToolResult -> total += ContextCompactor.estimateTokens(part.content)
-                is AgentContentPart.ToolUse -> total += ContextCompactor.estimateTokens(part.input.toString())
-                is AgentContentPart.ImageData -> Unit // contentParts 里的 ImageData 不带字节负载
+        var total = 0L
+        if (message.contentParts.isNotEmpty()) {
+            message.contentParts.forEach { part ->
+                when (part) {
+                    is AgentContentPart.Text -> total += ContextCompactor.estimateTokens(part.text)
+                    is AgentContentPart.ToolResult -> total += ContextCompactor.estimateTokens(part.content)
+                    is AgentContentPart.ToolUse -> total += ContextCompactor.estimateTokens(part.input.toString())
+                    is AgentContentPart.ImageData ->
+                        // base64 = ceil(4N/3) 字符；4 字符/token ≈ N 字节 1.33 token 上界
+                        total += (part.data.size.toLong() * 4 / 3 + ContextCompactor.CHARS_PER_TOKEN - 1) /
+                            ContextCompactor.CHARS_PER_TOKEN
+                }
+            }
+        } else {
+            total += ContextCompactor.estimateTokens(message.content)
+            for (img in message.imageParts) {
+                total += (img.data.size.toLong() * 4 / 3 + ContextCompactor.CHARS_PER_TOKEN - 1) /
+                    ContextCompactor.CHARS_PER_TOKEN
+            }
+            for (audio in message.audioParts) {
+                total += ContextCompactor.estimateTokens(audio.base64Data)
             }
         }
+        // putEcho 在 parts/legacy 两个分支都会带上 reasoning 字段
         message.reasoningContent?.let { total += ContextCompactor.estimateTokens(it) }
-        for (img in message.imageParts) {
-            // base64 = ceil(4N/3) 字符；4 字符/token ≈ N 字节 1.33 token 的上界
-            total += (img.data.size.toLong() * 4 / 3 + ContextCompactor.CHARS_PER_TOKEN - 1) /
-                ContextCompactor.CHARS_PER_TOKEN
-        }
-        for (audio in message.audioParts) {
-            total += ContextCompactor.estimateTokens(audio.base64Data)
-        }
         return total
     }
 

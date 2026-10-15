@@ -83,10 +83,10 @@ data class PreflightVerdict(
     enum class Decision { PASS, SHRINK_OUTPUT, NEEDS_COMPACTION }
 
     companion object {
-        private fun pass(input: Long, max: Int) = PreflightVerdict(Decision.PASS, input, max)
-        private fun shrinkOutput(input: Long, requested: Int, suggested: Int) =
+        internal fun pass(input: Long, max: Int) = PreflightVerdict(Decision.PASS, input, max)
+        internal fun shrinkOutput(input: Long, requested: Int, suggested: Int) =
             PreflightVerdict(Decision.SHRINK_OUTPUT, input, requested, suggestedMaxTokens = suggested)
-        private fun needsCompaction(input: Long, requested: Int, window: Int) =
+        internal fun needsCompaction(input: Long, requested: Int, window: Int) =
             PreflightVerdict(Decision.NEEDS_COMPACTION, input, requested, windowTokens = window)
     }
 

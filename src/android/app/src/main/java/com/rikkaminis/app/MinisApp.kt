@@ -278,6 +278,10 @@ class MinisApp : Application(), ImageLoaderFactory {
             // issues chat requests, so it must be able to learn from their 400s.
             // The persistence file lives in filesDir, shared across processes.
             EffortTierLearner.init(this)
+            // [fix/prewindow-budget-1015] 校准窗口持久化（filesDir，跨进程共享
+            // 文件语义与 EffortTierLearner 同）。worker 进程只是被动读；
+            // observe 只发生在主进程的引擎循环里。
+            com.rikkaminis.app.conversation.ContextCalibration.prime(this)
             return
         }
 
@@ -450,6 +454,9 @@ class MinisApp : Application(), ImageLoaderFactory {
         // `LoggingManager.startIfEnabled()` (called from MinisApp.swift:143).
         AppLogger.init(this)
         EffortTierLearner.init(this)
+        // [fix/prewindow-budget-1015] 主进程预热校准窗口 —— 引擎循环（唯一
+        // observe 写入方）与预检读数都跑在这里。
+        com.rikkaminis.app.conversation.ContextCalibration.prime(this)
 
         // Bug 2 (MIUI silent kill) diagnostic: write a launch-cycle beacon
         // so a subsequent launch can observe whether the previous run
