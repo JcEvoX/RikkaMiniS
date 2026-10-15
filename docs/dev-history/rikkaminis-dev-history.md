@@ -4,8 +4,8 @@
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
 - 合并范围：2026-08-03 ～ 2026-10-15，共 74 天
-- 条目总数：1747（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：2281447 / 总行数：31132
+- 条目总数：1748（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：2282141 / 总行数：31144
 
 ---
 
@@ -31125,6 +31125,18 @@ Pattern-Key: sandbox-l2s-pack-symlink-broken
 **合并**：POST /merges → main **`4b4eb54a8b24`**；containment behind=0（分支完全包含）；compare(分支tip→merge) **0 文件差异**（合并树逐字节一致）；远端分支 DELETE 204。单支合并树一致，main push 自动 CI 不等（先例）。
 
 **协作注**：修复会话（验证核实请求，05f34e96）当时仍在跑（登记 P2 至 backlog）；其纪律 = CI 绿停在分支，合并权在本会话由用户授权执行，无竞态。
+
+<!-- 2026-10-15 15:00:39 -->
+## 文档更新收尾（同会话续）
+
+
+**本地**：挂载 `笔记/RikkaMinis开发档案/` 三件套已刷新（1747 条 / 74 天，重建→脱敏→SAGAS→复核 NONE→结构校验：行首围栏 64 偶数、anchors==header==1747、outOrder 0；SAGAS 24 sagas / orphans 172）。
+
+**云端**：分支 `docs/dev-history-1015b` @ 52a3564 → `--no-ff` 合入 main **`6ec4a35`**（合并树 vs 分支 tip 0 差异；三件套与挂载源 sha256 逐字节对拍一致；README 统计 1743→1747）→ push → 分支已删。纯文本例外：未 dispatch 未等 CI。
+
+**流程坑（复发变体）**：`git checkout -q main` 落在**陈旧本地 main**（6fe4771）上直接 merge，产出的提交把 audit-verify-1015 的 16 文件也算进 diff——幸好 commit 未推。修法：merge 前必须 `git reset --hard origin/main`（fetch 之后）再合。判据：merge 输出的 --stat 里出现与本次改动无关的文件 = 落错了基座。
+
+**当前链**：main = 6ec4a35（audit-verify-1015 修复 4b4eb54 + 档案 6ec4a35）；远端非 sweep1014 分支已清零。
 
 ---
 
