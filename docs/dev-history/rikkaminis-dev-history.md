@@ -4,8 +4,8 @@
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
 - 合并范围：2026-08-03 ～ 2026-10-15，共 74 天
-- 条目总数：1743（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：2276582 / 总行数：31071
+- 条目总数：1747（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：2281447 / 总行数：31132
 
 ---
 
@@ -31064,6 +31064,67 @@ Pattern-Key: sandbox-l2s-pack-symlink-broken
 **★ 流程坑（新，重要）：gh_ci_wait 会把 scan-gate run 误认成 build-apk run**。push 分支后自动触发的是 Scan Gate（PR 触发、~5min 只跑扫描）；gh_ci_wait 按 head_sha 匹配到了 scan-gate 的 run 就判 success——"绿"的是扫描门，Kotlin 编译+单测根本没跑。**判据**：run_number 异常小（build-apk 是 21xx 序列，scan-gate 是 1x）+ API 按 workflow path 过滤核对。**标准动作**：分支 push 后必须显式 `gh-actions-dispatch build-apk.yml`，轮询用 `GET /actions/workflows/build-apk.yml/runs?branch=` 按 workflow 过滤，别信 head_sha 匹配就当 build 绿。
 
 **修复门纪律应用**：NEEDS_COMPACTION 触发面窄（输入本身就装不下），但正是该分支的设计场景且注释承诺落空——属于"修复不完备"而非 latent，修在半径内（同函数同分支）；preflightEstimate 重算属同族 capture-then-mutate 一并闭（顺路成本≈0）。
+
+<!-- 2026-10-15 12:04:55 -->
+## 用户偏好：「子代理」默认指会话子代理（已固化进 GLOBAL.md）
+
+
+用户明确：说「子代理 / sub-agent / 派发任务」默认指**会话子代理** = `minis-sessions-cli send`（跨会话 headless 派发），不是进程内 `spawn_agent`。派发用 `--prompt "读这个文件并立刻执行：<任务书路径>" --async`，返回值取 session_id，派发后回读 messages 验证送达；仅用户明确点名 spawn_agent 时才走进程内子代理。本次应要求已写入 `/var/minis/memory/GLOBAL.md`（「用户环境与设备」章节前）。
+
+<!-- 2026-10-15 12:05:32 -->
+## dev-history 档案更新 + 仓库同步（2026-10-15，用户令「更新一下文档，包括仓库的」）
+
+
+**执行**：rebuild（1743 条 / 74 天 / 31071 行）→ sanitize（main 296 替换 + INDEX 35 替换，probes NONE）→ SAGAS（24 sagas / 171 orphans / multi4=93）→ 仓库同步。
+
+**仓库同步链**：浅克隆 main（`55344ef`）→ 拷三件套到 `docs/dev-history/` → README 统计刷新（覆盖范围 69 天/1605 条 → 74 天/1743 条 + SAGAS 表「跨 74 天」）→ 分支 `docs/dev-history-1015` @ `eb44a95` → gh_sync.sh push → `--no-ff` 合入 main **`6fe4771`** → push → 远端+本地分支 DELETE。纯文本分支，未 dispatch CI 未等（既定例外）。
+
+**★ 结构校验假红（复发，档案自身已记录）**：`c.count("```")` 报 71 odd=False——行内三反引号提及（prose 里写「``` 开头」等 3 处）+ 缩进围栏（4 处）混入计数。正确判据 = **行首围栏**（`l.strip().startswith('```')`），本次 64 偶数配平 + anchors==header + outOrder=0。别再为 odd count() 翻档案找未闭合块。
+
+**沙箱坑**：sh 里 `grep -c '\`\`\`'` 双引号转义失败把反引号当命令替换，计数出 32249 垃圾值——围栏统计一律用 python。
+
+**边界**：挂载 `笔记/RikkaMinis开发档案/repo-docs/` 是旧版布局（无 dev-history 子目录），未强行同步，权威副本在 git 仓库。orphans 137→171 增长 34 条，多为 10-14/10-15 任务书引用条目——未开新 saga（多为修复流水，若下次同型再聚集可议 `fix-dispatch` 主题）。
+
+<!-- 2026-10-15 13:27:54 -->
+## 全仓审计报告第二道门核实（2026-10-15，附件 shared-04273e16.md）
+
+
+**基线**：main @ `6fe4771`；装置 `/var/minis/shared/work/verify-audit-1015/repo`（分支 verify）；报告 `shared/work/verify-audit-1015/VERIFY-REPORT.md`。
+
+**裁定**：12 Bug 中 11 实质成立（BUG-05 主成立、两处子指控不成立）、架构 7/7、性能 7/8（PERF-07 含虚构 `Files.probeContentType()`——全仓 0 处）。
+
+**★ 两条端到端实测复现（本机当场）**：
+- **BUG-01**：`python3 -c "sys.stdout.write('中文测试'*1500)"` 返回文本出现 `���/��`——`PersistentShell.readLoop`（实际 **435-440**，非报告 286-291）每 4096 字节独立 `String(buffer,0,n,UTF_8)` 解码；4096≡1 mod 3 故与 3 字节 CJK **每块错位 1 字节**，几乎每个读边界切碎一个汉字 → 影响 agent 自身阅读通路（>4KB 中文输出全带乱码）。P0。
+- **BUG-02**：`printf 'BEGIN\nnull\nEND\n'` 返回只剩 BEGIN/END，而同刻沙箱内 `grep -c '^null$'`=1 → 丢在输出通路。根因 = `TerminalSanitizer` Pass 4（实际 45-51）`.filter { it.trim() != "null" }`。**这正是 2026-09-30 记录的"shell_execute 吞裸 null 行"怪癖的真根因**（当时误归因给"管道"）。P1（Pass 4 的噪音出处未证实，动刀前先查）。
+
+**BUG-03 实测 fail-open 且正在掩盖真引用**：`scan.sh:172` 传 `source "$ROOT"` → guard 取 `args[0]="source"` 当根目录 → 扫 0 文件、exit 0；改用正确根 → 2 条违规，其一即 `OkHttpNetTraceListener.kt:45`（主工程未审计引用），另一条是测试文件（`"/test/" in rel` 无前导斜杠的漏判）。
+
+**BUG-04 结构确定 + 分支可达**：`SessionConcurrencyManager` Queued 分支在 promote 后取消时无 release；调用方 `ChatTurnPersistence.kt:389/397/449-452` 的 releaseSlot 在 try 内，acquireSlot 抛 CE 即跳过。真机日志 `CANCELLED waiting for slot` **运行时 5 条**（14:48/14:51/14:52）→ 分支确被打到；`ConcurrencyProbe` 的 Log.i 未落盘故泄漏无法直接观测。
+
+**★ 报告本身的三类可信度问题（方法论教训）**：①行号**系统性漂移 16–150 行**，且对照前一快照 `e5e733b` 也对不上 → 非快照问题；②**一处引文（BUG-05 的 `except urllib.error.HTTPError as e:` 分支）在仓库与 live skill 中都不存在**（两者 sha 相同）；③PERF-07 虚构系统调用。→ **"发现器有效、引证无效"**：可借其找方向，每条结论必须回源码重推。
+
+**P 级建议**：P0=Bug-01/04；P1=Bug-02/03/05/07/09/12a；P2=Bug-06/08/10/11/12b·c + ARCH-03/05/06/07 + PERF-01~06/08；P3=ARCH-01/02 重构。尚未动手，等用户拍板。
+
+<!-- 2026-10-15 14:53:49 -->
+## §100 云端分支核查+合并：fix/audit-verify-1015 → main 4b4eb54a8b（2026-
+
+# §100 云端分支核查+合并：fix/audit-verify-1015 → main 4b4eb54a8b（2026-10-15）
+
+**用户令**：「检查云端正在跑的分支。有问题就修，没问题就合并。最后更新文档，本地的和云端的。」
+
+**分支**：`fix/audit-verify-1015`（3 commits @ 3ec56e9d2e，基于 main 6fe4771）= 验证会话（05f34e96）对全仓审计报告第二道门核实后的修复支，修 9 条缺陷：BUG-01 CJK 4KB 边界乱码（InputStreamReader 跨块解码）、BUG-02 合法 null 行保真（删 Pass 4）、BUG-03 扫描门 fail-open（argv 失败闭锁 + test 树前缀 + OkHttpNetTraceListener 审计放行）、BUG-04 promote 后取消槽位泄漏（CancellationException catch + releasePromotedAfterCancel 按 runId 身份释放）、BUG-05 增量嵌入钉住后端不再静默降级（pinned 判定 + 维度单一/零丢失双守卫）、BUG-07 MCP 回环鉴权（token 0600 + 常量时间比较 + 旧 daemon 退役重fork）+ 池化会话配置指纹逐 get 重校验、BUG-09 rootfs 断链自愈（NOFOLLOW exists→delete→create）、BUG-12a OAuth 空闲 socket soTimeout 5s。
+
+**第二道门复核（我的独立证据，不依赖对方探针报告）**：
+- diff 818 行逐文件读完，无夹带/调试残留/冲突标记；main tip 未动（6fe4771 == merge-base）。
+- scan.sh **21/21 绿**（分支工作树实跑）+ debug_leak_guard `--self-test` 16 项全过（含 argv 契约新断言）。
+- **全部 JVM/py 探针独立复跑**：BUG-01 新旧解码差分 ALL PASS（旧实现 4096%3==1 每边界劈字，新实现 chunk=1..8192 全精确）；BUG-02 新生产 34/34 绿 + 负控（旧生产+新测试）恰好 3 红全落新用例；BUG-04 真测试文件 17/17 绿（16 旧+1 新）；BUG-09/12a 平台前提探针 ALL PASS（断链 FileAlreadyExistsException 实证 + soTimeout 语义）；py BUG-05 8 项 / BUG-07 14 项全过（含「授权 shutdown 生效」）。
+- 符号核查：daemon 端口/token 无 Kotlin 直连消费者（全部走 main.py 单一 choke point）；embed_texts 仅 2 调用点均被新守卫覆盖；TerminalSanitizerTest 无旧断言依赖 Pass 4。
+
+**CI**：build-apk run **#2112 success @ 3ec56e9d2e**（head_sha 逐字符一致；日志确认 4 条新测试逐条 PASSED——TerminalSanitizer 3 条 + SessionConcurrencyManager cancel-promote 1 条）。
+
+**合并**：POST /merges → main **`4b4eb54a8b24`**；containment behind=0（分支完全包含）；compare(分支tip→merge) **0 文件差异**（合并树逐字节一致）；远端分支 DELETE 204。单支合并树一致，main push 自动 CI 不等（先例）。
+
+**协作注**：修复会话（验证核实请求，05f34e96）当时仍在跑（登记 P2 至 backlog）；其纪律 = CI 绿停在分支，合并权在本会话由用户授权执行，无竞态。
 
 ---
 
