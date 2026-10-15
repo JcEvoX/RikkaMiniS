@@ -25,6 +25,7 @@ import com.rikkaminis.app.provider.sanitizeToolPairing
 import com.rikkaminis.app.provider.clampOutboundMaxTokens
 import com.rikkaminis.app.provider.clampOutboundTemperature
 import com.rikkaminis.app.provider.StreamTimeouts
+import com.rikkaminis.app.provider.StreamCancelBridge
 import com.rikkaminis.app.provider.VISION_UNSUPPORTED_PLACEHOLDER
 import com.rikkaminis.app.provider.openai.explicitOffEffortFor
 import com.rikkaminis.app.provider.thinking.EffortTierLearner
@@ -35,7 +36,6 @@ import com.rikkaminis.app.provider.thinking.ThinkingResolveContext
 import com.rikkaminis.app.provider.thinking.ThinkingRuleResolver
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -727,66 +727,16 @@ class OpenAIProvider constructor(
         }
         // [fix/zero-chunk-cancel] Cancellation BRIDGE, registered BEFORE the
         // first blocking call (call.execute() below, then reader.readLine()).
-        //
-        // On a wedged upstream (accepted the request, sent nothing) the read
-        // loop blocks inside readLine(). A blocking read is NOT interruptible
-        // by coroutine cancellation — measured with a real wedged server:
-        // cancelling the outer job, the inner job, a wrapping coroutineScope,
-        // and a withTimeoutOrNull each still ran the full 60s budget, while
-        // call.cancel() stopped it in 324ms.
-        //
-        // `awaitClose { call.cancel() }` cannot cover that window: it is
-        // registered only AFTER the loop exits, so a wedged read never reaches
-        // it. This child coroutine is registered first, so cancelling the
-        // producer scope reaches it even while the parent body is stuck — its
-        // `finally` then closes the socket and unblocks the read.
-        //
-        // Measured with the real nesting (outer runBlocking -> inner
-        // runBlocking -> callbackFlow + flowOn(IO)): 335ms with the bridge vs
-        // 60018ms without, user cancel at 300ms.
+        // The bridge is what makes a user cancel land while the body is parked
+        // in a blocking read; the shared implementation carries the three
+        // load-bearing semantics (catch-not-finally, cause-recorded-first,
+        // cancel-only-when-cancelled) and its measurements — see
+        // [com.rikkaminis.app.provider.StreamCancelBridge].
         //
         // Pairs with the worker's cancel watcher (ModelExecutionService),
         // which cancels the collecting job when the user's cancel file
         // appears — that is what reaches this bridge.
-        // Set once the stream body has been fully consumed, so the bridge can
-        // tell "we finished normally" from "we are being cancelled".
-        val streamCompleted = java.util.concurrent.atomic.AtomicBoolean(false)
-        // [fix/zero-chunk-cancel] The bridge's OWN cancellation cause.
-        //
-        // Closing the socket makes the blocking read fail with
-        // `SocketException: Socket closed` — and that exception is what the
-        // catch below sees. It says "the socket was closed", NOT *why*, so the
-        // user cancel that F-177 taught us to classify as INFO arrives looking
-        // exactly like a transport failure and is logged as
-        // `stream parse exception` again (measured: healthy stream, user cancel
-        // -> ERROR; same on the wedged path).
-        //
-        // Capturing the cause here restores the distinction: the CE handed to
-        // this cancelled coroutine IS its cancellation cause (user cancel ->
-        // ModelExecutionCancelledException; consumer died of an IOException ->
-        // a CE carrying that IOException). Recorded BEFORE `call.cancel()`, so
-        // it is always visible to the catch that the socket error triggers.
-        val bridgeCancelCause = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
-        val cancelBridge = launch {
-            // `catch` rather than `finally`: a cancelled coroutine's
-            // CancellationException is its cancellation cause, and this is the
-            // only public way to read it (`Job.getCancellationException` is
-            // internal kotlinx API).
-            val cause: Throwable? = try {
-                awaitCancellation()
-                null
-            } catch (e: CancellationException) {
-                e
-            }
-            // Only tear the socket down when we are being CANCELLED. On a
-            // normal completion the body is already fully consumed and
-            // OkHttp may return the connection to the pool — cancelling
-            // then would throw away a reusable connection for no reason.
-            if (!streamCompleted.get()) {
-                bridgeCancelCause.set(cause)
-                try { call.cancel() } catch (_: Exception) {}
-            }
-        }
+        val cancelBridge = StreamCancelBridge(scope = this) { call.cancel() }
         val response = try {
             call.execute()
         } catch (e: IOException) {
@@ -1470,7 +1420,7 @@ class OpenAIProvider constructor(
                 // erased. Deliberately the SAME predicate, so "consumer-side
                 // cancellation" keeps one definition: a cause-less CE is a
                 // teardown, while a CE carrying a real failure stays an error.
-                ?: bridgeCancelCause.get()?.asConsumerSideCancellation()
+                ?: cancelBridge.consumerCancellationCause?.asConsumerSideCancellation()
             if (consumerCancel != null) {
                 com.rikkaminis.app.logging.AppLogger.info(
                     "OpenAIProvider",
@@ -1496,13 +1446,13 @@ class OpenAIProvider constructor(
             // [fix/zero-chunk-cancel] The body was fully read (or failed) — mark
             // it so the cancellation bridge does not tear down a connection
             // OkHttp could otherwise return to the pool.
-            streamCompleted.set(true)
+            cancelBridge.markStreamCompleted()
             // [T-thinking-fold-leak] Always drop the per-stream tag state on
             // every exit (normal, error, cancellation) so a half-open tag can
             // never leak into the next stream served by this provider instance.
             thinkState.reset()
         }
-        cancelBridge.cancel()
+        cancelBridge.dispose()
         channel.close()
         // T171: when the coroutine is cancelled (user tapped stop), the
         // reader loop above is suspended inside the OkHttp source — only

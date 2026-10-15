@@ -44,6 +44,7 @@ import com.rikkaminis.app.provider.causeChainSummary
 import com.rikkaminis.app.provider.failOnSilentEmptyCompletion
 import com.rikkaminis.app.provider.asConsumerSideCancellation
 import com.rikkaminis.app.provider.StreamTimeouts
+import com.rikkaminis.app.provider.StreamCancelBridge
 import com.rikkaminis.app.provider.VISION_UNSUPPORTED_PLACEHOLDER
 import com.rikkaminis.app.provider.visionPlaceholder
 
@@ -189,6 +190,16 @@ class GeminiProvider(
             headersArrived.set(true)
             ttfbWatchdog.cancel()
         }
+        // [fix/audit2-cancelbridge-1015] Cancellation bridge, registered BEFORE
+        // the first blocking call (call.execute() below, then reader.readLine()).
+        // Without it a user cancel leaves this coroutine parked in the socket
+        // read until the upstream speaks or the generation readTimeout (30 min,
+        // FirstChunkTimeoutPolicy) fires — measured against a silently wedged
+        // server: the outer job, the inner job, a wrapping coroutineScope and a
+        // withTimeoutOrNull each still ran the full budget, socket still open.
+        // See [com.rikkaminis.app.provider.StreamCancelBridge] for the three
+        // semantics and the OpenAI arm's numbers.
+        val cancelBridge = StreamCancelBridge(scope = this) { call.cancel() }
         if (!response.isSuccessful) {
             val errorBody = response.body?.string() ?: ""
             val retryAfterMs = parseRetryAfterMs(response.headers["Retry-After"], System.currentTimeMillis())
@@ -299,6 +310,13 @@ class GeminiProvider(
             // (user tapped stop), not that the stream broke. Classifying it as
             // a stream error made a cancel look like a provider failure.
             val consumerCancel = e.asConsumerSideCancellation()
+                // [fix/audit2-cancelbridge-1015] The bridge closes the socket, so
+                // this catch sees `SocketException: Socket closed` — which says
+                // the socket closed, not *why*. Re-ask the bridge for the reason
+                // (the same second door OpenAIProvider uses), so a user cancel
+                // keeps landing in the INFO branch below instead of being logged
+                // as a stream error.
+                ?: cancelBridge.consumerCancellationCause?.asConsumerSideCancellation()
             if (consumerCancel != null) {
                 com.rikkaminis.app.logging.AppLogger.info(
                     "GeminiProvider",
@@ -311,7 +329,11 @@ class GeminiProvider(
         } finally {
             reader.close()
             response.close()
+            // The body left the read loop under its own power: a later scope
+            // cancellation is teardown, not "this stream was cancelled".
+            cancelBridge.markStreamCompleted()
         }
+        cancelBridge.dispose()
         channel.close()
         awaitClose()
         // [fix/provider-stream-flowon] Same starvation as OpenAIProvider: the
