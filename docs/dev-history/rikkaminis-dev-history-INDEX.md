@@ -1,6 +1,6 @@
 # rikkaminis-dev-history 按天索引
 
-快速跳转到每日开发日志。共 1734 条记录，74 天。
+快速跳转到每日开发日志。共 1743 条记录，74 天。
 
 ## 2026-08-03（11 条）
 
@@ -3668,7 +3668,7 @@
 - `23:19` **§97 收口：fix/skill-asset-hash-gate 合并 main 15a1f1336（用户令「没有问题就**
   - # §97 收口：fix/skill-asset-hash-gate 合并 main 15a1f1336（用户令「没有问题就合并」+「合并触发之后就不用等了」）
 
-## 2026-10-15（4 条）
+## 2026-10-15（13 条）
 
 - `00:11` **§97 内容哈希门控在真机未生效——根因定性：DB 行来源不是 bundled（原本就有，非本次改出）**
   - **验证对象**：设备包 `1.0.0+2095`（lastUpdate 23:21:46）= CI run **#2095** = `fix/skill-as…
@@ -3678,3 +3678,21 @@
   - **核查对象**：run #2097 = `fix/bundled-row-adoption-1015` @ `5da7153f7`（workflow_disp…
 - `00:43` **§97 端到端闭合（2026-10-15 00:39，设备包 1.0.0+2097）**
   - **身份链**：versionName `1.0.0+2097` ↔ CI run **#2097**（run_number 2097）= `fix/bundl…
+- `01:05` **§98 文档同步收口 + 沙箱膨胀数据清理（2026-10-15）**
+  - **文档同步**：dev-history 三件套重建（1734 条 → 24 saga，脱敏 3 遍 NONE）→ 分支 `docs/dev-history-s…
+- `06:13` **§99 全仓审计第二道门核实 + 4 会话派发（2026-10-15）**
+  - **输入**：用户丢来全仓审计报告（`shared-e8a7c3f5.md`，8 BUG + 5 ARCH + 6 PERF）令「检查核实」→ 核实后「工程量大…
+- `06:33` **FIX-B 完成：技能/备份恢复修复（fix/audit-1015-skillbackup @ 6645cce，CI #2099 绿，停在分支未合并）**
+  - **任务**：`shared/audit-1015/fix-tasks/FIX-B.md`；报告 `shared/audit-1015/fix-reports/…
+- `07:04` **FIX-A 完成：上下文链路修复（fix/audit-1015-context @ 24fa628，CI #2101 绿，停在分支未合并）**
+  - **任务**：`/var/minis/shared/audit-1015/fix-tasks/FIX-A.md`（核实报告 VERIFY-REPORT.md 先…
+- `07:20` **audit-1015 FIX-D 会话（native/jieba/WebApp/IPC 修复完成）**
+  - - 分支 `fix/audit-1015-native-misc`（333d7cb + 9815cf4），CI run 38652238091 绿，按任务书停在…
+- `07:36` **FIX-C 完成：AgentLoop 状态机 + 沙盒 Shell（audit-1015，分支 fix/audit-1015-loop-sandbox @ 3c5f916b，CI #2104 绿，停在分支未合并）**
+  - **用户令**：读 `/var/minis/shared/audit-1015/fix-tasks/FIX-C.md` 并立刻执行。基线 main `e5e73…
+- `10:42` **audit-1015 四分支合并收口（2026-10-15）**
+  - **用户令**：「检查云端上的4个分支，有问题就修，没问题就合并」+ 中途两次纠偏：「你是不是偏移最初目标了」「你这里承担的是合并前的检查环节」。
+- `11:07` **上下文预算缺口修复（fix/prewindow-budget-1015）**
+  - **现场**：2026-10-15 T321 会话（16c39966）——同一份 4.9MB agent 历史，deepseek 中转报 191,856 tok…
+- `12:02` **云端分支核查+修复+合并：fix/prewindow-budget-1015 → main 55344efa7（2026-10-15）**
+  - **用户令**：「检查云端上的那个分支」→ 报告缺口 →「1」（先修再合）→「构建完了」。
