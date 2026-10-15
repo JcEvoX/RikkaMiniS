@@ -706,6 +706,11 @@ fun SkillDetailScreen(
                                         name = parsed.name,
                                         description = parsed.description,
                                         body = parsed.body,
+                                        // [fix/audit-1015-b4-3] Carry the parsed
+                                        // version: the update() signature supports
+                                        // it but it was never passed, so a file
+                                        // update kept the old version string.
+                                        version = parsed.version,
                                     )
                                 }
                             }
@@ -1255,7 +1260,16 @@ fun SkillFileViewerScreen(
                             if (isSkillMd) {
                                 // SKILL.md edits go through importFromContent so
                                 // YAML frontmatter changes flow back into DB metadata.
-                                skillRepository.importFromContent(editContent, skill.importSource)
+                                // [fix/audit-1015-b4-2] Pin the preferred id to the
+                                // skill being edited: without it a renamed SKILL.md
+                                // saved here resolved to a fresh slugify id and was
+                                // added as a duplicate instead of refreshing the
+                                // existing entry.
+                                skillRepository.importFromContent(
+                                    editContent,
+                                    skill.importSource,
+                                    preferredId = skillId,
+                                )
                             } else {
                                 skillRepository.writeSkillFile(skillId, relativePath, editContent)
                             }
