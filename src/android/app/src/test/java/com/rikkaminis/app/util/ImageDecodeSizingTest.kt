@@ -208,4 +208,58 @@ class ImageDecodeSizingTest {
         assertFalse(ImageDecodeSizing.fitsWithin(0, 2000, MAX_EDGE))
         assertFalse(ImageDecodeSizing.fitsWithin(2000, 2000, 0))
     }
+
+    /**
+     * [audit3-F-13] The two bounds the Compose previews now use: 192 px for the
+     * launcher icon / 36.dp icon tile (`ICON_MAX_EDGE_PX` in AddToHomeSheet)
+     * and 1024 px for the image-reply preview (`QUICKTEST_MAX_EDGE_PX` in
+     * QuickTestSheet).
+     *
+     * These literals are what proves a 12 Mpx gallery photo no longer decodes
+     * at source resolution: at maxEdge 192 a 4000x3000 photo lands on 192x144
+     * (~110 KB of ARGB_8888) instead of 4000x3000 (~48 MB), and a 4096x4096
+     * generation lands on 1024x1024 (~4 MB) instead of ~64 MB.
+     */
+    @Test
+    fun `the icon and image-reply bounds land on the preview sizes (literals)`() {
+        // w, h, sample, expected w, expected h
+        val icon = listOf(
+            intArrayOf(4000, 3000, 16, 192, 144),   // 12 Mpx gallery photo
+            intArrayOf(3000, 4000, 16, 144, 192),   // portrait photo
+            intArrayOf(8000, 6000, 32, 192, 144),   // 48 Mpx photo -> sample 32
+            intArrayOf(192, 192, 1, 192, 192),      // already the icon size
+            intArrayOf(100, 50, 1, 100, 50),        // smaller than the bound: untouched
+            intArrayOf(4000, 1, 16, 192, 1),        // elongated: short edge stays >= 1
+        )
+        val reply = listOf(
+            intArrayOf(2048, 2048, 1, 1024, 1024),  // 2K generation
+            intArrayOf(4096, 4096, 2, 1024, 1024),  // 4K generation
+            intArrayOf(1024, 1024, 1, 1024, 1024),
+            intArrayOf(300, 200, 1, 300, 200),
+        )
+        for ((maxEdge, table) in listOf(192 to icon, 1024 to reply)) {
+            for (row in table) {
+                val (w, h, expSample, expW, expH) = row
+                assertEquals(
+                    "${w}x$h @$maxEdge sample",
+                    expSample,
+                    ImageDecodeSizing.sampleSizeForExactScale(w, h, maxEdge),
+                )
+                val out = ImageDecodeSizing.scaledSize(w, h, maxEdge)
+                assertEquals("${w}x$h @$maxEdge width", expW, out.width)
+                assertEquals("${w}x$h @$maxEdge height", expH, out.height)
+                // The decoded intermediate must stay inside the 2x window: that
+                // is the memory bound the previews rely on.
+                val sample = ImageDecodeSizing.sampleSizeForExactScale(w, h, maxEdge)
+                val ceilW = maxOf(1, (w + sample - 1) / sample)
+                val ceilH = maxOf(1, (h + sample - 1) / sample)
+                assertTrue("${w}x$h @$maxEdge decoded $ceilW x $ceilH exceeds the window", ceilW <= 2 * maxEdge && ceilH <= 2 * maxEdge)
+                // …and never below the target, or the exact pass would upscale.
+                assertTrue(
+                    "${w}x$h @$maxEdge decoded below target",
+                    maxOf(1, w / sample) >= out.width && maxOf(1, h / sample) >= out.height,
+                )
+            }
+        }
+    }
 }

@@ -1,6 +1,5 @@
 package com.rikkaminis.app.ui.components
 
-import android.graphics.BitmapFactory
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -59,6 +58,7 @@ import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.model.normalizeModalityName
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.util.ImageDecoding
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -66,6 +66,17 @@ import kotlinx.coroutines.CoroutineScope
 import androidx.compose.runtime.rememberCoroutineScope
 
 private const val TAG = "QuickTest"
+
+/**
+ * [audit3-F-13] Longest-edge ceiling for an image reply preview, in pixels.
+ *
+ * Derived from the layout below (`fillMaxWidth().heightIn(max = 220.dp)` inside
+ * a bottom sheet, `ContentScale.Fit`): on the widest phones that is ~1100 px of
+ * row width and ~600 px of height at 2.75x density, so 1024 keeps the preview
+ * sharp without a resize pass, while a 4K generation (4096x4096 = 64 MB
+ * ARGB_8888, native memory the GC cannot see) is decoded at ~4 MB instead.
+ */
+private const val QUICKTEST_MAX_EDGE_PX = 1024
 
 /**
  * [T-android-model-quick-test] A lightweight half-sheet that fires
@@ -317,8 +328,13 @@ private fun TestContent(run: QuickTestRun) {
             style = MaterialTheme.typography.bodyMedium,
         )
         is QuickTestState.ImageReply -> {
+            // [audit3-F-13] Bounded decode. Generation replies are 2K/4K PNGs,
+            // and this `remember {}` runs on the Compose thread: the bare
+            // `decodeByteArray` it replaces allocated the full-resolution
+            // bitmap (64 MB for 4096x4096) before the 220.dp preview could
+            // shrink it.
             val bmp = remember(s.data) {
-                runCatching { BitmapFactory.decodeByteArray(s.data, 0, s.data.size) }.getOrNull()
+                ImageDecoding.decodeBytesBounded(s.data, QUICKTEST_MAX_EDGE_PX)?.bitmap
             }
             if (bmp != null) {
                 Image(
