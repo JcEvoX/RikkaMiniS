@@ -244,19 +244,39 @@ object SessionActivityTracker {
     /**
      * [fix/audit0917-b8] Guards the read-modify-write of [_activeSessions]
      * plus the `wasActive` decision in [setActive] / [setInactive]. Kept
-     * separate from the `streamCancellers` / `pendingErrorFlag` monitors so
-     * the completion-listener fan-out below stays outside any lock.
+     * separate from the `streamCancellers` monitor and the
+     * [StreamErrorFlags] lock so the completion-listener fan-out below stays
+     * outside any lock.
      */
     private val activeSessionsLock = Any()
 
     /**
-     * T180-bg-notif: per-session "task is finishing — was it cancelled?"
-     * flag, set by [setInactive]'s callers via [setInactiveError] when
-     * the streamJob unwinds because of an error (vs a clean completion).
-     * Drives the success/error variant of the completion notification.
-     * Cleared as soon as the listener has fired.
+     * T180-bg-notif: per-session "this RUN ended in error" flag. Drives the
+     * success/error variant of the completion notification AND the
+     * scheduled-task outcome ([com.rikkaminis.app.scheduled.ScheduledTaskRunner]
+     * maps `isError` → RESULT_ERROR / RESULT_OK).
+     *
+     * Lifecycle — one flag per run, every edge owned by a named call:
+     *  - **set** → [markStreamError] the moment a terminal failure reaches the
+     *    error banner (`ChatViewModel.setInlineError`);
+     *  - **clear** → [clearStreamError] when that same run recovers (inline
+     *    error retracted by `clearInlineError`), plus the stale-flag drop in
+     *    [setActive] so a leftover flag can never report the NEXT run;
+     *  - **consume** → [setInactive] reads-and-removes it as `wasError`, which
+     *    is the value the completion listener fans out.
+     *
+     * [fix/da1015-sched-errorprop] Before this, the only writers were
+     * `catch (e: Exception)` blocks at the run boundaries — but
+     * `AgentLoopEngine` swallows almost every model failure and returns
+     * NORMALLY (`terminalErrorSurfaced` + fall-through to the break), so those
+     * catches never ran: a failed run was reported as a clean completion,
+     * `ScheduledTaskRunner` recorded RESULT_OK, `lastRunDate` got pinned and
+     * `failStreak` reset ⇒ the task fuse could never trip.
+     *
+     * The store is [StreamErrorFlags] — plain Kotlin, no Android — so the
+     * run-scoping rule is unit-testable directly.
      */
-    private val pendingErrorFlag = mutableSetOf<String>()
+    private val pendingErrorFlag = StreamErrorFlags()
 
     /**
      * T180-bg-notif: completion listener. Wired in MinisApp.onCreate to
@@ -332,6 +352,14 @@ object SessionActivityTracker {
      * action can fan out to every running session.
      */
     fun setActive(sessionId: String, onStop: (() -> Unit)? = null) {
+        // [fix/da1015-sched-errorprop] Run-scoped flag hygiene. The flag is
+        // normally consumed by setInactive at the end of the failing run, but
+        // a stale streamJob whose finally skipped setInactive (the
+        // claim-token guard) leaves it behind — and it would then be reported
+        // as the NEXT run's outcome (false "failed" → task fuse counts a
+        // failure for a run that succeeded). A new run starts from a clean
+        // slate; it re-flags itself if it fails.
+        pendingErrorFlag.clear(sessionId)
         // [fix/audit0917-b8] Same lock as setInactive — activation and
         // deactivation of the same session can arrive from different threads
         // (stream job vs. UI teardown); a concurrent pair used to be able to
@@ -380,7 +408,7 @@ object SessionActivityTracker {
             was
         }
         synchronized(streamCancellers) { streamCancellers.remove(sessionId) }
-        val wasError = synchronized(pendingErrorFlag) { pendingErrorFlag.remove(sessionId) }
+        val wasError = pendingErrorFlag.consume(sessionId)
         AppLogger.info(TAG, "Session deactivated: $sessionId (total: ${_activeSessions.value.size})")
 
         if (_activeSessions.value.isEmpty()) {
@@ -418,13 +446,39 @@ object SessionActivityTracker {
     }
 
     /**
-     * T180-bg-notif: caller marks the session's stream as having ended in
-     * an error. Must be invoked BEFORE [setInactive] (the flag is consumed
-     * inside setInactive). If never called, the completion listener fires
-     * with `isError=false`.
+     * Marks the session's CURRENT run as having ended in an error. Must be
+     * invoked BEFORE [setInactive] (the flag is consumed there). If never
+     * called, the completion listener fires with `isError=false`.
+     *
+     * [fix/da1015-sched-errorprop] Idempotent, and paired with
+     * [clearStreamError]: terminal failures flag here, a same-run recovery
+     * retracts in `clearInlineError`, and [setActive] drops any stale flag
+     * when the next run starts.
+     *
+     * User cancellation is deliberately NOT an error: no `CancellationException`
+     * handler calls this (they only log), so a stopped run still reports
+     * `isError=false`.
      */
     fun markStreamError(sessionId: String) {
-        synchronized(pendingErrorFlag) { pendingErrorFlag.add(sessionId) }
+        if (pendingErrorFlag.mark(sessionId)) {
+            AppLogger.info(TAG, "Stream error flagged: $sessionId")
+        }
+    }
+
+    /**
+     * Counterpart of [markStreamError] for a run that did NOT end in failure —
+     * the terminal error was retracted because the run recovered (the inline
+     * banner is cleared by `clearInlineError`), or a new run is starting and
+     * the previous run's flag is stale.
+     *
+     * Fires no completion listener and does not change [setInactive]'s
+     * semantics: a session with no flag still completes with `isError=false`,
+     * exactly as before this method existed.
+     */
+    fun clearStreamError(sessionId: String) {
+        if (pendingErrorFlag.clear(sessionId)) {
+            AppLogger.info(TAG, "Stream error flag cleared: $sessionId")
+        }
     }
 
     /**
@@ -662,4 +716,34 @@ object SessionActivityTracker {
         AgentForegroundService.stopService(context)
         Log.d(TAG, "All sessions complete, service stopped after idle debounce")
     }
+}
+
+/**
+ * [fix/da1015-sched-errorprop] Run-scoped "this session's stream ended in an
+ * error" store — the pure core of [SessionActivityTracker.pendingErrorFlag].
+ *
+ * Extracted out of the tracker because the tracker is an Android singleton
+ * (Context / Handler / Looper / Log), so its flag semantics could only be
+ * pinned by source probes. This class is plain Kotlin: `mark` / `clear` /
+ * `consume` under one lock, no Android imports — which makes the run-scoping
+ * rule ("a flag never outlives the run that set it") unit-testable directly
+ * instead of by assertion on text.
+ *
+ * Threading: marked from the agent-loop coroutine (IO) and consumed from
+ * whichever thread the run's `finally` lands on — the same reason the
+ * tracker wrapped its bare `mutableSetOf` in `synchronized`.
+ */
+internal class StreamErrorFlags {
+    private val lock = Any()
+    private val flagged = mutableSetOf<String>()
+
+    /** @return true when THIS call set the flag (false = already flagged). */
+    fun mark(sessionId: String): Boolean = synchronized(lock) { flagged.add(sessionId) }
+
+    /** @return true when THIS call retracted a flag (false = nothing to clear). */
+    fun clear(sessionId: String): Boolean = synchronized(lock) { flagged.remove(sessionId) }
+
+    /** Consume-on-read for [SessionActivityTracker.setInactive]: return the
+     *  flag AND drop it, so it can never be counted twice. */
+    fun consume(sessionId: String): Boolean = clear(sessionId)
 }

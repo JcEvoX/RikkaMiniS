@@ -3,6 +3,7 @@ package com.rikkaminis.app.ui.chat
 import android.util.Log
 import androidx.lifecycle.viewModelScope
 import com.rikkaminis.app.R
+import com.rikkaminis.app.service.SessionActivityTracker
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 
@@ -25,6 +26,20 @@ internal fun ChatViewModel.setInlineError(errorText: String, detail: String? = n
     // (`e.message ?: "Unknown error"` only guards null, not "") is the
     // realistic source. Coalesce to a generic non-empty message.
     val safeError = errorText.ifBlank { context.getString(R.string.error_empty_response_generic) }
+    // [fix/da1015-sched-errorprop] A terminal failure is reaching the banner —
+    // tell the activity tracker BEFORE the run unwinds, or the completion
+    // signal (notification variant + ScheduledTaskRunner outcome) reports a
+    // clean finish and the task fuse never counts the failure.
+    //
+    // This is the single funnel every terminal failure path uses: the engine's
+    // 9 internal `host.setInlineError` sites (content filter / length-wall
+    // ceiling / deterministic-empty / repetition abort / EOF stub /
+    // empty-response hint) plus every run boundary's catch via
+    // `reportAgentLoopError`, plus the turn-limit / budget-stop finalizers.
+    // Paired with SessionActivityTracker.clearStreamError in `clearInlineError`
+    // (same-run recovery) and the stale-flag drop in setActive (next run).
+    val sid = realSessionId.ifEmpty { sessionId }
+    if (sid.isNotEmpty()) SessionActivityTracker.markStreamError(sid)
     // T-streaming-side-channel: before mutating the canonical message,
     // drain any in-flight streaming delta so the error frame carries
     // the actual accumulated content (otherwise the user sees content
@@ -50,7 +65,6 @@ internal fun ChatViewModel.setInlineError(errorText: String, detail: String? = n
         // so we address the row by "last assistant" — matching the load-side
         // merge that keeps the last assistant row's identity. No-op when the
         // failing turn never persisted a row (first-turn failure).
-        val sid = realSessionId.ifEmpty { sessionId }
         if (sid.isNotEmpty()) {
             viewModelScope.launch(Dispatchers.IO) {
                 try { chatRepository.updateLastAssistantError(sid, safeError) }
