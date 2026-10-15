@@ -8,10 +8,10 @@
 > 由 `skills/dev-history-sync/scripts/build_sagas.py` 从档案自动生成，可重复执行。
 
 - 覆盖范围：2026-08-03 ～ 2026-10-15，共 74 天
-- 条目总数：1761（源文件：rikkaminis-dev-history.md）
+- 条目总数：1770（源文件：rikkaminis-dev-history.md）
 - 主题数：24
 - 未归入任何主题：172 条（9%，列在文末）
-- 归入 ≥4 个主题（说明规则偏松）：93 条
+- 归入 ≥4 个主题（说明规则偏松）：94 条
 - 标 `↳` 的条目是**推断归属**：标题里没有主题词（「X 完成 / X 收尾」这类收尾条目，主题词在**上一条**里），由「12 小时内最近一条有主题的条目」继承而来，共 129 条。
 
 ### 怎么读
@@ -29,27 +29,27 @@
 |---|------|------|------|------|
 | 1 | 滚动跟随 / 流式跳动 | 73 | 08-05 ～ 09-28 | 观察中 |
 | 2 | 输入框 / 键盘 / 粘贴 | 29 | 08-04 ～ 09-27 | 已闭环 |
-| 3 | native 内存 / OOM / 崩溃 | 138 | 08-03 ～ 10-15 | 持续跟踪 |
+| 3 | native 内存 / OOM / 崩溃 | 141 | 08-03 ～ 10-15 | 持续跟踪 |
 | 4 | 沙箱 / rootfs / PRoot / 终端 | 129 | 08-03 ～ 10-15 | 稳定 |
-| 5 | fastio offload / syscall 税 | 28 | 08-20 ～ 10-14 | 已合并 main |
-| 6 | 流式回答中断 / 恢复 / 取消 | 147 | 08-03 ～ 10-15 | 已闭环 |
+| 5 | fastio offload / syscall 税 | 29 | 08-20 ～ 10-15 | 已合并 main |
+| 6 | 流式回答中断 / 恢复 / 取消 | 149 | 08-03 ～ 10-15 | 已闭环 |
 | 7 | 思考 / 推理泄漏 | 88 | 08-08 ～ 10-09 | 已闭环 |
 | 8 | 上下文压缩 / 记忆 / 预算 | 186 | 08-06 ～ 10-15 | 稳定 |
 | 9 | Provider / 模型组 / 负载均衡 | 125 | 08-04 ～ 10-14 | 已闭环 |
-| 10 | 备份 / 多端同步 | 137 | 08-03 ～ 10-15 | 收敛 |
+| 10 | 备份 / 多端同步 | 138 | 08-03 ～ 10-15 | 收敛 |
 | 11 | 渲染性能 / Markdown / 长会话卡顿 | 123 | 08-05 ～ 10-15 | 已闭环 + 持续加固 |
 | 12 | 审计 / 整改（多轮） | 281 | 08-03 ～ 10-15 | 常态机制 |
-| 13 | 多会话并行协作 / 派发 / 交接 | 277 | 08-04 ～ 10-15 | 成熟 |
-| 14 | CI / 构建 / 发布流水线 | 311 | 08-03 ～ 10-15 | 稳定 |
+| 13 | 多会话并行协作 / 派发 / 交接 | 286 | 08-04 ～ 10-15 | 成熟 |
+| 14 | CI / 构建 / 发布流水线 | 318 | 08-03 ～ 10-15 | 稳定 |
 | 15 | 开发档案 / 记忆 / 工具链 | 156 | 08-03 ～ 10-15 | 常态维护 |
 | 16 | 会话 / 导航 / 抽屉交互 | 114 | 08-03 ～ 10-12 | 已闭环 |
 | 17 | 平台适配 / 通知 / 图标 / 权限 | 82 | 08-03 ～ 10-14 | 部分放弃 |
 | 18 | 国际化 / 文案 / 本地化 | 29 | 08-04 ～ 09-29 | 已闭环 |
 | 19 | 上游 / 生态吸收 / 开源 | 94 | 08-03 ～ 10-14 | 常态 |
 | 20 | UI 组件 / 设置页 / 交互微调 | 103 | 08-04 ～ 10-15 | 持续 |
-| 21 | Token 用量 / 成本统计 | 80 | 08-05 ～ 10-15 | 已闭环 |
+| 21 | Token 用量 / 成本统计 | 81 | 08-05 ～ 10-15 | 已闭环 |
 | 22 | 人格 / Soul / 提示词 / 技能体系 | 117 | 08-04 ～ 10-15 | 稳定 |
-| 23 | 语音 / 多模态输入 | 32 | 08-03 ～ 10-15 | 低优先级维护 |
+| 23 | 语音 / 多模态输入 | 33 | 08-03 ～ 10-15 | 低优先级维护 |
 | 24 | 被否掉的方向（决策记录） | 49 | 08-04 ～ 10-14 | 持续累积 |
 
 ---
@@ -176,7 +176,7 @@
 
 ## 3. native 内存 / OOM / 崩溃
 
-**跨度** 2026-08-03 ～ 2026-10-15 · **138 条** · **状态** 持续跟踪（09-13 三件套已合并；SOFT 450 / HARD 1200 阈值待 1–2 周真实数据复核）
+**跨度** 2026-08-03 ～ 2026-10-15 · **141 条** · **状态** 持续跟踪（09-13 三件套已合并；SOFT 450 / HARD 1200 阈值待 1–2 周真实数据复核）
 
 **叙事**：08-09 Scudo OOM → 08-15 早三次 OOM → 08-17 native offload 泄漏实证 → 08-20~22 进程隔离五 Phase + 小号 TF-A..TF-J 十连修 → 08-25/26 「RSS 单调泄漏」被沙箱实测**推翻**（是 PRoot VSZ reserve 不是泄漏）→ 09-13 两次 SIGABRT / RSS 5.4–6.1GB，口径从 VmRSS 换 **RssAnon**（61% 信号是可回收页）+ 崩溃态取证 → 09-15 HangDetector 后台冻结假阳性。**这是全档案最长的 saga，也是唯一「调查被自己的实测推翻」的一条。**
 
@@ -320,6 +320,9 @@
 | 10-14 21:34 | FIX-RV-E 完成：E1 API33 readNBytes 崩溃 + E2 技能更新 id + E4 视频高度 no | FIX-RV-E 完成：E1 API33 readNBytes 崩溃 + E2 技能更新 id + E4 视频高度 no-op（fix/rv1014-ui-small @ dff1ddf，CI #2083/3857062… |
 | 10-14 21:36 | ↳ FIX-RV-D 完成：D1 会话克隆 media 重映射 + D2 KeyRoulette 存量明文迁移（fix/rv | FIX-RV-D 完成：D1 会话克隆 media 重映射 + D2 KeyRoulette 存量明文迁移（fix/rv1014-fork-keys @ e39c66b，CI #2084 绿） |
 | 10-15 18:48 | FIX-A6-2 收口：精确缩放解码窗口改回 `< 2 × maxEdge`，分支 CI #2126 绿（2026-10-15） | 任务：读 shared/work/verify-audit2-1015/fix-tasks/FIX-A6-2.md 执行。修 audit2 第二道门发现的行为回归（PERF-03 的修法把 (maxEdge, 2×max… |
+| 10-15 18:55 | audit2 修复批次收口：六支合并 main `ba9ed437`（2026-10-15，用户令「检查，没问题就合并，有问题就修」+「完成之后再更新文档，包括云端的」） | 输入：全仓审计报告第二道门核实后的 6 份任务书（shared/work/verify-audit2-1015/fix-tasks/FIX-A{1..6}.md，基线 main 891d755）。 |
+| 10-15 20:26 | audit3 第二道门核实 + 七支派发（2026-10-15，基线 main `ca8b95d1`） | 输入：用户丢来 全量源码级深度架构、安全与性能审计报告（13 项：3×P0 / 4×P1 / 1×P2 / 3×架构 / 2×性能-内存），说「按流程来吧」。产物目录 /var/minis/shared/work/aud… |
+| 10-15 21:52 | FIX-D 收口：F-05 取消桥前移 + F-06 内存回收不重试（fix/audit3-cancel-retry-1015 @ a9631bf9，CI #2133 绿，停在分支） | 任务书 shared/work/audit3-1015/fix-tasks/FIX-D.md；报告 fix-reports/FIX-D.md；基线 main ca8b95d1；两提交 b76a0c5e（本体）+ a963… |
 
 ## 4. 沙箱 / rootfs / PRoot / 终端
 
@@ -461,7 +464,7 @@
 
 ## 5. fastio offload / syscall 税
 
-**跨度** 2026-08-20 ～ 2026-10-14 · **28 条** · **状态** 已合并 main（三期原语 + du 口径 P1 + F1 全部合并；未验证面 = 真机高并发耗时与发热）
+**跨度** 2026-08-20 ～ 2026-10-15 · **29 条** · **状态** 已合并 main（三期原语 + du 口径 P1 + F1 全部合并；未验证面 = 真机高并发耗时与发热）
 
 **叙事**：09-18 syscall 税首次量化（~200µs/op，纯计算≈原生）→ 09-30 定案缓解分层（L0 行为约定 / L1 fastio offload 立项，Termux 方向被否）→ minis-fastio handler（du + rm + GuestPathMapper 前缀守卫）→ du 字节口径 P1（busybox vs GNU 两个 du 同名不同语义）→ gate 闭环（ASK_ONCE + 会话桶缓存）→ 第二期 find/grep/cp/mv → 第三期 tar（slip 三面 + 权限行）→ 10-01 分支审查 F1（tar 成员名用解析后绝对路径）修后合并。**主题：把文件密集原语从 proot 税里搬出去；每期都用「逐字节 parity + 双臂探针 + 变异负控」验收。**
 
@@ -495,10 +498,11 @@
 | 10-14 16:06 | FIX-3 完成：FastioTar + 只读挂载守卫（fix/sweep1014-sandbox-io @ bf01735cd，CI #2027 绿） | 报告：/var/minis/shared/sweep-1014/reports/FIX-3.md；装置 /var/minis/shared/work/sweep1014-fix/f3/jvm/（extract_f3.py… |
 | 10-14 17:07 | FIX-R10 完成：B15+P1 bashism 误开 heredoc / B16 fastio mv 跨设备回退 / | FIX-R10 完成：B15+P1 bashism 误开 heredoc / B16 fastio mv 跨设备回退 / P5 pty 越界（fix/sweep1014-sandbox-low @ 2eb71c38，CI… |
 | 10-14 17:13 | ↳ FIX-R15 完成：calendar B25a Instances 相交列举 + B25b all-day UTC 锚 | FIX-R15 完成：calendar B25a Instances 相交列举 + B25b all-day UTC 锚定（fix/sweep1014-calendar @ e4c6e83，CI #38538412677… |
+| 10-15 21:13 | FIX-A 收口：audit3 F-01 FastioTar 根条目 tar-slip（P0）— 分支 CI #2129 绿，停在分支未合并（2026-10-15） | 任务：shared/work/audit3-1015/fix-tasks/FIX-A.md（基线 main ca8b95d1）。分支 fix/audit3-fastiotar-1015 @ 894ff37d（2 文件 +… |
 
 ## 6. 流式回答中断 / 恢复 / 取消
 
-**跨度** 2026-08-03 ～ 2026-10-15 · **147 条** · **状态** 已闭环（09-07 收口，含停止按钮竞态 + 多会话真并发真机验证）
+**跨度** 2026-08-03 ～ 2026-10-15 · **149 条** · **状态** 已闭环（09-07 收口，含停止按钮竞态 + 多会话真并发真机验证）
 
 **叙事**：08-18 「回答频繁断掉」诊断链（provider 层铁证健康）→ 08-24 首块超时 30000ms + retry 分类不对称 → 09-06 一天内连收四种形态：EOF 静默停、stream error 手动重试、content_filter→fallback、finish_reason=network_error 伪正常结束 → 09-07 预算墙第 4 形态 + provider-exec-concurrency。**「同一个用户现象 = 五种不同根因」的教科书案例**，每条都靠日志实证拆开。
 
@@ -651,6 +655,8 @@
 | 10-15 14:53 | §100 云端分支核查+合并：fix/audit-verify-1015 → main 4b4eb54a8b（2026- | §100 云端分支核查+合并：fix/audit-verify-1015 → main 4b4eb54a8b（2026-10-15） |
 | 10-15 15:00 | ↳ 文档更新收尾（同会话续） | 本地：挂载 笔记/RikkaMinis开发档案/ 三件套已刷新（1747 条 / 74 天，重建→脱敏→SAGAS→复核 NONE→结构校验：行首围栏 64 偶数、anchors==header==1747、outOrd… |
 | 10-15 16:44 | FIX-A1 收口：audit2 四项 P1 修复，分支 CI #2118 绿（2026-10-15） | 用户令：读 shared/work/verify-audit2-1015/fix-tasks/FIX-A1.md 并立刻执行 → 「构建完了」。 |
+| 10-15 21:14 | FIX-F 收口：F-08 会话路径解析不再因拒绝而全局回退（fix/audit3-sessionpath-1015 @ 6a20a481，CI #2128 绿，停在分支未合并） | 任务：读 shared/work/audit3-1015/fix-tasks/FIX-F.md 执行。基线 main ca8b95d1。commits：c0f2afa9（本体）+ 6a20a481（同族第 8 站点 + … |
+| 10-15 21:52 | FIX-D 收口：F-05 取消桥前移 + F-06 内存回收不重试（fix/audit3-cancel-retry-1015 @ a9631bf9，CI #2133 绿，停在分支） | 任务书 shared/work/audit3-1015/fix-tasks/FIX-D.md；报告 fix-reports/FIX-D.md；基线 main ca8b95d1；两提交 b76a0c5e（本体）+ a963… |
 
 ## 7. 思考 / 推理泄漏
 
@@ -1080,7 +1086,7 @@
 
 ## 10. 备份 / 多端同步
 
-**跨度** 2026-08-03 ～ 2026-10-15 · **137 条** · **状态** 收敛（多端同步已砍除，自动备份按「资产」语义保留）
+**跨度** 2026-08-03 ～ 2026-10-15 · **138 条** · **状态** 收敛（多端同步已砍除，自动备份按「资产」语义保留）
 
 **叙事**：08-04 WebDAV 备份把 main 编译弄坏 + 导入去重 → 08-09 备份并发 OOM → 08-10 多端自动同步 → 08-11 流量审计（用户发现方案欠考虑）→ 降本 + 合并守卫 → 08-13 备份模块审计 7 项 → 08-28 方案 C 重构 → 09-08 **产品哲学定调：资产 vs 副产品** + 自动备份 A+B + auto/ 目录分离 → 09-09 多端同步砍除。**从「做」到「砍」只用了一个月，中间靠一次流量审计转弯。**
 
@@ -1223,6 +1229,7 @@
 | 10-15 01:05 | §98 文档同步收口 + 沙箱膨胀数据清理（2026-10-15） | 文档同步：dev-history 三件套重建（1734 条 → 24 saga，脱敏 3 遍 NONE）→ 分支 docs/dev-history-sync-1015 → --no-ff 合入 main e5e733b（… |
 | 10-15 06:33 | FIX-B 完成：技能/备份恢复修复（fix/audit-1015-skillbackup @ 6645cce，CI #2099 绿，停在分支未合并） | 任务：shared/audit-1015/fix-tasks/FIX-B.md；报告 shared/audit-1015/fix-reports/FIX-B.md；工作树 shared/work/fix-b-1015/r… |
 | 10-15 12:05 | dev-history 档案更新 + 仓库同步（2026-10-15，用户令「更新一下文档，包括仓库的」） | 执行：rebuild（1743 条 / 74 天 / 31071 行）→ sanitize（main 296 替换 + INDEX 35 替换，probes NONE）→ SAGAS（24 sagas / 171 orp… |
+| 10-15 21:55 | FIX-C 交付收口：model-use 跨进程边界四块（F-03 P0 + F-04 + F-08 + F-10）—— 分支 CI #2135 绿，停在分支（2026-10-15） | 任务：读 shared/work/audit3-1015/fix-tasks/FIX-C.md 并立刻执行（基线 main ca8b95d1）。报告 shared/work/audit3-1015/fix-reports… |
 
 ## 11. 渲染性能 / Markdown / 长会话卡顿
 
@@ -1648,7 +1655,7 @@
 
 ## 13. 多会话并行协作 / 派发 / 交接
 
-**跨度** 2026-08-04 ～ 2026-10-15 · **277 条** · **状态** 成熟（skill: task-dispatch / git-parallel-collaboration / rikkaminis-dev-methodology）
+**跨度** 2026-08-04 ～ 2026-10-15 · **286 条** · **状态** 成熟（skill: task-dispatch / git-parallel-collaboration / rikkaminis-dev-methodology）
 
 **叙事**：08-07 多对话框并发操作同一 worktree 翻车（native OOM 修复）→ 08-12 多任务并行推进模式确立 → 08-15 T1–T10 十会话派发（平衡点施工）→ 08-18 RC 整改凭编号领取 → 08-22 小号 TF-A..TF-J → 08-23 bug-hunt 五会话 → 09-13 两条纪律固化：**每会话独立 clone 绝不共享 .git** + **两分支同基各一 commit 时第二个必须 rebase**。
 
@@ -1931,10 +1938,19 @@
 | 10-15 17:33 | FIX-A3 交付收口：BUG-08 cancelBridge 共享化（2026-10-15） | 任务：shared/work/verify-audit2-1015/fix-tasks/FIX-A3.md —— Anthropic/Gemini 缺 cancelBridge（首块之后用户点停止，协程停在 call.e… |
 | 10-15 18:07 | FIX-A1-2 收口：注释级修正（"provably true" 不成立）—— 分支 CI #2120 绿（2026-10-15） | 用户令：读 shared/work/verify-audit2-1015/fix-tasks/FIX-A1-2.md 并立刻执行。 |
 | 10-15 18:48 | FIX-A6-2 收口：精确缩放解码窗口改回 `< 2 × maxEdge`，分支 CI #2126 绿（2026-10-15） | 任务：读 shared/work/verify-audit2-1015/fix-tasks/FIX-A6-2.md 执行。修 audit2 第二道门发现的行为回归（PERF-03 的修法把 (maxEdge, 2×max… |
+| 10-15 18:55 | audit2 修复批次收口：六支合并 main `ba9ed437`（2026-10-15，用户令「检查，没问题就合并，有问题就修」+「完成之后再更新文档，包括云端的」） | 输入：全仓审计报告第二道门核实后的 6 份任务书（shared/work/verify-audit2-1015/fix-tasks/FIX-A{1..6}.md，基线 main 891d755）。 |
+| 10-15 20:26 | audit3 第二道门核实 + 七支派发（2026-10-15，基线 main `ca8b95d1`） | 输入：用户丢来 全量源码级深度架构、安全与性能审计报告（13 项：3×P0 / 4×P1 / 1×P2 / 3×架构 / 2×性能-内存），说「按流程来吧」。产物目录 /var/minis/shared/work/aud… |
+| 10-15 21:13 | FIX-A 收口：audit3 F-01 FastioTar 根条目 tar-slip（P0）— 分支 CI #2129 绿，停在分支未合并（2026-10-15） | 任务：shared/work/audit3-1015/fix-tasks/FIX-A.md（基线 main ca8b95d1）。分支 fix/audit3-fastiotar-1015 @ 894ff37d（2 文件 +… |
+| 10-15 21:14 | FIX-F 收口：F-08 会话路径解析不再因拒绝而全局回退（fix/audit3-sessionpath-1015 @ 6a20a481，CI #2128 绿，停在分支未合并） | 任务：读 shared/work/audit3-1015/fix-tasks/FIX-F.md 执行。基线 main ca8b95d1。commits：c0f2afa9（本体）+ 6a20a481（同族第 8 站点 + … |
+| 10-15 21:18 | FIX-E 收口：audit3 F-07 mount guard 四处绕过全修，分支 CI 38739081695 绿（2026-10-15） | 任务：读 shared/work/audit3-1015/fix-tasks/FIX-E.md 执行（基线 main ca8b95d1）。报告 shared/work/audit3-1015/fix-reports/FI… |
+| 10-15 21:19 | FIX-B 收口：audit3 F-02 预算停出环（P0）→ 分支 CI #2131 绿，停在分支（2026-10-15） | 任务：读 shared/work/audit3-1015/fix-tasks/FIX-B.md 执行。基线 main ca8b95d1，分支 fix/audit3-agentloop-1015 @ 09bb9df6，CI… |
+| 10-15 21:52 | FIX-D 收口：F-05 取消桥前移 + F-06 内存回收不重试（fix/audit3-cancel-retry-1015 @ a9631bf9，CI #2133 绿，停在分支） | 任务书 shared/work/audit3-1015/fix-tasks/FIX-D.md；报告 fix-reports/FIX-D.md；基线 main ca8b95d1；两提交 b76a0c5e（本体）+ a963… |
+| 10-15 21:52 | FIX-G 收口：NodeRegistry 摊销驱逐 + 图片解码有界化（fix/audit3-perf-small-1015 @ 993fed7e，CI #2134 绿，停在分支） | 任务：读 shared/work/audit3-1015/fix-tasks/FIX-G.md 立刻执行（audit3 F-12/F-13）。基线 main ca8b95d17，单提交 993fed7e，6 文件 +80… |
+| 10-15 21:55 | FIX-C 交付收口：model-use 跨进程边界四块（F-03 P0 + F-04 + F-08 + F-10）—— 分支 CI #2135 绿，停在分支（2026-10-15） | 任务：读 shared/work/audit3-1015/fix-tasks/FIX-C.md 并立刻执行（基线 main ca8b95d1）。报告 shared/work/audit3-1015/fix-reports… |
 
 ## 14. CI / 构建 / 发布流水线
 
-**跨度** 2026-08-03 ～ 2026-10-15 · **311 条** · **状态** 稳定（Publish 步骤已加 `if: refs/heads/main` 门控）
+**跨度** 2026-08-03 ～ 2026-10-15 · **318 条** · **状态** 稳定（Publish 步骤已加 `if: refs/heads/main` 门控）
 
 **叙事**：08-04 main 编译被 WebDAV 提交弄坏（连红 4 个 run）→ 08-05 android-latest 被分支构建污染 → workflow 门控修复 → 08-17 **CI 缓存恢复旧 native .so**（Tier 0 真 bug）→ 08-24 gh_ci_wait.sh 工具化 + 重复构建幂等守卫 → 09-10 语法门 grep 大小写坑 → 09-14 workflow_dispatch 并发竞态。**「CI 绿 ≠ 逻辑对」这条纪律就是从这条 saga 长出来的。**
 
@@ -2251,6 +2267,13 @@
 | 10-15 16:45 | FIX-A2 完成：browser bridge 凭证化 + dataUrl 上限（fix/audit2-bridge-1015 @ e4eccc4，CI 38705282566 绿，停在分支） | 任务书：shared/work/verify-audit2-1015/fix-tasks/FIX-A2.md；报告 fix-reports/FIX-A2.md；装置 shared/work/audit2-fix/a2/p… |
 | 10-15 18:07 | FIX-A1-2 收口：注释级修正（"provably true" 不成立）—— 分支 CI #2120 绿（2026-10-15） | 用户令：读 shared/work/verify-audit2-1015/fix-tasks/FIX-A1-2.md 并立刻执行。 |
 | 10-15 18:48 | FIX-A6-2 收口：精确缩放解码窗口改回 `< 2 × maxEdge`，分支 CI #2126 绿（2026-10-15） | 任务：读 shared/work/verify-audit2-1015/fix-tasks/FIX-A6-2.md 执行。修 audit2 第二道门发现的行为回归（PERF-03 的修法把 (maxEdge, 2×max… |
+| 10-15 21:13 | FIX-A 收口：audit3 F-01 FastioTar 根条目 tar-slip（P0）— 分支 CI #2129 绿，停在分支未合并（2026-10-15） | 任务：shared/work/audit3-1015/fix-tasks/FIX-A.md（基线 main ca8b95d1）。分支 fix/audit3-fastiotar-1015 @ 894ff37d（2 文件 +… |
+| 10-15 21:14 | FIX-F 收口：F-08 会话路径解析不再因拒绝而全局回退（fix/audit3-sessionpath-1015 @ 6a20a481，CI #2128 绿，停在分支未合并） | 任务：读 shared/work/audit3-1015/fix-tasks/FIX-F.md 执行。基线 main ca8b95d1。commits：c0f2afa9（本体）+ 6a20a481（同族第 8 站点 + … |
+| 10-15 21:18 | FIX-E 收口：audit3 F-07 mount guard 四处绕过全修，分支 CI 38739081695 绿（2026-10-15） | 任务：读 shared/work/audit3-1015/fix-tasks/FIX-E.md 执行（基线 main ca8b95d1）。报告 shared/work/audit3-1015/fix-reports/FI… |
+| 10-15 21:19 | FIX-B 收口：audit3 F-02 预算停出环（P0）→ 分支 CI #2131 绿，停在分支（2026-10-15） | 任务：读 shared/work/audit3-1015/fix-tasks/FIX-B.md 执行。基线 main ca8b95d1，分支 fix/audit3-agentloop-1015 @ 09bb9df6，CI… |
+| 10-15 21:52 | FIX-D 收口：F-05 取消桥前移 + F-06 内存回收不重试（fix/audit3-cancel-retry-1015 @ a9631bf9，CI #2133 绿，停在分支） | 任务书 shared/work/audit3-1015/fix-tasks/FIX-D.md；报告 fix-reports/FIX-D.md；基线 main ca8b95d1；两提交 b76a0c5e（本体）+ a963… |
+| 10-15 21:52 | FIX-G 收口：NodeRegistry 摊销驱逐 + 图片解码有界化（fix/audit3-perf-small-1015 @ 993fed7e，CI #2134 绿，停在分支） | 任务：读 shared/work/audit3-1015/fix-tasks/FIX-G.md 立刻执行（audit3 F-12/F-13）。基线 main ca8b95d17，单提交 993fed7e，6 文件 +80… |
+| 10-15 21:55 | FIX-C 交付收口：model-use 跨进程边界四块（F-03 P0 + F-04 + F-08 + F-10）—— 分支 CI #2135 绿，停在分支（2026-10-15） | 任务：读 shared/work/audit3-1015/fix-tasks/FIX-C.md 并立刻执行（基线 main ca8b95d1）。报告 shared/work/audit3-1015/fix-reports… |
 
 ## 15. 开发档案 / 记忆 / 工具链
 
@@ -2886,7 +2909,7 @@
 
 ## 21. Token 用量 / 成本统计
 
-**跨度** 2026-08-05 ～ 2026-10-15 · **80 条** · **状态** 已闭环（09-09 实时用量 + 预算上限；09-12 parseUsage 修复合并）
+**跨度** 2026-08-05 ～ 2026-10-15 · **81 条** · **状态** 已闭环（09-09 实时用量 + 预算上限；09-12 parseUsage 修复合并）
 
 **叙事**：08-06 TokenUsageSheet 补缓存命中率 → 08-08 双重扣减 + Gemini cache 修复 → 08-25 用量统计优化 A+B → 08-31 LiteLLM 成本层 V2（JSON 价格表 + 用户可编辑）→ **09-12 parseUsage 双重扣减再次出现**（同族复发）。
 
@@ -2972,6 +2995,7 @@
 | 10-11 00:49 | 分支核查+合并：fix/compact-stale-context-tokens-1010（2026-10-11 用户令 | 分支核查+合并：fix/compact-stale-context-tokens-1010（2026-10-11 用户令「有问题就修，没问题就合并」+「触发了就不用等了」） |
 | 10-15 11:07 | 上下文预算缺口修复（fix/prewindow-budget-1015） | 现场：2026-10-15 T321 会话（16c39966）——同一份 4.9MB agent 历史，deepseek 中转报 191,856 tokens、GLM 直连报 920,577（4.8×）。本地账本持中转口… |
 | 10-15 16:32 | FIX-A4 完成：消息级 token 估算双计/多路不一致 → 收敛为单一 wire 对齐实现（2026-10-15，分支 `fix/audit2-estimate-1015` @ `37533a3a`，CI #2115 绿，停在分支未合并） | 任务：shared/work/verify-audit2-1015/fix-tasks/FIX-A4.md（审计报告 BUG-06）。基线 main 891d755。报告 shared/work/verify-audit… |
+| 10-15 21:19 | FIX-B 收口：audit3 F-02 预算停出环（P0）→ 分支 CI #2131 绿，停在分支（2026-10-15） | 任务：读 shared/work/audit3-1015/fix-tasks/FIX-B.md 执行。基线 main ca8b95d1，分支 fix/audit3-agentloop-1015 @ 09bb9df6，CI… |
 
 ## 22. 人格 / Soul / 提示词 / 技能体系
 
@@ -3101,7 +3125,7 @@
 
 ## 23. 语音 / 多模态输入
 
-**跨度** 2026-08-03 ～ 2026-10-15 · **32 条** · **状态** 低优先级维护（语音输入可用，未再重点投入）
+**跨度** 2026-08-03 ～ 2026-10-15 · **33 条** · **状态** 低优先级维护（语音输入可用，未再重点投入）
 
 **叙事**：08-04 语音 UI 移除 → 08-06 语音功能清理（合并 main）→ 08-27 语音输入顺滑度修复 + voice-ime 合并 → 09-12 senseaudio「系统繁忙」实测 + TTFB 30s 通用缺口。**两次「移除」后又两次「修回来」**——语音这条线反复横跳，最终落在「保留但降低优先级」。
 
@@ -3139,6 +3163,7 @@
 | 10-15 13:27 | 全仓审计报告第二道门核实（2026-10-15，附件 shared-04273e16.md） | 基线：main @ 6fe4771；装置 /var/minis/shared/work/verify-audit-1015/repo（分支 verify）；报告 shared/work/verify-audit-1015… |
 | 10-15 15:54 | 第二道门核实：全仓审计报告（附件 25 项）→ VERIFY-REPORT.md（2026-10-15） | 用户令：「按照老流程来」+ 附件 rikkaminis_full_repository_audit_report.md（64.5KB，BUG×10 + DESIGN×8 + PERF×7 = 25 项）。基线 main … |
 | 10-15 16:30 | FIX-A6 完成：图片解码三处全尺寸位图 + 缩放算术出 0 尺寸（audit2-PERF-03，2026-10-15） | 用户令：「读这个文件并立刻执行：/var/minis/shared/work/verify-audit2-1015/fix-tasks/FIX-A6.md」。 |
+| 10-15 21:52 | FIX-G 收口：NodeRegistry 摊销驱逐 + 图片解码有界化（fix/audit3-perf-small-1015 @ 993fed7e，CI #2134 绿，停在分支） | 任务：读 shared/work/audit3-1015/fix-tasks/FIX-G.md 立刻执行（audit3 F-12/F-13）。基线 main ca8b95d17，单提交 993fed7e，6 文件 +80… |
 
 ## 24. 被否掉的方向（决策记录）
 
