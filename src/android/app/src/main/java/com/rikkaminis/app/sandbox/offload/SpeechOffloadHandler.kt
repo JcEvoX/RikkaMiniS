@@ -228,10 +228,12 @@ class SpeechOffloadHandler(private val context: Context) : NativeOffloadHandler 
 
     /**
      * Resolve a `/var/minis/...`-style Linux path to a host File via
-     * [PRootKernel]'s guarded resolvers only. Per-session paths
-     * (attachments / offloads / workspace / browser) work as long as the
-     * owning session is the most-recent shell to boot — last-writer-wins
-     * per the kernel's documentation.
+     * [PRootKernel]'s guarded resolvers only. With a session in scope the path
+     * is pinned to that session's tree; without one it resolves through the
+     * global bind mounts. [audit3 F-08] The session-vs-global decision is
+     * [PRootKernel.resolvePathForSession]'s — a path the session resolver
+     * rejects (escape out of the session tree) stays rejected instead of being
+     * re-resolved globally.
      *
      * [fix/sweep1013-security] Fail-closed: no `File(trimmed)` fallback.
      * The previous `?: File(trimmed)` tail let an unresolvable absolute
@@ -244,8 +246,7 @@ class SpeechOffloadHandler(private val context: Context) : NativeOffloadHandler 
         val trimmed = source.trim()
         if (trimmed.isEmpty() || !trimmed.startsWith("/")) return null
         return try {
-            sessionId?.let { PRootKernel.resolveSessionHostPath(it, trimmed, context) }
-                ?: PRootKernel.resolveHostPath(trimmed)
+            PRootKernel.resolvePathForSession(sessionId, trimmed, context)
         } catch (e: Throwable) {
             AppLogger.warning(TAG, "resolveSourcePath('$trimmed') failed: ${e.message}")
             null

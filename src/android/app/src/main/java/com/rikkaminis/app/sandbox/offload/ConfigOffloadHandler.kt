@@ -356,15 +356,18 @@ class ConfigOffloadHandler(private val context: Context) : NativeOffloadHandler 
 
     /**
      * [T-android-minis-config-set-shell-escape] Read a file's text by its
-     * guest (Linux) path, resolving it to the host path through the rootfs /
-     * bind mounts. Same helper shape as ModelUseOffloadHandler.readLinuxPath —
-     * used by `set --file` so the value-json never transits the shell. Returns
-     * null when the path can't be resolved, doesn't exist, or read fails.
+     * guest (Linux) path, resolving it to the host path through the session
+     * (when [sessionId] is known) or the rootfs / bind mounts. Same helper
+     * shape as ModelUseOffloadHandler.readLinuxPath — used by `set --file` so
+     * the value-json never transits the shell. Returns null when the path can't
+     * be resolved, doesn't exist, or read fails.
+     * [audit3 F-08] The session-vs-global choice lives in
+     * [PRootKernel.resolvePathForSession]; a path the session resolver rejects
+     * is not re-resolved globally any more.
      */
     private fun readLinuxPath(linuxPath: String, sessionId: String?): String? {
-        val hostFile: File = sessionId?.let {
-            PRootKernel.resolveSessionHostPath(it, linuxPath, context)
-        } ?: PRootKernel.resolveHostPath(linuxPath) ?: return null
+        val hostFile: File = PRootKernel.resolvePathForSession(sessionId, linuxPath, context)
+            ?: return null
         if (!hostFile.exists() || !hostFile.isFile) return null
         return try { hostFile.readText() } catch (_: Throwable) { null }
     }

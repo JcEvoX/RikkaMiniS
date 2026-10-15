@@ -878,23 +878,24 @@ class BrowserUseManager(
             // minis://workspace/foo.html → /var/minis/workspace/foo.html, then
             // resolve to the host file. Per-session subdirs (workspace /
             // attachments / offloads / browser) resolve through
-            // [PRootKernel.resolveSessionHostPath] — pinned to THIS chat
+            // [PRootKernel.resolvePathForSession] — pinned to THIS chat
             // session's minis-sessions/<sid>/ tree (T178 pattern, same as
             // file_upload) instead of the global fallback that returns the
             // first same-named file across ALL sessions (cross-session
             // disclosure). Non-session paths (minis://attachments-shared/…,
             // minis://minis-global/…) fall through to the global resolver
-            // inside resolveSessionHostPath itself.
+            // inside resolveSessionHostPath itself. [audit3 F-08] A path the
+            // session resolver *rejects* stays rejected — resolvePathForSession
+            // never re-resolves it globally.
             val host = uri.host ?: return null
             val path = uri.path ?: ""
             val linuxPath = "/var/minis/$host$path"
-            val localFile = minisSessionId
-                ?.let { sid ->
-                    runCatching {
-                        PRootKernel.resolveSessionHostPath(sid, linuxPath, webView.context)
-                    }.getOrNull()
-                }
-                ?: PRootKernel.resolveHostPath(linuxPath)
+            // runCatching keeps the pre-existing exception safety, but its null
+            // is now the single answer acted on below: a session-scoped
+            // rejection must not fall back to the global resolver.
+            val localFile = runCatching {
+                PRootKernel.resolvePathForSession(minisSessionId, linuxPath, webView.context)
+            }.getOrNull()
             if (localFile == null || !localFile.exists() || !localFile.isFile) {
                 return android.webkit.WebResourceResponse("text/plain", "UTF-8", 404, "Not Found",
                     emptyMap(), "File not found: $host$path".byteInputStream())
@@ -2605,16 +2606,16 @@ class BrowserUseManager(
         // pattern, same as file_read/file_edit/read_image): the global
         // resolveHostPath fallback searches EVERY minis-sessions/<id>/ tree
         // and returns the first same-named hit — i.e. possibly another chat
-        // session's file. resolveSessionHostPath pins per-session subdirs to
-        // THIS session; non-session paths (/tmp/...) fall through to the
-        // global resolver inside it.
+        // session's file. [audit3 F-08] resolvePathForSession is the single
+        // entry point: with a session in scope the global resolver is never
+        // consulted (not even when the session resolver rejects the path);
+        // non-session paths (/tmp/...) still fall through to the global
+        // resolver inside resolveSessionHostPath itself.
         val context = webView.context
         val hostFiles = mutableListOf<File>()
         for (linuxPath in paths) {
             val host = runCatching {
-                input.sessionId
-                    ?.let { PRootKernel.resolveSessionHostPath(it, linuxPath, context) }
-                    ?: PRootKernel.resolveHostPath(linuxPath)
+                PRootKernel.resolvePathForSession(input.sessionId, linuxPath, context)
             }.getOrNull()
             if (host == null || !host.exists() || !host.isFile) {
                 return BrowserActionResult.error(
