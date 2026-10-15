@@ -4,8 +4,8 @@
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
 - 合并范围：2026-08-03 ～ 2026-10-15，共 74 天
-- 条目总数：1734（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：2262257 / 总行数：30916
+- 条目总数：1743（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：2276582 / 总行数：31071
 
 ---
 
@@ -30909,6 +30909,161 @@ Pattern-Key: sandbox-l2s-pack-symlink-broken
 **★ §97 全链闭合**：版本门（发现）→ 内容哈希门（15a1f1336）→ 行标签领养（5da7153）→ 端到端落地。backlog §97 已登记闭合。
 **装置复用**：`shared/work/bundled-adopt-1015/`（run.sh 单测 / mutate.py 变异负控 / syntax-diff.sh 语法差分 / Probe2.kt 载荷哈希探针）。
 **手法**：①验证载荷哈希别只看 manifest——用同一实现独立重算仓库侧哈希对拍；②行标签领养不动 updated_at 的设计在 UI 得到验证（4 days ago 保留）。
+
+<!-- 2026-10-15 01:05:21 -->
+## §98 文档同步收口 + 沙箱膨胀数据清理（2026-10-15）
+
+
+**文档同步**：dev-history 三件套重建（1734 条 → 24 saga，脱敏 3 遍 NONE）→ 分支 `docs/dev-history-sync-1015` → --no-ff 合入 main **`e5e733b`**（纯文本分支，无 CI 面不等 CI）→ 远端分支已删。孤儿条目 137→171（多为 sweep-1014 任务书/报告存根，正常噪声，未新开 saga）。
+
+**清理**（用户报 app 用户数据 ~14G；shared/work 5.16G/102k 文件为大头）：
+- **shared/work：5.16G → 302M**（省 ~4.9G）。删除：全部克隆 `.git`（PRoot `.l2s.*` 哨兵同 inode 一并消失）、build 产物、可从 GitHub 重克隆的 src/repo 工作树（rvfix-1014 的 7 份 RikkaMinis 工作树 + sweep1014-fix f1–f9/r* 树 + 15 个 review-* 工作树）、旧验证 APK/art.zip、sqlite-jdbc.jar、tar.gz 冗余归档。**保留**：jvm/装置、报告 .md/.diff、脚本。
+- **logs：204M → 77M**：删 10-12/10-13 的 main/modelservice/debug/memspike（验证轮已闭，结论在日报）；保留 10-14/10-15。
+- **未动**：/tmp（84M，tmpfs 自动收割）、mounts/笔记（用户数据）。
+- **盲区**：`minis-sessions/<sid>/`（host 侧 77+ 会话的 per-session workspace 副本，含历史会话克隆的仓库）是 14G 的疑似大头，**guest 侧不可达**（fastio 只翻译 /tmp、/var/minis/workspace、mounts）→ 清理只能 app 侧做（Settings → Storage）。
+- shizuku `du /data/data/com.rikkaminis.app` 顶层 Permission denied（老坑复发：shell uid 读 app 私有目录不行），app 数据构成只能近似。
+
+**手法**：①批量删 .git 用 `find -type d -name .git | xargs rm -rf`，`.l2s.*` 哨兵随 objects 一起消失；②PRoot 下重活分批（fastio du 循环 ~40ms/次，102k 文件 ~20s 可接受）。
+
+<!-- 2026-10-15 06:13:05 -->
+## §99 全仓审计第二道门核实 + 4 会话派发（2026-10-15）
+
+
+**输入**：用户丢来全仓审计报告（`shared-e8a7c3f5.md`，8 BUG + 5 ARCH + 6 PERF）令「检查核实」→ 核实后「工程量大的话用会话子代理安排出去」。
+
+**核实**（克隆 main @ `e5e733b`，逐条机械核对，报告 `/var/minis/shared/audit-1015/VERIFY-REPORT.md`）：
+- **成立 15 条**：BUG-01（P0：ChatSessionLifecycle:251-254 摘要只写 content，四 Provider 出口 contentParts 非空时全无视 msg.content，摘要 100% 丢失 + buildConversationTextForSummary:385-393 双拼）、BUG-02A/2B/2C/2D（备份恢复 importFromArchive:649 硬编码 FILE / 三字段蒸发 / preferredId clean-install 丢弃 / 升级分支漏 BUNDLED+frontmatter）、BUG-03×4（1975 熔断被 2013 retry continue 劫持 / 2026 无 removeAt / 空壳→连续 USER 400 / maxTurnsThisRun:353 未钳制）、BUG-05（snprintf 下溢 13 处 + SA_ONSTACK + raise）、BUG-06、BUG-07（广播直写 PTY 无 isBusy）、BUG-08①③、PERF-01（:925 每 chunk 全量 utf8Length）、PERF-04（IPC 双份 Base64）、ARCH-01/03/05。
+- **不成立 2**：BUG-04#1 被 F-223 推翻（writeSkillMd:1833 合并保留未知键）；PERF-05 **引用不存在的代码**（全仓无 levenshtein(a,b,maxDist)/findClosestSkillNames，仅 ToolJsonRepair:124）。
+- **过度声明**：BUG-02「破解 §97」（写入者未钉死，领养修复已落地 4950a334）。
+- **报告质量**：行号漂移（BUG-08/06）、目录名错（backup/ vs data/）、规模失真（称 601 文件/207,604 行，实际 973/269,510）。
+
+**派发**（4 会话，任务书 `/var/minis/shared/audit-1015/fix-tasks/FIX-{A,B,C,D}.md`，全部含验证要求 + 停在分支不合并 + 环境坑段）：
+- FIX-A 上下文 `***UUID***`（分支 fix/audit-1015-context）
+- FIX-B 技能备份 `***UUID***`（fix/audit-1015-skillbackup）
+- FIX-C 循环沙盒 `***UUID***`（fix/audit-1015-loop-sandbox）
+- FIX-D 原生杂项 `***UUID***`（fix/audit-1015-native-misc）
+100s 回读四份全部送达且已开工。P2/存疑/驳回项已登记 backlog §99。
+
+**手法**：①审计核实 = 克隆当前 main 逐条对行号与逻辑链，别只读报告；②「引用不存在的代码」用全仓 find/grep 反查（PERF-05 式幻觉）；③`minis-sessions-cli send --async` 输出 session_id 会被 grep/tail 吃掉，用 `list --limit 8` 补查 id。
+
+<!-- 2026-10-15 06:33:38 -->
+## FIX-B 完成：技能/备份恢复修复（fix/audit-1015-skillbackup @ 6645cce，CI #2099 绿，停在分支未合并）
+
+
+**任务**：`shared/audit-1015/fix-tasks/FIX-B.md`；报告 `shared/audit-1015/fix-reports/FIX-B.md`；工作树 `shared/work/fix-b-1015/repo`。
+
+**修复**（5 文件 +358/−6）：BUG-02A importFromArchive 增 source/sourceURL 可选参数 + ConfigBackup archive 分支透传（防恢复篡改 importSource 为 file、URL 技能丢在线更新）；BUG-02B 新增 restoreUsageMetadata（只应用 >0 字段，老备份零值不动）+ 恢复循环调用；BUG-02C preferredId 放宽为「非空+合法目录名」（备份恢复=受信来源，存在性只决定 replace/add）；BUG-02D 升级分支补 frontmatter（importSource 刻意不动=版本门语义）；BUG-04 #2/#3 编辑器补 preferredId=skillId / version=parsed.version。决策逻辑抽纯 JVM `SkillRestorePolicy.kt`。
+
+**验证**：JVM 10/10 绿 + 变异负控 4/4 精确落位 + scan 21/21 + CI #2099 success @ 6645cce（job 日志 10 条 PASSED 逐条核过，防假绿）。
+
+**★ 装置教训（可复用）**：①**变异负控的陈旧编译污染**——非重编译变异轮拿上一轮 out 类文件跑测试，本轮变异没生效也会红（伪影）；修法=每轮重编译纯净被测文件再跑，重编译不做可选项。②grep 类接线测试的变异必须**删字符串**，`if (false) call(...)` 前缀字符串仍在、断言照样命中（B2 第一版逃逸根因）。③ConfigBackup archive/body 两分支有同名同缩进的 ImportSource.from+sourceURL 两行，变异锚点带 `skillRepo.importFromArchive(` 前缀消歧。④`gh_sync.sh gh-actions-dispatch` 必须带 `--workflow`。
+
+<!-- 2026-10-15 07:04:26 -->
+## FIX-A 完成：上下文链路修复（fix/audit-1015-context @ 24fa628，CI #2101 绿，停在分支未合并）
+
+
+**任务**：`/var/minis/shared/audit-1015/fix-tasks/FIX-A.md`（核实报告 VERIFY-REPORT.md 先读）。基线 main `e5e733b`，分支 `fix/audit-1015-context`，3 文件 +115/−33 + 测试 +264。
+
+**修复**：
+- **BUG-01（P0）摘要 100% 静默丢失**：注入点抽纯函数 `ChatCompactionLogic.injectSummaryIntoPostAnchor`（ChatSessionLifecycle 只留接线），**content 与 contentParts 双注入**——有 Text part 则前置拼接，无则头部插入 `AgentContentPart.Text(summary)`；else 分支新建 standalone summary turn 也带 Text part（否则同样被 Provider 丢弃）。
+- **BUG-01B（P0 同族）buildConversationTextForSummary 输入翻倍**：`contentParts.any { it is Text }` 为 true 时跳过顶层 content 拼接，仅无 Text part 时回退读 content。
+- **ARCH-03（P2 同批）placeholders 后置**：改为 `placeholders + existingParts`（Anthropic 要求 tool_result 先于 text）；纯 content USER 邻居先提升为尾部 Text part 并清空 content（防序列化丢弃 content）。
+
+**核实动作**：先读 OpenAI:2111-2130（按类型提取 toolResults/textParts 发 role:"tool"，顺序无关 = 重排安全）与 Anthropic:709-740（按 parts 顺序序列化 = 顺序敏感），任务要求的确认项达成。
+
+**验证**：①沙箱 JVM 10/10 绿（探针 `shared/work/fix-a-1015/probe/`，python 抽函数 verbatim 带 package+import；junit+hamcrest+json-20240303+kotlinx-serialization-core 全在 /opt/jvm-libs，**测试编译也要 junit 进 -cp**）；②变异负控 3/3 精确落位（A 注入只改 content→3 红 / B 恢复双拼→2 红 / C placeholders 后置→2 红），恢复后复跑 10/10 绿；③scan 21/21，scan_debt 7 标记/0 no-trigger；④CI run **38649670213 success @ 24fa628bb**（与本地 HEAD 逐字符一致），job 日志 Audit1015ContextFixTest 10/10 PASSED + SanitizeAgentHistoryUserNeighborTest 5/5 PASSED（防假绿核过）+ BUILD SUCCESSFUL。
+
+**★ CI 第一轮红（有价值教训）**：两个**既有测试**（SanitizeAgentHistoryUserNeighborTest）钉的是旧行为——`msgs[2].content == "原文"`（content 原样保留）。但 ARCH-03 修的正是这个面：content 留在顶层会被序列化丢弃。更新为新语义（content 提升 Text part + 顶层清空）后 CI 绿。**规矩：修序列化语义时，先 grep 测试目录里钉同一行为的既有测试**（`grep -rln <函数名> src/**/test/`），别等 CI 红。
+
+**★ 探针坑（复发预防）**：①变异 C 第一轮假红——探针目录的 SanitizeAgentHistory.kt 是整文件 cp 的，变异后忘了重新 cp 进 probe，红的是 B 残留的 CompactionProbe；**变异探针每次跑前必须同步全部被测文件**。②sed 改探针文件行号插入 import 易插进注释/删错行，用 python 重建更稳。③提取范围用行号切片时，切点要落在函数结束 `}` 与下一个 `/**` 之间，切进 KDoc 中间报 Unclosed comment。
+
+**装置**：`shared/work/fix-a-1015/`（repo 工作树 / probe/ 探针 / ci-job.log）。
+
+<!-- 2026-10-15 07:20:51 -->
+## audit-1015 FIX-D 会话（native/jieba/WebApp/IPC 修复完成）
+
+
+- 分支 `fix/audit-1015-native-misc`（333d7cb + 9815cf4），CI run 38652238091 绿，按任务书停在分支未合并。
+- 报告：`/var/minis/shared/work/audit1015-fix-d/FIX-D-REPORT.md`；登记项：BUG-08③ 拦截器放行外网=设计决策未修（全仓无离线声明）；snprintf 累加点实测 12（任务书写 13）。
+
+### 可复用：沙箱内验证 Kotlin/Android 代码的装置模式
+- **JVM 独立验证**（无 gradle）：取 buildRequestJson 这类纯函数的 verbatim 行切片包进本地 object + verbatim 测试文件 + 最小 android stub（Context/Intent/Log）+ room entity stub（对齐真实字段名），用 **kotlin-compiler-embeddable 2.1.0**（`/root/.gradle/caches/modules-2/.../kotlin-compiler-embeddable-2.1.0.jar`，编译器 classpath 还需 kstdlib+coroutines+serialization+hamcrest+trove4j+annotations）编译，JUnit 跑。沙箱 /opt/kotlinc 是 2.0.21，会报项目代码的推断错误（项目用 2.1.0），别用。
+- **C 函数 host 验证**：显式签名行锚点 + 花括号配对的 verbatim 抽取器（`extract.py`），负控用「金丝雀字节守卫 + 解析式算术证明」（Alpine 无 libasan，`-fsanitize=address` 链接失败）。
+- **变异负控**：对抽取/切片产物打点变异（去折叠/去钳制/去守卫），断言恰好覆盖用例变红。
+- gh CI dispatch：`sh gh_sync.sh gh-actions-dispatch --repo ... --workflow build-apk.yml --ref <branch>`；build-apk 只认 main 触发，分支必须手动 dispatch；等待用 `gh run view <id> --json status,conclusion` 轮询。
+
+<!-- 2026-10-15 07:36:47 -->
+## FIX-C 完成：AgentLoop 状态机 + 沙盒 Shell（audit-1015，分支 fix/audit-1015-loop-sandbox @ 3c5f916b，CI #2104 绿，停在分支未合并）
+
+
+**用户令**：读 `/var/minis/shared/audit-1015/fix-tasks/FIX-C.md` 并立刻执行。基线 main `e5e733b3`（核对一致）。
+
+**修复**（6 条 / 7 文件 +765/−22，2 commits：`3304ee4` 主源码 + `3c5f916` 测试入库）：
+- **3A 熔断被 retry 劫持**：新纯函数 `shouldContinueAfterDeterministicFuse(terminalErrorSurfaced, hits, contextExhausted, maxHits)` = `!terminalErrorSurfaced && shouldRetryEmptyLengthWall(...)`，:2013 改调它。核查过 `terminalErrorSurfaced=true` 的 5 个 setter，**只有 deterministic-empty 分支是 fall-through 到该门的**（其余 break/continue）→ 最小改动成立。
+- **3B 重试残留空 ASSISTANT**：`continue` 前 `dropTrailingBlankAssistantShell`（对照 :2489 先例）。
+- **3C 空壳→连续 USER→400**：两条 nudge 路径 bridge 前先 drop。判据**单源** `isBlankAssistantShell` = role==ASSISTANT && content.isEmpty() && contentParts.isEmpty() && reasoningContent.isNullOrEmpty()（三字段精确；带 reasoning 不删，DeepSeek V4 需回传）。
+- **3D 轮数横幅**：`maxTurnsThisRun` 从 `prefs.maxTurns()`（裸 256）改 `observeBudget.maxTurns`（已 min(user, ceiling)）。**循环边界一致性核查**：`for (0 until N)` 恰消耗 N 次 turn → 两条停机路径同一数字，无 ceiling 时逐字不变。
+- **BUG-07 广播直写 PTY**：新纯类 `PendingEnvironmentUpdate`（@Synchronized，per-key last-write-wins，null=unset）+ `internalBuildEnvironmentScript` 单源。`applyEnvironment` 在 pendingCallback!=null 时只暂存；`executeCommand` 在 writerLock 内写命令体前一次性 flush。per-command 注入路径（executeCommand 前调用）不受影响。
+- **PERF-01 O(N²)**：`utf8Length(CharSequence)` + 纯类 `IncrementalUtf8Budget { maxBytesProvider }`（只累加**实际追加**字节）。FastioTar.kt 的同名私有 utf8Length 不相干未动。
+
+**验证**：沙箱 JVM 138/138 绿（29 新 + 109 既有家族）→ 变异负控 3/3 精确落位（A 去 3A 守卫 3 红 / B 漏 reasoning 2 红 / C 增量不按实际追加 3 红）+ 语法差分 0 语法错误（5 文件错误种类集合对比）+ scan.sh 21/21 + CI **run #2104 success @ 3c5f916b**（逐字符一致；日志逐条列出 29 例新测试 PASSED；整套件 PASSED 4110 / FAILED 0；步骤 18 Build APK 给 Android 真编译验证面）。
+
+**★ 三个真教训（可复用）**：
+1. **变异前必须 commit 本体（复发！）**：首轮未提交就为变异跑 `git checkout --` → 把 3A/3C 两处本体改动一起回滚（`git status` 只剩 3 文件才发现）。**纪律：改完先 commit，再变异，再 `git checkout -- <变异文件>`**。
+2. **装置里的测试不是交付物**——首轮 CI 已绿但测试只在沙箱 `jvm/src/`，仓库零覆盖。发现后入库 `src/android/app/src/test/` + 重 dispatch。**判据：`ls repo/src/android/app/src/test/...` 能看到才算交付。**
+3. **变异 0 红 = 测试没覆盖生产代码，不是实现没问题**：变异 C 首跑 0 红，因测试自己复刻了累加逻辑。修法 = 把累加器抽成纯类 `IncrementalUtf8Budget` 让测试驱动**生产对象**，变异才落红。**负控 0 红时先问"测的是我改的那行吗"。**
+
+**装置**：`/var/minis/shared/work/audit-fix-c-1015/`（`jvm/extract_pure.py` + `run.sh` + `syntax-diff.sh`）。
+**报告**：`/var/minis/shared/audit-1015/fix-reports/FIX-C.md`。
+**沙箱坑（本次踩到）**：①拼接多 .kt 成一个文件 → 多 package 声明语法错（必须一 file 一 package）；②`LLMMessage` 第 3 参是 `imageParts`，intent contentParts 必须具名；③runtime classpath 必须含 `/opt/kotlinc/lib/kotlin-stdlib.jar`（否则 `NoClassDefFoundError: kotlin/enums/EnumEntriesKt`）+ `kotlinx-serialization-core-jvm` + `json-20240303`；④kotlinc 报错用 `grep -v '^warning:'` 后仍会 Broken pipe 噪声，改 `sed`/`tail`。
+
+<!-- 2026-10-15 10:42:28 -->
+## audit-1015 四分支合并收口（2026-10-15）
+
+
+**用户令**：「检查云端上的4个分支，有问题就修，没问题就合并」+ 中途两次纠偏：「你是不是偏移最初目标了」「你这里承担的是合并前的检查环节」。
+
+**纠偏教训（重要）**：①合并根本不需要本地 clone——GitHub API `POST /repos/{...}/merges` 服务端直接合并（既定路径），我却在本地 pack 损坏的诊断里打转；②合并前检查 ≠ 只读 diff 自洽，必须拿 findings 清单逐条对账（每个审计发现是否被对应分支修掉、有无漏项）+ 读新测试文件是否钉住生产行为。本次合并先于部分补查——顺序错了，但补查全部成立，若有漏项应开新分支补救而非回滚。
+
+**合并**：四分支（fix/audit-1015-context / -skillbackup / -loop-sandbox / -native-misc）全部 HTTP 201 顺序合入 main，无冲突，main `0eba94b5`（链 e5e733b → 64e4d65 → 79cff21 → 33a7f3c → 0eba94b5）。远端分支 DELETE 204。
+
+**补查结果（全部成立）**：
+- findings 对账 15/15 全覆盖无漏项（VERIFY-REPORT.md 清单 vs 四分支）；BUG-04#1/PERF-05 不成立项正确未修；**一处偏差**：BUG-08② 派发决策是「存疑/登记不修」，FIX-D 修了（remember 加 key，zero-risk hardening，无风险）。
+- 六个新测试文件全部驱动生产符号（injectSummaryIntoPostAnchor/resolveImportId/shouldContinueAfterDeterministicFuse/PendingEnvironmentUpdate/IncrementalUtf8Budget/image_parts 守卫）。
+- main CI run **2108 success @ 0eba94b5**（head_sha 逐字符一致）：并集树 4134 PASSED / 0 FAILED，六个新测试类逐条 PASSED（10+10+13+10+6+16=65 例），BUILD SUCCESSFUL，step 8/9 native 重建 + step 10 JNI 符号验证（native-misc 的 cpp 改动有真编译验证面）。
+
+**★ 假阴性教训（正则少空格，复发 2 轮）**：CI 日志测试行格式是 `ClassName > test PASSED`（`>` 前有空格），我的 grep 模式写成 `Test> \w+`（少空格）→ 六个新测试类全部 0 命中 → 差点误报「新测试没被收集」。**判读前先抽一条已知命中的样本验证正则本身**，再下「日志里没有」的结论。
+
+<!-- 2026-10-15 11:07:28 -->
+## 上下文预算缺口修复（fix/prewindow-budget-1015）
+
+
+**现场**：2026-10-15 T321 会话（16c39966）——同一份 4.9MB agent 历史，deepseek 中转报 191,856 tokens、GLM 直连报 920,577（4.8×）。本地账本持中转口径 → dynamicMaxTokens 顶格放 128K 输出 → 超 1M 窗口 1 个 token 必然 400，换模型/重试死循环。GLM 的数字才是诚实记账（字节数反推 5.2 B/token vs 中转 25.7 B/token）。
+
+**修复**（repo：verify-merge-1015，分支 fix/prewindow-budget-1015，commit 8379971f）：
+- P0 预检闸 `preflightContextBudget`（ContextReading.kt）：每 turn 请求组装后、发出前，本地估算+maxTokens+4K margin ≤ window 三档裁决（PASS/SHRINK_OUTPUT/NEEDS_COMPACTION），引擎接在 AgentLoopEngine turn 循环。
+- P1 `ContextEstimator`（结构感知估算：content/contentParts 按 OpenAIProvider 序列化互斥、工具 schema、图片 base64 上界、reasoning 回显、CJK 1字1token）+ `CalibrationStore`（纯核，JVM 可测）+ `ContextCalibration`（Android 壳）。校准 key=providerType|baseUrl|model——baseUrl 是刻意维度（中转≠直连）。带内（≤3×）样本学习系统性偏差，带外拒收，样本<3 系数保守=1.0。
+- 反向漏洞：AgentLoopState.lastContextTokensSourceKey 盖章读数来源，换 provider 后读数视为 0（必须在 dynamicMaxTokens 之前清零）。
+- 400-teacher：context-overflow 400 正文里的 "N input tokens" 反哺校准。
+- 测试 PrewindowBudgetTest 17 例（T321 现场做成回归），34/34 绿。
+
+**经验**：本地预算链不能单方信任 provider usage 口供；校准观察必须喂未乘系数的 rawEstimate（喂系数化的会闭环坍缩到 1.0）；usage 观察每流一次（最终帧）不是每 chunk 一次。CI 无本地 gradle，JVM 验证用 /var/minis/shared/work/verify-merge-1015/probe 的 kotlinc 手工桩编译法。P2（面板标注校准状态）未做，刻意延后。
+
+<!-- 2026-10-15 12:02:17 -->
+## 云端分支核查+修复+合并：fix/prewindow-budget-1015 → main 55344efa7（2026-10-15）
+
+
+**用户令**：「检查云端上的那个分支」→ 报告缺口 →「1」（先修再合）→「构建完了」。
+
+**核查发现（第二类缺口，分支原文逐行核对）**：预检在 `:643` 捕获 `preflightMessages`（effectiveAgentHistory 的投影快照）**之后**，`NEEDS_COMPACTION` 分支才跑 offload→compact→trim 管线，流调用 `:799` 发的是压缩前快照。既有注释（fix/diff-audit-0904-F3）钉死语义：**Compact 不缩 agentHistory 只写 marker（投影在请求时发生）、trim 直接砍 agentHistory**——两者都不触碰已捕获的独立 List 实例 → 本 turn 仍发全量历史+1024 输出 = 必然 400，恰是该分支声称要替代的死法。同族：`rawEstimate` 是压缩前算的，400-teacher 与 usage 校准回填都拿它做 localEstimate，消息重捕后不同步 → 观测比值系统性失真。另外 `99d7747e3`（摘要只注入首个 Text part）改了 FIX-A 已合入 main 的行为但无测试。
+
+**修复（ed00d285，2 文件 +69/−3）**：`preflightMessages`/`rawEstimate`/`preflightEstimate` 改 var；NEEDS_COMPACTION 分支管线跑完后重捕消息+重算两个估算（对应实际发出的压缩后请求）；SHRINK_OUTPUT/PASS 路径逐字不变。补测试 `multi Text-part target takes summary on FIRST part only`（Audit1015ContextFixTest）。
+
+**验证**：JVM 探针 4/4 绿（python 逐字提取 ChatCompactionLogic:435-500 + 最小 LLMMessage/AgentContentPart stub）+ 变异负控精确落红（恢复旧 map() 行为 → multi-part 测试 1/4 红）+ 括号配平对基线核对（baseline 与 worktree 同为 +1 = 既有字符串字面量）+ CI **#2110 success @ ed00d285**（新测试 PASSED、Audit1015ContextFixTest 22 例、BUILD SUCCESSFUL ×2）。合并 main **`55344efa7`**（behind 0 = 完全包含），远端分支 DELETE 204。
+
+**★ 流程坑（新，重要）：gh_ci_wait 会把 scan-gate run 误认成 build-apk run**。push 分支后自动触发的是 Scan Gate（PR 触发、~5min 只跑扫描）；gh_ci_wait 按 head_sha 匹配到了 scan-gate 的 run 就判 success——"绿"的是扫描门，Kotlin 编译+单测根本没跑。**判据**：run_number 异常小（build-apk 是 21xx 序列，scan-gate 是 1x）+ API 按 workflow path 过滤核对。**标准动作**：分支 push 后必须显式 `gh-actions-dispatch build-apk.yml`，轮询用 `GET /actions/workflows/build-apk.yml/runs?branch=` 按 workflow 过滤，别信 head_sha 匹配就当 build 绿。
+
+**修复门纪律应用**：NEEDS_COMPACTION 触发面窄（输入本身就装不下），但正是该分支的设计场景且注释承诺落空——属于"修复不完备"而非 latent，修在半径内（同函数同分支）；preflightEstimate 重算属同族 capture-then-mutate 一并闭（顺路成本≈0）。
 
 ---
 
