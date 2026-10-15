@@ -21,6 +21,7 @@ import com.rikkaminis.app.data.repository.BackgroundSettingsRepository
 import com.rikkaminis.app.data.repository.ChatRepository
 import com.rikkaminis.app.ui.chat.KatexWebViewPool
 import com.rikkaminis.app.ui.chat.clearMarkdownParseCachesForMemoryPressure
+import com.rikkaminis.app.ui.markdown.KaTeXRendererCache
 import com.rikkaminis.app.data.repository.EnvVarRepository
 import com.rikkaminis.app.data.MountedFoldersStore
 import com.rikkaminis.app.data.repository.MemoryRepository
@@ -704,6 +705,10 @@ class MinisApp : Application(), ImageLoaderFactory {
             // KaTeX 缓存），GC 仍留给无工具在跑的时机。
             runCatching { clearMarkdownParseCachesForMemoryPressure() }
             runCatching { KatexWebViewPool.clearRenderCacheForMemoryPressure() }
+            // [ARCH-03] 两个「KaTeX 缓存」是不同对象、同名前缀：上面只回收
+            // pool 的渲染结果缓存，64 MB 的 KaTeXRendererCache（display 模式
+            // 位图）此前从不在任何回收路径里。它是纯派生状态，丢了下次重渲染。
+            runCatching { KaTeXRendererCache.clearForMemoryPressure() }
         }
 
         // [fix/memory-hardening-governor] 采样器只观测，这里给它「动手」的能力。
@@ -712,6 +717,7 @@ class MinisApp : Application(), ImageLoaderFactory {
         com.rikkaminis.app.service.AppMemoryGovernor.dropCachesHook = {
             runCatching { clearMarkdownParseCachesForMemoryPressure() }
             runCatching { KatexWebViewPool.clearRenderCacheForMemoryPressure() }
+            runCatching { KaTeXRendererCache.clearForMemoryPressure() } // [ARCH-03] 同上，两个缓存都要丢
             runCatching { sharedBrowserTabPool.evictIdleTabs() }
             runCatching { ExecutionCoordinator.recycleIdleShells() }
         }
@@ -1300,9 +1306,15 @@ class MinisApp : Application(), ImageLoaderFactory {
                 // acceptable when the alternative is being OOM-killed mid-voice-
                 // dictation.
                 runCatching { clearMarkdownParseCachesForMemoryPressure() }
-                // [fix/audit-b22 / T2-L2] The KaTeX render cache holds up to
-                // 64 MB of bitmaps and was not part of this reclaim pass.
+                // [fix/audit-b22 / T2-L2] The KaTeX render caches hold up to
+                // 64 MB of bitmaps each and were not part of this reclaim pass.
+                // [ARCH-03] There are TWO of them and they are different
+                // objects: `KatexWebViewPool`'s result cache (streaming chat)
+                // and `KaTeXRendererCache` (display-mode formulas). Only the
+                // first one used to be cleared here — the name prefix made the
+                // second look covered. Drop both; the next render re-renders.
                 runCatching { KatexWebViewPool.clearRenderCacheForMemoryPressure() }
+                runCatching { KaTeXRendererCache.clearForMemoryPressure() }
                 System.gc()
             }
         }.onFailure {

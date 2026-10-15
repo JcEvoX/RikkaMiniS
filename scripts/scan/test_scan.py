@@ -1734,6 +1734,75 @@ def test_budget_stop_break():
     shutil.rmtree(root)
 
 
+def test_katex_bridge_arity():
+    """The asset HTML and its Kotlin hosts must agree on JS-bridge arity."""
+    print("━━━ katex_bridge_arity_check ━━━")
+
+    def fixture(kotlin_params, html_args="w, h, e, t"):
+        return {
+            "src/android/app/src/main/assets/katex/katex-render.html": (
+                "<script>\n"
+                "  function renderMath(latex, displayMode, fontSize, isDark, token) {\n"
+                "    AndroidBridge.onRendered(%s);\n"
+                "    // prose apostrophes must not break the scanner: the pool's cache\n"
+                "  }\n"
+                "</script>\n" % html_args
+            ),
+            "src/android/app/src/main/java/com/rikkaminis/app/ui/markdown/KaTeXView.kt": (
+                "package com.rikkaminis.app.ui.markdown\n"
+                "class V {\n"
+                "    private fun f(wv: Any) {\n"
+                "        wv.addJavascriptInterface(object {\n"
+                "            @JavascriptInterface\n"
+                "            fun onRendered(%s) { }\n"
+                "        }, \"AndroidBridge\")\n"
+                "    }\n"
+                "}\n" % kotlin_params
+            ),
+        }
+
+    root = make_tree(fixture("width: Int, height: Int, error: String, token: Long"))
+    code, out = run_scanner("katex_bridge_arity_check.py", root)
+    check("4-arg call site against a 4-arg declaration passes (exit 0)", code == 0, f"exit={code}\n{out}")
+    check("table reports the call site arity", "onRendered(4 args)" in out, out)
+    check("table reports the host declaration", "[OK]" in out and "[4]" in out, out)
+    shutil.rmtree(root)
+
+    # The exact audit3 BUG-05 shape: the sibling host was updated, this one was not.
+    root = make_tree(fixture("width: Int, height: Int, error: String"))
+    code, out = run_scanner("katex_bridge_arity_check.py", root)
+    check("3-arg declaration under a 4-arg call site is caught (exit 1)", code == 1, f"exit={code}\n{out}")
+    check("finding names the host file and the declared arity", "KaTeXView.kt" in out and "[3]" in out, out)
+    shutil.rmtree(root)
+
+    files = fixture("width: Int, height: Int, error: String")
+    files["src/android/app/src/main/java/com/rikkaminis/app/ui/chat/Pool.kt"] = (
+        "package com.rikkaminis.app.ui.chat\n"
+        "class P {\n"
+        "    fun f(wv: Any) {\n"
+        "        wv.addJavascriptInterface(JsBridge { w, h, e, t -> }, \"AndroidBridge\")\n"
+        "    }\n"
+        "    private class JsBridge(private val cb: (Int, Int, String, Long) -> Unit) {\n"
+        "        @JavascriptInterface\n"
+        "        fun onRendered(width: Int, height: Int, error: String, token: Long) { }\n"
+        "    }\n"
+        "}\n"
+    )
+    root = make_tree(files)
+    code, out = run_scanner("katex_bridge_arity_check.py", root)
+    check("a matching sibling host does not mask a stale one (exit 1)", code == 1, f"exit={code}\n{out}")
+    check("both hosts are checked per file", "Pool.kt" in out and "KaTeXView.kt" in out, out)
+    shutil.rmtree(root)
+
+    rot = fixture("width: Int, height: Int, error: String, token: Long)")
+    rot["src/android/app/src/main/assets/katex/katex-render.html"] = "<script>var x = 1;</script>\n"
+    root = make_tree(rot)
+    code, out = run_scanner("katex_bridge_arity_check.py", root)
+    check("a page with no call site trips the rot guard (exit 1)", code == 1, f"exit={code}\n{out}")
+    check("rot guard says the contract is unchecked", "ROT" in out, out)
+    shutil.rmtree(root)
+
+
 def test_real_repo():
     print("━━━ real repo tree (must be clean) ━━━")
     for script in (
@@ -1753,6 +1822,7 @@ def test_real_repo():
         "claim_release_guard.py",
         "loop_counter_reset_guard.py",
         "budget_stop_break_guard.py",
+        "katex_bridge_arity_check.py",
     ):
         code, out = run_scanner(script, REPO_ROOT)
         check(f"{script} on real repo exits 0", code == 0, f"exit={code}\n{out[:2000]}")
@@ -1963,6 +2033,7 @@ def main():
     test_claim_release()
     test_loop_counter_reset()
     test_budget_stop_break()
+    test_katex_bridge_arity()
     test_real_repo()
     print("")
     print(f"{'❌ FAILURES: ' + str(FAIL) if FAIL else '✅ ALL ' + str(PASS) + ' CASES PASS'}")
