@@ -7,7 +7,6 @@ import com.rikkaminis.app.data.model.LLMMessage
 import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.debug.LLMRequestLog
-import com.rikkaminis.app.provider.ProviderFactory
 import com.rikkaminis.app.provider.safeOptString
 import com.rikkaminis.app.sandbox.NativeOffloadHandler
 import com.rikkaminis.app.sandbox.NativeOffloadRequest
@@ -291,24 +290,42 @@ class ModelUseOffloadHandler(
         val maxTokens = args.get("max-tokens")?.toIntOrNull() ?: 4096
         val temperature = args.get("temperature")?.toDoubleOrNull()
 
-        // Build provider + call — runBlocking is acceptable here: this handler
-        // is invoked off the main thread by the offload server.
-        val apiKey = providerRepository.loadApiKey(entry.providerInstanceId)
-            ?: return NativeOffloadResult(
+        // [fix/da1015-modeluse-proc] No provider is built in this process any
+        // more. `:app` never sends the request (the CLI dispatches to
+        // :modelservice, which builds its own provider), so
+        // `ProviderFactory.create` here only ever produced two side effects for
+        // a request somebody else makes:
+        //   • a [com.rikkaminis.app.data.KeyRoulette] draw — LRU state plus a
+        //     non-atomic rewrite of `key_roulette.json`, i.e. a SECOND draw
+        //     milliseconds before the worker's own, competing with it on the
+        //     same file; and
+        //   • a [com.rikkaminis.app.network.ConnectionWarmer] TLS/DNS warm-up.
+        // The object was then used for exactly one thing — the type gate below —
+        // so the gate is now answered from the instance's provider type, which
+        // is the same input ProviderFactory uses to pick the class
+        // (ModelUseProtocol.isOpenAiCompatibleProviderType).
+        //
+        // Key PRESENCE is still pre-checked here: it preserves the CLI's own
+        // fail-fast message and exit code instead of spending a dispatch round
+        // trip to learn the same thing. The value itself is not read or passed —
+        // the worker re-reads it from the same encrypted prefs.
+        if (providerRepository.loadApiKey(entry.providerInstanceId) == null) {
+            return NativeOffloadResult(
                 2,
                 JSONObject().put("error", "missing_api_key")
                     .put("message", "No API key configured for provider ${entry.model.provider}.")
                     .toString() + "\n",
             )
+        }
         val instance = providerRepository.instance(entry.providerInstanceId)
             ?: return NativeOffloadResult(2, "minis-model-use run: provider instance not found\n")
-        val provider = ProviderFactory.create(instance, apiKey, entry.model, context)
+        val openAiCompatible = ModelUseProtocol.isOpenAiCompatibleProviderType(instance.providerType)
 
         // [GH#67] input_audio serialization is implemented for the OpenAI
         // chat/completions + responses paths only. Other provider types would
         // drop the audio at their own serialization layer — fail loudly here
         // instead. Mirrors iOS ModelUseOffloadBridge.
-        if (hasAudioInput && provider !is com.rikkaminis.app.provider.openai.OpenAIProvider) {
+        if (hasAudioInput && !openAiCompatible) {
             return NativeOffloadResult(
                 2,
                 JSONObject().put("error", "audio_input_unsupported_provider")
@@ -336,7 +353,7 @@ class ModelUseOffloadHandler(
         // it, and shapes the reply.
         val ptSpec = ModelUseProtocol.parsePassthroughEnvelope(inputText)
         if (ptSpec.active) {
-            if (provider !is com.rikkaminis.app.provider.openai.OpenAIProvider) {
+            if (!openAiCompatible) {
                 return NativeOffloadResult(
                     2,
                     JSONObject().put("error", "passthrough_unsupported")
@@ -389,26 +406,31 @@ class ModelUseOffloadHandler(
         // OpenAI top-level semantics. Mirrors iOS standard-mode promotion.
         // [T-model-use-passthrough-warnings] `callWarnings` collects every
         // provided-but-ignored/downgraded field (starting with envelope-
-        // lookalike warnings from the passthrough parser); `appliedExtras`
-        // confirms which passthrough capabilities actually took effect. Both
-        // are attached to the final result JSON. Mirrors iOS performRun.
+        // lookalike warnings from the passthrough parser); the worker's
+        // `applied_extras` confirms which passthrough capabilities actually took
+        // effect. Both are attached to the final result JSON. Mirrors iOS
+        // performRun.
         val callWarnings = ptSpec.warnings.toMutableList()
-        val appliedExtras = JSONObject()
-        (provider as? com.rikkaminis.app.provider.openai.OpenAIProvider)?.let { openAI ->
+        // [fix/da1015-modeluse-proc] The `extra_body` / `extra_headers` /
+        // `endpoint` envelope is INTERPRETED by `:modelservice`, which re-parses
+        // this same `input_json` with the same shared parsers and stamps the
+        // values onto the provider IT builds. Parsing it here as well only ever
+        // assigned those values to the (now gone) in-process provider object —
+        // assignments that reached no request, since this process no longer
+        // sends one.
+        //
+        // The parsing is kept for what it still uniquely provides: the
+        // CALLER-FACING WARNINGS. `extra_headers` present but not a JSON object
+        // is the case that proves it — the worker's copy of that parser returns
+        // silently for it, so without these lines that input error is invisible
+        // to the user (neither JSON body nor stderr mentions it).
+        if (openAiCompatible) {
             val chatExtra = parseChatExtraBody(inputText, callWarnings)
             if (chatExtra.isNotEmpty()) {
-                openAI.chatExtraBody = chatExtra
-                appliedExtras.put("extra_body_keys", JSONArray(chatExtra.keys.sorted()))
                 Log.i(TAG, "[ModelUseRoute] CHAT-PASSTHROUGH extra_body keys=[${chatExtra.keys.sorted().joinToString(",")}]")
             }
-            val chatHdrs = parseExtraHeaders(inputText, callWarnings)
-            if (chatHdrs.isNotEmpty()) {
-                openAI.chatExtraHeaders = chatHdrs
-                appliedExtras.put("extra_headers_keys", JSONArray(chatHdrs.keys.sorted()))
-            }
+            parseExtraHeaders(inputText, callWarnings)
             parseCustomEndpointPath(inputText)?.let { customPath ->
-                openAI.absoluteEndpointOverride = customPath
-                appliedExtras.put("custom_endpoint", customPath)
                 Log.i(TAG, "[ModelUseRoute] CUSTOM-ENDPOINT absolute path=$customPath")
             }
         }
@@ -499,7 +521,13 @@ class ModelUseOffloadHandler(
                     outputPath = outputPath,
                     outputExt = outputExt,
                     request = request,
-                    callWarnings = remoteWarnings,
+                    // [fix/da1015-modeluse-proc] MERGE, not replace. This line
+                    // used to be `callWarnings = remoteWarnings`, which threw
+                    // away every warning collected above — i.e. the ones only
+                    // this process can produce. Local first, then the worker's,
+                    // de-duplicated on first occurrence (both processes run the
+                    // same extra_body parser, so the overlap collapses).
+                    callWarnings = ModelUseProtocol.mergeCallWarnings(callWarnings, remoteWarnings),
                     appliedExtras = remoteExtras,
                 )
             }

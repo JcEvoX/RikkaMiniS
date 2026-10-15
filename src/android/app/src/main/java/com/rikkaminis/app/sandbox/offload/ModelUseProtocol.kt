@@ -94,6 +94,64 @@ internal object ModelUseProtocol {
         return out
     }
 
+    // ── provider shape (which implementation a type gets) ────────────────────
+    //
+    // [fix/da1015-modeluse-proc] `:app` used to answer "is this an
+    // OpenAI-compatible instance?" by BUILDING a provider and type-testing it
+    // (`provider is OpenAIProvider`), which cost a KeyRoulette draw plus a
+    // TLS warm-up per CLI call — side effects this process has no use for,
+    // because the request is sent by `:modelservice`, which builds its own
+    // provider. The predicate below answers the same question from the one
+    // input ProviderFactory uses to pick the class, with no construction.
+    //
+    // It is deliberately EXHAUSTIVE (no `else`): adding a ProviderType is then
+    // a compile error here, forcing the new type's provider class to be
+    // considered instead of silently inheriting an answer.
+    //
+    // `kimiCode` is included: ProviderFactory builds an OpenAIProvider for it
+    // (api.kimi.com/coding/v1 is an OpenAI-compatible upstream), so
+    // `input_audio`, `extra_body` and the raw passthrough mode all behave the
+    // way they do on the other OpenAI-family types.
+
+    /**
+     * Does the provider implementation built for [type] speak the OpenAI wire
+     * protocol (`OpenAIProvider`)? Mirrors `ProviderFactory.create`'s
+     * type→class mapping exactly; the six arms are pinned by
+     * [ModelUseProtocolTest] and cross-checked against the factory's source by
+     * the FIX-E probe (`probe/check_factory_mapping.py`), so a new mapping
+     * cannot drift away from this predicate unnoticed.
+     */
+    fun isOpenAiCompatibleProviderType(type: ProviderType): Boolean = when (type) {
+        ProviderType.openAI, ProviderType.openRouter, ProviderType.xAI, ProviderType.kimiCode -> true
+        ProviderType.anthropic, ProviderType.gemini -> false
+    }
+
+    // ── call feedback ───────────────────────────────────────────────────────
+
+    /**
+     * Warnings that ride on the final result: the caller-side envelope warnings
+     * collected in `:app` PLUS the worker's own (it re-parses `input_json` with
+     * these same parsers, so the two lists largely overlap).
+     *
+     * [fix/da1015-modeluse-proc] The caller-side list used to be DISCARDED: the
+     * remote branch assigned `callWarnings = remoteWarnings`, so a warning only
+     * this process can produce — e.g. `extra_headers` present but not a JSON
+     * object, which `:modelservice`'s copy of that parser silently ignores —
+     * never reached the caller in either the JSON body or stderr.
+     *
+     * Local first, then remote, de-duplicated on first occurrence: the caller's
+     * own envelope problems read first, and a warning both processes produce
+     * (identical strings, same parser) collapses to one line. This is the same
+     * rule `attachCallFeedback` applies to the body, so the value handed to the
+     * writer is already final.
+     */
+    fun mergeCallWarnings(local: List<String>, remote: List<String>): MutableList<String> {
+        val merged = LinkedHashSet<String>(local.size + remote.size)
+        merged.addAll(local)
+        merged.addAll(remote)
+        return merged.toMutableList()
+    }
+
     // ── image generation route ──────────────────────────────────────────────
     //
     // [fix/audit3-1015 F-10] The image route used to be implemented TWICE, in
