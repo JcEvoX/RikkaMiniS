@@ -2774,7 +2774,7 @@ internal class AgentLoopEngine(
                     // turn (empty-turn recovery, EOF one-shot retry) rule out.
                     // Same mislabel class as the fixed sites though: a blank
                     // turn persists NO row, so this hint's DB write lands on
-                    // the previous turn. Registered in backlog §112.
+                    // the previous turn. Registered in backlog §116.
                     withContext(Dispatchers.Main) { host.setInlineError(hint) }
                 }
                 // [fix/rv1014-g1] Auto-title: semantic condition, not
