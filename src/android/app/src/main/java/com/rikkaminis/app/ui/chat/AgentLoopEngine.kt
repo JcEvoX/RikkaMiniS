@@ -2783,10 +2783,13 @@ internal class AgentLoopEngine(
             // `eofStubContinues` never got past 1 and the length-wall,
             // deterministic-empty and EOF-stub guards were all dead; only
             // `maxTurns` (default 256) still bounded the loop.
-            // The condition is provably true at this point (every path through
-            // the empty-turn branch above ends in `break`) — it is written out
-            // so the invariant is greppable and machine-checkable:
-            // scripts/scan/loop_counter_reset_guard.py.
+            // The condition is written out rather than assumed: most paths
+            // through the empty-turn branch above leave the loop early
+            // (`continue`, e.g. the EOF one-shot retry at the tail) but not all
+            // of them — the normal-completion tail ends in `break` — so the
+            // reset must be guarded explicitly. The guard is what
+            // scripts/scan/loop_counter_reset_guard.py machine-checks; do not
+            // "simplify" it away on the strength of a comment.
             if (toolCalls.isNotEmpty()) {
                 // [feat/hermes-tier1] A tool-call turn clears the length-wall
                 // continuation budget AND the deterministic-empty streak: the
