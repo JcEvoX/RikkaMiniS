@@ -102,6 +102,47 @@ class VerificationStopPolicyTest {
         assertNull(VerificationStopPolicy.verificationKind(""))
     }
 
+    // ── hasFreshVerification ───────────────────────────────────────────────
+    // [deep-audit-1015 BUG-04] The turn-end guard must not demand verification
+    // the run has already done. Both stamps are readings of ONE monotonic
+    // clock (AgentLoopState.evidenceClock), so a plain `>` is the happens-after
+    // test; a run that never edited code has nothing to be fresh about.
+
+    @Test
+    fun `a passing verification after the last edit is fresh`() {
+        assertTrue(VerificationStopPolicy.hasFreshVerification(lastEditStamp = 1, lastVerifyStamp = 3))
+    }
+
+    @Test
+    fun `no verification, or an older one, is not fresh`() {
+        assertFalse("no verification yet", VerificationStopPolicy.hasFreshVerification(1, 0))
+        assertFalse("verification predates the edit", VerificationStopPolicy.hasFreshVerification(3, 2))
+        assertFalse("never edited code", VerificationStopPolicy.hasFreshVerification(0, 5))
+        assertFalse("nothing at all", VerificationStopPolicy.hasFreshVerification(0, 0))
+    }
+
+    @Test
+    fun `an edit after the passing verification makes the evidence stale again`() {
+        // edit(1) → verify(2) → edit(3): the newest edit has no evidence.
+        assertFalse(VerificationStopPolicy.hasFreshVerification(lastEditStamp = 3, lastVerifyStamp = 2))
+    }
+
+    @Test
+    fun `two independent per-kind counters could not express this order`() {
+        // The shape BUG-04 had: one counter bumped per edit, one per passing
+        // verification. After (edit, edit, verify) the edit counter is 2 and
+        // the verify counter 1, so a "verify > edit" comparison on those
+        // numbers reads as NO — the exact mis-order the shared clock removes.
+        val editsSeen = 2
+        val passesSeen = 1
+        assertFalse("independent counters mis-order this history", passesSeen > editsSeen)
+        // The shared-clock stamps for the same history.
+        assertTrue(
+            "the shared clock records that the verification was the newest event",
+            VerificationStopPolicy.hasFreshVerification(lastEditStamp = 2, lastVerifyStamp = 3),
+        )
+    }
+
     // ── buildNudge ─────────────────────────────────────────────────────────
 
     @Test
@@ -157,5 +198,42 @@ class VerificationStopPolicyTest {
         assertNotNull(nudge)
         assertTrue(nudge!!.contains("... and 12 more"))
         assertFalse(nudge.contains("File20.kt"))
+    }
+
+    // ── wiring: declared AND called ────────────────────────────────────────
+
+    @Test
+    fun `the engine actually consults the freshness stamp`() {
+        // [deep-audit-1015 BUG-04] The original defect was exactly this: the
+        // ordering bookkeeping existed and was never read. A pure function
+        // plus a unit test would reproduce that shape perfectly, so pin the
+        // call site in the engine too.
+        val lines = readRepoFile(ENGINE).split("\n")
+        val callIdx = lines.indexOfFirst { it.contains("VerificationStopPolicy.hasFreshVerification(") }
+        assertTrue("the verify-nudge gate must consult hasFreshVerification", callIdx > 0)
+
+        // …inside the `verifyNudge` decision, i.e. above the buildNudge call
+        // that the gate would otherwise take unconditionally.
+        val buildIdx = lines.indexOfFirst { it.contains("VerificationStopPolicy.buildNudge(") }
+        assertTrue("gate must precede the nudge it guards, $callIdx vs $buildIdx", callIdx < buildIdx)
+        assertTrue("the two must belong to the same decision", buildIdx - callIdx <= TAIL_WINDOW)
+    }
+
+    /** Walks up from user.dir so the test runs from the module dir or the repo root. */
+    private fun readRepoFile(relative: String): String {
+        var dir: java.io.File? = java.io.File(System.getProperty("user.dir"))
+        while (dir != null) {
+            val f = java.io.File(dir, relative)
+            if (f.exists()) return f.readText()
+            dir = dir.parentFile
+        }
+        throw java.io.FileNotFoundException(
+            "$relative not found from user.dir=${System.getProperty("user.dir")}",
+        )
+    }
+
+    private companion object {
+        const val ENGINE = "app/src/main/java/com/rikkaminis/app/ui/chat/AgentLoopEngine.kt"
+        const val TAIL_WINDOW = 40
     }
 }
