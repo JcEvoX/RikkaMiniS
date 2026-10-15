@@ -959,8 +959,7 @@ class ModelUseOffloadHandler(
             .put("model_id", entry.model.id)
 
         if (outputPath != null) {
-            val hostFile = sessionScopedHostFile(outputPath, sessionId)
-            ?: PRootKernel.resolveHostPath(outputPath)
+            val hostFile = sessionAwareHostFile(outputPath, sessionId)
             if (hostFile == null) {
                 out.put("output_error", "Could not resolve --output '$outputPath'")
                 inlineTextIfPossible(result.data, out)
@@ -1214,8 +1213,7 @@ class ModelUseOffloadHandler(
         val ts = System.currentTimeMillis() / 1000
         val modelSlug = entry.model.id.replace("/", "_")
         if (outputPath != null) {
-            val hostFile = sessionScopedHostFile(outputPath, sessionId)
-            ?: PRootKernel.resolveHostPath(outputPath)
+            val hostFile = sessionAwareHostFile(outputPath, sessionId)
                 ?: return NativeOffloadResult(
                     2,
                     "minis-model-use run: cannot resolve --output '$outputPath'\n",
@@ -1242,8 +1240,7 @@ class ModelUseOffloadHandler(
                 hostFile.writeText(response.text)
             }
         } else if (response.mediaAttachments.isNotEmpty()) {
-            val attachDir = sessionScopedHostFile("/var/minis/attachments", sessionId)
-                ?: PRootKernel.resolveHostPath("/var/minis/attachments")
+            val attachDir = sessionAwareHostFile("/var/minis/attachments", sessionId)
             if (attachDir != null) {
                 attachDir.mkdirs()
                 for ((idx, media) in response.mediaAttachments.withIndex()) {
@@ -1297,8 +1294,7 @@ class ModelUseOffloadHandler(
             // [T-android-model-use-session-scoped-write] Session-scoped first,
             // global resolver as fallback. --output is absolute here (relative
             // rejected in cmdRun before the API call).
-            val hostFile = sessionScopedHostFile(outputPath, sessionId)
-            ?: PRootKernel.resolveHostPath(outputPath)
+            val hostFile = sessionAwareHostFile(outputPath, sessionId)
                 ?: return NativeOffloadResult(
                     2,
                     "minis-model-use run: cannot resolve --output '$outputPath'\n",
@@ -1321,8 +1317,7 @@ class ModelUseOffloadHandler(
         } else if (response.mediaAttachments.isNotEmpty()) {
             // [T-android-model-use-session-scoped-write] Auto-save to the caller
             // session's attachments dir, not the global (last-writer-wins) mount.
-            val attachDir = sessionScopedHostFile("/var/minis/attachments", sessionId)
-                ?: PRootKernel.resolveHostPath("/var/minis/attachments")
+            val attachDir = sessionAwareHostFile("/var/minis/attachments", sessionId)
             if (attachDir != null) {
                 attachDir.mkdirs()
                 for ((idx, media) in response.mediaAttachments.withIndex()) {
@@ -1354,26 +1349,28 @@ class ModelUseOffloadHandler(
 
     /**
      * [T-android-model-use-session-scoped-write] Resolve a `/var/minis/<sub>/...`
-     * Linux path to the caller session's OWN host directory, bypassing the
-     * global (last-writer-wins) PRootKernel.bindMounts map. That global map is
-     * overwritten by ExecutionCoordinator.buildSessionBindMounts on every shell
-     * build, so PRootKernel.resolveHostPath("/var/minis/attachments") returns
-     * whichever session built a shell most recently — a model-use call from
-     * session A could then write into session B's attachments dir while the
-     * response reports the abstract `/var/minis/attachments/...` path, which A's
-     * shell (mounted to A's dir) can't read. Mirrors iOS da4b6c5d, which routes
-     * the write to minisAttachmentsPersistentDir(for: callerSid).
+     * Linux path for THIS call, without ever answering with a different
+     * session's file.
      *
-     * Session-scoped subdirs are attachments/offloads/workspace/browser (see
-     * buildSessionBindMounts). For those, host dir = filesDir/minis-sessions/
-     * <sid>/<sub>/<rest>. Returns null when [sessionId] is null (caller then
-     * falls back to the global resolveHostPath and logs the degrade) or the path
-     * isn't a session-scoped `/var/minis/<sub>` path.
+     * The session-scoped view exists because `PRootKernel.bindMounts` is global
+     * and last-writer-wins: `ExecutionCoordinator.buildSessionBindMounts`
+     * overwrites `/var/minis/attachments` etc. on every shell build, so the
+     * global resolver returns whichever session built a shell most recently — a
+     * model-use call from session A could then write into session B's
+     * attachments dir while the response reports the abstract
+     * `/var/minis/attachments/...` path, which A's shell (mounted to A's dir)
+     * can't read. Mirrors iOS da4b6c5d, which routes the write to
+     * minisAttachmentsPersistentDir(for: callerSid).
+     *
+     * [fix/audit3-1015 F-08] Delegates the decision to
+     * [sessionAwareHostFile], which fails CLOSED: when the call carries a
+     * session id and the path is one of the per-session scopes, a refusal by
+     * the traversal guard is final — it is not re-resolved through the global
+     * resolver (which would search every session tree, then the rootfs). The
+     * global resolver is consulted only when no session view applies at all.
      */
-    private fun sessionScopedHostFile(linuxPath: String, sessionId: String?): File? {
-        if (sessionId == null) return null
-        return sessionScopedJoin(context.filesDir, sessionId, linuxPath)
-    }
+    private fun sessionAwareHostFile(linuxPath: String, sessionId: String?): File? =
+        sessionAwareHostFile(context.filesDir, sessionId, linuxPath) { PRootKernel.resolveHostPath(it) }
 
     /** [T-android-model-use-session-scoped-write] One-line audit of a model-use
      *  write so the response path vs on-disk host path vs session scoping is
@@ -1534,16 +1531,14 @@ class ModelUseOffloadHandler(
     // the guest's cwd — the native_offload protocol forwards the shell's cwd
     // (NativeOffloadRequest.cwd), so a relative path inherits it instead of
     // silently dropping onto the rootfs root. The final path still goes
-    // through the same resolveSessionHostPath/resolveHostPath guards
-    // (canonicalize + prefix checks) — a hostile cwd string gets the same
-    // containment as an agent-supplied absolute path.
+    // through the same session-aware guard as every other model-use path
+    // (canonicalize + prefix check + fail-closed on refusal) — a hostile cwd
+    // string gets the same containment as an agent-supplied absolute path.
     private fun readLinuxPath(linuxPath: String, sessionId: String?, cwd: String?): String? {
         val resolved = if (!linuxPath.startsWith("/") && !cwd.isNullOrEmpty() && cwd.startsWith("/")) {
             if (cwd.endsWith("/")) "$cwd$linuxPath" else "$cwd/$linuxPath"
         } else linuxPath
-        val hostFile: File = sessionId?.let {
-            PRootKernel.resolveSessionHostPath(it, resolved, context)
-        } ?: PRootKernel.resolveHostPath(resolved) ?: return null
+        val hostFile: File = sessionAwareHostFile(resolved, sessionId) ?: return null
         if (!hostFile.exists() || !hostFile.isFile) return null
         return try { hostFile.readText() } catch (_: Throwable) { null }
     }
@@ -1675,8 +1670,8 @@ class ModelUseOffloadHandler(
      *  - `data:<mime>;base64,<...>` → inline base64
      *  - `file:///<host-path>` → direct host read
      *  - `/var/minis/<scope>/<path>` or `/<abs/linux/path>` → via
-     *    [PRootKernel.resolveHostPath] (which already handles
-     *    `/var/minis/` bind mounts longest-prefix)
+     *    [sessionAwareHostFile] (session-scoped first, global bind mounts for
+     *    paths with no session view, fail-closed on a refused scope path)
      *  - `http(s)://` → throw with a hint to download via shell_execute
      *    first (matches iOS — avoids egressing user content)
      *  - anything else (relative paths, unknown schemes) → throw
@@ -1724,9 +1719,7 @@ class ModelUseOffloadHandler(
                     "/var/minis/<scope>/<path>, or an absolute Linux path."
             )
         }
-        val hostFile: File = sessionId?.let {
-            PRootKernel.resolveSessionHostPath(it, linuxPath, context)
-        } ?: PRootKernel.resolveHostPath(linuxPath)
+        val hostFile: File = sessionAwareHostFile(linuxPath, sessionId)
             ?: throw ImageInputError(
                 "Image file not found at '$url'. Host-absolute paths outside " +
                     "the mounted scopes (/var/minis/*) are not readable from " +
@@ -1796,11 +1789,45 @@ class ModelUseOffloadHandler(
          * would resolve outside the session tree.
          */
         internal fun sessionScopedJoin(filesDir: File, sessionId: String, linuxPath: String): File? {
-            val m = Regex("^/var/minis/(attachments|offloads|workspace|browser)(/.*)?$").find(linuxPath)
-                ?: return null
+            val m = SESSION_SCOPED_PATH.find(linuxPath) ?: return null
             val base = File(filesDir, "minis-sessions/$sessionId/${m.groupValues[1]}")
             return PRootKernel.safeResolveWithin(base, m.groupValues[2].removePrefix("/"))
         }
+
+        /** `/var/minis/<per-session scope>[/...]` — the same four scopes as
+         *  GuestPathMapper.PER_SESSION_SUBDIRS (attachments/offloads/workspace/browser). */
+        private val SESSION_SCOPED_PATH = Regex("^/var/minis/(attachments|offloads|workspace|browser)(/.*)?$")
+
+
+        /**
+         * Pure classifier behind [sessionAwareHostFile] — kept here (like
+         * [sessionScopedJoin]) so the three-way decision is host-testable
+         * without a Context. [filesDir] is the app's `filesDir`.
+         */
+        internal fun classifySessionPath(filesDir: File, sessionId: String?, linuxPath: String): SessionScopedPathDecision {
+            if (sessionId == null) return SessionScopedPathDecision.NotSessionScoped
+            if (SESSION_SCOPED_PATH.find(linuxPath) == null) return SessionScopedPathDecision.NotSessionScoped
+            val joined = sessionScopedJoin(filesDir, sessionId, linuxPath) ?: return SessionScopedPathDecision.Rejected
+            return SessionScopedPathDecision.Resolved(joined)
+        }
+
+        /**
+         * [fix/audit3-1015 F-08] Resolve a Linux path to a host file for a call
+         * that may carry a session id, with the global resolver injected so the
+         * "was it consulted?" question is testable (a [SessionScopedPathDecision.Rejected]
+         * path must NOT consult it).
+         */
+        internal fun sessionAwareHostFile(
+            filesDir: File,
+            sessionId: String?,
+            linuxPath: String,
+            globalResolve: (String) -> File?,
+        ): File? = when (val d = classifySessionPath(filesDir, sessionId, linuxPath)) {
+            is SessionScopedPathDecision.Resolved -> d.file
+            SessionScopedPathDecision.NotSessionScoped -> globalResolve(linuxPath)
+            SessionScopedPathDecision.Rejected -> null
+        }
+
         private const val TAG = "ModelUseOffload"
         private const val NO_MODELS_HINT =
             "No models available. Go to Settings > Model Groups to add models that the agent can use."
@@ -1944,4 +1971,32 @@ Examples:
                       --input msgs.json --output /var/minis/workspace/out.txt
 """
     }
+}
+
+/**
+ * [fix/audit3-1015 F-08] What a path means for THIS call. The three
+ * cases are the fix; collapsing any two of them reintroduces the bug.
+ *
+ *  - [Resolved]         session-scoped shape, traversal guard passed → use it.
+ *  - [NotSessionScoped] no session view applies (no sessionId, or the path
+ *                       is not one of the per-session scopes, e.g. `/tmp/x`
+ *                       or `/var/minis/shared/...`) → the global resolver
+ *                       is the honest answer and stays in use.
+ *  - [Rejected]         session-scoped SHAPE, refused by the guard (a `..`
+ *                       climb above the scope base, or a symlink pointing
+ *                       out of the session tree) → there is no legitimate
+ *                       second opinion.
+ *
+ * Why [Rejected] must not fall back: the global resolver searches every
+ * `minis-sessions/<id>/<scope>` tree for a file that exists and then the
+ * rootfs. So a path session A was refused could come back as session B's
+ * same-named file (a cross-session read the caller never asked for), or
+ * as a rootfs placeholder that the guest's mount makes invisible (a write
+ * that silently goes nowhere). Either way the containment decision the
+ * guard just made is overruled by a resolver that knows less.
+ */
+internal sealed class SessionScopedPathDecision {
+    class Resolved(val file: File) : SessionScopedPathDecision()
+    object NotSessionScoped : SessionScopedPathDecision()
+    object Rejected : SessionScopedPathDecision()
 }
