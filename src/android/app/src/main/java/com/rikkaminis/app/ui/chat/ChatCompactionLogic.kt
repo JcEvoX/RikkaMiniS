@@ -455,13 +455,18 @@ internal fun injectSummaryIntoPostAnchor(
         }
         val target = postAnchor[firstTextUserOffset]
         // Prepend `<context-summary>...` to the user content AND keep
-        // contentParts in sync: if a Text part exists, prepend to it; if
-        // not, insert a leading Text part so serialization (which reads
+        // contentParts in sync: prepend to the FIRST Text part only; if none
+        // exists, insert a leading Text part so serialization (which reads
         // contentParts when present) still carries the summary.
-        val hasTextPart = target.contentParts.any { it is AgentContentPart.Text }
-        val injectedParts: List<AgentContentPart> = if (hasTextPart) {
-            target.contentParts.map { part ->
-                if (part is AgentContentPart.Text) {
+        val firstTextPartIdx = target.contentParts.indexOfFirst { it is AgentContentPart.Text }
+        val injectedParts: List<AgentContentPart> = if (firstTextPartIdx >= 0) {
+            // A user message can carry SEVERAL Text parts — typed text +
+            // per-image captions + the attached-files XML
+            // (ChatViewModel:3689-3695). Serialization emits every part in
+            // order, so prepending to each one duplicated the summary once
+            // per part; only the first part takes it.
+            target.contentParts.mapIndexed { idx, part ->
+                if (idx == firstTextPartIdx && part is AgentContentPart.Text) {
                     AgentContentPart.Text(summaryWrappedText + "\n\n" + part.text)
                 } else {
                     part
