@@ -49,6 +49,47 @@ class Audit1015ContextFixTest {
     }
 
     @Test
+    fun `multi Text-part target takes summary on FIRST part only`() {
+        // [fix/prewindow-budget-1015] A user message can carry SEVERAL Text
+        // parts (typed text + per-image captions + attached-files XML).
+        // Serialization emits every part in order, so prepending the summary
+        // to each Text part duplicated it once per part. Only the FIRST
+        // Text part takes it; later parts and non-Text parts stay verbatim.
+        val postAnchor = listOf(
+            LLMMessage(
+                role = LLMMessage.Role.USER,
+                content = "current question",
+                contentParts = listOf(
+                    AgentContentPart.Text("current question"),
+                    AgentContentPart.ImageData(ByteArray(1), "image/png"),
+                    AgentContentPart.Text("caption for image"),
+                ),
+            ),
+        )
+        val out = injectSummaryIntoPostAnchor(postAnchor, SUMMARY)
+        assertEquals(1, out.size)
+        val injected = out[0]
+        assertEquals(3, injected.contentParts.size)
+        val first = injected.contentParts[0] as AgentContentPart.Text
+        assertEquals(
+            "<context-summary>Earlier chat condensed.</context-summary>\n\ncurrent question",
+            first.text,
+        )
+        // Second Text part must NOT carry the summary (old map() behavior
+        // duplicated it here — the exact regression this pins).
+        val third = injected.contentParts[2] as AgentContentPart.Text
+        assertEquals("caption for image", third.text)
+        assertTrue(injected.contentParts[1] is AgentContentPart.ImageData)
+        // content field still gets the summary exactly once (serialization
+        // ignores it when parts are present, but the double-fill contract
+        // keeps it in sync for part-less exits).
+        assertTrue(injected.content.startsWith(
+            "<context-summary>Earlier chat condensed.</context-summary>\n\ncurrent question",
+        ))
+        assertEquals(1, injected.content.split("<context-summary>").size - 1)
+    }
+
+    @Test
     fun `inject into target without Text part inserts leading Text part`() {
         // A user message carrying an ImageData part but no Text part.
         val postAnchor = listOf(

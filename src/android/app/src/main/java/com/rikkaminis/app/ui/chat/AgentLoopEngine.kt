@@ -640,16 +640,26 @@ internal class AgentLoopEngine(
                 loopState.lastContextTokens = 0
                 host.setLastTurnContextTokens(0)
             }
-            val preflightMessages = host.applyRequestImageBudget(host.effectiveAgentHistory())
+            // [fix/prewindow-budget-1015] var（非 val）：NEEDS_COMPACTION 分支在
+            // 下方管线里实际收缩历史后必须重捕——compact 只写 marker、trim 砍
+            // agentHistory，都不触碰这里已捕获的快照实例；不重捕则本 turn 请求
+            // 仍带全量未压缩历史 + 最小输出 → 仍然必然 400（该缺口会让
+            // "裁剪后按最小输出重试"的承诺在本 turn 落空）。SHRINK_OUTPUT /
+            // PASS 不进管线，值与 val 时代逐字一致。
+            var preflightMessages = host.applyRequestImageBudget(host.effectiveAgentHistory())
             val preflightMaxTokens = host.dynamicMaxTokens(provider, loopState.lastContextTokens)
             // rawEstimate：provider 无关的本地原始口径 —— 校准观察（流结束/
             // 400-teacher）只用它，否则校准学到"系数化的自己"，闭环坍缩到 1.0。
-            val rawEstimate = ContextEstimator.estimateRequestTokens(
+            // [fix/prewindow-budget-1015] var：NEEDS_COMPACTION 分支重捕消息后
+            // 必须重算——400-teacher 与 usage 校准回填都拿它做 localEstimate，
+            // 若仍持压缩前的估算，观测比值 = 压缩后 usage / 压缩前估算，
+            // 系统性偏低且带内不可拒，会拖偏校准中位数。
+            var rawEstimate = ContextEstimator.estimateRequestTokens(
                 messages = preflightMessages,
                 systemPrompt = systemPrompt,
                 tools = host.agentTools,
             )
-            val preflightEstimate = rawEstimate * calibrationRatioFor(provider) / 100
+            var preflightEstimate = rawEstimate * calibrationRatioFor(provider) / 100
             val preflightVerdict = preflightContextBudget(
                 window = host.effectiveContextWindowTokens() ?: 0,
                 estimatedInput = preflightEstimate,
@@ -692,6 +702,21 @@ internal class AgentLoopEngine(
                     // 裁剪后按最小输出重试一次：trim 的预算本身按 window 收，
                     // 若裁后仍超（尾部太大），下一轮预检会再次禁发并走同样
                     // 管线 —— 不会死循环（每轮都实际收缩历史）。
+                    // [fix/prewindow-budget-1015] 重捕请求消息：管线写入的
+                    // compact marker（effectiveAgentHistory 在请求时做
+                    // summary+tail 投影）与 trim 砍掉的历史，只有重新调用
+                    // effectiveAgentHistory 才能取到 —— 上面 :643 捕获的快照
+                    // 是管线前的投影，直接发出去等于压缩白跑（本 turn 仍 400）。
+                    // 重捕后同步重算本地估算：400-teacher 与流结束的 usage
+                    // 校准回填都以 rawEstimate 为 localEstimate，必须对应
+                    // 实际发出的（压缩后）请求，否则观测比值系统性失真。
+                    preflightMessages = host.applyRequestImageBudget(host.effectiveAgentHistory())
+                    rawEstimate = ContextEstimator.estimateRequestTokens(
+                        messages = preflightMessages,
+                        systemPrompt = systemPrompt,
+                        tools = host.agentTools,
+                    )
+                    preflightEstimate = rawEstimate * calibrationRatioFor(provider) / 100
                     MIN_MAX_TOKENS_CONST
                 }
                 PreflightVerdict.Decision.PASS -> preflightMaxTokens
