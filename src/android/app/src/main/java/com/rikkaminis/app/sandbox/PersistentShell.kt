@@ -78,6 +78,13 @@ class PersistentShell(
     private var pendingCallback: CommandCallback? = null
 
     /**
+     * [audit-1015 BUG-07] Staging slot for env broadcasts that land while a
+     * command is mid-flight on this shell. Flushed — one atomic write under
+     * [writerLock] — right before the next command body in [executeCommand].
+     */
+    private val pendingEnvironment = PendingEnvironmentUpdate()
+
+    /**
      * [fix/audit-s4h3] True while a command is mid-flight on this shell
      * (callback pending). ExecutionCoordinator's idle recycler uses this to
      * avoid reaping a shell whose `lastActiveMs` is stale only because the
@@ -243,7 +250,6 @@ class PersistentShell(
          */
         val lineCallback: ((String, Boolean) -> Unit)?,
         var onComplete: ((String, Int, Boolean) -> Unit)? = null,
-        var truncated: Boolean = false,
         /** Unterminated tail carried across read chunks (see [feedLines]). */
         var pendingPartial: String = "",
     ) {
@@ -261,6 +267,19 @@ class PersistentShell(
         // atomic compare-and-set so exactly one thread wins; the loser is a
         // benign no-op (the shell is gone, the command already reported).
         private val completeOnce = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        /**
+         * [audit-1015 PERF-01] Incremental UTF-8 byte budget for [output].
+         * Each chunk measures ONLY the incoming text; the old path recomputed
+         * [TerminalSanitizer.utf8Length] over the whole buffer (as a
+         * `toString()` copy) on every 4 KB read — O(N²) over a run's output.
+         * The ceiling is read per append so a live `shellOutputKb` change
+         * still applies mid-command, exactly as before.
+         */
+        val byteBudget = IncrementalUtf8Budget { AgentRuntimeLimitsPrefs.shellOutputKb() * 1024 }
+
+        /** Whether any appended chunk was clipped or skipped. */
+        val truncated: Boolean get() = byteBudget.truncated
 
         /** Signal completion, but only the first caller wins. Returns whether
          *  THIS caller won (used by the stall guard: if the command completed on
@@ -518,9 +537,10 @@ class PersistentShell(
      * 384 KB of CJK.
      */
     private fun CommandCallback.appendOutput(text: String) {
-        if (internalTruncateOutput(output, text, AgentRuntimeLimitsPrefs.shellOutputKb() * 1024)) {
-            truncated = true
-        }
+        // [audit-1015 PERF-01] The byte accumulator lives in [IncrementalUtf8Budget]
+        // (pure + JVM-tested) — each chunk measures ONLY the incoming text,
+        // never a full recompute over [output].
+        byteBudget.appendTo(output, text)
     }
 
     /**
@@ -697,6 +717,17 @@ class PersistentShell(
                         // [audit-0917] Under writerLock: see its KDoc — an env
                         // broadcast must not interleave with the command body.
                         synchronized(writerLock) {
+                            // [audit-1015 BUG-07] Flush any env update staged
+                            // while the PREVIOUS command was mid-flight, BEFORE
+                            // the new command body: the shell is back at top
+                            // level here, so top-level `export` lines are safe
+                            // (a mid-flight write would be read by the running
+                            // child as stdin). One atomic write, then the body.
+                            val stagedScript = internalBuildEnvironmentScript(pendingEnvironment.drain())
+                            if (stagedScript.isNotEmpty()) {
+                                writer.write(stagedScript)
+                                writer.flush()
+                            }
                             writer.write(wrappedCommand)
                             writer.flush()
                         }
@@ -776,16 +807,25 @@ class PersistentShell(
                 // [audit-0917] One atomic block: the unset+export sequence must
                 // reach the PTY intact (see writerLock), otherwise a half-applied
                 // snapshot can leave the shell with a mix of old and new vars.
+                // [audit-1015 BUG-07] A broadcast that lands while a command is
+                // mid-flight (pendingCallback != null) used to write top-level
+                // `export` lines into the PTY input stream BENEATH the running
+                // command: the foreground child read them as its own stdin and
+                // the PTY ECHOed them into the command's captured output. Stage
+                // instead — executeCommand flushes the staged update right
+                // before the next command body, when the shell is back at top
+                // level.
                 synchronized(writerLock) {
-                    for (key in previousKeys - envVars.keys) {
-                        writer.write("unset $key\n")
+                    if (pendingCallback != null) {
+                        pendingEnvironment.merge(envVars, previousKeys)
+                        Log.i(TAG, "Command in flight — staged env broadcast (${envVars.size} key(s)) for the next command")
+                    } else {
+                        val entries = LinkedHashMap<String, String?>()
+                        for (key in previousKeys - envVars.keys) entries[key] = null
+                        for ((key, value) in envVars) entries[key] = value
+                        writer.write(internalBuildEnvironmentScript(entries))
+                        writer.flush()
                     }
-                    for ((key, value) in envVars) {
-                        // Escape single quotes in values
-                        val escaped = value.replace("'", "'\\''")
-                        writer.write("export $key='$escaped'\n")
-                    }
-                    writer.flush()
                 }
             } catch (e: Exception) {
                 Log.w(TAG, "Failed to apply env vars: ${e.message}")
@@ -829,6 +869,69 @@ class PersistentShell(
         commandCount = 0
         Log.i(TAG, "Persistent shell stopped")
     }
+}
+
+/**
+ * Pure function: build the `unset`/`export` lines for an environment update.
+ * A `null` value means `unset [key]`. Values containing single quotes are
+ * escaped with the POSIX end-quote idiom (`'` → `'\''`), byte-identical to
+ * the format the direct broadcast path has always written.
+ *
+ * [audit-1015 BUG-07] Shared by the direct broadcast path
+ * ([PersistentShell.applyEnvironment]) and the staged update drained before
+ * the next command body — one format for both, so a staged flush is
+ * indistinguishable from an immediate apply.
+ *
+ * Extracted as a top-level function so both paths and their tests are
+ * JVM-testable without loading [PersistentShell].
+ */
+internal fun internalBuildEnvironmentScript(entries: Map<String, String?>): String = buildString {
+    for ((key, value) in entries) {
+        if (value == null) {
+            append("unset $key\n")
+        } else {
+            append("export $key='")
+            append(value.replace("'", "'\\''"))
+            append("'\n")
+        }
+    }
+}
+
+/**
+ * [audit-1015 BUG-07] Staging slot for environment broadcasts that land while
+ * a command is mid-flight on the shell. A broadcast must NOT write top-level
+ * `export` lines into the PTY while a foreground child owns stdin — the child
+ * reads them as its own input and the PTY echoes them into the command's
+ * captured output. Staged updates merge PER KEY (a later broadcast overrides
+ * an earlier one for the same key; a `null` entry means `unset` — per-key
+ * last-write-wins is exactly the sequential-application semantics) and are
+ * drained in one atomic [internalBuildEnvironmentScript] write right before
+ * the next command body, when the shell is back at top level.
+ *
+ * Pure + JVM-testable (no Android dependencies).
+ */
+internal class PendingEnvironmentUpdate {
+    private val pending = LinkedHashMap<String, String?>()
+
+    /** Merge [envVars] (with [previousKeys] unsets) into the staged update. */
+    @Synchronized
+    fun merge(envVars: Map<String, String>, previousKeys: Set<String>) {
+        for (key in previousKeys - envVars.keys) pending[key] = null
+        for ((key, value) in envVars) pending[key] = value
+    }
+
+    /** Remove and return all staged entries (key -> value; null = unset). */
+    @Synchronized
+    fun drain(): Map<String, String?> {
+        if (pending.isEmpty()) return emptyMap()
+        val out = LinkedHashMap(pending)
+        pending.clear()
+        return out
+    }
+
+    /** Whether any update is currently staged. */
+    @Synchronized
+    fun isEmpty(): Boolean = pending.isEmpty()
 }
 
 /**
@@ -920,17 +1023,71 @@ internal fun internalParseMinisExitCode(text: String, marker: String): Int {
  *
  * A chunk that would cross the ceiling is truncated at the last code-point
  * boundary that fits, so the buffer can never end on a lone surrogate.
+ *
+ * [audit-1015 PERF-01] Production callers pass [currentUtf8Bytes] — the
+ * incrementally-maintained byte total of [output] (see
+ * [PersistentShell.appendOutput]) — so no full recompute runs per chunk. The
+ * legacy 3-arg form keeps the old behaviour for callers/tests without an
+ * accumulator.
  */
-internal fun internalTruncateOutput(output: StringBuilder, text: String, maxBytes: Int): Boolean {
-    val remaining = maxBytes - TerminalSanitizer.utf8Length(output.toString())
-    if (remaining <= 0) return true
+internal fun internalTruncateOutput(output: StringBuilder, text: String, maxBytes: Int): Boolean =
+    internalTruncateOutputDetailed(output, text, maxBytes, TerminalSanitizer.utf8Length(output)).truncated
+
+internal data class TruncateResult(
+    val truncated: Boolean,
+    /** UTF-8 bytes actually appended to [output] by this call. */
+    val appendedUtf8Bytes: Int,
+)
+
+internal fun internalTruncateOutputDetailed(
+    output: StringBuilder,
+    text: String,
+    maxBytes: Int,
+    currentUtf8Bytes: Int,
+): TruncateResult {
+    val remaining = maxBytes - currentUtf8Bytes
+    if (remaining <= 0) return TruncateResult(truncated = true, appendedUtf8Bytes = 0)
     val fitted = TerminalSanitizer.byteSafePrefixLength(text, remaining)
     if (fitted < text.length) {
         output.append(text, 0, fitted)
-        return true
+        return TruncateResult(
+            truncated = true,
+            appendedUtf8Bytes = TerminalSanitizer.utf8Length(text.subSequence(0, fitted)),
+        )
     }
     output.append(text)
-    return false
+    return TruncateResult(truncated = false, appendedUtf8Bytes = TerminalSanitizer.utf8Length(text))
+}
+
+/**
+ * [audit-1015 PERF-01] Incremental UTF-8 byte budget for a growing output
+ * buffer (the shell's per-command capture). Replaces the old per-chunk
+ * `utf8Length(output.toString())` recompute, which copied + scanned the whole
+ * accumulated output on every 4 KB read → O(N²) over a run's total output.
+ *
+ * The accumulator is advanced by the number of bytes [internalTruncateOutputDetailed]
+ * ACTUALLY appended (not by the incoming chunk's length), so a clipped or
+ * skipped chunk cannot drift the total.
+ *
+ * Pure + JVM-testable (no Android dependencies); the ceiling is supplied by a
+ * provider so a live `shellOutputKb` change applies mid-command.
+ */
+internal class IncrementalUtf8Budget(private val maxBytesProvider: () -> Int) {
+
+    /** Running UTF-8 byte total. Invariant: equals the buffer's encoded size. */
+    var byteLength: Int = 0
+        private set
+
+    /** Set once any chunk was clipped or skipped entirely. */
+    var truncated: Boolean = false
+        private set
+
+    /** Append [text] to [output], clipped to the remaining byte budget. */
+    fun appendTo(output: StringBuilder, text: String) {
+        val result = internalTruncateOutputDetailed(output, text, maxBytesProvider(), byteLength)
+        if (result.truncated) truncated = true
+        byteLength += result.appendedUtf8Bytes
+    }
 }
 
 /**

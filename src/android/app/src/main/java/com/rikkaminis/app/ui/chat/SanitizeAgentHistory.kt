@@ -138,3 +138,41 @@ internal fun ensureRoleAlternationBeforeUserAppend(
         )
     }
 }
+
+/**
+ * [audit-1015 BUG-03B/3C] Whether [msg] is a BLANK assistant shell: a message
+ * the agent loop appends as a turn placeholder that carries nothing usable —
+ * empty content, no content parts, AND no reasoning content. Both provider
+ * request builders filter such messages out
+ * (`.filter { contentParts.isNotEmpty() || content.isNotEmpty() }`), so a
+ * blank shell is invisible to the model — but it still breaks role
+ * alternation inside the in-memory history.
+ *
+ * The predicate is deliberately precise to THREE fields: a shell carrying
+ * reasoningContent is NOT blank (the reasoning round-trips on the next
+ * request for thinking-enabled models — DeepSeek V4 rejects assistant turns
+ * lacking reasoning_content), so it must never be dropped.
+ *
+ * Pure + JVM-testable (no ViewModel/Android dependencies).
+ */
+internal fun isBlankAssistantShell(msg: LLMMessage): Boolean =
+    msg.role == LLMMessage.Role.ASSISTANT &&
+        msg.content.isEmpty() &&
+        msg.contentParts.isEmpty() &&
+        msg.reasoningContent.isNullOrEmpty()
+
+/**
+ * [audit-1015 BUG-03B/3C] Drop the trailing history entry when it is a blank
+ * assistant shell ([isBlankAssistantShell]). Called before (a) the empty
+ * length-wall retry `continue` (BUG-03B — the just-added empty turn must not
+ * ride into the retry request) and (b) the nudge paths' role-alternation
+ * bridge (BUG-03C — an undropped blank shell is filtered out of the request
+ * by the provider, turning [..., shell, USER] into [..., USER, USER]).
+ *
+ * Pure + JVM-testable (no ViewModel/Android dependencies).
+ */
+internal fun dropTrailingBlankAssistantShell(history: MutableList<LLMMessage>) {
+    if (history.isNotEmpty() && isBlankAssistantShell(history.last())) {
+        history.removeAt(history.size - 1)
+    }
+}

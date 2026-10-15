@@ -278,3 +278,37 @@ fun shouldRetryEmptyLengthWall(
     contextExhausted: Boolean,
     maxHits: Int = LENGTH_WALL_EMPTY_MAX_HITS,
 ): Boolean = hits < maxHits && !contextExhausted
+
+/**
+ * [audit-1015 BUG-03A] Whether an empty `finish_reason="length"` turn may
+ * continue AFTER the deterministic-empty fast-exit may have already surfaced
+ * the terminal banner.
+ *
+ * [shouldRetryEmptyLengthWall] only refuses retries that are provably
+ * identical walls (context exhausted) or over its own 3-hit budget. It knows
+ * nothing about the deterministic-empty threshold in the same branch: when
+ * the usage block proves zero output tokens on consecutive empty walls, that
+ * threshold sets `terminalErrorSurfaced = true` and FALLS THROUGH to this
+ * gate (it is the only setter in the turn that does). Without the flag check
+ * the gate re-bills the full input for one more provably identical empty
+ * request AFTER the user was already shown the terminal banner — the fuse
+ * fired but did not stop the run.
+ *
+ * Field evidence: the same branch's sibling gate
+ * ([shouldRetryEmptyLengthWall], field log 2026-09-20) documents the
+ * exhausted variant of this shape; the deterministic variant fires when
+ * `usage.outputTokens == 0` on consecutive empty walls.
+ *
+ * @param terminalErrorSurfaced whether the deterministic-empty threshold (or
+ *   another failure-terminal branch) already surfaced the terminal banner.
+ * @param hits consecutive empty length-wall hits, INCLUDING this one.
+ * @param contextExhausted whether the context is at/over the hard window
+ *   ceiling.
+ * @param maxHits legacy ceiling on the retry budget.
+ */
+fun shouldContinueAfterDeterministicFuse(
+    terminalErrorSurfaced: Boolean,
+    hits: Int,
+    contextExhausted: Boolean,
+    maxHits: Int = LENGTH_WALL_EMPTY_MAX_HITS,
+): Boolean = !terminalErrorSurfaced && shouldRetryEmptyLengthWall(hits, contextExhausted, maxHits)
