@@ -1,6 +1,7 @@
 package com.rikkaminis.app.sandbox
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -176,6 +177,54 @@ class ExecutionCoordinatorRetryTest {
         assertRetry(exitCode = STALL_EXIT_CODE, alive = true, attempt = 1, maxRetries = 5, expected = false)
     }
 
+    // ── [fix/audit3-cancel-retry-1015 F-06] memory-recycled shells ────
+
+    @Test
+    fun `memory-recycled command is never retried even though the shell died`() {
+        // The in-flight memory monitor recycled the shell because the command
+        // crossed the dynamic memory ceiling. That is the same observable shape
+        // as an infra death (-1 + dead shell) — but retrying replays the command
+        // that crossed the ceiling, so it crosses it again.
+        assertRecycledRetry(exitCode = -1, alive = false, attempt = 1, recycled = true, expected = false)
+        assertRecycledRetry(exitCode = 0, alive = false, attempt = 1, recycled = true, expected = false)
+        assertRecycledRetry(exitCode = 124, alive = false, attempt = 1, recycled = true, expected = false)
+    }
+
+    @Test
+    fun `memory-recycled short-circuit does not depend on the retry budget`() {
+        // Even a generous budget must not turn a memory kill into a replay:
+        // the guard is a cause, not an attempt counter.
+        assertRecycledRetry(exitCode = -1, alive = false, attempt = 1, maxRetries = 5, recycled = true, expected = false)
+        assertRecycledRetry(exitCode = -1, alive = false, attempt = 4, maxRetries = 5, recycled = true, expected = false)
+    }
+
+    @Test
+    fun `memory kill is only refused when the monitor reports it`() {
+        // Fidelity guard for the fix: the SAME exit codes without the monitor's
+        // report keep their pre-existing semantics (an ordinary infra death is
+        // still retried on attempt 1). This is what keeps the fix from turning
+        // into "never retry a dead shell".
+        assertRecycledRetry(exitCode = -1, alive = false, attempt = 1, recycled = false, expected = true)
+        assertRecycledRetry(exitCode = 0, alive = false, attempt = 1, recycled = false, expected = true)
+    }
+
+    @Test
+    fun `memory-recycle notice carries the ceiling and refuses the replay`() {
+        // The agent-facing text is the only thing that turns a bare exit -1 into
+        // an actionable result, so its two load-bearing statements are pinned:
+        // which limit was crossed, and that the command was NOT re-run.
+        val withReason = internalMemoryRecycleNotice(
+            "the PRoot command's RSS 900MB crossed the 600MB ceiling",
+        )
+        assertTrue("notice must name the cause", withReason.contains("memory guard"))
+        assertTrue("notice must name the ceiling", withReason.contains("900MB crossed the 600MB ceiling"))
+        assertTrue("notice must say the command was not re-run", withReason.contains("NOT re-run"))
+
+        val withoutReason = internalMemoryRecycleNotice(null)
+        assertTrue("notice must still explain the kill", withoutReason.contains("memory guard"))
+        assertTrue("notice must still refuse the replay", withoutReason.contains("NOT re-run"))
+    }
+
     // ── helper ────────────────────────────────────────────────────────
 
     private fun assertRetry(
@@ -188,6 +237,23 @@ class ExecutionCoordinatorRetryTest {
         val actual = internalShouldRetryCommand(exitCode, alive, attempt, maxRetries)
         val msg = "shouldRetryCommand(exitCode=$exitCode, alive=$alive, attempt=$attempt, maxRetries=$maxRetries)" +
             " → expected=$expected, actual=$actual"
+        assertEquals(msg, expected, actual)
+    }
+
+    /** [fix/audit3-cancel-retry-1015 F-06] The same decision with the memory
+     *  monitor's report folded in (positional call, so a reordered parameter
+     *  list fails to compile instead of silently changing meaning). */
+    private fun assertRecycledRetry(
+        exitCode: Int,
+        alive: Boolean,
+        attempt: Int,
+        recycled: Boolean,
+        expected: Boolean,
+        maxRetries: Int = 2,
+    ) {
+        val actual = internalShouldRetryCommand(exitCode, alive, attempt, maxRetries, recycled)
+        val msg = "shouldRetryCommand(exitCode=$exitCode, alive=$alive, attempt=$attempt, " +
+            "maxRetries=$maxRetries, memoryRecycled=$recycled) → expected=$expected, actual=$actual"
         assertEquals(msg, expected, actual)
     }
 }
