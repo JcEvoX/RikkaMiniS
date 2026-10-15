@@ -324,10 +324,24 @@ class SessionActivityStreamErrorTest {
         )
         for ((name, assertion) in assertions) {
             val source = mutated.getValue(name)
-            assertFalse(
-                "the mutation for '$name' must really change the source — otherwise this control proves nothing",
-                source == originalSourceFor(name),
-            )
+            if (source == originalSourceFor(name)) {
+                // The production source no longer carries the wiring this
+                // control edits (it was removed for real — e.g. while mutation
+                // testing this very tree), so the edited copy is identical.
+                // The meaningful check then is the inverse: the assertion must
+                // reject the LIVE source, which is what the removal proves.
+                val rejected = try {
+                    assertion(source)
+                    false
+                } catch (e: AssertionError) {
+                    true
+                }
+                assertTrue(
+                    "the live source lost '$name' but the wiring assertion still accepts it",
+                    rejected,
+                )
+                continue
+            }
             val threw = try {
                 assertion(source)
                 false
