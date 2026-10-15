@@ -1,6 +1,6 @@
 # rikkaminis-dev-history 按天索引
 
-快速跳转到每日开发日志。共 1761 条记录，74 天。
+快速跳转到每日开发日志。共 1770 条记录，74 天。
 
 ## 2026-08-03（11 条）
 
@@ -3668,7 +3668,7 @@
 - `23:19` **§97 收口：fix/skill-asset-hash-gate 合并 main 15a1f1336（用户令「没有问题就**
   - # §97 收口：fix/skill-asset-hash-gate 合并 main 15a1f1336（用户令「没有问题就合并」+「合并触发之后就不用等了」）
 
-## 2026-10-15（31 条）
+## 2026-10-15（40 条）
 
 - `00:11` **§97 内容哈希门控在真机未生效——根因定性：DB 行来源不是 bundled（原本就有，非本次改出）**
   - **验证对象**：设备包 `1.0.0+2095`（lastUpdate 23:21:46）= CI run **#2095** = `fix/skill-as…
@@ -3732,3 +3732,21 @@
   - **用户令**：读 `shared/work/verify-audit2-1015/fix-tasks/FIX-A1-2.md` 并立刻执行。
 - `18:48` **FIX-A6-2 收口：精确缩放解码窗口改回 `< 2 × maxEdge`，分支 CI #2126 绿（2026-10-15）**
   - **任务**：读 `shared/work/verify-audit2-1015/fix-tasks/FIX-A6-2.md` 执行。修 audit2 第二道门…
+- `18:55` **audit2 修复批次收口：六支合并 main `ba9ed437`（2026-10-15，用户令「检查，没问题就合并，有问题就修」+「完成之后再更新文档，包括云端的」）**
+  - **输入**：全仓审计报告第二道门核实后的 6 份任务书（`shared/work/verify-audit2-1015/fix-tasks/FIX-A{1..…
+- `20:26` **audit3 第二道门核实 + 七支派发（2026-10-15，基线 main `ca8b95d1`）**
+  - **输入**：用户丢来 `全量源码级深度架构、安全与性能审计报告`（13 项：3×P0 / 4×P1 / 1×P2 / 3×架构 / 2×性能-内存），说「按流…
+- `21:13` **FIX-A 收口：audit3 F-01 FastioTar 根条目 tar-slip（P0）— 分支 CI #2129 绿，停在分支未合并（2026-10-15）**
+  - **任务**：`shared/work/audit3-1015/fix-tasks/FIX-A.md`（基线 main `ca8b95d1`）。分支 `fix/…
+- `21:14` **FIX-F 收口：F-08 会话路径解析不再因拒绝而全局回退（fix/audit3-sessionpath-1015 @ 6a20a481，CI #2128 绿，停在分支未合并）**
+  - **任务**：读 `shared/work/audit3-1015/fix-tasks/FIX-F.md` 执行。基线 main `ca8b95d1`。comm…
+- `21:18` **FIX-E 收口：audit3 F-07 mount guard 四处绕过全修，分支 CI 38739081695 绿（2026-10-15）**
+  - **任务**：读 `shared/work/audit3-1015/fix-tasks/FIX-E.md` 执行（基线 main `ca8b95d1`）。**报…
+- `21:19` **FIX-B 收口：audit3 F-02 预算停出环（P0）→ 分支 CI #2131 绿，停在分支（2026-10-15）**
+  - **任务**：读 `shared/work/audit3-1015/fix-tasks/FIX-B.md` 执行。基线 main `ca8b95d1`，分支 `…
+- `21:52` **FIX-D 收口：F-05 取消桥前移 + F-06 内存回收不重试（fix/audit3-cancel-retry-1015 @ a9631bf9，CI #2133 绿，停在分支）**
+  - **任务书** `shared/work/audit3-1015/fix-tasks/FIX-D.md`；**报告** `fix-reports/FIX-D.m…
+- `21:52` **FIX-G 收口：NodeRegistry 摊销驱逐 + 图片解码有界化（fix/audit3-perf-small-1015 @ 993fed7e，CI #2134 绿，停在分支）**
+  - **任务**：读 `shared/work/audit3-1015/fix-tasks/FIX-G.md` 立刻执行（audit3 F-12/F-13）。基线 …
+- `21:55` **FIX-C 交付收口：model-use 跨进程边界四块（F-03 P0 + F-04 + F-08 + F-10）—— 分支 CI #2135 绿，停在分支（2026-10-15）**
+  - **任务**：读 `shared/work/audit3-1015/fix-tasks/FIX-C.md` 并立刻执行（基线 main `ca8b95d1`）。…
