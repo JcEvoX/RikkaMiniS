@@ -194,9 +194,18 @@ object ExecutionCoordinator {
     /**
      * [P3-shell-auto-retry] Pure decision: should the command be re-run on a
      * rebuilt shell? Delegates to the top-level [internalShouldRetryCommand].
+     *
+     * [fix/audit3-cancel-retry-1015 F-06] `memoryRecycled` is true when the
+     * in-flight memory monitor itself killed the shell to keep the app alive —
+     * the command is then never replayed (see the predicate for why).
      */
-    internal fun shouldRetryCommand(exitCode: Int, shellAlive: Boolean, attempt: Int): Boolean {
-        return internalShouldRetryCommand(exitCode, shellAlive, attempt, MAX_AUTO_RETRIES)
+    internal fun shouldRetryCommand(
+        exitCode: Int,
+        shellAlive: Boolean,
+        attempt: Int,
+        memoryRecycled: Boolean = false,
+    ): Boolean {
+        return internalShouldRetryCommand(exitCode, shellAlive, attempt, MAX_AUTO_RETRIES, memoryRecycled)
     }
 
     data class CommandResult(
@@ -583,6 +592,21 @@ object ExecutionCoordinator {
             val shell = getOrCreateShell(sessionId)
             lastShell = shell
 
+            // [fix/audit3-cancel-retry-1015 F-06] Did OUR OWN memory monitor
+            // recycle this shell while the command was in flight? Both kill
+            // paths of the in-flight monitor set this (child-RSS crossing and
+            // app-native-heap crossing). A shell that we killed for memory is
+            // NOT an infra death, so the command must not be replayed on the
+            // rebuilt shell — see internalShouldRetryCommand.
+            //
+            // Atomics, not a captured `var`: the monitor runs in its own
+            // coroutine on the IO pool (PersistentShell's `monitorJob`), while
+            // this flag is read back on the command's coroutine after
+            // `executeCommand` returns; a plain closure write has no
+            // happens-before edge between the two.
+            val recycledMidCommand = java.util.concurrent.atomic.AtomicBoolean(false)
+            val recycleReason = java.util.concurrent.atomic.AtomicReference<String?>(null)
+
             // Inject environment variables as a full snapshot (T124a).
             val envVars = envVarRepository?.allAsDict() ?: emptyMap()
             val previousKeys = lastInjectedKeys[sessionId] ?: emptySet()
@@ -600,10 +624,23 @@ object ExecutionCoordinator {
                     // child RSS ceiling and the app-native recycling point
                     // scale with system MemAvailable.
                     val memNow = systemMemAvailableMB()
-                    midCommandRecycleIfOversized(shell, sessionId, rssMB, childRssHighWaterMarkMB(memNow))
+                    val childRssMarkMB = childRssHighWaterMarkMB(memNow)
+                    if (midCommandRecycleIfOversized(shell, sessionId, rssMB, childRssMarkMB)) {
+                        recycledMidCommand.set(true)
+                        recycleReason.compareAndSet(
+                            null,
+                            "the PRoot command's RSS ${rssMB}MB crossed the ${childRssMarkMB}MB ceiling",
+                        )
+                    }
                     val appNativeMB = Debug.getNativeHeapAllocatedSize() / (1024L * 1024L)
-                    if (appNativeMB > appNativeHighWaterMarkMB(memNow)) {
+                    val appNativeMarkMB = appNativeHighWaterMarkMB(memNow)
+                    if (appNativeMB > appNativeMarkMB) {
                         Log.w(TAG, "[$sessionId] App native heap ${appNativeMB}MB crossed mark in-flight — recycling shell")
+                        recycledMidCommand.set(true)
+                        recycleReason.compareAndSet(
+                            null,
+                            "the app's native heap ${appNativeMB}MB crossed the ${appNativeMarkMB}MB ceiling",
+                        )
                         sessionDidTerminate(sessionId)
                     }
                 },
@@ -618,7 +655,24 @@ object ExecutionCoordinator {
             // shell for those. `shellDied` here is only used to null out a
             // dead shell reference on the exhausted path.
             val shellDied = result.exitCode == -1 || !shell.isAlive
-            if (!shouldRetryCommand(result.exitCode, shell.isAlive, attempt)) {
+            val memoryRecycled = recycledMidCommand.get()
+            if (!shouldRetryCommand(result.exitCode, shell.isAlive, attempt, memoryRecycled)) {
+                if (memoryRecycled) {
+                    // [fix/audit3-cancel-retry-1015 F-06] Our own memory monitor
+                    // killed the shell mid-command. Re-running would rebuild a
+                    // shell and replay the very command that just crossed the
+                    // memory ceiling — it would cross it again (and repeat the
+                    // side effects of a non-idempotent command), so the agent
+                    // gets the death plus the reason instead. The kill site
+                    // already called sessionDidTerminate, so only the local
+                    // dead reference is dropped here (re-terminating would run
+                    // the recycle GC pass a second time for nothing).
+                    Log.w(
+                        TAG,
+                        "[$sessionId] Shell was memory-recycled mid-command (exit=${result.exitCode}) — " +
+                            "reporting to the agent instead of re-running the command",
+                    )
+                    lastShell = null
                 // [audit-RC7] Timeout must ALWAYS reclaim the shell. With
                 // withTimeoutOrNull only cancelling the coroutine, the command
                 // keeps running inside the PTY with pendingCallback already
@@ -633,7 +687,7 @@ object ExecutionCoordinator {
                 // so the branch fires on attempt 1 as well and the agent gets
                 // the timeout error immediately instead of after a silent
                 // re-run of the same command.
-                if (internalShouldReclaimOnExhaustedTimeout(result.exitCode)) {
+                } else if (internalShouldReclaimOnExhaustedTimeout(result.exitCode)) {
                     Log.w(
                         TAG,
                         "[$sessionId] Command timed out — reclaiming shell to kill the " +
@@ -653,7 +707,11 @@ object ExecutionCoordinator {
                 } else if (shellDied && attempt >= MAX_AUTO_RETRIES) {
                     lastShell = null // shell is dead and we're out of retries
                 }
-                return CommandResult(output = result.output, exitCode = result.exitCode, durationMs = 0L, truncated = result.truncated) to lastShell
+                // An exit code / output the agent can act on: a bare -1 with no
+                // explanation reads like an unexplained crash, so the memory
+                // kill carries the ceiling that was crossed.
+                val notice = if (memoryRecycled) internalMemoryRecycleNotice(recycleReason.get()) else ""
+                return CommandResult(output = result.output + notice, exitCode = result.exitCode, durationMs = 0L, truncated = result.truncated) to lastShell
             }
 
             Log.w(
@@ -669,12 +727,19 @@ object ExecutionCoordinator {
      * (it OOM'd), immediately recycle the session so the shell isn't held as
      * a zombie and the next command spawns fresh. Called from the executeCommand
      * in-flight monitor; rssMB of 0 means the child already died. The ceiling
-     * is dynamic ([memory-dynamic-budget]) — passed in by the caller. */
-    private fun midCommandRecycleIfOversized(shell: PersistentShell, sessionId: String, rssMB: Long, childRssMarkMB: Long) {
+     * is dynamic ([memory-dynamic-budget]) — passed in by the caller.
+     *
+     * [fix/audit3-cancel-retry-1015 F-06] Returns whether it actually recycled
+     * (rather than Unit, which the call site used to discard): a shell killed
+     * by the memory monitor is not an infra death, so the caller must refuse to
+     * replay the command that crossed the ceiling. */
+    private fun midCommandRecycleIfOversized(shell: PersistentShell, sessionId: String, rssMB: Long, childRssMarkMB: Long): Boolean {
         if (rssMB > childRssMarkMB) {
             Log.w(TAG, "[$sessionId] PRoot child RSS ${rssMB}MB crossed mark ${childRssMarkMB}MB mid-command — recycling")
             sessionDidTerminate(sessionId)
+            return true
         }
+        return false
     }
 
     /**
@@ -1265,7 +1330,24 @@ internal fun internalShouldRetryCommand(
     attempt: Int,
     // Keep in sync with ExecutionCoordinator.MAX_AUTO_RETRIES (defaults to 2).
     maxRetries: Int = 2,
+    /**
+     * [fix/audit3-cancel-retry-1015 F-06] True when the in-flight memory
+     * monitor recycled the shell to keep the app alive (PRoot child RSS or the
+     * app's native heap crossed its dynamic ceiling). Same shape as the stall
+     * and timeout guards above, but the reason is direct rather than inferred:
+     * the shell died precisely BECAUSE this command was over the memory
+     * ceiling, so a retry rebuilds a shell and replays the very command that
+     * crossed it — it crosses it again (that is how it got there), doubling
+     * the memory pressure the kill just relieved and repeating the side
+     * effects of a non-idempotent command. The agent gets the death plus the
+     * ceiling that was crossed ([internalMemoryRecycleNotice]) and picks a
+     * smaller approach. Defaults to false so every pre-existing call site and
+     * test keeps its exact semantics: an ordinary infra death (killed shell,
+     * exit -1, nothing to do with memory) is still retried as before.
+     */
+    memoryRecycled: Boolean = false,
 ): Boolean {
+    if (memoryRecycled) return false
     // [fix/memory-hardening-stall] A stall-killed command already burned its
     // whole no-progress window; retrying the SAME command would hang again for
     // the same reason. Hand the error to the agent instead and let it change
@@ -1298,6 +1380,33 @@ internal fun internalShouldRetryCommand(
  * the pre-existing dead-shell path already handles those without this.
  */
 internal fun internalShouldReclaimOnExhaustedTimeout(exitCode: Int): Boolean = exitCode == TIMEOUT_EXIT_CODE
+
+/**
+ * [fix/audit3-cancel-retry-1015 F-06] Agent-facing explanation appended to the
+ * output of a command whose shell was recycled mid-flight by the memory guard.
+ *
+ * Precedent: the stall guard appends its own reason line
+ * ([com.rikkaminis.app.sandbox.stallMessage]) instead of handing back a bare
+ * non-zero exit code. A memory kill is the same situation with a different
+ * cause — the tool result would otherwise read as an unexplained `-1` and the
+ * agent would have no way to tell "the sandbox killed this to stay alive"
+ * apart from "the shell crashed". The reason (which ceiling, which measurement)
+ * is carried through so the agent can size its next attempt.
+ *
+ * Kept as a top-level pure function so it is JVM-testable and so both the kill
+ * reason and the wording have a single source.
+ */
+internal fun internalMemoryRecycleNotice(reason: String?): String = buildString {
+    append("\n[memory-recycle] the command was killed by the sandbox memory guard")
+    if (reason != null) append(": $reason")
+    append(".")
+    append(
+        " The shell was recycled to keep the app alive and the command was NOT re-run — " +
+            "replaying it would cross the same ceiling again. Reduce its memory footprint " +
+            "(smaller batches, streaming instead of buffering, fewer parallel workers) " +
+            "before retrying."
+    )
+}
 
 // ──────────────────────────────────────────────────────────────────────────
 // [T3-retry-side-effects] Side-effect-aware retry policy — pure functions
