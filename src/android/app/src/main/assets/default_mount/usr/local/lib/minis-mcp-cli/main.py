@@ -30,6 +30,7 @@ stay pure-local (servers.json only) and never touch the daemon.
 
 import json
 import os
+import signal
 import socket
 import sys
 import time
@@ -43,6 +44,11 @@ LOG_PATH = "/var/minis/mcp-servers/mcp-cli.log"
 
 PID_FILE = "/tmp/minis-mcp-daemon.pid"
 PORT_FILE = "/tmp/minis-mcp-daemon.port"  # daemon publishes its 127.0.0.1 port here
+# [verify-1015 BUG-07] Loopback IPC auth token, derived from the port file so
+# the two sides can never drift. The daemon writes it 0600; every request
+# carries it, which is what keeps another local app from driving the user's
+# configured MCP servers (Android does not isolate 127.0.0.1 per app).
+TOKEN_FILE = PORT_FILE + ".token"
 LOCK_FILE = "/tmp/minis-mcp-daemon.lock"  # cold-start fork guard (one winner forks)
 CONN_TIMEOUT = 310.0  # socket recv timeout, slightly above the 300s RPC timeout
 LOCK_STALE_SECONDS = 12.0  # reclaim a cold-start lock older than this (crashed start)
@@ -221,12 +227,50 @@ def maybe_start_daemon():
         os._exit(0)
 
 
+def _read_daemon_token():
+    """[verify-1015 BUG-07] Read the loopback auth token, or None when the file
+    is absent (a pre-token daemon still running after an app update)."""
+    try:
+        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+def _retire_stale_daemon():
+    """[verify-1015 BUG-07] SIGTERM a daemon that predates the token (it cannot
+    authenticate us), then clear its files so the next call forks a fresh one.
+    The daemon handles SIGTERM and unlinks its own port/pid/token files."""
+    pid = None
+    try:
+        with open(PID_FILE, "r", encoding="utf-8") as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        pid = None
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + 3.0
+    while time.time() < deadline and os.path.exists(PORT_FILE):
+        time.sleep(0.1)
+    for path in (PORT_FILE, PID_FILE, TOKEN_FILE):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
 def send_to_daemon(request, timeout=CONN_TIMEOUT):
     """Send one newline-delimited JSON request over 127.0.0.1, return the parsed
     reply dict."""
     port = _read_daemon_port()
     if port is None:
         return {"ok": False, "error": "daemon not running", "code": "NO_DAEMON"}
+    token = _read_daemon_token()
+    if token:
+        # Attach at the single choke point so every subcommand is covered; an
+        # older daemon simply ignores the extra field.
+        request = dict(request, token=token)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(timeout)
     try:
@@ -259,6 +303,15 @@ def call_daemon(request, pretty):
     retry if the daemon wasn't ready yet right after a fresh fork."""
     maybe_start_daemon()
     resp = send_to_daemon(request)
+    if not resp.get("ok") and resp.get("code") == "AUTH":
+        # [verify-1015 BUG-07] A daemon that was forked before the token existed
+        # cannot authenticate us: retire it and fork a fresh one rather than
+        # failing the user's tool call (the update lands mid-session, and a
+        # daemon can outlive it by its idle TTL).
+        _retire_stale_daemon()
+        maybe_start_daemon()
+        time.sleep(0.5)
+        resp = send_to_daemon(request)
     if not resp.get("ok") and resp.get("code") == "NO_DAEMON":
         time.sleep(0.5)
         resp = send_to_daemon(request)
