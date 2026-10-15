@@ -235,34 +235,14 @@ internal fun ChatViewModel.effectiveAgentHistory(): List<LLMMessage> {
         // content field would be silently swallowed. Find the first USER
         // message that is NOT a tool_result-only message, and inject the
         // summary there.
-        val firstTextUserOffset = postAnchor.indexOfFirst {
-            it.role == LLMMessage.Role.USER &&
-                !it.contentParts.all { p -> p is AgentContentPart.ToolResult }
-        }
-        if (firstTextUserOffset >= 0) {
-            if (firstTextUserOffset > 0) {
-                result.addAll(postAnchor.subList(0, firstTextUserOffset))
-            }
-            val target = postAnchor[firstTextUserOffset]
-            // Prepend `<context-summary>...` to the user content. We
-            // edit `content` directly because Android LLMMessage uses
-            // `content: String` as the canonical text payload; any
-            // contentParts the message also carries get preserved.
-            val injected = target.copy(
-                content = summaryWrappedText + "\n\n" + target.content,
-            )
-            result.add(injected)
-            if (firstTextUserOffset + 1 < postAnchor.size) {
-                result.addAll(postAnchor.subList(firstTextUserOffset + 1, postAnchor.size))
-            }
-        } else {
-            // Rare: no user message after anchor (or all are tool_result-only).
-            // Append everything post-anchor (typically empty) then a standalone
-            // summary user turn. Safe — no later user follows it to break
-            // alternation.
-            result.addAll(postAnchor)
-            result.add(LLMMessage(role = LLMMessage.Role.USER, content = summaryWrappedText))
-        }
+        // [fix/audit-1015-bug01] Splice the summary into the post-anchor
+        // messages via the pure injector (extracted to ChatCompactionLogic
+        // for JVM testability). It updates BOTH `content` and `contentParts`:
+        // all four serialization exits (OpenAI/Anthropic/Gemini/Responses)
+        // ignore `content` whenever contentParts is non-empty, so editing
+        // `content` alone was silently swallowing the summary for any
+        // message that carries parts.
+        result.addAll(injectSummaryIntoPostAnchor(postAnchor, summaryWrappedText))
         // [T-compact-slice-tool-pairing] The slice (walkBack cap /
         // preAnchor prune / postAnchor splice) can split a tool round
         // across a boundary — e.g. cap lands on the tool_result user

@@ -382,9 +382,17 @@ fun resolveCompactStartIdx(
 fun buildConversationTextForSummary(history: List<LLMMessage>): String = buildString {
     for (msg in history) {
         val role = msg.role.name.lowercase()
-        val text = msg.content.take(500)
-        if (text.isNotEmpty()) {
-            append(role).append(": ").append(text).append('\n')
+        // [fix/audit-1015-bug01b] When the message carries Text parts, those
+        // parts ARE the canonical text (user messages are double-filled:
+        // `content` mirrors the Text part verbatim). Emitting both meant the
+        // same text reached the summarizer twice. Emit Text parts only and
+        // fall back to top-level `content` when no Text part exists.
+        val hasTextPart = msg.contentParts.any { it is AgentContentPart.Text }
+        if (!hasTextPart) {
+            val text = msg.content.take(500)
+            if (text.isNotEmpty()) {
+                append(role).append(": ").append(text).append('\n')
+            }
         }
         for (part in msg.contentParts) {
             when (part) {
@@ -405,6 +413,84 @@ fun buildConversationTextForSummary(history: List<LLMMessage>): String = buildSt
                 }
             }
         }
+    }
+}
+
+/**
+ * [fix/audit-1015-bug01] Splices the wrapped compaction summary
+ * (`<context-summary>…`) into the post-anchor messages of the v2 compact
+ * slice, keeping strict role alternation (the summary is inlined into the
+ * first post-anchor USER message rather than added as a standalone turn).
+ *
+ * Injects into BOTH `content` and `contentParts`: all four serialization
+ * exits (OpenAI:2111-2130 / Anthropic:709 / Gemini:363 / Responses:2947)
+ * ignore `content` whenever `contentParts` is non-empty, and user messages
+ * are always double-filled — so editing `content` alone silently swallowed
+ * the summary for any target that carries parts.
+ *
+ * Pure and side-effect-free (extracted verbatim from
+ * [ChatViewModel.effectiveAgentHistory]) so the injection contract is
+ * JVM-testable.
+ */
+internal fun injectSummaryIntoPostAnchor(
+    postAnchor: List<LLMMessage>,
+    summaryWrappedText: String,
+): List<LLMMessage> {
+    // [T-compact-slice-summary-toolresult] Skip tool_result-only messages
+    // when choosing the summary injection target: tool_result messages
+    // carry `content="" + ToolResult parts`, and serialization uses
+    // `contentParts` (ignoring the `content` string when parts are
+    // present) — injecting the summary into a tool_result message's
+    // content field would be silently swallowed. Find the first USER
+    // message that is NOT a tool_result-only message, and inject the
+    // summary there.
+    val firstTextUserOffset = postAnchor.indexOfFirst {
+        it.role == LLMMessage.Role.USER &&
+            !it.contentParts.all { p -> p is AgentContentPart.ToolResult }
+    }
+    return if (firstTextUserOffset >= 0) {
+        val result = mutableListOf<LLMMessage>()
+        if (firstTextUserOffset > 0) {
+            result.addAll(postAnchor.subList(0, firstTextUserOffset))
+        }
+        val target = postAnchor[firstTextUserOffset]
+        // Prepend `<context-summary>...` to the user content AND keep
+        // contentParts in sync: if a Text part exists, prepend to it; if
+        // not, insert a leading Text part so serialization (which reads
+        // contentParts when present) still carries the summary.
+        val hasTextPart = target.contentParts.any { it is AgentContentPart.Text }
+        val injectedParts: List<AgentContentPart> = if (hasTextPart) {
+            target.contentParts.map { part ->
+                if (part is AgentContentPart.Text) {
+                    AgentContentPart.Text(summaryWrappedText + "\n\n" + part.text)
+                } else {
+                    part
+                }
+            }
+        } else {
+            listOf(AgentContentPart.Text(summaryWrappedText)) + target.contentParts
+        }
+        result.add(
+            target.copy(
+                content = summaryWrappedText + "\n\n" + target.content,
+                contentParts = injectedParts,
+            )
+        )
+        if (firstTextUserOffset + 1 < postAnchor.size) {
+            result.addAll(postAnchor.subList(firstTextUserOffset + 1, postAnchor.size))
+        }
+        result
+    } else {
+        // Rare: no user message after anchor (or all are tool_result-only).
+        // Append everything post-anchor (typically empty) then a standalone
+        // summary user turn. Safe — no later user follows it to break
+        // alternation. The turn carries the summary as a Text part too —
+        // content-only construction would be dropped by serialization.
+        postAnchor + LLMMessage(
+            role = LLMMessage.Role.USER,
+            content = summaryWrappedText,
+            contentParts = listOf(AgentContentPart.Text(summaryWrappedText)),
+        )
     }
 }
 

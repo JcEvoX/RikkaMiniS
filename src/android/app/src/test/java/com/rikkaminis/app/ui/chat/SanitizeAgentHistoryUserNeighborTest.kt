@@ -42,7 +42,14 @@ class SanitizeAgentHistoryUserNeighborTest {
         // placeholders must land INSIDE the existing user message — no new
         // user message inserted before it
         assertTrue(msgs[2].contentParts.any { it is AgentContentPart.ToolResult })
-        assertEquals("and also look at logs", msgs[2].content)
+        // [fix/audit-1015-arch03] the plain-content neighbour is lifted into
+        // a Text part (content cleared) so serialization — which ignores
+        // `content` when parts are non-empty — cannot drop the text.
+        assertEquals("", msgs[2].content)
+        assertEquals(
+            "and also look at logs",
+            msgs[2].contentParts.filterIsInstance<AgentContentPart.Text>().first().text,
+        )
         // exactly one USER message after the tool_use (no consecutive USER)
         assertEquals(1, msgs.drop(1).count { it.role == LLMMessage.Role.USER })
     }
@@ -70,7 +77,14 @@ class SanitizeAgentHistoryUserNeighborTest {
             SANITIZE_PLACEHOLDER_RESULT_CONTENT,
             msgs[1].contentParts.filterIsInstance<AgentContentPart.ToolResult>().first().content,
         )
-        assertEquals("original instruction", msgs[1].content)
+        // [fix/audit-1015-arch03] content is lifted into a trailing Text part
+        // (placeholders precede text per Anthropic ordering) — top-level
+        // `content` is cleared so serialization reads the Text part.
+        assertEquals("", msgs[1].content)
+        assertEquals(
+            "original instruction",
+            msgs[1].contentParts.filterIsInstance<AgentContentPart.Text>().first().text,
+        )
     }
 
     @Test

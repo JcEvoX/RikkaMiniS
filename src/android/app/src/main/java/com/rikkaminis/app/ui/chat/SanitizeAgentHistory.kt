@@ -68,9 +68,25 @@ internal fun sanitizeAgentHistoryMessagesImpl(
         // merge). Any USER message can legally carry a tool_result block, so
         // every USER neighbour merges; only ASSISTANT neighbours insert.
         if (next != null && next.role == LLMMessage.Role.USER) {
-            // Append missing results to the existing user message
+            // [fix/audit-1015-arch03] Anthropic requires tool_result blocks
+            // to precede text blocks within the same user message — prepend
+            // placeholders instead of appending. Serialization emits parts
+            // in order (Anthropic:727 walks contentParts verbatim); OpenAI
+            // extracts tool_results by type and emits role:"tool" messages
+            // first regardless of part order, so the reorder is safe there.
+            // If `next` carries only top-level `content` (no parts), lift it
+            // into a trailing Text part first — otherwise serialization
+            // (which ignores `content` when parts are non-empty) would drop
+            // the original text entirely.
+            val liftedContent = next.contentParts.isEmpty() && next.content.isNotEmpty()
+            val existingParts = if (liftedContent) {
+                listOf<AgentContentPart>(AgentContentPart.Text(next.content))
+            } else {
+                next.contentParts
+            }
             messages[i + 1] = next.copy(
-                contentParts = next.contentParts + placeholders
+                content = if (liftedContent) "" else next.content,
+                contentParts = placeholders + existingParts
             )
         } else {
             // Insert a new user message with just the placeholder results
