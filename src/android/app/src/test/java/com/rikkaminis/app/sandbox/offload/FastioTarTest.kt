@@ -8,6 +8,7 @@ import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.util.zip.GZIPInputStream
@@ -305,10 +306,17 @@ class FastioTarTest {
         assertTrue(tarEntryTarget(dest, member("/etc/passwd")) is TarRefusal.Slip)
         assertTrue(tarEntryTarget(dest, member("a/../../evil.txt")) is TarRefusal.Slip)
         assertTrue(tarEntryTarget(dest, member("..")) is TarRefusal.Slip)
-        // audit-1014 B4a: a bare "." IS the root — legal, not slip (this used
-        // to assert Slip, which is exactly the bug: `tar -cf a.tar .` writes
-        // `./` as its first member and our own extractor refused it).
-        assertNull(tarEntryTarget(dest, member(".")))
+        // audit3 F-01: `dest` is the destination ROOT, so `member(name)` —
+        // which is a type '0' (regular file) header — must NOT be allowed to
+        // name it: writing "root as a regular file" replaces the root.
+        assertTrue(tarEntryTarget(dest, member(".")) is TarRefusal.Slip)
+        assertTrue(tarEntryTarget(dest, member("./")) is TarRefusal.Slip)
+        assertTrue(tarEntryTarget(dest, member("a/..")) is TarRefusal.Slip)
+        // audit-1014 B4a: a DIRECTORY entry that names the root IS legal (this
+        // used to assert Slip for every type, which is exactly the bug:
+        // `tar -cf a.tar .` writes `./` as its first member and our own
+        // extractor refused it).
+        assertNull(tarEntryTarget(dest, TarMember(".", '5', 0, 493, 0, "")))
         assertNull(tarEntryTarget(dest, member("a/../b.txt")))
         assertNull(tarEntryTarget(dest, member("dir/file.txt")))
         assertNull(tarEntryTarget(dest, member("./dir/file.txt")))
@@ -353,6 +361,195 @@ class FastioTarTest {
         assertFalse(safe)
         assertTrue(validation.errors.toString(), validation.errors[0].contains("tar_slip"))
         assertFalse(Files.exists(outside.resolve("pwned.txt")))
+    }
+
+    // ── audit3 F-01: the extraction ROOT as an attack surface ───────────────
+
+    /**
+     * The full attack: a `.` symlink entry replaces the destination directory
+     * itself with a link to anywhere on the host, and the member after it
+     * writes through that link. Validation must refuse the archive outright,
+     * so nothing is written anywhere ("refuse and leave nothing behind").
+     */
+    @Test
+    fun `a root symlink member is refused at validation and writes nothing`() {
+        val root = Files.createTempDirectory("fastio-tar-rootslip")
+        val dest = Files.createDirectory(root.resolve("out"))
+        val outside = root.resolve("outside")
+
+        val archive = ByteArrayOutputStream()
+        archive.write(craftHeader(".", '2', 0, 511, outside.toString()))
+        archive.write(craftHeader("pwned.txt", '0', 2, 420, ""))
+        archive.write("hi".toByteArray())
+        archive.write(ByteArray(pad(2)))
+        archive.write(ByteArray(1024))
+
+        val validation = TarExtractOutcome()
+        val safe = tarValidate(ByteArrayInputStream(archive.toByteArray()), dest, 100L, validation)
+
+        assertFalse(validation.errors.toString(), safe)
+        assertTrue(validation.errors.toString(), validation.errors[0].contains("tar_slip"))
+        assertTrue(
+            validation.errors.toString(),
+            validation.errors[0].contains("names the extraction root itself with type '2'"),
+        )
+        assertTrue("dest must still be a real directory", Files.isDirectory(dest, LinkOption.NOFOLLOW_LINKS))
+        assertFalse("dest must not have become a symlink", Files.isSymbolicLink(dest))
+        assertEquals("validation must not create anything under dest", 0, listingOf(dest).size)
+        assertFalse("nothing may land outside the destination", Files.exists(outside))
+    }
+
+    /**
+     * Second layer: the extraction pass re-checks every name, so a caller that
+     * skipped validation (or a future refactor that lets this archive through)
+     * still cannot swap the destination root for a symlink under --force.
+     * The link's target directory EXISTS here — that is the shape the pre-fix
+     * code escaped into (probe: shared/work/audit3-fix/a/jvm/).
+     */
+    @Test
+    fun `--force extraction cannot replace the destination root with a symlink`() {
+        val root = Files.createTempDirectory("fastio-tar-rootforce")
+        val dest = Files.createDirectory(root.resolve("out"))
+        val outside = Files.createDirectory(root.resolve("outside"))
+
+        val archive = ByteArrayOutputStream()
+        archive.write(craftHeader(".", '2', 0, 511, outside.toString()))
+        archive.write(craftHeader("pwned.txt", '0', 2, 420, ""))
+        archive.write("hi".toByteArray())
+        archive.write(ByteArray(pad(2)))
+        archive.write(ByteArray(1024))
+
+        val out = TarExtractOutcome()
+        tarExtract(ByteArrayInputStream(archive.toByteArray()), dest, true, 100L, out)
+
+        assertTrue("extraction must report the refusal: ${out.errors}", out.errors.isNotEmpty())
+        assertTrue(out.errors.toString(), out.errors[0].contains("tar_slip"))
+        assertTrue("dest must still be a real directory", Files.isDirectory(dest, LinkOption.NOFOLLOW_LINKS))
+        assertFalse("dest must not have become a symlink", Files.isSymbolicLink(dest))
+        assertEquals("the root entry must not have been written at all", 0, listingOf(dest).size)
+        assertFalse(
+            "the member after the root link must not write through it",
+            Files.exists(outside.resolve("pwned.txt")),
+        )
+    }
+
+    /**
+     * Only a DIRECTORY entry may name the root (`tar -cf a.tar .` writes `./`
+     * as its first member — that must keep working). Every other type naming
+     * the root replaces the root, and is refused.
+     */
+    @Test
+    fun `every non-directory entry that names the root is refused`() {
+        val dest = Files.createTempDirectory("fastio-tar-roottype")
+        val rootNames = listOf(".", "./", "././", "a/..")
+        val refusedTypes = charArrayOf('0', '2', '1', '7', '\u0000')
+        for (name in rootNames) {
+            for (type in refusedTypes) {
+                val refusal = tarEntryTarget(dest, TarMember(name, type, 0L, 420, 0L, ""))
+                assertTrue("'$name' type '$type' must be refused", refusal is TarRefusal.Slip)
+            }
+        }
+        // The compat red line: a DIRECTORY entry naming the root is legal.
+        assertNull(tarEntryTarget(dest, TarMember(".", '5', 0L, 493, 0L, "")))
+        assertNull(tarEntryTarget(dest, TarMember("./", '5', 0L, 493, 0L, "")))
+    }
+
+
+    /**
+     * The compat red line, built by the SECOND writer (not [tarCreate]): an
+     * archive whose first member is a root DIRECTORY entry — what GNU and
+     * busybox `tar -cf a.tar .` produce — must still extract.
+     */
+    @Test
+    fun `a crafted archive whose first member is a root directory still extracts`() {
+        val root = Files.createTempDirectory("fastio-tar-rootdir")
+        val dest = root.resolve("out")
+        val archive = ByteArrayOutputStream()
+        archive.write(craftHeader("./", '5', 0, 493, ""))
+        archive.write(craftHeader("./a.txt", '0', 2, 420, ""))
+        archive.write("hi".toByteArray())
+        archive.write(ByteArray(pad(2)))
+        archive.write(ByteArray(1024))
+        val bytes = archive.toByteArray()
+
+        val validation = TarExtractOutcome()
+        assertTrue(
+            validation.errors.toString(),
+            tarValidate(ByteArrayInputStream(bytes), dest, 100L, validation),
+        )
+        val out = TarExtractOutcome()
+        tarExtract(ByteArrayInputStream(bytes), dest, false, 100L, out)
+        assertTrue("extract errors: ${out.errors}", out.errors.isEmpty())
+        assertEquals(1L, out.dirs)
+        assertEquals(1L, out.files)
+        assertEquals("hi", Files.readAllBytes(dest.resolve("a.txt")).decodeToString())
+    }
+
+
+    /**
+     * Sibling shape of F-01, independent of the root rule: an archive that
+     * first creates a directory and then declares a symlink of the SAME name.
+     * `--force` used to delete the (empty) directory and leave a link in its
+     * place, silently, reported as success. The '2' branch now mirrors the
+     * regular-file branch and refuses to replace a directory at all.
+     */
+    @Test
+    fun `--force cannot replace a directory member with a symlink of the same name`() {
+        val root = Files.createTempDirectory("fastio-tar-dirlink")
+        val dest = Files.createDirectory(root.resolve("out"))
+        val archive = ByteArrayOutputStream()
+        archive.write(craftHeader("sub/", '5', 0, 493, ""))
+        archive.write(craftHeader("sub", '2', 0, 511, "/tmp/fastio-f01-target"))
+        archive.write(ByteArray(1024))
+
+
+        val out = TarExtractOutcome()
+        tarExtract(ByteArrayInputStream(archive.toByteArray()), dest, true, 100L, out)
+
+        assertEquals(
+            listOf("sub: target is a directory; refusing to replace it with a symlink"),
+            out.errors,
+        )
+        assertEquals(1L, out.dirs)
+        assertEquals(0L, out.symlinks)
+        assertTrue(Files.isDirectory(dest.resolve("sub"), LinkOption.NOFOLLOW_LINKS))
+        assertFalse(Files.isSymbolicLink(dest.resolve("sub")))
+    }
+
+
+    /**
+     * F-01 rule 5, on-disk half: a destination that is ALREADY a symlink is a
+     * precondition already met — no member may be written through it.
+     */
+    @Test
+    fun `a destination root that is already a symlink is refused`() {
+        val root = Files.createTempDirectory("fastio-tar-linkroot")
+        val real = Files.createDirectory(root.resolve("real"))
+        val dest = Files.createSymbolicLink(root.resolve("out"), real)
+        val archive = ByteArrayOutputStream()
+        archive.write(craftHeader("a.txt", '0', 2, 420, ""))
+        archive.write("hi".toByteArray())
+        archive.write(ByteArray(pad(2)))
+        archive.write(ByteArray(1024))
+        val bytes = archive.toByteArray()
+
+        val validation = TarExtractOutcome()
+        assertFalse(
+            validation.errors.toString(),
+            tarValidate(ByteArrayInputStream(bytes), dest, 100L, validation),
+        )
+        assertTrue(validation.errors.toString(), validation.errors[0].contains("is itself a symlink"))
+
+        val out = TarExtractOutcome()
+        tarExtract(ByteArrayInputStream(bytes), dest, false, 100L, out)
+        assertTrue(out.errors.toString(), out.errors.isNotEmpty())
+        assertFalse("no member may land through the root symlink", Files.exists(real.resolve("a.txt")))
+    }
+
+    private fun listingOf(dir: Path): List<Path> {
+        val names = ArrayList<Path>()
+        Files.newDirectoryStream(dir).use { for (p in it) names.add(p) }
+        return names
     }
 
     @Test

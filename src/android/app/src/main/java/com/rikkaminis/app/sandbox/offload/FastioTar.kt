@@ -390,6 +390,18 @@ internal fun tarExtract(
                                 reader.skipData()
                                 continue
                             }
+                            // [audit3 F-01] mirror the '0' branch: a DIRECTORY
+                            // is never replaceable. `--force` used to delete an
+                            // empty directory and drop a symlink in its place
+                            // (the archive's own root included: `target` is
+                            // `dest` for a `.` member), which turned the
+                            // extraction root into a link to anywhere on the
+                            // host and let every later member write through it.
+                            if (Files.isDirectory(target, LinkOption.NOFOLLOW_LINKS)) {
+                                out.errors.add("${member.name}: target is a directory; refusing to replace it with a symlink")
+                                reader.skipData()
+                                continue
+                            }
                             Files.delete(target)
                         }
                         Files.createDirectories(target.parent)
@@ -451,7 +463,10 @@ private fun describe(refusal: TarRefusal): String = when (refusal) {
  * illegal: absolute, containing NUL, or climbing above the root. An EMPTY
  * list means the entry IS the root itself (`.` / `./` / `././` — what GNU
  * and busybox `tar -cf a.tar .` both write as their first member); that is
- * legal and extracts to [dest] itself. Pure — the same rule is applied in
+ * legal for a DIRECTORY entry and extracts to [dest] itself — [tarEntryTarget]
+ * refuses any other entry type that normalizes to nothing, because it would
+ * replace the extraction root instead of writing inside it ([audit3 F-01]).
+ * Pure — the same rule is applied in
  * the validation pass and again in the extraction pass, so the two can
  * never disagree about what a name means.
  *
@@ -484,7 +499,7 @@ internal fun tarNormalizeMember(name: String): List<String>? {
  * The tar-slip rule, applied to ONE member. Returns null when [member] may be
  * written under [dest].
  *
- * Four ways out of the destination are refused:
+ * Five ways out of the destination are refused:
  *   1. an absolute name (`/etc/passwd`);
  *   2. a name whose `..` segments climb above the destination root;
  *   3. a name whose PARENT chain crosses a symlink that already exists on disk
@@ -495,10 +510,26 @@ internal fun tarNormalizeMember(name: String): List<String>? {
  *      that one: the link is created during extraction, after validation has
  *      to have decided. Checking it in the validation pass is what keeps
  *      "a hostile archive leaves nothing behind" true for the whole archive.
+ *   5. [audit3 F-01] the destination ROOT being in the same bad state: either
+ *      already a symlink on disk, or one this archive replaced (a `.` member of
+ *      type `2`, or a declared link whose normalized name is the empty string).
+ *      Rules 3 and 4 both walk the PARENT chain of a name, so an entry with no
+ *      parent segments — a top-level `pwned.txt`, or the root entry itself —
+ *      never gets its root inspected, and `dest.resolve(".").normalize()` IS
+ *      `dest`. Without rule 5 a `.` symlink could delete the destination
+ *      directory and rebuild it as a link to any host path, after which every
+ *      later member writes through it.
+ *
+ * A member that normalizes to NOTHING (`.`, `./`, `a/..`) names the destination
+ * itself; only a DIRECTORY entry (`type == '5'`) may do that — `tar -cf a.tar .`
+ * writes `./` as its first member and extracting it is a no-op on [dest]. Any
+ * other type naming the root (regular file, symlink, hard link) is refused: it
+ * would replace the root rather than write inside it.
  *
  * The last segment is deliberately NOT followed: writing onto an existing
  * symlink is what `force` is for, and it replaces the link rather than its
- * target (`Files.delete` below).
+ * target (`Files.delete` below) — never a directory, which the extractor
+ * refuses outright.
  */
 internal fun tarEntryTarget(
     dest: Path,
@@ -507,6 +538,36 @@ internal fun tarEntryTarget(
 ): TarRefusal? {
     val segments = tarNormalizeMember(member.name)
         ?: return TarRefusal.Slip(member.name, "entry '${member.name}' is absolute, contains NUL, or escapes the extraction root")
+
+    // [audit3 F-01] rule 5, checked before anything is written: the parent
+    // chain below starts at `dest`, so `dest` itself is the one component no
+    // member name can put into position to be examined.
+    if (Files.isSymbolicLink(dest)) {
+        return TarRefusal.Slip(
+            member.name,
+            "entry '${member.name}' would write through the extraction root '$dest', which is itself a symlink — refusing (tar slip)",
+        )
+    }
+    if ("" in declaredLinks) {
+        // Unreachable while a root type `2` entry is refused just below — kept
+        // so that the invariant "no member may be written once the root has
+        // been replaced by a link" does not depend on the branch above.
+        return TarRefusal.Slip(
+            member.name,
+            "entry '${member.name}' would write through the extraction root, which this archive replaced with a symlink — refusing (tar slip)",
+        )
+    }
+
+    if (segments.isEmpty()) {
+        return if (member.type == '5') {
+            null
+        } else {
+            TarRefusal.Slip(
+                member.name,
+                "entry '${member.name}' names the extraction root itself with type '${member.type}'; only a directory entry ('5') may — refusing (tar slip)",
+            )
+        }
+    }
 
     var current = dest
     for (i in 0 until segments.size - 1) {
