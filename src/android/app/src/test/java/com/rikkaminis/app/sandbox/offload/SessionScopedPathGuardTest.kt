@@ -150,4 +150,109 @@ class SessionScopedPathGuardTest {
             )
         }
     }
+
+    // ── [fix/audit3-1015 F-08] the three-way classification ─────────────
+
+    private fun classify(path: String, sid: String? = sessionId) =
+        ModelUseOffloadHandler.classifySessionPath(filesDir, sid, path)
+
+    @Test
+    fun `legitimate scope paths classify as Resolved`() {
+        val cases = mapOf(
+            "/var/minis/workspace/report.md" to "${sessionTree()}/workspace/report.md",
+            "/var/minis/attachments" to "${sessionTree()}/attachments",
+            "/var/minis/offloads/model-use/a.bin" to "${sessionTree()}/offloads/model-use/a.bin",
+            "/var/minis/browser/tabs/a.html" to "${sessionTree()}/browser/tabs/a.html",
+        )
+        for ((path, expected) in cases) {
+            val d = classify(path)
+            assertTrue("$path should be Resolved, was $d", d is SessionScopedPathDecision.Resolved)
+            assertEquals(expected, (d as SessionScopedPathDecision.Resolved).file.absolutePath)
+        }
+    }
+
+    @Test
+    fun `paths with no session view classify as NotSessionScoped`() {
+        // No session context: the global resolver is the honest answer.
+        assertTrue(classify("/var/minis/workspace/report.md", sid = null) is SessionScopedPathDecision.NotSessionScoped)
+        // Shared scopes are session-independent by construction.
+        assertTrue(classify("/var/minis/shared/notes/a.md") is SessionScopedPathDecision.NotSessionScoped)
+        assertTrue(classify("/var/minis/memory/GLOBAL.md") is SessionScopedPathDecision.NotSessionScoped)
+        // Guest paths outside /var/minis (e.g. --output /tmp/out.json → rootfs).
+        assertTrue(classify("/tmp/out.json") is SessionScopedPathDecision.NotSessionScoped)
+        assertTrue(classify("workspace/relative.md") is SessionScopedPathDecision.NotSessionScoped)
+    }
+
+    @Test
+    fun `guard-refused scope paths classify as Rejected, not NotSessionScoped`() {
+        val attacks = listOf(
+            "/var/minis/workspace/../../../debug_server_token",
+            "/var/minis/workspace/../../shared_prefs/offload_permissions.xml",
+            "/var/minis/workspace/../browser/cookies",
+            "/var/minis/workspace/..",
+        )
+        for (path in attacks) {
+            assertTrue(
+                "$path must be Rejected (its session-scoped shape means a refusal is final), was ${classify(path)}",
+                classify(path) is SessionScopedPathDecision.Rejected,
+            )
+        }
+    }
+
+    // ── [fix/audit3-1015 F-08] fail-closed resolution ───────────────────
+
+    @Test
+    fun `a Rejected path never reaches the global resolver`() {
+        var globalCalls = 0
+        val global: (String) -> File? = { globalCalls++; File(tmp.root, "global-placeholder") }
+        val resolved = ModelUseOffloadHandler.sessionAwareHostFile(
+            filesDir,
+            sessionId,
+            "/var/minis/workspace/../../../debug_server_token",
+            global,
+        )
+        assertNull("a refused scope path must resolve to nothing", resolved)
+        assertEquals("the global resolver must not get a second opinion", 0, globalCalls)
+    }
+
+    @Test
+    fun `a NotSessionScoped path still uses the global resolver`() {
+        val expected = File(filesDir, "rootfs-tmp-out.json")
+        var seen: String? = null
+        val resolved = ModelUseOffloadHandler.sessionAwareHostFile(filesDir, sessionId, "/tmp/out.json") {
+            seen = it; expected
+        }
+        assertEquals("/tmp/out.json", seen)
+        assertEquals(expected.absolutePath, resolved?.absolutePath)
+    }
+
+    /**
+     * The concrete leak this fix closes, as a differential: with session B
+     * holding a file at the same relative name, the pre-fix elvis chain
+     * (`?: PRootKernel.resolveHostPath(...)`) answered the refused query with
+     * session B's file — a cross-session read the caller never asked for. The
+     * injected resolver below IS that global resolver, returning B's file.
+     */
+    @Test
+    fun `a refused traversal cannot come back as another session's file`() {
+        val sidB = "9c2b8f31-6c2e-4f0a-9c1d-2b6f7a5e8d10"
+        val other = File(filesDir, "minis-sessions/$sidB/workspace/secret.txt")
+        other.parentFile.mkdirs()
+        other.writeText("session B's data")
+        val globalWouldReturn = { _: String -> other }
+
+        // The path a hostile caller passes from session A: refused by the
+        // in-scope guard, but the global resolver's normalized tail
+        // (`workspace/secret.txt`) matches B's real file.
+        val refused = ModelUseOffloadHandler.sessionAwareHostFile(
+            filesDir, sessionId, "/var/minis/workspace/../workspace/secret.txt", globalWouldReturn,
+        )
+        assertNull("refused path must not resolve to session B's file", refused)
+
+        // Control: the file really is reachable through the global resolver, so
+        // the assertion above is about the fail-closed decision, not about a
+        // missing file.
+        assertEquals(other.absolutePath, globalWouldReturn("/var/minis/workspace/secret.txt")?.absolutePath)
+        assertTrue(other.exists())
+    }
 }

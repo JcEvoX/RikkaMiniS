@@ -13,11 +13,20 @@ Rules (scan src/android/app/src/main/java, production only — never tests):
   HARD (exit 1):
    * `provider.sendMessage(`  — only legal in worker ModelExecutionService.kt
    * `provider.streamMessage(` — only legal in worker ModelExecutionService.kt
+   * `.rawPassthroughRequest(` — Model Use's raw mode; worker only
+   * `.generateImage(`         — Model Use's image mode; worker only
+
+  Patterns that are not already receiver-qualified are dot-prefixed so the
+  *declaration* inside a provider class (`suspend fun rawPassthroughRequest(`)
+  does not match — only call sites do. Sanctioned non-provider call sites are
+  exempted by[string] (see EXEMPT_SUBSTRINGS).
 
   SKIPPED:
    * comment lines (//, /*, *, */)
    * the worker file itself (ModelExecutionService.kt) — it OWNS provider calls
    * `viewModel.sendMessage` / `viewModel.streamMessage` — not a provider call
+   * lines carrying an EXEMPT_SUBSTRINGS entry (e.g. the CLI chokepoint
+     `ProviderExecutionGateway.generateImage(`)
 
   WARN (informational, exit 0):
    * ProviderFactory.create anywhere outside the worker (currently legitimate
@@ -35,10 +44,26 @@ import sys
 
 WORKER_RE = re.compile(r".*[/\\]offload[/\\]ModelExecutionService\.kt$")
 
-# Hard-flag target patterns: a direct provider network call.
+# Hard-flag target patterns: a direct provider network call. Patterns that are
+# not already receiver-qualified are dot-prefixed so a *declaration* inside a
+# provider class (`suspend fun rawPassthroughRequest(`) does not match — only
+# call sites do.
 TARGETS = [
     ("provider.sendMessage(", "provider.sendMessage("),
     ("provider.streamMessage(", "provider.streamMessage("),
+    # [fix/audit3-1015 F-03] Model Use's own provider entry points. `--passthrough`
+    # used to call `openAI.rawPassthroughRequest(...)` from :app, where the
+    # ProviderBoundary runtime guard refuses it — so the mode could never succeed
+    # and this gate's pattern list did not mention the entry point at all.
+    (".rawPassthroughRequest(", ".rawPassthroughRequest("),
+    (".generateImage(", ".generateImage("),
+]
+
+# Sanctioned call sites that legitimately contain a target pattern: the CLI
+# chokepoint is the gateway, not a provider — `ProviderExecutionGateway.generateImage`
+# (app side) dispatches to the worker.
+EXEMPT_SUBSTRINGS = [
+    "ProviderExecutionGateway.generateImage(",
 ]
 
 # ProviderFactory.create in the APP process is *informational*: TF-D's remaining
@@ -80,6 +105,8 @@ def main() -> int:
                         continue
                     for pat in TARGETS:
                         if pat[0] in line:
+                            if any(x in line for x in EXEMPT_SUBSTRINGS):
+                                continue
                             offences.append(f"{display}:{i}: {line.strip()}")
                     if CREATE_INFO in line:
                         # Metadata-only construction is tracked (informational).
@@ -90,7 +117,8 @@ def main() -> int:
         for o in offences:
             print(f"   - {o}")
         print(
-            "   All provider sendMessage/streamMessage MUST live in "
+            "   All provider network entry points (sendMessage / streamMessage / "
+            "rawPassthroughRequest / generateImage) MUST live in "
             "ModelExecutionService.kt (:modelservice). Route through "
             "ProviderExecutionGateway instead."
         )

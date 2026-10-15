@@ -73,6 +73,10 @@ object ModelExecutionDispatcher {
         // toggle stamped on the main-process provider object never reached the
         // wire. Carried as an explicit payload key instead.
         enhancedCache: Boolean = false,
+        // [fix/audit3-1015 F-03] Raw passthrough request (endpoint/method/
+        // headers/body) assembled by :app; the worker performs the HTTP call
+        // because ProviderBoundary forbids provider calls in the app process.
+        passthroughRequest: JSONObject? = null,
     ): String {
         return JSONObject().apply {
             put("instance_id", instance.id)
@@ -266,6 +270,7 @@ object ModelExecutionDispatcher {
             }
 
             if (inputJson.isNotBlank()) put("input_json", inputJson)
+            if (passthroughRequest != null) put("passthrough_request", passthroughRequest)
             outputExt?.let { put("output_ext", it) }
 
             if (tools.isNotEmpty()) {

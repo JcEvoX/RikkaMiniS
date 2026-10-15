@@ -76,7 +76,6 @@ ALLOWED = {
     ('src/android/app/src/main/java/com/rikkaminis/app/provider/openai/OpenAIProvider.kt', 'com.rikkaminis.app.logging.AppLogger.info('),
     ('src/android/app/src/main/java/com/rikkaminis/app/provider/openai/OpenAIProvider.kt', 'com.rikkaminis.app.logging.AppLogger.info('),
     ('src/android/app/src/main/java/com/rikkaminis/app/provider/openai/OpenAIProvider.kt', 'com.rikkaminis.app.logging.AppLogger.warning('),
-    ('src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ModelUseOffloadHandler.kt', 'Log.i(TAG, "[ModelUseRoute] raw-passthrough done status=${result.statu'),
     ('src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/OpenOffloadHandler.kt', 'Log.d(TAG, "startActivity url=\'$url\' action=${intent.action} resolved='),
     ('src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/OpenOffloadHandler.kt', 'Log.w(TAG, "no handler for \'$url\'")'),
     ('src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/OpenOffloadHandler.kt', 'Log.w(TAG, "parseUri failed for \'$url\': ${e.message}")'),
