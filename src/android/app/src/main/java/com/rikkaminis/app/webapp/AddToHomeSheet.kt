@@ -2,7 +2,6 @@ package com.rikkaminis.app.webapp
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color as AGColor
 import android.graphics.Paint
@@ -71,6 +70,7 @@ import com.rikkaminis.app.R
 import com.rikkaminis.app.ui.components.sanitizeSingleLineInput
 import com.rikkaminis.app.data.repository.WebAppShortcutRepository
 import com.rikkaminis.app.data.storage.SessionFileStore
+import com.rikkaminis.app.util.ImageDecoding
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -296,8 +296,14 @@ fun AddToHomeSheet(
                                 onClick = { selectedIcon = IconChoice.Webpage(path) },
                                 contentDescription = stringResource(R.string.webapp_sheet_icon_webpage),
                             ) {
+                                // [audit3-F-13] Bounded decode. This tile is
+                                // 36.dp, but the bare `decodeFile` here
+                                // materialised the whole source on the Compose
+                                // thread — a 12 Mpx webpage icon is ~48 MB of
+                                // ARGB_8888 for a thumbnail, and a 4K one blew
+                                // past the canvas draw ceiling.
                                 val bmp = remember(path) {
-                                    runCatching { BitmapFactory.decodeFile(path) }.getOrNull()
+                                    ImageDecoding.decodeFileBounded(path, ICON_MAX_EDGE_PX)?.bitmap
                                 }
                                 if (bmp != null) {
                                     androidx.compose.foundation.Image(
@@ -620,8 +626,29 @@ private fun parseHtmlTitle(file: File): String? {
     return m.groupValues.getOrNull(1)?.trim()?.takeIf { it.isNotBlank() }
 }
 
-private fun loadBitmapFromUri(context: Context, uri: Uri): Bitmap? = runCatching {
-    context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
+/**
+ * [audit3-F-13] Longest edge of a decoded icon bitmap, in pixels. Matches the
+ * 192x192 adaptive-ready icon [renderIconBitmap] builds (108dp safe zone) and
+ * the 36.dp preview tile, so nothing is decoded that cannot be shown.
+ */
+private const val ICON_MAX_EDGE_PX = 192
+
+/**
+ * Bounded decode of a picked image. Reads the encoded bytes once and hands them
+ * to [ImageDecoding.decodeBytesBounded], which probes the header
+ * (`inJustDecodeBounds`), samples the decode, and shrinks to the exact bound —
+ * so a 50 Mpx gallery photo never allocates its ~200 MB full-resolution
+ * bitmap just to fill a 36.dp tile. The encoded bytes (a few MB at worst) are
+ * strictly smaller than the pixels they replace and are released right after
+ * the decode.
+ */
+private fun loadBitmapFromUri(
+    context: Context,
+    uri: Uri,
+    maxEdge: Int = ICON_MAX_EDGE_PX,
+): Bitmap? = runCatching {
+    context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+        ?.let { ImageDecoding.decodeBytesBounded(it, maxEdge)?.bitmap }
 }.getOrNull()
 
 /**
@@ -642,19 +669,36 @@ private fun renderIconBitmap(context: Context, choice: IconChoice, title: String
 
     when (choice) {
         is IconChoice.Webpage -> {
-            val src = runCatching { BitmapFactory.decodeFile(choice.path) }.getOrNull()
+            // [audit3-F-13] Bounded decode + explicit recycling: the pre-fix
+            // code decoded the whole file, then `createScaledBitmap` left both
+            // the full-size source and the 192x192 copy unreachable-but-alive
+            // (bitmap pixels are native memory ART's GC does not see).
+            val src = ImageDecoding.decodeFileBounded(choice.path, size)?.bitmap
             if (src != null) {
+                // Kept on purpose: the source keeps its aspect ratio while the
+                // launcher icon is square, and the pre-fix code stretched the
+                // source over the whole canvas. Dropping this pass would
+                // letterbox every non-square icon — a visible change that has
+                // nothing to do with the decode bound.
                 val scaled = Bitmap.createScaledBitmap(src, size, size, true)
                 canvas.drawBitmap(scaled, 0f, 0f, null)
+                // `canvas` is a software canvas (Canvas(bmp) below), so the
+                // pixels are copied during drawBitmap and both temporaries can
+                // go immediately. `createScaledBitmap` returns its own input
+                // when no scaling is needed, hence the identity check.
+                if (scaled !== src) scaled.recycle()
+                src.recycle()
                 return bmp
             }
             drawTitleGlyph(canvas, title, size)
         }
         is IconChoice.Gallery -> {
-            val src = loadBitmapFromUri(context, choice.uri)
+            val src = loadBitmapFromUri(context, choice.uri, maxEdge = size)
             if (src != null) {
                 val scaled = Bitmap.createScaledBitmap(src, size, size, true)
                 canvas.drawBitmap(scaled, 0f, 0f, null)
+                if (scaled !== src) scaled.recycle()
+                src.recycle()
                 return bmp
             }
             drawTitleGlyph(canvas, title, size)
