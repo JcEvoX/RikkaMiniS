@@ -1,5 +1,9 @@
 package com.rikkaminis.app.sandbox.offload
 
+import com.rikkaminis.app.data.model.ImageEndpointMode
+import com.rikkaminis.app.data.model.ProviderCredential
+import com.rikkaminis.app.data.model.ProviderType
+import com.rikkaminis.app.provider.safeOptString
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -88,5 +92,233 @@ internal object ModelUseProtocol {
             }
         }
         return out
+    }
+
+    // ── image generation route ──────────────────────────────────────────────
+    //
+    // [fix/audit3-1015 F-10] The image route used to be implemented TWICE, in
+    // the two processes, and only one copy was live:
+    //
+    //   - `:app`'s `tryImageGenerationRoute` (≈150 lines) had the complete
+    //     routing logic (pure-image pinning, input-image handling, endpoint
+    //     resolution) but was reachable only from the fallback path taken when
+    //     a dispatch FAILED — and that path called `generateImage` in-process,
+    //     which `ProviderBoundary.enforce` rejects (F-03's violation).
+    //   - `:modelservice`'s branch was the live one, but it keyed the route on
+    //     `outputExt in ("png","jpg",…)` alone: a pure image generator invoked
+    //     without `-o` was sent to the chat endpoint (which cannot serve it),
+    //     input images were silently dropped into a text-to-image call, and
+    //     the pure-image endpoint pin was missing.
+    //
+    // The decision now lives here, once, as a pure function of its inputs.
+
+    /** Image-gen knobs the `run` input JSON may carry. */
+    data class ImageGenConfig(
+        val prompt: String? = null,
+        val n: Int = 1,
+        val size: String? = null,
+        val quality: String? = null,
+        val endpointOverride: ImageEndpointMode? = null,
+    )
+
+    /**
+     * `prompt`/`n`/`size`/`quality` from either the top level or
+     * `generation_config` (top level wins), plus an endpoint override via
+     * `image_endpoint` / `endpoint` / `generation_config.image_endpoint`.
+     */
+    fun parseImageGenConfig(inputJson: String): ImageGenConfig {
+        val obj = try {
+            val t = inputJson.trim()
+            if (t.startsWith("{")) JSONObject(t) else null
+        } catch (_: Throwable) { null } ?: return ImageGenConfig()
+
+        var prompt: String? = null
+        var n = 1
+        var size: String? = null
+        var quality: String? = null
+
+        // generation_config first (lower priority).
+        obj.optJSONObject("generation_config")?.let { gc ->
+            val gn = if (gc.has("n")) gc.optInt("n", 1)
+            else if (gc.has("number_of_images")) gc.optInt("number_of_images", 1) else 1
+            n = maxOf(1, gn)
+            size = gc.safeOptString("size", "").ifEmpty { gc.safeOptString("image_size", "").ifEmpty { null } }
+            quality = gc.safeOptString("quality", "").ifEmpty { null }
+            prompt = gc.safeOptString("prompt", "").ifEmpty { null }
+        }
+        // Top-level overrides.
+        obj.safeOptString("prompt", "").takeIf { it.isNotEmpty() }?.let { prompt = it }
+        if (obj.has("n")) n = maxOf(1, obj.optInt("n", n))
+        obj.safeOptString("size", "").takeIf { it.isNotEmpty() }?.let { size = it }
+        obj.safeOptString("quality", "").takeIf { it.isNotEmpty() }?.let { quality = it }
+
+        // Endpoint override (image_endpoint / endpoint / generation_config.image_endpoint).
+        val rawEndpoint = obj.safeOptString("image_endpoint", "").ifEmpty {
+            obj.safeOptString("endpoint", "").ifEmpty {
+                obj.optJSONObject("generation_config")?.safeOptString("image_endpoint", "").orEmpty()
+            }
+        }
+        val endpoint = when (rawEndpoint.lowercase()) {
+            "auto" -> ImageEndpointMode.auto
+            "images_generations", "images-generations", "images-gen" ->
+                ImageEndpointMode.imagesGenerations
+            "chat_completions", "chat-completions", "chat" ->
+                ImageEndpointMode.chatCompletions
+            else -> null
+        }
+        return ImageGenConfig(prompt, n, size, quality, endpoint)
+    }
+
+    /** Extensions that mean "the caller wants the answer written as an image". */
+    private val IMAGE_OUTPUT_EXTS = setOf("png", "jpg", "jpeg", "webp", "gif")
+
+    fun isImageOutputExt(ext: String?): Boolean = ext?.lowercase() in IMAGE_OUTPUT_EXTS
+
+    /**
+     * `image_output` without `text_output`: such a model has exactly ONE usable
+     * endpoint (the Images API). A stale cached `chatCompletions` pin would
+     * send it somewhere it cannot answer (401 "Missing scopes"), so the route
+     * pins it to `imagesGenerations` regardless of the cache.
+     */
+    fun isPureImageGenerator(outputModalities: List<String>): Boolean =
+        outputModalities.any { it.equals("image", ignoreCase = true) } &&
+            outputModalities.none { it.equals("text", ignoreCase = true) }
+
+    sealed class ImageRoute {
+        /** No image route: use the normal chat-completions sendMessage path. */
+        object ChatPath : ImageRoute()
+
+        /** Route through an image endpoint in the given mode. */
+        data class Generate(val mode: ImageEndpointMode) : ImageRoute()
+
+        /** Terminal refusal — the caller must surface this, not fall through. */
+        data class Reject(val error: String, val message: String) : ImageRoute()
+    }
+
+    /**
+     * Where should an image-output model send this `run` call?
+     *
+     * Ported verbatim from `:app`'s `tryImageGenerationRoute`, with the
+     * service's live `-o <media ext>` trigger kept as the mixed-model gate:
+     * `-o out.png` is the caller-facing way to say "I want an image".
+     */
+    fun decideImageRoute(
+        displayName: String,
+        outputModalities: List<String>,
+        outputExt: String?,
+        hasInputImages: Boolean,
+        providerType: ProviderType?,
+        credentialType: ProviderCredential?,
+        isOpenAiCompatibleProvider: Boolean,
+        imageEndpointMode: ImageEndpointMode,
+        imageEndpointResolved: ImageEndpointMode?,
+        endpointOverride: ImageEndpointMode?,
+    ): ImageRoute {
+        // Only OpenAI-compatible API-key instances have an Images API.
+        if (!isOpenAiCompatibleProvider) return ImageRoute.ChatPath
+        if (outputModalities.none { it.equals("image", ignoreCase = true) }) return ImageRoute.ChatPath
+        if (providerType != ProviderType.openAI &&
+            providerType != ProviderType.openRouter &&
+            providerType != ProviderType.xAI
+        ) {
+            return ImageRoute.ChatPath
+        }
+        if (credentialType == ProviderCredential.oauth) return ImageRoute.ChatPath
+
+        val pure = isPureImageGenerator(outputModalities)
+        // [F-10 gap 1] A pure image generator WITHOUT `-o <media ext>` used to
+        // be sent to the chat path, where an image-only model cannot answer.
+        // It has exactly one route; take it. (Mixed text+image models keep the
+        // `-o` trigger: a caller asking for text gets text.)
+        if (!isImageOutputExt(outputExt) && !pure) return ImageRoute.ChatPath
+
+        // [F-10 gap 2] Input images used to be silently dropped into a
+        // text-to-image call, so the reference image was ignored and the user
+        // got the wrong picture with no explanation.
+        if (hasInputImages) {
+            if (pure) {
+                return ImageRoute.Reject(
+                    error = "image_edit_not_supported",
+                    message = "Image-to-image editing (input image + $displayName) is not " +
+                        "supported by minis-model-use on Android yet — only text-to-image " +
+                        "generation. Omit the input image, or use a model that also supports " +
+                        "text output so the image can be passed via chat.",
+                )
+            }
+            // Mixed text+image model: the chat path forwards imageParts, so the
+            // reference image is at least seen.
+            return ImageRoute.ChatPath
+        }
+
+        // [F-10 gap 3] Endpoint-mode resolution, including the pure-image pin:
+        // a pure image generator can NEVER be pinned to chatCompletions (a
+        // stale probe cache would send it to an endpoint that cannot serve it).
+        val effectiveMode = when {
+            endpointOverride != null -> endpointOverride
+            pure -> ImageEndpointMode.imagesGenerations
+            imageEndpointMode == ImageEndpointMode.auto && imageEndpointResolved != null -> imageEndpointResolved
+            else -> imageEndpointMode
+        }
+        if (effectiveMode == ImageEndpointMode.chatCompletions) return ImageRoute.ChatPath
+        return ImageRoute.Generate(effectiveMode)
+    }
+
+    /**
+     * Does this provider error mean "that endpoint is not there" (→ the auto
+     * probe may cache chatCompletions and fall through) rather than a real
+     * failure (auth / moderation / network), which must surface?
+     */
+    fun looksLikeEndpointMissing(message: String): Boolean {
+        val m = message.lowercase()
+        return m.contains("404") ||
+            m.contains("not found") ||
+            m.contains("no such endpoint") ||
+            m.contains("unknown endpoint") ||
+            m.contains("invalid url") ||
+            m.contains("method not allowed") ||
+            m.contains("unsupported route") ||
+            m.contains("405")
+    }
+
+    /** Provider-specific image-param guidance appended to a terminal failure. */
+    fun imageParamHint(
+        displayName: String,
+        providerType: ProviderType?,
+        outputModalities: List<String>,
+    ): String {
+        if (outputModalities.none { it.equals("image", ignoreCase = true) }) return ""
+        return when (providerType) {
+            ProviderType.gemini -> """
+                Hint — $displayName is a Gemini image model. Pass image params under `generation_config` in the input JSON:
+                  aspect_ratio       "1:1" | "16:9" | "9:16" | "4:3" | "3:4"
+                  image_size         "512px" | "1K" | "2K" | "4K"
+                  number_of_images   1-4
+                  person_generation  "DONT_ALLOW" | "ALLOW_ADULT"
+                Example:
+                  {"messages":[{"role":"user","content":"<prompt>"}],
+                   "generation_config":{"aspect_ratio":"16:9","image_size":"2K"}}
+            """.trimIndent()
+            ProviderType.openAI, ProviderType.openRouter -> """
+                Hint — $displayName is an OpenAI-compatible image model. Pass image params at the top level of the input JSON (matches /v1/images/generations):
+                  n         integer, number of images (default 1)
+                  size      "1024x1024" | "1792x1024" | "1024x1792" | etc.
+                  quality   "standard" | "hd"
+                  prompt    string (overrides last user message)
+                Example:
+                  {"prompt":"<prompt>","size":"1792x1024","quality":"hd","n":1}
+
+                Passthrough (topics: image-to-image, extra_body, extra_headers, endpoint_path) — any field our schema doesn't model is forwarded VERBATIM into the /images/generations JSON body, so you can drive provider-specific params (e.g. Volcengine Seedream image-to-image via an `image` field, `watermark`, `tools`). Two ways, both optional & additive:
+                  • implicit: any unknown TOP-LEVEL key → request body
+                  • explicit: `extra_body` (object, merged into body), `extra_headers` (string map, added to request headers), `endpoint_path` (string, overrides "/images/generations" for non-standard endpoints)
+                Your keys win over our defaults; `model` is always forced to the resolved id. If you set `response_format`, the b64_json auto-probe is skipped.
+                Image-to-image example (Seedream — image goes in the BODY, not messages):
+                  {"prompt":"make the eyes blue","image":"data:image/png;base64,<...>","size":"2K","watermark":false}
+                Explicit-envelope example:
+                  {"messages":[{"role":"user","content":"<prompt>"}],"extra_body":{"image":"<url-or-data-uri>","seed":42},"extra_headers":{"X-Custom":"1"},"endpoint_path":"/api/v3/images/generations"}
+            """.trimIndent()
+            // xAI (Grok) / Kimi Coding have no image-output models in the
+            // current catalog — fall through to empty hint like Anthropic.
+            ProviderType.anthropic, ProviderType.xAI, ProviderType.kimiCode, null -> ""
+        }
     }
 }

@@ -5,7 +5,6 @@ import android.util.Base64
 import android.util.Log
 import com.rikkaminis.app.data.model.LLMMessage
 import com.rikkaminis.app.data.model.ModelEntry
-import com.rikkaminis.app.data.model.ProviderType
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.provider.ProviderFactory
 import com.rikkaminis.app.provider.safeOptString
@@ -415,6 +414,17 @@ class ModelUseOffloadHandler(
         if (remoteResult != null) {
             val remote = try { JSONObject(remoteResult) } catch (e: Throwable) { null }
             if (remote != null) {
+                // [fix/audit3-1015 F-10] The image endpoint auto-probe runs in
+                // :modelservice now; its answer rides back on the result and is
+                // persisted HERE, in the process that owns ProviderRepository —
+                // workers must not write SharedPreferences. Read before the error
+                // branch: the cache is valid even when the (follow-up) chat call
+                // then failed.
+                remote.optString("image_endpoint_resolved", "").takeIf { it.isNotEmpty() }?.let { cached ->
+                    com.rikkaminis.app.data.model.ImageEndpointMode.values()
+                        .firstOrNull { it.name == cached }
+                        ?.let { providerRepository.setImageEndpointResolved(instance.id, it) }
+                }
                 val remoteErr = remote.optString("error", "")
                 if (remoteErr.isNotEmpty()) {
                     Log.w(TAG, "remote run failed: $remoteErr")
@@ -465,26 +475,17 @@ class ModelUseOffloadHandler(
             }
             Log.w(TAG, "remote result unparseable — falling back in-process")
         }
-        val imageRouted = tryImageGenerationRoute(
-            entry = entry,
-            instance = instance,
-            provider = provider,
-            inputJson = inputText,
-            fallbackPromptMessages = nonSystem,
-            hasInputImages = imageParts.isNotEmpty(),
-            outputPath = outputPath,
-            outputExt = outputExt,
-            sessionId = request.sessionId,
-            callWarnings = callWarnings,
-        )
-        if (imageRouted != null) return attachCallFeedback(imageRouted, callWarnings, appliedExtras)
-
-        // TF-D: the remote (:modelservice) path was the primary executor but did
-        // not produce a usable result. The app process MUST NOT fall back to an
-        // in-process provider.sendMessage call (its native heap would climb in
-        // the main process — the exact problem this isolation exists to solve).
-        // Surface a structured error so the caller can retry via the gateway /
-        // switch provider / inform the user — no silent in-process fallback.
+        // TF-D: the remote (:modelservice) path IS the executor. The app process
+        // MUST NOT fall back to an in-process provider call — its native heap
+        // would climb in the main process, the exact problem this isolation
+        // exists to solve.
+        //
+        // [fix/audit3-1015 F-10] This is where the CLI-side image route used to
+        // run (`tryImageGenerationRoute`), i.e. the app re-decided image routing
+        // and made an in-process provider.generateImage call whenever the remote
+        // result was missing or unparseable. Routing now has exactly one owner
+        // (`ModelUseProtocol.decideImageRoute`, called by the worker) and the
+        // app never calls a provider, so the fallback is a structured error.
         Log.w(TAG, "remote model-use run produced no usable result — returning structured error")
         return NativeOffloadResult(
             1,
@@ -498,72 +499,6 @@ class ModelUseOffloadHandler(
     }
 
     /**
-     * [T-android-image-endpoint-mode] Parsed image-generation knobs from the
-     * input JSON top level (native /images/generations shape) with
-     * `generation_config` as a lower-priority fallback. Mirrors iOS
-     * ModelUseOffloadBridge.parseImageGenerationConfig.
-     */
-    private data class ImageGenConfig(
-        val prompt: String? = null,
-        val n: Int = 1,
-        val size: String? = null,
-        val quality: String? = null,
-        val endpointOverride: com.rikkaminis.app.data.model.ImageEndpointMode? = null,
-    )
-
-    private fun parseImageGenConfig(inputJson: String): ImageGenConfig {
-        val obj = try {
-            val t = inputJson.trim()
-            if (t.startsWith("{")) JSONObject(t) else null
-        } catch (_: Throwable) { null } ?: return ImageGenConfig()
-
-        var prompt: String? = null
-        var n = 1
-        var size: String? = null
-        var quality: String? = null
-
-        // generation_config first (lower priority).
-        obj.optJSONObject("generation_config")?.let { gc ->
-            val gn = if (gc.has("n")) gc.optInt("n", 1)
-            else if (gc.has("number_of_images")) gc.optInt("number_of_images", 1) else 1
-            n = maxOf(1, gn)
-            size = gc.safeOptString("size", "").ifEmpty { gc.safeOptString("image_size", "").ifEmpty { null } }
-            quality = gc.safeOptString("quality", "").ifEmpty { null }
-        }
-        // Top-level overrides.
-        obj.safeOptString("prompt", "").takeIf { it.isNotEmpty() }?.let { prompt = it }
-        if (obj.has("n")) n = maxOf(1, obj.optInt("n", n))
-        obj.safeOptString("size", "").takeIf { it.isNotEmpty() }?.let { size = it }
-        obj.safeOptString("quality", "").takeIf { it.isNotEmpty() }?.let { quality = it }
-
-        // Endpoint override (image_endpoint / endpoint / generation_config.image_endpoint).
-        val rawEndpoint = obj.safeOptString("image_endpoint", "").ifEmpty {
-            obj.safeOptString("endpoint", "").ifEmpty {
-                obj.optJSONObject("generation_config")?.safeOptString("image_endpoint", "").orEmpty()
-            }
-        }
-        val endpoint = when (rawEndpoint.lowercase()) {
-            "auto" -> com.rikkaminis.app.data.model.ImageEndpointMode.auto
-            "images_generations", "images-generations", "images-gen" ->
-                com.rikkaminis.app.data.model.ImageEndpointMode.imagesGenerations
-            "chat_completions", "chat-completions", "chat" ->
-                com.rikkaminis.app.data.model.ImageEndpointMode.chatCompletions
-            else -> null
-        }
-        return ImageGenConfig(prompt, n, size, quality, endpoint)
-    }
-
-    /**
-     * [T-android-model-use-image-passthrough GH#62] Provider-specific extras
-     * forwarded verbatim to the /images/generations request.
-     */
-    private data class ImagePassthrough(
-        val body: Map<String, Any?> = emptyMap(),
-        val headers: Map<String, String> = emptyMap(),
-        val path: String? = null,
-    )
-
-    /**
      * Keys the handler already interprets itself — never treated as implicit
      * passthrough body fields, so existing callers' structure/behavior is
      * unchanged. (Explicit `extra_body` can still re-introduce any of these.)
@@ -575,72 +510,6 @@ class ModelUseOffloadHandler(
         "image_endpoint", "endpoint_path", "extra_body", "extra_headers",
         "stream", "temperature", "max_tokens",
     )
-
-    /**
-     * [T-android-model-use-image-passthrough GH#62] Parse passthrough extras from
-     * the input JSON. Two complementary modes, both fully optional and additive
-     * (absent → empty, old calls unaffected):
-     *   • Explicit envelope: `extra_body` (object), `extra_headers` (string map),
-     *     `endpoint_path` (string). Unambiguous; recommended in help.
-     *   • Implicit: any TOP-LEVEL key not in [imageReservedKeys] is folded into
-     *     the body — so `{"prompt":..,"image":"data:..","watermark":false}` just
-     *     works for Seedream-style image-to-image without an envelope.
-     * Explicit `extra_body` wins over implicit keys on conflict. Values are kept
-     * as raw org.json types so JSONObject.put() re-serializes them faithfully.
-     * Mirrors iOS ModelUseOffloadBridge.parseImagePassthrough.
-     */
-    private fun parseImagePassthrough(
-        inputJson: String,
-        warnings: MutableList<String> = mutableListOf(),
-    ): ImagePassthrough {
-        val obj = try {
-            val t = inputJson.trim()
-            if (t.startsWith("{")) JSONObject(t) else null
-        } catch (_: Throwable) { null } ?: return ImagePassthrough()
-
-        val body = LinkedHashMap<String, Any?>()
-        // Implicit: unknown top-level keys → body.
-        for (key in obj.keys()) {
-            if (key in imageReservedKeys) continue
-            body[key] = obj.opt(key)
-        }
-        // Explicit envelope overrides/augments the implicit keys.
-        // [T-model-use-passthrough-warnings] Type mismatches warn instead of
-        // silently skipping (deduped against the standard-mode parser's copy).
-        obj.opt("extra_body")?.takeIf { it != JSONObject.NULL }?.let { raw ->
-            if (raw is JSONObject) {
-                for (key in raw.keys()) body[key] = raw.opt(key)
-            } else {
-                warnings.add(
-                    "extra_body is not a JSON object (actual type: ${jsonTypeName(raw)}) — ignored. " +
-                        "Wrap your fields in an object: \"extra_body\":{...}.",
-                )
-            }
-        }
-        val headers = LinkedHashMap<String, String>()
-        obj.opt("extra_headers")?.takeIf { it != JSONObject.NULL }?.let { raw ->
-            if (raw is JSONObject) {
-                for (key in raw.keys()) {
-                    val v = raw.opt(key)
-                    if (v is String) {
-                        headers[key] = v
-                    } else {
-                        warnings.add(
-                            "extra_headers.$key value is not a string (actual type: ${jsonTypeName(v)}) — " +
-                                "this header was ignored. Header values must be JSON strings.",
-                        )
-                    }
-                }
-            } else {
-                warnings.add(
-                    "extra_headers is not a JSON object (actual type: ${jsonTypeName(raw)}) — " +
-                        "all custom headers were ignored.",
-                )
-            }
-        }
-        val path = obj.safeOptString("endpoint_path", "").trim().takeIf { it.isNotEmpty() }
-        return ImagePassthrough(body, headers, path)
-    }
 
     // MARK: - Call feedback [T-model-use-passthrough-warnings]
 
@@ -1010,190 +879,6 @@ class ModelUseOffloadHandler(
     }
 
     /**
-     * [T-android-image-endpoint-mode] Heuristic: does this provider error mean
-     * the /images/generations route doesn't exist on this base URL? Only then
-     * does auto-mode fall back to chat completions — real errors (auth, content
-     * moderation, model-not-found) propagate unchanged. Mirrors iOS
-     * looksLikeEndpointMissing.
-     */
-    private fun looksLikeEndpointMissing(message: String): Boolean {
-        val m = message.lowercase()
-        return m.contains("404") ||
-            m.contains("not found") ||
-            m.contains("no such endpoint") ||
-            m.contains("unknown endpoint") ||
-            m.contains("invalid url") ||
-            m.contains("method not allowed") ||
-            m.contains("unsupported route") ||
-            m.contains("405")
-    }
-
-    /**
-     * [T-android-image-endpoint-mode] Attempt image-output routing through
-     * /v1/images/generations. Returns a completed [NativeOffloadResult] when
-     * the image path produced output, or null to fall through to the normal
-     * chat-completions sendMessage path (chatCompletions mode, auto-fallback,
-     * or "not an image route" — e.g. non-image model / OAuth / non-OpenAI).
-     * Mirrors iOS ModelUseOffloadBridge step 4.
-     */
-    private fun tryImageGenerationRoute(
-        entry: ModelEntry,
-        instance: com.rikkaminis.app.data.model.ProviderInstance,
-        provider: com.rikkaminis.app.provider.LLMProvider,
-        inputJson: String,
-        fallbackPromptMessages: List<ParsedMessage>,
-        hasInputImages: Boolean,
-        outputPath: String?,
-        outputExt: String,
-        sessionId: String?,
-        callWarnings: MutableList<String> = mutableListOf(),
-    ): NativeOffloadResult? {
-        val outputs = entry.model.outputModalities.orEmpty()
-        val wantsImageOutput = "image" in outputs
-        val openAI = provider as? com.rikkaminis.app.provider.openai.OpenAIProvider
-        // Only OpenAI-compatible API-key instances with an image-output model.
-        if (!wantsImageOutput || openAI == null) return null
-        val pType = instance.providerType
-        if (pType != ProviderType.openAI && pType != ProviderType.openRouter && pType != ProviderType.xAI) return null
-        if (instance.credentialType == com.rikkaminis.app.data.model.ProviderCredential.oauth) return null
-
-        val cfg = parseImageGenConfig(inputJson)
-        val prompt = cfg.prompt
-            ?: fallbackPromptMessages.lastOrNull { it.role == "user" }?.content
-            ?: ""
-
-        // [T-android-model-use-image-passthrough GH#62] Forward arbitrary
-        // provider-specific body fields, an endpoint-path override, and extra
-        // headers straight through to the /images/generations request — lets
-        // callers drive models our fixed schema never modeled (e.g. Volcengine
-        // Seedream image-to-image via the `image` body field) with no persisted
-        // config. Set on the per-call provider so every generateImage call site
-        // below picks them up; nothing leaks across runs (the provider is built
-        // fresh per model-use invocation).
-        val passthrough = parseImagePassthrough(inputJson, callWarnings)
-        openAI.imageExtraBody = passthrough.body
-        openAI.imagePathOverride = passthrough.path
-        openAI.imageExtraHeaders = passthrough.headers
-        if (passthrough.body.isNotEmpty() || passthrough.path != null || passthrough.headers.isNotEmpty()) {
-            Log.i(
-                TAG,
-                "[ModelUseRoute] PASSTHROUGH bodyKeys=[${passthrough.body.keys.sorted().joinToString(",")}] " +
-                    "pathOverride=${passthrough.path ?: "<nil>"} " +
-                    "extraHeaderKeys=[${passthrough.headers.keys.sorted().joinToString(",")}]",
-            )
-        }
-
-        // A pure image generator (image_output but NOT text_output) can ONLY
-        // use the Images API — never let a stale cached chatCompletions pin it
-        // to the chat endpoint (which 401s "Missing scopes"). Mixed text+image
-        // models keep auto/probe/fallback.
-        val isPureImageGenerator = "image" in outputs && "text" !in outputs
-
-        // [T-android-image-endpoint-edit-gap] iOS routes input-image requests to
-        // /v1/images/edits (image-to-image); Android has no editImage endpoint
-        // yet. Rather than silently DROP the input image into a text-to-image
-        // generateImage call (the model would ignore the reference image and
-        // the user wouldn't know), handle the two cases explicitly:
-        //   - mixed text+image model: decline the images route → fall through to
-        //     the chat path below, which forwards imageParts to the model so the
-        //     reference image is at least seen.
-        //   - pure image generator: chat can't serve it, so return a clear error
-        //     telling the caller image editing isn't supported here.
-        if (hasInputImages) {
-            if (isPureImageGenerator) {
-                return NativeOffloadResult(
-                    2,
-                    JSONObject().put("error", "image_edit_not_supported")
-                        .put(
-                            "message",
-                            "Image-to-image editing (input image + ${entry.model.displayName}) is not supported by minis-model-use on Android yet — only text-to-image generation. Omit the input image, or use a model that also supports text output so the image can be passed via chat.",
-                        )
-                        .toString() + "\n",
-                )
-            }
-            Log.i(
-                TAG,
-                "[ModelUseRoute] input images present for ${entry.model.id} — declining images route (no editImage), falling through to chat so images are forwarded",
-            )
-            return null
-        }
-
-        val effectiveMode = when {
-            cfg.endpointOverride != null -> cfg.endpointOverride
-            isPureImageGenerator -> com.rikkaminis.app.data.model.ImageEndpointMode.imagesGenerations
-            instance.imageEndpointMode == com.rikkaminis.app.data.model.ImageEndpointMode.auto &&
-                instance.imageEndpointResolved != null -> instance.imageEndpointResolved!!
-            else -> instance.imageEndpointMode
-        }
-        Log.i(
-            TAG,
-            "[ModelUseRoute] image route model=${entry.model.id} mode=${instance.imageEndpointMode} " +
-                "resolved=${instance.imageEndpointResolved} pure=$isPureImageGenerator override=${cfg.endpointOverride} " +
-                "effective=$effectiveMode",
-        )
-
-        // chatCompletions → no image route; fall through to normal sendMessage.
-        if (effectiveMode == com.rikkaminis.app.data.model.ImageEndpointMode.chatCompletions) return null
-
-        // imagesGenerations (forced/cached/pure) → call directly; a failure here
-        // is terminal (no silent fallback) so the caller sees the real error.
-        if (effectiveMode == com.rikkaminis.app.data.model.ImageEndpointMode.imagesGenerations) {
-            val response = try {
-                runBlocking { openAI.generateImage(prompt, cfg.n, cfg.size, cfg.quality) }
-            } catch (e: Throwable) {
-                Log.w(TAG, "[ModelUseRoute] images/generations (forced) failed: ${e.message}", e)
-                val hint = imageParamHint(entry)
-                val base = e.message ?: "image_generation_failed"
-                return NativeOffloadResult(
-                    1,
-                    JSONObject().put("error", "image_generation_failed")
-                        .put("message", if (hint.isEmpty()) base else "$base\n\n$hint")
-                        .toString() + "\n",
-                )
-            }
-            return writeImageResult(entry, response, outputPath, outputExt, "images_generations", sessionId)
-        }
-
-        // auto mode: probe /images/generations; cache the result; on a
-        // route-missing 4xx, cache chatCompletions and fall through to chat.
-        val response = try {
-            runBlocking { openAI.generateImage(prompt, cfg.n, cfg.size, cfg.quality) }.also {
-                providerRepository.setImageEndpointResolved(
-                    instance.id, com.rikkaminis.app.data.model.ImageEndpointMode.imagesGenerations,
-                )
-            }
-        } catch (e: Throwable) {
-            val msg = e.message ?: ""
-            val routeMissing = (e is com.rikkaminis.app.data.model.LLMError.ProviderError ||
-                e is com.rikkaminis.app.data.model.LLMError.InvalidApiKey) && looksLikeEndpointMissing(msg)
-            if (routeMissing) {
-                Log.i(TAG, "[ModelUseRoute] auto probe → route missing (${msg.take(120)}) — caching chat_completions, falling back")
-                providerRepository.setImageEndpointResolved(
-                    instance.id, com.rikkaminis.app.data.model.ImageEndpointMode.chatCompletions,
-                )
-                return null // fall through to chat path
-            }
-            // Real error (auth/moderation/network) — surface it, don't fall through.
-            Log.w(TAG, "[ModelUseRoute] auto probe failed (non-route): ${e.message}", e)
-            val hint = imageParamHint(entry)
-            val base = e.message ?: "image_generation_failed"
-            return NativeOffloadResult(
-                1,
-                JSONObject().put("error", "image_generation_failed")
-                    .put("message", if (hint.isEmpty()) base else "$base\n\n$hint")
-                    .toString() + "\n",
-            )
-        }
-        return writeImageResult(entry, response, outputPath, outputExt, "images_generations", sessionId)
-    }
-
-    /**
-     * [T-android-image-endpoint-mode] Write an image-generation [response] to
-     * --output (media-first when the path is an image extension) and build the
-     * standard model-use result JSON. Shared shape with cmdRun's media-write
-     * branch.
-     */
-    /**
      * [ModelExecutionService] Shared output writer for both the remote and
      * in-process run paths: media-first if the model returned image/audio/
      * video and --output has a media extension, else fall back to text.
@@ -1278,75 +963,6 @@ class ModelUseOffloadHandler(
         )
     }
 
-    private fun writeImageResult(
-        entry: ModelEntry,
-        response: com.rikkaminis.app.data.model.LLMResponse,
-        outputPath: String?,
-        outputExt: String,
-        endpointUsed: String,
-        sessionId: String?,
-    ): NativeOffloadResult {
-        val mediaFiles = JSONArray()
-        val firstMedia = response.mediaAttachments.firstOrNull()
-        val ts = System.currentTimeMillis() / 1000
-        val modelSlug = entry.model.id.replace("/", "_")
-        if (outputPath != null) {
-            // [T-android-model-use-session-scoped-write] Session-scoped first,
-            // global resolver as fallback. --output is absolute here (relative
-            // rejected in cmdRun before the API call).
-            val hostFile = sessionAwareHostFile(outputPath, sessionId)
-                ?: return NativeOffloadResult(
-                    2,
-                    "minis-model-use run: cannot resolve --output '$outputPath'\n",
-                )
-            val outputIsMedia = isImageExt(outputExt)
-            if (firstMedia != null && outputIsMedia) {
-                hostFile.parentFile?.mkdirs()
-                hostFile.writeBytes(firstMedia.data)
-                logModelUseWrite(outputPath, hostFile, sessionId)
-                mediaFiles.put(JSONObject().apply {
-                    put("type", firstMedia.type.value)
-                    put("mime_type", firstMedia.mimeType)
-                    put("path", outputPath)
-                    put("size", firstMedia.data.size)
-                })
-            } else {
-                hostFile.parentFile?.mkdirs()
-                hostFile.writeText(response.text)
-            }
-        } else if (response.mediaAttachments.isNotEmpty()) {
-            // [T-android-model-use-session-scoped-write] Auto-save to the caller
-            // session's attachments dir, not the global (last-writer-wins) mount.
-            val attachDir = sessionAwareHostFile("/var/minis/attachments", sessionId)
-            if (attachDir != null) {
-                attachDir.mkdirs()
-                for ((idx, media) in response.mediaAttachments.withIndex()) {
-                    val ext = mimeToExt(media.mimeType)
-                    val fileName = "model-use-$modelSlug-$ts-$idx.$ext"
-                    val hostFile = File(attachDir, fileName)
-                    hostFile.writeBytes(media.data)
-                    val responsePath = "/var/minis/attachments/$fileName"
-                    logModelUseWrite(responsePath, hostFile, sessionId)
-                    mediaFiles.put(JSONObject().apply {
-                        put("type", media.type.value)
-                        put("mime_type", media.mimeType)
-                        put("path", responsePath)
-                        put("size", media.data.size)
-                    })
-                }
-            }
-        }
-        val body = JSONObject().apply {
-            put("model", entry.model.id)
-            put("text", response.text)
-            put("image_endpoint", endpointUsed)
-            if (outputPath != null) put("output_file", outputPath)
-            if (mediaFiles.length() > 0) put("media_files", mediaFiles)
-            if (firstMedia == null) put("warning", "Image endpoint returned no image data.")
-        }
-        return NativeOffloadResult(0, body.toString(2) + "\n")
-    }
-
     /**
      * [T-android-model-use-session-scoped-write] Resolve a `/var/minis/<sub>/...`
      * Linux path for THIS call, without ever answering with a different
@@ -1381,49 +997,6 @@ class ModelUseOffloadHandler(
             "[ModelUseWrite] path=$responsePath hostFile=${hostFile.absolutePath} " +
                 "sessionId=$sessionId globalAttachMount=${PRootKernel.bindMounts["/var/minis/attachments"]}",
         )
-    }
-
-    /**
-     * If [entry] is an image_output model, return a hint listing the params it
-     * actually accepts, so a failed sendMessage tells the caller how to retry.
-     * Empty string for non-image models.
-     */
-    private fun imageParamHint(entry: ModelEntry): String {
-        if ("image" !in entry.model.outputModalities.orEmpty()) return ""
-        val pType = providerRepository.instance(entry.providerInstanceId)?.providerType
-        return when (pType) {
-            ProviderType.gemini -> """
-                Hint — ${entry.model.displayName} is a Gemini image model. Pass image params under `generation_config` in the input JSON:
-                  aspect_ratio       "1:1" | "16:9" | "9:16" | "4:3" | "3:4"
-                  image_size         "512px" | "1K" | "2K" | "4K"
-                  number_of_images   1-4
-                  person_generation  "DONT_ALLOW" | "ALLOW_ADULT"
-                Example:
-                  {"messages":[{"role":"user","content":"<prompt>"}],
-                   "generation_config":{"aspect_ratio":"16:9","image_size":"2K"}}
-            """.trimIndent()
-            ProviderType.openAI, ProviderType.openRouter -> """
-                Hint — ${entry.model.displayName} is an OpenAI-compatible image model. Pass image params at the top level of the input JSON (matches /v1/images/generations):
-                  n         integer, number of images (default 1)
-                  size      "1024x1024" | "1792x1024" | "1024x1792" | etc.
-                  quality   "standard" | "hd"
-                  prompt    string (overrides last user message)
-                Example:
-                  {"prompt":"<prompt>","size":"1792x1024","quality":"hd","n":1}
-
-                Passthrough (topics: image-to-image, extra_body, extra_headers, endpoint_path) — any field our schema doesn't model is forwarded VERBATIM into the /images/generations JSON body, so you can drive provider-specific params (e.g. Volcengine Seedream image-to-image via an `image` field, `watermark`, `tools`). Two ways, both optional & additive:
-                  • implicit: any unknown TOP-LEVEL key → request body
-                  • explicit: `extra_body` (object, merged into body), `extra_headers` (string map, added to request headers), `endpoint_path` (string, overrides "/images/generations" for non-standard endpoints)
-                Your keys win over our defaults; `model` is always forced to the resolved id. If you set `response_format`, the b64_json auto-probe is skipped.
-                Image-to-image example (Seedream — image goes in the BODY, not messages):
-                  {"prompt":"make the eyes blue","image":"data:image/png;base64,<...>","size":"2K","watermark":false}
-                Explicit-envelope example:
-                  {"messages":[{"role":"user","content":"<prompt>"}],"extra_body":{"image":"<url-or-data-uri>","seed":42},"extra_headers":{"X-Custom":"1"},"endpoint_path":"/api/v3/images/generations"}
-            """.trimIndent()
-            // xAI (Grok) / Kimi Coding have no image-output models in the
-            // current catalog — fall through to empty hint like Anthropic.
-            ProviderType.anthropic, ProviderType.xAI, ProviderType.kimiCode, null -> ""
-        }
     }
 
     private fun isImageExt(ext: String): Boolean =
