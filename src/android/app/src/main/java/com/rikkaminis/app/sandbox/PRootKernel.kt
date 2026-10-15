@@ -794,6 +794,63 @@ object PRootKernel {
     }
 
     /**
+     * Resolve a Linux path, honouring the owning session whenever one is known.
+     *
+     * [audit3 F-08] This is the single replacement for the hand-spelled
+     * `sessionId?.let { resolveSessionHostPath(it, p, ctx) } ?: resolveHostPath(p)`
+     * shape that callers used to repeat at each site (browser URL interception,
+     * file_upload, cookies-file, screenshot dir, config `set --file`, speech
+     * source, read_image, model-use). That shape conflated the two unrelated
+     * nulls [resolveSessionHostPath] can return:
+     *
+     *  - "no session scoping applies" (path outside `/var/minis/`, or a shared
+     *    subdir) — the global resolver is genuinely the right answer; and
+     *  - "[safeResolveWithin] rejected a `..`/symlink escape out of the session
+     *    tree" — the elvis then re-resolved the *rejected* path through
+     *    [resolveHostPath], which searches every `minis-sessions/<id>/` tree
+     *    and finally the rootfs placeholder. The containment check was defeated
+     *    by its own caller: a path refused for this session still resolved,
+     *    possibly to another session's file.
+     *
+     * Contract:
+     *  - `sessionId == null` → [resolveHostPath]. "No session in scope" is the
+     *    documented case for Coil / generic media callers — unchanged.
+     *  - `sessionId != null` → [resolveSessionHostPath] verbatim, including its
+     *    internal non-session fallbacks. A null from it means "rejected or
+     *    absent" and is returned as null; callers keep their existing
+     *    file-not-found / warning handling. Never re-resolve globally.
+     */
+    fun resolvePathForSession(sessionId: String?, linuxPath: String, context: Context): File? =
+        sessionScopedResolve(
+            sessionId = sessionId,
+            linuxPath = linuxPath,
+            resolveGlobal = { resolveHostPath(it) },
+            resolveSession = { sid, path -> resolveSessionHostPath(sid, path, context) },
+        )
+
+    /**
+     * Pure decision core of [resolvePathForSession]: no [Context], no
+     * filesystem, no [PRootKernel] state — so the JVM test source set can pin
+     * the three arms (no session → global; session hit → session; session
+     * *reject* → null, never the global resolver). Generic over the result type
+     * so tests can feed plain strings instead of [File]s.
+     *
+     * Keep the "session present ⇒ no global fallback" branch exactly as is: the
+     * `?:`/elvis form compiles, looks equivalent, and silently reopens the
+     * cross-session hole [resolvePathForSession] documents.
+     */
+    internal fun <T> sessionScopedResolve(
+        sessionId: String?,
+        linuxPath: String,
+        resolveGlobal: (String) -> T?,
+        resolveSession: (String, String) -> T?,
+    ): T? = if (sessionId == null) {
+        resolveGlobal(linuxPath)
+    } else {
+        resolveSession(sessionId, linuxPath)
+    }
+
+    /**
      * Resolve a Linux path to a host filesystem File by checking bind mounts.
      * Returns null if no matching mount is found.
      *

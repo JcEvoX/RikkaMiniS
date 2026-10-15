@@ -188,9 +188,10 @@ class BrowserUseOffloadHandler(private val app: MinisApp) : NativeOffloadHandler
         // dropping the array (which used to reach set_cookies as empty).
         val cookiesFile = args.get("cookies-file", "cookies_file")
         val cookiesRaw: String? = if (cookiesFile != null) {
-            val host = sessionId?.let {
-                PRootKernel.resolveSessionHostPath(it, cookiesFile, app)
-            } ?: PRootKernel.resolveHostPath(cookiesFile)
+            // [audit3 F-08] resolvePathForSession owns the session-vs-global
+            // decision: with a session in scope a rejected path stays rejected
+            // (previously the elvis re-resolved it globally).
+            val host = PRootKernel.resolvePathForSession(sessionId, cookiesFile, app)
                 ?: throw IllegalArgumentException("--cookies-file: cannot resolve path '$cookiesFile'")
             runCatching { host.readText() }.getOrNull()
                 ?: throw IllegalArgumentException("--cookies-file: could not read '$cookiesFile'")
@@ -268,11 +269,14 @@ class BrowserUseOffloadHandler(private val app: MinisApp) : NativeOffloadHandler
         // Persist screenshot bytes under /var/minis/browser/ so shells can
         // reference the JPEG via image_path + minis_url instead of piping
         // base64 through stdout.
-        val browserHostDir: File? = sessionId?.let {
-            PRootKernel.resolveSessionHostPath(it, VAR_MINIS_BROWSER, app)
-        } ?: PRootKernel.resolveHostPath(VAR_MINIS_BROWSER)?.also {
-            try { it.mkdirs() } catch (_: Throwable) { /* non-fatal — write will fail below */ }
-        }
+        // [audit3 F-08] One session-aware entry point; mkdirs() is idempotent
+        // and now covers both branches (the session dir is created at shell
+        // start anyway). A rejected session path yields null — no global
+        // fallback, no mkdirs.
+        val browserHostDir: File? =
+            PRootKernel.resolvePathForSession(sessionId, VAR_MINIS_BROWSER, app)?.also {
+                try { it.mkdirs() } catch (_: Throwable) { /* non-fatal — write will fail below */ }
+            }
 
         var persistedImagePath: String? = null
         val base64 = r.base64Image

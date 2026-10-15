@@ -57,12 +57,20 @@ object ReadImageTool {
             "/var/minis/" + decodeUriPath(rawPath.removePrefix("minis://"))
             } else rawPath
 
-            val file = (
-                if (sessionId != null && context != null) {
-                    PRootKernel.resolveSessionHostPath(sessionId, path, context)
-                } else null
-            ) ?: PRootKernel.resolveHostPath(path)
-                ?: return ToolExecutionResult("Error: Cannot resolve path: $path", false, toolTitle = toolTitle)
+            // [audit3 F-08] The session-vs-global choice lives in
+            // resolvePathForSession: with a session in scope a path it rejects
+            // (escape out of the session tree) is NOT re-resolved by the global
+            // resolver — the null check below is now only "cannot resolve at
+            // all". The legacy overload (no sessionId/context) keeps the global
+            // resolver, per the KDoc above.
+            val file = when {
+                sessionId != null && context != null ->
+                    PRootKernel.resolvePathForSession(sessionId, path, context)
+                else -> PRootKernel.resolveHostPath(path)
+            }
+            if (file == null) {
+                return ToolExecutionResult("Error: Cannot resolve path: $path", false, toolTitle = toolTitle)
+            }
 
             if (!file.exists()) {
                 return ToolExecutionResult("Error: File not found: $path", false, toolTitle = toolTitle)
