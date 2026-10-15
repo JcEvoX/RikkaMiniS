@@ -14,7 +14,7 @@ import org.junit.Test
  * `PRootKernel.resolveSessionHostPath` / `resolveHostPath` need a real
  * `filesDir` (Context), so the decision itself lives in the pure
  * [PRootKernel.sessionScopedResolve], which these tests drive directly, plus
- * source-shape assertions that the production wiring and the seven migrated
+ * source-shape assertions that the production wiring and the eight migrated
  * call sites still go through it.
  *
  * The arm that matters is the third one: a null from the *session* resolver
@@ -142,7 +142,7 @@ class SessionPathResolutionTest {
         assertFalse("pure core must not fall back through an elvis:\n$core", core.contains("?:"))
     }
 
-    // ── the seven migrated call sites (source shape) ────────────────────
+    // ── the migrated call sites (source shape) ─────────────────────────
 
     @Test
     fun `no migrated site keeps the elvis fallback to the global resolver`() {
@@ -154,11 +154,11 @@ class SessionPathResolutionTest {
                 "$relative still contains the F-08 elvis fallback: $offenders",
                 offenders.isEmpty(),
             )
-            val calls = src.lines().count { it.contains("PRootKernel.resolvePathForSession(") }
+            val calls = src.lines().count { it.contains("resolvePathForSession(") }
             assertEquals("$relative migrated call sites", expected, calls)
             migrated += calls
         }
-        assertEquals("total migrated call sites on this branch", 7, migrated)
+        assertEquals("total migrated call sites on this branch", 8, migrated)
     }
 
     /**
@@ -168,14 +168,13 @@ class SessionPathResolutionTest {
      * migrated — otherwise the F-08 hole reopens at the next site someone adds.
      */
     @Test
-    fun `session-scoped files do not keep a global fallback`() {
-        val filesWithSessionResolver = listOf(
+    fun `other session-scoped resolvers keep no global elvis fallback`() {
+        val referenceSites = listOf(
             "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/StreamingMarkdownText.kt",
             "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatLinkResolver.kt",
-            "src/android/app/src/main/java/com/rikkaminis/app/ui/sandbox/FileBrowserViewModel.kt",
             "src/android/app/src/main/java/com/rikkaminis/app/webapp/WebAppPathResolver.kt",
         )
-        for (relative in filesWithSessionResolver) {
+        for (relative in referenceSites) {
             val src = readRepoFile(relative)
             val offenders = src.lines().filter { it.contains("?: PRootKernel.resolveHostPath") }
             assertTrue("$relative keeps the F-08 elvis fallback: $offenders", offenders.isEmpty())
@@ -217,13 +216,16 @@ class SessionPathResolutionTest {
         private const val PRootKernelPath =
             "src/android/app/src/main/java/com/rikkaminis/app/sandbox/PRootKernel.kt"
 
-        /** file → migrated call sites on this branch (FIX-F: 7 across 5 files). */
+        /** file → migrated call sites on this branch (FIX-F: 8 across 6 files). */
         private val migratedSites = listOf(
             "src/android/app/src/main/java/com/rikkaminis/app/browser/BrowserUseManager.kt" to 2,
             "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/BrowserUseOffloadHandler.kt" to 2,
             "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ConfigOffloadHandler.kt" to 1,
             "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/SpeechOffloadHandler.kt" to 1,
             "src/android/app/src/main/java/com/rikkaminis/app/tools/ReadImageTool.kt" to 1,
+            // Textual shape the audit's grep for `?: PRootKernel.resolveHostPath`
+            // missed (`?.let { return it }` fall-through, same defect).
+            "src/android/app/src/main/java/com/rikkaminis/app/ui/sandbox/FileBrowserViewModel.kt" to 1,
         )
     }
 }

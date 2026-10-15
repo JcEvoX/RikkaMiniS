@@ -284,15 +284,21 @@ class FileBrowserViewModel(
             // T147: prefer the session-scoped resolver when we know which
             // session's view we're rendering — global bindMounts is
             // last-writer-wins and points at whichever session's PRoot
-            // booted most recently.
+            // booted most recently. [audit3 F-08] Route the choice through
+            // resolvePathForSession: a path the SESSION resolver rejects
+            // (escape out of the session tree) must not fall through to the
+            // global resolver, which searches every minis-sessions/<id>/ tree
+            // — i.e. possibly another session's view. Non-session paths
+            // (/var/minis/skills, mounts) still resolve globally, inside
+            // resolveSessionHostPath itself.
             val sid = sessionId
             val ctx = appContext
-            if (sid != null && ctx != null) {
-                com.rikkaminis.app.sandbox.PRootKernel
-                    .resolveSessionHostPath(sid, linuxPath, ctx)
-                    ?.let { return it }
+            val scoped = if (sid != null && ctx != null) {
+                com.rikkaminis.app.sandbox.PRootKernel.resolvePathForSession(sid, linuxPath, ctx)
+            } else {
+                com.rikkaminis.app.sandbox.PRootKernel.resolveHostPath(linuxPath)
             }
-            com.rikkaminis.app.sandbox.PRootKernel.resolveHostPath(linuxPath)?.let { return it }
+            scoped?.let { return it }
         }
         return if (relativePath.isEmpty()) rootPath else File(rootPath, relativePath)
     }
