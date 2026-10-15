@@ -274,10 +274,31 @@ object PRootKernel {
     internal const val GUARD_MARKER = "minis-mount-readonly-guard"
 
     // Commands whose LAST positional argument is the write target; the earlier
-    // ones are sources (cp/mv/ln). Everything else in [installMountWriteGuards]
+    // ones are sources (cp/ln). Everything else in [installMountWriteGuards]
     // takes every positional argument as a target, except dd (writes via `of=`).
+    // [audit3 F-07] `mv` moved HERE from "last arg": `mv <read-only>/f /tmp/`
+    // deletes f from the mount, so a source IS a write target for mv — the B5a
+    // "sources are reads" model only holds for cp/ln (a cp source is read, an
+    // ln source is read).
     // internal: the test package pins the shapes ([MountGuardScriptTest]).
-    internal val MOUNT_GUARD_LAST_ARG_CMDS = setOf("cp", "mv", "ln")
+    internal val MOUNT_GUARD_LAST_ARG_CMDS = setOf("cp", "ln")
+
+    // Full wrapper set installed by [installMountWriteGuards]. [audit3 F-07] the
+    // list is ALSO hardcoded into every generated script as an unwritable target:
+    // `rm /usr/local/bin/cp` issued through the `rm` wrapper used to be allowed —
+    // each wrapper only knew its own name — which deleted a sibling and reopened
+    // every bypass for that command.
+    // internal: pinned by [MountGuardScriptTest] + read by install + codegen.
+    internal val MOUNT_GUARD_CMDS =
+        listOf("touch", "tee", "cp", "mv", "mkdir", "rm", "rmdir", "ln", "dd")
+
+    // Guest path of the read-only prefix list the wrappers read at run time.
+    // [audit3 F-07] hardcoded unwritable too — an absent list makes every check
+    // pass, so deleting it was the cheapest full bypass.
+    internal const val MOUNT_GUARD_CFG_LINUX_PATH = "/var/minis/.mount-readonly-prefixes"
+
+    // Guest dir the wrappers live in (rootfs `usr/local/bin`, first on PATH).
+    internal const val MOUNT_GUARD_BIN_LINUX_PREFIX = "/usr/local/bin"
 
     /**
      * Reference to the user-mounted folders store, set by [MinisApp] at
@@ -1083,9 +1104,9 @@ object PRootKernel {
         } catch (t: Throwable) {
             return
         }
-        val binDir = File(rootfs, "usr/local/bin").also { it.mkdirs() }
-        val guardedCmds = listOf("touch", "tee", "cp", "mv", "mkdir", "rm", "rmdir", "ln", "dd")
-        val configFile = File(rootfs, "var/minis/.mount-readonly-prefixes")
+        val binDir = File(rootfs, MOUNT_GUARD_BIN_LINUX_PREFIX.trimStart('/')).also { it.mkdirs() }
+        val guardedCmds = MOUNT_GUARD_CMDS
+        val configFile = File(rootfs, MOUNT_GUARD_CFG_LINUX_PATH.trimStart('/'))
 
         if (readOnlyLinuxPrefixes.isEmpty()) {
             // No read-only mounts — remove the config + wrappers so plain busybox
@@ -1118,9 +1139,15 @@ object PRootKernel {
      * The shell wrapper for ONE guarded command. The argument selection is
      * command-specific (audit-1014 B5a) — three shapes by write semantics:
      *
-     *  - cp/mv/ln: only the LAST positional argument is the write target.
-     *    The earlier ones are sources — `cp /var/minis/mounts/vault/f /tmp/`
-     *    (reading OUT of a read-only mount) must stay legal;
+     *  - cp/ln: only the LAST positional argument is the write target. The
+     *    earlier ones are sources — `cp /var/minis/mounts/vault/f /tmp/`
+     *    (reading OUT of a read-only mount) must stay legal. `[audit3 F-07]`
+     *    exception: with `-t DIR` / `--target-directory[=]DIR` (clustered forms
+     *    `-rt DIR` / `-rtDIR` too) the write target is the FLAG VALUE and every
+     *    positional is a source, so the positional tail must NOT be checked;
+     *  - mv: every positional (plus the `-t` value, which is positional too) —
+     *    a mv SOURCE is destroyed, `mv <read-only>/f /tmp/` deletes f from the
+     *    mount, so B5a's "sources are reads" model does not hold here;
      *  - dd: the write target is the value of `of=`, never a positional
      *    argument — and `oflag=`/`ofs=` must not be confused with `of=`;
      *  - touch/tee/mkdir/rm/rmdir: every positional argument IS a target
@@ -1130,16 +1157,62 @@ object PRootKernel {
      * from the every-argument version: any selected target under a
      * read-only prefix still exits 1 — only WHICH arguments are checked got
      * command-specific.
+     *
+     * [audit3 F-07] every SELECTED target is canonicalized ([canon_target]
+     * below) and matched against the guard's own control files before the
+     * prefix list. The four bypasses that closes:
+     *
+     *  1. relative targets — `cd /var/minis/mounts/vault && rm secret.md` handed
+     *     `$1="secret.md"` to a raw `"$prefix"/…` match and was allowed through;
+     *  2. `.`/`..`/`//` spellings — `rm /var/minis/mounts/x/../../etc/f` (and
+     *     the inverse `cp a /var/minis/mounts/x/../x/b`) never matched the raw
+     *     prefix either, so the guard was blind in both directions;
+     *  3. self-destruction — `rm /var/minis/.mount-readonly-prefixes` deleted
+     *     the list, after which every later call allowed everything (the whole
+     *     check sat behind `if [ -f "$cfg" ]`); deleting a sibling wrapper
+     *     (`rm /usr/local/bin/cp` — each wrapper only knew its own name) had
+     *     the same effect for that command;
+     *  4. `cp -t <read-only dir> src` — only `src` was inspected;
+     *  5. `mv <read-only>/f /tmp/` — B5a classified a mv source as a read, but a
+     *     mv source is destroyed (see the shape list above), so moving a file
+     *     OUT of a read-only mount deleted it from the mount unchecked.
+     *
+     * Deliberate boundary (do not "fix" it here): this stays best-effort
+     * interception over the argv whitelist. Canonicalization is LEXICAL only —
+     * a symlinked alias of a mount is not resolved, because busybox `realpath`
+     * in this rootfs has no `-m` and `readlink -f` needs the target to exist,
+     * so an external dependency would either fail open (missing `-m`) or refuse
+     * every legal write (missing binary). `python3 -c "open(...)"`, `sed -i`,
+     * `> redirect` and the in-app [isLinuxPathUnderReadOnlyMount] guard cover
+     * those paths instead.
      */
     internal fun mountGuardScript(name: String): String {
+        // [audit3 F-07] hardcoded unwritable targets (self-protection): the
+        // prefix list + every wrapper of the set, this one included.
+        val guardBinPatterns = MOUNT_GUARD_CMDS
+            .joinToString(separator = "|") { "\"$MOUNT_GUARD_BIN_LINUX_PREFIX/$it\"" }
         val selection = when {
             name in MOUNT_GUARD_LAST_ARG_CMDS -> """
                 |dest=""
+                |tdest=""
+                |tdir=""
+                |take=""
                 |for arg in "${'$'}@"; do
-                |    case "${'$'}arg" in -*) continue;; esac
-                |    dest="${'$'}arg"
+                |    if [ "${'$'}take" = 1 ]; then take=""; tdest="${'$'}arg"; continue; fi
+                |    case "${'$'}arg" in
+                |        -t) tdir=1; take=1;;
+                |        -t?*) tdir=1; tdest="${'$'}{arg#-t}";;
+                |        -[!-]*t) tdir=1; take=1;;
+                |        -[!-]*t?*) tdir=1; tdest="${'$'}{arg##*[t]}";;
+                |        --target-directory) tdir=1; take=1;;
+                |        --target-directory=*) tdir=1; tdest="${'$'}{arg#*=}";;
+                |        -*) ;;
+                |        *) dest="${'$'}arg"
+                |    esac
                 |done
-                |if [ -n "${'$'}dest" ]; then
+                |if [ "${'$'}tdir" = 1 ]; then
+                |    [ -z "${'$'}tdest" ] || check_prefix "${'$'}tdest" || exit 1
+                |elif [ -n "${'$'}dest" ]; then
                 |    check_prefix "${'$'}dest" || exit 1
                 |fi
             """.trimMargin()
@@ -1161,11 +1234,71 @@ object PRootKernel {
         return """#!/bin/sh
             |# $GUARD_MARKER — reject writes into read-only mounted folders.
             |# Auto-installed by MinisApp PRootKernel (T219-4).
-            |cfg=/var/minis/.mount-readonly-prefixes
+            |cfg=$MOUNT_GUARD_CFG_LINUX_PATH
+            |canon_out=""
+            |# [audit3 F-07] POSIX-lexical canonicalization: collapses `//`, `/./`,
+            |# `/../` and a trailing `/`, and resolves RELATIVE paths against the
+            |# wrapper's cwd (the caller shell's cwd). Publishes through canon_out
+            |# instead of stdout so the common absolute argument costs no command
+            |# substitution. Lexical on purpose — see mountGuardScript's KDoc.
+            |canon_target() {
+            |    p=${'$'}1
+            |    case "${'$'}p" in
+            |        "") return 1;;
+            |        /*) ;;
+            |        *) cw=$(pwd) || return 1
+            |           [ -n "${'$'}cw" ] || return 1
+            |           p="${'$'}cw/${'$'}p";;
+            |    esac
+            |    out=""
+            |    while [ -n "${'$'}p" ]; do
+            |        case "${'$'}p" in
+            |            */*) seg=${'$'}{p%%/*}; p=${'$'}{p#*/};;
+            |            *) seg=${'$'}p; p="";;
+            |        esac
+            |        case "${'$'}seg" in
+            |            ""|.) continue;;
+            |            ..)
+            |                case "${'$'}out" in
+            |                    */*) out=${'$'}{out%/*};;
+            |                    *) out="";;
+            |                esac
+            |                continue;;
+            |        esac
+            |        out="${'$'}out/${'$'}seg"
+            |    done
+            |    [ -n "${'$'}out" ] || out="/"
+            |    canon_out="${'$'}out"
+            |    return 0
+            |}
+            |# $1 is one selected write target. Refuses (return 1) an unresolvable
+            |# target, the guard's own control files, and any target under a
+            |# read-only prefix; allows everything else.
             |check_prefix() {
+            |    canon_target "${'$'}1" || {
+            |        echo "$name: ${'$'}1: cannot resolve the write target — refused by the read-only mount guard" >&2
+            |        return 1
+            |    }
+            |    resolved="${'$'}canon_out"
+            |    # Self-protection first, and independent of the list's existence:
+            |    # the list and every wrapper are writable targets for the very
+            |    # commands they gate, and destroying either turns the guard into a
+            |    # silent no-op for every later call.
+            |    if [ "${'$'}resolved" = "${'$'}cfg" ]; then
+            |        echo "$name: ${'$'}1: read-only mount list — writes are disabled (manage mounts in Settings → Mount External Folders)" >&2
+            |        return 1
+            |    fi
+            |    case "${'$'}resolved" in
+            |        $guardBinPatterns)
+            |            echo "$name: ${'$'}1: read-only mount guard wrapper — writes are disabled (manage mounts in Settings → Mount External Folders)" >&2
+            |            return 1;;
+            |    esac
+            |    if [ ! -f "${'$'}cfg" ]; then
+            |        return 0
+            |    fi
             |    while IFS= read -r prefix; do
             |        [ -z "${'$'}prefix" ] && continue
-            |        case "${'$'}1" in
+            |        case "${'$'}resolved" in
             |            "${'$'}prefix"|"${'$'}prefix"/*)
             |                echo "$name: ${'$'}1: read-only mounted folder — writes are disabled (toggle in Settings → Mount External Folders)" >&2
             |                return 1;;
@@ -1173,9 +1306,7 @@ object PRootKernel {
             |    done < "${'$'}cfg"
             |    return 0
             |}
-            |if [ -f "${'$'}cfg" ]; then
             |$selection
-            |fi
             |exec /bin/busybox $name "${'$'}@"
             |""".trimMargin()
     }
