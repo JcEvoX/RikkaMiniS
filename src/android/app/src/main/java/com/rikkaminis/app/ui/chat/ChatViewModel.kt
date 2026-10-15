@@ -4072,6 +4072,11 @@ class ChatViewModel(
                         AppLogger.error(TAG_STREAM, "resume runAgentLoop EXCEPTION ${e.javaClass.simpleName}: ${e.message}")
                         Log.e(TAG, "Agent loop error (resume)", e)
                         reportAgentLoopError(e)
+                        // [fix/da1015-sched-errorprop] Flag the run as failed for
+                        // the same reason the send / retryLast boundaries do: this
+                        // finally unwinds through setInactive, and a resumed run
+                        // that dies must not settle as a clean completion.
+                        SessionActivityTracker.markStreamError(activeSessionId)
                     } finally {
                         AppLogger.info(TAG_STREAM, "resume streamJob FINALLY enter")
                         // [T-claim-token-vs-stale-finally] Only the current turn

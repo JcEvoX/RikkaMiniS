@@ -16,6 +16,7 @@ import com.rikkaminis.app.provider.LLMProvider
 import com.rikkaminis.app.provider.ProviderFactory
 import com.rikkaminis.app.sandbox.PRootKernel
 import com.rikkaminis.app.sandbox.offload.ProviderExecutionGateway
+import com.rikkaminis.app.service.SessionActivityTracker
 import com.rikkaminis.app.tools.AgentTraceRecorder
 import com.rikkaminis.app.tools.FileEditTool
 import com.rikkaminis.app.tools.FileReadTool
@@ -194,6 +195,16 @@ internal fun ChatViewModel.setTransientInlineError(errorText: String) {
 
 /** Clear any inline error on the last assistant message (used after successful retry). */
 internal fun ChatViewModel.clearInlineError() {
+    // [fix/da1015-sched-errorprop] Pair of `setInlineError`'s
+    // SessionActivityTracker.markStreamError: the error state is being
+    // retracted (the retried attempt got through / the loop is moving on to a
+    // fallback provider and will re-flag if that fails too), so the run must
+    // not be reported as failed. Deliberately placed BEFORE the two early
+    // returns below: markStreamError fires unconditionally (including the
+    // no-assistant-message fallback that writes `_error`), so the retraction
+    // must not depend on a banner being present to undo it.
+    val sid = realSessionId.ifEmpty { sessionId }
+    if (sid.isNotEmpty()) SessionActivityTracker.clearStreamError(sid)
     val msgs = _messages.value.toMutableList()
     val lastAssistantIdx = msgs.indexOfLast { it.role == "assistant" }
     if (lastAssistantIdx < 0) return
@@ -206,7 +217,6 @@ internal fun ChatViewModel.clearInlineError() {
     // Clear by the message's source DB rows when known (the in-memory bubble
     // maps to one or more persisted rows via sourceDbIds); fall back to the
     // last-assistant-row update otherwise.
-    val sid = realSessionId.ifEmpty { sessionId }
     if (sid.isNotEmpty()) {
         val dbIds = msg.sourceDbIds
         viewModelScope.launch(Dispatchers.IO) {

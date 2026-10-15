@@ -418,6 +418,14 @@ internal suspend fun ChatViewModel.drainQueuedPrompts(
         } catch (e: Exception) {
             Log.e(ChatViewModel.TAG, "Agent loop (queued-drain) error", e)
             reportAgentLoopError(e)
+            // [fix/da1015-sched-errorprop] Every run boundary flags the
+            // tracker, not just the send/retry/resume ones — a drain that dies
+            // here still unwinds through the same setInactive, and its
+            // completion signal must not read as a clean finish. (Idempotent
+            // with the flag set by reportAgentLoopError → setInlineError; kept
+            // explicit because this is the one boundary the audit found
+            // missing it.)
+            SessionActivityTracker.markStreamError(activeSessionId)
             break
         }
     }
