@@ -165,6 +165,7 @@ def main():
         return 1
 
     hosts = {}
+    unparsed = []
     for dirpath, _, files in os.walk(kotlin):
         for name in files:
             if not name.endswith(".kt"):
@@ -172,10 +173,29 @@ def main():
             path = os.path.join(dirpath, name)
             with open(path, encoding="utf-8", errors="replace") as fh:
                 text = strip_comments(fh.read())
+            if "addJavascriptInterface" not in text:
+                continue
+            rel = os.path.relpath(path, root)
             names = registered_names(text)
-            if names:
-                rel = os.path.relpath(path, root)
-                hosts[rel] = {n: declared_arities(text) for n in names}
+            if not names:
+                unparsed.append(rel)
+                continue
+            hosts[rel] = {n: declared_arities(text) for n in names}
+    if unparsed:
+        # A host that cannot be parsed must fail LOUDLY. This is not a
+        # hypothetical: it was found by the guard's own mutation test — a
+        # mangled registration made this file drop out of `hosts`, the other
+        # host still supplied the interface name, and the guard went green on
+        # a tree whose KaTeXView declaration no longer matched the page. That
+        # is precisely the stale-host shape the guard exists to catch, so a
+        # silent skip is the one failure mode it must never have.
+        c = "❌"
+        print(f"{c} ROT: addJavascriptInterface present but no interface name could be parsed:")
+        for rel in unparsed:
+            print(f"   {rel}")
+        print("   Keep the interface name a string literal in the registration; if it")
+        print("   must be computed, teach this guard how — do not let it skip the file.")
+        return 1
     if not hosts:
         print("❌ ROT: no addJavascriptInterface registration found anywhere")
         return 1

@@ -1803,6 +1803,27 @@ def test_katex_bridge_arity():
     shutil.rmtree(root)
 
 
+    # A host whose registration cannot be parsed must fail loudly instead of
+    # dropping out of the host set. Found by this guard's own mutation control:
+    # a mangled registration made KaTeXView.kt skip silently, the sibling host
+    # still supplied the interface name, and the guard went green on a tree
+    # whose declaration no longer matched the page.
+    files = fixture("width: Int, height: Int, error: String, token: Long)")
+    files["src/android/app/src/main/java/com/rikkaminis/app/ui/chat/Variable.kt"] = (
+        "package com.rikkaminis.app.ui.chat\n"
+        "class Q {\n"
+        "    fun f(wv: Any, name: String) {\n"
+        "        wv.addJavascriptInterface(object { }, name)\n"
+        "    }\n"
+        "}\n"
+    )
+    root = make_tree(files)
+    code, out = run_scanner("katex_bridge_arity_check.py", root)
+    check("an unparseable registration fails loudly (exit 1)", code == 1, f"exit={code}\n{out}")
+    check("rot guard names the offending file", "Variable.kt" in out and "ROT" in out, out)
+    shutil.rmtree(root)
+
+
 def test_real_repo():
     print("━━━ real repo tree (must be clean) ━━━")
     for script in (
