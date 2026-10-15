@@ -1349,6 +1349,25 @@ internal fun extractTar(
                 if (isTarget) {
                     outFile.parentFile?.mkdirs()
                     try {
+                        // [verify-1015 BUG-09] createSymbolicLink throws
+                        // FileAlreadyExistsException when the path is already
+                        // occupied — including by a BROKEN link, which is
+                        // exactly the state this extraction is supposed to
+                        // repair (self-heal: a clobbered busybox/sh link stayed
+                        // broken because every later extraction failed here and
+                        // the catch below only logged it). Clear the occupant
+                        // first, mirroring ensureBusyboxShellSymlink() in this
+                        // same file, which already does
+                        // `if (exists(NOFOLLOW_LINKS)) delete()` before linking.
+                        // Safe: this path is a link the tarball owns, and
+                        // regular files are overwritten unconditionally anyway.
+                        if (java.nio.file.Files.exists(
+                                outFile.toPath(),
+                                java.nio.file.LinkOption.NOFOLLOW_LINKS
+                            )
+                        ) {
+                            java.nio.file.Files.delete(outFile.toPath())
+                        }
                         java.nio.file.Files.createSymbolicLink(
                             outFile.toPath(),
                             java.nio.file.Paths.get(linkName)

@@ -169,7 +169,7 @@ fi
 #   (token-free loopback JSON-RPC on 127.0.0.1:5321) reaches release. The apk
 #   mode (below, in build-apk.yml) verifies the artifact itself.
 echo "━━━ [8/21] Debug-code release boundary (source) ━━━"
-if python3 scripts/scan/debug_leak_guard.py source "$ROOT"; then
+if python3 scripts/scan/debug_leak_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
 else

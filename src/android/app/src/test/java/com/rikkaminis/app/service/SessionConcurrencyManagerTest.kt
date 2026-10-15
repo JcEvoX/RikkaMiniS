@@ -336,4 +336,37 @@ class SessionConcurrencyManagerTest {
         assertEquals(setOf("s2", "s3"), SessionConcurrencyManager.runningSessions.value)
         assertEquals(3, reclaimed)
     }
+
+    // --- [verify-1015 BUG-04] 取消落在"提升后、恢复前"窗口不得泄漏槽位 ---
+
+    @Test
+    fun `cancel landing between promote and resume does not leak the slot`() = runTest {
+        val holders = (1..2).map { i -> async { SessionConcurrencyManager.acquireSlot("h$i") } }
+        holders.awaitAll()
+
+        val victim = launch { SessionConcurrencyManager.acquireSlot("victim") }
+        runCurrent()
+        assertTrue("victim must be queued first", SessionConcurrencyManager.isSuspended("victim"))
+
+        // 释放一个槽位 → victim 被提升（resume 已投递但协程还没跑），紧接着取消：
+        // CE 落在 suspendCancellableCoroutine 的挂起点上，调用方永远走不到
+        // releaseSlot，这正是槽位泄漏的窗口。
+        SessionConcurrencyManager.releaseSlot("h1")
+        victim.cancel()
+        victim.join()
+        runCurrent()
+
+        assertEquals(
+            "cancelled-after-promote run must not stay counted as running",
+            setOf("h2"),
+            SessionConcurrencyManager.runningSessions.value,
+        )
+
+        // 泄漏时下面的 acquire 会永远排队（cap=2 被 h2 + 幽灵 run 占满）
+        val next = async { SessionConcurrencyManager.acquireSlot("next") }
+        runCurrent()
+        assertTrue("slot must be free again after the cancelled run", next.isCompleted)
+        assertEquals(setOf("h2", "next"), SessionConcurrencyManager.runningSessions.value)
+        assertEquals(0, SessionConcurrencyManager.suspendedSessions.value.size)
+    }
 }

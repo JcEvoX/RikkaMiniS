@@ -14,6 +14,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.BufferedWriter
 import java.io.File
+import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.nio.charset.StandardCharsets
 import java.util.UUID
@@ -432,12 +433,25 @@ class PersistentShell(
         // re-scan them combined with the next chunk.
         var tail: String = ""
         try {
-            val buffer = ByteArray(4096)
-            val stream = p.inputStream
+            // [verify-1015 BUG-01] Decode through a Reader, NOT
+            // `String(bytes, 0, n, UTF_8)` per chunk. The chunked form decodes
+            // every read() independently, so a multi-byte character that
+            // straddles a read boundary becomes TWO U+FFFD — and this is not a
+            // rare edge: 4096 % 3 == 1, so for 3-byte CJK text the alignment
+            // advances one byte per read and EVERY boundary splits a character.
+            // Reproduced on-device 2026-10-15: 12 KB of Chinese written by a
+            // shell command came back with `中文测试中���测试`, i.e. the agent's
+            // own file/log reading path was corrupted, not just the terminal UI.
+            // InputStreamReader carries the decoder's leftover bytes across
+            // reads, so a split character is reassembled instead of mangled.
+            // Buffer is 4096 chars now (was 4096 bytes) — both far exceed the
+            // marker length, and the tail window below is unchanged.
+            val buffer = CharArray(4096)
+            val reader = InputStreamReader(p.inputStream, StandardCharsets.UTF_8)
             while (true) {
-                val n = stream.read(buffer)
+                val n = reader.read(buffer)
                 if (n < 0) break
-                val text = String(buffer, 0, n, StandardCharsets.UTF_8)
+                val text = String(buffer, 0, n)
 
                 // [audit-0917] Only the CURRENT process's reader may consume
                 // output: stop() + restart leaves this thread draining a dead

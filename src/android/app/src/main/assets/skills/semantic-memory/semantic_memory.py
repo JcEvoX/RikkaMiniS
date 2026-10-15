@@ -117,8 +117,16 @@ def embed_texts(entries, client=None, backend=None):
     auto（默认）先试 HF，首个批次失败即整体切 CF；显式 hf/cf 不切换。
     两种后端维度不同，**不可混用**——索引记录 backend，检索与增量重建都按
     索引自己的后端走。
+
+    [verify-1015 BUG-05] "显式 hf/cf 不切换" 是本函数一直写明的契约，但实现
+    读的是全局 env（SEMANTIC_EMBED_BACKEND，默认 auto）而不是"调用方是否钉住
+    了 backend"：cmd_build_incremental 按索引自己的后端钉 hf，HF 一报错照样
+    静默切成 1024 维的 CF，与复用的 384 维旧向量混进同一个索引。现在按
+    [pinned] 判定——钉住的后端失败就不再降级，由调用方中止写入（见
+    cmd_build_incremental 的维度/失败守卫），不产生"半新半旧"的索引。
     """
     global _ACTIVE_BACKEND
+    pinned = backend is not None
     if backend is None:
         backend = EMBED_BACKEND if EMBED_BACKEND in ("hf", "cf") else "hf"
     if client is None:
@@ -149,7 +157,10 @@ def embed_texts(entries, client=None, backend=None):
                     e["embedding"] = v
                 break
             except Exception as ex:
-                if backend == "hf" and EMBED_BACKEND not in ("hf", "cf"):
+                # [verify-1015 BUG-05] 降级只允许发生在"调用方没有钉住后端"时
+                # ——见 embed_texts 文档串。原来这里读全局 env，于是增量构建
+                # 明明钉了 hf 也会被静默切到 CF。
+                if backend == "hf" and not pinned and EMBED_BACKEND not in ("hf", "cf"):
                     print(f"  ⚠️ HF 不可用（{str(ex)[:90]}）→ 切换到 CF ({CF_EMBED_MODEL})")
                     backend, batch = "cf", CF_EMBED_BATCH
                     if i > 0:
@@ -159,6 +170,9 @@ def embed_texts(entries, client=None, backend=None):
                         # 向量被 zip 截断 → 相似度全错）。旧维度结果随重跑覆盖。
                         i = 0
                     continue
+                if pinned:
+                    print(f"  ⚠️ 后端 {backend} 是索引钉住的，不再降级（{str(ex)[:90]}）")
+                    print("     → 调用方应中止写入，避免新旧向量维度混杂")
                 print(f"  ⚠️ 批次 {i // batch + 1} 失败: {ex}")
                 for e in chunk:
                     e["embedding"] = None
@@ -355,8 +369,19 @@ def cmd_build():
 
     print("🧠 向量化（HF → CF 自动兜底）...")
     client = InferenceClient()
+    pending = entries   # embed_texts 原地写 embedding 并返回成功子集
     entries = embed_texts(entries, client)
     print(f"  成功: {len(entries)} 条（后端 {_ACTIVE_BACKEND}）")
+
+    # [verify-1015 BUG-05] 同族守卫（与 cmd_build_incremental 同款）：全量重建
+    # 里"部分批次失败"同样会让若干条静默消失——旧索引被覆盖后这些内容再也
+    # 不会被索引。中止写入/上传比悄悄少几条安全。
+    lost = [e for e in pending if not e.get("embedding")]
+    if lost:
+        sample = ", ".join(f"{e['source']}#{e['title']}" for e in lost[:3])
+        print(f"❌ {len(lost)} 条条目没有拿到向量：{sample}——中止：不写本地索引、"
+              "不上传，旧索引保持不变。请检查嵌入后端凭据或网络后重试。", file=sys.stderr)
+        sys.exit(1)
 
     # [rv1014-C2] 0 条守卫：HF 部分批成功后断（402/限流）+ CF 后端不可用 →
     # embed 全失败、entries 过滤成 []。无条件写盘会把本地索引清零、远端
@@ -413,12 +438,36 @@ def cmd_build_incremental():
             todo.append(e)
     print(f"♻️  复用旧向量 {reused} 条 | 🧠 待嵌入 {len(todo)} 条")
 
+    pending = todo   # 送嵌入的原始列表：embed_texts 原地写 embedding 并返回成功子集
     if todo:
         # 复用索引自己的后端：新旧向量必须同维度，混用会静默算错相似度
         todo = embed_texts(todo, backend=old_backend)
     good = [e for e in entries if e.get("embedding")]
     if len(good) < len(entries):
         print(f"  ⚠️ {len(entries)-len(good)} 条无向量，已丢弃")
+
+    # [verify-1015 BUG-05] 写盘前两道守卫（原来只有"0 条"一道，拦不住
+    # "旧向量还在、新内容静默丢失"和"半新半旧"两种损坏）：
+    #   1. 维度必须单一 —— hf=384 / cf=1024，混维索引检索时查询向量被 zip
+    #      截断，相似度全错且无声；
+    #   2. 本轮待嵌入条目一条都不能丢向量 —— 钉住的后端失败时 embed_texts
+    #      不再降级，会留下 embedding=None；旧向量仍会让 good 非空，于是
+    #      新内容就这么没了。注意必须查 [pending]（送嵌入的那批）而不是
+    #      embed_texts 的返回值——返回值本身就是"成功子集"，拿它判"有没有
+    #      丢"恒为假（2026-10-15 探针实测：守卫写错成 todo 时 C1 用例不触发）。
+    dims = {len(e["embedding"]) for e in good}
+    if len(dims) > 1:
+        print(f"❌ 向量维度混杂 {sorted(dims)}（不同嵌入后端被混用）——中止：不写本地"
+              "索引、不上传，旧索引保持不变。请用同一个后端跑一次全量 build。",
+              file=sys.stderr)
+        sys.exit(1)
+    lost = [e for e in pending if not e.get("embedding")]
+    if lost:
+        sample = ", ".join(f"{e['source']}#{e['title']}" for e in lost[:3])
+        print(f"❌ {len(lost)} 条待嵌入条目没有拿到向量（后端 {old_backend} 失败且钉住的"
+              f"后端不再降级）：{sample}——中止：不写本地索引、不上传，旧索引保持不变。"
+              "请恢复该后端额度，或显式改用另一个后端跑全量 build。", file=sys.stderr)
+        sys.exit(1)
 
     # [rv1014-C2] 同款 0 条守卫：全部复用失败且新嵌入全失败 → good=[]，无条
     # 件写盘会把旧索引清零、远端 dataset 被空数据覆盖。中止写入/上传。

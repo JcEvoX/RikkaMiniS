@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import queue
+import secrets
 import signal
 import socket
 import subprocess
@@ -409,6 +410,9 @@ class MCPPool:
         self._pool = {}
         self._lock = threading.Lock()
         self._on_empty = on_empty
+        # [verify-1015 BUG-07] name -> fingerprint of the config the cached
+        # session was built from, so config edits evict a live session.
+        self._cfg_fp = {}
 
     def _make_session(self, name, cfg):
         if config.is_stdio(cfg):
@@ -419,21 +423,38 @@ class MCPPool:
 
     def get(self, name):
         with self._lock:
+            # [verify-1015 BUG-07] Re-validate the config on EVERY get, not only
+            # when creating a session. The pool cached a live session by name
+            # for its whole 10-minute idle TTL, so disabling or deleting a
+            # server, or editing its url/command/args, left the OLD session
+            # answering: a disabled server stayed callable. Fingerprinting the
+            # resolved config evicts on every kind of edit (one mechanism, not
+            # just the `enabled` flag). Costs one config file read per call,
+            # negligible next to the tool call itself.
+            cfg = config.get_server(name)
+            if cfg is None:
+                self._evict_locked(name)
+                raise MCPError("NOT_FOUND", "server '%s' not found" % name)
+            if not cfg.get("enabled", True):
+                self._evict_locked(name)
+                raise MCPError("DISABLED", "server '%s' is disabled" % name)
+            fp = json.dumps(cfg, sort_keys=True, default=str)
             session = self._pool.get(name)
+            if session is not None and self._cfg_fp.get(name) != fp:
+                log.info("[%s] config changed, evicting cached session", name)
+                self._evict_locked(name)
+                session = None
             if session is not None and not session.is_alive():
                 log.warning("[%s] process died, evicting", name)
                 session.stop()
                 del self._pool[name]
+                self._cfg_fp.pop(name, None)
                 session = None
             if session is None:
-                cfg = config.get_server(name)
-                if cfg is None:
-                    raise MCPError("NOT_FOUND", "server '%s' not found" % name)
-                if not cfg.get("enabled", True):
-                    raise MCPError("DISABLED", "server '%s' is disabled" % name)
                 log.info("[%s] creating new session", name)
                 session = self._make_session(name, cfg)
                 self._pool[name] = session
+                self._cfg_fp[name] = fp
             return session
 
     def call_with_retry(self, name, fn):
@@ -448,11 +469,19 @@ class MCPPool:
                     continue
                 raise
 
-    def evict(self, name):
-        with self._lock:
-            session = self._pool.pop(name, None)
+    def _evict_locked(self, name):
+        """[verify-1015 BUG-07] Evict without re-acquiring the lock: get() already
+        holds it and threading.Lock is not reentrant, so get() must not call the
+        public evict(). Keeps the stop-inside-lock behaviour the pool already had
+        for dead processes."""
+        session = self._pool.pop(name, None)
+        self._cfg_fp.pop(name, None)
         if session:
             session.stop()
+
+    def evict(self, name):
+        with self._lock:
+            self._evict_locked(name)
 
     def gc(self):
         """TTL scan: evict idle-too-long or dead servers. Returns the live count
@@ -493,6 +522,11 @@ class DaemonServer:
     def __init__(self, port_file, pid_file):
         self.port_file = port_file
         self.pid_file = pid_file
+        # [verify-1015 BUG-07] Loopback IPC auth token lives next to the port
+        # file (same derivation rule as main.py, so the two can never drift).
+        # See run() for why: AF_INET loopback is a device-global namespace.
+        self.token_file = port_file + ".token"
+        self.token = None
         self._running = True
         self._empty_since = None
         self.pool = MCPPool(on_empty=self._on_pool_empty)
@@ -561,6 +595,18 @@ class DaemonServer:
             log.exception("unexpected error handling %s", cmd)
             return {"ok": False, "error": str(exc), "code": "MCP_ERROR", "server": server}
 
+    def _authorized(self, data):
+        """[verify-1015 BUG-07] Constant-time token check for loopback IPC.
+
+        Missing/blank tokens are rejected outright; a daemon started before this
+        existed cannot authenticate (the CLI retires it and re-forks, see
+        main.py::_retire_stale_daemon).
+        """
+        got = data.get("token") if isinstance(data, dict) else None
+        if not isinstance(got, str) or not got or not self.token:
+            return False
+        return secrets.compare_digest(got, self.token)
+
     def _handle_conn(self, conn):
         try:
             conn.settimeout(CONN_TIMEOUT)
@@ -576,6 +622,17 @@ class DaemonServer:
                 req = json.loads(buf.split(b"\n")[0])
             except ValueError:
                 conn.sendall((json.dumps({"ok": False, "error": "invalid JSON", "code": "PARSE_ERROR"}) + "\n").encode())
+                return
+            if not self._authorized(req):
+                # [verify-1015 BUG-07] Reject before any dispatch: the token is
+                # the only thing standing between a hostile local app and the
+                # user's configured MCP servers (and `shutdown`).
+                log.warning("rejected unauthenticated request: %r", str(req)[:120])
+                conn.sendall((json.dumps({
+                    "ok": False,
+                    "error": "unauthorized: missing or bad daemon token",
+                    "code": "AUTH",
+                }) + "\n").encode())
                 return
             resp = self.handle_request(req)
             conn.sendall((json.dumps(resp, ensure_ascii=False) + "\n").encode())
@@ -608,10 +665,22 @@ class DaemonServer:
         port = srv.getsockname()[1]
         srv.listen(16)
         srv.settimeout(1.0)  # wake periodically so _running flips take effect
-        tmp = self.port_file + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(str(port))
-        os.replace(tmp, self.port_file)
+        # [verify-1015 BUG-07] Loopback IPC auth. 127.0.0.1 is a
+        # device-global namespace (Android does not isolate loopback per app),
+        # so any other app on the phone can scan ephemeral ports and speak
+        # this protocol. The port file was also world-readable and connections
+        # carried no credential at all: a hostile app could call the user's
+        # configured MCP tools (including remote servers holding credentials)
+        # and could even send `shutdown`. Both files are now 0600 (app uid
+        # only) and every request must carry the token; a request without a
+        # matching token gets AUTH and is dropped.
+        self.token = secrets.token_hex(16)
+        for path, payload in ((self.port_file, str(port)), (self.token_file, self.token)):
+            tmp = path + ".tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+            os.replace(tmp, path)
         log.info("daemon listening on 127.0.0.1:%s pid=%s ttl=%ss", port, os.getpid(), TTL_SECONDS)
 
         def _sigterm(*_):
@@ -641,7 +710,7 @@ class DaemonServer:
             srv.close()
         except OSError:
             pass
-        for path in (self.port_file, self.pid_file):
+        for path in (self.port_file, self.pid_file, self.token_file):
             try:
                 os.unlink(path)
             except OSError:

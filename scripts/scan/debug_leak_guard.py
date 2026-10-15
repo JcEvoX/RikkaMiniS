@@ -57,6 +57,14 @@ ALLOWED_FILES = {
     "com/rikkaminis/app/provider/anthropic/AnthropicProvider.kt",   # LLMRequestLog
     "com/rikkaminis/app/provider/openai/OpenAIProvider.kt",         # LLMRequestLog
     "com/rikkaminis/app/sandbox/offload/SessionsOffloadHandler.kt", # ChatMutationMethods
+    # [verify-1015 BUG-03] Surfaced the moment the gate's argv wiring was
+    # fixed (2026-10-15). OkHttpNetTraceListener is main-tree (subclassed by
+    # ProviderHealthTraceListener) and calls LLMRequestLog.redactURL() so the
+    # debug payload stays redacted — the same audited reason AnthropicProvider
+    # and OpenAIProvider are listed above. Audited, not blanket-allowed: this
+    # entry covers one call site, and any NEW file touching debug code still
+    # fails the gate until it is audited.
+    "com/rikkaminis/app/network/OkHttpNetTraceListener.kt",        # LLMRequestLog.redactURL
 }
 
 # [audit-0916d] A `comment-only` entry used to sit here for ChatViewModel.kt.
@@ -105,7 +113,13 @@ def scan_source(root):
             path = os.path.join(base, fn)
             rel = os.path.relpath(path, src).replace(os.sep, "/")
             posix_rel = os.path.relpath(path, os.path.join(src, "main/java")).replace(os.sep, "/")
-            if "/test/" in rel or "/androidTest/" in rel or "/debug/" in posix_rel:
+            # [verify-1015 BUG-03] `rel` is relative to src/, so the top-level
+            # test tree reads as "test/java/..." — the old `"/test/" in rel`
+            # check never matched it (no leading slash), so every test file
+            # that references debug code was reported as a main-tree violation.
+            # Normalize with a leading slash before the containment checks.
+            rel_slash = "/" + rel
+            if "/test/" in rel_slash or "/androidTest/" in rel_slash or "/debug/" in posix_rel:
                 continue  # the debug package itself + tests pin the behaviour
             if posix_rel in ALLOWED_FILES:
                 continue
@@ -248,6 +262,30 @@ def self_test():
     v2 = scan_source(root2)
     ok &= check("source mode passes clean fixture (allow-listed + comment-only)", len(v2) == 0, str(v2))
 
+    # --- [verify-1015 BUG-03] reverse controls for the two fail-open holes ---
+    # (a) a test-tree file referencing debug code must NOT be reported as a
+    #     main-tree violation (`rel` had no leading slash, so "/test/" missed).
+    root3 = tempfile.mkdtemp(prefix="debugleak-testdir-")
+    test_file = "src/android/app/src/test/java/com/rikkaminis/app/SomeTest.kt"
+    p = os.path.join(root3, test_file)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    open(p, "w").write("import com.rikkaminis.app.debug.LLMRequestLog\n")
+    v3 = scan_source(root3)
+    ok &= check("source mode ignores test-tree references", len(v3) == 0, str(v3))
+
+    # (b) the argv contract: `source <root>` (the documented form) and a bogus
+    #     root must not read as "clean". A silently-empty walk was the whole
+    #     bug — the gate printed ✅ and exited 0 for a nonexistent tree.
+    ok &= check(
+        "argv: `source <root>` resolves the root, not the mode word",
+        _resolve_root(["source", root2]) == os.path.abspath(root2),
+    )
+    ok &= check(
+        "argv: bare <root> still works",
+        _resolve_root([root2]) == os.path.abspath(root2),
+    )
+    ok &= check("argv: missing tree is rejected", _resolve_root(["source"]) is None)
+
     # reverse control: the marker list itself must be non-trivial
     ok &= check("apk marker list non-empty", len(APK_MARKERS) >= 3)
 
@@ -352,6 +390,29 @@ def check(name, ok, detail=""):
     return False
 
 
+def _resolve_root(args):
+    """[verify-1015 BUG-03] Resolve the repo root from CLI args, or None when
+    the argv form cannot name a tree that actually contains the source.
+
+    Accepts both the documented `source <repo_root>` form and a bare
+    `<repo_root>`. Returns None — the caller must fail CLOSED — when the root
+    is missing or has no `src/android/app/src`: the old code turned a wrong
+    root into an empty walk that printed "clean" and exited 0, which is how
+    the gate stayed blind in CI (scan.sh passed the mode word as the root).
+    """
+    if not args:
+        return None
+    if args[0] == "source":
+        if len(args) < 2:
+            return None
+        root = os.path.abspath(args[1])
+    else:
+        root = os.path.abspath(args[0])
+    if not os.path.isdir(os.path.join(root, "src/android/app/src")):
+        return None
+    return root
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -378,7 +439,28 @@ def main():
         for x in present:
             print("     " + x)
         return 1
-    root = os.path.abspath(args[0])
+    # [verify-1015 BUG-03] Two failure modes lived here:
+    #   1. the documented `source <repo_root>` form (see the module docstring)
+    #      was not implemented, so `... debug_leak_guard.py source "$ROOT"` —
+    #      exactly what scan.sh called — took the literal string "source" as
+    #      the root, walked a nonexistent directory, and printed "no unaudited
+    #      debug-package references" with exit 0. The gate could not fail
+    #      (verified 2026-10-15 by running both forms: the correct root
+    #      immediately surfaced a real main-tree reference).
+    #   2. a missing source tree was indistinguishable from a clean tree.
+    # Both are closed by accepting the mode word AND failing CLOSED on a root
+    # that does not contain the source tree.
+    if args[0] == "source":
+        if len(args) < 2:
+            print("usage: debug_leak_guard.py source <repo_root>")
+            return 2
+    root = _resolve_root(args)
+    if root is None:
+        print("❌ Debug-leak guard (source): no source tree for the given argument(s)")
+        print(f"   argv={args!r} — pass the repo root, or `source <repo_root>`.")
+        print("   The gate fails CLOSED: a wrong or missing root must not read as")
+        print("   'nothing to scan'.")
+        return 1
     v = scan_source(root)
     if v:
         print(f"❌ Debug-leak guard (source): {len(v)} unaudited debug-package reference(s)")
