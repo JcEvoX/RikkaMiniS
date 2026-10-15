@@ -10,6 +10,7 @@ import com.rikkaminis.app.agent.runtime.CommandFailureKind
 import com.rikkaminis.app.agent.runtime.RetryOutcome
 import com.rikkaminis.app.agent.runtime.RetryPolicy
 import com.rikkaminis.app.agent.runtime.RetrySafety
+import com.rikkaminis.app.agent.runtime.ToolRetrySafetyRegistry
 import com.rikkaminis.app.data.AgentRuntimeLimitsPrefs
 import com.rikkaminis.app.data.repository.EnvVarRepository
 import com.rikkaminis.app.diagnostics.MemorySpikeRecorder
@@ -198,6 +199,14 @@ object ExecutionCoordinator {
      * [fix/audit3-cancel-retry-1015 F-06] `memoryRecycled` is true when the
      * in-flight memory monitor itself killed the shell to keep the app alive —
      * the command is then never replayed (see the predicate for why).
+     *
+     * [deep-audit-1015 ARCH-01] LEGACY — no production call site any more. The
+     * live decision in [executeWithShellRetry] is
+     * [internalDecideShellRetryVerdict], which additionally consults the
+     * trusted side-effect registry ([ToolRetrySafetyRegistry]) before allowing
+     * a replay. This wrapper and its top-level delegate are kept as the
+     * same-inputs comparison arm for the "before vs after" judgment table (and
+     * for the pre-existing tests that pin the legacy contract).
      */
     internal fun shouldRetryCommand(
         exitCode: Int,
@@ -450,9 +459,26 @@ object ExecutionCoordinator {
             // It used to take truncateIfNeeded's default (50 000) and compare
             // it against String.length, so the user's ceiling was ignored on
             // this path entirely and was 3× its declared value for CJK.
+            //
+            // [deep-audit-1015 BUG-09] …plus a suffix margin. By the time we get
+            // here the shell side has ALREADY clipped the capture to
+            // `shellOutputKb() * 1024` bytes (silently, by design), and
+            // executeWithShellRetry has appended its own trailing diagnostics
+            // ([internalMemoryRecycleNotice], the "(exit code: N)" trailer).
+            // Truncating at exactly the same ceiling therefore cut a SECOND
+            // time whenever the output landed within a suffix-length of the
+            // knob: a second "[... N bytes omitted ...]" marker with the tail of
+            // the real output and the diagnostics squeezed out. The margin is
+            // sized for the longest suffix this path appends (~350 chars) so the
+            // diagnostics survive intact and the single silent shell-side clip
+            // is the only truncation the agent ever sees.
+            // NOT fixed by moving the notice after the truncation: that only
+            // swaps which half gets cut (the notice would then be the clipped
+            // one), and it would introduce a "notice itself truncated" path.
             val truncated = TerminalSanitizer.truncateIfNeeded(
                 sanitized,
-                com.rikkaminis.app.data.AgentRuntimeLimitsPrefs.shellOutputKb() * 1024,
+                com.rikkaminis.app.data.AgentRuntimeLimitsPrefs.shellOutputKb() * 1024 +
+                    SHELL_OUTPUT_TRUNCATION_SUFFIX_MARGIN_BYTES,
             )
             // Combine host-side and shell-side truncation flags
             val outputTruncated = result.truncated || truncated != sanitized
@@ -615,6 +641,24 @@ object ExecutionCoordinator {
                 lastInjectedKeys[sessionId] = envVars.keys.toSet()
             }
 
+            // [deep-audit-1015 ARCH-01] PRE_FLIGHT probe — the ONE signal that
+            // tells "the command never reached the PTY" (zero side effects, so
+            // re-issuing it is just its first execution) apart from "the command
+            // ran and its result was lost" (re-issuing an UNKNOWN command would
+            // repeat its side effects).
+            //
+            // `PersistentShell.executeCommand` itself starts with
+            // `ensureStarted()` and then bails out at `writer == null || !isAlive`
+            // with `CommandResult("[Shell not running]", -1)`. Running that same
+            // start step HERE first keeps the probe conservative: a shell that is
+            // alive afterwards is treated as "dispatched" even in the rare case
+            // where the write itself could still fail, so the probe can never
+            // upgrade a genuine dispatch into a licence to replay. Only a shell
+            // that refuses to come up — where the command provably never reached
+            // the PTY — reports `dispatched = false`.
+            shell.ensureStarted()
+            val commandDispatched = shell.isAlive
+
             val result = shell.executeCommand(
                 command = command,
                 timeout = timeout,
@@ -656,7 +700,25 @@ object ExecutionCoordinator {
             // dead shell reference on the exhausted path.
             val shellDied = result.exitCode == -1 || !shell.isAlive
             val memoryRecycled = recycledMidCommand.get()
-            if (!shouldRetryCommand(result.exitCode, shell.isAlive, attempt, memoryRecycled)) {
+            // [deep-audit-1015 ARCH-01] The T3 side-effect-aware policy takes
+            // over from the legacy `shouldRetryCommand` here. `shell_execute` is
+            // registered as RetrySafety.UNKNOWN ("the command string cannot be
+            // proven idempotent"), so a DISPATCHED command whose result was lost
+            // (-1 / dead shell / truncated output) is never transparently
+            // re-run: the agent gets `outcomeKnown = false` and decides. Only the
+            // pre-flight case above (provably not dispatched) keeps the
+            // rebuild-and-replay ability.
+            val verdict = internalDecideShellRetryVerdict(
+                exitCode = result.exitCode,
+                shellAlive = shell.isAlive,
+                truncated = result.truncated,
+                attempt = attempt,
+                safety = ToolRetrySafetyRegistry.lookup(SHELL_EXECUTE_TOOL_NAME),
+                maxRetries = MAX_AUTO_RETRIES,
+                memoryRecycled = memoryRecycled,
+                commandDispatched = commandDispatched,
+            )
+            if (!verdict.retry) {
                 if (memoryRecycled) {
                     // [fix/audit3-cancel-retry-1015 F-06] Our own memory monitor
                     // killed the shell mid-command. Re-running would rebuild a
@@ -711,13 +773,31 @@ object ExecutionCoordinator {
                 // explanation reads like an unexplained crash, so the memory
                 // kill carries the ceiling that was crossed.
                 val notice = if (memoryRecycled) internalMemoryRecycleNotice(recycleReason.get()) else ""
-                return CommandResult(output = result.output + notice, exitCode = result.exitCode, durationMs = 0L, truncated = result.truncated) to lastShell
+                // [deep-audit-1015 ARCH-01] Carry the policy's verdict up:
+                // `outcomeKnown = false` marks "the command may have run but the
+                // result is not trustworthy" (see [CommandResult.outcomeKnown]).
+                // It is set on exactly the shapes where the replay was withheld
+                // — the two decisions are one decision.
+                return CommandResult(
+                    output = result.output + notice,
+                    exitCode = result.exitCode,
+                    durationMs = 0L,
+                    truncated = result.truncated,
+                    outcomeKnown = verdict.outcomeKnown,
+                ) to lastShell
             }
 
             Log.w(
                 TAG,
-                "[$sessionId] Shell died mid-command (exit=${result.exitCode}, alive=${shell.isAlive}) " +
-                    "— rebuilding and retrying (attempt $attempt/$MAX_AUTO_RETRIES)"
+                if (commandDispatched) {
+                    "[$sessionId] Retry policy allows a replay (exit=${result.exitCode}, " +
+                        "alive=${shell.isAlive}) — rebuilding and retrying " +
+                        "(attempt $attempt/$MAX_AUTO_RETRIES)"
+                } else {
+                    "[$sessionId] Command never reached the PTY (shell would not start) — " +
+                        "rebuilding the shell and dispatching it " +
+                        "(attempt $attempt/$MAX_AUTO_RETRIES)"
+                }
             )
             sessionDidTerminate(sessionId)
         }
@@ -1323,6 +1403,13 @@ object ExecutionCoordinator {
  * Extracted as a top-level function so it can be JVM-tested without loading
  * the [ExecutionCoordinator] object (which depends on `android.content.Context`
  * and `android.os.Debug`).
+ *
+ * [deep-audit-1015 ARCH-01] LEGACY: the production decision is now
+ * [internalDecideShellRetryVerdict] (side-effect aware, via
+ * [ToolRetrySafetyRegistry]). This predicate looks only at `exitCode == -1` and
+ * therefore replays a DISPATCHED command of unknown safety — the exact blind
+ * spot the audit found. Kept as the same-inputs comparison arm for the
+ * before/after table and as the contract guard the existing tests pin.
  */
 internal fun internalShouldRetryCommand(
     exitCode: Int,
@@ -1483,6 +1570,120 @@ internal fun internalDecideShellRetry(
         hasVerification = hasVerification,
     )
 }
+
+/**
+ * [deep-audit-1015 ARCH-01] Trusted tool name for the agent's shell tool, as
+ * registered in [ToolRetrySafetyRegistry] (`shell_execute` → [RetrySafety.UNKNOWN]:
+ * a command string can never be *proven* idempotent from the outside).
+ */
+internal const val SHELL_EXECUTE_TOOL_NAME = "shell_execute"
+
+/**
+ * [deep-audit-1015 ARCH-01] The production shape of the T3 decision: what to do
+ * about this failure, and whether the result may be believed.
+ *
+ * [internalDecideShellRetry] answers only "may the command be re-run". This type
+ * pairs that answer with [ExecutionCoordinator.CommandResult.outcomeKnown]
+ * because the two must be decided together — replaying a non-idempotent command
+ * and passing an untrustworthy result off as a known one are two halves of the
+ * same mistake.
+ */
+internal data class ShellRetryVerdict(
+    /**
+     * true = re-issue the same command on a freshly built shell. Allowed only
+     * when the replay is provably safe ([RetryOutcome.SafeToRetry]: read-only,
+     * or an idempotent write with a verification hook) or when the command was
+     * **never dispatched** (zero side effects — re-issuing it IS its first
+     * execution).
+     */
+    val retry: Boolean,
+    /**
+     * false = the result is unknown ([RetryOutcome.OutcomeUnknown] /
+     * `MustVerifyFirst`): the command may have run and its side effects may
+     * have happened, but the returned output cannot be trusted. The caller must
+     * neither replay a non-idempotent command on this basis nor treat a partial
+     * result as completed.
+     */
+    val outcomeKnown: Boolean,
+)
+
+/**
+ * [deep-audit-1015 ARCH-01] Wire the T3 contract into the production decision:
+ * given the raw signals of one shell command, answer "replay?" and "believable?".
+ *
+ * The policy itself is [RetryPolicy.decideRetry]'s existing matrix — no new
+ * semantics are invented here. Only two inputs are layer-specific:
+ *  - [memoryRecycled]: the F-06 in-flight memory guard killed the shell. A
+ *    replay rebuilds a shell and re-sends the very command that crossed the
+ *    ceiling (it crosses it again), and the result of the killed command is not
+ *    trustworthy either.
+ *  - [commandDispatched]: whether the command actually reached the PTY. false =
+ *    the shell was already unusable before the write
+ *    (`PersistentShell.executeCommand` bails out at `writer == null || !isAlive`
+ *    with `"[Shell not running]"`), so nothing ran and nothing can have had a
+ *    side effect — here "retry" is a FIRST execution and must be kept. This is
+ *    the one place the policy is more permissive than "never retry".
+ *
+ * The blind spot this closes: `shell_execute` is always [RetrySafety.UNKNOWN],
+ * so once a command HAS been dispatched, a lost result (`exitCode == -1` /
+ * dead shell / truncated output) must never be transparently re-run. The legacy
+ * [internalShouldRetryCommand] looked only at `exitCode == -1` and therefore
+ * replayed `git commit`, `rm -rf`, `curl -X POST`, `python3 deploy.py` — up to
+ * `MAX_AUTO_RETRIES` total executions — after a HyperOS silent_kill, a tracer
+ * OOM or a pipe break.
+ */
+internal fun internalDecideShellRetryVerdict(
+    exitCode: Int,
+    shellAlive: Boolean,
+    truncated: Boolean,
+    attempt: Int,
+    safety: RetrySafety,
+    maxRetries: Int = 2,
+    hasVerification: Boolean = false,
+    memoryRecycled: Boolean = false,
+    commandDispatched: Boolean = true,
+): ShellRetryVerdict {
+    // [fix/audit3-cancel-retry-1015 F-06] Not an infra death: our own memory
+    // monitor killed the shell because THIS command was over the ceiling.
+    if (memoryRecycled) return ShellRetryVerdict(retry = false, outcomeKnown = false)
+
+    // PRE_FLIGHT: the command never reached the PTY → zero side effects. Bounded
+    // by the same retry budget, so the "rebuild the shell and re-run" ability
+    // the legacy predicate provided for this case is preserved unchanged.
+    if (!commandDispatched) {
+        return ShellRetryVerdict(retry = attempt < maxRetries, outcomeKnown = true)
+    }
+
+    return when (
+        internalDecideShellRetry(
+            exitCode = exitCode,
+            shellAlive = shellAlive,
+            truncated = truncated,
+            attempt = attempt,
+            safety = safety,
+            maxRetries = maxRetries,
+            hasVerification = hasVerification,
+        )
+    ) {
+        RetryOutcome.SafeToRetry -> ShellRetryVerdict(retry = true, outcomeKnown = true)
+        RetryOutcome.DoNotRetry -> ShellRetryVerdict(retry = false, outcomeKnown = true)
+        // Must-verify and outcome-unknown both mean "do not believe this result
+        // and do not transparently replay it".
+        RetryOutcome.MustVerifyFirst, RetryOutcome.OutcomeUnknown ->
+            ShellRetryVerdict(retry = false, outcomeKnown = false)
+    }
+}
+
+/**
+ * [deep-audit-1015 BUG-09] Extra byte ceiling granted to the host-side
+ * truncation pass so the diagnostics appended AFTER the shell-side clip are not
+ * cut a second time.
+ *
+ * Must stay ≥ the longest suffix [ExecutionCoordinator.executeWithShellRetry]
+ * can append to a clipped capture: [internalMemoryRecycleNotice] (~350 chars)
+ * plus the `"(exit code: N)"` trailer. 1024 leaves ~2.5× headroom.
+ */
+internal const val SHELL_OUTPUT_TRUNCATION_SUFFIX_MARGIN_BYTES = 1024
 
 // ──────────────────────────────────────────────────────────────────────────
 // [shell-generation-scheduler] Shell generation scheduler — pure functions
