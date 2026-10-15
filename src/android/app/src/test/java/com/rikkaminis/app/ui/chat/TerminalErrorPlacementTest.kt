@@ -34,7 +34,7 @@ class TerminalErrorPlacementTest {
             listOf(AgentContentPart.Text("")),
             TerminalErrorPlacement.partsForTerminalError(
                 parts = emptyList(),
-                pendingTerminalError = "stream interrupted",
+                pendingInlineError = "stream interrupted",
             ),
         )
     }
@@ -45,7 +45,7 @@ class TerminalErrorPlacementTest {
             emptyList<AgentContentPart>(),
             TerminalErrorPlacement.partsForTerminalError(
                 parts = emptyList(),
-                pendingTerminalError = null,
+                pendingInlineError = null,
             ),
         )
     }
@@ -55,11 +55,11 @@ class TerminalErrorPlacementTest {
         val parts = listOf(AgentContentPart.Text("partial answer"))
         assertEquals(
             parts,
-            TerminalErrorPlacement.partsForTerminalError(parts, pendingTerminalError = "banner"),
+            TerminalErrorPlacement.partsForTerminalError(parts, pendingInlineError = "banner"),
         )
         assertEquals(
             parts,
-            TerminalErrorPlacement.partsForTerminalError(parts, pendingTerminalError = null),
+            TerminalErrorPlacement.partsForTerminalError(parts, pendingInlineError = null),
         )
     }
 
@@ -148,10 +148,24 @@ class TerminalErrorPlacementTest {
         val lines = readRepoFile(ENGINE).split("\n").toMutableList()
         // Re-create the pre-fix shape: surface the length-wall banner inline,
         // in a branch that reaches the turn tail without having persisted.
-        val idx = lines.indexOfFirst { it.trim() == "loopState.pendingTerminalError = host.string(R.string.error_output_truncated_repeated)" }
+        val idx = lines.indexOfFirst { it.trim() == "loopState.pendingInlineError = host.string(R.string.error_output_truncated_repeated)" }
         assertTrue("anchor not found", idx > 0)
         val indent = lines[idx].takeWhile { it == ' ' }
         lines.add(idx + 1, "${indent}host.setInlineError(host.string(R.string.error_output_truncated_repeated))")
+        expectProbeFailure(lines)
+    }
+
+    @Test
+    fun `negative control - a queue site below the flush is rejected`() {
+        val lines = readRepoFile(ENGINE).split("\n").toMutableList()
+        val flushIdx = lines.indexOfFirst {
+            it.contains(".terminalErrorToSurface(pendingInlineError, persistedRowId)")
+        }
+        assertTrue("flush anchor not found", flushIdx > 0)
+        // The mistake this half of the probe exists to prevent: the
+        // empty-response hint block sits BELOW the flush point, so queuing
+        // there would drop the banner instead of deferring it.
+        lines.add(flushIdx + 12, "                    loopState.pendingInlineError = \"empty response\"")
         expectProbeFailure(lines)
     }
 
@@ -211,6 +225,25 @@ class TerminalErrorPlacementTest {
                 local || deferred,
             )
             out += b to deferred
+        }
+
+        // The flush point sits UPSTREAM of the empty-response hint block, so a
+        // queue site below it is never surfaced — the banner would be dropped
+        // silently rather than deferred. Pin the order.
+        val flushIdx = lines.indexOfFirst {
+            it.contains(".terminalErrorToSurface(pendingInlineError, persistedRowId)")
+        }
+        assertTrue("deferred flush site not found in the turn tail", flushIdx > 0)
+        val queueSites = lines.withIndex()
+            .filter { (_, l) -> l.trim().startsWith("loopState.pendingInlineError = ") && !l.trim().endsWith("= null") }
+            .map { it.index }
+        assertTrue("probe found no queue sites — it is not looking at the engine", queueSites.isNotEmpty())
+        for (q in queueSites) {
+            assertTrue(
+                "queue site at line ${q + 1} sits below the flush at line ${flushIdx + 1} — " +
+                    "the banner would never be surfaced",
+                q < flushIdx,
+            )
         }
         return out
     }

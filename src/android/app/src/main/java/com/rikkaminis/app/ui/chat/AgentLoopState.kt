@@ -271,25 +271,28 @@ internal class AgentLoopState(
     var terminalErrorSurfaced: Boolean = false
 
     /**
-     * [deep-audit-1015 BUG-01b] The terminal banner a failure branch wants
-     * surfaced for THIS turn, held until the turn's own assistant row exists.
+     * [deep-audit-1015 BUG-01b] The inline banner this turn owes the user,
+     * held until the turn's own assistant row exists.
      *
      * WHY DEFERRED: `setInlineError` persists with
      * `updateLastAssistantError(sessionId, …)`, which targets the session's
-     * LAST assistant row (`ChatDao`: ORDER BY sort_order DESC LIMIT 1). A
-     * failure branch that runs before this turn persists a row therefore
-     * writes the banner onto the PREVIOUS turn's row — where it survives a
-     * reload as a permanent mislabel of a turn that actually succeeded
-     * (the empty-parts case: `persistAssistantTurn` inserts nothing, so there
-     * is no row of this turn to address). Branches that already persist an
-     * empty row up front (~2044 / ~2141) surface inline and are unaffected.
+     * LAST assistant row (`ChatDao`: ORDER BY sort_order DESC LIMIT 1). Code
+     * that runs before this turn persists a row therefore writes the banner
+     * onto the PREVIOUS turn's row — where it survives a reload as a
+     * permanent mislabel of a turn that actually succeeded. The empty-part
+     * case is the sharpest: `persistAssistantTurn` inserts nothing for an
+     * empty part list, so a blank turn has no row of this turn to address at
+     * all (both a failure-terminal banner and the empty-response hint land on
+     * the previous turn). Branches that persist an empty row up front
+     * (~2049 / ~2146) surface inline and are unaffected.
      *
-     * Contract: a branch sets this INSTEAD of calling setInlineError, and the
-     * no-tool-calls tail flushes it through
+     * Contract: a call site sets this INSTEAD of calling setInlineError, and
+     * the no-tool-calls tail consumes it through
      * [TerminalErrorPlacement.terminalErrorToSurface] right after the turn's
-     * persist returned a row id.
+     * persist returned a row id. Consume-once: the tail clears it even when
+     * it declines to surface.
      */
-    var pendingTerminalError: String? = null
+    var pendingInlineError: String? = null
 
     /**
      * [fix/tool-call-copy-suppress] The turn text as it looked BEFOR a restated
@@ -411,9 +414,9 @@ internal object TerminalErrorPlacement {
      */
     fun partsForTerminalError(
         parts: List<AgentContentPart>,
-        pendingTerminalError: String?,
+        pendingInlineError: String?,
     ): List<AgentContentPart> =
-        if (pendingTerminalError != null && parts.isEmpty()) {
+        if (pendingInlineError != null && parts.isEmpty()) {
             listOf(AgentContentPart.Text(""))
         } else {
             parts
@@ -429,6 +432,6 @@ internal object TerminalErrorPlacement {
      * persist result in is what makes the ordering "persist, then surface"
      * structural instead of a convention the next edit can silently break.
      */
-    fun terminalErrorToSurface(pendingTerminalError: String?, persistedRowId: String?): String? =
-        if (pendingTerminalError != null && persistedRowId != null) pendingTerminalError else null
+    fun terminalErrorToSurface(pendingInlineError: String?, persistedRowId: String?): String? =
+        if (pendingInlineError != null && persistedRowId != null) pendingInlineError else null
 }

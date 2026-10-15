@@ -2003,7 +2003,7 @@ internal class AgentLoopEngine(
                     // row" — with no row for this turn yet, that is the
                     // PREVIOUS turn's row. The turn tail flushes the banner
                     // once this turn's row exists.
-                    loopState.pendingTerminalError = host.string(R.string.error_stream_interrupted)
+                    loopState.pendingInlineError = host.string(R.string.error_stream_interrupted)
                     // [audit-0907 B5] Failure-terminal with a specific banner
                     // already on screen — flag so the exit side does not
                     // misclassify this as a MAX_AGENT_TURNS runaway and
@@ -2257,7 +2257,7 @@ internal class AgentLoopEngine(
                                 // write the banner onto the PREVIOUS turn's
                                 // row. See the error-shaped stub-ceiling
                                 // branch above for the full rationale.
-                                loopState.pendingTerminalError = host.string(R.string.error_output_truncated_repeated)
+                                loopState.pendingInlineError = host.string(R.string.error_output_truncated_repeated)
                                 // [audit-0907 B5] Failure-terminal (specific
                                 // banner shown) — see the flag's KDoc; prevents
                                 // the exit-side runaway misclassification.
@@ -2362,7 +2362,7 @@ internal class AgentLoopEngine(
                         // turn has NO parts (empty output) — TerminalErrorPlacement
                         // makes the tail persist an empty-text row for it, so
                         // the banner has a row of its own to land on.
-                        loopState.pendingTerminalError = host.string(R.string.error_output_truncated_repeated)
+                        loopState.pendingInlineError = host.string(R.string.error_output_truncated_repeated)
                         // [audit-0907 B5] Failure-terminal (specific banner
                         // shown) — prevents the exit-side runaway
                         // misclassification from overwriting it.
@@ -2391,7 +2391,7 @@ internal class AgentLoopEngine(
                             // [deep-audit-1015 BUG-01b] Deferred to the turn
                             // tail (this branch falls through to the persist) —
                             // see the error-shaped stub-ceiling branch above.
-                            loopState.pendingTerminalError = host.string(R.string.error_output_truncated_repeated)
+                            loopState.pendingInlineError = host.string(R.string.error_output_truncated_repeated)
                             // [audit-0907 B5] Failure-terminal (specific banner
                             // shown) — prevents the exit-side runaway
                             // misclassification from overwriting it.
@@ -2411,7 +2411,7 @@ internal class AgentLoopEngine(
                             // [deep-audit-1015 BUG-01b] Deferred to the turn
                             // tail (this branch falls through to the persist) —
                             // see the error-shaped stub-ceiling branch above.
-                            loopState.pendingTerminalError = host.string(R.string.error_output_truncated_repeated)
+                            loopState.pendingInlineError = host.string(R.string.error_output_truncated_repeated)
                             // [audit-0907 B5] Failure-terminal (specific banner
                             // shown) — prevents the exit-side runaway
                             // misclassification from overwriting it.
@@ -2659,22 +2659,22 @@ internal class AgentLoopEngine(
                 // succeeded). The empty-text filler keeps the row-present
                 // precondition true even for an empty-output failure — the
                 // same shape the two early-persist branches above already use.
-                val pendingTerminalError = loopState.pendingTerminalError
+                val pendingInlineError = loopState.pendingInlineError
                 // Consume-once: the slot belongs to THIS turn. Clearing it
                 // before the persist (rather than after) means a throwing
                 // insert cannot leak the banner into the NEXT turn's row —
                 // a DB failure surfaces through the caller's
                 // reportAgentLoopError instead, which is the more urgent
                 // truth anyway.
-                loopState.pendingTerminalError = null
+                loopState.pendingInlineError = null
                 val persistedRowId = host.persistAssistantTurn(
-                    TerminalErrorPlacement.partsForTerminalError(turnParts, pendingTerminalError),
+                    TerminalErrorPlacement.partsForTerminalError(turnParts, pendingInlineError),
                     lastUsage, turnReasoningContent, blockMeta,
                     modelId = loopState.currentProvider.model.id,
                     entryId = host.activeEntryId,
                 )
                 TerminalErrorPlacement
-                    .terminalErrorToSurface(pendingTerminalError, persistedRowId)
+                    .terminalErrorToSurface(pendingInlineError, persistedRowId)
                     ?.let { banner ->
                         withContext(Dispatchers.Main) { host.setInlineError(banner) }
                     }
@@ -2766,6 +2766,15 @@ internal class AgentLoopEngine(
                         else ->
                             host.string(R.string.error_empty_response_generic)
                     }
+                    // [deep-audit-1015 BUG-01b — KNOWN RESIDUAL] NOT deferred:
+                    // this block runs AFTER the turn tail's flush point, so
+                    // queuing here would never be surfaced. Routing it through
+                    // pendingInlineError requires moving the flush, which the
+                    // retry `continue`s between the persist and the end of the
+                    // turn (empty-turn recovery, EOF one-shot retry) rule out.
+                    // Same mislabel class as the fixed sites though: a blank
+                    // turn persists NO row, so this hint's DB write lands on
+                    // the previous turn. Registered in backlog §112.
                     withContext(Dispatchers.Main) { host.setInlineError(hint) }
                 }
                 // [fix/rv1014-g1] Auto-title: semantic condition, not
