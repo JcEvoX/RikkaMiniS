@@ -1,6 +1,6 @@
 # rikkaminis-dev-history 按天索引
 
-快速跳转到每日开发日志。共 1748 条记录，74 天。
+快速跳转到每日开发日志。共 1761 条记录，74 天。
 
 ## 2026-08-03（11 条）
 
@@ -3668,7 +3668,7 @@
 - `23:19` **§97 收口：fix/skill-asset-hash-gate 合并 main 15a1f1336（用户令「没有问题就**
   - # §97 收口：fix/skill-asset-hash-gate 合并 main 15a1f1336（用户令「没有问题就合并」+「合并触发之后就不用等了」）
 
-## 2026-10-15（18 条）
+## 2026-10-15（31 条）
 
 - `00:11` **§97 内容哈希门控在真机未生效——根因定性：DB 行来源不是 bundled（原本就有，非本次改出）**
   - **验证对象**：设备包 `1.0.0+2095`（lastUpdate 23:21:46）= CI run **#2095** = `fix/skill-as…
@@ -3706,3 +3706,29 @@
   - # §100 云端分支核查+合并：fix/audit-verify-1015 → main 4b4eb54a8b（2026-10-15）
 - `15:00` **文档更新收尾（同会话续）**
   - **本地**：挂载 `笔记/RikkaMinis开发档案/` 三件套已刷新（1747 条 / 74 天，重建→脱敏→SAGAS→复核 NONE→结构校验：行首围…
+- `15:03` **verify-1015 修复批次收口：P0/P1 全部 8 条，分支 CI #2112 绿（2026-10-15）**
+  - **任务**：核实报告（shared/work/verify-audit-1015/VERIFY-REPORT.md）P0/P1 8 条 → 分支 `fix/a…
+- `15:18` **TierFlow 批量密钥提取（2026-10-15，用户交付 10 个账号）**
+  - **任务**：用户给 10 个 tierflow.cn 账号（手机号+密码，均已实名），要求批量提取两类 API Key（按量 Key 扣余额 / 套餐 Key…
+- `15:28` **tierflow-key-harvest 技能固化 + 挂载交付（2026-10-15）**
+  - **用户令**：「把这个操作变成一个技能，处理好的就到挂载文件夹那里」。
+- `15:54` **第二道门核实：全仓审计报告（附件 25 项）→ VERIFY-REPORT.md（2026-10-15）**
+  - **用户令**：「按照老流程来」+ 附件 `rikkaminis_full_repository_audit_report.md`（64.5KB，BUG×10 …
+- `15:59` **audit2 修复批次派发（2026-10-15，用户令「按你的建议来吧」）**
+  - 六个会话子代理（minis-sessions-cli send --async，全部新会话，模型=羊毛组）：
+- `16:30` **FIX-A6 完成：图片解码三处全尺寸位图 + 缩放算术出 0 尺寸（audit2-PERF-03，2026-10-15）**
+  - **用户令**：「读这个文件并立刻执行：/var/minis/shared/work/verify-audit2-1015/fix-tasks/FIX-A6.m…
+- `16:32` **FIX-A4 完成：消息级 token 估算双计/多路不一致 → 收敛为单一 wire 对齐实现（2026-10-15，分支 `fix/audit2-estimate-1015` @ `37533a3a`，CI #2115 绿，停在分支未合并）**
+  - **任务**：`shared/work/verify-audit2-1015/fix-tasks/FIX-A4.md`（审计报告 BUG-06）。基线 main…
+- `16:41` **FIX-A5 完成：MCP 守护进程三处（per-name 锁 / 请求上限 / 引号 args）（2026-10-15）**
+  - **用户令**：「读 FIX-A5.md 并立刻执行」（子任务派发）。基线 main `891d755`，分支 `fix/audit2-mcpd-1015` @…
+- `16:44` **FIX-A1 收口：audit2 四项 P1 修复，分支 CI #2118 绿（2026-10-15）**
+  - **用户令**：读 `shared/work/verify-audit2-1015/fix-tasks/FIX-A1.md` 并立刻执行 → 「构建完了」。
+- `16:45` **FIX-A2 完成：browser bridge 凭证化 + dataUrl 上限（fix/audit2-bridge-1015 @ e4eccc4，CI 38705282566 绿，停在分支）**
+  - **任务书**：`shared/work/verify-audit2-1015/fix-tasks/FIX-A2.md`；**报告** `fix-reports…
+- `17:33` **FIX-A3 交付收口：BUG-08 cancelBridge 共享化（2026-10-15）**
+  - **任务**：`shared/work/verify-audit2-1015/fix-tasks/FIX-A3.md` —— Anthropic/Gemini …
+- `18:07` **FIX-A1-2 收口：注释级修正（"provably true" 不成立）—— 分支 CI #2120 绿（2026-10-15）**
+  - **用户令**：读 `shared/work/verify-audit2-1015/fix-tasks/FIX-A1-2.md` 并立刻执行。
+- `18:48` **FIX-A6-2 收口：精确缩放解码窗口改回 `< 2 × maxEdge`，分支 CI #2126 绿（2026-10-15）**
+  - **任务**：读 `shared/work/verify-audit2-1015/fix-tasks/FIX-A6-2.md` 执行。修 audit2 第二道门…
