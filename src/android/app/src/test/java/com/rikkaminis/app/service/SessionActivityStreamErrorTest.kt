@@ -233,15 +233,23 @@ class SessionActivityStreamErrorTest {
     /**
      * The engine must keep funnelling its terminal failures through
      * `setInlineError` — a failure branch that surfaces an error some other
-     * way would bypass the tracker again. `>=` and not `==` on the site count
-     * on purpose: adding a funnel site is correct, ONLY removing them (or
-     * opening a second error channel) is the regression.
+     * way would bypass the tracker again. One funnel, two shapes: immediate
+     * sites call `host.setInlineError` inline, and [deep-audit-1015 BUG-01b]
+     * deferred sites park the banner in `loopState.pendingInlineError` for
+     * the turn tail to drain through `TerminalErrorPlacement` into the SAME
+     * funnel — an inline call before the turn's row exists would stamp the
+     * banner onto the previous turn's row. `>=` and not `==` on both counts
+     * on purpose: adding a funnel site is correct; removing one, breaking
+     * the tail drain (or opening a second error channel) is the regression.
      */
     @Test
     fun `the engine keeps a single error funnel and no bypass channel`() {
         assertWiring(engineFunnelIntact(engineSource()), audience = "AgentLoopEngine funnel")
-        val sites = occurrences(normalize(engineSource()), "host.setInlineError(")
-        assertTrue("expected at least 9 terminal-failure funnel sites, found $sites", sites >= 9)
+        val body = normalize(engineSource())
+        val inline = occurrences(body, "host.setInlineError(")
+        val deferred = occurrences(body, "loopState.pendingInlineError = host.string(")
+        assertTrue("expected at least 5 direct funnel sites, found $inline", inline >= 5)
+        assertTrue("expected at least 5 deferred banner sites, found $deferred", deferred >= 5)
     }
 
     /**
@@ -345,6 +353,12 @@ class SessionActivityStreamErrorTest {
             "engine funnel" to { src: String ->
                 assertWiring(engineFunnelIntact(src), audience = "engine funnel (mutated)")
             },
+            "engine deferred site" to { src: String ->
+                assertWiring(engineFunnelIntact(src), audience = "engine deferred site (mutated)")
+            },
+            "engine tail drain" to { src: String ->
+                assertWiring(engineFunnelIntact(src), audience = "engine tail drain (mutated)")
+            },
         )
         val mutated = mapOf(
             "setInlineError mark" to inlineErrorSource().replace(
@@ -378,6 +392,14 @@ class SessionActivityStreamErrorTest {
             "engine funnel" to engineSource().replace(
                 "host.setInlineError(host.string(R.string.error_content_filtered))",
                 "host.someOtherErrorChannel(host.string(R.string.error_content_filtered))",
+            ),
+            "engine deferred site" to engineSource().replace(
+                "loopState.pendingInlineError = host.string(R.string.error_stream_interrupted)",
+                "host.someOtherErrorChannel(host.string(R.string.error_stream_interrupted))",
+            ),
+            "engine tail drain" to engineSource().replace(
+                "terminalErrorToSurface(pendingInlineError, persistedRowId)",
+                "terminalErrorToSurface(null, persistedRowId)",
             ),
         )
         for ((name, assertion) in assertions) {
@@ -513,8 +535,29 @@ class SessionActivityStreamErrorTest {
 
     private fun engineFunnelIntact(source: String): String? {
         val body = normalize(source)
-        val funnel = occurrences(body, "host.setInlineError(")
-        if (funnel < 9) return "the engine lost funnel sites: found $funnel, expected at least 9"
+        // One funnel, two shapes [fix/da1015-funnel-evidence]: immediate
+        // sites call host.setInlineError inline; [deep-audit-1015 BUG-01b]
+        // deferred sites park the banner in loopState.pendingInlineError and
+        // the turn tail drains the slot through TerminalErrorPlacement into
+        // the SAME funnel (persist first, then surface — an inline call
+        // before the turn's row exists stamps the banner onto the PREVIOUS
+        // turn's row). The literal call count therefore split in two, but
+        // the invariant did not: every banner must still land in
+        // host.setInlineError, and no second error channel may open.
+        val inline = occurrences(body, "host.setInlineError(")
+        if (inline < 5) return "the engine lost direct funnel sites: found $inline, expected at least 5"
+        val deferred = occurrences(body, "loopState.pendingInlineError = host.string(")
+        if (deferred < 5) return "the engine lost deferred banner sites: found $deferred, expected at least 5"
+        // The deferred slot must actually drain: the tail hands BOTH the
+        // banner and the persist result to TerminalErrorPlacement and puts
+        // what comes back onto the same funnel. A slot nobody drains would
+        // swallow the banner instead of surfacing it.
+        if (!contains(body, "terminalErrorToSurface(pendingInlineError, persistedRowId)")) {
+            return "the turn tail no longer drains the deferred banner through TerminalErrorPlacement"
+        }
+        if (!contains(body, "host.setInlineError(banner)")) {
+            return "the deferred banner flush no longer surfaces through the setInlineError funnel"
+        }
         if (contains(body, "_error.value =")) {
             return "the engine opened a second error channel (_error.value) that bypasses setInlineError"
         }
@@ -529,7 +572,7 @@ class SessionActivityStreamErrorTest {
         "setActive stale drop", "setInactive consume",
         "markStreamError store write", "clearStreamError store write" -> trackerSource()
         "cancel-is-not-error" -> chatViewModelSource()
-        "engine funnel" -> engineSource()
+        "engine funnel", "engine deferred site", "engine tail drain" -> engineSource()
         else -> error("unknown control '$name'")
     }
 
