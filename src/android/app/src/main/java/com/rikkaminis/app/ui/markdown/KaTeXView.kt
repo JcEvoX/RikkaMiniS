@@ -44,6 +44,22 @@ import kotlinx.coroutines.withContext
 private const val TAG = "KaTeXView"
 
 /**
+ * The render token handed to the shared asset HTML (`assets/katex/katex-render.html`).
+ *
+ * [bridge-arity] This renderer has exactly one in-flight `renderMath` call per
+ * WebView instance, so request identity is never used here — but the argument
+ * must be PRESENT. Chromium resolves `@JavascriptInterface` methods by name AND
+ * argument count, so the HTML's 5-argument `renderMath(..., token)` and its
+ * 4-argument `AndroidBridge.onRendered(..., token)` only reach a host that
+ * declares the same arity. `undefined` happens to coerce to 0 in the bridge, but
+ * writing the 0 explicitly keeps the JS side and the Kotlin side visibly paired
+ * at the call site. `KatexWebViewPool` passes a real monotonically increasing
+ * token; this file deliberately does not, because there is no second request a
+ * late callback could be misattributed to.
+ */
+private const val KATEX_RENDER_TOKEN = 0L
+
+/**
  * Renders a LaTeX string using KaTeX in an offscreen WebView, capturing the result as a bitmap.
  * Uses an LRU cache to avoid re-rendering identical expressions.
  */
@@ -68,6 +84,21 @@ object KaTeXRendererCache {
     val cache = object : LruCache<String, CacheEntry>(64 * 1024) {
         override fun sizeOf(key: String, value: CacheEntry): Int =
             (value.bitmap.byteCount / 1024).coerceAtLeast(1)
+    }
+
+    /**
+     * Drop every cached formula bitmap. (ARCH-03)
+     *
+     * [cache] is byte-budgeted but had NO reclaim path: the app's
+     * memory-pressure hooks called `KatexWebViewPool.clearRenderCacheForMemoryPressure()`
+     * — a different object that merely shares the "KaTeX cache" prefix in its
+     * name — so up to 64 MB of native bitmaps survived `onTrimMemory(TRIM_MEMORY_COMPLETE)`
+     * even though the cache is pure derived state (the next render is a cache miss
+     * and simply re-renders). This is the counterpart of that pool method; both
+     * caches are now cleared at every reclaim site in `MinisApp`.
+     */
+    fun clearForMemoryPressure() {
+        runCatching { cache.evictAll() }
     }
 
     fun cacheKey(latex: String, displayMode: Boolean, isDark: Boolean = false): String =
@@ -199,8 +230,45 @@ fun KaTeXRenderView(
                         setBackgroundColor(android.graphics.Color.TRANSPARENT)
 
                         addJavascriptInterface(object {
+                            // [bridge-arity BUG-05] The asset HTML
+                            // (`assets/katex/katex-render.html`) has called
+                            // `AndroidBridge.onRendered(w, h, error, token)` with FOUR
+                            // arguments ever since the audit-0909 T2-M3 change added the
+                            // render token to the shared pool. Chromium resolves
+                            // `@JavascriptInterface` members by name AND argument count,
+                            // so this three-argument declaration never matched: every
+                            // call died as "Method not found" *inside the page*, the
+                            // `renderMath` callback threw in its `requestAnimationFrame`
+                            // (outside its own try/catch), `renderedBitmap` stayed null
+                            // for the whole life of the row, and each uncached formula
+                            // kept its WebView alive — exactly the retention the
+                            // `onRelease` teardown (audit-0909 T10-M1) exists to prevent.
+                            //
+                            // Both arities are declared here so a three-argument caller
+                            // (none today) keeps working. Never change the count on one
+                            // side only: `scripts/scan/katex_bridge_arity_check.py`
+                            // mechanically cross-checks the JS call sites against the
+                            // declarations and fails the build on a mismatch.
                             @JavascriptInterface
                             fun onRendered(width: Int, height: Int, error: String) {
+                                onRendered(width, height, error, KATEX_RENDER_TOKEN)
+                            }
+
+                            /**
+                             * Four-argument form — the one the HTML actually calls.
+                             *
+                             * [token] is the request identity `KatexWebViewPool` uses to
+                             * ignore a late callback from a render it already gave up on.
+                             * This renderer does not need it: a WebView instance here
+                             * renders exactly one formula (a fresh WebView per uncached
+                             * `latex`, destroyed by `onRelease` the moment the bitmap
+                             * lands), so there is no second request a late callback could
+                             * be attributed to. The parameter is accepted and
+                             * deliberately unused rather than omitted — omitting it is
+                             * what broke the bridge in the first place.
+                             */
+                            @JavascriptInterface
+                            fun onRendered(width: Int, height: Int, error: String, token: Long) {
                                 if (error.isNotEmpty()) {
                                     AppLogger.warning(TAG, "KaTeX render failed: $error · latex=${latex.take(80)}")
                                     renderError = error
@@ -290,7 +358,7 @@ fun KaTeXRenderView(
                                     .replace("\n", "\\n")
                                     .replace("\r", "")
                                 evaluateJavascript(
-                                    "renderMath('$escapedLatex', $displayMode, $fontSize, $isDark)",
+                                    "renderMath('$escapedLatex', $displayMode, $fontSize, $isDark, $KATEX_RENDER_TOKEN)",
                                     null
                                 )
                             }
