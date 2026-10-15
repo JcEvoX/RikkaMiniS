@@ -5,6 +5,7 @@ import com.rikkaminis.app.data.model.LLMModel
 import com.rikkaminis.app.provider.anthropic.AnthropicProvider
 import com.rikkaminis.app.provider.gemini.GeminiProvider
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -21,6 +22,7 @@ import java.io.InputStream
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
@@ -174,6 +176,18 @@ class ProviderCancelBridgeAnthropicGeminiTest {
             outcome.chunksAtCancel,
             outcome.chunks,
         )
+        // The job cannot end cleanly here: our cancel closes the socket under the
+        // blocking `call.execute()`, so the stream surfaces a SocketException.
+        // Assert on it rather than letting an uncaught failure escape the test —
+        // a `launch` would hand it to the JVM-wide handler and
+        // kotlinx-coroutines-test charges that to the NEXT `runTest` class in
+        // this JVM (CI run #2132: SessionConcurrencyManagerTest failed with
+        // UncaughtExceptionsBeforeTest).
+        assertTrue(
+            "the collecting job may only fail with the socket close our own cancel caused (got " +
+                "${outcome.failures.map { it.javaClass.simpleName + ": " + it.message }})",
+            outcome.failures.all { it is java.io.IOException },
+        )
     }
 
     @Test
@@ -205,6 +219,18 @@ class ProviderCancelBridgeAnthropicGeminiTest {
             outcome.chunksAtCancel,
             outcome.chunks,
         )
+        // The job cannot end cleanly here: our cancel closes the socket under the
+        // blocking `call.execute()`, so the stream surfaces a SocketException.
+        // Assert on it rather than letting an uncaught failure escape the test —
+        // a `launch` would hand it to the JVM-wide handler and
+        // kotlinx-coroutines-test charges that to the NEXT `runTest` class in
+        // this JVM (CI run #2132: SessionConcurrencyManagerTest failed with
+        // UncaughtExceptionsBeforeTest).
+        assertTrue(
+            "the collecting job may only fail with the socket close our own cancel caused (got " +
+                "${outcome.failures.map { it.javaClass.simpleName + ": " + it.message }})",
+            outcome.failures.all { it is java.io.IOException },
+        )
     }
 
     /**
@@ -215,7 +241,16 @@ class ProviderCancelBridgeAnthropicGeminiTest {
     private fun runConnectWindow(provider: LLMProvider, server: SilentConnectServer): ConnectOutcome {
         val collected = AtomicInteger(0)
         val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-        val job = scope.launch {
+        // This job can only ever end one way: the cancel is delivered by closing
+        // the socket under the blocking `call.execute()`, so the stream surfaces
+        // a SocketException — an IOException, NOT a CancellationException. A bare
+        // `launch` hands an uncaught non-cancellation failure to the JVM-wide
+        // handler; kotlinx-coroutines-test records it and charges it to the NEXT
+        // `runTest` class in the same JVM (CI run #2132: SessionConcurrencyManagerTest
+        // failed with UncaughtExceptionsBeforeTest, with this SocketException as the
+        // registered cause). Collect it here and assert on it instead of leaking it.
+        val failures = CopyOnWriteArrayList<Throwable>()
+        val job = scope.launch(CoroutineExceptionHandler { _, e -> failures += e }) {
             provider.streamMessage(
                 messages = listOf(LLMMessage(LLMMessage.Role.USER, "hi")),
                 systemPrompt = null,
@@ -254,6 +289,7 @@ class ProviderCancelBridgeAnthropicGeminiTest {
             peerCloseMs = peerCloseMs,
             chunksAtCancel = chunksAtCancel,
             chunks = collected.get(),
+            failures = failures.toList(),
         )
     }
 
@@ -264,6 +300,8 @@ class ProviderCancelBridgeAnthropicGeminiTest {
         val peerCloseMs: Long,
         val chunksAtCancel: Int,
         val chunks: Int,
+        /** Anything the collecting job failed with (see [runConnectWindow]). */
+        val failures: List<Throwable>,
     )
 
     /**
