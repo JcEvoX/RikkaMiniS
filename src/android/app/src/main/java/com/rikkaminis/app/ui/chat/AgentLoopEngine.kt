@@ -1996,9 +1996,14 @@ internal class AgentLoopEngine(
                         TAG_STREAM,
                         "runAgentLoop turn=$turn finish=$turnFinishReason (error-shaped) stub ceiling hit — giving up with visible error",
                     )
-                    withContext(Dispatchers.Main) {
-                        host.setInlineError(host.string(R.string.error_stream_interrupted))
-                    }
+                    // [deep-audit-1015 BUG-01b] Deferred, not inline: this
+                    // branch falls through to the turn-tail persist, and an
+                    // inline setInlineError persists through
+                    // updateLastAssistantError = "the session's LAST assistant
+                    // row" — with no row for this turn yet, that is the
+                    // PREVIOUS turn's row. The turn tail flushes the banner
+                    // once this turn's row exists.
+                    loopState.pendingInlineError = host.string(R.string.error_stream_interrupted)
                     // [audit-0907 B5] Failure-terminal with a specific banner
                     // already on screen — flag so the exit side does not
                     // misclassify this as a MAX_AGENT_TURNS runaway and
@@ -2246,17 +2251,35 @@ internal class AgentLoopEngine(
                                     TAG_STREAM,
                                     "runAgentLoop turn=$turn finish=length empty ×$loopState.deterministicEmptyStreak with usage.outputTokens==0 — deterministic empty, skipping remaining retries",
                                 )
-                                withContext(Dispatchers.Main) {
-                                    host.setInlineError(host.string(R.string.error_output_truncated_repeated))
-                                }
+                                // [deep-audit-1015 BUG-01b] Deferred to the
+                                // turn tail (this branch falls through to the
+                                // persist): an inline setInlineError would
+                                // write the banner onto the PREVIOUS turn's
+                                // row. See the error-shaped stub-ceiling
+                                // branch above for the full rationale.
+                                loopState.pendingInlineError = host.string(R.string.error_output_truncated_repeated)
                                 // [audit-0907 B5] Failure-terminal (specific
                                 // banner shown) — see the flag's KDoc; prevents
                                 // the exit-side runaway misclassification.
                                 loopState.terminalErrorSurfaced = true
-                                // Fall through to the normal break path (persist + exit).
-                                // Do NOT `break` here directly: it would skip
-                                // `loopState.loopExitedNormally = true` and misclassify as a
-                                // MAX_AGENT_TURNS runaway.
+                                // Fall through to the normal break path
+                                // (persist + exit).
+                                //
+                                // [deep-audit-1015 BUG-01a] This branch does
+                                // NOT claim a clean completion: the old
+                                // warning here said breaking directly "would
+                                // skip loopExitedNormally = true and
+                                // misclassify as a MAX_AGENT_TURNS runaway" —
+                                // true before audit-0907 B5, false since.
+                                // terminalErrorSurfaced is what keeps
+                                // finalizeAtTurnLimit away (see
+                                // AgentLoopExitDecision.shouldFinalizeAsRunaway),
+                                // and the tail now sets the clean-completion
+                                // flag only when no terminal error was
+                                // surfaced. The fall-through is still
+                                // REQUIRED — it is what persists the partial
+                                // reply — it just no longer lies about the
+                                // outcome.
                             }
                         } else {
                             loopState.deterministicEmptyStreak = 0
@@ -2331,17 +2354,24 @@ internal class AgentLoopEngine(
                         // below (gated on finishedCleanly) won't fire — surface
                         // a visible error explicitly so the user isn't left
                         // staring at a silent blank bubble.
-                        withContext(Dispatchers.Main) {
-                            host.setInlineError(host.string(R.string.error_output_truncated_repeated))
-                        }
+                        //
+                        // [deep-audit-1015 BUG-01b] Deferred to the turn tail
+                        // (this branch falls through to the persist): an inline
+                        // setInlineError would write the banner onto the
+                        // PREVIOUS turn's row. This is also the branch whose
+                        // turn has NO parts (empty output) — TerminalErrorPlacement
+                        // makes the tail persist an empty-text row for it, so
+                        // the banner has a row of its own to land on.
+                        loopState.pendingInlineError = host.string(R.string.error_output_truncated_repeated)
                         // [audit-0907 B5] Failure-terminal (specific banner
                         // shown) — prevents the exit-side runaway
                         // misclassification from overwriting it.
                         loopState.terminalErrorSurfaced = true
-                        // Fall through to the normal break path (persist + exit).
-                        // Do NOT `break` here directly: it would skip
-                        // `loopState.loopExitedNormally = true` and misclassify as a
-                        // MAX_AGENT_TURNS runaway.
+                        // Fall through to the normal break path (persist +
+                        // exit) — the fall-through is what persists whatever
+                        // the turn produced. [deep-audit-1015 BUG-01a] It no
+                        // longer claims a clean completion; see the
+                        // deterministic-empty branch above.
                     } else {
                         // Truncated mid-answer: continue so the model finishes.
                         // [feat/hermes-tier1] Repetition guard FIRST (Hermes
@@ -2358,15 +2388,16 @@ internal class AgentLoopEngine(
                                 TAG_STREAM,
                                 "runAgentLoop turn=$turn finish=length but output is repetition-dominated (${turnText.length} chars) — aborting instead of continuing the degenerate response",
                             )
-                            withContext(Dispatchers.Main) {
-                                host.setInlineError(host.string(R.string.error_output_truncated_repeated))
-                            }
+                            // [deep-audit-1015 BUG-01b] Deferred to the turn
+                            // tail (this branch falls through to the persist) —
+                            // see the error-shaped stub-ceiling branch above.
+                            loopState.pendingInlineError = host.string(R.string.error_output_truncated_repeated)
                             // [audit-0907 B5] Failure-terminal (specific banner
                             // shown) — prevents the exit-side runaway
                             // misclassification from overwriting it.
                             loopState.terminalErrorSurfaced = true
                             // Fall through to the normal break path (persist +
-                            // exit). NOT `loopExitedNormally` (this is an
+                            // exit). NOT a clean completion (this is an
                             // abort), but also NOT a runaway misclassification:
                             // see the deterministic-empty branch above for the
                             // same pattern.
@@ -2377,13 +2408,18 @@ internal class AgentLoopEngine(
                                 TAG_STREAM,
                                 "runAgentLoop turn=$turn finish=length — continuation ceiling $lwMax reached, giving up (accumulated ${loopState.accumulatedText.length} chars)",
                             )
-                            withContext(Dispatchers.Main) {
-                                host.setInlineError(host.string(R.string.error_output_truncated_repeated))
-                            }
+                            // [deep-audit-1015 BUG-01b] Deferred to the turn
+                            // tail (this branch falls through to the persist) —
+                            // see the error-shaped stub-ceiling branch above.
+                            loopState.pendingInlineError = host.string(R.string.error_output_truncated_repeated)
                             // [audit-0907 B5] Failure-terminal (specific banner
                             // shown) — prevents the exit-side runaway
                             // misclassification from overwriting it.
                             loopState.terminalErrorSurfaced = true
+                            // Fall through to the normal break path (persist +
+                            // exit) — see the deterministic-empty branch above
+                            // for why the fall-through is required and why it
+                            // no longer claims a clean completion.
                         } else {
                             loopState.lengthWallContinues++
                             // T9: log the truncated turn before continuing
@@ -2485,14 +2521,28 @@ internal class AgentLoopEngine(
                 // [fix/verify-nudges-default-off] Read the live limit once and
                 // hand it to the policy — the log's denominator and the gate
                 // now provably share one read (0 = guard off, nudge is null).
+                // [deep-audit-1015 BUG-04] The gate the policy's KDoc always
+                // described: a PASSING verification newer than the last edit
+                // already answers the nudge, so do not demand it again.
+                // Without this the two evidence stamps were pure bookkeeping
+                // (write-only) and buildNudge fired on code edits alone —
+                // nudging for verification the run had just completed.
                 val verifyNudgeLimit = com.rikkaminis.app.data.AgentRuntimeLimitsPrefs.verifyNudges()
-                val verifyNudge = if (loopState.terminalErrorSurfaced) null else
+                val verifyNudge = if (loopState.terminalErrorSurfaced ||
+                    VerificationStopPolicy.hasFreshVerification(
+                        lastEditStamp = loopState.lastEditStamp,
+                        lastVerifyStamp = loopState.lastVerifyStamp,
+                    )
+                ) {
+                    null
+                } else {
                     VerificationStopPolicy.buildNudge(
                         changedPaths = loopState.changedCodePaths.toList(),
                         attempts = loopState.verifyNudgeAttempts,
                         lastEvidenceDetail = loopState.lastVerificationDetail,
                         nudgeLimit = verifyNudgeLimit,
                     )
+                }
                 if (verifyNudge != null) {
                     loopState.verifyNudgeAttempts++
                     // [fix/runtime-limits-audit] The log's denominator reads the
@@ -2599,11 +2649,35 @@ internal class AgentLoopEngine(
                 }
                 val turnParts = host.buildTurnParts(loopState.allToolBlocks, turnStartBlockIndex, toolInputMap)
                 val blockMeta = loopState.allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
-                host.persistAssistantTurn(
-                    turnParts, lastUsage, turnReasoningContent, blockMeta,
+                // [deep-audit-1015 BUG-01b] A failure branch above may have
+                // queued the turn's terminal banner. Persist THIS turn's row
+                // first and surface the banner from the row id that came back:
+                // setInlineError persists through updateLastAssistantError =
+                // "the session's LAST assistant row", so surfacing before the
+                // row exists stamps the banner onto the PREVIOUS turn (and,
+                // when the model streamed nothing, onto a turn the user knows
+                // succeeded). The empty-text filler keeps the row-present
+                // precondition true even for an empty-output failure — the
+                // same shape the two early-persist branches above already use.
+                val pendingInlineError = loopState.pendingInlineError
+                // Consume-once: the slot belongs to THIS turn. Clearing it
+                // before the persist (rather than after) means a throwing
+                // insert cannot leak the banner into the NEXT turn's row —
+                // a DB failure surfaces through the caller's
+                // reportAgentLoopError instead, which is the more urgent
+                // truth anyway.
+                loopState.pendingInlineError = null
+                val persistedRowId = host.persistAssistantTurn(
+                    TerminalErrorPlacement.partsForTerminalError(turnParts, pendingInlineError),
+                    lastUsage, turnReasoningContent, blockMeta,
                     modelId = loopState.currentProvider.model.id,
                     entryId = host.activeEntryId,
                 )
+                TerminalErrorPlacement
+                    .terminalErrorToSurface(pendingInlineError, persistedRowId)
+                    ?.let { banner ->
+                        withContext(Dispatchers.Main) { host.setInlineError(banner) }
+                    }
                 // [T-error-persist-android] Empty-response hint: the model ended a
                 // turn (finish=stop/end_turn) with no visible text anywhere in the
                 // reply and no tool blocks — the user just sees a blank bubble.
@@ -2692,6 +2766,15 @@ internal class AgentLoopEngine(
                         else ->
                             host.string(R.string.error_empty_response_generic)
                     }
+                    // [deep-audit-1015 BUG-01b — KNOWN RESIDUAL] NOT deferred:
+                    // this block runs AFTER the turn tail's flush point, so
+                    // queuing here would never be surfaced. Routing it through
+                    // pendingInlineError requires moving the flush, which the
+                    // retry `continue`s between the persist and the end of the
+                    // turn (empty-turn recovery, EOF one-shot retry) rule out.
+                    // Same mislabel class as the fixed sites though: a blank
+                    // turn persists NO row, so this hint's DB write lands on
+                    // the previous turn. Registered in backlog §116.
                     withContext(Dispatchers.Main) { host.setInlineError(hint) }
                 }
                 // [fix/rv1014-g1] Auto-title: semantic condition, not
@@ -2803,9 +2886,22 @@ internal class AgentLoopEngine(
                     finishReason = turnFinishReason,
                     durationMs = System.currentTimeMillis() - turnStartMs,
                 )
-                loopState.loopExitedNormally = true
-                // T7-D: 旁路验证 —— 工具序列完成，进入收尾
-                traceObserver.t7Reduce(AgentRunEvent.WorkCompleted)
+                // [deep-audit-1015 BUG-01a] A clean completion is claimed only
+                // when the turn did not already surface a terminal error. The
+                // failure-terminal branches above deliberately fall through to
+                // this tail (that is how their partial reply gets persisted),
+                // and the old unconditional assignment rewrote their outcome as
+                // "the model finished its reply" — T7 then recorded
+                // SUCCEEDED/COMPLETED for a run the user was told had failed.
+                // The fall-through is preserved; only the claim is gated. The
+                // audit-0907 B5 runaway guard is unaffected: it reads
+                // terminalErrorSurfaced, not this flag (see
+                // AgentLoopExitDecision.shouldFinalizeAsRunaway).
+                if (AgentLoopExitDecision.cleanCompletionFlag(loopState.terminalErrorSurfaced)) {
+                    loopState.loopExitedNormally = true
+                    // T7-D: 旁路验证 —— 工具序列完成，进入收尾
+                    traceObserver.t7Reduce(AgentRunEvent.WorkCompleted)
+                }
                 break
             }
             // [audit2 BUG-01] Only a turn that ACTUALLY produced tool calls may
@@ -3272,19 +3368,22 @@ internal class AgentLoopEngine(
                 }
 
                 // [feat/verification-stop] edit/verify bookkeeping. Edit side:
-                // a SUCCESSFUL file_write/file_edit on a code path marks the
-                // run's evidence stale (bumps lastEditSeq). Verify side: a
-                // verification-shaped shell command records its outcome and,
-                // when it PASSED, bumps lastVerifySeq — the turn-end guard
-                // compares the two stamps. Non-code paths (prose/config) are
-                // filtered by the policy so a SKILL.md edit never demands a
-                // verification script.
+                // a SUCCESSFUL file_write/file_edit on a code path records the
+                // edit. Verify side: a verification-shaped shell command
+                // records its outcome and, when it PASSED, records the
+                // verification. Both stamps are readings of ONE monotonic clock
+                // so the turn-end guard can order them (see
+                // AgentLoopState.evidenceClock for why two independent
+                // counters could not answer "was the verification newer?").
+                // Non-code paths (prose/config) are filtered by the policy so
+                // a SKILL.md edit never demands a verification script.
                 when {
                     result.success && (name == "file_write" || name == "file_edit") -> {
                         VerificationStopPolicy.changedPathFromArgs(name, p.argsStr)?.let { path ->
                             if (!VerificationStopPolicy.isNonCodePath(path)) {
                                 loopState.changedCodePaths.add(path)
-                                loopState.lastEditSeq++
+                                loopState.evidenceClock++
+                                loopState.lastEditStamp = loopState.evidenceClock
                             }
                         }
                     }
@@ -3298,7 +3397,10 @@ internal class AgentLoopEngine(
                                 else -> "FAILED"
                             }
                             loopState.lastVerificationDetail = "${cmd.take(120)} → $outcome"
-                            if (result.success) loopState.lastVerifySeq++
+                            if (result.success) {
+                                loopState.evidenceClock++
+                                loopState.lastVerifyStamp = loopState.evidenceClock
+                            }
                             AppLogger.info(TAG_STREAM, "[verification-stop] evidence: kind=$kind outcome=$outcome cmd=${cmd.take(80)}")
                         }
                     }
@@ -3516,7 +3618,12 @@ internal class AgentLoopEngine(
         // (b) is the only case that needs the inline-error/Resume hand-holding;
         // (a) must NOT be touched or every normal completion gets a fake "hit
         // 200 turns" sticker (the bug user hit at v1.4.0-dev tip).
-        if (!loopState.loopExitedNormally && !loopState.terminalErrorSurfaced && traceObserver.t7BudgetStopReason == null) {
+        if (AgentLoopExitDecision.shouldFinalizeAsRunaway(
+                loopExitedNormally = loopState.loopExitedNormally,
+                terminalErrorSurfaced = loopState.terminalErrorSurfaced,
+                budgetStopReason = traceObserver.t7BudgetStopReason,
+            )
+        ) {
             AppLogger.warning(
                 TAG_STREAM,
                 "runAgentLoop EXIT — hit MAX_AGENT_TURNS=$maxTurnsThisRun, finalizing as resumable",
@@ -3559,30 +3666,24 @@ internal class AgentLoopEngine(
         // T7-C: 预算中断 → deadline 走 Interrupted(DEADLINE_EXCEEDED)，
         //       计数耗尽走 Failed(EXECUTION_FAILED) + error 标注具体维度
         val budgetStop = traceObserver.t7BudgetStopReason
+        // [deep-audit-1015 BUG-01a] The decision table lives in
+        // AgentLoopExitDecision (same package, JVM-testable) and is CALLED
+        // here rather than mirrored in the test — the old test carried a copy
+        // of these `when` blocks, so a change in either one left the other
+        // green and this defect stayed invisible.
         traceObserver.t7EndRun(
-            terminal = when {
-                budgetStop == "deadline_reached" -> AgentTerminal.INTERRUPTED
-                budgetStop != null -> AgentTerminal.FAILED
-                loopState.loopExitedNormally -> AgentTerminal.SUCCEEDED
-                else -> AgentTerminal.FAILED
-            },
-            reason = when {
-                budgetStop == "deadline_reached" -> AgentTerminalReason.DEADLINE_EXCEEDED
-                budgetStop != null -> AgentTerminalReason.EXECUTION_FAILED
-                loopState.loopExitedNormally -> AgentTerminalReason.COMPLETED
-                else -> AgentTerminalReason.EXECUTION_FAILED
-            },
+            terminal = AgentLoopExitDecision.terminal(budgetStop, loopState.loopExitedNormally),
+            reason = AgentLoopExitDecision.reason(budgetStop, loopState.loopExitedNormally),
             durationMs = System.currentTimeMillis() - traceStartMs,
-            error = when {
-                budgetStop != null -> "budget_exhausted($budgetStop)"
-                // [audit-0907 B5] A failure-terminal error was already
-                // surfaced inline (EOF stub ceiling / repetition abort / …) —
-                // label it as such, NOT as a runaway turn-loop (which it
-                // isn't: the loop exited via a typed failure branch).
-                loopState.terminalErrorSurfaced -> "terminal_error_surfaced"
-                !loopState.loopExitedNormally -> "MAX_AGENT_TURNS"
-                else -> null
-            },
+            // [audit-0907 B5] A failure-terminal error was already surfaced
+            // inline (EOF stub ceiling / repetition abort / …) — label it as
+            // such, NOT as a runaway turn-loop (which it isn't: the loop
+            // exited via a typed failure branch).
+            error = AgentLoopExitDecision.errorLabel(
+                budgetStopReason = budgetStop,
+                terminalErrorSurfaced = loopState.terminalErrorSurfaced,
+                loopExitedNormally = loopState.loopExitedNormally,
+            ),
         )
         traceObserver.traceRunFile = null
         traceObserver.t7BudgetStopReason = null

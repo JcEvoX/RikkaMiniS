@@ -147,6 +147,23 @@ object VerificationStopPolicy {
 
     // ── the nudge ──────────────────────────────────────────────────────────
 
+    /**
+     * [deep-audit-1015 BUG-04] Whether the run's newest PASSING verification
+     * is fresher than its newest code edit — i.e. the edits already carry the
+     * evidence the turn-end guard exists to demand.
+     *
+     * The two stamps are clock readings from the SAME run-scoped monotonic
+     * counter (`AgentLoopState.evidenceClock`), so `>` is a real
+     * happens-after. (Two independent per-kind counters cannot express this:
+     * edit, edit, verify leaves edit=2 > verify=1, and the guard would nudge
+     * for work already verified.)
+     *
+     * `lastEditStamp > 0` keeps the "no edit yet" case out: a run that has
+     * only verified has nothing to be fresh about.
+     */
+    fun hasFreshVerification(lastEditStamp: Long, lastVerifyStamp: Long): Boolean =
+        lastEditStamp > 0L && lastVerifyStamp > lastEditStamp
+
     /** Build the synthetic follow-up reminder. Null when the guard should
      *  not fire (no code edits, all prose, attempts exhausted, or the limit
      *  is 0 = guard off).
