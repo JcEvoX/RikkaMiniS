@@ -401,7 +401,25 @@ internal class AgentLoopEngine(
         // until N) 恰好 consumeTurn N 次，全部 Allowed —— 上界不会比预算更
         // 松也不会更紧。
         val maxTurnsThisRun = observeBudget.maxTurns
-        for (turn in 0 until maxTurnsThisRun) {
+        // [audit3 F-02] LABELED loop — do not drop the `turnLoop@`.
+        // Two execution-budget gates live INSIDE this turn body's retry loop
+        // (`while (!collectDone)` further down): the deadline gate and the
+        // provider-attempt gate. Both set `t7BudgetStopReason` and then exit —
+        // but a bare `break` there only left the *retry* loop, so the turn fell
+        // through to the "the turn's stream completed without error" tail:
+        // it recorded `RouteOutcome.Success` for the very member whose attempt
+        // budget had just refused it (clearing that member's cooldown / circuit
+        // state, i.e. marking a throttled provider healthy), appended an empty
+        // ASSISTANT entry to agentHistory, and kept burning turns against a
+        // reducer already parked in FINALIZING (field log 2026-09-07: "3 empty
+        // turns burned in 4ms against a refused provider-attempt gate").
+        // `break@turnLoop` makes a budget stop exit the RUN, exactly like the
+        // two turn-entry gates just below (deadline / turn_limit), which sit at
+        // for-body depth and were therefore already correct.
+        // Machine-checked by scripts/scan/budget_stop_break_guard.py: a `break`
+        // inside a nested loop whose branch sets t7BudgetStopReason must carry
+        // the `@turnLoop` label.
+        turnLoop@ for (turn in 0 until maxTurnsThisRun) {
             // T7-C: deadline 到达后不发新 provider/tool 请求 —— turn 循环入口检查。
             // 中断标记后走统一 finalize（BudgetExhausted 不是静默失败）。
             if (traceObserver.activeRunBudget?.isExpired() == true) {
@@ -794,7 +812,18 @@ internal class AgentLoopEngine(
                     )
                     // T7-D: 旁路验证 —— deadline 到达
                     traceObserver.t7Reduce(AgentRunEvent.DeadlineReached())
-                    break
+                    // [audit3 F-02] `break@turnLoop`, not `break`: leave the RUN,
+                    // not just this retry loop (see the labeled turn loop for
+                    // the fall-through damage: bogus route Success + empty
+                    // assistant entry + burned turns).
+                    // Skipping the post-while fold (`accumulatedText +=
+                    // turnTextSb`) loses nothing — this gate sits at the TOP of
+                    // the while body, and every path that re-enters the while
+                    // clears turnTextSb first (the retry path and the fallback
+                    // path both call `turnTextSb.setLength(0)` before looping),
+                    // so the buffer is empty here and the fold would be a no-op.
+                    // Pinned by AgentLoopBudgetStopExitTest.
+                    break@turnLoop
                 }
                 try {
                     // T7-A: provider attempt 开始（每次 retry/fallback 都会重新进入）
@@ -809,7 +838,12 @@ internal class AgentLoopEngine(
                             "BudgetExhausted(provider_attempts)",
                         )
                         collectDone = true
-                        break
+                        // [audit3 F-02] Same as the deadline gate above: exit the
+                        // RUN. The while-exit assignment stays (it is the loop
+                        // condition's state, and the labeled break leaves the
+                        // loop either way) — the label is what stops the turn
+                        // from running on to the success tail.
+                        break@turnLoop
                     }
                     // T7-D: 旁路验证 —— ProviderAttemptStarted
                     traceObserver.t7Reduce(AgentRunEvent.ProviderAttemptStarted)

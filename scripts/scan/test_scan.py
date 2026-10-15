@@ -1620,6 +1620,120 @@ def test_loop_counter_reset():
     shutil.rmtree(root)
 
 
+def budget_stop_fixture(shape):
+    """Minimal repo tree for budget_stop_break_guard.
+
+    Ground truth = the audit3 F-02 shape (2026-10-15): the agent loop's
+    execution-budget gates sit inside the turn body's retry `while`, and their
+    bare `break` left only the retry loop — the turn then fell through to the
+    success tail (route Success for the refused member, empty assistant entry,
+    burned turns against a FINALIZING reducer).
+    """
+    rel = KOTLIN_PKG + "/ui/chat/Loop.kt"
+    head = (
+        "package com.rikkaminis.app.ui.chat\n"
+        "class Loop {\n"
+        "    fun run(maxTurns: Int) {\n"
+    )
+    tail = "        }\n    }\n}\n"
+    if shape == "good":
+        outer, inner = "        turnLoop@ for (turn in 0 until maxTurns) {\n", "            while (!done) {\n"
+        gate = (
+            "                if (!budget.consumeAttempt()) {\n"
+            '                    traceObserver.t7BudgetStopReason = "provider_attempt_limit"\n'
+            "                    break@turnLoop\n"
+            "                }\n"
+        )
+        closer, marker = "            }\n", "break@turnLoop"
+    elif shape == "bad_bare_break":
+        # The regression: same shape, but the break leaves only the while.
+        outer, inner = "        turnLoop@ for (turn in 0 until maxTurns) {\n", "            while (!done) {\n"
+        gate = (
+            "                if (!budget.consumeAttempt()) {\n"
+            '                    traceObserver.t7BudgetStopReason = "provider_attempt_limit"\n'
+            "                    break\n"
+            "                }\n"
+        )
+        closer, marker = "            }\n", "break"
+    elif shape == "bad_unlabeled_loop":
+        # Same, and the enclosing turn loop carries no label: nothing to break to.
+        outer, inner = "        for (turn in 0 until maxTurns) {\n", "            while (!done) {\n"
+        gate = (
+            "                if (!budget.consumeAttempt()) {\n"
+            '                    traceObserver.t7BudgetStopReason = "provider_attempt_limit"\n'
+            "                    break\n"
+            "                }\n"
+        )
+        closer, marker = "            }\n", "break"
+    elif shape == "shallow_ok":
+        # Turn-entry gate (no inner loop): a bare break already leaves the run —
+        # this is the production deadline / turn_limit shape.
+        outer, inner = "        turnLoop@ for (turn in 0 until maxTurns) {\n", ""
+        gate = (
+            "            if (budget.isExpired()) {\n"
+            '                traceObserver.t7BudgetStopReason = "deadline_reached"\n'
+            "                break\n"
+            "            }\n"
+        )
+        closer, marker = "", "break"
+    elif shape == "return_only":
+        # The branch returns an advisory error instead of ending the run
+        # (production: ChatPromptAndTools' tool_call_limit) — out of remit.
+        outer, inner = "        turnLoop@ for (turn in 0 until maxTurns) {\n", "            while (!done) {\n"
+        gate = (
+            "                if (!budget.consumeToolCall()) {\n"
+            '                    traceObserver.t7BudgetStopReason = "tool_call_limit"\n'
+            '                    return "budget exhausted"\n'
+            "                }\n"
+        )
+        closer, marker = "            }\n", "return"
+    else:
+        raise AssertionError(shape)
+    text = head + outer + inner + gate + closer + tail
+    line_no = text[: text.index(marker)].count("\n") + 1
+    return {rel: text}, line_no
+
+
+def test_budget_stop_break():
+    print("━━━ budget_stop_break_guard ━━━")
+    root = make_tree(budget_stop_fixture("good")[0])
+    code, out = run_scanner("budget_stop_break_guard.py", root)
+    check("break@turnLoop out of a nested budget gate passes (exit 0)",
+          code == 0, f"exit={code}\n{out}")
+    shutil.rmtree(root)
+
+    files, line_no = budget_stop_fixture("bad_bare_break")
+    root = make_tree(files)
+    code, out = run_scanner("budget_stop_break_guard.py", root)
+    check("bare break out of a nested budget gate is caught (exit 1)", code == 1,
+          f"exit={code}\n{out}")
+    check(f"finding names the exact file:line ({line_no})",
+          f"Loop.kt:{line_no}" in out, out)
+    check("finding names the required label", "break@turnLoop" in out, out)
+    shutil.rmtree(root)
+
+    files, line_no = budget_stop_fixture("bad_unlabeled_loop")
+    root = make_tree(files)
+    code, out = run_scanner("budget_stop_break_guard.py", root)
+    check("nested break with an unlabeled enclosing loop is caught (exit 1)",
+          code == 1, f"exit={code}\n{out}")
+    check("finding explains the missing label",
+          "carries no label" in out, out)
+    shutil.rmtree(root)
+
+    root = make_tree(budget_stop_fixture("shallow_ok")[0])
+    code, out = run_scanner("budget_stop_break_guard.py", root)
+    check("turn-entry gate at for-body depth may use a bare break (exit 0)",
+          code == 0, f"exit={code}\n{out}")
+    shutil.rmtree(root)
+
+    root = make_tree(budget_stop_fixture("return_only")[0])
+    code, out = run_scanner("budget_stop_break_guard.py", root)
+    check("a budget branch that returns instead of breaking is out of remit (exit 0)",
+          code == 0, f"exit={code}\n{out}")
+    shutil.rmtree(root)
+
+
 def test_real_repo():
     print("━━━ real repo tree (must be clean) ━━━")
     for script in (
@@ -1638,6 +1752,7 @@ def test_real_repo():
         "liveness_static_guard.py",
         "claim_release_guard.py",
         "loop_counter_reset_guard.py",
+        "budget_stop_break_guard.py",
     ):
         code, out = run_scanner(script, REPO_ROOT)
         check(f"{script} on real repo exits 0", code == 0, f"exit={code}\n{out[:2000]}")
@@ -1847,6 +1962,7 @@ def main():
     test_liveness_static()
     test_claim_release()
     test_loop_counter_reset()
+    test_budget_stop_break()
     test_real_repo()
     print("")
     print(f"{'❌ FAILURES: ' + str(FAIL) if FAIL else '✅ ALL ' + str(PASS) + ' CASES PASS'}")
