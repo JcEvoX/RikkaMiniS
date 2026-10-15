@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import coil.request.ImageRequest
 import coil.size.Precision
+import com.rikkaminis.app.util.ImageDecodeSizing
 
 /**
  * [T-android-canvas-large-bitmap-crash] Decode-size ceiling for images we hand
@@ -92,13 +93,15 @@ object DisplayBitmapLimits {
      * Power-of-two `inSampleSize` that brings `max(width, height)` to at most
      * [maxEdge]. Pure arithmetic, so it is unit-testable without a decoder.
      * Returns 1 for images already within the bound (never upsamples).
+     *
+     * [audit2-PERF-03] Delegates to [ImageDecodeSizing.sampleSizeFor]: the same
+     * arithmetic is now needed by the tool/attachment decode paths
+     * (`ReadImageTool`, `ChatPromptAndTools`), and a second copy would drift.
+     * Behaviour is unchanged; this file keeps the display-specific constants
+     * and the Coil ceiling.
      */
-    fun sampleSizeFor(width: Int, height: Int, maxEdge: Int): Int {
-        if (width <= 0 || height <= 0 || maxEdge <= 0) return 1
-        var sample = 1
-        while (width / sample > maxEdge || height / sample > maxEdge) sample *= 2
-        return sample
-    }
+    fun sampleSizeFor(width: Int, height: Int, maxEdge: Int): Int =
+        ImageDecodeSizing.sampleSizeFor(width, height, maxEdge)
 
     /**
      * Decode [path] for display with its longest edge bounded by [maxEdge].

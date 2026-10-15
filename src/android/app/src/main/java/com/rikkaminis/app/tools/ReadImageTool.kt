@@ -2,11 +2,11 @@ package com.rikkaminis.app.tools
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import com.rikkaminis.app.data.model.AgentToolDefinition
 import com.rikkaminis.app.data.model.AgentToolParam
 import com.rikkaminis.app.sandbox.PRootKernel
 import com.rikkaminis.app.ui.chat.decodeUriPath
+import com.rikkaminis.app.util.ImageDecoding
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 
@@ -68,41 +68,32 @@ object ReadImageTool {
                 return ToolExecutionResult("Error: File not found: $path", false, toolTitle = toolTitle)
             }
 
-            val original = BitmapFactory.decodeFile(file.absolutePath)
+            // [audit2-PERF-03] Bounded two-pass decode (bounds -> inSampleSize
+            // -> decode) through the single shared entry point. The old
+            // `BitmapFactory.decodeFile(path)` with no Options allocated the
+            // full-resolution bitmap first: a 12 Mpx photo is ~48 MB (8000x6000
+            // ~192 MB) of transient ARGB_8888 against a 256-512 MB heap, and the
+            // createScaledBitmap copy landed on top of it.
+            val maxEdge = 2000
+            val decoded = ImageDecoding.decodeFileBounded(file.absolutePath, maxEdge)
                 ?: return ToolExecutionResult("Error: Cannot decode image: $path", false, toolTitle = toolTitle)
 
-            val maxEdge = 2000
-            var scaled: Bitmap? = null
-            val width: Int
-            val height: Int
+            // Source dimensions come from the bounds probe, so nothing here can
+            // repeat the [fix/audit-s6h1] failure (reading width/height off a
+            // recycled bitmap threw "Can't call getWidth() on a recycled
+            // bitmap"). Recycle the one bitmap the decoder handed us.
+            val width = decoded.sourceWidth
+            val height = decoded.sourceHeight
             val imageBytes: ByteArray
             try {
-                val s = if (original.width > maxEdge || original.height > maxEdge) {
-                    val scale = maxEdge.toFloat() / maxOf(original.width, original.height)
-                    val w = (original.width * scale).toInt()
-                    val h = (original.height * scale).toInt()
-                    Bitmap.createScaledBitmap(original, w, h, true)
-                } else {
-                    original
-                }
-                scaled = s
                 val out = ByteArrayOutputStream()
-                s.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                decoded.bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
                 imageBytes = out.toByteArray()
-                // [fix/audit-s6h1] original.recycle() ran BEFORE reading
-                // original.width/height for the metadata string — reading a
-                // recycled Bitmap throws IllegalStateException, so every
-                // successfully-decoded image failed with "Can't call getWidth()
-                // on a recycled bitmap". Cache the dimensions first, then recycle.
-                width = original.width
-                height = original.height
             } finally {
                 // [audit-0917] Recycle on the error path too: a throw between the
-                // decode and the old explicit recycles used to leak both bitmaps
-                // until GC (native memory). recycle() is idempotent, so the
-                // success path is unchanged.
-                scaled?.let { if (it !== original) it.recycle() }
-                original.recycle()
+                // decode and the old explicit recycles used to leak the bitmap
+                // until GC (native memory). recycle() is idempotent.
+                decoded.bitmap.recycle()
             }
             val metadata = "[$path | ${width}x${height} | ${file.length()} bytes]"
             ToolExecutionResult(

@@ -1,7 +1,6 @@
 package com.rikkaminis.app.ui.chat
 
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
 import android.net.Uri
 import android.util.Log
 import androidx.lifecycle.viewModelScope
@@ -26,6 +25,8 @@ import com.rikkaminis.app.tools.SandboxDefectRegistry
 import com.rikkaminis.app.tools.SubagentSkill
 import com.rikkaminis.app.tools.ToolExecutionResult
 import com.rikkaminis.app.tools.UnknownToolMessage
+import com.rikkaminis.app.util.ImageDecodeSizing
+import com.rikkaminis.app.util.ImageDecoding
 import com.rikkaminis.app.util.Utf16Sanitizer
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -717,20 +718,23 @@ internal fun ChatViewModel.linuxPathToMinisURL(path: String): String? =
 /**
  * Resize a JPEG so its longest edge is at most `maxEdge` px. Returns null
  * if already within bounds. Mirrors iOS AIChatViewModel.resizedImageData.
+ *
+ * [audit2-PERF-03] The already-within-bounds case is decided from an
+ * `inJustDecodeBounds` header probe, and the decode itself goes through
+ * [ImageDecoding] so the full-resolution bitmap is never allocated (this used
+ * to be a bare `decodeByteArray` plus a post-hoc `createScaledBitmap`).
  */
 internal fun ChatViewModel.resizeJpegToMaxEdge(data: ByteArray, maxEdge: Int): ByteArray? {
-    val bmp = android.graphics.BitmapFactory.decodeByteArray(data, 0, data.size) ?: return null
-    val longest = maxOf(bmp.width, bmp.height)
-    if (longest <= maxEdge) { bmp.recycle(); return null }
-    val scale = maxEdge.toFloat() / longest
-    val w = (bmp.width * scale).toInt()
-    val h = (bmp.height * scale).toInt()
-    val resized = android.graphics.Bitmap.createScaledBitmap(bmp, w, h, true)
-    bmp.recycle()
-    val out = java.io.ByteArrayOutputStream()
-    resized.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, out)
-    resized.recycle()
-    return out.toByteArray()
+    val source = ImageDecoding.probeBytes(data) ?: return null
+    if (ImageDecodeSizing.fitsWithin(source.width, source.height, maxEdge)) return null
+    val decoded = ImageDecoding.decodeBytesBounded(data, maxEdge, source) ?: return null
+    return try {
+        val out = java.io.ByteArrayOutputStream()
+        decoded.bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
+        out.toByteArray()
+    } finally {
+        decoded.bitmap.recycle()
+    }
 }
 
 internal fun ChatViewModel.executeMemoryWriteTool(argsJson: String): ToolExecutionResult {
@@ -1484,6 +1488,12 @@ Sub-agent routing: the in-session sub-agent feature (spawn_agent) and cross-sess
  *
  * Returns null when the source already fits within [maxEdge] (caller
  * should fall back to [rawBytes]) or on any decode/compress failure.
+ *
+ * [audit2-PERF-03] Both decisions come from a header probe: "already fits"
+ * costs an `inJustDecodeBounds` read instead of a full-size decode, and the
+ * resize itself goes through [ImageDecoding] so the oversized bitmap is never
+ * allocated (it used to decode at full resolution, then copy into the scaled
+ * bitmap — two large rectangles alive at once).
  */
 internal fun ChatViewModel.resizeImageBytes(
     rawBytes: ByteArray,
@@ -1491,22 +1501,18 @@ internal fun ChatViewModel.resizeImageBytes(
     maxEdge: Int = 2000,
 ): ByteArray? {
     return try {
-        val original = BitmapFactory.decodeByteArray(rawBytes, 0, rawBytes.size) ?: return null
-        if (original.width <= maxEdge && original.height <= maxEdge) {
-            original.recycle()
-            return null
+        val source = ImageDecoding.probeBytes(rawBytes) ?: return null
+        if (ImageDecodeSizing.fitsWithin(source.width, source.height, maxEdge)) return null
+        val decoded = ImageDecoding.decodeBytesBounded(rawBytes, maxEdge, source) ?: return null
+        try {
+            val out = ByteArrayOutputStream()
+            val format = if (mimeType.contains("png")) Bitmap.CompressFormat.PNG
+            else Bitmap.CompressFormat.JPEG
+            decoded.bitmap.compress(format, 85, out)
+            out.toByteArray()
+        } finally {
+            decoded.bitmap.recycle()
         }
-        val scale = maxEdge.toFloat() / maxOf(original.width, original.height)
-        val w = (original.width * scale).toInt()
-        val h = (original.height * scale).toInt()
-        val scaled = Bitmap.createScaledBitmap(original, w, h, true)
-        val out = ByteArrayOutputStream()
-        val format = if (mimeType.contains("png")) Bitmap.CompressFormat.PNG
-        else Bitmap.CompressFormat.JPEG
-        scaled.compress(format, 85, out)
-        if (scaled !== original) scaled.recycle()
-        original.recycle()
-        out.toByteArray()
     } catch (_: Exception) {
         null
     }
