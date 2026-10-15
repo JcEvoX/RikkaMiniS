@@ -30,6 +30,7 @@ stay pure-local (servers.json only) and never touch the daemon.
 
 import json
 import os
+import shlex
 import signal
 import socket
 import sys
@@ -502,7 +503,16 @@ def cmd_add(args, pretty):
     elif command:
         server["command"] = command
         if args_raw:
-            server["args"] = args_raw.split()
+            # [audit2-A5] Quote-aware split. `--args "-Dfoo=hello world -Dbar=1"`
+            # is two arguments, not four whitespace fragments — str.split() made
+            # any argument containing a space impossible to express. Plain
+            # unquoted input splits exactly as str.split() did, so existing
+            # invocations are unaffected; unbalanced quotes are refused instead
+            # of silently truncated.
+            try:
+                server["args"] = shlex.split(args_raw)
+            except ValueError as exc:
+                _fail("--args: %s" % exc, "PARSE_ERROR", name, pretty)
         env = {}
         for e in env_raw:
             if "=" in e:
