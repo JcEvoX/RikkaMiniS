@@ -3,6 +3,7 @@ package com.rikkaminis.app.sandbox.offload
 import android.app.Service
 import android.content.Intent
 import android.os.IBinder
+import android.util.Base64
 import android.util.Log
 import com.rikkaminis.app.data.model.LLMStreamChunk
 import kotlinx.coroutines.Job
@@ -976,6 +977,51 @@ class ModelExecutionService : Service() {
         // owns ProviderRepository/SharedPreferences — can persist it; the
         // worker never touches prefs.
         var imageEndpointCache: com.rikkaminis.app.data.model.ImageEndpointMode? = null
+
+        // 0) Raw passthrough route. [fix/audit3-1015 F-03] This is where the
+        // HTTP call is allowed to happen: ProviderBoundary rejects provider
+        // calls in :app, so the app assembles the request (shared pure body
+        // builder + shared envelope parser) and ships it here. The reply is NOT
+        // parsed — the raw bytes ride back to :app, which owns --output/inline
+        // shaping and the session-scoped file IO.
+        val passthroughReq = req.optJSONObject("passthrough_request")
+        if (passthroughReq != null) {
+            if (openAI == null) {
+                return JSONObject().put("error", "passthrough_unsupported")
+                    .put("message", "passthrough mode requires an OpenAI-compatible provider instance")
+                    .toString()
+            }
+            return try {
+                val ptBody = passthroughReq.opt("body")?.takeIf { it != JSONObject.NULL } as? JSONObject
+                val ptHeaders = LinkedHashMap<String, String>()
+                passthroughReq.optJSONObject("headers")?.let { h ->
+                    for (k in h.keys()) {
+                        val v = h.opt(k)
+                        if (v is String) ptHeaders[k] = v
+                    }
+                }
+                val ptResult = runBlocking {
+                    openAI.rawPassthroughRequest(
+                        endpoint = passthroughReq.optString("endpoint", "").ifEmpty { null },
+                        method = passthroughReq.optString("method", "POST"),
+                        headers = ptHeaders,
+                        bodyObject = ptBody,
+                    )
+                }
+                JSONObject()
+                    .put("passthrough", true)
+                    .put("http_status", ptResult.status)
+                    .put("content_type", ptResult.contentType ?: JSONObject.NULL)
+                    .put("endpoint_url", ptResult.url)
+                    .put("bytes", ptResult.data.size)
+                    .put("body_b64", Base64.encodeToString(ptResult.data, Base64.NO_WRAP))
+                    .toString()
+            } catch (t: Throwable) {
+                JSONObject().put("error", "passthrough_failed")
+                    .put("message", t.message ?: "passthrough request failed")
+                    .toString()
+            }
+        }
 
         // 1) Image generation route. [fix/audit3-1015 F-10] The routing DECISION
         // is shared with the CLI side (`ModelUseProtocol.decideImageRoute`)

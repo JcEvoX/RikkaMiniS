@@ -21,6 +21,13 @@ import java.io.File
  */
 class NoInProcessProviderGuardTest {
 
+    /**
+     * Sanctioned call sites that legitimately contain a target pattern: the CLI
+     * chokepoint is the gateway, not a provider — `ProviderExecutionGateway.generateImage`
+     * (app side) only dispatches to the worker.
+     */
+    private val EXEMPT = listOf("ProviderExecutionGateway.generateImage(")
+
     private fun srcDirs(): List<File> {
         val candidates = listOf(
             File("src/android/app/src/main/java"),
@@ -50,8 +57,18 @@ class NoInProcessProviderGuardTest {
                     // the `it.sendMessage(text)` ViewModel case, not the Gateway
                     // object which is the sanctioned chokepoint).
                     if (line.contains("provider.sendMessage(") ||
-                        line.contains("provider.streamMessage(")
+                        line.contains("provider.streamMessage(") ||
+                        // [fix/audit3-1015 F-03] Model Use's own provider entry
+                        // points. `--passthrough` used to call
+                        // `openAI.rawPassthroughRequest(...)` right here in :app,
+                        // where the ProviderBoundary runtime guard refuses it — the
+                        // mode was 100% dead and no gate mentioned the entry point.
+                        // Dot-prefixed so the provider's own declaration
+                        // (`suspend fun rawPassthroughRequest(`) is not an offence.
+                        line.contains(".rawPassthroughRequest(") ||
+                        line.contains(".generateImage(")
                     ) {
+                        if (EXEMPT.any { line.contains(it) }) continue
                         offences.append("${file.name}:${i + 1}: $line\n")
                     }
                 }

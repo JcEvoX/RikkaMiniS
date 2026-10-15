@@ -321,4 +321,223 @@ internal object ModelUseProtocol {
             ProviderType.anthropic, ProviderType.xAI, ProviderType.kimiCode, null -> ""
         }
     }
+
+    // ── passthrough envelope [T-android-model-use-passthrough-mode] ──────
+    //
+    // [fix/audit3-1015 F-03] `--passthrough` used to run its network call in the
+    // APP process (`performRawPassthrough` → `openAI.rawPassthroughRequest`),
+    // where `ProviderBoundary.enforce` rejects the process; the catch turned
+    // that into `{"error":"passthrough_failed"}`, so the mode could never
+    // succeed. The split is explicit now: this module owns the pure JSON half
+    // (envelope parsing + body assembly, so the bytes come from ONE
+    // implementation), the app keeps CLI shaping and file IO, and the WORKER
+    // owns the HTTP call.
+
+    /**
+     * Keys the handler already interprets itself — never treated as implicit
+     * passthrough body fields, so existing callers' structure/behavior is
+     * unchanged. (Explicit `extra_body` can still re-introduce any of these.)
+     * Mirrors iOS ModelUseOffloadBridge.imageReservedKeys.
+     */
+    private val imageReservedKeys: Set<String> = setOf(
+        "messages", "model", "chat_model", "prompt", "n", "number_of_images",
+        "size", "image_size", "quality", "generation_config", "endpoint",
+        "image_endpoint", "endpoint_path", "extra_body", "extra_headers",
+        "stream", "temperature", "max_tokens",
+    )
+
+    /**
+     * Explicit passthrough envelope: verbatim body/headers/endpoint, raw
+     * (unparsed) response output. Mirrors iOS ModelUseOffloadBridge.PassthroughSpec.
+     */
+    data class PassthroughSpec(
+        val active: Boolean = false,
+        val endpoint: String? = null,        // "/abs/path?q" (absolute) or "rel/segment"
+        val method: String = "POST",
+        val headers: Map<String, String> = emptyMap(),
+        val body: Map<String, Any?> = emptyMap(),
+        val bodyMode: String = "merge",      // "merge" | "replace"
+        /** [T-model-use-passthrough-warnings] Ignored/downgraded-field feedback. */
+        val warnings: List<String> = emptyList(),
+    )
+
+    /**
+     * Parse the top-level `passthrough` object into a [PassthroughSpec].
+     * Mirrors iOS ModelUseOffloadBridge.parsePassthroughEnvelope.
+     */
+    fun parsePassthroughEnvelope(inputJson: String): PassthroughSpec {
+        val obj = try {
+            val t = inputJson.trim()
+            if (t.startsWith("{")) JSONObject(t) else null
+        } catch (_: Throwable) { null } ?: return PassthroughSpec()
+
+        val warnings = mutableListOf<String>()
+        val envRaw: Any? = obj.opt("passthrough")
+        val env = envRaw as? JSONObject
+        if (env == null) {
+            // [T-model-use-passthrough-warnings] Exact key absent or wrong
+            // type — surface the two silent failure shapes. Mirrors iOS.
+            if (envRaw != null && envRaw != JSONObject.NULL) {
+                warnings.add(
+                    "Top-level 'passthrough' is not a JSON object (actual type: ${jsonTypeName(envRaw)}) — " +
+                        "it was ignored and this call ran in STANDARD mode. " +
+                        "Expected shape: {\"passthrough\":{\"endpoint\":...,\"body\":{...}}}.",
+                )
+                return PassthroughSpec(warnings = warnings)
+            }
+            val envelopeKeys = setOf("endpoint", "body", "body_mode", "headers", "method")
+            for (key in obj.keys()) {
+                if (key == "passthrough" || key in imageReservedKeys) continue
+                val v = obj.opt(key) as? JSONObject ?: continue
+                val normalized = key.lowercase().replace("_", "").replace("-", "")
+                val looksLikeName = normalized in setOf("passthrough", "passthru", "passthough", "pathrough")
+                val looksLikeShape = v.keys().asSequence().any { it in envelopeKeys }
+                if (looksLikeName || looksLikeShape) {
+                    warnings.add(
+                        "Top-level key '$key' looks like a passthrough envelope, but the exact key " +
+                            "must be lowercase 'passthrough' — it was ignored and this call ran in STANDARD mode.",
+                    )
+                }
+            }
+            return PassthroughSpec(warnings = warnings)
+        }
+
+        var endpoint: String? = null
+        env.opt("endpoint")?.takeIf { it != JSONObject.NULL }?.let { epRaw ->
+            val ep = (epRaw as? String)?.trim()
+            if (!ep.isNullOrEmpty()) {
+                endpoint = ep
+            } else {
+                warnings.add(
+                    "passthrough.endpoint is not a non-empty string (actual type: ${jsonTypeName(epRaw)}) — " +
+                        "ignored; the default chat/completions path was used.",
+                )
+            }
+        }
+        var method = "POST"
+        env.opt("method")?.takeIf { it != JSONObject.NULL }?.let { mRaw ->
+            // PATCH included — provider-native update APIs use it. Mirrors iOS.
+            val allowed = setOf("GET", "POST", "PUT", "DELETE", "PATCH")
+            val m = (mRaw as? String)?.uppercase()
+            if (m != null && m in allowed) {
+                method = m
+            } else {
+                val desc = (mRaw as? String) ?: jsonTypeName(mRaw)
+                warnings.add("method value '$desc' is not supported (supported: GET/POST/PUT/DELETE/PATCH) — sent as POST.")
+            }
+        }
+        val headers = LinkedHashMap<String, String>()
+        env.opt("headers")?.takeIf { it != JSONObject.NULL }?.let { hRaw ->
+            if (hRaw is JSONObject) {
+                for (key in hRaw.keys()) {
+                    val v = hRaw.opt(key)
+                    if (v is String) {
+                        headers[key] = v
+                    } else {
+                        warnings.add(
+                            "passthrough.headers.$key value is not a string (actual type: ${jsonTypeName(v)}) — " +
+                                "this header was ignored. Header values must be JSON strings.",
+                        )
+                    }
+                }
+            } else {
+                warnings.add(
+                    "passthrough.headers is not a JSON object (actual type: ${jsonTypeName(hRaw)}) — " +
+                        "all custom headers were ignored.",
+                )
+            }
+        }
+        val body = LinkedHashMap<String, Any?>()
+        env.opt("body")?.takeIf { it != JSONObject.NULL }?.let { bRaw ->
+            if (bRaw is JSONObject) {
+                for (key in bRaw.keys()) body[key] = bRaw.opt(key)
+            } else {
+                warnings.add(
+                    "passthrough.body is not a JSON object (actual type: ${jsonTypeName(bRaw)}) — " +
+                        "ignored. Wrap your body fields in an object: \"body\":{...}.",
+                )
+            }
+        }
+        var bodyMode = "merge"
+        env.opt("body_mode")?.takeIf { it != JSONObject.NULL }?.let { bmRaw ->
+            val bm = (bmRaw as? String)?.lowercase()
+            if (bm != null && bm in setOf("merge", "replace")) {
+                bodyMode = bm
+            } else {
+                val desc = (bmRaw as? String) ?: jsonTypeName(bmRaw)
+                warnings.add("body_mode value '$desc' is invalid (only merge/replace are supported) — treated as merge.")
+            }
+        }
+        return PassthroughSpec(true, endpoint, method, headers, bodyMode = bodyMode, body = body, warnings = warnings)
+    }
+
+    /**
+     * Assemble the request body for a passthrough call.
+     *
+     * merge mode keeps the standard OpenAI shape (messages + system +
+     * max_tokens, `model` LOCKED to the resolved id) so callers add ONLY their
+     * extras; replace mode is the caller's object verbatim, with `model`
+     * unlocked — they own it. A replace-mode call with no body is legitimate
+     * for GET-style calls and a common nesting mistake otherwise, so it is
+     * reported through [warnings] either way rather than silently sent.
+     *
+     * [fix/audit3-1015 F-03] Deciding these bytes is JSON work, not I/O, so it
+     * belongs here where both processes can be shown to agree on it.
+     */
+    fun buildRawPassthroughBody(
+        spec: PassthroughSpec,
+        modelId: String,
+        systemPrompt: String?,
+        messages: List<Pair<String, String>>,
+        maxTokens: Int,
+        warnings: MutableList<String>,
+    ): JSONObject? {
+        if (spec.bodyMode == "replace") {
+            if (spec.body.isEmpty()) {
+                warnings.add(
+                    "body_mode=replace but body is empty or missing \u2014 this request was sent with NO body. " +
+                        "If that is not what you intended, check that your fields are nested inside " +
+                        "passthrough.body (not at the top level).",
+                )
+                return null
+            }
+            val out = JSONObject()
+            for ((k, v) in spec.body) out.put(k, v ?: JSONObject.NULL)
+            return out
+        }
+        val baseline = JSONObject().put("model", modelId)
+        if (messages.isNotEmpty()) {
+            val arr = JSONArray()
+            if (!systemPrompt.isNullOrEmpty()) {
+                arr.put(JSONObject().put("role", "system").put("content", systemPrompt))
+            }
+            for ((role, content) in messages) {
+                arr.put(JSONObject().put("role", role).put("content", content))
+            }
+            baseline.put("messages", arr)
+            baseline.put("max_tokens", maxTokens)
+            baseline.put("stream", false)
+        }
+        for ((k, v) in spec.body) baseline.put(k, v ?: JSONObject.NULL)
+        baseline.put("model", modelId)   // merge mode locks model
+        return baseline
+    }
+
+    /**
+     * The app→worker wire envelope for a passthrough call.
+     *
+     * [fix/audit3-1015 F-03] The assembled request travels as JSON through
+     * ModelExecutionDispatcher into :modelservice, which reads exactly the keys
+     * below (`endpoint` / `method` / `headers` / `body`). Building it here, next
+     * to the parser it mirrors, keeps the two ends of the boundary checkable
+     * against each other instead of by eye; absent values travel as explicit
+     * JSON null rather than being dropped.
+     */
+    fun buildPassthroughWireRequest(spec: PassthroughSpec, body: JSONObject?): JSONObject =
+        JSONObject()
+            .put("endpoint", spec.endpoint ?: JSONObject.NULL)
+            .put("method", spec.method)
+            .put("headers", JSONObject(spec.headers as Map<*, *>))
+            .put("body", body ?: JSONObject.NULL)
+            .put("body_mode", spec.bodyMode)
 }

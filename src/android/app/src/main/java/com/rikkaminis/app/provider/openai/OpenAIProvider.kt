@@ -1521,10 +1521,12 @@ class OpenAIProvider constructor(
     ): RawPassthroughResult = withContext(Dispatchers.IO) {
         // [T5-M3] This is a provider network entry point, so it must obey the
         // same process boundary as sendMessage/streamMessage: the app process
-        // must not fall back to an in-process provider call (TF-D). Its only
-        // caller (ModelUseOffloadHandler) runs in the main process, so a failed
-        // remote dispatch used to land here and allocate the raw response bytes
-        // on the app heap — exactly what the :modelservice worker prevents.
+        // must not fall back to an in-process provider call (TF-D).
+        // [fix/audit3-1015 F-03] The note that used to sit here said the only
+        // caller ran in the main process — which WAS the bug: `--passthrough`
+        // called this from :app, the enforce() below threw, and the mode could
+        // never succeed. The caller is ModelExecutionService's
+        // `passthrough_request` branch, so this runs in :modelservice.
         ProviderBoundary.enforce(ProviderBoundary.currentProcessName())
         val url: String = when {
             endpoint != null && endpoint.startsWith("/") ->

@@ -6,6 +6,7 @@ import android.util.Log
 import com.rikkaminis.app.data.model.LLMMessage
 import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.repository.ProviderRepository
+import com.rikkaminis.app.debug.LLMRequestLog
 import com.rikkaminis.app.provider.ProviderFactory
 import com.rikkaminis.app.provider.safeOptString
 import com.rikkaminis.app.sandbox.NativeOffloadHandler
@@ -326,10 +327,17 @@ class ModelUseOffloadHandler(
         // dispatch because body_mode=replace requests may carry no messages at
         // all. Only OpenAI-compatible providers; others error clearly. Mirrors
         // iOS ModelUseOffloadBridge passthrough branch.
-        val ptSpec = parsePassthroughEnvelope(inputText)
+        //
+        // [fix/audit3-1015 F-03] The HTTP call runs in :modelservice.
+        // ProviderBoundary forbids provider calls in this process and that
+        // boundary is load-bearing — the old in-process call could only ever
+        // come back `passthrough_failed`, so the mode was 100% dead. This
+        // branch assembles the request (shared pure body builder), dispatches
+        // it, and shapes the reply.
+        val ptSpec = ModelUseProtocol.parsePassthroughEnvelope(inputText)
         if (ptSpec.active) {
-            val openAI = provider as? com.rikkaminis.app.provider.openai.OpenAIProvider
-                ?: return NativeOffloadResult(
+            if (provider !is com.rikkaminis.app.provider.openai.OpenAIProvider) {
+                return NativeOffloadResult(
                     2,
                     JSONObject().put("error", "passthrough_unsupported")
                         .put(
@@ -339,17 +347,39 @@ class ModelUseOffloadHandler(
                                 "providers. Use the standard OpenAI input format instead.",
                         ).toString() + "\n",
                 )
-            return performRawPassthrough(
+            }
+            val ptWarnings = ptSpec.warnings.toMutableList()
+            val ptBody = ModelUseProtocol.buildRawPassthroughBody(
                 spec = ptSpec,
-                entry = entry,
-                openAI = openAI,
+                modelId = entry.model.id,
                 systemPrompt = systemPrompt,
-                messages = messages,
+                messages = messages.map { it.role.value to it.content },
                 maxTokens = maxTokens,
+                warnings = ptWarnings,
+            )
+            val ptRequestJson = ModelExecutionDispatcher.buildRequestJson(
+                instance = instance,
+                model = entry.model,
+                messages = messages,
+                systemPrompt = systemPrompt,
+                maxTokens = maxTokens,
+                temperature = temperature,
+                imageParts = imageParts,
+                inputJson = inputText,
+                outputExt = outputExt,
+                passthroughRequest = ModelUseProtocol.buildPassthroughWireRequest(ptSpec, ptBody),
+            )
+            val ptRemote = runBlocking { ModelExecutionDispatcher.dispatch(context, ptRequestJson) }
+            return shapeRawPassthrough(
+                spec = ptSpec,
+                warnings = ptWarnings,
+                entry = entry,
+                remoteResult = ptRemote,
                 outputPath = outputPath,
                 sessionId = request.sessionId,
             )
         }
+
 
         // [T-android-model-use-passthrough-mode GH#72] Standard mode: promote the
         // explicit `extra_body` / `extra_headers` envelope (previously image-
@@ -555,132 +585,7 @@ class ModelUseOffloadHandler(
         return NativeOffloadResult(result.exitCode, body.toString(2) + "\n")
     }
 
-    // MARK: - Passthrough mode [T-android-model-use-passthrough-mode]
 
-    /**
-     * Explicit passthrough envelope: verbatim body/headers/endpoint, raw
-     * (unparsed) response output. Mirrors iOS ModelUseOffloadBridge.PassthroughSpec.
-     */
-    private data class PassthroughSpec(
-        val active: Boolean = false,
-        val endpoint: String? = null,        // "/abs/path?q" (absolute) or "rel/segment"
-        val method: String = "POST",
-        val headers: Map<String, String> = emptyMap(),
-        val body: Map<String, Any?> = emptyMap(),
-        val bodyMode: String = "merge",      // "merge" | "replace"
-        /** [T-model-use-passthrough-warnings] Ignored/downgraded-field feedback. */
-        val warnings: List<String> = emptyList(),
-    )
-
-    /**
-     * Parse the top-level `passthrough` object into a [PassthroughSpec].
-     * Mirrors iOS ModelUseOffloadBridge.parsePassthroughEnvelope.
-     */
-    private fun parsePassthroughEnvelope(inputJson: String): PassthroughSpec {
-        val obj = try {
-            val t = inputJson.trim()
-            if (t.startsWith("{")) JSONObject(t) else null
-        } catch (_: Throwable) { null } ?: return PassthroughSpec()
-
-        val warnings = mutableListOf<String>()
-        val envRaw: Any? = obj.opt("passthrough")
-        val env = envRaw as? JSONObject
-        if (env == null) {
-            // [T-model-use-passthrough-warnings] Exact key absent or wrong
-            // type — surface the two silent failure shapes. Mirrors iOS.
-            if (envRaw != null && envRaw != JSONObject.NULL) {
-                warnings.add(
-                    "Top-level 'passthrough' is not a JSON object (actual type: ${jsonTypeName(envRaw)}) — " +
-                        "it was ignored and this call ran in STANDARD mode. " +
-                        "Expected shape: {\"passthrough\":{\"endpoint\":...,\"body\":{...}}}.",
-                )
-                return PassthroughSpec(warnings = warnings)
-            }
-            val envelopeKeys = setOf("endpoint", "body", "body_mode", "headers", "method")
-            for (key in obj.keys()) {
-                if (key == "passthrough" || key in imageReservedKeys) continue
-                val v = obj.opt(key) as? JSONObject ?: continue
-                val normalized = key.lowercase().replace("_", "").replace("-", "")
-                val looksLikeName = normalized in setOf("passthrough", "passthru", "passthough", "pathrough")
-                val looksLikeShape = v.keys().asSequence().any { it in envelopeKeys }
-                if (looksLikeName || looksLikeShape) {
-                    warnings.add(
-                        "Top-level key '$key' looks like a passthrough envelope, but the exact key " +
-                            "must be lowercase 'passthrough' — it was ignored and this call ran in STANDARD mode.",
-                    )
-                }
-            }
-            return PassthroughSpec(warnings = warnings)
-        }
-
-        var endpoint: String? = null
-        env.opt("endpoint")?.takeIf { it != JSONObject.NULL }?.let { epRaw ->
-            val ep = (epRaw as? String)?.trim()
-            if (!ep.isNullOrEmpty()) {
-                endpoint = ep
-            } else {
-                warnings.add(
-                    "passthrough.endpoint is not a non-empty string (actual type: ${jsonTypeName(epRaw)}) — " +
-                        "ignored; the default chat/completions path was used.",
-                )
-            }
-        }
-        var method = "POST"
-        env.opt("method")?.takeIf { it != JSONObject.NULL }?.let { mRaw ->
-            // PATCH included — provider-native update APIs use it. Mirrors iOS.
-            val allowed = setOf("GET", "POST", "PUT", "DELETE", "PATCH")
-            val m = (mRaw as? String)?.uppercase()
-            if (m != null && m in allowed) {
-                method = m
-            } else {
-                val desc = (mRaw as? String) ?: jsonTypeName(mRaw)
-                warnings.add("method value '$desc' is not supported (supported: GET/POST/PUT/DELETE/PATCH) — sent as POST.")
-            }
-        }
-        val headers = LinkedHashMap<String, String>()
-        env.opt("headers")?.takeIf { it != JSONObject.NULL }?.let { hRaw ->
-            if (hRaw is JSONObject) {
-                for (key in hRaw.keys()) {
-                    val v = hRaw.opt(key)
-                    if (v is String) {
-                        headers[key] = v
-                    } else {
-                        warnings.add(
-                            "passthrough.headers.$key value is not a string (actual type: ${jsonTypeName(v)}) — " +
-                                "this header was ignored. Header values must be JSON strings.",
-                        )
-                    }
-                }
-            } else {
-                warnings.add(
-                    "passthrough.headers is not a JSON object (actual type: ${jsonTypeName(hRaw)}) — " +
-                        "all custom headers were ignored.",
-                )
-            }
-        }
-        val body = LinkedHashMap<String, Any?>()
-        env.opt("body")?.takeIf { it != JSONObject.NULL }?.let { bRaw ->
-            if (bRaw is JSONObject) {
-                for (key in bRaw.keys()) body[key] = bRaw.opt(key)
-            } else {
-                warnings.add(
-                    "passthrough.body is not a JSON object (actual type: ${jsonTypeName(bRaw)}) — " +
-                        "ignored. Wrap your body fields in an object: \"body\":{...}.",
-                )
-            }
-        }
-        var bodyMode = "merge"
-        env.opt("body_mode")?.takeIf { it != JSONObject.NULL }?.let { bmRaw ->
-            val bm = (bmRaw as? String)?.lowercase()
-            if (bm != null && bm in setOf("merge", "replace")) {
-                bodyMode = bm
-            } else {
-                val desc = (bmRaw as? String) ?: jsonTypeName(bmRaw)
-                warnings.add("body_mode value '$desc' is invalid (only merge/replace are supported) — treated as merge.")
-            }
-        }
-        return PassthroughSpec(true, endpoint, method, headers, bodyMode = bodyMode, body = body, warnings = warnings)
-    }
 
     /**
      * Standard-mode chat `extra_body`: the EXPLICIT envelope only (implicit
@@ -747,83 +652,53 @@ class ModelUseOffloadHandler(
     }
 
     /**
-     * Execute a raw passthrough request and build the metadata result. The
-     * response is NOT parsed — full raw bytes go to --output (or, when
-     * text-decodable and small, inline into the result). An unwritable --output
-     * degrades to inline text + `output_error` instead of failing a call whose
-     * HTTP request already completed. Mirrors iOS performRawPassthrough.
+     * Shape a passthrough reply that :modelservice executed into the CLI
+     * contract. Field names, exit codes, `--output` degradation and warnings
+     * are unchanged from the pre-F-03 in-process version — only the source of
+     * the bytes moved: the worker performs the HTTP call and returns the body
+     * as Base64, and file IO stays here, where session scoping lives.
      */
-    private fun performRawPassthrough(
-        spec: PassthroughSpec,
+    private fun shapeRawPassthrough(
+        spec: ModelUseProtocol.PassthroughSpec,
+        warnings: MutableList<String>,
         entry: ModelEntry,
-        openAI: com.rikkaminis.app.provider.openai.OpenAIProvider,
-        systemPrompt: String?,
-        messages: List<LLMMessage>,
-        maxTokens: Int,
+        remoteResult: String?,
         outputPath: String?,
         sessionId: String?,
     ): NativeOffloadResult {
-        // Baseline body for merge mode: the standard OpenAI-shape conversion
-        // (messages + system + max_tokens), so callers add ONLY their extras.
-        // replace mode: spec.body verbatim (model unlocked — user owns it).
-        val warnings = spec.warnings.toMutableList()
-        val bodyObject: JSONObject? = if (spec.bodyMode == "replace") {
-            if (spec.body.isEmpty()) {
-                // Legit for GET-style calls, but a common symptom of body
-                // content nested at the wrong JSON level — say so. Mirrors iOS.
-                warnings.add(
-                    "body_mode=replace but body is empty or missing — this request was sent with NO body. " +
-                        "If that is not what you intended, check that your fields are nested inside " +
-                        "passthrough.body (not at the top level).",
-                )
-                null
-            } else JSONObject().also {
-                for ((k, v) in spec.body) it.put(k, v ?: JSONObject.NULL)
+        val remote = try { remoteResult?.let { JSONObject(it) } } catch (_: Throwable) { null }
+        val remoteError = remote?.optString("error", "").orEmpty()
+        if (remote == null || remoteError.isNotEmpty()) {
+            val message = when {
+                remoteResult == null -> "model service did not return a result"
+                remote == null -> "model service returned an unparseable result"
+                else -> remote.optString("message", "passthrough request failed")
             }
-        } else {
-            val baseline = JSONObject().put("model", entry.model.id)
-            if (messages.isNotEmpty()) {
-                val arr = JSONArray()
-                if (!systemPrompt.isNullOrEmpty()) {
-                    arr.put(JSONObject().put("role", "system").put("content", systemPrompt))
-                }
-                for (m in messages) {
-                    arr.put(JSONObject().put("role", m.role.value).put("content", m.content))
-                }
-                baseline.put("messages", arr)
-                baseline.put("max_tokens", maxTokens)
-                baseline.put("stream", false)
-            }
-            for ((k, v) in spec.body) baseline.put(k, v ?: JSONObject.NULL)
-            baseline.put("model", entry.model.id)   // merge mode locks model
-            baseline
-        }
-
-        val result = try {
-            runBlocking {
-                openAI.rawPassthroughRequest(
-                    endpoint = spec.endpoint,
-                    method = spec.method,
-                    headers = spec.headers,
-                    bodyObject = bodyObject,
-                )
-            }
-        } catch (e: Throwable) {
-            Log.w(TAG, "raw passthrough failed: ${e.message}", e)
+            Log.w(TAG, "raw passthrough failed: $message")
             return NativeOffloadResult(
                 1,
-                JSONObject().put("error", "passthrough_failed")
-                    .put("message", e.message ?: "passthrough request failed")
+                JSONObject().put("error", remoteError.ifEmpty { "passthrough_failed" })
+                    .put("message", message)
+                    .also { if (warnings.isNotEmpty()) it.put("warnings", JSONArray(warnings)) }
                     .toString() + "\n",
             )
         }
 
+        val status = remote.optInt("http_status", 0)
+        val url = remote.optString("endpoint_url", "")
+        val contentType = remote.optString("content_type", "").ifEmpty { null }
+        val data: ByteArray = try {
+            Base64.decode(remote.optString("body_b64", ""), Base64.NO_WRAP)
+        } catch (_: Throwable) {
+            ByteArray(0)
+        }
+
         val out = JSONObject()
             .put("passthrough", true)
-            .put("http_status", result.status)
-            .put("content_type", result.contentType ?: JSONObject.NULL)
-            .put("bytes", result.data.size)
-            .put("endpoint_url", result.url)
+            .put("http_status", status)
+            .put("content_type", contentType ?: JSONObject.NULL)
+            .put("bytes", data.size)
+            .put("endpoint_url", url)
             .put("body_mode", spec.bodyMode)
             .put("model_id", entry.model.id)
 
@@ -831,37 +706,38 @@ class ModelUseOffloadHandler(
             val hostFile = sessionAwareHostFile(outputPath, sessionId)
             if (hostFile == null) {
                 out.put("output_error", "Could not resolve --output '$outputPath'")
-                inlineTextIfPossible(result.data, out)
+                inlineTextIfPossible(data, out)
             } else {
                 try {
                     hostFile.parentFile?.mkdirs()
-                    hostFile.writeBytes(result.data)
+                    hostFile.writeBytes(data)
                     logModelUseWrite(outputPath, hostFile, sessionId)
                     out.put("output_file", outputPath)
                 } catch (e: Throwable) {
                     // Don't fail the whole call over an unwritable --output — the
                     // request already succeeded. Surface it + fall back to inline.
                     out.put("output_error", "Could not write --output at $outputPath: ${e.message}")
-                    inlineTextIfPossible(result.data, out)
+                    inlineTextIfPossible(data, out)
                 }
             }
         } else {
-            inlineTextIfPossible(result.data, out)
+            inlineTextIfPossible(data, out)
         }
-        if (result.status < 200 || result.status >= 300) {
+        if (status < 200 || status >= 300) {
             out.put(
                 "error_hint",
-                "Provider returned HTTP ${result.status}; the raw response body (output file or inline) is unmodified.",
+                "Provider returned HTTP $status; the raw response body (output file or inline) is unmodified.",
             )
         }
         if (warnings.isNotEmpty()) {
             out.put("warnings", JSONArray(warnings))
         }
-        Log.i(TAG, "[ModelUseRoute] raw-passthrough done status=${result.status} bytes=${result.data.size} url=${result.url} warnings=${warnings.size}")
+        Log.i(TAG, "[ModelUseRoute] raw-passthrough done status=$status bytes=${data.size} url=${LLMRequestLog.redactURL(url)} warnings=${warnings.size}")
         // Non-2xx → non-zero exit code (raw body still delivered), else 0.
-        val code = if (result.status in 200..299) 0 else 1
+        val code = if (status in 200..299) 0 else 1
         return NativeOffloadResult(code, out.toString(2) + "\n")
     }
+
 
     /**
      * Inline a UTF-8-decodable response into the result (truncated at 64KB);
