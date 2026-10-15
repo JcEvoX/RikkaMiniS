@@ -1,7 +1,6 @@
 package com.rikkaminis.app.conversation
 
 import com.rikkaminis.app.data.ContextPolicy
-import com.rikkaminis.app.data.model.AgentContentPart
 import com.rikkaminis.app.data.model.LLMMessage
 
 /**
@@ -210,22 +209,29 @@ object ContextCompactor {
     }
 
     /**
-     * 估算一条消息完整贡献的 token 数：content 文本 + contentParts 里的
-     * Text / ToolResult.content / ToolUse.input。工具结果在 agent 会话里通常
-     * 占大头，必须计入，否则尾部估算严重低估 → 刚压缩过又压缩。
+     * 估算一条消息完整贡献的 token 数 —— **委托** wire 对齐的权威实现
+     * [ContextEstimator.estimateMessageTokensFull]，本函数不再持有自己的公式。
+     *
+     * [fix/audit2-estimate-1015] 旧实现是 `estimateTokens(content)` 再逐 part 求和
+     * —— 对"content 与同文本 Text part 双填"的消息把同一段文本算两遍，而双填是
+     * **常态而非边角**：主发送路径的用户消息（`ChatViewModel`：
+     * `content = trimmed` + `contentParts = [Text(trimmed), …]`）与每一条
+     * assistant 文本轮（`AgentLoopEngine`：`content = turnText` +
+     * `assistantParts[0] = Text(turnText)`）都是这个形状。wire 侧在
+     * `contentParts` 非空时**只发 parts**（OpenAIProvider 的 structured-parts
+     * 分支：两个 role 的 `content` 都由 Text parts 拼出，`msg.content` 本身不发），
+     * 所以双计是纯虚高 —— 它同时喂大 [estimateTailTokens] 的 TAIL_TOO_SMALL 闸门
+     * 与两处保留预算（`resolveBudgetAnchorIdx` / `clampSliceStartByBudget`）。
+     *
+     * 为什么保留本函数而不是删掉改名：它有 6 个既有调用点，逐个改名只是把同一次
+     * 语义修正摊成更大的 diff。两个入口名背后只有**一份公式**（此处委托，
+     * [ContextEstimator] 是 wire 语义 KDoc 与来源记录的持有者）。
+     * 委托方向 = "调用点名前向计量权威"；[ContextEstimator] 反向只依赖本对象更低层
+     * 的文本原语 [estimateTokens]。两个 object 都没有 `init` 块互相引用，JVM 类
+     * 初始化是惰性的，不构成初始化环。
      */
-    fun estimateMessageTokens(message: LLMMessage): Long {
-        var total = estimateTokens(message.content)
-        message.contentParts.forEach { part ->
-            when (part) {
-                is AgentContentPart.Text -> total += estimateTokens(part.text)
-                is AgentContentPart.ToolResult -> total += estimateTokens(part.content)
-                is AgentContentPart.ToolUse -> total += estimateTokens(part.input.toString())
-                is AgentContentPart.ImageData -> Unit // 字节数据不计入文本 token 估算
-            }
-        }
-        return total
-    }
+    fun estimateMessageTokens(message: LLMMessage): Long =
+        ContextEstimator.estimateMessageTokensFull(message)
 
     /**
      * 最近一次压缩锚点（marker.lastCompactedMessageId）之后内容的总体积估算。

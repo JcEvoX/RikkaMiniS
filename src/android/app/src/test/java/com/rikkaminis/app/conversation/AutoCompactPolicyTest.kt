@@ -162,15 +162,74 @@ class AutoCompactPolicyTest {
     fun `estimateMessageTokens counts content plus content parts`() {
         val msg = LLMMessage(
             role = LLMMessage.Role.USER,
-            content = "a".repeat(40), // 10 tokens
+            content = "a".repeat(40), // 10 tokens — NOT sent on the wire (parts non-empty)
             contentParts = listOf(
                 AgentContentPart.Text("b".repeat(80)),        // 20 tokens
                 AgentContentPart.ToolResult("t1", "tool", "c".repeat(160)), // content 40 tokens
                 AgentContentPart.ToolUse("t2", "tool", JSONObject()), // {} → 0 tokens
             ),
         )
-        // 10 (content) + 20 (Text) + 40 (ToolResult.content) + 0 (empty ToolUse input)
-        assertEquals(70, ContextCompactor.estimateMessageTokens(msg).toInt())
+        // [fix/audit2-estimate-1015] wire 语义：contentParts 非空时只发 parts，
+        // `content` 字段被忽略（OpenAIProvider structured-parts 分支）—— 所以是
+        // 20 (Text) + 40 (ToolResult.content) + 0 (empty ToolUse input) = 60，
+        // 不是旧口径的 10 + 20 + 40 + 0 = 70。
+        assertEquals(60, ContextCompactor.estimateMessageTokens(msg).toInt())
+    }
+
+    @Test
+    fun `estimateMessageTokens counts content when there are no parts`() {
+        // legacy 分支：parts 为空才发 content（此处 content 必须计入，不得为 0）
+        val msg = LLMMessage(LLMMessage.Role.USER, "a".repeat(40))
+        assertEquals(10L, ContextCompactor.estimateMessageTokens(msg))
+    }
+
+    @Test
+    fun `estimateMessageTokens does not double count content mirrored into a Text part`() {
+        // [fix/audit2-estimate-1015] 回归：主发送路径与 assistant 文本轮都是
+        // "content = <同一段文本> + contentParts = [Text(<同一段文本>), …]" 的形状
+        // （ChatViewModel 用户消息 / AgentLoopEngine assistant turn）。旧实现把这段
+        // 文本算两遍；wire 只发 parts，故正确值是 1× 文本。
+        val text = "中文".repeat(16) // 32 个 CJK 字符 → 32 tokens（字面量，不从被测算常量推导）
+        val doubleFilled = LLMMessage(
+            role = LLMMessage.Role.USER,
+            content = text,
+            contentParts = listOf(AgentContentPart.Text(text)),
+        )
+        val textTokens = ContextCompactor.estimateTokens(text)
+        assertEquals(32L, textTokens) // 字面量：32 个 CJK 字符
+        assertEquals(textTokens, ContextCompactor.estimateMessageTokens(doubleFilled))
+        assertTrue(
+            "双计会让估算翻倍：${ContextCompactor.estimateMessageTokens(doubleFilled)}",
+            ContextCompactor.estimateMessageTokens(doubleFilled) < 2 * textTokens,
+        )
+    }
+
+    @Test
+    fun `estimateMessageTokens has a single implementation shared with ContextEstimator`() {
+        // 两个入口名背后只能有一份公式（委托，不是两份"差不多"的实现）
+        val samples = listOf(
+            LLMMessage(LLMMessage.Role.USER, "a".repeat(40)),
+            LLMMessage(
+                role = LLMMessage.Role.USER,
+                content = "中文".repeat(30),
+                contentParts = listOf(AgentContentPart.Text("中文".repeat(30))),
+            ),
+            LLMMessage(
+                role = LLMMessage.Role.ASSISTANT,
+                content = "done",
+                contentParts = listOf(
+                    AgentContentPart.Text("done"),
+                    AgentContentPart.ToolUse("t1", "shell_execute", JSONObject("{\"command\":\"ls\"}")),
+                ),
+                reasoningContent = "先列目录。".repeat(5),
+            ),
+        )
+        for (m in samples) {
+            assertEquals(
+                ContextEstimator.estimateMessageTokensFull(m),
+                ContextCompactor.estimateMessageTokens(m),
+            )
+        }
     }
 
     @Test

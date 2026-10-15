@@ -54,11 +54,22 @@ object ContextEstimator {
 
     /**
      * 单条消息估算 —— 与 [ContextCompactor.estimateMessageTokens] 的差异：
-     * (1) 与 OpenAIProvider 的 wire 序列化对齐（OpenAIProvider.kt:2070）——
-     * `contentParts` 非空时 wire 只发 parts（`content` 字段被忽略），parts
-     * 为空才发 `content` + 顶层图片/音频，二者互斥不双算；
+     * (1) 与 OpenAIProvider 的 wire 序列化对齐（OpenAIProvider 的
+     * structured-parts 分支）—— `contentParts` 非空时 wire 只发 parts
+     * （`content` 字段被忽略），parts 为空才发 `content` + 顶层图片/音频，
+     * 二者互斥不双算；
      * (2) 计入图片 base64 上界与 reasoningContent 回显（DeepSeek 系要求逐轮
      * 回显，这些 token 实打实占用 provider 侧窗口）。
+     *
+     * [fix/audit2-estimate-1015] 本函数是**消息级估算的唯一实现**：
+     * [ContextCompactor.estimateMessageTokens] 已改为委托到这里（此前它是
+     * 独立的一份公式，对"content 与同文本 Text part 双填"的消息双计）。改动
+     * 这条口径必须只改这里 —— 两个入口名背后不允许再有第二份逻辑。
+     *
+     * 有意的保守余量（保留，不改精确值）：图片按**未压缩字节**的 base64 上界计
+     * （wire 侧 user 图片还会过 `ImageBudget.compressUnderBudget` 再编码，实际
+     * 通常更小）、reasoning 回显无条件计入（`putEcho` 在策略为 OMIT 时其实不发
+     * 这个字段）。方向都是"宁可高估（早压缩）不可低估（爆窗口）"，见文件头说明。
      */
     fun estimateMessageTokensFull(message: LLMMessage): Long {
         var total = 0L
