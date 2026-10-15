@@ -221,7 +221,37 @@ object ModelExecutionDispatcher {
             put("max_tokens", maxTokens)
             temperature?.let { put("temperature", it) }
 
-            if (imageParts.isNotEmpty()) {
+            // [fix/audit-1015 PERF-04] Double-payload guard. `imageParts` is
+            // serialized twice on the chat path: once here and once inside the
+            // messages' contentParts (`AgentContentPart.ImageData` →
+            // "b64Data", :196), because the composer puts the same bytes into
+            // both the message's `imageParts` field and its `contentParts`
+            // (ChatViewModel:3695-3699 / ChatStreamToolHelpers:106-107). Base64
+            // for a photo is hundreds of KB, so the request file, the IPC
+            // write, and the worker's two decodes all doubled.
+            //
+            // The top-level `image_parts` array exists for exactly ONE
+            // consumer path: every provider (OpenAIProvider:2059→:2196,
+            // AnthropicProvider:815→:819, GeminiProvider:~440→:439) attaches
+            // the `imageParts` parameter to the last user message ONLY in the
+            // legacy branch taken when that message's `contentParts` is EMPTY.
+            // When the last user message carries contentParts, the providers
+            // read the images out of contentParts and ignore the parameter, so
+            // emitting `image_parts` in that case is pure dead weight — the
+            // bytes are still delivered, through contentParts, byte-identical
+            // on the wire.
+            //
+            // So emit it only when it can actually be consumed. The
+            // `minis-model-use run` path (ModelUseOffloadHandler:274) builds
+            // messages with no contentParts and relies on this array, so its
+            // behavior is unchanged; the chat path stops paying for the second
+            // copy. Absent ⇒ the worker's `jsonObjList(null)` yields an empty
+            // list (ModelExecutionService:1755), which is what the providers
+            // would have effectively used anyway.
+            val lastUserHasContentParts =
+                messages.lastOrNull { it.role == LLMMessage.Role.USER }
+                    ?.contentParts?.isNotEmpty() == true
+            if (imageParts.isNotEmpty() && !lastUserHasContentParts) {
                 put("image_parts", JSONArray().apply {
                     imageParts.forEach { img ->
                         put(JSONObject().apply {

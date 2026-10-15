@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <cstring>
 #include <cstdio>
+#include <stdarg.h>
 #include <ctime>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -38,6 +39,16 @@ static volatile sig_atomic_t g_in_handler = 0;
 #define MINIS_MAX_SIGNAL 32
 static struct sigaction g_old_sa[MINIS_MAX_SIGNAL];
 static volatile sig_atomic_t g_old_saved[MINIS_MAX_SIGNAL];
+
+// [fix/audit-1015 BUG-05] Alternate signal stack. The handler is installed
+// with SA_ONSTACK so that a stack-overflow SIGSEGV — where the crashing
+// thread's own stack is unusable — can still run it. Without a registered
+// alternate stack the flag is inert and such a crash produces no report at
+// all. Static BSS: nothing is allocated at install time or, more importantly,
+// in the handler. 64 KiB is the usual Android/debuggerd order of magnitude
+// (the handler's own frames are small: a 2 KiB report buffer plus /proc
+// scratch buffers, all static).
+static char g_alt_stack[64 * 1024];
 
 // ---- async-signal-safe helpers for richer crash context ----
 //
@@ -149,19 +160,46 @@ static void civil_from_days(long z, int* y, int* m, int* d) {
 }
 
 // [fix/sweep1014-crash-cpp] Restore the saved previous handler (typically
-// debuggerd's) and re-raise, so the tombstone chain stays intact. Falls
-// back to SIG_DFL if the previous handler was never saved. Used for every
-// re-raise path (early returns included — a tombstone helps there too).
+// debuggerd's) so the tombstone chain stays intact. Falls back to SIG_DFL if
+// the previous handler was never saved. Used for every re-raise path (early
+// returns included — a tombstone helps there too).
+//
+// [fix/audit-1015 BUG-05] The old body finished with an unconditional
+// raise(sig). raise() *delivers a brand-new siginfo_t*: si_code becomes
+// SI_USER/SI_TKILL and si_addr becomes nullptr, so debuggerd's tombstone —
+// the artifact this handler exists to preserve — lost the hardware fault
+// address (si_addr) and the fault classification (si_code). Instead:
+//   • previous handler SIG_DFL (or none saved): just RETURN. The crashing
+//     instruction re-executes, the kernel redelivers the signal with its
+//     original siginfo_t, and the default action terminates the process —
+//     no raise() needed, and the death keeps the true fault context.
+//   • previous handler declares SA_SIGINFO (debuggerd on Android): RETURN as
+//     well. The redelivered fault reaches debuggerd with si_addr/si_code
+//     intact, which is exactly what its tombstone wants.
+//   • previous handler is a legacy non-SA_SIGINFO sa_handler: it cannot read
+//     siginfo at all, so nothing is lost by raise(); keep the explicit
+//     synchronous re-delivery for that case.
+// Known residual (documented, not fixable here): if the signal was raised
+// *synchronously by software* rather than by a faulting instruction (e.g.
+// another thread's pthread_kill with SIGSEGV), the return path has no
+// instruction to re-execute and the thread continues. abort() is unaffected
+// (it re-raises itself when its handler returns, per POSIX); the app's crash
+// signals are otherwise hardware faults.
 static void restore_and_reraise(int sig) {
     struct sigaction sa{};
-    if (sig >= 0 && sig < MINIS_MAX_SIGNAL && g_old_saved[sig]) {
+    bool have_saved = (sig >= 0 && sig < MINIS_MAX_SIGNAL && g_old_saved[sig] != 0);
+    if (have_saved) {
         sa = g_old_sa[sig];
     } else {
         sa.sa_handler = SIG_DFL;
         sigemptyset(&sa.sa_mask);
     }
     sigaction(sig, &sa, nullptr);
-    raise(sig);
+    const bool old_is_dfl = !have_saved || sa.sa_handler == SIG_DFL;
+    const bool old_is_siginfo = (sa.sa_flags & SA_SIGINFO) != 0;
+    if (!old_is_dfl && !old_is_siginfo) {
+        raise(sig);
+    }
 }
 
 // [fix/sweep1014-crash-cpp] Install `sa` for `sig`, capturing the previous
@@ -175,6 +213,31 @@ static void install_and_save(int sig, const struct sigaction& sa) {
     } else {
         sigaction(sig, &sa, nullptr);
     }
+}
+
+// [fix/audit-1015 BUG-05] snprintf returns the number of bytes the formatted
+// output WOULD occupy, not the number actually stored. The previous
+// `off += snprintf(buf + off, sizeof(buf) - (size_t)off, ...)` pattern
+// therefore advanced `off` past the end of the buffer whenever the report
+// exceeded its capacity, and the NEXT call then (a) computed
+// `sizeof(buf) - (size_t)off` with `off > sizeof(buf)` — an unsigned
+// underflow to a huge size_t — and (b) wrote at `buf + off`, i.e. far out of
+// bounds, from inside the crash handler. All 12 appends below go through
+// `buf_append`, which clamps: `off` stays within [0, cap), a truncated write
+// is still NUL-terminated, and the size argument passed to vsnprintf is
+// always exact. The append is silent about truncation (a crash report that
+// stops early is still worth writing); the invariant it guarantees is
+// memory safety, not completeness. vsnprintf keeps the async-signal-safe
+// profile this file's snprintf use already relied on.
+static size_t buf_append(char* buf, size_t cap, size_t off, const char* fmt, ...) {
+    if (off + 1 >= cap) return off;  // no room for even one byte + NUL
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + off, cap - off, fmt, ap);
+    va_end(ap);
+    if (n <= 0) return off;          // error (or empty) -> leave off alone
+    size_t usable = (cap - off) - 1; // bytes available beside the NUL
+    return off + ((size_t)n <= usable ? (size_t)n : usable);
 }
 
 static void crash_signal_handler(int sig, siginfo_t* info, void* ctx) {
@@ -270,7 +333,7 @@ static void crash_signal_handler(int sig, siginfo_t* info, void* ctx) {
 
     char buf[2048];
     int off = 0;
-    off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+    off = (int)buf_append(buf, sizeof(buf), (size_t)off,
         "=== Minis Native Crash ===\n"
         "Signal: %d (%s)\n"
         "si_code: %d\n"
@@ -288,19 +351,19 @@ static void crash_signal_handler(int sig, siginfo_t* info, void* ctx) {
     // canonical timestamp; local timezone display is intentionally dropped.
 
     if (cmdline[0] != '\0') {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        off = (int)buf_append(buf, sizeof(buf), (size_t)off,
             "Process: %s\n", cmdline);
     }
     if (vm_rss[0] != '\0') {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        off = (int)buf_append(buf, sizeof(buf), (size_t)off,
             "VmRSS: %s kB\n", vm_rss);
     }
     if (vm_peak[0] != '\0') {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        off = (int)buf_append(buf, sizeof(buf), (size_t)off,
             "VmPeak: %s kB\n", vm_peak);
     }
     if (threads[0] != '\0') {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        off = (int)buf_append(buf, sizeof(buf), (size_t)off,
             "Threads: %s\n", threads);
     }
     // Private-anon split + address-space pressure. RssAnon is the metric the
@@ -308,30 +371,30 @@ static void crash_signal_handler(int sig, siginfo_t* info, void* ctx) {
     // probe curve that led to this death lives in
     // files/logs/memspike-<date>.log (columns anon/resid/native/java/peak).
     if (rss_anon[0] != '\0') {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        off = (int)buf_append(buf, sizeof(buf), (size_t)off,
             "RssAnon: %s kB\n", rss_anon);
     }
     if (rss_file[0] != '\0') {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        off = (int)buf_append(buf, sizeof(buf), (size_t)off,
             "RssFile: %s kB\n", rss_file);
     }
     if (rss_shmem[0] != '\0') {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        off = (int)buf_append(buf, sizeof(buf), (size_t)off,
             "RssShmem: %s kB\n", rss_shmem);
     }
     if (vm_size[0] != '\0') {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        off = (int)buf_append(buf, sizeof(buf), (size_t)off,
             "VmSize: %s kB\n", vm_size);
     }
     if (mem_available[0] != '\0') {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        off = (int)buf_append(buf, sizeof(buf), (size_t)off,
             "MemAvailable: %s kB\n", mem_available);
     }
     if (map_lines >= 0) {
-        off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+        off = (int)buf_append(buf, sizeof(buf), (size_t)off,
             "Maps: %ld entries\n", map_lines);
     }
-    off += snprintf(buf + off, sizeof(buf) - (size_t)off,
+    off = (int)buf_append(buf, sizeof(buf), (size_t)off,
         "\n"
         "(Full backtrace + abort message: run `logcat -b crash -d` and "
         "find this PID/TID.)\n");
@@ -367,9 +430,25 @@ Java_com_rikkaminis_app_crash_NativeCrashHandler_nativeInstall(
     // mkdir is fine here — we're on the JVM thread, not in a signal.
     mkdir(g_log_dir, 0755);
 
+    // [fix/audit-1015 BUG-05] Register the alternate signal stack BEFORE
+    // installing the handlers. Per-thread: it covers the installing (JVM
+    // main) thread; threads created later have no alternate stack and, per
+    // POSIX, a SA_ONSTACK handler without a registered stack simply runs on
+    // the current stack — i.e. their behavior is unchanged from before this
+    // fix (documented residual; a full per-thread registry would need a
+    // pthread_create hook, out of scope here).
+    stack_t ss{};
+    ss.ss_sp = g_alt_stack;
+    ss.ss_size = sizeof(g_alt_stack);
+    ss.ss_flags = 0;
+    sigaltstack(&ss, nullptr);
+
     struct sigaction sa{};
     sa.sa_sigaction = crash_signal_handler;
-    sa.sa_flags = SA_SIGINFO;
+    // [fix/audit-1015 BUG-05] SA_ONSTACK: without it a stack-overflow
+    // SIGSEGV cannot run any handler (the thread's own stack is the thing
+    // that died), so the one-shot report is never written.
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
     sigemptyset(&sa.sa_mask);
 
     // Register for the signals that map to JNI/native bugs we actually

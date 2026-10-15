@@ -1,5 +1,6 @@
 package com.rikkaminis.app.sandbox.offload
 
+import com.rikkaminis.app.data.model.AgentContentPart
 import com.rikkaminis.app.data.model.LLMMessage
 import com.rikkaminis.app.data.model.LLMModel
 import com.rikkaminis.app.data.model.ProviderCredential
@@ -377,6 +378,137 @@ class ModelExecutionDispatcherTest {
         assertTrue(messages.getJSONObject(1).has("reasoning_content"))
         // null → key absent, so the worker can distinguish null from "".
         assertFalse(messages.getJSONObject(2).has("reasoning_content"))
+    }
+
+    // ═════════ [fix/audit-1015 PERF-04] double-payload guard ═════════
+    // The top-level `image_parts` array is only consumed by the providers'
+    // LEGACY branch (taken when the last user message's contentParts is
+    // empty — OpenAIProvider:2059/:2196, AnthropicProvider:815/:819,
+    // GeminiProvider:439). When the last user message carries contentParts,
+    // the providers read images out of contentParts and ignore the
+    // parameter, so the dispatcher must not emit the array: on the chat
+    // path the same image bytes were otherwise base64-encoded twice
+    // (contentParts "b64Data" + top-level "data"), doubling the request
+    // file, the IPC write, and the worker's decodes.
+
+    private fun imgDataPart() = LLMMessage.ImagePart(
+        data = byteArrayOf(1, 2, 3, 4),
+        mimeType = "image/png",
+        linuxPath = "/var/minis/workspace/x.png",
+    )
+
+    @Test
+    fun `image parts omitted when last user message carries contentParts`() {
+        // Chat path shape: the last user message's contentParts already hold
+        // the ImageData (with b64Data), and the composer ALSO filled
+        // imageParts with the same bytes. Expect: no `image_parts` key, and
+        // the contentParts payload still carries the image.
+        val json = JSONObject(ModelExecutionDispatcher.buildRequestJson(
+            instance = sampleInstance(),
+            model = sampleModel(),
+            messages = listOf(
+                LLMMessage(
+                    role = LLMMessage.Role.ASSISTANT,
+                    content = "here you go",
+                ),
+                LLMMessage(
+                    role = LLMMessage.Role.USER,
+                    content = "",
+                    contentParts = listOf(
+                        AgentContentPart.Text("describe this"),
+                        AgentContentPart.ImageData(
+                            data = byteArrayOf(1, 2, 3, 4),
+                            mimeType = "image/png",
+                            linuxPath = "/var/minis/workspace/x.png",
+                        ),
+                    ),
+                ),
+            ),
+            systemPrompt = null,
+            maxTokens = 4096,
+            temperature = null,
+            imageParts = listOf(imgDataPart()),
+            inputJson = "",
+            outputExt = null,
+        ))
+        assertFalse(json.has("image_parts"))
+        // The image still reaches the worker through contentParts.
+        val parts = json.getJSONArray("messages").getJSONObject(1)
+            .getJSONArray("contentParts")
+        assertEquals("AQIDBA==", parts.getJSONObject(1).getString("b64Data"))
+    }
+
+    @Test
+    fun `image parts emitted when last user message has no contentParts`() {
+        // minis-model-use path shape (ModelUseOffloadHandler:274): messages
+        // carry plain content, images travel only in the top-level array.
+        // Expect: `image_parts` present with the data (behavior unchanged).
+        val json = JSONObject(ModelExecutionDispatcher.buildRequestJson(
+            instance = sampleInstance(),
+            model = sampleModel(),
+            messages = listOf(
+                LLMMessage(role = LLMMessage.Role.USER, content = "what is this?"),
+            ),
+            systemPrompt = null,
+            maxTokens = 4096,
+            temperature = null,
+            imageParts = listOf(imgDataPart()),
+            inputJson = "",
+            outputExt = null,
+        ))
+        val parts = json.getJSONArray("image_parts")
+        assertEquals(1, parts.length())
+        assertEquals("AQIDBA==", parts.getJSONObject(0).getString("data"))
+    }
+
+    @Test
+    fun `image parts emitted when there is no user message at all`() {
+        // Boundary: no user-role message → `lastOrNull { user }` is null →
+        // the guard must NOT drop the array (the existing
+        // `image parts serialize data and mime type` test pins the same
+        // contract via `messages = emptyList()`; this variant keeps one
+        // assistant message so the lastOrNull branch is exercised).
+        val json = JSONObject(ModelExecutionDispatcher.buildRequestJson(
+            instance = sampleInstance(),
+            model = sampleModel(),
+            messages = listOf(
+                LLMMessage(role = LLMMessage.Role.ASSISTANT, content = "hi"),
+            ),
+            systemPrompt = null,
+            maxTokens = 4096,
+            temperature = null,
+            imageParts = listOf(imgDataPart()),
+            inputJson = "",
+            outputExt = null,
+        ))
+        assertTrue(json.has("image_parts"))
+        assertEquals("AQIDBA==", json.getJSONArray("image_parts").getJSONObject(0).getString("data"))
+    }
+
+    @Test
+    fun `image parts omitted when last user contentParts are text-only`() {
+        // Text-only contentParts still take the structured branch on the
+        // provider side, so the top-level array would be ignored anyway
+        // (pre-existing silent drop, now reflected by not paying for the
+        // serialization either). Expect: omitted.
+        val json = JSONObject(ModelExecutionDispatcher.buildRequestJson(
+            instance = sampleInstance(),
+            model = sampleModel(),
+            messages = listOf(
+                LLMMessage(
+                    role = LLMMessage.Role.USER,
+                    content = "",
+                    contentParts = listOf(AgentContentPart.Text("plain text turn")),
+                ),
+            ),
+            systemPrompt = null,
+            maxTokens = 4096,
+            temperature = null,
+            imageParts = listOf(imgDataPart()),
+            inputJson = "",
+            outputExt = null,
+        ))
+        assertFalse(json.has("image_parts"))
     }
 
     private fun JSONArray.toList(): List<String> =
