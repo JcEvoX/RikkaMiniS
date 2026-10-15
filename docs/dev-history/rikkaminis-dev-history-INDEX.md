@@ -1,6 +1,6 @@
 # rikkaminis-dev-history 按天索引
 
-快速跳转到每日开发日志。共 1770 条记录，74 天。
+快速跳转到每日开发日志。共 1780 条记录，75 天。
 
 ## 2026-08-03（11 条）
 
@@ -3668,7 +3668,7 @@
 - `23:19` **§97 收口：fix/skill-asset-hash-gate 合并 main 15a1f1336（用户令「没有问题就**
   - # §97 收口：fix/skill-asset-hash-gate 合并 main 15a1f1336（用户令「没有问题就合并」+「合并触发之后就不用等了」）
 
-## 2026-10-15（40 条）
+## 2026-10-15（44 条）
 
 - `00:11` **§97 内容哈希门控在真机未生效——根因定性：DB 行来源不是 bundled（原本就有，非本次改出）**
   - **验证对象**：设备包 `1.0.0+2095`（lastUpdate 23:21:46）= CI run **#2095** = `fix/skill-as…
@@ -3750,3 +3750,26 @@
   - **任务**：读 `shared/work/audit3-1015/fix-tasks/FIX-G.md` 立刻执行（audit3 F-12/F-13）。基线 …
 - `21:55` **FIX-C 交付收口：model-use 跨进程边界四块（F-03 P0 + F-04 + F-08 + F-10）—— 分支 CI #2135 绿，停在分支（2026-10-15）**
   - **任务**：读 `shared/work/audit3-1015/fix-tasks/FIX-C.md` 并立刻执行（基线 main `ca8b95d1`）。…
+- `22:32` **audit3 收口完成：七支合并 main `984cbdd801dc` + 并集树 CI #2142 绿 + 文档归档进 main（2026-10-15，用户令「他们的任务都完成了」→「跑完了」）**
+  - **结果**：七支（FIX-A..G）全部合并 → main **`984cbdd801dc`**；**并集树 CI run #2142（id 38749571…
+- `22:58` **VERIFY-1015 真机验证（设备包 1.0.0+2142，用户令「现在这个应用就是包含了所有修改的，开始验证吧」）**
+  - **身份链闭合**：设备 base.apk sha256 `96792f34…5348b`（14,349,225 B，装于 22:33:37）== CI run…
+- `23:10` **VERIFY-1015 U 类自动执行（用户令「也自动跑掉」，2026-10-15 23:0x）**
+  - **U3 摘要 ✅**：日志实锤 `[Compact] summary SUCCESS candidate=1/4 (active tierflow_pro) …
+- `23:33` **deep-audit-1015 第二道门核实 + 5 支派发（用户令「走流程吧」，附新审计报告 14 项）**
+  - **输入**：用户附件 `rikkaminis_deep_audit_report.md`（1388 行，BUG-01..09 + ARCH-01..03 + …
+
+## 2026-10-16（6 条）
+
+- `00:01` **FIX-A 收口：deep-audit ARCH-01（T3 副作用安全重试接线，P0）+ BUG-09（二次截断）（2026-10-15）**
+  - **任务**：读 `shared/work/deep-audit-1015/fix-tasks/FIX-A.md` 立刻执行（基线 main `e10fb2aa…
+- `00:09` **deep-audit FIX-E 收口：model-use 主进程 provider 与告警合并（`fix/da1015-modeluse-proc` @ `4a244d93`，CI #2144 绿，停在分支）**
+  - **任务**：读 `shared/work/deep-audit-1015/fix-tasks/FIX-E.md` 立刻执行（deep-audit BUG-03…
+- `00:31` **FIX-C（deep-audit-1015 BUG-02）收口：失败运行被当成「正常完成」→ 分支 CI #2146 绿，停在分支（2026-10-15）**
+  - **任务**：读 `shared/work/deep-audit-1015/fix-tasks/FIX-C.md` 执行。**基线** main `e10fb2…
+- `00:33` **FIX-D 交付收口：KaTeX 桥 arity（BUG-05 P1）+ 缓存回收（ARCH-03 子项）—— 分支 CI #2147 绿，停在分支（2026-10-15）**
+  - **任务**：读 `shared/work/deep-audit-1015/fix-tasks/FIX-D.md` 并立刻执行（基线 main `e10fb2a…
+- `00:47` **FIX-B 收口：deep-audit BUG-01a/01b + BUG-04（fix/da1015-agentloop-report @ b6dcd671d9，CI #2145 绿，停在分支）**
+  - **任务书** `shared/work/deep-audit-1015/fix-tasks/FIX-B.md`；**报告** `fix-reports/FIX…
+- `00:58` **deep-audit-1015 收口核查完成（用户令「他们都完成了」）—— 5 支全绿，停在分支未合并**
+  - **基线** main `e10fb2aa53fb`；**试合树** `scratch-merge` @ `9596d7a9`（5 支顺序 `--no-ff`，…
