@@ -1,6 +1,7 @@
 package com.rikkaminis.app.service
 
 import android.util.Log
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CancellableContinuation
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -75,6 +76,9 @@ object SessionConcurrencyManager {
      * 容量未满立即返回；已满则进入 FIFO 队列挂起，直到 [releaseSlot] / 其它释放提升。
      * 协程被取消时从队列原子移除并以 [kotlinx.coroutines.CancellationException] 结束，
      * 不会在取消后又被提升为 active。
+     * [verify-1015 BUG-04] 取消若落在"已被提升、协程尚未真正恢复"的窗口内（CE 在
+     * 挂起点抛出、调用方看不到返回值），已占用的槽位由 [releasePromotedAfterCancel]
+     * 归还，保证取消路径不泄漏槽位。
      *
      * [memory-pressure-gate] 准入前检查进程 RSS 水线（[MemoryPressureGate]）：
      * ELEVATED 短暂等待 500ms（让回收动作生效）；CRITICAL 触发全局回收并等待 2s；
@@ -144,6 +148,14 @@ object SessionConcurrencyManager {
                         }
                         resumeNow?.resume(Unit)
                     }
+                } catch (e: CancellationException) {
+                    // [verify-1015 BUG-04] 见 releasePromotedAfterCancel 的说明：
+                    // 取消落在"已被提升、协程尚未真正恢复"的窗口时，槽位已计入
+                    // active，而 cancelWaiter()/cleanupIfStillWaiting() 都因条目
+                    // 已删或状态 PROMOTED 提前 return —— 调用方又拿不到返回值
+                    // （CE 抛出），于是没人 release。这里补上。
+                    releasePromotedAfterCancel(runId, sessionId)
+                    throw e
                 } finally {
                     // 防御性收敛：正常/取消路径均已清理，此处只处理未预期的残留。
                     cleanupIfStillWaiting(runId)
@@ -154,6 +166,37 @@ object SessionConcurrencyManager {
                 error("duplicate runId $runId for session $sessionId")
             }
         }
+    }
+
+    /**
+     * [verify-1015 BUG-04] 取消落在"已提升、未恢复"窗口时，把那个已计入 active 的
+     * 槽位释放掉。
+     *
+     * promote() 在两种形态下都会把 runId 记进 active：continuation 已注册则先删
+     * pending 条目再 resume；尚未注册则保留 PROMOTED 条目等注册时立即恢复。若此刻
+     * 协程已被取消，resume 被丢弃、调用方直接以 CancellationException 离开
+     * acquireSlot —— 它不会进入持有 releaseSlot 的 try（业务侧 try 从 acquireSlot
+     * 返回之后才开始），而 cancelWaiter() / cleanupIfStillWaiting() 又都提前 return
+     * （前者 `pending[runId] ?: return`，后者 `p.state == PROMOTED -> return`）。
+     * 结果：槽位永久泄漏；cap=2 时两次泄漏即全局排队死锁（后续所有会话永远排不上）。
+     * 真机证据（2026-10-15）：该取消分支在生产日志中已出现
+     * （CANCELLED waiting for slot，运行时 5 次），路径可达无需猜测。
+     *
+     * 按 runId 身份移除（不用 releaseSlot 的 removeLastOrNull）：同一 session 可能另有
+     * 并发 run 已被提升，栈是 LIFO，而此处要精确释放"我这个"，否则会误放别人的槽位。
+     */
+    @Synchronized
+    private fun releasePromotedAfterCancel(runId: String, sessionId: String) {
+        val stack = activeRunIdsBySession[sessionId] ?: return
+        // 从未被提升（仍在排队）：排队清理路径已覆盖，不能重复释放。
+        if (!stack.remove(runId)) return
+        pending.remove(runId)
+        if (stack.isEmpty()) {
+            activeRunIdsBySession.remove(sessionId)
+            _runningSessions.value = _runningSessions.value - sessionId
+        }
+        val promoted = controller.release(runId)
+        if (promoted != null) promote(promoted)
     }
 
     /**

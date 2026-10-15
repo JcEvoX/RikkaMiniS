@@ -249,4 +249,35 @@ class TerminalSanitizerTest {
         val input = "col1\tcol2\tcol3"
         assertEquals(input, TerminalSanitizer.sanitize(input))
     }
+
+    // --- [verify-1015 BUG-02] content fidelity: no line-class is dropped ---
+
+    @Test
+    fun `sanitize keeps a bare null line`() {
+        // A shell command's real output may contain the literal text `null`
+        // (JSON bodies, Kotlin sources, `SELECT NULL` results). The old Pass 4
+        // deleted such lines outright, so the agent read text that differed
+        // from the file it asked for.
+        val input = "BEGIN\nnull\nEND\n"
+        assertEquals(input, TerminalSanitizer.sanitize(input))
+    }
+
+    @Test
+    fun `sanitize keeps null inside a longer line and in runs`() {
+        // The old run-collapse `(?:null){2,}` edited text anywhere, not just at
+        // line granularity — `nullnull` inside prose or a JSON string was
+        // silently excised.
+        val run = "value=nullnull; trailing\n"
+        assertEquals(run, TerminalSanitizer.sanitize(run))
+        val prefixed = "file:null\n"
+        assertEquals(prefixed, TerminalSanitizer.sanitize(prefixed))
+    }
+
+    @Test
+    fun `sanitize keeps a null line while still collapsing blank runs`() {
+        // Pass 5 must still work: dropping Pass 4 must not disable blank-line
+        // collapsing (they are independent passes).
+        val input = "a\n\n\n\nnull\n\n\n\nb\n"
+        assertEquals("a\n\nnull\n\nb\n", TerminalSanitizer.sanitize(input))
+    }
 }

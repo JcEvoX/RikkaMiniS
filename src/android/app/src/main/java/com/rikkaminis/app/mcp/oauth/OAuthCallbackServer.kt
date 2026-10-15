@@ -14,6 +14,16 @@ class OAuthCallbackServer(
 ) {
     companion object {
         private const val TAG = "OAuthCallbackServer"
+
+        // [verify-1015 BUG-12a] Per-connection read budget. The accept loop is
+        // single-threaded and readLine() blocks with NO timeout, so one socket
+        // that connects and sends nothing (a browser preconnect / speculative
+        // connection, which Chrome opens for the authorization page before any
+        // redirect) parked the listener; the real callback then queued behind
+        // it and OAuth died on its 5-minute timeout. 5 s is ~1000x a real
+        // request (a single TCP segment, milliseconds) yet short enough that a
+        // stalled socket is dropped long before the user gives up.
+        private const val IDLE_CONNECT_TIMEOUT_MS = 5_000
     }
 
     private var serverSocket: ServerSocket? = null
@@ -67,6 +77,13 @@ class OAuthCallbackServer(
                 while (running) {
                     val socket = serverSocket?.accept() ?: break
                     try {
+                        // [verify-1015 BUG-12a] Bound the per-connection read
+                        // (see IDLE_CONNECT_TIMEOUT_MS): a connection that
+                        // sends nothing must not park the single-threaded
+                        // listener ahead of the real callback. On timeout
+                        // readLine() throws SocketTimeoutException, which the
+                        // catch below already logs and closes.
+                        socket.soTimeout = IDLE_CONNECT_TIMEOUT_MS
                         val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
                         val requestLine = reader.readLine() ?: continue
                         Log.d(TAG, "Request: $requestLine")

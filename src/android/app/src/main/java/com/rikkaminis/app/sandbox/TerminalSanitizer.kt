@@ -40,21 +40,34 @@ object TerminalSanitizer {
         // Pass 3: Remove null bytes and non-printable control chars (except \n \t)
         val cleaned = stripped.filter { it == '\n' || it == '\t' || it.code >= 0x20 }
 
-        // Pass 4: Remove "null" artifacts from PRoot/pipe issues
-        // - Lines that are entirely "null"
-        // - Runs of repeated "null" (e.g., "nullnullnull" → "")
-        // - Lines that are just "null" appended to a prefix (e.g., "file:nullnullnull")
-        val noNullLines = cleaned.lines()
-            .filter { it.trim() != "null" }
-            .joinToString("\n")
-            .replace(Regex("(?:null){2,}"), "") // Remove runs of 2+ consecutive "null"
+        // Pass 4 (REMOVED 2026-10-15, [verify-1015 BUG-02]): a filter that
+        // deleted every line whose trimmed text was "null", plus a
+        // `(?:null){2,}` run-collapse applied to the whole text. It claimed to
+        // remove "PRoot/pipe artifacts", but that artifact was never
+        // reproduced or recorded anywhere, while the collateral damage was
+        // real and reproducible:
+        //   * a legitimate `null` line vanished from tool output — probe
+        //     `printf 'BEGIN\nnull\nEND\n'` returned BEGIN/END while the
+        //     sandbox-side text still contained the line (2026-10-15). Same
+        //     mechanism as the "shell_execute swallows bare null lines" quirk
+        //     first hit on 2026-09-30, where the loss was misattributed to the
+        //     output pipe;
+        //   * the run-collapse edited text ANYWHERE, not just whole lines: it
+        //     had already eaten its own documentation example — the line that
+        //     spelled the pattern out now reads `(e.g., "" → "")`, i.e. the
+        //     literal was silently excised from this very file.
+        // Content fidelity wins over suppressing an unverified artifact: pass
+        // the shell's text through unchanged and let the caller see exactly
+        // what was written. If a real "null" artifact is ever observed, record
+        // the command that produced it first, then narrow the filter to that
+        // shape instead of dropping a whole text class.
 
         // Pass 5: Collapse excessive blank lines (3+ consecutive → 2).
         // Deliberately no .trim() here: leading whitespace (progress-bar
         // prefixes like " 100%[...]") and trailing whitespace (padding that
         // erases a previously longer overwritten line) are semantically
         // meaningful, and sanitize must preserve them.
-        return noNullLines.replace(Regex("\n{3,}"), "\n\n")
+        return cleaned.replace(Regex("\n{3,}"), "\n\n")
     }
 
     /**
