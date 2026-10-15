@@ -6,7 +6,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Regression tests for sweep-1014 FIX-3 (B5a / B5b).
+ * Regression tests for sweep-1014 FIX-3 (B5a / B5b) and audit3 FIX-E (F-07).
  *
  * B5b: [PRootKernel.isLinuxPathUnderReadOnlyMount] used to match the mount
  * prefix on the RAW string, so `/var/minis/./mounts/...` slipped past the
@@ -21,7 +21,15 @@ import org.junit.Test
  * semantics are unchanged. The live-run half of the evidence (wrapper
  * execution in a real shell against a simulated read-only mount) cannot
  * live here — it needs a shell — and is covered by the sandbox harness
- * (`shared/work/sweep1014-fix/f3/jvm/liverun.sh`).
+ * (`shared/work/audit3-fix/e/probe/run.sh`).
+ *
+ * F-07 (audit3): the wrapper only matched the RAW argument, so relative
+ * targets (`cd <mount> && rm secret.md`), `..`/`//` spellings and `cp -t`
+ * destinations slipped past, and the guard's own control files (the prefix
+ * list + every wrapper) were writable by the very commands they gate —
+ * deleting one turned the guard into a silent no-op. The generated script
+ * now canonicalizes every selected target, protects its own control files
+ * first and refuses unresolvable targets; these tests pin those shapes.
  */
 class MountGuardScriptTest {
 
@@ -78,8 +86,8 @@ class MountGuardScriptTest {
     // ── B5a: wrapper scripts select write targets per command ───────────────
 
     @Test
-    fun `cp mv ln check only the LAST positional argument`() {
-        assertEquals(setOf("cp", "mv", "ln"), PRootKernel.MOUNT_GUARD_LAST_ARG_CMDS)
+    fun `cp and ln check only the LAST positional argument`() {
+        assertEquals(setOf("cp", "ln"), PRootKernel.MOUNT_GUARD_LAST_ARG_CMDS)
         val cp = PRootKernel.mountGuardScript("cp")
         // the selection block collects the last non-flag argument
         assertTrue(cp.contains("dest=\"\""))
@@ -88,6 +96,82 @@ class MountGuardScriptTest {
         assertTrue(cp.contains(PRootKernel.GUARD_MARKER))
         assertTrue(cp.contains("/var/minis/.mount-readonly-prefixes"))
         assertTrue(cp.endsWith("exec /bin/busybox cp \"\$@\"\n"))
+    }
+
+    // ── F-07: canonicalization, self-protection, -t targets ────────────────
+
+    @Test
+    fun `wrapper set and control paths are pinned`() {
+        assertEquals(
+            listOf("touch", "tee", "cp", "mv", "mkdir", "rm", "rmdir", "ln", "dd"),
+            PRootKernel.MOUNT_GUARD_CMDS
+        )
+        assertEquals("/var/minis/.mount-readonly-prefixes", PRootKernel.MOUNT_GUARD_CFG_LINUX_PATH)
+        assertEquals("/usr/local/bin", PRootKernel.MOUNT_GUARD_BIN_LINUX_PREFIX)
+    }
+
+    @Test
+    fun `mv checks every positional argument`() {
+        // `mv <read-only>/f /tmp/` DESTROYS f in the mount, so a source is a
+        // write target for mv — the "earlier args are sources" model is
+        // cp/ln-only.
+        assertTrue(!PRootKernel.MOUNT_GUARD_LAST_ARG_CMDS.contains("mv"))
+        val mv = PRootKernel.mountGuardScript("mv")
+        assertTrue(mv.contains("check_prefix \"\$arg\" || exit 1"))
+        assertTrue(!mv.contains("tdir=1"))
+        assertTrue(!mv.contains("dest=\"\""))
+    }
+
+    @Test
+    fun `every selected target is canonicalized before matching`() {
+        for (name in PRootKernel.MOUNT_GUARD_CMDS) {
+            val s = PRootKernel.mountGuardScript(name)
+            assertTrue(s.contains("canon_target() {"))
+            assertTrue(s.contains("canon_target \"\$1\" || {"))
+            assertTrue(s.contains("resolved=\"\$canon_out\""))
+            // relative targets resolve against the caller's cwd
+            assertTrue(s.contains("p=\"\$cw/\$p\""))
+            assertTrue(s.contains("cannot resolve the write target"))
+        }
+    }
+
+    @Test
+    fun `the guard protects its own control files`() {
+        for (name in PRootKernel.MOUNT_GUARD_CMDS) {
+            val s = PRootKernel.mountGuardScript(name)
+            // the prefix list and every wrapper are unwritable for all nine
+            assertTrue(s.contains("if [ \"\$resolved\" = \"\$cfg\" ]; then"))
+            for (cmd in PRootKernel.MOUNT_GUARD_CMDS) {
+                assertTrue(s.contains("\"/usr/local/bin/$cmd\""))
+            }
+            // allow-all when the list is gone, but only AFTER self-protection
+            assertTrue(s.contains("if [ ! -f \"\$cfg\" ]; then"))
+            assertTrue(!s.contains("if [ -f \"\$cfg\" ]; then"))
+        }
+    }
+
+    @Test
+    fun `self-protection is ordered before the prefix list`() {
+        val s = PRootKernel.mountGuardScript("rm")
+        val self = s.indexOf("read-only mount list — writes are disabled")
+        val list = s.indexOf("while IFS= read -r prefix")
+        assertTrue(self > 0)
+        assertTrue(list > self)
+    }
+
+    @Test
+    fun `cp and ln treat -t as the write target`() {
+        for (name in listOf("cp", "ln")) {
+            val s = PRootKernel.mountGuardScript(name)
+            assertTrue(s.contains("-t) tdir=1; take=1;;"))
+            assertTrue(s.contains("-t?*) tdir=1; tdest=\"\${arg#-t}\";;"))
+            assertTrue(s.contains("-[!-]*t) tdir=1; take=1;;"))
+            assertTrue(s.contains("-[!-]*t?*) tdir=1; tdest=\"\${arg##*[t]}\";;"))
+            assertTrue(s.contains("--target-directory) tdir=1; take=1;;"))
+            assertTrue(s.contains("--target-directory=*) tdir=1; tdest=\"\${arg#*=}\";;"))
+            assertTrue(s.contains("check_prefix \"\$tdest\" || exit 1"))
+            assertTrue(s.contains("elif [ -n \"\$dest\" ]; then"))
+        }
     }
 
     @Test
