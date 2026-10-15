@@ -51,6 +51,20 @@ DAEMON_EXIT_GRACE = 60     # after the pool is empty, wait this long before exit
 RPC_TIMEOUT = 300.0        # per-RPC reply timeout (matches transport modules)
 CONN_TIMEOUT = 310.0       # socket recv timeout (slightly above RPC_TIMEOUT)
 STDERR_RING_LINES = 40     # child stderr lines kept for crash context
+# [audit2-A5] Hard cap on one newline-delimited IPC request. 127.0.0.1 is a
+# device-global namespace on Android, so ANY local process can connect and
+# stream bytes that never contain a newline: without a cap that is a trivial
+# memory-exhaustion primitive (CONN_TIMEOUT bounds idle time, not size, and the
+# auth token is only checked once the whole body has been buffered). 8 MiB
+# matches the app-side DebugServer.MAX_BODY_BYTES so the two loopback servers
+# agree. Oversized requests get BODY_TOO_LARGE and the connection is closed.
+MAX_REQUEST_BYTES = 8 * 1024 * 1024
+# After refusing an oversized request we half-close and discard what the client
+# is still sending for at most this long. Closing a socket that still has
+# unread data queued emits a TCP RST, which would destroy the BODY_TOO_LARGE
+# reply on the way out; the budget also bounds how long one hostile connection
+# can hold a handler thread.
+OVERSIZE_DRAIN_SECONDS = 2.0
 
 log = logging.getLogger("mcp-daemon")
 
@@ -413,6 +427,12 @@ class MCPPool:
         # [verify-1015 BUG-07] name -> fingerprint of the config the cached
         # session was built from, so config edits evict a live session.
         self._cfg_fp = {}
+        # [audit2-A5] name -> lock serializing session *creation* for that
+        # server. Building a session is the slow part (spawn + dependency
+        # install + handshake, tens of seconds for a cold `uvx`), so it must
+        # never run under the pool-wide lock — see get(). Bounded by the number
+        # of distinct server names this daemon has been asked about.
+        self._name_locks = {}
 
     def _make_session(self, name, cfg):
         if config.is_stdio(cfg):
@@ -421,38 +441,77 @@ class MCPPool:
             return session
         return MCPHTTPSession(name, cfg)
 
+    def _name_lock(self, name):
+        """[audit2-A5] The per-server lock that serializes session creation.
+
+        Only the dict bookkeeping happens under the pool lock; the caller must
+        never hold the pool lock while waiting on the returned lock, because
+        that wait is exactly what used to block unrelated servers.
+        """
+        with self._lock:
+            lock = self._name_locks.get(name)
+            if lock is None:
+                lock = threading.Lock()
+                self._name_locks[name] = lock
+            return lock
+
+    def _resolve_locked(self, name):
+        """[audit2-A5] Resolve + validate the cached session for `name`.
+
+        MUST be called with the pool lock held. Returns (session, cfg, fp) where
+        session is None when the caller has to build one (that part is done
+        outside the pool lock). Never builds anything itself.
+        """
+        # [verify-1015 BUG-07] Re-validate the config on EVERY get, not only
+        # when creating a session. The pool cached a live session by name
+        # for its whole 10-minute idle TTL, so disabling or deleting a
+        # server, or editing its url/command/args, left the OLD session
+        # answering: a disabled server stayed callable. Fingerprinting the
+        # resolved config evicts on every kind of edit (one mechanism, not
+        # just the `enabled` flag). Costs one config file read per call,
+        # negligible next to the tool call itself.
+        cfg = config.get_server(name)
+        if cfg is None:
+            self._evict_locked(name)
+            raise MCPError("NOT_FOUND", "server '%s' not found" % name)
+        if not cfg.get("enabled", True):
+            self._evict_locked(name)
+            raise MCPError("DISABLED", "server '%s' is disabled" % name)
+        fp = json.dumps(cfg, sort_keys=True, default=str)
+        session = self._pool.get(name)
+        if session is not None and self._cfg_fp.get(name) != fp:
+            log.info("[%s] config changed, evicting cached session", name)
+            self._evict_locked(name)
+            session = None
+        if session is not None and not session.is_alive():
+            log.warning("[%s] process died, evicting", name)
+            session.stop()
+            del self._pool[name]
+            self._cfg_fp.pop(name, None)
+            session = None
+        return session, cfg, fp
+
     def get(self, name):
         with self._lock:
-            # [verify-1015 BUG-07] Re-validate the config on EVERY get, not only
-            # when creating a session. The pool cached a live session by name
-            # for its whole 10-minute idle TTL, so disabling or deleting a
-            # server, or editing its url/command/args, left the OLD session
-            # answering: a disabled server stayed callable. Fingerprinting the
-            # resolved config evicts on every kind of edit (one mechanism, not
-            # just the `enabled` flag). Costs one config file read per call,
-            # negligible next to the tool call itself.
-            cfg = config.get_server(name)
-            if cfg is None:
-                self._evict_locked(name)
-                raise MCPError("NOT_FOUND", "server '%s' not found" % name)
-            if not cfg.get("enabled", True):
-                self._evict_locked(name)
-                raise MCPError("DISABLED", "server '%s' is disabled" % name)
-            fp = json.dumps(cfg, sort_keys=True, default=str)
-            session = self._pool.get(name)
-            if session is not None and self._cfg_fp.get(name) != fp:
-                log.info("[%s] config changed, evicting cached session", name)
-                self._evict_locked(name)
-                session = None
-            if session is not None and not session.is_alive():
-                log.warning("[%s] process died, evicting", name)
-                session.stop()
-                del self._pool[name]
-                self._cfg_fp.pop(name, None)
-                session = None
-            if session is None:
-                log.info("[%s] creating new session", name)
-                session = self._make_session(name, cfg)
+            session, cfg, fp = self._resolve_locked(name)
+        if session is not None:
+            return session
+        # [audit2-A5] Creation runs OUTSIDE the pool lock. It used to run
+        # inside it, so one server's cold start (spawn + dependency install +
+        # handshake — 30s+ for a cold `uvx`) serialized every OTHER server's
+        # calls behind it. The pool lock now only guards dict state; a
+        # per-name lock keeps two callers racing on the same cold server from
+        # building two child processes. The double-check re-runs the full
+        # BUG-07 validation inside the per-name lock, so "every get re-checks
+        # the config fingerprint" still holds on the creation path too.
+        with self._name_lock(name):
+            with self._lock:
+                session, cfg, fp = self._resolve_locked(name)
+            if session is not None:
+                return session
+            log.info("[%s] creating new session", name)
+            session = self._make_session(name, cfg)
+            with self._lock:
                 self._pool[name] = session
                 self._cfg_fp[name] = fp
             return session
@@ -611,11 +670,42 @@ class DaemonServer:
         try:
             conn.settimeout(CONN_TIMEOUT)
             buf = b""
+            # [audit2-A5] Bounded read: the cap is evaluated as bytes accumulate,
+            # so one connection can buffer at most MAX_REQUEST_BYTES + one recv
+            # chunk. An over-cap client is answered and dropped without ever
+            # reaching json.loads (and therefore without the O(n^2) growth of an
+            # unbounded `buf += chunk` loop).
+            too_large = False
             while b"\n" not in buf:
                 chunk = conn.recv(65536)
                 if not chunk:
                     break
                 buf += chunk
+                if len(buf) > MAX_REQUEST_BYTES:
+                    too_large = True
+                    break
+            if too_large:
+                log.warning("request exceeds %d bytes, closing connection", MAX_REQUEST_BYTES)
+                try:
+                    conn.sendall((json.dumps({
+                        "ok": False,
+                        "error": "request exceeds %d bytes" % MAX_REQUEST_BYTES,
+                        "code": "BODY_TOO_LARGE",
+                    }) + "\n").encode())
+                    # Give the client a chance to READ that reply: half-close
+                    # (so it sees EOF for its own write side) and discard the
+                    # bytes it is still streaming, for a bounded budget. A
+                    # plain close() with unread data queued becomes a TCP RST
+                    # and the BODY_TOO_LARGE line never arrives.
+                    conn.shutdown(socket.SHUT_WR)
+                    conn.settimeout(OVERSIZE_DRAIN_SECONDS)
+                    deadline = time.time() + OVERSIZE_DRAIN_SECONDS
+                    while time.time() < deadline:
+                        if not conn.recv(65536):
+                            break
+                except OSError:
+                    pass
+                return
             if not buf.strip():
                 return
             try:
