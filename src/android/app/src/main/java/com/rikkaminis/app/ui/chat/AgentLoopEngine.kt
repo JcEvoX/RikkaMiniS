@@ -628,7 +628,15 @@ internal class AgentLoopEngine(
             // 未知（0），本 turn 的输出预算按"无输入信息"分配；下一 turn 的
             // usage 回包会以新端点口径重建读数。必须在 dynamicMaxTokens 之前
             // 做 —— 清零晚了等于没清。
-            val currentCtxKey = contextKeyOf(provider)
+            // [audit2 BUG-02] Compare against the provider this turn will
+            // ACTUALLY call (`loopState.currentProvider`), not the `provider`
+            // formal parameter: the parameter is never re-assigned, so after
+            // any fallback it names the member we already left. The writer
+            // further down (`lastContextTokensSourceKey = contextKeyOf(
+            // loopState.currentProvider)`) already uses the live one — using
+            // the parameter here made every post-fallback turn compare two
+            // different providers and wipe the reading.
+            val currentCtxKey = contextKeyOf(loopState.currentProvider)
             if (loopState.lastContextTokensSourceKey != null &&
                 loopState.lastContextTokensSourceKey != currentCtxKey
             ) {
@@ -647,7 +655,9 @@ internal class AgentLoopEngine(
             // "裁剪后按最小输出重试"的承诺在本 turn 落空）。SHRINK_OUTPUT /
             // PASS 不进管线，值与 val 时代逐字一致。
             var preflightMessages = host.applyRequestImageBudget(host.effectiveAgentHistory())
-            val preflightMaxTokens = host.dynamicMaxTokens(provider, loopState.lastContextTokens)
+            // [audit2 BUG-02] Window / output budget follow the provider that
+            // will actually serve this turn, same reason as `currentCtxKey`.
+            val preflightMaxTokens = host.dynamicMaxTokens(loopState.currentProvider, loopState.lastContextTokens)
             // rawEstimate：provider 无关的本地原始口径 —— 校准观察（流结束/
             // 400-teacher）只用它，否则校准学到"系数化的自己"，闭环坍缩到 1.0。
             // [fix/prewindow-budget-1015] var：NEEDS_COMPACTION 分支重捕消息后
@@ -659,7 +669,11 @@ internal class AgentLoopEngine(
                 systemPrompt = systemPrompt,
                 tools = host.agentTools,
             )
-            var preflightEstimate = rawEstimate * calibrationRatioFor(provider) / 100
+            // [audit2 BUG-02] Calibration is per (providerType, baseUrl, model)
+            // — charging this turn the OLD member's coefficient after a
+            // fallback both mis-estimates the window and re-observes samples
+            // under the wrong key.
+            var preflightEstimate = rawEstimate * calibrationRatioFor(loopState.currentProvider) / 100
             val preflightVerdict = preflightContextBudget(
                 window = host.effectiveContextWindowTokens() ?: 0,
                 estimatedInput = preflightEstimate,
@@ -670,7 +684,7 @@ internal class AgentLoopEngine(
                 TAG_STREAM,
                 "[Preflight] turn=$turn ${preflightVerdict.toLogLine()} " +
                     "window=${host.effectiveContextWindowTokens() ?: 0} " +
-                    "providerEst=${loopState.lastContextTokens} calib=${calibrationRatioFor(provider)}",
+                    "providerEst=${loopState.lastContextTokens} calib=${calibrationRatioFor(loopState.currentProvider)}",
             )
             val maxTokens = when (preflightVerdict.decision) {
                 PreflightVerdict.Decision.SHRINK_OUTPUT -> preflightVerdict.suggestedMaxTokens ?: preflightMaxTokens
@@ -716,7 +730,7 @@ internal class AgentLoopEngine(
                         systemPrompt = systemPrompt,
                         tools = host.agentTools,
                     )
-                    preflightEstimate = rawEstimate * calibrationRatioFor(provider) / 100
+                    preflightEstimate = rawEstimate * calibrationRatioFor(loopState.currentProvider) / 100
                     MIN_MAX_TOKENS_CONST
                 }
                 PreflightVerdict.Decision.PASS -> preflightMaxTokens
@@ -1607,6 +1621,16 @@ internal class AgentLoopEngine(
                             willRetry = true,
                         )
                         loopState.currentProvider = next.provider
+                        // [audit2 BUG-03] Give the fallback member its own full
+                        // transient-retry allowance. `retryAttempt` is
+                        // per-turn and survives the member switch, so without
+                        // this the new member inherits a budget the failed
+                        // member already burned and a single transient blip on
+                        // it skipped straight to the next fallback. The
+                        // content-filter fallback path below already did this;
+                        // this path is the one that was missing it (only two
+                        // fallback switch points exist — see the report).
+                        retryAttempt = 0
                         // Also update class-level provider so the next sendMessage() starts from here
                         host.setCurrentProvider(next.provider)
                         // Update top bar model info + active entry. (For a same-
@@ -2108,16 +2132,15 @@ internal class AgentLoopEngine(
 
             // Map toolUseId -> input JSON string for persistence (accumulated across turns)
             toolCalls.forEach { (id, _, args) -> loopState.allToolInputs[id] = args.toString() }
-            // [feat/hermes-tier1] A tool-call turn clears the length-wall
-            // continuation budget AND the deterministic-empty streak: the
-            // model recovered and is doing new work, so future walls get a
-            // fresh allowance (mirrors Hermes resetting per-wall retry state).
-            loopState.lengthWallContinues = 0
-            loopState.deterministicEmptyStreak = 0
-            // [fix/eof-stub-continuation] A tool-call turn is proof the model
-            // produced new work after any EOF — reset the stub-continuation
-            // budget so long tool-heavy runs keep full allowance.
-            loopState.eofStubContinues = 0
+            // [audit2 BUG-01] The three continuation-counter resets that used
+            // to live HERE were moved down into the tool-call path (see the
+            // `if (toolCalls.isNotEmpty())` guard after the empty-turn branch).
+            // Sitting at this spot they ran unconditionally on every turn —
+            // including the length-wall / EOF-stub turns they were supposed to
+            // leave alone — so every counter was pinned back to 0 before it
+            // could reach its limit and all three guards were dead.
+            // Guarded so this exact regression cannot come back:
+            // scripts/scan/loop_counter_reset_guard.py.
             val toolInputMap = loopState.allToolInputs
             // Prefer the opaque blob from LLMStreamChunk.ReasoningContent when the
             // provider emitted one — that path preserves empty strings (DeepSeek V4
@@ -2751,6 +2774,34 @@ internal class AgentLoopEngine(
                 traceObserver.t7Reduce(AgentRunEvent.WorkCompleted)
                 break
             }
+            // [audit2 BUG-01] Only a turn that ACTUALLY produced tool calls may
+            // clear the continuation budgets — that is what the comments below
+            // always claimed ("a tool-call turn …"), and what this guard now
+            // enforces mechanically. Before the move, the three resets ran
+            // unconditionally ~640 lines above (before the empty-turn branch),
+            // so `lengthWallContinues` / `deterministicEmptyStreak` /
+            // `eofStubContinues` never got past 1 and the length-wall,
+            // deterministic-empty and EOF-stub guards were all dead; only
+            // `maxTurns` (default 256) still bounded the loop.
+            // The condition is written out rather than assumed: most paths
+            // through the empty-turn branch above leave the loop early
+            // (`continue`, e.g. the EOF one-shot retry at the tail) but not all
+            // of them — the normal-completion tail ends in `break` — so the
+            // reset must be guarded explicitly. The guard is what
+            // scripts/scan/loop_counter_reset_guard.py machine-checks; do not
+            // "simplify" it away on the strength of a comment.
+            if (toolCalls.isNotEmpty()) {
+                // [feat/hermes-tier1] A tool-call turn clears the length-wall
+                // continuation budget AND the deterministic-empty streak: the
+                // model recovered and is doing new work, so future walls get a
+                // fresh allowance (mirrors Hermes resetting per-wall retry state).
+                loopState.lengthWallContinues = 0
+                loopState.deterministicEmptyStreak = 0
+                // [fix/eof-stub-continuation] A tool-call turn is proof the model
+                // produced new work after any EOF — reset the stub-continuation
+                // budget so long tool-heavy runs keep full allowance.
+                loopState.eofStubContinues = 0
+            }
             AppLogger.info(TAG_STREAM, "runAgentLoop turn=$turn dispatching ${toolCalls.size} tool call(s), continuing")
             // [fix/tool-call-copy-suppress] The turn DID dispatch: whatever
             // markup its text carried was a copy of a call that went through,
@@ -3109,19 +3160,30 @@ internal class AgentLoopEngine(
                 // All pending tools are parallel-safe pure reads. Launch them
                 // concurrently, then pull each result in the original order so
                 // Pass 3 observes the same sequence as the old sequential loop.
+                // [audit2 DESIGN-03] Each call gets its OWN block-list copy —
+                // the shared `loopState.allToolBlocks` is never handed to a
+                // coroutine on the IO pool. Edits (none today: the whitelist is
+                // read-only) are merged back once, in `pending` order, on this
+                // thread after the batch. See ParallelToolBatchBlocks.
+                val sharedBlocks = loopState.allToolBlocks
+                val baseline = ParallelToolBatchBlocks.snapshot(sharedBlocks)
                 val deferred = coroutineScope {
                     pending.map { p ->
-                        p.id to async {
+                        val callBlocks = ParallelToolBatchBlocks.forkForCall(baseline)
+                        Triple(p.id, callBlocks, async {
                             val execStart = System.currentTimeMillis()
-                            val r = host.executeTool(p.name, p.argsStr, p.id, loopState.allToolBlocks, loopState.assistantId, loopState.accumulatedText)
+                            val r = host.executeTool(p.name, p.argsStr, p.id, callBlocks, loopState.assistantId, loopState.accumulatedText)
                             execMsById[p.id] = System.currentTimeMillis() - execStart
                             r
-                        }
+                        })
                     }
                 }
-                for ((pid, d) in deferred) {
+                val workedLists = ArrayList<List<AssistantBlock>>(deferred.size)
+                for ((pid, callBlocks, d) in deferred) {
                     resultsById[pid] = d.await()
+                    workedLists.add(callBlocks)
                 }
+                ParallelToolBatchBlocks.mergeBack(sharedBlocks, baseline, workedLists)
             } else {
                 // Any non-parallel tool (or a single call) → sequential, exactly
                 // like the original loop. Each queued call gets a non-blocking

@@ -1548,6 +1548,78 @@ def test_liveness_static():
     # Real-repo coverage comes from the test_real_repo() scanner list.
 
 
+def loop_reset_fixture(shape):
+    """Minimal repo tree for loop_counter_reset_guard.
+
+    Ground truth = the 2026-10-15 audit2 BUG-01 shape: a numeric counter reset
+    whose comment block claims tool-call semantics, placed at the brace depth
+    of the `if (toolCalls.isEmpty())` header instead of inside a tool-call
+    branch.
+    """
+    rel = KOTLIN_PKG + "/ui/chat/Loop.kt"
+    head = (
+        "package com.rikkaminis.app.ui.chat\n"
+        "class LoopState { var lengthWallContinues = 0 }\n"
+        "class Loop {\n"
+        "    fun turn(loopState: LoopState, toolCalls: List<String>) {\n"
+    )
+    guard = (
+        "        if (toolCalls.isEmpty()) {\n"
+        "            break\n"
+        "        }\n"
+    )
+    claim = (
+        "        // [feat/hermes-tier1] A tool-call turn clears the length-wall\n"
+        "        // continuation budget: the model recovered and is doing new work.\n"
+    )
+    reset = "        loopState.lengthWallContinues = 0\n"
+    if shape == "good":
+        body = (
+            guard
+            + "        if (toolCalls.isNotEmpty()) {\n"
+            + claim + reset
+            + "        }\n"
+        )
+    elif shape == "bad":
+        # The regression: same depth as the isEmpty() header, guarded by nothing.
+        body = guard + claim + reset
+    elif shape == "no_claim":
+        # A reset with no tool-call claim is out of this guard's remit.
+        body = guard + "        loopState.lengthWallContinues = 0\n"
+    else:
+        raise AssertionError(shape)
+    text = head + body + "    }\n}\n"
+    line_no = text[: text.index(reset)].count("\n") + 1
+    return {rel: text}, line_no
+
+
+def test_loop_counter_reset():
+    print("━━━ loop_counter_reset_guard ━━━")
+    files, line_no = loop_reset_fixture("good")
+    root = make_tree(files)
+    code, out = run_scanner("loop_counter_reset_guard.py", root)
+    check("reset inside a toolCalls.isNotEmpty() guard passes (exit 0)",
+          code == 0, f"exit={code}\n{out}")
+    shutil.rmtree(root)
+
+    files, line_no = loop_reset_fixture("bad")
+    root = make_tree(files)
+    code, out = run_scanner("loop_counter_reset_guard.py", root)
+    check("reset at the isEmpty() header depth is caught (exit 1)", code == 1,
+          f"exit={code}\n{out}")
+    check(f"finding names the exact file:line ({line_no})",
+          f"Loop.kt:{line_no}" in out, out)
+    check("finding explains the shared depth", "same depth as" in out, out)
+    shutil.rmtree(root)
+
+    files, _ = loop_reset_fixture("no_claim")
+    root = make_tree(files)
+    code, out = run_scanner("loop_counter_reset_guard.py", root)
+    check("reset without a tool-call claim is out of remit (exit 0)",
+          code == 0, f"exit={code}\n{out}")
+    shutil.rmtree(root)
+
+
 def test_real_repo():
     print("━━━ real repo tree (must be clean) ━━━")
     for script in (
@@ -1565,6 +1637,7 @@ def test_real_repo():
         "thinking_wiring_guard.py",
         "liveness_static_guard.py",
         "claim_release_guard.py",
+        "loop_counter_reset_guard.py",
     ):
         code, out = run_scanner(script, REPO_ROOT)
         check(f"{script} on real repo exits 0", code == 0, f"exit={code}\n{out[:2000]}")
@@ -1773,6 +1846,7 @@ def main():
     test_thinking_wiring()
     test_liveness_static()
     test_claim_release()
+    test_loop_counter_reset()
     test_real_repo()
     print("")
     print(f"{'❌ FAILURES: ' + str(FAIL) if FAIL else '✅ ALL ' + str(PASS) + ' CASES PASS'}")
