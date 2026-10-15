@@ -1774,25 +1774,15 @@ class ModelExecutionService : Service() {
 
     // ── passthrough parsing (mirrors ModelUseOffloadHandler) ──
 
-    private fun parseChatExtraBody(inputJson: String, warnings: MutableList<String>): Map<String, Any> {
-        val obj = try { val t = inputJson.trim(); if (t.startsWith("{")) JSONObject(t) else null }
-        catch (_: Exception) { null } ?: return emptyMap()
-        val eb = obj.optJSONObject("extra_body") ?: return emptyMap()
-        val result = linkedMapOf<String, Any>()
-        for (key in eb.keys()) {
-            when (val v = eb.get(key)) {
-                is Int, is Long, is Double, is Boolean, is String -> result[key] = v
-                is JSONArray -> {
-                    val list = (0 until v.length()).mapNotNull { e ->
-                        e.let { if (it is Int || it is Long || it is Double || it is Boolean || it is String) it else null }
-                    }
-                    if (list.isNotEmpty()) result[key] = list
-                }
-                else -> warnings.add("extra_body.$key: unsupported type, dropped")
-            }
-        }
-        return result
-    }
+    /**
+     * [fix/audit3-1015 F-04] Delegates to the single shared dialect in
+     * [ModelUseProtocol]. This copy used to rebuild arrays from the loop
+     * *index* (`[0, 1, … N-1]`) and warn-and-drop nested objects, so the same
+     * `extra_body` produced one body from `:app` and a different one from
+     * `:modelservice`. One implementation, two callers — no dialect to drift.
+     */
+    private fun parseChatExtraBody(inputJson: String, warnings: MutableList<String>): Map<String, Any?> =
+        ModelUseProtocol.parseChatExtraBody(inputJson, warnings)
 
     /**
      * [fix/audit0917-b8] Header values are JSON strings — the same dialect the

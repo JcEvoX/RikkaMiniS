@@ -818,25 +818,14 @@ class ModelUseOffloadHandler(
      * unknown top-level keys stay image-path-only, per iOS). Values kept as raw
      * org.json types so JSONObject.put re-serializes them faithfully.
      */
-    private fun parseChatExtraBody(inputJson: String, warnings: MutableList<String>): Map<String, Any?> {
-        val obj = try {
-            val t = inputJson.trim()
-            if (t.startsWith("{")) JSONObject(t) else null
-        } catch (_: Throwable) { null } ?: return emptyMap()
-        val raw = obj.opt("extra_body")?.takeIf { it != JSONObject.NULL } ?: return emptyMap()
-        val extra = raw as? JSONObject
-        if (extra == null) {
-            // [T-model-use-passthrough-warnings] type-mismatch feedback
-            warnings.add(
-                "extra_body is not a JSON object (actual type: ${jsonTypeName(raw)}) — ignored. " +
-                    "Wrap your fields in an object: \"extra_body\":{...}.",
-            )
-            return emptyMap()
-        }
-        val out = LinkedHashMap<String, Any?>()
-        for (key in extra.keys()) out[key] = extra.opt(key)
-        return out
-    }
+    /**
+     * [fix/audit3-1015 F-04] Delegates to the single shared dialect in
+     * [ModelUseProtocol] (this was the in-process copy the worker's parser was
+     * supposed to mirror; the mirror had drifted). Behavior here is unchanged —
+     * the worker now agrees with it instead of the other way round.
+     */
+    private fun parseChatExtraBody(inputJson: String, warnings: MutableList<String>): Map<String, Any?> =
+        ModelUseProtocol.parseChatExtraBody(inputJson, warnings)
 
     /** Standard-mode `extra_headers` (string map). */
     private fun parseExtraHeaders(inputJson: String, warnings: MutableList<String>): Map<String, String> {
