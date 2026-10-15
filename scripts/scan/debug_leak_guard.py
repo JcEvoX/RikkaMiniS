@@ -65,6 +65,12 @@ ALLOWED_FILES = {
     # entry covers one call site, and any NEW file touching debug code still
     # fails the gate until it is audited.
     "com/rikkaminis/app/network/OkHttpNetTraceListener.kt",        # LLMRequestLog.redactURL
+    # [fix/audit3-1015 F-03] The passthrough reply log redacts the endpoint URL
+    # via LLMRequestLog.redactURL() — the same audited reason the three entries
+    # above are listed. The call site is the pure string helper (no server, no
+    # BuildConfig.DEBUG dependency); the URL is user-supplied (a relay base URL
+    # can carry a key in its query), which is exactly what redactURL is for.
+    "com/rikkaminis/app/sandbox/offload/ModelUseOffloadHandler.kt", # LLMRequestLog.redactURL
 }
 
 # [audit-0916d] A `comment-only` entry used to sit here for ChatViewModel.kt.

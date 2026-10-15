@@ -3,6 +3,7 @@ package com.rikkaminis.app.sandbox.offload
 import android.app.Service
 import android.content.Intent
 import android.os.IBinder
+import android.util.Base64
 import android.util.Log
 import com.rikkaminis.app.data.model.LLMStreamChunk
 import kotlinx.coroutines.Job
@@ -970,23 +971,102 @@ class ModelExecutionService : Service() {
 
         // ── Dispatch ──
         val outputExt = req.optString("output_ext", "").ifEmpty { null }
-        val isMediaOutput = outputExt in listOf("png", "jpg", "jpeg", "webp", "gif")
         val openAI = provider as? com.rikkaminis.app.provider.openai.OpenAIProvider
+        // [fix/audit3-1015 F-10] Set by the image route (auto probe). It rides
+        // along in whatever result this run returns so :app — the process that
+        // owns ProviderRepository/SharedPreferences — can persist it; the
+        // worker never touches prefs.
+        var imageEndpointCache: com.rikkaminis.app.data.model.ImageEndpointMode? = null
 
-        // 1) Image generation route (media output ext + OpenAI-compat provider)
-        if (openAI != null && isMediaOutput) {
-            val genConfig = parseImageGenConfig(inputJson)
-            val prompt = genConfig.prompt
-                ?: messages.lastOrNull { it.role == com.rikkaminis.app.data.model.LLMMessage.Role.USER }?.content?.takeIf { it.isNotEmpty() }
+        // 0) Raw passthrough route. [fix/audit3-1015 F-03] This is where the
+        // HTTP call is allowed to happen: ProviderBoundary rejects provider
+        // calls in :app, so the app assembles the request (shared pure body
+        // builder + shared envelope parser) and ships it here. The reply is NOT
+        // parsed — the raw bytes ride back to :app, which owns --output/inline
+        // shaping and the session-scoped file IO.
+        val passthroughReq = req.optJSONObject("passthrough_request")
+        if (passthroughReq != null) {
+            if (openAI == null) {
+                return JSONObject().put("error", "passthrough_unsupported")
+                    .put("message", "passthrough mode requires an OpenAI-compatible provider instance")
+                    .toString()
+            }
+            return try {
+                val ptBody = passthroughReq.opt("body")?.takeIf { it != JSONObject.NULL } as? JSONObject
+                val ptHeaders = LinkedHashMap<String, String>()
+                passthroughReq.optJSONObject("headers")?.let { h ->
+                    for (k in h.keys()) {
+                        val v = h.opt(k)
+                        if (v is String) ptHeaders[k] = v
+                    }
+                }
+                val ptResult = runBlocking {
+                    openAI.rawPassthroughRequest(
+                        endpoint = passthroughReq.optString("endpoint", "").ifEmpty { null },
+                        method = passthroughReq.optString("method", "POST"),
+                        headers = ptHeaders,
+                        bodyObject = ptBody,
+                    )
+                }
+                JSONObject()
+                    .put("passthrough", true)
+                    .put("http_status", ptResult.status)
+                    .put("content_type", ptResult.contentType ?: JSONObject.NULL)
+                    .put("endpoint_url", ptResult.url)
+                    .put("bytes", ptResult.data.size)
+                    .put("body_b64", Base64.encodeToString(ptResult.data, Base64.NO_WRAP))
+                    .toString()
+            } catch (t: Throwable) {
+                JSONObject().put("error", "passthrough_failed")
+                    .put("message", t.message ?: "passthrough request failed")
+                    .toString()
+            }
+        }
+
+        // 1) Image generation route. [fix/audit3-1015 F-10] The routing DECISION
+        // is shared with the CLI side (`ModelUseProtocol.decideImageRoute`)
+        // rather than an `outputExt` test here: this used to be the only image
+        // routing that ran, and it (a) sent a pure image generator without `-o`
+        // to the chat path, which cannot serve it, (b) dropped an input image
+        // into a text-to-image call instead of declining the route, and
+        // (c) fell through to chat on ANY failure, hiding terminal errors.
+        val imageConfig = ModelUseProtocol.parseImageGenConfig(inputJson)
+        val imageRoute = ModelUseProtocol.decideImageRoute(
+            displayName = model.displayName,
+            outputModalities = model.outputModalities.orEmpty(),
+            outputExt = outputExt,
+            hasInputImages = imageParts.isNotEmpty(),
+            providerType = instance.providerType,
+            credentialType = instance.credentialType,
+            isOpenAiCompatibleProvider = openAI != null,
+            imageEndpointMode = instance.imageEndpointMode,
+            imageEndpointResolved = instance.imageEndpointResolved,
+            endpointOverride = imageConfig.endpointOverride,
+        )
+        if (imageRoute is ModelUseProtocol.ImageRoute.Reject) {
+            return JSONObject().apply {
+                put("error", imageRoute.error)
+                put("message", imageRoute.message)
+                put("exit_code", 2)
+            }.toString()
+        }
+        if (imageRoute is ModelUseProtocol.ImageRoute.Generate && openAI != null) {
+            val prompt = imageConfig.prompt
+                ?: messages.lastOrNull { it.role == com.rikkaminis.app.data.model.LLMMessage.Role.USER }
+                    ?.content?.takeIf { it.isNotEmpty() }
                 ?: ""
             if (prompt.isNotEmpty()) {
-                // Apply image passthrough extras from inputJson (mirrors
-                // ModelUseOffloadHandler.tryImageGenerationRoute's passthrough
-                // injection).
+                // Apply image passthrough extras from inputJson.
                 applyImagePassthrough(openAI, inputJson, callWarnings)
+                // imagesGenerations (forced/pure/cached) → a failure is terminal;
+                // auto → a route-missing 4xx is a cacheable "no Images API".
+                val forced = imageRoute.mode == com.rikkaminis.app.data.model.ImageEndpointMode.imagesGenerations
                 try {
                     val imgResult = runBlocking {
-                        openAI.generateImage(prompt, genConfig.n, genConfig.size, genConfig.quality)
+                        openAI.generateImage(prompt, imageConfig.n, imageConfig.size, imageConfig.quality)
+                    }
+                    if (!forced) {
+                        imageEndpointCache = com.rikkaminis.app.data.model.ImageEndpointMode.imagesGenerations
                     }
                     return JSONObject().apply {
                         put("model", model.id)
@@ -1008,12 +1088,35 @@ class ModelExecutionService : Service() {
                         })
                         if (appliedExtras.length() > 0) put("applied_extras", appliedExtras)
                         if (callWarnings.isNotEmpty()) put("warnings", JSONArray(callWarnings))
+                        imageEndpointCache?.let { put("image_endpoint_resolved", it.name) }
                         put("exit_code", 0)
                     }.toString()
                 } catch (t: Throwable) {
-                    // Fall through to text path — mirror tryImageGenerationRoute's
-                    // route-missing fallback semantics.
-                    callWarnings.add("image_route_fallback: ${t.message}")
+                    val routeMissing = !forced &&
+                        (t is com.rikkaminis.app.data.model.LLMError.ProviderError ||
+                            t is com.rikkaminis.app.data.model.LLMError.InvalidApiKey) &&
+                        ModelUseProtocol.looksLikeEndpointMissing(t.message ?: "")
+                    if (routeMissing) {
+                        // Cache the answer and run the chat path below.
+                        Log.i(TAG, "[image-route] auto probe → route missing — caching chat_completions")
+                        imageEndpointCache = com.rikkaminis.app.data.model.ImageEndpointMode.chatCompletions
+                        callWarnings.add("image_route_fallback: ${t.message}")
+                    } else {
+                        // Forced/pure mode, or a real error (auth/moderation/
+                        // network) — surface it instead of falling through.
+                        Log.w(TAG, "[image-route] image generation failed: ${t.message}", t)
+                        val hint = ModelUseProtocol.imageParamHint(
+                            displayName = model.displayName,
+                            providerType = instance.providerType,
+                            outputModalities = model.outputModalities.orEmpty(),
+                        )
+                        val base = t.message ?: "image_generation_failed"
+                        return JSONObject().apply {
+                            put("error", "image_generation_failed")
+                            put("message", if (hint.isEmpty()) base else "$base\n\n$hint")
+                            put("exit_code", 1)
+                        }.toString()
+                    }
                 }
             }
         }
@@ -1040,6 +1143,7 @@ class ModelExecutionService : Service() {
             return JSONObject().apply {
                 put("error", "model_use_failed")
                 put("message", e.message ?: "unknown")
+                imageEndpointCache?.let { put("image_endpoint_resolved", it.name) }
                 put("exit_code", 1)
             }.toString()
         }
@@ -1065,6 +1169,9 @@ class ModelExecutionService : Service() {
             })
             if (appliedExtras.length() > 0) put("applied_extras", appliedExtras)
             if (callWarnings.isNotEmpty()) put("warnings", JSONArray(callWarnings))
+            // [fix/audit3-1015 F-10] The auto probe's answer rides home with the
+            // chat result; :app persists it (this process must not touch prefs).
+            imageEndpointCache?.let { put("image_endpoint_resolved", it.name) }
             put("exit_code", 0)
         }.toString()
     }
@@ -1774,25 +1881,15 @@ class ModelExecutionService : Service() {
 
     // ── passthrough parsing (mirrors ModelUseOffloadHandler) ──
 
-    private fun parseChatExtraBody(inputJson: String, warnings: MutableList<String>): Map<String, Any> {
-        val obj = try { val t = inputJson.trim(); if (t.startsWith("{")) JSONObject(t) else null }
-        catch (_: Exception) { null } ?: return emptyMap()
-        val eb = obj.optJSONObject("extra_body") ?: return emptyMap()
-        val result = linkedMapOf<String, Any>()
-        for (key in eb.keys()) {
-            when (val v = eb.get(key)) {
-                is Int, is Long, is Double, is Boolean, is String -> result[key] = v
-                is JSONArray -> {
-                    val list = (0 until v.length()).mapNotNull { e ->
-                        e.let { if (it is Int || it is Long || it is Double || it is Boolean || it is String) it else null }
-                    }
-                    if (list.isNotEmpty()) result[key] = list
-                }
-                else -> warnings.add("extra_body.$key: unsupported type, dropped")
-            }
-        }
-        return result
-    }
+    /**
+     * [fix/audit3-1015 F-04] Delegates to the single shared dialect in
+     * [ModelUseProtocol]. This copy used to rebuild arrays from the loop
+     * *index* (`[0, 1, … N-1]`) and warn-and-drop nested objects, so the same
+     * `extra_body` produced one body from `:app` and a different one from
+     * `:modelservice`. One implementation, two callers — no dialect to drift.
+     */
+    private fun parseChatExtraBody(inputJson: String, warnings: MutableList<String>): Map<String, Any?> =
+        ModelUseProtocol.parseChatExtraBody(inputJson, warnings)
 
     /**
      * [fix/audit0917-b8] Header values are JSON strings — the same dialect the
@@ -1837,37 +1934,12 @@ class ModelExecutionService : Service() {
         return obj.optString("endpoint", "").ifEmpty { null }
     }
 
-    private fun parseImageGenConfig(inputJson: String): ImageGenConfig {
-        val obj = try { val t = inputJson.trim(); if (t.startsWith("{")) JSONObject(t) else null }
-        catch (_: Exception) { null } ?: return ImageGenConfig()
-        var prompt: String? = null
-        var n = 1
-        var size: String? = null
-        var quality: String? = null
-        if (obj.has("prompt")) prompt = obj.optString("prompt", null)
-        if (obj.has("n")) n = obj.optInt("n", 1)
-        if (obj.has("size")) size = obj.optString("size", null)
-        if (obj.has("quality")) quality = obj.optString("quality", null)
-        val gc = obj.optJSONObject("generation_config")
-        if (gc != null) {
-            if (prompt == null && gc.has("prompt")) prompt = gc.optString("prompt", null)
-            if (gc.has("number_of_images")) n = gc.optInt("number_of_images", 1)
-            if (gc.has("image_size")) size = gc.optString("image_size", null)
-        }
-        return ImageGenConfig(prompt, n, size, quality)
-    }
-
-    private data class ImageGenConfig(
-        val prompt: String? = null,
-        val n: Int = 1,
-        val size: String? = null,
-        val quality: String? = null,
-    )
 
     /**
      * Parse image passthrough extras from the input JSON and apply them to
-     * the [OpenAIProvider]. Mirrors
-     * [ModelUseOffloadHandler.tryImageGenerationRoute] passthrough injection.
+     * the [OpenAIProvider]. The passthrough injection used to exist on both
+     * sides (the CLI-side copy was deleted with the in-process fallback in
+     * audit3 F-10); this is now the only one.
      */
     private fun applyImagePassthrough(
         openAI: com.rikkaminis.app.provider.openai.OpenAIProvider,
