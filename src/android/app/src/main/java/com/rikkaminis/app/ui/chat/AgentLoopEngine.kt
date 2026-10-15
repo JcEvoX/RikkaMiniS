@@ -23,6 +23,10 @@ import com.rikkaminis.app.data.model.LLMMessage
 import com.rikkaminis.app.data.model.LLMStreamChunk
 import com.rikkaminis.app.data.model.LLMUsage
 import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.conversation.ContextCalibration
+import com.rikkaminis.app.conversation.ContextEstimator
+import com.rikkaminis.app.conversation.PreflightVerdict
+import com.rikkaminis.app.conversation.preflightContextBudget
 import com.rikkaminis.app.provider.LLMProvider
 import com.rikkaminis.app.tools.AgentTraceRecorder
 import android.os.SystemClock
@@ -104,6 +108,42 @@ internal class AgentLoopEngine(
     private companion object {
         private const val TAG_STREAM = "ChatVMStream"
         private const val TAG = "ChatViewModel"
+
+        /** [fix/prewindow-budget-1015] 预检输出下限（= ChatViewModel.MIN_MAX_TOKENS）。 */
+        private const val MIN_MAX_TOKENS_CONST = 1024
+
+        /** [fix/prewindow-budget-1015] 校准百分比换算（ratio 存 100×便于 Long 运算）。 */
+        private const val CALIB_PCT = 100L
+
+        /**
+         * [fix/prewindow-budget-1015] per-(providerType, baseUrl, model) 校准
+         * 系数。0 未校准 / 100 已校准且一致 / >100 provider 口径更大。估算
+         * 只乘一次，避免每消息重复读 prefs。
+         */
+        private fun calibrationRatioFor(provider: LLMProvider): Long {
+            val inst = provider.instanceContext ?: return CALIB_PCT
+            val key = ContextCalibration.keyFor(
+                providerType = inst.providerType.name,
+                baseUrl = inst.customBaseURL ?: "",
+                modelId = provider.model.id,
+            )
+            return (ContextCalibration.ratio(key) * CALIB_PCT).toLong().coerceAtLeast(CALIB_PCT)
+        }
+
+        /**
+         * [fix/prewindow-budget-1015] 当前 provider 的校准 key；instanceContext
+         * 缺失（mock provider / 非-offload 路径）返回 null —— 调用方跳过
+         * 失效检查与校准回填，行为退回旧世界。
+         */
+        private fun contextKeyOf(provider: LLMProvider): String? {
+            val inst = provider.instanceContext ?: return null
+            return ContextCalibration.keyFor(
+                providerType = inst.providerType.name,
+                baseUrl = inst.customBaseURL ?: "",
+                modelId = provider.model.id,
+            )
+        }
+
     }
 
     /** Verbatim lift of ChatViewModel.unwrapFlowException (used by the retry path). */
@@ -574,7 +614,113 @@ internal class AgentLoopEngine(
             var turnFinishReason: String? = null
             var turnTruncated = false
             var lastUsage: LLMUsage? = null
-            val maxTokens = host.dynamicMaxTokens(provider, loopState.lastContextTokens)
+            // [fix/prewindow-budget-1015] 2026-10-15 T321（session 16c39966）：
+            // 同一份 ~4.9MB 历史在 deepseek 中转口径下记 191.9K，GLM 直连口径
+            // 记 920.6K。旧链路此时 lastContextTokens 仍持 deepseek 的 191.9K
+            // → dynamicMaxTokens 按 220K−191.9K 顶格放 128K 输出 →
+            // 920,577+128,000 > 1,048,576 必然 400，且本地所有闸门（offload/
+            // compact/trim）都看不见这次超支。预检用 provider 无关的本地估算
+            // 在请求组装完成后做一次硬性结构检查，裁决三档：PASS / 收缩输出
+            // 预算 / 禁止直发（走下方 compact+trim 管线再重估）。
+            // [fix/prewindow-budget-1015] 反向漏洞：换到"记账更大"的端点后，旧
+            // provider 的 lastContextTokens 偏大 → dynamicMaxTokens 把输出饿死
+            // （空 length-wall）。读数来源 key 与当前 provider 不匹配 → 视为
+            // 未知（0），本 turn 的输出预算按"无输入信息"分配；下一 turn 的
+            // usage 回包会以新端点口径重建读数。必须在 dynamicMaxTokens 之前
+            // 做 —— 清零晚了等于没清。
+            val currentCtxKey = contextKeyOf(provider)
+            if (loopState.lastContextTokensSourceKey != null &&
+                loopState.lastContextTokensSourceKey != currentCtxKey
+            ) {
+                AppLogger.info(
+                    TAG_STREAM,
+                    "[Preflight] turn=$turn context reading from stale provider " +
+                        "(${loopState.lastContextTokensSourceKey} → $currentCtxKey); treating as unknown",
+                )
+                loopState.lastContextTokens = 0
+                host.setLastTurnContextTokens(0)
+            }
+            // [fix/prewindow-budget-1015] var（非 val）：NEEDS_COMPACTION 分支在
+            // 下方管线里实际收缩历史后必须重捕——compact 只写 marker、trim 砍
+            // agentHistory，都不触碰这里已捕获的快照实例；不重捕则本 turn 请求
+            // 仍带全量未压缩历史 + 最小输出 → 仍然必然 400（该缺口会让
+            // "裁剪后按最小输出重试"的承诺在本 turn 落空）。SHRINK_OUTPUT /
+            // PASS 不进管线，值与 val 时代逐字一致。
+            var preflightMessages = host.applyRequestImageBudget(host.effectiveAgentHistory())
+            val preflightMaxTokens = host.dynamicMaxTokens(provider, loopState.lastContextTokens)
+            // rawEstimate：provider 无关的本地原始口径 —— 校准观察（流结束/
+            // 400-teacher）只用它，否则校准学到"系数化的自己"，闭环坍缩到 1.0。
+            // [fix/prewindow-budget-1015] var：NEEDS_COMPACTION 分支重捕消息后
+            // 必须重算——400-teacher 与 usage 校准回填都拿它做 localEstimate，
+            // 若仍持压缩前的估算，观测比值 = 压缩后 usage / 压缩前估算，
+            // 系统性偏低且带内不可拒，会拖偏校准中位数。
+            var rawEstimate = ContextEstimator.estimateRequestTokens(
+                messages = preflightMessages,
+                systemPrompt = systemPrompt,
+                tools = host.agentTools,
+            )
+            var preflightEstimate = rawEstimate * calibrationRatioFor(provider) / 100
+            val preflightVerdict = preflightContextBudget(
+                window = host.effectiveContextWindowTokens() ?: 0,
+                estimatedInput = preflightEstimate,
+                requestedMaxTokens = preflightMaxTokens,
+                outputFloor = MIN_MAX_TOKENS_CONST,
+            )
+            AppLogger.info(
+                TAG_STREAM,
+                "[Preflight] turn=$turn ${preflightVerdict.toLogLine()} " +
+                    "window=${host.effectiveContextWindowTokens() ?: 0} " +
+                    "providerEst=${loopState.lastContextTokens} calib=${calibrationRatioFor(provider)}",
+            )
+            val maxTokens = when (preflightVerdict.decision) {
+                PreflightVerdict.Decision.SHRINK_OUTPUT -> preflightVerdict.suggestedMaxTokens ?: preflightMaxTokens
+                PreflightVerdict.Decision.NEEDS_COMPACTION -> {
+                    // 输入本身就装不下：先走既有的 offload → auto-compact →
+                    // hard-trim 管线（和上方窗口管理同一段），然后用裁剪后的
+                    // 历史重估一次；仍装不下 → 硬 trim 兜底后按最小输出发。
+                    // 这个分支替代旧世界"发出必然 400"的死法。
+                    // 读数用预检估算（loopState.lastContextTokens 可能刚被
+                    // window-mgmt 清零，而预检估算恰恰是此刻唯一可信的压力
+                    // 证据 —— 本地口径，与 provider 无关）。
+                    val windowNow = host.effectiveContextWindowTokens() ?: 0
+                    val pressureReading = preflightEstimate.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+                    val postOffload = host.offloadContextIfNeeded(
+                        contextWindow = windowNow,
+                        lastContextTokens = pressureReading,
+                        force = true,
+                    )
+                    val compacted = host.maybeAutoCompactInLoop(
+                        contextWindow = windowNow,
+                        lastContextTokens = postOffload ?: pressureReading,
+                    )
+                    if (!compacted) {
+                        host.trimContextHistoryWindow(
+                            contextWindow = windowNow,
+                            lastContextTokens = postOffload ?: pressureReading,
+                        )
+                    }
+                    // 裁剪后按最小输出重试一次：trim 的预算本身按 window 收，
+                    // 若裁后仍超（尾部太大），下一轮预检会再次禁发并走同样
+                    // 管线 —— 不会死循环（每轮都实际收缩历史）。
+                    // [fix/prewindow-budget-1015] 重捕请求消息：管线写入的
+                    // compact marker（effectiveAgentHistory 在请求时做
+                    // summary+tail 投影）与 trim 砍掉的历史，只有重新调用
+                    // effectiveAgentHistory 才能取到 —— 上面 :643 捕获的快照
+                    // 是管线前的投影，直接发出去等于压缩白跑（本 turn 仍 400）。
+                    // 重捕后同步重算本地估算：400-teacher 与流结束的 usage
+                    // 校准回填都以 rawEstimate 为 localEstimate，必须对应
+                    // 实际发出的（压缩后）请求，否则观测比值系统性失真。
+                    preflightMessages = host.applyRequestImageBudget(host.effectiveAgentHistory())
+                    rawEstimate = ContextEstimator.estimateRequestTokens(
+                        messages = preflightMessages,
+                        systemPrompt = systemPrompt,
+                        tools = host.agentTools,
+                    )
+                    preflightEstimate = rawEstimate * calibrationRatioFor(provider) / 100
+                    MIN_MAX_TOKENS_CONST
+                }
+                PreflightVerdict.Decision.PASS -> preflightMaxTokens
+            }
             val toolCalls = mutableListOf<Triple<String, String, JSONObject>>() // id, name, args
 
             // [T-dedupe-toolcallid 03fbcbfd] Per-turn dedupe of tool_call_id.
@@ -675,9 +821,9 @@ internal class AgentLoopEngine(
                     var streamChunkCount = 0
                     host.streamChatTurnOffloaded(
                         provider = loopState.currentProvider,
-                        messages = host.applyRequestImageBudget(host.effectiveAgentHistory()),
+                        messages = preflightMessages,
                         systemPrompt = systemPrompt,
-                        maxTokens = host.dynamicMaxTokens(loopState.currentProvider, loopState.lastContextTokens),
+                        maxTokens = maxTokens,
                         temperature = null,
                         imageParts = emptyList(),
                         tools = host.agentTools,
@@ -1079,6 +1225,7 @@ internal class AgentLoopEngine(
                                 (chunk.usage.cacheCreationInputTokens ?: 0)
                         }
                         if (loopState.lastContextTokens > 0) {
+                            loopState.lastContextTokensSourceKey = contextKeyOf(loopState.currentProvider)
                             host.setLastTurnContextTokens(loopState.lastContextTokens)
                             if (prevContextTokens > 0 && loopState.lastContextTokens > prevContextTokens) {
                                 host.recordContextGrowth(loopState.lastContextTokens - prevContextTokens)
@@ -1171,6 +1318,32 @@ internal class AgentLoopEngine(
                 } catch (e: Exception) {
                     if (e is CancellationException && e.cause == null) throw e  // real job cancellation
                     val actual = unwrapFlowExceptionImpl(e)
+                    // [fix/prewindow-budget-1015] 400-teacher：上下文超限 400 的
+                    // 正文带着该端点自己报的精确 input_tokens（"your prompt
+                    // contains at least 920577 input tokens"）。预检的本地估算
+                    // 对同一请求算过 —— 这个比值是教科书级校准样本（带错误
+                    // 历史的估算必然偏低，正好把累计偏差一次学进去）。
+                    if (actual is com.rikkaminis.app.data.model.LLMError.ProviderError &&
+                        isContextTooLargeError(actual) && preflightEstimate > 0
+                    ) {
+                        Regex("""(\d{3,})\s*input tokens""").find(actual.detail)?.groupValues?.get(1)
+                            ?.toLongOrNull()?.let { reportedInput ->
+                                val inst = loopState.currentProvider.instanceContext
+                                if (inst != null) {
+                                    val ck = ContextCalibration.keyFor(
+                                        providerType = inst.providerType.name,
+                                        baseUrl = inst.customBaseURL ?: "",
+                                        modelId = loopState.currentProvider.model.id,
+                                    )
+                                    val obs = ContextCalibration.observe(ck, reportedInput, rawEstimate)
+                                    AppLogger.warning(
+                                        TAG_STREAM,
+                                        "[Calibration] $ck 400-teacher observed=$obs reported=$reportedInput " +
+                                            "localEst=$preflightEstimate ratio=${ContextCalibration.ratio(ck)}",
+                                    )
+                                }
+                            }
+                    }
                     val isRateLimit = actual is com.rikkaminis.app.data.model.LLMError.RateLimited
                     val is5xx = actual is com.rikkaminis.app.data.model.LLMError.ProviderError &&
                         actual.detail.contains(Regex("\\b[5][0-9]{2}\\b"))
@@ -1591,6 +1764,35 @@ internal class AgentLoopEngine(
                     }
                 }
             }  // end while (!collectDone)
+
+            // [fix/prewindow-budget-1015] usage → 校准窗口回填，流结束后恰好
+            // 一次（移出 chunk 处理器：一次流可能吐多帧 usage，会把窗口灌成
+            // 近似重复样本）。用 lastUsage 的最终帧；本地端用预检时对同一
+            // wire 请求算的原始估算（未乘校准）。
+            run {
+                val usageNow = lastUsage
+                val latest = usageNow?.latestContextTokens ?: 0
+                if (latest > 0 && preflightEstimate > 0) {
+                    val inst = loopState.currentProvider.instanceContext
+                    if (inst != null) {
+                        val ck = ContextCalibration.keyFor(
+                            providerType = inst.providerType.name,
+                            baseUrl = inst.customBaseURL ?: "",
+                            modelId = loopState.currentProvider.model.id,
+                        )
+                        val obs = ContextCalibration.observe(
+                            key = ck,
+                            providerUsage = latest.toLong(),
+                            localEstimate = rawEstimate,
+                        )
+                        AppLogger.info(
+                            TAG_STREAM,
+                            "[Calibration] $ck observed=$obs usage=$latest " +
+                                "localEst=$preflightEstimate ratio=${ContextCalibration.ratio(ck)}",
+                        )
+                    }
+                }
+            }
 
             // [T-recovery] The turn's stream completed without error — the
             // member that served it is healthy. Clears any prior cooldown /
