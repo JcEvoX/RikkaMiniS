@@ -3,8 +3,12 @@ package com.rikkaminis.app.service
 import org.junit.Assert.assertEquals
 import org.junit.Assert.fail
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import com.rikkaminis.app.scheduled.ScheduledTask
+import com.rikkaminis.app.scheduled.ScheduledTaskTransitions
+import com.rikkaminis.app.scheduled.ScheduledTasksFile
 import java.io.File
 import java.util.concurrent.CountDownLatch
 
@@ -240,6 +244,60 @@ class SessionActivityStreamErrorTest {
         assertTrue("expected at least 9 terminal-failure funnel sites, found $sites", sites >= 9)
     }
 
+    /**
+     * The consequence chain this fix exists for, end to end on the pure
+     * surfaces: flag → the run's verdict → the outcome `ScheduledTaskRunner`
+     * records → the policy's streak / daily gate. Before the fix the failing
+     * path produced RESULT_OK here, which pinned `lastRunDate` and reset
+     * `failStreak` — the fuse could not trip no matter how often a run failed.
+     */
+    @Test
+    fun `the verdict still drives the scheduled-task outcome and its streak`() {
+        val runner = bodyOf(
+            appSource(RUNNER_REL),
+            "fun onSessionSettled(context: Context, sessionId: String, isError: Boolean)",
+            RUNNER_REL,
+        )
+        assertWiring(runnerMapsVerdict(runner), audience = "ScheduledTaskRunner.onSessionSettled")
+
+        val file = ScheduledTasksFile(
+            globalEnabled = true,
+            tasks = listOf(
+                ScheduledTask(
+                    id = "t-1",
+                    title = "briefing",
+                    prompt = "summarize",
+                    windowStart = "07:00",
+                    windowEnd = "23:00",
+                    lastRunDate = null,
+                    failStreak = 0,
+                ),
+            ),
+        )
+
+        // A flagged run settles as failed (RESULT_ERROR = "error").
+        val flags = StreamErrorFlags()
+        flags.mark("s1")
+        val outcome = if (flags.consume("s1")) ScheduledTask.RESULT_ERROR else ScheduledTask.RESULT_OK
+        assertEquals("error", outcome)
+        val failed = ScheduledTaskTransitions.completeRun(file, "t-1", outcome, "2026-10-15")
+        assertEquals("a failed run counts one failure", 1, failed.task!!.failStreak)
+        assertNull(
+            "a failed run must NOT advance the daily gate — that is what keeps the day's retry open",
+            failed.task.lastRunDate,
+        )
+        assertFalse("one failure is below the fuse threshold", failed.fuseTripped)
+
+        // An unflagged run settles as success: gate advanced, streak cleared.
+        val clean = StreamErrorFlags()
+        val cleanOutcome =
+            if (clean.consume("s1")) ScheduledTask.RESULT_ERROR else ScheduledTask.RESULT_OK
+        assertEquals("ok", cleanOutcome)
+        val ok = ScheduledTaskTransitions.completeRun(file, "t-1", cleanOutcome, "2026-10-15")
+        assertEquals(0, ok.task!!.failStreak)
+        assertEquals("2026-10-15", ok.task.lastRunDate)
+    }
+
     // ── 3. negative controls (mutate a real-source copy, expect a red) ───────
 
     @Test
@@ -444,6 +502,15 @@ class SessionActivityStreamErrorTest {
         }
     }
 
+    private fun runnerMapsVerdict(body: String): String? = when {
+        !contains(body, "isError") -> "the runner must branch on the tracker verdict"
+        !contains(body, "ScheduledTask.RESULT_ERROR") ->
+            "the runner must map a flagged run to RESULT_ERROR"
+        !contains(body, "ScheduledTask.RESULT_OK") ->
+            "the runner must map a clean run to RESULT_OK"
+        else -> null
+    }
+
     private fun engineFunnelIntact(source: String): String? {
         val body = normalize(source)
         val funnel = occurrences(body, "host.setInlineError(")
@@ -558,6 +625,9 @@ class SessionActivityStreamErrorTest {
         const val PROMPT_TOOLS_FILE = "src/main/java/com/rikkaminis/app/ui/chat/ChatPromptAndTools.kt"
         const val CHAT_VM_FILE = "src/main/java/com/rikkaminis/app/ui/chat/ChatViewModel.kt"
         const val ENGINE_FILE = "src/main/java/com/rikkaminis/app/ui/chat/AgentLoopEngine.kt"
+
+        /** Package-relative (under `com/rikkaminis/app/`) path used by [appSource]. */
+        const val RUNNER_REL = "scheduled/ScheduledTaskRunner.kt"
 
         const val SET_INLINE_ERROR_SIG = "internal fun ChatViewModel.setInlineError("
         const val CLEAR_INLINE_ERROR_SIG = "internal fun ChatViewModel.clearInlineError()"
