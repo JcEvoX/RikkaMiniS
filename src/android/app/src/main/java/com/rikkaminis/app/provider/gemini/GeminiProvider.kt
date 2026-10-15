@@ -177,6 +177,31 @@ class GeminiProvider(
                 call.cancel()
             }
         }
+        // [fix/audit2-cancelbridge-1015, placement corrected by audit3 F-05]
+        // Cancellation bridge, registered BEFORE the first blocking call —
+        // which is `call.execute()` immediately below, then `reader.readLine()`
+        // in the loop. The position is load-bearing, not stylistic: `execute()`
+        // itself blocks while the connection is established and the response
+        // headers are awaited, and a blocking socket read is NOT interruptible
+        // by coroutine cancellation. With the bridge registered AFTER
+        // `execute()` (where audit2 first put it) a user cancel landing in that
+        // connect/header window had no handler to reach, so the coroutine ran
+        // on until the headers arrived or the TTFB watchdog
+        // (StreamTimeouts.TTFB_TIMEOUT_MS) fired. Measured: with the bridge
+        // after execute a cancel during a silent connect window is still parked
+        // in the socket read past the 10s probe bound; with it before, the call
+        // is torn down in milliseconds (see the connect-window arm of
+        // ProviderCancelBridgeAnthropicGeminiTest).
+        //
+        // Without any bridge at all, a cancel during the body read leaves this
+        // coroutine parked until the upstream speaks or the generation
+        // readTimeout (30 min, FirstChunkTimeoutPolicy) fires — measured against
+        // a silently wedged server: the outer job, the inner job, a wrapping
+        // coroutineScope and a withTimeoutOrNull each still ran the full budget,
+        // socket still open. OpenAIProvider registers it in exactly this spot.
+        // See [com.rikkaminis.app.provider.StreamCancelBridge] for the three
+        // semantics and the OpenAI arm's numbers.
+        val cancelBridge = StreamCancelBridge(scope = this) { call.cancel() }
         val response = try {
             call.execute()
         } catch (e: IOException) {
@@ -190,16 +215,6 @@ class GeminiProvider(
             headersArrived.set(true)
             ttfbWatchdog.cancel()
         }
-        // [fix/audit2-cancelbridge-1015] Cancellation bridge, registered BEFORE
-        // the first blocking call (call.execute() below, then reader.readLine()).
-        // Without it a user cancel leaves this coroutine parked in the socket
-        // read until the upstream speaks or the generation readTimeout (30 min,
-        // FirstChunkTimeoutPolicy) fires — measured against a silently wedged
-        // server: the outer job, the inner job, a wrapping coroutineScope and a
-        // withTimeoutOrNull each still ran the full budget, socket still open.
-        // See [com.rikkaminis.app.provider.StreamCancelBridge] for the three
-        // semantics and the OpenAI arm's numbers.
-        val cancelBridge = StreamCancelBridge(scope = this) { call.cancel() }
         if (!response.isSuccessful) {
             val errorBody = response.body?.string() ?: ""
             val retryAfterMs = parseRetryAfterMs(response.headers["Retry-After"], System.currentTimeMillis())
