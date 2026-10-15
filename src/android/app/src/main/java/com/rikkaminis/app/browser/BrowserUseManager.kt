@@ -105,6 +105,19 @@ class BrowserUseManager(
          *  LLM context). */
         private const val DIAGNOSTICS_TEXT_CAP = 16_000
 
+        /**
+         * [audit2-A2] Ceiling on the `data:` URL string a page may push through
+         * the `__minis__.saveBlobDownload` bridge / the download listener.
+         *
+         * Sized off the DECODED payload — 24 MiB of URL text is ≈16 MiB of
+         * bytes for base64 (4 chars per 3 bytes) — which is comfortably above
+         * any real export a page offers (worksheets, PDFs, images, small
+         * archives) and far below "allocate the app to death": the decode step
+         * holds the string and its byte copy at once, and the pool then writes
+         * that same payload into the session workspace.
+         */
+        private const val MAX_BLOB_DATA_URL_CHARS = 24 * 1024 * 1024
+
         @SuppressLint("SetJavaScriptEnabled")
         fun configureWebView(webView: WebView, profile: UserAgentProfile, customUA: String? = null) {
             // [T-android-browser-blank] The browser lives inside a Material3
@@ -257,6 +270,26 @@ class BrowserUseManager(
     private var asyncJsDeferred: CompletableDeferred<String>? = null
     private var asyncJsActiveToken: String? = null
 
+    /**
+     * [audit2-A2] One-shot credential for the `__minis__.saveBlobDownload`
+     * bridge call — same shape as [asyncJsActiveToken] above (a fresh UUID per
+     * request, compared with `==`). [fetchBlobDownload] arms it right before
+     * injecting the FileReader that echoes it back.
+     *
+     * Why it exists: `addJavascriptInterface` exposes the bridge to EVERY page
+     * this tab loads, so without a credential any third-party page (or an
+     * iframe inside one) could call `__minis__.saveBlobDownload(…)` itself and
+     * write attacker-chosen bytes into the session workspace — no user action
+     * needed. The token is only knowable to script we injected ourselves.
+     *
+     * Consumed (cleared) on first use, so a replayed call after the real
+     * download landed is rejected as well.
+     */
+    // @Volatile: armed on the main thread (download listener →
+    // fetchBlobDownload), read on the WebView's JavaBridge thread.
+    @Volatile
+    private var blobDownloadActiveToken: String? = null
+
     // ── [feat/browser-console-network-upload] diagnostics buffers ────────────
 
     /** One page JS console message, captured in onConsoleMessage. */
@@ -349,43 +382,80 @@ class BrowserUseManager(
          * Receives a blob: download read as a data URL by [fetchBlobDownload]'s
          * injected FileReader. Runs on the WebView's JavaBridge thread — file
          * I/O downstream is fine, but don't touch the WebView from here.
+         *
+         * [audit2-A2] Credential check. This method is reachable from ANY page
+         * the tab loads (that is what `addJavascriptInterface` means), so the
+         * call is only honoured when it carries the token [fetchBlobDownload]
+         * just armed. An unauthenticated call is dropped silently — never
+         * thrown back into the page, which would leak internals — and leaves a
+         * warn line for forensics.
          */
         @JavascriptInterface
-        fun saveBlobDownload(dataUrl: String, filename: String) {
-            // [audit-RC11] Defense-in-depth: page-provided names are untrusted.
-            // The pool also sanitizes, but refuse as early as possible so the
-            // bytes are never even handed off for an unsafe name.
-            val safeName = BrowserTabPool.sanitizeDownloadName(filename) ?: run {
-                Log.w(TAG, "blob download rejected: unsafe filename '${filename.take(80)}'")
+        fun saveBlobDownload(token: String, dataUrl: String, filename: String) {
+            if (token != blobDownloadActiveToken) {
+                Log.w(TAG, "blob download rejected: bad bridge token")
                 return
             }
-            val comma = dataUrl.indexOf(',')
-            if (comma < 0 || !dataUrl.startsWith("data:")) {
-                Log.w(TAG, "blob download: malformed data URL (len=${dataUrl.length})")
-                return
-            }
-            val header = dataUrl.substring(5, comma)
-            val mime = header.substringBefore(';').ifEmpty { null }
-            val bytes = try {
-                if (header.endsWith(";base64")) {
-                    android.util.Base64.decode(dataUrl.substring(comma + 1), android.util.Base64.DEFAULT)
-                } else {
-                    // Non-base64 data: URL — payload is percent-encoded text.
-                    java.net.URLDecoder.decode(dataUrl.substring(comma + 1), "UTF-8")
-                        .toByteArray(Charsets.UTF_8)
-                }
-            } catch (t: Throwable) {
-                Log.w(TAG, "blob download: payload decode failed: ${t.message}")
-                return
-            }
-            Log.i(TAG, "blob download decoded: $safeName (${bytes.size} bytes, mime=$mime)")
-            onBlobDownloadData?.invoke(bytes, safeName, mime)
+            // One-shot: the credential dies with the call it authorised.
+            blobDownloadActiveToken = null
+            deliverBlobDownload(dataUrl, filename)
         }
 
         @JavascriptInterface
         fun blobDownloadError(error: String) {
             Log.w(TAG, "blob download failed in page JS: $error")
         }
+    }
+
+    /**
+     * Decode a `data:` URL produced by the page-side blob reader and hand the
+     * bytes to [onBlobDownloadData]. Deliberately NOT a `@JavascriptInterface`
+     * member: the two legitimate callers are the bridge method above (after its
+     * credential check) and the `data:` branch of the download listener (an
+     * in-process call from native code, which needs no token).
+     */
+    private fun deliverBlobDownload(dataUrl: String, filename: String) {
+        // [audit2-A2] Bound the payload before touching it. The page chooses
+        // this string, and the decode below allocates a SECOND copy of it
+        // (base64 is 4 chars per 3 bytes, so ≈0.75×; percent-encoded text can
+        // double), then the pool persists it to the workspace — an unbounded
+        // input is an unbounded allocation plus an unbounded file. The check
+        // must be on the STRING length, before decoding: decoding first would
+        // mean the allocation we are trying to prevent has already happened.
+        // (The page-side string itself is built inside the WebView before we
+        // ever see it, so this bounds our amplification, not the page's.)
+        if (dataUrl.length > MAX_BLOB_DATA_URL_CHARS) {
+            Log.w(TAG, "blob download rejected: data URL too large (${dataUrl.length} > $MAX_BLOB_DATA_URL_CHARS chars)")
+            return
+        }
+        // [audit-RC11] Defense-in-depth: page-provided names are untrusted.
+        // The pool also sanitizes, but refuse as early as possible so the
+        // bytes are never even handed off for an unsafe name.
+        val safeName = BrowserTabPool.sanitizeDownloadName(filename) ?: run {
+            Log.w(TAG, "blob download rejected: unsafe filename '${filename.take(80)}'")
+            return
+        }
+        val comma = dataUrl.indexOf(',')
+        if (comma < 0 || !dataUrl.startsWith("data:")) {
+            Log.w(TAG, "blob download: malformed data URL (len=${dataUrl.length})")
+            return
+        }
+        val header = dataUrl.substring(5, comma)
+        val mime = header.substringBefore(';').ifEmpty { null }
+        val bytes = try {
+            if (header.endsWith(";base64")) {
+                android.util.Base64.decode(dataUrl.substring(comma + 1), android.util.Base64.DEFAULT)
+            } else {
+                // Non-base64 data: URL — payload is percent-encoded text.
+                java.net.URLDecoder.decode(dataUrl.substring(comma + 1), "UTF-8")
+                    .toByteArray(Charsets.UTF_8)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "blob download: payload decode failed: ${t.message}")
+            return
+        }
+        Log.i(TAG, "blob download decoded: $safeName (${bytes.size} bytes, mime=$mime)")
+        onBlobDownloadData?.invoke(bytes, safeName, mime)
     }
 
     init {
@@ -403,9 +473,11 @@ class BrowserUseManager(
                 url.startsWith("blob:") -> fetchBlobDownload(url, contentDisposition, mimetype)
                 // data: URLs carry the payload inline — decode directly
                 // (java.net.URL can't fetch them in the pool's downloader).
+                // [audit2-A2] In-process call: no bridge token involved, the
+                // value never travelled through page JS.
                 url.startsWith("data:") -> {
                     val name = android.webkit.URLUtil.guessFileName(url, contentDisposition, mimetype)
-                    jsBridge.saveBlobDownload(url, name)
+                    deliverBlobDownload(url, name)
                 }
                 else -> onDownloadStart?.invoke(url, userAgent, contentDisposition, mimetype, contentLength)
             }
@@ -434,9 +506,21 @@ class BrowserUseManager(
      * through the `__minis__.saveBlobDownload` bridge. blob: object URLs are
      * scoped to the page — they cannot be fetched from native code, so this
      * injected fetch + FileReader round-trip is the only way to get the data.
+     *
+     * [audit2-A2] Arms [blobDownloadActiveToken] first and interpolates that
+     * token into the injected script, so the bridge only accepts the callback
+     * from THIS reader.
      */
     private fun fetchBlobDownload(blobUrl: String, contentDisposition: String?, mimeType: String?) {
         val guessedName = android.webkit.URLUtil.guessFileName(blobUrl, contentDisposition, mimeType)
+        // [audit2-A2] Arm the one-shot bridge credential for THIS fetch: the
+        // token interpolated below is the only value the bridge will accept
+        // until the page's FileReader hands its data back. Kept separate from
+        // [asyncJsActiveToken] (rather than reusing it) so the download path
+        // stays independent of any in-flight executeJS request — the two have
+        // different lifetimes and would otherwise clear each other's token.
+        val token = UUID.randomUUID().toString()
+        blobDownloadActiveToken = token
         val js = """
             (function() {
                 fetch(${JSONObject.quote(blobUrl)})
@@ -444,7 +528,7 @@ class BrowserUseManager(
                     .then(function(blob) {
                         var reader = new FileReader();
                         reader.onloadend = function() {
-                            __minis__.saveBlobDownload(reader.result, ${JSONObject.quote(guessedName)});
+                            __minis__.saveBlobDownload(${JSONObject.quote(token)}, reader.result, ${JSONObject.quote(guessedName)});
                         };
                         reader.onerror = function() { __minis__.blobDownloadError('FileReader error'); };
                         reader.readAsDataURL(blob);
@@ -2320,7 +2404,14 @@ class BrowserUseManager(
 
         val collected = LinkedHashSet<String>()
         for (i in 0 until iterations) {
-            val escaped = selector.replace("\\", "\\\\").replace("'", "\\'")
+            // [audit2-A2] Was a hand-rolled `replace("\\","\\\\").replace("'","\\'")`,
+            // which left raw line terminators in the literal below — a selector
+            // containing a newline (a legal CSS attribute value, e.g.
+            // div[title="a\nb"]) produced an unterminated JS string, so the
+            // whole snippet died as a SyntaxError and scroll_and_collect
+            // silently returned nothing. Use the one escaper the rest of the
+            // browser JS is built with (`\n` / `\r` / `\t` / quotes).
+            val escaped = BrowserUseJS.jsQuote(selector)
             val raw = evaluateJavascript(
                 """(function(){
                     try {
