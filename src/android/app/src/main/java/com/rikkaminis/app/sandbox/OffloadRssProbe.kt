@@ -41,7 +41,10 @@ object OffloadRssProbe {
     /** 单 handler 累计正 delta 超过该值即判定「可疑泄漏源」并 WARN 一次。 */
     private const val LEAK_SUSPECT_KB = 1_024L * 1024L  // 1 GiB 累计
 
-    private data class Stats(
+    // [fix/da1016-rssprobe-lock-scope] private → internal：决策纯函数
+    // [applyAndDecideLocked] 的签名要暴露它，JVM 并发装置也要直接驱动该函数
+    // （对齐本文件 parseVmRssKb 的「internal 为 JVM 单测」先例）。
+    internal data class Stats(
         var count: Int = 0,
         var totalDeltaKb: Long = 0L,
         var peakDeltaKb: Long = 0L,
@@ -50,6 +53,22 @@ object OffloadRssProbe {
     ) {
         fun averageDeltaKb(): Long = if (count == 0) 0L else totalDeltaKb / count
     }
+
+    /**
+     * [fix/da1016-rssprobe-lock-scope] [applyAndDecideLocked] 的决策快照：record
+     * 在锁内拿到它，锁外只据它做副作用（Log / governanceHook）。数值字段是
+     * 「本次调用后、治理归零前」的读数——观测日志与告警文案同源，不再各自
+     * 撕裂地读 Stats 的可变字段。
+     */
+    internal data class RssDecision(
+        val totalDeltaKb: Long,
+        val count: Int,
+        val avgDeltaKb: Long,
+        val peakDeltaKb: Long,
+        val warnLeak: Boolean,
+        val govern: Boolean,
+        val governCumulative: Boolean,
+    )
 
     // handler 名 → 聚合统计（进程级累计，与 RSS 生命周期对齐）。
     // ConcurrentHashMap 保证并发 handler（Semaphore(2) 内的多个 worker 线程）安全。
@@ -92,31 +111,30 @@ object OffloadRssProbe {
     fun record(name: String, beforeKb: Long, afterKb: Long) {
         val deltaKb = afterKb - beforeKb
         val st = byHandler.computeIfAbsent(name) { Stats() }
-        // [fix/audit-b20 / T3-L2] Up to two offload workers (Semaphore(2)) can
-        // record into the same Stats concurrently; the ConcurrentHashMap only
-        // protects the map, not the value's fields, so `+=` lost updates.
-        synchronized(st) {
-            st.count += 1
-            st.totalDeltaKb += deltaKb
-            st.lastDeltaKb = deltaKb
-            if (deltaKb > st.peakDeltaKb) st.peakDeltaKb = deltaKb
-        }
+        // [fix/da1016-rssprobe-lock-scope] 唯一临界区：自增 + LEAK-SUSPECT 赢家
+        // 置位 + 治理判定 + 归零全部在锁内（[applyAndDecideLocked]）完成，并把
+        // 决策与读数捕获进局部快照 d；锁外只消费 d 做副作用（Log、governanceHook）。
+        // 修复前 synchronized 只护住自增，LEAK-SUSPECT 的 check-then-act 与
+        // toGovern 判定/归零都在锁外——两个 offload worker（Semaphore(2)）并发
+        // record 同一 Stats 时：判定与归零之间的并发 `+=` 抹掉那笔增量（累计被
+        // 系统性低估、该触发的治理不触发）、两个 worker 同过 !leaked 打两条
+        // LEAK-SUSPECT WARN、同过 toGovern 让高代价回收并发执行两次。
+        val d = synchronized(st) { applyAndDecideLocked(st, deltaKb) }
 
         // 每次调用一行观测日志（压测时可按 handler 名 grep 归类）
         Log.i(
             TAG,
             "[offload-rss] handler=$name Δ=${deltaKb}kB " +
                 "before=${beforeKb / 1024}MB after=${afterKb / 1024}MB " +
-                "cum=${st.totalDeltaKb / 1024}MB(×${st.count}, avg=${st.averageDeltaKb() / 1024}MB)"
+                "cum=${d.totalDeltaKb / 1024}MB(×${d.count}, avg=${d.avgDeltaKb / 1024}MB)"
         )
 
         // 累计正增量越过嫌疑阈值 → 判定为可疑泄漏源，WARN 一次身份
-        if (!st.leaked && st.totalDeltaKb >= LEAK_SUSPECT_KB) {
-            st.leaked = true
+        if (d.warnLeak) {
             Log.w(
                 TAG,
-                "[offload-rss] LEAK-SUSPECT handler=$name totalDelta=${st.totalDeltaKb / 1024}MB " +
-                    "over ${st.count} calls (peak=${st.peakDeltaKb / 1024}MB) — 候选 native OOM 源头"
+                "[offload-rss] LEAK-SUSPECT handler=$name totalDelta=${d.totalDeltaKb / 1024}MB " +
+                    "over ${d.count} calls (peak=${d.peakDeltaKb / 1024}MB) — 候选 native OOM 源头"
             )
         }
 
@@ -124,12 +142,11 @@ object OffloadRssProbe {
         // 增量异常大时，触发一次 governanceHook（回收 PRoot tracer / GC 善后），
         // 并把该 handler 的累计归零，防止同一慢泄漏在后续每次调用里反复触发
         // 高代价回收。hook 空实现时保持纯观测（向后兼容、零副作用）。
-        val toGovern = st.totalDeltaKb >= CUMULATIVE_GOVERN_KB || deltaKb >= PEAK_GOVERN_KB
-        if (toGovern) {
-            if (st.totalDeltaKb >= CUMULATIVE_GOVERN_KB) {
+        if (d.govern) {
+            if (d.governCumulative) {
                 Log.w(
                     TAG,
-                    "[offload-rss] GOVERN handler=$name cumulative ${st.totalDeltaKb / 1024}MB " +
+                    "[offload-rss] GOVERN handler=$name cumulative ${d.totalDeltaKb / 1024}MB " +
                         ">= ${CUMULATIVE_GOVERN_KB / 1024}MB — triggering governance + reset"
                 )
             } else {
@@ -139,9 +156,49 @@ object OffloadRssProbe {
                         ">= ${PEAK_GOVERN_KB / 1024}MB — triggering governance"
                 )
             }
-            st.totalDeltaKb = 0L
             runCatching { governanceHook() }
         }
+    }
+
+    /**
+     * [fix/da1016-rssprobe-lock-scope] 一次临界区里完成「自增 + 决策 + 复位」的
+     * 纯逻辑（对齐本文件 parseVmRssKb 的「抽纯函数零回归」路线，JVM 可直测；
+     * 多线程守恒臂见 OffloadRssProbeLockScopeTest）。
+     *
+     * **只允许在 `synchronized(st)` 内调用**——调用方负责持锁；本函数保证
+     * 「判定」与它所依据的数值之间不可能被另一个 worker 插入：
+     * - leaked 只由第一个跨 [LEAK_SUSPECT_KB] 的调用置位（赢家语义 ⇒ WARN 恰一次）；
+     * - 治理判定与累计归零是同一原子步（赢家语义 ⇒ hook 恰一次、增量不再被抹掉）。
+     *
+     * 返回的 [RssDecision] 携带归零前的读数，锁外只据它格式化日志、执行 hook。
+     */
+    internal fun applyAndDecideLocked(st: Stats, deltaKb: Long): RssDecision {
+        st.count += 1
+        st.totalDeltaKb += deltaKb
+        st.lastDeltaKb = deltaKb
+        if (deltaKb > st.peakDeltaKb) st.peakDeltaKb = deltaKb
+
+        // 归零前快照：观测日志、LEAK-SUSPECT、GOVERN 三处文案同源。
+        val totalAfterKb = st.totalDeltaKb
+        val countNow = st.count
+        val peakNow = st.peakDeltaKb
+
+        val warnLeak = !st.leaked && totalAfterKb >= LEAK_SUSPECT_KB
+        if (warnLeak) st.leaked = true
+
+        val governCumulative = totalAfterKb >= CUMULATIVE_GOVERN_KB
+        val govern = governCumulative || deltaKb >= PEAK_GOVERN_KB
+        if (govern) st.totalDeltaKb = 0L
+
+        return RssDecision(
+            totalDeltaKb = totalAfterKb,
+            count = countNow,
+            avgDeltaKb = if (countNow == 0) 0L else totalAfterKb / countNow,
+            peakDeltaKb = peakNow,
+            warnLeak = warnLeak,
+            govern = govern,
+            governCumulative = governCumulative,
+        )
     }
 
     /** 打印全量聚合汇总（压测结束 / 定时 dump 用）。返回汇总文本。 */
@@ -150,9 +207,15 @@ object OffloadRssProbe {
             Log.i(TAG, "[offload-rss] summary: (no offload handlers executed)")
             return "(no data)"
         }
+        // [fix/da1016-rssprobe-lock-scope] 锁内取一份快照（Stats.copy()），锁外
+        // 格式化：与并发 record 交错时每行读数自洽（cum/count/avg 同源），不再
+        // 打印撕裂读数、排序键也不再是撕裂值。
+        val snapshot = byHandler.entries.map { (name, st) ->
+            name to synchronized(st) { st.copy() }
+        }
         val sb = StringBuilder("offload-rss summary:\n")
-        byHandler.entries
-            .sortedByDescending { it.value.totalDeltaKb }
+        snapshot
+            .sortedByDescending { it.second.totalDeltaKb }
             .forEach { (name, st) ->
                 sb.append(
                     "  $name: cum=${st.totalDeltaKb / 1024}MB " +
