@@ -3,6 +3,7 @@ package com.rikkaminis.app.ui.chat
 import com.rikkaminis.app.agent.Level
 import com.rikkaminis.app.agent.ToolLoopDetector
 import com.rikkaminis.app.data.model.AgentContentPart
+import com.rikkaminis.app.data.model.AgentToolDefinition
 import com.rikkaminis.app.data.model.LLMModel
 import com.rikkaminis.app.provider.ToolJsonRepair
 import com.rikkaminis.app.service.SessionActivityTracker
@@ -100,6 +101,89 @@ internal const val TOOL_INPUT_CHUNK_RING_MAX = 10
  *  AgentRuntimeLimitsPrefs.transientRetryDelaysSec() (count-tunable, same
  *  1/2/4s cadence at the default 3); kept as the documented default. */
 internal val AUTO_RETRY_DELAYS_SEC = intArrayOf(1, 2, 4)
+
+/**
+ * [deep-audit-1016 6a] Re-derive a turn's request budget for the member that is
+ * about to serve it — the ONE definition of "what a provider switch does to the
+ * output budget and to the calibration".
+ *
+ * Why it must exist (field shape: HTTP 400 right after a fallback): a turn
+ * captures its budget ONCE, before the retry loop, from the member that serves
+ * the *first* attempt. Both fallback switches then replace
+ * `loopState.currentProvider` mid-turn and re-enter the retry loop, which
+ * re-uses that captured `maxTokens` — sized for the member we just left. A
+ * group whose first entry is a 64K-output model falling back to a 4K-output
+ * one therefore sent `max_tokens = 64000` to the 4K member, and the
+ * calibration sample was charged to the OLD member's per-(provider, model)
+ * key. [audit2 BUG-02] fixed exactly this for the turn-entry read; the two
+ * fallback switches are the same defect one level down (this audit's 6a).
+ *
+ * Pure by construction — every provider-dependent value is an argument, so the
+ * decision table is JVM-testable without an Android host
+ * (see `RequestBudgetRecomputeTest`).
+ */
+internal object RequestBudgetRecompute {
+
+    /** The recalculation for one provider: estimates + the output budget it implies. */
+    data class Result(
+        /** Provider-neutral estimate of the request input (before calibration). */
+        val rawEstimateTokens: Long,
+        /** [rawEstimateTokens] scaled by the provider's calibration coefficient. */
+        val calibratedEstimateTokens: Long,
+        val verdict: PreflightVerdict,
+        /** Output budget to send with the request. */
+        val maxTokens: Int,
+    )
+
+    /**
+     * @param messages the exact message list the request will carry.
+     * @param systemPrompt the same system prompt the request will carry.
+     * @param tools the same tool schemas the request will carry.
+     * @param calibrationRatioPercent the NEW provider's coefficient (100 = calibrated-equal).
+     * @param windowTokens the NEW provider's effective context window (0/negative = unknown).
+     * @param providerMaxTokens `dynamicMaxTokens(newProvider, …)` — what the member can emit.
+     * @param outputFloor minimum output budget (`MIN_MAX_TOKENS_CONST`).
+     */
+    fun forProvider(
+        messages: List<LLMMessage>,
+        systemPrompt: String?,
+        tools: List<AgentToolDefinition>,
+        calibrationRatioPercent: Long,
+        windowTokens: Int,
+        providerMaxTokens: Int,
+        outputFloor: Int,
+    ): Result {
+        val rawEstimate = ContextEstimator.estimateRequestTokens(
+            messages = messages,
+            systemPrompt = systemPrompt,
+            tools = tools,
+        )
+        val calibrated = rawEstimate * calibrationRatioPercent / 100
+        val verdict = preflightContextBudget(
+            window = windowTokens,
+            estimatedInput = calibrated,
+            requestedMaxTokens = providerMaxTokens,
+            outputFloor = outputFloor,
+        )
+        val maxTokens = when (verdict.decision) {
+            PreflightVerdict.Decision.PASS -> providerMaxTokens
+            PreflightVerdict.Decision.SHRINK_OUTPUT ->
+                verdict.suggestedMaxTokens ?: providerMaxTokens
+            // Mid-turn we do NOT re-run the offload → auto-compact → hard-trim
+            // pipeline (that is the turn entry's job and it needs the host).
+            // Floor the output instead — the same terminal answer the pipeline
+            // gives once the history has been shrunk as far as it goes; the
+            // next turn entry re-runs the full pipeline while still over.
+            PreflightVerdict.Decision.NEEDS_COMPACTION -> outputFloor
+        }
+        return Result(
+            rawEstimateTokens = rawEstimate,
+            calibratedEstimateTokens = calibrated,
+            verdict = verdict,
+            maxTokens = maxTokens,
+        )
+    }
+}
 
 internal class AgentLoopEngine(
     private val host: AgentLoopHost,
@@ -704,7 +788,7 @@ internal class AgentLoopEngine(
                     "window=${host.effectiveContextWindowTokens() ?: 0} " +
                     "providerEst=${loopState.lastContextTokens} calib=${calibrationRatioFor(loopState.currentProvider)}",
             )
-            val maxTokens = when (preflightVerdict.decision) {
+            var maxTokens = when (preflightVerdict.decision) {
                 PreflightVerdict.Decision.SHRINK_OUTPUT -> preflightVerdict.suggestedMaxTokens ?: preflightMaxTokens
                 PreflightVerdict.Decision.NEEDS_COMPACTION -> {
                     // 输入本身就装不下：先走既有的 offload → auto-compact →
@@ -753,6 +837,59 @@ internal class AgentLoopEngine(
                 }
                 PreflightVerdict.Decision.PASS -> preflightMaxTokens
             }
+
+            // [deep-audit-1016 6a] ONE definition, consumed by both fallback
+            // switches below. A switch replaces the member that serves the next
+            // attempt, so everything the preflight captured from the OLD member
+            // has to be re-derived from the NEW one: the calibration key (its
+            // per-(provider, model) coefficient) and the output budget
+            // (`dynamicMaxTokens` reads the member's own output ceiling and the
+            // now-updated window). Leaving `maxTokens` as captured is what sent
+            // a 64K `max_tokens` to a 4K-output fallback member (HTTP 400).
+            //
+            // `preflightMessages` is deliberately NOT re-derived here: the image
+            // budget is provider-independent and the var already holds the exact
+            // list the next attempt will carry (it is what the request site
+            // reads), so re-fetching the history mid-retry could only introduce
+            // a divergence between the estimate and the bytes on the wire.
+            fun rebudgetForSwitchedProvider(site: String) {
+                // The member we left reported ITS input口径; carrying that
+                // reading into the new member's window is the T321 shape. The
+                // turn-entry gate treats a reading whose source key does not
+                // match the current provider as unknown (0) — a mid-turn switch
+                // must do the same, and it must happen BEFORE dynamicMaxTokens
+                // sizes the output from it.
+                loopState.lastContextTokens = 0
+                host.setLastTurnContextTokens(0)
+                val rebudget = RequestBudgetRecompute.forProvider(
+                    messages = preflightMessages,
+                    systemPrompt = systemPrompt,
+                    tools = host.agentTools,
+                    calibrationRatioPercent = calibrationRatioFor(loopState.currentProvider),
+                    windowTokens = host.effectiveContextWindowTokens() ?: 0,
+                    providerMaxTokens = host.dynamicMaxTokens(
+                        loopState.currentProvider,
+                        loopState.lastContextTokens,
+                    ),
+                    outputFloor = MIN_MAX_TOKENS_CONST,
+                )
+                // Re-derived from the same message list, so it stays the
+                // invariant `rawEstimate ⇔ preflightMessages` the calibration
+                // backfill and the 400-teacher both read.
+                rawEstimate = rebudget.rawEstimateTokens
+                preflightEstimate = rebudget.calibratedEstimateTokens
+                maxTokens = rebudget.maxTokens
+                AppLogger.info(
+                    TAG_STREAM,
+                    "[Preflight] re-budget after provider switch ($site) turn=$turn " +
+                        "${rebudget.verdict.toLogLine()} " +
+                        "window=${host.effectiveContextWindowTokens() ?: 0} " +
+                        "providerEst=${loopState.lastContextTokens} " +
+                        "calib=${calibrationRatioFor(loopState.currentProvider)} " +
+                        "member=${loopState.currentProvider?.model?.id ?: "?"}",
+                )
+            }
+
             val toolCalls = mutableListOf<Triple<String, String, JSONObject>>() // id, name, args
 
             // [T-dedupe-toolcallid 03fbcbfd] Per-turn dedupe of tool_call_id.
@@ -1772,6 +1909,11 @@ internal class AgentLoopEngine(
                         // first delta coalesces against the failed attempt's
                         // clocks and the reply head stalls visibly.
                         resetStreamThrottle(loopState)
+                        // [deep-audit-1016 6a] The member that will serve the
+                        // next attempt is a different one — re-derive the
+                        // budget/calibration from IT before the retry loop
+                        // re-issues with the captured values.
+                        rebudgetForSwitchedProvider("error-fallback")
                         // loop continues — will retry collect with loopState.currentProvider
                     } else {
                         // All fallbacks exhausted. Surface the trail of tried
@@ -1852,15 +1994,38 @@ internal class AgentLoopEngine(
                 }
             }
 
+            // [deep-audit-1016 6b] A content-filter / safety-block finish with NO
+            // usable output is a member-level refusal, not a healthy serve — the
+            // branch further down consumes the fallback chain for it. Recording
+            // `Success` for it cleared that member's cooldown and closed its
+            // half-open circuit, i.e. it marked a REFUSING member healthy.
+            // `RouteOutcome` has no member for "the member refused this prompt"
+            // (Success / RateLimited / ServerError / AuthError are all transport
+            // or credential verdicts, see its KDoc: outcomes that should not
+            // affect a member's health are deliberately absent), so the correct
+            // record is none — the member keeps whatever health it had, and a
+            // later genuinely-served turn restores it as usual.
+            // One definition, two consumers: this health record and the fallback
+            // branch that acts on it. It reads the raw turn buffer, which is the
+            // value `turnTextRaw` takes a few lines below — nothing writes the
+            // buffer between the two points (only the streaming collect above
+            // does), so the two spellings can never disagree.
+            val blockedEmptyReply = toolCalls.isEmpty() &&
+                turnTextSb.isEmpty() &&
+                ContentFilterFinishPolicy.isBlockedFinish(turnFinishReason)
+
             // [T-recovery] The turn's stream completed without error — the
             // member that served it is healthy. Clears any prior cooldown /
             // circuit state (also closes a half-open circuit: a successful
             // probe restores the member).
             host.activeEntryId?.let { entryId ->
-                host.groupRouter.recordResult(
-                    entryId,
-                    com.rikkaminis.app.data.routing.RouteOutcome.Success,
-                )
+                // [deep-audit-1016 6b] …except a blocked-empty reply, as above.
+                if (!blockedEmptyReply) {
+                    host.groupRouter.recordResult(
+                        entryId,
+                        com.rikkaminis.app.data.routing.RouteOutcome.Success,
+                    )
+                }
             }
 
             // T307: materialise the per-turn StringBuilder ONCE at the
@@ -2082,9 +2247,7 @@ internal class AgentLoopEngine(
             //    continuing (mirrors the empty-after-toolresult retry path);
             //  - the loopExitedNormally flow below is skipped entirely via
             //    `continue`.
-            if (toolCalls.isEmpty() && turnTextRaw.isEmpty() &&
-                ContentFilterFinishPolicy.isBlockedFinish(turnFinishReason)
-            ) {
+            if (blockedEmptyReply) {
                 // [feat/content-filter-fallback] A content-filter / safety-
                 // block finish with NO usable output is a DETERMINISTIC
                 // member-level refusal: this member will answer the same way
@@ -2127,6 +2290,10 @@ internal class AgentLoopEngine(
                     // budget so the fallback member gets its own full
                     // transient-retry allowance.
                     retryAttempt = 0
+                    // [deep-audit-1016 6a] Same as the error-path fallback: the
+                    // next attempt is served by a different member, so the
+                    // captured budget/calibration must be re-derived from it.
+                    rebudgetForSwitchedProvider("content-filter-fallback")
                     // skip the rest of this turn's post-processing (history
                     // add / persist) — `continue` targets the OUTER for(turn)
                     // loop, same as the length-wall and EOF-stub branches.
