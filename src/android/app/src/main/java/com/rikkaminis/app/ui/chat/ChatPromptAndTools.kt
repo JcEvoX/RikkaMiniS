@@ -629,7 +629,18 @@ internal suspend fun ChatViewModel.executeShellCommand(
 ): ToolExecutionResult {
     // T7-A: 观察 —— shell 命令消耗 shell_commands 预算（advisory，不阻断）
     // T7-C: shell_commands 预算耗尽 → 不执行命令，返回明确错误
+    // [deep-audit-1016 5a] 与上方 tool_calls 门逐字段对称：预算耗尽不只是
+    // 返回一条错误 —— 还要钉住**终态**（t7BudgetStopReason）并让 reducer
+    // 离开运行态。只返回错误的话，耗尽的事实不进 trace、不进
+    // AgentLoopExitDecision：run 会被记成正常完成（SUCCEEDED/COMPLETED），
+    // 用户看到的是"答完了"而不是"撞了预算"，`launch-beacon`/审计也查不到
+    // 哪一维预算耗尽了。reason 串只被既有通用模板消费（
+    // `budget_exhausted($reason)` 的 trace 标签 + "an execution budget was
+    // exhausted ($reason)" 横幅），无 per-reason 文案，故不需要新增
+    // 字符串资源。
     if (!traceObserver.t7ConsumeAndTrace(AgentTraceRecorder.DIMENSION_SHELL_COMMANDS) { it.consumeShellCommand() }) {
+        traceObserver.t7BudgetStopReason = "shell_command_limit"
+        traceObserver.t7Reduce(AgentRunEvent.ProcessInterrupted("budget_exhausted(shell_commands)"))
         return ToolExecutionResult("Error: Agent budget exhausted (shell_commands)", false)
     }
     // T7-B: shell lease —— 执行期间占用 shell 资源，finally 无条件释放
