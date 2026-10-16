@@ -118,6 +118,67 @@ object ContextCompactor {
      * @param escalatedFromOffload 是否因 offload 欠交付而要求升级（唯一允许低于
      *   压缩线触发的例外）
      */
+    /**
+     * [fix/compact-pregate-exhausted-1016] 循环路径的前置门（纯判定，可单测）：
+     * 本轮压力档位 + offload 欠交付标志，是否允许调用方走到 [decide]。
+     *
+     * 这道门唯一的用途是把 [decide] 里 `estimateTailTokens` 那次 O(N) 历史遍历
+     * 从「无压力的常见回合」上摘掉，所以它必须对**所有 decide 会动手的档位**开口：
+     *  - `NEEDS_COMPACT` —— 压缩带内（1016 之前的唯一形态）；
+     *  - `EXHAUSTED` —— 天花板 / 小窗档 exhaust 线以上，正是 [decide] 回答
+     *    RESCUE（每用户动作周期一次）或 EXHAUSTED 停摆兜底的入口；
+     *  - `OK` 且 escalated —— [T-ctx-offload-escalation] 的压缩线以下例外。
+     *
+     * 开口不等于压缩：[decide] 自己重读 [ContextPolicy.check]，防抖/尾门/档位
+     * 契约全部照旧，因此放宽前置门不可能造出 decide 会拒绝的压缩。
+     *
+     * 发送入口（`maybeTriggerAutoCompact`）**刻意不走这道门**：那里的 EXHAUSTED
+     * 已由 checkContextBeforeSend 拦下发送，恢复动作归对话框（新会话 / 显式
+     * /compact），RESCUE 是长跑任务中途的可选项，不是发送前的可选项。
+     */
+    fun loopGateOpens(
+        verdict: ContextPolicy.CheckResult,
+        escalatedFromOffload: Boolean,
+    ): Boolean =
+        verdict == ContextPolicy.CheckResult.NEEDS_COMPACT ||
+            verdict == ContextPolicy.CheckResult.EXHAUSTED ||
+            escalatedFromOffload
+
+    /**
+     * [fix/compact-lastfailure-pin-1016] 候选链失败的**单步归约**（纯函数，可单测）。
+     *
+     * 链上的失败分两类：ContextTooLarge 分类的（唯一能让外层 catch 走二分拆解的
+     * 容量证据）与普通的（超时 / 5xx / unavailable / truncated）。归约规则：
+     *  - TooLarge → 钉住**第一个**出现的（容量证据的时序以首次为准，后续 TooLarge
+     *    不覆盖）；
+     *  - 普通失败 → 覆盖「最后一个普通失败」槽位（保持既有语义：链尾失败即终态）。
+     *
+     * 调用方在链尾用 [chainTerminalFailure] 取终态。把规则放在这里而不是散在
+     * 循环里，是因为「哪条失败被抛出去」决定了外层要不要二分拆解，必须单源且
+     * 可被 JVM 装置按失败序列直接验。
+     *
+     * @return (新的 lastOrdinary, 新的 pinnedTooLarge)
+     */
+    fun chainFailureAfter(
+        lastOrdinary: Exception,
+        pinnedTooLarge: Exception?,
+        candidate: Exception,
+        isTooLarge: (Throwable) -> Boolean,
+    ): Pair<Exception, Exception?> =
+        if (isTooLarge(candidate)) lastOrdinary to (pinnedTooLarge ?: candidate)
+        else candidate to pinnedTooLarge
+
+    /**
+     * [fix/compact-lastfailure-pin-1016] 链全败时的**终态选择**（纯函数）：
+     * 钉住的 TooLarge 优先于最后一个普通失败。
+     *
+     * 外层 catch 只按 `isContextTooLargeError` 判断要不要二分拆解；终态若被链尾
+     * 的普通失败（超时 / 5xx）冲掉，链上唯一的容量证据就丢了 —— 不拆解、不重试，
+     * 整条链以失败收场（真实日志：`[Compact] Splitting` 3 天 0 次触发）。
+     */
+    fun chainTerminalFailure(lastOrdinary: Exception, pinnedTooLarge: Exception?): Exception =
+        pinnedTooLarge ?: lastOrdinary
+
     fun decide(
         estimatedTokens: Int,
         contextWindow: Int,
@@ -163,9 +224,19 @@ object ContextCompactor {
         // （候选池耗尽，缺口是 offload 结构上够不到的对话文本），调用方显式
         // 要求升级——否则上下文会卡在 offload 线与压缩线之间的死区里空转，
         // 直到自然涨过压缩线。tail/debounce 闸门仍然生效，升级只放宽这一条。
-        if (!escalatedFromOffload &&
-            policy.check(estimatedTokens, contextWindow) != ContextPolicy.CheckResult.NEEDS_COMPACT
-        ) {
+        // [fix/compact-escalation-tier-contract-1016] 但「只放宽这一条」必须
+        // 真的只放宽 band 检查，不能顺手替档位造一条设计上不存在的压缩线：
+        // exhaustedOnly 档（compactThreshold = 0，ContextPolicy 文档原文
+        // "too small for auto-compact; only surface .exhausted"；本类
+        // reservedForGrowth 的小窗豁免用的就是这一对字段）里 check() 永远不会
+        // 回答 NEEDS_COMPACT，escalation 若继续放行就等于在小窗档自动压缩——
+        // 用真实类量过：window 50 000 / tokens 45 000 / escalated=true ->
+        // AUTO_COMPACT，而同一坐标 check()=EXHAUSTED。小窗档仍只允许 EXHAUSTED
+        // 语义，恢复动作归对话框（manualCompactAllowed）或新会话。
+        val bandReached =
+            policy.check(estimatedTokens, contextWindow) == ContextPolicy.CheckResult.NEEDS_COMPACT
+        val tierHasNoCompactLine = policy.compactThreshold <= 0 || policy.exhaustedOnly
+        if (!bandReached && (!escalatedFromOffload || tierHasNoCompactLine)) {
             return Decision.OK
         }
         // Guard against Long underflow: `lastAutoCompactAtMs` is
