@@ -45,6 +45,8 @@ REL = os.path.join(
 
 
 def strip_comments(text):
+    """Drop comment text but keep every newline, so line numbers still point at
+    the real file (a stripped block comment used to shift every later anchor)."""
     out = []
     i = 0
     while i < len(text):
@@ -55,6 +57,8 @@ def strip_comments(text):
         elif c == "/" and i + 1 < len(text) and text[i + 1] == "*":
             i += 2
             while i + 1 < len(text) and not (text[i] == "*" and text[i + 1] == "/"):
+                if text[i] == "\n":
+                    out.append("\n")
                 i += 1
             i += 2
         else:
@@ -122,52 +126,71 @@ def function_body(text, name):
     return None
 
 
+def line_of(src, needle):
+    """1-based line of the first occurrence of `needle`, 0 when absent."""
+    i = src.find(needle)
+    return src.count("\n", 0, i) + 1 if i >= 0 else 0
+
+
 def analyse(src):
-    """-> list of (criterion, ok, detail). One entry per criterion, always."""
+    """-> list of (criterion, ok, line, note).
+
+    `line` is the 1-based anchor line in the handler (0 = the anchor is gone,
+    which is reported as a FAIL rather than a skip; COMMON §4 wants violations
+    cited as file:line).
+    """
     results = []
     flags = re.search(r"val\s+NO_VALUE_FLAGS\s*=\s*setOf\(([^)]*)\)", src)
     names = set(re.findall(r'"([^"]+)"', flags.group(1))) if flags else set()
 
+    anchor = "OffloadArgs(rest, booleanFlags = NO_VALUE_FLAGS)"
     results.append((
         "1 parser receives declared switches",
-        re.search(r"OffloadArgs\(\s*rest\s*,\s*booleanFlags\s*=\s*NO_VALUE_FLAGS\s*\)", src) is not None,
-        "OffloadArgs(rest, booleanFlags = NO_VALUE_FLAGS)",
+        anchor in src,
+        line_of(src, anchor),
+        "expected `%s`" % anchor,
     ))
     results.append((
         "2 NO_VALUE_FLAGS covers switches, excludes value flags",
         flags is not None and {"block", "unblock"} <= names and "importance" not in names,
+        line_of(src, "val NO_VALUE_FLAGS"),
         "declared=%s" % (sorted(names) if flags else "MISSING"),
     ))
     body = function_body(src, "encodeInputText")
     results.append((
         "3 input text uses the platform %s escape",
         body is not None and '"%s"' in body and "replace(' ', '%')" not in body,
-        "helper " + ("missing" if body is None else "found"),
+        line_of(src, "internal fun encodeInputText("),
+        "helper " + ("missing" if body is None else "present, must emit \"%s\" and not a bare '%'"),
     ))
     cmd = function_body(src, "buildPackageClearCommand")
     results.append((
         "4 package clear is per-package (no global trim-caches stand-in)",
         cmd is not None and '--cache-only' in cmd and '"pm", "clear"' in cmd and "trim-caches" not in src,
-        "helper " + ("missing" if cmd is None else "found"),
+        line_of(src, 'val cmd = mutableListOf("pm", "clear")'), 
+        "helper " + ("missing" if cmd is None else "present") + ", trim-caches hits=%d" % src.count("trim-caches"),
     ))
     notify = function_body(src, "handleNotification") or ""
     results.append((
         "5 channel sub-command wired to parsed positionals",
         "notificationChannel(args.positional.drop(1), args)" in notify,
+        line_of(src, "notificationChannel("),
         "handleNotification body" if notify else "handleNotification MISSING",
     ))
     chan = function_body(src, "notificationChannel")
     results.append((
         "6 notificationChannel reads positionals, not raw argv",
         chan is not None and "pos.getOrNull(1)" in chan and "rest.getOrNull(" not in chan,
-        "helper " + ("missing" if chan is None else "found"),
+        line_of(src, "private fun notificationChannel("),
+        "helper " + ("missing" if chan is None else "present"),
     ))
     clear = function_body(src, "packageClear")
     results.append((
         "7 package clear payload reports the scope it actually cleared",
         clear is not None and "clearScope(cacheOnly)" in clear
         and "buildPackageClearCommand(" in clear,
-        "helper " + ("missing" if clear is None else "found"),
+        line_of(src, "private fun packageClear("),
+        "helper " + ("missing" if clear is None else "present"),
     ))
     return results
 
@@ -240,14 +263,14 @@ def selftest():
     print("── selftest: compliant fixture must be green, each breaker must go red ──")
     base = analyse(strip_comments(COMPLIANT))
     failures = []
-    greens = [c for c, ok, _ in base if ok]
-    if len(greens) != len(base):
-        failures.append("compliant fixture is not green: %s" % [c for c, ok, _ in base if not ok])
-        print("  [FAIL] compliant fixture red on: %s" % [c for c, ok, _ in base if not ok])
+    reds0 = [c for c, ok, _, _ in base if not ok]
+    if reds0:
+        failures.append("compliant fixture is not green: %s" % reds0)
+        print("  [FAIL] compliant fixture red on: %s" % reds0)
     else:
         print("  [OK] compliant fixture green on all %d criteria" % len(base))
 
-    names = [c for c, _, _ in base]
+    names = [c for c, _, _, _ in base]
     for idx, (old, new) in BREAKERS.items():
         if old not in COMPLIANT:
             failures.append("breaker %d cannot apply (fixture text moved)" % idx)
@@ -255,7 +278,7 @@ def selftest():
             continue
         mutated = strip_comments(COMPLIANT.replace(old, new, 1))
         res = analyse(mutated)
-        red = [c for c, ok, _ in res if not ok]
+        red = [c for c, ok, _, _ in res if not ok]
         target = names[idx - 1]
         if target not in red:
             failures.append("breaker %d did not turn %r red (red=%s)" % (idx, target, red))
@@ -284,15 +307,16 @@ def main():
     with open(path, encoding="utf-8") as f:
         results = analyse(strip_comments(f.read()))
     bad = []
-    for crit, ok, detail in results:
-        print("  [%s] %s  (%s)" % ("OK" if ok else "FAIL", crit, detail))
+    for crit, ok, line, note in results:
+        where = "%s:%d" % (REL.replace(os.sep, "/"), line) if line else "%s:<anchor missing>" % REL
+        print("  [%s] %s  (%s) @ %s" % ("OK" if ok else "FAIL", crit, note, where))
         if not ok:
-            bad.append(crit)
+            bad.append((crit, where))
     print("")
     if bad:
         print("❌ shizuku_args_check findings (%d):" % len(bad))
-        for b in bad:
-            print("   - %s" % b)
+        for crit, where in bad:
+            print("   - %s:%s" % (where, crit))
         return 1
     print("✅ android-shizuku-cli argument handling: argv parsing + call sites verified")
     return 0
