@@ -13,6 +13,11 @@ import java.io.RandomAccessFile
  *     is consumed in bounded windows, never pulled whole into memory.
  *   - a single line longer than [maxLineBytes] is reported as
  *     [ReadResult.OversizedLine] and dropped, never ballooned in memory.
+ *     A window that contains newlines can still hold an oversized line
+ *     ([maxReadBytes] may exceed [maxLineBytes]); such a line is dropped and
+ *     reported via [ReadResult.Lines.oversizedLines] while the well-formed
+ *     lines around it are still returned — a neighbor's bulk must not cost
+ *     the agent its good frames.
  *   - an unterminated trailing line is NOT consumed: the caller keeps the
  *     returned `newOffset` and simply re-polls from there, so the partial
  *     tail is re-read together with whatever the producer appends — a chunk
@@ -33,11 +38,21 @@ class BoundedLineReader(
 
     sealed class ReadResult {
         /** Complete newline-terminated lines, and the new byte offset (just past
-         *  the last consumed newline). */
-        data class Lines(val lines: List<String>, val newOffset: Long) : ReadResult()
+         *  the last consumed newline). [oversizedLines] lists the lines in this
+         *  window whose content exceeded [maxLineBytes]: they were dropped by
+         *  the reader (never decoded) and are already skipped by [newOffset] —
+         *  the caller only needs to report them, not to advance past them. */
+        data class Lines(
+            val lines: List<String>,
+            val newOffset: Long,
+            val oversizedLines: List<OversizedLine> = emptyList(),
+        ) : ReadResult()
 
         /** A single unterminated line grew past [maxLineBytes] in this window; it
-         *  was dropped. [lineStartOffset] is where the oversized line began. */
+         *  was dropped. [lineStartOffset] is where the oversized line began.
+         *  (Oversized lines found INSIDE a newline-containing window are reported
+         *  through [Lines.oversizedLines] instead, so the window's well-formed
+         *  lines are not lost.) */
         data class OversizedLine(val lineStartOffset: Long, val lineByteLength: Long) : ReadResult()
 
         /** No complete new line available yet (only a partial trail, or nothing new). */
@@ -92,14 +107,65 @@ class BoundedLineReader(
         // Complete region is [0, lastNl); the trailing partial tail is [lastNl+1, got)
         // and is intentionally NOT consumed — the caller re-reads it next poll.
         val newOffset = offset + lastNl + 1
-        val lines = decodeLines(consumed.copyOfRange(0, lastNl))
-        return ReadResult.Lines(lines, newOffset)
+        // [deep-audit-1018 ISSUE-06] maxReadBytes (1 MiB by default) is larger
+        // than maxLineBytes (256 KiB), so a window CAN hold a complete line that
+        // is itself oversized. Enforce the cap per line here too — otherwise the
+        // oversized line is decoded whole and returned, breaking the class KDoc
+        // ("never ballooned") while its neighbours are perfectly good frames.
+        val decoded = decodeLinesBounded(consumed, lastNl, offset)
+        return ReadResult.Lines(decoded.first, newOffset, decoded.second)
     }
 
-    private fun decodeLines(bytes: ByteArray): List<String> {
-        if (bytes.isEmpty()) return emptyList()
-        val text = String(bytes, Charsets.UTF_8)
-        val lines = text.split('\n')
-        return lines.map { if (it.endsWith('\r')) it.dropLast(1) else it }
+    /**
+     * Split the complete region `[0, regionEnd)` into decoded lines, dropping
+     * (without decoding) any line whose content exceeds [maxLineBytes].
+     *
+     * Byte-level scanning is UTF-8 safe: `'\n'` (0x0A) never occurs inside a
+     * multi-byte sequence. The compared length excludes the terminating `'\n'`
+     * (matching the no-newline branch, which compares the raw byte count) but
+     * includes a trailing `'\r'`.
+     *
+     * Returns the decoded lines (in order, with the oversized ones omitted) and
+     * the [ReadResult.OversizedLine] reports for the dropped ones.
+     */
+    private fun decodeLinesBounded(
+        consumed: ByteArray,
+        regionEnd: Int,
+        windowOffset: Long,
+    ): Pair<List<String>, List<ReadResult.OversizedLine>> {
+        if (regionEnd <= 0) return emptyList<String>() to emptyList()
+        val lines = ArrayList<String>()
+        val oversized = ArrayList<ReadResult.OversizedLine>()
+        var lineStart = 0
+        var i = 0
+        while (i < regionEnd) {
+            if (consumed[i] == '\n'.code.toByte()) {
+                appendDecodedLine(consumed, lineStart, i, windowOffset, lines, oversized)
+                lineStart = i + 1
+            }
+            i++
+        }
+        // Trailing segment. When the region itself ends with '\n' (an empty line
+        // before the final terminator) this appends "" — same as the split('\n')
+        // this replaces.
+        appendDecodedLine(consumed, lineStart, regionEnd, windowOffset, lines, oversized)
+        return lines to oversized
+    }
+
+    private fun appendDecodedLine(
+        consumed: ByteArray,
+        start: Int,
+        end: Int,
+        windowOffset: Long,
+        lines: MutableList<String>,
+        oversized: MutableList<ReadResult.OversizedLine>,
+    ) {
+        val contentLen = end - start
+        if (contentLen > maxLineBytes) {
+            oversized.add(ReadResult.OversizedLine(windowOffset + start, contentLen.toLong()))
+            return
+        }
+        val text = String(consumed, start, contentLen, Charsets.UTF_8)
+        lines.add(if (text.endsWith('\r')) text.dropLast(1) else text)
     }
 }
