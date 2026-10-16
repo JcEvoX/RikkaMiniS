@@ -2025,6 +2025,186 @@ def test_readonly_mount_write_guard():
     check("an unguarded --output write site is caught (exit 1)", code == 1, f"exit={code}\n{out}")
     check("the finding names the function and the missing call",
           "runA(" in out and "isLinuxPathUnderReadOnlyMount" in out, out)
+def exec_gate_fixture(shape="good"):
+    """Minimal repo tree for exec_gate_release_check.
+
+    The fixture is the criterion written out: two interruptible wrappers, the
+    rollback helper, the dispatch wrapper and the calibrated settle. Each dirty
+    shape breaks exactly one of those, so a gate that stops seeing that shape
+    fails here instead of failing silently in CI.
+    """
+    TARGET = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/ExecutionCoordinator.kt"
+
+    heavy_wrapper = (
+        "internal suspend fun awaitHeavyGatePermitInterruptibly(\n"
+        "    heavyGate: Semaphore,\n"
+        "    timeoutMs: Long,\n"
+        "): Boolean = runInterruptible(Dispatchers.IO) {\n"
+        "    heavyGate.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS)\n"
+        "}\n"
+    )
+    if shape == "no_interruptible":
+        # 4b regression: the wait is blocking again, so a cancelled coroutine
+        # stays parked for the whole timeout.
+        heavy_wrapper = heavy_wrapper.replace(
+            "): Boolean = runInterruptible(Dispatchers.IO) {\n"
+            "    heavyGate.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS)\n"
+            "}\n",
+            "): Boolean = heavyGate.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS)\n",
+        )
+
+    rollback_body = (
+        "    return try {\n"
+        "        globalConcurrency.tryAcquire(1, TimeUnit.SECONDS)\n"
+        "    } catch (t: Throwable) {\n"
+        "        if (heavyGateHeld) heavyGate.release()\n"
+        "        throw t\n"
+        "    }\n"
+    )
+    if shape == "no_rollback":
+        # 4a regression: an interrupt while waiting for the global slot now
+        # escapes holding the one heavy permit.
+        rollback_body = rollback_body.replace(
+            "        if (heavyGateHeld) heavyGate.release()\n", "")
+
+    dispatch_body = (
+        "        when (recycleDispatchMode(isOnMainThread = "
+        "Looper.myLooper() == Looper.getMainLooper())) {\n"
+        "            RecycleDispatch.DEFERRED -> "
+        "recoveryScope.launch { postRecycleMemoryRecoveryNow() }\n"
+        "            RecycleDispatch.INLINE -> postRecycleMemoryRecoveryNow()\n"
+        "        }\n"
+    )
+    if shape == "no_dispatch":
+        # 4c regression: back to running the GC loop inline on the caller thread.
+        dispatch_body = "        postRecycleMemoryRecoveryNow()\n"
+
+    settle = "        Thread.sleep(120)\n"
+    if shape == "no_settle":
+        settle = "        Thread.sleep(1)\n"
+
+    extra_acquire = ""
+    if shape == "bare_acquire":
+        # A raw blocking acquire reappearing in the command path.
+        extra_acquire = (
+            "\n    private fun execute(globalConcurrency: Semaphore) {\n"
+            "        globalConcurrency.tryAcquire(60, TimeUnit.SECONDS)\n"
+            "    }\n"
+        )
+
+    command_path = (
+        "\n    private suspend fun executeCommand(\n"
+        "        globalConcurrency: Semaphore,\n"
+        "        heavyGate: Semaphore,\n"
+        "    ) {\n"
+        "        val heavyHeld = awaitHeavyGatePermitInterruptibly(heavyGate, 1000L)\n"
+        "        awaitGlobalShellSlotInterruptibly(globalConcurrency, heavyGate, heavyHeld)\n"
+        "    }\n"
+    )
+    if shape == "unwired":
+        # G3b regression: the command path goes back to the raw helper, leaving
+        # the wrapper behind as dead code that still passes every JVM arm —
+        # invisible in a diff, only countable.
+        command_path = command_path.replace(
+            "        awaitGlobalShellSlotInterruptibly(globalConcurrency, heavyGate, heavyHeld)\n",
+            "        internalAcquireGlobalShellSlot(globalConcurrency, heavyGate, heavyHeld)\n",
+        )
+
+    content = (
+        "package com.rikkaminis.app.sandbox\n"
+        "\n"
+        "import java.util.concurrent.Semaphore\n"
+        "import java.util.concurrent.TimeUnit\n"
+        "\n"
+        + heavy_wrapper +
+        "\n"
+        "internal suspend fun awaitGlobalShellSlotInterruptibly(\n"
+        "    globalConcurrency: Semaphore,\n"
+        "    heavyGate: Semaphore,\n"
+        "    heavyGateHeld: Boolean,\n"
+        "): Boolean = runInterruptible(Dispatchers.IO) {\n"
+        "    internalAcquireGlobalShellSlot(globalConcurrency, heavyGate, heavyGateHeld)\n"
+        "}\n"
+        "\n"
+        "internal fun internalAcquireGlobalShellSlot(\n"
+        "    globalConcurrency: Semaphore,\n"
+        "    heavyGate: Semaphore,\n"
+        "    heavyGateHeld: Boolean,\n"
+        "): Boolean {\n"
+        + rollback_body +
+        "}\n"
+        "\n"
+        "internal enum class RecycleDispatch { INLINE, DEFERRED }\n"
+        "\n"
+        "internal fun recycleDispatchMode(isOnMainThread: Boolean): RecycleDispatch =\n"
+        "    if (isOnMainThread) RecycleDispatch.DEFERRED else RecycleDispatch.INLINE\n"
+        "\n"
+        "object ExecutionCoordinator {\n"
+        + extra_acquire
+        + command_path +
+        "\n    private fun postRecycleMemoryRecovery() {\n"
+        + dispatch_body +
+        "    }\n"
+        "\n    private fun postRecycleMemoryRecoveryNow() {\n"
+        + settle +
+        "    }\n"
+        "}\n"
+    )
+    if shape == "missing_file":
+        return {}
+    return {TARGET: content}
+
+
+def test_exec_gate():
+    print("━━━ exec_gate_release_check ━━━")
+
+    root = make_tree(exec_gate_fixture("good"))
+    code, out = run_scanner("exec_gate_release_check.py", root)
+    check("clean tree exits 0", code == 0, f"exit={code}\n{out}")
+    shutil.rmtree(root)
+
+    root = make_tree(exec_gate_fixture("bare_acquire"))
+    code, out = run_scanner("exec_gate_release_check.py", root)
+    check("raw blocking acquire caught",
+          code == 1 and "raw blocking acquire" in out, f"exit={code}\n{out}")
+    shutil.rmtree(root)
+
+    root = make_tree(exec_gate_fixture("no_interruptible"))
+    code, out = run_scanner("exec_gate_release_check.py", root)
+    check("unwrapped heavy wait caught",
+          code == 1 and "not interruptible" in out, f"exit={code}\n{out}")
+    shutil.rmtree(root)
+
+    root = make_tree(exec_gate_fixture("no_rollback"))
+    code, out = run_scanner("exec_gate_release_check.py", root)
+    check("missing heavy-permit rollback caught",
+          code == 1 and "rollback missing" in out, f"exit={code}\n{out}")
+    shutil.rmtree(root)
+
+    root = make_tree(exec_gate_fixture("no_dispatch"))
+    code, out = run_scanner("exec_gate_release_check.py", root)
+    check("inline main-thread recovery caught",
+          code == 1 and "main-thread recovery dispatch missing" in out,
+          f"exit={code}\n{out}")
+    shutil.rmtree(root)
+
+    root = make_tree(exec_gate_fixture("no_settle"))
+    code, out = run_scanner("exec_gate_release_check.py", root)
+    check("changed settle caught",
+          code == 1 and "calibrated settle changed" in out, f"exit={code}\n{out}")
+    shutil.rmtree(root)
+
+    root = make_tree(exec_gate_fixture("unwired"))
+    code, out = run_scanner("exec_gate_release_check.py", root)
+    check("unwired command path caught (wrapper left as dead code)",
+          code == 1 and "wrapper wiring changed" in out, f"exit={code}\n{out}")
+    shutil.rmtree(root)
+
+    # Rot guard: no target file at all must FAIL, not pass vacuously.
+    root = make_tree(exec_gate_fixture("missing_file"))
+    code, out = run_scanner("exec_gate_release_check.py", root)
+    check("missing target file fails instead of passing silently",
+          code == 1 and "anchor lost" in out, f"exit={code}\n{out}")
     shutil.rmtree(root)
 
 
@@ -2049,6 +2229,7 @@ def test_real_repo():
         "budget_stop_break_guard.py",
         "katex_bridge_arity_check.py",
         "readonly_mount_write_guard.py",
+        "exec_gate_release_check.py",
     ):
         code, out = run_scanner(script, REPO_ROOT)
         check(f"{script} on real repo exits 0", code == 0, f"exit={code}\n{out[:2000]}")
@@ -2262,6 +2443,7 @@ def main():
     test_katex_bridge_arity()
     test_gemini_base_version()
     test_readonly_mount_write_guard()
+    test_exec_gate()
     test_real_repo()
     print("")
     print(f"{'❌ FAILURES: ' + str(FAIL) if FAIL else '✅ ALL ' + str(PASS) + ' CASES PASS'}")
