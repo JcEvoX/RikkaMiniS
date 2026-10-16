@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.app.ActivityManager
 import android.content.Context
 import android.os.Debug
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import com.rikkaminis.app.agent.runtime.CommandFailureKind
@@ -19,6 +20,11 @@ import com.rikkaminis.app.sandbox.offload.ChatStreamOffloadHandler
 import com.rikkaminis.app.sandbox.offload.ModelExecutionMailbox
 import com.rikkaminis.app.service.MemoryPressureGate
 import com.rikkaminis.app.service.MemoryPressureLevel
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runInterruptible
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.io.File
@@ -393,8 +399,15 @@ object ExecutionCoordinator {
         // globalConcurrency（锁序一致无死锁）。等待超时（10min）说明另一
         // heavy 还在跑——排队而非并发叠加，防止多会话大任务把 memcg 推爆。
         val heavyGateTimeoutMs = AgentRuntimeLimitsPrefs.heavyGateTimeoutSec() * 1000L
+        // [deep-audit-1016 FIX-D 4b] The wait must be interruptible — see
+        // [awaitHeavyGatePermitInterruptibly]. A cancel that lands while a HEAVY
+        // command is queued behind another HEAVY one (a wait of up to 10
+        // minutes) used to leave the thread parked inside `Semaphore.tryAcquire`
+        // with no suspension point: the coroutine went Cancelling, the shell
+        // stayed reserved, and the session's next command reported "System busy"
+        // until the timeout expired.
         val heavyGateAcquired = cmdClass == CommandClass.HEAVY &&
-            heavyGate.tryAcquire(heavyGateTimeoutMs, TimeUnit.MILLISECONDS)
+            awaitHeavyGatePermitInterruptibly(heavyGate, heavyGateTimeoutMs)
         if (cmdClass == CommandClass.HEAVY && !heavyGateAcquired) {
             Log.w(TAG, "[$sessionId] Heavy gate timeout after ${heavyGateTimeoutMs}ms — another heavy command still running")
             postRecycleMemoryRecovery()
@@ -409,10 +422,26 @@ object ExecutionCoordinator {
         // slots are occupied by other sessions, wait up to 60s before
         // giving up — this prevents a third concurrent session from
         // pushing the combined memory footprint past Scudo's limit.
-        val acquired = globalConcurrency.tryAcquire(60, TimeUnit.SECONDS)
+        //
+        // [deep-audit-1016 FIX-D 4a+4b] Same interruptible wait, PLUS the
+        // reason it is not a bare `tryAcquire` any more: this call sits between
+        // the heavyGate acquisition and the `try` whose `finally` releases it,
+        // so with the wait now interruptible an interrupt here would throw out
+        // of `execute` while still holding the ONE heavy permit — and a leaked
+        // heavy permit queues every HEAVY command in the process for the rest of
+        // its life. [awaitGlobalShellSlotInterruptibly] →
+        // [internalAcquireGlobalShellSlot] is the single place that can throw
+        // from inside that window, and it hands the permit back before
+        // rethrowing.
+        val acquired =
+            awaitGlobalShellSlotInterruptibly(
+                globalConcurrency = globalConcurrency,
+                heavyGate = heavyGate,
+                heavyGateHeld = heavyGateAcquired,
+            )
         if (!acquired) {
             if (heavyGateAcquired) heavyGate.release()
-            Log.w(TAG, "[$sessionId] Global concurrency slot timeout after 60s — rejecting command")
+            Log.w(TAG, "[$sessionId] Global concurrency slot timeout after ${GLOBAL_SHELL_SLOT_TIMEOUT_SEC}s — rejecting command")
             postRecycleMemoryRecovery()
             return CommandResult(
                 "[System busy: too many concurrent sessions (limit $maxConcurrentShells). " +
@@ -959,6 +988,43 @@ object ExecutionCoordinator {
     }
 
     /**
+     * [deep-audit-1016 FIX-D 4c] App-scoped IO scope for reclaim work that a
+     * main-thread caller must not run inline. Process-lifetime by design (this
+     * object is a singleton): the recovery is best-effort cleanup, never tied
+     * to a lifecycle that can be cancelled out from under it — which is also
+     * why nothing here checks `isActive` before launching.
+     */
+    private val recoveryScope: CoroutineScope by lazy { CoroutineScope(SupervisorJob() + Dispatchers.IO) }
+
+    /**
+     * [P2-app-native-oom] Post-recycle memory recovery, dispatched by caller
+     * thread.
+     *
+     * Background callers (the whole command path: the pre-exec rejection
+     * branches and [sessionDidTerminate] reached from the agent loop) keep the
+     * SYNCHRONOUS contract — the pre-exec rejection paths deliberately GC
+     * before returning so the caller's retry starts from a lower baseline.
+     *
+     * [deep-audit-1016 FIX-D 4c] Main-thread callers DEFER instead. They are
+     * real: Compose calls `promoteDraftIfNeeded()` (ChatScreen), which launches
+     * `ensureSession()` on viewModelScope (Dispatchers.Main.immediate), which
+     * calls `migrateDraftResources` → `ExecutionCoordinator.sessionDidTerminate`
+     * → here — so the first message in a NEW chat used to run up to three
+     * `System.gc()` rounds with a 120ms settle each on the UI thread, and
+     * `ViewModel.onCleared()` (also main) did the same on every chat screen
+     * close. Nothing on those paths consumes the synchronous side effect: the
+     * call sites discard the result (migrateDraftResources wraps it in
+     * runCatching) or are teardown.
+     */
+    private fun postRecycleMemoryRecovery() {
+        if (!::appContext.isInitialized) return
+        when (recycleDispatchMode(isOnMainThread = Looper.myLooper() == Looper.getMainLooper())) {
+            RecycleDispatch.DEFERRED -> recoveryScope.launch { postRecycleMemoryRecoveryNow() }
+            RecycleDispatch.INLINE -> postRecycleMemoryRecoveryNow()
+        }
+    }
+
+    /**
      * [P2-app-native-oom] Trigger garbage collection and log the memory
      * released. The 2026-08-12 crash showed that recycling the PRoot shell
      * alone does NOT release the app process's own native heap (the actual
@@ -978,8 +1044,7 @@ object ExecutionCoordinator {
      * This directly addresses the "Post-recycle GC freed 0MB — session locked
      * forever" failure mode (2026-08-12, 5.5GB app native heap).
      */
-    private fun postRecycleMemoryRecovery() {
-        if (!::appContext.isInitialized) return
+    private fun postRecycleMemoryRecoveryNow() {
         try {
             val runtime = Runtime.getRuntime()
             val startingNative = Debug.getNativeHeapAllocatedSize() / (1024L * 1024L)
@@ -1884,4 +1949,104 @@ internal fun shouldContinueNativeReclaim(
     lockedFloorMb: Long,
 ): Boolean {
     return roundsUsed < maxRounds && nativeNowMb >= lockedFloorMb
+}
+
+// [deep-audit-1016 FIX-D 4a] How long a command waits for a global shell slot
+// before the "System busy" rejection. Named (it used to be a bare `60` in the
+// acquire call AND in the log line next to it — the two could drift apart, and
+// the log is what a user report gets triaged against). Value unchanged.
+private const val GLOBAL_SHELL_SLOT_TIMEOUT_SEC = 60L
+
+/**
+ * [deep-audit-1016 FIX-D 4a] Take the global shell slot, and on ANY failure
+ * hand back the heavy permit the caller may already be holding.
+ *
+ * Why this exists as its own function: it is the only statement in `execute`
+ * that can throw between acquiring the one global heavy permit (`heavyGate`,
+ * `Semaphore(1, true)`) and entering the `try` whose `finally` releases it.
+ * With 4b wrapping this wait in `runInterruptible`, an interrupt (user cancel)
+ * on exactly this line would otherwise throw out of `execute` still holding the
+ * permit — and a leaked heavy permit queues EVERY heavy command in the process
+ * until it dies. Before 4b there was no interrupt source, so the window was
+ * unreachable; the two halves ship together on purpose.
+ *
+ * Contract:
+ *  - returns true  → the global slot is held; the caller still holds the heavy
+ *                    permit (`heavyGateHeld`) and must release both.
+ *  - returns false → plain timeout, nothing acquired. The heavy permit is left
+ *                    to the caller (see the `if (!acquired)` branch), which
+ *                    releases it before returning the "System busy" result.
+ *  - throws        → the heavy permit has ALREADY been released; the caller
+ *                    holds nothing and must not release again.
+ *
+ * Blocking by design: the caller runs it inside `runInterruptible(Dispatchers.IO)`
+ * so a cancel interrupts the waiting thread. JVM-testable — plain
+ * `java.util.concurrent.Semaphore`, no Android, no coroutines.
+ */
+internal fun internalAcquireGlobalShellSlot(
+    globalConcurrency: Semaphore,
+    heavyGate: Semaphore,
+    heavyGateHeld: Boolean,
+    timeoutSec: Long = GLOBAL_SHELL_SLOT_TIMEOUT_SEC,
+): Boolean {
+    return try {
+        globalConcurrency.tryAcquire(timeoutSec, TimeUnit.SECONDS)
+    } catch (t: Throwable) {
+        // Interrupted while waiting (coroutine cancel) or any other throw:
+        // give the heavy permit back before propagating, or this process never
+        // runs another HEAVY command.
+        if (heavyGateHeld) heavyGate.release()
+        throw t
+    }
+}
+
+/** [deep-audit-1016 FIX-D 4c] Where a recovery call should run. */
+internal enum class RecycleDispatch { INLINE, DEFERRED }
+
+/**
+ * [deep-audit-1016 FIX-D 4c] The main-thread decision, split out so the
+ * "who runs the GC loop" question is testable without an Android runtime.
+ * `DEFERRED` = hand it to `recoveryScope`; `INLINE` = run it here (a blocking
+ * GC loop is fine — and for the pre-exec rejection paths, required — on a
+ * background thread).
+ */
+internal fun recycleDispatchMode(isOnMainThread: Boolean): RecycleDispatch =
+    if (isOnMainThread) RecycleDispatch.DEFERRED else RecycleDispatch.INLINE
+
+/**
+ * [deep-audit-1016 FIX-D 4b] Wait for the heavy serialization gate in a way a
+ * cancelled coroutine can actually break out of.
+ *
+ * `Semaphore.tryAcquire` is a blocking JUC call with no suspension point, so a
+ * coroutine cancelled while parked in it stayed parked (the shell stayed
+ * reserved behind it). `runInterruptible` interrupts the worker thread when the
+ * coroutine is cancelled, `tryAcquire` throws `InterruptedException`, and that
+ * surfaces as the cancellation the caller already handles.
+ *
+ * No permit is held when this throws (the interrupt lands while waiting, before
+ * the semaphore hands anything over), so there is nothing to hand back here —
+ * unlike [awaitGlobalShellSlotInterruptibly], which runs while a permit IS held.
+ */
+internal suspend fun awaitHeavyGatePermitInterruptibly(
+    heavyGate: Semaphore,
+    timeoutMs: Long,
+): Boolean = runInterruptible(Dispatchers.IO) {
+    heavyGate.tryAcquire(timeoutMs, TimeUnit.MILLISECONDS)
+}
+
+/**
+ * [deep-audit-1016 FIX-D 4b] Interruptible wait for a global shell slot.
+ *
+ * The body is [internalAcquireGlobalShellSlot] so the rollback of an already
+ * held heavy permit is part of the same (directly JVM-testable) function that
+ * runs inside the interruptible block — cancellation can land on any line of
+ * it, and the permit must come back on all of them.
+ */
+internal suspend fun awaitGlobalShellSlotInterruptibly(
+    globalConcurrency: Semaphore,
+    heavyGate: Semaphore,
+    heavyGateHeld: Boolean,
+    timeoutSec: Long = GLOBAL_SHELL_SLOT_TIMEOUT_SEC,
+): Boolean = runInterruptible(Dispatchers.IO) {
+    internalAcquireGlobalShellSlot(globalConcurrency, heavyGate, heavyGateHeld, timeoutSec)
 }
