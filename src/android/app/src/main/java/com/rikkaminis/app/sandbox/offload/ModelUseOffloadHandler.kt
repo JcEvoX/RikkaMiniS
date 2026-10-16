@@ -573,17 +573,6 @@ class ModelUseOffloadHandler(
 
     // MARK: - Call feedback [T-model-use-passthrough-warnings]
 
-    /** Human-readable JSON type name for warning messages. Mirrors iOS jsonTypeName. */
-    private fun jsonTypeName(v: Any?): String = when (v) {
-        null, JSONObject.NULL -> "null"
-        is String -> "string"
-        is Boolean -> "bool"
-        is Number -> "number"
-        is JSONArray -> "array"
-        is JSONObject -> "object"
-        else -> v.javaClass.simpleName
-    }
-
     /**
      * Append collected `warnings` and `applied_extras` to a result's JSON body.
      * Both are omitted when empty (no noise on clean calls); warnings are
@@ -631,35 +620,16 @@ class ModelUseOffloadHandler(
     private fun parseChatExtraBody(inputJson: String, warnings: MutableList<String>): Map<String, Any?> =
         ModelUseProtocol.parseChatExtraBody(inputJson, warnings)
 
-    /** Standard-mode `extra_headers` (string map). */
-    private fun parseExtraHeaders(inputJson: String, warnings: MutableList<String>): Map<String, String> {
-        val obj = try {
-            val t = inputJson.trim()
-            if (t.startsWith("{")) JSONObject(t) else null
-        } catch (_: Throwable) { null } ?: return emptyMap()
-        val raw = obj.opt("extra_headers")?.takeIf { it != JSONObject.NULL } ?: return emptyMap()
-        val hdrs = raw as? JSONObject
-        if (hdrs == null) {
-            warnings.add(
-                "extra_headers is not a JSON object (actual type: ${jsonTypeName(raw)}) — " +
-                    "all custom headers were ignored.",
-            )
-            return emptyMap()
-        }
-        val out = LinkedHashMap<String, String>()
-        for (key in hdrs.keys()) {
-            val v = hdrs.opt(key)
-            if (v is String) {
-                out[key] = v
-            } else {
-                warnings.add(
-                    "extra_headers.$key value is not a string (actual type: ${jsonTypeName(v)}) — " +
-                        "this header was ignored. Header values must be JSON strings.",
-                )
-            }
-        }
-        return out
-    }
+    /**
+     * Standard-mode `extra_headers` (string map).
+     *
+     * [da1019 ISSUE-01] Delegates to the single shared dialect in
+     * [ModelUseProtocol]; the per-process copy here and the one in
+     * `ModelExecutionService` had drifted (the worker dropped a non-object
+     * `extra_headers` without a warning while this side warned).
+     */
+    private fun parseExtraHeaders(inputJson: String, warnings: MutableList<String>): Map<String, String> =
+        ModelUseProtocol.parseExtraHeaders(inputJson, warnings)
 
     /**
      * Parse a CUSTOM absolute endpoint path from top-level `endpoint` /
@@ -667,19 +637,12 @@ class ModelUseOffloadHandler(
      * replacing the entire URL path after scheme+host. Symbolic values
      * (auto/images-gen/chat) return null. Mirrors iOS parseCustomEndpointPath.
      *
-     * Note: on Android these arrive inside the input JSON (not as translated
-     * argv), so unlike iOS there is no rootfs-dataPath prefix to strip — the
-     * value is used verbatim.
+     * [da1019 ISSUE-01] Delegates to [ModelUseProtocol] — the worker's copy of
+     * this parser required nothing of the value, so it accepted a symbolic
+     * endpoint mode as a path.
      */
-    private fun parseCustomEndpointPath(inputJson: String): String? {
-        val obj = try {
-            val t = inputJson.trim()
-            if (t.startsWith("{")) JSONObject(t) else null
-        } catch (_: Throwable) { null } ?: return null
-        val raw = obj.safeOptString("image_endpoint", "").ifEmpty { obj.safeOptString("endpoint", "") }
-            .trim()
-        return if (raw.startsWith("/")) raw else null
-    }
+    private fun parseCustomEndpointPath(inputJson: String): String? =
+        ModelUseProtocol.parseCustomEndpointPath(inputJson)
 
     /**
      * Shape a passthrough reply that :modelservice executed into the CLI
