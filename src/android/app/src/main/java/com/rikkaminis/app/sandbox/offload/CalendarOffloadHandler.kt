@@ -485,8 +485,17 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
 
         val startStr = args.get("start") ?: return NativeOffloadResult(2, "android-calendar freebusy: --start is required\n")
         val endStr = args.get("end") ?: return NativeOffloadResult(2, "android-calendar freebusy: --end is required\n")
-        val startMs = parseDate(startStr) ?: return NativeOffloadResult(2, "android-calendar: invalid --start '$startStr'\n")
-        val endMs = parseDate(endStr) ?: return NativeOffloadResult(2, "android-calendar: invalid --end '$endStr'\n")
+        val nowMs = System.currentTimeMillis()
+        val zone = TimeZone.getDefault()
+        val startMs = parseDateInZone(startStr, nowMs, zone)
+            ?: return NativeOffloadResult(2, "android-calendar: invalid --start '$startStr'\n")
+        // [da1016c-F F-B] A bare "YYYY-MM-DD" --end covers the whole day
+        // (inclusive 23:59:59.999): `--start D --end D` used to build a
+        // zero-width window and answer empty for a day the caller named
+        // explicitly. Same treatment as the list window (alignBareDateEnd).
+        val endMs = parseDateInZone(endStr, nowMs, zone)
+            ?.let { alignBareDateEnd(it, endStr, zone) }
+            ?: return NativeOffloadResult(2, "android-calendar: invalid --end '$endStr'\n")
         if (endMs <= startMs) {
             return NativeOffloadResult(2, "android-calendar freebusy: --end must be after --start\n")
         }
@@ -623,38 +632,28 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
 
     /**
      * Mirror apple-calendar resolve_date_range: --today (today only, [00:00,
-     * +24h)) → --days N (last N days through now, with start at 00:00) →
-     * --start/--end (explicit, defaults to last 24h on either side). Returns
-     * null only when --start/--end are supplied but unparseable.
+     * next-day 00:00) via Calendar day arithmetic — DST-safe, no 24h constant)
+     * → --days N (last N calendar days through now, start at 00:00 via
+     * add(DAY_OF_YEAR, -N)) → --start/--end (explicit; a bare "YYYY-MM-DD"
+     * --end is INCLUSIVE of that whole day — through 23:59:59.999, same 口径
+     * as SessionsOffloadHandler.parseEndDate — while datetime inputs keep
+     * their explicit instant; missing sides default to last 24h on either
+     * side, unchanged). Returns null only when --start/--end are supplied but
+     * unparseable.
+     *
+     * [deep-audit-1016c ISSUE-09B] The decision core is [resolveRangePure]
+     * (companion, JVM-tested with pinned DST-day literals); this shell only
+     * supplies device-zone inputs.
      */
-    private fun resolveDateRange(args: OffloadArgs): Pair<Long, Long>? {
-        val now = System.currentTimeMillis()
-        if (args.hasFlag("today")) {
-            val cal = Calendar.getInstance().apply {
-                set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0)
-                set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
-            }
-            val s = cal.timeInMillis
-            return s to (s + 24 * 60 * 60 * 1000L)
-        }
-        args.getInt("days")?.let { days ->
-            val n = if (days <= 0) 7 else days
-            val cal = Calendar.getInstance().apply {
-                timeInMillis = now - n * 24 * 60 * 60 * 1000L
-                set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0)
-                set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
-            }
-            return cal.timeInMillis to now
-        }
-        val startStr = args.get("start")
-        val endStr = args.get("end")
-        val startMs = if (startStr != null) parseDate(startStr) ?: return null
-                      else now - 24 * 60 * 60 * 1000L
-        val endMs = if (endStr != null) parseDate(endStr) ?: return null
-                    else now
-        // EventStore predicates don't tolerate start > end on iOS; mirror that.
-        return if (startMs > endMs) endMs to startMs else startMs to endMs
-    }
+    private fun resolveDateRange(args: OffloadArgs): Pair<Long, Long>? =
+        resolveRangePure(
+            nowMs = System.currentTimeMillis(),
+            zone = TimeZone.getDefault(),
+            todayFlag = args.hasFlag("today"),
+            daysRaw = args.getInt("days"),
+            startRaw = args.get("start"),
+            endRaw = args.get("end"),
+        ) { s, nowMs, z -> parseDateInZone(s, nowMs, z) }
 
     /**
      * Resolve the target calendar for create: --calendar-id wins, then a
@@ -871,6 +870,96 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
         private const val TAG = "CalendarOffload"
         private const val DEFAULT_LIMIT = 50
 
+        // [da1016c-F F-B] A date-only input: exactly "YYYY-MM-DD" (no time, no
+        // zone suffix, not a relative shorthand). Only this form gets the
+        // end-of-day boundary treatment — "2026-10-16T10:00" and "-7d" keep
+        // their explicit instants.
+        private val DATE_ONLY: Regex = Regex("""^\d{4}-\d{2}-\d{2}$""")
+
+        // [da1016c-F F-B] Local 00:00:00.000 of the day containing [ms].
+        internal fun startOfLocalDay(ms: Long, zone: TimeZone): Long =
+            Calendar.getInstance(zone).apply {
+                timeInMillis = ms
+                set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+            }.timeInMillis
+
+        // [da1016c-F F-B] Inclusive end of the day containing [ms]: 23:59:59.999.
+        // add(DAY_OF_YEAR, 1) then -1 ms — the SessionsOffloadHandler.parseEndDate
+        // idiom, DST-safe where a 24h-1ms constant is not (a 23/25-hour day is
+        // covered in full).
+        internal fun endOfLocalDay(ms: Long, zone: TimeZone): Long {
+            val cal = Calendar.getInstance(zone).apply {
+                timeInMillis = ms
+                add(Calendar.DAY_OF_YEAR, 1)
+                set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+            }
+            return cal.timeInMillis - 1
+        }
+
+        // [da1016c-F F-B] Calendar day arithmetic (add(DAY_OF_YEAR)) — keeps the
+        // wall-clock day stable across DST transitions where an n*24h offset
+        // does not.
+        internal fun addLocalDays(ms: Long, days: Int, zone: TimeZone): Long {
+            val cal = Calendar.getInstance(zone).apply {
+                timeInMillis = ms
+                add(Calendar.DAY_OF_YEAR, days)
+            }
+            return cal.timeInMillis
+        }
+
+        // [da1016c-F F-B] End boundary alignment for a BARE-DATE --end: the
+        // whole day is covered (23:59:59.999, inclusive) instead of the parsed
+        // 00:00:00.000 — a bare-date --start --end X --end X used to be a
+        // zero-width window that answered an empty day. Datetime/relative
+        // inputs keep their explicit instant.
+        internal fun alignBareDateEnd(parsedMs: Long, raw: String, zone: TimeZone): Long =
+            if (DATE_ONLY.matches(raw.trim())) endOfLocalDay(parsedMs, zone) else parsedMs
+
+        /**
+         * [da1016c-F F-B] Pure decision core of [resolveDateRange] — device
+         * inputs injected ([nowMs], [zone], parser), no clock/zone reads, so
+         * the DST-day arms are pinned with literals in JVM tests.
+         *
+         * - `--today` → [today 00:00, next-day 00:00) via Calendar day
+         *   arithmetic (the old +24h constant clipped/overshot a 23/25-hour
+         *   DST day by exactly 1h).
+         * - `--days N` → [N calendar days back at 00:00, now) via
+         *   add(DAY_OF_YEAR, -N); N <= 0 degrades to 7 (unchanged).
+         * - `--start/--end` explicit; missing sides default to last 24h
+         *   (unchanged); parse failure → null (error semantics unchanged);
+         *   start > end → swapped (unchanged).
+         * - a bare-date --end is inclusive end-of-day via [alignBareDateEnd].
+         */
+        internal fun resolveRangePure(
+            nowMs: Long,
+            zone: TimeZone,
+            todayFlag: Boolean,
+            daysRaw: Int?,
+            startRaw: String?,
+            endRaw: String?,
+            parse: (String, Long, TimeZone) -> Long?,
+        ): Pair<Long, Long>? {
+            if (todayFlag) {
+                val s = startOfLocalDay(nowMs, zone)
+                val e = startOfLocalDay(addLocalDays(nowMs, 1, zone), zone)
+                return s to e
+            }
+            daysRaw?.let { rawDays ->
+                val n = if (rawDays <= 0) 7 else rawDays
+                return startOfLocalDay(addLocalDays(nowMs, -n, zone), zone) to nowMs
+            }
+            val startMs = if (startRaw != null) parse(startRaw, nowMs, zone) ?: return null
+                          else nowMs - 24 * 60 * 60 * 1000L
+            val endMs = if (endRaw != null) {
+                val parsed = parse(endRaw, nowMs, zone) ?: return null
+                alignBareDateEnd(parsed, endRaw, zone)
+            } else nowMs
+            // EventStore predicates don't tolerate start > end on iOS; mirror that.
+            return if (startMs > endMs) endMs to startMs else startMs to endMs
+        }
+
         // [sweep1014-B25a] Pure window-intersection predicate for a calendar
         // instance (or event) against the query window: the occurrence
         // overlaps the window iff it starts before the window ends AND ends
@@ -973,7 +1062,11 @@ Dates accept ISO 8601 (YYYY-MM-DDThh:mm[:ss][Z|±HH:MM]) or relative
 shorthand (-7d, -2h, +30m). YYYY-MM-DD is treated as midnight local,
 except for all-day events: those are stored on UTC-midnight boundaries
 (create --all-day, or update of an event that is already all-day), so
-their dates are parsed in UTC instead.
+their dates are parsed in UTC instead. For list/freebusy windows a
+bare YYYY-MM-DD --end covers the WHOLE day (inclusive, through
+23:59:59.999 local), so `--start D --end D` returns that day.
+--today spans the local calendar day (DST-safe); --days N spans the
+last N calendar days.
 
 Aliases for backwards compatibility:
   --max ↔ --limit
