@@ -572,6 +572,12 @@ class MemoryRepository(private val memoryDir: File) {
         // [FIX-6 / F-224] Same guard for the persona file: it is not a daily
         // log, and deleting it re-seeds the default content on next launch.
         if (name == SOUL_FILE) return false
+        // [FIX-E / ISSUE-09] And the rollup product file. It is regenerable in
+        // principle, but regenerating it needs the old daily logs, which are
+        // exactly what it already distilled away: losing it silently drops
+        // every distilled rule. Same "not a user-editable daily log" class as
+        // GLOBAL.md / SOUL.md, so it is refused here too.
+        if (name == ROLLUP_FILE) return false
         return File(memoryDir, name).delete()
     }
 
