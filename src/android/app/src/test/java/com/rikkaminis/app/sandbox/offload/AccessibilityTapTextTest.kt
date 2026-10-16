@@ -90,7 +90,7 @@ class AccessibilityTapTextTest {
             "if (n.isClickable) n.performAction(AccessibilityNodeInfo.ACTION_CLICK);\n        if (true",
         )
         assertFalse(mutated.contains("TapTextFlow.plan("))
-        assertRejects(mutated)
+        assertRejects(body, mutated)
     }
 
     @Test
@@ -102,7 +102,7 @@ class AccessibilityTapTextTest {
             "",
         )
         assertFalse(mutated.contains("ACTION_FAILED"))
-        assertRejects(mutated)
+        assertRejects(body, mutated)
     }
 
     private fun assertTapTextShape(body: String) {
@@ -127,7 +127,11 @@ class AccessibilityTapTextTest {
         assertTrue("a failed fallback must return an error", tail.contains("return err(args,"))
     }
 
-    private fun assertRejects(mutated: String) {
+    private fun assertRejects(pristine: String, mutated: String) {
+        // A negative control only means something if the probe accepts the real
+        // source first — otherwise it is "rejects everything", which would pass
+        // against any tree, including the pre-fix one.
+        assertTapTextShape(pristine)
         var rejected = false
         try {
             assertTapTextShape(mutated)

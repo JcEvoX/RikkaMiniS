@@ -92,7 +92,11 @@ class ScreenshotCaptureShapeTest {
         return src.substring(start, end)
     }
 
-    private fun assertRejects(mutated: String) {
+    private fun assertRejects(pristine: String, mutated: String) {
+        // A negative control only means something if the probe accepts the real
+        // source first — otherwise it is "rejects everything", which would pass
+        // against any tree, including the pre-fix one.
+        assertCaptureScreenshotShape(pristine)
         var rejected = false
         try {
             assertCaptureScreenshotShape(mutated)
@@ -114,7 +118,7 @@ class ScreenshotCaptureShapeTest {
     @Test
     fun `probe rejects a body that parks the late frame instead of recycling it`() {
         val body = captureBody()
-        assertRejects(body.replace("slot.exit(timedOut)", ""))
+        assertRejects(body, body.replace("slot.exit(timedOut)", ""))
     }
 
     @Test
@@ -125,22 +129,20 @@ class ScreenshotCaptureShapeTest {
         val lateGuard = body.replaceRange(guard, guard + "if (!slot.isCallerWaiting())".length, "if (false)")
         // Sanity: the guard is gone, everything else is untouched.
         assertFalse(lateGuard.contains("isCallerWaiting()"))
-        assertRejects(lateGuard)
+        assertRejects(body, lateGuard)
     }
 
     @Test
     fun `probe rejects the pre-fix resultRef hand-off`() {
-        assertRejects(
-            captureBody() +
-                "\n        resultRef.set(ShotResult(sw))\n",
-        )
+        val body = captureBody()
+        assertRejects(body, body + "\n        resultRef.set(ShotResult(sw))\n")
     }
 
     @Test
     fun `probe rejects a re-tuned timeout constant`() {
         val body = captureBody()
         assertEquals(1, countOccurrences(body, "timeoutMs: Long = 5_000"))
-        assertRejects(body.replace("timeoutMs: Long = 5_000", "timeoutMs: Long = 10_000"))
+        assertRejects(body, body.replace("timeoutMs: Long = 5_000", "timeoutMs: Long = 10_000"))
     }
 
     private fun countOccurrences(haystack: String, needle: String): Int {

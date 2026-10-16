@@ -80,7 +80,11 @@ class SystemSpeechLifecycleShapeTest {
         return src.substring(start, end)
     }
 
-    private fun assertRejects(mutated: String, fileSrc: String) {
+    private fun assertRejects(pristine: String, mutated: String, fileSrc: String) {
+        // A negative control only means something if the probe accepts the real
+        // source first — otherwise it is "rejects everything", which would pass
+        // against any tree, including the pre-fix one.
+        assertStartupShape(pristine, fileSrc)
         var rejected = false
         try {
             assertStartupShape(mutated, fileSrc)
@@ -130,7 +134,7 @@ class SystemSpeechLifecycleShapeTest {
             countOccurrences(codeOnly(mutated), "tearDown()") <
                 countOccurrences(codeOnly(body), "tearDown()"),
         )
-        assertRejects(mutated, src)
+        assertRejects(body, mutated, src)
     }
 
     @Test
@@ -142,7 +146,7 @@ class SystemSpeechLifecycleShapeTest {
             "usingOnDevice = wantOnDevice",
         )
         assertFalse(mutated.contains("SpeechOnDevicePlan.effective("))
-        assertRejects(mutated, src)
+        assertRejects(body, mutated, src)
     }
 
     private fun readRepoFile(relative: String): String {
