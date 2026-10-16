@@ -121,7 +121,15 @@ fun resolveCompactAnchorIdx(
             }
         } else if (i == 0 &&
             history[0].role == LLMMessage.Role.USER &&
-            history[0].contentParts.any { p -> p !is AgentContentPart.ToolResult } &&
+            // [fix/da1018-compact-pin] Was the bare `contentParts.any { it !is
+            // ToolResult }`, which is vacuously FALSE on an empty
+            // `contentParts` — so the most common shape (a plain-text prompt,
+            // content set, no structured parts) failed this guard and the sole
+            // instruction could be compacted away. [isToolResultOnly] carries
+            // the emptiness guard (non-empty AND all ToolResult), so its
+            // negation is the single truth source for "not a tool-result
+            // carrier".
+            !history[0].isToolResultOnly() &&
             history.drop(1).none { it.role == LLMMessage.Role.ASSISTANT }
         ) {
             // Sole unanswered user prompt and nothing anchored before it —
@@ -140,6 +148,15 @@ fun resolveCompactAnchorIdx(
  * on an empty list, so the un-guarded form misclassifies every plain-text
  * user message (`content` set, `contentParts` empty) as a tool-result
  * carrier. See [isPersistedUserPrompt].
+ *
+ * [fix/da1018-compact-pin] This predicate is the single truth source for
+ * "is this a tool-result carrier" and now also backs the two sites that had
+ * hand-rolled the same test inline in the *opposite* polarity:
+ * [resolveCompactAnchorIdx]'s sole-prompt guard (`any { it !is ToolResult }`,
+ * vacuously FALSE on empty) and [injectSummaryIntoPostAnchor]'s injection
+ * target (`!all { it is ToolResult }`, also FALSE on empty). Both are now
+ * `!isToolResultOnly()`, so the empty-`contentParts` case resolves the same
+ * way everywhere in the compaction domain.
  */
 internal fun LLMMessage.isToolResultOnly(): Boolean =
     contentParts.isNotEmpty() && contentParts.all { it is AgentContentPart.ToolResult }
@@ -444,9 +461,14 @@ internal fun injectSummaryIntoPostAnchor(
     // content field would be silently swallowed. Find the first USER
     // message that is NOT a tool_result-only message, and inject the
     // summary there.
+    // [fix/da1018-compact-pin] Was `!it.contentParts.all { … ToolResult }`,
+    // whose empty-list form is `!true == false` — a plain-text user message
+    // (the ordinary instruction shape) was therefore skipped as if it were a
+    // tool-result carrier, and the summary landed on a later turn or as a
+    // standalone head instead of inlining into the current instruction.
+    // [isToolResultOnly] is the single source for that classification.
     val firstTextUserOffset = postAnchor.indexOfFirst {
-        it.role == LLMMessage.Role.USER &&
-            !it.contentParts.all { p -> p is AgentContentPart.ToolResult }
+        it.role == LLMMessage.Role.USER && !it.isToolResultOnly()
     }
     return if (firstTextUserOffset >= 0) {
         val result = mutableListOf<LLMMessage>()
