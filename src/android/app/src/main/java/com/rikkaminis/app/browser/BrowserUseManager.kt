@@ -283,12 +283,25 @@ class BrowserUseManager(
      * (which previously caused cross-request result串台 — request A's data
      * delivered to request B).
      */
-    private var asyncJsDeferred: CompletableDeferred<String>? = null
-    private var asyncJsActiveToken: String? = null
+    /**
+     * Single-slot registry for in-flight async JS bridge requests.
+     * [fix/audit-s6h2] each request is tagged with a unique token that the JS
+     * callbacks echo back; a late resolve/reject from a TIMED-OUT prior
+     * request is discarded instead of completing the next request's deferred
+     * (which previously caused cross-request result串台 — request A's data
+     * delivered to request B).
+     *
+     * [deep-audit-1016c ISSUE-03B] Was two bare fields (`asyncJsDeferred` /
+     * `asyncJsActiveToken`) with no `@Volatile` and an unconditional,
+     * token-less `finish` — see [AsyncJsSlot] for the three defects it fixes
+     * (visibility on the JavaBridge thread, finish only clearing its own slot,
+     * begin completing the evicted deferred with a structured error).
+     */
+    private val asyncJsSlot = AsyncJsSlot<CompletableDeferred<String>>()
 
     /**
      * [audit2-A2] One-shot credential for the `__minis__.saveBlobDownload`
-     * bridge call — same shape as [asyncJsActiveToken] above (a fresh UUID per
+     * bridge call — same shape as the async-JS token above (a fresh UUID per
      * request, compared with `==`). [fetchBlobDownload] arms it right before
      * injecting the FileReader that echoes it back.
      *
@@ -372,26 +385,36 @@ class BrowserUseManager(
     private fun beginAsyncJsRequest(): Pair<CompletableDeferred<String>, String> {
         val token = UUID.randomUUID().toString()
         val deferred = CompletableDeferred<String>()
-        asyncJsDeferred = deferred
-        asyncJsActiveToken = token
+        // [deep-audit-1016c ISSUE-03B] A request starting while another is
+        // still in flight evicts it — complete the evicted deferred with a
+        // structured error (same shape as the bridge's own reject, so both
+        // executeJS and fetch surface it as a real error) instead of
+        // orphaning it until the full 30s/60s timeout.
+        asyncJsSlot.begin(token, deferred)?.complete(
+            "{\"error\":\"superseded by a newer async JS request\"}"
+        )
         return deferred to token
     }
 
-    private fun finishAsyncJsRequest() {
-        asyncJsDeferred = null
-        asyncJsActiveToken = null
+    /**
+     * Release the slot iff [token] still owns it. [deep-audit-1016c ISSUE-03B]
+     * a timed-out / cancelled / failed request must never clear the slot of a
+     * newer request that already began.
+     */
+    private fun finishAsyncJsRequest(token: String) {
+        asyncJsSlot.finish(token)
     }
 
     /** JavaScript interface for async script result callbacks. */
     private val jsBridge = object {
         @JavascriptInterface
         fun resolve(token: String, result: String) {
-            if (token == asyncJsActiveToken) asyncJsDeferred?.complete(result)
+            asyncJsSlot.ifOwner(token)?.complete(result)
         }
 
         @JavascriptInterface
         fun reject(token: String, error: String) {
-            if (token == asyncJsActiveToken) asyncJsDeferred?.complete("{\"error\":${JSONObject.quote(error)}}")
+            asyncJsSlot.ifOwner(token)?.complete("{\"error\":${JSONObject.quote(error)}}")
         }
 
         /**
@@ -532,9 +555,9 @@ class BrowserUseManager(
         // [audit2-A2] Arm the one-shot bridge credential for THIS fetch: the
         // token interpolated below is the only value the bridge will accept
         // until the page's FileReader hands its data back. Kept separate from
-        // [asyncJsActiveToken] (rather than reusing it) so the download path
-        // stays independent of any in-flight executeJS request — the two have
-        // different lifetimes and would otherwise clear each other's token.
+        // the async-JS slot's token (rather than reusing it) so the download
+        // path stays independent of any in-flight executeJS request — the two
+        // have different lifetimes and would otherwise clear each other's token.
         val token = UUID.randomUUID().toString()
         blobDownloadActiveToken = token
         val js = """
@@ -1592,8 +1615,12 @@ class BrowserUseManager(
         // Wrap in an async IIFE so `await` works in user scripts.
         // Android WebView doesn't resolve Promises from evaluateJavascript,
         // so we use a JS bridge callback (__minis__.resolve / __minis__.reject).
+        // [deep-audit-1016c ISSUE-03B] begin() hoisted out of the try: the
+        // catch blocks below must release the slot THEY own (the old
+        // declaration was invisible from the catch clauses). It has no
+        // throwing surface (UUID + a CompletableDeferred constructor).
+        val (deferred, token) = beginAsyncJsRequest()
         return try {
-            val (deferred, token) = beginAsyncJsRequest()
             val wrapped = """
                 (async function(){
                     try {
@@ -1616,10 +1643,10 @@ class BrowserUseManager(
             }
             val raw = withTimeoutOrNull(30_000L) { deferred.await() }
                 ?: run {
-                    finishAsyncJsRequest()
+                    finishAsyncJsRequest(token)
                     return BrowserActionResult.error("JavaScript execution timed out (30s)")
                 }
-            finishAsyncJsRequest()
+            finishAsyncJsRequest(token)
             val json = try { JSONObject(raw) } catch (_: Exception) { null }
             if (json != null) {
                 if (json.has("error")) {
@@ -1635,10 +1662,10 @@ class BrowserUseManager(
             // swallowed CancellationException and turned a cancelled run into a
             // "JavaScript error" result — the caller then treated an aborted
             // tool call as a completed one. Still release the registry slot.
-            finishAsyncJsRequest()
+            finishAsyncJsRequest(token)
             throw e
         } catch (e: Exception) {
-            finishAsyncJsRequest()
+            finishAsyncJsRequest(token)
             BrowserActionResult.error("JavaScript error: ${e.message}")
         }
     }
@@ -1761,7 +1788,7 @@ class BrowserUseManager(
         val raw = try {
             withTimeoutOrNull(60_000L) { deferred.await() }
         } finally {
-            finishAsyncJsRequest()
+            finishAsyncJsRequest(token)
         }
         return raw
     }

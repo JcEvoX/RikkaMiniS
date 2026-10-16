@@ -16,6 +16,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
@@ -469,13 +470,18 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
             state = DownloadState.DOWNLOADING,
             startedAt = System.currentTimeMillis(),
         )
-        _downloads.value = listOf(entry) + _downloads.value
+        // [deep-audit-1016c ISSUE-03C] read-modify-write on a StateFlow races
+        // across writer threads (URL-download listener on Main, blob bridge on
+        // the JavaBridge thread, download coroutines on IO) — a lost update
+        // here makes a concurrently-registered download vanish from the panel
+        // or a progress/settle write regress. `update {}` is the atomic CAS.
+        _downloads.update { listOf(entry) + it }
         _activeDownload.value = DownloadUiState(dest.name, if (totalBytes > 0) 0f else -1f)
         return id
     }
 
     private fun updateDownloadEntry(id: Long, transform: (DownloadEntry) -> DownloadEntry) {
-        _downloads.value = _downloads.value.map { if (it.id == id) transform(it) else it }
+        _downloads.update { current -> current.map { if (it.id == id) transform(it) else it } }
     }
 
     private fun updateDownloadProgress(id: Long, name: String, copied: Long, total: Long) {
@@ -524,15 +530,15 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
 
     /** Panel opened — terminal entries stop counting toward the badge. */
     fun markDownloadsSeen() {
-        _downloads.value = _downloads.value.map {
-            if (it.state != DownloadState.DOWNLOADING) it.copy(seen = true) else it
+        _downloads.update { current ->
+            current.map { if (it.state != DownloadState.DOWNLOADING) it.copy(seen = true) else it }
         }
     }
 
     /** "Clear" in the panel: drops ALL finished records (completed AND failed,
      *  iOS v3 semantics) — in-flight rows untouched. */
     fun clearFinishedDownloads() {
-        _downloads.value = _downloads.value.filter { it.state == DownloadState.DOWNLOADING }
+        _downloads.update { current -> current.filter { it.state == DownloadState.DOWNLOADING } }
     }
 
 
@@ -800,9 +806,17 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
 
     /**
      * Acquire a tab (creating / selecting per [acquireTab]) and run the action.
-     * Shared by the serialized (explicit existing tab id) and unlocked (tab-less
-     * / new-tab) execution paths. [T-browser-use-per-tab-serial-android]
+     * Shared by the serialized (explicit existing tab id) and tab-less
+     * execution paths. [T-browser-use-per-tab-serial-android]
      *
+     * [deep-audit-1016c ISSUE-03A] Both paths end up holding the executed
+     * tab's per-tab mutex around the WebView-driving call: `executeSerialized`
+     * holds it before acquiring, and the implicit path takes it here around
+     * `tab.manager.execute` — see the lock comment in the body.
+     *
+     * @param implicitTab true when the caller did NOT pre-lock the tab
+     *   (`executeSerialized` passes false — Kotlin Mutex is not reentrant, so
+     *   re-taking the tab lock here would self-deadlock).
      * @param acquireTabId [T-browser-readaction-follow-tab-and-yolo-android]
      *   when non-null, acquire exactly this tab id instead of `input.tabId` —
      *   used by [executeSerialized] so a tab-less follow-selected / YOLO action
@@ -823,7 +837,42 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
             return BrowserActionResult.error(e.message ?: "all browser tabs busy")
         } ?: return BrowserActionResult.error("Failed to acquire browser tab")
         return try {
-            val result = tab.manager.execute(input)
+            // [deep-audit-1016c ISSUE-03A] The unlocked (implicit-tab) entry path
+            // takes the ACQUIRED tab's per-tab mutex around the one call that
+            // drives the WebView. Previously only `executeSerialized` took that
+            // mutex, so an explicit `executeSerialized(T)` and a tab-less action
+            // that fanned out to T could overlap: (1) the explicit path holds
+            // `lockForTab(T)` before its own `acquireTab` flips `inUse=true`, a
+            // Main-dispatcher gap in which the fan-out still sees T free; and
+            // (2) `acquireTab`'s explicit-existing-id branch returns T without
+            // checking `inUse`, so an explicit action walks straight onto a tab a
+            // tab-less action is already driving. Locking here closes both: any
+            // execute on T — explicit or implicit — now holds T's own mutex.
+            //
+            // `implicitTab == false` means the caller is `executeSerialized`,
+            // which ALREADY holds `lockForTab(tab.id)`; Kotlin's Mutex is not
+            // reentrant, so re-taking it here would self-deadlock.
+            //
+            // Deadlock freedom: each path holds at most one per-tab mutex at a
+            // time (executeSerialized: lock → acquireTab, which takes no tab
+            // lock; implicit: acquireTab → lock), so there is no circular wait.
+            // The wait is bounded by the same timeout/policy as
+            // [executeSerialized] — a stuck action must not hang a tab-less
+            // caller forever.
+            val executed = if (implicitTab) {
+                withTimeoutOrNull(TAB_SERIAL_WAIT_TIMEOUT_MS) {
+                    lockForTab(tab.id).withLock { tab.manager.execute(input) }
+                }
+            } else {
+                tab.manager.execute(input)
+            }
+            val result = executed ?: return BrowserActionResult.error(
+                context.getString(
+                    R.string.browser_use_tab_busy_timeout,
+                    tab.id,
+                    (TAB_SERIAL_WAIT_TIMEOUT_MS / 1000L).toInt(),
+                ),
+            )
 
             // [T-browser-risk-control] Detect risk challenges (Cloudflare,
             // captcha, rate limits, etc.) from the current page title and URL.
