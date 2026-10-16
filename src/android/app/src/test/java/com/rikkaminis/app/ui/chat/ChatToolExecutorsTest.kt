@@ -518,4 +518,163 @@ class ChatToolExecutorsTest {
         assertFalse(toolResultMsg.content.contains("Error: Error:"))
         assertTrue(toolResultMsg.content.contains("Error: Agent budget exhausted"))
     }
+
+    // ── [fix/da1017-subagent-residue] turn hand-back contract ─────
+    //
+    // Every path that hands a turn back to the model (`continue`: residue
+    // refill, truncation continuation) must record the turn's VISIBLE text in
+    // history first — the next request is the model's only view of what it
+    // wrote. The residue path used to skip it, so the model restated the
+    // prose on the retry and `resultSb` (the sub-agent's persisted result,
+    // which the main agent then reads as its own) carried it twice.
+
+    private val residueProse = "Here is my plan. <invoke name=\"shellexecute\">ls -la</invoke>"
+
+    @Test
+    fun `appendSubagentTurnText appends non-blank text and skips blank`() {
+        val history = mutableListOf(LLMMessage(role = LLMMessage.Role.USER, content = "q"))
+        assertTrue(appendSubagentTurnText(history, "turn text"))
+        assertEquals(2, history.size)
+        assertEquals(LLMMessage.Role.ASSISTANT, history[1].role)
+        assertEquals("turn text", history[1].content)
+        // A blank turn appends NOTHING: the providers filter
+        // (content.isEmpty() && contentParts.isEmpty()) messages out of the
+        // request, so a blank shell is invisible to the model while still
+        // breaking role alternation in memory.
+        assertFalse(appendSubagentTurnText(history, "   "))
+        assertFalse(appendSubagentTurnText(history, ""))
+        assertEquals(2, history.size)
+    }
+
+    @Test
+    fun `residue refill request carries the turn text as an assistant message`() {
+        val requests = mutableListOf<List<LLMMessage>>()
+        kotlinx.coroutines.runBlocking {
+            runSubagentLoop(
+                skillName = "s", query = "q", title = "t", config = config(),
+                systemPrompt = "sys",
+                streamProvider = { messages ->
+                    requests.add(messages.toList())
+                    if (messages.size == 1) {
+                        kotlinx.coroutines.flow.flowOf(LLMStreamChunk.Text(residueProse))
+                    } else {
+                        kotlinx.coroutines.flow.flowOf(LLMStreamChunk.Text("done"))
+                    }
+                },
+                executeSubTool = { _, _ -> ToolExecutionResult("x", true) },
+                knownToolNames = listOf("file_read", "shell_execute"),
+                log = {},
+            )
+        }
+        assertEquals(2, requests.size)
+        val second = requests[1]
+        // query → the turn the model just wrote → refill nudge. Three
+        // messages, alternating: the assistant turn is present, so the bridge
+        // must NOT synthesize a second one.
+        assertEquals(
+            listOf(LLMMessage.Role.USER, LLMMessage.Role.ASSISTANT, LLMMessage.Role.USER),
+            second.map { it.role },
+        )
+        val assistant = second[1]
+        assertTrue("assistant turn missing prose: '${assistant.content}'",
+            assistant.content.contains("Here is my plan."))
+        assertFalse("residue markup leaked into history: '${assistant.content}'",
+            assistant.content.contains("shellexecute"))
+    }
+
+    @Test
+    fun `residue-only turn adds no blank assistant shell`() {
+        val requests = mutableListOf<List<LLMMessage>>()
+        kotlinx.coroutines.runBlocking {
+            runSubagentLoop(
+                skillName = "s", query = "q", title = "t", config = config(),
+                systemPrompt = "sys",
+                streamProvider = { messages ->
+                    requests.add(messages.toList())
+                    if (messages.size == 1) {
+                        kotlinx.coroutines.flow.flowOf(
+                            LLMStreamChunk.Text("<invoke name=\"shellexecute\">ls</invoke>"),
+                        )
+                    } else {
+                        kotlinx.coroutines.flow.flowOf(LLMStreamChunk.Text("done"))
+                    }
+                },
+                executeSubTool = { _, _ -> ToolExecutionResult("x", true) },
+                knownToolNames = listOf("file_read", "shell_execute"),
+                log = {},
+            )
+        }
+        val second = requests[1]
+        assertEquals(
+            "blank shells in request: ${second.map { it.role }}",
+            0,
+            second.count { it.content.isBlank() && it.contentParts.isEmpty() },
+        )
+        assertTrue(second.any { it.content.contains("Re-emit it NOW") })
+    }
+
+    @Test
+    fun `tool dispatch turn history shape is unchanged`() {
+        // Zero-regression arm: the echo helper must not fire on a turn that
+        // parsed a real call (baseline shape: text + tool_use part, then the
+        // tool result as a user message).
+        val requests = mutableListOf<List<LLMMessage>>()
+        kotlinx.coroutines.runBlocking {
+            runSubagentLoop(
+                skillName = "s", query = "q", title = "t", config = config(),
+                systemPrompt = "sys",
+                streamProvider = { messages ->
+                    requests.add(messages.toList())
+                    if (messages.size == 1) {
+                        kotlinx.coroutines.flow.flowOf(
+                            LLMStreamChunk.Text("need tool"),
+                            LLMStreamChunk.ToolCallComplete("id1", "file_read", org.json.JSONObject()),
+                        )
+                    } else {
+                        kotlinx.coroutines.flow.flowOf(LLMStreamChunk.Text("final"))
+                    }
+                },
+                executeSubTool = { _, _ -> ToolExecutionResult("tool output", true) },
+                knownToolNames = listOf("file_read", "shell_execute"),
+                log = {},
+            )
+        }
+        val second = requests[1]
+        assertEquals(3, second.size)
+        assertEquals(
+            listOf(LLMMessage.Role.USER, LLMMessage.Role.ASSISTANT, LLMMessage.Role.USER),
+            second.map { it.role },
+        )
+        assertEquals("need tool", second[1].content)
+        assertEquals(
+            1,
+            second[1].contentParts.filterIsInstance<com.rikkaminis.app.data.model.AgentContentPart.ToolUse>().size,
+        )
+    }
+
+    @Test
+    fun `subagent cancellation propagates instead of becoming a failure result`() {
+        // A stop is not a sub-agent failure: the generic catch used to swallow
+        // CancellationException and hand back "Sub-agent '<name>' encountered
+        // an error after N turn(s)" — a stop read as a crash, attributed to
+        // the model.
+        var returned: ToolExecutionResult? = null
+        val thrown: Throwable? = try {
+            kotlinx.coroutines.runBlocking {
+                returned = runSubagentLoop(
+                    skillName = "s", query = "q", title = "t", config = config(),
+                    systemPrompt = "sys",
+                    streamProvider = { throw kotlinx.coroutines.CancellationException("stop pressed") },
+                    executeSubTool = { _, _ -> ToolExecutionResult("x", true) },
+                    knownToolNames = listOf("file_read"),
+                    log = {},
+                )
+            }
+            null
+        } catch (t: Throwable) {
+            t
+        }
+        assertNull("the loop returned $returned instead of propagating", returned)
+        assertTrue("expected CancellationException, got ${thrown?.javaClass}", thrown is kotlinx.coroutines.CancellationException)
+    }
 }
