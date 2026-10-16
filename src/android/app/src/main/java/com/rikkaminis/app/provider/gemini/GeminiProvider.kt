@@ -51,7 +51,7 @@ import com.rikkaminis.app.provider.visionPlaceholder
 class GeminiProvider(
     private val apiKey: String,
     override var model: LLMModel = LLMModel.gemini25Flash,
-    private val basePath: String = "https://generativelanguage.googleapis.com/v1beta",
+    private val basePath: String = GeminiBasePath.DEFAULT_BASE,
 ) : LLMProvider {
     override val name = "Google"
     override var instanceContext: com.rikkaminis.app.data.model.ProviderInstance? = null
@@ -60,21 +60,16 @@ class GeminiProvider(
     override val supportsPrefill: Boolean get() = true
 
     /**
-     * [FIX-1 / F-194] The request path is built as
-     * `$basePath/models/<id>:generateContent`, so a base that already carries an
-     * API-version segment produces `.../v1/v1beta/models/...` = 404. The models
-     * LIST api has always collapsed this (GeminiModelsApi:29 strips
-     * `/v1beta` and `/v1` with a comment saying exactly that relays do paste
-     * either), but the request side never did — so a user who pasted a working
-     * relay base into the models field got a green model list and a 404 on
-     * every message. Same normalization, applied where the URL is actually
-     * assembled.
+     * [FIX-1 / F-194; corrected by deep-audit-1016 ISSUE-01] The request path is built as
+     * `$basePath/models/<id>:generateContent`, so the base needs exactly one API-version
+     * segment and nothing more. FIX-1 stripped `/v1beta` / `/v1` (relays paste either) but
+     * never restored one, which turned "some relay bases 404" into "every base 404s" —
+     * measured 404 on the versionless path, 400 on `/v1beta/models/...`.
+     *
+     * The rule now lives in one place ([GeminiBasePath]) because two copies of it drifting
+     * apart is what produced the month-long split shape: model list 200, chat 404.
      */
-    private fun normalizedBasePath(): String {
-        var p = basePath
-        while (p.endsWith("/")) p = p.dropLast(1)
-        return p.removeSuffix("/v1beta").removeSuffix("/v1")
-    }
+    private fun normalizedBasePath(): String = GeminiBasePath.normalize(basePath)
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)

@@ -1824,6 +1824,142 @@ def test_katex_bridge_arity():
     shutil.rmtree(root)
 
 
+GEMINI_DIR = "src/android/app/src/main/java/com/rikkaminis/app/provider/gemini"
+
+
+def gemini_fixture(provider_normalizer=None, shared_normalizer=None, sibling_normalizer=None,
+                   extra_bypass=False):
+    """Build a three-file gemini tree mirroring the live shape."""
+    provider_body = provider_normalizer or (
+        "    private fun normalizedBasePath(): String = GeminiBasePath.normalize(basePath)\n"
+    )
+    shared_body = shared_normalizer or (
+        "    fun normalize(raw: String?): String {\n"
+        "        val base = raw?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } ?: return DEFAULT_BASE\n"
+        "        var stripped = base\n"
+        "        while (true) {\n"
+        "            val next = stripped.removeSuffix(\"/v1beta\").removeSuffix(\"/v1\")\n"
+        "            if (next == stripped) break\n"
+        "            stripped = next\n"
+        "        }\n"
+        "        return \"$stripped/v1beta\"\n"
+        "    }\n"
+    )
+    sibling_body = sibling_normalizer or (
+        "    fun normalizeBase(baseUrl: String?): String {\n"
+        "        val raw = baseUrl?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } ?: return DEFAULT_BASE\n"
+        "        val stripped = raw.removeSuffix(\"/v1beta\").removeSuffix(\"/v1\")\n"
+        "        return \"$stripped/v1beta\"\n"
+        "    }\n"
+    )
+    bypass = (
+        "    fun extra() {\n"
+        "        val url = \"${basePath}/models/gemini-2.5-flash:generateContent\"\n"
+        "    }\n"
+        if extra_bypass else ""
+    )
+    return {
+        GEMINI_DIR + "/GeminiProvider.kt": (
+            "package com.rikkaminis.app.provider.gemini\n"
+            "class GeminiProvider(private val basePath: String = GeminiBasePath.DEFAULT_BASE) {\n"
+            + provider_body
+            + "    fun sendMessage() {\n"
+            "        val url = \"${normalizedBasePath()}/models/gemini-2.5-flash:generateContent\"\n"
+            "    }\n"
+            "    fun streamMessage() {\n"
+            "        val url = \"${normalizedBasePath()}/models/gemini-2.5-flash:streamGenerateContent\"\n"
+            "    }\n"
+            + bypass
+            + "}\n"
+        ),
+        GEMINI_DIR + "/GeminiBasePath.kt": (
+            "package com.rikkaminis.app.provider.gemini\n"
+            "internal object GeminiBasePath {\n"
+            "    const val DEFAULT_BASE = \"https://generativelanguage.googleapis.com/v1beta\"\n"
+            + shared_body
+            + "}\n"
+        ),
+        GEMINI_DIR + "/GeminiModelsApi.kt": (
+            "package com.rikkaminis.app.provider.gemini\n"
+            "internal object GeminiModelsApi {\n"
+            "    private const val DEFAULT_BASE = \"https://generativelanguage.googleapis.com/v1beta\"\n"
+            + sibling_body
+            + "}\n"
+        ),
+    }
+
+
+def test_gemini_base_version():
+    """The Gemini base must end in exactly one /v1beta — per file, both call sites."""
+    print("━━━ gemini_base_version_check ━━━")
+
+    root = make_tree(gemini_fixture())
+    code, out = run_scanner("gemini_base_version_check.py", root)
+    check("all three normalizers present passes (exit 0)", code == 0, f"exit={code}\n{out}")
+    check("delegation is reported as the intended shape", "delegates to GeminiBasePath.normalize" in out, out)
+    check("both call sites are counted", "routes 2 call site(s)" in out, out)
+    shutil.rmtree(root)
+
+    # The live pre-fix shape: strips the version segment, never restores one.
+    root = make_tree(gemini_fixture(provider_normalizer=(
+        "    private fun normalizedBasePath(): String {\n"
+        "        var p = basePath\n"
+        "        while (p.endsWith(\"/\")) p = p.dropLast(1)\n"
+        "        return p.removeSuffix(\"/v1beta\").removeSuffix(\"/v1\")\n"
+        "    }\n"
+    )))
+    code, out = run_scanner("gemini_base_version_check.py", root)
+    check("strip-without-restore is caught (exit 1)", code == 1, f"exit={code}\n{out}")
+    check("finding names GeminiProvider.kt", "GeminiProvider.kt" in out, out)
+    shutil.rmtree(root)
+
+    # Anti-mask: the provider delegates, so the shared file has to carry the restore.
+    root = make_tree(gemini_fixture(shared_normalizer=(
+        "    fun normalize(raw: String?): String {\n"
+        "        val base = raw?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } ?: return DEFAULT_BASE\n"
+        "        var stripped = base\n"
+        "        while (true) {\n"
+        "            val next = stripped.removeSuffix(\"/v1beta\").removeSuffix(\"/v1\")\n"
+        "            if (next == stripped) break\n"
+        "            stripped = next\n"
+        "        }\n"
+        "        return stripped\n"
+        "    }\n"
+    )))
+    code, out = run_scanner("gemini_base_version_check.py", root)
+    check("delegation does not launder a broken shared implementation (exit 1)", code == 1, f"exit={code}\n{out}")
+    check("finding names GeminiBasePath.kt", "GeminiBasePath.kt" in out, out)
+    shutil.rmtree(root)
+
+    # Per-file, not union: the sibling normalizer is the one the list path uses.
+    root = make_tree(gemini_fixture(sibling_normalizer=(
+        "    fun normalizeBase(baseUrl: String?): String {\n"
+        "        val raw = baseUrl?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } ?: return DEFAULT_BASE\n"
+        "        return raw.removeSuffix(\"/v1beta\").removeSuffix(\"/v1\")\n"
+        "    }\n"
+    )))
+    code, out = run_scanner("gemini_base_version_check.py", root)
+    check("a broken sibling normalizer is caught on its own (exit 1)", code == 1, f"exit={code}\n{out}")
+    check("finding names GeminiModelsApi.kt", "GeminiModelsApi.kt" in out, out)
+    shutil.rmtree(root)
+
+    # Rot guard: a renamed normalizer must fail loudly, not read as clean.
+    root = make_tree(gemini_fixture(provider_normalizer=(
+        "    private fun normalizedBase(): String = GeminiBasePath.normalize(basePath)\n"
+    )))
+    code, out = run_scanner("gemini_base_version_check.py", root)
+    check("a renamed normalizer is a hard fail, not a skip (exit 1)", code == 1, f"exit={code}\n{out}")
+    check("rot message says the function was not found", "not found" in out, out)
+    shutil.rmtree(root)
+
+    # Wiring: one call site that skips the normalizer is the exact comeback shape.
+    root = make_tree(gemini_fixture(extra_bypass=True))
+    code, out = run_scanner("gemini_base_version_check.py", root)
+    check("a call site built from the raw basePath is caught (exit 1)", code == 1, f"exit={code}\n{out}")
+    check("finding mentions the raw basePath", "raw basePath" in out, out)
+    shutil.rmtree(root)
+
+
 def test_real_repo():
     print("━━━ real repo tree (must be clean) ━━━")
     for script in (
@@ -2055,6 +2191,7 @@ def main():
     test_loop_counter_reset()
     test_budget_stop_break()
     test_katex_bridge_arity()
+    test_gemini_base_version()
     test_real_repo()
     print("")
     print(f"{'❌ FAILURES: ' + str(FAIL) if FAIL else '✅ ALL ' + str(PASS) + ' CASES PASS'}")
