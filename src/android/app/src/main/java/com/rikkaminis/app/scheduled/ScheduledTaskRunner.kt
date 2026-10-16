@@ -52,6 +52,14 @@ object ScheduledTaskRunner {
         val taskId: String,
         val deadlineSec: Int,
         val startedAtMs: Long,
+        /**
+         * [deep-audit-1016c ISSUE-09A] The local calendar day this run was
+         * FIRED on ("YYYY-MM-DD") — the same day [ScheduledTaskPolicy.evaluate]
+         * compared [ScheduledTask.lastRunDate] against when it decided to fire.
+         * Threaded to [finalizeRun] so the settlement credits the scheduled day,
+         * not the (possibly next) day the run happened to settle on.
+         */
+        val scheduledDate: String,
     )
 
     /** In-process single-flight gate (brief §5.2); mirrored by the persisted marker. */
@@ -107,6 +115,7 @@ object ScheduledTaskRunner {
                 taskId = dispatch.taskId,
                 outcome = if (isError) ScheduledTask.RESULT_ERROR else ScheduledTask.RESULT_OK,
                 sessionId = sessionId,
+                scheduledDate = dispatch.scheduledDate,
             )
         }
     }
@@ -215,7 +224,12 @@ object ScheduledTaskRunner {
         for (v in verdicts) logVerdict(v, today)
         val fireId = verdicts.firstOrNull { it is ScheduledTaskPolicy.PassVerdict.Fire }?.taskId ?: return
         val task = current.tasks.firstOrNull { it.id == fireId } ?: return
-        fire(app, task)
+        // [deep-audit-1016c ISSUE-09A] The scheduled day rides along the
+        // dispatch record: the settle path reads it back from [dispatched] and
+        // credits THIS day (the day the fire pass observed the task due), not
+        // the day the run happens to settle on (a 23:55 run settling at 00:06
+        // used to pin tomorrow's date and skip tomorrow's whole window).
+        fire(app, task, today)
     }
 
     /**
@@ -232,7 +246,7 @@ object ScheduledTaskRunner {
             if (!dispatched.remove(sid, d)) continue
             AppLogger.info(TAG, "abort task=${d.taskId} reason=stale-dispatch")
             MemorySpikeRecorder.onEvent(TAG, "abort task=${d.taskId} reason=stale-dispatch")
-            finalizeRun(app, d.taskId, ScheduledTask.RESULT_ERROR, sid)
+            finalizeRun(app, d.taskId, ScheduledTask.RESULT_ERROR, sid, d.scheduledDate)
         }
     }
 
@@ -246,7 +260,7 @@ object ScheduledTaskRunner {
     // Fire
     // ------------------------------------------------------------------
 
-    private suspend fun fire(app: MinisApp, task: ScheduledTask) {
+    private suspend fun fire(app: MinisApp, task: ScheduledTask, scheduledDate: String) {
         runningTaskId = task.id
         var sessionId: String? = null
         try {
@@ -265,6 +279,7 @@ object ScheduledTaskRunner {
                 taskId = task.id,
                 deadlineSec = task.deadlineSec,
                 startedAtMs = System.currentTimeMillis(),
+                scheduledDate = scheduledDate,
             )
             AppLogger.info(TAG, "fire task=${task.id} session=$sid")
             MemorySpikeRecorder.onEvent(TAG, "fire task=${task.id}")
@@ -292,7 +307,7 @@ object ScheduledTaskRunner {
                         "dispatch produced no stream task=${task.id} status=$status " +
                             "reason=${result.optString("responseText", "")}",
                     )
-                    finalizeRun(app, task.id, ScheduledTask.RESULT_ERROR, sid)
+                    finalizeRun(app, task.id, ScheduledTask.RESULT_ERROR, sid, scheduledDate)
                 }
             }
         } catch (t: Throwable) {
@@ -301,7 +316,12 @@ object ScheduledTaskRunner {
             val pending = if (sid != null) dispatched.remove(sid) else null
             if (sid == null || pending != null) {
                 // No dispatch record -> no settle can ever arrive; finalize now.
-                finalizeRun(app, task.id, ScheduledTask.RESULT_ERROR, sid)
+                // [ISSUE-09A] The run never started: outcome is RESULT_ERROR so
+                // the gate never advances; the scheduled day still attributes
+                // the attempt to the day the fire pass observed it due (the
+                // fire-time `today` this function received — available even
+                // when prepareSession threw before a dispatch record existed).
+                finalizeRun(app, task.id, ScheduledTask.RESULT_ERROR, sid, scheduledDate)
             }
         }
     }
@@ -316,10 +336,27 @@ object ScheduledTaskRunner {
         return sessionId
     }
 
-    private suspend fun finalizeRun(app: MinisApp, taskId: String, outcome: String, sessionId: String?) {
+    private suspend fun finalizeRun(
+        app: MinisApp,
+        taskId: String,
+        outcome: String,
+        sessionId: String?,
+        scheduledDate: String,
+    ) {
         sessionId?.let { AgentRunBudgetCeilings.clear(it) }
         val res = try {
-            ScheduledTasksStore.completeRun(app, taskId, outcome, LocalDate.now().toString())
+            // [deep-audit-1016c ISSUE-09A] Credit the day the run was FIRED on
+            // (the same `today` the evaluate gate compared lastRunDate against,
+            // threaded through Dispatch.scheduledDate), never the settlement-day
+            // clock read. Settlement past local midnight used to pin tomorrow's
+            // date here, making the gate see the task as already-run for the
+            // whole of tomorrow.
+            ScheduledTasksStore.completeRun(
+                app,
+                taskId,
+                outcome,
+                ScheduledRunDating.gateDateOnSettle(scheduledDate, LocalDate.now().toString(), outcome),
+            )
         } catch (t: Throwable) {
             AppLogger.warning(TAG, "finalize failed task=$taskId: ${t.javaClass.simpleName}")
             if (runningTaskId == taskId) runningTaskId = null
@@ -444,4 +481,43 @@ internal object InMemoryRunBookkeeping {
         }
         return Plan(dropSessions = dropSessions, clearRunningTaskId = clearRunningTaskId)
     }
+}
+
+/**
+ * [deep-audit-1016c ISSUE-09A] Pure decision core for the date a settling run
+ * writes into the daily gate. Companion to [InMemoryRunBookkeeping]: pure JVM,
+ * so the harness can drive every arm without instantiating the Android-bound
+ * runner. The wiring it documents lives in [ScheduledTaskRunner.finalizeRun].
+ */
+internal object ScheduledRunDating {
+
+    /**
+     * The `today` argument a settled run hands to
+     * [ScheduledTasksStore.completeRun] — the write that advances the daily
+     * gate ([ScheduledTask.lastRunDate], compared by
+     * [ScheduledTaskPolicy.evaluate] as `lastRunDate == nowDate` → ALREADY_RAN).
+     *
+     * Decision: the run is credited to its SCHEDULED local calendar day —
+     * captured when the fire pass observed the task due and threaded through
+     * [ScheduledTaskRunner.Dispatch.scheduledDate] — never to the day the run
+     * happened to settle on. A run fired at 23:55 that settles at 00:06 used
+     * to pin tomorrow's date here and skip tomorrow's whole window
+     * (ALREADY_RAN) while having run nothing tomorrow; crediting the scheduled
+     * day keeps the "one run per local calendar day, credited to the day that
+     * was due" contract.
+     *
+     * @param scheduledDate fire-time local day, "YYYY-MM-DD" (Dispatch.scheduledDate).
+     * @param settleDate settle-time local day. Accepted — and deliberately not
+     *   used — so the decision is total over the facts the caller has and the
+     *   rejected alternative (settle-day pinning, the defect shape) stays an
+     *   addressable arm: swapping the return to [settleDate] is exactly the
+     *   old behavior and must flip the harness's cross-midnight arm red.
+     * @param outcome ScheduledTask.RESULT_OK / RESULT_ERROR / RESULT_TIMEOUT.
+     *   Failures never advance the gate — [ScheduledTaskTransitions.completeRun]
+     *   ignores the date for non-OK outcomes (brief §3 semantics, preserved
+     *   verbatim) — so returning [scheduledDate] for those is inert at the
+     *   store; [outcome] is part of the signature to keep that dependency
+     *   explicit at the call site and addressable by the failure arm.
+     */
+    fun gateDateOnSettle(scheduledDate: String, settleDate: String, outcome: String): String = scheduledDate
 }
