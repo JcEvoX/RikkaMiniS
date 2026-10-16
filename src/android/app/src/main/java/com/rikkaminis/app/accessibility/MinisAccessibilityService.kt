@@ -20,6 +20,7 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * MinisAccessibilityService — host-side AccessibilityService backing the
@@ -64,6 +65,70 @@ private class BoundedEventRing<T>(private val cap: Int) {
         count.set(0)
     }
 }
+
+/**
+ * [T-android-a11y-late-screenshot] Hand-off between a blocking caller that may
+ * give up and a producer whose answer may arrive after it did.
+ *
+ * Two mechanisms, because they close different windows:
+ *  - [isCallerWaiting] is a cheap peek the producer consults *before* it spends
+ *    its payload (a full-screen bitmap copy is ~10–15 MB, and skipping that is
+ *    the point);
+ *  - the slot itself is the mutex: [exit] swaps `null` in, so a producer that
+ *    already passed the peek still loses the race — its [publish] sees a null
+ *    predecessor and discards its own payload instead of parking it where
+ *    nothing will ever read (and therefore never recycle) it.
+ *
+ * Exactly one side owns any given payload: after [exit] the caller owns what it
+ * took, [onDiscard] receives everything else, and a payload is never delivered
+ * to both. [fallback] is the caller's own pre-made answer; it is never handed to
+ * [onDiscard] (only real payloads are).
+ *
+ * Generic and Android-free so the arbitration itself is unit-testable.
+ */
+internal class LateValueSlot<T : Any>(private val fallback: T, private val onDiscard: (T) -> Unit) {
+    private val ref = AtomicReference<T?>(fallback)
+
+    /** True while the caller would still read a published value (it has not exited). */
+    fun isCallerWaiting(): Boolean = ref.get() != null
+
+    /** Current value, or `null` once the slot is closed. */
+    fun current(): T? = ref.get()
+
+    /**
+     * Producer side. Returns true when the value was retained for the caller;
+     * false when the caller had already exited — the value then goes to
+     * [onDiscard] and must not be used again.
+     *
+     * A refused publish leaves the slot closed: the swap has already written the
+     * value, so the sentinel goes back (CAS, so a concurrent publish of its own
+     * value is not clobbered). Otherwise the payload would stay reachable in a
+     * slot nobody reads — the very leak this class exists to prevent.
+     */
+    fun publish(value: T): Boolean {
+        val displaced = ref.getAndSet(value)
+        if (displaced == null) {
+            ref.compareAndSet(value, null)
+            onDiscard(value)
+            return false
+        }
+        // A second publish displaces a payload that no longer has an owner.
+        if (displaced !== fallback) onDiscard(displaced)
+        return true
+    }
+
+    /**
+     * Caller side, once it stops reading. [taken] is the value it keeps (the
+     * caller's fallback when it gave up); anything else still in the slot is
+     * discarded. Returns whatever the slot held.
+     */
+    fun exit(taken: T?): T? {
+        val leftover = ref.getAndSet(null)
+        if (leftover != null && leftover !== fallback && leftover !== taken) onDiscard(leftover)
+        return leftover
+    }
+}
+
 class MinisAccessibilityService : AccessibilityService() {
 
     companion object {
@@ -253,51 +318,79 @@ class MinisAccessibilityService : AccessibilityService() {
      * `AccessibilityService.takeScreenshot` (API 30+). Blocks the calling
      * thread up to [timeoutMs]. Caller must check `Build.VERSION.SDK_INT`
      * before invoking — annotated `@RequiresApi(R)`.
+     *
+     * [T-android-a11y-late-screenshot] The callback is delivered by the system
+     * whenever it finishes, which can be *after* [timeoutMs] — the platform
+     * gives no way to unregister it. Each such late callback used to copy a
+     * full-screen bitmap (~10–15 MB) into a reference nobody would ever read
+     * again, so every timed-out capture leaked one screen-sized allocation for
+     * the life of the process. The hand-off now goes through [LateValueSlot]:
+     * the callback checks [LateValueSlot.isCallerWaiting] before allocating and
+     * publishes atomically, and this side closes the slot (recycling anything
+     * already published) before it returns.
+     *
+     * Consequence, deliberately: a screenshot that lands after the deadline is
+     * discarded rather than returned, so a timeout always reports TIMEOUT
+     * instead of sometimes succeeding with a late frame.
      */
     @RequiresApi(Build.VERSION_CODES.R)
     fun captureScreenshot(displayId: Int = Display.DEFAULT_DISPLAY, timeoutMs: Long = 5_000): ShotResult {
         val done = CountDownLatch(1)
-        val resultRef = java.util.concurrent.atomic.AtomicReference(
-            ShotResult(null, "TIMEOUT", "takeScreenshot timed out")
-        )
+        val timedOut = ShotResult(null, "TIMEOUT", "takeScreenshot timed out")
+        val slot = LateValueSlot(timedOut) { late -> late.bitmap?.recycle() }
         val executor = java.util.concurrent.Executors.newSingleThreadExecutor()
+        var result: ShotResult
         try {
             takeScreenshot(displayId, executor, object : TakeScreenshotCallback {
                 override fun onSuccess(screenshot: ScreenshotResult) {
                     try {
                         val hwBuffer: HardwareBuffer = screenshot.hardwareBuffer
+                        if (!slot.isCallerWaiting()) {
+                            // Caller already returned: release the buffer and skip
+                            // the whole-screen copy that nobody owns.
+                            try { hwBuffer.close() } catch (_: Throwable) {}
+                            return
+                        }
                         val cs: ColorSpace? = screenshot.colorSpace
                         val bmp = Bitmap.wrapHardwareBuffer(hwBuffer, cs)
                         try { hwBuffer.close() } catch (_: Throwable) {}
                         if (bmp == null) {
-                            resultRef.set(ShotResult(null, "DECODE_FAILED", "wrapHardwareBuffer returned null"))
+                            slot.publish(ShotResult(null, "DECODE_FAILED", "wrapHardwareBuffer returned null"))
                         } else {
                             // Copy to a software bitmap so we can encode + scale freely.
                             val sw = bmp.copy(Bitmap.Config.ARGB_8888, false)
                             bmp.recycle()
-                            resultRef.set(ShotResult(sw))
+                            slot.publish(ShotResult(sw))
                         }
                     } catch (t: Throwable) {
-                        resultRef.set(ShotResult(null, "DECODE_FAILED", "${t.javaClass.simpleName}: ${t.message ?: ""}"))
+                        slot.publish(ShotResult(null, "DECODE_FAILED", "${t.javaClass.simpleName}: ${t.message ?: ""}"))
                     } finally {
                         done.countDown()
                     }
                 }
 
                 override fun onFailure(errorCode: Int) {
-                    resultRef.set(ShotResult(null, "TAKE_SCREENSHOT_FAILED", "takeScreenshot error code=$errorCode"))
+                    slot.publish(ShotResult(null, "TAKE_SCREENSHOT_FAILED", "takeScreenshot error code=$errorCode"))
                     done.countDown()
                 }
             })
             if (!done.await(timeoutMs, TimeUnit.MILLISECONDS)) {
                 AppLogger.warning(TAG, "takeScreenshot timed out after ${timeoutMs}ms")
+                // Nobody will read the slot: reclaim whatever a late callback left.
+                slot.exit(timedOut)
+                return timedOut
             }
+            result = slot.current() ?: timedOut
         } catch (t: Throwable) {
-            resultRef.set(ShotResult(null, "INTERNAL", "${t.javaClass.simpleName}: ${t.message ?: ""}"))
+            slot.publish(ShotResult(null, "INTERNAL", "${t.javaClass.simpleName}: ${t.message ?: ""}"))
+            result = slot.current() ?: timedOut
         } finally {
             executor.shutdown()
         }
-        return resultRef.get()
+        // Hand-off complete: close the slot so a callback still in flight discards
+        // its own bitmap instead of parking it here.
+        slot.exit(result)
+        return result
     }
 
     fun setNodeText(node: AccessibilityNodeInfo, text: String): Boolean {
