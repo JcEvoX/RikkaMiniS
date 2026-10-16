@@ -75,7 +75,7 @@ internal object ChatDebugMethods {
         val session = repo.dao.getSession(sessionId)
             ?: throw RPCException(-32602, "Session not found")
         val provRepo = provider(context)
-        val msgs = repo.dao.loadMessages(sessionId)
+        val messageCount = repo.messageCount(sessionId)
         return JSONObject().apply {
             put("id", session.id)
             put("title", session.title ?: JSONObject.NULL)
@@ -85,7 +85,7 @@ internal object ChatDebugMethods {
             put("isRunning", SessionActivityTracker.isActive(session.id))
             put("memoryEnabled", session.memoryEnabled == 1)
             put("category", session.category ?: JSONObject.NULL)
-            put("messageCount", msgs.size)
+            put("messageCount", messageCount)
             put("createdAt", session.createdAt)
             put("updatedAt", session.updatedAt)
         }
@@ -109,7 +109,7 @@ internal object ChatDebugMethods {
 
         val repo = chat(context)
         repo.dao.getSession(sessionId) ?: throw RPCException(-32602, "Session not found")
-        val all = repo.dao.loadMessages(sessionId)
+        val all = repo.loadMessages(sessionId)
         val filtered = if (rolesFilter == null) all else all.filter { it.role in rolesFilter }
         val sliced = filtered.drop(offset).take(limit)
 
@@ -170,7 +170,7 @@ internal object ChatDebugMethods {
         val perTurn = params.optBoolean("perTurn", false)
         val repo = chat(context)
         repo.dao.getSession(sessionId) ?: throw RPCException(-32602, "Session not found")
-        val msgs = repo.dao.loadMessages(sessionId)
+        val msgs = repo.loadMessages(sessionId)
 
         var totalIn = 0L
         var totalOut = 0L
