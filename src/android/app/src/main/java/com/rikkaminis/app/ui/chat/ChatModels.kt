@@ -467,11 +467,25 @@ internal fun neutralizeCompactArtifacts(messages: List<ChatMessage>): List<ChatM
  * for it. See [neutralizeCompactArtifacts] for why the payload is the
  * discriminator rather than `toolName` alone.
  *
+ * [fix/da1016-chat-sysinfo] The payload may sit in ANY block, not only the
+ * first: `appendSystemInfo` coalesces every same-`iconKind` call landing
+ * inside the 200 ms `SYSINFO_COALESCE_WINDOW_MS` window (ChatViewModel) into
+ * ONE ChatMessage whose `toolBlocks` accumulate in call order, and the
+ * message keeps the FIRST block's id (`flushPendingSysInfo` hands
+ * `pendingSysInfoBlocks.toList()` straight to `toolBlocks`). A `"compact"`
+ * notice that shares the window with the divider therefore pushes the
+ * payload-bearing block off index 0 — the old `firstOrNull()` shape then
+ * reported "not a divider" and silently disabled BOTH consumers:
+ * `applyCompactGreyedRange` left the stale divider in the list and never
+ * re-anchored the greyed range, and `revertCompact` (ChatViewModel) left the
+ * divider behind after undoing the fold. Existence over position is the right
+ * reading of "this row carries the summary", and it costs nothing for the
+ * single-block rows that make up every other case.
+ *
  * Shared with the tests so the production predicate cannot drift away from
  * the one under assertion.
  */
 internal fun ChatMessage.isCompactDividerRow(): Boolean {
     if (role != "system") return false
-    val block = toolBlocks.firstOrNull() ?: return false
-    return block.toolName == "compact" && block.toolArgs.isNotEmpty()
+    return toolBlocks.any { it.toolName == "compact" && it.toolArgs.isNotEmpty() }
 }
