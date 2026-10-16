@@ -2575,6 +2575,14 @@ def test_da1017_external_fixtures():
 DA1016_GATES = [
     # (script without .py, selftest closing marker, real-tree argv)
     ("tts_voice_and_sanitizer_check", "TTS-VOICE GATE ALL ARMS MATCH", ("--root", REPO_ROOT)),
+    ("loop_persist_slice_check", 'SELFTEST=PASS loop_persist_slice_check (6 violating fixtures red, compliant fixture green)', (REPO_ROOT,)),
+    ("offload_host_path_check", 'SELFTEST=PASS (7 fixtures: 4 violations caught, 3 clean trees green)', (REPO_ROOT,)),
+    ("browser_tab_exec_serial_check", 'SELFTEST=PASS (browser_tab_exec_serial: 3 fixtures)', (REPO_ROOT,)),
+    ("downloads_atomic_update_check", 'SELFTEST=PASS (downloads_atomic_update: 4 fixtures)', (REPO_ROOT,)),
+    ("compact_decision_gate_check", 'COMPACT_DECISION_GATE_SELFTEST=PASS', (REPO_ROOT,)),
+    ("schedule_date_source_check", 'SELFTEST=PASS (schedule-date-source: 2 files x 2 arms, teeth on every criterion)', (REPO_ROOT,)),
+    ("sysinfo_state_thread_check", 'SYSINFO-STATE SELFTEST=PASS', (REPO_ROOT,)),
+    ("rss_probe_lock_scope_check", 'SELFTEST=PASS (5 fixtures)', (REPO_ROOT,)),
 ]
 
 def test_da1016_gates():
