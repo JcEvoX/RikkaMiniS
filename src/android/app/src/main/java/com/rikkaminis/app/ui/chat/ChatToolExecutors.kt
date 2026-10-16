@@ -253,6 +253,39 @@ internal fun executeMemoryRollupTool(
 }
 
 /**
+ * [fix/da1017-subagent-residue] Record a finished turn's VISIBLE text in the
+ * sub-agent [history] as the assistant message the model actually wrote.
+ *
+ * Every path that hands the turn back to the model (`continue` instead of
+ * `break` — residue refill, truncation continuation) MUST call this first.
+ * The sub-agent's history is the ONLY thing the next request shows the model:
+ * a hand-back that leaves the turn out of history makes the model re-write
+ * what it already wrote (the copy lands in `resultSb` a second time, which is
+ * the sub-agent's persisted result — the main agent reads the text twice).
+ * The MAIN loop has the same contract at `AgentLoopEngine`'s
+ * `agentHistory.add(content = turnText)` — this is its sub-agent twin.
+ *
+ * Conventions mirrored from the main loop / the truncation path:
+ *  - [text] is the turn's VISIBLE text (residue already stripped) — see the
+ *    call site's `ToolCallResiduePolicy.stripResidue` step. The raw markup
+ *    must never reach history (it would re-enter every later request).
+ *  - A blank turn appends NOTHING. Both providers filter
+ *    `content.isEmpty() && contentParts.isEmpty()` messages out of the
+ *    request, so a blank shell is invisible to the model while still
+ *    breaking role alternation in memory — the exact shape
+ *    [ensureRoleAlternationBeforeUserAppend] then "bridges" into a
+ *    synthetic assistant turn (Anthropic hard 400 territory is avoided by
+ *    NOT creating the shell in the first place).
+ *
+ * @return true when an assistant message was appended.
+ */
+internal fun appendSubagentTurnText(history: MutableList<LLMMessage>, text: String): Boolean {
+    if (text.isBlank()) return false
+    history.add(LLMMessage(role = LLMMessage.Role.ASSISTANT, content = text))
+    return true
+}
+
+/**
  * [T7-subagent] The spawn_agent multi-turn loop, extracted verbatim from
  * ChatViewModel.executeSpawnAgentTool with the provider stream + sub-tool
  * executor injected as functions (no ViewModel capture).
@@ -359,6 +392,15 @@ internal suspend fun runSubagentLoop(
                 if (residue != null && subResidueNudges < ToolCallResiduePolicy.MAX_RESIDUE_REFILL_NUDGES) {
                     subResidueNudges++
                     val refill = ToolCallResiduePolicy.refillMessage(residue)
+                    // [fix/da1017-subagent-residue] The residue turn's VISIBLE
+                    // text is the assistant turn — record it before the nudge.
+                    // Without it the model never sees what it just wrote (the
+                    // refill names only the tool, never the prose) and restates
+                    // the same text on the retry, so `resultSb` carries it
+                    // twice. Same contract as the main loop, where the turn's
+                    // stripped text enters agentHistory (AgentLoopEngine) right
+                    // before its refill nudge.
+                    appendSubagentTurnText(history, text)
                     // Same invariant as the main loop's nudges: tool results
                     // are persisted to history as role=USER messages, so the
                     // tail here can be user(tool_result) — a blind USER append
@@ -389,10 +431,11 @@ internal suspend fun runSubagentLoop(
                 if (TruncatedToolCallPolicy.isTruncatedFinish(turnFinishReason) || turnTruncated) {
                     if (text.isNotBlank() && truncationContinues < MAX_SUBAGENT_TRUNCATION_CONTINUES) {
                         truncationContinues++
-                        history.add(LLMMessage(
-                            role = LLMMessage.Role.ASSISTANT,
-                            content = text,
-                        ))
+                        // [fix/da1017-subagent-residue] Same hand-back contract
+                        // as the residue refill above: the partial turn stays in
+                        // history, so the model resumes at the exact cut point
+                        // instead of re-writing the part it already emitted.
+                        appendSubagentTurnText(history, text)
                         ensureRoleAlternationBeforeUserAppend(history)
                         val reminder = lengthWallReminder(text.takeLast(80))
                         history.add(LLMMessage(
@@ -443,6 +486,14 @@ internal suspend fun runSubagentLoop(
                 ))
             }
         }
+    } catch (e: CancellationException) {
+        // [fix/da1017-subagent-residue] A stop / cancellation is not a
+        // sub-agent failure — the generic catch below used to swallow it and
+        // hand back a "Sub-agent '<name>' encountered an error" result (a
+        // stop reads as a crash, and the log line blames the model). Same
+        // shape as the other executors in this file. Cancellation is
+        // cooperative: rethrow so the caller's own cleanup runs.
+        throw e
     } catch (e: Exception) {
         val msg = e.message ?: e.javaClass.simpleName
         log("[Subagent] '$skillName' error after $turns turn(s): $msg")

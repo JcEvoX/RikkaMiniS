@@ -2512,6 +2512,59 @@ def test_thinking_wiring():
     check("missing picker call fails instead of passing silently", code == 1, f"exit={code}\n{out}")
     shutil.rmtree(root)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# deep-audit-1017 gates (FIX-A..G, registered at union-tree wrap-up)
+# Each new gate ships its own --selftest with negative arms (pre-fix shapes
+# asserted red) — asserted here with a marker so a stubbed gate cannot pass
+# silently; the real-tree check pins the union tree the way CI runs it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+DA1017_GATES = [
+    # (script without .py, selftest marker that proves negative arms ran, real-tree argv)
+    ("tool_result_image_branch_check", "missing provider package is a hard failure", (REPO_ROOT,)),
+    ("turn_tail_finalize_order", "SELFTEST PASS", (REPO_ROOT,)),
+    ("subagent_handback_check", "SELFTEST OK", (REPO_ROOT,)),
+    ("calendar_events_nullable_predicate_check", "ALL ARMS MATCH", ("--root", REPO_ROOT)),
+    ("shizuku_args_check", "gate flips red on every criterion", (REPO_ROOT,)),
+    ("marker_boundary_check", "SELFTEST=PASS", (REPO_ROOT,)),
+    ("a11y_handler_contract_check", "selftest passed", (REPO_ROOT,)),
+]
+
+def test_da1017_gates():
+    print("━━━ deep-audit-1017 gates (selftest teeth + real tree) ━━━")
+    for script, marker, real_args in DA1017_GATES:
+        proc = subprocess.run(
+            [sys.executable, os.path.join(SCRIPT_DIR, script + ".py"), "--selftest"],
+            capture_output=True, text=True,
+        )
+        out = (proc.stdout or "") + (proc.stderr or "")
+        check(f"{script} selftest has teeth ({marker})", proc.returncode == 0 and marker in out,
+              out[-280:])
+        rc, out = run_scanner(script + ".py", *real_args)
+        check(f"{script} real tree green", rc == 0, out[-280:])
+
+def test_da1017_external_fixtures():
+    """External clean/dirty pairs for the two gates that ship module-level fixture
+    constants: import the gate, materialize its GOOD/PRE-fix fixture into a temp
+    tree, and drive the gate as a subprocess — independent of the gate's own
+    selftest wiring (a gate stubbed to exit 0 still fails here)."""
+    print("━━━ deep-audit-1017 external fixture pairs ━━━")
+    import importlib.util
+    for script, clean_const, dirty_const, dirty_name in (
+        ("marker_boundary_check", "OK_FIXTURE", "PRE_FIX_FIXTURE", "pre-fix boundary hit"),
+        ("subagent_handback_check", "GOOD", "NO_ECHO", "missing assistant echo"),
+    ):
+        spec = importlib.util.spec_from_file_location(
+            script, os.path.join(SCRIPT_DIR, script + ".py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        clean_root = make_tree({mod.TARGET: getattr(mod, clean_const)})
+        rc, out = run_scanner(script + ".py", clean_root)
+        check(f"{script} external clean fixture green", rc == 0, out[-280:])
+        dirty_root = make_tree({mod.TARGET: getattr(mod, dirty_const)})
+        rc, out = run_scanner(script + ".py", dirty_root)
+        check(f"{script} external {dirty_name} fixture red", rc == 1, out[-280:])
+
 def main():
     print("╔══════════════════════════════════════════════════╗")
     print("║  Scan Self-Test (fixture ground truth)          ║")
@@ -2543,6 +2596,8 @@ def main():
     test_readonly_mount_write_guard()
     test_exec_gate()
     test_scheduled_store_release()
+    test_da1017_gates()
+    test_da1017_external_fixtures()
     test_real_repo()
     print("")
     print(f"{'❌ FAILURES: ' + str(FAIL) if FAIL else '✅ ALL ' + str(PASS) + ' CASES PASS'}")

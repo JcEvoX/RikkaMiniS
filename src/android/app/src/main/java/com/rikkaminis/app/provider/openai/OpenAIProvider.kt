@@ -647,7 +647,7 @@ class OpenAIProvider constructor(
         val body = if (usesChatCompletionsAPI) {
             buildRequestBody(messages, systemPrompt, maxTokens, stream = true, temperature = temperature, imageParts = imageParts, tools = tools, thinkingLevel = thinkingLevel)
         } else {
-            buildResponsesAPIBody(messages, systemPrompt, maxTokens, stream = true, temperature = temperature, tools = tools, thinkingLevel = thinkingLevel)
+            buildResponsesAPIBody(messages, systemPrompt, maxTokens, stream = true, temperature = temperature, tools = tools, thinkingLevel = thinkingLevel, imageParts = imageParts)
         }
         // T302: serialize the request body exactly once. Pre-T302 we called
         // body.toString() three times per request (debug log + OAuth byte
@@ -2071,6 +2071,43 @@ class OpenAIProvider constructor(
                                 put("content", tr.content)
                             })
                         }
+                        // [da1017-01 / ISSUE-01] Tool-result images (read_image,
+                        // browser_use screenshots) used to be dropped here: a
+                        // role:"tool" entry only accepts a plain string, and
+                        // nothing else in this branch looked at
+                        // ToolResult.imageData. Emit them in the user message
+                        // right after the tool results — see
+                        // OpenAIToolResultImages. Capture-only results
+                        // (imageData == null) add no entry at all, so a
+                        // text-only history serializes byte-identically to
+                        // before this change.
+                        val toolResultImages = toolResults.mapNotNull { tr ->
+                            val bytes = tr.imageData
+                            val mime = tr.imageMimeType
+                            if (bytes != null && mime != null) {
+                                OpenAIToolResultImages.Entry(
+                                    caption = "[tool result image: ${capChatToolCallId(tr.id)}]",
+                                    bytes = bytes,
+                                    mimeType = mime,
+                                )
+                            } else {
+                                null
+                            }
+                        }
+                        if (toolResultImages.isNotEmpty()) {
+                            messagesArray.put(JSONObject().apply {
+                                put("role", "user")
+                                put(
+                                    "content",
+                                    OpenAIToolResultImages.chatUserContent(
+                                        entries = toolResultImages,
+                                        supportsImages = supportsImages,
+                                        compress = { com.rikkaminis.app.provider.ImageBudget.compressUnderBudget(it) },
+                                        encodeBase64 = { Base64.encodeToString(it, Base64.NO_WRAP) },
+                                    ),
+                                )
+                            })
+                        }
                         // T132: emit text + image_url parts as a structured user
                         // message. The previous structured-contentParts branch
                         // dropped AgentContentPart.ImageData entirely — only the
@@ -2715,6 +2752,15 @@ class OpenAIProvider constructor(
         temperature: Double? = null,
         tools: List<AgentToolDefinition> = emptyList(),
         thinkingLevel: ThinkingLevel = ThinkingLevel.OFF,
+        // [da1017-01 / ISSUE-01] Top-level image attachments of the current
+        // turn. The Chat-Completions builder has taken this since T132; this
+        // one never did, so every Responses-API request that carried images
+        // (image-generation / image-edit via the `minis-model-use` CLI on a
+        // Codex-OAuth instance) went out with the bytes silently missing —
+        // the model only saw whatever caption the caller embedded in the
+        // prompt. Defaulted for the same reason the parameter above is:
+        // existing callers stay source-compatible.
+        imageParts: List<LLMMessage.ImagePart> = emptyList(),
     ): JSONObject {
         // T264: same vision-capability gate as buildRequestBody. Responses API
         // path (Codex OAuth) is currently always wired to a vision-capable
@@ -2895,7 +2941,11 @@ class OpenAIProvider constructor(
         // structured content parts become typed input items — function_call /
         // function_call_output — instead of free-text role/content pairs.
         val input = JSONArray()
-        for (msg in sanitizedMessages) {
+        // [da1017-01] Same anchor the Chat-Completions builder uses: the
+        // top-level `imageParts` argument belongs to the CURRENT turn, which is
+        // the last user message in the list.
+        val lastUserIndex = sanitizedMessages.indexOfLast { it.role == LLMMessage.Role.USER }
+        for ((index, msg) in sanitizedMessages.withIndex()) {
             if (msg.contentParts.isNotEmpty()) {
                 when (msg.role) {
                     LLMMessage.Role.ASSISTANT -> {
@@ -2928,12 +2978,46 @@ class OpenAIProvider constructor(
                         }
                     }
                     LLMMessage.Role.USER -> {
-                        for (tr in msg.contentParts.filterIsInstance<AgentContentPart.ToolResult>()) {
+                        val toolResults = msg.contentParts.filterIsInstance<AgentContentPart.ToolResult>()
+                        for (tr in toolResults) {
                             val (callId, _) = splitResponsesAPIIds(tr.id)
                             input.put(JSONObject().apply {
                                 put("type", "function_call_output")
                                 put("call_id", capResponsesId(callId))
                                 put("output", tr.content)
+                            })
+                        }
+                        // [da1017-01 / ISSUE-01] Tool-result images. Same defect
+                        // as the Chat-Completions branch above and the same
+                        // remedy: `function_call_output.output` is a plain
+                        // string, so the bytes ride in the user message that
+                        // follows — via the input_image part type this path
+                        // already uses for composer attachments.
+                        val toolResultImages = toolResults.mapNotNull { tr ->
+                            val bytes = tr.imageData
+                            val mime = tr.imageMimeType
+                            if (bytes != null && mime != null) {
+                                OpenAIToolResultImages.Entry(
+                                    caption = "[tool result image: ${capResponsesId(splitResponsesAPIIds(tr.id).first)}]",
+                                    bytes = bytes,
+                                    mimeType = mime,
+                                )
+                            } else {
+                                null
+                            }
+                        }
+                        if (toolResultImages.isNotEmpty()) {
+                            input.put(JSONObject().apply {
+                                put("role", "user")
+                                put(
+                                    "content",
+                                    OpenAIToolResultImages.responsesUserContent(
+                                        entries = toolResultImages,
+                                        supportsImages = supportsImages,
+                                        compress = { com.rikkaminis.app.provider.ImageBudget.compressUnderBudget(it) },
+                                        encodeBase64 = { Base64.encodeToString(it, Base64.NO_WRAP) },
+                                    ),
+                                )
                             })
                         }
                         // T132: emit text + input_image content for the user
@@ -3006,6 +3090,35 @@ class OpenAIProvider constructor(
                         })
                     }
                 }
+            } else if (imageParts.isNotEmpty() && msg.role == LLMMessage.Role.USER && index == lastUserIndex) {
+                // [da1017-01 / ISSUE-01] Legacy (non-contentParts) message whose
+                // images arrive in the top-level `imageParts` argument — the
+                // `minis-model-use` CLI path, and the analogue of the
+                // `attachTopLevelImages` branch in buildRequestBody. Before
+                // this, the Responses builder had no image handling of any
+                // kind: a Codex-OAuth instance asked to do image generation or
+                // image editing sent the prompt text and none of the bytes.
+                // Mirrors the Chat flavour: images first, then the message text
+                // as an input_text part (an empty one is skipped, per GH#67's
+                // note about servers that reject it).
+                val contentArray = OpenAIToolResultImages.responsesUserContent(
+                    entries = imageParts.map {
+                        OpenAIToolResultImages.Entry(caption = "", bytes = it.data, mimeType = it.mimeType)
+                    },
+                    supportsImages = supportsImages,
+                    compress = { com.rikkaminis.app.provider.ImageBudget.compressUnderBudget(it) },
+                    encodeBase64 = { Base64.encodeToString(it, Base64.NO_WRAP) },
+                )
+                if (msg.content.isNotEmpty()) {
+                    contentArray.put(JSONObject().apply {
+                        put("type", "input_text")
+                        put("text", msg.content)
+                    })
+                }
+                input.put(JSONObject().apply {
+                    put("role", "user")
+                    put("content", contentArray)
+                })
             } else if (msg.audioParts.isNotEmpty()) {
                 // [GH#67] Legacy (non-contentParts) message carrying audio —
                 // the minis-model-use path. The Responses API keeps the SAME
@@ -3214,3 +3327,108 @@ class OpenAIProvider constructor(
 
 // [refactor/split-provider] OkHttpNetTraceListener moved verbatim to
 // OkHttpNetTraceListener.kt (private -> internal).
+
+/**
+ * [da1017-01 / ISSUE-01] Wire encoding for images that reach the request
+ * through a **tool result** (`AgentContentPart.ToolResult.imageData` —
+ * `read_image` and `browser_use` screenshots) on the two OpenAI flavours.
+ *
+ * Why a user message instead of the tool message: OpenAI's `role:"tool"`
+ * entry (and the Responses API's `function_call_output`) carries a plain
+ * string, so there is no field to hang bytes on. The images therefore ride in
+ * the user message that immediately follows the tool results, carrying a
+ * caption text part so the model can pair each image back to the tool call.
+ *
+ * Why this object exists at all: `grep -n imageData` over this file used to
+ * return **0 hits** while both siblings had the branch already —
+ * AnthropicProvider `:789` (image block inside `tool_result.content`) and
+ * GeminiProvider `:431` (`inlineData` sibling part). Anthropic/Gemini can put
+ * the bytes *inside* the tool-result block because their schemas allow it;
+ * OpenAI cannot, which is the whole reason the shape differs. Same defect
+ * family as the earlier "[FIX-1 / F-192] read_image returns ToolResult
+ * imageData" fix — OpenAI was the third of three.
+ *
+ * The two platform edges are injected (`compress` =
+ * `ImageBudget.compressUnderBudget`, `encodeBase64` = `android.util.Base64`)
+ * so the wire shape — the part that the tests pin — stays JVM-testable; the
+ * budget/b64 choices at the call sites are identical to the ones the
+ * `ImageData` branches in both serializers already make.
+ */
+internal object OpenAIToolResultImages {
+    /**
+     * One image queued for the wire. [caption] is emitted as a text part
+     * immediately before the image part (same "caption precedes its image"
+     * ordering the composer uses for `[attached image: …]` parts); an empty
+     * caption is skipped.
+     */
+    class Entry(val caption: String, val bytes: ByteArray, val mimeType: String)
+
+    /** Chat Completions user content array (`text` + `image_url` object). */
+    fun chatUserContent(
+        entries: List<Entry>,
+        supportsImages: Boolean,
+        compress: (ByteArray) -> ByteArray,
+        encodeBase64: (ByteArray) -> String,
+    ): JSONArray = build(entries, supportsImages, compress, encodeBase64, responsesFlavor = false)
+
+    /**
+     * Responses API user content array (`input_text` + `input_image` with the
+     * flattened `image_url` string) — see the T132 comment in the Responses
+     * serializer below the builders.
+     */
+    fun responsesUserContent(
+        entries: List<Entry>,
+        supportsImages: Boolean,
+        compress: (ByteArray) -> ByteArray,
+        encodeBase64: (ByteArray) -> String,
+    ): JSONArray = build(entries, supportsImages, compress, encodeBase64, responsesFlavor = true)
+
+    private fun build(
+        entries: List<Entry>,
+        supportsImages: Boolean,
+        compress: (ByteArray) -> ByteArray,
+        encodeBase64: (ByteArray) -> String,
+        responsesFlavor: Boolean,
+    ): JSONArray {
+        val textType = if (responsesFlavor) "input_text" else "text"
+        val out = JSONArray()
+        for (entry in entries) {
+            if (entry.caption.isNotEmpty()) {
+                out.put(JSONObject().apply {
+                    put("type", textType)
+                    put("text", entry.caption)
+                })
+            }
+            if (supportsImages) {
+                // T-imgsize: same belt-and-braces backstop the ImageData
+                // branches run — history tool-result screenshots can be raw
+                // 12-megapixel PNGs that never went through the composer's
+                // budget pass, and we would 413 on replay.
+                val safeBytes = compress(entry.bytes)
+                val safeMime = if (safeBytes === entry.bytes) entry.mimeType else "image/jpeg"
+                val dataUri = "data:$safeMime;base64,${encodeBase64(safeBytes)}"
+                out.put(if (responsesFlavor) {
+                    JSONObject().apply {
+                        put("type", "input_image")
+                        // Responses API takes image_url as a *string*, not the
+                        // {"url":…} object shape Chat Completions uses.
+                        put("image_url", dataUri)
+                    }
+                } else {
+                    JSONObject().apply {
+                        put("type", "image_url")
+                        put("image_url", JSONObject().apply { put("url", dataUri) })
+                    }
+                })
+            } else {
+                // T264: target model has no vision modality — one literal
+                // shared by every provider so they cannot drift apart.
+                out.put(JSONObject().apply {
+                    put("type", textType)
+                    put("text", VISION_UNSUPPORTED_PLACEHOLDER)
+                })
+            }
+        }
+        return out
+    }
+}

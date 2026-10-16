@@ -348,6 +348,94 @@ class PersistentShellTest {
         assertEquals("output-part1 partial ", flushed.toString())
     }
 
+    // ── internalScanMarker: exit-code / `__` split [fix/da1017-marker-boundary]
+    //
+    // A 4096-char read boundary can fall between `_EXIT_` and the digits (or
+    // inside the digits), leaving a marker prefix with no closing `__`. The old
+    // scan reported a hit there with the -1 "shell died" code and discarded the
+    // rest of the line; these tests pin the wait-for-the-full-marker contract.
+
+    @Test
+    fun `scanMarker does not hit while only the prefix has arrived`() {
+        val r = internalScanMarker("", "out__MINIS_DONE_abc123_EXIT_", "abc123")
+        assertFalse(r.hit)
+        assertEquals(-1, r.exitCode)
+        assertEquals("out", r.beforeMarker)
+        assertEquals("__MINIS_DONE_abc123_EXIT_", r.keptTail)
+    }
+
+    @Test
+    fun `scanMarker hits once the split exit code arrives in the next chunk`() {
+        val r = internalScanMarker("__MINIS_DONE_abc123_EXIT_", "0__\n", "abc123")
+        assertTrue(r.hit)
+        assertEquals(0, r.exitCode)
+        assertEquals("", r.beforeMarker)
+        assertEquals("", r.keptTail)
+    }
+
+    @Test
+    fun `scanMarker carries a partially delivered multi-digit exit code`() {
+        val first = internalScanMarker("", "a__MINIS_DONE_abc123_EXIT_12", "abc123")
+        assertFalse(first.hit)
+        assertEquals("a", first.beforeMarker)
+        assertEquals("__MINIS_DONE_abc123_EXIT_12", first.keptTail)
+
+        val second = internalScanMarker(first.keptTail, "7__", "abc123")
+        assertTrue(second.hit)
+        assertEquals(127, second.exitCode)
+        assertEquals("", second.beforeMarker)
+    }
+
+    @Test
+    fun `scanMarker waits for exit code split at the 4096 read boundary`() {
+        // Real shape: the reader's CharArray(4096) boundary lands exactly after
+        // `_EXIT_` — body 4069 chars + 25-char prefix = 4096 chars in chunk 1.
+        val prefix = "__MINIS_DONE_abc123_EXIT_"
+        val body = "x".repeat(4096 - prefix.length)
+        var tail = ""
+        val flushed = StringBuilder()
+        var exit = -2
+        for (chunk in listOf(body + prefix, "0__\n")) {
+            val r = internalScanMarker(tail, chunk, "abc123")
+            flushed.append(r.beforeMarker)
+            if (r.hit) { exit = r.exitCode; break }
+            tail = r.keptTail
+        }
+        assertEquals(0, exit)
+        assertEquals(body, flushed.toString())
+    }
+
+    @Test
+    fun `scanMarker flushes an over-long pending marker instead of buffering it`() {
+        // A literal prefix followed by 1000 chars without `__` is not a split
+        // marker (the marker is a fresh random token per command). It degrades
+        // to ordinary output — no unbounded withheld window.
+        val junk = "__MINIS_DONE_abc123_EXIT_" + "9".repeat(1000)
+        val r = internalScanMarker("", junk, "abc123")
+        assertFalse(r.hit)
+        assertEquals(-1, r.exitCode)
+        assertEquals("__MINIS_DONE_abc123_EXIT_" + "9".repeat(976), r.beforeMarker)
+        assertEquals("9".repeat(24), r.keptTail)
+    }
+
+    @Test
+    fun `scanMarker still finds a real marker after an over-long window was flushed`() {
+        val junk = "__MINIS_DONE_abc123_EXIT_" + "9".repeat(1000)
+        var tail = ""
+        val flushed = StringBuilder()
+        var exit = -2
+        for (chunk in listOf("A" + junk, "__MINIS_DONE_abc123_EXIT_3__\n")) {
+            val r = internalScanMarker(tail, chunk, "abc123")
+            flushed.append(r.beforeMarker)
+            if (r.hit) { exit = r.exitCode; break }
+            tail = r.keptTail
+        }
+        assertEquals(3, exit)
+        // Only the trailing 24-char window of the junk is carried, never the
+        // whole 1025-char run.
+        assertEquals(24, tail.length)
+    }
+
     // ── splitDisplayLines / DisplayLineBuffer ─────────────────────────
     //
     // Read chunks routinely end mid-line: internalScanMarker withholds the

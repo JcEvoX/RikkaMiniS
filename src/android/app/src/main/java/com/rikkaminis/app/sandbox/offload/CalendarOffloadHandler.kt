@@ -34,8 +34,8 @@ import java.util.TimeZone
  *                          [--notes N] [--location L] [--all-day]
  *                          [--alarm <minutes>] [--calendar NAME | --calendar-id ID]
  *   android-calendar update --id <event_id> [--title ...] [--start ...] [--end ...]
- *                          [--notes ...] [--location ...] [--alarm <minutes>]
- *                          [--calendar NAME | --calendar-id ID]
+ *                          [--notes ...] [--location ...] [--all-day]
+ *                          [--alarm <minutes>] [--calendar NAME | --calendar-id ID]
  *   android-calendar delete --id <event_id>
  *   android-calendar freebusy --start <ISO> --end <ISO>
  *   android-calendar calendars                List writable calendars
@@ -343,20 +343,65 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
         val id = args.getLong("id")
             ?: return NativeOffloadResult(2, "android-calendar update: --id <event_id> is required\n")
 
+        // [da1017-D2] All-day handling (was: silently ignored).
+        //
+        //  - `--all-day` used to be parsed as a boolean flag and then dropped:
+        //    the event stayed TIMED and the call still answered
+        //    {"updated":true,"rows":1} (measured on-device, event stayed
+        //    allDay=0 with eventTimezone=Asia/Singapore).
+        //  - `--start`/`--end` were always parsed in the device zone, but the
+        //    provider stores all-day events at UTC midnight: fixAllDayTime()
+        //    zeroes h/m/s in UTC and instance expansion forces TZ=UTC for
+        //    allDay rows (CalendarInstancesHelper: "in the events table,
+        //    allDay events start at midnight"). Re-parsing a bare date in
+        //    UTC+8 then truncated the value back a day — "move it to 11-26"
+        //    left the event on 11-25 while answering rows=1 (measured).
+        //
+        // The stored row decides the semantics even when the caller omitted
+        // the flag (moving an existing all-day event), and its day-span keeps
+        // DTEND consistent — see allDayEndRepairMs for why DTSTART cannot be
+        // written alone.
+        val explicitAllDay = args.hasFlag("all-day")
+        val stored = findEventRow(id)
+        val isAllDay = updateUsesAllDaySemantics(explicitAllDay, stored?.allDay)
+        fun parseInput(s: String): Long? = if (isAllDay) parseDateUtc(s) else parseDate(s)
+
         // Build a sparse ContentValues with only the fields the caller supplied.
         val values = ContentValues()
         args.get("title")?.let { values.put(CalendarContract.Events.TITLE, it) }
-        args.get("start")?.let { s ->
-            val ms = parseDate(s) ?: return NativeOffloadResult(2, "android-calendar update: invalid --start '$s'\n")
-            values.put(CalendarContract.Events.DTSTART, ms)
+        val newStartMs = args.get("start")?.let { s ->
+            parseInput(s) ?: return NativeOffloadResult(2, "android-calendar update: invalid --start '$s'\n")
         }
-        args.get("end")?.let { e ->
-            val ms = parseDate(e) ?: return NativeOffloadResult(2, "android-calendar update: invalid --end '$e'\n")
-            values.put(CalendarContract.Events.DTEND, ms)
+        val newEndMs = args.get("end")?.let { e ->
+            parseInput(e) ?: return NativeOffloadResult(2, "android-calendar update: invalid --end '$e'\n")
         }
+        newStartMs?.let { values.put(CalendarContract.Events.DTSTART, it) }
+        newEndMs?.let { values.put(CalendarContract.Events.DTEND, it) }
         args.get("location")?.let { values.put(CalendarContract.Events.EVENT_LOCATION, it) }
         (args.get("notes") ?: args.get("description"))?.let {
             values.put(CalendarContract.Events.DESCRIPTION, it)
+        }
+        if (explicitAllDay) {
+            // Same stored shape as doCreate: ALL_DAY=1 rides with
+            // EVENT_TIMEZONE="UTC" (Google Calendar rejects a local-tz
+            // all-day event, and the provider derives all-day boundaries in
+            // UTC regardless of the stored timezone).
+            values.put(CalendarContract.Events.ALL_DAY, 1)
+            values.put(CalendarContract.Events.EVENT_TIMEZONE, "UTC")
+        }
+        // [da1017-D2] An all-day event whose DTSTART moves without --end must
+        // not leave the stale DTEND behind: instance expansion drops any row
+        // whose dtend precedes the query window, so the "moved" event would
+        // silently disappear from both list and freebusy (measured on-device:
+        // an inverted all-day row, dtstart=11-26T00Z > dtend=11-25T00Z, was
+        // absent from instances/when over 11-25T23:00Z..11-27T00:00Z and
+        // `android-calendar list` answered events=[] for that day). Keep the
+        // stored day-span instead — 0 for the canonical single-day row, where
+        // the provider itself stores dtstart == dtend.
+        if (isAllDay && newStartMs != null && newEndMs == null) {
+            allDayEndRepairMs(stored?.startMs, stored?.endMs, newStartMs)?.let {
+                values.put(CalendarContract.Events.DTEND, it)
+            }
         }
         // --calendar / --calendar-id: move event to a different calendar.
         // resolveCalendarIdOptional lets either flag be absent without falling
@@ -446,18 +491,40 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
             return NativeOffloadResult(2, "android-calendar freebusy: --end must be after --start\n")
         }
 
-        val projection = arrayOf(
-            CalendarContract.Events.TITLE,
-            CalendarContract.Events.DTSTART,
-            CalendarContract.Events.DTEND,
-            CalendarContract.Events.ALL_DAY,
-        )
-        val selection = "${CalendarContract.Events.DTSTART} < ? AND ${CalendarContract.Events.DTEND} > ?"
-        val selArgs = arrayOf(endMs.toString(), startMs.toString())
-        val sort = "${CalendarContract.Events.DTSTART} ASC"
+        // [da1017-D1] Query CalendarContract.Instances, not Events.
+        //
+        // Recurring events carry RRULE + DURATION and leave Events.DTEND NULL:
+        // the provider rejects the two together (CalendarProvider2
+        // validateEventData: "Cannot have both DTEND and DURATION in an
+        // event"), and the documented insert contract is "dtend if the event
+        // is non-recurring / duration if the event is recurring". A NULL
+        // DTEND makes the old `DTEND > ?` predicate UNKNOWN — never true —
+        // for *every* recurring event, so weekly stand-ups, birthdays and
+        // holidays were all reported as free.
+        //
+        // Measured on-device (2026-10-16, Android 15) with a probe row
+        // FREQ=WEEKLY;COUNT=6 (dtend=NULL, duration=P1H): the Events
+        // predicate returned "No result found" for a window containing an
+        // occurrence, and `android-calendar freebusy` answered busy=[] with
+        // the whole window marked free, while `android-calendar list` (which
+        // already reads Instances) showed the occurrence. Instances expands
+        // RRULE rows and carries BEGIN/END per occurrence — the same source
+        // doList migrated to in [sweep1014-B25a].
+        val projection = freebusyInstanceProjection()
+        val (selection, selArgs) = instancesWindowSelection(startMs, endMs)
+        val sort = "${CalendarContract.Instances.BEGIN} ASC"
 
         val cursor = try {
-            context.contentResolver.query(CalendarContract.Events.CONTENT_URI, projection, selection, selArgs, sort)
+            // Same UriMatcher constraint as doList ([sweep1014-B25a-fix]): the
+            // bare instances CONTENT_URI has no registered match and the
+            // provider throws IllegalArgumentException — the window must ride
+            // as the two trailing path segments (instances/when/<start>/<end>).
+            // startMs/endMs are Longs, so no URI-injection surface.
+            val instancesUri = CalendarContract.Instances.CONTENT_URI.buildUpon()
+                .appendPath(startMs.toString())
+                .appendPath(endMs.toString())
+                .build()
+            context.contentResolver.query(instancesUri, projection, selection, selArgs, sort)
         } catch (e: SecurityException) {
             return NativeOffloadResult(77, providerBlockedJson("READ_CALENDAR", e, args))
         } catch (e: Throwable) {
@@ -724,6 +791,34 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
         return OffloadOutput.formatBody(body, args) + "\n"
     }
 
+    /**
+     * [da1017-D2] Snapshot of the stored event row used by update: whether it
+     * is all-day (which decides the date-parsing zone) and its current UTC
+     * span (which decides the DTEND repair). Null when the row cannot be read
+     * at all — a missing READ_CALENDAR grant, an OEM privacy layer, or an id
+     * that is not visible to this app. Callers must then fall back to the
+     * flag-only behaviour rather than guess.
+     */
+    private data class StoredEventRow(val allDay: Boolean, val startMs: Long?, val endMs: Long?)
+
+    private fun findEventRow(id: Long): StoredEventRow? = try {
+        val uri = CalendarContract.Events.CONTENT_URI.buildUpon()
+            .appendPath(id.toString()).build()
+        context.contentResolver.query(uri, EVENT_ROW_PROJECTION, null, null, null)?.use { c ->
+            if (c.moveToFirst()) {
+                StoredEventRow(
+                    allDay = c.getInt(0) == 1,
+                    startMs = if (c.isNull(1)) null else c.getLong(1),
+                    endMs = if (c.isNull(2)) null else c.getLong(2),
+                )
+            } else null
+        }
+    } catch (e: Throwable) {
+        // Not fatal: update proceeds with the flag-only interpretation.
+        AppLogger.warning(TAG, "update: could not read event $id (${e.message})")
+        null
+    }
+
     private fun parseDate(s: String): Long? =
         parseDateInZone(s, System.currentTimeMillis(), TimeZone.getDefault())
 
@@ -797,6 +892,66 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
             "${CalendarContract.Instances.BEGIN} < ? AND ${CalendarContract.Instances.END} > ?" to
                 arrayOf(winEndMs.toString(), winStartMs.toString())
 
+        // [da1017-D1] Projection for the freebusy Instances query. The index
+        // order is an implicit contract with the positional cursor reads in
+        // doFreebusy: 0 TITLE, 1 BEGIN, 2 END, 3 ALL_DAY. Kept as a function
+        // so the exact column list can be executed against a fixture SQLite
+        // schema in JVM probes (a wrong column name fails there loudly instead
+        // of coming back null on-device).
+        internal fun freebusyInstanceProjection(): Array<String> = arrayOf(
+            CalendarContract.Instances.TITLE,
+            CalendarContract.Instances.BEGIN,
+            CalendarContract.Instances.END,
+            CalendarContract.Instances.ALL_DAY,
+        )
+
+        // [da1017-D2] Projection for the stored-row snapshot read by update:
+        // 0 ALL_DAY, 1 DTSTART, 2 DTEND (positional reads in findEventRow).
+        private val EVENT_ROW_PROJECTION = arrayOf(
+            CalendarContract.Events.ALL_DAY,
+            CalendarContract.Events.DTSTART,
+            CalendarContract.Events.DTEND,
+        )
+
+        /**
+         * [da1017-D2] Which date semantics an update must use: an explicit
+         * `--all-day` flag, or the stored event already being all-day (moving
+         * an all-day event has to stay on UTC-midnight boundaries even when
+         * the caller left the flag out). [storedAllDay] is null when the row
+         * could not be read — then only the flag decides, i.e. the previous
+         * behaviour, never a guess. Pure so the truth table is JVM-testable.
+         */
+        internal fun updateUsesAllDaySemantics(explicitAllDay: Boolean, storedAllDay: Boolean?): Boolean =
+            explicitAllDay || storedAllDay == true
+
+        /**
+         * [da1017-D2] DTEND to write when an all-day event's DTSTART moves
+         * without `--end`. Returns null when DTSTART did not move (no repair
+         * needed).
+         *
+         * Writing DTSTART alone leaves DTEND behind, and the provider then
+         * hides the event: instance expansion skips any row whose END precedes
+         * the window start (CalendarInstancesHelper: `if (dtendMillis < begin)
+         * continue`), so an all-day event pushed later than its old DTEND
+         * disappears from both `list` and `freebusy` — measured on-device with
+         * an inverted probe row (dtstart=11-26T00:00Z > dtend=11-25T00:00Z):
+         * no instance in the 11-25T23:00Z..11-27T00:00Z window, `list`
+         * answered events=[].
+         *
+         * The stored day-span is preserved rather than collapsed: the provider
+         * stores the canonical single-day row as dtstart == dtend, so a span of
+         * 0 reproduces exactly the shape doCreate + fixAllDayTime() produce,
+         * while a multi-day all-day event keeps its length. Unknown span
+         * (unreadable row) degrades to 0 — the canonical single-day shape.
+         */
+        internal fun allDayEndRepairMs(storedStartMs: Long?, storedEndMs: Long?, newStartMs: Long?): Long? {
+            if (newStartMs == null) return null
+            val span = if (storedStartMs != null && storedEndMs != null && storedEndMs > storedStartMs) {
+                storedEndMs - storedStartMs
+            } else 0L
+            return newStartMs + span
+        }
+
         private const val HELP = """android-calendar — list, create, update, delete events; query free/busy
                                     (mirrors apple-calendar)
 
@@ -808,14 +963,17 @@ Usage:
                          [--notes N] [--location L] [--all-day]
                          [--alarm <minutes>] [--calendar NAME | --calendar-id ID]
   android-calendar update --id <event_id> [--title ...] [--start ...] [--end ...]
-                         [--notes ...] [--location ...] [--alarm <minutes>]
+                         [--notes ...] [--location ...] [--all-day] [--alarm <minutes>]
                          [--calendar NAME | --calendar-id ID]
   android-calendar delete --id <event_id>
   android-calendar freebusy --start <ISO> --end <ISO>
   android-calendar calendars             List writable calendars (debugging)
 
 Dates accept ISO 8601 (YYYY-MM-DDThh:mm[:ss][Z|±HH:MM]) or relative
-shorthand (-7d, -2h, +30m). YYYY-MM-DD is treated as midnight local.
+shorthand (-7d, -2h, +30m). YYYY-MM-DD is treated as midnight local,
+except for all-day events: those are stored on UTC-midnight boundaries
+(create --all-day, or update of an event that is already all-day), so
+their dates are parsed in UTC instead.
 
 Aliases for backwards compatibility:
   --max ↔ --limit

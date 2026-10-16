@@ -473,7 +473,9 @@ class PersistentShell(
                         tail = ""
                     } else {
                         // Keep the trailing window — the marker (or its
-                        // start) may be split across this chunk boundary.
+                        // start, or an `_EXIT_<n>__` split by the chunk
+                        // boundary — [fix/da1017-marker-boundary]) may be
+                        // split across this chunk boundary.
                         tail = scan.keptTail
                     }
                 } else {
@@ -1105,16 +1107,38 @@ internal class IncrementalUtf8Budget(private val maxBytesProvider: () -> Int) {
 }
 
 /**
+ * [fix/da1017-marker-boundary] Upper bound on the pending-marker window that
+ * may be withheld across reads once a `__MINIS_DONE_<marker>_EXIT_` prefix has
+ * been seen without its closing `__`.
+ *
+ * A legitimately split marker is at most the 27-char prefix (13 chars of
+ * `__MINIS_DONE_` + the 8-char marker + 6 chars of `_EXIT_`) plus a few
+ * exit-code digits plus `__`, so 64 leaves roughly 2x headroom for any real
+ * marker — the marker is a fresh random token per command, so a stream that
+ * keeps the prefix open for 64+ chars is garbled or hostile output. Dropping
+ * the window there keeps the reader's memory bounded (the withheld tail is
+ * never counted against the output budget, which is capped separately) and the
+ * command still converges through the existing stall-guard / timeout / EOF
+ * paths in [PersistentShell.readLoop].
+ */
+internal const val MAX_PENDING_MARKER_CHARS = 64
+
+/**
  * Cross-chunk scan for the completion marker. `text` is the latest chunk
  * read from the shell's stdout; `tail` is the trailing window withheld from
  * the PREVIOUS chunk (it may hold the start of a marker that got split).
  *
  * Hit  → [MarkerScanResult.beforeMarker] = all output before the marker,
  *        [MarkerScanResult.exitCode] = parsed exit code, `keptTail` empty.
+ *        A hit requires the FULL `_EXIT_<n>__` to have arrived: the prefix
+ *        alone is not a completion.
  * Miss → [MarkerScanResult.beforeMarker] = output safe to flush now,
  *        [MarkerScanResult.keptTail] = last (markerPattern.length - 1)
  *        chars that could be a split marker prefix (must be re-scanned with
- *        the next chunk).
+ *        the next chunk), or — [fix/da1017-marker-boundary] — the whole
+ *        pending marker (prefix + partial exit code) when the read boundary
+ *        fell between `_EXIT_` and the closing `__`, capped by
+ *        [MAX_PENDING_MARKER_CHARS].
  *
  * Extracted as a pure function so the split-marker behaviour is JVM-testable
  * without Android deps (see [internalParseMinisExitCode]).
@@ -1130,21 +1154,43 @@ internal fun internalScanMarker(tail: String, text: String, marker: String): Mar
     val markerPattern = "__MINIS_DONE_${marker}_EXIT_"
     val combined = if (tail.isEmpty()) text else tail + text
     val idx = combined.indexOf(markerPattern)
-    return if (idx >= 0) {
-        MarkerScanResult(
-            hit = true,
-            beforeMarker = combined.substring(0, idx),
-            exitCode = internalParseMinisExitCode(combined.substring(idx), marker),
-            keptTail = "",
-        )
-    } else {
-        val keepLen = (markerPattern.length - 1).coerceAtMost(combined.length)
-        val flushEnd = combined.length - keepLen
-        MarkerScanResult(
-            hit = false,
-            beforeMarker = combined.substring(0, flushEnd),
-            exitCode = -1,
-            keptTail = combined.substring(flushEnd),
-        )
+    if (idx >= 0) {
+        val exitCode = internalParseMinisExitCode(combined.substring(idx), marker)
+        if (exitCode >= 0) {
+            return MarkerScanResult(
+                hit = true,
+                beforeMarker = combined.substring(0, idx),
+                exitCode = exitCode,
+                keptTail = "",
+            )
+        }
+        // [fix/da1017-marker-boundary] Prefix present, closing `_EXIT_<n>__`
+        // not (yet): the read boundary fell inside the marker line. Reporting a
+        // hit here (the old behaviour) declared the command complete with
+        // `exitCode = -1` — the "shell died" code, which makes
+        // ExecutionCoordinator rebuild the shell and RE-RUN the command — and
+        // discarded every byte of the marker line that had not arrived yet.
+        // Flush what is safely output and carry the rest for the next chunk.
+        val pending = combined.substring(idx)
+        if (pending.length <= MAX_PENDING_MARKER_CHARS) {
+            return MarkerScanResult(
+                hit = false,
+                beforeMarker = combined.substring(0, idx),
+                exitCode = -1,
+                keptTail = pending,
+            )
+        }
+        // Too long to be a real split marker (see [MAX_PENDING_MARKER_CHARS]):
+        // fall through and treat it as ordinary output, i.e. flush all but the
+        // usual trailing window. Nothing is lost, and a complete marker that
+        // arrives in a later chunk is still found by the scan above.
     }
+    val keepLen = (markerPattern.length - 1).coerceAtMost(combined.length)
+    val flushEnd = combined.length - keepLen
+    return MarkerScanResult(
+        hit = false,
+        beforeMarker = combined.substring(0, flushEnd),
+        exitCode = -1,
+        keptTail = combined.substring(flushEnd),
+    )
 }

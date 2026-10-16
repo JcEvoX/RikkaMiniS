@@ -80,6 +80,12 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
         }
 
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
+        // [deep-audit-1017 G2] `tap text --contains X` reads the "contains" flag in
+        // tapText, but it was never declared boolean: the parser took X as the
+        // flag's value and swallowed it, so positional[2] was null and every
+        // `--contains` call died on "missing <text>". Declared here, and the set is
+        // asserted against every hasFlag() name in this file by
+        // AccessibilityTapTextTest.
         val args = OffloadArgs(
             request.argv.drop(1),
             booleanFlags = setOf(
@@ -88,6 +94,7 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
                 "clickable", "editable", "scrollable", "checked", "enabled",
                 "visible-only", "auto-scroll", "auto-dismiss", "auto-confirm",
                 "confirm", "deny", "children", "ancestors",
+                "contains",
             ),
         )
         if (args.hasFlag("h", "help") || args.positional.isEmpty()) {
@@ -519,12 +526,23 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
         val n = matches.getOrNull(index)
             ?: return err(args, "NODE_NOT_FOUND",
                 "no node with text${if (contains) " containing " else "="}\"$text\" (matches: ${matches.size})")
-        if (n.isClickable) n.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-        else {
-            val r = Rect(); n.getBoundsInScreen(r)
-            tapXYRaw(svc, r.centerX(), r.centerY(), args)
+        // [deep-audit-1017 G3] Both branches of the attempt used to have their
+        // result thrown away and the call reported `ok` unconditionally: a node
+        // that advertises `clickable` but refuses ACTION_CLICK (disabled, or the
+        // action is handled by an ancestor) and a coordinate tap the system
+        // cancelled both came back as success — the agent believed a tap landed
+        // that never happened. Report what happened instead, and keep the two
+        // failure modes apart from NODE_NOT_FOUND above.
+        if (TapTextFlow.plan(n.isClickable, n.performAction(AccessibilityNodeInfo.ACTION_CLICK))
+            == TapTextFlow.Stage.CLICKED
+        ) {
+            return ok(args, JSONObject().put("text", text).put("action", "click"))
         }
-        return ok(args, JSONObject().put("text", text).put("action", "click"))
+        val r = Rect(); n.getBoundsInScreen(r)
+        val tapped = tapXYRaw(svc, r.centerX(), r.centerY(), args)
+        if (TapTextFlow.fallbackSucceeded(tapped.exitCode)) return tapped
+        return err(args, "ACTION_FAILED",
+            "tap text \"$text\": node did not accept ACTION_CLICK and the coordinate tap failed")
     }
 
     private fun findByTextOrDesc(
@@ -1180,4 +1198,31 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
         }
     }
 
+}
+
+/**
+ * [deep-audit-1017 G3] Decision table for `tap text`, kept out of the
+ * Android-touching body so all three outcomes are pinnable on the JVM
+ * (`AccessibilityNodeInfo` cannot be instantiated there).
+ *
+ * A matched node is tapped directly only when it says it is clickable AND the
+ * action is accepted; every other combination falls through to the coordinate
+ * tap, whose own result decides success or failure. Neither result may be
+ * assumed — that assumption is what used to report success for taps that never
+ * happened.
+ */
+internal object TapTextFlow {
+    enum class Stage {
+        /** ACTION_CLICK was offered and accepted — nothing else to try. */
+        CLICKED,
+
+        /** Tap the node's centre and let `tapXYRaw` report the outcome. */
+        COORDINATE_FALLBACK,
+    }
+
+    fun plan(nodeClickable: Boolean, clickAccepted: Boolean): Stage =
+        if (nodeClickable && clickAccepted) Stage.CLICKED else Stage.COORDINATE_FALLBACK
+
+    /** `NativeOffloadResult.exitCode == 0` is the CLI's success convention. */
+    fun fallbackSucceeded(exitCode: Int): Boolean = exitCode == 0
 }
