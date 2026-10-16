@@ -103,7 +103,17 @@ class GeminiBasePathTest {
         assertEquals("https://generativelanguage.googleapis.com/v1beta", GeminiBasePath.normalize(null))
         assertEquals("https://generativelanguage.googleapis.com/v1beta", GeminiBasePath.normalize(""))
         assertEquals("https://generativelanguage.googleapis.com/v1beta", GeminiBasePath.normalize("   "))
-        assertEquals("https://generativelanguage.googleapis.com/v1beta", GeminiBasePath.normalize("/v1beta"))
+    }
+
+    @Test
+    fun `a version segment with no host stays relative (degenerate input fails loudly)`() {
+        // "/v1beta" on its own is not a base: there is no scheme and no host. Stripping the
+        // only segment leaves nothing to prepend, so the result is a relative URL — OkHttp
+        // rejects it outright, which surfaces the bad configuration instead of quietly
+        // redirecting the user's API key to the public endpoint. GeminiModelsApi.normalizeBase
+        // returns the same "/v1beta" for this input; this is the one degenerate shape where
+        // falling back to DEFAULT_BASE would be a *behaviour* difference, not a fix.
+        assertEquals("/v1beta", GeminiBasePath.normalize("/v1beta"))
     }
 
     @Test
