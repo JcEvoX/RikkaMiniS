@@ -46,7 +46,9 @@ class ActiveStreamsSourceShapeTest {
         )
         assertTrue(
             "reclaim log must read the counter atomically",
-            src.contains("activeStreams=${ChatStreamOffloadHandler.activeStreams.get()}"),
+            // NOTE 模板转义：${...} 在 Kotlin 里是字符串模板，不转义会求值成
+            // "activeStreams=0"，断言的就不是源码字面量了。
+            src.contains("activeStreams=\${ChatStreamOffloadHandler.activeStreams.get()}"),
         )
     }
 
