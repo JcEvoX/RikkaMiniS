@@ -666,7 +666,12 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
 
         val archiveResolution = GuestPathMapper.resolve(archiveRaw, request.cwd, bindings)
         if (archiveResolution is GuestPathMapper.Resolution.Denied) {
-            return finishTar(deniedEntry(archiveRaw, archiveResolution), false, startedNs, args)
+            // A refused archive path means NO archive was written, so the exit
+            // code must say so: `false` here returned 0 with an error object in
+            // the body, which `set -e` and `&&` chains read as success. Matches
+            // the destination-denied branch in tarExtractFrom (same shape, true).
+            // (deep-audit-1019 ISSUE-03)
+            return finishTar(deniedEntry(archiveRaw, archiveResolution), true, startedNs, args)
         }
         val archive = archiveResolution as GuestPathMapper.Resolution.Ok
         val archivePath = Paths.get(archive.hostPath)
