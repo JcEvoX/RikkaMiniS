@@ -124,7 +124,7 @@ object PRootKernel {
      * server. Split out so [boot] is only "fast path + gate"; never call this
      * directly (it is the thing [bootGate] exists to serialize).
      */
-    private fun bootCriticalSection(context: Context) {
+    private suspend fun bootCriticalSection(context: Context) {
         bootContext = context.applicationContext
         rootfsManager = RootfsManager.getInstance(context)
         rootfsManager.installIfNeeded()
@@ -1414,8 +1414,17 @@ internal class BootOnceGate {
     var isDone: Boolean = false
         private set
 
-    /** Runs [body] unless it already completed; returns true when this call ran it. */
-    suspend fun run(body: () -> Unit): Boolean {
+    /**
+     * Runs [body] unless it already completed; returns true when this call ran it.
+     *
+     * [body] is `suspend` because the only production caller is [PRootKernel.boot],
+     * whose body awaits `RootfsManager`'s suspend API. The first version of this
+     * refactor declared the parameter (and [PRootKernel.bootCriticalSection])
+     * non-suspend and CI's `compileReleaseKotlin` rejected the file — the local
+     * extraction harness slices fragments, so it cannot see a signature-level
+     * error in a body it does not extract.
+     */
+    suspend fun run(body: suspend () -> Unit): Boolean {
         if (isDone) return false
         return mutex.withLock {
             if (isDone) return@withLock false

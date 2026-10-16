@@ -99,7 +99,32 @@ class PRootKernelBootGateTest {
         )
         assertTrue(
             "the critical section must be private — only the gate may run it:\n$src",
-            src.contains("private fun bootCriticalSection(context: Context)"),
+            src.contains("private suspend fun bootCriticalSection(context: Context)"),
+        )
+        // Suspend-ness is part of the contract, not a detail: the body awaits
+        // RootfsManager's suspend API, and the first version of this refactor
+        // declared BOTH this helper and the gate's lambda parameter non-suspend
+        // — `:app:compileReleaseKotlin` rejected the file ("Suspend function
+        // 'installIfNeeded' should be called only from a coroutine…"). The
+        // extraction harness can't catch it: it slices fragments, so a
+        // signature-level error in a body it never extracts is invisible.
+        val criticalSection = declarationSlice(src, "fun bootCriticalSection(")
+        val suspendCalls = listOf(
+            "installIfNeeded(", "installProotIfNeeded(", "autoRepair(",
+            "applyDefaultMountOverlay(", "retryFailedApkWorld(", "dumpApkWorld(",
+        ).filter { criticalSection.contains(it) }
+        assertTrue(
+            "bootCriticalSection must be `suspend` — its body awaits ${suspendCalls.ifEmpty { listOf("the rootfs API") }}:\n$criticalSection",
+            criticalSection.contains("suspend fun bootCriticalSection("),
+        )
+        assertTrue(
+            "bootCriticalSection no longer calls any suspend rootfs API — if that is now true, " +
+                "drop the `suspend` requirement in the same change (this assertion exists to keep the two in sync):\n$criticalSection",
+            suspendCalls.isNotEmpty(),
+        )
+        assertTrue(
+            "BootOnceGate.run must accept a suspend body (its production caller awaits inside):\n$src",
+            Regex("""suspend fun run\(body: suspend \(\) -> Unit\)""").containsMatchIn(src),
         )
     }
 
