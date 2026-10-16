@@ -11,7 +11,6 @@ import com.rikkaminis.app.sandbox.NativeOffloadResult
 import com.rikkaminis.app.speech.TextToSpeechManager
 import org.json.JSONArray
 import org.json.JSONObject
-import java.util.Locale
 
 /**
  * android-speak — speak text aloud via Android TTS.
@@ -36,9 +35,12 @@ import java.util.Locale
  *
  * Voice resolution: iOS treats `--voice` as a BCP-47 language tag (passed to
  * `AVSpeechSynthesisVoice voiceWithLanguage:`). Android's TTS API exposes
- * voices by identifier AND by Locale; we accept the iOS-style language tag
- * via `Locale.forLanguageTag(...)` for cross-platform parity, and additionally
- * try to match an exact voice identifier when `voices` enumeration finds one.
+ * voices by identifier AND by Locale. [fix/da1016-tts-voice] `--voice` is
+ * resolved where the text is spoken: [TtsLanguagePolicy] pins the explicit
+ * tag over the zh/en auto-detect (which used to overwrite it), and the result
+ * body reports the language the engine actually accepted via
+ * [TextToSpeechManager.currentLanguageTag] — a refused tag is no longer
+ * echoed back as if it were in effect.
  */
 class SpeakOffloadHandler(private val context: Context) : NativeOffloadHandler {
     private val tts = TextToSpeechManager().also { it.init(context) }
@@ -102,23 +104,48 @@ class SpeakOffloadHandler(private val context: Context) : NativeOffloadHandler {
             return NativeOffloadResult(1, OffloadOutput.formatBody(body, args) + "\n")
         }
 
-        // Voice / language: --voice takes precedence and is treated as a
-        // BCP-47 language tag (matches iOS). Empty / invalid tags fall
-        // through to the auto-detect path inside speak().
+        // Voice / language: --voice is a caller-pinned BCP-47 language tag
+        // (matches iOS). [fix/da1016-tts-voice] It is no longer applied
+        // eagerly here — speak() resolves the utterance language in ONE place
+        // (explicit tag wins over auto-detection, [TtsLanguagePolicy]); the
+        // old eager setLanguage + unconditional re-detection inside speak()
+        // meant every tag was silently overwritten by the zh/en guess.
         val voiceTag = args.get("voice")
-        if (!voiceTag.isNullOrBlank()) {
-            tts.setLanguage(Locale.forLanguageTag(voiceTag))
-        }
 
         args.getDouble("rate")?.let { tts.speechRate = it.toFloat() }
         args.getDouble("pitch")?.let { tts.speechPitch = it.toFloat() }
         args.getDouble("volume")?.let { tts.speechVolume = it.toFloat() }
 
-        tts.speak(text)
+        val spoke = tts.speak(text, explicitLanguage = voiceTag)
+        if (!spoke) {
+            // [fix/da1016-tts-voice] Nothing was voiced. Distinguish an engine
+            // that died mid-call from text that has nothing speakable after
+            // cleanup (e.g. a message that was only a fenced code block) —
+            // both used to be reported as "speaking".
+            val preview = if (text.length > 100) text.take(100) + "..." else text
+            val engineDown = !tts.isInitialized
+            val body = JSONObject()
+                .put("error", if (engineDown) "tts_unavailable" else "nothing_to_speak")
+                .put(
+                    "message",
+                    if (engineDown) {
+                        "TTS engine became unavailable"
+                    } else {
+                        "text has no speakable content after cleanup (markdown/URL stripping)"
+                    },
+                )
+                .put("text", preview)
+                .toString()
+            return NativeOffloadResult(1, OffloadOutput.formatBody(body, args) + "\n")
+        }
         val preview = if (text.length > 100) text.take(100) + "..." else text
+        // [fix/da1016-tts-voice] Report the language the engine will actually
+        // speak (accepted explicit tag, or the auto-detected one), not the
+        // requested tag — a refused tag used to be echoed back as if chosen.
+        val effectiveVoice = tts.currentLanguageTag() ?: "unknown"
         val body = JSONObject()
             .put("text", preview)
-            .put("voice", voiceTag ?: "auto")
+            .put("voice", effectiveVoice)
             .put("rate", tts.speechRate.toDouble())
             .put("pitch", tts.speechPitch.toDouble())
             .put("characters", text.length)
@@ -251,7 +278,8 @@ COMMON OPTIONS:
 
 SPEAK OPTIONS:
   --text <string>      Text to speak (positional also accepted)
-  --voice <tag>        BCP-47 language tag (e.g. en-US, zh-CN)
+  --voice <tag>        BCP-47 language tag (e.g. en-US, zh-CN); pinned over
+                       auto-detection instead of being overwritten by it
   --rate <0.1-3.0>     Speech rate (default: 1.0)
   --pitch <0.5-2.0>    Pitch multiplier (default: 1.0)
   --volume <0.0-1.0>   Volume (default: 1.0)
@@ -264,6 +292,14 @@ EXAMPLES:
   android-speak speak --text "Bonjour" --voice fr-FR --rate 0.5
   android-speak voices --language en
   android-speak stop
+
+NOTES:
+  Text is sanitized before synthesis: markdown syntax, fenced code blocks,
+  emoji and bare URLs are stripped or rewritten ("link to <host>") instead of
+  being read out verbatim. A text with nothing speakable (e.g. only a code
+  block) returns {"error":"nothing_to_speak"} and nothing is played.
+  The "voice" field reports the language the engine will actually use
+  ("unknown" when the engine never accepted any tag).
 
 Returns structured JSON on errors:
   {"error":"tts_unavailable","message":"...","available_engines":[...]}

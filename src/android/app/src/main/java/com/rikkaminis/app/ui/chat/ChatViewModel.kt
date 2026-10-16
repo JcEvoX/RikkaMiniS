@@ -431,13 +431,23 @@ class ChatViewModel(
     // [T-chat-sysinfo-coalesce] Pending coalesce window for appendSystemInfo.
     // Same-iconKind calls within SYSINFO_COALESCE_WINDOW_MS are merged into one
     // ChatMessage with accumulated toolBlocks; different iconKind flushes the
-    // current window immediately. Runs on Main so the single _messages.value
-    // write is atomic from the UI's perspective.
-    private var pendingSysInfoJob: Job? = null
-    private var pendingSysInfoIconKind: String? = null
-    private var pendingSysInfoBlocks: MutableList<AssistantBlock> = mutableListOf()
-    private var pendingSysInfoPayload: String? = null
-    private var pendingSysInfoFirstId: String? = null
+    // current window immediately.
+    //
+    // [FIX-G da1016-sysinfo-race] The window STATE (iconKind/firstId/payload/
+    // blocks) lives in [SysInfoCoalescer] behind a single lock: two callers
+    // reach it from different threads — the agent loop (sendMessage →
+    // Dispatchers.IO) reaches appendSystemInfo through
+    // ChatContextWindow.trimContextHistoryWindow, while the UI / slash-command /
+    // compact paths (checkContextBeforeSend, /compact, revertCompact,
+    // setProviderName) run on Main. The old loose fields had no mutual
+    // exclusion: an IO append interleaved with a Main flush could lose a
+    // notice, emit a ChatMessage whose id and toolBlocks came from different
+    // windows, or crash the UI thread on a torn ArrayList.
+    // Only the timer handle is kept here — it is written last-wins per thread
+    // and every cancel precedes the cancelling thread's own re-assign, so the
+    // handle can never end up dead while a window is pending.
+    private val sysInfoCoalescer = SysInfoCoalescer<AssistantBlock>(idOf = { it.id })
+    private var sysInfoFlushJob: Job? = null
 
     // ── Long-session window cap ────────────────────────────────────────
     //
@@ -2112,11 +2122,16 @@ class ChatViewModel(
      * [T-chat-sysinfo-coalesce] Consecutive same-iconKind calls within
      * [SYSINFO_COALESCE_WINDOW_MS] are merged into ONE ChatMessage whose
      * toolBlocks accumulate in call order; payload takes the last non-null
-     * value. Different iconKind flushes the current window first. The merge
-     * runs on Main via viewModelScope so the single _messages.value write is
-     * atomic from the UI's perspective and avoids the per-call
-     * read-modify-write that used to recompose the entire LazyColumn on every
-     * system notice during compact/revert failure chains.
+     * value. Different iconKind flushes the current window first.
+     *
+     * [FIX-G da1016-sysinfo-race] The merge no longer depends on the caller's
+     * dispatcher: the window state AND the _messages.value read-modify-write
+     * run inside [SysInfoCoalescer]'s lock, so a Main caller
+     * (checkContextBeforeSend / `/compact` / revertCompact / setProviderName)
+     * and an IO caller (the agent loop's trimContextHistoryWindow) can
+     * interleave safely while still landing one write per flush — which is what
+     * keeps the LazyColumn from recomposing on every system notice during
+     * compact/revert failure chains.
      */
     internal fun appendSystemInfo(text: String, iconKind: String, payload: String? = null) {
         val block = AssistantBlock(
@@ -2129,47 +2144,57 @@ class ChatViewModel(
             // affordance opening a detail sheet (mirrors iOS CompactSummarySheet).
             toolArgs = payload.orEmpty(),
         )
-        // Different iconKind → flush any pending window first (preserve ordering).
-        if (pendingSysInfoIconKind != null && pendingSysInfoIconKind != iconKind) {
-            flushPendingSysInfo()
+        // [FIX-G da1016-sysinfo-race] Window mutation, the "different iconKind
+        // flushes first" rule and the drain+publish of that flush all happen
+        // inside SysInfoCoalescer's lock, so a concurrent IO append can no
+        // longer interleave with this thread's window bookkeeping.
+        sysInfoCoalescer.append(block, iconKind, payload) { window ->
+            publishSysInfoWindow(window)
         }
-        // Start or extend the coalesce window.
-        if (pendingSysInfoIconKind == null) {
-            pendingSysInfoIconKind = iconKind
-            pendingSysInfoFirstId = block.id
-            pendingSysInfoBlocks.clear()
-            pendingSysInfoPayload = payload
-        } else {
-            // Same kind: accumulate. Last non-null payload wins.
-            if (payload != null) pendingSysInfoPayload = payload
-        }
-        pendingSysInfoBlocks.add(block)
-        // Schedule (or reschedule) the flush at the end of the window.
-        pendingSysInfoJob?.cancel()
-        pendingSysInfoJob = viewModelScope.launch(kotlinx.coroutines.Dispatchers.Main) {
+        // Schedule (or reschedule) the flush at the end of the window. This
+        // handle is the only sysinfo state left outside the coalescer, and it is
+        // safe unlocked: cancels only ever precede the cancelling thread's own
+        // re-assign, so the last assignment in the write order is always a live
+        // job (see the field comment).
+        sysInfoFlushJob?.cancel()
+        sysInfoFlushJob = viewModelScope.launch(kotlinx.coroutines.Dispatchers.Main) {
             kotlinx.coroutines.delay(SYSINFO_COALESCE_WINDOW_MS)
             flushPendingSysInfo()
         }
     }
 
-    /** Flush the pending coalesce window into a single ChatMessage. Idempotent. */
+    /**
+     * Flush the pending coalesce window into a single ChatMessage. Idempotent.
+     *
+     * [FIX-G da1016-sysinfo-race] Deliberately does NOT cancel [sysInfoFlushJob]:
+     * the timer is re-armed by the appender, and a stale timer that finds an
+     * empty window is a no-op. Cancelling here would re-introduce the
+     * cross-thread handle race the window lock just removed — a Main flush
+     * could kill the timer an IO append had re-armed a moment earlier,
+     * stranding the fresh window until the next sysinfo event.
+     */
     private fun flushPendingSysInfo() {
-        pendingSysInfoJob?.cancel()
-        pendingSysInfoJob = null
-        pendingSysInfoIconKind ?: return
-        val blocks = pendingSysInfoBlocks.toList()
-        val id = pendingSysInfoFirstId ?: "sysinfo_${System.currentTimeMillis()}"
-        pendingSysInfoIconKind = null
-        pendingSysInfoBlocks.clear()
-        pendingSysInfoPayload = null
-        pendingSysInfoFirstId = null
-        if (blocks.isEmpty()) return
+        sysInfoCoalescer.flush { window -> publishSysInfoWindow(window) }
+    }
+
+    /**
+     * Turn one drained coalesce window into a system notice row.
+     *
+     * [FIX-G da1016-sysinfo-race] Runs INSIDE [SysInfoCoalescer]'s lock (via the
+     * publish lambda), which makes the read-modify-write on [_messages] below
+     * atomic against a concurrent flush on another thread — otherwise two
+     * flushes could each read the same snapshot and the second write would drop
+     * the first notice. Keep it allocation-only: no suspension, no re-entry into
+     * the coalescer. [window].blocks is never empty (the coalescer starts a
+     * window and adds its first block in one critical section).
+     */
+    private fun publishSysInfoWindow(window: SysInfoCoalescer.Window<AssistantBlock>) {
         val list = _messages.value
         val notice = ChatMessage(
-            id = id,
+            id = window.firstId,
             role = "system",
             content = "",
-            toolBlocks = blocks,
+            toolBlocks = window.blocks,
         )
         // [fix/compact-divider-ux] A system notice must never land *below*
         // an answer that is still growing. The in-loop auto-compact path
@@ -4342,3 +4367,92 @@ internal fun coalesceSystemInfoBlocks(blocks: List<AssistantBlock>): List<Assist
 /** Pure: last non-null payload wins; all-null → null. */
 internal fun resolveCoalescedPayload(payloads: List<String?>): String? =
     payloads.lastOrNull { it != null }
+
+// [FIX-G da1016-sysinfo-race] Single home for the pending system-notice coalesce
+// window. Before this class the window lived in four loose `pendingSysInfo*`
+// fields on ChatViewModel that two threads mutated: Main (UI notices —
+// checkContextBeforeSend, `/compact`, revertCompact, setProviderName) and the
+// agent loop's IO coroutine (ChatContextWindow.trimContextHistoryWindow, reached
+// from AgentLoopEngine :658 / :864). Interleaving them lost notices, emitted a
+// ChatMessage whose id came from one window while its toolBlocks came from
+// another, and could tear the backing ArrayList on the UI thread.
+//
+// Every mutation and every snapshot now happens under one lock, and the publish
+// callback of a drain runs inside that lock, so the owner's read-modify-write on
+// its message list is atomic as well.
+//
+// Generic on purpose: pure JVM, no Android/ViewModel dependency, so the state
+// machine is directly unit-testable (SysInfoCoalescerTest).
+internal class SysInfoCoalescer<T>(private val idOf: (T) -> String) {
+
+    /**
+     * One drained coalesce window.
+     *
+     * [blocks] is never empty: a window is created and given its first block
+     * inside one critical section, and only an existing window can be drained.
+     */
+    internal class Window<T>(
+        val firstId: String,
+        val iconKind: String,
+        /** Last non-null payload seen in the window; null when every call passed null. */
+        val payload: String?,
+        val blocks: List<T>,
+    )
+
+    /** Window identity — the trio that must never disagree with each other. */
+    private class WindowState(val iconKind: String, val firstId: String, val payload: String?)
+
+    private val lock = Any()
+    private var current: WindowState? = null
+    private val blocks = ArrayList<T>()
+
+    /**
+     * Append [block] to the pending window. A pending window of a different
+     * [iconKind] is drained — and handed to [publish] — before the new window
+     * starts, which preserves call order. [publish] runs INSIDE the lock.
+     */
+    fun append(block: T, iconKind: String, payload: String?, publish: (Window<T>) -> Unit) {
+        synchronized(lock) {
+            val open = current
+            if (open != null && open.iconKind != iconKind) {
+                publishLocked(publish)
+            }
+            val stillOpen = current
+            if (stillOpen == null) {
+                current = WindowState(iconKind = iconKind, firstId = idOf(block), payload = payload)
+            } else if (payload != null) {
+                // Last non-null payload wins — parity with the old
+                // pendingSysInfoPayload write, which nothing consumed
+                // (backlog :2525 R5 is a deliberate negative decision). Kept so
+                // the write sequence stays identical; do NOT wire it up here.
+                current = WindowState(stillOpen.iconKind, stillOpen.firstId, payload)
+            }
+            blocks.add(block)
+        }
+    }
+
+    /**
+     * Drain the pending window (if any) into [publish]. No-op when no window is
+     * open, so a stale timer that fires after a flush cannot emit an empty card.
+     * [publish] runs INSIDE the lock.
+     */
+    fun flush(publish: (Window<T>) -> Unit) {
+        synchronized(lock) {
+            publishLocked(publish)
+        }
+    }
+
+    /** Caller must hold [lock]: snapshot the window, clear it, then publish. */
+    private fun publishLocked(publish: (Window<T>) -> Unit) {
+        val state = current ?: return
+        val drained = Window(
+            firstId = state.firstId,
+            iconKind = state.iconKind,
+            payload = state.payload,
+            blocks = blocks.toList(),
+        )
+        current = null
+        blocks.clear()
+        publish(drained)
+    }
+}

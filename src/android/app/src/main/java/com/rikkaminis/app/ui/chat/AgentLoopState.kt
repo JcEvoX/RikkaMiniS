@@ -54,6 +54,36 @@ internal class AgentLoopState(
     val allToolBlocks: MutableList<AssistantBlock> = mutableListOf()
 
     /**
+     * [deep-audit-1016c ISSUE-01] Run-scoped start of the block range that has
+     * NOT been written to any DB row yet — "尚未落库的块起点".
+     *
+     * Why this exists (and why it is NOT the same thing as the per-turn
+     * `turnStartBlockIndex` the loop captures at its top every iteration):
+     * `allToolBlocks` is append-only for the whole run, but five no-tool
+     * continuation branches (`continue` without a terminal persist: EOF-stub,
+     * length-wall prefill / reminder, verify nudge, residue-refill) leave the
+     * text they already streamed unpersisted. The next iteration re-captures
+     * `turnStartBlockIndex` at the CURRENT end of the list, so every later
+     * persistence slice — which used to start there — skips those blocks
+     * forever: the segment reloads as nothing. This index moves ONLY when a
+     * persist actually lands, so the next terminal slice still covers the
+     * skipped segment.
+     *
+     * Two-index contract (do not collapse them):
+     *  - persistence slices (terminal / early / live preview) → THIS index;
+     *  - `rollbackTurnBlocksTo(allToolBlocks, turnStartBlockIndex)` (fallback
+     *    retry: roll back ONLY the failed attempt's partial blocks) and the
+     *    per-turn empty check (`allToolBlocks.drop(turnStartBlockIndex)` —
+     *    "did THIS turn show anything") → `turnStartBlockIndex`.
+     *
+     * Invariants: `0 <= unpersistedBlockStart <= allToolBlocks.size` at all
+     * times; advanced to `allToolBlocks.size` ONLY on a successful persist
+     * (never when the DB returned no row id); reset to 0 wherever
+     * `allToolBlocks` is cleared (queue-interrupt new bubble).
+     */
+    var unpersistedBlockStart: Int = 0
+
+    /**
      * [fix/stream-segmenter-duplication] Monotonic, run-scoped (NOT
      * turn-scoped) block sequence. Text block ids are built as
      *   "text_${turn}_${allToolBlocks.size}_${blockSeq++}"

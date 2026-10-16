@@ -13,9 +13,11 @@ import androidx.core.content.ContextCompat
 import androidx.exifinterface.media.ExifInterface
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.offload.OffloadPermissionManager
+import com.rikkaminis.app.sandbox.GuestPathMapper
 import com.rikkaminis.app.sandbox.NativeOffloadHandler
 import com.rikkaminis.app.sandbox.NativeOffloadRequest
 import com.rikkaminis.app.sandbox.NativeOffloadResult
+import com.rikkaminis.app.sandbox.PRootKernel
 import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
@@ -84,7 +86,7 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
                 "albums" -> handleAlbums(args)
                 "album" -> handleAlbum(args)
                 "export" -> handleExport(args)
-                "import", "save" -> handleImport(args)
+                "import", "save" -> handleImport(args, request)
                 "create-album" -> handleCreateAlbum(args)
                 "favorite" -> handleFavorite(args)
                 "delete" -> handleDelete(args)
@@ -617,23 +619,50 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
     // ── import (T64) ─────────────────────────────────────────────────────
 
     /**
-     * Copy a host-filesystem file into MediaStore. Mirrors apple-photos
-     * import. --album-name creates the bucket implicitly via RELATIVE_PATH
+     * Copy a *sandbox* file into MediaStore. Mirrors apple-photos import.
+     * `--album-name` creates the bucket implicitly via RELATIVE_PATH
      * (Android API 29+) — there's no "create empty album" API.
+     *
+     * [deep-audit-1016c FIX-B A] `--path` is a GUEST path — that is the ONLY
+     * shape HELP documents (`import --path <file>`, examples under
+     * /var/minis/...), and the shape every other file-taking android-* flag
+     * uses. It used to be handed straight to `File(path)`, which broke the
+     * command twice over:
+     *   • functionally — PRoot's bind layout is not the host layout, so a guest
+     *     file never exists at the raw host path and EVERY import answered
+     *     `no_file`;
+     *   • as a read escape — a host-absolute path (e.g.
+     *     `/data/data/<pkg>/databases/minis.db`, which is exactly what the
+     *     host-side process CAN read) was opened as a plain host File and
+     *     copied into the public MediaStore, i.e. out of the app sandbox.
+     * Same bug class as [SpeechOffloadHandler.resolveSourcePath]
+     * ([fix/sweep1013-security]) and the same remedy: normalize against the
+     * guest cwd ([GuestPathMapper.absoluteGuestPath]), resolve through the
+     * session-aware resolver, then FAIL CLOSED. There is deliberately no
+     * `?: File(path)` tail — an unresolvable path is an error, not a guess.
      */
-    private fun handleImport(args: OffloadArgs): NativeOffloadResult {
-        val path = args.get("path")
+    private fun handleImport(args: OffloadArgs, request: NativeOffloadRequest): NativeOffloadResult {
+        val rawPath = args.get("path")
             ?: return NativeOffloadResult(2, "android-photos import: --path <file> is required\n")
-        val src = File(path)
+        val guestPath = GuestPathMapper.absoluteGuestPath(request.cwd, rawPath)
+            ?: return importPathError(
+                args, rawPath, "path_outside_sandbox",
+                "Path climbs above the sandbox root; --path must name a file inside the " +
+                    "sandbox (e.g. /var/minis/workspace/<file>).",
+            )
+        val src = PRootKernel.resolvePathForSession(request.sessionId, guestPath, context)
+            ?: return importPathError(
+                args, rawPath, "no_file",
+                "No such file inside the sandbox: '$guestPath' is not reachable through any " +
+                    "mounted tree. Check the path (relative paths resolve against the shell " +
+                    "cwd) and that the file was written by this session.",
+                guestPath,
+            )
         if (!src.exists() || !src.isFile) {
-            return NativeOffloadResult(
-                1,
-                OffloadOutput.formatBody(
-                    JSONObject().put("error", "no_file").put("path", path)
-                        .put("message", "Source file does not exist or is not a regular file.")
-                        .toString(),
-                    args,
-                ) + "\n",
+            return importPathError(
+                args, rawPath, "no_file",
+                "Source file does not exist or is not a regular file.",
+                guestPath,
             )
         }
         val albumName = args.get("album-name")
@@ -665,6 +694,7 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
                 put(MediaStore.MediaColumns.IS_PENDING, 1)
             }
         }
+        var insertedUri: Uri? = null
         return try {
             val uri = context.contentResolver.insert(collection, values)
                 ?: return NativeOffloadResult(
@@ -674,6 +704,7 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
                         args,
                     ) + "\n",
                 )
+            insertedUri = uri
             val written = context.contentResolver.openOutputStream(uri)?.use { os ->
                 FileInputStream(src).use { input ->
                     var n = 0L
@@ -700,11 +731,46 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
             if (albumName != null) data.put("album", albumName)
             NativeOffloadResult(0, OffloadOutput.formatBody(data.toString(2), args) + "\n")
         } catch (e: Throwable) {
-            val body = JSONObject().put("error", "import_failed").put("path", path)
+            // [deep-audit-1016c FIX-B A] An insert that succeeded but whose
+            // write/finish step failed left an orphan IS_PENDING row in
+            // MediaStore — every retry would stack another ghost row. Roll the
+            // insert back; a failed cleanup is logged, never masked.
+            insertedUri?.let { uri ->
+                try {
+                    context.contentResolver.delete(uri, null, null)
+                } catch (cleanup: Throwable) {
+                    AppLogger.warning(TAG, "import rollback failed for $uri: ${cleanup.message}")
+                }
+            }
+            val body = JSONObject().put("error", "import_failed").put("path", rawPath)
                 .put("message", e.message ?: "Failed to insert media")
                 .toString()
             NativeOffloadResult(1, OffloadOutput.formatBody(body, args) + "\n")
         }
+    }
+
+    /**
+     * Structured refusal for `import --path` ([deep-audit-1016c FIX-B A]).
+     * Keeps the historical `no_file` contract (exit 1 + `path` + `message`)
+     * while distinguishing the two failure halves the model needs to tell
+     * apart: a path that is not a sandbox path at all (`path_outside_sandbox`)
+     * vs. one that is simply not there / not readable by this session
+     * (`no_file`). `guest_path` is echoed back when known so the model can
+     * self-correct against the shell's own view of the tree.
+     */
+    private fun importPathError(
+        args: OffloadArgs,
+        rawPath: String,
+        error: String,
+        message: String,
+        guestPath: String? = null,
+    ): NativeOffloadResult {
+        val body = JSONObject()
+            .put("error", error)
+            .put("path", rawPath)
+            .put("message", message)
+        if (guestPath != null) body.put("guest_path", guestPath)
+        return NativeOffloadResult(1, OffloadOutput.formatBody(body.toString(), args) + "\n")
     }
 
     // ── create-album (T64) ───────────────────────────────────────────────
@@ -851,19 +917,28 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
      * Mirror apple-photos resolve_date_range: --days N (last N days
      * through now) wins over --start/--end. Returns (startMs?, endMs?)
      * as a Pair; either side may be null when no flag set.
+     *
+     * [deep-audit-1016c FIX-B C] Two date-shaped bugs lived here:
+     *   • a date-only `--end 2026-10-16` parsed to that day's 00:00:00, so
+     *     `--start 2026-10-16 --end 2026-10-16` was a zero-width window that
+     *     matched nothing — and `--end <today>` silently excluded everything
+     *     the user took a photo of today. A date-only bound means the whole
+     *     day; it is aligned to 23:59:59.999 ([alignDateOnlyEndMs]).
+     *   • `--days N` did `now - N * 24h` and then truncated to local midnight.
+     *     Across a DST transition that hour of drift can land the truncation on
+     *     the wrong DAY (one extra or one missing day of results). It now walks
+     *     the calendar ([daysAgoStartOfDayMs]) so the wall clock is preserved.
      */
     private fun resolveDateRange(args: OffloadArgs): Pair<Long?, Long?> {
+        val zone = TimeZone.getDefault()
         args.getInt("days")?.let { days ->
             val n = if (days <= 0) 7 else days
-            val cal = Calendar.getInstance().apply {
-                timeInMillis = System.currentTimeMillis() - n * 24L * 60 * 60 * 1000
-                set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0)
-                set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
-            }
-            return cal.timeInMillis to System.currentTimeMillis()
+            return daysAgoStartOfDayMs(System.currentTimeMillis(), n, zone) to System.currentTimeMillis()
         }
         val startMs = args.get("start")?.let { parseDate(it) }
-        val endMs = args.get("end")?.let { parseDate(it) }
+        val endMs = args.get("end")?.let { raw ->
+            parseDate(raw)?.let { ms -> if (isDateOnly(raw)) alignDateOnlyEndMs(ms, zone) else ms }
+        }
         return startMs to endMs
     }
 
@@ -1060,8 +1135,58 @@ Android edge cases vs apple-photos:
   - Export writes to host filesDir; the JSON returns `host_path`. The
     Linux-side bind-mount path varies per session, so we don't mirror
     iOS `data.path = /var/minis/offloads/...` exactly.
+  - Import reads a SANDBOX path (`--path /var/minis/workspace/x.png`;
+    relative paths resolve against the shell's cwd). Host paths such as
+    /data/data/... are refused (`path_outside_sandbox` / `no_file`)
+    instead of being read straight off the host filesystem.
 
 Errors return JSON: {"error":"...","message":"..."}.
 """
     }
+}
+
+// ── [deep-audit-1016c FIX-B C] pure date helpers ─────────────────────────────
+// Top-level (not members of the Android-coupled handler) so the JVM test source
+// set can pin them with zero Android deps — the same split as
+// GuestPathMapper.normalizeDotSegments / PRootKernel.hasDotDotSegment.
+// Expectations live in PhotosDateRangePureTest as written literals.
+
+private val DATE_ONLY_SHAPE = Regex("""\d{4}-\d{2}-\d{2}""")
+
+/** True when [raw] is exactly a calendar date (`2026-10-16`) — no time part. */
+internal fun isDateOnly(raw: String): Boolean = DATE_ONLY_SHAPE.matches(raw.trim())
+
+/**
+ * End-of-day for the local day [ms] falls in: 23:59:59.999 in [zone].
+ * Goes through Calendar fields, not ±24h arithmetic, so a DST transition day
+ * keeps its full local wall clock (23:00:00.000…22:59:59.999 where the clock
+ * falls back / springs forward).
+ */
+internal fun alignDateOnlyEndMs(ms: Long, zone: TimeZone): Long {
+    val cal = Calendar.getInstance(zone).apply {
+        timeInMillis = ms
+        set(Calendar.HOUR_OF_DAY, 23)
+        set(Calendar.MINUTE, 59)
+        set(Calendar.SECOND, 59)
+        set(Calendar.MILLISECOND, 999)
+    }
+    return cal.timeInMillis
+}
+
+/**
+ * Local midnight N days before [nowMs] (for `--days N`: "last N days through
+ * now"). Calendar.add(DAY_OF_YEAR, -n) keeps the wall clock across DST; the
+ * old `now - N * 24h` form drifted an hour per transition and could truncate
+ * onto the wrong day.
+ */
+internal fun daysAgoStartOfDayMs(nowMs: Long, days: Int, zone: TimeZone): Long {
+    val cal = Calendar.getInstance(zone).apply {
+        timeInMillis = nowMs
+        add(Calendar.DAY_OF_YEAR, -days)
+        set(Calendar.HOUR_OF_DAY, 0)
+        set(Calendar.MINUTE, 0)
+        set(Calendar.SECOND, 0)
+        set(Calendar.MILLISECOND, 0)
+    }
+    return cal.timeInMillis
 }

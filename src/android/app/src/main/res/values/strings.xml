@@ -1750,4 +1750,7 @@
     <string name="scheduled_delete_body">“%1$s” will be permanently deleted.</string>
     <string name="scheduled_fuse_notification_title">Scheduled task suspended</string>
     <string name="scheduled_fuse_notification_body">“%1$s” failed %2$d times in a row and was disabled. Resume it in Settings.</string>
+    <!-- Text-to-speech: spoken link phrases (VoiceTextSanitizer). -->
+    Spoken when rewriting a bare URL before text-to-speech synthesis (device locale for the host name inserted).<string name="tts_spoken_link_to_host">link to %1$s</string>
+    <string name="tts_spoken_bare_link">link</string>
 </resources>

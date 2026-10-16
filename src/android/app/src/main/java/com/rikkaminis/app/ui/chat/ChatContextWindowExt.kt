@@ -193,6 +193,11 @@ internal fun ChatViewModel.maybeTriggerAutoCompact() {
     // EXHAUSTED is already handled by checkContextBeforeSend (send blocked);
     // OK means no pressure. Both are non-AUTO_COMPACT. Only NEEDS_COMPACT
     // can possibly trigger an auto-compact, so only that path walks tail.
+    // [fix/compact-pregate-exhausted-1016] This send-entry gate deliberately
+    // does NOT adopt [ContextCompactor.loopGateOpens]: at send time EXHAUSTED
+    // means the send was already blocked and the context-full dialog owns the
+    // recovery (new session / explicit /compact). The once-only RESCUE is an
+    // agent-loop affordance (a run mid-task), not a send-entry one.
     if (policy.check(tokens, window) != ContextPolicy.CheckResult.NEEDS_COMPACT) return
     val anchorId = _cachedLatestMarker?.lastCompactedMessageId
     val tail = ContextCompactor.estimateTailTokens(agentHistory, anchorId)
@@ -267,16 +272,32 @@ internal suspend fun ChatViewModel.maybeAutoCompactInLoop(
     if (_isCompacting.value) return false
     if (contextWindow <= 0 || lastContextTokens <= 0) return false
     val policy = effectiveContextPolicy(contextWindow)
-    // Only fire while we're in the compact band (NEEDS_COMPACT), i.e. BEFORE
-    // the hard ceiling forces trimContextHistoryWindow to drop turns verbatim.
-    val inCompactBand =
-        policy.check(lastContextTokens, contextWindow) == ContextPolicy.CheckResult.NEEDS_COMPACT
+    // Only fire while the pressure verdict gives decide() something to act on,
+    // i.e. BEFORE the hard ceiling forces trimContextHistoryWindow to drop
+    // turns verbatim.
+    // [fix/compact-pregate-exhausted-1016] This gate used to open ONLY on
+    // NEEDS_COMPACT (plus the escalation exception). Because ContextPolicy
+    // answers EXHAUSTED the moment tokens >= window (rule 1) and only answers
+    // NEEDS_COMPACT while tokens < window (rule 2), the ceiling — the single
+    // state that [ContextCompactor.decide] adjudicates into RESCUE / EXHAUSTED
+    // — could never reach decide() here unless this very turn's offload pass
+    // had raised the one-shot under-delivery flag. The once-per-user-action
+    // rescue ([fix/compact-exhausted-rescue-1005]) was therefore squeezed
+    // behind that one narrow door and the EXHAUSTED branch below (the skip
+    // line that reports the rescue gate state) was dead in this caller, so
+    // an over-ceiling context fell straight through to the verbatim hard
+    // trim. The gate now opens on EXHAUSTED too; decide() stays the single
+    // adjudicator (it re-reads policy.check and still applies the debounce +
+    // tail gates), so widening cannot force a compaction decide() would
+    // refuse.
+    val verdict = policy.check(lastContextTokens, contextWindow)
+    val inCompactBand = verdict == ContextPolicy.CheckResult.NEEDS_COMPACT
     // [T-ctx-offload-escalation] This turn's offload pass may have proved it can
     // no longer shrink the context (candidate pool exhausted). Sitting in the
     // dead band between the offload line and the compact line only lets the
     // context climb, so escalate now rather than waiting for the compact line.
     val escalatedFromOffload = consumeOffloadUnderDelivery()
-    if (!inCompactBand && !escalatedFromOffload) {
+    if (!ContextCompactor.loopGateOpens(verdict, escalatedFromOffload)) {
         return false
     }
     val anchorId = _cachedLatestMarker?.lastCompactedMessageId

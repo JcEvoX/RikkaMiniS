@@ -1650,4 +1650,7 @@
     <string name="backup_passphrase_title">暗号化されたバックアップ</string>
     <string name="backup_passphrase_body">この OpenMinis パッケージは暗号化されています（minisbak-enc/1）。エクスポート時に設定したパスフレーズを入力してください。</string>
     <string name="backup_passphrase_label">パスフレーズ</string>
+    <!-- Text-to-speech: spoken link phrases (VoiceTextSanitizer). -->
+    <string name="tts_spoken_link_to_host">%1$sへのリンク</string>
+    <string name="tts_spoken_bare_link">リンク</string>
 </resources>

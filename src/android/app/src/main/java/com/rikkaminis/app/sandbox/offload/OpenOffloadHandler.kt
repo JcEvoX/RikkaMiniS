@@ -20,6 +20,14 @@ import org.json.JSONObject
  *   • Any `ActivityNotFoundException` → structured error naming the
  *     missing handler instead of crashing.
  *
+ * [deep-audit-1016c FIX-B B] `intent:` / `android-app:` URIs keep their full
+ * URI semantics (alarm / map / store intents with inline extras still work)
+ * but are hardened before startActivity: grant flags, clipData and a
+ * same-package `component` target are stripped, so a crafted URI can neither
+ * hand a launched activity a URI grant nor start an internal (non-exported)
+ * activity of this app. The plain ACTION_VIEW path (http/tel/mailto/geo/
+ * market) is untouched.
+ *
  * Usage:
  *   android-open <url>
  *   android-open --help
@@ -49,6 +57,27 @@ class OpenOffloadHandler(private val context: Context) : NativeOffloadHandler {
             val intent: Intent = if (url.startsWith("intent:") || url.startsWith("android-app:")) {
                 Intent.parseUri(url, Intent.URI_INTENT_SCHEME).apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    // [deep-audit-1016c FIX-B B] A model-supplied intent URI is
+                    // untrusted input: strip everything it could use to reach
+                    // into THIS app or hand out grants.
+                    //   • FLAG_GRANT_*_URI_PERMISSION (+ PERSISTABLE/PREFIX)
+                    //     would let a crafted `intent:` URI pass a read/write
+                    //     (persistable) grant on a URI to whatever activity
+                    //     gets launched;
+                    //   • clipData carries attacker-chosen URIs/permissions
+                    //     along with the intent;
+                    //   • a same-package `component` target would launch an
+                    //     internal activity that `exported=false` never
+                    //     protects against same-uid explicit intents — the
+                    //     system chooser must stay the arbiter.
+                    removeFlags(
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                            Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                            Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
+                    )
+                    clipData = null
+                    if (component?.packageName == context.packageName) component = null
                     // Browsers inject a selector to bind the URI to a
                     // specific package; we already trust the model-supplied
                     // intent, so let the system-wide chooser apply.
