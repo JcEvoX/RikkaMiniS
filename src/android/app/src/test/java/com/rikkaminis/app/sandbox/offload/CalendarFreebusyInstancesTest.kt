@@ -1,0 +1,202 @@
+package com.rikkaminis.app.sandbox.offload
+
+import java.io.File
+import java.io.FileNotFoundException
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * [da1017-D] Regression tests for the two calendar defects fixed on this branch.
+ *
+ * Layer split (why this file does not drive the handler end to end):
+ *  - `android.content.ContentValues` / `ContentResolver` are stubs in the JVM
+ *    unit-test runtime (returnDefaultValues) — a behavioural run would prove
+ *    nothing, and `Instances.CONTENT_URI` is `Uri.parse`-built, i.e. null there.
+ *  - So CI pins: (a) the pure decision core, (b) the *source* shape of the
+ *    query surface (which table the freebusy path reads, which columns, which
+ *    output fields), and (c) the window-selection template + argument order.
+ *  - Behaviour against real provider rows is proven in the sandbox probe
+ *    (`shared/work/deep-audit-1017/fix-d/probe/jvm/`, 12 tests) plus a SQLite
+ *    differential that executes the captured predicate against the measured
+ *    row dump.
+ *
+ * Expectations below are literals, never derived from the code under test.
+ */
+class CalendarFreebusyInstancesTest {
+
+    // ── part 1: freebusy must read Instances, not Events ─────────────────────
+
+    @Test
+    fun `freebusy queries instances and drops the null-able events predicate`() {
+        val body = memberSlice(readHandlerSource(), "private fun doFreebusy(")
+
+        assertTrue(
+            "the freebusy window must ride on the instances URI (sweep1014-B25a precedent)",
+            body.contains("CalendarContract.Instances.CONTENT_URI"),
+        )
+        assertTrue(
+            "the instants window must go through the shared selection helper",
+            body.contains("instancesWindowSelection("),
+        )
+        assertTrue(
+            "the projection must come from the shared helper (cursor reads are positional)",
+            body.contains("freebusyInstanceProjection("),
+        )
+        // The defect: Events.DTEND is NULL for every RRULE event (the provider
+        // stores DURATION instead), so `DTEND > ?` is never true and every
+        // recurring event was reported as free.
+        assertFalse(
+            "freebusy must not filter on Events.DTEND again — NULL for recurring events",
+            body.contains("CalendarContract.Events.DTEND"),
+        )
+        assertFalse(body.contains("CalendarContract.Events.DTSTART"))
+        assertFalse(body.contains("CalendarContract.Events.CONTENT_URI"))
+    }
+
+    @Test
+    fun `freebusy projection maps the positional cursor reads`() {
+        val proj = memberSlice(readHandlerSource(), "internal fun freebusyInstanceProjection(")
+        val title = proj.indexOf("CalendarContract.Instances.TITLE")
+        val begin = proj.indexOf("CalendarContract.Instances.BEGIN")
+        val end = proj.indexOf("CalendarContract.Instances.END")
+        val allDay = proj.indexOf("CalendarContract.Instances.ALL_DAY")
+
+        assertTrue("TITLE must be projected", title >= 0)
+        assertTrue("BEGIN must be projected", begin >= 0)
+        assertTrue("END must be projected", end >= 0)
+        assertTrue("ALL_DAY must be projected", allDay >= 0)
+        // doFreebusy reads 0=TITLE, 1=BEGIN, 2=END, 3=ALL_DAY — order is load-bearing.
+        assertTrue("TITLE before BEGIN", title < begin)
+        assertTrue("BEGIN before END", begin < end)
+        assertTrue("END before ALL_DAY", end < allDay)
+    }
+
+    @Test
+    fun `freebusy window selection keeps the operator shape and argument order`() {
+        val (selection, selArgs) = CalendarOffloadHandler.instancesWindowSelection(1_000L, 2_000L)
+
+        // Template shape (names come from the constants; the *literal* column
+        // names are pinned by freebusyProjectionColumnMapping above + the SQLite
+        // differential, and the parameter order below is the load-bearing part).
+        val m = Regex("^(.+) < \\? AND (.+) > \\?$").find(selection)
+        assertTrue("selection must be '<col> < ? AND <col> > ?' but was '$selection'", m != null)
+        assertTrue("left operand must not be empty", m!!.groupValues[1].isNotBlank())
+        assertTrue("right operand must not be empty", m.groupValues[2].isNotBlank())
+        assertEquals("exactly two bind placeholders", 2, selection.count { it == '?' })
+
+        // Instances windows are half-open [begin, end): BEGIN < winEnd, END > winStart.
+        assertEquals(2, selArgs.size)
+        assertEquals("2000", selArgs[0])
+        assertEquals("1000", selArgs[1])
+    }
+
+    @Test
+    fun `freebusy still skips all-day instances and keeps its output fields`() {
+        val body = memberSlice(readHandlerSource(), "private fun doFreebusy(")
+        assertTrue("all-day skip must survive the table switch", body.contains("it.getInt(3) == 1"))
+        assertTrue(body.contains("if (isAllDay) continue"))
+        // Caller contract: field names are unchanged by this fix.
+        assertTrue(body.contains("put(\"busy\""))
+        assertTrue(body.contains("put(\"free\""))
+        assertTrue(body.contains("put(\"title\""))
+        assertTrue(body.contains("put(\"start\""))
+        assertTrue(body.contains("put(\"end\""))
+    }
+
+    // ── part 2: update must honour all-day semantics ─────────────────────────
+
+    @Test
+    fun `all-day semantics come from the flag or the stored row`() {
+        assertTrue(CalendarOffloadHandler.updateUsesAllDaySemantics(explicitAllDay = true, storedAllDay = true))
+        assertTrue(CalendarOffloadHandler.updateUsesAllDaySemantics(explicitAllDay = true, storedAllDay = false))
+        assertTrue(CalendarOffloadHandler.updateUsesAllDaySemantics(explicitAllDay = false, storedAllDay = true))
+        assertFalse(CalendarOffloadHandler.updateUsesAllDaySemantics(explicitAllDay = false, storedAllDay = false))
+        // Unreadable row: never guess, fall back to the flag-only reading.
+        assertFalse(CalendarOffloadHandler.updateUsesAllDaySemantics(explicitAllDay = false, storedAllDay = null))
+    }
+
+    @Test
+    fun `all-day DTEND repair keeps the stored day span`() {
+        // single-day all-day row: provider stores dtstart == dtend (span 0)
+        assertEquals(
+            1_795_651_200_000L,
+            CalendarOffloadHandler.allDayEndRepairMs(1_795_564_800_000L, 1_795_564_800_000L, 1_795_651_200_000L),
+        )
+        // 3-day all-day row keeps its 3-day length
+        assertEquals(
+            1_796_083_200_000L,
+            CalendarOffloadHandler.allDayEndRepairMs(1_795_132_800_000L, 1_795_392_000_000L, 1_795_824_000_000L),
+        )
+        // unreadable span degrades to the canonical single-day shape
+        assertEquals(
+            1_795_651_200_000L,
+            CalendarOffloadHandler.allDayEndRepairMs(null, null, 1_795_651_200_000L),
+        )
+        // inverted stored row must not carry a negative span
+        assertEquals(
+            1_795_651_200_000L,
+            CalendarOffloadHandler.allDayEndRepairMs(1_795_651_200_000L, 1_795_564_800_000L, 1_795_651_200_000L),
+        )
+        // no DTSTART in the update: nothing to repair
+        assertEquals(null, CalendarOffloadHandler.allDayEndRepairMs(1_795_564_800_000L, 1_795_564_800_000L, null))
+    }
+
+    @Test
+    fun `update reads the stored row and routes dates through the all-day parser`() {
+        val body = memberSlice(readHandlerSource(), "private fun doUpdate(")
+        assertTrue("must read the stored row first", body.contains("findEventRow("))
+        assertTrue(body.contains("updateUsesAllDaySemantics("))
+        assertTrue("all-day dates are UTC-midnight parsed (doCreate precedent)", body.contains("parseDateUtc("))
+        assertTrue("moved all-day events must repair DTEND", body.contains("allDayEndRepairMs("))
+        assertTrue("the flag must actually be consumed", body.contains("hasFlag(\"all-day\")"))
+        assertTrue(body.contains("CalendarContract.Events.DTEND"))
+    }
+
+    @Test
+    fun `help documents --all-day for update`() {
+        val src = readHandlerSource()
+        // Both the class KDoc usage block and the HELP text must carry the flag
+        // on the *update* line (the `--notes N`-style create line is separate).
+        assertEquals(
+            "update usage must list --all-day in KDoc and HELP",
+            2,
+            Regex("\\[--notes \\.\\.\\.\\] \\[--location \\.\\.\\.\\] \\[--all-day\\]").findAll(src).count(),
+        )
+        assertTrue(
+            "HELP must explain the all-day date semantics",
+            src.contains("their dates are parsed in UTC instead"),
+        )
+    }
+
+    // ── helpers ─────────────────────────────────────────────────────────────
+
+    private fun readHandlerSource(): String =
+        readRepoFile("src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/CalendarOffloadHandler.kt")
+
+    private fun readRepoFile(relative: String): String {
+        var dir: File? = File(System.getProperty("user.dir"))
+        while (dir != null) {
+            val f = File(dir, relative)
+            if (f.exists()) return f.readText()
+            dir = dir.parentFile
+        }
+        throw FileNotFoundException("$relative not found from user.dir=${System.getProperty("user.dir")}")
+    }
+
+    /** Lines of the member declared at [marker], up to the next sibling member. */
+    private fun memberSlice(src: String, marker: String): String {
+        val lines = src.lines()
+        val start = lines.indexOfFirst { it.contains(marker) }
+        assertTrue("marker not found: $marker", start >= 0)
+        val end = (start + 1 until lines.size).firstOrNull { i ->
+            val line = lines[i]
+            val indent = line.takeWhile { it == ' ' }.length
+            indent <= 4 && line.isNotBlank() && !line.trimStart().startsWith("//") &&
+                !line.trimStart().startsWith("*") &&
+                Regex("^(private|internal|public|protected|fun|val|var|@)").containsMatchIn(line.trimStart())
+        } ?: lines.size
+        return lines.subList(start, end).joinToString("\n")
+    }
+}
