@@ -498,9 +498,9 @@ internal class AgentLoopEngine(
         // just-finished bubble is sealed and a fresh loopState.assistantId starts so the
         // queued user message renders BETWEEN them. `loopState.allToolBlocks` and
         // `loopState.accumulatedText` are also reset at that point so the new bubble
-        // starts empty and `host.buildTurnParts(loopState.allToolBlocks, turnStartBlockIndex,
-        // toolInputMap)` continues to slice only the current turn's blocks
-        // (turnStartBlockIndex is captured at iteration start to 0 after reset).
+        // starts empty and the persistence slice continues to cover only the current
+        // bubble's unpersisted blocks (both the run-scoped unpersisted start and the
+        // per-turn turn-start index are reset to 0 right after the clear).
         val loopState = AgentLoopState(
             currentProvider = provider,
             remainingFallbacks = fallbackProviders.toMutableList(),
@@ -2875,7 +2875,13 @@ internal class AgentLoopEngine(
                 // bubble froze at the pre-recovery text for the rest of the run
                 // and only refreshed at the next terminal event. It now runs once,
                 // immediately before the `break` below.
-                val turnParts = host.buildTurnParts(loopState.allToolBlocks, turnStartBlockIndex, toolInputMap)
+                // [deep-audit-1016c ISSUE-01] Slice from the run-scoped
+                // unpersisted start, NOT from this turn's start: a continuation
+                // branch above (EOF-stub / length-wall / verify nudge / residue
+                // refill) may have streamed blocks that no persist ever picked
+                // up — they ride along in this terminal row instead of being
+                // skipped forever.
+                val turnParts = host.buildTurnParts(loopState.allToolBlocks, loopState.unpersistedBlockStart, toolInputMap)
                 val blockMeta = loopState.allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
                 // [deep-audit-1015 BUG-01b] A failure branch above may have
                 // queued the turn's terminal banner. Persist THIS turn's row
@@ -2901,6 +2907,26 @@ internal class AgentLoopEngine(
                     modelId = loopState.currentProvider.model.id,
                     entryId = host.activeEntryId,
                 )
+                // [deep-audit-1016c ISSUE-01/A] Every block up to now is durable
+                // (the row above was written with parts covering the full
+                // unpersisted range). Advance only on success — if the DB write
+                // produced no row id, the next persist must re-cover this range
+                // rather than silently assume it landed.
+                if (persistedRowId != null) {
+                    loopState.unpersistedBlockStart = loopState.allToolBlocks.size
+                    // [deep-audit-1016c ISSUE-01/B] dbId backfill, same shape as
+                    // the tool-path terminal below — without it the assistant
+                    // message reloads with a null DB anchor and compaction falls
+                    // back to a degraded walk. Skip (do NOT invent an entry) when
+                    // no matching message exists.
+                    val lastAssistantIdx = host.agentHistory.indexOfLast {
+                        it.role == LLMMessage.Role.ASSISTANT && it.dbMessageId == null
+                    }
+                    if (lastAssistantIdx >= 0) {
+                        host.agentHistory[lastAssistantIdx] =
+                            host.agentHistory[lastAssistantIdx].copy(dbMessageId = persistedRowId)
+                    }
+                }
                 TerminalErrorPlacement
                     .terminalErrorToSurface(pendingInlineError, persistedRowId)
                     ?.let { banner ->
@@ -3211,7 +3237,12 @@ internal class AgentLoopEngine(
             // in place instead of inserting a second row for the same turn.
             var earlyAssistantDbId: String? = null
             run {
-                val livePreviewParts = host.buildTurnParts(loopState.allToolBlocks, turnStartBlockIndex, toolInputMap)
+                // [deep-audit-1016c ISSUE-01] Live preview + early persist carry the
+            // same unpersisted range as the terminal slice: on a turn whose run
+            // already has unpersisted continuation blocks, the early row must
+            // include them (kill-during-tool-exec keeps the earlier text), and
+            // the terminal update below rewrites the row from the same basis.
+            val livePreviewParts = host.buildTurnParts(loopState.allToolBlocks, loopState.unpersistedBlockStart, toolInputMap)
                 val liveMeta = loopState.allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
                 if (livePreviewParts.isNotEmpty()) {
                     host.updateSessionPreview(
@@ -3749,7 +3780,9 @@ internal class AgentLoopEngine(
             // hang between tool-END and the next REQ can be attributed to the
             // persist phase vs the next-turn dispatch.
             android.util.Log.i("ChatVMStream", "runAgentLoop turn=$turn persist-begin blocks=${loopState.allToolBlocks.size}")
-            val turnParts = host.buildTurnParts(loopState.allToolBlocks, turnStartBlockIndex, toolInputMap)
+            // [deep-audit-1016c ISSUE-01] Same unpersisted-start basis as the
+            // no-tool terminal slice (see that site).
+            val turnParts = host.buildTurnParts(loopState.allToolBlocks, loopState.unpersistedBlockStart, toolInputMap)
             val blockMeta = loopState.allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
             // [fix/early-turn-persist] When the row already exists (written
             // before the tools ran) refresh it with the finished tool blocks
@@ -3772,6 +3805,10 @@ internal class AgentLoopEngine(
                 if (lastIdx >= 0) {
                     host.agentHistory[lastIdx] = host.agentHistory[lastIdx].copy(dbMessageId = assistantDbId)
                 }
+                // [deep-audit-1016c ISSUE-01/A] The row now durably carries every
+                // block in the unpersisted range (its slice starts there) — the
+                // next turn's persistence must not re-send them.
+                loopState.unpersistedBlockStart = loopState.allToolBlocks.size
             }
 
             // Persist tool results as user-role message (mirrors iOS)
@@ -3857,6 +3894,9 @@ internal class AgentLoopEngine(
                     loopState.assistantId = handled.newAssistantId
                     loopState.accumulatedText = ""
                     loopState.allToolBlocks.clear()
+                    // [deep-audit-1016c ISSUE-01/A] New bubble ⇒ unpersisted range
+                    // restarts from 0, in lockstep with the cleared list.
+                    loopState.unpersistedBlockStart = 0
                     loopState.allToolInputs.clear()
                     loopState.toolInputChunkRings.clear()
                     host.setCanResume(false)
