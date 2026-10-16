@@ -185,6 +185,57 @@ internal object RequestBudgetRecompute {
     }
 }
 
+/**
+ * [deep-audit-1017 ISSUE-03] Per-turn visible-content predicate for the
+ * `toolCalls.isEmpty()` tail of `runAgentLoop`.
+ *
+ * The tail used to ask this question of the RUN-scoped accumulators
+ * (`loopState.accumulatedText` / `loopState.allToolBlocks`): both are
+ * append-only for the whole run (cleared only by the queued-prompt interrupt
+ * checkpoint), so once ANY earlier turn streamed text or dispatched a tool
+ * they stayed non-empty forever and `if (!hasVisibleContent && finishedCleanly)`
+ * could never fire again. That made the empty-turn recovery — including
+ * `EmptyTurnRecovery.Plan.NudgeExistingPart(isToolResult = true)`, the arm the
+ * reminder exists for ("model stalled after a tool result") — unreachable from
+ * the engine: the run silently stopped on an empty reply with no nudge, no
+ * retry, no hint.
+ *
+ * The question is per turn, so the inputs are per turn: `turnText` is this
+ * turn's text (the seam-trimmed message body) and `turnBlocks` is this turn's
+ * block slice (`allToolBlocks.drop(turnStartBlockIndex)`). Mirrors iOS
+ * AIChatViewModel.swift, which asks the question of the current turn.
+ *
+ * Top-level + pure so the decision is directly unit-testable
+ * (`TurnVisibleContentTest`), same as [RequestBudgetRecompute] above.
+ */
+internal object TurnVisibleContent {
+
+    /** This turn showed the user something: streamed text or a rendered block. */
+    fun hasVisibleContent(turnText: String, turnBlocks: List<AssistantBlock>): Boolean =
+        turnText.isNotBlank() ||
+            turnBlocks.any { it.kind == "tool_use" || (it.kind == "text" && it.content.isNotBlank()) }
+
+    /**
+     * [T-truncated-stream-retry] A truncated turn (EOF without a
+     * `finish_reason`) is NOT a clean finish even when the stop reason is null
+     * or "stop" — the EOF retry branch owns it, so the empty-turn path must not
+     * swallow it with an error hint. Same for any non-terminal finish reason.
+     */
+    fun finishedCleanly(turnFinishReason: String?, turnTruncated: Boolean): Boolean =
+        (turnFinishReason == null ||
+            turnFinishReason == "stop" || turnFinishReason == "end_turn") &&
+            !turnTruncated
+
+    /** The empty-turn trigger: nothing visible this turn AND a clean finish. */
+    fun isEmptyTurn(
+        turnText: String,
+        turnBlocks: List<AssistantBlock>,
+        turnFinishReason: String?,
+        turnTruncated: Boolean,
+    ): Boolean = !hasVisibleContent(turnText, turnBlocks) &&
+        finishedCleanly(turnFinishReason, turnTruncated)
+}
+
 internal class AgentLoopEngine(
     private val host: AgentLoopHost,
     private val traceObserver: ChatAgentTraceObserver,
@@ -2811,9 +2862,19 @@ internal class AgentLoopEngine(
                 }
 
                 AppLogger.info(TAG_STREAM, "runAgentLoop turn=$turn no tool calls → break (finishReason=$turnFinishReason)")
-                withContext(Dispatchers.Main) {
-                    host.updateAssistantMessage(loopState.assistantId, loopState.accumulatedText, false, loopState.allToolBlocks)
-                }
+                // [deep-audit-1017 ISSUE-02] The row finalize (isStreaming=false)
+                // used to sit HERE, ~260 lines above the `break`, i.e. BEFORE the
+                // four `continue` branches below (empty-turn recovery ×2, EOF-stub
+                // continuation, EOF one-shot retry). Every one of those keeps
+                // streaming into THIS row — `loopState.assistantId` is minted once
+                // per run — and a finalized row rejects every later delta
+                // (StaleStreamPublishPolicy.DROP_FINALIZED: canonical
+                // isStreaming=false + the side channel drained by this very call,
+                // and nothing in `runAgentLoop` ever flips the row back — the
+                // isStreaming=true writers only touch `_streamingById`). So the
+                // bubble froze at the pre-recovery text for the rest of the run
+                // and only refreshed at the next terminal event. It now runs once,
+                // immediately before the `break` below.
                 val turnParts = host.buildTurnParts(loopState.allToolBlocks, turnStartBlockIndex, toolInputMap)
                 val blockMeta = loopState.allToolBlocks.filter { it.kind == "tool_use" }.associateBy { it.id }
                 // [deep-audit-1015 BUG-01b] A failure branch above may have
@@ -2852,16 +2913,21 @@ internal class AgentLoopEngine(
                 // compaction; otherwise suggest retry/switch. host.setInlineError
                 // attaches + persists onto the (empty) assistant row so the hint
                 // survives a reload too.
-                val hasVisibleContent = loopState.accumulatedText.isNotBlank() ||
-                    loopState.allToolBlocks.any { it.kind == "tool_use" || (it.kind == "text" && it.content.isNotBlank()) }
-                val finishedCleanly = (turnFinishReason == null ||
-                    turnFinishReason == "stop" || turnFinishReason == "end_turn") &&
-                    // [T-truncated-stream-retry] a truncated turn (EOF without
-                    // finish_reason) is NOT a clean finish even though
-                    // stopReason is null — the retry branch below owns it, so
-                    // the empty-turn path must not swallow it with an error hint.
-                    !turnTruncated
-                if (!hasVisibleContent && finishedCleanly) {
+                // [deep-audit-1017 ISSUE-03] Per-TURN visible content, not the
+                // run-scoped accumulators. `loopState.accumulatedText` /
+                // `loopState.allToolBlocks` are append-only for the whole run,
+                // so reading them here answered "did ANY turn show something" —
+                // true from the first tool-call turn onward — and the empty-turn
+                // recovery below could never fire again. See [TurnVisibleContent].
+                val turnVisibleBlocks = loopState.allToolBlocks.drop(turnStartBlockIndex)
+                val hasVisibleContent = TurnVisibleContent.hasVisibleContent(turnText, turnVisibleBlocks)
+                // [T-truncated-stream-retry] a truncated turn (EOF without
+                // finish_reason) is NOT a clean finish even though stopReason is
+                // null — the retry branch below owns it, so the empty-turn path
+                // must not swallow it with an error hint. That rule lives inside
+                // TurnVisibleContent.finishedCleanly; the trigger itself is the
+                // one extracted decision:
+                if (TurnVisibleContent.isEmptyTurn(turnText, turnVisibleBlocks, turnFinishReason, turnTruncated)) {
                     // [T-android-empty-after-toolresult-reminder] Special case: the
                     // server returned an empty turn. The model owed a follow-up
                     // but stalled — the user sees a blank bubble with no explanation.
@@ -2976,6 +3042,11 @@ internal class AgentLoopEngine(
                 // The stacking guard drops a stale stub reminder so consecutive
                 // EOFs do not pile up reminder turns (same pattern as the
                 // length-wall reminder below).
+                // [deep-audit-1017 ISSUE-03] `hasVisibleContent` is THIS turn's
+                // (see [TurnVisibleContent]) — the EOF ladder asks "did this
+                // truncated turn stream anything", and the run-scoped read made
+                // the `else if` below ("blank stream → nothing worth keeping")
+                // unreachable for any run whose earlier turns had shown text.
                 if (turnTruncated && hasVisibleContent) {
                     // [feat/runtime-limits-panel] 同上：上限改读 prefs（默认 2）。
                     val eofStubMax = com.rikkaminis.app.data.AgentRuntimeLimitsPrefs.eofStubContinues()
@@ -3064,6 +3135,26 @@ internal class AgentLoopEngine(
                 // audit-0907 B5 runaway guard is unaffected: it reads
                 // terminalErrorSurfaced, not this flag (see
                 // AgentLoopExitDecision.shouldFinalizeAsRunaway).
+                // [deep-audit-1017 ISSUE-02] The single row finalize for this
+                // turn — after ALL four `continue` branches above, so the row
+                // stays streaming for the recovery/continuation that follows
+                // them (see the note at the head of this block). Ordering is
+                // unchanged for every path that reaches here: the turn was
+                // persisted above (persistAssistantTurn), banners
+                // (pendingInlineError / empty-response hint / EOF give-up)
+                // were surfaced above, and `updateAssistantMessage(false)` does
+                // not touch `error`, so a banner stamped on the row survives it.
+                //
+                // It sits ABOVE the clean-completion gate, not below the guard's
+                // closing brace: TerminalErrorSurfacedTest's negative control
+                // mutates the source by the exact adjacency of the guard's close
+                // followed by the break, so anything parked between that `}` and
+                // the `break` would silently disarm that control (2026-10-16 CI
+                // #2168: the control failed with "mutation must change the
+                // source" for exactly this reason).
+                withContext(Dispatchers.Main) {
+                    host.updateAssistantMessage(loopState.assistantId, loopState.accumulatedText, false, loopState.allToolBlocks)
+                }
                 if (AgentLoopExitDecision.cleanCompletionFlag(loopState.terminalErrorSurfaced)) {
                     loopState.loopExitedNormally = true
                     // T7-D: 旁路验证 —— 工具序列完成，进入收尾
