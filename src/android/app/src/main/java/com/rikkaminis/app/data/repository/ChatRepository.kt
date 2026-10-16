@@ -343,27 +343,46 @@ class ChatRepository(
         var offset = 0
         while (offset < total) {
             val limit = LOAD_PAGE_SIZE
-            val page = try {
-                dao.loadMessagesPage(sessionId, offset, limit)
-            } catch (e: SQLiteBlobTooBigException) {
-                // Fall back to single-row pages so we can isolate the
-                // offending blob(s) and serve the rest of the slice.
-                loadPageRowByRow(sessionId, offset, limit)
-            } catch (e: IllegalStateException) {
-                // Some Room/SQLite combinations wrap the CursorWindow
-                // overflow in IllegalStateException("Couldn't read row N,
-                // col N from CursorWindow"); treat the same way.
-                if (e.message?.contains("CursorWindow", ignoreCase = true) == true) {
-                    loadPageRowByRow(sessionId, offset, limit)
-                } else {
-                    throw e
-                }
-            }
+            val page = loadPageTolerant(sessionId, offset, limit)
             if (page.isEmpty()) break
             out.addAll(page)
             offset += limit
         }
         return out
+    }
+
+    /**
+     * Paged read that survives the per-CursorWindow 2 MB ceiling.
+     *
+     * Both the legacy `dao.loadMessages` batch and a plain
+     * `dao.loadMessagesPage` materialise their rows into a single
+     * CursorWindow, so one row holding a large tool_result blob (>2 MB)
+     * aborts the whole read with [SQLiteBlobTooBigException] (Issue #17).
+     * Every production paged read funnels through here so the degradation
+     * policy lives in exactly one place: try the normal page, then fall
+     * back to single-row pages, substituting an [oversizedProxyRow] for any
+     * row that genuinely cannot be materialised — the slice stays
+     * continuous instead of failing the caller.
+     */
+    private suspend fun loadPageTolerant(
+        sessionId: String,
+        offset: Int,
+        limit: Int,
+    ): List<MessageEntity> = try {
+        dao.loadMessagesPage(sessionId, offset, limit)
+    } catch (e: SQLiteBlobTooBigException) {
+        // Fall back to single-row pages so we can isolate the
+        // offending blob(s) and serve the rest of the slice.
+        loadPageRowByRow(sessionId, offset, limit)
+    } catch (e: IllegalStateException) {
+        // Some Room/SQLite combinations wrap the CursorWindow
+        // overflow in IllegalStateException("Couldn't read row N,
+        // col N from CursorWindow"); treat the same way.
+        if (e.message?.contains("CursorWindow", ignoreCase = true) == true) {
+            loadPageRowByRow(sessionId, offset, limit)
+        } else {
+            throw e
+        }
     }
 
     private suspend fun loadPageRowByRow(
@@ -896,13 +915,18 @@ class ChatRepository(
      * to stream-export long sessions without loading every message into
      * memory. Unlike [loadMessagePage] this does not strip / project the
      * row; the exporter needs the full `parts_json` payload to serialize.
+     *
+     * Routed through [loadPageTolerant] so a session containing a
+     * un-materialisable (>2 MB) blob degrades one row at a time instead of
+     * aborting the whole export (the exporter's own catch turns a throw
+     * into a failed export, not a degraded one).
      */
     suspend fun loadMessagePageRaw(
         sessionId: String,
         offset: Int,
         limit: Int,
     ): List<MessageEntity> =
-        dao.loadMessagesPage(sessionId, offset, limit)
+        loadPageTolerant(sessionId, offset, limit)
 
     /**
      * Walk parts_json and concatenate every `{type:"text", value:...}`
