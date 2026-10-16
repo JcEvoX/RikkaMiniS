@@ -4,8 +4,8 @@
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
 - 合并范围：2026-08-03 ～ 2026-10-16，共 75 天
-- 条目总数：1791（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：2381829 / 总行数：32030
+- 条目总数：1802（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：2412244 / 总行数：32274
 
 ---
 
@@ -32023,6 +32023,250 @@ P2 登记项（BUG-04/07/09/10、DESIGN-01/05/06/08、PERF-01/02/04/05）与 P3�
 **核查证据**：8/8 CI head_sha 逐字符 MATCH（#2153/2162/2156/2163/2158/2160/2157/2155）；文件集生产部分两两互斥；backlog §118–§125 八段；AUDIT-REPORT.md sha256 ≡ 用户原件。报告 `shared/work/deep-audit-1016/CLOSE.md`。
 
 **残留**：真机验收全未做（装新包后：打开报告不闪退 / B-9c / F 删运行中任务 / 各支装置面见 §118-125）；并集树 CI #2164 @ `812d0587` 在跑（多支并集树必须等绿才算收口——#2150 教训）。
+
+<!-- 2026-10-16 11:03:33 -->
+## deep-audit-1016 最终收口（2026-10-16）：main `812d0587` + 并集树 CI #2164 green + Release 已发布 + 文档上云
+
+
+**并集树 CI #2164（id 38842323044）success @ `812d0587`**，24 步全 success。**云端实证**（日志抓取，绕 Authorization 重定向）：①第 3 步扫描门 **`Summary: 28 passed, 0 failed`** 且门标记 [1/28]…[28/28] 在场 = 我重建的并集 scan.sh 在 CI 真跑（不只是本地）；②第 15 步单测收集实核：新测试类 `MarkdownBlockModelListFenceTest`(6)/`InlineParenMathTest`(7)/`GeminiBasePathTest`(13)/`BrowserSessionBindingTest`(11)/`GuestPathParseMatrixTest`(21) 全在日志里 + 4 个新门名各命中；③第 23 步 Publish success → **`RikkaMinis-arm64-v8a.apk` 已上传 android-latest Release**（= 用户可直接装包做真机验收）。
+
+**文档**：三件套重建 **1791 条 / 75 天（08-03～10-16）/ 24 sagas / orphans 173 / 脱敏探针 clean**；`docs/dev-history-1016b` → API merge main `e748b14b72e1`（纯文本：不 dispatch、不等 CI —— 且该 paths 过滤不含 docs/，不影响在跑的 #2164）；README 计数 1780→1791；远端分支 DELETE 204。本地落 `mounts/笔记/RikkaMinis开发档案/`。
+
+**手法沉淀**：①**多支共改同一脚本的并集陷阱**——各支独立"末尾加门 + 全文件重编号"⇒ 试合冲突形态是「门块 else/fi 落在冲突块外」，机械保留两侧产出语法坏文件（Git 报 CONFLICT 但不报语法）；正解 = 以 main 为主干 + 从各支原文件切**完整门块**（注释头到独立 fi）+ 全量重编号重排。脚本 `rebuild_scan_sh.py`。②**云端门数取证**：`grep -o '\[N/M\]'` 抓日志里步标记 = 证明「线上跑的就是我改的那版门序」，比"CI 绿"强。③CI job 日志下载仍需 NoRedirect 取 Location 再裸下（带 Authorization 跟重定向必 401）。
+
+<!-- 2026-10-16 11:14:41 -->
+## VERIFY-DEVICE-1016 真机验证（设备包 1.0.0+2164，用户令「这个应用包含全部修改，开始验证」）
+
+
+**身份链闭合**：设备 base.apk sha256 `36b7f59e…45f5d`（14,351,449 B，装于 11:03:51）== CI run **#2164**（id 38842323044，conclusion success，head_sha **`812d0587`** = deep-audit-1016 八支并集树）artifact `app-release.apk` 逐字节一致。报告 `shared/work/verify-1016/VERIFY-DEVICE-1016.md`。
+
+**用户已手动验证项 ✅**：打开 111KB `AUDIT-REPORT.md` 不再闪退。修复前崩溃链实锤：`crash-2026-10-16_08-31-58/08-32-22.log`（旧包 2152）`IllegalArgumentException: alternateText can't be an empty string` = androidx `appendInlineContent(tag,"")` require；装包后 0 个新 crash 快照。
+
+**★ 独立文件级取证（比「用户点了不崩」更硬）**：把设备同款修复逻辑（逐字抽取装置 `crash1016-fix/probe/src`）跑在**真报告文件**上（1668 行/97,236 字符/240 块）→ 列表吞围栏 **0 处**、`normalizedBasePath` 行落 **CodeBlock**、`inlineParenMathSpan` 产 **null**；**变异臂**（删两处 `startsWith("```") break` + 删 `latex.isEmpty()` 守卫）→ 20 处吞围栏 / 落 UnorderedList / `latex=''` = 崩溃前置条件精确复现。装置 `verify-1016/probe/ReportFileProbe.kt`（`REPORT_PROBE_VERDICT=PASS`）。
+
+**活体探针（我就在沙箱里，可直接 A/B）**：
+- **FIX-C 路径归一化**：`file_write /var/minis/workspace/./da1016-probe.txt` → 落真实路径、`file_read` 用 `/var/minis/./workspace/...` 读到同一份、`//var/minis/...` 同一文件、`find / -xdev` 仅 **1 份** = 无幽灵路径（修复前该形态写入成功但读不到）。
+- **FIX-B 9c**：CLI `minis-browser-use navigate --url minis://workspace/da1016-probe.html` → **success / Title: PROBE1016-FIXB9C**（修复前同形态返回 `File not found`）。
+- **FIX-D 4a/4b**：两条**独立** HEAVY（`python3`）调用各 `dur=56ms`，memspike 分类 HEAVY ⇒ heavyGate permit 按期获取+释放、无泄漏（泄漏则第二条排队至 global-slot 超时）。
+- **FIX-C 2b**：装包后 `installMountWriteGuards: no read-only mounts, guards cleared`（pristine 分支正确，守卫本体仍不可触发）。
+- **健康**：新包窗口 `[ERROR]`=0、无 crash/ANR、pid 30959 未 silent_kill、RSS 315–341MB 正常回落；3 份 error-snapshot = 上游 tierflow **HTTP 503 cpu_overloaded**（瞬时，非 app 缺陷）。
+
+**未取得判据（交用户）**：FIX-A Gemini /v1beta（本窗口无 Gemini 流量 + 本机 SNI 封 Google）、FIX-E 6a/6b（需触发 fallback / content-filter）、FIX-F B-7b/7c（需建删定时任务）、FIX-D 4c（需 UI 触发）、FIX-B 9a/9b/9d、FIX-G §118 通知头像与压缩分割线。逐项验证法见报告 §7。
+
+**手法沉淀**：①**「用户点了不崩」之外还要文件级取证**——把修复逻辑抽出来跑真输入文件，并用变异臂证探针有牙，得到的是可复跑证据而非一次性观察。②**沙箱即被测面**：FIX-C（路径解析）/FIX-B 9c（会话绑定）/FIX-D（执行闸门）三项修复都能由 agent 自己在沙箱里发起真实调用 A/B，不必等用户操作。③日志里 `alternateText` 的「1 次命中」= 自己 grep 命令的 logcat 回显（ToolCallComplete args），**判读日志命中前先排除自身工具调用镜像**。
+
+<!-- 2026-10-16 12:12:01 -->
+## deep-audit-1017 第二道门 + 7 支派发（2026-10-16，基线 main `e748b14`）
+
+
+**输入**：附件 `shared-4dc0dfc3.md`（1993 行，ISSUE-01..10）。工作目录 `shared/work/deep-audit-1017/`（repo 浅克隆 + verify1..6.sh/out + TRIAGE.md + COMMON.md + fix-tasks/FIX-A..G.md + DISPATCH.md）。
+
+**★ 本轮报告的臆造密度比 1015/1016 更高**：文件路径错（ProviderExecutionGateway 真实在 `sandbox/offload/` 非 `service/`）、符号不存在（`writeRunOutput`、`ImageBudget.capMessageImages`、`LLMResponse` 无该字段却称「返回 ExecutionResult.toolCalls 恒空」）、整段代码片段形状不符（PlayerOffloadHandler 的 `getInstance(context)`/`args.get("session")`、PersistentShell 的 `MarkerScanStep/emit/carry/foundExitTail`、ChatToolExecutors 的 `NativeToolResult`）。**但核心缺陷多数成立**——判据必须回到本树重取，不能因「片段假」而整体否，也不能因「行号对」而照抄修复指令。
+
+**判定：10 工单 → 修 7 支（文件集两两互斥、全并行）· 登记 2（ISSUE-05 latent / ISSUE-07 主体驳回）· ISSUE-02 先证后改**
+- 实锤：I-01（P0，OpenAIProvider 全文 `imageData` **0 命中**；Anthropic `:784`+Gemini `:422` 均已修 = **同族第 3 处漏改**；Responses 顶层 imageParts 不透传 `:650`/`:2706`）、I-03（`:2855` hasVisibleContent 用 `loopState.accumulatedText`/`allToolBlocks` 跨回合累计 → 工具后空回合 recovery 分支 100% 不可达）、I-06（doFreebusy 查 `Events` + `DTEND > ?`，RRULE 的 Events.DTEND=NULL → 周期日程全漏；doList 已有 Instances 先例）、I-08（inputText `replace(' ','%')`；notificationChannel 用未过滤 `rest` 而非 `a.positional`（sweep1014-B30a 同族漏改）；packageClear `--cache-only`→全局 `trim-caches 1G` 却返回 cleared=pkg）、I-09（`internalScanMarker` idx 命中即 hit，而 `internalParseMinisExitCode` 正则要求 `_EXIT_(\d+)__` 闭合 → 块边界落在中间 = 立即 `finishOnce(-1)` + 尾字节丢；`[fix/marker-chunk-boundary]` 只修了前缀拆分）、I-10 五子项（截图迟到回调位图不回收；`booleanFlags` 缺 `"contains"` 致 `tap text --contains` 100% 坏；tapText 丢返回值无条件 ok；speech `startInternal` 无前置 tearDown + `usingOnDevice = wantOnDevice` 不看降级）。
+- 半实锤：I-02（`:2815` 终态 `updateAssistantMessage(...,false,...)` 确在 4 条 continue 之前 + `StaleStreamPublishPolicy.verdict(true,false,false)=DROP_FINALIZED` 实锤；但报告称「100% 冻结」需证「canonical 行无 isStreaming 翻转路径」→ 交子代理先证，证不出只登记）、I-04（residue 分支实测无 ASSISTANT 写入且 `resultSb.append(text)` 在判定**之前** → 重复拼接成立；**报告说的 `ensureRoleAlternationBeforeUserAppend` 缺失不成立**——真实树该行在场；吞取消后果有限=P2）。
+- 登记不修：I-05（executeRun 确实不读 thinking_level + LLMResponse 确实无 toolCalls，**但全部非流式调用方（摘要/标题/QuickTest）thinkingLevel=OFF 且 tools=空** ⇒ latent 零触发面；「writeRunOutput 非原子写」驳回）→ backlog **§126**；I-07 主体驳回（resolveHostPath KDoc 明说给无会话上下文调用方用 = 符合契约；竞态有状态守卫+双层 catch；seek 已有守卫）→ backlog **§127**（残留=Player 是否缺 OffloadGate.enforce）。
+
+**派发**：FIX-A `358cb6ee` / FIX-B `7d3c5d84` / FIX-C `5bfd5a43` / FIX-D `ce5e5a3a` / FIX-E `9254e0fe` / FIX-F `f7401620` / FIX-G `63043992`（羊毛组，全 async，一次成发未重发；回读 messages 验证送达 7/7）。分支名 `fix/da1017-*`。
+
+**★ 流程改进（吸取 1016 scan.sh 四支共改冲突教训）**：本轮 **7 支一律不改 `scripts/scan/scan.sh` 与 `test_scan.py`**（各支只写独立 `scripts/scan/<name>_check.py` + 自带负控自测 + 报告给注册 diff），门注册与重编号由主会话收口时统一做。写进 COMMON.md §1.3 / §4。
+
+**backlog 机械门**：`scan_debt.py notes` → 117 段 / no-触发条件 1 段（旧）/ 豁免 11 段，§126/§127 均 OK。
+
+<!-- 2026-10-16 13:05:32 -->
+## FIX-F 收口：deep-audit-1017 ISSUE-09 marker 分块边界误报完成（fix/da1017-marker-boundary @ 57dcd79a，CI #2165 绿，停在分支）
+
+
+**任务**：读 `shared/work/deep-audit-1017/fix-tasks/FIX-F.md` 立刻执行（基线 main `e748b14b`）。**报告** `fix-reports/FIX-F.md`；**装置** `fix-f/probe/`（durable）；3 文件 `+349/−18`。
+
+**缺陷与修法**：`internalScanMarker`（PersistentShell.kt:1153）把裸前缀 `__MINIS_DONE_<m>_EXIT_` 当 hit，而 exit code 正则要求闭合 `__` → 当 4096 字符读边界落在 `_EXIT_` 与数字之间时，命令以 `exitCode = -1` 完成（= `CommandFailureKind.SHELL_DIED`，`ExecutionCoordinator` 会**重建 shell 并重跑命令**——非幂等命令二次执行），且 `pendingCallback = null; tail = ""` 把该命令后续全部输出丢弃。**修法**：hit 收窄为 `internalParseMinisExitCode(...) >= 0`；未闭合时 `beforeMarker` 照常刷、`keptTail = pending` 留给下一块；新增 `MAX_PENDING_MARKER_CHARS = 64` 上限（超限落回既有 miss 尾窗语义，靠 stall-guard/timeout/EOF 收敛，**不新增悬空状态**）。调用点零改动，marker 注入字面量未动。新增静态门 `scripts/scan/marker_boundary_check.py`（+`--selftest` 5 夹具；未注册 scan.sh，注册 diff 见报告 §5）。
+
+**证据**：①**双臂差分** pre（`git show e748b14:` 基线源，sha256 与基线 blob 逐字节一致）= **62 run / 5 failures**（全落新用例家族，既有 56 例两臂全绿）/ post = **OK (62 tests)**；②字节级探针 `MarkerBoundaryProbe.kt`（照搬 readLoop 的 scan→carry→flush→EOF）：s1 边界拆 `exit -1→0`、s4 数字拆分 `-1→127`、s5 畸形 `outLen 1→1029`（字节零丢失）、s6 畸形后真 marker `-1→3`，s2/s3 健康对照两臂逐字节一致；③**变异 4/4 PRECISE-RED**（m1 恢复缺陷形态/5 红、m2 不保留 pending/3 红、m3 去掉上限/2 红、m4 对称臂改既有 keepLen/5 红）；④scan **28/28**；⑤CI #2165（id 38851752721）success，head_sha 三方逐字符一致，24 步全绿 + Publish skipped；拉日志核 **62 条 PersistentShellTest 行、新增 6 例逐条 PASSED**。
+
+**★ 手法沉淀（可复用）**：
+1. **抽取式装置可编译双臂**：`extract.py` 对缺失声明**告警跳过**（而非报错），同一装置就能编译「基线源」与「修复源」，于是**差分闭包是免费的**（pre 5 红 → post 全绿），比另写一个 baseline 装置省一半工。回退真实性用 `git show <基线>:<path>` sha256 + 修复独有标识符命中数（0 vs 4）钉死。
+2. **变异期望写错要分两种**：m2 预测 4 红实测 3 红（over-long 用例根本不走 pending 分支 = 我的分析错，且该例的牙由 m1/m3 各命中一次证明）/ m4 预测 4 红实测 5 红（两个新例也断言 fall-through 尾窗）。**登记实测值 + 写明为何，不要硬凑回预测**。
+3. **陈旧 result.log 假读数（同族第二次）**：`run.sh` 只在 java 之前 `rm` 日志，编译失败时盘上留的是上一次的 `OK (62 tests)`——驱动一度把它记成 m1 结果。加固：`rc==2` 直接判编译失败并**拒绝读取 result.log**（10-14 FIX-RV-D 是"陈旧 junit.log 假绿"，这次是"陈旧 OK"）。
+4. **CI 日志取证走预签名 URL**：`actions/jobs/<id>/logs` 302 到 blob store 且带 Authorization 跟跳转必 401 → 先取 Location 再裸下载（`probe/ci_log.sh`），token 不外泄。**"用例被收集"判据**：grep 测试名 + PASSED，而不是只看 CI 绿。
+5. **沙箱瞬时 glitch**：本轮遇到 2 次 `/bin/sh: can't create /tmp/.minis_cwd_*: Function not implemented`（python subprocess.wait 抛 OSError 38 / gh_sync dispatch 返 -1）+ 1 次 scan.sh 被 180s 无进度 stall-guard 掐掉（exit 125）——**重试即恢复**，别归因成脚本坏了。
+
+**登记不修 → 报告 §11（待主会话分配编号）**：A 真机对齐复现 / B `-1` 哨兵语义分离（`ParsedExit(ok,code)`）/ C marker 字面量单源化 / D `SHELL_DIED` 重跑面核实（交叉引用 §123 家族）。
+
+<!-- 2026-10-16 13:13:35 -->
+## FIX-E 收口：deep-audit-1017 ISSUE-08 ShizukuOffloadHandler 三个 argv 缺陷（fix/da1017-shizuku-args @ 2a5cddd1，CI #2166 绿，停在分支）
+
+
+**任务**：读 `shared/work/deep-audit-1017/fix-tasks/FIX-E.md` 立刻执行（基线 main `e748b14`）。**报告** `fix-reports/FIX-E.md`；**装置** `fix-e/probe/`（pre/ 先证原文 · jvm/ 抽取式 JVM 装置 + 变异驱动 · revert-arm.sh · ci_evidence.py + ci-logs/）；工作树 `fix-e/repo`（自建）。**独占文件** `ShizukuOffloadHandler.kt`（未越界）；scan.sh/test_scan.py **未动**（COMMON §1.3）。3 文件 +595/−18。两提交：`2c161ba6`（修复+测试）+ `2a5cddd1`（门改进）= tip。
+
+**CI**：run **#2166**（id 38852508381）**success**，`head_sha 2a5cddd1bc70…` 与本地 HEAD 逐字符一致；26 步仅 step 23 Publish skipped（分支门控）；step 3 日志 `Summary: 28 passed, 0 failed`；step 15 日志里 `ShizukuCliArgsTest` **14 例逐条 PASSED 在册**（防「没收集也算绿」）。**停止节点达成，未合并。**
+
+**三处修法（全部本树实测锚点，工单锚点逐条复现）**：
+- **08a** `:703` `text.replace(' ', '%')` → `encodeInputText(text)` = `replace(" ", "%s").replace("'", "")`。**AOSP 原文取证**（`probe/pre/InputShellCommand.java` android15-release :371-386）：`sendText` 只在 `%` 后紧跟 `s` 时替换为空格，其余 `%` 原样送 KCM；设备 `/system/bin/input` = sh 包 `cmd input "$@"` ⇒ argv 原样抵达 ⇒ 修前每个空格被打成**字面 `%`**（不是「丢失」而是「变别的字符」）。
+- **08b** 调用点 `notificationChannel(rest.drop(1), args)` → `args.positional.drop(1)`（同文件 `permissionAppops(pos,…)/inputSwipe(pos,…)` 既有风格）+ 函数内 `rest.getOrNull(1/2)` → `pos.getOrNull(1/2)`；新增 `NO_VALUE_FLAGS = setOf("block","unblock")` 传给 `OffloadArgs`。**读 OffloadArgs 定义发现缺陷是两层叠加**：未声明旗标会把下一个 token 当自己的值吃掉（`--block com.pkg` ⇒ `get("block")=="com.pkg"`）+ raw 取参把旗标当目标 ⇒ `channel set --block com.pkg chid` 修前把 `--block` 当包名送进 `cmd notification`。`--importance` **刻意不进**该集合（带值，声明它会把 `3` 留成孤立 positional）。
+- **08c** `--cache-only` 修前跑全局 `pm trim-caches 1G` 却回 `cleared=<pkg>`（**谎报**）→ `buildPackageClearCommand(pkg,cacheOnly,user)` 真 per-package（`pm clear [--cache-only] [--user U] <pkg>`），payload 新增 `scope`（cache-only / data+cache）如实说明清了什么。设备实证支持：`pm help clear` 有 `[--cache-only]`，AOSP `runClear`（`PMSC.java:2312-2358`）走 `deleteApplicationCacheFilesAsUser`。
+
+**验证**：JVM 抽取式装置 **OK (14 tests)** + 模拟器 post-fix 打出真空格（pre-fix 打 `hello%world`）；**变异负控 10/10 PRECISE-RED**（J1-J5 helper、G1-G5 **接线**——「包装活着≠路径在走它」的 1016 FIX-D G3b 同源，接线臂是这条的核心资产）；**回退臂**（§2.2）把 e748b14 基线写回：修后标识符 0 命中 / 基线标记回归 → 装置 `FAIL (extract)` rot 退出、结构门 **7/7 全红且行号正确**（:715/:762/:235）→ 复原后复绿；scan **28/28**；新门 `shizuku_args_check.py` 独立跑通 + `--selftest` 7/7 造反例全红。
+
+**★ 手法沉淀（可复用）**：
+1. **平台语义必须取 AOSP 原文而不是猜**：`input text` 的空格编码 + `pm clear --cache-only` 的两条结论都靠 android15-release 源码原文落盘（`sendText` 的 escapeFlag 分支、`runClear` 的 observer 回调）——报告/上游注释都可能不准，源码是 ground truth。
+2. **结构门的行号会被「剥离注释时吃掉换行」整体前移**（实测判据 1 报 30、真实 58）⇒ `strip_comments` 必须**保留块注释里的每个换行**，否则 file:line 输出全是假读数（COMMON §4 要求 file:line，这个 bug 会静默抵消该要求）。
+3. **表达式体函数（`= expr`）没有自己的大括号**，配平会吞进下一个声明的体（1016 FIX-D G3b 同款）⇒ `function_body` 先按 `=`/`{` 分流。
+4. **CI job 日志下载：NoRedirect 时 urllib 把 302 抛成 `HTTPError`**（不是返回响应对象）⇒ 要 `except urllib.error.HTTPError` 取 `e.headers["Location"]` 再裸下（预签名 URL 不带 auth）；相对路径写 `"actions/jobs/<id>/logs"` 会 `unknown url type`，必须补全 `https://api.github.com/repos/...`。
+5. **工单里的「同文件既有先例」也可能是假的**：SAFE_IDENT 全仓 **0 命中**（`probe/pre/p5`），先证把「照抄一个不存在的机制」挡住了；结论「不加朴素正则」（包名字法边界易错 + positional 化已关掉旗标冒充包名这条实际路径）——**先证的价值不只是证缺陷，也证前提**。
+
+**同族观察（本支不修，建议主会话登记）**：①`channel set` 命令面本身在本机不可用——`set_channel_importance` 不在 `cmd notification` 子命令表，按渠道屏蔽的真原语是 `set_bubbles_channel`（现用的是**应用级** `set_bubbles`）；②`channel list` 正则匹配不到本机 dumpsys 形状（`mId=`/`mName=`/`mImportance=`）⇒ 恒空且 pkg 未参与过滤（代码已打 ponytail 标记）；③本 handler 无值旗标未全量声明（`package clear --cache-only <pkg>` flag 前置会响亮失败 INVALID_ARGS）；④SAFE_IDENT 类校验全仓缺失（需独立设计，勿塞本条）；⑤`pm clear --cache-only <不存在的包>` 平台侧会**挂住**（observer 永不回调）→ 走 `runProcess` 15s 超时后如实报错（有界、不谎报，逐变体探针 `probe/pre/` 已存）。
+
+**诚实边界**：真机端到端未跑（不向不确定焦点输入框注入按键、不对真实包执行 pm clear；真机窗口可补两条：`input text a b` 打出 `a b` / 对无关包跑 `package clear --cache-only` 看 `scope=cache-only`）；`--user × --cache-only` 组合未真机验证；老 API 上 `--cache-only` 未验（不支持则响亮失败）。
+
+<!-- 2026-10-16 13:15:12 -->
+## FIX-C 收口：deep-audit-1017 ISSUE-04（子代理回合交还契约）—— fix/da1017-subagent-residue @ bf124e8d，CI #2167 绿，停在分支
+
+
+**任务**：读 `shared/work/deep-audit-1017/fix-tasks/FIX-C.md` 立刻执行（基线 main `e748b14`，浅克隆）。**报告** `fix-reports/FIX-C.md`（189 行）；**装置** `fix-c/probe/`（durable：clone.sh / pre-residue.txt / pre-cancel.txt / scan-out*.txt / ci_verify.py / ci-2167.log + `jvm/` 全套）。
+
+**改动**：3 文件 +494/−4（生产 `ChatToolExecutors.kt` +55/−4；CI 测试 +159；新门 +280）。
+
+**两处修复（同一支，正好是同一条链上的两件事）**：
+- **P1 residue 交还丢回声**：residue refill 分支把 USER nudge 追加进 history，却**没把本回合可见文本写成 ASSISTANT** → 模型看不到自己写过什么（`ToolCallResiduePolicy.refillMessage` 只点名工具、**不内嵌 partial text**，先证确认）→ 重试重写同一段正文，而 `resultSb`（判定前已 append）再收一次 = 子代理持久化结果里正文出现两次。修法**照抄主回路**（`AgentLoopEngine:2359` 可见文本入 agentHistory + `:2808` 才追加 nudge）+ 同文件 truncation 续写分支的既有形状；抽 `appendSubagentTurnText(history, text)` 作**唯一定义**，两条 `continue` 路径共用。**`isBlank()` 守卫必需**（空串会造出「provider 过滤掉的空壳」= 模型看不见但内存里破坏角色交替）。
+- **P2 吞取消**：循环外层 `catch (e: Exception)` 把 CancellationException 转成 `ToolExecutionResult("… encountered an error … stop pressed by the user", false)` → 用户按停止被记成子代理失败（**pre-fix 臂实测打印出这条**）。加 `catch (e: CancellationException) { throw e }`（同文件 `:180` 先例）。调用链无 withTimeout ⇒ 不升 P0/P1。
+
+**★ 审计报告臆造密度本轮再创新高**：返回类型 `NativeToolResult`（本树是 `ToolExecutionResult`）、`ToolCallResiduePolicy.detect`（**本树没有**，真实是 `firstResidue`/`stripResidue`/`refillMessage`）、行号 `:356-370`（本树 `:392-421`）。判据全部回本树重取；TRIAGE 已预警，实测逐条对上。
+
+**验证**：
+- JVM 装置（`probe/jvm/`，抽取式）：`run.sh` **7/7**；**差分闭包** pre-fix（`git show <base>:<path>` 物化镜像树，含 ROLLBACK_VERIFIED base_marks=0/live_marks=3）= **6 run / 2 failures 恰为两个缺陷臂**、4 条零回归臂保持绿；post-fix 全绿。
+- **变异 4/4 PRECISE-RED**：M1 删 echo（门也红）/ M2 删取消重抛（门也红）/ M3 删 blank 守卫（**门不红，只有装置红**）/ M4 echo 挪到桥接之后（顺序错，同样只有装置红）。
+- 新门 `scripts/scan/subagent_handback_check.py`（C1 回声契约 + C2 取消契约，作用域=runSubagentLoop 体）`--selftest` **6 夹具全对**，含「echo 只写在注释里必须仍红」（掩码器自证）；真树 2 条 hand-back 全合规。**未注册 scan.sh**（本轮冻结该文件），报告给注册 diff + `test_scan.py` 夹具建议。
+- scan：`bash scan.sh` 第一次撞 **S28 瞬时故障**（第 24 门 `OSError: [Errno 38] Function not implemented`，前 23 门绿）→ 重试 attempt 1 **`Summary: 28 passed, 0 failed`**；另按 S28 健康路径逐门直跑 **28 passed / 0 failed**。
+- **CI #2167（id 38852646901）success @ `bf124e8d66d72a0aca159fd8bb713c633aeb6a86`，三方逐字符一致**（本地 HEAD == 远端 tip（API `branches/...`）== head_sha）；24 步全绿、Publish skipped；**新 5 条用例逐条 PASSED 在册**（日志 992KB 落盘）；全日志 `FAILED` 6 处**全是 PASSED 行里含 `_FAILED` 的用例名**（判读陷阱复核）。**停止节点达成，未合并 main。**
+
+**★ 手法沉淀（可复用）**：
+1. **出站请求才是判据面**：断言不落在被测函数内部状态，而落在「假 provider 收到的 messages 列表」= 模型的全部视野 —— 缺陷（缺 ASSISTANT）与修复（有 ASSISTANT）在同一观测面上直接可比。
+2. **同一条链上的两个缺陷可以一个装置一次验完**（回声 + 取消），差分臂把「修复前必红/修复后必绿」钉在一屏内。
+3. **门管「做没做」、装置管「做对没做对」**：M3/M4 的教训——机械门判不了 blank 守卫与调用顺序，写门时就要在 KDoc 里写明这条边界（否则下一位接手者会以为门能兜住）。
+4. **抽取式装置的锚点要防漂移**：`const` 无花括号 ⇒ 「下一个 `^}`」会吞掉后面整段（本轮首跑就踩到，改成 const 单行特判）；pre-fix 臂要 `--lenient`（helper 在基线不存在）；差分臂不复用 class（先 rm out/ 与 junit.log）。
+5. **沙箱 S28（ENOSYS）现在会打到子进程壳层**：`subprocess.run` 直接抛 OSError，变异驱动中途崩且**留下未还原的变异**（树脏）→ 驱动必须给子进程加 ENOSYS 重试 + 崩溃后先 `git checkout --` 再判「干净」。
+6. **任务书给的 clone URL 缺主机名**（`https://***OWNER***/RikkaMinis.git`）：gh_sync.sh clone 要求 cwd 在 git repo 内（新工作树里不是）→ 自写 `probe/clone.sh`（GIT_ASKPASS + `--depth 1` + 显式 proxy config），URL 必须带 `github.com`。
+
+<!-- 2026-10-16 13:21:19 -->
+## FIX-D 收口：deep-audit-1017 ISSUE-06（calendar freebusy 漏周期日程 + doUpdate 丢 --all-day）—— 分支 CI #2169 绿，停在分支
+
+
+**任务**：读 `shared/work/deep-audit-1017/fix-tasks/FIX-D.md` 立刻执行（基线 main `e748b14`）。**报告** `fix-reports/FIX-D.md`；**装置** `fix-d/probe/`（`pre-*.txt` 8 份先证真机证据 + `jvm/` 全套：stubs ×12 / run.sh / run_ci_test.sh / sql_diff.py / mutations.py / ci_load_log.py / ci_verify_log.py）。
+
+**分支 `fix/da1017-freebusy-instances` @ `bd26d5ef77ca3ef7e3151a209f2c9d5722d91a67`**（单提交，3 文件 **+623/−20**）。**CI run #2169（id 38853028009）success，head_sha 与本机 HEAD 逐字符一致**；步 [3] 扫描门 / [15] 全量单测 / [18] Build APK success、[23] Publish skipped。**用例真被收集**：`CalendarFreebusyInstancesTest` **8/8 PASSED 在册**（拉 job 日志逐条核，非只看 run 绿）；日志 6 条含 `FAILED` 的行逐条确认**全是 PASSED 用例名的一部分**（`... produces FAILED without calling provider PASSED` 之类）——判读「FAILED 计数」前必须先看它是否只是用例名子串。**停止节点达成，未合并 main。**
+
+**修法**：
+- **D-1（P2 → 实为误导性权威输出）**：`doFreebusy` 谓词是 `Events.DTSTART < ? AND Events.DTEND > ?`（本树 `:455`），而**周期事件在 Events 表的 DTEND 为 NULL**（provider 拒绝 DTEND 与 DURATION 并存）⇒ SQL `NULL > ?` 永假 ⇒ 每周例会/生日/节假日全被报成「空闲」。真机对照：窗口含 occurrence 时 `freebusy` 返回 `busy=[]`（全闲），而 `list`（已是 Instances 路径）**显示**该 occurrence = 同窗口两条命令给出相反事实。改查 `CalendarContract.Instances.CONTENT_URI`（`instances/when/<s>/<e>` 形态，**逐字段对齐 doList 先例**，不自创第三套），谓词抽 `instancesWindowSelection()`；输出 JSON 字段名一字未改；新增 `providerErrorJson` 使 provider 异常不再被吞成空 `busy`（空 busy 恰是「空闲」的合法答案 = 吞错即造假事实）。
+- **D-2**：`doUpdate` 解析 `--all-day` 后**丢掉**（事件保持 timed 却回报 `rows=1`），且全天日期按设备时区解析（真机：`--start 2026-11-26` 落成 **11-25**）。修法=语义取「显式 flag **或** 已存行」+ `parseDateUtc` + `ALL_DAY=1`/`EVENT_TIMEZONE="UTC"` + **DTEND 修复**（只写 DTSTART 会留陈旧 DTEND，实例展开丢弃 DTEND<窗口的行 → 事件从 `list` 与 `freebusy` **同时静默消失**，真机 inverted-row 实测）。
+
+**证据**：JVM 探针 **OK (12 tests)** / repo CI 测试 **OK (8 tests)** / `sql_diff.py` **ALL ARMS MATCH**（旧谓词对周期行 `_id=14` 返 0 行 vs 新谓词返该 occurrence）/ 捕获查询 ground truth `captured-freebusy-query.json`（uri `.../instances/when/1793398800000/1793406000000`、selection `begin < ? AND end > ?`、投射 `title,begin,end,allDay`）/ 门 selftest **ALL ARMS MATCH**（5 夹具）/ 真树 PASS / 基线树 FAIL(5) / scan **28 passed, 0 failed**。
+
+**变异负控（先 commit 再跑，每条核回退真发生 = 工作文件 sha256 == `HEAD:<path>`）**：`pre-fix` 门 5 违规精确红（探针/CI 为**编译级**红——基线无新 API，**非行为级**，报告已如实标注）· `M1-events-table`（投影+谓词+URI 三处改回 Events）探针 2 红 / CI 1 红 / 门 5 红 / SQL 2 红 · `M2-flag-only` 探针 2 红 · `M3-no-dtend-repair` 2 红 · `M4-local-zone-parse` 4 红 → 全 PRECISE-RED。
+
+**★ 手法沉淀**：
+1. **探针装置「stub 表面 + 真实源码」可直测 Android 依赖 handler**：转写 AOSP `CalendarContract` 表面 + `ContentResolver` 捕获查询 → 云端不可测的 provider 路径在沙箱内可跑 JUnit，并顺带产出**查询 ground truth**（`captured-*.json`）供 SQL 级差分（`sql_diff.py` 在真 SQLite 上跑旧/新谓词对照）。
+2. **CI 日志判读三则**：①`grep -c FAILED` 会被**用例名子串**污染（`...FAILED... PASSED`），必须先看整行；②「run 绿」不等于「我的测试被收集」——要按**类名+用例名**逐条在日志里找到 PASSED；③token 认证的 job logs 会 302 到 blob store，带 Authorization 跟重定向必 401 → `-D -` 取 Location 后**裸下**（脚本 `ci_load_log.py`）。
+3. **门必须自证牙**：`--selftest` 五夹具（违规必红 / Instances 合规必绿 / `IS NULL` 守卫+只写 DTEND 必绿 / 别处文件谓词必红 / 别处文件只写必绿），并在**基线树**上跑到 5 违规 = 对真缺陷有牙，而非只在夹具上绿。
+4. **变异臂的「编译级红」要如实降级标注**：提取/形状类探针 pin 了修复后的 API 形状，无法对基线编译，这类红不能算行为级证据（行为级由门 + SQL 差分 + 真机 pre-*.txt 承担）。
+
+**登记建议（编号留空，交主会话；COMMON 要求不自行写 backlog）**：R1 修复后真机验证（需装包：freebusy 对含 occurrence 的窗口应返回 busy；`update --all-day` 后 list 应 allDay=true 且日期不偏）· R2 门注册（`scan.sh` 第 29 门 + `test_scan.py` 4 条夹具，diff 与夹具建议已写进报告 §12）· R3 门只覆盖 `Events.DTEND`（DURATION/RRULE 未覆盖）· R4 装置盲区（基线不可编译）· R5 CI 测试的形状计数断言刻意保留（改写 HELP 用法行时需同步）。
+
+**同族观察**：全 `src/android/app/src/main/java` 树中**只有这一处**谓词比较 `Events.DTEND`（门覆盖全树）；`doList` 早是 Instances 路径（`sweep1014-B25a`）→ 本次是**同族漏改第 2 处**（1014 改 list、漏 freebusy）；`doDelete`/`doUpdate` 用 `Events.CONTENT_URI` 按 `_id` 定位是**正确用法**，门不报警（只咬「比较可空列」）。
+
+<!-- 2026-10-16 13:24:24 -->
+## FIX-A 收口：deep-audit-1017 ISSUE-01（OpenAI 系 tool-result 图 100% 丢失，P0）—— 分支 CI #2170 绿，停在分支（2026-10-16）
+
+
+**任务** `shared/work/deep-audit-1017/fix-tasks/FIX-A.md`；**报告** `fix-reports/FIX-A.md`；**装置** `fix-a/probe/`（pre-P1..P4 取证、pre-fix-differential、gate-prefix-arm、run-gates-individually.sh、jvm/{extract.py,run.sh,mutations.py}）。基线 main `e748b14`；推送前 `git ls-remote` 确认镜像可能落后（e748b14）。
+
+**分支 `fix/da1017-openai-toolimg` @ `83b86bde97de31c12417384ec109887d88903670`**（2 commits：`707d813` 本体 → `83b86bd` 独立扫门）；**CI run #2170（id 38854035299）success，head_sha 三方逐字符一致**（本机 HEAD = 远端 tip = head_sha），26 步全绿、Publish skipped；**拉 job 日志逐条核到 `OpenAIToolResultImagesTest` 12 个 testcase 全 PASSED**（防「没收集也算绿」）。**停止节点达成，未合并 main。**
+
+**修法**（3 文件 +845/−3）：①新增同文件内纯逻辑 `internal object OpenAIToolResultImages`（`Entry(caption,bytes,mime)`；chat/responses 两个入口**共用一个 private build**，只由 flavor 布尔区分 part 词表 ⇒ 两 flavors 不可能漂移；平台边 `compress`/`encodeBase64` **由调用点注入** ⇒ wire 形状 JVM 可测）；②Chat 路径 tool 消息后追加 user 消息（caption 用 `capChatToolCallId(tr.id)` + `image_url` data URI）；③Responses 路径 tool-result 图（`input_image` 扁平 url）+ **新增顶层 `imageParts` 参数**（默认空、`:650` 透传、legacy 分支按 `index == lastUserIndex && USER` 判据，照 Chat 侧既有语义）；④非 vision → T264 共享占位符；capture-only（`imageData == null`）不产生 entry ⇒ 无图历史**逐字节零回归**。
+
+**前置证据（先证后改 P1–P4）**：P1 基线 OpenAIProvider `imageData` **0 命中** vs Anthropic `:789` / Gemini `:431` 已在（同族第 3 处）；P2 两条路径都只写 `tr.content` + `:650` 不传 imageParts；P3 **请求级预算已覆盖 ToolResult.imageData**（ChatPromptAndTools:95-108）⇒ 不新增预算机制、不越界，只加 `compressUnderBudget` 每图回退网（两兄弟同款）；P4 兄弟原文 + 「Anthropic/Gemini 能把图塞进 tool-result 块、OpenAI 不能」= 形状必须不同。
+
+**证据**：JVM 装置 **12/12**（`extract.py` 注释/字符串感知括号配平切生产对象 + 逐字取占位符字面量，**编译仓库里那份测试文件原文** ⇒ 沙箱绿与 CI 收集的是同一份断言）；变异 **4/4 PRECISE**（M1 删 Chat 块→{9}、M2 断透传→{11}、M3 vision 翻 false→{1,2,3,4,7,8}、M4 丢 caption→{1,2,5,7,8}；每条 revert 后复核修复标识符在场）；pre-fix 差分包（基线真树跑 extract → `EXTRACT-FAILED`，imageData 0→9）；scan **28/28**；新门 `tool_result_image_branch_check.py` **--selftest 8/8** + 基线真树红（`[missing-imageData] openai/OpenAIProvider.kt`）。
+
+**★ 手法沉淀（可复用）**：
+1. **"提取式装置 + 仓库测试原文"双保险**：装置不手抄一行（extract 切块 + 逐字取常量），测试文件就是仓库那份 ⇒ 无"装置 vs 交付"漂移；边界 = 签名级错误仍需 CI（1016 FIX-C 同款）。
+2. **锚点串要带行首 `\n`**：`"            if (supportsImages) {\n"` 会**子串命中**所有更深缩进的同名行（count=4 当场暴露）。变异驱动"锚点不符就拒绝执行"是对的。
+3. **块结束锚点要指名道姓**：`mapNotNull {` 与 `if (...) {` 的闭合 `}` 缩进可能相同，取"第一个更浅的 `}`"会切短 → 用特征结尾串 + 行数区间双校验。
+4. **`git show <baseline>:<path>` 造"基线真树"跑门** = 对同一判据拿到"真缺陷上红 / 修复树上绿"的成对证据。
+5. **S28 假红两段式处置**（本轮实证）：整链红 → 失败行是否都带 `Function not implemented`；带 → 逐门直跑；逐门也红才是真红。本轮整链两次中断（[15/28] ENOSYS）、逐门 26 个 .py 全 rc=0 + native rc=0、重跑整链 28/28，三条原始输出都留档。**别把沙箱症状当代码红，也别拿逐门绿冒充整链绿。**
+6. **CI 日志里的编译警告先比对既有文件再归因**：本支新增的唯一警告（`OpenAIToolResultImagesTest.kt:256:47 Java type mismatch`，`System.getProperty("user.dir")` 那行）在既有 12+ 测试文件里共 29 处同款 ⇒ 仓库惯用写法，不修不登记。
+
+**登记建议（编号留空，交主会话分配；报告 §9 四条）**：真机未验证（三条抓包路径见报告 §7）· 非 vision 占位符负决策 · 门对 `filterIsInstance` 形态只能到文件级粒度 · 新门尚未注册进 scan.sh/test_scan.py（§10 给了注册 diff 建议，本支按 COMMON §4 未改那两文件）。
+
+<!-- 2026-10-16 13:31:32 -->
+## FIX-G 收口：deep-audit-1017 ISSUE-10（a11y 截图/点击 + speech，P2 4 子项）—— fix/da1017-a11y-speech @ a304097，CI #2171 绿，停在分支
+
+
+**任务书** `shared/work/deep-audit-1017/fix-tasks/FIX-G.md`（基线 main `e748b14`）；**报告** `fix-reports/FIX-G.md`；**装置** `fix-g/probe/`（pre-G1/G2G3/G4 先证 + jvm/extract.py + run.sh + mutations.py + ci_verify.py）。工作树 `fix-g/repo`（gh_sync.sh clone 必须在 git repo 内跑——全局 ROOT 解析，否则静默退出；直接 `git clone` 可用）。
+
+**四子项修法**：
+- **G1**（截图迟到回调泄漏 ~10-15MB/次）：`LateValueSlot<T>(fallback, onDiscard)`（MinisAccessibilityService.kt:89）——null 槽=已退出（AtomicBoolean 的等价物）；回调**分配前** `isCallerWaiting()` 窥视；publish 原子换入，**拒绝路径 `compareAndSet(value, null)` 把槽留在关闭态**；超时分支 `slot.exit(timedOut)`+返 TIMEOUT；成功路径 `slot.exit(result)`。`timeoutMs: Long = 5_000` 未动。行为变化（刻意，KDoc 写明）：deadline 后落地帧**丢弃**，超时恒 TIMEOUT。
+- **G2**：`booleanFlags` 补 `"contains"`（:97；注释放 setOf **外**防字面量解析被污染）——`tap text --contains X` 修复前 100% 死于 missing <text>（live parser 探针实证 positional[2]=null）。
+- **G3**：tapText(:518) 走 `TapTextFlow.plan()`：CLICKED→ok(click)；否则坐标 fallback→`exitCode==0` 透传，否则 `err(ACTION_FAILED)`（与 NODE_NOT_FOUND 分开）。tapId 是同文件既有先例。
+- **G4**：startInternal(:191) 前置 `tearDown()`（幂等）+ `usingOnDevice = SpeechOnDevicePlan.effective(wantOnDevice, onDeviceCreationFailed)`(:217)。**任务书叙事反了**：错报 true 的后果是「多走一次无效重启」不是「重试被跳过」。
+
+**证据**：post 臂 OK(29 tests)（6 类：6/5/6/5/3/4）/ pre 臂**真实回退**（`git show baseline:file` 写回工作树+先验 post-only 标识符消失+trap 恢复）14/14 红 / **变异 11/11 PRECISE-RED**（每臂锚点唯一性断言→应用→跑→精确期望集→checkout+sha256 对拍）/ scan.sh **28/28** / test_scan **158 PASS** / 新门 `a11y_handler_contract_check.py` selftest **10/10**+真树 exit 0 / CI **#2171 (id 38854339782) success @ a304097 三方逐字符一致，25/26 steps（Publish skipped=分支门控正常），日志核 6 类 PASSED 逐类计数吻合 FAILED=0**。COMMON §1.3 遵守：**未动 scan.sh/test_scan.py**，注册 diff 写进报告 §6。
+
+**★ 装置手法（可复用）**：
+1. **strip_strings 必须长度保持+按行重置引号**：KDoc 里的撇号（"caller's"）会把引号状态带进后续所有行——非长度保持版本还会让切片索引错位（双倍坏）。空行/注释行同理防「散文提及满足形状探针」→ 测试侧 `codeOnly()` 把注释行 blank 成等长空格。
+2. **负控非空洞化**：assertRejects 先断言探针接受**真实源**再断言拒绝变异体，否则「拒绝一切」的探针在基线树上也绿（负控假阳性）；pre 臂上负控因此同红 = 可区分「探针瞎」与「树错」。
+3. **竞态测试所有权模型**：caller 必须**镜像生产的两阶段**（peek→exit(kept)），不能拿 exit 的返回值当所有权——exit 返回 leftover 但 caller 传 fallback 时 leftover 已被 discard，把返回值当 kept 会把「已丢弃」误记成「已保留」→ 双计。
+4. **CI 终验脚本模板**（ci_verify.py）：run_number→id→head_sha 三方对拍 + job log 经 NoRedirect Location 裸下 + **逐测试类 PASSED 计数核对**（防「没收集也算绿」），全流程一条命令可复跑。
+
+**登记不修 → 报告 §10（编号留空待主会话分配）**：真机验证（G1 需真实超时/G3 需拒绝点击的节点/G4 需面板连点）；树级 hasFlag↔声明门（其它 handler 走共享 helper → 大量假阳性，需逐 handler 豁免表或 OffloadArgs fail-closed——装置∝影响面，本轮放弃做成了单文件族门）。
+
+<!-- 2026-10-16 13:54:35 -->
+## deep-audit-1017 FIX-B 收口：per-turn 可见内容谓词 + turn-tail 终态收尾（`fix/da1017-loop-finalize` @ `9e6ba91`，CI #2173 绿，停在分支）
+
+
+**任务**：`shared/work/deep-audit-1017/fix-tasks/FIX-B.md`（ISSUE-03 累计状态污染 + ISSUE-02 终态过早）。**报告** `fix-reports/FIX-B.md`（含 §11 CI 三轮表）；**装置** `fix-b/probe/`；**背板** backlog **§128**。
+
+**修法**：ISSUE-03 新增 `TurnVisibleContent.isEmptyTurn(turnText, turnVisibleBlocks, finishReason, truncated)` per-turn 谓词，turn-tail 判定不再读 RUN-scoped `accumulatedText`/`allToolBlocks`（工具后空回合 recovery 分支修前 100% 不可达）；ISSUE-02 把行级 finalize 移到全部 4 条 `continue` 之后单点执行（干净完成经 `cleanCompletionFlag` 置 `loopExitedNormally` + T7 `WorkCompleted` 在守卫内）。新门 `scripts/scan/turn_tail_finalize_order.py`。CI #2173 全 28 步 success、扫描门 28/28、`TurnVisibleContentTest` 10 条 + `TerminalErrorSurfacedTest` 12 条全 PASSED、head_sha 三方逐字符一致。
+
+**★ 三轮 CI 的两个真教训（可复用）**：
+1. **改共享源文件的「形状」前，先 grep 哪些测试在读它的源码文本**——本仓 ≥9 个测试对 `AgentLoopEngine.kt` 做**源码级结构断言**（负控变异锚点 = 精确邻接字符串）。
+   - #2168：我在守卫 `}` 与 `break` 之间插 finalize ⇒ 负控锚点 `t7Reduce(WorkCompleted)\n}\nbreak` 消失 ⇒ `mutation must change the source` 挂。
+   - #2172：为保锚点把 finalize 移到守卫之前，但**解释性注释里写了 `AgentRunEvent.WorkCompleted` 字面量** ⇒ 测试取「全文件第一个含该符号的行」命中注释行（在守卫外）⇒ 换了一条挂。
+   - **规则**：①不打断被测试引用的精确邻接；②注释里别出现测试按「首次出现」定位的符号字面量。装置：`probe/terminal_error_surfaced_replica.py`（逐条复现断言算法，含 blockEnd 括号配对）+ `probe/anchor_live_check.py`（扫 `.replace(` 首参锚点存活，raw string/第 2 参需人工复核）——第三轮靠它一次绿。
+2. **push 失败第一问是 `git remote -v`**——一度把 remote URL 改坏成 `https://***OWNER***/RikkaMinis.git`（丢 `github.com`），SNI 变成账号名 → TLS `unexpected eof`，表象与「代理抽风」**完全一致**，我两次归因代理白烧一轮。正解：`git remote -v` + `GIT_TRACE_CURL=1` 看握手目标（日志里 `Establish HTTP proxy tunnel to ***OWNER***:443` / SNI `***OWNER***-gyw` 就是铁证），再怀疑网络。
+
+**环境**：代理地址本会话中途变了（`***PROXY_ADDR***` → `***PROXY_ADDR***`），仓库 local config 里存的是**克隆时快照**，会静默过期——这种情形报"Failed to connect"（旧端口拒绝）而不是 TLS 错，两者要分清。amend 后强推需 `--force-with-lease=<ref>:<旧sha>`（先 fetch，否则 `stale info` rejected）。
+
+<!-- 2026-10-16 14:27:09 -->
+## deep-audit-1017 收口完成：七支全绿 + 并集树 CI #2174 绿，停在并集分支（2026-10-16，用户令「按流程」→「他们都完成了」→「跑完了」）
+
+
+**输入**：附件 `shared-4dc0dfc3.md`（1993 行，ISSUE-01..10）。工作目录 `shared/work/deep-audit-1017/`。
+
+**流程全链**：读工单 → 第二道门（6 轮 `verify*.sh` 回本树机械核实；**报告臆造密度高于 1015/1016**：文件路径错、符号不存在、整段片段形状不符 → 逐条回本树重判）→ 判级 `TRIAGE.md`（修 7 支 / 登记 2）→ 写 `COMMON.md` + 7 份任务书 → 派 7 支会话子代理（一次成发未重发，回读 7/7 送达）→ 各支自跑 CI → **主会话收口**：独立核 CI → 并集树 → 门注册 → 并集 CI。
+
+| 支 | ISSUE | 分支 @ tip | CI |
+|---|---|---|---|
+| A | 01 P0 OpenAI tool-result 图 100% 丢 | `fix/da1017-openai-toolimg` @ `83b86bde` | #2170 success |
+| B | 02+03 P1 终态过早 + 累计状态污染 | `fix/da1017-loop-finalize` @ `9e6ba915` | #2173 success（#2168/#2172 两轮挂红自纠） |
+| C | 04 P1 子代理交还契约 | `fix/da1017-subagent-residue` @ `bf124e8d` | #2167 success |
+| D | 06 P2 freebusy 漏周期日程 | `fix/da1017-freebusy-instances` @ `bd26d5ef` | #2169 success |
+| E | 08 P2 shizuku argv 三缺陷 | `fix/da1017-shizuku-args` @ `2a5cddd1` | #2166 success |
+| F | 09 P2 marker 分块边界 | `fix/da1017-marker-boundary` @ `57dcd79a` | #2165 success |
+| G | 10 P2 a11y 截图/点击 + speech | `fix/da1017-a11y-speech` @ `a3040973` | #2171 success |
+
+**并集树** `integration/da1017` @ **`fcc108b15aa3`**：7 支 `--no-ff` 零冲突（文件集两两互斥是施工前设计出来的：每支 = 独占生产文件 + 独占测试文件 + 独占 `scripts/scan/<name>_check.py`；`scan.sh`/`test_scan.py` 施工期冻结 → 1016 的「多支共改 scan.sh」陷阱未复现）。注册提交：7 门 append（29..35）+ 全量 `[N/28]`→`[N/35]` 重编号 + `test_scan.py` 18 例夹具（每门 = `--selftest` 带牙标记断言 + 真树绿；F/C 两门另加外部 CLEAN/DIRTY 对）。本地：`scan.sh` 35/35、`test_scan.py` ALL 176 CASES PASS。
+
+**CI #2174（id 38859449291）success @ fcc108b15aa3**（16.1 min、26 步、唯一非 success = Publish skipped）；**job 日志 1012571 B 逐条核**：`Summary: 35 passed, 0 failed` + `ALL 176 CASES PASS` + 7 个新门名在册 + 6 条含 `FAILED` 的行逐条确认**全是 PASSED 用例名子串**（判读陷阱第 N 次复核）。**停止节点达成，未合并 main（全支有 .kt 验证面 = 非纯文本例外，合并起手权在用户）。**
+
+**★ 本轮可复用手法**：
+1. **门注册前先逐门在并集树上试跑**——`calendar_events_nullable_predicate_check.py` 只吃 `--root ROOT`（无位置参数），直接 `python3 门.py .` 返回 exit 2 usage，6/7 绿 1 红当场暴露接口形态差异；`register_gates.py` 里按门写 `arg` 形态而不是统一位置参数。
+2. **`test_scan.py` 夹具的两次「脚本名少 `.py`」自伤**（`run_scanner` 内部 `join(SCRIPT_DIR, script)`）——11 例红全是这个；**快速迭代法**：`python3 -c "import sys; sys.argv=['x']; sys.path.insert(0,'scripts/scan'); import test_scan as t; t.test_xxx()"` 只跑新函数（秒级），不用每次跑全量 176 例（分钟级）。
+3. **门自证的「带牙标记断言」**：夹具断言 `--selftest` 输出里出现该门独有的收尾标记（`SELFTEST=PASS` / `ALL ARMS MATCH` / `gate flips red on every criterion` / `SELFTEST OK (6 fixtures)` …）⇒ 堵住「门被掏空成 `sys.exit(0)` 仍绿」的静默洞（标记缺失即红），比复刻 7 套外部 dirty 夹具省，且装置比例更合适（已登记 backlog §135）。
+4. **代理快照过期**：本会话中途 `git ls-remote` 报 `Failed to connect to ***PROXY_ADDR***:<port>`（旧端口拒绝）——仓库 local config 存的是克隆时代理，`git config --local http(s).proxy "$HTTPS_PROXY"` 变量引用更新即恢复（**不回显值**）。表象与 TLS 错不同：连不上 = 旧端口；TLS eof = remote URL 坏。
+5. **备份任务实测**：本批七支并行重负载窗口（12:06–13:5x）**app silent_kill = 0**（beacon 12 点后 grep 计数 0）——与 09-16 的 23 次形成对照。
+
+**登记**：backlog §126（ISSUE-05 latent）/§127（ISSUE-07 驳回）/§128（B 支）+ §129–§134（A/C/D/E/F/G 残留）+ §135（装置比例负决策）；机械门 125 段 / no-触发条件 1（旧）/ 豁免 11。
 
 ---
 
