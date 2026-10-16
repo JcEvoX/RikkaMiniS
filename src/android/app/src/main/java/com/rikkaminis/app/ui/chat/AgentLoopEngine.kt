@@ -236,6 +236,48 @@ internal object TurnVisibleContent {
         finishedCleanly(turnFinishReason, turnTruncated)
 }
 
+/**
+ * [deep-audit-1018 ISSUE-12c] Single source of truth for the stub-reminder
+ * STACKING guard, shared by the two eofStubReminder injection sites in the
+ * agent loop.
+ *
+ * The bug class (same family as the length-wall reminder guard): a second
+ * consecutive error-shaped / EOF-truncated turn re-enters the continuation
+ * branch. The previous iteration's reminder is still sitting in history —
+ * behind THIS turn's assistant message — so a blind add piles reminder on
+ * reminder: the model sees a stack of identical "continue where you left
+ * off" instructions (context noise, repeated-anchor confusion) instead of
+ * exactly one.
+ *
+ * The first stub branch (error-shaped, finish-path) shipped WITHOUT the
+ * guard while its EOF-stub sibling had it — this object is the extracted,
+ * testable form of that sibling's inline predicate. Judgement is shape-only:
+ * a USER message whose single part is Text containing the eofStubReminder
+ * marker string (`"cut off by a network error"`, from [eofStubReminder]'s
+ * literal wording — greppable, and textually distinct from
+ * [lengthWallReminder]'s "output token limit" wording so the two reminder
+ * families never cross-match).
+ */
+internal object EofStubReminderStackGuard {
+
+    /** Marker unique to eofStubReminder (vs lengthWallReminder). */
+    internal const val REMINDER_MARKER = "cut off by a network error"
+
+    /**
+     * True when [prevTail] is a stale stub reminder from a previous
+     * error-shaped/EOF continuation and must be removed before the new one is
+     * appended. Callers pass `agentHistory[size - 2]` — the entry BEHIND this
+     * turn's assistant message (the reminder always sits immediately behind
+     * it, which is also why a null/short history is a clean no-match).
+     */
+    fun isStaleEofStubReminder(prevTail: LLMMessage?): Boolean =
+        prevTail != null &&
+            prevTail.role == LLMMessage.Role.USER &&
+            prevTail.contentParts.size == 1 &&
+            (prevTail.contentParts.first() as? AgentContentPart.Text)?.text
+                ?.contains(REMINDER_MARKER) == true
+}
+
 internal class AgentLoopEngine(
     private val host: AgentLoopHost,
     private val traceObserver: ChatAgentTraceObserver,
@@ -2197,6 +2239,22 @@ internal class AgentLoopEngine(
                                     ?: turnThinking.toString().takeIf { it.isNotEmpty() },
                             )
                         )
+                        // [deep-audit-1018 ISSUE-12c] Stacking guard — the
+                        // EOF-stub branch below has had this since its own
+                        // introduction, but this error-shaped twin shipped
+                        // without it: consecutive error-shaped continuations
+                        // piled identical reminders into history (the model
+                        // saw N stacked "continue where you left off"
+                        // instructions). Drop the stale reminder sitting
+                        // behind this turn's assistant message before adding
+                        // the fresh one. Same off-by-one note as the EOF-stub
+                        // sibling: the previous reminder lives at size - 2,
+                        // BEHIND this turn's assistant message added just above.
+                        val errPrevTailIdx = host.agentHistory.size - 2
+                        val errPrevTail = host.agentHistory.getOrNull(errPrevTailIdx)
+                        if (EofStubReminderStackGuard.isStaleEofStubReminder(errPrevTail)) {
+                            host.agentHistory.removeAt(errPrevTailIdx)
+                        }
                         val stubReminder = eofStubReminder(turnText.takeLast(80))
                         host.agentHistory.add(
                             LLMMessage(
@@ -3087,14 +3145,12 @@ internal class AgentLoopEngine(
                         // [fix/audit-b20 / T1-LOW-2] Same off-by-one as the
                         // length-wall guard: the previous stub reminder lives
                         // behind this turn's assistant message.
+                        // [deep-audit-1018 ISSUE-12c] Predicate extracted to
+                        // [EofStubReminderStackGuard] — the error-shaped branch
+                        // above now shares it (it had no guard at all).
                         val prevTailIdx = host.agentHistory.size - 2
                         val prevTail = host.agentHistory.getOrNull(prevTailIdx)
-                        val tailIsEofStubReminder = prevTail != null &&
-                            prevTail.role == LLMMessage.Role.USER &&
-                            prevTail.contentParts.size == 1 &&
-                            (prevTail.contentParts.first() as? AgentContentPart.Text)?.text
-                                ?.contains("cut off by a network error") == true
-                        if (tailIsEofStubReminder) {
+                        if (EofStubReminderStackGuard.isStaleEofStubReminder(prevTail)) {
                             host.agentHistory.removeAt(prevTailIdx)
                         }
                         val stubReminder = eofStubReminder(turnText.takeLast(80))
@@ -3387,6 +3443,14 @@ internal class AgentLoopEngine(
                 // Place it BEFORE ToolJsonRepair: refusing on the raw payload
                 // means the refusal can never depend on a repaired one.
                 //
+                // [deep-audit-1018 ISSUE-01] The guard consults BOTH truncation
+                // sources: turnFinishReason (the provider declared the ceiling)
+                // and this turn's `turnTruncated` flag (stream died mid-flight
+                // with no finish_reason — see OpenAIProvider's EOF guard, which
+                // had to learn to count tool-call events before a tool-call-only
+                // turn could set it). finishReason alone missed the EOF class
+                // entirely, which is exactly the half-streamed-argument case.
+                //
                 // Accepted residual risk: this branch does NOT charge the
                 // length-wall continuation budget (that counter is only
                 // advanced on the `toolCalls.isEmpty()` side), so a model that
@@ -3395,11 +3459,11 @@ internal class AgentLoopEngine(
                 // worth the extra state: the refusal message tells the model to
                 // re-issue with FULL arguments, and executing a prefix argument
                 // is strictly worse than spending turns.
-                val truncatedRefusal = TruncatedToolCallPolicy.rejectionReason(name, turnFinishReason)
+                val truncatedRefusal = TruncatedToolCallPolicy.rejectionReason(name, turnFinishReason, turnTruncated)
                 if (truncatedRefusal != null) {
                     AppLogger.warning(
                         TAG_STREAM,
-                        "runAgentLoop turn=$turn truncated tool call REFUSED name=$name id=$id finish=$turnFinishReason",
+                        "runAgentLoop turn=$turn truncated tool call REFUSED name=$name id=$id finish=$turnFinishReason eofTruncated=$turnTruncated",
                     )
                     val truncatedIdx = loopState.allToolBlocks.indexOfFirst { it.id == id }
                     if (truncatedIdx >= 0) {

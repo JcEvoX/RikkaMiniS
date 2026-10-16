@@ -26,6 +26,13 @@ package com.rikkaminis.app.ui.chat
  * JVM-testable, and conservative by default — a null or unrecognised reason is
  * NEVER treated as truncated, so only spellings we actually know can block a
  * call.
+ *
+ * [deep-audit-1018 ISSUE-01] finish_reason is only ONE of the two ways a turn
+ * gets cut. A stream that dies mid-flight (network EOF / relay drop) carries
+ * no finish_reason at all — the providers surface that as
+ * [LLMStreamChunk.Finished.truncated] instead. Both sources are accepted by
+ * [rejectionReason]; the flag parameter defaults to `false` so existing
+ * finishReason-only call sites keep their exact behavior.
  */
 object TruncatedToolCallPolicy {
 
@@ -63,12 +70,36 @@ object TruncatedToolCallPolicy {
      * The synthetic tool result to hand back instead of executing, or null
      * when the call may run normally. Keeping this in one place means the
      * guard site and its test share the same wording and the same trigger.
+     *
+     * [deep-audit-1018 ISSUE-01] TWO truncation sources, not one:
+     *  - [finishReason] — the provider itself declared the ceiling
+     *    (finish_reason=length / max_tokens). The original (and only) source.
+     *  - [turnTruncated] — the stream-level flag the providers raise when the
+     *    stream ended WITHOUT a finish_reason while content (text, reasoning
+     *    OR tool-call events) was still being produced (network EOF /
+     *    connection drop / relay cut). OpenAIProvider only started raising it
+     *    for tool-call-only turns when its EOF guard learned to count
+     *    `toolCallEventCount`; a tool-call turn cut by EOF used to reach the
+     *    executor with a half-streamed argument object, because the dispatch
+     *    path consulted finishReason alone.
+     *
+     * When BOTH hold the ceiling wording wins (it names the provider's own
+     * reason, the more specific diagnostic). The prefix `[TRUNCATED] Tool '…'
+     * was NOT executed:` is stable across both sources — callers and tests
+     * grep it; only the explanation clause differs.
      */
-    fun rejectionReason(toolName: String, finishReason: String?): String? {
-        if (!isTruncatedFinish(finishReason)) return null
-        return "[TRUNCATED] Tool '$toolName' was NOT executed: the model reached " +
-            "the output limit (${finishReason?.trim()}) while this turn was still " +
-            "streaming, so the arguments may be an incomplete prefix. Re-issue " +
-            "the call with the full arguments."
+    fun rejectionReason(toolName: String, finishReason: String?, turnTruncated: Boolean = false): String? {
+        val ceilingDeclared = isTruncatedFinish(finishReason)
+        if (!ceilingDeclared && !turnTruncated) return null
+        if (ceilingDeclared) {
+            return "[TRUNCATED] Tool '$toolName' was NOT executed: the model reached " +
+                "the output limit (${finishReason?.trim()}) while this turn was still " +
+                "streaming, so the arguments may be an incomplete prefix. Re-issue " +
+                "the call with the full arguments."
+        }
+        return "[TRUNCATED] Tool '$toolName' was NOT executed: the stream ended " +
+            "mid-turn (network EOF / connection dropped before a finish reason " +
+            "arrived) while this call's arguments were still streaming, so they " +
+            "may be an incomplete prefix. Re-issue the call with the full arguments."
     }
 }
