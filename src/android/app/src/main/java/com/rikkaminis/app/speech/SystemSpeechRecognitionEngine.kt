@@ -180,6 +180,15 @@ class SystemSpeechRecognitionEngine(private val appContext: Context) : SpeechRec
     private fun startInternal(locale: Locale, allowOnDeviceRetry: Boolean) {
         mainHandler.post {
             try {
+                // [deep-audit-1017 G4] A fresh start() arrives here with whatever
+                // recognizer the previous session left behind: tearDown() ran only
+                // from cancel()/onResults/onError, so a second start without one of
+                // those (mic tapped again while a session is live, or after stop())
+                // abandoned a live SpeechRecognizer with its Binder + audio session
+                // for the life of the process. Its callbacks are already inert (the
+                // session token moved on in start()), so destroying it here loses
+                // nothing; tearDown() is idempotent.
+                tearDown()
                 // Only reach for the on-device recognizer when the user actually
                 // asked for offline. It used to be created unconditionally on
                 // S+, which silently overrode the panel's "System Recognition
@@ -190,13 +199,22 @@ class SystemSpeechRecognitionEngine(private val appContext: Context) : SpeechRec
                 val wantOnDevice = preferOffline &&
                     Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
                     allowOnDeviceRetry
+                var onDeviceCreationFailed = false
                 val r = if (wantOnDevice) {
                     try { SpeechRecognizer.createOnDeviceSpeechRecognizer(appContext) }
-                    catch (_: Throwable) { SpeechRecognizer.createSpeechRecognizer(appContext) }
+                    catch (_: Throwable) {
+                        onDeviceCreationFailed = true
+                        SpeechRecognizer.createSpeechRecognizer(appContext)
+                    }
                 } else {
                     SpeechRecognizer.createSpeechRecognizer(appContext)
                 }
-                usingOnDevice = wantOnDevice
+                // [deep-audit-1017 G4] Report the recognizer we actually got, not
+                // the one we asked for: after the fallback above the session runs
+                // on the default recognizer, and onError's "on-device has no pack
+                // for this locale" retry reads this flag to decide whether a
+                // restart can help at all.
+                usingOnDevice = SpeechOnDevicePlan.effective(wantOnDevice, onDeviceCreationFailed)
                 pendingLocale = locale
                 recognizer = r
                 r.setRecognitionListener(recognitionCallbacks(sessionToken))
@@ -405,4 +423,25 @@ class SystemSpeechRecognitionEngine(private val appContext: Context) : SpeechRec
             else -> "Unknown error ($code)"
         }
     }
+}
+
+/**
+ * [deep-audit-1017 G4] Which recognizer a session really runs on.
+ *
+ * `preferOffline` is a request, not a guarantee: [SystemSpeechRecognitionEngine]
+ * falls back to the default recognizer when the on-device (SODA) one cannot be
+ * created at all, and the OS may silently substitute its own pick when no
+ * offline pack exists. The retry in `onError` is gated on this value, so it must
+ * describe the recognizer that was created rather than the one that was wanted —
+ * a flag that says "on-device" for a session running on the default recognizer
+ * sends that retry down a path that cannot help. Android-free so it is testable.
+ */
+internal object SpeechOnDevicePlan {
+    /**
+     * @param requestedOnDevice `preferOffline && SDK >= S && allowOnDeviceRetry`
+     * @param onDeviceCreationFailed `createOnDeviceSpeechRecognizer` threw, so
+     *   the default recognizer was used instead.
+     */
+    fun effective(requestedOnDevice: Boolean, onDeviceCreationFailed: Boolean): Boolean =
+        requestedOnDevice && !onDeviceCreationFailed
 }
