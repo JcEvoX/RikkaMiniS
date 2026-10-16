@@ -54,7 +54,9 @@ private const val PINNED_HEADER =
  * Included: USER messages' [LLMMessage.content] plus any structured
  * [AgentContentPart.Text] parts (both are user-authored text, mirroring
  * what [com.rikkaminis.app.ui.chat.buildConversationTextForSummary] renders
- * as user text). Excluded: assistant messages and tool-result carriers
+ * as user text), de-duplicated WITHIN each message so the double-filled
+ * (content == Text part) shape pins once — see the collection comment below.
+ * Excluded: assistant messages and tool-result carriers
  * (USER messages whose contentParts are all ToolResult) — tools/assistant
  * content is the summarizer's job, pinning is only for what the user said.
  *
@@ -78,10 +80,31 @@ fun extractPinnedUserMessages(
         if (msg.contentParts.isNotEmpty() && msg.contentParts.all { it is AgentContentPart.ToolResult }) {
             continue
         }
-        if (msg.content.isNotBlank()) texts.add(msg.content)
+        // [fix/da1018-compact-pin] Same-message de-duplication. Every USER
+        // message in this app is DOUBLE-FILLED: the main send path puts the
+        // trimmed text in BOTH `content` and the first Text part
+        // (ChatViewModel:3713-3714), and every engine-side reminder mirrors it
+        // (AgentLoopEngine:2205/2713/2780/2844/3105, ChatToolExecutors:413/444,
+        // EmptyTurnRecovery:90, SanitizeAgentHistory:136, ChatCompactionLogic
+        // :497). Collecting both copies pinned each user line twice, which (a)
+        // ate the [PINNED_USER_MESSAGES_TOKEN_LIMIT] budget at 2× the real
+        // content, so the over-cap trim dropped older real messages early, and
+        // (b) duplicated the text inside the summary string that rides every
+        // request. Both sources are still read — parts carry text `content`
+        // does not (per-image captions, `[image …]` placeholders, the
+        // attached-files XML) — only EXACT duplicates within one message
+        // collapse. Insertion order is preserved (content first, then parts),
+        // and duplicates ACROSS messages are deliberately left alone: the pin
+        // stays a faithful chronological record, not a global de-dup set. This
+        // is the third site of the same family: [ContextEstimator
+        // .estimateMessageTokensFull] and [buildConversationTextForSummary]
+        // were fixed earlier (audit-1015-bug01b).
+        val seenInMessage = LinkedHashSet<String>()
+        if (msg.content.isNotBlank()) seenInMessage.add(msg.content)
         for (part in msg.contentParts) {
-            if (part is AgentContentPart.Text && part.text.isNotBlank()) texts.add(part.text)
+            if (part is AgentContentPart.Text && part.text.isNotBlank()) seenInMessage.add(part.text)
         }
+        texts.addAll(seenInMessage)
     }
     if (texts.isEmpty()) return emptyList()
 
