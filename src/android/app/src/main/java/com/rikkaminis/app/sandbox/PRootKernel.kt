@@ -14,6 +14,8 @@ import java.io.File
 import java.io.IOException
 import java.util.TimeZone
 import kotlin.math.abs
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * PRoot configuration holder and command builder.
@@ -25,8 +27,25 @@ object PRootKernel {
 
     private const val TAG = "PRootKernel"
 
-    var isBooted: Boolean = false
-        private set
+    /**
+     * True once [boot] has completed its critical section.
+     *
+     * [deep-audit-1016 FIX-C 3a] Backed by [bootGate] rather than a plain
+     * non-volatile `var`: the visibility flag and the mutual exclusion must be
+     * the same fact, or a concurrent entrant can observe "booted" while the
+     * install is still running.
+     */
+    val isBooted: Boolean
+        get() = bootGate.isDone
+
+    /**
+     * Serializes [boot]'s critical section. Two callers race on cold start —
+     * `ExecutionCoordinator`'s auto-boot and `TerminalSession`'s
+     * open-a-terminal — and the body *deletes and re-extracts the rootfs*
+     * (`RootfsManager.installIfNeeded`), so the second entrant used to destroy
+     * the tree the first was unpacking.
+     */
+    private val bootGate = BootOnceGate()
 
     /** Path to native library directory (for LD_LIBRARY_PATH). */
     var nativeLibDir: String = ""
@@ -47,8 +66,28 @@ object PRootKernel {
      *  supplied Context. */
     private var bootContext: Context? = null
 
-    /** Custom environment variables injected into every proot command. */
-    val customEnvironment: MutableMap<String, String> = mutableMapOf()
+    /**
+     * Custom environment variables injected into every proot command.
+     *
+     * [deep-audit-1016 FIX-C 3b] ConcurrentHashMap, not mutableMapOf(): writers
+     * are [boot] (a dozen putIfAbsent/put for PATH/LANG/TZ/PROOT_*),
+     * [updateTimezone] and [updateProxy] — the last two run from
+     * `MinisApp`'s timezone / proxy broadcasts, i.e. at arbitrary times while a
+     * shell is starting. Readers iterate it while building the child envp
+     * (`PersistentShell`, `ShellExecutor`, `TerminalSession`). A plain
+     * LinkedHashMap threw ConcurrentModificationException out of whichever
+     * shell_execute happened to be starting — the exact same race
+     * [bindMounts] was fixed for in [audit-0917], in the sibling declaration
+     * below: that fix changed one map and left this one. Env-var iteration
+     * order carries no meaning (the kernel takes an unordered envp block), so
+     * the weakly-consistent iterator is a strict improvement.
+     *
+     * Declared type stays `MutableMap<String, String>`: the three iteration
+     * sites keep compiling unchanged, and `putIfAbsent` keeps its atomic
+     * JDK-8 ConcurrentMap meaning (Kotlin's `MutableMap.putIfAbsent` delegates
+     * to `java.util.Map.putIfAbsent` when the receiver implements it).
+     */
+    val customEnvironment: MutableMap<String, String> = java.util.concurrent.ConcurrentHashMap()
 
     /**
      * Bind mounts: Linux path -> host filesystem path.
@@ -73,7 +112,19 @@ object PRootKernel {
             Log.d(TAG, "Already booted")
             return
         }
+        // [deep-audit-1016 FIX-C 3a] The fast path above stays lock-free; the
+        // gate re-checks under the lock and runs the body at most once. A loser
+        // waits here and then returns without touching the rootfs.
+        val performed = bootGate.run { bootCriticalSection(context) }
+        if (!performed) Log.d(TAG, "Already booted (concurrent entrant)")
+    }
 
+    /**
+     * [boot]'s one-shot body — rootfs install/repair, env, bind mounts, offload
+     * server. Split out so [boot] is only "fast path + gate"; never call this
+     * directly (it is the thing [bootGate] exists to serialize).
+     */
+    private suspend fun bootCriticalSection(context: Context) {
         bootContext = context.applicationContext
         rootfsManager = RootfsManager.getInstance(context)
         rootfsManager.installIfNeeded()
@@ -217,7 +268,9 @@ object PRootKernel {
         // were known at app launch.
         applyMountedFoldersSnapshot(context)
 
-        isBooted = true
+        // [deep-audit-1016 FIX-C 3a] `bootGate` marks completion here — the
+        // flag-before-body ordering (`isBooted = true` used to sit one line
+        // earlier) would let a concurrent entrant skip the tail of this body.
         Log.i(TAG, "PRoot kernel booted " +
             "rootfs=${rootfsManager.rootfsDir.absolutePath} " +
             "nativeLibDir=$nativeLibDir " +
@@ -799,20 +852,24 @@ object PRootKernel {
      *
      * Falls back to [resolveHostPath] for paths outside `/var/minis/` or for the
      * shared subdirs (memory/skills/shared) which don't depend on sessionId.
+     *
+     * [deep-audit-1016 FIX-C 2a] The decision lives in the pure
+     * [resolveSessionGuestHostPath], which normalizes `linuxPath` BEFORE any
+     * prefix match. The raw-string form this used to be (and the read-only
+     * guard's own [normalizeLinuxPath] call) disagreed on malformed input:
+     * `/var/minis/./workspace/x` extracted `subdir == "."`, matched no
+     * per-session scope and no bind mount, and fell through to the rootfs
+     * join — i.e. a *ghost* file at `<rootfs>/var/minis/workspace/x`, shared
+     * between sessions and invisible to the session's own workspace.
      */
-    fun resolveSessionHostPath(sessionId: String, linuxPath: String, context: Context): File? {
-        if (!linuxPath.startsWith("/var/minis/")) return resolveHostPath(linuxPath)
-        val rest = linuxPath.removePrefix("/var/minis/")
-        val slash = rest.indexOf('/')
-        val subdir = if (slash < 0) rest else rest.substring(0, slash)
-        if (subdir !in perSessionSubdirs) return resolveHostPath(linuxPath)
-        val sessionBase = File(context.filesDir, "minis-sessions/$sessionId/$subdir")
-        val tail = if (slash < 0) "" else rest.substring(slash + 1)
-        if (tail.isEmpty()) return sessionBase
-        // Normalize dot-segments and enforce the resolved path stays inside
-        // sessionBase (guards `..`/symlink escapes out of the session tree).
-        return safeResolveWithin(sessionBase, tail)
-    }
+    fun resolveSessionHostPath(sessionId: String, linuxPath: String, context: Context): File? =
+        resolveSessionGuestHostPath(
+            sessionId = sessionId,
+            linuxPath = linuxPath,
+            filesDir = context.filesDir,
+            perSessionSubdirs = perSessionSubdirs,
+            resolveGlobal = { resolveHostPath(it) },
+        )
 
     /**
      * Resolve a Linux path, honouring the owning session whenever one is known.
@@ -884,55 +941,19 @@ object PRootKernel {
      * that actually exists — the same fallback resolveMdMediaFile uses — so a
      * `minis://attachments/x.png` URL still resolves to a real file instead of
      * the empty rootfs placeholder.
+     *
+     * [deep-audit-1016 FIX-C 2a] Delegates to the pure [resolveGuestHostPath],
+     * which normalizes the guest path before every prefix match (bind mounts
+     * and the per-session subdir scan alike) — see
+     * [resolveSessionGuestHostPath] for the malformed-input symptom.
      */
-    fun resolveHostPath(linuxPath: String): File? {
-        // Check bind mounts (longest prefix match)
-        val sorted = bindMounts.keys.sortedByDescending { it.length }
-        for (mountPoint in sorted) {
-            if (linuxPath == mountPoint || linuxPath.startsWith("$mountPoint/")) {
-                val hostBase = bindMounts[mountPoint]!!
-                val relativePath = linuxPath.removePrefix(mountPoint).removePrefix("/")
-                if (relativePath.isEmpty()) {
-                    File(hostBase)
-                } else {
-                    // Normalize dot-segments and enforce the resolved path stays
-                    // inside hostBase (guards `..`/symlink escapes out of the mount).
-                    safeResolveWithin(File(hostBase), relativePath)
-                }.let { return it }
-            }
-        }
-
-        // Per-session subdir fallback: no session context available — search
-        // all minis-sessions/<id>/ trees for an existing file (or existing
-        // dir) at this Linux path. Picks the first match; ambiguity is
-        // acceptable here because these callers can't know the session anyway.
-        if (linuxPath.startsWith("/var/minis/")) {
-            val rest = linuxPath.removePrefix("/var/minis/")
-            val subdir = rest.substringBefore('/')
-            if (subdir in perSessionSubdirs) {
-                val sessionsRoot = bootContext?.filesDir?.let { File(it, "minis-sessions") }
-                val tail = rest.substringAfter('/', missingDelimiterValue = "")
-                if (sessionsRoot?.isDirectory == true) {
-                    sessionsRoot.listFiles()?.forEach { sessionDir ->
-                        if (!sessionDir.isDirectory) return@forEach
-                        val candidate = if (tail.isEmpty()) File(sessionDir, subdir)
-                        else safeResolveWithin(File(sessionDir, subdir), tail)
-                        if (candidate?.exists() == true) return candidate
-                    }
-                }
-                // No existing file in any session — fall through to rootfs
-                // placeholder (matches pre-existing behavior for missing files).
-            }
-        }
-
-        // Fallback: resolve relative to rootfs
-        if (!::rootfsManager.isInitialized) return null
-        val stripped = linuxPath.removePrefix("/")
-        if (stripped.isEmpty()) return rootfsManager.rootfsDir
-        // Normalize dot-segments and keep the resolved path inside the rootfs —
-        // never allow `..` (or symlinks) to climb out into the host filesystem.
-        return safeResolveWithin(rootfsManager.rootfsDir, stripped)
-    }
+    fun resolveHostPath(linuxPath: String): File? = resolveGuestHostPath(
+        linuxPath = linuxPath,
+        bindMounts = bindMounts,
+        perSessionSubdirs = perSessionSubdirs,
+        sessionsRoot = bootContext?.filesDir?.let { File(it, "minis-sessions") },
+        rootfsDir = if (::rootfsManager.isInitialized) rootfsManager.rootfsDir else null,
+    )
 
     /**
      * Create a stub executable inside the rootfs for every registered
@@ -1352,4 +1373,198 @@ internal fun normalizeLinuxPath(path: String): String? {
         }
     }
     return if (absolute) "/" + out.joinToString("/") else out.joinToString("/")
+}
+
+/**
+ * True when [path] carries a literal `..` segment ([deep-audit-1016 FIX-C 2a]).
+ *
+ * Segment-wise, not a substring test: `a..b` is an ordinary file name. Used by
+ * the session-scoped write classifier to treat `..` as the deliberate-escape
+ * signal *before* normalization — normalizing it away would silently re-target
+ * the write (`workspace/../browser/c` → `browser/c`) instead of refusing it.
+ *
+ * Top-level (not a member) so it is JVM-testable with zero Android deps, like
+ * [normalizeLinuxPath].
+ */
+internal fun hasDotDotSegment(path: String): Boolean = path.split('/').any { it == ".." }
+
+/**
+ * One-shot initialization gate ([deep-audit-1016 FIX-C 3a]).
+ *
+ * `PRootKernel.boot()` used to be guarded by a bare `if (isBooted) return` on
+ * a non-volatile flag, and it is called from two independent places on cold
+ * start (`ExecutionCoordinator`'s auto-boot, `TerminalSession`'s
+ * open-a-terminal). Both could observe `false` and run the body concurrently;
+ * the body calls `RootfsManager.installIfNeeded`, which *deletes* the rootfs
+ * directory and re-extracts it — so the second entrant deleted the tree the
+ * first was still unpacking.
+ *
+ * A plain class (no Android, no `PRootKernel` state) so the concurrency
+ * contract is JVM-testable: [run] executes the body at most once across
+ * concurrent callers, and every later caller observes [isDone] == true and
+ * skips. The flag is the *same fact* as the mutual exclusion, so a reader can
+ * never see "done" while the body is still running.
+ */
+internal class BootOnceGate {
+
+    private val mutex = Mutex()
+
+    /** True once [run]'s body has completed. Volatile: read from other threads. */
+    @Volatile
+    var isDone: Boolean = false
+        private set
+
+    /**
+     * Runs [body] unless it already completed; returns true when this call ran it.
+     *
+     * [body] is `suspend` because the only production caller is [PRootKernel.boot],
+     * whose body awaits `RootfsManager`'s suspend API. The first version of this
+     * refactor declared the parameter (and [PRootKernel.bootCriticalSection])
+     * non-suspend and CI's `compileReleaseKotlin` rejected the file — the local
+     * extraction harness slices fragments, so it cannot see a signature-level
+     * error in a body it does not extract.
+     */
+    suspend fun run(body: suspend () -> Unit): Boolean {
+        if (isDone) return false
+        return mutex.withLock {
+            if (isDone) return@withLock false
+            body()
+            isDone = true
+            true
+        }
+    }
+}
+
+/**
+ * Pure core of [PRootKernel.resolveSessionHostPath]
+ * ([deep-audit-1016 FIX-C 2a]).
+ *
+ * Decides "this session's `<subdir>` tree, or hand the path to the global
+ * resolver" for a caller that knows the owning session. No `Context`, no
+ * `PRootKernel` state, no boot requirement — the session base comes in as
+ * [filesDir], the global arm as [resolveGlobal] — so the JVM test source set
+ * can pin the whole parse matrix (canonical, malformed, escaping, symlinked).
+ *
+ * ## Normalize first, then match
+ *
+ * Every prefix/length decision runs on [normalizeLinuxPath]'s output. Matching
+ * the RAW string (the pre-fix shape, and the shape [normalizeLinuxPath]'s own
+ * KDoc describes for the read-only guard) made `.`/`//`-noise paths fall
+ * through every scope check and land in the rootfs join instead — a ghost file
+ * at `<rootfs>/var/minis/<subdir>/...`, shared by all sessions, while the
+ * caller's real session directory stayed empty.
+ *
+ * ## Fail closed
+ *
+ * A null from [normalizeLinuxPath] (empty input, or a relative path that
+ * climbs above its root) returns null — it is NOT re-matched as a raw string.
+ * Falling back to the raw form here would reproduce the `?:` elvis hole
+ * `resolvePathForSession` documents (backlog §111 R3).
+ *
+ * @param resolveGlobal consulted only when no session scope applies — a path
+ *   outside `/var/minis/`, or one of the shared subdirs. Never consulted for a
+ *   path this function rejects.
+ */
+internal fun resolveSessionGuestHostPath(
+    sessionId: String,
+    linuxPath: String,
+    filesDir: File,
+    perSessionSubdirs: Set<String>,
+    resolveGlobal: (String) -> File?,
+): File? {
+    val normalized = normalizeLinuxPath(linuxPath) ?: return null
+    if (!normalized.startsWith("/var/minis/")) return resolveGlobal(normalized)
+    val rest = normalized.removePrefix("/var/minis/")
+    val slash = rest.indexOf('/')
+    val subdir = if (slash < 0) rest else rest.substring(0, slash)
+    if (subdir !in perSessionSubdirs) return resolveGlobal(normalized)
+    val sessionBase = File(filesDir, "minis-sessions/$sessionId/$subdir")
+    val tail = if (slash < 0) "" else rest.substring(slash + 1)
+    if (tail.isEmpty()) return sessionBase
+    // The resolved path must stay inside sessionBase (guards symlink escapes
+    // out of the session tree; dot-segments are already gone).
+    return PRootKernel.safeResolveWithin(sessionBase, tail)
+}
+
+/**
+ * Pure core of [PRootKernel.resolveHostPath] ([deep-audit-1016 FIX-C 2a]).
+ *
+ * Longest-bind-mount-prefix match, then the per-session tree scan (no session
+ * context — picks the first existing match), then the rootfs join. State comes
+ * in as parameters ([bindMounts], [sessionsRoot], [rootfsDir] — the latter two
+ * null before boot) so the JVM test source set can pin the full parse matrix
+ * without an Android `Context`.
+ *
+ * Normalization happens ONCE, on entry, and every later match uses the
+ * normalized string — the pre-fix code matched prefixes on the raw input while
+ * [PRootKernel.safeResolveWithin] (and the read-only-mount guard) resolved
+ * dot-segments themselves, so the two disagreed about which file a malformed
+ * path named.
+ *
+ * Behaviour notes for the parse matrix (see the FIX-C report):
+ *  - `/var/minis/./workspace/x` and `//var/minis/workspace/x` now resolve like
+ *    `/var/minis/workspace/x` (pre-fix: rootfs ghost);
+ *  - `/var/minis/../etc/passwd` now resolves like `/etc/passwd` (pre-fix:
+ *    null). This is POSIX/PRoot semantics and matches
+ *    [com.rikkaminis.app.sandbox.GuestPathMapper.resolve]'s own normalization;
+ *    the result is still inside the sandbox (rootfs or a bind mount), never on
+ *    a host path outside it;
+ *  - `""` now returns null (pre-fix: the rootfs directory itself);
+ *  - every canonical path returns exactly what it returned before — that is
+ *    the regression contract pinned by `GuestPathParseMatrixTest`.
+ */
+internal fun resolveGuestHostPath(
+    linuxPath: String,
+    bindMounts: Map<String, String>,
+    perSessionSubdirs: Set<String>,
+    sessionsRoot: File?,
+    rootfsDir: File?,
+): File? {
+    val normalized = normalizeLinuxPath(linuxPath) ?: return null
+
+    // Check bind mounts (longest prefix match)
+    val sorted = bindMounts.keys.sortedByDescending { it.length }
+    for (mountPoint in sorted) {
+        if (normalized == mountPoint || normalized.startsWith("$mountPoint/")) {
+            val hostBase = bindMounts[mountPoint]!!
+            val relativePath = normalized.removePrefix(mountPoint).removePrefix("/")
+            if (relativePath.isEmpty()) {
+                File(hostBase)
+            } else {
+                // Keep the resolved path inside hostBase (guards `..`/symlink
+                // escapes out of the mount).
+                PRootKernel.safeResolveWithin(File(hostBase), relativePath)
+            }.let { return it }
+        }
+    }
+
+    // Per-session subdir fallback: no session context available — search
+    // all minis-sessions/<id>/ trees for an existing file (or existing
+    // dir) at this Linux path. Picks the first match; ambiguity is
+    // acceptable here because these callers can't know the session anyway.
+    if (normalized.startsWith("/var/minis/")) {
+        val rest = normalized.removePrefix("/var/minis/")
+        val subdir = rest.substringBefore('/')
+        if (subdir in perSessionSubdirs) {
+            val tail = rest.substringAfter('/', missingDelimiterValue = "")
+            if (sessionsRoot?.isDirectory == true) {
+                sessionsRoot.listFiles()?.forEach { sessionDir ->
+                    if (!sessionDir.isDirectory) return@forEach
+                    val candidate = if (tail.isEmpty()) File(sessionDir, subdir)
+                    else PRootKernel.safeResolveWithin(File(sessionDir, subdir), tail)
+                    if (candidate?.exists() == true) return candidate
+                }
+            }
+            // No existing file in any session — fall through to rootfs
+            // placeholder (matches pre-existing behavior for missing files).
+        }
+    }
+
+    // Fallback: resolve relative to rootfs
+    if (rootfsDir == null) return null
+    val stripped = normalized.removePrefix("/")
+    if (stripped.isEmpty()) return rootfsDir
+    // Keep the resolved path inside the rootfs — never allow a symlink to
+    // climb out into the host filesystem (dot-segments are already gone).
+    return PRootKernel.safeResolveWithin(rootfsDir, stripped)
 }

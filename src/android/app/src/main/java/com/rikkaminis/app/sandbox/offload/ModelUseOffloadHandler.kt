@@ -12,6 +12,8 @@ import com.rikkaminis.app.sandbox.NativeOffloadHandler
 import com.rikkaminis.app.sandbox.NativeOffloadRequest
 import com.rikkaminis.app.sandbox.NativeOffloadResult
 import com.rikkaminis.app.sandbox.PRootKernel
+import com.rikkaminis.app.sandbox.hasDotDotSegment
+import com.rikkaminis.app.sandbox.normalizeLinuxPath
 import kotlinx.coroutines.runBlocking
 import org.json.JSONArray
 import org.json.JSONObject
@@ -730,7 +732,20 @@ class ModelUseOffloadHandler(
             .put("body_mode", spec.bodyMode)
             .put("model_id", entry.model.id)
 
-        if (outputPath != null) {
+        if (outputPath != null && PRootKernel.isLinuxPathUnderReadOnlyMount(outputPath)) {
+            // [deep-audit-1016 FIX-C 2b] T219 read-only mount guard — same
+            // contract as tools/FileWriteTool.kt (refuse, never silently write
+            // elsewhere). Keeps the established `output_error` field so the
+            // existing JSON contract (and the tests asserting it) is unchanged;
+            // the body still comes back inline because the provider call itself
+            // succeeded and is not re-runnable for free.
+            out.put(
+                "output_error",
+                "'$outputPath' is inside a read-only mounted folder — nothing was written. " +
+                    "Toggle writability in Settings → Mount External Folders if this is a mistake.",
+            )
+            inlineTextIfPossible(data, out)
+        } else if (outputPath != null) {
             val hostFile = sessionAwareHostFile(outputPath, sessionId)
             if (hostFile == null) {
                 out.put("output_error", "Could not resolve --output '$outputPath'")
@@ -802,6 +817,18 @@ class ModelUseOffloadHandler(
         val ts = System.currentTimeMillis() / 1000
         val modelSlug = entry.model.id.replace("/", "_")
         if (outputPath != null) {
+            // [deep-audit-1016 FIX-C 2b] T219 read-only mount guard — refuse
+            // before touching disk (same contract as tools/FileWriteTool.kt).
+            // Exit code 2 matches the neighbouring "cannot resolve --output"
+            // refusal: the established shape for "the --output target could not
+            // be used", which callers already branch on.
+            if (PRootKernel.isLinuxPathUnderReadOnlyMount(outputPath)) {
+                return NativeOffloadResult(
+                    2,
+                    "minis-model-use run: '$outputPath' is inside a read-only mounted folder and cannot be " +
+                        "written — toggle writability in Settings → Mount External Folders\n",
+                )
+            }
             val hostFile = sessionAwareHostFile(outputPath, sessionId)
                 ?: return NativeOffloadResult(
                     2,
@@ -1280,11 +1307,33 @@ class ModelUseOffloadHandler(
          * Pure classifier behind [sessionAwareHostFile] — kept here (like
          * [sessionScopedJoin]) so the three-way decision is host-testable
          * without a Context. [filesDir] is the app's `filesDir`.
+         *
+         * [deep-audit-1016 FIX-C 2a] Two additions, both on the *raw* string
+         * before any scope match:
+         *
+         *  1. A literal `..` segment is refused outright
+         *     ([hasDotDotSegment]). For a guest-supplied write target a `..` is
+         *     an escape attempt, not a request for the normalized destination —
+         *     FIX-08's decision is that a refusal here is FINAL (never re-asked
+         *     of the global resolver), and silently re-targeting
+         *     `workspace/../browser/c` to `browser/c` would be exactly the
+         *     "normalize an attack into a permission" move this guard exists to
+         *     prevent.
+         *  2. The scope match now runs on the normalized path. Pre-fix the raw
+         *     match meant `/var/minis/./workspace/out.txt` (or
+         *     `//var/minis/workspace/out.txt`) failed the regex, fell through to
+         *     `NotSessionScoped`, and the global resolver wrote the file into
+         *     the ROOTFS placeholder — a ghost the session's own shell cannot
+         *     see, shared with every other session.
          */
         internal fun classifySessionPath(filesDir: File, sessionId: String?, linuxPath: String): SessionScopedPathDecision {
             if (sessionId == null) return SessionScopedPathDecision.NotSessionScoped
-            if (SESSION_SCOPED_PATH.find(linuxPath) == null) return SessionScopedPathDecision.NotSessionScoped
-            val joined = sessionScopedJoin(filesDir, sessionId, linuxPath) ?: return SessionScopedPathDecision.Rejected
+            if (hasDotDotSegment(linuxPath)) return SessionScopedPathDecision.Rejected
+            val normalized = normalizeLinuxPath(linuxPath)
+                ?: return SessionScopedPathDecision.Rejected
+            if (SESSION_SCOPED_PATH.find(normalized) == null) return SessionScopedPathDecision.NotSessionScoped
+            val joined = sessionScopedJoin(filesDir, sessionId, normalized)
+                ?: return SessionScopedPathDecision.Rejected
             return SessionScopedPathDecision.Resolved(joined)
         }
 

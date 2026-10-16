@@ -485,6 +485,16 @@ fi
 
 echo "━━━ [25/25] Gemini base version guard ━━━"
 if python3 scripts/scan/gemini_base_version_check.py "$ROOT"; then
+# --- 25. Read-only-mount write guard (call-site coverage) ---
+#   Added 2026-10-16 (deep-audit FIX-C 2b). `isLinuxPathUnderReadOnlyMount` is
+#   the contract every host-file write site must consult; T219 wired it into
+#   `tools/FileWriteTool`/`FileEditTool` only, so `minis-model-use --output`
+#   (shapeRawPassthrough / writeRunOutput) wrote into read-only mounts while the
+#   same path refused through `file_write`. Criterion: a function that takes a
+#   caller-supplied path parameter and writes a host file must call the guard —
+#   unless its file is exempt WITH evidence, and rotted evidence fails loudly.
+echo "━━━ [26/25] Read-only-mount write guard ━━━"
+if python3 scripts/scan/readonly_mount_write_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
 else
