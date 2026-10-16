@@ -50,7 +50,12 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
 
         val group = argv[0]
         val rest = argv.drop(1)
-        val args = OffloadArgs(rest)
+        // [deep-audit-1017 ISSUE-08b] Declare this handler's value-less long
+        // options: OffloadArgs treats `--flag` as boolean only when the caller
+        // declares it (a flag it doesn't know greedily eats the next token as
+        // its value — the B26a failure mode pinned by SessionsCliArgsTest). See
+        // [NO_VALUE_FLAGS].
+        val args = OffloadArgs(rest, booleanFlags = NO_VALUE_FLAGS)
 
         // `service ping/status` reports state without requiring READY.
         if (group == "service") return handleService(rest, args)
@@ -234,17 +239,14 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
 
     private fun packageClear(pkg: String?, args: OffloadArgs): NativeOffloadResult {
         if (pkg.isNullOrBlank()) return errEnvelope("INVALID_ARGS", "package clear <packageName>", args)
-        val cmd: MutableList<String> = if (args.hasFlag("cache-only")) {
-            mutableListOf("pm", "trim-caches", "1G")
-        } else {
-            mutableListOf("pm", "clear").apply {
-                args.get("user")?.let { addAll(listOf("--user", it)) }
-                add(pkg)
-            }
-        }
+        val cacheOnly = args.hasFlag("cache-only")
+        val cmd = buildPackageClearCommand(pkg, cacheOnly, args.get("user"))
         val r = ShizukuManager.runProcess(cmd.toTypedArray(), timeoutMs = 15_000)
-        return if (r.exitCode == 0) okEnvelope(JSONObject().put("cleared", pkg), args)
-        else errEnvelope("OPERATION_FAILED", failMessage(r), args)
+        return if (r.exitCode == 0) {
+            okEnvelope(JSONObject().put("cleared", pkg).put("scope", clearScope(cacheOnly)), args)
+        } else {
+            errEnvelope("OPERATION_FAILED", failMessage(r), args)
+        }
     }
 
     private fun packagePath(pkg: String?, args: OffloadArgs): NativeOffloadResult {
@@ -699,8 +701,7 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
 
     private fun inputText(text: String, args: OffloadArgs): NativeOffloadResult {
         if (text.isBlank()) return errEnvelope("INVALID_ARGS", "input text <text>", args)
-        // `input text` doesn't accept spaces directly — replace with %s
-        val safe = text.replace(' ', '%').replace("'", "")
+        val safe = encodeInputText(text)
         val r = ShizukuManager.runProcess(arrayOf("input", "text", safe))
         return if (r.exitCode == 0) okEnvelope(JSONObject().put("text", text), args)
         else errEnvelope("OPERATION_FAILED", failMessage(r), args)
@@ -712,7 +713,7 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
         return when (sub) {
             "list" -> notificationList(args)
             "dismiss" -> notificationDismiss(args)
-            "channel" -> notificationChannel(rest.drop(1), args)
+            "channel" -> notificationChannel(args.positional.drop(1), args)
             "help", "--help", "-h" -> ok(NOTIFICATION_HELP)
             else -> NativeOffloadResult(2, "notification: unknown subcommand '$sub'\n$NOTIFICATION_HELP")
         }
@@ -759,14 +760,32 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
         }
     }
 
-    private fun notificationChannel(rest: List<String>, args: OffloadArgs): NativeOffloadResult {
-        val sub = rest.firstOrNull() ?: return errEnvelope("INVALID_ARGS", "notification channel list <pkg> | set <pkg> <channelId> [--block|--unblock|--importance N]", args)
+    /**
+     * [deep-audit-1017 ISSUE-08b] `pos` is the **parsed** positional list
+     * (`args.positional.drop(1)`, the convention `permission appops` / `input
+     * swipe` already use), not the raw argv tail.
+     *
+     * Reading raw argv meant a flag that precedes the package mis-placed every
+     * argument: `notification channel set --importance 3 com.pkg chid` took
+     * `--importance` as the package and `3` as the channel id, and
+     * `… set --block com.pkg chid` took `--block` as the package — the latter
+     * then reached `cmd notification` as a privileged call with a garbage
+     * target. With the parsed list the sub-command, package and channel id are
+     * taken from the same tokens the flags were stripped out of.
+     */
+    private fun notificationChannel(pos: List<String>, args: OffloadArgs): NativeOffloadResult {
+        val sub = pos.firstOrNull() ?: return errEnvelope("INVALID_ARGS", "notification channel list <pkg> | set <pkg> <channelId> [--block|--unblock|--importance N]", args)
         return when (sub) {
             "list" -> {
-                val pkg = rest.getOrNull(1) ?: return errEnvelope("INVALID_ARGS", "notification channel list <pkg>", args)
+                val pkg = pos.getOrNull(1) ?: return errEnvelope("INVALID_ARGS", "notification channel list <pkg>", args)
                 val r = ShizukuManager.runProcess(arrayOf("dumpsys", "notification"), timeoutMs = 8_000)
                 if (r.exitCode != 0) return errEnvelope("OPERATION_FAILED", failMessage(r), args)
                 val arr = JSONArray()
+                // ponytail: pkg is validated but not used to filter the dump |
+                // 天花板: this regex targets `id=/name=/importance=` while the
+                // device emits `mId=/mName=/mImportance=` (probe/pre/p4b), so the
+                // list comes back empty regardless of the filter | 升级触发:
+                // deep-audit-1017 FIX-E report §同族观察 (dispatched as own item)
                 val regex = Regex("""NotificationChannel\{.*?id=([^,]+).*?name=([^,]+).*?importance=(\d+)""")
                 for (m in regex.findAll(r.stdout)) {
                     arr.put(JSONObject()
@@ -777,8 +796,8 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
                 okEnvelope(arr, args)
             }
             "set" -> {
-                val pkg = rest.getOrNull(1)
-                val ch = rest.getOrNull(2)
+                val pkg = pos.getOrNull(1)
+                val ch = pos.getOrNull(2)
                 if (pkg == null || ch == null) return errEnvelope("INVALID_ARGS", "notification channel set <pkg> <channelId>", args)
                 val cmd = mutableListOf("cmd", "notification")
                 when {
@@ -1050,6 +1069,23 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
     companion object {
         private const val TAG = "ShizukuOffload"
 
+        /**
+         * [deep-audit-1017 ISSUE-08b] Long options this handler accepts that take
+         * no value.
+         *
+         * [OffloadArgs] classifies `--flag` as boolean only when (a) the caller
+         * declared it, (b) it is the last token, or (c) the next token starts
+         * with `-`. An undeclared `--block com.pkg` therefore reads "com.pkg" as
+         * the *value* of `--block` and silently drops a positional — and the raw
+         * `rest` indexing that `notification channel` used then handed that
+         * value straight to `cmd notification`. The parser is built once in
+         * [handle], so the declaration lives here.
+         *
+         * Only pure switches belong here: `--importance` takes a value and must
+         * stay out (declaring it would leave `3` as a stray positional).
+         */
+        internal val NO_VALUE_FLAGS = setOf("block", "unblock")
+
         private const val HELP = """android-shizuku-cli — privileged Android system control via Shizuku.
 
 Usage:
@@ -1224,3 +1260,49 @@ Usage:
 """
     }
 }
+
+/**
+ * [deep-audit-1017 ISSUE-08a] Encode a string for `input text`.
+ *
+ * Ground truth (`probe/pre/InputShellCommand.java`, AOSP android15-release —
+ * `services/core/java/com/android/server/input/InputShellCommand.java:371-386`):
+ * `sendText` rewrites the two-character sequence `%s` into a space and passes
+ * every other `%` through untouched. `/system/bin/input` is `cmd input "$@"`,
+ * so argv reaches that parser verbatim and the escape is the only way to
+ * represent a space. The previous encoder emitted a bare `%`
+ * (`replace(' ', '%')`), which the parser does not recognize: every space was
+ * typed as a literal `%`.
+ *
+ * Single quotes are still stripped — pre-existing behavior, they are a
+ * shell-quoting hazard for callers that route the text through `exec`.
+ */
+internal fun encodeInputText(text: String): String =
+    text.replace(" ", "%s").replace("'", "")
+
+/**
+ * [deep-audit-1017 ISSUE-08c] argv for `package clear`.
+ *
+ * Ground truth: `pm help clear` on the target device (Android 15 / HyperOS 3)
+ * documents `clear [--user USER_ID] [--cache-only] PACKAGE`, and AOSP
+ * `PackageManagerShellCommand.runClear` (:2312-2358) routes `--cache-only` to
+ * `deleteApplicationCacheFilesAsUser(pkg, userId, obs)` — a per-package cache
+ * clear. The previous implementation ran the **global** `pm trim-caches 1G`
+ * while still reporting `cleared=<pkg>`, i.e. it claimed a per-package clear it
+ * never performed. Global trimming is still reachable via
+ * `android-shizuku-cli exec 'pm trim-caches <space>'` — it just isn't what this
+ * sub-command promises.
+ *
+ * Platform caveat (not ours): for a package that does not exist the platform
+ * never fires the clear observer, so the call blocks until the caller's timeout
+ * (`runProcess` -> `ProcessResult(124)`) instead of failing fast.
+ */
+internal fun buildPackageClearCommand(pkg: String, cacheOnly: Boolean, user: String?): List<String> {
+    val cmd = mutableListOf("pm", "clear")
+    if (cacheOnly) cmd.add("--cache-only")
+    if (user != null) cmd.addAll(listOf("--user", user))
+    cmd.add(pkg)
+    return cmd
+}
+
+/** [deep-audit-1017 ISSUE-08c] What a successful `package clear` actually removed. */
+internal fun clearScope(cacheOnly: Boolean): String = if (cacheOnly) "cache-only" else "data+cache"
