@@ -158,35 +158,35 @@ class OffloadCliArgsTest {
 
     @Test
     fun `relative path joins onto an absolute cwd`() {
-        assertEquals("/root/ws/val.json", ConfigOffloadHandler.resolveMaybeRelative("val.json", "/root/ws"))
+        assertEquals("/root/ws/val.json", resolveMaybeRelative("val.json", "/root/ws"))
     }
 
     @Test
     fun `trailing slash cwd does not double the separator`() {
-        assertEquals("/root/ws/val.json", ConfigOffloadHandler.resolveMaybeRelative("val.json", "/root/ws/"))
+        assertEquals("/root/ws/val.json", resolveMaybeRelative("val.json", "/root/ws/"))
     }
 
     @Test
     fun `absolute path ignores the cwd`() {
-        assertEquals("/abs/x", ConfigOffloadHandler.resolveMaybeRelative("/abs/x", "/root/ws"))
+        assertEquals("/abs/x", resolveMaybeRelative("/abs/x", "/root/ws"))
     }
 
     /** No cwd → unchanged, so the session-aware resolver fails closed. */
     @Test
     fun `missing cwd leaves the path untouched`() {
-        assertEquals("val.json", ConfigOffloadHandler.resolveMaybeRelative("val.json", null))
-        assertEquals("val.json", ConfigOffloadHandler.resolveMaybeRelative("val.json", ""))
+        assertEquals("val.json", resolveMaybeRelative("val.json", null))
+        assertEquals("val.json", resolveMaybeRelative("val.json", ""))
     }
 
     /** A relative cwd must not be guessed onto — the downstream gate decides. */
     @Test
     fun `relative cwd is not joined`() {
-        assertEquals("val.json", ConfigOffloadHandler.resolveMaybeRelative("val.json", "relative-cwd"))
+        assertEquals("val.json", resolveMaybeRelative("val.json", "relative-cwd"))
     }
 
     @Test
     fun `nested relative path keeps its own segments`() {
-        assertEquals("/root/ws/sub/val.json", ConfigOffloadHandler.resolveMaybeRelative("sub/val.json", "/root/ws"))
+        assertEquals("/root/ws/sub/val.json", resolveMaybeRelative("sub/val.json", "/root/ws"))
     }
 
     // ── C. wiring probes (source shape) ─────────────────────────────────────
