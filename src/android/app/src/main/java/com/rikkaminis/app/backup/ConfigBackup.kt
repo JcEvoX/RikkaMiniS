@@ -592,10 +592,17 @@ object ConfigBackup {
         // with the switch in the right position and nothing behind it.
         val memoryFiles = JSONArray()
         if (memoryRepo != null) {
-            for (info in runCatching { memoryRepo.listAllFiles() }.getOrDefault(emptyList())) {
-                val content = runCatching { memoryRepo.readFile(info.name) }.getOrNull() ?: continue
+            // [FIX-E / ISSUE-09] listAllFiles() deliberately hides the distilled
+            // MEMORY-ROLLUP.md from the settings list — memoryBackupEntries()
+            // puts it back for the payload only, so a restored device keeps the
+            // distilled rules the daily logs were folded into.
+            val entries = memoryBackupEntries(
+                listed = runCatching { memoryRepo.listAllFiles() }
+                    .getOrDefault(emptyList()).map { it.name },
+            ) { name -> runCatching { memoryRepo.readFile(name) }.getOrNull() }
+            for ((name, content) in entries) {
                 memoryFiles.put(JSONObject().apply {
-                    put("name", info.name)
+                    put("name", name)
                     put("content", content)
                 })
             }
@@ -1384,7 +1391,18 @@ object ConfigBackup {
         val chatMessagesArr = root.optJSONArray("chatMessages")
         if (chatSessionsArr != null && chatRepo != null) {
             val (sessionsImported, messagesImported) =
-                importChatSections(chatRepo, chatSessionsArr, chatMessagesArr, skipped)
+                importChatSections(
+                    chatRepo = chatRepo,
+                    chatSessionsArr = chatSessionsArr,
+                    chatMessagesArr = chatMessagesArr,
+                    skipped = skipped,
+                    // [FIX-E / ISSUE-09] session modelBinding rows carry the
+                    // source install's group/entry uuids — remap them onto the
+                    // ids minted by Stages 1-2 or restoreFromBinding degrades
+                    // every restored session to its stale modelId.
+                    groupIdMap = groupIdMap,
+                    entryIdMap = entryIdMap,
+                )
             chatSessionsImported += sessionsImported
             chatMessagesImported += messagesImported
         } else if (chatSessionsArr != null && chatSessionsArr.length() > 0 && chatRepo == null) {
@@ -1534,37 +1552,6 @@ object ConfigBackup {
      *  token this build doesn't know (forward-compat with newer backups). */
     private inline fun <reified T : Enum<T>> enumOrDefault(name: String, default: T): T =
         runCatching { enumValueOf<T>(name) }.getOrDefault(default)
-
-    /**
-     * Rewrite the source group/entry ids embedded in a `defaults.*` field to the
-     * ids minted during this import. Group-typed fields
-     * (primaryGroup / subGroup / agentLoopGroups) map through [groupIdMap];
-     * agentLoopEntries maps through [entryIdMap]. Everything else is returned
-     * unchanged. Unmapped ids are passed through so the field's own writer can
-     * report them as unknown rather than this layer silently dropping them.
-     */
-    private fun remapDefaultsIds(
-        path: String,
-        value: ConfigValue,
-        groupIdMap: Map<String, String>,
-        entryIdMap: Map<String, String>,
-    ): ConfigValue {
-        val map = when (path) {
-            "defaults.primaryGroup", "defaults.subGroup", "defaults.agentLoopGroups" -> groupIdMap
-            "defaults.agentLoopEntries" -> entryIdMap
-            else -> return value
-        }
-        if (map.isEmpty()) return value
-        return when (value) {
-            is ConfigValue.Str -> ConfigValue.Str(map[value.value] ?: value.value)
-            is ConfigValue.Arr -> ConfigValue.Arr(
-                value.value.map { el ->
-                    if (el is ConfigValue.Str) ConfigValue.Str(map[el.value] ?: el.value) else el
-                }
-            )
-            else -> value
-        }
-    }
 
     /** Hard cap on messages carried per session in a chat-history backup. */
     internal const val MAX_CHAT_MESSAGES_PER_SESSION = 200
@@ -1866,6 +1853,131 @@ object ConfigBackup {
 }
 
 /**
+ * Rewrite the source group/entry ids embedded in a `defaults.*` field to the
+ * ids minted during this import. Group-typed fields
+ * (primaryGroup / subGroup / agentLoopGroups) map through [groupIdMap];
+ * agentLoopEntries and `runtime.compactModelEntryId` (the pinned compaction
+ * model) map through [entryIdMap]. Everything else is returned
+ * unchanged. Unmapped ids are passed through so the field's own writer can
+ * report them as unknown rather than this layer silently dropping them.
+ *
+ * Pure and Android-free so [BackupIdRemapTest] can pin every branch on the JVM.
+ * [FIX-E / ISSUE-09] `runtime.compactModelEntryId` used to be absent here: its
+ * consumer (CompactOrchestration's chain head) treats an unresolvable pin as
+ * "not reachable — follow the session chain" with a single INFO line, so a
+ * restore onto another install silently dropped the user's pinned compaction
+ * model instead of failing loudly.
+ */
+internal fun remapDefaultsIds(
+    path: String,
+    value: ConfigValue,
+    groupIdMap: Map<String, String>,
+    entryIdMap: Map<String, String>,
+): ConfigValue {
+    val map = when (path) {
+        "defaults.primaryGroup", "defaults.subGroup", "defaults.agentLoopGroups" -> groupIdMap
+        "defaults.agentLoopEntries", "runtime.compactModelEntryId" -> entryIdMap
+        else -> return value
+    }
+    if (map.isEmpty()) return value
+    return when (value) {
+        is ConfigValue.Str -> ConfigValue.Str(map[value.value] ?: value.value)
+        is ConfigValue.Arr -> ConfigValue.Arr(
+            value.value.map { el ->
+                if (el is ConfigValue.Str) ConfigValue.Str(map[el.value] ?: el.value) else el
+            }
+        )
+        else -> value
+    }
+}
+
+/**
+ * Rewrite the source group/entry ids inside a session's persisted
+ * `modelBinding` JSON onto the ids minted during this import.
+ *
+ * The two shapes `ChatSessionEntryExt.persistBinding` / `ChatModelRouting`
+ * write are `{"type":"group","groupId":…[,"lastEntryId":…]}` and
+ * `{"type":"entry","entryId":…}`; a restored session whose binding still
+ * points at a foreign uuid fails [ChatViewModel.restoreFromBinding] and
+ * silently degrades to the stored `modelId` (group binding lost, no fallback
+ * chain) — see [FIX-E / ISSUE-09].
+ *
+ * Contract: blank input is returned unchanged; with no maps at all the input
+ * is returned byte-identically (same-install restore must not rewrite
+ * anything); an unmapped id keeps its original value; a payload that is not
+ * the expected JSON object is returned unchanged rather than dropped.
+ */
+internal fun remapSessionBindingJson(
+    bindingJson: String?,
+    groupIdMap: Map<String, String>,
+    entryIdMap: Map<String, String>,
+): String? {
+    if (bindingJson.isNullOrBlank()) return bindingJson
+    if (groupIdMap.isEmpty() && entryIdMap.isEmpty()) return bindingJson
+    return try {
+        val obj = JSONObject(bindingJson)
+        when (obj.optString("type")) {
+            "group" -> {
+                val gid = obj.optString("groupId")
+                if (gid.isNotEmpty()) obj.put("groupId", groupIdMap[gid] ?: gid)
+                val lastEid = obj.optString("lastEntryId")
+                if (lastEid.isNotEmpty()) obj.put("lastEntryId", entryIdMap[lastEid] ?: lastEid)
+            }
+            "entry" -> {
+                val eid = obj.optString("entryId")
+                if (eid.isNotEmpty()) obj.put("entryId", entryIdMap[eid] ?: eid)
+            }
+            // Unknown / future binding shape: keep it verbatim. Re-serializing
+            // would rewrite an object this layer does not understand.
+            else -> return bindingJson
+        }
+        obj.toString()
+    } catch (_: Throwable) {
+        bindingJson
+    }
+}
+
+/**
+ * [FIX-E / ISSUE-09] The `memoryFiles` entries a backup carries, in payload
+ * order: everything [MemoryRepository.listAllFiles] lists (GLOBAL.md + daily
+ * logs), plus the distilled [MemoryRollupEngine.ROLLUP_FILE] index.
+ *
+ * The rollup is deliberately excluded from `listAllFiles` (it must stay out of
+ * the settings file list and out of `memory_get`), which used to make it the
+ * one memory artifact a backup never carried: after a device transfer the
+ * distilled rules — everything old daily logs were folded into — were simply
+ * gone. It is added here, not in `listAllFiles`, so the UI keeps its shape.
+ *
+ * [read] is the caller's read primitive: a name it cannot read yields null.
+ * Entries for listed names are kept even when the content is empty (unchanged
+ * pre-existing behavior); the optional rollup is only carried when it actually
+ * has content, so a device without one writes no extra entry.
+ */
+internal fun memoryBackupEntries(
+    listed: List<String>,
+    read: (String) -> String?,
+): List<Pair<String, String>> {
+    val out = ArrayList<Pair<String, String>>(listed.size + 1)
+    for (name in listed) {
+        val content = read(name) ?: continue
+        out.add(name to content)
+    }
+    val rollup = ROLLUP_BACKUP_FILE
+    if (rollup !in listed) {
+        val content = read(rollup)
+        if (!content.isNullOrEmpty()) out.add(rollup to content)
+    }
+    return out
+}
+
+/**
+ * [FIX-E / ISSUE-09] Distilled-memory index carried by every backup. Note the
+ * source of truth is [MemoryRollupEngine.ROLLUP_FILE] — never re-spelled.
+ */
+internal const val ROLLUP_BACKUP_FILE: String =
+    com.rikkaminis.app.workspace.MemoryRollupEngine.ROLLUP_FILE
+
+/**
  * [fix-audit-finding-1] The entry-id ordering contract.
  *
  * `_entryIds` MUST be emitted in the exact order [ProviderRepository.exportInstanceJSON]
@@ -1902,6 +2014,8 @@ internal suspend fun importChatSections(
     chatSessionsArr: JSONArray?,
     chatMessagesArr: JSONArray?,
     skipped: MutableList<String>,
+    groupIdMap: Map<String, String> = emptyMap(),
+    entryIdMap: Map<String, String> = emptyMap(),
 ): Pair<Int, Int> {
     var chatSessionsImported = 0
     var chatMessagesImported = 0
@@ -1918,7 +2032,11 @@ internal suspend fun importChatSections(
                     updatedAt = s.optLong("updatedAt"),
                     category = s.optString("category").ifEmpty { null },
                     lastMessage = s.optString("lastMessage").ifEmpty { null },
-                    modelBinding = s.optString("modelBinding").ifEmpty { null },
+                    modelBinding = remapSessionBindingJson(
+                        s.optString("modelBinding").ifEmpty { null },
+                        groupIdMap = groupIdMap,
+                        entryIdMap = entryIdMap,
+                    ),
                     source = s.optString("source").ifEmpty { null },
                     memoryEnabled = s.optInt("memoryEnabled", 1),
                     pinnedAt = if (s.has("pinnedAt")) s.optLong("pinnedAt") else null,
