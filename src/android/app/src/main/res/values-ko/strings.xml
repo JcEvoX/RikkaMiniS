@@ -1651,4 +1651,7 @@
     <string name="backup_passphrase_title">암호화된 백업</string>
     <string name="backup_passphrase_body">이 OpenMinis 패키지는 암호화되어 있습니다(minisbak-enc/1). 내보낼 때 설정한 암호 문구를 입력하세요.</string>
     <string name="backup_passphrase_label">암호 문구</string>
+    <!-- Text-to-speech: spoken link phrases (VoiceTextSanitizer). -->
+    <string name="tts_spoken_link_to_host">%1$s 링크</string>
+    <string name="tts_spoken_bare_link">링크</string>
 </resources>

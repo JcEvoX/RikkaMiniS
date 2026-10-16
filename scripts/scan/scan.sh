@@ -17,7 +17,7 @@ echo "╚═══════════════════════�
 echo ""
 
 # --- 1. Four-way sync check ---
-echo "━━━ [1/35] Four-way sync check ━━━"
+echo "━━━ [1/36] Four-way sync check ━━━"
 if python3 scripts/scan/four_way_sync_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -35,7 +35,7 @@ fi
 #   out of the shared strings.xml, so the default set is the UNION over
 #   strings*.xml. Reading strings.xml alone reports those keys as orphans and
 #   fails the build for resources that exist.
-echo "━━━ [2/35] i18n consistency check ━━━"
+echo "━━━ [2/36] i18n consistency check ━━━"
 python3 -c "
 import re, os, sys
 root = '$ROOT'
@@ -83,7 +83,7 @@ fi
 echo ""
 
 # --- 3. Bare valueOf check (persisted enum safety) ---
-echo "━━━ [3/35] Enum parse safety check ━━━"
+echo "━━━ [3/36] Enum parse safety check ━━━"
 if python3 scripts/scan/enum_parse_safety_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -96,7 +96,7 @@ fi
 # --- 4. Provider process-boundary guard (TF-E) ---
 # Mechanical constraint: the app process must never call a provider network
 # entry point directly — only :modelservice (ModelExecutionService) owns them.
-echo "━━━ [4/35] Provider process-boundary guard ━━━"
+echo "━━━ [4/36] Provider process-boundary guard ━━━"
 if python3 scripts/scan/provider_boundary_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -112,7 +112,7 @@ fi
 # loop on AgentTraceRecorder output (produce → consume). Inline selftest
 # goldens keep the evaluator itself honest in CI; device traces can be added
 # later under tests/traces/golden/ referencing real .jsonl files.
-echo "━━━ [5/35] Agent trace replay eval ━━━"
+echo "━━━ [5/36] Agent trace replay eval ━━━"
 if python3 scripts/scan/trace_eval_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -129,7 +129,7 @@ fi
 #   always empty and nothing ever failed, logged or warned. New references are a
 #   build failure unless the file is allow-listed or justifies it inline with
 #   `legacy-ok: <reason>`.
-echo "━━━ [6/35] Legacy pipeline guard ━━━"
+echo "━━━ [6/36] Legacy pipeline guard ━━━"
 if python3 scripts/scan/legacy_pipeline_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -146,7 +146,7 @@ fi
 #   would ship unverified — the same header source is compiled by the host
 #   compiler and asserted against fixture /proc text. Skipped (not failed) on
 #   machines without a host C++ compiler.
-echo "━━━ [7/35] Native crash-field host test ━━━"
+echo "━━━ [7/36] Native crash-field host test ━━━"
 if sh "$ROOT/scripts/native/crash_fields_host_test.sh" > /tmp/minis_crash_fields_host_test.log 2>&1; then
     tail -n 2 /tmp/minis_crash_fields_host_test.log
     PASS=$((PASS + 1))
@@ -168,7 +168,7 @@ fi
 #   outside the audited allow-list is the silent path by which debug code
 #   (token-free loopback JSON-RPC on 127.0.0.1:5321) reaches release. The apk
 #   mode (below, in build-apk.yml) verifies the artifact itself.
-echo "━━━ [8/35] Debug-code release boundary (source) ━━━"
+echo "━━━ [8/36] Debug-code release boundary (source) ━━━"
 if python3 scripts/scan/debug_leak_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -184,7 +184,7 @@ fi
 #   wired. The last one compiles and runs — it just never executes, so a
 #   fresh install and an upgraded install end up with different schemas and
 #   nothing fails until a user hits the missing column.
-echo "━━━ [9/35] Room migration chain ━━━"
+echo "━━━ [9/36] Room migration chain ━━━"
 if python3 scripts/scan/room_migration_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -199,7 +199,7 @@ fi
 #   decision (wire init in that process's Application branch, or justify with
 #   `logging-ok:`). The 2026-09-18 incident: :modelservice never ran init, so
 #   the LLM-request process logged zero lines — 9 provider 400s, no trace.
-echo "━━━ [10/35] Process-logging coverage ━━━"
+echo "━━━ [10/36] Process-logging coverage ━━━"
 if python3 scripts/scan/process_logging_gate.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -215,7 +215,7 @@ fi
 #   so an int[] (or Kotlin's listOf()) makes a repeating alarm silently replay
 #   as a one-shot. No crash, no failing test, no user-visible log. The repo has
 #   two ACTION_SET_ALARM writers and they drifted apart once already.
-echo "━━━ [11/35] AlarmClock EXTRA_DAYS container type ━━━"
+echo "━━━ [11/36] AlarmClock EXTRA_DAYS container type ━━━"
 if python3 scripts/scan/extra_days_container_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -234,7 +234,7 @@ fi
 #   streaming text froze at the first composed frame (user saw the first two
 #   characters of an answer until they re-entered the session). Nothing
 #   crashed, no test failed. Fix is always `rememberUpdatedState`.
-echo "━━━ [12/35] Stale-closure guard ━━━"
+echo "━━━ [12/36] Stale-closure guard ━━━"
 if python3 scripts/scan/stale_closure_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -253,7 +253,7 @@ fi
 #   test, no log. User-reported 2026-09-20 (skill + memory editors) after the
 #   same family had been patched piecemeal 4+ times (BrowserSettingsSheet /
 #   MCPIntegrations GH#44 / EnvironmentVariables / SettingsComponents T183).
-echo "━━━ [13/35] IME-inset guard ━━━"
+echo "━━━ [13/36] IME-inset guard ━━━"
 if python3 scripts/scan/ime_inset_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -274,7 +274,7 @@ fi
 #   unreachable at once. 2026-09-20: a 1.6MB request sat 272s with no byte back.
 #   No test can catch this (it would have to wait 30 real minutes), so it has
 #   to be a static judgement.
-echo "━━━ [14/35] Stream-flow dispatch guard ━━━"
+echo "━━━ [14/36] Stream-flow dispatch guard ━━━"
 if python3 scripts/scan/stream_flow_dispatch_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -293,7 +293,7 @@ fi
 #   ok:true while every reader kept serving the primed default (128 KB) until
 #   process restart. Unobservable at runtime (no exception, no log), so it has
 #   to be a static judgement.
-echo "━━━ [15/35] Prefs listener holder guard ━━━"
+echo "━━━ [15/36] Prefs listener holder guard ━━━"
 if python3 scripts/scan/prefs_listener_holder_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -312,7 +312,7 @@ fi
 #   Sibling guard four_way_sync_check.py covers Model<->Entity<->snapshot for
 #   ProviderInstance/ModelGroup only; it does not cover this IPC hop, nor
 #   LLMModel. Any new boundary model must be registered in BOUNDARY_MODELS.
-echo "━━━ [16/35] Cross-process boundary completeness ━━━"
+echo "━━━ [16/36] Cross-process boundary completeness ━━━"
 if python3 scripts/scan/xproc_boundary_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -333,7 +333,7 @@ fi
 #   tested in the sandbox, so this gate reads the call site as text and checks
 #   the argument's PROVENANCE (following local `val` bindings, so a rename
 #   cannot defeat it).
-echo "━━━ [17/35] Thinking-level wiring guard ━━━"
+echo "━━━ [17/36] Thinking-level wiring guard ━━━"
 if python3 scripts/scan/thinking_wiring_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -352,7 +352,7 @@ fi
 #   entry whose probe was deleted is a dead ruler holding a permission slip
 #   (2026-09-22: buildFlatChatItems.ledgerReseed); (C) census call-site counts
 #   match raw counts (regex-drift guard; the D4 `[dwiev]` shape hid 47.6%).
-echo "━━━ [18/35] Liveness static guard ━━━"
+echo "━━━ [18/36] Liveness static guard ━━━"
 if python3 scripts/scan/liveness_static_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -369,7 +369,7 @@ fi
 #   can a credential reach an output through this new line? The gate flags whole
 #   URL interpolation inside log calls within the credential-bearing subtrees and
 #   keeps an audited allow-list (`--seed` regenerates it).
-echo "━━━ [19/35] Log URL redaction guard ━━━"
+echo "━━━ [19/36] Log URL redaction guard ━━━"
 if python3 scripts/scan/log_url_redaction_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -384,7 +384,7 @@ fi
 #   statement position: it compiled, logged, and recorded nothing, so a budget
 #   silently stayed at its 30 s default. Watchlist-driven, so extending it is the
 #   maintenance path when another value-returning recorder is discovered.
-echo "━━━ [20/35] Discarded-return guard ━━━"
+echo "━━━ [20/36] Discarded-return guard ━━━"
 if python3 scripts/scan/discarded_return_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -405,7 +405,7 @@ fi
 #   pre-fix tree trips B at all 7 claim sites, the post-fix tree at none.
 #   Audited-safe families carry an ALLOWED entry with its rationale; new
 #   ungated writes get `release-ok:` / `claim-ok:` or a re-audit.
-echo "━━━ [21/35] Claim/release ownership guard ━━━"
+echo "━━━ [21/36] Claim/release ownership guard ━━━"
 if python3 scripts/scan/claim_release_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -426,7 +426,7 @@ fi
 #   which is why nothing caught it. Criterion is mechanical: a numeric
 #   `loopState.<name> = 0` whose comment block claims tool-call semantics must
 #   sit inside the brace span of a `toolCalls` positive guard.
-echo "━━━ [22/35] Loop counter reset guard ━━━"
+echo "━━━ [22/36] Loop counter reset guard ━━━"
 if python3 scripts/scan/loop_counter_reset_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -449,7 +449,7 @@ fi
 #   Criterion: a `break` that follows a `t7BudgetStopReason = "<string>"`
 #   assignment inside the same brace block, and is enclosed by >= 2 loops,
 #   must carry the outermost loop's label (`break@turnLoop`).
-echo "━━━ [23/35] Budget-stop break guard ━━━"
+echo "━━━ [23/36] Budget-stop break guard ━━━"
 if python3 scripts/scan/budget_stop_break_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -473,7 +473,7 @@ fi
 #   file that registers that interface name must declare a matching arity.
 #   Checked per file, because a union across hosts is exactly what hides this
 #   bug shape.
-echo "━━━ [24/35] KaTeX bridge arity guard ━━━"
+echo "━━━ [24/36] KaTeX bridge arity guard ━━━"
 if python3 scripts/scan/katex_bridge_arity_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -483,7 +483,7 @@ else
     echo ""
 fi
 
-echo "━━━ [25/35] Gemini base version guard ━━━"
+echo "━━━ [25/36] Gemini base version guard ━━━"
 if python3 scripts/scan/gemini_base_version_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -501,7 +501,7 @@ fi
 #   same path refused through `file_write`. Criterion: a function that takes a
 #   caller-supplied path parameter and writes a host file must call the guard —
 #   unless its file is exempt WITH evidence, and rotted evidence fails loudly.
-echo "━━━ [26/35] Read-only-mount write guard ━━━"
+echo "━━━ [26/36] Read-only-mount write guard ━━━"
 if python3 scripts/scan/readonly_mount_write_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -526,7 +526,7 @@ fi
 #   catch+release+throw, the dispatch wrapper containing the main-thread check,
 #   and the calibrated `Thread.sleep(120)` settle still in place. Losing an
 #   anchor FAILS loudly rather than passing silently.
-echo "━━━ [27/35] Execution-gate guard ━━━"
+echo "━━━ [27/36] Execution-gate guard ━━━"
 if python3 scripts/scan/exec_gate_release_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -542,7 +542,7 @@ fi
 #   lock. Missing call = the deleted task keeps the in-process single-flight
 #   lock until the reaper fires (~30 min); a call nested inside the store lock
 #   inverts the lock order against the runner's checkMutex and deadlocks.
-echo "━━━ [28/35] Scheduled-task store release guard ━━━"
+echo "━━━ [28/36] Scheduled-task store release guard ━━━"
 if python3 scripts/scan/scheduled_store_release_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -557,7 +557,7 @@ fi
 #   image on the wire: OpenAI (chat + responses) dropped it entirely while both
 #   siblings already carried it, so the model saw the caption and answered blind.
 #   vision-unsupported models must emit the shared T264 placeholder instead.
-echo "━━━ [29/35] Tool-result image consumer guard ━━━"
+echo "━━━ [29/36] Tool-result image consumer guard ━━━"
 if python3 scripts/scan/tool_result_image_branch_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -573,7 +573,7 @@ fi
 #   the assistant row (canonical isStreaming=false) and the later writes are
 #   dropped by StaleStreamPublishPolicy. The turn-visibility predicate must read
 #   per-turn values, never the run-scoped accumulator.
-echo "━━━ [30/35] Turn-tail finalize order ━━━"
+echo "━━━ [30/36] Turn-tail finalize order ━━━"
 if python3 scripts/scan/turn_tail_finalize_order.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -589,7 +589,7 @@ fi
 #   cannot see what it already wrote and rewrites it -> duplicated body), and
 #   the loop-wrapping catch(Exception) must rethrow CancellationException (a
 #   user stop was otherwise recorded as a sub-agent failure).
-echo "━━━ [31/35] Sub-agent turn hand-back guard ━━━"
+echo "━━━ [31/36] Sub-agent turn hand-back guard ━━━"
 if python3 scripts/scan/subagent_handback_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -604,7 +604,7 @@ fi
 #   DURATION together), so a selection comparing it is never true -- freebusy
 #   answered "free" for windows holding a weekly occurrence. Predicates must be
 #   built on CalendarContract.Instances.
-echo "━━━ [32/35] Calendar Events nullable-column predicate guard ━━━"
+echo "━━━ [32/36] Calendar Events nullable-column predicate guard ━━━"
 if python3 scripts/scan/calendar_events_nullable_predicate_check.py --root "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -620,7 +620,7 @@ fi
 #   value-less switches (otherwise a flag eats the package and is handed to
 #   `cmd notification` as the target); `package clear --cache-only` must be a
 #   per-package clear and must report the scope it actually cleared.
-echo "━━━ [33/35] android-shizuku-cli argv guard ━━━"
+echo "━━━ [33/36] android-shizuku-cli argv guard ━━━"
 if python3 scripts/scan/shizuku_args_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -636,7 +636,7 @@ fi
 #   4096-char read boundary) finished the command with -1, which
 #   ExecutionCoordinator maps to SHELL_DIED -> shell rebuild + retry, and the
 #   remaining output of that command was discarded.
-echo "━━━ [34/35] Shell marker boundary guard ━━━"
+echo "━━━ [34/36] Shell marker boundary guard ━━━"
 if python3 scripts/scan/marker_boundary_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -652,8 +652,26 @@ fi
 #   "contains" declared in booleanFlags, tapText must propagate the click result
 #   instead of always reporting ok, and starting the recognizer twice must tear
 #   down the previous session and report the on-device state that is used.
-echo "━━━ [35/35] Accessibility CLI contract guard ━━━"
+echo "━━━ [35/36] Accessibility CLI contract guard ━━━"
 if python3 scripts/scan/a11y_handler_contract_check.py "$ROOT"; then
+    PASS=$((PASS + 1))
+    echo ""
+else
+    RC=1
+    FAIL=$((FAIL + 1))
+    echo ""
+fi
+
+# --- 36. TTS voice channel + sanitizer wiring (deep-audit-1016c FIX-E / ISSUE-07) ---
+#   android-speak --voice used to be silently overwritten by speak()'s
+#   unconditional auto-detect (zh/en binary), and the JSON body echoed the
+#   requested tag as if chosen; VoiceTextSanitizer existed with tests but had
+#   zero production call sites. This gate pins: single-point language
+#   resolution (policy + honest effective-voice report), sanitize-before-
+#   engine-call with an honest nothing_to_speak bail, and the streaming path
+#   keeping its auto-detection.
+echo "━━━ [36/36] TTS voice channel + sanitizer wiring ━━━"
+if python3 scripts/scan/tts_voice_and_sanitizer_check.py --root "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
 else
