@@ -434,6 +434,15 @@ internal suspend fun parseMarkdownBlocks(content: String): List<MdBlock> {
                     val indent = l.length - t.length
                     if (t.isEmpty()) { i++; continue }
                     if (!t.matches(bulletListItemRegex) && indent <= baseIndent) break
+                    // [crash-1016] An indented fenced code block under a list item is
+                    // a CODE BLOCK, not continuation prose: the paragraph branch below
+                    // breaks on ``` but this loop did not, so fence bodies leaked into
+                    // item.text and were rendered as inline markdown (`**` inside code
+                    // became bold, and an empty `\(`\)` span in a python regex reached
+                    // appendInlineContent as an empty alternateText and crashed the
+                    // whole app — androidx requires it non-empty). Break so the outer
+                    // loop re-enters the fenced-code branch at this line.
+                    if (t.startsWith("```")) break
                     if (indent > baseIndent && !t.matches(bulletListItemRegex)) {
                         // Continuation (indented prose) — append to last item.
                         // [fix/indented-bullet-continuation] An indented line that is
@@ -470,6 +479,10 @@ internal suspend fun parseMarkdownBlocks(content: String): List<MdBlock> {
                     val indent = l.length - t.length
                     if (t.isEmpty()) { i++; continue }
                     if (!t.matches(numberedListItemRegex) && indent <= baseIndent) break
+                    // [crash-1016] Same guard as the unordered-list loop above: an
+                    // indented fence is a code block, not continuation text — fence
+                    // bodies must not be fed to the inline renderer.
+                    if (t.startsWith("```")) break
                     if (indent > baseIndent && !t.matches(numberedListItemRegex)) {
                         // Same guard as the unordered-list branch above (see
                         // fix/indented-bullet-continuation): an indented line that is
