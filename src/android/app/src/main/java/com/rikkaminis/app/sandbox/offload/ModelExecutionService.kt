@@ -368,9 +368,17 @@ class ModelExecutionService : Service() {
                 // and thread-parking inside the runBlocking thread (the
                 // request thread is dedicated to this run, so parking it is
                 // free). On timeout publish a frame and re-enter the queue.
-                val wantsQueueFrames = runCatching {
-                    JSONObject(requestFile.readText()).optBoolean("streaming", false)
-                }.getOrDefault(false)
+                // [ISSUE-12a] Read + parse the request body ONCE per run; every
+                // consumer below reuses this capture. request.json is written
+                // exactly once by ModelExecutionDispatcher before startService
+                // and deleted only after this worker's terminal marker (which is
+                // written after the ack barrier — after the last consumer), so
+                // one capture is faithful to what each site would have read.
+                // Per-site failure semantics are carried by CapturedRequestBody:
+                // the queue-frame/ack-barrier sites degrade to false, the formal
+                // read re-throws into the catch → model_use_failed below.
+                val requestBody = CapturedRequestBody.capture { requestFile.readText() }
+                val wantsQueueFrames = requestBody.streamingFlagOrFalse()
                 if (wantsQueueFrames) {
                     var lastPublished = -1
                     while (!executionSlots.tryAcquire(QUEUE_FRAME_POLL_MS, java.util.concurrent.TimeUnit.MILLISECONDS)) {
@@ -390,14 +398,14 @@ class ModelExecutionService : Service() {
                 try {
                     synchronized(lifecycleLock) { queuedRequests.decrementAndGet() }
                     try {
-                        val requestText = requestFile.readText()
-                        val isStreaming = JSONObject(requestText).optBoolean("streaming", false)
+                        val req = requestBody.jsonOrThrow()
+                        val isStreaming = req.optBoolean("streaming", false)
                         if (isStreaming) {
                             // TF-I: streaming exec writes the result and closes
                             // the stream INSIDE the lock (serialized provider
                             // network), but does NOT wait for the client ack —
                             // that barrier runs outside below.
-                            executeStreamingRun(requestText, dir)
+                            executeStreamingRun(req, dir)
                         } else {
                             // TF-J2: non-streaming worker beats liveness too.
                             // start() is idempotent; the beat is stopped in the
@@ -408,7 +416,7 @@ class ModelExecutionService : Service() {
                             // only once the beat goes silent after terminal.
                             heartbeat.start()
                             ModelExecutionRunDir.writeReady(dir)
-                            val result = executeRun(requestText, dir)
+                            val result = executeRun(req, dir)
                             writeResultAtomically(dir, result)
                             Log.i(TAG, "result written ($result.length bytes), pid=${android.os.Process.myPid()}")
                         }
@@ -439,9 +447,7 @@ class ModelExecutionService : Service() {
                 // call, never to a sleeping ack-wait. finalize must run after
                 // the barrier so its quiescence check sees the released (or
                 // held-on-timeout) ACK token.
-                val isStreaming = runCatching {
-                    JSONObject(requestFile.readText()).optBoolean("streaming", false)
-                }.getOrDefault(false)
+                val isStreaming = requestBody.streamingFlagOrFalse()
                 try {
                     if (isStreaming) {
                         awaitStreamAckBarrier(dir)
@@ -791,8 +797,9 @@ class ModelExecutionService : Service() {
         }
     }
 
-    private fun executeRun(requestJson: String, dir: File): String {
-        val req = JSONObject(requestJson)
+    private fun executeRun(req: JSONObject, dir: File): String {
+        // [ISSUE-12a] `req` is pre-parsed by the caller (CapturedRequestBody) —
+        // the duplicate parse of the multi-MB body is gone.
         // [T-worker-thinking-rules-restore] Restore this instance's custom thinking
         // rules from the request JSON BEFORE building the provider — the worker
         // process never touches ProviderRepository, so the resolver cache is empty
@@ -1187,7 +1194,7 @@ class ModelExecutionService : Service() {
      *  - On cancel (main process creates [dir]/[CANCEL_FILE]): aborts the stream, writes an error line so
      *    the client's Flow terminates (hardened-3: cancellation propagation).
      */
-    private fun executeStreamingRun(requestJson: String, dir: File) {
+    private fun executeStreamingRun(req: JSONObject, dir: File) {
         val streamFile = File(dir, STREAM_FILE)
         val cancelFile = File(dir, CANCEL_FILE)
         val runId = runIdOf(dir)
@@ -1206,7 +1213,8 @@ class ModelExecutionService : Service() {
                 output!!.append(line).append('\n')
                 output!!.flush()
             }
-            val req = JSONObject(requestJson)
+            // [ISSUE-12a] `req` arrives pre-parsed (CapturedRequestBody) — this
+            // path used to re-parse the same multi-MB body a second time.
             // [T-worker-thinking-rules-restore] Same restore as executeRun — the
             // streaming path is the main chat path, where the sensenova clamp bug
             // was observed live.
@@ -2073,3 +2081,46 @@ internal class UnknownEnumValueException(
     val enumClass: String,
     val unknownValue: String,
 ) : RuntimeException("unknown $enumClass value: $unknownValue")
+
+/**
+ * [ISSUE-12a] One run's request body, read from disk and parsed exactly once.
+ *
+ * The old flow read `request.json` three times (queue-frame decision, formal
+ * read, ack-barrier decision) and parsed it at each site — 2 redundant reads
+ * and 2 redundant parses of a body that can reach several MB (base64 input
+ * images). request.json is written exactly once by ModelExecutionDispatcher
+ * before startService, and is deleted only after this worker's terminal
+ * marker — which is written after the ack barrier, i.e. after the last
+ * consumer — so a single capture is faithful to what every site would have
+ * observed.
+ *
+ * Each consumer site's failure semantics are preserved exactly:
+ *  - [streamingFlagOrFalse]: a read OR parse failure degrades to `false`.
+ *    Matches the old `runCatching { JSONObject(readText()) }.getOrDefault(false)`
+ *    at the queue-frame and ack-barrier sites.
+ *  - [jsonOrThrow]: a read OR parse failure is re-thrown, landing in the
+ *    run's catch → `model_use_failed` result. Matches the old formal-read
+ *    site, where `readText()` / `JSONObject()` threw inside the try.
+ *
+ * The one deliberate delta: when the first read fails, the formal-read site
+ * no longer gets a second IO attempt. The file is write-once (see above), so
+ * a retry could only succeed through a transient fs hiccup — and the failure
+ * still converges to the same structured `model_use_failed` result the old
+ * code produced.
+ */
+internal class CapturedRequestBody private constructor(
+    private val json: Result<JSONObject>,
+) {
+    /** Queue-frame / ack-barrier sites: any read/parse failure → `false`. */
+    fun streamingFlagOrFalse(): Boolean =
+        json.map { it.optBoolean("streaming", false) }.getOrDefault(false)
+
+    /** Formal-read site: the original read/parse failure is re-thrown. */
+    fun jsonOrThrow(): JSONObject = json.getOrThrow()
+
+    companion object {
+        /** Reads via [read] exactly once and parses exactly once. */
+        fun capture(read: () -> String): CapturedRequestBody =
+            CapturedRequestBody(runCatching { JSONObject(read()) })
+    }
+}
