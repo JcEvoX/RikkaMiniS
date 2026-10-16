@@ -101,6 +101,17 @@ class BrowserUseOffloadHandler(private val app: MinisApp) : NativeOffloadHandler
                     // YOLO single-tab mode so every tab-less action sticks to the
                     // selected tab. Explicit --tab-id still routes normally.
                     // Mirrors iOS BrowserUseOffloadBridge passing singleTab=true.
+                    //
+                    // [deep-audit-1016 9c] Point the shared pool at the
+                    // requesting chat session before executing. The pool is an
+                    // app-scoped singleton whose session is pinned at startup to
+                    // the placeholder "minis-browser-use", so without this every
+                    // minis:// resolution and every download landed under
+                    // minis-sessions/minis-browser-use/ instead of the caller's
+                    // own session dir. Context-only bind — it does not load the
+                    // session's persisted tab state (see
+                    // BrowserTabPool.bindSessionContextOnly).
+                    input.sessionId?.let { app.sharedBrowserTabPool.bindSessionContextOnly(it) }
                     app.sharedBrowserTabPool.execute(input, singleTab = true)
                 }
             }

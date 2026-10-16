@@ -368,6 +368,48 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
         loadSavedState()
     }
 
+    /**
+     * [deep-audit-1016 9c] Re-point this pool at [sessionId] *without* loading
+     * that session's persisted tab state.
+     *
+     * The shared shell pool (`MinisApp.sharedBrowserTabPool`) is built once at
+     * app start and its session is pinned there to the placeholder
+     * "minis-browser-use", so every `minis-browser-use` call used to resolve
+     * minis:// through the placeholder (`PRootKernel.resolvePathForSession`)
+     * and download into `minis-sessions/minis-browser-use/workspace` — the
+     * caller's own files were invisible to the session that asked for them.
+     * Live A/B measured before this fix: `minis-browser-use navigate --url
+     * minis://workspace/probe.html` answered `File not found:
+     * workspace/probe.html`, while the built-in browser_use tool (a
+     * per-ChatViewModel pool, bound through [setSession]) loaded the identical
+     * URL and reported its title.
+     *
+     * Deliberately NOT [setSession]: that one also runs [loadSavedState], whose
+     * job is to materialise the *new* session's `browser_tabs/<sid>.json` — it
+     * schedules [restoreSavedTabs] and re-applies that session's viewport
+     * override. Both are right at a real session boundary (a pool belongs to
+     * one session for its lifetime) and wrong here: the CLI driver is a
+     * long-lived cross-session pool, so loading state on every call would drag
+     * the chat session's saved tabs into the driver's own tab list.
+     *
+     * Concurrency: the pool stays one shared instance, so a binding is
+     * last-writer-wins — two chat sessions running `minis-browser-use`
+     * simultaneously share one tab list and one binding, exactly as they
+     * already shared one tab list. Per-session pools would remove that
+     * coupling but change the pool's identity and lifetime (out of scope).
+     */
+    fun bindSessionContextOnly(sessionId: String) {
+        val decision = BrowserSessionBinding.decideRebind(this.sessionId, sessionId)
+        if (!decision.rebind) return
+        this.sessionId = sessionId
+        _tabs.value.forEach { it.manager.minisSessionId = sessionId }
+        if (decision.resetViewport) {
+            _sessionViewportWidth.value = 0
+            _sessionViewportHeight.value = 0
+        }
+        Log.i(TAG, "Bound shared browser pool to session ${sessionId.take(12)}")
+    }
+
     // -- Downloads --
 
     /** UI state for the browser sheet's download banner. progress < 0 = indeterminate. */
@@ -1562,6 +1604,12 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
                 // re-pointed pool doesn't carry the old session's tabs into
                 // saveState or implicit-tab restore.
                 savedURLs.clear()
+                // [deep-audit-1016 9d] Same reason for the session viewport:
+                // the override belongs to the session we are leaving, and this
+                // branch used to leave it applied, so the next session silently
+                // inherited a size it never set.
+                _sessionViewportWidth.value = 0
+                _sessionViewportHeight.value = 0
                 return
             }
             val json = JSONObject(file.readText())
@@ -1599,9 +1647,16 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
             // back to the global custom viewport / UA profile default.
             val w = json.optInt("sessionViewportWidth", 0)
             val h = json.optInt("sessionViewportHeight", 0)
-            if (w > 0 && h > 0) {
-                _sessionViewportWidth.value = w
-                _sessionViewportHeight.value = h
+            // [deep-audit-1016 9d] Always write the restored override, including
+            // the "none" case: the old `if (w > 0 && h > 0)` guard left a
+            // previous session's size in place whenever the new session had no
+            // (or a degenerate 0) override, so a re-pointed pool kept a viewport
+            // the new session never set. 0/0 means "no override" and falls back
+            // to the global custom viewport / UA profile default.
+            val restoredViewport = BrowserSessionBinding.viewportForLoadedSession(w, h)
+            _sessionViewportWidth.value = restoredViewport.width
+            _sessionViewportHeight.value = restoredViewport.height
+            if (restoredViewport.hasOverride) {
                 // Re-apply to any live tabs that predate load (rare). At
                 // session-load time we're not in a suspend context and the
                 // usual case has zero live tabs, so fire-and-forget is
@@ -1648,5 +1703,61 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
 
     private fun updateTabs() {
         _tabs.value = _tabs.value.toList()
+    }
+}
+
+/**
+ * [deep-audit-1016 9c/9d] Pure decision core for the shared shell browser
+ * pool's session binding and for the session-scoped viewport.
+ *
+ * Split out of [BrowserTabPool] so both rules are JVM-testable without a
+ * WebView or a Context — the same reason
+ * [com.rikkaminis.app.ui.chat.AgentLoopExitDecision] lives on its own.
+ */
+internal object BrowserSessionBinding {
+
+    /** What re-pointing a pool from [current] to [next] implies. */
+    data class Rebind(
+        /** False when the pool is already pointed at [next] (no-op call). */
+        val rebind: Boolean,
+        /**
+         * True when the session-scoped viewport override must be dropped: the
+         * stored value belongs to the session being left, and this path
+         * deliberately does not load the new session's state.
+         */
+        val resetViewport: Boolean,
+    )
+
+    /**
+     * Re-binding to the SAME session must be a no-op: the pool's tabs, its
+     * persisted state and its viewport override all already belong to that
+     * session, and a repeated `minis-browser-use` call inside one turn must not
+     * throw the override away (`set_viewport` … `get_page_info` is a multi-call
+     * sequence).
+     *
+     * A null [current] (pool never bound) counts as a change.
+     */
+    fun decideRebind(current: String?, next: String): Rebind {
+        if (current == next) return Rebind(rebind = false, resetViewport = false)
+        return Rebind(rebind = true, resetViewport = true)
+    }
+
+    /** A session viewport override; `0 × 0` means "no override". */
+    data class Viewport(val width: Int, val height: Int) {
+        val hasOverride: Boolean get() = width > 0 && height > 0
+    }
+
+    /**
+     * The override a freshly loaded session state yields, given the two
+     * persisted values. Anything that is not a complete positive pair — absent
+     * keys, a degenerate 0, a corrupt negative — collapses to `0 × 0` rather
+     * than being skipped by the caller, because "the new session has no
+     * override" and "keep the previous session's override" must not be the same
+     * code path.
+     */
+    fun viewportForLoadedSession(persistedWidth: Int, persistedHeight: Int): Viewport {
+        val w = persistedWidth.coerceAtLeast(0)
+        val h = persistedHeight.coerceAtLeast(0)
+        return if (w > 0 && h > 0) Viewport(w, h) else Viewport(0, 0)
     }
 }
