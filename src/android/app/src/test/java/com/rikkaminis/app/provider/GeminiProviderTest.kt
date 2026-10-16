@@ -362,6 +362,75 @@ class GeminiProviderTest {
         assertEquals(3, usageChunks[0].usage.outputTokens)
     }
 
+    // -- [deep-audit-1016 ISSUE-01] every base shape must reach a versioned path --
+
+    // Ground truth for the shape under test (probed 2026-10-16 from a non-blocked egress,
+    // bogus key): "/models/<id>:generateContent" -> 404 (path missing),
+    // "/v1beta/models/<id>:generateContent" -> 400 "API key not valid" (path exists).
+    // Before the fix every shape below produced the 404 path — official base included.
+
+    private fun nonStreamingPathFor(base: String): String = runBlocking {
+        val p = GeminiProvider(apiKey = "test-key", model = LLMModel.gemini25Flash, basePath = base)
+        server.enqueue(MockResponse().setBody("""{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}"""))
+        p.sendMessage(listOf(LLMMessage(LLMMessage.Role.USER, "hi")), null, 100)
+        server.takeRequest().path!!
+    }
+
+    private fun streamingPathFor(base: String): String = runBlocking {
+        val p = GeminiProvider(apiKey = "test-key", model = LLMModel.gemini25Flash, basePath = base)
+        server.enqueue(
+            MockResponse()
+                .setBody("""data: {"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}""" + "\n\n")
+                .setHeader("Content-Type", "text/event-stream"),
+        )
+        p.streamMessage(listOf(LLMMessage(LLMMessage.Role.USER, "hi")), null, 100).toList()
+        server.takeRequest().path!!
+    }
+
+    private fun baseShapes(): List<Pair<String, String>> {
+        val origin = server.url("/").toString().trimEnd('/')
+        return listOf(
+            "bare host (what a fresh instance passes)" to origin,
+            "official v1beta" to "$origin/v1beta",
+            "openai-shaped v1" to "$origin/v1",
+            "v1beta + appendV1Suffix" to "$origin/v1beta/v1",
+            "doubled v1 then v1beta" to "$origin/v1/v1beta",
+            "trailing slash" to "$origin/v1beta/",
+            "deep relay path" to "$origin/relay/gemini/v1beta",
+        )
+    }
+
+    @Test
+    fun `sendMessage targets a single versioned path for every base shape`() {
+        for ((label, base) in baseShapes()) {
+            val path = nonStreamingPathFor(base)
+            assertTrue("[$label] expected /v1beta/... but got $path",
+                path.startsWith("/v1beta/models/gemini-2.5-flash:generateContent?key=test-key"))
+            assertTrue("[$label] duplicated version segment in $path", !path.contains("/v1beta/v1/"))
+            assertTrue("[$label] doubled slash before models in $path", !path.contains("//models"))
+        }
+    }
+
+    @Test
+    fun `streamMessage targets a single versioned path for every base shape`() {
+        for ((label, base) in baseShapes()) {
+            val path = streamingPathFor(base)
+            assertTrue("[$label] expected /v1beta/... but got $path",
+                path.startsWith("/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=test-key"))
+            assertTrue("[$label] duplicated version segment in $path", !path.contains("/v1beta/v1/"))
+            assertTrue("[$label] doubled slash before models in $path", !path.contains("//models"))
+        }
+    }
+
+    @Test
+    fun `deep relay path keeps its prefix and gains one version segment`() {
+        val origin = server.url("/").toString().trimEnd('/')
+        assertEquals(
+            "/relay/gemini/v1beta/models/gemini-2.5-flash:generateContent?key=test-key",
+            nonStreamingPathFor("$origin/relay/gemini/v1beta"),
+        )
+    }
+
     // -- Error handling --
 
     @Test(expected = LLMError.InvalidApiKey::class)
