@@ -227,6 +227,30 @@ class MinisMainDocGateTest {
                 "target — passing the target would make every minis:// url trust itself:\n$hook",
             hook.contains("MinisMainDocGate.allowsTopLevelNavigation(lastMainDocUrl, urlStr)"),
         )
+        // Reachability, not mere presence. `if (false && …)` — or any other term
+        // spliced in ahead of the gate — keeps the call text while disabling the
+        // guard, and no runtime arm can see it: those exercise the gate directly.
+        // Only the source shape can pin that the gate IS the branch condition.
+        assertTrue(
+            "the guard must be the branch condition itself, not an unreachable term " +
+                "(a dead `&&` prefix keeps the call text and drops the check):\n$hook",
+            Regex(
+                "if \\(request\\.isForMainFrame &&\\s*" +
+                    "!MinisMainDocGate\\.allowsTopLevelNavigation\\(lastMainDocUrl, urlStr\\)",
+            ).containsMatchIn(hook),
+        )
+        // A guard whose block does not return still lets the navigation through to
+        // the fall-through path, so the refusal has to be in the block itself.
+        val guardAt = hook.indexOf(
+            "!MinisMainDocGate.allowsTopLevelNavigation(lastMainDocUrl, urlStr)",
+        )
+        val guardEnd = hook.indexOf("\n                }", guardAt)
+        val guardBody = hook.substring(guardAt, if (guardEnd > 0) guardEnd else hook.length)
+        assertTrue(
+            "the guard must actually refuse the navigation — its block must return " +
+                "true, otherwise it falls through and the page wins anyway:\n$guardBody",
+            guardBody.contains("return true"),
+        )
         assertFalse(
             "the guard must not read the incoming target as its trust input",
             hook.contains("allowsTopLevelNavigation(urlStr"),
