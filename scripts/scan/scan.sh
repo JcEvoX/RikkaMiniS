@@ -485,6 +485,14 @@ fi
 
 echo "━━━ [25/28] Gemini base version guard ━━━"
 if python3 scripts/scan/gemini_base_version_check.py "$ROOT"; then
+    PASS=$((PASS + 1))
+    echo ""
+else
+    RC=1
+    FAIL=$((FAIL + 1))
+    echo ""
+fi
+
 # --- 25. Read-only-mount write guard (call-site coverage) ---
 #   Added 2026-10-16 (deep-audit FIX-C 2b). `isLinuxPathUnderReadOnlyMount` is
 #   the contract every host-file write site must consult; T219 wired it into
@@ -495,6 +503,14 @@ if python3 scripts/scan/gemini_base_version_check.py "$ROOT"; then
 #   unless its file is exempt WITH evidence, and rotted evidence fails loudly.
 echo "━━━ [26/28] Read-only-mount write guard ━━━"
 if python3 scripts/scan/readonly_mount_write_guard.py "$ROOT"; then
+    PASS=$((PASS + 1))
+    echo ""
+else
+    RC=1
+    FAIL=$((FAIL + 1))
+    echo ""
+fi
+
 # --- 25. Execution-gate guard (heavy-permit rollback / interruptible waits) ---
 #   Added 2026-10-16 (deep-audit-1016 FIX-D). Three properties of
 #   ExecutionCoordinator's two shell semaphores that no compiler or unit test
