@@ -208,8 +208,27 @@ object NativeOffloadServer {
                 "previous process holding the namespace?",
             )
         serverSocket = s
+        // [ISSUE-12b] Thread creation for this generation is owned by the pool:
+        // it spawns a worker only while a permit is free (non-blocking
+        // tryAcquire) and the worker returns the permit when it drains empty —
+        // so an idle server holds zero worker threads, while a burst can never
+        // exceed the permit cap the rest of the memory budgeting was sized for.
+        val pool = BoundedWorkerPool<LocalSocket>(
+            permits = workerConcurrency,
+            threadName = "native-offload-worker",
+            spawnThread = { name, body -> thread(name = name, isDaemon = true) { body() } },
+            handler = { client, queueMs ->
+                try {
+                    handleClient(client, queueMs)
+                } catch (e: Exception) {
+                    Log.w(TAG, "worker error: ${e.message}", e)
+                } finally {
+                    try { client.close() } catch (_: Exception) {}
+                }
+            },
+        )
         acceptThread = thread(name = "native-offload-accept", isDaemon = true) {
-            runAcceptLoop(s)
+            runAcceptLoop(s, pool)
         }
         Log.i(TAG, "listening on abstract socket '$SOCKET_NAME' " +
             "handlers=${handlers.keys.sorted()} tmpDir=${rootfsTmpDir?.absolutePath}")
@@ -240,7 +259,7 @@ object NativeOffloadServer {
         tmpLedger.clearAll()
     }
 
-    private fun runAcceptLoop(s: LocalServerSocket) {
+    private fun runAcceptLoop(s: LocalServerSocket, pool: BoundedWorkerPool<LocalSocket>) {
         while (true) {
             val client = try {
                 s.accept()
@@ -249,35 +268,15 @@ object NativeOffloadServer {
                 return
             }
             Log.d(TAG, "accepted client from proot extension")
-            thread(name = "native-offload-worker", isDaemon = true) {
-                // [native-rss-tool-guard] Bounded concurrency: acquire the
-                // worker slot BEFORE reading the frame so a burst of
-                // concurrent offload requests queues here instead of each
-                // spawning an unbounded handler thread that bloats native
-                // heap. The slot is released on every exit path (success,
-                // decode error, handler throw) so one bad client can't leak
-                // the worker permit.
-                val queueStartNs = System.nanoTime()
-                val acquired = try {
-                    workerConcurrency.acquire()
-                } catch (e: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    runCatching { client.close() }
-                    return@thread
-                }
-                // [audit-cs0913] Time spent waiting for a slot — reported by
-                // handleClient (see OffloadQueuePolicy). Pool size is
-                // ConcurrencyPrefs.maxConcurrentSessions() (default 2).
-                val queueMs = (System.nanoTime() - queueStartNs) / 1_000_000
-                try {
-                    handleClient(client, queueMs)
-                } catch (e: Exception) {
-                    Log.w(TAG, "worker error: ${e.message}", e)
-                } finally {
-                    workerConcurrency.release()
-                    try { client.close() } catch (_: Exception) {}
-                }
-            }
+            // [ISSUE-12b] The accept loop no longer spawns one OS thread per
+            // connection (and no longer blocks, so `serverSocket.close()` keeps
+            // interrupting `accept()` exactly as before). It hands the socket to
+            // the bounded pool, which spawns a worker ONLY while a permit is
+            // free and queues excess clients as cheap FIFO entries — a parked
+            // thread costs a ~1 MB native stack, a queued socket entry
+            // effectively nothing. Arrival order, the concurrency cap and the
+            // back-pressure measurement are unchanged.
+            pool.submit(client)
         }
     }
 
@@ -410,4 +409,95 @@ object NativeOffloadServer {
         writeLEInt(bytes.size)
         if (bytes.isNotEmpty()) write(bytes)
     }
+}
+
+/**
+ * [ISSUE-12b] Bounded transient worker pool backing [NativeOffloadServer].
+ *
+ * The old accept loop spawned one `thread {}` per accepted connection and let
+ * that thread block on the concurrency semaphore — so a burst of N
+ * offloads created N OS threads (each parking on a ~1 MB native stack) while
+ * only 2 made progress. The [native-rss-tool-guard] comment promised "queues
+ * here instead of spawning an unbounded handler thread", but the queue was
+ * implemented as parked threads.
+ *
+ * This pool makes that promise real, with the semaphore still the single
+ * bound mechanism (sized in `start()` from ConcurrencyPrefs, unchanged):
+ *  - at most `permits.availablePermits()+in-flight` — i.e. exactly the permit
+ *    count — worker threads exist at any moment: a submit spawns a worker only
+ *    via non-blocking `tryAcquire()`, and the worker holds that permit until
+ *    it drains the queue empty and releases it on exit;
+ *  - excess clients wait as FIFO queue entries (arrival order preserved, the
+ *    same order the old fair semaphore gave);
+ *  - workers are transient: a drained pool holds zero threads, so an idle
+ *    server costs no native stack (the D-2 memory rationale, kept);
+ *  - no accepted client is ever lost: the submit side (enqueue + tryAcquire)
+ *    and the worker-exit side (poll-empty + release) run under the same lock,
+ *    so a submit either sees a free permit and spawns, or sees a live worker
+ *    that is guaranteed to poll the just-enqueued entry;
+ *  - the accept thread never blocks on permits, so `stop()`'s
+ *    `serverSocket.close()` keeps interrupting `accept()` exactly as before;
+ *  - a throwing handler neither strands the queue nor leaks the permit (the
+ *    old per-connection worker released in a `finally`): the worker keeps
+ *    draining, then rethrows the first failure after it exits.
+ *
+ * `queueMs` handed to [handler] keeps [OffloadQueuePolicy]'s meaning — time
+ * spent waiting for a worker slot ([audit-cs0913] back-pressure report),
+ * measured accept→pickup instead of thread-start→acquire: the same wait,
+ * end to end.
+ */
+internal class BoundedWorkerPool<T>(
+    private val permits: java.util.concurrent.Semaphore,
+    private val threadName: String,
+    private val spawnThread: (name: String, body: () -> Unit) -> Unit,
+    private val handler: (item: T, queueMs: Long) -> Unit,
+) {
+    private class Entry<T>(val item: T, val enqueuedNs: Long)
+
+    private val lock = Any()
+    private val pending = java.util.ArrayDeque<Entry<T>>()
+
+    /** FIFO enqueue; spawns a worker only when a permit is free. */
+    fun submit(item: T) {
+        val spawn = synchronized(lock) {
+            pending.addLast(Entry(item, System.nanoTime()))
+            permits.tryAcquire()
+        }
+        if (spawn) {
+            spawnThread(threadName) { drain() }
+        }
+    }
+
+    private fun drain() {
+        var firstFailure: Throwable? = null
+        while (true) {
+            val entry = synchronized(lock) {
+                pending.pollFirst() ?: run {
+                    // No work left: hand the permit back so a future submit
+                    // can spawn again. Poll-empty + release are atomic w.r.t.
+                    // submit's enqueue + tryAcquire — that is what makes
+                    // "enqueue sees a permit-less world with no live worker"
+                    // impossible.
+                    permits.release()
+                    null
+                }
+            } ?: break
+            try {
+                handler(entry.item, (System.nanoTime() - entry.enqueuedNs) / 1_000_000)
+            } catch (t: Throwable) {
+                // A throwing handler must neither strand the queue nor leak the
+                // permit — the old per-connection worker released in a finally
+                // for exactly this reason. Keep draining (the production
+                // wiring already logs each handler error), remember the first
+                // failure and rethrow it once this worker exits, so an
+                // unhandled Error still reaches the thread's default handler
+                // instead of being swallowed.
+                if (firstFailure == null) firstFailure = t
+            }
+        }
+        firstFailure?.let { throw it }
+    }
+
+    /** Diagnostics / tests only: entries still waiting for a worker. */
+    val pendingCount: Int get() = synchronized(lock) { pending.size }
 }
