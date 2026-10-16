@@ -261,12 +261,48 @@ internal object HeadlessChatRunner {
         }
         for (att in attachments) vm.addAttachment(att)
         vm.sendMessage(text)
-        if (!wait) return@withContext PromptResult(status = "Running", responseText = null, timedOut = false)
-
-        // Wait for isStreaming to be false (sendMessage flips it true synchronously
-        // before launching its coroutine; if it never flips true the message was
-        // dropped — return immediately as Completed-but-empty).
+        // [da1016 B-7b] `sendMessage` claims `_isStreaming` SYNCHRONOUSLY and
+        // only after every pre-flight gate (the "send _isStreaming=true (sync)"
+        // site in ChatViewModel.sendMessage — minted AFTER the safe-mode /
+        // no-provider / compacting / context-exhausted / blank-input gates); a
+        // send that is dropped returns *before* that line, so nothing will
+        // ever stream and no settle signal will ever arrive. Reading the flag
+        // here (same Main dispatcher, straight after the call) therefore
+        // answers "did a run actually start?".
+        //
+        // Pre-fix the `!wait` branch returned "Running" unconditionally: the
+        // scheduler's fire() then held its in-process single-flight lock until
+        // reapAbandonedDispatch's deadline+grace expired (30 min for a default
+        // task), blocking every other task in the meantime.
+        //
+        // Residual window: a drop that happens INSIDE the launched coroutine
+        // (awaitAutoCompactIfNeeded, ensureSession failure) still reports
+        // "Running" — reapAbandonedDispatch is its backstop. A run that starts
+        // *and* finishes before we read the flag cannot happen: the streaming
+        // Job is created by an IO coroutine, which only runs after this
+        // function returns to its suspension point.
         val started = vm.isStreaming.value
+        if (!wait) {
+            return@withContext if (started) {
+                PromptResult(status = "Running", responseText = null, timedOut = false)
+            } else {
+                // Status strings are a contract: ScheduledTaskRunner settles
+                // any status != "Running" as RESULT_ERROR (and no longer sits
+                // on the lock), while the offload/CLI and debug-RPC layers pass
+                // the string through verbatim. Reuse the existing "Error"
+                // value — plus a reason in responseText, the same shape as
+                // "no_provider_resolved_in_5s" — instead of minting a new word.
+                PromptResult(
+                    status = "Error",
+                    responseText = "send_dropped_before_stream",
+                    timedOut = false,
+                )
+            }
+        }
+
+        // Wait for isStreaming to be false. `started` was read above; when it is
+        // false the message was dropped (or completed before we returned to the
+        // suspension point) — fall through to drain.
         if (!started) {
             // Either dropped (e.g. compacting in flight) or completed before we
             // returned to the suspension point — fall through to drain.

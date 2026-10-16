@@ -111,6 +111,76 @@ object ScheduledTaskRunner {
         }
     }
 
+    /**
+     * [da1016 B-7c] The persisted task set changed: tasks were deleted, or the
+     * whole document was replaced by a backup restore. Called by
+     * [ScheduledTasksStore] — the single funnel every mutation of the stored
+     * task list goes through.
+     *
+     * The store clears the persisted `running` marker for those runs
+     * ([ScheduledTasksStore.deleteTask] / [ScheduledTasksStore.importDocument]),
+     * but the in-process bookkeeping ([runningTaskId] + [dispatched]) survived
+     * the deletion: the deleted task kept the single-flight lock until
+     * [reapAbandonedDispatch]'s deadline+grace (30 min for a default task) and
+     * every other task degraded to `overlap`, while a backup restore left the
+     * lock pointing at a task the restored document knows nothing about.
+     *
+     * What this does NOT do: it does not cancel the in-flight run. A deleted
+     * task's headless run keeps streaming into its own session and finishes on
+     * its own; it merely stops being *managed* — its session is dropped from
+     * [dispatched], so a late `onSessionSettled` is ignored instead of
+     * settling (or resurrecting) a task that no longer exists
+     * ([ScheduledTaskTransitions.completeRun] would no-op for a deleted id, but
+     * a restore can legally re-create the same id, and then the late settle
+     * would count a run this process never dispatched).
+     *
+     * @param removedTaskIds task ids that disappeared from the document, or
+     *   `null` when the whole document was replaced (backup restore) — then
+     *   every in-process run is released.
+     *
+     * LOCK ORDER (do not call this while holding [ScheduledTasksStore]'s
+     * mutex): this takes [checkMutex], which [checkAndFireToday] holds across a
+     * whole fire pass — and a fire pass calls back into the store
+     * (`markRunning`). Release first, then notify: the stores' call sites do
+     * exactly that, and `scripts/scan/scheduled_store_release_guard.py` fails
+     * if a call ever moves inside the store lock.
+     */
+    suspend fun onTasksRemoved(removedTaskIds: Set<String>?) {
+        checkMutex.withLock {
+            val snapshot = dispatched.toMap()
+            val plan = InMemoryRunBookkeeping.planRemoval(
+                InMemoryRunBookkeeping.State(
+                    runningTaskId = runningTaskId,
+                    dispatchedTaskIdBySession = snapshot.mapValues { it.value.taskId },
+                ),
+                removedTaskIds = removedTaskIds,
+            )
+            if (plan.isEmpty) return@withLock
+            AppLogger.info(
+                TAG,
+                "release removed=${removedTaskIds?.joinToString(",") ?: "all"} " +
+                    "sessions=${plan.dropSessions.size} lockReleased=${plan.clearRunningTaskId}",
+            )
+            for (sid in plan.dropSessions) {
+                // Compare-and-remove: only drop the exact dispatch we decided
+                // about. (Removal by key alone would be equivalent today — a
+                // scheduled run gets a freshly created session id and never
+                // reuses one — but the CAS keeps that independent of the
+                // session-creation path.)
+                val expected = snapshot[sid] ?: continue
+                if (dispatched.remove(sid, expected)) {
+                    // The abandoned run already snapshotted its budget at run
+                    // entry (AgentLoopEngine reads the ceiling once, at
+                    // runAgentLoop ENTER), so clearing now cannot loosen a live
+                    // run's caps — while leaving it would leak one entry per
+                    // released run for the life of the process.
+                    AgentRunBudgetCeilings.clear(sid)
+                }
+            }
+            if (plan.clearRunningTaskId) runningTaskId = null
+        }
+    }
+
     // ------------------------------------------------------------------
     // Check pass
     // ------------------------------------------------------------------
@@ -199,10 +269,13 @@ object ScheduledTaskRunner {
             AppLogger.info(TAG, "fire task=${task.id} session=$sid")
             MemorySpikeRecorder.onEvent(TAG, "fire task=${task.id}")
 
-            // wait=false: returns "Running" once the message is handed to the
-            // VM, or an error status when the send path refused it. Completion
-            // arrives via onSessionSettled(); a run that never started is
-            // reaped on a later beat.
+            // wait=false: returns "Running" once the message actually started a
+            // stream, or "Error" (+ a responseText reason) when the send path
+            // refused it — the headless runner reads `isStreaming` right after
+            // sendMessage (B-7b), so a dropped send no longer reports
+            // "Running" and no longer holds the single-flight lock until the
+            // reaper fires. Completion arrives via onSessionSettled(); a run
+            // that dies mid-flight is reaped on a later beat.
             val result = ChatMutationMethods.prompt(
                 app,
                 JSONObject().apply {
@@ -214,7 +287,11 @@ object ScheduledTaskRunner {
             val status = result.optString("status", "")
             if (status != "Running") {
                 if (dispatched.remove(sid) != null) {
-                    AppLogger.warning(TAG, "dispatch produced no stream task=${task.id} status=$status")
+                    AppLogger.warning(
+                        TAG,
+                        "dispatch produced no stream task=${task.id} status=$status " +
+                            "reason=${result.optString("responseText", "")}",
+                    )
                     finalizeRun(app, task.id, ScheduledTask.RESULT_ERROR, sid)
                 }
             }
@@ -306,5 +383,65 @@ object ScheduledTaskRunner {
                     AppLogger.info(TAG, "miss task=${v.taskId} reason=window-passed")
                 }
         }
+    }
+}
+
+/**
+ * [da1016 B-7c] Pure decision core for releasing the runner's IN-PROCESS
+ * single-flight bookkeeping when the persisted task set changes (task deleted
+ * / document replaced by a backup restore). Kept as a separate pure object —
+ * the same file-placing convention as `ScheduledTaskTransitions` inside
+ * `ScheduledTaskPolicy.kt` — so the JVM tests can drive every branch without
+ * instantiating the Android-bound runner.
+ *
+ * Input is a *snapshot*; the runner applies the plan with compare-and-remove
+ * so a concurrent settle/reap still wins its own race against this release.
+ */
+internal object InMemoryRunBookkeeping {
+
+    /** @param dispatchedTaskIdBySession sessionId → the taskId it is running for. */
+    data class State(
+        val runningTaskId: String?,
+        val dispatchedTaskIdBySession: Map<String, String>,
+    )
+
+    /**
+     * @param dropSessions session ids whose dispatch entries must be removed
+     *   (so a late settle finds nothing and is ignored).
+     * @param clearRunningTaskId whether [State.runningTaskId] must be cleared
+     *   (freeing the single-flight lock for other tasks).
+     */
+    data class Plan(
+        val dropSessions: List<String>,
+        val clearRunningTaskId: Boolean,
+    ) {
+        val isEmpty: Boolean get() = dropSessions.isEmpty() && !clearRunningTaskId
+    }
+
+    /**
+     * Decide what in-process state must be released.
+     *
+     * - `removedTaskIds == null` → the document was replaced wholesale (backup
+     *   restore): drop every dispatch and clear the lock whatever it points
+     *   at — the restored document has no marker either
+     *   (`importDocument` writes `running = null`), so an in-process run the
+     *   restore invalidated must not keep managing the new document.
+     * - otherwise → drop exactly the sessions running a removed task, and
+     *   clear the lock only if it points at a removed task. Deleting an
+     *   unrelated (or nonexistent) id must not touch a live run: the lock
+     *   stays with the running task.
+     */
+    fun planRemoval(state: State, removedTaskIds: Set<String>?): Plan {
+        val dropSessions = state.dispatchedTaskIdBySession.entries
+            .filter { (_, taskId) ->
+                removedTaskIds == null || taskId in removedTaskIds
+            }
+            .map { (sid, _) -> sid }
+            .sorted() // deterministic for tests/logs; the CHM order is not.
+        val clearRunningTaskId = when (removedTaskIds) {
+            null -> state.runningTaskId != null
+            else -> state.runningTaskId != null && state.runningTaskId in removedTaskIds
+        }
+        return Plan(dropSessions = dropSessions, clearRunningTaskId = clearRunningTaskId)
     }
 }
