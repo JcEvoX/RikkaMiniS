@@ -18,11 +18,27 @@ import com.rikkaminis.app.data.model.RoutingStrategy
  * zero behavior change. The health map is consulted but never populated yet,
  * so [isUsable] always returns true. Phase 2 wires [recordResult] into the
  * loop's error classification and the health gate becomes real.
+ *
+ * [audit-1018 ISSUE-10] Threading contract: this instance is app-wide —
+ * ChatViewModel declares it inside its companion object, so every session /
+ * sub-agent loop talks to the SAME health map. Writers: [recordResult] from
+ * the agent-loop error classification (worker coroutines) and [clearHealth]
+ * on an explicit user pick (main thread). Readers: [isUsable] during
+ * selection / fallback and [healthOf] in diagnostics. All health bookkeeping
+ * is therefore serialized on [healthLock]: the plain map stays structurally
+ * safe, the read-modify-write in [recordResult] is atomic, and the FIFO
+ * eviction under [MAX_HEALTH_ENTRIES] keeps its insertion-order semantics
+ * (a ConcurrentHashMap would silently drop the FIFO guarantee, which is why
+ * a private monitor was chosen over a concurrent container). [MemberHealth]
+ * values are immutable, so the lock protects the map, not the entries.
  */
 class GroupRouter(
     /** Clock in epoch-millis (default: System.currentTimeMillis). */
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
+    /** Serializes every access to [health] — see the class KDoc. */
+    private val healthLock = Any()
+
     private val health = mutableMapOf<String, MemberHealth>()
 
     // ── selection ──────────────────────────────────────────────────────────
@@ -204,34 +220,41 @@ class GroupRouter(
      * NetworkError / TransientError deliberately never reach here (see
      * RouteOutcome) — transient connectivity is the user's side and would
      * churn the whole group over a wifi blip.
+     *
+     * The whole update — the read-modify-write of the failure counter and the
+     * eviction below — is one [healthLock] critical section ([audit-1018
+     * ISSUE-10]): unguarded, concurrent 5xx reports for the same member lost
+     * counts (under-counting the transient failures that open the circuit).
      */
     fun recordResult(entryId: String, outcome: RouteOutcome) {
         val now = clock()
-        when (outcome) {
-            RouteOutcome.Success -> health[entryId] = MemberHealth.Healthy
+        synchronized(healthLock) {
+            when (outcome) {
+                RouteOutcome.Success -> health[entryId] = MemberHealth.Healthy
 
-            is RouteOutcome.RateLimited -> {
-                val untilMs = now + (outcome.retryAfterMs ?: RATE_LIMIT_COOLDOWN_DEFAULT_MS)
-                health[entryId] = MemberHealth.Cooling(untilMs)
+                is RouteOutcome.RateLimited -> {
+                    val untilMs = now + (outcome.retryAfterMs ?: RATE_LIMIT_COOLDOWN_DEFAULT_MS)
+                    health[entryId] = MemberHealth.Cooling(untilMs)
+                }
+
+                RouteOutcome.ServerError -> {
+                    val current = health[entryId]
+                    val failures = if (current is MemberHealth.OpenCircuit) current.failures + 1 else 1
+                    // Below threshold: OpenCircuit(now) is immediately usable but
+                    // carries the counter. At threshold: circuit opens for real.
+                    health[entryId] = MemberHealth.OpenCircuit(
+                        untilMs = if (failures >= CIRCUIT_FAILURE_THRESHOLD) now + CIRCUIT_OPEN_MS else now,
+                        failures = failures,
+                    )
+                }
+
+                RouteOutcome.AuthError -> health[entryId] = MemberHealth.Dead
             }
-
-            RouteOutcome.ServerError -> {
-                val current = health[entryId]
-                val failures = if (current is MemberHealth.OpenCircuit) current.failures + 1 else 1
-                // Below threshold: OpenCircuit(now) is immediately usable but
-                // carries the counter. At threshold: circuit opens for real.
-                health[entryId] = MemberHealth.OpenCircuit(
-                    untilMs = if (failures >= CIRCUIT_FAILURE_THRESHOLD) now + CIRCUIT_OPEN_MS else now,
-                    failures = failures,
-                )
+            // Bounded memory: drop the oldest entries beyond the cap (simple FIFO).
+            if (health.size > MAX_HEALTH_ENTRIES) {
+                val eldest = health.keys.firstOrNull() ?: return
+                health.remove(eldest)
             }
-
-            RouteOutcome.AuthError -> health[entryId] = MemberHealth.Dead
-        }
-        // Bounded memory: drop the oldest entries beyond the cap (simple FIFO).
-        if (health.size > MAX_HEALTH_ENTRIES) {
-            val eldest = health.keys.firstOrNull() ?: return
-            health.remove(eldest)
         }
     }
 
@@ -243,12 +266,16 @@ class GroupRouter(
      * an app restart).
      */
     fun clearHealth() {
-        health.clear()
+        synchronized(healthLock) { health.clear() }
     }
 
     /** True when the member may be selected now (no entry = healthy). */
-    fun isUsable(entryId: String): Boolean = health[entryId]?.isUsable(clock()) ?: true
+    fun isUsable(entryId: String): Boolean = synchronized(healthLock) {
+        health[entryId]?.isUsable(clock()) ?: true
+    }
 
     /** Current health of a member (no entry = healthy). */
-    fun healthOf(entryId: String): MemberHealth = health[entryId] ?: MemberHealth.Healthy
+    fun healthOf(entryId: String): MemberHealth = synchronized(healthLock) {
+        health[entryId] ?: MemberHealth.Healthy
+    }
 }
