@@ -137,6 +137,19 @@ class BrowserUseManager(
                 useWideViewPort = true
                 builtInZoomControls = false
                 setSupportMultipleWindows(true)
+                // [deep-audit-1016 9b] Explicitly deny the file:// and
+                // content:// surfaces. WebView's defaults for these only became
+                // false in API 30, so on the minSdk 26 floor this pool would
+                // still inherit the old permissive defaults unless they are
+                // named. Nothing here needs them — the pool loads http/https
+                // plus minis://, which is served through shouldInterceptRequest
+                // rather than as a file URL — and WebAppActivity sets the same
+                // four for its own WebView. The KaTeX pool is a different
+                // WebView with a deliberate file:// load, so it is unaffected.
+                allowFileAccess = false
+                allowContentAccess = false
+                allowFileAccessFromFileURLs = false
+                allowUniversalAccessFromFileURLs = false
                 mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                 val ua = customUA ?: profile.userAgentString
                 if (ua != null) userAgentString = ua
@@ -176,13 +189,16 @@ class BrowserUseManager(
     /**
      * Last committed main-document URL for the minis:// subresource gate.
      *
-     * Maintained ONLY on the WebView's UI thread from onPageStarted /
-     * onPageFinished (top-level navigations commit synchronously in WebView
-     *'s internal order; mid-navigation subresource races therefore read a
-     * single coherent value). Reset to null on destroy().
+     * Maintained ONLY on the WebView's UI thread, and only from signals that
+     * mean this tab actually adopted the document: onPageStarted /
+     * onPageFinished, the main-frame minis:// interception in
+     * shouldInterceptRequest, and shouldOverrideUrlLoading — that last one only
+     * once it has decided not to route the navigation away (deep-audit-1016
+     * 9a: recording a URL this hook then cancels let a page seed the gate with
+     * an origin the tab never committed to). Reset to null on destroy().
      *
-     * Keep the [minisMainDocAllowsSubresource] gate fail-closed for null —
-     * fresh tabs commit only when the blank bootstrap page lands.
+     * Keep the [MinisMainDocGate] gate fail-closed for null — fresh tabs commit
+     * only when the blank bootstrap page lands.
      */
     @Volatile
     private var lastMainDocUrl: String? = null
@@ -583,82 +599,20 @@ class BrowserUseManager(
         webView.setInitialScale(scalePct)
     }
 
-    /** Strip an arbitrary `Origin` header value down to `scheme://host[:port]`.
-     *  Scheme + authority are lowercased (RFC 3986 case-insensitivity) so
-     *  `MINIS://…` / `HTTPS://APPASSETS…` spellings normalize before any
-     *  prefix comparison; the `null` opaque-origin sentinel maps to "". */
-    private fun originOf(headerValue: String): String {
-        // `null` (sentinel for sandboxed/opaque origins) and anything that
-        // doesn't look like scheme://… carries no trustable site identity.
-        val v = headerValue.trim()
-        val schemeEnd = v.indexOf("://")
-        if (v.equals("null", ignoreCase = true) || schemeEnd <= 0) return ""
-        val rest = v.substring(schemeEnd + 3)
-        val authority = rest.substringBefore('/').substringBefore('?').substringBefore('#')
-        return "${v.substring(0, schemeEnd).lowercase()}://${authority.lowercase()}"
-    }
-
-    /** Exact-host app-assets origin check (tightened from the old loose
-     *  `startsWith("https://appassets")` prefix, which also matched
-     *  `https://appassets.evil.com`). Allows the bare origin plus path /
-     *  port suffixes only. */
-    private fun isAppAssetsOrigin(origin: String): Boolean {
-        val base = "https://appassets.androidplatform.net"
-        return origin == base || origin.startsWith("$base/") || origin.startsWith("$base:")
-    }
+    // originOf() and isAppAssetsOrigin() moved into MinisMainDocGate below so
+    // the whole minis:// trust decision is one JVM-testable pure unit.
 
     /**
-     * [audit-RC13] Same-origin policy gate for minis:// SUBRESOURCE loads
-     * (minisMainDocAllowsSubresource). Pure JVM-friendly: callers pass the
-     * current tab's main-document URL and the optional Origin request header
-     * (value looked up case-insensitively by the caller — Chromium may send
-     * "Origin" or "origin").
-     *
-     * When a main document IS committed, it is the sole authority: a
-     * page-supplied Origin header can never rescue a disallowed document
-     * (the header is attacker-controllable — `Origin: minis://…` sent by an
-     * https:// page must not re-open the door the main-document gate just
-     * closed). Only minis:// / appassets / about:blank main documents may
-     * reference minis:// subresources — that is the built-in preview path
-     * (minis:// page pulling minis:// attachment images). Any website main
-     * document is rejected with or without an Origin header: no-Origin
-     * subresources (<img src>, <iframe src>, <script src>) were previously
-     * waved through, which let any web page read sandbox-local minis://
-     * files (local disclosure / SSRF vector). Fail-closed.
-     *
-     * When NO main document is committed yet (subresource racing the very
-     * first navigation), fall back to an explicit Origin header naming an
-     * allowed app origin; the opaque-origin `null` sentinel and website
-     * origins reject here too.
+     * [audit-RC13] Same-origin policy gate for minis:// SUBRESOURCE loads.
+     * Thin delegation to [MinisMainDocGate], which owns the decision (and the
+     * only reason it is JVM-testable): see its KDoc for the full rationale —
+     * a committed main document is the sole authority, a page-supplied Origin
+     * header can never rescue a disallowed document, and both arms fail closed.
      */
     internal fun minisMainDocAllowsSubresource(
         mainDocUrl: String?,
         originHeader: String?,
-    ): Boolean {
-        // Lowercase: scheme is case-insensitive per RFC 3986 and this gate's
-        // prefix comparisons are exact — normalize before matching. (Chromium
-        // emits normalized lowercase URLs anyway; this defends the gate
-        // against unnormalized input shapes.)
-        val doc = mainDocUrl?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
-        if (doc != null) {
-            val mainOrigin = originOf(doc)
-            // The blank-tab bootstrap page (loadDataWithBaseURL(null, …))
-            // lands on about:blank; blocking it would break fresh-tab
-            // subresource loads. (Known second-order nuance: an about:blank
-            // window.open'ed by a website inherits the opener's origin —
-            // logged as a follow-up hardening candidate, out of scope here.)
-            return doc == "about:blank" ||
-                doc.startsWith("minis://") ||
-                isAppAssetsOrigin(mainOrigin)
-        }
-        // No committed main document yet — header-based fallback only.
-        // (The header is forgeable; this only covers the pre-first-commit
-        // race window, so it keeps the original semantics: any minis://
-        // origin passes — harmless, since resolution is subdir-pinned —
-        // while the appassets origin is checked against its exact host.)
-        val headerOrigin = originOf(originHeader ?: "")
-        return headerOrigin.startsWith("minis://") || isAppAssetsOrigin(headerOrigin)
-    }
+    ): Boolean = MinisMainDocGate.allowsSubresource(mainDocUrl, originHeader)
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun setupWebViewClient() {
@@ -703,11 +657,32 @@ class BrowserUseManager(
                 request: WebResourceRequest,
             ): Boolean {
                 val urlStr = request.url?.toString()
-                // [audit-RC13] A committed MAIN-frame navigation switches the
-                // tab's origin immediately — commit the gate's main-document
-                // here too, before the new document's own subresources fire.
-                if (request.isForMainFrame && !urlStr.isNullOrEmpty()) {
-                    lastMainDocUrl = urlStr
+                // [deep-audit-1016 9a] A page must not be able to hand this tab
+                // a minis:// document: that discloses a sandbox file into the
+                // tab, and if the landed file carries script it becomes a
+                // trusted main document that may then pull *other* minis://
+                // files. Refuse a top-level minis:// navigation unless the
+                // document that initiated it is already trusted. Tested against
+                // the committed document, i.e. before this navigation could
+                // change it; a tab with no document yet passes, so the app's
+                // own first load (loadUrl does not reach this hook) and a
+                // trusted page's navigations are unaffected.
+                //
+                // Deliberately no completeNavigationExternally here, unlike the
+                // two branches below: those end a load the app is waiting on,
+                // whereas this hook only sees renderer-initiated navigations —
+                // never the navigation a navigate() wait is attached to. There
+                // is also no NavigationOutcome for "blocked", so completing the
+                // wait would mislabel it as ROUTED_EXTERNALLY.
+                if (request.isForMainFrame &&
+                    !MinisMainDocGate.allowsTopLevelNavigation(lastMainDocUrl, urlStr)
+                ) {
+                    Log.w(
+                        TAG,
+                        "Blocked top-level minis:// navigation from mainDoc=" +
+                            "${lastMainDocUrl?.take(80)} target=${urlStr?.take(80)}",
+                    )
+                    return true
                 }
                 // T234: Google permanently disallows WebView for sign-in /
                 // OAuth. Hand any auth-domain navigation to Chrome Custom
@@ -733,6 +708,18 @@ class BrowserUseManager(
                 // navigation timeout and then report the wrong thing (before
                 // this fix: a plain success).
                 if (handled && request.isForMainFrame) completeNavigationExternally(urlStr)
+                // [audit-RC13 / deep-audit-1016 9a] Commit the minis:// gate's
+                // main-document for a MAIN-frame navigation this hook actually
+                // lets the WebView carry out. This write used to sit at the top
+                // of the method, ahead of the two cancel branches above, so a
+                // URL this hook then refuses was recorded as the tab's document
+                // while the page that named it kept running — the gate trusted
+                // an origin the tab never committed to. Kept here rather than
+                // dropped so the RC13 intent still holds: an adopted navigation
+                // is committed before the new document's own subresources fire.
+                if (!handled && request.isForMainFrame && !urlStr.isNullOrEmpty()) {
+                    lastMainDocUrl = urlStr
+                }
                 return handled
             }
 
@@ -2716,4 +2703,118 @@ class BrowserUseManager(
         Log.i(TAG, "BrowserUseManager WebView destroyed")
     }
 
+}
+
+/**
+ * [deep-audit-1016 9a] Pure trust decisions for the `minis://` gate: which
+ * main documents may reference minis:// resources, and which may navigate the
+ * tab to a minis:// document.
+ *
+ * Lifted out of [BrowserUseManager] (two private helpers plus the gate body,
+ * moved verbatim) so the whole policy is one JVM-testable unit — it had no
+ * direct test before, because an Android-owned instance method cannot be
+ * exercised without a WebView.
+ */
+internal object MinisMainDocGate {
+
+    /** Strip an arbitrary `Origin` header value down to `scheme://host[:port]`.
+     *  Scheme + authority are lowercased (RFC 3986 case-insensitivity) so
+     *  `MINIS://…` / `HTTPS://APPASSETS…` spellings normalize before any
+     *  prefix comparison; the `null` opaque-origin sentinel maps to "". */
+    fun originOf(headerValue: String): String {
+        // `null` (sentinel for sandboxed/opaque origins) and anything that
+        // doesn't look like scheme://… carries no trustable site identity.
+        val v = headerValue.trim()
+        val schemeEnd = v.indexOf("://")
+        if (v.equals("null", ignoreCase = true) || schemeEnd <= 0) return ""
+        val rest = v.substring(schemeEnd + 3)
+        val authority = rest.substringBefore('/').substringBefore('?').substringBefore('#')
+        return "${v.substring(0, schemeEnd).lowercase()}://${authority.lowercase()}"
+    }
+
+    /** Exact-host app-assets origin check (tightened from the old loose
+     *  `startsWith("https://appassets")` prefix, which also matched
+     *  `https://appassets.evil.com`). Allows the bare origin plus path /
+     *  port suffixes only. */
+    fun isAppAssetsOrigin(origin: String): Boolean {
+        val base = "https://appassets.androidplatform.net"
+        return origin == base || origin.startsWith("$base/") || origin.startsWith("$base:")
+    }
+
+    /**
+     * Whether a page whose COMMITTED main document is [mainDocUrl] is trusted
+     * to reach sandbox-local `minis://` content at all. Null / blank means "no
+     * document committed yet" and is NOT trusted here — callers that need the
+     * pre-first-commit race arm use [allowsSubresource] instead.
+     */
+    fun isTrustedMainDoc(mainDocUrl: String?): Boolean {
+        // Lowercase: scheme is case-insensitive per RFC 3986 and this gate's
+        // prefix comparisons are exact — normalize before matching. (Chromium
+        // emits normalized lowercase URLs anyway; this defends the gate
+        // against unnormalized input shapes.)
+        val doc = mainDocUrl?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return false
+        // The blank-tab bootstrap page (loadDataWithBaseURL(null, …)) lands on
+        // about:blank; blocking it would break fresh-tab subresource loads.
+        // (Known second-order nuance: an about:blank window.open'ed by a
+        // website inherits the opener's origin — logged as a follow-up
+        // hardening candidate, out of scope here.)
+        return doc == "about:blank" ||
+            doc.startsWith("minis://") ||
+            isAppAssetsOrigin(originOf(doc))
+    }
+
+    /**
+     * [audit-RC13] Same-origin policy gate for minis:// SUBRESOURCE loads.
+     * Callers pass the current tab's main-document URL and the optional Origin
+     * request header (value looked up case-insensitively by the caller —
+     * Chromium may send "Origin" or "origin").
+     *
+     * When a main document IS committed, it is the sole authority: a
+     * page-supplied Origin header can never rescue a disallowed document
+     * (the header is attacker-controllable — `Origin: minis://…` sent by an
+     * https:// page must not re-open the door the main-document gate just
+     * closed). Only minis:// / appassets / about:blank main documents may
+     * reference minis:// subresources — that is the built-in preview path
+     * (minis:// page pulling minis:// attachment images). Any website main
+     * document is rejected with or without an Origin header: no-Origin
+     * subresources (<img src>, <iframe src>, <script src>) were previously
+     * waved through, which let any web page read sandbox-local minis://
+     * files (local disclosure / SSRF vector). Fail-closed.
+     *
+     * When NO main document is committed yet (subresource racing the very
+     * first navigation), fall back to an explicit Origin header naming an
+     * allowed app origin; the opaque-origin `null` sentinel and website
+     * origins reject here too.
+     */
+    fun allowsSubresource(mainDocUrl: String?, originHeader: String?): Boolean {
+        val doc = mainDocUrl?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+        if (doc != null) return isTrustedMainDoc(doc)
+        // No committed main document yet — header-based fallback only.
+        // (The header is forgeable; this only covers the pre-first-commit
+        // race window, so it keeps the original semantics: any minis://
+        // origin passes — harmless, since resolution is subdir-pinned —
+        // while the appassets origin is checked against its exact host.)
+        val headerOrigin = originOf(originHeader ?: "")
+        return headerOrigin.startsWith("minis://") || isAppAssetsOrigin(headerOrigin)
+    }
+
+    /**
+     * [deep-audit-1016 9a] Whether a TOP-LEVEL navigation to [targetUrl] may
+     * proceed out of a page whose committed main document is [mainDocUrl].
+     *
+     * Non-minis:// targets are always allowed — this gate exists only for the
+     * arm `shouldInterceptRequest` cannot cover: a page navigating the tab to a
+     * `minis://` document (`location.href = "minis://workspace/…"`), which
+     * displays a sandbox file in the tab and — if that file carries script —
+     * hands the page a trusted main document to pull other minis:// files
+     * with. [mainDocUrl] null/blank means the tab has no document yet, so the
+     * navigation is allowed: `loadUrl` never reaches the caller's hook, which
+     * is how the app's own (trusted) navigations arrive.
+     */
+    fun allowsTopLevelNavigation(mainDocUrl: String?, targetUrl: String?): Boolean {
+        val target = targetUrl?.trim()?.lowercase() ?: return true
+        if (!target.startsWith("minis://")) return true
+        if (mainDocUrl.isNullOrBlank()) return true
+        return isTrustedMainDoc(mainDocUrl)
+    }
 }
