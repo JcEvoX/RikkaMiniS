@@ -23,7 +23,10 @@ object BrowserRssProbe {
     /** 单 action 累计正 delta 超过该值即判定「可疑泄漏源」并 WARN 一次。 */
     private const val LEAK_SUSPECT_KB = 1_024L * 1024L  // 1 GiB 累计
 
-    private data class Stats(
+    // [fix/da1019-rssprobe-lock-scope] private → internal：决策纯函数
+    // [applyAndDecideLocked] 的签名要暴露它，JVM 并发装置也要直接驱动该函数
+    // （对齐 OffloadRssProbe 的同款修复形态）。
+    internal data class Stats(
         var count: Int = 0,
         var totalDeltaKb: Long = 0L,
         var peakDeltaKb: Long = 0L,
@@ -32,6 +35,19 @@ object BrowserRssProbe {
     ) {
         fun averageDeltaKb(): Long = if (count == 0) 0L else totalDeltaKb / count
     }
+
+    /**
+     * [fix/da1019-rssprobe-lock-scope] [applyAndDecideLocked] 的决策快照：record
+     * 在锁内拿到它，锁外只据它做副作用（Log）。数值字段是「本次调用后」的读数——
+     * 观测日志与告警文案同源，不再各自撕裂地读 Stats 的可变字段。
+     */
+    internal data class BrowserRssDecision(
+        val totalDeltaKb: Long,
+        val count: Int,
+        val avgDeltaKb: Long,
+        val peakDeltaKb: Long,
+        val warnLeak: Boolean,
+    )
 
     // action 名 → 聚合统计（进程级累计，与 RSS 生命周期对齐）。
     private val byAction = ConcurrentHashMap<String, Stats>()
@@ -60,28 +76,65 @@ object BrowserRssProbe {
     fun record(action: String, beforeKb: Long, afterKb: Long) {
         val deltaKb = afterKb - beforeKb
         val st = byAction.computeIfAbsent(action) { Stats() }
-        st.count += 1
-        st.totalDeltaKb += deltaKb
-        st.lastDeltaKb = deltaKb
-        if (deltaKb > st.peakDeltaKb) st.peakDeltaKb = deltaKb
+        // [fix/da1019-rssprobe-lock-scope] 唯一临界区：自增 + 峰值 + LEAK-SUSPECT
+        // 赢家置位全部在锁内（[applyAndDecideLocked]）完成，并把读数捕获进局部
+        // 快照 d；锁外只消费 d 做副作用（Log）。修复前 record 全程无锁——
+        // 复合自增（count/totalDeltaKb/peakDeltaKb）丢更新（累计被系统性低估、
+        // 该触发的 LEAK-SUSPECT 不触发），且 `!st.leaked` 与 `st.leaked = true`
+        // 之间有窗口，两个并发 action 会让本该「只报一次」的 WARN 重复打印。
+        // 并发来源：BrowserTabPool 的多 tab 池在主进程并发执行 action。
+        val d = synchronized(st) { applyAndDecideLocked(st, deltaKb) }
 
         // 每次调用一行观测日志（压测时可按 action 名 grep 归类）
         Log.i(
             TAG,
             "[browser-rss] action=$action Δ=${deltaKb}kB " +
                 "before=${beforeKb / 1024}MB after=${afterKb / 1024}MB " +
-                "cum=${st.totalDeltaKb / 1024}MB(×${st.count}, avg=${st.averageDeltaKb() / 1024}MB)"
+                "cum=${d.totalDeltaKb / 1024}MB(×${d.count}, avg=${d.avgDeltaKb / 1024}MB)"
         )
 
-        // 累计正增量越过嫌疑阈值 → 判定为可疑泄漏源，WARN 一次
-        if (!st.leaked && st.totalDeltaKb >= LEAK_SUSPECT_KB) {
-            st.leaked = true
+        // 累计正增量越过嫌疑阈值 → 判定为可疑泄漏源，WARN 一次（赢家语义）
+        if (d.warnLeak) {
             Log.w(
                 TAG,
-                "[browser-rss] LEAK-SUSPECT action=$action totalDelta=${st.totalDeltaKb / 1024}MB " +
-                    "over ${st.count} calls (peak=${st.peakDeltaKb / 1024}MB) — 候选 WebView native OOM 源头"
+                "[browser-rss] LEAK-SUSPECT action=$action totalDelta=${d.totalDeltaKb / 1024}MB " +
+                    "over ${d.count} calls (peak=${d.peakDeltaKb / 1024}MB) — 候选 WebView native OOM 源头"
             )
         }
+    }
+
+    /**
+     * [fix/da1019-rssprobe-lock-scope] 一次临界区里完成「自增 + 阈值判定 +
+     * 赢家置位」的纯逻辑（对齐 OffloadRssProbe.applyAndDecideLocked 的形状，
+     * JVM 可直测；并发守恒臂见 BrowserRssProbeLockScopeTest）。
+     *
+     * **只允许在 `synchronized(st)` 内调用**——调用方负责持锁；本函数保证
+     * 「判定」与它所依据的数值之间不可能被另一个 action 插入：
+     * - leaked 只由第一个跨 [LEAK_SUSPECT_KB] 的调用置位（赢家语义 ⇒ WARN 恰一次）；
+     * - 返回的 [BrowserRssDecision] 携带同步的 count / total / avg / peak 读数，
+     *   锁外格式化日志时不会读到撕裂值。
+     */
+    internal fun applyAndDecideLocked(st: Stats, deltaKb: Long): BrowserRssDecision {
+        st.count += 1
+        st.totalDeltaKb += deltaKb
+        st.lastDeltaKb = deltaKb
+        if (deltaKb > st.peakDeltaKb) st.peakDeltaKb = deltaKb
+
+        // 读数快照：观测日志与 LEAK-SUSPECT 文案同源。
+        val totalAfterKb = st.totalDeltaKb
+        val countNow = st.count
+        val peakNow = st.peakDeltaKb
+
+        val warnLeak = !st.leaked && totalAfterKb >= LEAK_SUSPECT_KB
+        if (warnLeak) st.leaked = true
+
+        return BrowserRssDecision(
+            totalDeltaKb = totalAfterKb,
+            count = countNow,
+            avgDeltaKb = if (countNow == 0) 0L else totalAfterKb / countNow,
+            peakDeltaKb = peakNow,
+            warnLeak = warnLeak,
+        )
     }
 
     /** 打印全量聚合汇总（压测结束 / 定时 dump 用）。返回汇总文本。 */
@@ -90,9 +143,15 @@ object BrowserRssProbe {
             Log.i(TAG, "[browser-rss] summary: (no browser actions executed)")
             return "(no data)"
         }
+        // [fix/da1019-rssprobe-lock-scope] 锁内取一份快照（Stats.copy()），锁外
+        // 格式化：与并发 record 交错时每行读数自洽（cum/count/avg/peak 同源），
+        // 不再打印撕裂读数、排序键也不再是撕裂值。
+        val snapshot = byAction.entries.map { (name, st) ->
+            name to synchronized(st) { st.copy() }
+        }
         val sb = StringBuilder("browser-rss summary:\n")
-        byAction.entries
-            .sortedByDescending { it.value.totalDeltaKb }
+        snapshot
+            .sortedByDescending { it.second.totalDeltaKb }
             .forEach { (name, st) ->
                 sb.append(
                     "  $name: cum=${st.totalDeltaKb / 1024}MB " +
