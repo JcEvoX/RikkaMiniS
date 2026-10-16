@@ -417,7 +417,23 @@ internal fun AssistantMessageView(
             .fillMaxWidth()
             .padding(vertical = 2.dp),
     ) {
-        AssistantHeader()
+        // [fix/da1016-chat-sysinfo] A "system" row is a NOTICE, not a speaker
+        // turn: slash-command confirmations (`/memory`, `/thinking`), browser
+        // download progress, context-pressure/trim warnings and the compact
+        // divider all arrive as `role = "system"` messages built by
+        // `appendSystemInfo` (the only production writer of that role — see
+        // ChatViewModel.flushPendingSysInfo). Rendering the ✨ identity header
+        // above each of them put an AI attribution on rows the assistant never
+        // said. The legacy flat builder already skipped the header for
+        // `isSystem` rows (legacy/LegacyFlatChatBuilder.kt), but the aggregate
+        // pipeline — the ONLY live one (ChatScreen aggregate-path note) —
+        // renders every non-user message through this composable, so the skip
+        // has to live here. Guarding here (rather than emitting a different
+        // FlatChatItem) keeps the row's body identical: FallbackInfoBlock is a
+        // self-contained 44dp card with its own padding, so nothing collapses.
+        if (message.role != "system") {
+            AssistantHeader()
+        }
 
         // Render blocks in original order — text, thinking, and tool calls interleaved
         // exactly as they arrived in the stream (each assistant turn may contain multiple
