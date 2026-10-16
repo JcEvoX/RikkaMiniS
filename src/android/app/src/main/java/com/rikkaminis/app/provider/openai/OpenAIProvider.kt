@@ -1359,7 +1359,14 @@ class OpenAIProvider constructor(
             // and silently save a half answer. Signal truncated so the
             // turnTruncated retry owns it. Only fires for non-empty EOF: a fully
             // empty EOF is already handled by failOnSilentEmptyCompletion.
-            if (!finishedSent && (contentLen > 0 || reasoningLen > 0)) {
+            // [deep-audit-1018 ISSUE-01] `toolCallEventCount` joins the guard
+            // (Anthropic's `toolChars` counterpart — same-family 2nd site): a
+            // tool-call-only turn (zero text/reasoning) cut by EOF used to emit
+            // no Finished at all, so `turnTruncated` stayed false downstream and
+            // the truncated-tool-call guard never fired — a half-streamed
+            // argument object then reached the executor (and ToolJsonRepair
+            // would happily close it into a valid-but-wrong payload).
+            if (!finishedSent && (contentLen > 0 || reasoningLen > 0 || toolCallEventCount > 0)) {
                 send(LLMStreamChunk.Finished(finishReason, truncated = !sawFinishReason))
             }
 

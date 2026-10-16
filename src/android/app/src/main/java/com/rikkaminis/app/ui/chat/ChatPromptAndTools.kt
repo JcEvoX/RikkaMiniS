@@ -363,8 +363,10 @@ internal suspend fun ChatViewModel.executeTool(
     )
     // T7-A: 观察 —— 工具结束（ToolFinished 语义）
     traceObserver.t7State(ChatAgentTraceObserver.t7PhaseSchema(AgentRunPhase.EXECUTING_TOOLS), ChatAgentTraceObserver.t7PhaseSchema(AgentRunPhase.EXECUTING_TOOLS), "ToolFinished($name)")
-    // T7-D: 旁路验证 —— 工具结束（resultKnown = 结果已到达）
-    traceObserver.t7Reduce(AgentRunEvent.ToolFinished(name, resultKnown = true))
+    // T7-D: 旁路验证 —— 工具结束。resultKnown 取自结果对象本身
+    // （[deep-audit-1018 ISSUE-03]）：shell 的 outcomeKnown=false 表示
+    // 重放被扣下、结果不可信，reducer 据此判 SUCCEED_WITH_UNKNOWN_TOOL。
+    traceObserver.t7Reduce(AgentRunEvent.ToolFinished(name, resultKnown = result.outcomeKnown))
 
     // T3: failure-learning automation hook. Side-channel only — the
     // failed result still flows to the LLM exactly as before; this just
@@ -691,12 +693,10 @@ internal suspend fun ChatViewModel.executeShellCommand(
             // leftovers (e.g. a future call site publishing progress).
             publishToolProgress(toolId, "")
         }
-        return ToolExecutionResult(
-            output = result.output,
-            success = result.success,
-            toolTitle = result.toolTitle,
-            timedOut = result.timedOut,
-        )
+        // [deep-audit-1018 ISSUE-03] single mapping (ToolResultShell ->
+        // ToolExecutionResult, outcomeKnown included) lives in
+        // ChatShellExecution.kt so the field cannot be dropped by re-inlining.
+        return result.toToolExecutionResult()
     } finally {
         // T7-B: 无条件释放 shell lease —— 覆盖成功、异常、取消路径
         traceObserver.t7ResourceRelease(

@@ -179,7 +179,7 @@ class CompactCancelOnStopTest {
             "app/src/main/java/com/rikkaminis/app/conversation/CompactOrchestration.kt",
         )
         val region = lifecycle
-            .substringAfter("chatRepository.dao.loadMessages(sid).map { it.id }.toSet()")
+            .substringAfter("val rawDbIds: Set<String> = try {")
             .substringBefore("verifiedAnchorIdx")
         val ce = region.indexOf("catch (e: CancellationException)")
         val generic = region.indexOf("catch (e: Exception)")

@@ -279,10 +279,60 @@ internal fun executeMemoryRollupTool(
  *
  * @return true when an assistant message was appended.
  */
-internal fun appendSubagentTurnText(history: MutableList<LLMMessage>, text: String): Boolean {
+internal fun appendSubagentTurnText(
+    history: MutableList<LLMMessage>,
+    text: String,
+    /**
+     * [deep-audit-1018 ISSUE-02] The turn's captured reasoning (opaque
+     * ReasoningContent blob, else the ThinkingDelta concatenation) — echoes
+     * back on the next request exactly like the main loop's assistant history
+     * entries do. Defaults to null so callers with no reasoning channel keep
+     * the previous message shape.
+     */
+    reasoningContent: String? = null,
+): Boolean {
     if (text.isBlank()) return false
-    history.add(LLMMessage(role = LLMMessage.Role.ASSISTANT, content = text))
+    history.add(LLMMessage(
+        role = LLMMessage.Role.ASSISTANT,
+        content = text,
+        reasoningContent = reasoningContent,
+    ))
     return true
+}
+
+/**
+ * [deep-audit-1018 ISSUE-02] Per-turn reasoning capture for the sub-agent
+ * loop — the sub-agent twin of the main loop's `turnThinking` /
+ * `turnReasoningBlob` pair (AgentLoopEngine, per-turn locals).
+ *
+ * Semantics are copied verbatim from the main loop so the two loops hand back
+ * the same shape:
+ *  - [LLMStreamChunk.ThinkingDelta] — real-time increments, CONCATENATED.
+ *  - [LLMStreamChunk.ReasoningContent] — the provider's full opaque blob;
+ *    the LAST one wins (assignment, not append). It takes precedence over the
+ *    concatenation, and an EMPTY blob is preserved as "" (DeepSeek V4 emits
+ *    `reasoning_content: ""` on non-thinking turns — fabricating text or
+ *    collapsing to null would change what the server asked us to round-trip).
+ *  - No reasoning chunks at all → null (no field to round-trip).
+ *
+ * One instance per turn (declared inside the loop body) — that IS the
+ * per-turn reset; the main loop gets the same effect from its per-turn locals.
+ */
+internal class SubagentReasoningAccumulator {
+    private val thinking = StringBuilder()
+    private var opaqueBlob: String? = null
+
+    /** Feed one stream chunk; ignores everything that is not reasoning. */
+    fun accept(chunk: LLMStreamChunk) {
+        when (chunk) {
+            is LLMStreamChunk.ThinkingDelta -> thinking.append(chunk.text)
+            is LLMStreamChunk.ReasoningContent -> opaqueBlob = chunk.content
+            else -> {}
+        }
+    }
+
+    /** Blob wins (including ""); else the concatenation if non-empty; else null. */
+    fun value(): String? = opaqueBlob ?: thinking.toString().takeIf { it.isNotEmpty() }
 }
 
 /**
@@ -339,6 +389,13 @@ internal suspend fun runSubagentLoop(
             turnFinishReason = null
             turnTruncated = false
             val textSb = StringBuilder()
+            // [deep-audit-1018 ISSUE-02] Per-turn reasoning capture — declared
+            // inside the loop, so per-turn freshness mirrors the main loop's
+            // per-turn `turnThinking`/`turnReasoningBlob` locals. Both chunk
+            // kinds were previously dropped on the floor here (`else -> {}`),
+            // so every sub-agent assistant history entry went back without
+            // reasoning_content.
+            val turnReasoning = SubagentReasoningAccumulator()
             val toolCalls = mutableListOf<SubagentToolCall>()
 
             // TF-D: sub-agent runs through :modelservice via the gateway. Chunks
@@ -347,6 +404,18 @@ internal suspend fun runSubagentLoop(
             streamProvider(history.toList()).collect { chunk ->
                 when (chunk) {
                     is LLMStreamChunk.Text -> textSb.append(chunk.text)
+                    // [deep-audit-1018 ISSUE-02] Reasoning chunks were silently
+                    // discarded here (they fell into `else -> {}`) while the
+                    // main loop has handled them since
+                    // [T-android-thinking-delta-main-thread-throttle] /
+                    // ReasoningContent. Result: sub-agent assistant history
+                    // entries carried no reasoning_content, so a thinking
+                    // provider re-read its own turns as if it had never
+                    // reasoned (and a hard-validating relay could 400).
+                    // The accumulator owns the exact main-loop semantics
+                    // (blob wins, empty blob round-trips, thinking concatenates).
+                    is LLMStreamChunk.ThinkingDelta -> turnReasoning.accept(chunk)
+                    is LLMStreamChunk.ReasoningContent -> turnReasoning.accept(chunk)
                     is LLMStreamChunk.ToolCallComplete -> {
                         toolCalls.add(SubagentToolCall(chunk.id, chunk.name, chunk.args))
                     }
@@ -400,7 +469,7 @@ internal suspend fun runSubagentLoop(
                     // twice. Same contract as the main loop, where the turn's
                     // stripped text enters agentHistory (AgentLoopEngine) right
                     // before its refill nudge.
-                    appendSubagentTurnText(history, text)
+                    appendSubagentTurnText(history, text, turnReasoning.value())
                     // Same invariant as the main loop's nudges: tool results
                     // are persisted to history as role=USER messages, so the
                     // tail here can be user(tool_result) — a blind USER append
@@ -435,7 +504,7 @@ internal suspend fun runSubagentLoop(
                         // as the residue refill above: the partial turn stays in
                         // history, so the model resumes at the exact cut point
                         // instead of re-writing the part it already emitted.
-                        appendSubagentTurnText(history, text)
+                        appendSubagentTurnText(history, text, turnReasoning.value())
                         ensureRoleAlternationBeforeUserAppend(history)
                         val reminder = lengthWallReminder(text.takeLast(80))
                         history.add(LLMMessage(
@@ -454,36 +523,69 @@ internal suspend fun runSubagentLoop(
             }
 
             // Append assistant turn with tool uses to history
+            // [deep-audit-1018 ISSUE-02] Carry the turn's captured reasoning
+            // too — same round-trip the main loop performs at its
+            // `agentHistory.add(...)` (AgentLoopEngine, turnReasoningContent).
             history.add(LLMMessage(
                 role = LLMMessage.Role.ASSISTANT,
                 content = text,
                 contentParts = toolCalls.map { call ->
                     AgentContentPart.ToolUse(id = call.id, name = call.name, input = call.args)
                 },
+                reasoningContent = turnReasoning.value(),
             ))
 
-            // Execute tools sequentially
+            // Execute tools sequentially. [deep-audit-1018 ISSUE-01] The
+            // main loop's truncated-tool-call guard was absent here (this was
+            // the family's remaining site): a truncated turn's tool call was
+            // dispatched to the executor with whatever argument prefix had
+            // streamed — and ToolJsonRepair's truncation strategy closes a
+            // cut-off JSON object into a valid-but-wrong payload, so the
+            // failure mode is "silently executed half a dangerous command".
+            // The judgement comes from TruncatedToolCallPolicy (single source
+            // of truth — wording included), covering BOTH sources: the
+            // protocol finish reason and the stream-level truncated flag.
+            // A refused call still gets a tool_result (pairing holds) and the
+            // loop continues so the model can re-issue with full arguments.
             for (call in toolCalls) {
-                val result = executeSubTool(call.name, call.args.toString())
-                // [fix/sweep1014-b19] Was "Error: ${result.output}" even when
-                // the sub-tool's own failure output already carries the
-                // "Error: " prefix (budget exhausted, provider errors) — the
-                // next request read "Error: Error: ...".
-                val resultContent = if (result.success) {
-                    result.output
-                } else if (result.output.startsWith("Error: ")) {
-                    result.output
+                val truncatedRefusal = TruncatedToolCallPolicy.rejectionReason(
+                    call.name,
+                    turnFinishReason,
+                    turnTruncated,
+                )
+                if (truncatedRefusal != null) {
+                    log("[Subagent] turn=$turns truncated tool call REFUSED name=${call.name} " +
+                        "id=${call.id} finish=${turnFinishReason ?: "eof"} eofTruncated=$turnTruncated")
+                    history.add(LLMMessage(
+                        role = LLMMessage.Role.USER,
+                        content = "Result of ${call.name} (${call.id}):\n$truncatedRefusal",
+                        contentParts = listOf(AgentContentPart.ToolResult(
+                            id = call.id, name = call.name,
+                            content = truncatedRefusal, isError = true,
+                        )),
+                    ))
                 } else {
-                    "Error: ${result.output}"
+                    val result = executeSubTool(call.name, call.args.toString())
+                    // [fix/sweep1014-b19] Was "Error: ${result.output}" even when
+                    // the sub-tool's own failure output already carries the
+                    // "Error: " prefix (budget exhausted, provider errors) — the
+                    // next request read "Error: Error: ...".
+                    val resultContent = if (result.success) {
+                        result.output
+                    } else if (result.output.startsWith("Error: ")) {
+                        result.output
+                    } else {
+                        "Error: ${result.output}"
+                    }
+                    history.add(LLMMessage(
+                        role = LLMMessage.Role.USER,
+                        content = "Result of ${call.name} (${call.id}):\n$resultContent",
+                        contentParts = listOf(AgentContentPart.ToolResult(
+                            id = call.id, name = call.name,
+                            content = resultContent, isError = !result.success,
+                        )),
+                    ))
                 }
-                history.add(LLMMessage(
-                    role = LLMMessage.Role.USER,
-                    content = "Result of ${call.name} (${call.id}):\n$resultContent",
-                    contentParts = listOf(AgentContentPart.ToolResult(
-                        id = call.id, name = call.name,
-                        content = resultContent, isError = !result.success,
-                    )),
-                ))
             }
         }
     } catch (e: CancellationException) {

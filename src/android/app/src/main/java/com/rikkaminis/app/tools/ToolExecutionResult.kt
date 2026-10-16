@@ -27,6 +27,16 @@ data class ToolExecutionResult(
      * subclassification iOS handles inline via error-message parsing.
      */
     val timedOut: Boolean = false,
+    /**
+     * [deep-audit-1018 ISSUE-03] Mirrors
+     * [com.rikkaminis.app.sandbox.ExecutionCoordinator.CommandResult.outcomeKnown]:
+     * false = "the command may have run but its result is not trustworthy"
+     * (shell replay withheld / outcome unknown). Consumed by the T7 trace layer
+     * (`AgentRunEvent.ToolFinished.resultKnown`) so the run reducer can classify
+     * SUCCEED_WITH_UNKNOWN_TOOL instead of SUCCEEDED. Defaults to true: every
+     * tool family except shell is outcome-known by construction.
+     */
+    val outcomeKnown: Boolean = true,
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
@@ -36,7 +46,7 @@ data class ToolExecutionResult(
             imageMimeType == other.imageMimeType && toolTitle == other.toolTitle &&
             pageURL == other.pageURL && imageFilePath == other.imageFilePath &&
             imageLinuxPath == other.imageLinuxPath &&
-            timedOut == other.timedOut
+            timedOut == other.timedOut && outcomeKnown == other.outcomeKnown
     }
 
     override fun hashCode(): Int {
@@ -49,6 +59,7 @@ data class ToolExecutionResult(
         result = 31 * result + (imageFilePath?.hashCode() ?: 0)
         result = 31 * result + (imageLinuxPath?.hashCode() ?: 0)
         result = 31 * result + timedOut.hashCode()
+        result = 31 * result + outcomeKnown.hashCode()
         return result
     }
 }

@@ -79,12 +79,13 @@ object ChatStreamOffloadHandler {
      * to skip stopService(:modelservice) while a stream is active — otherwise the
      * app process kill would sever the stream mid-answer (stream.jsonl left without
      * DONE/error, leaving the UI silently stalled until the poll timeout).
-     * @Volatile because it is incremented/decremented from stream coroutines but
-     * read from a different execution context (reclaim path).
+     * [deep-audit-1018 ISSUE-04] Atomicity is enforced by the TYPE: the counter is
+     * an AtomicInteger, so concurrent stream coroutines can no longer lose an
+     * increment (the previous read-modify-write pair could — and a lost increment
+     * either skipped or blocked model-service reclamation). The reclaim path reads
+     * it from a different execution context, so every reader goes through get().
      */
-    @Volatile
-    var activeStreams = 0
-        private set
+    val activeStreams = java.util.concurrent.atomic.AtomicInteger(0)
 
     /**
      * Execute a streaming request and expose decoded chunks as a [Flow].
@@ -117,7 +118,7 @@ object ChatStreamOffloadHandler {
         // failures under cache-dir pressure permanently disabled model-service
         // reclamation. Track incrementing with its own try/finally so EVERY
         // exit path pairs ++ with --.
-        activeStreams++
+        activeStreams.getAndIncrement()
         try {
         val dir = try {
             val root = File(context.cacheDir, STAGING_ROOT)
@@ -373,10 +374,12 @@ object ChatStreamOffloadHandler {
             } catch (_: Exception) {}
         }
         } finally {
-            // [fix/audit-s2h4] Pairs the outer activeStreams++ (moved inside a
+            // [fix/audit-s2h4] Pairs the outer increment (moved inside a
             // dedicated try/finally in 2026-09-02): staging failures previously
             // skipped this decrement entirely.
-            activeStreams = (activeStreams - 1).coerceAtLeast(0)
+            // [deep-audit-1018 ISSUE-04] Atomic decrement with a floor: no
+            // read-modify-write can be lost, and the counter never goes negative.
+            activeStreams.updateAndGet { (it - 1).coerceAtLeast(0) }
         }
     }.flowOn(Dispatchers.IO)
 

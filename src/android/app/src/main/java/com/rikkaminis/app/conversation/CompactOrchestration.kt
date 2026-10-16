@@ -327,7 +327,7 @@ internal fun ChatViewModel.compactAll(
             // the original anchorIdx until we find an entry whose id is
             // both non-empty AND present in rawDbIds.
             val rawDbIds: Set<String> = try {
-                chatRepository.dao.loadMessages(sid).map { it.id }.toSet()
+                chatRepository.loadMessages(sid).map { it.id }.toSet()
             } catch (e: CancellationException) {
                 // [fix/clearchat-compact-ce-1002] A stop press cancels
                 // compactJob (fix/compact-cancel-on-stop-1002). The summary

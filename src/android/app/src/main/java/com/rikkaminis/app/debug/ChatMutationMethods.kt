@@ -99,7 +99,7 @@ internal object ChatMutationMethods {
         )
 
         // Re-read DB to pick up the latest message metadata after the run.
-        val msgs = app.chatRepository.dao.loadMessages(sessionId)
+        val msgs = app.chatRepository.loadMessages(sessionId)
         val userMsg = msgs.lastOrNull { it.role == "user" }
         val displayedModelName = overrideName ?: app.chatRepository.dao.getSession(sessionId)?.let { resolveDisplay(context, it.modelId) }
         return JSONObject().apply {
@@ -197,7 +197,7 @@ internal object ChatMutationMethods {
         val app = app(context)
         val s = app.chatRepository.dao.getSession(sessionId)
             ?: throw RPCException(-32602, "Session not found")
-        val msgs = app.chatRepository.dao.loadMessages(sessionId)
+        val msgs = app.chatRepository.loadMessages(sessionId)
         val lastMsg = msgs.lastOrNull()
         return JSONObject().apply {
             put("sessionId", sessionId)

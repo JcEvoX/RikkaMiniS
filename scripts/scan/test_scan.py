@@ -2598,6 +2598,40 @@ def test_da1016_gates():
         rc, out = run_scanner(script + ".py", *real_args)
         check(f"{script} real tree green", rc == 0, out[-280:])
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# deep-audit-1018 gates (FIX-A..H, registered at branch wrap-up)
+# Same pattern as DA1017/DA1016: each gate ships its own --selftest whose
+# negative arms assert the pre-fix shape red. The marker assertion is what
+# makes a stubbed gate (sys.exit(0)) fail here — verified by gutting
+# dao_loadmessages_check.py during wrap-up: without the marker check it stayed
+# green, which is exactly the failure mode this list exists to block.
+# ─────────────────────────────────────────────────────────────────────────────
+
+DA1018_GATES = [
+    # (script without .py, selftest closing marker, real-tree argv)
+    ("truncated_call_guard_check", "TRUNCATED_CALL_GUARD_SELFTEST=PASS", (REPO_ROOT,)),
+    ("outcome_known_chain_check", "OUTCOME_KNOWN_CHAIN_SELFTEST=PASS", ("--root", REPO_ROOT)),
+    ("compact_pin_truth_check", "COMPACT_PIN_TRUTH_SELFTEST=PASS", (REPO_ROOT,)),
+    ("dao_loadmessages_check", "DAO_LOADMESSAGES_SELFTEST=PASS", ("--root", REPO_ROOT)),
+    ("backup_remap_rollup_check", "BACKUP_REMAP_ROLLUP_SELFTEST=PASS", (REPO_ROOT,)),
+    ("router_lock_check", "ROUTER_LOCK_SELFTEST=PASS", ("--root", REPO_ROOT)),
+    ("modelsvc_single_read_check", "MODELSVC_SINGLE_READ_SELFTEST=PASS", (REPO_ROOT,)),
+]
+
+def test_da1018_gates():
+    print("━━━ deep-audit-1018 gates (selftest teeth + real tree) ━━━")
+    for script, marker, real_args in DA1018_GATES:
+        proc = subprocess.run(
+            [sys.executable, os.path.join(SCRIPT_DIR, script + ".py"), "--selftest"],
+            capture_output=True, text=True,
+        )
+        out = (proc.stdout or "") + (proc.stderr or "")
+        check(f"{script} selftest has teeth ({marker})", proc.returncode == 0 and marker in out,
+              out[-280:])
+        rc, out = run_scanner(script + ".py", *real_args)
+        check(f"{script} real tree green", rc == 0, out[-280:])
+
 def main():
     print("╔══════════════════════════════════════════════════╗")
     print("║  Scan Self-Test (fixture ground truth)          ║")
@@ -2631,6 +2665,7 @@ def main():
     test_scheduled_store_release()
     test_da1017_gates()
     test_da1016_gates()
+    test_da1018_gates()
     test_da1017_external_fixtures()
     test_real_repo()
     print("")

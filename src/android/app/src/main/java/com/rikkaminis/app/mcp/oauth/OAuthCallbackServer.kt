@@ -76,13 +76,21 @@ class OAuthCallbackServer(
                 Log.d(TAG, "Listening on port $boundPort")
                 while (running) {
                     val socket = serverSocket?.accept() ?: break
+                    // [da1018-G] FD safety: every exit from this iteration — the
+                    // empty-request-line `continue`, the OPTIONS preflight, the
+                    // success path, a parse failure, an exception — releases the
+                    // socket in the finally below. The previous code closed only
+                    // on the normal paths, so a peer that connected and sent
+                    // nothing (`readLine() ?: continue`) leaked one FD per
+                    // attempt and could exhaust the descriptor table on a
+                    // long-lived listener (ISSUE-11).
                     try {
                         // [verify-1015 BUG-12a] Bound the per-connection read
                         // (see IDLE_CONNECT_TIMEOUT_MS): a connection that
                         // sends nothing must not park the single-threaded
                         // listener ahead of the real callback. On timeout
                         // readLine() throws SocketTimeoutException, which the
-                        // catch below already logs and closes.
+                        // catch below already logs; the finally closes it.
                         socket.soTimeout = IDLE_CONNECT_TIMEOUT_MS
                         val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
                         val requestLine = reader.readLine() ?: continue
@@ -118,7 +126,6 @@ class OAuthCallbackServer(
                                 "Access-Control-Max-Age: 600\r\n" +
                                 "Connection: close\r\n\r\n"
                             socket.getOutputStream().write(pre.toByteArray())
-                            socket.close()
                             continue
                         }
 
@@ -126,10 +133,16 @@ class OAuthCallbackServer(
                         val parts = requestLine.split(" ")
                         if (parts.size >= 2) {
                             val uri = URI("http://localhost${ parts[1] }")
-                            val params = uri.query?.split("&")?.associate {
-                                val kv = it.split("=", limit = 2)
-                                kv[0] to (if (kv.size > 1) java.net.URLDecoder.decode(kv[1], "UTF-8") else "")
-                            } ?: emptyMap()
+                            // [da1018-G] Parse the RAW query and %-decode each
+                            // component exactly once. The previous code read
+                            // uri.query — already decoded once by the URI getter —
+                            // and decoded again, so "%2B" in an authorization code
+                            // became a space and "%26" was split into a separate
+                            // param, breaking the token exchange for providers
+                            // whose codes contain those sequences (ISSUE-11). The
+                            // decode shape (escape "+" first) matches the
+                            // WebDavClient.decodeHrefSegment precedent.
+                            val params = parseCallbackQuery(uri.rawQuery)
 
                             val code = params["code"]
                             val state = params["state"]
@@ -138,6 +151,9 @@ class OAuthCallbackServer(
                             val html = "<html><body><h1>Authorization complete</h1><p>You can close this tab.</p><script>window.close()</script></body></html>"
                             val response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: ${html.length}\r\nConnection: close\r\n\r\n$html"
                             socket.getOutputStream().write(response.toByteArray())
+                            // Release the FD before invoking the callback below,
+                            // which may block while resuming the OAuth wait; the
+                            // finally is the backstop for every other path.
                             socket.close()
 
                             if (code != null) {
@@ -154,9 +170,11 @@ class OAuthCallbackServer(
                                 return@Thread
                             }
                         }
-                        socket.close()
                     } catch (e: Exception) {
                         Log.w(TAG, "Error handling connection", e)
+                    } finally {
+                        // [da1018-G] Single guarantee that the connection is
+                        // released on every path (a second close is a no-op).
                         try { socket.close() } catch (_: Exception) {}
                     }
                 }
@@ -186,3 +204,52 @@ class OAuthCallbackServer(
         }
     }
 }
+
+/**
+ * [da1018-G] Parses the query component of an OAuth redirect URL into a
+ * parameter map, %-decoding each key and value EXACTLY ONCE.
+ *
+ * [rawQuery] must be the still-encoded form ([java.net.URI.getRawQuery]),
+ * never [java.net.URI.getQuery] — the getter has already decoded it once, so
+ * a second URLDecoder pass corrupts values: "%2B" in an authorization code
+ * became a space and "%26" split the code into two params (ISSUE-11). Keep
+ * this function pure (no Android types) — it is unit-tested on the JVM by
+ * OAuthCallbackQueryDecodeTest with literal expectations taken from the
+ * java.net ground-truth probe, not derived from this implementation.
+ *
+ * "+" semantics: a literal "+" is preserved as "+", never decoded to a
+ * space. This mirrors the [com.rikkaminis.app.backup.WebDavClient]
+ * decodeHrefSegment precedent ("+" escaped to %2B before decoding): OAuth
+ * codes are not form-urlencoded bodies, a provider that means a plus encodes
+ * it as %2B, and both forms must survive the single decode. A space arrives
+ * as %20 and still decodes to a space.
+ *
+ * Robustness: empty segments, a bare key (no '='), and undecodable escape
+ * sequences are skipped rather than thrown — a hostile or broken redirect
+ * must not kill the listener thread. A bare key maps to the empty string,
+ * matching the previous behavior.
+ */
+internal fun parseCallbackQuery(rawQuery: String?): Map<String, String> {
+    if (rawQuery.isNullOrEmpty()) return emptyMap()
+    val params = LinkedHashMap<String, String>()
+    for (segment in rawQuery.split("&")) {
+        if (segment.isEmpty()) continue
+        val kv = segment.split("=", limit = 2)
+        val key = decodeQueryComponentOnce(kv[0]) ?: continue
+        if (kv.size > 1) {
+            val value = decodeQueryComponentOnce(kv[1]) ?: continue
+            params[key] = value
+        } else {
+            params[key] = ""
+        }
+    }
+    return params
+}
+
+/**
+ * Single %-decode of one query component. Returns null (skip) instead of
+ * throwing on malformed escapes; a literal "+" survives as "+"
+ * (WebDavClient shape: escape first, decode once).
+ */
+private fun decodeQueryComponentOnce(raw: String): String? =
+    runCatching { java.net.URLDecoder.decode(raw.replace("+", "%2B"), "UTF-8") }.getOrNull()

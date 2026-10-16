@@ -286,6 +286,9 @@ internal suspend fun executeShellCommandEngine(
         success = result.exitCode == 0,
         toolTitle = toolTitle,
         timedOut = timedOut,
+        // [deep-audit-1018 ISSUE-03] stamp from the coordinator verdict, so a
+        // withheld replay reaches the trace layer as an unknown outcome.
+        outcomeKnown = result.outcomeKnown,
     )
 }
 
@@ -295,12 +298,37 @@ internal data class ToolResultShell(
     val success: Boolean,
     val toolTitle: String,
     val timedOut: Boolean,
+    /**
+     * [deep-audit-1018 ISSUE-03] Mirrors [com.rikkaminis.app.sandbox.ExecutionCoordinator.CommandResult.outcomeKnown]:
+     * false means "the command may have run but its result is not trustworthy"
+     * (the retry policy withheld a replay). Defaults to true for the
+     * construction sites that are known-outcome by construction (syntax errors,
+     * rejected input), so the field can never be silently dropped on a new path.
+     */
+    val outcomeKnown: Boolean = true,
 ) {
     companion object {
         fun error(message: String, toolTitle: String) =
             ToolResultShell("Error: $message", false, toolTitle, timedOut = false)
     }
 }
+
+/**
+ * [deep-audit-1018 ISSUE-03] The single mapping from the shell engine's result
+ * to the tool-dispatch result. Living here (not inlined at the VM call site)
+ * keeps the outcomeKnown hop in one place: the field has to survive four
+ * layers (coordinator CommandResult -> ToolResultShell -> ToolExecutionResult ->
+ * AgentRunEvent.ToolFinished.resultKnown), and an inlined construction is
+ * exactly where a later field addition silently drops it.
+ */
+internal fun ToolResultShell.toToolExecutionResult(): com.rikkaminis.app.tools.ToolExecutionResult =
+    com.rikkaminis.app.tools.ToolExecutionResult(
+        output = output,
+        success = success,
+        toolTitle = toolTitle,
+        timedOut = timedOut,
+        outcomeKnown = outcomeKnown,
+    )
 
 /**
  * The streamed-line accumulator the original inline closure owned as
