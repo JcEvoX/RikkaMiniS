@@ -66,6 +66,25 @@ internal fun ChatViewModel.compactAll(
     // next provider call, so the guard's "don't tear the streaming UI" concern
     // does not apply. All other callers (manual /compact, sendMessage auto-
     // compact) keep the strict guard via the default false.
+    // ── silent 契约（[fix/compact-silent-abort-cards-1016]）──────────────
+    // silent=true 的调用方只有两个：发送前的 maybeTriggerAutoCompact 与
+    // 长跑回合边界的 maybeAutoCompactInLoop —— 都是 agent 侧的上下文管理，
+    // 不是用户主动动作，对话记录必须看起来没被动过。所以 compactAll 内部
+    // 的**每一条** appendSystemInfo 都必须是「manual-only」，即包在
+    // `if (!silent)` 里（分栏 divider 是唯一的例外：它本来就在 else 分支，
+    // 只在非 silent 路径出现）。判据不是「silent 模式下不许有任何输出」，
+    // 而是「能被重复触发、会在回合中反复出现的卡片 = 泄漏；一次性的、用户
+    // 需要知道的失败通知 = 保留」。逐点判定（2026-10-16，FIX-D）：
+    //  - 已 gate 的 9 处（busy/no-provider/empty-session/no-persisted/
+    //    already-done/nothing/budget-exhausted/anchor-failed/empty-summary）：
+    //    无事发生或可重复的失败，silent 不打印，日志保留诊断；
+    //  - anchor_id_missing：刻意不 gate —— LLMMessage.dbMessageId 是 val、
+    //    且上游两条路都保证非空，这条分支证明不可达；若真的触发，说明内存
+    //    不变量本身坏了，属于「用户需要看一次」的失败通知（见该处注释）；
+    //  - compact_failed 横幅：gate —— 3 天真机日志（10-14/15/16）11 次
+    //    "Compact failed"，同窗口 134 次 compactAll 全部 silent=true，且失败在回合间会复发
+    //    （provider 超时持续存在），正是会重复的卡片；下游仍有 trim 通知、
+    //    发送前 context-full 提示与 Log.w，信息不丢。
     if (_isStreaming.value && !allowInStream) {
         AppLogger.info(ChatViewModel.TAG, "[Compact] aborted: stream in progress")
         if (!silent) {
@@ -273,8 +292,22 @@ internal fun ChatViewModel.compactAll(
                 depth = 0,
             ).trim()
             if (summary.isEmpty()) {
-                withContext(Dispatchers.Main) {
-                    appendSystemInfo(context.getString(R.string.sysmsg_compact_empty_summary), "compact")
+                // [fix/compact-silent-abort-cards-1016] Gated with !silent like
+                // every other abort branch above: a silent auto-compact must
+                // leave the transcript untouched, and this branch can be
+                // re-entered on each eligible attempt (an empty summary is a
+                // provider behaviour, not a one-off), so the card would recur.
+                // Observability moves to the log — the branch had none before,
+                // and the card used to be the only trace of "summary came back
+                // empty". Manual /compact still shows it.
+                AppLogger.warning(
+                    ChatViewModel.TAG,
+                    "[Compact] summary came back empty (silent=$silent) — nothing folded",
+                )
+                if (!silent) {
+                    withContext(Dispatchers.Main) {
+                        appendSystemInfo(context.getString(R.string.sysmsg_compact_empty_summary), "compact")
+                    }
                 }
                 return@launch
             }
@@ -324,8 +357,14 @@ internal fun ChatViewModel.compactAll(
             }
             if (verifiedAnchorIdx < 0) {
                 Log.w(ChatViewModel.TAG, "[Compact] No agentHistory entry has a DB-persisted dbMessageId; aborting")
-                withContext(Dispatchers.Main) {
-                    appendSystemInfo(context.getString(R.string.sysmsg_compact_anchor_failed), "compact")
+                // [fix/compact-silent-abort-cards-1016] Gated with !silent like
+                // its :139 pre-summary twin (same stuck-anchor family — when
+                // reachable it recurs every eligible attempt, so a silent
+                // auto-compact must not print it). Manual /compact keeps it.
+                if (!silent) {
+                    withContext(Dispatchers.Main) {
+                        appendSystemInfo(context.getString(R.string.sysmsg_compact_anchor_failed), "compact")
+                    }
                 }
                 return@launch
             }
@@ -339,6 +378,16 @@ internal fun ChatViewModel.compactAll(
             val lastCompactedDbId = history[verifiedAnchorIdx].dbMessageId
                 ?: run {
                     Log.w(ChatViewModel.TAG, "[Compact] verified anchor at idx=$verifiedAnchorIdx lost dbMessageId; aborting")
+                    // [fix/compact-silent-abort-cards-1016] Deliberately NOT
+                    // silent-gated, unlike the three sibling abort cards. Criterion:
+                    // a silent auto-compact must stay invisible only for cards that
+                    // can be re-emitted; this branch is provably unreachable —
+                    // LLMMessage.dbMessageId is a `val` on an immutable data class,
+                    // and the guard above only lets a non-empty id through (both
+                    // the rawDbIds walk-back and resolveCompactAnchorIdx require
+                    // "not null and not empty"). If it ever fires the in-memory
+                    // invariant itself broke, and that is a one-time notice the
+                    // user should see rather than a repeatable card.
                     withContext(Dispatchers.Main) {
                         appendSystemInfo(context.getString(R.string.sysmsg_compact_anchor_id_missing), "compact")
                     }
@@ -485,11 +534,26 @@ internal fun ChatViewModel.compactAll(
             throw e
         } catch (e: Exception) {
             Log.w(ChatViewModel.TAG, "Compact failed", e)
-            withContext(Dispatchers.Main) {
-                appendSystemInfo(
-                    text = context.getString(R.string.sysmsg_compact_failed, e.message ?: e.javaClass.simpleName),
-                    iconKind = "compact",
-                )
+            // [fix/compact-silent-abort-cards-1016] Gated with !silent: this is
+            // the most frequent compact-failure path (3 days of device logs:
+            // 11 "Compact failed" emissions, and all 134 compactAll() attempts
+            // in that window were silent=true), and it re-fires on every
+            // eligible attempt (provider timeouts persist across turns), so in
+            // silent mode it is exactly the "repeated card mid-answer" leak
+            // shape the 9 already-gated abort branches were closed for. The
+            // failure still surfaces downstream: in-loop the caller falls back
+            // to trimContextHistoryWindow (its trim notice is a separate
+            // feature the strip pass must not eat), the send entry gets the
+            // context-full advisory, and Log.w + the caller's
+            // "[AutoCompactLoop] folded=nothing" INFO stay. Manual /compact
+            // keeps the banner.
+            if (!silent) {
+                withContext(Dispatchers.Main) {
+                    appendSystemInfo(
+                        text = context.getString(R.string.sysmsg_compact_failed, e.message ?: e.javaClass.simpleName),
+                        iconKind = "compact",
+                    )
+                }
             }
         } finally {
             _isCompacting.value = false
@@ -687,9 +751,16 @@ internal suspend fun ChatViewModel.generateCompactSummary(conversationText: Stri
     // counts as a failure and tries the next candidate — a truncated
     // summary must never replace the context. withTimeoutOrNull swallows ONLY
     // its own TimeoutCancellationException — a user cancel still propagates
-    // (termination path unchanged) — and an exhausted chain throws
-    // lastFailure exactly as before, so the splitter's halving retry is
-    // untouched. See ordersCompactionCandidates for the ordering logic.
+    // (termination path unchanged) — and an exhausted chain throws lastFailure
+    // exactly as before, so the splitter's halving retry is
+    // untouched.
+    // [fix/compact-lastfailure-pin-1016] "exactly as before" 有一个刻意的例外：
+    // 链上出现过 ContextTooLarge 分类的失败时，抛出的必须是它，而不是链尾的
+    // 最后一个普通失败（超时 / 5xx / unavailable）—— 否则外层 catch 的
+    // isContextTooLargeError 分支永远看不到容量证据，「halving retry is
+    // untouched」就只是注释里的空话（真实日志：Splitting 事件 3 天 0 次）。
+    // 普通失败链的语义不变：仍然抛最后一条。See ordersCompactionCandidates
+    // for the ordering logic.
     // [feat/compact-model-pin-1005] The user-pinned compaction model
     // (Settings → Model Groups → 压缩模型, moved from Runtime Limits) rides
     // the chain head. It works
@@ -733,6 +804,14 @@ internal suspend fun ChatViewModel.generateCompactSummary(conversationText: Stri
     }
     val deadlineAt = SystemClock.elapsedRealtime() + ChatViewModel.COMPACT_SUMMARY_TOTAL_BUDGET_MS
     var lastFailure: Exception = IllegalStateException("compaction failed")
+    // [fix/compact-lastfailure-pin-1016] ContextTooLarge 的原始失败必须钉住：
+    // 二分拆解（recursive halving）只认 `isContextTooLargeError`，而判定发生在
+    // **外层** catch —— 本函数把异常抛出去之后。若 TooLarge 被后续候选的普通
+    // 失败（超时 / 5xx / unavailable / truncated）覆盖，链上唯一的容量证据就
+    // 丢了：外层按普通失败处理 → 不拆解、不重试，整条链当失败收场，而这正是
+    // :691 注释里「halving retry is untouched」契约的反面。真实时序量过：
+    // 候选 1/2 回 400 context length、候选 2/2 超时，修复后外层看到的必须是 400。
+    var tooLargeFailure: Exception? = null
     for ((index, step) in chain.withIndex()) {
         val (candidate, entryId) = step
         val budgetMs = compactionCandidateBudgetMs(
@@ -793,7 +872,19 @@ internal suspend fun ChatViewModel.generateCompactSummary(conversationText: Stri
                     "[Compact] summary failed on ${if (entryId != null) "fallback $label" else "active member"} " +
                         "(${r.code}: ${r.message}) — trying next of ${chain.size - index - 1} candidate(s)",
                 )
-                lastFailure = IllegalStateException("compaction failed (${r.code}): ${r.message}")
+                // [fix/compact-lastfailure-pin-1016] 归约规则单源在
+                // [ContextCompactor.chainFailureAfter]：链上唯一的容量证据在此
+                // 钉住，任何后续候选的普通失败都不得覆盖它（见 tooLargeFailure
+                // 声明处的时序注释）。
+                val candidateFailure = IllegalStateException("compaction failed (${r.code}): ${r.message}")
+                val reduced = ContextCompactor.chainFailureAfter(
+                    lastOrdinary = lastFailure,
+                    pinnedTooLarge = tooLargeFailure,
+                    candidate = candidateFailure,
+                    isTooLarge = ::isContextTooLargeError,
+                )
+                lastFailure = reduced.first
+                tooLargeFailure = reduced.second
             }
             is ProviderExecutionGateway.SendResult.Unavailable -> {
                 AppLogger.info(
@@ -804,6 +895,11 @@ internal suspend fun ChatViewModel.generateCompactSummary(conversationText: Stri
             }
         }
     }
+    // [fix/compact-lastfailure-pin-1016] 链全败收场时：TooLarge 优先于普通失败
+    // 抛出 —— 让外层 catch 的 isContextTooLargeError 分支（二分拆解重试）拿到
+    // 它该看到的证据，而不是被链尾的最后一个普通失败冲掉。终态规则单源在
+    // [ContextCompactor.chainTerminalFailure]。
+    lastFailure = ContextCompactor.chainTerminalFailure(lastFailure, tooLargeFailure)
     throw lastFailure
 }
 
