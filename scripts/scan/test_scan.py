@@ -1824,6 +1824,77 @@ def test_katex_bridge_arity():
     shutil.rmtree(root)
 
 
+def ro_write_guard_fixture(guarded=True):
+    """Minimal tree for readonly_mount_write_guard: three handlers that write a
+    host file at a caller-supplied path parameter, optionally WITHOUT the guard
+    — the exact FIX-C 2b shape (`shapeRawPassthrough` / `writeRunOutput` had no
+    read-only check while `tools/FileWriteTool` did).
+
+    Three sites, not one: the scanner's rot guard refuses to report a clean bill
+    of health for a tree where it found almost nothing to check, so a fixture
+    with a single site would exercise the rot path instead of the rule.
+    """
+    def guard(param):
+        return (
+            f"        if ({param} != null && PRootKernel.isLinuxPathUnderReadOnlyMount({param})) {{\n"
+            '            return 2\n'
+            "        }\n"
+            if guarded else ""
+        )
+
+    def handler(tag, param):
+        return (
+            "package com.rikkaminis.app.sandbox.offload\n"
+            "\n"
+            "import java.io.File\n"
+            "\n"
+            f"class Handler{tag} {{\n"
+            f"    fun run{tag}({param}: String?): Int {{\n"
+            + guard(param) +
+            f"        val hostFile = File({param} ?: return 0)\n"
+            '        hostFile.writeText("body")\n'
+            "        return 0\n"
+            "    }\n"
+            "}\n"
+        )
+
+    proot = (
+        "package com.rikkaminis.app.sandbox\n"
+        "\n"
+        "object PRootKernel {\n"
+        "    fun isLinuxPathUnderReadOnlyMount(linuxPath: String): Boolean = false\n"
+        "}\n"
+    )
+    files = {
+        os.path.join(KOTLIN_PKG, "sandbox/offload/HandlerA.kt"): handler("A", "outputPath"),
+        os.path.join(KOTLIN_PKG, "sandbox/offload/HandlerB.kt"): handler("B", "destPath"),
+        os.path.join(KOTLIN_PKG, "sandbox/offload/HandlerC.kt"): handler("C", "linuxPath"),
+        os.path.join(KOTLIN_PKG, "sandbox/PRootKernel.kt"): proot,
+    }
+    for i in range(24):
+        files[os.path.join(KOTLIN_PKG, f"sandbox/Filler{i}.kt")] = (
+            f"package com.rikkaminis.app.sandbox\n\nclass Filler{i}\n"
+        )
+    return files
+
+
+def test_readonly_mount_write_guard():
+    print("━━━ readonly_mount_write_guard ━━━")
+
+    root = make_tree(ro_write_guard_fixture(guarded=True))
+    code, out = run_scanner("readonly_mount_write_guard.py", root)
+    check("a guarded --output write site passes (exit 0)", code == 0, f"exit={code}\n{out}")
+    check("the scan reports how many sites it actually checked", "write site(s) guarded" in out, out)
+    shutil.rmtree(root)
+
+    root = make_tree(ro_write_guard_fixture(guarded=False))
+    code, out = run_scanner("readonly_mount_write_guard.py", root)
+    check("an unguarded --output write site is caught (exit 1)", code == 1, f"exit={code}\n{out}")
+    check("the finding names the function and the missing call",
+          "runA(" in out and "isLinuxPathUnderReadOnlyMount" in out, out)
+    shutil.rmtree(root)
+
+
 def test_real_repo():
     print("━━━ real repo tree (must be clean) ━━━")
     for script in (
@@ -1844,6 +1915,7 @@ def test_real_repo():
         "loop_counter_reset_guard.py",
         "budget_stop_break_guard.py",
         "katex_bridge_arity_check.py",
+        "readonly_mount_write_guard.py",
     ):
         code, out = run_scanner(script, REPO_ROOT)
         check(f"{script} on real repo exits 0", code == 0, f"exit={code}\n{out[:2000]}")
@@ -2055,6 +2127,7 @@ def main():
     test_loop_counter_reset()
     test_budget_stop_break()
     test_katex_bridge_arity()
+    test_readonly_mount_write_guard()
     test_real_repo()
     print("")
     print(f"{'❌ FAILURES: ' + str(FAIL) if FAIL else '✅ ALL ' + str(PASS) + ' CASES PASS'}")
