@@ -172,7 +172,7 @@ object SessionConcurrencyManager {
      * [verify-1015 BUG-04] 取消落在"已提升、未恢复"窗口时，把那个已计入 active 的
      * 槽位释放掉。
      *
-     * promote() 在两种形态下都会把 runId 记进 active：continuation 已注册则先删
+     * promoteLocked() 在两种形态下都会把 runId 记进 active：continuation 已注册则先删
      * pending 条目再 resume；尚未注册则保留 PROMOTED 条目等注册时立即恢复。若此刻
      * 协程已被取消，resume 被丢弃、调用方直接以 CancellationException 离开
      * acquireSlot —— 它不会进入持有 releaseSlot 的 try（业务侧 try 从 acquireSlot
@@ -185,38 +185,50 @@ object SessionConcurrencyManager {
      * 按 runId 身份移除（不用 releaseSlot 的 removeLastOrNull）：同一 session 可能另有
      * 并发 run 已被提升，栈是 LIFO，而此处要精确释放"我这个"，否则会误放别人的槽位。
      */
-    @Synchronized
+    /**
+     * [audit-1018 ISSUE-10] 临界区内只做状态迁移，resume 与打点交还
+     * [finishPromotion] 在**锁外**执行（旧写法是 @Synchronized 方法体里直接调
+     * promote，它内部的 `toResume?.resume(Unit)` 因此落在持锁线程上——注释与实现相反）。
+     */
     private fun releasePromotedAfterCancel(runId: String, sessionId: String) {
-        val stack = activeRunIdsBySession[sessionId] ?: return
-        // 从未被提升（仍在排队）：排队清理路径已覆盖，不能重复释放。
-        if (!stack.remove(runId)) return
-        pending.remove(runId)
-        if (stack.isEmpty()) {
-            activeRunIdsBySession.remove(sessionId)
-            _runningSessions.value = _runningSessions.value - sessionId
+        val promotion = synchronized(this) {
+            val stack = activeRunIdsBySession[sessionId] ?: return@synchronized Promotion.NONE
+            // 从未被提升（仍在排队）：排队清理路径已覆盖，不能重复释放。
+            if (!stack.remove(runId)) return@synchronized Promotion.NONE
+            pending.remove(runId)
+            if (stack.isEmpty()) {
+                activeRunIdsBySession.remove(sessionId)
+                _runningSessions.value = _runningSessions.value - sessionId
+            }
+            val promoted = controller.release(runId)
+            if (promoted != null) promoteLocked(promoted) else Promotion.NONE
         }
-        val promoted = controller.release(runId)
-        if (promoted != null) promote(promoted)
+        finishPromotion(promotion)
     }
 
     /**
      * 释放该 session 最近获得的 active 槽位；无 active 槽位时 no-op（幂等）。
      * 释放后若等待队列非空，队首 waiter 被提升并恢复。
+     *
+     * [audit-1018 ISSUE-10] 临界区只覆盖状态迁移（本函数不再是 @Synchronized 方法），
+     * 被提升 waiter 的 resume 由 [finishPromotion] 在锁外执行。
      */
-    @Synchronized
     fun releaseSlot(sessionId: String) {
-        val stack = activeRunIdsBySession[sessionId] ?: return
-        val runId = stack.removeLastOrNull() ?: return
-        // [fix/audit-b19 / T8-L1] Only drop the session from the running set
-        // when its last active run goes away. The old unconditional removal
-        // made a session with two concurrent runs look idle after one of them
-        // finished (occupancy() is read by RuntimeLimitsScreen).
-        if (stack.isEmpty()) {
-            activeRunIdsBySession.remove(sessionId)
-            _runningSessions.value = _runningSessions.value - sessionId
+        val promotion = synchronized(this) {
+            val stack = activeRunIdsBySession[sessionId] ?: return@synchronized Promotion.NONE
+            val runId = stack.removeLastOrNull() ?: return@synchronized Promotion.NONE
+            // [fix/audit-b19 / T8-L1] Only drop the session from the running set
+            // when its last active run goes away. The old unconditional removal
+            // made a session with two concurrent runs look idle after one of them
+            // finished (occupancy() is read by RuntimeLimitsScreen).
+            if (stack.isEmpty()) {
+                activeRunIdsBySession.remove(sessionId)
+                _runningSessions.value = _runningSessions.value - sessionId
+            }
+            val promoted = controller.release(runId)
+            if (promoted != null) promoteLocked(promoted) else Promotion.NONE
         }
-        val promoted = controller.release(runId)
-        if (promoted != null) promote(promoted)
+        finishPromotion(promotion)
     }
 
     fun isSuspended(sessionId: String): Boolean = sessionId in _suspendedSessions.value
@@ -251,29 +263,53 @@ object SessionConcurrencyManager {
             it !== except && it.sessionId == sessionId && it.state != PendingRun.State.PROMOTED
         }
 
-    /** 将 [runId] 对应的 waiter 提升为 active 并恢复其协程（在锁外 resume，避免死锁）。 */
-    private fun promote(runId: String) {
-        var toResume: CancellableContinuation<Unit>? = null
-        synchronized(this) {
-            val p = pending[runId] ?: return
-            if (p.state == PendingRun.State.PROMOTED) return // 只提升一次
-            p.state = PendingRun.State.PROMOTED
-            // [fix/audit-0917-b9] 仅在“本 session 没有别的 waiter 还在等”时清挂起标记：
-            // 同一会话并发两次发送时两个 run 共用一个 sessionId，提升第一个就清标记，
-            // 会让仍在排队的第二个在 UI 上不再显示“等待中”。PROMOTED 的不算（已进 running）。
-            if (!hasOtherWaiting(p.sessionId, p)) {
-                _suspendedSessions.value = _suspendedSessions.value - p.sessionId
-            }
-            _runningSessions.value = _runningSessions.value + p.sessionId
-            activeRunIdsBySession.getOrPut(p.sessionId) { ArrayDeque() }.addLast(runId)
-            if (p.continuation != null) {
-                pending.remove(runId)
-                toResume = p.continuation
-            }
-            // continuation == null：提升发生在 acquireSlot 挂起注册之前（线程抢占窗口），
-            // 保留 PROMOTED 条目，等挂起块注册 continuation 时立即恢复，避免 resume 丢失。
+    /**
+     * [promoteLocked] 的结果：本次是否真的发生了提升（[D-2] 打点用）+ 需要由调用方在
+     * **锁外** resume 的 continuation（null = 提升发生在挂起注册之前，PROMOTED 条目
+     * 保留，等挂起块注册时立即恢复，避免 resume 丢失）。
+     */
+    private class Promotion(val happened: Boolean, val toResume: CancellableContinuation<Unit>?) {
+        companion object {
+            /** 无提升（runId 不在队列 / 已提升过）。 */
+            val NONE = Promotion(happened = false, toResume = null)
         }
-        toResume?.resume(Unit)
+    }
+
+    /**
+     * 锁内核心：将 [runId] 对应的 waiter 提升为 active。
+     *
+     * **调用方必须已持有本对象锁**（本函数自身不加锁，好让 [releaseSlot] /
+     * [releasePromotedAfterCancel] 在同一个临界区里完成"释放+提升"）；它只做状态迁移，
+     * 把需要在锁外执行的 resume 交还调用方。这是本类的硬约定 —— resume 在持锁线程上
+     * 执行会让被唤醒 waiter 的后续回调排在本对象锁之后，[audit-1018 ISSUE-10] 修的就是
+     * 旧实现把这层分工架空（注释宣称"锁外 resume"，实际两个调用方都是 @Synchronized）。
+     */
+    private fun promoteLocked(runId: String): Promotion {
+        val p = pending[runId] ?: return Promotion.NONE
+        if (p.state == PendingRun.State.PROMOTED) return Promotion.NONE // 只提升一次
+        p.state = PendingRun.State.PROMOTED
+        // [fix/audit-0917-b9] 仅在“本 session 没有别的 waiter 还在等”时清挂起标记：
+        // 同一会话并发两次发送时两个 run 共用一个 sessionId，提升第一个就清标记，
+        // 会让仍在排队的第二个在 UI 上不再显示“等待中”。PROMOTED 的不算（已进 running）。
+        if (!hasOtherWaiting(p.sessionId, p)) {
+            _suspendedSessions.value = _suspendedSessions.value - p.sessionId
+        }
+        _runningSessions.value = _runningSessions.value + p.sessionId
+        activeRunIdsBySession.getOrPut(p.sessionId) { ArrayDeque() }.addLast(runId)
+        val cont = p.continuation ?: return Promotion(happened = true, toResume = null)
+        // continuation 已注册：先删 pending 条目再把它交出去 resume。
+        pending.remove(runId)
+        return Promotion(happened = true, toResume = cont)
+    }
+
+    /**
+     * 锁外收尾：resume 被 [promoteLocked] 提升的 waiter，然后打 [D-2] 点。
+     *
+     * **绝不可以在持有本对象锁时调用** —— 见 [promoteLocked]。
+     */
+    private fun finishPromotion(promotion: Promotion) {
+        promotion.toResume?.resume(Unit)
+        if (!promotion.happened) return
         // [D-2] 槽位释放后队列头部被提升：记录释放后的占用，配合 queue 打点完整还原
         // 每一轮占压-释放周期，判断 cap 是否够用。
         val snap = controller.snapshot()
