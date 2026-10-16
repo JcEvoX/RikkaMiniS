@@ -1652,4 +1652,7 @@
     <string name="backup_passphrase_title">加密備份套件</string>
     <string name="backup_passphrase_body">此 OpenMinis 備份套件已加密（minisbak-enc/1）。請輸入匯出時設定的密碼。</string>
     <string name="backup_passphrase_label">密碼</string>
+    <!-- Text-to-speech: spoken link phrases (VoiceTextSanitizer). -->
+    <string name="tts_spoken_link_to_host">連結到%1$s</string>
+    <string name="tts_spoken_bare_link">連結</string>
 </resources>

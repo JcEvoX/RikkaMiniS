@@ -1652,4 +1652,7 @@
     <string name="backup_passphrase_title">Verschlüsseltes Backup</string>
     <string name="backup_passphrase_body">Dieses OpenMinis-Paket ist verschlüsselt (minisbak-enc/1). Geben Sie die beim Export verwendete Passphrase ein.</string>
     <string name="backup_passphrase_label">Passphrase</string>
+    <!-- Text-to-speech: spoken link phrases (VoiceTextSanitizer). -->
+    <string name="tts_spoken_link_to_host">Link zu %1$s</string>
+    <string name="tts_spoken_bare_link">Link</string>
 </resources>

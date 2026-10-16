@@ -1605,4 +1605,7 @@
     <string name="backup_passphrase_title">Зашифрованная резервная копия</string>
     <string name="backup_passphrase_body">Этот пакет OpenMinis зашифрован (minisbak-enc/1). Введите парольную фразу, использованную при экспорте.</string>
     <string name="backup_passphrase_label">Парольная фраза</string>
+    <!-- Text-to-speech: spoken link phrases (VoiceTextSanitizer). -->
+    <string name="tts_spoken_link_to_host">Ссылка на %1$s</string>
+    <string name="tts_spoken_bare_link">Ссылка</string>
 </resources>

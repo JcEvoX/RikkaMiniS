@@ -2565,6 +2565,31 @@ def test_da1017_external_fixtures():
         rc, out = run_scanner(script + ".py", dirty_root)
         check(f"{script} external {dirty_name} fixture red", rc == 1, out[-280:])
 
+# ─────────────────────────────────────────────────────────────────────────────
+# deep-audit-1016 gate (FIX-E / ISSUE-07, registered at branch wrap-up)
+# Same pattern as DA1017: the gate ships its own --selftest with negative
+# arms; asserted here via its unique closing marker so a stubbed gate cannot
+# pass silently, plus the real-tree check pinned the way CI runs it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+DA1016_GATES = [
+    # (script without .py, selftest closing marker, real-tree argv)
+    ("tts_voice_and_sanitizer_check", "TTS-VOICE GATE ALL ARMS MATCH", ("--root", REPO_ROOT)),
+]
+
+def test_da1016_gates():
+    print("━━━ deep-audit-1016 gates (selftest teeth + real tree) ━━━")
+    for script, marker, real_args in DA1016_GATES:
+        proc = subprocess.run(
+            [sys.executable, os.path.join(SCRIPT_DIR, script + ".py"), "--selftest"],
+            capture_output=True, text=True,
+        )
+        out = (proc.stdout or "") + (proc.stderr or "")
+        check(f"{script} selftest has teeth ({marker})", proc.returncode == 0 and marker in out,
+              out[-280:])
+        rc, out = run_scanner(script + ".py", *real_args)
+        check(f"{script} real tree green", rc == 0, out[-280:])
+
 def main():
     print("╔══════════════════════════════════════════════════╗")
     print("║  Scan Self-Test (fixture ground truth)          ║")
@@ -2597,6 +2622,7 @@ def main():
     test_exec_gate()
     test_scheduled_store_release()
     test_da1017_gates()
+    test_da1016_gates()
     test_da1017_external_fixtures()
     test_real_repo()
     print("")

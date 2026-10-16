@@ -171,4 +171,59 @@ class VoiceTextSanitizerTest {
         assertTrue(out.contains("the guide"))
         assertTrue(out.contains("first item"))
     }
+
+    // -- localized phrases (the R.string path TtsSpokenPhrases wires) --
+
+    @Test
+    fun `localized link phrases are honoured for bare urls`() {
+        // [fix/da1016-tts-voice] The phrases come from strings.xml via
+        // TtsSpokenPhrases; this pins that a non-English set is honoured,
+        // including the bare-link branch (URL with no parseable host).
+        val zh = VoiceTextSanitizer.LinkPhrases(linkToHost = "%1\$s 的链接", bareLink = "链接")
+        assertEquals(
+            "见 example.com 的链接",
+            VoiceTextSanitizer.sanitize("见 https://www.example.com/a", zh),
+        )
+        assertEquals("见 链接", VoiceTextSanitizer.sanitize("见 https:///path", zh))
+    }
+
+    @Test
+    fun `localized link phrases are honoured for descriptionless markdown links`() {
+        val zh = VoiceTextSanitizer.LinkPhrases(linkToHost = "%1\$s 的链接", bareLink = "链接")
+        assertEquals(
+            "看 example.com 的链接",
+            VoiceTextSanitizer.sanitize("看 [](https://www.example.com/a)", zh),
+        )
+    }
+
+    // -- exact output for multi-line tables (was only contains-asserted) --
+
+    @Test
+    fun `cross line table keeps its cells in reading order`() {
+        assertEquals("a b\n\n1 2", clean("| a | b |\n| --- | --- |\n| 1 | 2 |"))
+    }
+
+    @Test
+    fun `cross line table with cjk cells keeps the han`() {
+        assertEquals(
+            "名称 数量\n\n苹果 3",
+            clean("| 名称 | 数量 |\n| --- | --- |\n| 苹果 | 3 |"),
+        )
+    }
+
+    // -- cjk text keeps the han through markdown cleanup --
+
+    @Test
+    fun `cjk survives emphasis heading and emoji cleanup`() {
+        // The sanitized text is what language auto-detection sees now, so a
+        // Han-bearing message must not come out Han-free.
+        assertEquals("重要", clean("**重要**"))
+        assertEquals("标题", clean("## 标题"))
+        assertEquals("重要", clean("重要🔥"))
+        assertTrue(
+            "han must survive so auto-detection still picks zh-CN",
+            VoiceTextSanitizer.sanitize("见 example.com 的链接", VoiceTextSanitizer.LinkPhrases("%1\$s 的链接", "链接"))
+                .contains("的链接"),
+        )
+    }
 }

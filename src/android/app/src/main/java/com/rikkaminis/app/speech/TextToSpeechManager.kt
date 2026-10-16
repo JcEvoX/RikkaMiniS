@@ -4,6 +4,7 @@ import android.content.Context
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
+import com.rikkaminis.app.R
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -14,13 +15,13 @@ import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Manages Android TextToSpeech engine for reading assistant responses aloud.
- * Supports en-US and zh-CN with automatic language detection.
+ * Supports en-US and zh-CN with automatic language detection, plus an
+ * explicit-language channel and spoken-text cleanup ([speak]).
  */
 class TextToSpeechManager : TextToSpeech.OnInitListener {
 
     companion object {
         private const val TAG = "TextToSpeech"
-        private val HAN_REGEX = Regex("[\\u4e00-\\u9fff\\u3400-\\u4dbf]")
         // [T-android-tts-intranumber-guard] The sentence-boundary set moved to
         // SpeechSentenceSplitter.SENTENCE_ENDERS — a single source of truth
         // shared by every TTS path, so they can't drift.
@@ -29,6 +30,20 @@ class TextToSpeechManager : TextToSpeech.OnInitListener {
     private var tts: TextToSpeech? = null
     var isInitialized = false
         private set
+
+    // [fix/da1016-tts-voice] Mirror of the language the engine is currently
+    // set to — only tags the engine ACCEPTED are recorded (a rejected
+    // setLanguage leaves the engine on its previous language), so
+    // [currentLanguageTag] never reports a language the engine refused.
+    // @Volatile: written from the main thread (speak / setLanguage) and read
+    // back by the offload handler thread for its return body.
+    @Volatile
+    private var currentLocaleTag: String? = null
+
+    // [fix/da1016-tts-voice] Application context for the spoken link phrases
+    // ([TtsSpokenPhrases]). Application-scoped, so holding it cannot leak an
+    // Activity.
+    private var appContext: Context? = null
 
     private val _isSpeaking = MutableStateFlow(false)
     val isSpeaking: StateFlow<Boolean> = _isSpeaking.asStateFlow()
@@ -77,6 +92,7 @@ class TextToSpeechManager : TextToSpeech.OnInitListener {
      * instance (which holds native audio resources until shutdown).
      */
     fun init(context: Context) {
+        appContext = context.applicationContext
         tts?.let { old -> old.shutdown() }
         tts = null
         isInitialized = false
@@ -89,9 +105,13 @@ class TextToSpeechManager : TextToSpeech.OnInitListener {
             tts?.apply {
                 setSpeechRate(speechRate)
                 setPitch(speechPitch)
-                setLanguage(Locale.US)
                 setOnUtteranceProgressListener(createProgressListener())
             }
+            // [fix/da1016-tts-voice] Route the default language through the
+            // single chokepoint so the mirror knows the engine's state from
+            // the start — a --voice tag the engine later rejects then reports
+            // the language that will actually be spoken, not "unknown".
+            applyLanguage(Locale.US)
             Log.d(TAG, "TTS initialized successfully")
         } else {
             Log.e(TAG, "TTS initialization failed with status: $status")
@@ -100,10 +120,33 @@ class TextToSpeechManager : TextToSpeech.OnInitListener {
 
     /**
      * Speaks text immediately, interrupting any ongoing speech (QUEUE_FLUSH).
-     * Automatically detects language from text content.
+     *
+     * [fix/da1016-tts-voice] **Text cleanup first**: the text is sanitized
+     * before the engine reads it — markdown syntax, bare URLs and
+     * non-speakable glyphs are stripped or rewritten as link phrases
+     * ([VoiceTextSanitizer], now wired from the R.string source its own KDoc
+     * describes). When nothing speakable remains (e.g. a message that was
+     * only a fenced code block) nothing is voiced and the result is `false`;
+     * callers must not fall back to reading the raw text. Language detection
+     * runs on the sanitized text — what is actually spoken.
+     *
+     * [fix/da1016-tts-voice] **Explicit language**: [explicitLanguage] is a
+     * caller-pinned BCP-47 tag (android-speak `--voice`) and wins over
+     * auto-detection, which only runs when it is null/blank. The previous
+     * unconditional detection here overwrote whatever the offload handler had
+     * just set from `--voice`, collapsing every tag to the zh/en binary
+     * guess. The streaming path ([appendText] / [flush] → [speakQueued]) keeps
+     * per-slice auto-detection: it has no explicit language to honor.
+     *
+     * @return true when an utterance was actually enqueued.
      */
-    fun speak(text: String) {
-        if (!isInitialized || text.isBlank()) return
+    fun speak(text: String, explicitLanguage: String? = null): Boolean {
+        if (!isInitialized || text.isBlank()) return false
+
+        // [T-android-voice-text-sanitizer] Empty after cleanup = nothing to
+        // speak — leave the engine (and any ongoing session) untouched.
+        val speakable = VoiceTextSanitizer.sanitize(text, TtsSpokenPhrases.from(appContext))
+        if (speakable.isBlank()) return false
 
         // [sweep1014-B20b] Bump the epoch BEFORE enqueueing: the utterance the
         // engine flushes still delivers onDone/onError asynchronously — with a
@@ -112,15 +155,22 @@ class TextToSpeechManager : TextToSpeech.OnInitListener {
         val sessionEpoch = drain.newSession()
         sentenceBuffer.setLength(0)
 
-        autoDetectAndSetLanguage(text)
+        applyLanguage(TtsLanguagePolicy.resolveTargetLocale(explicitLanguage, speakable))
 
         val params = buildSpeechParams()
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, drain.utteranceId(sessionEpoch))
+        tts?.speak(speakable, TextToSpeech.QUEUE_FLUSH, params, drain.utteranceId(sessionEpoch))
         _isSpeaking.value = true
+        return true
     }
 
     /**
      * Adds text to the speech queue without interrupting (QUEUE_ADD).
+     *
+     * [fix/da1016-tts-voice] The streaming path ([appendText] / [flush]) keeps
+     * its per-slice auto-detection — there is no explicit language to honor
+     * there — and is intentionally NOT sanitized: cleaning slice by slice
+     * would break cross-slice link rewriting. [speak] is the sanitized
+     * read-aloud entry.
      */
     fun speakQueued(text: String) {
         if (!isInitialized || text.isBlank()) return
@@ -217,10 +267,31 @@ class TextToSpeechManager : TextToSpeech.OnInitListener {
      */
     fun setLanguage(locale: Locale) {
         if (!isInitialized) return
-        val result = tts?.setLanguage(locale)
+        applyLanguage(locale)
+    }
+
+    /**
+     * The language tag the engine is currently set to, or null when unknown.
+     * Only tags the engine ACCEPTED are recorded ([currentLocaleTag]), so a
+     * caller reporting the "effective voice" never echoes back a language the
+     * engine refused. [fix/da1016-tts-voice]
+     */
+    fun currentLanguageTag(): String? = currentLocaleTag
+
+    /**
+     * [fix/da1016-tts-voice] Single language chokepoint: every language change
+     * (default on init, auto-detection, explicit `--voice`) goes through here,
+     * so the [currentLocaleTag] mirror can't drift from the engine state.
+     */
+    private fun applyLanguage(locale: Locale) {
+        val engine = tts ?: return
+        val result = engine.setLanguage(locale)
         if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
+            // The engine keeps its previous language — leave the mirror alone
+            // so currentLanguageTag() reports what will actually be spoken.
             Log.w(TAG, "Language not supported: ${locale.toLanguageTag()}")
         } else {
+            currentLocaleTag = locale.toLanguageTag()
             Log.d(TAG, "Language set to: ${locale.toLanguageTag()}")
         }
     }
@@ -233,19 +304,19 @@ class TextToSpeechManager : TextToSpeech.OnInitListener {
         tts?.shutdown()
         tts = null
         isInitialized = false
+        currentLocaleTag = null
         Log.d(TAG, "TTS shut down")
     }
 
     /**
      * Detects if text contains Han characters and sets language accordingly.
+     *
+     * [fix/da1016-tts-voice] Delegates to the shared [TtsLanguagePolicy] so
+     * the read-aloud path ([speak], explicit tag wins) and this streaming
+     * path share one decision source.
      */
     private fun autoDetectAndSetLanguage(text: String) {
-        val locale = if (HAN_REGEX.containsMatchIn(text)) {
-            Locale.SIMPLIFIED_CHINESE
-        } else {
-            Locale.US
-        }
-        tts?.setLanguage(locale)
+        applyLanguage(TtsLanguagePolicy.autoDetectLocale(text))
     }
 
     private fun buildSpeechParams(): android.os.Bundle {
@@ -348,4 +419,85 @@ internal class TtsDrainTracker {
                 ?.substringBefore('-')
                 ?.toLongOrNull()
     }
+}
+
+/**
+ * [fix/da1016-tts-voice] Pure language decision for one spoken utterance.
+ *
+ * [T-android-speech-asr] The Han regex mirrors
+ * SpeechRecognizer.DEFAULT_LANGUAGES: Simplified Chinese plus the Extension A
+ * block, so text the recognizer could be asked to transcribe is also
+ * recognized here as Chinese.
+ *
+ * The auto-detect path stays binary (Chinese vs. "other"), exactly as the
+ * legacy inline implementation. The decision lives here because it used to
+ * run unconditionally inside [TextToSpeechManager.speak] — overwriting the
+ * language SpeakOffloadHandler had just set from `--voice`, so every explicit
+ * tag collapsed to the zh/en guess while the tool still reported it as the
+ * chosen voice.
+ *
+ * Pure JVM (Locale + Regex only): the sandbox device and the CI suite test
+ * the same decision.
+ */
+internal object TtsLanguagePolicy {
+
+    private val HAN_REGEX = Regex("[\\u4e00-\\u9fff\\u3400-\\u4dbf]")
+
+    /**
+     * The language to use for [text]: a caller-pinned BCP-47 tag
+     * ([explicitTag]) wins over auto-detection — explicit zh on English text
+     * must not be overridden. A tag the platform cannot turn into a usable
+     * language (blank, or one whose language subtag resolves empty — "und",
+     * "x-privateuse") falls back to [autoDetectLocale] instead of handing the
+     * engine a language it will refuse anyway. Shape-valid but unknown codes
+     * still go through: only the engine knows what it supports, and it says
+     * so with its own return code ([TextToSpeech.setLanguage]).
+     */
+    fun resolveTargetLocale(explicitTag: String?, text: String): Locale {
+        if (!explicitTag.isNullOrBlank()) {
+            val locale = forLanguageTagSafe(explicitTag)
+            if (locale.language.isNotEmpty()) return locale
+        }
+        return autoDetectLocale(text)
+    }
+
+    /**
+     * Legacy binary auto-detection, verbatim: Han characters → zh-CN,
+     * everything else → en-US.
+     */
+    fun autoDetectLocale(text: String): Locale =
+        if (HAN_REGEX.containsMatchIn(text)) Locale.SIMPLIFIED_CHINESE else Locale.US
+
+    /**
+     * [Locale.forLanguageTag] never throws for BCP-47 input (ill-formed tags
+     * resolve to "und" — measured on this JVM, see the fix's probe), so there
+     * is no crash path to hide here; the catch is belt-and-braces for exotic
+     * runtimes and keeps the "unusable → auto-detect" outcome either way.
+     */
+    private fun forLanguageTagSafe(tag: String): Locale =
+        try {
+            Locale.forLanguageTag(tag)
+        } catch (_: RuntimeException) {
+            Locale("")
+        }
+}
+
+/**
+ * [fix/da1016-tts-voice] The spoken link phrases [VoiceTextSanitizer]
+ * rewrites bare URLs into, resolved from localized resources so they follow
+ * the device locale — the R.string source the sanitizer's own KDoc describes
+ * (iOS hardcodes the Chinese phrases; here they are translatable). English
+ * defaults when no Context is available yet.
+ */
+internal object TtsSpokenPhrases {
+
+    fun from(context: Context?): VoiceTextSanitizer.LinkPhrases =
+        if (context == null) {
+            VoiceTextSanitizer.LinkPhrases()
+        } else {
+            VoiceTextSanitizer.LinkPhrases(
+                linkToHost = context.getString(R.string.tts_spoken_link_to_host),
+                bareLink = context.getString(R.string.tts_spoken_bare_link),
+            )
+        }
 }
