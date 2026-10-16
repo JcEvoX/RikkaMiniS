@@ -1,6 +1,6 @@
 # rikkaminis-dev-history 按天索引
 
-快速跳转到每日开发日志。共 1816 条记录，75 天。
+快速跳转到每日开发日志。共 1829 条记录，76 天。
 
 ## 2026-08-03（11 条）
 
@@ -3759,7 +3759,7 @@
 - `23:33` **deep-audit-1015 第二道门核实 + 5 支派发（用户令「走流程吧」，附新审计报告 14 项）**
   - **输入**：用户附件 `rikkaminis_deep_audit_report.md`（1388 行，BUG-01..09 + ARCH-01..03 + …
 
-## 2026-10-16（42 条）
+## 2026-10-16（54 条）
 
 - `00:01` **FIX-A 收口：deep-audit ARCH-01（T3 副作用安全重试接线，P0）+ BUG-09（二次截断）（2026-10-15）**
   - **任务**：读 `shared/work/deep-audit-1015/fix-tasks/FIX-A.md` 立刻执行（基线 main `e10fb2aa…
@@ -3845,3 +3845,32 @@
   - **任务** `shared/work/deep-audit-1016c/fix-tasks/FIX-A.md`；**报告** `fix-reports/FIX…
 - `18:50` **FIX-D 收口：deep-audit-1016c auto-compact 治理四支（`fix/da1016-compact-governance` @ `feef7cd`，CI #2184 绿，停在分支）**
   - **任务**：读 `shared/work/deep-audit-1016c/fix-tasks/FIX-D.md`（先证再改）。**报告** `fix-rep…
+- `19:15` **deep-audit-1016c 收口完成：八支全绿 + 并集树 CI #2185 绿 + 文档已进 main，停在并集分支（用户令「他们都完成了，按流程走，不要忘了更新文档」）**
+  - **收口全链**：独立核 CI 8/8（每支 conclusion=success 且 head_sha == 远端 tip == 报告 sha）→ diff …
+- `19:18` **deep-audit-1016c 合并完成：main `c38cbba752c2`（用户令「合并」），9 分支已清**
+  - **合并前核查（三项全过）**：①检查 = 并集相对合并基（e3ef745）49 文件恰为授权集、docs 0 触碰、冲突标记 0、调试残留 0；②验证 = C…
+- `19:39` **VERIFY-DEVICE-1016c 真机验证完成（2026-10-16 19:26–19:45，用户令「开始验证」）—— 4 支取得判据 · 3 支未触发 · 1 新装置发现**
+  - **身份链闭合**：设备 `1.0.0+2185` base.apk sha256 `27eef513…5681`（14,362,657 B）== CI #21…
+- `19:45` **E 支听感验证闭合（2026-10-16 19:5x，用户现场配合）**
+  - **两项听感判据全部确认**：
+- `22:21` **FIX-G 收口：deep-audit-1018 ISSUE-11（OAuth 回调双解码 + socket FD 泄漏，P2）—— fix/da1018-oauth-callback @ d94cf63，CI #38912447230 绿，停在分支**
+  - **修法两半**：①`parseCallbackQuery(uri.rawQuery)` 纯函数（单次解码，key/value 各 `URLDecoder.de…
+- `22:22` **FIX-C 收口：deep-audit-1018 ISSUE-07（CompactPin 同消息双钉 + 紧凑域裸真值陷阱，P1）—— `fix/da1018-compact-pin` @ `9b34241`，CI #38912121098 绿，停在分支**
+  - **任务** `shared/work/deep-audit-1018/fix-tasks/FIX-C.md`（+ COMMON.md/TRIAGE.md 实读…
+- `22:36` **FIX-H 收口完成：deep-audit-1018 ISSUE-12a/b（:modelservice 重复读盘 + 无界线程，P2）—— fix/da1018-modelsvc-io @ 5fce91199109947504653926e30c274c8f5bb64b，CI #38914243668 绿，停在分支**
+  - **任务书** `shared/work/deep-audit-1018/fix-tasks/FIX-H.md`；**报告** `fix-reports/FIX…
+- `22:43` **FIX-E 收口：deep-audit-1018 ISSUE-09（备份恢复漏重映射 + 漏打包蒸馏层，P1）—— `fix/da1018-backup-remap` @ `e3d16b4`，CI #2190 绿，停在分支**
+  - **任务**：读 `shared/work/deep-audit-1018/fix-tasks/FIX-E.md` 并执行（先读 COMMON/TRIAGE）。…
+- `22:49` **FIX-D 收口：deep-audit-1018 ISSUE-08（12 处 `.dao.loadMessages(` 直调收敛 + ChatRepository 容错入口）—— fix/da1018-dao-loadmessages @ fd5cfe6，CI #38916547458 绿，停在分支**
+  - **任务**：读 `shared/work/deep-audit-1018/fix-tasks/FIX-D.md` 并立刻执行（先读 COMMON/TRIAGE…
+- `23:13` **FIX-F 收口：deep-audit-1018 ISSUE-10（GroupRouter health 无锁 + SCM 锁内 resume）—— fix/da1018-router-locks @ aed2560，CI #2194 绿，停在分支**
+  - **任务** `shared/work/deep-audit-1018/fix-tasks/FIX-F.md`；**报告** `fix-reports/FIX-…
+- `23:22` **FIX-A 收口：deep-audit-1018 ISSUE-01（P0 截断工具调用）+ ISSUE-02（P1 子代理 reasoning 丢失）+ ISSUE-12c（P2 叠楼守卫）—— fix/da1018-turn-integrity @ 00026c3 两提交，CI #2195 绿，停在分支**
+  - **任务**：读 `shared/work/deep-audit-1018/fix-tasks/FIX-A.md`（先证再改）。**报告** `fix-repo…
+- `23:36` **FIX-B 交付收口：deep-audit-1018 ISSUE-04/06/03（分支 CI #2196 绿，停在分支）**
+  - **身份链**：分支 `fix/da1018-offload-wiring`，基线 main `c38cbba`，HEAD **`afee1fa37e08cb6…
+
+## 2026-10-17（1 条）
+
+- `00:05` **deep-audit-1018 收口完成：8 支全绿 + 并集树 CI #2197 绿（停在并集分支，未合并 main）**
+  - **输入**：用户附件 `shared-d48335c9.md`（2566 行 / 12 工单）。基线 main `c38cbba752c2`。
