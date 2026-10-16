@@ -199,7 +199,14 @@ object MarkdownParser {
                     // startsWith("  ") test and was swallowed as a
                     // continuation of the previous bullet's content.
                     // containsMatchIn tests the prefix the regex reads.
-                    while (i < lines.size && lines[i].startsWith("  ") && !Regex("^\\s{0,3}[-*+]\\s").containsMatchIn(lines[i])) {
+                    // [crash-1016] A fenced code block under a bullet is a CODE BLOCK,
+                    // not continuation text: fence bodies used to leak into item
+                    // content and be inline-parsed (the chat parser's list loops had
+                    // the same hole; an empty `\(`\)` inside such a body crashed the
+                    // renderer there). Keep the two parsers in sync.
+                    while (i < lines.size && lines[i].startsWith("  ") &&
+                        !Regex("^\\s{0,3}[-*+]\\s").containsMatchIn(lines[i]) &&
+                        !lines[i].trimStart().startsWith("```")) {
                         items[items.lastIndex] = items.last().copy(
                             content = items.last().content + "\n" + lines[i].trimStart()
                         )

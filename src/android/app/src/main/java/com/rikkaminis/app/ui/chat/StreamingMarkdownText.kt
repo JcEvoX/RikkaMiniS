@@ -2798,10 +2798,10 @@ private fun parseInline(text: String, colors: MdColors): AnnotatedString {
                 // code before this reorder). `\[ … \]` display math stays block-
                 // level; here we only handle the inline `\( … \)` form.
                 text.startsWith("\\(", i) -> {
-                    val end = text.indexOf("\\)", i + 2)
-                    if (end != -1) {
-                        appendInlineContent(katexInlineTagFor(text.substring(i + 2, end)), text.substring(i + 2, end))
-                        i = end + 2
+                    val span = inlineParenMathSpan(text, i)
+                    if (span != null) {
+                        appendInlineContent(katexInlineTagFor(span.latex), span.latex)
+                        i = span.next
                     } else { append(text[i]); i++ }
                 }
                 // Escape: \* \_ \` etc.
@@ -2948,10 +2948,10 @@ private fun AnnotatedString.Builder.appendRecursive(text: String, colors: MdColo
             // before the `\` escape branch so `\(` is treated as math, not an
             // escaped `(`.
             text.startsWith("\\(", i) -> {
-                val end = text.indexOf("\\)", i + 2)
-                if (end != -1) {
-                    appendInlineContent(katexInlineTagFor(text.substring(i + 2, end)), text.substring(i + 2, end))
-                    i = end + 2
+                val span = inlineParenMathSpan(text, i)
+                if (span != null) {
+                    appendInlineContent(katexInlineTagFor(span.latex), span.latex)
+                    i = span.next
                 } else { append(text[i]); i++ }
             }
             text[i] == '$' && i + 1 < text.length && text[i + 1] != '$' && text[i + 1] != ' ' -> {
@@ -3120,6 +3120,41 @@ internal fun estimateInlineMathSize(latex: String, fontSize: TextUnit): Pair<Tex
     return (fontSize * widthEm) to (fontSize * heightEm)
 }
 
+// ─── [crash-1016] `\(` … `\)` inline-math span extraction ─────────────────
+
+/** A resolved `\(` … `\)` inline-math span: its payload plus the index just
+ *  past the closing `\)`. */
+internal class ParenMathSpan(val latex: String, val next: Int)
+
+/**
+ * [crash-1016] Resolve the `\(` … `\)` inline-math span opening at [open]
+ * (which must point at the backslash), or `null` when the characters there must
+ * render as LITERAL text instead.
+ *
+ * `null` means either "no closing `\)`" or "the payload is EMPTY". The empty
+ * case is not math and must never reach the renderer: the payload doubles as the
+ * accessibility alternate text of `appendInlineContent(tag, alternateText)`, and
+ * androidx requires it non-empty (`InlineTextContent.kt`:
+ * `require(alternateText.isNotEmpty())`). An adjacent `\(`\)` therefore threw
+ * `IllegalArgumentException: alternateText can't be an empty string` from inside
+ * Compose's draw pass and killed the app (2026-10-16 crash: a python regex
+ * `…f\(\): String…` sat inside a fenced code block that the block splitter had
+ * leaked into a list item's text, i.e. straight into inline parsing). Empty
+ * payloads now fall through as literal text, mirroring the existing
+ * `looksLikeMath` guard on the `$…$` branch. All three scan sites
+ * (parseInline, the emphasis-scoped parser, collectInlineMathLatex) share this
+ * one decision so the pre-registered KaTeX slots and the rendered tags can
+ * never disagree.
+ */
+internal fun inlineParenMathSpan(text: String, open: Int): ParenMathSpan? {
+    if (!text.startsWith("\\(", open)) return null
+    val end = text.indexOf("\\)", open + 2)
+    if (end == -1) return null
+    val latex = text.substring(open + 2, end)
+    if (latex.isEmpty()) return null
+    return ParenMathSpan(latex, end + 2)
+}
+
 /**
  * T208-4 part 4: scan a markdown line for inline-math spans (same delimiter
  * logic as parseInline) so we can pre-register a sized placeholder for
@@ -3134,10 +3169,10 @@ internal fun collectInlineMathLatex(text: String): List<String> {
             i += 2; continue
         }
         if (c == '\\' && i + 1 < text.length && text[i + 1] == '(') {
-            val end = text.indexOf("\\)", i + 2)
-            if (end != -1) {
-                out.add(text.substring(i + 2, end))
-                i = end + 2; continue
+            val span = inlineParenMathSpan(text, i)
+            if (span != null) {
+                out.add(span.latex)
+                i = span.next; continue
             }
         }
         if (c == '$' && i + 1 < text.length && text[i + 1] != '$' && text[i + 1] != ' ') {
