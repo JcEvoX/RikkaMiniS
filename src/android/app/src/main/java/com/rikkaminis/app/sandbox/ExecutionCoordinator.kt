@@ -603,7 +603,17 @@ object ExecutionCoordinator {
             // [mem-spike-diag] 命令结束归因：ΔRSS + PRoot 子进程聚合，落盘
             // memspike-<date>.log。诊断旁路，不影响返回值。
             MemorySpikeRecorder.onCommandEnd(durationMs, rssBeforeKb)
-            CommandResult(output = output, exitCode = result.exitCode, durationMs = durationMs, truncated = outputTruncated)
+            // [deep-audit-1018 ISSUE-03] L1: carry the retry verdict's outcomeKnown
+            // through the truncation re-wrap. Pre-fix this construction dropped it,
+            // so the SAME command's two exits disagreed (executeWithShellRetry
+            // stamped it, this wrap did not) and a withheld replay looked known.
+            CommandResult(
+                output = output,
+                exitCode = result.exitCode,
+                durationMs = durationMs,
+                truncated = outputTruncated,
+                outcomeKnown = result.outcomeKnown,
+            )
         }
     } finally {
         // [mem-spike-diag] 兜底配对：异常 / 提前 return 的路径也把命令上下文收尾，
@@ -1127,9 +1137,9 @@ object ExecutionCoordinator {
         // stream.jsonl truncated (no DONE, no error) and the UI silently stalled
         // until the poll timeout. Skip the shutdown request and let the next
         // non-streaming pressure tick handle it.
-        if (ChatStreamOffloadHandler.activeStreams > 0) {
+        if (ChatStreamOffloadHandler.activeStreams.get() > 0) {
             Log.w(TAG, "[direction-A] skipped reclaim: active stream in progress " +
-                "(activeStreams=${ChatStreamOffloadHandler.activeStreams}, native ${nativeNowMb}MB)")
+                "(activeStreams=${ChatStreamOffloadHandler.activeStreams.get()}, native ${nativeNowMb}MB)")
             return
         }
         try {
