@@ -35,6 +35,19 @@ object ChatViewModelStore {
      */
     private val aliases = mutableMapOf<String, String>()
 
+    /**
+     * [da1019-ISSUE-07] Read side of [aliases]. Every mutation of the map
+     * (`rename` / `release`) already runs under this object's monitor, but the
+     * lookups did not — `activeSessionId` is read from the offload worker
+     * thread (`minis-config session.*` → ConfigBuiltins' readers), so an
+     * unsynchronized `aliases[sessionId]` raced the main thread's
+     * `LinkedHashMap` mutation with no happens-before edge. A reader could
+     * miss a just-registered draft alias and resolve a draft key to itself
+     * (the config layer then reads the wrong session row), and concurrent
+     * structural mutation of a plain `LinkedHashMap` is undefined behaviour.
+     * Same lock as the writers, so reads and writes serialize.
+     */
+    @Synchronized
     private fun resolveKey(sessionId: String): String =
         aliases[sessionId] ?: sessionId
 
@@ -85,7 +98,10 @@ object ChatViewModelStore {
     private var activeSessionIdInternal: String? = null
 
     val activeSessionId: String?
-        get() = activeSessionIdInternal?.let { resolveKey(it) }
+        // [da1019-ISSUE-07] Same monitor as `setActiveSession` / `rename` /
+        // `release`: the offload thread that serves `minis-config session.*`
+        // must not read the alias table while the main thread mutates it.
+        @Synchronized get() = activeSessionIdInternal?.let { resolveKey(it) }
 
     @Synchronized
     fun setActiveSession(sessionId: String?) {
