@@ -48,9 +48,19 @@ object ScheduledTasksStore {
      * marker never survives a restore (the restored device has no in-flight
      * run), matching the brief's process-local single-flight truth.
      */
-    suspend fun importDocument(context: Context, document: JSONObject) = lock.withLock {
-        val file = ScheduledTasksCodec.parse(document.toString())
-        writeLocked(context, file.copy(running = null))
+    suspend fun importDocument(context: Context, document: JSONObject) {
+        lock.withLock {
+            val file = ScheduledTasksCodec.parse(document.toString())
+            writeLocked(context, file.copy(running = null))
+        }
+        // [da1016 B-7c] The restore replaces the whole task set and clears the
+        // persisted marker; the in-process single-flight state must go with it,
+        // or the lock keeps pointing at a run the restored document knows
+        // nothing about. Called AFTER the store lock is released — the store's
+        // mutex and the runner's checkMutex must never nest (LOCK ORDER note on
+        // ScheduledTaskRunner.onTasksRemoved); guarded by
+        // scripts/scan/scheduled_store_release_guard.py.
+        ScheduledTaskRunner.onTasksRemoved(removedTaskIds = null)
     }
 
     suspend fun load(context: Context): ScheduledTasksFile = withContext(Dispatchers.IO) {
@@ -87,14 +97,25 @@ object ScheduledTasksStore {
             file.copy(tasks = tasks)
         }
 
-    suspend fun deleteTask(context: Context, taskId: String): ScheduledTasksFile =
-        mutate(context) { file ->
+    suspend fun deleteTask(context: Context, taskId: String): ScheduledTasksFile {
+        val next = mutate(context) { file ->
             if (file.running?.taskId == taskId) {
                 file.copy(tasks = file.tasks.filterNot { it.id == taskId }, running = null)
             } else {
                 file.copy(tasks = file.tasks.filterNot { it.id == taskId })
             }
         }
+        // [da1016 B-7c] Deleting the task that is running right now only cleared
+        // the persisted marker; the runner's in-memory lock (runningTaskId +
+        // dispatched) kept pointing at the deleted task, so every other task
+        // degraded to `overlap` until reapAbandonedDispatch's deadline+grace
+        // (30 min by default). Release it here — after the store lock, see the
+        // LOCK ORDER note on ScheduledTaskRunner.onTasksRemoved. Unconditional
+        // (not guarded on the deleted id matching a run) on purpose: the plan
+        // decides, and a delete that hits a live run can never be forgotten.
+        ScheduledTaskRunner.onTasksRemoved(removedTaskIds = setOf(taskId))
+        return next
+    }
 
     suspend fun setTaskEnabled(context: Context, taskId: String, enabled: Boolean): ScheduledTasksFile =
         mutate(context) { file ->

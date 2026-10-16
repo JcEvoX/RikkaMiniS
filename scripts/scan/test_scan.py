@@ -2208,6 +2208,103 @@ def test_exec_gate():
     shutil.rmtree(root)
 
 
+def store_release_fixture(shape):
+    """Minimal repo tree for scheduled_store_release_guard.
+
+    Ground truth = the deep-audit-1016 B-7c shape (fixed 2026-10-16): the store
+    cleared the persisted `running` marker but not the runner's in-process
+    single-flight state, so a deleted task held the lock until the reaper fired.
+    The fix is a notification call — which must sit OUTSIDE the store lock
+    (nesting it inverts the lock order against the runner's checkMutex).
+    """
+    rel = KOTLIN_PKG + "/scheduled/ScheduledTasksStore.kt"
+    head = (
+        "package com.rikkaminis.app.scheduled\n"
+        "object ScheduledTasksStore {\n"
+        "    private val lock = Mutex()\n"
+    )
+    release = "        ScheduledTaskRunner.onTasksRemoved(removedTaskIds = setOf(taskId))\n"
+    release_all = "        ScheduledTaskRunner.onTasksRemoved(removedTaskIds = null)\n"
+    if shape == "missing_call":
+        release = ""
+    if shape == "nested":
+        # The regression shape: called from inside the store's mutation block.
+        release = "            ScheduledTaskRunner.onTasksRemoved(removedTaskIds = setOf(taskId))\n"
+        body_delete = (
+            "    suspend fun deleteTask(context: Any, taskId: String): Any {\n"
+            "        return mutate(context) { file ->\n"
+            "            file.copy(tasks = file.tasks.filterNot { it.id == taskId })\n"
+            + release
+            + "        }\n"
+            "    }\n"
+        )
+    else:
+        body_delete = (
+            "    suspend fun deleteTask(context: Any, taskId: String): Any {\n"
+            "        val next = mutate(context) { file ->\n"
+            "            file.copy(tasks = file.tasks.filterNot { it.id == taskId })\n"
+            "        }\n"
+            + release
+            + "        return next\n"
+            "    }\n"
+        )
+    body_import = (
+        "    suspend fun importDocument(context: Any, doc: Any) {\n"
+        "        lock.withLock {\n"
+        "            writeLocked(context, doc.copy(running = null))\n"
+        "        }\n"
+        + release_all
+        + "    }\n"
+    )
+    if shape == "rot":
+        # Nothing that looks like a task removal: the gate must fail loudly
+        # instead of passing vacuously.
+        body_delete = (
+            "    suspend fun setGlobalEnabled(context: Any, enabled: Boolean): Any {\n"
+            "        return mutate(context) { it.copy(globalEnabled = enabled) }\n"
+            "    }\n"
+        )
+        body_import = (
+            "    private fun writeLocked(context: Any, file: Any) {\n"
+            "        println(file)\n"
+            "    }\n"
+        )
+    text = head + body_delete + body_import + "}\n"
+    return {rel: text}
+
+def test_scheduled_store_release():
+    print("━━━ scheduled_store_release_guard ━━━")
+    root = make_tree(store_release_fixture("good"))
+    code, out = run_scanner("scheduled_store_release_guard.py", root)
+    check("both removal paths releasing the runner passes (exit 0)", code == 0,
+          f"exit={code}\n{out}")
+    check("report names both guarded functions",
+          "deleteTask" in out and "importDocument" in out, out)
+    shutil.rmtree(root)
+
+    root = make_tree(store_release_fixture("missing_call"))
+    code, out = run_scanner("scheduled_store_release_guard.py", root)
+    check("a removal path with no release call is caught (exit 1)", code == 1,
+          f"exit={code}\n{out}")
+    check("finding names the offending function",
+          "[deleteTask]" in out and "never calls" in out, out)
+    shutil.rmtree(root)
+
+    root = make_tree(store_release_fixture("nested"))
+    code, out = run_scanner("scheduled_store_release_guard.py", root)
+    check("a release call nested in the store lock is caught (exit 1)", code == 1,
+          f"exit={code}\n{out}")
+    check("finding reports the depth and the lock-order rule",
+          "depth 2" in out and "LOCK ORDER" in out, out)
+    shutil.rmtree(root)
+
+    root = make_tree(store_release_fixture("rot"))
+    code, out = run_scanner("scheduled_store_release_guard.py", root)
+    check("a store with no detectable removal path trips the rot guard (exit 1)",
+          code == 1, f"exit={code}\n{out}")
+    check("rot guard says the criterion is unchecked", "ROT" in out, out)
+    shutil.rmtree(root)
+
 def test_real_repo():
     print("━━━ real repo tree (must be clean) ━━━")
     for script in (
@@ -2230,6 +2327,7 @@ def test_real_repo():
         "katex_bridge_arity_check.py",
         "readonly_mount_write_guard.py",
         "exec_gate_release_check.py",
+        "scheduled_store_release_guard.py",
     ):
         code, out = run_scanner(script, REPO_ROOT)
         check(f"{script} on real repo exits 0", code == 0, f"exit={code}\n{out[:2000]}")
@@ -2444,6 +2542,7 @@ def main():
     test_gemini_base_version()
     test_readonly_mount_write_guard()
     test_exec_gate()
+    test_scheduled_store_release()
     test_real_repo()
     print("")
     print(f"{'❌ FAILURES: ' + str(FAIL) if FAIL else '✅ ALL ' + str(PASS) + ' CASES PASS'}")
