@@ -404,8 +404,10 @@ class GeminiProviderTest {
     fun `sendMessage targets a single versioned path for every base shape`() {
         for ((label, base) in baseShapes()) {
             val path = nonStreamingPathFor(base)
-            assertTrue("[$label] expected /v1beta/... but got $path",
-                path.startsWith("/v1beta/models/gemini-2.5-flash:generateContent?key=test-key"))
+            val expected = "/v1beta/models/gemini-2.5-flash:generateContent?key=test-key"
+            assertTrue("[$label] expected ...$expected but got $path", path.contains(expected))
+            assertEquals("[$label] expected exactly one version segment in $path",
+                1, path.split("/v1beta").size - 1)
             assertTrue("[$label] duplicated version segment in $path", !path.contains("/v1beta/v1/"))
             assertTrue("[$label] doubled slash before models in $path", !path.contains("//models"))
         }
@@ -415,8 +417,10 @@ class GeminiProviderTest {
     fun `streamMessage targets a single versioned path for every base shape`() {
         for ((label, base) in baseShapes()) {
             val path = streamingPathFor(base)
-            assertTrue("[$label] expected /v1beta/... but got $path",
-                path.startsWith("/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=test-key"))
+            val expected = "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse&key=test-key"
+            assertTrue("[$label] expected ...$expected but got $path", path.contains(expected))
+            assertEquals("[$label] expected exactly one version segment in $path",
+                1, path.split("/v1beta").size - 1)
             assertTrue("[$label] duplicated version segment in $path", !path.contains("/v1beta/v1/"))
             assertTrue("[$label] doubled slash before models in $path", !path.contains("//models"))
         }
