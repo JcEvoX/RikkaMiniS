@@ -245,7 +245,20 @@ class BrowserUseManager(
      * timeout runnable / handing the URL to another app) stamps which of those
      * actually happened, because the old `Unit` made them indistinguishable and
      * navigate() answered `success = true` for all of them (§20b).
+     *
+     * [deep-audit-1019 ISSUE-08] `@Volatile`, for the same reason
+     * [pendingFileChooser] carries one ("every write happens on the main
+     * thread, but readers run on the offload coroutine") and the same reason
+     * [AsyncJsSlot] replaced two bare fields: here the shapes are inverted but
+     * the hazard is identical — `navigate()` / `reloadAndWait()` install the
+     * deferred from the calling coroutine thread, while the readers are WebView
+     * callbacks and [destroy], all on Main. A teardown read that saw a stale
+     * `null` would skip the wake-up this fix exists to perform, making it
+     * silently dependent on scheduling. `complete()` is itself thread-safe;
+     * this does not make the reference swap atomic, so every existing
+     * identity guard (`navigationDeferred === deferred`) stays as it was.
      */
+    @Volatile
     private var navigationDeferred: CompletableDeferred<NavigationResult>? = null
 
     /** Screenshots directory. */
@@ -482,13 +495,11 @@ class BrowserUseManager(
         val header = dataUrl.substring(5, comma)
         val mime = header.substringBefore(';').ifEmpty { null }
         val bytes = try {
-            if (header.endsWith(";base64")) {
-                android.util.Base64.decode(dataUrl.substring(comma + 1), android.util.Base64.DEFAULT)
-            } else {
-                // Non-base64 data: URL — payload is percent-encoded text.
-                java.net.URLDecoder.decode(dataUrl.substring(comma + 1), "UTF-8")
-                    .toByteArray(Charsets.UTF_8)
-            }
+            // [deep-audit-1019 ISSUE-08] The decode decision lives in the
+            // top-level [decodeDataUrlPayload] so the `+`-vs-form semantics are
+            // unit-testable without a WebView — the same JVM lift [MinisMainDocGate]
+            // was created for.
+            decodeDataUrlPayload(header, dataUrl.substring(comma + 1))
         } catch (t: Throwable) {
             Log.w(TAG, "blob download: payload decode failed: ${t.message}")
             return
@@ -659,6 +670,19 @@ class BrowserUseManager(
                     )
                 )
                 navigationDeferred = null
+                // [deep-audit-1019 ISSUE-08] The navigation wait has been woken
+                // here for a long time; the async-JS wait sitting next to it was
+                // not. `__minis__.resolve` / `.reject` live inside this renderer,
+                // so an in-flight executeJS()/fetch() would have burned its full
+                // 30s/60s timeout and then reported a JS timeout for a tab whose
+                // renderer is already gone. Completed with the bridge's own
+                // reject shape (`{"error":…}`, same literal form as the eviction
+                // message in beginAsyncJsRequest) — a bare text payload would
+                // fall through executeJS's "not JSON" branch and surface as a
+                // SUCCESSFUL result for a request that never ran.
+                asyncJsSlot.takeCurrent()?.complete(
+                    "{\"error\":\"WebView renderer process was killed before the async JS request completed\"}"
+                )
                 // Deliberately NOT destroying the instance here (unlike the
                 // rebuild-by-key hosts): this tab is still in BrowserTabPool's
                 // list and the pool keeps handing the same WebView to the next
@@ -2705,6 +2729,27 @@ class BrowserUseManager(
             runCatching { pendingFileChooser?.onReceiveValue(null) }
             pendingFileChooser = null
             pendingFileAccept = null
+            // [deep-audit-1019 ISSUE-08] Wake the other two in-flight waiters
+            // BEFORE the client is swapped for a no-op and the WebView is
+            // destroyed: after that neither onPageFinished nor a
+            // `__minis__.resolve`/`.reject` callback can ever arrive, so
+            // navigate()/reloadAndWait() and executeJS()/fetch() would each
+            // burn their full 30s/60s timeout and then blame the network / the
+            // page for what was really a tab that no longer exists. Same
+            // complete-then-clear pairing every other completion site in this
+            // file uses. The async-JS error keeps the bridge's own reject shape
+            // (`{"error":…}`) because executeJS treats any non-JSON payload as
+            // a successful result.
+            navigationDeferred?.complete(
+                NavigationResult(
+                    NavigationOutcome.FAILED,
+                    errorDescription = "WebView was destroyed before the navigation completed",
+                )
+            )
+            navigationDeferred = null
+            asyncJsSlot.takeCurrent()?.complete(
+                "{\"error\":\"WebView was destroyed before the async JS request completed\"}"
+            )
             // Remove from any parent before destroying — WebView.destroy() on
             // an attached view is undefined behavior on some OEMs and can
             // crash the app (ConnectionTerminated / missing renderer).
@@ -2845,3 +2890,39 @@ internal object MinisMainDocGate {
         return isTrustedMainDoc(mainDocUrl)
     }
 }
+
+/**
+ * [deep-audit-1019 ISSUE-08] Decode the payload half of a `data:` URL.
+ *
+ * RFC 2397 payloads are percent-encoded (RFC 3986), where a literal `+` is
+ * just a `+` — never a space. [java.net.URLDecoder] implements FORM decoding
+ * (`application/x-www-form-urlencoded`, '+' → ' '), which silently corrupted
+ * every non-base64 download that contained one: `data:text/plain,1+1%3D2`
+ * landed on disk as `1 1=2` (likewise `1e+5` in CSV, `+` in code/text). The
+ * pre-escape of a literal '+' as "%2B" is the same fix WebDavClient's
+ * `decodeHrefSegment` and OAuthCallbackServer's query decoder already carry;
+ * `%20` still decodes to a space, and an already-encoded `%2B` still decodes
+ * to a literal '+'.
+ *
+ * Lifted out of `deliverBlobDownload` (decision moved verbatim, call site
+ * semantics unchanged) for the same reason [MinisMainDocGate] exists: an
+ * Android-owned instance method cannot be exercised without a WebView, and
+ * silent data corruption is exactly what a pinned unit test should hold
+ * still. `base64Decoder` is a parameter so the *routing* decision is testable
+ * on the JVM too; [decodeDataUrlBase64] stays the production default.
+ */
+internal fun decodeDataUrlPayload(
+    header: String,
+    payload: String,
+    base64Decoder: (String) -> ByteArray = ::decodeDataUrlBase64,
+): ByteArray =
+    if (header.endsWith(";base64")) {
+        base64Decoder(payload)
+    } else {
+        java.net.URLDecoder.decode(payload.replace("+", "%2B"), "UTF-8")
+            .toByteArray(Charsets.UTF_8)
+    }
+
+/** [deep-audit-1019 ISSUE-08] Production Base64 half of [decodeDataUrlPayload]. */
+private fun decodeDataUrlBase64(payload: String): ByteArray =
+    Base64.decode(payload, Base64.DEFAULT)
