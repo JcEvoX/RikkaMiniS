@@ -4,15 +4,25 @@
 Pins the cache/share housekeeping contract:
 
   arm1: every production .kt file that constructs `File(context.cacheDir,
-        "share")` must also call `pruneShareDir(` — share/ blobs were written
-        once and never deleted, accumulating for the life of the install.
-        The pruner's definition file (FullscreenImageViewer.kt) is exempt.
+        "share")` — or `"shared"` — must also call `pruneShareDir(` — share/
+        blobs were written once and never deleted, accumulating for the life of
+        the install. The pruner's definition file (FullscreenImageViewer.kt) is
+        exempt.
+        [da1024-G] "shared" was this gate's own N+1 hole: SHARE_DIR_PAT required
+        a `)` right after the `"share"` literal, so the three
+        `File(context.cacheDir, "shared")` writers were invisible while the
+        singular directory was covered.
   arm2: in WebAppActivity.kt's stagedShareUri, the share-dir construction
         (and its `mkdirs()`) must live INSIDE the `withContext(Dispatchers.IO)`
         block, and the call order must be
         withContext(Dispatchers.IO) → File(cacheDir, "share") → pruneShareDir
         → copyTo. Before the fix, `mkdirs()` ran on the main thread and
         `pruneShareDir` was never called.
+  arm3: [da1024-G] the cacheDir/shared writers must do their disk work off the
+        main thread. `exportProviderInstance` / `shareMcpServerJson` must stay
+        `private suspend fun` with their mkdirs/prune/writeText inside
+        `withContext(Dispatchers.IO)`, and ChatExporter.exportToZip must build
+        the shared/ dir and prune before opening the zip stream.
 
   Prune-then-copy is safe by construction: the 24h TTL cutoff always
   postdates the fresh copy written after the prune, so the prune can never
@@ -33,8 +43,21 @@ import tempfile
 DEFINER_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/components/FullscreenImageViewer.kt"
 ACTIVITY_REL = "src/android/app/src/main/java/com/rikkaminis/app/webapp/WebAppActivity.kt"
 MAIN_ROOT = "src/android/app/src/main"
+SETTINGS_DIR = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings"
+PROVIDER_REL = SETTINGS_DIR + "/ProviderDetailScreen.kt"
+MCP_REL = SETTINGS_DIR + "/MCPIntegrationsScreen.kt"
+EXPORTER_REL = "src/android/app/src/main/java/com/rikkaminis/app/share/ChatExporter.kt"
 
-SHARE_DIR_PAT = re.compile(r"File\(\s*context\.cacheDir\s*,\s*\"share\"\s*\)")
+# Covers both cacheDir/share (plural writers) and cacheDir/shared. The literal
+# run is bounded by the closing quote so "share_inbound" / "shared-foo" cannot
+# match by accident.
+SHARE_DIR_PAT = re.compile(r"File\(\s*context\.cacheDir\s*,\s*\"share(?:d)?\"\s*\)")
+
+# arm3: (file, suspend-signature marker, what it stages)
+UI_WRITERS = (
+    (PROVIDER_REL, "private suspend fun exportProviderInstance"),
+    (MCP_REL, "private suspend fun shareMcpServerJson"),
+)
 
 # Files that satisfy the prune contract with their own name-scoped housekeeping
 # instead of pruneShareDir. Each entry maps filename -> marker that must be
@@ -158,6 +181,103 @@ def check_arm2(root):
     return None
 
 
+def extract_braced_block(code, marker):
+    """Return the text from `marker` through the matching closing brace.
+
+    Unlike extract_function (which assumes the signature line carries the
+    opening brace), this tolerates multi-line parameter lists — both
+    exportProviderInstance and shareMcpServerJson brace on their own line.
+    """
+    start = code.find(marker)
+    if start < 0:
+        return None
+    brace = code.find("{", start)
+    if brace < 0:
+        return None
+    depth = 0
+    for i in range(brace, len(code)):
+        ch = code[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return code[start:i + 1]
+    return None
+
+
+def _read_stripped(root, rel):
+    path = os.path.join(root, rel)
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return strip_comments(f.read())
+
+
+def check_arm3(root):
+    """[da1024-G] cacheDir/shared writers: suspend + IO context + prune first."""
+    problems = []
+    for rel, marker in UI_WRITERS:
+        code = _read_stripped(root, rel)
+        if code is None:
+            problems.append(f"{rel}: file missing (was it renamed/moved?)")
+            continue
+        fn = extract_braced_block(code, marker)
+        if fn is None:
+            problems.append(
+                f"{rel}: `{marker}` not found — it must stay a "
+                "`private suspend fun` (the body runs disk I/O)"
+            )
+            continue
+        if "withContext(Dispatchers.IO)" not in fn:
+            problems.append(
+                f"{rel}: `{marker}` must run its mkdirs/prune/write inside "
+                "withContext(Dispatchers.IO)"
+            )
+            continue
+        prune = fn.find("pruneShareDir(")
+        write = fn.find(".writeText(")
+        if prune < 0:
+            problems.append(f"{rel}: `{marker}` must call pruneShareDir( before staging")
+        elif write < 0:
+            problems.append(f"{rel}: `{marker}` lost its staging .writeText( call")
+        elif prune > write:
+            problems.append(
+                f"{rel}: pruneShareDir( must precede the staging write "
+                f"(prune={prune} write={write})"
+            )
+
+    # ChatExporter.exportToZip already runs inside withContext(Dispatchers.IO);
+    # pin that the prune sits between the dir construction and the zip stream.
+    code = _read_stripped(root, EXPORTER_REL)
+    if code is None:
+        problems.append(f"{EXPORTER_REL}: file missing (was it renamed/moved?)")
+        return problems
+    fn = extract_braced_block(code, "suspend fun exportToZip")
+    if fn is None:
+        problems.append(f"{EXPORTER_REL}: `suspend fun exportToZip` not found")
+        return problems
+    io_idx = fn.find("withContext(Dispatchers.IO)")
+    dir_idx = fn.find('File(context.cacheDir, "shared")')
+    prune_idx = fn.find("pruneShareDir(")
+    zip_idx = fn.find("ZipOutputStream(")
+    if io_idx < 0:
+        problems.append(f"{EXPORTER_REL}: exportToZip lost its withContext(Dispatchers.IO) block")
+    elif dir_idx < 0:
+        problems.append(f'{EXPORTER_REL}: exportToZip lost the File(context.cacheDir, "shared") construction')
+    elif prune_idx < 0:
+        problems.append(f"{EXPORTER_REL}: exportToZip must call pruneShareDir( before staging the zip")
+    elif zip_idx < 0:
+        problems.append(f"{EXPORTER_REL}: exportToZip lost its ZipOutputStream( staging call")
+    elif not (io_idx < dir_idx < prune_idx < zip_idx):
+        problems.append(
+            f"{EXPORTER_REL}: exportToZip ordering broken: expected withContext(Dispatchers.IO) "
+            f'< File(cacheDir, "shared") < pruneShareDir < ZipOutputStream, got '
+            f"io={io_idx} dir={dir_idx} prune={prune_idx} zip={zip_idx}"
+        )
+    return problems
+
+
 # --- compliant / violation fixture snippets (code-level, not comments) ---
 
 COMPLIANT = """package com.rikkaminis.app.webapp
@@ -222,6 +342,86 @@ def run_fixture(name, content, expect_ok):
         return status == "PASS"
 
 
+# --- [da1024-G] arm3 fixtures: the three cacheDir/shared writers ------------
+
+PROVIDER_OK = """package com.rikkaminis.app.ui.settings
+
+private suspend fun exportProviderInstance(
+    context: android.content.Context,
+    providerRepository: ProviderRepository,
+) {
+    val file = withContext(Dispatchers.IO) {
+        val json = providerRepository.exportInstanceJSON(id) ?: return@withContext null
+        val dir = java.io.File(context.cacheDir, "shared").apply { mkdirs() }
+        pruneShareDir(dir)
+        val f = java.io.File(dir, "label.json")
+        runCatching { f.writeText(json) }.map { f }.getOrNull()
+    } ?: return
+    context.startActivity(android.content.Intent())
+}
+"""
+
+MCP_OK = """package com.rikkaminis.app.ui.settings
+
+private suspend fun shareMcpServerJson(context: android.content.Context, serverId: String, json: String) {
+    val file = withContext(Dispatchers.IO) {
+        val dir = java.io.File(context.cacheDir, "shared").apply { mkdirs() }
+        pruneShareDir(dir)
+        val f = java.io.File(dir, "server-mcp.json")
+        runCatching { f.writeText(json) }.map { f }.getOrNull()
+    } ?: return
+    context.startActivity(android.content.Intent())
+}
+"""
+
+EXPORTER_OK = """package com.rikkaminis.app.share
+
+class ChatExporter {
+    suspend fun exportToZip(context: Context): Pair<Uri, Summary> = withContext(Dispatchers.IO) {
+        val sharedDir = File(context.cacheDir, "shared").apply { mkdirs() }
+        pruneShareDir(sharedDir)
+        val zipFile = File(sharedDir, "t.zip")
+        ZipOutputStream(FileOutputStream(zipFile).buffered()).use { it.flush() }
+        uri to summary
+    }
+}
+"""
+
+# The gate's own N+1 tooth: `"shared"` producers were invisible to the old
+# SHARE_DIR_PAT (which demanded `)` right after the `"share"` literal).
+SHARED_PRODUCER_NO_PRUNE = """package com.rikkaminis.app.other
+
+class SharedWriter {
+    val dir = java.io.File(context.cacheDir, "shared").apply { mkdirs() }
+    fun write() { java.io.File(dir, "a.json").writeText("{}") }
+}
+"""
+
+
+def run_writer_fixture(name, rel, content, expect_ok):
+    """Write the four contracted files (one overridden) and grade arm1+arm2+arm3."""
+    files = {
+        ACTIVITY_REL: COMPLIANT,
+        PROVIDER_REL: PROVIDER_OK,
+        MCP_REL: MCP_OK,
+        EXPORTER_REL: EXPORTER_OK,
+        rel: content,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        for r, body in files.items():
+            path = os.path.join(tmp, r)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(body)
+        a1 = check_arm1(tmp)
+        a2 = check_arm2(tmp)
+        a3 = check_arm3(tmp)
+        ok = not a1 and a2 is None and not a3
+        status = "PASS" if ok == expect_ok else "FAIL"
+        print(f"  [{status}] fixture {name}: arm1={a1!r} arm2={a2!r} arm3={a3!r}")
+        return status == "PASS"
+
+
 def selftest():
     print("share_dir_prune_check selftest:")
     ok = True
@@ -270,6 +470,52 @@ def selftest():
     ok &= run_fixture("compliant", COMPLIANT, expect_ok=True)
     ok &= run_fixture("violation-no-prune", VIOLATION_NO_PRUNE, expect_ok=False)
     ok &= run_fixture("violation-main-thread", VIOLATION_MAIN_THREAD, expect_ok=False)
+    # arm1 tooth for the "shared" pattern (the N+1 this batch closed): a
+    # `cacheDir/shared` producer with no pruner must be caught, while the
+    # pattern must stay blind to it under the OLD regex — printed below.
+    ok &= run_writer_fixture(
+        "shared-producer-without-prune",
+        "src/android/app/src/main/java/com/rikkaminis/app/other/SharedWriter.kt",
+        SHARED_PRODUCER_NO_PRUNE,
+        expect_ok=False,
+    )
+    old_pat = re.compile(r"File\(\s*context\.cacheDir\s*,\s*\"share\"\s*\)")
+    blind = old_pat.search(SHARED_PRODUCER_NO_PRUNE) is None
+    ok &= blind
+    print(f"  [{'PASS' if blind else 'FAIL'}] fixture shared-producer is invisible to the old pattern (regression tooth)")
+    # arm3: compliant baseline is green...
+    ok &= run_writer_fixture("writers-compliant", EXPORTER_REL, EXPORTER_OK, expect_ok=True)
+    # ...and each criterion has exactly one fixture that breaks it.
+    ok &= run_writer_fixture(
+        "provider-not-suspend",
+        PROVIDER_REL,
+        PROVIDER_OK.replace("private suspend fun exportProviderInstance(", "private fun exportProviderInstance("),
+        expect_ok=False,
+    )
+    ok &= run_writer_fixture(
+        "provider-without-io-context",
+        PROVIDER_REL,
+        PROVIDER_OK.replace("withContext(Dispatchers.IO) {", "run {"),
+        expect_ok=False,
+    )
+    ok &= run_writer_fixture(
+        "provider-without-prune",
+        PROVIDER_REL,
+        PROVIDER_OK.replace("        pruneShareDir(dir)\n", ""),
+        expect_ok=False,
+    )
+    ok &= run_writer_fixture(
+        "mcp-without-io-context",
+        MCP_REL,
+        MCP_OK.replace("withContext(Dispatchers.IO) {", "run {"),
+        expect_ok=False,
+    )
+    ok &= run_writer_fixture(
+        "exporter-without-prune",
+        EXPORTER_REL,
+        EXPORTER_OK.replace("        pruneShareDir(sharedDir)\n", ""),
+        expect_ok=False,
+    )
     print("SHARE_DIR_PRUNE_SELFTEST=" + ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 
@@ -288,11 +534,14 @@ def main():
     a2 = check_arm2(root)
     if a2:
         failures.append(f"arm2 (stagedShareUri IO/prune contract): {a2}")
+    a3 = check_arm3(root)
+    if a3:
+        failures.append(f"arm3 (cacheDir/shared writers must be suspend + IO + prune): {a3}")
     if failures:
         for f in failures:
             print("FAIL:", f)
         sys.exit(1)
-    print("share_dir_prune_check: OK (arm1 + arm2 green)")
+    print("share_dir_prune_check: OK (arm1 + arm2 + arm3 green)")
 
 
 if __name__ == "__main__":

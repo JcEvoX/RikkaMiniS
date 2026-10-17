@@ -108,6 +108,10 @@ object ChatExporter {
 
             // Build zip under shared/ so FileProvider can hand it out.
             val sharedDir = File(context.cacheDir, "shared").apply { mkdirs() }
+            // [da1024-G] Nothing else ever deletes cacheDir/shared/: the zip
+            // carries a full transcript, so prune entries older than the same
+            // 24h TTL cache/share/ uses before staging the new one.
+            com.rikkaminis.app.ui.components.pruneShareDir(sharedDir)
             val safeTitle = (session.title ?: "conversation")
                 .replace(Regex("[^A-Za-z0-9_-]+"), "_")
                 .take(64)
