@@ -1,5 +1,7 @@
 package com.rikkaminis.app.ui.settings
 
+import android.content.Context
+import android.content.SharedPreferences
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -43,6 +45,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -98,6 +101,28 @@ fun ModelGroupsScreen(
     // edit-then-live semantics.
     var compactModelEntryId by remember {
         mutableStateOf(AgentRuntimeLimitsPrefs.compactModelEntryId())
+    }
+    // [da1024-C] ...and re-read it when someone ELSE writes the pin. The
+    // `remember` above is a one-shot snapshot: this page persists on every
+    // pick, so an external writer — `minis-config set runtime.compactModelEntryId`,
+    // a backup restore, or the removeEntry / removeInstance / replaceEntries
+    // cascade resetting a dangling pin — used to leave the row showing an id
+    // the repository no longer resolves. Same DisposableEffect + named
+    // listener shape as RuntimeLimitsScreen (prefs_listener_holder_guard:
+    // SharedPreferencesImpl holds listeners weakly, so an inline lambda is
+    // collected and the callback silently stops firing).
+    DisposableEffect(context) {
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            if (key == null || key == AgentRuntimeLimitsPrefs.KEY_COMPACT_MODEL_ENTRY_ID) {
+                compactModelEntryId = AgentRuntimeLimitsPrefs.compactModelEntryId()
+            }
+        }
+        val pinPrefs = context.applicationContext.getSharedPreferences(
+            AgentRuntimeLimitsPrefs.PREFS,
+            Context.MODE_PRIVATE,
+        )
+        pinPrefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { pinPrefs.unregisterOnSharedPreferenceChangeListener(listener) }
     }
     // Choices = every model entry in the provider config (provider label for
     // grouping, display name for the row); recomputed whenever the config
