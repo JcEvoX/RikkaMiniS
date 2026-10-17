@@ -53,6 +53,8 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.rikkaminis.app.ui.sandbox.FileItem
 import com.rikkaminis.app.ui.sandbox.FilePreviewScreen
+import com.rikkaminis.app.ui.sandbox.MirrorCategory
+import com.rikkaminis.app.ui.sandbox.MirrorCategoryDetailScreen
 import com.rikkaminis.app.ui.sandbox.RootfsManagementScreen
 import com.rikkaminis.app.ui.settings.EnvironmentVariablesScreen
 import com.rikkaminis.app.ui.settings.AppearanceScreen
@@ -169,6 +171,12 @@ object Routes {
     const val STORAGE = "storage"
     const val SESSION_STORAGE_DETAIL = "session_storage/{sessionId}"
     const val ROOTFS_MANAGEMENT = "rootfs_management"
+    /** [da1021-C] Per-mirror-category detail (speed-test results + per-mirror
+     *  switch). `categoryId` carries the [com.rikkaminis.app.ui.sandbox.MirrorCategory.key]
+     *  token ("alpine"/"pip"/"npm"); encoded through [seg] like every other
+     *  path-segment builder below. */
+    const val MIRROR_CATEGORY_DETAIL = "mirror_category/{categoryId}"
+    fun mirrorCategoryDetail(categoryId: String) = "mirror_category/${seg(categoryId)}"
     // [sweep1014-D13] File-browser configuration (rootPath/rootLabel/linuxRoot/
     // displayPrefix) travels as query params instead of the FilePreviewHolder
     // static singleton — process death re-creates the VM from the route args,
@@ -205,7 +213,7 @@ object Routes {
     const val SCHEDULED_TASKS = "scheduled_tasks"
     const val SCHEDULED_TASK_EDIT = "scheduled_task_edit/{taskId}"
     fun scheduledTaskEdit(taskId: String?) =
-        if (taskId == null) "scheduled_task_edit/-" else "scheduled_task_edit/$taskId"
+        if (taskId == null) "scheduled_task_edit/-" else "scheduled_task_edit/${seg(taskId)}"
     /** [feat/chat-tuning-panel] Chat Tuning page (reading / scrolling / composer knobs). */
     const val CHAT_TUNING = "chat_tuning"
     const val SKILLS = "skills"
@@ -213,12 +221,15 @@ object Routes {
     const val SKILL_FILE = "skill_file/{skillId}/{relativePath}"
     const val MINIS_SKILLS_BROWSER = "minis_skills_browser"
 
-    fun skillDetail(skillId: String) = "skill/$skillId"
+    fun skillDetail(skillId: String) = "skill/${seg(skillId)}"
     fun skillFile(skillId: String, relativePath: String = "SKILL.md"): String {
         // Path may contain `/`, which the nav library treats as a route
         // separator. URL-encode so subdirectory paths survive a round-trip.
+        // [da1021-C] skillId now goes through seg() like the other path
+        // segments; relativePath keeps the URLEncoder encoding (its receiver
+        // hand-decodes — see the SKILL_FILE composable).
         val encoded = java.net.URLEncoder.encode(relativePath, "UTF-8").replace("+", "%20")
-        return "skill_file/$skillId/$encoded"
+        return "skill_file/${seg(skillId)}/$encoded"
     }
     const val TERMINAL = "terminal?initCommand={initCommand}&sessionId={sessionId}"
     fun terminal(initCommand: String? = null, sessionId: String? = null): String {
@@ -234,7 +245,7 @@ object Routes {
     }
     /** Chat-files browser: opens FileBrowser rooted at /var/minis for the session. */
     const val CHAT_FILES = "chat_files/{sessionId}"
-    fun chatFiles(sessionId: String) = "chat_files/$sessionId"
+    fun chatFiles(sessionId: String) = "chat_files/${seg(sessionId)}"
     const val MEMORY = "memory"
     /** [T-mcp-integration-android] MCP Integrations management screen. */
     const val MCP = "mcp"
@@ -260,15 +271,15 @@ object Routes {
     /** T219-2: Mount external folders settings + detail. */
     const val MOUNTED_FOLDERS = "mounted_folders"
     const val MOUNTED_FOLDERS_DETAIL = "mounted_folders_detail/{mountId}"
-    fun mountedFoldersDetail(mountId: String) = "mounted_folders_detail/$mountId"
+    fun mountedFoldersDetail(mountId: String) = "mounted_folders_detail/${seg(mountId)}"
     /** T235: Shared folders (Shared / Skills / Memory) — fixed list. */
     const val SHARED_FOLDERS = "shared_folders"
     const val BACKUP = "backup"
     const val SHARED_FOLDERS_DETAIL = "shared_folders_detail/{folderId}"
-    fun sharedFoldersDetail(folderId: String) = "shared_folders_detail/$folderId"
-    fun logDetail(fileName: String) = "log_detail/$fileName"
-    fun sessionStorageDetail(sessionId: String) = "session_storage/$sessionId"
-    fun memoryFileEdit(fileName: String, isGlobal: Boolean) = "memory_file/$fileName/$isGlobal"
+    fun sharedFoldersDetail(folderId: String) = "shared_folders_detail/${seg(folderId)}"
+    fun logDetail(fileName: String) = "log_detail/${seg(fileName)}"
+    fun sessionStorageDetail(sessionId: String) = "session_storage/${seg(sessionId)}"
+    fun memoryFileEdit(fileName: String, isGlobal: Boolean) = "memory_file/${seg(fileName)}/$isGlobal"
     /**
      * [P0-0] `focusMessageId` defaults to null so every existing single-arg
      * caller is unchanged. Encoded the same way as [terminal]: URLEncoder
@@ -277,7 +288,10 @@ object Routes {
      * protects against ids that ever carry reserved characters.
      */
     fun chat(sessionId: String, focusMessageId: String? = null): String {
-        val base = "chat/$sessionId"
+        // [da1021-C] sessionId is a path segment — encode through seg() like
+        // the other builders (UUIDs today, but a reserved character in a
+        // future id would otherwise hand nav a malformed route).
+        val base = "chat/${seg(sessionId)}"
         if (focusMessageId.isNullOrBlank()) return base
         val enc = java.net.URLEncoder.encode(focusMessageId, "UTF-8").replace("+", "%20")
         return "$base?focusMessageId=$enc"
@@ -389,7 +403,21 @@ fun AppNavigation(
             // parser already resolved the path → route mapping so we
             // just navigate.
             is DeepLinkAction.OpenSettingsScreen -> {
-                navController.safeNavigate(initialDeepLink.route)
+                // [da1021-C] The route builders now percent-encode their ids
+                // (root-cause fix), so a malformed route should be impossible
+                // — this runCatching is the "never crash on a deep link"
+                // backstop for future routes that forget to encode, mirroring
+                // MainActivity's hot-start handler. Bare navigate() (not
+                // safeNavigate) is deliberate: this branch runs AFTER
+                // awaitResumed() above, so the back-then-tap race
+                // safeNavigate defangs cannot happen here — da1020-F moved
+                // the dispatch behind that wait for exactly this reason.
+                // Wrapping in runCatching does not reintroduce the race; it
+                // only stops a malformed route from crashing cold start.
+                runCatching { navController.navigate(initialDeepLink.route) }
+                    .onFailure {
+                        runCatching { navController.navigate(Routes.SETTINGS) }
+                    }
             }
             is DeepLinkAction.OpenPermissionSettings -> {
                 navController.safeNavigate(Routes.PERMISSIONS)
@@ -1049,7 +1077,35 @@ fun AppNavigation(
                         ),
                     )
                 },
+                // [da1021-C] MirrorCategoryDetailScreen existed with zero call
+                // sites — the per-category row tap did nothing. Wire it up:
+                // the category key ("alpine"/"pip"/"npm") is the route token,
+                // encoded by Routes.mirrorCategoryDetail.
+                onMirrorCategoryClick = { cat ->
+                    navController.safeNavigate(Routes.mirrorCategoryDetail(cat.key))
+                },
             )
+        }
+
+        // [da1021-C] Mirror category detail. Nav percent-decodes path args
+        // exactly once, so getString returns the raw key; an unknown key is
+        // fail-closed — back out instead of rendering a null-category screen
+        // (a hand-typed deep link must never crash).
+        composable(
+            Routes.MIRROR_CATEGORY_DETAIL,
+            arguments = listOf(navArgument("categoryId") { type = NavType.StringType }),
+        ) { backStackEntry ->
+            val category = backStackEntry.arguments
+                ?.getString("categoryId")
+                ?.let { MirrorCategory.fromKey(it) }
+            if (category == null) {
+                LaunchedEffect(Unit) { navController.safePopBackStack() }
+            } else {
+                MirrorCategoryDetailScreen(
+                    category = category,
+                    onBack = { navController.safePopBackStack() },
+                )
+            }
         }
 
         // [sweep1014-D13] VM is created via viewModel() bound to this
