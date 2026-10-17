@@ -2051,7 +2051,11 @@ class ProviderRepository(private val context: Context) {
                 // provider implementations directly (data→provider reverse
                 // dependency). Registry returns empty list for types without
                 // a registered fetcher.
-                ModelListProviderRegistry.fetchModels(instance, apiKey, isThirdParty, forceRefresh)
+                // [fix/da1020-models-cache] Forward our Context so the fetcher's
+                // disk cache is reachable: every *ModelsApi short-circuits on
+                // `context != null`, so dropping it here silently disabled the
+                // 7-day cache read, the 401/403 invalidate and the save alike.
+                ModelListProviderRegistry.fetchModels(instance, apiKey, isThirdParty, forceRefresh, context)
             } catch (e: Exception) {
                 android.util.Log.e("ProviderRepo", "refreshModels fetch error: ${e.message}", e)
                 emptyList()
