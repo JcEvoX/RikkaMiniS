@@ -1218,6 +1218,10 @@ internal object ConfigBuiltins {
                                     "appendV1Suffix" to ConfigValue.Bool(inst.appendV1Suffix),
                                     "useResponsesAPI" to ConfigValue.Bool(inst.useResponsesAPI),
                                     "azureMode" to ConfigValue.Bool(inst.azureMode),
+                                    // [fix/da1020-memory-gate-provider-fields]
+                                    // Same read shape as the per-instance field
+                                    // (empty override → Null = branded default).
+                                    "customUserAgent" to (inst.customUserAgent?.let { ConfigValue.Str(it) } ?: ConfigValue.Null),
                                 )
                             )
                         }
