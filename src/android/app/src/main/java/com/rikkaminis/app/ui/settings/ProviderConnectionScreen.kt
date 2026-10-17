@@ -27,6 +27,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 import com.rikkaminis.app.R
+import com.rikkaminis.app.config.collections.customUserAgentWritable
 import com.rikkaminis.app.data.model.ImageEndpointMode
 import com.rikkaminis.app.data.model.ProviderType
 import com.rikkaminis.app.data.repository.ProviderRepository
@@ -67,23 +68,31 @@ fun ProviderConnectionScreen(
     var editKeyValue by remember { mutableStateOf("") }
     var keyVisible by remember { mutableStateOf(false) }
 
-    var customBaseURL by rememberSaveable { mutableStateOf(instance.customBaseURL ?: "") }
-    var customUserAgent by rememberSaveable { mutableStateOf(instance.customUserAgent ?: "") }
+    // [da1023-C] Bind the connection states to instance.id: the old keyless
+    // rememberSaveable leaked this instance's URL/UA state into the next
+    // instance's screen when navigating between detail pages (same
+    // destination, different argument → state survived the swap).
+    var customBaseURL by rememberSaveable(instance.id) { mutableStateOf(instance.customBaseURL ?: "") }
+    var customUserAgent by rememberSaveable(instance.id) { mutableStateOf(instance.customUserAgent ?: "") }
 
     fun saveBaseURLSettings() {
-        // /v1 is appended automatically for all non-Gemini providers (Gemini
-        // uses v1beta full-path URLs). effectiveBaseURL guards double-append.
-        val appendV1 = instance.providerType != ProviderType.gemini
+        // [da1023-C] appendV1Suffix is NOT re-derived here: the instance's
+        // stored value (set at creation from the provider type, and
+        // independently writable via provider.instances.update /
+        // providers.<id>.appendV1Suffix) used to be clobbered on every focus
+        // loss with `providerType != gemini` — an OpenAI-compatible endpoint
+        // configured with appendV1Suffix=false silently flipped back to true.
+        // effectiveBaseURL guards double-append, so not touching the flag is
+        // safe either way.
         providerRepository.updateInstance(
             instance.copy(
                 customBaseURL = customBaseURL.ifBlank { null },
-                appendV1Suffix = appendV1,
                 customUserAgent = customUserAgent.ifBlank { null },
             )
         )
         AppLogger.info(
             TAG,
-            "Saved base URL for ${instance.id}: url='${customBaseURL.ifBlank { "<default>" }}', appendV1=$appendV1, ua='${customUserAgent.ifBlank { "<default>" }}'",
+            "Saved base URL for ${instance.id}: url='${customBaseURL.ifBlank { "<default>" }}', appendV1=${instance.appendV1Suffix}, ua='${customUserAgent.ifBlank { "<default>" }}'",
         )
     }
 
@@ -160,8 +169,15 @@ fun ProviderConnectionScreen(
                             )
                         }
                     }
-                    val showUserAgentField = instance.providerType == ProviderType.openAI ||
-                        instance.providerType == ProviderType.anthropic
+                    // [da1023-C] Align the field's visibility with the
+                    // ProvidersCollection write contract: customUserAgent is
+                    // writable exactly when credentialType == apiKey (OAuth
+                    // instances are rejected with the OAuth message). The old
+                    // providerType openAI||anthropic gate showed the field on
+                    // OAuth-authenticated instances the write path refuses,
+                    // and hid it on apiKey xAI/kimiCode instances the write
+                    // path accepts.
+                    val showUserAgentField = customUserAgentWritable(instance.credentialType)
                     if (showUserAgentField) {
                         Column(modifier = Modifier.padding(vertical = 8.dp)) {
                             Text(

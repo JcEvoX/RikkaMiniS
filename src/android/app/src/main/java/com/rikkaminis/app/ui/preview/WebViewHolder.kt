@@ -495,11 +495,22 @@ internal fun toAssetLoaderUrl(fileUrl: String): String? {
  * [ASSET_LOADER_PREFIX]: `https://appassets.androidplatform.net.evil.com/…` does
  * not match (`startsWith` fails on the `.`). Same guard shape as
  * `BrowserUseManager`'s asset-loader origin check.
+ *
+ * [da1023-H] A literal `#` / `?` in the reported asset URL is always a
+ * fragment / query, never part of the file name: [toAssetLoaderUrl] encodes
+ * the whole last segment, so a name that really contains `#` or `?` arrives
+ * here as `%23` / `%3F`. Cutting them BEFORE [decodeUriPath] matches how the
+ * androidx loader itself resolves the request (path only, fragment never sent
+ * on the wire) and keeps the published `file://` URL one a `File.exists()`
+ * check can actually satisfy — `…/a.html#section` previously survived the
+ * round trip and became a path that exists() rejected.
  */
 internal fun fromAssetLoaderUrl(assetUrl: String, rootDir: String?): String? {
     if (rootDir == null) return null
     if (!assetUrl.startsWith(ASSET_LOADER_PREFIX)) return null
-    val relative = decodeUriPath(assetUrl.removePrefix(ASSET_LOADER_PREFIX))
+    val relative = decodeUriPath(
+        assetUrl.removePrefix(ASSET_LOADER_PREFIX).substringBefore('#').substringBefore('?'),
+    )
     val resolved = resolveWithinRoot(relative, rootDir) ?: return null
     return FILE_URL_PREFIX + resolved
 }

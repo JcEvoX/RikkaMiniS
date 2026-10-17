@@ -66,6 +66,30 @@ object AutoBackupManager {
             ?.sortedByDescending { it.lastModified() } ?: emptyList()
     }
 
+    /**
+     * [fix/da1023-backup-streaming-fetch] Pure selection behind
+     * [rotateLocalAutoBackups]: given a newest-first local list (the order
+     * [listLocal] guarantees), everything beyond the first [keep] entries is
+     * a rotation victim. [keep] <= 0 means "no local history" — every file is
+     * a victim, which is what the caller asked for; both branches are
+     * explicit so the boundary is unit-testable.
+     */
+    fun selectLocalRotationVictims(files: List<File>, keep: Int): List<File> =
+        if (keep <= 0) files else files.drop(keep)
+
+    /**
+     * [fix/da1023-backup-streaming-fetch] Enforce the local auto-backup cap:
+     * keep the newest [WebDavSync.AUTO_BACKUP_KEEP] copies, delete the rest
+     * (best-effort, mirroring the previous inline behavior in runLocked).
+     * Shared between the nightly run and the settings screen's
+     * fetch-to-local path, which previously wrote a fetched copy WITHOUT any
+     * rotation — every fetch added an unbounded local copy.
+     */
+    fun rotateLocalAutoBackups(context: Context) {
+        selectLocalRotationVictims(listLocal(context), WebDavSync.AUTO_BACKUP_KEEP)
+            .forEach { runCatching { it.delete() } }
+    }
+
     /** Human-readable last-run timestamp, or null when never run. */
     fun lastRunLabel(context: Context): String? =
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
@@ -125,7 +149,27 @@ object AutoBackupManager {
         // headers+env) — a deliberate product-posture change; if a user ever
         // wants secret-bearing auto-backups that must be an explicit opt-in
         // setting, not a silent default.
-        val payload = ConfigBackup.export(
+        //
+        // [fix/da1023-backup-streaming-fetch] The document is streamed
+        // straight into the local file (ConfigBackup.exportToWriter) instead
+        // of being assembled as one String first (ConfigBackup.export). The
+        // auto payload excludes chat but still reaches tens of MB on a heavy
+        // install (skills + memory + shared/ artifacts + knowledge graph):
+        // the String path materializes the whole document AND its
+        // toString()/StringBuilder twin in UTF-16 before the first byte
+        // touches disk — that is the OOM shape the manual export path already
+        // removed for itself ([T-backup-streaming-export]). Same assembly
+        // (buildSections is the single source of truth for both), so the
+        // written document is the same shape as before.
+        val dir = File(app.filesDir, DIR).apply { mkdirs() }
+        val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
+        val local = File(dir, "$LOCAL_FILE_PREFIX$stamp.json")
+        // exportToWriter returns the count of fields it could not read. The
+        // unattended path has no UI to surface them in, so a nonzero count is
+        // logged and the backup still lands (the String path dropped those
+        // fields the same way; only the reporting channel differs).
+        val unreadableFields = local.bufferedWriter().use { writer ->
+            ConfigBackup.exportToWriter(
                 providerRepo = app.providerRepository,
                 includeSecrets = false,
                 envVarRepo = app.envVarRepository,
@@ -141,23 +185,26 @@ object AutoBackupManager {
                 webDavConfig = WebDavConfigStore(app).load(),
                 scheduledTasks = com.rikkaminis.app.scheduled.ScheduledTasksStore
                     .exportDocument(app),
+                writer = writer,
             )
+        }
+        if (unreadableFields > 0) {
+            Log.w(TAG, "auto backup wrote $unreadableFields unreadable field(s)")
+        }
 
-        val dir = File(app.filesDir, DIR).apply { mkdirs() }
-        val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-        File(dir, "$LOCAL_FILE_PREFIX$stamp.json").writeText(payload)
-
-        // Local rotation: keep the newest AUTO_BACKUP_KEEP auto files.
-        listLocal(app)
-            .drop(WebDavSync.AUTO_BACKUP_KEEP)
-            .forEach { runCatching { it.delete() } }
+        // Local rotation: keep the newest AUTO_BACKUP_KEEP auto files
+        // (shared helper — the settings screen's fetch path rotates the same
+        // way, so the cap has a single implementation).
+        rotateLocalAutoBackups(app)
 
         // Remote push is best-effort: local copy already exists, so a failed
-        // upload only means the offsite copy lags until tomorrow.
+        // upload only means the offsite copy lags until tomorrow. The push
+        // uploads the file we just wrote (bytes read off disk), never a
+        // re-assembled String.
         val cfg = WebDavConfigStore(app).load()
         if (cfg != null && cfg.url.isNotBlank() && cfg.username.isNotBlank()) {
             runCatching {
-                WebDavSync.backupAuto(cfg, payload)
+                WebDavSync.backupAuto(cfg, local)
                 WebDavSync.pruneAutoBackups(cfg, keep = WebDavSync.AUTO_BACKUP_KEEP)
             }.onFailure { Log.w(TAG, "remote push failed: ${it.message}") }
         }

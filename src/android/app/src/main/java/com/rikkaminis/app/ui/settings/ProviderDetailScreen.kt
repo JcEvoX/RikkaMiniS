@@ -120,7 +120,11 @@ fun ProviderDetailScreen(
     if (instance == null) return
     val currentInstance = instance
 
-    var label by remember { mutableStateOf(instance.label) }
+    // [da1023-C] Bind label to (instance.id, attribute): the old keyless
+    // remember kept the first instance's values after navigating between
+    // detail pages, and a focus loss then wrote the STALE label back over
+    // the new instance (external RPC rename + UI focus loss = silent revert).
+    var label by remember(instance.id, instance.label) { mutableStateOf(instance.label) }
     val labelChanged = label != instance.label
 
     // [T-android-provider-apikey-save-stale] Hold the stored API key in Compose
@@ -151,7 +155,10 @@ fun ProviderDetailScreen(
     // the sheet lives inside this screen.
     var showManageModelsSheet by remember { mutableStateOf(false) }
 
-    var isEnabled by remember { mutableStateOf(instance.isEnabled) }
+    // [da1023-C] Same (instance.id, attribute) binding as label above: an
+    // external RPC enable/disable while this screen is open used to leave the
+    // stale toggle on screen, and the next save wrote the stale value back.
+    var isEnabled by remember(instance.id, instance.isEnabled) { mutableStateOf(instance.isEnabled) }
 
     // saveBaseURLSettings(): single source of truth for persisting the three
     // [perf-provider-detail-models] Cache the entry list per (instanceId, config)

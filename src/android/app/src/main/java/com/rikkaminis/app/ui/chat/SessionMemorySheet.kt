@@ -81,7 +81,20 @@ fun SessionMemorySheet(
 ) {
     val context = LocalContext.current
     var mode by remember { mutableStateOf<MemorySheetMode>(MemorySheetMode.List) }
-    val autoItems = remember(memoryRepository, context) { buildAutoInjectedItems(context, memoryRepository) }
+    // [deep-audit-1023 ISSUE-07] `buildAutoInjectedItems` reads GLOBAL.md /
+    // SOUL.md / the two newest daily logs off disk and caches the full text in
+    // each AutoItem. Its `remember` only keyed on (memoryRepository, context) —
+    // both stable for the life of the sheet — so the snapshot was computed once
+    // per sheet open and never recomputed, even though three paths inside this
+    // same sheet rewrite exactly those files (AutoFile save, Write-record save,
+    // Write revoke). After a save the list still showed the OLD line count and
+    // re-opening the file fed the OLD cached content into the editor, so the
+    // next save spliced stale text over the file. Bump the tick on every
+    // successful mutation and the snapshot rebuilds.
+    var autoItemsRefreshTick by remember { mutableStateOf(0) }
+    val autoItems = remember(memoryRepository, context, autoItemsRefreshTick) {
+        buildAutoInjectedItems(context, memoryRepository)
+    }
 
     // Editing state for the active detail screen. Lives at the sheet level so
     // a single Save button in the header can read the latest buffer without
@@ -209,6 +222,7 @@ fun SessionMemorySheet(
                             }
                             mode = MemorySheetMode.AutoFile(m.name, full, m.editable)
                             isEditing = false
+                            autoItemsRefreshTick++
                             savedToastVisible = true
                         } catch (_: Exception) { /* fall through; UI toast omitted on failure */ }
                     },
@@ -265,6 +279,7 @@ fun SessionMemorySheet(
                                 m.record.copy(writtenContent = editedState.text.toString())
                             )
                             isEditing = false
+                            autoItemsRefreshTick++
                             savedToastVisible = true
                         } else {
                             mutationResult = result
@@ -295,6 +310,7 @@ fun SessionMemorySheet(
                 // ViewModel; pop back to list so the user sees the list
                 // re-render without the row.
                 if (result is MemoryRepository.EntryMutationResult.Success) {
+                    autoItemsRefreshTick++
                     mode = MemorySheetMode.List
                 }
             },
@@ -515,51 +531,89 @@ internal data class AutoItem(
     val content: String,
 )
 
+/**
+ * [deep-audit-1023 ISSUE-07] Pure half of [buildAutoInjectedItems]: content ->
+ * AutoItem for the always-present persona/config files (SOUL.md / GLOBAL.md).
+ * No Context, no IO, so the "the item really reflects the bytes that are on
+ * disk now" rule is unit-testable instead of only observable by eye in the
+ * sheet — the sheet used to cache the whole list forever, and the refresh tick
+ * is only worth anything if the rebuilt item carries the new text/count.
+ */
+internal fun autoItemFor(
+    fileName: String,
+    displayName: String,
+    content: String,
+    emptyLabel: String,
+): AutoItem {
+    if (content.isNotBlank()) {
+        val lineCount = content.lines().size
+        return AutoItem(
+            name = displayName,
+            detail = "$lineCount lines (full)",
+            fileName = fileName,
+            content = content,
+        )
+    }
+    return AutoItem(
+        name = displayName,
+        detail = emptyLabel,
+        fileName = fileName,
+        content = "",
+    )
+}
+
+/**
+ * [deep-audit-1023 ISSUE-07] Pure half of [buildAutoInjectedItems] for the
+ * daily logs. Returns null when the log has no content — an empty day is not
+ * an "auto-injected" item at all. The `>200` injection cap spelled out here is
+ * what the sheet shows as `N/M lines injected`, so a stale snapshot used to
+ * under-report the log the user had just grown.
+ */
+internal fun dailyAutoItemFor(
+    fileName: String,
+    displayName: String,
+    content: String,
+): AutoItem? {
+    if (content.isBlank()) return null
+    val lineCount = content.lines().size
+    val injected = minOf(lineCount, 200)
+    val detail = if (lineCount > 200) "$injected/$lineCount lines injected" else "$lineCount lines (full)"
+    return AutoItem(
+        name = displayName,
+        detail = detail,
+        fileName = fileName,
+        content = content,
+    )
+}
+
 private fun buildAutoInjectedItems(context: Context, memoryRepository: MemoryRepository): List<AutoItem> {
     val items = mutableListOf<AutoItem>()
+    val emptyLabel = context.getString(R.string.memory_file_empty)
 
     // SOUL.md — persona / identity. Lives in the same memory dir as
     // GLOBAL.md and is auto-injected into the system prompt by
     // SystemPromptBuilder.identitySection(). Surfaced here so the user
     // can see + edit the same file the model sees, mirroring GLOBAL.md.
-    val soulContent = memoryRepository.readFile("SOUL.md")
-    if (soulContent.isNotBlank()) {
-        val lineCount = soulContent.lines().size
-        items.add(AutoItem(
-            name = "SOUL.md",
-            detail = "$lineCount lines (full)",
+    items.add(
+        autoItemFor(
             fileName = "SOUL.md",
-            content = soulContent,
-        ))
-    } else {
-        items.add(AutoItem(
-            name = "SOUL.md",
-            detail = context.getString(R.string.memory_file_empty),
-            fileName = "SOUL.md",
-            content = "",
-        ))
-    }
+            displayName = "SOUL.md",
+            content = memoryRepository.readFile("SOUL.md"),
+            emptyLabel = emptyLabel,
+        )
+    )
 
     // GLOBAL.md
-    val globalContent = memoryRepository.loadGlobalMd()
-    if (globalContent.isNotBlank()) {
-        val lineCount = globalContent.lines().size
-        items.add(AutoItem(
-            name = "GLOBAL.md",
-            detail = "$lineCount lines (full)",
+    items.add(
+        autoItemFor(
             fileName = "GLOBAL.md",
-            content = globalContent,
-        ))
-    } else {
-        items.add(AutoItem(
-            name = "GLOBAL.md",
-            detail = context.getString(R.string.memory_file_empty),
-            fileName = "GLOBAL.md",
-            content = "",
-        ))
-    }
+            displayName = "GLOBAL.md",
+            content = memoryRepository.loadGlobalMd(),
+            emptyLabel = emptyLabel,
+        )
+    )
 
-    // Today + yesterday
+    // Today + yesterday. Empty days are skipped (not injected).
     val dateFmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
     val today = dateFmt.format(Date())
     val yesterday = dateFmt.format(Date(Date().time - 86400_000L))
@@ -567,18 +621,11 @@ private fun buildAutoInjectedItems(context: Context, memoryRepository: MemoryRep
     for (dateStr in listOf(today, yesterday)) {
         val fileName = "$dateStr.md"
         val label = if (dateStr == today) context.getString(R.string.time_today) else context.getString(R.string.time_yesterday)
-        val content = memoryRepository.readFile(fileName)
-        if (content.isNotBlank()) {
-            val lineCount = content.lines().size
-            val injected = minOf(lineCount, 200)
-            val detail = if (lineCount > 200) "$injected/$lineCount lines injected" else "$lineCount lines (full)"
-            items.add(AutoItem(
-                name = "$label — $fileName",
-                detail = detail,
-                fileName = fileName,
-                content = content,
-            ))
-        }
+        dailyAutoItemFor(
+            fileName = fileName,
+            displayName = "$label — $fileName",
+            content = memoryRepository.readFile(fileName),
+        )?.let { items.add(it) }
     }
 
     return items

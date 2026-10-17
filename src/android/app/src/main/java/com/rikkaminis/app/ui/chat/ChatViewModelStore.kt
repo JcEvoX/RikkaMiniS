@@ -51,6 +51,23 @@ object ChatViewModelStore {
     private fun resolveKey(sessionId: String): String =
         aliases[sessionId] ?: sessionId
 
+    /**
+     * [da1023-F] Public view of [resolveKey] for callers that hold the nav-arg
+     * session id instead of the VM.
+     *
+     * A draft chat's route arg stays on `__new__<uuid>` for the lifetime of
+     * the screen even after the first send promotes it to a real session row
+     * (`ChatSessionEntryExt.ensureSession` → [rename]). In-chat callers read
+     * the live id through `viewModel.currentSessionId`; callers outside the
+     * screen (`AppNavigation` route builders) only have the route arg, so they
+     * need the same alias hop or they navigate session-scoped destinations
+     * into the orphan draft key. Unknown / canonical ids pass through
+     * unchanged, so non-draft callers see identical behaviour.
+     */
+    @Synchronized
+    fun resolveSessionId(sessionId: String): String =
+        resolveKey(sessionId)
+
     @Synchronized
     fun ownerFor(sessionId: String): ViewModelStoreOwner {
         val key = resolveKey(sessionId)

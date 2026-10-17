@@ -64,7 +64,11 @@ fun MoveToSessionSheet(
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var sessions by remember { mutableStateOf<List<ChatSessionEntity>>(emptyList()) }
 
-    LaunchedEffect(Unit) {
+    // [da1023-F] Keyed on currentSessionId, not Unit: the caller passes the
+    // ACTIVE id (ChatInputArea ← ChatScreen), which changes when a draft is
+    // promoted mid-screen — the effect must re-run so the self-filter drops
+    // the now-current row instead of the stale draft key.
+    LaunchedEffect(currentSessionId) {
         sessions = withContext(Dispatchers.IO) {
             chatRepository.dao.listSessions().filter { it.id != currentSessionId }
         }
