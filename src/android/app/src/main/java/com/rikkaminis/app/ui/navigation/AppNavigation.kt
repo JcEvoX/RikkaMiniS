@@ -114,6 +114,23 @@ private val NavBackStackEntry.isColdStartPlaceholder: Boolean
 
 object Routes {
     /**
+     * [da1020-F] Single encode口径 for a route **path segment**.
+     *
+     * The Nav library splits a route string on `/` *before* %-decoding each
+     * segment, so any id that carries a reserved character (`/`, space, `#`,
+     * `?`, …) must be percent-encoded by the builder — otherwise the built
+     * route no longer matches the registered pattern and `navigate()` throws
+     * `IllegalArgumentException: destination … cannot be found`.
+     *
+     * Every parameterised `Routes.*` builder below routes its interpolated id
+     * through this one helper. Callers must therefore pass the **raw** id
+     * (already decoded) — pre-encoding at a call site would double-encode.
+     * Mirrors the existing [modelEntryDetail] / [filePreview] / [fileBrowser]
+     * precedent (`android.net.Uri.encode` emits `%20` for spaces, never `+`).
+     */
+    internal fun seg(v: String): String = android.net.Uri.encode(v)
+
+    /**
      * [P0-0] `focusMessageId` is an OPTIONAL query arg: any caller that just
      * wants "open this session" keeps calling [chat] with one argument and
      * gets the exact pre-P0-0 behaviour (nav supplies null via defaultValue).
@@ -265,10 +282,16 @@ object Routes {
         val enc = java.net.URLEncoder.encode(focusMessageId, "UTF-8").replace("+", "%20")
         return "$base?focusMessageId=$enc"
     }
-    fun providerDetail(instanceId: String) = "provider/$instanceId"
-    fun providerConnection(instanceId: String) = "provider_connection/$instanceId"
-    fun modelGroupDetail(groupId: String) = "model_group/$groupId"
-    fun addModelsToGroup(groupId: String) = "add_models_to_group/$groupId"
+    // [da1020-F] Path-segment builders encode through [seg] — a deep link
+    // (`minis://settings/providers/<id>`, emitted by an LLM-generated markdown
+    // link or any external app, both of which can carry a space or a `/`) used
+    // to hand `nav.navigate` a malformed route → uncaught
+    // IllegalArgumentException. The receiver side (NavBackStackEntry arguments)
+    // %-decodes exactly once, so ids round-trip byte-for-byte.
+    fun providerDetail(instanceId: String) = "provider/${seg(instanceId)}"
+    fun providerConnection(instanceId: String) = "provider_connection/${seg(instanceId)}"
+    fun modelGroupDetail(groupId: String) = "model_group/${seg(groupId)}"
+    fun addModelsToGroup(groupId: String) = "add_models_to_group/${seg(groupId)}"
     // [T-android-model-entry-route-slash-crash] entryId is a composite key
     // "<instanceId>/<modelId>" (compositeEntryKey) — it CONTAINS a '/'. Left
     // raw, that slash splits the route into an extra path segment, so the
@@ -278,8 +301,8 @@ object Routes {
     // crash on tapping any model whose id carries a '/'. URL-encode it so the
     // slash becomes %2F (one segment); the receiver decodes it back.
     fun modelEntryDetail(instanceId: String, entryId: String) =
-        "model_entry/${android.net.Uri.encode(instanceId)}/${android.net.Uri.encode(entryId)}"
-    fun addCustomModel(instanceId: String) = "add_custom_model/$instanceId"
+        "model_entry/${seg(instanceId)}/${seg(entryId)}"
+    fun addCustomModel(instanceId: String) = "add_custom_model/${seg(instanceId)}"
 }
 
 // [sweep1014-D13] Former FilePreviewHolder static singleton (currentItem /

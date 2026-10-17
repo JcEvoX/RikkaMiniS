@@ -27,12 +27,25 @@ import com.rikkaminis.app.ui.navigation.Routes
  *   minis://settings/logs                       → Log management
  *   minis://settings/appearance                 → Appearance
  *   minis://settings/background                 → Background settings
- *   minis://settings/about                      → About
  *   minis://settings/permissions                → Permissions
+ *   minis://settings/mcp, mcp-servers           → MCP Integrations (T-mcp-oauth-
+ *                                                 deeplink: the authorize round-trip
+ *                                                 emitted by minis-mcp-cli lands here;
+ *                                                 the server-name segment is ignored —
+ *                                                 the MCP screen is a list destination)
+ *   minis://settings/soul                       → SOUL.md editor
+ *   minis://settings/backup                     → Backup & restore
+ *   minis://settings/scheduled-tasks            → Scheduled tasks
+ *   minis://settings/runtime-limits             → Runtime Limits page
+ *   minis://settings/chat-tuning                → Chat Tuning page
  *   minis://settings/environments[?create_key=...&create_value=...&create_note=...]
  *                                               → Environment variables
  *   minis://settings/rootfs                     → Rootfs management (mirror config lives here)
  *   minis://settings/mirrors                    → alias for rootfs (mirrors live inside Rootfs UI)
+ *
+ * (`minis://settings/about` was documented here once but no About
+ * destination ever existed in the nav table — such paths land on
+ * Settings home via the fallback below.)
  *
  * Unknown settings paths fall back to Settings home rather than
  * Unknown — matches iOS's "best-effort land somewhere reasonable"
@@ -95,6 +108,109 @@ sealed class DeepLinkAction {
     ) : DeepLinkAction()
 
     data object Unknown : DeepLinkAction()
+}
+
+/**
+ * [da1020-F] Resolved target of a `minis://settings/<path>` link — the pure
+ * decision shape behind [DeepLinkHandler.parseSettingsPath].
+ */
+internal sealed class SettingsDeepLink {
+    /** A ready-to-navigate route from [Routes] (arguments already applied). */
+    data class Route(val route: String) : SettingsDeepLink()
+
+    /** `environments?create_key=…` — prefilled env-var create form. */
+    data class EnvVarCreate(val key: String, val value: String, val note: String) : SettingsDeepLink()
+
+    /** `permissions` keeps its dedicated dispatch branch. */
+    data object PermissionSettings : SettingsDeepLink()
+}
+
+/**
+ * [da1020-F] Pure routing table for `minis://settings/<path>`.
+ *
+ * Deliberately free of `android.net.Uri` (a stub on the JVM test VM) so the
+ * whole table — including the percent-encoding contract of the [Routes]
+ * builders — is unit-testable. Both inputs are **already decoded**, which is
+ * what Android's `Uri.getPath()` / `Uri.getQueryParameter()` hand over; the
+ * argument therefore reaches the `Routes.*` builders raw, and those builders
+ * are the single place that re-encodes it (no double-encoding).
+ *
+ * Unknown paths land on [Routes.SETTINGS] rather than failing, so an
+ * LLM-generated link can never strand the user (iOS parity) — this fallback is
+ * deliberate and must not be turned into an error.
+ */
+internal fun resolveSettingsDeepLink(path: String, query: Map<String, String>): SettingsDeepLink {
+    val segments = path.trimStart('/').split('/').filter { it.isNotEmpty() }
+    val head = segments.firstOrNull() ?: return SettingsDeepLink.Route(Routes.SETTINGS)
+    val arg = segments.getOrNull(1)?.takeIf { it.isNotBlank() }
+
+    return when (head) {
+        "providers" ->
+            if (arg != null) SettingsDeepLink.Route(Routes.providerDetail(arg))
+            else SettingsDeepLink.Route(Routes.PROVIDER_LIST)
+        "model-groups", "model_groups" ->
+            if (arg != null) SettingsDeepLink.Route(Routes.modelGroupDetail(arg))
+            else SettingsDeepLink.Route(Routes.MODEL_GROUPS)
+        "usage", "usage-stats", "usage_stats" ->
+            SettingsDeepLink.Route(Routes.USAGE_STATS)
+        "skills" -> SettingsDeepLink.Route(Routes.SKILLS)
+        "memory" -> SettingsDeepLink.Route(Routes.MEMORY)
+        "storage" -> SettingsDeepLink.Route(Routes.STORAGE)
+        "mount-external", "mount_external", "mounts", "mounted-folders", "mounted_folders" ->
+            SettingsDeepLink.Route(Routes.MOUNTED_FOLDERS)
+        "shared-folders", "shared_folders" ->
+            SettingsDeepLink.Route(Routes.SHARED_FOLDERS)
+        // [da1020-F] `minis://settings/mcp-servers/<name>` is emitted by the
+        // MCP OAuth flow itself (minis-mcp-cli `transport/http.py`
+        // `_authorize_deeplink`: `"[Authorize](minis://settings/mcp-servers/%s)"`
+        // with the server name percent-encoded). Until this branch existed the
+        // link fell through to Settings home, so the authorize round-trip never
+        // reached the MCP screen. Routes.MCP is a single list destination with
+        // no argument slot, so the server-name segment is accepted and
+        // **ignored** (appending it would build a route no destination matches
+        // = the crash class fixed below). Landing on the list is recorded as a
+        // residual: deep-linking to one server's edit sheet needs a pending
+        // hand-off into MCPIntegrationsScreen (outside this change's blast
+        // radius).
+        "mcp", "mcp-servers", "mcp_servers" -> SettingsDeepLink.Route(Routes.MCP)
+        "soul" -> SettingsDeepLink.Route(Routes.SOUL)
+        "backup" -> SettingsDeepLink.Route(Routes.BACKUP)
+        "scheduled-tasks", "scheduled_tasks" -> SettingsDeepLink.Route(Routes.SCHEDULED_TASKS)
+        "runtime-limits", "runtime_limits" -> SettingsDeepLink.Route(Routes.RUNTIME_LIMITS)
+        "chat-tuning", "chat_tuning" -> SettingsDeepLink.Route(Routes.CHAT_TUNING)
+        "logs" -> SettingsDeepLink.Route(Routes.LOGS)
+        "appearance" -> SettingsDeepLink.Route(Routes.APPEARANCE)
+        "background" -> SettingsDeepLink.Route(Routes.BACKGROUND)
+        "permissions" -> SettingsDeepLink.PermissionSettings
+        // mirrors live as a section inside Rootfs management — no
+        // standalone destination, so route both /mirrors and /rootfs
+        // there. The user lands on the same screen; mirror config is
+        // visible as the "Mirrors" section inside.
+        "mirrors", "rootfs", "rootfs-management", "rootfs_management" ->
+            SettingsDeepLink.Route(Routes.ROOTFS_MANAGEMENT)
+        "environments" -> {
+            // iOS parity (AIChatView.swift L1407-1411): only `create_key`
+            // is required. Missing `create_value`/`create_note` default
+            // to empty string so a link like
+            //   minis://settings/environments?create_key=GH_TOKEN&create_value=
+            // (where `create_value=` is present-but-blank) still opens
+            // the prefilled form. Without create_key, plain navigation
+            // to the Env Vars list.
+            val key = query["create_key"]
+            if (!key.isNullOrEmpty()) {
+                SettingsDeepLink.EnvVarCreate(
+                    key = key,
+                    value = query["create_value"] ?: "",
+                    note = query["create_note"] ?: "",
+                )
+            } else {
+                SettingsDeepLink.Route(Routes.ENV_VARS)
+            }
+        }
+        // Unknown path — land on Settings home rather than failing,
+        // so the user can find what they wanted by browsing.
+        else -> SettingsDeepLink.Route(Routes.SETTINGS)
+    }
 }
 
 object DeepLinkHandler {
@@ -167,63 +283,26 @@ object DeepLinkHandler {
      * carrying a route string from [Routes]. Unknown paths land on
      * Settings home rather than [DeepLinkAction.Unknown] so an LLM-
      * generated link can never strand the user; iOS does the same.
+     *
+     * [da1020-F] The routing table itself now lives in [resolveSettingsDeepLink]
+     * — a pure function free of `android.net.Uri` (a stub on the JVM test
+     * VM) so it stays unit-testable. This wrapper only adapts the URI into
+     * that signature: Android's `Uri.getPath()` / `getQueryParameter()` hand
+     * over **already-decoded** values, so the argument reaches the
+     * `Routes.*` builders raw and they are the single place that re-encodes
+     * it (no double-encoding).
      */
     private fun parseSettingsPath(uri: Uri): DeepLinkAction {
-        val path = uri.path?.trimStart('/').orEmpty()
-        if (path.isEmpty()) return DeepLinkAction.OpenSettingsScreen(Routes.SETTINGS)
-        val segments = path.split('/').filter { it.isNotEmpty() }
-        val head = segments.firstOrNull() ?: return DeepLinkAction.OpenSettingsScreen(Routes.SETTINGS)
-        val arg = segments.getOrNull(1)?.takeIf { it.isNotBlank() }
-
-        return when (head) {
-            "providers" ->
-                if (arg != null) DeepLinkAction.OpenSettingsScreen(Routes.providerDetail(arg))
-                else DeepLinkAction.OpenSettingsScreen(Routes.PROVIDER_LIST)
-            "model-groups", "model_groups" ->
-                if (arg != null) DeepLinkAction.OpenSettingsScreen(Routes.modelGroupDetail(arg))
-                else DeepLinkAction.OpenSettingsScreen(Routes.MODEL_GROUPS)
-            "usage", "usage-stats", "usage_stats" ->
-                DeepLinkAction.OpenSettingsScreen(Routes.USAGE_STATS)
-            "skills" -> DeepLinkAction.OpenSettingsScreen(Routes.SKILLS)
-            "memory" -> DeepLinkAction.OpenSettingsScreen(Routes.MEMORY)
-            "storage" -> DeepLinkAction.OpenSettingsScreen(Routes.STORAGE)
-            "mount-external", "mount_external", "mounts", "mounted-folders", "mounted_folders" ->
-                DeepLinkAction.OpenSettingsScreen(Routes.MOUNTED_FOLDERS)
-            "shared-folders", "shared_folders" ->
-                DeepLinkAction.OpenSettingsScreen(Routes.SHARED_FOLDERS)
-            "logs" ->
-                DeepLinkAction.OpenSettingsScreen(Routes.LOGS)
-            "appearance" -> DeepLinkAction.OpenSettingsScreen(Routes.APPEARANCE)
-            "background" -> DeepLinkAction.OpenSettingsScreen(Routes.BACKGROUND)
-            "permissions" -> DeepLinkAction.OpenPermissionSettings
-            // mirrors live as a section inside Rootfs management — no
-            // standalone destination, so route both /mirrors and /rootfs
-            // there. The user lands on the same screen; mirror config is
-            // visible as the "Mirrors" section inside.
-            "mirrors", "rootfs", "rootfs-management", "rootfs_management" ->
-                DeepLinkAction.OpenSettingsScreen(Routes.ROOTFS_MANAGEMENT)
-            "environments" -> {
-                // iOS parity (AIChatView.swift L1407-1411): only `create_key`
-                // is required. Missing `create_value`/`create_note` default
-                // to empty string so a link like
-                //   minis://settings/environments?create_key=GH_TOKEN&create_value=
-                // (where `create_value=` is present-but-blank) still opens
-                // the prefilled form. Without create_key, plain navigation
-                // to the Env Vars list.
-                val key = uri.getQueryParameter("create_key")
-                if (!key.isNullOrEmpty()) {
-                    DeepLinkAction.CreateEnvironmentVariable(
-                        key = key,
-                        value = uri.getQueryParameter("create_value") ?: "",
-                        note = uri.getQueryParameter("create_note") ?: "",
-                    )
-                } else {
-                    DeepLinkAction.OpenSettingsScreen(Routes.ENV_VARS)
-                }
-            }
-            // Unknown path — land on Settings home rather than failing,
-            // so the user can find what they wanted by browsing.
-            else -> DeepLinkAction.OpenSettingsScreen(Routes.SETTINGS)
+        val query = uri.queryParameterNames.orEmpty()
+            .associateWith { uri.getQueryParameter(it).orEmpty() }
+        return when (val resolved = resolveSettingsDeepLink(uri.path.orEmpty(), query)) {
+            is SettingsDeepLink.Route -> DeepLinkAction.OpenSettingsScreen(resolved.route)
+            is SettingsDeepLink.EnvVarCreate -> DeepLinkAction.CreateEnvironmentVariable(
+                key = resolved.key,
+                value = resolved.value,
+                note = resolved.note,
+            )
+            SettingsDeepLink.PermissionSettings -> DeepLinkAction.OpenPermissionSettings
         }
     }
 

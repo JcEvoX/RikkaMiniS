@@ -802,7 +802,11 @@ internal suspend fun ChatViewModel.executeConversationHistoryTool(argsJson: Stri
 // log into MEMORY-ROLLUP.md. Uses the same memory dir as the repository.
 internal fun ChatViewModel.executeMemoryRollupTool(): ToolExecutionResult {
     val repo = memoryRepository ?: return ToolExecutionResult("Error: Memory not available", false)
-    return com.rikkaminis.app.ui.chat.executeMemoryRollupTool(repo) { record ->
+    // [fix/da1020-memory-gate-provider-fields] Same gate as memory_write
+    // (below): a session with /memory off must not let a rollup call write
+    // MEMORY-ROLLUP.md. Covers both dispatch sites (main loop + sub-agent
+    // loop) — they share this single wrapper.
+    return com.rikkaminis.app.ui.chat.executeMemoryRollupTool(repo, _memoryEnabled.value) { record ->
         _memoryToolRecords.value = _memoryToolRecords.value + record
     }
 }

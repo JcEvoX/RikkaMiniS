@@ -185,6 +185,20 @@ internal suspend fun executeBrowserUseTool(
 }
 
 /**
+ * [fix/da1020-memory-gate-provider-fields] Single source for the memory
+ * tool gate: null = allowed, non-null = the rejection message. Both the
+ * memory_write and memory_rollup executors consult this so a session with
+ * /memory off answers the two write-shaped tools identically (reads remain
+ * available — the /memory command only turns off writes + injection).
+ */
+internal fun memoryToolDisabledMessage(memoryEnabled: Boolean): String? =
+    if (memoryEnabled) null
+    else "Memory writes are disabled for this session (user toggled /memory off). Reads remain available."
+
+/** Shared toolTitle for a memory tool rejected by [memoryToolDisabledMessage]. */
+internal const val MEMORY_DISABLED_TOOL_TITLE = "Memory (disabled)"
+
+/**
  * memory_write executor. [recordSink] replaces the _memoryToolRecords side
  * channel (production appends to the StateFlow).
  */
@@ -194,9 +208,8 @@ internal fun executeMemoryWriteTool(
     memoryEnabled: Boolean,
     recordSink: (MemoryToolRecord) -> Unit,
 ): ToolExecutionResult {
-    if (!memoryEnabled) {
-        val msg = "Memory writes are disabled for this session (user toggled /memory off). Reads remain available."
-        return ToolExecutionResult(msg, false, toolTitle = "Memory (disabled)")
+    memoryToolDisabledMessage(memoryEnabled)?.let {
+        return ToolExecutionResult(it, false, toolTitle = MEMORY_DISABLED_TOOL_TITLE)
     }
     val result = com.rikkaminis.app.tools.MemoryTools.executeMemoryWrite(argsJson, repo)
     // Record for SessionMemorySheet
@@ -236,11 +249,21 @@ internal fun executeMemoryGetTool(
 /**
  * [T6-rollup] On-demand memory rollup: distills the previous day's daily
  * log into MEMORY-ROLLUP.md. Uses the same memory dir as the repository.
+ *
+ * [fix/da1020-memory-gate-provider-fields] Same gate as memory_write:
+ * MemoryRollupTool.execute writes MEMORY-ROLLUP.md, so a session with
+ * /memory off must not let a rollup call reach the disk (the schema gate
+ * in AgentTools.makeAgentTools drops the tool, but a tool_use block that
+ * still arrives — mid-turn toggle, replayed block — would otherwise write).
  */
 internal fun executeMemoryRollupTool(
     repo: com.rikkaminis.app.data.repository.MemoryRepository,
+    memoryEnabled: Boolean,
     recordSink: (MemoryToolRecord) -> Unit,
 ): ToolExecutionResult {
+    memoryToolDisabledMessage(memoryEnabled)?.let {
+        return ToolExecutionResult(it, false, toolTitle = MEMORY_DISABLED_TOOL_TITLE)
+    }
     val memoryDir = repo.memoryDirectory()
     val result = com.rikkaminis.app.tools.MemoryRollupTool.execute(memoryDir)
     recordSink(MemoryToolRecord(

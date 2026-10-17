@@ -48,14 +48,31 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
         }
         if (argv[0] == "--version") return ok("android-shizuku-cli 1.0 (T322)")
 
-        val group = argv[0]
-        val rest = argv.drop(1)
-        // [deep-audit-1017 ISSUE-08b] Declare this handler's value-less long
-        // options: OffloadArgs treats `--flag` as boolean only when the caller
-        // declares it (a flag it doesn't know greedily eats the next token as
-        // its value — the B26a failure mode pinned by SessionsCliArgsTest). See
-        // [NO_VALUE_FLAGS].
-        val args = OffloadArgs(rest, booleanFlags = NO_VALUE_FLAGS)
+        // [deep-audit-1020 ISSUE-02] Read the group **by position**, not by
+        // index. A leading option that belongs to the invocation (`--compact`,
+        // `--format json`, …) used to become the group name, so
+        // `android-shizuku-cli --compact package list` died as
+        // `unknown subcommand '--compact'`. [splitShizukuArgv] returns the first
+        // token the parser reads as a positional plus every other token in
+        // order, so the group handler still sees the leading options through
+        // [args] and `args.positional.first()` is its sub-command.
+        val split = splitShizukuArgv(argv)
+        val group = split.group ?: return NativeOffloadResult(
+            2,
+            "android-shizuku-cli: no subcommand given.\n" +
+                "  - Run `android-shizuku-cli` with no args to see available subcommands.\n",
+        )
+        // [deep-audit-1017 ISSUE-08b / deep-audit-1020 ISSUE-02] Declare this
+        // handler's value-less long options: OffloadArgs treats `--flag` as
+        // boolean only when the caller declares it (a flag it doesn't know
+        // greedily eats the next token as its value — the B26a failure mode
+        // pinned by SessionsCliArgsTest). See [NO_VALUE_FLAGS]; the declaration
+        // is per group because `--data` is read as a value by `activity`
+        // ([noValueFlagsFor]).
+        val args = OffloadArgs(split.withoutGroup, booleanFlags = noValueFlagsFor(group))
+        // `exec` joins the tokens *after* the group into one shell command, so a
+        // leading option must never leak into the command string.
+        val rest = if (group == "exec") split.trailing else split.withoutGroup
 
         // `service ping/status` reports state without requiring READY.
         if (group == "service") return handleService(rest, args)
@@ -87,6 +104,7 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
 
         return try {
             when (group) {
+                "help", "--help", "-h" -> ok(HELP)
                 "package" -> handlePackage(rest, args)
                 "permission" -> handlePermission(rest, args)
                 "activity" -> handleActivity(rest, args)
@@ -114,7 +132,7 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
 
     // ─── Group: service ────────────────────────────────────────────────────
     private fun handleService(rest: List<String>, args: OffloadArgs): NativeOffloadResult {
-        val sub = rest.firstOrNull() ?: "status"
+        val sub = args.positional.firstOrNull() ?: "status"
         val snap = ShizukuManager.snapshot.value
         return when (sub) {
             "status" -> {
@@ -142,7 +160,7 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
 
     // ─── Group: package ────────────────────────────────────────────────────
     private fun handlePackage(rest: List<String>, args: OffloadArgs): NativeOffloadResult {
-        val sub = rest.firstOrNull() ?: return ok(PACKAGE_HELP)
+        val sub = args.positional.firstOrNull() ?: return ok(PACKAGE_HELP)
         return when (sub) {
             "list" -> packageList(args)
             "info" -> packageInfo(args.positional.getOrNull(1), args)
@@ -263,7 +281,7 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
 
     // ─── Group: permission ────────────────────────────────────────────────
     private fun handlePermission(rest: List<String>, args: OffloadArgs): NativeOffloadResult {
-        val sub = rest.firstOrNull() ?: return ok(PERMISSION_HELP)
+        val sub = args.positional.firstOrNull() ?: return ok(PERMISSION_HELP)
         return when (sub) {
             "list" -> permissionList(args.positional.getOrNull(1), args)
             "grant" -> permissionGrantRevoke(args.positional.getOrNull(1), args.positional.getOrNull(2), args, grant = true)
@@ -330,7 +348,7 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
 
     // ─── Group: activity ──────────────────────────────────────────────────
     private fun handleActivity(rest: List<String>, args: OffloadArgs): NativeOffloadResult {
-        val sub = rest.firstOrNull() ?: return ok(ACTIVITY_HELP)
+        val sub = args.positional.firstOrNull() ?: return ok(ACTIVITY_HELP)
         return when (sub) {
             "start" -> activityStart(args)
             "force-stop" -> activityForceStop(args.positional.getOrNull(1), args)
@@ -410,7 +428,7 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
 
     // ─── Group: display ───────────────────────────────────────────────────
     private fun handleDisplay(rest: List<String>, args: OffloadArgs): NativeOffloadResult {
-        val sub = rest.firstOrNull() ?: return ok(DISPLAY_HELP)
+        val sub = args.positional.firstOrNull() ?: return ok(DISPLAY_HELP)
         return when (sub) {
             "list" -> displayList(args)
             "set" -> displaySet(args)
@@ -470,7 +488,7 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
 
     // ─── Group: settings ──────────────────────────────────────────────────
     private fun handleSettings(rest: List<String>, args: OffloadArgs): NativeOffloadResult {
-        val sub = rest.firstOrNull() ?: return ok(SETTINGS_HELP)
+        val sub = args.positional.firstOrNull() ?: return ok(SETTINGS_HELP)
         val ns = args.positional.getOrNull(1)
         return when (sub) {
             "get" -> settingsGet(ns, args.positional.getOrNull(2), args)
@@ -546,7 +564,7 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
 
     // ─── Group: user ──────────────────────────────────────────────────────
     private fun handleUser(rest: List<String>, args: OffloadArgs): NativeOffloadResult {
-        val sub = rest.firstOrNull() ?: return ok(USER_HELP)
+        val sub = args.positional.firstOrNull() ?: return ok(USER_HELP)
         return when (sub) {
             "list" -> userList(args)
             "create" -> userCreate(args.positional.getOrNull(1), args)
@@ -609,7 +627,7 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
 
     // ─── Group: network ───────────────────────────────────────────────────
     private fun handleNetwork(rest: List<String>, args: OffloadArgs): NativeOffloadResult {
-        val sub = rest.firstOrNull() ?: return ok(NETWORK_HELP)
+        val sub = args.positional.firstOrNull() ?: return ok(NETWORK_HELP)
         return when (sub) {
             "restrict" -> networkRestrict(args.positional.getOrNull(1), args, restrict = true)
             "allow" -> networkRestrict(args.positional.getOrNull(1), args, restrict = false)
@@ -662,7 +680,7 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
 
     // ─── Group: input ─────────────────────────────────────────────────────
     private fun handleInput(rest: List<String>, args: OffloadArgs): NativeOffloadResult {
-        val sub = rest.firstOrNull() ?: return ok(INPUT_HELP)
+        val sub = args.positional.firstOrNull() ?: return ok(INPUT_HELP)
         return when (sub) {
             "tap" -> inputTap(args.positional.getOrNull(1), args.positional.getOrNull(2), args)
             "swipe" -> inputSwipe(args.positional.drop(1), args)
@@ -709,7 +727,7 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
 
     // ─── Group: notification ──────────────────────────────────────────────
     private fun handleNotification(rest: List<String>, args: OffloadArgs): NativeOffloadResult {
-        val sub = rest.firstOrNull() ?: return ok(NOTIFICATION_HELP)
+        val sub = args.positional.firstOrNull() ?: return ok(NOTIFICATION_HELP)
         return when (sub) {
             "list" -> notificationList(args)
             "dismiss" -> notificationDismiss(args)
@@ -818,7 +836,7 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
 
     // ─── Group: file ──────────────────────────────────────────────────────
     private fun handleFile(rest: List<String>, args: OffloadArgs): NativeOffloadResult {
-        val sub = rest.firstOrNull() ?: return ok(FILE_HELP)
+        val sub = args.positional.firstOrNull() ?: return ok(FILE_HELP)
         return when (sub) {
             "ls" -> fileLs(args.positional.getOrNull(1), args)
             "pull" -> filePullPush(args.positional.getOrNull(1), args.positional.getOrNull(2), args, pull = true)
@@ -864,7 +882,7 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
 
     // ─── Group: device ────────────────────────────────────────────────────
     private fun handleDevice(rest: List<String>, args: OffloadArgs): NativeOffloadResult {
-        val sub = rest.firstOrNull() ?: return ok(DEVICE_HELP)
+        val sub = args.positional.firstOrNull() ?: return ok(DEVICE_HELP)
         return when (sub) {
             "info" -> deviceInfo(args)
             "battery" -> deviceBattery(args)
@@ -1081,10 +1099,35 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
          * value straight to `cmd notification`. The parser is built once in
          * [handle], so the declaration lives here.
          *
+         * [deep-audit-1020 ISSUE-02] Every long switch read through `hasFlag`
+         * belongs in this set — 20 of them were missing, so `--system`,
+         * `--cache-only`, `--grant-permissions`, `--recursive`, … silently ate
+         * the token following them (`package clear --cache-only com.pkg` read
+         * the package as the value of the switch and then reported "package
+         * clear <packageName>" for a perfectly good command). The handler gate
+         * (`scripts/scan/shizuku_args_check.py`) now cross-checks the set
+         * against every `hasFlag("…")` long name in this file.
+         *
          * Only pure switches belong here: `--importance` takes a value and must
          * stay out (declaring it would leave `3` as a stray positional).
+         * `--data` is the one name read two ways — see [noValueFlagsFor], which
+         * drops it for the group that reads it as a value.
          */
-        internal val NO_VALUE_FLAGS = setOf("block", "unblock")
+        internal val NO_VALUE_FLAGS = setOf(
+            // permission appops / notification channel
+            "block", "unblock",
+            // package
+            "system", "third-party", "disabled",
+            "replace", "downgrade", "grant-permissions", "keep-data", "cache-only",
+            // permission
+            "granted", "denied", "dangerous",
+            // user
+            "managed-profile", "guest",
+            // network
+            "all", "background", "wifi", "data",
+            // input / file
+            "long-press", "long", "recursive",
+        )
 
         private const val HELP = """android-shizuku-cli — privileged Android system control via Shizuku.
 
@@ -1306,3 +1349,71 @@ internal fun buildPackageClearCommand(pkg: String, cacheOnly: Boolean, user: Str
 
 /** [deep-audit-1017 ISSUE-08c] What a successful `package clear` actually removed. */
 internal fun clearScope(cacheOnly: Boolean): String = if (cacheOnly) "cache-only" else "data+cache"
+
+/**
+ * [deep-audit-1020 ISSUE-02] The value-less long options in force for one group.
+ *
+ * `data` is the single name this CLI reads two ways: `activity start` takes it
+ * as a value (`--data <uri>`, read through [OffloadArgs.get] next to
+ * `-a`/`-p`/`-c`), while `network restrict|allow` uses it as a switch
+ * (NETWORK_HELP documents `--background|--wifi|--data|--all`). Declaring it
+ * value-less for every group would turn the activity uri into a stray
+ * positional and drop it silently, so the one group that reads it as a value
+ * opts out. `--data=<uri>` keeps working under both readings — `--key=value`
+ * is classified before the switch rule.
+ */
+internal fun noValueFlagsFor(group: String?): Set<String> =
+    if (group == "activity") ShizukuOffloadHandler.NO_VALUE_FLAGS - "data"
+    else ShizukuOffloadHandler.NO_VALUE_FLAGS
+
+/** [splitShizukuArgv] result — see that function. */
+internal data class ShizukuArgv(
+    val group: String?,
+    /** Every token except [group], in order — leading options included. */
+    val withoutGroup: List<String>,
+    /** The tokens after [group]; what `exec` joins into one shell command. */
+    val trailing: List<String>,
+)
+
+/**
+ * [deep-audit-1020 ISSUE-02] Top-level split of an `android-shizuku-cli` argv:
+ * the group name is the first token the parser reads as a **positional**, so a
+ * leading `--compact` / `--format json` / … stays an option instead of becoming
+ * the group (`argv[0]` used to be read directly, which made
+ * `android-shizuku-cli --compact package list` die as
+ * `unknown subcommand '--compact'`).
+ *
+ * The switch classification is delegated to [firstPositionalIndex] — the full
+ * [ShizukuOffloadHandler.NO_VALUE_FLAGS] set, because a leading option can
+ * belong to any group's switch vocabulary and `--data` leading an invocation is
+ * not a real shape.
+ */
+internal fun splitShizukuArgv(argv: List<String>): ShizukuArgv {
+    val index = firstPositionalIndex(argv, ShizukuOffloadHandler.NO_VALUE_FLAGS)
+    if (index < 0) return ShizukuArgv(null, argv, emptyList())
+    return ShizukuArgv(
+        group = argv[index],
+        withoutGroup = argv.filterIndexed { i, _ -> i != index },
+        trailing = argv.drop(index + 1),
+    )
+}
+
+/**
+ * Index of the first token [OffloadArgs] reads as a positional, or -1 when
+ * every token is an option.
+ *
+ * The classification is delegated to the parser itself, one prefix at a time,
+ * instead of re-implemented here: a second copy of the "is this `--flag` a
+ * switch or does it take the next token?" rule is exactly how the parser and
+ * its callers drift apart — the deep-audit-1020 ISSUE-02 class of bug. A CLI
+ * invocation is short, so the prefix walk is free.
+ */
+internal fun firstPositionalIndex(argv: List<String>, booleanFlags: Set<String>): Int {
+    var seen = 0
+    for (i in argv.indices) {
+        val count = OffloadArgs(argv.subList(0, i + 1), booleanFlags).positional.size
+        if (count > seen) return i
+        seen = count
+    }
+    return -1
+}

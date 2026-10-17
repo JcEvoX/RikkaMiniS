@@ -21,6 +21,20 @@ import java.util.Locale
 import java.util.TimeZone
 
 /**
+ * [da1020-C] Relative→absolute join for `--paths` tokens: a relative [path]
+ * with an absolute [cwd] resolves against it, same helper shape as
+ * [resolveMaybeRelative] (ConfigOffloadHandler's `--file` join). Everything
+ * else — an absolute path, or a missing / relative cwd — is returned
+ * unchanged, so the session-aware resolver downstream stays the only gate
+ * and a path it rejects fails closed instead of being guessed onto the
+ * rootfs. Pure so both arms stay testable off-device. Top-level (same
+ * package): [resolveMaybeRelative] is the single join implementation —
+ * reusing it here does not create a third copy.
+ */
+internal fun resolveMaybeRelativeAll(paths: List<String>, cwd: String?): List<String> =
+    paths.map { resolveMaybeRelative(it, cwd) }
+
+/**
  * minis-browser-use — expose the agent's browser_use tool as a CLI inside the
  * PRoot sandbox.
  *
@@ -60,7 +74,7 @@ class BrowserUseOffloadHandler(private val app: MinisApp) : NativeOffloadHandler
 
         // Parse args into the browser_use input shape.
         val inputJson = try {
-            buildInputJson(args, request.sessionId)
+            buildInputJson(args, request.sessionId, request.cwd)
         } catch (e: IllegalArgumentException) {
             return emitError(action = "execute", code = ERR_INVALID_ARGS,
                 message = e.message ?: "invalid arguments",
@@ -139,7 +153,7 @@ class BrowserUseOffloadHandler(private val app: MinisApp) : NativeOffloadHandler
 
     // ── Input parsing ────────────────────────────────────────────────────
 
-    private fun buildInputJson(args: OffloadArgs, sessionId: String?): JSONObject {
+    private fun buildInputJson(args: OffloadArgs, sessionId: String?, cwd: String?): JSONObject {
         // Explicit --json wins; action/flags are ignored in that case.
         args.get("json")?.let { raw ->
             return try {
@@ -179,9 +193,15 @@ class BrowserUseOffloadHandler(private val app: MinisApp) : NativeOffloadHandler
             // Comma- or whitespace-separated Linux paths (quoting multiple
             // paths through busybox-ash is painful; a single flat string is
             // the shell-friendly shape).
-            val tokens = raw.split(Regex("[,\\s]+"))
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
+            // [da1020-C] Relative tokens resolve against the guest cwd first
+            // (the shell's cwd is forwarded by the native_offload protocol,
+            // and the handler is the only layer that sees it): the
+            // downstream session-aware resolver only receives absolute
+            // paths, and a path it rejects still fails closed.
+            val tokens = resolveMaybeRelativeAll(
+                raw.split(Regex("[,\\s]+")).map { it.trim() }.filter { it.isNotEmpty() },
+                cwd,
+            )
             if (tokens.isNotEmpty()) obj.put("paths", JSONArray(tokens))
         }
         args.get("keywords")?.let { raw ->
@@ -202,7 +222,13 @@ class BrowserUseOffloadHandler(private val app: MinisApp) : NativeOffloadHandler
             // [audit3 F-08] resolvePathForSession owns the session-vs-global
             // decision: with a session in scope a rejected path stays rejected
             // (previously the elvis re-resolved it globally).
-            val host = PRootKernel.resolvePathForSession(sessionId, cookiesFile, app)
+            // [da1020-C] A relative --cookies-file resolves against the guest
+            // cwd first (same helper shape as ConfigOffloadHandler's --file);
+            // the joined path still goes through the same session-aware guard
+            // below, so a hostile cwd string gets the same containment as an
+            // agent-supplied absolute path.
+            val joined = resolveMaybeRelative(cookiesFile, cwd)
+            val host = PRootKernel.resolvePathForSession(sessionId, joined, app)
                 ?: throw IllegalArgumentException("--cookies-file: cannot resolve path '$cookiesFile'")
             runCatching { host.readText() }.getOrNull()
                 ?: throw IllegalArgumentException("--cookies-file: could not read '$cookiesFile'")

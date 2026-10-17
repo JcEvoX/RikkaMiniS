@@ -15,6 +15,7 @@ import androidx.compose.runtime.setValue
 import androidx.webkit.WebViewAssetLoader
 import com.rikkaminis.app.browser.SafeWebViewClient
 import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.ui.chat.decodeUriPath
 import java.io.File
 
 /**
@@ -68,16 +69,26 @@ class WebViewHolder(
      */
     private val assetLoader: WebViewAssetLoader?
 
+    /**
+     * [da1020-D] Absolute path of the directory [assetLoader] serves, or null
+     * when this holder does not serve local files. The loader's
+     * `InternalStoragePathHandler` root is the initial file's parent directory,
+     * so [fromAssetLoaderUrl] needs that same root to map an
+     * `https://appassets.androidplatform.net/…` URL back to the `file://` URL
+     * the host actually asked for.
+     */
+    private val assetRootDir: String?
+
     init {
+        val parent = if (initialUrl.startsWith("file://")) {
+            File(initialUrl.removePrefix("file://")).parentFile
+        } else null
+        assetRootDir = parent?.absolutePath
         @Suppress("DEPRECATION")
-        assetLoader = if (initialUrl.startsWith("file://")) {
-            val file = File(initialUrl.removePrefix("file://"))
-            val parent = file.parentFile
-            if (parent != null) {
-                WebViewAssetLoader.Builder()
-                    .addPathHandler("/", WebViewAssetLoader.InternalStoragePathHandler(appContext, parent))
-                    .build()
-            } else null
+        assetLoader = if (parent != null) {
+            WebViewAssetLoader.Builder()
+                .addPathHandler("/", WebViewAssetLoader.InternalStoragePathHandler(appContext, parent))
+                .build()
         } else null
     }
 
@@ -193,7 +204,26 @@ class WebViewHolder(
 
             override fun onPageStarted(view: WebView, url: String, favicon: Bitmap?) {
                 isLoading = true
-                currentUrl = url
+                // [da1020-D] The WebView reports the URL it is really loading,
+                // which for local HTML is the asset-loader origin
+                // (`https://appassets.androidplatform.net/<name>`) — NOT the
+                // `file://` URL this holder was constructed with. Publishing it
+                // here silently broke three consumers that key off the
+                // user-visible URL:
+                //   * bottom-sheet / fullscreen "open in browser" — the
+                //     FileProvider branch is gated on `startsWith("file://")`,
+                //     so it degraded to a meaningless ACTION_VIEW of an internal
+                //     URL (the page opened by nothing);
+                //   * the "pin to home" entry point, gated the same way, so it
+                //     disappeared as soon as the page started loading;
+                //   * ChatScreen's holder-reuse check (`existing.currentUrl !=
+                //     url`), which compared appassets vs `file://` and therefore
+                //     destroyed + rebuilt the holder on every repeat tap,
+                //     dropping scroll position and typed form state.
+                // Keep `currentUrl` a single-sourced, user-meaningful URL: map
+                // back to `file://` when the WebView is on our asset-loader
+                // origin, otherwise keep whatever the WebView reports.
+                currentUrl = fromAssetLoaderUrl(url, assetRootDir) ?: url
                 AppLogger.debug(TAG, "onPageStarted url=${url.take(160)}")
             }
 
@@ -264,7 +294,7 @@ class WebViewHolder(
         hasLoaded = true
         // For file:// URLs, load via the asset loader's secure origin
         // instead of granting direct file:// access.
-        val loadUrl = assetLoaderUrl(currentUrl) ?: currentUrl
+        val loadUrl = toAssetLoaderUrl(currentUrl) ?: currentUrl
         if (webView.isAttachedToWindow && webView.width > 0 && webView.height > 0) {
             AppLogger.info(TAG, "loadUrl (attached) ${loadUrl.take(160)}")
             webView.loadUrl(loadUrl)
@@ -396,7 +426,6 @@ class WebViewHolder(
 
     companion object {
         private const val TAG = "WebViewHolder"
-        private const val ASSET_LOADER_HOST = "appassets.androidplatform.net"
         // Match BrowserAction.UserAgentProfile.DESKTOP_CHROME so the in-chat
         // web preview and the Browser tab desktop modes are identical.
         private const val DESKTOP_UA =
@@ -404,18 +433,118 @@ class WebViewHolder(
                 "Chrome/134.0.0.0 Safari/537.36"
         // Match UserAgentProfile.DESKTOP_CHROME.viewportSize.
         private const val DESKTOP_VIEWPORT_CSS_WIDTH = 1280
-
-        /**
-         * Convert a file:// URL to the asset loader's secure origin URL.
-         * Returns null for non-file URLs so they load normally.
-         */
-        private fun assetLoaderUrl(url: String): String? {
-            if (!url.startsWith("file://")) return null
-            val file = File(url.removePrefix("file://"))
-            return "https://$ASSET_LOADER_HOST/${file.name}"
-        }
     }
 }
+
+// ---------------------------------------------------------------------------
+// [da1020-D] Asset-loader URL mapping — single source for BOTH directions.
+//
+// The preview WebView serves local HTML through `WebViewAssetLoader` under the
+// secure `https://appassets.androidplatform.net/` origin (see the holder's
+// init), so a URL *reported* by the WebView is in that origin while the URL the
+// rest of the app expects is the original `file://` one. Keeping the forward
+// transform here — instead of inline at the `loadUrl` call site — and the
+// inverse next to it makes the pair provably symmetric: the origin/prefix
+// strings exist exactly once, so the two directions cannot drift apart.
+//
+// Deliberately free of `android.net.Uri` / `android.webkit.*`: the mapping is
+// pure string work so it is unit-testable on a plain JVM. That is not just a
+// test convenience — `unitTests.isReturnDefaultValues = true` (build.gradle.kts)
+// makes stubbed `Uri.parse` return null instead of throwing, so a test built on
+// `android.net.Uri` would pass while testing nothing.
+// --- begin asset-loader-url-mapping (JVM harness slices this region verbatim) ---
+
+internal const val ASSET_LOADER_HOST = "appassets.androidplatform.net"
+
+private const val ASSET_LOADER_PREFIX = "https://$ASSET_LOADER_HOST/"
+private const val FILE_URL_PREFIX = "file://"
+private const val HEX_DIGITS = "0123456789ABCDEF"
+
+/**
+ * Convert a `file://` URL to the asset loader's secure origin URL, percent-
+ * encoding the file name. Returns null for anything that is not a file URL with
+ * a trailing path segment, so callers fall back to loading the URL unchanged.
+ *
+ * Encoding the name is a fix, not decoration: the loader resolves its path as a
+ * URL path, so a name containing a space or a CJK character previously produced
+ * an invalid URL (`/我的 报告.html`) that it could not resolve. Names limited to
+ * ASCII unreserved characters encode to the identical string as before.
+ *
+ * Scope: the loader's root is the initial file's *parent* directory, so only the
+ * last path segment is meaningful here — this mapping is one-way-then-back with
+ * [fromAssetLoaderUrl] and must stay symmetric with it.
+ */
+internal fun toAssetLoaderUrl(fileUrl: String): String? {
+    if (!fileUrl.startsWith(FILE_URL_PREFIX)) return null
+    val name = fileUrl.removePrefix(FILE_URL_PREFIX).substringAfterLast('/')
+    if (name.isEmpty()) return null
+    return ASSET_LOADER_PREFIX + encodePathSegment(name)
+}
+
+/**
+ * Inverse of [toAssetLoaderUrl]: map an asset-loader URL back to the `file://`
+ * URL it was derived from, under [rootDir] — the directory the loader serves
+ * (the holder's initial file's parent directory).
+ *
+ * Returns null when the URL is not on our asset-loader origin, when no root is
+ * known, or when the path would resolve outside the root; every caller keeps the
+ * URL it already had in that case, so an unmappable URL degrades to "show the
+ * real URL" rather than to a wrong one.
+ *
+ * The host comparison is exact because the `/` right after the host is part of
+ * [ASSET_LOADER_PREFIX]: `https://appassets.androidplatform.net.evil.com/…` does
+ * not match (`startsWith` fails on the `.`). Same guard shape as
+ * `BrowserUseManager`'s asset-loader origin check.
+ */
+internal fun fromAssetLoaderUrl(assetUrl: String, rootDir: String?): String? {
+    if (rootDir == null) return null
+    if (!assetUrl.startsWith(ASSET_LOADER_PREFIX)) return null
+    val relative = decodeUriPath(assetUrl.removePrefix(ASSET_LOADER_PREFIX))
+    val resolved = resolveWithinRoot(relative, rootDir) ?: return null
+    return FILE_URL_PREFIX + resolved
+}
+
+/**
+ * Percent-encode one path segment: the RFC 3986 unreserved set (`ALPHA` /
+ * `DIGIT` / `-._~`) survives, every other UTF-8 byte becomes `%XX`. Spaces and
+ * non-ASCII characters therefore encode, while `+` and `%` are escaped too —
+ * which is what keeps the inverse ([decodeUriPath], path semantics: `+` is a
+ * literal, not a space) an exact round-trip.
+ */
+private fun encodePathSegment(segment: String): String {
+    val sb = StringBuilder(segment.length)
+    for (b in segment.toByteArray(Charsets.UTF_8)) {
+        val value = b.toInt() and 0xFF
+        val c = value.toChar()
+        if (c in 'A'..'Z' || c in 'a'..'z' || c in '0'..'9' || c == '-' || c == '.' || c == '_' || c == '~') {
+            sb.append(c)
+        } else {
+            sb.append('%').append(HEX_DIGITS[value shr 4]).append(HEX_DIGITS[value and 0x0F])
+        }
+    }
+    return sb.toString()
+}
+
+/**
+ * Join [relative] under [rootDir], collapsing empty and `.` segments and
+ * resolving `..` lexically. Returns null when the path would climb above the
+ * root: the reverse mapping must never hand a caller a path outside the
+ * directory the asset loader is allowed to serve (the loader rejects such
+ * requests itself — this makes the URL we *expose* obey the same rule).
+ */
+private fun resolveWithinRoot(relative: String, rootDir: String): String? {
+    val segments = ArrayList<String>()
+    for (segment in relative.split('/')) {
+        when (segment) {
+            "", "." -> {}
+            ".." -> if (segments.isEmpty()) return null else segments.removeAt(segments.size - 1)
+            else -> segments.add(segment)
+        }
+    }
+    val root = rootDir.trimEnd('/')
+    return if (segments.isEmpty()) root else root + "/" + segments.joinToString("/")
+}
+// --- end asset-loader-url-mapping ---
 
 /**
  * Compose-friendly holder factory. Produces a holder keyed on URL — the

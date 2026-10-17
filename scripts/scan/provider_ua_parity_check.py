@@ -46,6 +46,15 @@ FACTORY_REL = (
 GEMINI_REL = (
     "src/android/app/src/main/java/com/rikkaminis/app/provider/gemini/GeminiProvider.kt"
 )
+GEMINI_MODELS_REL = (
+    "src/android/app/src/main/java/com/rikkaminis/app/provider/gemini/GeminiModelsApi.kt"
+)
+OPENROUTER_MODELS_REL = (
+    "src/android/app/src/main/java/com/rikkaminis/app/provider/openrouter/OpenRouterModelsApi.kt"
+)
+ADAPTERS_REL = (
+    "src/android/app/src/main/java/com/rikkaminis/app/provider/ModelListProviderAdapters.kt"
+)
 
 CTOR_RE = re.compile(r"\b(AnthropicProvider|GeminiProvider|OpenAIProvider)\s*\(")
 UA_ARG = "customUserAgent ="
@@ -273,6 +282,99 @@ def check_gemini(src):
     return v
 
 
+def check_gemini_models(src):
+    """[da1020 ISSUE-05] GeminiModelsApi: the models-list fetcher accepts and
+    applies the per-provider customUserAgent (no hard-coded null override)."""
+    v = []
+    code = strip_comments(src)
+    if "customUserAgent: String? = null" not in code:
+        v.append(
+            "GeminiModelsApi.kt: fetchModels no longer declares "
+            "'customUserAgent: String? = null' (da1020 ISSUE-05: without the "
+            "parameter the adapter cannot forward the override)"
+        )
+    if NULL_OVERRIDE in code:
+        v.append(
+            "GeminiModelsApi.kt:%d: hard-coded '%s' is back "
+            "(da1020 ISSUE-05: the fetcher must apply the customUserAgent "
+            "parameter, falling back to the branded default when unset)"
+            % (code.split("\n").index(
+                next(l for l in code.split("\n") if NULL_OVERRIDE in l)) + 1,
+               NULL_OVERRIDE)
+        )
+    if OVERRIDE_PASSED not in code:
+        v.append(
+            "GeminiModelsApi.kt: '%s' missing (da1020 ISSUE-05: the request "
+            "builder must pass the customUserAgent parameter)" % OVERRIDE_PASSED
+        )
+    return v
+
+
+def check_openrouter_models(src):
+    """[da1020 ISSUE-05] OpenRouterModelsApi: same UA parity contract as
+    GeminiModelsApi."""
+    v = []
+    code = strip_comments(src)
+    if "customUserAgent: String? = null" not in code:
+        v.append(
+            "OpenRouterModelsApi.kt: fetchModels no longer declares "
+            "'customUserAgent: String? = null' (da1020 ISSUE-05: without the "
+            "parameter the adapter cannot forward the override)"
+        )
+    if NULL_OVERRIDE in code:
+        v.append(
+            "OpenRouterModelsApi.kt:%d: hard-coded '%s' is back "
+            "(da1020 ISSUE-05: the fetcher must apply the customUserAgent "
+            "parameter)" % (code.split("\n").index(
+                next(l for l in code.split("\n") if NULL_OVERRIDE in l)) + 1,
+               NULL_OVERRIDE)
+        )
+    if OVERRIDE_PASSED not in code:
+        v.append(
+            "OpenRouterModelsApi.kt: '%s' missing (da1020 ISSUE-05: the "
+            "request builder must pass the customUserAgent parameter)"
+            % OVERRIDE_PASSED
+        )
+    return v
+
+
+def check_adapters(src):
+    """[da1020 ISSUE-05] Both adapter families forward instance.customUserAgent
+    into their ModelsApi call."""
+    v = []
+    code = strip_comments(src)
+    for api in ("GeminiModelsApi.fetchModels", "OpenRouterModelsApi.fetchModels"):
+        i = code.find(api + "(")
+        if i < 0:
+            v.append(
+                "ModelListProviderAdapters.kt: %s call not found "
+                "(gate anchors moved — deliberate edit required)" % api
+            )
+            continue
+        depth = 0
+        end = None
+        for k in range(i + len(api), len(code)):
+            if code[k] == "(":
+                depth += 1
+            elif code[k] == ")":
+                depth -= 1
+                if depth == 0:
+                    end = k
+                    break
+        if end is None:
+            v.append("ModelListProviderAdapters.kt: %s unbalanced" % api)
+            continue
+        args = code[i + len(api):end]
+        if UA_ARG + " instance.customUserAgent" not in args:
+            v.append(
+                "ModelListProviderAdapters.kt:%d: %s call drops '%s' "
+                "(da1020 ISSUE-05: the adapter must forward the per-provider "
+                "override)"
+                % (code.count("\n", 0, i) + 1, api, UA_ARG)
+            )
+    return v
+
+
 def read(root, rel):
     path = os.path.join(root, rel)
     with open(path, "r", encoding="utf-8") as fh:
@@ -286,10 +388,16 @@ def run(root):
     try:
         factory = read(root, FACTORY_REL)
         gemini = read(root, GEMINI_REL)
+        gemini_models = read(root, GEMINI_MODELS_REL)
+        openrouter_models = read(root, OPENROUTER_MODELS_REL)
+        adapters = read(root, ADAPTERS_REL)
     except OSError as exc:
         print("provider_ua_parity_check: cannot read sources: %s" % exc)
         return 2
-    violations = check_factory(factory) + check_gemini(gemini)
+    violations = (check_factory(factory) + check_gemini(gemini)
+                  + check_gemini_models(gemini_models)
+                  + check_openrouter_models(openrouter_models)
+                  + check_adapters(adapters))
     if violations:
         print("FAIL provider_ua_parity_check")
         for v in violations:
@@ -432,6 +540,89 @@ internal fun shouldFlagEofTruncated(
 )
 
 
+GOOD_GEMINI_MODELS = """
+object GeminiModelsApi {
+    suspend fun fetchModels(
+        apiKey: String,
+        context: Context? = null,
+        forceRefresh: Boolean = false,
+        customUserAgent: String? = null,
+    ): List<LLMModel> = withContext(Dispatchers.IO) {
+        val builder = Request.Builder()
+        builder.url("https://x/models?key=" + apiKey)
+        builder.applyUserAgentOverride(customUserAgent)
+        emptyList()
+    }
+}
+"""
+
+BAD_GEMINI_MODELS_NULL = GOOD_GEMINI_MODELS.replace(
+    "builder.applyUserAgentOverride(customUserAgent)",
+    "builder.applyUserAgentOverride(null)",
+)
+
+BAD_GEMINI_MODELS_NO_PARAM = GOOD_GEMINI_MODELS.replace(
+    "        customUserAgent: String? = null,\n", ""
+).replace(
+    "builder.applyUserAgentOverride(customUserAgent)",
+    "builder.applyUserAgentOverride(null)",
+)
+
+GOOD_OPENROUTER_MODELS = """
+object OpenRouterModelsApi {
+    suspend fun fetchModels(
+        apiKey: String,
+        context: Context? = null,
+        forceRefresh: Boolean = false,
+        customUserAgent: String? = null,
+    ): List<LLMModel> = withContext(Dispatchers.IO) {
+        val request = Request.Builder()
+            .url("https://openrouter.ai/api/v1/models")
+            .applyUserAgentOverride(customUserAgent)
+            .build()
+        emptyList()
+    }
+}
+"""
+
+BAD_OPENROUTER_MODELS_NULL = GOOD_OPENROUTER_MODELS.replace(
+    ".applyUserAgentOverride(customUserAgent)",
+    ".applyUserAgentOverride(null)",
+)
+
+GOOD_ADAPTERS = """
+object Adapters {
+    fun gemini(instance: ProviderInstance, apiKey: String, context: Context?): List<LLMModel> {
+        return GeminiModelsApi.fetchModels(
+            apiKey,
+            instance.effectiveBaseURL,
+            context = context,
+            customUserAgent = instance.customUserAgent,
+        )
+    }
+
+    fun openrouter(instance: ProviderInstance, apiKey: String, context: Context?): List<LLMModel> {
+        return OpenRouterModelsApi.fetchModels(
+            apiKey,
+            context = context,
+            customUserAgent = instance.customUserAgent,
+        )
+    }
+}
+"""
+
+BAD_ADAPTERS_DROP = GOOD_ADAPTERS.replace(
+    """        return OpenRouterModelsApi.fetchModels(
+            apiKey,
+            context = context,
+            customUserAgent = instance.customUserAgent,
+        )""",
+    """        return OpenRouterModelsApi.fetchModels(
+            apiKey,
+            context = context,
+        )""",
+)
+
 def selftest():
     failures = []
 
@@ -447,6 +638,13 @@ def selftest():
     good_gemini = check_gemini(GOOD_GEMINI)
     expect_clean("compliant factory fixture", good_factory)
     expect_clean("compliant gemini fixture", good_gemini)
+
+    good_gm = check_gemini_models(GOOD_GEMINI_MODELS)
+    good_orm = check_openrouter_models(GOOD_OPENROUTER_MODELS)
+    good_ad = check_adapters(GOOD_ADAPTERS)
+    expect_clean("compliant gemini-models fixture", good_gm)
+    expect_clean("compliant openrouter-models fixture", good_orm)
+    expect_clean("compliant adapters fixture", good_ad)
 
     bad_drop = check_factory(BAD_FACTORY_DROP)
     expect_trip("dropped-openRouter fixture (ISSUE-04a)", bad_drop, "drops")
@@ -472,6 +670,19 @@ def selftest():
     expect_trip("verdict-fn-deleted fixture (ISSUE-04c)", bad_nofn, "no longer routed")
     expect_trip("verdict-fn-deleted fixture (ISSUE-04c)", bad_nofn, "declaration not found")
 
+    bad_gm_null = check_gemini_models(BAD_GEMINI_MODELS_NULL)
+    expect_trip("gemini-models hard-coded-null fixture", bad_gm_null, "applyUserAgentOverride(null)")
+
+    bad_gm_noparam = check_gemini_models(BAD_GEMINI_MODELS_NO_PARAM)
+    expect_trip("gemini-models no-param fixture", bad_gm_noparam, "no longer declares")
+
+    bad_orm_null = check_openrouter_models(BAD_OPENROUTER_MODELS_NULL)
+    expect_trip("openrouter-models hard-coded-null fixture", bad_orm_null, "applyUserAgentOverride(null)")
+
+    bad_ad = check_adapters(BAD_ADAPTERS_DROP)
+    expect_trip("adapters-drop fixture", bad_ad, "drops")
+    expect_trip("adapters-drop fixture", bad_ad, "OpenRouterModelsApi")
+
     print("selftest compliant factory        -> %d violation(s)" % len(good_factory))
     print("selftest compliant gemini         -> %d violation(s)" % len(good_gemini))
     print("selftest dropped-openRouter       -> %d violation(s)" % len(bad_drop))
@@ -481,6 +692,10 @@ def selftest():
     print("selftest no-tool-accumulation     -> %d violation(s)" % len(bad_accum))
     print("selftest inline-verdict           -> %d violation(s)" % len(bad_callsite))
     print("selftest verdict-fn-deleted       -> %d violation(s)" % len(bad_nofn))
+    print("selftest gemini-models hard-null  -> %d violation(s)" % len(bad_gm_null))
+    print("selftest gemini-models no-param   -> %d violation(s)" % len(bad_gm_noparam))
+    print("selftest openrouter-models null   -> %d violation(s)" % len(bad_orm_null))
+    print("selftest adapters-drop            -> %d violation(s)" % len(bad_ad))
 
     if failures:
         for f in failures:
