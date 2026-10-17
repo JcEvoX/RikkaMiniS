@@ -173,8 +173,10 @@ class FastioTarTest {
         val name = "tmp/$segment/$segment/a.txt"      // 136 bytes: no plain fit
         val unpacked = splitUstarName(name)!!
         assertTrue("prefix must be non-empty", unpacked.first.isNotEmpty())
-        assertTrue(unpacked.first.toByteArray().size <= 155)
-        assertTrue(unpacked.second.toByteArray().size <= 100)
+        // 154 / 99, not 155 / 100: putText keeps the last byte of each field for
+        // the NUL terminator, so those are the real ceilings (ISSUE-03).
+        assertTrue(unpacked.first.toByteArray().size <= 154)
+        assertTrue(unpacked.second.toByteArray().size <= 99)
 
         val root = Files.createTempDirectory("fastio-tar-long")
         val deep = root.resolve(segment).resolve(segment)
@@ -223,12 +225,19 @@ class FastioTarTest {
 
     @Test
     fun `splitUstarName gives up on a single segment longer than the name field`() {
-        // The ustar ceiling is 155 (prefix) + '/' + 100 (name); a single segment
-        // can never be split, so the writer must switch to a GNU record rather
-        // than silently truncating the name.
+        // The ustar ceiling is 154 (prefix) + '/' + 99 (name) — putText keeps the
+        // final byte of every field for the NUL terminator, so a single segment
+        // can never be split above that and the writer must switch to a GNU
+        // record rather than silently truncating the name. (deep-audit-1019
+        // ISSUE-03: this test used to assert that a 100-byte segment DOES fit,
+        // which is precisely the off-by-one being fixed.)
         assertNull(splitUstarName("f".repeat(101)))
         assertNull(splitUstarName("f".repeat(4000)))
-        assertEquals("f".repeat(100), splitUstarName("f".repeat(100))!!.second)
+        assertNull(splitUstarName("f".repeat(100)))
+        // 99 bytes is the real ceiling: it must still take the short-name path.
+        val exact = splitUstarName("f".repeat(99))!!
+        assertEquals("", exact.first)
+        assertEquals("f".repeat(99), exact.second)
     }
 
     @Test

@@ -888,20 +888,31 @@ private fun writeHeader(sink: OutputStream, member: TarMember) {
 }
 
 /**
- * Split [name] across the `name`/`prefix` pair when it does not fit 100 bytes.
+ * Split [name] across the `name`/`prefix` pair when it does not fit the fields.
  * The LAST '/' that leaves both halves in range wins, because a larger prefix
  * keeps the (100-byte) name field as short as possible.
  * Returns null when no split fits — the caller then emits a GNU long name.
+ *
+ * The ceilings are the field sizes **minus one**: [putText] reserves the final
+ * byte for the NUL terminator (`count = minOf(bytes.size, length - 1)`), so a
+ * 100-byte name written into a 100-byte field loses its last character — a
+ * `.py` becomes `.p`, and a multi-byte UTF-8 character gets cut in half — with
+ * nothing on the write path to report it. `NAME_LENGTH - 1` / `PREFIX_LENGTH - 1`
+ * keep the "does it fit" question in sync with what the writer can actually
+ * store, and push anything one byte larger onto the GNU long-name record, which
+ * has no such ceiling. This mirrors the linkname test in [writeHeader]
+ * (`> LINKNAME_LENGTH - 1`), which had always accounted for the terminator.
+ * (deep-audit-1019 ISSUE-03)
  */
 internal fun splitUstarName(name: String): Pair<String, String>? {
-    if (utf8Length(name) <= NAME_LENGTH) return "" to name
+    if (utf8Length(name) <= NAME_LENGTH - 1) return "" to name
     var best = -1
     for (i in name.indices) {
         if (name[i] != '/') continue
         val prefix = name.substring(0, i)
         val rest = name.substring(i + 1)
         if (rest.isEmpty()) continue
-        if (utf8Length(prefix) <= PREFIX_LENGTH && utf8Length(rest) <= NAME_LENGTH) best = i
+        if (utf8Length(prefix) <= PREFIX_LENGTH - 1 && utf8Length(rest) <= NAME_LENGTH - 1) best = i
     }
     if (best < 0) return null
     return name.substring(0, best) to name.substring(best + 1)
