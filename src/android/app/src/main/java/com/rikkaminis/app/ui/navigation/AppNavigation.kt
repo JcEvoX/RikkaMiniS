@@ -33,6 +33,7 @@ import androidx.navigation.navArgument
 import com.rikkaminis.app.data.repository.ChatRepository
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.ui.chat.ChatScreen
+import com.rikkaminis.app.ui.chat.ChatViewModelStore
 import com.rikkaminis.app.ui.settings.AddAgentLoopGroupsScreen
 import com.rikkaminis.app.ui.settings.AddAgentLoopModelsScreen
 import com.rikkaminis.app.ui.settings.AgentLoopModelsScreen
@@ -700,12 +701,21 @@ fun AppNavigation(
                         launchSingleTop = true
                     }
                 },
+                // [da1023-F] Resolve the nav-arg id through the draft alias
+                // table before navigating: the route arg stays on the draft
+                // key after first-send promotion, so a bare pass-through opens
+                // the terminal/files browser under the orphan __new__ session.
                 onOpenTerminal = {
-                    navController.safeNavigate(Routes.terminal(sessionId = sessionId))
+                    navController.safeNavigate(
+                        Routes.terminal(sessionId = ChatViewModelStore.resolveSessionId(sessionId)),
+                    )
                 },
                 onOpenTerminalWithCommand = { command ->
                     navController.safeNavigate(
-                        Routes.terminal(initCommand = command, sessionId = sessionId),
+                        Routes.terminal(
+                            initCommand = command,
+                            sessionId = ChatViewModelStore.resolveSessionId(sessionId),
+                        ),
                     )
                 },
                 onMoveToSession = { targetId ->
@@ -714,7 +724,9 @@ fun AppNavigation(
                     }
                 },
                 onBrowseChatFiles = {
-                    navController.safeNavigate(Routes.chatFiles(sessionId))
+                    navController.safeNavigate(
+                        Routes.chatFiles(ChatViewModelStore.resolveSessionId(sessionId)),
+                    )
                 },
                 onPreviewAttachment = { item ->
                     navController.safeNavigate(Routes.filePreview(item.file.absolutePath))
