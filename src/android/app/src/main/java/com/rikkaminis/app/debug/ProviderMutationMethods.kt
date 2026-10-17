@@ -13,6 +13,7 @@ import com.rikkaminis.app.data.model.ProviderInstance
 import com.rikkaminis.app.data.model.ProviderType
 import com.rikkaminis.app.data.model.RoutingStrategy
 import com.rikkaminis.app.data.repository.ProviderRepository
+import com.rikkaminis.app.provider.applyUserAgentOverride
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -62,9 +63,16 @@ internal object ProviderMutationMethods {
         // (e.g. a custom sync that wants the built-in static list verbatim).
         val seedBuiltInModels = params.optBoolean("seedBuiltInModels", false)
 
-        // Mirrors iOS gating: customBaseURL only honored on OpenAI-shape types.
-        if (customBaseURL != null && type != ProviderType.openAI) {
-            throw RPCException(-32602, "customBaseURL only supported for providerType=openAI")
+        // [da1023-C] customBaseURL is honored by every provider arm in
+        // ProviderFactory except openRouter, whose request builder pins
+        // https://openrouter.ai/api/v1 — the old openAI-only gate rejected
+        // configs the platform actually runs: the UI and the providers.<id>
+        // collection write customBaseURL for all non-openRouter types, and
+        // instances.update has no type gate, so a create-time openAI-only
+        // rejection contradicted its own update path. Only openRouter keeps
+        // the hard rejection (no remote base URL to honor).
+        if (customBaseURL != null && type == ProviderType.openRouter) {
+            throw RPCException(-32602, "customBaseURL is not supported for providerType=openRouter")
         }
 
         // [T-ua-block-oauth-provider] customUserAgent only for apiKey providers.
@@ -228,7 +236,12 @@ internal object ProviderMutationMethods {
             .readTimeout(timeoutMs.toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
             .build()
 
+        // [da1023-C] Same UA contract as ProviderFactory/CLI probes: pass the
+        // instance's custom UA (OAuth instances never have one — the write
+        // path rejects it) and fall back to the app default, so the probe
+        // reflects the headers a real request from this instance carries.
         val builder = okhttp3.Request.Builder().url(probeURL).get()
+            .applyUserAgentOverride(instance.customUserAgent)
         when (instance.providerType) {
             ProviderType.anthropic -> if (!key.isNullOrEmpty()) builder.header("x-api-key", key).header("anthropic-version", "2023-06-01")
             ProviderType.openAI -> if (!key.isNullOrEmpty()) builder.header("Authorization", "Bearer $key")
@@ -336,8 +349,27 @@ internal object ProviderMutationMethods {
             outputModalities = outputModalities.takeIf { it.isNotEmpty() },
         )
         val entry = ModelEntry(providerInstanceId = instanceId, baseModel = model, isCustom = true)
-        repo.addEntry(entry)
-        return entryToJson(entry)
+        // [da1023-C] Fail-closed on duplicates at the RPC surface: a repeated
+        // (instance, modelId) add used to mint a second config entry whose
+        // composite primary key collided (LazyColumn "Key was already used"
+        // crash). addEntry now guards custom AND API-reported entries and
+        // returns the canonical persisted id.
+        if (repo.config.value.modelEntries.any {
+                it.providerInstanceId == instanceId && it.baseModel.id == modelId
+            }
+        ) {
+            throw RPCException(
+                -32602,
+                "model '$modelId' already exists on instance '${instance.displayName}' ($instanceId)",
+            )
+        }
+        val persistedId = repo.addEntry(entry)
+        // Return the canonical persisted entry (not the pre-persist uuid):
+        // saveConfig's canonicalize pass rewrites entry.uuid to the composite
+        // instanceId/modelId key.
+        val persisted = repo.config.value.modelEntries.firstOrNull { it.id == persistedId }
+            ?: entry.copy(uuid = persistedId)
+        return entryToJson(persisted)
     }
 
     fun modelsUpdate(context: Context, params: JSONObject): JSONObject {
@@ -379,8 +411,14 @@ internal object ProviderMutationMethods {
         val newHidden = if (params.has("isHidden")) params.optBoolean("isHidden", current.isHidden) else current.isHidden
 
         val updated = current.copy(baseModel = newModel, overrides = newOverrides, isHidden = newHidden)
-        repo.updateEntry(updated)
-        return entryToJson(updated)
+        // [da1023-C] updateEntry returns the canonical persisted id (null when
+        // the write was rejected fail-closed) — report the persisted entry,
+        // not the pre-persist copy whose uuid no longer matches the row.
+        val persistedId = repo.updateEntry(updated)
+            ?: throw RPCException(-32602, "Entry update rejected (blank or colliding model id): $entryId")
+        val persisted = repo.config.value.modelEntries.firstOrNull { it.id == persistedId }
+            ?: updated.copy(uuid = persistedId)
+        return entryToJson(persisted)
     }
 
     fun modelsDelete(context: Context, params: JSONObject): JSONObject {

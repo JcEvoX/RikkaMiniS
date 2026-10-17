@@ -3,6 +3,7 @@ package com.rikkaminis.app.data.repository
 import android.content.Context
 import android.content.SharedPreferences
 import android.util.Base64
+import com.rikkaminis.app.data.AgentRuntimeLimitsPrefs
 import com.rikkaminis.app.data.db.ProviderConfigDao
 import com.rikkaminis.app.data.db.ProviderConfigMetaKeys
 import com.rikkaminis.app.data.db.ProviderConfigSnapshot
@@ -792,6 +793,12 @@ class ProviderRepository(private val context: Context) {
                 group.memberEntryIds.removeAll { it in removedEntryIds }
             }
             config.agentLoopModelEntryIds.removeAll { it in removedEntryIds }
+            // [da1023-C] Same compact-pin cleanup as removeEntry, applied to
+            // the whole removed set — removeInstance cascades on its own and
+            // would otherwise leave the pin dangling on a vanished instance.
+            if (decideCompactPinCleanup(AgentRuntimeLimitsPrefs.compactModelEntryId(), removedEntryIds)) {
+                AgentRuntimeLimitsPrefs.save(context, compactModelEntryId = "")
+            }
         }
         val emptyGroupIds = config.modelGroups.filter { it.memberEntryIds.isEmpty() }.map { it.id }.toSet()
         if (emptyGroupIds.isNotEmpty()) {
@@ -1355,20 +1362,46 @@ class ProviderRepository(private val context: Context) {
 
     // --- Model Entry management ---
 
-    fun addEntry(entry: ModelEntry) = synchronized(configLock) {
+    fun addEntry(entry: ModelEntry): String = synchronized(configLock) {
         ensureConfigLoaded()
         val config = mutationSnapshot(_config.value)
-        if (!entry.isCustom) {
-            val exists = config.modelEntries.any {
-                it.providerInstanceId == entry.providerInstanceId && it.baseModel.id == entry.baseModel.id
-            }
-            if (exists) return@synchronized
+        // [da1023-C] Composite-key guard, unified for custom AND API-reported
+        // entries: two rows with the same (providerInstanceId, baseModel.id)
+        // canonicalize to the same id (ProviderConfigMapping writes
+        // idMap[entry.uuid] = compositeEntryKey(...) and loads uuid = row.id),
+        // so LazyColumn `key = entry.id` crashes with "Key was already used"
+        // and one of the pair silently vanishes on reload. A duplicate is
+        // never written (fail-closed at the data layer); the agent-facing
+        // surfaces (ModelsCollection.add, provider.models.add) pre-check and
+        // translate the skip into their typed errors.
+        val decision = decideEntryAdd(
+            providerInstanceId = entry.providerInstanceId,
+            modelId = entry.baseModel.id,
+            existing = config.modelEntries.map {
+                it.id to compositeEntryKey(it.providerInstanceId, it.baseModel.id)
+            },
+        )
+        if (!decision.allowed) {
+            android.util.Log.w(
+                "ProviderRepo",
+                "[ProviderStore] addEntry skipped duplicate: " +
+                    "${entry.providerInstanceId}/${entry.baseModel.id} already exists as ${decision.persistedId}",
+            )
+            return@synchronized decision.persistedId
         }
         config.modelEntries.add(entry)
         saveConfig(config)
+        // Re-query the persisted list for the canonical id (mirrors
+        // mergeImportInstanceJSON): the uuid minted by ModelEntry's default is
+        // rewritten by saveConfig's canonicalize pass, and the re-query
+        // survives a future drift in that pass where a computed composite
+        // would not.
+        _config.value.modelEntries.firstOrNull {
+            it.providerInstanceId == entry.providerInstanceId && it.baseModel.id == entry.baseModel.id
+        }?.id ?: compositeEntryKey(entry.providerInstanceId, entry.baseModel.id)
     }
 
-    fun updateEntry(entry: ModelEntry) = synchronized(configLock) {
+    fun updateEntry(entry: ModelEntry): String? = synchronized(configLock) {
         ensureConfigLoaded()
         val config = mutationSnapshot(_config.value)
         val idx = config.modelEntries.indexOfFirst { it.id == entry.id }
@@ -1393,7 +1426,7 @@ class ProviderRepository(private val context: Context) {
                     "ProviderRepo",
                     "[ProviderStore] updateEntry rejected: ${decision.rejectionReason}",
                 )
-                return@synchronized
+                return@synchronized null
             }
             val renamed = decision.newKey != null
             val newUuid = decision.newKey ?: existing.id
@@ -1418,9 +1451,28 @@ class ProviderRepository(private val context: Context) {
                 // next new chat still falls back to "the model I was just
                 // using" instead of the newest-provider fallback.
                 if (lastUsedEntryId == oldKey) lastUsedEntryId = newUuid
+                // [da1023-C] KEY_COMPACT_MODEL_ENTRY_ID (AgentRuntimeLimitsPrefs)
+                // is a prefs-level secondary reference to this entry — same
+                // class as the lastUsedEntryId rewrite above, but it lives
+                // outside ProviderConfig, so saveConfig's idMap translation
+                // cannot heal it. Without the rewrite the pin dangles and
+                // CompactOrchestration silently follows the session chain.
+                decideCompactPinMigration(
+                    pinEntryId = AgentRuntimeLimitsPrefs.compactModelEntryId(),
+                    oldKey = oldKey,
+                    newKey = newUuid,
+                )?.let { migrated ->
+                    AgentRuntimeLimitsPrefs.save(context, compactModelEntryId = migrated)
+                    android.util.Log.i(
+                        "ProviderRepo",
+                        "[ProviderStore] compactModelEntryId migrated: $oldKey -> $migrated",
+                    )
+                }
             }
             saveConfig(config)
+            return@synchronized newUuid
         }
+        null
     }
 
     fun removeEntry(entryId: String) = synchronized(configLock) {
@@ -1435,6 +1487,14 @@ class ProviderRepository(private val context: Context) {
         // no longer exists. Mirrors iOS ProviderConfigStore.removeEntry
         // (Providers/ProviderConfigStore.swift L268).
         config.agentLoopModelEntryIds.removeAll { it == entryId }
+        // [da1023-C] Same compact-pin cascade as the agent-loop cleanup above:
+        // the pin is prefs-held (AgentRuntimeLimitsPrefs) and saveConfig's
+        // idMap translation cannot see it — a dangling pin makes
+        // CompactOrchestration silently follow the session chain. Reset to ""
+        // (explicit follow-session) when the pinned entry goes away.
+        if (decideCompactPinCleanup(AgentRuntimeLimitsPrefs.compactModelEntryId(), setOf(entryId))) {
+            AgentRuntimeLimitsPrefs.save(context, compactModelEntryId = "")
+        }
         saveConfig(config)
     }
 
@@ -2747,3 +2807,34 @@ internal fun readRunConfigFields(dict: org.json.JSONObject): RunConfigSnapshot {
         pinned = dict.optBoolean(RCF_PINNED, false),
     )
 }
+
+// --- [da1023-C] Pure entry-key / compact-pin decision helpers. Top-level in
+// this file (not ProviderRepositoryUtils.kt, which other 1023 fix branches
+// may own) to stay inside this branch's exclusive file set; same package
+// keeps them JVM-testable. ---
+
+/** [da1023-C] Outcome of the addEntry composite-key guard. */
+internal data class EntryAddDecision(
+    /** false = a live entry already owns this (instance, modelId) composite key. */
+    val allowed: Boolean,
+    /** Composite key of the new entry; the surviving entry's id on duplicate. */
+    val persistedId: String,
+)
+
+internal fun decideEntryAdd(
+    providerInstanceId: String,
+    modelId: String,
+    existing: List<Pair<String, String>>,
+): EntryAddDecision {
+    val newKey = "$providerInstanceId/$modelId"
+    val hit = existing.firstOrNull { it.second == newKey }
+    return if (hit != null) EntryAddDecision(false, hit.first) else EntryAddDecision(true, newKey)
+}
+
+/** [da1023-C] Compact-pin rewrite decision on a rename (null = no rewrite). */
+internal fun decideCompactPinMigration(pinEntryId: String, oldKey: String, newKey: String): String? =
+    if (pinEntryId.isNotEmpty() && pinEntryId == oldKey && oldKey != newKey) newKey else null
+
+/** [da1023-C] Compact-pin reset decision on removal. */
+internal fun decideCompactPinCleanup(pinEntryId: String, removedEntryIds: Collection<String>): Boolean =
+    pinEntryId.isNotEmpty() && removedEntryIds.contains(pinEntryId)

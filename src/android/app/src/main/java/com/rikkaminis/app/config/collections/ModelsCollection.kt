@@ -109,8 +109,10 @@ class ModelsCollection(
             isHidden = false,
             userModifiedAt = System.currentTimeMillis(),
         )
-        repo.addEntry(entry)
-        return entry.id
+        // [da1023-C] Return the canonical persisted id (saveConfig's
+        // canonicalize pass rewrites entry.uuid to the composite
+        // instanceId/modelId key), not the pre-persist uuid.
+        return repo.addEntry(entry)
     }
 
     override fun remove(id: String) {
