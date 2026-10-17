@@ -77,11 +77,15 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
 
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
         val rawArgv = request.argv.drop(1)
-        // The subcommand is the first token. `normalizeTarShorts` already
-        // depends on that convention (its own `firstOrNull() != "tar"` guard),
-        // so this predicate is deliberately the SAME expression — the expander
-        // and the flag set below can never drift apart.
-        val isTarCommand = rawArgv.firstOrNull() == "tar"
+        // [da1020-C] The subcommand token is found PAST any leading options —
+        // the global output flags (`--compact` / `-q` / `--quiet`) take no
+        // value, so `--compact tar -cf a.tar x` still names `tar` as the
+        // subcommand. `normalizeTarShorts` calls the SAME helper for its own
+        // guard, so the expander and the flag set below can never drift apart
+        // (they used to be two copies of `firstOrNull() == "tar"`, which broke
+        // whenever a global output flag preceded the subcommand: the tar verbs
+        // went undeclared and the `-cf` expansion never ran).
+        val isTarCommand = firstSubcommandToken(rawArgv) == "tar"
         val args = OffloadArgs(
             // `find`-style single-dash long options (`-name`, `-type`, `-limit`)
             // are rewritten to their `--` spelling first: OffloadArgs reads any
@@ -90,28 +94,9 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
             // path. Rewriting here leaves the parser shared by all ~46 handlers
             // untouched.
             normalizeLongOptionSpelling(normalizeTarShorts(rawArgv)),
-            // `--recursive` / `--force` / `--ignore-case` are booleans, not
-            // `--key value` pairs. Without this declaration OffloadArgs consumes
-            // the NEXT token as the option's value, so `rm --recursive /tmp/x`
-            // lost the path and reported "missing <path>" instead of deleting
-            // anything.
-            //
-            // The tar verbs (`--create`/`--extract`/`--gzip`/`--verbose`) are
-            // modes too, but they are declared ONLY for `tar`. The parser turns
-            // any UNKNOWN `--key` into a `--key value` pair, so declaring them
-            // for every subcommand made `du --create btree` treat `--create` as
-            // a flag and silently walk `btree` (exit 0), where the intended
-            // behaviour is the parser's own "missing <path>" (exit 2). Scope —
-            // not acceptance — is the contract.
-            booleanFlags = if (isTarCommand) {
-                setOf(
-                    "recursive", "force", "ignore-case",
-                    // tar verbs: `--create`/`--gzip`/... are modes, never `--key value`.
-                    "create", "extract", "gzip", "verbose",
-                )
-            } else {
-                setOf("recursive", "force", "ignore-case")
-            },
+            // Declared booleans — see [fastioBooleanFlags] for why the tar
+            // verbs are scoped to `tar` only.
+            booleanFlags = fastioBooleanFlags(isTarCommand),
         )
         if (args.hasFlag("h", "help")) return NativeOffloadResult(0, HELP)
 
@@ -1012,6 +997,63 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
         )
 
         /**
+         * [da1020-C] Boolean flags the shared parser must declare, keyed by
+         * whether the invocation is a `tar` command. Kept pure so both arms
+         * stay testable off-device:
+         *
+         * `--recursive` / `--force` / `--ignore-case` are booleans, not
+         * `--key value` pairs. Without this declaration OffloadArgs consumes
+         * the NEXT token as the option's value, so `rm --recursive /tmp/x`
+         * lost the path and reported "missing <path>" instead of deleting
+         * anything.
+         *
+         * The tar verbs (`--create`/`--extract`/`--gzip`/`--verbose`) are
+         * modes too, but they are declared ONLY for `tar`. The parser turns
+         * any UNKNOWN `--key` into a `--key value` pair, so declaring them
+         * for every subcommand made `du --create btree` treat `--create` as
+         * a flag and silently walk `btree` (exit 0), where the intended
+         * behaviour is "missing <path>" (exit 2). Scope — not acceptance —
+         * is the contract.
+         */
+        internal fun fastioBooleanFlags(isTarCommand: Boolean): Set<String> =
+            if (isTarCommand) {
+                setOf(
+                    "recursive", "force", "ignore-case",
+                    // tar verbs: `--create`/`--gzip`/... are modes, never `--key value`.
+                    "create", "extract", "gzip", "verbose",
+                )
+            } else {
+                setOf("recursive", "force", "ignore-case")
+            }
+
+        /**
+         * [da1020-C] The subcommand is the first token that is not part of a
+         * leading option cluster. Mirrors OffloadArgs' own token rule so the
+         * raw-argv scan and the shared parse agree:
+         *   - global output flags (`--compact` / `-q` / `--quiet`, see
+         *     [OffloadOutput.OUTPUT_FLAGS]) and short flags take no value;
+         *   - a `--key value` pair consumes the next token, exactly as an
+         *     UNKNOWN `--key` does in OffloadArgs;
+         *   - `--key=value` is self-contained;
+         *   - the first non-option token names the subcommand.
+         * `isTarCommand` and [normalizeTarShorts] both call this, so the flag
+         * set and the expander can never drift apart.
+         */
+        internal fun firstSubcommandToken(rawArgv: List<String>): String? {
+            var i = 0
+            while (i < rawArgv.size) {
+                val token = rawArgv[i]
+                if (!token.startsWith("-") || token == "-") return token
+                val consumesValue = token.startsWith("--") &&
+                    !token.contains('=') &&
+                    token.substring(2) !in OffloadOutput.OUTPUT_FLAGS &&
+                    rawArgv.getOrNull(i + 1)?.startsWith("-") == false
+                i += if (consumesValue) 2 else 1
+            }
+            return null
+        }
+
+        /**
          * Single-dash long options an agent types out of `find`/`grep` habit,
          * rewritten to the `--` spelling OffloadArgs reads as `key value`.
          * Exact matches only, so a path that merely contains a dash is safe.
@@ -1020,7 +1062,7 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
             "-name", "-type", "-limit", "-max-entries", "-ignore-case",
         )
 
-        private fun normalizeLongOptionSpelling(argv: List<String>): List<String> =
+        internal fun normalizeLongOptionSpelling(argv: List<String>): List<String> =
             argv.map { if (it in SHORT_LONG_OPTIONS) "-$it" else it }
 
         /**
@@ -1036,8 +1078,11 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
          * cluster leaves the whole token untouched, so the caller reports it
          * as an unknown option instead of silently dropping it.
          */
-        private fun normalizeTarShorts(argv: List<String>): List<String> {
-            if (argv.firstOrNull() != "tar") return argv
+        internal fun normalizeTarShorts(argv: List<String>): List<String> {
+            // [da1020-C] The guard calls the SAME helper as `isTarCommand` —
+            // `firstOrNull() != "tar"` broke whenever a global output flag
+            // (`--compact` / `-q` / `--quiet`) preceded the subcommand.
+            if (firstSubcommandToken(argv) != "tar") return argv
             val out = ArrayList<String>(argv.size)
             for (token in argv) {
                 if (token.length < 2 || token[0] != '-' || token.startsWith("--")) {
