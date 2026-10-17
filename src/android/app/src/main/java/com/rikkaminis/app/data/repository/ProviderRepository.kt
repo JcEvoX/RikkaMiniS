@@ -1373,7 +1373,52 @@ class ProviderRepository(private val context: Context) {
         val config = mutationSnapshot(_config.value)
         val idx = config.modelEntries.indexOfFirst { it.id == entry.id }
         if (idx >= 0) {
-            config.modelEntries[idx] = entry.copy(userModifiedAt = System.currentTimeMillis())
+            val existing = config.modelEntries[idx]
+            // [da1022-E] Id-rename integrity (decideEntryRename, extracted to
+            // ProviderRepositoryUtils for JVM testing): a custom model id edit
+            // changes the composite entry key. Blank ids and renames that
+            // collide with another entry of the same instance are rejected
+            // fail-closed (a collision would make upsertEntries REPLACE the
+            // existing row and silently drop the duplicate on next load).
+            val decision = decideEntryRename(
+                existingUuid = existing.id,
+                updatedInstanceId = entry.providerInstanceId,
+                updatedModelId = entry.baseModel.id,
+                others = config.modelEntries
+                    .filter { it.id != existing.id }
+                    .map { it.providerInstanceId to it.baseModel.id },
+            )
+            if (!decision.allowed) {
+                android.util.Log.w(
+                    "ProviderRepo",
+                    "[ProviderStore] updateEntry rejected: ${decision.rejectionReason}",
+                )
+                return@synchronized
+            }
+            val renamed = decision.newKey != null
+            val newUuid = decision.newKey ?: existing.id
+            config.modelEntries[idx] = entry.copy(uuid = newUuid, userModifiedAt = System.currentTimeMillis())
+            if (renamed) {
+                val oldKey = decision.oldKey
+                // Canonicalize this entry's uuid to the new composite key and
+                // sync the in-config references that hang off the old key.
+                // (saveConfig's idMap translation would heal the persisted
+                // rows either way, but only canonicalizing here keeps
+                // memory, DB and prefs consistent within the same session —
+                // lastUsedVisibleEntry() compares by string equality, so a
+                // pref rewritten ahead of the in-memory uuid would dangle
+                // until the next cold start.)
+                config.modelGroups.forEach { group ->
+                    group.memberEntryIds.replaceAll { id -> if (id == oldKey) newUuid else id }
+                }
+                config.agentLoopModelEntryIds.replaceAll { id -> if (id == oldKey) newUuid else id }
+                // KEY_LAST_USED_ENTRY (prefs) holds the entry id; the
+                // legacy-uuid rewrite at load only covers the upgrade
+                // first-launch, not in-place renames. Rewrite here so the
+                // next new chat still falls back to "the model I was just
+                // using" instead of the newest-provider fallback.
+                if (lastUsedEntryId == oldKey) lastUsedEntryId = newUuid
+            }
             saveConfig(config)
         }
     }

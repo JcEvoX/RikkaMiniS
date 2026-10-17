@@ -60,10 +60,18 @@ fun SessionMcpsSheet(
     // write landed — and if the emission arrived between flip and write, the
     // switch visibly snapped back. Existing keys are now preserved; only newly
     // appearing servers get seeded.
-    val overrides = remember {
+    // [da1022-b] Key the map identity on `sessionId`: when the draft session
+    // is promoted the caller re-composes with the real session id, so a FRESH
+    // map + re-run of the seeding effect below re-derive every toggle from the
+    // real id's stored overrides (a keyless map would keep serving the
+    // pre-promotion `__new__…` seeds, and the merge logic's `!in overrides`
+    // guard would skip re-seeding same-id servers). Within a single session id
+    // the [audit-0917] merge semantics are unchanged: servers-StateFlow
+    // emissions MERGE into the live map instead of rebuilding it.
+    val overrides = remember(sessionId) {
         mutableStateMapOf<String, Boolean>()
     }
-    LaunchedEffect(servers) {
+    LaunchedEffect(servers, sessionId) {
         for (server in servers) {
             if (server.id !in overrides) {
                 overrides[server.id] = mcpRepository.isEnabledForSession(server.id, sessionId)

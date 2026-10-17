@@ -137,9 +137,24 @@ class ProviderExecutionGatewayTest {
 
     @Test
     fun `success with media_files parses attachments`() {
+        // 96 raw bytes -> 130 b64 chars -> wrapped by android.util.Base64.DEFAULT
+        // (76 chars/line + trailing '\n'); the strict RFC 4648 decoder rejected
+        // exactly this shape before [fix/da1022-a1].
+        val mediaBytes = ByteArray(96) { (it % 251).toByte() }
+        val wrapped = java.util.Base64.getEncoder().encodeToString(mediaBytes)
+            .chunked(76).joinToString("\n") + "\n"
         val raw = JSONObject().apply {
             put("exit_code", 0)
             put("media_files", org.json.JSONArray().apply {
+                // Fixture 1: wrapped form — simulates the worker's
+                // android.util.Base64.encodeToString(..., Base64.DEFAULT) output.
+                put(JSONObject().apply {
+                    put("type", "image")
+                    put("mime_type", "image/png")
+                    put("data", wrapped)
+                })
+                // Fixture 2: no-wrap control — guards against an over-fix that
+                // only accepts wrapped input.
                 put(JSONObject().apply {
                     put("type", "image")
                     put("mime_type", "image/png")
@@ -150,8 +165,9 @@ class ProviderExecutionGatewayTest {
         val r = ProviderExecutionGateway.parseNonStreamingResult(raw)
         assertTrue(r is ProviderExecutionGateway.SendResult.Success)
         val media = (r as ProviderExecutionGateway.SendResult.Success).response.mediaAttachments
-        assertEquals(1, media.size)
-        assertTrue(media[0].data.contentEquals(byteArrayOf(1, 2, 3)))
+        assertEquals(2, media.size)
+        assertTrue(media[0].data.contentEquals(mediaBytes))
+        assertTrue(media[1].data.contentEquals(byteArrayOf(1, 2, 3)))
     }
 
     /** The gateway must not import / reference a concrete provider type. */

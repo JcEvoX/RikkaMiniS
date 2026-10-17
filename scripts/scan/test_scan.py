@@ -2709,6 +2709,31 @@ def test_da1021_gates():
 
 
 
+DA1022_GATES = [
+    ("offload_media_b64_wire_check", "OFFLOAD_MEDIA_B64_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("session_sheet_id_binding_check", "SESSION_SHEET_ID_BINDING_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("mediaplayer_release_guard", "MEDIAPLAYER_RELEASE_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("browser_history_snapshot_check", "BROWSER_HISTORY_SNAPSHOT_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("openminis_compat_field_parity_check", "OPENMINIS_COMPAT_FIELD_PARITY_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("entry_id_rename_integrity_check", "ENTRY_ID_RENAME_INTEGRITY_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("mirror_vm_thread_check", "MIRROR_VM_THREAD_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("browser_cookie_ui_refresh_check", "BROWSER_COOKIE_UI_REFRESH_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("tool_title_error_branch_check", "TOOL_TITLE_ERROR_BRANCH_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("share_dir_prune_check", "SHARE_DIR_PRUNE_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("file_preview_url_encode_check", "FILE_PREVIEW_URL_ENCODE_SELFTEST=PASS", (), (REPO_ROOT,)),
+]
+
+def test_da1022_gates():
+    print("━━━ deep-audit-1022 gates (selftest teeth + real tree) ━━━")
+    for script, marker, st_extra, real_args in DA1022_GATES:
+        argv = [sys.executable, os.path.join(SCRIPT_DIR, script + ".py")] + list(st_extra) + ["--selftest"]
+        proc = subprocess.run(argv, capture_output=True, text=True)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        check("%s selftest has teeth (%s)" % (script, marker),
+              proc.returncode == 0 and marker in out, out[-280:])
+        rc, out = run_scanner(script + ".py", *real_args)
+        check("%s real tree green" % script, rc == 0, out[-280:])
+
 def main():
     print("╔══════════════════════════════════════════════════╗")
     print("║  Scan Self-Test (fixture ground truth)          ║")
@@ -2746,6 +2771,7 @@ def main():
     test_da1019_gates()
     test_da1020_gates()
     test_da1021_gates()
+    test_da1022_gates()
     test_da1017_external_fixtures()
     test_real_repo()
     print("")

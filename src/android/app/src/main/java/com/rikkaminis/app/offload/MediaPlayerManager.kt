@@ -19,7 +19,18 @@ object MediaPlayerManager {
         val player: MediaPlayer,
         val filePath: String,
         val mediaType: String, // "audio" or "video"
-        var state: PlayerState = PlayerState.IDLE,
+        // [da1022-C] Callbacks (onCompletion/onError) write state on the
+        // player's binder/playback threads while play()/pause()/resume()/
+        // stop() write it on the caller thread. The map is a
+        // ConcurrentHashMap, but that only orders the map itself — it gives
+        // no happens-before edge for this field, so a reader could keep
+        // observing a stale PLAYING/PAUSED after a terminalize and hand a
+        // released player to stop()/pause(). @Volatile is the minimal means:
+        // the transitions are single-writer, so visibility (not atomicity) is
+        // the missing half. Chosen over "one lock for every read/write"
+        // because that would put player binder calls (stop/pause/seek) under
+        // the lock for no additional guarantee.
+        @Volatile var state: PlayerState = PlayerState.IDLE,
     )
 
     enum class PlayerState { IDLE, PLAYING, PAUSED, STOPPED }
@@ -51,9 +62,18 @@ object MediaPlayerManager {
      * If the session already exists, the previous player is released first.
      */
     fun play(sessionId: String, filePath: String): String {
-        // Stop existing session if any
-        sessions[sessionId]?.let { existing ->
-            releaseSession(existing)
+        // [da1022-C] Releasing the previous player for this id happens UNDER
+        // the lock the terminalize callbacks take: unlocked, the
+        // onCompletion/onError handler could be mid-releaseSession() on the
+        // same instance while this path released it a second time (same shape
+        // as the check-then-act backstop below, which already routes the
+        // replaced-instance release through releaseSession outside the lock —
+        // that one stays outside because put() already removed it from the
+        // map, so no second owner can reach it).
+        synchronized(lock) {
+            sessions[sessionId]?.let { existing ->
+                releaseSession(existing)
+            }
         }
 
         val hostFile = PRootKernel.resolveHostPath(filePath)
@@ -189,11 +209,15 @@ object MediaPlayerManager {
     }
 
     fun stop(sessionId: String): String {
-        val session = sessions[sessionId]
+        // [da1022-C] remove() must be atomic with the release: unlocked
+        // "release then remove" races a concurrent play() that re-registers
+        // this id — the remove() would then drop the fresh session from the
+        // map while its player is still live and unreferenced (leak + the
+        // caller sees "no session" for a player that is still playing).
+        val removed = synchronized(lock) { sessions.remove(sessionId) }
             ?: return "Error: no session '$sessionId'"
 
-        releaseSession(session)
-        sessions.remove(sessionId)
+        releaseSession(removed)
         return "Stopped and released session '$sessionId'"
     }
 
@@ -232,10 +256,22 @@ object MediaPlayerManager {
     // ── Internal ────────────────────────────────────────────────────────
 
     private fun releaseSession(session: Session) {
+        // [da1022-C] stop() and release() are TWO try blocks on purpose — same
+        // shape as InlineMediaPlayer.onDispose. stop() throws
+        // IllegalStateException whenever the player has already left the
+        // playable states (the onError terminalize is exactly that case: the
+        // player is in Error, our state may still read PLAYING/PAUSED). With
+        // one shared try the throw skipped release() and the native
+        // codec/AudioTrack handles stayed alive until GC; release() must run
+        // on EVERY path.
         try {
             if (session.state == PlayerState.PLAYING || session.state == PlayerState.PAUSED) {
                 session.player.stop()
             }
+        } catch (e: Exception) {
+            Log.w(TAG, "Error stopping player before release: ${e.message}")
+        }
+        try {
             session.player.release()
             session.state = PlayerState.STOPPED
         } catch (e: Exception) {

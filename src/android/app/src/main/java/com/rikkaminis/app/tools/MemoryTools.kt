@@ -104,10 +104,12 @@ object MemoryTools {
     )
 
     fun executeMemoryWrite(inputJson: String, repository: MemoryRepository): ToolResult {
+        // [fix/da1022-G] Resolve the title BEFORE the try (FileWriteTool pattern):
+        // a try-scoped val left the catch arm with no title to report.
+        val toolTitle = resolveToolTitle(inputJson, "memory_write")
         return try {
             val obj = JSONObject(inputJson)
             val content = obj.optString("content", "")
-            val toolTitle = obj.optString("tool_title", "memory_write")
 
             if (content.isBlank()) {
                 ToolResult("Error: Missing required 'content' parameter", false, toolTitle)
@@ -117,21 +119,23 @@ object MemoryTools {
                 ToolResult(result, success, toolTitle)
             }
         } catch (e: Exception) {
-            ToolResult("Error: ${e.message}", false)
+            ToolResult("Error: ${e.message}", false, toolTitle)
         }
     }
 
     fun executeMemoryGet(inputJson: String, repository: MemoryRepository): ToolResult {
+        // [fix/da1022-G] Resolve the title BEFORE the try (FileWriteTool pattern):
+        // a try-scoped val left the catch arm with no title to report.
+        val toolTitle = resolveToolTitle(inputJson, "memory_get")
         return try {
             val obj = JSONObject(inputJson)
             val keywords = obj.optString("keywords", "")
             val scope = obj.optString("scope", "all")
-            val toolTitle = obj.optString("tool_title", "memory_get")
 
             val result = repository.getMemory(keywords, scope)
             ToolResult(result, true, toolTitle)
         } catch (e: Exception) {
-            ToolResult("Error: ${e.message}", false)
+            ToolResult("Error: ${e.message}", false, toolTitle)
         }
     }
 }

@@ -29,10 +29,12 @@ object FileReadTool {
     )
 
     fun execute(argsJson: String, sessionId: String, context: Context): ToolExecutionResult {
+        // [fix/da1022-G] Resolve the title BEFORE the try (FileWriteTool pattern):
+        // a try-scoped val left the catch arm with no title to report.
+        val toolTitle = resolveToolTitle(argsJson, NAME)
         return try {
             val args = JSONObject(argsJson)
             val path = args.optString("path", "")
-            val toolTitle = args.optString("tool_title", NAME)
             val offset = args.optInt("offset", 1).coerceAtLeast(1)
             // T-FILEREAD-CAP: hard upper bound on returned content length.
             // Pre-cap, the agent could ask for `max_length=1_000_000` and we
@@ -140,7 +142,7 @@ object FileReadTool {
             val content = if (capped.truncated) capped.content + "\n... (truncated)" else capped.content
             ToolExecutionResult("$header\n$content", true, toolTitle = toolTitle)
         } catch (e: Exception) {
-            ToolExecutionResult("Error reading file: ${e.message}", false, toolTitle = NAME)
+            ToolExecutionResult("Error reading file: ${e.message}", false, toolTitle = toolTitle)
         }
     }
 }
