@@ -583,7 +583,14 @@ private fun SkillImportSheet(
                                             // disk IO, so it must not run on the Main thread (ANR), and
                                             // an exception must be caught, not propagated out of a click
                                             // handler (crash).
-                                            val result = skillRepository.importFromContent(pasteContent)
+                                            // [fix/da1023-E] The comment asked for the mirror; the
+                                            // code never had it — parse + SQLite write + SKILL.md write
+                                            // all ran on Main (the URL tab above already wraps in
+                                            // withContext(Dispatchers.IO)). Same wrap now; catch /
+                                            // finally / error copy unchanged.
+                                            val result = withContext(Dispatchers.IO) {
+                                                skillRepository.importFromContent(pasteContent)
+                                            }
                                             if (result != null) onDismiss()
                                             else errorText = context.getString(R.string.skill_import_error_format)
                                         } catch (e: Exception) { errorText = "Error: ${e.message}" }
@@ -713,6 +720,13 @@ fun SkillDetailScreen(
                                         // it but it was never passed, so a file
                                         // update kept the old version string.
                                         version = parsed.version,
+                                        // [fix/da1023-E] Same contract as
+                                        // updateFromURL: the picked document's
+                                        // frontmatter travels with the managed
+                                        // fields, so `subagent` / `max_turns` /
+                                        // `allowed_tools` land instead of being
+                                        // shadowed by whatever was on disk.
+                                        frontmatter = parsed.frontmatter.ifBlank { null },
                                     )
                                 }
                             }
@@ -1228,17 +1242,23 @@ fun SkillFileViewerScreen(
     // from disk.
     val initialContent = remember(skillId, relativePath, skill.updatedAt) {
         if (isSkillMd) {
-            buildString {
-                appendLine("---")
-                appendLine("name: ${skill.name}")
-                appendLine("version: ${skill.version}")
-                if (skill.description.isNotEmpty()) {
-                    appendLine("description: ${skill.description}")
-                }
-                appendLine("---")
-                appendLine()
-                append(skill.body)
-            }
+            // [fix/da1023-E] Reconstruct through the repository's single merge
+            // exit instead of hand-splicing a 3-key block here. The splice was
+            // the READ half of the same bug as the write-side polarity
+            // inversion: it showed only name / version / description, so the
+            // block an edit handed back carried none of the extended keys and
+            // the editor could neither add nor delete one (and it rendered a
+            // literal "null" version for a skill whose row had none). Passing
+            // skill.frontmatter — the block loadAll read from disk and
+            // rescanFromDisk refreshes — through mergeFrontmatter makes the
+            // screen render byte-for-byte what writeSkillMd would write.
+            SkillRepository.mergeFrontmatter(
+                existing = skill.frontmatter.ifBlank { null },
+                name = skill.name,
+                description = skill.description,
+                version = skill.version ?: "1.0.0",
+                body = skill.body,
+            )
         } else {
             skillRepository.readSkillFile(skillId, relativePath) ?: ""
         }

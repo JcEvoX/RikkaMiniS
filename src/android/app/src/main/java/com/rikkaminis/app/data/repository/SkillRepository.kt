@@ -104,7 +104,16 @@ class SkillRepository(private val context: Context) {
             }
             // Walk the frontmatter, swapping the managed keys in place and
             // passing every other line (comments, subagent, max_turns,
-            // allowed_tools, ...) through verbatim.
+            // allowed_tools, ...) through verbatim. [fix/da1023-E] The walk
+            // starts at line 1: line 0 is the OPENING `---` delimiter, and
+            // emitting it again below doubled the delimiter on every rewrite
+            // whose base already carried a block — `---\n---\nname: …` — which
+            // parseSkillMd reads as a 2-line frontmatter with no `name:` key
+            // and returns null for, and extractFrontmatterBlock truncates to
+            // `---\n---`, dropping every extended key. In other words the
+            // first in-app rewrite of any skill used to corrupt its SKILL.md
+            // into an unparsable document — the exact class of silent
+            // frontmatter loss this branch exists to close.
             val managed = mapOf(
                 "name" to name,
                 "description" to description,
@@ -112,7 +121,7 @@ class SkillRepository(private val context: Context) {
             )
             val seen = mutableSetOf<String>()
             val fm = mutableListOf<String>()
-            for (i in 0 until frontmatterEnd) {
+            for (i in 1 until frontmatterEnd) {
                 val line = src[i]
                 val colon = line.indexOf(':')
                 val key = if (colon > 0) line.substring(0, colon).trim().lowercase() else null
@@ -135,6 +144,37 @@ class SkillRepository(private val context: Context) {
                 append(body)
             }
         }
+
+        /**
+         * [fix/da1023-E] Which frontmatter block a SKILL.md rewrite merges
+         * into — the single exit for that decision, and it is memory-first:
+         *
+         *  - a caller-supplied block (the NEW value being landed: an import,
+         *    a URL / file update, a bundled upgrade) wins whenever it is
+         *    non-blank, so remote `subagent` / `max_turns` / `allowed_tools`
+         *    changes actually reach the disk;
+         *  - otherwise the on-disk document is the base, so a caller that only
+         *    touches a managed key (rename, metadata edit) preserves every
+         *    extended key exactly as the disk holds it — including edits made
+         *    outside the app (`file_write` / a shell `sed` in the sandbox);
+         *  - both absent → `null`, and [mergeFrontmatter] emits the canonical
+         *    3-key block.
+         *
+         * The pre-fix call site read `existing ?: skill.frontmatter`, i.e. disk
+         * first: as soon as a SKILL.md existed, the caller's block was ignored
+         * entirely — the opposite of what [mergeFrontmatter]'s own seeding note
+         * and the bundled-upgrade KDoc ("writeSkillMd merges against this
+         * field") both describe, and the reason an "Update from URL" refreshed
+         * name/description/body while silently keeping the stale extended keys.
+         *
+         * Pure nullability work (no Android deps) so the polarity itself lives
+         * under JVM tests; the `writeSkillMd` call site that must use it is
+         * pinned by `scripts/scan/skill_frontmatter_roundtrip_check.py`.
+         */
+        internal fun resolveMergeBase(
+            newFrontmatter: String?,
+            diskContent: String?,
+        ): String? = newFrontmatter?.ifBlank { null } ?: diskContent
 
         /**
          * [B14b] Rewrite the `name:` line inside the frontmatter block of a
@@ -332,6 +372,16 @@ class SkillRepository(private val context: Context) {
         description: String? = null,
         body: String? = null,
         version: String? = null,
+        // [fix/da1023-E] The frontmatter block carried by the landing document.
+        // updateFromURL / update-from-file pass it so remote `subagent` /
+        // `max_turns` / `allowed_tools` changes reach the disk instead of being
+        // shadowed by the old block (writeSkillMd merges memory-first now).
+        // `null` — or a blank block, fail-closed — keeps the pre-fix behaviour
+        // for every existing caller: the copy re-seeds from the on-disk
+        // SKILL.md, so the merge base still resolves to the disk block and a
+        // plain rename preserves extended keys, including edits made outside
+        // the app while it was running.
+        frontmatter: String? = null,
     ): Boolean {
         val current = _skills.value.find { it.id == id } ?: return false
         val updated = current.copy(
@@ -339,6 +389,8 @@ class SkillRepository(private val context: Context) {
             description = description ?: current.description,
             body = body ?: current.body,
             version = version ?: current.version,
+            frontmatter = frontmatter?.ifBlank { null }
+                ?: readSkillMdFrontmatter(id).ifBlank { current.frontmatter },
             updatedAt = System.currentTimeMillis(),
         )
 
@@ -629,12 +681,14 @@ class SkillRepository(private val context: Context) {
                 // [fix/subagent-frontmatter-newskill] Refresh the in-memory
                 // frontmatter from the incoming content so frontmatter-only
                 // keys (`subagent: true`) the caller edited land without
-                // waiting for the next full loadAll. Keep the previous block
-                // when the incoming document has none — the on-disk merge
-                // below preserves it, and a blank here would shadow it until
-                // the next reload.
-                frontmatter = SubagentSkill.extractFrontmatterBlock(content)
-                    .ifBlank { current.frontmatter },
+                // waiting for the next full loadAll. [fix/da1023-E] This block is
+                // no longer merely a cache of the incoming document: it IS the
+                // merge base now (writeSkillMd resolves memory-first), so a
+                // paste / restore / file import replaces the extended keys
+                // wholesale — including dropping a `subagent: true` the incoming
+                // document removed. Keep the previous block when the incoming
+                // document has none: a blank resolves to the disk anyway.
+                frontmatter = parsed.frontmatter.ifBlank { current.frontmatter },
             )
             db.execSQL(
                 "UPDATE skills SET name=?, description=?, version=?, import_source=?, source_url=?, updated_at=? WHERE id=?",
@@ -658,8 +712,11 @@ class SkillRepository(private val context: Context) {
             // [fix/subagent-frontmatter-newskill] Carry the incoming block so
             // a brand-new skill keeps its `subagent: true` / max_turns /
             // allowed_tools on the first landing (writeSkillMd seeds its merge
-            // with this when no on-disk file exists).
-            frontmatter = SubagentSkill.extractFrontmatterBlock(content),
+            // with this when no on-disk file exists). [fix/da1023-E] The block
+            // now travels on ParsedSkill — one extraction per document instead
+            // of every frontmatter-aware call site re-running
+            // extractFrontmatterBlock over the raw content.
+            frontmatter = parsed.frontmatter,
             // [fix/da1021-A] Pass the resolved id through to the add branch:
             // on a clean install this is the add path, and without it the id
             // resolved above (backup's exported id) was recomputed as
@@ -893,12 +950,19 @@ class SkillRepository(private val context: Context) {
         val parsed = parseSkillMd(content)
             ?: return@withContext UpdateResult.Failure("Downloaded SKILL.md is not valid (missing YAML frontmatter or 'name:' field)")
 
+        // [fix/da1023-E] The remote document's frontmatter has to travel with
+        // the managed fields. Without it update() kept the old block, so an
+        // "Update from URL" refreshed name / description / body / version while
+        // `subagent`, `max_turns` and `allowed_tools` stayed whatever the disk
+        // already said — a catalogue that changed those keys under an installed
+        // skill never caught up, and nothing was ever reported.
         val ok = update(
             id = skillId,
             name = parsed.name,
             description = parsed.description,
             body = parsed.body,
             version = parsed.version,
+            frontmatter = parsed.frontmatter.ifBlank { null },
         )
         if (!ok) return@withContext UpdateResult.Failure("Failed to write updated skill")
 
@@ -1523,14 +1587,18 @@ class SkillRepository(private val context: Context) {
                 // writeSkillMd merges against this field, and a stale block
                 // here made a version upgrade shadow frontmatter-only keys
                 // (`subagent: true`, max_turns, allowed_tools) until the next
-                // full reload. Keep the previous block when the incoming
-                // document has none. importSource is deliberately NOT touched:
+                // full reload. [fix/da1023-E] That sentence is only true after
+                // this batch: with the pre-fix `existing ?: skill.frontmatter`
+                // base the field was ignored whenever a SKILL.md already
+                // existed — i.e. on EVERY upgrade — so this refresh changed
+                // memory only and the disk kept the previous block. Keep the
+                // previous block when the incoming document has none.
+                // importSource is deliberately NOT touched:
                 // if the row was adopted to BUNDLED it already is; a
                 // user-imported row that reached this branch (their version is
                 // older) keeps its own source label — that is the version
                 // gate's contract, not ours to overwrite.
-                frontmatter = SubagentSkill.extractFrontmatterBlock(content)
-                    .ifBlank { existing.frontmatter },
+                frontmatter = parsed.frontmatter.ifBlank { existing.frontmatter },
             )
             db.execSQL(
                 "UPDATE skills SET description=?, version=?, updated_at=? WHERE id=?",
@@ -1550,7 +1618,7 @@ class SkillRepository(private val context: Context) {
                 // [fix/subagent-frontmatter-newskill] Carry the bundled block
                 // so a first install keeps `subagent: true` / max_turns /
                 // allowed_tools on disk and in memory.
-                frontmatter = SubagentSkill.extractFrontmatterBlock(content),
+                frontmatter = parsed.frontmatter,
                 // [fix/da1021-A] A bundled skill must land under its assets
                 // dirName — the sibling payload was extracted into
                 // <dirName>/ by syncBundledSiblings. Without this, a SKILL.md
@@ -1935,7 +2003,17 @@ class SkillRepository(private val context: Context) {
         // re-imported. Seed the merge with the caller's frontmatter block:
         // mergeFrontmatter swaps the three managed keys in place and carries
         // every other key verbatim.
-        val mergeBase = existing ?: skill.frontmatter.ifBlank { null }
+        //
+        // [fix/da1023-E] But seeding only worked while no file existed: the
+        // pre-fix base was `existing ?: skill.frontmatter`, so the disk
+        // shadowed the caller's block on EVERY path that already had a file —
+        // updateFromURL / update-from-file refreshed name/description/body
+        // while silently keeping the old extended keys, and an editor save
+        // couldn't delete a `subagent: true` the user had just removed.
+        // The base now resolves memory-first through [resolveMergeBase]
+        // (one exit for the rule; callers without a fresh block re-seed from
+        // disk, so plain renames keep disk-wins semantics there).
+        val mergeBase = resolveMergeBase(skill.frontmatter, existing)
         val content = mergeFrontmatter(
             existing = mergeBase,
             name = skill.name,
@@ -1977,6 +2055,13 @@ class SkillRepository(private val context: Context) {
         val description: String,
         val version: String = "1.0.0",
         val body: String,
+        // [fix/da1023-E] Raw frontmatter block of the parsed document (`---`
+        // delimiters included), "" when it has none. [body] is
+        // frontmatter-STRIPPED, so every frontmatter-only key rides on this
+        // field — without it, the callers that only get a ParsedSkill
+        // (updateFromURL, update-from-file) had no way to hand the NEW block
+        // to writeSkillMd, and the landing kept the old extended keys.
+        val frontmatter: String = "",
     )
 
     /**
@@ -2088,7 +2173,16 @@ class SkillRepository(private val context: Context) {
             lines.subList(bodyStartLine, lines.size).joinToString("\n").trim('\n')
         } else ""
 
-        return ParsedSkill(name, description, version, body)
+        // [fix/da1023-E] Hand the raw block to the caller too (see
+        // ParsedSkill.frontmatter) so update paths can seed writeSkillMd's
+        // memory-first merge base with the NEW frontmatter.
+        return ParsedSkill(
+            name,
+            description,
+            version,
+            body,
+            frontmatter = SubagentSkill.extractFrontmatterBlock(trimmed),
+        )
     }
 
     private fun slugify(name: String): String =
