@@ -14,23 +14,23 @@ import okhttp3.Request
 import org.json.JSONObject
 
 object GeminiModelsApi {
-    private const val DEFAULT_BASE = "https://generativelanguage.googleapis.com/v1beta"
     private const val TAG = "GeminiModelsApi"
 
     /**
      * [fix/audit-b22 / T5-L6] Mirror GeminiProvider's base handling: the base
      * carries the API version (`.../v1beta`), but users often paste either
      * form into the provider settings, so tolerate both.
+     *
+     * [deep-audit-1024 ISSUE-02] Delegates to [GeminiBasePath.normalize] instead of
+     * keeping a copy of the rule. The copy stripped each suffix **once**, so the
+     * `.../v1beta/v1` shape that `appendV1Suffix` (default `true`) produces on a
+     * `.../v1beta` base collapsed to `.../v1beta/v1beta` → the model list 404'd for
+     * exactly the custom/relay bases this helper exists to tolerate, while chat (which
+     * already delegated) worked. Blank input still falls back to the same public
+     * `.../v1beta` endpoint, now taken from [GeminiBasePath.DEFAULT_BASE] — the two
+     * literals were identical, so the default is unchanged.
      */
-    private fun normalizeBase(baseUrl: String?): String {
-        val raw = baseUrl?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } ?: return DEFAULT_BASE
-        // effectiveBaseURL appends "/v1" when the instance has
-        // appendV1Suffix=true (the OpenAI-shaped default). Gemini's version
-        // segment is "/v1beta", so collapse either suffix before adding ours —
-        // otherwise a relay base became ".../v1/v1beta/models".
-        val stripped = raw.removeSuffix("/v1beta").removeSuffix("/v1")
-        return "$stripped/v1beta"
-    }
+    private fun normalizeBase(baseUrl: String?): String = GeminiBasePath.normalize(baseUrl)
 
     private val client = OkHttpClient()
     private val cache = ProviderModelsCache("gemini")

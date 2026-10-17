@@ -342,7 +342,14 @@ private fun AgentPolicyRow(
     toolName: String,
     showDivider: Boolean,
 ) {
-    var currentLevel by remember { mutableStateOf(OffloadPermissionManager.getLevel(toolName)) }
+    // [fix/da1024-H] The level lives in SharedPreferences and is written both by
+    // this row's menu and by "Reset All" in the toolbar — neither is a Compose
+    // state read, so a keyless `remember` froze the first-composition value and
+    // Reset All left every chip on the old level until the screen was reopened.
+    // Keying on the manager's revision re-reads getLevel() after every mutation;
+    // currentLevel stays a local echo for this row's own selection.
+    val revision by OffloadPermissionManager.revision.collectAsState()
+    var currentLevel by remember(toolName, revision) { mutableStateOf(OffloadPermissionManager.getLevel(toolName)) }
     var expanded by remember { mutableStateOf(false) }
 
     Box {
@@ -388,7 +395,9 @@ private fun PermissionRow(
     tool: OffloadPermissionManager.ToolPermissionInfo,
     showDivider: Boolean,
 ) {
-    var currentLevel by remember { mutableStateOf(OffloadPermissionManager.getLevel(tool.toolName)) }
+    // [fix/da1024-H] Same refresh key as AgentPolicyRow — see the note there.
+    val revision by OffloadPermissionManager.revision.collectAsState()
+    var currentLevel by remember(tool.toolName, revision) { mutableStateOf(OffloadPermissionManager.getLevel(tool.toolName)) }
     var expanded by remember { mutableStateOf(false) }
 
     Box {

@@ -7,6 +7,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
@@ -151,6 +152,23 @@ object OffloadPermissionManager {
      *  request after they already said no. Cleared with
      *  [clearSessionGrants]. */
     private val sessionDenials = java.util.concurrent.ConcurrentHashMap<String, MutableSet<String>>() // sessionId -> set of toolNames
+
+    /**
+     * [fix/da1024-H] UI refresh signal for the persisted levels above/below and
+     * the two session caches next door.
+     *
+     * [setLevel] and [resetAll] are the only mutators that can change a row's
+     * verdict from outside the settings screen itself (the "Reset All" button),
+     * and neither writes a Compose-observable value — so every row kept the
+     * level it read at first composition and "Reset All" left the whole page
+     * showing the old levels until the screen was re-entered. Both paths bump
+     * this counter; `OffloadPermissionScreen` keys its row state on it.
+     *
+     * Refresh signal ONLY. [getLevel] remains the single source of truth for a
+     * level and [checkPermission] never consults this value.
+     */
+    private val _revision = MutableStateFlow(0)
+    val revision: StateFlow<Int> = _revision.asStateFlow()
 
     /** Active permission request waiting for user response. */
     private val _pendingRequest = MutableStateFlow<PermissionRequest?>(null)
@@ -440,6 +458,14 @@ object OffloadPermissionManager {
 
     fun setLevel(toolName: String, level: PermissionLevel) {
         prefs.edit().putString("level_$toolName", level.name).apply()
+        // [fix/da1024-H] A level change invalidates every session-scoped
+        // grant/deny recorded for THAT tool: the cache says "this tool was
+        // allowed/denied in this session", which is a verdict about the OLD
+        // level. Without this, a session that had already denied a tool (or
+        // been granted it) short-circuits [checkPermission] before the dialog
+        // and the new level never takes effect in that session.
+        clearToolSessionState(toolName)
+        bumpRevision()
     }
 
     fun resetAll() {
@@ -448,6 +474,12 @@ object OffloadPermissionManager {
             editor.remove("level_${tool.toolName}")
         }
         editor.apply()
+        // [fix/da1024-H] "Reset All" means ALL of the permission state the user
+        // can see: the persisted levels AND the in-memory session caches.
+        // Leaving the caches behind let a cached verdict outlive the reset and
+        // silently allow/refuse the next call in the same session.
+        clearAllSessionGrants()
+        bumpRevision()
     }
 
     /**
@@ -586,6 +618,65 @@ object OffloadPermissionManager {
     fun clearSessionGrants(sessionId: String) {
         sessionGrants.remove(sessionId)
         sessionDenials.remove(sessionId)
+    }
+
+    /**
+     * [fix/da1024-H] The session ids in [sessions] whose entry contains
+     * [toolName].
+     *
+     * Split out as a pure function (plain map in, plain set out — no
+     * SharedPreferences, no Context) so the "which sessions does this tool
+     * actually touch" decision is unit-testable on the JVM. See
+     * `OffloadPermissionResetTest`.
+     */
+    internal fun sessionsContaining(sessions: Map<String, Set<String>>, toolName: String): Set<String> =
+        sessions.entries.filter { toolName in it.value }.map { it.key }.toSet()
+
+    /**
+     * [fix/da1024-H] Drop [toolName] from every entry of one cache, leaving
+     * every other tool's entry (and every other session) untouched.
+     *
+     * Two-pass on purpose: collect the ids first, then mutate. The ids come
+     * from a weakly-consistent snapshot, so this never structurally edits the
+     * map while iterating it.
+     */
+    internal fun clearToolFrom(sessions: MutableMap<String, MutableSet<String>>, toolName: String) {
+        for (id in sessionsContaining(sessions, toolName)) {
+            sessions[id]?.remove(toolName)
+        }
+    }
+
+    /**
+     * [fix/da1024-H] Drop [toolName] from every session's grant AND denial set.
+     * Called by [setLevel].
+     *
+     * Deliberately per-tool: a grant for a different tool is still a valid
+     * verdict about a level the user did not touch, and dropping it would
+     * re-prompt for permissions nothing changed. Emptied sets stay allocated —
+     * that costs one entry apiece and keeps [pruneSessionMapsIfNeeded]'s
+     * eviction order untouched.
+     */
+    internal fun clearToolSessionState(toolName: String) {
+        clearToolFrom(sessionGrants, toolName)
+        clearToolFrom(sessionDenials, toolName)
+    }
+
+    /**
+     * [fix/da1024-H] Drop every session's grants and denials. Called by
+     * [resetAll], where the user's intent is "clear everything".
+     *
+     * Wider than [clearSessionGrants] on purpose: that one is per-session and
+     * part of the session-teardown contract, this one is per-reset and covers
+     * every session including the shared [OFFLOAD_GLOBAL_SESSION_ID] slot.
+     */
+    internal fun clearAllSessionGrants() {
+        sessionGrants.clear()
+        sessionDenials.clear()
+    }
+
+    /** [fix/da1024-H] See [_revision]. Refresh signal only, never a verdict. */
+    private fun bumpRevision() {
+        _revision.update { it + 1 }
     }
 
     /**

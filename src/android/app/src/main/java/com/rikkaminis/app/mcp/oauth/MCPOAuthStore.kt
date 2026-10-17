@@ -143,6 +143,128 @@ object MCPOAuthStore {
         deleteBridgeFile(context, server)
     }
 
+    // -- Config-change reconciliation -----------------------------------------
+    //
+    // [da1024-D] ISSUE-04 (deep-audit-1024): credential cleanup used to be a bag
+    // of partial verbs that each caller had to remember to run in the right
+    // combination. `setClientSecret(ctx, id, null)` removes ONLY `secret::<id>`,
+    // so switching an authorized server to STDIO (or clearing its OAuth block)
+    // left `tokens::<id>` plus the bridge file
+    // `/var/minis/mcp-servers/oauth/<id>.json` — which holds a live bearer token
+    // in plaintext for the in-guest CLI — behind permanently: the STDIO form
+    // hides the OAuth section, so the Sign Out button that would have cleared
+    // them no longer existed. Editing an authorized server had the opposite
+    // drift: the config moved, the bridge metadata (token_endpoint / client_id /
+    // client_secret / resource) did not, so the CLI refreshed against a dead
+    // endpoint.
+    //
+    // The convergence point lives HERE, called from the data layer, not from
+    // the UI: every save path (edit form, JSON import, backup restore, any
+    // future entry point) goes through MCPRepository.add/update/importJSON, so
+    // reconciling there enforces one invariant instead of one rule per caller:
+    //
+    //   stored credentials exist  ⇔  the persisted config says "fully configured
+    //   OAuth over a URL transport", and the bridge file mirrors THAT config.
+    //
+    // Deliberately self-contained: callers pass the saved config's facts only —
+    // the secret and the tokens are read back from this store, so no caller can
+    // hand a stale copy or forget a field. Secrets never reach the log lines
+    // below (server name only), and never enter servers.json (MCPOAuthConfig is
+    // the non-secret half).
+
+    /** What [reconcileForServer] must do for a server whose config just changed. */
+    internal enum class ReconcileAction { PURGE, KEEP, REFRESH_BRIDGE }
+
+    /**
+     * Pure: a URL transport with a fully configured OAuth block. Anything else
+     * can never authorize, so any credential it still holds belongs to a config
+     * that no longer exists.
+     */
+    internal fun usableOAuth(urlTransport: Boolean, oauth: MCPOAuthConfig?): Boolean =
+        urlTransport && oauth != null && oauth.isConfigured
+
+    /**
+     * Pure decision behind [reconcileForServer], split out so it is unit-testable
+     * without a Context (the store itself needs EncryptedSharedPreferences + the
+     * guest bind-mount).
+     *
+     * KEEP (configured but not authorized) is not an oversight: the edit form
+     * writes the client secret *before* the browser round-trip, and [signOut]
+     * promises "forget issued tokens but keep the client secret". Purging on
+     * hasTokens == false would wipe a secret that a pending authorization still
+     * needs, and would break that documented contract.
+     */
+    internal fun decideReconcileAction(
+        urlTransport: Boolean,
+        oauth: MCPOAuthConfig?,
+        hasTokens: Boolean,
+    ): ReconcileAction = when {
+        !usableOAuth(urlTransport, oauth) -> ReconcileAction.PURGE
+        hasTokens -> ReconcileAction.REFRESH_BRIDGE
+        else -> ReconcileAction.KEEP
+    }
+
+    /**
+     * Bring this server's stored credentials and in-guest bridge file in line
+     * with the config that was just persisted. Idempotent, and safe to call for
+     * every save of every server: a server with no OAuth state at all costs one
+     * prefs read and no writes.
+     *
+     * Never throws for an unsafe server name — [purge] / [materializeBridgeFile]
+     * refuse-and-log. Callers still wrap this in `runCatching` because it runs
+     * inside a save, where a credential-store hiccup must not abort the save
+     * that already reached servers.json.
+     */
+    fun reconcileForServer(
+        context: Context,
+        server: String,
+        urlTransport: Boolean,
+        oauth: MCPOAuthConfig?,
+        serverUrl: String?,
+    ) {
+        val stored = tokens(context, server)
+        when (decideReconcileAction(urlTransport, oauth, stored != null)) {
+            ReconcileAction.PURGE -> {
+                purge(context, server)
+                AppLogger.info(
+                    TAG,
+                    "reconcile '$server': dropped OAuth state (no configured URL-transport OAuth)",
+                )
+            }
+
+            ReconcileAction.KEEP -> Unit
+
+            ReconcileAction.REFRESH_BRIDGE -> {
+                // decideReconcileAction only returns REFRESH_BRIDGE for a usable
+                // config with tokens on file. Assert the invariant instead of
+                // using !! — a future refactor that breaks it must fail loudly
+                // (and land in the caller's runCatching) rather than silently
+                // materializing a bridge file with blank metadata.
+                val cfg = requireNotNull(oauth) { "REFRESH_BRIDGE requires an oauth config" }
+                val t = requireNotNull(stored) { "REFRESH_BRIDGE requires stored tokens" }
+                materializeBridgeFile(
+                    context, server,
+                    BridgePayload(
+                        accessToken = t.accessToken,
+                        refreshToken = t.refreshToken,
+                        // The bridge expects SECONDS; StoredTokens keeps ms.
+                        expiresAtSeconds = if (t.expiresAtMs > 0) t.expiresAtMs / 1000 else 0L,
+                        tokenEndpoint = cfg.tokenEndpoint,
+                        clientId = cfg.clientId,
+                        // Read back from the store — the edit form has already
+                        // written the new value by the time the save lands.
+                        clientSecret = clientSecret(context, server),
+                        resource = McpPkce.canonicalResourceUri(serverUrl),
+                    ),
+                )
+                AppLogger.info(
+                    TAG,
+                    "reconcile '$server': re-materialized bridge metadata from the saved config",
+                )
+            }
+        }
+    }
+
     // -- In-guest token bridge (materialized for minis-mcp-cli) ---------------
     //
     // [T-mcp-oauth-bridge-materialize] The in-guest `minis-mcp-cli` reads OAuth

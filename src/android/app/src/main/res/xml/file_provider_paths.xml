@@ -52,4 +52,13 @@
          external-open / share chain it must resolve through the provider
          (deep-audit-1023 ISSUE-01). -->
     <files-path name="photos-export" path="photos-export/" />
+    <!-- Inbound system-share staging copies: ChatViewModel.addAttachmentFromStagedShare
+         copies filesDir/share_extension/* into cacheDir/share_inbound/ so the
+         attachment outlives SharedShareStore.cleanSharedFiles. The dir was written
+         (and never deleted) but not declared, so tapping a staged composer
+         attachment → FilePreviewScreen.openExternally/shareFile (or
+         WebPreviewBottomSheet.openExternalFromSheet) always threw
+         IllegalArgumentException instead of opening the share sheet
+         (deep-audit-1024 ISSUE-01). -->
+    <cache-path name="share-inbound" path="share_inbound/" />
 </paths>

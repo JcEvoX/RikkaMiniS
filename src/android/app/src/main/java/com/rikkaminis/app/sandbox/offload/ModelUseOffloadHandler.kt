@@ -138,23 +138,25 @@ class ModelUseOffloadHandler(
         // Modality precheck: if --output extension implies a media modality
         // the model doesn't advertise, fail fast before hitting the API.
         // Mirrors iOS ModelUseOffloadBridge.performRun:208-228.
-        val outputPath = args.get("output")
-        // [T-android-model-use-relative-output] A relative --output can't be
-        // resolved reliably: this handler runs in-process and does NOT inherit
-        // the shell's cwd, so PRootKernel.resolveHostPath would silently drop a
-        // relative path onto the rootfs root (e.g. "gen_output.json" ->
-        // <rootfs>/gen_output.json) and report an unreadable bare-relative path
-        // that read_image later rejects. Fail fast with a clear message asking
-        // for an absolute path instead. `file://` URLs are already absolute.
+        // [da1024-I] `--output` now joins onto the shell cwd exactly like
+        // `--input`/`--system-file` above — [resolveMaybeRelative] is the single
+        // join implementation. A bare relative path only survives when the cwd
+        // itself is missing/relative; then we still fail closed with a clear
+        // "absolute path required" error instead of dropping it onto the rootfs
+        // root (which `read_image` would later reject). `file://` URLs are
+        // already absolute and are left untouched.
+        val outputPath = args.get("output")?.let { raw ->
+            if (raw.startsWith("file://")) raw else resolveMaybeRelative(raw, request.cwd)
+        }
         if (outputPath != null && !outputPath.startsWith("/") && !outputPath.startsWith("file://")) {
             return NativeOffloadResult(
                 2,
                 JSONObject().put("error", "invalid_output_path")
                     .put(
                         "message",
-                        "--output must be an absolute path (e.g. /var/minis/workspace/out.jpg). " +
-                            "Got the relative path '$outputPath', which cannot be resolved because " +
-                            "minis-model-use does not inherit the shell's working directory.",
+                        "--output must be an absolute path (e.g. /var/minis/workspace/out.jpg) or a " +
+                            "relative path resolvable against the shell cwd. Got the relative path " +
+                            "'$outputPath', which could not be resolved (no absolute guest cwd).",
                     )
                     .toString() + "\n",
             )
@@ -230,7 +232,7 @@ class ModelUseOffloadHandler(
             )
         }
         val parsed = try {
-            parseMessages(inputText, request.sessionId)
+            parseMessages(inputText, request.sessionId, request.cwd)
         } catch (e: ImageInputError) {
             return NativeOffloadResult(
                 2,
@@ -1001,10 +1003,11 @@ class ModelUseOffloadHandler(
     // through the same session-aware guard as every other model-use path
     // (canonicalize + prefix check + fail-closed on refusal) — a hostile cwd
     // string gets the same containment as an agent-supplied absolute path.
+    // [da1024-I] The join itself lives ONCE in [resolveMaybeRelative] (the
+    // same helper `minis-config`/`browser-use` use) — this file no longer keeps
+    // a private inline copy that could drift from the other handlers.
     private fun readLinuxPath(linuxPath: String, sessionId: String?, cwd: String?): String? {
-        val resolved = if (!linuxPath.startsWith("/") && !cwd.isNullOrEmpty() && cwd.startsWith("/")) {
-            if (cwd.endsWith("/")) "$cwd$linuxPath" else "$cwd/$linuxPath"
-        } else linuxPath
+        val resolved = resolveMaybeRelative(linuxPath, cwd)
         val hostFile: File = sessionAwareHostFile(resolved, sessionId) ?: return null
         if (!hostFile.exists() || !hostFile.isFile) return null
         return try { hostFile.readText() } catch (_: Throwable) { null }
@@ -1041,7 +1044,7 @@ class ModelUseOffloadHandler(
      * - `[{"role":"...","content":"..."}, ...]` — array of messages
      * - Plain text → wrapped as a single user message
      */
-    private fun parseMessages(text: String, sessionId: String?): List<ParsedMessage> {
+    private fun parseMessages(text: String, sessionId: String?, cwd: String? = null): List<ParsedMessage> {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return emptyList()
         try {
@@ -1049,10 +1052,10 @@ class ModelUseOffloadHandler(
                 val obj = JSONObject(trimmed)
                 val arr = obj.optJSONArray("messages")
                     ?: return listOf(ParsedMessage("user", trimmed, emptyList()))
-                return parseMessageArray(arr, sessionId)
+                return parseMessageArray(arr, sessionId, cwd)
             }
             if (trimmed.startsWith("[")) {
-                return parseMessageArray(JSONArray(trimmed), sessionId)
+                return parseMessageArray(JSONArray(trimmed), sessionId, cwd)
             }
         } catch (e: ImageInputError) {
             // Deliberate hard errors from block parsing must NOT be swallowed
@@ -1068,7 +1071,7 @@ class ModelUseOffloadHandler(
         return listOf(ParsedMessage("user", trimmed, emptyList()))
     }
 
-    private fun parseMessageArray(arr: JSONArray, sessionId: String?): List<ParsedMessage> {
+    private fun parseMessageArray(arr: JSONArray, sessionId: String?, cwd: String? = null): List<ParsedMessage> {
         val out = mutableListOf<ParsedMessage>()
         for (i in 0 until arr.length()) {
             val m = arr.optJSONObject(i) ?: continue
@@ -1089,7 +1092,7 @@ class ModelUseOffloadHandler(
                             val url = imgObj.optString("url", "").takeIf { it.isNotEmpty() }
                                 ?: continue
                             try {
-                                imgs.add(resolveImageUrl(url, sessionId))
+                                imgs.add(resolveImageUrl(url, sessionId, cwd))
                             } catch (e: ImageInputError) {
                                 // Don't silently drop — surface to the agent so it
                                 // can correct the URL or fall back to text.
@@ -1139,15 +1142,18 @@ class ModelUseOffloadHandler(
      *  - `/var/minis/<scope>/<path>` or `/<abs/linux/path>` → via
      *    [sessionAwareHostFile] (session-scoped first, global bind mounts for
      *    paths with no session view, fail-closed on a refused scope path)
+     *  - a relative path → joined onto the guest cwd with [resolveMaybeRelative]
+     *    first, then resolved like an absolute path above (a relative path with
+     *    no absolute cwd stays relative and is rejected below)
      *  - `http(s)://` → throw with a hint to download via shell_execute
      *    first (matches iOS — avoids egressing user content)
-     *  - anything else (relative paths, unknown schemes) → throw
+     *  - anything else (unknown schemes) → throw
      *
      * Throws [ImageInputError] on any unresolvable URL so the CLI exits
      * non-zero with a descriptive message instead of silently feeding
      * the model an image-less request (the prior failure mode).
      */
-    private fun resolveImageUrl(url: String, sessionId: String?): LLMMessage.ImagePart {
+    private fun resolveImageUrl(url: String, sessionId: String?, cwd: String? = null): LLMMessage.ImagePart {
         // data:<mime>;base64,<base64>
         if (url.startsWith("data:")) {
             val rest = url.substring(5)
@@ -1181,10 +1187,12 @@ class ModelUseOffloadHandler(
         val linuxPath = when {
             url.startsWith("file://") -> url.removePrefix("file://")
             url.startsWith("/") -> url
-            else -> throw ImageInputError(
-                "Unsupported image_url '$url'. Use a data: URL, file:///host/path, " +
-                    "/var/minis/<scope>/<path>, or an absolute Linux path."
-            )
+            else -> resolveMaybeRelative(url, cwd).takeIf { it.startsWith("/") }
+                ?: throw ImageInputError(
+                    "Unsupported image_url '$url'. Use a data: URL, file:///host/path, " +
+                        "/var/minis/<scope>/<path>, an absolute Linux path, or a relative path " +
+                        "resolvable against the shell cwd."
+                )
         }
         val hostFile: File = sessionAwareHostFile(linuxPath, sessionId)
             ?: throw ImageInputError(

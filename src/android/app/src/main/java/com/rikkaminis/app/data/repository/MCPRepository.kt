@@ -60,6 +60,18 @@ class MCPRepository(private val context: Context) {
             }
             return "imported-mcp"
         }
+
+        /**
+         * [da1024-D] Pure: does [server] get PERSISTED as a URL transport
+         * (HTTP / SSE)? Mirrors [entryToJson]'s branch order — a non-blank
+         * command wins and the entry is written as STDIO, so an entry carrying
+         * both is a STDIO server as far as the guest (and its OAuth
+         * credentials) are concerned. A blank-transport entry is not a URL
+         * server either. Extracted so the OAuth-reconcile rule is testable
+         * without a Context (see MCPOAuthLifecycleTest).
+         */
+        internal fun persistsAsUrlTransport(server: MCPServerConfig): Boolean =
+            !server.isStdio && !server.url.isNullOrBlank()
     }
 
     /** Truncation cap for MCP notes shown in list rows / prompt fragments.
@@ -351,6 +363,7 @@ class MCPRepository(private val context: Context) {
         if (server.id.isBlank()) return false
         _servers.value = _servers.value.filter { it.id != server.id } + server
         save()
+        reconcileOAuth(server)
         Log.i(TAG, "Added MCP server: ${server.id}")
         return true
     }
@@ -359,7 +372,38 @@ class MCPRepository(private val context: Context) {
         if (_servers.value.none { it.id == server.id }) return false
         _servers.value = _servers.value.map { if (it.id == server.id) server else it }
         save()
+        reconcileOAuth(server)
         return true
+    }
+
+    /**
+     * [da1024-D] Bring [server]'s stored OAuth state (encrypted secret/tokens +
+     * the in-guest bridge file) in line with the config that was just
+     * persisted. Called from every write path — [add], [update], [importJSON] —
+     * so the invariant "credentials exist iff the saved config is a configured
+     * URL-transport OAuth server" holds for the form, a pasted JSON import and
+     * a backup restore alike, without each caller remembering which partial
+     * cleanup verb to run.
+     *
+     * Ordering: servers.json first, credentials second. If the credential
+     * reconcile fails, the saved config is still the truth (so the next save
+     * retries) instead of having purged credentials for a config that never
+     * landed. Best-effort by design — a credential-store hiccup must not fail
+     * the save that already succeeded. Credentials are never logged (the server
+     * name is the whole message).
+     */
+    private fun reconcileOAuth(server: MCPServerConfig) {
+        runCatching {
+            com.rikkaminis.app.mcp.oauth.MCPOAuthStore.reconcileForServer(
+                context = context,
+                server = server.id,
+                urlTransport = persistsAsUrlTransport(server),
+                oauth = server.oauth,
+                serverUrl = server.url,
+            )
+        }.onFailure {
+            Log.w(TAG, "OAuth reconcile failed for '${server.id}': ${it.message}")
+        }
     }
 
     fun delete(id: String) {
@@ -472,6 +516,13 @@ class MCPRepository(private val context: Context) {
         _servers.value = _servers.value.filter { it.id !in incomingIds } + parsed
         _servers.value = _servers.value.sortedByDescending { it.createdAt }
         save()
+        // [da1024-D] An import overwrites same-id entries last-write-wins, so an
+        // entry that used to be an authorized HTTP server can be replaced by a
+        // STDIO / OAuth-less one — the old tokens, client secret and plaintext
+        // bridge file would survive the overwrite untouched. Reconcile every
+        // imported entry (a fresh entry is a no-op: no credentials are stored
+        // under an id that was never authorized).
+        for (s in parsed) reconcileOAuth(s)
         Log.i(TAG, "Imported ${parsed.size} MCP server(s)")
         return parsed
     }

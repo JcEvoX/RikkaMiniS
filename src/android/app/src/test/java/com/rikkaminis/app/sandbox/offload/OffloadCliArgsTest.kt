@@ -344,6 +344,151 @@ class OffloadCliArgsTest {
         assertTrue("the probe must fail once the source is mutated", failed)
     }
 
+    // ── D. ModelUseOffloadHandler relative-path wiring (ISSUE-09) ────────────
+    //
+    // The pure join semantics are covered in section B above (`resolveMaybeRelative`
+    // is shared by ConfigOffloadHandler and ModelUseOffloadHandler — same function,
+    // same literal expectations). What ISSUE-09 added is the *wiring*: three
+    // ModelUse sites must now delegate to it — `--output` normalisation,
+    // `readLinuxPath` (was a private inline copy), and the image_url chain
+    // (`parseMessages` -> `parseMessageArray` -> `resolveImageUrl`, which had no
+    // cwd at all) — and the inline copy must be gone for good. Asserted against
+    // the compiled source, FastioWiringTest shape.
+
+    private val modelUseFile =
+        "src/main/java/com/rikkaminis/app/sandbox/offload/ModelUseOffloadHandler.kt"
+
+    private fun assertModelUseRelativePathWiring(src: String) {
+        val code = codeOnlyStrings(src)
+        assertTrue(
+            "--output must be normalised through the shared join before the fail-closed guard",
+            code.contains("if (raw.startsWith(\"file://\")) raw else resolveMaybeRelative(raw, request.cwd)"),
+        )
+        assertTrue(
+            "readLinuxPath must delegate to the shared join, not keep an inline copy",
+            code.contains("val resolved = resolveMaybeRelative(linuxPath, cwd)"),
+        )
+        assertTrue(
+            "resolveImageUrl must accept the guest cwd",
+            code.contains(
+                "private fun resolveImageUrl(url: String, sessionId: String?, cwd: String? = null): LLMMessage.ImagePart",
+            ),
+        )
+        assertTrue(
+            "resolveImageUrl must resolve a relative url against the cwd",
+            code.contains("else -> resolveMaybeRelative(url, cwd).takeIf { it.startsWith(\"/\") }"),
+        )
+        assertTrue(
+            "the image_url chain must forward request.cwd from cmdRun",
+            code.contains("parseMessages(inputText, request.sessionId, request.cwd)"),
+        )
+        assertTrue(
+            "parseMessageArray must forward the cwd into resolveImageUrl",
+            code.contains("imgs.add(resolveImageUrl(url, sessionId, cwd))"),
+        )
+        assertFalse(
+            "no hand-written cwd join may survive (resolveMaybeRelative is the single implementation)",
+            code.contains("\"\$cwd"),
+        )
+    }
+
+    @Test
+    fun `model-use relative paths are wired through the shared join`() {
+        assertModelUseRelativePathWiring(source(modelUseFile))
+    }
+
+    @Test
+    fun `negative control - a re-inlined --output guard fails the probe`() {
+        val original = source(modelUseFile)
+        val mutated = original.replace(
+            "if (raw.startsWith(\"file://\")) raw else resolveMaybeRelative(raw, request.cwd)",
+            "val normalizedOutput = resolveMaybeRelative(raw, request.cwd)",
+        )
+        assertTrue("the --output normalisation line must exist to be mutated", mutated != original)
+        assertProbeFails { assertModelUseRelativePathWiring(mutated) }
+    }
+
+    @Test
+    fun `negative control - re-inlining readLinuxPath fails the probe`() {
+        val original = source(modelUseFile)
+        val mutated = original.replace(
+            "val resolved = resolveMaybeRelative(linuxPath, cwd)",
+            "val resolved = if (cwd.endsWith(\"/\")) \"\$cwd\$linuxPath\" else \"\$cwd/\$linuxPath\"",
+        )
+        assertTrue("the delegated join must exist to be mutated", mutated != original)
+        assertProbeFails { assertModelUseRelativePathWiring(mutated) }
+    }
+
+    @Test
+    fun `negative control - dropping the cwd from the image chain fails the probe`() {
+        val original = source(modelUseFile)
+        val mutated = original.replace(
+            "imgs.add(resolveImageUrl(url, sessionId, cwd))",
+            "imgs.add(resolveImageUrl(url, sessionId))",
+        )
+        assertTrue("the image_url call site must exist to be mutated", mutated != original)
+        assertProbeFails { assertModelUseRelativePathWiring(mutated) }
+    }
+
+    /**
+     * Template-aware comment stripper for the ModelUse probes. Two traps:
+     * the shared [codeOnly] truncates a line at the FIRST `//` (which would
+     * delete the call in `if (raw.startsWith("file://")) raw else
+     * resolveMaybeRelative(...)`), and a quote NESTED inside a template
+     * expression (`"…'${args.get("input")}'…"`) desyncs any non-recursive
+     * scanner. States: 0 = code, 1 = string, 2 = raw string.
+     */
+    private fun codeOnlyStrings(src: String): String {
+        val out = StringBuilder()
+        val states = ArrayDeque<Int>()
+        val depths = ArrayDeque<Int>()
+        states.addLast(0); depths.addLast(0)
+        var i = 0
+        val n = src.length
+        while (i < n) {
+            when (states.last()) {
+                0 -> {
+                    if (src.startsWith("\"\"\"", i)) {
+                        states.addLast(2); depths.addLast(0); out.append("\"\"\""); i += 3
+                    } else {
+                        val c = src[i]
+                        when {
+                            c == '"' -> { states.addLast(1); depths.addLast(0); out.append(c); i++ }
+                            src.startsWith("//", i) -> { while (i < n && src[i] != '\n') i++ }
+                            src.startsWith("/*", i) -> {
+                                val end = src.indexOf("*/", i + 2)
+                                i = if (end < 0) n else end + 2
+                            }
+                            c == '{' -> { depths.addLast(depths.removeLast() + 1); out.append(c); i++ }
+                            c == '}' && depths.last() == 0 && states.size > 1 -> {
+                                states.removeLast(); depths.removeLast(); out.append(c); i++
+                            }
+                            c == '}' -> { depths.addLast(depths.removeLast() - 1); out.append(c); i++ }
+                            else -> { out.append(c); i++ }
+                        }
+                    }
+                }
+                1 -> {
+                    val c = src[i]
+                    when {
+                        c == '\\' -> { out.append(c); if (i + 1 < n) out.append(src[i + 1]); i += 2 }
+                        src.startsWith("\${", i) -> {
+                            states.addLast(0); depths.addLast(0); out.append("\${"); i += 2
+                        }
+                        c == '"' || c == '\n' -> { states.removeLast(); depths.removeLast(); out.append(c); i++ }
+                        else -> { out.append(c); i++ }
+                    }
+                }
+                else -> {
+                    if (src.startsWith("\"\"\"", i)) {
+                        states.removeLast(); depths.removeLast(); out.append("\"\"\""); i += 3
+                    } else { out.append(src[i]); i++ }
+                }
+            }
+        }
+        return out.toString()
+    }
+
     // ── source location (same technique as DatabaseVersionGuardTest) ─────────
 
     /** Strip line + block comments so a comment quoting a bad pattern cannot trip a probe. */

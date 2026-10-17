@@ -416,13 +416,21 @@ fun ChatScreen(
     val shareBufferVersion by com.rikkaminis.app.share.ShareCoordinator.bufferVersion.collectAsState()
     androidx.compose.runtime.LaunchedEffect(shareBufferVersion) {
         if (shareBufferVersion == 0) return@LaunchedEffect
-        val pending = com.rikkaminis.app.share.ShareCoordinator.consumeBuffer(context)
-            ?: return@LaunchedEffect
+        // [fix/da1024-A] deep-audit-1024 ISSUE-01: draining a share is disk work —
+        // consumeBuffer itself cleans the staging dir when the buffered share has
+        // expired, the per-attachment copy is up to 100 MB (ShareReceiverActivity
+        // cap) and cleanSharedFiles walks + deletes the whole staging dir. All of
+        // it runs on IO; only the composer mutations below stay on Main.
+        val pending = withContext(Dispatchers.IO) {
+            com.rikkaminis.app.share.ShareCoordinator.consumeBuffer(context)
+        } ?: return@LaunchedEffect
         com.rikkaminis.app.logging.AppLogger.info(
             "ChatScreen",
             "[Share] injecting ${pending.items.size} item(s) into chat session=${SessionIdAliases.resolve(sessionId)}",
         )
-        val sharedDir = com.rikkaminis.app.share.SharedShareStore.sharedFileDirectory(context)
+        val sharedDir = withContext(Dispatchers.IO) {
+            com.rikkaminis.app.share.SharedShareStore.sharedFileDirectory(context)
+        }
         for (item in pending.items) {
             when (item.kind) {
                 com.rikkaminis.app.share.PendingShare.Item.Kind.INLINE_TEXT -> {
@@ -436,12 +444,15 @@ fun ChatScreen(
                     viewModel.setInputText(newText, caretOverride = newText.length)
                 }
                 com.rikkaminis.app.share.PendingShare.Item.Kind.ATTACHMENT -> {
+                    // Suspend: copies the staged bytes on IO, adds the attachment on Main.
                     viewModel.addAttachmentFromStagedShare(java.io.File(sharedDir, item.value))
                 }
             }
         }
         viewModel.markShareInjected()
-        com.rikkaminis.app.share.SharedShareStore.cleanSharedFiles(context)
+        withContext(Dispatchers.IO) {
+            com.rikkaminis.app.share.SharedShareStore.cleanSharedFiles(context)
+        }
     }
 
     // T311: publish "this is the active chat" while ChatScreen is composed,

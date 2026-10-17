@@ -2833,7 +2833,7 @@ class ChatViewModel(
      * an [InputAttachment] and add it to the composer. Called by
      * ChatScreen when draining a [com.rikkaminis.app.share.PendingShare].
      */
-    fun addAttachmentFromStagedShare(file: java.io.File): InputAttachment? {
+    suspend fun addAttachmentFromStagedShare(file: java.io.File): InputAttachment? {
         if (!file.exists()) return null
         val ext = file.extension.lowercase()
         val mime = android.webkit.MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
@@ -2848,16 +2848,27 @@ class ChatViewModel(
         // the LLM payload, leaving the model staring at "what is this?" with no
         // picture. Copy the staged bytes into our own private dir so the
         // attachment outlives the share-extension cleanup.
-        val durableDir = java.io.File(context.cacheDir, "share_inbound").apply { mkdirs() }
-        val durable = java.io.File(durableDir, "${java.util.UUID.randomUUID()}-${file.name}")
-        try {
-            file.inputStream().use { input ->
-                durable.outputStream().use { output -> input.copyTo(output) }
+        // [fix/da1024-A] deep-audit-1024 ISSUE-01: `mkdirs` + the 24h orphan prune
+        // + the (100 MB-capable) stream copy are disk work — run them on IO so
+        // draining a share cannot stall the UI thread; addAttachment stays on Main.
+        val durable = withContext(Dispatchers.IO) {
+            val durableDir = java.io.File(context.cacheDir, "share_inbound").apply { mkdirs() }
+            // Nothing ever deleted this dir before (it is under cacheDir but not the
+            // system cache, so the OS has no reason to reclaim it). A prune failure
+            // must never block the copy.
+            runCatching { pruneExpiredShareInboundFiles(durableDir, System.currentTimeMillis()) }
+                .onFailure { Log.w(TAG, "share_inbound prune failed: ${it.message}") }
+            val f = java.io.File(durableDir, "${java.util.UUID.randomUUID()}-${file.name}")
+            try {
+                file.inputStream().use { input ->
+                    f.outputStream().use { output -> input.copyTo(output) }
+                }
+                f
+            } catch (e: Exception) {
+                Log.w(TAG, "failed to copy staged share file ${file.name}: ${e.message}")
+                null
             }
-        } catch (e: Exception) {
-            Log.w(TAG, "failed to copy staged share file ${file.name}: ${e.message}")
-            return null
-        }
+        } ?: return null
         val attachment = InputAttachment(
             fileName = file.name,
             uri = android.net.Uri.fromFile(durable),
@@ -4455,4 +4466,38 @@ internal class SysInfoCoalescer<T>(private val idOf: (T) -> String) {
         blocks.clear()
         publish(drained)
     }
+}
+
+// [fix/da1024-A] deep-audit-1024 ISSUE-01: retention window for the staged
+// system-share copies under `cacheDir/share_inbound/`. 24h — the same window as
+// the sibling cacheDir prunes (LargeContentGuard, FullscreenImageViewer,
+// ChatMutationMethods.pruneStaleAttachments).
+internal const val SHARE_INBOUND_TTL_MS = 24L * 60L * 60L * 1000L
+
+/**
+ * Delete `share_inbound` copies older than [maxAgeMs]; `0` when the dir is
+ * missing or empty (`listFiles()` null). Pure JVM — no Android dependency — so
+ * the TTL boundary is unit-testable. Only regular files count, and a failed
+ * delete counts as kept: the prune must never block the copy it precedes.
+ *
+ * @param nowMs clock reading, injected so the boundary is testable.
+ * @param maxAgeMs retention window; defaults to [SHARE_INBOUND_TTL_MS].
+ *
+ * ponytail: 只在入站拷贝前顺带清扫（无后台巡检）| 天花板: 分享过就不再分享的人，
+ * 副本会留到 cache 被系统回收 | 升级触发: share_inbound 在存储诊断里成为可增长目录
+ */
+internal fun pruneExpiredShareInboundFiles(
+    inboundDir: java.io.File,
+    nowMs: Long,
+    maxAgeMs: Long = SHARE_INBOUND_TTL_MS,
+): Int {
+    val children = inboundDir.listFiles() ?: return 0
+    val cutoff = nowMs - maxAgeMs
+    var deleted = 0
+    for (f in children) {
+        if (f.isFile && f.lastModified() < cutoff && runCatching { f.delete() }.getOrDefault(false)) {
+            deleted++
+        }
+    }
+    return deleted
 }
