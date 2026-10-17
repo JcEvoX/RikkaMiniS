@@ -1,0 +1,50 @@
+{
+ "1": {
+  "voice_rc": 1,
+  "ua_rc": 0,
+  "voice_ok": true,
+  "ua_ok": true,
+  "restored": true,
+  "ok": true
+ },
+ "2": {
+  "voice_rc": 1,
+  "ua_rc": 0,
+  "voice_ok": true,
+  "ua_ok": true,
+  "restored": true,
+  "ok": true
+ },
+ "3": {
+  "voice_rc": 0,
+  "ua_rc": 1,
+  "voice_ok": true,
+  "ua_ok": true,
+  "restored": true,
+  "ok": true
+ },
+ "4": {
+  "voice_rc": 1,
+  "ua_rc": 0,
+  "voice_ok": true,
+  "ua_ok": true,
+  "restored": true,
+  "ok": true
+ },
+ "5": {
+  "voice_rc": 1,
+  "ua_rc": 0,
+  "voice_ok": true,
+  "ua_ok": true,
+  "restored": true,
+  "ok": true
+ },
+ "6": {
+  "voice_rc": 1,
+  "ua_rc": 0,
+  "voice_ok": true,
+  "ua_ok": true,
+  "restored": true,
+  "ok": true
+ }
+}
