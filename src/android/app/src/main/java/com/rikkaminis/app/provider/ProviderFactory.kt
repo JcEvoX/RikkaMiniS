@@ -62,14 +62,20 @@ object ProviderFactory {
         }
         return (when (instance.providerType) {
             ProviderType.anthropic -> {
-                // [T-provider-custom-user-agent] Only meaningful for custom-base
-                // (relay) instances; on the official direct path it's null.
+                // [T-provider-custom-user-agent] Covers both the custom-base
+                // (relay) and the official direct path: nothing pins the
+                // override to relay instances — the settings screen and
+                // `android provider` both accept customUserAgent on ANY apiKey
+                // instance, so gating on `basePath != null` silently dropped a
+                // value the user actually set ([deep-audit-1019 ISSUE-04]).
+                // A null/blank value falls back to MinisUserAgent.DEFAULT
+                // inside applyUserAgentOverride, so passing it is free.
                 if (basePath != null) AnthropicProvider(effectiveKey, model, basePath, customUserAgent = instance.customUserAgent)
-                else AnthropicProvider(effectiveKey, model)
+                else AnthropicProvider(effectiveKey, model, customUserAgent = instance.customUserAgent)
             }
             ProviderType.gemini -> {
-                if (basePath != null) GeminiProvider(effectiveKey, model, basePath)
-                else GeminiProvider(effectiveKey, model)
+                if (basePath != null) GeminiProvider(effectiveKey, model, basePath, customUserAgent = instance.customUserAgent)
+                else GeminiProvider(effectiveKey, model, customUserAgent = instance.customUserAgent)
             }
             ProviderType.openAI -> {
                 val base = basePath ?: "https://api.openai.com/v1"
@@ -79,8 +85,10 @@ object ProviderFactory {
                     basePath = base,
                     useResponsesAPI = instance.useResponsesAPI,
                     // [T-provider-custom-user-agent] Covers both chat and
-                    // /responses for custom-base OpenAI-compat relays; null
-                    // on the official direct path.
+                    // /responses for custom-base OpenAI-compat relays; a
+                    // null/blank value falls back to MinisUserAgent.DEFAULT
+                    // (deep-audit-1019 ISSUE-04: nothing pins it to relay
+                    // instances — it is settable on any apiKey provider).
                     customUserAgent = instance.customUserAgent,
                     // [T-android-azure-openai] Azure auths with api-key +
                     // deployments-path URL. Pass the RAW customBaseURL (not
@@ -96,6 +104,10 @@ object ProviderFactory {
                     apiKey = effectiveKey,
                     model = model,
                     basePath = "https://openrouter.ai/api/v1",
+                    // [deep-audit-1019 ISSUE-04] The OpenAI-compatible branches
+                    // below all dropped this; OpenRouter relays commonly key on
+                    // UA, and the user set it on the instance.
+                    customUserAgent = instance.customUserAgent,
                     extraHeaders = mapOf(
                         "HTTP-Referer" to "https://github.com/OpenMinis/OpenMinis",
                         "X-Title" to "Minis App",
@@ -110,6 +122,9 @@ object ProviderFactory {
                     apiKey = effectiveKey,
                     model = model,
                     basePath = base,
+                    // [deep-audit-1019 ISSUE-04] Same dropped override as the
+                    // OpenRouter branch above.
+                    customUserAgent = instance.customUserAgent,
                 )
             }
             ProviderType.kimiCode -> {
@@ -122,6 +137,9 @@ object ProviderFactory {
                     apiKey = effectiveKey,
                     model = model,
                     basePath = base,
+                    // [deep-audit-1019 ISSUE-04] Same dropped override as the
+                    // xAI / OpenRouter branches above.
+                    customUserAgent = instance.customUserAgent,
                 )
             }
         }).also { provider ->
