@@ -66,6 +66,11 @@ fun ThinkingRuleEditorDialog(
         mutableStateOf((seed.scope as? ThinkingRule.Scope.ModelPattern)?.pattern ?: "")
     }
     var choice by remember { mutableStateOf(FormatChoice.from(seed.wireFormat)) }
+    // [da1024-F] "the user actively changed the format" — the dropdown selection OR any
+    // per-format parameter field below. Until this is set, the dialog must not rewrite a
+    // wire format it cannot represent (FormatChoice.from's `else` would map DeepSeekRelay /
+    // QwenRootOnly / null onto REASONING_EFFORT). See ThinkingRuleEditPreserve.kt.
+    var formatChanged by remember { mutableStateOf(false) }
     // Shared editable params across formats.
     var sendOffValue by remember { mutableStateOf(formatOffValue(seed.wireFormat) != null) }
     var offValue by remember { mutableStateOf(formatOffValue(seed.wireFormat) ?: "") }
@@ -90,11 +95,19 @@ fun ThinkingRuleEditorDialog(
         )
     }
 
-    fun buildRule() = ThinkingRule(
-        kind = ThinkingRule.Kind.CUSTOM,
-        scope = if (allModels) ThinkingRule.Scope.AllModels else ThinkingRule.Scope.ModelPattern(pattern.trim()),
-        wireFormat = buildWireFormat(),
-        label = label.trim(),
+    /** True while the dialog has neither changed nor been able to represent the seed's format. */
+    val preservesSeedFormat = !formatChanged && !isDropdownRepresentableWireFormat(seed.wireFormat)
+
+    fun buildRule() = buildEditedThinkingRule(
+        seed = seed,
+        allModels = allModels,
+        pattern = pattern,
+        wireFormat = chooseEditedWireFormat(
+            seedWire = seed.wireFormat,
+            formatChanged = formatChanged,
+            edited = buildWireFormat(),
+        ),
+        label = label,
     )
 
     val isValid = label.isNotBlank() &&
@@ -158,22 +171,39 @@ fun ThinkingRuleEditorDialog(
                 )
                 Column {
                     MinisTextButton(onClick = { formatMenuOpen = true }) {
-                        Text(stringResource(choice.titleRes))
+                        // ponytail: the preserved case labels the button with the list's
+                        // English wireFormatSummary instead of adding localized titles for
+                        // two rarely-copied formats. | 天花板: a non-English user sees one
+                        // English label in this dialog. | 升级触发: DeepSeekRelay /
+                        // QwenRootOnly get real FormatChoice entries (needs 8-language
+                        // strings.xml) — then the label collapses back to choice.titleRes.
+                        Text(
+                            if (preservesSeedFormat) {
+                                // The dropdown has no entry for this rule's format, so it
+                                // must not claim one: show the same summary the rules list
+                                // shows, which is also what Save will persist.
+                                wireFormatSummary(seed.wireFormat)
+                            } else {
+                                stringResource(choice.titleRes)
+                            },
+                        )
                     }
                     DropdownMenu(expanded = formatMenuOpen, onDismissRequest = { formatMenuOpen = false }) {
                         FormatChoice.entries.forEach { c ->
                             DropdownMenuItem(
                                 text = { Text(stringResource(c.titleRes)) },
-                                onClick = { choice = c; formatMenuOpen = false },
+                                onClick = { choice = c; formatChanged = true; formatMenuOpen = false },
                             )
                         }
                     }
                 }
-                Text(
-                    stringResource(choice.explanationRes),
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+                if (!preservesSeedFormat) {
+                    Text(
+                        stringResource(choice.explanationRes),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
 
                 // Per-format fields
                 when (choice) {
@@ -186,13 +216,13 @@ fun ThinkingRuleEditorDialog(
                             Text(stringResource(R.string.thinking_rules_send_off_value))
                             Switch(
                                 checked = sendOffValue,
-                                onCheckedChange = { sendOffValue = it },
+                                onCheckedChange = { sendOffValue = it; formatChanged = true },
                             )
                         }
                         if (sendOffValue) {
                             OutlinedTextField(
                                 value = offValue,
-                                onValueChange = { offValue = sanitizeSingleLineInput(it) },
+                                onValueChange = { offValue = sanitizeSingleLineInput(it); formatChanged = true },
                                 label = { Text(stringResource(R.string.thinking_rules_off_value)) },
                                 singleLine = true,
                                 modifier = Modifier.fillMaxWidth(),
@@ -202,7 +232,7 @@ fun ThinkingRuleEditorDialog(
                     FormatChoice.BOOLEAN_TOGGLE, FormatChoice.EXTRA_BODY_TOGGLE -> {
                         OutlinedTextField(
                             value = path,
-                            onValueChange = { path = sanitizeSingleLineInput(it) },
+                            onValueChange = { path = sanitizeSingleLineInput(it); formatChanged = true },
                             label = { Text(stringResource(R.string.thinking_rules_field_path)) },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
@@ -211,7 +241,7 @@ fun ThinkingRuleEditorDialog(
                     FormatChoice.CUSTOM_PATH -> {
                         OutlinedTextField(
                             value = path,
-                            onValueChange = { path = sanitizeSingleLineInput(it) },
+                            onValueChange = { path = sanitizeSingleLineInput(it); formatChanged = true },
                             label = { Text(stringResource(R.string.thinking_rules_dotted_path)) },
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth(),
@@ -221,6 +251,7 @@ fun ThinkingRuleEditorDialog(
                                 value = customValues[tier] ?: "",
                                 onValueChange = {
                                     customValues = customValues + (tier to sanitizeSingleLineInput(it))
+                                    formatChanged = true
                                 },
                                 label = {
                                     Text(
@@ -276,6 +307,15 @@ enum class FormatChoice(val titleRes: Int, val explanationRes: Int) {
     CUSTOM_PATH(R.string.thinking_fmt_custom_title, R.string.thinking_fmt_custom_desc);
 
     companion object {
+        /**
+         * The dropdown entry that stands for [fmt] — DISPLAY ONLY.
+         *
+         * The `else` fallback is safe here because it can no longer reach the wire: the
+         * save path goes through `chooseEditedWireFormat`, which keeps the seed's own
+         * format unless the user actively changed it ([da1024-F], see
+         * ThinkingRuleEditPreserve.kt). Before that, `from` was the ONLY source of the
+         * saved format, so this `else` silently rewrote DeepSeekRelay / QwenRootOnly.
+         */
         fun from(fmt: ThinkingWireFormat?): FormatChoice = when (fmt) {
             is ThinkingWireFormat.OmitEverything -> OMIT
             is ThinkingWireFormat.ReasoningEffort -> REASONING_EFFORT
