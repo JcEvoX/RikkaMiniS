@@ -254,7 +254,11 @@ object ChatMenuPrefs {
      * Default: true (visible).
      */
     const val TOP_BAR_INPUT_HISTORY = "topBar.inputHistory"
-    private const val TOP_BAR_INPUT_HISTORY_PREF = "topBar.inputHistory.visible"
+    // internal (was private): ChatMenuSettingsScreen's prefs-change listener
+    // must match on this exact key (it does NOT start with "chatMenu.", so the
+    // "chatMenu." prefix guard alone never fired for external minis-config /
+    // backup-restore writes). Single source — no second string copy in the UI.
+    internal const val TOP_BAR_INPUT_HISTORY_PREF = "topBar.inputHistory.visible"
 
     fun isTopBarInputHistoryVisible(prefs: SharedPreferences): Boolean =
         prefs.getBoolean(TOP_BAR_INPUT_HISTORY_PREF, true)
@@ -274,7 +278,9 @@ object ChatMenuPrefs {
      * trigger. Default: true (visible).
      */
     const val COMPOSER_MODEL_PICKER_BUTTON = "composer.modelPickerButton"
-    private const val COMPOSER_MODEL_PICKER_BUTTON_PREF = "composer.modelPickerButton.visible"
+    // internal (was private): same reason as TOP_BAR_INPUT_HISTORY_PREF — the
+    // settings screen's listener matches on this key too; single source.
+    internal const val COMPOSER_MODEL_PICKER_BUTTON_PREF = "composer.modelPickerButton.visible"
 
     fun isComposerModelPickerVisible(prefs: SharedPreferences): Boolean =
         prefs.getBoolean(COMPOSER_MODEL_PICKER_BUTTON_PREF, true)
