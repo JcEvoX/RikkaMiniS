@@ -356,7 +356,12 @@ internal object ProviderMutationMethods {
             }
         }
         val newModel = if (params.has("modelId")) {
-            val mid = params.optString("modelId", current.baseModel.id)
+            // [da1022-E] trim + reject blank ids (same integrity gate as the
+            // detail screen); a blank id would mint a dangling composite key.
+            val mid = params.optString("modelId", current.baseModel.id).trim()
+            if (mid.isEmpty()) {
+                throw RPCException(-32602, "modelId must not be blank")
+            }
             current.baseModel.copy(id = mid)
         } else current.baseModel
 
