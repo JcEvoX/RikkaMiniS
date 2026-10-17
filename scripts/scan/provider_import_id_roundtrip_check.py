@@ -61,6 +61,23 @@ LLM_EXEMPT = {
                 "providerType.displayName; export: per-instance dict)",
 }
 
+# Parse-direction exemption: these keys are read through the bitfield-fallback
+# helper, not by a quoted literal in parseImportedModelEntries' body. The gate
+# asserts the helper is the reader (call present) instead of a bare literal.
+PARSE_HELPER_READ = {
+    "inputModalities": "readModalitiesWithBitfieldFallback",
+    "outputModalities": "readModalitiesWithBitfieldFallback",
+}
+PARSE_HELPER_CALL = "readModalitiesWithBitfieldFallback(m)"
+
+# Arm 2/3 anchors: the READ/WRITE call, not a bare key string — the parse
+# body also carries each key as the LLMModel constructor argument
+# (`declaresNoEffortTiers = declaresNoEffortTiers`), which satisfies a bare
+# presence check even after the read block is deleted (mutation M3 caught
+# exactly that false green).
+EXPORT_ANCHORS = ('put("reasoningEffortValues"', 'put("declaresNoEffortTiers"')
+PARSE_ANCHORS = ('optJSONArray("reasoningEffortValues")', 'optBoolean("declaresNoEffortTiers")')
+
 REASONING_KEYS = ("reasoningEffortValues", "declaresNoEffortTiers")
 ECHO_KEY = "reasoningEchoJson"
 
@@ -142,17 +159,17 @@ def check_merge_requery(src, rel=PR_REL):
 # ----------------------------------------------------------------------
 # Arms 2/3 — export & parse must carry the reasoning pair
 # ----------------------------------------------------------------------
-def check_reasoning_keys(src, rel, header, arm, what):
+def check_reasoning_keys(src, rel, header, arm, what, anchors):
     body = function_text(src, header)
     if body is None:
         return [(rel, 0, arm, header + " not found — gate ROT")]
     code = code_only(body)
     out = []
-    for key in REASONING_KEYS:
-        if key not in code:
+    for anchor in anchors:
+        if anchor not in code:
             out.append((rel, line_of(src, src.find(header)), arm,
-                        "%s does not carry %s — a backup restore evaporates the "
-                        "%s field (Room path already has it)" % (what, key, key)))
+                        "%s does not %s — a backup restore evaporates the field "
+                        "(Room path already has it)" % (what, anchor)))
     return out
 
 
@@ -202,11 +219,22 @@ def check_field_completeness(srcs, rels=None):
         if prop in LLM_EXEMPT:
             continue
         key = LLM_KEY_MAP.get(prop, prop)
-        if key not in export_code:
+        key_lit = '"%s"' % key
+        # Line-level: the key must appear inside a READ/WRITE call, not as a
+        # bare constructor argument — a dropped read leaves the constructor
+        # arg behind (mutation M3's false green).
+        def _has_call(code, callwords):
+            for line in code.split("\n"):
+                if key_lit in line and any(w in line for w in callwords):
+                    return True
+            return False
+        if not _has_call(export_code, ("put(", "opt", "has(")):
             out.append((rels["pr"], line_of(pr_src, pr_src.find("fun exportInstanceJSON(")), "5",
                         "exportInstanceJSON does not serialize LLMModel.%s (key \"%s\") — "
                         "add-a-field-sync-everywhere regression" % (prop, key)))
-        if key not in parse_code:
+        if not _has_call(parse_code, ("opt", "has(")):
+            if prop in PARSE_HELPER_READ and PARSE_HELPER_CALL in parse_code:
+                continue  # helper-owned read (bitfield fallback contract)
             out.append((rels["pr"], line_of(pr_src, pr_src.find("fun parseImportedModelEntries(")), "5",
                         "parseImportedModelEntries does not read LLMModel.%s (key \"%s\") — "
                         "add-a-field-sync-everywhere regression" % (prop, key)))
@@ -225,8 +253,8 @@ def run_checks(root):
     srcs = {"pr": pr, "bm": bm, "lm": lm}
     checks = []
     checks += check_merge_requery(pr)
-    checks += check_reasoning_keys(pr, PR_REL, "fun exportInstanceJSON(", "2", "exportInstanceJSON")
-    checks += check_reasoning_keys(pr, PR_REL, "fun parseImportedModelEntries(", "3", "parseImportedModelEntries")
+    checks += check_reasoning_keys(pr, PR_REL, "fun exportInstanceJSON(", "2", "exportInstanceJSON", EXPORT_ANCHORS)
+    checks += check_reasoning_keys(pr, PR_REL, "fun parseImportedModelEntries(", "3", "parseImportedModelEntries", PARSE_ANCHORS)
     checks += check_convert_echo(bm)
     checks += check_field_completeness(srcs)
     return checks
@@ -357,6 +385,38 @@ FIX_PARSE_BAD = """private fun parseImportedModelEntries(dict: JSONObject, insta
 }
 """
 
+# M3-mimicking variant: the constructor argument stays (bare key presence
+# would satisfy it) but the READ is dropped — the read/writer-call anchors
+# must catch exactly this false green.
+FIX_PARSE_READDROPPED_BAD = """private fun parseImportedModelEntries(dict: JSONObject, instanceId: String): List<ModelEntry> {
+    val entries = mutableListOf<ModelEntry>()
+    for (i in 0 until models.length()) {
+        val m = models.getJSONObject(i)
+        val modelId = m.optString("modelId", "")
+        val displayName = m.optString("displayName", modelId)
+        val contextWindow = if (m.has("contextWindow")) m.optInt("contextWindow").takeIf { it > 0 } else null
+        val maxOutputTokens = if (m.has("maxOutputTokens")) m.optInt("maxOutputTokens").takeIf { it > 0 } else null
+        val supportsReasoning = if (m.has("supportsReasoning")) m.optBoolean("supportsReasoning") else null
+        val interleavedReasoningField = m.optString("interleavedReasoningField", "").ifEmpty { null }
+        val (baseIn, baseOut) = readModalitiesWithBitfieldFallback(m)
+        val model = LLMModel(
+            id = modelId,
+            displayName = displayName,
+            contextWindow = contextWindow,
+            maxOutputTokens = maxOutputTokens,
+            supportsReasoning = supportsReasoning,
+            interleavedReasoningField = interleavedReasoningField,
+            inputModalities = baseIn,
+            outputModalities = baseOut,
+            reasoningEffortValues = null,
+            declaresNoEffortTiers = null,
+        )
+        entries.add(ModelEntry(providerInstanceId = instanceId, baseModel = model))
+    }
+    return entries
+}
+"""
+
 FIX_MERGE_OK = """fun mergeImportInstanceJSON(
     jsonStr: String,
     srcEntryIds: List<String>,
@@ -473,12 +533,18 @@ def selftest():
         arms = sorted({x[2] for x in v})
         if arms != ["1", "2", "3", "4", "5"]:
             failures.append("violating fixture arms=%r (violations=%r)" % (arms, v))
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_OK, FIX_EXPORT_OK, FIX_PARSE_READDROPPED_BAD, FIX_CONVERT_OK)
+        v = run_checks(tmp)
+        arms = sorted({x[2] for x in v})
+        if arms != ["3", "5"]:
+            failures.append("read-dropped fixture arms=%r (violations=%r)" % (arms, v))
     if failures:
         for f in failures:
             print("SELFTEST-FAIL: " + f)
         print("PROVIDER_IMPORT_ID_ROUNDTRIP_SELFTEST=FAIL")
         return 1
-    print("selftest: compliant fixture green / violating fixture red on arms 1-5")
+    print("selftest: compliant green / violating red arms 1-5 / read-dropped red arms 3+5")
     print("PROVIDER_IMPORT_ID_ROUNDTRIP_SELFTEST=PASS")
     return 0
 
