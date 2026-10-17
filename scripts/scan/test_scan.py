@@ -2734,6 +2734,31 @@ def test_da1022_gates():
         rc, out = run_scanner(script + ".py", *real_args)
         check("%s real tree green" % script, rc == 0, out[-280:])
 
+DA1023_GATES = [
+    ("file_provider_paths_coverage_check", "FILE_PROVIDER_PATHS_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("model_entry_override_parity_check", "MODEL_ENTRY_OVERRIDE_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("compact_entry_pin_migration_check", "COMPACT_ENTRY_PIN_MIGRATION_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("entry_composite_key_guard_check", "ENTRY_COMPOSITE_KEY_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("collection_copy_on_mutate_check", "COLLECTION_COPY_ON_MUTATE_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("skill_frontmatter_roundtrip_check", "SKILL_FRONTMATTER_ROUNDTRIP_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("skill_import_offmain_check", "SKILL_IMPORT_OFFMAIN_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("chat_session_id_binding_check", "CHAT_SESSION_ID_BINDING_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("memory_ui_wiring_check", "MEMORY_UI_WIRING_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("file_uri_parse_guard_check", "FILE_URI_PARSE_GUARD_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("backup_streaming_export_check", "BACKUP_STREAMING_EXPORT_SELFTEST=PASS", (), (REPO_ROOT,)),
+]
+
+def test_da1023_gates():
+    print("━━━ deep-audit-1023 gates (selftest teeth + real tree) ━━━")
+    for script, marker, st_extra, real_args in DA1023_GATES:
+        argv = [sys.executable, os.path.join(SCRIPT_DIR, script + ".py")] + list(st_extra) + ["--selftest"]
+        proc = subprocess.run(argv, capture_output=True, text=True)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        check("%s selftest has teeth (%s)" % (script, marker),
+              proc.returncode == 0 and marker in out, out[-280:])
+        rc, out = run_scanner(script + ".py", *real_args)
+        check("%s real tree green" % script, rc == 0, out[-280:])
+
 def main():
     print("╔══════════════════════════════════════════════════╗")
     print("║  Scan Self-Test (fixture ground truth)          ║")
@@ -2772,6 +2797,7 @@ def main():
     test_da1020_gates()
     test_da1021_gates()
     test_da1022_gates()
+    test_da1023_gates()
     test_da1017_external_fixtures()
     test_real_repo()
     print("")
