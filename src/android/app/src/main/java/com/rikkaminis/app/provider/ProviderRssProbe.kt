@@ -103,7 +103,10 @@ object ProviderRssProbe {
                 (if (outputBytes >= 0) " out=${outputBytes}" else "")
     }
 
-    private data class Stats(
+    // [fix/da1019-rssprobe-lock-scope] private → internal：决策纯函数
+    // [applyAndDecideLocked] 的签名要暴露它，JVM 并发装置也要直接驱动该函数
+    // （对齐 OffloadRssProbe 的同款修复形态）。
+    internal data class Stats(
         var count: Int = 0,
         var totalDeltaKb: Long = 0L,
         var peakDeltaMaxKb: Long = 0L,   // 所有调用中单次 peakDeltaKb 的最大值
@@ -115,6 +118,20 @@ object ProviderRssProbe {
     ) {
         fun averageDeltaKb(): Long = if (count == 0) 0L else totalDeltaKb / count
     }
+
+    /**
+     * [fix/da1019-rssprobe-lock-scope] [applyAndDecideLocked] 的决策快照：record
+     * 在锁内拿到它，锁外只据它做副作用（Log）。字段是「本次调用后」的读数——
+     * 观测日志与 LEAK-SUSPECT 文案同源，不再各自撕裂地读 Stats 的可变字段。
+     */
+    internal data class ProviderRssDecision(
+        val totalDeltaKb: Long,
+        val count: Int,
+        val avgDeltaKb: Long,
+        val peakDeltaMaxKb: Long,
+        val postCallRssKb: Long,
+        val warnCondition: String?,
+    )
 
     // 调用类型名 → 聚合统计（进程级累计，与 RSS 生命周期对齐）。
     private val byKind = ConcurrentHashMap<String, Stats>()
@@ -247,6 +264,94 @@ object ProviderRssProbe {
 
     // ---- 记录与聚合 ----
 
+    /**
+     * 记录一条 provider 调用观测。kind 用于区分调用类型（"sendMessage" / "streamMessage:<provider>"）。
+     * 零副作用：所有聚合与日志都无法影响调用结果。
+     *
+     * [fix/da1019-rssprobe-lock-scope] record() is entered from LLMProvider default
+     * methods, and parallel sub-agents (max_parallel=4) can hit the same Stats at
+     * once. ConcurrentHashMap guards the map, not the value's fields, so the
+     * `+=` / min / max sequences **and** the LEAK-SUSPECT check-then-act (the
+     * `decideLeakSuspect` read plus the `st.leaked = true` winner write) must form
+     * ONE critical section ([applyAndDecideLocked]); the logs are formatted from
+     * that section's snapshot. Before the fix the decision and the winner write sat
+     * outside `synchronized(st)` — two callers could both pass `!st.leaked` and
+     * print the single-shot LEAK-SUSPECT WARN twice, and the observation log read
+     * torn count / cumulative fields.
+     */
+    fun record(record: ProbeRecord) {
+        if (record.kind.isEmpty()) return
+        val st = byKind.computeIfAbsent(record.kind) { Stats() }
+        val deltaKb = record.afterRss - record.beforeRss
+        // 判定所需的 peakDelta 先算好，临界区内不做任何可能重入/高开销的调用。
+        val peakDelta = record.peakDeltaKb()
+        // 唯一临界区：自增 + LEAK-SUSPECT 决策（[decideLeakSuspect]）+ 赢家置位
+        // 全部在锁内完成，读数捕获进局部快照 d；锁外只消费 d 做 Log。
+        val d = synchronized(st) { applyAndDecideLocked(st, deltaKb, peakDelta, record) }
+
+        Log.i(
+            TAG,
+            "[provider-rss] ${record.brief()} " +
+                "cum=${d.totalDeltaKb / 1024}MB(×${d.count}, avg=${d.avgDeltaKb / 1024}MB " +
+                "peakΔmax=${d.peakDeltaMaxKb / 1024}MB postRss=${d.postCallRssKb / 1024}MB)"
+        )
+
+        // LEAK-SUSPECT 赢家语义：首个跨阈值的调用打印恰一次 WARN（锁内置位）。
+        if (d.warnCondition != null) {
+            Log.w(
+                TAG,
+                "[provider-rss] LEAK-SUSPECT ${record.kind} (${d.warnCondition}) " +
+                    "peakΔmax=${d.peakDeltaMaxKb / 1024}MB totalDelta=${d.totalDeltaKb / 1024}MB " +
+                    "over ${d.count} calls postRss=${d.postCallRssKb / 1024}MB — 候选聊天路径 native OOM 源头"
+            )
+        }
+    }
+
+    /**
+     * [fix/da1019-rssprobe-lock-scope] 一次临界区里完成「自增 + LEAK-SUSPECT 决策
+     * + 赢家置位」的纯逻辑（对齐 OffloadRssProbe.applyAndDecideLocked 的形状，
+     * JVM 可直测；并发守恒臂见 ProviderRssProbeLockScopeTest）。
+     *
+     * **只允许在 `synchronized(st)` 内调用**——调用方负责持锁；本函数保证
+     * 「判定」与它所依据的数值之间不可能被另一个调用方插入：
+     * - [decideLeakSuspect] 读到的 count / lowestPostCallRssKb / totalDeltaKb 与
+     *   本次自增同源（修复前它们与判定分处锁内外，判定读到的是撕裂/过期读数）；
+     * - leaked 只由第一个跨阈值的调用置位（赢家语义 ⇒ WARN 恰一次）。
+     *
+     * 返回的 [ProviderRssDecision] 携带锁内读数，锁外只据它格式化日志。
+     * 行为不变：本探针无治理语义（不做累计归零），阈值常量与日志文案逐字保持。
+     */
+    internal fun applyAndDecideLocked(
+        st: Stats,
+        deltaKb: Long,
+        peakDelta: Long,
+        record: ProbeRecord,
+    ): ProviderRssDecision {
+        st.count += 1
+        st.totalDeltaKb += deltaKb
+        st.lastDeltaKb = deltaKb
+        st.postCallRssKb = record.afterRss
+        st.lowestPostCallRssKb = minOf(st.lowestPostCallRssKb, record.afterRss)
+        if (peakDelta > st.peakDeltaMaxKb) st.peakDeltaMaxKb = peakDelta
+        if (record.peakRss > st.peakRssMaxKb) st.peakRssMaxKb = record.peakRss
+
+        val condition = decideLeakSuspect(st, peakDelta, record)
+        val warnCondition = if (!st.leaked && condition != null) {
+            st.leaked = true
+            condition
+        } else {
+            null
+        }
+        return ProviderRssDecision(
+            totalDeltaKb = st.totalDeltaKb,
+            count = st.count,
+            avgDeltaKb = st.averageDeltaKb(),
+            peakDeltaMaxKb = st.peakDeltaMaxKb,
+            postCallRssKb = st.postCallRssKb,
+            warnCondition = warnCondition,
+        )
+    }
+
     /** 兼容 v1 的便捷入口：只给 kind + before + after，其余字段走当前进程快照默认。 */
     fun record(kind: String, beforeKb: Long, afterKb: Long) {
         val snap = currentSnapshot()
@@ -261,48 +366,6 @@ object ProviderRssProbe {
                 vmPeak = snap.vmPeak,
             )
         )
-    }
-
-    /**
-     * 记录一条 provider 调用观测。kind 用于区分调用类型（"sendMessage" / "streamMessage:<provider>"）。
-     * 零副作用：所有聚合与日志都无法影响调用结果。
-     */
-    fun record(record: ProbeRecord) {
-        if (record.kind.isEmpty()) return
-        val st = byKind.computeIfAbsent(record.kind) { Stats() }
-        // [fix/audit-b20 / T5-L4] record() is entered from LLMProvider default
-        // methods, and parallel sub-agents (max_parallel=4) can hit the same
-        // Stats at once. ConcurrentHashMap guards the map, not the value's
-        // fields, so the `+=` / min / max sequences lost updates.
-        val deltaKb = record.afterRss - record.beforeRss
-        val peakDelta = record.peakDeltaKb()
-        synchronized(st) {
-            st.count += 1
-            st.totalDeltaKb += deltaKb
-            st.lastDeltaKb = deltaKb
-            st.postCallRssKb = record.afterRss
-            st.lowestPostCallRssKb = minOf(st.lowestPostCallRssKb, record.afterRss)
-            if (peakDelta > st.peakDeltaMaxKb) st.peakDeltaMaxKb = peakDelta
-            if (record.peakRss > st.peakRssMaxKb) st.peakRssMaxKb = record.peakRss
-        }
-
-        Log.i(
-            TAG,
-            "[provider-rss] ${record.brief()} " +
-                "cum=${st.totalDeltaKb / 1024}MB(×${st.count}, avg=${st.averageDeltaKb() / 1024}MB " +
-                "peakΔmax=${st.peakDeltaMaxKb / 1024}MB postRss=${st.postCallRssKb / 1024}MB)"
-        )
-
-        val condition = decideLeakSuspect(st, peakDelta, record)
-        if (!st.leaked && condition != null) {
-            st.leaked = true
-            Log.w(
-                TAG,
-                "[provider-rss] LEAK-SUSPECT ${record.kind} (${condition}) " +
-                    "peakΔmax=${st.peakDeltaMaxKb / 1024}MB totalDelta=${st.totalDeltaKb / 1024}MB " +
-                    "over ${st.count} calls postRss=${st.postCallRssKb / 1024}MB — 候选聊天路径 native OOM 源头"
-            )
-        }
     }
 
     /**
@@ -343,9 +406,15 @@ object ProviderRssProbe {
             Log.i(TAG, "[provider-rss] summary: (no provider calls instrumented)")
             return "(no data)"
         }
+        // [fix/da1019-rssprobe-lock-scope] 锁内取一份快照（Stats.copy()），锁外
+        // 格式化：与并发 record 交错时每行读数自洽（cum/count/avg/peakΔmax/
+        // postRss/lowest 同源），不再打印撕裂读数、排序键也不再是撕裂值。
+        val snapshot = byKind.entries.map { (kind, st) ->
+            kind to synchronized(st) { st.copy() }
+        }
         val sb = StringBuilder("provider-rss summary (pid=$pid process=$processName):\n")
-        byKind.entries
-            .sortedByDescending { it.value.totalDeltaKb }
+        snapshot
+            .sortedByDescending { it.second.totalDeltaKb }
             .forEach { (kind, st) ->
                 val baseline = if (st.lowestPostCallRssKb == Long.MAX_VALUE) "?" else (st.lowestPostCallRssKb / 1024).toString() + "MB"
                 sb.append(
