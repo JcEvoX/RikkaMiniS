@@ -212,11 +212,11 @@ class FastioWiringTest {
     private fun assertTarOptionSpelling(handler: String) {
         assertTrue(
             "the `tar` cluster expander must exist",
-            handler.contains("private fun normalizeTarShorts("),
+            handler.contains("internal fun normalizeTarShorts("),
         )
         assertTrue(
             "it must be scoped to the tar subcommand, or `rm -rf` loses its meaning",
-            handler.contains("if (argv.firstOrNull() != \"tar\") return argv"),
+            handler.contains("if (firstSubcommandToken(argv) != \"tar\") return argv"),
         )
         val expander = handler.indexOf("normalizeLongOptionSpelling(normalizeTarShorts(rawArgv))")
         assertTrue(
@@ -232,8 +232,8 @@ class FastioWiringTest {
             "the tar verbs must stay SCOPED to `tar`: declared for every subcommand they made " +
                 "`du --create btree` treat `--create` as a flag and walk `btree` (exit 0), where the " +
                 "intended behaviour is the parser's own \"missing <path>\" (exit 2)",
-            handler.contains("val isTarCommand = rawArgv.firstOrNull() == \"tar\"") &&
-                handler.substringAfter("booleanFlags = if (isTarCommand) {")
+            handler.contains("val isTarCommand = firstSubcommandToken(rawArgv) == \"tar\"") &&
+                handler.substringAfter("internal fun fastioBooleanFlags(isTarCommand: Boolean): Set<String>")
                     .substringAfter("} else {")
                     .substringBefore("}")
                     .let { branch ->
@@ -505,7 +505,7 @@ class FastioWiringTest {
     fun `negative control - unscoping the tar expander makes the spelling probe fail`() {
         val original = source(handlerFile)
         val mutated = original.replace(
-            "if (argv.firstOrNull() != \"tar\") return argv",
+            "if (firstSubcommandToken(argv) != \"tar\") return argv",
             "",
         )
         assertTrue("the subcommand guard must exist to be removable", mutated != original)
