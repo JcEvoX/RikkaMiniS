@@ -1,0 +1,72 @@
+=== [5] customUserAgent 全仓 ===
+src/android/app/src/main/java/com/rikkaminis/app/backup/OpenMinisBackupCompat.kt:476:            inst.optString("customUserAgent", "").takeIf { it.isNotEmpty() }
+src/android/app/src/main/java/com/rikkaminis/app/backup/OpenMinisBackupCompat.kt:477:                ?.let { obj.put("customUserAgent", it) }
+src/android/app/src/main/java/com/rikkaminis/app/browser/BrowserTabPool.kt:1101:        if (userAgentProfile == UserAgentProfile.CUSTOM && !customUserAgentString.isNullOrEmpty()) {
+src/android/app/src/main/java/com/rikkaminis/app/browser/BrowserTabPool.kt:1102:            manager.setUserAgent(userAgentProfile, customUserAgentString)
+src/android/app/src/main/java/com/rikkaminis/app/browser/BrowserTabPool.kt:1204:        if (userAgentProfile == UserAgentProfile.CUSTOM && !customUserAgentString.isNullOrEmpty()) {
+src/android/app/src/main/java/com/rikkaminis/app/browser/BrowserTabPool.kt:1205:            manager.setUserAgent(userAgentProfile, customUserAgentString)
+src/android/app/src/main/java/com/rikkaminis/app/browser/BrowserTabPool.kt:1345:        customUserAgentString = customUA
+src/android/app/src/main/java/com/rikkaminis/app/browser/BrowserTabPool.kt:246:    private var customUserAgentString: String? = null
+src/android/app/src/main/java/com/rikkaminis/app/browser/BrowserTabPool.kt:310:        customUserAgentString = prefs.getString("custom_user_agent", null)?.ifEmpty { null }
+src/android/app/src/main/java/com/rikkaminis/app/config/collections/ProvidersCollection.kt:324:    private fun customUserAgent(id: String): ConfigField =
+src/android/app/src/main/java/com/rikkaminis/app/config/collections/ProvidersCollection.kt:326:            path = "providers.$id.customUserAgent",
+src/android/app/src/main/java/com/rikkaminis/app/config/collections/ProvidersCollection.kt:334:                ConfigValue.Str(inst.customUserAgent ?: "")
+src/android/app/src/main/java/com/rikkaminis/app/config/collections/ProvidersCollection.kt:348:                mutate(id) { it.copy(customUserAgent = s.ifEmpty { null }) }
+src/android/app/src/main/java/com/rikkaminis/app/config/collections/ProvidersCollection.kt:62:            customUserAgent(forId),
+src/android/app/src/main/java/com/rikkaminis/app/data/db/ProviderConfigMapping.kt:231:            customUserAgent = row.customUserAgent,
+src/android/app/src/main/java/com/rikkaminis/app/data/db/ProviderConfigMapping.kt:93:            customUserAgent = inst.customUserAgent,
+src/android/app/src/main/java/com/rikkaminis/app/data/db/ProviderInstanceEntity.kt:33:    @ColumnInfo(name = "custom_user_agent") val customUserAgent: String? = null,
+src/android/app/src/main/java/com/rikkaminis/app/data/model/ProviderConfig.kt:198:    var customUserAgent: String? = null,
+src/android/app/src/main/java/com/rikkaminis/app/data/repository/ProviderRepository.kt:2295:            instance.customUserAgent?.takeIf { it.isNotBlank() }?.let { put("customUserAgent", it) }
+src/android/app/src/main/java/com/rikkaminis/app/data/repository/ProviderRepository.kt:2341:        val customUserAgent = dict.optString("customUserAgent", "").ifEmpty { null }
+src/android/app/src/main/java/com/rikkaminis/app/data/repository/ProviderRepository.kt:2360:            customUserAgent = customUserAgent,
+src/android/app/src/main/java/com/rikkaminis/app/debug/DebugMethodRegistry.kt:568:                ParamSpec("customUserAgent", "string", required = false, description = "Override outbound User-Agent. apiKey providers only."),
+src/android/app/src/main/java/com/rikkaminis/app/debug/DebugMethodRegistry.kt:586:                ParamSpec("customUserAgent", "string", required = false, description = "Override outbound User-Agent (null/\"\" reverts to default). apiKey providers only."),
+src/android/app/src/main/java/com/rikkaminis/app/debug/ProviderDebugMethods.kt:103:                put("customUserAgent", inst.customUserAgent ?: JSONObject.NULL)
+src/android/app/src/main/java/com/rikkaminis/app/debug/ProviderMutationMethods.kt:116:        // [T-ua-block-oauth-provider] customUserAgent only applies to third-party
+src/android/app/src/main/java/com/rikkaminis/app/debug/ProviderMutationMethods.kt:122:        val customUserAgent: String? = if (params.has("customUserAgent")) {
+src/android/app/src/main/java/com/rikkaminis/app/debug/ProviderMutationMethods.kt:126:            if (params.isNull("customUserAgent")) null
+src/android/app/src/main/java/com/rikkaminis/app/debug/ProviderMutationMethods.kt:127:            else params.optString("customUserAgent", "").ifEmpty { null }
+src/android/app/src/main/java/com/rikkaminis/app/debug/ProviderMutationMethods.kt:128:        } else current.customUserAgent
+src/android/app/src/main/java/com/rikkaminis/app/debug/ProviderMutationMethods.kt:152:            customUserAgent = customUserAgent,
+src/android/app/src/main/java/com/rikkaminis/app/debug/ProviderMutationMethods.kt:289:            put("customUserAgent", inst.customUserAgent ?: JSONObject.NULL)
+src/android/app/src/main/java/com/rikkaminis/app/debug/ProviderMutationMethods.kt:70:        // [T-ua-block-oauth-provider] customUserAgent only for apiKey providers.
+src/android/app/src/main/java/com/rikkaminis/app/debug/ProviderMutationMethods.kt:71:        val customUserAgent = params.optString("customUserAgent", "").ifEmpty { null }
+src/android/app/src/main/java/com/rikkaminis/app/debug/ProviderMutationMethods.kt:72:        if (customUserAgent != null && credentialType != ProviderCredential.apiKey) {
+src/android/app/src/main/java/com/rikkaminis/app/debug/ProviderMutationMethods.kt:85:            customUserAgent = customUserAgent,
+src/android/app/src/main/java/com/rikkaminis/app/provider/ModelListProviderAdapters.kt:150:            customUserAgent = instance.customUserAgent,
+src/android/app/src/main/java/com/rikkaminis/app/provider/ModelListProviderAdapters.kt:46:            customUserAgent = instance.customUserAgent,
+src/android/app/src/main/java/com/rikkaminis/app/provider/ModelListProviderAdapters.kt:91:            customUserAgent = instance.customUserAgent,
+src/android/app/src/main/java/com/rikkaminis/app/provider/ProviderFactory.kt:110:                    customUserAgent = instance.customUserAgent,
+src/android/app/src/main/java/com/rikkaminis/app/provider/ProviderFactory.kt:127:                    customUserAgent = instance.customUserAgent,
+src/android/app/src/main/java/com/rikkaminis/app/provider/ProviderFactory.kt:142:                    customUserAgent = instance.customUserAgent,
+src/android/app/src/main/java/com/rikkaminis/app/provider/ProviderFactory.kt:68:                // `android provider` both accept customUserAgent on ANY apiKey
+src/android/app/src/main/java/com/rikkaminis/app/provider/ProviderFactory.kt:73:                if (basePath != null) AnthropicProvider(effectiveKey, model, basePath, customUserAgent = instance.customUserAgent)
+src/android/app/src/main/java/com/rikkaminis/app/provider/ProviderFactory.kt:74:                else AnthropicProvider(effectiveKey, model, customUserAgent = instance.customUserAgent)
+src/android/app/src/main/java/com/rikkaminis/app/provider/ProviderFactory.kt:77:                if (basePath != null) GeminiProvider(effectiveKey, model, basePath, customUserAgent = instance.customUserAgent)
+src/android/app/src/main/java/com/rikkaminis/app/provider/ProviderFactory.kt:78:                else GeminiProvider(effectiveKey, model, customUserAgent = instance.customUserAgent)
+src/android/app/src/main/java/com/rikkaminis/app/provider/ProviderFactory.kt:92:                    customUserAgent = instance.customUserAgent,
+src/android/app/src/main/java/com/rikkaminis/app/provider/UserAgentOverride.kt:16: * **Fallback policy (T-android-default-ua):** when `customUserAgent` is
+src/android/app/src/main/java/com/rikkaminis/app/provider/UserAgentOverride.kt:30:    customUserAgent: String?,
+src/android/app/src/main/java/com/rikkaminis/app/provider/UserAgentOverride.kt:33:    val ua = customUserAgent?.trim()
+src/android/app/src/main/java/com/rikkaminis/app/provider/anthropic/AnthropicModelsApi.kt:37:        customUserAgent: String? = null,
+src/android/app/src/main/java/com/rikkaminis/app/provider/anthropic/AnthropicModelsApi.kt:80:                .applyUserAgentOverride(customUserAgent)
+src/android/app/src/main/java/com/rikkaminis/app/provider/anthropic/AnthropicProvider.kt:1175:            customUserAgent,
+src/android/app/src/main/java/com/rikkaminis/app/provider/anthropic/AnthropicProvider.kt:62:    private val customUserAgent: String? = null,
+src/android/app/src/main/java/com/rikkaminis/app/provider/gemini/GeminiProvider.kt:116:            .applyUserAgentOverride(customUserAgent)
+src/android/app/src/main/java/com/rikkaminis/app/provider/gemini/GeminiProvider.kt:169:            .applyUserAgentOverride(customUserAgent)
+src/android/app/src/main/java/com/rikkaminis/app/provider/gemini/GeminiProvider.kt:64:    private val customUserAgent: String? = null,
+src/android/app/src/main/java/com/rikkaminis/app/provider/openai/OpenAIModelsApi.kt:39:        customUserAgent: String? = null,
+src/android/app/src/main/java/com/rikkaminis/app/provider/openai/OpenAIModelsApi.kt:62:            .applyUserAgentOverride(customUserAgent)
+src/android/app/src/main/java/com/rikkaminis/app/provider/openai/OpenAIProvider.kt:1671:            builder.applyUserAgentOverride(customUserAgent)
+src/android/app/src/main/java/com/rikkaminis/app/provider/openai/OpenAIProvider.kt:2393:        builder.applyUserAgentOverride(customUserAgent)
+src/android/app/src/main/java/com/rikkaminis/app/provider/openai/OpenAIProvider.kt:91:    private val customUserAgent: String? = null,
+src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ModelExecutionDispatcher.kt:88:            instance.customUserAgent?.let { put("user_agent", it) }
+src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ModelExecutionService.kt:1237:                customUserAgent = req.optString("user_agent", "").ifEmpty { null },
+src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ModelExecutionService.kt:823:            customUserAgent = req.optString("user_agent", "").ifEmpty { null },
+src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatProviderRouteLogic.kt:39:        a.customUserAgent != b.customUserAgent ||
+src/android/app/src/main/java/com/rikkaminis/app/ui/settings/ProviderConnectionScreen.kt:173:                                value = customUserAgent,
+src/android/app/src/main/java/com/rikkaminis/app/ui/settings/ProviderConnectionScreen.kt:174:                                onValueChange = { customUserAgent = it },
+src/android/app/src/main/java/com/rikkaminis/app/ui/settings/ProviderConnectionScreen.kt:71:    var customUserAgent by rememberSaveable { mutableStateOf(instance.customUserAgent ?: "") }
+src/android/app/src/main/java/com/rikkaminis/app/ui/settings/ProviderConnectionScreen.kt:81:                customUserAgent = customUserAgent.ifBlank { null },
+src/android/app/src/main/java/com/rikkaminis/app/ui/settings/ProviderConnectionScreen.kt:86:            "Saved base URL for ${instance.id}: url='${customBaseURL.ifBlank { "<default>" }}', appendV1=$appendV1, ua='${customUserAgent.ifBlank { "<default>" }}'",

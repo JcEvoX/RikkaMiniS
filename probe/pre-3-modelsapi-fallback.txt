@@ -1,0 +1,225 @@
+=== [3a] OpenAIModelsApi.kt 50,105 ===
+            // override existed would still carry models.dev's under-declared tier set
+            // and cap the picker, so the correction is re-applied on the cache path too
+            // (it is a no-op for every host we have no measurement for).
+            cache.load(ctx, cacheKey)?.let {
+                return@withContext ModelsDevApi.applyGatewayEffortTruth(it, baseURL)
+            }
+        }
+        val url = buildURL(baseURL)
+        val request = Request.Builder()
+            .url(url)
+            .header("Authorization", "Bearer $apiKey")
+            // [T-provider-custom-user-agent] models-list UA override.
+            .applyUserAgentOverride(customUserAgent)
+            .build()
+
+        // [fix/audit0917-b8] Call cancellation is now wired into the request:
+        // `execute()` is blocking and has no cancellation hook, so a cancelled
+        // fetchModels (user leaves the screen / switches provider) used to run
+        // to completion — including `cache.save` — and hold an OkHttp thread.
+        // The completion hook cancels the Call, which makes `execute()` throw
+        // immediately; the catch below asks the coroutine whether *it* is still
+        // alive and only falls back if it is.
+        //
+        // [FIX-1 / F-209] This was the ORIGINAL of that idiom and the only
+        // place it lived; four sibling fetchers kept the bare execute(). The
+        // hook now lives in provider/CallCancellation.kt and every fetcher —
+        // including this one — calls it, so there is one implementation instead
+        // of five copies of which one was correct.
+        val call = client.newCall(request)
+        val response = try {
+            call.executeOrCancel()
+        } catch (e: CancellationException) {
+            // The caller must unwind, not fall back.
+            throw e
+        } catch (_: Throwable) {
+            return@withContext fallback
+        }
+        // [fix/audit-s4m1] try/finally guarantees close across every early
+        // return@withContext below (body-null, !isSuccessful, empty data,
+        // parse throw). Previously a successful models-list fetch leaked a
+        // Response + connection handle.
+        try {
+            val body = response.body?.string() ?: return@withContext fallback
+
+            if (!response.isSuccessful) {
+                if (context != null && (response.code == 401 || response.code == 403)) {
+                    cache.invalidate(context, cacheKey)
+                }
+                return@withContext fallback
+            }
+
+            val models = try {
+                val json = JSONObject(body)
+                val data = json.optJSONArray("data") ?: return@withContext fallback
+                val parsed = mutableListOf<LLMModel>()
+                for (i in 0 until data.length()) {
+
+=== [3b] GeminiModelsApi.kt 60,110 ===
+        baseUrl: String? = null,
+        cloudCodeFallback: Boolean = false,
+        context: Context? = null,
+        forceRefresh: Boolean = false,
+        // [FIX-1 / F-196] True when this instance authenticates with OAuth. The
+        // documented 403 fallback belongs to exactly that case (a Cloud Code
+        // Assist token without the generative-language scope); an API-key 403
+        // means the key was rejected, and answering it with the static catalog
+        // hides that from the user.
+        oauthCredential: Boolean = false,
+    ): List<LLMModel> = withContext(Dispatchers.IO) {
+        if (cloudCodeFallback) return@withContext LLMModel.allGemini
+
+        val base = normalizeBase(baseUrl)
+        val cacheKey = "key|$base|" + apiKey
+        if (context != null && !forceRefresh) {
+            cache.load(context, cacheKey)?.let { return@withContext it }
+        }
+
+        val builder = Request.Builder()
+        builder.url("$base/models?key=$apiKey")
+
+        // [T-android-default-ua] brand outbound /v1beta/models request.
+        builder.applyUserAgentOverride(null)
+        // [audit-0917] execute() moved INSIDE the try. It was outside, so an
+        // IOException (offline, DNS failure, TLS reset — the common case for a
+        // model-list refresh) propagated out of fetchModels instead of
+        // returning the built-in fallback the way every HTTP error path does.
+        val response = try {
+            // [FIX-1 / F-209] Cancellable execute — see provider/CallCancellation.kt.
+            client.newCall(builder.build()).executeOrCancel()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // A cancelled fetch must unwind, not masquerade as a network error
+            // and hand back the builtin list.
+            throw e
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "models fetch failed, using builtin list: ${e.message}")
+            return@withContext LLMModel.allGemini
+        }
+        try {
+            val body = response.body?.string() ?: return@withContext LLMModel.allGemini
+
+            if (!response.isSuccessful) {
+                // [FIX-1 / F-196] 401/403 is an AUTH answer, not "this endpoint
+                // does not do model lists". Returning the builtin catalog for it
+                // made a revoked key, a WAF block or a regional denial look like
+                // a successful refresh whose result happened to be the static
+                // list — the user got no signal and the UI reported success. The
+                // 403 fallback exists for one specific case: an OAuth token that
+                // carries no generative-language scope (Cloud Code Assist), where
+                // the builtin list is genuinely the best answer. Restrict it to
+
+=== [3c] OpenRouterModelsApi.kt 25,95 ===
+     * input/output modalities) — we parse it here instead of waiting for
+     * `ModelsDevApi.enrichModels` to match, matching iOS `OpenRouterModelsAPI`.
+     *
+     * @param context When provided, results are cached for 7 days at
+     *   `cacheDir/models-cache/openrouter/<sha256(apiKey)>.json`. Pass null to
+     *   bypass the cache entirely (matches existing callers).
+     * @param forceRefresh Skip the cache read but still write-through on success.
+     */
+    suspend fun fetchModels(
+        apiKey: String,
+        context: Context? = null,
+        forceRefresh: Boolean = false,
+    ): List<LLMModel> = withContext(Dispatchers.IO) {
+        val cacheKey = apiKey
+        if (context != null && !forceRefresh) {
+            cache.load(context, cacheKey)?.let { return@withContext it }
+        }
+
+        val request = Request.Builder()
+            .url("https://openrouter.ai/api/v1/models")
+            .header("Authorization", "Bearer $apiKey")
+            .header("HTTP-Referer", "https://github.com/OpenMinis/OpenMinis")
+            .header("X-Title", "Minis App")
+            // [T-android-default-ua] brand outbound /api/v1/models request.
+            .applyUserAgentOverride(null)
+            .build()
+
+        // [FIX-1 / F-209] Cancellable execute — see provider/CallCancellation.kt.
+        val response = client.newCall(request).executeOrCancel()
+        try {
+            val body = response.body?.string() ?: return@withContext emptyList()
+
+            if (!response.isSuccessful) {
+                if (context != null && (response.code == 401 || response.code == 403)) {
+                    cache.invalidate(context, cacheKey)
+                }
+                return@withContext emptyList()
+            }
+
+            val models = try {
+                val json = JSONObject(body)
+                val data = json.optJSONArray("data") ?: return@withContext emptyList()
+                parseModels(data)
+            } catch (_: Exception) {
+                return@withContext emptyList()
+            }
+
+            val enriched = ModelsDevApi.enrichModels(models)
+            if (context != null) cache.save(context, cacheKey, enriched)
+            enriched
+        } finally {
+            response.close()
+        }
+    }
+
+    private fun parseModels(data: JSONArray): List<LLMModel> {
+        val models = mutableListOf<LLMModel>()
+        for (i in 0 until data.length()) {
+            val obj = data.getJSONObject(i)
+            val id = obj.optString("id")
+            if (id.isEmpty()) continue
+            val name = obj.optString("name", id)
+
+            // OpenRouter exposes `architecture.input_modalities` / `output_modalities`
+            // as arrays of short strings (e.g. "text", "image", "audio"). Fall back
+            // to `[text, text]` when absent — most text-only models omit these.
+            val arch = obj.optJSONObject("architecture")
+            // OpenRouter returns modalities as `image_input` / `text_output` with suffixes;
+            // the rest of the codebase (models.dev, capability fragments,
+            // ModelEntryDetailScreen toggles) uses the bare form. Normalize at the parse
+            // boundary so persisted overrides round-trip correctly through the toggles.
+=== [3d] AnthropicModelsApi.kt 70,110 ===
+            // ProviderConfig.effectiveBaseURL (appendV1Suffix honored). Trust it as-is
+            // and only append /models — never force /v1, or the "append /v1" toggle is
+            // overridden and services without /v1 return 404. idx > 0 are climbed parent
+            // paths used purely for host-root discovery (e.g. deepseek.com/anthropic ->
+            // host root /v1/models); those keep the /v1 auto-append.
+            val url = buildURL(candidate, forceV1Discovery = idx > 0)
+            val requestBuilder = Request.Builder()
+                .url(url)
+                .header("anthropic-version", "2023-06-01")
+                // [T-provider-custom-user-agent] models-list UA override.
+                .applyUserAgentOverride(customUserAgent)
+
+            if (candidate != null) {
+                // Custom endpoint: Bearer auth
+                requestBuilder.header("Authorization", "Bearer $apiKey")
+            } else {
+                // Standard Anthropic API key
+                requestBuilder.header("x-api-key", apiKey)
+            }
+
+            val request = requestBuilder.build()
+            android.util.Log.d("AnthropicModels", "Fetching models (level=$idx): ${request.url.scheme}://${request.url.host}${request.url.encodedPath} headerKeys=${request.headers.names()} authPresent=${request.headers["Authorization"] != null}")
+
+            val response: Response = try {
+                // [FIX-1 / F-209] Cancellable execute — see provider/CallCancellation.kt.
+                // Matters most here: this is a per-level fallback loop, so an
+                // uncancellable fetch stacked its cost once per candidate base.
+                client.newCall(request).executeOrCancel()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                android.util.Log.e("AnthropicModels", "Fetch error (level=$idx): ${e.message}")
+                continue
+            }
+            // [fix/audit-s4m1] close on every path — this loop `continue`s on
+            // failures and returns on success, and each level previously leaked
+            // a Response; the leak amplified across fallback levels.
+            try {
+                val body = response.body?.string() ?: run {
+                    android.util.Log.w("AnthropicModels", "Empty response body (level=$idx)")
+                    ""

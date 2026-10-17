@@ -57,6 +57,9 @@ object GeminiModelsApi {
         // [fix/audit-b22 / T5-L6] The Anthropic and OpenAI adapters pass
         // instance.effectiveBaseURL here; Gemini hardcoded the public endpoint,
         // so a relay/proxy base URL silently listed the wrong catalog.
+        // [fix/audit-b22 / T5-L6] Mirror GeminiProvider's base handling: the base
+        // carries the API version (`.../v1beta`), but users often paste either
+        // form into the provider settings, so tolerate both.
         baseUrl: String? = null,
         cloudCodeFallback: Boolean = false,
         context: Context? = null,
@@ -67,6 +70,9 @@ object GeminiModelsApi {
         // means the key was rejected, and answering it with the static catalog
         // hides that from the user.
         oauthCredential: Boolean = false,
+        // [T-provider-custom-user-agent] models-list UA override (da1020
+        // ISSUE-05: Gemini/OpenRouter were the only fetchers not accepting it).
+        customUserAgent: String? = null,
     ): List<LLMModel> = withContext(Dispatchers.IO) {
         if (cloudCodeFallback) return@withContext LLMModel.allGemini
 
@@ -79,8 +85,9 @@ object GeminiModelsApi {
         val builder = Request.Builder()
         builder.url("$base/models?key=$apiKey")
 
-        // [T-android-default-ua] brand outbound /v1beta/models request.
-        builder.applyUserAgentOverride(null)
+        // [T-provider-custom-user-agent] models-list UA override; falls back to
+        // the branded default when the instance has no custom UA.
+        builder.applyUserAgentOverride(customUserAgent)
         // [audit-0917] execute() moved INSIDE the try. It was outside, so an
         // IOException (offline, DNS failure, TLS reset — the common case for a
         // model-list refresh) propagated out of fetchModels instead of

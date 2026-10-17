@@ -1,0 +1,153 @@
+=== VoiceProviderFactory.kt ===
+     1	package com.rikkaminis.app.provider.voice
+     2	
+     3	import android.util.Log
+     4	import com.rikkaminis.app.data.KeyRoulette
+     5	import com.rikkaminis.app.data.model.ProviderInstance
+     6	import com.rikkaminis.app.data.model.ProviderType
+     7	
+     8	/**
+     9	 * [T-android-provider-voice] Maps a configured ProviderInstance to a concrete
+    10	 * VoiceProvider — Android port of iOS VoiceProviderFactory.swift.
+    11	 *
+    12	 * Minis has no dedicated "voice provider type": vendors riding on an
+    13	 * OpenAI/Anthropic-compatible instance (Groq, MiniMax, Doubao, Xunfei, Alibaba,
+    14	 * MiMo …) are detected from the instance's custom base URL. Returns null when
+    15	 * the instance cannot serve voice.
+    16	 *
+    17	 * Doubao / iFlytek need more than one credential. Rather than extend the
+    18	 * credential store, the user enters them as a ";"-joined compound string in the
+    19	 * single API-key field ("appId;apiKey;apiSecret" for iFlytek); [splitCompound]
+    20	 * unpacks it. The caller supplies the API key (loaded from the repository's
+    21	 * encrypted store) so the factory stays free of storage dependencies.
+    22	 */
+    23	object VoiceProviderFactory {
+    24	
+    25	    private const val TAG = "VoiceFactory"
+    26	
+    27	    fun make(instance: ProviderInstance, rawApiKey: String?): VoiceProvider? {
+    28	        // [T-provider-key-roulette] Rotate at the voice choke point too, so no
+    29	        // vendor ever receives the raw multi-key string. A single key comes
+    30	        // back cleaned and verbatim, and Xunfei's "appId;apiKey;apiSecret"
+    31	        // compound is unaffected: rotation only splits on whitespace/commas,
+    32	        // so a user holding several compound credentials separates them with
+    33	        // a comma and gets one complete compound per request.
+    34	        val apiKey = rawApiKey?.let { KeyRoulette.next(it, instance.id) }
+    35	        val custom = instance.customBaseURL
+    36	        val normalizedBase = (custom ?: "").lowercase()
+    37	
+    38	        return when (instance.providerType) {
+    39	            // OpenAI-compatible families -------------------------------------
+    40	            ProviderType.openAI, ProviderType.openRouter -> {
+    41	                if (instance.providerType == ProviderType.openRouter) {
+    42	                    // Some voice models flow through the OpenAI-compatible path.
+    43	                    return VoiceProvider(instance.id, custom ?: "https://openrouter.ai/api", apiKey)
+    44	                }
+    45	                when {
+    46	                    normalizedBase.contains("groq.com") ->
+    47	                        GroqVoiceProvider(instance.id, custom ?: "https://api.groq.com/openai", apiKey)
+    48	                    normalizedBase.contains("dashscope") ->
+    49	                        AlibabaVoiceProvider(instance.id, custom ?: "https://dashscope.aliyuncs.com/compatible-mode", apiKey)
+    50	                    normalizedBase.contains("minimax") ->
+    51	                        MiniMaxVoiceProvider(instance.id, custom ?: "https://api.minimax.io", apiKey)
+    52	                    // Doubao / Volcano v3: single API Key (new console).
+    53	                    normalizedBase.contains("openspeech.bytedance") || normalizedBase.contains("volcano") -> {
+    54	                        Log.i(TAG, "Doubao voice provider: base=$normalizedBase keyLen=${apiKey?.length ?: -1}")
+    55	                        // [fix/audit-0917-b9] Pass the user's base through:
+    56	                        // reaching this branch REQUIRES a customBaseURL that
+    57	                        // contains the vendor token, and Volcano exposes
+    58	                        // per-region hosts — dropping it silently pinned
+    59	                        // every user to the global openspeech.bytedance.com.
+    60	                        DoubaoVoiceProvider(
+    61	                            instance.id,
+    62	                            custom ?: "https://openspeech.bytedance.com",
+    63	                            apiKey,
+    64	                        )
+    65	                    }
+    66	                    // iFlytek / Xunfei: the API-key field carries "appId;apiKey;apiSecret".
+    67	                    normalizedBase.contains("xfyun") -> {
+    68	                        val p = splitCompound(apiKey)
+    69	                        if (p.size >= 3) XunfeiVoiceProvider(instance.id, p[0], p[1], p[2]) else {
+    70	                            // [fix/audit-0917-b9] Was a bare null: the user saw
+    71	                            // "voice input unavailable" with nothing anywhere
+    72	                            // explaining that the compound key was malformed.
+    73	                            Log.w(TAG, "Xunfei voice provider: key field split into ${p.size} part(s), need appId;apiKey;apiSecret")
+    74	                            null
+    75	                        }
+    76	                    }
+    77	                    normalizedBase.contains("xiaomimimo") ->
+    78	                        MimoVoiceProvider(instance.id, custom ?: "https://api.xiaomimimo.com", apiKey)
+    79	                    normalizedBase.contains("elevenlabs") ->
+    80	                        ElevenLabsVoiceProvider(instance.id, custom ?: "https://api.elevenlabs.io", apiKey)
+    81	                    normalizedBase.contains("tts.speech.microsoft.com") -> {
+    82	                        // Strip /cognitiveservices if the user included it — the
+    83	                        // provider appends it in the endpoint path.
+    84	                        var azureBase = custom ?: "https://eastasia.tts.speech.microsoft.com"
+    85	                        if (azureBase.endsWith("/cognitiveservices")) {
+    86	                            azureBase = azureBase.removeSuffix("/cognitiveservices")
+    87	                        }
+    88	                        AzureTTSVoiceProvider(instance.id, azureBase, apiKey)
+    89	                    }
+    90	                    normalizedBase.contains("deepgram") ->
+    91	                        DeepgramVoiceProvider(instance.id, custom ?: "https://api.deepgram.com", apiKey)
+    92	                    else ->
+    93	                        VoiceProvider(instance.id, custom ?: "https://api.openai.com", apiKey)
+    94	                }
+    95	            }
+    96	
+    97	            // xAI Grok ---------------------------------------------------------
+    98	            ProviderType.xAI ->
+    99	                XAIVoiceProvider(instance.id, custom ?: "https://api.x.ai", apiKey)
+   100	
+   101	            // Anthropic — only MiniMax-behind-Anthropic-base serves voice ------
+   102	            ProviderType.anthropic ->
+   103	                if (normalizedBase.contains("minimax")) {
+   104	                    MiniMaxVoiceProvider(instance.id, custom ?: "https://api.minimax.io", apiKey)
+   105	                } else {
+   106	                    null
+   107	                }
+   108	
+   109	            // Native Gemini TTS (generateContent + AUDIO modality, ?key= auth).
+   110	            ProviderType.gemini ->
+   111	                GeminiVoiceProvider(
+   112	                    instance.id,
+   113	                    custom ?: "https://generativelanguage.googleapis.com/v1beta",
+   114	                    apiKey,
+   115	                )
+   116	
+   117	            // [T-kimi-oauth] Kimi Coding Plan serves no voice models.
+   118	            ProviderType.kimiCode -> null
+   119	        }
+   120	    }
+   121	
+   122	    /**
+   123	     * True when [make] would return a provider for [instance] with [apiKey] —
+   124	     * the shadow-voice candidate gate. Pass the real stored key: Xunfei's
+   125	     * compound-credential check ("appId;apiKey;apiSecret") depends on it.
+   126	     *
+   127	     * [T-provider-key-roulette] Classifies against the first *cleaned*
+   128	     * candidate and deliberately does NOT consume a rotation draw: this gate
+   129	     * runs while merely listing voice options, and browsing the UI must not
+   130	     * re-order which key the next real request picks. Passing a single-token
+   131	     * value into [make] keeps its own rotation a no-op.
+   132	     */
+   133	    fun supports(instance: ProviderInstance, apiKey: String?): Boolean =
+   134	        make(instance, apiKey?.let { KeyRoulette.candidates(it).firstOrNull() ?: it }) != null
+   135	
+   136	    /**
+   137	     * Split a compound credential ("appId;key" / "appId;key;secret") stored as
+   138	     * one string. Tolerates whitespace; drops empty segments.
+   139	     */
+   140	    fun splitCompound(value: String?): List<String> {
+   141	        if (value.isNullOrEmpty()) return emptyList()
+   142	        return value.split(';').map { it.trim() }.filter { it.isNotEmpty() }
+   143	    }
+   144	}
+
+=== override executeRequest/transcribeChatBased 全 provider/voice ===
+src/android/app/src/main/java/com/rikkaminis/app/provider/voice/VoiceProvider.kt:92:            return transcribeChatBased(request)
+src/android/app/src/main/java/com/rikkaminis/app/provider/voice/VoiceProvider.kt:257:    open suspend fun transcribeChatBased(request: VoiceInputRequest): VoiceInputResponse {
+src/android/app/src/main/java/com/rikkaminis/app/provider/voice/VoiceProviderVendors.kt:224:    override fun parseVoiceInputResponse(data: ByteArray, request: VoiceInputRequest): VoiceInputResponse {
+src/android/app/src/main/java/com/rikkaminis/app/provider/voice/VoiceProviderVendors.kt:313:    override fun parseVoiceInputResponse(data: ByteArray, request: VoiceInputRequest): VoiceInputResponse {
+src/android/app/src/main/java/com/rikkaminis/app/provider/voice/VoiceProviderVendors.kt:641:    override fun parseVoiceInputResponse(data: ByteArray, request: VoiceInputRequest): VoiceInputResponse {
+src/android/app/src/main/java/com/rikkaminis/app/provider/voice/VoiceProviderVendors.kt:703:    override suspend fun transcribe(request: VoiceInputRequest): VoiceInputResponse {

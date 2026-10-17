@@ -67,6 +67,9 @@ private object GeminiModelListAdapter : ModelListProvider {
             // [FIX-1 / F-196] The 403→builtin fallback is an OAuth-only case.
             oauthCredential = instance.credentialType ==
                 com.rikkaminis.app.data.model.ProviderCredential.oauth,
+            // [T-provider-custom-user-agent] models-list UA override
+            // (da1020 ISSUE-05: was the only adapter family not passing it).
+            customUserAgent = instance.customUserAgent,
         )
     }
 }
@@ -110,6 +113,9 @@ private object OpenRouterModelListAdapter : ModelListProvider {
             apiKey,
             context = context,
             forceRefresh = forceRefresh,
+            // [T-provider-custom-user-agent] models-list UA override
+            // (da1020 ISSUE-05: was the only adapter family not passing it).
+            customUserAgent = instance.customUserAgent,
         )
     }
 }

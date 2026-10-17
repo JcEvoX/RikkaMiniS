@@ -1,0 +1,97 @@
+=== [1] VoiceProvider.kt 215-245 ===
+            }
+        }
+        return base + p
+    }
+
+    suspend fun executeRequest(request: Request): ByteArray = withContext(Dispatchers.IO) {
+        httpClient.newCall(request).execute().use { response ->
+            val body = response.body?.bytes()
+            if (!response.isSuccessful) {
+                if (response.code == 401 || response.code == 403) {
+                    Log.e(TAG, "Voice auth failed: HTTP ${response.code}")
+                    throw VoiceProviderException.Auth()
+                }
+                Log.e(TAG, "Voice request failed: HTTP ${response.code}")
+                throw VoiceProviderException.Http(response.code, body)
+            }
+            body ?: ByteArray(0)
+        }
+    }
+
+    // -- Chat-based ASR (audio+text multimodal chat models) -------------------
+
+    /**
+     * Whether this model transcribes via chat completions instead of the
+     * Whisper-style transcriptions endpoint. DEFAULT IS THE TRANSCRIPTIONS
+     * ENDPOINT — audio-capable CHAT models are a small enumerable family
+     * (gpt*audio*, qwen*audio*, *omni*); dedicated ASR models are an open set
+     * and must be the fallback. Model NAME is the signal — modality bits can't
+     * distinguish a hand-annotated Whisper from a true audio chat model.
+     */
+    open fun usesChatBasedASR(model: com.rikkaminis.app.data.model.LLMModel): Boolean {
+
+=== [1b] VoiceProvider.kt 250,330 ===
+    }
+
+    /**
+     * Transcribe audio via chat completions. The system prompt forces the model
+     * to output ONLY the verbatim transcription so it behaves like a dedicated
+     * ASR engine.
+     */
+    open suspend fun transcribeChatBased(request: VoiceInputRequest): VoiceInputResponse {
+        val url = composedUrlString("/v1/chat/completions")
+        val audioBase64 = Base64.encodeToString(request.audioData, Base64.NO_WRAP)
+        val langHint = iso6391(request.language) ?: "auto"
+
+        val body = JSONObject().apply {
+            put("model", request.model ?: "gpt-4o-mini-audio-preview")
+            put(
+                "messages",
+                JSONArray()
+                    .put(
+                        JSONObject()
+                            .put("role", "system")
+                            .put(
+                                "content",
+                                "You are a speech-to-text transcription engine. Output ONLY the exact verbatim transcription of the audio. No commentary, no punctuation corrections, no translations, no markdown, no extra text. If the audio is empty or unintelligible, output an empty string. Language hint: $langHint.",
+                            ),
+                    )
+                    .put(
+                        JSONObject()
+                            .put("role", "user")
+                            .put(
+                                "content",
+                                JSONArray().put(
+                                    JSONObject()
+                                        .put("type", "input_audio")
+                                        .put(
+                                            "input_audio",
+                                            JSONObject()
+                                                .put("data", audioBase64)
+                                                .put("format", "wav"),
+                                        ),
+                                ),
+                            ),
+                    ),
+            )
+            put("max_tokens", 4096)
+            put("temperature", 0)
+        }
+        val builder = Request.Builder()
+            .url(url)
+            .post(body.toString().toRequestBody("application/json".toMediaType()))
+        applyVoiceAuth(builder)
+
+        val data = executeRequest(builder.build())
+        val obj = runCatching { JSONObject(String(data, Charsets.UTF_8)) }.getOrNull()
+            ?: throw VoiceProviderException.Parse("Undecodable chat ASR response")
+        val text = obj.optJSONArray("choices")
+            ?.optJSONObject(0)
+            ?.optJSONObject("message")
+            ?.optString("content")
+            ?.trim()
+            ?: ""
+        return VoiceInputResponse(text = text)
+    }
+}

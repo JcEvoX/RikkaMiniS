@@ -1,0 +1,109 @@
+=== [2] executeOrCancel 使用点 + 定义 ===
+src/android/app/src/main/java/com/rikkaminis/app/provider/CallCancellation.kt:35: *     client.newCall(request).executeOrCancel()
+src/android/app/src/main/java/com/rikkaminis/app/provider/CallCancellation.kt:43:internal suspend fun Call.executeOrCancel(): Response {
+src/android/app/src/main/java/com/rikkaminis/app/provider/anthropic/AnthropicModelsApi.kt:3:import com.rikkaminis.app.provider.executeOrCancel
+src/android/app/src/main/java/com/rikkaminis/app/provider/anthropic/AnthropicModelsApi.kt:97:                client.newCall(request).executeOrCancel()
+src/android/app/src/main/java/com/rikkaminis/app/provider/gemini/GeminiModelsApi.kt:3:import com.rikkaminis.app.provider.executeOrCancel
+src/android/app/src/main/java/com/rikkaminis/app/provider/gemini/GeminiModelsApi.kt:90:            client.newCall(builder.build()).executeOrCancel()
+src/android/app/src/main/java/com/rikkaminis/app/provider/openai/OpenAIModelsApi.kt:10:import com.rikkaminis.app.provider.executeOrCancel
+src/android/app/src/main/java/com/rikkaminis/app/provider/openai/OpenAIModelsApi.kt:80:            call.executeOrCancel()
+src/android/app/src/main/java/com/rikkaminis/app/provider/openrouter/OpenRouterModelsApi.kt:3:import com.rikkaminis.app.provider.executeOrCancel
+src/android/app/src/main/java/com/rikkaminis/app/provider/openrouter/OpenRouterModelsApi.kt:53:        val response = client.newCall(request).executeOrCancel()
+
+=== [2b] CallCancellation.kt 全文 ===
+package com.rikkaminis.app.provider
+
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.job
+import kotlinx.coroutines.ensureActive
+import okhttp3.Call
+import okhttp3.Response
+
+/**
+ * [FIX-1 / F-209] Blocking `Call.execute()` with a coroutine-cancellation hook.
+ *
+ * `execute()` is synchronous and has no cancellation hook, so a `fetchModels`
+ * whose coroutine is cancelled (user leaves the screen, switches provider,
+ * refreshes in a loop) used to run to completion — including `cache.save` —
+ * while holding an OkHttp dispatcher thread.
+ *
+ * `fix/audit0917-b8` added the hook to `OpenAIModelsApi` only, while the other
+ * five model-list fetchers kept the bare `execute()`. Rather than copy the
+ * five-line idiom four more times (and leave a sixth site free to be added
+ * without it), the logic lives here once.
+ *
+ * Cancellation semantics are preserved deliberately:
+ *  - OkHttp reports a cancelled Call as `IOException("Canceled")`, NOT as
+ *    `CancellationException`, so callers that catch broad `Exception` would
+ *    otherwise swallow a cancellation and return a fallback list. That would
+ *    leave the caller running after it was told to stop — so this function
+ *    rethrows the cancellation as a real `CancellationException` when *our*
+ *    job is the one that died, and lets an ordinary IO failure through
+ *    untouched when it is not.
+ *
+ * Usage:
+ * ```
+ * val response = try {
+ *     client.newCall(request).executeOrCancel()
+ * } catch (e: CancellationException) {
+ *     throw e              // never fall back on a cancellation
+ * } catch (e: Exception) {
+ *     return fallback
+ * }
+ * ```
+ */
+internal suspend fun Call.executeOrCancel(): Response {
+    currentCoroutineContext().job.invokeOnCompletion { cause ->
+        if (cause is CancellationException) cancel()
+    }
+    return try {
+        execute()
+    } catch (e: Throwable) {
+        // Translate "the Call was cancelled because our job died" back into a
+        // cancellation. `ensureActive()` throws CancellationException when the
+        // current job is no longer active, and returns normally otherwise —
+        // so a genuine network failure still surfaces as itself.
+        currentCoroutineContext().ensureActive()
+        throw e
+    }
+}
+
+=== [2c] parseVoiceInputResponse 空守卫 (160,195) ===
+            .url(url)
+            .post(body.toString().toRequestBody("application/json".toMediaType()))
+        applyVoiceAuth(builder)
+        return builder.build()
+    }
+
+    /** Parse the ASR response. Default: OpenAI JSON, falling back to plain text. */
+    open fun parseVoiceInputResponse(data: ByteArray, request: VoiceInputRequest): VoiceInputResponse {
+        val text = String(data, Charsets.UTF_8)
+        val obj = runCatching { JSONObject(text) }.getOrNull()
+        if (obj != null && obj.has("text")) {
+            // [audit-0917 F-203] The empty-transcript guard the three vendor
+            // parsers carry (Xunfei/Doubao/Deepgram, 442e6d0) was missing here —
+            // the base class every OpenAI-compatible endpoint falls back to.
+            // `optString` yields "" for a missing or empty key, so the old
+            // `has("text")` gate returned text="" and the consumer
+            // (ProviderSpeechRecognitionEngine) mapped a malformed response to
+            // NO_MATCH ("heard nothing") instead of surfacing a protocol error.
+            // NOTE: the raw-text fallback below is deliberately left as-is — a
+            // non-JSON body is a different, already-handled shape.
+            val transcript = obj.optString("text").takeIf { it.isNotEmpty() }
+                ?: throw VoiceProviderException.Parse("Empty ASR transcript in JSON response")
+            return VoiceInputResponse(
+                text = transcript,
+                language = obj.optString("language").takeIf { it.isNotBlank() },
+                durationSeconds = if (obj.has("duration")) obj.optDouble("duration") else null,
+            )
+        }
+        // Some compatible endpoints return raw text.
+        if (text.isNotEmpty()) return VoiceInputResponse(text = text)
+        throw VoiceProviderException.Parse("Empty or undecodable ASR response")
+    }
+
+    /** Inject auth header. Default: Bearer token. */
+    open fun applyVoiceAuth(builder: Request.Builder) {
+        val key = apiKey?.takeIf { it.isNotEmpty() } ?: return
+        builder.header("Authorization", "Bearer $key")

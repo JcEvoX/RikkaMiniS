@@ -1,0 +1,71 @@
+=== [4] speech engine empty/exception handling ===
+12:import com.rikkaminis.app.provider.voice.VoiceProviderException
+58:    override val supportedLocales: List<Locale> = emptyList()
+108:        if (repo == null || candidates.isEmpty()) {
+110:                RecognitionError.OEM_NO_SERVICE,
+117:            listener.onError(RecognitionError.RECOGNIZER_BUSY, "A capture is already in flight.")
+128:                listener.onError(RecognitionError.AUDIO_ERROR, "AudioRecord unsupported buffer size.")
+141:                listener.onError(RecognitionError.AUDIO_ERROR, "AudioRecord init failed: ${e.message}")
+147:                listener.onError(RecognitionError.AUDIO_ERROR, "AudioRecord not initialized.")
+170:                listener.onError(RecognitionError.AUDIO_ERROR, e.message)
+190:            if (audio.isEmpty()) {
+191:                listener.onError(RecognitionError.NO_MATCH, "No audio captured.")
+238:                        if (text.isEmpty()) {
+242:                            listener.onError(RecognitionError.NO_MATCH, "Empty transcription.")
+262:                            RecognitionError.UNKNOWN,
+269:                        e is VoiceProviderException.Auth -> RecognitionError.PERMISSION_DENIED
+270:                        e is java.io.IOException -> RecognitionError.NETWORK
+271:                        else -> RecognitionError.UNKNOWN
+
+--- context around 250-300 ---
+                        Log.e(TAG, "transcribe failed on ${entry.model.displayName}: ${e.message} — trying next candidate")
+                        lastError = e
+                    }
+                }
+                if (!cancelled.get()) {
+                    val e = lastError
+                    // [fix/audit0917-b8] All-skipped is a configuration problem,
+                    // not a provider failure — report it as such instead of
+                    // letting it fall through to "All voice-input candidates
+                    // failed" with kind=UNKNOWN.
+                    if (e == null && skipped > 0) {
+                        listener.onError(
+                            RecognitionError.UNKNOWN,
+                            "No usable voice-input provider: all $skipped candidate(s) were skipped " +
+                                "(missing provider implementation or API key).",
+                        )
+                        return@launch
+                    }
+                    val kind = when {
+                        e is VoiceProviderException.Auth -> RecognitionError.PERMISSION_DENIED
+                        e is java.io.IOException -> RecognitionError.NETWORK
+                        else -> RecognitionError.UNKNOWN
+                    }
+                    listener.onError(kind, e?.message ?: "All voice-input candidates failed.")
+                }
+            }
+        }
+    }
+
+    override fun stop() {
+        // Flip the capture loop off; the capture coroutine then hands the take
+        // to the transcription step, which delivers onFinal/onError.
+        // [sweep1014-B20a] Unconditional: only one capture can be in flight
+        // (the busy guard in start), so stop() is terminal for it. External
+        // semantics unchanged (immediate stop).
+        captureGuard.forceRelease()
+    }
+
+    override fun cancel() {
+        cancelled.set(true)
+        captureGuard.forceRelease()
+        // captureJob is intentionally NOT cancelled — the capture loop exits
+        // via the capture guard because AudioRecord.read() is a blocking call
+        // that doesn't respond to job cancellation. Only drop the stale handle.
+        transcribeJob?.cancel()
+        transcribeJob = null
+        captureJob = null
+    }
+
+    /**
+     * [T-android-asr-provider-shutdown] Release the engine's process-scoped

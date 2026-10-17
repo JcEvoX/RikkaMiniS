@@ -1,0 +1,239 @@
+=== [6] UserAgentOverride.kt ===
+package com.rikkaminis.app.provider
+
+import com.rikkaminis.app.BuildConfig
+import okhttp3.Request
+
+/**
+ * [T-provider-custom-user-agent] Single chokepoint for the per-provider
+ * User-Agent override. Each provider/models-api request builder calls this
+ * right before `.build()`, so the "null/blank → fall back, non-blank →
+ * replace" rule lives in exactly one place.
+ *
+ * `.header(...)` replaces any value the builder set earlier (e.g. the Codex
+ * `codex_cli_rs/...` UA or the Anthropic OAuth `claude-cli/...` UA), so a
+ * non-blank override wins over the provider default.
+ *
+ * **Fallback policy (T-android-default-ua):** when `customUserAgent` is
+ * null/blank, we now apply [MinisUserAgent.DEFAULT] instead of leaving
+ * the builder UA-less (which lets OkHttp insert its own `okhttp/4.12.0`).
+ * The default carries the Minis version so request logs upstream can be
+ * traced back to the app build that issued them — matching the
+ * "branded UA except where a specific client identity is required"
+ * intent of the feature.
+ *
+ * Callers that issue requests under a SPECIFIC client identity (Codex
+ * OAuth's `codex_cli_rs/...`, Anthropic OAuth's `claude-cli/...`) MUST
+ * pass `defaultUserAgent = null` so this helper leaves their previously-
+ * set UA header alone. Everywhere else the default takes effect.
+ */
+fun Request.Builder.applyUserAgentOverride(
+    customUserAgent: String?,
+    defaultUserAgent: String? = MinisUserAgent.DEFAULT,
+): Request.Builder {
+    val ua = customUserAgent?.trim()
+    when {
+        !ua.isNullOrEmpty() -> header("User-Agent", ua)
+        defaultUserAgent != null -> header("User-Agent", defaultUserAgent)
+        // else: leave whatever UA the builder already had (preserves
+        // Codex / Claude CLI fingerprints on OAuth paths).
+    }
+    return this
+}
+
+/**
+ * [T-android-default-ua] Branded User-Agent used by every Minis-originated
+ * outbound request that doesn't have a SDK-specific UA requirement.
+ *
+ * Format mirrors iOS exactly:
+ *   `Minis/<version> (Android <release>; <model>)`
+ *
+ * e.g. `Minis/0.14-preview (Android 13; Pixel 4a)` — same shape as iOS's
+ * `Minis/1.10 (iOS 26.5; iPhone)`.
+ *
+ * Version comes from BuildConfig (auto-tracks every release). OS release
+ * from `Build.VERSION.RELEASE` (the marketing version a user recognises;
+ * the API-level SDK_INT is omitted for parity with iOS, which doesn't
+ * carry a sibling axis). Model is `Build.MODEL` — already broadcast by
+ * default OkHttp UAs, useful for device-specific diagnosis without
+ * de-anonymising the user further.
+ *
+ * Built lazily — only the first request constructs the string, so the
+ * `Build.*` reads (cheap but JNI-bound) don't cost startup time.
+ */
+object MinisUserAgent {
+    val DEFAULT: String by lazy {
+        val release = android.os.Build.VERSION.RELEASE ?: "unknown"
+        val model = (android.os.Build.MODEL ?: "unknown").trim().ifEmpty { "unknown" }
+        "Minis/${BuildConfig.VERSION_NAME} (Android $release; $model)"
+    }
+}
+
+=== [7] ModelListProviderAdapters.kt ===
+     1	package com.rikkaminis.app.provider
+     2	
+     3	import android.content.Context
+     4	
+     5	import com.rikkaminis.app.provider.KimiConstants
+     6	import com.rikkaminis.app.data.model.LLMModel
+     7	import com.rikkaminis.app.data.model.ProviderInstance
+     8	import com.rikkaminis.app.data.model.ProviderType
+     9	import com.rikkaminis.app.data.repository.ModelListProvider
+    10	import com.rikkaminis.app.data.repository.ModelListProviderRegistry
+    11	import com.rikkaminis.app.provider.anthropic.AnthropicModelsApi
+    12	import com.rikkaminis.app.provider.gemini.GeminiModelsApi
+    13	import com.rikkaminis.app.provider.openai.OpenAIModelsApi
+    14	import com.rikkaminis.app.provider.openrouter.OpenRouterModelsApi
+    15	import com.rikkaminis.app.provider.xai.XAIModelsApi
+    16	
+    17	/**
+    18	 * [T8-1] Provider-package adapters that implement [ModelListProvider],
+    19	 * breaking the data→provider reverse dependency. The data layer's
+    20	 * [ModelListProviderRegistry] only knows the interface; these adapters
+    21	 * (here, in the provider package) delegate to the concrete `*ModelsApi`
+    22	 * singletons.
+    23	 *
+    24	 * Each adapter mirrors exactly the dispatch the old `ProviderRepository`
+    25	 * `when (instance.providerType)` block performed, so behaviour is
+    26	 * unchanged.
+    27	 */
+    28	
+    29	private object AnthropicModelListAdapter : ModelListProvider {
+    30	    override suspend fun fetchModels(
+    31	        apiKey: String?,
+    32	        instance: ProviderInstance,
+    33	        thirdParty: Boolean,
+    34	        forceRefresh: Boolean,   // no cache — accepted for interface, ignored
+    35	        context: Context?,
+    36	    ): List<LLMModel> {
+    37	        if (apiKey == null) return emptyList()
+    38	        return AnthropicModelsApi.fetchModels(
+    39	            apiKey,
+    40	            instance.effectiveBaseURL,
+    41	            // [FIX-1 / F-208] Context was never forwarded, so
+    42	            // AnthropicModelsCache was unreachable from production.
+    43	            context = context,
+    44	            forceRefresh = forceRefresh,
+    45	            // [T-provider-custom-user-agent] models-list UA override.
+    46	            customUserAgent = instance.customUserAgent,
+    47	        )
+    48	    }
+    49	}
+    50	
+    51	private object GeminiModelListAdapter : ModelListProvider {
+    52	    override suspend fun fetchModels(
+    53	        apiKey: String?,
+    54	        instance: ProviderInstance,
+    55	        thirdParty: Boolean,
+    56	        forceRefresh: Boolean,   // no cache — accepted for interface, ignored
+    57	        context: Context?,
+    58	    ): List<LLMModel> {
+    59	        if (apiKey == null) return emptyList()
+    60	        // [fix/audit-b22 / T5-L6] Same as the Anthropic/OpenAI adapters above.
+    61	        // [FIX-1 / F-208] Context forwarded — see the Anthropic adapter note.
+    62	        return GeminiModelsApi.fetchModels(
+    63	            apiKey,
+    64	            instance.effectiveBaseURL,
+    65	            context = context,
+    66	            forceRefresh = forceRefresh,
+    67	            // [FIX-1 / F-196] The 403→builtin fallback is an OAuth-only case.
+    68	            oauthCredential = instance.credentialType ==
+    69	                com.rikkaminis.app.data.model.ProviderCredential.oauth,
+    70	        )
+    71	    }
+    72	}
+    73	
+    74	private object OpenAIModelListAdapter : ModelListProvider {
+    75	    override suspend fun fetchModels(
+    76	        apiKey: String?,
+    77	        instance: ProviderInstance,
+    78	        thirdParty: Boolean,
+    79	        forceRefresh: Boolean,
+    80	        context: Context?,
+    81	    ): List<LLMModel> {
+    82	        if (apiKey == null) return emptyList()
+    83	        val baseURL = instance.effectiveBaseURL
+    84	        return OpenAIModelsApi.fetchModels(
+    85	            apiKey,
+    86	            baseURL,
+    87	            // [FIX-1 / F-208] Without this the 7-day cache (and the
+    88	            // forceRefresh bypass it exists to serve) never ran at all.
+    89	            context = context,
+    90	            // [T-provider-custom-user-agent] models-list UA override.
+    91	            customUserAgent = instance.customUserAgent,
+    92	            // Bypass the 7-day ProviderModelsCache so a freshly-added custom
+    93	            // provider re-validates its URL+key against the live endpoint.
+    94	            forceRefresh = forceRefresh,
+    95	        )
+    96	    }
+    97	}
+    98	
+    99	private object OpenRouterModelListAdapter : ModelListProvider {
+   100	    override suspend fun fetchModels(
+   101	        apiKey: String?,
+   102	        instance: ProviderInstance,
+   103	        thirdParty: Boolean,
+   104	        forceRefresh: Boolean,   // no cache — accepted for interface, ignored
+   105	        context: Context?,
+   106	    ): List<LLMModel> {
+   107	        if (apiKey == null) return emptyList()
+   108	        // [FIX-1 / F-208] Context forwarded — see the Anthropic adapter note.
+   109	        return OpenRouterModelsApi.fetchModels(
+   110	            apiKey,
+   111	            context = context,
+   112	            forceRefresh = forceRefresh,
+   113	        )
+   114	    }
+   115	}
+   116	
+   117	private object XAIModelListAdapter : ModelListProvider {
+   118	    override suspend fun fetchModels(
+   119	        apiKey: String?,
+   120	        instance: ProviderInstance,
+   121	        thirdParty: Boolean,
+   122	        forceRefresh: Boolean,   // no cache — accepted for interface, ignored
+   123	        context: Context?,       // no cache — accepted for interface, ignored
+   124	    ): List<LLMModel> {
+   125	        // xAI: the model list is static (no /v1/models gating call needed —
+   126	        // XAIModelsApi exposes the spec-mandated set).
+   127	        return XAIModelsApi.fetchModels()
+   128	    }
+   129	}
+   130	
+   131	private object KimiModelListAdapter : ModelListProvider {
+   132	    override suspend fun fetchModels(
+   133	        apiKey: String?,
+   134	        instance: ProviderInstance,
+   135	        thirdParty: Boolean,
+   136	        forceRefresh: Boolean,
+   137	        context: Context?,
+   138	    ): List<LLMModel> {
+   139	        // [T-kimi-oauth] Kimi Code: the OAuth token CAN call the models
+   140	        // endpoint — real fetch from GET /coding/v1/models. The upstream
+   141	        // lineup shifts across generations, so the live list replaces the
+   142	        // minimal built-in fallback.
+   143	        if (apiKey == null) return emptyList()
+   144	        val baseURL = instance.effectiveBaseURL ?: "${KimiConstants.CODING_API_BASE}/v1"
+   145	        return OpenAIModelsApi.fetchModels(
+   146	            apiKey,
+   147	            baseURL,
+   148	            // [FIX-1 / F-208] Context forwarded — see the Anthropic adapter note.
+   149	            context = context,
+   150	            customUserAgent = instance.customUserAgent,
+   151	            forceRefresh = forceRefresh,
+   152	        )
+   153	    }
+   154	}
+   155	
+   156	/**
+   157	 * Register all built-in model-list providers. Called once at app
+   158	 * startup (see MinisApp / ProviderRepository init path).
+   159	 */
+   160	fun registerModelListProviders() {
+   161	    ModelListProviderRegistry.register(ProviderType.anthropic, AnthropicModelListAdapter)
+   162	    ModelListProviderRegistry.register(ProviderType.gemini, GeminiModelListAdapter)
+   163	    ModelListProviderRegistry.register(ProviderType.openAI, OpenAIModelListAdapter)
+   164	    ModelListProviderRegistry.register(ProviderType.openRouter, OpenRouterModelListAdapter)
+   165	    ModelListProviderRegistry.register(ProviderType.xAI, XAIModelListAdapter)
+   166	    ModelListProviderRegistry.register(ProviderType.kimiCode, KimiModelListAdapter)
+   167	}
