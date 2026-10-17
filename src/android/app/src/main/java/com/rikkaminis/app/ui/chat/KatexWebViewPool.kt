@@ -76,8 +76,16 @@ internal object KatexWebViewPool {
 
     @Volatile
     private var webView: WebView? = null
-    @Volatile
-    private var isReady = false
+
+    /**
+     * [da1019-ISSUE-07] Load coordination for the offscreen WebView. The
+     * ready flag and the waiters' deferred used to be two fields juggled
+     * separately, so `awaitReady()` could decide "not ready" and then create a
+     * deferred in the same instant `onPageFinished` was completing a
+     * (still-null) one. See [KatexReadyGate].
+     */
+    private val readyGate = KatexReadyGate()
+
     @Volatile
     private var pending: PendingRender? = null
     private var nextRenderToken = 0L
@@ -183,8 +191,11 @@ internal object KatexWebViewPool {
             webViewClient = object : SafeWebViewClient() {
                 override fun onPageFinished(view: WebView?, url: String?) {
                     super.onPageFinished(view, url)
-                    isReady = true
-                    readyDeferred?.complete(Unit)
+                    // [da1019-ISSUE-07] Flipping the ready flag and waking the
+                    // waiters is ONE atomic step inside the gate; splitting it
+                    // (as this used to) let a waiter register a deferred after
+                    // the flag was set but before it was visible here.
+                    readyGate.markPageFinished()
                 }
 
                 /**
@@ -204,11 +215,14 @@ internal object KatexWebViewPool {
                     // went on to evaluateJavascript on the dead WebView and
                     // burned the full 4s timeout. Exceptional completion lets
                     // awaitReady() see the real failure and return false.
-                    isReady = false
-                    readyDeferred?.completeExceptionally(
+                    // [da1019-ISSUE-07] Taking the waiter and clearing the slot
+                    // happen under the gate's lock, so a waiter that arrives
+                    // concurrently either gets failed here or sees `ready ==
+                    // false` and registers a fresh deferred — never a stranded
+                    // one.
+                    readyGate.markRendererGone(
                         IllegalStateException("renderer process was killed by the system"),
                     )
-                    readyDeferred = null
                     val current = pending
                     pending = null
                     current?.deferred?.complete(
@@ -277,30 +291,26 @@ internal object KatexWebViewPool {
         }
     }
 
-    @Volatile
-    private var readyDeferred: CompletableDeferred<Unit>? = null
-
     private suspend fun awaitReady(): Boolean {
-        if (isReady) return true
-        val d = readyDeferred ?: CompletableDeferred<Unit>().also { readyDeferred = it }
+        // [da1019-ISSUE-07] The "am I ready / give me the awaitable" pair runs
+        // under one lock inside the gate, so a callback landing in what used to
+        // be the gap between the two steps can no longer strand a freshly
+        // created deferred nobody would complete (that path burned the full
+        // RENDER_TIMEOUT_MS and dropped the first formula to the raw-LaTeX
+        // placeholder).
         // [sweep1014-P1b] onRendererGone completes the deferred exceptionally —
         // await() throws, which must surface as ok=false (caller falls back to
         // the placeholder and the next render rebuilds the WebView), never
         // propagate as a coroutine crash.
-        val ok = try {
-            withTimeoutOrNull(RENDER_TIMEOUT_MS) { d.await() } != null
-        } catch (e: CancellationException) {
-            // [rv1014-E6] The caller's coroutine was cancelled while awaiting —
-            // rethrow so structured concurrency still works; swallowing it made
-            // renderInternal's withLock block run its fallback path instead of
-            // unwinding.
-            throw e
-        } catch (e: Throwable) {
-            android.util.Log.w(TAG, "WebView died before ready: ${e.message}")
-            false
+        // [rv1014-E6] CancellationException of the CALLER is rethrown by the
+        // gate, so a cancelled coroutine still unwinds; swallowing it made
+        // renderInternal's withLock block run its fallback path instead.
+        val failure = readyGate.await(RENDER_TIMEOUT_MS)
+        if (failure is ReadyFailure.RendererGone) {
+            android.util.Log.w(TAG, "WebView died before ready: ${failure.cause.message}")
         }
-        if (!ok) android.util.Log.w(TAG, "WebView never reached ready state")
-        return ok
+        if (failure != null) android.util.Log.w(TAG, "WebView never reached ready state")
+        return failure == null
     }
 
     private inline fun runOnMain(crossinline block: () -> Unit) {
@@ -337,6 +347,94 @@ internal object KatexWebViewPool {
         @JavascriptInterface
         fun onRendered(width: Int, height: Int, error: String, token: Long) {
             onResult(width, height, error, token)
+        }
+    }
+}
+
+/**
+ * [da1019-ISSUE-07] How the pool's load coordination failed before this type
+ * existed: `awaitReady()` checked `isReady` and then — as a SEPARATE step —
+ * created/registered `readyDeferred`. Both fields were `@Volatile`, but the
+ * compound check-then-act was not atomic, so this interleaving was possible:
+ *
+ *  1. background renderer: `if (isReady) return true` observes false;
+ *  2. MAIN thread, `onPageFinished`: `isReady = true` +
+ *     `readyDeferred?.complete(Unit)` (null → no-op);
+ *  3. background renderer: `readyDeferred = CompletableDeferred()` — a fresh
+ *     deferred nobody will ever complete;
+ *  4. the waiting render then burned the full 4s render budget and fell back
+ *     to the raw-LaTeX placeholder for the first formula.
+ *
+ * The gate makes "flip the ready flag" and "grab the waiters' deferred" one
+ * atomic step (a single small lock), so only two orderings remain: a waiter
+ * that registers first is guaranteed a completer, and a waiter that arrives
+ * after the callback short-circuits on the flag.
+ *
+ * Pure Kotlin (no android.* dependency) so the interleavings are exercised by
+ * the JVM probe (`probe/jvm`) against the exact production source, not only
+ * on device.
+ */
+internal sealed interface ReadyFailure {
+    /** The page did not finish loading within the caller's budget. */
+    object Timeout : ReadyFailure
+
+    /** The renderer died (or the wait failed) — [cause] names the real reason. */
+    data class RendererGone(val cause: Throwable) : ReadyFailure
+}
+
+/**
+ * Ready/waiter coordination between a main-thread "page finished" callback and
+ * background waiters. All mutation of [ready]/[waiter] happens inside
+ * `synchronized(lock)`; `complete`/`completeExceptionally` are invoked OUTSIDE
+ * the lock (never resume a coroutine while holding a monitor).
+ */
+internal class KatexReadyGate {
+    @Volatile
+    private var ready = false
+    private var waiter: CompletableDeferred<Unit>? = null
+    private val lock = Any()
+
+    /** Main thread: the page finished loading — wake every current waiter. */
+    fun markPageFinished() {
+        val d = synchronized(lock) {
+            ready = true
+            waiter
+        }
+        d?.complete(Unit)
+    }
+
+    /**
+     * The renderer died: fail the waiter (if any) with [cause]; the pool slot
+     * is dropped by the caller so the next render rebuilds the WebView.
+     */
+    fun markRendererGone(cause: Throwable) {
+        val d = synchronized(lock) {
+            ready = false
+            waiter.also { waiter = null }
+        }
+        d?.completeExceptionally(cause)
+    }
+
+    /**
+     * Wait until the page is ready, at most [timeoutMs].
+     *
+     * @return null when the page is (or became) ready;
+     *         [ReadyFailure.Timeout] when the budget elapsed first;
+     *         [ReadyFailure.RendererGone] when the renderer died while
+     *         waiting. `CancellationException` of the CALLING coroutine is
+     *         rethrown (see rv1014-E6: structured concurrency must unwind).
+     */
+    suspend fun await(timeoutMs: Long): ReadyFailure? {
+        val d = synchronized(lock) {
+            if (ready) return null
+            waiter ?: CompletableDeferred<Unit>().also { waiter = it }
+        }
+        return try {
+            if (withTimeoutOrNull(timeoutMs) { d.await() } == null) ReadyFailure.Timeout else null
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            ReadyFailure.RendererGone(e)
         }
     }
 }
