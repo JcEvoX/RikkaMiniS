@@ -129,29 +129,28 @@ fun ModelEntryDetailScreen(
         actions = {
             MinisButton(
                 onClick = {
-                    val baseInputs = baseModel.inputModalities ?: emptyList()
-                    val baseOutputs = baseModel.outputModalities ?: emptyList()
-                    val newInputs = buildList {
-                        if (imageInput) add("image")
-                        if (pdfInput) add("pdf")
-                        if (audioInput) add("audio")
-                        if (videoInput) add("video")
-                    }
-                    val newOutputs = buildList {
-                        if (imageOutput) add("image")
-                        if (audioOutput) add("audio")
-                    }
-                    val newOverrides = ModelOverrides(
-                        displayName = displayName.trim().takeIf { it.isNotEmpty() && it != baseModel.displayName },
-                        maxOutputTokens = maxOutputTokensText.trim().toIntOrNull()?.takeIf { it > 0 },
-                        contextWindow = contextWindowText.trim().toIntOrNull()?.takeIf { it > 0 },
-                        // supportsReasoning: persist only when user diverged from base.
-                        supportsReasoning = thinkingEnabled.takeIf { it != (baseModel.supportsReasoning ?: false) },
-                        // Modality lists: persist only when user-edited set differs
-                        // from baseModel's set; otherwise leave null so the entry
-                        // tracks future provider updates to the base modalities.
-                        inputModalities = if (newInputs.toSet() != baseInputs.toSet()) newInputs else null,
-                        outputModalities = if (newOutputs.toSet() != baseOutputs.toSet()) newOutputs else null,
+                    // [da1023-B] Derivation lives in ModelEntryOverrideBuilder.kt
+                    // (pure, JVM-tested). The inline version had four defects:
+                    // switches alone rebuilt the lists so "text" was dropped
+                    // (and output "video"), the diff comparison ran against the
+                    // RAW base list while the switches were normalized (suffixed
+                    // bases forced a write on a no-op save), and the positional
+                    // `ModelOverrides(...)` constructor lost maxThinkingLevel —
+                    // `previous.copy(...)` keeps every field this screen does
+                    // not own.
+                    val newOverrides = buildModelEntryOverrides(
+                        baseModel = baseModel,
+                        previous = overrides,
+                        displayName = displayName,
+                        maxOutputTokensText = maxOutputTokensText,
+                        contextWindowText = contextWindowText,
+                        thinkingEnabled = thinkingEnabled,
+                        imageInput = imageInput,
+                        pdfInput = pdfInput,
+                        audioInput = audioInput,
+                        videoInput = videoInput,
+                        imageOutput = imageOutput,
+                        audioOutput = audioOutput,
                     )
                     val updated = if (entry.isCustom) {
                         // [da1022-E] trim before persisting; the composite
