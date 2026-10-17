@@ -282,8 +282,24 @@ class SkillRepository(private val context: Context) {
         // `max_turns`, `allowed_tools`) survive the first landing — see
         // writeSkillMd, which seeds its merge with this when the skill is new.
         frontmatter: String = "",
+        // [fix/da1021-A] The caller's already-resolved id. Callers that
+        // resolved the landing id through [SkillRestorePolicy.resolveImportId]
+        // (importFromContent's preferredId parameter, installBundledSkill's
+        // assets dirName) pass it through: without this the add branch below
+        // recomputed `slugify(name)` and dropped the resolved id — a renamed
+        // skill (pure-CJK name → blank slug → add returned null) was silently
+        // lost, or landed under a fresh slug while its backup payload and
+        // session_skill_overrides still pointed at the old id (dir split).
+        // Null keeps the legacy slugify behavior for callers that have no
+        // preferred id. Unsafe values (blank, `/`, `\`, `..`) are rejected
+        // inside resolveImportId — they fall back to the name slug.
+        preferredId: String? = null,
     ): Skill? {
-        val id = slugify(name)
+        // [fix/da1021-A] Never recompute the landing id here: a caller with an
+        // already-resolved id (backup restore / bundled dirName) must land
+        // under it. resolveImportId rejects unsafe values and falls back to
+        // the name slug, so an illegal preferredId can't be adopted verbatim.
+        val id = SkillRestorePolicy.resolveImportId(preferredId, slugify(name))
         if (id.isBlank()) return null
 
         return synchronized(addLock) {
@@ -644,6 +660,12 @@ class SkillRepository(private val context: Context) {
             // allowed_tools on the first landing (writeSkillMd seeds its merge
             // with this when no on-disk file exists).
             frontmatter = SubagentSkill.extractFrontmatterBlock(content),
+            // [fix/da1021-A] Pass the resolved id through to the add branch:
+            // on a clean install this is the add path, and without it the id
+            // resolved above (backup's exported id) was recomputed as
+            // slugify(parsed.name) — renamed skills came back under a fresh
+            // slug, splitting the dir from their payload and overrides.
+            preferredId = id,
         )
     }
 
@@ -1529,6 +1551,12 @@ class SkillRepository(private val context: Context) {
                 // so a first install keeps `subagent: true` / max_turns /
                 // allowed_tools on disk and in memory.
                 frontmatter = SubagentSkill.extractFrontmatterBlock(content),
+                // [fix/da1021-A] A bundled skill must land under its assets
+                // dirName — the sibling payload was extracted into
+                // <dirName>/ by syncBundledSiblings. Without this, a SKILL.md
+                // whose name slugified differently from the dirName (e.g. a
+                // CJK name) landed under a different slug than the payload.
+                preferredId = dirName,
             )
             syncBundledSiblings(dirName)
             Log.i(TAG, "Installed bundled skill: $dirName (v$bundledVersion)")

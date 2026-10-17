@@ -514,14 +514,30 @@ class MinisApp : Application(), ImageLoaderFactory {
         }
 
         database = AppDatabase.getInstance(this)
+        // [fix/da1021-A] Build skill/mcp repositories BEFORE chatRepository so
+        // the cross-db session cleanup callback can reference these exact
+        // lateinit fields (same instances — they are process-wide singletons;
+        // constructing a second copy here would make the cleanup reap a
+        // repository the app doesn't use).
+        skillRepository = SkillRepository(this)
+        mcpRepository = MCPRepository(this)
         chatRepository = ChatRepository(
             database.chatDao(),
             com.rikkaminis.app.data.storage.SessionFileStore(this),
+            // [fix/da1021-A] Cross-db session cleanup: a deleted session's
+            // skill/mcp overrides (skill_session_overrides /
+            // mcp_session_overrides) leaked into later sessions reusing the
+            // id — both clearSessionOverrides functions had zero production
+            // callers. Attached here so every delete entry point
+            // (user delete, drawer, fork rollback, empty-session sweep) is
+            // covered by one hook. Each cleanup is independently contained.
+            onSessionDeleted = { sid ->
+                runCatching { skillRepository.clearSessionOverrides(sid) }
+                runCatching { mcpRepository.clearSessionOverrides(sid) }
+            },
         )
         providerRepository = ProviderRepository(this)
         envVarRepository = EnvVarRepository(this)
-        skillRepository = SkillRepository(this)
-        mcpRepository = MCPRepository(this)
         memoryRepository = MemoryRepository(java.io.File(filesDir, "minis-global/memory"))
 
         webAppShortcutRepository = WebAppShortcutRepository(database.webAppShortcutDao())
