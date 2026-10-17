@@ -27,13 +27,15 @@ object FileEditTool {
     )
 
     fun execute(argsJson: String, sessionId: String, context: Context): ToolExecutionResult {
+        // [fix/da1022-G] Resolve the title BEFORE the try (FileWriteTool pattern):
+        // a try-scoped val left the catch arm with no title to report.
+        val toolTitle = resolveToolTitle(argsJson, NAME)
         return try {
             val args = JSONObject(argsJson)
             val path = args.optString("path", "")
             val oldString = args.optString("old_string", "")
             val newString = args.optString("new_string", "")
             val replaceAll = args.optBoolean("replace_all", false)
-            val toolTitle = args.optString("tool_title", NAME)
 
             if (path.isBlank()) {
                 return ToolExecutionResult("Error: 'path' is required", false, toolTitle = toolTitle)
@@ -123,7 +125,7 @@ object FileEditTool {
                 true, toolTitle = toolTitle
             )
         } catch (e: Exception) {
-            ToolExecutionResult("Error editing file: ${e.message}", false, toolTitle = NAME)
+            ToolExecutionResult("Error editing file: ${e.message}", false, toolTitle = toolTitle)
         }
     }
 }

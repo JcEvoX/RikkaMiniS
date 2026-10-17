@@ -40,10 +40,12 @@ object ReadImageTool {
      * pipeline.
      */
     fun execute(argsJson: String, sessionId: String? = null, context: Context? = null): ToolExecutionResult {
+        // [fix/da1022-G] Resolve the title BEFORE the try (FileWriteTool pattern):
+        // a try-scoped val left the catch arm with no title to report.
+        val toolTitle = resolveToolTitle(argsJson, NAME)
         return try {
             val args = JSONObject(argsJson)
             val rawPath = args.optString("path", "")
-            val toolTitle = args.optString("tool_title", NAME)
 
             if (rawPath.isBlank()) {
                 return ToolExecutionResult("Error: 'path' is required", false, toolTitle = toolTitle)
@@ -115,7 +117,7 @@ object ReadImageTool {
                 imageFilePath = file.absolutePath,
             )
         } catch (e: Exception) {
-            ToolExecutionResult("Error reading image: ${e.message}", false)
+            ToolExecutionResult("Error reading image: ${e.message}", false, toolTitle = toolTitle)
         }
     }
 }
