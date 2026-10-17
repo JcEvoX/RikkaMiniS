@@ -179,7 +179,10 @@ fun BackupSettingsScreen(
         mutableStateOf(com.rikkaminis.app.backup.AutoBackupManager.isEnabled(context))
     }
     var autoBackupRunning by remember { mutableStateOf(false) }
-    var autoBackupFiles by remember { mutableStateOf(com.rikkaminis.app.backup.AutoBackupManager.listLocal(context)) }
+    // [fix/da1023-backup-streaming-fetch] `listLocal` lists filesDir — it must
+    // not run inside `remember` on the composition (Main) thread. Start empty
+    // and load on IO, same shape as the snapshot list below.
+    var autoBackupFiles by remember { mutableStateOf<List<File>>(emptyList()) }
     // [fix-autobackup-keep-3] Local auto-backup copies collapse by default —
     // same treatment as the pre-restore snapshot list: they are a rollback
     // utility, not a primary surface. Tap the toggle row to expand the list.
@@ -216,6 +219,14 @@ fun BackupSettingsScreen(
     // Refresh the snapshot list on entry (and after restore writes a new one).
     LaunchedEffect(Unit) {
         snapshotFiles = withContext(Dispatchers.IO) { ConfigBackup.listSnapshots(snapshotDir) }
+    }
+
+    // [fix/da1023-backup-streaming-fetch] Entry load for the local automatic
+    // backup list. Listing filesDir is disk IO, so it runs on IO — the state
+    // starts empty — instead of inside the `remember` on the composition
+    // (Main) thread it used to sit in. Same shape as the snapshot refresh.
+    LaunchedEffect(Unit) {
+        autoBackupFiles = withContext(Dispatchers.IO) { com.rikkaminis.app.backup.AutoBackupManager.listLocal(context) }
     }
 
     val refreshSnapshots: () -> Unit = {
@@ -636,11 +647,16 @@ fun BackupSettingsScreen(
                     operationBusy = true
                     application.applicationScope.launch {
                         try {
-                            withContext(Dispatchers.IO) {
-                                com.rikkaminis.app.backup.AutoBackupManager.runNow(application)
-                            }
+                            // [fix/da1023-backup-streaming-fetch] runNow and
+                            // the post-run local listing are both disk IO —
+                            // the listing used to run inside the
+                            // Dispatchers.Main block below; do it on IO and
+                            // hand only the result back to Main.
+                            val autoManager = com.rikkaminis.app.backup.AutoBackupManager
+                            withContext(Dispatchers.IO) { autoManager.runNow(application) }
+                            val refreshedFiles = withContext(Dispatchers.IO) { autoManager.listLocal(context) }
                             withContext(Dispatchers.Main) {
-                                autoBackupFiles = com.rikkaminis.app.backup.AutoBackupManager.listLocal(context)
+                                autoBackupFiles = refreshedFiles
                                 autoBackupLastRun = com.rikkaminis.app.backup.AutoBackupManager.lastRunLabel(context)
                                 android.widget.Toast.makeText(
                                     context, savedToast, android.widget.Toast.LENGTH_SHORT,
@@ -1076,21 +1092,42 @@ fun BackupSettingsScreen(
                                 // → local `rikkaminis-auto-<stamp>.json` so it
                                 // joins the local auto-backup rotation and can
                                 // be restored offline any time.
-                                val stamp = entry.item.displayName
+                                // [fix/da1023-backup-streaming-fetch] The
+                                // display name comes from the WebDAV server
+                                // and is NOT under our control — a hostile or
+                                // just odd name must never be concatenated
+                                // into a local path unfiltered
+                                // (`../../evil` would write through the
+                                // backup-autos directory). Sanitize
+                                // fail-closed: refuse to write on anything
+                                // that is not a clean filename token.
+                                val rawStamp = entry.item.displayName
                                     .removePrefix(WebDavSync.AUTO_BACKUP_PREFIX)
                                     .removeSuffix(WebDavSync.BACKUP_SUFFIX)
+                                val stamp = WebDavSync.sanitizeAutoBackupStamp(rawStamp)
+                                if (stamp == null) {
+                                    // ponytail: English-only rejection message for a hostile-input corner | 天花板: 非英文用户看到英文报错（极罕见：服务器侧名字被污染才会触发） | 升级触发: strings.xml 解冻或同类"拒绝输入"文案积累
+                                    throw IllegalArgumentException(
+                                        "Rejected unsafe auto-backup filename: ${entry.item.displayName}",
+                                    )
+                                }
                                 val local = File(
                                     dir,
                                     com.rikkaminis.app.backup.AutoBackupManager.LOCAL_FILE_PREFIX + stamp + ".json",
                                 )
                                 withContext(Dispatchers.IO) { local.writeText(json) }
+                                // [fix/da1023-backup-streaming-fetch] The
+                                // fetched copy joins the SAME local rotation
+                                // as the nightly writes — before this, every
+                                // fetch added an unbounded local copy with no
+                                // AUTO_BACKUP_KEEP cap applied.
+                                withContext(Dispatchers.IO) {
+                                    com.rikkaminis.app.backup.AutoBackupManager.rotateLocalAutoBackups(context)
+                                }
                                 // Refresh the local auto-backup list so the
                                 // fetched copy shows up immediately (state
                                 // write back on Main — scope.launch is Main).
-                                autoBackupFiles =
-                                    withContext(Dispatchers.IO) {
-                                        com.rikkaminis.app.backup.AutoBackupManager.listLocal(context)
-                                    }
+                                autoBackupFiles = withContext(Dispatchers.IO) { com.rikkaminis.app.backup.AutoBackupManager.listLocal(context) }
                                 android.widget.Toast.makeText(
                                     context,
                                     context.getString(R.string.auto_backup_fetched),
