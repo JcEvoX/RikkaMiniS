@@ -1937,10 +1937,12 @@ fun ChatScreen(
             linkRenderCache.resolve(url, viewModel.currentSessionId)
         },
         LocalMarkdownImageTapHandler provides markdownImageTapHandler,
-        // Route markdown media resolution through this chat's session so
-        // minis://attachments/* lookups don't rely on the global bindMounts
+        // Route markdown media resolution through this chat's ACTIVE session
+        // (real id once the draft is promoted, __new__ route arg before —
+        // matches [ChatViewModel.currentSessionId]) so minis://attachments/*
+        // lookups don't rely on the global bindMounts
         // map (which is last-writer-wins across sessions).
-        LocalMarkdownSessionId provides sessionId,
+        LocalMarkdownSessionId provides viewModel.currentSessionId,
     ) {
     // RikkaHub-style left-swipe drawer: the chat is wrapped in a
     // ModalNavigationDrawer whose sheet is the conversation history. A left
@@ -2013,7 +2015,7 @@ fun ChatScreen(
                 .collectAsState()
             ChatHistoryDrawer(
                 chatRepository = chatRepository,
-                currentSessionId = sessionId,
+                currentSessionId = viewModel.currentSessionId,
                 draft = draftSnapshot
                     ?.takeIf { it.text.isNotBlank() && it.id != sessionId },
                 onOpenDraft = {
@@ -4791,7 +4793,7 @@ fun ChatScreen(
     if (showSkillsSheet && skillRepository != null) {
         SessionSkillsSheet(
             skillRepository = skillRepository,
-            sessionId = sessionId,
+            sessionId = viewModel.currentSessionId,
             onDismiss = { showSkillsSheet = false },
         )
     }
@@ -4800,7 +4802,7 @@ fun ChatScreen(
     if (showMcpsSheet && mcpRepository != null) {
         SessionMcpsSheet(
             mcpRepository = mcpRepository,
-            sessionId = sessionId,
+            sessionId = viewModel.currentSessionId,
             onDismiss = { showMcpsSheet = false },
         )
     }
@@ -4982,7 +4984,7 @@ fun ChatScreen(
             com.rikkaminis.app.ui.preview.WebPreviewBottomSheet(
                 holder = holder,
                 fallbackTitle = htmlPreviewFallbackTitle,
-                pinSessionId = sessionId,
+                pinSessionId = viewModel.currentSessionId,
                 onExpandFullscreen = {
                     holder.detach()
                     htmlPreviewFullscreen = true

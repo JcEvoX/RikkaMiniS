@@ -66,7 +66,13 @@ fun SessionSkillsSheet(
     // already covered on Android by the `__new__<uuid>` route arg (every
     // draft has its own stable session id), unlike iOS which previously
     // coerced nil to "" and bled overrides across drafts.
-    val overrides = remember(skills) {
+    // [da1022-b] Key the seed on `sessionId` as well: when the draft session
+    // is promoted (first send), the caller re-composes with the real session
+    // id and this map must re-derive from the real id's stored overrides —
+    // otherwise the sheet keeps showing (and the toggles keep writing against)
+    // the pre-promotion `__new__…` key. Mirrors the sessionId key added here
+    // to both sheets.
+    val overrides = remember(skills, sessionId) {
         mutableStateMapOf<String, Boolean>().apply {
             for (skill in skills) {
                 put(skill.id, skillRepository.isEnabledForSession(skill.id, sessionId))
