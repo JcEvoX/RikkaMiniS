@@ -19,6 +19,8 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.compose.material.icons.outlined.Extension
 import androidx.compose.material.icons.outlined.Language
 import androidx.compose.material.icons.outlined.Terminal
@@ -723,7 +725,10 @@ private fun MCPFormTab(
             }) { Text(stringResource(R.string.mcp_export_copy)) }
             MinisTextButton(onClick = {
                 val server = buildServerFromForm() ?: return@MinisTextButton
-                shareMcpServerJson(context, server.id, mcpRepository.exportServerJSON(server))
+                // exportServerJSON is pure in-memory JSON building; only the
+                // staging write needs a coroutine (see shareMcpServerJson).
+                val json = mcpRepository.exportServerJSON(server)
+                oauthScope.launch { shareMcpServerJson(context, server.id, json) }
             }) { Text(stringResource(R.string.mcp_export_share)) }
         }
 
@@ -962,12 +967,21 @@ private fun FieldLabel(text: String) {
  * (${packageName}.fileprovider, configured for cache-path "shared/"), and
  * launch a chooser with type application/json.
  */
-private fun shareMcpServerJson(context: android.content.Context, serverId: String, json: String) {
+private suspend fun shareMcpServerJson(context: android.content.Context, serverId: String, json: String) {
     val safeName = serverId.ifBlank { "mcp-server" }
         .replace(Regex("[^A-Za-z0-9._-]"), "_")
-    val dir = java.io.File(context.cacheDir, "shared").apply { mkdirs() }
-    val file = java.io.File(dir, "$safeName-mcp.json")
-    runCatching { file.writeText(json) }.onFailure { return }
+    // [da1024-G] mkdirs / prune / writeText are disk work — keep them off the
+    // main thread. Returns null when the write fails, preserving the previous
+    // "silently skip the share sheet" behaviour.
+    val file = withContext(Dispatchers.IO) {
+        val dir = java.io.File(context.cacheDir, "shared").apply { mkdirs() }
+        // Same 24h-TTL pruner the cache/share/ writers use: nothing else ever
+        // deletes cacheDir/shared/, so stale exports (and their credentials)
+        // used to live for the life of the install.
+        com.rikkaminis.app.ui.components.pruneShareDir(dir)
+        val f = java.io.File(dir, "$safeName-mcp.json")
+        runCatching { f.writeText(json) }.map { f }.getOrNull()
+    } ?: return
     val uri = try {
         androidx.core.content.FileProvider.getUriForFile(
             context, "${context.packageName}.fileprovider", file,

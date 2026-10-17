@@ -421,7 +421,7 @@ fun ProviderDetailScreen(
             onConfirm = {
                 showExportDialog = false
                 AppLogger.info(TAG, "Export instance ${instance.id} (${instance.label})")
-                exportProviderInstance(exportContext, providerRepository, instance)
+                scope.launch { exportProviderInstance(exportContext, providerRepository, instance) }
             },
         )
     }
@@ -581,17 +581,28 @@ private fun connectionSummary(
  * via FileProvider. Mirrors iOS `ProviderShareSheet` — writes a <label>.json
  * file to app-scoped cache and emits ACTION_SEND with a content:// URI.
  */
-private fun exportProviderInstance(
+private suspend fun exportProviderInstance(
     context: android.content.Context,
     providerRepository: ProviderRepository,
     instance: com.rikkaminis.app.data.model.ProviderInstance,
 ) {
-    val json = providerRepository.exportInstanceJSON(instance.id) ?: return
     val safeLabel = instance.label.ifBlank { "provider" }
         .replace(Regex("[^A-Za-z0-9._-]"), "_")
-    val dir = java.io.File(context.cacheDir, "shared").apply { mkdirs() }
-    val file = java.io.File(dir, "$safeLabel.json")
-    runCatching { file.writeText(json) }.onFailure { return }
+    // [da1024-G] exportInstanceJSON reads EncryptedSharedPreferences and
+    // serializes the whole instance (hundreds of entries for a large catalog),
+    // and the staging write is disk I/O — both used to run on the UI thread
+    // from the dialog's onConfirm. Returns null when the export or the write
+    // fails, preserving the previous "silently skip the share sheet".
+    val file = withContext(Dispatchers.IO) {
+        val json = providerRepository.exportInstanceJSON(instance.id) ?: return@withContext null
+        val dir = java.io.File(context.cacheDir, "shared").apply { mkdirs() }
+        // Same 24h-TTL pruner the cache/share/ writers use. This file carries
+        // the API key in plain Base64 (see the confirmation dialog), so a stale
+        // copy must not outlive a day.
+        com.rikkaminis.app.ui.components.pruneShareDir(dir)
+        val f = java.io.File(dir, "$safeLabel.json")
+        runCatching { f.writeText(json) }.map { f }.getOrNull()
+    } ?: return
 
     val uri = try {
         androidx.core.content.FileProvider.getUriForFile(
