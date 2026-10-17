@@ -314,7 +314,8 @@ object Routes {
     // (model_entry/{instanceId}/{entryId}) and navigate() throws
     // IllegalArgumentException "destination … cannot be found" — a guaranteed
     // crash on tapping any model whose id carries a '/'. URL-encode it so the
-    // slash becomes %2F (one segment); the receiver decodes it back.
+    // slash becomes %2F (one segment); the nav framework %-decodes the segment
+    // exactly once on the way in (no decode at the receiver — [da1024-E]).
     fun modelEntryDetail(instanceId: String, entryId: String) =
         "model_entry/${seg(instanceId)}/${seg(entryId)}"
     fun addCustomModel(instanceId: String) = "add_custom_model/${seg(instanceId)}"
@@ -1004,14 +1005,22 @@ fun AppNavigation(
                 navArgument("entryId") { type = NavType.StringType },
             ),
         ) { backStackEntry ->
-            // [T-android-model-entry-route-slash-crash] Decode back the
-            // %2F-encoded composite ids so ModelEntryDetailScreen can match
-            // entry.id == "<instanceId>/<modelId>" (which carries a literal '/')
-            // against the repo. Mirrors the encode in Routes.modelEntryDetail.
+            // [T-android-model-entry-route-slash-crash] No second decode: the
+            // Nav framework already %-decodes each route path segment exactly
+            // once (NavDeepLink.getMatchingPathArguments -> Uri.decode), so the
+            // %2F-encoded composite key arrives as "<instanceId>/<modelId>"
+            // intact and matches entry.id in the repo — same contract as
+            // MIRROR_CATEGORY_DETAIL / SKILL_FILE_VIEWER below.
+            // [da1024-E] The previous extra Uri.decode corrupted any id that
+            // carries a literal '%': "100%25" was rewritten to "100%" and a
+            // bare '%' ("a%b") became U+FFFD (Uri.decode substitutes the
+            // replacement char, it does not throw on Android 13+), so the
+            // lookup missed and the screen popped straight back — tapping the
+            // model looked like a no-op.
             val instanceId = backStackEntry.arguments?.getString("instanceId")
-                ?.let { android.net.Uri.decode(it) } ?: return@composable
+                ?: return@composable
             val entryId = backStackEntry.arguments?.getString("entryId")
-                ?.let { android.net.Uri.decode(it) } ?: return@composable
+                ?: return@composable
             ModelEntryDetailScreen(
                 instanceId = instanceId,
                 entryId = entryId,
