@@ -151,8 +151,14 @@ class SkillRestorePolicyTest {
             .substringAfter("if (existing != null) {")
             .substringBefore("Upgraded bundled skill")
         assertTrue(
+            // [fix/da1023-E] Re-anchored: the batch converges frontmatter
+            // extraction onto ParsedSkill (one extraction per document), so the
+            // old per-site `extractFrontmatterBlock(content)` call this
+            // assertion pinned is gone from the upgrade branch — the refresh
+            // now rides on `frontmatter = parsed.frontmatter`, which resolves
+            // to the same incoming block.
             "upgrade branch must refresh frontmatter from the incoming content",
-            upgrade.contains("extractFrontmatterBlock(content)"),
+            upgrade.contains("frontmatter = parsed.frontmatter"),
         )
         assertFalse(
             "upgrade branch must not rewrite importSource (version gate's contract)",
