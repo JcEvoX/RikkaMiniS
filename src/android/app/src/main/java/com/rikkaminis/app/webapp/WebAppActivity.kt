@@ -70,6 +70,8 @@ import com.rikkaminis.app.MinisApp
 import com.rikkaminis.app.R
 import com.rikkaminis.app.browser.SafeWebViewClient
 import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.ui.preview.ASSET_LOADER_HOST
+import com.rikkaminis.app.ui.preview.toAssetLoaderUrl
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -616,7 +618,21 @@ class WebAppActivity : ComponentActivity() {
             }
         }
 
-        val url = "https://$ASSET_LOADER_HOST/${file.name}"
+        // [da1021-F] Route through the shared single-source mapping
+        // (WebViewHolder.toAssetLoaderUrl) instead of pasting `file.name` raw:
+        // the loader resolves its path as a URL path, so a space/CJK name used
+        // to produce an unresolvable URL. The mapping's root is the initial
+        // file's *parent* directory — the same root this handler serves
+        // (`InternalStoragePathHandler(this, parent)`), so only the last path
+        // segment is meaningful here and the reuse is exact. The null branch
+        // is unreachable for an existing File (the input is always a well-
+        // formed file:// URL) but fails closed into the source-missing state
+        // rather than a doomed 404.
+        val url = toAssetLoaderUrl("file://" + file.absolutePath)
+            ?: run {
+                renderSourceMissing(sourceSessionId = null)
+                return
+            }
         webView.loadUrl(url)
     }
 
@@ -637,7 +653,10 @@ class WebAppActivity : ComponentActivity() {
         // reader anywhere in the repo (grep across all sources: the constant's
         // only consumer was the write it was created for). openInMinis now uses
         // the existing minis://session/<sid> deep link.
-        private const val ASSET_LOADER_HOST = "appassets.androidplatform.net"
+        // [da1021-F] ASSET_LOADER_HOST removed: the single source now lives in
+        // ui/preview/WebViewHolder.kt (`internal const val`) — this activity
+        // imports it (with toAssetLoaderUrl) instead of carrying a second copy
+        // of the origin string that could drift apart from the loader mapping.
         private const val AUTO_HIDE_MS = 4000L
     }
 }

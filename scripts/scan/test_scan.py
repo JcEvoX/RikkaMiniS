@@ -2683,6 +2683,32 @@ def test_da1020_gates():
         check("%s real tree green" % script, rc == 0, out[-280:])
 
 
+
+DA1021_GATES = [
+    ("skill_restore_session_cleanup_check", "SKILL_RESTORE_SESSION_CLEANUP_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("provider_import_id_roundtrip_check", "PROVIDER_IMPORT_ID_ROUNDTRIP_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("mirror_category_route_check", "MIRROR_CATEGORY_ROUTE_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("chat_menu_prefs_listener_check", "CHAT_MENU_PREFS_LISTENER_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("skill_file_save_result_check", "SKILL_FILE_SAVE_RESULT_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("webapp_asset_url_cleanup_check", "WEBAPP_ASSET_URL_CLEANUP_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("speech_active_engine_check", "SPEECH_ACTIVE_ENGINE_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("open_url_broker_scheme_check", "OPEN_URL_BROKER_SCHEME_SELFTEST=PASS", (), (REPO_ROOT,)),
+]
+
+
+def test_da1021_gates():
+    print("━━━ deep-audit-1021 gates (selftest teeth + real tree) ━━━")
+    for script, marker, st_extra, real_args in DA1021_GATES:
+        argv = [sys.executable, os.path.join(SCRIPT_DIR, script + ".py")] + list(st_extra) + ["--selftest"]
+        proc = subprocess.run(argv, capture_output=True, text=True)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        check("%s selftest has teeth (%s)" % (script, marker),
+              proc.returncode == 0 and marker in out, out[-280:])
+        rc, out = run_scanner(script + ".py", *real_args)
+        check("%s real tree green" % script, rc == 0, out[-280:])
+
+
+
 def main():
     print("╔══════════════════════════════════════════════════╗")
     print("║  Scan Self-Test (fixture ground truth)          ║")
@@ -2719,6 +2745,7 @@ def main():
     test_da1018_gates()
     test_da1019_gates()
     test_da1020_gates()
+    test_da1021_gates()
     test_da1017_external_fixtures()
     test_real_repo()
     print("")

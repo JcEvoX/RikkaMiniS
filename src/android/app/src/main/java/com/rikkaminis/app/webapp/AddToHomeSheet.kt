@@ -50,6 +50,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -153,6 +154,18 @@ fun AddToHomeSheet(
             f.parentFile?.delete()
         }
         Unit
+    }
+    // [da1021-F] Universal cleanup: the Cancel button (plain `onDismiss`) and
+    // any external state removal (`webAppSheetTarget = null` at both call
+    // sites) tear the sheet out of composition WITHOUT invoking
+    // `onDismissRequest`, which used to leak the copied attachment dir
+    // permanently. onDispose is the one hook every disappearance path funnels
+    // through; cleanupCopiedAttachment is idempotent (deleting a null or
+    // already-deleted file is a no-op) and its `!pinned` guard keeps a
+    // successful pin intact, so stacking it with the explicit
+    // `onDismissRequest` call is safe.
+    DisposableEffect(Unit) {
+        onDispose { cleanupCopiedAttachment() }
     }
     var copyFailed by remember { mutableStateOf(false) }
     var parsedTitle by remember { mutableStateOf<String?>(null) }
@@ -445,6 +458,13 @@ fun AddToHomeSheet(
                                     Toast.LENGTH_SHORT,
                                 ).show()
                             } else {
+                                // [da1021-F] Pin failed: the DB row was already
+                                // inserted by `create(...)` above — delete it too,
+                                // or `webapp_shortcuts` keeps an orphan record
+                                // pointing at a copy this sheet just cleaned up.
+                                // `delete` is suspend; this runs inside the
+                                // coroutine scope the pin block already launched.
+                                runCatching { app.webAppShortcutRepository.delete(entity.id) }
                                 cleanupCopiedAttachment()
                             }
                             onDismiss()

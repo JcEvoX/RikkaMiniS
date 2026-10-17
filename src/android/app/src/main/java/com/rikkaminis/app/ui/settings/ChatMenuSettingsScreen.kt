@@ -115,12 +115,45 @@ fun ChatMenuSettingsScreen(
     // recomposition trigger for the in-screen switches; without a listener it
     // never moved for external writes, so the switches kept rendering the
     // values read at first composition.
+    //
+    // [da1021-D] Two gaps closed here:
+    //  1. The guard used to match ONLY `key.startsWith("chatMenu.")`, but the
+    //     two top-bar/composer keys are `topBar.inputHistory.visible` and
+    //     `composer.modelPickerButton.visible` — they never fired the tick, so
+    //     the two switches this KDoc names kept rendering stale values on
+    //     external writes. The predicate now matches the self-contained set:
+    //     the chatMenu.* prefix OR the two fixed keys (referenced via
+    //     ChatMenuPrefs constants — single source, no second string copy).
+    //  2. The three order States (menuOrder / footerOrder / attachOrder) were
+    //     never re-read either: an external restore of `chatMenu.order` /
+    //     `chatMenu.pinOrder` / `chatMenu.attachOrder` left the lists stale,
+    //     and a subsequent in-screen drag would write the stale order back.
+    //     The re-read expressions are VERBATIM copies of the first-composition
+    //     reads (resolveOrder + defaultMenuVisible filter / settingsPinOrder /
+    //     resolveAttachOrder) so an external restore renders exactly the list
+    //     a fresh open would. Guarded by `draggingEntry == null` so an async
+    //     listener notification can't interrupt an in-flight drag gesture or
+    //     overwrite the commit* write-back path (which is idempotent: the
+    //     re-read reproduces the same list the commit wrote).
     DisposableEffect(context) {
         val prefs = context.applicationContext
             .getSharedPreferences(ChatMenuPrefs.PREFS, android.content.Context.MODE_PRIVATE)
         val listener =
             android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-                if (key != null && key.startsWith("chatMenu.")) prefsTick++
+                if (key != null && (
+                        key.startsWith("chatMenu.") ||
+                            key == ChatMenuPrefs.TOP_BAR_INPUT_HISTORY_PREF ||
+                            key == ChatMenuPrefs.COMPOSER_MODEL_PICKER_BUTTON_PREF
+                    )
+                ) {
+                    prefsTick++
+                    if (draggingEntry == null) {
+                        menuOrder = ChatMenuPrefs.resolveOrder(prefs)
+                            .filter { ChatActionCatalog.spec(it)?.defaultMenuVisible != false }
+                        footerOrder = ChatMenuPrefs.settingsPinOrder(prefs)
+                        attachOrder = ChatMenuPrefs.resolveAttachOrder(prefs)
+                    }
+                }
             }
         prefs.registerOnSharedPreferenceChangeListener(listener)
         onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }

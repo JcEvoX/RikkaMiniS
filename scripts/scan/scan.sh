@@ -17,7 +17,7 @@ echo "╚═══════════════════════�
 echo ""
 
 # --- 1. Four-way sync check ---
-echo "━━━ [1/66] Four-way sync check ━━━"
+echo "━━━ [1/74] Four-way sync check ━━━"
 if python3 scripts/scan/four_way_sync_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -35,7 +35,7 @@ fi
 #   out of the shared strings.xml, so the default set is the UNION over
 #   strings*.xml. Reading strings.xml alone reports those keys as orphans and
 #   fails the build for resources that exist.
-echo "━━━ [2/66] i18n consistency check ━━━"
+echo "━━━ [2/74] i18n consistency check ━━━"
 python3 -c "
 import re, os, sys
 root = '$ROOT'
@@ -83,7 +83,7 @@ fi
 echo ""
 
 # --- 3. Bare valueOf check (persisted enum safety) ---
-echo "━━━ [3/66] Enum parse safety check ━━━"
+echo "━━━ [3/74] Enum parse safety check ━━━"
 if python3 scripts/scan/enum_parse_safety_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -96,7 +96,7 @@ fi
 # --- 4. Provider process-boundary guard (TF-E) ---
 # Mechanical constraint: the app process must never call a provider network
 # entry point directly — only :modelservice (ModelExecutionService) owns them.
-echo "━━━ [4/66] Provider process-boundary guard ━━━"
+echo "━━━ [4/74] Provider process-boundary guard ━━━"
 if python3 scripts/scan/provider_boundary_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -112,7 +112,7 @@ fi
 # loop on AgentTraceRecorder output (produce → consume). Inline selftest
 # goldens keep the evaluator itself honest in CI; device traces can be added
 # later under tests/traces/golden/ referencing real .jsonl files.
-echo "━━━ [5/66] Agent trace replay eval ━━━"
+echo "━━━ [5/74] Agent trace replay eval ━━━"
 if python3 scripts/scan/trace_eval_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -129,7 +129,7 @@ fi
 #   always empty and nothing ever failed, logged or warned. New references are a
 #   build failure unless the file is allow-listed or justifies it inline with
 #   `legacy-ok: <reason>`.
-echo "━━━ [6/66] Legacy pipeline guard ━━━"
+echo "━━━ [6/74] Legacy pipeline guard ━━━"
 if python3 scripts/scan/legacy_pipeline_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -146,7 +146,7 @@ fi
 #   would ship unverified — the same header source is compiled by the host
 #   compiler and asserted against fixture /proc text. Skipped (not failed) on
 #   machines without a host C++ compiler.
-echo "━━━ [7/66] Native crash-field host test ━━━"
+echo "━━━ [7/74] Native crash-field host test ━━━"
 if sh "$ROOT/scripts/native/crash_fields_host_test.sh" > /tmp/minis_crash_fields_host_test.log 2>&1; then
     tail -n 2 /tmp/minis_crash_fields_host_test.log
     PASS=$((PASS + 1))
@@ -168,7 +168,7 @@ fi
 #   outside the audited allow-list is the silent path by which debug code
 #   (token-free loopback JSON-RPC on 127.0.0.1:5321) reaches release. The apk
 #   mode (below, in build-apk.yml) verifies the artifact itself.
-echo "━━━ [8/66] Debug-code release boundary (source) ━━━"
+echo "━━━ [8/74] Debug-code release boundary (source) ━━━"
 if python3 scripts/scan/debug_leak_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -184,7 +184,7 @@ fi
 #   wired. The last one compiles and runs — it just never executes, so a
 #   fresh install and an upgraded install end up with different schemas and
 #   nothing fails until a user hits the missing column.
-echo "━━━ [9/66] Room migration chain ━━━"
+echo "━━━ [9/74] Room migration chain ━━━"
 if python3 scripts/scan/room_migration_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -199,7 +199,7 @@ fi
 #   decision (wire init in that process's Application branch, or justify with
 #   `logging-ok:`). The 2026-09-18 incident: :modelservice never ran init, so
 #   the LLM-request process logged zero lines — 9 provider 400s, no trace.
-echo "━━━ [10/66] Process-logging coverage ━━━"
+echo "━━━ [10/74] Process-logging coverage ━━━"
 if python3 scripts/scan/process_logging_gate.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -215,7 +215,7 @@ fi
 #   so an int[] (or Kotlin's listOf()) makes a repeating alarm silently replay
 #   as a one-shot. No crash, no failing test, no user-visible log. The repo has
 #   two ACTION_SET_ALARM writers and they drifted apart once already.
-echo "━━━ [11/66] AlarmClock EXTRA_DAYS container type ━━━"
+echo "━━━ [11/74] AlarmClock EXTRA_DAYS container type ━━━"
 if python3 scripts/scan/extra_days_container_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -234,7 +234,7 @@ fi
 #   streaming text froze at the first composed frame (user saw the first two
 #   characters of an answer until they re-entered the session). Nothing
 #   crashed, no test failed. Fix is always `rememberUpdatedState`.
-echo "━━━ [12/66] Stale-closure guard ━━━"
+echo "━━━ [12/74] Stale-closure guard ━━━"
 if python3 scripts/scan/stale_closure_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -253,7 +253,7 @@ fi
 #   test, no log. User-reported 2026-09-20 (skill + memory editors) after the
 #   same family had been patched piecemeal 4+ times (BrowserSettingsSheet /
 #   MCPIntegrations GH#44 / EnvironmentVariables / SettingsComponents T183).
-echo "━━━ [13/66] IME-inset guard ━━━"
+echo "━━━ [13/74] IME-inset guard ━━━"
 if python3 scripts/scan/ime_inset_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -274,7 +274,7 @@ fi
 #   unreachable at once. 2026-09-20: a 1.6MB request sat 272s with no byte back.
 #   No test can catch this (it would have to wait 30 real minutes), so it has
 #   to be a static judgement.
-echo "━━━ [14/66] Stream-flow dispatch guard ━━━"
+echo "━━━ [14/74] Stream-flow dispatch guard ━━━"
 if python3 scripts/scan/stream_flow_dispatch_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -293,7 +293,7 @@ fi
 #   ok:true while every reader kept serving the primed default (128 KB) until
 #   process restart. Unobservable at runtime (no exception, no log), so it has
 #   to be a static judgement.
-echo "━━━ [15/66] Prefs listener holder guard ━━━"
+echo "━━━ [15/74] Prefs listener holder guard ━━━"
 if python3 scripts/scan/prefs_listener_holder_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -312,7 +312,7 @@ fi
 #   Sibling guard four_way_sync_check.py covers Model<->Entity<->snapshot for
 #   ProviderInstance/ModelGroup only; it does not cover this IPC hop, nor
 #   LLMModel. Any new boundary model must be registered in BOUNDARY_MODELS.
-echo "━━━ [16/66] Cross-process boundary completeness ━━━"
+echo "━━━ [16/74] Cross-process boundary completeness ━━━"
 if python3 scripts/scan/xproc_boundary_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -333,7 +333,7 @@ fi
 #   tested in the sandbox, so this gate reads the call site as text and checks
 #   the argument's PROVENANCE (following local `val` bindings, so a rename
 #   cannot defeat it).
-echo "━━━ [17/66] Thinking-level wiring guard ━━━"
+echo "━━━ [17/74] Thinking-level wiring guard ━━━"
 if python3 scripts/scan/thinking_wiring_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -352,7 +352,7 @@ fi
 #   entry whose probe was deleted is a dead ruler holding a permission slip
 #   (2026-09-22: buildFlatChatItems.ledgerReseed); (C) census call-site counts
 #   match raw counts (regex-drift guard; the D4 `[dwiev]` shape hid 47.6%).
-echo "━━━ [18/66] Liveness static guard ━━━"
+echo "━━━ [18/74] Liveness static guard ━━━"
 if python3 scripts/scan/liveness_static_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -369,7 +369,7 @@ fi
 #   can a credential reach an output through this new line? The gate flags whole
 #   URL interpolation inside log calls within the credential-bearing subtrees and
 #   keeps an audited allow-list (`--seed` regenerates it).
-echo "━━━ [19/66] Log URL redaction guard ━━━"
+echo "━━━ [19/74] Log URL redaction guard ━━━"
 if python3 scripts/scan/log_url_redaction_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -384,7 +384,7 @@ fi
 #   statement position: it compiled, logged, and recorded nothing, so a budget
 #   silently stayed at its 30 s default. Watchlist-driven, so extending it is the
 #   maintenance path when another value-returning recorder is discovered.
-echo "━━━ [20/66] Discarded-return guard ━━━"
+echo "━━━ [20/74] Discarded-return guard ━━━"
 if python3 scripts/scan/discarded_return_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -405,7 +405,7 @@ fi
 #   pre-fix tree trips B at all 7 claim sites, the post-fix tree at none.
 #   Audited-safe families carry an ALLOWED entry with its rationale; new
 #   ungated writes get `release-ok:` / `claim-ok:` or a re-audit.
-echo "━━━ [21/66] Claim/release ownership guard ━━━"
+echo "━━━ [21/74] Claim/release ownership guard ━━━"
 if python3 scripts/scan/claim_release_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -426,7 +426,7 @@ fi
 #   which is why nothing caught it. Criterion is mechanical: a numeric
 #   `loopState.<name> = 0` whose comment block claims tool-call semantics must
 #   sit inside the brace span of a `toolCalls` positive guard.
-echo "━━━ [22/66] Loop counter reset guard ━━━"
+echo "━━━ [22/74] Loop counter reset guard ━━━"
 if python3 scripts/scan/loop_counter_reset_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -449,7 +449,7 @@ fi
 #   Criterion: a `break` that follows a `t7BudgetStopReason = "<string>"`
 #   assignment inside the same brace block, and is enclosed by >= 2 loops,
 #   must carry the outermost loop's label (`break@turnLoop`).
-echo "━━━ [23/66] Budget-stop break guard ━━━"
+echo "━━━ [23/74] Budget-stop break guard ━━━"
 if python3 scripts/scan/budget_stop_break_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -473,7 +473,7 @@ fi
 #   file that registers that interface name must declare a matching arity.
 #   Checked per file, because a union across hosts is exactly what hides this
 #   bug shape.
-echo "━━━ [24/66] KaTeX bridge arity guard ━━━"
+echo "━━━ [24/74] KaTeX bridge arity guard ━━━"
 if python3 scripts/scan/katex_bridge_arity_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -483,7 +483,7 @@ else
     echo ""
 fi
 
-echo "━━━ [25/66] Gemini base version guard ━━━"
+echo "━━━ [25/74] Gemini base version guard ━━━"
 if python3 scripts/scan/gemini_base_version_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -501,7 +501,7 @@ fi
 #   same path refused through `file_write`. Criterion: a function that takes a
 #   caller-supplied path parameter and writes a host file must call the guard —
 #   unless its file is exempt WITH evidence, and rotted evidence fails loudly.
-echo "━━━ [26/66] Read-only-mount write guard ━━━"
+echo "━━━ [26/74] Read-only-mount write guard ━━━"
 if python3 scripts/scan/readonly_mount_write_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -526,7 +526,7 @@ fi
 #   catch+release+throw, the dispatch wrapper containing the main-thread check,
 #   and the calibrated `Thread.sleep(120)` settle still in place. Losing an
 #   anchor FAILS loudly rather than passing silently.
-echo "━━━ [27/66] Execution-gate guard ━━━"
+echo "━━━ [27/74] Execution-gate guard ━━━"
 if python3 scripts/scan/exec_gate_release_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -542,7 +542,7 @@ fi
 #   lock. Missing call = the deleted task keeps the in-process single-flight
 #   lock until the reaper fires (~30 min); a call nested inside the store lock
 #   inverts the lock order against the runner's checkMutex and deadlocks.
-echo "━━━ [28/66] Scheduled-task store release guard ━━━"
+echo "━━━ [28/74] Scheduled-task store release guard ━━━"
 if python3 scripts/scan/scheduled_store_release_guard.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -557,7 +557,7 @@ fi
 #   image on the wire: OpenAI (chat + responses) dropped it entirely while both
 #   siblings already carried it, so the model saw the caption and answered blind.
 #   vision-unsupported models must emit the shared T264 placeholder instead.
-echo "━━━ [29/66] Tool-result image consumer guard ━━━"
+echo "━━━ [29/74] Tool-result image consumer guard ━━━"
 if python3 scripts/scan/tool_result_image_branch_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -573,7 +573,7 @@ fi
 #   the assistant row (canonical isStreaming=false) and the later writes are
 #   dropped by StaleStreamPublishPolicy. The turn-visibility predicate must read
 #   per-turn values, never the run-scoped accumulator.
-echo "━━━ [30/66] Turn-tail finalize order ━━━"
+echo "━━━ [30/74] Turn-tail finalize order ━━━"
 if python3 scripts/scan/turn_tail_finalize_order.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -589,7 +589,7 @@ fi
 #   cannot see what it already wrote and rewrites it -> duplicated body), and
 #   the loop-wrapping catch(Exception) must rethrow CancellationException (a
 #   user stop was otherwise recorded as a sub-agent failure).
-echo "━━━ [31/66] Sub-agent turn hand-back guard ━━━"
+echo "━━━ [31/74] Sub-agent turn hand-back guard ━━━"
 if python3 scripts/scan/subagent_handback_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -604,7 +604,7 @@ fi
 #   DURATION together), so a selection comparing it is never true -- freebusy
 #   answered "free" for windows holding a weekly occurrence. Predicates must be
 #   built on CalendarContract.Instances.
-echo "━━━ [32/66] Calendar Events nullable-column predicate guard ━━━"
+echo "━━━ [32/74] Calendar Events nullable-column predicate guard ━━━"
 if python3 scripts/scan/calendar_events_nullable_predicate_check.py --root "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -620,7 +620,7 @@ fi
 #   value-less switches (otherwise a flag eats the package and is handed to
 #   `cmd notification` as the target); `package clear --cache-only` must be a
 #   per-package clear and must report the scope it actually cleared.
-echo "━━━ [33/66] android-shizuku-cli argv guard ━━━"
+echo "━━━ [33/74] android-shizuku-cli argv guard ━━━"
 if python3 scripts/scan/shizuku_args_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -636,7 +636,7 @@ fi
 #   4096-char read boundary) finished the command with -1, which
 #   ExecutionCoordinator maps to SHELL_DIED -> shell rebuild + retry, and the
 #   remaining output of that command was discarded.
-echo "━━━ [34/66] Shell marker boundary guard ━━━"
+echo "━━━ [34/74] Shell marker boundary guard ━━━"
 if python3 scripts/scan/marker_boundary_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -652,7 +652,7 @@ fi
 #   "contains" declared in booleanFlags, tapText must propagate the click result
 #   instead of always reporting ok, and starting the recognizer twice must tear
 #   down the previous session and report the on-device state that is used.
-echo "━━━ [35/66] Accessibility CLI contract guard ━━━"
+echo "━━━ [35/74] Accessibility CLI contract guard ━━━"
 if python3 scripts/scan/a11y_handler_contract_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -670,7 +670,7 @@ fi
 #   resolution (policy + honest effective-voice report), sanitize-before-
 #   engine-call with an honest nothing_to_speak bail, and the streaming path
 #   keeping its auto-detection.
-echo "━━━ [36/66] TTS voice channel + sanitizer wiring ━━━"
+echo "━━━ [36/74] TTS voice channel + sanitizer wiring ━━━"
 if python3 scripts/scan/tts_voice_and_sanitizer_check.py --root "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -681,7 +681,7 @@ else
 fi
 
 # --- 37. Loop persist slice guard (ISSUE-01) ---
-echo "━━━ [37/66] Loop persist slice guard (ISSUE-01) ━━━"
+echo "━━━ [37/74] Loop persist slice guard (ISSUE-01) ━━━"
 if python3 scripts/scan/loop_persist_slice_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -692,7 +692,7 @@ else
 fi
 
 # --- 38. Offload host-path injection guard (ISSUE-02) ---
-echo "━━━ [38/66] Offload host-path injection guard (ISSUE-02) ━━━"
+echo "━━━ [38/74] Offload host-path injection guard (ISSUE-02) ━━━"
 if python3 scripts/scan/offload_host_path_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -703,7 +703,7 @@ else
 fi
 
 # --- 39. Browser tab exec serialisation guard (ISSUE-03A) ---
-echo "━━━ [39/66] Browser tab exec serialisation guard (ISSUE-03A) ━━━"
+echo "━━━ [39/74] Browser tab exec serialisation guard (ISSUE-03A) ━━━"
 if python3 scripts/scan/browser_tab_exec_serial_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -714,7 +714,7 @@ else
 fi
 
 # --- 40. Downloads atomic update guard (ISSUE-03C) ---
-echo "━━━ [40/66] Downloads atomic update guard (ISSUE-03C) ━━━"
+echo "━━━ [40/74] Downloads atomic update guard (ISSUE-03C) ━━━"
 if python3 scripts/scan/downloads_atomic_update_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -725,7 +725,7 @@ else
 fi
 
 # --- 41. Compact decision gate coverage (ISSUE-04/05) ---
-echo "━━━ [41/66] Compact decision gate coverage (ISSUE-04/05) ━━━"
+echo "━━━ [41/74] Compact decision gate coverage (ISSUE-04/05) ━━━"
 if python3 scripts/scan/compact_decision_gate_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -736,7 +736,7 @@ else
 fi
 
 # --- 42. Schedule date source guard (ISSUE-09) ---
-echo "━━━ [42/66] Schedule date source guard (ISSUE-09) ━━━"
+echo "━━━ [42/74] Schedule date source guard (ISSUE-09) ━━━"
 if python3 scripts/scan/schedule_date_source_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -747,7 +747,7 @@ else
 fi
 
 # --- 43. SysInfo pending-state thread guard (ISSUE-10) ---
-echo "━━━ [43/66] SysInfo pending-state thread guard (ISSUE-10) ━━━"
+echo "━━━ [43/74] SysInfo pending-state thread guard (ISSUE-10) ━━━"
 if python3 scripts/scan/sysinfo_state_thread_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -758,7 +758,7 @@ else
 fi
 
 # --- 44. RSS probe lock scope guard (ISSUE-11) ---
-echo "━━━ [44/66] RSS probe lock scope guard (ISSUE-11) ━━━"
+echo "━━━ [44/74] RSS probe lock scope guard (ISSUE-11) ━━━"
 if python3 scripts/scan/rss_probe_lock_scope_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -769,7 +769,7 @@ else
 fi
 
 # --- 45. A/ISSUE-01 Truncated tool-call guard ---
-echo "━━━ [45/66] A/ISSUE-01 Truncated tool-call guard ━━━"
+echo "━━━ [45/74] A/ISSUE-01 Truncated tool-call guard ━━━"
 if python3 scripts/scan/truncated_call_guard_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -780,7 +780,7 @@ else
 fi
 
 # --- 46. B/ISSUE-04 outcomeKnown chain ---
-echo "━━━ [46/66] B/ISSUE-04 outcomeKnown chain ━━━"
+echo "━━━ [46/74] B/ISSUE-04 outcomeKnown chain ━━━"
 if python3 scripts/scan/outcome_known_chain_check.py --root "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -791,7 +791,7 @@ else
 fi
 
 # --- 47. C/ISSUE-07 compact pin truth ---
-echo "━━━ [47/66] C/ISSUE-07 compact pin truth ━━━"
+echo "━━━ [47/74] C/ISSUE-07 compact pin truth ━━━"
 if python3 scripts/scan/compact_pin_truth_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -802,7 +802,7 @@ else
 fi
 
 # --- 48. D/ISSUE-08 dao.loadMessages funnel ---
-echo "━━━ [48/66] D/ISSUE-08 dao.loadMessages funnel ━━━"
+echo "━━━ [48/74] D/ISSUE-08 dao.loadMessages funnel ━━━"
 if python3 scripts/scan/dao_loadmessages_check.py --root "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -813,7 +813,7 @@ else
 fi
 
 # --- 49. E/ISSUE-09 backup remap + rollup ---
-echo "━━━ [49/66] E/ISSUE-09 backup remap + rollup ━━━"
+echo "━━━ [49/74] E/ISSUE-09 backup remap + rollup ━━━"
 if python3 scripts/scan/backup_remap_rollup_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -824,7 +824,7 @@ else
 fi
 
 # --- 50. F/ISSUE-10 router/session-slot locks ---
-echo "━━━ [50/66] F/ISSUE-10 router/session-slot locks ━━━"
+echo "━━━ [50/74] F/ISSUE-10 router/session-slot locks ━━━"
 if python3 scripts/scan/router_lock_check.py --root "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -835,7 +835,7 @@ else
 fi
 
 # --- 51. H/ISSUE-12a/b modelservice single-read + worker cap ---
-echo "━━━ [51/66] H/ISSUE-12a/b modelservice single-read + worker cap ━━━"
+echo "━━━ [51/74] H/ISSUE-12a/b modelservice single-read + worker cap ━━━"
 if python3 scripts/scan/modelsvc_single_read_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -846,7 +846,7 @@ else
 fi
 
 # --- 52. A/ISSUE-01 modeluse envelope dialect single-source ---
-echo "━━━ [52/66] A/ISSUE-01 modeluse envelope dialect single-source ━━━"
+echo "━━━ [52/74] A/ISSUE-01 modeluse envelope dialect single-source ━━━"
 if python3 scripts/scan/modeluse_proto_single_source_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -857,7 +857,7 @@ else
 fi
 
 # --- 53. B/ISSUE-02 tool status publish pass ---
-echo "━━━ [53/66] B/ISSUE-02 tool status publish pass ━━━"
+echo "━━━ [53/74] B/ISSUE-02 tool status publish pass ━━━"
 if python3 scripts/scan/loop_tool_status_transition_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -868,7 +868,7 @@ else
 fi
 
 # --- 54. C/ISSUE-03 fastio tar field bounds + denied exit ---
-echo "━━━ [54/66] C/ISSUE-03 fastio tar field bounds + denied exit ━━━"
+echo "━━━ [54/74] C/ISSUE-03 fastio tar field bounds + denied exit ━━━"
 if python3 scripts/scan/fastio_tar_bounds_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -879,7 +879,7 @@ else
 fi
 
 # --- 55. D/ISSUE-04 provider customUserAgent parity + EOF ---
-echo "━━━ [55/66] D/ISSUE-04 provider customUserAgent parity + EOF ━━━"
+echo "━━━ [55/74] D/ISSUE-04 provider customUserAgent parity + EOF ━━━"
 if python3 scripts/scan/provider_ua_parity_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -890,7 +890,7 @@ else
 fi
 
 # --- 56. E/ISSUE-05 session provider enabled gate ---
-echo "━━━ [56/66] E/ISSUE-05 session provider enabled gate ━━━"
+echo "━━━ [56/74] E/ISSUE-05 session provider enabled gate ━━━"
 if python3 scripts/scan/session_provider_enabled_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -901,7 +901,7 @@ else
 fi
 
 # --- 57. F/ISSUE-06 parts_json funnel ---
-echo "━━━ [57/66] F/ISSUE-06 parts_json funnel ━━━"
+echo "━━━ [57/74] F/ISSUE-06 parts_json funnel ━━━"
 if python3 scripts/scan/parts_json_funnel_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -912,7 +912,7 @@ else
 fi
 
 # --- 58. G/ISSUE-07 katex ready race + alias lock ---
-echo "━━━ [58/66] G/ISSUE-07 katex ready race + alias lock ━━━"
+echo "━━━ [58/74] G/ISSUE-07 katex ready race + alias lock ━━━"
 if python3 scripts/scan/katex_ready_race_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -923,7 +923,7 @@ else
 fi
 
 # --- 59. H/ISSUE-08 browser teardown wake-up ---
-echo "━━━ [59/66] H/ISSUE-08 browser teardown wake-up ━━━"
+echo "━━━ [59/74] H/ISSUE-08 browser teardown wake-up ━━━"
 if python3 scripts/scan/browser_destroy_wakeup_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -934,7 +934,7 @@ else
 fi
 
 # --- 60. J/ISSUE-10 contacts argv + config cwd ---
-echo "━━━ [60/66] J/ISSUE-10 contacts argv + config cwd ━━━"
+echo "━━━ [60/74] J/ISSUE-10 contacts argv + config cwd ━━━"
 if python3 scripts/scan/offload_cli_args_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -945,7 +945,7 @@ else
 fi
 
 # --- 61. A/ISSUE-01 provider models-cache wiring ---
-echo "━━━ [61/66] A/ISSUE-01 provider models-cache wiring ━━━"
+echo "━━━ [61/74] A/ISSUE-01 provider models-cache wiring ━━━"
 if python3 scripts/scan/provider_models_cache_wiring_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -956,7 +956,7 @@ else
 fi
 
 # --- 62. D/ISSUE-04 webview holder url source ---
-echo "━━━ [62/66] D/ISSUE-04 webview holder url source ━━━"
+echo "━━━ [62/74] D/ISSUE-04 webview holder url source ━━━"
 if python3 scripts/scan/webview_holder_url_source_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -967,7 +967,7 @@ else
 fi
 
 # --- 63. E/ISSUE-05 voice cancel guard ---
-echo "━━━ [63/66] E/ISSUE-05 voice cancel guard ━━━"
+echo "━━━ [63/74] E/ISSUE-05 voice cancel guard ━━━"
 if python3 scripts/scan/voice_cancel_guard_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -978,7 +978,7 @@ else
 fi
 
 # --- 64. F/ISSUE-06 deeplink settings routes ---
-echo "━━━ [64/66] F/ISSUE-06 deeplink settings routes ━━━"
+echo "━━━ [64/74] F/ISSUE-06 deeplink settings routes ━━━"
 if python3 scripts/scan/deeplink_settings_routes_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -989,7 +989,7 @@ else
 fi
 
 # --- 65. G/ISSUE-07 memory gate + provider UA fields ---
-echo "━━━ [65/66] G/ISSUE-07 memory gate + provider UA fields ━━━"
+echo "━━━ [65/74] G/ISSUE-07 memory gate + provider UA fields ━━━"
 if python3 scripts/scan/memory_gate_provider_fields_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
@@ -1000,8 +1000,96 @@ else
 fi
 
 # --- 66. H/ISSUE-08 filepreview print bounded read ---
-echo "━━━ [66/66] H/ISSUE-08 filepreview print bounded read ━━━"
+echo "━━━ [66/74] H/ISSUE-08 filepreview print bounded read ━━━"
 if python3 scripts/scan/filepreview_print_bounded_check.py "$ROOT"; then
+    PASS=$((PASS + 1))
+    echo ""
+else
+    RC=1
+    FAIL=$((FAIL + 1))
+    echo ""
+fi
+
+# --- 67. A/ISSUE-01+10 skill restore preferredId + session cleanup ---
+echo "━━━ [67/74] A/ISSUE-01+10 skill restore preferredId + session cleanup ━━━"
+if python3 scripts/scan/skill_restore_session_cleanup_check.py "$ROOT"; then
+    PASS=$((PASS + 1))
+    echo ""
+else
+    RC=1
+    FAIL=$((FAIL + 1))
+    echo ""
+fi
+
+# --- 68. B/ISSUE-02+09 provider import id + backup field parity ---
+echo "━━━ [68/74] B/ISSUE-02+09 provider import id + backup field parity ━━━"
+if python3 scripts/scan/provider_import_id_roundtrip_check.py "$ROOT"; then
+    PASS=$((PASS + 1))
+    echo ""
+else
+    RC=1
+    FAIL=$((FAIL + 1))
+    echo ""
+fi
+
+# --- 69. C/ISSUE-03 mirror category detail route wiring ---
+echo "━━━ [69/74] C/ISSUE-03 mirror category detail route wiring ━━━"
+if python3 scripts/scan/mirror_category_route_check.py "$ROOT"; then
+    PASS=$((PASS + 1))
+    echo ""
+else
+    RC=1
+    FAIL=$((FAIL + 1))
+    echo ""
+fi
+
+# --- 70. D/ISSUE-05 chat menu prefs listener keys + order reload ---
+echo "━━━ [70/74] D/ISSUE-05 chat menu prefs listener keys + order reload ━━━"
+if python3 scripts/scan/chat_menu_prefs_listener_check.py "$ROOT"; then
+    PASS=$((PASS + 1))
+    echo ""
+else
+    RC=1
+    FAIL=$((FAIL + 1))
+    echo ""
+fi
+
+# --- 71. E/ISSUE-06 skill file save result + IO dispatch ---
+echo "━━━ [71/74] E/ISSUE-06 skill file save result + IO dispatch ━━━"
+if python3 scripts/scan/skill_file_save_result_check.py "$ROOT"; then
+    PASS=$((PASS + 1))
+    echo ""
+else
+    RC=1
+    FAIL=$((FAIL + 1))
+    echo ""
+fi
+
+# --- 72. F/ISSUE-07 webapp asset url single-source + addtohome cleanup ---
+echo "━━━ [72/74] F/ISSUE-07 webapp asset url single-source + addtohome cleanup ━━━"
+if python3 scripts/scan/webapp_asset_url_cleanup_check.py "$ROOT"; then
+    PASS=$((PASS + 1))
+    echo ""
+else
+    RC=1
+    FAIL=$((FAIL + 1))
+    echo ""
+fi
+
+# --- 73. G/ISSUE-08 speech active engine binding ---
+echo "━━━ [73/74] G/ISSUE-08 speech active engine binding ━━━"
+if python3 scripts/scan/speech_active_engine_check.py "$ROOT"; then
+    PASS=$((PASS + 1))
+    echo ""
+else
+    RC=1
+    FAIL=$((FAIL + 1))
+    echo ""
+fi
+
+# --- 74. H/ISSUE-11 open-url broker scheme gate ---
+echo "━━━ [74/74] H/ISSUE-11 open-url broker scheme gate ━━━"
+if python3 scripts/scan/open_url_broker_scheme_check.py "$ROOT"; then
     PASS=$((PASS + 1))
     echo ""
 else

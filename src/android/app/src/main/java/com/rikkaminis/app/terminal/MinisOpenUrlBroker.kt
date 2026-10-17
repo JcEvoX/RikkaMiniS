@@ -35,16 +35,21 @@ object MinisOpenUrlBroker {
     private val _terminalVisible = MutableStateFlow(false)
     val terminalVisible: StateFlow<Boolean> = _terminalVisible.asStateFlow()
 
-    fun offer(uri: Uri) { _pendingUrl.value = uri }
+    fun offer(uri: Uri) {
+        // [audit-0917 added the comment but edited the wrong overload;
+        // da1021-H completed it] Same scheme gate as offer(String) — refuse
+        // unsupported schemes (a file:// / javascript: / content:// Uri a
+        // future caller hands in) before publishing to _pendingUrl.
+        if (!isSupportedScheme(uri.scheme)) return
+        _pendingUrl.value = uri
+    }
 
     fun offer(uriString: String) {
+        // Delegate to offer(Uri) so both entry points share the single
+        // isSupportedScheme gate — a second inline copy here would be the
+        // next drift site.
         val parsed = runCatching { Uri.parse(uriString) }.getOrNull() ?: return
-        // [audit-0917] Same scheme gate as offer(Uri) — the string entry point
-        // already refused unsupported schemes; the Uri overload accepted
-        // anything a caller handed it (e.g. a file:// or javascript: payload
-        // routed straight into the WebView preview).
-        if (!isSupportedScheme(parsed.scheme)) return
-        _pendingUrl.value = parsed
+        offer(parsed)
     }
 
     fun consume() { _pendingUrl.value = null }

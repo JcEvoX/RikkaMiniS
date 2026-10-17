@@ -28,6 +28,17 @@ import java.util.UUID
 class ChatRepository(
     internal val dao: ChatDao,
     private val sessionFiles: SessionFileStore? = null,
+    // [fix/da1021-A] Cross-db session cleanup hook. Invoked after the session
+    // row (and messages) are gone from both delete entry points, so
+    // session-scoped tables in OTHER repositories (skill / mcp
+    // session_skill_overrides / mcp_session_overrides) are reaped with the
+    // session. Those clearSessionOverrides functions existed with zero
+    // production callers — a deleted session's "Allow in this session" skill
+    // toggles leaked into every later session that reused the id. runCatching:
+    // a cleanup failure must never bubble into the delete itself (the rows are
+    // already gone; failing the delete now would double-delete or surface a
+    // spurious error for work that is already done).
+    val onSessionDeleted: ((String) -> Unit)? = null,
 ) {
 
     fun observeSessions(): Flow<List<ChatSessionEntity>> = dao.observeSessions()
@@ -204,6 +215,17 @@ class ChatRepository(
     suspend fun deleteSession(id: String): SessionFileStore.DeleteResult? {
         dao.deleteMessages(id)
         dao.deleteSession(id)
+        // [fix/da1021-A] Cross-db cleanup — must run AFTER the session row is
+        // gone (the rows are the source of truth for "session exists"; a
+        // cleanup that raced ahead could be seen as legit by a concurrent
+        // session). Failures are contained: the DB rows are already deleted,
+        // so propagating an exception would only mislead the caller.
+        runCatching { onSessionDeleted?.invoke(id) }.onFailure {
+            AppLogger.warning(
+                "ChatRepository",
+                "onSessionDeleted($id) cleanup failed: ${it.message}",
+            )
+        }
         // [A: session file reclamation] Dropping the DB rows previously leaked
         // the bind-mounted session dir (minis-sessions/<id>: workspace /
         // attachments / offloads / browser) and any media, which kept burning
@@ -251,6 +273,16 @@ class ChatRepository(
     suspend fun deleteSessionRowOnly(id: String) {
         dao.deleteMessages(id)
         dao.deleteSession(id)
+        // [fix/da1021-A] Same cross-db cleanup as deleteSession: an
+        // empty-session sweep (cleanupIfEmptyOnExit) removes rows that only
+        // ever held a thinking / memory toggle — that toggle may have written
+        // a session_skill_overrides row, so it must be reaped with the session.
+        runCatching { onSessionDeleted?.invoke(id) }.onFailure {
+            AppLogger.warning(
+                "ChatRepository",
+                "onSessionDeleted($id) cleanup failed (rowOnly): ${it.message}",
+            )
+        }
     }
 
     /**
