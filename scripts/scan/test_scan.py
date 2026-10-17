@@ -2759,6 +2759,61 @@ def test_da1023_gates():
         rc, out = run_scanner(script + ".py", *real_args)
         check("%s real tree green" % script, rc == 0, out[-280:])
 
+def test_trace_step_tag():
+    print("━━━ trace_step_tag_check ━━━")
+    # The tagger reads AgentTraceRecorder's event/field names and the golden
+    # traces. A rename on either side does not raise -- it just silently labels
+    # 0 calls and reports "no write action", which reads like a normal result.
+    # These fixtures are the ground truth for each of the three faces.
+    script = "trace_step_tag_check.py"
+
+    # teeth: the three faces must each flip red on their own bad input
+    proc = subprocess.run(
+        [sys.executable, os.path.join(SCRIPT_DIR, script), "--selftest"],
+        capture_output=True, text=True,
+    )
+    out = (proc.stdout or "") + (proc.stderr or "")
+    check("tag checker selftest has teeth (TRACE_STEP_TAG_SELFTEST=PASS)",
+          proc.returncode == 0 and "TRACE_STEP_TAG_SELFTEST=PASS" in out, out[-280:])
+
+    # real tree green
+    rc, out = run_scanner(script, REPO_ROOT)
+    check("tag checker real tree green", rc == 0, out[-280:])
+
+    # discrimination: empty golden -> end-to-end face must fail the whole gate
+    # (a gate that stays green on a trace with 0 tool calls would never notice
+    #  the Kotlin side stopping writing them)
+    kt = ("src/android/app/src/main/java/com/rikkaminis/app/tools/"
+          "AgentTraceRecorder.kt")
+    root = make_tree({
+        kt: ('const val TYPE_TOOL_CALL = "tool_call"\n'
+             'const val TYPE_TOOL_RESULT = "tool_result"\n'
+             'const val TYPE_TURN_START = "turn_start"\n'
+             'const val TYPE_TURN_END = "turn_end"\n'
+             'put("tool", x)\nput("args", x)\nput("tool_id", x)\nput("success", x)\n'),
+        "tests/traces/golden/traces/empty.jsonl": '{"type":"trace_start"}\n',
+    })
+    rc, out = run_scanner(script, root)
+    check("empty golden caught (exit 1)", rc == 1 and "0 次 tool_call" in out,
+          f"exit={rc}\n{out[-280:]}")
+    shutil.rmtree(root)
+
+    # discrimination: renamed Kotlin field -> wiring face must fail the gate
+    root = make_tree({
+        kt: ('const val TYPE_TOOL_CALL = "tool_call"\n'
+             'const val TYPE_TOOL_RESULT = "tool_result"\n'
+             'const val TYPE_TURN_START = "turn_start"\n'
+             'const val TYPE_TURN_END = "turn_end"\n'
+             'put("tool", x)\nput("arguments", x)\nput("tool_id", x)\nput("success", x)\n'),
+        "tests/traces/golden/traces/t.jsonl":
+            '{"type":"tool_call","tool":"file_read","args":"{}","tool_id":"a"}\n',
+    })
+    rc, out = run_scanner(script, root)
+    check("renamed Kotlin field caught (exit 1)",
+          rc == 1 and 'put("args")' in out, f"exit={rc}\n{out[-280:]}")
+    shutil.rmtree(root)
+
+
 def main():
     print("╔══════════════════════════════════════════════════╗")
     print("║  Scan Self-Test (fixture ground truth)          ║")
@@ -2798,6 +2853,7 @@ def main():
     test_da1021_gates()
     test_da1022_gates()
     test_da1023_gates()
+    test_trace_step_tag()
     test_da1017_external_fixtures()
     test_real_repo()
     print("")
