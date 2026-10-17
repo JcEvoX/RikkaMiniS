@@ -31,6 +31,14 @@
       `path="."`/`path=""`) — widening the provider to a whole volume is a
       separate, explicitly approved decision, not something a coverage fix
       may slip in.
+  C8  [fix/da1024-A] the `cacheDir/share_inbound/` writer copies on
+      `Dispatchers.IO` (`addAttachmentFromStagedShare` is `suspend`, its body
+      switches) AND prunes its own orphans there under a literal TTL constant —
+      nothing used to delete those staged copies (deep-audit-1024 ISSUE-01).
+  C9  [fix/da1024-A] the ChatScreen share drain keeps its disk work on IO: the
+      `LaunchedEffect(shareBufferVersion)` body switches with
+      `withContext(Dispatchers.IO)` and the `cleanSharedFiles(` directory sweep
+      sits inside one of those regions.
 
 用法:
   python3 file_provider_paths_coverage_check.py [repo_root]
@@ -50,6 +58,10 @@ XML_REL = "src/android/app/src/main/res/xml/file_provider_paths.xml"
 KT_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/LargeContentGuard.kt"
 MEDIASTORE_REL = "src/android/app/src/main/java/com/rikkaminis/app/data/storage/MediaStore.kt"
 PHOTOS_REL = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/PhotosOffloadHandler.kt"
+# [fix/da1024-A] deep-audit-1024 ISSUE-01: the share_inbound staging dir lives in
+# ChatViewModel.kt and is drained from ChatScreen.kt.
+CHATVM_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatViewModel.kt"
+SCREEN_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatScreen.kt"
 
 # (registry id, writer file, regex proving the dir is written, provider tag,
 #  declared path). This list IS the coverage contract: a new dir handed to
@@ -64,9 +76,15 @@ WRITER_DIRS = [
     ("photos-export", PHOTOS_REL,
      r'File\(\s*context\.filesDir,\s*"photos-export"\s*\)',
      "files-path", "photos-export/"),
+    ("share-inbound", CHATVM_REL,
+     r'File\(\s*context\.cacheDir,\s*"share_inbound"\s*\)',
+     "cache-path", "share_inbound/"),
 ]
 
 TTL_EXPECTED = "internal const val LARGE_MESSAGE_EXPORT_TTL_MS = 24L * 60L * 60L * 1000L"
+SHARE_TTL_EXPECTED = "internal const val SHARE_INBOUND_TTL_MS = 24L * 60L * 60L * 1000L"
+
+IO_OPEN_RE = re.compile(r'withContext\(\s*Dispatchers\.IO\s*\)\s*\{')
 
 DECL_RE = re.compile(
     r'<\s*(files-path|cache-path|external-path|external-files-path|external-cache-path|root-path)'
@@ -170,6 +188,31 @@ def fn_body(code: str, signature_re: str):
     return None, None
 
 
+def brace_body(code: str, open_idx: int):
+    """Brace-matched body starting at the `{` at [open_idx], or None."""
+    depth = 0
+    for i in range(open_idx, len(code)):
+        if code[i] == "{":
+            depth += 1
+        elif code[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return code[open_idx:i + 1]
+    return None
+
+
+def io_regions(code: str):
+    """Brace-matched bodies of every `withContext(Dispatchers.IO) { ... }` —
+    the only anchor that proves a disk call is actually inside the IO switch
+    rather than merely sitting next to it."""
+    out = []
+    for m in IO_OPEN_RE.finditer(code):
+        body = brace_body(code, code.index("{", m.start()))
+        if body is not None:
+            out.append(body)
+    return out
+
+
 def check(root: Path) -> list:
     violations = []
 
@@ -179,6 +222,9 @@ def check(root: Path) -> list:
         return [f"{XML_REL} MISSING"]
     if not kt_path.exists():
         return [f"{KT_REL} MISSING"]
+    for rel in (CHATVM_REL, SCREEN_REL):
+        if not (root / rel).exists():
+            return [f"{rel} MISSING"]
 
     xml_text = xml_path.read_text()
     code = strip_comments(kt_path.read_text())
@@ -255,6 +301,63 @@ def check(root: Path) -> list:
                               "export called straight from onClick would not compile off-thread, "
                               "and a non-suspend one blocks the UI thread")
 
+    # ── C8 [fix/da1024-A]: the staged-share copy runs on IO and prunes ──────
+    #     its own orphans (deep-audit-1024 ISSUE-01 face 2 + 3). The dir is
+    #     written, never deleted, and the copy is up to 100 MB per file
+    #     (ShareReceiverActivity cap) — all of it used to run on the UI thread.
+    vm_code = strip_comments((root / CHATVM_REL).read_text())
+    if not re.search(r'internal\s+fun\s+pruneExpiredShareInboundFiles\s*\(', vm_code):
+        violations.append("C8 pruneExpiredShareInboundFiles is not defined as a top-level "
+                          "`internal fun` in ChatViewModel.kt — nothing would ever delete the "
+                          "share_inbound staging copies")
+    if SHARE_TTL_EXPECTED not in vm_code:
+        violations.append(f"C8 TTL literal changed — expected `{SHARE_TTL_EXPECTED}` "
+                          "(recalibrating it is a deliberate act: update this gate in the same "
+                          "commit)")
+    if not re.search(r'suspend\s+fun\s+addAttachmentFromStagedShare\s*\(', vm_code):
+        violations.append("C8 addAttachmentFromStagedShare is not `suspend` — a non-suspending "
+                          "signature means the 100 MB stream copy cannot leave the UI thread")
+    vm_body, _vm_off = fn_body(vm_code, r'fun\s+addAttachmentFromStagedShare\s*\(')
+    if vm_body is None:
+        violations.append("C8 addAttachmentFromStagedShare body not found — cannot verify the "
+                          "share_inbound copy left the main thread")
+    else:
+        regions = io_regions(vm_body)
+        if not regions:
+            violations.append("C8 addAttachmentFromStagedShare body has no "
+                              "`withContext(Dispatchers.IO)` — mkdirs / the TTL prune / the "
+                              "stream copy would run on the UI thread again "
+                              "(deep-audit-1024 ISSUE-01)")
+        elif not any("pruneExpiredShareInboundFiles(" in r for r in regions):
+            violations.append("C8 the share_inbound prune is not inside "
+                              "`withContext(Dispatchers.IO)` in addAttachmentFromStagedShare — a "
+                              "directory walk on the UI thread right before a 100 MB copy")
+
+    # ── C9 [fix/da1024-A]: the ChatScreen share drain keeps its disk work on
+    #     IO. Anchor is the `LaunchedEffect(shareBufferVersion)` body itself, so
+    #     a `withContext(Dispatchers.IO)` that drifted to an unrelated call site
+    #     does not satisfy the criterion.
+    scr_code = strip_comments((root / SCREEN_REL).read_text())
+    scr_body, _scr_off = fn_body(scr_code, r'LaunchedEffect\s*\(\s*shareBufferVersion\s*\)')
+    if scr_body is None:
+        violations.append("C9 ChatScreen share-drain ingestion point not found — expected a "
+                          "`LaunchedEffect(shareBufferVersion) {` block in ChatScreen.kt")
+    else:
+        if "addAttachmentFromStagedShare(" not in scr_body:
+            violations.append("C9 ChatScreen share drain no longer calls "
+                              "addAttachmentFromStagedShare — a staged share would stop being "
+                              "attached to the composer")
+        regions = io_regions(scr_body)
+        if not regions:
+            violations.append("C9 the ChatScreen share drain has no "
+                              "`withContext(Dispatchers.IO)` — consumeBuffer / the attachment "
+                              "copy / the staging-dir sweep all run on the UI thread again "
+                              "(deep-audit-1024 ISSUE-01)")
+        elif not any("cleanSharedFiles(" in r for r in regions):
+            violations.append("C9 SharedShareStore.cleanSharedFiles is called outside "
+                              "`withContext(Dispatchers.IO)` in the ChatScreen share drain — "
+                              "listFiles() + per-file delete() on the UI thread")
+
     return violations
 
 
@@ -265,6 +368,7 @@ CLEAN_XML = """<?xml version="1.0" encoding="utf-8"?>
     <cache-path name="shared" path="shared/" />
     <cache-path name="share" path="share/" />
     <cache-path name="large-messages" path="large-messages/" />
+    <cache-path name="share-inbound" path="share_inbound/" />
     <files-path name="media" path="media/" />
     <files-path name="photos-export" path="photos-export/" />
     <files-path name="logs" path="logs/" />
@@ -350,8 +454,96 @@ class PhotosOffloadHandler(private val context: Context) {
 }
 '''
 
+# [fix/da1024-A] minimal stand-in for ui/chat/ChatViewModel.kt: the
+# share_inbound writer, its suspend IO switch and the orphan prune.
+CLEAN_CHATVM = '''package com.rikkaminis.app.ui.chat
 
-def write_fixture(base: Path, xml=None, kt=None, media=None, photos=None):
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.File
+
+class ChatViewModel(private val context: android.content.Context) {
+
+    suspend fun addAttachmentFromStagedShare(file: File): Any? {
+        if (!file.exists()) return null
+        val durable = withContext(Dispatchers.IO) {
+            val durableDir = File(context.cacheDir, "share_inbound").apply { mkdirs() }
+            runCatching { pruneExpiredShareInboundFiles(durableDir, System.currentTimeMillis()) }
+                .onFailure { Log.w(TAG, "share_inbound prune failed: ${it.message}") }
+            val f = File(durableDir, "${java.util.UUID.randomUUID()}-${file.name}")
+            try {
+                file.inputStream().use { input ->
+                    f.outputStream().use { output -> input.copyTo(output) }
+                }
+                f
+            } catch (e: Exception) {
+                Log.w(TAG, "failed to copy staged share file ${file.name}: ${e.message}")
+                null
+            }
+        } ?: return null
+        addAttachment(durable)
+        return durable
+    }
+}
+
+internal const val SHARE_INBOUND_TTL_MS = 24L * 60L * 60L * 1000L
+
+internal fun pruneExpiredShareInboundFiles(
+    inboundDir: File,
+    nowMs: Long,
+    maxAgeMs: Long = SHARE_INBOUND_TTL_MS,
+): Int {
+    val children = inboundDir.listFiles() ?: return 0
+    val cutoff = nowMs - maxAgeMs
+    var deleted = 0
+    for (f in children) {
+        if (f.isFile && f.lastModified() < cutoff && runCatching { f.delete() }.getOrDefault(false)) {
+            deleted++
+        }
+    }
+    return deleted
+}
+'''
+
+# [fix/da1024-A] minimal stand-in for ui/chat/ChatScreen.kt: the share drain.
+CLEAN_SCREEN = '''package com.rikkaminis.app.ui.chat
+
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
+@Composable
+fun ChatScreen(sessionId: String, viewModel: ChatViewModel) {
+    val shareBufferVersion by ShareCoordinator.bufferVersion.collectAsState()
+    LaunchedEffect(shareBufferVersion) {
+        if (shareBufferVersion == 0) return@LaunchedEffect
+        val pending = withContext(Dispatchers.IO) {
+            ShareCoordinator.consumeBuffer(context)
+        } ?: return@LaunchedEffect
+        val sharedDir = withContext(Dispatchers.IO) {
+            SharedShareStore.sharedFileDirectory(context)
+        }
+        for (item in pending.items) {
+            when (item.kind) {
+                PendingShare.Item.Kind.INLINE_TEXT -> {
+                    viewModel.setInputText(item.value)
+                }
+                PendingShare.Item.Kind.ATTACHMENT -> {
+                    viewModel.addAttachmentFromStagedShare(File(sharedDir, item.value))
+                }
+            }
+        }
+        viewModel.markShareInjected()
+        withContext(Dispatchers.IO) {
+            SharedShareStore.cleanSharedFiles(context)
+        }
+    }
+}
+'''
+
+
+def write_fixture(base: Path, xml=None, kt=None, media=None, photos=None, chatvm=None, screen=None):
     def put(rel, text):
         p = base / rel
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -360,6 +552,8 @@ def write_fixture(base: Path, xml=None, kt=None, media=None, photos=None):
     put(KT_REL, kt if kt is not None else CLEAN_KT)
     put(MEDIASTORE_REL, media if media is not None else CLEAN_MEDIASTORE)
     put(PHOTOS_REL, photos if photos is not None else CLEAN_PHOTOS)
+    put(CHATVM_REL, chatvm if chatvm is not None else CLEAN_CHATVM)
+    put(SCREEN_REL, screen if screen is not None else CLEAN_SCREEN)
 
 
 def selftest() -> int:
@@ -467,6 +661,78 @@ def selftest() -> int:
         "call site outside launch",
         expect_red=True,
         kt=CLEAN_KT.replace("            scope.launch {\n", "            run {\n"),
+    )
+
+    # ── [fix/da1024-A] deep-audit-1024 ISSUE-01: share_inbound wiring ───────
+    run(
+        "XML missing share-inbound",
+        expect_red=True,
+        xml=CLEAN_XML.replace('    <cache-path name="share-inbound" path="share_inbound/" />\n', ""),
+    )
+    run(
+        "share_inbound writer dir renamed",
+        expect_red=True,
+        chatvm=CLEAN_CHATVM.replace('File(context.cacheDir, "share_inbound")',
+                                    'File(context.cacheDir, "share_inbound2")'),
+    )
+    run(
+        "share_inbound prune call removed",
+        expect_red=True,
+        chatvm=CLEAN_CHATVM.replace(
+            '            runCatching { pruneExpiredShareInboundFiles(durableDir, System.currentTimeMillis()) }\n'
+            '                .onFailure { Log.w(TAG, "share_inbound prune failed: ${it.message}") }\n', ""),
+    )
+    run(
+        "share_inbound prune outside the IO switch",
+        expect_red=True,
+        chatvm=(CLEAN_CHATVM
+                .replace('            runCatching { pruneExpiredShareInboundFiles(durableDir, System.currentTimeMillis()) }\n'
+                         '                .onFailure { Log.w(TAG, "share_inbound prune failed: ${it.message}") }\n', "")
+                .replace('        val durable = withContext(Dispatchers.IO) {\n',
+                         '        pruneExpiredShareInboundFiles(File(context.cacheDir, "share_inbound"), 0L)\n'
+                         '        val durable = withContext(Dispatchers.IO) {\n')),
+    )
+    run(
+        "share_inbound copy not on IO",
+        expect_red=True,
+        chatvm=CLEAN_CHATVM.replace("val durable = withContext(Dispatchers.IO) {",
+                                    "val durable = run {"),
+    )
+    run(
+        "share_inbound copy no longer suspend",
+        expect_red=True,
+        chatvm=CLEAN_CHATVM.replace("suspend fun addAttachmentFromStagedShare(",
+                                    "fun addAttachmentFromStagedShare("),
+    )
+    run(
+        "share_inbound prune not internal top-level",
+        expect_red=True,
+        chatvm=CLEAN_CHATVM.replace("\ninternal fun pruneExpiredShareInboundFiles(",
+                                    "\nprivate fun pruneExpiredShareInboundFiles("),
+    )
+    run(
+        "share_inbound TTL literal recalibrated silently",
+        expect_red=True,
+        chatvm=CLEAN_CHATVM.replace("SHARE_INBOUND_TTL_MS = 24L * 60L * 60L * 1000L",
+                                    "SHARE_INBOUND_TTL_MS = 7L * 24L * 60L * 60L * 1000L"),
+    )
+    run(
+        "ChatScreen sweep outside the IO switch",
+        expect_red=True,
+        screen=CLEAN_SCREEN.replace(
+            '        withContext(Dispatchers.IO) {\n            SharedShareStore.cleanSharedFiles(context)\n        }\n',
+            '        SharedShareStore.cleanSharedFiles(context)\n'),
+    )
+    run(
+        "ChatScreen drain has no IO switch at all",
+        expect_red=True,
+        screen=CLEAN_SCREEN.replace("withContext(Dispatchers.IO) {", "run {"),
+    )
+    run(
+        "ChatScreen drain stops attaching staged files",
+        expect_red=True,
+        screen=CLEAN_SCREEN.replace("viewModel.addAttachmentFromStagedShare(File(sharedDir, item.value))",
+                                    "Unit"),
     )
 
     print("=== file_provider_paths_coverage --selftest ===")
