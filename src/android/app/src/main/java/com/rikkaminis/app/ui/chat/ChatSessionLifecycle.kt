@@ -14,6 +14,8 @@ import com.rikkaminis.app.data.model.AgentContentPart
 import com.rikkaminis.app.data.model.LLMMessage
 import com.rikkaminis.app.data.model.LLMModel
 import com.rikkaminis.app.data.model.LLMResponse
+import com.rikkaminis.app.data.model.ModelEntry
+import com.rikkaminis.app.data.model.ProviderInstance
 import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.data.model.RoutingStrategy
 import com.rikkaminis.app.diagnostics.SessionIdAliases
@@ -406,31 +408,39 @@ internal fun ChatViewModel.loadSession() {
         if (!resolved) {
             val entry = findModelEntry(session.modelId)
             if (entry != null) {
-                currentModel = entry.model
-                _modelName.value = entry.model.displayName
-                _activeEntryId.value = entry.id
+                // [da1019-FIX-E] Resolve + validate BEFORE writing any state.
+                // The old order wrote currentModel / _modelName / _activeEntryId
+                // first and only then looked the instance + credential up, so a
+                // disabled provider or a missing API key left the UI reporting
+                // "model ready" while currentProvider stayed null — and handed
+                // Priority 3 a surface that already looked resolved.
                 val instance = providerRepository.instance(entry.providerInstanceId)
-                if (instance != null) {
-                    val apiKey = providerRepository.loadApiKey(instance.id)
-                    if (apiKey != null) {
-                        currentProvider = ProviderFactory.create(instance, apiKey, entry.model, context)
-                        _providerName.value = instance.label.ifEmpty { entry.model.provider }
-                        resolved = true
-                        // No binding row (e.g. a synced session that only
-                        // carried model_id). If the entry belongs to the
-                        // default group, adopt that group so group fallback
-                        // works — otherwise buildFallbackProviders returns
-                        // empty and provider errors never fall back. NOT
-                        // applied to an explicit "entry" binding (user pin),
-                        // which restoreFromBinding handles above. Mirrors
-                        // the iOS runAgentLoop group-discovery fix.
-                        val defaultGroupId = providerRepository.defaultPrimaryGroupId
-                        if (defaultGroupId != null &&
-                            providerRepository.group(defaultGroupId)?.memberEntryIds?.contains(entry.id) == true
-                        ) {
-                            _selectedGroupId.value = defaultGroupId
-                        }
+                val apiKey = instance?.let { providerRepository.loadApiKey(it.id) }
+                val decision = decideSessionModelResolution(entry, instance, apiKey)
+                if (decision is SessionModelResolution.Use) {
+                    currentModel = entry.model
+                    _modelName.value = entry.model.displayName
+                    _activeEntryId.value = entry.id
+                    currentProvider =
+                        ProviderFactory.create(decision.instance, decision.apiKey, entry.model, context)
+                    _providerName.value = decision.instance.label.ifEmpty { entry.model.provider }
+                    resolved = true
+                    // No binding row (e.g. a synced session that only
+                    // carried model_id). If the entry belongs to the
+                    // default group, adopt that group so group fallback
+                    // works — otherwise buildFallbackProviders returns
+                    // empty and provider errors never fall back. NOT
+                    // applied to an explicit "entry" binding (user pin),
+                    // which restoreFromBinding handles above. Mirrors
+                    // the iOS runAgentLoop group-discovery fix.
+                    val defaultGroupId = providerRepository.defaultPrimaryGroupId
+                    if (defaultGroupId != null &&
+                        providerRepository.group(defaultGroupId)?.memberEntryIds?.contains(entry.id) == true
+                    ) {
+                        _selectedGroupId.value = defaultGroupId
                     }
+                } else if (decision is SessionModelResolution.Unusable) {
+                    logSessionModelUnusable("loadSession-priority2", entry.id, decision.reason)
                 }
             }
         }
@@ -1022,6 +1032,79 @@ internal fun ChatViewModel.rewriteMarkerForHeal(
     )
 }
 
+/**
+ * [da1019-FIX-E] Why a session model binding could not be applied. An enum (not
+ * a string) so callers and tests assert on the exact cause.
+ */
+internal enum class UnusableModelReason { MISSING_INSTANCE, PROVIDER_DISABLED, MISSING_API_KEY }
+
+/**
+ * [da1019-FIX-E] Outcome of resolving a session's (entry, instance, credential)
+ * triple. [Use] carries the validated parts so the caller does not repeat the
+ * null checks that the decision already performed.
+ */
+internal sealed interface SessionModelResolution {
+    /** All parts present and the provider is enabled — safe to apply. */
+    data class Use(val entry: ModelEntry, val instance: ProviderInstance, val apiKey: String) :
+        SessionModelResolution
+
+    /**
+     * A precondition failed. The caller must not write any provider state —
+     * see the state-pollution note on [decideSessionModelResolution].
+     */
+    data class Unusable(val reason: UnusableModelReason) : SessionModelResolution
+}
+
+/**
+ * [da1019-FIX-E] Single decision point for the three session-model resolution
+ * sites ([restoreFromBinding]'s `"entry"` branch, [loadSession] priority 2 and
+ * [applyNewChatDefaultModel]).
+ *
+ * Enforces two contracts that used to be applied inconsistently:
+ *  1. A disabled provider is never used at runtime. This mirrors
+ *     `ProviderRepository.enabledMemberEntries` /
+ *     [resolveProviderFromGroup], whose KDoc spells out that "a member whose
+ *     provider instance is currently disabled is silently skipped". Resolving
+ *     to a disabled instance here would create a provider and send requests to
+ *     it, bypassing the enable switch entirely.
+ *  2. Missing credentials (or a missing instance) must be decided BEFORE any
+ *     state write. Writing currentModel / _modelName / _activeEntryId first
+ *     leaves the UI claiming "model ready" while currentProvider stays null or
+ *     points at an unusable provider, and it also hands a polluted surface to
+ *     the next fallback tier.
+ *
+ * Pure (no repository, no Android types beyond the two data classes) so the
+ * decision is unit-testable without a running ChatViewModel.
+ */
+internal fun decideSessionModelResolution(
+    entry: ModelEntry,
+    instance: ProviderInstance?,
+    apiKey: String?,
+): SessionModelResolution {
+    if (instance == null) return SessionModelResolution.Unusable(UnusableModelReason.MISSING_INSTANCE)
+    if (!instance.isEnabled) return SessionModelResolution.Unusable(UnusableModelReason.PROVIDER_DISABLED)
+    if (apiKey == null) return SessionModelResolution.Unusable(UnusableModelReason.MISSING_API_KEY)
+    return SessionModelResolution.Use(entry, instance, apiKey)
+}
+
+/**
+ * [da1019-FIX-E] Trace why a session-model site declined to resolve. The skip is
+ * silent by design (same as `resolveProviderFromGroup` skipping disabled
+ * members), which makes it invisible on a device — one INFO line per rejection
+ * is the only hook for 「禁用后重开会话到底走了哪条 fallback」.
+ * Ids are truncated; nothing credential-shaped is ever logged.
+ */
+private fun ChatViewModel.logSessionModelUnusable(
+    site: String,
+    entryId: String,
+    reason: UnusableModelReason,
+) {
+    AppLogger.info(
+        ChatViewModel.TAG,
+        "[SessionModel] $site skipped entry=${entryId.take(8)} reason=$reason",
+    )
+}
+
 /** Restore provider state from a JSON binding string. Returns true if successfully resolved. */
 internal fun ChatViewModel.restoreFromBinding(bindingJson: String?): Boolean {
     bindingJson ?: return false
@@ -1038,15 +1121,30 @@ internal fun ChatViewModel.restoreFromBinding(bindingJson: String?): Boolean {
             "entry" -> {
                 val entryId = obj.optString("entryId").takeIf { it.isNotEmpty() } ?: return false
                 val entry = providerRepository.config.value.modelEntries.find { it.id == entryId } ?: return false
-                val instance = providerRepository.instance(entry.providerInstanceId) ?: return false
-                val apiKey = providerRepository.loadApiKey(instance.id) ?: return false
+                // [da1019-FIX-E] An explicit "entry" binding is a user pin, but
+                // it is a pin on the *entry*, not on the provider being enabled.
+                // Without the isEnabled gate, disabling a provider left the
+                // binding authoritative: reopening a session pinned to it still
+                // created a provider and dispatched requests to it, bypassing
+                // the switch. Returning false hands the session to the caller's
+                // fallback chain (default group → new-chat default), which is
+                // what resolveProviderFromGroup already does for group members.
+                val instance = providerRepository.instance(entry.providerInstanceId)
+                val apiKey = instance?.let { providerRepository.loadApiKey(it.id) }
+                val decision = decideSessionModelResolution(entry, instance, apiKey)
+                if (decision !is SessionModelResolution.Use) {
+                    if (decision is SessionModelResolution.Unusable) {
+                        logSessionModelUnusable("restoreFromBinding-entry", entry.id, decision.reason)
+                    }
+                    return false
+                }
                 currentModel = entry.model
                 _modelName.value = entry.model.displayName
-                _providerName.value = instance.label.ifEmpty { entry.model.provider }
+                _providerName.value = decision.instance.label.ifEmpty { entry.model.provider }
                 _selectedGroupId.value = null
                 _selectedGroupName.value = ""
                 _activeEntryId.value = entry.id
-                currentProvider = ProviderFactory.create(instance, apiKey, entry.model, context)
+                currentProvider = ProviderFactory.create(decision.instance, decision.apiKey, entry.model, context)
                 true
             }
             else -> false
@@ -1168,14 +1266,24 @@ internal fun ChatViewModel.applyNewChatDefaultModel(): Boolean {
     val entry = providerRepository.lastUsedVisibleEntry()
         ?: providerRepository.newestProviderNewestTextEntry()
         ?: return false
-    val instance = providerRepository.instance(entry.providerInstanceId) ?: return false
-    currentModel = entry.model
+    val instance = providerRepository.instance(entry.providerInstanceId)
+    // [da1019-FIX-E] The two entry sources above already filter to enabled
+    // providers, but the credential is a separate check that used to run AFTER
+    // the state writes — so a missing API key still flipped _activeEntryId /
+    // _modelName and then reported success (`return true`) while
+    // currentProvider stayed null. Decide first, write nothing unless the
+    // triple is fully usable, and tell the caller the truth.
+    val apiKey = instance?.let { providerRepository.loadApiKey(it.id) }
+    val decision = decideSessionModelResolution(entry, instance, apiKey)
+    if (decision !is SessionModelResolution.Use) {
+        if (decision is SessionModelResolution.Unusable) {
+            logSessionModelUnusable("applyNewChatDefaultModel", entry.id, decision.reason)
+        }
+        return false
+    }
     _modelName.value = entry.model.displayName
     _activeEntryId.value = entry.id
-    _providerName.value = instance.label.ifEmpty { entry.model.provider }
-    val apiKey = providerRepository.loadApiKey(instance.id)
-    if (apiKey != null) {
-        currentProvider = ProviderFactory.create(instance, apiKey, entry.model, context)
-    }
+    _providerName.value = decision.instance.label.ifEmpty { entry.model.provider }
+    currentProvider = ProviderFactory.create(decision.instance, decision.apiKey, entry.model, context)
     return true
 }
