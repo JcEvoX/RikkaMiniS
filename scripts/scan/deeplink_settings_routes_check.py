@@ -17,6 +17,17 @@ Judged invariants:
   3. The unknown-path fallback to Settings home is still present
      (deliberate design — must not regress into an error).
   4. MainActivity's deep-link navigate has a runCatching backstop.
+  5. [da1021-C] AppNavigation's cold-start deep-link navigate keeps its
+     runCatching backstop.
+  6. [da1024-E] No composable block decodes a route argument itself: the Nav
+     framework %-decodes each path segment exactly once
+     (NavDeepLink.getMatchingPathArguments -> Uri.decode), so a second decode
+     rewrites ids carrying a literal '%'. Uri.encode stays legal (builders).
+     Scope = the composable blocks, which is where route args are read; a
+     decode added elsewhere in this file is out of scope by design (see the
+     branch report's negative decisions).
+  7. [da1024-E] The MODEL_ENTRY_DETAIL block still reads both args via
+     getString and keeps the `?: return@composable` fail-closed guard.
 """
 import re
 import subprocess
@@ -82,6 +93,47 @@ def code_only(src: str) -> str:
 def fail(path, msg):
     VIOLATIONS.append(f"{path}: {msg}")
 
+# [da1024-E] A second decode of a route argument. Builder-side Uri.encode is
+# NOT covered (the nav graph must keep encoding when it builds a route).
+DECODE_RE = re.compile(r"(?:android\.net\.|java\.net\.)?(?:Uri|URLDecoder)\.decode\s*\(")
+
+def is_comment_line(line: str) -> bool:
+    s = line.strip()
+    return s.startswith("//") or s.startswith("*") or s.startswith("/*")
+
+def code_lines(src: str):
+    """(1-based lineno, text) for every non-comment line.
+
+    code_only() drops comment lines, so it shifts line numbers; the criteria
+    below report positions a human can grep, so they walk the raw lines and
+    skip comments themselves.
+    """
+    return [(i + 1, l) for i, l in enumerate(src.split("\n")) if not is_comment_line(l)]
+
+def composable_blocks(indexed):
+    """[(start_lineno, [(lineno, text), ...])] for every `composable(...) { }`.
+
+    A block ends at the first following `}` that sits at the opener's own
+    indentation, so the scan cannot bleed into the next composable's body.
+    """
+    blocks = []
+    i = 0
+    while i < len(indexed):
+        lineno, line = indexed[i]
+        if line.strip().startswith("composable("):
+            indent = len(line) - len(line.lstrip())
+            j = i + 1
+            while j < len(indexed):
+                text = indexed[j][1]
+                if text.strip() == "}" and (len(text) - len(text.lstrip())) == indent:
+                    break
+                j += 1
+            blocks.append((lineno, indexed[i:j + 1]))
+            i = j + 1
+        else:
+            i += 1
+    return blocks
+
 
 def read(root: Path, rel: str) -> str:
     p = root / rel
@@ -92,7 +144,8 @@ def read(root: Path, rel: str) -> str:
 
 def check(root: Path) -> None:
     dlh = code_only(read(root, REL_DLH))
-    nav = code_only(read(root, REL_NAV))
+    nav_raw = read(root, REL_NAV)
+    nav = code_only(nav_raw)
     main = code_only(read(root, REL_MAIN))
     if not dlh:
         fail(REL_DLH, "missing source file")
@@ -143,6 +196,37 @@ def check(root: Path) -> None:
     # the runCatching is the never-crash backstop mirroring MainActivity.
     if "runCatching { navController.navigate(initialDeepLink.route) }" not in nav:
         fail(REL_NAV, "cold-start OpenSettingsScreen deep link lacks the runCatching backstop")
+
+    # --- 6. [da1024-E] no second decode of a route argument ---
+    # The Nav framework %-decodes every route path segment exactly once
+    # (navigation-common 2.8.5 NavDeepLink.getMatchingPathArguments ->
+    # `Uri.decode(matcher.group(index + 1))`). Anything the nav graph decodes
+    # itself is therefore a SECOND decode: it rewrites an id carrying a literal
+    # '%' ("100%25" -> "100%") and turns a bare '%' into U+FFFD — on Android
+    # 13+ Uri.decode substitutes the replacement character instead of throwing
+    # (android.net.UriCodec.decode(..., throwOnFailure = false)) — so the
+    # destination's lookup misses and the screen pops straight back.
+    for start, block in composable_blocks(code_lines(nav_raw)):
+        for lineno, text in block:
+            if DECODE_RE.search(text):
+                fail(REL_NAV,
+                     f"composable at line {start} decodes a route argument "
+                     f"(line {lineno}): the Nav framework already "
+                     f"%-decodes each path segment once")
+
+    # --- 7. [da1024-E] MODEL_ENTRY_DETAIL reads both args, fail-closed ---
+    entry_blocks = [bl for _, bl in composable_blocks(code_lines(nav_raw))
+                    if any("Routes.MODEL_ENTRY_DETAIL" in t for _, t in bl)]
+    if not entry_blocks:
+        fail(REL_NAV, "MODEL_ENTRY_DETAIL composable block not found")
+    else:
+        blk = "\n".join(t for _, t in entry_blocks[0])
+        for arg in ("instanceId", "entryId"):
+            if f'getString("{arg}")' not in blk:
+                fail(REL_NAV, f"MODEL_ENTRY_DETAIL does not read '{arg}' via getString")
+        if blk.count("?: return@composable") < 2:
+            fail(REL_NAV,
+                 "MODEL_ENTRY_DETAIL lost its `?: return@composable` fail-closed guard")
 
 
 # ---------------- selftest fixtures (minimal synthetic repo) ----------------
@@ -202,6 +286,22 @@ suspend fun handleColdStartDeepLink(navController: NavController, initialDeepLin
                 .onFailure { runCatching { navController.navigate(Routes.SETTINGS) } }
         }
         else -> {}
+    }
+}
+
+fun NavGraphBuilder.modelEntryDetailGraph(navController: NavController) {
+    composable(
+        route = Routes.MODEL_ENTRY_DETAIL,
+        arguments = listOf(
+            navArgument("instanceId") { type = NavType.StringType },
+            navArgument("entryId") { type = NavType.StringType },
+        ),
+    ) { backStackEntry ->
+        val instanceId = backStackEntry.arguments?.getString("instanceId")
+            ?: return@composable
+        val entryId = backStackEntry.arguments?.getString("entryId")
+            ?: return@composable
+        ModelEntryDetailScreen(instanceId = instanceId, entryId = entryId)
     }
 }
 '''
@@ -303,6 +403,79 @@ def selftest() -> None:
             print("SELFTEST fixture G (raw mirrorCategoryDetail) did not trip the gate")
         else:
             print("SELFTEST G (raw mirrorCategoryDetail) RED as expected")
+
+        # fixture H: [da1024-E] ONE second decode back inside the composable
+        # block -> exactly one decode violation, and the fail-closed guard
+        # survives (so criterion 7 must stay green: each criterion has a
+        # fixture that breaks it and one that does not).
+        bad_nav_h = FIXTURE_NAV.replace(
+            'val instanceId = backStackEntry.arguments?.getString("instanceId")\n'
+            '            ?: return@composable',
+            'val instanceId = backStackEntry.arguments?.getString("instanceId")\n'
+            '            ?.let { android.net.Uri.decode(it) } ?: return@composable',
+        )
+        write_fixture(root, FIXTURE_DLH, bad_nav_h, FIXTURE_MAIN)
+        VIOLATIONS.clear()
+        check(root)
+        dec = [v for v in VIOLATIONS if "decodes a route argument" in v]
+        guard = [v for v in VIOLATIONS if "fail-closed guard" in v]
+        if len(dec) != 1 or guard:
+            ok = False
+            print(f"SELFTEST fixture H (one second decode) wrong verdict: {VIOLATIONS}")
+        else:
+            print("SELFTEST H (one second decode) RED as expected")
+
+        # fixture I: both args decoded again -> two decode violations (the
+        # criterion counts sites, it is not satisfied by the first hit).
+        bad_nav_i = bad_nav_h.replace(
+            'val entryId = backStackEntry.arguments?.getString("entryId")\n'
+            '            ?: return@composable',
+            'val entryId = backStackEntry.arguments?.getString("entryId")\n'
+            '            ?.let { android.net.Uri.decode(it) } ?: return@composable',
+        )
+        write_fixture(root, FIXTURE_DLH, bad_nav_i, FIXTURE_MAIN)
+        VIOLATIONS.clear()
+        check(root)
+        dec = [v for v in VIOLATIONS if "decodes a route argument" in v]
+        if len(dec) != 2:
+            ok = False
+            print(f"SELFTEST fixture I (both decoded again) expected 2 violations, got {len(dec)}")
+        else:
+            print("SELFTEST I (both decoded again) RED as expected")
+
+        # fixture I2: URLDecoder variant of the same defect -> still RED.
+        bad_nav_i2 = bad_nav_h.replace(
+            "?.let { android.net.Uri.decode(it) } ?: return@composable",
+            '?.let { java.net.URLDecoder.decode(it, "UTF-8") } ?: return@composable',
+        )
+        write_fixture(root, FIXTURE_DLH, bad_nav_i2, FIXTURE_MAIN)
+        VIOLATIONS.clear()
+        check(root)
+        if not [v for v in VIOLATIONS if "decodes a route argument" in v]:
+            ok = False
+            print("SELFTEST fixture I2 (URLDecoder double decode) did not trip the gate")
+        else:
+            print("SELFTEST I2 (URLDecoder double decode) RED as expected")
+
+        # fixture J: fail-closed guard dropped (no decode at all) -> only
+        # criterion 7 may fire.
+        bad_nav_j = FIXTURE_NAV.replace(
+            'arguments?.getString("instanceId")\n            ?: return@composable',
+            'arguments?.getString("instanceId") ?: ""',
+        ).replace(
+            'arguments?.getString("entryId")\n            ?: return@composable',
+            'arguments?.getString("entryId") ?: ""',
+        )
+        write_fixture(root, FIXTURE_DLH, bad_nav_j, FIXTURE_MAIN)
+        VIOLATIONS.clear()
+        check(root)
+        dec = [v for v in VIOLATIONS if "decodes a route argument" in v]
+        guard = [v for v in VIOLATIONS if "fail-closed guard" in v]
+        if not guard or dec:
+            ok = False
+            print(f"SELFTEST fixture J (guard dropped) wrong verdict: {VIOLATIONS}")
+        else:
+            print("SELFTEST J (fail-closed guard dropped) RED as expected")
 
     if not ok:
         sys.exit("DEEPLINK_SETTINGS_ROUTES_SELFTEST=FAIL")
