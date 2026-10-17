@@ -432,7 +432,7 @@ private fun HtmlPreview(item: FileItem) {
                         rendererEpoch += 1
                     }
                 }
-                val targetUrl = "file://${item.file.absolutePath}"
+                val targetUrl = fileUrlFor(item.file)
                 post { loadUrl(targetUrl) }
             }
         },
@@ -1220,7 +1220,7 @@ private fun printFile(context: Context, item: FileItem, preRenderedHtml: String?
             }
         }
         if (preRenderedHtml == null) {
-            webView.loadUrl("file://${item.file.absolutePath}")
+            webView.loadUrl(fileUrlFor(item.file))
         } else {
             webView.loadDataWithBaseURL(null, preRenderedHtml, "text/html", "utf-8", null)
         }
@@ -1366,4 +1366,59 @@ private fun collectImageGallery(
     }
     return items to startIdx
 }
+
+// ── file:// URL encoding (da1022-H / backlog §1021-V) ─────────────────────────
+
+// --- begin file-url-path-encode (JVM harness slices this region verbatim) ---
+
+private const val FILE_URL_HEX = "0123456789ABCDEF"
+
+/**
+ * Percent-encode an absolute filesystem path for use in a `file://` URL.
+ *
+ * Why this exists (backlog §1021-V, device-verified): a name containing `#`
+ * pasted raw into a `file://` URL makes WebView treat everything after the
+ * `#` as a fragment, so `a#b.html` loads as `a.html` → `net::ERR_FILE_NOT_FOUND`.
+ * Space, `?`, `%` and non-ASCII names break the same way.
+ *
+ * [com.rikkaminis.app.ui.preview.toAssetLoaderUrl] does NOT apply here: it
+ * maps to the asset loader's `https://appassets.androidplatform.net/` origin,
+ * which only resolves when a WebViewAssetLoader intercepts the load —
+ * FilePreviewScreen loads plain `file://` URLs, so it needs the path itself
+ * encoded. This is also why `android.net.Uri.encode(path, "/")` is not used:
+ * this function is JVM-pure (no Android imports) so it is unit-testable
+ * without Robolectric.
+ *
+ * Semantics: the RFC 3986 unreserved set (`ALPHA` / `DIGIT` / `-._~`) plus
+ * `/` survives byte-for-byte (encoding `/` would destroy the path structure);
+ * every other UTF-8 byte becomes `%XX`. `%` itself is escaped (`50%off` →
+ * `50%25off`), which is what keeps a file literally named `a#b.html` or
+ * `50%23.html` round-tripping to itself after WebView's percent-decode —
+ * deliberately NOT idempotent on already-encoded input for the same reason.
+ */
+internal fun encodeFileUrlPath(path: String): String {
+    val sb = StringBuilder(path.length)
+    for (b in path.toByteArray(Charsets.UTF_8)) {
+        val value = b.toInt() and 0xFF
+        val c = value.toChar()
+        val safe = c in 'A'..'Z' || c in 'a'..'z' || c in '0'..'9' ||
+            c == '-' || c == '.' || c == '_' || c == '~' || c == '/'
+        if (safe) {
+            sb.append(c)
+        } else {
+            sb.append('%').append(FILE_URL_HEX[value shr 4]).append(FILE_URL_HEX[value and 0x0F])
+        }
+    }
+    return sb.toString()
+}
+
+// --- end file-url-path-encode ---
+
+/**
+ * Build the `file://` URL for [file] with the path percent-encoded — never
+ * concatenate `"file://" + file.absolutePath` raw: a name containing `#` or
+ * `?` is parsed as fragment/query by WebView and the load fails with
+ * `net::ERR_FILE_NOT_FOUND` (backlog §1021-V, device-verified 2026-10-17).
+ */
+private fun fileUrlFor(file: File): String = "file://" + encodeFileUrlPath(file.absolutePath)
 
