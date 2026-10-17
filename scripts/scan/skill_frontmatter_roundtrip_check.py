@@ -1,0 +1,465 @@
+#!/usr/bin/env python3
+"""
+Gate: FIX-E (deep-audit-1023 ISSUE-05, P1) — SKILL.md frontmatter integrity on
+the write path: memory-first merge base, update chain carries the block, and
+the merge exit emits a parsable (single-delimiter) document.
+
+ISSUE-05: writeSkillMd seeded its merge with `existing ?: skill.frontmatter`
+(disk shadows the incoming block), update() had no frontmatter parameter (the
+URL / file update chain could not hand the remote block over), and the merge
+walk duplicated the opening `---` (an unparsable document).
+
+Fix contract asserted here (code anchors, comments stripped before matching):
+
+  arm1  resolveMergeBase is defined, its FIRST parameter is the fresh block
+        (polarity lives in the parameter order)
+  arm2  writeSkillMd calls resolveMergeBase(skill.frontmatter, existing) and
+        the pre-fix expression `existing ?: skill.frontmatter` is gone
+  arm3  update() gained `frontmatter: String? = null` and re-seeds its copy
+        from the on-disk SKILL.md when the caller passes none
+  arm4  updateFromURL passes `frontmatter = parsed.frontmatter...`
+  arm5  ParsedSkill carries the block and parseSkillMd populates it
+  arm6  importFromContent consumes parsed.frontmatter (replace + add branch)
+  arm7  mergeFrontmatter's walk starts at line 1 — no doubled opening `---`
+        (scoped to mergeFrontmatter; renameFrontmatterName's offset loop is a
+        different, correct `0 until`)
+  arm8  the SKILL.md viewer renders through the repository's single merge exit
+        instead of hand-splicing a 3-key block
+
+Usage: python3 scripts/scan/skill_frontmatter_roundtrip_check.py [repo_root]
+       python3 scripts/scan/skill_frontmatter_roundtrip_check.py --selftest
+Exit:  0 = clean, 1 = violation(s), 2 = usage
+"""
+import os
+import sys
+
+REPO_REL = "src/android/app/src/main/java/com/rikkaminis/app"
+SR_REL = REPO_REL + "/data/repository/SkillRepository.kt"
+SM_REL = REPO_REL + "/ui/settings/SkillsManagementScreen.kt"
+
+SELFTEST_MARK = "SKILL_FRONTMATTER_ROUNDTRIP_SELFTEST=PASS"
+
+# ── anchors ──────────────────────────────────────────────────────────────
+RESOLVE_DEF = "internal fun resolveMergeBase("
+RESOLVE_FIRST_PARAM = "newFrontmatter: String?,"
+WRITE_CALL = "resolveMergeBase(skill.frontmatter, existing)"
+OLD_POLARITY = "existing ?: skill.frontmatter"
+UPDATE_PARAM = "frontmatter: String? = null"
+UPDATE_RESEED = "?: readSkillMdFrontmatter(id).ifBlank { current.frontmatter }"
+URL_PASSES = "frontmatter = parsed.frontmatter.ifBlank { null }"
+PARSED_FIELD = "val frontmatter: String = \"\""
+PARSE_RETURNS = "frontmatter = SubagentSkill.extractFrontmatterBlock(trimmed)"
+IMPORT_REPLACE = "frontmatter = parsed.frontmatter.ifBlank { current.frontmatter }"
+IMPORT_ADD = "frontmatter = parsed.frontmatter,"
+MERGE_WALK_FIXED = "for (i in 1 until frontmatterEnd)"
+MERGE_WALK_DOUBLED = "for (i in 0 until frontmatterEnd)"
+VIEWER_EXIT = "SkillRepository.mergeFrontmatter("
+VIEWER_SPLICE = 'appendLine("name: '
+DETAIL_PASSES = "frontmatter = parsed.frontmatter.ifBlank { null }"
+
+
+def strip_comments(text):
+    """Remove // and /* */ comments; strings are kept (length-preserving)."""
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            if text.startswith('"""', i):
+                j = text.find('"""', i + 3)
+                j = n if j < 0 else j + 3
+            else:
+                j = i + 1
+                while j < n:
+                    if text[j] == "\\":
+                        j += 2
+                        continue
+                    if text[j] in ('"', "\n"):
+                        j += 1
+                        break
+                    j += 1
+            out.append(text[i:j])
+            i = j
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i)
+            i = n if j < 0 else j + 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def mask_strings(text):
+    """Replace string-literal CONTENTS with 'x' (length-preserving) so brace
+    matching survives `${...}` templates."""
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            if text.startswith('"""', i):
+                j = text.find('"""', i + 3)
+                j = n if j < 0 else j + 3
+                out.append('x' * (j - i))
+            else:
+                j = i + 1
+                while j < n:
+                    if text[j] == "\\":
+                        j += 2
+                        continue
+                    if text[j] in ('"', "\n"):
+                        j += 1
+                        break
+                    j += 1
+                out.append('x' * (j - i))
+            i = j
+        elif c == "'":
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] in ("'", "\n"):
+                    j += 1
+                    break
+                j += 1
+            out.append('x' * (j - i))
+            i = j
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def function_body(text_nc, text_masked, signature):
+    """The {...} block of the function whose signature matches `signature`
+    (first occurrence), via brace matching on the string-masked text."""
+    idx = text_nc.find(signature)
+    if idx < 0:
+        return None
+    open_idx = text_masked.find("{", idx)
+    if open_idx < 0:
+        return None
+    depth = 0
+    for i in range(open_idx, len(text_masked)):
+        if text_masked[i] == "{":
+            depth += 1
+        elif text_masked[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text_nc[idx:i + 1]
+    return None
+
+
+def run_checks_text(sr_text, sm_text):
+    sr_nc = strip_comments(sr_text)
+    sm_nc = strip_comments(sm_text)
+    sr_masked = mask_strings(sr_nc)
+    sm_masked = mask_strings(sm_nc)
+
+    failures = []
+
+    def check(name, cond, detail=""):
+        if not cond:
+            failures.append("%s%s" % (name, (" — " + detail) if detail else ""))
+
+    # arm1+2: polarity, single exit, call-site ordering
+    check("arm1 resolveMergeBase defined", RESOLVE_DEF in sr_nc)
+    check("arm1 first param is the fresh block",
+          RESOLVE_FIRST_PARAM in sr_nc,
+          "polarity lives in the parameter order (memory-first)")
+    check("arm2 writeSkillMd uses the single exit (caller block first)",
+          WRITE_CALL in sr_nc)
+    check("arm2 pre-fix polarity expression gone",
+          OLD_POLARITY not in sr_nc,
+          "`existing ?: skill.frontmatter` still present (code, not comment)")
+
+    # arm3: update() carries + re-seeds
+    update_body = function_body(sr_nc, sr_masked, "fun update(")
+    check("arm3 update() signature has frontmatter param",
+          update_body is not None and UPDATE_PARAM in update_body.split("): Boolean")[0])
+    check("arm3 update() re-seeds from disk when no block passed",
+          update_body is not None and UPDATE_RESEED in update_body)
+
+    # arm4: updateFromURL passes the remote block
+    url_body = function_body(sr_nc, sr_masked, "suspend fun updateFromURL(")
+    if url_body is None:
+        url_body = function_body(sr_nc, sr_masked, "fun updateFromURL(")
+    check("arm4 updateFromURL passes parsed.frontmatter",
+          url_body is not None and "frontmatter = parsed.frontmatter" in url_body)
+
+    # arm5: ParsedSkill carries the block; parseSkillMd populates it
+    check("arm5 ParsedSkill has the frontmatter field", PARSED_FIELD in sr_nc)
+    parse_body = function_body(sr_nc, sr_masked, "private fun parseSkillMd(")
+    check("arm5 parseSkillMd returns the block",
+          parse_body is not None and PARSE_RETURNS in parse_body)
+
+    # arm6: importFromContent consumes parsed.frontmatter (both branches)
+    import_body = function_body(sr_nc, sr_masked, "fun importFromContent(")
+    check("arm6 importFromContent replace branch uses parsed.frontmatter",
+          import_body is not None and IMPORT_REPLACE in import_body)
+    check("arm6 importFromContent add branch uses parsed.frontmatter",
+          import_body is not None and IMPORT_ADD in import_body)
+    check("arm6 no per-site re-extraction left in importFromContent",
+          import_body is not None and "extractFrontmatterBlock(content)" not in import_body)
+
+    # arm7: the merge walk must not duplicate the opening delimiter
+    merge_body = function_body(sr_nc, sr_masked, "internal fun mergeFrontmatter(")
+    check("arm7 mergeFrontmatter walk starts at line 1",
+          merge_body is not None and MERGE_WALK_FIXED in merge_body)
+    check("arm7 doubled walk gone from mergeFrontmatter",
+          merge_body is not None and MERGE_WALK_DOUBLED not in merge_body,
+          "renameFrontmatterName's `0 until` offset loop is a different, correct site")
+
+    # arm8: the viewer renders through the single merge exit
+    viewer_idx = sm_nc.find("val initialContent = remember")
+    viewer_seg = sm_nc[viewer_idx:viewer_idx + 4000] if viewer_idx >= 0 else ""
+    check("arm8 viewer renders through the repository merge exit",
+          VIEWER_EXIT in viewer_seg)
+    check("arm8 hand-spliced 3-key block gone from the viewer",
+          VIEWER_SPLICE not in viewer_seg)
+    # the detail "update from file" path passes the block too
+    check("arm8 update-from-file passes parsed.frontmatter",
+          DETAIL_PASSES in sm_nc)
+
+    return failures
+
+
+def run_checks(repo_root):
+    sr = open(os.path.join(repo_root, SR_REL), encoding="utf-8").read()
+    sm = open(os.path.join(repo_root, SM_REL), encoding="utf-8").read()
+    return run_checks_text(sr, sm)
+
+
+# ── selftest fixtures ────────────────────────────────────────────────────
+
+GOOD_SR = '''package com.rikkaminis.app.data.repository
+
+class SkillRepository {
+    companion object {
+        internal fun mergeFrontmatter(
+            existing: String?,
+            name: String,
+            description: String,
+            version: String,
+            body: String,
+        ): String {
+            val raw = existing?.trimStart().orEmpty()
+            val src = raw.lines()
+            var frontmatterEnd = -1
+            if (raw.startsWith("---") && src.isNotEmpty()) {
+                for (i in 1 until src.size) {
+                    if (src[i].trim() == "---") { frontmatterEnd = i; break }
+                }
+            }
+            if (frontmatterEnd < 0) {
+                return buildString {
+                    appendLine("---")
+                    appendLine("name: " + name)
+                    appendLine("---")
+                    append(body)
+                }
+            }
+            val fm = mutableListOf<String>()
+            for (i in 1 until frontmatterEnd) {
+                fm.add(src[i])
+            }
+            return buildString {
+                appendLine("---")
+                for (line in fm) appendLine(line)
+                appendLine("---")
+                append(body)
+            }
+        }
+
+        internal fun resolveMergeBase(
+            newFrontmatter: String?,
+            diskContent: String?,
+        ): String? = newFrontmatter?.ifBlank { null } ?: diskContent
+    }
+
+    private fun writeSkillMd(skill: Skill) {
+        val dir = java.io.File("/tmp/skills", skill.id)
+        dir.mkdirs()
+        val file = java.io.File(dir, "SKILL.md")
+        val existing = runCatching { file.readText() }.getOrNull()
+        val mergeBase = resolveMergeBase(skill.frontmatter, existing)
+        val content = mergeFrontmatter(
+            existing = mergeBase,
+            name = skill.name,
+            description = skill.description,
+            version = skill.version,
+            body = skill.body,
+        )
+        file.writeText(content)
+    }
+
+    suspend fun updateFromURL(skillId: String, content: String): Boolean {
+        val parsed = parseSkillMd(content) ?: return false
+        val ok = update(
+            id = skillId,
+            name = parsed.name,
+            description = parsed.description,
+            body = parsed.body,
+            version = parsed.version,
+            frontmatter = parsed.frontmatter.ifBlank { null },
+        )
+        return ok
+    }
+
+    private fun readSkillMdFrontmatter(id: String): String = "---"
+
+    fun update(
+        id: String,
+        name: String? = null,
+        description: String? = null,
+        body: String? = null,
+        version: String? = null,
+        frontmatter: String? = null,
+    ): Boolean {
+        val current = _skills.value.find { it.id == id } ?: return false
+        val updated = current.copy(
+            name = name ?: current.name,
+            frontmatter = frontmatter?.ifBlank { null }
+                ?: readSkillMdFrontmatter(id).ifBlank { current.frontmatter },
+        )
+        return true
+    }
+
+    data class ParsedSkill(
+        val name: String,
+        val description: String,
+        val version: String = "1.0.0",
+        val body: String,
+        val frontmatter: String = "",
+    )
+
+    private fun parseSkillMd(content: String): ParsedSkill? {
+        val trimmed = content.trimStart()
+        if (!trimmed.startsWith("---")) return null
+        return ParsedSkill(
+            "n", "d", "1.0.0", "b",
+            frontmatter = SubagentSkill.extractFrontmatterBlock(trimmed),
+        )
+    }
+
+    fun importFromContent(content: String): Skill? {
+        val parsed = parseSkillMd(content) ?: return null
+        val id = "x"
+        if (id.isNotBlank() && _skills.value.any { it.id == id }) {
+            val current = _skills.value.first { it.id == id }
+            val replaced = current.copy(
+                frontmatter = parsed.frontmatter.ifBlank { current.frontmatter },
+            )
+            return replaced
+        }
+        return add(
+            name = parsed.name,
+            frontmatter = parsed.frontmatter,
+        )
+    }
+}
+'''
+
+GOOD_SM = '''package com.rikkaminis.app.ui.settings
+
+val initialContent = remember(skillId, relativePath, skill.updatedAt) {
+    if (isSkillMd) {
+        SkillRepository.mergeFrontmatter(
+            existing = skill.frontmatter.ifBlank { null },
+            name = skill.name,
+            description = skill.description,
+            version = skill.version ?: "1.0.0",
+            body = skill.body,
+        )
+    } else {
+        skillRepository.readSkillFile(skillId, relativePath) ?: ""
+    }
+}
+
+// viewer save path passes the block too:
+val ok = skillRepository.update(
+    id = skill.id,
+    name = parsed.name,
+    version = parsed.version,
+    frontmatter = parsed.frontmatter.ifBlank { null },
+)
+'''
+
+# dirty variants — each flips exactly one arm
+DIRTY_SR_POLARITY = GOOD_SR.replace(
+    "resolveMergeBase(skill.frontmatter, existing)",
+    "existing ?: skill.frontmatter.ifBlank { null }").replace(
+    "): String? = newFrontmatter?.ifBlank { null } ?: diskContent",
+    "): String? = diskContent ?: newFrontmatter?.ifBlank { null }")
+DIRTY_SR_WALK = GOOD_SR.replace("for (i in 1 until frontmatterEnd) {\n                fm.add(src[i])",
+                                "for (i in 0 until frontmatterEnd) {\n                fm.add(src[i])")
+DIRTY_SR_UPDATE = GOOD_SR.replace("        frontmatter: String? = null,\n    ): Boolean {",
+                                  "    ): Boolean {")
+DIRTY_SR_PARSE = GOOD_SR.replace(
+    "            frontmatter = SubagentSkill.extractFrontmatterBlock(trimmed),\n        )\n    }\n\n    fun importFromContent",
+    "        )\n    }\n\n    fun importFromContent")
+DIRTY_SM_SPLICE = GOOD_SM.replace(
+    """        SkillRepository.mergeFrontmatter(
+            existing = skill.frontmatter.ifBlank { null },
+            name = skill.name,
+            description = skill.description,
+            version = skill.version ?: "1.0.0",
+            body = skill.body,
+        )""",
+    """        buildString {
+            appendLine("---")
+            appendLine("name: " + skill.name)
+            appendLine("---")
+            append(skill.body)
+        }""")
+
+
+def selftest():
+    # tempfile.mkdtemp resolves through the guest-tmp translation (host-side
+    # path the sandbox cannot reopen) — run the checks on in-memory text
+    # instead; the repo-root wrapper above is the only filesystem path.
+    ok = True
+
+    def run(sr_text, sm_text):
+        return run_checks_text(sr_text, sm_text)
+
+    f = run(GOOD_SR, GOOD_SM)
+    print("selftest clean tree: %s" % ("PASS" if not f else "FAIL %s" % f))
+    ok &= not f
+
+    for label, sr_t, sm_t in [
+        ("polarity reverted", DIRTY_SR_POLARITY, GOOD_SM),
+        ("delimiter walk reverted", DIRTY_SR_WALK, GOOD_SM),
+        ("update() loses frontmatter param", DIRTY_SR_UPDATE, GOOD_SM),
+        ("parseSkillMd stops returning the block", DIRTY_SR_PARSE, GOOD_SM),
+        ("viewer hand-splice returns", GOOD_SR, DIRTY_SM_SPLICE),
+    ]:
+        f = run(sr_t, sm_t)
+        red = len(f) > 0
+        print("selftest dirty %-38s: %s %s" % (label, "RED" if red else "NOT-RED", f[:1]))
+        ok &= red
+
+    print(SELFTEST_MARK if ok else "SKILL_FRONTMATTER_ROUNDTRIP_SELFTEST=FAIL")
+    return 0 if ok else 1
+
+
+def main():
+    if len(sys.argv) == 2 and sys.argv[1] == "--selftest":
+        sys.exit(selftest())
+    repo = sys.argv[1] if len(sys.argv) > 1 else "."
+    failures = run_checks(repo)
+    if failures:
+        print("FAIL %s" % SR_REL)
+        for f in failures:
+            print("  - %s" % f)
+        sys.exit(1)
+    print("OK %s + %s (%d arms)" % (SR_REL, SM_REL, 12))
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
