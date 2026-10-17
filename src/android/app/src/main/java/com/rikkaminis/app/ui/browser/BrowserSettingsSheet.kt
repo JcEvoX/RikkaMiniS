@@ -116,6 +116,12 @@ fun BrowserSettingsSheet(
     // Cookie filter (mirrors iOS `.searchable("Filter by domain")`).
     var cookieFilterText by remember { mutableStateOf("") }
 
+    // [fix/da1022-G] Refresh tick for the cookie section. hasCookies/domains were
+    // computed from plain locals with no State write on delete/clear, so nothing
+    // triggered recomposition and the list + Clear-All button stayed stale.
+    // Declared at the top level so the clear-all AlertDialog below can bump it.
+    var cookieRefreshTick by remember { mutableStateOf(0) }
+
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState,
@@ -339,9 +345,30 @@ fun BrowserSettingsSheet(
             )
             Spacer(Modifier.height(8.dp))
 
-            val hasCookies = CookieManager.getInstance().hasCookies()
+            // [fix/da1022-G] hasCookies was a plain local var; keying on a tick state
+            // is what makes delete/clear actually refresh the section.
+            val cookieManager = remember { CookieManager.getInstance() }
+            val hasCookies = remember(cookieRefreshTick) { cookieManager.hasCookies() }
             val historyStore = remember { com.rikkaminis.app.browser.BrowserHistoryStore.getInstance(context) }
-            val allDomains = remember(hasCookies) { historyStore.uniqueDomains() }
+            // [fix/da1022-G] Real cookie domains cannot be enumerated on Android
+            // (getCookie(url) needs a URL; hasCookies() is just a boolean), so the
+            // list is the history domains probed against both schemes — exactly the
+            // domains the per-domain delete below can clear. Domains holding only
+            // HttpOnly cookies are invisible to getCookie and drop out; the
+            // `hasCookies -> cookies_stored` empty-state branch covers that case.
+            // ponytail: 域名列表 = 历史域 × 双 scheme 可读 cookie 探查（Android 无枚举 API）
+            // | 天花板: 仅持 HttpOnly cookie 的域不出现在列表（per-domain 删除本来就碰不到它们）
+            // | 升级触发: WebView 暴露 cookie 枚举 API，或用户要求列出/删除 HttpOnly 域
+            val allDomains = remember(hasCookies, cookieRefreshTick) {
+                if (!hasCookies) {
+                    emptyList()
+                } else {
+                    historyStore.uniqueDomains().filter { domain ->
+                        !cookieManager.getCookie("https://$domain").isNullOrBlank() ||
+                            !cookieManager.getCookie("http://$domain").isNullOrBlank()
+                    }
+                }
+            }
             val domains = remember(allDomains, cookieFilterText) {
                 if (cookieFilterText.isBlank()) allDomains
                 else allDomains.filter { it.contains(cookieFilterText.trim(), ignoreCase = true) }
@@ -390,14 +417,24 @@ fun BrowserSettingsSheet(
                                     // HttpOnly cookies are invisible to getCookie, so
                                     // Android offers no way to expire those per domain.
                                     val cm = CookieManager.getInstance()
-                                    val url = if (domain.startsWith("http")) domain else "https://$domain"
-                                    val names = cm.getCookie(url).orEmpty()
-                                        .split(';')
-                                        .mapNotNull { part ->
-                                            part.substringBefore('=').trim().takeIf { it.isNotEmpty() }
-                                        }
-                                    names.forEach { cm.setCookie(url, "$it=; Max-Age=0; Path=/") }
+                                    // [fix/da1022-G] History domains are URI hosts
+                                    // (no scheme) — expire both variants, or a
+                                    // cookie set over http survives the deletion.
+                                    val candidateUrls = if (domain.startsWith("http")) {
+                                        listOf(domain)
+                                    } else {
+                                        listOf("https://$domain", "http://$domain")
+                                    }
+                                    for (url in candidateUrls) {
+                                        val names = cm.getCookie(url).orEmpty()
+                                            .split(';')
+                                            .mapNotNull { part ->
+                                                part.substringBefore('=').trim().takeIf { it.isNotEmpty() }
+                                            }
+                                        names.forEach { cm.setCookie(url, "$it=; Max-Age=0; Path=/") }
+                                    }
                                     cm.flush()
+                                    cookieRefreshTick++
                                 },
                                 modifier = Modifier.size(32.dp),
                             ) {
@@ -431,9 +468,17 @@ fun BrowserSettingsSheet(
             text = { Text(stringResource(R.string.browser_settings_clear_all_dialog_message)) },
             confirmButton = {
                 MinisTextButton(onClick = {
-                    CookieManager.getInstance().removeAllCookies(null)
+                    // [fix/da1022-G] removeAllCookies(null) left no flush and no
+                    // refresh: use the callback form to persist + bump the tick,
+                    // and bump immediately for the (possibly synchronous) case.
+                    val cm = CookieManager.getInstance()
+                    cm.removeAllCookies {
+                        cm.flush()
+                        cookieRefreshTick++
+                    }
                     WebStorage.getInstance().deleteAllData()
                     showClearConfirm = false
+                    cookieRefreshTick++
                 }) {
                     Text(stringResource(R.string.browser_settings_clear), color = MaterialTheme.colorScheme.error)
                 }
