@@ -1900,47 +1900,25 @@ class ModelExecutionService : Service() {
         ModelUseProtocol.parseChatExtraBody(inputJson, warnings)
 
     /**
-     * [fix/audit0917-b8] Header values are JSON strings — the same dialect the
-     * in-process path (`ModelUseOffloadHandler.parseExtraHeaders`) documents
-     * and enforces. The worker path used to be silently *lax* (`optString`
-     * stringified numbers, and the image route dropped non-strings with no
-     * trace), so a typo'd header looked like it had been sent. Both routes now
-     * drop + warn identically.
+     * [da1019 ISSUE-01] Delegates to the single shared dialect in
+     * [ModelUseProtocol]. This copy used to read `extra_headers` with
+     * `optJSONObject` — a present-but-not-an-object value was dropped with
+     * **zero** warning while the in-process route warned — and its KDoc
+     * claimed "both routes now drop + warn identically".
      */
-    private fun jsonTypeName(v: Any?): String = when (v) {
-        null, JSONObject.NULL -> "null"
-        is String -> "string"
-        is Boolean -> "bool"
-        is Number -> "number"
-        is JSONArray -> "array"
-        is JSONObject -> "object"
-        else -> v.javaClass.simpleName
-    }
+    private fun parseExtraHeaders(inputJson: String, warnings: MutableList<String>): Map<String, String> =
+        ModelUseProtocol.parseExtraHeaders(inputJson, warnings)
 
-    private fun parseExtraHeaders(inputJson: String, warnings: MutableList<String>): Map<String, String> {
-        val obj = try { val t = inputJson.trim(); if (t.startsWith("{")) JSONObject(t) else null }
-        catch (_: Exception) { null } ?: return emptyMap()
-        val eh = obj.optJSONObject("extra_headers") ?: return emptyMap()
-        val result = linkedMapOf<String, String>()
-        for (key in eh.keys()) {
-            val v = eh.opt(key)
-            if (v is String) {
-                result[key] = v
-            } else {
-                warnings.add(
-                    "extra_headers.$key value is not a string (actual type: ${jsonTypeName(v)}) — " +
-                        "this header was ignored. Header values must be JSON strings.",
-                )
-            }
-        }
-        return result
-    }
-
-    private fun parseCustomEndpointPath(inputJson: String): String? {
-        val obj = try { val t = inputJson.trim(); if (t.startsWith("{")) JSONObject(t) else null }
-        catch (_: Exception) { null } ?: return null
-        return obj.optString("endpoint", "").ifEmpty { null }
-    }
+    /**
+     * [da1019 ISSUE-01] Delegates to [ModelUseProtocol]. This copy used to
+     * accept ANY non-empty `endpoint` string as a path — including symbolic
+     * endpoint-mode values like `{"endpoint":"chat"}` — and write it into
+     * `provider.absoluteEndpointOverride` + `applied_extras.custom_endpoint`.
+     * The shared dialect requires a "/" prefix (and reads `image_endpoint`
+     * first, which the worker never saw at all).
+     */
+    private fun parseCustomEndpointPath(inputJson: String): String? =
+        ModelUseProtocol.parseCustomEndpointPath(inputJson)
 
 
     /**
@@ -1974,24 +1952,11 @@ class ModelExecutionService : Service() {
             for (key in eb.keys()) body[key] = eb.opt(key)
         }
         if (body.isNotEmpty()) openAI.imageExtraBody = body
-        val headers = LinkedHashMap<String, String>()
-        obj.optJSONObject("extra_headers")?.let { eh ->
-            for (key in eh.keys()) {
-                val v = eh.opt(key)
-                if (v is String) {
-                    headers[key] = v
-                } else {
-                    // [fix/audit0917-b8] Same dialect + same visibility as the
-                    // in-process path; the old `if (v is String)` dropped
-                    // these without a trace, so a non-string header looked
-                    // like it had been sent.
-                    warnings.add(
-                        "extra_headers.$key value is not a string (actual type: ${jsonTypeName(v)}) — " +
-                            "this header was ignored. Header values must be JSON strings.",
-                    )
-                }
-            }
-        }
+        // [da1019 ISSUE-01] This was a THIRD copy of the `extra_headers`
+        // dialect inside the worker: `optJSONObject(...)` meant a
+        // present-but-not-an-object value was dropped without a warning here
+        // as well. One parser now, three call sites.
+        val headers = ModelUseProtocol.parseExtraHeaders(inputJson, warnings)
         if (headers.isNotEmpty()) openAI.imageExtraHeaders = headers
         obj.optString("endpoint_path", "").trim().takeIf { it.isNotEmpty() }?.let {
             openAI.imagePathOverride = it

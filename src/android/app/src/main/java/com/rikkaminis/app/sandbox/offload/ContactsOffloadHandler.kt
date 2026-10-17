@@ -30,29 +30,51 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
 
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
         val rawArgs = request.argv.drop(1)
-        if (rawArgs.isEmpty() || rawArgs[0] == "-h" || rawArgs[0] == "--help") {
+        // T54 / [da1019-J]: parse once, then dispatch off the PARSED positional
+        // list — never off the raw argv. OffloadArgs has already stripped the
+        // shared output-shaping flags (--compact / -q / --quiet) and consumed
+        // named values (`--max 10`), so an option placed before the subcommand
+        // no longer takes the subcommand or the <id> slot.
+        // [sweep1014-B34] fixed only the search query in this file; dispatch,
+        // needsWrite and get/delete kept reading `rawArgs[0]`, so
+        // `android-contacts --compact list` died with "unknown subcommand
+        // '--compact'" and `android-contacts get --compact 42` read "--compact"
+        // as the id (exit 2) — both are 100%-reproducible agent CLI combos.
+        val cmd = parseContactsCommand(rawArgs)
+        val parsedArgs = cmd.args
+
+        // Help + empty-invocation handling moves to the parsed flags too, the
+        // same shape as every other android-* handler
+        // (`args.hasFlag("h", "help")`). It needs the help/h booleanFlags
+        // declaration ([sweep1014-B26a]): without it `--help list` greedily
+        // binds "list" as the *value* of --help and the flag disappears.
+        // Behaviour delta vs. the old first-token check: `--help` in any
+        // position now prints help (was: only as argv[1]).
+        if (rawArgs.isEmpty() || parsedArgs.hasFlag("h", "help")) {
             return NativeOffloadResult(0, HELP_TEXT)
         }
-        // T54: parse for shared --compact / -q / --quiet handling. Subcommand
-        // dispatch still keys off the raw `rawArgs`; the search query reads
-        // parsedArgs.positional[1] ([sweep1014-B34]) because OffloadArgs has
-        // already consumed named values like `--max 10`.
-        val parsedArgs = OffloadArgs(rawArgs)
 
         // T330: tri-state agent gate before any work or system permission ask.
         OffloadGate.enforce("contacts", "android-contacts", parsedArgs, request)?.let { return it }
 
         // delete needs WRITE_CONTACTS in addition to READ; the read-only path
         // is fine with READ_CONTACTS alone.
-        val needsWrite = rawArgs[0] == "delete"
+        val needsWrite = cmd.sub == "delete"
         ensurePermission(needsWrite = needsWrite, args = parsedArgs)?.let { return it }
 
         return try {
-            when (val sub = rawArgs[0]) {
-                "list" -> doList(rawArgs.drop(1), parsedArgs)
-                "search" -> doSearch(rawArgs.drop(1), parsedArgs)
-                "get" -> doGet(rawArgs.drop(1), parsedArgs)
-                "delete" -> doDelete(rawArgs.drop(1), parsedArgs)
+            when (val sub = cmd.sub) {
+                "list" -> doList(parsedArgs)
+                "search" -> doSearch(parsedArgs)
+                "get" -> doGet(cmd.id, parsedArgs)
+                "delete" -> doDelete(cmd.id, parsedArgs)
+                // sub == null ⇒ the argv held only options / named values
+                // (a bare `--compact`, `--max 10`): there is no subcommand to
+                // name, so say that instead of quoting the literal "null".
+                null -> NativeOffloadResult(
+                    2,
+                    "android-contacts: missing subcommand — expected one of list / search / get / delete\n$HELP_TEXT",
+                )
                 else -> NativeOffloadResult(2, "android-contacts: unknown subcommand '$sub'\n$HELP_TEXT")
             }
         } catch (e: SecurityException) {
@@ -146,8 +168,8 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
         }
     }
 
-    private fun doList(args: List<String>, parsedArgs: OffloadArgs): NativeOffloadResult {
-        val max = parseMax(args, default = 50)
+    private fun doList(parsedArgs: OffloadArgs): NativeOffloadResult {
+        val max = listMax(parsedArgs)
         val projection = arrayOf(
             ContactsContract.Contacts._ID,
             ContactsContract.Contacts.DISPLAY_NAME_PRIMARY,
@@ -169,7 +191,7 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
         return NativeOffloadResult(0, OffloadOutput.formatBody(arr.toString(2), parsedArgs) + "\n")
     }
 
-    private fun doSearch(args: List<String>, parsedArgs: OffloadArgs): NativeOffloadResult {
+    private fun doSearch(parsedArgs: OffloadArgs): NativeOffloadResult {
         // [sweep1014-B34] The old `args.firstOrNull { !it.startsWith("-") }`
         // scanned the RAW args, so `search --max 10 Alice` picked "10" as the
         // query and dropped "Alice". parsedArgs has already consumed the named
@@ -201,8 +223,8 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
         return NativeOffloadResult(0, OffloadOutput.formatBody(arr.toString(2), parsedArgs) + "\n")
     }
 
-    private fun doGet(args: List<String>, parsedArgs: OffloadArgs): NativeOffloadResult {
-        val id = args.firstOrNull()?.toLongOrNull()
+    private fun doGet(contactId: Long?, parsedArgs: OffloadArgs): NativeOffloadResult {
+        val id = contactId
             ?: return NativeOffloadResult(2, "android-contacts get: missing or invalid <id>\n")
 
         val projection = arrayOf(
@@ -235,8 +257,8 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
      * that the aggregated URI silently refuses (commonly orphaned raw rows
      * left by sync adapters or test inserts).
      */
-    private fun doDelete(args: List<String>, parsedArgs: OffloadArgs): NativeOffloadResult {
-        val id = args.firstOrNull()?.toLongOrNull()
+    private fun doDelete(contactId: Long?, parsedArgs: OffloadArgs): NativeOffloadResult {
+        val id = contactId
             ?: return NativeOffloadResult(2, "android-contacts delete: missing or invalid <id>\n")
 
         var deleted = context.contentResolver.delete(
@@ -383,12 +405,6 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
         return aggregateValues(pairs)
     }
 
-    private fun parseMax(args: List<String>, default: Int): Int {
-        val i = args.indexOfFirst { it == "--max" || it == "-n" }
-        if (i < 0 || i + 1 >= args.size) return default
-        return args[i + 1].toIntOrNull() ?: default
-    }
-
     companion object {
         private const val TAG = "ContactsOffload"
         // [sweep1014-P10] SQLite's default host-parameter ceiling is 999;
@@ -400,6 +416,61 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
          * --max-swallowed-query regression stays testable off-device.
          */
         private fun searchQueryOf(positional: List<String>): String? = positional.getOrNull(1)
+
+        /** Default page size for `list` when no `--max` is given. */
+        private const val DEFAULT_LIST_MAX = 50
+
+        /**
+         * [da1019-J] The parsed shape of one `android-contacts` invocation
+         * (argv with the program name already dropped). Pure value — no
+         * Context, no filesystem — so subcommand / id resolution stays
+         * testable off-device.
+         */
+        internal data class ContactsCommand(
+            /** positional[0] — the subcommand, or null when every token was an option. */
+            val sub: String?,
+            /** positional[1] parsed as a contact id — consumed by `get` / `delete`. */
+            val id: Long?,
+            val args: OffloadArgs,
+        )
+
+        /**
+         * [da1019-J] Parse the raw argv into [ContactsCommand]. Dispatch,
+         * `needsWrite` and the id lookup all key off
+         * [OffloadArgs.positional] instead of the raw list, so output-shaping
+         * flags (`--compact` / `-q` / `--quiet`) and named values
+         * (`--max 10`) no longer shift the subcommand / id slots.
+         *
+         * `help` / `h` must be declared as boolean flags: otherwise
+         * `--help list` greedily binds "list" as the *value* of --help and
+         * both the flag and the subcommand vanish ([sweep1014-B26a]).
+         */
+        internal fun parseContactsCommand(argv: List<String>): ContactsCommand {
+            val args = OffloadArgs(argv, booleanFlags = setOf("help", "h"))
+            return ContactsCommand(
+                sub = args.positional.getOrNull(0),
+                id = args.positional.getOrNull(1)?.toLongOrNull(),
+                args = args,
+            )
+        }
+
+        /**
+         * [da1019-J] `--max N` (and `--max=N`) is a named value that
+         * [OffloadArgs] consumes, so it is read through [OffloadArgs.getInt].
+         * The legacy `-n N` short form binds no value in the parser (a short
+         * option becomes a bare flag and its value lands in
+         * [OffloadArgs.positional]), so that form is read as the positional
+         * right after the subcommand. This replaces the old raw-argv scan
+         * (`parseMax`) — the last site in this file that still walked the
+         * unparsed argument list. Pure so both arms stay testable off-device.
+         */
+        internal fun listMax(parsedArgs: OffloadArgs, default: Int = DEFAULT_LIST_MAX): Int {
+            parsedArgs.getInt("max")?.let { return it }
+            if (parsedArgs.hasFlag("n")) {
+                parsedArgs.positional.getOrNull(1)?.toIntOrNull()?.let { return it }
+            }
+            return default
+        }
 
         /** "?,?,…" placeholder list for an IN (…) selection. Pure. */
         private fun inPlaceholders(count: Int): String = List(count) { "?" }.joinToString(",")

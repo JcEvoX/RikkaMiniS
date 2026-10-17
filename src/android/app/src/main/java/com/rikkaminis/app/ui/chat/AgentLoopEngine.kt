@@ -278,6 +278,68 @@ internal object EofStubReminderStackGuard {
                 ?.contains(REMINDER_MARKER) == true
 }
 
+/**
+ * [deep-audit-1019 ISSUE-02] Pure transition table for the tool-block status a
+ * dispatch publishes, for the three-pass tool dispatch in
+ * [AgentLoopEngine.runAgentLoop].
+ *
+ * Pass 1 decides whether a queued call may run at all (same-turn dedupe /
+ * truncation guard / loop detector / preflight); Pass 2 hands the survivors to
+ * `host.executeTool`. The PENDING → RUNNING flip belongs to Pass 2 — the moment
+ * a call is really dispatched — because until then the call is still QUEUED.
+ * Publishing it in Pass 1 (where it used to live, above BOTH refusal gates)
+ * broke two things at once:
+ *
+ *  * a call the loop detector refused with CRITICAL had already been shown as
+ *    RUNNING, and that refusal path edited the block in memory only — so the
+ *    card kept its spinner until the turn's next bulk publish, while every
+ *    sibling refusal path (dedupe / truncation / preflight) publishes its flip;
+ *  * the sequential branch's "waiting for previous tool(s)" cue is guarded on
+ *    PENDING, and Pass 1 had already flipped every queued call, so the guard
+ *    could never match — the cue was dead code.
+ *
+ * Unit-test expectations for these functions are written literals, never derived
+ * from them, so a mutation cannot move an expectation along with it and stay
+ * green.
+ */
+internal object ToolPassTransitionPolicy {
+
+    /** What a call queued behind an earlier one shows while the head still runs. */
+    const val QUEUE_CUE_TEXT = "⏳ Waiting for previous tool(s) to finish…"
+
+    /**
+     * Indices, within a SEQUENTIAL batch, of the calls that announce they are
+     * queued behind an earlier one. The head starts as soon as the batch does
+     * (no cue for it) and a single-call batch has nobody to wait for.
+     */
+    fun sequentialQueueCueIndices(pendingCount: Int): List<Int> =
+        if (pendingCount > 1) (1 until pendingCount).toList() else emptyList()
+
+    /**
+     * The status a block takes when the execution pass dispatches it, given the
+     * status it has as the pass reaches it — or null to leave it untouched.
+     *
+     * PENDING is the only state a dispatch may consume: anything else is either
+     * already published as RUNNING (the parallel branch flips its whole batch up
+     * front) or a terminal refusal Pass 1 published, which a dispatch must never
+     * resurrect into a spinner.
+     */
+    fun statusAtDispatch(current: ToolBlockStatus?): ToolBlockStatus? =
+        if (current == ToolBlockStatus.PENDING) ToolBlockStatus.RUNNING else null
+
+    /**
+     * The content a block carries the moment the execution pass flips it to
+     * RUNNING: [QUEUE_CUE_TEXT] is dispatch bookkeeping, not tool output, and the
+     * finalisation pass keeps `max(existingContent, resultContent)` **by length** —
+     * a leftover 38-character cue would out-length a short result and then be
+     * shown, and persisted, as that tool's output. Anything else (the empty
+     * content a freshly streamed call carries, or live output a tool has already
+     * written into its own block) is preserved.
+     */
+    fun contentAtDispatchFlip(current: String, queueCue: String): String =
+        if (current == queueCue) "" else current
+}
+
 internal class AgentLoopEngine(
     private val host: AgentLoopHost,
     private val traceObserver: ChatAgentTraceObserver,
@@ -3344,10 +3406,14 @@ internal class AgentLoopEngine(
             // Pass 1 (sequential): per-call preflight + loop-detect. CRITICAL /
             // preflight rejections synthesize their tool_result right here and
             // `continue` — exactly as the original loop did. Calls that pass are
-            // collected into `pending`.
+            // collected into `pending`. Pass 1 publishes ONLY refusals: it never
+            // flips a call to RUNNING ([deep-audit-1019 ISSUE-02] — see
+            // ToolPassTransitionPolicy for why the flip lives in Pass 2).
             // Pass 2 (execute): a batch of ONLY parallel-safe tools runs
             // concurrently (async, awaited in original order). Anything else runs
-            // sequentially — identical to the old single-loop behavior.
+            // sequentially — identical to the old single-loop behavior. This is
+            // where PENDING → RUNNING is published, at the moment each call is
+            // actually dispatched.
             // Pass 3 (sequential): per-call post-execution — loop-detect.record,
             // block content/status update, resultParts, UI refresh — kept in the
             // original tool-call order.
@@ -3530,15 +3596,13 @@ internal class AgentLoopEngine(
                 }
                 val argsStr = args.toString()
                 val paramsMap = parseToolParams(argsStr)
-                // Flip PENDING → RUNNING right before the execute dispatch so the UI
-                // (tool pill spinner) shows the exact moment execution begins.
-                val preIdx = loopState.allToolBlocks.indexOfFirst { it.id == id }
-                if (preIdx >= 0 && loopState.allToolBlocks[preIdx].toolStatus == ToolBlockStatus.PENDING) {
-                    loopState.allToolBlocks[preIdx] = loopState.allToolBlocks[preIdx].copy(toolStatus = ToolBlockStatus.RUNNING)
-                    withContext(Dispatchers.Main) {
-                        host.updateAssistantMessage(loopState.assistantId, loopState.accumulatedText, true, loopState.allToolBlocks)
-                    }
-                }
+                // [deep-audit-1019 ISSUE-02] No status flip here any more. Pass 1
+                // only DECIDES whether a call may run; the PENDING → RUNNING flip
+                // belongs to the pass that actually dispatches it, because
+                // publishing RUNNING above the loop detector + preflight gates
+                // left a refused call spinning (the CRITICAL path retracts only in
+                // memory) and consumed the PENDING state that Pass 2's waiting cue
+                // is guarded on. See ToolPassTransitionPolicy.
 
                 // Loop-detector check BEFORE execution. CRITICAL outcomes short-circuit
                 // the call: synthesize an error result so the tool_use/tool_result pair
@@ -3558,6 +3622,14 @@ internal class AgentLoopEngine(
                             content = blockedMsg,
                             durationMs = elapsed,
                         )
+                        // [deep-audit-1019 ISSUE-02] Publish the refusal. Every
+                        // sibling Pass-1 refusal path does (dedupe / truncation /
+                        // preflight); this one published nothing, so with the flip
+                        // that used to run above it the card kept spinning and the
+                        // user never saw that the call had been blocked.
+                        withContext(Dispatchers.Main) {
+                            host.updateAssistantMessage(loopState.assistantId, loopState.accumulatedText, true, loopState.allToolBlocks)
+                        }
                     }
                     // Record the blocked attempt so consecutive blocks still
                     // count toward the unknown-tool / circuit-breaker windows.
@@ -3577,6 +3649,11 @@ internal class AgentLoopEngine(
                 // AIChatViewModel.swift. Synthesizes a tool_result error so the
                 // model can self-correct on the next turn without us spawning
                 // shells or touching the filesystem on `{}` args.
+                //
+                // [deep-audit-1019 ISSUE-02] That ordering promise is true again:
+                // the flip runs in Pass 2, below both refusal gates. Until this
+                // audit the flip sat ABOVE this check, so "before the UI flips to
+                // RUNNING" described a state the code never reached.
                 val preflightError = host.preflightValidateToolCall(name, args, host.agentTools)
                 if (preflightError != null) {
                     val chunkRing: List<String> = loopState.toolInputChunkRings.remove(id) ?: emptyList()
@@ -3649,6 +3726,27 @@ internal class AgentLoopEngine(
                 // read-only) are merged back once, in `pending` order, on this
                 // thread after the batch. See ParallelToolBatchBlocks.
                 val sharedBlocks = loopState.allToolBlocks
+                // [deep-audit-1019 ISSUE-02] A parallel batch dispatches every
+                // queued call at once, so the whole batch is RUNNING *here*, before
+                // the forks are taken — the baseline snapshot must carry the flip
+                // (Pass 3 finalises blocks that never showed a start otherwise),
+                // and it is published once from this thread because the point of
+                // the forks is that no coroutine touches this list.
+                var flippedForBatch = false
+                for (p in pending) {
+                    val flipIdx = sharedBlocks.indexOfFirst { it.id == p.id }
+                    if (flipIdx < 0) continue
+                    val flippedStatus = ToolPassTransitionPolicy.statusAtDispatch(sharedBlocks[flipIdx].toolStatus)
+                    if (flippedStatus != null) {
+                        sharedBlocks[flipIdx] = sharedBlocks[flipIdx].copy(toolStatus = flippedStatus)
+                        flippedForBatch = true
+                    }
+                }
+                if (flippedForBatch) {
+                    withContext(Dispatchers.Main) {
+                        host.updateAssistantMessage(loopState.assistantId, loopState.accumulatedText, true, loopState.allToolBlocks)
+                    }
+                }
                 val baseline = ParallelToolBatchBlocks.snapshot(sharedBlocks)
                 val deferred = coroutineScope {
                     pending.map { p ->
@@ -3669,21 +3767,59 @@ internal class AgentLoopEngine(
                 ParallelToolBatchBlocks.mergeBack(sharedBlocks, baseline, workedLists)
             } else {
                 // Any non-parallel tool (or a single call) → sequential, exactly
-                // like the original loop. Each queued call gets a non-blocking
-                // "waiting" cue so the UI doesn't look hung while earlier tools
-                // still run — pure visibility, no status flip, no semantics.
-                pending.forEachIndexed { index, p ->
-                    if (index > 0) {
-                        val waitIdx = loopState.allToolBlocks.indexOfFirst { it.id == p.id }
-                        if (waitIdx >= 0) {
-                            val waitBlock = loopState.allToolBlocks[waitIdx]
-                            if (waitBlock.toolStatus == ToolBlockStatus.PENDING) {
-                                loopState.allToolBlocks[waitIdx] = waitBlock.copy(
-                                    content = "⏳ Waiting for previous tool(s) to finish…",
-                                )
-                                withContext(Dispatchers.Main) {
-                                    host.updateAssistantMessage(loopState.assistantId, loopState.accumulatedText, true, loopState.allToolBlocks)
-                                }
+                // like the original loop.
+                //
+                // [deep-audit-1019 ISSUE-02] A queued call is published TWICE and
+                // the order carries the contract:
+                //   1. at batch entry — every call behind the head keeps PENDING
+                //      and says it is waiting, so the batch reads as a queue while
+                //      the head runs;
+                //   2. at that call's own turn — it flips PENDING → RUNNING and the
+                //      cue is retracted.
+                // Step 1 is the branch that used to be dead: Pass 1 flipped every
+                // queued call to RUNNING before Pass 2 ran, so the PENDING guard
+                // below matched nothing and the cue never appeared.
+                val cueIndices = ToolPassTransitionPolicy.sequentialQueueCueIndices(pending.size)
+                if (cueIndices.isNotEmpty()) {
+                    var cued = false
+                    for (index in cueIndices) {
+                        val queued = pending.getOrNull(index)
+                        if (queued == null) continue
+                        val cueIdx = loopState.allToolBlocks.indexOfFirst { it.id == queued.id }
+                        if (cueIdx < 0) continue
+                        val cueBlock = loopState.allToolBlocks[cueIdx]
+                        if (cueBlock.toolStatus != ToolBlockStatus.PENDING) continue
+                        loopState.allToolBlocks[cueIdx] = cueBlock.copy(
+                            content = ToolPassTransitionPolicy.QUEUE_CUE_TEXT,
+                        )
+                        cued = true
+                    }
+                    if (cued) {
+                        withContext(Dispatchers.Main) {
+                            host.updateAssistantMessage(loopState.assistantId, loopState.accumulatedText, true, loopState.allToolBlocks)
+                        }
+                    }
+                }
+                pending.forEach { p ->
+                    // Flip PENDING → RUNNING right before this call's own execute
+                    // dispatch so the UI (tool pill spinner) shows the exact moment
+                    // execution begins. Moved here from Pass 1 by
+                    // [deep-audit-1019 ISSUE-02] — see ToolPassTransitionPolicy; the
+                    // flip also retires this call's queue cue (contentAtDispatchFlip).
+                    val flipIdx = loopState.allToolBlocks.indexOfFirst { it.id == p.id }
+                    if (flipIdx >= 0) {
+                        val flippingBlock = loopState.allToolBlocks[flipIdx]
+                        val flippedStatus = ToolPassTransitionPolicy.statusAtDispatch(flippingBlock.toolStatus)
+                        if (flippedStatus != null) {
+                            loopState.allToolBlocks[flipIdx] = flippingBlock.copy(
+                                toolStatus = flippedStatus,
+                                content = ToolPassTransitionPolicy.contentAtDispatchFlip(
+                                    flippingBlock.content,
+                                    ToolPassTransitionPolicy.QUEUE_CUE_TEXT,
+                                ),
+                            )
+                            withContext(Dispatchers.Main) {
+                                host.updateAssistantMessage(loopState.assistantId, loopState.accumulatedText, true, loopState.allToolBlocks)
                             }
                         }
                     }

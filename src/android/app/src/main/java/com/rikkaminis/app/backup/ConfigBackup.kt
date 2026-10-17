@@ -2056,14 +2056,26 @@ internal suspend fun importChatSections(
         for (i in 0 until chatMessagesArr.length()) {
             val m = chatMessagesArr.optJSONObject(i) ?: continue
             try {
+                // [fix/da1019-partsjson-funnel] A restored row is a row. The
+                // import path used to insert the payload verbatim, so a backup
+                // carrying an oversized parts_json / reasoning_content (hand-
+                // edited payload, older write path, another tool's export)
+                // landed a blob the loader cannot materialise out of a 2 MB
+                // CursorWindow — SQLiteBlobTooBigException on the next open of
+                // that session. Both columns now take the same ceilings the
+                // runtime writers apply (ChatRepository companion funnels).
                 val message = MessageEntity(
                     id = m.optString("id"),
                     sessionId = m.optString("sessionId"),
                     role = m.optString("role"),
-                    partsJson = m.optString("partsJson"),
+                    partsJson = ChatRepository.capPartsJsonForRow(m.optString("partsJson")),
                     createdAt = m.optLong("createdAt"),
                     sortOrder = m.optInt("sortOrder", i),
-                    reasoningContent = if (m.has("reasoningContent")) m.optString("reasoningContent") else null,
+                    reasoningContent = if (m.has("reasoningContent")) {
+                        ChatRepository.capReasoningContentForRow(m.optString("reasoningContent"))
+                    } else {
+                        null
+                    },
                 )
                 if (chatRepo.dao.getMessage(message.id) == null) {
                     chatRepo.dao.insertMessage(message)

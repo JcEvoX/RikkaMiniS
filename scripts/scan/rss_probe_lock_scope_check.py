@@ -33,7 +33,13 @@ FAMILY = (
     "src/android/app/src/main/java/com/rikkaminis/app/browser/BrowserRssProbe.kt",
     "src/android/app/src/main/java/com/rikkaminis/app/provider/ProviderRssProbe.kt",
 )
-ENFORCED = FAMILY[0]
+# [da1019 FIX-I] the whole family is now enforced: both remaining probes were
+# fixed in fix/da1019-rssprobe-lock-scope. The governance-reset criterion is
+# scoped to GOVERNANCE_OWNER — Browser/Provider probes deliberately have NO
+# governance semantics (no cumulative reset), so requiring the reset there
+# would force a dead/fake write and change their behaviour.
+ENFORCED = FAMILY
+GOVERNANCE_OWNER = FAMILY[0]
 
 RECORD = "record"
 DECISION = "applyAndDecideLocked"
@@ -111,7 +117,7 @@ def line_of(src, needle):
     return src.count("\n", 0, i) + 1 if i >= 0 else 0
 
 
-def analyse(src):
+def analyse(src, require_govern_reset=True):
     """Returns list of (criterion, ok, detail, line). ok=True means contract held."""
     res = []
     rec = function_body(src, RECORD)
@@ -138,6 +144,10 @@ def analyse(src):
         res.append(("locked decision function %s found" % DECISION, False, "missing", 0))
     else:
         for crit, needle in DECISION_MUST_CONTAIN:
+            # Only the governance owner carries the cumulative reset; the
+            # other family members have no governance section at all.
+            if needle == "totalDeltaKb = 0L" and not require_govern_reset:
+                continue
             res.append((
                 crit,
                 needle in dec,
@@ -267,31 +277,23 @@ def main():
     elif args:
         root = args[0]
     root = root or "."
-    if not os.path.isfile(os.path.join(root, ENFORCED)):
-        print("FAIL %s not found under root %s" % (ENFORCED, root))
-        return 1
+    for rel in ENFORCED:
+        if not os.path.isfile(os.path.join(root, rel)):
+            print("FAIL %s not found under root %s" % (rel, root))
+            return 1
 
     results = []
-    obs_failures = 0
-    for rel in FAMILY:
+    for rel in ENFORCED:
         path = os.path.join(root, rel)
         if not os.path.isfile(path):
-            if rel == ENFORCED:
-                print("FAIL %s not found under root %s" % (rel, root))
-                return 1
-            print("== observation: %s (not present in this tree — skipped)" % rel)
-            continue
+            print("FAIL %s not found under root %s" % (rel, root))
+            return 1
         src = open(path, encoding="utf-8").read()
-        if rel == ENFORCED:
-            print("== enforced: %s" % rel)
-            for crit, ok, detail, line in analyse(strip_comments(src)):
-                results.append((crit, ok, detail, line, rel))
-        else:
-            print("== observation: %s (same family, fixed in a later branch)" % rel)
-            for crit, ok, detail, line in analyse(strip_comments(src)):
-                if not ok:
-                    obs_failures += 1
-                    print("  [OBSERVATION] %s:%s %s (%s)" % (os.path.basename(rel), line, crit, detail))
+        print("== enforced: %s" % rel)
+        for crit, ok, detail, line in analyse(
+            strip_comments(src), require_govern_reset=(rel == GOVERNANCE_OWNER)
+        ):
+            results.append((crit, ok, detail, line, rel))
 
     failed = [(c, d, l, r) for c, ok, d, l, r in results if not ok]
     for c, ok, d, l, r in results:
@@ -302,7 +304,7 @@ def main():
 
     total = len(results)
     print("Summary: %d passed, %d failed" % (total - len(failed), len(failed)))
-    print("Observation (same family, not fixed in this branch): %d" % obs_failures)
+    print("Observation (same family, not fixed in this branch): 0")
     if failed:
         print("rss-probe lock scope gate: RED — the fix contract is violated")
         return 1

@@ -52,6 +52,16 @@ class GeminiProvider(
     private val apiKey: String,
     override var model: LLMModel = LLMModel.gemini25Flash,
     private val basePath: String = GeminiBasePath.DEFAULT_BASE,
+    /**
+     * [T-provider-custom-user-agent / deep-audit-1019 ISSUE-04] Per-provider
+     * User-Agent override. Both request builders used to hard-code
+     * `applyUserAgentOverride(null)` and this class had no parameter for it, so
+     * a UA the user set on a Gemini instance was unreachable. null/blank →
+     * MinisUserAgent.DEFAULT (the helper's fallback), non-blank → replaces the
+     * outbound User-Agent. Defaulted so every existing call site compiles
+     * unchanged.
+     */
+    private val customUserAgent: String? = null,
 ) : LLMProvider {
     override val name = "Google"
     override var instanceContext: com.rikkaminis.app.data.model.ProviderInstance? = null
@@ -100,8 +110,10 @@ class GeminiProvider(
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             // [T-android-default-ua] Brand the outbound UA so server logs
             // can trace the request back to the Minis build. Gemini has no
-            // SDK-specific UA requirement, so the helper's default kicks in.
-            .applyUserAgentOverride(null)
+            // SDK-specific UA requirement, so the helper's default kicks in
+            // when no override is set ([deep-audit-1019 ISSUE-04]: this used
+            // to be a hard-coded `null`, which also masked the user's value).
+            .applyUserAgentOverride(customUserAgent)
             .build()
 
         // [fix/audit-s4m1] response closed via .use{} on all paths.
@@ -152,8 +164,9 @@ class GeminiProvider(
             .url(url)
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             // [T-android-default-ua] same intent as the non-streaming
-            // branch above — brand outbound requests with Minis/<version>.
-            .applyUserAgentOverride(null)
+            // branch above — brand outbound requests with Minis/<version>
+            // unless the instance carries an override ([deep-audit-1019 ISSUE-04]).
+            .applyUserAgentOverride(customUserAgent)
             .build()
 
         val call = client.newCall(request)
@@ -240,6 +253,14 @@ class GeminiProvider(
             // content present → truncated) from a genuinely empty EOF (left to
             // failOnSilentEmptyCompletion).
             var contentChars = 0
+            // [deep-audit-1019 ISSUE-04] Gemini's streamGenerateContent hands
+            // each functionCall over WHOLE in a single SSE chunk (there is no
+            // Anthropic-style input_json_delta stream), so the counterpart of
+            // AnthropicProvider's `toolChars` is the call payload itself: a
+            // pure-tool turn that is cut after the calls but before any
+            // finishReason must still trip the truncated-Finished below instead
+            // of looking like a clean end_turn with an incomplete tool set.
+            var toolChars = 0
             var line: String?
             while (reader.readLine().also { line = it } != null) {
                 val l = line ?: continue
@@ -280,6 +301,12 @@ class GeminiProvider(
                     // stable name-indexed id so the engine's per-turn dedupe
                     // (dedupeToolStartId) can collapse repeats.
                     val toolId = "gemini_${System.nanoTime()}"
+                    // [deep-audit-1019 ISSUE-04] Count the call payload as stream
+                    // activity (name + serialized args — the args JSON text, not
+                    // the JSONObject key count) so a tool-only turn that never
+                    // saw a finishReason is classified as truncated rather than
+                    // clean.
+                    toolChars += toolCallActivityChars(fcName, fcArgs.toString())
                     send(LLMStreamChunk.ToolUseStart(toolId, fcName))
                     send(LLMStreamChunk.ToolCallComplete(toolId, fcName, fcArgs))
                 }
@@ -291,6 +318,11 @@ class GeminiProvider(
                 // (:94) — the SSE loop previously only read text/thinking
                 // parts, silently dropping media bytes on streaming turns.
                 extractInlineMedia(json).forEach { media ->
+                    // [deep-audit-1019 ISSUE-04] Inline media is streamed output
+                    // content too (audit report's companion fix): count its bytes
+                    // into the activity counter so a media-only turn cut before
+                    // finishReason is not reclassified as a clean end_turn.
+                    contentChars += media.data.size
                     send(LLMStreamChunk.MediaAttachment(media))
                 }
 
@@ -309,7 +341,7 @@ class GeminiProvider(
             // signal truncated so the turnTruncated retry path owns it. A fully
             // empty EOF (contentChars == 0) is left to failOnSilentEmptyCompletion
             // and is not flagged here.
-            if (lastFinishReason == null && contentChars > 0) {
+            if (shouldFlagEofTruncated(lastFinishReason, contentChars, toolChars)) {
                 send(LLMStreamChunk.Finished(null, truncated = true))
             } else {
                 send(LLMStreamChunk.Finished(lastFinishReason ?: "end_turn"))
@@ -709,4 +741,37 @@ class GeminiProvider(
         if (error is java.io.IOException) return LLMError.NetworkError(error)
         return LLMError.Unknown(error)
     }
+
+    /**
+     * [deep-audit-1019 ISSUE-04] Stream-activity size of one Gemini functionCall:
+     * the tool name plus its args JSON text. Mirrors AnthropicProvider's `toolChars`
+     * intent (tool input counts as stream activity) adapted to Gemini's shape,
+     * where each call arrives whole in a single SSE chunk instead of as an
+     * input_json_delta stream.
+     */
+    private fun toolCallActivityChars(name: String, argsJson: String): Int =
+        name.length + argsJson.length
 }
+
+/**
+ * [deep-audit-1019 ISSUE-04] Pure verdict for Gemini's SSE EOF path: the loop
+ * exited without any finishReason but the stream DID deliver output — text /
+ * thinking / media bytes ([contentChars]) or whole functionCall payloads
+ * ([toolChars], AnthropicProvider's `toolChars` counterpart). That is a
+ * mid-stream cut, so the turn must be re-signalled as truncated instead of
+ * falling through to a clean `Finished("end_turn")`.
+ *
+ * A fully empty EOF (both counters 0) stays FALSE here: that is the
+ * "silent empty completion" case owned by failOnSilentEmptyCompletion, and
+ * flagging it here would double-handle it. A clear finishReason always
+ * wins (FALSE) even when tool calls were delivered.
+ *
+ * Extracted as a top-level pure function so the boundary table is directly
+ * unit-testable (see GeminiEofTruncatedDecisionTest) instead of being buried
+ * in the SSE loop.
+ */
+internal fun shouldFlagEofTruncated(
+    lastFinishReason: String?,
+    contentChars: Int,
+    toolChars: Int,
+): Boolean = lastFinishReason == null && (contentChars > 0 || toolChars > 0)

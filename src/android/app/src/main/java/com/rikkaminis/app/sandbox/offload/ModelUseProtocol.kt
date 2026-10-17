@@ -94,6 +94,89 @@ internal object ModelUseProtocol {
         return out
     }
 
+    /**
+     * Standard-mode `extra_headers` (a string→string map added to the request).
+     *
+     * [da1019 ISSUE-01] The last two envelope parsers that still had a hand-
+     * written copy in EACH process. They had already drifted, in both
+     * directions:
+     *
+     *  - `:modelservice` read with `obj.optJSONObject("extra_headers")`, so a
+     *    present-but-not-an-object value (e.g. `["Authorization: ..."]`) was
+     *    dropped with **zero** warning; `:app` warned. Its KDoc nevertheless
+     *    claimed "both routes now drop + warn identically".
+     *  - `:modelservice` read only `endpoint` (never `image_endpoint`) and
+     *    never checked the `/` prefix, so `{"endpoint":"chat"}` — a SYMBOLIC
+     *    endpoint-mode value that [parseImageGenConfig] consumes as a mode —
+     *    was written verbatim into `provider.absoluteEndpointOverride` and
+     *    echoed back in `applied_extras.custom_endpoint`.
+     *
+     * The strict (and correct) dialect is the in-process one, which is what
+     * this function and [parseCustomEndpointPath] now are: one implementation,
+     * two callers. Same rule as [parseChatExtraBody].
+     *
+     * Values must be JSON strings: `optString` would stringify a number or
+     * boolean, so a typo'd header (`{"x-retry": 3}`) would look like it had
+     * been sent. Non-string values are dropped **with** a warning instead.
+     */
+    fun parseExtraHeaders(inputJson: String, warnings: MutableList<String>): Map<String, String> {
+        val obj = try {
+            val t = inputJson.trim()
+            if (t.startsWith("{")) JSONObject(t) else null
+        } catch (_: Throwable) { null } ?: return emptyMap()
+        val raw = obj.opt("extra_headers")?.takeIf { it != JSONObject.NULL } ?: return emptyMap()
+        val hdrs = raw as? JSONObject
+        if (hdrs == null) {
+            warnings.add(
+                "extra_headers is not a JSON object (actual type: ${jsonTypeName(raw)}) — " +
+                    "all custom headers were ignored.",
+            )
+            return emptyMap()
+        }
+        val out = LinkedHashMap<String, String>()
+        for (key in hdrs.keys()) {
+            val v = hdrs.opt(key)
+            if (v is String) {
+                out[key] = v
+            } else {
+                warnings.add(
+                    "extra_headers.$key value is not a string (actual type: ${jsonTypeName(v)}) — " +
+                        "this header was ignored. Header values must be JSON strings.",
+                )
+            }
+        }
+        return out
+    }
+
+    /**
+     * Parse a CUSTOM absolute endpoint path from top-level `image_endpoint` /
+     * `endpoint` values (the former wins). A value starting with "/" is an
+     * absolute path replacing the entire URL path after scheme+host; anything
+     * else — symbolic values (`auto` / `chat` / `images-gen`, which are
+     * endpoint MODES consumed by [parseImageGenConfig], not paths) and JSON
+     * null — returns null.
+     *
+     * [da1019 ISSUE-01] `:modelservice` used to accept any non-empty
+     * `endpoint` string here, so `{"endpoint":"chat"}` reached
+     * `provider.absoluteEndpointOverride` and the reply's
+     * `applied_extras.custom_endpoint`, while an `image_endpoint` path was
+     * dropped entirely (the `:app` log line saying otherwise was the only
+     * side that had resolved it).
+     *
+     * Note: on Android these arrive inside the input JSON (not as translated
+     * argv), so unlike iOS there is no rootfs-dataPath prefix to strip — the
+     * value is used verbatim.
+     */
+    fun parseCustomEndpointPath(inputJson: String): String? {
+        val obj = try {
+            val t = inputJson.trim()
+            if (t.startsWith("{")) JSONObject(t) else null
+        } catch (_: Throwable) { null } ?: return null
+        val raw = obj.safeOptString("image_endpoint", "").ifEmpty { obj.safeOptString("endpoint", "") }
+            .trim()
+        return if (raw.startsWith("/")) raw else null
+    }
+
     // ── provider shape (which implementation a type gets) ────────────────────
     //
     // [fix/da1015-modeluse-proc] `:app` used to answer "is this an

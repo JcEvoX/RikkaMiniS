@@ -68,4 +68,34 @@ internal class AsyncJsSlot<T : Any> {
         entry = null
         return true
     }
+
+    /**
+     * [deep-audit-1019 ISSUE-08] Take (and clear) whatever the slot holds,
+     * whoever owns it. The teardown paths — `BrowserUseManager.destroy()` and
+     * its `onRendererGone` — use this to complete the in-flight waiter with a
+     * structured error instead of leaving it to burn the full 30s/60s timeout
+     * on bridge callbacks that can never arrive again (the JS interface dies
+     * with the renderer, and a destroyed WebView never re-registers one).
+     *
+     * Deliberately NOT token-guarded, unlike [finish]: teardown does not know
+     * (or care) which request is in flight, and after teardown no request may
+     * wait on this WebView at all. Returns null when the slot is free, so a
+     * teardown racing a request that already finished is a no-op — and a
+     * request that [begin]s *after* the take keeps its own slot (take never
+     * stores a null entry).
+     *
+     * Read-then-clear has the same best-effort concurrency shape as
+     * [begin]/[finish]: the single volatile reference keeps each token/value
+     * pair intact, it does not make the swap atomic. A [begin] concurrent with
+     * a take therefore lands either before it (its deferred is handed to the
+     * teardown and fails — correct, that request has no completion path) or
+     * after it (its deferred survives, and the bridge that would resolve it is
+     * already gone — it times out, which is the pre-fix behaviour and no
+     * worse).
+     */
+    fun takeCurrent(): T? {
+        val current = entry ?: return null
+        entry = null
+        return current.value
+    }
 }
