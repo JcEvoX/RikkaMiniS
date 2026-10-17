@@ -301,11 +301,16 @@ class DaoLoadMessagesConvergenceTest {
         val src = repoFile("app/src/main/java/com/rikkaminis/app/data/repository/ChatRepository.kt")
         // A) the batch bypass is gone from the repository entirely
         assertFalse(src.contains("dao.loadMessages("))
-        // B) both production paged entries funnel through one policy function:
-        //    1 definition + 2 call sites (loadMessagesInner, loadMessagePageRaw).
-        assertEquals(3, Regex("loadPageTolerant\\(").findAll(src).count())
+        // B) every production paged entry funnels through one policy function:
+        //    1 definition + 3 call sites (loadMessagesInner, loadMessagePageRaw,
+        //    loadMessagePage). [fix/da1019-partsjson-funnel] re-anchored 3 -> 4:
+        //    loadMessagePage's unbounded branch used to call the DAO directly,
+        //    so the count legitimately grows with the convergence (see
+        //    PartsJsonFunnelTest for the funnel's own pin).
+        assertEquals(4, Regex("loadPageTolerant\\(").findAll(src).count())
         assertTrue(src.contains("val page = loadPageTolerant(sessionId, offset, limit)"))
         assertTrue(src.contains("        loadPageTolerant(sessionId, offset, limit)"))
+        assertTrue(src.contains("val rows = loadPageTolerant(sessionId, offset, limit, startMs, endMs)"))
         // C) both CursorWindow arms (type + message-shaped) survive the extraction
         assertTrue(src.contains("catch (e: SQLiteBlobTooBigException)"))
         assertTrue(src.contains("""e.message?.contains("CursorWindow", ignoreCase = true) == true"""))

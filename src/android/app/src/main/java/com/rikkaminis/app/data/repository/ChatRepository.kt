@@ -368,32 +368,61 @@ class ChatRepository(
         sessionId: String,
         offset: Int,
         limit: Int,
+        // [fix/da1019-partsjson-funnel] Optional created_at bounds, forwarded
+        // verbatim from loadMessagePage. The date-filtered query reads the same
+        // columns of the same table, so it is exposed to the very same
+        // CursorWindow ceiling — it funnels through here too instead of taking
+        // its own raw DAO path (1018 FIX-D R1 registered that raw read; this
+        // closes it). null/null keeps the pre-existing unbounded query.
+        startMs: Long? = null,
+        endMs: Long? = null,
     ): List<MessageEntity> = try {
-        dao.loadMessagesPage(sessionId, offset, limit)
+        loadPageSlice(sessionId, offset, limit, startMs, endMs)
     } catch (e: SQLiteBlobTooBigException) {
         // Fall back to single-row pages so we can isolate the
         // offending blob(s) and serve the rest of the slice.
-        loadPageRowByRow(sessionId, offset, limit)
+        loadPageRowByRow(sessionId, offset, limit, startMs, endMs)
     } catch (e: IllegalStateException) {
         // Some Room/SQLite combinations wrap the CursorWindow
         // overflow in IllegalStateException("Couldn't read row N,
         // col N from CursorWindow"); treat the same way.
         if (e.message?.contains("CursorWindow", ignoreCase = true) == true) {
-            loadPageRowByRow(sessionId, offset, limit)
+            loadPageRowByRow(sessionId, offset, limit, startMs, endMs)
         } else {
             throw e
         }
+    }
+
+    /**
+     * The single place that picks which paged DAO shape a slice read uses
+     * (unbounded vs created_at-bounded). Kept separate from
+     * [loadPageTolerant] so the degradation policy and the query selection stay
+     * independently readable — and so `dao.loadMessagesPage*` has exactly one
+     * call site, which `scripts/scan/parts_json_funnel_check.py` pins.
+     */
+    private suspend fun loadPageSlice(
+        sessionId: String,
+        offset: Int,
+        limit: Int,
+        startMs: Long?,
+        endMs: Long?,
+    ): List<MessageEntity> = if (startMs == null && endMs == null) {
+        dao.loadMessagesPage(sessionId, offset, limit)
+    } else {
+        dao.loadMessagesPageInRange(sessionId, offset, limit, startMs, endMs)
     }
 
     private suspend fun loadPageRowByRow(
         sessionId: String,
         baseOffset: Int,
         limit: Int,
+        startMs: Long? = null,
+        endMs: Long? = null,
     ): List<MessageEntity> {
         val result = ArrayList<MessageEntity>(limit)
         for (i in 0 until limit) {
             val row = try {
-                dao.loadMessagesPage(sessionId, baseOffset + i, 1).firstOrNull()
+                loadPageSlice(sessionId, baseOffset + i, 1, startMs, endMs).firstOrNull()
             } catch (e: SQLiteBlobTooBigException) {
                 // [fix/audit-s5h2] a genuinely un-materialisable oversized row
                 // is now represented by a proxy MessageEntity instead of being
@@ -438,7 +467,12 @@ class ChatRepository(
      * target tool_use. Mirrors iOS ChatStore.updateMessageParts.
      */
     suspend fun updateMessageParts(id: String, partsJson: String) =
-        dao.updateMessageParts(id, partsJson)
+        // [fix/da1019-partsjson-funnel] Second writer of the same column, so it
+        // takes the same ceiling: `ChatViewModel.rerunFromToolBlock` rewrites a
+        // row in place with the parts of an existing (possibly oversized) row,
+        // and an uncapped write here reinstates exactly the payload the append
+        // path truncated — the 2 MB CursorWindow crash walks straight back in.
+        dao.updateMessageParts(id, capPartsJsonForRow(partsJson))
 
     /** [T-error-persist-android] Set/clear the error sticker on a row by id. */
     suspend fun updateMessageErrorInfo(messageId: String, errorInfo: String?) =
@@ -492,13 +526,7 @@ class ChatRepository(
         // for CJK, 2.0 MB for 4-byte emoji against a 500 KB nominal cap) —
         // exactly the SQLiteBlobTooBigException this guard exists to prevent.
         val capped = capPartsJsonForRow(partsJson)
-        val cappedReasoning = reasoningContent?.let { rc ->
-            if (rc.toByteArray(Charsets.UTF_8).size > MAX_MESSAGE_PARTS_JSON_BYTES) {
-                buildTruncatedText(rc)
-            } else {
-                rc
-            }
-        }
+        val cappedReasoning = capReasoningContentForRow(reasoningContent)
         val message = MessageEntity(
             id = UUID.randomUUID().toString(),
             sessionId = sessionId,
@@ -876,11 +904,12 @@ class ChatRepository(
         startMs: Long? = null,
         endMs: Long? = null,
     ): List<MessagePageItem> {
-        val rows = if (startMs == null && endMs == null) {
-            dao.loadMessagesPage(sessionId, offset, limit)
-        } else {
-            dao.loadMessagesPageInRange(sessionId, offset, limit, startMs, endMs)
-        }
+        // [fix/da1019-partsjson-funnel] Both branches funnel through the same
+        // tolerant pager. The unbounded branch used to call
+        // `dao.loadMessagesPage` directly, so a single >2 MB row inside the
+        // page aborted the whole call (SessionsOffloadHandler / `minis-sessions-cli
+        // messages` got SQLiteBlobTooBigException instead of a degraded slice).
+        val rows = loadPageTolerant(sessionId, offset, limit, startMs, endMs)
         return rows.mapNotNull { e ->
             val text = extractTextForOffload(e.partsJson, e.role)
             if (text.isBlank()) return@mapNotNull null
@@ -1126,6 +1155,26 @@ class ChatRepository(
                 buildTruncatedPartsJson(partsJson)
             } else {
                 partsJson
+            }
+
+        /**
+         * [fix/da1019-partsjson-funnel] Companion funnel for the
+         * `reasoning_content` byte ceiling — the sibling of
+         * [capPartsJsonForRow] over the same budget.
+         *
+         * Extracted from [appendMessage] so the *other* writer of that column
+         * (backup restore, `ConfigBackup.importChatSections`) shares one
+         * definition instead of re-deriving the byte comparison. A restored row
+         * with a multi-MB reasoning blob is the same CursorWindow crash as an
+         * oversized `parts_json`, and nothing on the import path capped either.
+         */
+        internal fun capReasoningContentForRow(reasoningContent: String?): String? =
+            reasoningContent?.let { rc ->
+                if (rc.toByteArray(Charsets.UTF_8).size > MAX_MESSAGE_PARTS_JSON_BYTES) {
+                    buildTruncatedText(rc)
+                } else {
+                    rc
+                }
             }
 
         /** [F-226] Byte-budgeted truncation of a plain string field (reasoning). */
