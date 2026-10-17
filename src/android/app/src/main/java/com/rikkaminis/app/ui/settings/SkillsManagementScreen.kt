@@ -61,6 +61,8 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import com.rikkaminis.app.ui.components.DialogTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
@@ -1245,7 +1247,20 @@ fun SkillFileViewerScreen(
     var isEditing by remember { mutableStateOf(false) }
     var editContent by remember(skillId, relativePath) { mutableStateOf(initialContent) }
 
+    // [fix/da1021-issue06] Save failures used to be silently discarded: the
+    // return values of importFromContent / writeSkillFile were dropped and the
+    // screen unconditionally popped, destroying the user's edits (a broken
+    // SKILL.md frontmatter made importFromContent return null without writing
+    // anything). Consume the result, run the write off the main thread, and
+    // surface a snackbar on failure instead of leaving the screen.
+    var isSaving by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    val snackbarHostState = remember { SnackbarHostState() }
+    val invalidFormatMsg = stringResource(R.string.skill_detail_error_invalid)
+    val updateFailedMsg = stringResource(R.string.skill_detail_error_update_failed)
+
     Scaffold(
+        snackbarHost = { SnackbarHost(snackbarHostState) },
         topBar = {
             TopAppBar(
                 title = { Text(fileName) },
@@ -1257,24 +1272,38 @@ fun SkillFileViewerScreen(
                 actions = {
                     if (isEditing) {
                         MinisTextButton(onClick = {
-                            if (isSkillMd) {
-                                // SKILL.md edits go through importFromContent so
-                                // YAML frontmatter changes flow back into DB metadata.
-                                // [fix/audit-1015-b4-2] Pin the preferred id to the
-                                // skill being edited: without it a renamed SKILL.md
-                                // saved here resolved to a fresh slugify id and was
-                                // added as a duplicate instead of refreshing the
-                                // existing entry.
-                                skillRepository.importFromContent(
-                                    editContent,
-                                    skill.importSource,
-                                    preferredId = skillId,
-                                )
-                            } else {
-                                skillRepository.writeSkillFile(skillId, relativePath, editContent)
+                            if (isSaving) return@MinisTextButton
+                            isSaving = true
+                            val contentToSave = editContent
+                            scope.launch {
+                                val ok = withContext(Dispatchers.IO) {
+                                    if (isSkillMd) {
+                                        // SKILL.md edits go through importFromContent so
+                                        // YAML frontmatter changes flow back into DB metadata.
+                                        // [fix/audit-1015-b4-2] Pin the preferred id to the
+                                        // skill being edited: without it a renamed SKILL.md
+                                        // saved here resolved to a fresh slugify id and was
+                                        // added as a duplicate instead of refreshing the
+                                        // existing entry.
+                                        skillRepository.importFromContent(
+                                            contentToSave,
+                                            skill.importSource,
+                                            preferredId = skillId,
+                                        ) != null
+                                    } else {
+                                        skillRepository.writeSkillFile(skillId, relativePath, contentToSave)
+                                    }
+                                }
+                                isSaving = false
+                                if (ok) {
+                                    isEditing = false
+                                    onBack()
+                                } else {
+                                    snackbarHostState.showSnackbar(
+                                        if (isSkillMd) invalidFormatMsg else updateFailedMsg,
+                                    )
+                                }
                             }
-                            isEditing = false
-                            onBack()
                         }) { Text(stringResource(R.string.skill_file_save)) }
                     } else {
                         MinisTextButton(onClick = {
