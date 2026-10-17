@@ -14,6 +14,7 @@ import com.rikkaminis.app.data.model.ProviderType
 import com.rikkaminis.app.data.model.RoutingStrategy
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.provider.applyUserAgentOverride
+import com.rikkaminis.app.provider.gemini.GeminiBasePath
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -221,16 +222,7 @@ internal object ProviderMutationMethods {
         val key = repo.loadApiKey(id)?.let {
             com.rikkaminis.app.data.KeyRoulette.next(it, instance.id)
         }
-        val probeURL = when (instance.providerType) {
-            ProviderType.anthropic -> "$baseURL/v1/models"
-            ProviderType.gemini -> "$baseURL/v1beta/models?key=" + (key ?: "")
-            ProviderType.openAI -> if (baseURL.endsWith("/v1")) "$baseURL/models" else "$baseURL/v1/models"
-            ProviderType.openRouter -> "$baseURL/models"
-            // xAI exposes an OpenAI-compatible /models endpoint at the same base.
-            ProviderType.xAI -> if (baseURL.endsWith("/v1")) "$baseURL/models" else "$baseURL/v1/models"
-            // Kimi Coding: OpenAI-compatible /models under /coding/v1.
-            ProviderType.kimiCode -> if (baseURL.endsWith("/v1")) "$baseURL/models" else "$baseURL/v1/models"
-        }
+        val probeURL = providerProbeUrl(instance.providerType, baseURL, key)
         val client = okhttp3.OkHttpClient.Builder()
             .connectTimeout(timeoutMs.toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
             .readTimeout(timeoutMs.toLong(), java.util.concurrent.TimeUnit.MILLISECONDS)
@@ -649,3 +641,38 @@ internal object ProviderMutationMethods {
         }
     }
 }
+
+/**
+ * [deep-audit-1024 ISSUE-02] Connectivity-probe URL for `provider.instances.test`.
+ *
+ * Pure on purpose (no Context/OkHttp) so the version-segment rules are assertable in a
+ * JVM unit test — the rule drifted precisely because each provider family assembled its
+ * own URL inline.
+ *
+ * [baseURL] is the instance's `effectiveBaseURL`, or the per-type public endpoint when the
+ * instance has none. Two of the six arms carry a version segment that `effectiveBaseURL`
+ * may already have supplied, and both used to append it blindly:
+ *  - Gemini's segment (`/v1beta`) lives *inside* the base, so it goes through
+ *    [GeminiBasePath.normalize] instead of a literal append. A custom base that already
+ *    ends in `/v1beta`, or the `/v1beta/v1` shape `appendV1Suffix` (default `true`)
+ *    produces from one, probed `.../v1beta/v1beta/models` → 404.
+ *  - Anthropic's `effectiveBaseURL` already ends in `/v1` once `appendV1Suffix` applied,
+ *    so the unconditional append probed `.../v1/v1/models` → 404.
+ * The other four arms (openAI/xAI/kimiCode, plus openRouter's versionless base) already
+ * guarded on `endsWith("/v1")` — the asymmetry was the defect, not a design choice.
+ */
+internal fun providerProbeUrl(type: ProviderType, baseURL: String, key: String?): String =
+    when (type) {
+        ProviderType.anthropic ->
+            if (baseURL.endsWith("/v1")) "$baseURL/models" else "$baseURL/v1/models"
+        ProviderType.gemini -> "${GeminiBasePath.normalize(baseURL)}/models?key=" + (key ?: "")
+        ProviderType.openAI ->
+            if (baseURL.endsWith("/v1")) "$baseURL/models" else "$baseURL/v1/models"
+        ProviderType.openRouter -> "$baseURL/models"
+        // xAI exposes an OpenAI-compatible /models endpoint at the same base.
+        ProviderType.xAI ->
+            if (baseURL.endsWith("/v1")) "$baseURL/models" else "$baseURL/v1/models"
+        // Kimi Coding: OpenAI-compatible /models under /coding/v1.
+        ProviderType.kimiCode ->
+            if (baseURL.endsWith("/v1")) "$baseURL/models" else "$baseURL/v1/models"
+    }

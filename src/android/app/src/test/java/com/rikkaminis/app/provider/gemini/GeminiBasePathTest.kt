@@ -1,5 +1,7 @@
 package com.rikkaminis.app.provider.gemini
 
+import com.rikkaminis.app.data.model.ProviderType
+import com.rikkaminis.app.debug.providerProbeUrl
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
@@ -122,6 +124,100 @@ class GeminiBasePathTest {
         assertEquals(
             "https://example.com/api/v1beta-2/v1beta",
             GeminiBasePath.normalize("https://example.com/api/v1beta-2"),
+        )
+    }
+
+    /**
+     * [deep-audit-1024 ISSUE-02] The shapes the **other three** call sites feed in — the
+     * model list (`GeminiModelsApi.normalizeBase` ← `instance.effectiveBaseURL`), the
+     * connectivity probe and Gemini TTS. They all delegate here now, so one table covers
+     * all three; before the fix each of them carried a weaker copy of the rule.
+     *
+     * The `.../v1beta/v1` row is the negative control: a **single** strip pass — the
+     * removed `GeminiModelsApi` copy — yields `.../v1beta/v1beta`, the measured 404 shape,
+     * while the looped collapse yields the working `.../v1beta`. Rows are literal
+     * expectations, none derived from the implementation.
+     */
+    @Test
+    fun `every base shape the list, probe and voice sites feed collapses to one version segment`() {
+        val shapes = listOf(
+            // custom/relay base that `appendV1Suffix` (default true) extended: single pass
+            // would leave ".../v1beta/v1beta" = 404.
+            "https://relay.example.com/gemini/v1beta/v1" to "https://relay.example.com/gemini/v1beta",
+            // OpenAI-shaped base a user pasted for a Gemini instance.
+            "https://relay.example.com/gemini/v1" to "https://relay.example.com/gemini/v1beta",
+            // already-correct base stays put.
+            "https://relay.example.com/gemini/v1beta" to "https://relay.example.com/gemini/v1beta",
+            // bare host + trailing slash (the shape the old voice `contains()` check
+            // handled by accident).
+            "https://relay.example.com/gemini/" to "https://relay.example.com/gemini/v1beta",
+            // doubled segment: single pass also 404s here (".../v1beta/v1beta").
+            "https://relay.example.com/gemini/v1beta/v1beta" to "https://relay.example.com/gemini/v1beta",
+            // no custom base at all — the probe's per-type fallback endpoint (no version).
+            "https://generativelanguage.googleapis.com" to "https://generativelanguage.googleapis.com/v1beta",
+            // blank/null keep falling back to the public endpoint.
+            "" to "https://generativelanguage.googleapis.com/v1beta",
+            null to "https://generativelanguage.googleapis.com/v1beta",
+        )
+        for ((input, expected) in shapes) {
+            assertEquals("normalize($input)", expected, GeminiBasePath.normalize(input))
+        }
+    }
+
+    /**
+     * [deep-audit-1024 ISSUE-02] `provider.instances.test` probe URLs. The Gemini and
+     * Anthropic arms used to append their version segment unconditionally, so a custom
+     * base that already carried it probed `.../v1beta/v1beta/models` / `.../v1/v1/models`
+     * and reported a healthy provider as unreachable. Expectations are literals.
+     */
+    @Test
+    fun `gemini probe URL carries exactly one version segment for every base shape`() {
+        assertEquals(
+            "https://relay.example.com/gemini/v1beta/models?key=K",
+            providerProbeUrl(ProviderType.gemini, "https://relay.example.com/gemini/v1beta/v1", "K"),
+        )
+        assertEquals(
+            "https://relay.example.com/gemini/v1beta/models?key=",
+            providerProbeUrl(ProviderType.gemini, "https://relay.example.com/gemini/v1", null),
+        )
+        assertEquals(
+            "https://generativelanguage.googleapis.com/v1beta/models?key=K",
+            providerProbeUrl(ProviderType.gemini, "https://generativelanguage.googleapis.com", "K"),
+        )
+    }
+
+    @Test
+    fun `anthropic probe URL does not double the v1 segment`() {
+        // Custom base: `effectiveBaseURL` already appended /v1 (appendV1Suffix default true).
+        assertEquals(
+            "https://relay.example.com/anthropic/v1/models",
+            providerProbeUrl(ProviderType.anthropic, "https://relay.example.com/anthropic/v1", "K"),
+        )
+        // Public endpoint: no version segment yet, so one is appended.
+        assertEquals(
+            "https://api.anthropic.com/v1/models",
+            providerProbeUrl(ProviderType.anthropic, "https://api.anthropic.com", "K"),
+        )
+    }
+
+    @Test
+    fun `the openai-shaped probe arms keep their own v1 guard`() {
+        for (type in listOf(ProviderType.openAI, ProviderType.xAI, ProviderType.kimiCode)) {
+            assertEquals(
+                "$type with a /v1 base",
+                "https://relay.example.com/v1/models",
+                providerProbeUrl(type, "https://relay.example.com/v1", "K"),
+            )
+            assertEquals(
+                "$type with a bare base",
+                "https://relay.example.com/v1/models",
+                providerProbeUrl(type, "https://relay.example.com", "K"),
+            )
+        }
+        // openRouter's base is already versionless by construction.
+        assertEquals(
+            "https://openrouter.ai/api/v1/models",
+            providerProbeUrl(ProviderType.openRouter, "https://openrouter.ai/api/v1", "K"),
         )
     }
 }
