@@ -80,29 +80,23 @@ import com.rikkaminis.app.ui.theme.ChatColors
 
 // ─── Data Model ──────────────────────────────────────────────────────────────
 
-enum class MirrorCategory(
-    val key: String,
-    val displayName: String,
-    val configPath: String,
-) {
-    ALPINE("alpine", "Alpine APK", "etc/apk/repositories"),
-    PIP("pip", "Python pip", "etc/pip/pip.conf"),
-    NPM("npm", "Node.js npm", "root/.npmrc");
+// [da1021-C] The enum itself moved to MirrorCategory.kt (dependency-free, so
+// the fromKey route parsing is unit-testable from the JVM test source set).
+// Icon/color presentation stays here — it needs Compose + material-icons —
+// re-declared as extension properties; call sites are unchanged.
+val MirrorCategory.icon: ImageVector
+    get() = when (this) {
+        MirrorCategory.ALPINE -> Icons.Filled.Terrain
+        MirrorCategory.PIP -> Icons.Filled.Inventory2
+        MirrorCategory.NPM -> Icons.Outlined.Javascript
+    }
 
-    val icon: ImageVector
-        get() = when (this) {
-            ALPINE -> Icons.Filled.Terrain
-            PIP -> Icons.Filled.Inventory2
-            NPM -> Icons.Outlined.Javascript
-        }
-
-    val iconColor: Color
-        get() = when (this) {
-            ALPINE -> Color(0xFF007AFF)
-            PIP -> Color(0xFF34C759)
-            NPM -> Color(0xFFFF3B30)
-        }
-}
+val MirrorCategory.iconColor: Color
+    get() = when (this) {
+        MirrorCategory.ALPINE -> Color(0xFF007AFF)
+        MirrorCategory.PIP -> Color(0xFF34C759)
+        MirrorCategory.NPM -> Color(0xFFFF3B30)
+    }
 
 data class MirrorEntry(
     val id: String,

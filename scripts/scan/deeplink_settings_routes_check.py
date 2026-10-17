@@ -41,9 +41,18 @@ REL_MAIN = "src/android/app/src/main/java/com/rikkaminis/app/MainActivity.kt"
 REL_HTTP_PY = "src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/transport/http.py"
 
 # Parameterised Routes segment builders that MUST encode their id.
+# [da1021-C] Extended to ALL 17 path-segment builders (the 6 da1020-F ones +
+# the 10 that were still raw-interpolated + the new mirrorCategoryDetail).
+# Excluded on purpose: fileBrowser / terminal / filePreview encode through
+# their own local `enc` helpers (same android.net.Uri.encode semantics, no
+# seg() dependency).
 SEG_BUILDERS = [
     "providerDetail", "providerConnection", "modelGroupDetail",
     "addModelsToGroup", "addCustomModel", "modelEntryDetail",
+    "scheduledTaskEdit", "skillDetail", "skillFile", "chatFiles",
+    "mountedFoldersDetail", "sharedFoldersDetail", "logDetail",
+    "sessionStorageDetail", "memoryFileEdit", "chat",
+    "mirrorCategoryDetail",
 ]
 
 VIOLATIONS = []
@@ -128,6 +137,13 @@ def check(root: Path) -> None:
     if "runCatching { nav.navigate(action.route) }" not in main:
         fail(REL_MAIN, "OpenSettingsScreen navigate lacks the runCatching backstop")
 
+    # --- 5. [da1021-C] cold-start deep-link backstop in AppNavigation ---
+    # The cold-start LaunchedEffect(initialDeepLink) branch runs after
+    # awaitResumed(), so bare navigate() is safe there (da1020-F reasoning);
+    # the runCatching is the never-crash backstop mirroring MainActivity.
+    if "runCatching { navController.navigate(initialDeepLink.route) }" not in nav:
+        fail(REL_NAV, "cold-start OpenSettingsScreen deep link lacks the runCatching backstop")
+
 
 # ---------------- selftest fixtures (minimal synthetic repo) ----------------
 
@@ -158,6 +174,35 @@ object Routes {
     fun addCustomModel(instanceId: String) = "add_custom_model/${seg(instanceId)}"
     fun modelEntryDetail(instanceId: String, entryId: String) =
         "model_entry/${seg(instanceId)}/${seg(entryId)}"
+    fun scheduledTaskEdit(taskId: String?) =
+        if (taskId == null) "scheduled_task_edit/-" else "scheduled_task_edit/${seg(taskId)}"
+    fun skillDetail(skillId: String) = "skill/${seg(skillId)}"
+    fun skillFile(skillId: String, relativePath: String): String {
+        val encoded = relativePath.replace("+", "%20")
+        return "skill_file/${seg(skillId)}/$encoded"
+    }
+    fun chatFiles(sessionId: String) = "chat_files/${seg(sessionId)}"
+    fun mountedFoldersDetail(mountId: String) = "mounted_folders_detail/${seg(mountId)}"
+    fun sharedFoldersDetail(folderId: String) = "shared_folders_detail/${seg(folderId)}"
+    fun logDetail(fileName: String) = "log_detail/${seg(fileName)}"
+    fun sessionStorageDetail(sessionId: String) = "session_storage/${seg(sessionId)}"
+    fun memoryFileEdit(fileName: String, isGlobal: Boolean) = "memory_file/${seg(fileName)}/$isGlobal"
+    fun chat(sessionId: String, focusMessageId: String? = null): String {
+        val base = "chat/${seg(sessionId)}"
+        if (focusMessageId.isNullOrBlank()) return base
+        return "$base?focusMessageId=$focusMessageId"
+    }
+    fun mirrorCategoryDetail(categoryId: String) = "mirror_category/${seg(categoryId)}"
+}
+
+suspend fun handleColdStartDeepLink(navController: NavController, initialDeepLink: DeepLinkAction) {
+    when (initialDeepLink) {
+        is DeepLinkAction.OpenSettingsScreen -> {
+            runCatching { navController.navigate(initialDeepLink.route) }
+                .onFailure { runCatching { navController.navigate(Routes.SETTINGS) } }
+        }
+        else -> {}
+    }
 }
 '''
 
@@ -231,6 +276,33 @@ def selftest() -> None:
             print("SELFTEST fixture E (backstop removed) did not trip the gate")
         else:
             print("SELFTEST E (backstop removed) RED as expected")
+
+        # fixture F: [da1021-C] cold-start backstop removed -> must fail
+        bad_nav_cold = FIXTURE_NAV.replace(
+            "runCatching { navController.navigate(initialDeepLink.route) }",
+            "navController.navigate(initialDeepLink.route)",
+        )
+        write_fixture(root, FIXTURE_DLH, bad_nav_cold, FIXTURE_MAIN)
+        VIOLATIONS.clear()
+        check(root)
+        if not any("cold-start" in v for v in VIOLATIONS):
+            ok = False
+            print("SELFTEST fixture F (cold-start backstop removed) did not trip the gate")
+        else:
+            print("SELFTEST F (cold-start backstop removed) RED as expected")
+
+        # fixture G: [da1021-C] raw mirrorCategoryDetail -> must fail
+        bad_nav_mirror = FIXTURE_NAV.replace(
+            '"mirror_category/${seg(categoryId)}"', '"mirror_category/$categoryId"'
+        )
+        write_fixture(root, FIXTURE_DLH, bad_nav_mirror, FIXTURE_MAIN)
+        VIOLATIONS.clear()
+        check(root)
+        if not any("mirrorCategoryDetail" in v for v in VIOLATIONS):
+            ok = False
+            print("SELFTEST fixture G (raw mirrorCategoryDetail) did not trip the gate")
+        else:
+            print("SELFTEST G (raw mirrorCategoryDetail) RED as expected")
 
     if not ok:
         sys.exit("DEEPLINK_SETTINGS_ROUTES_SELFTEST=FAIL")
