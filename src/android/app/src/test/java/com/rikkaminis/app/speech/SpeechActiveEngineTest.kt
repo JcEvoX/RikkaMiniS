@@ -1,5 +1,6 @@
 package com.rikkaminis.app.speech
 
+import android.content.SharedPreferences
 import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -65,7 +66,7 @@ class SpeechActiveEngineTest {
         engines.add(b)
         (field("_state").get(SpeechRecognitionManager) as MutableStateFlow<RecognitionState>).value = RecognitionState.IDLE
         (field("_selectedEngineId").get(SpeechRecognitionManager) as MutableStateFlow<String>).value = "sys"
-        field("prefs").set(SpeechRecognitionManager, StubPrefs)
+        field("prefs").set(SpeechRecognitionManager, FakePrefs())
         field("activeCallbacks").set(SpeechRecognitionManager, null)
         field("activeEngine").set(SpeechRecognitionManager, null)
         a.started = 0; a.stopped = 0; a.cancelled = 0; a.isAvailable = true
@@ -175,12 +176,89 @@ class SpeechActiveEngineTest {
         assertEquals("prov", (field("_selectedEngineId").get(SpeechRecognitionManager) as MutableStateFlow<*>).value)
     }
 
-    private object StubPrefs : android.content.SharedPreferences {
-        override fun edit(): android.content.SharedPreferences.Editor = StubEditor
-    }
+    /** House-pattern fake prefs (mirrors ChatMenuPrefsTest.FakePrefs): a FULL
+     *  implementation of the real android.content.SharedPreferences interface —
+     *  a partial stub compiles against the sandbox's minimal android stub but
+     *  fails CI's real SDK ("is not abstract and does not implement"). */
+    private class FakePrefs : SharedPreferences {
+        private val map = HashMap<String, Any?>()
+        private val listeners = HashSet<SharedPreferences.OnSharedPreferenceChangeListener>()
 
-    private object StubEditor : android.content.SharedPreferences.Editor {
-        override fun putString(key: String?, value: String?): android.content.SharedPreferences.Editor = this
-        override fun apply() {}
+        override fun getAll(): Map<String, *> = HashMap(map)
+
+        override fun getString(key: String, defValue: String?): String? =
+            map[key] as? String ?: defValue
+
+        override fun getInt(key: String, defValue: Int): Int =
+            map[key] as? Int ?: defValue
+
+        override fun getLong(key: String, defValue: Long): Long =
+            map[key] as? Long ?: defValue
+
+        override fun getFloat(key: String, defValue: Float): Float =
+            map[key] as? Float ?: defValue
+
+        override fun getBoolean(key: String, defValue: Boolean): Boolean =
+            map[key] as? Boolean ?: defValue
+
+        override fun contains(key: String): Boolean = key in map
+
+        override fun edit(): SharedPreferences.Editor = FakeEditor(this)
+
+        override fun registerOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener) {
+            listeners.add(listener)
+        }
+
+        override fun unregisterOnSharedPreferenceChangeListener(listener: SharedPreferences.OnSharedPreferenceChangeListener) {
+            listeners.remove(listener)
+        }
+
+        override fun getStringSet(key: String, defValues: Set<String>?): Set<String>? = null
+
+        private class FakeEditor(private val prefs: FakePrefs) : SharedPreferences.Editor {
+            private val pending = HashMap<String, Any?>()
+
+            override fun putString(key: String, value: String?): SharedPreferences.Editor = apply {
+                pending[key] = value
+            }
+
+            override fun putInt(key: String, value: Int): SharedPreferences.Editor = apply {
+                pending[key] = value
+            }
+
+            override fun putLong(key: String, value: Long): SharedPreferences.Editor = apply {
+                pending[key] = value
+            }
+
+            override fun putFloat(key: String, value: Float): SharedPreferences.Editor = apply {
+                pending[key] = value
+            }
+
+            override fun putBoolean(key: String, value: Boolean): SharedPreferences.Editor = apply {
+                pending[key] = value
+            }
+
+            override fun remove(key: String): SharedPreferences.Editor = apply {
+                pending[key] = null
+            }
+
+            override fun clear(): SharedPreferences.Editor = apply {
+                prefs.map.keys.forEach { pending[it] = null }
+            }
+
+            override fun commit(): Boolean {
+                apply()
+                return true
+            }
+
+            override fun apply() {
+                pending.forEach { (k, v) ->
+                    if (v == null) prefs.map.remove(k) else prefs.map[k] = v
+                }
+                pending.clear()
+            }
+
+            override fun putStringSet(key: String, values: Set<String>?): SharedPreferences.Editor = this
+        }
     }
 }
