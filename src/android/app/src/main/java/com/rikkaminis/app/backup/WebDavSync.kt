@@ -1,6 +1,7 @@
 package com.rikkaminis.app.backup
 
 import okhttp3.OkHttpClient
+import java.io.File
 import java.time.Instant
 
 /**
@@ -76,6 +77,28 @@ object WebDavSync {
         config: WebDavConfig,
         payload: String,
         client: OkHttpClient = WebDavClient.defaultClient(),
+    ): String = putAutoBackup(config, payload.toByteArray(Charsets.UTF_8), client)
+
+    /**
+     * [fix/da1023-backup-streaming-fetch] File overload for callers that
+     * already have the document on disk — the automatic backup streams its
+     * payload straight into the local copy (ConfigBackup.exportToWriter) and
+     * must NOT rebuild a whole-document String just to upload it. The bytes
+     * are read off disk for the PUT; the file itself stays owned by the
+     * caller (the local rotation manages it).
+     */
+    fun backupAuto(
+        config: WebDavConfig,
+        file: File,
+        client: OkHttpClient = WebDavClient.defaultClient(),
+    ): String = putAutoBackup(config, file.inputStream().use { it.readBytes() }, client)
+
+    /** Shared naming + push for both [backupAuto] overloads (same
+     *  `auto/` subdir convention, second-precision name). */
+    private fun putAutoBackup(
+        config: WebDavConfig,
+        bytes: ByteArray,
+        client: OkHttpClient,
     ): String {
         val dav = WebDavClient(config, client)
         dav.ensureCollectionExists()
@@ -84,9 +107,45 @@ object WebDavSync {
             java.text.SimpleDateFormat("yyyyMMdd-HHmmss", java.util.Locale.US)
                 .format(java.util.Date())
         }.json"
-        dav.put("$AUTO_SUBDIR/$name", payload.toByteArray(Charsets.UTF_8), "application/json")
+        dav.put("$AUTO_SUBDIR/$name", bytes, "application/json")
         return name
     }
+
+    /**
+     * [fix/da1023-backup-streaming-fetch] Reduce a remote auto-backup display
+     * name (after the [AUTO_BACKUP_PREFIX] / [BACKUP_SUFFIX] strip) to a token
+     * that is safe to embed in a LOCAL file name. The display name arrives
+     * from the WebDAV server, i.e. it is not under our control: before this,
+     * `rikkaminis-backup-auto-../../evil.json` was concatenated straight into
+     * `File(dir, LOCAL_FILE_PREFIX + stamp + ".json")` and wrote through the
+     * backup-autos directory.
+     *
+     * Fail-closed: returns null (caller must refuse to write) when the stamp
+     *  - is blank (after trimming),
+     *  - contains a path separator (`/` or `\`),
+     *  - contains a `..` sequence (parent traversal), or
+     *  - contains an ASCII control character (C0 or DEL — never legitimate).
+     *
+     * Everything else is whitelisted character by character: `[A-Za-z0-9._-]`
+     * passes through, any other character (space, punctuation, non-ASCII) is
+     * replaced with `_`, so a mildly odd but harmless name still fetches
+     * instead of failing outright.
+     */
+    fun sanitizeAutoBackupStamp(raw: String): String? {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return null
+        if (trimmed.contains('/') || trimmed.contains('\\')) return null
+        if (trimmed.contains("..")) return null
+        if (trimmed.any { it.code < 0x20 || it.code == 0x7F }) return null
+        // Explicit ASCII whitelist (NOT Char.isLetterOrDigit, which is
+        // Unicode-category based and would pass CJK through untouched).
+        return trimmed.map {
+            if (it in 'A'..'Z' || it in 'a'..'z' || it in '0'..'9' ||
+                it == '.' || it == '_' || it == '-'
+            ) it else '_'
+        }.joinToString("")
+    }
+
 
     /** [T-auto-backup-assets] Auto-backup filename prefix (subset of
      *  [BACKUP_PREFIX], distinct from manual uploads by the `auto-` token). */
