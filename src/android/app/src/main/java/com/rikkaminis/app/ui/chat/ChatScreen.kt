@@ -1872,7 +1872,11 @@ fun ChatScreen(
     // only contains still images. Resolution of `minis://` → host File is
     // deferred to the gallery's Coil model — Coil's MinisImageFetcher walks
     // the same session-aware resolver we use for inline rendering.
-    val markdownImageTapHandler = remember<(String, String) -> Unit>(messages, sessionId) {
+    // [da1023-F] Keyed on the ACTIVE session id (viewModel.currentSessionId),
+    // not the route arg: the route stays on the draft key after first-send
+    // promotion while the session dirs live under the real id — an unkeyed
+    // handler would resolve media against the orphan __new__ directory.
+    val markdownImageTapHandler = remember<(String, String) -> Unit>(messages, viewModel.currentSessionId) {
         handler@{ tappedMessageId, tappedUrl ->
             val imageRegex = Regex("!\\[([^\\]]*)\\]\\(([^)\\s]+)\\)")
             data class Ref(val messageId: String, val source: String, val title: String)
@@ -1912,7 +1916,9 @@ fun ChatScreen(
                 // doesn't have to re-walk PRootKernel for every page swipe.
                 // Falls back to the raw URL string when resolution misses —
                 // AsyncImage will route it through MinisImageFetcher anyway.
-                val resolved = resolveMdMediaFile(context, ref.source, sessionId)
+                // [da1023-F] Live read: draft key never resolves media after
+                // promotion — use the VM's current id.
+                val resolved = resolveMdMediaFile(context, ref.source, viewModel.currentSessionId)
                 com.rikkaminis.app.ui.components.ImageGalleryItem(
                     model = resolved ?: ref.source,
                     caption = ref.title,
@@ -2057,10 +2063,15 @@ fun ChatScreen(
                     // anchoring on a same-session tap (the drawer just closes)
                     // would leave a dangling anchor that pollutes that
                     // session's later steps with a meaningless sinceClickMs.
-                    if (id != sessionId) {
+                    // [da1023-F] Compare against the ACTIVE session id (the
+                    // drawer itself is already fed viewModel.currentSessionId
+                    // at :2018) — the route arg stays on the draft key after
+                    // first-send promotion, so "current session" must be the
+                    // promoted id or the tap navigates a same-session row.
+                    if (id != viewModel.currentSessionId) {
                         com.rikkaminis.app.diagnostics.PerfLongCtx.click(id)
                     }
-                    if (id == sessionId) {
+                    if (id == viewModel.currentSessionId) {
                         // Current session: just close the drawer, no navigation.
                         historyDrawerScope.launch { historyDrawerState.close() }
                     } else {
@@ -4530,7 +4541,10 @@ fun ChatScreen(
             // message-list body (the long-session input jank root cause).
             ChatInputArea(
                 viewModel = viewModel,
-                sessionId = sessionId,
+                // [da1023-F] Active id, not the route arg: the composer's
+                // downstream consumers (MoveToSessionSheet's self-filter,
+                // attachment add) must follow the promoted session.
+                sessionId = viewModel.currentSessionId,
                 chatRepository = chatRepository,
                 chatActions = chatActions,
                 isStreaming = isStreaming,
@@ -5033,7 +5047,10 @@ fun ChatScreen(
             source = com.rikkaminis.app.webapp.WebAppSource.ChatAttachment(
                 uri = target.uri,
                 fileName = target.fileName,
-                sessionId = sessionId,
+                // [da1023-F] The sheet copies bytes into
+                // minis-sessions/<sid>/attachments/<shortcutId>/ — the draft key
+                // would strand the shortcut in the orphan __new__ dir.
+                sessionId = viewModel.currentSessionId,
                 sessionTitle = null,
             ),
             onDismiss = { webAppSheetTarget = null },
