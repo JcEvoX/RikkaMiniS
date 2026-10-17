@@ -1,0 +1,25 @@
+src/android/app/src/main/java/com/rikkaminis/app/browser/BrowserTabPool.kt:379:     * minis:// through the placeholder (`PRootKernel.resolvePathForSession`)
+src/android/app/src/main/java/com/rikkaminis/app/browser/BrowserUseManager.kt:2647:        // session's file. [audit3 F-08] resolvePathForSession is the single
+src/android/app/src/main/java/com/rikkaminis/app/browser/BrowserUseManager.kt:2656:                PRootKernel.resolvePathForSession(input.sessionId, linuxPath, context)
+src/android/app/src/main/java/com/rikkaminis/app/browser/BrowserUseManager.kt:915:            // [PRootKernel.resolvePathForSession] — pinned to THIS chat
+src/android/app/src/main/java/com/rikkaminis/app/browser/BrowserUseManager.kt:922:            // session resolver *rejects* stays rejected — resolvePathForSession
+src/android/app/src/main/java/com/rikkaminis/app/browser/BrowserUseManager.kt:931:                PRootKernel.resolvePathForSession(minisSessionId, linuxPath, webView.context)
+src/android/app/src/main/java/com/rikkaminis/app/sandbox/PRootKernel.kt:1462: * `resolvePathForSession` documents (backlog §111 R3).
+src/android/app/src/main/java/com/rikkaminis/app/sandbox/PRootKernel.kt:901:    fun resolvePathForSession(sessionId: String?, linuxPath: String, context: Context): File? =
+src/android/app/src/main/java/com/rikkaminis/app/sandbox/PRootKernel.kt:910:     * Pure decision core of [resolvePathForSession]: no [Context], no
+src/android/app/src/main/java/com/rikkaminis/app/sandbox/PRootKernel.kt:918:     * cross-session hole [resolvePathForSession] documents.
+src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/BrowserUseOffloadHandler.kt:202:            // [audit3 F-08] resolvePathForSession owns the session-vs-global
+src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/BrowserUseOffloadHandler.kt:205:            val host = PRootKernel.resolvePathForSession(sessionId, cookiesFile, app)
+src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/BrowserUseOffloadHandler.kt:288:            PRootKernel.resolvePathForSession(sessionId, VAR_MINIS_BROWSER, app)?.also {
+src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ConfigOffloadHandler.kt:382:     * [PRootKernel.resolvePathForSession]; a path the session resolver rejects
+src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ConfigOffloadHandler.kt:385:     * ([resolveMaybeRelative]) — the native_offload protocol forwards the
+src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ConfigOffloadHandler.kt:393:        val resolved = resolveMaybeRelative(linuxPath, cwd)
+src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ConfigOffloadHandler.kt:394:        val hostFile: File = PRootKernel.resolvePathForSession(sessionId, resolved, context)
+src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ConfigOffloadHandler.kt:52:internal fun resolveMaybeRelative(path: String, cwd: String?): String =
+src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/PhotosOffloadHandler.kt:653:        val src = PRootKernel.resolvePathForSession(request.sessionId, guestPath, context)
+src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/SpeechOffloadHandler.kt:234:     * [PRootKernel.resolvePathForSession]'s — a path the session resolver
+src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/SpeechOffloadHandler.kt:249:            PRootKernel.resolvePathForSession(sessionId, trimmed, context)
+src/android/app/src/main/java/com/rikkaminis/app/tools/ReadImageTool.kt:61:            // resolvePathForSession: with a session in scope a path it rejects
+src/android/app/src/main/java/com/rikkaminis/app/tools/ReadImageTool.kt:68:                    PRootKernel.resolvePathForSession(sessionId, path, context)
+src/android/app/src/main/java/com/rikkaminis/app/ui/sandbox/FileBrowserViewModel.kt:288:            // resolvePathForSession: a path the SESSION resolver rejects
+src/android/app/src/main/java/com/rikkaminis/app/ui/sandbox/FileBrowserViewModel.kt:297:                com.rikkaminis.app.sandbox.PRootKernel.resolvePathForSession(sid, linuxPath, ctx)

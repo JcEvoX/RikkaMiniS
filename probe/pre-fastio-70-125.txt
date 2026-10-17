@@ -1,0 +1,56 @@
+70| *     replaced or removed (copying INTO such a directory is fine — the target
+71| *     is then `<root>/<name>`, which the handler resolves first);
+72| *   - an existing target unless `--force` is passed (refuse-instead-of-guess:
+73| *     an accidental overwrite has no undo);
+74| *   - a target inside its own source (`cp -r /a /a/b` never terminates).
+75| */
+76|class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler {
+77|
+78|    override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
+79|        val rawArgv = request.argv.drop(1)
+80|        // The subcommand is the first token. `normalizeTarShorts` already
+81|        // depends on that convention (its own `firstOrNull() != "tar"` guard),
+82|        // so this predicate is deliberately the SAME expression — the expander
+83|        // and the flag set below can never drift apart.
+84|        val isTarCommand = rawArgv.firstOrNull() == "tar"
+85|        val args = OffloadArgs(
+86|            // `find`-style single-dash long options (`-name`, `-type`, `-limit`)
+87|            // are rewritten to their `--` spelling first: OffloadArgs reads any
+88|            // `-word` as a short FLAG, so `find /usr -name "*.log"` would
+89|            // otherwise parse `-name` as a flag and `*.log` as a positional
+90|            // path. Rewriting here leaves the parser shared by all ~46 handlers
+91|            // untouched.
+92|            normalizeLongOptionSpelling(normalizeTarShorts(rawArgv)),
+93|            // `--recursive` / `--force` / `--ignore-case` are booleans, not
+94|            // `--key value` pairs. Without this declaration OffloadArgs consumes
+95|            // the NEXT token as the option's value, so `rm --recursive /tmp/x`
+96|            // lost the path and reported "missing <path>" instead of deleting
+97|            // anything.
+98|            //
+99|            // The tar verbs (`--create`/`--extract`/`--gzip`/`--verbose`) are
+100|            // modes too, but they are declared ONLY for `tar`. The parser turns
+101|            // any UNKNOWN `--key` into a `--key value` pair, so declaring them
+102|            // for every subcommand made `du --create btree` treat `--create` as
+103|            // a flag and silently walk `btree` (exit 0), where the intended
+104|            // behaviour is the parser's own "missing <path>" (exit 2). Scope —
+105|            // not acceptance — is the contract.
+106|            booleanFlags = if (isTarCommand) {
+107|                setOf(
+108|                    "recursive", "force", "ignore-case",
+109|                    // tar verbs: `--create`/`--gzip`/... are modes, never `--key value`.
+110|                    "create", "extract", "gzip", "verbose",
+111|                )
+112|            } else {
+113|                setOf("recursive", "force", "ignore-case")
+114|            },
+115|        )
+116|        if (args.hasFlag("h", "help")) return NativeOffloadResult(0, HELP)
+117|
+118|        val sub = args.positional.firstOrNull()
+119|        val paths = args.positional.drop(1)
+120|        return when (sub) {
+121|            null -> NativeOffloadResult(2, usage("missing subcommand", args))
+122|            "du" -> du(paths, args, request)
+123|            "rm" -> rm(paths, args, request)
+124|            "find" -> find(paths, args, request)
+125|            "grep" -> grep(paths, args, request)

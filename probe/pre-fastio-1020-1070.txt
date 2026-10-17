@@ -1,0 +1,51 @@
+1020|            "-name", "-type", "-limit", "-max-entries", "-ignore-case",
+1021|        )
+1022|
+1023|        private fun normalizeLongOptionSpelling(argv: List<String>): List<String> =
+1024|            argv.map { if (it in SHORT_LONG_OPTIONS) "-$it" else it }
+1025|
+1026|        /**
+1027|         * Expand `tar`'s clustered short options before the shared parse
+1028|         * (`-czf a.tar x` → `--create --gzip --file ... `), because OffloadArgs
+1029|         * reads any `-word` as ONE flag. Only `tar` gets this: `-rf` must keep
+1030|         * its meaning for `rm`/`cp`.
+1031|         *
+1032|         * `-f` is dropped rather than mapped to `--file`: its value (the
+1033|         * archive) must stay a POSITIONAL, and `--key value` would consume it
+1034|         * into `values`. `-C` maps to `--directory` (it also takes a value,
+1035|         * and the directory is not a positional). An unknown letter inside a
+1036|         * cluster leaves the whole token untouched, so the caller reports it
+1037|         * as an unknown option instead of silently dropping it.
+1038|         */
+1039|        private fun normalizeTarShorts(argv: List<String>): List<String> {
+1040|            if (argv.firstOrNull() != "tar") return argv
+1041|            val out = ArrayList<String>(argv.size)
+1042|            for (token in argv) {
+1043|                if (token.length < 2 || token[0] != '-' || token.startsWith("--")) {
+1044|                    out.add(token)
+1045|                    continue
+1046|                }
+1047|                val expanded = ArrayList<String>(token.length)
+1048|                var known = true
+1049|                for (ch in token.substring(1)) {
+1050|                    when (ch) {
+1051|                        'c' -> expanded.add("--create")
+1052|                        'x' -> expanded.add("--extract")
+1053|                        'z' -> expanded.add("--gzip")
+1054|                        'v' -> expanded.add("--verbose")
+1055|                        'C' -> expanded.add("--directory")
+1056|                        'f' -> Unit   // the archive value stays a positional
+1057|                        else -> known = false
+1058|                    }
+1059|                }
+1060|                if (known) out.addAll(expanded) else out.add(token)
+1061|            }
+1062|            return out
+1063|        }
+1064|
+1065|        private val HELP = """minis-fastio — file-intensive primitives run by the host process on the real filesystem, bypassing the PRoot syscall tax (~100-200µs/op → ~1µs/op).
+1066|
+1067|Usage:
+1068|  minis-fastio du <path>...            Read-only: file/dir counts + apparent bytes per tree (JSON).
+1069|                                       Use instead of `du -sb` / `find | wc -l` / `find | xargs stat`
+1070|                                       when walking a large tree.

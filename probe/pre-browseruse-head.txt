@@ -1,0 +1,140 @@
+1|package com.rikkaminis.app.sandbox.offload
+2|
+3|import android.util.Log
+4|import com.rikkaminis.app.MinisApp
+5|import com.rikkaminis.app.browser.BrowserAction
+6|import com.rikkaminis.app.browser.BrowserActionInput
+7|import com.rikkaminis.app.browser.BrowserActionResult
+8|import com.rikkaminis.app.sandbox.NativeOffloadHandler
+9|import com.rikkaminis.app.sandbox.NativeOffloadRequest
+10|import com.rikkaminis.app.sandbox.NativeOffloadResult
+11|import com.rikkaminis.app.sandbox.PRootKernel
+12|import kotlinx.coroutines.TimeoutCancellationException
+13|import kotlinx.coroutines.runBlocking
+14|import kotlinx.coroutines.withTimeout
+15|import org.json.JSONArray
+16|import org.json.JSONObject
+17|import java.io.File
+18|import java.text.SimpleDateFormat
+19|import java.util.Date
+20|import java.util.Locale
+21|import java.util.TimeZone
+22|
+23|/**
+24| * minis-browser-use — expose the agent's browser_use tool as a CLI inside the
+25| * PRoot sandbox.
+26| *
+27| * Output contract mirrors iOS `BrowserUseOffload.m` / `NativeOffloadUtils.m`:
+28| * every invocation emits a JSON envelope
+29| *   `{ ok, tool, action, data | error, timestamp }`
+30| * (pretty-printed by default; minified with `--compact`; data-only with `-q`).
+31| * Screenshots are persisted under `/var/minis/browser/` and referenced via
+32| * `image_path` + `minis_url` — raw base64 is only included when the caller
+33| * explicitly passes `--with-base64`, matching iOS.
+34| *
+35| * Hard 90-second timeout via `withTimeout` so a hanging navigation can't lock
+36| * the shell indefinitely. Exits 0 for success, 1 for runtime errors, 2 for
+37| * bad arguments. Bare invocation prints help and exits 0 (matches iOS).
+38| */
+39|class BrowserUseOffloadHandler(private val app: MinisApp) : NativeOffloadHandler {
+40|
+41|    override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
+42|        // Declared-boolean flags: without this set, the shared OffloadArgs
+43|        // parser would greedily consume the next positional token (typically
+44|        // the action name) as a value, e.g. `--compact navigate` would store
+45|        // `compact=navigate` and drop `navigate` from positional args.
+46|        val args = OffloadArgs(
+47|            request.argv.drop(1),
+48|            booleanFlags = BOOLEAN_FLAGS,
+49|        )
+50|        val compact = args.hasFlag("compact")
+51|        val quiet = args.hasFlag("q", "quiet")
+52|        val withBase64 = args.hasFlag("with-base64", "with_base64")
+53|
+54|        // Bare invocation / --help: exit 0 with help (matches iOS). iOS writes
+55|        // help to stderr; stdout vs stderr is not separable across this native
+56|        // offload boundary, so we return help in `output` with exit 0.
+57|        if (request.argv.size <= 1 || args.hasFlag("h", "help")) {
+58|            return NativeOffloadResult(0, HELP)
+59|        }
+60|
+61|        // Parse args into the browser_use input shape.
+62|        val inputJson = try {
+63|            buildInputJson(args, request.sessionId)
+64|        } catch (e: IllegalArgumentException) {
+65|            return emitError(action = "execute", code = ERR_INVALID_ARGS,
+66|                message = e.message ?: "invalid arguments",
+67|                compact = compact, quiet = quiet, exit = 2)
+68|        }
+69|
+70|        val parsedInput = BrowserActionInput.parse(inputJson.toString())
+71|            ?: return emitError(action = "execute", code = ERR_INVALID_ARGS,
+72|                message = "Invalid browser_use input. Required: 'action' (one of ${BrowserAction.allValues.joinToString(", ")})",
+73|                compact = compact, quiet = quiet, exit = 2)
+74|        // [fix/browser-trio-audit] Inject the requesting chat session (T340
+75|        // MINIS_CHAT_SESSION_ID, null for interactive terminals) so
+76|        // file_upload resolves per-session paths via resolveSessionHostPath
+77|        // instead of the global cross-session fallback. Never parsed from
+78|        // the model's JSON — the CLI argv cannot pick another session.
+79|        val input = request.sessionId?.let { parsedInput.copy(sessionId = it) } ?: parsedInput
+80|
+81|        val actionName = input.action.value
+82|
+83|        // [T-bg-overlay phase 2 fix] Surface browser sub-action progress
+84|        // to SessionActivityTracker.currentToolStatus so the background
+85|        // overlay capsule + FGS notification show what the agent is
+86|        // actually doing — "browser_use: navigate https://example.com"
+87|        // instead of the static "Running: browser_use".
+88|        com.rikkaminis.app.service.SessionActivityTracker.updateToolStatus(
+89|            statusForBrowserAction(actionName, inputJson),
+90|        )
+91|
+92|        // Execute under a 90s hard timeout. A hanging navigation in a tab
+93|        // pool shouldn't be able to block the entire shell forever.
+94|        val result: BrowserActionResult = try {
+95|            runBlocking {
+96|                withTimeout(EXECUTE_TIMEOUT_MS) {
+97|                    // [T-browser-readaction-follow-tab-and-yolo-android] The CLI
+98|                    // (`minis-browser-use`) is a serial human/script driver:
+99|                    // navigate → execute_js / get_text / … all expect the page
+100|                    // just navigated to, not a fanned-out grace tab. Drive in
+101|                    // YOLO single-tab mode so every tab-less action sticks to the
+102|                    // selected tab. Explicit --tab-id still routes normally.
+103|                    // Mirrors iOS BrowserUseOffloadBridge passing singleTab=true.
+104|                    //
+105|                    // [deep-audit-1016 9c] Point the shared pool at the
+106|                    // requesting chat session before executing. The pool is an
+107|                    // app-scoped singleton whose session is pinned at startup to
+108|                    // the placeholder "minis-browser-use", so without this every
+109|                    // minis:// resolution and every download landed under
+110|                    // minis-sessions/minis-browser-use/ instead of the caller's
+111|                    // own session dir. Context-only bind — it does not load the
+112|                    // session's persisted tab state (see
+113|                    // BrowserTabPool.bindSessionContextOnly).
+114|                    input.sessionId?.let { app.sharedBrowserTabPool.bindSessionContextOnly(it) }
+115|                    app.sharedBrowserTabPool.execute(input, singleTab = true)
+116|                }
+117|            }
+118|        } catch (_: TimeoutCancellationException) {
+119|            return emitError(action = actionName, code = ERR_INTERNAL,
+120|                message = "browser action timed out after ${EXECUTE_TIMEOUT_MS / 1000}s",
+121|                compact = compact, quiet = quiet, exit = 1)
+122|        } catch (e: Throwable) {
+123|            Log.w(TAG, "execute failed: ${e.message}", e)
+124|            return emitError(action = actionName, code = ERR_INTERNAL,
+125|                message = e.message ?: "browser action failed",
+126|                compact = compact, quiet = quiet, exit = 1)
+127|        }
+128|
+129|        if (!result.success) {
+130|            return emitError(action = actionName, code = ERR_INTERNAL,
+131|                message = result.text.ifEmpty { "browser action failed" },
+132|                compact = compact, quiet = quiet, exit = 1)
+133|        }
+134|
+135|        val data = encodeData(result, withBase64 = withBase64, sessionId = request.sessionId)
+136|        val envelope = envelope(actionName, data)
+137|        return NativeOffloadResult(0, emit(envelope, data, compact = compact, quiet = quiet))
+138|    }
+139|
+140|    // ── Input parsing ────────────────────────────────────────────────────

@@ -1,0 +1,41 @@
+145|            .map { Binding(it.key, it.value) }
+146|            .sortedByDescending { it.guestPrefix.length }
+147|    }
+148|
+149|    /**
+150|     * Normalize [path] against [cwd] into an absolute guest path, resolving
+151|     * `.` / `..` via [normalizeDotSegments]. Returns null when `..` climbs
+152|     * above `/` — the one case that must not be silently clamped, because the
+153|     * caller asked for something outside the guest tree.
+154|     */
+155|    fun absoluteGuestPath(cwd: String, path: String): String? {
+156|        val base = if (path.startsWith("/")) {
+157|            path
+158|        } else {
+159|            val dir = if (cwd.startsWith("/")) cwd else "/"
+160|            if (dir.endsWith("/")) dir + path else "$dir/$path"
+161|        }
+162|        val segments = normalizeDotSegments(base) ?: return null
+163|        return "/" + segments.joinToString("/")
+164|    }
+165|
+166|    /**
+167|     * Translate one guest path. [bindings] must come from [sessionBindings]
+168|     * (or an equivalent table) — the longest matching guest prefix wins, so a
+169|     * user mount nested under `/var/minis/` resolves to the mount rather than
+170|     * to the rootfs placeholder.
+171|     */
+172|    fun resolve(path: String, cwd: String, bindings: List<Binding>): Resolution {
+173|        val guest = absoluteGuestPath(cwd, path)
+174|            ?: return Resolution.Denied(
+175|                path,
+176|                Refusal.CLIMBS_ABOVE_ROOT,
+177|                "'$path' (cwd '$cwd') climbs above '/' — refusing to translate",
+178|            )
+179|
+180|        for (pseudo in PSEUDO_FS_PREFIXES) {
+181|            if (guest == pseudo || guest.startsWith("$pseudo/")) {
+182|                return Resolution.Denied(
+183|                    guest,
+184|                    Refusal.PSEUDO_FS,
+185|                    "'$guest' is the host $pseudo surface (bound by proot -b), not a guest file",

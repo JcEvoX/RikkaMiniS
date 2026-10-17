@@ -1,0 +1,17 @@
+42:    val OUTPUT_FLAGS: Set<String> = setOf("compact", "quiet", "q")
+215|        // [T-android-minis-config-set-shell-escape] (issue #36) `--file <path>`
+216|        // reads the value-json from a file instead of an argv positional. The
+217|        // value normally rides through the guest shell as a positional arg, so
+218|        // busybox ash mangles embedded double-quotes / backslashes / newlines /
+219|        // $ / backticks before this handler sees them — breaking large free-text
+220|        // writes like soul.body. Reading from a file bypasses shell escaping
+221|        // entirely. Mirrors iOS 5dcff277.
+222|        val fileArg = args.get("file")
+223|        val valueJSON = if (fileArg != null) {
+224|            readLinuxPath(fileArg, request.sessionId, request.cwd) ?: return errorResult(
+225|                args, EXIT_INVALID_ARGS, "INVALID_ARGS",
+226|                "--file: could not read value from '$fileArg'."
+227|            )
+228|        } else {
+229|            args.positional.getOrNull(2)
+230|        }

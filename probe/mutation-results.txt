@@ -1,0 +1,2 @@
+M3 gate_exit=0 ids=[] jvm_exit=2 red_tests=[] restore_rc=0
+M4 gate_exit=1 ids=[] jvm_exit=1 red_tests=[probeBrowserUseJoinsBeforeResolve,] restore_rc=0

@@ -1,0 +1,101 @@
+140|    // ── Input parsing ────────────────────────────────────────────────────
+141|
+142|    private fun buildInputJson(args: OffloadArgs, sessionId: String?): JSONObject {
+143|        // Explicit --json wins; action/flags are ignored in that case.
+144|        args.get("json")?.let { raw ->
+145|            return try {
+146|                JSONObject(raw)
+147|            } catch (e: Exception) {
+148|                throw IllegalArgumentException("--json is not valid JSON: ${e.message}")
+149|            }
+150|        }
+151|
+152|        val action = args.positional.firstOrNull()
+153|            ?: throw IllegalArgumentException("missing <action>. Use --help for usage.")
+154|
+155|        val obj = JSONObject().put("action", action)
+156|        args.get("url")?.let { obj.put("url", it) }
+157|        args.get("selector")?.let { obj.put("selector", it) }
+158|        args.get("text")?.let { obj.put("text", it) }
+159|        args.getInt("coordinate-x", "coordinate_x", "x")?.let { obj.put("coordinate_x", it) }
+160|        args.getInt("coordinate-y", "coordinate_y", "y")?.let { obj.put("coordinate_y", it) }
+161|        args.get("direction")?.let { obj.put("direction", it) }
+162|        args.getInt("amount")?.let { obj.put("amount", it) }
+163|        args.get("script")?.let { obj.put("script", it) }
+164|        args.get("user-agent", "user_agent", "ua")?.let { obj.put("user_agent", it) }
+165|        args.getInt("max-depth", "max_depth")?.let { obj.put("max_depth", it) }
+166|        args.getInt("tab-id", "tab_id")?.let { obj.put("tab_id", it) }
+167|        // set_viewport parameters
+168|        args.getInt("width")?.let { obj.put("viewport_width", it) }
+169|        args.getInt("height")?.let { obj.put("viewport_height", it) }
+170|        if (args.hasFlag("reset")) obj.put("reset", true)
+171|        // get_cookies / scroll_and_collect parameters
+172|        args.get("item-selector", "item_selector")?.let { obj.put("item_selector", it) }
+173|        args.getInt("scroll-count", "scroll_count")?.let { obj.put("scroll_count", it) }
+174|        args.getInt("timeout")?.let { obj.put("timeout", it) }
+175|        if (args.hasFlag("fuzzy")) obj.put("fuzzy", true)
+176|        // [feat/browser-console-network-upload] diagnostics + upload params.
+177|        if (args.hasFlag("clear")) obj.put("clear", true)
+178|        args.get("paths")?.let { raw ->
+179|            // Comma- or whitespace-separated Linux paths (quoting multiple
+180|            // paths through busybox-ash is painful; a single flat string is
+181|            // the shell-friendly shape).
+182|            val tokens = raw.split(Regex("[,\\s]+"))
+183|                .map { it.trim() }
+184|                .filter { it.isNotEmpty() }
+185|            if (tokens.isNotEmpty()) obj.put("paths", JSONArray(tokens))
+186|        }
+187|        args.get("keywords")?.let { raw ->
+188|            // Comma- or whitespace-separated list.
+189|            val tokens = raw.split(Regex("[,\\s]+"))
+190|                .map { it.trim() }
+191|                .filter { it.isNotEmpty() }
+192|            if (tokens.isNotEmpty()) obj.put("keywords", JSONArray(tokens))
+193|        }
+194|        // set_cookies: a JSON array of cookie objects. Either inline via
+195|        // --cookies '<json>' or, to dodge busybox-ash shell mangling of the
+196|        // JSON's quotes / braces / colons, from a file via --cookies-file <path>
+197|        // (mirrors `minis-config set --file`). Parse failures throw so the
+198|        // handler surfaces an explicit invalid_args error instead of silently
+199|        // dropping the array (which used to reach set_cookies as empty).
+200|        val cookiesFile = args.get("cookies-file", "cookies_file")
+201|        val cookiesRaw: String? = if (cookiesFile != null) {
+202|            // [audit3 F-08] resolvePathForSession owns the session-vs-global
+203|            // decision: with a session in scope a rejected path stays rejected
+204|            // (previously the elvis re-resolved it globally).
+205|            val host = PRootKernel.resolvePathForSession(sessionId, cookiesFile, app)
+206|                ?: throw IllegalArgumentException("--cookies-file: cannot resolve path '$cookiesFile'")
+207|            runCatching { host.readText() }.getOrNull()
+208|                ?: throw IllegalArgumentException("--cookies-file: could not read '$cookiesFile'")
+209|        } else {
+210|            args.get("cookies")
+211|        }
+212|        cookiesRaw?.let { raw ->
+213|            // JSON array first; otherwise accept a Netscape cookies.txt export.
+214|            val arr = runCatching { JSONArray(raw) }.getOrNull()
+215|                ?: parseNetscapeCookies(raw)
+216|                ?: throw IllegalArgumentException(
+217|                    "--cookies (or --cookies-file content) must be a JSON ARRAY of cookie " +
+218|                        "objects, or a Netscape cookies.txt file. JSON object fields: name + " +
+219|                        "value (required); optional domain (defaults to current page host), " +
+220|                        "path (defaults to \"/\"), secure (bool), http_only (bool, alias " +
+221|                        "httpOnly), expires (unix seconds, alias expirationDate), sameSite. " +
+222|                        "e.g. '[{\"name\":\"sid\",\"value\":\"abc\",\"domain\":\".x.com\",\"secure\":true}]'. " +
+223|                        "If the shell is mangling the quotes, write the JSON array to a file " +
+224|                        "and pass --cookies-file <path>.",
+225|                )
+226|            obj.put("cookies", arr)
+227|        }
+228|        return obj
+229|    }
+230|
+231|    /**
+232|     * Parse a Netscape-format cookie file (curl/wget/browser export) into the
+233|     * JSON array `set_cookies` consumes. Returns null if it doesn't look like
+234|     * Netscape, so the caller falls through to the JSON error. Format: 7
+235|     * TAB-separated fields per line — domain, includeSubdomains, path, secure,
+236|     * expires, name, value. `#` lines are comments, except curl's `#HttpOnly_`
+237|     * domain prefix which marks an HttpOnly cookie.
+238|     */
+239|    private fun parseNetscapeCookies(text: String): JSONArray? {
+240|        val out = JSONArray()

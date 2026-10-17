@@ -1,0 +1,22 @@
+{
+ "M1": {
+  "applied_sha": "a651c4aeb98463b01ea91bcf5c9c3a2b94880dddae6eddd2b0534196c5c40673",
+  "pre_sha": "9d2b963d1f6181a66bc61ec26771036b50a929d0c2157b3bf4743821626621f2",
+  "restored_exact": true
+ },
+ "M2": {
+  "applied_sha": "8ae9389d9ae33e179294f3c0614636ee46983cf7bbb1f0b739fc97e5cf624d52",
+  "pre_sha": "1cb0cadbdb5013daec0783808a22e11caaedef29f3409ef4eefdaff9d7252d54",
+  "restored_exact": true
+ },
+ "M3": {
+  "applied_sha": "5f834d8883af7bae877ac4dc275160cccdfdae2072833c5b65b9729e17bc22c0",
+  "pre_sha": "1cb0cadbdb5013daec0783808a22e11caaedef29f3409ef4eefdaff9d7252d54",
+  "restored_exact": true
+ },
+ "M4": {
+  "applied_sha": "6b1cdf34d45940d52f51ff9a12cde6108a61a042e3bd231176d9d6bdf5ddfa8d",
+  "pre_sha": "9d2b963d1f6181a66bc61ec26771036b50a929d0c2157b3bf4743821626621f2",
+  "restored_exact": true
+ }
+}
