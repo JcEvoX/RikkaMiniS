@@ -143,11 +143,11 @@ def analyse(src):
     flags = re.search(r"val\s+NO_VALUE_FLAGS\s*=\s*setOf\(([^)]*)\)", src)
     names = set(re.findall(r'"([^"]+)"', flags.group(1))) if flags else set()
 
-    anchor = "OffloadArgs(rest, booleanFlags = NO_VALUE_FLAGS)"
+    anchor = "OffloadArgs(split.withoutGroup, booleanFlags = noValueFlagsFor(group))"
     results.append((
-        "1 parser receives declared switches",
+        "1 parser receives declared switches (per group)",
         anchor in src,
-        line_of(src, anchor),
+        line_of(src, "OffloadArgs(split.withoutGroup"),
         "expected `%s`" % anchor,
     ))
     results.append((
@@ -192,6 +192,65 @@ def analyse(src):
         line_of(src, "private fun packageClear("),
         "helper " + ("missing" if clear is None else "present"),
     ))
+
+    # ── deep-audit-1020 ISSUE-02: declaration coverage + argv shaping ──────
+    # 8. every long option read through hasFlag must be declared value-less
+    used_names = set()
+    for m in re.finditer(r'hasFlag\(((?:"[^"]*"\s*,?\s*)+)\)', src):
+        for nm in re.findall(r'"([^"]+)"', m.group(1)):
+            if len(nm) > 1:
+                used_names.add(nm)
+    undeclared = used_names - names - {"help"}
+    results.append((
+        "8 every hasFlag long name is declared value-less",
+        flags is not None and not undeclared,
+        line_of(src, "val NO_VALUE_FLAGS"),
+        ("undeclared=%s (a switch that eats the next token)" % sorted(undeclared))
+        if undeclared else "covered=%d names" % len(used_names),
+    ))
+
+    # 9. the group comes from the parsed positional, never from argv[0] — both
+    #    at the call site AND inside the splitter's implementation (a mutation
+    #    that guts firstPositionalIndex must not slip past the call-site pin)
+    handle_body = function_body(src, "handle") or ""
+    results.append((
+        "9 group taken by position (splitShizukuArgv), not argv[0]",
+        "splitShizukuArgv(argv)" in handle_body and "split.group" in handle_body
+        and "val rest = if (group == \"exec\") split.trailing else split.withoutGroup" in handle_body
+        and "firstPositionalIndex(argv" in src and "group = argv[index]" in src
+        and "group = argv[0]" not in src,
+        line_of(src, "splitShizukuArgv(argv)"),
+        "handle body + splitter impl" + ("" if handle_body else " MISSING"),
+    ))
+
+    # 10. none of the group handlers may read the raw rest tail for its sub
+    raw_sub = line_of(src, "val sub = rest.firstOrNull()")
+    results.append((
+        "10 group sub-commands read parsed positionals, not raw rest",
+        raw_sub == 0,
+        raw_sub if raw_sub else line_of(src, "private fun handlePackage("),
+        "raw `val sub = rest.firstOrNull()` hits=%d" % src.count("val sub = rest.firstOrNull()"),
+    ))
+
+    # 11. exec passthrough still joins the raw tail
+    exec_body = function_body(src, "handleExec")
+    results.append((
+        "11 exec passthrough joins the raw tail verbatim",
+        exec_body is not None and 'rest.joinToString(" ")' in exec_body,
+        line_of(src, "private fun handleExec("),
+        "handleExec " + ("missing" if exec_body is None else "present, must be `rest.joinToString(\" \")`"),
+    ))
+
+    # 12. the one two-meaning option must be opted out explicitly
+    data_flag = 'hasFlag("data")' in src
+    data_value = re.search(r'args\.get\(\s*"data"', src) is not None
+    opt_out = 'NO_VALUE_FLAGS - "data"' in src
+    results.append((
+        "12 --data read both ways is opted out per group",
+        not (data_flag and data_value) or opt_out,
+        line_of(src, 'NO_VALUE_FLAGS - "data"'),
+        "hasFlag(data)=%s get(data)=%s opt-out=%s" % (data_flag, data_value, opt_out),
+    ))
     return results
 
 
@@ -199,8 +258,17 @@ COMPLIANT = '''package com.rikkaminis.app.sandbox.offload
 
 class ShizukuOffloadHandler {
     private fun handle(request: Any) {
-        val rest = listOf<String>()
-        val args = OffloadArgs(rest, booleanFlags = NO_VALUE_FLAGS)
+        val argv = listOf<String>()
+        val split = splitShizukuArgv(argv)
+        val group = split.group ?: return
+        val args = OffloadArgs(split.withoutGroup, booleanFlags = noValueFlagsFor(group))
+        val rest = if (group == "exec") split.trailing else split.withoutGroup
+        val sub = args.positional.firstOrNull()
+    }
+
+    private fun handleExec(rest: List<String>, args: OffloadArgs): Int {
+        val cmd = rest.joinToString(" ")
+        return run(cmd)
     }
 
     private fun inputText(text: String, args: OffloadArgs): Int = run(encodeInputText(text))
@@ -209,6 +277,15 @@ class ShizukuOffloadHandler {
         val cacheOnly = args.hasFlag("cache-only")
         val cmd = buildPackageClearCommand(pkg ?: "", cacheOnly, args.get("user"))
         return ok(cmd, clearScope(cacheOnly))
+    }
+
+    private fun netData(args: OffloadArgs): Int {
+        if (args.hasFlag("data")) return run(args.get("user") ?: "")
+        return 0
+    }
+
+    private fun actData(args: OffloadArgs): Int {
+        return run(args.get("data", "d") ?: "")
     }
 
     private fun handleNotification(rest: List<String>, args: OffloadArgs): Int {
@@ -222,9 +299,20 @@ class ShizukuOffloadHandler {
     }
 
     companion object {
-        internal val NO_VALUE_FLAGS = setOf("block", "unblock")
+        internal val NO_VALUE_FLAGS = setOf("block", "unblock", "cache-only", "data")
     }
 }
+
+internal fun noValueFlagsFor(group: String?): Set<String> =
+    if (group == "activity") ShizukuOffloadHandler.NO_VALUE_FLAGS - "data"
+    else ShizukuOffloadHandler.NO_VALUE_FLAGS
+
+internal fun splitShizukuArgv(argv: List<String>): ShizukuArgv {
+    val index = firstPositionalIndex(argv, ShizukuOffloadHandler.NO_VALUE_FLAGS)
+    return ShizukuArgv(group = argv[index])
+}
+
+internal fun firstPositionalIndex(argv: List<String>, booleanFlags: Set<String>): Int = 0
 
 internal fun encodeInputText(text: String): String =
     text.replace(" ", "%s").replace("'", "")
@@ -242,13 +330,19 @@ internal fun clearScope(cacheOnly: Boolean): String = if (cacheOnly) "cache-only
 
 # criterion index (1-based) -> (mutation, expected broken criteria)
 BREAKERS = {
-    1: ("OffloadArgs(rest, booleanFlags = NO_VALUE_FLAGS)", "OffloadArgs(rest)"),
-    2: ('setOf("block", "unblock")', 'setOf("block", "unblock", "importance")'),
+    1: ("OffloadArgs(split.withoutGroup, booleanFlags = noValueFlagsFor(group))", "OffloadArgs(split.withoutGroup)"),
+    2: ('setOf("block", "unblock", "cache-only", "data")',
+        'setOf("block", "unblock", "cache-only", "data", "importance")'),
     3: ('text.replace(" ", "%s")', "text.replace(' ', '%')"),
     4: ('cmd.add("--cache-only")', 'cmd.add("--cache-only") // kept'),  # replaced below
     5: ("notificationChannel(args.positional.drop(1), args)", "notificationChannel(rest.drop(1), args)"),
     6: ("pos.getOrNull(1)", "rest.getOrNull(1)"),
     7: ("clearScope(cacheOnly)", "clearScope(false)"),
+    8: ('setOf("block", "unblock", "cache-only", "data")', 'setOf("block", "unblock", "data")'),
+    9: ("val group = split.group ?: return", "val group = argv[0]"),
+    10: ("val sub = args.positional.firstOrNull()", "val sub = rest.firstOrNull()"),
+    11: ('rest.joinToString(" ")', 'args.positional.joinToString(" ")'),
+    12: ('NO_VALUE_FLAGS - "data"', 'NO_VALUE_FLAGS'),
 }
 # criterion 4 has two halves; break the global-trim half explicitly
 BREAKERS[4] = (
