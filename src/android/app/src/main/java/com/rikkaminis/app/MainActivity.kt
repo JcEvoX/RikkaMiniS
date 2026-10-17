@@ -778,8 +778,17 @@ class MainActivity : ComponentActivity() {
                 nav.navigate(Routes.ENV_VARS)
             }
             // T183: any settings screen reachable by route string.
+            // [da1020-F] The route builders now percent-encode their ids (the
+            // root-cause fix), so a malformed route should be impossible — this
+            // runCatching is the "never crash on a deep link" backstop for
+            // future routes that forget to encode. On failure fall back to
+            // Settings home (always a valid destination), never crash.
             is DeepLinkAction.OpenSettingsScreen -> {
-                nav.navigate(action.route)
+                runCatching { nav.navigate(action.route) }
+                    .onFailure {
+                        AppLogger.warning("DeepLink", "OpenSettingsScreen: navigate failed; falling back to Settings home")
+                        runCatching { nav.navigate(Routes.SETTINGS) }
+                    }
             }
             is DeepLinkAction.OpenPermissionSettings -> {
                 nav.navigate(Routes.PERMISSIONS)
