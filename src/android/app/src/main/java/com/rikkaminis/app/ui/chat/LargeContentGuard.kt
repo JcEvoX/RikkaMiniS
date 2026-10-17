@@ -24,6 +24,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -34,6 +35,9 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import com.rikkaminis.app.R
 import com.rikkaminis.app.logging.AppLogger
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 /**
@@ -86,6 +90,7 @@ internal fun LargeContentBadge(
     onExpand: () -> Unit,
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val sizeLabel = remember(content.length) { formatByteSize(content.length) }
 
     Column(
@@ -150,16 +155,26 @@ internal fun LargeContentBadge(
 
             TextButton(
                 onClick = {
-                    val ok = exportLargeContentToFile(context, content, stableKey)
-                    Toast.makeText(
-                        context,
-                        if (ok) {
-                            context.getString(R.string.chat_message_large_export_ok)
-                        } else {
-                            context.getString(R.string.chat_message_large_export_fail)
-                        },
-                        Toast.LENGTH_SHORT,
-                    ).show()
+                    // [fix/da1023-A] deep-audit-1023 ISSUE-01: this button used to
+                    // run the whole export — mkdirs + a multi-MB writeText + the
+                    // FileProvider root lookup — synchronously on the UI thread.
+                    // The write is bounded only by message size (the guard
+                    // triggers at 32K chars, legacy rows reach 200KB+), so a tap
+                    // could stall a frame. exportLargeContentToFile is now
+                    // suspending and moves the disk work to Dispatchers.IO; the
+                    // toast and its two string resources are unchanged.
+                    scope.launch {
+                        val ok = exportLargeContentToFile(context, content, stableKey)
+                        Toast.makeText(
+                            context,
+                            if (ok) {
+                                context.getString(R.string.chat_message_large_export_ok)
+                            } else {
+                                context.getString(R.string.chat_message_large_export_fail)
+                            },
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
                 },
                 modifier = Modifier.padding(0.dp),
             ) {
@@ -349,18 +364,87 @@ private fun formatByteSize(chars: Int): String {
 }
 
 /**
+ * How long an exported oversized-message file survives in
+ * `cacheDir/large-messages`. 24h, matching the
+ * [com.rikkaminis.app.ui.components.pruneShareDir] precedent — the file is a
+ * throwaway hand-off to another app behind a temporary FileProvider grant;
+ * nothing in-app reads it back.
+ */
+internal const val LARGE_MESSAGE_EXPORT_TTL_MS = 24L * 60L * 60L * 1000L
+
+/**
+ * Delete exported large-message files older than [maxAgeMs] and return how
+ * many went away.
+ *
+ * Until [fix/da1023-A] nothing ever deleted
+ * `cacheDir/large-messages/msg-*.txt`, so every export was a permanent
+ * orphan (deep-audit-1023 ISSUE-01). Prune-before-write, like
+ * [com.rikkaminis.app.debug.ChatMutationMethods.pruneStaleAttachments] and
+ * [com.rikkaminis.app.ui.settings.LogManagementScreen.pruneStaleDiagnosticZips].
+ *
+ * Deliberately free of Android types so a JVM unit test can drive a real temp
+ * dir — see [com.rikkaminis.app.ui.chat.LargeMessageExportPruneTest].
+ *
+ * Expiry test matches [com.rikkaminis.app.ui.components.pruneShareDir]:
+ * strictly-older dies, so a file whose age equals [maxAgeMs] exactly
+ * survives. A failed delete is counted as kept, never as an exception.
+ *
+ * @param exportDir `cacheDir/large-messages`. A missing (or non-directory)
+ *   path yields `0` — first-run before any export, or a dir the OS already
+ *   reclaimed, is not an error.
+ * @param nowMs clock reading, injected so the TTL boundary is testable.
+ * @param maxAgeMs retention window; defaults to [LARGE_MESSAGE_EXPORT_TTL_MS].
+ *
+ * ponytail: 只在导出前顺带清扫（无后台巡检）| 天花板: 导出一次后再不导出的人，
+ * 那份文件会留到 cache 被系统回收为止 | 升级触发: cacheDir/large-messages 在存储
+ * 诊断里成为可增长目录，或单次点击会累积多份孤儿文件
+ */
+internal fun pruneExpiredLargeMessageFiles(
+    exportDir: File,
+    nowMs: Long,
+    maxAgeMs: Long = LARGE_MESSAGE_EXPORT_TTL_MS,
+): Int {
+    val children = exportDir.listFiles() ?: return 0
+    val cutoff = nowMs - maxAgeMs
+    var deleted = 0
+    for (f in children) {
+        if (f.isFile && f.lastModified() < cutoff && runCatching { f.delete() }.getOrDefault(false)) {
+            deleted++
+        }
+    }
+    return deleted
+}
+
+/**
  * Dump the content to a temp file under cacheDir/large-messages and fire an
  * ACTION_SEND chooser. Returns true if the chooser was launched.
+ *
+ * Suspending: everything that touches the disk — `mkdirs`, the TTL prune
+ * (`listFiles` is a directory walk) and the multi-MB `writeText` — runs on
+ * [Dispatchers.IO]. The caller ([LargeContentBadge]) invokes this from
+ * `rememberCoroutineScope()`, so the `FileProvider` lookup and the chooser
+ * below still happen on the main thread, after the write has completed.
  */
-private fun exportLargeContentToFile(
+private suspend fun exportLargeContentToFile(
     context: android.content.Context,
     content: String,
     stableKey: String,
 ): Boolean = try {
-    val dir = File(context.cacheDir, "large-messages").apply { mkdirs() }
-    val safeKey = stableKey.replace(Regex("[^A-Za-z0-9_.-]"), "_").take(64)
-    val file = File(dir, "msg-$safeKey-${System.currentTimeMillis()}.txt")
-    file.writeText(content)
+    val file = withContext(Dispatchers.IO) {
+        val dir = File(context.cacheDir, "large-messages").apply { mkdirs() }
+        // [fix/da1023-A] deep-audit-1023 ISSUE-01: nothing deleted these
+        // exports, so every tap left a permanent orphan (the dir is not the
+        // system cache — the OS has no reason to reclaim it). Prune before
+        // writing, the same shape as ChatMutationMethods.pruneStaleAttachments
+        // and LogManagementScreen.pruneStaleDiagnosticZips. A prune failure
+        // must never block the export the user asked for.
+        runCatching { pruneExpiredLargeMessageFiles(dir, System.currentTimeMillis()) }
+            .onFailure { AppLogger.warning("LargeContentGuard", "prune failed: ${it.message}") }
+        val safeKey = stableKey.replace(Regex("[^A-Za-z0-9_.-]"), "_").take(64)
+        val f = File(dir, "msg-$safeKey-${System.currentTimeMillis()}.txt")
+        f.writeText(content)
+        f
+    }
     val authority = context.packageName + ".fileprovider"
     val uri = FileProvider.getUriForFile(context, authority, file)
     val send = Intent(Intent.ACTION_SEND).apply {

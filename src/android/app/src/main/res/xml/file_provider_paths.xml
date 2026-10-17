@@ -32,4 +32,24 @@
          text body instead of a real file attachment — broke email / Drive
          / any chat target that wanted the .log file itself. -->
     <files-path name="logs" path="logs/" />
+    <!-- Oversized-message exports (LargeContentGuard.exportLargeContentToFile
+         writes msg-*.txt under cacheDir/large-messages). The dir was written
+         but never declared, so FileProvider.getUriForFile threw
+         IllegalArgumentException on EVERY export and the user only saw the
+         "export failed" toast while the file stayed behind as an orphan
+         (deep-audit-1023 ISSUE-01). -->
+    <cache-path name="large-messages" path="large-messages/" />
+    <!-- Non-image chat attachments staged by data/storage/MediaStore under
+         filesDir/media (saveMedia writes <yyyy/MM/dd>/<sessionId>/<uuid>.<ext>).
+         FilePreviewScreen.openExternally/shareFile, InlineMediaPlayer.shareMediaFile
+         and the markdown media cards all hand these files to
+         getUriForFile — undeclared here meant every external open / share of
+         a chat attachment threw (deep-audit-1023 ISSUE-01). -->
+    <files-path name="media" path="media/" />
+    <!-- Photo/video blobs exported by the android-photos offload handler under
+         filesDir/photos-export and reported back to the agent as `host_path`.
+         When such a path is opened through the in-app file preview /
+         external-open / share chain it must resolve through the provider
+         (deep-audit-1023 ISSUE-01). -->
+    <files-path name="photos-export" path="photos-export/" />
 </paths>
