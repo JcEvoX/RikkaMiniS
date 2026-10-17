@@ -2649,9 +2649,31 @@ DA1019_GATES = [
     ("offload_cli_args_check", "OFFLOAD_CLI_ARGS_SELFTEST=PASS", (REPO_ROOT,), (REPO_ROOT,)),
 ]
 
+DA1020_GATES = [
+    ("provider_models_cache_wiring_check", "PROVIDER_MODELS_CACHE_WIRING_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("webview_holder_url_source_check", "WEBVIEW_HOLDER_URL_SOURCE_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("voice_cancel_guard_check", "VOICE_CANCEL_GUARD_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("deeplink_settings_routes_check", "DEEPLINK_SETTINGS_ROUTES_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("memory_gate_provider_fields_check", "MEMORY_GATE_PROVIDER_FIELDS_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("filepreview_print_bounded_check", "FILEPREVIEW_PRINT_BOUNDED_SELFTEST=PASS", (), (REPO_ROOT,)),
+]
+
+
 def test_da1019_gates():
     print("━━━ deep-audit-1019 gates (selftest teeth + real tree) ━━━")
     for script, marker, st_extra, real_args in DA1019_GATES:
+        argv = [sys.executable, os.path.join(SCRIPT_DIR, script + ".py")] + list(st_extra) + ["--selftest"]
+        proc = subprocess.run(argv, capture_output=True, text=True)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        check("%s selftest has teeth (%s)" % (script, marker),
+              proc.returncode == 0 and marker in out, out[-280:])
+        rc, out = run_scanner(script + ".py", *real_args)
+        check("%s real tree green" % script, rc == 0, out[-280:])
+
+
+def test_da1020_gates():
+    print("━━━ deep-audit-1020 gates (selftest teeth + real tree) ━━━")
+    for script, marker, st_extra, real_args in DA1020_GATES:
         argv = [sys.executable, os.path.join(SCRIPT_DIR, script + ".py")] + list(st_extra) + ["--selftest"]
         proc = subprocess.run(argv, capture_output=True, text=True)
         out = (proc.stdout or "") + (proc.stderr or "")
@@ -2696,6 +2718,7 @@ def main():
     test_da1016_gates()
     test_da1018_gates()
     test_da1019_gates()
+    test_da1020_gates()
     test_da1017_external_fixtures()
     test_real_repo()
     print("")
