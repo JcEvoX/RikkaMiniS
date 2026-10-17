@@ -2632,6 +2632,35 @@ def test_da1018_gates():
         rc, out = run_scanner(script + ".py", *real_args)
         check(f"{script} real tree green", rc == 0, out[-280:])
 
+
+# deep-audit-1019 gates: same two-layer teeth as DA1016/1017/1018 — the gate's
+# own --selftest must print its unique closing marker (a stubbed gate that only
+# calls sys.exit(0) cannot print it), and the gate must pass on the real tree.
+DA1019_GATES = [
+    # (script without .py, selftest closing marker, selftest extra argv, real-tree argv)
+    ("modeluse_proto_single_source_check", "MODELUSE_PROTO_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("loop_tool_status_transition_check", "LOOP_TOOL_STATUS_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("fastio_tar_bounds_check", "FASTIO_TAR_BOUNDS_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("provider_ua_parity_check", "PROVIDER_UA_PARITY_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("session_provider_enabled_check", "SESSION_PROVIDER_ENABLED_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("parts_json_funnel_check", "PARTSJSON_FUNNEL_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("katex_ready_race_check", "KATEX_READY_RACE_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("browser_destroy_wakeup_check", "BROWSER_DESTROY_WAKEUP_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("offload_cli_args_check", "OFFLOAD_CLI_ARGS_SELFTEST=PASS", (REPO_ROOT,), (REPO_ROOT,)),
+]
+
+def test_da1019_gates():
+    print("━━━ deep-audit-1019 gates (selftest teeth + real tree) ━━━")
+    for script, marker, st_extra, real_args in DA1019_GATES:
+        argv = [sys.executable, os.path.join(SCRIPT_DIR, script + ".py")] + list(st_extra) + ["--selftest"]
+        proc = subprocess.run(argv, capture_output=True, text=True)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        check("%s selftest has teeth (%s)" % (script, marker),
+              proc.returncode == 0 and marker in out, out[-280:])
+        rc, out = run_scanner(script + ".py", *real_args)
+        check("%s real tree green" % script, rc == 0, out[-280:])
+
+
 def main():
     print("╔══════════════════════════════════════════════════╗")
     print("║  Scan Self-Test (fixture ground truth)          ║")
@@ -2666,6 +2695,7 @@ def main():
     test_da1017_gates()
     test_da1016_gates()
     test_da1018_gates()
+    test_da1019_gates()
     test_da1017_external_fixtures()
     test_real_repo()
     print("")
