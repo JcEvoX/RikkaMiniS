@@ -37,6 +37,11 @@ package com.rikkaminis.app.backup
  *                                     model 嵌套对象拍平成 modelId/…，
  *                                     ISO-8601 时间转 epoch 毫秒）
  *                                     + secrets.json 的凭据（本就是 base64，透传）
+ *                                     实例/模型键与 Android 自家导出
+ *                                     （exportInstanceJSON）做集合奇偶校验，
+ *                                     由 openminis_compat_field_parity_check 门
+ *                                     钉住（appendV1Suffix 三态、reasoning 档对、
+ *                                     costTier 等新增键自动进校验集）
  *   thinkingRules[]                ← data/thinking_rules.jsonl 按 instanceId 聚合，
  *                                     instanceId → (providerType, label)
  *   groups[]                       ← provider_config.json 的 modelGroups（直传，
@@ -53,7 +58,8 @@ package com.rikkaminis.app.backup
  *                                     形态）拆成逐服务器包装
  *   chatSessions[]                 ← data/sessions*.jsonl 的 SessionV2 记录；
  *                                     memoryEnabled 由 Boolean 转 Int（org.json 的
- *                                     optInt 不做 Boolean→Int 强转）；ISO→毫秒
+ *                                     optInt 不做 Boolean→Int 强转）；ISO→毫秒；
+ *                                     pinnedAt 三态透传（正毫秒，缺键=未置顶）
  *   chatMessages[]                 ← data/messages*.jsonl 的 MessageV2 记录；
  *                                     parts 数组序列化为 partsJson 字符串；ISO→毫秒
  *
@@ -471,7 +477,19 @@ object OpenMinisBackupCompat {
             obj.put("createdAt", isoToMillis(inst.opt("createdAt")) ?: now())
             inst.optString("customBaseURL", "").takeIf { it.isNotEmpty() }
                 ?.let { obj.put("customBaseURL", it) }
-            if (inst.optBoolean("appendV1Suffix", false)) obj.put("appendV1Suffix", true)
+            // [fix-minisbak-append-v1-parity] appendV1Suffix 两端默认都是 true：
+            // RikkaMinis 导入端 optBoolean("appendV1Suffix", true)，Android 自家
+            // 导出只在 false 时写键（ProviderRepository exportInstanceJSON 的
+            // `if (!instance.appendV1Suffix) put(…, false)`——缺键即默认 true）。
+            // 原实现照抄了隔壁 useResponsesAPI 的「默认 false、只在 true 时写」
+            // 形态：那行对 useResponsesAPI 是对的（它的导入默认恰是 false），但
+            // 套在极性相反的字段上 → iOS 显式 false 的实例丢键后被导回 true，
+            // 每个请求平白多出 /v1 后缀（非 /v1 网关 404）。改三态透传：显式值
+            // 原样传递；缺键保持既有行为（导入端默认）。iOS 侧「缺键」的自身
+            // 默认值无法从本仓库证实（上游闭源），透传在任何语义下都严格不劣。
+            if (inst.has("appendV1Suffix")) {
+                obj.put("appendV1Suffix", inst.optBoolean("appendV1Suffix"))
+            }
             if (inst.optBoolean("useResponsesAPI", false)) obj.put("useResponsesAPI", true)
             inst.optString("customUserAgent", "").takeIf { it.isNotEmpty() }
                 ?.let { obj.put("customUserAgent", it) }
@@ -523,7 +541,31 @@ object OpenMinisBackupCompat {
                 }
                 model.optString("interleavedReasoningField", "").takeIf { it.isNotEmpty() }
                     ?.let { mo.put("interleavedReasoningField", it) }
+                // [fix-minisbak-compat-parity] 1021 修好了 Android 自家导出/导入的
+                // 这对字段（provider_import_id_roundtrip_check 第 2/3 臂），但
+                // OpenMinis 转换层没跟进：iOS LLMModel 本就携带两者（LLMModel.kt
+                // 注释 "Mirrors iOS LLMModel.reasoningEffortValues /
+                // declaresNoEffortTiers"）。漏迁后跨端恢复静默蒸发 effort 档位
+                // 上限（ThinkingLevelCatalog）与「无 effort 档位」声明（xAI 系模型
+                // 不该收 reasoning_effort），且只对 models.dev 里查不到的网关模型
+                // 生效——正是最需要手工档位配置的那批。写侧守卫镜像 Android 导出：
+                // 空数组不写；三态标志保持「显式 null = 缺省」。
+                model.optJSONArray("reasoningEffortValues")?.let {
+                    if (it.length() > 0) mo.put("reasoningEffortValues", it)
+                }
+                if (model.has("declaresNoEffortTiers") && !model.isNull("declaresNoEffortTiers")) {
+                    mo.put("declaresNoEffortTiers", model.optBoolean("declaresNoEffortTiers"))
+                }
                 isoToMillis(e.opt("userModifiedAt"))?.let { mo.put("userModifiedAt", it) }
+                // [fix-minisbak-compat-parity] costTier 驱动 cheapestFirst 路由；
+                // Android 导出/导入两端都带（optInt + Int.MIN_VALUE 哨兵，0 值 =
+                // 免费档位必须存活）。上游 iOS 是否导出该键无法从本仓库证实
+                // （上游闭源；该字段源自本仓 [T-recovery] 特性）——守卫透传：
+                // 源缺键 → 输出缺键（与现状完全一致），源有键（携带该字段的其他
+                // Minis 系导出器）→ 迁移。
+                if (e.has("costTier") && !e.isNull("costTier")) {
+                    mo.put("costTier", e.optInt("costTier"))
+                }
                 model.optJSONArray("inputModalities")?.let {
                     if (it.length() > 0) mo.put("inputModalities", it)
                 }
@@ -814,6 +856,13 @@ object OpenMinisBackupCompat {
             val memEnabled = if (d.has("memoryEnabled")) d.optBoolean("memoryEnabled", true)
             else s.optBoolean("memoryEnabled", true)
             o.put("memoryEnabled", if (memEnabled) 1 else 0)
+            // [fix-minisbak-compat-parity] 会话置顶时间戳：ConfigBackup 导出写
+            // pinnedAt、导入按 has 读取（null=未置顶）。0/负值会被导入端当成
+            // 「置顶于纪元零点」，故只写正毫秒值；缺键=不置顶，与现状一致。
+            // isoToMillis 同时覆盖上游的裸 Long 与四种 ISO-8601 形态；d/s 双读
+            // 对齐 memoryEnabled 的包裹层/平铺层兼容。
+            val pinnedRaw = if (d.has("pinnedAt")) d.opt("pinnedAt") else s.opt("pinnedAt")
+            isoToMillis(pinnedRaw)?.takeIf { it > 0 }?.let { o.put("pinnedAt", it) }
             o.put("editCount", d.optInt("editCount", 0))
             d.optString("thinkingOverride", "").takeIf { it.isNotEmpty() }
                 ?.let { o.put("thinkingOverride", it) }

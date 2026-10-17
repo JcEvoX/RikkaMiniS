@@ -639,4 +639,162 @@ class OpenMinisBackupCompatTest {
             assertNotNull(e.message)
         }
     }
+
+    // ------------------------------------------------------------------
+    // [fix-minisbak-append-v1-parity] + [fix-minisbak-compat-parity]
+    // 1022 ISSUE-04：转换层字段极性与字段完整性
+    // ------------------------------------------------------------------
+
+    @Test
+    fun providersAppendV1SuffixIsThreeStateNotPolarityFlipped() {
+        // 回归：appendV1Suffix 两端默认 true——RikkaMinis 导入端
+        // optBoolean("appendV1Suffix", true)，Android 自家导出只在 false 时
+        // 写键（缺键=默认 true）。旧实现照抄隔壁 useResponsesAPI 的「默认
+        // false、只在 true 时写」形态（那行对 useResponsesAPI 恰好正确——它的
+        // 导入默认就是 false），套在极性相反的字段上 → iOS 显式 false 的实例
+        // 丢键后被导回 true，每个请求平白多出 /v1 后缀（非 /v1 网关 404）。
+        fun inst(id: String, flag: Boolean?): JSONObject {
+            val j = JSONObject()
+                .put("id", id)
+                .put("providerType", "anthropic")
+                .put("label", id)
+                .put("credentialType", "apiKey")
+                .put("createdAt", "2026-06-10T12:00:00Z")
+            if (flag != null) j.put("appendV1Suffix", flag)
+            return j
+        }
+        val pc = JSONObject().put(
+            "instances",
+            JSONArray().put(inst("inst-on", true)).put(inst("inst-off", false))
+                .put(inst("inst-absent", null))
+        )
+        val root = JSONObject(
+            OpenMinisBackupCompat.convert(
+                zipOf(
+                    "manifest.json" to jsonEntry(plainManifest()),
+                    "data/provider_config.json" to jsonEntry(pc),
+                )
+            )
+        )
+        val prov = root.getJSONArray("providers")
+        assertEquals(3, prov.length())
+        val on = prov.getJSONObject(0)
+        val off = prov.getJSONObject(1)
+        val absent = prov.getJSONObject(2)
+        // 显式 true：键与值都保真
+        assertTrue(on.has("appendV1Suffix"))
+        assertTrue(on.getBoolean("appendV1Suffix"))
+        // 显式 false：必须显式落键——修复前这里丢键，导入端读回 true（反转）
+        assertTrue(off.has("appendV1Suffix"))
+        assertFalse(off.getBoolean("appendV1Suffix"))
+        // 缺键：保持缺键（导入端默认 true；透传不伪造值，iOS 缺键语义无从
+        // 证实，与旧行为一致）
+        assertFalse(absent.has("appendV1Suffix"))
+        // 对照组：useResponsesAPI 的「默认 false」极性不受本次修复影响
+        assertFalse(on.has("useResponsesAPI"))
+        assertFalse(off.has("useResponsesAPI"))
+    }
+
+    @Test
+    fun providersCarryEffortTierPairAndCostTier() {
+        // 回归：1021 修好了 Android 自家导出/导入的 reasoningEffortValues +
+        // declaresNoEffortTiers（iOS LLMModel 本就携带两者，见 LLMModel.kt
+        // "Mirrors iOS LLMModel.…" 注释），但 OpenMinis 转换层没跟进 → 跨端
+        // 恢复静默蒸发 effort 档位上限与 xAI「无 effort 档位」声明，只对
+        // models.dev 查不到的网关模型生效。costTier（cheapestFirst 路由）同族。
+        val model = JSONObject()
+            .put("id", "glm-4.7-plus")
+            .put("displayName", "GLM 4.7 Plus")
+            .put("provider", "zhipuai")
+            .put("reasoningEffortValues", JSONArray().put("high").put("medium"))
+            .put("declaresNoEffortTiers", false)
+        val bareModel = JSONObject()
+            .put("id", "bare-model")
+            .put("displayName", "Bare")
+            .put("provider", "zhipuai")
+            .put("reasoningEffortValues", JSONArray())
+            .put("declaresNoEffortTiers", JSONObject.NULL)
+        val entry = JSONObject()
+            .put("providerInstanceId", "inst-1")
+            .put("model", model)
+            .put("costTier", 2)
+        val bareEntry = JSONObject()
+            .put("providerInstanceId", "inst-1")
+            .put("model", bareModel)
+        val instance = JSONObject()
+            .put("id", "inst-1")
+            .put("providerType", "zhipuai")
+            .put("label", "GLM 网关")
+            .put("credentialType", "apiKey")
+            .put("createdAt", "2026-06-10T12:00:00Z")
+        val pc = JSONObject()
+            .put("instances", JSONArray().put(instance))
+            .put("modelEntries", JSONArray().put(entry).put(bareEntry))
+        val root = JSONObject(
+            OpenMinisBackupCompat.convert(
+                zipOf(
+                    "manifest.json" to jsonEntry(plainManifest()),
+                    "data/provider_config.json" to jsonEntry(pc),
+                )
+            )
+        )
+        val models = root.getJSONArray("providers").getJSONObject(0)
+            .getJSONArray("models")
+        assertEquals(2, models.length())
+        val full = models.getJSONObject(0)
+        assertEquals("high", full.getJSONArray("reasoningEffortValues").getString(0))
+        assertEquals("medium", full.getJSONArray("reasoningEffortValues").getString(1))
+        // 三态：显式 false 落键（不得塌缩成缺键——导入端缺键语义是 null）
+        assertTrue(full.has("declaresNoEffortTiers"))
+        assertFalse(full.getBoolean("declaresNoEffortTiers"))
+        assertEquals(2, full.getInt("costTier"))
+        // 守卫透传的另一半：空数组/显式 null/缺键一律不硬造
+        val bare = models.getJSONObject(1)
+        assertFalse(bare.has("reasoningEffortValues"))
+        assertFalse(bare.has("declaresNoEffortTiers"))
+        assertFalse(bare.has("costTier"))
+    }
+
+    @Test
+    fun chatSessionsPinnedAtSurvivesAsPositiveMillis() {
+        // 回归：ConfigBackup 导出写 pinnedAt、导入按 has 读取（null=未置顶）。
+        // 转换层此前整个字段缺失 → 跨端恢复丢会话置顶状态。0/负值不写：
+        // 导入端会把它当成「置顶于纪元零点」。
+        fun sessionLine(id: String, pinned: Any?): String {
+            val d = JSONObject()
+                .put(
+                    "session",
+                    JSONObject()
+                        .put("id", id)
+                        .put("title", "置顶测试")
+                        .put("modelId", "claude-fable-5")
+                        .put("createdAt", "2026-09-30T08:00:00Z")
+                        .put("updatedAt", "2026-09-30T08:05:00Z")
+                )
+                .put("memoryEnabled", true)
+            if (pinned != null) d.put("pinnedAt", pinned)
+            return JSONObject().put("t", "SessionV2").put("v", 1).put("d", d).toString()
+        }
+        val lines = sessionLine("sess-iso", "2026-10-01T09:30:00Z") + "\n" +
+            sessionLine("sess-zero", 0) + "\n" +
+            sessionLine("sess-absent", null) + "\n"
+        val root = JSONObject(
+            OpenMinisBackupCompat.convert(
+                zipOf(
+                    "manifest.json" to jsonEntry(plainManifest()),
+                    "data/sessions.jsonl" to textEntry(lines),
+                )
+            )
+        )
+        val sessions = root.getJSONArray("chatSessions")
+        assertEquals(3, sessions.length())
+        val iso = sessions.getJSONObject(0)
+        // 2026-10-01T09:30:00Z（ISO 形态上游可能用，裸 Long 同理）
+        assertTrue(iso.has("pinnedAt"))
+        assertEquals(1790847000000L, iso.getLong("pinnedAt"))
+        // 0 → 不写（导入端 Long 读回 0 会变成「置顶于纪元零点」）
+        assertFalse(sessions.getJSONObject(1).has("pinnedAt"))
+        // 缺键 → 不写（不硬造）
+        assertFalse(sessions.getJSONObject(2).has("pinnedAt"))
+    }
 }
