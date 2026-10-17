@@ -349,12 +349,12 @@ def main():
         files[rel] = open(path, encoding="utf-8").read()
 
     results = analyse(files[REPO_REL], files[REGISTRY_REL], files[ADAPTERS_REL], files[CACHE_REL])
-    failed = [(c, d, l, r) for c, ok, d, l, r in results if not ok]
-    for c, ok, d, l, r in results:
+    failed = [(c, d, f, l) for c, ok, d, f, l in results if not ok]
+    for c, ok, d, f, l in results:
         if ok:
             print("  [OK] %s" % c)
         else:
-            print("  [FAIL] %s:%s %s — %s" % (os.path.basename(r), l, c, d))
+            print("  [FAIL] %s:%s %s — %s" % (os.path.basename(f), l, c, d))
 
     total = len(results)
     print("Summary: %d passed, %d failed" % (total - len(failed), len(failed)))
