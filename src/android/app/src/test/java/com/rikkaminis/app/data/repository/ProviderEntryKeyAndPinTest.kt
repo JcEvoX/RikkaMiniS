@@ -198,6 +198,123 @@ class ProviderEntryKeyAndPinTest {
         assertTrue(body.contains("compactModelEntryId = \"\""))
     }
 
+    // ── [da1024-C] decideStaleRefCleanup: the prefs-held refs next to the pin ─
+    // lastUsedEntryId / voiceInput·OutputOverrideEntryId are SharedPreferences
+    // values held as `String?`. A bare `ref in ids` on such a property DOES
+    // compile and behaves (null and "" are simply absent from the set — both
+    // measured on kotlinc 2.0.21, see probe/jvm/snippet_semantics.kt), so this
+    // predicate is not a typing workaround: it is one shared rule for three
+    // refs across four removal paths, mirroring the pin's house pattern, and
+    // testable without a Context.
+
+    @Test
+    fun `stale ref inside the removed set is cleared`() {
+        assertTrue(decideStaleRefCleanup("inst-1/gone", setOf("inst-1/gone")))
+        assertTrue(decideStaleRefCleanup("inst-1/gone", setOf("other", "inst-1/gone")))
+    }
+
+    @Test
+    fun `stale ref outside the removed set is untouched`() {
+        assertFalse(decideStaleRefCleanup("inst-1/keep", setOf("inst-1/gone")))
+        assertFalse(decideStaleRefCleanup("inst-1/keep", emptySet()))
+    }
+
+    @Test
+    fun `unset ref is never stale`() {
+        // null = "never picked a model" (lastUsed) / "follow the group binding"
+        // (voice overrides). Claiming a match would write a pointless pref
+        // clear on every unrelated removal.
+        assertFalse(decideStaleRefCleanup(null, setOf("inst-1/gone", "")))
+        assertFalse(decideStaleRefCleanup(null, emptySet()))
+    }
+
+    @Test
+    fun `empty-string ref is only stale when the removed set contains it`() {
+        // The compact pin spells "follow the session chain" as "", the voice /
+        // lastUsed prefs use null. Pinned so a future refactor of the shared
+        // predicate cannot conflate the two idioms.
+        assertTrue(decideStaleRefCleanup("", setOf("", "inst-1/gone")))
+        assertFalse(decideStaleRefCleanup("", setOf("inst-1/gone")))
+    }
+
+    @Test
+    fun `a System voice sentinel can never be stale`() {
+        // The voice overrides may hold "<sentinel>/system-tts" for the
+        // on-device engine; that is not a provider entry id.
+        assertFalse(
+            decideStaleRefCleanup(
+                "minis-system-voice/system-tts",
+                setOf("inst-1/gone", "inst-2/keep"),
+            ),
+        )
+    }
+
+    // ── [da1024-C] source-shape: the widened removal cascade ───────────────
+
+    @Test
+    fun `replaceEntries cascades pin and per-device refs inside the else branch`() {
+        val body = bodyOf(repositorySource(), "fun replaceEntries(")
+        // The else of `if (suspiciousShrink)` — a transient API hiccup must
+        // keep both the curated agent-loop set AND the pin.
+        val elseBlock = elseBlockAfter(body, "if (suspiciousShrink)")
+        assertTrue(elseBlock.contains("decideCompactPinCleanup("))
+        assertTrue(elseBlock.contains("compactModelEntryId = \"\""))
+        assertTrue(elseBlock.contains("clearStaleSecondaryRefs(prunedEntryIds)"))
+    }
+
+    @Test
+    fun `ensureVoiceTemplateModels cascades every ref of the dissolved seeds`() {
+        val body = bodyOf(repositorySource(), "fun ensureVoiceTemplateModels(")
+        val guard = body.indexOf("if (staleSeedIds.isNotEmpty())")
+        assertTrue("the stale-seed guard must still be the entry point", guard >= 0)
+        val block = body.substring(guard)
+        assertTrue(block.contains("memberEntryIds.removeAll { it in staleSeedIds }"))
+        assertTrue(block.contains("config.agentLoopModelEntryIds.removeAll { it in staleSeedIds }"))
+        assertTrue(block.contains("decideCompactPinCleanup("))
+        assertTrue(block.contains("clearStaleSecondaryRefs(staleSeedIds)"))
+    }
+
+    @Test
+    fun `the per-device applier clears all three refs through the shared predicate`() {
+        val body = bodyOf(repositorySource(), "private fun clearStaleSecondaryRefs(")
+        assertTrue(body.contains("decideStaleRefCleanup(lastUsedEntryId"))
+        assertTrue(body.contains("decideStaleRefCleanup(voiceInputOverrideEntryId"))
+        assertTrue(body.contains("decideStaleRefCleanup(voiceOutputOverrideEntryId"))
+    }
+
+    @Test
+    fun `ModelGroupsScreen re-reads the compact pin from a strongly held listener`() {
+        // Mutation ② (inline the listener) must be caught here too: the guard
+        // gate covers the GC hazard, this covers "the page stopped refreshing".
+        val src = readRepoFile(
+            "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/ModelGroupsScreen.kt",
+        )
+        assertTrue(src.contains("val listener = SharedPreferences.OnSharedPreferenceChangeListener"))
+        assertTrue(src.contains("registerOnSharedPreferenceChangeListener(listener)"))
+        assertTrue(src.contains("unregisterOnSharedPreferenceChangeListener(listener)"))
+        assertTrue(src.contains("AgentRuntimeLimitsPrefs.KEY_COMPACT_MODEL_ENTRY_ID"))
+        assertTrue(src.contains("compactModelEntryId = AgentRuntimeLimitsPrefs.compactModelEntryId()"))
+    }
+
+    /** Balanced `{ ... }` of the first `else` that follows [marker]. */
+    private fun elseBlockAfter(src: String, marker: String): String {
+        val m = src.indexOf(marker)
+        require(m >= 0) { "marker not found: $marker" }
+        val e = src.indexOf("else", m)
+        require(e >= 0) { "no else branch after: $marker" }
+        val open = src.indexOf('{', e)
+        require(open >= 0) { "no block after the else of: $marker" }
+        var depth = 0
+        for (j in open until src.length) {
+            if (src[j] == '{') depth++
+            if (src[j] == '}') {
+                depth--
+                if (depth == 0) return src.substring(open, j + 1)
+            }
+        }
+        error("unbalanced else block after: $marker")
+    }
+
     /**
      * Walk up from the test working directory to the repo root containing
      * [relative]. Gradle sets user.dir to the module dir; a sandbox JVM run

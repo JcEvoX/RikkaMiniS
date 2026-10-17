@@ -654,6 +654,26 @@ class ProviderRepository(private val context: Context) {
     }
 
     /**
+     * [da1024-C] Clear the prefs-held secondary references an entry removal
+     * orphans: `lastUsedEntryId` and the voice input/output overrides. They are
+     * per-device SharedPreferences values, so [saveConfig]'s idMap translation
+     * cannot heal them the way it heals the in-config group / agent-loop refs.
+     *
+     * The compact pin is deliberately NOT handled here — every call site goes
+     * through the shared [decideCompactPinCleanup] predicate (one rule, four
+     * sites) rather than a second copy of "is the pin dangling".
+     */
+    private fun clearStaleSecondaryRefs(removedEntryIds: Collection<String>) {
+        if (decideStaleRefCleanup(lastUsedEntryId, removedEntryIds)) lastUsedEntryId = null
+        if (decideStaleRefCleanup(voiceInputOverrideEntryId, removedEntryIds)) {
+            voiceInputOverrideEntryId = null
+        }
+        if (decideStaleRefCleanup(voiceOutputOverrideEntryId, removedEntryIds)) {
+            voiceOutputOverrideEntryId = null
+        }
+    }
+
+    /**
      * [T-android-provider-voice] Reconcile voice-template seed entries on every
      * launch: add template models a previous build didn't know, remove RETIRED
      * seeds, and heal corrupted modality. Straight port of iOS
@@ -692,6 +712,18 @@ class ProviderRepository(private val context: Context) {
                 config.modelEntries.removeAll {
                     it.providerInstanceId == instance.id && it.baseModel.id in staleSeedIds
                 }
+                // [da1024-C] Full secondary-reference cascade for the ids just
+                // dissolved (mirrors replaceEntries' prune branch): group
+                // members, agent-loop pins, the compact pin and the per-device
+                // lastUsed / voice references.
+                for (group in config.modelGroups) {
+                    group.memberEntryIds.removeAll { it in staleSeedIds }
+                }
+                config.agentLoopModelEntryIds.removeAll { it in staleSeedIds }
+                if (decideCompactPinCleanup(AgentRuntimeLimitsPrefs.compactModelEntryId(), staleSeedIds)) {
+                    AgentRuntimeLimitsPrefs.save(context, compactModelEntryId = "")
+                }
+                clearStaleSecondaryRefs(staleSeedIds)
                 changed = true
                 android.util.Log.i("ProviderRepo", "[VoiceTemplateMigrate] ${instance.label}: removed stale voice entries: ${staleSeedIds.sorted()}")
             }
@@ -799,6 +831,8 @@ class ProviderRepository(private val context: Context) {
             if (decideCompactPinCleanup(AgentRuntimeLimitsPrefs.compactModelEntryId(), removedEntryIds)) {
                 AgentRuntimeLimitsPrefs.save(context, compactModelEntryId = "")
             }
+            // [da1024-C] ...and the per-device refs the same removal orphans.
+            clearStaleSecondaryRefs(removedEntryIds)
         }
         val emptyGroupIds = config.modelGroups.filter { it.memberEntryIds.isEmpty() }.map { it.id }.toSet()
         if (emptyGroupIds.isNotEmpty()) {
@@ -1341,6 +1375,14 @@ class ProviderRepository(private val context: Context) {
                 if (agentRemoved > 0) {
                     android.util.Log.i("ProviderRepo", "[ModelList] replaceEntries pruned $agentRemoved stale agent-loop entry pins")
                 }
+                // [da1024-C] Same cascade for the references that live OUTSIDE
+                // ProviderConfig, which saveConfig's idMap cannot translate:
+                // the compact pin and the per-device lastUsed / voice refs.
+                // Inside the non-suspicious-shrink branch, like the two above.
+                if (decideCompactPinCleanup(AgentRuntimeLimitsPrefs.compactModelEntryId(), prunedEntryIds)) {
+                    AgentRuntimeLimitsPrefs.save(context, compactModelEntryId = "")
+                }
+                clearStaleSecondaryRefs(prunedEntryIds)
             }
         }
 
@@ -1495,6 +1537,10 @@ class ProviderRepository(private val context: Context) {
         if (decideCompactPinCleanup(AgentRuntimeLimitsPrefs.compactModelEntryId(), setOf(entryId))) {
             AgentRuntimeLimitsPrefs.save(context, compactModelEntryId = "")
         }
+        // [da1024-C] Twin cascade for the per-device references: a deleted
+        // entry id can still be the last-used / voice override value, and only
+        // this path can clear it (the readers fall back silently).
+        clearStaleSecondaryRefs(setOf(entryId))
         saveConfig(config)
     }
 
@@ -2838,3 +2884,13 @@ internal fun decideCompactPinMigration(pinEntryId: String, oldKey: String, newKe
 /** [da1023-C] Compact-pin reset decision on removal. */
 internal fun decideCompactPinCleanup(pinEntryId: String, removedEntryIds: Collection<String>): Boolean =
     pinEntryId.isNotEmpty() && removedEntryIds.contains(pinEntryId)
+
+/**
+ * [da1024-C] True when the prefs-held secondary reference [ref] points at an
+ * entry id that is going away. One predicate for `lastUsedEntryId` and the two
+ * voice overrides — all `String?` SharedPreferences values, so the null case
+ * (and the System voice sentinels, which never equal a provider entry id) is
+ * spelled out exactly once instead of at every removal path.
+ */
+internal fun decideStaleRefCleanup(ref: String?, removedEntryIds: Collection<String>): Boolean =
+    ref != null && removedEntryIds.contains(ref)
