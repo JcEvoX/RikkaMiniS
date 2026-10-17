@@ -111,9 +111,17 @@ class BrowserHistoryStore private constructor(private val context: Context) {
 
     private fun save() {
         try {
+            // [da1022-C] Lock ONLY the shallow copy: record()/clear() mutate
+            // `entries` under this same monitor, and save() is called from
+            // both of them — serializing while iterating `entries` directly
+            // can throw ConcurrentModificationException (and, worse, persist
+            // a torn view). The copy itself is O(n) but allocation-only; keep
+            // the JSON building and file write OUTSIDE the lock so a slow
+            // flash write never blocks record().
+            val snapshot = synchronized(entries) { entries.toList() }
             val file = File(context.filesDir, FILENAME)
             val array = JSONArray()
-            for (entry in entries) {
+            for (entry in snapshot) {
                 val obj = JSONObject()
                 obj.put("id", entry.id)
                 obj.put("url", entry.url)
