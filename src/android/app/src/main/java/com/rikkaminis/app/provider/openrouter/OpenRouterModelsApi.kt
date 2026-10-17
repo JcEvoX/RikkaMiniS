@@ -16,6 +16,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 object OpenRouterModelsApi {
+    private const val TAG = "OpenRouterModelsApi"
     private val client = OkHttpClient()
     private val cache = ProviderModelsCache("openrouter")
 
@@ -34,6 +35,9 @@ object OpenRouterModelsApi {
         apiKey: String,
         context: Context? = null,
         forceRefresh: Boolean = false,
+        // [T-provider-custom-user-agent] models-list UA override (da1020
+        // ISSUE-05: Gemini/OpenRouter were the only fetchers not accepting it).
+        customUserAgent: String? = null,
     ): List<LLMModel> = withContext(Dispatchers.IO) {
         val cacheKey = apiKey
         if (context != null && !forceRefresh) {
@@ -45,12 +49,29 @@ object OpenRouterModelsApi {
             .header("Authorization", "Bearer $apiKey")
             .header("HTTP-Referer", "https://github.com/OpenMinis/OpenMinis")
             .header("X-Title", "Minis App")
-            // [T-android-default-ua] brand outbound /api/v1/models request.
-            .applyUserAgentOverride(null)
+            // [T-provider-custom-user-agent] models-list UA override; falls back
+            // to the branded default when the instance has no custom UA.
+            .applyUserAgentOverride(customUserAgent)
             .build()
 
         // [FIX-1 / F-209] Cancellable execute — see provider/CallCancellation.kt.
-        val response = client.newCall(request).executeOrCancel()
+        // [da1020 ISSUE-05] executeOrCancel moved INSIDE the try, matching
+        // GeminiModelsApi: it was outside, so an IOException (offline, DNS
+        // failure, TLS reset — the common case for a model-list refresh)
+        // propagated out of fetchModels instead of returning the empty fallback
+        // the way every HTTP error path does; on a single-key instance the
+        // exception then climbed all the way to
+        // ProviderRepository.refreshModels, losing the fallback semantics.
+        val response = try {
+            client.newCall(request).executeOrCancel()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // A cancelled fetch must unwind, not masquerade as a network error
+            // and hand back the empty list.
+            throw e
+        } catch (e: Exception) {
+            android.util.Log.w(TAG, "models fetch failed, using empty list: ${e.message}")
+            return@withContext emptyList()
+        }
         try {
             val body = response.body?.string() ?: return@withContext emptyList()
 

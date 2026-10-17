@@ -1,8 +1,12 @@
 package com.rikkaminis.app.provider.voice
 
+import com.rikkaminis.app.provider.executeOrCancel
+
 import android.util.Base64
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
@@ -218,17 +222,44 @@ open class VoiceProvider(
     }
 
     suspend fun executeRequest(request: Request): ByteArray = withContext(Dispatchers.IO) {
-        httpClient.newCall(request).execute().use { response ->
-            val body = response.body?.bytes()
-            if (!response.isSuccessful) {
-                if (response.code == 401 || response.code == 403) {
-                    Log.e(TAG, "Voice auth failed: HTTP ${response.code}")
-                    throw VoiceProviderException.Auth()
+        val call = httpClient.newCall(request)
+        // [FIX-1 / F-209] Cancellable execute — see provider/CallCancellation.kt:
+        // executeOrCancel rethrows a real CancellationException (never a
+        // fallback) and cancels the Call when the coroutine completes.
+        //
+        // [da1020 ISSUE-05] Prompt-interruption watcher. readTimeout here is
+        // 120s (TTS can be slow), and coroutine cancellation does not interrupt
+        // a blocking body read. executeOrCancel's own hook is registered on the
+        // withContext job itself, which cannot reach its final state while this
+        // body is blocked — sandbox-verified (probe/jvm/CancelProbe2.kt,
+        // kotlinx-coroutines 1.9.0): its Call.cancel() only fired AFTER the
+        // blocking read was released (promptCancelCount=0). A child job that
+        // does nothing but await cancellation CAN complete promptly (it has no
+        // blocking body), so its completion hook cancels the Call while the
+        // read is still in flight — which makes execute() throw immediately
+        // (probe: job.join returned in ~190ms with the Call cancelled).
+        val watchJob = launch { awaitCancellation() }
+        val watchDisposable = watchJob.invokeOnCompletion { _ -> call.cancel() }
+        try {
+            call.executeOrCancel().use { response ->
+                val body = response.body?.bytes()
+                if (!response.isSuccessful) {
+                    if (response.code == 401 || response.code == 403) {
+                        Log.e(TAG, "Voice auth failed: HTTP ${response.code}")
+                        throw VoiceProviderException.Auth()
+                    }
+                    Log.e(TAG, "Voice request failed: HTTP ${response.code}")
+                    throw VoiceProviderException.Http(response.code, body)
                 }
-                Log.e(TAG, "Voice request failed: HTTP ${response.code}")
-                throw VoiceProviderException.Http(response.code, body)
+                body ?: ByteArray(0)
             }
-            body ?: ByteArray(0)
+        } finally {
+            // Normal-completion path: drop the hook and stop the watcher so
+            // withContext does not wait for it. On the throw path structured
+            // concurrency cancels the watcher, and the still-attached hook then
+            // cancels the Call — harmless cleanup for an already-failed call.
+            watchDisposable.dispose()
+            watchJob.cancel()
         }
     }
 
@@ -299,14 +330,33 @@ open class VoiceProvider(
         applyVoiceAuth(builder)
 
         val data = executeRequest(builder.build())
-        val obj = runCatching { JSONObject(String(data, Charsets.UTF_8)) }.getOrNull()
-            ?: throw VoiceProviderException.Parse("Undecodable chat ASR response")
-        val text = obj.optJSONArray("choices")
-            ?.optJSONObject(0)
-            ?.optJSONObject("message")
-            ?.optString("content")
-            ?.trim()
-            ?: ""
-        return VoiceInputResponse(text = text)
+        return VoiceInputResponse(text = parseChatAsrTranscript(data))
     }
+}
+
+/**
+ * Parse the chat-completion ASR response body into the transcript text.
+ *
+ * [da1020 ISSUE-05] The empty-transcript guard mirrors the transcriptions
+ * endpoint parser (parseVoiceInputResponse, [audit-0917 F-203]): `optString`
+ * yields "" for a missing or empty key, so the old inline chain returned
+ * text="" and the consumer (ProviderSpeechRecognitionEngine) mapped a
+ * malformed chat response to NO_MATCH ("heard nothing") instead of surfacing
+ * a protocol error — which also blocked the fail-over chain (a Parse throw
+ * advances to the next candidate; a successful empty transcript does not).
+ *
+ * Extracted as a top-level pure function so the parse contract is testable
+ * without the OkHttp/android surface.
+ */
+internal fun parseChatAsrTranscript(data: ByteArray): String {
+    val obj = runCatching { JSONObject(String(data, Charsets.UTF_8)) }.getOrNull()
+        ?: throw VoiceProviderException.Parse("Undecodable chat ASR response")
+    val text = obj.optJSONArray("choices")
+        ?.optJSONObject(0)
+        ?.optJSONObject("message")
+        ?.optString("content")
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?: throw VoiceProviderException.Parse("Empty ASR transcript in chat ASR response")
+    return text
 }
