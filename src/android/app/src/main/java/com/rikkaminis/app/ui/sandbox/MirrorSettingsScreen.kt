@@ -50,6 +50,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshots.Snapshot
 import androidx.compose.runtime.snapshots.SnapshotStateMap
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.ui.Alignment
@@ -219,13 +220,20 @@ object MirrorSpeedTestViewModel {
         synchronized(this) {
             if (loaded) return
             val p = prefs(context)
-            for (cat in MirrorCategory.entries) {
-                val savedUrl = p.getString("mirror.selected.${cat.key}", null)
-                if (savedUrl != null) {
-                    val entry = MirrorCatalog.findByBaseURL(savedUrl)
-                    if (entry != null) selectedMirrorId[cat] = entry.id
+            // [da1022-F] ensureLoaded runs on background threads too (boot path
+            // via applyAllActiveMirrors, and retryApkWorldWithMirrorFallback on
+            // Dispatchers.IO), so these SnapshotStateMap writes must land as one
+            // atomic snapshot — a concurrent main-thread reader would otherwise
+            // observe a half-loaded map (selection written, toggle flag not yet).
+            Snapshot.withMutableSnapshot {
+                for (cat in MirrorCategory.entries) {
+                    val savedUrl = p.getString("mirror.selected.${cat.key}", null)
+                    if (savedUrl != null) {
+                        val entry = MirrorCatalog.findByBaseURL(savedUrl)
+                        if (entry != null) selectedMirrorId[cat] = entry.id
+                    }
+                    useCustomMirror[cat] = p.getBoolean("mirror.useCustom.${cat.key}", false)
                 }
-                useCustomMirror[cat] = p.getBoolean("mirror.useCustom.${cat.key}", false)
             }
             loaded = true
         }
@@ -284,22 +292,28 @@ object MirrorSpeedTestViewModel {
                 }
 
                 val sorted = perCategory.mapValues { (_, list) -> list.sortedWith(latencyComparator) }
+                val autoApplied = mutableListOf<MirrorCategory>()
                 withContext(Dispatchers.Main) {
                     results.clear()
                     results.putAll(sorted)
 
-                    // Auto-select fastest for categories without prior selection
-                    for (cat in MirrorCategory.entries) {
-                        if (selectedMirrorId[cat] == null) {
-                            val fastest = sorted[cat]?.firstOrNull { it.isSuccess }
-                            if (fastest != null) {
-                                selectedMirrorId[cat] = fastest.mirror.id
-                                persist(context, cat)
-                            }
-                        }
+                    // Auto-select fastest for categories without prior selection.
+                    // [da1022-F] A selection recorded without useCustomMirror=true
+                    // + applyMirror never reached the rootfs config — the speed
+                    // test conclusion was persisted but had no effect
+                    // (autoDetectOnceIfNeeded is the reference shape). applyMirror
+                    // is disk IO, so applied categories are collected here and
+                    // applied below, off the main thread (same shape as
+                    // selectMirror / setUseCustom).
+                    for ((cat, fastest) in autoSelectFastest(sorted) { selectedMirrorId[it] != null }) {
+                        selectedMirrorId[cat] = fastest.mirror.id
+                        useCustomMirror[cat] = true
+                        persist(context, cat)
+                        autoApplied += cat
                     }
+                    Log.i(TAG, "Mirror speed test complete: ${sorted.mapValues { it.value.size }}")
                 }
-                Log.i(TAG, "Mirror speed test complete: ${sorted.mapValues { it.value.size }}")
+                for (cat in autoApplied) applyMirror(context, cat)
             } finally {
                 // T10-L8: NonCancellable is required — a plain withContext in
                 // the finally of a cancelled job throws JobCancellationException
@@ -442,6 +456,7 @@ object MirrorSpeedTestViewModel {
             // Reuse the normal test flow, then await its completion via currentJob.
             runAllTests(context)
             currentJob?.join()
+            val toApply = mutableListOf<MirrorCategory>()
             withContext(Dispatchers.Main) {
                 for (cat in MirrorCategory.entries) {
                     val fastest = results[cat]?.firstOrNull { it.isSuccess } ?: continue
@@ -449,10 +464,15 @@ object MirrorSpeedTestViewModel {
                     selectedMirrorId[cat] = fastest.mirror.id
                     useCustomMirror[cat] = true
                     persist(context, cat)
-                    applyMirror(context, cat)
+                    toApply += cat
                 }
-                Log.i(TAG, "Auto mirror detection applied")
             }
+            // [da1022-F] applyMirror is disk IO — it used to run inside the
+            // withContext(Dispatchers.Main) block above. State writes stay on
+            // the main thread, the file writes happen here (same split as
+            // selectMirror / setUseCustom, T10-L7).
+            for (cat in toApply) applyMirror(context, cat)
+            Log.i(TAG, "Auto mirror detection applied")
         }
     }
 
@@ -493,8 +513,15 @@ object MirrorSpeedTestViewModel {
             tried.add(next.id)
             switches++
             p.edit().putStringSet(triedKey, tried).apply()
-            selectedMirrorId[MirrorCategory.ALPINE] = next.id
-            useCustomMirror[MirrorCategory.ALPINE] = true
+            // [da1022-F] This runs on the boot's IO dispatcher (RootfsManager
+            // .retryFailedApkWorld); the two snapshot-state writes must land as
+            // one atomic snapshot so a concurrent main-thread reader never sees
+            // "selection switched, custom flag still false". No Main-thread hop
+            // here — the boot path must not wait on the UI thread.
+            Snapshot.withMutableSnapshot {
+                selectedMirrorId[MirrorCategory.ALPINE] = next.id
+                useCustomMirror[MirrorCategory.ALPINE] = true
+            }
             persist(context, MirrorCategory.ALPINE)
             applyMirror(context, MirrorCategory.ALPINE)
             Log.i(TAG, "APK mirror fallback: switched to ${next.name} (switch $switches/${APK_MIRROR_FALLBACK_MAX_SWITCHES})")
@@ -583,6 +610,25 @@ object MirrorSpeedTestViewModel {
 }
 
 // ─── Views ───────────────────────────────────────────────────────────────────
+
+/**
+ * [da1022-F] Pure selection decision for the speed-test auto-select: for every
+ * category without a prior selection, take the first successful result of the
+ * caller-ordered list (runAllTests sorts by latencyComparator — successes
+ * ascending, failures last — so that entry is the fastest reachable mirror).
+ * Dependency-free (MirrorCategory / MirrorEntry / MirrorTestResult are all pure
+ * Kotlin) so it is unit-testable from the JVM test source set — same split as
+ * [da1021-C] did for MirrorCategory. The caller performs the state writes,
+ * persistence, and the applyMirror disk IO.
+ */
+internal fun autoSelectFastest(
+    sorted: Map<MirrorCategory, List<MirrorTestResult>>,
+    hasPriorSelection: (MirrorCategory) -> Boolean,
+): List<Pair<MirrorCategory, MirrorTestResult>> =
+    MirrorCategory.entries.mapNotNull { cat ->
+        if (hasPriorSelection(cat)) return@mapNotNull null
+        sorted[cat]?.firstOrNull { it.isSuccess }?.let { cat to it }
+    }
 
 /**
  * Body-only rows (no section header) for embedding inside an outer
