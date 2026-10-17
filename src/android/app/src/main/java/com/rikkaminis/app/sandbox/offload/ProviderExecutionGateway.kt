@@ -187,7 +187,11 @@ object ProviderExecutionGateway {
                     mimeType = m.optString("mime_type", "application/octet-stream"),
                     // [audit-0917] Malformed base64 -> skip the attachment, not an
                     // untyped IllegalArgumentException out of the typed-failure path.
-                    data = runCatching { java.util.Base64.getDecoder().decode(b64) }.getOrNull()
+                    // [fix/da1022-a1] MIME decoder: the worker encodes with
+                    // android.util.Base64 (RFC 2045 family), so tolerate line
+                    // terminators; the strict RFC 4648 decoder rejected any
+                    // wrapped payload (silently dropping every attachment).
+                    data = runCatching { java.util.Base64.getMimeDecoder().decode(b64) }.getOrNull()
                         ?: return@mapNotNull null,
                 )
             }

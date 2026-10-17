@@ -1089,7 +1089,7 @@ class ModelExecutionService : Service() {
                                 put(JSONObject().apply {
                                     put("type", m.type.value)
                                     put("mime_type", m.mimeType)
-                                    put("data", android.util.Base64.encodeToString(m.data, android.util.Base64.DEFAULT))
+                                    put("data", android.util.Base64.encodeToString(m.data, android.util.Base64.NO_WRAP))
                                 })
                             }
                         })
@@ -1170,7 +1170,7 @@ class ModelExecutionService : Service() {
                     put(JSONObject().apply {
                         put("type", m.type.value)
                         put("mime_type", m.mimeType)
-                        put("data", android.util.Base64.encodeToString(m.data, android.util.Base64.DEFAULT))
+                        put("data", android.util.Base64.encodeToString(m.data, android.util.Base64.NO_WRAP))
                     })
                 }
             })
