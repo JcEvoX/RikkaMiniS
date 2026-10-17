@@ -1267,12 +1267,17 @@ private fun releasePrintWebView(view: WebView) {
 
 /**
  * Read a text-ish preview file (capped at [MAX_TEXT_PREVIEW_BYTES]) and wrap
- * it in a printable HTML document. Call from Dispatchers.IO: the read itself
- * is unbounded (the cap applies to the bytes handed to the WebView, not to
- * how much is read from disk).
+ * it in a printable HTML document. Call from Dispatchers.IO.
+ *
+ * [da1020-08] The read is bounded as well, through the same [readCapped] the
+ * preview surfaces below use: this used to call `File.readBytes()`, so printing
+ * a multi-GB .log pulled the whole file into the heap before [decodeUtf8Capped]
+ * applied its cap. Printed output is unchanged — at most MAX+1 bytes are read
+ * (the one-extra-byte verdict documented on [readCapped]) and [decodeUtf8Capped]
+ * still hands the WebView exactly [MAX_TEXT_PREVIEW_BYTES] bytes.
  */
 private fun buildPrintHtml(item: FileItem): String {
-    val raw = decodeUtf8Capped(item.file.readBytes())
+    val raw = decodeUtf8Capped(readCapped(item.file, MAX_TEXT_PREVIEW_BYTES))
     return buildString {
         append("<html><head><meta charset=\"utf-8\">")
         append("<style>body{font-family:monospace;font-size:12px;white-space:pre-wrap;word-wrap:break-word;}</style>")
