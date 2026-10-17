@@ -85,6 +85,7 @@ class ProvidersCollection(
      *     "appendV1Suffix":   true,                                     // optional, default true
      *     "useResponsesAPI":  false,                                    // optional, default false
      *     "azureMode":        false,                                    // optional, default false (OpenAI api-key only)
+     *     "customUserAgent":  "MyAgent/1.0",                            // optional, apiKey providers only
      *     "apiKey":           "sk-…" | "$\$DEEPSEEK_KEY",                 // optional; literal OR env ref
      *   }
      *
@@ -121,6 +122,15 @@ class ProvidersCollection(
         val useResponsesAPI = (obj["useResponsesAPI"] as? ConfigValue.Bool)?.value ?: false
         val azureMode = (obj["azureMode"] as? ConfigValue.Bool)?.value ?: false
 
+        // [fix/da1020-memory-gate-provider-fields] Same credential rule as the
+        // per-instance write field — shared via [customUserAgentWritable], not
+        // a second copy. A supplied-but-empty value is treated as absent
+        // (matches the debug `provider.add` create path).
+        val customUserAgent = resolveAddCustomUserAgent(
+            (obj["customUserAgent"] as? ConfigValue.Str)?.value,
+            credentialType,
+        )
+
         // Resolve apiKey BEFORE addInstance, so a bad $$ENV ref aborts
         // the whole operation without leaving a half-created instance.
         val apiKeyValue = (obj["apiKey"] as? ConfigValue.Str)?.value?.takeIf { it.isNotEmpty() }
@@ -135,6 +145,7 @@ class ProvidersCollection(
             appendV1Suffix = appendV1Suffix,
             useResponsesAPI = useResponsesAPI,
             azureMode = azureMode,
+            customUserAgent = customUserAgent,
         )
         repo.addInstance(instance)
         if (apiKeyValue != null) repo.saveApiKey(instance.id, apiKeyValue)
@@ -341,9 +352,12 @@ class ProvidersCollection(
                 // fixed client UA — overriding it can break the handshake or be
                 // rejected upstream. Block ALL writes (including clearing to "")
                 // for non-apiKey credentials; reads stay unblocked.
+                // [fix/da1020-memory-gate-provider-fields] The rule + wording
+                // live in [customUserAgentWritable] /
+                // [CUSTOM_USER_AGENT_OAUTH_MESSAGE] so `add` reuses them.
                 val inst = repo.instance(id) ?: throw ConfigError.InvalidValue("Provider not found")
-                if (inst.credentialType != ProviderCredential.apiKey) {
-                    throw ConfigError.InvalidValue("Custom User-Agent is only supported for third-party API-key providers. OAuth providers (Anthropic/Codex) use their own authentication UA and cannot be overridden.")
+                if (!customUserAgentWritable(inst.credentialType)) {
+                    throw ConfigError.InvalidValue(CUSTOM_USER_AGENT_OAUTH_MESSAGE)
                 }
                 mutate(id) { it.copy(customUserAgent = s.ifEmpty { null }) }
             },
@@ -383,4 +397,44 @@ class ProvidersCollection(
                 }
             },
         )
+}
+
+// ─── [fix/da1020-memory-gate-provider-fields] Shared UA credential rule ──
+
+/**
+ * [T-ua-block-oauth-provider] Custom User-Agent only applies to third-party
+ * API-key providers. OAuth providers (Anthropic / Codex) ride their own
+ * authentication request chain with a fixed client UA — overriding it can
+ * break the handshake or be rejected upstream.
+ *
+ * Single source for the rule and the wording: both the
+ * `providers.<id>.customUserAgent` write field and the `add` payload path
+ * ([resolveAddCustomUserAgent]) consult this instead of keeping a copy each.
+ * The debug `provider.add` (ProviderMutationMethods) still carries its own
+ * copy — registered as a follow-up, not silently diverged.
+ */
+internal const val CUSTOM_USER_AGENT_OAUTH_MESSAGE: String =
+    "Custom User-Agent is only supported for third-party API-key providers. OAuth providers (Anthropic/Codex) use their own authentication UA and cannot be overridden."
+
+internal fun customUserAgentWritable(credentialType: ProviderCredential): Boolean =
+    credentialType == ProviderCredential.apiKey
+
+/**
+ * Pure slice of [ProvidersCollection.add]: resolve the optional
+ * `customUserAgent` payload entry into the value stored on the new
+ * [com.rikkaminis.app.data.model.ProviderInstance], applying the same
+ * credential rule as the `providers.<id>.customUserAgent` write field.
+ * Absent/blank ⇒ null (no override). A supplied UA on a non-apiKey
+ * credential throws [ConfigError.InvalidValue] — mirrors the debug
+ * `provider.add` gating, so a bare OAuth create without a UA keeps working.
+ */
+internal fun resolveAddCustomUserAgent(
+    raw: String?,
+    credentialType: ProviderCredential,
+): String? {
+    val ua = raw?.takeIf { it.isNotBlank() } ?: return null
+    if (!customUserAgentWritable(credentialType)) {
+        throw ConfigError.InvalidValue(CUSTOM_USER_AGENT_OAUTH_MESSAGE)
+    }
+    return ua
 }
