@@ -53,13 +53,12 @@ class GroupsCollection(
 
         // Accept either `entries` (matches the group's display field + the
         // aggregate `groups` summary key) or the legacy `members` alias.
-        val members = mutableListOf<String>()
         val entryArr = (obj["entries"] as? ConfigValue.Arr)?.value
             ?: (obj["members"] as? ConfigValue.Arr)?.value
-        entryArr?.forEach { v ->
-            val s = (v as? ConfigValue.Str)?.value
-            if (!s.isNullOrEmpty()) members.add(s)
-        }
+        // [fix/da1023-D] shared decode: strict on element type, rejects empty
+        // ids, collapses duplicates (see parseMemberEntryIds).
+        val members = entryArr?.let { parseMemberEntryIds(it).toMutableList() }
+            ?: mutableListOf()
 
         val strategy = (obj["strategy"] as? ConfigValue.Str)?.value?.let {
             runCatching { RoutingStrategy.valueOf(it) }.getOrNull()
@@ -103,12 +102,26 @@ class GroupsCollection(
 
     private fun mutate(id: String, apply: (ModelGroup) -> Unit) {
         val g = group(id) ?: throw ConfigError.UnknownPath("groups.$id")
-        // ModelGroup fields used here (name/strategy/fallbackStrategy/
-        // memberEntryIds) are all `var`, so an in-place mutate followed
-        // by updateGroup persists the change.
-        apply(g)
-        repo.updateGroup(g)
+        // [fix/da1023-D / ISSUE-04] Copy-on-mutate. `group(id)` hands back the
+        // LIVE object inside `_config.value.modelGroups`, and every field
+        // written here is a `var` — so the previous in-place `apply(g)` let a
+        // concurrent reader (group detail screen, model picker, the
+        // `groupsList` / `groups.update` RPCs) observe a half-applied edit —
+        // members cleared but not yet refilled — and a throw after `apply`
+        // left memory changed while the disk stayed old. Both sibling
+        // collections persist a NEW object instead (ProvidersCollection.mutate,
+        // ModelsCollection.mutate), as do the two entries converted by
+        // [fix/audit-b18 / T9-L2] (ProviderRepository.updateGroup,
+        // ProviderMutationMethods.groupsUpdate); this was the third entry of
+        // that family, left behind. The copy/re-materialise core lives in
+        // GroupWriteRules.mutatedGroupCopy (pure, JVM-testable) — this is its
+        // only production caller, wired by the copy-on-mutate scan gate.
+        repo.updateGroup(mutatedGroupCopy(g, apply))
     }
+
+    // [fix/da1023-D] member-entry-id decode moved to GroupWriteRules.
+    // parseMemberEntryIds (pure, shared by `add` and `entries` — the
+    // top-level function in the same package binds at both call sites).
 
     private fun nameField(id: String): ConfigField =
         ClosureField(
@@ -210,7 +223,11 @@ class GroupsCollection(
             },
             writer = { v ->
                 val i = (v as? ConfigValue.Int)?.value ?: throw ConfigError.TypeMismatch("int")
-                mutate(id) { it.contextLimitTokens = if (i == 0) null else i }
+                // [fix/da1023-D] context-limit write semantics (a positive
+                // value also refreshes the "last selected" memory the UI
+                // restores on an OFF→ON toggle; clearing keeps the memory)
+                // live in GroupWriteRules.applyContextLimitWrite.
+                mutate(id) { applyContextLimitWrite(it, i) }
             },
         )
 
@@ -261,7 +278,8 @@ class GroupsCollection(
             },
             writer = { v ->
                 val arr = (v as? ConfigValue.Arr)?.value ?: throw ConfigError.TypeMismatch("array")
-                val ids = arr.mapNotNull { (it as? ConfigValue.Str)?.value }
+                // [fix/da1023-D] strict decode + dedup (see parseMemberEntryIds).
+                val ids = parseMemberEntryIds(arr)
                 val valid = repo.config.value.modelEntries.map { it.id }.toSet()
                 for (eid in ids) {
                     if (eid !in valid) throw ConfigError.InvalidValue("Unknown model entry uuid: $eid")
