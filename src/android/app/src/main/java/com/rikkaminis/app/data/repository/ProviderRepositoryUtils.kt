@@ -126,3 +126,56 @@ internal fun readModalitiesWithBitfieldFallback(
     val bits = obj.optInt("modalityOverride", 0)
     return modalityListsFromBitfield(bits)
 }
+
+/**
+ * [da1022-E] Decision core for [ProviderRepository.updateEntry]'s id-rename
+ * path, extracted here so it can be JVM-unit-tested (ProviderRepository
+ * itself needs a Room-backed Context and is not JVM-constructible).
+ *
+ * A custom model id edit changes the composite entry key
+ * ("{instanceId}/{modelId}" — the shape data.db.compositeEntryKey mints and
+ * every persisted row's primary key). The decision:
+ *  - a blank model id would mint the key "instanceId/" and orphan every
+ *    downstream lookup → fail-closed (rejected);
+ *  - a rename whose new (instance, model) pair already exists in another
+ *    entry would make [syncAllIncremental]'s upsertEntries REPLACE the
+ *    existing row (same primary key) — the duplicate entry would silently
+ *    vanish on next load → fail-closed (rejected);
+ *  - otherwise, when the composite key actually changed, [oldKey]/[newKey]
+ *    carry the rename remap (uuid canonicalization + reference sync).
+ *
+ * @param existingUuid the entry's current id (= uuid, canonicalized to the
+ *   composite shape by saveConfig's round-trip)
+ * @param updatedInstanceId / updatedModelId the proposed new (instance, model)
+ * @param others (providerInstanceId, baseModel.id) of every OTHER entry
+ */
+internal data class EntryRenameDecision(
+    val allowed: Boolean,
+    /** Rejection reason for the log line; null when allowed. */
+    val rejectionReason: String? = null,
+    /** Old composite key; non-null only on an allowed rename. */
+    val oldKey: String? = null,
+    /** New composite key; non-null only on an allowed rename. */
+    val newKey: String? = null,
+)
+
+internal fun decideEntryRename(
+    existingUuid: String,
+    updatedInstanceId: String,
+    updatedModelId: String,
+    others: List<Pair<String, String>>,
+): EntryRenameDecision {
+    if (updatedModelId.isBlank()) {
+        return EntryRenameDecision(allowed = false, rejectionReason = "blank model id")
+    }
+    val newKey = "$updatedInstanceId/$updatedModelId"
+    if (newKey == existingUuid) return EntryRenameDecision(allowed = true)
+    val collides = others.any { it.first == updatedInstanceId && it.second == updatedModelId }
+    if (collides) {
+        return EntryRenameDecision(
+            allowed = false,
+            rejectionReason = "composite key already exists: $newKey",
+        )
+    }
+    return EntryRenameDecision(allowed = true, oldKey = existingUuid, newKey = newKey)
+}

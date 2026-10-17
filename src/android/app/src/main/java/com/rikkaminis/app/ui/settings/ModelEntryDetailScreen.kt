@@ -154,13 +154,21 @@ fun ModelEntryDetailScreen(
                         outputModalities = if (newOutputs.toSet() != baseOutputs.toSet()) newOutputs else null,
                     )
                     val updated = if (entry.isCustom) {
-                        entry.copy(baseModel = baseModel.copy(id = modelId), overrides = newOverrides, isHidden = isHidden)
+                        // [da1022-E] trim before persisting; the composite
+                        // entry key is minted from this id, so a whitespace
+                        // edge would mint a dangling key. Blank input is
+                        // blocked by the Save button's enabled gate below.
+                        entry.copy(baseModel = baseModel.copy(id = modelId.trim()), overrides = newOverrides, isHidden = isHidden)
                     } else {
                         entry.copy(overrides = newOverrides, isHidden = isHidden)
                     }
                     providerRepository.updateEntry(updated)
                     onBack()
                 },
+                // [da1022-E] fail-closed: block saving a blank/whitespace
+                // model id (same gate as AddCustomModelScreen's
+                // enabled = modelId.isNotBlank()).
+                enabled = !entry.isCustom || modelId.isNotBlank(),
                 modifier = Modifier.padding(end = 8.dp),
             ) { Text(stringResource(R.string.common_save)) }
         },
