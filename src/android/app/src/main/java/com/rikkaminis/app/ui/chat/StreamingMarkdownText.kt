@@ -1724,6 +1724,10 @@ internal fun resolveMdMediaFile(context: Context, url: String, sessionId: String
     // contain '#' (hashtags). `minis://` URLs don't carry fragments anyway,
     // and truncating here would hide the '.mp4' extension and the file's real
     // name from the resolver.
+    // [da1023-H] every branch below now honours that contract: the `file://`
+    // branch used to hand the string to `Uri.parse(...).path`, which re-cut it
+    // at the first `#` and cancelled this line — that branch now uses
+    // decodeUriPath like the `minis://` one, so `#` survives end to end.
     val stripped = url.substringBefore('?')
     val primary: File? = when {
         stripped.startsWith("minis://") -> {
@@ -1741,7 +1745,13 @@ internal fun resolveMdMediaFile(context: Context, url: String, sessionId: String
             if (sessionId != null) PRootKernel.resolveSessionHostPath(sessionId, linuxPath, context)
             else PRootKernel.resolveHostPath(linuxPath)
         }
-        stripped.startsWith("file://") -> File(Uri.parse(stripped).path ?: return null)
+        // [da1023-H] decodeUriPath, not `Uri.parse(...).path`: the latter
+        // treated a literal '#' in the name as a fragment start and truncated
+        // the path, which cancelled the '#' contract stated above. Blank after
+        // prefix removal = fail-closed null (File("") would resolve to the
+        // process working directory).
+        stripped.startsWith("file://") ->
+            decodeUriPath(stripped.removePrefix("file://")).takeIf { it.isNotBlank() }?.let { File(it) }
         stripped.startsWith("/") -> File(stripped)
         else -> null
     }

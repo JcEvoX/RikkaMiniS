@@ -65,6 +65,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.ui.chat.decodeUriPath
 
 /**
  * Immersive 90%-tall bottom sheet that hosts a [WebViewHolder] for a
@@ -451,13 +452,20 @@ internal fun openExternalFromSheet(context: android.content.Context, url: String
     AppLogger.info("WebPreviewSheet", "open external: $url")
     val intent = if (url.startsWith("file://")) {
         runCatching {
-            // [audit-0917] Use the path as-is: Uri.parse(...).path is ALREADY
-            // percent-decoded, so the extra URLDecoder.decode() was a second
-            // decode — a filename containing '%' or '+' (e.g. "report%20v2.pdf"
-            // arriving as "%2520", or any literal "+") was corrupted, the
-            // resulting File did not exist, and the sheet silently fell through
-            // to the generic branch instead of previewing the file.
-            val raw = Uri.parse(url).path ?: return@runCatching null
+            // [da1023-H] Resolve through decodeUriPath (the single URI-path
+            // exit, ui/chat/UriPathDecode.kt) instead of `Uri.parse(url).path`.
+            // `Uri.parse` reparses the string as a generic URI, so a literal
+            // `#` or `?` inside a local file name started a fragment / query
+            // there and was dropped from `.path` — `report#1.html` became
+            // `…/report`, exists() was false, and "open in browser" silently
+            // did nothing (a warning line in the log was the only trace).
+            // Percent-decoding stays exactly where [audit-0917] put it: ONE
+            // decode, path semantics (`+` is a literal, a bare `%` survives).
+            // The `startsWith("file://")` gate above makes the prefix removal
+            // unconditional-safe; a degenerate "file://" (empty path) refuses
+            // here instead of reaching FileProvider with "".
+            val raw = decodeUriPath(url.removePrefix("file://"))
+            if (raw.isBlank()) return@runCatching null
             val file = java.io.File(raw)
             if (!file.exists()) return@runCatching null
             val authority = context.packageName + ".fileprovider"
