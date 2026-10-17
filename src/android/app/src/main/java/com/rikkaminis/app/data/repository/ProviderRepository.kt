@@ -1459,7 +1459,7 @@ class ProviderRepository(private val context: Context) {
                 // CompactOrchestration silently follows the session chain.
                 decideCompactPinMigration(
                     pinEntryId = AgentRuntimeLimitsPrefs.compactModelEntryId(),
-                    oldKey = oldKey,
+                    oldKey = oldKey ?: existing.id,
                     newKey = newUuid,
                 )?.let { migrated ->
                     AgentRuntimeLimitsPrefs.save(context, compactModelEntryId = migrated)

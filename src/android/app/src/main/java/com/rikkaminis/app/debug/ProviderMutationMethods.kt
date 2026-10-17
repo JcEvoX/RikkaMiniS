@@ -360,7 +360,7 @@ internal object ProviderMutationMethods {
         ) {
             throw RPCException(
                 -32602,
-                "model '$modelId' already exists on instance '${instance.displayName}' ($instanceId)",
+                "model '$modelId' already exists on instance '${instance.label}' ($instanceId)",
             )
         }
         val persistedId = repo.addEntry(entry)
