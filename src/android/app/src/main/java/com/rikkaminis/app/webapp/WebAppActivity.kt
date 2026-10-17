@@ -526,7 +526,8 @@ class WebAppActivity : ComponentActivity() {
     /**
      * Copy [file] into `cacheDir/share/` and return a FileProvider Uri for
      * it. Returns null on IO failure. The staged file overwrites any prior
-     * copy with the same name — share/ accumulates one entry per WebApp.
+     * copy with the same name — [pruneShareDir] clears entries older than a
+     * day before each new staging, so share/ no longer grows unbounded.
      *
      * [fix/audit0917-b8] Suspends and copies on [Dispatchers.IO]: the caller is
      * a toolbar click handler on the main thread, and a large page (bundled
@@ -534,10 +535,23 @@ class WebAppActivity : ComponentActivity() {
      */
     private suspend fun stagedShareUri(context: android.content.Context, file: File): Uri? {
         return try {
-            val shareDir = File(context.cacheDir, "share").apply { mkdirs() }
             val stem = file.nameWithoutExtension.ifBlank { "webapp" }
-            val staged = File(shareDir, "$stem.html")
-            withContext(Dispatchers.IO) { file.copyTo(staged, overwrite = true) }
+            val staged = withContext(Dispatchers.IO) {
+                // [da1022-H] mkdirs + prune on IO, not the main thread: the
+                // caller is a toolbar click handler and `dir.listFiles()` in
+                // pruneShareDir is a disk walk that stalls on large cache dirs.
+                val shareDir = File(context.cacheDir, "share").apply { mkdirs() }
+                // [da1022-H] Nothing deleted share/ entries before the pruner
+                // landed (fix/render-ui F-273) — share/ accumulated one blob
+                // per WebApp for the life of the install. Prune before
+                // staging: the 24h TTL cutoff always postdates the fresh copy
+                // written below, so prune-then-copy can never delete the file
+                // this call is about to stage.
+                com.rikkaminis.app.ui.components.pruneShareDir(shareDir)
+                val s = File(shareDir, "$stem.html")
+                file.copyTo(s, overwrite = true)
+                s
+            }
             FileProvider.getUriForFile(
                 context,
                 "${context.packageName}.fileprovider",
