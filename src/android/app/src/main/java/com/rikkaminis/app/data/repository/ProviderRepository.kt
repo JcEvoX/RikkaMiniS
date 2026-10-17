@@ -2203,6 +2203,18 @@ class ProviderRepository(private val context: Context) {
                     entry.baseModel.maxOutputTokens?.let { put("maxOutputTokens", it) }
                     entry.baseModel.supportsReasoning?.let { put("supportsReasoning", it) }
                     entry.baseModel.interleavedReasoningField?.let { put("interleavedReasoningField", it) }
+                    // [T-fix-import-id-roundtrip] Export the reasoning-capability
+                    // pair the Room/kotlinx path already carries. Additive +
+                    // optional: readers without the keys ignore them, and the
+                    // import below reads each independently with null defaults.
+                    // Without these, a backup restore evaporates the effort-tier
+                    // list (ThinkingLevelCatalog ceiling) and the
+                    // declaresNoEffortTiers flag (xAI grok-build must NOT receive
+                    // reasoning_effort) for gateway models absent from models.dev.
+                    entry.baseModel.reasoningEffortValues?.takeIf { it.isNotEmpty() }?.let {
+                        put("reasoningEffortValues", JSONArray(it))
+                    }
+                    entry.baseModel.declaresNoEffortTiers?.let { put("declaresNoEffortTiers", it) }
                     // [T-fix-backup-field-evap] Export the user-visible ModelEntry
                     // fields that the backup/restore round-trip must preserve.
                     // These four fields (costTier, userModifiedAt, maxThinkingLevel,
@@ -2444,6 +2456,19 @@ class ProviderRepository(private val context: Context) {
             val maxOutputTokens = if (m.has("maxOutputTokens")) m.optInt("maxOutputTokens").takeIf { it > 0 } else null
             val supportsReasoning = if (m.has("supportsReasoning")) m.optBoolean("supportsReasoning") else null
             val interleavedReasoningField = m.optString("interleavedReasoningField", "").ifEmpty { null }
+            // [T-fix-import-id-roundtrip] Restore the reasoning-capability pair
+            // the export side now writes. Each key is read independently with a
+            // null default when absent (old backup) — a legacy restore behaves
+            // exactly as before. Empty lists / null / explicit-null degrade to
+            // null ("unknown") instead of an empty list.
+            val reasoningEffortValues = m.optJSONArray("reasoningEffortValues")?.let { arr ->
+                (0 until arr.length())
+                    .mapNotNull { idx -> arr.optString(idx, "").takeIf { it.isNotBlank() } }
+                    .takeIf { it.isNotEmpty() }
+            }
+            val declaresNoEffortTiers = if (m.has("declaresNoEffortTiers") && !m.isNull("declaresNoEffortTiers")) {
+                m.optBoolean("declaresNoEffortTiers")
+            } else null
             // [T-fix-backup-field-evap] Restore the user-visible ModelEntry
             // metadata that the hand-written serializer previously dropped.
             // Each key is read independently with a null default when absent
@@ -2467,6 +2492,8 @@ class ProviderRepository(private val context: Context) {
                 interleavedReasoningField = interleavedReasoningField,
                 inputModalities = baseIn,
                 outputModalities = baseOut,
+                reasoningEffortValues = reasoningEffortValues,
+                declaresNoEffortTiers = declaresNoEffortTiers,
             )
             val overridesObj = m.optJSONObject("overrides")
             val overrides = if (overridesObj != null) {
@@ -2575,7 +2602,18 @@ class ProviderRepository(private val context: Context) {
             }
             val resolvedEntryId = hit?.id ?: run {
                 addEntry(entry)
-                entry.id
+                // [T-fix-import-id-roundtrip] addEntry 落盘后 _config.value 已被
+                // saveConfig 的 toSnapshot→toProviderConfig canonicalize 为复合键
+                // 形状（"{instanceId}/{modelId}"）——裸返 entry.id 会把一次性随机
+                // UUID 交给 entryIdMap，令模型组 / agentLoopEntries /
+                // compactModelEntryId / 会话 binding 的重映射全部悬空。Requery 返回
+                // 落盘后的真实 id；addEntry 的 exists 跳过谓词与上面的 hit 谓词
+                // 逐字相同（hit==null ⇒ 不会被跳过），但 requery 仍比裸算
+                // compositeEntryKey 更稳——若未来 skip 谓词漂移，它返回的是既有行
+                // 的真实 id 而非新算值。
+                _config.value.modelEntries.firstOrNull {
+                    it.providerInstanceId == existing.id && it.baseModel.id == entry.baseModel.id
+                }?.id ?: compositeEntryKey(existing.id, entry.baseModel.id)
             }
             if (srcId.isNotEmpty()) entryMap[srcId] = resolvedEntryId
         }

@@ -576,6 +576,14 @@ object OpenMinisBackupCompat {
             d.optString("scopePattern", "").takeIf { it.isNotEmpty() }
                 ?.let { r.put("scopePattern", it) }
             r.put("wireFormatJson", d.optString("wireFormatJson", "{}"))
+            // [T-fix-import-id-roundtrip] Carry the reasoning-echo policy across
+            // the OpenMinis conversion. The restore side (restoreThinkingRules)
+            // already reads "reasoningEchoJson" — only this converter dropped it,
+            // so a cross-device restore silently reset the echo policy to null.
+            // Key name matches ThinkingRuleCoding.encodeEcho's canonical wire
+            // key. Additive + optional: records without the key stay null.
+            d.optString("reasoningEchoJson", "").takeIf { it.isNotEmpty() }
+                ?.let { r.put("reasoningEchoJson", it) }
             r.put("sortOrder", d.optInt("sortOrder", 0))
             arr.put(r)
         }
