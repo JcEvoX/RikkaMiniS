@@ -2,6 +2,7 @@ package com.rikkaminis.app.provider.voice
 
 import android.util.Base64
 import android.util.Log
+import com.rikkaminis.app.provider.gemini.GeminiBasePath
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaType
@@ -505,8 +506,12 @@ class GeminiVoiceProvider(providerId: String, baseURL: String, apiKey: String?) 
 
     override fun buildVoiceOutputRequest(request: VoiceOutputRequest): Request {
         val model = request.model ?: defaultVoiceOutputModel()
-        var base = effectiveBaseURL()
-        if (!base.contains("/v1beta")) base = base.trimEnd('/') + "/v1beta"
+        // [deep-audit-1024 ISSUE-02] Same single source as the chat path. The local
+        // `if (!base.contains("/v1beta")) base += "/v1beta"` check only caught the
+        // bare-host shape: a base the user pasted as `.../v1` (→ `.../v1/v1beta/models`)
+        // or `.../v1beta/v1` (contains "/v1beta" → left alone → `.../v1beta/v1/models`)
+        // both 404'd here while the chat path worked.
+        val base = GeminiBasePath.normalize(effectiveBaseURL())
         val url = "$base/models/$model:generateContent?key=${apiKey ?: ""}"
         val body = JSONObject()
             .put(
