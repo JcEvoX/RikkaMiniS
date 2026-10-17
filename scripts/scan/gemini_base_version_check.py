@@ -485,7 +485,12 @@ def selftest():
             shutil.rmtree(root, ignore_errors=True)
 
     run("clean full tree passes", False, "[FULL]")
-    run("gemini-only tree falls back to criteria 1-3", False, "[PARTIAL]", partial=True)
+    # post-1024: the fixture suite ships both cross-file targets, so a gemini-only
+    # tree is no longer the normal fixture shape -- it means a target was renamed or
+    # moved. Keep the [PARTIAL] arm (it must still pass cleanly) but pin the message
+    # that names the missing paths, since that line is the only signal left.
+    run("gemini-only tree falls back to criteria 1-3",
+        False, "[PARTIAL] cross-file criteria skipped", partial=True)
     run(
         "GeminiModelsApi keeping its own single-pass copy is caught",
         True,

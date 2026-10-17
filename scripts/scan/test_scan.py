@@ -1825,10 +1825,70 @@ def test_katex_bridge_arity():
 
 
 GEMINI_DIR = "src/android/app/src/main/java/com/rikkaminis/app/provider/gemini"
+VOICE_REL = ("src/android/app/src/main/java/com/rikkaminis/app/provider/voice/"
+             "VoiceProviderVendors.kt")
+MUTATION_REL = "src/android/app/src/main/java/com/rikkaminis/app/debug/ProviderMutationMethods.kt"
+
+# Cross-file criteria (4/5) of gemini_base_version_check only speak when both targets are
+# present. They are written here so the fixture exercises the FULL path, not the [PARTIAL]
+# fallback -- otherwise the two criteria would never be covered by the fixture suite and a
+# future rename of either target would degrade the gate silently.
+GEMINI_PROBE_ARMS_OK = (
+    '        ProviderType.anthropic -> if (baseURL.endsWith("/v1")) "$baseURL/models" '
+    'else "$baseURL/v1/models"\n'
+    '        ProviderType.gemini -> "${GeminiBasePath.normalize(baseURL)}/models?key=" '
+    '+ (key ?: "")\n'
+    '        ProviderType.openAI -> if (baseURL.endsWith("/v1")) "$baseURL/models" '
+    'else "$baseURL/v1/models"\n'
+)
+
+
+def gemini_voice_fixture(fn_body=None):
+    """VoiceProviderVendors.kt with a decoy sibling + GeminiVoiceProvider."""
+    gemini = fn_body if fn_body is not None else (
+        "        val base = GeminiBasePath.normalize(effectiveBaseURL())\n"
+        '        return "$base/models/$model:generateContent?key="\n'
+    )
+    return (
+        "package com.rikkaminis.app.provider.voice\n"
+        "\n"
+        "class OtherVoiceProvider(providerId: String, baseURL: String, apiKey: String?) {\n"
+        "    override fun buildVoiceOutputRequest(request: String): String {\n"
+        "        return composedUrlString(voiceOutputEndpointPath())\n"
+        "    }\n"
+        "}\n"
+        "\n"
+        "class GeminiVoiceProvider(providerId: String, baseURL: String, apiKey: String?) {\n"
+        "    override fun buildVoiceOutputRequest(request: String): String {\n"
+        + gemini
+        + "    }\n"
+        "}\n"
+    )
+
+
+def gemini_mutation_fixture(arms=None):
+    """ProviderMutationMethods.kt: a decoy per-type `when` + the probe builder."""
+    body = arms if arms is not None else GEMINI_PROBE_ARMS_OK
+    return (
+        "package com.rikkaminis.app.debug\n"
+        "\n"
+        "internal object ProviderMutationMethods {\n"
+        "    private fun fallback(type: ProviderType): String = when (type) {\n"
+        '        ProviderType.anthropic -> "https://api.anthropic.com"\n'
+        '        ProviderType.gemini -> "https://generativelanguage.googleapis.com"\n'
+        '        ProviderType.kimiCode -> "https://api.kimi.com/coding/v1"\n'
+        "    }\n"
+        "}\n"
+        "\n"
+        "internal fun providerProbeUrl(type: ProviderType, baseURL: String, key: String?): String =\n"
+        "    when (type) {\n"
+        + body
+        + "    }\n"
+    )
 
 
 def gemini_fixture(provider_normalizer=None, shared_normalizer=None, sibling_normalizer=None,
-                   extra_bypass=False):
+                   extra_bypass=False, voice_fn=None, probe_arms=None):
     """Build a three-file gemini tree mirroring the live shape."""
     provider_body = provider_normalizer or (
         "    private fun normalizedBasePath(): String = GeminiBasePath.normalize(basePath)\n"
@@ -1846,11 +1906,8 @@ def gemini_fixture(provider_normalizer=None, shared_normalizer=None, sibling_nor
         "    }\n"
     )
     sibling_body = sibling_normalizer or (
-        "    fun normalizeBase(baseUrl: String?): String {\n"
-        "        val raw = baseUrl?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } ?: return DEFAULT_BASE\n"
-        "        val stripped = raw.removeSuffix(\"/v1beta\").removeSuffix(\"/v1\")\n"
-        "        return \"$stripped/v1beta\"\n"
-        "    }\n"
+        "    private fun normalizeBase(baseUrl: String?): String = "
+        "GeminiBasePath.normalize(baseUrl)\n"
     )
     bypass = (
         "    fun extra() {\n"
@@ -1886,6 +1943,8 @@ def gemini_fixture(provider_normalizer=None, shared_normalizer=None, sibling_nor
             + sibling_body
             + "}\n"
         ),
+        VOICE_REL: gemini_voice_fixture(voice_fn),
+        MUTATION_REL: gemini_mutation_fixture(probe_arms),
     }
 
 
@@ -1957,6 +2016,47 @@ def test_gemini_base_version():
     code, out = run_scanner("gemini_base_version_check.py", root)
     check("a call site built from the raw basePath is caught (exit 1)", code == 1, f"exit={code}\n{out}")
     check("finding mentions the raw basePath", "raw basePath" in out, out)
+    shutil.rmtree(root)
+
+    # Criteria 4/5 (deep-audit-1024 ISSUE-02): the three sibling sites must delegate.
+    # The fixture now ships both cross-file targets, so the gate runs FULL -- assert that
+    # explicitly, otherwise a future rename silently drops back to the [PARTIAL] fallback.
+    root = make_tree(gemini_fixture())
+    code, out = run_scanner("gemini_base_version_check.py", root)
+    check("cross-file criteria run FULL on a complete tree", code == 0 and "[FULL]" in out, f"exit={code}\n{out}")
+    shutil.rmtree(root)
+
+    # Voice site carrying its own inline copy instead of delegating.
+    root = make_tree(gemini_fixture(voice_fn=(
+        "        val base = effectiveBaseURL()\n"
+        "        val fixed = if (base.contains(\"/v1beta\")) base else \"$base/v1beta\"\n"
+        '        return "$fixed/models/$model:generateContent?key="\n'
+    )))
+    code, out = run_scanner("gemini_base_version_check.py", root)
+    check("voice site copy is caught (exit 1)", code == 1, f"exit={code}\n{out}")
+    check("finding names GeminiVoiceProvider", "GeminiVoiceProvider" in out, out)
+    shutil.rmtree(root)
+
+    # Probe arm: gemini concatenates a literal version segment (the pre-fix 404 shape).
+    root = make_tree(gemini_fixture(probe_arms=(
+        GEMINI_PROBE_ARMS_OK.splitlines(True)[0]
+        + '        ProviderType.gemini -> "$baseURL/v1beta/models?key=" + (key ?: "")\n'
+        + GEMINI_PROBE_ARMS_OK.splitlines(True)[2]
+    )))
+    code, out = run_scanner("gemini_base_version_check.py", root)
+    check("gemini probe arm literal segment is caught (exit 1)", code == 1, f"exit={code}\n{out}")
+    shutil.rmtree(root)
+
+    # Probe arm: anthropic appends /v1 with no guard (the asymmetry that made 404 reachable).
+    root = make_tree(gemini_fixture(probe_arms=(
+        '        ProviderType.anthropic -> "$baseURL/v1/models"\n'
+        + "".join(GEMINI_PROBE_ARMS_OK.splitlines(True)[1:])
+    )))
+    code, out = run_scanner("gemini_base_version_check.py", root)
+    check("unguarded anthropic probe arm is caught (exit 1)", code == 1, f"exit={code}\n{out}")
+    shutil.rmtree(root)
+
+
 def ro_write_guard_fixture(guarded=True):
     """Minimal tree for readonly_mount_write_guard: three handlers that write a
     host file at a caller-supplied path parameter, optionally WITHOUT the guard
@@ -2759,6 +2859,26 @@ def test_da1023_gates():
         rc, out = run_scanner(script + ".py", *real_args)
         check("%s real tree green" % script, rc == 0, out[-280:])
 
+DA1024_GATES = [
+    ("mcp_oauth_lifecycle_check", "MCP_OAUTH_LIFECYCLE_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("thinking_rule_editor_preserve_check", "THINKING_RULE_EDITOR_PRESERVE_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("offload_permission_reset_sync_check", "OFFLOAD_PERMISSION_RESET_SYNC_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("offload_relative_path_unify_check", "OFFLOAD_RELATIVE_PATH_UNIFY_SELFTEST=PASS", (), (REPO_ROOT,)),
+]
+
+
+def test_da1024_gates():
+    print("━━━ deep-audit-1024 gates (selftest teeth + real tree) ━━━")
+    for script, marker, st_extra, real_args in DA1024_GATES:
+        argv = [sys.executable, os.path.join(SCRIPT_DIR, script + ".py")] + list(st_extra) + ["--selftest"]
+        proc = subprocess.run(argv, capture_output=True, text=True)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        check("%s selftest has teeth (%s)" % (script, marker),
+              proc.returncode == 0 and marker in out, out[-280:])
+        rc, out = run_scanner(script + ".py", *real_args)
+        check("%s real tree green" % script, rc == 0, out[-280:])
+
+
 def test_trace_step_tag():
     print("━━━ trace_step_tag_check ━━━")
     # The tagger reads AgentTraceRecorder's event/field names and the golden
@@ -2853,6 +2973,7 @@ def main():
     test_da1021_gates()
     test_da1022_gates()
     test_da1023_gates()
+    test_da1024_gates()
     test_trace_step_tag()
     test_da1017_external_fixtures()
     test_real_repo()
