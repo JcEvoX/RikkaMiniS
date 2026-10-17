@@ -27,6 +27,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -45,6 +46,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -62,7 +64,9 @@ import com.rikkaminis.app.ui.components.buildEditWindow
 import com.rikkaminis.app.ui.components.chunkText
 import com.rikkaminis.app.ui.components.spliceEditWindow
 import java.util.Date
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * [FIX-6 / F-224] Reserved file name that lives in the memory directory but is
@@ -129,8 +133,14 @@ fun MemoryManagementScreen(
         onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
     }
 
+    val scope = rememberCoroutineScope()
+
+    // [deep-audit-1023 ISSUE-07] listAllFiles()/deleteFile() are plain blocking
+    // file IO (MemoryRepository has no suspend surface), and they used to run on
+    // the composition thread here — with 76+ daily logs this reads every file's
+    // first line inside the frame. Same rule now applies to the delete path below.
     LaunchedEffect(Unit) {
-        files = memoryRepository.listAllFiles()
+        files = withContext(Dispatchers.IO) { memoryRepository.listAllFiles() }
     }
 
     // top-level page: rely on system back gesture / bottom nav (no back arrow)
@@ -231,11 +241,25 @@ fun MemoryManagementScreen(
             text = { Text(stringResource(R.string.memory_delete_confirm_text)) },
             confirmButton = {
                 MinisTextButton(onClick = {
-                    deleteFileName?.let {
-                        memoryRepository.deleteFile(it)
-                        files = memoryRepository.listAllFiles()
-                    }
+                    // [deep-audit-1023 ISSUE-07] Two defects in one block: the
+                    // confirm used to run blocking delete + full re-list on the
+                    // main thread, and — because `deleteFileName` was only
+                    // cleared after the IO finished — a second tap re-entered
+                    // the same delete. Clear the dialog state first, then do the
+                    // IO on Dispatchers.IO and publish the refreshed list back
+                    // on the composition thread (scope is tied to this screen,
+                    // so leaving the screen cancels the pending work).
+                    val name = deleteFileName
                     deleteFileName = null
+                    if (name != null) {
+                        scope.launch {
+                            val refreshed = withContext(Dispatchers.IO) {
+                                memoryRepository.deleteFile(name)
+                                memoryRepository.listAllFiles()
+                            }
+                            files = refreshed
+                        }
+                    }
                 }) {
                     Text(stringResource(R.string.common_delete), color = MaterialTheme.colorScheme.error)
                 }
@@ -309,6 +333,23 @@ private fun MemoryFileRow(
             tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
             modifier = Modifier.size(20.dp),
         )
+        // [deep-audit-1023 ISSUE-07] `onDelete` was a parameter this row never
+        // consumed: the caller at MemoryFileRow(...) builds a real callback for
+        // every non-global, non-SOUL file and the screen has a full delete
+        // confirmation AlertDialog, but nothing rendered a handle for it — the
+        // daily-log delete feature was 100% unreachable. `null` still means
+        // "not deletable" (GLOBAL.md / SOUL.md), so the data-layer and UI-layer
+        // protections keep their exact shape: no button at all is rendered.
+        if (onDelete != null) {
+            IconButton(onClick = onDelete) {
+                Icon(
+                    Icons.Filled.Delete,
+                    contentDescription = stringResource(R.string.common_delete),
+                    tint = MaterialTheme.colorScheme.error,
+                    modifier = Modifier.size(20.dp),
+                )
+            }
+        }
     }
 }
 
