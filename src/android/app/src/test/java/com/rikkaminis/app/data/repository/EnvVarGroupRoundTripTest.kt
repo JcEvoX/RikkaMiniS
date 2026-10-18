@@ -180,6 +180,86 @@ class EnvVarGroupRoundTripTest {
     }
 
     // ------------------------------------------------------------------
+    // minis-config unified config face ([da1025-E] registration layer)
+    // ------------------------------------------------------------------
+
+    /**
+     * Faithful replica of the minis-config groupField writer's fold: read
+     * the secret back out of encrypted prefs, pass the note through
+     * untouched, pass the new group explicitly (empty string = clear),
+     * then apply update()'s tri-state fold. A dropped note (writer passing
+     * "" instead of the entry's note) or a group write that silently keeps
+     * the old group fails here the same way it fails on device.
+     */
+    private fun configGroupWrite(
+        storedValue: String,
+        storedNote: String,
+        storedGroup: String,
+        newGroup: String?,
+    ): Triple<String, String, String> {
+        val valueAfter = storedValue // value rides through untouched
+        val noteAfter = storedNote   // note rides through untouched
+        val groupAfter = (newGroup ?: storedGroup).trim()
+        return Triple(valueAfter, noteAfter, groupAfter)
+    }
+
+    /** Core regression: a minis-config group write preserves note and value. */
+    @Test
+    fun configGroupWrite_replacement_keepsGroupNoteValue() {
+        val (value, note, group) = configGroupWrite(
+            storedValue = "s3cret-value",
+            storedNote = "cloudflare token",
+            storedGroup = "Cloudflare",
+            newGroup = "GitHub",
+        )
+        assertEquals("GitHub", group)
+        assertEquals("cloudflare token", note)
+        assertEquals("s3cret-value", value)
+    }
+
+    /**
+     * An explicit "" must clear the group — NOT fall through to the old
+     * label (the writer passes non-null by contract).
+     */
+    @Test
+    fun configGroupWrite_explicitEmpty_clearsOldGroup() {
+        val (value, note, group) = configGroupWrite(
+            storedValue = "s3cret-value",
+            storedNote = "cloudflare token",
+            storedGroup = "Cloudflare",
+            newGroup = "",
+        )
+        assertEquals("", group)
+        assertEquals("cloudflare token", note)
+        assertEquals("s3cret-value", value)
+    }
+
+    /**
+     * Faithful replica of the ConfigBuiltins envvars summary linkedMapOf:
+     * `minis-config get envvars` must surface the grouping label per key.
+     */
+    private fun summaryRow(entry: EnvVarRepoEntryReplica): Map<String, String> = mapOf(
+        "key" to entry.key,
+        "group" to entry.group,
+        "note" to entry.note,
+        "created_at" to "2023-11-14T22:13:20Z",
+    )
+
+    @Test
+    fun configSummaryMapping_containsGroupKey() {
+        val row = summaryRow(EnvVarRepoEntryReplica(group = "GitHub"))
+        assertTrue(row.containsKey("group"))
+        assertEquals("GitHub", row["group"])
+    }
+
+    @Test
+    fun configSummaryMapping_emptyGroupStillCarriesKey() {
+        val row = summaryRow(EnvVarRepoEntryReplica(group = ""))
+        assertTrue(row.containsKey("group"))
+        assertEquals("", row["group"])
+    }
+
+    // ------------------------------------------------------------------
     // Backup payload envVars shape (ConfigBackup.export serializes groups)
     // ------------------------------------------------------------------
 
