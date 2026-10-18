@@ -123,6 +123,19 @@ BLOCKING_IO_CALLS = (
         r"\bfun\s+clearLogs\s*\(",
         "log purge (closes the writers + unlinks every log file)",
     ),
+    (
+        "share/ShareReceiverActivity.kt",
+        r"importProviderJson\s*\(",
+        r"\bfun\s+importProviderJson\s*\(",
+        "provider import (importInstanceJSON: ensureConfigLoaded runBlocking + "
+        "EncryptedSharedPreferences commit + Room write)",
+    ),
+    (
+        "share/ShareReceiverActivity.kt",
+        r"discardStagedAttachments\s*\(",
+        r"\bfun\s+discardStagedAttachments\s*\(",
+        "staging discard (length() + delete() per staged attachment)",
+    ),
 )
 
 # Guarded = the call sits inside a brace-balanced `withContext(Dispatchers.IO) {`
@@ -695,9 +708,69 @@ def _app_logger():
     )
 
 
+SHARE_BODIES = {
+    # the shape the fix ships (deep-audit-1026 ISSUE-07): both disk-bound calls
+    # inside the withContext(Dispatchers.IO) block
+    "io": (
+        "    fun onPositive(json: String, items: List<String>) {\n"
+        "        lifecycleScope.launch {\n"
+        "            withContext(Dispatchers.IO) {\n"
+        "                if (importProviderJson(json)) discardStagedAttachments(items)\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
+    ),
+    # pre-fix shape for the import: the staged-file delete is wrapped, the
+    # import (ensureConfigLoaded + prefs commit + Room write) is not
+    "direct_import": (
+        "    fun onPositive(json: String, items: List<String>) {\n"
+        "        if (importProviderJson(json)) {\n"
+        "            withContext(Dispatchers.IO) { discardStagedAttachments(items) }\n"
+        "        }\n"
+        "    }\n"
+    ),
+    # the delete left on the dialog callback's thread
+    "direct_discard": (
+        "    fun onPositive(json: String, items: List<String>) {\n"
+        "        withContext(Dispatchers.IO) { importProviderJson(json) }\n"
+        "        discardStagedAttachments(items)\n"
+        "    }\n"
+    ),
+    # `lifecycleScope.launch` alone is NOT an IO wrap — the body still runs on
+    # Main, so both calls must stay red (fail-closed on a plausible mistake)
+    "launch_only": (
+        "    fun onPositive(json: String, items: List<String>) {\n"
+        "        lifecycleScope.launch {\n"
+        "            if (importProviderJson(json)) discardStagedAttachments(items)\n"
+        "        }\n"
+        "    }\n"
+    ),
+}
+
+
+def _share_receiver(shape="io"):
+    return (
+        "package com.rikkaminis.app.share\n"
+        "\n"
+        "import kotlinx.coroutines.Dispatchers\n"
+        "import kotlinx.coroutines.launch\n"
+        "import kotlinx.coroutines.withContext\n"
+        "\n"
+        "class ShareReceiverActivity {\n"
+        "    fun importProviderJson(json: String): Boolean = json.isNotEmpty()\n"
+        "\n"
+        "    fun discardStagedAttachments(items: List<String>) {\n"
+        "        items.forEach { java.io.File(it).length() }\n"
+        "    }\n"
+        "\n"
+        + SHARE_BODIES[shape] +
+        "}\n"
+    )
+
+
 def write_io_fixture(root, store_shape="io", log_shape="io", store_fn="probeWritable",
                      drop_store=False, drop_log=False, data_pkg=True, ui_pkg=True,
-                     keep_pkgs_when_dropped=True):
+                     keep_pkgs_when_dropped=True, share_shape="io", drop_share=False):
     """A `com/rikkaminis/app` tree carrying both criterion-2 targets.
 
     [keep_pkgs_when_dropped] leaves an unrelated file in the package whose anchor
@@ -720,6 +793,10 @@ def write_io_fixture(root, store_shape="io", log_shape="io", store_fn="probeWrit
         files["ui/settings/OtherScreen.kt"] = (
             "package com.rikkaminis.app.ui.settings\n\nclass OtherScreen\n"
         )
+    if not drop_share:
+        files["share/ShareReceiverActivity.kt"] = _share_receiver(share_shape)
+    elif keep_pkgs_when_dropped:
+        files["share/ShareHost.kt"] = "package com.rikkaminis.app.share\n\nclass ShareHost\n"
     if not data_pkg:
         files.pop("data/MountRegistry.kt", None)
     if not ui_pkg:
@@ -776,6 +853,15 @@ def selftest():
         "lost its anchor", drop_store=True, drop_log=True)
     run("a tree that never shipped the package is skipped, not failed", False,
         "[PARTIAL]", drop_store=True, drop_log=True, keep_pkgs_when_dropped=False)
+    run("the provider import wrapped in Dispatchers.IO passes", False)
+    run("the provider import outside the IO block is caught", True,
+        "share/ShareReceiverActivity.kt", share_shape="direct_import")
+    run("the staged-file discard outside the IO block is caught", True,
+        "share/ShareReceiverActivity.kt", share_shape="direct_discard")
+    run("`lifecycleScope.launch` alone does not wrap the calls in IO", True,
+        "share/ShareReceiverActivity.kt", share_shape="launch_only")
+    run("a share anchor that lost its file is a rot failure", True,
+        "lost its anchor", drop_share=True)
 
     print("=== readonly_mount_write_guard --selftest ===")
     failed = 0
