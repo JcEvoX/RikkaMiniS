@@ -1,6 +1,6 @@
 # rikkaminis-dev-history 按天索引
 
-快速跳转到每日开发日志。共 1969 条记录，77 天。
+快速跳转到每日开发日志。共 1976 条记录，78 天。
 
 ## 2026-08-03（11 条）
 
@@ -4042,7 +4042,7 @@
 - `23:51` **deep-audit-1024 第二道门核实 + 9 支派发（用户令「走流程吧」，附新审计报告 9 项 v3）**
   - **输入**：`REPORT-1024.md`（1414 行，ISSUE-01..09）。基线 main `f688c97`（= da1023 收口树）。工作区…
 
-## 2026-10-18（56 条）
+## 2026-10-18（59 条）
 
 - `00:33` **交付：deep-audit-1024 FIX-D（ISSUE-04 MCP OAuth 凭据/沙盒桥接文件生命周期，P1）—— `fix/da1024-mcp-oauth-bridge-lifecycle` @ `b611732a`，CI #39048727885 success，停在分支**
   - **任务**：读 `shared/work/deep-audit-1024/fix-tasks/FIX-D.md` 立刻执行（先证再改）。基线 main `f6…
@@ -4156,3 +4156,20 @@
   - **事故**：20:56 用 `file_write`（未设 append）写 §1027-D 到 `shared/backlog.md`，整文件被覆写成 25…
 - `21:38` **deep-audit-1027 收口完成（用户「他们都跑完了」）：7 支并入并集树，CI 绿 @ 5030841**
   - **身份链**：基线 main `1f6ca13` → 7 支（A–G）→ 并集树 **`integration/da1027` @ `5030841`**（7…
+- `21:57` **deep-audit-1027 合并 main + 文档归档 + 分支清理（用户「合并，清理，更新文档」）+ 日报被覆盖事故（第 3 次复发）与原文级恢复**
+  - **① 合并**：`integration/da1027 @ 5030841` → main `d026210`（`--no-ff`，**main tree `…
+- `22:20` **审计背景包升级（外部审计模型输入包）：context v9→v10 + prompt v6→v7**
+  - **位置与用途**：挂载 `笔记/RikkaMinis审计背景包/`——`audit-context.md` + `audit-prompt-v7.md` + …
+- `23:47` **deep-audit-1028 启动：第二道门核实 + 判级 + 8→3 合支派发（用户令「走流程吧，小的合并少开会话」）**
+  - - **输入**：REPORT-1028（8 工单/12 裂口，基线声明 889d645 = main 一致）。工作区 `shared/work/deep-au…
+
+## 2026-10-19（4 条）
+
+- `00:56` **FIX-C 收口：deep-audit-1028 ISSUE-02 + ISSUE-05 + ISSUE-06（UI 状态失步 / filesDir 清理接线 / 深链响应式）—— `fix/da1028-c-ui-state-wiring` @ `aaa4cc1`，CI #39145801329 绿，停在分支**
+  - **身份链**：基线 main `889d645`（tree `f12ca356`）→ 单提交 **`aaa4cc1b6267a40e7683c2e4795a5…
+- `01:28` **FIX-B 收口：deep-audit-1028 ISSUE-03 + ISSUE-04（配置作用域 / 外部写回流）—— `fix/da1028-b-config-sync` @ `7a17c5a`，CI #39148284718 绿，停在分支**
+  - **身份链**：基线 `889d645` → 分支 @ **`7a17c5a603da5e1f3590dbfab69bcd139a9f4be8`**（父=基线，…
+- `02:08` **deep-audit-1028 收口完成：8 工单 → 3 支会话（用户令「小的合并」），并集树 CI 全绿 @ 6e6fc9a**
+  - **身份链**：基线 main `889d645` → 3 支（A/B/C）→ 并集树 `integration/da1028` @ **`6e6fc9a`**…
+- `03:04` **deep-audit-1028 合并 main 完成（用户令「合并」）+ main CI 全绿**
+  - - **合并**：`integration/da1028 @ 6e6fc9a`（tree `a777fc76`）`--no-ff` 合入 main → **`8…
