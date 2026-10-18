@@ -2879,6 +2879,26 @@ def test_da1024_gates():
         check("%s real tree green" % script, rc == 0, out[-280:])
 
 
+DA1025_GATES = [
+    ("browser_tabs_lifecycle_check", "BROWSER_TABS_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("envvar_config_group_check", "ENVVAR_GROUP_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("provider_remember_key_check", "PROVIDER_REMEMBER_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("provider_rpc_symmetry_check", "PROVIDER_RPC_SELFTEST=PASS", (), (REPO_ROOT,)),
+]
+
+
+def test_da1025_gates():
+    print("━━━ deep-audit-1025 gates (selftest teeth + real tree) ━━━")
+    for script, marker, st_extra, real_args in DA1025_GATES:
+        argv = [sys.executable, os.path.join(SCRIPT_DIR, script + ".py")] + list(st_extra) + ["--selftest"]
+        proc = subprocess.run(argv, capture_output=True, text=True)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        check("%s selftest has teeth (%s)" % (script, marker),
+              proc.returncode == 0 and marker in out, out[-280:])
+        rc, out = run_scanner(script + ".py", *real_args)
+        check("%s real tree green" % script, rc == 0, out[-280:])
+
+
 def test_trace_step_tag():
     print("━━━ trace_step_tag_check ━━━")
     # The tagger reads AgentTraceRecorder's event/field names and the golden
@@ -2974,6 +2994,7 @@ def main():
     test_da1022_gates()
     test_da1023_gates()
     test_da1024_gates()
+    test_da1025_gates()
     test_trace_step_tag()
     test_da1017_external_fixtures()
     test_real_repo()
