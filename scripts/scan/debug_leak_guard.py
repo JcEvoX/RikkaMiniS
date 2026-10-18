@@ -109,6 +109,104 @@ def strip_comments(text):
     return out
 
 
+# [da1028-A] ISSUE-07 — API-33 stream helpers on a minSdk-26 app.
+# The handler used to read a file slice with
+# `inputStream().use { it.skip(offset); it.readNBytes(limit) }`:
+# `InputStream.readNBytes(int)` is API 33+ (NoSuchMethodError below that) and
+# `skip()` may under-skip, silently reading from the wrong offset. The fix is
+# the shape `handleLogsRead` already used: RandomAccessFile.seek + a bounded
+# read loop. The bounded loop was extracted to `readFileSegment` so it can be
+# exercised by a JVM slice test (the task prescribes that extraction), so this
+# gate pins the contract TRANSITIVELY: `handleReadFile` must either use
+# RandomAccessFile itself or route through a helper that does.
+DEBUG_RPC_REL = "src/android/app/src/main/java/com/rikkaminis/app/debug/DebugRPCHandler.kt"
+API33_STREAM_RE = re.compile(r"\.readNBytes\s*\(")
+READ_FILE_FUN = "handleReadFile"
+SEGMENT_HELPER = "readFileSegment"
+
+
+def _fun_block(lines, name):
+    """(start_line, end_line) of `fun NAME(…)`'s body in already
+    comment-stripped lines, or None. Both block bodies and expression bodies
+    take the first `{` after the signature."""
+    text = "\n".join(lines)
+    m = re.search(r"\bfun\s+" + re.escape(name) + r"\s*\(", text)
+    if not m:
+        return None
+    i = text.find("(", m.end() - 1)
+    depth = 0
+    while i < len(text):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    if depth != 0:
+        return None
+    j = text.find("{", i + 1)
+    if j < 0:
+        return None
+    depth = 0
+    k = j
+    while k < len(text):
+        if text[k] == "{":
+            depth += 1
+        elif text[k] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        k += 1
+    if depth != 0:
+        return None
+    return (text.count("\n", 0, m.start()), text.count("\n", 0, k))
+
+
+def scan_api26_reads(root):
+    """Violations for the minSdk-26 read contract in the debug RPC handler.
+
+    Criteria (fail-closed; comment-stripped, so a doc mention never counts):
+      1. no `.readNBytes(` anywhere in the file;
+      2. `handleReadFile` uses RandomAccessFile, or routes through
+         `readFileSegment`, whose body must then use RandomAccessFile;
+      3. a missing / renamed `handleReadFile`, or a helper that is called but
+         not defined here, is anchor drift and is itself a violation.
+
+    A tree that has no DebugRPCHandler.kt at all (the source scan is also run
+    against synthetic fixtures) is reported as SKIPPED, loudly — never as a
+    silent pass.
+    """
+    path = os.path.join(root, DEBUG_RPC_REL)
+    if not os.path.isfile(path):
+        print("  [skip] api26 reads: %s absent from this tree" % DEBUG_RPC_REL)
+        return []
+    lines = strip_comments(open(path, encoding="utf-8", errors="replace").read())
+    out = []
+    for i, line in enumerate(lines):
+        if API33_STREAM_RE.search(line):
+            out.append("%s:%d  API 33+ stream call on minSdk 26: %s" % (DEBUG_RPC_REL, i + 1, line.strip()[:80]))
+    block = _fun_block(lines, READ_FILE_FUN)
+    if block is None:
+        out.append("%s: anchor drift — `fun %s(` not found" % (DEBUG_RPC_REL, READ_FILE_FUN))
+        return out
+    body = "\n".join(lines[block[0]:block[1] + 1])
+    if "RandomAccessFile" in body:
+        return out
+    if SEGMENT_HELPER + "(" in body:
+        helper = _fun_block(lines, SEGMENT_HELPER)
+        if helper is None:
+            out.append("%s:%d  %s() is called but not defined in this file"
+                       % (DEBUG_RPC_REL, block[0] + 1, SEGMENT_HELPER))
+        elif "RandomAccessFile" not in "\n".join(lines[helper[0]:helper[1] + 1]):
+            out.append("%s:%d  %s() does not use RandomAccessFile (bounded seek+read)"
+                       % (DEBUG_RPC_REL, helper[0] + 1, SEGMENT_HELPER))
+        return out
+    out.append("%s:%d  %s() neither uses RandomAccessFile nor routes through %s()"
+               % (DEBUG_RPC_REL, block[0] + 1, READ_FILE_FUN, SEGMENT_HELPER))
+    return out
+
+
 def scan_source(root):
     src = os.path.join(root, "src/android/app/src")
     violations = []
@@ -374,6 +472,90 @@ def self_test():
     )
     for p in (apk_clean_path, apk_dirty_path, apk_broken_path):
         os.unlink(p)
+    # --- [da1028-A] ISSUE-07: minSdk-26 read contract (API-33 stream helpers) ---
+    # Ground truth for scan_api26_reads(): the comment-stripped live call is
+    # caught; a comment-only mention is not (precision control); the fix's two
+    # failure shapes (no RandomAccessFile anywhere in the path, and a called
+    # helper that is not defined) each go red on their own criterion.
+    import shutil
+
+    api_rel = os.path.dirname(DEBUG_RPC_REL)
+
+    def _api_tree(handler_text):
+        d = tempfile.mkdtemp(prefix="debugleak-api26-")
+        p = os.path.join(d, api_rel, "DebugRPCHandler.kt")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        open(p, "w").write(handler_text)
+        return d
+
+    ok_handler = (
+        "package com.rikkaminis.app.debug\n"
+        "\n"
+        "import java.io.RandomAccessFile\n"
+        "\n"
+        "class DebugRPCHandler {\n"
+        "    // [da1028-A] was `it.skip(offset); it.readNBytes(limit)`: readNBytes(int) is\n"
+        "    // API 33+ while minSdk is 26, and skip() may under-skip.\n"
+        "    private fun handleReadFile(params: org.json.JSONObject): ByteArray {\n"
+        "        return readFileSegment(java.io.File(\"x\"), 0L, 16)\n"
+        "    }\n"
+        "\n"
+        "    private fun readFileSegment(file: java.io.File, offset: Long, limit: Int): ByteArray {\n"
+        "        return RandomAccessFile(file, \"r\").use { raf ->\n"
+        "            raf.seek(offset)\n"
+        "            ByteArray(0)\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+    )
+    live_handler = ok_handler.replace(
+        "        return readFileSegment(java.io.File(\"x\"), 0L, 16)\n",
+        "        val input = java.io.File(\"x\").inputStream()\n"
+        "        input.skip(0L)\n"
+        "        return input.readNBytes(16)\n",
+    )
+    noraf_handler = ok_handler.replace(
+        "        return readFileSegment(java.io.File(\"x\"), 0L, 16)\n",
+        "        return java.io.File(\"x\").readBytes()\n",
+    )
+    missing_helper_handler = ok_handler.replace(
+        "    private fun readFileSegment(file: java.io.File, offset: Long, limit: Int): ByteArray {\n"
+        "        return RandomAccessFile(file, \"r\").use { raf ->\n"
+        "            raf.seek(offset)\n"
+        "            ByteArray(0)\n"
+        "        }\n"
+        "    }\n",
+        "",
+    )
+    drifted_handler = ok_handler.replace("private fun handleReadFile(", "private fun readFileSection(")
+
+    api_fixtures = [
+        ("comment-only readNBytes mention + helper with RandomAccessFile is clean", ok_handler, [], True),
+        ("live `.readNBytes(` is caught", live_handler, ["API 33+"], False),
+        ("handleReadFile with neither RandomAccessFile nor the helper is caught", noraf_handler, ["neither uses"], False),
+        ("a called-but-undefined helper is caught", missing_helper_handler, ["not defined"], False),
+        ("a renamed handleReadFile is anchor drift", drifted_handler, ["anchor drift"], False),
+    ]
+    api_ok = True
+    for label, text, needles, want_clean in api_fixtures:
+        d = _api_tree(text)
+        got = scan_api26_reads(d)
+        clean = got == []
+        if want_clean:
+            passed = clean
+        else:
+            passed = (not clean) and all(any(n in x for x in got) for n in needles)
+        api_ok &= check("api26: %s" % label, passed, "got=%s" % got)
+        shutil.rmtree(d, ignore_errors=True)
+    d_none = tempfile.mkdtemp(prefix="debugleak-api26-none-")
+    api_ok &= check(
+        "api26: a tree without the handler is skipped, never failed silently",
+        scan_api26_reads(d_none) == [],
+    )
+    shutil.rmtree(d_none, ignore_errors=True)
+    ok &= api_ok
+    print("   DEBUG_API26_SELFTEST=%s (%d fixtures)" % ("PASS" if api_ok else "FAIL", len(api_fixtures) + 1))
+
     return 0 if ok else 1
 
 
@@ -468,16 +650,27 @@ def main():
         print("   'nothing to scan'.")
         return 1
     v = scan_source(root)
-    if v:
-        print(f"❌ Debug-leak guard (source): {len(v)} unaudited debug-package reference(s)")
-        print("   debug/ lives in src/main; release hygiene depends on R8 DCE +")
-        print("   BuildConfig.DEBUG guards at every call site. New references must")
-        print("   be audited and added to ALLOWED_FILES — or justified inline with")
-        print("   `debug-ok: <reason>`.")
-        for x in v:
-            print("     " + x)
+    api = scan_api26_reads(root)
+    if v or api:
+        if v:
+            print(f"❌ Debug-leak guard (source): {len(v)} unaudited debug-package reference(s)")
+            print("   debug/ lives in src/main; release hygiene depends on R8 DCE +")
+            print("   BuildConfig.DEBUG guards at every call site. New references must")
+            print("   be audited and added to ALLOWED_FILES — or justified inline with")
+            print("   `debug-ok: <reason>`.")
+            for x in v:
+                print("     " + x)
+        if api:
+            print(f"❌ Debug-leak guard (source): {len(api)} minSdk-26 read-contract violation(s)")
+            print("   minSdk is 26; `InputStream.readNBytes(int)` is API 33+ (NoSuchMethodError")
+            print("   below that) and `skip()` may under-skip (reads from the wrong offset).")
+            print("   Use RandomAccessFile.seek + a bounded read loop — the shape")
+            print("   handleLogsRead already used before this contract was pinned.")
+            for x in api:
+                print("     " + x)
         return 1
     print("✅ Debug-leak guard (source): no unaudited debug-package references")
+    print("✅ Debug-leak guard (source): debug read path is minSdk-26 safe")
     return 0
 if __name__ == "__main__":
     sys.exit(main())

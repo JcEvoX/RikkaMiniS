@@ -1,6 +1,7 @@
 package com.rikkaminis.app.offload
 
 import android.content.Context
+import android.content.SharedPreferences
 import com.rikkaminis.app.logging.AppLogger
 import org.json.JSONArray
 import org.json.JSONObject
@@ -18,9 +19,24 @@ import org.json.JSONObject
  * AlarmOffloadManager; we deliberately keep this separate so the two
  * surfaces don't collide on key names or fire semantics.
  */
-internal class ScheduledNotificationStore(context: Context) {
+internal class ScheduledNotificationStore(
+    private val prefs: SharedPreferences,
+) {
 
-    private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    /**
+     * Production entry point — callers keep writing
+     * `ScheduledNotificationStore(context)`.
+     *
+     * [da1028-A] A `Context` is used for exactly one thing here (the prefs
+     * handle), so it is a constructor parameter: that lets the unit test drive
+     * the read-modify-write loop below with an in-memory double. Unit tests run
+     * against android.jar's stub `Context`
+     * (`android.testOptions.unitTests.isReturnDefaultValues = true`), whose
+     * `getSharedPreferences` returns null — untestable off-device otherwise.
+     */
+    internal constructor(context: Context) : this(
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE),
+    )
 
     // [audit-0919 F-283] Every write below is a whole-blob read-modify-write
     // (`loadAll()` → mutate → `putString(entire JSON)`). Without mutual
@@ -38,7 +54,18 @@ internal class ScheduledNotificationStore(context: Context) {
     // `store.add(entry)`), so a dropped entry leaves an alarm that fires but
     // cannot be listed by `pending` nor cancelled by `cancel --id` (get()
     // returns null) — the user can only wait for it.
-    private val lock = Any()
+    //
+    // [da1028-A] The lock therefore lives in the COMPANION, not on the
+    // instance: the handler (NotificationOffloadHandler:55) and the receiver
+    // (ScheduledNotificationReceiver:113) each construct their own store, both
+    // in the same process. An instance-level lock handed each of them a private
+    // mutex, so the two writers above never excluded each other and the
+    // `remove()` that a fired notification performs to stop its row lingering
+    // could be rolled back by a concurrent `add()`: the fired alarm's row comes
+    // back in `pending` with its AlarmManager alarm already gone (or, when the
+    // add is the one that loses, the same orphan state this class exists to
+    // prevent). One process-wide lock is the only granularity that matches the
+    // single SharedPreferences file both instances write to.
 
     /**
      * [audit-0919 F-283] Soft ceiling. Exceeding it triggers a sweep of
@@ -85,18 +112,27 @@ internal class ScheduledNotificationStore(context: Context) {
         }
     }
 
-    fun get(id: String): JSONObject? {
+    /**
+     * [da1028-A] Both readers take [lock] too. Readers used to run unsynchronized: a
+     * `get`/`loadAll` that started while a writer was inside its
+     * read-modify-write returned the pre-write blob — `android-notification
+     * pending` and `cancel --id` (which looks the row up with [get]) then
+     * reported an alarm as absent while it was in fact registered, or the
+     * reverse. Same lock as the writers, so a reader can no longer observe a
+     * half-applied ledger.
+     */
+    fun get(id: String): JSONObject? = synchronized(lock) {
         val list = loadAll()
         for (i in 0 until list.length()) {
             val o = list.getJSONObject(i)
-            if (o.optString("id") == id) return o
+            if (o.optString("id") == id) return@synchronized o
         }
-        return null
+        null
     }
 
-    fun loadAll(): JSONArray {
-        val raw = prefs.getString(KEY, null) ?: return JSONArray()
-        return try { JSONArray(raw) } catch (_: Exception) { JSONArray() }
+    fun loadAll(): JSONArray = synchronized(lock) {
+        val raw = prefs.getString(KEY, null) ?: return@synchronized JSONArray()
+        try { JSONArray(raw) } catch (_: Exception) { JSONArray() }
     }
 
     /**
@@ -131,6 +167,16 @@ internal class ScheduledNotificationStore(context: Context) {
     }
 
     companion object {
+        /**
+         * [da1028-A] Process-wide mutex — see the long note on the writers
+         * above. `companion object` gives it static storage, so every store
+         * instance (handler, receiver, any future construction site) shares the
+         * one monitor; an instance-level `private val lock = Any()` does not.
+         * `synchronized` is re-entrant, so the writers may keep calling the
+         * now-guarded [loadAll] from inside their own critical section.
+         */
+        private val lock = Any()
+
         private const val TAG = "ScheduledNotifStore"
         private const val PREFS = "minis_scheduled_notifications"
         private const val KEY = "scheduled"

@@ -210,6 +210,106 @@ def analyse_scm(code):
     return res
 
 
+STORE = "src/android/app/src/main/java/com/rikkaminis/app/offload/ScheduledNotificationStore.kt"
+STORE_LOCK = re.compile(r"\bval\s+lock\b\s*=\s*Any\(\)")
+STORE_GUARD = re.compile(r"\bsynchronized\s*\(\s*lock\s*\)")
+
+
+def block_span(code, open_off):
+    """(open, close) offsets of the brace block opened at `open_off`, or None."""
+    depth = 0
+    k = open_off
+    while k < len(code):
+        if code[k] == "{":
+            depth += 1
+        elif code[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return (open_off, k)
+        k += 1
+    return None
+
+
+def companion_span(code):
+    m = re.search(r"\bcompanion\s+object\b[^{]*\{", code)
+    if not m:
+        return None
+    return block_span(code, m.end() - 1)
+
+
+def fun_span(code, name):
+    """(start, end) of `fun NAME(…)` INCLUDING its body block — block bodies and
+    expression bodies (`= synchronized(lock) { … }`) both take the first `{`
+    after the signature, which is exactly what identification needs."""
+    m = re.search(r"\bfun\s+" + re.escape(name) + r"\s*\(", code)
+    if not m:
+        return None
+    i = code.find("(", m.end() - 1)
+    depth = 0
+    while i < len(code):
+        if code[i] == "(":
+            depth += 1
+        elif code[i] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    if depth != 0:
+        return None
+    br = code.find("{", i + 1)
+    if br < 0:
+        return None
+    span = block_span(code, br)
+    if span is None:
+        return None
+    return (m.start(), span[1])
+
+
+def analyse_store(code):
+    """deep-audit-1028 ISSUE-01 — the scheduled-notification store keeps ONE
+    process-wide monitor and holds it on the read path too.
+
+    `lock` was an instance field and `get`/`loadAll` read outside any monitor:
+    two live instances (NotificationOffloadHandler + ScheduledNotificationReceiver)
+    each held their own lock, so a reader could observe the pre-`putString`
+    string and a removed (already fired) alarm id came back on the next write.
+    Contract: `lock` is declared inside the companion object, and both read
+    entry points hold `synchronized(lock)` in their own body.
+    """
+    res = []
+    comp = companion_span(code)
+    res.append((
+        "store: companion object block present",
+        comp is not None,
+        "companion object block found" if comp else "no `companion object { … }` block",
+        _line(code, comp[0]) if comp else 0,
+    ))
+    lock = STORE_LOCK.search(code)
+    inside = bool(comp and lock and comp[0] < lock.start() < comp[1])
+    res.append((
+        "store: `lock` lives in the companion object (process-wide monitor)",
+        bool(lock) and inside,
+        ("`val lock = Any()` at line %d, inside the companion object" % _line(code, lock.start())) if inside
+        else ("no `val lock = Any()` declaration" if not lock
+              else "`val lock = Any()` at line %d is OUTSIDE the companion object"
+                   % _line(code, lock.start())),
+        _line(code, lock.start()) if lock else 0,
+    ))
+    for fname in ("get", "loadAll"):
+        sp = fun_span(code, fname)
+        body = code[sp[0]:sp[1]] if sp else ""
+        guarded = bool(sp) and STORE_GUARD.search(body) is not None
+        res.append((
+            "store: %s() body holds synchronized(lock)" % fname,
+            guarded,
+            ("`synchronized(lock)` present in the body" if guarded
+             else ("`fun %s(` not found (anchor drift)" % fname if not sp
+                   else "body has no `synchronized(lock)`")),
+            _line(code, sp[0]) if sp else 0,
+        ))
+    return res
+
+
 COMPLIANT_ROUTER = '''package com.rikkaminis.app.data.routing
 
 class CompliantRouter {
@@ -318,6 +418,54 @@ SCM_BREAKERS = {
 }
 
 
+COMPLIANT_STORE = '''package com.rikkaminis.app.offload
+
+class ScheduledNotificationStore {
+    fun add(id: String) {
+        synchronized(lock) {
+            raw = (raw ?: "") + id
+        }
+    }
+
+    fun get(id: String): String? = synchronized(lock) {
+        loadAll()
+        if (raw == id) id else null
+    }
+
+    fun loadAll(): String = synchronized(lock) {
+        raw ?: ""
+    }
+
+    companion object {
+        private val lock = Any()
+        private var raw: String? = null
+    }
+}
+'''
+
+STORE_BREAKERS = {
+    "instance-lock": (
+        [(("    companion object {\n        private val lock = Any()\n"),
+          ("    private val lock = Any()\n\n    companion object {\n"))],
+        "store: `lock` lives in the companion object (process-wide monitor)",
+    ),
+    "get-unguarded": (
+        [("    fun get(id: String): String? = synchronized(lock) {\n        loadAll()\n        if (raw == id) id else null\n    }",
+          "    fun get(id: String): String? {\n        loadAll()\n        return if (raw == id) id else null\n    }")],
+        "store: get() body holds synchronized(lock)",
+    ),
+    "load-all-unguarded": (
+        [("    fun loadAll(): String = synchronized(lock) {\n        raw ?: \"\"\n    }",
+          "    fun loadAll(): String = raw ?: \"\"")],
+        "store: loadAll() body holds synchronized(lock)",
+    ),
+    "load-all-renamed": (
+        [("    fun loadAll(): String = synchronized(lock) {", "    fun readAll(): String = synchronized(lock) {")],
+        "store: loadAll() body holds synchronized(lock)",
+    ),
+}
+
+
 def selftest():
     print("-- selftest: compliant fixtures green; every breaker red on its target --")
     failures = []
@@ -385,6 +533,32 @@ def selftest():
         else:
             print("  [OK] scm breaker %d -> red on %r (+%d side)" % (idx, target, len(reds) - 1))
 
+    base_st = analyse_store(code_only(COMPLIANT_STORE))
+    reds = [c for c, ok, _, _ in base_st if not ok]
+    fixtures += 1
+    if reds:
+        failures.append("compliant store fixture red on: %s" % reds)
+        print("  [FAIL] compliant store fixture red on: %s" % reds)
+    else:
+        print("  [OK] compliant store fixture green on all %d criteria" % len(base_st))
+
+    for name, (pairs, target) in STORE_BREAKERS.items():
+        mutated = COMPLIANT_STORE
+        missing = [old for old, _ in pairs if old not in mutated]
+        fixtures += 1
+        if missing:
+            failures.append("store breaker %s cannot apply (fixture anchor moved)" % name)
+            print("  [FAIL] store breaker %s: anchor not found in fixture" % name)
+            continue
+        for old, new in pairs:
+            mutated = mutated.replace(old, new, 1)
+        reds = [c for c, ok, _, _ in analyse_store(code_only(mutated)) if not ok]
+        if target not in reds:
+            failures.append("store breaker %s did not turn %r red (red=%s)" % (name, target, reds))
+            print("  [FAIL] store breaker %s -> %r stayed green (red=%s)" % (name, target, reds))
+        else:
+            print("  [OK] store breaker %s -> red on %r (+%d side)" % (name, target, len(reds) - 1))
+
     return failures, fixtures
 
 
@@ -394,6 +568,7 @@ def main():
         if fails:
             print("SELFTEST FAIL (%d)" % len(fails))
             return 1
+        print("STORE_LOCK_CRITERIA=PASS (5 store criteria, 4 breakers)")
         print("ROUTER_LOCK_SELFTEST=PASS (%d fixtures)" % fixtures)
         return 0
 
@@ -405,7 +580,7 @@ def main():
         root = args[0]
 
     results = []
-    for rel, analyser in ((ROUTER, analyse_router), (SCM, analyse_scm)):
+    for rel, analyser in ((ROUTER, analyse_router), (SCM, analyse_scm), (STORE, analyse_store)):
         path = os.path.join(root, rel)
         if not os.path.isfile(path):
             print("FAIL %s not found under root %s" % (rel, root))
