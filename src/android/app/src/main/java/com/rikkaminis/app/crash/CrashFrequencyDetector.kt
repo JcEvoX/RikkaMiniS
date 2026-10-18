@@ -976,7 +976,7 @@ object CrashFrequencyDetector {
                 }
             }
         }
-        return zipFile
+        return@withContext zipFile
     }
 
     private fun formatBytes(bytes: Long): String = when {

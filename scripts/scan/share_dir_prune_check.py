@@ -308,7 +308,7 @@ object CrashFrequencyDetector {
         ZipOutputStream(FileOutputStream(zipFile).buffered()).use { zout ->
             zout.write(byteArrayOf(1))
         }
-        return zipFile
+        return@withContext zipFile
     }
 }
 """
@@ -345,6 +345,16 @@ def check_arm4(root):
             f"{CRASH_REL}: packageZip ordering broken: expected withContext(Dispatchers.IO) < "
             f'File(ctx.cacheDir, "share") < pruneShareDir < ZipOutputStream, got '
             f"io={io_idx} dir={dir_idx} prune={prune_idx} zip={zip_idx}"
+        ]
+    # `withContext`'s block parameter is crossinline => a bare non-local `return`
+    # inside it does not compile ("'return' is prohibited here"). CI run
+    # 39087482248 caught exactly this at :979 after the [da1025-B] conversion;
+    # ban the shape here so the next edit fails locally instead of on CI.
+    if re.search(r"(?<![\w.@])return\s+[^\s@]", fn):
+        return [
+            f"{CRASH_REL}: packageZip contains a bare `return` inside the "
+            "withContext(Dispatchers.IO) block — withContext's block is crossinline, "
+            "so only `return@withContext` compiles ('return' is prohibited here)"
         ]
     return []
 
@@ -643,6 +653,11 @@ def selftest():
     )
     # regression tooth: the OLD strict regex (context.cacheDir only) was blind
     # to the `File(ctx.cacheDir, "share")` form this batch uncovered.
+    ok &= run_crash_fixture(
+        "crash-bare-return",
+        CRASH_OK.replace("return@withContext zipFile", "return zipFile"),
+        expect_ok=False,
+    )
     blind2 = re.compile(r"File\(\s*context\.cacheDir\s*,\s*\"share\"\s*\)").search(CRASH_OK) is None
     ok &= blind2 and 'File(ctx.cacheDir, "share")' in CRASH_OK
     print(f"  [{'PASS' if blind2 else 'FAIL'}] fixture crash file's ctx.cacheDir form is invisible to the old strict pattern (regression tooth)")
