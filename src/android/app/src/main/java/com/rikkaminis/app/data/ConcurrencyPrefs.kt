@@ -18,6 +18,15 @@ import android.content.SharedPreferences
  * prime time and held until the next process start, so a change applies the
  * next time the app process launches — safe, no runtime slot resizing.
  *
+ * [ARCH-02] The cache is also **self-syncing**: [prime] registers an
+ * object-owned, strongly-referenced [selfSyncListener] on the prefs file, so
+ * any direct SharedPreferences write (PrefsIntField via minis-config, backup
+ * restore, the agent) refreshes [cachedMaxSessions] immediately — visibility
+ * no longer depends on an external module remembering to re-prime. The
+ * runtime effect statement above is unchanged: the sized semaphores keep the
+ * bound they took at process start; this only makes the persisted value
+ * *visible* to the context-free readers.
+ *
  * Deliberately a SINGLE cap shared by all three coordinated gates. Phase 0
  * aligned them to the same bound on purpose; a single knob keeps them aligned
  * (changing one without the other two would silently let one path burst past
@@ -47,12 +56,53 @@ object ConcurrencyPrefs {
     @Volatile
     private var primed = false
 
+    /**
+     * [ARCH-02] Self-owned, strongly-referenced re-priming handle.
+     *
+     * `PrefsIntField` (minis-config), a backup restore and the agent all write
+     * this prefs file **straight to SharedPreferences** — they never call
+     * [setMaxConcurrentSessions]. Before ARCH-02 the only thing that refreshed
+     * [cachedMaxSessions] after such a write was an external listener mounted in
+     * `ConfigBuiltins`; if that registration is ever missed (or the listener is
+     * collected, see the F-134 WeakHashMap note in `prefs_listener_holder_guard`),
+     * every context-free reader keeps serving the value taken at startup.
+     *
+     * Holding the listener on the object that owns the cache makes the cache
+     * self-refreshing: [prime] is the only thing anyone has to remember to call,
+     * and it is already called from `MinisApp.onCreate`.
+     *
+     * The `SharedPreferences` instance handed to the callback is used directly —
+     * no `Context` is retained, so there is no dead-field leak (F-235).
+     *
+     * Guard: `scripts/scan/prefs_listener_holder_guard.py`.
+     */
+    @Volatile
+    private var listenerRegistered = false
+
+    private val selfSyncListener =
+        SharedPreferences.OnSharedPreferenceChangeListener { changed, _ ->
+            cachedMaxSessions = clamp(changed.getInt(KEY_MAX_CONCURRENT_SESSIONS, DEFAULT))
+        }
+
     private fun prefs(context: Context): SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     /** Capture the app context and warm the cache. Call from MinisApp.onCreate. */
     fun prime(context: Context) {
-        cachedMaxSessions = clamp(prefs(context).getInt(KEY_MAX_CONCURRENT_SESSIONS, DEFAULT))
+        val p = prefs(context)
+        // Frameworks de-duplicate by listener identity too, but keeping the
+        // registration to once per process makes the intent explicit and skips
+        // the monitor on the hot path (prime is called again on every write by
+        // the external re-primers too).
+        if (!listenerRegistered) {
+            synchronized(this) {
+                if (!listenerRegistered) {
+                    p.registerOnSharedPreferenceChangeListener(selfSyncListener)
+                    listenerRegistered = true
+                }
+            }
+        }
+        cachedMaxSessions = clamp(p.getInt(KEY_MAX_CONCURRENT_SESSIONS, DEFAULT))
         primed = true
     }
 
