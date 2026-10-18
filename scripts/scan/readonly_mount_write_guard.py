@@ -589,6 +589,80 @@ def check_blocking_io(root):
     return violations, rot, sites, notes
 
 
+# ── Criterion 3: the share-import UI hand-off must stay on a Looper thread ──
+#
+# The ISSUE-07 fix moved the provider import onto Dispatchers.IO, which made the
+# `toast()` helper functionally dependent on hopping back to Main: `Toast.show()`
+# on a worker thread throws "Can't toast on a thread that has not called
+# Looper.prepare()". No criterion-2 rule can see that dependency (showing a
+# Toast is not a blocking-I/O call), so a future cleanup that removes the hop
+# would read as a pure simplification and pass every gate — then crash at
+# runtime on the very first shared-provider import. This criterion pins the hop
+# in the one file that owns it, and reports ROT when its premise disappears.
+SHARE_TOAST_HOP_RE = re.compile(r"runOnUiThread\s*[({]|Handler\s*\(")
+
+def check_share_toast_hop(root):
+    """The share `toast()` must hop to a Looper thread.
+
+    Returns (violations, rot, sites, notes) — the same contract as
+    check_blocking_io, wired into main() the same way. Skipped ([PARTIAL]) on
+    trees that do not ship the share package, e.g. the frozen `test_scan.py`
+    fixtures, which build a `sandbox/`-only tree.
+    """
+    rel = "share/ShareReceiverActivity.kt"
+    path = os.path.join(root, APP_REL, *rel.split("/"))
+    violations, rot, notes = [], [], []
+    sites = 0
+    if not os.path.isfile(path):
+        if os.path.isdir(os.path.dirname(path)):
+            rot.append(
+                f"{rel}: missing while `share/` still exists — the toast-hop "
+                f"criterion lost its anchor"
+            )
+        else:
+            notes.append("[PARTIAL] share toast hop criterion skipped (share/ absent)")
+        return violations, rot, sites, notes
+
+    text = strip_comments(open(path, encoding="utf-8", errors="replace").read())
+    bodies = [body for name, _params, body in functions(text) if name == "toast"]
+    if not bodies:
+        rot.append(
+            f"{rel}: no `fun toast(` left to check — the criterion would pass "
+            f"by looking at nothing"
+        )
+        return violations, rot, sites, notes
+
+    # Premise: the import really does run on a worker thread in this file. If a
+    # future refactor pulls it back onto Main, the hop stops being required —
+    # say so and let a human re-justify or retire the criterion instead of
+    # enforcing it forever for no reason (the same rot-not-skip idiom as
+    # criterion 2).
+    regions = io_block_regions(text)
+    if regions is None:
+        rot.append(f"{rel}: unbalanced braces around a withContext(Dispatchers.IO) block")
+        return violations, rot, sites, notes
+    import_offsets = call_offsets(
+        text, re.compile(r"importProviderJson\s*\("), re.compile(r"\bfun\s+importProviderJson\s*\(")
+    )
+    if not any(s <= o < e for s, e in regions for o in import_offsets):
+        rot.append(
+            f"{rel}: the toast-hop criterion's premise is gone — no "
+            f"importProviderJson call inside a withContext(Dispatchers.IO) block"
+        )
+        return violations, rot, sites, notes
+
+    head = text.find("fun toast(")
+    for body in bodies:
+        sites += 1
+        if not SHARE_TOAST_HOP_RE.search(body):
+            line = text.count("\n", 0, head) + 1 if head >= 0 else 0
+            violations.append(
+                f"{rel}:{line} — toast() shows the Toast on its calling thread; the provider "
+                f"import now runs on Dispatchers.IO, where Toast.show() throws without a "
+                f"Looper — hop back with runOnUiThread {{ … }}"
+            )
+    return violations, rot, sites, notes
+
 # ── selftest ────────────────────────────────────────────────────────────────
 
 FILLER_GUARD = "isLinuxPathUnderReadOnlyMount("
@@ -747,8 +821,28 @@ SHARE_BODIES = {
     ),
 }
 
+# Criterion-3 fixtures: what the `toast()` helper looks like. `hop` is the shape
+# ISSUE-07 ships; `direct` is the crash-on-first-import shape; `missing` is the
+# rot shape (the helper was deleted outright, so the criterion must not read
+# the tree as clean by checking nothing).
+SHARE_TOAST_BODIES = {
+    "hop": (
+        "    private fun toast(msg: String) {\n"
+        "        runOnUiThread {\n"
+        "            android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()\n"
+        "        }\n"
+        "    }\n"
+    ),
+    "direct": (
+        "    private fun toast(msg: String) {\n"
+        "        android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()\n"
+        "    }\n"
+    ),
+    "missing": "",
+}
 
-def _share_receiver(shape="io"):
+
+def _share_receiver(shape="io", toast_hop="hop"):
     return (
         "package com.rikkaminis.app.share\n"
         "\n"
@@ -764,13 +858,16 @@ def _share_receiver(shape="io"):
         "    }\n"
         "\n"
         + SHARE_BODIES[shape] +
+        "\n"
+        + SHARE_TOAST_BODIES[toast_hop] +
         "}\n"
     )
 
 
 def write_io_fixture(root, store_shape="io", log_shape="io", store_fn="probeWritable",
                      drop_store=False, drop_log=False, data_pkg=True, ui_pkg=True,
-                     keep_pkgs_when_dropped=True, share_shape="io", drop_share=False):
+                     keep_pkgs_when_dropped=True, share_shape="io", drop_share=False,
+                     toast_hop="hop"):
     """A `com/rikkaminis/app` tree carrying both criterion-2 targets.
 
     [keep_pkgs_when_dropped] leaves an unrelated file in the package whose anchor
@@ -794,7 +891,7 @@ def write_io_fixture(root, store_shape="io", log_shape="io", store_fn="probeWrit
             "package com.rikkaminis.app.ui.settings\n\nclass OtherScreen\n"
         )
     if not drop_share:
-        files["share/ShareReceiverActivity.kt"] = _share_receiver(share_shape)
+        files["share/ShareReceiverActivity.kt"] = _share_receiver(share_shape, toast_hop)
     elif keep_pkgs_when_dropped:
         files["share/ShareHost.kt"] = "package com.rikkaminis.app.share\n\nclass ShareHost\n"
     if not data_pkg:
@@ -862,6 +959,14 @@ def selftest():
         "share/ShareReceiverActivity.kt", share_shape="launch_only")
     run("a share anchor that lost its file is a rot failure", True,
         "lost its anchor", drop_share=True)
+    run("the share toast hop after the import moved to IO passes", False,
+        "share UI hand-off verified on a Looper thread")
+    run("a Toast shown straight from the dialog thread is caught", True,
+        "share/ShareReceiverActivity.kt", toast_hop="direct")
+    run("a share tree whose toast() was removed is a rot failure, not a silent skip", True,
+        "no `fun toast(", toast_hop="missing")
+    run("the toast-hop criterion reports its premise gone when the import is not on IO", True,
+        "premise is gone", share_shape="launch_only")
 
     print("=== readonly_mount_write_guard --selftest ===")
     failed = 0
@@ -883,6 +988,7 @@ def main():
     root = os.path.abspath(args[0] if args else os.path.join(os.path.dirname(__file__), "..", ".."))
     violations, checked, files, exempt_used = scan(root)
     io_violations, io_rot, io_sites, io_notes = check_blocking_io(root)
+    hop_violations, hop_rot, hop_sites, hop_notes = check_share_toast_hop(root)
 
     rot = []
     if files < 20:
@@ -890,20 +996,28 @@ def main():
     if checked < 3:
         rot.append(f"only {checked} path-parameter write sites found — the detector stopped matching?")
     rot += io_rot
+    rot += hop_rot
     if rot:
         print("ROT — the guard can no longer see what it is supposed to check:")
         for r in rot:
             print(f"  ✗ {r}")
         return 1
-    for n in io_notes:
+    for n in io_notes + hop_notes:
         print(f"  {n}")
     if violations or io_violations:
         print("Unguarded host-file writes:")
         for v in violations + io_violations:
             print(f"  ✗ {v}")
+    if hop_violations:
+        print("UI calls left on the wrong thread:")
+        for v in hop_violations:
+            print(f"  ✗ {v}")
+    if violations or io_violations or hop_violations:
         return 1
     print(f"OK: {checked} path-parameter write site(s) guarded ({files} files scanned)")
     print(f"    {io_sites} blocking-IO call site(s) inside Dispatchers.IO")
+    if hop_sites:
+        print(f"    {hop_sites} share UI hand-off verified on a Looper thread")
     for rel, reason in sorted(exempt_used.items()):
         print(f"  · exempt {rel}: {reason}")
     return 0
