@@ -37,6 +37,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -49,6 +50,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.core.content.FileProvider
 import com.rikkaminis.app.logging.AppLogger
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.RandomAccessFile
@@ -69,6 +71,11 @@ fun LogManagementScreen(
     onLogFileClick: (fileName: String) -> Unit = {},
 ) {
     val context = LocalContext.current
+    // Delete-all runs clearLogs() (writer close + directory scan + unlink of
+    // every daily/crash file) plus a directory rescan. Both are host I/O and
+    // must not sit on the Main thread — `readonly_mount_write_guard.py` pins
+    // the call into Dispatchers.IO [deep-audit-1025 ISSUE-08].
+    val scope = rememberCoroutineScope()
     // T-logs-perf: capped, separated daily/crash lists. Pre-T-logs-perf the
     // screen called AppLogger.listLogFiles() + totalSize() synchronously on
     // the main thread inside a LaunchedEffect, AND each row called
@@ -147,9 +154,15 @@ fun LogManagementScreen(
             },
             confirmButton = {
                 MinisTextButton(onClick = {
-                    AppLogger.clearLogs()
-                    refresh()
-                    showDeleteAllConfirm = false
+                    scope.launch {
+                        // [deep-audit-1025 ISSUE-08] clearLogs() closes the
+                        // writers and unlinks every log file; on a long-running
+                        // install that is a directory listing plus up to ~100
+                        // unlinks — a Main-thread freeze for the duration.
+                        withContext(Dispatchers.IO) { AppLogger.clearLogs() }
+                        refresh()
+                        showDeleteAllConfirm = false
+                    }
                 }) {
                     Text(stringResource(R.string.log_delete_confirm), color = MaterialTheme.colorScheme.error)
                 }
