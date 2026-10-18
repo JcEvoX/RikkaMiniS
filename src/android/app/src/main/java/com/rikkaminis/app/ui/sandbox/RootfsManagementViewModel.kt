@@ -7,11 +7,13 @@ import com.rikkaminis.app.R
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.sandbox.RootfsInstallState
 import com.rikkaminis.app.sandbox.RootfsManager
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 data class RootfsManagementUiState(
     val isInstalled: Boolean = false,
@@ -167,28 +169,39 @@ class RootfsManagementViewModel : ViewModel() {
      * guest to restore bash/readline/ncurses, only falling back to a full
      * reset when apk itself is unusable. The terminal falls back to /bin/sh
      * independently if repair still leaves bash broken.
+     *
+     * [deep-audit-1027 ISSUE-05] Both integrity reads are hoisted into
+     * `withContext(Dispatchers.IO)`: `verifyIntegrity()` reads
+     * `.integrity_manifest` and stats seven critical files, and this method is
+     * reached straight from the screen's `onClick` — on Main it blocked a frame
+     * per read (the second `withContext` was previously a `viewModelScope.launch`
+     * whose `Main.immediate` body ran the read inline).
      */
     fun repairRootfs(ctx: Context) {
         val manager = RootfsManager.getInstance(ctx)
-        val initial = manager.verifyIntegrity()
-        if (initial.healthy) {
-            _uiState.value = _uiState.value.copy(
-                lastOperationSuccess = true,
-                resultMessage = ctx.getString(R.string.rootfs_msg_healthy),
-            )
-            return
-        }
-
-        _uiState.value = _uiState.value.copy(
-            isProcessing = true,
-            statusMessage = ctx.getString(R.string.rootfs_msg_repairing),
-            resultMessage = null,
-            installProgress = 0f,
-        )
         viewModelScope.launch {
+            val initial = withContext(Dispatchers.IO) {
+                manager.verifyIntegrity()
+            }
+            if (initial.healthy) {
+                _uiState.value = _uiState.value.copy(
+                    lastOperationSuccess = true,
+                    resultMessage = ctx.getString(R.string.rootfs_msg_healthy),
+                )
+                return@launch
+            }
+
+            _uiState.value = _uiState.value.copy(
+                isProcessing = true,
+                statusMessage = ctx.getString(R.string.rootfs_msg_repairing),
+                resultMessage = null,
+                installProgress = 0f,
+            )
             try {
                 val repaired = manager.autoRepair()
-                val after = manager.verifyIntegrity()
+                val after = withContext(Dispatchers.IO) {
+                    manager.verifyIntegrity()
+                }
                 _uiState.value = _uiState.value.copy(
                     isProcessing = false,
                     lastOperationSuccess = repaired,
