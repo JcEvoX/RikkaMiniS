@@ -1403,6 +1403,24 @@ internal object ConfigBuiltins {
                                     "name" to ConfigValue.Str(g.name),
                                     "strategy" to ConfigValue.Str(g.strategy.name),
                                     "fallback_strategy" to ConfigValue.Str(g.fallbackStrategy.name),
+                                    // [fix/da1026-H] The two per-group session
+                                    // defaults were write-only on this face:
+                                    // `minis-config get groups` hid them, so an
+                                    // agent could set them at add time and never
+                                    // read them back. Same read shape as the
+                                    // sibling providers summary (carrier field,
+                                    // Null = "no override") — the `add` payload
+                                    // accepts null/absent for both keys, so a
+                                    // summary round-trips through add unchanged.
+                                    // Token vocabulary matches the
+                                    // `groups.<id>.defaultThinkingLevel` field
+                                    // reader (lowercase, `thinkingLevelToToken`).
+                                    "default_thinking_level" to (g.defaultThinkingLevel?.let {
+                                        ConfigValue.Str(thinkingLevelToToken(it))
+                                    } ?: ConfigValue.Null),
+                                    "context_limit_tokens" to (g.contextLimitTokens?.let {
+                                        ConfigValue.Int(it)
+                                    } ?: ConfigValue.Null),
                                     "entries" to ConfigValue.Arr(entries),
                                 )
                             )
