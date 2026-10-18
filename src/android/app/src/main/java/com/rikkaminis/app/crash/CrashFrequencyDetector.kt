@@ -20,6 +20,11 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.core.content.FileProvider
 import com.rikkaminis.app.R
+import com.rikkaminis.app.ui.components.pruneShareDir
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
@@ -38,10 +43,12 @@ import java.util.zip.ZipOutputStream
  * next foreground Activity gets a one-shot AlertDialog offering to share
  * the logs via ACTION_SEND_MULTIPLE.
  *
- * Self-contained on purpose: zero Minis-internal dependencies (no
+ * Self-contained on purpose: zero heavy Minis-internal dependencies (no
  * AppLogger / ChatViewModel / ProviderRepository etc), uses
  * `android.util.Log` directly, every entry point wrapped in try/catch.
  * Runs early enough that a partial-init / pre-DI launch can't break it.
+ * [da1025-B] One exception: `pruneShareDir` (leaf top-level function, no DI)
+ * is imported from ui.components instead of duplicating the 24h TTL pruner.
  */
 object CrashFrequencyDetector {
     private const val TAG = "CrashFreqDetector"
@@ -652,6 +659,12 @@ object CrashFrequencyDetector {
         emailOnly: Boolean,
         onClosed: (() -> Unit)?,
     ) {
+        // [da1025-B] packageZip runs its zip loop (up to tens of MB of crash
+        // logs) on Dispatchers.IO; wrapping the body in a Main scope keeps the
+        // share sheet / mailto launch on the calling thread while the disk
+        // work leaves the UI thread. Failure semantics (toast + finishClose)
+        // are preserved verbatim inside the coroutine.
+        CoroutineScope(Dispatchers.Main).launch {
         try {
             val zip = packageZip(ctx, files) ?: run {
                 Toast.makeText(
@@ -660,7 +673,7 @@ object CrashFrequencyDetector {
                     Toast.LENGTH_LONG,
                 ).show()
                 finishClose(onClosed)
-                return
+                return@launch
             }
             val authority = "${ctx.packageName}.fileprovider"
             val uri = FileProvider.getUriForFile(ctx, authority, zip)
@@ -694,6 +707,7 @@ object CrashFrequencyDetector {
                 Toast.LENGTH_LONG,
             ).show()
             finishClose(onClosed)
+        }
         }
     }
 
@@ -813,6 +827,9 @@ object CrashFrequencyDetector {
         saveLauncher: (zip: File, onSaveDone: () -> Unit) -> Unit,
         onClosed: (() -> Unit)?,
     ) {
+        // [da1025-B] Same off-main-thread packaging as dispatchZippedShare;
+        // the picker handoff below still runs on Main via this scope.
+        CoroutineScope(Dispatchers.Main).launch {
         try {
             val zip = packageZip(ctx, files) ?: run {
                 Toast.makeText(
@@ -821,7 +838,7 @@ object CrashFrequencyDetector {
                     Toast.LENGTH_LONG,
                 ).show()
                 finishClose(onClosed)
-                return
+                return@launch
             }
             // Defer safe-mode clear / Activity finish until the picker
             // result lands. Without this, MainActivity would finish() the
@@ -836,6 +853,7 @@ object CrashFrequencyDetector {
                 Toast.LENGTH_LONG,
             ).show()
             finishClose(onClosed)
+        }
         }
     }
 
@@ -852,6 +870,9 @@ object CrashFrequencyDetector {
         files: List<File>,
         onClosed: (() -> Unit)?,
     ) {
+        // [da1025-B] Same off-main-thread packaging; the MediaStore copy
+        // below stays inside this Main-scoped coroutine (unchanged semantics).
+        CoroutineScope(Dispatchers.Main).launch {
         try {
             val zip = packageZip(ctx, files) ?: run {
                 Toast.makeText(
@@ -860,7 +881,7 @@ object CrashFrequencyDetector {
                     Toast.LENGTH_LONG,
                 ).show()
                 finishClose(onClosed)
-                return
+                return@launch
             }
             val savedPath: String = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val resolver = ctx.contentResolver
@@ -903,6 +924,7 @@ object CrashFrequencyDetector {
         } finally {
             finishClose(onClosed)
         }
+        }
     }
 
     /**
@@ -912,10 +934,16 @@ object CrashFrequencyDetector {
      * shares but never re-opens Minis; FileProvider already grants the
      * receiving app read access via FLAG_GRANT_READ_URI_PERMISSION.
      */
-    private fun packageZip(ctx: Context, files: List<File>): File? {
+    private suspend fun packageZip(ctx: Context, files: List<File>): File? =
+        withContext(Dispatchers.IO) {
         val readable = files.filter { it.exists() && it.length() > 0 }
-        if (readable.isEmpty()) return null
+        if (readable.isEmpty()) return@withContext null
         val shareDir = File(ctx.cacheDir, "share").apply { mkdirs() }
+        // [da1025-B] Name-agnostic 24h TTL prune via the shared pruner — the
+        // [audit-0917] prune below only drops all but the newest
+        // minis-logs-*.zip and is blind to any other blob that lands in the
+        // same dir. Must run before the new archive is written.
+        pruneShareDir(shareDir)
         // [audit-0917] Prune older archives before writing a new one. The zip
         // lives in cacheDir (so the OS may reclaim it), but the chooser needs
         // the file to survive the handoff and nothing else deletes these —
@@ -948,7 +976,7 @@ object CrashFrequencyDetector {
                 }
             }
         }
-        return zipFile
+        return@withContext zipFile
     }
 
     private fun formatBytes(bytes: Long): String = when {

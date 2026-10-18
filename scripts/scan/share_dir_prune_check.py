@@ -23,6 +23,15 @@ Pins the cache/share housekeeping contract:
         `private suspend fun` with their mkdirs/prune/writeText inside
         `withContext(Dispatchers.IO)`, and ChatExporter.exportToZip must build
         the shared/ dir and prune before opening the zip stream.
+  arm4: [da1025-B] CrashFrequencyDetector.packageZip is the single write point
+        for cacheDir/share (all three dispatch* paths call it). It must stay a
+        `private suspend fun` with the mkdir/prune/zip work inside
+        `withContext(Dispatchers.IO)` (zip packaging ran on the calling UI
+        thread before the fix — bounded ANR risk on every export), must call
+        the shared `pruneShareDir(` pruner before opening the zip stream (the
+        inline [audit-0917] prune only drops all but the newest
+        minis-logs-*.zip and is blind to other blobs), and the prune must
+        precede ZipOutputStream.
 
   Prune-then-copy is safe by construction: the 24h TTL cutoff always
   postdates the fresh copy written after the prune, so the prune can never
@@ -32,7 +41,8 @@ Usage:
   python3 share_dir_prune_check.py <repo_root>   # real tree
   python3 share_dir_prune_check.py --selftest    # fixtures
 
-Selftest marker: SHARE_DIR_PRUNE_SELFTEST=PASS
+Selftest marker: SHARE_DIR_PRUNE_SELFTEST=PASS (+ CRASH_SHARE_SELFTEST=PASS
+for the [da1025-B] arm4 fixture block)
 """
 
 import os
@@ -47,11 +57,16 @@ SETTINGS_DIR = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings"
 PROVIDER_REL = SETTINGS_DIR + "/ProviderDetailScreen.kt"
 MCP_REL = SETTINGS_DIR + "/MCPIntegrationsScreen.kt"
 EXPORTER_REL = "src/android/app/src/main/java/com/rikkaminis/app/share/ChatExporter.kt"
+CRASH_REL = "src/android/app/src/main/java/com/rikkaminis/app/crash/CrashFrequencyDetector.kt"
 
-# Covers both cacheDir/share (plural writers) and cacheDir/shared. The literal
-# run is bounded by the closing quote so "share_inbound" / "shared-foo" cannot
-# match by accident.
-SHARE_DIR_PAT = re.compile(r"File\(\s*context\.cacheDir\s*,\s*\"share(?:d)?\"\s*\)")
+# Covers cacheDir/share (plural writers) and cacheDir/shared, for ANY receiver
+# (`context.cacheDir` / `ctx.cacheDir` / ...). The literal run is bounded by the
+# closing quote so "share_inbound" / "shared-foo" cannot match by accident.
+# [da1025-B] the receiver was widened from `context.cacheDir` to
+# `(?:\w+\.)?cacheDir`: CrashFrequencyDetector constructs `File(ctx.cacheDir,
+# "share")` and the strict pattern was blind to it (this gate's own N+1 hole,
+# same shape as the da1024-G "shared" hole).
+SHARE_DIR_PAT = re.compile(r"File\(\s*(?:\w+\.)?cacheDir\s*,\s*\"share(?:d)?\"\s*\)")
 
 # arm3: (file, suspend-signature marker, what it stages)
 UI_WRITERS = (
@@ -278,8 +293,73 @@ def check_arm3(root):
     return problems
 
 
-# --- compliant / violation fixture snippets (code-level, not comments) ---
+CRASH_OK = """package com.rikkaminis.app.crash
 
+import com.rikkaminis.app.ui.components.pruneShareDir
+
+object CrashFrequencyDetector {
+    private suspend fun packageZip(ctx: Context, files: List<File>): File? =
+        withContext(Dispatchers.IO) {
+        val readable = files.filter { it.exists() && it.length() > 0 }
+        if (readable.isEmpty()) return@withContext null
+        val shareDir = File(ctx.cacheDir, "share").apply { mkdirs() }
+        pruneShareDir(shareDir)
+        val zipFile = File(shareDir, "minis-logs-stamp.zip")
+        ZipOutputStream(FileOutputStream(zipFile).buffered()).use { zout ->
+            zout.write(byteArrayOf(1))
+        }
+        return@withContext zipFile
+    }
+}
+"""
+
+
+def check_arm4(root):
+    """[da1025-B] CrashFrequencyDetector.packageZip: suspend + IO + prune-first."""
+    code = _read_stripped(root, CRASH_REL)
+    if code is None:
+        return [f"{CRASH_REL}: file missing (was it renamed/moved?)"]
+    fn = extract_braced_block(code, "private suspend fun packageZip")
+    if fn is None:
+        return [
+            f"{CRASH_REL}: `packageZip` must stay a `private suspend fun` — "
+            "its mkdir/prune/zip work runs disk I/O off the calling (UI) thread"
+        ]
+    io_idx = fn.find("withContext(Dispatchers.IO)")
+    dir_idx = fn.find('File(ctx.cacheDir, "share")')
+    prune_idx = fn.find("pruneShareDir(")
+    zip_idx = fn.find("ZipOutputStream(")
+    if io_idx < 0:
+        return [
+            f"{CRASH_REL}: packageZip lost its withContext(Dispatchers.IO) block "
+            "— zip packaging ran back on the calling thread"
+        ]
+    if dir_idx < 0:
+        return [f'{CRASH_REL}: packageZip lost the File(ctx.cacheDir, "share") construction']
+    if prune_idx < 0:
+        return [f"{CRASH_REL}: packageZip must call the shared pruneShareDir( pruner before writing"]
+    if zip_idx < 0:
+        return [f"{CRASH_REL}: packageZip lost its ZipOutputStream( staging call"]
+    if not (io_idx < dir_idx < prune_idx < zip_idx):
+        return [
+            f"{CRASH_REL}: packageZip ordering broken: expected withContext(Dispatchers.IO) < "
+            f'File(ctx.cacheDir, "share") < pruneShareDir < ZipOutputStream, got '
+            f"io={io_idx} dir={dir_idx} prune={prune_idx} zip={zip_idx}"
+        ]
+    # `withContext`'s block parameter is crossinline => a bare non-local `return`
+    # inside it does not compile ("'return' is prohibited here"). CI run
+    # 39087482248 caught exactly this at :979 after the [da1025-B] conversion;
+    # ban the shape here so the next edit fails locally instead of on CI.
+    if re.search(r"(?<![\w.@])return\s+[^\s@]", fn):
+        return [
+            f"{CRASH_REL}: packageZip contains a bare `return` inside the "
+            "withContext(Dispatchers.IO) block — withContext's block is crossinline, "
+            "so only `return@withContext` compiles ('return' is prohibited here)"
+        ]
+    return []
+
+
+# --- compliant / violation fixture snippets (code-level, not comments) ---
 COMPLIANT = """package com.rikkaminis.app.webapp
 
 import com.rikkaminis.app.ui.components.pruneShareDir
@@ -396,6 +476,32 @@ class SharedWriter {
     fun write() { java.io.File(dir, "a.json").writeText("{}") }
 }
 """
+
+
+def run_crash_fixture(name, crash_content, expect_ok):
+    """Write the five contracted files (CrashFrequencyDetector overridden) and
+    grade arm1+arm2+arm3+arm4."""
+    files = {
+        ACTIVITY_REL: COMPLIANT,
+        PROVIDER_REL: PROVIDER_OK,
+        MCP_REL: MCP_OK,
+        EXPORTER_REL: EXPORTER_OK,
+        CRASH_REL: crash_content,
+    }
+    with tempfile.TemporaryDirectory() as tmp:
+        for r, body in files.items():
+            path = os.path.join(tmp, r)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(body)
+        a1 = check_arm1(tmp)
+        a2 = check_arm2(tmp)
+        a3 = check_arm3(tmp)
+        a4 = check_arm4(tmp)
+        ok = not a1 and a2 is None and not a3 and not a4
+        status = "PASS" if ok == expect_ok else "FAIL"
+        print(f"  [{status}] fixture {name}: arm1={a1!r} arm2={a2!r} arm3={a3!r} arm4={a4!r}")
+        return status == "PASS"
 
 
 def run_writer_fixture(name, rel, content, expect_ok):
@@ -516,6 +622,46 @@ def selftest():
         EXPORTER_OK.replace("        pruneShareDir(sharedDir)\n", ""),
         expect_ok=False,
     )
+    # --- [da1025-B] arm4 fixtures: CrashFrequencyDetector.packageZip ---------
+    print("  [da1025-B] arm4 (crash export chain):")
+    ok &= run_crash_fixture("crash-compliant", CRASH_OK, expect_ok=True)
+    ok &= run_crash_fixture(
+        "crash-without-prune",
+        CRASH_OK.replace("        pruneShareDir(shareDir)\n", ""),
+        expect_ok=False,
+    )
+    ok &= run_crash_fixture(
+        "crash-prune-after-write",
+        CRASH_OK.replace(
+            "        pruneShareDir(shareDir)\n"
+            '        val zipFile = File(shareDir, "minis-logs-stamp.zip")\n'
+            "        ZipOutputStream(FileOutputStream(zipFile).buffered()).use { zout ->\n"
+            "            zout.write(byteArrayOf(1))\n"
+            "        }\n",
+            '        val zipFile = File(shareDir, "minis-logs-stamp.zip")\n'
+            "        ZipOutputStream(FileOutputStream(zipFile).buffered()).use { zout ->\n"
+            "            zout.write(byteArrayOf(1))\n"
+            "        }\n"
+            "        pruneShareDir(shareDir)\n",
+        ),
+        expect_ok=False,
+    )
+    ok &= run_crash_fixture(
+        "crash-zip-on-main-thread",
+        CRASH_OK.replace("        withContext(Dispatchers.IO) {", "        run {"),
+        expect_ok=False,
+    )
+    # regression tooth: the OLD strict regex (context.cacheDir only) was blind
+    # to the `File(ctx.cacheDir, "share")` form this batch uncovered.
+    ok &= run_crash_fixture(
+        "crash-bare-return",
+        CRASH_OK.replace("return@withContext zipFile", "return zipFile"),
+        expect_ok=False,
+    )
+    blind2 = re.compile(r"File\(\s*context\.cacheDir\s*,\s*\"share\"\s*\)").search(CRASH_OK) is None
+    ok &= blind2 and 'File(ctx.cacheDir, "share")' in CRASH_OK
+    print(f"  [{'PASS' if blind2 else 'FAIL'}] fixture crash file's ctx.cacheDir form is invisible to the old strict pattern (regression tooth)")
+    print("CRASH_SHARE_SELFTEST=" + ("PASS" if ok else "FAIL"))
     print("SHARE_DIR_PRUNE_SELFTEST=" + ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 
@@ -537,11 +683,14 @@ def main():
     a3 = check_arm3(root)
     if a3:
         failures.append(f"arm3 (cacheDir/shared writers must be suspend + IO + prune): {a3}")
+    a4 = check_arm4(root)
+    if a4:
+        failures.append(f"arm4 ([da1025-B] CrashFrequencyDetector.packageZip suspend + IO + prune): {a4}")
     if failures:
         for f in failures:
             print("FAIL:", f)
         sys.exit(1)
-    print("share_dir_prune_check: OK (arm1 + arm2 + arm3 green)")
+    print("share_dir_prune_check: OK (arm1 + arm2 + arm3 + arm4 green)")
 
 
 if __name__ == "__main__":
