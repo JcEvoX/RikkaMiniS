@@ -27,6 +27,23 @@ Pins the two shapes this branch fixed, so neither can silently regress:
      "tar"`, which broke whenever a global output flag preceded the
      subcommand).
 
+[da1026-B] additions (ISSUE-02 — the global boolean-flag set, and the
+handler that forgot to declare its own):
+
+  5. `OffloadOutput.OUTPUT_FLAGS` must recognize `help` / `h`. `OffloadArgs`
+     merges that set into every handler's `booleanFlags`, so ONLY a name
+     listed here (or declared by the handler itself) is exempt from the
+     greedy `--key value` branch. `--help <sub>` is the same shape as
+     `--compact list`: with `help` missing from the set, `--help list`
+     parsed as `--help = "list"`, `hasFlag("h", "help")` stayed false and the
+     handler fell through to its DEFAULT subcommand and ran it for real
+     (calendar/clipboard/location/notification/device …). Fail-closed: no
+     `val OUTPUT_FLAGS … = setOf(…)` declaration found → red.
+  6. `SpeakOffloadHandler` must declare `--stop` / `--status` as boolean
+     flags: both are read with `hasFlag`, and an undeclared flag is eaten as
+     a `--key value` pair (`android-speak --stop now` stored "now" as the
+     value of `--stop`, so the stop branch was never reached).
+
 Comment-aware: judgements run on code-only text, so a comment quoting a
 forbidden pattern cannot satisfy the gate (and deleting a pinned line cannot
 be masked by prose).
@@ -45,6 +62,8 @@ CONTACTS = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/Con
 CONFIG = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ConfigOffloadHandler.kt"
 BROWSERUSE = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/BrowserUseOffloadHandler.kt"
 FASTIO = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/FastioOffloadHandler.kt"
+OUTPUT = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/OffloadOutput.kt"
+SPEAK = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/SpeakOffloadHandler.kt"
 
 # (id, kind, needle) — kind: "req" exact substring / "forbid" exact substring /
 # "req_re" / "forbid_re" required-or-forbidden regex / "count_re" (needle = (re, n))
@@ -73,6 +92,23 @@ CONFIG_RULES = [
     ("K6", "req", "val resolved = resolveMaybeRelative(linuxPath, cwd)"),
     ("K7", "count_re", (r"readLinuxPath\(fileArg, request\.sessionId, request\.cwd\)", 3)),
     ("K8", "forbid_re", r"readLinuxPath\(fileArg, request\.sessionId\)(?!,)"),
+]
+
+# [da1026-B] OffloadOutput.OUTPUT_FLAGS must cover the universal help flags;
+# judged against code_only text, so a comment listing help/h cannot satisfy it.
+# Fail-closed: the declaration itself must exist.
+OUTPUT_FLAGS_RULES = [
+    ("O1", "req", "val OUTPUT_FLAGS: Set<String> = setOf("),
+    ("O2", "req_re", r'val OUTPUT_FLAGS: Set<String> = setOf\([^)]*"help"[^)]*\)'),
+    ("O3", "req_re", r'val OUTPUT_FLAGS: Set<String> = setOf\([^)]*"h"[^)]*\)'),
+]
+
+# [da1026-B] SpeakOffloadHandler reads --stop/--status via hasFlag, so the
+# OffloadArgs call must declare them boolean (the handler previously used the
+# no-arg default `booleanFlags = emptySet()`).
+SPEAK_RULES = [
+    ("S1", "req_re", r'OffloadArgs\(request\.argv\.drop\(1\),\s*booleanFlags\s*=\s*setOf\([^)]*"stop"[^)]*\)'),
+    ("S2", "req_re", r'booleanFlags\s*=\s*setOf\([^)]*"status"[^)]*\)'),
 ]
 
 # [da1020-C] BrowserUse relative-path join: the guest cwd must reach
@@ -159,6 +195,35 @@ def check_text(contacts_src: str, config_src: str, browseruse_src: str = "", fas
         elif kind == "forbid_re":
             if re.search(needle, fastio):
                 findings.append((rid, "present", needle))
+    return findings
+
+
+def check_flag_set(output_src: str, speak_src: str) -> list:
+    """[da1026-B] Global boolean-flag set + the handler that forgot to declare.
+
+    Judged on code-only text (a comment quoting the wanted set cannot pass).
+    Fail-closed: a missing `val OUTPUT_FLAGS ... = setOf(...)` declaration is a
+    finding, never a silent skip.
+    """
+    findings = []
+    output = code_only(output_src)
+    speak = code_only(speak_src)
+    declared_literal = re.search(r"val OUTPUT_FLAGS: Set<String> = setOf\(([^)]*)\)", output)
+    declared = set(re.findall(r'"([^"]*)"', declared_literal.group(1))) if declared_literal else None
+    for rid, kind, needle in OUTPUT_FLAGS_RULES:
+        if kind == "req":
+            if needle not in output:
+                findings.append((rid, "missing", needle))
+        elif kind == "req_re":
+            if declared is None:
+                # O1 already reports the missing declaration; do not add noise.
+                continue
+            want = "help" if rid == "O2" else "h"
+            if want not in declared:
+                findings.append((rid, "missing", f'"{want}" in OUTPUT_FLAGS'))
+    for rid, kind, needle in SPEAK_RULES:
+        if not re.search(needle, speak):
+            findings.append((rid, "missing", needle))
     return findings
 
 
@@ -274,6 +339,27 @@ GREEN_FASTIO = """
         internal fun normalizeLongOptionSpelling(argv: List<String>): List<String> =
             argv.map { if (it in SHORT_LONG_OPTIONS) "-$it" else it }
     }
+"""
+
+
+# [da1026-B] green fixtures for the OUTPUT_FLAGS / speak arms. The declared set
+# is written out literally (never `OffloadOutput.OUTPUT_FLAGS + ...`), so the
+# fixture states the wanted contract instead of restating the code.
+GREEN_OUTPUT = """
+internal object OffloadOutput {
+    val OUTPUT_FLAGS: Set<String> = setOf("compact", "quiet", "q", "help", "h")
+}
+"""
+
+GREEN_SPEAK = """
+class SpeakOffloadHandler {
+    override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
+        val args = OffloadArgs(request.argv.drop(1), booleanFlags = setOf("stop", "status"))
+        if (args.hasFlag("h", "help")) return NativeOffloadResult(0, HELP)
+        if (args.hasFlag("stop")) return cmdStop(args)
+        if (args.hasFlag("status")) return buildStatus(args)
+    }
+}
 """
 
 
@@ -397,7 +483,46 @@ def selftest() -> int:
                               "private fun normalizeTarShorts(argv: List<String>): List<String>"),
          {"F7"}),
     ]
+    # [da1026-B] the flag-set arm: (label, output_src, speak_src, want).
+    red_cases_flags = [
+        ("OUTPUT_FLAGS reverted to the three output-shaping names",
+         GREEN_OUTPUT.replace('setOf("compact", "quiet", "q", "help", "h")',
+                              'setOf("compact", "quiet", "q")'),
+         GREEN_SPEAK, {"O2", "O3"}),
+        ("OUTPUT_FLAGS loses only help",
+         GREEN_OUTPUT.replace('"q", "help", "h"', '"q", "h"'),
+         GREEN_SPEAK, {"O2"}),
+        ("OUTPUT_FLAGS loses only h",
+         GREEN_OUTPUT.replace('"q", "help", "h"', '"q", "help"'),
+         GREEN_SPEAK, {"O3"}),
+        ("OUTPUT_FLAGS declaration removed entirely",
+         GREEN_OUTPUT.replace("    val OUTPUT_FLAGS: Set<String> = setOf(\"compact\", \"quiet\", \"q\", \"help\", \"h\")\n", ""),
+         GREEN_SPEAK, {"O1"}),
+        ("a comment naming help/h cannot satisfy the declaration",
+         GREEN_OUTPUT.replace(
+             '    val OUTPUT_FLAGS: Set<String> = setOf("compact", "quiet", "q", "help", "h")',
+             '    // setOf("compact", "quiet", "q", "help", "h")\n'
+             '    val OUTPUT_FLAGS: Set<String> = setOf("compact", "quiet", "q")'),
+         GREEN_SPEAK, {"O2", "O3"}),
+        ("speak handler parses with the no-arg default again",
+         GREEN_OUTPUT,
+         GREEN_SPEAK.replace(', booleanFlags = setOf("stop", "status")', ""),
+         {"S1", "S2"}),
+        ("speak declares stop but not status",
+         GREEN_OUTPUT,
+         GREEN_SPEAK.replace('setOf("stop", "status")', 'setOf("stop")'),
+         {"S2"}),
+    ]
     failures = 0
+    for label, output, speak, want in red_cases_flags:
+        if output == GREEN_OUTPUT and speak == GREEN_SPEAK:
+            print(f"SELFTEST-FAIL: {label}: mutation did not apply to any arm")
+            failures += 1
+            continue
+        got = {rid for rid, _, _ in check_flag_set(output, speak)}
+        if got != want:
+            print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
+            failures += 1
     for label, contacts, config, *extra in red_cases:
         if len(extra) == 1:
             browseruse, fastio, want = GREEN_BROWSERUSE, GREEN_FASTIO, extra[0]
@@ -414,8 +539,10 @@ def selftest() -> int:
             failures += 1
     # the green arms must be fully clean, or every rule is vacuous
     clean = check_text(GREEN_CONTACTS, GREEN_CONFIG, GREEN_BROWSERUSE, GREEN_FASTIO)
-    if clean:
-        print(f"SELFTEST-FAIL: green fixtures must produce no findings, got {describe(clean)}")
+    clean_flags = check_flag_set(GREEN_OUTPUT, GREEN_SPEAK)
+    if clean or clean_flags:
+        print(f"SELFTEST-FAIL: green fixtures must produce no findings, "
+              f"got {describe(clean + clean_flags)}")
         failures += 1
     if failures:
         print(f"SELFTEST: {failures} failing case(s)")
@@ -435,20 +562,26 @@ def main(argv):
     config_path = root / CONFIG
     browseruse_path = root / BROWSERUSE
     fastio_path = root / FASTIO
+    output_path = root / OUTPUT
+    speak_path = root / SPEAK
     if not contacts_path.is_file() or not config_path.is_file() \
-            or not browseruse_path.is_file() or not fastio_path.is_file():
+            or not browseruse_path.is_file() or not fastio_path.is_file() \
+            or not output_path.is_file() or not speak_path.is_file():
         print(f"GATE-FAIL: handler source not found under {root}")
         return 1
     findings = check_text(contacts_path.read_text(encoding="utf-8"),
                           config_path.read_text(encoding="utf-8"),
                           browseruse_path.read_text(encoding="utf-8"),
                           fastio_path.read_text(encoding="utf-8"))
+    findings += check_flag_set(output_path.read_text(encoding="utf-8"),
+                               speak_path.read_text(encoding="utf-8"))
     if findings:
         print("offload_cli_args_check: FAIL")
         print(describe(findings))
         return 1
     print("offload_cli_args_check: PASS (contacts dispatch parsed, config --file cwd-aware, "
-          "browseruse paths joined, fastio tar verdict shared)")
+          "browseruse paths joined, fastio tar verdict shared, "
+          "OUTPUT_FLAGS covers help/h, speak declares stop/status)")
     return 0
 
 
