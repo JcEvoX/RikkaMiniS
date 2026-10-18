@@ -25,7 +25,21 @@ Criteria (all structural; the file must be the real handler):
      list (`args.positional.drop(1)`), not the raw argv tail;
   6. `notificationChannel` reads its package/channel from those positionals
      (`pos.getOrNull(1)`) and never from raw `rest`;
-  7. `packageClear` reports the scope it actually cleared (`clearScope(...)`).
+  7. `packageClear` reports the scope it actually cleared (`clearScope(...)`);
+  8. every long option read through `hasFlag` is declared value-less;
+  9. the group comes from the parsed positional (`splitShizukuArgv`), not
+     `argv[0]`;
+ 10. group sub-commands read parsed positionals, not the raw `rest` tail;
+ 11. `exec` passthrough still joins the raw tail verbatim;
+ 12. the one two-meaning option (`--data`) is opted out per group;
+ 13. [deep-audit-1029 ISSUE-07] `exec`'s payload is a shell command, not an
+     option list: the parser is fed only the CLI's own tokens
+     (`split.execOptionTokens`) and the one option `exec` owns
+     (`--timeout-ms N`) is lifted out of the payload by
+     `stripExecTimeoutTokens`. Either half missing restores a shipped defect —
+     the payload reaching the output shaper (`exec grep -q foo /p` did, via
+     `-q` → `--quiet`) makes it drop the whole `data` object on a non-zero exit,
+     and the un-lifted option is executed by the shell.
 
 A renamed function is a HARD FAIL, never a skip (the gate must not go quiet
 because the code moved).
@@ -251,6 +265,31 @@ def analyse(src):
         line_of(src, 'NO_VALUE_FLAGS - "data"'),
         "hasFlag(data)=%s get(data)=%s opt-out=%s" % (data_flag, data_value, opt_out),
     ))
+
+    # 13. [deep-audit-1029 ISSUE-07] `exec`'s payload is a shell command, not an
+    #     option list: the parser must be fed the CLI's own tokens only, and the
+    #     one option `exec` owns (`--timeout-ms N`) must be lifted out of the
+    #     payload by the splitter. Either half missing restores a shipped
+    #     defect — the payload reaching the output shaper drops the whole `data`
+    #     object on a non-zero exit, and the un-lifted option is executed by the
+    #     shell (`sh -c "… --timeout-ms 5000"`).
+    strip_body = function_body(src, "stripExecTimeoutTokens")
+    splitter_body = function_body(src, "splitShizukuArgv") or ""
+    strips_in_splitter = "stripExecTimeoutTokens(" in splitter_body
+    parser_uses_exec_tokens = "OffloadArgs(split.execOptionTokens" in handle_body
+    results.append((
+        "13 exec trims its own options out of the shell payload",
+        strip_body is not None and strips_in_splitter and parser_uses_exec_tokens
+        and "execOptionTokens = " in src,
+        line_of(src, "internal fun stripExecTimeoutTokens("),
+        "helper=%s splitter-calls-it=%s handle-feeds-execOptionTokens=%s slot=%s"
+        % (
+            "present" if strip_body is not None else "MISSING",
+            strips_in_splitter,
+            parser_uses_exec_tokens,
+            "execOptionTokens = " in src,
+        ),
+    ))
     return results
 
 
@@ -261,7 +300,11 @@ class ShizukuOffloadHandler {
         val argv = listOf<String>()
         val split = splitShizukuArgv(argv)
         val group = split.group ?: return
-        val args = OffloadArgs(split.withoutGroup, booleanFlags = noValueFlagsFor(group))
+        val args = if (group == "exec") {
+            OffloadArgs(split.execOptionTokens, booleanFlags = noValueFlagsFor(group))
+        } else {
+            OffloadArgs(split.withoutGroup, booleanFlags = noValueFlagsFor(group))
+        }
         val rest = if (group == "exec") split.trailing else split.withoutGroup
         val sub = args.positional.firstOrNull()
     }
@@ -309,8 +352,46 @@ internal fun noValueFlagsFor(group: String?): Set<String> =
 
 internal fun splitShizukuArgv(argv: List<String>): ShizukuArgv {
     val index = firstPositionalIndex(argv, ShizukuOffloadHandler.NO_VALUE_FLAGS)
-    return ShizukuArgv(group = argv[index])
+    if (index < 0) return ShizukuArgv(null, argv, emptyList(), execOptionTokens = argv)
+    val group = argv[index]
+    val leading = argv.take(index)
+    val tail = argv.drop(index + 1)
+    val (payload, execOptions) =
+        if (group == EXEC_GROUP) stripExecTimeoutTokens(tail) else tail to emptyList()
+    return ShizukuArgv(
+        group = group,
+        withoutGroup = argv.filterIndexed { i, _ -> i != index },
+        trailing = payload,
+        execOptionTokens = leading + execOptions,
+    )
 }
+
+private const val EXEC_GROUP = "exec"
+
+internal fun stripExecTimeoutTokens(tokens: List<String>): Pair<List<String>, List<String>> {
+    val payload = mutableListOf<String>()
+    val options = mutableListOf<String>()
+    var i = 0
+    while (i < tokens.size) {
+        val token = tokens[i]
+        val next = tokens.getOrNull(i + 1)
+        when {
+            token == "--timeout-ms" && next != null && isExecTimeoutValue(next) -> {
+                options.add(token)
+                options.add(next)
+                i += 2
+            }
+            else -> {
+                payload.add(token)
+                i += 1
+            }
+        }
+    }
+    return payload to options
+}
+
+private fun isExecTimeoutValue(value: String): Boolean =
+    value.isNotEmpty() && value.all { it in '0'..'9' }
 
 internal fun firstPositionalIndex(argv: List<String>, booleanFlags: Set<String>): Int = 0
 
@@ -343,7 +424,23 @@ BREAKERS = {
     10: ("val sub = args.positional.firstOrNull()", "val sub = rest.firstOrNull()"),
     11: ('rest.joinToString(" ")', 'args.positional.joinToString(" ")'),
     12: ('NO_VALUE_FLAGS - "data"', 'NO_VALUE_FLAGS'),
+    13: ("if (group == EXEC_GROUP) stripExecTimeoutTokens(tail) else tail to emptyList()",
+         "if (group == EXEC_GROUP) tail to emptyList() else tail to emptyList()"),
 }
+
+# Criterion 13 bundles three anchors (helper present / splitter runs it / the
+# parser is fed the isolated set). The main table can only flip one criterion
+# per entry, so the other two anchors get their own arms here — otherwise a
+# sub-condition could be dead text that no fixture proves live.
+EXTRA_BREAKERS = [
+    ("13b handle feeds the parser the whole argv again",
+     "OffloadArgs(split.execOptionTokens, booleanFlags = noValueFlagsFor(group))",
+     "OffloadArgs(split.withoutGroup, booleanFlags = noValueFlagsFor(group))"),
+    ("13c the helper is gone (renamed)",
+     "internal fun stripExecTimeoutTokens(tokens: List<String>): Pair<List<String>, List<String>> {",
+     "internal fun stripExecTimeoutTokensRenamed(tokens: List<String>): "
+     "Pair<List<String>, List<String>> {"),
+]
 # criterion 4 has two halves; break the global-trim half explicitly
 BREAKERS[4] = (
     'internal fun buildPackageClearCommand(pkg: String, cacheOnly: Boolean, user: String?): List<String> {\n'
@@ -366,6 +463,10 @@ def selftest():
 
     names = [c for c, _, _, _ in base]
     for idx, (old, new) in BREAKERS.items():
+        if idx > len(names):
+            failures.append("criterion %d is gone from analyse()" % idx)
+            print("  [FAIL] criterion %d: not evaluated (only %d criteria)" % (idx, len(names)))
+            continue
         if old not in COMPLIANT:
             failures.append("breaker %d cannot apply (fixture text moved)" % idx)
             print("  [FAIL] breaker %d: anchor not found in fixture" % idx)
@@ -379,6 +480,27 @@ def selftest():
             print("  [FAIL] breaker %d -> %r stayed green (red=%s)" % (idx, target, red))
         else:
             print("  [OK] breaker %d -> red on %r%s" % (idx, target, "" if len(red) == 1 else " (+%d side)" % (len(red) - 1)))
+
+    target13 = next((c for c in names if c.startswith("13 ")), None)
+    for label, old, new in EXTRA_BREAKERS:
+        if target13 is None:
+            failures.append("%s: criterion 13 is gone from analyse()" % label)
+            print("  [FAIL] %s: criterion 13 not evaluated" % label)
+            continue
+        if old not in COMPLIANT:
+            failures.append("%s: anchor not found in fixture" % label)
+            print("  [FAIL] %s: anchor not found in fixture" % label)
+            continue
+        res = analyse(strip_comments(COMPLIANT.replace(old, new, 1)))
+        red = [c for c, ok, _, _ in res if not ok]
+        if target13 in red:
+            print("  [OK] breaker %s -> red on %r%s" % (label, target13, "" if len(red) == 1 else " (+%d side)" % (len(red) - 1)))
+        else:
+            failures.append("breaker %s did not turn %r red (red=%s)" % (label, target13, red))
+            print("  [FAIL] breaker %s -> %r stayed green (red=%s)" % (label, target13, red))
+    if not failures:
+        print("SHIZUKU_ARGS_SELFTEST=PASS criteria=%d breakers=%d extra=%d"
+              % (len(base), len(BREAKERS), len(EXTRA_BREAKERS)))
     return failures
 
 
