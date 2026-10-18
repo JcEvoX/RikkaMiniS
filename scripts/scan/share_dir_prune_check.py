@@ -33,6 +33,20 @@ Pins the cache/share housekeeping contract:
         minis-logs-*.zip and is blind to other blobs), and the prune must
         precede ZipOutputStream.
 
+  arm5: [da1028-C] the three writers whose staging dir lives in filesDir /
+        externalFilesDir (NOT cacheDir) — `createCameraOutputUri`
+        (filesDir/camera-photos), `PhotosOffloadHandler.handleExport`
+        (filesDir/photos-export) and `AccessibilityOffloadHandler.uiScreenshot`
+        (externalFilesDir/a11y_screenshots) — must each call the shared
+        `pruneShareDir(` pruner, because the OS has no reason to reclaim those
+        dirs and nothing else ever deleted them. arm1 is blind to them by
+        construction (its pattern requires `cacheDir`), which is exactly the
+        N+1 shape this arm closes. It also pins the de-duplication:
+        `ChatMutationMethods.pruneStaleAttachments` must DELEGATE to the shared
+        pruner instead of carrying its own copy of the TTL loop, and the single
+        `internal fun pruneShareDir(` definition must still exist (reverse
+        anchor). Every anchor missing = RED.
+
   Prune-then-copy is safe by construction: the 24h TTL cutoff always
   postdates the fresh copy written after the prune, so the prune can never
   delete the file the current call is about to stage.
@@ -42,7 +56,8 @@ Usage:
   python3 share_dir_prune_check.py --selftest    # fixtures
 
 Selftest marker: SHARE_DIR_PRUNE_SELFTEST=PASS (+ CRASH_SHARE_SELFTEST=PASS
-for the [da1025-B] arm4 fixture block)
+for the [da1025-B] arm4 fixture block, ARM5_FILESDIR_PRUNE_SELFTEST=PASS for
+the [da1028-C] arm5 fixture block)
 """
 
 import os
@@ -58,6 +73,11 @@ PROVIDER_REL = SETTINGS_DIR + "/ProviderDetailScreen.kt"
 MCP_REL = SETTINGS_DIR + "/MCPIntegrationsScreen.kt"
 EXPORTER_REL = "src/android/app/src/main/java/com/rikkaminis/app/share/ChatExporter.kt"
 CRASH_REL = "src/android/app/src/main/java/com/rikkaminis/app/crash/CrashFrequencyDetector.kt"
+# [da1028-C] the three filesDir/externalFilesDir growers + the de-duplicated copy
+CAMERA_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatScreenHelpers.kt"
+PHOTOS_REL = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/PhotosOffloadHandler.kt"
+A11Y_REL = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/AccessibilityOffloadHandler.kt"
+MUTATION_REL = "src/android/app/src/main/java/com/rikkaminis/app/debug/ChatMutationMethods.kt"
 
 # Covers cacheDir/share (plural writers) and cacheDir/shared, for ANY receiver
 # (`context.cacheDir` / `ctx.cacheDir` / ...). The literal run is bounded by the
@@ -359,6 +379,68 @@ def check_arm4(root):
     return []
 
 
+# --- arm5 [da1028-C]: filesDir / externalFilesDir staging-dir growers ------
+
+# (rel, function marker, human label). `extract_braced_block` on the marker;
+# a missing anchor is RED so a rename cannot quietly retire the arm.
+PRUNE_WRITE_POINTS = (
+    (CAMERA_REL, "internal fun createCameraOutputUri", "filesDir/camera-photos"),
+    (PHOTOS_REL, "private fun handleExport", "filesDir/photos-export"),
+    (A11Y_REL, "private fun uiScreenshot", "externalFilesDir/a11y_screenshots"),
+)
+
+PRUNER_CALL = "pruneShareDir("
+# the second hand-rolled copy of the 24h loop; must not come back
+PRUNE_LOOP_ANCHORS = ("listFiles()", "lastModified() < cutoff")
+
+def check_arm5(root):
+    """[da1028-C] filesDir/externalFilesDir staging dirs must be pruned too."""
+    problems = []
+    for rel, marker, label in PRUNE_WRITE_POINTS:
+        code = _read_stripped(root, rel)
+        if code is None:
+            problems.append(f"{rel}: file missing (was it renamed/moved?)")
+            continue
+        fn = extract_braced_block(code, marker)
+        if fn is None:
+            problems.append(
+                f"{rel}: anchor `{marker}` not found (fail-closed: the {label} write "
+                "point moved or was renamed — re-derive this arm)")
+            continue
+        if PRUNER_CALL not in fn:
+            problems.append(
+                f"{rel}: the {label} write point does not call the shared "
+                f"`{PRUNER_CALL}` pruner — that dir lives outside cacheDir, so nothing "
+                "else can reclaim it and it grows for the life of the install")
+    code = _read_stripped(root, MUTATION_REL)
+    if code is None:
+        problems.append(f"{MUTATION_REL}: file missing (was it renamed/moved?)")
+    else:
+        fn = extract_braced_block(code, "private fun pruneStaleAttachments")
+        if fn is None:
+            problems.append(
+                f"{MUTATION_REL}: anchor `private fun pruneStaleAttachments` not found "
+                "(fail-closed: this arm pins the de-duplication)")
+        elif PRUNER_CALL not in fn:
+            problems.append(
+                f"{MUTATION_REL}: pruneStaleAttachments must delegate to the shared "
+                f"`{PRUNER_CALL}` pruner instead of keeping its own copy of the TTL loop")
+        else:
+            for anchor in PRUNE_LOOP_ANCHORS:
+                if anchor in fn:
+                    problems.append(
+                        f"{MUTATION_REL}: pruneStaleAttachments still carries a hand-rolled "
+                        f"24h loop (`{anchor}`) alongside the shared pruner — two TTL copies "
+                        "drift apart silently")
+    definer = _read_stripped(root, DEFINER_REL)
+    if definer is None:
+        problems.append(f"{DEFINER_REL}: file missing (was it renamed/moved?)")
+    elif "internal fun pruneShareDir(" not in definer:
+        problems.append(
+            f"{DEFINER_REL}: the single `internal fun pruneShareDir(` definition is gone — "
+            "every caller above would stop compiling, so this is anchor rot, not a fix")
+    return problems
+
 # --- compliant / violation fixture snippets (code-level, not comments) ---
 COMPLIANT = """package com.rikkaminis.app.webapp
 
@@ -528,6 +610,100 @@ def run_writer_fixture(name, rel, content, expect_ok):
         return status == "PASS"
 
 
+# --- [da1028-C] arm5 fixtures: filesDir/externalFilesDir growers ------------
+CAMERA_OK = """package com.rikkaminis.app.ui.chat
+
+internal fun createCameraOutputUri(context: android.content.Context): Pair<Uri, java.io.File> {
+    val dir = java.io.File(context.filesDir, "camera-photos").also { it.mkdirs() }
+    com.rikkaminis.app.ui.components.pruneShareDir(dir)
+    val file = java.io.File(dir, "photo-1.jpg")
+    file.createNewFile()
+    return Uri.fromFile(file) to file
+}
+"""
+
+PHOTOS_OK = """package com.rikkaminis.app.sandbox.offload
+
+class PhotosOffloadHandler {
+    private fun handleExport(args: OffloadArgs): NativeOffloadResult {
+        val outDir = File(context.filesDir, "photos-export").also { it.mkdirs() }
+        com.rikkaminis.app.ui.components.pruneShareDir(outDir)
+        val target = File(outDir, "export-1.jpg")
+        FileOutputStream(target).use { it.write(payload) }
+        return NativeOffloadResult(ok = true)
+    }
+}
+"""
+
+A11Y_OK = """package com.rikkaminis.app.sandbox.offload
+
+class AccessibilityOffloadHandler {
+    private fun uiScreenshot(args: OffloadArgs): NativeOffloadResult {
+        val dir = (context.getExternalFilesDir("a11y_screenshots") ?: java.io.File(context.cacheDir, "a11y_screenshots"))
+        if (!dir.exists()) dir.mkdirs()
+        com.rikkaminis.app.ui.components.pruneShareDir(dir)
+        val shot = File(dir, "a11y-1.png")
+        shot.outputStream().use { it.write(bytes) }
+        return NativeOffloadResult(ok = true)
+    }
+}
+"""
+
+MUTATION_OK = """package com.rikkaminis.app.debug
+
+class ChatMutationMethods {
+    private fun pruneStaleAttachments(dir: File) {
+        com.rikkaminis.app.ui.components.pruneShareDir(dir)
+    }
+}
+"""
+
+# the PRE-FIX shape: hand-rolled copy of the very same 24h loop
+MUTATION_SELF_LOOP = """package com.rikkaminis.app.debug
+
+class ChatMutationMethods {
+    private fun pruneStaleAttachments(dir: File) {
+        val cutoff = System.currentTimeMillis() - 24L * 60 * 60 * 1000
+        dir.listFiles()?.forEach { f ->
+            if (f.isFile && f.lastModified() < cutoff) runCatching { f.delete() }
+        }
+    }
+}
+"""
+
+DEFINER_OK = """package com.rikkaminis.app.ui.components
+
+internal fun pruneShareDir(dir: File) {
+    val cutoff = System.currentTimeMillis() - 24L * 60 * 60 * 1000
+    dir.listFiles()?.forEach { f ->
+        if (f.isFile && f.lastModified() < cutoff) runCatching { f.delete() }
+    }
+}
+"""
+
+def run_arm5_fixture(name, overrides, expect_ok):
+    """Write the arm5 targets (some overridden) and grade arm5 only."""
+    files = {
+        CAMERA_REL: CAMERA_OK,
+        PHOTOS_REL: PHOTOS_OK,
+        A11Y_REL: A11Y_OK,
+        MUTATION_REL: MUTATION_OK,
+        DEFINER_REL: DEFINER_OK,
+    }
+    files.update(overrides)
+    with tempfile.TemporaryDirectory() as tmp:
+        for r, body in files.items():
+            path = os.path.join(tmp, r)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(body)
+        problems = check_arm5(tmp)
+        ok = not problems
+        status = "PASS" if ok == expect_ok else "FAIL"
+        print(f"  [{status}] fixture {name}: arm5={problems!r}")
+        return status == "PASS"
+
+
 def selftest():
     print("share_dir_prune_check selftest:")
     ok = True
@@ -662,6 +838,47 @@ def selftest():
     ok &= blind2 and 'File(ctx.cacheDir, "share")' in CRASH_OK
     print(f"  [{'PASS' if blind2 else 'FAIL'}] fixture crash file's ctx.cacheDir form is invisible to the old strict pattern (regression tooth)")
     print("CRASH_SHARE_SELFTEST=" + ("PASS" if ok else "FAIL"))
+    # --- [da1028-C] arm5 fixtures: filesDir/externalFilesDir growers ---------
+    print("  [da1028-C] arm5 (filesDir/externalFilesDir staging dirs + pruner de-dup):")
+    ok5 = True
+    ok5 &= run_arm5_fixture("arm5-all-wired", {}, expect_ok=True)
+    ok5 &= run_arm5_fixture(
+        "arm5-camera-photos-without-prune",
+        {CAMERA_REL: CAMERA_OK.replace(
+            "    com.rikkaminis.app.ui.components.pruneShareDir(dir)\n", "")},
+        expect_ok=False,
+    )
+    ok5 &= run_arm5_fixture(
+        "arm5-photos-export-without-prune",
+        {PHOTOS_REL: PHOTOS_OK.replace(
+            "        com.rikkaminis.app.ui.components.pruneShareDir(outDir)\n", "")},
+        expect_ok=False,
+    )
+    ok5 &= run_arm5_fixture(
+        "arm5-a11y-screenshots-without-prune",
+        {A11Y_REL: A11Y_OK.replace(
+            "        com.rikkaminis.app.ui.components.pruneShareDir(dir)\n", "")},
+        expect_ok=False,
+    )
+    # the de-dup tooth: the old hand-rolled copy must not come back
+    ok5 &= run_arm5_fixture(
+        "arm5-mutation-self-loop",
+        {MUTATION_REL: MUTATION_SELF_LOOP},
+        expect_ok=False,
+    )
+    # fail-closed: a renamed write point must RED, not silently retire the arm
+    ok5 &= run_arm5_fixture(
+        "arm5-failclosed-camera-anchor-missing",
+        {CAMERA_REL: "package com.rikkaminis.app.ui.chat\n\nfun unrelated() {}\n"},
+        expect_ok=False,
+    )
+    ok5 &= run_arm5_fixture(
+        "arm5-failclosed-pruner-definition-gone",
+        {DEFINER_REL: "package com.rikkaminis.app.ui.components\n\nfun unrelated() {}\n"},
+        expect_ok=False,
+    )
+    ok &= ok5
+    print("ARM5_FILESDIR_PRUNE_SELFTEST=" + ("PASS" if ok5 else "FAIL"))
     print("SHARE_DIR_PRUNE_SELFTEST=" + ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 
@@ -686,11 +903,14 @@ def main():
     a4 = check_arm4(root)
     if a4:
         failures.append(f"arm4 ([da1025-B] CrashFrequencyDetector.packageZip suspend + IO + prune): {a4}")
+    a5 = check_arm5(root)
+    if a5:
+        failures.append(f"arm5 ([da1028-C] filesDir/externalFilesDir growers + pruner de-dup): {a5}")
     if failures:
         for f in failures:
             print("FAIL:", f)
         sys.exit(1)
-    print("share_dir_prune_check: OK (arm1 + arm2 + arm3 + arm4 green)")
+    print("share_dir_prune_check: OK (arm1 + arm2 + arm3 + arm4 + arm5 green)")
 
 
 if __name__ == "__main__":

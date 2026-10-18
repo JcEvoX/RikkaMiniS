@@ -536,6 +536,11 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
         )
 
         val outDir = File(context.filesDir, "photos-export").also { it.mkdirs() }
+        // [da1028-C] filesDir, not cacheDir: nothing reclaims this dir, and the
+        // export path had no prune point — a long-lived install grew it without
+        // bound. Same 24h contract as cache/share. Handler runs on the offload
+        // server's worker thread, so the dir walk is off the main thread.
+        com.rikkaminis.app.ui.components.pruneShareDir(outDir)
         val safeName = displayName.replace(Regex("[^A-Za-z0-9._-]"), "_").take(64)
         val ext = displayName.substringAfterLast('.', "")
             .ifEmpty { if (mediaType == "video") "mp4" else "jpg" }

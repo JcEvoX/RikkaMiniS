@@ -35,6 +35,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.rikkaminis.app.R
+import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.model.ProviderInstance
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.provider.thinking.ThinkingRule
@@ -60,6 +61,12 @@ import com.rikkaminis.app.provider.thinking.ThinkingRule
 fun ThinkingRulesSection(
     instance: ProviderInstance,
     providerRepository: ProviderRepository,
+    // [da1028-C] This instance's full model entry list (`entriesFor(instanceId)`,
+    // NOT the visible-only subset). Both derived values below are computed from
+    // the repo's own `config.modelEntries` — passing the list in is what lets the
+    // `remember` keys observe a catalog refresh. Default keeps the old call sites
+    // compiling unchanged.
+    modelEntries: List<ModelEntry> = emptyList(),
 ) {
     // --- UI scoping: official-protocol providers get a notice, not a list ---
     if (!instance.supportsCustomThinkingRules) {
@@ -96,10 +103,10 @@ fun ThinkingRulesSection(
     val customRules = customRulesAndIds.first
     // The persisted ids parallel the custom rules in stored order (for edit/delete/reorder).
     val customIds = customRulesAndIds.second
-    val builtIns = remember(instance.id, reloadKey) {
+    val builtIns = remember(instance.id, instance.customBaseURL, instance.appendV1Suffix, modelEntries, reloadKey) {
         providerRepository.builtInThinkingRulesForDisplay(instance.id)
     }
-    val sampleModelId = remember(instance.id, reloadKey) {
+    val sampleModelId = remember(instance.id, modelEntries, reloadKey) {
         providerRepository.firstModelId(instance.id)
     }
 
