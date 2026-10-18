@@ -29,6 +29,15 @@ import android.content.SharedPreferences
  *
  * Every key is also registered in ConfigBuiltins (runtime.* paths) so
  * minis-config can read/write them and the in-app backup carries them.
+ *
+ * [ARCH-02] The cache is self-syncing: [prime] registers an object-owned,
+ * strongly-held [selfSyncListener] that re-runs [loadFromPreferences] on any
+ * direct SharedPreferences write, so a `minis-config` write or a backup
+ * restore becomes visible to the context-free readers without depending on
+ * another module remembering to re-prime. The runtime-effect statement above
+ * is unchanged (a run keeps its budget; worker-scoped limits apply at the
+ * next worker spawn) — this only removes the "cache silently keeps serving
+ * the startup value" failure mode.
  */
 object AgentRuntimeLimitsPrefs {
     const val PREFS = "minis_runtime_limits_prefs"
@@ -330,12 +339,56 @@ object AgentRuntimeLimitsPrefs {
     @Volatile private var cachedHeavyGateTimeoutSec = HEAVY_GATE_TIMEOUT_DEFAULT_SEC
     @Volatile private var primed = false
 
+    /**
+     * [ARCH-02] Self-owned, strongly-referenced re-priming handle — the same
+     * contract as `ConcurrencyPrefs.selfSyncListener`, scaled to the ~40-key
+     * family: the listener re-reads the whole file via [loadFromPreferences],
+     * so it stays correct no matter which key a future writer touches.
+     *
+     * `ConfigBuiltins` still keeps its own re-primer (`runtimeLimitsListener`,
+     * [F-134]/[fix/da1026-prefs-priming]); both are deliberately retained —
+     * the external one as defense in depth, this one because the cache must
+     * not depend on any other module remembering to register anything.
+     *
+     * The callback's `SharedPreferences` argument is used directly; no
+     * `Context` is retained (F-235 dead-field discipline).
+     *
+     * Guard: `scripts/scan/prefs_listener_holder_guard.py`.
+     */
+    @Volatile
+    private var listenerRegistered = false
+
+    private val selfSyncListener =
+        SharedPreferences.OnSharedPreferenceChangeListener { changed, _ ->
+            loadFromPreferences(changed)
+        }
+
     private fun prefs(context: Context): SharedPreferences =
         context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
     /** Capture the app context and warm every cached limit. Call from MinisApp.onCreate. */
     fun prime(context: Context) {
         val p = prefs(context)
+        if (!listenerRegistered) {
+            synchronized(this) {
+                if (!listenerRegistered) {
+                    p.registerOnSharedPreferenceChangeListener(selfSyncListener)
+                    listenerRegistered = true
+                }
+            }
+        }
+        loadFromPreferences(p)
+        primed = true
+    }
+
+    /**
+     * [ARCH-02] Single re-priming body for every cached limit — shared by
+     * [prime] and [selfSyncListener] so the listener reloads byte-identically
+     * to a cold start (a key-based listener that skips the clamp/trim logic
+     * would be a second, subtly different loader; this way there is exactly
+     * one).
+     */
+    private fun loadFromPreferences(p: SharedPreferences) {
         cachedMaxTurns = p.getInt(KEY_MAX_TURNS, TURNS_DEFAULT).coerceIn(TURNS_MIN, TURNS_MAX)
         cachedMaxProviderAttempts = p.getInt(KEY_MAX_PROVIDER_ATTEMPTS, PROVIDER_ATTEMPTS_DEFAULT)
             .coerceIn(PROVIDER_ATTEMPTS_MIN, PROVIDER_ATTEMPTS_MAX)
@@ -415,7 +468,6 @@ object AgentRuntimeLimitsPrefs {
             .coerceIn(SHELL_IDLE_TIMEOUT_MIN_MIN, SHELL_IDLE_TIMEOUT_MAX_MIN)
         cachedHeavyGateTimeoutSec = p.getInt(KEY_HEAVY_GATE_TIMEOUT_SEC, HEAVY_GATE_TIMEOUT_DEFAULT_SEC)
             .coerceIn(HEAVY_GATE_TIMEOUT_MIN_SEC, HEAVY_GATE_TIMEOUT_MAX_SEC)
-        primed = true
     }
 
     /** Exposed for tests: whether [prime] has run in this process. */
