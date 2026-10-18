@@ -47,12 +47,12 @@ internal object ProviderDebugMethods {
         val builtInIds = JSONArray()
         for (m in type.builtInModels) builtInIds.put(m.id)
 
-        // T192: Anthropic now supports custom base URL too (Anthropic-
-        // compatible endpoints like DeepSeek-anthropic, Bailian-anthropic).
-        // iOS LLMProviderFactory.makeAnthropicProvider has always allowed
-        // this — Android was the only platform reporting the field as
-        // unsupported via RPC `provider.types`.
-        val customBaseSupported = type == ProviderType.openAI || type == ProviderType.anthropic
+        // T192: Anthropic now supports custom base URL too. Since FIX-I the
+        // predicate is single-sourced (ProviderType.supportsCustomBaseURL,
+        // [da1023-C] semantics: every type except openRouter), so gemini/xAI/
+        // kimiCode now report supported as well — matching what the write path
+        // (instancesCreate guard / ProvidersCollection) actually accepts.
+        val customBaseSupported = type.supportsCustomBaseURL
         return JSONObject().apply {
             put("id", type.name)
             put("displayName", type.displayName)
