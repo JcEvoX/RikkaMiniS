@@ -14,6 +14,15 @@ import com.rikkaminis.app.data.model.ProviderInstance
 import com.rikkaminis.app.data.model.ProviderType
 import com.rikkaminis.app.data.repository.EnvVarRepository
 import com.rikkaminis.app.data.repository.ProviderRepository
+// ISSUE-05 single-source predicate read (supportsCustomBaseURL): a pure internal
+// extension property (`this != openRouter`) — no debug entry point, no
+// BuildConfig.DEBUG branch, no log line. R8 folds it into the call site, so it
+// does not pull the debug JSON-RPC surface into the release APK.
+// The debug-leak allow-list was NOT touched (shared gate, COMMON §3): for a
+// one-site cross-package read the in-line exemption is the audited form, and
+// provider_rpc_symmetry_check C1 pins that this stays the ONLY definition.
+// debug-ok: pure predicate read, no debug-only behaviour (see above)
+import com.rikkaminis.app.debug.supportsCustomBaseURL
 
 /**
  * Exposes `ProviderInstance` fields under `providers.<id>.…`. Mirrors
@@ -117,7 +126,14 @@ class ProvidersCollection(
                 ?: throw ConfigError.InvalidValue("Unknown credentialType '$raw' (allowed: apiKey, oauth)")
         } ?: ProviderCredential.apiKey
 
-        val customBaseURL = (obj["customBaseURL"] as? ConfigValue.Str)?.value?.takeIf { it.isNotBlank() }
+        // [deep-audit-1026 ISSUE-05] Same openRouter rule as the per-instance
+        // write field and the debug `provider.add` — shared via
+        // [resolveAddCustomBaseURL], not a second copy. Absent/blank ⇒ null
+        // (no override), so a bare create keeps working for every type.
+        val customBaseURL = resolveAddCustomBaseURL(
+            (obj["customBaseURL"] as? ConfigValue.Str)?.value,
+            providerType,
+        )
         val appendV1Suffix = (obj["appendV1Suffix"] as? ConfigValue.Bool)?.value ?: true
         val useResponsesAPI = (obj["useResponsesAPI"] as? ConfigValue.Bool)?.value ?: false
         val azureMode = (obj["azureMode"] as? ConfigValue.Bool)?.value ?: false
@@ -263,6 +279,17 @@ class ProvidersCollection(
             },
             writer = { v ->
                 val s = (v as? ConfigValue.Str)?.value ?: throw ConfigError.TypeMismatch("string")
+                // [deep-audit-1026 ISSUE-05] openRouter's request builder pins
+                // https://openrouter.ai/api/v1 and ignores this field entirely,
+                // and the settings UI does not render it for openRouter — so a
+                // write here used to be a *phantom* config: reported success,
+                // took effect in the collection, changed nothing at runtime, and
+                // could not be cleared from the UI. Same rule + wording as the
+                // debug `provider.instances.create/update` guards.
+                val inst = repo.instance(id) ?: throw ConfigError.InvalidValue("Provider not found")
+                if (!inst.providerType.supportsCustomBaseURL) {
+                    throw ConfigError.InvalidValue(CUSTOM_BASE_URL_OPENROUTER_MESSAGE)
+                }
                 mutate(id) { it.copy(customBaseURL = s.ifEmpty { null }) }
             },
         )
@@ -437,4 +464,46 @@ internal fun resolveAddCustomUserAgent(
         throw ConfigError.InvalidValue(CUSTOM_USER_AGENT_OAUTH_MESSAGE)
     }
     return ua
+}
+
+// ─── [deep-audit-1026 ISSUE-05] Shared customBaseURL type rule ────────────
+
+/**
+ * [da1023-C] Custom base URL is honored by every provider arm in
+ * ProviderFactory except openRouter, whose request builder pins
+ * https://openrouter.ai/api/v1. The predicate itself is **single-sourced** in
+ * `ProviderMutationMethods.supportsCustomBaseURL` (debug face) — this file
+ * imports it rather than restating `this != openRouter` a second time.
+ *
+ * `CUSTOM_BASE_URL_OPENROUTER_MESSAGE` is the wording single source for the
+ * collection face, mirroring `CUSTOM_USER_AGENT_OAUTH_MESSAGE`: both the
+ * `providers.<id>.customBaseURL` write field and the `add` payload path
+ * consult it instead of keeping a copy each. The debug
+ * `provider.instances.create/update` guards carry the same sentence, and the
+ * `provider_rpc_symmetry_check` gate pins that they still do (C2/C5) — so the
+ * two faces cannot drift to different user-visible errors silently.
+ */
+internal const val CUSTOM_BASE_URL_OPENROUTER_MESSAGE: String =
+    "customBaseURL is not supported for providerType=openRouter"
+
+/**
+ * Pure slice of [ProvidersCollection.add]: resolve the optional
+ * `customBaseURL` payload entry into the value stored on the new
+ * [com.rikkaminis.app.data.model.ProviderInstance], applying the same
+ * openRouter rule as the `providers.<id>.customBaseURL` write field.
+ * Absent/blank ⇒ null (no override, and no throw — a blank value is a read of
+ * "no custom base", exactly as the debug `provider.instances.update` treats an
+ * empty/JSON-null patch). A supplied base URL on a type that ignores it throws
+ * [ConfigError.InvalidValue] — mirrors the debug `provider.add` gating, so a
+ * bare openRouter create without a base URL keeps working.
+ */
+internal fun resolveAddCustomBaseURL(
+    raw: String?,
+    providerType: ProviderType,
+): String? {
+    val base = raw?.takeIf { it.isNotBlank() } ?: return null
+    if (!providerType.supportsCustomBaseURL) {
+        throw ConfigError.InvalidValue(CUSTOM_BASE_URL_OPENROUTER_MESSAGE)
+    }
+    return base
 }

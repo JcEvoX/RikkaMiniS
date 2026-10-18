@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-provider_rpc_symmetry_check.py — deep-audit-1025 FIX-I gate.
+provider_rpc_symmetry_check.py — deep-audit-1025 FIX-I gate
+                                (+ deep-audit-1026 ISSUE-05 C4/C5).
 
 [da1025-I] Provider RPC 层守卫/字段不对称（debug vs mutation）的三条判据：
 
@@ -19,7 +20,19 @@ provider_rpc_symmetry_check.py — deep-audit-1025 FIX-I gate.
   C3  instanceToJson（或其委托的 instanceJsonCore）的 put 键集合 ⊇
       instancesList 每实例 JSONObject 的 put 键集合（fail-closed）。
 
+[da1026-ISSUE-05] 第三张脸（config collection）接入同一条谓词，两条判据：
+
+  C4  ProvidersCollection.kt 的每个 customBaseURL 写入点，其**所在函数体**
+      必须引用守卫 token（supportsCustomBaseURL / customBaseURLWritable /
+      resolveAddCustomBaseURL）。fail-closed：剥注释后找不到任何写入点 ⇒ 红。
+      写入点两形态：`copy(customBaseURL = …)`（字段 writer）与
+      `customBaseURL = <expr>`（add 里的 ProviderInstance 构造实参）。
+  C5  ProviderMutationMethods.kt 的 `supportsCustomBaseURL` 出现次数 ≥
+      基线下限（防「把谓词搬到别处 / 内联否定掉」后静默退化）。
+
 Selftest：≥4 夹具，每条判据至少一个「恰好被它打破」的形态。
+注：C5 与 C1/C2 共享同一 token，协同变化（见 F10 注释）——它作为「下限守卫」
+而非独立可分辨判据存在，报告里如实分层。
 用法：
   python3 provider_rpc_symmetry_check.py <repo_root>   # 真树模式（位置参数）
   python3 provider_rpc_symmetry_check.py --selftest    # 夹具模式
@@ -36,11 +49,31 @@ import tempfile
 
 DEBUG_FILE = "ProviderDebugMethods.kt"
 MUTATION_FILE = "ProviderMutationMethods.kt"
+PROVIDERS_COLLECTION_FILE = "ProvidersCollection.kt"
 PREDICATE_DEF_PAT = re.compile(r"val\s+ProviderType\.supportsCustomBaseURL")
 # openAI-first order: only the customBaseSupported hardcode uses this order.
 INLINE_HARDCODE = "type == ProviderType.openAI || type == ProviderType.anthropic"
 OPENROUTER_MSG = "customBaseURL is not supported for providerType=openRouter"
 SELFTEST_MARKER = "PROVIDER_RPC_SELFTEST=PASS"
+
+# ---- [da1026-ISSUE-05] collection-face write sites & guard tokens ----
+# A write site is either the field writer's `mutate(id) { it.copy(customBaseURL = …) }`
+# or the `add` payload's `customBaseURL = <expr>,` constructor argument. A bare
+# declaration (`val customBaseURL = …`) is NOT a write — hence the line-anchored
+# form for the constructor case (rules out `val …`).
+BASE_URL_WRITE_PATS = (
+    re.compile(r"copy\(\s*customBaseURL\s*="),
+    re.compile(r"^\s*customBaseURL\s*=\s*[A-Za-z_]", re.M),
+)
+# Any of these inside the enclosing function body counts as the guard being wired.
+BASE_URL_GUARD_TOKENS = (
+    "supportsCustomBaseURL",
+    "customBaseURLWritable",
+    "resolveAddCustomBaseURL",
+)
+# Baseline use-count floor in ProviderMutationMethods.kt (create + update + def).
+MUTATION_PREDICATE_MIN_USES = 3
+FUN_DECL_PAT = re.compile(r"\bfun\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 
 
 def strip_comments(text):
@@ -167,9 +200,28 @@ def put_keys(block):
     return set(PUT_KEY_PAT.findall(block))
 
 
+def enclosing_function(code, pos):
+    """Name of the last ``fun <name>(`` declared before ``pos`` in
+    comment-stripped code. Returns None (fail-closed) when the write site sits
+    outside any function."""
+    best = None
+    for m in FUN_DECL_PAT.finditer(code, 0, pos):
+        best = m.group(1)
+    return best
+
+
+def base_url_write_offsets(code):
+    """Sorted offsets of every customBaseURL write site (see BASE_URL_WRITE_PATS)."""
+    offs = set()
+    for pat in BASE_URL_WRITE_PATS:
+        for m in pat.finditer(code):
+            offs.add(m.start())
+    return sorted(offs)
+
+
 def check_tree(root):
     """Returns (rc, detail dict). rc=0 all green."""
-    detail = {"c1": [], "c2": [], "c3": [], "fail_closed": []}
+    detail = {"c1": [], "c2": [], "c3": [], "c4": [], "c5": [], "fail_closed": []}
 
     debug_paths = find_files(root, DEBUG_FILE)
     mut_paths = find_files(root, MUTATION_FILE)
@@ -290,8 +342,45 @@ def check_tree(root):
                 % sorted(missing)
             )
 
+    # ---- C4 ---- [da1026-ISSUE-05] collection-face customBaseURL guards
+    coll_paths = find_files(root, PROVIDERS_COLLECTION_FILE)
+    if len(coll_paths) != 1:
+        detail["fail_closed"].append(
+            "expected exactly one %s, found %d" % (PROVIDERS_COLLECTION_FILE, len(coll_paths))
+        )
+    else:
+        with open(coll_paths[0], encoding="utf-8") as f:
+            coll_code = strip_comments(f.read())
+        write_offs = base_url_write_offsets(coll_code)
+        if not write_offs:
+            detail["fail_closed"].append(
+                "no customBaseURL write site found in %s (fail-closed)" % PROVIDERS_COLLECTION_FILE
+            )
+        for off in write_offs:
+            fn = enclosing_function(coll_code, off)
+            if fn is None:
+                detail["c4"].append(
+                    "customBaseURL write site at char %d is outside any function" % off
+                )
+                continue
+            fn_start = coll_code.rfind("fun %s(" % fn, 0, off)
+            body = coll_code[fn_start:off] if fn_start >= 0 else ""
+            if not any(tok in body for tok in BASE_URL_GUARD_TOKENS):
+                detail["c4"].append(
+                    "%s: customBaseURL write site in fun %s has no supportsCustomBaseURL guard"
+                    % (PROVIDERS_COLLECTION_FILE, fn)
+                )
+
+    # ---- C5 ---- [da1026-ISSUE-05] predicate use-count floor in mutation file
+    mut_uses = mut_code.count("supportsCustomBaseURL")
+    if mut_uses < MUTATION_PREDICATE_MIN_USES:
+        detail["c5"].append(
+            "ProviderMutationMethods.kt references supportsCustomBaseURL %d times (floor %d) — guard moved/inlined?"
+            % (mut_uses, MUTATION_PREDICATE_MIN_USES)
+        )
+
     rc = 0
-    for k in ("c1", "c2", "c3", "fail_closed"):
+    for k in ("c1", "c2", "c3", "c4", "c5", "fail_closed"):
         if detail[k]:
             rc = 1
     return rc, detail
@@ -408,18 +497,61 @@ internal val ProviderType.supportsCustomBaseURL: Boolean
     get() = this != ProviderType.openRouter
 '''
 
+# ---------------------------------------------------------------------------
+# [da1026-ISSUE-05] Collection-face fixture (ProvidersCollection.kt shape).
+# ---------------------------------------------------------------------------
+
+GOOD_COLLECTION = '''package com.rikkaminis.app.config.collections
+
+internal class ProvidersCollection {
+    override fun add(payload: ConfigValue): String {
+        val providerType = resolveType(payload)
+        val customBaseURL = resolveAddCustomBaseURL(rawBase(payload), providerType)
+        val instance = ProviderInstance(
+            id = newId(),
+            label = label,
+            customBaseURL = customBaseURL,
+        )
+        repo.addInstance(instance)
+        return instance.id
+    }
+
+    private fun customBaseURL(id: String): ConfigField =
+        ClosureField(
+            path = "providers." + id + ".customBaseURL",
+            reader = {
+                val inst = repo.instance(id) ?: return@ClosureField ConfigValue.Null
+                ConfigValue.Str(inst.customBaseURL ?: "")
+            },
+            writer = { v ->
+                val s = (v as? ConfigValue.Str)?.value ?: throw ConfigError.TypeMismatch("string")
+                val inst = repo.instance(id) ?: throw ConfigError.InvalidValue("Provider not found")
+                if (!inst.providerType.supportsCustomBaseURL) {
+                    throw ConfigError.InvalidValue("customBaseURL is not supported for providerType=openRouter")
+                }
+                mutate(id) { it.copy(customBaseURL = s.ifEmpty { null }) }
+            },
+        )
+}
+'''
+
 # Minimal stand-ins so the fixture compiles conceptually (never compiled here);
 # the gate only reads text.
 GOOD_MUTATION = GOOD_MUTATION.replace("ProviderInstanceFix", "com.rikkaminis.app.data.model.ProviderInstanceStub")
 
 
-def write_fixture(debug_text, mutation_text):
+def write_fixture(debug_text, mutation_text, collection_text=None):
     root = tempfile.mkdtemp(prefix="rpcsym-")
     os.makedirs(os.path.join(root, "src", "debug"))
+    os.makedirs(os.path.join(root, "src", "collections"))
     with open(os.path.join(root, "src", "debug", DEBUG_FILE), "w", encoding="utf-8") as f:
         f.write(debug_text)
     with open(os.path.join(root, "src", "debug", MUTATION_FILE), "w", encoding="utf-8") as f:
         f.write(mutation_text)
+    if collection_text is None:
+        collection_text = GOOD_COLLECTION
+    with open(os.path.join(root, "src", "collections", PROVIDERS_COLLECTION_FILE), "w", encoding="utf-8") as f:
+        f.write(collection_text)
     return root
 
 
@@ -507,6 +639,58 @@ def run_selftest():
     results.append(("F6-fail-closed-missing-json", ok, detail))
     shutil.rmtree(root)
 
+    # F7: collection `add` guard removed → only C4 red.
+    bad_coll = GOOD_COLLECTION.replace(
+        "val customBaseURL = resolveAddCustomBaseURL(rawBase(payload), providerType)",
+        "val customBaseURL = rawBase(payload)",
+    )
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, bad_coll)
+    rc, detail = check_tree(root)
+    ok = (rc == 1 and detail["c4"] and not detail["c1"] and not detail["c2"]
+          and not detail["c3"] and not detail["c5"] and not detail["fail_closed"])
+    results.append(("F7-collection-add-guard-deleted-C4", ok, detail))
+    shutil.rmtree(root)
+
+    # F8: collection field-writer guard removed → only C4 red.
+    bad_coll = GOOD_COLLECTION.replace(
+        '''                if (!inst.providerType.supportsCustomBaseURL) {
+                    throw ConfigError.InvalidValue("customBaseURL is not supported for providerType=openRouter")
+                }
+''',
+        "",
+    )
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, bad_coll)
+    rc, detail = check_tree(root)
+    ok = (rc == 1 and detail["c4"] and not detail["c1"] and not detail["c2"]
+          and not detail["c3"] and not detail["c5"] and not detail["fail_closed"])
+    results.append(("F8-collection-writer-guard-deleted-C4", ok, detail))
+    shutil.rmtree(root)
+
+    # F9: collection has NO customBaseURL write site at all → fail-closed red.
+    bad_coll = GOOD_COLLECTION.replace("customBaseURL = customBaseURL,\n", "")
+    bad_coll = bad_coll.replace(
+        "mutate(id) { it.copy(customBaseURL = s.ifEmpty { null }) }", "mutate(id) { it }")
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, bad_coll)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["fail_closed"] and not detail["c4"]
+    results.append(("F9-collection-no-write-site-fail-closed", ok, detail))
+    shutil.rmtree(root)
+
+    # F10: mutation guards inlined to a raw `!= openRouter` compare → the
+    # predicate use-count drops below its floor. C5 shares this token with
+    # C1/C2, so it is a floor guard rather than an independently
+    # distinguishable criterion — the assertion only requires C5 to fire
+    # (C1 fires too, by construction).
+    bad = GOOD_MUTATION.replace(
+        "if (customBaseURL != null && !type.supportsCustomBaseURL) {",
+        "if (customBaseURL != null && type != ProviderType.openRouter) {",
+    )
+    root = write_fixture(GOOD_DEBUG, bad)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c5"]
+    results.append(("F10-mutation-predicate-inlined-C5", ok, detail))
+    shutil.rmtree(root)
+
     all_ok = True
     for name, ok, detail in results:
         print("%s %s" % ("PASS" if ok else "FAIL", name))
@@ -532,9 +716,10 @@ def main():
     rc, detail = check_tree(root)
     if rc == 0:
         print("provider_rpc_symmetry: ALL GREEN (C1 predicate single-source, "
-              "C2 update guard, C3 key symmetry)")
+              "C2 update guard, C3 key symmetry, C4 collection guard, "
+              "C5 mutation predicate floor)")
         return 0
-    for k in ("c1", "c2", "c3", "fail_closed"):
+    for k in ("c1", "c2", "c3", "c4", "c5", "fail_closed"):
         for line in detail[k]:
             print("[%s] %s" % (k.upper(), line))
     return 1
