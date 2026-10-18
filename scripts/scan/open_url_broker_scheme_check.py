@@ -29,6 +29,20 @@ exactly once. The gate enforces:
   U4  the whitelist itself is not weakened: `isSupportedScheme` still
       lowercases, fail-closes on null, and still lists http/https/about/minis.
 
+deep-audit-1027 FIX-G (ISSUE-07, P2) added the consumer half of the same
+contract, which lives in a different file:
+
+  U5  `ui/terminal/TerminalScreen.kt`, inside its `LaunchedEffect(pendingUrl)`
+      block, must call `MinisOpenUrlBroker.consume()` ONLY inside the
+      `if (MinisOpenUrlBroker.isWebScheme(...))` branch. The fullscreen
+      terminal only *presents* web schemes; consuming unconditionally ate
+      `minis://` deep links / local-file previews before they could sit in
+      the broker for the underlying ChatScreen (whose observer deliberately
+      defers while `terminalVisible` is true and re-runs when it flips back
+      to false). Anchors are fail-closed: a missing/ambiguous block is RED.
+      The criterion is skipped when TerminalScreen.kt is absent (mini-tree
+      fixtures that only stage the broker file).
+
 Usage: python3 open_url_broker_scheme_check.py [ROOT]   (ROOT = repo root)
        python3 open_url_broker_scheme_check.py --selftest
 Exit:  0 = gate green, 1 = violations found (or selftest failures).
@@ -38,6 +52,7 @@ import re
 import sys
 
 BROKER_REL = "src/android/app/src/main/java/com/rikkaminis/app/terminal/MinisOpenUrlBroker.kt"
+TERMINAL_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/terminal/TerminalScreen.kt"
 
 
 def strip_comments(src):
@@ -192,6 +207,87 @@ def analyse(code_raw):
                     "lowercase=%s null-close=%s schemes=%s" % (ok_lower, ok_null, ok_list)))
     return results
 
+# ------------------------------------------------------- TerminalScreen (U5) ---
+RE_LAUNCHED_PENDING = re.compile(r"LaunchedEffect\(\s*pendingUrl\s*\)\s*\{")
+RE_WEB_SCHEME_IF = re.compile(r"if\s*\(\s*MinisOpenUrlBroker\.isWebScheme\(")
+CONSUME_CALL = "MinisOpenUrlBroker.consume()"
+
+def match_brace(code, open_idx):
+    """Index of the '}' matching the '{' at open_idx (string-aware), else -1."""
+    depth = 0
+    i = open_idx
+    n = len(code)
+    quote = None
+    while i < n:
+        c = code[i]
+        if quote is not None:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in ('"', "'"):
+            quote = c
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+def analyse_terminal(code_raw):
+    """U5 — the fullscreen terminal may only consume URLs it actually presents."""
+    code = strip_comments(code_raw)
+
+    m = RE_LAUNCHED_PENDING.search(code)
+    if not m:
+        return [("U5a LaunchedEffect(pendingUrl) block present", False,
+                 "anchor block missing — fail-closed")]
+    end_idx = match_brace(code, m.end() - 1)
+    if end_idx < 0:
+        return [("U5a LaunchedEffect(pendingUrl) block present", False,
+                 "unbalanced block braces — fail-closed")]
+    block = code[m.end() - 1:end_idx + 1]
+    results = [("U5a LaunchedEffect(pendingUrl) block present", True, "block found")]
+
+    mi = RE_WEB_SCHEME_IF.search(block)
+    if not mi:
+        results.append(("U5b isWebScheme branch inside the block", False,
+                        "no `if (MinisOpenUrlBroker.isWebScheme(` anchor — fail-closed"))
+        return results
+    oi = block.find("{", mi.end())
+    if oi < 0:
+        results.append(("U5b isWebScheme branch inside the block", False,
+                        "gate without a body — fail-closed"))
+        return results
+    ei = match_brace(block, oi)
+    if ei < 0:
+        results.append(("U5b isWebScheme branch inside the block", False,
+                        "unbalanced gate braces — fail-closed"))
+        return results
+    results.append(("U5b isWebScheme branch inside the block", True, "gate body found"))
+
+    sites = []
+    start = 0
+    while True:
+        j = block.find(CONSUME_CALL, start)
+        if j < 0:
+            break
+        sites.append(j)
+        start = j + 1
+    if not sites:
+        results.append(("U5c consume() only inside the isWebScheme branch", False,
+                        "no consume() call in the LaunchedEffect(pendingUrl) block"))
+    else:
+        outside = [j for j in sites if not (oi < j < ei)]
+        results.append(("U5c consume() only inside the isWebScheme branch", not outside,
+                        "consume() sites=%d outside-gate=%d" % (len(sites), len(outside))))
+    return results
+
 
 # ---------------------------------------------------------------- selftest ---
 GOOD = """package probe
@@ -268,6 +364,66 @@ class B {
 """
 
 
+GOOD_TERMINAL = """package probe
+@Composable
+fun TerminalScreen(pendingUrl: Uri?) {
+    var previewUrl by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(pendingUrl) {
+        val uri = pendingUrl ?: return@LaunchedEffect
+        if (MinisOpenUrlBroker.isWebScheme(uri.scheme)) {
+            previewUrl = uri.toString()
+            MinisOpenUrlBroker.consume()
+        }
+    }
+}
+"""
+
+BAD_TERMINAL_OUTSIDE = """package probe
+@Composable
+fun TerminalScreen(pendingUrl: Uri?) {
+    var previewUrl by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(pendingUrl) {
+        val uri = pendingUrl ?: return@LaunchedEffect
+        if (MinisOpenUrlBroker.isWebScheme(uri.scheme)) {
+            previewUrl = uri.toString()
+        }
+        MinisOpenUrlBroker.consume()
+    }
+}
+"""
+
+BAD_TERMINAL_NO_CONSUME = """package probe
+@Composable
+fun TerminalScreen(pendingUrl: Uri?) {
+    var previewUrl by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(pendingUrl) {
+        val uri = pendingUrl ?: return@LaunchedEffect
+        if (MinisOpenUrlBroker.isWebScheme(uri.scheme)) {
+            previewUrl = uri.toString()
+        }
+    }
+}
+"""
+
+BAD_TERMINAL_NO_ANCHOR = """package probe
+@Composable
+fun TerminalScreen(pendingUrl: Uri?) {
+    val pendingUrl2 = pendingUrl
+}
+"""
+
+GOOD_TERMINAL_COMMENT_ONLY = """package probe
+// LaunchedEffect(pendingUrl) {
+//     if (MinisOpenUrlBroker.isWebScheme(uri.scheme)) {
+//         MinisOpenUrlBroker.consume()
+//     }
+// }
+@Composable
+fun TerminalScreen(pendingUrl: Uri?) {
+    val pendingUrl2 = pendingUrl
+}
+"""
+
 def selftest():
     failures = []
 
@@ -311,6 +467,33 @@ def selftest():
     expect(len(d) == 1 and not d["U1 offer(uri: Uri) present and unambiguous"],
            "garbage input must fail-closed on U1")
 
+    # ---- U5 (TerminalScreen consumer placement) ----
+    tgood = as_dict(analyse_terminal(GOOD_TERMINAL))
+    expect(len(tgood) == 3, "U5 good fixture should produce 3 criteria, got %d" % len(tgood))
+    for c, ok in tgood.items():
+        expect(ok, "U5 good fixture must pass %s" % c)
+
+    d = as_dict(analyse_terminal(BAD_TERMINAL_OUTSIDE))
+    expect(not d["U5c consume() only inside the isWebScheme branch"],
+           "BAD_TERMINAL_OUTSIDE U5c must be RED (consume outside the gate)")
+    expect(d["U5a LaunchedEffect(pendingUrl) block present"],
+           "BAD_TERMINAL_OUTSIDE U5a must stay OK")
+    expect(d["U5b isWebScheme branch inside the block"],
+           "BAD_TERMINAL_OUTSIDE U5b must stay OK")
+
+    d = as_dict(analyse_terminal(BAD_TERMINAL_NO_CONSUME))
+    expect(not d["U5c consume() only inside the isWebScheme branch"],
+           "BAD_TERMINAL_NO_CONSUME U5c must be RED (nothing consumes)")
+
+    d = as_dict(analyse_terminal(BAD_TERMINAL_NO_ANCHOR))
+    expect(len(d) == 1 and not d["U5a LaunchedEffect(pendingUrl) block present"],
+           "BAD_TERMINAL_NO_ANCHOR must fail-closed on U5a")
+
+    # KDoc quoting the anchor must not satisfy the criterion (comments stripped)
+    d = as_dict(analyse_terminal(GOOD_TERMINAL_COMMENT_ONLY))
+    expect(not d["U5a LaunchedEffect(pendingUrl) block present"],
+           "comment-only anchor must NOT read as green (comments must be stripped)")
+
     if failures:
         print("OPEN_URL_BROKER_SCHEME_SELFTEST=FAIL")
         for f in failures:
@@ -332,6 +515,12 @@ def main():
     with open(path, "r", encoding="utf-8") as f:
         code = f.read()
     results = analyse(code)
+    tpath = os.path.join(root, TERMINAL_REL)
+    if os.path.isfile(tpath):
+        with open(tpath, "r", encoding="utf-8") as f:
+            results = results + analyse_terminal(f.read())
+    else:
+        print("  [--] U5 skipped — %s not staged in this tree" % TERMINAL_REL)
     failed = [(c, d) for c, ok, d in results if not ok]
     for c, ok, d in results:
         print("  [%s] %s%s" % ("ok" if ok else "RED", c,
