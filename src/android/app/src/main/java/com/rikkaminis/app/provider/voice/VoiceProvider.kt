@@ -1,5 +1,6 @@
 package com.rikkaminis.app.provider.voice
 
+import com.rikkaminis.app.provider.applyUserAgentOverride
 import com.rikkaminis.app.provider.executeOrCancel
 
 import android.util.Base64
@@ -33,6 +34,21 @@ open class VoiceProvider(
     val providerId: String,
     val baseURL: String,
     val apiKey: String? = null,
+    /**
+     * [da1029 I05] Per-instance User-Agent override, mirroring the chat
+     * providers' `customUserAgent`. Before this, the voice family was the one
+     * outbound subsystem that never carried it: the chat / model-list /
+     * connectivity paths all go through `applyUserAgentOverride`, so a user
+     * fronting an OpenAI-compatible relay with a CF WAF / UA allow-list got a
+     * working chat but a 403 on ASR/TTS (the request went out as `okhttp/4.12.0`).
+     *
+     * Declared as a constructor parameter with a default so the 11 vendor
+     * subclasses keep their 3-argument `super(...)` calls unchanged; the
+     * factory assigns it after construction ([VoiceProviderFactory.make]).
+     * null/blank falls back to [com.rikkaminis.app.provider.MinisUserAgent.DEFAULT]
+     * inside the single-source helper — the same fallback the chat link uses.
+     */
+    var customUserAgent: String? = null,
 ) {
     companion object {
         private const val TAG = "VoiceProvider"
@@ -222,7 +238,19 @@ open class VoiceProvider(
     }
 
     suspend fun executeRequest(request: Request): ByteArray = withContext(Dispatchers.IO) {
-        val call = httpClient.newCall(request)
+        // [da1029 I05] Single HTTP chokepoint for the whole voice family
+        // (ASR, TTS, chat-based ASR and every vendor override that builds its
+        // own request all end up here), so the per-instance UA is applied in
+        // exactly one place. A null/blank override falls back to the branded
+        // MinisUserAgent.DEFAULT — identical to the chat link, where the
+        // factory hands the instance value to each provider and the provider
+        // applies it right before building its request, so a relay
+        // allow-listing the app's UA sees the same identity on the voice
+        // endpoints as on /chat/completions.
+        val effectiveRequest = request.newBuilder()
+            .applyUserAgentOverride(customUserAgent)
+            .build()
+        val call = httpClient.newCall(effectiveRequest)
         // [FIX-1 / F-209] Cancellable execute — see provider/CallCancellation.kt:
         // executeOrCancel rethrows a real CancellationException (never a
         // fallback) and cancels the Call when the coroutine completes.

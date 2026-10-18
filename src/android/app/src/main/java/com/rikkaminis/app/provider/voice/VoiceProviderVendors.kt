@@ -2,6 +2,7 @@ package com.rikkaminis.app.provider.voice
 
 import android.util.Base64
 import android.util.Log
+import com.rikkaminis.app.provider.applyUserAgentOverride
 import com.rikkaminis.app.provider.gemini.GeminiBasePath
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
@@ -372,7 +373,15 @@ class XunfeiVoiceProvider(
         val result = withTimeoutOrNull(TTS_TIMEOUT_MS) {
             suspendCancellableCoroutine { cont ->
                 val pcm = ByteArrayOutputStream()
-                val wsRequest = Request.Builder().url(signedUrl).build()
+                // [da1029 I05] The TTS WebSocket is the ONE voice request that
+                // never passes through [VoiceProvider.executeRequest] (it goes
+                // to httpClient.newWebSocket), so it needs the override of its
+                // own. Purely a header — Xunfei authenticates with the signed
+                // URL, so no signature input changes.
+                val wsRequest = Request.Builder()
+                    .url(signedUrl)
+                    .applyUserAgentOverride(customUserAgent)
+                    .build()
                 val socket = httpClient.newWebSocket(
                     wsRequest,
                     object : WebSocketListener() {
