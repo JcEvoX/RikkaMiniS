@@ -40,11 +40,33 @@ class SessionFileStore internal constructor(
     /** Media root: filesDir/media/<date>/<sid>/. */
     private val mediaRoot: File = File(filesDirForTestingOrProd, "media")
 
+    /**
+     * Root of the browser tab-pool saved-state files:
+     * filesDir/browser_tabs/<sid>.json (written by BrowserTabPool.saveState).
+     * [da1025-D] A session's on-disk footprint is also THIS file — it holds
+     * the full tab URLs the session visited — yet it lived outside both
+     * deleteSessionFiles and orphan reclamation, so a deleted session's URL
+     * history stayed on disk forever (invisible even to the storage page's
+     * orphan sweep). Centralised here alongside the other two roots so the
+     * session-file lifecycle is owned in one place.
+     */
+    private val browserTabsRoot: File = File(filesDirForTestingOrProd, "browser_tabs")
+
     /** Test-only accessor for the media root (mirrors [mediaRoot]). */
     internal fun mediaRootForTesting(): File = mediaRoot
 
+    /** Test-only accessor for the browser-tabs root (mirrors [browserTabsRoot]). */
+    internal fun browserTabsRootForTesting(): File = browserTabsRoot
+
     /** Per-session directory under [sessionsRoot]. */
     fun sessionDir(sessionId: String): File = File(sessionsRoot, sessionId)
+
+    /**
+     * The browser tab-pool saved-state file for [sessionId]:
+     * filesDir/browser_tabs/<sid>.json (same path BrowserTabPool writes/reads
+     * — single source for the path shape, no literal drift).
+     */
+    fun browserTabFile(sessionId: String): File = File(browserTabsRoot, "$sessionId.json")
 
     /**
      * Recursive on-disk size of [dir] in bytes.
@@ -215,9 +237,10 @@ class SessionFileStore internal constructor(
         return out
     }
 
-    /** Recursively delete a session's bind-mounted dir + its media. No-op if absent. */
+    /** Recursively delete a session's bind-mounted dir + its media + its browser tab-pool state. No-op if absent. */
     fun deleteSessionFiles(sessionId: String): DeleteResult {
-        val sessionDeleted = deleteRecursivelyChecked(sessionDir(sessionId))
+        val sessionDeleted = deleteRecursivelyChecked(sessionDir(sessionId)) &&
+            deleteRecursivelyChecked(browserTabFile(sessionId))
         val mediaDeleted = mediaSessionDirs(sessionId).fold(true) { acc, dir ->
             deleteRecursivelyChecked(dir) && acc
         }
@@ -244,7 +267,18 @@ class SessionFileStore internal constructor(
         }
     }
 
-    /** Outcome of a session-file delete: which parts actually went away. */
+    /**
+     * Outcome of a session-file delete: which parts actually went away.
+     *
+     * [da1025-D] `sessionDeleted` now covers BOTH the bind-mounted session dir
+     * (minis-sessions/<sid>/) AND the browser tab-pool state file
+     * (browser_tabs/<sid>.json — the session's visited-URL history). Callers
+     * (ChatRepository.deleteSession, StorageManagementScreen) read only
+     * `fullyDeleted`, so folding the tab file into `sessionDeleted` widens the
+     * partial-failure signal without changing any caller contract. A session
+     * with no browsing history has no tab file: `deleteRecursivelyChecked`
+     * returns true for an absent file, so the outcome is unchanged there.
+     */
     data class DeleteResult(
         val sessionDeleted: Boolean,
         val mediaDeleted: Boolean,
@@ -267,6 +301,11 @@ class SessionFileStore internal constructor(
             // Re-delete media leaves (walk again; ids may overlap session dirs).
             deleteOrphanMediaLeaves(liveSessionIds)
         }
+        // [da1025-D] Also reclaim orphaned browser tab-pool state files
+        // (browser_tabs/<sid>.json for deleted sessions) — previously they
+        // leaked forever (full visited-URL history of a dead session left on
+        // disk, invisible to this sweep).
+        deleteOrphanBrowserTabFiles(liveSessionIds)
         return report
     }
 
@@ -346,6 +385,31 @@ class SessionFileStore internal constructor(
         if (!mediaRoot.exists()) return
         mediaRoot.walkTopDown().forEach { dir ->
             if (isOrphanMediaLeaf(dir, liveSessionIds)) dir.deleteRecursively()
+        }
+    }
+
+    /**
+     * [da1025-D] Delete orphaned browser tab-pool state files:
+     * browser_tabs/<stem>.json where the stem is a session id (UUID shape) or
+     * a draft id (`__new__<uuid>` — BrowserTabPool writes under the draft id
+     * before ChatSessionEntryExt renames it on promotion) and the session is
+     * not among [liveSessionIds]. Same fail-safe shape guard as
+     * [looksLikeSessionId]: unknown-looking stems are never reclaimed, so a
+     * stray file under browser_tabs/ can never be deleted by mistake.
+     *
+     * Deliberately NOT counted in [ReclaimReport] (minimal radius): the
+     * storage page's "orphan data" banner keeps reporting session+media bytes
+     * only — registered as backlog §1025-D rather than widening the report
+     * shape (which would drag UI text + existing test assertions along).
+     */
+    private fun deleteOrphanBrowserTabFiles(liveSessionIds: Set<String>) {
+        if (!browserTabsRoot.exists()) return
+        browserTabsRoot.listFiles()?.forEach { file ->
+            if (!file.isFile) return@forEach
+            val stem = file.name.removeSuffix(".json")
+            if (stem == file.name) return@forEach // not a .json state file
+            val isSessionShaped = looksLikeSessionId(stem) || stem.startsWith("__new__")
+            if (isSessionShaped && stem !in liveSessionIds) file.delete()
         }
     }
 
