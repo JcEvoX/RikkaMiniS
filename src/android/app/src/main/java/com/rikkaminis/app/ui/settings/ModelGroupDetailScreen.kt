@@ -116,22 +116,27 @@ fun ModelGroupDetailScreen(
     val persistedGroup: ModelGroup = group
     fun currentGroup(): ModelGroup = config.modelGroups.find { it.id == groupId } ?: persistedGroup
 
-    var name by remember(group.id) { mutableStateOf(group.name) }
+    var name by remember(group.id, group.name) { mutableStateOf(group.name) }
     val snackbarHostState = remember { SnackbarHostState() }
     val coroutineScope = rememberCoroutineScope()
     val focusManager = LocalFocusManager.current
     val nameSavedMsg = stringResource(R.string.model_group_name_saved)
-    var strategy by remember(group.id) { mutableStateOf(group.strategy) }
-    var fallbackStrategy by remember(group.id) { mutableStateOf(group.fallbackStrategy) }
-    // T312: Session Defaults — keyed on group.id so navigating to another
-    // group via NavBackStack rebuilds these from the new group's persisted
-    // values. Using `group` as key would also re-fire on every config
-    // refresh (since `group` is recomputed from the StateFlow each
-    // recomposition); id-keyed remember is the stable alternative.
-    var defaultThinkingLevel by remember(group.id) {
+    var strategy by remember(group.id, group.strategy) { mutableStateOf(group.strategy) }
+    var fallbackStrategy by remember(group.id, group.fallbackStrategy) {
+        mutableStateOf(group.fallbackStrategy)
+    }
+    // T312: Session Defaults — keyed on (group.id, group.<field>): navigating
+    // to another group via NavBackStack rebuilds these from the new group's
+    // persisted values, AND an external write to the same field (minis-config /
+    // Debug RPC / backup restore) re-seeds the editor instead of leaving the
+    // stale text on screen for the focus-loss save to write back. Keying on the
+    // whole `group` object would also re-fire on unrelated config refreshes
+    // (member reorder, another group edited), which is why the key is the id
+    // plus the exact field this editor owns.
+    var defaultThinkingLevel by remember(group.id, group.defaultThinkingLevel) {
         mutableStateOf(group.defaultThinkingLevel)
     }
-    var contextLimitTokens by remember(group.id) {
+    var contextLimitTokens by remember(group.id, group.contextLimitTokens) {
         mutableStateOf(group.contextLimitTokens)
     }
 
