@@ -69,10 +69,22 @@ fun EnvironmentVariablesScreen(
     val visibleKeys = remember { mutableStateOf(setOf<String>()) }
     val clipboardManager = LocalClipboardManager.current
 
-    LaunchedEffect(Unit) {
-        DeepLinkCoordinator.consumePendingEnvVarCreate()?.let {
+    // [da1028-C] Reactively observe the pending create request instead of a
+    // one-shot `LaunchedEffect(Unit)` + `.value` read. The old shape only ran
+    // once per composition: a deep link arriving while this screen was already
+    // up (warm start, Activity not recreated) never re-ran the effect and the
+    // request was silently dropped. Keying the effect on the value re-runs it
+    // when a request lands; `consume` → null re-runs it as a harmless no-op.
+    val pendingCreate by DeepLinkCoordinator.pendingEnvVarCreate.collectAsState()
+    LaunchedEffect(pendingCreate) {
+        pendingCreate?.let {
+            // The request is an ADD intent, so drop any stale edit target first —
+            // otherwise the sheet opens in edit mode and `editEntry` wins the
+            // key/value defaults, prefilling nothing and saving over that entry.
+            editEntryId = null
             prefill = it
             showAddSheet = true
+            DeepLinkCoordinator.consumePendingEnvVarCreate()
         }
     }
 
@@ -320,12 +332,31 @@ private fun EnvVarFormSheet(
     // and the user must drag it up to reach the value/note fields and the
     // save button. Open fully instead — the form is a single screenful.
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    var keyText by remember { mutableStateOf(editEntry?.key ?: prefillKey) }
-    var valueText by remember {
-        mutableStateOf(editEntry?.let { envVarRepository.getValue(it.key) } ?: prefillValue)
+    // [da1028-C] Every field is keyed on the entry it was seeded from (plus the
+    // deep-link prefill): a keyless `remember` kept the FIRST entry's text after
+    // `editEntry` switched identity (another entry updated / backup restore /
+    // approval write), so pressing Save wrote the stale text back over the
+    // external write. Same family as 1027-E's group/mount editors.
+    //
+    // `valueText` keys on the LIVE secret (`currentSecretValue`) rather than a
+    // snapshot, which is what makes an external write visible at all. Trade-off
+    // (recorded, accepted): while the user is typing, an external write to the
+    // same key re-seeds the box with the new value. The alternative — keying on
+    // `editEntry` alone — cannot see a value-only change, since the entry object
+    // is not rebuilt when only the secret moves.
+    val currentSecretValue = editEntry?.let { envVarRepository.getValue(it.key) } ?: prefillValue
+    var keyText by remember(editEntry?.id, editEntry?.key, prefillKey) {
+        mutableStateOf(editEntry?.key ?: prefillKey)
     }
-    var noteText by remember { mutableStateOf(editEntry?.note ?: prefillNote) }
-    var groupText by remember { mutableStateOf(editEntry?.group ?: "") }
+    var valueText by remember(editEntry?.id, currentSecretValue, prefillValue) {
+        mutableStateOf(currentSecretValue)
+    }
+    var noteText by remember(editEntry?.id, editEntry?.note, prefillNote) {
+        mutableStateOf(editEntry?.note ?: prefillNote)
+    }
+    var groupText by remember(editEntry?.id, editEntry?.group) {
+        mutableStateOf(editEntry?.group ?: "")
+    }
 
     val isEditing = editEntry != null
     val normalizedKey = keyText.trim().uppercase()

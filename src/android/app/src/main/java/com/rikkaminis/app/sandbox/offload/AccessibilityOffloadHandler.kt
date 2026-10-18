@@ -450,6 +450,11 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
 
         val dir = (context.getExternalFilesDir("a11y_screenshots") ?: java.io.File(context.cacheDir, "a11y_screenshots"))
         if (!dir.exists()) dir.mkdirs()
+        // [da1028-C] Plaintext screenshots are the most sensitive thing this
+        // handler writes and nothing ever deleted them (externalFilesDir is not
+        // the OS-reclaimable cache). Same 24h contract as cache/share. This runs
+        // on the offload server's worker thread, never the main thread.
+        com.rikkaminis.app.ui.components.pruneShareDir(dir)
         val file = java.io.File(dir, "a11y_${System.currentTimeMillis()}.png")
         return try {
             java.io.FileOutputStream(file).use { it.write(pngBytes) }

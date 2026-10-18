@@ -28,6 +28,18 @@ Judged invariants:
      branch report's negative decisions).
   7. [da1024-E] The MODEL_ENTRY_DETAIL block still reads both args via
      getString and keeps the `?: return@composable` fail-closed guard.
+  8. [da1028-C] EnvironmentVariablesScreen must OBSERVE its pending deep-link
+     create request: `pendingEnvVarCreate` read through `collectAsState()`,
+     and no `LaunchedEffect(Unit)` that consumes it (a one-shot effect never
+     re-runs, so a warm-start deep link into an already-composed screen is
+     dropped). EnvVarFormSheet's four field shadows (`keyText`, `valueText`,
+     `noteText`, `groupText`) must each be keyed on what they are seeded from
+     — keyless keeps the FIRST entry's text after `editEntry` switches.
+  9. [da1028-C] ChatScreen must observe `pendingChatAction` the same way
+     (`collectAsState()`; no `.value` snapshot). Regression anchor: the
+     neighbouring `pendingHtmlPreview` subscription must stay reactive — that
+     is the shape this file already uses and nothing may "simplify" it back.
+  10. Anchors missing in either file = RED (a rename must not retire 8/9).
 """
 import re
 import subprocess
@@ -50,6 +62,37 @@ REL_DLH = "src/android/app/src/main/java/com/rikkaminis/app/deeplink/DeepLinkHan
 REL_NAV = "src/android/app/src/main/java/com/rikkaminis/app/ui/navigation/AppNavigation.kt"
 REL_MAIN = "src/android/app/src/main/java/com/rikkaminis/app/MainActivity.kt"
 REL_HTTP_PY = "src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/transport/http.py"
+# [da1028-C] reactive deep-link consumers
+REL_ENV_SCREEN = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/EnvironmentVariablesScreen.kt"
+REL_CHAT_SCREEN = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatScreen.kt"
+# the four shadow copies EnvVarFormSheet seeds from its entry
+ENV_FORM_FIELDS = ("keyText", "valueText", "noteText", "groupText")
+
+def launch_effect_blocks(code, arg):
+    """[(lineno, block_text)] for every `LaunchedEffect(<arg>) { ... }`.
+
+    A block ends at the first following `}` sitting at the opener's own
+    indentation (same rule as composable_blocks).
+    """
+    blocks = []
+    indexed = code_lines(code)
+    pat = re.compile(r"LaunchedEffect\s*\(\s*" + re.escape(arg) + r"\s*\)")
+    i = 0
+    while i < len(indexed):
+        lineno, line = indexed[i]
+        if not pat.search(line):
+            i += 1
+            continue
+        indent = len(line) - len(line.lstrip())
+        j = i + 1
+        while j < len(indexed):
+            text = indexed[j][1]
+            if text.strip() == "}" and (len(text) - len(text.lstrip())) == indent:
+                break
+            j += 1
+        blocks.append((lineno, "\n".join(t for _, t in indexed[i:j + 1])))
+        i = j + 1
+    return blocks
 
 # Parameterised Routes segment builders that MUST encode their id.
 # [da1021-C] Extended to ALL 17 path-segment builders (the 6 da1020-F ones +
@@ -228,6 +271,70 @@ def check(root: Path) -> None:
             fail(REL_NAV,
                  "MODEL_ENTRY_DETAIL lost its `?: return@composable` fail-closed guard")
 
+    # --- 8. [da1028-C] EnvironmentVariablesScreen observes its deep link ----
+    # The deep-link create request is a StateFlow. A `LaunchedEffect(Unit)` +
+    # `.value` read fires only on first composition, so a request delivered to
+    # a screen that is already up (warm start — the Activity is not recreated)
+    # is silently dropped. The screen must subscribe to the flow instead.
+    env = code_only(read(root, REL_ENV_SCREEN))
+    if not env:
+        fail(REL_ENV_SCREEN,
+             "missing source file (fail-closed: this file hosts criteria 8/10)")
+    else:
+        if not re.search(r"pendingEnvVarCreate\s*\.\s*collectAsState\s*\(", env):
+            fail(REL_ENV_SCREEN,
+                 "pendingEnvVarCreate is not observed through collectAsState() — the "
+                 "screen cannot see a request that arrives after first composition")
+        if not re.search(r"\bconsumePendingEnvVarCreate\s*\(", env):
+            fail(REL_ENV_SCREEN,
+                 "consumePendingEnvVarCreate() call not found (fail-closed: criterion 8 "
+                 "pins the one-shot-vs-reactive shape, re-derive it if the consume path "
+                 "was renamed)")
+        else:
+            for lineno, blk in launch_effect_blocks(env, "Unit"):
+                if "consumePendingEnvVarCreate(" in blk:
+                    fail(REL_ENV_SCREEN,
+                         f"LaunchedEffect(Unit) at line {lineno} still consumes the pending "
+                         "create request — a one-shot effect never re-runs, so a warm-start "
+                         "deep link into this screen is dropped")
+        # 10. the form's four shadow copies must be keyed on their source
+        if "fun EnvVarFormSheet(" not in env:
+            fail(REL_ENV_SCREEN,
+                 "EnvVarFormSheet( not found (fail-closed: criterion 10 pins its field "
+                 "seeding)")
+        else:
+            for field in ENV_FORM_FIELDS:
+                m = re.search(rf"var\s+{field}\s+by\s+remember\s*\(([^)]*)\)", env)
+                if not m:
+                    fail(REL_ENV_SCREEN,
+                         f"`var {field} by remember(...)` not found — the field is keyless "
+                         "or renamed (fail-closed: it must be keyed on what it seeds from)")
+                elif not m.group(1).strip():
+                    fail(REL_ENV_SCREEN,
+                         f"`var {field} by remember()` carries no keys — it keeps the first "
+                         "entry's text after editEntry switches identity, and Save writes "
+                         "that stale text back over an external write")
+
+    # --- 9. [da1028-C] ChatScreen observes its pending quick action ---------
+    chat = code_only(read(root, REL_CHAT_SCREEN))
+    if not chat:
+        fail(REL_CHAT_SCREEN,
+             "missing source file (fail-closed: this file hosts criterion 9)")
+    else:
+        if not re.search(r"pendingChatAction\s*\.\s*collectAsState\s*\(", chat):
+            fail(REL_CHAT_SCREEN,
+                 "pendingChatAction is not observed through collectAsState() — a quick "
+                 "action delivered to an already-composed ChatScreen never opens the camera")
+        if re.search(r"pendingChatAction\s*\.\s*value\b", chat):
+            fail(REL_CHAT_SCREEN,
+                 "pendingChatAction is still read via a `.value` snapshot — that read only "
+                 "happens when the effect first composes")
+        if not re.search(r"pendingHtmlPreview\w*\s*\.\s*collectAsState\s*\(", chat):
+            fail(REL_CHAT_SCREEN,
+                 "pendingHtmlPreview lost its collectAsState() subscription (regression "
+                 "anchor: this subscription is the shape criterion 9 mirrors, it must not "
+                 "be 'simplified' back to .value)")
+
 
 # ---------------- selftest fixtures (minimal synthetic repo) ----------------
 
@@ -314,9 +421,145 @@ private fun handleDeepLink() {
 }
 '''
 
+# --- [da1028-C] fixtures: reactive deep-link consumers ----------------------
 
-def write_fixture(root: Path, dlh: str, nav: str, main: str) -> None:
-    for rel, content in ((REL_DLH, dlh), (REL_NAV, nav), (REL_MAIN, main)):
+FIXTURE_ENV_SCREEN = '''package com.rikkaminis.app.ui.settings
+
+@Composable
+fun EnvironmentVariablesScreen() {
+    val pendingCreate by DeepLinkCoordinator.pendingEnvVarCreate.collectAsState()
+    LaunchedEffect(pendingCreate) {
+        pendingCreate?.let {
+            editEntryId = null
+            prefill = it
+            showAddSheet = true
+            DeepLinkCoordinator.consumePendingEnvVarCreate()
+        }
+    }
+}
+
+@Composable
+fun EnvVarFormSheet(editEntry: EnvVarEntry?, editEntryId: String?) {
+    val currentSecretValue = editEntry?.let { envVarRepository.getValue(it.key) } ?: prefillValue
+    var keyText by remember(editEntry?.id, editEntry?.key, prefillKey) {
+        mutableStateOf(editEntry?.key ?: prefillKey)
+    }
+    var valueText by remember(editEntry?.id, currentSecretValue, prefillValue) {
+        mutableStateOf(currentSecretValue)
+    }
+    var noteText by remember(editEntry?.id, editEntry?.note, prefillNote) {
+        mutableStateOf(editEntry?.note ?: prefillNote)
+    }
+    var groupText by remember(editEntry?.id, editEntry?.group) {
+        mutableStateOf(editEntry?.group ?: "")
+    }
+}
+'''
+
+# the pre-fix shape: one-shot consume, invisible to a warm start
+FIXTURE_ENV_SINGLE_SHOT = '''package com.rikkaminis.app.ui.settings
+
+@Composable
+fun EnvironmentVariablesScreen() {
+    LaunchedEffect(Unit) {
+        DeepLinkCoordinator.consumePendingEnvVarCreate()?.let {
+            prefill = it
+            showAddSheet = true
+        }
+    }
+}
+
+@Composable
+fun EnvVarFormSheet(editEntry: EnvVarEntry?, editEntryId: String?) {
+    var keyText by remember(editEntry?.id, editEntry?.key, prefillKey) { mutableStateOf("") }
+    var valueText by remember(editEntry?.id, currentSecretValue, prefillValue) { mutableStateOf("") }
+    var noteText by remember(editEntry?.id, editEntry?.note, prefillNote) { mutableStateOf("") }
+    var groupText by remember(editEntry?.id, editEntry?.group) { mutableStateOf("") }
+}
+'''
+
+# the form still seeds each field once
+FIXTURE_ENV_KEYLESS_FIELDS = FIXTURE_ENV_SCREEN.replace(
+    "var keyText by remember(editEntry?.id, editEntry?.key, prefillKey) {",
+    "var keyText by remember {",
+).replace(
+    "var groupText by remember(editEntry?.id, editEntry?.group) {",
+    "var groupText by remember {",
+)
+
+# `remember()` with an empty key list is the same defect wearing a hat
+FIXTURE_ENV_EMPTY_KEY_LIST = FIXTURE_ENV_SINGLE_SHOT \
+    .replace("var keyText by remember(editEntry?.id, editEntry?.key, prefillKey)",
+             "var keyText by remember()") \
+    .replace("var valueText by remember(editEntry?.id, currentSecretValue, prefillValue)",
+             "var valueText by remember()") \
+    .replace("var noteText by remember(editEntry?.id, editEntry?.note, prefillNote)",
+             "var noteText by remember()") \
+    .replace("var groupText by remember(editEntry?.id, editEntry?.group)",
+             "var groupText by remember()")
+
+FIXTURE_CHAT_SCREEN = '''package com.rikkaminis.app.ui.chat
+@Composable
+fun ChatScreen(sessionId: String) {
+    val pendingChatActionState by com.rikkaminis.app.deeplink.DeepLinkCoordinator
+        .pendingChatAction.collectAsState()
+    LaunchedEffect(sessionId, pendingChatActionState) {
+        if (pendingChatActionState == com.rikkaminis.app.deeplink.DeepLinkCoordinator
+                .ChatAction.OPEN_CAMERA
+        ) {
+            com.rikkaminis.app.deeplink.DeepLinkCoordinator.consumePendingChatAction()
+            launchCamera()
+        }
+    }
+    val pendingHtmlPreviewState by com.rikkaminis.app.deeplink.DeepLinkCoordinator
+        .pendingHtmlPreview.collectAsState()
+    LaunchedEffect(sessionId, pendingHtmlPreviewState) {
+        pendingHtmlPreviewState?.let { openHtmlPreview(it) }
+    }
+}
+'''
+
+# the pre-fix shape: `.value` snapshot
+FIXTURE_CHAT_STATIC_READ = '''package com.rikkaminis.app.ui.chat
+
+@Composable
+fun ChatScreen(sessionId: String) {
+    LaunchedEffect(sessionId) {
+        val pending = com.rikkaminis.app.deeplink.DeepLinkCoordinator
+            .pendingChatAction.value
+        if (pending == com.rikkaminis.app.deeplink.DeepLinkCoordinator
+                .ChatAction.OPEN_CAMERA
+        ) {
+            com.rikkaminis.app.deeplink.DeepLinkCoordinator.consumePendingChatAction()
+            launchCamera()
+        }
+    }
+    val pendingHtmlPreviewState by com.rikkaminis.app.deeplink.DeepLinkCoordinator
+        .pendingHtmlPreview.collectAsState()
+    LaunchedEffect(sessionId, pendingHtmlPreviewState) {
+        pendingHtmlPreviewState?.let { openHtmlPreview(it) }
+    }
+}
+'''
+
+# regression anchor: the neighbouring subscription was "simplified" away
+FIXTURE_CHAT_HTML_PREVIEW_REGRESSED = FIXTURE_CHAT_SCREEN.replace(
+    "    val pendingHtmlPreviewState by com.rikkaminis.app.deeplink.DeepLinkCoordinator\n"
+    "        .pendingHtmlPreview.collectAsState()\n"
+    "    LaunchedEffect(sessionId, pendingHtmlPreviewState) {\n"
+    "        pendingHtmlPreviewState?.let { openHtmlPreview(it) }\n"
+    "    }\n",
+    "    LaunchedEffect(sessionId) {\n"
+    "        com.rikkaminis.app.deeplink.DeepLinkCoordinator.pendingHtmlPreview.value\n"
+    "            ?.let { openHtmlPreview(it) }\n"
+    "    }\n",
+)
+
+
+def write_fixture(root: Path, dlh: str, nav: str, main: str,
+                  env: str = FIXTURE_ENV_SCREEN, chat: str = FIXTURE_CHAT_SCREEN) -> None:
+    for rel, content in ((REL_DLH, dlh), (REL_NAV, nav), (REL_MAIN, main),
+                         (REL_ENV_SCREEN, env), (REL_CHAT_SCREEN, chat)):
         p = root / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
@@ -476,6 +719,84 @@ def selftest() -> None:
             print(f"SELFTEST fixture J (guard dropped) wrong verdict: {VIOLATIONS}")
         else:
             print("SELFTEST J (fail-closed guard dropped) RED as expected")
+
+        # --- [da1028-C] fixtures K..O: reactive deep-link consumers ---------
+        # fixture K: the one-shot consume shape -> two violations (no
+        # collectAsState + a LaunchedEffect(Unit) that consumes).
+        write_fixture(root, FIXTURE_DLH, FIXTURE_NAV, FIXTURE_MAIN,
+                      env=FIXTURE_ENV_SINGLE_SHOT)
+        VIOLATIONS.clear()
+        check(root)
+        sub = [v for v in VIOLATIONS if "pendingEnvVarCreate is not observed" in v]
+        one = [v for v in VIOLATIONS if "still consumes the pending create request" in v]
+        if not sub or not one:
+            ok = False
+            print(f"SELFTEST K (one-shot consume) wrong verdict: {VIOLATIONS}")
+        else:
+            print("SELFTEST K (one-shot deep-link consume) RED as expected")
+
+        # fixture L: the form seeds each field once (the pre-fix keyless shape)
+        write_fixture(root, FIXTURE_DLH, FIXTURE_NAV, FIXTURE_MAIN,
+                      env=FIXTURE_ENV_KEYLESS_FIELDS)
+        VIOLATIONS.clear()
+        check(root)
+        keyless = [v for v in VIOLATIONS if "the field is keyless or renamed" in v]
+        if len(keyless) != 2 or not all("keyText" in v or "groupText" in v for v in keyless):
+            ok = False
+            print(f"SELFTEST L (keyless form fields) expected 2 violations, got {keyless}")
+        else:
+            print("SELFTEST L (keyless form fields) RED as expected")
+
+        # fixture L2: `remember()` with an empty key list is the same defect
+        write_fixture(root, FIXTURE_DLH, FIXTURE_NAV, FIXTURE_MAIN,
+                      env=FIXTURE_ENV_EMPTY_KEY_LIST)
+        VIOLATIONS.clear()
+        check(root)
+        empty_keys = [v for v in VIOLATIONS if "carries no keys" in v]
+        if len(empty_keys) != 4:
+            ok = False
+            print(f"SELFTEST L2 (empty key list) expected 4 violations, got {empty_keys}")
+        else:
+            print("SELFTEST L2 (empty key list) RED as expected")
+
+        # fixture M: ChatScreen keeps the `.value` snapshot
+        write_fixture(root, FIXTURE_DLH, FIXTURE_NAV, FIXTURE_MAIN,
+                      chat=FIXTURE_CHAT_STATIC_READ)
+        VIOLATIONS.clear()
+        check(root)
+        static = [v for v in VIOLATIONS if "still read via a `.value` snapshot" in v]
+        missing = [v for v in VIOLATIONS if "pendingChatAction is not observed" in v]
+        if not static or not missing:
+            ok = False
+            print(f"SELFTEST M (static quick-action read) wrong verdict: {VIOLATIONS}")
+        else:
+            print("SELFTEST M (static quick-action read) RED as expected")
+
+        # fixture N: the neighbouring pendingHtmlPreview subscription regressed
+        write_fixture(root, FIXTURE_DLH, FIXTURE_NAV, FIXTURE_MAIN,
+                      chat=FIXTURE_CHAT_HTML_PREVIEW_REGRESSED)
+        VIOLATIONS.clear()
+        check(root)
+        if not [v for v in VIOLATIONS if "pendingHtmlPreview lost its collectAsState()" in v]:
+            ok = False
+            print(f"SELFTEST N (pendingHtmlPreview regression anchor) missed: {VIOLATIONS}")
+        else:
+            print("SELFTEST N (pendingHtmlPreview regression anchor) RED as expected")
+
+        # fixture O: precision — editing an unrelated file (the deep-link
+        # resolver) must not make criteria 8/9/10 speak up.
+        write_fixture(root, FIXTURE_DLH.replace(
+            '"memory" -> SettingsDeepLink.Route(Routes.MEMORY)',
+            '"memory", "memories" -> SettingsDeepLink.Route(Routes.MEMORY)',
+        ), FIXTURE_NAV, FIXTURE_MAIN)
+        VIOLATIONS.clear()
+        check(root)
+        noise = [v for v in VIOLATIONS if REL_ENV_SCREEN + ":" in v or REL_CHAT_SCREEN + ":" in v]
+        if noise:
+            ok = False
+            print(f"SELFTEST O (unrelated edit) leaked into the consumer criteria: {noise}")
+        else:
+            print("SELFTEST O (unrelated edit stays silent) GREEN as expected")
 
     if not ok:
         sys.exit("DEEPLINK_SETTINGS_ROUTES_SELFTEST=FAIL")

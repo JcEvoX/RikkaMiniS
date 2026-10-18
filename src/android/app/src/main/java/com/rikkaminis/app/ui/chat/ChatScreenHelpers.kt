@@ -282,6 +282,11 @@ import com.rikkaminis.app.ui.components.MinisTextButton
  */
 internal fun createCameraOutputUri(context: android.content.Context): Pair<Uri, java.io.File> {
     val dir = java.io.File(context.filesDir, "camera-photos").also { it.mkdirs() }
+    // [da1028-C] `camera-photos` sits in filesDir, so the OS has no reason to
+    // reclaim it and nothing else ever deleted these captures. Prune the 24h-old
+    // ones with the shared pruner (same contract as cache/share) — the walk is
+    // bounded by that TTL, so it stays cheap on the click path.
+    com.rikkaminis.app.ui.components.pruneShareDir(dir)
     val ts = System.currentTimeMillis()
     val file = java.io.File(dir, "photo-$ts.jpg")
     file.createNewFile()
