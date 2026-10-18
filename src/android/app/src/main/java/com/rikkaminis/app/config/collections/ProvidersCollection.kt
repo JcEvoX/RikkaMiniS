@@ -286,11 +286,17 @@ class ProvidersCollection(
                 // took effect in the collection, changed nothing at runtime, and
                 // could not be cleared from the UI. Same rule + wording as the
                 // debug `provider.instances.create/update` guards.
+                // [ARCH-01] The decision lives in [isCustomBaseURLWriteAllowed]
+                // (ProviderWriteRules) so this face, the debug
+                // `provider.instances.create/update` guards, and the `add`
+                // payload path share one predicate. Blank is a clear, not a
+                // write, so it stays allowed.
                 val inst = repo.instance(id) ?: throw ConfigError.InvalidValue("Provider not found")
-                if (!inst.providerType.supportsCustomBaseURL) {
+                val newBase = s.ifEmpty { null }
+                if (!isCustomBaseURLWriteAllowed(inst.providerType, newBase)) {
                     throw ConfigError.InvalidValue(CUSTOM_BASE_URL_OPENROUTER_MESSAGE)
                 }
-                mutate(id) { it.copy(customBaseURL = s.ifEmpty { null }) }
+                mutate(id) { it.copy(customBaseURL = newBase) }
             },
         )
 
@@ -437,8 +443,9 @@ class ProvidersCollection(
  * Single source for the rule and the wording: both the
  * `providers.<id>.customUserAgent` write field and the `add` payload path
  * ([resolveAddCustomUserAgent]) consult this instead of keeping a copy each.
- * The debug `provider.add` (ProviderMutationMethods) still carries its own
- * copy — registered as a follow-up, not silently diverged.
+ * [ARCH-01] The debug `provider.add` / `provider.instances.update`
+ * (ProviderMutationMethods) now delegate here too, so the minis-config and
+ * Debug RPC faces cannot drift.
  */
 internal const val CUSTOM_USER_AGENT_OAUTH_MESSAGE: String =
     "Custom User-Agent is only supported for third-party API-key providers. OAuth providers (Anthropic/Codex) use their own authentication UA and cannot be overridden."
@@ -466,25 +473,7 @@ internal fun resolveAddCustomUserAgent(
     return ua
 }
 
-// ─── [deep-audit-1026 ISSUE-05] Shared customBaseURL type rule ────────────
-
-/**
- * [da1023-C] Custom base URL is honored by every provider arm in
- * ProviderFactory except openRouter, whose request builder pins
- * https://openrouter.ai/api/v1. The predicate itself is **single-sourced** in
- * `ProviderMutationMethods.supportsCustomBaseURL` (debug face) — this file
- * imports it rather than restating `this != openRouter` a second time.
- *
- * `CUSTOM_BASE_URL_OPENROUTER_MESSAGE` is the wording single source for the
- * collection face, mirroring `CUSTOM_USER_AGENT_OAUTH_MESSAGE`: both the
- * `providers.<id>.customBaseURL` write field and the `add` payload path
- * consult it instead of keeping a copy each. The debug
- * `provider.instances.create/update` guards carry the same sentence, and the
- * `provider_rpc_symmetry_check` gate pins that they still do (C2/C5) — so the
- * two faces cannot drift to different user-visible errors silently.
- */
-internal const val CUSTOM_BASE_URL_OPENROUTER_MESSAGE: String =
-    "customBaseURL is not supported for providerType=openRouter"
+// ─── [deep-audit-1026 ISSUE-05] Shared customBaseURL add-path rule ────────
 
 /**
  * Pure slice of [ProvidersCollection.add]: resolve the optional
@@ -496,6 +485,11 @@ internal const val CUSTOM_BASE_URL_OPENROUTER_MESSAGE: String =
  * empty/JSON-null patch). A supplied base URL on a type that ignores it throws
  * [ConfigError.InvalidValue] — mirrors the debug `provider.add` gating, so a
  * bare openRouter create without a base URL keeps working.
+ *
+ * The predicate (`isCustomBaseURLWriteAllowed`) and the wording
+ * (`CUSTOM_BASE_URL_OPENROUTER_MESSAGE`) are single-sourced in
+ * `ProviderWriteRules.kt` [ARCH-01]; this file consults them instead of
+ * keeping a copy.
  */
 internal fun resolveAddCustomBaseURL(
     raw: String?,
