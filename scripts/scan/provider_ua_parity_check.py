@@ -55,6 +55,15 @@ OPENROUTER_MODELS_REL = (
 ADAPTERS_REL = (
     "src/android/app/src/main/java/com/rikkaminis/app/provider/ModelListProviderAdapters.kt"
 )
+VOICE_PROVIDER_REL = (
+    "src/android/app/src/main/java/com/rikkaminis/app/provider/voice/VoiceProvider.kt"
+)
+VOICE_VENDORS_REL = (
+    "src/android/app/src/main/java/com/rikkaminis/app/provider/voice/VoiceProviderVendors.kt"
+)
+VOICE_FACTORY_REL = (
+    "src/android/app/src/main/java/com/rikkaminis/app/provider/voice/VoiceProviderFactory.kt"
+)
 
 CTOR_RE = re.compile(r"\b(AnthropicProvider|GeminiProvider|OpenAIProvider)\s*\(")
 UA_ARG = "customUserAgent ="
@@ -381,6 +390,124 @@ def read(root, rel):
         return fh.read()
 
 
+def read_optional(root, rel):
+    """Drift-detector read: None when the file is absent (mini tree), so a
+    fixture that only carries the original outlet files does not turn the new
+    voice criteria into a false red. A file that EXISTS is judged fail-closed:
+    a missing anchor there is a violation, not a skip. (A deleted voice file
+    altogether is a loud compile error — every voice call site breaks — the
+    gate's job is the wiring contract, not the file's existence.)"""
+    path = os.path.join(root, rel)
+    if not os.path.isfile(path):
+        return None
+    with open(path, "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
+def decl_body(code, decl):
+    """Return the balanced {...} of the body that follows `decl` (the first
+    opening brace after the declaration — a withContext lambda for
+    `executeRequest`, the `.also {}` lambda for an expression-bodied `make`),
+    or None when the declaration or a body is not found (fail-closed)."""
+    i = code.find(decl)
+    if i < 0:
+        return None
+    j = code.find("{", i)
+    if j < 0:
+        return None
+    depth = 0
+    for k in range(j, len(code)):
+        if code[k] == "{":
+            depth += 1
+        elif code[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return code[j:k + 1]
+    return None
+
+
+INJECTION_RE = re.compile(
+    r"(?<!val )(?<!var )[\w?.]*customUserAgent\s*=\s*instance\.customUserAgent"
+)
+
+
+def check_voice(provider_src, vendors_src, factory_src):
+    """[da1029 ISSUE-05] The voice family was the one outbound subsystem with
+    zero customUserAgent wiring. Three criteria (fail-closed, comment-stripped):
+
+      V1  VoiceProvider.executeRequest — the single HTTP door every ASR/TTS
+          request in the family goes through — applies the override;
+      V2  the Xunfei TTS WebSocket request (the one voice request that bypasses
+          executeRequest, httpClient.newWebSocket) carries it too;
+      V3  VoiceProviderFactory.make wires the instance value in at its entry
+          (one post-construction injection covering every build() arm, incl.
+          the two early returns and the null arms — per-branch forwarding is
+          the deep-audit-1019 ISSUE-04 shape that silently drops new arms).
+
+    provider/ModelsDevApi.kt is deliberately NOT part of this contract: it has
+    no instance-level UA by design (TRIAGE §5) and must not be counted as a gap.
+    """
+    v = []
+    code_p = blank_strings(strip_comments(provider_src))
+    code_v = blank_strings(strip_comments(vendors_src))
+    code_f = blank_strings(strip_comments(factory_src))
+
+    # V1
+    if "customUserAgent: String? = null" not in code_p:
+        v.append(
+            "VoiceProvider.kt: no 'customUserAgent: String? = null' property "
+            "(da1029 ISSUE-05: without it the factory has nowhere to inject the "
+            "instance override)"
+        )
+    body = decl_body(code_p, "suspend fun executeRequest(")
+    if body is None:
+        v.append(
+            "VoiceProvider.kt: 'suspend fun executeRequest(' not found (gate "
+            "anchors moved — deliberate edit required)"
+        )
+    elif ".applyUserAgentOverride(customUserAgent)" not in body:
+        v.append(
+            "VoiceProvider.kt: executeRequest does not apply "
+            "'.applyUserAgentOverride(customUserAgent)' (da1029 ISSUE-05: it is "
+            "the single HTTP door for every ASR/TTS request in the family)"
+        )
+
+    # V2
+    url_at = code_v.find(".url(signedUrl)")
+    if url_at < 0:
+        v.append(
+            "VoiceProviderVendors.kt: Xunfei TTS WebSocket request "
+            "('.url(signedUrl)') not found (gate anchors moved — deliberate "
+            "edit required)"
+        )
+    else:
+        build_at = code_v.find(".build()", url_at)
+        if build_at < 0:
+            v.append("VoiceProviderVendors.kt: Xunfei WebSocket request statement unbalanced")
+        elif ".applyUserAgentOverride(" not in code_v[url_at:build_at]:
+            v.append(
+                "VoiceProviderVendors.kt: the Xunfei TTS WebSocket request drops "
+                "'.applyUserAgentOverride(' (da1029 ISSUE-05: it is the one voice "
+                "request that bypasses executeRequest)"
+            )
+
+    # V3
+    body = decl_body(code_f, "fun make(")
+    if body is None:
+        v.append(
+            "VoiceProviderFactory.kt: 'fun make(' body not found (gate anchors "
+            "moved — deliberate edit required)"
+        )
+    elif not INJECTION_RE.search(body):
+        v.append(
+            "VoiceProviderFactory.kt: make() does not inject "
+            "'instance.customUserAgent' at its entry (da1029 ISSUE-05: one "
+            "post-construction injection must cover every build() arm; per-arm "
+            "forwarding is the deep-audit-1019 ISSUE-04 shape that drops new arms)"
+        )
+    return v
+
+
 def run(root):
     if not os.path.isdir(root):
         print("provider_ua_parity_check: not a directory: %s" % root)
@@ -398,13 +525,24 @@ def run(root):
                   + check_gemini_models(gemini_models)
                   + check_openrouter_models(openrouter_models)
                   + check_adapters(adapters))
+    # [da1029 ISSUE-05] voice family — drift-detector read, judged fail-closed
+    # when present (see read_optional).
+    voice_provider = read_optional(root, VOICE_PROVIDER_REL)
+    voice_vendors = read_optional(root, VOICE_VENDORS_REL)
+    voice_factory = read_optional(root, VOICE_FACTORY_REL)
+    if voice_provider is not None and voice_vendors is not None \
+            and voice_factory is not None:
+        violations += check_voice(voice_provider, voice_vendors, voice_factory)
+    else:
+        print("note: voice family sources not present in this tree — "
+              "voice-UA criteria skipped (drift-detector semantics)")
     if violations:
         print("FAIL provider_ua_parity_check")
         for v in violations:
             print("  " + v)
         return 1
     print("PASS provider_ua_parity_check (UA forwarded on every provider arm, "
-          "Gemini EOF verdict weighs tool payload)")
+          "Gemini EOF verdict weighs tool payload, voice family carries the UA)")
     return 0
 
 
@@ -623,6 +761,91 @@ BAD_ADAPTERS_DROP = GOOD_ADAPTERS.replace(
         )""",
 )
 
+# -- [da1029 ISSUE-05] voice family fixtures: each new criterion gets its own
+#    "exactly broken by it" violating fixture plus a compliant one. -----------
+
+GOOD_VOICE_PROVIDER = """
+class VoiceProvider(
+    val providerId: String,
+    val baseURL: String,
+    val apiKey: String? = null,
+    var customUserAgent: String? = null,
+) {
+    suspend fun executeRequest(request: Request): ByteArray = withContext(Dispatchers.IO) {
+        val effectiveRequest = request.newBuilder()
+            .applyUserAgentOverride(customUserAgent)
+            .build()
+        val call = httpClient.newCall(effectiveRequest)
+        emptyList<Byte>()
+    }
+}
+"""
+
+BAD_VOICE_PROVIDER_DROP = GOOD_VOICE_PROVIDER.replace(
+    """        val effectiveRequest = request.newBuilder()
+            .applyUserAgentOverride(customUserAgent)
+            .build()
+        val call = httpClient.newCall(effectiveRequest)""",
+    """        val call = httpClient.newCall(request)""",
+)
+
+BAD_VOICE_PROVIDER_NO_FN = GOOD_VOICE_PROVIDER.replace(
+    "suspend fun executeRequest(", "suspend fun sendBytes("
+)
+
+GOOD_VOICE_VENDORS = """
+class XunfeiVoiceProvider {
+    override suspend fun synthesize(request: VoiceOutputRequest): ByteArray {
+        val signedUrl = buildSignedURL(host = "tts-api.xfyun.cn")
+        return withTimeoutOrNull(TTS_TIMEOUT_MS) {
+            suspendCancellableCoroutine { cont ->
+                val wsRequest = Request.Builder()
+                    .url(signedUrl)
+                    .applyUserAgentOverride(customUserAgent)
+                    .build()
+                val socket = httpClient.newWebSocket(wsRequest, listener)
+            }
+        }
+    }
+}
+"""
+
+BAD_VOICE_VENDORS_DROP = GOOD_VOICE_VENDORS.replace(
+    """                val wsRequest = Request.Builder()
+                    .url(signedUrl)
+                    .applyUserAgentOverride(customUserAgent)
+                    .build()""",
+    """                val wsRequest = Request.Builder().url(signedUrl).build()""",
+)
+
+BAD_VOICE_VENDORS_ANCHOR_MOVED = GOOD_VOICE_VENDORS.replace(
+    ".url(signedUrl)", ".url(signed)"
+)
+
+GOOD_VOICE_FACTORY = """
+object VoiceProviderFactory {
+    fun make(instance: ProviderInstance, rawApiKey: String?): VoiceProvider? =
+        build(instance, rawApiKey).also { it?.customUserAgent = instance.customUserAgent }
+
+    private fun build(instance: ProviderInstance, rawApiKey: String?): VoiceProvider? {
+        return when (instance.providerType) {
+            ProviderType.openAI -> VoiceProvider(instance.id, "https://x", rawApiKey)
+            else -> null
+        }
+    }
+}
+"""
+
+BAD_VOICE_FACTORY_DROP = GOOD_VOICE_FACTORY.replace(
+    "        build(instance, rawApiKey).also { it?.customUserAgent = instance.customUserAgent }",
+    "        build(instance, rawApiKey)",
+)
+
+BAD_VOICE_FACTORY_NULL = GOOD_VOICE_FACTORY.replace(
+    "it?.customUserAgent = instance.customUserAgent",
+    "it?.customUserAgent = null",
+)
+
 def selftest():
     failures = []
 
@@ -682,6 +905,42 @@ def selftest():
     bad_ad = check_adapters(BAD_ADAPTERS_DROP)
     expect_trip("adapters-drop fixture", bad_ad, "drops")
     expect_trip("adapters-drop fixture", bad_ad, "OpenRouterModelsApi")
+
+    good_vp = check_voice(GOOD_VOICE_PROVIDER, GOOD_VOICE_VENDORS, GOOD_VOICE_FACTORY)
+    expect_clean("compliant voice fixtures", good_vp)
+
+    bad_vp_drop = check_voice(BAD_VOICE_PROVIDER_DROP, GOOD_VOICE_VENDORS, GOOD_VOICE_FACTORY)
+    expect_trip("voice executeRequest-drop fixture (ISSUE-05 V1)", bad_vp_drop,
+                "executeRequest does not apply")
+
+    bad_vp_nofn = check_voice(BAD_VOICE_PROVIDER_NO_FN, GOOD_VOICE_VENDORS, GOOD_VOICE_FACTORY)
+    expect_trip("voice executeRequest-renamed fixture (ISSUE-05 V1)", bad_vp_nofn,
+                "executeRequest(' not found")
+
+    bad_vv_drop = check_voice(GOOD_VOICE_PROVIDER, BAD_VOICE_VENDORS_DROP, GOOD_VOICE_FACTORY)
+    expect_trip("xunfei WS-drop fixture (ISSUE-05 V2)", bad_vv_drop,
+                "WebSocket request drops")
+
+    bad_vv_moved = check_voice(GOOD_VOICE_PROVIDER, BAD_VOICE_VENDORS_ANCHOR_MOVED,
+                               GOOD_VOICE_FACTORY)
+    expect_trip("xunfei WS-anchor-moved fixture (ISSUE-05 V2)", bad_vv_moved,
+                "not found")
+
+    bad_vf_drop = check_voice(GOOD_VOICE_PROVIDER, GOOD_VOICE_VENDORS, BAD_VOICE_FACTORY_DROP)
+    expect_trip("voice factory injection-drop fixture (ISSUE-05 V3)", bad_vf_drop,
+                "does not inject")
+
+    bad_vf_null = check_voice(GOOD_VOICE_PROVIDER, GOOD_VOICE_VENDORS, BAD_VOICE_FACTORY_NULL)
+    expect_trip("voice factory fake-null wiring fixture (ISSUE-05 V3)", bad_vf_null,
+                "does not inject")
+
+    print("selftest compliant voice family   -> %d violation(s)" % len(good_vp))
+    print("selftest voice executeRequest-drop-> %d violation(s)" % len(bad_vp_drop))
+    print("selftest voice executeRequest-ren -> %d violation(s)" % len(bad_vp_nofn))
+    print("selftest xunfei WS-drop           -> %d violation(s)" % len(bad_vv_drop))
+    print("selftest xunfei WS-anchor-moved   -> %d violation(s)" % len(bad_vv_moved))
+    print("selftest voice factory drop       -> %d violation(s)" % len(bad_vf_drop))
+    print("selftest voice factory null       -> %d violation(s)" % len(bad_vf_null))
 
     print("selftest compliant factory        -> %d violation(s)" % len(good_factory))
     print("selftest compliant gemini         -> %d violation(s)" % len(good_gemini))
