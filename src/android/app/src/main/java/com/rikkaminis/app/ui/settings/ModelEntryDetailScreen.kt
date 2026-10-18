@@ -66,10 +66,27 @@ fun ModelEntryDetailScreen(
     val baseModel = entry.baseModel
     val overrides = entry.overrides
 
-    var modelId by remember { mutableStateOf(baseModel.id) }
-    var displayName by remember { mutableStateOf(overrides.displayName ?: baseModel.displayName) }
-    var maxOutputTokensText by remember { mutableStateOf(overrides.maxOutputTokens?.toString() ?: "") }
-    var contextWindowText by remember {
+    // [da1026-C] Every editable field below is keyed on (entry identity, the
+    // exact sources its initial value derives from). A keyless `remember`
+    // froze the FIRST composition's values for the lifetime of the screen: an
+    // external write while this page was open (minis-config / backup restore /
+    // provider RPC) left the old snapshot rendered, and Save then wrote those
+    // stale values back over the external change. Keys stay field-level
+    // (never the whole `entry` object) so an unrelated external edit cannot
+    // discard what the user is currently typing.
+    var modelId by remember(entry.id, baseModel.id) { mutableStateOf(baseModel.id) }
+    var displayName by remember(entry.id, baseModel.displayName, overrides.displayName) {
+        mutableStateOf(overrides.displayName ?: baseModel.displayName)
+    }
+    var maxOutputTokensText by remember(entry.id, overrides.maxOutputTokens) {
+        mutableStateOf(overrides.maxOutputTokens?.toString() ?: "")
+    }
+    var contextWindowText by remember(
+        entry.id,
+        baseModel.contextWindow,
+        baseModel.id,
+        overrides.contextWindow,
+    ) {
         mutableStateOf(
             (overrides.contextWindow ?: baseModel.contextWindow?.takeIf { it > 0 })
                 ?.toString()
@@ -82,11 +99,11 @@ fun ModelEntryDetailScreen(
                 ?: inferContextWindowTokens(baseModel).toString()
         )
     }
-    var thinkingEnabled by remember {
+    var thinkingEnabled by remember(entry.id, baseModel.supportsReasoning, overrides.supportsReasoning) {
         mutableStateOf(overrides.supportsReasoning ?: baseModel.supportsReasoning ?: false)
     }
-    var isHidden by remember { mutableStateOf(entry.isHidden) }
-    var showQuickTest by remember { mutableStateOf(false) }
+    var isHidden by remember(entry.id, entry.isHidden) { mutableStateOf(entry.isHidden) }
+    var showQuickTest by remember(entry.id) { mutableStateOf(false) }
 
     // Modality state — derive from override-or-base so the toggles reflect
     // what the model actually supports today, then let the user flip from
@@ -100,12 +117,12 @@ fun ModelEntryDetailScreen(
         .map { it.normalizeModalityName() }
     val effectiveOutput = (overrides.outputModalities ?: baseModel.outputModalities ?: emptyList())
         .map { it.normalizeModalityName() }
-    var imageInput by remember { mutableStateOf("image" in effectiveInput) }
-    var pdfInput by remember { mutableStateOf("pdf" in effectiveInput) }
-    var audioInput by remember { mutableStateOf("audio" in effectiveInput) }
-    var videoInput by remember { mutableStateOf("video" in effectiveInput) }
-    var imageOutput by remember { mutableStateOf("image" in effectiveOutput) }
-    var audioOutput by remember { mutableStateOf("audio" in effectiveOutput) }
+    var imageInput by remember(entry.id, effectiveInput) { mutableStateOf("image" in effectiveInput) }
+    var pdfInput by remember(entry.id, effectiveInput) { mutableStateOf("pdf" in effectiveInput) }
+    var audioInput by remember(entry.id, effectiveInput) { mutableStateOf("audio" in effectiveInput) }
+    var videoInput by remember(entry.id, effectiveInput) { mutableStateOf("video" in effectiveInput) }
+    var imageOutput by remember(entry.id, effectiveOutput) { mutableStateOf("image" in effectiveOutput) }
+    var audioOutput by remember(entry.id, effectiveOutput) { mutableStateOf("audio" in effectiveOutput) }
 
     SettingsScaffold(
         title = stringResource(R.string.model_entry_model_detail),
