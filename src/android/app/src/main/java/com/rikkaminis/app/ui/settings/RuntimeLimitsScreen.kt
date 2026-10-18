@@ -153,7 +153,20 @@ fun RuntimeLimitsScreen(onBack: () -> Unit) {
     // shape (see FIX-6 REPORT.md), and a generic helper would have to own all
     // of their key lists to be worth its weight.
     DisposableEffect(context) {
+        val app = context.applicationContext
         val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+            // [fix/da1026-prefs-priming] Prime FIRST, then read. SharedPreferencesImpl
+            // dispatches pending callbacks in unspecified order, so this
+            // screen's listener can run BEFORE ConfigBuiltins' own re-priming
+            // listener — without the primes here the getters below would read
+            // whatever cache state happened to be current, i.e. the value from
+            // before the write that just triggered this callback. And this
+            // screen's Save re-persists every knob it shows, so a stale read
+            // here is not cosmetic: it would silently roll the external write
+            // back on the next Save. (ConfigBuiltins primes too — this is the
+            // ordering-independent belt, not a duplicate of the core fix.)
+            ConcurrencyPrefs.prime(app)
+            AgentRuntimeLimitsPrefs.prime(app)
             subagentEnabled = SubagentPrefs.isEnabled(context)
             maxSessions = ConcurrencyPrefs.maxConcurrentSessions()
             maxTurns = AgentRuntimeLimitsPrefs.maxTurns()
@@ -195,7 +208,6 @@ fun RuntimeLimitsScreen(onBack: () -> Unit) {
             shellIdleTimeoutMin = AgentRuntimeLimitsPrefs.shellIdleTimeoutMin()
             heavyGateTimeoutSec = AgentRuntimeLimitsPrefs.heavyGateTimeoutSec()
         }
-        val app = context.applicationContext
         val limitsPrefs = app.getSharedPreferences(AgentRuntimeLimitsPrefs.PREFS, Context.MODE_PRIVATE)
         val concurrencyPrefs = app.getSharedPreferences(ConcurrencyPrefs.PREFS, Context.MODE_PRIVATE)
         val subagentPrefs = app.getSharedPreferences(SubagentPrefs.PREFS, Context.MODE_PRIVATE)
@@ -219,6 +231,18 @@ fun RuntimeLimitsScreen(onBack: () -> Unit) {
         actions = {
             MinisTextButton(
                 onClick = {
+                    // [fix/da1026-prefs-priming] Prime both caches before the
+                    // batched write. This Save re-persists every knob on the
+                    // page from screen state, so the write path must run on top
+                    // of a fresh cache: if a change was written to either prefs
+                    // file by someone other than this screen (minis-config / a
+                    // backup restore / the agent) while the page was open, a
+                    // stale read here would persist the pre-change value back
+                    // over it. Belt for the write path — the load-bearing fix
+                    // for the display half is the re-priming listener in the
+                    // DisposableEffect above (and ConfigBuiltins' own listener).
+                    ConcurrencyPrefs.prime(context)
+                    AgentRuntimeLimitsPrefs.prime(context)
                     SubagentPrefs.setEnabled(context, subagentEnabled)
                     ConcurrencyPrefs.setMaxConcurrentSessions(context, maxSessions)
                     AgentRuntimeLimitsPrefs.save(

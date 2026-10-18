@@ -38,8 +38,20 @@ internal object OffloadOutput {
      * always merges this set into its [booleanFlags] argument so e.g.
      * `--compact list` parses as flag + positional rather than swallowing
      * `list` as the value of `--compact`.
+     *
+     * [da1026-B] `help` / `h` belong here for the same reason: every handler
+     * checks `args.hasFlag("h", "help")` first, and a handler that did not
+     * ALSO declare them (only [ContactsOffloadHandler] and
+     * [SessionsOffloadHandler] do) used to parse `--help list` as
+     * `--help = "list"` — the subcommand vanished, `hasFlag("h", "help")`
+     * stayed false, and the default subcommand branch ran for real (calendar
+     * read the calendar, clipboard read the clipboard, location read the
+     * precise position …). Recognizing them globally is the same fix as
+     * `--compact` above, so a handler cannot be "not wired for `--help`" by
+     * omission. `h` additionally keeps [`OffloadArgs.unknownFlags`] from
+     * reporting the documented `-h` short flag as a typo.
      */
-    val OUTPUT_FLAGS: Set<String> = setOf("compact", "quiet", "q")
+    val OUTPUT_FLAGS: Set<String> = setOf("compact", "quiet", "q", "help", "h")
 
     /**
      * Apply the active output flags to a finished body. Caller passes the

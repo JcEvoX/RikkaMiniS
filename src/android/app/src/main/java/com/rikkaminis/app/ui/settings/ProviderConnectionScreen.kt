@@ -72,8 +72,15 @@ fun ProviderConnectionScreen(
     // rememberSaveable leaked this instance's URL/UA state into the next
     // instance's screen when navigating between detail pages (same
     // destination, different argument → state survived the swap).
-    var customBaseURL by rememberSaveable(instance.id) { mutableStateOf(instance.customBaseURL ?: "") }
-    var customUserAgent by rememberSaveable(instance.id) { mutableStateOf(instance.customUserAgent ?: "") }
+    // [da1026-C] Key on the FIELD VALUE as well as the id (same shape as
+    // ProviderDetailScreen's label/isEnabled binding, [da1023-C]): with only
+    // `instance.id` as the key, an external write to customBaseURL /
+    // customUserAgent while this page stayed open (minis-config RPC, backup
+    // restore, provider RPC) left the stale text on screen, and the
+    // focus-loss saveBaseURLSettings() then wrote that stale value back over
+    // the external change — the silent-revert shape da1023-C fixed for label.
+    var customBaseURL by rememberSaveable(instance.id, instance.customBaseURL) { mutableStateOf(instance.customBaseURL ?: "") }
+    var customUserAgent by rememberSaveable(instance.id, instance.customUserAgent) { mutableStateOf(instance.customUserAgent ?: "") }
 
     fun saveBaseURLSettings() {
         // [da1023-C] appendV1Suffix is NOT re-derived here: the instance's

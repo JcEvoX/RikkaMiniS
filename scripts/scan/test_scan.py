@@ -2879,6 +2879,22 @@ def test_da1024_gates():
         check("%s real tree green" % script, rc == 0, out[-280:])
 
 
+DA1026_GATES = [
+    ("models_provider_field_check", "MODELS_PROVIDER_FIELD_SELFTEST=PASS", (), (REPO_ROOT,)),
+]
+
+def test_da1026_gates():
+    print("━━━ deep-audit-1026 gates (selftest teeth + real tree) ━━━")
+    for script, marker, st_extra, real_args in DA1026_GATES:
+        argv = [sys.executable, os.path.join(SCRIPT_DIR, script + ".py")] + list(st_extra) + ["--selftest"]
+        proc = subprocess.run(argv, capture_output=True, text=True)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        check("%s selftest has teeth (%s)" % (script, marker),
+              proc.returncode == 0 and marker in out, out[-280:])
+        rc, out = run_scanner(script + ".py", *real_args)
+        check("%s real tree green" % script, rc == 0, out[-280:])
+
+
 DA1025_GATES = [
     ("browser_tabs_lifecycle_check", "BROWSER_TABS_SELFTEST=PASS", (), (REPO_ROOT,)),
     ("envvar_config_group_check", "ENVVAR_GROUP_SELFTEST=PASS", (), (REPO_ROOT,)),
@@ -2995,6 +3011,7 @@ def main():
     test_da1023_gates()
     test_da1024_gates()
     test_da1025_gates()
+    test_da1026_gates()
     test_trace_step_tag()
     test_da1017_external_fixtures()
     test_real_repo()

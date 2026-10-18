@@ -70,13 +70,15 @@ class ModelsCollection(
             ?: throw ConfigError.InvalidValue("`instance_id` (or `provider_id`) required")
         if (instanceId.isEmpty()) throw ConfigError.InvalidValue("`instance_id` (or `provider_id`) required")
 
-        val modelIdStr = (obj["model_id"] as? ConfigValue.Str)?.value
+        // [da1026-D] Trim before validating (parity with modelsUpdate's
+        // [da1022-E] blank-id gate): a whitespace-only id passed isEmpty()
+        // and minted a blank composite-key row.
+        val modelIdStr = (obj["model_id"] as? ConfigValue.Str)?.value?.trim()
             ?: throw ConfigError.InvalidValue("`model_id` required")
         if (modelIdStr.isEmpty()) throw ConfigError.InvalidValue("`model_id` required")
 
-        if (repo.instance(instanceId) == null) {
-            throw ConfigError.InvalidValue("No provider instance with id $instanceId")
-        }
+        val instance = repo.instance(instanceId)
+            ?: throw ConfigError.InvalidValue("No provider instance with id $instanceId")
         // Refuse silent dedupe: the spec contract is that re-adding the
         // same provider+model pair surfaces an `already_exists` error so
         // the agent knows the prior add already succeeded.
@@ -97,7 +99,14 @@ class ModelsCollection(
         val model = LLMModel(
             id = modelIdStr,
             displayName = displayName,
-            provider = instanceId,
+            // [da1026-D] Persist the human provider name (ProviderType
+            // displayName) — the same value provider.models.add and
+            // AddCustomModelScreen write — instead of the instance UUID.
+            // minis-model-use list rendered the raw UUID and
+            // ModelsDevApi.enrichModel could never resolve providerKeyMap /
+            // registry for these rows, dropping them into the
+            // order-dependent all-providers scan (the F-212 failure).
+            provider = instance.providerType.displayName,
             contextWindow = contextWindow,
             maxOutputTokens = maxOut,
             supportsReasoning = supportsReasoning,

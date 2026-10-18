@@ -182,17 +182,41 @@ class ShareReceiverActivity : ComponentActivity() {
             .setTitle(getString(com.rikkaminis.app.R.string.share_provider_json_title))
             .setMessage(getString(com.rikkaminis.app.R.string.share_provider_json_message))
             .setPositiveButton(getString(com.rikkaminis.app.R.string.share_provider_json_import)) { _, _ ->
-                if (importProviderJson(json)) {
-                    // Imported: the staged JSON has served its purpose. Drop it
-                    // (and debit the cumulative byte counter) so the file doesn't
-                    // linger in share_extension/ forever — cleanSharedFiles only
-                    // runs on the pending-share consumption path.
-                    discardStagedAttachments(items)
-                    finish()
-                } else {
-                    // Import failed — fall through to the attachment flow so the
-                    // user doesn't lose the file (same promise as dismiss/back).
-                    finishWithAttachmentFlow(items)
+                // [deep-audit-1026 ISSUE-07] Both steps below are disk-bound:
+                // importInstanceJSON runs ensureConfigLoaded (runBlocking) + an
+                // EncryptedSharedPreferences commit + the Room write, and
+                // discardStagedAttachments does length() + delete() per staged
+                // file. Executing them straight in the positive-button callback
+                // froze the main thread for the whole import — and this Activity
+                // is the cold-start share entry point, so a multi-MB provider
+                // JSON plus many staged attachments could stall the first frame
+                // long enough for Input dispatching timeout (ANR).
+                //
+                // Mirrors the [T6-M4] shape in ProviderListScreen: do the I/O on
+                // the IO dispatcher, then return to Main for the UI hand-off.
+                // Toasts raised inside importProviderJson hop back via
+                // runOnUiThread (Toast needs a Looper on its calling thread).
+                lifecycleScope.launch {
+                    val imported = withContext(Dispatchers.IO) {
+                        val ok = importProviderJson(json)
+                        if (ok) {
+                            // Imported: the staged JSON has served its purpose.
+                            // Drop it (and debit the cumulative byte counter) so
+                            // the file doesn't linger in share_extension/
+                            // forever — cleanSharedFiles only runs on the
+                            // pending-share consumption path.
+                            discardStagedAttachments(items)
+                        }
+                        ok
+                    }
+                    if (imported) {
+                        finish()
+                    } else {
+                        // Import failed — fall through to the attachment flow so
+                        // the user doesn't lose the file (same promise as
+                        // dismiss/back).
+                        finishWithAttachmentFlow(items)
+                    }
                 }
             }
             .setNegativeButton(getString(com.rikkaminis.app.R.string.share_provider_json_attach)) { _, _ ->
@@ -242,8 +266,19 @@ class ShareReceiverActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Show [msg] on the main thread. [deep-audit-1026 ISSUE-07]: the provider
+     * import now runs on the IO dispatcher, and `Toast` needs a Looper on the
+     * thread that shows it — calling it from a `Dispatchers.IO` worker throws
+     * "Can't toast on a thread that has not called Looper.prepare()".
+     * `runOnUiThread` posts when we are not already on Main and runs inline
+     * when we are, so both the import path and any future Main-thread caller
+     * behave identically.
+     */
     private fun toast(msg: String) {
-        android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()
+        runOnUiThread {
+            android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun handleSingleSend(intent: Intent, out: MutableList<PendingShare.Item>) {

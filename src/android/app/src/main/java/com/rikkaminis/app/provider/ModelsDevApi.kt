@@ -43,6 +43,17 @@ object ModelsDevApi {
         // models.dev provider ids, same shape as the entries above.
         "xAI" to listOf("xai"),
         "Kimi" to listOf("moonshotai", "moonshotai-cn"),
+        // [da1026-D] Custom-model adds persist ProviderType.displayName, not
+        // the short key above (provider.models.add, AddCustomModelScreen and
+        // now ModelsCollection.add all write the displayName). The Gemini /
+        // xAI / Kimi displayNames diverge from their models.dev ids, so those
+        // rows missed this map entirely and fell through to the
+        // order-dependent all-providers scan — the exact F-212 failure this
+        // map exists to prevent. Keep the short keys: built-in catalog rows
+        // and historical data still carry them.
+        "Google Gemini" to listOf("google", "google-vertex"),
+        "xAI (Grok)" to listOf("xai"),
+        "Kimi Code" to listOf("moonshotai", "moonshotai-cn"),
     )
 
     private var cachedRegistry: Map<String, ProviderEntry>? = null

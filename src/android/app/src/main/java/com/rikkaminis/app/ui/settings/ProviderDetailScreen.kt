@@ -180,8 +180,11 @@ fun ProviderDetailScreen(
     val entries = remember(instanceId, config) {
         providerRepository.visibleEntries(instanceId)
     }
-    // Full catalog size, for the section header + refresh toast. Computed the
-    // same remembered way so it doesn't rescan on every recomposition either.
+    // Full catalog size, for the section header. Computed the same remembered
+    // way so it doesn't rescan on every recomposition either. [da1026-C] The
+    // refresh toast deliberately does NOT read this snapshot: it is keyed on
+    // the config that existed before the fetch ran, so it would report the
+    // pre-refresh count. The toast re-reads entriesFor() after the refresh.
     val allEntries = remember(instanceId, config) {
         providerRepository.entriesFor(instanceId)
     }
@@ -286,9 +289,20 @@ fun ProviderDetailScreen(
                             scope.launch {
                                 try {
                                     val result = providerRepository.refreshModels(instance)
+                                    // [da1026-C] Count AFTER the refresh, never from a
+                                    // captured snapshot: `allEntries` is a plain value
+                                    // remembered against (instanceId, config), so the
+                                    // closure below captured the PRE-refresh list and the
+                                    // toast always reported the old number — a brand-new
+                                    // provider's first successful refresh said
+                                    // "Refreshed 0 models from API". entriesFor() is a
+                                    // synchronous filter over the in-memory config
+                                    // StateFlow (no Room, no IO), so reading it here on
+                                    // the main dispatcher is safe and needs no withContext.
+                                    val total = providerRepository.entriesFor(instance.id).size
                                     Toast.makeText(
                                         toastContext,
-                                        refreshResultMessage(result, allEntries.size, toastContext),
+                                        refreshResultMessage(result, total, toastContext),
                                         Toast.LENGTH_SHORT,
                                     ).show()
                                     AppLogger.info(TAG, "Refreshed models for ${instance.id}: $result")

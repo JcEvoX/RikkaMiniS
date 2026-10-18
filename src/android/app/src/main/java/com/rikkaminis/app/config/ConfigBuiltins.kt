@@ -48,6 +48,30 @@ internal object ConfigBuiltins {
     @Volatile private var runtimeLimitsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
 
     /**
+     * [fix/da1026-prefs-priming] Strong holder for the concurrency-cap change
+     * listener — the same F-134 rationale as [runtimeLimitsListener] above: a
+     * bare lambda *argument* is held only weakly by SharedPreferencesImpl, so
+     * the GC collects it and the callback silently stops firing (no error, no
+     * exception — the write lands and the registration "succeeded").
+     *
+     * `ConcurrencyPrefs` caches the cap in a @Volatile field that
+     * MinisApp.onCreate primes once. Its PrefsIntField is registered in
+     * [registerRuntime] below, so `minis-config set runtime.maxConcurrentSessions`
+     * and a backup restore write straight to SharedPreferences — with no
+     * listener the primed cache keeps serving the pre-write value to
+     * SessionConcurrencyManager / ExecutionCoordinator / NativeOffloadServer
+     * until the next process start, and RuntimeLimitsScreen's own read-back
+     * shows (then re-persists) that stale value.
+     *
+     * prime() only refreshes the cache; the sized semaphores still take their
+     * bound at process start (see ConcurrencyPrefs's class doc), so this
+     * changes *visibility*, not when the cap takes effect.
+     *
+     * Guard: `scripts/scan/prefs_listener_holder_guard.py`.
+     */
+    @Volatile private var concurrencyPrefsListener: SharedPreferences.OnSharedPreferenceChangeListener? = null
+
+    /**
      * [T8-2] Dependency-injected registration. The config layer must not
      * import service/UI classes — the UI-coupled values are supplied
      * by the caller instead:
@@ -131,6 +155,26 @@ internal object ConfigBuiltins {
                 maxValue = com.rikkaminis.app.data.ConcurrencyPrefs.MAX,
             )
         )
+        // [fix/da1026-prefs-priming] Re-prime the ConcurrencyPrefs cache on any
+        // write to its prefs file — the same "changed but takes effect never"
+        // shape the AgentRuntimeLimitsPrefs listener below exists to prevent,
+        // and the same strong-holder requirement (see the field KDoc).
+        // PrefsIntField writes go straight to SharedPreferences (minis-config
+        // / backup restore / the agent), but the cap cache is only primed once
+        // at MinisApp.onCreate: without this listener an external write lands
+        // while SessionConcurrencyManager, ExecutionCoordinator and
+        // NativeOffloadServer keep serving the startup value.
+        //
+        // prime() refreshes the cache only — the sized semaphores keep the
+        // bound they took at process start (deliberate, see ConcurrencyPrefs's
+        // class doc), so this makes the persisted value *visible*, it does not
+        // resize any live slot controller.
+        val appCtx = context.applicationContext
+        val concurrencyListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+            com.rikkaminis.app.data.ConcurrencyPrefs.prime(appCtx)
+        }
+        concurrencyPrefsListener = concurrencyListener
+        prefs.registerOnSharedPreferenceChangeListener(concurrencyListener)
         // [T-subagent-toggle] Cross-session sub-agent dispatch switch. Same
         // prefs+key as SubagentPrefs so Settings / minis-config / the agent
         // all read-write one source of truth. OFF by default (side-effectful:
@@ -174,7 +218,8 @@ internal object ConfigBuiltins {
         // unheld lambda is collected by the GC and the callback silently stops
         // firing (see the field's KDoc). Registration is idempotent per
         // (prefs, listener) pair, so re-entering registerInto is harmless.
-        val appCtx = context.applicationContext
+        // (The `appCtx` this listener captures is declared once above, for the
+        // concurrency listener — same application context, one declaration.)
         val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
             com.rikkaminis.app.data.AgentRuntimeLimitsPrefs.prime(appCtx)
         }
@@ -1358,6 +1403,24 @@ internal object ConfigBuiltins {
                                     "name" to ConfigValue.Str(g.name),
                                     "strategy" to ConfigValue.Str(g.strategy.name),
                                     "fallback_strategy" to ConfigValue.Str(g.fallbackStrategy.name),
+                                    // [fix/da1026-H] The two per-group session
+                                    // defaults were write-only on this face:
+                                    // `minis-config get groups` hid them, so an
+                                    // agent could set them at add time and never
+                                    // read them back. Same read shape as the
+                                    // sibling providers summary (carrier field,
+                                    // Null = "no override") — the `add` payload
+                                    // accepts null/absent for both keys, so a
+                                    // summary round-trips through add unchanged.
+                                    // Token vocabulary matches the
+                                    // `groups.<id>.defaultThinkingLevel` field
+                                    // reader (lowercase, `thinkingLevelToToken`).
+                                    "default_thinking_level" to (g.defaultThinkingLevel?.let {
+                                        ConfigValue.Str(thinkingLevelToToken(it))
+                                    } ?: ConfigValue.Null),
+                                    "context_limit_tokens" to (g.contextLimitTokens?.let {
+                                        ConfigValue.Int(it)
+                                    } ?: ConfigValue.Null),
                                     "entries" to ConfigValue.Arr(entries),
                                 )
                             )
