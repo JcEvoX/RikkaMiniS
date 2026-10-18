@@ -38,6 +38,13 @@ class BackgroundSettingsRepository(context: Context) {
         const val KEY_TASK_NOTIFICATIONS = "taskNotificationsEnabled"
         const val DEFAULT_TASK_NOTIFICATIONS = true
         const val KEY_BG_OVERLAY_ENABLED = "backgroundOverlayEnabled"
+        // [da1028-B / ISSUE-03] Same single-source rule as the two above: the
+        // registry (ConfigBuiltins.registerBackground) registers
+        // `background.overlay` against this key, so the default has to be one
+        // declaration — a `false` literal on one side and `true` on the other
+        // is exactly the F-238/F-239 drift shape this companion was created
+        // to end. Defaults to OFF: the overlay needs SYSTEM_ALERT_WINDOW.
+        const val DEFAULT_BG_OVERLAY_ENABLED = false
         const val KEY_BG_OVERLAY_X = "backgroundOverlayX"
         const val KEY_BG_OVERLAY_Y = "backgroundOverlayY"
     }
@@ -65,7 +72,9 @@ class BackgroundSettingsRepository(context: Context) {
      * we won't surface anything until the user opts in.
      */
     private val _backgroundOverlayEnabled =
-        MutableStateFlow(prefs.getBoolean(KEY_BG_OVERLAY_ENABLED, false))
+        MutableStateFlow(
+            prefs.getBoolean(KEY_BG_OVERLAY_ENABLED, DEFAULT_BG_OVERLAY_ENABLED),
+        )
     val backgroundOverlayEnabled: StateFlow<Boolean> =
         _backgroundOverlayEnabled.asStateFlow()
 
@@ -106,7 +115,7 @@ class BackgroundSettingsRepository(context: Context) {
                         prefs.getBoolean(KEY_TASK_NOTIFICATIONS, DEFAULT_TASK_NOTIFICATIONS)
                 KEY_BG_OVERLAY_ENABLED ->
                     _backgroundOverlayEnabled.value =
-                        prefs.getBoolean(KEY_BG_OVERLAY_ENABLED, false)
+                        prefs.getBoolean(KEY_BG_OVERLAY_ENABLED, DEFAULT_BG_OVERLAY_ENABLED)
             }
         }
 

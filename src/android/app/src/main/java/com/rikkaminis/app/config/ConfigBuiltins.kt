@@ -1185,7 +1185,28 @@ internal object ConfigBuiltins {
         )
         // [T-android-config-feature-unavailable] Live Updates / "dynamic
         // island" was removed 2026-08-17 — this feature (and its registration)
-        // is gone; nothing between the two notification fields references it.
+        // is gone; nothing here references it any more.
+        //
+        // [da1028-B / ISSUE-03] `background.overlay` ("show the floating
+        // tool-status overlay while backgrounded") is a real switch in
+        // Settings → Background with no registry entry: `minis-config set
+        // background.overlay true` answered "unknown field" while the same
+        // toggle was reachable by tap, and the value was in no backup scope.
+        // Same key convention as the notification fields above — the key and
+        // the default come from BackgroundSettingsRepository, never re-typed
+        // here.
+        r.register(
+            PrefsBoolField(
+                path = "background.overlay",
+                displayName = "Background task overlay",
+                description = "Show a small floating capsule with the current tool while the app is in the background. Same switch as Settings → Background → Background Task Overlay; needs permission to display over other apps.",
+                prefs = prefs,
+                key = com.rikkaminis.app.data.repository.BackgroundSettingsRepository
+                    .KEY_BG_OVERLAY_ENABLED,
+                defaultValue = com.rikkaminis.app.data.repository.BackgroundSettingsRepository
+                    .DEFAULT_BG_OVERLAY_ENABLED,
+            )
+        )
     }
 
     // -- Logs --
