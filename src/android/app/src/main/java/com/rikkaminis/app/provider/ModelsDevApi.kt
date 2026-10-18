@@ -3,6 +3,9 @@ package com.rikkaminis.app.provider
 import android.content.Context
 import android.util.Log
 import com.rikkaminis.app.data.model.LLMModel
+import com.rikkaminis.app.data.model.ProviderType
+import com.rikkaminis.app.data.model.legacyProviderNames
+import com.rikkaminis.app.data.model.modelsDevProviderIds
 import com.rikkaminis.app.provider.thinking.GatewayEffortTruth
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -27,6 +30,14 @@ object ModelsDevApi {
     private const val CACHE_TTL_MS = 48 * 3600 * 1000L // 48 hours
 
     // Provider-key mapping for enrichment lookups (matches iOS)
+    //
+    // [ARCH-03] The explicit literals below are kept verbatim (static gates and
+    // reviewers read this text) and are MERGED with the exhaustive
+    // `ProviderType` metadata tables — displayName, enum constant name, and the
+    // legacy catalog short names all map to the family's models.dev provider
+    // ids. A future vendor added to `ProviderType` therefore lands in this map
+    // automatically; it cannot be forgotten here the way xAI / kimiCode were
+    // (F-212) or the displayName keys were (1026 ISSUE-04).
     private val providerKeyMap = mapOf(
         "Anthropic" to listOf("anthropic"),
         "Google" to listOf("google", "google-vertex"),
@@ -54,7 +65,12 @@ object ModelsDevApi {
         "Google Gemini" to listOf("google", "google-vertex"),
         "xAI (Grok)" to listOf("xai"),
         "Kimi Code" to listOf("moonshotai", "moonshotai-cn"),
-    )
+    ) + ProviderType.values().flatMap { type ->
+        val ids = type.modelsDevProviderIds
+        (listOf(type.displayName, type.name) + type.legacyProviderNames)
+            .distinct()
+            .map { key -> key to ids }
+    }.toMap()
 
     private var cachedRegistry: Map<String, ProviderEntry>? = null
     private var cacheTimestamp: Long = 0L
