@@ -91,6 +91,28 @@ fun LogManagementScreen(
     var showDeleteAllConfirm by remember { mutableStateOf(false) }
     var loggingEnabled by remember { mutableStateOf(AppLogger.isEnabled(context)) }
 
+    // [da1028-B / ISSUE-04] Re-read the switch when `logs.enabled` is written
+    // OUTSIDE this screen — `minis-config set logs.enabled …` (ConfigBuiltins
+    // registers the same prefs file + key via AppLogger) or a backup-restore.
+    // Without it the Switch keeps rendering the value captured at open time and
+    // the user then toggles from a stale state. Same shape as
+    // MemoryManagementScreen's memory.global.enabled listener; the prefs file
+    // is process-scoped, so onDispose must unregister.
+    DisposableEffect(context) {
+        val prefs = context.applicationContext.getSharedPreferences(
+            AppLogger.PREF_NAME,
+            Context.MODE_PRIVATE,
+        )
+        val listener =
+            android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+                if (key == AppLogger.KEY_ENABLED) {
+                    loggingEnabled = AppLogger.isEnabled(context)
+                }
+            }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
+
     val refreshTrigger = remember { mutableStateOf(0) }
     LaunchedEffect(refreshTrigger.value) {
         loading = true

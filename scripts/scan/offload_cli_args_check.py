@@ -140,6 +140,38 @@ FASTIO_RULES = [
 ]
 
 
+# [da1028-A] ISSUE-08 — DebugOffloadHandler's pass-through subcommands.
+# The handler used to parse argv ONCE, greedily (`OffloadArgs` treats every
+# `-`-prefixed token anywhere as one of ITS flags) and then hand the leftovers
+# to `exec` / `shizuku` / `model-use`: `minis-debug exec ls -l` lost the `-l`
+# because the top level had already eaten it. Contract: a second structural
+# view (`splitArgv` → globals / subcommand / verbatim tail) feeds the
+# pass-through branches, while output shaping for those branches reads the
+# GLOBAL slice only, so a child's own `-q` cannot strip this command's
+# envelope. The rules pin the wiring; the anchor-drift case (a missing needle)
+# is itself a finding.
+DEBUG_HANDLER = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/DebugOffloadHandler.kt"
+DEBUG_RULES = [
+    ("D1", "req", "internal fun splitArgv(tokens: List<String>): DebugArgvSplit {"),
+    ("D2", "req", "internal fun forwardedArgv("),
+    ("D3", "req", "): List<String> = if (sub in PASSTHROUGH_SUBCOMMANDS) rawRest else args.positional.drop(1)"),
+    ("D4", "req", 'private val PASSTHROUGH_SUBCOMMANDS = setOf("exec", "shizuku", "model-use", "modelUse")'),
+    ("D5", "req", "val argv = splitArgv(raw)"),
+    ("D6", "req", "val sub = argv.subcommand"),
+    ("D7", "req", "buildRpcCall(sub, args, argv.rawRest)"),
+    ("D8", "req", "private fun buildRpcCall(sub: String, args: OffloadArgs, rawRest: List<String>): RpcCall {"),
+    ("D9", "req", "val rest = forwardedArgv(sub, args, rawRest)"),
+    ("D10", "req", 'RpcCall("debug.shizuku.exec", buildExecForwarder(rest, args))'),
+    ("D11", "req", 'RpcCall("debug.modelUse.exec", buildExecForwarder(rest, args))'),
+    ("D12", "req", "execCommandLine(rest)"),
+    ("D13", "req", "if (sub in PASSTHROUGH_SUBCOMMANDS) OffloadArgs(argv.globals, BOOLEAN_FLAGS) else args"),
+    ("D14", "forbid_re", r"buildExecForwarder\(args\.positional"),
+    ("D15", "forbid", "buildRpcCall(sub, args)"),
+    ("D16", "forbid", "forwardedArgv(sub, args)"),
+    ("D17", "forbid_re", r"buildExecForwarder\(OffloadArgs\("),
+]
+
+
 def code_only(src: str) -> str:
     """Strip block + line comments so prose quoting a pattern cannot trip a rule."""
     src = re.sub(r"/\*.*?\*/", "", src, flags=re.DOTALL)
@@ -224,6 +256,29 @@ def check_flag_set(output_src: str, speak_src: str) -> list:
     for rid, kind, needle in SPEAK_RULES:
         if not re.search(needle, speak):
             findings.append((rid, "missing", needle))
+    return findings
+
+
+def check_debug(debug_src: str) -> list:
+    """[da1028-A] ISSUE-08 rules, judged on comment-stripped text.
+
+    Fail-closed by construction: every needle is a `req` (missing → finding) or
+    a `forbid` (present → finding), so a renamed helper, a rebuilt greedy parse
+    at a pass-through branch, or a whole-file rewrite all land as findings
+    rather than as a silently empty rule set.
+    """
+    findings = []
+    debug = code_only(debug_src)
+    for rid, kind, needle in DEBUG_RULES:
+        if kind == "req":
+            if needle not in debug:
+                findings.append((rid, "missing", needle))
+        elif kind == "forbid":
+            if needle in debug:
+                findings.append((rid, "present", needle))
+        elif kind == "forbid_re":
+            if re.search(needle, debug):
+                findings.append((rid, "present", needle))
     return findings
 
 
@@ -359,6 +414,70 @@ class SpeakOffloadHandler {
         if (args.hasFlag("stop")) return cmdStop(args)
         if (args.hasFlag("status")) return buildStatus(args)
     }
+}
+"""
+
+
+GREEN_DEBUG = """
+class DebugOffloadHandler {
+    private val PASSTHROUGH_SUBCOMMANDS = setOf("exec", "shizuku", "model-use", "modelUse")
+
+    override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
+        val args = OffloadArgs(raw)
+        val argv = splitArgv(raw)
+        val sub = argv.subcommand
+            ?: return NativeOffloadResult(2, HELP)
+        val rpc: RpcCall = try {
+            buildRpcCall(sub, args, argv.rawRest)
+        } catch (e: BadArgsException) {
+            return NativeOffloadResult(2, "minis-debug ${'$'}sub: ${'$'}{e.message}")
+        }
+        val outArgs =
+            if (sub in PASSTHROUGH_SUBCOMMANDS) OffloadArgs(argv.globals, BOOLEAN_FLAGS) else args
+        return NativeOffloadResult(0, OffloadOutput.formatBody("{}", outArgs))
+    }
+
+    private fun buildRpcCall(sub: String, args: OffloadArgs, rawRest: List<String>): RpcCall {
+        val rest = forwardedArgv(sub, args, rawRest)
+        return when (sub) {
+            "exec" -> {
+                if (rest.isEmpty()) throw BadArgsException("missing <command...>")
+                RpcCall("debug.shellExecute", JSONObject().put("command", execCommandLine(rest)))
+            }
+            "shizuku" -> RpcCall("debug.shizuku.exec", buildExecForwarder(rest, args))
+            "model-use", "modelUse" -> RpcCall("debug.modelUse.exec", buildExecForwarder(rest, args))
+            else -> throw BadArgsException("unknown subcommand '${'$'}sub'")
+        }
+    }
+
+    private fun buildExecForwarder(rest: List<String>, args: OffloadArgs): JSONObject = JSONObject()
+
+    internal fun splitArgv(tokens: List<String>): DebugArgvSplit {
+        val globals = mutableListOf<String>()
+        var i = 0
+        while (i < tokens.size) {
+            val t = tokens[i]
+            if (!t.startsWith("-")) break
+            globals.add(t)
+            if (t == "--args") {
+                i += 1
+                if (i < tokens.size) globals.add(tokens[i])
+            }
+            i += 1
+        }
+        if (i >= tokens.size) return DebugArgvSplit(globals, null, emptyList())
+        val tail = tokens.subList(i + 1, tokens.size).toList()
+        val rest = if (tail.firstOrNull() == "--") tail.drop(1) else tail
+        return DebugArgvSplit(globals, tokens[i], rest)
+    }
+
+    internal fun forwardedArgv(
+        sub: String,
+        args: OffloadArgs,
+        rawRest: List<String>,
+    ): List<String> = if (sub in PASSTHROUGH_SUBCOMMANDS) rawRest else args.positional.drop(1)
+
+    internal fun execCommandLine(argv: List<String>): String = argv.joinToString(" ")
 }
 """
 
@@ -537,12 +656,66 @@ def selftest() -> int:
         if got != want:
             print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
             failures += 1
+    # [da1028-A] ISSUE-08 arms. Expected rule-id sets are written by hand from
+    # DEBUG_RULES — never derived from a run.
+    red_cases_debug = [
+        ("forwardedArgv falls back to the greedy leftovers everywhere",
+         GREEN_DEBUG.replace(
+             "): List<String> = if (sub in PASSTHROUGH_SUBCOMMANDS) rawRest else args.positional.drop(1)",
+             "): List<String> = args.positional.drop(1)"),
+         {"D3"}),
+        ("the rest slice is rebuilt from the greedy parse at the call site",
+         GREEN_DEBUG.replace("val rest = forwardedArgv(sub, args, rawRest)",
+                             "val rest = args.positional.drop(1)"),
+         {"D9"}),
+        ("the shizuku branch stops forwarding the verbatim tail",
+         GREEN_DEBUG.replace('RpcCall("debug.shizuku.exec", buildExecForwarder(rest, args))',
+                             'RpcCall("debug.shizuku.exec", buildExecForwarder(args.positional, args))'),
+         {"D10", "D14"}),
+        ("the model-use branch stops forwarding the verbatim tail",
+         GREEN_DEBUG.replace('RpcCall("debug.modelUse.exec", buildExecForwarder(rest, args))',
+                             'RpcCall("debug.modelUse.exec", buildExecForwarder(args.positional, args))'),
+         {"D11", "D14"}),
+        ("the rawRest never reaches buildRpcCall",
+         GREEN_DEBUG.replace("buildRpcCall(sub, args, argv.rawRest)", "buildRpcCall(sub, args)"),
+         {"D7", "D15"}),
+        ("forwardedArgv is called without the verbatim tail",
+         GREEN_DEBUG.replace("val rest = forwardedArgv(sub, args, rawRest)",
+                             "val rest = forwardedArgv(sub, args)"),
+         {"D9", "D16"}),
+        ("the exec branch forwards the greedy leftovers",
+         GREEN_DEBUG.replace("execCommandLine(rest)", "execCommandLine(args.positional)"),
+         {"D12"}),
+        ("output shaping reverts to the whole-argv view",
+         GREEN_DEBUG.replace(
+             "if (sub in PASSTHROUGH_SUBCOMMANDS) OffloadArgs(argv.globals, BOOLEAN_FLAGS) else args",
+             "args"),
+         {"D13"}),
+        ("the structural argv view is dropped from the head",
+         GREEN_DEBUG.replace("val argv = splitArgv(raw)",
+                             "val argv = DebugArgvSplit(emptyList(), null, emptyList())"),
+         {"D5"}),
+        ("a fresh greedy parse is handed to the forwarder",
+         GREEN_DEBUG.replace('RpcCall("debug.modelUse.exec", buildExecForwarder(rest, args))',
+                             'RpcCall("debug.modelUse.exec", buildExecForwarder(OffloadArgs(raw).positional, args))'),
+         {"D11", "D17"}),
+    ]
+    for label, debug_src, want in red_cases_debug:
+        if debug_src == GREEN_DEBUG:
+            print(f"SELFTEST-FAIL: {label}: mutation did not apply to any arm")
+            failures += 1
+            continue
+        got = {rid for rid, _, _ in check_debug(debug_src)}
+        if got != want:
+            print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
+            failures += 1
     # the green arms must be fully clean, or every rule is vacuous
     clean = check_text(GREEN_CONTACTS, GREEN_CONFIG, GREEN_BROWSERUSE, GREEN_FASTIO)
     clean_flags = check_flag_set(GREEN_OUTPUT, GREEN_SPEAK)
-    if clean or clean_flags:
+    clean_debug = check_debug(GREEN_DEBUG)
+    if clean or clean_flags or clean_debug:
         print(f"SELFTEST-FAIL: green fixtures must produce no findings, "
-              f"got {describe(clean + clean_flags)}")
+              f"got {describe(clean + clean_flags + clean_debug)}")
         failures += 1
     if failures:
         print(f"SELFTEST: {failures} failing case(s)")
@@ -564,9 +737,11 @@ def main(argv):
     fastio_path = root / FASTIO
     output_path = root / OUTPUT
     speak_path = root / SPEAK
+    debug_path = root / DEBUG_HANDLER
     if not contacts_path.is_file() or not config_path.is_file() \
             or not browseruse_path.is_file() or not fastio_path.is_file() \
-            or not output_path.is_file() or not speak_path.is_file():
+            or not output_path.is_file() or not speak_path.is_file() \
+            or not debug_path.is_file():
         print(f"GATE-FAIL: handler source not found under {root}")
         return 1
     findings = check_text(contacts_path.read_text(encoding="utf-8"),
@@ -575,13 +750,15 @@ def main(argv):
                           fastio_path.read_text(encoding="utf-8"))
     findings += check_flag_set(output_path.read_text(encoding="utf-8"),
                                speak_path.read_text(encoding="utf-8"))
+    findings += check_debug(debug_path.read_text(encoding="utf-8"))
     if findings:
         print("offload_cli_args_check: FAIL")
         print(describe(findings))
         return 1
     print("offload_cli_args_check: PASS (contacts dispatch parsed, config --file cwd-aware, "
           "browseruse paths joined, fastio tar verdict shared, "
-          "OUTPUT_FLAGS covers help/h, speak declares stop/status)")
+          "OUTPUT_FLAGS covers help/h, speak declares stop/status, "
+          "debug pass-through argv verbatim + global-only output shaping)")
     return 0
 
 

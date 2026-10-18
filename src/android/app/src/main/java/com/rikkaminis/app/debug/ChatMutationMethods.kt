@@ -417,12 +417,15 @@ internal object ChatMutationMethods {
         }
     }
 
-    /** T9-L4: drop attachment blobs older than 24h before writing new ones. */
+    /**
+     * T9-L4: drop attachment blobs older than 24h before writing new ones.
+     * [da1028-C] Delegates to the one shared pruner instead of keeping a second
+     * hand-rolled copy of the same loop: two copies of the TTL/`isFile`/`<`
+     * triple can drift apart silently (and did — the copy here and
+     * `ui/components/pruneShareDir` were byte-identical only by luck).
+     */
     private fun pruneStaleAttachments(dir: File) {
-        val cutoff = System.currentTimeMillis() - 24L * 60 * 60 * 1000
-        dir.listFiles()?.forEach { f ->
-            if (f.isFile && f.lastModified() < cutoff) runCatching { f.delete() }
-        }
+        com.rikkaminis.app.ui.components.pruneShareDir(dir)
     }
 
     private fun parseAttachments(context: Context, params: JSONObject): List<InputAttachment> {

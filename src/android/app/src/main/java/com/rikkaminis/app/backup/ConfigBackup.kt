@@ -54,7 +54,12 @@ object ConfigBackup {
      * device-local state (session ids, cached metadata) or derived, and
      * restoring it would do more harm than good.
      */
-    private val BACKED_UP_SCOPES = setOf(
+    // [da1028-B / ISSUE-03] `internal` (not private) so
+    // ConfigBackupEnvvarsAndOverlayTest can pin the exact scope set — a
+    // text-grep probe cannot tell "envvars is in the set" from "the string
+    // appears in the KDoc". Same testability-visibility precedent as
+    // `memoryBackupEntries` / `ROLLUP_BACKUP_FILE` in this file.
+    internal val BACKED_UP_SCOPES = setOf(
         "appearance",   // theme, font scale, chat bubble/background look
         "chat",         // composer + rendering preferences
         "background",   // background image / effect settings
@@ -63,6 +68,21 @@ object ConfigBackup {
         "memory",       // memory feature toggles
         "logs",         // log retention preferences
         "runtime",      // agent-runtime knobs (e.g. max concurrent sessions)
+        // [da1028-B / ISSUE-03] `envvars.privacyMode` is a real, registered
+        // config face (ConfigBuiltins.registerEnvVars). Missing from this list
+        // it was exported by nobody and — worse — a payload that carried it
+        // was rejected on the way back in ("outside backup scope"), so
+        // migrating devices silently dropped the privacy switch.
+        //
+        // Scope "envvars" contributes exactly two registry-level fields: the
+        // `envvars` aggregate (ReadOnly, dropped by the READWRITE filter) and
+        // `envvars.privacyMode`. The per-key `envvars.<KEY>.value|note|group`
+        // children are *not* registry-level fields — they only exist through
+        // EnvVarsCollection.fields(forId) — and buildSections walks
+        // ConfigRegistry.allVisibleFieldPaths() (top-level only), so this entry
+        // cannot pull them (or a secret value) into a backup. The keys
+        // themselves travel in their own `envVars` section, secret-gated.
+        "envvars",      // env-var privacy mode toggle
     )
     // NOTE: `session.*` is deliberately NOT backed up. Despite the dot-path
     // prefix it is not a persisted preference — session.primaryModel /

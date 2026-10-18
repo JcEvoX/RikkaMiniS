@@ -58,6 +58,15 @@ Criteria (each fail-closed: missing anchor = RED, never silent skip):
       contain a `collectAsState()` read. C10b: the `LaunchedEffect(...)` whose
       body calls `computeUsageStats(` must key on both `range` and
       `providerConfig`.
+  C11 ThinkingRulesSection [da1028-C] — the two derived values that decide
+      what the section shows must be keyed on every source they are derived
+      from. C11a: the `remember(...)` whose initializer calls
+      `builtInThinkingRulesForDisplay(` must key on `customBaseURL`,
+      `appendV1Suffix` (both feed `effectiveBaseURL` inside the repo call) and
+      `modelEntries`. C11b: the `remember(...)` calling `firstModelId(` must key
+      on `modelEntries`. C11c: the ProviderDetailScreen call site must forward
+      `modelEntries = ...` — a section that is never handed the list cannot key
+      on it at all. Anchors missing = RED.
 
 Usage:
   python3 provider_remember_key_check.py <repo_root>   # real-tree mode
@@ -85,6 +94,8 @@ REL_GROUP_DETAIL = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings
 REL_MOUNT_DETAIL = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/MountDetailScreen.kt"
 REL_APP_NAV = "src/android/app/src/main/java/com/rikkaminis/app/ui/navigation/AppNavigation.kt"
 REL_USAGE_STATS = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/UsageStatsScreen.kt"
+# da1028-C
+REL_THINKING_SECTION = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/ThinkingRulesSection.kt"
 
 # C6c — value families a remember initializer can derive from in
 # ModelEntryDetailScreen. Reading any of them makes the call site
@@ -327,8 +338,10 @@ def check_sheet(code):
 
 
 def check_provider_detail(code):
-    """C7a/b/c — the refresh toast must report a count read AFTER the refresh."""
-    results = []
+    """C7a/b/c — the refresh toast must report a count read AFTER the refresh.
+    C11c [da1028-C] — the ThinkingRulesSection call site forwards the model
+    entry list."""
+    results = [check_thinking_rules_call_site(code)]
     rm_pos = find_call_site(code, "refreshModels")
     msg_pos = find_call_site(code, "refreshResultMessage")
     if rm_pos < 0:
@@ -526,6 +539,63 @@ def check_usage_stats(code):
     return results
 
 
+def check_thinking_rules_call_site(code):
+    """C11c — ProviderDetailScreen must hand the section its entry list."""
+    pos = find_call_site(code, "ThinkingRulesSection")
+    if pos < 0:
+        results = ("C11c", False,
+                   "anchor `ThinkingRulesSection(` call not found in ProviderDetailScreen "
+                   "(fail-closed: section dropped or renamed — re-derive this criterion)")
+    else:
+        args = call_args(code, pos)
+        if args is None:
+            results = ("C11c", False,
+                       "ThinkingRulesSection( has no balanced argument list (fail-closed)")
+        elif re.search(r"\bmodelEntries\s*=", args):
+            results = ("C11c", True, "call site forwards `modelEntries = ...`")
+        else:
+            results = ("C11c", False,
+                       "ThinkingRulesSection( is not given `modelEntries` — the section's derived "
+                       "keys can never observe a catalog refresh")
+    return results
+
+def check_thinking_rules(code):
+    """C11a / C11b — ThinkingRulesSection derived remember keys.
+
+    Only the initializer counts as a read (same rule as C8/C9): the key list
+    mentioning a field is exactly what is under test, so grading the whole
+    statement would be tautological. Keyless counts as a miss whenever the
+    initializer is derived. Fail-closed: no remember whose initializer calls
+    the anchor callee means the section was reworked → RED."""
+    results = []
+    targets = (
+        ("C11a", "builtInThinkingRulesForDisplay(",
+         ("customBaseURL", "appendV1Suffix", "modelEntries"), "built-in rule list"),
+        ("C11b", "firstModelId(", ("modelEntries",), "resolution-preview model id"),
+    )
+    calls = iter_remember_calls(code, "remember")
+    for cid, callee, required, label in targets:
+        hits = [c for c in calls if callee in c[3]]
+        if not hits:
+            results.append((cid, False,
+                            "no `remember(...)` whose initializer calls %s (fail-closed: the %s "
+                            "call was reworked — re-derive this criterion)" % (callee, label)))
+            continue
+        bad = []
+        for line_no, keys, _span, _init in hits:
+            if keys is None:
+                bad.append("L%d: keyless remember derives from %s" % (line_no, callee))
+                continue
+            missing = [tok for tok in required if tok not in keys]
+            if missing:
+                bad.append("L%d: keys=[%s] missing %s"
+                           % (line_no, " ".join(keys.split()), ",".join(missing)))
+        results.append((cid, not bad,
+                        "all %d %s remember call(s) key on %s"
+                        % (len(hits), label, " + ".join(required))
+                        if not bad else "; ".join(bad)))
+    return results
+
 CHECKERS = (
     (REL_PROVIDER_LIST, check_provider_list),
     (REL_SHEET, check_sheet),
@@ -536,6 +606,7 @@ CHECKERS = (
     (REL_MOUNT_DETAIL, check_mount_detail),
     (REL_APP_NAV, check_app_navigation),
     (REL_USAGE_STATS, check_usage_stats),
+    (REL_THINKING_SECTION, check_thinking_rules),
 )
 
 
@@ -616,6 +687,7 @@ IconButton(onClick = {
         Toast.makeText(ctx, refreshResultMessage(result, total, ctx), Toast.LENGTH_SHORT).show()
     }
 })
+ThinkingRulesSection(instance = currentInstance, providerRepository = providerRepository, modelEntries = allEntries)
 """
 
 # the pre-fix shape: toast reads the snapshot captured before the fetch ran
@@ -628,6 +700,7 @@ IconButton(onClick = {
         Toast.makeText(ctx, refreshResultMessage(result, allEntries.size, ctx), Toast.LENGTH_SHORT).show()
     }
 })
+ThinkingRulesSection(instance = currentInstance, providerRepository = providerRepository, modelEntries = allEntries)
 """
 
 # no snapshot read in the args, but also no fresh read: still a stale count
@@ -641,6 +714,7 @@ IconButton(onClick = {
         Toast.makeText(ctx, refreshResultMessage(result, total, ctx), Toast.LENGTH_SHORT).show()
     }
 })
+ThinkingRulesSection(instance = currentInstance, providerRepository = providerRepository, modelEntries = allEntries)
 """
 
 # the accepted alternative shape: state-backed list re-assigned on the refresh path
@@ -654,7 +728,13 @@ IconButton(onClick = {
         Toast.makeText(ctx, refreshResultMessage(result, allEntries.size, ctx), Toast.LENGTH_SHORT).show()
     }
 })
+ThinkingRulesSection(instance = currentInstance, providerRepository = providerRepository, modelEntries = allEntries)
 """
+
+# [da1028-C] C11c: the section is called without its entry list, so the keys
+# inside it can never observe a catalog refresh.
+FIX_PROVIDER_DETAIL_NO_SECTION_ARGS = FIX_PROVIDER_DETAIL_CLEAN.replace(
+    ", modelEntries = allEntries", "")
 
 FIX_PROVIDER_DETAIL_MISSING_ANCHOR = """package com.rikkaminis.app.ui.settings
 
@@ -828,6 +908,60 @@ fun UsageStatsScreen(chatDao: ChatDao, providerConfig: ProviderConfig? = null) {
 }
 """
 
+# --- da1028-C fixtures: ThinkingRulesSection derived keys ------------------
+
+FIX_THINKING_CLEAN = """package com.rikkaminis.app.ui.settings
+
+@Composable
+fun ThinkingRulesSection(
+    instance: ProviderInstance,
+    providerRepository: ProviderRepository,
+    modelEntries: List<ModelEntry> = emptyList(),
+) {
+    var reloadKey by remember { mutableStateOf(0) }
+    var defaultsExpanded by remember { mutableStateOf(false) }
+    val customRulesAndIds = remember(instance.id, reloadKey) {
+        providerRepository.thinkingRulesWithIds(instance.id)
+    }
+    val builtIns = remember(instance.id, instance.customBaseURL, instance.appendV1Suffix, modelEntries, reloadKey) {
+        providerRepository.builtInThinkingRulesForDisplay(instance.id)
+    }
+    val sampleModelId = remember(instance.id, modelEntries, reloadKey) {
+        providerRepository.firstModelId(instance.id)
+    }
+}
+"""
+
+FIX_THINKING_NO_BASEURL_KEY = FIX_THINKING_CLEAN.replace(
+    "remember(instance.id, instance.customBaseURL, instance.appendV1Suffix, modelEntries, reloadKey)",
+    "remember(instance.id, instance.appendV1Suffix, modelEntries, reloadKey)")
+
+FIX_THINKING_BUILTINS_NO_MODEL_ENTRIES = FIX_THINKING_CLEAN.replace(
+    "remember(instance.id, instance.customBaseURL, instance.appendV1Suffix, modelEntries, reloadKey)",
+    "remember(instance.id, instance.customBaseURL, instance.appendV1Suffix, reloadKey)")
+
+FIX_THINKING_SAMPLE_NO_MODEL_ENTRIES = FIX_THINKING_CLEAN.replace(
+    "remember(instance.id, modelEntries, reloadKey) {\n        providerRepository.firstModelId(instance.id)",
+    "remember(instance.id, reloadKey) {\n        providerRepository.firstModelId(instance.id)")
+
+FIX_THINKING_SAMPLE_KEYLESS = FIX_THINKING_CLEAN.replace(
+    "remember(instance.id, modelEntries, reloadKey) {\n        providerRepository.firstModelId(instance.id)",
+    "remember {\n        providerRepository.firstModelId(instance.id)")
+
+FIX_THINKING_MISSING_ANCHOR = """package com.rikkaminis.app.ui.settings
+
+fun unrelated() {}
+"""
+
+# Precision control: touching a remember this criterion does NOT own (a Room
+# loader and two pure-UI flags, one keyless) must leave the gate green —
+# otherwise "any keyless remember reds" would masquerade as coverage.
+FIX_THINKING_PRECISION_UNRELATED = FIX_THINKING_CLEAN.replace(
+    "    val customRulesAndIds = remember(instance.id, reloadKey) {",
+    "    var editorRequest by remember { mutableStateOf<ThinkingRuleEditorRequest?>(null) }\n"
+    "    val customRulesAndIds = remember {",
+)
+
 CLEAN_TREE = {
     REL_PROVIDER_LIST: FIX_PROVIDER_LIST_CLEAN,
     REL_SHEET: FIX_SHEET_CLEAN,
@@ -838,6 +972,7 @@ CLEAN_TREE = {
     REL_MOUNT_DETAIL: FIX_MOUNT_DETAIL_CLEAN,
     REL_APP_NAV: FIX_APPNAV_CLEAN,
     REL_USAGE_STATS: FIX_USAGE_STATS_CLEAN,
+    REL_THINKING_SECTION: FIX_THINKING_CLEAN,
 }
 
 
@@ -939,7 +1074,8 @@ def run_selftest():
     run_case("c7-detail-state-backed-variant", 0,
              variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_STATE_BACKED), failures)
     run_case("failclosed-missing-detail-anchor", 1,
-             variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_MISSING_ANCHOR), failures, ("C7",))
+             variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_MISSING_ANCHOR), failures,
+             ("C7", "C11c"))
     # --- da1027-E: C8 / C9 (field-keyed editors) ---------------------------
     run_case("c8-group-no-name-key", 1,
              variant(REL_GROUP_DETAIL, FIX_GROUP_DETAIL_NO_NAME_KEY), failures, ("C8",))
@@ -958,6 +1094,23 @@ def run_selftest():
              variant(REL_USAGE_STATS, FIX_USAGE_STATS_NO_CONFIG_KEY), failures, ("C10b",))
     run_case("failclosed-missing-usage-anchor", 1,
              variant(REL_USAGE_STATS, FIX_USAGE_STATS_MISSING_ANCHOR), failures, ("C10b",))
+    # --- da1028-C: C11a / C11b / C11c (ThinkingRulesSection derived keys) ---
+    run_case("c11a-builtins-no-baseurl-key", 1,
+             variant(REL_THINKING_SECTION, FIX_THINKING_NO_BASEURL_KEY), failures, ("C11a",))
+    run_case("c11a-builtins-no-modelEntries-key", 1,
+             variant(REL_THINKING_SECTION, FIX_THINKING_BUILTINS_NO_MODEL_ENTRIES), failures, ("C11a",))
+    run_case("c11b-sample-no-modelEntries-key", 1,
+             variant(REL_THINKING_SECTION, FIX_THINKING_SAMPLE_NO_MODEL_ENTRIES), failures, ("C11b",))
+    run_case("c11b-sample-keyless-remember", 1,
+             variant(REL_THINKING_SECTION, FIX_THINKING_SAMPLE_KEYLESS), failures, ("C11b",))
+    # precision: a remember this criterion does not own (keyless UI flag + a
+    # Room loader) must NOT turn the gate red
+    run_case("c11-precision-unrelated-remember-green", 0,
+             variant(REL_THINKING_SECTION, FIX_THINKING_PRECISION_UNRELATED), failures)
+    run_case("failclosed-missing-thinking-anchor", 1,
+             variant(REL_THINKING_SECTION, FIX_THINKING_MISSING_ANCHOR), failures, ("C11a", "C11b"))
+    run_case("c11c-detail-call-site-undrilled", 1,
+             variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_NO_SECTION_ARGS), failures, ("C11c",))
     if failures:
         print("SELFTEST FAILURES:")
         for f in failures:

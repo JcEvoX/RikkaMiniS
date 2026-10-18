@@ -781,13 +781,18 @@ fun ChatScreen(
     }
 
     // App-icon quick action: when the user launched via
-    // `minis://action/camera_chat`, auto-open the camera on first compose.
-    // Consumed exactly once so re-entering the chat later does NOT re-trigger.
+    // `minis://action/camera_chat`, auto-open the camera.
+    // [da1028-C] Subscribe reactively (same shape as the pendingHtmlPreview
+    // block further down): the old `.value` snapshot was read only when the
+    // effect first composed, so a quick action delivered to an already-composed
+    // ChatScreen (warm start — Activity not recreated) was never observed and
+    // the camera never opened. Consumed exactly once so re-entering the chat
+    // later does NOT re-trigger.
     // (The old voice quick-action variant was removed with the mic button.)
-    LaunchedEffect(sessionId) {
-        val pending = com.rikkaminis.app.deeplink.DeepLinkCoordinator
-            .pendingChatAction.value
-        if (pending == com.rikkaminis.app.deeplink.DeepLinkCoordinator
+    val pendingChatActionState by com.rikkaminis.app.deeplink.DeepLinkCoordinator
+        .pendingChatAction.collectAsState()
+    LaunchedEffect(sessionId, pendingChatActionState) {
+        if (pendingChatActionState == com.rikkaminis.app.deeplink.DeepLinkCoordinator
                 .ChatAction.OPEN_CAMERA
         ) {
             com.rikkaminis.app.deeplink.DeepLinkCoordinator

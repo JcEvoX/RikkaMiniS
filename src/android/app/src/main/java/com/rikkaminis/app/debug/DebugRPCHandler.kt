@@ -381,15 +381,17 @@ class DebugRPCHandler(private val context: Context) {
         val offset = params.optLong("offset", 0)
         // [fix/audit-s7l2] clamp limit like handleLogsRead/maxDepth/scale —
         // previously a token-authenticated client could pass Int.MAX_VALUE and
-        // trigger a huge readNBytes allocation. Cap at 4 MiB (read() may still
-        // return fewer bytes than requested when the file is smaller).
+        // trigger a huge allocation. Cap at 4 MiB (a short read is normal when
+        // the file is smaller).
         val limit = params.optInt("limit", 524_288).coerceIn(1, 4 * 1024 * 1024)
         val forceBase64 = params.optBoolean("base64", false)
 
-        val bytes = hostFile.inputStream().use { stream ->
-            if (offset > 0) stream.skip(offset)
-            stream.readNBytes(limit)
-        }
+        // [da1028-A] was `inputStream().use { it.skip(offset); it.readNBytes(limit) }`:
+        // readNBytes(int) is API 33+ (minSdk 26 → NoSuchMethodError on Android
+        // 8-12) and `skip`'s return value was dropped, so a short skip silently
+        // read from the wrong offset. RandomAccessFile.seek + bounded read has
+        // neither problem — same shape as AppLogger.readLogSegment.
+        val bytes = readFileSegment(hostFile, offset, limit)
 
         val isText = !forceBase64 && bytes.all {
             it in 0x09..0x0D || it in 0x20..0x7E || it.toInt() and 0xFF > 0x7F
@@ -1227,3 +1229,43 @@ class DebugRPCHandler(private val context: Context) {
 }
 
 internal class RPCException(val code: Int, override val message: String) : Exception(message)
+
+/**
+ * [da1028-A] Bounded segment read for `debug.readFile`, API-26 safe.
+ *
+ * The inline shape this replaces (`inputStream().use { it.skip(offset);
+ * it.readNBytes(limit) }`) had two defects:
+ *   1. `java.io.InputStream.readNBytes(int)` is API 33+ while minSdk is 26 and
+ *      desugaring is off — on Android 8-12 the call threw `NoSuchMethodError`,
+ *      which is an `Error`, not an `Exception` (the `catch (e: Exception)`
+ *      wrappers around RPC handling do not cover it, so the debug client saw a
+ *      dead socket instead of an error reply).
+ *   2. `skip()` may skip FEWER bytes than requested and its return value was
+ *      discarded: the read then started past (or short of) `offset` and
+ *      returned plausible-looking wrong bytes, with no way for the client to
+ *      notice.
+ *
+ * Shape mirrors [com.rikkaminis.app.logging.AppLogger.readLogSegment] (same
+ * offset/limit contract, already reviewed): clamp the window against the file
+ * size, then read exactly that many bytes with `RandomAccessFile`. EOF is not
+ * an error — the caller returns `bytesRead`/`truncated` from what it actually
+ * got — so a short read yields fewer bytes (no zero padding) and an offset at
+ * or past EOF yields an empty array.
+ */
+internal fun readFileSegment(file: File, offset: Long, limit: Int): ByteArray {
+    val size = file.length()
+    val start = offset.coerceIn(0L, size)
+    val end = (start + limit.coerceAtLeast(0).toLong()).coerceAtMost(size)
+    if (end <= start) return ByteArray(0)
+    val out = ByteArray((end - start).toInt())
+    java.io.RandomAccessFile(file, "r").use { raf ->
+        raf.seek(start)
+        var read = 0
+        while (read < out.size) {
+            val n = raf.read(out, read, out.size - read)
+            if (n < 0) break
+            read += n
+        }
+        return if (read == out.size) out else out.copyOf(read)
+    }
+}

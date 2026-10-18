@@ -34,6 +34,26 @@ All criteria are fail-closed: if the anchor function/block cannot be extracted
 from the (comment-stripped) source, the criterion is RED, never silently
 skipped.
 
+[da1028-B / ISSUE-03] Four more criteria pin the two halves of the same
+field-evap class on the *backup scope* face:
+  8.  ConfigBackup.BACKED_UP_SCOPES must contain "envvars" — else
+      `envvars.privacyMode` is dropped from every backup AND refused on the way
+      back in ("outside backup scope"), so migrating devices lose the privacy
+      switch silently.
+  9.  ConfigBuiltins.registerBackground must register path
+      "background.overlay" — the same switch exists in Settings → Background
+      but `minis-config set background.overlay …` answered "unknown field".
+  10. That registration must reference BackgroundSettingsRepository's
+      KEY_BG_OVERLAY_ENABLED / DEFAULT_BG_OVERLAY_ENABLED constants and must NOT
+      re-spell the raw key literal (the F-238/F-239 single-source rule).
+  11. Reverse anchors: the eight legacy scopes are still in BACKED_UP_SCOPES
+      and `envvars.privacyMode` is still registered — guards a "fix" that
+      swaps something out instead of adding.
+
+Criteria 8–11 only run when the caller supplies a ConfigBackup.kt path; the
+legacy mini-tree fixtures (which hold only the three config files) leave the
+parameter out and are judged by 1–7 exactly as before.
+
 Usage:
     python3 envvar_config_group_check.py <repo_root>   # real-tree mode
     python3 envvar_config_group_check.py --selftest    # fixture mode
@@ -181,6 +201,7 @@ def func_window(text: str, header_re: str, stop_re: str = r"\n    (private |over
 ENVVARS_REL = "EnvVarsCollection.kt"
 BUILTINS_REL = "ConfigBuiltins.kt"
 GROUPS_REL = "GroupsCollection.kt"
+BACKUP_REL = "ConfigBackup.kt"
 
 
 def check_fields_registration(envvars_src: str) -> str | None:
@@ -303,8 +324,96 @@ def check_providers_summary_ua_key(builtins_src: str) -> str | None:
         return "C7 RED: providers summary block lost its customUserAgent key"
     return None
 
+# --------------------------------------------------------------------------
+# [da1028-B / ISSUE-03] Criteria 8-11 — the backup-scope face of the same
+# field-evap class.
+# --------------------------------------------------------------------------
 
-def check(envvars_path: str, builtins_path: str, groups_path: str) -> list[str]:
+LEGACY_BACKED_UP_SCOPES = (
+    "appearance", "chat", "background", "defaults",
+    "soul", "memory", "logs", "runtime",
+)
+
+def backed_up_scopes_block(backup_src: str) -> str | None:
+    """The `setOf( … )` argument of BACKED_UP_SCOPES. None (fail-closed) when
+    the declaration is absent or the parens never balance."""
+    text = strip_comments(backup_src)
+    m = re.search(r"val\s+BACKED_UP_SCOPES\s*=\s*setOf\(", text)
+    if not m:
+        return None
+    return extract_paren_block(text, m.end() - 1)
+
+def check_backup_scope_envvars(backup_src: str) -> str | None:
+    """Criterion 8: BACKED_UP_SCOPES carries "envvars"."""
+    block = backed_up_scopes_block(backup_src)
+    if block is None:
+        return "C8 EXTRACT_FAIL: ConfigBackup.BACKED_UP_SCOPES setOf(…) not found (fail-closed)"
+    if '"envvars"' not in block:
+        return (
+            'C8 RED: BACKED_UP_SCOPES lacks "envvars" — envvars.privacyMode is '
+            "dropped from every backup and refused on restore (\"outside backup scope\")"
+        )
+    return None
+
+def check_overlay_registration(builtins_src: str) -> str | None:
+    """Criterion 9: registerBackground registers path "background.overlay"."""
+    text = strip_comments(builtins_src)
+    body = extract_braced(text, r"fun registerBackground\(r: ConfigRegistry,\s*context: Context\)")
+    if body is None:
+        return (
+            "C9 EXTRACT_FAIL: ConfigBuiltins.registerBackground(r: ConfigRegistry, context: Context) "
+            "body not found (fail-closed)"
+        )
+    if 'path = "background.overlay"' not in body:
+        return (
+            'C9 RED: registerBackground does not register path "background.overlay" — '
+            'the Settings → Background overlay switch is unreachable via minis-config '
+            '("unknown field") and is in no backup scope'
+        )
+    return None
+
+def check_overlay_single_source(builtins_src: str) -> str | None:
+    """Criterion 10: the overlay registration references the repository's key +
+    default constants and does not re-spell the raw key (F-238/F-239 rule: the
+    registry and BackgroundSettingsRepository must name the key identically)."""
+    text = strip_comments(builtins_src)
+    body = extract_braced(text, r"fun registerBackground\(r: ConfigRegistry,\s*context: Context\)")
+    if body is None:
+        return (
+            "C10 EXTRACT_FAIL: ConfigBuiltins.registerBackground(r: ConfigRegistry, context: Context) "
+            "body not found (fail-closed)"
+        )
+    for const in ("KEY_BG_OVERLAY_ENABLED", "DEFAULT_BG_OVERLAY_ENABLED"):
+        if const not in body:
+            return (
+                f"C10 RED: registerBackground does not reference "
+                f"BackgroundSettingsRepository.{const} — a re-typed key/default "
+                f"drifts out of that companion silently"
+            )
+    if '"backgroundOverlayEnabled"' in body:
+        return (
+            'C10 RED: registerBackground spells the raw key literal '
+            '"backgroundOverlayEnabled" instead of the repository constant'
+        )
+    return None
+
+def check_reverse_anchors(backup_src: str, builtins_src: str) -> str | None:
+    """Criterion 11 (reverse anchors): the eight legacy scopes are still in
+    BACKED_UP_SCOPES, and `envvars.privacyMode` is still a registered field —
+    a fix that swaps one out for the other is not a fix."""
+    block = backed_up_scopes_block(backup_src)
+    if block is None:
+        return "C11 EXTRACT_FAIL: ConfigBackup.BACKED_UP_SCOPES setOf(…) not found (fail-closed)"
+    for scope in LEGACY_BACKED_UP_SCOPES:
+        if '"%s"' % scope not in block:
+            return f'C11 RED: BACKED_UP_SCOPES lost legacy scope "{scope}"'
+    if not re.search(r'path\s*=\s*"envvars\.privacyMode"', strip_comments(builtins_src)):
+        return 'C11 RED: path = "envvars.privacyMode" is no longer registered in ConfigBuiltins'
+    return None
+
+
+def check(envvars_path: str, builtins_path: str, groups_path: str,
+          backup_path: str | None = None) -> list[str]:
     with open(envvars_path, encoding="utf-8") as f:
         ev = f.read()
     with open(builtins_path, encoding="utf-8") as f:
@@ -324,12 +433,28 @@ def check(envvars_path: str, builtins_path: str, groups_path: str) -> list[str]:
         r = fn(src)
         if r is not None:
             failures.append(r)
+
+    # Criteria 8-11 (da1028-B). Judged only when the caller hands us the backup
+    # source: the three-file mini fixtures predate this arm and keep their
+    # one-criterion-per-fixture shape.
+    if backup_path is not None:
+        with open(backup_path, encoding="utf-8") as f:
+            bk = f.read()
+        for fn in (
+            lambda: check_backup_scope_envvars(bk),
+            lambda: check_overlay_registration(cb),
+            lambda: check_overlay_single_source(cb),
+            lambda: check_reverse_anchors(bk, cb),
+        ):
+            r = fn()
+            if r is not None:
+                failures.append(r)
     return failures
 
 
-def locate(root: str) -> tuple[str, str, str]:
-    """Locate the three production files under repo_root. Fail-closed."""
-    ev = cb = gr = None
+def locate(root: str) -> tuple[str, str, str, str]:
+    """Locate the four production files under repo_root. Fail-closed."""
+    ev = cb = gr = bk = None
     for dirpath, _dirnames, filenames in os.walk(root):
         if "build" in dirpath.split(os.sep) or "test" in dirpath.split(os.sep):
             continue
@@ -340,13 +465,17 @@ def locate(root: str) -> tuple[str, str, str]:
                 cb = os.path.join(dirpath, fn)
             elif fn == GROUPS_REL and gr is None and "config" in dirpath.split(os.sep):
                 gr = os.path.join(dirpath, fn)
+            elif fn == BACKUP_REL and bk is None and "backup" in dirpath.split(os.sep):
+                bk = os.path.join(dirpath, fn)
     if ev is None:
         raise SystemExit("LOCATE_FAIL: EnvVarsCollection.kt not found under " + root)
     if cb is None:
         raise SystemExit("LOCATE_FAIL: ConfigBuiltins.kt not found under " + root)
     if gr is None:
         raise SystemExit("LOCATE_FAIL: GroupsCollection.kt not found under " + root)
-    return ev, cb, gr
+    if bk is None:
+        raise SystemExit("LOCATE_FAIL: ConfigBackup.kt not found under " + root)
+    return ev, cb, gr, bk
 
 
 # --------------------------------------------------------------------------
@@ -505,6 +634,83 @@ object ConfigBuiltins {
 }
 '''
 
+
+FIXTURE_BACKUP_OK = '''package fake
+
+object ConfigBackup {
+    internal val BACKED_UP_SCOPES = setOf(
+        "appearance",
+        "chat",
+        "background",
+        "defaults",
+        "soul",
+        "memory",
+        "logs",
+        "runtime",
+        "envvars",
+    )
+}
+'''
+
+OVERLAY_FN_OK = '''    private fun registerBackground(r: ConfigRegistry, context: Context) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        r.register(
+            PrefsBoolField(
+                path = "background.overlay",
+                displayName = "Background task overlay",
+                prefs = prefs,
+                key = com.rikkaminis.app.data.repository.BackgroundSettingsRepository
+                    .KEY_BG_OVERLAY_ENABLED,
+                defaultValue = com.rikkaminis.app.data.repository.BackgroundSettingsRepository
+                    .DEFAULT_BG_OVERLAY_ENABLED,
+            )
+        )
+    }
+
+'''
+
+PRIVACY_FN_OK = '''    private fun registerEnvVars(r: ConfigRegistry, context: Context) {
+        r.register(
+            ClosureField(
+                path = "envvars.privacyMode",
+                displayName = "Privacy Mode",
+                valueSchema = ConfigSchema.Bool,
+                reader = { ConfigValue.Bool(true) },
+                writer = { v -> Unit },
+            )
+        )
+    }
+'''
+
+def inject_members(src: str, members: str) -> str:
+    """Append members just before the object's closing brace (fixture sugar:
+    the injected text stays inside `object ConfigBuiltins { … }`)."""
+    i = src.rstrip().rfind("}")
+    return src[:i] + "\n" + members + src[i:]
+
+def full_fixture(builtins: str, backup: str) -> str:
+    """A four-source mini tree: criteria 1-7 run on the config fixtures as
+    before, 8-11 additionally judge ConfigBuiltins + ConfigBackup."""
+    d = tempfile.mkdtemp(prefix="envvar_group_full_")
+    os.makedirs(os.path.join(d, "fake", "config", "collections"))
+    os.makedirs(os.path.join(d, "fake", "backup"))
+    with open(os.path.join(d, "fake", "config", "collections", "EnvVarsCollection.kt"), "w", encoding="utf-8") as f:
+        f.write(FIXTURE_ENVVARS_OK)
+    with open(os.path.join(d, "fake", "config", "collections", "GroupsCollection.kt"), "w", encoding="utf-8") as f:
+        f.write(FIXTURE_GROUPS_OK)
+    with open(os.path.join(d, "fake", "config", "ConfigBuiltins.kt"), "w", encoding="utf-8") as f:
+        f.write(builtins)
+    with open(os.path.join(d, "fake", "backup", "ConfigBackup.kt"), "w", encoding="utf-8") as f:
+        f.write(backup)
+    return d
+
+def full_check(d: str) -> list[str]:
+    return check(
+        os.path.join(d, "fake", "config", "collections", "EnvVarsCollection.kt"),
+        os.path.join(d, "fake", "config", "ConfigBuiltins.kt"),
+        os.path.join(d, "fake", "config", "collections", "GroupsCollection.kt"),
+        os.path.join(d, "fake", "backup", "ConfigBackup.kt"),
+    )
 
 def fixture_dir() -> str:
     d = tempfile.mkdtemp(prefix="envvar_group_selftest_")
@@ -698,6 +904,110 @@ def run_fixtures() -> bool:
         for dd in (d2, d3, d4, d5, d6, d7, d8, d9, d10):
             shutil.rmtree(dd, ignore_errors=True)
 
+    # ── [da1028-B / ISSUE-03] criteria 8-11 ────────────────────────────────
+    # Four-source trees: 1-7 judge the config fixtures as always, 8-11 judge
+    # the backup scope list + the registerBackground block.
+
+    def expect_prefixes(label: str, failures: list[str], wants: tuple) -> bool:
+        """Precision control for arms where a shared precondition legitimately
+        trips more than one criterion: the failure list must match `wants`
+        exactly (same length, same order, same "Cx KIND" heads)."""
+        def head(s: str) -> str:
+            return (s.split(":", 1)[0] if ":" in s else s).strip()
+
+        got = tuple(head(f) for f in failures)
+        want = tuple(head(w) for w in wants)
+        if got != want:
+            print(f"[SELFTEST] {label}: expected {want}, got {failures}")
+            return False
+        print(f"[SELFTEST] {label}: red as expected ({'; '.join(failures)})")
+        return True
+
+    BUILTINS_OK4 = inject_members(FIXTURE_BUILTINS_OK, OVERLAY_FN_OK + PRIVACY_FN_OK)
+    fds = []
+
+    def full_arm(label: str, builtins: str, backup: str, wants) -> bool:
+        d4 = full_fixture(builtins, backup)
+        fds.append(d4)
+        fails = full_check(d4)
+        if not wants:
+            if fails:
+                print(f"[SELFTEST] {label}: expected GREEN, got {fails}")
+                return False
+            print(f"[SELFTEST] {label}: GREEN as expected")
+            return True
+        return expect_prefixes(label, fails, wants)
+
+    ok &= full_arm("FIX-11 complete (all four sources)", BUILTINS_OK4, FIXTURE_BACKUP_OK, ())
+
+    # FIX-12: whitelist drops "envvars" -> exactly C8
+    ok &= full_arm(
+        "FIX-12 backup-whitelist-no-envvars",
+        BUILTINS_OK4,
+        FIXTURE_BACKUP_OK.replace('        "envvars",\n', ""),
+        ("C8 RED:",),
+    )
+
+    # FIX-13: overlay registered under the wrong path -> exactly C9 (the
+    # constants are intact, so C10 stays green — arms must not blur together)
+    ok &= full_arm(
+        "FIX-13 overlay-wrong-path",
+        BUILTINS_OK4.replace('path = "background.overlay"', 'path = "background.overlayEnabled"'),
+        FIXTURE_BACKUP_OK,
+        ("C9 RED:",),
+    )
+
+    # FIX-14: key re-spelled as the raw literal instead of the repository
+    # constant -> exactly C10
+    ok &= full_arm(
+        "FIX-14 overlay-key-literal",
+        BUILTINS_OK4.replace(
+            "                key = com.rikkaminis.app.data.repository.BackgroundSettingsRepository\n"
+            "                    .KEY_BG_OVERLAY_ENABLED,",
+            '                key = "backgroundOverlayEnabled",',
+        ),
+        FIXTURE_BACKUP_OK,
+        ("C10 RED:",),
+    )
+
+    # FIX-15 (fail-closed control): no registerBackground member at all ->
+    # C9 and C10 both refuse to judge, never a silent green (the privacy
+    # registration stays so this arm isolates the overlay precondition)
+    ok &= full_arm(
+        "FIX-15 overlay-registration-absent",
+        inject_members(FIXTURE_BUILTINS_OK, PRIVACY_FN_OK),
+        FIXTURE_BACKUP_OK,
+        ("C9 EXTRACT_FAIL:", "C10 EXTRACT_FAIL:"),
+    )
+
+    # FIX-16 (fail-closed control): the scope set is gone -> C8 + C11 refuse
+    ok &= full_arm(
+        "FIX-16 backup-anchor-absent",
+        BUILTINS_OK4,
+        "package fake\n\nobject ConfigBackup {\n}\n",
+        ("C8 EXTRACT_FAIL:", "C11 EXTRACT_FAIL:"),
+    )
+
+    # FIX-17 (reverse anchor): a legacy scope is swapped out -> exactly C11
+    ok &= full_arm(
+        "FIX-17 legacy-scope-swapped-out",
+        BUILTINS_OK4,
+        FIXTURE_BACKUP_OK.replace('        "runtime",\n', ""),
+        ("C11 RED:",),
+    )
+
+    # FIX-18 (reverse anchor): the privacy toggle stops being registered ->
+    # exactly C11
+    ok &= full_arm(
+        "FIX-18 privacyMode-unregistered",
+        inject_members(FIXTURE_BUILTINS_OK, OVERLAY_FN_OK),
+        FIXTURE_BACKUP_OK,
+        ("C11 RED:",),
+    )
+
+    for dd in fds:
+        shutil.rmtree(dd, ignore_errors=True)
+
     return ok
 
 
@@ -713,14 +1023,14 @@ def main() -> int:
     if not roots:
         print("usage: envvar_config_group_check.py <repo_root> | --selftest")
         return 2
-    ev, cb, gr = locate(roots[0])
-    failures = check(ev, cb, gr)
+    ev, cb, gr, bk = locate(roots[0])
+    failures = check(ev, cb, gr, bk)
     if failures:
         for f in failures:
             print(f)
         print(f"envvar_config_group_check: {len(failures)} violation(s)")
         return 1
-    print("envvar_config_group_check: OK (7 criteria green)")
+    print("envvar_config_group_check: OK (11 criteria green)")
     return 0
 
 

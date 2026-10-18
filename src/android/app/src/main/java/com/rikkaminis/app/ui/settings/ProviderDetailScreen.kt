@@ -257,7 +257,16 @@ fun ProviderDetailScreen(
         }
 
         // ─── Thinking Rules [T-android-thinking-rules-phase2 §3] ─────
-        ThinkingRulesSection(instance = currentInstance, providerRepository = providerRepository)
+        // [da1028-C] Pass the full entry list (entriesFor, not the visible-only
+        // `entries`): builtInThinkingRulesForDisplay / firstModelId both read
+        // `config.modelEntries` for this instance, so the section's `remember`
+        // keys must observe that exact source or a catalog refresh leaves the
+        // list + resolution preview on a stale snapshot.
+        ThinkingRulesSection(
+            instance = currentInstance,
+            providerRepository = providerRepository,
+            modelEntries = allEntries,
+        )
 
         // ─── Models ─────────────────────────────────────────────────
         SettingsSection(
