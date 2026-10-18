@@ -2879,6 +2879,23 @@ def test_da1024_gates():
         check("%s real tree green" % script, rc == 0, out[-280:])
 
 
+DA1026_ARCH_GATES = [
+    ("provider_write_rules_check", "PROVIDER_WRITE_RULES_SELFTEST=PASS", (), (REPO_ROOT,)),
+    ("provider_type_registry_check", "PROVIDER_TYPE_REGISTRY_SELFTEST=PASS", (), (REPO_ROOT,)),
+]
+
+def test_da1026_arch_gates():
+    print("━━━ deep-audit-1026 ARCH gates (selftest teeth + real tree) ━━━")
+    for script, marker, st_extra, real_args in DA1026_ARCH_GATES:
+        argv = [sys.executable, os.path.join(SCRIPT_DIR, script + ".py")] + list(st_extra) + ["--selftest"]
+        proc = subprocess.run(argv, capture_output=True, text=True)
+        out = (proc.stdout or "") + (proc.stderr or "")
+        check("%s selftest has teeth (%s)" % (script, marker),
+              proc.returncode == 0 and marker in out, out[-280:])
+        rc, out = run_scanner(script + ".py", *real_args)
+        check("%s real tree green" % script, rc == 0, out[-280:])
+
+
 DA1026_GATES = [
     ("models_provider_field_check", "MODELS_PROVIDER_FIELD_SELFTEST=PASS", (), (REPO_ROOT,)),
 ]
@@ -3012,6 +3029,7 @@ def main():
     test_da1024_gates()
     test_da1025_gates()
     test_da1026_gates()
+    test_da1026_arch_gates()
     test_trace_step_tag()
     test_da1017_external_fixtures()
     test_real_repo()
