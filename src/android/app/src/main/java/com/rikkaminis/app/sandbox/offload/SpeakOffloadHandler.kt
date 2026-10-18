@@ -46,7 +46,12 @@ class SpeakOffloadHandler(private val context: Context) : NativeOffloadHandler {
     private val tts = TextToSpeechManager().also { it.init(context) }
 
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
-        val args = OffloadArgs(request.argv.drop(1))
+        // [da1026-B] `--stop` / `--status` are read with hasFlag below, so they
+        // must be declared boolean or the parser's greedy `--key value` branch
+        // eats the next token (`android-speak --stop now` used to store
+        // "now" as the value of `--stop` → hasFlag("stop") false → the
+        // dispatcher reported "missing command" and the audio kept playing).
+        val args = OffloadArgs(request.argv.drop(1), booleanFlags = setOf("stop", "status"))
         if (args.hasFlag("h", "help")) return NativeOffloadResult(0, HELP)
 
         // Legacy `--stop` flag — pre-T60 callers used it as a synonym for
