@@ -236,6 +236,49 @@ class MemoryRepositoryTest {
         assertFalse("the daily log file must be gone", log.exists())
     }
 
+    // -- [deep-audit-1029 ISSUE-03] saveFile/readFile call contract --------
+    // Settings → Memory's file editor writes SOUL.md through the raw
+    // MemoryRepository.saveFile path (it does not go through SoulStore.save,
+    // which is why the UI refreshes SoulStore's cache by hand afterwards).
+    // Pin the two assumptions that path makes: the bytes land verbatim, and
+    // the persona name really is the agreed literal (no drift away from
+    // SoulStore.FILE_NAME). Expectations are written as literals on purpose —
+    // deriving them from the constant under test would let a rename pass.
+    @Test
+    fun saveFile_writesSoulPersonaByteExact() {
+        memoryDir.mkdirs()
+        val repo = MemoryRepository(memoryDir)
+        val content = "---\nname: Rikka\n---\n\nbody with unicode \u2713 中文\n"
+
+        repo.saveFile(SoulStore.FILE_NAME, content)
+
+        val written = File(memoryDir, SoulStore.FILE_NAME)
+        assertTrue("SOUL.md must exist on disk after saveFile", written.exists())
+        assertEquals("saveFile must write the exact bytes", content, written.readText())
+        assertEquals(
+            "the persona file name is the agreed literal",
+            "SOUL.md",
+            SoulStore.FILE_NAME,
+        )
+    }
+
+    @Test
+    fun readFile_soulRoundTrip_survivesLargeBody() {
+        // The editor screen exists for 200KB+ files; the round trip must be
+        // exact at that size, not just on a one-line sample.
+        memoryDir.mkdirs()
+        val repo = MemoryRepository(memoryDir)
+        val content = "A".repeat(200_000) + "\nTAIL-CHUNK\n"
+
+        repo.saveFile(SoulStore.FILE_NAME, content)
+
+        assertEquals(
+            "readFile must return exactly what saveFile wrote",
+            content,
+            repo.readFile(SoulStore.FILE_NAME),
+        )
+    }
+
     // ── F-9: dailyLogSizeSummary / largestDailyLogBytes on empty input ──
     // Pre-fix, dailyLogSizes() returned null only when the DIR was missing;
     // an existing-but-filtered-empty dir (all files excluded, e.g. only
