@@ -86,6 +86,14 @@ class GroupsCollection(
             defaultThinkingLevel = defaultThinking,
             contextLimitTokens = contextLimit,
         )
+        // [fix/da1026-H] Same write semantics as the contextLimitField writer
+        // (:230): a positive CLI limit must also refresh the "last selected"
+        // memory the UI restores on an OFF→ON toggle — without this, a group
+        // created here kept lastContextLimitTokens at the null default, so the
+        // first limit-clearing write (CLI 0 or the UI switch) left nothing to
+        // restore and the toggle snapped back to the 128K default instead of
+        // the value the user set at creation.
+        applyContextLimitWrite(g, contextLimit ?: 0)
         repo.addGroup(g)
         return g.id
     }
