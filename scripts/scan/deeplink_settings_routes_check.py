@@ -428,6 +428,17 @@ def check(root: Path) -> None:
                  "cold-start dispatch still ends in a catch-all `else ->` — name the "
                  "remaining subclasses explicitly so adding one is a compile error here "
                  "instead of a silent no-op")
+        # The subject is `DeepLinkAction?`; with the catch-all gone the compiler
+        # demands an explicit null branch ("'when' expression must be
+        # exhaustive"). Mirror that at the source layer so the failure is caught
+        # offline instead of on the CI compile pass.
+        if re.search(r"initialDeepLink\s*:\s*DeepLinkAction\s*\?", nav) and \
+                not re.search(r"(?:^|,)\s*null\s*->", dispatch, re.M):
+            fail(REL_NAV,
+                 "cold-start dispatch: `initialDeepLink` is nullable "
+                 "(`DeepLinkAction?`) and the catch-all `else` is gone — the `when` "
+                 "must name the `null` case explicitly (otherwise the compiler "
+                 "rejects it: \"'when' expression must be exhaustive\")")
         if not re.search(
             r"is\s+DeepLinkAction\.OpenAlarmList\s*->\s*\{[^}]*"
             r"AlarmClock\.ACTION_SHOW_ALARMS",
@@ -489,7 +500,7 @@ object Routes {
     fun mirrorCategoryDetail(categoryId: String) = "mirror_category/${seg(categoryId)}"
 }
 
-suspend fun handleColdStartDeepLink(navController: NavController, initialDeepLink: DeepLinkAction) {
+suspend fun handleColdStartDeepLink(navController: NavController, initialDeepLink: DeepLinkAction?) {
     when (initialDeepLink) {
         is DeepLinkAction.OpenTerminal -> {
             navController.navigate(Routes.terminal(initialDeepLink.initCommand))
@@ -516,7 +527,8 @@ suspend fun handleColdStartDeepLink(navController: NavController, initialDeepLin
             context.startActivity(showAlarms)
         }
         is DeepLinkAction.OpenShare,
-        is DeepLinkAction.Unknown -> {}
+        is DeepLinkAction.Unknown,
+        null -> {}
     }
 }
 
@@ -942,7 +954,8 @@ def selftest() -> None:
 
         # fixture Q: put the catch-all `else -> {}` back -> must fail
         write_fixture(root, FIXTURE_DLH, FIXTURE_NAV.replace(
-            "        is DeepLinkAction.OpenShare,\n        is DeepLinkAction.Unknown -> {}",
+            "        is DeepLinkAction.OpenShare,\n"
+            "        is DeepLinkAction.Unknown,\n        null -> {}",
             "        else -> {}",
         ), FIXTURE_MAIN)
         VIOLATIONS.clear()
@@ -988,6 +1001,35 @@ def selftest() -> None:
             print(f"SELFTEST S (resolver else -> null) leaked into criterion 11: {noise}")
         else:
             print("SELFTEST S (startDestination resolver stays out of scope) GREEN as expected")
+
+        # fixture T [da1029-A]: nullable subject with the `null ->` case dropped.
+        # The catch-all is gone, so this is a hard compile error in the real
+        # build ("'when' expression must be exhaustive") — the gate mirrors it
+        # offline instead of spending a CI round on it.
+        write_fixture(root, FIXTURE_DLH, FIXTURE_NAV.replace(
+            "        is DeepLinkAction.Unknown,\n        null -> {}\n", "",
+        ), FIXTURE_MAIN)
+        VIOLATIONS.clear()
+        check(root)
+        if not any("nullable" in v for v in VIOLATIONS):
+            ok = False
+            print("SELFTEST T (nullable subject, null case dropped) did not trip criterion 11")
+        else:
+            print("SELFTEST T (nullable subject, null case dropped) RED as expected")
+
+        # fixture U [da1029-A] precision: a NON-nullable subject needs no `null`
+        # branch, so dropping it must stay silent.
+        write_fixture(root, FIXTURE_DLH, FIXTURE_NAV.replace(
+            "initialDeepLink: DeepLinkAction?", "initialDeepLink: DeepLinkAction",
+        ).replace("        is DeepLinkAction.Unknown,\n        null -> {}\n", ""),
+            FIXTURE_MAIN)
+        VIOLATIONS.clear()
+        check(root)
+        if any("nullable" in v for v in VIOLATIONS):
+            ok = False
+            print("SELFTEST U (non-nullable subject) leaked the nullable criterion")
+        else:
+            print("SELFTEST U (non-nullable subject needs no null branch) GREEN as expected")
 
     if not ok:
         sys.exit("DEEPLINK_SETTINGS_ROUTES_SELFTEST=FAIL")

@@ -462,9 +462,12 @@ fun AppNavigation(
             // silently into the cold-start no-op path — which is exactly how
             // OpenAlarmList went missing. Naming every remaining subclass makes
             // the `when` exhaustive: adding one is now a compile error here until
-            // it gets a handler.
+            // it gets a handler. `initialDeepLink` is `DeepLinkAction?`, so the
+            // null case is named too — without it the compiler rejects the
+            // `when` outright ("must be exhaustive").
             is DeepLinkAction.OpenShare,
-            is DeepLinkAction.Unknown -> {}
+            is DeepLinkAction.Unknown,
+            null -> {}
         }
     }
 

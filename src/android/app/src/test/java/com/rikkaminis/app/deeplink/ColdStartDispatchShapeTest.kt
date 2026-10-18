@@ -118,7 +118,7 @@ class ColdStartDispatchShapeTest {
     fun `probe rejects a restored catch-all else`() {
         val code = commentFreeLines(readRepoFile(navRel))
         val terminal = "            is DeepLinkAction.OpenShare,\n" +
-            "            is DeepLinkAction.Unknown -> {}"
+            "            is DeepLinkAction.Unknown,\n            null -> {}"
         org.junit.Assume.assumeTrue(
             "tree has no named terminal cases to collapse (pre-da1029 shape)",
             code.contains(terminal),
