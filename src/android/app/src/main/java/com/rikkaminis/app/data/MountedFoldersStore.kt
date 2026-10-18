@@ -121,7 +121,11 @@ class MountedFoldersStore(private val context: Context) {
         // OS-level writability driven by the actual filesystem (Option A path
         // is what PRoot will use, not the SAF grant). isWritePermission can
         // be true while a per-package scoped-storage rule still rejects open(2).
-        val probedWritable = probeWritable(resolvedHostPath)
+        // [deep-audit-1025 ISSUE-08] probeWritable() is blocking file I/O
+        // (create + delete a probe file) and `add()` is reached from a
+        // Main-scoped launch in MountedFoldersScreen — on a slow or
+        // network-backed mount that stalls frames.
+        val probedWritable = withContext(Dispatchers.IO) { probeWritable(resolvedHostPath) }
         val entry = Entry(
             name = name,
             sourceDisplayName = sourceDisplayName,
@@ -205,7 +209,12 @@ class MountedFoldersStore(private val context: Context) {
     suspend fun refreshWritability() = mutex.withLock {
         val before = _entries.value
         val after = before.map { e ->
-            val probed = e.resolvedHostPath?.let { probeWritable(it) } ?: false
+            // [deep-audit-1025 ISSUE-08] the probe is blocking file I/O, and
+            // this reader runs on the caller's thread (Main: ON_RESUME and the
+            // storage-permission result both call it), so probe off it.
+            val probed = e.resolvedHostPath
+                ?.let { p -> withContext(Dispatchers.IO) { probeWritable(p) } }
+                ?: false
             if (probed != e.isWritable) e.copy(isWritable = probed) else e
         }
         if (after != before) {
@@ -274,6 +283,11 @@ class MountedFoldersStore(private val context: Context) {
      * the same reality PRoot will see — `open(O_WRONLY|O_CREAT)` against
      * the real filesystem — so scoped-storage restrictions or freshly
      * revoked permissions reflect honestly in the badge.
+     *
+     * Blocking: this is synchronous host file I/O. Every caller must hop off
+     * its own thread first (`withContext(Dispatchers.IO) { … }`) —
+     * `readonly_mount_write_guard.py` enforces that mechanically
+     * [deep-audit-1025 ISSUE-08].
      */
     fun probeWritable(hostPath: String): Boolean {
         val dir = File(hostPath)
