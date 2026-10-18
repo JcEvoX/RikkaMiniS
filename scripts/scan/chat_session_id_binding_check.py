@@ -26,6 +26,14 @@ This gate pins the six audited entry points (deep-audit-1023 ISSUE-06):
     6. `LaunchedEffect(currentSessionId)` — re-runs the self-filter when the
        promoted id changes instead of caching the draft-era list.
 
+  ChatScreen.kt (deep-audit-1027 ISSUE-01) — criterion 8 below
+    7. pinned-shortcut HTML preview — the `LaunchedEffect` consuming
+       `consumePendingHtmlPreview()` must be keyed on `viewModel.currentSessionId`,
+       resolve through `resolvePathForSession(activeSessionId, …)` (never the
+       global `resolveHostPath`), and accept the promoted id
+       (`pending.sessionId != activeSessionId`) — the route arg alone leaves a
+       shortcut pinned after draft promotion permanently unconsumed.
+
 Bare route-arg usage at these sites must not come back. `resolveKey` itself
 stays private — `katex_ready_race_check.py` hard-pins its source form.
 """
@@ -125,6 +133,64 @@ def extract_call_block(code: str, start: str, end: str) -> str:
     return code[idx : code.find(end, idx) + len(end)] if end else code[idx:]
 
 
+def _skip_string_literal(code: str, i: int) -> int:
+    """Index just past the string literal starting at `code[i]` (a quote).
+
+    Brace matching must not be fooled by `{`/`}` inside literals — the pinned
+    block legitimately contains `"${pending.resourcePath}"` and warning text
+    with interpolations. Mirrors the literal handling in [strip_comments].
+    """
+    quote = code[i]
+    if quote == '"' and code.startswith('"""', i):
+        j = code.find('"""', i + 3)
+        return len(code) if j == -1 else j + 3
+    j = i + 1
+    n = len(code)
+    while j < n:
+        if code[j] == "\\":
+            j += 2
+            continue
+        if code[j] == quote or code[j] == "\n":
+            return j + 1
+        j += 1
+    return n
+
+
+def extract_effect_block(code: str, marker: str) -> "tuple[str, str] | None":
+    """Isolate the `LaunchedEffect(<keys>) { <body> }` block containing [marker].
+
+    Returns `(keys, body)` — the key-list text and the braced body — or `None`
+    when the marker is absent, no enclosing `LaunchedEffect(` precedes it, or
+    the braces do not balance. Callers must treat `None` as a violation
+    (fail-closed): a renamed or relocated block must never silently pass.
+    """
+    idx = code.find(marker)
+    if idx == -1:
+        return None
+    start = code.rfind("LaunchedEffect(", 0, idx)
+    if start == -1:
+        return None
+    brace = code.find("{", start)
+    if brace == -1 or brace > idx:
+        return None
+    depth = 0
+    i = brace
+    n = len(code)
+    while i < n:
+        c = code[i]
+        if c == '"' or c == "'":
+            i = _skip_string_literal(code, i)
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return code[start + len("LaunchedEffect(") : brace], code[brace : i + 1]
+        i += 1
+    return None
+
+
 def check(root: Path) -> int:
     del errors[:]
     screen_path = root / REL_SCREEN
@@ -218,6 +284,55 @@ def check(root: Path) -> int:
             "(katex_ready_race_check.py pins it)"
         )
 
+    # --- 8. pinned-shortcut HTML preview effect (deep-audit-1027 ISSUE-01) ---
+    # Anchored on the consume call so a renamed/moved block is RED, not skipped.
+    effect = extract_effect_block(screen, "consumePendingHtmlPreview()")
+    if effect is None:
+        errors.append(
+            "ChatScreen.kt: pinned-shortcut block anchored on "
+            "`consumePendingHtmlPreview()` is not inside a `LaunchedEffect` "
+            "(renamed or moved? re-anchor this criterion, do not drop it)"
+        )
+    else:
+        effect_keys, effect_body = effect
+        if "viewModel.currentSessionId" not in effect_keys:
+            errors.append(
+                "ChatScreen.kt: pinned-shortcut LaunchedEffect must be keyed on "
+                "`viewModel.currentSessionId` so a promoted draft re-runs it"
+            )
+        if "pendingHtmlPreviewState" not in effect_keys:
+            errors.append(
+                "ChatScreen.kt: pinned-shortcut LaunchedEffect must observe the pending "
+                "state (`pendingHtmlPreviewState` key + `collectAsState()`), not a "
+                "one-shot `.value` read — a hot-path deep link reusing the live "
+                "ChatScreen would otherwise never re-run the effect"
+            )
+        if "collectAsState()" not in screen:
+            errors.append("ChatScreen.kt: pinned-shortcut pending state is not collected")
+        if "resolvePathForSession(" not in effect_body:
+            errors.append(
+                "ChatScreen.kt: pinned-shortcut must resolve via "
+                "`PRootKernel.resolvePathForSession(activeSessionId, …)`"
+            )
+        if "resolveHostPath(" in effect_body:
+            errors.append(
+                "ChatScreen.kt: pinned-shortcut must not resolve through the global "
+                "`resolveHostPath` (scans every session tree; needs boot; cross-session reads)"
+            )
+        if (
+            "viewModel.currentSessionId" not in effect_body
+            and "ChatViewModelStore.resolveSessionId(" not in effect_body
+        ):
+            errors.append(
+                "ChatScreen.kt: pinned-shortcut must bind the session through "
+                "`viewModel.currentSessionId` (or `ChatViewModelStore.resolveSessionId(…)`)"
+            )
+        if "pending.sessionId != activeSessionId" not in effect_body:
+            errors.append(
+                "ChatScreen.kt: pinned-shortcut must accept the live session id "
+                "(`pending.sessionId != activeSessionId`), not the route arg alone"
+            )
+
     if errors:
         for e in errors:
             print(f"FAIL {e}")
@@ -292,6 +407,35 @@ MUTATIONS = [
             "remember<(String, String) -> Unit>(messages, viewModel.currentSessionId)",
             "remember<(String, String) -> Unit>(messages, sessionId)"), nav, move),
     ),
+    (
+        "MUT-11 pinned shortcut back to the global resolver",
+        lambda screen, nav, move: (screen.replace(
+            "PRootKernel.resolvePathForSession(\n        activeSessionId,",
+            "PRootKernel.resolveHostPath(\n        activeSessionId,"), nav, move),
+    ),
+    (
+        "MUT-12 pinned shortcut drops the live-session comparison",
+        lambda screen, nav, move: (screen.replace(
+            "if (pending.sessionId != sessionId && pending.sessionId != activeSessionId) {",
+            "if (pending.sessionId != sessionId) {"), nav, move),
+    ),
+    (
+        "MUT-13 pinned shortcut key drops viewModel.currentSessionId",
+        lambda screen, nav, move: (screen.replace(
+            "LaunchedEffect(sessionId, viewModel.currentSessionId, pendingHtmlPreviewState) {",
+            "LaunchedEffect(sessionId, pendingHtmlPreviewState) {"), nav, move),
+    ),
+    (
+        "MUT-14 pinned shortcut forgets the consume anchor",
+        lambda screen, nav, move: (screen.replace(
+            "consumePendingHtmlPreview()", "consumePreview()", 1), nav, move),
+    ),
+    (
+        "MUT-15 pinned shortcut stops observing the pending state",
+        lambda screen, nav, move: (screen.replace(
+            "LaunchedEffect(sessionId, viewModel.currentSessionId, pendingHtmlPreviewState) {",
+            "LaunchedEffect(sessionId, viewModel.currentSessionId) {"), nav, move),
+    ),
 ]
 
 
@@ -312,6 +456,22 @@ def _green_fixtures() -> "tuple[str, str, str]":
         "    sessionId = viewModel.currentSessionId,\n"
         "    sessionTitle = null,\n"
         ")\n"
+        # deep-audit-1027 ISSUE-01: pinned-shortcut effect (criterion 8).
+        "val pendingHtmlPreviewState by com.rikkaminis.app.deeplink.DeepLinkCoordinator\n"
+        "    .pendingHtmlPreview.collectAsState()\n"
+        "LaunchedEffect(sessionId, viewModel.currentSessionId, pendingHtmlPreviewState) {\n"
+        "    val pending = pendingHtmlPreviewState ?: return@LaunchedEffect\n"
+        "    val activeSessionId = ChatViewModelStore.resolveSessionId(viewModel.currentSessionId)\n"
+        "    if (pending.sessionId != sessionId && pending.sessionId != activeSessionId) {\n"
+        "        return@LaunchedEffect\n"
+        "    }\n"
+        "    com.rikkaminis.app.deeplink.DeepLinkCoordinator.consumePendingHtmlPreview()\n"
+        "    val file = com.rikkaminis.app.sandbox.PRootKernel.resolvePathForSession(\n"
+        "        activeSessionId,\n"
+        '        "/var/minis${pending.resourcePath}",\n'
+        "        appCtx,\n"
+        "    )\n"
+        "}\n"
     )
     nav = (
         "onOpenTerminal = {\n"
