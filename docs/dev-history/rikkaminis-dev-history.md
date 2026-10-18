@@ -4,8 +4,8 @@
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
 - 合并范围：2026-08-03 ～ 2026-10-18，共 77 天
-- 条目总数：1957（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：2757453 / 总行数：35399
+- 条目总数：1960（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：2763592 / 总行数：35458
 
 ---
 
@@ -35392,6 +35392,65 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 **收口期踩坑**：`test_scan.py` 夹具列表**元组间缺逗号**（`join("\n")` 而非 `join(",\n")`）→ Python 把相邻元组解析为调用 → `TypeError: 'tuple' object is not callable`（报错行 = 夹具行本身）。注册脚本已修；`ast.parse` 自检 + 直接读报错行定位，秒级修好。
 
 **待用户**：合并 main（3 支均含 `.kt` = 非纯文本例外，起手权在用户）。真机行为级未验证（自定义 baseURL 假成功 / 外部直写 UI 反映 / 新枚举编译失败）需装包。
+
+<!-- 2026-10-18 17:49:10 -->
+## ARCH 批次合并 main + 文档归档完成（用户「合并，并更新文档」）+ CI 假红取证（flaky）
+
+
+**身份链**：并集树 `integration/da1026-arch` `407bdd4`（CI #2294 success）→ **main `4822410`**（--no-ff，树对拍 `9f793097` 逐字节一致）→ 文档合并 → **main `d6d16f5`**。
+
+**★ main CI #2295 红→绿 = 假红（flaky），已完整取证**（报告 `deep-audit-1026/FLAKY-2295.md`）：
+- attempt 1 **failure** @ 4822410：失败步骤 = **15 Run unit tests（门禁步骤全过）**；两用例 = `BrowserRssProbeLockScopeTest > summary stays self consistent while records run concurrently` + `BrowserRssProbeTest > small cumulative growth does not flag leak suspect`。
+- **排除本批**：`git log --name-only | grep -i rssprobe` = 空（ARCH 三支 + 1026 八支从未碰过）；同树分支 CI #2294 绿。
+- **根因链（源码级 + 沙箱确定性复现）**：①`BrowserRssProbeLockScopeTest.kt:178-206` 6 个**无限写线程** start() 后主线程**无同步点**直接 `repeat(200){summary()}`；②`BrowserRssProbe.kt:141-145` `summary()` 在 `byAction.isEmpty()` 时返回 `"(no data)"`；③首读早于首写 → `IllegalStateException: action 'mix' missing from summary:\n(no data)`（**与 CI 失败逐字一致**）；④清理代码 `stop.set(true)`/`join()`（:202-203）**不在 finally** → 6 线程泄漏为 CPU 燃烧式无限写；⑤后续测试 @Before `reset()` 清空后立刻被写回 → `BrowserRssProbeTest.kt:107-114` 的**整份 summary 级**断言被污染一击即中。
+- **铁证**：失败 B 的摘要含 `mix`（A 测试独有 action 名），B 自己只写 `get_readable`。
+- **沙箱复现装置** `flaky-probe/`（kotlinc 直编 `BrowserRssProbe.kt` + `android.util.Log` 桩 + `repro/Repro.kt`）：B3/B5 全复现 = true，对照臂（try/finally 清理）干净 ✓。**附加观测**：泄漏线程 1 秒写 27 万次（`cum=34857728MB`）。
+- **判级 P1**（触发路径可指认 + 误导性错误 + 次生：掩盖同 JVM 真实失败）；修法两处各 1-3 行（A 测试 stop/join 移入 finally + 加 latch；B 测试断言收窄到 `lineFor` 行级）→ backlog **§1026-FLAKY**，触发条件「下次想让它不再假红时」。
+- **重跑**：`rerun-failed-jobs` → attempt 2 **success** @ 4822410，26 步全 success、0 skipped（含 Publish，滚动 release）。
+
+**文档三件套**：**1957 条**（1952→1957）/ 77 天 / 24 sagas / 180 orphans / multi4=127；脱敏 NONE ×2；fences 82 偶、anchors==header==1957、outOrder 0；README 1952→1957。云分支 `docs/dev-history-arch` @ `f00a826`（三文件 sha256 SAME）→ 合并 → main `d6d16f5`；**docs merge push 未触发新 run** ✓（纯文本例外实测第二次成立）。
+
+**远端待清理 15 支**：8×`fix/da1026-*` + `fix/da1026-arch01/02/03-*` + `integration/da1026` + `integration/da1026-arch` + `docs/dev-history-1026` + `docs/dev-history-arch`（触发 = 用户说「清掉」）。
+
+**backlog 机械门**：198 段 / no-触发条件 3（既有）/ 豁免 11。
+
+<!-- 2026-10-18 17:52:37 -->
+## 1026 + ARCH 全批次收官：分支清理 15/15 + flaky 攒批（用户拍板）
+
+
+**用户判问**：flaky 是否影响应用正常运转？→ **确认不影响**（两文件都在 `src/android/app/src/test/` 测试源集，**不进 APK**；生产 `BrowserRssProbe.kt` 的 `summary()` 空态返回 `(no data)` 是设计；代价仅在 CI 侧 = 偶发假红白烧一轮 + 可能掩盖同 JVM 真实失败）。用户拍板「先攒着，等下一批一起处理」。
+
+**backlog §1026-FLAKY 已改绑触发条件**：从「下一次想让它不再假红时」→ **「下一批缺陷修复开工时一并处理」**（亦可提前至任何动 `BrowserRssProbe*` 测试文件的改动，顺路成本≈0）；搁置理由注入口径（test 源集不进 APK + 用户确认）。
+
+**分支清理 15/15**（脚本 `loose_ends_1026_arch.py`，check/delete 两模式，fail-closed）：
+- 先全量验证：**verified=15 refused=0**（判据 = `compare/main...<b>` 的 `ahead_by == 0`；全部 ahead=0 / behind 30-31 / status=behind）
+- 删除：**15/15 http 204**（8×`fix/da1026-*` + 3×`fix/da1026-arch0N-*` + 2×`integration/da1026[-arch]` + 2×`docs/dev-history-{1026,arch}`）
+- **三源核实**：①REST 按名 GET → 404 ②`git ls-remote --heads origin` → 只剩 `main` ③逐名探测 3/3 → 0 refs
+- **云端终态：只剩 `main`**
+
+**机械门**：198 段 / no-触发条件 3（既有）/ 豁免 11。
+
+**批次终态**：main `d6d16f5`（代码 `4822410` + 文档），main CI 绿（#2295 attempt 2，26 步 0 skipped = Publish 已滚动 release）；108 门 / 329 夹具。
+**deep-audit-1026 全流程闭环**：第二道门 → 8 支 → 并集树 `ad0c5d7` → main `3f99b30` → 文档 `9d18269` → ARCH 蓝图 3 支 → 并集树 `407bdd4` → main `4822410` → 文档 `d6d16f5` → 分支清理 15/15。
+
+<!-- 2026-10-18 18:13:48 -->
+## 下一批审计准备：背景包 v9 + 提示词 v6 + 三项提案评估（2026-10-18）
+
+
+**用户令**：为下一批审计做准备（挂载文件夹里的背景文件 + 提示词，该改的改）；检查本地与云端 dev-history 是否更新，没有则更新；并评估三项提案（UI 动作差分 / Set-of-Marks / 沙箱快照回滚）是否有必要、是否符合「只把必要的任务加进去（背景文档 + 加任务）」的既定规则。
+
+**背景包更新（`/var/minis/mounts/笔记/RikkaMinis审计背景包/`，基线 `dc04fc3` → `d6d16f5`）**：
+- `audit-context.md` **v8 → v9**（约 56KB → 61KB）：门 105→**108**（新增 `models_provider_field` / `provider_type_registry` / `provider_write_rules`）、夹具 323→**329**、主代码 600→601 .kt / 全仓 1085→1087；§2.4 加 **1026/ARCH 四个收敛样板**（ProviderWriteRules 写入规则单源 / PrimedPrefs 自治重预热 / ProviderType 枚举派生注册表 / ModelsCollection provider 字段收敛）；§4 家族补 1026 实例（家族 4 汇总视图漏键=第 7 次、6 写入面三处不对称、7 闭包捕获旧值+remember 六连、11 argv 三张表、14 有缓存无重预热、15 枚举双表第 6 次、16 CSV 预览第 5 处、20 主线程 IO 第 4 连）；§4.1 指标表 → **十三轮**（1026 = 8/8 成立 0 驳回、判级连续第二轮 0 修正）+ 再生链表加 4 条新链（有缓存无重预热 / 有界读漏网 / RPC 多视图 / argv 注册表）；§5 防线加「1026/ARCH 轮增量」段；§6 刻意设计 **35 → 48 条**（新增 §1026-A~H / §ARCH-01/02/03 / §1026-FLAKY 的负决策，含「门判据只能是漂移探测器，不能说"这棵树没有那个世界"」）；§7 饱和度地图换基线 + 1026/ARCH 犁区 + latent ⑩~⑬（含「RSSProbe flaky 属测试源集，别当产品缺陷重报」）；§8 加 **「文本不是 ground truth」**失真表（口径失真 / 位置归属失真 / 键名 camelCase-snake / 行号漂移 / **蓝图捏造枚举常量**）+ 三道硬动作；§8.1 加 1026 机制样板（写入规则单源 / 枚举派生集合 / 有缓存必带重预热）。
+- `audit-prompt-v5.md` → **`audit-prompt-v6.md`**：门数/条数引用同步、校准行 → 八轮、§1.1 边际变化段（1026+ARCH 犁区）、**新增 §2.0d（1026 失真形态表 + 三道追加动作）**、§5 自检清单 +4 条 v6 项。旧版 v5 已回 `archive/`（★ **教训：改提示词前先把当前版复制进 archive，不要就地改**——本次就地改了，靠反向还原脚本才补回归档）。
+- `README.md` 版本表更新（context v9 / prompt v6）+ 维护动作里写明上述归档纪律。
+
+**backlog 新增 4 条**（`/var/minis/shared/backlog.md`，机械门 **202 段** / no-触发条件 3（既有）/ 豁免 11，四条均判 **OK**）：§PROP-1018-UIDIFF（**过一阶门（弱通过）**，建议只做最小版）/ §PROP-1018-SOM（**不过一阶门**，登记）/ §PROP-1018-SNAPSHOT（**不过一阶门**，登记为负决策）/ §PROP-1018-META（**归口纪律：不写进审计背景包 + 不预先建工单**，理由=范畴错误与顺序错误）。
+
+**★ 三项提案评估要点（本轮最值钱的三条判词）**：
+1. **UI 动作差分反馈 = 弱通过**。唯一硬理由 = 「前态不可事后重建」（a11y 是时变外部状态，动作前没读树就永远不知道"变了什么"）；附强理由 = 树里已证 [deep-audit-1017 G3] 曾有「丢弃 performAction 结果、无条件报 ok」⇒ 今天的 `ok` = 调用成功 ≠ 界面变了，差分会给 agent 一个**效果验证通道**。必须收窄（只报同 nodeId 集合的增/删/文本/焦点变化 + 有界截断），未拍板不动手；**建议顺序 = 先 Browser 半边（一套栈一个点），再 a11y 半边（需先解决 NodeRegistry 的 nodeId 稳定性）**。
+2. **Set-of-Marks = 不通过**。有 a11y 树的世界：锚点数据**今天已存在**（`nodeToJson` 已给 `nodeId` + `center{x,y}` + `bounds`）⇒ 只是把已有数据渲染到图上（便利，非新能力）；无 a11y 树的世界：锚点必须靠 **CV 检测**（这才是"彻底解决"那一半，也是最贵的一半，且**不给新信息**——像素已在图里，误差来源没消失）。「彻底解决…失明」= 用全称词代替条件（与本包 §8 的失真形态同款）。
+3. **沙箱快照回滚 = 不通过**。已有三层更强/更便宜的快照（git / `/var/minis/shared` / per-session 工作区=重开会话即回退）；事故史 = **一次**（1016 FIX-B `git checkout -- .`），**根因已用纪律根治**；二阶门边清单本身即成本证明（手机存储 + PRoot 下 reflink 不可用 + `/tmp` 收割交互 + 回滚是破坏性操作 + 配额清理）。复活条件 = 「git 之外的工作被 agent 自己毁掉且无法恢复」的实际事故 ≥2 次。
+4. **归口纪律**：三项都**不写进 `audit-context.md`**（那是给审计模型的过滤/地图，写进去会污染过滤面 = 降低下一轮报告精度，属**范畴错误**）；**也不预先建工单**（未过一阶门/未经拍板就建工单 = 造新装置，属**顺序错误**）；正确落点 = backlog（负决策台账）。
 
 ---
 
