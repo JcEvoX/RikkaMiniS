@@ -82,7 +82,11 @@ fun ProviderListScreen(
     // re-ran them for EVERY row on EVERY recomposition, stalling the frame
     // during navigation transitions. Caching here means the I/O happens once
     // per instances change, not once per row per recomposition.
-    val providerRows: List<ProviderRowData> = remember(instances) {
+    // [da1025-F] Key on (instances, config.modelEntries), not instances alone:
+    // refreshModels changes config.modelEntries WITHOUT changing instances,
+    // so keying on instances alone kept the stale snapshot here and a freshly
+    // added provider showed modelCount = 0 until an unrelated recomposition.
+    val providerRows: List<ProviderRowData> = remember(instances, config.modelEntries) {
         instances.map { instance ->
             val apiKey = providerRepository.loadApiKey(instance.id)
             val isConfigured = !apiKey.isNullOrBlank()
@@ -106,7 +110,10 @@ fun ProviderListScreen(
     // scroll. The reorder path below is the deliberate asymmetry —
     // ProviderRepository.permuteById REFUSES a list holding duplicate ids, so
     // on a corrupted config drags just no-op until the duplicate is gone.
-    val reorderableRows = remember(instances) { providerRows.distinctBy { it.instance.id } }
+    // [da1025-F] Key on providerRows (its actual derivation source), not
+    // instances: providerRows recomputes when modelEntries changes too, and
+    // keying on instances alone kept this derived list stale with it.
+    val reorderableRows = remember(providerRows) { providerRows.distinctBy { it.instance.id } }
     val pinnedRows = reorderableRows.filter { it.instance.pinned }
     val groupedRows = reorderableRows.filter { !it.instance.pinned }.groupBy { it.instance.providerType }
 
@@ -315,7 +322,7 @@ fun ProviderListScreen(
                                         apiKey = row.apiKey,
                                         isConfigured = row.isConfigured,
                                         pinned = row.instance.pinned,
-                                        onTogglePinned = remember(row.instance.id) {
+                                        onTogglePinned = remember(row.instance.id, row.instance.pinned) {
                                             { providerRepository.setInstancePinned(row.instance.id, !row.instance.pinned) }
                                         },
                                         onClick = remember(row.instance.id) { { onProviderClick(row.instance.id) } },
@@ -349,7 +356,7 @@ fun ProviderListScreen(
                                         apiKey = row.apiKey,
                                         isConfigured = row.isConfigured,
                                         pinned = row.instance.pinned,
-                                        onTogglePinned = remember(row.instance.id) {
+                                        onTogglePinned = remember(row.instance.id, row.instance.pinned) {
                                             { providerRepository.setInstancePinned(row.instance.id, !row.instance.pinned) }
                                         },
                                         onClick = remember(row.instance.id) { { onProviderClick(row.instance.id) } },
