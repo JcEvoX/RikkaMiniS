@@ -786,4 +786,84 @@ class AgentTraceRecorderTest {
         assertFalse(AgentTraceRecorder.TRACE_START_KEYS_2.any { it.contains("key", ignoreCase = true) || it.contains("token", ignoreCase = true) })
         assertNotNull(AgentTraceRecorder.TRACE_START_KEYS_2)
     }
+
+    // ══════════════════ 锁边界（da1029-C / I09） ══════════════════
+
+    @Test
+    fun `write emits the run context installed by the last beginRun`() {
+        // 顺序回归臂：beginRun 之后落的行必须携带新的 run 上下文。
+        val sink = Sink()
+        val r = recorder(sink)
+        r.beginRun("run-1", "sess-1", "P", "prompt")
+        r.turnStart(1)
+        r.beginRun("run-2", "sess-2", "P", "prompt")
+        r.turnStart(2)
+
+        val turns = AgentTraceRecorder.parse(sink.raw)
+            .filter { it.getString("type") == AgentTraceRecorder.TYPE_TURN_START }
+        assertEquals(2, turns.size)
+        assertEquals("run-1", turns[0].getString("run_id"))
+        assertEquals("sess-1", turns[0].getString("session_id"))
+        assertEquals("run-2", turns[1].getString("run_id"))
+        assertEquals("sess-2", turns[1].getString("session_id"))
+    }
+
+    @Test
+    fun `line build shares the write lock so ts order matches sink order`() {
+        // [da1029-C / I09] write() 的行构建必须与 writeTerminalOnce() 一样在
+        // writeLock 内。buildLine 采样 clock() 之后才读 activeRunId /
+        // activeSessionId，而 beginRun 在同一把锁内成对更新这两个字段 ——
+        // 构建放在锁外时，「采样 ts」到「本行落盘」之间可以被另一线程完整写完
+        // 一行，磁盘上相邻两行的 ts 就倒挂了。
+        //
+        // 这个窗口由注入的 clock 探针撑成确定时序：线程 A 采样 100 之后等线程 B
+        // 写完（B 的行 ts=200）才落盘。持锁时 B 只能排在 A 之后 —— 采样序与落盘
+        // 序同序；不持锁时 B 的行先落盘、A 的 ts=100 后落盘 —— 倒挂。
+        val sink = Sink()
+        val aInBuild = CountDownLatch(1)
+        val bDone = CountDownLatch(1)
+        val bFinished = CountDownLatch(1)
+        val r = AgentTraceRecorder(
+            appendLine = { line -> synchronized(sink) { sink.lines.add(line) } },
+            clock = {
+                when (Thread.currentThread().name) {
+                    "da1029-A" -> {
+                        aInBuild.countDown()
+                        bDone.await(1, TimeUnit.SECONDS)
+                        100L
+                    }
+                    "da1029-B" -> 200L
+                    else -> 50L
+                }
+            },
+        )
+
+        r.beginRun("run-1", "sess-1", "P", "prompt")      // ts=50
+        val a = Thread({ r.turnStart(1) }, "da1029-A")
+        val b = Thread({
+            try {
+                r.beginRun("run-2", "sess-2", "P", "prompt")
+            } finally {
+                bDone.countDown()
+                bFinished.countDown()
+            }
+        }, "da1029-B")
+        a.start()
+        assertTrue("A 必须已进入构行", aInBuild.await(5, TimeUnit.SECONDS))
+        b.start()
+        a.join(10_000)
+        b.join(10_000)
+        assertFalse("A 未在 10s 内结束", a.isAlive)
+        assertTrue("B 未在 10s 内结束", bFinished.await(5, TimeUnit.SECONDS))
+
+        val events = AgentTraceRecorder.parse(sink.raw)
+        // 期望值是字面量：采样序 50(A 之前) / 100(A) / 200(B) 必须与落盘序一致。
+        assertEquals(listOf(50L, 100L, 200L), events.map { it.getLong("ts") })
+
+        val turnLine = events.first { it.getString("type") == AgentTraceRecorder.TYPE_TURN_START }
+        assertEquals("run-1", turnLine.getString("run_id"))
+        assertEquals("sess-1", turnLine.getString("session_id"))
+        val lastStart = events.last { it.getString("type") == AgentTraceRecorder.TYPE_TRACE_START }
+        assertEquals("run-2", lastStart.getString("run_id"))
+    }
 }

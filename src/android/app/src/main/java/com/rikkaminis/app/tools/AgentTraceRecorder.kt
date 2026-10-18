@@ -672,10 +672,16 @@ class AgentTraceRecorder(
      * 并发调用不会把两个事件交错进同一行。
      * 写失败（appendLine 抛异常）被吞掉并计数，绝不向上传播 ——
      * trace 是旁路证据，不能改变 Run 终态。
+     *
+     * [da1029-C] 行的**构建**也必须在这把锁内：`buildLine` 读 `activeRunId` /
+     * `activeSessionId` 并采样 `clock()`，而 `beginRun` 是在同一把锁内成对更新这
+     * 两个字段的。构建放在锁外时，本行可能读到「上一半 run 上下文」（或两个字段
+     * 来自不同 run），且 `ts` 采样会早于并发写入的行 —— 落盘行序与 ts 倒挂。
+     * 与 [writeTerminalOnce] 完全对称。
      */
     private fun write(type: String, block: JSONObject.() -> Unit) {
-        val line = buildLine(type, block)
         synchronized(writeLock) {
+            val line = buildLine(type, block)
             runCatching { appendLine(line) }
                 .onFailure { failedWriteCount++ }
         }

@@ -187,6 +187,40 @@ class SkillRestorePolicyTest {
         )
     }
 
+    // -- Wiring: 锁边界（da1029-C / I04） --
+
+    @Test
+    fun recordSkillUse_publishesTheMirrorInsideTheAddLock() {
+        // [da1029-C] SkillRepository 在 JVM 上装不起来（Context +
+        // SQLiteOpenHelper + OkHttp），所以「写回与 add() 同锁」这件事按源码形状
+        // 钉住 —— 与上面的 editor 调用点断言同一手法。
+        //
+        // 判据落在**锁归属**上而不是右侧表达式的形状：块内
+        // `_skills.value = <任意表达式>` 都算合规（内联 map，或先赋局部变量）。
+        val fn = readRepoFile("app/src/main/java/com/rikkaminis/app/data/repository/SkillRepository.kt")
+            .substringAfter("fun recordSkillUse(")
+            .substringBefore("private fun normalizeUseCounts")
+
+        val lockAt = fn.indexOf("synchronized(addLock)")
+        assertTrue("recordSkillUse 必须在 addLock 内做读-改-写", lockAt >= 0)
+
+        // 与调用方同缩进（8 空格）的 `}` 就是 synchronized 块的收尾。
+        val blockEnd = fn.indexOf("\n        }", lockAt)
+        assertTrue("找不到 synchronized(addLock) 块的收尾", blockEnd > 0)
+        val inLock = fn.substring(lockAt, blockEnd)
+        val afterLock = fn.substring(blockEnd)
+
+        assertTrue(
+            "（da1029-C）use_count 的写回必须在 synchronized(addLock) 块内",
+            inLock.contains("_skills.value ="),
+        )
+        assertFalse(
+            "（da1029-C）锁释放后不得再发布 _skills.value —— 并发 recordSkillUse 会丢一次" +
+                "增量（内存落后 DB），并发 add() 会被基于旧快照的写回抹掉",
+            afterLock.contains("_skills.value ="),
+        )
+    }
+
     private fun readRepoFile(relative: String): String {
         var dir: java.io.File? = java.io.File(System.getProperty("user.dir"))
         while (dir != null) {

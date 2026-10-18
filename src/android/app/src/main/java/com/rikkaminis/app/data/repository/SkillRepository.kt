@@ -575,7 +575,12 @@ class SkillRepository(private val context: Context) {
         // read the pre-bump snapshot → both write useCount+1 → memory drifts
         // one behind the DB, and normalizeUseCounts later persists a value
         // derived from that stale snapshot.
-        val next = synchronized(addLock) {
+        // [da1029-C] The write-back itself now happens INSIDE the lock too:
+        // computing `mapped` under the lock while publishing it after the
+        // release left a window where a concurrent recordSkillUse read the
+        // pre-publish snapshot (one increment lost) and a concurrent add()
+        // appended to a list that our stale publish then overwrote.
+        synchronized(addLock) {
             val current = _skills.value.find { it.id == skillId } ?: return
             val bumped = current.copy(useCount = current.useCount + 1.0)
             db.execSQL(
@@ -586,9 +591,8 @@ class SkillRepository(private val context: Context) {
             if (bumped.useCount > NORMALIZE_THRESHOLD) {
                 mapped = normalizeUseCounts(mapped)
             }
-            mapped
+            _skills.value = mapped
         }
-        _skills.value = next
     }
 
     private fun normalizeUseCounts(list: List<Skill>): List<Skill> {

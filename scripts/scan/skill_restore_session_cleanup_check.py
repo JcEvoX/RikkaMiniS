@@ -27,11 +27,23 @@ Checks assert PRESENCE of the routing rather than the absence of a spelling,
 so a refactor that keeps the contract is a deliberate edit to this gate rather
 than a silent pass.
 
+I04 (SkillRepository.kt, deep-audit-1029)
+  `recordSkillUse` computed its mapped list under `synchronized(addLock)` but
+  published `_skills.value = next` AFTER the release — while the KDoc directly
+  above claimed the update happened under the same lock as `add`. Two
+  concurrent calls (parallel tool executions on Dispatchers.IO) both read the
+  pre-publish snapshot, so memory drifted one behind the atomic SQL increment;
+  a concurrent `add()` could be erased outright by the stale publish. The rule:
+  every `_skills.value =` inside `recordSkillUse` sits inside the
+  `synchronized(addLock)` block (criterion on lock ownership, not on the shape
+  of the right-hand side).
+
 Usage: python3 scripts/scan/skill_restore_session_cleanup_check.py [repo_root]
        python3 scripts/scan/skill_restore_session_cleanup_check.py --selftest
 Exit:  0 = clean, 1 = violation(s), 2 = usage/ROT
 """
 import os
+import re
 import sys
 
 SKILL_REPO_REL = "src/android/app/src/main/java/com/rikkaminis/app/data/repository/SkillRepository.kt"
@@ -53,8 +65,131 @@ SKILL_NEW = "skillRepository = SkillRepository("
 MCP_NEW = "mcpRepository = MCPRepository("
 
 
+RECORD_DECL = "fun recordSkillUse("
+RECORD_LOCK = "synchronized(addLock)"
+SKILLS_ASSIGN = "_skills.value ="
+
+
 def lines_of(src, needle):
     return [i + 1 for i, line in enumerate(src.split("\n")) if needle in line]
+
+
+def strip_literals(src):
+    """Empty out string bodies + drop comments so brace matching can't be fooled.
+
+    Needed because the KDoc for `recordSkillUse` quotes `synchronized(addLock)`
+    and `_skills.value` verbatim, and because SQL literals could carry braces.
+    Returns None when a literal/comment never terminates (caller treats that as
+    ROT rather than silently matching garbage).
+    """
+    out, i, n = [], 0, len(src)
+    while i < n:
+        if src.startswith('"""', i):
+            end = src.find('"""', i + 3)
+            if end < 0:
+                return None
+            out.append("~")
+            i = end + 3
+            continue
+        c = src[i]
+        if c == '"':
+            i += 1
+            while i < n and src[i] != '"':
+                i += 2 if src[i] == "\\" else 1
+            if i >= n:
+                return None
+            out.append("~")
+            i += 1
+            continue
+        if src.startswith("//", i):
+            j = src.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if src.startswith("/*", i):
+            j = src.find("*/", i + 2)
+            if j < 0:
+                return None
+            i = j + 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def brace_block_end(code, open_idx):
+    """Index just past the '}' matching the '{' at `open_idx`, or -1."""
+    depth = 0
+    for i in range(open_idx, len(code)):
+        if code[i] == "{":
+            depth += 1
+        elif code[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def check_record_skill_use_lock(src):
+    """Arm 4 [da1029-C / I04]: recordSkillUse's StateFlow write-back must be
+    INSIDE the `synchronized(addLock)` block, and nowhere outside it.
+
+    The pre-fix shape computed `mapped` under the lock but published it after
+    the release; the comment above the function claimed the opposite. Two
+    concurrent calls then both read the pre-publish snapshot (one increment
+    lost, memory drifts behind the DB) and a concurrent `add()` could be
+    overwritten by the stale publish.
+
+    The criterion is on **lock ownership**, deliberately not on the shape of
+    the right-hand side: `_skills.value = <any expression>` inside the block is
+    accepted (mapping inline, or via an intermediate `val`).
+    """
+    v = []
+    code = strip_literals(src)
+    if code is None:
+        v.append("SkillRepository.kt: unterminated string/comment literal — cannot brace-match "
+                 "recordSkillUse (ROT — update this gate)")
+        return v
+    start = code.find(RECORD_DECL)
+    if start < 0:
+        v.append("SkillRepository.kt: '%s' not found (ROT — update this gate)" % RECORD_DECL)
+        return v
+    open_brace = code.find("{", start)
+    if open_brace < 0:
+        v.append("SkillRepository.kt: recordSkillUse has no body brace (ROT — update this gate)")
+        return v
+    end = brace_block_end(code, open_brace)
+    if end < 0:
+        v.append("SkillRepository.kt: recordSkillUse body braces do not balance (ROT — update this gate)")
+        return v
+    body = code[open_brace:end + 1]
+
+    lock_at = body.find(RECORD_LOCK)
+    if lock_at < 0:
+        v.append("SkillRepository.kt: recordSkillUse has no '%s' — the read-modify-write "
+                 "over _skills.value is back outside the add lock" % RECORD_LOCK)
+        return v
+    lock_open = body.find("{", lock_at)
+    lock_end = brace_block_end(body, lock_open) if lock_open >= 0 else -1
+    if lock_end < 0:
+        v.append("SkillRepository.kt: recordSkillUse's synchronized block braces do not balance "
+                 "(ROT — update this gate)")
+        return v
+
+    assigns = [m.start() for m in re.finditer(re.escape(SKILLS_ASSIGN), body)]
+    if not assigns:
+        v.append("SkillRepository.kt: recordSkillUse never publishes '%s' — the use_count bump "
+                 "would never reach the in-memory mirror" % SKILLS_ASSIGN)
+        return v
+    inside = [p for p in assigns if lock_open < p < lock_end]
+    outside = [p for p in assigns if not (lock_open < p < lock_end)]
+    if not inside:
+        v.append("SkillRepository.kt: recordSkillUse computes under the lock but publishes "
+                 "'%s' only OUTSIDE it — a concurrent recordSkillUse loses one increment and a "
+                 "concurrent add() can be overwritten by the stale publish" % SKILLS_ASSIGN)
+    for p in outside:
+        v.append("SkillRepository.kt: '%s' at body offset %d is out of the '%s' block — "
+                 "write-back must share the lock with add()" % (SKILLS_ASSIGN, p, RECORD_LOCK))
+    return v
 
 
 def slice_between(src, start_marker, end_marker, label, violations):
@@ -71,6 +206,9 @@ def slice_between(src, start_marker, end_marker, label, violations):
 
 def check_skill_repo(src):
     v = []
+
+    # Arm 4 [da1029-C / I04]: recordSkillUse's write-back shares add()'s lock.
+    v.extend(check_record_skill_use_lock(src))
 
     # Arm 1: add()'s first assignment must resolve the id through the policy.
     add_slice = slice_between(src, ADD_DECL, ADD_SIG_END, "SkillRepository.kt", v)
@@ -248,6 +386,19 @@ internal class SkillRepository(private val context: Context) {
     }
 
     private fun isAdoptableBundledRow(existing: Skill): Boolean = false
+
+    fun recordSkillUse(skillId: String) {
+        // The mirror must move under the same lock as add().
+        synchronized(addLock) {
+            val current = _skills.value.find { it.id == skillId } ?: return
+            val bumped = current.copy(useCount = current.useCount + 1.0)
+            db.execSQL(
+                "UPDATE skills SET use_count = use_count + 1 WHERE id=?",
+                arrayOf<Any>(skillId)
+            )
+            _skills.value = _skills.value.map { if (it.id == skillId) bumped else it }
+        }
+    }
 }
 """
 
@@ -262,6 +413,38 @@ BAD_SKILL_DROP_ID = GOOD_SKILL.replace(
 )
 
 BAD_SKILL_BUNDLED = GOOD_SKILL.replace("preferredId = dirName,", "")
+
+# [da1029-C / I04] the pre-fix shape: `mapped` computed under the lock, then
+# published after the release — exactly what the KDoc above it used to claim
+# was already impossible.
+BAD_SKILL_PUBLISH_OUTSIDE_LOCK = GOOD_SKILL.replace(
+    """        synchronized(addLock) {
+            val current = _skills.value.find { it.id == skillId } ?: return""",
+    """        val next = synchronized(addLock) {
+            val current = _skills.value.find { it.id == skillId } ?: return""",
+).replace(
+    """            _skills.value = _skills.value.map { if (it.id == skillId) bumped else it }
+        }
+    }
+}""",
+    """            _skills.value.map { if (it.id == skillId) bumped else it }
+        }
+        _skills.value = next
+    }
+}""",
+)
+
+# No lock at all around the read-modify-write.
+BAD_SKILL_NO_LOCK = GOOD_SKILL.replace(
+    """        synchronized(addLock) {
+            val current = _skills.value.find { it.id == skillId } ?: return""",
+    """        run {
+            val current = _skills.value.find { it.id == skillId } ?: return""",
+)
+
+# Anchor itself gone -> fail-closed, not a silent skip.
+BAD_SKILL_DROP_FUNCTION = GOOD_SKILL.replace(
+    "fun recordSkillUse(", "fun recordSkillUseRenamed(")
 
 GOOD_CHAT = """
 class ChatRepository(
@@ -347,11 +530,24 @@ def selftest():
     bad_slug = check_skill_repo(BAD_SKILL_RAW_SLUG)
     bad_drop = check_skill_repo(BAD_SKILL_DROP_ID)
     bad_bundled = check_skill_repo(BAD_SKILL_BUNDLED)
+    bad_publish = check_skill_repo(BAD_SKILL_PUBLISH_OUTSIDE_LOCK)
+    bad_nolock = check_skill_repo(BAD_SKILL_NO_LOCK)
+    bad_nofunc = check_skill_repo(BAD_SKILL_DROP_FUNCTION)
+
+    # Precision control: a compliant fixture must be clean, or "everything is
+    # red" would masquerade as teeth.
+    if good_skill:
+        failures.append("compliant skill fixture is not clean: %r" % good_skill)
 
     expect_trip("raw-slugify fixture (ISSUE-01)", bad_slug, "does not resolve", failures)
     expect_trip("raw-slugify fixture (ISSUE-01)", bad_slug, "does not consult preferredId", failures)
     expect_trip("dropped-id fixture (ISSUE-01)", bad_drop, "does not pass 'preferredId ='", failures)
     expect_trip("bundled-dirName fixture (ISSUE-01)", bad_bundled, "other than its", failures)
+    # [da1029-C / I04]
+    expect_trip("publish-outside-lock fixture (I04)", bad_publish, "publishes", failures)
+    expect_trip("publish-outside-lock fixture (I04)", bad_publish, "out of the", failures)
+    expect_trip("no-lock fixture (I04)", bad_nolock, "has no 'synchronized(addLock)'", failures)
+    expect_trip("dropped-function fixture (I04)", bad_nofunc, "not found (ROT", failures)
 
     good_chat = check_chat_repo(GOOD_CHAT)
     bad_chat = check_chat_repo(BAD_CHAT_NO_HOOK)
@@ -365,6 +561,9 @@ def selftest():
     print("selftest raw-slugify skill repo  -> %d violation(s)" % len(bad_slug))
     print("selftest dropped-id skill repo   -> %d violation(s)" % len(bad_drop))
     print("selftest bundled-dirName repo    -> %d violation(s)" % len(bad_bundled))
+    print("selftest publish-outside-lock    -> %d violation(s)" % len(bad_publish))
+    print("selftest no-lock recordSkillUse  -> %d violation(s)" % len(bad_nolock))
+    print("selftest recordSkillUse removed  -> %d violation(s)" % len(bad_nofunc))
     print("selftest compliant chat repo     -> %d violation(s)" % len(good_chat))
     print("selftest unwired-hook chat repo  -> %d violation(s)" % len(bad_chat))
     print("selftest compliant MinisApp      -> %d violation(s)" % len(good_app))
