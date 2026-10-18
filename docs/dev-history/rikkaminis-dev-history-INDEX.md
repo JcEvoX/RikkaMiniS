@@ -1,6 +1,6 @@
 # rikkaminis-dev-history 按天索引
 
-快速跳转到每日开发日志。共 1952 条记录，77 天。
+快速跳转到每日开发日志。共 1957 条记录，77 天。
 
 ## 2026-08-03（11 条）
 
@@ -4042,7 +4042,7 @@
 - `23:51` **deep-audit-1024 第二道门核实 + 9 支派发（用户令「走流程吧」，附新审计报告 9 项 v3）**
   - **输入**：`REPORT-1024.md`（1414 行，ISSUE-01..09）。基线 main `f688c97`（= da1023 收口树）。工作区…
 
-## 2026-10-18（39 条）
+## 2026-10-18（44 条）
 
 - `00:33` **交付：deep-audit-1024 FIX-D（ISSUE-04 MCP OAuth 凭据/沙盒桥接文件生命周期，P1）—— `fix/da1024-mcp-oauth-bridge-lifecycle` @ `b611732a`，CI #39048727885 success，停在分支**
   - **任务**：读 `shared/work/deep-audit-1024/fix-tasks/FIX-D.md` 立刻执行（先证再改）。基线 main `f6…
@@ -4122,3 +4122,13 @@
   - **任务** `fix-tasks/FIX-H.md`（COMMON 实读自上级目录）；**报告** `fix-reports/FIX-H.md`（8 节 / …
 - `15:32` **deep-audit-1026 收口完成（用户令「按流程来」→ 8 支全绿 → 并集树 CI 绿）**
   - **身份链**：基线 main `dc04fc3` → 8 支（A..H，逐支 CI 绿）→ 并集树 `integration/da1026` **`ad0c5…
+- `15:52` **deep-audit-1026 合并 main + 文档归档完成（用户令「合并，不要忘了文档」）**
+  - **合并**：`integration/da1026`（@ `ad0c5d7`）`--no-ff` 合入 main → **`3f99b30ce582c4547…
+- `16:40` **ARCH-01 交付：ProviderWriteRules 单源校验层（`fix/da1026-arch01-provider-write-rules` @ `5737f75`，CI run 39110944268 success，停在分支未合并）**
+  - **任务** `ARCH-COMMON.md` + 蓝图 `ARCH-01` 小节（Provider / Model 跨面写入规则收口）。**报告** `fix…
+- `16:47` **ARCH-03 收口：ProviderType 编译期穷举元数据契约 —— `fix/da1026-arch03-provider-type-registry` @ `22a15ed`，CI run 39110831683 success，停在分支**
+  - **任务**：pinned 指令 = 读 `shared/work/deep-audit-1026/ARCH-COMMON.md`，执行同目录 `ARCH-BL…
+- `16:48` **ARCH-02 收口：PrimedPrefs 自治重预热契约（`fix/da1026-arch02-primed-prefs` @ `0f9f7cd`，CI #2293 绿，停在分支）**
+  - **任务** `/var/minis/shared/work/deep-audit-1026/ARCH-COMMON.md`（工单 = `ARCH-BLUEPR…
+- `17:18` **ARCH 批次收口完成（用户「他们完成了」/「跑完了」）：3 支并入并集树，CI 绿 @ 407bdd4**
+  - **身份链**：基线 main `9d18269` → 3 支 → 并集树 **`integration/da1026-arch` @ `407bdd4`**（…

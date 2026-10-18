@@ -4,8 +4,8 @@
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
 - 合并范围：2026-08-03 ～ 2026-10-18，共 77 天
-- 条目总数：1952（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：2743634 / 总行数：35286
+- 条目总数：1957（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：2757453 / 总行数：35399
 
 ---
 
@@ -35279,6 +35279,119 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 **批次拓扑**：蓝图明确要求前置 = 1026 八项修复合入后（锚点依赖本批产物：`provider = ...displayName`、`customUserAgentWritable`、ConcurrencyPrefs 监听器）→ **批次 B（ARCH-01/02/03 并行，文件集正交）触发条件 = 本批并入 main**；批次 C（ARCH-GATE）串行在 B 之后。ARCH-01 吸收 E 支守卫为单源 `isCustomBaseURLWriteAllowed`；ARCH-02 叠加在 A 支之上（保留外部监听器作双重保障，自监听器须为 object 成员以过 `prefs_listener_holder_guard`）；ARCH-03 叠加在 D 支之上（保留显式 mapOf 字面量 + 枚举派生增量合并）。
 
 **待用户**：①合并 main（8 支均含 .kt，非纯文本例外，起手权在用户）②真机行为级验证（8 项）。台账 `DISPATCH.md`、收口 `CONVERGE.md`、蓝图计划 `PLAN-ARCH.md`。
+
+<!-- 2026-10-18 15:52:17 -->
+## deep-audit-1026 合并 main + 文档归档完成（用户令「合并，不要忘了文档」）
+
+
+**合并**：`integration/da1026`（@ `ad0c5d7`）`--no-ff` 合入 main → **`3f99b30ce582c454754184405ad0db7c08d546f5`**；**树对拍 `main^{tree}` == `integration/da1026^{tree}` == `9a6b3c8d0aef3d7545320311bfc77de10dde58c8` 逐字节一致** = 「我看过的树 == 线上树」。**main CI #2290（39108142056）success @ 3f99b30**（push 自动触发）。
+
+**文档三件套重建**（`dev-history-sync` skill v2.1.1）：**1952 条**（1937→1952）/ 77 天（2026-08-03～10-18）/ 24 sagas / 180 orphans（9.2%）/ multi4=126。fences 82 偶、anchors==header==1952、outOrder 0；脱敏三轮（main+INDEX、SAGAS 单独）均 `Remaining sensitive: NONE`。README 计数 1937→1952。云分支 `docs/dev-history-1026` @ `be570a2`（三文件 sha256 与本地逐字节 SAME）→ `--no-ff` 合并 → **main `9d18269`** → push。**纯文本例外实测**：docs merge push **未触发新 run**（最新 run 仍 #2290 @ 3f99b30）✓；415+/27− 仅 docs/dev-history。
+
+**ARCH 批次（蓝图三支）已派发**（用户「追加」蓝图，前置 1026 合入满足 → 按计划派发）：
+| 支 | 工单 | 分支 | session |
+|---|---|---|---|
+| ARCH-01 | ProviderWriteRules 单源层（收 E 支守卫为 isCustomBaseURLWriteAllowed） | fix/da1026-arch01-provider-write-rules | ***UUID*** |
+| ARCH-02 | PrimedPrefs 自治缓存（叠加 A 支，保留外部监听器双重保障） | fix/da1026-arch02-primed-prefs | ***UUID*** |
+| ARCH-03 | ProviderType 枚举注册表（叠加 D 支，保留 mapOf 字面量+枚举派生） | fix/da1026-arch03-provider-type-registry | ***UUID*** |
+
+通用纪律 `ARCH-COMMON.md`（蓝图=唯一施工指令 + 行号不可采信 + 门归属 + 四层验证 + 变异点选编译期收敛处）；ARCH-03 的新建门 `provider_type_registry_check.py`；`provider_rpc_symmetry`/`memory_gate_provider_fields`/`prefs_listener_holder_guard` 三门分别归 01/02 支扩展。回读 3/3 送达 marker≥2。
+
+**CI 判读坑（再犯一次）**：`jobs API` 的 step `conclusion` 对**未开始的步 = None**，过滤 `not in ('success','skipped')` 会把 None 全算成 failed → 一度误读"8 步 failed"。正确过滤 = `conclusion=='failure'` 或 `status=='completed'` 计数。
+
+**当前 main**：`9d18269`（代码 `3f99b30` + 文档合并）。**待收口**：ARCH 三支回报 → 三项核查 → 并集树 → 门注册 → CI → 交用户。
+
+<!-- 2026-10-18 16:40:56 -->
+## ARCH-01 交付：ProviderWriteRules 单源校验层（`fix/da1026-arch01-provider-write-rules` @ `5737f75`，CI run 39110944268 success，停在分支未合并）
+
+
+**任务** `ARCH-COMMON.md` + 蓝图 `ARCH-01` 小节（Provider / Model 跨面写入规则收口）。**报告** `fix-reports/ARCH-01-REPORT.md`（11223 B，§1–§9）；**装置** `repo-arch1/probe/`（durable，`.gitignore:141` 已含 `probe/`）。基线 main `9d18269937f4dba4b3b5fc788ae0e81b6f304990`。
+
+**交付 5 文件 +601/−41**（单提交）：新建 `config/collections/ProviderWriteRules.kt`（+90，纯 JVM 规则层：`isCustomBaseURLWriteAllowed` / `normalizeCustomModelId` / `canonicalModelProviderName` / `CUSTOM_BASE_URL_OPENROUTER_MESSAGE`）· `ProvidersCollection.kt`（writer 改走共享谓词，删内联重复）· `debug/ProviderMutationMethods.kt`（create/update 守卫引共享消息 + modelsAdd 用共享归一化/标签）· 扩展门 `provider_rpc_symmetry_check.py`（+98）· 新建门 `provider_write_rules_check.py`（+372）。
+
+**四层验证**：①**门 1 pre 差分最强**：旧门 × 修复后源码 = rc=1 **恰 {C2,C4} 红** → 改动半径被机械标定；post 真树 rc=0 + selftest 全绿（F11–F14）+ 带牙标记 `PROVIDER_RPC_SELFTEST=PASS` 保留。②**门 2 新**：W1–W7 判据、`--selftest` 7 夹具全 PASS、独有标记 `PROVIDER_WRITE_RULES_SELFTEST=PASS`、真树 rc=0、位置参数形态；**未注册** scan.sh/test_scan.py（COMMON §3 冻结，归主会话收口）。③**JVM 装置**：post `OK (7 tests)` + `OK (10 tests)`；pre（基线源码切片）`OK (7 tests)`。④**变异负控 7/7**（`probe/evidence/mutations.txt`，全部 `restored_exact=true` 逐字节还原）：MUT-1/4/5/6 由门 2 唯一守住（GREEN/GREEN/RED），MUT-2/3 由行为层唯一守住（门 GREEN / JVM RED），MUT-7 = 门 2 W1 + 装置 EXTRACT_FAIL。⑤**全量**：`scan.sh` **106/0** · `test_scan.py` **ALL 325 CASES PASS**。⑥**CI**：run 39110944268（#2292）success @ 08:35:10Z，head_sha 三方逐字符一致，26 步唯一非 success = Publish skipped，job log 1,178,342 B 判读（门头 106 + `Summary: 106 passed, 0 failed` + `ALL 325 CASES PASS` + 11 条新用例 PASSED 在册 + 6 条含 FAILED 行全是 PASSED 用例名子串）。
+
+**★ 本轮最值钱的三条**：
+1. **蓝图未预见的真实门禁约束**：新建文件引用 `com.rikkaminis.app.debug.supportsCustomBaseURL` 触发 `debug_leak_guard.py` 红灯；先例是**行内豁免** `// debug-ok: <reason>`，且**该注释必须紧邻 import**——门只查本行与上一行，写在 5 行注释块末尾仍红（首轮实测踩到，`ProviderWriteRules.kt:4` → 移到紧邻后 rc=0）。allow-list（`ALLOWED_FILES`）未动（共享门）。
+2. **`test_scan.py` 的 cwd 敏感（口径陷阱）**：在 `scripts/scan/` 内执行得 3 处**假红**（`compact_decision_gate_check` / `truncated_call_guard_check` / `backup_remap_rollup_check` 报 `not found (moved?)` / `missing …` / `does not look like the RikkaMinis root`）；从**仓库根**执行 = `ALL 325 CASES PASS`。判别：先确认 cwd 再判定回归。
+3. **变异期望矩阵修正 1 条（如实记录）**：MUT-7（共享 helper 改名）我原预期门 1 的 C4 会红，实测 **GREEN**——C4 是**调用点文本**判据，改名只动定义、调用点文本仍在 ⇒ 门判据分工成立，改名由门 2 W1 + 装置 fail-closed 抓，**不是门漏判而是我期望写错**。变异点均选编译期类型已收敛处。
+
+**登记**：backlog `§ARCH-01`（R1 真机三写入面 / R2 门未注册（夹具与预期已给） / R3 debug-ok 复制风险 / R4 负决策未迁 `supportsCustomBaseURL` 出 debug 包 / R5 负决策未动 `ProviderDebugMethods.kt` / R6 test_scan cwd 口径）；机械门 `scan_debt.py notes` = **194 段 / no-触发条件 3 / 豁免 11**，§ARCH-01 判 **OK**（五条带触发条件）。
+
+**停止节点达成：分支 CI 绿，未合并 main**（改动含 .kt 验证面，合并起手权在用户）。
+
+<!-- 2026-10-18 16:47:15 -->
+## ARCH-03 收口：ProviderType 编译期穷举元数据契约 —— `fix/da1026-arch03-provider-type-registry` @ `22a15ed`，CI run 39110831683 success，停在分支
+
+
+**任务**：pinned 指令 = 读 `shared/work/deep-audit-1026/ARCH-COMMON.md`，执行同目录 `ARCH-BLUEPRINT.md` 的「ARCH-03」小节。基线 main `9d18269`。交付 **3 文件 +554/−1**（`ProviderConfig.kt` 两穷举 `when (this)` 扩展属性 `modelsDevProviderIds`/`legacyProviderNames`（**无 else**）· `ModelsDevApi.kt` `providerKeyMap` = 10 字面量键 verbatim 保留 + `ProviderType.values().flatMap{…}.toMap()` 派生合并 · 新建门 `scripts/scan/provider_type_registry_check.py` +491）。**报告** `fix-reports/ARCH-03-REPORT.md`（14,004 B，§8/§6/§9 已回填）；**装置** `repo-arch3/probe/`（不入库，`.gitignore` 排除；`jvm/{extract.py,Arch03Test.kt,run.sh}` + `mutations.py` + `run_mutations.sh` + **`run_arms.sh`** + `run_testscan_sections.sh` + `ci_fetch.py`）。
+
+**先证与护栏**：全量 `scan.sh` **106/0**（含 da1026-D 的 `models_provider_field_check` 字面量锚点门，未被破坏）；新门 pre（×基线树）= **10 violations rc=1**（arm1b×2/arm2a×3/arm2b×5），post = `OK (2 arms clean)`；selftest 8 夹具 + 带牙标记 `PROVIDER_TYPE_REGISTRY_SELFTEST=PASS`。
+
+**★★ 蓝图捏造枚举常量（本支最值钱发现）**：蓝图 §3 称枚举 7 常量、Before/After 代码块给 `antigravity("Antigravity")` 与 `ProviderType.antigravity -> emptyList()`；**真实树只有 6 常量（anthropic/gemini/openAI/openRouter/xAI/kimiCode），无 antigravity**。按蓝图逐字落码 = `unresolved reference` **编译红**。我中途一度按蓝图补了两分支（未提交），**回读枚举声明原文后当场撤销**（`git diff`=0、`TREE_CLEAN_VS_HEAD=true`）。**纪律：蓝图/工单文本不是 ground truth，树才是；怀疑「缺分支」先读声明再动手。** 另两条失真：蓝图用 `openai` 而真树是 `openAI`；蓝图「验证命令」字段指 `entry_composite_key_guard_check.py`（属 da1023，模板复制残留）→ 3 条进 TRIAGE §4（归收口会话）。
+
+**变异负控 5/5 分层落位（canonical 复跑齐全，产物 `probe/mut-out/<MUT>.{apply,gate,jvm,extract,restore}.log`）**：MUT-1 加 else（末位）→ 门 `arm 1c`×1 / JVM **OK(18)**（else 永不可达 → 门是唯一防线）· MUT-2 删合并表达式 → 门 `arm 2b`×3 / JVM **恰 2 红** `mergedMap_resolves_gemini_family` + `mergedMap_keys_frozen`（快照 `MUT-2.junit.log`）· MUT-3 删 3 imports → 门 `arm 2a`×3 / JVM OK(18)（切片不含 import）· MUT-4 删 `"Kimi"` 字面量键 → 门 `arm 2c`×1 / JVM **OK(18)**（`legacyProviderNames` 派生补齐 → 行为不变，门守锚点契约）· MUT-5 枚举加第 7 厂商 deepSeek 未映射 → 门 `arm 1d`×2 / JVM **COMPILE_FAIL**（编译器逐字 `Add the 'deepSeek' branch or an 'else' branch`，两处 when 各一条）= **设计意图本体证明**。五臂 `RESTORED_EXACT=true`、收尾 `TREE: 0 modified`。
+
+**★★★ 两条装置自伤（canonical 复跑逼出来，都是 1018 FIX-H 同族）**：
+1. **run.sh 内部重生成切片漏带 `ARCH3_ALLOW_MUTANTS=1`**：我先前为修「陈旧切片假红」给 run.sh 加了"每次先重生成"，但那行是裸 `python3 extract.py` → 在 MUT-2 变异树上撞 `assert fm >= 0` → `EXTRACT_FAIL` ⇒ **canonical 记录的 MUT-2「jvm 判定为空」是装置自伤，不是被测物行为**（首轮 2 红仍成立）。修 = `ARCH3_ALLOW_MUTANTS="${ARCH3_ALLOW_MUTANTS:-1}"`（干净树 `fm>=0` 恒成立 → no-op，不削弱干净树 fail-closed）。**分层纪律：门拥有「合并尾部在场」（arm 2b），JVM 拥有行为判据——装置任何一层都不得吃掉变异证据。**
+2. **junit 红例归因洞**：run.sh 只打 `tail -4`，编号红例在 `out/junit.log`，而 `out/` **每臂 rm -rf** ⇒ 红例名不可归因（同 1018 FIX-H「不得从被包装 stdout 尾巴判 JUnit」，这次是装置面）。修 = `run_arms.sh` 每臂 `cp out/junit.log mut-out/<MUT>.junit.log` 快照；`run_mutations.sh` 未同步（登记 §ARCH-03 R8）。
+
+**验证四层 + CI**：门 selftest 8/8 · 全量 `scan.sh` **106/0** · JVM `OK (18 tests)` · 变异 5/5 · **CI run 39110831683 success**，job `117626426371`，**三方逐字符一致 @ `22a15ed647947de711ec0b460442c12f994a2bde`**，26 步 `bad=[]` 唯一 skipped=`Publish to Releases`（分支门控正常）；job log 1,178,194 B 逐条判读 = 门头 `[N/106]` 106 无缺 + `Summary: 106 passed, 0 failed` + `ALL 325 CASES PASS` + `BUILD SUCCESSFUL`×4 + PASSED 5,312 + 含 FAILED 的 6 行全是 PASSED 用例名子串 + **新门 0 命中 = 未注册如实生效**。**编译面是本支最关键独立证据**：沙箱 JVM 装置编切片、门只做文本判据 ⇒ `compileReleaseKotlin` 绿是本支两个**无 else 穷举 when** 在生产文件上可编译的唯一证明（1026-D/1025-FIX-B 同族缺口）。
+
+**登记**：backlog **§ARCH-03**（R1 真机 `minis-model-use list` 消费面 / R2 门待注册两处 106→107 / R3 负决策不补 antigravity / R4 失真 3 条归 TRIAGE / R5 装置自伤已修 / R6 MUT-2 行为可见性仅 2/18 / R7 test_scan cwd 敏感 / R8 run_mutations.sh 未加快照，各带触发条件）。**停止节点达成（分支 CI 绿），未合并 main**（含 .kt 验证面，起手权在用户）。
+
+<!-- 2026-10-18 16:48:35 -->
+## ARCH-02 收口：PrimedPrefs 自治重预热契约（`fix/da1026-arch02-primed-prefs` @ `0f9f7cd`，CI #2293 绿，停在分支）
+
+
+**任务** `/var/minis/shared/work/deep-audit-1026/ARCH-COMMON.md`（工单 = `ARCH-BLUEPRINT.md` 的 ARCH-02 小节）。**报告** `fix-reports/ARCH-02-REPORT.md`（§1-§9 / 17447 B）；**证据归档** `probe-arch2-evidence/`（ci-job.log 1,179,249 B · gate-pre/post-tree.log · gate-selftest.log · full-scan/testscan-final.log）；**backlog** `§ARCH-02`（R1-R9）。基线 main `9d18269`；两提交：`befb9f7`（生产+门）· `0f9f7cd`（门收窄，由全量 test_scan 逼出）。
+
+**交付** 4 文件 **+434/−5**（门 +286/−2 · AgentRuntimeLimitsPrefs +53/−1 · ConcurrencyPrefs +51/−1 · FastModePrefs +44/−1）。生产改动 148 增/3 删，**零新增文件/依赖/配置项**（阶梯停在第 7 级）。
+
+**修法**：三个「prime 预热 @Volatile 缓存 + 无 Context 读取」对象自带**对象自有强引用** `selfSyncListener` + `listenerRegistered` 双检注册；`AgentRuntimeLimitsPrefs` 抽 `loadFromPreferences(p)` 让冷启动与再预热同源。`ConfigBuiltins`/`RuntimeLimitsScreen` 外部器**保留为防御纵深**（一行未改）。三对象风险分级如实记录：ConcurrencyPrefs/AgentRuntimeLimitsPrefs = **真实失步修复**；FastModePrefs = **结构性保险**（`ConfigBuiltins` 里根本没注册路径，今天所有写走 `setEnabled`）。
+
+**验证四层**：门 selftest **13/13**（新建 7 判据 C4/C5/C6a/C6b/C7/S1-S3，既有 6 夹具保留，标记 `PREFS_PRIMING_SELFTEST=PASS` 未改名）· **门差分 PRE 树 rc=1 恰 3 条**（逐条点名三对象）/ POST rc=0 · JVM 双臂 **POST `OK (10 tests)` / PRE `Tests run: 10, Failures: 7`**（全落 ARCH-02 家族，3 对照例两臂同绿）· 全量 `scan.sh` **106/106** + `test_scan.py` **ALL 325 CASES PASS** · **CI #2293（39111344339）success @ 0f9f7cd**，三方 SHA 逐字符，job 117627958184 `steps_failed=[]`、唯一 skipped=Publish，job log 判读 = 106 distinct 门头 + `[106/106]` + `Summary: 106 passed, 0 failed` + `ALL 325` + 4×BUILD SUCCESSFUL + 6 条含 FAILED 全是 PASSED 用例名子串。
+
+**★★★ 本轮最值钱的一条（门被冻结夹具逼着改）**：首版把新判据写成**无条件 fail-closed**（「树里找不到 primed 缓存对象 ⇒ 红」）→ 全量 `test_scan.py` **4 条绿期望夹具翻红**（named field holder / local stored into a field / prefs-listener-ok escape hatch / onDispose-held listener —— 全是**只有监听器持有关系、没有 prefs 缓存世界**的迷你树）。处置 = **改门不改被冻结的夹具**：收窄为**漂移探测器**（仅当树仍带 ARCH-02 锚点：三对象名之一或其 prefs 文件名字面量，而 primed 形状不可辨认时才开火）。**判据说「这棵树漂移了」，不能说「这棵树没有那个世界」。** 收窄后 PRE/POST 差分与 13 夹具自检均不变、`ALL 325` 回归。
+
+**★ 变异负控 5/5**（每条 RESTORE_EXACT + 还原后复绿）：MUT-1 删注册调用 → 门 rc=1(S2) + **行为 3 红** · MUT-2 监听器体置空 → 门 rc=1(S3) + 行为 2 红 · **MUT-3 只摘 clamp 实参 → 门 rc=0 看不见 / 行为 1 红** · **MUT-4 摘守卫无条件注册 → 门 rc=0 / 行为 1 红** · MUT-5 声明+注册同删 → 门 rc=1(S1) + 行为 2 红。**MUT-3/4 是「门判在场、行为判顺序与实参」的正确分层**，不为它们扩门（装置比例）。变异点全落编译期类型已收敛处（MUT-5 必须两处同删，只删声明=编译红≠行为红）。
+
+**★ 装置自伤第二次踩（同族第 2 次，登记未立规则）**：`extract.py` 把 `selfSyncListener` 列为 required token ⇒ MUT-1/MUT-5 在抽取阶段 `EXTRACT_ABORT`，**守卫把变异臂的证据吃掉**（1026 FIX-H 同型）。修 = 增 `mutated` 模式（缺 token 降级 `EXTRACT_WARN`，对象存在性与括号配平仍硬断言），**只对变异臂开放**。
+
+**★ 蓝图失真 3 条（进 TRIAGE §4）**：① 行号失真——`AgentRuntimeLimitsPrefs::prime` 蓝图称 184–225，实测 **`:339` 附近**；② 蓝图「Before」引文与真树不符（FastModePrefs 蓝图 `cached`+`PREFS_NAME` vs 真树 `cachedEnabled`+`PREFS="minis_fast_mode_prefs"`）；③ 蓝图「After」写 `raw.coerceIn(MIN,MAX)`，实际复用该文件既有 `clamp(...)`（clamp 语义单源）。**F-235 归属更正**：FastModePrefs 死 `appContext` 字段在 **1026 批次**就已移除（基线只剩 KDoc 引用），**不记 ARCH-02 功劳**。
+
+**环境要点**：CI 分支 push 不触发 → 手动 `gh-actions-dispatch --workflow build-apk.yml --ref <branch>`；job log 下载 = **auth 给 API、裸取 302 Location**（首版把 HTTPError 当响应体读 → 0 字节，已修 `probe/ci_judge.py`）。**停止节点达成，未合并 main**（有 .kt 验证面，合并起手权在用户）。
+
+<!-- 2026-10-18 17:18:48 -->
+## ARCH 批次收口完成（用户「他们完成了」/「跑完了」）：3 支并入并集树，CI 绿 @ 407bdd4
+
+
+**身份链**：基线 main `9d18269` → 3 支 → 并集树 **`integration/da1026-arch` @ `407bdd4`**（3 次 `--no-ff` 零冲突 + 门注册提交）。
+
+**三支交付（3/3 支 CI 绿）**：
+| 支 | 内容 | 分支 HEAD | 支 CI run |
+|---|---|---|---|
+| ARCH-01 | ProviderWriteRules 单源层（`isCustomBaseURLWriteAllowed`） | `5737f75` | 39110944268 success |
+| ARCH-02 | PrimedPrefs 自治缓存（selfSyncListener + 保留外部监听器） | `0f9f7cd` | 39111344339 success |
+| ARCH-03 | ProviderType 枚举注册表（`modelsDevProviderIds`/`legacyProviderAliases` + exhaustive when） | `22a15ed` | 39110831683 success |
+
+**门禁**：`scan.sh` **108 passed / 0 failed**（106→108：ARCH-01 新建 `provider_write_rules_check`、ARCH-03 新建 `provider_type_registry_check`）；`test_scan.py` **ALL 329 CASES PASS**（325→329）。扩展门：`provider_rpc_symmetry_check`(01) / `prefs_listener_holder_guard`(02，13/13)。
+
+**并集树 CI**：run **#2294（39113597246）success @ `407bdd4`**（head_sha 本地==远端==CI 三方逐字符）；26 步唯一非 success = Publish skipped；job log 1,180,338 B 逐条核 = `ALL 329 CASES PASS` + `[107/108]`/`[108/108]` 在册 + **行尾 `FAILED$` = 0**（含 FAILED 的行全是用例名子串）。
+
+**三项核查**：①12 文件两两正交（`OVERLAP=0` 实测）、冲突标记 0、调试残留 0（唯一命中是注释里的 `TODO()`）；②本地 108/329 全绿 + 4 个 CI 绿 + head_sha 一致；③修复本体抽查 3/3（ProviderWriteRules:61 被调用 2 处 / ConcurrencyPrefs:100 selfSyncListener 且 ConfigBuiltins:72,176 外部监听保留 / ProviderConfig 枚举派生接线）。
+
+**★ 蓝图失真 2 条（本批最值钱发现）**：
+1. **蓝图捏造 `ProviderType.antigravity` 枚举常量**（称 7 常量，真实树只有 6：anthropic/gemini/openAI/openRouter/xAI/kimiCode）。ARCH-03 支按蓝图逐字落码 → `unresolved reference` 编译红，支内回读枚举声明后当场撤销（中途 `git diff`=0 证实撤干净）。**教训：蓝图文本不是 ground truth，树才是**——这条与「报告行号不可采信」同族但更深一层（连**代码内容**都可臆造）。
+2. 蓝图「验证命令」引用 `entry_composite_key_guard_check.py`（da1023 的门）= 模板复制残留。
+3. 命名差异（非失真）：蓝图 `modelsDevKeys` → 实现 `modelsDevProviderIds`，语义等价。
+→ 三条进 TRIAGE §4 工单失真登记（D1/D2/D3）。
+
+**变异负控 17 条全 PRECISE**（01:7 / 02:5 / 03:5）。亮点：ARCH-03 MUT-5（枚举加第 7 厂商不配映射）JVM 切片 **COMPILE-FAIL** = `'when' expression must be exhaustive` 被真编译器强制（蓝图「编译期穷举」的本体证明）；ARCH-02 MUT-3/MUT-4 门 rc=0 看不见、只有行为层红 —— 报告如实分层。
+
+**收口期踩坑**：`test_scan.py` 夹具列表**元组间缺逗号**（`join("\n")` 而非 `join(",\n")`）→ Python 把相邻元组解析为调用 → `TypeError: 'tuple' object is not callable`（报错行 = 夹具行本身）。注册脚本已修；`ast.parse` 自检 + 直接读报错行定位，秒级修好。
+
+**待用户**：合并 main（3 支均含 `.kt` = 非纯文本例外，起手权在用户）。真机行为级未验证（自定义 baseURL 假成功 / 外部直写 UI 反映 / 新枚举编译失败）需装包。
 
 ---
 

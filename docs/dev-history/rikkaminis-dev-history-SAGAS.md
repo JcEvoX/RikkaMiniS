@@ -8,11 +8,11 @@
 > 由 `skills/dev-history-sync/scripts/build_sagas.py` 从档案自动生成，可重复执行。
 
 - 覆盖范围：2026-08-03 ～ 2026-10-18，共 77 天
-- 条目总数：1952（源文件：rikkaminis-dev-history.md）
+- 条目总数：1957（源文件：rikkaminis-dev-history.md）
 - 主题数：24
 - 未归入任何主题：180 条（9%，列在文末）
-- 归入 ≥4 个主题（说明规则偏松）：126 条
-- 标 `↳` 的条目是**推断归属**：标题里没有主题词（「X 完成 / X 收尾」这类收尾条目，主题词在**上一条**里），由「12 小时内最近一条有主题的条目」继承而来，共 138 条。
+- 归入 ≥4 个主题（说明规则偏松）：127 条
+- 标 `↳` 的条目是**推断归属**：标题里没有主题词（「X 完成 / X 收尾」这类收尾条目，主题词在**上一条**里），由「12 小时内最近一条有主题的条目」继承而来，共 139 条。
 
 ### 怎么读
 
@@ -35,12 +35,12 @@
 | 6 | 流式回答中断 / 恢复 / 取消 | 163 | 08-03 ～ 10-18 | 已闭环 |
 | 7 | 思考 / 推理泄漏 | 90 | 08-08 ～ 10-18 | 已闭环 |
 | 8 | 上下文压缩 / 记忆 / 预算 | 197 | 08-06 ～ 10-18 | 稳定 |
-| 9 | Provider / 模型组 / 负载均衡 | 137 | 08-04 ～ 10-18 | 已闭环 |
+| 9 | Provider / 模型组 / 负载均衡 | 139 | 08-04 ～ 10-18 | 已闭环 |
 | 10 | 备份 / 多端同步 | 158 | 08-03 ～ 10-18 | 收敛 |
 | 11 | 渲染性能 / Markdown / 长会话卡顿 | 129 | 08-05 ～ 10-17 | 已闭环 + 持续加固 |
-| 12 | 审计 / 整改（多轮） | 311 | 08-03 ～ 10-18 | 常态机制 |
-| 13 | 多会话并行协作 / 派发 / 交接 | 419 | 08-04 ～ 10-18 | 成熟 |
-| 14 | CI / 构建 / 发布流水线 | 440 | 08-03 ～ 10-18 | 稳定 |
+| 12 | 审计 / 整改（多轮） | 315 | 08-03 ～ 10-18 | 常态机制 |
+| 13 | 多会话并行协作 / 派发 / 交接 | 423 | 08-04 ～ 10-18 | 成熟 |
+| 14 | CI / 构建 / 发布流水线 | 445 | 08-03 ～ 10-18 | 稳定 |
 | 15 | 开发档案 / 记忆 / 工具链 | 166 | 08-03 ～ 10-18 | 常态维护 |
 | 16 | 会话 / 导航 / 抽屉交互 | 129 | 08-03 ～ 10-18 | 已闭环 |
 | 17 | 平台适配 / 通知 / 图标 / 权限 | 90 | 08-03 ～ 10-18 | 部分放弃 |
@@ -1006,7 +1006,7 @@
 
 ## 9. Provider / 模型组 / 负载均衡
 
-**跨度** 2026-08-04 ～ 2026-10-18 · **137 条** · **状态** 已闭环（09-12 收尾；负载均衡语义已在代码级核实为「生效但语义与用户预期不同」）
+**跨度** 2026-08-04 ～ 2026-10-18 · **139 条** · **状态** 已闭环（09-12 收尾；负载均衡语义已在代码级核实为「生效但语义与用户预期不同」）
 
 **叙事**：08-04 loadBalance 轮转游标不前进 → 08-08 模型组 recovery 策略 → 08-14 模型组策略重构 P1–P4 + 思考折叠（中转站）→ 08-15 模型切换无缝（cancel+restart）→ 09-04 思考字段决策键（tokenrhythm 报错）→ 09-06 负载均衡请求级改造 → 09-11 多密钥轮换 + Groq 免费档不可用 → 09-12 「负载均衡像回退模式」**第二次**被报（08-04 同款问题）。**同一现象两次立项**，说明第一次的修法没解释清语义。
 
@@ -1149,6 +1149,8 @@
 | 10-18 10:07 | FIX-I 交付收口：deep-audit-1025 ISSUE-09（P2 Provider RPC 守卫/字段不对称）—— fix/da1025-provider-rpc-symmetry @ `6b40595`，CI #2276（39087616148）success，停在分支 | 任务书 shared/work/deep-audit-1025/fix-tasks/FIX-I.md；报告 fix-reports/FIX-I.md（8 节齐）；装置 repo-i/probe/（durable）；bac… |
 | 10-18 14:12 | FIX-E 交付收口：deep-audit-1026 ISSUE-05（ProvidersCollection customBaseURL 漏守卫，P1）—— `fix/da1026-providers-baseurl-guard` @ `53c9d08`，CI run 39101827796 绿，停在分支 | 任务书 fix-tasks/FIX-E.md（COMMON 实际在上级目录，已读）。基线 main dc04fc3。交付 2 文件 +261/−7。 |
 | 10-18 14:18 | FIX-D 收口：deep-audit-1026 ISSUE-04（`minis-config` 加模型落库 provider 存实例 UUID + 未 trim + providerKeyMap 缺 displayName 键）—— `fix/da1026-models-provider-field` @ `4be9d09`，CI #2285 绿，停在分支 | 任务 fix-tasks/FIX-D.md（先读 COMMON，实际在上级目录）。报告 fix-reports/FIX-D.md；装置 repo-d/probe/（树内，.gitignore:141 已含 probe/）… |
+| 10-18 16:40 | ARCH-01 交付：ProviderWriteRules 单源校验层（`fix/da1026-arch01-provider-write-rules` @ `5737f75`，CI run 39110944268 success，停在分支未合并） | 任务 ARCH-COMMON.md + 蓝图 ARCH-01 小节（Provider / Model 跨面写入规则收口）。报告 fix-reports/ARCH-01-REPORT.md（11223 B，§1–§9）；装… |
+| 10-18 16:47 | ARCH-03 收口：ProviderType 编译期穷举元数据契约 —— `fix/da1026-arch03-provider-type-registry` @ `22a15ed`，CI run 39110831683 success，停在分支 | 任务：pinned 指令 = 读 shared/work/deep-audit-1026/ARCH-COMMON.md，执行同目录 ARCH-BLUEPRINT.md 的「ARCH-03」小节。基线 main 9d182… |
 
 ## 10. 备份 / 多端同步
 
@@ -1457,7 +1459,7 @@
 
 ## 12. 审计 / 整改（多轮）
 
-**跨度** 2026-08-03 ～ 2026-10-18 · **311 条** · **状态** 常态机制（已固化为 security-audit-checklist / four-way-sync-check 等 skill）
+**跨度** 2026-08-03 ～ 2026-10-18 · **315 条** · **状态** 常态机制（已固化为 security-audit-checklist / four-way-sync-check 等 skill）
 
 **叙事**：08-05 首次全量代码审查 → 08-16 系统性审计 → 08-18 RC1–RC17 两轮整改（多会话并行）→ 08-26/27 模块审计批 → 09-02 bug-hunt 四会话 → 09-04 diff 驱动定向审计 → 09-09 全局第二轮 T1–T12 → 09-13 完善度横向扫描 → 09-14 度量存活度 → 09-15 七轴 sweep。**审计是本项目最稳定的工程节奏**：每次改动后必有一次独立审计，且审计本身产出纪律（skill）。
 
@@ -1774,10 +1776,14 @@
 | 10-18 11:27 | 审计背景包升级 v8 + prompt v5（用户令：为下一波外发审查准备背景文件与提示词） | 位置：/var/minis/mounts/笔记/RikkaMinis审计背景包/（该目录即审计发包目录，另有 /var/minis/mounts/笔记/RikkaMinis审计全记录/）。交付面 = GitHub 仓库源… |
 | 10-18 11:39 | deep-audit-1025 分支清理完成（用户令「清掉」） | 结果：11/11 删除 http 204 —— 9×fix/da1025- + integration/da1025 + docs/dev-history-1025。判据 compare/main...<b> 的 ahe… |
 | 10-18 13:06 | deep-audit-1026 启动：第二道门核实完成 + 7 支派发（用户令「按流程来」，附新审计报告 8 项） | 输入：shared-d2163f57.md（132KB，8 ISSUE）→ shared/work/deep-audit-1026/REPORT-1026.md。基线 main dc04fc3（= 1025 收口树）。门… |
+| 10-18 16:40 | ARCH-01 交付：ProviderWriteRules 单源校验层（`fix/da1026-arch01-provider-write-rules` @ `5737f75`，CI run 39110944268 success，停在分支未合并） | 任务 ARCH-COMMON.md + 蓝图 ARCH-01 小节（Provider / Model 跨面写入规则收口）。报告 fix-reports/ARCH-01-REPORT.md（11223 B，§1–§9）；装… |
+| 10-18 16:47 | ARCH-03 收口：ProviderType 编译期穷举元数据契约 —— `fix/da1026-arch03-provider-type-registry` @ `22a15ed`，CI run 39110831683 success，停在分支 | 任务：pinned 指令 = 读 shared/work/deep-audit-1026/ARCH-COMMON.md，执行同目录 ARCH-BLUEPRINT.md 的「ARCH-03」小节。基线 main 9d182… |
+| 10-18 16:48 | ARCH-02 收口：PrimedPrefs 自治重预热契约（`fix/da1026-arch02-primed-prefs` @ `0f9f7cd`，CI #2293 绿，停在分支） | 任务 /var/minis/shared/work/deep-audit-1026/ARCH-COMMON.md（工单 = ARCH-BLUEPRINT.md 的 ARCH-02 小节）。报告 fix-reports/A… |
+| 10-18 17:18 | ARCH 批次收口完成（用户「他们完成了」/「跑完了」）：3 支并入并集树，CI 绿 @ 407bdd4 | 身份链：基线 main 9d18269 → 3 支 → 并集树 integration/da1026-arch @ 407bdd4（3 次 --no-ff 零冲突 + 门注册提交）。 |
 
 ## 13. 多会话并行协作 / 派发 / 交接
 
-**跨度** 2026-08-04 ～ 2026-10-18 · **419 条** · **状态** 成熟（skill: task-dispatch / git-parallel-collaboration / rikkaminis-dev-methodology）
+**跨度** 2026-08-04 ～ 2026-10-18 · **423 条** · **状态** 成熟（skill: task-dispatch / git-parallel-collaboration / rikkaminis-dev-methodology）
 
 **叙事**：08-07 多对话框并发操作同一 worktree 翻车（native OOM 修复）→ 08-12 多任务并行推进模式确立 → 08-15 T1–T10 十会话派发（平衡点施工）→ 08-18 RC 整改凭编号领取 → 08-22 小号 TF-A..TF-J → 08-23 bug-hunt 五会话 → 09-13 两条纪律固化：**每会话独立 clone 绝不共享 .git** + **两分支同基各一 commit 时第二个必须 rebase**。
 
@@ -2202,10 +2208,14 @@
 | 10-18 14:30 | FIX-F 收口：deep-audit-1026 ISSUE-06（CSV 预览绕过 readCapped 无界读 + 两预览 remember 无键）—— `fix/da1026-csv-bounded-read` @ `011812a`，CI run 39103139228 绿，停在分支 | 任务 fix-tasks/FIX-F.md（COMMON 在上级目录）。报告 fix-reports/FIX-F.md（8 节 / 12794 B / 无占位符）；装置 repo-f/probe/（durable、不入库… |
 | 10-18 15:05 | FIX-H 收口：deep-audit-1026 ISSUE-08（group context-limit 写漏斗不同步 + `get groups` 缺两键，P2）—— `fix/da1026-group-sync` @ `0353112`，CI #2288 绿，停在分支 | 任务 fix-tasks/FIX-H.md（COMMON 实读自上级目录）；报告 fix-reports/FIX-H.md（8 节 / 16002 B / 无 TODO）；装置 repo-h/probe/（jvm/{ex… |
 | 10-18 15:32 | deep-audit-1026 收口完成（用户令「按流程来」→ 8 支全绿 → 并集树 CI 绿） | 身份链：基线 main dc04fc3 → 8 支（A..H，逐支 CI 绿）→ 并集树 integration/da1026 ad0c5d78c9024750df52bc7c57c3eba5e338b6f0（8 次 -… |
+| 10-18 15:52 | ↳ deep-audit-1026 合并 main + 文档归档完成（用户令「合并，不要忘了文档」） | 合并：integration/da1026（@ ad0c5d7）--no-ff 合入 main → 3f99b30ce582c454754184405ad0db7c08d546f5；树对拍 main^{tree} == … |
+| 10-18 16:47 | ARCH-03 收口：ProviderType 编译期穷举元数据契约 —— `fix/da1026-arch03-provider-type-registry` @ `22a15ed`，CI run 39110831683 success，停在分支 | 任务：pinned 指令 = 读 shared/work/deep-audit-1026/ARCH-COMMON.md，执行同目录 ARCH-BLUEPRINT.md 的「ARCH-03」小节。基线 main 9d182… |
+| 10-18 16:48 | ARCH-02 收口：PrimedPrefs 自治重预热契约（`fix/da1026-arch02-primed-prefs` @ `0f9f7cd`，CI #2293 绿，停在分支） | 任务 /var/minis/shared/work/deep-audit-1026/ARCH-COMMON.md（工单 = ARCH-BLUEPRINT.md 的 ARCH-02 小节）。报告 fix-reports/A… |
+| 10-18 17:18 | ARCH 批次收口完成（用户「他们完成了」/「跑完了」）：3 支并入并集树，CI 绿 @ 407bdd4 | 身份链：基线 main 9d18269 → 3 支 → 并集树 integration/da1026-arch @ 407bdd4（3 次 --no-ff 零冲突 + 门注册提交）。 |
 
 ## 14. CI / 构建 / 发布流水线
 
-**跨度** 2026-08-03 ～ 2026-10-18 · **440 条** · **状态** 稳定（Publish 步骤已加 `if: refs/heads/main` 门控）
+**跨度** 2026-08-03 ～ 2026-10-18 · **445 条** · **状态** 稳定（Publish 步骤已加 `if: refs/heads/main` 门控）
 
 **叙事**：08-04 main 编译被 WebDAV 提交弄坏（连红 4 个 run）→ 08-05 android-latest 被分支构建污染 → workflow 门控修复 → 08-17 **CI 缓存恢复旧 native .so**（Tier 0 真 bug）→ 08-24 gh_ci_wait.sh 工具化 + 重复构建幂等守卫 → 09-10 语法门 grep 大小写坑 → 09-14 workflow_dispatch 并发竞态。**「CI 绿 ≠ 逻辑对」这条纪律就是从这条 saga 长出来的。**
 
@@ -2651,6 +2661,11 @@
 | 10-18 14:30 | FIX-F 收口：deep-audit-1026 ISSUE-06（CSV 预览绕过 readCapped 无界读 + 两预览 remember 无键）—— `fix/da1026-csv-bounded-read` @ `011812a`，CI run 39103139228 绿，停在分支 | 任务 fix-tasks/FIX-F.md（COMMON 在上级目录）。报告 fix-reports/FIX-F.md（8 节 / 12794 B / 无占位符）；装置 repo-f/probe/（durable、不入库… |
 | 10-18 15:05 | FIX-H 收口：deep-audit-1026 ISSUE-08（group context-limit 写漏斗不同步 + `get groups` 缺两键，P2）—— `fix/da1026-group-sync` @ `0353112`，CI #2288 绿，停在分支 | 任务 fix-tasks/FIX-H.md（COMMON 实读自上级目录）；报告 fix-reports/FIX-H.md（8 节 / 16002 B / 无 TODO）；装置 repo-h/probe/（jvm/{ex… |
 | 10-18 15:32 | deep-audit-1026 收口完成（用户令「按流程来」→ 8 支全绿 → 并集树 CI 绿） | 身份链：基线 main dc04fc3 → 8 支（A..H，逐支 CI 绿）→ 并集树 integration/da1026 ad0c5d78c9024750df52bc7c57c3eba5e338b6f0（8 次 -… |
+| 10-18 15:52 | ↳ deep-audit-1026 合并 main + 文档归档完成（用户令「合并，不要忘了文档」） | 合并：integration/da1026（@ ad0c5d7）--no-ff 合入 main → 3f99b30ce582c454754184405ad0db7c08d546f5；树对拍 main^{tree} == … |
+| 10-18 16:40 | ARCH-01 交付：ProviderWriteRules 单源校验层（`fix/da1026-arch01-provider-write-rules` @ `5737f75`，CI run 39110944268 success，停在分支未合并） | 任务 ARCH-COMMON.md + 蓝图 ARCH-01 小节（Provider / Model 跨面写入规则收口）。报告 fix-reports/ARCH-01-REPORT.md（11223 B，§1–§9）；装… |
+| 10-18 16:47 | ARCH-03 收口：ProviderType 编译期穷举元数据契约 —— `fix/da1026-arch03-provider-type-registry` @ `22a15ed`，CI run 39110831683 success，停在分支 | 任务：pinned 指令 = 读 shared/work/deep-audit-1026/ARCH-COMMON.md，执行同目录 ARCH-BLUEPRINT.md 的「ARCH-03」小节。基线 main 9d182… |
+| 10-18 16:48 | ARCH-02 收口：PrimedPrefs 自治重预热契约（`fix/da1026-arch02-primed-prefs` @ `0f9f7cd`，CI #2293 绿，停在分支） | 任务 /var/minis/shared/work/deep-audit-1026/ARCH-COMMON.md（工单 = ARCH-BLUEPRINT.md 的 ARCH-02 小节）。报告 fix-reports/A… |
+| 10-18 17:18 | ARCH 批次收口完成（用户「他们完成了」/「跑完了」）：3 支并入并集树，CI 绿 @ 407bdd4 | 身份链：基线 main 9d18269 → 3 支 → 并集树 integration/da1026-arch @ 407bdd4（3 次 --no-ff 零冲突 + 门注册提交）。 |
 
 ## 15. 开发档案 / 记忆 / 工具链
 
