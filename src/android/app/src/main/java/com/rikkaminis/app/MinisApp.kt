@@ -629,7 +629,7 @@ class MinisApp : Application(), ImageLoaderFactory {
         NativeOffloadServer.register("android-notification", NotificationOffloadHandler(this))
         NativeOffloadServer.register("android-open", OpenOffloadHandler(this))
         NativeOffloadServer.register("android-photos", PhotosOffloadHandler(this))
-        NativeOffloadServer.register("android-player", PlayerOffloadHandler())
+        NativeOffloadServer.register("android-player", PlayerOffloadHandler(this))
         NativeOffloadServer.register("android-speak", SpeakOffloadHandler(this))
         NativeOffloadServer.register("android-speech", SpeechOffloadHandler(this))
         NativeOffloadServer.register("android-weather", WeatherOffloadHandler(this))

@@ -1269,7 +1269,7 @@ internal object ConfigBuiltins {
             ReadOnlyField(
                 path = "envvars",
                 displayName = "Environment variables (summary)",
-                description = "Read-only list of env var keys with note and createdAt. Values are never exposed.",
+                description = "Read-only list of env var keys with group, note and createdAt. Values are never exposed.",
                 valueSchema = ConfigSchema.Json,
                 reader = {
                     ConfigValue.Arr(
@@ -1277,6 +1277,7 @@ internal object ConfigBuiltins {
                             ConfigValue.Obj(
                                 linkedMapOf(
                                     "key" to ConfigValue.Str(e.key),
+                                    "group" to ConfigValue.Str(e.group),
                                     "note" to ConfigValue.Str(e.note),
                                     "created_at" to ConfigValue.Str(isoFormatter.format(java.time.Instant.ofEpochMilli(e.createdAt))),
                                 )

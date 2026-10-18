@@ -54,6 +54,7 @@ class EnvVarsCollection(
         return listOf(
             createdAtField(forId),
             noteField(forId),
+            groupField(forId),
             // Hidden guard: an agent attempt to read or write the
             // value gets a precise permission_denied.
             HiddenField(
@@ -119,6 +120,34 @@ class EnvVarsCollection(
                 // (clear), so an unqualified note write would silently
                 // flatten the user's grouping label.
                 repo.update(e.id, e.key, currentValue, s, e.group)
+            },
+        )
+
+    private fun groupField(key: String): ConfigField =
+        ClosureField(
+            path = "envvars.$key.group",
+            displayName = "Group",
+            description = "Grouping label shown as a section header. Empty string clears it.",
+            valueSchema = ConfigSchema.Str(maxLength = 200),
+            risk = ConfigRisk.NORMAL,
+            revertable = true,
+            reader = {
+                val e = repo.entries.value.firstOrNull { it.key == key }
+                if (e == null) ConfigValue.Null
+                else ConfigValue.Str(e.group)
+            },
+            writer = { v ->
+                val s = (v as? ConfigValue.Str)?.value ?: throw ConfigError.TypeMismatch("string")
+                val e = repo.entries.value.firstOrNull { it.key == key }
+                    ?: throw ConfigError.UnknownPath("envvars.$key")
+                // Update via a value-preserving path: read existing value
+                // back out of encrypted prefs, then write the new group
+                // alongside it. The note rides through untouched and the
+                // repo's [update] keeps the secret in place when the same
+                // key is provided. An empty string clears the group
+                // (update()'s explicit-"" branch).
+                val currentValue = repo.getValue(e.key) ?: ""
+                repo.update(e.id, e.key, currentValue, e.note, s)
             },
         )
 }

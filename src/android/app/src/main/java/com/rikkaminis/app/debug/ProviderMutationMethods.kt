@@ -72,7 +72,7 @@ internal object ProviderMutationMethods {
         // instances.update has no type gate, so a create-time openAI-only
         // rejection contradicted its own update path. Only openRouter keeps
         // the hard rejection (no remote base URL to honor).
-        if (customBaseURL != null && type == ProviderType.openRouter) {
+        if (customBaseURL != null && !type.supportsCustomBaseURL) {
             throw RPCException(-32602, "customBaseURL is not supported for providerType=openRouter")
         }
 
@@ -135,6 +135,21 @@ internal object ProviderMutationMethods {
             if (params.isNull("customUserAgent")) null
             else params.optString("customUserAgent", "").ifEmpty { null }
         } else current.customUserAgent
+
+        // [da1023-C] Same openRouter guard as instancesCreate: openRouter's
+        // request builder pins https://openrouter.ai/api/v1, so a non-empty
+        // customBaseURL written via update would be silently ignored by the
+        // request builder while the config happily persists it. A blank or
+        // JSON-null value is a clear, not a write. providerType is NOT mutable
+        // via update (params.providerType is never consumed — the copy below
+        // doesn't touch it), so the type at write time is exactly
+        // current.providerType.
+        if (params.has("customBaseURL") && !params.isNull("customBaseURL")) {
+            val newBase = params.optString("customBaseURL", "").ifEmpty { null }
+            if (newBase != null && !current.providerType.supportsCustomBaseURL) {
+                throw RPCException(-32602, "customBaseURL is not supported for providerType=openRouter")
+            }
+        }
 
         // [GH#68] Optional imageEndpointMode patch. Accepts the Kotlin enum
         // name or the wire SerialName (images_generations / chat_completions).
@@ -282,20 +297,7 @@ internal object ProviderMutationMethods {
     private fun instanceToJson(repo: ProviderRepository, inst: ProviderInstance): JSONObject {
         val cfg = repo.config.value
         val entryCount = cfg.modelEntries.count { it.providerInstanceId == inst.id }
-        return JSONObject().apply {
-            put("id", inst.id)
-            put("label", inst.label)
-            put("providerType", inst.providerType.name)
-            put("credentialType", inst.credentialType.name)
-            put("isEnabled", inst.isEnabled)
-            put("customBaseURL", inst.customBaseURL ?: JSONObject.NULL)
-            put("appendV1Suffix", inst.appendV1Suffix)
-            put("useResponsesAPI", inst.useResponsesAPI)
-            put("customUserAgent", inst.customUserAgent ?: JSONObject.NULL)
-            put("createdAt", inst.createdAt)
-            put("hasCredential", repo.loadApiKey(inst.id)?.isNotEmpty() == true)
-            put("modelEntryCount", entryCount)
-        }
+        return instanceJsonCore(inst, repo.loadApiKey(inst.id)?.isNotEmpty() == true, entryCount)
     }
 
     // ─── Models ─────────────────────────────────────────────────────────────
@@ -641,6 +643,51 @@ internal object ProviderMutationMethods {
         }
     }
 }
+
+/**
+ * [deep-audit-1025 FIX-I] Pure instance-JSON builder for the mutation RPC
+ * face — key-for-key symmetric with the per-instance object that
+ * `provider.instances.list` (ProviderDebugMethods) returns, including the
+ * [GH#68] image-endpoint keys. Before this the mutation responses dropped
+ * `imageEndpointMode`/`imageEndpointResolved`, so an automation harness that
+ * mutated an instance and round-tripped the response lost the image-endpoint
+ * state the debug listing still reported. Pure on purpose (no repo/Context)
+ * so the key symmetry is assertable in a JVM unit test; `hasCredential` /
+ * `entryCount` are computed by the caller (they need the repository).
+ */
+internal fun instanceJsonCore(inst: ProviderInstance, hasCredential: Boolean, entryCount: Int): JSONObject =
+    JSONObject().apply {
+        put("id", inst.id)
+        put("label", inst.label)
+        put("providerType", inst.providerType.name)
+        put("credentialType", inst.credentialType.name)
+        put("isEnabled", inst.isEnabled)
+        put("customBaseURL", inst.customBaseURL ?: JSONObject.NULL)
+        put("appendV1Suffix", inst.appendV1Suffix)
+        put("useResponsesAPI", inst.useResponsesAPI)
+        // [GH#68] Mirror the instancesList keys so a mutation response and the
+        // debug listing round-trip without losing the image-endpoint state.
+        put("imageEndpointMode", inst.imageEndpointMode.name)
+        put("imageEndpointResolved", inst.imageEndpointResolved?.name ?: JSONObject.NULL)
+        put("customUserAgent", inst.customUserAgent ?: JSONObject.NULL)
+        put("createdAt", inst.createdAt)
+        put("hasCredential", hasCredential)
+        put("modelEntryCount", entryCount)
+    }
+
+/**
+ * [da1023-C] Single source for "does this provider type honor a custom base
+ * URL": every provider arm in ProviderFactory except openRouter does —
+ * openRouter's request builder pins https://openrouter.ai/api/v1. Consumed by
+ * the instances.create / instances.update openRouter guards (this file) and by
+ * the `customBaseURLSupported` / `appendV1SuffixConfigurable` fields of
+ * `provider.types` (ProviderDebugMethods). The old per-face openAI/anthropic
+ * hardcode misreported gemini/xAI/kimiCode as unsupported via
+ * `provider.types` while the same instance could actually be created with a
+ * custom base URL — the debug field contradicted the write path.
+ */
+internal val ProviderType.supportsCustomBaseURL: Boolean
+    get() = this != ProviderType.openRouter
 
 /**
  * [deep-audit-1024 ISSUE-02] Connectivity-probe URL for `provider.instances.test`.

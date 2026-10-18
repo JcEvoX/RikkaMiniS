@@ -10,6 +10,7 @@ import com.rikkaminis.app.data.repository.SkillRepository
 import com.rikkaminis.app.tools.SubagentSkill
 import com.rikkaminis.app.tools.SubagentToolCall
 import com.rikkaminis.app.tools.ToolExecutionResult
+import com.rikkaminis.app.tools.resolveToolTitle
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.Flow
 import org.json.JSONObject
@@ -104,17 +105,21 @@ internal suspend fun executeBrowserUseTool(
     artifactWriter: (filename: String, data: ByteArray) -> String?,
     resizeJpeg: (ByteArray, Int) -> ByteArray?,
 ): ToolExecutionResult {
+    // [fix/da1025-G] Resolve the title BEFORE the parse early-return
+    // (ToolTitleResolver's contract: callers must invoke this before their
+    // try block). The title used to be a try-scoped val inside the success
+    // path, so the invalid-input early return and the catch arm had no title
+    // to report — the capsule degraded to the bare tool name on every
+    // browser_use error path.
+    val toolTitle = resolveToolTitle(argsJson, "browser_use")
     val parsed = BrowserActionInput.parse(argsJson)
-        ?: return ToolExecutionResult("Error: Invalid browser_use input", false)
+        ?: return ToolExecutionResult("Error: Invalid browser_use input", false, toolTitle = toolTitle)
     // copy(sessionId = null) is a no-op when sessionId is absent — callers
     // without a session (rare) keep the global-resolver behavior.
     val input = parsed.copy(sessionId = sessionId)
 
     return try {
         val result = tabPool.execute(input)
-        val toolTitle = try {
-            JSONObject(argsJson).optString("tool_title", "browser_use")
-        } catch (_: Exception) { "browser_use" }
 
         var output = result.text
         // [T-android-browser-toolresult-guard] Bound browser tool result text
@@ -180,7 +185,7 @@ internal suspend fun executeBrowserUseTool(
     } catch (e: CancellationException) {
         throw e
     } catch (e: Exception) {
-        ToolExecutionResult("Error: ${e.message}", false)
+        ToolExecutionResult("Error: ${e.message}", false, toolTitle = toolTitle)
     }
 }
 

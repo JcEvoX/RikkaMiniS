@@ -164,4 +164,66 @@ class SessionFileStoreTest {
         assertFalse(s.sessionDir(dead).exists())
         assertFalse(mediaLeaf.exists())
     }
+
+    // ── da1025-D: browser_tabs/<sid>.json lifecycle ──────────────────────────
+
+    @Test
+    fun `deleteSessionFiles deletes the browser tab state file`() {
+        val s = store()
+        val id = sid()
+        val tabFile = s.browserTabFile(id)
+        write(tabFile, 40)
+
+        val result = s.deleteSessionFiles(id)
+        assertTrue(result.fullyDeleted)
+        assertFalse("browser tab state file must be deleted with the session", tabFile.exists())
+    }
+
+    @Test
+    fun `deleteSessionFiles with no browser tab file still reports full success`() {
+        val s = store()
+        val id = sid()
+        write(File(s.sessionDir(id), "workspace/a"), 100)
+
+        // Zero side-effect regression: a session that never opened a browser
+        // has no tab file; absent == nothing to delete == success.
+        val result = s.deleteSessionFiles(id)
+        assertTrue(result.fullyDeleted)
+        assertFalse(s.sessionDir(id).exists())
+    }
+
+    @Test
+    fun `reclaimOrphans deletes orphan browser tab files and keeps live ones`() {
+        val s = store()
+        val live = sid()
+        val dead = sid()
+        val liveTabs = write(s.browserTabFile(live), 30)
+        val deadTabs = write(s.browserTabFile(dead), 45)
+
+        val report = s.reclaimOrphans(setOf(live))
+        assertTrue("live session's tab file must be kept", liveTabs.exists())
+        assertFalse("orphaned tab file must be reclaimed", deadTabs.exists())
+        // Deliberate minimal radius: the report's byte counts still cover
+        // session dirs + media only (see deleteOrphanBrowserTabFiles KDoc).
+        assertEquals(0, report.mediaDirs)
+    }
+
+    @Test
+    fun `reclaimOrphans deletes orphaned draft __new__ tab files`() {
+        val s = store()
+        val draftStem = "__new__${UUID.randomUUID()}"
+        val draftTabs = write(File(s.browserTabsRootForTesting(), "$draftStem.json"), 20)
+
+        s.reclaimOrphans(emptySet())
+        assertFalse("orphaned draft tab file must be reclaimed", draftTabs.exists())
+    }
+
+    @Test
+    fun `reclaimOrphans never touches non-session-shaped files under browser_tabs`() {
+        val s = store()
+        val stray = write(File(s.browserTabsRootForTesting(), "not-a-session.json"), 15)
+
+        s.reclaimOrphans(emptySet())
+        assertTrue("fail-safe guard: unknown stems are never reclaimed", stray.exists())
+    }
 }

@@ -14,18 +14,34 @@ it does not — it refuses *any* external-mount write, a superset of the
 read-only rule, which is why it is exempt below WITH evidence rather than
 silently passed.)
 
-Criterion: for every function that (a) declares a path parameter from
-PATH_PARAMS and (b) writes a host file, the function body must call
-`isLinuxPathUnderReadOnlyMount(` — unless the file is in EXEMPT with a reason
-and an evidence pattern that must still be present (an exemption that rots is
-a failure, not a pass).
+Criterion 1 (read-only mounts): for every function that (a) declares a path
+parameter from PATH_PARAMS and (b) writes a host file, the function body must
+call `isLinuxPathUnderReadOnlyMount(` — unless the file is in EXEMPT with a
+reason and an evidence pattern that must still be present (an exemption that
+rots is a failure, not a pass).
+
+Criterion 2 (blocking I/O off the caller's thread, [deep-audit-1025 ISSUE-08]):
+same "one contract, two write sites, nothing mechanical looked at both" shape,
+one layer down. `MountedFoldersStore.probeWritable()` does a synchronous
+create+delete probe write and was called straight from the suspend `add()` /
+`refreshWritability()` bodies — both reached from Main (`rememberCoroutineScope()`
+in MountedFoldersScreen, ON_RESUME, the storage-permission result) — while
+`AppLogger.clearLogs()` (writer close + directory scan + unlink of every log
+file) was called straight from the delete-all button's onClick. Every call site
+of either must now sit inside a `withContext(Dispatchers.IO) { … }` block; see
+BLOCKING_IO_CALLS for the table and `check_blocking_io` for what "inside" means.
 
 Usage: python3 scripts/scan/readonly_mount_write_guard.py [repo_root]
+       python3 scripts/scan/readonly_mount_write_guard.py --selftest
 Exit:  0 = every site guarded (or exempt with evidence), 1 = unguarded site
 """
+import contextlib
+import io
 import os
 import re
+import shutil
 import sys
+import tempfile
 
 GUARD = "isLinuxPathUnderReadOnlyMount("
 
@@ -83,11 +99,123 @@ EXEMPT = {
 }
 
 
-def strip_comments(text):
-    """Comments first: prose apostrophes / braces otherwise unbalance the slice."""
-    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
-    text = re.sub(r"//[^\n]*", "", text)
-    return text
+APP_REL = os.path.join("src", "android", "app", "src", "main", "java", "com", "rikkaminis", "app")
+
+# ── Criterion 2: blocking host I/O that must not run on the caller's thread ──
+#
+# (anchor file rel, call regex, definition regex, label)
+#
+# The anchor file is where the blocking work lives / is reached from: if it is
+# gone while its package directory survives, the criterion has lost its subject
+# and says so instead of quietly checking nothing. The *call* regexes are then
+# applied to every Kotlin file under the app package — the blocking call is what
+# matters, not which file happens to hold it today.
+BLOCKING_IO_CALLS = (
+    (
+        "data/MountedFoldersStore.kt",
+        r"probeWritable\s*\(",
+        r"\bfun\s+probeWritable\s*\(",
+        "probeWritability (creates + deletes a probe file on the mount)",
+    ),
+    (
+        "ui/settings/LogManagementScreen.kt",
+        r"AppLogger\.clearLogs\s*\(",
+        r"\bfun\s+clearLogs\s*\(",
+        "log purge (closes the writers + unlinks every log file)",
+    ),
+)
+
+# Guarded = the call sits inside a brace-balanced `withContext(Dispatchers.IO) {`
+# block that encloses it. The non-blocking `withContext(IO) expr` form is
+# deliberately NOT recognised: a wrong-shaped wrap must go red rather than pass
+# on a technicality (fail-closed). An unbalanced block is a ROT failure, never a
+# silent skip — an unparseable file must not read as clean.
+IO_BLOCK_RE = re.compile(r"withContext\s*\(\s*Dispatchers\.IO\s*\)\s*\{")
+
+
+def strip_comments(text, collapse_literals=True):
+    """Drop comments, keep every newline (so a finding can cite the real line).
+
+    A character scanner, not a regex. The regex version this replaces ate `//`
+    inside string literals (`"https://…"`), which left the quote unterminated and
+    then corrupted every brace/quote scan downstream — measured on
+    `sandbox/RootfsManager.kt`, whose stripped text lost quote parity and made a
+    perfectly balanced `withContext(Dispatchers.IO) { … }` look unbalanced.
+
+    [collapse_literals] replaces a string/char literal with `""` / `''` (and a raw
+    string with a newline-preserving placeholder) so nothing inside one counts as
+    structure: a brace in a message must not unbalance a block, and a guard call
+    quoted in prose must not satisfy criterion 1. `False` keeps literal bodies
+    verbatim — that is the view the EXEMPT evidence patterns are matched against,
+    where `"photos-export"` must still be found.
+    Kotlin nests block comments, so `/*` counts depth.
+    """
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            if text.startswith('"""', i):
+                end = text.find('"""', i + 3)
+                end = n if end < 0 else end + 3
+                out.append('""' + "\n" * text.count("\n", i, end)
+                           if collapse_literals else text[i:end])
+                i = end
+                continue
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == "\n" or text[j] == '"':
+                    break
+                j += 1
+            closed = j < n and text[j] == '"'
+            if collapse_literals:
+                out.append('""' if closed else " ")
+            else:
+                out.append(text[i:j + 1] if closed else text[i:])
+            i = j + 1 if j < n else n
+            continue
+        if c == "'":
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == "\n" or text[j] == "'":
+                    break
+                j += 1
+            closed = j < n and text[j] == "'"
+            if collapse_literals:
+                out.append("''" if closed else " ")
+            else:
+                out.append(text[i:j + 1] if closed else text[i:])
+            i = j + 1 if j < n else n
+            continue
+        if text.startswith("//", i):
+            while i < n and text[i] != "\n":
+                i += 1
+            continue
+        if text.startswith("/*", i):
+            depth = 0
+            while i < n:
+                if text.startswith("/*", i):
+                    depth += 1
+                    i += 2
+                    continue
+                if text.startswith("*/", i):
+                    depth -= 1
+                    i += 2
+                    if depth == 0:
+                        break
+                    continue
+                if text[i] == "\n":
+                    out.append("\n")
+                i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 def strip_strings(line):
@@ -107,6 +235,38 @@ def strip_strings(line):
         out.append(c)
         i += 1
     return "".join(out)
+
+
+def param_close(sig_text):
+    """Index just past the `)` that closes the first `(`; -1 when unbalanced.
+
+    Needed instead of a non-greedy regex because a parameter list can nest
+    parentheses (`(onDone: () -> Unit)`) and span lines.
+    """
+    start = sig_text.find("(")
+    if start < 0:
+        return -1
+    depth, i = 0, start
+    while i < len(sig_text):
+        c = sig_text[i]
+        if c in "\"'":
+            quote = c
+            i += 1
+            while i < len(sig_text) and sig_text[i] != quote:
+                i += 2 if sig_text[i] == "\\" else 1
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return -1
+
+
+def depth_of(text):
+    """Net ( and { opened by a chunk of stripped source."""
+    return text.count("(") - text.count(")") + text.count("{") - text.count("}")
 
 
 def functions(text):
@@ -134,8 +294,29 @@ def functions(text):
                 break
             j += 1
         sig_text = "\n".join(sig)
-        pm = re.search(r"\((.*?)\)", sig_text, flags=re.S)
-        params = pm.group(1) if pm else ""
+        close = param_close(sig_text)
+        params = sig_text[sig_text.find("(") + 1:close - 1] if close > 0 else ""
+        # Expression body (`: T = expr`, no `{` before the `=`): the signature
+        # scan already followed the expression's parentheses, so the body is the
+        # tail of the signature rather than the next `{` block. Without this the
+        # scan runs on into the *following* declaration — crediting this function
+        # with a write that is not its own and skipping that declaration
+        # entirely (measured on `PRootKernel.resolveHostPath`, a pure resolver
+        # that was credited with `installHandlerStubs`' `stub.writeText(…)`).
+        rest = strip_strings(sig_text[close:]) if close > 0 else ""
+        eq, brace = rest.find("="), rest.find("{")
+        if eq >= 0 and (brace < 0 or eq < brace):
+            body = [sig_text[close:]]
+            depth = depth_of(strip_strings(body[0]))
+            k = j + 1
+            while depth > 0 and k < len(lines):
+                s = strip_strings(lines[k])
+                body.append(lines[k])
+                depth += depth_of(s)
+                k += 1
+            out.append((name, params, "\n".join(body)))
+            i = k
+            continue
         # Body: brace-balanced from the signature's last line.
         bal, k, seen_brace, body = 0, j, False, []
         while k < len(lines):
@@ -174,6 +355,21 @@ def scan(root):
     app = os.path.join(root, "src/android/app/src/main/java/com/rikkaminis/app")
     violations, checked, files = [], 0, 0
     exempt_used = {}
+    evidence_cache = {}
+
+    def evidence_text(rel_key):
+        """Comment-free text with literal bodies kept — the EXEMPT view.
+
+        Evidence patterns name things that live inside string literals
+        (`"photos-export"`), so they must be matched against a view that did not
+        collapse literals away. Structure, by contrast, is scanned on the
+        collapsed view (`GUARD in body`), where a guard call quoted in a message
+        cannot satisfy the criterion.
+        """
+        if rel_key not in evidence_cache:
+            evidence_cache[rel_key] = strip_comments(read(root, rel_key), collapse_literals=False)
+        return evidence_cache[rel_key]
+
     for dirpath, _dirs, filenames in os.walk(app):
         for fn in sorted(filenames):
             if not fn.endswith(".kt"):
@@ -195,7 +391,7 @@ def scan(root):
                     reason, evidence = EXEMPT[rel]
                     rotted = []
                     for ev_rel, pattern, need in evidence:
-                        target = text if ev_rel is None else read(root, ev_rel)
+                        target = evidence_text(ev_rel or rel)
                         hits = len(re.findall(pattern, target))
                         if hits < need:
                             rotted.append(f"{ev_rel or rel}: /{pattern}/ {hits} < {need}")
@@ -214,21 +410,414 @@ def scan(root):
     return violations, checked, files, exempt_used
 
 
+def balanced_block(text, open_idx):
+    """Index just past the closer matching text[open_idx]; -1 when unbalanced.
+
+    String literals are skipped so a quoted brace (or a `${…}` interpolation
+    inside one) can never be mistaken for structure.
+    """
+    depth, i = 0, open_idx
+    while i < len(text):
+        c = text[i]
+        if c in "\"'":
+            quote = c
+            i += 1
+            while i < len(text) and text[i] != quote:
+                i += 2 if text[i] == "\\" else 1
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return -1
+
+
+def io_block_regions(text):
+    """[(start, end)] of every `withContext(Dispatchers.IO) { … }` block; None = unbalanced."""
+    regions = []
+    for m in IO_BLOCK_RE.finditer(text):
+        open_idx = text.find("{", m.start(), m.end())
+        if open_idx < 0:
+            return None
+        end = balanced_block(text, open_idx)
+        if end < 0:
+            return None
+        regions.append((open_idx, end))
+    return regions
+
+
+def call_offsets(text, call_re, decl_re):
+    """Offsets of every call, skipping the declaration it is named after.
+
+    A definition (`fun probeWritable(`) is not a call site: counting it would
+    report the declaration line as an unguarded caller — the false positive this
+    criterion would otherwise open with.
+    """
+    decl_spans = [m.span() for m in decl_re.finditer(text)] if decl_re else []
+    out = []
+    for m in call_re.finditer(text):
+        if any(s <= m.start() < e for s, e in decl_spans):
+            continue
+        out.append(m.start())
+    return out
+
+
+def app_kt_files(root):
+    app = os.path.join(root, APP_REL)
+    found = []
+    for dirpath, _dirs, filenames in os.walk(app):
+        for fn in sorted(filenames):
+            if fn.endswith(".kt"):
+                found.append(os.path.join(dirpath, fn))
+    return found
+
+
+def check_blocking_io(root):
+    """Blocking host I/O reached off a `Dispatchers.IO` block.
+
+    Returns (violations, rot, sites, notes). A target whose anchor file is gone
+    while its package directory survives is ROT (the tree moved, not the bug);
+    a tree that simply does not ship that package (the frozen `test_scan.py`
+    fixtures build a `sandbox/`-only tree) is noted as `[PARTIAL]` and skipped.
+    """
+    app = os.path.join(root, APP_REL)
+    violations, rot, notes = [], [], []
+    sites = 0
+
+    active = []
+    for rel, call_pat, decl_pat, label in BLOCKING_IO_CALLS:
+        path = os.path.join(app, *rel.split("/"))
+        if os.path.isfile(path):
+            active.append((rel, call_pat, decl_pat, label))
+            continue
+        pkg = os.path.dirname(path)
+        if os.path.isdir(pkg):
+            rot.append(
+                f"{rel}: missing while `{os.path.basename(pkg)}/` still exists — "
+                f"the {label} criterion lost its anchor"
+            )
+        else:
+            notes.append(f"[PARTIAL] {label} criterion skipped ({rel} absent)")
+
+    if not active:
+        return violations, rot, sites, notes
+
+    # One pass over the app package, holding on to nothing that is not a hit.
+    # (An earlier revision stripped all ~600 sources into a dict first; that is
+    # ~20 MB of live Python strings and got the whole sandbox SIGKILLed mid-run
+    # at gate 26 of scan.sh. Keep it streaming.)
+    rules = [(rel, re.compile(call_pat), re.compile(decl_pat), label)
+             for rel, call_pat, decl_pat, label in active]
+    decl_hits = {label: 0 for _rel, _cp, _dp, label in rules}
+    sites_here = {rel: 0 for rel, _cp, _dp, _label in rules}
+    kept, hits, total = {}, [], {label: 0 for _rel, _cp, _dp, label in rules}
+
+    for full in app_kt_files(root):
+        fps = os.path.relpath(full, app).replace(os.sep, "/")
+        try:
+            raw = open(full, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        text = strip_comments(raw)
+        regions = None
+        for rel, call_re, decl_re, label in rules:
+            decl_hits[label] += len(decl_re.findall(text))
+            offsets = call_offsets(text, call_re, decl_re)
+            if not offsets:
+                continue
+            if regions is None:
+                regions = io_block_regions(text)
+                if regions is None:
+                    rot.append(
+                        f"{fps}: unbalanced braces around a withContext(Dispatchers.IO) block"
+                    )
+                    regions = []
+            kept[fps] = (text, regions)
+            total[label] += len(offsets)
+            if fps == rel:
+                sites_here[rel] += len(offsets)
+            for off in offsets:
+                hits.append((fps, off, label))
+        del text
+
+    for rel, _call_re, _decl_re, label in rules:
+        if decl_hits[label] == 0:
+            rot.append(
+                f"{label}: no definition matching its declaration pattern anywhere — renamed "
+                f"or removed, so the criterion would pass by looking at nothing"
+            )
+            continue
+        if total[label] == 0:
+            rot.append(
+                f"{rel}: nothing calls this any more — the {label} criterion would be vacuous"
+            )
+            continue
+        if sites_here[rel] == 0:
+            # The call moved out of its home file. Still enforced (the scan above
+            # is app-wide), but the anchor is worth naming: it is the place a
+            # reader looks first when this criterion changes.
+            notes.append(f"[PARTIAL] {label}: no call site left in {rel} (enforced app-wide)")
+
+    if rot:
+        # Nothing below can be trusted to have parsed: report and let main decide.
+        return violations, rot, sites, notes
+
+    for fps, off, label in hits:
+        sites += 1
+        text, regions = kept[fps]
+        if not any(s <= off < e for s, e in regions):
+            line = text.count("\n", 0, off) + 1
+            violations.append(
+                f"{fps}:{line} — {label} runs on the caller's thread; wrap it in "
+                f"withContext(Dispatchers.IO) {{ … }}"
+            )
+    return violations, rot, sites, notes
+
+
+# ── selftest ────────────────────────────────────────────────────────────────
+
+FILLER_GUARD = "isLinuxPathUnderReadOnlyMount("
+
+
+def _filler(tag):
+    """A guarded path-parameter write site — filler for the criterion-1 rot guards."""
+    return (
+        "package com.rikkaminis.app.filler\n"
+        "\n"
+        f"class Filler{tag} {{\n"
+        f"    fun write{tag}(outputPath: String, data: String) {{\n"
+        f"        if ({FILLER_GUARD}outputPath)) return\n"
+        "        java.io.File(outputPath).writeText(data)\n"
+        "    }\n"
+        "}\n"
+    )
+
+
+MOUNT_READERS = {
+    # the shape criterion 2 exists to keep: the probe hops to IO
+    "io": (
+        "    suspend fun refreshWritability() {\n"
+        "        val probed = entry.resolvedHostPath?.let { p ->\n"
+        "            withContext(Dispatchers.IO) { @@FN@@(p) }\n"
+        "        } ?: false\n"
+        "    }\n"
+    ),
+    # the pre-fix shape (live until deep-audit-1025)
+    "direct": (
+        "    suspend fun refreshWritability() {\n"
+        "        val probed = entry.resolvedHostPath?.let { p -> @@FN@@(p) } ?: false\n"
+        "    }\n"
+    ),
+    # `withContext(IO) expr` — correct at runtime, but not a block: fail-closed
+    "inline_io": (
+        "    suspend fun refreshWritability() {\n"
+        "        val probed = entry.resolvedHostPath?.let { p ->\n"
+        "            withContext(Dispatchers.IO) @@FN@@(p)\n"
+        "        } ?: false\n"
+        "    }\n"
+    ),
+}
+
+
+def _mount_store(shape="io", fn_name="probeWritable"):
+    reader = MOUNT_READERS[shape].replace("@@FN@@", fn_name)
+    return (
+        "package com.rikkaminis.app.data\n"
+        "\n"
+        "import kotlinx.coroutines.Dispatchers\n"
+        "import kotlinx.coroutines.withContext\n"
+        "\n"
+        "class MountedFoldersStore {\n"
+        "    private val entry = Entry()\n"
+        "\n"
+        f"    fun {fn_name}(hostPath: String): Boolean {{\n"
+        '        val probe = java.io.File(hostPath, ".minis-probe")\n'
+        "        return runCatching { probe.outputStream().use { it.write(0) }; true }\n"
+        "            .getOrDefault(false)\n"
+        "            .also { runCatching { probe.delete() } }\n"
+        "    }\n"
+        "\n"
+        + reader +
+        "}\n"
+    )
+
+
+LOG_BODIES = {
+    "io": (
+        "            MinisTextButton(onClick = {\n"
+        "                scope.launch {\n"
+        "                    withContext(Dispatchers.IO) { AppLogger.clearLogs() }\n"
+        "                    refresh()\n"
+        "                }\n"
+        "            })\n"
+    ),
+    # the pre-fix shape: purge on whatever thread the click arrived on
+    "direct": (
+        "            MinisTextButton(onClick = {\n"
+        "                AppLogger.clearLogs()\n"
+        "                refresh()\n"
+        "            })\n"
+    ),
+    # IO used for a *different* call — the wrap must actually cover the purge
+    "wrong_call": (
+        "            MinisTextButton(onClick = {\n"
+        "                withContext(Dispatchers.IO) { somethingElse() }\n"
+        "                AppLogger.clearLogs()\n"
+        "            })\n"
+    ),
+}
+
+
+def _log_screen(shape="io"):
+    return (
+        "package com.rikkaminis.app.ui.settings\n"
+        "\n"
+        "import kotlinx.coroutines.Dispatchers\n"
+        "import kotlinx.coroutines.withContext\n"
+        "\n"
+        "@Composable\n"
+        "fun LogManagementScreen() {\n"
+        + LOG_BODIES[shape] +
+        "}\n"
+    )
+
+
+def _app_logger():
+    return (
+        "package com.rikkaminis.app.logging\n"
+        "\n"
+        "object AppLogger {\n"
+        "    fun clearLogs() {\n"
+        "    }\n"
+        "}\n"
+    )
+
+
+def write_io_fixture(root, store_shape="io", log_shape="io", store_fn="probeWritable",
+                     drop_store=False, drop_log=False, data_pkg=True, ui_pkg=True,
+                     keep_pkgs_when_dropped=True):
+    """A `com/rikkaminis/app` tree carrying both criterion-2 targets.
+
+    [keep_pkgs_when_dropped] leaves an unrelated file in the package whose anchor
+    was dropped, which is what a *moved* file looks like (ROT). With it off, the
+    package is gone too, which is what a synthetic fixture tree looks like
+    ([PARTIAL] — the frozen `test_scan.py` shape).
+    """
+    app = os.path.join(root, APP_REL)
+    files = {}
+    for i in range(22):
+        files[f"filler/F{i}.kt"] = _filler(i)
+    files["logging/AppLogger.kt"] = _app_logger()
+    if not drop_store:
+        files["data/MountedFoldersStore.kt"] = _mount_store(store_shape, store_fn)
+    elif keep_pkgs_when_dropped:
+        files["data/MountRegistry.kt"] = "package com.rikkaminis.app.data\n\nclass MountRegistry\n"
+    if not drop_log:
+        files["ui/settings/LogManagementScreen.kt"] = _log_screen(log_shape)
+    elif keep_pkgs_when_dropped:
+        files["ui/settings/OtherScreen.kt"] = (
+            "package com.rikkaminis.app.ui.settings\n\nclass OtherScreen\n"
+        )
+    if not data_pkg:
+        files.pop("data/MountRegistry.kt", None)
+    if not ui_pkg:
+        files.pop("ui/settings/OtherScreen.kt", None)
+    for rel, text in files.items():
+        path = os.path.join(app, *rel.split("/"))
+        if not os.path.isdir(os.path.dirname(path)):
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+
+def _run_gate(root):
+    old = sys.argv
+    sys.argv = ["readonly_mount_write_guard.py", str(root)]
+    try:
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = main()
+        return code, buf.getvalue()
+    finally:
+        sys.argv = old
+
+
+def selftest():
+    """Fixture trees — one dirty arm per criterion, every one must turn it red."""
+    results = []
+
+    def run(name, expect_red, note_in=None, **kwargs):
+        root = tempfile.mkdtemp(prefix="romount_")
+        try:
+            write_io_fixture(root, **kwargs)
+            code, out = _run_gate(root)
+            ok = (code == 1) if expect_red else (code == 0)
+            if ok and note_in is not None and note_in not in out:
+                ok, note_in = False, f"missing {note_in!r} in output"
+            results.append((name, ok, note_in or f"exit={code}"))
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    run("both call sites wrapped in Dispatchers.IO pass", False,
+        "blocking-IO call site(s) inside Dispatchers.IO")
+    run("the probe called straight from the suspend reader is caught", True,
+        "data/MountedFoldersStore.kt", store_shape="direct")
+    run("the log purge on the click's thread is caught", True,
+        "ui/settings/LogManagementScreen.kt", log_shape="direct")
+    run("a wrap around a different call does not cover the purge", True,
+        "ui/settings/LogManagementScreen.kt", log_shape="wrong_call")
+    run("the non-blocking `withContext(IO) expr` form is not accepted (fail-closed)", True,
+        "data/MountedFoldersStore.kt", store_shape="inline_io")
+    run("a renamed probe is a rot failure, not a silent skip", True,
+        "no definition matching", store_fn="probe")
+    run("a package that lost its anchor file is a rot failure", True,
+        "lost its anchor", drop_store=True, drop_log=True)
+    run("a tree that never shipped the package is skipped, not failed", False,
+        "[PARTIAL]", drop_store=True, drop_log=True, keep_pkgs_when_dropped=False)
+
+    print("=== readonly_mount_write_guard --selftest ===")
+    failed = 0
+    for name, ok, note in results:
+        if not ok:
+            failed += 1
+        print(f"[{'ok' if ok else 'FAIL'}] {name} -> {note}")
+    if failed:
+        print(f"SELFTEST: {failed} arm(s) misbehaved")
+        return 1
+    print(f"MOUNT_PROBE_IO_SELFTEST=PASS ({len(results)} arms)")
+    return 0
+
+
 def main():
-    root = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(__file__), "..", ".."))
+    args = sys.argv[1:]
+    if "--selftest" in args:
+        return selftest()
+    root = os.path.abspath(args[0] if args else os.path.join(os.path.dirname(__file__), "..", ".."))
     violations, checked, files, exempt_used = scan(root)
+    io_violations, io_rot, io_sites, io_notes = check_blocking_io(root)
+
+    rot = []
     if files < 20:
-        print(f"ROT: only {files} Kotlin files under com/rikkaminis/app — the source tree moved?")
-        return 1
+        rot.append(f"only {files} Kotlin files under com/rikkaminis/app — the source tree moved?")
     if checked < 3:
-        print(f"ROT: only {checked} path-parameter write sites found — the detector stopped matching?")
+        rot.append(f"only {checked} path-parameter write sites found — the detector stopped matching?")
+    rot += io_rot
+    if rot:
+        print("ROT — the guard can no longer see what it is supposed to check:")
+        for r in rot:
+            print(f"  ✗ {r}")
         return 1
-    if violations:
+    for n in io_notes:
+        print(f"  {n}")
+    if violations or io_violations:
         print("Unguarded host-file writes:")
-        for v in violations:
+        for v in violations + io_violations:
             print(f"  ✗ {v}")
         return 1
     print(f"OK: {checked} path-parameter write site(s) guarded ({files} files scanned)")
+    print(f"    {io_sites} blocking-IO call site(s) inside Dispatchers.IO")
     for rel, reason in sorted(exempt_used.items()):
         print(f"  · exempt {rel}: {reason}")
     return 0

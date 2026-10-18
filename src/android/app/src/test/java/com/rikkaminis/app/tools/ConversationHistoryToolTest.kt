@@ -322,6 +322,24 @@ class ConversationHistoryToolTest {
         assertEquals("remembering", result.toolTitle)
     }
 
+    // ── [fix/da1025-G] tool_title fallback: errors must name the tool ────
+
+    @Test
+    fun `an error on a call without tool_title still names the tool, not an empty title`() = runBlocking {
+        val result = executeConversationHistoryTool("""{}""", "s") { throw IllegalStateException("db closed") }
+        assertFalse(result.success)
+        // Literal, not the production constant — a constant change must not
+        // mask a fallback regression (self-reference trap).
+        assertEquals("conversation_history", result.toolTitle)
+    }
+
+    @Test
+    fun `malformed args json still names the tool on the refusal path`() = runBlocking {
+        val result = executeConversationHistoryTool("""{"tool_title": nope""", "s") { emptyList() }
+        assertFalse(result.success)
+        assertEquals("conversation_history", result.toolTitle)
+    }
+
     @Test
     fun `header reports match counts and paging state`() {
         val page = buildTranscriptPage(

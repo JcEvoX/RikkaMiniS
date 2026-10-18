@@ -378,7 +378,10 @@ internal suspend fun executeConversationHistoryTool(
     sessionId: String,
     loadRows: suspend (String) -> List<TranscriptRow>,
 ): ToolExecutionResult {
-    val toolTitle = runCatching { JSONObject(argsJson).optString("tool_title") }.getOrDefault("")
+    // [fix/da1025-G] fallback 从 "" 改为工具名：错误时胶囊标题不能是空串
+    // （空标题在 UI 上渲染为无名胶囊）。resolveToolTitle 单源（ToolTitleResolver
+    // 的契约：必须在进入 try/when 之前调用，畸形 JSON 回退工具名）。
+    val toolTitle = resolveToolTitle(argsJson, ConversationHistoryContract.NAME)
     return when (val request = parseConversationHistoryRequest(argsJson)) {
         is ConversationHistoryRequest.Invalid -> ToolExecutionResult(
             output = "Error: ${request.message}",
