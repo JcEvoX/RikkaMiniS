@@ -28,6 +28,52 @@ enum class ProviderType(val displayName: String) {
         }
 }
 
+/**
+ * [ARCH-03] Authoritative `models.dev` provider ids for each [ProviderType].
+ *
+ * This is the single source of truth that `ModelsDevApi.providerKeyMap` derives
+ * from. It is deliberately an **exhaustive `when (this)` with no `else`
+ * branch**: adding an eighth vendor to [ProviderType] fails COMPILATION here
+ * (`'when' expression must be exhaustive`) until its `models.dev` mapping is
+ * declared, instead of silently letting the new family's models fall through
+ * to the order-dependent all-providers scan in `ModelsDevApi.enrichModel`
+ * (the F-212 failure: grok-4.5 enriched with a relay's 1,000,000 context;
+ * kimi-k3 given a 5-tier effort ladder from an unrelated relay).
+ *
+ * An empty list is a *deliberate* "this vendor has no public models.dev row"
+ * (previously expressed as an explicit `emptyList()` map entry).
+ */
+val ProviderType.modelsDevProviderIds: List<String>
+    get() = when (this) {
+        ProviderType.anthropic -> listOf("anthropic")
+        ProviderType.gemini -> listOf("google", "google-vertex")
+        ProviderType.openAI -> listOf("openai")
+        ProviderType.openRouter -> listOf("openrouter")
+        ProviderType.xAI -> listOf("xai")
+        ProviderType.kimiCode -> listOf("moonshotai", "moonshotai-cn")
+    }
+
+/**
+ * [ARCH-03] Short / legacy `LLMModel.provider` strings this family's rows carry
+ * in the built-in catalog ([LLMModel.Companion.allModels]) and in data persisted
+ * before [ProviderType.displayName] became the canonical write value.
+ *
+ * Exhaustive `when (this)` for the same reason as [modelsDevProviderIds].
+ * Entries that duplicate [ProviderType.displayName] are harmless (the derived
+ * map just merges two identical keys) — they are listed explicitly so the
+ * mapping is readable at a glance and so a catalog-side rename cannot silently
+ * drop a family out of the key map.
+ */
+val ProviderType.legacyProviderNames: List<String>
+    get() = when (this) {
+        ProviderType.anthropic -> listOf("Anthropic")
+        ProviderType.gemini -> listOf("Google")
+        ProviderType.openAI -> listOf("OpenAI")
+        ProviderType.openRouter -> listOf("OpenRouter")
+        ProviderType.xAI -> listOf("xAI")
+        ProviderType.kimiCode -> listOf("Kimi")
+    }
+
 @Serializable
 enum class ProviderCredential {
     apiKey,

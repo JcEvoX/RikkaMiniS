@@ -14,9 +14,12 @@ provider_rpc_symmetry_check.py — deep-audit-1025 FIX-I gate
         不受此判据约束）；
       - typeSpec（Debug）与 instancesCreate 守卫（Mutation）引用
         supportsCustomBaseURL。
-  C2  instancesUpdate 守卫：函数体内引用 supportsCustomBaseURL，且含与
-      instancesCreate 逐字一致的 openRouter 守卫消息
-      "customBaseURL is not supported for providerType=openRouter"。
+  C2  instancesUpdate 守卫：函数体内引用 supportsCustomBaseURL，且 openRouter
+      守卫消息来源单一 —— 要么与 instancesCreate 逐字一致的字面量
+      "customBaseURL is not supported for providerType=openRouter"，要么
+      [ARCH-01] 引用共享常量 CUSTOM_BASE_URL_OPENROUTER_MESSAGE
+      （ProviderWriteRules.kt 单源；create/update 两面都不许再写字面量拷贝，
+      也不许两面对不上）。
   C3  instanceToJson（或其委托的 instanceJsonCore）的 put 键集合 ⊇
       instancesList 每实例 JSONObject 的 put 键集合（fail-closed）。
 
@@ -24,7 +27,8 @@ provider_rpc_symmetry_check.py — deep-audit-1025 FIX-I gate
 
   C4  ProvidersCollection.kt 的每个 customBaseURL 写入点，其**所在函数体**
       必须引用守卫 token（supportsCustomBaseURL / customBaseURLWritable /
-      resolveAddCustomBaseURL）。fail-closed：剥注释后找不到任何写入点 ⇒ 红。
+      resolveAddCustomBaseURL / [ARCH-01] isCustomBaseURLWriteAllowed）。
+      fail-closed：剥注释后找不到任何写入点 ⇒ 红。
       写入点两形态：`copy(customBaseURL = …)`（字段 writer）与
       `customBaseURL = <expr>`（add 里的 ProviderInstance 构造实参）。
   C5  ProviderMutationMethods.kt 的 `supportsCustomBaseURL` 出现次数 ≥
@@ -54,6 +58,9 @@ PREDICATE_DEF_PAT = re.compile(r"val\s+ProviderType\.supportsCustomBaseURL")
 # openAI-first order: only the customBaseSupported hardcode uses this order.
 INLINE_HARDCODE = "type == ProviderType.openAI || type == ProviderType.anthropic"
 OPENROUTER_MSG = "customBaseURL is not supported for providerType=openRouter"
+# [ARCH-01] The shared wording constant. Word-boundary anchored: a drifted copy
+# named `…_MESSAGE_V2` must NOT satisfy the C2 arm (fixture F14 pins this).
+SHARED_MSG_REF = re.compile(r"\bCUSTOM_BASE_URL_OPENROUTER_MESSAGE\b")
 SELFTEST_MARKER = "PROVIDER_RPC_SELFTEST=PASS"
 
 # ---- [da1026-ISSUE-05] collection-face write sites & guard tokens ----
@@ -66,10 +73,14 @@ BASE_URL_WRITE_PATS = (
     re.compile(r"^\s*customBaseURL\s*=\s*[A-Za-z_]", re.M),
 )
 # Any of these inside the enclosing function body counts as the guard being wired.
+# [ARCH-01] isCustomBaseURLWriteAllowed (ProviderWriteRules.kt) is the shared
+# predicate the collection writer now routes through — it encodes the same
+# rule, so it counts as a wired guard exactly like the raw extension.
 BASE_URL_GUARD_TOKENS = (
     "supportsCustomBaseURL",
     "customBaseURLWritable",
     "resolveAddCustomBaseURL",
+    "isCustomBaseURLWriteAllowed",
 )
 # Baseline use-count floor in ProviderMutationMethods.kt (create + update + def).
 MUTATION_PREDICATE_MIN_USES = 3
@@ -283,7 +294,11 @@ def check_tree(root):
     else:
         if "supportsCustomBaseURL" not in update_body:
             detail["c2"].append("instancesUpdate guard does not reference supportsCustomBaseURL")
-        if OPENROUTER_MSG not in update_body:
+        # [ARCH-01] The openRouter guard message must be single-sourced: either
+        # the create-identical literal, or a reference to the shared constant
+        # in ProviderWriteRules.kt. A hand-written third copy (or a message
+        # that drifted) fails both arms.
+        if OPENROUTER_MSG not in update_body and not SHARED_MSG_REF.search(update_body):
             detail["c2"].append(
                 "instancesUpdate lacks the create-identical openRouter guard message"
             )
@@ -689,6 +704,79 @@ def run_selftest():
     rc, detail = check_tree(root)
     ok = rc == 1 and detail["c5"]
     results.append(("F10-mutation-predicate-inlined-C5", ok, detail))
+    shutil.rmtree(root)
+
+    # F11 [ARCH-01]: collection writer routes the guard through the shared
+    # predicate (ProviderWriteRules.isCustomBaseURLWriteAllowed) — the new
+    # accepted shape must be GREEN (old gate red here: acceptance broadening).
+    new_coll = GOOD_COLLECTION.replace(
+        '''                if (!inst.providerType.supportsCustomBaseURL) {
+                    throw ConfigError.InvalidValue("customBaseURL is not supported for providerType=openRouter")
+                }
+                mutate(id) { it.copy(customBaseURL = s.ifEmpty { null }) }''',
+        '''                val newBase = s.ifEmpty { null }
+                if (!isCustomBaseURLWriteAllowed(inst.providerType, newBase)) {
+                    throw ConfigError.InvalidValue(CUSTOM_BASE_URL_OPENROUTER_MESSAGE)
+                }
+                mutate(id) { it.copy(customBaseURL = newBase) }''',
+    )
+    assert new_coll != GOOD_COLLECTION, "F11 anchor missing"
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, new_coll)
+    rc, detail = check_tree(root)
+    results.append(("F11-writer-guard-via-shared-predicate-green", rc == 0, detail))
+    shutil.rmtree(root)
+
+    # F12 [ARCH-01]: teeth — shared-predicate writer with the guard call
+    # removed must stay C4-red (the F11 acceptance did not blind C4).
+    bad_coll = new_coll.replace(
+        '''                if (!isCustomBaseURLWriteAllowed(inst.providerType, newBase)) {
+                    throw ConfigError.InvalidValue(CUSTOM_BASE_URL_OPENROUTER_MESSAGE)
+                }
+''',
+        "",
+    )
+    assert bad_coll != new_coll, "F12 anchor missing"
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, bad_coll)
+    rc, detail = check_tree(root)
+    ok = (rc == 1 and detail["c4"] and not detail["c1"] and not detail["c2"]
+          and not detail["c3"] and not detail["c5"] and not detail["fail_closed"])
+    results.append(("F12-shared-predicate-writer-guard-deleted-C4", ok, detail))
+    shutil.rmtree(root)
+
+    # F13 [ARCH-01]: update guard message via the shared constant reference —
+    # the new accepted shape must be GREEN (literal copy removed by ARCH-01).
+    new_mut = GOOD_MUTATION.replace(
+        '''            if (newBase != null && !current.providerType.supportsCustomBaseURL) {
+                throw RPCException(-32602, "customBaseURL is not supported for providerType=openRouter")
+            }''',
+        '''            if (newBase != null && !current.providerType.supportsCustomBaseURL) {
+                throw RPCException(-32602, CUSTOM_BASE_URL_OPENROUTER_MESSAGE)
+            }''',
+        1,
+    )
+    assert new_mut != GOOD_MUTATION, "F13 anchor missing"
+    root = write_fixture(GOOD_DEBUG, new_mut)
+    rc, detail = check_tree(root)
+    results.append(("F13-update-message-via-shared-constant-green", rc == 0, detail))
+    shutil.rmtree(root)
+
+    # F14 [ARCH-01]: teeth — a *near-miss* constant name (drifted copy) is
+    # neither the literal nor the shared constant → C2-red (F4 covers the
+    # plain-literal drift; this one pins the constant-identifier arm).
+    bad_mut = GOOD_MUTATION.replace(
+        '''            if (newBase != null && !current.providerType.supportsCustomBaseURL) {
+                throw RPCException(-32602, "customBaseURL is not supported for providerType=openRouter")
+            }''',
+        '''            if (newBase != null && !current.providerType.supportsCustomBaseURL) {
+                throw RPCException(-32602, CUSTOM_BASE_URL_OPENROUTER_MESSAGE_V2)
+            }''',
+        1,
+    )
+    assert bad_mut != GOOD_MUTATION, "F14 anchor missing"
+    root = write_fixture(GOOD_DEBUG, bad_mut)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c2"] and not detail["c1"] and not detail["c3"] and not detail["fail_closed"]
+    results.append(("F14-update-message-near-miss-constant-C2", ok, detail))
     shutil.rmtree(root)
 
     all_ok = True

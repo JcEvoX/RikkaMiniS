@@ -413,6 +413,206 @@ def scan_priming(root):
     return report, problems
 
 
+# ==========================================================================
+# [ARCH-02] "PrimedPrefs" self-sync contract.
+#
+# Concern: the two criteria families above both require an *external* module to
+# remember something -- F-134's holder discipline for whoever writes the
+# registration by hand, and C1/C2 for whoever owns the config path. Neither can
+# help a cache whose file is written by a path that has no listener at all.
+# ARCH-02 moves the refresh *into* the object that owns the cache: `prime(...)`
+# registers an object-owned, strongly-held listener that reloads the snapshot.
+# Then the only thing anyone must remember is calling `prime`, which
+# MinisApp.onCreate already does for all three.
+#
+#   C4  the file that *declares the cache's prefs file name*
+#       (`const val PREFS = "minis_…_prefs"`) must contain an object that
+#       satisfies S1-S3 for it -- the literal is the cache's identity anchor
+#   C5  shape anchor (name-independent, so a 4th primed cache is covered the
+#       day it appears): any `object` exposing `fun prime(<x>: Context)` over a
+#       `@Volatile private var cached…` snapshot must satisfy S1-S3
+#   C6  both drift directions of the two anchors: an object that still exists
+#       while its literal is gone (C4/C5 go blind), and a literal with no
+#       object left to declare it
+#   C7  the in-scope object must not retain a `Context`-typed field -- the
+#       listener has to take the `SharedPreferences` the callback hands it
+#       (F-235's dead `appContext` field, re-opened by this very refactor)
+#
+#   S1  an object-owned listener handle is declared
+#   S2  that handle is registered from inside `prime(...)`
+#   S3  its body actually refreshes the snapshot (`cached… = …`, or a call to
+#       the shared loader) -- an empty or `TODO()` listener satisfies S1+S2
+#       while refreshing nothing, which is the silent-failure shape again
+# ==========================================================================
+
+_ARCH02_CACHES = (
+    ("ConcurrencyPrefs", "minis_concurrency_prefs"),
+    ("AgentRuntimeLimitsPrefs", "minis_runtime_limits_prefs"),
+    ("FastModePrefs", "minis_fast_mode_prefs"),
+)
+# Read from the RAW text: _strip_comments_and_strings blanks string contents.
+_ARCH02_DECL_LITS = {
+    lit: re.compile(r'\bconst\s+val\s+\w+\s*=\s*"%s"' % re.escape(lit))
+    for _obj, lit in _ARCH02_CACHES
+}
+_ARCH02_PRIME_FUN_RE = re.compile(
+    r"\bfun\s+prime\s*\(\s*\w+\s*:\s*(?:android\.content\.)?Context\b")
+_ARCH02_CACHED_FIELD_RE = re.compile(
+    r"@Volatile\b(?:\s+@\w+)*\s*private\s+var\s+(cached\w*)")
+_ARCH02_LISTENER_DECL_RE = re.compile(
+    r"\bval\s+(\w+)\s*=\s*(?:[\w.]+\.)?OnSharedPreferenceChangeListener\s*\{")
+_ARCH02_CONTEXT_FIELD_RE = re.compile(
+    r"\b(?:val|var)\s+(\w+)\s*:\s*(?:android\.content\.)?Context\b")
+
+
+def _object_bodies(clean):
+    """[(object name, brace body)] for every `object Name { ... }` in `clean`."""
+    out = []
+    for m in re.finditer(r"\bobject\s+(\w+)\s*(?::[^{]*?)?\{", clean):
+        body = _brace_body(clean, m.end() - 1)
+        out.append((m.group(1), body if body is not None else ""))
+    return out
+
+
+def _self_sync_defects(body, obj, rel, problems, report):
+    """S1-S3 + C7 for one in-scope object body. Appends findings."""
+    ctx_fields = _ARCH02_CONTEXT_FIELD_RE.findall(body)
+    if ctx_fields:
+        problems.append(
+            "%s: `object %s` keeps a Context-typed field (%s) -- the self-sync listener "
+            "must reload from the SharedPreferences the callback hands it; a retained "
+            "Context is the F-235 dead field this refactor is meant to keep out"
+            % (rel, obj, ", ".join(sorted(set(ctx_fields))))
+        )
+
+    decls = _ARCH02_LISTENER_DECL_RE.findall(body)
+    if not decls:
+        problems.append(
+            "%s: `object %s` owns a primed cache but declares no object-owned "
+            "`OnSharedPreferenceChangeListener` field -- prime() alone cannot keep the "
+            "cache in step with a direct SharedPreferences write (minis-config / backup "
+            "restore / the agent), so the context-free readers keep the startup snapshot"
+            % (rel, obj)
+        )
+        return
+
+    prime_m = _ARCH02_PRIME_FUN_RE.search(body)
+    brace = body.find("{", prime_m.end()) if prime_m else -1
+    prime_body = _brace_body(body, brace) if brace >= 0 else None
+    if prime_body is None:
+        problems.append(
+            "%s: `object %s` exposes prime() but its body could not be located -- cannot "
+            "prove the self-sync listener is registered" % (rel, obj)
+        )
+        return
+
+    bodies = _listener_bodies(body)
+    for ident in decls:
+        if not re.search(
+            r"\.registerOnSharedPreferenceChangeListener\s*\(\s*" + re.escape(ident) + r"\s*\)",
+            prime_body,
+        ):
+            problems.append(
+                "%s: `object %s` declares the self-sync listener `%s` but never registers "
+                "it from prime() -- a listener that is never registered refreshes nothing"
+                % (rel, obj, ident)
+            )
+            continue
+        found = [b for n, b in bodies if n == ident]
+        if not found:
+            problems.append(
+                "%s: `object %s` registers `%s` but its body could not be located -- cannot "
+                "prove it refreshes the cache" % (rel, obj, ident)
+            )
+        elif not re.search(r"\bcached\w*\s*=(?!=)", found[0]) and "loadFromPreferences(" not in found[0]:
+            problems.append(
+                "%s: `object %s`'s self-sync listener `%s` refreshes nothing (no `cached… =` "
+                "assignment and no shared loader call) -- it satisfies the shape while leaving "
+                "the cache at the startup value, i.e. the same silent desync one layer in"
+                % (rel, obj, ident)
+            )
+        else:
+            report.append("  %s: `object %s` self-syncs via `%s`" % (rel, obj, ident))
+
+
+def scan_self_priming(root):
+    """ARCH-02 self-sync criteria. Returns (report lines, problems)."""
+    report = []
+    problems = []
+    checked = set()
+    files = []
+    for path in _kt_files(root):
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        files.append((path, raw, _strip_comments_and_strings(raw)))
+
+    def check(path, clean, obj, body, why):
+        rel = path.relative_to(root)
+        if (str(rel), obj) in checked:
+            return
+        checked.add((str(rel), obj))
+        _self_sync_defects(body, obj, rel, problems, report)
+
+    # ── C4: cache identity anchor (the prefs file name literal) ──────────
+    for obj, lit in _ARCH02_CACHES:
+        decl_files = [f for f in files if _ARCH02_DECL_LITS[lit].search(f[1])]
+        obj_declared = any(re.search(r"\bobject\s+%s\b" % obj, f[2]) for f in files)
+        if not decl_files:
+            if obj_declared:
+                problems.append(
+                    'no file declares the prefs file name "%s" although `object %s` still '
+                    "exists -- the ARCH-02 identity anchor was renamed/removed, re-point "
+                    "this criterion" % (lit, obj)
+                )
+            continue
+        if not obj_declared:
+            problems.append(
+                'a file declares the prefs file name "%s" but no file declares `object %s` '
+                "-- the object was renamed while the C4/C5 anchors did not follow"
+                % (lit, obj)
+            )
+        for path, _raw, clean in decl_files:
+            scoped = [(n, b) for n, b in _object_bodies(clean)
+                      if _ARCH02_PRIME_FUN_RE.search(b) and _ARCH02_CACHED_FIELD_RE.search(b)]
+            if not scoped:
+                problems.append(
+                    '%s declares the primed prefs file "%s" but exposes no `object` with '
+                    "`fun prime(<x>: Context)` over a `@Volatile private var cached…` "
+                    "snapshot -- the self-sync contract has no anchor here (shape renamed?)"
+                    % (path.relative_to(root), lit)
+                )
+                continue
+            for n, b in scoped:
+                check(path, clean, n, b, "C4")
+
+    # ── C5: shape anchor, name-independent (covers a future 4th cache) ───
+    for path, _raw, clean in files:
+        for n, b in _object_bodies(clean):
+            if _ARCH02_PRIME_FUN_RE.search(b) and _ARCH02_CACHED_FIELD_RE.search(b):
+                check(path, clean, n, b, "C5")
+
+    # Drift detector, NOT a shape requirement: only speak up when the tree still
+    # carries an ARCH-02 anchor (one of the three cache objects by name, or one
+    # of their prefs-file literals) while no primed-cache object is recognisable.
+    #
+    # It must stay silent on a tree with no prefs-cache world at all -- the
+    # miniature fixture trees used by test_scan.py / --selftest are exactly that,
+    # and an unconditional "nothing to check" there turns 4 green-expectation
+    # fixtures red (found by running the frozen test_scan.py on this branch).
+    anchored = any(
+        re.search(r"\bobject\s+(%s)\b" % "|".join(n for n, _l in _ARCH02_CACHES), clean)
+        or any(_ARCH02_DECL_LITS[lit].search(raw) for _o, lit in _ARCH02_CACHES)
+        for _path, raw, clean in files
+    )
+    if not checked and anchored:
+        problems.append(
+            "the tree still declares a primed prefs cache object / prefs-file literal but no "
+            "object with the primed shape (`fun prime(<x>: Context)` over a `@Volatile private "
+            "var cached…` snapshot) was found -- the ARCH-02 criteria have lost their anchor "
+            "(did the caches move or get renamed?)"
+        )
+    return report, problems
+
+
 def _selftest():
     """Fixture mode: each fixture is a miniature tree with exactly one defect."""
     import subprocess
@@ -509,10 +709,51 @@ def _selftest():
         "}\n"
     )
 
+    def self_sync_src(lit="minis_concurrency_prefs", obj="ConcurrencyPrefs",
+                      decl=True, register=True, refresh=True, context_field=False):
+        """A miniature primed-cache object in the shipped shape, broken in one way."""
+        lines = [
+            HOLD,
+            "object %s {\n" % obj,
+            '    const val PREFS = "%s"\n' % lit,
+            "    const val KEY = \"maxConcurrentSessions\"\n",
+            # shipped shape: @Volatile and the field live on separate lines
+            "    @Volatile\n    private var cachedValue = 1\n",
+        ]
+        if context_field:
+            lines.append("    private var appContext: Context? = null\n")
+        if decl:
+            if refresh:
+                lines.append(
+                    "    private val selfSyncListener =\n"
+                    "        SharedPreferences.OnSharedPreferenceChangeListener { changed, _ ->\n"
+                    "            cachedValue = changed.getInt(KEY, 1)\n"
+                    "        }\n"
+                )
+            else:
+                lines.append(
+                    "    private val selfSyncListener =\n"
+                    "        SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->\n"
+                    "        }\n"
+                )
+        lines.append(
+            "    fun prime(context: Context) {\n"
+            "        val p = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)\n"
+        )
+        if register and decl:
+            lines.append("        p.registerOnSharedPreferenceChangeListener(selfSyncListener)\n")
+        lines.append(
+            "        cachedValue = p.getInt(KEY, 1)\n"
+            "    }\n"
+            "}\n"
+        )
+        return "".join(lines)
+
     fixtures = [
         # name, files, expected rc, fragment that must appear ("" = must be green)
         ("clean tree (precision control)",
-         {"Cfg.kt": cfg(), "Screen.kt": screen()}, 0, "re-primed by"),
+         {"Cfg.kt": cfg(), "Screen.kt": screen(), "Prefs.kt": self_sync_src()},
+         0, "re-primed by"),
         ("concurrency listener never primes (C1)",
          {"Cfg.kt": cfg(conc_prime=False), "Screen.kt": screen()},
          1, "re-primes nothing: the listener `cl` on ConcurrencyPrefs.PREFS"),
@@ -526,6 +767,33 @@ def _selftest():
          {"Cfg.kt": inline_reg}, 1, "no resolvable change-listener registration"),
         ("config-path anchor renamed away (fail-closed)",
          {"MinisApp.kt": renamed}, 1, "the anchor was renamed/removed"),
+        # [ARCH-02] self-sync fixtures -- one defect each.
+        ("primed cache declares no self-sync listener (S1/C4)",
+         {"Prefs.kt": self_sync_src(decl=False)}, 1,
+         "declares no object-owned"),
+        ("self-sync listener never registered from prime (S2)",
+         {"Prefs.kt": self_sync_src(register=False)}, 1,
+         "never registers"),
+        ("self-sync listener refreshes nothing (S3)",
+         {"Prefs.kt": self_sync_src(refresh=False)}, 1,
+         "refreshes nothing"),
+        ("self-synced cache object (precision control, green)",
+         {"Prefs.kt": self_sync_src(), "Cfg.kt": cfg(), "Screen.kt": screen()},
+         0, "self-syncs via"),
+        ("primed object with no cached snapshot in it (C4 anchor lost)",
+         {"Prefs.kt": HOLD + (
+             "object Prefs {\n"
+             '    const val PREFS = "minis_concurrency_prefs"\n'
+             "    fun prime(context: Context) {\n"
+             "    }\n"
+             "}\n")}, 1,
+         "no `object` with `fun prime"),
+        ("object exists but its prefs-file literal was renamed (C6a)",
+         {"Prefs.kt": self_sync_src(lit="renamed_concurrency_prefs")}, 1,
+         'no file declares the prefs file name "minis_concurrency_prefs"'),
+        ("primed cache object retains a Context field (C7)",
+         {"Prefs.kt": self_sync_src(context_field=True)}, 1,
+         "keeps a Context-typed field"),
     ]
 
     ok = True
@@ -627,6 +895,13 @@ if _priming_report:
         print(_line)
     print("")
 
+_arch02_report, _arch02_problems = scan_self_priming(ROOT)
+if _arch02_report:
+    print("Self-syncing primed caches ([ARCH-02] the cache owns its own re-priming listener):")
+    for _line in _arch02_report:
+        print(_line)
+    print("")
+
 print("SharedPreferences change-listener registrations:")
 for rel, line, kind in sites:
     print(f"  {rel}:{line}  {kind}")
@@ -653,8 +928,17 @@ if _priming_problems:
     print("\n  Fix: where the config path is registered, also register a listener on that")
     print("       prefs file and have it call <Prefs>.prime(context) before any cached read.")
 
-if problems or _priming_problems:
+if _arch02_problems:
+    print("\nFAIL: a primed cache is not self-syncing ([ARCH-02] contract broken)")
+    for p in _arch02_problems:
+        print(f"  - {p}")
+    print("\n  Fix: in the object that owns the cache, declare a strongly-held listener")
+    print("       (OnSharedPreferenceChangeListener { changed, _ -> <reload> }) and register")
+    print("       it once from prime(). See scripts/scan/prefs_listener_holder_guard.py [ARCH-02].")
+
+if problems or _priming_problems or _arch02_problems:
     sys.exit(1)
 
 print(f"\nOK: all {len(sites)} prefs listener registration(s) strongly held")
 print(f"OK: re-priming criteria green ({len(_priming_report)} re-priming site(s) verified)")
+print(f"OK: self-syncing primed caches ({len(_arch02_report)} cache(s) own their re-priming listener)")

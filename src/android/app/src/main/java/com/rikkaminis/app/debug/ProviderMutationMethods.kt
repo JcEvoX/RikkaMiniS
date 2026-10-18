@@ -2,6 +2,11 @@ package com.rikkaminis.app.debug
 
 import android.content.Context
 import com.rikkaminis.app.MinisApp
+import com.rikkaminis.app.config.collections.CUSTOM_BASE_URL_OPENROUTER_MESSAGE
+import com.rikkaminis.app.config.collections.CUSTOM_USER_AGENT_OAUTH_MESSAGE
+import com.rikkaminis.app.config.collections.canonicalModelProviderName
+import com.rikkaminis.app.config.collections.customUserAgentWritable
+import com.rikkaminis.app.config.collections.normalizeCustomModelId
 import com.rikkaminis.app.data.model.FallbackStrategy
 import com.rikkaminis.app.data.model.ImageEndpointMode
 import com.rikkaminis.app.data.model.LLMModel
@@ -10,6 +15,8 @@ import com.rikkaminis.app.data.model.ModelGroup
 import com.rikkaminis.app.data.model.ModelOverrides
 import com.rikkaminis.app.data.model.ProviderCredential
 import com.rikkaminis.app.data.model.ProviderInstance
+import com.rikkaminis.app.config.collections.canonicalModelProviderName
+import com.rikkaminis.app.config.collections.normalizeCustomModelId
 import com.rikkaminis.app.data.model.ProviderType
 import com.rikkaminis.app.data.model.RoutingStrategy
 import com.rikkaminis.app.data.repository.ProviderRepository
@@ -71,15 +78,18 @@ internal object ProviderMutationMethods {
         // collection write customBaseURL for all non-openRouter types, and
         // instances.update has no type gate, so a create-time openAI-only
         // rejection contradicted its own update path. Only openRouter keeps
-        // the hard rejection (no remote base URL to honor).
+        // the hard rejection (no remote base URL to honor). [ARCH-01] The
+        // wording delegates to the shared constant in ProviderWriteRules.
         if (customBaseURL != null && !type.supportsCustomBaseURL) {
-            throw RPCException(-32602, "customBaseURL is not supported for providerType=openRouter")
+            throw RPCException(-32602, CUSTOM_BASE_URL_OPENROUTER_MESSAGE)
         }
 
         // [T-ua-block-oauth-provider] customUserAgent only for apiKey providers.
+        // [ARCH-01] Delegates to the shared predicate + message in
+        // ProvidersCollection so Debug RPC and minis-config cannot drift.
         val customUserAgent = params.optString("customUserAgent", "").ifEmpty { null }
-        if (customUserAgent != null && credentialType != ProviderCredential.apiKey) {
-            throw RPCException(-32602, "Custom User-Agent is only supported for third-party API-key providers. OAuth providers (Anthropic/Codex) use their own authentication UA and cannot be overridden.")
+        if (customUserAgent != null && !customUserAgentWritable(credentialType)) {
+            throw RPCException(-32602, CUSTOM_USER_AGENT_OAUTH_MESSAGE)
         }
 
         val instance = ProviderInstance(
@@ -127,10 +137,11 @@ internal object ProviderMutationMethods {
         // authentication request chain with a fixed client UA — overriding it can
         // break the handshake or be rejected upstream. Reject any write (including
         // the empty-string clear) for non-apiKey instances, mirroring the
-        // minis-config writer guard in ProvidersCollection.kt.
+        // minis-config writer guard in ProvidersCollection.kt. [ARCH-01] Delegates
+        // to the shared predicate + message in ProvidersCollection.
         val customUserAgent: String? = if (params.has("customUserAgent")) {
-            if (current.credentialType != ProviderCredential.apiKey) {
-                throw RPCException(-32602, "Custom User-Agent is only supported for third-party API-key providers. OAuth providers (Anthropic/Codex) use their own authentication UA and cannot be overridden.")
+            if (!customUserAgentWritable(current.credentialType)) {
+                throw RPCException(-32602, CUSTOM_USER_AGENT_OAUTH_MESSAGE)
             }
             if (params.isNull("customUserAgent")) null
             else params.optString("customUserAgent", "").ifEmpty { null }
@@ -143,11 +154,13 @@ internal object ProviderMutationMethods {
         // JSON-null value is a clear, not a write. providerType is NOT mutable
         // via update (params.providerType is never consumed — the copy below
         // doesn't touch it), so the type at write time is exactly
-        // current.providerType.
+        // current.providerType. [ARCH-01] The wording delegates to the shared
+        // constant in ProviderWriteRules (gate C2 accepts the literal or the
+        // shared constant reference).
         if (params.has("customBaseURL") && !params.isNull("customBaseURL")) {
             val newBase = params.optString("customBaseURL", "").ifEmpty { null }
             if (newBase != null && !current.providerType.supportsCustomBaseURL) {
-                throw RPCException(-32602, "customBaseURL is not supported for providerType=openRouter")
+                throw RPCException(-32602, CUSTOM_BASE_URL_OPENROUTER_MESSAGE)
             }
         }
 
@@ -309,9 +322,12 @@ internal object ProviderMutationMethods {
         }
         val instance = repo.instance(instanceId)
             ?: throw RPCException(-32602, "Instance not found: $instanceId")
-        val modelId = params.optString("modelId", "").ifEmpty {
-            throw RPCException(-32602, "Missing 'modelId' param")
-        }
+        // [ARCH-01] Trim before validating — shared with the minis-config
+        // `models.add` face (ModelsCollection.add) via [normalizeCustomModelId].
+        // Untrimmed, a whitespace-only id passed `ifEmpty` and minted a
+        // blank/padded composite-key row on this surface only.
+        val modelId = normalizeCustomModelId(params.optString("modelId", ""))
+            ?: throw RPCException(-32602, "Missing 'modelId' param")
         val displayName = params.optString("displayName", "").ifEmpty {
             // Prettify: "deepseek-v4-pro" → "Deepseek V4 Pro" — same heuristic
             // the iOS doc describes; cheap inline impl matches the result for
@@ -335,7 +351,7 @@ internal object ProviderMutationMethods {
         val model = LLMModel(
             id = modelId,
             displayName = displayName,
-            provider = instance.providerType.displayName,
+            provider = canonicalModelProviderName(instance.providerType),
             contextWindow = contextWindow,
             maxOutputTokens = maxOut,
             supportsReasoning = supportsReasoning,
