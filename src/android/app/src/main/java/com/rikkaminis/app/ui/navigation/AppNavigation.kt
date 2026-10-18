@@ -1462,9 +1462,14 @@ fun AppNavigation(
         }
 
         composable(Routes.USAGE_STATS) {
+            // Reactive read: `providerRepository.config.value` is a one-shot
+            // snapshot at composition time, so a config update (custom model
+            // entry added/renamed/removed) never reached UsageStatsScreen and
+            // its stats kept bucketing under the raw modelId / "Unknown".
+            val providerConfig by providerRepository.config.collectAsState()
             UsageStatsScreen(
                 chatDao = chatRepository.dao,
-                providerConfig = providerRepository.config.value,
+                providerConfig = providerConfig,
                 onBack = { navController.safePopBackStack() },
             )
         }

@@ -88,11 +88,15 @@ fun UsageStatsScreen(
     var isLoaded by remember { mutableStateOf(false) }
     var range by remember { mutableStateOf(UsageRange.ALL) }
 
-    LaunchedEffect(range) {
+    LaunchedEffect(range, providerConfig) {
         // A (usage-stats-perf-1007): the whole compute used to run on the main
         // dispatcher — with enough history the spinner froze for seconds.
         // Query + aggregation off-main, then hand the results back to
         // composition (state writes stay on main).
+        // `providerConfig` is a key too: computeUsageStats resolves custom
+        // model entries out of it, so a config update must re-run the
+        // aggregation instead of leaving the page on the previous provider /
+        // model labelling.
         val (total, groups) = withContext(Dispatchers.Default) {
             computeUsageStats(range, chatDao, providerConfig)
         }

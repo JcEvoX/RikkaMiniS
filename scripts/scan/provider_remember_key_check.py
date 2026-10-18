@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """provider_remember_key_check.py — deep-audit-1025 ISSUE-06 [da1025-F]
                                         + deep-audit-1026 ISSUE-03 [da1026-C]
+                                        + deep-audit-1027 ISSUE-02/08 [da1027-E]
 
 Gates the Compose remember-key shape in the provider settings screens so
 derived values always list their derivation sources as remember keys
@@ -42,6 +43,21 @@ Criteria (each fail-closed: missing anchor = RED, never silent skip):
       re-assigned on the refresh path. C7c: the refresh path must contain a
       fresh `entriesFor(` read (or an assignment to a mutableStateOf-backed
       `allEntries`).
+  C8  ModelGroupDetailScreen: every `remember(...)` whose initializer reads a
+      `group.<field>` must key on that exact `group.<field>` (with only
+      `group.id` as key an external write — minis-config / Debug RPC / backup
+      restore — left the old text on screen and the name field's focus-loss
+      save wrote it straight back). Anchor: at least one group-derived call
+      must exist, else RED (fail-closed — re-derive if the screen is reworked).
+  C9  MountDetailScreen: same shape for `entry.<field>` — `canSave` compares
+      the edit buffer against the entry, so a field-keyed remember is what
+      keeps an external write from inverting the Save button.
+  C10 AppNavigation / UsageStatsScreen — the usage page must observe config
+      changes. C10a: the `Routes.USAGE_STATS` route block must NOT pass
+      `providerConfig = <...>.value` (a one-shot StateFlow snapshot) and must
+      contain a `collectAsState()` read. C10b: the `LaunchedEffect(...)` whose
+      body calls `computeUsageStats(` must key on both `range` and
+      `providerConfig`.
 
 Usage:
   python3 provider_remember_key_check.py <repo_root>   # real-tree mode
@@ -64,6 +80,11 @@ REL_SHEET = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/Manage
 REL_PROVIDER_DETAIL = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/ProviderDetailScreen.kt"
 REL_CONNECTION = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/ProviderConnectionScreen.kt"
 REL_ENTRY_DETAIL = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/ModelEntryDetailScreen.kt"
+# da1027-E
+REL_GROUP_DETAIL = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/ModelGroupDetailScreen.kt"
+REL_MOUNT_DETAIL = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/MountDetailScreen.kt"
+REL_APP_NAV = "src/android/app/src/main/java/com/rikkaminis/app/ui/navigation/AppNavigation.kt"
+REL_USAGE_STATS = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/UsageStatsScreen.kt"
 
 # C6c — value families a remember initializer can derive from in
 # ModelEntryDetailScreen. Reading any of them makes the call site
@@ -76,6 +97,9 @@ DERIVED_SOURCES = ("entry.", "baseModel.", "overrides.", "effectiveInput", "effe
 DERIVED_TOKEN_RE = re.compile(
     r"\b(?:entry|baseModel|overrides)\.[A-Za-z_][A-Za-z0-9_]*"
     r"|\b(?:effectiveInput|effectiveOutput)\b")
+# C8 / C9 — the field families the two detail screens edit.
+GROUP_FIELD_RE = re.compile(r"\bgroup\.[A-Za-z_][A-Za-z0-9_]*")
+ENTRY_FIELD_RE = re.compile(r"\bentry\.[A-Za-z_][A-Za-z0-9_]*")
 
 
 def strip_comments(text):
@@ -391,12 +415,127 @@ def check_entry_detail(code):
     return results
 
 
+def check_field_keyed_remember(code, field_re, target, cid, screen):
+    """C8 / C9 — every `remember(...)` whose initializer reads a
+    `<target>.<field>` must key on that exact field.
+
+    Only the initializer counts as a read: the key list itself mentioning the
+    field is what we are testing for, so counting the whole statement would
+    make the criterion tautological. Keyless (`remember { ... }`) counts as a
+    miss whenever the initializer is field-derived.
+
+    Fail-closed anchor: no field-derived remember call at all means the screen
+    was reworked and this criterion can no longer see what it guards → RED
+    (never a silent skip)."""
+    results = []
+    calls = iter_remember_calls(code, "remember")
+    derived = 0
+    bad = []
+    for line_no, keys, _span, init in calls:
+        sources = sorted(set(field_re.findall(init)))
+        if not sources:
+            continue
+        derived += 1
+        if keys is None:
+            bad.append("L%d: keyless remember derives from %s" % (line_no, ",".join(sources)))
+            continue
+        missing = [tok for tok in sources if tok not in keys]
+        if missing:
+            bad.append("L%d: initializer derives from %s but keys=[%s]"
+                       % (line_no, ",".join(missing), " ".join(keys.split())))
+    if derived == 0:
+        results.append((cid, False,
+                        "no remember call in %s derives from %s.<field> (fail-closed: "
+                        "screen reworked, re-derive this criterion)" % (screen, target)))
+        return results
+    results.append((cid, not bad,
+                    "all %d %s-derived remember calls key the exact field they read"
+                    % (derived, target) if not bad else "; ".join(bad)))
+    return results
+
+
+def check_group_detail(code):
+    """C8 — ModelGroupDetailScreen session-defaults / name editors."""
+    return check_field_keyed_remember(code, GROUP_FIELD_RE, "group", "C8",
+                                      "ModelGroupDetailScreen")
+
+
+def check_mount_detail(code):
+    """C9 — MountDetailScreen userAllowWrite switch."""
+    return check_field_keyed_remember(code, ENTRY_FIELD_RE, "entry", "C9",
+                                      "MountDetailScreen")
+
+
+USAGE_STATS_ANCHOR = "composable(Routes.USAGE_STATS)"
+NEXT_COMPOSABLE_RE = re.compile(r"composable\(Routes\.")
+
+
+def check_app_navigation(code):
+    """C10a — the usage route must read the provider config reactively."""
+    results = []
+    pos = code.find(USAGE_STATS_ANCHOR)
+    if pos < 0:
+        results.append(("C10a", False,
+                        "anchor `%s` not found (fail-closed)" % USAGE_STATS_ANCHOR))
+        return results
+    nxt = NEXT_COMPOSABLE_RE.search(code, pos + len(USAGE_STATS_ANCHOR))
+    block = code[pos:nxt.start()] if nxt else code[pos:]
+    if "UsageStatsScreen(" not in block:
+        results.append(("C10a", False,
+                        "anchor `%s` block does not call UsageStatsScreen( (fail-closed)"
+                        % USAGE_STATS_ANCHOR))
+        return results
+    snapshot = re.search(r"providerConfig\s*=\s*[\w.]+\.value\b", block)
+    reactive = "collectAsState" in block
+    if snapshot is not None:
+        results.append(("C10a", False,
+                        "route passes a one-shot snapshot: `%s` — config updates never "
+                        "reach UsageStatsScreen; use collectAsState()"
+                        % " ".join(snapshot.group(0).split())))
+        return results
+    results.append(("C10a", reactive,
+                    "route reads the config via collectAsState()" if reactive else
+                    "no `collectAsState()` in the usage route block — the config is not "
+                    "observed (fail-closed)"))
+    return results
+
+
+def check_usage_stats(code):
+    """C10b — the stats LaunchedEffect must key on the config it consumes."""
+    results = []
+    hits = [(ln, keys, span, init)
+            for ln, keys, span, init in iter_remember_calls(code, "LaunchedEffect")
+            if "computeUsageStats(" in init]
+    if not hits:
+        results.append(("C10b", False,
+                        "no LaunchedEffect(...) whose body calls computeUsageStats( "
+                        "(fail-closed: anchor gone, re-derive this criterion)"))
+        return results
+    bad = []
+    for line_no, keys, _span, _init in hits:
+        if keys is None:
+            bad.append("L%d: keyless LaunchedEffect" % line_no)
+            continue
+        missing = [tok for tok in ("range", "providerConfig") if tok not in keys]
+        if missing:
+            bad.append("L%d: keys=[%s] missing %s"
+                       % (line_no, " ".join(keys.split()), ",".join(missing)))
+    results.append(("C10b", not bad,
+                    "all %d computeUsageStats effect(s) key on range + providerConfig" % len(hits)
+                    if not bad else "; ".join(bad)))
+    return results
+
+
 CHECKERS = (
     (REL_PROVIDER_LIST, check_provider_list),
     (REL_SHEET, check_sheet),
     (REL_PROVIDER_DETAIL, check_provider_detail),
     (REL_CONNECTION, check_connection),
     (REL_ENTRY_DETAIL, check_entry_detail),
+    (REL_GROUP_DETAIL, check_group_detail),
+    (REL_MOUNT_DETAIL, check_mount_detail),
+    (REL_APP_NAV, check_app_navigation),
+    (REL_USAGE_STATS, check_usage_stats),
 )
 
 
@@ -571,12 +710,134 @@ FIX_ENTRY_DETAIL_MISSING_ANCHOR = """package com.rikkaminis.app.ui.settings
 fun unrelated() {}
 """
 
+# --- da1027-E fixtures: the two detail screens + the usage route ----------
+
+FIX_GROUP_DETAIL_CLEAN = """package com.rikkaminis.app.ui.settings
+
+fun ModelGroupDetailScreen(groupId: String) {
+    var name by remember(group.id, group.name) { mutableStateOf(group.name) }
+    var strategy by remember(group.id, group.strategy) { mutableStateOf(group.strategy) }
+    var fallbackStrategy by remember(group.id, group.fallbackStrategy) {
+        mutableStateOf(group.fallbackStrategy)
+    }
+    var defaultThinkingLevel by remember(group.id, group.defaultThinkingLevel) {
+        mutableStateOf(group.defaultThinkingLevel)
+    }
+    var contextLimitTokens by remember(group.id, group.contextLimitTokens) {
+        mutableStateOf(group.contextLimitTokens)
+    }
+    var memberIds by remember(group.memberEntryIds) { mutableStateOf(group.memberEntryIds.toList()) }
+    var entryToRemove by remember { mutableStateOf<String?>(null) }
+    val groupMaxThinkingLevel = remember(group.memberEntryIds, config.modelEntries) {
+        group.memberEntryIds.mapNotNull { entryId -> config.modelEntries.find { it.id == entryId } }
+    }
+}
+"""
+
+# the pre-fix shape: the editor is keyed on the identity only, so an external
+# write to `name` left the old text on screen for the focus-loss save to undo
+FIX_GROUP_DETAIL_NO_NAME_KEY = FIX_GROUP_DETAIL_CLEAN.replace(
+    "remember(group.id, group.name) { mutableStateOf(group.name) }",
+    "remember(group.id) { mutableStateOf(group.name) }")
+
+FIX_GROUP_DETAIL_MISSING_ANCHOR = """package com.rikkaminis.app.ui.settings
+
+fun unrelated() {}
+"""
+
+FIX_MOUNT_DETAIL_CLEAN = """package com.rikkaminis.app.ui.settings
+
+fun MountDetailScreen(mountId: String) {
+    val entry = entries.firstOrNull { it.id == mountId }
+    var allowWrite by remember(entry.id, entry.userAllowWrite) { mutableStateOf(entry.userAllowWrite) }
+    var showUnmountConfirm by remember { mutableStateOf(false) }
+    val canSave = allowWrite != entry.userAllowWrite
+}
+"""
+
+FIX_MOUNT_DETAIL_NO_WRITE_KEY = FIX_MOUNT_DETAIL_CLEAN.replace(
+    "remember(entry.id, entry.userAllowWrite)", "remember(entry.id)")
+
+FIX_MOUNT_DETAIL_MISSING_ANCHOR = """package com.rikkaminis.app.ui.settings
+
+fun unrelated() {}
+"""
+
+FIX_APPNAV_CLEAN = """package com.rikkaminis.app.ui.navigation
+
+composable(Routes.USAGE_STATS) {
+    val providerConfig by providerRepository.config.collectAsState()
+    UsageStatsScreen(
+        chatDao = chatRepository.dao,
+        providerConfig = providerConfig,
+        onBack = { navController.safePopBackStack() },
+    )
+}
+
+composable(Routes.APPEARANCE) {
+    AppearanceScreen(onBack = { navController.safePopBackStack() })
+}
+"""
+
+# the pre-fix shape: a one-shot snapshot; the config flow never recomposes the
+# route, so the screen keeps whatever config existed when it was first opened
+FIX_APPNAV_SNAPSHOT = """package com.rikkaminis.app.ui.navigation
+
+composable(Routes.USAGE_STATS) {
+    UsageStatsScreen(
+        chatDao = chatRepository.dao,
+        providerConfig = providerRepository.config.value,
+        onBack = { navController.safePopBackStack() },
+    )
+}
+
+composable(Routes.APPEARANCE) {
+    AppearanceScreen(onBack = { navController.safePopBackStack() })
+}
+"""
+
+FIX_APPNAV_MISSING_ANCHOR = """package com.rikkaminis.app.ui.navigation
+
+composable(Routes.APPEARANCE) {
+    AppearanceScreen(onBack = { navController.safePopBackStack() })
+}
+"""
+
+FIX_USAGE_STATS_CLEAN = """package com.rikkaminis.app.ui.settings
+
+@Composable
+fun UsageStatsScreen(chatDao: ChatDao, providerConfig: ProviderConfig? = null, onBack: () -> Unit) {
+    var range by remember { mutableStateOf(UsageRange.ALL) }
+    LaunchedEffect(range, providerConfig) {
+        val (total, groups) = withContext(Dispatchers.Default) {
+            computeUsageStats(range, chatDao, providerConfig)
+        }
+        grandTotal = total
+    }
+}
+"""
+
+FIX_USAGE_STATS_NO_CONFIG_KEY = FIX_USAGE_STATS_CLEAN.replace(
+    "LaunchedEffect(range, providerConfig) {", "LaunchedEffect(range) {")
+
+FIX_USAGE_STATS_MISSING_ANCHOR = """package com.rikkaminis.app.ui.settings
+
+@Composable
+fun UsageStatsScreen(chatDao: ChatDao, providerConfig: ProviderConfig? = null) {
+    var range by remember { mutableStateOf(UsageRange.ALL) }
+}
+"""
+
 CLEAN_TREE = {
     REL_PROVIDER_LIST: FIX_PROVIDER_LIST_CLEAN,
     REL_SHEET: FIX_SHEET_CLEAN,
     REL_PROVIDER_DETAIL: FIX_PROVIDER_DETAIL_CLEAN,
     REL_CONNECTION: FIX_CONNECTION_CLEAN,
     REL_ENTRY_DETAIL: FIX_ENTRY_DETAIL_CLEAN,
+    REL_GROUP_DETAIL: FIX_GROUP_DETAIL_CLEAN,
+    REL_MOUNT_DETAIL: FIX_MOUNT_DETAIL_CLEAN,
+    REL_APP_NAV: FIX_APPNAV_CLEAN,
+    REL_USAGE_STATS: FIX_USAGE_STATS_CLEAN,
 }
 
 
@@ -679,6 +940,24 @@ def run_selftest():
              variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_STATE_BACKED), failures)
     run_case("failclosed-missing-detail-anchor", 1,
              variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_MISSING_ANCHOR), failures, ("C7",))
+    # --- da1027-E: C8 / C9 (field-keyed editors) ---------------------------
+    run_case("c8-group-no-name-key", 1,
+             variant(REL_GROUP_DETAIL, FIX_GROUP_DETAIL_NO_NAME_KEY), failures, ("C8",))
+    run_case("failclosed-missing-group-anchor", 1,
+             variant(REL_GROUP_DETAIL, FIX_GROUP_DETAIL_MISSING_ANCHOR), failures, ("C8",))
+    run_case("c9-mount-no-write-key", 1,
+             variant(REL_MOUNT_DETAIL, FIX_MOUNT_DETAIL_NO_WRITE_KEY), failures, ("C9",))
+    run_case("failclosed-missing-mount-anchor", 1,
+             variant(REL_MOUNT_DETAIL, FIX_MOUNT_DETAIL_MISSING_ANCHOR), failures, ("C9",))
+    # --- da1027-E: C10a / C10b (usage page observes the config) ------------
+    run_case("c10a-appnav-snapshot", 1,
+             variant(REL_APP_NAV, FIX_APPNAV_SNAPSHOT), failures, ("C10a",))
+    run_case("failclosed-missing-appnav-anchor", 1,
+             variant(REL_APP_NAV, FIX_APPNAV_MISSING_ANCHOR), failures, ("C10a",))
+    run_case("c10b-usage-effect-no-config-key", 1,
+             variant(REL_USAGE_STATS, FIX_USAGE_STATS_NO_CONFIG_KEY), failures, ("C10b",))
+    run_case("failclosed-missing-usage-anchor", 1,
+             variant(REL_USAGE_STATS, FIX_USAGE_STATS_MISSING_ANCHOR), failures, ("C10b",))
     if failures:
         print("SELFTEST FAILURES:")
         for f in failures:
