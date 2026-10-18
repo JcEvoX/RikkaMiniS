@@ -2,6 +2,7 @@ package com.rikkaminis.app.offload
 
 import android.media.MediaPlayer
 import android.util.Log
+import android.content.Context
 import com.rikkaminis.app.sandbox.PRootKernel
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
@@ -60,8 +61,23 @@ object MediaPlayerManager {
     /**
      * Start playback of a file in a new or existing session.
      * If the session already exists, the previous player is released first.
+     *
+     * [da1025-A] `chatSessionId` + `context` opt into the session-aware
+     * resolution chain: the (handler-joined) path is resolved through
+     * [PRootKernel.resolvePathForSession] so per-session sandbox dirs are
+     * honoured and a `..`/symlink escape out of the session tree fails
+     * closed; paths outside `/var/minis/` (user mounts, rootfs) still
+     * resolve globally via that resolver's internal fallbacks. Callers
+     * without a `context` (none today besides PlayerOffloadHandler) keep
+     * the pre-fix global [PRootKernel.resolveHostPath] behaviour as the
+     * safe default.
      */
-    fun play(sessionId: String, filePath: String): String {
+    fun play(
+        sessionId: String,
+        filePath: String,
+        chatSessionId: String? = null,
+        context: Context? = null,
+    ): String {
         // [da1022-C] Releasing the previous player for this id happens UNDER
         // the lock the terminalize callbacks take: unlocked, the
         // onCompletion/onError handler could be mid-releaseSession() on the
@@ -76,8 +92,21 @@ object MediaPlayerManager {
             }
         }
 
-        val hostFile = PRootKernel.resolveHostPath(filePath)
-            ?: return "Error: cannot resolve path '$filePath'"
+        // [da1025-A] Session-aware resolution: the pure decision core keeps
+        // the fail-closed arm testable off-device. A null from the session
+        // resolver means "rejected or absent" and is returned as a play
+        // error — never re-guessed through the global resolver, whose elvis
+        // fallback would reopen the cross-session read hole
+        // resolvePathForSession documents.
+        val sessionResolver: ((String?, String) -> File?)? = context?.let { ctx ->
+            { sid: String?, path: String -> PRootKernel.resolvePathForSession(sid, path, ctx) }
+        }
+        val hostFile = playerPathResolve(
+            chatSessionId = chatSessionId,
+            resolvedPath = filePath,
+            resolveSession = sessionResolver,
+            resolveGlobal = { PRootKernel.resolveHostPath(it) },
+        ) ?: return "Error: cannot resolve path '$filePath' (session=${chatSessionId ?: "none"})"
 
         if (!hostFile.exists()) {
             return "Error: file not found at '$filePath' (resolved: ${hostFile.absolutePath})"
@@ -254,6 +283,27 @@ object MediaPlayerManager {
     }
 
     // ── Internal ────────────────────────────────────────────────────────
+
+    /**
+     * [da1025-A] Pure decision core of the play() path resolution: no
+     * [Context], no [PRootKernel] state, so the JVM test source set can pin
+     * the three arms — session resolver present → its result verbatim; a
+     * null from it is "rejected or absent" and is returned as null (callers
+     * turn that into a play error, never a global re-guess — the elvis
+     * fallback would reopen the cross-session read hole
+     * [PRootKernel.resolvePathForSession] documents); context-less callers
+     * fall back to the pre-fix global resolver.
+     */
+    internal fun <T> playerPathResolve(
+        chatSessionId: String?,
+        resolvedPath: String,
+        resolveSession: ((String?, String) -> T?)?,
+        resolveGlobal: (String) -> T?,
+    ): T? = if (resolveSession != null) {
+        resolveSession(chatSessionId, resolvedPath)
+    } else {
+        resolveGlobal(resolvedPath)
+    }
 
     private fun releaseSession(session: Session) {
         // [da1022-C] stop() and release() are TWO try blocks on purpose — same
