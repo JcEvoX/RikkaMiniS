@@ -95,15 +95,37 @@ fun BrowserSettingsSheet(
 
     // Viewport state — bound to the pool's flows so changes from other surfaces
     // (e.g. the agent calling set_viewport) reflect in this sheet immediately.
+    //
+    // [da1029-E] Two sources, one meaning. The pool resolves a tab's viewport as
+    // session override > global custom > UA default, but this sheet only ever
+    // subscribed to the GLOBAL pair: an agent `set_viewport` (session-scoped)
+    // left the panel rendering "Using UA default <session size>", with empty
+    // width/height fields and the Default radio selected. Subscribe to both and
+    // derive the effective pair with the pool's own priority (both components
+    // must be > 0 for a source to win — mirroring resolvedViewportSize()).
     val customWidthFromPool by tabPool.customViewportWidth.collectAsState()
     val customHeightFromPool by tabPool.customViewportHeight.collectAsState()
-    var viewportWidthText by remember(customWidthFromPool) {
-        mutableStateOf(if (customWidthFromPool > 0) customWidthFromPool.toString() else "")
+    val sessionWidthFromPool by tabPool.sessionViewportWidth.collectAsState()
+    val sessionHeightFromPool by tabPool.sessionViewportHeight.collectAsState()
+    val sessionViewportActive = sessionWidthFromPool > 0 && sessionHeightFromPool > 0
+    val customViewportActive = customWidthFromPool > 0 && customHeightFromPool > 0
+    val effectiveWidthFromPool = when {
+        sessionViewportActive -> sessionWidthFromPool
+        customViewportActive -> customWidthFromPool
+        else -> 0
     }
-    var viewportHeightText by remember(customHeightFromPool) {
-        mutableStateOf(if (customHeightFromPool > 0) customHeightFromPool.toString() else "")
+    val effectiveHeightFromPool = when {
+        sessionViewportActive -> sessionHeightFromPool
+        customViewportActive -> customHeightFromPool
+        else -> 0
     }
-    val isCustomViewportActive = customWidthFromPool > 0 && customHeightFromPool > 0
+    var viewportWidthText by remember(effectiveWidthFromPool) {
+        mutableStateOf(if (effectiveWidthFromPool > 0) effectiveWidthFromPool.toString() else "")
+    }
+    var viewportHeightText by remember(effectiveHeightFromPool) {
+        mutableStateOf(if (effectiveHeightFromPool > 0) effectiveHeightFromPool.toString() else "")
+    }
+    val isCustomViewportActive = effectiveWidthFromPool > 0 && effectiveHeightFromPool > 0
     // Bug 1: decouple radio selection from pool state. The radio reflects what the
     // user picked *in the sheet*; Apply (or a preset tap) is what writes to the
     // pool. Without this, tapping Custom with empty width/height fields was a
@@ -111,7 +133,9 @@ fun BrowserSettingsSheet(
     var viewportMode by remember(isCustomViewportActive) {
         mutableStateOf(if (isCustomViewportActive) ViewportMode.CUSTOM else ViewportMode.DEFAULT)
     }
-    var showCustomViewportEditor by remember { mutableStateOf(isCustomViewportActive) }
+    var showCustomViewportEditor by remember(isCustomViewportActive) {
+        mutableStateOf(isCustomViewportActive)
+    }
 
     // Cookie filter (mirrors iOS `.searchable("Filter by domain")`).
     var cookieFilterText by remember { mutableStateOf("") }
@@ -239,10 +263,18 @@ fun BrowserSettingsSheet(
                 showEditor = showCustomViewportEditor,
                 onWidthChange = { viewportWidthText = it.filter { ch -> ch.isDigit() }.take(5) },
                 onHeightChange = { viewportHeightText = it.filter { ch -> ch.isDigit() }.take(5) },
+                // [da1029-E] Every action here writes the GLOBAL viewport, but a
+                // session override shadows it — so without clearing the session
+                // pair first, "Default" left the tabs at the agent's
+                // set_viewport size and the panel kept reporting it as custom
+                // (the actions looked like no-ops). Clear the session override
+                // before writing the global value, so the resolved viewport is
+                // the one the user just picked.
                 onSelectDefault = {
                     viewportMode = ViewportMode.DEFAULT
                     AppLogger.info("BrowserSettings", "viewportMode → DEFAULT")
                     coroutineScope.launch {
+                        tabPool.resetSessionViewport()
                         tabPool.setGlobalViewport(0, 0)
                         AppLogger.info("BrowserSettings", "viewport set to UA default")
                     }
@@ -258,6 +290,7 @@ fun BrowserSettingsSheet(
                     val h = viewportHeightText.toIntOrNull()
                     if (w != null && h != null && w > 0 && h > 0) {
                         coroutineScope.launch {
+                            tabPool.resetSessionViewport()
                             tabPool.setGlobalViewport(w.coerceIn(VIEWPORT_MIN, VIEWPORT_MAX), h.coerceIn(VIEWPORT_MIN, VIEWPORT_MAX))
                             AppLogger.info("BrowserSettings", "viewport set to ${w}x$h (custom)")
                         }
@@ -273,6 +306,7 @@ fun BrowserSettingsSheet(
                         viewportHeightText = ch.toString()
                         viewportMode = ViewportMode.CUSTOM
                         coroutineScope.launch {
+                            tabPool.resetSessionViewport()
                             tabPool.setGlobalViewport(cw, ch)
                             AppLogger.info("BrowserSettings", "viewport applied ${cw}x$ch")
                         }
@@ -283,6 +317,7 @@ fun BrowserSettingsSheet(
                     viewportHeightText = h.toString()
                     viewportMode = ViewportMode.CUSTOM
                     coroutineScope.launch {
+                        tabPool.resetSessionViewport()
                         tabPool.setGlobalViewport(w, h)
                         AppLogger.info("BrowserSettings", "viewport preset ${w}x$h")
                     }
