@@ -527,7 +527,10 @@ private fun FullscreenVideoContent(file: File, onDismiss: () -> Unit) {
                     },
                     onDragEnd = {
                         if (dragOffsetPx > dismissThresholdPx * 0.5f) {
-                            try { videoView?.pause() } catch (_: Throwable) {}
+                            // [da1027-F] Dismissal is a terminating path, not a
+                            // pause: release the track so the codec/handles do
+                            // not outlive the dialog (pause() left them live).
+                            try { videoView?.stopPlayback() } catch (_: Throwable) {}
                             onDismiss()
                         } else {
                             dragOffsetPx = 0f
@@ -559,6 +562,18 @@ private fun FullscreenVideoContent(file: File, onDismiss: () -> Unit) {
                     }
                     videoView = this
                 }
+            },
+            // [da1027-F] Terminating path for the fullscreen player — covers
+            // back-key/gesture/dialog dimiss, not just the close button. All
+            // three exits funnel through `onDismiss()` -> the caller's holder
+            // (`previewVideoFile` / `showPlayer`) goes null -> this composable
+            // leaves composition -> the view is released here. Without it the
+            // MediaPlayer and its hardware codec/AudioTrack handles stayed
+            // registered after the dialog closed, so audio could keep playing
+            // for a moment and the native player leaked until GC.
+            onRelease = { view ->
+                try { view.stopPlayback() } catch (_: Throwable) {}
+                if (videoView === view) videoView = null
             },
             modifier = Modifier
                 .fillMaxSize()
@@ -594,7 +609,10 @@ private fun FullscreenVideoContent(file: File, onDismiss: () -> Unit) {
                     icon = Icons.Default.Close,
                     contentDescription = stringResource(R.string.common_close),
                     onClick = {
-                        try { videoView?.pause() } catch (_: Throwable) {}
+                        // [da1027-F] Close is a terminating path: release the
+                        // player instead of pausing it (pause kept the codec
+                        // and audio handles alive past the dialog).
+                        try { videoView?.stopPlayback() } catch (_: Throwable) {}
                         onDismiss()
                     },
                 )
