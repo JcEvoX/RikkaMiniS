@@ -52,8 +52,16 @@ object AppLogger {
     private fun dateStampFor(epochMillis: Long): String =
         Instant.ofEpochMilli(epochMillis).atZone(ZoneId.systemDefault()).toLocalDate().format(dateFormat)
 
-    private const val PREF_NAME = "logging_prefs"
-    private const val KEY_ENABLED = "logging_enabled"
+    // [da1028-B / ISSUE-04] `internal`, not private: the Settings → Logs screen
+    // registers an OnSharedPreferenceChangeListener against this same prefs
+    // file so a `minis-config set logs.enabled …` / backup-restore write is
+    // reflected in the switch instead of leaving it on the value captured at
+    // open time. A screen that must name the key has to reference one
+    // declaration — the private form forces a second string copy in the UI and
+    // that is precisely how the F-239 key-name drift started (same principle
+    // chat_menu_prefs_listener_check arm 4 enforces for ChatMenuPrefs).
+    internal const val PREF_NAME = "logging_prefs"
+    internal const val KEY_ENABLED = "logging_enabled"
 
     private var logDir: File? = null
     private var currentDate: String = ""

@@ -23,6 +23,24 @@ Arms:
      (the screen references them — a private revert forces a second string
      copy in the UI, the same-family recurrence shape).
 
+[da1028-B / ISSUE-04] Five more arms for the two stale-write screens (only
+judged when the caller supplies their sources; the legacy two-file fixtures
+leave them out):
+  5. SoulStore declares `writeVersion` and `save()` bumps it — Settings → Soul
+     keys its reload on it, so without the bump an external write leaves the
+     editors stale and the next Save rolls that write back;
+  6. SoulStore's `refreshCache()` bumps it too — that is the documented entry
+     point for "SOUL.md was rewritten outside save()" (the chat memory sheet
+     calls it right after its raw saveFile write);
+  7. SoulSettingsScreen loads in a `LaunchedEffect` keyed on `writeVersion`
+     and that effect re-reads the file (a `LaunchedEffect(Unit)` load is the
+     pre-fix shape this arm exists to reject);
+  8. LogManagementScreen registers an OnSharedPreferenceChangeListener for
+     `logs.enabled` through AppLogger's constants (no re-typed literal) and
+     unregisters it on dispose — the unregister half is required, not optional;
+  9. anchors missing (store member / effect / listener block) -> red, never a
+     silent skip.
+
 Judgements are made on comment-stripped code (comment anchors rot); raw text
 is also accepted for arm 1 so a string-literal form is not silently missed.
 """
@@ -35,6 +53,10 @@ ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
 
 SCREEN_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/ChatMenuSettingsScreen.kt"
 PREFS_REL = "src/android/app/src/main/java/com/rikkaminis/app/config/ChatMenuPrefs.kt"
+# [da1028-B / ISSUE-04] stale-write surfaces
+SOUL_STORE_REL = "src/android/app/src/main/java/com/rikkaminis/app/agent/SoulStore.kt"
+SOUL_SCREEN_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/SoulSettingsScreen.kt"
+LOG_SCREEN_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/LogManagementScreen.kt"
 
 MARKER = "CHAT_MENU_PREFS_LISTENER_SELFTEST=PASS"
 
@@ -122,13 +144,148 @@ def guarded_reads(body: str) -> bool:
     return all(r in inner for r in ORDER_READS)
 
 
-def check_arms(screen_text: str, prefs_text: str):
-    """Return (problems, ok_summary). Four arms, judge on stripped code."""
+def brace_body(clean: str, header_re: str) -> str:
+    """Brace-matched body of the first member whose header matches header_re.
+    Empty string when the header is absent (callers fail closed on "")."""
+    m = re.search(header_re, clean)
+    if not m:
+        return ""
+    brace = clean.find("{", m.end())
+    if brace < 0:
+        return ""
+    depth, i, n = 1, brace + 1, len(clean)
+    while i < n and depth:
+        if clean[i] == "{":
+            depth += 1
+        elif clean[i] == "}":
+            depth -= 1
+        i += 1
+    return clean[brace:i]
+
+
+def check_stale_write_arms(soul_store_text: str, soul_screen_text: str,
+                           log_screen_text: str):
+    """[da1028-B / ISSUE-04] arms 5-8 (see module docstring). Only called when
+    the caller supplied the three sources."""
+    problems = []
+
+    # ---- arm 5/6: the store's write counter ------------------------------
+    store = strip_comments_and_strings(soul_store_text)
+    if not re.search(r"\bval\s+writeVersion\b", store) or "_writeVersion" not in store:
+        problems.append(
+            "arm5: SoulStore exposes no writeVersion StateFlow -- outside writers "
+            "(minis-config / restore / the chat memory sheet) have no way to tell "
+            "Settings → Soul that the file changed"
+        )
+    else:
+        save_body = brace_body(store, r"\bfun\s+save\s*\(\s*context\s*:")
+        if not save_body:
+            problems.append(
+                "arm5: SoulStore.save(…) body not found -- re-point this guard"
+            )
+        elif not re.search(r"_writeVersion\.value\s*(\+=\s*1|\+\+|=\s*[^=])", save_body):
+            problems.append(
+                "arm5: SoulStore.save(…) no longer bumps _writeVersion -- every "
+                "external write becomes invisible to the Soul editors, so the "
+                "next Save silently rolls it back"
+            )
+        refresh_body = brace_body(store, r"\bfun\s+refreshCache\s*\(")
+        if not refresh_body:
+            problems.append(
+                "arm6: SoulStore.refreshCache(…) body not found -- re-point this guard"
+            )
+        elif not re.search(r"_writeVersion\.value\s*(\+=\s*1|\+\+|=\s*[^=])", refresh_body):
+            problems.append(
+                "arm6: SoulStore.refreshCache(…) no longer bumps _writeVersion -- "
+                "the documented \"rewritten outside save()\" path (the chat memory "
+                "sheet's raw saveFile) stops notifying the editors"
+            )
+
+    # ---- arm 7: the Soul screen re-loads on that counter ------------------
+    soul_clean = strip_comments_and_strings(soul_screen_text)
+    if "writeVersion" not in soul_clean:
+        problems.append(
+            "arm7: SoulSettingsScreen does not observe SoulStore.writeVersion -- "
+            "it loads once and then keeps editing a snapshot of the file it read "
+            "at open time"
+        )
+    else:
+        keyed = None
+        for m in re.finditer(r"\bLaunchedEffect\s*\(", soul_clean):
+            open_paren = soul_clean.find("(", m.start())
+            depth, i, n = 1, open_paren + 1, len(soul_clean)
+            while i < n and depth:
+                if soul_clean[i] == "(":
+                    depth += 1
+                elif soul_clean[i] == ")":
+                    depth -= 1
+                i += 1
+            if "writeVersion" in soul_clean[open_paren:i]:
+                keyed = i
+                break
+        if keyed is None:
+            problems.append(
+                "arm7: no LaunchedEffect keyed on writeVersion in "
+                "SoulSettingsScreen -- the reload path is not wired to the counter"
+            )
+        else:
+            body = brace_body(soul_clean[keyed:], r"\s*")
+            if "SoulStore.load(" not in body:
+                problems.append(
+                    "arm7: the writeVersion-keyed effect does not re-read the file "
+                    "(no SoulStore.load( inside it) -- re-point this guard if the "
+                    "reload moved into a helper"
+                )
+
+    # ---- arm 8: the Logs screen listener ---------------------------------
+    body, raw_body = listener_body(log_screen_text)
+    if not body:
+        problems.append(
+            "arm8: LogManagementScreen has no DisposableEffect registering an "
+            "OnSharedPreferenceChangeListener -- `minis-config set logs.enabled …` "
+            "or a restore leaves the Switch on the value captured at open time"
+        )
+    else:
+        if ".unregisterOnSharedPreferenceChangeListener" not in body:
+            problems.append(
+                "arm8: the logs listener is never unregistered on dispose -- "
+                "the prefs file is process-scoped, so the callback outlives the "
+                "screen and leaks its composition scope"
+            )
+        if "AppLogger.PREF_NAME" not in body or "AppLogger.KEY_ENABLED" not in body:
+            problems.append(
+                "arm8: the logs listener does not go through AppLogger.PREF_NAME / "
+                "AppLogger.KEY_ENABLED -- a re-typed prefs/key literal drifts out "
+                "of AppLogger silently (the F-239 key-name shape)"
+            )
+        elif '"logging_prefs"' in raw_body:
+            problems.append(
+                'arm8: the logs listener re-spells the prefs name literal '
+                '"logging_prefs" instead of AppLogger.PREF_NAME'
+            )
+
+    return problems
+
+
+def check_arms(screen_text: str, prefs_text: str,
+               soul_store_text: str = None,
+               soul_screen_text: str = None,
+               log_screen_text: str = None):
+    """Return (problems, ok_summary). Four + five arms, judge on stripped code.
+
+    Arms 5-8 are judged only when the corresponding source is supplied: the
+    legacy two-file fixtures predate them, the real-tree call always passes
+    all three (and main() fails closed when a file is missing).
+    """
     problems = []
     body, raw_body = listener_body(screen_text)
     if not body:
-        return ["could not locate the DisposableEffect listener block in "
-                + SCREEN_REL + " -- the registration call may have moved"], []
+        problems.append("could not locate the DisposableEffect listener block in "
+                        + SCREEN_REL + " -- the registration call may have moved")
+        if soul_store_text is not None or soul_screen_text is not None or log_screen_text is not None:
+            problems.extend(check_stale_write_arms(
+                soul_store_text or "", soul_screen_text or "", log_screen_text or ""))
+        return problems, []
 
     # arm 1: predicate matches both fixed keys (constant name in stripped
     # code, or raw key string in case a literal form is used) -- both judged
@@ -179,6 +336,11 @@ def check_arms(screen_text: str, prefs_text: str):
                 "the screen cannot reference it and will drift to a second "
                 "string copy (same-family recurrence shape)"
             )
+
+    # arms 5-8: the two stale-write screens ([da1028-B / ISSUE-04])
+    if soul_store_text is not None or soul_screen_text is not None or log_screen_text is not None:
+        problems.extend(check_stale_write_arms(
+            soul_store_text or "", soul_screen_text or "", log_screen_text or ""))
 
     return problems, []
 
@@ -261,6 +423,95 @@ object ChatMenuPrefs {
         ok = False
     else:
         print("  selftest no-listener: RED (expect RED) ok")
+
+    # ── arms 5-8 fixtures ([da1028-B / ISSUE-04]) ──────────────────────────
+    COMPLIANT_STORE = '''
+object SoulStore {
+    private val _writeVersion = MutableStateFlow(0L)
+    val writeVersion: StateFlow<Long> = _writeVersion.asStateFlow()
+
+    fun refreshCache(context: Context) {
+        val parsed = load(context)
+        _cachedMetadata.value = parsed?.metadata ?: SoulMetadata.DEFAULT
+        _writeVersion.value += 1
+    }
+
+    fun save(context: Context, file: SoulFile) {
+        context.filesDir.resolve("SOUL.md").writeText(render(file))
+        _cachedMetadata.value = file.metadata
+        _writeVersion.value += 1
+    }
+}
+'''
+    COMPLIANT_SOUL_SCREEN = '''
+@Composable
+fun SoulSettingsScreen(onBack: () -> Unit) {
+    val writeVersion by SoulStore.writeVersion.collectAsState()
+    var loaded by remember { mutableStateOf(false) }
+    LaunchedEffect(writeVersion) {
+        val parsed = SoulStore.load(context) ?: SoulFile.defaults()
+        loaded = true
+    }
+}
+'''
+    COMPLIANT_LOG_SCREEN = '''
+@Composable
+fun LogManagementScreen(context: Context) {
+    var loggingEnabled by remember { mutableStateOf(AppLogger.isEnabled(context)) }
+    DisposableEffect(context) {
+        val prefs = context.applicationContext.getSharedPreferences(
+            AppLogger.PREF_NAME,
+            Context.MODE_PRIVATE,
+        )
+        val listener =
+            android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+                if (key == AppLogger.KEY_ENABLED) {
+                    loggingEnabled = AppLogger.isEnabled(context)
+                }
+            }
+        prefs.registerOnSharedPreferenceChangeListener(listener)
+        onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }
+    }
+}
+'''
+    S5_STORE = COMPLIANT_STORE.replace(
+        "        _cachedMetadata.value = file.metadata\n        _writeVersion.value += 1",
+        "        _cachedMetadata.value = file.metadata")
+    S6_STORE = COMPLIANT_STORE.replace(
+        """        _cachedMetadata.value = parsed?.metadata ?: SoulMetadata.DEFAULT
+        _writeVersion.value += 1""",
+        "        _cachedMetadata.value = parsed?.metadata ?: SoulMetadata.DEFAULT")
+    S7_SCREEN = COMPLIANT_SOUL_SCREEN.replace("LaunchedEffect(writeVersion)", "LaunchedEffect(Unit)")
+    S8A_SCREEN = COMPLIANT_LOG_SCREEN.replace(
+        "        onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }\n", "")
+    S8B_SCREEN = COMPLIANT_LOG_SCREEN.replace("AppLogger.PREF_NAME", '"logging_prefs"')
+    S8C_SCREEN = COMPLIANT_LOG_SCREEN
+
+    def arm(name, want, s_store, s_screen, l_screen):
+        problems, _ = check_arms(COMPLIANT_SCREEN, COMPLIANT_PREFS, s_store, s_screen, l_screen)
+        red = len(problems) > 0
+        mark = "ok" if red == bool(want) else "FAIL"
+        print(f"  selftest arm5-8 {name}: {'RED' if red else 'GREEN'} "
+              f"(expect {'RED' if want else 'GREEN'}) {mark}")
+        for p in problems:
+            print(f"      - {p}")
+        return mark == "ok"
+
+    ok &= arm("compliant stale-write surfaces", 0,
+              COMPLIANT_STORE, COMPLIANT_SOUL_SCREEN, COMPLIANT_LOG_SCREEN)
+    ok &= arm("arm5 save() stops bumping writeVersion", 1,
+              S5_STORE, COMPLIANT_SOUL_SCREEN, COMPLIANT_LOG_SCREEN)
+    ok &= arm("arm6 refreshCache() stops bumping writeVersion", 1,
+              S6_STORE, COMPLIANT_SOUL_SCREEN, COMPLIANT_LOG_SCREEN)
+    ok &= arm("arm7 soul screen loads once (LaunchedEffect(Unit))", 1,
+              COMPLIANT_STORE, S7_SCREEN, COMPLIANT_LOG_SCREEN)
+    ok &= arm("arm8a listener never unregistered", 1,
+              COMPLIANT_STORE, COMPLIANT_SOUL_SCREEN, S8A_SCREEN)
+    ok &= arm("arm8b prefs name re-spelled as a literal", 1,
+              COMPLIANT_STORE, COMPLIANT_SOUL_SCREEN, S8B_SCREEN)
+    ok &= arm("arm8c listener block absent (fail-closed)", 1,
+              COMPLIANT_STORE, COMPLIANT_SOUL_SCREEN, S8C_SCREEN.replace(
+                  "DisposableEffect(context) {", "if (true) {"))
     return ok
 
 
@@ -275,22 +526,30 @@ def main() -> int:
 
     screen_path = ROOT / SCREEN_REL
     prefs_path = ROOT / PREFS_REL
-    if not screen_path.exists():
-        print(f"FAIL: missing {SCREEN_REL}")
-        return 1
-    if not prefs_path.exists():
-        print(f"FAIL: missing {PREFS_REL}")
-        return 1
+    soul_store_path = ROOT / SOUL_STORE_REL
+    soul_screen_path = ROOT / SOUL_SCREEN_REL
+    log_screen_path = ROOT / LOG_SCREEN_REL
+    for rel, p in ((SCREEN_REL, screen_path), (PREFS_REL, prefs_path),
+                   (SOUL_STORE_REL, soul_store_path),
+                   (SOUL_SCREEN_REL, soul_screen_path),
+                   (LOG_SCREEN_REL, log_screen_path)):
+        if not p.exists():
+            print(f"FAIL: missing {rel}")
+            return 1
     problems, _ = check_arms(screen_path.read_text(encoding="utf-8", errors="replace"),
-                             prefs_path.read_text(encoding="utf-8", errors="replace"))
+                             prefs_path.read_text(encoding="utf-8", errors="replace"),
+                             soul_store_path.read_text(encoding="utf-8", errors="replace"),
+                             soul_screen_path.read_text(encoding="utf-8", errors="replace"),
+                             log_screen_path.read_text(encoding="utf-8", errors="replace"))
     if problems:
-        print("FAIL: chat menu settings listener gaps")
+        print("FAIL: settings listener / stale-write gaps")
         for p in problems:
             print(f"  - {p}")
         return 1
     print("OK: chat menu prefs listener matches both fixed keys, "
           "re-reads all three orders inside the draggingEntry guard, "
-          "and both key constants are non-private (2 sites checked)")
+          "both key constants are non-private, and both stale-write screens "
+          "re-seed on external writes (7 sites checked)")
     return 0
 
 

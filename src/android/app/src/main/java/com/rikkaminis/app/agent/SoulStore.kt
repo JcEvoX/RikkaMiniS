@@ -422,6 +422,13 @@ lang: "auto"
             tmp.delete()
         }
         _cachedMetadata.value = file.metadata
+        // [da1028-B / ISSUE-04] Signal for UI surfaces that hold an editable
+        // copy of what is on disk. `cachedMetadata` cannot serve as that
+        // signal: StateFlow de-duplicates equal values, so a body-only rewrite
+        // (the common `minis-config set soul.body …`) leaves the metadata
+        // identical and never emits. A monotonic counter emits on every write
+        // regardless of what changed.
+        _writeVersion.value += 1
     }
 
     /**
@@ -434,6 +441,23 @@ lang: "auto"
     val cachedMetadata: StateFlow<SoulMetadata> = _cachedMetadata.asStateFlow()
 
     /**
+     * [da1028-B / ISSUE-04] Monotonic counter bumped on every rewrite of
+     * SOUL.md. Settings → Soul keys its load on this so an external write
+     * (minis-config behind the confirm sheet, a backup-restore, the chat
+     * memory sheet's SOUL.md editor) re-seeds the editors instead of leaving
+     * the screen on the values it read at open time — the user's next Save
+     * would otherwise write that stale snapshot straight back over the
+     * external change (the 1026-A / 1027-E silent-rollback family).
+     *
+     * Bumped from [save] *and* [refreshCache]: the latter is the documented
+     * entry point for "the file was rewritten outside [save]" (the chat
+     * memory sheet calls it right after its raw `saveFile`), so a rewrite
+     * that notifies the metadata cache must notify this too.
+     */
+    private val _writeVersion = MutableStateFlow(0L)
+    val writeVersion: StateFlow<Long> = _writeVersion.asStateFlow()
+
+    /**
      * Re-read SOUL.md into [cachedMetadata]. Call once at app launch
      * (after [ensureExists]) and any time the file is rewritten outside
      * of [save] (currently only the Settings UI uses save()).
@@ -441,6 +465,7 @@ lang: "auto"
     fun refreshCache(context: Context) {
         val parsed = load(context)
         _cachedMetadata.value = parsed?.metadata ?: SoulMetadata.DEFAULT
+        _writeVersion.value += 1
     }
 }
 
