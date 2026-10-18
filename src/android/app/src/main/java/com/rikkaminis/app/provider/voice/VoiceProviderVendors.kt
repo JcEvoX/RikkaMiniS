@@ -332,7 +332,14 @@ class XunfeiVoiceProvider(
                 cw.optJSONObject(j)?.optString("w")?.let { sb.append(it) }
             }
         }
-        return VoiceInputResponse(text = sb.toString(), language = request.language)
+        // [da1027 ISSUE-04] Guard the ASSEMBLED transcript, not just the Base64
+        // envelope above: a decodable payload whose `ws` set carries no words
+        // assembled to "" and was still returned as a successful result, which
+        // the consumer pins sticky + NO_MATCH forever and never advances the
+        // fail-over chain. Same shape as Doubao/Deepgram.
+        val transcript = sb.toString().takeIf { it.isNotEmpty() }
+            ?: throw VoiceProviderException.Parse("Unexpected Xunfei ASR response format")
+        return VoiceInputResponse(text = transcript, language = request.language)
     }
 
     /**

@@ -22,6 +22,15 @@ Arms (judged on comment/string-stripped code; anchors are code shapes):
      ... }` sits INSIDE a synchronized(lock) block.
   4. stop(): `sessions.remove(sessionId)` sits INSIDE a synchronized(lock)
      block (atomic with the release against a racing play()).
+  5. (da1027-F) `ui/media/InlineMediaPlayer.kt`, when that file is present:
+     every `AndroidView(...)` call must carry an `onRelease` that calls
+     `stopPlayback()` (5a), the block that hoists the view into a state
+     (`videoView = this`) must also clear that reference in its `onRelease`
+     (5b), and every dismissal call site `onDismiss()` must sit in a block
+     that calls `stopPlayback()` -- i.e. dismissing is a terminating path,
+     not a bare `pause()` (5c). Anchors are fail-closed: 0 AndroidView
+     blocks / 0 onDismiss() sites => RED. A mini-tree fixture that lacks the
+     file is skipped (drift detector, not a target).
 """
 import re
 import sys
@@ -30,6 +39,10 @@ from pathlib import Path
 ROOT = Path(sys.argv[1] if len(sys.argv) > 1 else ".")
 
 TARGET_REL = "src/android/app/src/main/java/com/rikkaminis/app/offload/MediaPlayerManager.kt"
+
+INLINE_PLAYER_REL = (
+    "src/android/app/src/main/java/com/rikkaminis/app/ui/media/InlineMediaPlayer.kt"
+)
 
 MARKER = "MEDIAPLAYER_RELEASE_SELFTEST=PASS"
 
@@ -207,6 +220,90 @@ def check_arms(clean: str):
     return problems
 
 
+def android_view_blocks(clean: str):
+    """(start, end) spans of every `AndroidView(` argument list (paren-matched)."""
+    spans = []
+    n = len(clean)
+    for m in re.finditer(r"\bAndroidView\s*\(", clean):
+        open_idx = clean.find("(", m.start())
+        depth, i = 1, open_idx + 1
+        while i < n and depth:
+            if clean[i] == "(":
+                depth += 1
+            elif clean[i] == ")":
+                depth -= 1
+            i += 1
+        spans.append((open_idx, i))
+    return spans
+
+
+def enclosing_block(clean: str, idx: int):
+    """Smallest brace span containing idx, or None. Strings/comments must
+    already be stripped so brace_span's counting is exact."""
+    best = None
+    for pos, c in enumerate(clean):
+        if c != "{":
+            continue
+        start, end = brace_span(clean, pos)
+        if start < idx < end and (best is None or (end - start) < (best[1] - best[0])):
+            best = (start, end)
+    return best
+
+
+def check_inline_player(clean):
+    """Arm 5 (da1027-F). `clean` = comment/string-stripped InlineMediaPlayer.kt,
+    or None when the file is absent (mini-tree fixture -> skip)."""
+    problems = []
+    if clean is None:
+        return problems
+
+    blocks = android_view_blocks(clean)
+    if not blocks:
+        problems.append(
+            "arm5a: found 0 `AndroidView(` call sites in InlineMediaPlayer.kt -- the "
+            "anchor is fail-closed; re-point this guard (both the inline player and "
+            "the fullscreen player are hosted by AndroidView)")
+    for start, end in blocks:
+        block = clean[start:end]
+        if not re.search(r"\bonRelease\s*=", block):
+            problems.append(
+                "arm5a: AndroidView at offset %d has no `onRelease =` -- the view is "
+                "never released when it leaves composition, so the MediaPlayer and "
+                "its hardware codec/AudioTrack handles stay registered until GC"
+                % start)
+        elif not re.search(r"\bstopPlayback\s*\(", block):
+            problems.append(
+                "arm5a: AndroidView at offset %d has an `onRelease` that never calls "
+                "`stopPlayback()` -- release must stop the track, not just hide the "
+                "controller window" % start)
+        if re.search(r"\bvideoView\s*=\s*this\b", block):
+            # The fullscreen player hoists the view into state that the position
+            # poll and the play/pause button read back.
+            if not re.search(r"\bvideoView\s*=\s*null\b", block):
+                problems.append(
+                    "arm5b: AndroidView at offset %d hoists `videoView = this` but its "
+                    "`onRelease` never clears the reference (`videoView = null`) -- the "
+                    "released view stays reachable and the position poll keeps touching "
+                    "a stopped player" % start)
+
+    sites = [m.start() for m in re.finditer(r"\bonDismiss\s*\(\s*\)", clean)]
+    if not sites:
+        problems.append(
+            "arm5c: found 0 `onDismiss()` call sites in InlineMediaPlayer.kt -- the "
+            "anchor is fail-closed; re-point this guard (every dismissal branch must "
+            "terminate the player)")
+    for idx in sites:
+        span = enclosing_block(clean, idx)
+        if span is None or not re.search(r"\bstopPlayback\s*\(", clean[span[0]:span[1]]):
+            problems.append(
+                "arm5c: the block containing `onDismiss()` at offset %d does not call "
+                "`stopPlayback()` -- dismissing the fullscreen player is a terminating "
+                "path, not a pause (the back-key branch reaches the same release only "
+                "through onRelease, so a bare pause() there leaks the native player "
+                "and lets audio outlive the dialog)" % idx)
+    return problems
+
+
 def run_selftest() -> bool:
     COMPLIANT = '''
 object MediaPlayerManager {
@@ -304,6 +401,141 @@ object MediaPlayerManager {
         ok = False
     else:
         print("  selftest no-releaseSession: RED (expect RED) ok")
+
+    ok = run_inline_player_selftest() and ok
+    return ok
+
+
+def run_inline_player_selftest() -> bool:
+    """Arm 5 fixtures (da1027-F). Each dirty case must go red AND the expected
+    sub-arm must be the one that fires."""
+    COMPLIANT = '''
+@Composable
+fun InlineVideoPlayer(filePath: String, modifier: Modifier = Modifier) {
+    Surface(modifier = modifier) {
+        androidx.compose.ui.viewinterop.AndroidView(
+            factory = { ctx ->
+                android.widget.VideoView(ctx).apply {
+                    setVideoURI(Uri.parse(filePath))
+                }
+            },
+            onRelease = { view ->
+                mediaController.hide()
+                view.stopPlayback()
+            },
+            modifier = Modifier.fillMaxWidth(),
+        )
+    }
+}
+
+@Composable
+fun MinisFullscreenVideoPlayer(file: File, onDismiss: () -> Unit) {
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(),
+    ) {
+        FullscreenVideoContent(file = file, onDismiss = onDismiss)
+    }
+}
+
+@Composable
+private fun FullscreenVideoContent(file: File, onDismiss: () -> Unit) {
+    var videoView by remember { mutableStateOf<android.widget.VideoView?>(null) }
+    Box(
+        modifier = Modifier.pointerInput(Unit) {
+            detectVerticalDragGestures(
+                onDragEnd = {
+                    if (dragOffsetPx > dismissThresholdPx * 0.5f) {
+                        try { videoView?.stopPlayback() } catch (_: Throwable) {}
+                        onDismiss()
+                    } else {
+                        dragOffsetPx = 0f
+                    }
+                },
+            )
+        },
+    ) {
+        androidx.compose.ui.viewinterop.AndroidView(
+            factory = { ctx ->
+                android.widget.VideoView(ctx).apply {
+                    setVideoURI(Uri.fromFile(file))
+                    videoView = this
+                }
+            },
+            onRelease = { view ->
+                try { view.stopPlayback() } catch (_: Throwable) {}
+                if (videoView === view) videoView = null
+            },
+            modifier = Modifier.fillMaxSize(),
+        )
+        CircleControlButton(
+            icon = Icons.Default.Close,
+            onClick = {
+                try { videoView?.stopPlayback() } catch (_: Throwable) {}
+                onDismiss()
+            },
+        )
+    }
+}
+'''
+    FULLSCREEN_ONRELEASE = '''            onRelease = { view ->
+                try { view.stopPlayback() } catch (_: Throwable) {}
+                if (videoView === view) videoView = null
+            },
+'''
+    GESTURE_STOP = ('                        try { videoView?.stopPlayback() } '
+                    'catch (_: Throwable) {}\n                        onDismiss()')
+    CLOSE_STOP = ('                try { videoView?.stopPlayback() } '
+                  'catch (_: Throwable) {}\n                onDismiss()')
+
+    M5 = COMPLIANT.replace(FULLSCREEN_ONRELEASE, "")
+    M6 = COMPLIANT.replace(
+        "                if (videoView === view) videoView = null\n",
+        "                view.setBackgroundColor(0)\n")
+    M7 = COMPLIANT.replace(GESTURE_STOP, GESTURE_STOP.replace("stopPlayback", "pause"))
+    M8 = COMPLIANT.replace(CLOSE_STOP, CLOSE_STOP.replace("stopPlayback", "pause"))
+    M9 = COMPLIANT.replace("androidx.compose.ui.viewinterop.AndroidView(", "VideoSurface(")
+    M10 = COMPLIANT.replace("            onDismiss()\n", "")
+    M11 = COMPLIANT.replace("view ->", "view ->").replace(
+        "                view.stopPlayback()\n", "")
+
+    cases = [
+        ("arm5 compliant", COMPLIANT, None),
+        ("arm5a M5 no onRelease on fullscreen block", M5, "arm5a"),
+        ("arm5b M6 onRelease does not clear the hoisted ref", M6, "arm5b"),
+        ("arm5c M7 gesture back to pause()", M7, "arm5c"),
+        ("arm5c M8 close button back to pause()", M8, "arm5c"),
+        ("arm5a M9 no AndroidView at all (fail-closed anchor)", M9, "arm5a"),
+        ("arm5c M10 no onDismiss() site (fail-closed anchor)", M10, "arm5c"),
+        ("arm5a M11 inline onRelease stops releasing", M11, "arm5a"),
+    ]
+    ok = True
+    for name, src, want_key in cases:
+        problems = check_inline_player(strip_comments_and_strings(src))
+        red = len(problems) > 0
+        if want_key is None:
+            mark = "ok" if not red else "FAIL"
+            print(f"  selftest {name}: {'RED' if red else 'GREEN'} "
+                  f"(expect GREEN) {mark}")
+            if red:
+                ok = False
+        else:
+            fired = any(p.startswith(want_key) for p in problems)
+            mark = "ok" if (red and fired) else "FAIL"
+            print(f"  selftest {name}: {'RED' if red else 'GREEN'} "
+                  f"(expect RED via {want_key}) {mark}")
+            if not (red and fired):
+                ok = False
+        for p in problems:
+            print(f"      - {p}")
+
+    # mini-tree fixture: InlineMediaPlayer.kt absent -> judgement skipped
+    if check_inline_player(None):
+        print("  selftest arm5 mini tree (no InlineMediaPlayer.kt): expected "
+              "GREEN (skipped), got RED -- FAIL")
+        ok = False
+    else:
+        print("  selftest arm5 mini tree (no InlineMediaPlayer.kt): GREEN (skipped) ok")
     return ok
 
 
@@ -322,6 +554,11 @@ def main() -> int:
         return 1
     problems = check_arms(strip_comments_and_strings(
         target.read_text(encoding="utf-8", errors="replace")))
+    inline = ROOT / INLINE_PLAYER_REL
+    problems += check_inline_player(
+        strip_comments_and_strings(
+            inline.read_text(encoding="utf-8", errors="replace"))
+        if inline.exists() else None)
     if problems:
         print("FAIL: MediaPlayerManager release/lock gaps")
         for p in problems:
@@ -329,7 +566,10 @@ def main() -> int:
         return 1
     print("OK: MediaPlayerManager releases on every path (stop/release in "
           "separate try blocks), Session.state is @Volatile, and the "
-          "play()/stop() session-map mutations sit inside synchronized(lock)")
+          "play()/stop() session-map mutations sit inside synchronized(lock); "
+          "every AndroidView in InlineMediaPlayer.kt releases via "
+          "onRelease/stopPlayback and every onDismiss() branch terminates the "
+          "player")
     return 0
 
 

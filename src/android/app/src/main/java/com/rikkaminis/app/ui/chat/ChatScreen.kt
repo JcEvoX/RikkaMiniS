@@ -1699,18 +1699,47 @@ fun ChatScreen(
     // matching session; opens fullscreen HTML preview backed by a fresh
     // holder. Pending state is left untouched when a different chat is on
     // screen so the right ChatScreen instance still consumes it later.
-    LaunchedEffect(sessionId) {
-        val pending = com.rikkaminis.app.deeplink.DeepLinkCoordinator
-            .pendingHtmlPreview.value ?: return@LaunchedEffect
-        if (pending.sessionId != sessionId) return@LaunchedEffect
+    //
+    // [deep-audit-1027 ISSUE-01] Two fixes over the route-arg-only form:
+    //
+    //  1. The pending state is observed (`collectAsState`), and both the
+    //     route arg AND the live `viewModel.currentSessionId` are keys. A
+    //     draft chat keeps the `__new__<uuid>` route arg for the whole screen
+    //     lifetime even after the first send promotes it, while the pinned
+    //     shortcut stores the id that was live at pin time
+    //     (`viewModel.currentSessionId`). Matching against the route arg alone
+    //     left the pending state unconsumed forever — the shortcut silently
+    //     did nothing.
+    //  2. Resolution goes through `resolvePathForSession(activeSessionId, …)`
+    //     instead of the global `resolveHostPath`. Two reasons: (a) cold start
+    //     — the global resolver scans `minis-sessions/<id>/…` through
+    //     `bootContext`, which is still null this early, so a pinned shortcut
+    //     could never open before boot; the session-scoped resolver takes the
+    //     `Context` we already hold. (b) isolation — the global resolver picks
+    //     the FIRST existing match across every session tree, so two sessions
+    //     with a same-named `browser/index.html` could serve each other's
+    //     file. The session-scoped path is pinned to the owning session, and
+    //     paths outside the session subdirs (`shared/`, `mounts/`) still fall
+    //     through to the global resolver internally — see
+    //     `resolveSessionGuestHostPath`.
+    val pendingHtmlPreviewState by com.rikkaminis.app.deeplink.DeepLinkCoordinator
+        .pendingHtmlPreview.collectAsState()
+    LaunchedEffect(sessionId, viewModel.currentSessionId, pendingHtmlPreviewState) {
+        val pending = pendingHtmlPreviewState ?: return@LaunchedEffect
+        val activeSessionId = ChatViewModelStore.resolveSessionId(viewModel.currentSessionId)
+        if (pending.sessionId != sessionId && pending.sessionId != activeSessionId) {
+            return@LaunchedEffect
+        }
         com.rikkaminis.app.deeplink.DeepLinkCoordinator.consumePendingHtmlPreview()
-        // Resolve through PRootKernel so dot-segments / separators can never
-        // escape the `/var/minis` sandbox into an arbitrary host path — the
-        // preview WebView serves from the host file, so we must hand it the
-        // normalized host File rather than naively concatenating the raw
-        // resource path onto `/var/minis`.
-        val file = com.rikkaminis.app.sandbox.PRootKernel.resolveHostPath(
-            "/var/minis${pending.resourcePath}"
+        // Dot-segments / separators can never escape the `/var/minis` sandbox
+        // into an arbitrary host path: the resolver normalizes the guest path
+        // and containment-checks it against the session tree (or a bind mount
+        // for the shared dirs) before handing back the host File the preview
+        // WebView serves from.
+        val file = com.rikkaminis.app.sandbox.PRootKernel.resolvePathForSession(
+            activeSessionId,
+            "/var/minis${pending.resourcePath}",
+            appCtx,
         )
         if (file == null || !file.exists()) {
             com.rikkaminis.app.logging.AppLogger.warning(

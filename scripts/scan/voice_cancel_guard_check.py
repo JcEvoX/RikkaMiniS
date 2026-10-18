@@ -24,6 +24,17 @@ D (OpenRouterModelsApi.fetchModels)
   Exception -> return@withContext emptyList()): outside, an IOException
   propagated out of fetchModels instead of returning the empty fallback.
 
+E (XunfeiVoiceProvider.parseVoiceInputResponse)   [da1027 ISSUE-04]
+  The empty-transcript guard must sit on the ASSEMBLED transcript
+  (`sb.toString().takeIf { it.isNotEmpty() } ?: throw Parse(...)`), not only
+  on the Base64 envelope: a decodable payload whose `ws` set carries no words
+  assembled to "" and was still returned as a successful result. The consumer
+  (ProviderSpeechRecognitionEngine.startListening) pins the candidate as
+  `stickyEntryId` and reports NO_MATCH for it, so the empty result blocks
+  fail-over to the remaining candidates — only a THROWN Parse advances the
+  chain. Third recurrence of the guard-on-the-wrong-layer shape (0917 F-203
+  base class / Doubao / Deepgram carried it; Xunfei only guarded the envelope).
+
 Usage: python3 scripts/scan/voice_cancel_guard_check.py [repo_root]
        python3 scripts/scan/voice_cancel_guard_check.py --selftest
 Exit:  0 = clean, 1 = violation(s), 2 = usage/ROT
@@ -34,6 +45,16 @@ import sys
 
 VP_REL = "src/android/app/src/main/java/com/rikkaminis/app/provider/voice/VoiceProvider.kt"
 OR_REL = "src/android/app/src/main/java/com/rikkaminis/app/provider/openrouter/OpenRouterModelsApi.kt"
+VENDORS_REL = ("src/android/app/src/main/java/com/rikkaminis/app/provider/voice/"
+               "VoiceProviderVendors.kt")
+
+# da1027 ISSUE-04: the guard must cover the ASSEMBLED transcript AND carry the
+# Xunfei Parse message — either half alone was the exact shape of the bug
+# (envelope-only guard) or of a silent contract change (message drift).
+XUNFEI_TRANSCRIPT_GUARD = re.compile(
+    r"sb\.toString\(\)\s*\.takeIf\s*\{\s*it\.isNotEmpty\(\)\s*\}\s*\?:\s*throw\s+"
+    r"VoiceProviderException\.Parse\(\"Unexpected Xunfei ASR response format\"\)"
+)
 
 
 def strip_comments(src):
@@ -160,6 +181,72 @@ def check_openrouter(src):
     return v
 
 
+def brace_block(text, start):
+    """Brace-balanced block starting at the first `{` at/after `start`.
+
+    String literals are skipped so a quoted brace (e.g. inside a JSON template)
+    can never unbalance the count or be mistaken for structure. Returns None
+    when the braces never close — the caller treats that as a moved anchor.
+    """
+    j = text.find("{", start)
+    if j < 0:
+        return None
+    depth = 0
+    i = j
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            i += 1
+            while i < len(text) and text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+            i += 1  # step past the closing quote (a bare `continue` here would
+            #         re-enter the SAME quote as an opener and desync every
+            #         subsequent string in the file)
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[j:i + 1]
+        i += 1
+    return None
+
+
+def check_xunfei_transcript(src):
+    """da1027 ISSUE-04 — the Xunfei guard must sit on the assembled transcript."""
+    v = []
+    code = strip_comments(src)
+    # Scope first: three vendors override parseVoiceInputResponse in this file,
+    # so an unscoped anchor would silently grade Doubao's copy instead.
+    cls = code.find("class XunfeiVoiceProvider")
+    if cls < 0:
+        v.append("VoiceProviderVendors.kt: XunfeiVoiceProvider class not found "
+                 "(gate anchors moved — deliberate edit required)")
+        return v
+    anchor = code.find("fun parseVoiceInputResponse", cls)
+    body = brace_block(code, anchor) if anchor >= 0 else None
+    if body is None or '"ws"' not in body:
+        # No `ws` frame read ⇒ we are not looking at the Xunfei override (or it
+        # was renamed/inlined). Fail closed rather than grade a sibling parser.
+        v.append("VoiceProviderVendors.kt: XunfeiVoiceProvider.parseVoiceInputResponse "
+                 "not found (its `ws` frame read is gone — gate anchors moved, "
+                 "deliberate edit required)")
+        return v
+    if not XUNFEI_TRANSCRIPT_GUARD.search(body):
+        v.append("VoiceProviderVendors.kt: XunfeiVoiceProvider.parseVoiceInputResponse no "
+                 "longer guards the ASSEMBLED transcript "
+                 "(sb.toString().takeIf { it.isNotEmpty() } ?: throw "
+                 "VoiceProviderException.Parse(\"Unexpected Xunfei ASR response format\")) "
+                 "— da1027 ISSUE-04: an empty transcript is returned as a successful "
+                 "result, pinning the candidate sticky + NO_MATCH and blocking fail-over")
+    if "return VoiceInputResponse(text = sb.toString()" in body:
+        v.append("VoiceProviderVendors.kt: bare 'return VoiceInputResponse(text = "
+                 "sb.toString()' is back in the Xunfei parser (da1027 ISSUE-04: the "
+                 "envelope-only guard let an empty transcript through as success)")
+    return v
+
+
 def read(root, rel):
     with open(os.path.join(root, rel), "r", encoding="utf-8") as fh:
         return fh.read()
@@ -176,13 +263,22 @@ def run(root):
         print("voice_cancel_guard_check: cannot read sources: %s" % exc)
         return 2
     violations = check_voiceprovider(vp) + check_openrouter(ors)
+    vendors_path = os.path.join(root, VENDORS_REL)
+    if os.path.exists(vendors_path):
+        try:
+            with open(vendors_path, "r", encoding="utf-8") as fh:
+                violations += check_xunfei_transcript(fh.read())
+        except OSError as exc:
+            print("voice_cancel_guard_check: cannot read sources: %s" % exc)
+            return 2
     if violations:
         print("FAIL voice_cancel_guard_check")
         for x in violations:
             print("  " + x)
         return 1
     print("PASS voice_cancel_guard_check (cancel watcher + empty-transcript "
-          "guard + openrouter fallback envelope all wired)")
+          "guards [chat ASR + Xunfei transcript] + openrouter fallback envelope "
+          "all wired)")
     return 0
 
 
@@ -290,6 +386,74 @@ BAD_OR_NO_EXEC_IN_TRY = GOOD_OR.replace(
 )
 
 
+GOOD_VENDORS = '''
+class XunfeiVoiceProvider(
+    providerId: String,
+    private val appId: String,
+    apiKey: String,
+    private val apiSecret: String,
+) : VoiceProvider(providerId, "https://iat-api.xfyun.cn", apiKey) {
+
+    override fun parseVoiceInputResponse(data: ByteArray, request: VoiceInputRequest): VoiceInputResponse {
+        val json = runCatching { JSONObject(String(data, Charsets.UTF_8)) }.getOrNull()
+            ?: throw VoiceProviderException.Parse("Unexpected Xunfei ASR response format")
+        val b64Text = json.optJSONObject("payload")?.optJSONObject("result")?.optString("text")
+            ?.takeIf { it.isNotEmpty() }
+            ?: throw VoiceProviderException.Parse("Unexpected Xunfei ASR response format")
+        val textJson = runCatching {
+            JSONObject(String(Base64.decode(b64Text, Base64.DEFAULT), Charsets.UTF_8))
+        }.getOrNull() ?: throw VoiceProviderException.Parse("Unexpected Xunfei ASR response format")
+
+        val sb = StringBuilder()
+        val ws = textJson.optJSONArray("ws") ?: JSONArray()
+        for (i in 0 until ws.length()) {
+            val cw = ws.optJSONObject(i)?.optJSONArray("cw") ?: continue
+            for (j in 0 until cw.length()) {
+                cw.optJSONObject(j)?.optString("w")?.let { sb.append(it) }
+            }
+        }
+        val transcript = sb.toString().takeIf { it.isNotEmpty() }
+            ?: throw VoiceProviderException.Parse("Unexpected Xunfei ASR response format")
+        return VoiceInputResponse(text = transcript, language = request.language)
+    }
+}
+'''
+
+# Pre-fix shape: only the Base64 ENVELOPE is guarded, the assembled transcript
+# is returned as-is (this is da1027 ISSUE-04 verbatim).
+BAD_VENDORS_BARE = GOOD_VENDORS.replace(
+    "        val transcript = sb.toString().takeIf { it.isNotEmpty() }\n"
+    "            ?: throw VoiceProviderException.Parse(\"Unexpected Xunfei ASR response format\")\n"
+    "        return VoiceInputResponse(text = transcript, language = request.language)",
+    "        return VoiceInputResponse(text = sb.toString(), language = request.language)")
+
+# Guard kept but its Parse message drifted: the fail-over contract is carried by
+# `catch (e: Exception)` in the engine, so a wrong exception/message is a
+# silent contract change, not a cosmetic edit.
+BAD_VENDORS_MSG = GOOD_VENDORS.replace(
+    "val transcript = sb.toString().takeIf { it.isNotEmpty() }\n"
+    "            ?: throw VoiceProviderException.Parse(\"Unexpected Xunfei ASR response format\")",
+    "val transcript = sb.toString().takeIf { it.isNotEmpty() }\n"
+    "            ?: throw VoiceProviderException.Parse(\"Empty Xunfei transcript\")")
+
+# Precision probe: a GUARDED sibling parser sits earlier in the file (exactly
+# the real Doubao/Xunfei order), so an unscoped anchor would grade the decoy and
+# report clean while the Xunfei path stayed broken.
+BAD_VENDORS_DECOY = '''
+class DoubaoVoiceProvider(providerId: String, baseUrl: String, apiKey: String?) :
+    VoiceProvider(providerId, baseUrl, apiKey) {
+
+    override fun parseVoiceInputResponse(data: ByteArray, request: VoiceInputRequest): VoiceInputResponse {
+        val json = runCatching { JSONObject(String(data, Charsets.UTF_8)) }.getOrNull()
+        val text = json?.optJSONObject("result")?.optString("text")
+            ?.takeIf { it.isNotEmpty() }
+            ?: throw VoiceProviderException.Parse("Unexpected Doubao v3 ASR response format")
+        return VoiceInputResponse(text = text, language = request.language)
+    }
+}
+''' + BAD_VENDORS_BARE
+
+
 def selftest():
     failures = []
 
@@ -322,13 +486,34 @@ def selftest():
     bad_or2 = check_openrouter(BAD_OR_NO_EXEC_IN_TRY)
     expect_trip("execute-inside-try fixture", bad_or2, "OUTSIDE the try")
 
+    good_vend = check_xunfei_transcript(GOOD_VENDORS)
+    expect_clean("compliant Xunfei-transcript fixture", good_vend)
+
+    bad_vend_bare = check_xunfei_transcript(BAD_VENDORS_BARE)
+    expect_trip("bare-sb-return fixture", bad_vend_bare,
+                "no longer guards the ASSEMBLED transcript")
+    expect_trip("bare-sb-return fixture", bad_vend_bare,
+                "bare 'return VoiceInputResponse(text = sb.toString()'")
+
+    bad_vend_msg = check_xunfei_transcript(BAD_VENDORS_MSG)
+    expect_trip("drifted-guard-message fixture", bad_vend_msg,
+                "no longer guards the ASSEMBLED transcript")
+
+    bad_vend_decoy = check_xunfei_transcript(BAD_VENDORS_DECOY)
+    expect_trip("guarded-sibling-decoy fixture", bad_vend_decoy,
+                "no longer guards the ASSEMBLED transcript")
+
     print("selftest compliant VoiceProvider    -> %d violation(s)" % len(good_vp))
     print("selftest compliant OpenRouter       -> %d violation(s)" % len(good_or))
+    print("selftest compliant Xunfei transcript-> %d violation(s)" % len(good_vend))
     print("selftest bare-execute               -> %d violation(s)" % len(bad_exec))
     print("selftest no-watcher                 -> %d violation(s)" % len(bad_watcher))
     print("selftest no-empty-guard             -> %d violation(s)" % len(bad_guard))
     print("selftest executeOrCancel-outside-try-> %d violation(s)" % len(bad_or))
     print("selftest execute-inside-try         -> %d violation(s)" % len(bad_or2))
+    print("selftest bare-sb-return             -> %d violation(s)" % len(bad_vend_bare))
+    print("selftest drifted-guard-message      -> %d violation(s)" % len(bad_vend_msg))
+    print("selftest guarded-sibling-decoy      -> %d violation(s)" % len(bad_vend_decoy))
 
     if failures:
         for f in failures:

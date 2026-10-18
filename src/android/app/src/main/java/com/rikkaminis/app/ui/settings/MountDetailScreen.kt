@@ -91,7 +91,11 @@ fun MountDetailScreen(
         return
     }
 
-    var allowWrite by remember(entry.id) { mutableStateOf(entry.userAllowWrite) }
+    // Keyed on (entry.id, entry.userAllowWrite): an external write to the mount
+    // entry (another screen / a future sync path) re-seeds the switch, so
+    // `canSave` cannot invert — without the field key an untouched toggle lit
+    // the Save button and saving wrote the stale value back.
+    var allowWrite by remember(entry.id, entry.userAllowWrite) { mutableStateOf(entry.userAllowWrite) }
     var showUnmountConfirm by remember { mutableStateOf(false) }
 
     val canSave = allowWrite != entry.userAllowWrite

@@ -30,6 +30,11 @@ in MountedFoldersScreen, ON_RESUME, the storage-permission result) — while
 file) was called straight from the delete-all button's onClick. Every call site
 of either must now sit inside a `withContext(Dispatchers.IO) { … }` block; see
 BLOCKING_IO_CALLS for the table and `check_blocking_io` for what "inside" means.
+[deep-audit-1027 ISSUE-05] added the third subject: `RootfsManager.verifyIntegrity()`
+(manifest read + seven stats) was called twice from
+`RootfsManagementViewModel.repairRootfs`, reached straight from the screen's
+`onClick` — once inline, once inside a `viewModelScope.launch` whose
+`Main.immediate` body ran it on the click thread anyway.
 
 Usage: python3 scripts/scan/readonly_mount_write_guard.py [repo_root]
        python3 scripts/scan/readonly_mount_write_guard.py --selftest
@@ -135,6 +140,12 @@ BLOCKING_IO_CALLS = (
         r"discardStagedAttachments\s*\(",
         r"\bfun\s+discardStagedAttachments\s*\(",
         "staging discard (length() + delete() per staged attachment)",
+    ),
+    (
+        "ui/sandbox/RootfsManagementViewModel.kt",
+        r"manager\.verifyIntegrity\s*\(",
+        r"\bfun\s+verifyIntegrity\s*\(",
+        "rootfs integrity verification (reads .integrity_manifest + stats 7 critical files)",
     ),
 )
 
@@ -782,6 +793,84 @@ def _app_logger():
     )
 
 
+# ── criterion-2 subject added by [deep-audit-1027 ISSUE-05] ──────────────────
+# `RootfsManager.verifyIntegrity()` reads `.integrity_manifest` and stats seven
+# critical files; the pre-fix ViewModel called it twice from a method reached
+# straight from the screen's onClick.
+ROOTFS_BODIES = {
+    # the shape FIX-D ships: both reads inside `withContext(Dispatchers.IO) { … }`
+    "io": (
+        "    fun repairRootfs(ctx: Ctx) {\n"
+        "        val manager = RootfsManager.getInstance(ctx)\n"
+        "        viewModelScope.launch {\n"
+        "            val initial = withContext(Dispatchers.IO) {\n"
+        "                manager.verifyIntegrity()\n"
+        "            }\n"
+        "            if (initial.healthy) return@launch\n"
+        "            manager.autoRepair()\n"
+        "            val after = withContext(Dispatchers.IO) { manager.verifyIntegrity() }\n"
+        "        }\n"
+        "    }\n"
+    ),
+    # pre-fix shape (live until deep-audit-1027): the first read on the click thread
+    "direct": (
+        "    fun repairRootfs(ctx: Ctx) {\n"
+        "        val manager = RootfsManager.getInstance(ctx)\n"
+        "        val initial = manager.verifyIntegrity()\n"
+        "        if (initial.healthy) return\n"
+        "        viewModelScope.launch {\n"
+        "            val after = withContext(Dispatchers.IO) { manager.verifyIntegrity() }\n"
+        "        }\n"
+        "    }\n"
+    ),
+    # the second read left inside `viewModelScope.launch`: Main.immediate is not an
+    # IO hop, so the read still runs on the click thread
+    "launch_only": (
+        "    fun repairRootfs(ctx: Ctx) {\n"
+        "        val manager = RootfsManager.getInstance(ctx)\n"
+        "        withContext(Dispatchers.IO) { manager.verifyIntegrity() }\n"
+        "        viewModelScope.launch {\n"
+        "            val after = manager.verifyIntegrity()\n"
+        "        }\n"
+        "    }\n"
+    ),
+    # correct at runtime, wrong shape (`withContext(IO) expr`) — fail-closed
+    "inline_io": (
+        "    fun repairRootfs(ctx: Ctx) {\n"
+        "        val manager = RootfsManager.getInstance(ctx)\n"
+        "        val initial = withContext(Dispatchers.IO) manager.verifyIntegrity()\n"
+        "    }\n"
+    ),
+}
+
+
+def _rootfs_vm(shape="io"):
+    return (
+        "package com.rikkaminis.app.ui.sandbox\n"
+        "\n"
+        "import kotlinx.coroutines.Dispatchers\n"
+        "import kotlinx.coroutines.launch\n"
+        "import kotlinx.coroutines.withContext\n"
+        "\n"
+        "class RootfsManagementViewModel {\n"
+        + ROOTFS_BODIES[shape] +
+        "}\n"
+    )
+
+
+def _rootfs_manager():
+    """The declaration the criterion's fail-closed anchor points at."""
+    return (
+        "package com.rikkaminis.app.sandbox\n"
+        "\n"
+        "class RootfsManager {\n"
+        "    fun verifyIntegrity(): Boolean = true\n"
+        "\n"
+        "    suspend fun autoRepair(): Boolean = true\n"
+        "}\n"
+    )
+
+
 SHARE_BODIES = {
     # the shape the fix ships (deep-audit-1026 ISSUE-07): both disk-bound calls
     # inside the withContext(Dispatchers.IO) block
@@ -867,7 +956,7 @@ def _share_receiver(shape="io", toast_hop="hop"):
 def write_io_fixture(root, store_shape="io", log_shape="io", store_fn="probeWritable",
                      drop_store=False, drop_log=False, data_pkg=True, ui_pkg=True,
                      keep_pkgs_when_dropped=True, share_shape="io", drop_share=False,
-                     toast_hop="hop"):
+                     toast_hop="hop", rootfs_shape="io", drop_rootfs=False):
     """A `com/rikkaminis/app` tree carrying both criterion-2 targets.
 
     [keep_pkgs_when_dropped] leaves an unrelated file in the package whose anchor
@@ -894,6 +983,13 @@ def write_io_fixture(root, store_shape="io", log_shape="io", store_fn="probeWrit
         files["share/ShareReceiverActivity.kt"] = _share_receiver(share_shape, toast_hop)
     elif keep_pkgs_when_dropped:
         files["share/ShareHost.kt"] = "package com.rikkaminis.app.share\n\nclass ShareHost\n"
+    if not drop_rootfs:
+        files["sandbox/RootfsManager.kt"] = _rootfs_manager()
+        files["ui/sandbox/RootfsManagementViewModel.kt"] = _rootfs_vm(rootfs_shape)
+    elif keep_pkgs_when_dropped:
+        files["ui/sandbox/OtherScreen.kt"] = (
+            "package com.rikkaminis.app.ui.sandbox\n\nclass OtherScreen\n"
+        )
     if not data_pkg:
         files.pop("data/MountRegistry.kt", None)
     if not ui_pkg:
@@ -967,6 +1063,17 @@ def selftest():
         "no `fun toast(", toast_hop="missing")
     run("the toast-hop criterion reports its premise gone when the import is not on IO", True,
         "premise is gone", share_shape="launch_only")
+    run("both rootfs integrity reads inside Dispatchers.IO pass", False)
+    run("the rootfs integrity read on the click thread is caught", True,
+        "rootfs integrity verification (reads .integrity_manifest", rootfs_shape="direct")
+    run("`viewModelScope.launch` alone does not wrap the rootfs read in IO", True,
+        "ui/sandbox/RootfsManagementViewModel.kt", rootfs_shape="launch_only")
+    run("the non-blocking `withContext(IO) expr` rootfs wrap is not accepted", True,
+        "ui/sandbox/RootfsManagementViewModel.kt", rootfs_shape="inline_io")
+    run("a rootfs ViewModel anchor that lost its file is a rot failure", True,
+        "lost its anchor", drop_rootfs=True)
+    run("a tree that never shipped the rootfs ViewModel package is skipped, not failed", False,
+        "[PARTIAL]", drop_rootfs=True, keep_pkgs_when_dropped=False)
 
     print("=== readonly_mount_write_guard --selftest ===")
     failed = 0
