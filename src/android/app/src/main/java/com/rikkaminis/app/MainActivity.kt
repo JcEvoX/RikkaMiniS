@@ -659,7 +659,11 @@ class MainActivity : ComponentActivity() {
         val mode = getAppearancePrefs(this).getInt(KEY_LAUNCH_SESSION, 0)
         if (mode != 2) return
         val nav = navController ?: return
-        val newRoute = Routes.chat("__new__${java.util.UUID.randomUUID()}")
+        // [da1029-A] Route through the single source (ComposerDraftStore)
+        // instead of a bare "__new__<uuid>": a fresh id here would orphan the
+        // existing draft slot, and ComposerDraftStore.saveText drops writes
+        // aimed at a different draft id — the user's typed text would vanish.
+        val newRoute = Routes.chat(com.rikkaminis.app.data.ComposerDraftStore.nextDraftId(this))
         AppLogger.info("LaunchSession", "resume → mode=NewChat, deferring navigate to onResume (lifecycle=$lifecycle.currentState)")
         pendingLaunchSessionRoute = newRoute
     }
@@ -824,7 +828,10 @@ class MainActivity : ComponentActivity() {
                         .setPendingChatAction(DeepLinkCoordinator.ChatAction.OPEN_CAMERA)
                     else -> {}
                 }
-                val newRoute = Routes.chat("__new__${java.util.UUID.randomUUID()}")
+                // [da1029-A] Same single-source rule as onStart(): reuse the
+                // live draft id so the composer's existing text survives the
+                // quick-action hop (bare uuid → orphaned slot → dropped text).
+                val newRoute = Routes.chat(com.rikkaminis.app.data.ComposerDraftStore.nextDraftId(this))
                 nav.navigate(newRoute) {
                     popUpTo(nav.graph.startDestinationId) { inclusive = true }
                     launchSingleTop = true
