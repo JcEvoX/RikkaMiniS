@@ -167,7 +167,7 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
         // [T-bg-overlay phase 2 fix] Surface a11y sub-action progress to
         // SessionActivityTracker.currentToolStatus so the background
         // overlay capsule + FGS notification show what the agent is
-        // actually doing — "tap by-text Login" instead of the static
+        // actually doing — "tap text Login" instead of the static
         // "Running: a11y_cli". Computed before dispatch so even fast
         // sub-commands (status / ping) get a one-line update before they
         // return. Does NOT touch the per-message tool name / running
@@ -1153,10 +1153,17 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
      *
      * Examples:
      *   ui dump           → "a11y_cli: dumping UI tree"
-     *   tap by-text Login → "a11y_cli: tap \"Login\""
-     *   input set --text X → "a11y_cli: input text"
-     *   scroll forward    → "a11y_cli: scroll forward"
+     *   tap text Login    → "a11y_cli: tap \"Login\""
+     *   tap xy 100 200    → "a11y_cli: tap at (100)"
+     *   input text Hello  → "a11y_cli: input text"
+     *   scroll to-text X  → "a11y_cli: scrolling to \"X\""
      *   event watch       → "a11y_cli: watching events"
+     *
+     * [deep-audit-1025 ISSUE-03] The first three examples above were wrong in
+     * the shipped build: the table listed `by-text` / `set` / `forward`, none of
+     * which the dispatcher accepts, so the capsule showed the generic label for
+     * every tap / input / scroll. The verbs and their labels now live together
+     * in [A11yStatusLabels], keyed by the dispatched verb.
      */
     private fun statusForSubAction(sub: String, verb: String?, args: OffloadArgs): String {
         val v = verb ?: ""
@@ -1170,23 +1177,17 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
                 "screenshot" -> "a11y_cli: capturing screenshot"
                 else         -> "a11y_cli: ui"
             }
-            "tap" -> when (v) {
-                "by-text"     -> "a11y_cli: tap \"${target ?: ""}\""
-                "by-id"       -> "a11y_cli: tap #${target ?: ""}"
-                "by-node"     -> "a11y_cli: tap node ${target ?: ""}"
-                "at"          -> "a11y_cli: tap at ($target)"
-                else          -> "a11y_cli: tap"
-            }
-            "input" -> when (v) {
-                "set"   -> "a11y_cli: input text"
-                "clear" -> "a11y_cli: clearing input"
-                else    -> "a11y_cli: input"
-            }
-            "scroll" -> when (v) {
-                "forward", "backward", "up", "down" -> "a11y_cli: scroll $v"
-                "to-text"                            -> "a11y_cli: scrolling to \"${target ?: ""}\""
-                else                                 -> "a11y_cli: scroll"
-            }
+            // [deep-audit-1025 ISSUE-03] These three used to be hand-written
+            // `when` tables listing verbs the dispatcher never accepted
+            // (`by-text`/`set`/`forward`), so every real call fell through to
+            // the generic label. They are now rendered from the single table
+            // whose keys ARE the dispatched verbs — see [A11yStatusLabels].
+            "tap" -> A11yStatusLabels.labelFor(A11yStatusLabels.TAP, v, target)
+                ?: "a11y_cli: tap"
+            "input" -> A11yStatusLabels.labelFor(A11yStatusLabels.INPUT, v, target)
+                ?: "a11y_cli: input"
+            "scroll" -> A11yStatusLabels.labelFor(A11yStatusLabels.SCROLL, v, target)
+                ?: "a11y_cli: scroll"
             "gesture"  -> "a11y_cli: gesture${v.takeIf { it.isNotBlank() }?.let { " $it" } ?: ""}"
             "wait"     -> "a11y_cli: waiting for ${v.ifBlank { "condition" }}"
             "event"    -> if (v == "watch") "a11y_cli: watching events" else "a11y_cli: event $v"
@@ -1198,6 +1199,69 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
         }
     }
 
+}
+
+/**
+ * [deep-audit-1025 ISSUE-03] Single source of truth for the a11y sub-action
+ * status line — the text the background overlay capsule and the FGS
+ * notification show while the agent drives the UI.
+ *
+ * The verbs the dispatcher accepts (`tapSub` / `inputSub` / `scrollSub`) and the
+ * verbs this status line could name used to be two hand-written lists, and all
+ * three pairs had drifted apart:
+ *
+ * | group  | dispatched              | the status table knew           |
+ * |--------|-------------------------|---------------------------------|
+ * | tap    | node / xy / text / id   | by-text / by-id / by-node / at  |
+ * | input  | text / clear / key      | set / clear                     |
+ * | scroll | node / xy / to-text     | forward / backward / up / down  |
+ *
+ * Every one of those operations therefore fell through to the generic label
+ * ("a11y_cli: tap"), so the capsule was blank exactly when it was supposed to
+ * narrate — 100 % of a11y calls. The keys here are the dispatched verb itself,
+ * which is what collapses the two lists into one: there is nothing left to keep
+ * in sync by hand, and `a11y_handler_contract_check.py` fails when the two sets
+ * stop matching in either direction.
+ *
+ * `%s` is the sub-command's target argument (positional #2); a label without it
+ * ignores the target. An unknown verb returns null so the caller's generic
+ * fallback still applies — a verb added to the dispatcher without a label here
+ * fails the gate instead of silently degrading the capsule again.
+ */
+internal object A11yStatusLabels {
+    /** `tap node|xy|text|id` → overlay label. */
+    val TAP: Map<String, String> = mapOf(
+        "node" to "a11y_cli: tap node %s",
+        "xy"   to "a11y_cli: tap at (%s)",
+        "text" to "a11y_cli: tap \"%s\"",
+        "id"   to "a11y_cli: tap #%s",
+    )
+
+    /** `input text|clear|key` → overlay label. */
+    val INPUT: Map<String, String> = mapOf(
+        "text"  to "a11y_cli: input text",
+        "clear" to "a11y_cli: clearing input",
+        "key"   to "a11y_cli: input key %s",
+    )
+
+    /** `scroll node|xy|to-text` → overlay label. */
+    val SCROLL: Map<String, String> = mapOf(
+        "node"    to "a11y_cli: scroll node %s",
+        "xy"      to "a11y_cli: scroll at (%s)",
+        "to-text" to "a11y_cli: scrolling to \"%s\"",
+    )
+
+    /**
+     * Render [table]'s label for [verb], substituting [target] for `%s`. Null
+     * when the table has no entry for [verb] (or [verb] is absent), which is the
+     * caller's signal to keep its generic fallback.
+     */
+    fun labelFor(table: Map<String, String>, verb: String?, target: String?): String? {
+        val template = table[verb ?: return null] ?: return null
+        return template.replace(TARGET_PLACEHOLDER, target ?: "")
+    }
+
+    private const val TARGET_PLACEHOLDER = "%s"
 }
 
 /**
