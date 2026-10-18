@@ -731,7 +731,7 @@ fun BackupSettingsScreen(
                 title = stringResource(R.string.backup_export),
                 subtitle = stringResource(R.string.backup_export_sub),
                 icon = Icons.Default.Download,
-                onClick = if (operationBusy) null else ({ showSecretWarning = true }),
+                onClick = if (operationBusy) null else ({ webDavUploadPending = false; showSecretWarning = true }),
             )
             SettingsRow(
                 title = stringResource(R.string.backup_chat_window_title),
@@ -937,7 +937,10 @@ fun BackupSettingsScreen(
             }
         }
         AlertDialog(
-            onDismissRequest = { showSecretWarning = false },
+            onDismissRequest = {
+                showSecretWarning = false
+                webDavUploadPending = false
+            },
             title = { Text(stringResource(R.string.backup_secret_title)) },
             text = { Text(stringResource(R.string.backup_secret_body)) },
             confirmButton = {

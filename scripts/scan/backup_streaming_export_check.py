@@ -27,6 +27,18 @@ Pins the automatic-backup streaming + fetch-hardening contract:
         (single-line wrapping) so the gate stays a dumb, greppable text check
         instead of a brace-tracking heuristic; the entry load, the post-run
         refresh and the post-fetch refresh are the only three call sites.
+  arm5 (secret-warning routing flag, deep-audit-1027 ISSUE-03): the
+        `webDavUploadPending` marker is read once, inside the shared secret
+        confirmation (`runExport`), to decide whether a confirmed export goes
+        to WebDAV or through the local SAF picker. Any path that can leave a
+        stale `true` behind silently re-routes a later LOCAL export to a
+        remote upload (API keys included). The flag must therefore be cleared
+        on >= 3 sites: the local-export entry, the `runExport` consumption and
+        the dialog's `onDismissRequest`. Anchor is fail-closed: if the flag
+        declaration disappears (renamed/moved), the arm goes RED instead of
+        silently counting zero and passing — re-point the arm at the new name.
+        The count contract is deliberately dumb/greppable (same style as arm4)
+        rather than brace-tracking.
 
 Usage:
   python3 backup_streaming_export_check.py <repo_root>   # real tree
@@ -180,6 +192,33 @@ def check_arm4(screen_code):
     return None
 
 
+def check_arm5(screen_code):
+    """Secret-warning routing flag must be cleared on every escaping path.
+
+    A leaked `webDavUploadPending = true` (dialog dismissed via back press /
+    tap outside) re-routes the NEXT local export into a WebDAV upload —
+    silently shipping a secrets-included payload to the remote server.
+    """
+    if screen_code is None:
+        # Drift-probe / mini-tree fixture without the screen: nothing to pin.
+        return None
+    if not re.search(r"\bvar webDavUploadPending\b", screen_code):
+        return (
+            "BackupSettingsScreen must declare `var webDavUploadPending` — the "
+            "secret-warning routing flag vanished (anchor drift). Re-point this "
+            "arm at the renamed flag; do not delete the arm."
+        )
+    clears = screen_code.count("webDavUploadPending = false")
+    if clears < 3:
+        return (
+            "webDavUploadPending must be cleared on >= 3 sites (local-export "
+            "entry / runExport consumption / dialog onDismissRequest) — a stale "
+            "`true` redirects a later local export to a remote WebDAV upload "
+            f"(secrets included): found {clears}"
+        )
+    return None
+
+
 def check_all(root):
     auto = read_stripped(root, AUTO_MGR_REL)
     sync = read_stripped(root, SYNC_REL)
@@ -190,6 +229,7 @@ def check_all(root):
         ("arm2", check_arm2(sync)),
         ("arm3", check_arm3(screen)),
         ("arm4", check_arm4(screen)),
+        ("arm5", check_arm5(screen)),
     ):
         if err:
             failures.append(f"{name}: {err}")
@@ -240,9 +280,36 @@ COMPLIANT_SCREEN = """package com.rikkaminis.app.ui.settings
 
 @Composable
 fun BackupSettingsScreen(context: Context) {
+    var showSecretWarning by remember { mutableStateOf(false) }
+    var webDavUploadPending by remember { mutableStateOf(false) }
     var autoBackupFiles by remember { mutableStateOf<List<File>>(emptyList()) }
     LaunchedEffect(Unit) {
         autoBackupFiles = withContext(Dispatchers.IO) { AutoBackupManager.listLocal(context) }
+    }
+    SettingsRow(
+        onClick = if (operationBusy) null else ({ webDavUploadPending = false; showSecretWarning = true }),
+    )
+    SettingsRow(
+        onClick = if (webDavConfig != null && !operationBusy) {
+            { webDavUploadPending = true; showSecretWarning = true }
+        } else {
+            null
+        },
+    )
+    if (showSecretWarning) {
+        val runExport: (Boolean) -> Unit = runExport@{ withSecrets ->
+            operationBusy = true
+            showSecretWarning = false
+            val toWebDav = webDavUploadPending
+            webDavUploadPending = false
+            if (toWebDav) uploadRemote() else exportWithSecrets = withSecrets
+        }
+        AlertDialog(
+            onDismissRequest = {
+                showSecretWarning = false
+                webDavUploadPending = false
+            },
+        )
     }
     fun onFetch(entry: WebDavSync.AutoBackupEntry) {
         val stamp = WebDavSync.sanitizeAutoBackupStamp(entry.item.displayName) ?: return
@@ -308,6 +375,25 @@ VIOLATION_MAIN_THREAD_REFRESH = COMPLIANT_SCREEN.replace(
     "autoBackupFiles = withContext(Dispatchers.Main) { AutoBackupManager.listLocal(context) }",
 )
 
+# arm5 (deep-audit-1027 ISSUE-03) — the secret-warning routing flag.
+VIOLATION_NO_ENTRY_CLEAR = COMPLIANT_SCREEN.replace(
+    "({ webDavUploadPending = false; showSecretWarning = true })",
+    "({ showSecretWarning = true })",
+)
+
+VIOLATION_NO_DISMISS_CLEAR = COMPLIANT_SCREEN.replace(
+    "            onDismissRequest = {\n"
+    "                showSecretWarning = false\n"
+    "                webDavUploadPending = false\n"
+    "            },",
+    "            onDismissRequest = { showSecretWarning = false },",
+)
+
+VIOLATION_FLAG_RENAMED = COMPLIANT_SCREEN.replace(
+    "webDavUploadPending",
+    "webDavUploadQueued",
+)
+
 
 def write_tree(tmp, auto=None, sync=None, screen=None):
     for rel, content in (
@@ -350,6 +436,9 @@ def selftest():
     ok &= run_fixture("violation-fetch-no-rotation", expect_ok=False, screen=VIOLATION_FETCH_NO_ROTATION)
     ok &= run_fixture("violation-main-thread-remember", expect_ok=False, screen=VIOLATION_MAIN_THREAD_REMEMBER)
     ok &= run_fixture("violation-main-thread-refresh", expect_ok=False, screen=VIOLATION_MAIN_THREAD_REFRESH)
+    ok &= run_fixture("violation-entry-no-flag-clear", expect_ok=False, screen=VIOLATION_NO_ENTRY_CLEAR)
+    ok &= run_fixture("violation-dismiss-no-flag-clear", expect_ok=False, screen=VIOLATION_NO_DISMISS_CLEAR)
+    ok &= run_fixture("violation-flag-renamed-anchor-drift", expect_ok=False, screen=VIOLATION_FLAG_RENAMED)
     print("BACKUP_STREAMING_EXPORT_SELFTEST=" + ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 
@@ -366,7 +455,7 @@ def main():
         for f in failures:
             print("FAIL:", f)
         sys.exit(1)
-    print("backup_streaming_export_check: OK (arm1 + arm2 + arm3 + arm4 green)")
+    print("backup_streaming_export_check: OK (arm1 + arm2 + arm3 + arm4 + arm5 green)")
 
 
 if __name__ == "__main__":
