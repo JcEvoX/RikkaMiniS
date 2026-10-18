@@ -568,7 +568,8 @@ def main():
         if fails:
             print("SELFTEST FAIL (%d)" % len(fails))
             return 1
-        print("STORE_LOCK_CRITERIA=PASS (5 store criteria, 4 breakers)")
+        print("STORE_LOCK_CRITERIA=PASS (%d store criteria, %d breakers)"
+              % (len(analyse_store(code_only(COMPLIANT_STORE))), len(STORE_BREAKERS)))
         print("ROUTER_LOCK_SELFTEST=PASS (%d fixtures)" % fixtures)
         return 0
 
