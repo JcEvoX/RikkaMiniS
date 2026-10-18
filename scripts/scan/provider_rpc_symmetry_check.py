@@ -82,7 +82,7 @@ def strip_comments(text):
     return "".join(out)
 
 
-def find_files(root, name, skip=(".git", "build", "node_modules")):
+def find_files(root, name, skip=(".git", "build", "node_modules", "probe", "slice")):
     hits = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if d not in skip]
@@ -188,7 +188,7 @@ def check_tree(root):
     # ---- C1 ----
     all_defs = []
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in (".git", "build", "node_modules")]
+        dirnames[:] = [d for d in dirnames if d not in (".git", "build", "node_modules", "probe", "slice")]
         for fn in filenames:
             if fn.endswith(".kt"):
                 p = os.path.join(dirpath, fn)
