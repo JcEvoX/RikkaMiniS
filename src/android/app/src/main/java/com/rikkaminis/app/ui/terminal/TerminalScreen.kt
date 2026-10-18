@@ -133,8 +133,14 @@ fun TerminalScreen(
         val uri = pendingUrl ?: return@LaunchedEffect
         if (MinisOpenUrlBroker.isWebScheme(uri.scheme)) {
             previewUrl = uri.toString()
+            // Only claim the broker for what this screen actually presents.
+            // A non-web scheme (minis:// deep link / in-app file preview) is
+            // left pending on purpose: ChatScreen's observer defers while
+            // `terminalVisible` is true and re-runs the moment it flips back
+            // to false, so dismissing the terminal delivers the URL there.
+            // [da1027-G] consuming unconditionally here ate those URLs.
+            MinisOpenUrlBroker.consume()
         }
-        MinisOpenUrlBroker.consume()
     }
 
     val accessoryBarHeightDp = 40.dp
