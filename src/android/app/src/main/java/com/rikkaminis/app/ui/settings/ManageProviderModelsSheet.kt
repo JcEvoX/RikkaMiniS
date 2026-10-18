@@ -63,7 +63,11 @@ fun ManageProviderModelsSheet(
     onModelEntryClick: (String) -> Unit = {},
 ) {
     val config by providerRepository.config.collectAsState()
-    val instance = remember(instanceId) { config.instances.firstOrNull { it.id == instanceId } }
+    // [da1025-F] Key on (instanceId, config), mirroring the allEntries remember
+    // below: config changes when the provider is deleted, and keying on
+    // instanceId alone kept the stale non-null snapshot here — the
+    // provider-deleted auto-dismiss guard below never fired.
+    val instance = remember(instanceId, config) { config.instances.firstOrNull { it.id == instanceId } }
     if (instance == null) {
         // Provider deleted while the sheet was open -> just close
         LaunchedEffect(Unit) { onDismiss() }
