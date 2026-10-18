@@ -4,8 +4,8 @@
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
 - 合并范围：2026-08-03 ～ 2026-10-18，共 77 天
-- 条目总数：1962（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：2767542 / 总行数：35500
+- 条目总数：1969（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：2779416 / 总行数：35680
 
 ---
 
@@ -34433,6 +34433,7 @@ A `b48d1bdc` ISSUE-01(gateway/service) · B `b7b189db` ISSUE-02(chat) · C `4d7c
 ## 交付：deep-audit-1024 FIX-D（ISSUE-04 MCP OAuth 凭据/沙盒桥接文件生命周期，P1）—— `fix/da1024-mcp-oauth-bridge-lifecycle` @ `b611732a`，CI #39048727885 success，停在分支
 
 
+
 **任务**：读 `shared/work/deep-audit-1024/fix-tasks/FIX-D.md` 立刻执行（先证再改）。基线 main `f688c97`（da1023 收口树）。**报告** `fix-reports/FIX-D.md`（8 节 + "谁抓谁"分层表）；**装置** `repo-d/probe/`（jvm harness / mutations.py / run_mutation.sh / gate_sweep.sh / verify_head_blob.sh / ci_judge.py，全 gitignore）；**backlog §1024-D**（scan_debt 判 OK）。
 
 **四文件 +922 / −0**（既有 `delete()` 的 purge、UI 文件 **未动**）：`MCPOAuthStore.kt` +122（`ReconcileAction` 枚举 + 纯 `usableOAuth` + 纯 `decideReconcileAction` + 自包含 `reconcileForServer`）· `MCPRepository.kt` +51（纯 `persistsAsUrlTransport` + `private reconcileOAuth` + add/update/importJSON 各接一行）· 新测试 173 行 9 例 · 新门 576 行。
@@ -34458,6 +34459,7 @@ A `b48d1bdc` ISSUE-01(gateway/service) · B `b7b189db` ISSUE-02(chat) · C `4d7c
 ## FIX-B 交付收口：deep-audit-1024 ISSUE-02（Gemini base URL 四处分叉 → 统一出口）—— fix/da1024-gemini-base-single-source @ ac1bb9e，CI #2264 绿，停在分支
 
 
+
 **身份链**：基线 main `f688c97`；单提交 `ac1bb9e854dbbc01c74ef60d48f343de069de2c4`；**远端 tip == 本地 HEAD == CI head_sha 三方逐字符一致**；CI run **#2264（id 39049277351）success** @ `ac1bb9e`，26 步 `not-success=[]`、唯一 skipped = `Publish to Releases`（main 门控）。工作树干净、`probe/` 未入库。报告 `fix-reports/FIX-B.md`；装置 `repo-b/probe/`（jvm/ · mutations.py · chunk_test_scan.py · diff_closure.py · ci_judge.py）；backlog §1024-B（scan_debt 判 OK）。
 
 **修法（三站点委托统一出口，净 +24 行生产代码）**：①`GeminiModelsApi.normalizeBase` 单趟副本 → 单表达式 `GeminiBasePath.normalize(baseUrl)`（并删掉与 `GeminiBasePath.DEFAULT_BASE` 逐字符相同的私有 `DEFAULT_BASE`）；②`ProviderMutationMethods.instancesTest` 的探针 URL 抽成顶层 `internal fun providerProbeUrl(type, baseURL, key)`（纯函数，JVM 可直测），anthropic 臂补 `endsWith("/v1")` 守卫、gemini 臂委托；③`GeminiVoiceProvider.buildVoiceOutputRequest` 的 `contains("/v1beta")` → 委托。
@@ -34477,6 +34479,7 @@ A `b48d1bdc` ISSUE-01(gateway/service) · B `b7b189db` ISSUE-02(chat) · C `4d7c
 
 <!-- 2026-10-18 00:39:23 -->
 ## FIX-E 收口：deep-audit-1024 ISSUE-05（MODEL_ENTRY_DETAIL 路由二次 decode，P2）—— fix/da1024-model-entry-route-no-double-decode @ e0ad364，CI #39048800163 绿，停在分支
+
 
 
 **任务** `shared/work/deep-audit-1024/fix-tasks/FIX-E.md`（先读 COMMON/TRIAGE）。**报告** `fix-reports/FIX-E.md`（193 行 8 节齐全）；**装置** `repo-e/probe/`（durable，0 tracked）。基线 main `f688c97`。3 文件 +490/−8。
@@ -34501,6 +34504,7 @@ A `b48d1bdc` ISSUE-01(gateway/service) · B `b7b189db` ISSUE-02(chat) · C `4d7c
 ## FIX-I 收口：deep-audit-1024 ISSUE-09（ModelUse 相对路径未接 resolveMaybeRelative，P1）—— `fix/da1024-model-use-relative-path` @ `0360290`，CI #39048853946 绿，停在分支
 
 
+
 **任务**：读 `shared/work/deep-audit-1024/fix-tasks/FIX-I.md` 并立刻执行（先读 COMMON / TRIAGE §3.3 / REPORT-1024 ISSUE-09）。基线 main `f688c97`。**报告** `fix-reports/FIX-I.md`；**装置** `repo-i/probe/`（durable）；**backlog** §1024-I（scan_debt 判 OK）。
 
 **修法（3 站点，生产文件 1491→1499 行，+8 净增 ≤ 预算 15）**：①`cmdRun` 的 `--output` 归一化 `args.get("output")?.let { raw -> if (raw.startsWith("file://")) raw else resolveMaybeRelative(raw, request.cwd) }`，**保留** `!startsWith("/") && !startsWith("file://")` → `exit 2 invalid_output_path` fail-closed 分支（仅 cwd 缺失/相对时命中）；②`readLinuxPath` 3 行内联 join → `val resolved = resolveMaybeRelative(linuxPath, cwd)`（消除唯一手写副本）；③image_url 链 `resolveImageUrl(url, sessionId, cwd=null)` → `parseMessageArray` → `parseMessages`，`cmdRun` 传 `request.cwd`，else 分支 `resolveMaybeRelative(url, cwd).takeIf { it.startsWith("/") } ?: throw ImageInputError`。必守锚点全保：`outputPath` 形参名 / `readLinuxPath(` 函数名 / `isLinuxPathUnderReadOnlyMount(outputPath)`。**归一化刻意就地内联不抽 helper**——门的判据②锚定 `cmdRun` body 里这一处，抽出会让锚点消失。
@@ -34520,6 +34524,7 @@ A `b48d1bdc` ISSUE-01(gateway/service) · B `b7b189db` ISSUE-02(chat) · C `4d7c
 ## FIX-A 交付：deep-audit-1024 ISSUE-01（share_inbound 三合一，P1）—— fix/da1024-share-inbound-fileprovider-io @ 11096d9，CI #2263/run 39049248443 绿，停在分支
 
 
+
 **任务**：读 `shared/work/deep-audit-1024/fix-tasks/FIX-A.md` 并立刻执行（先读 COMMON.md/TRIAGE.md §3.1/REPORT ISSUE-01）。基线 main `f688c97`。报告 `fix-reports/FIX-A.md`（8 节全填）；装置 `repo-a/probe/`（durable，不入库）。
 
 **三面修法**：①`file_provider_paths.xml` 新增 `<cache-path name="share-inbound" path="share_inbound/" />`（否则输入框附件卡片 → 预览/外发/分享 100% 抛 `IllegalArgumentException`）；②`ChatViewModel.addAttachmentFromStagedShare` 改 `suspend`，`mkdirs`+prune+流式拷贝（上限 100 MB）进 `withContext(Dispatchers.IO)`，`addAttachment` 留主线程；`ChatScreen` 分享消费三处 I/O（`consumeBuffer`/`sharedFileDirectory`/`cleanSharedFiles`）分别切 IO（**该文件此前全文件 0 处 withContext**）；③新增顶层 `SHARE_INBOUND_TTL_MS`(24h) + 纯函数 `pruneExpiredShareInboundFiles`（照抄 `LargeContentGuard.pruneExpiredLargeMessageFiles` 形状），接在拷贝前。
@@ -34536,6 +34541,7 @@ A `b48d1bdc` ISSUE-01(gateway/service) · B `b7b189db` ISSUE-02(chat) · C `4d7c
 
 <!-- 2026-10-18 00:43:31 -->
 ## FIX-G 交付收口：deep-audit-1024 ISSUE-07（cacheDir/shared 主线程 IO + 无 TTL）—— `fix/da1024-shared-cache-io-and-prune` @ `cf55123`，CI #39049093263 绿，停在分支
+
 
 
 **基线 main `f688c97`**；单提交 5 文件 +487/−17（3 生产 + 1 测试 + 1 门）；报告 `shared/work/deep-audit-1024/fix-reports/FIX-G.md`；装置 `repo-g/probe/`（durable：arms.sh + edit_bytes.py + jvm/run.sh + scan/test_scan/ci 证据副本）。
@@ -34559,6 +34565,7 @@ A `b48d1bdc` ISSUE-01(gateway/service) · B `b7b189db` ISSUE-02(chat) · C `4d7c
 ## FIX-H 收口：deep-audit-1024 ISSUE-08（Reset All 后 UI 不刷新 + 内存 session 授权/拒绝未清，P2）—— fix/da1024-offload-permission-reset-sync @ db52d99，CI #2262 绿，停在分支
 
 
+
 **身份链**：基线 main `f688c97c6877e3b801eeacd33d58c2371d1b803f` → 单提交 **`db52d99786f64171fcb4abe4643a60036787764a`**；远端 tip == 本地 HEAD（逐字符）；**CI run `39049224537`（#2262）success @ db52d99**，head_sha 三方逐字符一致，job `117444221496` 26 步 failed_steps=[]、唯一 skipped = `Publish to Releases`（分支门控）。报告 `fix-reports/FIX-H.md`（8 节）；装置 `repo-h/probe/`；backlog **§1024-H**（scan_debt 判 OK）。4 文件 +890/−2（2 生产 + 1 新门 + 1 新测试）；`scan.sh`/`test_scan.py` 未动。
 
 **两裂口修法**：①`OffloadPermissionManager` 加 `revision: StateFlow<Int>`（`bumpRevision()` = `_revision.update { it + 1 }`，只作刷新信号，`getLevel` 仍是唯一真值、`checkPermission` 永不读它），`setLevel` → `clearToolSessionState(toolName)`（**只清该工具**，别的工具裁定仍有效）+ bump，`resetAll` → `clearAllSessionGrants()` + bump；②`OffloadPermissionScreen` 两行各 `val revision by …revision.collectAsState()` + `remember(toolName, revision)` / `remember(tool.toolName, revision)`。
@@ -34577,6 +34584,7 @@ A `b48d1bdc` ISSUE-01(gateway/service) · B `b7b189db` ISSUE-02(chat) · C `4d7c
 
 <!-- 2026-10-18 00:46:18 -->
 ## FIX-F 收口：deep-audit-1024 ISSUE-06（思考规则编辑器保存丢 reasoningEcho/id + 静默改写 wireFormat）—— fix/da1024-thinking-rule-editor-preserve @ 0babeaa，CI #2265 绿，停在分支
+
 
 
 **任务**：读 `shared/work/deep-audit-1024/fix-tasks/FIX-F.md` 立刻执行（先读 COMMON/TRIAGE §3.4）。**报告** `fix-reports/FIX-F.md`（8 节齐、0 占位）；**装置** `repo-f/probe/`（durable）；**backlog** §1024-F（scan_debt notes 判 **OK**）。基线 main `f688c97`。交付 4 文件 +1045/−16。
@@ -34600,6 +34608,7 @@ A `b48d1bdc` ISSUE-01(gateway/service) · B `b7b189db` ISSUE-02(chat) · C `4d7c
 ## FIX-C 交付收口：deep-audit-1024 ISSUE-03（P1 二级引用漏清理 + ModelGroupsScreen 无监听）—— `fix/da1024-compact-pin-cascade-and-listener` @ `f7f1419beb32`，CI #39049819858 绿，停在分支
 
 
+
 **任务** `shared/work/deep-audit-1024/fix-tasks/FIX-C.md`（先证再改）；**报告** `fix-reports/FIX-C.md`；**装置** `repo-c/probe/`（durable：jvm/{extract.py,run.sh} + mut/{apply.py,snapshots} + run_mutations.sh + ci_judge.py）。基线 main `f688c97`。4 文件 +554/−119。
 
 **修法**：`ProviderRepository` —— 新增 `decideStaleRefCleanup`（顶层纯函数，与 decideCompactPinCleanup 同一纯函数块，切片可 JVM 直编）+ `clearStaleSecondaryRefs`（应用器，三引用各一次判定）；4 个删除入口全部接线：`replaceEntries` 的 **else（非 suspiciousShrink）块末尾**（pin 三件套 + 应用器）、`ensureVoiceTemplateModels` 的 stale-seed 块（group 成员 + agent-loop + pin + 应用器，此前只删行）、`removeEntry` / `removeInstance`（各 +1 行）。pin 的判定四处**全部复用既有 decideCompactPinCleanup**（门 arm 5 的锚点即此，未写第二份"pin 是否悬空"）。`ModelGroupsScreen`：`DisposableEffect` + 具名 `OnSharedPreferenceChangeListener`（key 判据 `KEY_COMPACT_MODEL_ENTRY_ID`）+ onDispose 反注册（RuntimeLimitsScreen 同形，prefs_listener_holder_guard 认可）。
@@ -34616,6 +34625,7 @@ A `b48d1bdc` ISSUE-01(gateway/service) · B `b7b189db` ISSUE-02(chat) · C `4d7c
 
 <!-- 2026-10-18 01:49:33 -->
 ## deep-audit-1024 收口完成（用户令「一并处理 + 更新文档」）：10 分支并入 main，代码+文档双绿
+
 
 
 **终态**：main **`bcb6569`**（代码 `f1df9de` + 文档 `bcb6569`）；**`main^{tree}` == `b3ed8a6^{tree}`（并集树 CI 验证过的那个 commit）== `3c672538a2c47f04`** 逐字节一致 = 「我看过的树 == 线上树」。
@@ -34640,6 +34650,7 @@ A `b48d1bdc` ISSUE-01(gateway/service) · B `b7b189db` ISSUE-02(chat) · C `4d7c
 
 <!-- 2026-10-18 01:51:02 -->
 ## RikkaMinis 审计背景包更新（v7 / prompt v4）+ deep-audit-1024 收口核验
+
 
 
 **用户指令原话**：「为下一波的那个审计做准备吧，该更新的更新，该优化的优化，该改的改。你自己的判断。」随后明确：「在笔记文件夹挂载的那个文件夹里面 RikkaMinis审计背景包」——**要更新的是发给审计模型的背景包与提示词**（不是修复侧文档）。
@@ -34668,6 +34679,7 @@ A `b48d1bdc` ISSUE-01(gateway/service) · B `b7b189db` ISSUE-02(chat) · C `4d7c
 ## deep-audit-1024 分支清理终态（用户令「清掉吧」，2026-10-18）
 
 
+
 **终态**：远端**只剩 `main`**（`bcb6569`，tree `2ab5be8d`），12 个分支（9×fix/da1024-* + feat/trace-step-tag-1017 + integration/da1024 + docs/dev-history-1024）全部已不在。
 
 **★ 关键事实：不是本会话删的。** 用户令下达后我先跑只读 `check`，得到「远端分支总数 1 -> ['main']」；随后写好的 `loose_ends_1024.py delete` 模式**从未执行**。本会话对 origin 的写操作只有 push（main / integration/da1024 / docs/dev-history-1024 三分支）。删除窗口 = 「合并 docs 后那次 fetch（本地 refs 仍 12 个）」与「本轮探测（全 404）」之间约 20 分钟。
@@ -34680,6 +34692,7 @@ A `b48d1bdc` ISSUE-01(gateway/service) · B `b7b189db` ISSUE-02(chat) · C `4d7c
 
 <!-- 2026-10-18 09:03:17 -->
 ## deep-audit-1025 第二道门 + 9 支派发（用户令「走流程」，附审计报告 v4 9 项）
+
 
 
 **输入**：`shared-45079a1b.md`（135,630 B / 1874 行，ISSUE-01..09）。基线 main `bcb6569`（1024 收口树）。工作区 `shared/work/deep-audit-1025/`（repo = 1024/repo 复制 + `fetch --depth 1 origin main` 更新到 bcb6569；`origin` 已 set-url 到 GitHub）。
@@ -34710,6 +34723,7 @@ A `b48d1bdc` ISSUE-01(gateway/service) · B `b7b189db` ISSUE-02(chat) · C `4d7c
 <!-- 2026-10-18 09:06:14 -->
 ## deep-audit-1025 派发更正（2026-10-18 凌晨）
 
+
 ### deep-audit-1025 派发更正（2026-10-18 凌晨）
 
 第一批 9 支（601a179a / 41a85b72 / 0c8245a0 / aa86c4df / 2adb2f1c / ca69b7ed / 9b2c08e3 / 36f41b13 / 3547741e）因**模型 provider 问题**未跑起来，用户说「已经自动取消了」→ 未做任何取消操作。用户自行调整了模型配置后，**第二批 9 支重新派发成功**（同一批任务书，dispatch.sh 复用）：
@@ -34734,6 +34748,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 ## FIX-G 交付收口：deep-audit-1025 ISSUE-07（P1 工具错误分支丢失胶囊标题）—— fix/da1025-tool-title-error-branch @ e46cdee，CI #39087080210 绿，停在分支
 
 
+
 **任务**：读 `shared/work/deep-audit-1025/fix-tasks/FIX-G.md` 立刻执行（先读 COMMON/TRIAGE）。**报告** `fix-reports/FIX-G.md`（8 节齐）；**装置** `repo-g/probe/jvm/` + `probe/mutate.py`（durable）；**backlog** §1025-G（scan_debt notes 判 **OK**，1025 批第一个落 backlog 的支）。基线 main `bcb6569`。单提交 5 文件 +201/−62。
 
 **修法**：①`ChatToolExecutors.kt` browser_use——toolTitle 提取前移到 `parse` 早退之前（`resolveToolTitle(argsJson, "browser_use")`），`:108` 早退 + `:183` catch 两处补 `toolTitle = toolTitle`，删 `:115-117` try-scoped 内联副本；②`ConversationHistoryTool.kt`——fallback `""` → `resolveToolTitle(argsJson, ConversationHistoryContract.NAME)`（无新增字符串）；③`FileWriteTool.kt`——inline runCatching 副本换单源调用；④门 `tool_title_error_branch_check.py` 5→7 文件（FileWriteTool 模式收紧 `inline_or_helper`→`helper`，锚点匹配 startswith→**contains**——`?: return ToolExecutionResult("Error: …")` 早退行带前缀，startswith 漏检；SPEC 每项带自己的目录）。
@@ -34748,6 +34763,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 
 <!-- 2026-10-18 09:54:45 -->
 ## FIX-F 收口：deep-audit-1025 ISSUE-06（P1 Compose remember 键陈旧：modelCount 卡 0 + 删除守卫失效）—— `fix/da1025-provider-remember-keys` @ `8460ef06`，CI #2277（run 39087103229）绿，停在分支
+
 
 
 **任务**：读 `shared/work/deep-audit-1025/fix-tasks/FIX-F.md`（先读 COMMON/TRIAGE，基线 main `bcb6569`）。**报告** `fix-reports/FIX-F.md`（8 节齐）；**装置** `repo-f/probe/`（durable：mutate.py + mut/*.snap + ci_judge.py + ci-job.log 1,163,482 B + chunk 恢复脚本）。交付 2 生产文件 + 1 门（+16/−5 生产）。
@@ -34768,6 +34784,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 
 <!-- 2026-10-18 09:59:27 -->
 ## FIX-A 交付收口：deep-audit-1025 ISSUE-01（android-player 相对路径 100% 失败 + 跨会话读逃逸，P1）
+
 
 
 **分支** `fix/da1025-player-session-path` @ **`57945206c2b83dd6d321dffb294554e4b26f4e39`**（单提交，4 文件）；基线 main `bcb6569`。**CI #39085995318 success**（job 117552571060）：head_sha 三方逐字符一致、26 步 steps_failed=0、唯一 skipped = Publish（main 门控）。
@@ -34795,6 +34812,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 ## FIX-H 交付收口：deep-audit-1025 ISSUE-08（挂载探针 + 日志清理离开主线程）—— `fix/da1025-mount-probe-io` @ `d66c7a6`，CI #39087410687 绿，停在分支
 
 
+
 **任务** `shared/work/deep-audit-1025/fix-tasks/FIX-H.md`（P2，8 节报告齐）。基线 main `bcb6569`。交付 3 文件：2 生产（+32/−5）+ 1 门脚本扩展（238→827 行）。报告 `fix-reports/FIX-H.md`；装置 `repo-h/probe/`（durable：mutations.py / arms.py / ci_judge.py / evidence/*）；backlog §1025-H（scan_debt 判 **OK**）。
 
 **修法**：`MountedFoldersStore` 两处 probe 调用（`add()`:128 / `refreshWritability()`:215-217）包 `withContext(Dispatchers.IO)`（函数本 suspend、`withLock`/`map`/`let` 皆 inline ⇒ 直接可用，**改内部不改调用点、不改签名**）；`LogManagementScreen` 删除全部日志 onClick → `rememberCoroutineScope().launch { withContext(IO) { clearLogs() } }`，`refresh()`/关框留 Main。探针语义、mutex 语义、`MinisApp:943`（本就 IO）未动。
@@ -34820,6 +34838,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 ## FIX-D 收口：deep-audit-1025 ISSUE-04（browser_tabs/<sid>.json 免疫生命周期清理，P1）—— fix/da1025-browser-tabs-lifecycle @ c1dbf37，CI #39087510098 success，停在分支
 
 
+
 **工单** `shared/work/deep-audit-1025/fix-tasks/FIX-D.md`（先证再改）；**报告** `fix-reports/FIX-D.md`（8 节 / 169 行）；**装置** `repo-d/probe/`（durable）；基线 main `bcb6569`。3 文件 +449/−3。
 
 **缺陷**：`BrowserTabPool.saveState:1619` 把每会话全部标签 URL + 视口写进 `filesDir/browser_tabs/<sid>.json`，但 `SessionFileStore` 的会话级清理只管 `minis-sessions/<sid>/` 与 `media/<date>/<sid>/` ⇒ 删会话后**完整 URL 明文永久残留**，且设置页「孤儿数据清理」扫不到（M4 同族第 4 次）。
@@ -34838,6 +34857,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 
 <!-- 2026-10-18 10:07:34 -->
 ## FIX-I 交付收口：deep-audit-1025 ISSUE-09（P2 Provider RPC 守卫/字段不对称）—— fix/da1025-provider-rpc-symmetry @ `6b40595`，CI #2276（39087616148）success，停在分支
+
 
 
 **任务书** `shared/work/deep-audit-1025/fix-tasks/FIX-I.md`；**报告** `fix-reports/FIX-I.md`（8 节齐）；**装置** `repo-i/probe/`（durable）；**backlog** §1025-I（scan_debt notes 判 OK）。基线 main `bcb6569`。3 文件 +743/−21。
@@ -34859,6 +34879,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 
 <!-- 2026-10-18 10:09:10 -->
 ## FIX-C 交付收口：deep-audit-1025 ISSUE-03（a11y 双表失步，P1）—— `fix/da1025-a11y-status-verbs` @ `8b73bee`，CI #2277 绿，停在分支
+
 
 
 **任务** `shared/work/deep-audit-1025/fix-tasks/FIX-C.md`（先证再改）；**报告** `fix-reports/FIX-C.md`（9 节）；**装置** `repo-c/probe/{prefix,jvm,full}`；**backlog** §1025-C（scan_debt 判 OK）。基线 `bcb6569`（= 1024 收口树）。3 文件 +514/−22。
@@ -34885,6 +34906,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 ## FIX-E 交付：deep-audit-1025 ISSUE-05（EnvVarEntry.group 统一配置面漏层）—— fix/da1025-envvar-config-group @ 3eda8d9，CI #39087430292 绿，停在分支
 
 
+
 **任务** `shared/work/deep-audit-1025/fix-tasks/FIX-E.md`（先证再改）；**报告** `fix-reports/FIX-E.md`（8 节 / 0 占位）；**装置** `repo-e/probe/`（probe/ 在 .gitignore 不入库；编译产物与日志在 `/var/minis/shared/work/da1025-e-harness/`）；**backlog** §1025-E（`scan_debt.py notes` 判 OK）。基线 main `bcb6569`。交付 4 文件 +574/−1。
 
 **修法**：①`EnvVarsCollection` 新增 `groupField(key)`（ClosureField / `envvars.<key>.group` / `Str(maxLength=200)` / NORMAL / revertable；writer = value-preserving：读回密文 + **note 原样透传** + 显式 group，空串=清空）并挂进 `fields(forId)`（createdAt → note → **group** → HiddenField）；②`ConfigBuiltins` envvars 汇总块补 `"group" to ConfigValue.Str(e.group)` + description；③**不改** noteField writer（已正确）。
@@ -34902,6 +34924,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 
 <!-- 2026-10-18 10:21:47 -->
 ## FIX-B 收口：deep-audit-1025 ISSUE-02（CrashFrequencyDetector 主线程长耗时 I/O + 漏挂 TTL 清理，P1）—— `fix/da1025-crash-share-io` @ `1612c0b`，CI 绿，停在分支
+
 
 
 **任务** `fix-tasks/FIX-B.md`（先证再改，COMMON 实际在上级目录）。**报告** `fix-reports/FIX-B.md`（105 行，§1b 记首轮 CI 红）；**装置** `repo-b/probe/`（durable，不入库）。基线 main `bcb6569`。交付 2 文件 **+191/−14**，两提交（`5fb4e4f` 主体 + `1612c0b` CI 编译修复/门补牙）。
@@ -34926,6 +34949,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 
 <!-- 2026-10-18 11:05:48 -->
 ## deep-audit-1025 收口完成（用户令「他们都完成了」）：9 支并入并集树，CI 绿 @ 3bf0834
+
 
 
 **身份链**：基线 main `bcb6569` → 9 支（A..I）→ 并集树 `integration/da1025` **`3bf08341717bf6817970a912efd4ee6c8046fd40`**（9 次 `--no-ff` 零冲突 + 主会话门注册提交）。
@@ -34961,6 +34985,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 ## deep-audit-1025 合并 main 完成（用户令「合并」）：main `dc04fc3`，代码+文档双落地
 
 
+
 **身份链**：基线 `bcb6569` → 并集树 `integration/da1025` `3bf0834`（CI #2279 绿，树 `ca4bff07`）→ **main `e5c1712`**（--no-ff）→ 文档归档 → **main `dc04fc3`**。
 
 **★ 树对拍（核心机械证据）**：`main^{tree}`（e5c1712）== `3bf0834^{tree}` == **`ca4bff07ffd0a9664c70aed60a3a821121f843e5`** 逐字节一致 = 「我看过的树 == 线上树」。
@@ -34975,6 +35000,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 
 <!-- 2026-10-18 11:27:58 -->
 ## 审计背景包升级 v8 + prompt v5（用户令：为下一波外发审查准备背景文件与提示词）
+
 
 
 **位置**：`/var/minis/mounts/笔记/RikkaMinis审计背景包/`（该目录即审计发包目录，另有 `/var/minis/mounts/笔记/RikkaMinis审计全记录/`）。**交付面 = GitHub 仓库源码 zip（用户自行下载）+ `audit-context.md` + `audit-prompt-v5.md` 三件，外部审计模型无本会话任何上下文 ⇒ 两份文件必须自包含。**
@@ -34992,6 +35018,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 
 <!-- 2026-10-18 11:39:42 -->
 ## deep-audit-1025 分支清理完成（用户令「清掉」）
+
 
 
 **结果**：11/11 删除 **http 204** —— 9×`fix/da1025-*` + `integration/da1025` + `docs/dev-history-1025`。判据 `compare/main...<b>` 的 **`ahead_by == 0`**（fail-closed：有未并入分支则 `sys.exit(1)` 拒绝执行），实测 verified=11 refused=0。
@@ -35012,6 +35039,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 ## backlog 台账卫生：27 条「门未注册」类 stale 条目标闭（用户令 a11y 修复「攒着等下一批吧」之后顺手做的复核）
 
 
+
 **背景**：用户对 test_scan.py:2630 a11y 门标记遗留缺陷说「攒着等下一批吧」→ 按待办登记纪律把该条触发条件改绑到活的时点；顺手发现 backlog 里同类的「门未注册 scan.sh」条目**全都没有标闭**，收口早已完成。
 
 **a11y 条（唯一真待办，backlog §1025-C R6）**：触发条件从已过期的「主会话收口注册本批门时」改绑为「**下一批修复开工时**」，并加「亦可提前至任何一次动 `scripts/scan/test_scan.py` 的改动」（同一文件半径内，顺路成本≈0）。修法 = DA1017_GATES 里 a11y 门元组第 2 项 `"selftest passed"` → `"A11Y_STATUS_SELFTEST=PASS"`。
@@ -35028,6 +35056,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 ## deep-audit-1025 R1 机验半边完成（用户装 2280 包后令「方便完成的验证验了」）
 
 
+
 **装包身份链 ✓**：设备 `versionName=1.0.0+2280` / versionCode 220002280 / lastUpdateTime 2026-10-18 11:47:09 == release `android-latest`（RikkaMinis Android v1.0.0+2280）== main CI #2280（run 39092455333）success @ `e5c1712`；`e5c1712^{tree}` == `3bf0834^{tree}`（ca4bff07，CI #2279 核过的并集树）→ 装的就是 1025 九支修复代码。
 
 **A 支 player 真机主半边 ✓（agent 机验）**：生成 y.wav（python wave，/var/minis/workspace）→ `android-player play probe ./y.wav` → `Playing '/var/minis/workspace/./y.wav' (duration=0:01)` state=PLAYING —— 修复前相对路径 100% 失败，cwd join（resolveMaybeRelative）真在跑；日志 `D/MediaPlayerManager(3438): Playback completed: session=probe` = 真 MediaPlayer 播完。越界测例 `/etc/hostname`（**guest rootfs 实存**，6B）→ `Error: failed to play … Prepare failed` 被捕获（E/MediaPlayerManager IOException 栈），未播未崩未回落 = fail-closed 形态在场；错误走 MediaPlayer setDataSource/prepare 层（解析器未明确拒，宿主侧无对应文件），跨会话拒绝半边需双会话场景 → 攒。测完 `stop probe` 释放。
@@ -35040,6 +35069,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 
 <!-- 2026-10-18 13:06:53 -->
 ## deep-audit-1026 启动：第二道门核实完成 + 7 支派发（用户令「按流程来」，附新审计报告 8 项）
+
 
 
 **输入**：`shared-d2163f57.md`（132KB，8 ISSUE）→ `shared/work/deep-audit-1026/REPORT-1026.md`。基线 main `dc04fc3`（= 1025 收口树）。门禁基线 **105 passed / 0 failed**（pre-fix/scan-baseline.txt）。
@@ -35072,6 +35102,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 ## FIX-A 交付：deep-audit-1026 ISSUE-01（ConcurrencyPrefs 缺重预热监听 + 陈旧缓存回滚，P1）—— `fix/da1026-prefs-priming` @ `cf5c8fd`，CI #2281 绿，停在分支
 
 
+
 **任务书** `shared/work/deep-audit-1026/fix-tasks/FIX-A.md`（COMMON 实读自上级目录）；**报告** `fix-reports/FIX-A.md`（149 行 8 节无 TODO）；**装置** `probe-a/`（**仓库树外**）；基线 main `dc04fc3`。交付 3 文件 **+419/−2**：`ConfigBuiltins.kt` +47/−2 · `RuntimeLimitsScreen.kt` +26/−1 · `scripts/scan/prefs_listener_holder_guard.py` +348。
 
 **修法**：①`ConfigBuiltins.registerRuntime` 新增 `@Volatile concurrencyPrefsListener` + 在 `ConcurrencyPrefs.PREFS` 上注册重预热监听（形态逐字照抄既有 `runtimeLimitsListener`），合并重复的 `val appCtx`；②`RuntimeLimitsScreen` 监听回调**先 prime 再读**（`SharedPreferencesImpl` 派发顺序无序 ⇒ 顺序无关保险）、Save 前 prime 两缓存（断「读到陈旧缓存 → 整页批量回写 → 静默抹掉外部写入」回滚链）。**刻意不动**：`ConcurrencyPrefs` lazy 控制器/信号量尺寸不运行期重分配（prime 只让持久化值可见，不改生效时机）。
@@ -35091,6 +35122,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 
 <!-- 2026-10-18 14:10:01 -->
 ## FIX-G 收口：deep-audit-1026 ISSUE-07（ShareReceiverActivity 主线程同步导入+删暂存，P1）—— `fix/da1026-share-import-io` @ `2e680cd`，CI #2283 绿，停在分支
+
 
 
 **任务** `fix-tasks/FIX-G.md`（COMMON.md 实际在上级目录 `deep-audit-1026/`，不在 fix-tasks/）。**报告** `fix-reports/FIX-G.md`（8 节 170 行，无待填）；**装置** `repo-g/probe/`（durable，含 ci-job.log 1,173,895 B）。基线 main `dc04fc3`。交付 2 文件 **+249/−14**，两提交（`2c7084a` 生产修复 + `2e680cd` 门判据 3）。
@@ -35123,6 +35155,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 ## FIX-E 交付收口：deep-audit-1026 ISSUE-05（ProvidersCollection customBaseURL 漏守卫，P1）—— `fix/da1026-providers-baseurl-guard` @ `53c9d08`，CI run 39101827796 绿，停在分支
 
 
+
 **任务书** `fix-tasks/FIX-E.md`（COMMON 实际在上级目录，已读）。基线 main `dc04fc3`。交付 2 文件 +261/−7。
 
 **修法**：`add` payload 经新顶层 `resolveAddCustomBaseURL(raw, providerType)`（null/blank→null 放行、非空+openRouter→抛与 debug 面同句）+ write field 写前谓词守卫；消息单源 `CUSTOM_BASE_URL_OPENROUTER_MESSAGE` const（镜像 CUSTOM_USER_AGENT_OAUTH_MESSAGE 先例）；谓词 import 自 debug 包处用 **`debug-ok` 行内豁免**（debug_leak_guard 因新 import 抓红 = 全量 scan 的价值；COMMON §3 不改共享 allow-list，理由注释在 import 前一行——门只看前一行，放后一行无效，两次试错定形）。
@@ -35143,6 +35176,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 
 <!-- 2026-10-18 14:13:10 -->
 ## FIX-B 收口：deep-audit-1026 ISSUE-02（OffloadOutput.OUTPUT_FLAGS 漏 help/h + SpeakOffloadHandler 漏 booleanFlags，P1）—— `fix/da1026-offload-help-flag` @ `b3f9eb4`，CI 绿，停在分支
+
 
 
 **任务** `fix-tasks/FIX-B.md`（COMMON 实际在上级目录）；**报告** `fix-reports/FIX-B.md`；**装置** `repo-b/probe/`（durable）。基线 main `dc04fc3`。交付 3 文件 **+156/−6**（OffloadOutput.kt +14/−2 · SpeakOffloadHandler.kt +7/−1 · 门 offload_cli_args_check.py +141/−3），单提交。
@@ -35169,6 +35203,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 ## FIX-C 收口：deep-audit-1026 ISSUE-03（三屏 remember 漏绑字段值 + 刷新 Toast 读旧快照，A=P1/B=P2）—— `fix/da1026-detail-remember-keys` @ `05c9ade`，CI #2286 绿，停在分支
 
 
+
 **任务** `fix-tasks/FIX-C.md`（先读 COMMON，实际在上级目录 `shared/work/deep-audit-1026/COMMON.md`）；**报告** `fix-reports/FIX-C.md`（8 节 / 14691 B / 无 TODO）；**装置** `repo-c/probe/`（gitignore 已排除 `probe/`，不入库）。基线 main `dc04fc3`。交付 4 文件 **+483/−66**（`git show --numstat`：ProviderDetailScreen +17/−3 · ProviderConnectionScreen +9/−2 · ModelEntryDetailScreen +30/−13 · 门 +427/−48）。
 
 **修法**：①Toast 计数改在 `refreshModels` 后即时重读 `entriesFor(instance.id).size`（先核 `ProviderRepository.kt:1125` = 内存 StateFlow 同步过滤，非 Room/suspend ⇒ 不需 `withContext(IO)`）；②连接屏两处 `rememberSaveable` 补字段值键；③条目屏 13 处 keyless `remember` 补 `(entry.id, <字段初始值真正来源>)`，**刻意不绑整个 entry 对象**（`ModelGroupDetailScreen` T312 反模式：按对象绑 ⇒ 任意外部改动整体重置用户输入）。门扩既有 104 号门：新 `C5/C5a`（连接屏字段值键 + 锚点 fail-closed）、`C6/C6c`（keyless 计数为 0 / 键须含来源）、`C7a/b/c`（Toast 位置 + 实参不含未重赋 allEntries + 刷新路径须有新鲜读数），selftest 8→18 夹具（每条断言**精确失败集**），牙标记沿用 `PROVIDER_REMEMBER_SELFTEST=PASS`（工单写的 `…_KEY_SELFTEST` 与文件不符，以文件为准）。
@@ -35185,6 +35220,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 
 <!-- 2026-10-18 14:18:21 -->
 ## FIX-D 收口：deep-audit-1026 ISSUE-04（`minis-config` 加模型落库 provider 存实例 UUID + 未 trim + providerKeyMap 缺 displayName 键）—— `fix/da1026-models-provider-field` @ `4be9d09`，CI #2285 绿，停在分支
+
 
 
 **任务** `fix-tasks/FIX-D.md`（先读 COMMON，实际在上级目录）。**报告** `fix-reports/FIX-D.md`；**装置** `repo-d/probe/`（树内，`.gitignore:141` 已含 `probe/`）。基线 main `dc04fc3`。3 文件：`ModelsCollection.kt` · `ModelsDevApi.kt` · 新建门 `scripts/scan/models_provider_field_check.py`（未注册，COMMON §3 冻结）。
@@ -35212,6 +35248,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 ## FIX-F 收口：deep-audit-1026 ISSUE-06（CSV 预览绕过 readCapped 无界读 + 两预览 remember 无键）—— `fix/da1026-csv-bounded-read` @ `011812a`，CI run 39103139228 绿，停在分支
 
 
+
 **任务** `fix-tasks/FIX-F.md`（COMMON 在上级目录）。**报告** `fix-reports/FIX-F.md`（8 节 / 12794 B / 无占位符）；**装置** `repo-f/probe/`（durable、不入库：jvm/ + mutations/ + ci_judge.py + ci-job.log 1,175,860 B）；**backlog** `§1026-F`（R1-R5，扫描门 192 段 / no-触发条件 3 / 豁免 11，新段 OK）。基线 main `dc04fc3`。交付 **3 文件 +484/−25**（未动 `scan.sh`/`test_scan.py` —— 扩展既有门而非新建，无需收口期注册）。
 
 **修法**：①裂口 A（P1）`CsvPreview` 的裸 `bufferedReader().readLine()` 循环（只有 200 **行**上限、无字节上限）→ 复用 `readCapped(512KB)` 链路：新增标记区 `csv-bounded-preview`（`CsvPreviewSlice` + `readCsvPreviewSlice` + `splitPreviewLines`），**残行策略 = 截断时 `dropLast(1)` 丢残片**（宁可少显示不留半个谎，KDoc 写明代价：切点落在换行符上会多丢一条完整行），字节/行两个截断旗标 → 两条独立横幅；②裂口 B（P2）`TextPreview`/`MarkdownPreview` 的 `remember { }` → `remember(item.file) { }`。字符串复用既有 `filepreview_truncated_kb/_rows`（7 语言目录全在，**无新增 → 无 8 语言同步面**）。
@@ -35234,6 +35271,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 ## FIX-H 收口：deep-audit-1026 ISSUE-08（group context-limit 写漏斗不同步 + `get groups` 缺两键，P2）—— `fix/da1026-group-sync` @ `0353112`，CI #2288 绿，停在分支
 
 
+
 **任务** `fix-tasks/FIX-H.md`（COMMON 实读自上级目录）；**报告** `fix-reports/FIX-H.md`（8 节 / 16002 B / 无 TODO）；**装置** `repo-h/probe/`（jvm/{extract.py,run.sh,stubs,tests} · mutations.py · run_mutations.sh · ci-job.log 1,174,770 B · scan-full/testscan-full.txt）。基线 main `dc04fc3`，修复前源码臂 = `cf5c8fd` **字节快照**（常量锚，非 HEAD）。交付 3 文件 **+303/−12**（门 +277/−12 · ConfigBuiltins +18 · GroupsCollection +8），单提交。
 
 **两裂口**：A `GroupsCollection.add`（:78-88）构造 ModelGroup 后直接 `repo.addGroup(g)`，**写漏斗 helper 零调用** ⇒ CLI 建的组 `lastContextLimitTokens` 停在 null，与 UI 滑块/CLI 字段 writer 不一致；B `ConfigBuiltins` groups 汇总（`path = "groups",` :1364）只有 5 键，**缺 `default_thinking_level` + `context_limit_tokens`** ⇒ `minis-config get groups` 读不回（1020 providers/UA、1025-E envvars/group 同族第 3 次）。**修法**：`add` 内 `repo.addGroup(g)` 前插 `applyContextLimitWrite(g, contextLimit ?: 0)`（与 writer body :238 同出口；`?: 0` 因 helper 形参非空 Int 且 0 即「无 override」编码，不扩 helper 契约）；汇总补两键，token 词表复用同类私有 `thinkingLevelToToken`（**零新增映射**），Null-for-absent、可 round-trip 回 add。
@@ -35252,6 +35290,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 
 <!-- 2026-10-18 15:32:47 -->
 ## deep-audit-1026 收口完成（用户令「按流程来」→ 8 支全绿 → 并集树 CI 绿）
+
 
 
 **身份链**：基线 main `dc04fc3` → 8 支（A..H，逐支 CI 绿）→ 并集树 `integration/da1026` **`ad0c5d78c9024750df52bc7c57c3eba5e338b6f0`**（8 次 --no-ff 零冲突 + 门注册提交）。**CI run 39107210376 success @ ad0c5d7**（07:19:15Z→07:30:33Z），本地 HEAD == 远端 tip == CI head_sha 逐字符一致。规模 **24 文件 / +2888 −242**。
@@ -35284,6 +35323,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 ## deep-audit-1026 合并 main + 文档归档完成（用户令「合并，不要忘了文档」）
 
 
+
 **合并**：`integration/da1026`（@ `ad0c5d7`）`--no-ff` 合入 main → **`3f99b30ce582c454754184405ad0db7c08d546f5`**；**树对拍 `main^{tree}` == `integration/da1026^{tree}` == `9a6b3c8d0aef3d7545320311bfc77de10dde58c8` 逐字节一致** = 「我看过的树 == 线上树」。**main CI #2290（39108142056）success @ 3f99b30**（push 自动触发）。
 
 **文档三件套重建**（`dev-history-sync` skill v2.1.1）：**1952 条**（1937→1952）/ 77 天（2026-08-03～10-18）/ 24 sagas / 180 orphans（9.2%）/ multi4=126。fences 82 偶、anchors==header==1952、outOrder 0；脱敏三轮（main+INDEX、SAGAS 单独）均 `Remaining sensitive: NONE`。README 计数 1937→1952。云分支 `docs/dev-history-1026` @ `be570a2`（三文件 sha256 与本地逐字节 SAME）→ `--no-ff` 合并 → **main `9d18269`** → push。**纯文本例外实测**：docs merge push **未触发新 run**（最新 run 仍 #2290 @ 3f99b30）✓；415+/27− 仅 docs/dev-history。
@@ -35305,6 +35345,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 ## ARCH-01 交付：ProviderWriteRules 单源校验层（`fix/da1026-arch01-provider-write-rules` @ `5737f75`，CI run 39110944268 success，停在分支未合并）
 
 
+
 **任务** `ARCH-COMMON.md` + 蓝图 `ARCH-01` 小节（Provider / Model 跨面写入规则收口）。**报告** `fix-reports/ARCH-01-REPORT.md`（11223 B，§1–§9）；**装置** `repo-arch1/probe/`（durable，`.gitignore:141` 已含 `probe/`）。基线 main `9d18269937f4dba4b3b5fc788ae0e81b6f304990`。
 
 **交付 5 文件 +601/−41**（单提交）：新建 `config/collections/ProviderWriteRules.kt`（+90，纯 JVM 规则层：`isCustomBaseURLWriteAllowed` / `normalizeCustomModelId` / `canonicalModelProviderName` / `CUSTOM_BASE_URL_OPENROUTER_MESSAGE`）· `ProvidersCollection.kt`（writer 改走共享谓词，删内联重复）· `debug/ProviderMutationMethods.kt`（create/update 守卫引共享消息 + modelsAdd 用共享归一化/标签）· 扩展门 `provider_rpc_symmetry_check.py`（+98）· 新建门 `provider_write_rules_check.py`（+372）。
@@ -35322,6 +35363,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 
 <!-- 2026-10-18 16:47:15 -->
 ## ARCH-03 收口：ProviderType 编译期穷举元数据契约 —— `fix/da1026-arch03-provider-type-registry` @ `22a15ed`，CI run 39110831683 success，停在分支
+
 
 
 **任务**：pinned 指令 = 读 `shared/work/deep-audit-1026/ARCH-COMMON.md`，执行同目录 `ARCH-BLUEPRINT.md` 的「ARCH-03」小节。基线 main `9d18269`。交付 **3 文件 +554/−1**（`ProviderConfig.kt` 两穷举 `when (this)` 扩展属性 `modelsDevProviderIds`/`legacyProviderNames`（**无 else**）· `ModelsDevApi.kt` `providerKeyMap` = 10 字面量键 verbatim 保留 + `ProviderType.values().flatMap{…}.toMap()` 派生合并 · 新建门 `scripts/scan/provider_type_registry_check.py` +491）。**报告** `fix-reports/ARCH-03-REPORT.md`（14,004 B，§8/§6/§9 已回填）；**装置** `repo-arch3/probe/`（不入库，`.gitignore` 排除；`jvm/{extract.py,Arch03Test.kt,run.sh}` + `mutations.py` + `run_mutations.sh` + **`run_arms.sh`** + `run_testscan_sections.sh` + `ci_fetch.py`）。
@@ -35344,6 +35386,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 ## ARCH-02 收口：PrimedPrefs 自治重预热契约（`fix/da1026-arch02-primed-prefs` @ `0f9f7cd`，CI #2293 绿，停在分支）
 
 
+
 **任务** `/var/minis/shared/work/deep-audit-1026/ARCH-COMMON.md`（工单 = `ARCH-BLUEPRINT.md` 的 ARCH-02 小节）。**报告** `fix-reports/ARCH-02-REPORT.md`（§1-§9 / 17447 B）；**证据归档** `probe-arch2-evidence/`（ci-job.log 1,179,249 B · gate-pre/post-tree.log · gate-selftest.log · full-scan/testscan-final.log）；**backlog** `§ARCH-02`（R1-R9）。基线 main `9d18269`；两提交：`befb9f7`（生产+门）· `0f9f7cd`（门收窄，由全量 test_scan 逼出）。
 
 **交付** 4 文件 **+434/−5**（门 +286/−2 · AgentRuntimeLimitsPrefs +53/−1 · ConcurrencyPrefs +51/−1 · FastModePrefs +44/−1）。生产改动 148 增/3 删，**零新增文件/依赖/配置项**（阶梯停在第 7 级）。
@@ -35364,6 +35407,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 
 <!-- 2026-10-18 17:18:48 -->
 ## ARCH 批次收口完成（用户「他们完成了」/「跑完了」）：3 支并入并集树，CI 绿 @ 407bdd4
+
 
 
 **身份链**：基线 main `9d18269` → 3 支 → 并集树 **`integration/da1026-arch` @ `407bdd4`**（3 次 `--no-ff` 零冲突 + 门注册提交）。
@@ -35397,6 +35441,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 ## ARCH 批次合并 main + 文档归档完成（用户「合并，并更新文档」）+ CI 假红取证（flaky）
 
 
+
 **身份链**：并集树 `integration/da1026-arch` `407bdd4`（CI #2294 success）→ **main `4822410`**（--no-ff，树对拍 `9f793097` 逐字节一致）→ 文档合并 → **main `d6d16f5`**。
 
 **★ main CI #2295 红→绿 = 假红（flaky），已完整取证**（报告 `deep-audit-1026/FLAKY-2295.md`）：
@@ -35418,6 +35463,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 ## 1026 + ARCH 全批次收官：分支清理 15/15 + flaky 攒批（用户拍板）
 
 
+
 **用户判问**：flaky 是否影响应用正常运转？→ **确认不影响**（两文件都在 `src/android/app/src/test/` 测试源集，**不进 APK**；生产 `BrowserRssProbe.kt` 的 `summary()` 空态返回 `(no data)` 是设计；代价仅在 CI 侧 = 偶发假红白烧一轮 + 可能掩盖同 JVM 真实失败）。用户拍板「先攒着，等下一批一起处理」。
 
 **backlog §1026-FLAKY 已改绑触发条件**：从「下一次想让它不再假红时」→ **「下一批缺陷修复开工时一并处理」**（亦可提前至任何动 `BrowserRssProbe*` 测试文件的改动，顺路成本≈0）；搁置理由注入口径（test 源集不进 APK + 用户确认）。
@@ -35437,6 +35483,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 ## 下一批审计准备：背景包 v9 + 提示词 v6 + 三项提案评估（2026-10-18）
 
 
+
 **用户令**：为下一批审计做准备（挂载文件夹里的背景文件 + 提示词，该改的改）；检查本地与云端 dev-history 是否更新，没有则更新；并评估三项提案（UI 动作差分 / Set-of-Marks / 沙箱快照回滚）是否有必要、是否符合「只把必要的任务加进去（背景文档 + 加任务）」的既定规则。
 
 **背景包更新（`/var/minis/mounts/笔记/RikkaMinis审计背景包/`，基线 `dc04fc3` → `d6d16f5`）**：
@@ -35454,6 +35501,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 
 <!-- 2026-10-18 18:16:00 -->
 ## 1026+ARCH 批次装机验证完成（用户令「老规矩验证，UI 先放着」）
+
 
 
 **装机**：`1.0.0+2295`（lastUpdate 17:53:08）= run #2295（39114863481，attempt 2）产物 @ `4822410`。
@@ -35476,6 +35524,7 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 ## 「秩序/熵」框架的落点判断：一次实测 + 三根候选轴（登记不建装置）+ 归口纪律（2026-10-18）
 
 
+
 **用户给的框架**（结构秩序=依赖图无环/分层/主序列；信息秩序=可压缩性/每功能增量/重复率；行为秩序=可预测性/测试即约束行为空间；再生性=变更失败率/爆炸半径/DORA），问「之前修改的是否要因此加东西 / 有什么启发」。
 
 **我的判词（三句）**：
@@ -35493,6 +35542,137 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 **backlog §ORDER-1018（三根候选轴，各带触发条件）**：①**依赖环检查**——触发 = 有人真动依赖结构（拆模块/换 DI）或"一次修复被迫跨 ≥3 包互改"≥2 次；触发后先出**环边清单**（给人看，不加门）；搁置理由 = 单模块跨包互引是常态、环不构成缺陷、无事故归因。②**克隆率趋势**——触发 = 1027 轮收口时重跑同脚本对比（克隆率上升 + 机制候选仍集中三热区 ⇒ **只调整收口型改动的排序，不建度量装置**）；搁置理由 = 单次测量无语义，17.4% 不该当 KPI。③**幂等/错误一致性**——触发 = 出现重试/重放导致重复副作用的实际事故；触发后只在单一具体路径补断言。
 
 **★ 框架对三项提案的第二个用处（加论证、不改结论）**：UI 动作差分 = 把「动作→效果」从不可判定变可判定＝**行为秩序轴提一格**（与我"弱通过"判定同向）；Set-of-Marks = **四根轴一格不动**（纯渲染层）⇒ 不通过不变；**沙箱快照 = 唯一被框架加分的一项**（对应再生性/DORA 恢复时间）——判定不变（事故实证仍只 1 次且根因已由纪律根治），但如实记：**若复活，框架给的论证是"恢复时间"而非"防误操作"，且第一级仍先做破坏性操作 pre-flight 而不是建快照层**。
+
+---
+
+*本文件由 memory daily logs 自动重建（脚本保存在 skill: dev-history-sync/scripts/），重建时剔除与 RikkaMinis 应用开发无关的内容（其他仓库/平台账号工具链/网络代理/元讨论/生态调研）及敏感信息（账户标识/凭据已脱敏）。*
+
+<!-- 2026-10-18 19:47:28 -->
+## deep-audit-1027 启动：第二道门核实 + 7 支派发（用户令「走流程」，附新审计报告 8 项）
+
+
+【本条为 12:56 UTC 日报截断事故后由主会话重建：原文不可逐字节取回（app 日志仅存前 309 字符、语义索引最后 build=10-10），以下按本会话记录与 TRIAGE/DISPATCH 台账重写；事实以台账文件为准】
+
+**输入**：`shared-41e4ba59.md`（115,588 B / 1273 行，Round 1027，8 工单 / 11 裂口，自评 P1×6 + P2×2，0 P0）。基线 main `1f6ca13`。工作区 `shared/work/deep-audit-1027/`。
+**第二道门**：不采信报告行号，8/8 缺陷本体回本树核实成立；判级 = 自评一致（P1×6 + P2×2）；ISSUE-02+08 同文件冲突合为 E 支。详见 `TRIAGE.md`。
+**门禁基线**：`scan.sh` 108 passed / 0 failed（`pre-fix/scan-baseline.txt`）。
+**派发**（7 支会话子代理，`minis-sessions-cli send --async`，一次成发，回读 7/7 送达 marker≥2）：
+| 支 | 工单 | session |
+|---|---|---|
+| A | ISSUE-01 | ***UUID*** |
+| B | ISSUE-03 | ***UUID*** |
+| C | ISSUE-04 | ***UUID*** |
+| D | ISSUE-05 | ***UUID*** |
+| E | ISSUE-02+08 | ***UUID*** |
+| F | ISSUE-06 | ***UUID*** |
+| G | ISSUE-07 | ***UUID*** |
+任务书 `fix-tasks/FIX-A..G.md` + `COMMON.md`；台账 `DISPATCH.md`；判级 `TRIAGE.md`。开工 5 分钟抽查：7/7 已克隆 + 各支先证文件在写。
+
+<!-- 2026-10-18 20:05:00 -->
+## 并发派发踩门禁的解法：gate_run.sh（用户提出「多任务派发跑门禁会互相踩，怎么解决」）
+
+
+【本条为 12:56 UTC 日报截断事故后由主会话重建：原文不可逐字节取回，按本会话记录与落地文件重写】
+
+**诊断（两层）**：①结构层 = COMMON「施工期本地跑全量」+ CI workflow 本就跑全量（build-apk.yml:47/:51）⇒ 7 支并行 = 全量被重复跑 8 份，对分支零新增证据；②机械层 = 并发窗口重叠时 PRoot fork/clone 概率性失败（sandbox-limits §S28），症状 = 假红（`Function not implemented`）/ 整链半途死 / shell 直接死；实测一条只读探测把整个 shell 跑死（`python3: Function not implemented` + `can't create /tmp/.minis_cwd_XXXXXX`）。
+**落地**：`/var/minis/shared/tools/gate_run.sh` —— 全局 flock 互斥 + 分层（--gate / --subset / --full）+ ENOSYS 自愈重试 + envretry 计数（BusyBox flock 无 `-w` → `-n` 轮询实现 WAIT）。测试：subset 4/4 GREEN；一次撞 S28 后按纪律空档 60s 重跑成功；`sh -n` OK。
+**配套改文件**：COMMON v1.1 删「施工期本地跑全量」（全量交分支 CI）；sandbox-limits §S28 加「da1027 并发窗口」变体；skill `rikkaminis-dev-methodology` §6.8 并发门禁纪律；fix-harness-playbook / batch-common-template / tools/README 同步。
+**决策**：不打扰跑批中的 7 支（中途注入 = 未测失败模式），工具进下一批标准路径 + 收口期主会话用它跑全量。
+**收口期后记（同日补）**：串行窗口 `--full` 108/108、sandbox=0、envretry=0 —— S28 在串行下完全消失，与并行窗口高发形成正反对照。
+
+<!-- 2026-10-18 20:55:00 -->
+## FIX-D 收口：deep-audit-1027 ISSUE-05（RootfsVM 两次 verifyIntegrity 主线程直调）—— fix/da1027-d-rootfs-io @ a7aa249，CI #39127888788 绿，停在分支
+
+
+**修法**：`repairRootfs(ctx)` 整体并入一个 `viewModelScope.launch`，两处 `manager.verifyIntegrity()`（基线 `:173` 点击回调内 / `:191` launch 内 Main.immediate）各包 `withContext(Dispatchers.IO) { … }`；健康短路 `return` → `return@launch`（承重标签，mut4 证明去掉 = kotlinc `'return' is prohibited here`）；`isProcessing` 顺序 / try-catch / 三条 R.string 逐字保真；`autoRepair()` 不动。调用点盘点 11 处：只修 UI 层 2 处，`RootfsManager` 内部 6 + `PRootKernel:139` 全不被动。2 文件 +136/−16（guard.py +109）。
+
+**验证四层**：门差分改前 rc=1（:184/:203 精确）/ 改后 rc=0 · 门 selftest 17→**23 arms**（新 6 臂：io/direct/launch_only/inline_io/anchor-rot/never-shipped）· 行为 **6 臂**（fixed GREEN 4 tests / baseline RED 4（3 例 main 线程记录）/ mut1 RED 4 / mut2 RED 3（=到达第二读的测试数）/ mut3named 行为 GREEN+门 RED=分层 / mut4 COMPILE-FAIL 带针）· 门变异 **4/4 PRECISE**（MUT-3 变异字节与 mut3named.kt sha256 逐字节一致）· 全量 scan **108/108** + test_scan **329/329**。
+
+**装置耐久性（两次事故）**：①S28 两次（第二次打在 mutations.py 嵌套 subprocess 上，工作树留在变异态）→ 恢复 = git show 字节写回 + sha256 对拍；根治 = 驱动**分层**（python 只做 heal/apply/restore/check 字节编辑，shell 编排子进程，每轮先 heal）。②期望失败数两处错：mut2 期望 2→实证 3；门 needle 行号 :184/:203→实证 :183/:202（**3 行块折 1 行后调用行号上移**——变异期望的行号必须对变异后文件数，不能从修复文件推导）。
+
+**登记（backlog §1027-D）**：R1 真机行为级未验证（修复按钮不再掉帧需装包核）；R2 门对具名参数形态判红是刻意严格（fail-closed 分层）；R3 Main.immediate 语义模型（桩近似 + mut4 编译证据 + launch_only 臂双面钉住）；R4 scan.sh/test_scan.py 未动（108/329 不变）。
+
+<!-- 2026-10-18 21:02:23 -->
+## FIX-C 收口：deep-audit-1027 ISSUE-04（Xunfei 空转写被当成功结果返回）—— `fix/da1027-c-xunfei-transcript` @ `d01da0d`，CI #39128561098 绿，停在分支
+
+
+**任务**：读 `shared/work/deep-audit-1027/fix-tasks/FIX-C.md` + `COMMON.md`（注意：`COMMON.md` 在 **上级目录**，不在 `fix-tasks/`）。**报告** `fix-reports/FIX-C.md`（8 节）；**装置** `repo-c/probe/{jvm,ci}/`（留盘不入库）；**backlog** §1027-C（机械门 208 段 OK）。基线 `1f6ca13b52db`，2 提交 +194/−2。
+
+**缺陷与修法**：`VoiceProviderVendors.kt:318-335` 的 Xunfei 解析器只给 **Base64 信封** 装了 `takeIf{isNotEmpty()} ?: throw Parse`，**组装结果** `sb.toString()` 裸返回 → `ws:[]` / `cw:[]` / `w:""`（解析器专门处理这三种形状 = 预期输入）都把空串当**成功**。消费侧 `ProviderSpeechRecognitionEngine:236-250` 的契约是：**抛异常 → catch → 换下一个候选**；**空串 → 钉 sticky 首位 + NO_MATCH + `return@launch` 终止整条链**。修法 = 补同形守卫（`val transcript = sb.toString().takeIf { it.isNotEmpty() } ?: throw VoiceProviderException.Parse("Unexpected Xunfei ASR response format")`），与基类/Doubao/Deepgram **同惯用法**——「守卫装错层」**第 3 次复发**。
+
+**★ 可复用教训**：
+1. **字符串感知的括号 walker 必须 `i += 1` 跨过闭引号**——首版用 `continue` 直接回到同一引号当开引号重入，**全文件字符串错位** → 真树首跑就红（方向反过来就是静默假绿）。
+2. **同文件多厂商 override 同一函数时，判据必须先按类锚定作用域 + 用 discriminator 兜底信（本支 = `optJSONArray("ws")`）**，否则会去评分兄弟解析器的副本；抽出物不含信 = fail-closed 红。
+3. **门的正则要把"守卫 + 消息"绑在同一锚点**：否则改消息（= 改降级契约，`catch(Exception)` 靠异常类型/消息分流）能溜过门。变异 m2 证明 JVM 侧的消息字面量断言也能咬住。
+4. **变异臂要诚实分层**：m3（等价写法 `if (isNotEmpty()) return`）门红 JVM 绿 = 门钉惯用法；m4（删信封守卫）**两层都不红** = 该守卫对解析器可能收到的输入**行为冗余**（三条路径都落进同一个 `runCatching → Parse`）→ 登记不加判据（装置比例）。
+5. **probe 的 `.kt` 与仓门 `ROOT.rglob("*.kt")` 共存实测无假红**（108/0 是 probe 在场时跑的）；两个 rglob 门（`extra_days_container_guard` / `dao_loadmessages_check`）判据都不命中 probe 代码 → 不必事先 .snap 改名。
+6. **全量 scan 首轮在 `[47/108]` 后整段 `[Errno 38] Function not implemented`（文件读取级 ENOSYS，655 条）**= S28 沙箱症状（不是代码坏）；间隔后整轮重跑 **108/0、0 次 ENOSYS**。
+7. **自写 chunk 脚本踩坑**：从 `scan.sh` 切门块时必须**重算 ROOT**（切出来的脚本 `dirname $0` 指向新位置 → `can't open file /var/minis/shared/scripts/...`，全红是脚本错不是沙箱）。别急着建装置——全量一次跑通往往就够（用户当时明说"只有你在跑重活，不会出那些问题"）。
+8. **CI 判读复用**：`probe/ci/ci_judge.py`（token 只从 env 读、从不打印；job 日志走 `NoRedirect` 拿 302 Location 再裸下载）。本支日志 1,180,272 B：`PASS voice_cancel_guard_check (… Xunfei transcript …)` + `selftest has teeth` + `real tree green` + `Summary: 108 passed, 0 failed` + `ALL 329 CASES PASS` 全在册；6 条含 `FAILED` 的行逐行确认为 PASSED 用例名子串。
+
+**负决策**：不改 `VoiceProvider.kt:176` / `Vendors.kt:229` 两处过时注释（本修复落地后**恰好成真**）；不动引擎 `NO_MATCH` 分支（其 KDoc 服务"合法空转写"，本缺陷是**解析失败**被误装成它）；不注册新门、不动 `scan.sh`/`test_scan.py`（门 108 / 夹具 329 不变）。
+
+<!-- 2026-10-18 21:09:49 -->
+## deep-audit-1027 FIX-E 收口（ISSUE-02+08 合支，停在分支）2026-10-18
+
+
+**身份链**：基线 main `1f6ca13` → 分支 `fix/da1027-e-remember-keys` @ **`5c648634fb4b29bdaf431386bc00e7c00527120c`**（单提交，5 文件 +310/−13）→ CI **#2302（run 39128718515）success**，head_sha 本地==远端==CI 三方逐字符。**未合并 main**（含 .kt 验证面，起手权在用户）。
+
+**合支理由**（主会话冲突矩阵）：ISSUE-02 与 ISSUE-08 唯一共同文件 = `provider_remember_key_check.py`（前者加 C8/C9，后者加 C10）→ 分两支必冲突；其余文件零交集。
+
+**修法（4 处全部先回树复核行号，命中）**：①`ModelGroupDetailScreen.kt` 5 个编辑态 `remember(group.id)` → `remember(group.id, group.<field>)`（:119/124/125/131/134 → 改后 :119/124/125/136/139；后果不是"显示旧值"而是**失焦回滚把外部写入覆盖掉** = P1）；②`MountDetailScreen.kt:94` 加 `entry.userAllowWrite` key（报告称"canSave 反转"，按树口径记为「与屏上开关脱钩：没动开关却亮 Save，点一下写回旧值」）；③`AppNavigation.kt` 用量路由 `.value` → `by … collectAsState()`（:15 的 import **改前未使用**，本支首次启用 → 无需加 import）；④`UsageStatsScreen.kt:91` `LaunchedEffect(range)` → `(range, providerConfig)`。
+
+**★ 三条可复用手法**：
+1. **判据「只把初始化器算作读取」**（C8/C9 与既有 C5 的刻意差异）：C5 用 span（含 keys）→ 判据自我满足、变异删了 key 也绿；C8/C9 只看 init ⇒ 「keys 里有该字段」才成立。写进门函数 docstring。
+2. **行为层替代装置 = 形状断言双臂回放 + 期望值写死字面量**（Compose 屏无 Android SDK 编不了）：8 处 group/mount/effect/nav 断言 + **1 条"不得改动"的回归锚点**（`memberIds` 必须仍是单 key）——预修臂上锚点仍 OK，证明装置有分辨力不是"什么文本都红"。
+3. **S28（`Function not implemented`）健康路径实测有效**：`scan.sh` 整链两次被打断 → 把冻结的 scan.sh 按门块切 14 个 chunk（preamble/门块/summary 逐字保留）+ 可续跑驱动（结果落盘、重试、识别 S28 特征串）→ **14/14 rc=0**，与后来整链复跑 `108 passed / 0 failed` 读数一致。python 侧 `subprocess.waitpid` 同样炸 Errno 38 → **变异驱动拆成 python 只做字节编辑 + shell 负责跑门**。
+
+**证据面**：门真树 GREEN（C8 7 站/C9 1 站/C10a/C10b）；`--selftest` **26 夹具 0 MISMATCH**（新增 8 条=4"恰好被它打破"+4 fail-closed）；**真源差分** `prefix_gate_probe.sh`（4 文件回改前 → RED 且失败集**恰为** {C8,C9,C10a,C10b}，逐站指名）；**变异 4/4 PRECISE**（每条只红自己那条，`sha_mismatch=0`，先提交再变异、驱动不碰 git）；`test_scan.py` **ALL 329 CASES PASS**（扩展既有门 → 夹具表无需改，该门在 test_scan 只断言带牙标记）；CI 侧**编译层**（`:app:compileReleaseKotlin` 通过）是本支唯一可被机器证的层。
+
+**CI 判读陷阱复现**：日志里 grep `Publish` 命中 9 行**全是单测用例名**（`StaleStreamPublishPolicyTest …`）→ 步骤结论只能取 API `steps[].conclusion`（=`Publish to Releases skipped`）。本次含 FAILED 且不含 PASSED 的行 = 0。
+
+**同族扫描结论（fix-completeness）**：全仓 `remember(<x>.id)` 共 9 处 —— 7 处纯 UI 标志（identity-keyed 正确）+ 2 处派生值复核**均正确**（`QuickTestSheet.kt:162` 有 `LaunchedEffect(entry.id)` 重播种；`ConfigConfirmDialog.kt:68` pending id 唯一 + 重同步）⇒ **没有第 3 处同缺陷**，半径不扩。
+
+**登记 backlog §1027-E（R1–R5，机械门 209 段 / §1027-E 判 OK）**：R1 真机三条行为级；R2 `UsageStatsScreen.kt:126` 注释不完备（原句仍成立 → 不为一句注释重跑 16 min CI）；R3 同族结论；R4 门注册无需动作（扩展非新建）；R5 装置耐久性。**未合并、未改 DISPATCH.md**。报告 `shared/work/deep-audit-1027/fix-reports/FIX-E.md`（8 节 / TODO 0 / 装置表可复跑）。
+
+<!-- 2026-10-18 21:10:00 -->
+## backlog 覆盖事故（同族复发第 2 次）：file_write 未加 append 覆盖 ~209 段台账 + 重建完成
+
+
+**事故**：20:56 用 `file_write`（未设 append）写 §1027-D 到 `shared/backlog.md`，整文件被覆写成 25 行（原 ~209 段）。恢复 = `backlog.md.bak-20261018-114456`（185 段，11:44 快照）+ 从各支报告「残留与登记」节 + 当日日报重建 24 段（§1026-A..H、§ARCH-01/02/03、§1026-CONVERGE/FLAKY、§PROP-1018×4、§ORDER-1018、§1027-A..G）。终态 **212 段 / no-触发条件 3 / 豁免 11**（与覆盖前口径一致）。上一同款事故：2026-10-17（§145–§155 重建条）——**第 2 次复发，规则已写进 LEARNINGS（LRN-20261018-B1）+ backlog §REBUILD-20261018-门**。
+
+**可复用要点**：①机械信号 = `scan_debt.py notes` 段数骤降（209→1），比靠记忆发现快；②重建条措辞必须用「触发条件」（机械门认字面，写「**触发**」被判 no-触发条件）；③多段台账追加必须 append=true 或 `>>`，整文件重写前先 cp 快照；④升级触发 = 第三次复发 ⇒ 做统一脚本入口（快照 + 段数校验）。
+
+<!-- 2026-10-18 21:38:26 -->
+## deep-audit-1027 收口完成（用户「他们都跑完了」）：7 支并入并集树，CI 绿 @ 5030841
+
+
+**身份链**：基线 main `1f6ca13` → 7 支（A–G）→ 并集树 **`integration/da1027` @ `5030841`**（7 次 `--no-ff` 零冲突）→ 并集 CI **#2303（39131097372）success**，三方逐字符一致。
+
+| 支 | ISSUE | 分支 HEAD | 支 CI |
+|---|---|---|---|
+| A | 01 会话作用域路径解析 | `3ab8bde` | #2299 |
+| B | 03 webDavUploadPending 污染 | `201a99f` | #2296 |
+| C | 04 Xunfei 空转写守卫错层 | `d01da0d` | #2301 |
+| D | 05 主线程 verifyIntegrity | `a7aa249` | #2300 |
+| E | 02+08 remember 键/.value | `5c64863` | #2302 |
+| F | 06 全屏播放器终止路径 | `e1d1a14` | #2297 |
+| G | 07 Broker 消费边界 | `ff4d858` | #2298 |
+
+**17 文件 / +1392 −49**；7 支文件集**两两互斥**（7 门 + 11 Kotlin），无一支碰 `scan.sh`/`test_scan.py` → **门数 108 / 夹具 329 不变，无需重编号**（本批全为扩展既有门）。
+
+**★ 本轮首次用 gate_run.sh 收口（并发纪律的工具化验证）**：`--full` 在并集树上 **108 passed / 0 failed / 0 sandbox / 0 env-retry**，`test_scan` **ALL 329 CASES PASS**；7 门 `--selftest` 全带牙标记。**对照**：施工期 7 支并行时 S28 在 A/B/C？/F/G 多支命中（B 支整链两次半途死、F 支报 94 passed/14 failed 全带 S28 签名、G 支 13 passed/95 failed 假红）——**串行窗口里 0 次 S28**，机械层有效性有了正反对照。
+
+**独立于 CI 的差分证据（并集树上实跑，非报告转述）**：F `inline_player_probe.py` → `PROBE: ALL ARMS OK`（pre RED / post GREEN）；E `prefix_gate_probe.sh main` → RED 逐站指名（L109/L114/L115/L121/L124 五个 group 站点 + L80 + C10a + C10b）→ `@HEAD` 全 PASS（同一门跑真源码、零夹具 = 最强形态）；A `replay_probe.py` → `REPLAY_PROBE=PASS`（含对照臂「别的会话的 pending 必须留着」）；G `anchor_probe.py` → `ANCHOR_PROBE=PASS`。
+
+**并集 CI job 判读**（`verify/union_ci_judge.py`，日志 1,177,438 B）：26 步 `failed=[]`、唯一 skipped = Publish（main 门控）；`Summary: 108 passed, 0 failed`；`[1/108]`→`[108/108]` 在册；`ALL 329 CASES PASS`；含 `FAILED` 的 6 行**全部 PASSED 结尾**（判读陷阱第 N 次复核）；7 个被改的门各在日志里留痕（`readonly_mount_write_guard` 的标记形态不同 → 用「on real repo exits 0」行取证）。
+**下载 job 日志的正确姿势（本轮踩坑修正）**：第一跳**必须带** `Authorization` + `Accept: application/vnd.github+json` 才拿得到 302 Location（裸请求直接 403 且无 Location）；第二跳 Location **不可带 auth**。
+
+**★ 本批两件副产品（都在「并发写共享资源」这条线上）**：
+1. **`shared/backlog.md` 第二次被覆盖**（某会话用 `file_write` 未 append 写 §1027-D，~209 段 → 25 行；靠 11:44 快照 + 报告重建 24 段，终态 212 段；详见 backlog §REBUILD-20261018-门 与日报）。→ 我把原定「第三次复发才做脚本」升级为**现在就做**：`/var/minis/shared/tools/shared_append.sh`（每文件独立 flock + 写前快照保留 5 份 + **段数守卫：减少即自动回滚**；`--check` / `--restore`）。负控实测：正常追加 ✓、0 段 payload 允许 ✓、**两个并发追加串行化 1→2→3 无丢更新** ✓、越权覆盖会被守卫拦下并回滚。理由：P0 级（数据丢失）+ 该路径每批必走（7 支都写 backlog），不该等第三次。
+2. **并发踩踏的机制确认**：S28 只在并发窗口高发，串行 0 命中 —— 与「本地全量 = CI 的 N 倍重复」这一结构判断互相印证。
+
+**待用户**：合并 `integration/da1027` 进 main；真机行为级（各支 R1）；远端 9 支分支清理（7 fix + 1 integration + …）。
 
 ---
 
