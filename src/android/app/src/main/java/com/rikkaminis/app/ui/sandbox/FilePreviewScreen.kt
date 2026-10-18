@@ -96,6 +96,11 @@ import com.rikkaminis.app.ui.components.MinisTextButton
 
 private const val MAX_TEXT_PREVIEW_BYTES = 512_000 // 500 KB
 
+// [da1026-F] Row cap for the CSV/TSV table preview — unchanged from the
+// original loop (`if (read >= 200)`). A row cap alone is NOT a memory bound;
+// see [readCsvPreviewSlice].
+private const val MAX_CSV_PREVIEW_ROWS = 200
+
 // [rv1014-E1] Fixed read buffer for [readCapped]: one 64 KB chunk per read()
 // syscall, no size surprises for small or huge files alike.
 private const val READ_BUFFER_BYTES = 64 * 1024
@@ -268,9 +273,16 @@ private fun TextPreview(item: FileItem) {
     // [fix/render-ui F-276] Error fallbacks below are user-visible; resolve
     // them through resources like the rest of this screen.
     val context = androidx.compose.ui.platform.LocalContext.current
-    var content by remember { mutableStateOf<String?>(null) }
-    var truncated by remember { mutableStateOf(false) }
-    var error by remember { mutableStateOf<String?>(null) }
+    // [da1026-F] These three had no `remember` key, so Compose reused the slot
+    // across file switches: `error` in particular stayed non-null until the new
+    // read finished (and if the new read succeeded it was never cleared at
+    // all, because the success path only assigns `content`), leaving the error
+    // banner permanently masking the newly opened file. Keyed on item.file the
+    // state is discarded on switch — same form CsvPreview/JsonPreview already
+    // used.
+    var content by remember(item.file) { mutableStateOf<String?>(null) }
+    var truncated by remember(item.file) { mutableStateOf(false) }
+    var error by remember(item.file) { mutableStateOf<String?>(null) }
 
     LaunchedEffect(item.file) {
         withContext(Dispatchers.IO) {
@@ -355,8 +367,11 @@ private fun MarkdownPreview(item: FileItem) {
     // [fix/render-ui F-276] Error fallbacks below are user-visible; resolve
     // them through resources like the rest of this screen.
     val context = androidx.compose.ui.platform.LocalContext.current
-    var content by remember { mutableStateOf<String?>(null) }
-    var error by remember { mutableStateOf<String?>(null) }
+    // [da1026-F] Same unkeyed-remember defect as TextPreview above: a stale
+    // `error` from the previous file masked the next one (the success path
+    // never clears it).
+    var content by remember(item.file) { mutableStateOf<String?>(null) }
+    var error by remember(item.file) { mutableStateOf<String?>(null) }
 
     LaunchedEffect(item.file) {
         withContext(Dispatchers.IO) {
@@ -711,24 +726,22 @@ private fun CsvPreview(item: FileItem) {
     // them through resources like the rest of this screen.
     val context = androidx.compose.ui.platform.LocalContext.current
     var rows by remember(item.file) { mutableStateOf<List<List<String>>?>(null) }
-    var truncated by remember(item.file) { mutableStateOf(false) }
+    var byteTruncated by remember(item.file) { mutableStateOf(false) }
+    var rowTruncated by remember(item.file) { mutableStateOf(false) }
     var error by remember(item.file) { mutableStateOf<String?>(null) }
 
     LaunchedEffect(item.file) {
         withContext(Dispatchers.IO) {
             try {
                 val sep = if (item.file.extension.equals("tsv", true)) '\t' else ','
-                val parsed = mutableListOf<List<String>>()
-                item.file.bufferedReader(Charsets.UTF_8).use { br ->
-                    var read = 0
-                    var line: String?
-                    while (br.readLine().also { line = it } != null) {
-                        if (read >= 200) { truncated = true; break }
-                        parsed.add(parseCsvLine(line!!, sep))
-                        read++
-                    }
-                }
-                rows = parsed
+                // [da1026-F] was a bare `item.file.bufferedReader(...)` +
+                // readLine() loop with only a ROW cap — see
+                // [readCsvPreviewSlice] for why the row cap did not bound
+                // memory.
+                val slice = readCsvPreviewSlice(item.file, sep, MAX_CSV_PREVIEW_ROWS)
+                rows = slice.rows
+                byteTruncated = slice.byteTruncated
+                rowTruncated = slice.rowTruncated
             } catch (e: Exception) {
                 error = e.message ?: context.getString(R.string.filepreview_csv_parse_error)
             }
@@ -745,9 +758,25 @@ private fun CsvPreview(item: FileItem) {
         else -> {
             val table = rows!!
             Column(Modifier.fillMaxSize()) {
-                if (truncated) {
+                if (byteTruncated || rowTruncated) {
                     Text(
-                        text = stringResource(R.string.filepreview_truncated_rows, 200, item.formattedSize),
+                        // Byte cap and row cap are independent: a huge single
+                        // line trips the byte cap without ever reaching 200
+                        // rows, and a 200-row file trips only the row cap.
+                        // Report the one that actually clipped the table.
+                        text = if (byteTruncated) {
+                            stringResource(
+                                R.string.filepreview_truncated_kb,
+                                MAX_TEXT_PREVIEW_BYTES / 1000,
+                                item.formattedSize,
+                            )
+                        } else {
+                            stringResource(
+                                R.string.filepreview_truncated_rows,
+                                MAX_CSV_PREVIEW_ROWS,
+                                item.formattedSize,
+                            )
+                        },
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
@@ -778,6 +807,77 @@ private fun CsvPreview(item: FileItem) {
         }
     }
 }
+
+// --- begin csv-bounded-preview (JVM harness / unit test slices this region) ---
+
+/** [da1026-F] Result of [readCsvPreviewSlice]: parsed rows + why it stopped early. */
+internal data class CsvPreviewSlice(
+    val rows: List<List<String>>,
+    val byteTruncated: Boolean,
+    val rowTruncated: Boolean,
+)
+
+/**
+ * [da1026-F] Row-bounded **and** byte-bounded CSV/TSV preview slice.
+ *
+ * The previous implementation streamed `bufferedReader().readLine()` with a
+ * 200-row cap and nothing else. A row cap is not a memory bound: `readLine()`
+ * materialises the whole line before the cap can look at it, so a CSV whose
+ * single line is hundreds of MB (a minified data dump, a one-line export)
+ * grew one String to the size of the file → `OutOfMemoryError`. That is an
+ * `Error`, not an `Exception`, so the surrounding `catch (e: Exception)` in
+ * the caller never saw it and the process was killed. Same class of bug
+ * [rv1014-E1] fixed for TextPreview/MarkdownPreview/JsonPreview and
+ * [da1020-08] fixed for buildPrintHtml — this was the one site left, because
+ * the gate only looked for `.readBytes()`.
+ *
+ * Now the file goes through the same [readCapped] the other four surfaces use
+ * (at most [MAX_TEXT_PREVIEW_BYTES] + 1 bytes), so both the decode and the
+ * split operate on a bounded String no matter how the file is shaped.
+ *
+ * **Residual-fragment policy (deliberate).** A byte-capped slice normally ends
+ * mid-line. That fragment is DISCARDED rather than parsed: rendering it would
+ * put a half row on screen looking exactly like a complete one, and the row it
+ * belongs to is not otherwise recoverable. This mirrors [decodeUtf8Capped],
+ * which drops a split multi-byte stump for the same "don't show a lie" reason.
+ * Consequence: when the cut lands exactly on a newline the last *complete* row
+ * is dropped too — a bounded over-drop, never an under-drop, and the banner
+ * tells the user the preview is clipped anyway.
+ *
+ * Line splitting mirrors `BufferedReader.readLine()` rather than a naive
+ * `split('\n')`: a terminating newline does not produce a trailing empty row,
+ * an empty file produces no rows, and interior blank lines are preserved.
+ *
+ * @param maxRows row cap for the rendered table (rows beyond it set
+ *   [CsvPreviewSlice.rowTruncated]).
+ */
+internal fun readCsvPreviewSlice(file: File, sep: Char, maxRows: Int): CsvPreviewSlice {
+    val capped = readCapped(file, MAX_TEXT_PREVIEW_BYTES)
+    val byteTruncated = capped.size > MAX_TEXT_PREVIEW_BYTES
+    val lines = splitPreviewLines(decodeUtf8Capped(capped))
+    val completeLines = if (byteTruncated) lines.dropLast(1) else lines
+    val rowTruncated = completeLines.size > maxRows
+    val kept = if (rowTruncated) completeLines.subList(0, maxRows) else completeLines
+    return CsvPreviewSlice(
+        rows = kept.map { parseCsvLine(it, sep) },
+        byteTruncated = byteTruncated,
+        rowTruncated = rowTruncated,
+    )
+}
+
+/** `readLine()`-equivalent line split; see [readCsvPreviewSlice]. */
+internal fun splitPreviewLines(text: String): List<String> {
+    if (text.isEmpty()) return emptyList()
+    // Kotlin's lines() splits on CRLF / LF / CR — the same three terminators
+    // BufferedReader.readLine() does, so CRLF files keep their original
+    // behaviour (the \r never reaches a cell). `lines()` yields one trailing
+    // empty element when the text ends in a terminator; readLine() would not
+    // have produced that row, so drop it.
+    val parts = text.lines()
+    return if (parts.last().isEmpty()) parts.dropLast(1) else parts
+}
+
+// --- end csv-bounded-preview ---
 
 private fun parseCsvLine(line: String, sep: Char): List<String> {
     val out = mutableListOf<String>()
