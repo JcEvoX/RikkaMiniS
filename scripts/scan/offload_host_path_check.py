@@ -54,6 +54,73 @@ RESOLVER_CALL_RE = re.compile(
     r"\b(?:resolvePathForSession|resolveSourcePath|resolveHostPath|resolveGuestHostPath|readLinuxPath)\("
 )
 
+# ── [da1025-A] R3: player session-path wiring ───────────────────────────────
+# android-player play <session> <path> must join relative paths against the
+# session cwd and resolve the file session-scoped, fail-closed. Pre-fix, the
+# handler ignored request.sessionId entirely and MediaPlayerManager resolved
+# through the bare global fallback: relative paths 100% failed and a path in
+# another session's sandbox dir still played (the per-session isolation was
+# bypassed; same family as the Speech:245 host-read escape, fixed earlier).
+PLAYER_HANDLER_REL = os.path.join(OFFLOAD_REL, "PlayerOffloadHandler.kt")
+PLAYER_MANAGER_REL = os.path.join(
+    "src", "android", "app", "src", "main", "java", "com", "rikkaminis", "app",
+    "offload", "MediaPlayerManager.kt",
+)
+
+
+def _fun_body(text, header_pat):
+    """Body of the first function matching header_pat (brace-balanced), or None."""
+    m = re.search(header_pat, text)
+    if not m:
+        return None
+    open_brace = text.find("{", m.end())
+    if open_brace < 0:
+        return None
+    depth = 0
+    for i in range(open_brace, len(text)):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_brace:i + 1]
+    return None
+
+
+def scan_player_session_path(root):
+    """R3: player play paths must be cwd-joined and session-scoped (fail-closed)."""
+    problems = []
+    handler_path = os.path.join(root, PLAYER_HANDLER_REL)
+    if not os.path.isfile(handler_path):
+        return ["%s: missing — cannot verify player session-path wiring" % PLAYER_HANDLER_REL]
+    with open(handler_path, encoding="utf-8", errors="replace") as fh:
+        handler = strip_comments(fh.read())
+    if "request.sessionId" not in handler:
+        problems.append(
+            "%s: `request.sessionId` never used — play cannot be session-scoped "
+            "(cross-session read hole)" % PLAYER_HANDLER_REL
+        )
+    if "resolveMaybeRelative(" not in handler:
+        problems.append(
+            "%s: no resolveMaybeRelative(...) call — relative play paths are "
+            "passed raw and fail" % PLAYER_HANDLER_REL
+        )
+    manager_path = os.path.join(root, PLAYER_MANAGER_REL)
+    if not os.path.isfile(manager_path):
+        return problems + ["%s: missing — cannot verify session-scoped play resolution" % PLAYER_MANAGER_REL]
+    with open(manager_path, encoding="utf-8", errors="replace") as fh:
+        manager = strip_comments(fh.read())
+    body = _fun_body(manager, r"\bfun\s+play\s*\(")
+    if body is None:
+        problems.append("%s: `fun play` could not be delimited — fail-closed" % PLAYER_MANAGER_REL)
+    elif "resolvePathForSession(" not in body:
+        problems.append(
+            "%s: play() does not resolve through PRootKernel.resolvePathForSession — "
+            "per-session containment is bypassed" % PLAYER_MANAGER_REL
+        )
+    return problems
+
 
 def strip_comments(text):
     """Blank out // and /* */ comment content, keeping line structure."""
@@ -341,6 +408,96 @@ def selftest():
         print("❌ selftest failed: %s" % ", ".join(failures))
         return 1
     print("SELFTEST=PASS (7 fixtures: 4 violations caught, 3 clean trees green)")
+
+    # ── [da1025-A] R3: player session-path fixtures ────────────────────────
+    # Each dirty fixture breaks exactly one criterion: NO_SESSION keeps the
+    # cwd join (only the sessionId criterion fires), NO_RELATIVE keeps the
+    # sessionId wiring (only the join criterion fires), and the manager
+    # fixture keeps both handler criteria while dropping the session-scoped
+    # resolution from play() (only the play criterion fires).
+    PLAYER_HANDLER_OK = """package com.rikkaminis.app.sandbox.offload
+
+class PlayerOffloadHandler(private val context: Context) : NativeOffloadHandler {
+    override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
+        val resolved = resolveMaybeRelative("y.wav", request.cwd)
+        return MediaPlayerManager.play("s", resolved, chatSessionId = request.sessionId, context = context)
+    }
+}
+"""
+
+    PLAYER_HANDLER_NO_SESSION = """package com.rikkaminis.app.sandbox.offload
+
+class PlayerOffloadHandler(private val context: Context) : NativeOffloadHandler {
+    override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
+        val resolved = resolveMaybeRelative("y.wav", request.cwd)
+        return MediaPlayerManager.play("s", resolved, context = context)
+    }
+}
+"""
+
+    PLAYER_HANDLER_NO_RELATIVE = """package com.rikkaminis.app.sandbox.offload
+
+class PlayerOffloadHandler(private val context: Context) : NativeOffloadHandler {
+    override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
+        return MediaPlayerManager.play("s", "y.wav", chatSessionId = request.sessionId, context = context)
+    }
+}
+"""
+
+    PLAYER_MANAGER_OK = """package com.rikkaminis.app.offload
+
+object MediaPlayerManager {
+    fun play(sessionId: String, filePath: String): String {
+        val hostFile = PRootKernel.resolvePathForSession("sid", filePath, context)
+            ?: return "Error: cannot resolve path"
+        return "Playing"
+    }
+}
+"""
+
+    PLAYER_MANAGER_NO_SESSION = """package com.rikkaminis.app.offload
+
+object MediaPlayerManager {
+    fun play(sessionId: String, filePath: String): String {
+        val hostFile = PRootKernel.resolveHostPath(filePath)
+            ?: return "Error: cannot resolve path"
+        return "Playing"
+    }
+}
+"""
+
+    def player_fixture_root(handler_src, manager_src):
+        root = tempfile.mkdtemp(prefix="offload-gate-selftest-player-")
+        for rel, content in ((PLAYER_HANDLER_REL, handler_src), (PLAYER_MANAGER_REL, manager_src)):
+            path = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+        return root
+
+    player_cases = [
+        ("R3 dirty: handler never uses request.sessionId", PLAYER_HANDLER_NO_SESSION, PLAYER_MANAGER_OK, False),
+        ("R3 dirty: handler no resolveMaybeRelative", PLAYER_HANDLER_NO_RELATIVE, PLAYER_MANAGER_OK, False),
+        ("R3 dirty: play() bypasses resolvePathForSession", PLAYER_HANDLER_OK, PLAYER_MANAGER_NO_SESSION, False),
+        ("R3 clean: cwd-join + session-scoped play", PLAYER_HANDLER_OK, PLAYER_MANAGER_OK, True),
+    ]
+    player_failures = []
+    for label, handler_src, manager_src, expect_clean in player_cases:
+        root = player_fixture_root(handler_src, manager_src)
+        try:
+            problems = scan_player_session_path(root)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+        clean = not problems
+        ok = clean == expect_clean
+        print("  [%s] %s%s" % ("PASS" if ok else "FAIL", label,
+                               "" if ok else "  → problems=%s" % problems))
+        if not ok:
+            player_failures.append(label)
+    if player_failures:
+        print("❌ selftest failed: %s" % ", ".join(player_failures))
+        return 1
+    print("PLAYER_PATH_SELFTEST=PASS (4 fixtures: 3 violations caught, 1 clean tree green)")
     return 0
 
 
@@ -355,6 +512,7 @@ def main():
         print("unknown option(s): %s" % " ".join(unknown))
         return 2
     scanned, problems = check_tree(root)
+    problems.extend(scan_player_session_path(root))
     if problems:
         print("offload_host_path_check: %d handler file(s) scanned, %d violation(s)" % (scanned, len(problems)))
         return 1

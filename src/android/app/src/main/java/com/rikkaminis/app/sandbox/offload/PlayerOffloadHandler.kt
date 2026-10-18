@@ -1,5 +1,6 @@
 package com.rikkaminis.app.sandbox.offload
 
+import android.content.Context
 import com.rikkaminis.app.offload.MediaPlayerManager
 import com.rikkaminis.app.sandbox.NativeOffloadHandler
 import com.rikkaminis.app.sandbox.NativeOffloadRequest
@@ -17,7 +18,7 @@ import com.rikkaminis.app.sandbox.NativeOffloadResult
  *   android-player status <session>
  *   android-player list
  */
-class PlayerOffloadHandler : NativeOffloadHandler {
+class PlayerOffloadHandler(private val context: Context) : NativeOffloadHandler {
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
         val args = OffloadArgs(request.argv.drop(1))
         // [T-offload-defaults-batch-android] Help only on explicit
@@ -36,7 +37,14 @@ class PlayerOffloadHandler : NativeOffloadHandler {
                     if (id == null || path == null) {
                         return NativeOffloadResult(2, "android-player play: need <session> <path>\n")
                     }
-                    MediaPlayerManager.play(id, path)
+                    // [da1025-A] Relative play paths (`./y.wav`, `Music/x.mp3`)
+                    // are joined against the session cwd first — previously
+                    // they were passed raw and 100% failed against the
+                    // global resolver. The chat session id rides along so
+                    // MediaPlayerManager resolves session-scoped (fail-closed)
+                    // instead of ignoring the per-session sandbox isolation.
+                    val resolved = resolveMaybeRelative(path, request.cwd)
+                    MediaPlayerManager.play(id, resolved, chatSessionId = request.sessionId, context = context)
                 }
                 "pause" -> {
                     if (id == null) return NativeOffloadResult(2, "android-player pause: need <session>\n")
