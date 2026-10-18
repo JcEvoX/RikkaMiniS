@@ -590,11 +590,25 @@ def scan_self_priming(root):
             if _ARCH02_PRIME_FUN_RE.search(b) and _ARCH02_CACHED_FIELD_RE.search(b):
                 check(path, clean, n, b, "C5")
 
-    if not checked:
+    # Drift detector, NOT a shape requirement: only speak up when the tree still
+    # carries an ARCH-02 anchor (one of the three cache objects by name, or one
+    # of their prefs-file literals) while no primed-cache object is recognisable.
+    #
+    # It must stay silent on a tree with no prefs-cache world at all -- the
+    # miniature fixture trees used by test_scan.py / --selftest are exactly that,
+    # and an unconditional "nothing to check" there turns 4 green-expectation
+    # fixtures red (found by running the frozen test_scan.py on this branch).
+    anchored = any(
+        re.search(r"\bobject\s+(%s)\b" % "|".join(n for n, _l in _ARCH02_CACHES), clean)
+        or any(_ARCH02_DECL_LITS[lit].search(raw) for _o, lit in _ARCH02_CACHES)
+        for _path, raw, clean in files
+    )
+    if not checked and anchored:
         problems.append(
-            "no object with a primed (`fun prime(context: Context)` + `@Volatile private "
-            "var cached…`) snapshot was found -- the ARCH-02 criteria have nothing to check "
-            "(did the prefs caches move or get renamed?)"
+            "the tree still declares a primed prefs cache object / prefs-file literal but no "
+            "object with the primed shape (`fun prime(<x>: Context)` over a `@Volatile private "
+            "var cached…` snapshot) was found -- the ARCH-02 criteria have lost their anchor "
+            "(did the caches move or get renamed?)"
         )
     return report, problems
 
