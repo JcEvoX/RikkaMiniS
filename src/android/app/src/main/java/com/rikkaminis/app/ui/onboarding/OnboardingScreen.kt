@@ -50,7 +50,9 @@ import com.rikkaminis.app.data.model.ProviderType
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.ui.components.MinisButton
 import com.rikkaminis.app.ui.components.sanitizeSingleLineInput
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.rikkaminis.app.ui.components.MinisTextButton
 
 /**
@@ -112,6 +114,10 @@ private fun ApiKeyStep(
     var selectedType by remember { mutableStateOf(ProviderType.anthropic) }
     var apiKey by remember { mutableStateOf("") }
     var saved by remember { mutableStateOf(false) }
+    // [deep-audit-1033 I05] The save is now a coroutine; without this the
+    // button stays live for the round trip and a double tap adds the provider
+    // twice (addInstance is not idempotent).
+    var saving by remember { mutableStateOf(false) }
 
     Scaffold { padding ->
         Column(
@@ -185,25 +191,43 @@ private fun ApiKeyStep(
 
             MinisButton(
                 onClick = {
-                    if (apiKey.isNotBlank()) {
+                    if (apiKey.isNotBlank() && !saving) {
+                        saving = true
                         val instance = ProviderInstance(
                             id = "${selectedType.name}_onboarding",
                             label = selectedType.displayName,
                             providerType = selectedType,
                             credentialType = com.rikkaminis.app.data.model.ProviderCredential.apiKey,
                         )
-                        providerRepository.addInstance(instance)
-                        providerRepository.saveApiKey(instance.id, apiKey.trim())
-                        // [T-provider-no-static-seed] No built-in model seeding —
-                        // a fresh provider starts empty and refreshModels() pulls
-                        // the real upstream /v1/models list. The onboarding's
-                        // ModelSelectionStep shows what's fetched; the picker's
-                        // stale-while-revalidate covers the rest.
-                        scope.launch { providerRepository.refreshModels(instance) }
-                        saved = true
+                        scope.launch {
+                            try {
+                                // [deep-audit-1033 I05] addInstance + saveApiKey
+                                // touch SQLite and EncryptedSharedPreferences;
+                                // both used to run inline in the click handler
+                                // (main thread), so the first keystore access
+                                // after an app update blocked the frame. The
+                                // refresh below still starts only once the key
+                                // is on disk — same order as before.
+                                withContext(Dispatchers.IO) {
+                                    providerRepository.addInstance(instance)
+                                    providerRepository.saveApiKey(instance.id, apiKey.trim())
+                                }
+                                // [T-provider-no-static-seed] No built-in model seeding —
+                                // a fresh provider starts empty and refreshModels() pulls
+                                // the real upstream /v1/models list. The onboarding's
+                                // ModelSelectionStep shows what's fetched; the picker's
+                                // stale-while-revalidate covers the rest.
+                                // Fire-and-forget on this screen's scope: `saved` (and
+                                // the Next button) must not wait for the network fetch.
+                                scope.launch { providerRepository.refreshModels(instance) }
+                                saved = true
+                            } finally {
+                                saving = false
+                            }
+                        }
                     }
                 },
-                enabled = apiKey.isNotBlank() && !saved,
+                enabled = apiKey.isNotBlank() && !saved && !saving,
                 modifier = Modifier.fillMaxWidth(),
             ) {
                 Text(stringResource(if (saved) R.string.onboarding_saved else R.string.onboarding_save_api_key))

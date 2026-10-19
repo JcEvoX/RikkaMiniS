@@ -8,6 +8,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import com.rikkaminis.app.ui.settings.SharedFolderRegistry
 import java.io.File
 import java.nio.file.Files
 import java.text.SimpleDateFormat
@@ -417,6 +418,21 @@ class FileBrowserViewModel(
                 if (com.rikkaminis.app.sandbox.PRootKernel.isLinuxPathUnderReadOnlyMount(lp)) {
                     _uiState.value = _uiState.value.copy(
                         errorMessage = "Read-only mount: ${item.name} cannot be deleted",
+                    )
+                    return@launch
+                }
+                // [deep-audit-1033 I01] The browser also opens the two
+                // read-only shared folders (Settings → Shared Folders →
+                // Skills / Memory, and the agent's /var/minis/{skills,memory}
+                // shortcuts). Their `writable = false` reached the AccessBadge
+                // and nothing else, so the trash icon really removed SOUL.md /
+                // GLOBAL.md / SKILL.md from disk while the screen said
+                // Read-Only. Refusal shape is deliberately the same as the
+                // mount guard above; the predicate comes from the registry
+                // (single source), not a second path list here.
+                if (SharedFolderRegistry.isLinuxPathUnderReadOnlySharedDir(lp)) {
+                    _uiState.value = _uiState.value.copy(
+                        errorMessage = "Read-only folder: ${item.name} cannot be deleted",
                     )
                     return@launch
                 }
