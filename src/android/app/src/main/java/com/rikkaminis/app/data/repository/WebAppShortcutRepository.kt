@@ -44,6 +44,30 @@ class WebAppShortcutRepository(private val dao: WebAppShortcutDao) {
 
     suspend fun update(entity: WebAppShortcutEntity) = dao.update(entity)
 
+    /**
+     * [da1030-A ISSUE-01] Re-point every shortcut pinned against the draft id
+     * onto the real session id.
+     *
+     * Called from `ChatViewModel.ensureSession()`'s `if (isDraft)` block, right
+     * after `migrateDraftResources()` has moved the session's disk tree to the
+     * real id and deleted the draft directory. A shortcut's `scopeContext` /
+     * `sourceSessionId` were frozen at pin time (`__new__<uuid>`, see
+     * AddToHomeSheet), and [com.rikkaminis.app.webapp.WebAppPathResolver]'s
+     * relative-path branch resolves `htmlPath` under
+     * `minis-sessions/<scopeContext>/attachments` — which the migration just
+     * moved away. Without this hop the pinned icon keeps pointing at the dead
+     * draft key and reports "Source Missing" forever; nothing else re-points
+     * it (the row is written once, at pin time).
+     *
+     * No-op without touching the DAO when either id is blank or when they are
+     * equal, so callers can invoke it unconditionally.
+     */
+    suspend fun renameSessionShortcuts(fromDraft: String, toReal: String) {
+        if (fromDraft.isBlank() || toReal.isBlank() || fromDraft == toReal) return
+        dao.renameScopeContext(fromDraft, toReal)
+        dao.renameSourceSessionId(fromDraft, toReal)
+    }
+
     companion object {
         const val SCOPE_SESSION_ATTACHMENT = "session_attachment"
         const val SCOPE_SHARED = "shared"

@@ -354,9 +354,13 @@ private suspend fun importSkillFromCurrentUrl(
             // name OR slug (pure helper below, JVM-covered), pass the full
             // ParsedSkill, and run the repository write on IO — db.execSQL +
             // writeSkillMd are disk IO and used to run on the Main
-            // dispatcher. update() has no frontmatter parameter; its
-            // writeSkillMd preserves the existing frontmatter block, so no
-            // managed key is lost (boundary registered in the report).
+            // dispatcher. [da1030-A ISSUE-02] The landing document's frontmatter
+            // block travels with the managed fields: update() re-seeds its copy
+            // from the on-disk SKILL.md when no block is passed, so omitting it
+            // shadowed `subagent` / `max_turns` / `allowed_tools` with whatever
+            // the disk already said (a catalogue edit under a refactor never
+            // landed, silently). Same contract as updateFromURL /
+            // "update from file".
             val targetId = resolveUpdateTargetId(
                 skillRepository.skills.value.map { it.id to it.name },
                 slug = slugify(parsed.name),
@@ -375,6 +379,11 @@ private suspend fun importSkillFromCurrentUrl(
                     // default (accepted: same exposure as refreshFromDisk).
                     version = parsed.version,
                     body = parsed.body,
+                    // [da1030-A ISSUE-02] Hand the parsed document's block over
+                    // too — without it update() re-seeds from the on-disk
+                    // SKILL.md, so the incoming `subagent` / `max_turns` /
+                    // `allowed_tools` were shadowed by whatever the disk said.
+                    frontmatter = parsed.frontmatter.ifBlank { null },
                 )
             }
             if (updated) {
