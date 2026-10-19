@@ -489,6 +489,189 @@ class OffloadCliArgsTest {
         return out.toString()
     }
 
+    // ── E. Offload payloads are JSON objects/arrays, never prose (ISSUE-04) ───
+    //
+    // [da1033-D] `OffloadOutput.formatBody` only *re-shapes* JSON: plain text
+    // passes through untouched on the no-flag fast path AND on the parse-failure
+    // fallback (OffloadOutput.kt:61-80). So an empty result used to leave
+    // `android-photos near` and `android-contacts search|get` printing an
+    // English sentence on stdout with exit 0 — every downstream `jq` /
+    // `json.loads` broke on the *most common* branch — and `near` handed back a
+    // bare JSONArray when it was NOT empty, so even the top-level type flipped
+    // with the result. Both handlers are Android-bound (Context /
+    // ContentResolver / MediaStore), so the payload contract is pinned here as
+    // a shape assertion over the compiled sources with literal expectations;
+    // `scripts/scan/offload_cli_args_check.py` (arms N1 / N2) enforces the same
+    // rule mechanically, and the branch's probe log parses these literals with
+    // a real JSON parser.
+
+    private val photosFile = "src/main/java/com/rikkaminis/app/sandbox/offload/PhotosOffloadHandler.kt"
+
+    /**
+     * The two places a payload can be spelled out as a literal: the first
+     * argument of `formatBody(` and the operand of a `return`. Comment-aware
+     * ([codeOnly]), so prose quoted in a comment neither trips nor satisfies
+     * the check.
+     */
+    private fun payloadLiterals(src: String): List<String> {
+        val code = codeOnly(src)
+        val out = mutableListOf<String>()
+        for (m in Regex("formatBody\\(").findAll(code)) {
+            var j = m.range.last + 1
+            while (j < code.length && code[j].isWhitespace()) j++
+            if (j < code.length && code[j] == '"') literalAt(code, j)?.let { out.add(it) }
+        }
+        for (m in Regex("\\breturn\\s+(?=\")").findAll(code)) {
+            literalAt(code, m.range.last + 1)?.let { out.add(it) }
+        }
+        return out
+    }
+
+    /** The Kotlin string literal (plain or raw) starting at [start], else null. */
+    private fun literalAt(code: String, start: Int): String? {
+        if (code.startsWith("\"\"\"", start)) {
+            val end = code.indexOf("\"\"\"", start + 3)
+            return if (end < 0) null else code.substring(start, end + 3)
+        }
+        var i = start + 1
+        while (i < code.length) {
+            when (code[i]) {
+                '\\' -> i += 2
+                '"' -> return code.substring(start, i + 1)
+                '\n' -> return null
+                else -> i++
+            }
+        }
+        return null
+    }
+
+    /** `${…}` interpolations out — the *Before* sentence
+     *  `"No photos found within ${radiusKm}km of ($lat, $lon)."` would otherwise
+     *  look JSON-shaped because of the brace in `${radiusKm}`. */
+    private fun maskTemplates(lit: String): String {
+        val out = StringBuilder()
+        var i = 0
+        while (i < lit.length) {
+            if (lit[i] == '$' && i + 1 < lit.length && lit[i + 1] == '{') {
+                var depth = 0
+                var j = i + 1
+                while (j < lit.length) {
+                    if (lit[j] == '{') depth++
+                    if (lit[j] == '}') {
+                        depth--
+                        if (depth == 0) break
+                    }
+                    j++
+                }
+                i = j + 1
+            } else {
+                out.append(lit[i])
+                i++
+            }
+        }
+        return out.toString()
+    }
+
+    /** A literal is JSON when its OWN text carries `{` / `[`. A literal that is
+     *  nothing but interpolation is the variable in a template coat. */
+    private fun isJsonPayload(lit: String): Boolean {
+        val own = maskTemplates(lit).trim('"', ' ', '\n', '\t')
+        if (own.isEmpty()) return true
+        return own.contains('{') || own.contains('[')
+    }
+
+    private fun assertOffloadPayloads(src: String) {
+        val code = codeOnly(src)
+        for (lit in payloadLiterals(src)) {
+            assertTrue("a payload literal must be JSON, got $lit", isJsonPayload(lit))
+        }
+        assertFalse("the empty-radius sentence must not come back", code.contains("\"No photos found within"))
+        assertFalse("no-match must not be a sentence", code.contains("\"No contacts found matching"))
+        assertFalse("a null cursor must not be a sentence", code.contains("\"android-contacts: failed to query"))
+        assertFalse("a missing id must not be a sentence", code.contains("\"android-contacts: no contact with id="))
+    }
+
+    private fun assertNearEnvelope(src: String) {
+        val code = codeOnly(src)
+        for (key in listOf("media", "count", "lat", "lon", "radius_km")) {
+            assertTrue("near must publish \"$key\" in its envelope", code.contains(".put(\"$key\""))
+        }
+        assertTrue(
+            "the hint must ride on the empty branch as a field",
+            code.contains("if (hint.isNotEmpty()) data.put(\"hint\", hint)"),
+        )
+        assertTrue("near must return the envelope", code.contains("return data.toString(2)"))
+        assertFalse("near must not return the bare array any more", code.contains("return photos.toString(2)"))
+    }
+
+    private fun assertContactsFailureBranches(src: String) {
+        val code = codeOnly(src)
+        assertTrue(
+            "an empty search must return the same [] shape doList returns",
+            code.contains("OffloadOutput.formatBody(arr.toString(2), parsedArgs)"),
+        )
+        assertTrue(
+            "a missing id must be an error object carrying the id",
+            code.contains(".put(\"error\", \"not_found\")") && code.contains(".put(\"id\", id)"),
+        )
+        assertEquals("query_failed must have exactly one implementation", 1, Regex("\"query_failed\"").findAll(code).count())
+        assertEquals(
+            "all three null-cursor sites keep exit 1 with the shared body",
+            3,
+            Regex("NativeOffloadResult\\(\\s*1,\\s*OffloadOutput\\.formatBody\\(queryFailedBody\\(").findAll(code).count(),
+        )
+    }
+
+    @Test
+    fun `offload payloads are JSON, not prose`() {
+        assertOffloadPayloads(source(photosFile))
+        assertOffloadPayloads(source(contactsFile))
+    }
+
+    @Test
+    fun `android-photos near publishes one envelope for empty and non-empty`() {
+        assertNearEnvelope(source(photosFile))
+    }
+
+    @Test
+    fun `android-contacts failure branches stay JSON with exit 1`() {
+        assertContactsFailureBranches(source(contactsFile))
+    }
+
+    @Test
+    fun `negative control - the near sentence fails the probe`() {
+        val original = source(photosFile)
+        val mutated = original.replace(
+            "return data.toString(2)",
+            "return \"No photos found within \${radiusKm}km of (\$lat, \$lon).\$hint\"",
+        )
+        assertTrue("the near payload must exist to be mutated", mutated != original)
+        assertProbeFails { assertOffloadPayloads(mutated) }
+    }
+
+    @Test
+    fun `negative control - a prose search branch fails the probe`() {
+        val original = source(contactsFile)
+        val mutated = original.replace(
+            "OffloadOutput.formatBody(arr.toString(2), parsedArgs)",
+            "OffloadOutput.formatBody(\"No contacts found matching 'q'.\", parsedArgs)",
+        )
+        assertTrue("the empty-search payload must exist to be mutated", mutated != original)
+        assertProbeFails { assertOffloadPayloads(mutated) }
+    }
+
+    @Test
+    fun `negative control - a prose null-cursor branch fails the probe`() {
+        val original = source(contactsFile)
+        val mutated = original.replace(
+            "OffloadOutput.formatBody(queryFailedBody(\"Failed to query contacts.\"), parsedArgs)",
+            "OffloadOutput.formatBody(\"android-contacts: failed to query contacts\", parsedArgs)",
+        )
+        assertTrue("the shared null-cursor body must exist to be mutated", mutated != original)
+        assertProbeFails { assertOffloadPayloads(mutated) }
+        assertProbeFails { assertContactsFailureBranches(mutated) }
+    }
+
     // ── source location (same technique as DatabaseVersionGuardTest) ─────────
 
     /** Strip line + block comments so a comment quoting a bad pattern cannot trip a probe. */
