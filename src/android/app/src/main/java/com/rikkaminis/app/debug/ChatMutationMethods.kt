@@ -535,8 +535,12 @@ internal object ChatMutationMethods {
     }
 
     private fun resolveDisplay(context: Context, modelId: String): String {
-        val cfg = app(context).providerRepository.config.value
-        val entry = cfg.modelEntries.firstOrNull { it.baseModel.id == modelId } ?: return modelId
-        return entry.model.displayName
+        // Single-sourced [da1032-B]: the predicate that decides what a model
+        // reference means must not exist twice. This used to be a local copy
+        // with the bare-id predicate only, so a composite entry id
+        // (`providerInstanceId:modelId`, which chat.sessions.create / .update
+        // accept) resolved to the raw id here while `chat.sessions.get`
+        // resolved the display name — same session, two answers.
+        return ChatDebugMethods.resolveModelDisplay(app(context).providerRepository, modelId)
     }
 }

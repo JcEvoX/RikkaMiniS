@@ -253,6 +253,76 @@ class CalendarFreebusyInstancesTest {
         )
     }
 
+    // ── part 4: doCreate's --end must not swallow a bad value (da1032-C) ─────
+
+    @Test
+    fun `create keeps the 1h default exactly when --end is absent`() {
+        val start = 1_795_651_200_000L
+        // absent flag -> the documented default, and the parser is not even
+        // consulted (nothing to parse).
+        var parserCalls = 0
+        assertEquals(
+            "absent --end keeps doCreate's 1h default",
+            1_795_654_800_000L,
+            CalendarOffloadHandler.createEndMs(null, start) { parserCalls++; 42L },
+        )
+        assertEquals("an absent flag must not reach the parser", 0, parserCalls)
+        // The literal above is start + 3_600_000, spelled out so a change to
+        // the default is not silently absorbed by the expectation.
+        assertEquals(3_600_000L, 1_795_654_800_000L - start)
+    }
+
+    @Test
+    fun `create uses the caller's instant when --end parses`() {
+        assertEquals(
+            1_795_656_600_000L,
+            CalendarOffloadHandler.createEndMs("2026-11-22T10:30:00Z", 1_795_651_200_000L) { 1_795_656_600_000L },
+        )
+    }
+
+    @Test
+    fun `create signals a refusal when --end cannot be parsed`() {
+        val start = 1_795_651_200_000L
+        // The defect: `args.get("end")?.let { parse(it) } ?: (start + 1h)`
+        // joined "no value supplied" with "supplied but unreadable" and wrote a
+        // one-hour event, answering success. Null is the refusal signal.
+        assertEquals(null, CalendarOffloadHandler.createEndMs("2026-13-40", start) { null })
+        // ...and an unreadable value must never fall back to the default.
+        assertTrue(
+            CalendarOffloadHandler.createEndMs("nope", start) { null } != start + 3_600_000L,
+        )
+        // A flag with no usable value is the ABSENT case, not a refusal — the
+        // parser's own model (OffloadArgs treats a bare `--end` as a boolean
+        // flag and hands back null). Behaviour for these is unchanged.
+        assertEquals(
+            1_795_654_800_000L,
+            CalendarOffloadHandler.createEndMs("", start) { 42L },
+        )
+        assertEquals(
+            1_795_654_800_000L,
+            CalendarOffloadHandler.createEndMs("   ", start) { 42L },
+        )
+    }
+
+    @Test
+    fun `create refuses an unreadable --end in the source, not just in the helper`() {
+        val body = memberSlice(readHandlerSource(), "private fun doCreate(")
+        assertTrue("doCreate must route --end through the shared helper", body.contains("createEndMs("))
+        assertTrue(
+            "the refusal must name the flag the caller got wrong",
+            body.contains("android-calendar create: invalid --end"),
+        )
+        val helper = memberSlice(readHandlerSource(), "internal fun createEndMs(")
+        assertTrue(
+            "a flag with no value is the ABSENT case, before any parse",
+            helper.contains("if (rawEnd.isNullOrBlank())"),
+        )
+        assertTrue(
+            "the 1h default lives inside the absent branch",
+            helper.contains("60L * 60 * 1000"),
+        )
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────────
 
     private fun readHandlerSource(): String =

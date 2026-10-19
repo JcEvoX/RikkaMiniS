@@ -5,6 +5,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
+import java.io.FileNotFoundException
 import java.util.TimeZone
 
 /**
@@ -21,6 +22,11 @@ import java.util.TimeZone
  *  1. date-only `--end` parsed to 00:00:00.000 ⇒ zero-width ranges;
  *  2. `--days N` computed as `now - N * 24h` ⇒ hour of drift across a DST
  *     transition can truncate onto the wrong local day.
+ *
+ * [da1032-C] adds the window RESOLUTION layer (`resolvePhotoRange`): an
+ * unreadable `--start` / `--end` or an inverted window must refuse the command
+ * instead of resolving to "no filter", plus the positional contract of
+ * `handleAlbum`'s projection (the album surface published no dimensions).
  */
 class PhotosDateRangePureTest {
 
@@ -117,7 +123,187 @@ class PhotosDateRangePureTest {
         assertEquals(1791849600000L, daysAgoStartOfDayMs(1792152000000L, 3, utc))
     }
 
+    // ── resolvePhotoRange (da1032-C ISSUE-04) ─────────────────────────────
+
+    /**
+     * Fake parser for the window arms below: only the two shapes they use
+     * resolve; anything else is the "supplied but unreadable" case. (The real
+     * `parseDate` list is exercised by the arms above.)
+     */
+    private val fakeParse: (String) -> Long? = { raw ->
+        when (raw) {
+            "2026-10-16" -> 1792108800000L   // ground truth: 2026-10-16T00:00:00Z
+            "2026-10-18" -> 1792281600000L   // ground truth: 2026-10-18T00:00:00Z
+            "2026-10-18T12:00:00" -> 1792324800000L // ground truth: 2026-10-18T12:00:00Z
+            else -> null
+        }
+    }
+
+    @Test
+    fun `no date flags means no filter, and the parser is not consulted`() {
+        var calls = 0
+        val r = resolvePhotoRange(1792166400000L, utc, null, null, null) { calls++; fakeParse(it) }
+        assertEquals(PhotoRange.Window(null, null), r)
+        assertEquals("absent flags must not reach the parser", 0, calls)
+    }
+
+    @Test
+    fun `a lone --start filters from that instant on`() {
+        // A bare-date start is the day's start (only the END bound gets the
+        // end-of-day alignment), unchanged from the pre-fix contract.
+        assertEquals(
+            PhotoRange.Window(1792108800000L, null),
+            resolvePhotoRange(1792166400000L, utc, null, "2026-10-16", null, fakeParse),
+        )
+    }
+
+    @Test
+    fun `a lone bare-date --end covers that whole day`() {
+        assertEquals(
+            PhotoRange.Window(null, 1792195199999L), // 2026-10-16T23:59:59.999Z
+            resolvePhotoRange(1792166400000L, utc, null, null, "2026-10-16", fakeParse),
+        )
+    }
+
+    @Test
+    fun `--days outranks the explicit bounds`() {
+        assertEquals(
+            PhotoRange.Window(1791518400000L, 1792166400000L),
+            resolvePhotoRange(1792166400000L, ny, 7, "2026-10-16", "2026-10-16", fakeParse),
+        )
+        // days <= 0 keeps the historical 7-day reading.
+        assertEquals(
+            PhotoRange.Window(1791518400000L, 1792166400000L),
+            resolvePhotoRange(1792166400000L, ny, 0, null, null, fakeParse),
+        )
+    }
+
+    @Test
+    fun `an unreadable bound is refused by name, never read as no filter`() {
+        // The defect: these used to answer Window(null, …) -> "no filter" ->
+        // the command returned the ENTIRE library for a typo'd date.
+        assertEquals(
+            PhotoRange.Invalid("--start", "2026-13-40"),
+            resolvePhotoRange(1792166400000L, utc, null, "2026-13-40", null, fakeParse),
+        )
+        assertEquals(
+            PhotoRange.Invalid("--end", "2026-13-40"),
+            resolvePhotoRange(1792166400000L, utc, null, null, "2026-13-40", fakeParse),
+        )
+        assertEquals(
+            PhotoRange.Invalid("--end", "2026-10-16"),
+            resolvePhotoRange(1792166400000L, utc, null, "2026-10-18", "2026-10-16", fakeParse),
+        )
+    }
+
+    @Test
+    fun `an inverted window is refused while same-day and equal bounds stay legal`() {
+        // start 2026-10-18 > end 2026-10-16 -> a range that cannot hold anything.
+        assertEquals(
+            PhotoRange.Invalid("--end", "2026-10-16"),
+            resolvePhotoRange(1792166400000L, utc, null, "2026-10-18", "2026-10-16", fakeParse),
+        )
+        // Same day named twice: start = 00:00, end = 23:59:59.999 -> legal.
+        assertEquals(
+            PhotoRange.Window(1792108800000L, 1792195199999L),
+            resolvePhotoRange(1792166400000L, utc, null, "2026-10-16", "2026-10-16", fakeParse),
+        )
+        // Equal instants are a (narrow) legal query, not an inversion.
+        assertEquals(
+            PhotoRange.Window(1792324800000L, 1792324800000L),
+            resolvePhotoRange(1792166400000L, utc, null, "2026-10-18T12:00:00", "2026-10-18T12:00:00", fakeParse),
+        )
+    }
+
+    @Test
+    fun `a flag with no value stays the absent case`() {
+        assertEquals(
+            PhotoRange.Window(null, null),
+            resolvePhotoRange(1792166400000L, utc, null, "", "  ", fakeParse),
+        )
+    }
+
+    // ── the query surface (da1032-C ISSUE-04) ─────────────────────────────
+
+    @Test
+    fun `the list surface refuses an invalid window instead of querying`() {
+        val body = memberSlice(readRepoFile(HANDLER_REL), "private fun handleList(")
+        assertTrue(
+            "handleList must branch on the resolved range, not destructure a nullable pair",
+            body.contains("resolveDateRange(args)"),
+        )
+        assertTrue("an invalid window must be refused here", body.contains("PhotoRange.Invalid"))
+        assertTrue("the refusal names the offending flag", body.contains("invalid \${r.flag}"))
+    }
+
+    @Test
+    fun `the handler resolves the window through the shared pure core`() {
+        val body = memberSlice(readRepoFile(HANDLER_REL), "private fun resolveDateRange(")
+        assertTrue("must delegate to the pure core", body.contains("resolvePhotoRange("))
+        // The null / alignment decisions must live in the core, not here.
+        assertFalse("the end-of-day alignment decision belongs to the core", body.contains("alignDateOnlyEndMs("))
+        assertFalse("the member must not branch on nulls itself", body.contains("?.let"))
+    }
+
+    @Test
+    fun `album rows carry the width and height columns at the indices the cursor reads`() {
+        val body = memberSlice(readRepoFile(HANDLER_REL), "private fun handleAlbum(")
+        val projBlock = body.substringAfter("val proj = arrayOf(").substringBefore(")")
+        val cols = Regex("""MediaStore\.Images\.Media\.(\w+)""")
+            .findAll(projBlock).map { it.groupValues[1] }.toList()
+        // The defect: the album projection dropped WIDTH/HEIGHT, so every
+        // album row published no dimensions while handleList published both.
+        val widthIdx = cols.indexOf("WIDTH")
+        val heightIdx = cols.indexOf("HEIGHT")
+        assertTrue("album rows need the WIDTH column (have $cols)", widthIdx >= 0)
+        assertTrue("album rows need the HEIGHT column (have $cols)", heightIdx >= 0)
+        // Column order is an implicit contract with the positional reads.
+        assertEquals(
+            "every projected column is read exactly once, in order",
+            (0 until cols.size).toList(),
+            Regex("""c\.get\w+\((\d+)\)""").findAll(body).map { it.groupValues[1].toInt() }.toList(),
+        )
+        assertTrue(
+            "width must be emitted from the WIDTH column (index $widthIdx)",
+            body.contains("put(\"width\", c.getInt($widthIdx))"),
+        )
+        assertTrue(
+            "height must be emitted from the HEIGHT column (index $heightIdx)",
+            body.contains("put(\"height\", c.getInt($heightIdx))"),
+        )
+    }
+
+    // ── helpers ───────────────────────────────────────────────────────────
+
+    private fun readRepoFile(relative: String): String {
+        var dir: File? = File(System.getProperty("user.dir"))
+        while (dir != null) {
+            val f = File(dir, relative)
+            if (f.exists()) return f.readText()
+            dir = dir.parentFile
+        }
+        throw FileNotFoundException("$relative not found from user.dir=${System.getProperty("user.dir")}")
+    }
+
+    /** Lines of the member declared at [marker], up to the next sibling member. */
+    private fun memberSlice(src: String, marker: String): String {
+        val lines = src.lines()
+        val start = lines.indexOfFirst { it.contains(marker) }
+        assertTrue("marker not found: $marker", start >= 0)
+        val end = (start + 1 until lines.size).firstOrNull { i ->
+            val line = lines[i]
+            val indent = line.takeWhile { it == ' ' }.length
+            indent <= 4 && line.isNotBlank() && !line.trimStart().startsWith("//") &&
+                !line.trimStart().startsWith("*") &&
+                Regex("^(private|internal|public|protected|fun|val|var|@)").containsMatchIn(line.trimStart())
+        } ?: lines.size
+        return lines.subList(start, end).joinToString("\n")
+    }
+
     companion object {
+        const val HANDLER_REL =
+            "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/PhotosOffloadHandler.kt"
+
         // Silence "unused" for the fixture tree anchor used by the runner script.
         @JvmStatic fun probeSource(): File = File(".")
     }

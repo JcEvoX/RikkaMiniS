@@ -109,12 +109,23 @@ class PhotosImportShapeTest {
 
     @Test
     fun `date-only --end is aligned at the call site and days walk the calendar`() {
-        val body = declarationSlice(readRepoFile(photos), "private fun resolveDateRange(")
-        assertTrue("date-only end must be detected", body.contains("isDateOnly("))
-        assertTrue("end must be aligned to end-of-day", body.contains("alignDateOnlyEndMs("))
-        assertTrue("--days must walk the calendar", body.contains("daysAgoStartOfDayMs("))
-        assertFalse("24h constant arithmetic came back", body.contains("24L * 60 * 60 * 1000"))
-        assertFalse("24h constant arithmetic came back", body.contains("24 * 60 * 60 * 1000"))
+        // [da1032-C ISSUE-04] the range resolution moved into the shared pure
+        // core `resolvePhotoRange`, which `resolveDateRange` now delegates to.
+        // Every assertion below is unchanged — only the slice is re-anchored on
+        // the declaration that OWNS the decision (bind the decision point, not
+        // the call site: deep-audit-1031-D / COMMON.md §4 re-anchor rule).
+        val src = readRepoFile(photos)
+        val core = topLevelSlice(src, "internal fun resolvePhotoRange(")
+        assertTrue("date-only end must be detected", core.contains("isDateOnly("))
+        assertTrue("end must be aligned to end-of-day", core.contains("alignDateOnlyEndMs("))
+        assertTrue("--days must walk the calendar", core.contains("daysAgoStartOfDayMs("))
+        assertFalse("24h constant arithmetic came back", core.contains("24L * 60 * 60 * 1000"))
+        assertFalse("24h constant arithmetic came back", core.contains("24 * 60 * 60 * 1000"))
+        // …and the handler must still REACH that core from its own member:
+        assertTrue(
+            "the handler must still resolve the window through the shared core",
+            declarationSlice(src, "private fun resolveDateRange(").contains("resolvePhotoRange("),
+        )
     }
 
     // ── helpers ───────────────────────────────────────────────────────────
@@ -146,6 +157,34 @@ class PhotosImportShapeTest {
                 t.startsWith("    fun ") || t.startsWith("    internal fun ") ||
                 t.startsWith("    private fun ") || t.startsWith("    public fun ") ||
                 t.startsWith("    internal val ") || t.startsWith("    private val ")
+        } ?: lines.size
+        return lines.subList(start, end).joinToString("\n")
+    }
+
+    /**
+     * [da1032-C] Source lines of the TOP-LEVEL declaration at [marker], up to
+     * the next top-level one (or EOF). `declarationSlice` above only knows how
+     * to cut members of a class — the range decision now lives in a top-level
+     * `internal fun`, which sits at column 0 and would otherwise swallow the
+     * rest of the file into the slice.
+     */
+    private fun topLevelSlice(src: String, marker: String): String {
+        val lines = src.lines()
+        val start = lines.indexOfFirst { it.contains(marker) }
+        assertTrue("marker not found: $marker", start >= 0)
+        // Only a real declaration keyword ends the slice. A bare `): Foo {`
+        // (the closing paren of a multi-line signature) sits at column 0 too
+        // and must NOT be mistaken for the next top-level declaration —
+        // measured: that mistake truncated this slice to 7 lines of signature.
+        val end = (start + 1 until lines.size).firstOrNull { i ->
+            val t = lines[i]
+            t.isNotBlank() && !t.startsWith(" ") && !t.startsWith("\t") && !t.startsWith("}") &&
+                (t.startsWith("internal ") || t.startsWith("private ") ||
+                    t.startsWith("public ") || t.startsWith("fun ") ||
+                    t.startsWith("class ") || t.startsWith("object ") ||
+                    t.startsWith("sealed ") || t.startsWith("data class ") ||
+                    t.startsWith("enum ") || t.startsWith("@") ||
+                    t.startsWith("val ") || t.startsWith("const ") || t.startsWith("//"))
         } ?: lines.size
         return lines.subList(start, end).joinToString("\n")
     }

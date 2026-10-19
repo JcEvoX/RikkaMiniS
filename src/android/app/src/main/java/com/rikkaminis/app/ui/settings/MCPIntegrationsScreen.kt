@@ -80,8 +80,15 @@ fun MCPIntegrationsScreen(
     // AFTER launch isn't reflected in the `servers` StateFlow until restart.
     // Re-read the file each time the screen appears (mirrors the Skills screen's
     // reloadFromDisk on entry) so CLI-added servers show without an app restart.
+    // [fix/da1032-e] Mirrors the Skills screen fix: reloadFromDisk() (==
+    // MCPRepository.load()) reads servers.json and may write it back for the
+    // createdAt back-fill — disk I/O that used to run inline on Main every
+    // time this screen appeared. Only the thread changes; the `_servers.value`
+    // publish and the save() stay on IO, both thread-safe.
     LaunchedEffect(Unit) {
-        mcpRepository.reloadFromDisk()
+        withContext(Dispatchers.IO) {
+            mcpRepository.reloadFromDisk()
+        }
     }
 
     var showAddSheet by remember { mutableStateOf(false) }

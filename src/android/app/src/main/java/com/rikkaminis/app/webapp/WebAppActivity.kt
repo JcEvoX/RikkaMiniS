@@ -109,7 +109,18 @@ class WebAppActivity : ComponentActivity() {
      */
     private var rendererEpoch by androidx.compose.runtime.mutableIntStateOf(0)
     private var resolvedFile: File? = null
-    private var isFullscreen: Boolean = false
+    /**
+     * [da1032-A] The ONE fullscreen source. It lives on the Activity — not in
+     * the composition — because two writers need it (the system back callback
+     * below and the toolbar toggle in [WebAppHost]); [WebAppHost] therefore
+     * only *reads* it and never keeps a copy. The previous shape held a plain
+     * `Boolean` here plus a keyed `remember` copy inside the host, and that
+     * copy could survive a host re-run whose key did not change (false → false),
+     * leaving the toolbar icon and the system bars disagreeing after a back
+     * press. A snapshot state read by the composition makes that class of drift
+     * unrepresentable.
+     */
+    private val fullscreenState = mutableStateOf(false)
 
     // T-n01-andmenu-l10n: pre-Tiramisu locale override (see MainActivity).
     override fun attachBaseContext(newBase: android.content.Context) {
@@ -138,11 +149,16 @@ class WebAppActivity : ComponentActivity() {
         // T-pwa-3: back press — exit fullscreen if active, else finish.
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (isFullscreen) {
-                    isFullscreen = false
+                if (fullscreenState.value) {
+                    // [da1032-A] Flip the single source only. The composition
+                    // reads it, so the toolbar icon follows by recomposition —
+                    // renderHost() is deliberately NOT called here: re-running
+                    // setContent bought nothing once the state moved to the
+                    // Activity (nothing here owns the fullscreen value any
+                    // more) and it is the exact call that made a WebView
+                    // rebuild possible ([audit-0909 T7-M2]).
+                    fullscreenState.value = false
                     applySystemBars(fullscreen = false)
-                    // Re-render Compose host so toolbar icon updates.
-                    renderHost()
                 } else {
                     finish()
                 }
@@ -182,7 +198,7 @@ class WebAppActivity : ComponentActivity() {
         super.onResume()
         // Re-apply current bar state — dialogs / external activities can
         // resurrect bars even when we asked for fullscreen.
-        applySystemBars(fullscreen = isFullscreen)
+        applySystemBars(fullscreen = fullscreenState.value)
     }
 
     private fun applySystemBars(fullscreen: Boolean) {
@@ -202,9 +218,9 @@ class WebAppActivity : ComponentActivity() {
             MaterialTheme {
                 WebAppHost(
                     file = file,
-                    initialFullscreen = isFullscreen,
+                    fullscreen = fullscreenState.value,
                     onFullscreenChange = { fs ->
-                        isFullscreen = fs
+                        fullscreenState.value = fs
                         applySystemBars(fullscreen = fs)
                     },
                     onClose = { finish() },
@@ -289,18 +305,20 @@ class WebAppActivity : ComponentActivity() {
     @Composable
     private fun WebAppHost(
         file: File,
-        initialFullscreen: Boolean,
+        fullscreen: Boolean,
         onFullscreenChange: (Boolean) -> Unit,
         onClose: () -> Unit,
         onWebViewReady: (WebView) -> Unit,
     ) {
         val context = LocalContext.current
-        // [fix/audit-1015 BUG-08②] remember now keys on initialFullscreen so a
-        // host re-run with a changed flag re-initializes. Zero-risk hardening:
-        // today WebAppHost only composes under renderHost's setContent, which
-        // restarts the composition wholesale (so the unkeyed remember already
-        // reset); the key removes the reliance on that incidental detail.
-        var fullscreen by remember(initialFullscreen) { mutableStateOf(initialFullscreen) }
+        // [da1032-A] `fullscreen` is a plain read here on purpose: the Activity
+        // owns the single snapshot (fullscreenState) and this composable only
+        // observes it. Do NOT reintroduce a `remember { mutableStateOf(...) }`
+        // copy — a second source is exactly what let the toolbar icon and the
+        // system bars drift apart when the host was re-run with an unchanged
+        // key. (Superseded note from [fix/audit-1015 BUG-08②]: that key existed
+        // to paper over the re-run, and the re-run is gone — the back callback
+        // now only flips state.)
         var toolbarVisible by remember { mutableStateOf(true) }
         // Bumped on each user interaction; LaunchedEffect uses it as a key
         // so the auto-hide timer restarts on every tap.
@@ -352,15 +370,19 @@ class WebAppActivity : ComponentActivity() {
                     webViewState = wv
                     wv
                 },
-                // [audit-0909 T7-M2] renderHost() re-runs setContent on every
-                // fullscreen toggle (back press), and each pass dropped the
-                // previous AndroidView without destroying its WebView — a live
-                // renderer per toggle (BrowserUseManager's own note puts those
-                // at 50-100 MB each, and setContent replays the composition so
-                // the factory runs again). onRelease covers both the
+                // [audit-0909 T7-M2] The composition can still replace this
+                // AndroidView (a renderer death bumps `rendererEpoch` above,
+                // which re-keys the block), and a pass used to drop the
+                // previous instance without destroying its WebView — a live
+                // renderer per replacement (BrowserUseManager's own note puts
+                // those at 50-100 MB each). onRelease covers both the
                 // replacement and the activity-teardown path; destroy() is
                 // idempotent and clearing the refs keeps onDestroy() from
                 // touching an already-destroyed instance.
+                // [da1032-A] The fullscreen toggle no longer re-runs
+                // setContent (the state is Activity-owned and this host only
+                // reads it), so the epoch is the only remaining rebuild path
+                // this hook guards.
                 onRelease = { wv ->
                     if (webViewRef === wv) webViewRef = null
                     if (webViewState === wv) webViewState = null
@@ -386,8 +408,7 @@ class WebAppActivity : ComponentActivity() {
                     fullscreen = fullscreen,
                     onClose = onClose,
                     onToggleFullscreen = {
-                        fullscreen = !fullscreen
-                        onFullscreenChange(fullscreen)
+                        onFullscreenChange(!fullscreen)
                         toolbarVisible = true
                         interactionTick += 1
                     },

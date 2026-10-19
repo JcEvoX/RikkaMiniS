@@ -29,6 +29,22 @@ Judged by CODE anchors (comments stripped first — never anchor on comments):
     * `LaunchedEffect(servers, sessionId)` present (seeding effect re-runs on
       id change)
 
+  [da1032-A] ISSUE-02 — `SessionEditSheet` is host-agnostic: its Regenerate
+  button and its live row are both defaulted parameters, so a host that omits
+  them still compiles and the button silently no-ops. Two more blocks:
+
+  ChatScreen.kt
+    * SessionEditSheet(  block: `onRegenerate =` present AND `liveSession =`
+                                present (never rely on the defaults)
+
+  SessionsShared.kt (inside the `internal fun SessionEditSheet(` body only)
+    * `var title by remember(<keys containing session.id>)` present,
+      keyless `var title by remember {` forbidden
+    * `var selectedCategory by remember(<keys containing session.id>)` present,
+      keyless `var selectedCategory by remember {` forbidden
+    * `LaunchedEffect(<keys containing liveSession.id>)` present (the seeding
+      effect must re-run when the sheet is re-pointed at another row)
+
 Other bare `sessionId = sessionId` sites in ChatScreen (routing params of
 unrelated UI children) are OUT OF SCOPE — the guard pins to the named call
 blocks only, never the whole file.
@@ -54,6 +70,8 @@ CHAT_DIR = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat"
 CHATSCREEN = os.path.join(CHAT_DIR, "ChatScreen.kt")
 SKILLS_SHEET = os.path.join(CHAT_DIR, "SessionSkillsSheet.kt")
 MCPS_SHEET = os.path.join(CHAT_DIR, "SessionMcpsSheet.kt")
+SESSIONS_DIR = "src/android/app/src/main/java/com/rikkaminis/app/ui/sessions"
+SESSIONS_SHARED = os.path.join(SESSIONS_DIR, "SessionsShared.kt")
 
 LINE_COMMENT_RE = re.compile(r"//.*$")
 BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", re.S)
@@ -125,6 +143,50 @@ def extract_call_block(code, call_name):
     return None
 
 
+def _match_forward(code, start, opener, closer):
+    """Index of the token that closes the group opened at `start`, or -1."""
+    depth = 0
+    for j in range(start, len(code)):
+        if code[j] == opener:
+            depth += 1
+        elif code[j] == closer:
+            depth -= 1
+            if depth == 0:
+                return j
+    return -1
+
+
+def extract_block_fun_body(code, signature_fragment):
+    """Body of a BLOCK-body function, scoped so the file's other composables
+    cannot satisfy (or break) its anchors.
+
+    Parameters are paren-matched first and only then the body `{` is taken —
+    a bare brace-pairing search would trip over `onRegenerate: () -> Unit = {}`
+    inside the parameter list. Expressions bodies (`fun f(...) = ...`) are NOT
+    supported: returning None makes the caller fail closed rather than judge
+    the wrong region.
+    """
+    m = re.search(re.escape(signature_fragment), code)
+    if not m:
+        return None
+    open_paren = code.find("(", m.start())
+    if open_paren < 0:
+        return None
+    close_paren = _match_forward(code, open_paren, "(", ")")
+    if close_paren < 0:
+        return None
+    open_brace = code.find("{", close_paren)
+    if open_brace < 0:
+        return None
+    # `{` must be the body opener, not a stray brace in a return type/annotation
+    if "fun " in code[close_paren:open_brace]:
+        return None
+    close_brace = _match_forward(code, open_brace, "{", "}")
+    if close_brace < 0:
+        return None
+    return code[open_brace : close_brace + 1]
+
+
 # ---------------------------------------------------------------------------
 # Anchor specs
 
@@ -135,6 +197,26 @@ BLOCK_SPECS = [
     ("WebPreviewBottomSheet", r"pinSessionId\s*=\s*viewModel\.currentSessionId", r"pinSessionId\s*=\s*sessionId\b", "web preview pin"),
     ("ChatHistoryDrawer", r"currentSessionId\s*=\s*viewModel\.currentSessionId", r"currentSessionId\s*=\s*sessionId\b", "history drawer"),
 ]
+
+# [da1032-A] ISSUE-02: `SessionEditSheet` is host-agnostic — `onRegenerate`
+# defaults to `{}` and `liveSession` defaults to the (stale) `session`
+# snapshot, so omitting either compiles clean and disables the feature
+# silently. Pin both arguments at the call site.
+EDIT_SHEET_CALL = "SessionEditSheet"
+EDIT_SHEET_SPECS = [
+    (EDIT_SHEET_CALL, [r"onRegenerate\s*=", r"liveSession\s*="], "session edit sheet"),
+]
+
+EDIT_SHEET_FUN_SIG = "internal fun SessionEditSheet"
+
+# Keyed-remember key lists: the id must appear SOMEWHERE among the keys (the
+# decision point is "re-seeds when the sheet is re-pointed"), so extra keys
+# stay legal.
+TITLE_KEYED_RE = r"\bvar\s+title\s+by\s+remember\s*\([^)]*\bsession\.id\b"
+TITLE_KEYLESS_RE = r"\bvar\s+title\s+by\s+remember\s*\{"
+CATEGORY_KEYED_RE = r"\bvar\s+selectedCategory\s+by\s+remember\s*\([^)]*\bsession\.id\b"
+CATEGORY_KEYLESS_RE = r"\bvar\s+selectedCategory\s+by\s+remember\s*\{"
+LIVE_SEED_EFFECT_RE = r"LaunchedEffect\s*\([^)]*\bliveSession\.id\b"
 
 
 def check_chatscreen(code, findings):
@@ -166,6 +248,61 @@ def check_chatscreen(code, findings):
     elif "viewModel.currentSessionId" not in m.group(1):
         findings.append(
             f"ChatScreen.kt: LocalMarkdownSessionId provides `{m.group(1)}` — expected viewModel.currentSessionId"
+        )
+    # [da1032-A] SessionEditSheet call block
+    for call_name, required_patterns, label in EDIT_SHEET_SPECS:
+        block = extract_call_block(code, call_name)
+        if block is None:
+            findings.append(f"ChatScreen.kt: call site `{call_name}(` not found")
+            continue
+        for required in required_patterns:
+            if not re.search(required, block):
+                arg = required.replace(r"\s*=", "").replace("\\s*=", "")
+                findings.append(
+                    f"ChatScreen.kt: `{call_name}(` ({label}) must pass `{arg}` explicitly — "
+                    f"it is a defaulted parameter, so omitting it compiles clean and silently "
+                    f"disables the control it feeds"
+                )
+    return findings
+
+
+def check_sessions_shared(code, findings):
+    """[da1032-A] The edit-sheet seed state must be keyed on the row id.
+
+    Scoped to the `internal fun SessionEditSheet` body: other composables in
+    this file legitimately hold keyless `var … by remember` state and must not
+    be judged.
+    """
+    code = strip_comments(code)
+    body = extract_block_fun_body(code, EDIT_SHEET_FUN_SIG)
+    if body is None:
+        findings.append(
+            "SessionsShared.kt: `internal fun SessionEditSheet(` body not found — "
+            "cannot verify the edit-state keys"
+        )
+        return findings
+    if not re.search(TITLE_KEYED_RE, body):
+        findings.append(
+            "SessionsShared.kt: `title` must be seeded by "
+            "`var title by remember(<keys with session.id>)` — otherwise the field keeps "
+            "the previous session's text when the sheet is re-pointed"
+        )
+    if re.search(TITLE_KEYLESS_RE, body):
+        findings.append("SessionsShared.kt: keyless `var title by remember {` still present")
+    if not re.search(CATEGORY_KEYED_RE, body):
+        findings.append(
+            "SessionsShared.kt: `selectedCategory` must be seeded by "
+            "`var selectedCategory by remember(<keys with session.id>)`"
+        )
+    if re.search(CATEGORY_KEYLESS_RE, body):
+        findings.append(
+            "SessionsShared.kt: keyless `var selectedCategory by remember {` still present"
+        )
+    if not re.search(LIVE_SEED_EFFECT_RE, body):
+        findings.append(
+            "SessionsShared.kt: the live-row seeding effect must key on `liveSession.id` "
+            "(expected `LaunchedEffect(liveSession.id, …)`) — otherwise a re-pointed sheet "
+            "never re-seeds from the new row"
         )
     return findings
 
@@ -209,6 +346,7 @@ def check(root):
         CHATSCREEN: check_chatscreen,
         SKILLS_SHEET: check_skills_sheet,
         MCPS_SHEET: check_mcps_sheet,
+        SESSIONS_SHARED: check_sessions_shared,
     }
     for rel, fn in paths.items():
         p = os.path.join(root, rel)
@@ -253,10 +391,40 @@ fun ChatScreen() {
         pinSessionId = viewModel.currentSessionId,
         onDismiss = onFullDismiss,
     )
+    // [da1032-A] the edit sheet host block: both defaulted args passed
+    // explicitly, and deliberately NOT in declaration order (the guard is on
+    // the decision point, not the argument order).
+    editingSession?.let { session ->
+        com.rikkaminis.app.ui.sessions.SessionEditSheet(
+            session = session,
+            liveSession = liveSessions.firstOrNull { it.id == session.id } ?: session,
+            onDismiss = { editingSession = null },
+            onSave = { t, c -> viewModel.updateTitleAndCategory(t, c) },
+            onRegenerate = { viewModel.regenerateSessionTitle() },
+        )
+    }
     // unrelated bare pass-through that stays legal
     SomeOtherChild(sessionId = sessionId)
 }
 """
+
+# [da1032-A] the pre-fix call site: compiles clean, button dead.
+FIX_CHATSCEEN_EDITSHEET_MISSING = FIX_CHATSCEEN_OK.replace(
+    """            liveSession = liveSessions.firstOrNull { it.id == session.id } ?: session,
+            onDismiss = { editingSession = null },
+            onSave = { t, c -> viewModel.updateTitleAndCategory(t, c) },
+            onRegenerate = { viewModel.regenerateSessionTitle() },
+""",
+    """            onDismiss = { editingSession = null },
+            onSave = { t, c -> viewModel.updateTitleAndCategory(t, c) },
+""",
+)
+
+# half-wired: the button works, the field never refreshes.
+FIX_CHATSCEEN_EDITSHEET_NO_LIVE = FIX_CHATSCEEN_OK.replace(
+    "            liveSession = liveSessions.firstOrNull { it.id == session.id } ?: session,\n",
+    "",
+)
 
 FIX_CHATSCEEN_DIRTY = """\
 fun ChatScreen() {
@@ -359,12 +527,72 @@ def write_fixture(root, rel, content):
         f.write(content)
 
 
-def make_tree(chatscreen, skills, mcps):
+FIX_SESSIONS_OK = """\
+@Composable
+internal fun SessionEditSheet(
+    session: ChatSessionEntity,
+    onDismiss: () -> Unit,
+    onSave: (title: String, category: String?) -> Unit,
+    liveSession: ChatSessionEntity = session,
+    isRegenerating: Boolean = false,
+    onRegenerate: () -> Unit = {},
+) {
+    // extra keys are legal: the guard asks whether the key list carries the id,
+    // not whether the list is exactly (session.id)
+    var title by remember(session.id, session.title) { mutableStateOf(session.title ?: "") }
+    var selectedCategory by remember(session.id) { mutableStateOf(session.category) }
+    val defaultSessionTitle = stringResource(R.string.session_new_chat_default)
+
+    LaunchedEffect(liveSession.id, liveSession.title, liveSession.category) {
+        liveSession.title?.let { title = it }
+        selectedCategory = liveSession.category
+    }
+
+    OutlinedButton(onClick = onRegenerate, enabled = !isRegenerating) {
+        Text(defaultSessionTitle)
+    }
+}
+
+// PRECISION: a different composable in the SAME file holding keyless seed
+// state with the same names — legal, and the guard is scoped to the
+// SessionEditSheet body so it must not be judged.
+@Composable
+internal fun SessionListRow(session: ChatSessionEntity) {
+    var title by remember { mutableStateOf(session.title ?: "") }
+    var selectedCategory by remember { mutableStateOf(session.category) }
+    Text(title ?: "", selectedCategory)
+}
+"""
+
+# [da1032-A] the pre-fix shape: unkeyed seeds + an effect that cannot re-seed
+# when the sheet is re-pointed at another row.
+FIX_SESSIONS_DIRTY = """\
+@Composable
+internal fun SessionEditSheet(
+    session: ChatSessionEntity,
+    liveSession: ChatSessionEntity = session,
+    onRegenerate: () -> Unit = {},
+) {
+    var title by remember { mutableStateOf(session.title ?: "") }
+    var selectedCategory by remember { mutableStateOf(session.category) }
+
+    LaunchedEffect(liveSession.title, liveSession.category) {
+        liveSession.title?.let { title = it }
+        selectedCategory = liveSession.category
+    }
+
+    OutlinedButton(onClick = onRegenerate) { Text(title) }
+}
+"""
+
+
+def make_tree(chatscreen, skills, mcps, sessions=FIX_SESSIONS_OK):
     root = tempfile.mkdtemp(prefix="ssib-selftest-")
     base = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat"
     write_fixture(root, os.path.join(base, "ChatScreen.kt"), chatscreen)
     write_fixture(root, os.path.join(base, "SessionSkillsSheet.kt"), skills)
     write_fixture(root, os.path.join(base, "SessionMcpsSheet.kt"), mcps)
+    write_fixture(root, os.path.join(SESSIONS_DIR, "SessionsShared.kt"), sessions)
     return root
 
 
@@ -389,6 +617,59 @@ def selftest():
                 print(f"[selftest FAIL] {name}: expected {'clean' if expect_clean else 'findings'}, got: {findings}")
             else:
                 print(f"[selftest ok] {name}: {'clean' if clean else f'{len(findings)} finding(s)'}")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    # [da1032-A] the new condition, three shapes + one precision arm
+    edit_cases = [
+        ("edit sheet call missing BOTH defaulted args",
+         FIX_CHATSCEEN_EDITSHEET_MISSING, FIX_SESSIONS_OK, False),
+        ("edit sheet call missing liveSession only",
+         FIX_CHATSCEEN_EDITSHEET_NO_LIVE, FIX_SESSIONS_OK, False),
+        ("sessions shared unkeyed seeds + effect without liveSession.id",
+         FIX_CHATSCEEN_OK, FIX_SESSIONS_DIRTY, False),
+        ("sessions shared keyed (precision: extra keys stay legal)",
+         FIX_CHATSCEEN_OK, FIX_SESSIONS_OK, True),
+    ]
+    for name, cs, ss, expect_clean in edit_cases:
+        root = make_tree(cs, FIX_SKILLS_OK, FIX_MCPS_OK, ss)
+        try:
+            findings = check(root)
+            clean = not findings
+            if clean != expect_clean:
+                ok = False
+                print(f"[selftest FAIL] {name}: expected {'clean' if expect_clean else 'findings'}, got: {findings}")
+            else:
+                print(f"[selftest ok] {name}: {'clean' if clean else f'{len(findings)} finding(s)'}")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    # precision: the two new shapes must name their own anchor, and only theirs.
+    for name, cs, ss, must_mention, must_not_mention, want_count in (
+        ("edit sheet both args missing", FIX_CHATSCEEN_EDITSHEET_MISSING, FIX_SESSIONS_OK,
+         ["SessionEditSheet", "onRegenerate", "liveSession"], [], 2),
+        ("edit sheet liveSession missing", FIX_CHATSCEEN_EDITSHEET_NO_LIVE, FIX_SESSIONS_OK,
+         ["SessionEditSheet", "liveSession"], ["onRegenerate"], 1),
+        ("sessions shared unkeyed", FIX_CHATSCEEN_OK, FIX_SESSIONS_DIRTY,
+         ["liveSession.id", "var title by remember", "var selectedCategory by remember"], [], 5),
+    ):
+        root = make_tree(cs, FIX_SKILLS_OK, FIX_MCPS_OK, ss)
+        try:
+            findings = check(root)
+            joined = " | ".join(findings)
+            for hit in must_mention:
+                if hit not in joined:
+                    ok = False
+                    print(f"[selftest FAIL] precision {name}: missing `{hit}` in findings")
+            for hit in must_not_mention:
+                if hit in joined:
+                    ok = False
+                    print(f"[selftest FAIL] precision {name}: unexpected `{hit}` in findings")
+            if len(findings) != want_count:
+                ok = False
+                print(f"[selftest FAIL] precision {name}: expected {want_count} finding(s), got {len(findings)}: {findings}")
+            else:
+                print(f"[selftest ok] precision {name}: exactly {want_count} finding(s), anchors named")
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
@@ -440,7 +721,8 @@ def main():
         for f in findings:
             print(f"  - {f}")
         return 1
-    print("session_sheet_id_binding_check: OK (5 call sites active-bound, both sheets id-keyed)")
+    print("session_sheet_id_binding_check: OK (4 session-scoped call blocks + LocalMarkdownSessionId "
+          "active-bound, SessionEditSheet call args wired, both sheets + edit-sheet keys id-keyed)")
     return 0
 
 

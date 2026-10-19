@@ -4569,13 +4569,32 @@ fun ChatScreen(
             // edits from the in-chat pill are visually + behaviourally
             // identical to the home-screen long-press flow.
             editingSession?.let { session ->
+                // [da1032-A] `editingSession` is a one-shot snapshot
+                // (loadSessionEntity() at open time), but the sheet's
+                // Regenerate-Title button writes straight to the DB row — so
+                // the sheet has to follow the row, not the snapshot.
+                // Observing *inside* the `let` scopes the subscription to the
+                // sheet's lifetime: the block leaves the composition on
+                // dismiss, so ChatScreen gains no standing sessions
+                // subscription. `remember` keeps the cold Room flow's identity
+                // stable across the many recompositions of this screen
+                // (collectAsState would otherwise re-subscribe on every pass).
+                val sessionsFlow = remember { chatRepository.observeSessions() }
+                val liveSessions by sessionsFlow.collectAsState(initial = emptyList())
+                val liveSession = liveSessions.firstOrNull { it.id == session.id } ?: session
                 com.rikkaminis.app.ui.sessions.SessionEditSheet(
                     session = session,
+                    liveSession = liveSession,
                     onDismiss = { editingSession = null },
                     onSave = { newTitle, newCategory ->
                         viewModel.updateTitleAndCategory(newTitle, newCategory)
                         editingSession = null
                     },
+                    // [da1032-A] Same source as the drawer's regenerate entry
+                    // (:2200) — the ViewModel acts on the CURRENT session, which
+                    // is what this sheet always edits. Without this the
+                    // OutlinedButton ran its default no-op.
+                    onRegenerate = { viewModel.regenerateSessionTitle() },
                 )
             }
 
