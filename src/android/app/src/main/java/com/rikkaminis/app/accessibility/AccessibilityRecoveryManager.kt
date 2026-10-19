@@ -104,7 +104,36 @@ object AccessibilityRecoveryManager {
     private val _pendingPrompt = MutableStateFlow<RepairPrompt?>(null)
     val pendingPrompt: StateFlow<RepairPrompt?> = _pendingPrompt.asStateFlow()
 
-    private var continuation: Continuation<Decision>? = null
+    /**
+     * Serializes every read and write of [continuation] / [promptToken] and of
+     * the prompt slot they describe. The critical sections are pure field work —
+     * no suspension, no callback — so a plain monitor is the right tool: the
+     * resumptions happen OUTSIDE it, and `respond` (UI thread) can never
+     * interleave with a timeout/cancellation cleanup (agent thread).
+     */
+    private val slotLock = Any()
+
+    /**
+     * The waiter that currently owns the repair prompt.
+     *
+     * [Volatile] because [respond] runs on the UI thread while the waiting
+     * coroutine lives on the agent's; every mutation still goes through
+     * [slotLock].
+     */
+    @Volatile private var continuation: Continuation<Decision>? = null
+
+    /**
+     * Identity of the slot owner. Bumped when a waiter publishes, when the UI
+     * answers, and claimed by each new waiter up front.
+     *
+     * Every path that CLEARS the slot (timeout, coroutine cancellation) must
+     * still be holding its own token to be allowed to do so. Without this a late
+     * cleanup from waiter A tore down the dialog a newer waiter B had just put
+     * on screen — B then sat parked until its own full timeout with nothing to
+     * answer. The same token keeps a stale responder from mis-delivering a
+     * decision to the wrong waiter.
+     */
+    private var promptToken: Long = 0L
 
     /**
      * Observable "the grant is currently missing" flag for Settings UI, so the
@@ -168,21 +197,36 @@ object AccessibilityRecoveryManager {
      * `pkg/.Class` form, because the framework normalizes entries it rewrites
      * (observed: TalkBack's entry came back as `pkg/.TalkBackService` after we
      * wrote the fully-qualified form).
+     *
+     * The accessibility master switch is consulted first, and OFF means revoked:
+     * with `ACCESSIBILITY_ENABLED == 0` the framework ignores the service list
+     * entirely, so a listed-but-master-off service receives no events and the
+     * repair affordance is exactly what the user needs. This is the same verdict
+     * [A11yState.isServiceEnabled] reaches for the same fact — one predicate,
+     * two readers, no drift.
      */
     fun isGrantRevoked(context: Context): Boolean {
         val now = System.currentTimeMillis()
         cachedRevoked?.let { if (now - cachedAtMs < CHECK_CACHE_TTL_MS) return it }
 
         val revoked = try {
-            val enabled = Settings.Secure.getString(
-                context.contentResolver,
-                Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
-            )
-            isRevokedIn(
-                enabledValue = enabled,
-                pkg = context.packageName,
-                serviceClass = MinisAccessibilityService::class.java.name,
-            )
+            // Master switch OFF ⇒ the framework ignores the service list, so a
+            // listed service is not running: that IS the revoked state. Read
+            // through the same predicate the settings screens use, and stay
+            // inside the cache's verdict (see the KDoc note above).
+            if (A11yState.isMasterSwitchOn(context)) {
+                val enabled = Settings.Secure.getString(
+                    context.contentResolver,
+                    Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+                )
+                isRevokedIn(
+                    enabledValue = enabled,
+                    pkg = context.packageName,
+                    serviceClass = MinisAccessibilityService::class.java.name,
+                )
+            } else {
+                true
+            }
         } catch (t: Throwable) {
             // A read failure is not evidence of revocation — do not prompt on it.
             AppLogger.warning(TAG, "isGrantRevoked read failed: ${t.message}")
@@ -302,33 +346,96 @@ object AccessibilityRecoveryManager {
      * "service not running" error instead of hanging the agent loop. The
      * pending prompt is always cleared, including on coroutine cancellation,
      * so a stale dialog can never outlive its caller.
+     *
+     * Both invariants are enforced through [promptToken]: this waiter claims an
+     * id before it publishes, and every teardown (timeout here, cancellation in
+     * [clearSlotIfOwner], a decision in [respond]) has to still own the slot to
+     * touch it. Two consequences the naive version got wrong: a late teardown
+     * can no longer clear a NEWER waiter's prompt, and a waiter that finds the
+     * slot already taken converges with CANCEL immediately instead of parking
+     * for a full timeout on a dialog that is not its own.
      */
     private suspend fun awaitDecision(prompt: RepairPrompt): Decision {
+        val token = synchronized(slotLock) { ++promptToken }
         val decision = withTimeoutOrNull(PROMPT_TIMEOUT_MS) {
             suspendCancellableCoroutine<Decision> { cont ->
-                continuation = cont
-                _pendingPrompt.value = prompt
-                cont.invokeOnCancellation {
-                    _pendingPrompt.value = null
-                    continuation = null
+                var displaced: Continuation<Decision>? = null
+                val accepted = synchronized(slotLock) {
+                    if (promptToken != token) {
+                        false
+                    } else {
+                        displaced = continuation
+                        continuation = cont
+                        _pendingPrompt.value = prompt
+                        true
+                    }
                 }
+                if (!accepted) {
+                    // Superseded while starting up: never suspend on a slot we
+                    // do not own, and never leave the caller hanging.
+                    runCatching { cont.resume(Decision.CANCEL) }
+                    return@suspendCancellableCoroutine
+                }
+                // A previous waiter was displaced by this publish; converge it
+                // now rather than letting it sit until its own timeout.
+                displaced?.let { runCatching { it.resume(Decision.CANCEL) } }
+                cont.invokeOnCancellation { clearSlotIfOwner(token) }
             }
         }
         if (decision == null) {
-            // Timed out: tear the dialog down so it doesn't linger on screen.
-            _pendingPrompt.value = null
-            continuation = null
+            // Timed out: tear the dialog down so it doesn't linger on screen —
+            // but only if this waiter still owns it.
+            clearSlotIfOwner(token)
             AppLogger.info(TAG, "repair prompt timed out after ${PROMPT_TIMEOUT_MS}ms — treating as cancel")
         }
         return decision ?: Decision.CANCEL
     }
 
-    /** Called by the UI once the dialog closes. Safe to call spuriously. */
-    fun respond(decision: Decision) {
-        _pendingPrompt.value = null
-        val c = continuation
+    /**
+     * Release the prompt slot, provided [token] is still the current owner.
+     *
+     * The check is the whole point: teardown from an expired waiter must not
+     * dismiss the prompt a newer one is showing.
+     */
+    private fun clearSlotIfOwner(token: Long) {
+        synchronized(slotLock) { clearSlotLocked(token) }
+    }
+
+    /**
+     * The ONE release site of the prompt slot. Callers MUST hold [slotLock].
+     *
+     * Single site on purpose: this family (memory, 2026-09-06 → 10-12) loses an
+     * ownership guard exactly when a second release path is written without one,
+     * so every teardown — timeout, cancellation, and the UI's answer — goes
+     * through here.
+     *
+     * @return the waiting continuation, or null when [token] is no longer the
+     *   owner (then nothing is taken and nothing is cleared).
+     */
+    private fun clearSlotLocked(token: Long): Continuation<Decision>? {
+        if (promptToken != token) return null
+        val taken = continuation
         continuation = null
-        c?.resume(decision)
+        _pendingPrompt.value = null
+        return taken
+    }
+
+    /**
+     * Called by the UI once the dialog closes. Safe to call spuriously.
+     *
+     * Mints a token first: that bump is what invalidates every teardown still
+     * holding the previous one (including the waiting caller's cancellation
+     * handler), and it lets the answer go through the same guarded release path
+     * as everything else. The resume happens OUTSIDE the lock — the resumed code
+     * runs on its own thread and may re-enter this object — and tolerates a
+     * continuation that was already cancelled.
+     */
+    fun respond(decision: Decision) {
+        val taken = synchronized(slotLock) {
+            val token = ++promptToken
+            clearSlotLocked(token)
+        }
+        runCatching { taken?.resume(decision) }
     }
 
     /**

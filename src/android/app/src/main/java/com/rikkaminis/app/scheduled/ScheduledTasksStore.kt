@@ -86,16 +86,16 @@ object ScheduledTasksStore {
     suspend fun setGlobalEnabled(context: Context, enabled: Boolean): ScheduledTasksFile =
         mutate(context) { it.copy(globalEnabled = enabled) }
 
+    /**
+     * Editor save — thin wrapper over [ScheduledTaskTransitions.mergeUpsertTask]:
+     * only the editable spec fields are applied, while run state (`lastRunDate` /
+     * `lastResult` / `failStreak` / `suspendedByFuse`) and `enabled` stay with the
+     * stored record. Writing the caller's whole record here used to erase any run
+     * that settled while the editor was open (up to the full prompt budget) —
+     * see the merge function for the shape.
+     */
     suspend fun upsertTask(context: Context, task: ScheduledTask): ScheduledTasksFile =
-        mutate(context) { file ->
-            val idx = file.tasks.indexOfFirst { it.id == task.id }
-            val tasks = if (idx < 0) {
-                file.tasks + task
-            } else {
-                file.tasks.toMutableList().also { it[idx] = task }
-            }
-            file.copy(tasks = tasks)
-        }
+        mutate(context) { file -> ScheduledTaskTransitions.mergeUpsertTask(file, task) }
 
     suspend fun deleteTask(context: Context, taskId: String): ScheduledTasksFile {
         val next = mutate(context) { file ->

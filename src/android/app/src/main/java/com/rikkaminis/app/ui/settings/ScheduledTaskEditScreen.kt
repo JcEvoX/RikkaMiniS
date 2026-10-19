@@ -100,7 +100,14 @@ fun ScheduledTaskEditScreen(
     val turnsOk = turnsValue != null && turnsValue > 0
     val deadlineOk = deadlineValue != null && deadlineValue > 0
     val tokensOk = tokensValue != null && tokensValue > 0
-    val canSave = prompt.isNotBlank() && windowOk && turnsOk && deadlineOk && tokensOk
+    // Save is gated on the stored record being loaded first for an EDIT. The
+    // form opens with defaults (07:00-23:00, empty title) while
+    // `LaunchedEffect(taskId)` loads the real task; saving in that window would
+    // write those defaults over the stored spec (the store merges run state now,
+    // but the spec fields would still come from the untouched form). A brand-new
+    // task has no record to wait for, so `isNew` keeps it savable.
+    val canSave = prompt.isNotBlank() && windowOk && turnsOk && deadlineOk && tokensOk &&
+        (isNew || original != null)
 
     if (showDeleteConfirm) {
         AlertDialog(
