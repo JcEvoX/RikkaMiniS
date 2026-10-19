@@ -37,13 +37,18 @@ object OpenAIModelsApi {
         // [T-provider-custom-user-agent] Per-provider UA override; null/blank
         // keeps the default UA. Threaded from ProviderRepository.refreshModels.
         customUserAgent: String? = null,
+        // [da1030 ISSUE-06] Azure instances authenticate with the `api-key`
+        // header, not `Authorization: Bearer` — without this the models-list
+        // fetch got a hard 401 on every Azure provider. Threaded from
+        // ProviderInstance.azureMode by ModelListProviderAdapters.
+        azureMode: Boolean = false,
     ): List<LLMModel> = withContext(Dispatchers.IO) {
         val isCustomBase = baseURL != null && !isOfficialOpenAI(baseURL)
         // For third-party endpoints (vLLM, Ollama, etc.), return empty on failure
         // so the caller preserves existing models instead of replacing with built-in GPT list.
         val fallback = if (isCustomBase) emptyList() else LLMModel.allOpenAI
 
-        val cacheKey = (baseURL ?: "") + "|" + apiKey
+        val cacheKey = modelsCacheKey(baseURL, apiKey, azureMode)
         val ctx = context
         if (shouldConsultCache(ctx != null, forceRefresh) && ctx != null) {
             // [T-sensenova-effort-enum] A cache entry written before the gateway-truth
@@ -55,12 +60,7 @@ object OpenAIModelsApi {
             }
         }
         val url = buildURL(baseURL)
-        val request = Request.Builder()
-            .url(url)
-            .header("Authorization", "Bearer $apiKey")
-            // [T-provider-custom-user-agent] models-list UA override.
-            .applyUserAgentOverride(customUserAgent)
-            .build()
+        val request = buildModelsRequest(url, apiKey, azureMode, customUserAgent)
 
         // [fix/audit0917-b8] Call cancellation is now wired into the request:
         // `execute()` is blocking and has no cancellation hook, so a cancelled
@@ -198,6 +198,34 @@ object OpenAIModelsApi {
      */
     internal fun shouldConsultCache(hasContext: Boolean, forceRefresh: Boolean): Boolean =
         hasContext && !forceRefresh
+
+    /**
+     * [da1030 ISSUE-06] Pure request builder for the models list, extracted so
+     * the auth-header + UA contract is JVM-testable without a network stack.
+     * Auth goes through [applyOpenAIKeyAuth] — the same single source the chat
+     * builders use — so an Azure instance sends `api-key` here too.
+     */
+    internal fun buildModelsRequest(
+        url: String,
+        apiKey: String,
+        azureMode: Boolean,
+        customUserAgent: String?,
+    ): Request =
+        Request.Builder()
+            .url(url)
+            .applyOpenAIKeyAuth(azureMode, apiKey)
+            // [T-provider-custom-user-agent] models-list UA override.
+            .applyUserAgentOverride(customUserAgent)
+            .build()
+
+    /**
+     * [da1030 ISSUE-06] The 7-day cache row must not be shared between the two
+     * auth schemes: an Azure instance and a plain OpenAI-compatible instance can
+     * point at the same URL with the same key while only one of them can
+     * actually authenticate. The suffix keeps them in separate rows.
+     */
+    internal fun modelsCacheKey(baseURL: String?, apiKey: String, azureMode: Boolean): String =
+        (baseURL ?: "") + "|" + apiKey + "|" + if (azureMode) "azure" else "bearer"
 
     private fun buildURL(baseURL: String?): String {
         if (baseURL == null) return "https://api.openai.com/v1/models"
