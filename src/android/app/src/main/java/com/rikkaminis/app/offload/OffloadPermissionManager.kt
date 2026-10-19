@@ -177,7 +177,7 @@ object OffloadPermissionManager {
     // [fix/audit0917-b8] Written by the UI thread (respond*), read by
     // native-offload worker threads (the suspend callers) — @Volatile so a
     // response is never missed on a different core.
-    @Volatile private var pendingContinuation: kotlin.coroutines.Continuation<Response>? = null
+    @Volatile private var pendingContinuation: kotlin.coroutines.Continuation<Response?>? = null
 
     // ── Android system runtime permission request (for location etc.) ──────────
 
@@ -205,6 +205,29 @@ object OffloadPermissionManager {
      * concurrent offload workers need.
      */
     private val slotLock = Any()
+
+    /**
+     * [§1031-B] Reserved-but-not-yet-installed marker for a round-trip slot.
+     *
+     * A claim used to be a pure read, so two concurrent callers could both pass
+     * it and the later one overwrote the earlier one's continuation. The claim
+     * now stores this marker while its caller is between "won the slot" and
+     * "parked its continuation"; the install only proceeds while the marker is
+     * still ours.
+     *
+     * `Continuation<in T>` is contravariant in `T`, so `Continuation<Any?>` is a
+     * subtype of every `Continuation<T>` and one marker serves all three slots.
+     * It is never parked on: every write of it is either replaced by a real
+     * continuation or released by [clearSlotLocked].
+     */
+    private object SlotClaimed : kotlin.coroutines.Continuation<Any?> {
+        override val context: kotlin.coroutines.CoroutineContext
+            get() = kotlin.coroutines.EmptyCoroutineContext
+
+        override fun resumeWith(result: Result<Any?>) {
+            // Marker only — a real waiter is never parked here.
+        }
+    }
 
     /**
      * [audit-0919 F-282] Upper bound on the number of chat sessions whose
@@ -242,20 +265,45 @@ object OffloadPermissionManager {
                 )
                 return AndroidPermissionResult.TIMEOUT
             }
+            // [§1031-B] Reserve, don't just check: [claimSlot] answers "is it
+            // free?", but the install happens outside this lock, so two
+            // concurrent callers could both pass that test and the later one
+            // would overwrite a live waiter. The marker makes claim→install one
+            // transition; the install only proceeds while it is still ours.
+            androidPermissionContinuation = SlotClaimed
         }
+        // [§1031-B] The continuation this caller installed, captured for the
+        // timeout branch below so it can go through the same guarded release
+        // point as the cancellation path.
+        var slotToken: kotlin.coroutines.Continuation<AndroidPermissionResult>? = null
         val timed = withTimeoutOrNull(SYSTEM_DIALOG_TIMEOUT_MS) {
             suspendCancellableCoroutine<AndroidPermissionResult> { cont ->
-                androidPermissionContinuation = cont
-                _pendingAndroidPermission.value = AndroidPermissionRequest(permissions)
+                // [§1031-B] Reserve → install is one critical section: the claim
+                // above stored [SlotClaimed], so installing is legal only while
+                // the marker is still ours. A caller that finds the marker gone
+                // aborts instead of overwriting the waiter that took over.
+                val installed = synchronized(slotLock) {
+                    if (androidPermissionContinuation !== SlotClaimed) {
+                        false
+                    } else {
+                        androidPermissionContinuation = cont
+                        slotToken = cont
+                        _pendingAndroidPermission.value = AndroidPermissionRequest(permissions)
+                        true
+                    }
+                }
+                if (!installed) {
+                    // Reservation lost (released or stolen): take the same
+                    // verdict a rejected claim gets — never overwrite the slot.
+                    cont.resume(AndroidPermissionResult.TIMEOUT)
+                    return@suspendCancellableCoroutine
+                }
                 // [fix/audit0917-b8] Identity guard: a newer caller may have
                 // installed its own continuation after this one timed out, and
                 // an unconditional clear would cancel the *active* request's
                 // dialog (its waiter then blocks to its own timeout).
                 cont.invokeOnCancellation {
-                    if (androidPermissionContinuation === cont) {
-                        _pendingAndroidPermission.value = null
-                        androidPermissionContinuation = null
-                    }
+                    clearSlotLocked(cont)
                 }
             }
         }
@@ -270,10 +318,11 @@ object OffloadPermissionManager {
             // timeout path invokeOnCancellation has already cleared the slot
             // (so this branch is idempotent); this guard only matters in the
             // stale-timeout window, where the slot now belongs to someone else.
-            if (androidPermissionContinuation == null) {
-                _pendingAndroidPermission.value = null
-                androidPermissionContinuation = null
-            }
+            // [§1031-B] Third path through the single guarded release point
+            // (respond* and invokeOnCancellation are the other two): the normal
+            // timeout has already released the slot via the cancellation
+            // handler, so this is the idempotent safety net.
+            clearSlotLocked(slotToken)
             return AndroidPermissionResult.TIMEOUT
         }
         return timed
@@ -285,10 +334,17 @@ object OffloadPermissionManager {
         // gets resumed, so a late response can never resume a newer waiter
         // that has since taken the slot. Resuming an already-cancelled
         // continuation is a no-op in kotlinx.coroutines, so no runCatching.
-        val cont = androidPermissionContinuation ?: return
-        androidPermissionContinuation = null
-        _pendingAndroidPermission.value = null
-        cont.resume(result)
+        // [§1031-B] Take and clear are one step under [slotLock], through the
+        // single guarded release point, so a newer claim can no longer land
+        // between them. A slot holding only the [SlotClaimed] marker has not
+        // published a dialog yet — nothing to answer, same as a free slot.
+        var cont: kotlin.coroutines.Continuation<AndroidPermissionResult>? = null
+        synchronized(slotLock) {
+            val token = androidPermissionContinuation ?: return
+            if (token === SlotClaimed) return
+            if (clearSlotLocked(token) != null) cont = token
+        }
+        cont?.resume(result)
     }
 
     /** Overload kept for callers that only have a granted/denied bool. */
@@ -361,25 +417,53 @@ object OffloadPermissionManager {
                 )
                 return AndroidPermissionResult.DENIED
             }
+            // [§1031-B] Reserve, don't just check — see [requestAndroidPermission].
+            settingsGateContinuation = SlotClaimed
         }
         // [fix/audit0917-b8] Phase 1 now has the same timeout discipline as
         // phase 2 (and as requestAndroidPermission): if the UI never calls
         // respondToSettingsGate (dialog swallowed by a state glitch, activity
         // gone), the caller used to block forever on a native-offload worker
         // thread. Timed-out/cancelled phase 1 == DENIED, never a hang.
+        // [§1031-B] The continuation this caller installed, captured for the
+        // timeout branch below so it clears through the same guarded release
+        // point as the cancellation path.
+        var slotToken: kotlin.coroutines.Continuation<SettingsGateDecision>? = null
         val decision = withTimeoutOrNull(SETTINGS_GATE_TIMEOUT_MS) {
             suspendCancellableCoroutine<SettingsGateDecision> { cont ->
-                settingsGateContinuation = cont
-                _pendingSettingsGate.value = request
-                // Identity guard — only clear the slot if it is still ours.
-                cont.invokeOnCancellation {
-                    if (settingsGateContinuation === cont) {
-                        _pendingSettingsGate.value = null
-                        settingsGateContinuation = null
+                // [§1031-B] Reserve → install in one critical section (see
+                // [requestAndroidPermission]): installing is legal only while
+                // the claim's [SlotClaimed] marker is still ours.
+                val installed = synchronized(slotLock) {
+                    if (settingsGateContinuation !== SlotClaimed) {
+                        false
+                    } else {
+                        settingsGateContinuation = cont
+                        slotToken = cont
+                        _pendingSettingsGate.value = request
+                        true
                     }
                 }
+                if (!installed) {
+                    // Reservation lost (released or stolen): same verdict as a
+                    // rejected claim — never overwrite the slot.
+                    cont.resume(SettingsGateDecision.CANCEL)
+                    return@suspendCancellableCoroutine
+                }
+                // Identity guard — only clear the slot if it is still ours.
+                cont.invokeOnCancellation {
+                    clearSlotLocked(cont)
+                }
             }
-        } ?: return AndroidPermissionResult.DENIED
+        }
+        if (decision == null) {
+            // [§1031-B] Timeout path through the single guarded release point
+            // (the cancellation handler has normally released the slot already).
+            clearSlotLocked(slotToken)
+            // [fix/audit0917-b8] Timed-out/cancelled phase 1 == DENIED, never a
+            // hang.
+            return AndroidPermissionResult.DENIED
+        }
         if (decision == SettingsGateDecision.CANCEL) return AndroidPermissionResult.DENIED
 
         val granted = withTimeoutOrNull(SETTINGS_GATE_TIMEOUT_MS) {
@@ -419,10 +503,15 @@ object OffloadPermissionManager {
     /** Called from UI after the in-app "go to settings" dialog closes. */
     fun respondToSettingsGate(decision: SettingsGateDecision) {
         // [fix/audit0917-b8] Take-then-clear (see respondToAndroidPermission).
-        val cont = settingsGateContinuation ?: return
-        settingsGateContinuation = null
-        _pendingSettingsGate.value = null
-        cont.resume(decision)
+        // [§1031-B] One guarded step under [slotLock]; a slot holding only the
+        // [SlotClaimed] marker has published no dialog yet — nothing to answer.
+        var cont: kotlin.coroutines.Continuation<SettingsGateDecision>? = null
+        synchronized(slotLock) {
+            val token = settingsGateContinuation ?: return
+            if (token === SlotClaimed) return
+            if (clearSlotLocked(token) != null) cont = token
+        }
+        cont?.resume(decision)
     }
 
     /**
@@ -533,6 +622,11 @@ object OffloadPermissionManager {
                         )
                         return false
                     }
+                    // [§1031-B] Reserve, don't just check — see
+                    // [requestAndroidPermission]. Two concurrent
+                    // checkPermission callers used to both pass this test and
+                    // the later one overwrote the earlier one's waiter.
+                    pendingContinuation = SlotClaimed
                 }
                 // [phase-3] The 120 s wait used to be a black hole in the log:
                 // the agent saw nothing between "command started" and the
@@ -543,25 +637,45 @@ object OffloadPermissionManager {
                     TAG,
                     "gate: awaiting user approval tool=$toolName session=$sessionId timeout_ms=$SYSTEM_DIALOG_TIMEOUT_MS",
                 )
+                // [§1031-B] The continuation this caller installed, captured for
+                // the timeout arm below so it clears through the same guarded
+                // release point as the cancellation path.
+                var slotToken: kotlin.coroutines.Continuation<Response?>? = null
                 val response = withTimeoutOrNull(SYSTEM_DIALOG_TIMEOUT_MS) {
-                    suspendCancellableCoroutine<Response> { cont ->
-                        pendingContinuation = cont
-                        _pendingRequest.value = PermissionRequest(
-                            toolName = toolName,
-                            toolTitle = toolTitle,
-                            description = "Allow ${info?.displayName ?: toolName} access?",
-                            sessionId = sessionId,
-                        )
+                    suspendCancellableCoroutine<Response?> { cont ->
+                        // [§1031-B] Reserve → install in one critical section:
+                        // installing is legal only while the claim's
+                        // [SlotClaimed] marker is still ours.
+                        val installed = synchronized(slotLock) {
+                            if (pendingContinuation !== SlotClaimed) {
+                                false
+                            } else {
+                                pendingContinuation = cont
+                                slotToken = cont
+                                _pendingRequest.value = PermissionRequest(
+                                    toolName = toolName,
+                                    toolTitle = toolTitle,
+                                    description = "Allow ${info?.displayName ?: toolName} access?",
+                                    sessionId = sessionId,
+                                )
+                                true
+                            }
+                        }
+                        if (!installed) {
+                            // Reservation lost (released or stolen): null ==
+                            // "deny, no verdict recorded", the same shape the
+                            // rejection above returns — never overwrite the
+                            // waiter that took the slot.
+                            cont.resume(null)
+                            return@suspendCancellableCoroutine
+                        }
                         cont.invokeOnCancellation {
                             // [fix/audit0917-b8] Identity guard — a newer
                             // checkPermission caller may have already taken
                             // the slot; clearing it unconditionally would
                             // leave its dialog showing with no waiter behind
                             // it.
-                            if (pendingContinuation === cont) {
-                                _pendingRequest.value = null
-                                pendingContinuation = null
-                            }
+                            clearSlotLocked(cont)
                         }
                     }
                 }
@@ -583,7 +697,14 @@ object OffloadPermissionManager {
                         denials.add(toolName)
                         false
                     }
-                    null -> false  // timed out or cancelled: deny rather than block forever
+                    null -> {
+                        // [§1031-B] Timeout path through the single guarded
+                        // release point (the cancellation handler has normally
+                        // released the slot already). deny rather than block
+                        // forever.
+                        clearSlotLocked(slotToken)
+                        false
+                    }
                 }
                 AppLogger.info(
                     TAG,
@@ -608,16 +729,42 @@ object OffloadPermissionManager {
         // the waiter timed out could resume a stale continuation (or, worse,
         // a newer waiter's) — IllegalStateException territory. Taking the
         // reference first makes the pair atomic from the UI's point of view.
-        val cont = pendingContinuation ?: return
-        pendingContinuation = null
-        _pendingRequest.value = null
-        cont.resume(response)
+        // [§1031-B] One guarded step under [slotLock] (was a read-then-write
+        // pair a concurrent caller could slip into); a slot holding only the
+        // [SlotClaimed] marker has published no dialog yet — nothing to answer.
+        var cont: kotlin.coroutines.Continuation<Response?>? = null
+        synchronized(slotLock) {
+            val token = pendingContinuation ?: return
+            if (token === SlotClaimed) return
+            if (clearSlotLocked(token) != null) cont = token
+        }
+        cont?.resume(response)
     }
 
     /** Clear session grants AND denials (call when a session ends). */
     fun clearSessionGrants(sessionId: String) {
         sessionGrants.remove(sessionId)
         sessionDenials.remove(sessionId)
+    }
+
+    /**
+     * [§1031-B] Move the draft session's grants/denials onto the real id.
+     *
+     * Same hop as the skill/mcp/WebAppShortcut renames in
+     * `promoteDraftIfNeeded`: the session id changes, and the user's verdicts
+     * about that session must move with it. Without this, a grant the user gave
+     * on a draft chat stayed keyed under `__new__<uuid>` and the same tool
+     * asked again under the real id (the draft key is unreachable afterwards —
+     * nothing else reads it, so the entries are simply lost).
+     *
+     * Each map is a ConcurrentHashMap, so the single-key remove-then-put is
+     * atomic; no read-then-write pair is involved. The draft key is fresh and
+     * the target id is the freshly created session row, so there is never an
+     * existing entry to merge with.
+     */
+    fun renameSessionGrants(fromDraft: String, toReal: String) {
+        sessionGrants.remove(fromDraft)?.let { sessionGrants[toReal] = it }
+        sessionDenials.remove(fromDraft)?.let { sessionDenials[toReal] = it }
     }
 
     /**
@@ -701,6 +848,48 @@ object OffloadPermissionManager {
             while (sessionDenials.size > MAX_TRACKED_SESSIONS) {
                 val oldest = sessionDenials.keys.firstOrNull() ?: break
                 sessionDenials.remove(oldest)
+            }
+        }
+    }
+
+    /**
+     * [§1031-B] The single guarded release point for all three round-trip
+     * slots: `respond*`, the timeout branches and `invokeOnCancellation` all
+     * clear through it, so "is this still mine?" and "clear it" are one atomic
+     * step under [slotLock].
+     *
+     * [token] is the continuation the caller believes it owns. Returns the
+     * continuation that was released, or null when [token] no longer holds a
+     * slot (a newer caller took it, or it was already released) — callers may
+     * resume only on a non-null result and must never clear a slot themselves.
+     * A null [token] releases nothing.
+     *
+     * The [SlotClaimed] marker counts as released on purpose: the cancellation
+     * of a caller that never got to install its continuation must still drop
+     * the reservation, otherwise the slot would stay claimed forever.
+     */
+    private fun clearSlotLocked(
+        token: kotlin.coroutines.Continuation<*>?,
+    ): kotlin.coroutines.Continuation<*>? {
+        if (token == null) return null
+        synchronized(slotLock) {
+            return when {
+                androidPermissionContinuation === token -> {
+                    androidPermissionContinuation = null
+                    _pendingAndroidPermission.value = null
+                    token
+                }
+                settingsGateContinuation === token -> {
+                    settingsGateContinuation = null
+                    _pendingSettingsGate.value = null
+                    token
+                }
+                pendingContinuation === token -> {
+                    pendingContinuation = null
+                    _pendingRequest.value = null
+                    token
+                }
+                else -> null
             }
         }
     }
