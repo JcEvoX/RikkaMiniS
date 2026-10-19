@@ -31,6 +31,25 @@ Arms (judged on comment/string-stripped code; anchors are code shapes):
      not a bare `pause()` (5c). Anchors are fail-closed: 0 AndroidView
      blocks / 0 onDismiss() sites => RED. A mini-tree fixture that lacks the
      file is skipped (drift detector, not a target).
+  6. (da1033-B, same file) The audio transport calls must not be able to
+     throw out of a click callback, and the share path must not fabricate a
+     cross-process `file://` URI:
+     6a. every `mediaPlayer.seekTo(` / `mediaPlayer.pause(` / `mediaPlayer.start(`
+     sits inside a `try {` block -- the native player can already be in the
+     Error state while the frame still renders Stop (the isPlaying/error
+     writes land through the main-thread callback queue, so the click can be
+     handled first), and an escaping IllegalStateException crashes the app.
+     6b. `shareMediaFile`: no `Uri.fromFile(` anywhere in the function body
+     (a `file://` URI in a cross-process ACTION_SEND raises
+     FileUriExposedException), the failure path logs AND tells the user via a
+     Toast reusing an existing `*share_failed_toast` string, and that failure
+     branch `return`s instead of letting the unresolved uri reach
+     `Intent.putExtra(EXTRA_STREAM, ...)`. `Uri.fromFile` in the in-process
+     VideoView paths is legitimate and must NOT be flagged -- the criterion is
+     scoped to the function body, not the file.
+     Anchors are fail-closed: 0 transport call sites / no `shareMediaFile`
+     => RED. `onDispose`'s stop()/release() are covered by arm 1's
+     two-separate-try-blocks rule and are deliberately not re-checked here.
 """
 import re
 import sys
@@ -304,6 +323,95 @@ def check_inline_player(clean):
     return problems
 
 
+def catch_body_after(text: str, try_end: int):
+    """Body (braces included) of the `catch (...) { ... }` that immediately
+    follows the try block ending at `try_end`, or None when the shape is not
+    a try/catch at all. `text` must already be comment/string-stripped."""
+    tail = text[try_end:]
+    m = re.search(r"^\s*catch\s*(?:\([^)]*\))?\s*\{", tail)
+    if not m:
+        return None
+    brace = tail.find("{", m.start())
+    start, end = brace_span(tail, brace)
+    return tail[start:end]
+
+
+def check_inline_player_guards(clean):
+    """Arm 6 (da1033-B). `clean` = comment/string-stripped
+    InlineMediaPlayer.kt, or None when the file is absent (mini tree ->
+    skip). Judged on the same stripped view as arm 5, so a commented-out
+    call never counts."""
+    problems = []
+    if clean is None:
+        return problems
+
+    # ── arm 6a: audio transport calls are unreachable from the caller's
+    # exception surface ────────────────────────────────────────────────────
+    calls = list(re.finditer(
+        r"\bmediaPlayer\s*\.\s*(seekTo|pause|start)\s*\(", clean))
+    if not calls:
+        problems.append(
+            "arm6a: found 0 `mediaPlayer.seekTo(` / `.pause()` / `.start()` call "
+            "sites in InlineMediaPlayer.kt -- the anchor is fail-closed; re-point "
+            "this guard (the audio transport controls live in InlineAudioPlayer)")
+    for m in calls:
+        if enclosing_try(clean, m.start()) is None:
+            problems.append(
+                "arm6a: `mediaPlayer.%s(` at offset %d is not inside a try block -- "
+                "the player can already be in the Error state while the frame still "
+                "renders the control, and the IllegalStateException then escapes the "
+                "click callback and crashes the app" % (m.group(1), m.start()))
+
+    # ── arm 6b: the share path never hands a fabricated file:// URI to
+    # another process, and its failure branch is visible + terminating ─────
+    share_body = function_body(clean, r"private\s+fun\s+shareMediaFile\s*\(")
+    if not share_body:
+        problems.append(
+            "arm6b: could not locate `private fun shareMediaFile(...)` in "
+            "InlineMediaPlayer.kt -- re-point this guard")
+        return problems
+
+    fp = re.search(r"getUriForFile\s*\(", share_body)
+    if fp is None:
+        problems.append(
+            "arm6b: shareMediaFile no longer resolves the share uri through "
+            "FileProvider.getUriForFile -- re-point this guard")
+    if re.search(r"\bUri\s*\.\s*fromFile\s*\(", share_body):
+        problems.append(
+            "arm6b: shareMediaFile builds a `Uri.fromFile(...)` -- a plain file:// "
+            "uri inside ACTION_SEND crosses the process boundary and raises "
+            "FileUriExposedException (API 24+), so the share key silently does "
+            "nothing; an undeclared path must be reported, not faked as a uri")
+    if not re.search(r"\bAppLogger\s*\.\s*warning\s*\(", share_body):
+        problems.append(
+            "arm6b: the FileProvider failure path in shareMediaFile logs nothing -- "
+            "an undeclared path then leaves no trace anywhere")
+    if not re.search(r"\bToast\s*\.\s*makeText\s*\(", share_body):
+        problems.append(
+            "arm6b: the FileProvider failure path in shareMediaFile never tells the "
+            "user -- the share key must surface the refusal instead of doing nothing")
+    if not re.search(r"R\s*\.\s*string\s*\.\s*\w*share_failed_toast", share_body):
+        problems.append(
+            "arm6b: the share failure path does not reuse an existing "
+            "`*share_failed_toast` string resource -- adding a new per-language "
+            "entry for this is not the shape the rest of the share call sites use")
+    if fp is not None:
+        tspan = enclosing_try(share_body, fp.start())
+        if tspan is None:
+            problems.append(
+                "arm6b: getUriForFile( is not inside a try block -- an undeclared "
+                "path throws IllegalArgumentException out of shareMediaFile")
+        else:
+            cbody = catch_body_after(share_body, tspan[1])
+            if cbody is None or not re.search(r"\breturn\b", cbody):
+                problems.append(
+                    "arm6b: the catch of the FileProvider lookup does not `return` -- "
+                    "the failure path falls through and still puts the unresolved uri "
+                    "into ACTION_SEND (EXTRA_STREAM), so the failure is never "
+                    "terminating")
+    return problems
+
+
 def run_selftest() -> bool:
     COMPLIANT = '''
 object MediaPlayerManager {
@@ -403,6 +511,7 @@ object MediaPlayerManager {
         print("  selftest no-releaseSession: RED (expect RED) ok")
 
     ok = run_inline_player_selftest() and ok
+    ok = run_inline_player_guards_selftest() and ok
     return ok
 
 
@@ -539,6 +648,150 @@ private fun FullscreenVideoContent(file: File, onDismiss: () -> Unit) {
     return ok
 
 
+def run_inline_player_guards_selftest() -> bool:
+    """Arm 6 fixtures (da1033-B). Each dirty case must go red through the
+    expected sub-arm, the precision case must stay green (an in-process
+    `Uri.fromFile` in the VideoView path is NOT the defect), and every
+    mutation is checked for actually applying (a drifting fixture must fail
+    loudly instead of passing as "expected red")."""
+    COMPLIANT = '''
+fun InlineAudioPlayer(filePath: String) {
+    var isPlaying by remember { mutableStateOf(false) }
+    val mediaPlayer = remember(filePath) { MediaPlayer() }
+    if (isPlaying) {
+        IconButton(
+            onClick = {
+                if (!prepared) return@IconButton
+                try {
+                    mediaPlayer.seekTo(0)
+                    mediaPlayer.pause()
+                    isPlaying = false
+                } catch (e: Exception) {
+                    isPlaying = false
+                    error = e.message ?: "Playback failed"
+                }
+            },
+        ) { }
+    }
+}
+
+private fun inlineVideo(filePath: String) {
+    AndroidView(
+        factory = { ctx ->
+            android.widget.VideoView(ctx).apply {
+                setVideoURI(Uri.fromFile(File(filePath)))
+            }
+        },
+    )
+}
+
+private fun shareMediaFile(context: android.content.Context, file: File, mime: String) {
+    val authority = context.packageName + ".fileprovider"
+    val uri = try {
+        androidx.core.content.FileProvider.getUriForFile(context, authority, file)
+    } catch (_: Throwable) {
+        AppLogger.warning("InlineMediaPlayer", "share: path not covered by FileProvider: $file")
+        Toast.makeText(
+            context,
+            context.getString(R.string.file_share_failed_toast, file.name),
+            Toast.LENGTH_SHORT,
+        ).show()
+        return
+    }
+    val intent = Intent(Intent.ACTION_SEND).apply { type = mime }
+    try { context.startActivity(Intent.createChooser(intent, file.name)) } catch (_: Throwable) {}
+}
+'''
+    STOP_GUARDED = (
+        "                try {\n"
+        "                    mediaPlayer.seekTo(0)\n"
+        "                    mediaPlayer.pause()\n"
+        "                    isPlaying = false\n"
+        "                } catch (e: Exception) {\n"
+        "                    isPlaying = false\n"
+        "                    error = e.message ?: \"Playback failed\"\n"
+        "                }\n")
+    STOP_BARE = (
+        "                mediaPlayer.seekTo(0)\n"
+        "                mediaPlayer.pause()\n"
+        "                isPlaying = false\n")
+
+    M6a = COMPLIANT.replace(STOP_GUARDED, STOP_BARE)
+    M6c = COMPLIANT.replace(STOP_GUARDED, "                pendingPlay = true\n")
+    M6b = COMPLIANT.replace("        return\n    }\n",
+                            "        val fake = Uri.fromFile(file)\n        return\n    }\n")
+    M6b2 = COMPLIANT.replace("        return\n    }\n", "    }\n")
+    M6b3 = COMPLIANT.replace(
+        "        Toast.makeText(\n"
+        "            context,\n"
+        "            context.getString(R.string.file_share_failed_toast, file.name),\n"
+        "            Toast.LENGTH_SHORT,\n"
+        "        ).show()\n", "")
+    M6b4 = COMPLIANT.replace(
+        '        AppLogger.warning("InlineMediaPlayer", "share: path not covered by '
+        'FileProvider: $file")\n', "")
+    M6b5 = COMPLIANT.replace("R.string.file_share_failed_toast", "R.string.common_share")
+    M6d = COMPLIANT.replace(
+        "private fun shareMediaFile(context: android.content.Context, file: File, "
+        "mime: String) {", "private fun shareSomethingElse(mime: String) {")
+    # precision: comments may mention the very calls that are forbidden
+    P2 = COMPLIANT.replace(
+        "                if (!prepared) return@IconButton\n",
+        "                // legacy shape was mediaPlayer.pause() ... Uri.fromFile(file)\n"
+        "                if (!prepared) return@IconButton\n")
+
+    # A mutation that silently stopped applying would read as a false alarm;
+    # name the drift instead.
+    ok = True
+    for label, mut in (("M6a", M6a), ("M6b", M6b), ("M6b2", M6b2), ("M6b3", M6b3),
+                       ("M6b4", M6b4), ("M6b5", M6b5), ("M6c", M6c), ("M6d", M6d),
+                       ("P2", P2)):
+        if mut == COMPLIANT:
+            print(f"  selftest arm6 {label}: mutation did not apply "
+                  f"(fixture drifted) -- FAIL")
+            ok = False
+
+    cases = [
+        ("arm6 compliant", COMPLIANT, None),
+        ("arm6a M6a stop transport left unguarded", M6a, "arm6a"),
+        ("arm6b M6b fromFile fallback restored", M6b, "arm6b"),
+        ("arm6b M6b2 catch does not return", M6b2, "arm6b"),
+        ("arm6b M6b3 failure path never toasts", M6b3, "arm6b"),
+        ("arm6b M6b4 failure path never logs", M6b4, "arm6b"),
+        ("arm6b M6b5 toast drops the shared string resource", M6b5, "arm6b"),
+        ("arm6 precision P2 comments mention the calls", P2, None),
+        ("arm6a M6c no transport call site (fail-closed anchor)", M6c, "arm6a"),
+        ("arm6b M6d shareMediaFile gone (fail-closed anchor)", M6d, "arm6b"),
+    ]
+    for name, src, want_key in cases:
+        problems = check_inline_player_guards(strip_comments_and_strings(src))
+        red = len(problems) > 0
+        if want_key is None:
+            mark = "ok" if not red else "FAIL"
+            print(f"  selftest {name}: {'RED' if red else 'GREEN'} "
+                  f"(expect GREEN) {mark}")
+            if red:
+                ok = False
+        else:
+            fired = any(p.startswith(want_key) for p in problems)
+            mark = "ok" if (red and fired) else "FAIL"
+            print(f"  selftest {name}: {'RED' if red else 'GREEN'} "
+                  f"(expect RED via {want_key}) {mark}")
+            if not (red and fired):
+                ok = False
+        for p in problems:
+            print(f"      - {p}")
+
+    # mini-tree fixture: InlineMediaPlayer.kt absent -> judgement skipped
+    if check_inline_player_guards(None):
+        print("  selftest arm6 mini tree (no InlineMediaPlayer.kt): expected "
+              "GREEN (skipped), got RED -- FAIL")
+        ok = False
+    else:
+        print("  selftest arm6 mini tree (no InlineMediaPlayer.kt): GREEN (skipped) ok")
+    return ok
+
+
 def main() -> int:
     if "--selftest" in sys.argv:
         print("mediaplayer_release_guard selftest:")
@@ -555,10 +808,11 @@ def main() -> int:
     problems = check_arms(strip_comments_and_strings(
         target.read_text(encoding="utf-8", errors="replace")))
     inline = ROOT / INLINE_PLAYER_REL
-    problems += check_inline_player(
-        strip_comments_and_strings(
-            inline.read_text(encoding="utf-8", errors="replace"))
+    inline_clean = (strip_comments_and_strings(
+        inline.read_text(encoding="utf-8", errors="replace"))
         if inline.exists() else None)
+    problems += check_inline_player(inline_clean)
+    problems += check_inline_player_guards(inline_clean)
     if problems:
         print("FAIL: MediaPlayerManager release/lock gaps")
         for p in problems:
@@ -569,7 +823,8 @@ def main() -> int:
           "play()/stop() session-map mutations sit inside synchronized(lock); "
           "every AndroidView in InlineMediaPlayer.kt releases via "
           "onRelease/stopPlayback and every onDismiss() branch terminates the "
-          "player")
+          "player; the audio transport calls are try-guarded and the share "
+          "path reports an undeclared path instead of faking a file:// uri")
     return 0
 
 
