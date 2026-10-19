@@ -2,6 +2,7 @@ package com.rikkaminis.app.debug
 
 import android.content.Context
 import com.rikkaminis.app.MinisApp
+import com.rikkaminis.app.data.db.ChatSessionEntity
 import com.rikkaminis.app.data.db.MessageEntity
 import com.rikkaminis.app.data.repository.ChatRepository
 import com.rikkaminis.app.data.repository.ProviderRepository
@@ -44,21 +45,7 @@ internal object ChatDebugMethods {
             val lastParts = repo.dao.lastMessageParts(session.id)
             if (!includeEmpty && lastParts == null) continue
 
-            val modelDisplay = resolveModelDisplay(provRepo, session.modelId)
-            arr.put(JSONObject().apply {
-                put("id", session.id)
-                put("title", session.title ?: JSONObject.NULL)
-                put("modelId", session.modelId)
-                put("modelName", modelDisplay)
-                put("source", session.source ?: JSONObject.NULL)
-                put("isRunning", SessionActivityTracker.isActive(session.id))
-                put("memoryEnabled", session.memoryEnabled == 1)
-                put("category", session.category ?: JSONObject.NULL)
-                put("pinnedAt", session.pinnedAt ?: JSONObject.NULL)
-                put("lastMessagePreview", session.lastMessage ?: JSONObject.NULL)
-                put("createdAt", session.createdAt)
-                put("updatedAt", session.updatedAt)
-            })
+            arr.put(sessionCoreJson(session, provRepo))
             emitted++
         }
         return JSONObject().apply {
@@ -76,7 +63,26 @@ internal object ChatDebugMethods {
             ?: throw RPCException(-32602, "Session not found")
         val provRepo = provider(context)
         val messageCount = repo.messageCount(sessionId)
-        return JSONObject().apply {
+        return sessionCoreJson(session, provRepo).apply {
+            put("messageCount", messageCount)
+        }
+    }
+
+    /**
+     * The session metadata both `chat.sessions.list` and `chat.sessions.get`
+     * publish — single-sourced on purpose [da1032-B]. The two RPCs used to
+     * build their objects independently and drifted apart: `sessionsGet` was
+     * missing `pinnedAt` / `lastMessagePreview`, so the same session looked
+     * different depending on which entry point the caller used. Callers append
+     * their own extra fields on top (the single-session view adds
+     * `messageCount`).
+     *
+     * Key order matches the historical `sessionsList` shape; `messageCount` is
+     * still only emitted by `sessionsGet` (adding it to the list view would
+     * turn the list into an N+1 COUNT query).
+     */
+    private fun sessionCoreJson(session: ChatSessionEntity, provRepo: ProviderRepository): JSONObject =
+        JSONObject().apply {
             put("id", session.id)
             put("title", session.title ?: JSONObject.NULL)
             put("modelId", session.modelId)
@@ -85,11 +91,11 @@ internal object ChatDebugMethods {
             put("isRunning", SessionActivityTracker.isActive(session.id))
             put("memoryEnabled", session.memoryEnabled == 1)
             put("category", session.category ?: JSONObject.NULL)
-            put("messageCount", messageCount)
+            put("pinnedAt", session.pinnedAt ?: JSONObject.NULL)
+            put("lastMessagePreview", session.lastMessage ?: JSONObject.NULL)
             put("createdAt", session.createdAt)
             put("updatedAt", session.updatedAt)
         }
-    }
 
     suspend fun messagesList(context: Context, params: JSONObject): JSONObject {
         val sessionId = params.optString("sessionId", "").ifEmpty {
@@ -123,7 +129,18 @@ internal object ChatDebugMethods {
         }
     }
 
-    private fun messageToJson(m: MessageEntity, includeTools: Boolean, includeReasoning: Boolean): JSONObject {
+    /**
+     * Project one stored `parts_json` row into the RPC message shape.
+     *
+     * [internal] rather than private, and NOT inlined into [messagesList], for
+     * one reason: this is the whole cross-boundary protocol between the on-disk
+     * `ContentPart` serial names and the RPC view, and it is pure — a JVM test
+     * can drive it with a real [MessageEntity] and assert the classification
+     * [da1032-B]. The serial-name set is the `@SerialName` set in
+     * [com.rikkaminis.app.data.model.ContentPart]; the legacy underscore
+     * spellings stay accepted so rows written by older builds still surface.
+     */
+    internal fun messageToJson(m: MessageEntity, includeTools: Boolean, includeReasoning: Boolean): JSONObject {
         val obj = JSONObject().apply {
             put("id", m.id)
             put("role", m.role)
@@ -142,9 +159,9 @@ internal object ChatDebugMethods {
                 val p = parts.optJSONObject(i) ?: continue
                 when (p.optString("type")) {
                     "text" -> sb.append(p.optString("value", ""))
-                    "tool_call", "tool_use" -> if (includeTools) tools.put(p)
-                    "tool_result" -> if (includeTools) tools.put(p)
-                    "image", "file", "attachment" -> attachments.put(p)
+                    "toolUse", "tool_call", "tool_use" -> if (includeTools) tools.put(p)
+                    "toolResult", "tool_result" -> if (includeTools) tools.put(p)
+                    "mediaRef", "image", "file", "attachment" -> attachments.put(p)
                 }
             }
             if (sb.isNotEmpty()) obj.put("content", sb.toString())
@@ -272,7 +289,18 @@ internal object ChatDebugMethods {
         }
     }
 
-    private fun resolveModelDisplay(repo: ProviderRepository, modelId: String): String {
+    /**
+     * Resolve a model reference (bare `modelId` OR a composite
+     * `providerInstanceId:modelId` entry id) to its display name.
+     *
+     * Single-sourced [da1032-B]: both debug RPC surfaces (`chat.models.list`
+     * consumers, `chat.sessions.*`, and the mutation side in
+     * [ChatMutationMethods]) must agree on what a model reference means. The
+     * mutation copy used to carry only the bare-id predicate, so a composite
+     * entry id came back as the raw string while the read side resolved it
+     * properly.
+     */
+    internal fun resolveModelDisplay(repo: ProviderRepository, modelId: String): String {
         val cfg = repo.config.value
         val entry = cfg.modelEntries.firstOrNull { it.baseModel.id == modelId || it.id == modelId }
             ?: return modelId
