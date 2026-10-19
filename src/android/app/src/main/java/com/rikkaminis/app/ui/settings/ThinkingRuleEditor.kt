@@ -60,22 +60,29 @@ fun ThinkingRuleEditorDialog(
     onSave: (ThinkingRule) -> Unit,
 ) {
     val seed = request.seed
-    var label by remember { mutableStateOf(seed.label) }
-    var allModels by remember { mutableStateOf(seed.scope is ThinkingRule.Scope.AllModels) }
-    var pattern by remember {
+    // [da1033-I07] Every editable field below is seeded from `seed`, so every one of
+    // them keys on it: without a key, an external write (minis-config / Debug RPC /
+    // backup restore) left the dialog showing the copy it opened with, and Save wrote
+    // that copy back over the newer rule — or resurrected one that had been deleted.
+    // One key for the whole form on purpose: a half-refreshed state (the new seed's
+    // label next to the previous seed's format choice) is not a state this dialog can
+    // represent. `formatMenuOpen` below is a transient popup flag and stays keyless.
+    var label by remember(seed) { mutableStateOf(seed.label) }
+    var allModels by remember(seed) { mutableStateOf(seed.scope is ThinkingRule.Scope.AllModels) }
+    var pattern by remember(seed) {
         mutableStateOf((seed.scope as? ThinkingRule.Scope.ModelPattern)?.pattern ?: "")
     }
-    var choice by remember { mutableStateOf(FormatChoice.from(seed.wireFormat)) }
+    var choice by remember(seed) { mutableStateOf(FormatChoice.from(seed.wireFormat)) }
     // [da1024-F] "the user actively changed the format" — the dropdown selection OR any
     // per-format parameter field below. Until this is set, the dialog must not rewrite a
     // wire format it cannot represent (FormatChoice.from's `else` would map DeepSeekRelay /
     // QwenRootOnly / null onto REASONING_EFFORT). See ThinkingRuleEditPreserve.kt.
-    var formatChanged by remember { mutableStateOf(false) }
+    var formatChanged by remember(seed) { mutableStateOf(false) }
     // Shared editable params across formats.
-    var sendOffValue by remember { mutableStateOf(formatOffValue(seed.wireFormat) != null) }
-    var offValue by remember { mutableStateOf(formatOffValue(seed.wireFormat) ?: "") }
-    var path by remember { mutableStateOf(formatPath(seed.wireFormat) ?: "") }
-    var customValues by remember { mutableStateOf(customEditableValues(seed.wireFormat)) }
+    var sendOffValue by remember(seed) { mutableStateOf(formatOffValue(seed.wireFormat) != null) }
+    var offValue by remember(seed) { mutableStateOf(formatOffValue(seed.wireFormat) ?: "") }
+    var path by remember(seed) { mutableStateOf(formatPath(seed.wireFormat) ?: "") }
+    var customValues by remember(seed) { mutableStateOf(customEditableValues(seed.wireFormat)) }
     var formatMenuOpen by remember { mutableStateOf(false) }
 
     fun buildWireFormat(): ThinkingWireFormat = when (choice) {

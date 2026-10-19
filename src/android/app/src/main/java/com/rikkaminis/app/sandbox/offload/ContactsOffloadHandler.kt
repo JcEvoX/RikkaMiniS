@@ -168,6 +168,16 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
         }
     }
 
+    /**
+     * [da1033-D ISSUE-04] Structured replacement for the three bare
+     * "android-contacts: failed to query …" sentences. A null cursor out of
+     * ContactsProvider is a JSON error object like every other failure branch
+     * in this handler, so `jq` / `json.loads` keeps working when the provider
+     * misbehaves. Exit code stays 1 at each call site (it was 1 before too).
+     */
+    private fun queryFailedBody(message: String): String =
+        JSONObject().put("error", "query_failed").put("message", message).toString()
+
     private fun doList(parsedArgs: OffloadArgs): NativeOffloadResult {
         val max = listMax(parsedArgs)
         val projection = arrayOf(
@@ -178,7 +188,10 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
         val sort = "${ContactsContract.Contacts.DISPLAY_NAME_PRIMARY} ASC"
         val cursor = context.contentResolver.query(
             ContactsContract.Contacts.CONTENT_URI, projection, null, null, sort,
-        ) ?: return NativeOffloadResult(1, OffloadOutput.formatBody("android-contacts: failed to query contacts", parsedArgs) + "\n")
+        ) ?: return NativeOffloadResult(
+            1,
+            OffloadOutput.formatBody(queryFailedBody("Failed to query contacts."), parsedArgs) + "\n",
+        )
 
         // [sweep1014-P10] Collect the page first, then batch-load phones +
         // emails for all ids in one query per data kind — the old per-row
@@ -211,15 +224,20 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
         val sort = "${ContactsContract.Contacts.DISPLAY_NAME_PRIMARY} ASC"
         val cursor = context.contentResolver.query(
             ContactsContract.Contacts.CONTENT_URI, projection, selection, selectionArgs, sort,
-        ) ?: return NativeOffloadResult(1, OffloadOutput.formatBody("android-contacts: failed to query contacts", parsedArgs) + "\n")
+        ) ?: return NativeOffloadResult(
+            1,
+            OffloadOutput.formatBody(queryFailedBody("Failed to query contacts."), parsedArgs) + "\n",
+        )
 
         val arr = JSONArray()
         cursor.use {
             attachContactData(collectContactPage(it, max), arr)
         }
-        if (arr.length() == 0) {
-            return NativeOffloadResult(0, OffloadOutput.formatBody("No contacts found matching '$query'.", parsedArgs) + "\n")
-        }
+        // [da1033-D ISSUE-04] No-match is a normal result, not a message: this
+        // branch used to emit the bare sentence "No contacts found matching
+        // '<q>'." with exit 0, so `... | jq` broke on the most common empty
+        // path. `arr.toString(2)` is `[]` here — the same JSONArray shape
+        // doList returns for an empty address book.
         return NativeOffloadResult(0, OffloadOutput.formatBody(arr.toString(2), parsedArgs) + "\n")
     }
 
@@ -238,11 +256,22 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
             "${ContactsContract.Contacts._ID} = ?",
             arrayOf(id.toString()),
             null,
-        ) ?: return NativeOffloadResult(1, OffloadOutput.formatBody("android-contacts: failed to query contact", parsedArgs) + "\n")
+        ) ?: return NativeOffloadResult(
+            1,
+            OffloadOutput.formatBody(queryFailedBody("Failed to query contact id=$id."), parsedArgs) + "\n",
+        )
 
         cursor.use {
             if (!it.moveToFirst()) {
-                return NativeOffloadResult(1, OffloadOutput.formatBody("android-contacts: no contact with id=$id", parsedArgs) + "\n")
+                // [da1033-D ISSUE-04] Same envelope as doDelete below
+                // (error / id / message, exit 1). A missing id is an error
+                // object, not the bare sentence "android-contacts: no contact
+                // with id=$id".
+                val body = JSONObject().put("error", "not_found")
+                    .put("id", id)
+                    .put("message", "No contact with id=$id.")
+                    .toString()
+                return NativeOffloadResult(1, OffloadOutput.formatBody(body, parsedArgs) + "\n")
             }
             val obj = readContactRow(it)
             return NativeOffloadResult(0, OffloadOutput.formatBody(obj.toString(2), parsedArgs) + "\n")

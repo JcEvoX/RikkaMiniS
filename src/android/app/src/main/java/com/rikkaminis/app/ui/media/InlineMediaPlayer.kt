@@ -1,10 +1,12 @@
 package com.rikkaminis.app.ui.media
 
 import com.rikkaminis.app.R
+import com.rikkaminis.app.logging.AppLogger
 import androidx.compose.ui.res.stringResource
 import android.content.Intent
 import android.media.MediaPlayer
 import android.net.Uri
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -95,7 +97,11 @@ fun InlineAudioPlayer(
     var progress by remember { mutableFloatStateOf(0f) }
     var duration by remember { mutableStateOf("0:00") }
     var position by remember { mutableStateOf("0:00") }
-    var error by remember { mutableStateOf<String?>(null) }
+    // [da1033-B] Keyed on filePath like prepared/pendingPlay/mediaPlayer below:
+    // this composable is reused across chat message slots, so an unkeyed error
+    // kept the previous file's message and replaced the new player's whole
+    // button area with stale "Audio error: …" text.
+    var error by remember(filePath) { mutableStateOf<String?>(null) }
     // [sweep1014-B33] prepareAsync() means there is a short window where the
     // player is still Preparing and start() would throw. A tap landing in that
     // window is queued here and drained by the prepared listener, so a tap
@@ -264,11 +270,27 @@ fun InlineAudioPlayer(
                         Spacer(Modifier.width(8.dp))
                         IconButton(
                             onClick = {
-                                mediaPlayer.seekTo(0)
-                                mediaPlayer.pause()
-                                isPlaying = false
-                                progress = 0f
-                                position = "0:00"
+                                // [da1033-B] Same guard as the play/pause button
+                                // above. The native player can already sit in
+                                // the Error state while this frame still renders
+                                // Stop: isPlaying / error arrive through the
+                                // main-thread callback queue, so this click can
+                                // be handled first and seekTo()/pause() then
+                                // throw IllegalStateException — which crashed
+                                // the app because this callback had no guard.
+                                // [sweep1014-B33] !prepared is the still-
+                                // Preparing window (prepareAsync pending).
+                                if (!prepared) return@IconButton
+                                try {
+                                    mediaPlayer.seekTo(0)
+                                    mediaPlayer.pause()
+                                    isPlaying = false
+                                    progress = 0f
+                                    position = "0:00"
+                                } catch (e: Exception) {
+                                    isPlaying = false
+                                    error = e.message ?: "Playback failed"
+                                }
                             },
                             modifier = Modifier.size(28.dp),
                         ) {
@@ -761,7 +783,21 @@ private fun shareMediaFile(context: android.content.Context, file: File, mime: S
     val uri = try {
         androidx.core.content.FileProvider.getUriForFile(context, authority, file)
     } catch (_: Throwable) {
-        Uri.fromFile(file)
+        // [da1033-B] No `Uri.fromFile` fallback: a plain file:// URI handed to
+        // another process raises FileUriExposedException (API 24+), and the
+        // catch around startActivity() at the bottom swallowed it — the share
+        // key just did nothing, with no log and no toast. Paths outside
+        // res/xml/file_provider_paths.xml (e.g. an external mount) cannot be
+        // shared directly, so tell the user instead of building a dead URI.
+        // Copying the file into cacheDir/share first is deliberately NOT done:
+        // videos here can be tens of MB and this runs on the click callback.
+        AppLogger.warning("InlineMediaPlayer", "share: path not covered by FileProvider: $file")
+        Toast.makeText(
+            context,
+            context.getString(R.string.file_share_failed_toast, file.name),
+            Toast.LENGTH_SHORT,
+        ).show()
+        return
     }
     val intent = Intent(Intent.ACTION_SEND).apply {
         type = mime

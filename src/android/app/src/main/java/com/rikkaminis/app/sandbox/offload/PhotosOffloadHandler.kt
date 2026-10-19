@@ -1083,15 +1083,32 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
                 }
             }
         }
+        // [da1033-D ISSUE-04] ONE envelope for the empty and the non-empty case.
+        // The old shape was a bare JSONArray when photos matched and a bare
+        // English sentence when none did, so the top-level type flipped with the
+        // result and `jq` / `json.loads` died on the empty branch — the most
+        // common outcome for a radius nobody has photos inside. Keys mirror the
+        // sibling readers (`list` / `album` above); `count` makes empty vs
+        // non-empty explicit, and `near` is no longer the only read subcommand
+        // that hands back a bare array.
+        val data = JSONObject()
+            .put("media", photos)
+            .put("count", photos.length())
+            .put("lat", lat)
+            .put("lon", lon)
+            .put("radius_km", radiusKm)
         if (photos.length() == 0) {
+            // Diagnostics only; the three sources are unchanged (redacted EXIF
+            // without ACCESS_MEDIA_LOCATION, or the bounded scan window). Now a
+            // JSON field instead of a sentence suffix, hence trimmed.
             val hint = if (!hasMediaLoc && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                "  (GPS EXIF is redacted without the ACCESS_MEDIA_LOCATION permission; add it to AndroidManifest and request it from the user.)"
+                "GPS EXIF is redacted without the ACCESS_MEDIA_LOCATION permission; add it to AndroidManifest and request it from the user."
             } else if (scanned == scanLimit) {
-                "  (scanned the newest $scanLimit photos; no matches in that window)"
+                "scanned the newest $scanLimit photos; no matches in that window"
             } else ""
-            return "No photos found within ${radiusKm}km of ($lat, $lon).$hint"
+            if (hint.isNotEmpty()) data.put("hint", hint)
         }
-        return photos.toString(2)
+        return data.toString(2)
     }
 
     private fun haversine(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {

@@ -52,6 +52,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -303,6 +304,15 @@ private fun ColumnScope.ApiKeyConfigSection(
     // WebDAV backup transfer in BackupSettingsScreen).
     val appContext = LocalContext.current.applicationContext
     var showApiKeyPlaintext by remember { mutableStateOf(false) }
+    // [deep-audit-1033 I05] The save below became a coroutine: without this
+    // the button stays live across the disk round trip and a double tap adds
+    // the provider twice (addInstance is not idempotent). The write rides the
+    // application scope like the refresh below (a save must not be cancelled
+    // by this screen's disposal); `fallbackScope` only covers the impossible
+    // `appContext is not MinisApp` case, where silently dropping the save
+    // would be worse than a write bound to composition.
+    var saving by remember { mutableStateOf(false) }
+    val fallbackScope = rememberCoroutineScope()
     // /v1 is appended automatically for all non-Gemini providers (Gemini uses
     // v1beta full-path URLs). effectiveBaseURL already guards against double-append.
     val appendV1Suffix = providerType != ProviderType.gemini
@@ -421,6 +431,10 @@ private fun ColumnScope.ApiKeyConfigSection(
     Spacer(Modifier.height(20.dp))
     MinisButton(
         onClick = {
+            // [deep-audit-1033 I05] Guard the widened window the coroutine
+            // opens (addInstance is not idempotent).
+            if (saving) return@MinisButton
+            saving = true
             val trimmedBase = customBaseURL.trim()
             val instance = ProviderInstance(
                 id = UUID.randomUUID().toString(),
@@ -432,57 +446,76 @@ private fun ColumnScope.ApiKeyConfigSection(
                 // Only OpenAI-family providers expose the Responses API toggle.
                 useResponsesAPI = providerType == ProviderType.openAI && useResponsesAPI,
             )
-            providerRepository.addInstance(instance)
-            providerRepository.saveApiKey(instance.id, apiKey.trim())
-            // Auto-refresh models in background (fetches from API or falls back to models.dev).
-            // Launched on the app-scoped scope so the fetch survives this screen's disposal.
-            // forceRefresh=true bypasses the 7-day ProviderModelsCache so a brand-new provider
-            // re-validates its URL+key immediately instead of reusing a stale cached result
-            // and leaving the model list empty until the next daily auto-refresh.
-            // [fix/audit-0917-b9] The old `(appContext as? MinisApp)?...`
-            // silently did nothing when the cast failed or the scope was
-            // null: the provider got saved but its model list never
-            // refreshed, with no signal anywhere. The cast cannot fail in
-            // production (MinisApp IS the Application), so this is
-            // refuse-instead-of-guess — surface it loudly instead of
-            // skipping the refresh without a trace.
             val appScope = appContext as? MinisApp
-            if (appScope == null) {
-                android.util.Log.w(
-                    "AddProviderScreen",
-                    "appContext is ${appContext::class.java.name}, not MinisApp — " +
-                        "post-save model refresh skipped for ${instance.id}",
-                )
-            } else appScope.applicationScope.launch {
-                val result = providerRepository.refreshModels(instance, forceRefresh = true)
-                if (result != ModelRefreshResult.SUCCESS_API) {
-                    // [fix/audit-b22 / T6-L6] These three were hardcoded Chinese
-                    // while the rest of this screen uses R.string — English
-                    // users got a Chinese toast.
-                    val msg = when (result) {
-                        ModelRefreshResult.NO_KEY -> appContext.getString(R.string.provider_saved_no_api_key)
-                        ModelRefreshResult.FAILURE -> appContext.getString(R.string.provider_saved_models_failed)
-                        ModelRefreshResult.PRESERVED -> appContext.getString(R.string.provider_saved_models_unreachable)
-                        else -> null
+            // [deep-audit-1033 I05] addInstance writes SQLite and saveApiKey
+            // commits to EncryptedSharedPreferences — both are blocking
+            // disk/keystore IO and used to run inline in this click handler,
+            // on the main thread. The refresh below still starts only once
+            // the key is on disk (same order as before).
+            (appScope?.applicationScope ?: fallbackScope).launch {
+                try {
+                    withContext(Dispatchers.IO) {
+                        providerRepository.addInstance(instance)
+                        providerRepository.saveApiKey(instance.id, apiKey.trim())
                     }
-                    // [fix/addprovider-toast-looper] Toast 必须回主线程弹，
-                    // applicationScope 跑在 Dispatchers.IO，无 Looper，直接
-                    // Toast 会抛 "Can't toast on a thread that has not called
-                    // Looper.prepare()" NPE 闪退（密钥填错/模型列表拉取失败
-                    // 时必现）。
-                    msg?.let {
-                        withContext(Dispatchers.Main) {
-                            Toast.makeText(appContext, it, Toast.LENGTH_LONG).show()
+                // Auto-refresh models in background (fetches from API or falls back to models.dev).
+                // Launched on the app-scoped scope so the fetch survives this screen's disposal.
+                // forceRefresh=true bypasses the 7-day ProviderModelsCache so a brand-new provider
+                // re-validates its URL+key immediately instead of reusing a stale cached result
+                // and leaving the model list empty until the next daily auto-refresh.
+                // [fix/audit-0917-b9] The old `(appContext as? MinisApp)?...`
+                // silently did nothing when the cast failed or the scope was
+                // null: the provider got saved but its model list never
+                // refreshed, with no signal anywhere. The cast cannot fail in
+                // production (MinisApp IS the Application), so this is
+                // refuse-instead-of-guess — surface it loudly instead of
+                // skipping the refresh without a trace.
+                if (appScope == null) {
+                    android.util.Log.w(
+                        "AddProviderScreen",
+                        "appContext is ${appContext::class.java.name}, not MinisApp — " +
+                            "post-save model refresh skipped for ${instance.id}",
+                    )
+                } else appScope.applicationScope.launch {
+                    val result = providerRepository.refreshModels(instance, forceRefresh = true)
+                    if (result != ModelRefreshResult.SUCCESS_API) {
+                        // [fix/audit-b22 / T6-L6] These three were hardcoded Chinese
+                        // while the rest of this screen uses R.string — English
+                        // users got a Chinese toast.
+                        val msg = when (result) {
+                            ModelRefreshResult.NO_KEY -> appContext.getString(R.string.provider_saved_no_api_key)
+                            ModelRefreshResult.FAILURE -> appContext.getString(R.string.provider_saved_models_failed)
+                            ModelRefreshResult.PRESERVED -> appContext.getString(R.string.provider_saved_models_unreachable)
+                            else -> null
+                        }
+                        // [fix/addprovider-toast-looper] Toast 必须回主线程弹，
+                        // applicationScope 跑在 Dispatchers.IO，无 Looper，直接
+                        // Toast 会抛 "Can't toast on a thread that has not called
+                        // Looper.prepare()" NPE 闪退（密钥填错/模型列表拉取失败
+                        // 时必现）。
+                        msg?.let {
+                            withContext(Dispatchers.Main) {
+                                Toast.makeText(appContext, it, Toast.LENGTH_LONG).show()
+                            }
                         }
                     }
                 }
+                // onSaved() pops this route and the application scope is not
+                // Main — hop back before touching navigation or that state.
+                withContext(Dispatchers.Main) {
+                    saving = false
+                    onSaved()
+                }
+                } catch (t: Throwable) {
+                    withContext(Dispatchers.Main) { saving = false }
+                    throw t
+                }
             }
-            onSaved()
         },
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp),
-        enabled = apiKey.isNotBlank(),
+        enabled = apiKey.isNotBlank() && !saving,
     ) {
         Text(stringResource(R.string.provider_list_add_provider))
     }

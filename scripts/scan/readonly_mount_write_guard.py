@@ -50,6 +50,29 @@ import tempfile
 
 GUARD = "isLinuxPathUnderReadOnlyMount("
 
+# [deep-audit-1033 I01] A SECOND, independent refusal is required at the
+# browser's delete site. `deleteItem` already refuses read-only *mounts*
+# (da1031-C), but the same browser also opens the two folders the settings
+# screen labels Read-Only — Skills and Memory — because their
+# `SharedFolderEntry.writable = false` reached the AccessBadge and nothing else:
+# the trash icon really deleted SOUL.md / GLOBAL.md / SKILL.md from disk.
+#
+# Deliberately NOT folded into `GUARD`: the two live in different semantic
+# domains (a mount lock is the user's runtime choice; the shared-folder rule is
+# the registry's static declaration) and the second one has to stay derived from
+# `SharedFolderRegistry.entries` rather than becoming a second path list here.
+# `SandboxPathGuardWiringTest` pins that the two predicates do not overlap.
+SHARED_DIR_GUARD = "isLinuxPathUnderReadOnlySharedDir("
+
+# Sites that must carry an ADDITIONAL guard on top of `GUARD`, keyed by
+# (file, function): (needle, what it refuses).
+EXTRA_GUARDS = {
+    ("ui/sandbox/FileBrowserViewModel.kt", "deleteItem"): (
+        SHARED_DIR_GUARD,
+        "refusing the read-only shared folders (skills / memory)",
+    ),
+}
+
 PATH_PARAMS = re.compile(
     r"^(outputPath|linuxPath|guestPath|destPath|dstPath|dest|dst|hostPath|targetPath|archivePath|outPath)$"
 )
@@ -146,6 +169,43 @@ BLOCKING_IO_CALLS = (
         r"manager\.verifyIntegrity\s*\(",
         r"\bfun\s+verifyIntegrity\s*\(",
         "rootfs integrity verification (reads .integrity_manifest + stats 7 critical files)",
+    ),
+    # [deep-audit-1033 I05 / I08] Save paths that wrote on the click's thread.
+    # The call regexes are receiver-qualified on purpose: the blocking work is
+    # reached through the repository/store handle the UI holds, while the same
+    # operation called from a repository-internal or debug-RPC caller (which
+    # already runs off Main) is not what this criterion is about. Unqualified
+    # names would flag those callers too and force churn far outside the
+    # screens that actually had the defect.
+    (
+        "ui/onboarding/OnboardingScreen.kt",
+        r"providerRepository\.addInstance\s*\(",
+        r"\bfun\s+addInstance\s*\(",
+        "provider instance insert (SQLite write from the onboarding save button)",
+    ),
+    (
+        "ui/onboarding/OnboardingScreen.kt",
+        r"providerRepository\.saveApiKey\s*\(",
+        r"\bfun\s+saveApiKey\s*\(",
+        "API key persist (EncryptedSharedPreferences commit from the UI)",
+    ),
+    (
+        "ui/settings/AddCustomModelScreen.kt",
+        r"providerRepository\.addEntry\s*\(",
+        r"\bfun\s+addEntry\s*\(",
+        "custom model insert (SQLite write from the save button)",
+    ),
+    (
+        "ui/settings/BackupSettingsScreen.kt",
+        r"webDavStore\.load\s*\(",
+        r"\bfun\s+load\s*\(",
+        "WebDAV config read (EncryptedSharedPreferences + Keystore unwrap)",
+    ),
+    (
+        "ui/settings/BackupSettingsScreen.kt",
+        r"webDavStore\.save\s*\(",
+        r"\bfun\s+save\s*\(",
+        "WebDAV config persist (EncryptedSharedPreferences commit)",
     ),
 )
 
@@ -720,6 +780,12 @@ def check_guard_call_shape(root):
     of these anchors is a synthetic fixture tree (the frozen `test_scan.py`
     shape), not a regression. As soon as one anchor is present, a missing one is
     ROT — the criterion lost its subject and says so instead of checking nothing.
+
+    A site can owe more than the mount guard: [EXTRA_GUARDS] lists the sites
+    that were later shown to need a second, independent refusal (the read-only
+    shared folders the browser also opens). Extra guards are judged the same way
+    — present, and in front of the write — because a refusal placed after the
+    delete is a post-mortem, not a guard.
     """
     anchors = [(rel, fn, rx, label) for rel, fn, rx, label in GUARD_SITES]
     route_rel, route_anchor, route_needle = MOUNT_ROUTE
@@ -756,6 +822,19 @@ def check_guard_call_shape(root):
                 f"{rel}:{fn}() — {GUARD}) runs AFTER the write it is meant to refuse; "
                 f"move it in front of it"
             )
+        extra = EXTRA_GUARDS.get((rel, fn))
+        if extra is not None:
+            needle, what = extra
+            extra_at = body.find(needle)
+            if extra_at < 0:
+                violations.append(
+                    f"{rel}:{fn}() — {label} without {what} ({needle})"
+                )
+            elif extra_at > write.start():
+                violations.append(
+                    f"{rel}:{fn}() — {needle}) runs AFTER the write it is meant to "
+                    f"refuse; move it in front of it"
+                )
 
     route_src = read(root, route_rel)
     if not route_src:
@@ -1056,7 +1135,7 @@ def _share_receiver(shape="io", toast_hop="hop"):
     )
 
 
-BROWSER_GUARD_BODY = (
+BROWSER_MOUNT_GUARD = (
     "        linuxPathOf(item)?.let { lp ->\n"
     "            if (PRootKernel.isLinuxPathUnderReadOnlyMount(lp)) {\n"
     "                return@launch\n"
@@ -1064,15 +1143,42 @@ BROWSER_GUARD_BODY = (
     "        }\n"
 )
 
+# [deep-audit-1033 I01] The second, independent refusal the delete path owes:
+# the browser also opens the folders the settings screen labels Read-Only.
+BROWSER_SHARED_GUARD = (
+    "        linuxPathOf(item)?.let { lp ->\n"
+    "            if (SharedFolderRegistry.isLinuxPathUnderReadOnlySharedDir(lp)) {\n"
+    "                return@launch\n"
+    "            }\n"
+    "        }\n"
+)
+
+BROWSER_GUARD_BODY = BROWSER_MOUNT_GUARD + BROWSER_SHARED_GUARD
+
 
 def _file_browser_vm(shape="guard"):
     """Criterion-5 anchor: the delete path of a listed item.
 
-    [shape] guard (default) / direct (no guard) / late (guard AFTER the delete —
-    the post-mortem shape) / renamed (function renamed away → ROT).
+    [shape] guard (default — both refusals, in front of the delete) /
+    mount_only (the da1033 defect shape: read-only mounts refused, the read-only
+    shared folders not) / shared_first (both, written in the other order —
+    precision arm: order must not matter) / shared_late (mount refusal in front,
+    shared refusal after the delete) / direct (no guard) / late (both guards
+    AFTER the delete — the post-mortem shape) / renamed (function renamed away →
+    ROT).
     """
-    guard = "" if shape == "direct" else BROWSER_GUARD_BODY
-    head, tail = ("", guard) if shape == "late" else (guard, "")
+    if shape == "guard":
+        head, tail = BROWSER_GUARD_BODY, ""
+    elif shape == "shared_first":
+        head, tail = BROWSER_SHARED_GUARD + BROWSER_MOUNT_GUARD, ""
+    elif shape == "mount_only":
+        head, tail = BROWSER_MOUNT_GUARD, ""
+    elif shape == "shared_late":
+        head, tail = BROWSER_MOUNT_GUARD, BROWSER_SHARED_GUARD
+    elif shape == "late":
+        head, tail = "", BROWSER_GUARD_BODY
+    else:  # direct / renamed
+        head, tail = "", ""
     fn = "deleteEntry" if shape == "renamed" else "deleteItem"
     return (
         "package com.rikkaminis.app.ui.sandbox\n"
@@ -1161,12 +1267,144 @@ def _app_nav(shape="guard"):
     )
 
 
+# ── criterion-2 subjects added by [deep-audit-1033 I05 / I08] ────────────────
+# Three save paths that used to run on the click's thread. They are why the C2
+# table grew receiver-qualified rows: the blocking work is reached through the
+# repository/store handle the screen holds.
+
+def _save_targets():
+    """Declarations the C2 rows look for (a call without a declaration would be
+    reported as vacuous instead of passing, so the fixture ships both)."""
+    return (
+        "package com.rikkaminis.app.ui.settings\n"
+        "\n"
+        "class ProviderRepository {\n"
+        "    fun addInstance(instance: Any, apiKey: String) {}\n"
+        "    fun saveApiKey(id: String, key: String) {}\n"
+        "    fun addEntry(entry: Any) {}\n"
+        "}\n"
+        "\n"
+        "class WebDavConfigStore {\n"
+        "    fun load(): Any? = null\n"
+        "    fun save(cfg: Any) {}\n"
+        "}\n"
+    )
+
+
+def _onboarding_screen(shape="io"):
+    """Onboarding save button: SQLite insert + Keystore commit, in that order."""
+    calls = (
+        "                providerRepository.addInstance(instance, apiKey)\n"
+        "                providerRepository.saveApiKey(instance.id, apiKey.trim())\n"
+    )
+    if shape == "io":
+        body = (
+            "        scope.launch {\n"
+            "            withContext(Dispatchers.IO) {\n"
+            + calls +
+            "            }\n"
+            "        }\n"
+        )
+    elif shape == "io_nested":
+        body = (
+            "        scope.launch {\n"
+            "            runCatching {\n"
+            "                withContext(Dispatchers.IO) {\n"
+            + calls +
+            "                }\n"
+            "            }\n"
+            "        }\n"
+        )
+    else:  # direct
+        body = (
+            "        providerRepository.addInstance(instance, apiKey)\n"
+            "        providerRepository.saveApiKey(instance.id, apiKey.trim())\n"
+        )
+    return (
+        "package com.rikkaminis.app.ui.onboarding\n"
+        "\n"
+        "class OnboardingScreen {\n"
+        "    fun save(\n"
+        "        providerRepository: ProviderRepository,\n"
+        "        instance: Any,\n"
+        "        apiKey: String,\n"
+        "    ) {\n"
+        + body +
+        "    }\n"
+        "}\n"
+    )
+
+
+def _add_model_screen(shape="io"):
+    """Custom-model save button: one SQLite insert, then navigate back."""
+    if shape == "io":
+        body = (
+            "        scope.launch {\n"
+            "            withContext(Dispatchers.IO) {\n"
+            "                providerRepository.addEntry(entry)\n"
+            "            }\n"
+            "            onBack()\n"
+            "        }\n"
+        )
+    elif shape == "none":
+        body = "        onBack()\n"
+    else:  # direct
+        body = (
+            "        providerRepository.addEntry(entry)\n"
+            "        onBack()\n"
+        )
+    return (
+        "package com.rikkaminis.app.ui.settings\n"
+        "\n"
+        "class AddCustomModelScreen {\n"
+        "    fun save(providerRepository: ProviderRepository) {\n"
+        + body +
+        "    }\n"
+        "}\n"
+    )
+
+
+def _backup_screen(shape="io"):
+    """Backup screen: WebDAV config read at first composition + persist on save."""
+    if shape == "io":
+        body = (
+            "        LaunchedEffect(Unit) {\n"
+            "            withContext(Dispatchers.IO) {\n"
+            "                webDavStore.load()\n"
+            "            }\n"
+            "        }\n"
+            "        scope.launch {\n"
+            "            withContext(Dispatchers.IO) {\n"
+            "                webDavStore.save(cfg)\n"
+            "            }\n"
+            "        }\n"
+        )
+    else:  # direct
+        body = (
+            "        webDavStore.load()\n"
+            "        webDavStore.save(cfg)\n"
+        )
+    return (
+        "package com.rikkaminis.app.ui.settings\n"
+        "\n"
+        "class BackupSettingsScreen {\n"
+        "    fun applyWebDavConfig(\n"
+        "        webDavStore: WebDavConfigStore,\n"
+        "        cfg: Any,\n"
+        "    ) {\n"
+        + body +
+        "    }\n"
+        "}\n"
+    )
+
+
 def write_io_fixture(root, store_shape="io", log_shape="io", store_fn="probeWritable",
                      drop_store=False, drop_log=False, data_pkg=True, ui_pkg=True,
                      keep_pkgs_when_dropped=True, share_shape="io", drop_share=False,
                      toast_hop="hop", rootfs_shape="io", drop_rootfs=False,
                      browser_shape="guard", rpc_shape="guard", nav_shape="guard",
-                     drop_guard_anchors=False):
+                     drop_guard_anchors=False,
+                     onboarding_shape="io", add_model_shape="io", backup_shape="io"):
     """A `com/rikkaminis/app` tree carrying both criterion-2 targets.
 
     [keep_pkgs_when_dropped] leaves an unrelated file in the package whose anchor
@@ -1214,6 +1452,16 @@ def write_io_fixture(root, store_shape="io", log_shape="io", store_fn="probeWrit
         files["ui/sandbox/FileBrowserViewModel.kt"] = _file_browser_vm(browser_shape)
         files["debug/DebugRPCHandler.kt"] = _debug_rpc(rpc_shape)
         files["ui/navigation/AppNavigation.kt"] = _app_nav(nav_shape)
+    # [deep-audit-1033 I05 / I08] criterion-2's new subjects belong to the same
+    # "did this tree ever ship the package?" question. The onboarding pair is
+    # unconditional (no arm drops `ui/onboarding/`), and its declaration stubs
+    # travel with it so the anchor is never reported as vacuous. The two
+    # `ui/settings/` anchors follow that package's existence.
+    files["ui/onboarding/OnboardingScreen.kt"] = _onboarding_screen(onboarding_shape)
+    files["ui/onboarding/SaveTargets.kt"] = _save_targets()
+    if not drop_log or keep_pkgs_when_dropped:
+        files["ui/settings/AddCustomModelScreen.kt"] = _add_model_screen(add_model_shape)
+        files["ui/settings/BackupSettingsScreen.kt"] = _backup_screen(backup_shape)
     for rel, text in files.items():
         path = os.path.join(app, *rel.split("/"))
         if not os.path.isdir(os.path.dirname(path)):
@@ -1314,6 +1562,28 @@ def selftest():
         "no Routes.fileBrowser( call", nav_shape="no_route")
     run("a tree that never shipped the criterion-5 anchors is skipped, not failed", False,
         "[PARTIAL] the read-only-mount guard anchors", drop_guard_anchors=True)
+
+    # ── criterion 2 (da1033 I05 / I08): the save paths off the click's thread ─
+    run("the three save paths wrapped in Dispatchers.IO pass", False,
+        "blocking-IO call site(s) inside Dispatchers.IO")
+    run("the onboarding insert on the click's thread is caught", True,
+        "ui/onboarding/OnboardingScreen.kt", onboarding_shape="direct")
+    run("a model insert left on the click's thread is caught", True,
+        "ui/settings/AddCustomModelScreen.kt", add_model_shape="direct")
+    run("the WebDAV read + persist on the composable's thread is caught", True,
+        "ui/settings/BackupSettingsScreen.kt", backup_shape="direct")
+    run("an IO wrap nested inside launch + runCatching still counts", False,
+        onboarding_shape="io_nested")
+    run("a save path whose call was removed is a rot failure, not a silent skip", True,
+        "nothing calls this any more", add_model_shape="none")
+
+    # ── criterion 5 (da1033 I01): the second, independent refusal ───────────
+    run("a browser that refuses read-only mounts but not the read-only shared folders is caught",
+        True, "refusing the read-only shared folders", browser_shape="mount_only")
+    run("a shared-folder refusal placed AFTER the delete is caught", True,
+        "runs AFTER the write", browser_shape="shared_late")
+    run("the two refusals may be written in either order", False,
+        browser_shape="shared_first")
 
     print("=== readonly_mount_write_guard --selftest ===")
     failed = 0

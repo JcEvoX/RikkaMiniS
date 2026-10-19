@@ -38,6 +38,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.rikkaminis.app.R
+import com.rikkaminis.app.sandbox.normalizeLinuxPath
 import com.rikkaminis.app.ui.theme.ChatColors
 
 /**
@@ -212,5 +213,42 @@ internal object SharedFolderRegistry {
         ),
     )
 
+    /**
+     * Linux roots this registry declares read-only — DERIVED from [entries],
+     * never a second literal list.
+     *
+     * [deep-audit-1033 I01]: `writable = false` was wired only to [AccessBadge],
+     * so the file browser happily deleted `SOUL.md` / `GLOBAL.md` / `SKILL.md`
+     * out of a folder the same screen labels Read-Only. Consumers ask this
+     * object, so a future read-only entry cannot be left unguarded.
+     */
+    val readOnlyLinuxPaths: List<String>
+        get() = entries.filterNot { it.writable }.map { it.linuxPath }
+
     fun find(id: String): SharedFolderEntry? = entries.firstOrNull { it.id == id }
+
+    /** True when [linuxPath] is one of the read-only folders above, or inside one. */
+    fun isLinuxPathUnderReadOnlySharedDir(linuxPath: String): Boolean =
+        isUnderReadOnlyLinuxRoot(linuxPath, readOnlyLinuxPaths)
+}
+
+/**
+ * Pure matcher behind [SharedFolderRegistry.isLinuxPathUnderReadOnlySharedDir].
+ *
+ * Top-level (not an object member) so a JVM test can drive it without loading
+ * the Compose-typed entry list, and so it reuses the sandbox's single
+ * normalization policy: a raw `startsWith` on the caller's string would let
+ * `/var/minis/skills/../shared/x` through. Both sides are normalized — a root
+ * spelled with a trailing slash would otherwise match nothing at all.
+ *
+ * An unresolvable path is *not* under a read-only root; that mirrors
+ * `PRootKernel.isLinuxPathUnderReadOnlyMount`, whose callers hold real
+ * host paths from the browser listing.
+ */
+internal fun isUnderReadOnlyLinuxRoot(linuxPath: String, readOnlyRoots: List<String>): Boolean {
+    val target = normalizeLinuxPath(linuxPath) ?: return false
+    return readOnlyRoots.any { root ->
+        val base = normalizeLinuxPath(root)
+        base != null && (target == base || target.startsWith("$base/"))
+    }
 }

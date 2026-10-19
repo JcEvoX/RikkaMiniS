@@ -143,13 +143,24 @@ fun BackupSettingsScreen(
     // reported via a system notification if the screen is gone by then.
     val application = remember { context.applicationContext as MinisApp }
     val notifier = remember { application.backgroundTaskNotifier }
-    var webDavConfig by remember { mutableStateOf(webDavStore.load()) }
+    // [deep-audit-1033 I08] Starts null: `webDavStore.load()` opens
+    // EncryptedSharedPreferences (Keystore unwrap) and must not run on the
+    // composition (Main) thread. The LaunchedEffect below fills it.
+    var webDavConfig by remember { mutableStateOf<WebDavConfig?>(null) }
     // [T-auto-backup-assets] Persist a restored WebDAV server config and
     // refresh Compose state. Declared AFTER webDavConfig so the lambda can
     // reference it (local-variable ordering).
+    // [deep-audit-1033 I08] The save is a blocking EncryptedSharedPreferences
+    // commit() and this callback runs inside the config-import path
+    // (ConfigBackup.import), which may outlive this screen — so it runs on the
+    // app-scoped scope (a screen scope cancelled by navigation would silently
+    // drop a restored server config) and hops back to Main for the Compose
+    // state write, which used to happen on the caller's thread.
     val applyWebDavConfig: (WebDavConfig) -> Unit = { cfg ->
-        runCatching { webDavStore.save(cfg) }
-        webDavConfig = cfg
+        application.applicationScope.launch {
+            withContext(Dispatchers.IO) { runCatching { webDavStore.save(cfg) } }
+            withContext(Dispatchers.Main) { webDavConfig = cfg }
+        }
     }
     var showWebDavConfig by remember { mutableStateOf(false) }
     var showRemoteList by remember { mutableStateOf(false) }
@@ -175,9 +186,10 @@ fun BackupSettingsScreen(
     // — see AutoBackupManager class doc. Local auto copies restore through
     // the same snapshotRestoreTarget dialog + restoreWithSnapshot path as
     // pre-restore snapshots (both are full JSON payloads with rollback).
-    var autoBackupEnabled by remember {
-        mutableStateOf(com.rikkaminis.app.backup.AutoBackupManager.isEnabled(context))
-    }
+    // [deep-audit-1033 I08] Both of these read SharedPreferences, which parses
+    // the XML file on first access — off the composition thread, filled by the
+    // entry LaunchedEffect below (same shape as the two list loads).
+    var autoBackupEnabled by remember { mutableStateOf(false) }
     var autoBackupRunning by remember { mutableStateOf(false) }
     // [fix/da1023-backup-streaming-fetch] `listLocal` lists filesDir — it must
     // not run inside `remember` on the composition (Main) thread. Start empty
@@ -187,9 +199,7 @@ fun BackupSettingsScreen(
     // same treatment as the pre-restore snapshot list: they are a rollback
     // utility, not a primary surface. Tap the toggle row to expand the list.
     var autoBackupsExpanded by remember { mutableStateOf(false) }
-    var autoBackupLastRun by remember {
-        mutableStateOf(com.rikkaminis.app.backup.AutoBackupManager.lastRunLabel(context))
-    }
+    var autoBackupLastRun by remember { mutableStateOf<String?>(null) }
     // [T-auto-backup-remote-dir] Remote automatic-backup management state:
     // the WebDAV `auto/` subdirectory listing (plus legacy root stragglers),
     // managed from a dedicated dialog inside the auto-backup section so the
@@ -227,6 +237,22 @@ fun BackupSettingsScreen(
     // (Main) thread it used to sit in. Same shape as the snapshot refresh.
     LaunchedEffect(Unit) {
         autoBackupFiles = withContext(Dispatchers.IO) { com.rikkaminis.app.backup.AutoBackupManager.listLocal(context) }
+    }
+
+    // [deep-audit-1033 I08] Entry load for the WebDAV server config and the
+    // auto-backup row. `webDavStore.load()` opens EncryptedSharedPreferences
+    // (Keystore unwrap, blocking) and the other two are SharedPreferences
+    // reads — all three used to run inline in `remember { … }`, i.e. on the
+    // composition (Main) thread, on every entry to this screen. Start from the
+    // "not configured / never ran" defaults and load them here.
+    LaunchedEffect(Unit) {
+        webDavConfig = withContext(Dispatchers.IO) { webDavStore.load() }
+        val autoRow = withContext(Dispatchers.IO) {
+            com.rikkaminis.app.backup.AutoBackupManager.isEnabled(context) to
+                com.rikkaminis.app.backup.AutoBackupManager.lastRunLabel(context)
+        }
+        autoBackupEnabled = autoRow.first
+        autoBackupLastRun = autoRow.second
     }
 
     val refreshSnapshots: () -> Unit = {
@@ -963,14 +989,26 @@ fun BackupSettingsScreen(
             httpClient = webDavHttpClient,
             onDismiss = { showWebDavConfig = false },
             onSave = { cfg ->
-                webDavStore.save(cfg)
-                webDavConfig = webDavStore.load()
-                showWebDavConfig = false
-                Toast.makeText(
-                    context,
-                    context.getString(R.string.webdav_saved),
-                    Toast.LENGTH_SHORT,
-                ).show()
+                // [deep-audit-1033 I08] save() commits to EncryptedSharedPreferences
+                // and the reload below reads it back — both are blocking keystore
+                // IO and used to run inline in this click handler, on the main
+                // thread. App-scoped for the same reason as applyWebDavConfig:
+                // navigating away must not lose a just-typed server config.
+                application.applicationScope.launch {
+                    val reloaded = withContext(Dispatchers.IO) {
+                        runCatching { webDavStore.save(cfg) }
+                        webDavStore.load()
+                    }
+                    withContext(Dispatchers.Main) {
+                        webDavConfig = reloaded
+                        showWebDavConfig = false
+                        Toast.makeText(
+                            context,
+                            context.getString(R.string.webdav_saved),
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                }
             },
         )
     }

@@ -12,6 +12,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
@@ -24,6 +25,9 @@ import com.rikkaminis.app.ui.components.RowLabel
 import com.rikkaminis.app.ui.components.SectionTextField
 import com.rikkaminis.app.R
 import com.rikkaminis.app.ui.components.MinisButton
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Add Custom Model — adopts the SettingsScaffold/SettingsSection toolkit
@@ -47,6 +51,11 @@ fun AddCustomModelScreen(
 
     var modelId by remember { mutableStateOf("") }
     var displayName by remember { mutableStateOf("") }
+    // [deep-audit-1033 I05] The write below is a coroutine now; without this
+    // the Save button stays live for the round trip and a double tap can add
+    // the same custom model twice (addEntry has no uniqueness check).
+    var saving by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     SettingsScaffold(
         title = stringResource(R.string.provider_detail_add_custom_model),
@@ -78,6 +87,8 @@ fun AddCustomModelScreen(
         Spacer(Modifier.height(20.dp))
         MinisButton(
             onClick = {
+                if (saving) return@MinisButton
+                saving = true
                 val name = displayName.ifBlank { modelId }
                 val model = LLMModel(
                     id = modelId.trim(),
@@ -89,10 +100,19 @@ fun AddCustomModelScreen(
                     baseModel = model,
                     isCustom = true,
                 )
-                providerRepository.addEntry(entry)
-                onBack()
+                scope.launch {
+                    try {
+                        // [deep-audit-1033 I05] addEntry goes to SQLite on the
+                        // caller's thread; saving a custom model used to block
+                        // the frame that navigates back.
+                        withContext(Dispatchers.IO) { providerRepository.addEntry(entry) }
+                        onBack()
+                    } finally {
+                        saving = false
+                    }
+                }
             },
-            enabled = modelId.isNotBlank(),
+            enabled = modelId.isNotBlank() && !saving,
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(horizontal = 16.dp),
