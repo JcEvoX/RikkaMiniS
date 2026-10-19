@@ -64,10 +64,14 @@ class SessionsOffloadHandler(
                 "messages" -> cmdMessages(args)
                 "send" -> cmdSend(args)
                 else -> {
+                    // [da1032-C] ISSUE-08: the list is built from SUBCOMMANDS —
+                    // the same table the dispatch above covers — so the message
+                    // can no longer fall behind the dispatch (it said "list,
+                    // search, messages" while `send` was already reachable).
                     val err = errorEnvelope(
                         sub,
                         "INVALID_ARGS",
-                        "Unknown command '$sub'. Valid: list, search, messages. " +
+                        "Unknown command '$sub'. Valid: ${SUBCOMMANDS.joinToString(", ")}. " +
                             "Use --help for details.",
                     )
                     NativeOffloadResult(
@@ -76,6 +80,15 @@ class SessionsOffloadHandler(
                     )
                 }
             }
+        } catch (e: InvalidDateArg) {
+            // [da1032-C] ISSUE-08: a date flag the caller supplied that this
+            // command cannot read refuses the command, instead of silently
+            // dropping the bound and answering the whole history.
+            val err = errorEnvelope(sub, "INVALID_ARGS", e.message ?: "invalid date")
+            NativeOffloadResult(
+                EXIT_INVALID_ARGS,
+                OffloadOutput.formatBody(err.toString(2), args) + "\n" + HELP_TEXT,
+            )
         } catch (e: Throwable) {
             // Last-ditch: any unexpected exception (sql parse error, OOM,
             // …) becomes an INTERNAL envelope rather than a crash so the
@@ -92,8 +105,7 @@ class SessionsOffloadHandler(
     private fun cmdList(args: OffloadArgs): NativeOffloadResult {
         val ids = parseIds(args)
         val kws = parseKeywords(args)
-        val startMs = parseDate(args.get("start"))
-        val endMs = parseEndDate(args.get("end"))
+        val (startMs, endMs) = resolveDateBounds(args)
         val limit = parseLimit(args)
 
         val metas = runBlocking { repo.querySessionsMeta(ids, kws, limit, startMs, endMs) }
@@ -134,8 +146,7 @@ class SessionsOffloadHandler(
             )
         }
         val ids = parseIds(args)
-        val startMs = parseDate(args.get("start"))
-        val endMs = parseEndDate(args.get("end"))
+        val (startMs, endMs) = resolveDateBounds(args)
         val limit = parseLimit(args)
 
         val matches = runBlocking { repo.searchMessages(ids, kws, limit, startMs, endMs) }
@@ -183,8 +194,7 @@ class SessionsOffloadHandler(
         // `messages` parsed neither — the CLI accepted the flags and silently
         // returned the whole session, which reads as "the filter worked and
         // matched everything".
-        val startMs = parseDate(args.get("start"))
-        val endMs = parseEndDate(args.get("end"))
+        val (startMs, endMs) = resolveDateBounds(args)
 
         val (page, total) = runBlocking {
             // Single coroutine block so the two reads see a consistent
@@ -319,14 +329,23 @@ class SessionsOffloadHandler(
         return parts.takeIf { it.isNotEmpty() }
     }
 
-    private fun parseDate(raw: String?): Long? {
-        if (raw.isNullOrBlank()) return null
-        return runCatching {
-            val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.US)
-            sdf.timeZone = TimeZone.getDefault()
-            sdf.isLenient = false
-            sdf.parse(raw)?.time
-        }.getOrNull()
+    /**
+     * [da1032-C] ISSUE-08: the `--start` / `--end` bounds shared by list,
+     * search and messages.
+     *
+     * An absent (or blank) flag stays null — "no filter", the documented
+     * behaviour, and the only reading of "the caller did not ask for a
+     * window". A flag the caller DID pass that this command cannot read as a
+     * date throws [InvalidDateArg], which [handle] answers with the standard
+     * INVALID_ARGS envelope + exit 2. The old shape fed the parse result
+     * straight into the query, so `--start 2026-13-40` degraded to "no filter"
+     * and the command returned the ENTIRE history — an unreadable argument
+     * read as a successful, wider query.
+     */
+    private fun resolveDateBounds(args: OffloadArgs): Pair<Long?, Long?> {
+        val startMs = sessionsDateBound("--start", args.get("start")) { parseSessionsDate(it) }
+        val endMs = sessionsDateBound("--end", args.get("end")) { parseEndDate(it) }
+        return startMs to endMs
     }
 
     /**
@@ -336,7 +355,7 @@ class SessionsOffloadHandler(
      * don't run UTC. Mirrors iOS SessionsOffload.m L141-145.
      */
     private fun parseEndDate(raw: String?): Long? {
-        val ms = parseDate(raw) ?: return null
+        val ms = parseSessionsDate(raw) ?: return null
         val cal = Calendar.getInstance().apply {
             timeInMillis = ms
             add(Calendar.DAY_OF_YEAR, 1)
@@ -390,6 +409,15 @@ class SessionsOffloadHandler(
         private val DATE_FMT: java.time.format.DateTimeFormatter =
             java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm", Locale.US)
                 .withZone(java.time.ZoneId.systemDefault())
+
+        /**
+         * [da1032-C] ISSUE-08: the dispatchable subcommands, single-sourced.
+         * [handle]'s `when` branches and the unknown-command message both key
+         * off this list, so a subcommand can no longer be reachable while the
+         * message still lists an older, shorter set (`send` was dispatchable
+         * while the text said "list, search, messages").
+         */
+        private val SUBCOMMANDS = listOf("list", "search", "messages", "send")
 
         private const val HELP_TEXT = """minis-sessions-cli - Query historical chat sessions and messages
 
@@ -453,4 +481,47 @@ EXAMPLES:
   minis-sessions-cli messages --id <session_id> --offset 20 --limit 10
 """
     }
+}
+
+/**
+ * [da1032-C] ISSUE-08: a caller-supplied date flag this command cannot read
+ * as a date. [sessionsDateBound] throws it; [SessionsOffloadHandler.handle]
+ * answers it with the same INVALID_ARGS envelope + exit 2 that cmdSearch /
+ * cmdMessages already use for a missing --keywords / --id.
+ */
+internal class InvalidDateArg(flag: String, raw: String) :
+    Exception("$flag '$raw' is not a YYYY-MM-DD date (e.g. 2026-10-19).")
+
+/**
+ * [da1032-C] ISSUE-08: the date parser for the `--start` / `--end` flags.
+ * Strict (`isLenient = false`), date-only, local zone — lifted out of the
+ * handler so the fail-closed decision below is JVM-testable against the real
+ * parser instead of a hand copy.
+ */
+internal fun parseSessionsDate(raw: String?): Long? {
+    if (raw.isNullOrBlank()) return null
+    return runCatching {
+        val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        sdf.timeZone = TimeZone.getDefault()
+        sdf.isLenient = false
+        sdf.parse(raw)?.time
+    }.getOrNull()
+}
+
+/**
+ * [da1032-C] ISSUE-08 decision core for ONE `--start` / `--end` flag:
+ *
+ *  • null result — the caller did not supply the flag → "no filter", the
+ *    documented behaviour;
+ *  • the parsed instant — the caller's bound;
+ *  • [InvalidDateArg] — the caller DID supply the flag and this command
+ *    cannot read it → the whole command is refused.
+ *
+ * The old shape collapsed the first and third case, so a typo'd `--start`
+ * silently widened list/search/messages to the entire history. [parse] is
+ * injected so the truth table runs against the real parser in JVM tests.
+ */
+internal fun sessionsDateBound(flag: String, raw: String?, parse: (String) -> Long?): Long? {
+    if (raw.isNullOrBlank()) return null
+    return parse(raw) ?: throw InvalidDateArg(flag, raw)
 }

@@ -115,7 +115,16 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
         if (type !in setOf("photo", "video", "all")) {
             return NativeOffloadResult(2, "android-photos list: --type must be photo|video|all\n")
         }
-        val (startMs, endMs) = resolveDateRange(args)
+        // [da1032-C] ISSUE-04: a supplied-but-unreadable `--start`/`--end` (or
+        // an inverted window) refuses the command. It used to resolve to a null
+        // bound → "no filter" → the command answered the entire library.
+        val range = when (val r = resolveDateRange(args)) {
+            is PhotoRange.Window -> r
+            is PhotoRange.Invalid ->
+                return NativeOffloadResult(2, "android-photos list: invalid ${r.flag} '${r.raw}'\n")
+        }
+        val startMs = range.startMs
+        val endMs = range.endMs
         AppLogger.info(TAG, "list: type=$type limit=$limit range=${startMs?.let { formatIso(it) }}..${endMs?.let { formatIso(it) }}")
         // [sweep1014-B22a] Query photos and videos independently (each capped
         // at [limit]) and merge by time in memory. The old shared-quota form
@@ -432,10 +441,17 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
         // limit first, leftover quota goes to videos) starved album videos
         // once the album held ≥limit photos. The inline projection stays:
         // queryMedia hides selection behind the start/end filters.
+        // [da1032-C] ISSUE-04: the projection must carry WIDTH/HEIGHT like
+        // queryMedia does — the album rows were the only media surface without
+        // dimensions (width/height came back absent, i.e. 0 to the caller).
+        // Column order is an implicit contract with the positional cursor
+        // reads below; the indices follow the list.
         val proj = arrayOf(
             MediaStore.Images.Media._ID,
             MediaStore.Images.Media.DISPLAY_NAME,
             MediaStore.Images.Media.DATE_TAKEN,
+            MediaStore.Images.Media.WIDTH,
+            MediaStore.Images.Media.HEIGHT,
             MediaStore.Images.Media.SIZE,
             MediaStore.Images.Media.MIME_TYPE,
             MediaStore.Images.Media.BUCKET_ID,
@@ -451,10 +467,12 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
                         .put("media_type", kind)
                     val dt = c.getLong(2)
                     if (dt > 0) p.put("date", formatDateTime(dt)).put("date_iso", formatIso(dt))
-                    p.put("size_bytes", c.getLong(3))
-                        .put("mime_type", c.getString(4) ?: "")
-                        .put("bucket_id", c.getLong(5))
-                        .put("bucket_name", c.getString(6) ?: "")
+                    p.put("width", c.getInt(3))
+                        .put("height", c.getInt(4))
+                        .put("size_bytes", c.getLong(5))
+                        .put("mime_type", c.getString(6) ?: "")
+                        .put("bucket_id", c.getLong(7))
+                        .put("bucket_name", c.getString(8) ?: "")
                     out.add(MediaEntry(dt, p))
                 }
             }
@@ -934,18 +952,26 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
      *     the wrong DAY (one extra or one missing day of results). It now walks
      *     the calendar ([daysAgoStartOfDayMs]) so the wall clock is preserved.
      */
-    private fun resolveDateRange(args: OffloadArgs): Pair<Long?, Long?> {
-        val zone = TimeZone.getDefault()
-        args.getInt("days")?.let { days ->
-            val n = if (days <= 0) 7 else days
-            return daysAgoStartOfDayMs(System.currentTimeMillis(), n, zone) to System.currentTimeMillis()
-        }
-        val startMs = args.get("start")?.let { parseDate(it) }
-        val endMs = args.get("end")?.let { raw ->
-            parseDate(raw)?.let { ms -> if (isDateOnly(raw)) alignDateOnlyEndMs(ms, zone) else ms }
-        }
-        return startMs to endMs
-    }
+    /**
+     * [da1032-C] ISSUE-04: the `list` window, resolved fail-closed.
+     *
+     * Absent flags are not an error — they mean "no filter on that side", and
+     * so do `--days`, `--start` alone and `--end` alone. What is an error is a
+     * flag the caller DID supply that this command cannot read as a date: the
+     * old shape returned null and `handleList` read null as "no filter", so
+     * `android-photos list --start 2026-13-40` answered the ENTIRE library —
+     * a typo silently widened the query instead of failing it. An inverted
+     * window (`--end` before `--start`) is refused for the same reason: the
+     * caller named a range that cannot contain anything.
+     */
+    private fun resolveDateRange(args: OffloadArgs): PhotoRange =
+        resolvePhotoRange(
+            nowMs = System.currentTimeMillis(),
+            zone = TimeZone.getDefault(),
+            daysRaw = args.getInt("days"),
+            startRaw = args.get("start"),
+            endRaw = args.get("end"),
+        ) { parseDate(it) }
 
     private fun parseDate(s: String): Long? {
         val patterns = listOf(
@@ -1194,4 +1220,58 @@ internal fun daysAgoStartOfDayMs(nowMs: Long, days: Int, zone: TimeZone): Long {
         set(Calendar.MILLISECOND, 0)
     }
     return cal.timeInMillis
+}
+
+/**
+ * [da1032-C] ISSUE-04: outcome of resolving the `list` window from
+ * `--days` / `--start` / `--end`.
+ *
+ * [Window] carries the resolved bounds (either side may be null = no filter on
+ * that side). [Invalid] names the flag the caller got wrong — the previous
+ * shape collapsed this case into a null bound, which the query path read as
+ * "no filter" and answered the whole library for.
+ */
+internal sealed class PhotoRange {
+    data class Window(val startMs: Long?, val endMs: Long?) : PhotoRange()
+    data class Invalid(val flag: String, val raw: String) : PhotoRange()
+}
+
+/**
+ * [da1032-C] Pure decision core for the `android-photos list` date window.
+ * Same three-part contract as CalendarOffloadHandler's resolveRangePure:
+ * absent flags stay absent, a supplied-but-unreadable flag is refused by name,
+ * and the day boundaries keep the calendar-walk semantics (bare-date `--end`
+ * covers the whole day via [alignDateOnlyEndMs], `--days N` walks local days
+ * via [daysAgoStartOfDayMs]) that deep-audit-1016c fixed here.
+ *
+ * [parse] is injected so the core stays free of the handler's SimpleDateFormat
+ * list and can be driven with a fixed clock in JVM tests.
+ */
+internal fun resolvePhotoRange(
+    nowMs: Long,
+    zone: TimeZone,
+    daysRaw: Int?,
+    startRaw: String?,
+    endRaw: String?,
+    parse: (String) -> Long?,
+): PhotoRange {
+    if (daysRaw != null) {
+        val n = if (daysRaw <= 0) 7 else daysRaw
+        return PhotoRange.Window(daysAgoStartOfDayMs(nowMs, n, zone), nowMs)
+    }
+    val startMs = if (startRaw.isNullOrBlank()) {
+        null
+    } else {
+        parse(startRaw) ?: return PhotoRange.Invalid("--start", startRaw)
+    }
+    val endMs = if (endRaw.isNullOrBlank()) {
+        null
+    } else {
+        val ms = parse(endRaw) ?: return PhotoRange.Invalid("--end", endRaw)
+        if (isDateOnly(endRaw)) alignDateOnlyEndMs(ms, zone) else ms
+    }
+    if (startMs != null && endMs != null && endMs < startMs) {
+        return PhotoRange.Invalid("--end", endRaw.orEmpty())
+    }
+    return PhotoRange.Window(startMs, endMs)
 }

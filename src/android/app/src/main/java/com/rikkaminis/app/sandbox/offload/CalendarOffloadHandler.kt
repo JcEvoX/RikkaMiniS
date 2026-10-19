@@ -280,8 +280,15 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
         val isAllDay = args.hasFlag("all-day")
         val startMs = (if (isAllDay) parseDateUtc(startStr) else parseDate(startStr))
             ?: return NativeOffloadResult(2, "android-calendar: invalid --start '$startStr'\n")
-        val endMs = args.get("end")?.let { if (isAllDay) parseDateUtc(it) else parseDate(it) }
-            ?: (startMs + 60 * 60 * 1000L)
+        // [da1032-C] ISSUE-04: an EXPLICIT `--end` that fails to parse must be
+        // refused, not silently replaced by the 1h default — `--end 2026-13-40`
+        // used to write a one-hour event at the caller's start and answer
+        // success. [createEndMs] keeps the two cases apart: absent → the 1h
+        // default (unchanged), present-but-unparseable → null → refusal, the
+        // same shape doUpdate/doFreebusy use.
+        val rawEnd = args.get("end")
+        val endMs = createEndMs(rawEnd, startMs) { if (isAllDay) parseDateUtc(it) else parseDate(it) }
+            ?: return NativeOffloadResult(2, "android-calendar create: invalid --end '$rawEnd'\n")
         // [da1031-C] ISSUE-05 B: an explicit --end at or before --start used to
         // be written as-is → DTSTART > DTEND, and the provider then hides the
         // row from list/instances/freebusy (the all-day half of this shape was
@@ -1134,6 +1141,30 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
          */
         internal fun invertedTimedRange(isAllDay: Boolean, startMs: Long?, endMs: Long?): Boolean =
             !isAllDay && startMs != null && endMs != null && endMs <= startMs
+
+        /**
+         * [da1032-C] doCreate's DTEND resolution. Three cases, and the whole
+         * point is that the middle two cannot collapse:
+         *
+         *  • [rawEnd] carries no value — the caller left `--end` OUT (OffloadArgs
+         *    hands back null for a flag with no usable value, including a bare
+         *    `--end` followed by another flag) → the documented 1h default.
+         *    Unchanged from before this fix, and pinned by
+         *    CalendarFreebusyInstancesTest + timedEndRepairMs.
+         *  • [rawEnd] has a value and [parse] answers — the caller's exact instant.
+         *  • [rawEnd] has a value and [parse] answers null — the caller TYPED an
+         *    end and it is not a date this command accepts → null, which the
+         *    caller turns into a refusal (the shape doUpdate/doFreebusy use).
+         *
+         * The old `args.get("end")?.let { parse(it) } ?: (startMs + 1h)` merged
+         * the first and third case: a typo'd `--end` silently created a
+         * one-hour event at the start and answered success. Pure so the truth
+         * table is JVM-testable next to [timedEndRepairMs].
+         */
+        internal fun createEndMs(rawEnd: String?, startMs: Long, parse: (String) -> Long?): Long? {
+            if (rawEnd.isNullOrBlank()) return startMs + 60L * 60 * 1000
+            return parse(rawEnd)
+        }
 
 
         private const val HELP = """android-calendar — list, create, update, delete events; query free/busy

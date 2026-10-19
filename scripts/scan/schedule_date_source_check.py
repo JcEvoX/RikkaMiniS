@@ -45,6 +45,9 @@ SCHEDULER_REL = (
 CALENDAR_REL = (
     "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/CalendarOffloadHandler.kt"
 )
+PHOTOS_REL = (
+    "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/PhotosOffloadHandler.kt"
+)
 
 COMPLETE_CALL = "ScheduledTasksStore.completeRun("
 DATING_CALL = "ScheduledRunDating.gateDateOnSettle("
@@ -243,12 +246,103 @@ def violations_calendar(src, label):
                        "date must go through alignBareDateEnd" % label)
         if ALIGN_CALL not in fb:
             bad.append("%s:1: freebusy --end must route through %s" % (label, ALIGN_CALL))
+
+    crt = member_slice(src, "private fun doCreate(")
+    if crt is None:
+        bad.append("%s:1: doCreate is gone (rename => update this gate)" % label)
+    else:
+        if "createEndMs(" not in crt:
+            bad.append("%s:1: doCreate does not route --end through createEndMs(…) — an "
+                       "explicit --end that fails to parse silently falls back to the 1h "
+                       "default: create answers an event in a window the caller never asked "
+                       "for, and nothing says the value was rejected" % label)
+        if "invalid --end" not in crt:
+            bad.append("%s:1: doCreate no longer refuses an unparseable --end — the caller is "
+                       "never told the value was rejected" % label)
+        if re.search(r"\?: \(\s*startMs\s*\+", crt):
+            bad.append("%s:1: doCreate keeps the elvis-default swallow (present-but-unusable "
+                       "--end silently becomes start+1h) — the rule is bound at the decision, "
+                       "not at the spelling of the default" % label)
+    if "internal fun createEndMs(" not in src:
+        bad.append("%s:1: createEndMs helper is gone" % label)
+    else:
+        cem = member_slice(src, "internal fun createEndMs(") or ""
+        if "isNullOrBlank" not in cem:
+            bad.append("%s:1: createEndMs no longer separates ABSENT (→ the 1h default) from "
+                       "PRESENT-BUT-UNPARSEABLE (→ null → refusal): that decision point is the "
+                       "whole fix — an invalid --end slips back into the default branch" % label)
+        if "60L * 60 * 1000" not in cem:
+            bad.append("%s:1: createEndMs lost the 1h default for an absent --end" % label)
+    return bad
+
+
+def violations_photos(src, label):
+    """ISSUE-04(B) rules for PhotosOffloadHandler.kt: a --start/--end that decides a
+    day must REFUSE a value the caller spelled wrong, never silently widen the window
+    to the whole library."""
+    bad = []
+
+    rdr = member_slice(src, "private fun resolveDateRange(")
+    if rdr is None:
+        bad.append("%s:1: resolveDateRange is gone (rename => update this gate)" % label)
+    else:
+        if "resolvePhotoRange(" not in rdr:
+            bad.append("%s:1: resolveDateRange must delegate to the pure core "
+                       "resolvePhotoRange(…)" % label)
+        own_code = strip_calls(rdr, "resolvePhotoRange(")
+        if "parseDate(" in own_code:
+            bad.append("%s:1: resolveDateRange parses --start/--end itself again — an "
+                       "unparseable value goes back to being silently dropped and the "
+                       "command answers the entire library" % label)
+        if "daysAgoStartOfDayMs(" in own_code or "alignDateOnlyEndMs(" in own_code:
+            bad.append("%s:1: resolveDateRange rebuilds the day math inline instead of the "
+                       "shared helpers" % label)
+
+    if "internal sealed class PhotoRange" not in src:
+        bad.append("%s:1: PhotoRange is gone — the refusal outcome has no carrier, so an "
+                   "invalid bound degrades to null == 'no filter' again" % label)
+    if "internal fun resolvePhotoRange(" not in src:
+        bad.append("%s:1: resolvePhotoRange is gone" % label)
+    else:
+        pure = member_slice(src, "internal fun resolvePhotoRange(") or ""
+        if "PhotoRange.Invalid(" not in pure:
+            bad.append("%s:1: resolvePhotoRange no longer returns an Invalid outcome for a bad "
+                       "--start/--end — ISSUE-04(B) re-opens (the window silently widens)" % label)
+        if "endMs < startMs" not in pure:
+            bad.append("%s:1: resolvePhotoRange lost the inverted-range refusal (--start after "
+                       "--end must not be served as a back-to-front window)" % label)
+        for needed in ("daysAgoStartOfDayMs(", "alignDateOnlyEndMs("):
+            if needed not in pure:
+                bad.append("%s:1: resolvePhotoRange lost %s (the shared day-math helper)"
+                           % (label, needed))
+
+    hl = member_slice(src, "private fun handleList(")
+    if hl is None:
+        bad.append("%s:1: handleList is gone" % label)
+    else:
+        if "PhotoRange.Invalid" not in hl:
+            bad.append("%s:1: handleList no longer branches on PhotoRange.Invalid — the refusal "
+                       "never reaches the caller" % label)
+        if "android-photos list: invalid" not in hl:
+            bad.append("%s:1: handleList no longer reports which bound was invalid" % label)
+
+    alb = member_slice(src, "private fun handleAlbum(")
+    if alb is None:
+        bad.append("%s:1: handleAlbum is gone" % label)
+    else:
+        if ("MediaStore.Images.Media.WIDTH" not in alb
+                or "MediaStore.Images.Media.HEIGHT" not in alb):
+            bad.append("%s:1: handleAlbum's projection no longer asks for WIDTH/HEIGHT — every "
+                       "album row answers 0x0 and the caller cannot pick a size" % label)
+        if 'put("width"' not in alb or 'put("height"' not in alb:
+            bad.append("%s:1: handleAlbum no longer emits width/height in its JSON" % label)
     return bad
 
 
 def check(repo_root):
     bad = []
-    for rel, fn in ((SCHEDULER_REL, violations_scheduler), (CALENDAR_REL, violations_calendar)):
+    for rel, fn in ((SCHEDULER_REL, violations_scheduler), (CALENDAR_REL, violations_calendar),
+                    (PHOTOS_REL, violations_photos)):
         path = os.path.join(repo_root, rel)
         if not os.path.isfile(path):
             bad.append("%s:1: ROT — file not found under %s" % (rel, repo_root))
@@ -337,6 +431,11 @@ GOOD_CALENDAR = """
             val s = startOfLocalDay(addLocalDays(nowMs, -1, zone), zone)
             return alignBareDateEnd(parse(endRaw ?: "", nowMs, zone) ?: return null, endRaw ?: "", zone) to s
         }
+
+        internal fun createEndMs(rawEnd: String?, startMs: Long, parse: (String) -> Long?): Long? {
+            if (rawEnd.isNullOrBlank()) return startMs + 60L * 60 * 1000
+            return parse(rawEnd)
+        }
     }
 
     private fun resolveDateRange(args: OffloadArgs): Pair<Long, Long>? =
@@ -354,6 +453,14 @@ GOOD_CALENDAR = """
             ?.let { alignBareDateEnd(it, endStr, TimeZone.getDefault()) }
             ?: return NativeOffloadResult(2, "bad --end")
         return NativeOffloadResult(0, "$endMs")
+    }
+
+    private fun doCreate(args: OffloadArgs): NativeOffloadResult {
+        val startMs = parseDate(startStr) ?: return NativeOffloadResult(2, "bad --start")
+        val rawEnd = args.get("end")
+        val endMs = createEndMs(rawEnd, startMs) { if (isAllDay) parseDateUtc(it) else parseDate(it) }
+            ?: return NativeOffloadResult(2, "android-calendar create: invalid --end '$rawEnd'\\n")
+        return NativeOffloadResult(0, "$startMs..$endMs")
     }
 """
 
@@ -387,6 +494,136 @@ BAD_CALENDAR_RAW_PARSE = GOOD_CALENDAR.replace(
     """        val endMs = parseDate(endStr) ?: return NativeOffloadResult(2, "bad --end")""",
 )
 
+# [da1032-C] ISSUE-04(A) negatives: the old shape (present-but-invalid --end falls
+# back to the 1h default) must trip a rule of its own.
+BAD_CALENDAR_SWALLOW_END = GOOD_CALENDAR.replace(
+    "        val endMs = createEndMs(rawEnd, startMs) { if (isAllDay) parseDateUtc(it) else parseDate(it) }",
+    '        val endMs = args.get("end")?.let { parseDate(it) } ?: (startMs + 60 * 60 * 1000L)',
+)
+
+BAD_CALENDAR_NO_REFUSAL = GOOD_CALENDAR.replace(
+    '"android-calendar create: invalid --end',
+    '"android-calendar create: bad value for',
+)
+
+BAD_CALENDAR_NULL_CHECK = GOOD_CALENDAR.replace(
+    "if (rawEnd.isNullOrBlank()) return startMs + 60L * 60 * 1000",
+    "if (rawEnd == null) return startMs + 60L * 60 * 1000",
+)
+
+BAD_CALENDAR_NO_DEFAULT = GOOD_CALENDAR.replace(
+    "if (rawEnd.isNullOrBlank()) return startMs + 60L * 60 * 1000",
+    "if (rawEnd.isNullOrBlank()) return startMs",
+)
+
+# [da1032-C] ISSUE-04(B) fixtures: a --start/--end the caller spelled wrong must be
+# REFUSED, never silently widened to the whole library.
+GOOD_PHOTOS = """
+    private fun resolveDateRange(args: OffloadArgs): PhotoRange =
+        resolvePhotoRange(
+            nowMs = System.currentTimeMillis(),
+            zone = TimeZone.getDefault(),
+            daysRaw = args.getInt("days"),
+            startRaw = args.get("start"),
+            endRaw = args.get("end"),
+        ) { parseDate(it) }
+
+    private fun handleList(args: OffloadArgs): NativeOffloadResult {
+        val range = when (val r = resolveDateRange(args)) {
+            is PhotoRange.Window -> r
+            is PhotoRange.Invalid ->
+                return NativeOffloadResult(2, "android-photos list: invalid ${r.flag} '${r.raw}'")
+        }
+        return NativeOffloadResult(0, "${range.startMs}..${range.endMs}")
+    }
+
+    private fun handleAlbum(args: OffloadArgs): NativeOffloadResult {
+        val proj = arrayOf(
+            MediaStore.Images.Media._ID,
+            MediaStore.Images.Media.DISPLAY_NAME,
+            MediaStore.Images.Media.DATE_TAKEN,
+            MediaStore.Images.Media.WIDTH,
+            MediaStore.Images.Media.HEIGHT,
+            MediaStore.Images.Media.SIZE,
+            MediaStore.Images.Media.MIME_TYPE,
+            MediaStore.Images.Media.BUCKET_ID,
+            MediaStore.Images.Media.BUCKET_DISPLAY_NAME,
+        )
+        val out = JSONArray()
+        while (c.moveToNext()) {
+            out.put(JSONObject().put("id", c.getLong(0))
+                .put("size", c.getLong(5))
+                .put("width", c.getInt(3))
+                .put("height", c.getInt(4))
+                .put("mime", c.getString(6)))
+        }
+        return NativeOffloadResult(0, out.toString())
+    }
+
+internal sealed class PhotoRange {
+    data class Window(val startMs: Long?, val endMs: Long?) : PhotoRange()
+    data class Invalid(val flag: String, val raw: String) : PhotoRange()
+}
+
+internal fun resolvePhotoRange(
+    nowMs: Long,
+    zone: TimeZone,
+    daysRaw: Int?,
+    startRaw: String?,
+    endRaw: String?,
+    parse: (String) -> Long?,
+): PhotoRange {
+    if (daysRaw != null) {
+        val n = if (daysRaw <= 0) 7 else daysRaw
+        return PhotoRange.Window(daysAgoStartOfDayMs(nowMs, n, zone), nowMs)
+    }
+    val startMs = if (startRaw.isNullOrBlank()) null else parse(startRaw) ?: return PhotoRange.Invalid("--start", startRaw)
+    val endMs = if (endRaw.isNullOrBlank()) {
+        null
+    } else {
+        val ms = parse(endRaw) ?: return PhotoRange.Invalid("--end", endRaw)
+        if (isDateOnly(endRaw)) alignDateOnlyEndMs(ms, zone) else ms
+    }
+    if (startMs != null && endMs != null && endMs < startMs) {
+        return PhotoRange.Invalid("--end", endRaw.orEmpty())
+    }
+    return PhotoRange.Window(startMs, endMs)
+}
+"""
+
+BAD_PHOTOS_OWN_PARSE = GOOD_PHOTOS.replace(
+    ") { parseDate(it) }",
+    ') { parseDate(it) }.also { parseDate("x") }',
+)
+
+BAD_PHOTOS_NO_REFUSAL = GOOD_PHOTOS.replace(
+    'parse(startRaw) ?: return PhotoRange.Invalid("--start", startRaw)',
+    'parse(startRaw) ?: null',
+).replace(
+    'val ms = parse(endRaw) ?: return PhotoRange.Invalid("--end", endRaw)',
+    'val ms = parse(endRaw) ?: 0L',
+).replace(
+    'return PhotoRange.Invalid("--end", endRaw.orEmpty())',
+    'return PhotoRange.Window(null, null)',
+)
+
+BAD_PHOTOS_NO_INVERT = GOOD_PHOTOS.replace("endMs < startMs", "false")
+
+BAD_PHOTOS_ALBUM_NO_SIZE = GOOD_PHOTOS.replace(
+    "            MediaStore.Images.Media.WIDTH,\n"
+    "            MediaStore.Images.Media.HEIGHT,\n",
+    "",
+)
+
+BAD_PHOTOS_LIST_NO_BRANCH = GOOD_PHOTOS.replace(
+    """        val range = when (val r = resolveDateRange(args)) {
+            is PhotoRange.Window -> r
+            is PhotoRange.Invalid ->
+                return NativeOffloadResult(2, "android-photos list: invalid ${r.flag} '${r.raw}'")
+        }""",
+    "        val range = resolveDateRange(args) as PhotoRange.Window",
+)
+
 SELFTEST_MARK = "SELFTEST=PASS (schedule-date-source: 2 files x 2 arms, teeth on every criterion)"
 
 
@@ -396,6 +633,16 @@ def run_selftest():
         ("runner/settle-clock", violations_scheduler(BAD_RUNNER_SETTLE_CLOCK, "fixture"), ">0"),
         ("calendar/compliant", violations_calendar(GOOD_CALENDAR, "fixture"), 0),
         ("calendar/raw-parse", violations_calendar(BAD_CALENDAR_RAW_PARSE, "fixture"), ">0"),
+        ("calendar/create-swallows-end", violations_calendar(BAD_CALENDAR_SWALLOW_END, "fixture"), ">0"),
+        ("calendar/no-refusal", violations_calendar(BAD_CALENDAR_NO_REFUSAL, "fixture"), ">0"),
+        ("calendar/absent-vs-invalid", violations_calendar(BAD_CALENDAR_NULL_CHECK, "fixture"), ">0"),
+        ("calendar/no-1h-default", violations_calendar(BAD_CALENDAR_NO_DEFAULT, "fixture"), ">0"),
+        ("photos/compliant", violations_photos(GOOD_PHOTOS, "fixture"), 0),
+        ("photos/own-parse", violations_photos(BAD_PHOTOS_OWN_PARSE, "fixture"), ">0"),
+        ("photos/no-refusal", violations_photos(BAD_PHOTOS_NO_REFUSAL, "fixture"), ">0"),
+        ("photos/no-inversion-refusal", violations_photos(BAD_PHOTOS_NO_INVERT, "fixture"), ">0"),
+        ("photos/album-drops-size", violations_photos(BAD_PHOTOS_ALBUM_NO_SIZE, "fixture"), ">0"),
+        ("photos/list-loses-branch", violations_photos(BAD_PHOTOS_LIST_NO_BRANCH, "fixture"), ">0"),
     ]
     problems = []
     for name, bad, expected in cases:
@@ -414,6 +661,52 @@ def run_selftest():
         problems.append("calendar/raw-parse: the DST-constant rule did not fire")
     if not any("alignBareDateEnd" in b for b in violations_calendar(BAD_CALENDAR_RAW_PARSE, "fixture")):
         problems.append("calendar/raw-parse: the freebusy alignment rule did not fire")
+    # [da1032-C] ISSUE-04(A): each new Calendar rule proves itself, and the
+    # compliant fixture's legit "absent --end -> 1h default" path stays clean.
+    if not any("does not route --end through createEndMs" in b
+               for b in violations_calendar(BAD_CALENDAR_SWALLOW_END, "fixture")):
+        problems.append("calendar/create-swallows-end: the routing rule did not fire")
+    if not any("keeps the elvis-default swallow" in b
+               for b in violations_calendar(BAD_CALENDAR_SWALLOW_END, "fixture")):
+        problems.append("calendar/create-swallows-end: the elvis-swallow rule did not fire")
+    if not any("no longer refuses an unparseable --end" in b
+               for b in violations_calendar(BAD_CALENDAR_NO_REFUSAL, "fixture")):
+        problems.append("calendar/no-refusal: the refusal rule did not fire")
+    if not any("separates ABSENT" in b
+               for b in violations_calendar(BAD_CALENDAR_NULL_CHECK, "fixture")):
+        problems.append("calendar/absent-vs-invalid: the decision-point rule did not fire")
+    if not any("lost the 1h default" in b
+               for b in violations_calendar(BAD_CALENDAR_NO_DEFAULT, "fixture")):
+        problems.append("calendar/no-1h-default: the default rule did not fire")
+    # [da1032-C] ISSUE-04(B): each Photos rule proves itself; the two precision
+    # controls pin that a delegating/emitting fixture is NOT flagged.
+    if not any("parses --start/--end itself again" in b
+               for b in violations_photos(BAD_PHOTOS_OWN_PARSE, "fixture")):
+        problems.append("photos/own-parse: the inline-parse rule did not fire")
+    if any("must delegate to the pure core" in b
+           for b in violations_photos(BAD_PHOTOS_OWN_PARSE, "fixture")):
+        problems.append("photos/own-parse: the delegate rule fired on a delegating fixture")
+    if not any("no longer returns an Invalid outcome" in b
+               for b in violations_photos(BAD_PHOTOS_NO_REFUSAL, "fixture")):
+        problems.append("photos/no-refusal: the Invalid-outcome rule did not fire")
+    if any("inverted-range refusal" in b
+           for b in violations_photos(BAD_PHOTOS_NO_REFUSAL, "fixture")):
+        problems.append("photos/no-refusal: the inversion rule fired on a fixture that kept it")
+    if not any("inverted-range refusal" in b
+               for b in violations_photos(BAD_PHOTOS_NO_INVERT, "fixture")):
+        problems.append("photos/no-inversion-refusal: the inversion rule did not fire")
+    if not any("projection no longer asks for WIDTH/HEIGHT" in b
+               for b in violations_photos(BAD_PHOTOS_ALBUM_NO_SIZE, "fixture")):
+        problems.append("photos/album-drops-size: the projection rule did not fire")
+    if any("no longer emits width/height" in b
+           for b in violations_photos(BAD_PHOTOS_ALBUM_NO_SIZE, "fixture")):
+        problems.append("photos/album-drops-size: the emit rule fired on a fixture that kept it")
+    if not any("branches on PhotoRange.Invalid" in b
+               for b in violations_photos(BAD_PHOTOS_LIST_NO_BRANCH, "fixture")):
+        problems.append("photos/list-loses-branch: the branch rule did not fire")
+    if not any("reports which bound was invalid" in b
+               for b in violations_photos(BAD_PHOTOS_LIST_NO_BRANCH, "fixture")):
+        problems.append("photos/list-loses-branch: the refusal-message rule did not fire")
 
     if problems:
         print("SELFTEST=FAIL")

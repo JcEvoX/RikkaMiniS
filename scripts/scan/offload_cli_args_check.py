@@ -171,6 +171,35 @@ DEBUG_RULES = [
     ("D17", "forbid_re", r"buildExecForwarder\(OffloadArgs\("),
 ]
 
+# [da1032-C] ISSUE-08 — SessionsOffloadHandler's date bounds.
+# The three date-carrying subcommands (list / search / messages) each parsed
+# `parseDate(args.get("start"))` on their own and answered `null` on a value
+# the caller DID spell but the parser could not read — and `null` means "no
+# filter", so a typo returned the WHOLE library. The fix routes every bound
+# through ONE funnel (resolveDateBounds → sessionsDateBound → parseSessionsDate)
+# that throws [InvalidDateArg] for a supplied-but-unreadable value while an
+# ABSENT flag still resolves to null (no filter — legal). The unknown-command
+# message is generated from SUBCOMMANDS so it can no longer drift out of sync
+# with the dispatch table (`send` was missing from the hand-written list).
+SESSIONS = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/SessionsOffloadHandler.kt"
+SESSIONS_RULES = [
+    ("J1", "req", "private fun resolveDateBounds(args: OffloadArgs): Pair<Long?, Long?>"),
+    ("J2", "req", 'val startMs = sessionsDateBound("--start", args.get("start"))'),
+    ("J3", "req", 'val endMs = sessionsDateBound("--end", args.get("end"))'),
+    ("J4", "count_re", (r"val \(startMs, endMs\) = resolveDateBounds\(args\)", 3)),
+    ("J5", "req", "internal fun sessionsDateBound(flag: String, raw: String?, parse: (String) -> Long?): Long?"),
+    ("J6", "req", "internal fun parseSessionsDate(raw: String?): Long?"),
+    ("J7", "req", "internal class InvalidDateArg(flag: String, raw: String)"),
+    ("J8", "req", "catch (e: InvalidDateArg)"),
+    ("J9", "req", 'private val SUBCOMMANDS = listOf("list", "search", "messages", "send")'),
+    ("J10", "req", 'Valid: ${SUBCOMMANDS.joinToString(", ")}'),
+    ("J11", "forbid", "Valid: list, search, messages."),
+    ("J12", "forbid_re", r"parseDate\(args\.get\(\"start\"\)\)"),
+    ("J13", "forbid_re", r"parseEndDate\(args\.get\(\"end\"\)\)"),
+    ("J14", "req", '"send" -> cmdSend(args)'),
+    ("J15", "count_re", (r"throw InvalidDateArg\(flag, raw\)", 1)),
+]
+
 
 def code_only(src: str) -> str:
     """Strip block + line comments so prose quoting a pattern cannot trip a rule."""
@@ -278,6 +307,34 @@ def check_debug(debug_src: str) -> list:
                 findings.append((rid, "present", needle))
         elif kind == "forbid_re":
             if re.search(needle, debug):
+                findings.append((rid, "present", needle))
+    return findings
+
+
+def check_sessions(sessions_src: str) -> list:
+    """[da1032-C] ISSUE-08 rules for SessionsOffloadHandler, on comment-stripped text.
+
+    Fail-closed by construction: every needle is a `req` (missing → finding), a
+    `forbid` (present → finding), a `count_re`, or a `forbid_re`. A renamed
+    funnel, a rebuilt per-command parse, or a whole-file rewrite all land as
+    findings rather than as a silently empty rule set.
+    """
+    findings = []
+    sessions = code_only(sessions_src)
+    for rid, kind, needle in SESSIONS_RULES:
+        if kind in ("req", "forbid"):
+            hit = needle in sessions
+            if kind == "req" and not hit:
+                findings.append((rid, "missing", needle))
+            if kind == "forbid" and hit:
+                findings.append((rid, "present", needle))
+        elif kind == "count_re":
+            pattern, want = needle
+            got = len(re.findall(pattern, sessions))
+            if got != want:
+                findings.append((rid, f"count {got} != {want}", pattern))
+        elif kind == "forbid_re":
+            if re.search(needle, sessions):
                 findings.append((rid, "present", needle))
     return findings
 
@@ -478,6 +535,76 @@ class DebugOffloadHandler {
     ): List<String> = if (sub in PASSTHROUGH_SUBCOMMANDS) rawRest else args.positional.drop(1)
 
     internal fun execCommandLine(argv: List<String>): String = argv.joinToString(" ")
+}
+"""
+
+
+# [da1032-C] green fixture for the Sessions date-bound arms: ONE funnel
+# (resolveDateBounds → sessionsDateBound), three call sites, a throwing guard
+# for a supplied-but-unreadable bound, and an unknown-command message generated
+# from the SUBCOMMANDS list (so it cannot drift from the dispatch table).
+GREEN_SESSIONS = """
+class SessionsOffloadHandler {
+    override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
+        val args = OffloadArgs(request.argv.drop(1))
+        return try {
+            when (val sub = args.positional.getOrNull(0)) {
+                "list" -> cmdList(args)
+                "search" -> cmdSearch(args)
+                "messages" -> cmdMessages(args)
+                "send" -> cmdSend(args)
+                else -> NativeOffloadResult(EXIT_INVALID_ARGS, "Unknown command '$sub'. Valid: ${SUBCOMMANDS.joinToString(", ")}. ")
+            }
+        } catch (e: InvalidDateArg) {
+            NativeOffloadResult(EXIT_INVALID_ARGS, e.message)
+        }
+    }
+
+    private fun cmdList(args: OffloadArgs): NativeOffloadResult {
+        val (startMs, endMs) = resolveDateBounds(args)
+        return NativeOffloadResult(0, "${startMs}..${endMs}")
+    }
+
+    private fun cmdSearch(args: OffloadArgs): NativeOffloadResult {
+        val (startMs, endMs) = resolveDateBounds(args)
+        return NativeOffloadResult(0, "${startMs}..${endMs}")
+    }
+
+    private fun cmdMessages(args: OffloadArgs): NativeOffloadResult {
+        val (startMs, endMs) = resolveDateBounds(args)
+        return NativeOffloadResult(0, "${startMs}..${endMs}")
+    }
+
+    private fun cmdSend(args: OffloadArgs): NativeOffloadResult = NativeOffloadResult(0, "")
+
+    private fun resolveDateBounds(args: OffloadArgs): Pair<Long?, Long?> {
+        val startMs = sessionsDateBound("--start", args.get("start")) { parseSessionsDate(it) }
+        val endMs = sessionsDateBound("--end", args.get("end")) { parseEndDate(it) }
+        return startMs to endMs
+    }
+
+    private fun parseEndDate(raw: String?): Long? {
+        val ms = parseSessionsDate(raw) ?: return null
+        return ms
+    }
+
+    companion object {
+        private val SUBCOMMANDS = listOf("list", "search", "messages", "send")
+        private const val EXIT_INVALID_ARGS = 2
+    }
+}
+
+internal class InvalidDateArg(flag: String, raw: String) :
+    IllegalArgumentException("sessions: invalid $flag '$raw'")
+
+internal fun parseSessionsDate(raw: String?): Long? {
+    if (raw.isNullOrBlank()) return null
+    return null
+}
+
+internal fun sessionsDateBound(flag: String, raw: String?, parse: (String) -> Long?): Long? {
+    if (raw.isNullOrBlank()) return null
+    return parse(raw) ?: throw InvalidDateArg(flag, raw)
 }
 """
 
@@ -709,13 +836,79 @@ def selftest() -> int:
         if got != want:
             print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
             failures += 1
+    # [da1032-C] each Sessions rule must be winnable by exactly the mutation it
+    # pins — the funnel rename, the per-command parse coming back, the guard
+    # losing its throw, the hand-written "Valid:" list, the SUBCOMMANDS drift.
+    red_cases_sessions = [
+        ("the funnel is renamed",
+         GREEN_SESSIONS.replace(
+             "private fun resolveDateBounds(args: OffloadArgs): Pair<Long?, Long?>",
+             "private fun resolveBounds(args: OffloadArgs): Pair<Long?, Long?>"),
+         {"J1"}),
+        ("a subcommand skips the funnel",
+         GREEN_SESSIONS.replace("val (startMs, endMs) = resolveDateBounds(args)",
+                                "val (startMs, endMs) = resolveBounds(args)", 1),
+         {"J4"}),
+        ("--start is parsed outside the funnel",
+         GREEN_SESSIONS.replace(
+             'val startMs = sessionsDateBound("--start", args.get("start")) { parseSessionsDate(it) }',
+             'val startMs = parseDate(args.get("start"))'),
+         {"J2", "J12"}),
+        ("--end is parsed outside the funnel",
+         GREEN_SESSIONS.replace(
+             'val endMs = sessionsDateBound("--end", args.get("end")) { parseEndDate(it) }',
+             'val endMs = parseEndDate(args.get("end"))'),
+         {"J3", "J13"}),
+        ("sessionsDateBound is renamed",
+         GREEN_SESSIONS.replace(
+             "internal fun sessionsDateBound(flag: String, raw: String?, parse: (String) -> Long?): Long?",
+             "internal fun bound(flag: String, raw: String?, parse: (String) -> Long?): Long?"),
+         {"J5"}),
+        ("parseSessionsDate is renamed",
+         GREEN_SESSIONS.replace("internal fun parseSessionsDate(raw: String?): Long?",
+                                "internal fun parseDate(raw: String?): Long?"),
+         {"J6"}),
+        ("the guard stops refusing",
+         GREEN_SESSIONS.replace("return parse(raw) ?: throw InvalidDateArg(flag, raw)",
+                                "return parse(raw)"),
+         {"J15"}),
+        ("the refusal carrier is renamed",
+         GREEN_SESSIONS.replace("internal class InvalidDateArg(flag: String, raw: String) :",
+                                "internal class BadDateArg(flag: String, raw: String) :"),
+         {"J7"}),
+        ("handle stops catching the refusal",
+         GREEN_SESSIONS.replace("} catch (e: InvalidDateArg) {", "} catch (e: Exception) {"),
+         {"J8"}),
+        ("the declared list drops send",
+         GREEN_SESSIONS.replace(
+             'private val SUBCOMMANDS = listOf("list", "search", "messages", "send")',
+             'private val SUBCOMMANDS = listOf("list", "search", "messages")'),
+         {"J9"}),
+        ("the Valid: list is hand-written again",
+         GREEN_SESSIONS.replace('Valid: ${SUBCOMMANDS.joinToString(", ")}',
+                                "Valid: list, search, messages."),
+         {"J10", "J11"}),
+        ("the dispatch table loses send",
+         GREEN_SESSIONS.replace('"send" -> cmdSend(args)', '"send" -> doNothing(args)'),
+         {"J14"}),
+    ]
+    for label, sessions_src, want in red_cases_sessions:
+        if sessions_src == GREEN_SESSIONS:
+            print(f"SELFTEST-FAIL: {label}: mutation did not apply to any arm")
+            failures += 1
+            continue
+        got = {rid for rid, _, _ in check_sessions(sessions_src)}
+        if got != want:
+            print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
+            failures += 1
     # the green arms must be fully clean, or every rule is vacuous
     clean = check_text(GREEN_CONTACTS, GREEN_CONFIG, GREEN_BROWSERUSE, GREEN_FASTIO)
     clean_flags = check_flag_set(GREEN_OUTPUT, GREEN_SPEAK)
     clean_debug = check_debug(GREEN_DEBUG)
-    if clean or clean_flags or clean_debug:
+    clean_sessions = check_sessions(GREEN_SESSIONS)
+    if clean or clean_flags or clean_debug or clean_sessions:
         print(f"SELFTEST-FAIL: green fixtures must produce no findings, "
-              f"got {describe(clean + clean_flags + clean_debug)}")
+              f"got {describe(clean + clean_flags + clean_debug + clean_sessions)}")
         failures += 1
     if failures:
         print(f"SELFTEST: {failures} failing case(s)")
@@ -728,9 +921,15 @@ def main(argv):
     if not argv:
         print(__doc__)
         return 2
-    root = Path(argv[0])
-    if "--selftest" in argv[1:]:
+    # Order-independent: gate_run.sh calls `python3 <gate> --selftest <repo>`,
+    # test_scan.py calls `python3 <gate> --selftest`, humans call `... <repo>`.
+    if "--selftest" in argv:
         return selftest()
+    positional = [a for a in argv if not a.startswith("--")]
+    if not positional:
+        print(__doc__)
+        return 2
+    root = Path(positional[0])
     contacts_path = root / CONTACTS
     config_path = root / CONFIG
     browseruse_path = root / BROWSERUSE
@@ -738,10 +937,11 @@ def main(argv):
     output_path = root / OUTPUT
     speak_path = root / SPEAK
     debug_path = root / DEBUG_HANDLER
+    sessions_path = root / SESSIONS
     if not contacts_path.is_file() or not config_path.is_file() \
             or not browseruse_path.is_file() or not fastio_path.is_file() \
             or not output_path.is_file() or not speak_path.is_file() \
-            or not debug_path.is_file():
+            or not debug_path.is_file() or not sessions_path.is_file():
         print(f"GATE-FAIL: handler source not found under {root}")
         return 1
     findings = check_text(contacts_path.read_text(encoding="utf-8"),
@@ -751,6 +951,7 @@ def main(argv):
     findings += check_flag_set(output_path.read_text(encoding="utf-8"),
                                speak_path.read_text(encoding="utf-8"))
     findings += check_debug(debug_path.read_text(encoding="utf-8"))
+    findings += check_sessions(sessions_path.read_text(encoding="utf-8"))
     if findings:
         print("offload_cli_args_check: FAIL")
         print(describe(findings))
@@ -758,6 +959,7 @@ def main(argv):
     print("offload_cli_args_check: PASS (contacts dispatch parsed, config --file cwd-aware, "
           "browseruse paths joined, fastio tar verdict shared, "
           "OUTPUT_FLAGS covers help/h, speak declares stop/status, "
+          "sessions date bounds funneled + refuse invalid, "
           "debug pass-through argv verbatim + global-only output shaping)")
     return 0
 
