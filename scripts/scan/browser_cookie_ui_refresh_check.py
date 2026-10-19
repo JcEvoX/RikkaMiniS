@@ -37,9 +37,24 @@ the panel shows the viewport the pool actually resolves:
       local search box; giving it a key (e.g. the refresh tick) would reset the
       user's filter text on every recomposition — this arm is what proves the
       family has discrimination rather than "any change is green".
+  V6  [da1030-B] the UA radio selection (`selectedProfile`) must be seeded from
+      the pool's `currentUserAgentProfile` flow and keyed on it. The pre-fix
+      sheet snapshotted the `user_agent_profile` prefs key once (un-keyed
+      remember), so an agent `set_user_agent` — which now routes through the
+      pool — left the panel rendering the old radio while the tabs had moved on.
+  V7  [da1030-B] the pool's `when (input.action)` must route
+      `BrowserAction.SET_USER_AGENT` through an explicit branch, and that
+      handler must replay the resolved viewport (`applyViewportToAllTabs()`).
+      Pre-fix the action fell into the per-tab `else`: one tab got the new UA,
+      `BrowserUseManager.setUserAgent` reset that tab's layout to the profile
+      default, and `applyViewport()` (no-arg) replayed only the profile's own
+      size — so a session/global custom viewport was clobbered and the other
+      tabs kept the old profile.
 
-Families 1-4 are judged by [check] (cookie) and 5-9 by [check_viewport], each
-with its own fixtures; both run on the real file.
+Families 1-4 are judged by [check] (cookie); V1–V6 by [check_viewport] and V7 by
+[check_pool_ua] — the latter is the first criterion here that reads a second file
+(`BrowserTabPool.kt`). Each family carries its own fixtures; all run on the real
+tree, not on samples.
 
 Code anchors only — comments are stripped before judgment, so a KDoc that
 mentions `removeAllCookies(null)` does not trip the gate.
@@ -53,6 +68,7 @@ import re
 import sys
 
 TARGET = "src/android/app/src/main/java/com/rikkaminis/app/ui/browser/BrowserSettingsSheet.kt"
+POOL_TARGET = "src/android/app/src/main/java/com/rikkaminis/app/browser/BrowserTabPool.kt"
 MARKER = "BROWSER_COOKIE_UI_REFRESH_SELFTEST=PASS"
 
 
@@ -164,6 +180,8 @@ VIEWPORT_ACTIONS = ("onSelectDefault", "onSelectCustom", "onApply", "onPreset")
 RESET_CALL = "resetSessionViewport()"
 GLOBAL_WRITE = "setGlobalViewport("
 FROZEN_FILTER = "cookieFilterText"
+UA_POOL_FLOW = "currentUserAgentProfile"
+REPLAY_CALL = "applyViewportToAllTabs()"
 
 
 def _statement_window(code, ident):
@@ -277,6 +295,83 @@ def check_viewport(source: str) -> list:
             "regression anchor lost its subject (ROT: re-point it)" % FROZEN_FILTER
         )
 
+    # ── V6 [da1030-B] the UA radio must follow the pool, not a prefs snapshot ──
+    if not re.search(r"\.%s\s*\.\s*collectAsState\s*\(\s*\)" % UA_POOL_FLOW, code):
+        errs.append(
+            "does not subscribe to `%s` — an agent `set_user_agent` (which now "
+            "routes through the pool) leaves this panel on the old radio (V6)"
+            % UA_POOL_FLOW
+        )
+    m = re.search(r"var\s+selectedProfile\s+by\s+remember\s*\(([^)]*)\)", code)
+    if not m:
+        errs.append(
+            "`var selectedProfile by remember {` has no key list at all — it froze "
+            "on the prefs snapshot read at the first composition, so the radio kept "
+            "showing the profile the sheet was opened with (V6)"
+        )
+    else:
+        keys = [k.strip() for k in m.group(1).split(",") if k.strip()]
+        backed = False
+        for key in keys:
+            if not re.fullmatch(r"[A-Za-z_]\w*", key):
+                continue
+            window = _statement_window(code, key)
+            if window and UA_POOL_FLOW in window:
+                backed = True
+        if not backed:
+            errs.append(
+                "`selectedProfile` is keyed on %s, none of which is fed by the "
+                "pool's `%s` flow — a key must re-seed the selection from the pool "
+                "(V6)" % (keys, UA_POOL_FLOW)
+            )
+
+    return errs
+
+
+def check_pool_ua(source: str) -> list:
+    """[da1030-B] V7 — `set_user_agent` must be a pool-level action.
+
+    Two halves, each with a fixture: the branch must exist explicitly (falling
+    into the per-tab `else` is the defect) and its handler must replay the
+    resolved viewport (`BrowserUseManager.setUserAgent` resets the tab layout to
+    the new profile's default; without the replay a session/global custom
+    viewport is silently clobbered).
+    """
+    code = mask_code(source)
+    errs = []
+
+    block = slice_from_marker(code, "when (input.action)")
+    if not block:
+        errs.append(
+            "no `when (input.action)` block in %s — the pool dispatch this "
+            "criterion pins is gone (ROT: update this gate)" % POOL_TARGET
+        )
+        return errs
+
+    m = re.search(r"BrowserAction\.SET_USER_AGENT\s*->\s*([A-Za-z_]\w*)\s*\(", block)
+    if not m:
+        errs.append(
+            "`when (input.action)` has no explicit `BrowserAction.SET_USER_AGENT ->` "
+            "branch — the action falls into the per-tab `else`, so it hits ONE tab, "
+            "skips the viewport replay and leaves the panel/other tabs on the old "
+            "profile (V7)"
+        )
+        return errs
+
+    handler = m.group(1)
+    body = slice_from_marker(code, "fun %s(" % handler)
+    if not body:
+        errs.append(
+            "`BrowserAction.SET_USER_AGENT ->` calls `%s(` but no such function body "
+            "exists in %s (V7)" % (handler, POOL_TARGET)
+        )
+    elif REPLAY_CALL not in body:
+        errs.append(
+            "`%s` never calls `%s` — `setUserAgent` resets each tab to the new "
+            "profile's default viewport, so a session/global custom override is "
+            "clobbered (V7)" % (handler, REPLAY_CALL)
+        )
+
     return errs
 
 
@@ -366,6 +461,10 @@ def selftest() -> int:
         if (sessionViewportActive) sessionWidthFromPool else customWidthFromPool
     val effectiveHeightFromPool =
         if (sessionViewportActive) sessionHeightFromPool else customHeightFromPool
+    val poolProfile by tabPool.currentUserAgentProfile.collectAsState()
+    var selectedProfile by remember(poolProfile) {
+        mutableStateOf(poolProfile)
+    }
     var viewportWidthText by remember(effectiveWidthFromPool) {
         mutableStateOf(if (effectiveWidthFromPool > 0) effectiveWidthFromPool.toString() else "")
     }
@@ -446,6 +545,56 @@ def selftest() -> int:
          good_vp.replace("var cookieFilterText by remember {",
                          "var cookieFilterText by remember(cookieRefreshTick) {"),
          ["gained a remember key"]),
+        ("V6 UA radio un-keyed (prefs snapshot)",
+         good_vp.replace("var selectedProfile by remember(poolProfile) {",
+                         "var selectedProfile by remember {"),
+         ["no key list at all"]),
+        ("V6 UA radio keyed on a nonce",
+         good_vp.replace("var selectedProfile by remember(poolProfile) {",
+                         "var selectedProfile by remember(vpNonce) {"),
+         ["none of which is fed by"]),
+        ("V6 UA pool flow not subscribed",
+         good_vp.replace("    val poolProfile by tabPool.currentUserAgentProfile.collectAsState()\n", ""),
+         ["does not subscribe to `currentUserAgentProfile`"]),
+    ]
+
+    # ── [da1030-B] pool-side fixtures: set_user_agent must be pool-level (V7) ──
+    good_pool = """
+        val result = when (input.action) {
+            BrowserAction.NEW_TAB -> newTab(input.url)
+            BrowserAction.SET_VIEWPORT -> handleSetViewport(input)
+            BrowserAction.SET_USER_AGENT -> handleSetUserAgent(input)
+            else -> {
+                val serialTabId = input.tabId
+                if (serialTabId != null) executeSerialized(serialTabId, input) else execute(input)
+            }
+        }
+    }
+
+    private suspend fun handleSetUserAgent(input: BrowserActionInput): BrowserActionResult = withContext(Dispatchers.Main) {
+        val newProfile = input.userAgent
+            ?: return@withContext BrowserActionResult.error("set_user_agent requires --user-agent")
+        val customUA = if (newProfile == UserAgentProfile.CUSTOM) customUserAgentString else null
+        userAgentProfile = newProfile
+        for (tab in _tabs.value) {
+            tab.manager.setUserAgent(newProfile, customUA)
+        }
+        applyViewportToAllTabs()
+        val (w, h) = resolvedViewportSize()
+        BrowserActionResult(text = "Switched to ${newProfile.value} (${w}x$h)")
+    }
+    """
+    pool_arms = [
+        ("V7 compliant pool routing", good_pool, []),
+        ("V7 branch missing (falls into the per-tab else)",
+         good_pool.replace("            BrowserAction.SET_USER_AGENT -> handleSetUserAgent(input)\n", ""),
+         ["no explicit `BrowserAction.SET_USER_AGENT ->` branch"]),
+        ("V7 handler skips the viewport replay",
+         good_pool.replace("        applyViewportToAllTabs()\n", ""),
+         ["never calls `applyViewportToAllTabs()`"]),
+        ("V7 dispatch block gone",
+         good_pool.replace("when (input.action)", "when (input.mode)"),
+         ["no `when (input.action)` block"]),
     ]    # the comment trap: a KDoc mentioning removeAllCookies(null) must NOT trip
     good_with_comment = """
             // [fix/da1022-G] removeAllCookies(null) left no flush and no refresh:
@@ -486,6 +635,21 @@ def selftest() -> int:
             failures += 1
         else:
             print(f"  OK {name}: {errs}")
+    for name, sample, needles in pool_arms:
+        errs = check_pool_ua(sample)
+        if not needles:
+            if errs:
+                print(f"  FAIL {name}: expected green, got {errs}")
+                failures += 1
+            else:
+                print(f"  OK {name}: green")
+            continue
+        hit = [n for n in needles if not any(n in e for e in errs)]
+        if hit or not errs:
+            print(f"  FAIL {name}: expected {needles}, got {errs}")
+            failures += 1
+        else:
+            print(f"  OK {name}: {errs}")
     if failures:
         print(f"SELFTEST FAILED ({failures} arms)")
         return 1
@@ -510,23 +674,35 @@ def main() -> int:
         print("usage: <repo_root> | --root <repo_root> | --selftest", file=sys.stderr)
         return 2
     import os
-    path = os.path.join(root, TARGET)
-    try:
-        src = open(path).read()
-    except OSError as e:
-        print(f"cannot read {path}: {e}", file=sys.stderr)
+
+    def read_target(rel):
+        path = os.path.join(root, rel)
+        try:
+            return open(path).read()
+        except OSError as e:
+            print(f"cannot read {path}: {e}", file=sys.stderr)
+            return None
+
+    src = read_target(TARGET)
+    if src is None:
+        return 2
+    pool_src = read_target(POOL_TARGET)
+    if pool_src is None:
         return 2
     errs = check(src)
     vp_errs = check_viewport(src)
-    if errs or vp_errs:
-        print(f"browser_cookie_ui_refresh_check RED on {TARGET}:")
+    pool_errs = check_pool_ua(pool_src)
+    if errs or vp_errs or pool_errs:
+        print("browser_cookie_ui_refresh_check RED on %s (+ %s):" % (TARGET, POOL_TARGET))
         for e in errs:
             print(f"  - {e}")
         for e in vp_errs:
             print(f"  - [viewport] {e}")
+        for e in pool_errs:
+            print(f"  - [pool] {e}")
         return 1
     print(f"browser_cookie_ui_refresh_check OK ({TARGET}; cookie refresh + "
-          f"viewport/session-override wiring)")
+          f"viewport/session-override + UA-pool wiring; {POOL_TARGET} checked too)")
     return 0
 
 

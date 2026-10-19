@@ -719,6 +719,12 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
             BrowserAction.CLOSE_TAB -> closeTab(input.tabId)
             BrowserAction.LIST_TABS -> listTabs()
             BrowserAction.SET_VIEWPORT -> handleSetViewport(input)
+            // [da1030-B] The UA is a pool-wide setting persisted to the same
+            // `browser_prefs` keys the settings sheet writes, so route it
+            // through the pool: the single-tab fallback path below applied it
+            // to one tab and skipped the viewport replay, leaving the other
+            // tabs (and the sheet) on the old profile.
+            BrowserAction.SET_USER_AGENT -> handleSetUserAgent(input)
             else -> {
                 // [T-browser-use-per-tab-serial-android] Serialize per explicit
                 // tab id. Only an explicit tab_id that names an EXISTING tab can
@@ -1609,6 +1615,40 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
         }
         setSessionViewport(w, h)
         BrowserActionResult(text = "Viewport set to ${w}x$h (session override)")
+    }
+
+    /**
+     * [da1030-B] Pool-wide `set_user_agent`. A tool call carries only the
+     * profile name, so the stored custom UA string (typed in the settings
+     * sheet, restored from prefs) is reused verbatim for
+     * [UserAgentProfile.CUSTOM] instead of being cleared — switching away from
+     * CUSTOM keeps it stored so switching back restores the same UA.
+     *
+     * Mirrors [handleSetViewport]: publishes both the live tabs and the
+     * persisted setting, then replays the *resolved* viewport, because
+     * `setUserAgent` resets each tab's layout to the new profile's default and
+     * would otherwise silently clobber a session/global custom override.
+     */
+    private suspend fun handleSetUserAgent(input: BrowserActionInput): BrowserActionResult = withContext(Dispatchers.Main) {
+        val newProfile = input.userAgent
+            ?: return@withContext BrowserActionResult.error("set_user_agent requires --user-agent")
+        val customUA = if (newProfile == UserAgentProfile.CUSTOM) customUserAgentString else null
+        userAgentProfile = newProfile
+        for (tab in _tabs.value) {
+            tab.manager.setUserAgent(newProfile, customUA)
+        }
+        // Same keys the settings sheet writes — one meaning, one source of
+        // truth, so a sheet reopened after an agent-driven switch seeds from
+        // the new profile instead of the stale prefs snapshot.
+        val prefs = context.getSharedPreferences("browser_prefs", Context.MODE_PRIVATE)
+        val editor = prefs.edit().putString("user_agent_profile", newProfile.name)
+        if (newProfile == UserAgentProfile.CUSTOM && !customUA.isNullOrEmpty()) {
+            editor.putString("custom_user_agent", customUA)
+        }
+        editor.apply()
+        applyViewportToAllTabs()
+        val (w, h) = resolvedViewportSize()
+        BrowserActionResult(text = "Switched to ${newProfile.value} (${w}x$h)")
     }
 
     // -- Disk Persistence --
