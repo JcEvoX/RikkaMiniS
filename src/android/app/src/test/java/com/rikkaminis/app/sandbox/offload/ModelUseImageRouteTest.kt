@@ -299,4 +299,52 @@ class ModelUseImageRouteTest {
         assertEquals("", ModelUseProtocol.imageParamHint("m", ProviderType.openAI, listOf("text")))
         assertEquals("", ModelUseProtocol.imageParamHint("m", null, image))
     }
+
+    // ── [da1031-D ISSUE-08] the extracted eligibility judge ──────────────
+
+    @Test
+    fun `supportsImageApiRoute is the provider-credential leg of the route`() {
+        // OpenAI-wire provider + an Images-API type + a non-oauth credential.
+        assertTrue(ModelUseProtocol.supportsImageApiRoute(ProviderType.openAI, ProviderCredential.apiKey, true))
+        assertTrue(ModelUseProtocol.supportsImageApiRoute(ProviderType.openRouter, ProviderCredential.apiKey, true))
+        assertTrue(ModelUseProtocol.supportsImageApiRoute(ProviderType.xAI, ProviderCredential.apiKey, true))
+        // OAuth has no API key to put in the Images API header.
+        assertFalse(ModelUseProtocol.supportsImageApiRoute(ProviderType.openAI, ProviderCredential.oauth, true))
+        // kimiCode speaks the OpenAI wire protocol but is not an Images-API type.
+        assertFalse(ModelUseProtocol.supportsImageApiRoute(ProviderType.kimiCode, ProviderCredential.apiKey, true))
+        // Non-OpenAI-wire providers are refused by the compat arm.
+        assertFalse(ModelUseProtocol.supportsImageApiRoute(ProviderType.gemini, ProviderCredential.apiKey, false))
+        assertFalse(ModelUseProtocol.supportsImageApiRoute(ProviderType.anthropic, ProviderCredential.apiKey, false))
+        // An unknown provider type is not rescued by a truthy compat flag.
+        assertFalse(ModelUseProtocol.supportsImageApiRoute(null, ProviderCredential.apiKey, true))
+        // An unknown credential is fine — only oauth is excluded.
+        assertTrue(ModelUseProtocol.supportsImageApiRoute(ProviderType.openAI, null, true))
+    }
+
+    @Test
+    fun `decideImageRoute refuses exactly whoever supportsImageApiRoute refuses`() {
+        // The extraction must not move the boundary: every (type, cred, compat)
+        // tuple the predicate refuses still lands on ChatPath, and an accepted
+        // one still reaches the Images API.
+        val refused = listOf(
+            Triple(ProviderType.kimiCode, ProviderCredential.apiKey, true),
+            Triple(ProviderType.gemini, ProviderCredential.apiKey, false),
+            Triple(ProviderType.anthropic, ProviderCredential.apiKey, false),
+            Triple(ProviderType.openAI, ProviderCredential.oauth, true),
+        )
+        for ((type, cred, compat) in refused) {
+            val label = "$type/$cred/compat=$compat"
+            assertFalse(label, ModelUseProtocol.supportsImageApiRoute(type, cred, compat))
+            assertEquals(
+                label,
+                chatPath,
+                decide(type = type, cred = cred, compat = compat, ext = "png", mode = ImageEndpointMode.imagesGenerations),
+            )
+        }
+        assertTrue(ModelUseProtocol.supportsImageApiRoute(ProviderType.openRouter, ProviderCredential.apiKey, true))
+        assertEquals(
+            gen(ImageEndpointMode.imagesGenerations),
+            decide(type = ProviderType.openRouter, ext = "png", mode = ImageEndpointMode.imagesGenerations),
+        )
+    }
 }
