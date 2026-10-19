@@ -232,7 +232,12 @@ class TerminalSession(private val context: Context) {
                 // old handler only flipped the state, orphaning a live shell
                 // process that nothing would ever reap.
                 termuxSession?.let { s ->
-                    termuxSession = null
+                    // [da1032-D] Release ONLY the slot this attempt owns: a
+                    // newer start() can already have installed its own PTY
+                    // while this coroutine was failing (same ownership family
+                    // as the generation guards above). Killing `s` stays
+                    // unconditional — it is this attempt's dead PTY either way.
+                    if (termuxSession === s) termuxSession = null
                     runCatching { killTermuxProcessTree(s) }
                         .onFailure { Log.w(TAG, "cleanup after start failure: ${it.message}") }
                 }
@@ -584,7 +589,13 @@ class TerminalSession(private val context: Context) {
             // session — later attach()/sendInput() calls then targeted a
             // finished process instead of starting a fresh one.
             startGeneration.incrementAndGet()
-            termuxSession = null
+            // [da1032-D] Ownership-gated release: this callback can land after a
+            // newer start() installed its own PTY (e.g. the screen was re-entered
+            // while the old shell was exiting). Clearing the slot unconditionally
+            // would strand the live session — exactly the stale-teardown family
+            // `claim_release_guard.py` watches. The state/bookkeeping lines below
+            // keep their historical behaviour.
+            if (termuxSession === changedSession) termuxSession = null
             if (_state.value != State.STOPPED) _state.value = State.STOPPED
             liveSessions.removeAll { it.get() === this@TerminalSession || it.get() == null }
         }
