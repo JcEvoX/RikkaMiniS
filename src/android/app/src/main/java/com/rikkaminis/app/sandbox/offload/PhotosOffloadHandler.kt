@@ -226,6 +226,16 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
             Manifest.permission.READ_EXTERNAL_STORAGE
         }
         if (ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED) return true
+        // [da1034-A3] ISSUE-06: A13+ gates each media class separately and the
+        // check above asks about images only, so a user who granted ONLY
+        // READ_MEDIA_VIDEO was refused every video subcommand with a hint to go
+        // grant the photos permission they had already granted. Either class
+        // satisfies the gate; the queries themselves stay filtered by the
+        // system (an ungranted collection reads back empty rows, not an error).
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.READ_MEDIA_VIDEO) ==
+            PackageManager.PERMISSION_GRANTED
+        ) return true
         // A14+ partial access counts
         if (Build.VERSION.SDK_INT >= 34) {
             val partial = "android.permission.READ_MEDIA_VISUAL_USER_SELECTED"
@@ -253,6 +263,10 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
         val requestList = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             buildList {
                 add(Manifest.permission.READ_MEDIA_IMAGES)
+                // [da1034-A3] ISSUE-06: ask for the video class too. Without it
+                // the dialog could never produce a grant that the video path
+                // accepts, so re-granting "Photos" left clips invisible.
+                add(Manifest.permission.READ_MEDIA_VIDEO)
                 if (Build.VERSION.SDK_INT >= 34) add("android.permission.READ_MEDIA_VISUAL_USER_SELECTED")
             }
         } else {
@@ -506,6 +520,11 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
      *
      * --size thumb / medium re-encode to JPEG at 256px / 1024px max edge
      * via BitmapFactory; original copies the resource bytes as-is.
+     *
+     * [da1034-A3] Video assets are ALWAYS a verbatim copy, whatever `--size`
+     * says (BitmapFactory cannot decode video), so their output keeps the real
+     * container extension, `format` reports `original`, and `size_note` records
+     * that the requested size was ignored.
      */
     private fun handleExport(args: OffloadArgs): NativeOffloadResult {
         val id = args.getLong("id")
@@ -559,15 +578,17 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
         // bound. Same 24h contract as cache/share. Handler runs on the offload
         // server's worker thread, so the dir walk is off the main thread.
         com.rikkaminis.app.ui.components.pruneShareDir(outDir)
-        val safeName = displayName.replace(Regex("[^A-Za-z0-9._-]"), "_").take(64)
-        val ext = displayName.substringAfterLast('.', "")
-            .ifEmpty { if (mediaType == "video") "mp4" else "jpg" }
-        val sizeSuffix = if (size == "original") "" else "_$size"
-        val outFile = File(outDir, "${id}${sizeSuffix}_$safeName${if (size == "original") "" else ".jpg"}")
-            .let { if (it.name.endsWith(".$ext", true) || size != "original") it else File(outDir, "${id}${sizeSuffix}_$safeName.$ext") }
+        val safeName = exportSafeName(displayName)
+        val ext = exportExt(displayName, mediaType)
+        // [da1034-A3] ISSUE-05: a video is copied verbatim for EVERY --size
+        // (BitmapFactory cannot decode video), so the output must not be named
+        // `…_thumb_x.jpg` — that lied twice, in the size marker and in the
+        // container, about bytes that are an untouched mp4.
+        val copiesSourceBytes = exportCopiesSourceBytes(size, mediaType)
+        val outFile = File(outDir, exportFileName(id, size, mediaType, safeName, ext))
 
         return try {
-            val bytesWritten = if (size == "original" || mediaType == "video") {
+            val bytesWritten = if (copiesSourceBytes) {
                 copyStream(src, outFile)
             } else {
                 val maxEdge = if (size == "thumb") 256 else 1024
@@ -579,9 +600,17 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
                 .put("host_path", outFile.absolutePath)
                 .put("size_bytes", bytesWritten)
                 .put("media_type", mediaType)
-                .put("format", if (size == "original") "original" else "jpeg")
+                .put("format", exportFormatLabel(size, mediaType))
                 .put("export_size", size)
                 .put("note", "Written to host filesDir; reachable as `host_path` via shell tools. Linux-side bind-mount path varies per session.")
+            // [da1034-A3] ISSUE-05: `export_size` records the size the caller
+            // ASKED for, which for a video is not applied at all. Spelled out
+            // in its own key rather than folded into `note` (that constant is
+            // about where the file landed) because the fact is conditional on
+            // the media kind — a photo export has nothing to say here.
+            if (mediaType == "video") {
+                data.put("size_note", "video assets are always copied as-is; --size is ignored for videos")
+            }
             if (width > 0) data.put("width", width)
             if (height > 0) data.put("height", height)
             NativeOffloadResult(0, OffloadOutput.formatBody(data.toString(2), args) + "\n")
@@ -1017,9 +1046,33 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
                 totalSize += c.getLong(1)
             }
         }
+        // [da1034-A3] ISSUE-06: the second half of the A13+ media pair. Rows
+        // come back empty (not an error) when READ_MEDIA_VIDEO is not granted,
+        // which is exactly what `hasMediaPermission` now accepts.
+        var videoCount = 0L
+        var videoSize = 0L
+        context.contentResolver.query(
+            MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+            arrayOf(MediaStore.Video.Media.SIZE),
+            null, null, null,
+        )?.use { c ->
+            while (c.moveToNext()) {
+                videoCount++
+                videoSize += c.getLong(0)
+            }
+        }
         val json = JSONObject()
             .put("total_photos", count)
             .put("total_size_mb", String.format("%.1f", totalSize / 1e6))
+            // [da1034-A3] ISSUE-06: this function only ever queried
+            // MediaStore.Images, so a device full of clips answered
+            // `total_photos: 0` with nothing to say that videos had been left
+            // out of the count. Videos now report in their OWN keys:
+            // `total_size_mb` keeps pairing with `total_photos` (folding video
+            // bytes in would make the per-photo average a lie) and
+            // `earliest`/`latest` below keep their images-only meaning.
+            .put("total_videos", videoCount)
+            .put("total_video_size_mb", String.format("%.1f", videoSize / 1e6))
         if (earliest < Long.MAX_VALUE) json.put("earliest", formatDateTime(earliest))
         if (latest > 0) json.put("latest", formatDateTime(latest))
         return json.toString(2)
@@ -1291,4 +1344,61 @@ internal fun resolvePhotoRange(
         return PhotoRange.Invalid("--end", endRaw.orEmpty())
     }
     return PhotoRange.Window(startMs, endMs)
+}
+
+// ── [da1034-A3] ISSUE-05 pure export-shape helpers ────────────────────────────
+// Same split as the date helpers above: top-level, zero Android deps, so the
+// JVM test source set pins them directly — and the naming/format decisions have
+// ONE home instead of being spelled inline at the export call site.
+
+/**
+ * File-name stem for `export`: every character outside `[A-Za-z0-9._-]` folds
+ * to `_`, capped at 64 chars. Behaviour unchanged — extracted verbatim so the
+ * video path below shares it instead of re-copying the regex.
+ */
+internal fun exportSafeName(displayName: String): String =
+    displayName.replace(Regex("[^A-Za-z0-9._-]"), "_").take(64)
+
+/**
+ * Container extension to write for an export: the asset's own trailing
+ * extension, else `mp4` for a video / `jpg` for a photo.
+ */
+internal fun exportExt(displayName: String, mediaType: String): String =
+    displayName.substringAfterLast('.', "")
+        .ifEmpty { if (mediaType == "video") "mp4" else "jpg" }
+
+/**
+ * True when `export` writes the source bytes untouched.
+ *
+ * Videos are verbatim for EVERY `--size` — BitmapFactory cannot decode them, so
+ * there is no frame to re-encode; photos are verbatim only at `original`.
+ */
+internal fun exportCopiesSourceBytes(size: String, mediaType: String): Boolean =
+    size == "original" || mediaType == "video"
+
+/** `format` field of the export JSON: `original` iff the bytes were not re-encoded. */
+internal fun exportFormatLabel(size: String, mediaType: String): String =
+    if (exportCopiesSourceBytes(size, mediaType)) "original" else "jpeg"
+
+/**
+ * Output file name for an export.
+ *
+ * A re-encoded photo (`thumb` / `medium`) is always JPEG, hence the forced
+ * `.jpg`. Everything else keeps the asset's real extension — the old form
+ * applied `.jpg` to every non-`original` export, so a video's untouched bytes
+ * landed in a file named `…_thumb_clip.jpg`.
+ */
+internal fun exportFileName(
+    id: Long,
+    size: String,
+    mediaType: String,
+    safeName: String,
+    ext: String,
+): String {
+    val sizeSuffix = if (size == "original") "" else "_$size"
+    val copiesSource = exportCopiesSourceBytes(size, mediaType)
+    val base = "${id}${sizeSuffix}_$safeName${if (copiesSource) "" else ".jpg"}"
+    // Verbatim copies keep the real container extension; the forced `.jpg`
+    // above only applies to re-encoded photos.
+    return if (copiesSource && !base.endsWith(".$ext", ignoreCase = true)) "$base.$ext" else base
 }
