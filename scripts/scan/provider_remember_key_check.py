@@ -112,6 +112,37 @@ Criteria (each fail-closed: missing anchor = RED, never silent skip):
       (state must not be written during composition). New-rule paths (`isNew` / `existingId == null`) seed from
       the request itself and must NOT be flagged.
 
+  C16 EnvironmentVariablesScreen [da1034-B4] — the Add/Edit sheet is opened for an
+      ID (`editEntryId`), and the target is re-resolved from the LIVE list every
+      composition. When the entry is deleted externally (`minis-config remove
+      envvars.<KEY>` / backup restore) the lookup yields null while `editEntryId`
+      stays non-null, so `EnvVarFormSheet` silently drops to new-variable semantics
+      (`isEditing == false`) and Save creates a NEW entry under the key the user
+      believes they are editing. The derivation must therefore be paired with a
+      close effect: a `LaunchedEffect` keyed on BOTH `editEntryId` and the list it
+      resolves against (`entries`), which resets `editEntryId` when the target is
+      gone. Graded on the DECISION (does it close ONLY when the target vanished),
+      not the spelling: an inline existence test (`entries.none { … }`,
+      `indexOfFirst(…) < 0`) counts, and so does a call to a file-local helper
+      whose own body carries such a test (the helper is the decision point, kept
+      pure so a JVM test can run it for real) — the same "decision, not spelling"
+      rule as C14/C15. Closing unconditionally does NOT count (that would dismiss
+      the sheet on any recomposition), and neither does the neighbouring deep-link
+      effect, which also assigns `editEntryId = null` but derives from the pending
+      request. Fail-closed when the edit gate / the resolving derivation is gone.
+
+  C17 WebDavConfigDialog [da1034-B4] — the four form states are seeded from
+      `initial`, which the screen fills in ASYNCHRONOUSLY (`LaunchedEffect` →
+      `webDavStore.load()`, first frame `null` — [deep-audit-1033 I08]). A keyless
+      `remember` froze the boxes at the first composition's value, so opening the
+      dialog in the null window showed four empty fields and Save wrote those
+      empties back over the real config. Every `remember(...)` inside the dialog
+      whose initializer reads `initial?.<field>` must key on `initial`; states that
+      derive from nothing (`testing` / `testResult` / `confirmClearPassword`) stay
+      keyless and are NOT graded. Same "initializer read" rule as C14 (counting the
+      key list would be tautological). Fail-closed when the dialog is gone or no
+      state derives from `initial.` any more (re-derive rather than delete).
+
 Usage:
   python3 provider_remember_key_check.py <repo_root>   # real-tree mode
   python3 provider_remember_key_check.py --selftest    # fixture mode
@@ -144,6 +175,9 @@ REL_THINKING_SECTION = "src/android/app/src/main/java/com/rikkaminis/app/ui/sett
 REL_THINKING_RESOLVER = "src/android/app/src/main/java/com/rikkaminis/app/provider/thinking/ThinkingRuleResolver.kt"
 # da1033-E (I06 / I07)
 REL_THINKING_EDITOR = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/ThinkingRuleEditor.kt"
+# da1034-B4 (B-07 / B-08)
+REL_ENVVAR_SCREEN = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/EnvironmentVariablesScreen.kt"
+REL_BACKUP_SCREEN = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/BackupSettingsScreen.kt"
 
 # ---- [da1030-C ISSUE-05] C12 / C13 ----
 # The collected revision local may be named either way; both spellings are the
@@ -183,6 +217,24 @@ DERIVED_TOKEN_RE = re.compile(
 # C8 / C9 — the field families the two detail screens edit.
 GROUP_FIELD_RE = re.compile(r"\bgroup\.[A-Za-z_][A-Za-z0-9_]*")
 ENTRY_FIELD_RE = re.compile(r"\bentry\.[A-Za-z_][A-Za-z0-9_]*")
+
+# ---- [da1034-B4] C16 / C17 ----
+# C16 — the Add/Edit sheet of EnvironmentVariablesScreen: the edit gate, the
+# derivation that can silently degrade to "new variable", and the close effect.
+ENVVAR_EDIT_GATE_RE = re.compile(r"if\s*\(\s*showAddSheet\s*\|\|\s*editEntryId\s*!=\s*null\s*\)")
+ENVVAR_EDITING_ANCHOR_RE = re.compile(r"editEntryId\?\.let\s*\{[^}]*entries\.find\s*\{")
+ENVVAR_CLOSE_EFFECT_RE = re.compile(
+    r"LaunchedEffect\s*\(([^)]*)\)\s*\{[\s\S]{0,900}?\beditEntryId\s*=\s*null")
+# The existence test on the close path — inline, or inside a file-local helper the
+# effect calls. `\< 0` / `== null` cover the index/lookup spellings the sibling
+# criteria (C15b) already use; `.none` is the collection spelling.
+VANISHED_EXISTS_RE = re.compile(
+    r"\.none\s*[\({]|\.indexOfFirst\s*\(|\.indexOf\s*\(|<\s*0|==\s*-1|!in\b|==\s*null"
+    r"|isEmpty\(\)|isNotEmpty\(\)")
+IDENT_CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+# C17 — the WebDav dialog's states seeded from its `initial` argument.
+INITIAL_FIELD_RE = re.compile(r"\binitial\?\.[A-Za-z_][A-Za-z0-9_]*")
+WEBCONFIG_DIALOG = "WebDavConfigDialog"
 
 
 def strip_comments(text):
@@ -882,6 +934,111 @@ def check_thinking_dialog_seed(code):
                         "rule is gone"))
     return results
 
+
+def _close_condition_tests_vanished(code, span):
+    """C16 arm — does this close-effect's condition test the edit target for
+    existence? Graded on the decision, not the spelling: an inline collection /
+    index test counts, and so does a call to a file-local helper whose own body
+    carries such a test (the helper is the decision point, kept pure for the JVM
+    test). Closing unconditionally counts as NO."""
+    if VANISHED_EXISTS_RE.search(span):
+        return True, "inline existence test"
+    for name in IDENT_CALL_RE.findall(span):
+        body = func_body(code, name)
+        if body is not None and VANISHED_EXISTS_RE.search(body):
+            return True, "via helper %s()" % name
+    return False, "close path carries no existence test"
+
+
+def check_envvar_screen(code):
+    """C16 [da1034-B4] — the env-var edit sheet must close when its target vanishes.
+
+    The sheet is opened for an ID; the target is re-resolved from the live list
+    every composition. An external delete (`minis-config remove envvars.<KEY>` /
+    backup restore) leaves `editEntryId` non-null while the lookup yields null, so
+    the form sheet drops to new-variable semantics and Save creates a NEW entry
+    under the key the user believes they are editing.
+
+    Fail-closed arms: the edit gate line and the resolving derivation must both be
+    present. The close effect must (a) key on BOTH `editEntryId` and `entries`
+    (keying on the id alone would not re-run when the list loses the entry) and
+    (b) close only when the target is gone (decision, not spelling — see
+    _close_condition_tests_vanished)."""
+    results = []
+    if not ENVVAR_EDIT_GATE_RE.search(code):
+        results.append(("C16", False,
+                        "anchor `if (showAddSheet || editEntryId != null)` not found "
+                        "(fail-closed: the sheet was reworked, re-derive this criterion)"))
+        return results
+    if not ENVVAR_EDITING_ANCHOR_RE.search(code):
+        results.append(("C16", False,
+                        "anchor `editEntryId?.let { … entries.find … }` not found (fail-closed: "
+                        "the resolving derivation was reworked, re-derive this criterion)"))
+        return results
+    best = None
+    ok = False
+    for m in ENVVAR_CLOSE_EFFECT_RE.finditer(code):
+        keys = m.group(1)
+        span = m.group(0)
+        if "editEntryId" not in keys or "entries" not in keys:
+            best = best or ("no close effect keyed on (editEntryId, entries) — the "
+                            "deep-link effect also writes `editEntryId = null` but derives "
+                            "from the pending request")
+            continue
+        tested, why = _close_condition_tests_vanished(code, span)
+        if tested:
+            ok = True
+            best = ("a LaunchedEffect keyed on (editEntryId, entries) closes the sheet "
+                    "when the live lookup says the entry is gone (%s)" % why)
+        else:
+            best = "close effect does not test the edit target for existence (%s)" % why
+        break
+    results.append(("C16", ok, best or "no close effect for the edit sheet"))
+    return results
+
+
+def check_webdav_dialog(code):
+    """C17 [da1034-B4] — every state seeded from the dialog's `initial` re-seeds with it.
+
+    `initial` arrives asynchronously (the screen fills it in inside a LaunchedEffect,
+    first frame null — [deep-audit-1033 I08]), so a keyless `remember` froze the four
+    form fields at the first composition's value and Save wrote those empties back
+    over the real config.
+
+    Same "initializer read" rule as C14: only the initializer counts as a read.
+    Fail-closed: the dialog body must exist and at least one remember must derive
+    from `initial.` (dialog reworked → re-derive rather than silently pass)."""
+    results = []
+    body = func_body(code, WEBCONFIG_DIALOG)
+    if body is None:
+        results.append(("C17", False,
+                        "no `fun WebDavConfigDialog(` body found (fail-closed: the dialog "
+                        "was dropped or renamed, re-derive this criterion)"))
+        return results
+    derived = 0
+    bad = []
+    for line_no, keys, _span, init in iter_remember_calls(body, "remember"):
+        sources = sorted(set(INITIAL_FIELD_RE.findall(init)))
+        if not sources:
+            continue  # derives from nothing (testing / testResult …) — not graded
+        derived += 1
+        if keys is None:
+            bad.append("L%d: keyless remember derives from %s" % (line_no, ",".join(sources)))
+            continue
+        if "initial" not in keys:
+            bad.append("L%d: initializer derives from %s but keys=[%s] cannot see an "
+                       "async / restore update of the config"
+                       % (line_no, ",".join(sources), " ".join(keys.split())))
+    if derived == 0:
+        results.append(("C17", False,
+                        "no remember call in WebDavConfigDialog derives from `initial.` "
+                        "(fail-closed: the dialog was reworked, re-derive this criterion)"))
+        return results
+    results.append(("C17", not bad,
+                    "all %d initial-derived remember call(s) key on the config they were "
+                    "seeded from" % derived if not bad else "; ".join(bad)))
+    return results
+
 CHECKERS = (
     (REL_PROVIDER_LIST, check_provider_list),
     (REL_SHEET, check_sheet),
@@ -896,6 +1053,8 @@ CHECKERS = (
     (REL_THINKING_RESOLVER, check_thinking_resolver),
     (REL_THINKING_SECTION, check_thinking_dialog_seed),
     (REL_THINKING_EDITOR, check_thinking_editor),
+    (REL_ENVVAR_SCREEN, check_envvar_screen),
+    (REL_BACKUP_SCREEN, check_webdav_dialog),
 )
 
 
@@ -1458,6 +1617,136 @@ FIX_THINKING_EDITOR_MISSING_ANCHOR = """package com.rikkaminis.app.ui.settings
 fun unrelated() {}
 """
 
+# --- da1034-B4 (C16) fixtures: the env-var edit sheet's disappearance recheck ---
+
+# The real shape: the deep-link effect (which also writes `editEntryId = null`
+# but derives from the pending request) sits NEXT TO the close effect, so a
+# criterion that merely looked for "some effect nulling editEntryId" would be
+# satisfied by the wrong one. The keyless UI flags here are deliberate: C16
+# grades the close effect, not every remember in the file.
+FIX_ENVVAR_CLEAN = """package com.rikkaminis.app.ui.settings
+
+internal fun editTargetVanished(
+    entries: List<EnvVarRepository.EnvVarEntry>,
+    editEntryId: String?,
+): Boolean {
+    if (editEntryId == null) return false
+    return entries.none { it.id == editEntryId }
+}
+
+@Composable
+fun EnvironmentVariablesScreen(envVarRepository: EnvVarRepository, onBack: () -> Unit) {
+    val entries by envVarRepository.entries.collectAsState()
+    var showAddSheet by remember { mutableStateOf(false) }
+    var editEntryId by remember { mutableStateOf<String?>(null) }
+    var deleteEntryId by remember { mutableStateOf<String?>(null) }
+    val visibleKeys = remember { mutableStateOf(setOf<String>()) }
+    val pendingCreate by DeepLinkCoordinator.pendingEnvVarCreate.collectAsState()
+    LaunchedEffect(pendingCreate) {
+        pendingCreate?.let {
+            editEntryId = null
+            showAddSheet = true
+            DeepLinkCoordinator.consumePendingEnvVarCreate()
+        }
+    }
+    if (showAddSheet || editEntryId != null) {
+        LaunchedEffect(editEntryId, entries) {
+            if (editTargetVanished(entries, editEntryId)) {
+                editEntryId = null
+            }
+        }
+        val editing = editEntryId?.let { id -> entries.find { it.id == id } }
+        EnvVarFormSheet(editEntry = editing, envVarRepository = envVarRepository)
+    }
+}
+"""
+
+# The pre-fix tree: the sheet is opened for an id and the target is resolved from
+# the live list, but nothing closes it when that lookup stops resolving.
+FIX_ENVVAR_PREFIX = FIX_ENVVAR_CLEAN.replace(
+    """        LaunchedEffect(editEntryId, entries) {
+            if (editTargetVanished(entries, editEntryId)) {
+                editEntryId = null
+            }
+        }
+""", "")
+
+# Closes on every recomposition instead of only when the target is gone.
+FIX_ENVVAR_UNCONDITIONAL_CLOSE = FIX_ENVVAR_CLEAN.replace(
+    """        LaunchedEffect(editEntryId, entries) {
+            if (editTargetVanished(entries, editEntryId)) {
+                editEntryId = null
+            }
+        }""",
+    """        LaunchedEffect(editEntryId, entries) {
+            editEntryId = null
+        }""")
+
+# The lookup is against the list, so the effect must re-run when the list moves:
+# keyed on the id alone it never notices the entry disappearing.
+FIX_ENVVAR_NO_ENTRIES_KEY = FIX_ENVVAR_CLEAN.replace(
+    "LaunchedEffect(editEntryId, entries) {", "LaunchedEffect(editEntryId) {")
+
+FIX_ENVVAR_MISSING_ANCHOR = """package com.rikkaminis.app.ui.settings
+
+fun unrelated() {}
+"""
+
+# --- da1034-B4 (C17) fixtures: the WebDav dialog's initial-seeded states --------
+
+FIX_BACKUP_CLEAN = """package com.rikkaminis.app.ui.settings
+
+@Composable
+private fun WebDavConfigDialog(
+    initial: WebDavConfig?,
+    httpClient: OkHttpClient,
+    onDismiss: () -> Unit,
+    onSave: (WebDavConfig) -> Unit,
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var url by remember(initial) { mutableStateOf(initial?.url.orEmpty()) }
+    var username by remember(initial) { mutableStateOf(initial?.username.orEmpty()) }
+    var password by remember(initial) { mutableStateOf(initial?.password.orEmpty()) }
+    var path by remember(initial) {
+        mutableStateOf(initial?.path ?: WebDavConfig.DEFAULT_BACKUP_DIR)
+    }
+    var testing by remember { mutableStateOf(false) }
+    var testResult by remember { mutableStateOf<String?>(null) }
+    var confirmClearPassword by remember { mutableStateOf(false) }
+    val runTest: () -> Unit = runTest@{
+        val cfg = WebDavConfig(
+            url = url,
+            username = username,
+            password = password.ifBlank { initial?.password.orEmpty() },
+            path = path,
+        )
+        if (cfg.url.isBlank() || cfg.username.isBlank()) {
+            return@runTest
+        }
+        scope.launch { testing = true }
+    }
+}
+"""
+
+# The pre-fix shape: four keyless states frozen at the first composition's
+# `initial` (which is still null while the async load runs).
+FIX_BACKUP_KEYLESS = FIX_BACKUP_CLEAN.replace("remember(initial) {", "remember {")
+
+# Half-fixed: the value boxes re-seed, the credential/path ones do not.
+FIX_BACKUP_PARTIAL = FIX_BACKUP_CLEAN.replace(
+    "var password by remember(initial) {", "var password by remember {").replace(
+    "var path by remember(initial) {", "var path by remember {")
+
+# Keyed, but on something that cannot move when `initial` moves.
+FIX_BACKUP_FOREIGN_KEY = FIX_BACKUP_CLEAN.replace(
+    "var url by remember(initial) {", "var url by remember(httpClient) {")
+
+FIX_BACKUP_MISSING_ANCHOR = """package com.rikkaminis.app.ui.settings
+
+fun unrelated() {}
+"""
+
 CLEAN_TREE = {
     REL_PROVIDER_LIST: FIX_PROVIDER_LIST_CLEAN,
     REL_SHEET: FIX_SHEET_CLEAN,
@@ -1471,6 +1760,8 @@ CLEAN_TREE = {
     REL_THINKING_SECTION: FIX_THINKING_CLEAN,
     REL_THINKING_RESOLVER: FIX_THINKING_RESOLVER_CLEAN,
     REL_THINKING_EDITOR: FIX_THINKING_EDITOR_CLEAN,
+    REL_ENVVAR_SCREEN: FIX_ENVVAR_CLEAN,
+    REL_BACKUP_SCREEN: FIX_BACKUP_CLEAN,
 }
 
 
@@ -1657,6 +1948,29 @@ def run_selftest():
              missing(REL_THINKING_EDITOR), failures, ("FILE",))
     run_case("failclosed-missing-editor-anchor", 1,
              variant(REL_THINKING_EDITOR, FIX_THINKING_EDITOR_MISSING_ANCHOR), failures, ("C14",))
+    # --- da1034-B4: C16 (env-var edit target disappearance) -----------------
+    run_case("c16-envvar-prefix-no-close-effect", 1,
+             variant(REL_ENVVAR_SCREEN, FIX_ENVVAR_PREFIX), failures, ("C16",))
+    run_case("c16-envvar-unconditional-close", 1,
+             variant(REL_ENVVAR_SCREEN, FIX_ENVVAR_UNCONDITIONAL_CLOSE), failures, ("C16",))
+    run_case("c16-envvar-close-missing-entries-key", 1,
+             variant(REL_ENVVAR_SCREEN, FIX_ENVVAR_NO_ENTRIES_KEY), failures, ("C16",))
+    run_case("failclosed-missing-envvar-anchor", 1,
+             variant(REL_ENVVAR_SCREEN, FIX_ENVVAR_MISSING_ANCHOR), failures, ("C16",))
+    # precision: the clean fixture carries the deep-link effect (which also writes
+    # `editEntryId = null`) plus keyless UI flags and stays green — C16 grades the
+    # close effect, not every effect / remember in the file.
+    # --- da1034-B4: C17 (WebDav dialog seeds) -------------------------------
+    run_case("c17-webdav-keyless-seeds", 1,
+             variant(REL_BACKUP_SCREEN, FIX_BACKUP_KEYLESS), failures, ("C17",))
+    run_case("c17-webdav-partial-keys", 1,
+             variant(REL_BACKUP_SCREEN, FIX_BACKUP_PARTIAL), failures, ("C17",))
+    run_case("c17-webdav-foreign-key", 1,
+             variant(REL_BACKUP_SCREEN, FIX_BACKUP_FOREIGN_KEY), failures, ("C17",))
+    run_case("failclosed-missing-backup-anchor", 1,
+             variant(REL_BACKUP_SCREEN, FIX_BACKUP_MISSING_ANCHOR), failures, ("C17",))
+    run_case("failclosed-missing-backup-file", 1,
+             missing(REL_BACKUP_SCREEN), failures, ("FILE",))
     if failures:
         print("SELFTEST FAILURES:")
         for f in failures:
