@@ -44,6 +44,24 @@ handler that forgot to declare its own):
      a `--key value` pair (`android-speak --stop now` stored "now" as the
      value of `--stop`, so the stop branch was never reached).
 
+[da1033-D] addition (ISSUE-04 — the payload that reaches `formatBody` is JSON):
+
+  7. `PhotosOffloadHandler` / `ContactsOffloadHandler` must never hand
+     `OffloadOutput.formatBody` a *bare* string literal, and must never
+     `return` one from a payload helper. `formatBody` only re-shapes JSON —
+     prose passes straight through, so `android-photos near` (empty radius)
+     and `android-contacts search|get|list` (empty result / no cursor) used to
+     exit 0 with an English sentence and break every downstream `jq` /
+     `json.loads`; `near` additionally returned a bare JSONArray when it was
+     NOT empty, so even the top-level type flipped with the result. Accepted
+     shapes: variables, expressions (`JSONObject()…toString()`,
+     `arr.toString(2)`, a helper call) and literals that already carry `{` /
+     `[`. Judged on code-only text, so a prose payload quoted in a comment
+     cannot satisfy OR trip the rule. Two spellings are pinned because the
+     Photos payload is *returned* by a String-returning helper and therefore
+     arrives at the call site as a variable: N1 (first argument) and N2
+     (`return <literal>`).
+
 Comment-aware: judgements run on code-only text, so a comment quoting a
 forbidden pattern cannot satisfy the gate (and deleting a pinned line cannot
 be masked by prose).
@@ -64,6 +82,7 @@ BROWSERUSE = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/B
 FASTIO = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/FastioOffloadHandler.kt"
 OUTPUT = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/OffloadOutput.kt"
 SPEAK = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/SpeakOffloadHandler.kt"
+PHOTOS = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/PhotosOffloadHandler.kt"
 
 # (id, kind, needle) — kind: "req" exact substring / "forbid" exact substring /
 # "req_re" / "forbid_re" required-or-forbidden regex / "count_re" (needle = (re, n))
@@ -343,6 +362,117 @@ def describe(findings) -> str:
     return "\n".join(f"  ✗ {rid}: {kind} → {needle}" for rid, kind, needle in findings)
 
 
+# ── [da1033-D] ISSUE-04: the payload handed to OffloadOutput.formatBody is JSON ──
+#
+# `OffloadOutput.formatBody` only *re-shapes* JSON — a plain sentence passes
+# through untouched (OffloadOutput.kt:61-80, both the no-flag fast path and the
+# parse-failure fallback). So `android-photos near` and `android-contacts
+# search|get|list` used to exit 0 with an English sentence whenever the result
+# was empty (the most common outcome), breaking every `jq` / `json.loads`
+# downstream — and `near` returned a bare JSONArray when it was NOT empty, so
+# even the top-level type flipped with the result.
+#
+# Decision point (deliberately NOT a call form): a *bare string literal* must
+# never be the payload. Accepted, in any spelling: a variable, any expression
+# (`JSONObject()…toString()`, `arr.toString(2)`, `photos.toString(2)`, a helper
+# call), or a literal that already carries JSON delimiters (`{` / `[`, e.g. the
+# `"""{"error":…}"""` form, or a template with an interpolated object).
+#
+# Two sites, because the defect has two spellings:
+#   N1 — the first argument of every `formatBody(` call in the two files.
+#   N2 — every `return <literal>` in the two files: the Photos payload is
+#        produced by the String-returning `nearPhotos`, so at the call site it
+#        is just a variable — N1 alone would be blind to it (this gate exists
+#        because the *review* proposed N1 only).
+#
+# Letter N is free: C / K / B / F / O / S / D / J are the other arms.
+_STR_LIT_RE = re.compile(r'"(?:[^"\\\n]|\\.)*"')
+_RAW_LIT_RE = re.compile(r'"""(?:[^"]|"(?!""))*"""')
+
+
+def _literal_at(src: str, i: int):
+    """Source text of the Kotlin string literal starting at `i`, else None."""
+    if src.startswith('"""', i):
+        m = _RAW_LIT_RE.match(src, i)
+        return m.group(0) if m else None
+    if src[i] == '"':
+        m = _STR_LIT_RE.match(src, i)
+        return m.group(0) if m else None
+    return None
+
+
+def _mask_templates(lit: str) -> str:
+    """Drop Kotlin `${…}` interpolations, leaving the literal's own text.
+
+    Load-bearing: `${radiusKm}` contains a `{`, so a naive delimiter test would
+    call `"No photos found within ${radiusKm}km."` JSON — the *Before* shape of
+    this very defect. The delimiter has to come from the literal text.
+    """
+    out = []
+    i = 0
+    while i < len(lit):
+        if lit[i] == "$" and i + 1 < len(lit) and lit[i + 1] == "{":
+            depth = 0
+            j = i + 1
+            while j < len(lit):
+                if lit[j] == "{":
+                    depth += 1
+                elif lit[j] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            i = j + 1  # skip the whole interpolation
+            continue
+        out.append(lit[i])
+        i += 1
+    return "".join(out)
+
+
+def _is_json_literal(lit: str) -> bool:
+    """A literal is JSON-shaped when its OWN text carries `{` / `[`.
+
+    `"{\\"error\\":\\"$code\\"}"` → yes. `"No photos found within ${km}km."` →
+    no (the brace is interpolation, not structure). A literal that is nothing
+    but interpolation (`"${obj}"`) counts as a variable in a template coat and
+    is accepted, same as passing `obj` directly.
+    """
+    core = _mask_templates(lit).strip().strip('"').strip()
+    if core == "":
+        return True  # pure interpolation — equivalent to passing the variable
+    return "{" in core or "[" in core
+
+
+def payload_findings(label: str, src: str) -> list:
+    """N1 / N2 for one payload file (code-only text, comments stripped)."""
+    findings = []
+    code = code_only(src)
+    for m in re.finditer(r"formatBody\(", code):
+        j = m.end()
+        while j < len(code) and code[j] in " \t\r\n":
+            j += 1
+        if j >= len(code) or code[j] != '"':
+            continue  # variable / expression / helper call → accepted
+        lit = _literal_at(code, j)
+        if lit is None:
+            findings.append(("N1", "unreadable literal", label))
+        elif not _is_json_literal(lit):
+            findings.append(("N1", "bare non-JSON payload literal", label + ": " + lit[:70]))
+    for m in re.finditer(r"\breturn\s+(?=\")", code):
+        lit = _literal_at(code, m.end())
+        if lit is None:
+            findings.append(("N2", "unreadable literal", label))
+        elif not _is_json_literal(lit):
+            findings.append(("N2", "bare non-JSON payload return", label + ": " + lit[:70]))
+    return findings
+
+
+def check_offload_json(photos_src: str, contacts_src: str) -> list:
+    """[da1033-D] ISSUE-04 rules for the two payload files, comment-aware."""
+    return (payload_findings("PhotosOffloadHandler.kt", photos_src)
+            + payload_findings("ContactsOffloadHandler.kt", contacts_src))
+
+
 # ── selftest: every rule must have a tooth, and the green arm must pass ──────
 
 GREEN_CONTACTS = """
@@ -608,6 +738,92 @@ internal fun sessionsDateBound(flag: String, raw: String?, parse: (String) -> Lo
 }
 """
 
+
+# [da1033-D] ISSUE-04 green fixtures for the payload-JSON arm. Synthetic but
+# shape-faithful: every accepted spelling appears once (variable, JSON builder,
+# helper call, raw JSON literal, expression-into-arrayOf, a prose literal that
+# lives in a COMMENT) plus the two N2 spellings (`return data.toString(2)`).
+GREEN_PAYLOAD_PHOTOS = r"""
+    private fun nearPhotos(lat: Double, lon: Double, radiusKm: Double, max: Int): String {
+        val photos = JSONArray()
+        // A prose payload quoted in a comment must not trip the gate:
+        // formatBody("No photos found within 1km of (1.0, 2.0).", args)
+        val data = JSONObject()
+            .put("media", photos)
+            .put("count", photos.length())
+            .put("lat", lat)
+            .put("lon", lon)
+            .put("radius_km", radiusKm)
+        if (photos.length() == 0) {
+            val hint = if (scanned == scanLimit) "scanned the newest 500 photos; no matches in that window" else ""
+            if (hint.isNotEmpty()) data.put("hint", hint)
+        }
+        return data.toString(2)
+    }
+
+    private fun handleNear(args: OffloadArgs): NativeOffloadResult {
+        return NativeOffloadResult(0, OffloadOutput.formatBody(nearPhotos(1.0, 2.0, 1.0, 20), args) + "\n")
+    }
+"""
+
+GREEN_PAYLOAD_CONTACTS = r"""
+    private fun queryFailedBody(message: String): String =
+        JSONObject().put("error", "query_failed").put("message", message).toString()
+
+
+    private fun doList(parsedArgs: OffloadArgs): NativeOffloadResult {
+        val cursor = context.contentResolver.query(uri, projection, null, null, sort)
+            ?: return NativeOffloadResult(
+                1,
+                OffloadOutput.formatBody(
+                    queryFailedBody("Failed to query contacts."),
+                    parsedArgs,
+                ) + "\n",
+            )
+        val listArr = JSONArray()
+        return NativeOffloadResult(0, OffloadOutput.formatBody(listArr.toString(2), parsedArgs) + "\n")
+    }
+
+    private fun doSearch(parsedArgs: OffloadArgs): NativeOffloadResult {
+        val searchArr = JSONArray()
+        return NativeOffloadResult(0, OffloadOutput.formatBody(searchArr.toString(2), parsedArgs) + "\n")
+    }
+
+    private fun doGet(id: Long, parsedArgs: OffloadArgs): NativeOffloadResult {
+        cursor.use {
+            if (!it.moveToFirst()) {
+                val body = JSONObject().put("error", "not_found").put("id", id)
+                    .put("message", "No contact with id=$id.")
+                    .toString()
+                return NativeOffloadResult(1, OffloadOutput.formatBody(body, parsedArgs) + "\n")
+            }
+        }
+        // Precision arm: an expression-built payload (the header/staging shape)
+        // is not the literal this rule judges.
+        return NativeOffloadResult(
+            0,
+            OffloadOutput.formatBody(arrayOf("All contacts (N):").joinToString("\n"), parsedArgs) + "\n",
+        )
+    }
+
+    private fun doStrict(parsedArgs: OffloadArgs): NativeOffloadResult {
+        return NativeOffloadResult(0, OffloadOutput.formatBody(@Q3@{"media": [], "count": 0}@Q3@, parsedArgs) + "\n")
+    }
+
+    private fun doFromConstant(parsedArgs: OffloadArgs): NativeOffloadResult {
+        return NativeOffloadResult(0, OffloadOutput.formatBody(HELP_TEXT, parsedArgs) + "\n")
+    }
+
+    private fun doTemplate(parsedArgs: OffloadArgs): NativeOffloadResult {
+        val code = "x"
+        val payload = JSONObject().put("a", 1)
+        return NativeOffloadResult(
+            1,
+            OffloadOutput.formatBody("{\"error\":\"${code}\"}", parsedArgs) + "\n" +
+                OffloadOutput.formatBody("${payload}", parsedArgs) + "\n",
+        )
+    }
+""".replace("@Q3@", '"' * 3)
 
 def selftest() -> int:
     # Each case mutates ONE arm and names the rules it must trip. The expected
@@ -901,14 +1117,65 @@ def selftest() -> int:
         if got != want:
             print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
             failures += 1
+    # [da1033-D] ISSUE-04 — each payload spelling has a tooth: the prose return
+    # (N2), the prose first argument in a one-line / multi-line / raw-string
+    # call (N1), and the unterminated literal (fail-closed, not a silent skip).
+    red_cases_payload = [
+        ("photos payload reverts to the English sentence",
+         GREEN_PAYLOAD_PHOTOS.replace('return data.toString(2)',
+                                      'return "No photos found within ${radiusKm}km of ($lat, $lon).$hint"'),
+         GREEN_PAYLOAD_CONTACTS, {"N2"}),
+        ("prose behind an interpolation is still prose",
+         GREEN_PAYLOAD_PHOTOS,
+         GREEN_PAYLOAD_CONTACTS.replace("formatBody(searchArr.toString(2), parsedArgs)",
+                                        'formatBody("Failed to query contacts for ${name}.", parsedArgs)'),
+         {"N1"}),
+        ("the near call site inlines a prose literal",
+         GREEN_PAYLOAD_PHOTOS.replace("formatBody(nearPhotos(1.0, 2.0, 1.0, 20), args)",
+                                      'formatBody("No photos found within 1km of (1.0, 2.0).", args)'),
+         GREEN_PAYLOAD_CONTACTS, {"N1"}),
+        ("the raw-string prose spelling is caught too",
+         GREEN_PAYLOAD_PHOTOS.replace("formatBody(nearPhotos(1.0, 2.0, 1.0, 20), args)",
+                                      "formatBody(" + '"' * 3 + "No photos found within 1km." + '"' * 3 + ", args)"),
+         GREEN_PAYLOAD_CONTACTS, {"N1"}),
+        ("an unterminated literal fails closed",
+         GREEN_PAYLOAD_PHOTOS.replace("formatBody(nearPhotos(1.0, 2.0, 1.0, 20), args)",
+                                      'formatBody("No photos found within 1km.\n, args)'),
+         GREEN_PAYLOAD_CONTACTS, {"N1"}),
+        ("contacts no-match reverts to prose",
+         GREEN_PAYLOAD_PHOTOS,
+         GREEN_PAYLOAD_CONTACTS.replace("formatBody(searchArr.toString(2), parsedArgs)",
+                                        'formatBody("No contacts found matching \'q\'.", parsedArgs)'),
+         {"N1"}),
+        ("contacts not-found reverts to the bare id sentence",
+         GREEN_PAYLOAD_PHOTOS,
+         GREEN_PAYLOAD_CONTACTS.replace("formatBody(body, parsedArgs)",
+                                        'formatBody("android-contacts: no contact with id=$id", parsedArgs)'),
+         {"N1"}),
+        ("the multi-line query-failure call inlines the sentence",
+         GREEN_PAYLOAD_PHOTOS,
+         GREEN_PAYLOAD_CONTACTS.replace('queryFailedBody("Failed to query contacts.")',
+                                        '"Failed to query contacts."'),
+         {"N1"}),
+    ]
+    for label, photos_src, contacts_src, want in red_cases_payload:
+        if photos_src == GREEN_PAYLOAD_PHOTOS and contacts_src == GREEN_PAYLOAD_CONTACTS:
+            print(f"SELFTEST-FAIL: {label}: mutation did not apply to any arm")
+            failures += 1
+            continue
+        got = {rid for rid, _, _ in check_offload_json(photos_src, contacts_src)}
+        if got != want:
+            print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
+            failures += 1
     # the green arms must be fully clean, or every rule is vacuous
     clean = check_text(GREEN_CONTACTS, GREEN_CONFIG, GREEN_BROWSERUSE, GREEN_FASTIO)
     clean_flags = check_flag_set(GREEN_OUTPUT, GREEN_SPEAK)
     clean_debug = check_debug(GREEN_DEBUG)
     clean_sessions = check_sessions(GREEN_SESSIONS)
-    if clean or clean_flags or clean_debug or clean_sessions:
+    clean_payload = check_offload_json(GREEN_PAYLOAD_PHOTOS, GREEN_PAYLOAD_CONTACTS)
+    if clean or clean_flags or clean_debug or clean_sessions or clean_payload:
         print(f"SELFTEST-FAIL: green fixtures must produce no findings, "
-              f"got {describe(clean + clean_flags + clean_debug + clean_sessions)}")
+              f"got {describe(clean + clean_flags + clean_debug + clean_sessions + clean_payload)}")
         failures += 1
     if failures:
         print(f"SELFTEST: {failures} failing case(s)")
@@ -938,10 +1205,12 @@ def main(argv):
     speak_path = root / SPEAK
     debug_path = root / DEBUG_HANDLER
     sessions_path = root / SESSIONS
+    photos_path = root / PHOTOS
     if not contacts_path.is_file() or not config_path.is_file() \
             or not browseruse_path.is_file() or not fastio_path.is_file() \
             or not output_path.is_file() or not speak_path.is_file() \
-            or not debug_path.is_file() or not sessions_path.is_file():
+            or not debug_path.is_file() or not sessions_path.is_file() \
+            or not photos_path.is_file():
         print(f"GATE-FAIL: handler source not found under {root}")
         return 1
     findings = check_text(contacts_path.read_text(encoding="utf-8"),
@@ -952,6 +1221,8 @@ def main(argv):
                                speak_path.read_text(encoding="utf-8"))
     findings += check_debug(debug_path.read_text(encoding="utf-8"))
     findings += check_sessions(sessions_path.read_text(encoding="utf-8"))
+    findings += check_offload_json(photos_path.read_text(encoding="utf-8"),
+                                   contacts_path.read_text(encoding="utf-8"))
     if findings:
         print("offload_cli_args_check: FAIL")
         print(describe(findings))
@@ -960,7 +1231,8 @@ def main(argv):
           "browseruse paths joined, fastio tar verdict shared, "
           "OUTPUT_FLAGS covers help/h, speak declares stop/status, "
           "sessions date bounds funneled + refuse invalid, "
-          "debug pass-through argv verbatim + global-only output shaping)")
+          "debug pass-through argv verbatim + global-only output shaping, "
+          "photos/contacts payloads are JSON)")
     return 0
 
 
