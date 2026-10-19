@@ -108,4 +108,72 @@ class UsageAggregatorTest {
     fun `empty list returns empty map`() {
         assertTrue(UsageAggregator.aggregate(emptyList(), dayFormat = utcDayFormat).isEmpty())
     }
+    @Test
+    fun `a model whose rows are all malformed produces no entry`() {
+        val rows = listOf(
+            // All of model-a's rows in the window are unparseable ...
+            row(modelId = "model-a", json = "{not valid json", createdAtMs = 1_000L),
+            row(modelId = "model-a", json = "", createdAtMs = 2_000L),
+            // ... while model-b has one usable row.
+            row(modelId = "model-b", json = """{"inputTokens":50,"outputTokens":5}""", createdAtMs = 3_000L),
+        )
+        val result = UsageAggregator.aggregate(rows, dayFormat = utcDayFormat)
+        // The SQL fast path filters json_valid() in its WHERE clause before GROUP BY, so
+        // an all-bad window yields no row for that model — both paths must agree.
+        assertEquals(setOf("model-b"), result.keys)
+        assertEquals(50L, result["model-b"]!!.inputTokens)
+    }
+
+    // ── [da1033-I06] display lookup: the live config wins, the catalog is the fallback ──
+
+    @Test
+    fun `live config wins over the built-in catalog`() {
+        val lookup = UsageAggregator.modelDisplayLookup(
+            configured = listOf(
+                ModelIdentity("gemini-3-pro", "Renamed Gemini", "Google Gemini"),
+            ),
+            builtins = listOf(
+                ModelIdentity("gemini-3-pro", "Gemini 3 Pro", "Google"),
+                ModelIdentity("gpt-5.5", "GPT-5.5", "OpenAI"),
+            ),
+        )
+        // Literal expectations on purpose: deriving them from the production constants
+        // would let a mutation masquerade as PASS.
+        assertEquals("Renamed Gemini" to "Google Gemini", lookup["gemini-3-pro"])
+        // Catalog-only ids still resolve (historical rows with no live instance).
+        assertEquals("GPT-5.5" to "OpenAI", lookup["gpt-5.5"])
+        assertEquals(2, lookup.size)
+    }
+
+    @Test
+    fun `first configured entry wins for a duplicated model id`() {
+        val lookup = UsageAggregator.modelDisplayLookup(
+            configured = listOf(
+                ModelIdentity("gpt-5.5", "First", "OpenAI"),
+                ModelIdentity("gpt-5.5", "Second", "OpenRouter"),
+            ),
+            builtins = emptyList(),
+        )
+        assertEquals("First" to "OpenAI", lookup["gpt-5.5"])
+    }
+
+    // ── [da1033-I06] provider group order ──
+
+    @Test
+    fun `real providers sort above the Unknown bucket`() {
+        val input = listOf("Unknown", "OpenRouter", "OpenAI", "xAI", "Anthropic", "Google Gemini")
+        assertEquals(
+            listOf("OpenAI", "Anthropic", "Google Gemini", "OpenRouter", "xAI", "Unknown"),
+            input.sortedBy { UsageAggregator.providerGroupSortKey(it) },
+        )
+        assertTrue(
+            "a real provider must never render below the unattributed bucket",
+            UsageAggregator.providerGroupSortKey("Kimi Code") <
+                UsageAggregator.providerGroupSortKey(UNKNOWN_PROVIDER),
+        )
+        assertTrue(
+            UsageAggregator.providerGroupSortKey("OpenAI") <
+                UsageAggregator.providerGroupSortKey("OpenRouter"),
+        )
+    }
 }

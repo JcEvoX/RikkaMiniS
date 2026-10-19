@@ -23,6 +23,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -236,9 +237,34 @@ fun ThinkingRulesSection(
     }
 
     // --- Editor dialog (hoisted here, not inside a row — Dialog has its own window) ---
+    // [da1033-I07] The dialog must edit the rule as it is NOW, not the snapshot taken
+    // when its row was tapped. `customRules` re-reads on `customRulesRevision` (see
+    // C12 above), so a rule written OUTSIDE this screen — minis-config, Debug RPC,
+    // backup restore, worker restore — is already in the list; but `editorRequest`
+    // still carried the opening copy, and Save wrote that old copy back over the
+    // external edit (or resurrected a rule the external writer had deleted).
+    // Same shape as MCPIntegrationsScreen's `val liveServer = servers.find { … }`.
+    // `customIds` and `customRules` are parallel columns, so both are read here.
+    val editorLiveIndex = editorRequest?.existingId?.let { customIds.indexOf(it) } ?: -1
+    // Deleted while the dialog was open, or its id vanished from the live column:
+    // close instead of re-creating it on Save. State must not be written during
+    // composition, so this runs as an effect.
+    LaunchedEffect(editorRequest?.existingId, editorLiveIndex) {
+        // [da1033-I07] For an id that is no longer in the live list there is nothing
+        // left to edit — drop the request rather than saving the stale snapshot back.
+        val req = editorRequest
+        if (req?.existingId != null && editorLiveIndex < 0) editorRequest = null
+    }
     editorRequest?.let { req ->
+        // New rules (the "Add rule" and "Copy of …" entries, existingId == null)
+        // seed from the request itself; only an edit re-reads the live rule.
+        val liveSeed = if (req.existingId != null && !req.isNew && editorLiveIndex >= 0) {
+            customRules[editorLiveIndex]
+        } else {
+            req.seed
+        }
         ThinkingRuleEditorDialog(
-            request = req,
+            request = req.copy(seed = liveSeed),
             onDismiss = { editorRequest = null },
             onSave = { rule ->
                 providerRepository.saveThinkingRule(instance.id, rule, id = req.existingId)
