@@ -391,9 +391,26 @@ fun MemoryFileEditScreen(
     // fullBase is the file text captured at entry (source of truth for the
     // read-only viewer AND for splice-back); the editor state only holds the
     // chunk window built at Edit tap from the viewer's visible range, so text
-    // layout stays O(window) instead of O(file). readFile is non-suspend so
-    // it can run directly in remember; remember(fileName) reloads on switch.
-    var fullBase by remember(fileName) { mutableStateOf(memoryRepository.readFile(fileName)) }
+    // layout stays O(window) instead of O(file).
+    //
+    // [deep-audit-1029 ISSUE-03 裂口 A] The read used to run inside this
+    // `remember { }` — i.e. on the composition thread of the first frame, and
+    // this screen exists precisely for 200KB+ files. MemoryRepository has no
+    // suspend surface, so the blocking `readFile()` now rides a
+    // `withContext(Dispatchers.IO)` inside a `LaunchedEffect(fileName)` (which
+    // also re-reads on file switch, matching the old `remember(fileName)` key).
+    var fullBase by remember(fileName) { mutableStateOf("") }
+    // [deep-audit-1029 ISSUE-03] With the read now async, `fullBase` is "" for
+    // the first frame(s). Without a gate, a tap on Edit before the read lands
+    // would open the editor against the empty base and a Save would splice the
+    // user's keystrokes into "" and overwrite the real file. Deliberately a
+    // single flag (no state machine): it only disables the Edit action until
+    // the load completes; the viewer already renders "" harmlessly.
+    var isLoaded by remember(fileName) { mutableStateOf(false) }
+    LaunchedEffect(fileName) {
+        fullBase = withContext(Dispatchers.IO) { memoryRepository.readFile(fileName) }
+        isLoaded = true
+    }
     val chunks = remember(fullBase) { chunkText(fullBase) }
     val listState = remember(fileName) { LazyListState() }
     val state = remember(fileName) { TextFieldState() }
@@ -402,6 +419,11 @@ fun MemoryFileEditScreen(
     // [T-android-memory-file-jank] false = virtualized read-only viewer.
     var isEditing by remember(fileName) { mutableStateOf(false) }
     val context = LocalContext.current
+    // [deep-audit-1029 ISSUE-03] Save runs through this scope so the blocking
+    // saveFile() can be moved to Dispatchers.IO while the Toast / state writes
+    // stay on the composition (Main) dispatcher. Tied to the screen, so
+    // leaving cancels any in-flight write.
+    val scope = rememberCoroutineScope()
     // [T-memory-save-toast-feedback] Confirm Save actually committed by
     // flashing a toast — previously the Save tap silently closed nothing,
     // showed no state change, and the user had no signal that the edit
@@ -424,7 +446,10 @@ fun MemoryFileEditScreen(
                     // read-only mode we show the pencil; while editing we show
                     // Save (always visible — see the KDoc note above).
                     if (!isEditing) {
-                        IconButton(onClick = {
+                        // [deep-audit-1029 ISSUE-03] Gated on the async read:
+                        // the edit window is built from `fullBase`/`chunks`, so
+                        // entering before the load would edit an empty base.
+                        IconButton(enabled = isLoaded, onClick = {
                             // [fix-memory-editor-windowed-edit] Window = the
                             // chunks the user was looking at ± margin
                             // (clamped inside buildEditWindow). The editor
@@ -451,28 +476,52 @@ fun MemoryFileEditScreen(
                         // [T-global-memory-save-always-visible] Always render Save —
                         // no hasChanges gate (see KDoc above).
                         MinisTextButton(onClick = {
-                            try {
-                                // [fix-memory-editor-windowed-edit] Splice the
-                                // edited window back into the full file
-                                // (byte-exact, offsets captured at edit
-                                // entry), then refresh the viewer's source.
-                                val newText = state.text.toString()
-                                val full = editWindow
-                                    ?.let {
-                                        spliceEditWindow(fullBase, it.startOffset, it.endOffset, newText)
+                            // [deep-audit-1029 ISSUE-03 裂口 A] saveFile() is
+                            // blocking file IO on a screen built for 200KB+
+                            // files; it used to run on the click thread. The
+                            // splice + write now ride Dispatchers.IO, while the
+                            // Toast / state writes stay on the composition
+                            // thread (scope is Main-dispatched) so the visible
+                            // sequence is unchanged.
+                            //
+                            // [deep-audit-1029 ISSUE-03 裂口 B] A SOUL.md write
+                            // through this raw saveFile() bypasses
+                            // SoulStore.save(), so refresh the cache here —
+                            // exactly like the twin chat memory sheet does —
+                            // otherwise cachedMetadata / writeVersion stay on
+                            // the pre-edit values for the chat header and the
+                            // Settings → Soul editors.
+                            val newText = state.text.toString()
+                            val window = editWindow
+                            val base = fullBase
+                            scope.launch {
+                                try {
+                                    // [fix-memory-editor-windowed-edit] Splice
+                                    // the edited window back into the full file
+                                    // (byte-exact, offsets captured at edit
+                                    // entry), then refresh the viewer's source.
+                                    val full = window
+                                        ?.let {
+                                            spliceEditWindow(base, it.startOffset, it.endOffset, newText)
+                                        }
+                                        ?: newText
+                                    withContext(Dispatchers.IO) {
+                                        memoryRepository.saveFile(fileName, full)
+                                        if (fileName == SOUL_FILE_NAME) {
+                                            com.rikkaminis.app.agent.SoulStore.refreshCache(context)
+                                        }
                                     }
-                                    ?: newText
-                                memoryRepository.saveFile(fileName, full)
-                                fullBase = full
-                                saveError = null
-                                android.widget.Toast.makeText(
-                                    context,
-                                    savedToastText,
-                                    android.widget.Toast.LENGTH_SHORT,
-                                ).show()
-                                isEditing = false
-                            } catch (e: Exception) {
-                                saveError = e.message
+                                    fullBase = full
+                                    saveError = null
+                                    android.widget.Toast.makeText(
+                                        context,
+                                        savedToastText,
+                                        android.widget.Toast.LENGTH_SHORT,
+                                    ).show()
+                                    isEditing = false
+                                } catch (e: Exception) {
+                                    saveError = e.message
+                                }
                             }
                         }) {
                             Text(stringResource(R.string.common_save))
