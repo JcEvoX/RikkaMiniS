@@ -398,12 +398,11 @@ class OffloadPermissionSlotLockTest {
         denied?.let { denials()[sessionId] = ConcurrentHashMap.newKeySet<String>().apply { add(it) } }
     }
 
-    @Suppress("UNCHECKED_CAST")
     private fun grants(): MutableMap<String, MutableSet<String>> = sessionMap("sessionGrants")
 
-    @Suppress("UNCHECKED_CAST")
     private fun denials(): MutableMap<String, MutableSet<String>> = sessionMap("sessionDenials")
 
+    @Suppress("UNCHECKED_CAST")
     private fun sessionMap(name: String): MutableMap<String, MutableSet<String>> {
         val field = OffloadPermissionManager::class.java.getDeclaredField(name)
         field.isAccessible = true
