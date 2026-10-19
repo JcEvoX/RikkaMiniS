@@ -150,6 +150,34 @@ class DeepLinkReactiveConsumeTest {
         falseAlarmFor("a one-shot consume is unreachable", src, "LaunchedEffect(Unit)")
     }
 
+    // -- [da1034-B4] the edit sheet must close when its target disappears ----
+
+    @Test
+    fun `the edit sheet closes when its target disappears`() {
+        val src = codeOnly(envScreen)
+        assertTrue(
+            "the sheet is opened for an id and its target is re-resolved from the live " +
+                "list, so an entry deleted while the sheet is up (minis-config remove / " +
+                "backup restore) leaves editEntryId non-null over a null lookup — the form " +
+                "silently flips to new-variable semantics and Save creates a phantom entry. " +
+                "The close effect must be keyed on (editEntryId, entries): keying on the id " +
+                "alone would not re-run when the list loses the entry",
+            Regex("""LaunchedEffect\s*\(\s*editEntryId\s*,\s*entries\s*\)""")
+                .containsMatchIn(src),
+        )
+        assertTrue(
+            "the close must be decided by the live lookup (editTargetVanished), not taken " +
+                "unconditionally — an unconditional close would dismiss the sheet on every " +
+                "recomposition",
+            Regex("""editTargetVanished\s*\(\s*entries\s*,\s*editEntryId\s*\)""")
+                .containsMatchIn(src),
+        )
+        assertTrue(
+            "the deep-link prefill effect must stay keyless-independent of the close effect",
+            Regex("""LaunchedEffect\s*\(\s*pendingCreate\s*\)""").containsMatchIn(src),
+        )
+    }
+
     @Test
     fun `the chat screen subscribes to the pending quick action and keeps the session guard`() {
         val src = codeOnly(chatScreen)
