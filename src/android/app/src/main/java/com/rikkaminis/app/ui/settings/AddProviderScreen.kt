@@ -245,11 +245,6 @@ private fun ConfigureProviderScreen(
     }
     var apiKey by remember { mutableStateOf("") }
     var customBaseURL by remember { mutableStateOf("") }
-    // [deep-audit-1033 I05] The save became a coroutine (see the button
-    // below); without this the button stays live across the round trip and
-    // a double tap adds the provider twice.
-    var saving by remember { mutableStateOf(false) }
-    val scope = rememberCoroutineScope()
 
     SettingsScaffold(
         title = stringResource(R.string.add_provider_configure_provider, providerType.displayName),
@@ -309,6 +304,15 @@ private fun ColumnScope.ApiKeyConfigSection(
     // WebDAV backup transfer in BackupSettingsScreen).
     val appContext = LocalContext.current.applicationContext
     var showApiKeyPlaintext by remember { mutableStateOf(false) }
+    // [deep-audit-1033 I05] The save below became a coroutine: without this
+    // the button stays live across the disk round trip and a double tap adds
+    // the provider twice (addInstance is not idempotent). The write rides the
+    // application scope like the refresh below (a save must not be cancelled
+    // by this screen's disposal); `fallbackScope` only covers the impossible
+    // `appContext is not MinisApp` case, where silently dropping the save
+    // would be worse than a write bound to composition.
+    var saving by remember { mutableStateOf(false) }
+    val fallbackScope = rememberCoroutineScope()
     // /v1 is appended automatically for all non-Gemini providers (Gemini uses
     // v1beta full-path URLs). effectiveBaseURL already guards against double-append.
     val appendV1Suffix = providerType != ProviderType.gemini
@@ -442,14 +446,14 @@ private fun ColumnScope.ApiKeyConfigSection(
                 // Only OpenAI-family providers expose the Responses API toggle.
                 useResponsesAPI = providerType == ProviderType.openAI && useResponsesAPI,
             )
-            scope.launch {
+            val appScope = appContext as? MinisApp
+            // [deep-audit-1033 I05] addInstance writes SQLite and saveApiKey
+            // commits to EncryptedSharedPreferences — both are blocking
+            // disk/keystore IO and used to run inline in this click handler,
+            // on the main thread. The refresh below still starts only once
+            // the key is on disk (same order as before).
+            (appScope?.applicationScope ?: fallbackScope).launch {
                 try {
-                    // [deep-audit-1033 I05] addInstance writes SQLite and
-                    // saveApiKey commits to EncryptedSharedPreferences —
-                    // both are blocking disk/keystore IO and used to run
-                    // inline in this click handler, on the main thread.
-                    // The refresh below still starts only once the key is
-                    // on disk (same order as before).
                     withContext(Dispatchers.IO) {
                         providerRepository.addInstance(instance)
                         providerRepository.saveApiKey(instance.id, apiKey.trim())
@@ -466,7 +470,6 @@ private fun ColumnScope.ApiKeyConfigSection(
                 // production (MinisApp IS the Application), so this is
                 // refuse-instead-of-guess — surface it loudly instead of
                 // skipping the refresh without a trace.
-                val appScope = appContext as? MinisApp
                 if (appScope == null) {
                     android.util.Log.w(
                         "AddProviderScreen",
@@ -497,9 +500,15 @@ private fun ColumnScope.ApiKeyConfigSection(
                         }
                     }
                 }
-                onSaved()
-                } finally {
+                // onSaved() pops this route and the application scope is not
+                // Main — hop back before touching navigation or that state.
+                withContext(Dispatchers.Main) {
                     saving = false
+                    onSaved()
+                }
+                } catch (t: Throwable) {
+                    withContext(Dispatchers.Main) { saving = false }
+                    throw t
                 }
             }
         },
