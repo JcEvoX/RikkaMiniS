@@ -53,6 +53,29 @@ Deliberate tightening vs the ISSUE-04 write-up: `add`/`update` are NOT allowed
 to satisfy R1/R2 with a bare `purge(` — purging on every save would destroy the
 credentials of a correctly authorized server, i.e. crack 1's mirror image.
 
+[da1029-E] Two UI-side criteria were added to the same gate, because they pin
+the same invariant from the other end — "the sheet edits what is on disk":
+
+  U1  the edit-sheet call site in `MCPIntegrationsScreen` must hand
+      `MCPAddSheet` the LIVE entry (resolved from the listing with
+      `servers.find { … }` and an elvis fallback) instead of the
+      `editServer` snapshot captured at tap time. With the snapshot, a write
+      that landed while the sheet was open (a reconcile from `add`/`update`,
+      a paste-import, `reloadFromDisk`) was both displayed stale and then
+      rolled back by Save — the reconcile this gate defends was undone by the
+      UI. The elvis fallback is required so an entry deleted meanwhile does
+      not silently turn the edit sheet into the add flow.
+  U2  every `var … by remember` in `MCPFormTab` whose initializer mentions
+      `editServer` must be keyed on that entry, so a changed entry re-seeds
+      the field states instead of leaving the old values on screen (1027-E
+      ModelGroupDetailScreen / 1028-C EnvVarFormSheet are the same defect).
+
+U2 is enumerated, not counted by hand: a hand-written "16 fields" list is
+exactly what drifts. The check walks every `remember` in the function body and
+reports the un-keyed ones by line. Keyed-on-the-entry is required rather than
+any key: `remember(nonce)` would satisfy "has a key" while still never
+re-seeding.
+
 Usage: python3 scripts/scan/mcp_oauth_lifecycle_check.py [repo_root]
        python3 scripts/scan/mcp_oauth_lifecycle_check.py --selftest
 Exit:  0 = clean, 1 = violation(s), 2 = usage/ROT
@@ -63,8 +86,17 @@ import sys
 
 STORE_REL = "src/android/app/src/main/java/com/rikkaminis/app/mcp/oauth/MCPOAuthStore.kt"
 REPO_REL = "src/android/app/src/main/java/com/rikkaminis/app/data/repository/MCPRepository.kt"
+UI_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/MCPIntegrationsScreen.kt"
 
 SELFTEST_MARK = "MCP_OAUTH_LIFECYCLE_SELFTEST=PASS"
+
+# [da1029-E] UI-side anchors.
+UI_FORM_FUN = "MCPFormTab"
+UI_LIST_HOLDER = "servers"
+UI_ENTRY_PARAM = "editServer"
+UI_KEY_TOKENS = (UI_ENTRY_PARAM, "liveServer")
+UI_LIVE_PASS = "editServer = "
+UI_RESOLVE_PARAM = "MCPAddSheet"
 
 CONVERGE_DECL = "reconcileForServer("
 DECIDE_DECL = "decideReconcileAction("
@@ -303,6 +335,123 @@ def check_repo(code):
     return v
 
 
+def balanced(code, start, open_ch, close_ch):
+    """Index of the char closing the group opened at [start], or -1."""
+    depth = 0
+    j = start
+    while j < len(code):
+        if code[j] == open_ch:
+            depth += 1
+        elif code[j] == close_ch:
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    return -1
+
+
+def remember_sites(body):
+    """[(offset, keys, expr)] for every `remember(...)`/`remember {...}`.
+
+    The identifier must be followed by `(` or `{` — that keeps
+    `rememberCoroutineScope(` / `rememberModalBottomSheetState(` out, and the
+    calling code is passed already comment/string-masked.
+    """
+    out = []
+    for m in re.finditer(r"\bremember\s*([({])", body):
+        i = m.start()
+        closer = m.group(1)
+        if closer == "{":
+            keys = ""
+            end = balanced(body, m.end() - 1, "{", "}")
+        else:
+            kend = balanced(body, m.end() - 1, "(", ")")
+            if kend < 0:
+                continue
+            keys = body[m.end():kend]
+            brace = body.find("{", kend)
+            end = balanced(body, brace, "{", "}") if brace >= 0 else kend
+        if end < 0:
+            end = len(body) - 1
+        out.append((i, keys, body[i:end + 1]))
+    return out
+
+
+def check_ui(code):
+    """[da1029-E] U1 + U2 — the edit sheet must edit the live entry.
+
+    Returns (violations, keyed_field_count) so the real-repo run can report how
+    many field states the enumerated check actually walked (a check that lost
+    its subject must not read as green).
+    """
+    v = []
+    m = re.search(r"\bfun\s+" + re.escape(UI_FORM_FUN) + r"\s*\(", code)
+    if not m:
+        v.append(
+            "MCPIntegrationsScreen.kt: no `fun %s(` — the form whose "
+            "field-state keys this check pins is gone (ROT: update this gate)"
+            % UI_FORM_FUN
+        )
+        return v, 0
+    body = body_at(code, m.start())
+    body_off = code.find(body, m.start()) if body else -1
+    if body is None or body_off < 0:
+        v.append(
+            "MCPIntegrationsScreen.kt: `%s` has no brace body — this check "
+            "cannot see its field states (ROT: update this gate)" % UI_FORM_FUN
+        )
+        return v, 0
+    enforced = 0
+    for off, keys, expr in remember_sites(body):
+        if UI_ENTRY_PARAM not in expr:
+            continue
+        line = line_of(code, body_off + off)
+        if not any(tok in keys for tok in UI_KEY_TOKENS):
+            v.append(
+                "MCPIntegrationsScreen.kt:%d: a `remember` seeded from `%s` has "
+                "no key on that entry — an entry changed behind the sheet keeps "
+                "displaying (and Save writes back) the values it was opened with"
+                % (line, UI_ENTRY_PARAM)
+            )
+        else:
+            enforced += 1
+    if enforced == 0:
+        v.append(
+            "MCPIntegrationsScreen.kt: not one keyed `remember` seeded from "
+            "`%s` was found in `%s` — the field states moved or the enumerated "
+            "check lost its subject (ROT: re-point it)" % (UI_ENTRY_PARAM, UI_FORM_FUN)
+        )
+
+    resolve = re.search(
+        r"\bval\s+([A-Za-z_]\w*)\s*=\s*" + re.escape(UI_LIST_HOLDER) + r"\.find\s*\{([^}]*)\}",
+        code,
+    )
+    if not resolve:
+        v.append(
+            "MCPIntegrationsScreen.kt: no `val <live> = %s.find { … }` — the "
+            "sheet is handed the tap-time `%s` snapshot, so a write that landed "
+            "while the sheet was open gets rolled back by Save"
+            % (UI_LIST_HOLDER, UI_ENTRY_PARAM)
+        )
+        return v, enforced
+    live_name = resolve.group(1)
+    tail = code[resolve.end():resolve.end() + 40].lstrip()
+    if not tail.startswith("?:"):
+        v.append(
+            "MCPIntegrationsScreen.kt: the live-entry lookup has no `?: ` "
+            "fallback — an entry deleted while the sheet is open would pass "
+            "null to %s, silently turning the edit sheet into the add flow"
+            % UI_RESOLVE_PARAM
+        )
+    if "%s%s," % (UI_LIVE_PASS, live_name) not in code:
+        v.append(
+            "MCPIntegrationsScreen.kt: `%s` is resolved but never passed as "
+            "`%s%s` — the sheet still receives the snapshot"
+            % (live_name, UI_LIVE_PASS, live_name)
+        )
+    return v, enforced
+
+
 def read(root, rel):
     with open(os.path.join(root, rel), "r", encoding="utf-8") as fh:
         return fh.read()
@@ -319,14 +468,27 @@ def run(root):
         print("mcp_oauth_lifecycle_check: cannot read sources: %s" % exc)
         return 2
     violations = check_store(store) + check_repo(repo)
+    ui_path = os.path.join(root, UI_REL)
+    ui_keyed = None
+    if os.path.exists(ui_path):
+        ui_v, ui_keyed = check_ui(mask(read(root, UI_REL)))
+        violations += ui_v
+    else:
+        # Drift-detector convention: gates in this suite may be run against a
+        # mini tree holding only the files a fixture is about. The UI criteria
+        # only apply where the screen exists; the CD check on the real repo
+        # fails loudly if the file is deleted.
+        print("note: %s absent — UI criteria (U1/U2) skipped" % UI_REL)
     if violations:
         print("FAIL mcp_oauth_lifecycle_check")
         for item in violations:
             print("  " + item)
         return 1
+    note = "" if ui_keyed is None else "; %d form field state(s) keyed on the entry" % ui_keyed
     print(
         "PASS mcp_oauth_lifecycle_check (one reconcile point; add/update/import "
-        "all wired; no secret-only cleanup path)"
+        "all wired; no secret-only cleanup path; edit sheet edits the live entry%s)"
+        % note
     )
     return 0
 
@@ -486,6 +648,72 @@ BAD_REPO_SECRET_VERB = GOOD_REPO.replace(
     private fun reconcileOAuth(server: MCPServerConfig) {""",
 )
 
+# ── [da1029-E] UI fixtures ────────────────────────────────────────────────
+GOOD_UI = """
+@Composable
+fun MCPIntegrationsScreen(mcpRepository: MCPRepository) {
+    val servers by mcpRepository.servers.collectAsState()
+    var editServer by remember { mutableStateOf<MCPRepository.MCPServerConfig?>(null) }
+    if (editServer != null) {
+        editServer?.let { captured ->
+            val liveServer = servers.find { it.id == captured.id } ?: captured
+            MCPAddSheet(
+                mcpRepository = mcpRepository,
+                editServer = liveServer,
+                onDismiss = { editServer = null },
+                onRequestDelete = { deleteId = liveServer.id },
+            )
+        }
+    }
+}
+
+@Composable
+private fun MCPFormTab(editServer: MCPRepository.MCPServerConfig?) {
+    var transport by remember(editServer) { mutableIntStateOf(if (editServer?.isStdio == true) 2 else 0) }
+    var name by remember(editServer) { mutableStateOf(editServer?.id ?: "") }
+    var oauthClientSecret by remember(editServer) {
+        mutableStateOf(editServer?.id?.let { MCPOAuthStore.clientSecret(context, it) } ?: "")
+    }
+    var errorText by remember { mutableStateOf<String?>(null) }
+}
+"""
+
+# one field left un-keyed (the "15 of 16" shape)
+BAD_UI_UNKEYED = GOOD_UI.replace(
+    '    var name by remember(editServer) { mutableStateOf(editServer?.id ?: "") }',
+    '    var name by remember { mutableStateOf(editServer?.id ?: "") }',
+)
+
+# the pre-fix shape: the sheet gets the tap-time snapshot
+BAD_UI_SNAPSHOT = GOOD_UI.replace(
+    "            val liveServer = servers.find { it.id == captured.id } ?: captured\n",
+    "",
+).replace("editServer = liveServer,", "editServer = captured,")
+
+# live value resolved but never passed through
+BAD_UI_NOT_PASSED = GOOD_UI.replace("editServer = liveServer,", "editServer = captured,")
+
+# resolved without the elvis fallback (deleted entry ⇒ add flow)
+BAD_UI_NO_FALLBACK = GOOD_UI.replace(
+    "servers.find { it.id == captured.id } ?: captured",
+    "servers.find { it.id == captured.id }",
+)
+
+# the form is gone entirely (anchor drift)
+BAD_UI_NO_FORM = GOOD_UI.replace("private fun MCPFormTab(", "private fun MCPFormBody(")
+
+# the comment trap: docs describing the old shape / claiming the fix
+COMMENTED_UI = GOOD_UI.replace(
+    "private fun MCPFormTab(",
+    """// the old shape was `var name by remember { mutableStateOf(editServer?.id ?: "") }`
+private fun MCPFormTab(""",
+)
+LYING_UI = BAD_UI_UNKEYED.replace(
+    "private fun MCPFormTab(",
+    """// every field is now keyed on editServer — no un-keyed remember remains
+private fun MCPFormTab(""",
+)
+
 
 def selftest():
     failures = []
@@ -530,6 +758,29 @@ def selftest():
     r_secret = check_repo(mask(BAD_REPO_SECRET_VERB))
     expect_trip("repository-secret-only-verb fixture", r_secret, "uses `setClientSecret(")
 
+    # [da1029-E] UI arms
+    good_ui, good_ui_keyed = check_ui(mask(GOOD_UI))
+    expect_clean("compliant live-edit UI fixture", good_ui)
+
+    u_unkeyed, _ = check_ui(mask(BAD_UI_UNKEYED))
+    expect_trip("un-keyed field fixture", u_unkeyed, "has no key on that entry")
+
+    u_snap, _ = check_ui(mask(BAD_UI_SNAPSHOT))
+    expect_trip("tap-time snapshot fixture", u_snap, "the sheet is handed the tap-time")
+
+    u_pass, _ = check_ui(mask(BAD_UI_NOT_PASSED))
+    expect_trip("live value not passed fixture", u_pass, "is resolved but never passed")
+
+    u_fall, _ = check_ui(mask(BAD_UI_NO_FALLBACK))
+    expect_trip("no elvis fallback fixture", u_fall, "has no `?: ` fallback")
+
+    u_form, _ = check_ui(mask(BAD_UI_NO_FORM))
+    expect_trip("renamed form fixture", u_form, "field-state keys this check pins is gone")
+
+    expect_clean("comment describing the old shape",
+                 check_ui(mask(COMMENTED_UI))[0])
+    expect_trip("comment claiming a fix", check_ui(mask(LYING_UI))[0], "has no key on that entry")
+
     # masking arm: a compliant store whose *comment* mentions the old
     # secret-only cleanup, and a violating store whose comment claims it is
     # fixed, must be judged on the code only.
@@ -555,6 +806,10 @@ def selftest():
     print("selftest unwired add/update/imp -> %d/%d/%d violation(s)" % (len(r_add), len(r_upd), len(r_imp)))
     print("selftest dead indirection       -> %d violation(s)" % len(r_dead))
     print("selftest repo secret-only verb  -> %d violation(s)" % len(r_secret))
+    print("selftest UI live-edit           -> %d violation(s), %d field state(s) keyed"
+          % (len(good_ui), good_ui_keyed))
+    print("selftest UI arms (unkeyed/snapshot/not-passed/no-fallback/renamed-form) -> %d/%d/%d/%d/%d violation(s)"
+          % (len(u_unkeyed), len(u_snap), len(u_pass), len(u_fall), len(u_form)))
 
     if failures:
         for item in failures:
