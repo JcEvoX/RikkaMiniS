@@ -22,6 +22,7 @@ import com.rikkaminis.app.data.model.RoutingStrategy
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.provider.applyUserAgentOverride
 import com.rikkaminis.app.provider.gemini.GeminiBasePath
+import com.rikkaminis.app.provider.openai.openAIKeyAuthHeader
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -734,21 +735,20 @@ internal val ProviderType.supportsCustomBaseURL: Boolean
     get() = this != ProviderType.openRouter
 
 /**
- * [da1030-C ISSUE-04] Auth-header (name, value) pair for the connectivity
- * probe — the Azure fork of [com.rikkaminis.app.provider.openai.OpenAIProvider]'s
- * `applyKeyAuth` (`api-key` vs `Authorization: Bearer`). Pure on purpose so the
- * fork is assertable in a JVM unit test (ProviderRpcSymmetryTest) and so the
- * gate `provider_rpc_symmetry_check.py` (C7) can pin that `instancesTest` keys
- * the header on the instance's `azureMode`.
+ * [da1030-C ISSUE-04 → da1031-D ISSUE-07] Auth-header (name, value) pair for the
+ * connectivity probe — thin wrapper over the shared single source
+ * [com.rikkaminis.app.provider.openai.openAIKeyAuthHeader], keeping the probe's
+ * shape assertable in a JVM unit test (ProviderRpcSymmetryTest) and letting the
+ * gate `provider_rpc_symmetry_check.py` (C7) pin that `instancesTest` keys the
+ * header on the instance's `azureMode` (C10 pins the delegation itself).
  *
- * ponytail: 该分叉在此最小内联（`applyKeyAuth` 是 OpenAIProvider 的 private
- * 扩展函数、`isAzure` 是它的构造参数，debug 探测面调不到）| 天花板: 第二份
- * auth-header 分叉，与 provider/openai 的副本各自演化 | 升级触发: 共享单源
- * （provider/openai/OpenAIAuthHeader.kt 的 applyOpenAIKeyAuth，见 deep-audit-1030
- * FIX-D）落进本树后，本函数体改为委托它、由 C7 的允许清单接住。
+ * The former local fork is discharged: its `ponytail:` note said the wrapper
+ * would delegate once `provider/openai/OpenAIAuthHeader.kt` landed in this tree
+ * (deep-audit-1030 FIX-D) — it has, so the second copy of the azure/bearer
+ * ternary is gone. Signature and behaviour are unchanged.
  */
 internal fun probeAuthHeader(azureMode: Boolean, key: String): Pair<String, String> =
-    if (azureMode) "api-key" to key else "Authorization" to "Bearer $key"
+    openAIKeyAuthHeader(azure = azureMode, token = key)
 
 /**
  * [deep-audit-1024 ISSUE-02] Connectivity-probe URL for `provider.instances.test`.
