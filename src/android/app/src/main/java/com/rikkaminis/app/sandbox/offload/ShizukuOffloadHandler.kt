@@ -69,7 +69,19 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
         // pinned by SessionsCliArgsTest). See [NO_VALUE_FLAGS]; the declaration
         // is per group because `--data` is read as a value by `activity`
         // ([noValueFlagsFor]).
-        val args = OffloadArgs(split.withoutGroup, booleanFlags = noValueFlagsFor(group))
+        // [deep-audit-1029 ISSUE-07] For `exec` the parser gets only the CLI's
+        // own tokens ([ShizukuArgv.execOptionTokens]): the shell payload is not
+        // an option list, so `android-shizuku-cli exec grep -q foo /p` must not
+        // hand `-q` to the output shaper — that read as `--quiet` and made
+        // [OffloadOutput.formatBody] drop the whole `data` object (stdout /
+        // stderr / exitCode) on a non-zero exit, the one thing `handleExec`
+        // promises to keep. Every other group still parses the full argv minus
+        // the group.
+        val args = if (group == "exec") {
+            OffloadArgs(split.execOptionTokens, booleanFlags = noValueFlagsFor(group))
+        } else {
+            OffloadArgs(split.withoutGroup, booleanFlags = noValueFlagsFor(group))
+        }
         // `exec` joins the tokens *after* the group into one shell command, so a
         // leading option must never leak into the command string.
         val rest = if (group == "exec") split.trailing else split.withoutGroup
@@ -1186,7 +1198,12 @@ Examples:
 
 Notes:
   - Caller owns quoting/escaping. Metacharacters (; | > backticks) work.
-  - Default timeout 30s; override via --timeout-ms.
+  - Default timeout 30s; override via `--timeout-ms N` (digits). That option
+    belongs to `exec` itself and is lifted out of the command line.
+  - Output-shaping flags go **before** the group —
+    `android-shizuku-cli --compact exec pm list packages`. After `exec`,
+    every token belongs to the shell command, so `exec grep -q foo` hands
+    `-q` to grep rather than to this CLI.
   - Prefer curated subcommands when they exist — they emit structured JSON.
 """
 
@@ -1373,6 +1390,19 @@ internal data class ShizukuArgv(
     val withoutGroup: List<String>,
     /** The tokens after [group]; what `exec` joins into one shell command. */
     val trailing: List<String>,
+    /**
+     * [deep-audit-1029 ISSUE-07] The tokens of an `exec` invocation that belong
+     * to **the CLI itself**: the leading options plus whatever option tokens
+     * [stripExecTimeoutTokens] lifted out of [trailing]. For every other group
+     * it is just the leading options.
+     *
+     * This is the set the parser is fed for `exec`, precisely so that a
+     * sub-command token such as `grep -q foo` stays out of it: `-q` used to be
+     * read as the output-shaping `--quiet` (which makes [OffloadOutput] strip
+     * the whole `data` envelope on a non-zero exit). Defaults to the empty list
+     * so a hand-built instance keeps compiling.
+     */
+    val execOptionTokens: List<String> = emptyList(),
 )
 
 /**
@@ -1390,13 +1420,75 @@ internal data class ShizukuArgv(
  */
 internal fun splitShizukuArgv(argv: List<String>): ShizukuArgv {
     val index = firstPositionalIndex(argv, ShizukuOffloadHandler.NO_VALUE_FLAGS)
-    if (index < 0) return ShizukuArgv(null, argv, emptyList())
+    if (index < 0) return ShizukuArgv(null, argv, emptyList(), execOptionTokens = argv)
+    val group = argv[index]
+    // [deep-audit-1029 ISSUE-07] `exec` owns one trailing option of its own
+    // (`--timeout-ms N`): it is read by the parser and must not be joined into
+    // the shell command. Every other token after the group is payload — a
+    // sub-command's `-q` / `--quiet` included, which is exactly what the
+    // top-level parser must never see.
+    val leading = argv.take(index)
+    val tail = argv.drop(index + 1)
+    val (payload, execOptions) =
+        if (group == EXEC_GROUP) stripExecTimeoutTokens(tail) else tail to emptyList()
     return ShizukuArgv(
-        group = argv[index],
+        group = group,
         withoutGroup = argv.filterIndexed { i, _ -> i != index },
-        trailing = argv.drop(index + 1),
+        trailing = payload,
+        execOptionTokens = leading + execOptions,
     )
 }
+
+/** The group whose trailing tokens are a shell command, not parsed positionals. */
+private const val EXEC_GROUP = "exec"
+
+/** The one option `exec` reads itself; declared in `EXEC_HELP`. */
+private const val EXEC_TIMEOUT_OPT = "--timeout-ms"
+
+/**
+ * [deep-audit-1029 ISSUE-07] Split `exec`'s trailing tokens into
+ * (shell payload, option tokens the CLI owns).
+ *
+ * Only a **well-formed** `--timeout-ms <digits>` / `--timeout-ms=<digits>` is
+ * claimed. A token that merely looks like the option but carries anything else
+ * (`--timeout-ms foo`, a bare `--timeout-ms` at the end) stays in the payload,
+ * so an over-eager strip cannot silently eat a sub-command argument: the shell
+ * still sees it and fails loudly instead of running a mangled command.
+ *
+ * Known boundary (registered, not a goal): a sub-command that has its own
+ * numeric `--timeout-ms N` cannot be reached through `exec` — write the option
+ * as one shell word (`--timeout-ms\ N`) or use a curated subcommand.
+ */
+internal fun stripExecTimeoutTokens(tokens: List<String>): Pair<List<String>, List<String>> {
+    val payload = mutableListOf<String>()
+    val options = mutableListOf<String>()
+    var i = 0
+    while (i < tokens.size) {
+        val token = tokens[i]
+        val next = tokens.getOrNull(i + 1)
+        when {
+            token.startsWith("$EXEC_TIMEOUT_OPT=") &&
+                isExecTimeoutValue(token.substring(EXEC_TIMEOUT_OPT.length + 1)) -> {
+                options.add(token)
+                i += 1
+            }
+            token == EXEC_TIMEOUT_OPT && next != null && isExecTimeoutValue(next) -> {
+                options.add(token)
+                options.add(next)
+                i += 2
+            }
+            else -> {
+                payload.add(token)
+                i += 1
+            }
+        }
+    }
+    return payload to options
+}
+
+/** A `--timeout-ms` value is digits only — `getInt` would read anything else as null. */
+private fun isExecTimeoutValue(value: String): Boolean =
+    value.isNotEmpty() && value.all { it in '0'..'9' }
 
 /**
  * Index of the first token [OffloadArgs] reads as a positional, or -1 when
