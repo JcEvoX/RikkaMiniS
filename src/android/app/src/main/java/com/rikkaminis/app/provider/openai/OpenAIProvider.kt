@@ -319,9 +319,13 @@ class OpenAIProvider constructor(
      * header; every other OpenAI-compatible endpoint uses `Authorization:
      * Bearer`. Centralized so the Azure branch can't accidentally set the wrong
      * one. Mirrors iOS OpenAIProvider.applyKeyAuth.
+     *
+     * [da1030 ISSUE-06] The body now delegates to the package-level
+     * [applyOpenAIKeyAuth] so the models-list fetcher (OpenAIModelsApi) shares
+     * this exact rule instead of keeping a second, hard-coded Bearer path.
      */
     private fun Request.Builder.applyKeyAuth(token: String): Request.Builder =
-        if (isAzure) header("api-key", token) else header("Authorization", "Bearer $token")
+        applyOpenAIKeyAuth(isAzure, token)
 
     /**
      * Build the request URL for Azure OpenAI, mirroring the official AzureOpenAI
@@ -1563,6 +1567,10 @@ class OpenAIProvider constructor(
         // ctor extraHeaders, then user headers LAST — replace semantics.
         for ((k, v) in extraHeaders) builder.header(k, v)
         for ((k, v) in headers) builder.header(k, v)
+        // [da1030 ISSUE-06] Same last-wins placement as the chat/responses
+        // builders (:2390): after extraHeaders + user headers, so the
+        // per-provider override beats any UA a caller smuggled into `headers`.
+        builder.applyUserAgentOverride(customUserAgent)
 
         com.rikkaminis.app.logging.AppLogger.info(
             "OpenAIProvider",
