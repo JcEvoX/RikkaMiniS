@@ -3,15 +3,15 @@
 > **这是档案的「主题视角」**。同一批条目，换一根轴来读：
 > - `rikkaminis-dev-history.md` — 时间轴（这天发生了什么）
 > - `rikkaminis-dev-history-INDEX.md` — 按天索引（快速跳转）
-> - **本文件** — 主题轴（这件事的完整历史，跨 78 天）
+> - **本文件** — 主题轴（这件事的完整历史，跨 79 天）
 >
 > 由 `skills/dev-history-sync/scripts/build_sagas.py` 从档案自动生成，可重复执行。
 
-- 覆盖范围：2026-08-03 ～ 2026-10-19，共 78 天
-- 条目总数：2012（源文件：rikkaminis-dev-history.md）
+- 覆盖范围：2026-08-03 ～ 2026-10-20，共 79 天
+- 条目总数：2025（源文件：rikkaminis-dev-history.md）
 - 主题数：24
-- 未归入任何主题：182 条（9%，列在文末）
-- 归入 ≥4 个主题（说明规则偏松）：131 条
+- 未归入任何主题：182 条（8%，列在文末）
+- 归入 ≥4 个主题（说明规则偏松）：135 条
 - 标 `↳` 的条目是**推断归属**：标题里没有主题词（「X 完成 / X 收尾」这类收尾条目，主题词在**上一条**里），由「12 小时内最近一条有主题的条目」继承而来，共 140 条。
 
 ### 怎么读
@@ -30,26 +30,26 @@
 | 1 | 滚动跟随 / 流式跳动 | 75 | 08-05 ～ 10-17 | 观察中 |
 | 2 | 输入框 / 键盘 / 粘贴 | 31 | 08-04 ～ 10-19 | 已闭环 |
 | 3 | native 内存 / OOM / 崩溃 | 157 | 08-03 ～ 10-18 | 持续跟踪 |
-| 4 | 沙箱 / rootfs / PRoot / 终端 | 135 | 08-03 ～ 10-18 | 稳定 |
+| 4 | 沙箱 / rootfs / PRoot / 终端 | 136 | 08-03 ～ 10-19 | 稳定 |
 | 5 | fastio offload / syscall 税 | 32 | 08-20 ～ 10-17 | 已合并 main |
 | 6 | 流式回答中断 / 恢复 / 取消 | 164 | 08-03 ～ 10-19 | 已闭环 |
-| 7 | 思考 / 推理泄漏 | 90 | 08-08 ～ 10-18 | 已闭环 |
+| 7 | 思考 / 推理泄漏 | 91 | 08-08 ～ 10-20 | 已闭环 |
 | 8 | 上下文压缩 / 记忆 / 预算 | 198 | 08-06 ～ 10-19 | 稳定 |
 | 9 | Provider / 模型组 / 负载均衡 | 140 | 08-04 ～ 10-19 | 已闭环 |
 | 10 | 备份 / 多端同步 | 161 | 08-03 ～ 10-19 | 收敛 |
 | 11 | 渲染性能 / Markdown / 长会话卡顿 | 129 | 08-05 ～ 10-17 | 已闭环 + 持续加固 |
-| 12 | 审计 / 整改（多轮） | 331 | 08-03 ～ 10-19 | 常态机制 |
-| 13 | 多会话并行协作 / 派发 / 交接 | 457 | 08-04 ～ 10-19 | 成熟 |
-| 14 | CI / 构建 / 发布流水线 | 476 | 08-03 ～ 10-19 | 稳定 |
-| 15 | 开发档案 / 记忆 / 工具链 | 168 | 08-03 ～ 10-19 | 常态维护 |
-| 16 | 会话 / 导航 / 抽屉交互 | 140 | 08-03 ～ 10-19 | 已闭环 |
+| 12 | 审计 / 整改（多轮） | 334 | 08-03 ～ 10-19 | 常态机制 |
+| 13 | 多会话并行协作 / 派发 / 交接 | 468 | 08-04 ～ 10-20 | 成熟 |
+| 14 | CI / 构建 / 发布流水线 | 485 | 08-03 ～ 10-20 | 稳定 |
+| 15 | 开发档案 / 记忆 / 工具链 | 169 | 08-03 ～ 10-19 | 常态维护 |
+| 16 | 会话 / 导航 / 抽屉交互 | 143 | 08-03 ～ 10-20 | 已闭环 |
 | 17 | 平台适配 / 通知 / 图标 / 权限 | 93 | 08-03 ～ 10-19 | 部分放弃 |
 | 18 | 国际化 / 文案 / 本地化 | 29 | 08-04 ～ 09-29 | 已闭环 |
 | 19 | 上游 / 生态吸收 / 开源 | 100 | 08-03 ～ 10-17 | 常态 |
-| 20 | UI 组件 / 设置页 / 交互微调 | 114 | 08-04 ～ 10-19 | 持续 |
-| 21 | Token 用量 / 成本统计 | 82 | 08-05 ～ 10-16 | 已闭环 |
-| 22 | 人格 / Soul / 提示词 / 技能体系 | 141 | 08-04 ～ 10-19 | 稳定 |
-| 23 | 语音 / 多模态输入 | 39 | 08-03 ～ 10-19 | 低优先级维护 |
+| 20 | UI 组件 / 设置页 / 交互微调 | 115 | 08-04 ～ 10-20 | 持续 |
+| 21 | Token 用量 / 成本统计 | 83 | 08-05 ～ 10-20 | 已闭环 |
+| 22 | 人格 / Soul / 提示词 / 技能体系 | 142 | 08-04 ～ 10-20 | 稳定 |
+| 23 | 语音 / 多模态输入 | 40 | 08-03 ～ 10-19 | 低优先级维护 |
 | 24 | 被否掉的方向（决策记录） | 51 | 08-04 ～ 10-18 | 持续累积 |
 
 ---
@@ -346,7 +346,7 @@
 
 ## 4. 沙箱 / rootfs / PRoot / 终端
 
-**跨度** 2026-08-03 ～ 2026-10-18 · **135 条** · **状态** 稳定（09-05 rootfs 事件日志 + apk 自动恢复已上线）
+**跨度** 2026-08-03 ～ 2026-10-19 · **136 条** · **状态** 稳定（09-05 rootfs 事件日志 + apk 自动恢复已上线）
 
 **叙事**：08-03 proot 源码构建（loader 必须独立打包）→ 08-09 终端死屏根治 + 反复开关 OOM → 08-13 PRoot 文件 IO 幽灵层 + apk 包持久化方案 3 + rootfs 占位 tar → 09-05 「沙箱重置、工具不见」三源取证（**不是重置，是 per-session 设计**）→ 09-13 apk 残留进程占锁误诊为「源慢」。**教训密度最高的一条**：沙箱里几乎每个「环境坏了」最后都归到「你误诊了现象」。
 
@@ -487,6 +487,7 @@
 | 10-17 13:20 | FIX-F 收口：deep-audit-1021（WebApp asset URL 单源 + AddToHome 清理闭环）—— fix/da1021-webapp-asset-url-cleanup @ ab9c247，CI #2226 绿，停在分支 | 任务：读 shared/work/deep-audit-1021/fix-tasks/COMMON.md + FIX-F.md（8 支并发派发，我领 FIX-F）。报告 fix-reports/FIX-F.md；装置 r… |
 | 10-17 17:23 | FIX-F 收口：deep-audit-1022 ISSUE-06（镜像 ViewModel 跨线程快照写 + 主线程 IO + 测速自动选源半途）—— fix/da1022-mirror-vm-thread @ 0d4f11d，CI #2240 绿，停在分支 | 任务：读 shared/work/deep-audit-1022/fix-tasks/COMMON.md + FIX-F.md 并执行（先证再改）。基线 main ba4daf69（克隆后逐字符核对）。报告 fix-re… |
 | 10-18 20:55 | FIX-D 收口：deep-audit-1027 ISSUE-05（RootfsVM 两次 verifyIntegrity 主线程直调）—— fix/da1027-d-rootfs-io @ a7aa249，CI #39127888788 绿，停在分支 | 修法：repairRootfs(ctx) 整体并入一个 viewModelScope.launch，两处 manager.verifyIntegrity()（基线 :173 点击回调内 / :191 launch 内 M… |
+| 10-19 20:54 | deep-audit-1032 收口完成（用户令「先更新文档，然后再合并」）：main `c6d426a` + 档案 2012 条 + 7 支待清 | 身份链终态：基线 main 09b6c12（= 报告 2c8c174 + docs，代码零差异）→ 5 支（A c6978d1 / B 6c46f96 / C ad24155 / D af900f2 / E a2106a… |
 
 ## 5. fastio offload / syscall 税
 
@@ -704,7 +705,7 @@
 
 ## 7. 思考 / 推理泄漏
 
-**跨度** 2026-08-08 ～ 2026-10-18 · **90 条** · **状态** 已闭环（09-12 打包合并；同类新方言需重新进表）
+**跨度** 2026-08-08 ～ 2026-10-20 · **91 条** · **状态** 已闭环（09-12 打包合并；同类新方言需重新进表）
 
 **叙事**：08-14 思考折叠框缺失（模型组中转站场景）→ 08-18 「思考跑进正文」+ 断流诊断 → 08-20 thinking 级别无效 → 09-04 thinking-rules-port + 思考字段决策键 → 09-05 thinking-gap-close（审计出 2 HIGH）→ 09-11/12 **think 泄漏实锤：中转站 `<think>` 标签不在解析表**。核心难点：泄漏来自**上游 provider 的方言差异**，不是我们自己的解析 bug。
 
@@ -800,6 +801,7 @@
 | 10-09 00:40 | sweep-B 修复完成（thinking 规则缓存冷启动预热，sweep-1008 唯一 HIGH） | 任务：/var/minis/shared/sweep-1008/fix-tasks/B.md。分支 fix/sweep-p1-thinking-cache-1008 @ 4f6646f8b6ac94e0081ee7279… |
 | 10-16 23:22 | FIX-A 收口：deep-audit-1018 ISSUE-01（P0 截断工具调用）+ ISSUE-02（P1 子代理 reasoning 丢失）+ ISSUE-12c（P2 叠楼守卫）—— fix/da1018-turn-integrity @ 00026c3 两提交，CI #2195 绿，停在分支 | 任务：读 shared/work/deep-audit-1018/fix-tasks/FIX-A.md（先证再改）。报告 fix-reports/FIX-A.md；装置 repo-a/probe/（durable，含 c… |
 | 10-18 00:46 | FIX-F 收口：deep-audit-1024 ISSUE-06（思考规则编辑器保存丢 reasoningEcho/id + 静默改写 wireFormat）—— fix/da1024-thinking-rule-editor-preserve @ 0babeaa，CI #2265 绿，停在分支 | 任务：读 shared/work/deep-audit-1024/fix-tasks/FIX-F.md 立刻执行（先读 COMMON/TRIAGE §3.4）。报告 fix-reports/FIX-F.md（8 节齐、0… |
+| 10-20 00:59 | FIX-E 收口（deep-audit-1033 ISSUE-06 + 07 P1 合支）：usage 模型身份取实时配置 + thinking 弹窗活值 —— `fix/da1033-e-settings-derived-state` @ `1a61b87a`，CI #2350 绿，停在分支 | 身份链三方逐字符：基线 c6d426a7 → 1a61b87a6c7c…；CI run 39278816691（#2350）success。7 文件 +629/−29（4 生产 .kt + 2 测试 .kt + 1 门扩… |
 
 ## 8. 上下文压缩 / 记忆 / 预算
 
@@ -1467,7 +1469,7 @@
 
 ## 12. 审计 / 整改（多轮）
 
-**跨度** 2026-08-03 ～ 2026-10-19 · **331 条** · **状态** 常态机制（已固化为 security-audit-checklist / four-way-sync-check 等 skill）
+**跨度** 2026-08-03 ～ 2026-10-19 · **334 条** · **状态** 常态机制（已固化为 security-audit-checklist / four-way-sync-check 等 skill）
 
 **叙事**：08-05 首次全量代码审查 → 08-16 系统性审计 → 08-18 RC1–RC17 两轮整改（多会话并行）→ 08-26/27 模块审计批 → 09-02 bug-hunt 四会话 → 09-04 diff 驱动定向审计 → 09-09 全局第二轮 T1–T12 → 09-13 完善度横向扫描 → 09-14 度量存活度 → 09-15 七轴 sweep。**审计是本项目最稳定的工程节奏**：每次改动后必有一次独立审计，且审计本身产出纪律（skill）。
 
@@ -1804,10 +1806,13 @@
 | 10-19 13:24 | deep-audit-1030 收尾闭环（用户令「继续推」）：合并 main + main CI 绿 + 文档三件套 + 分支清理 7/7 | 身份链终态：基线 main f7364ec → 5 支并集树 integration/da1030 @ 97e73e7（tree 7145a2bf）→ 合并 main 5032e6a（main^{tree} == 97e… |
 | 10-19 13:34 | 审计背景包 v12→v13 升级（deep-audit-1030 收口后） | 位置：mounts/笔记/RikkaMinis审计背景包/。三件全升：context v12→v13（146→159 KB / 546 行）· prompt v9→v10（46→50 KB / 360 行）· zip b… |
 | 10-19 17:44 | 审计背景包 v13→v14 升级（deep-audit-1031 收口后） | 位置：mounts/笔记/RikkaMinis审计背景包/。三件全升：context v13→v14（159→174 KB / 579 行）· prompt v10→v11（50→54 KB / 375 行）· zip … |
+| 10-19 20:50 | 审计背景包 v14→v15 + prompt v11→v12：结构性重写（用户令「按这一套更新」） | 位置：mounts/笔记/RikkaMinis审计背景包/。三件全换：context v15（174→80 KB / 459 行）· prompt v12（53→21 KB / 226 行）· zip RikkaMini… |
+| 10-19 20:56 | deep-audit-1032 分支清理完成（用户令「清了吧」）：远端只剩 main | cleanup_1032.py delete：7/7 http 204（5×fix/da1032- + docs/dev-history-1032 + integration/da1032，先 check 相全量核验 m… |
+| 10-19 23:48 | FIX-C 收口（deep-audit-1033 ISSUE-03 P1）：android-speech --source 相对路径 —— `fix/da1033-c-speech-cwd` @ `d3037a76`，CI #2348 绿，停在分支 | 身份链三方逐字符：基线 main c6d426a7 → 2 提交（生产 + test/门）→ CI run 39275575813（#2348）success @ 2026-10-19T15:10:26Z→15:28:0… |
 
 ## 13. 多会话并行协作 / 派发 / 交接
 
-**跨度** 2026-08-04 ～ 2026-10-19 · **457 条** · **状态** 成熟（skill: task-dispatch / git-parallel-collaboration / rikkaminis-dev-methodology）
+**跨度** 2026-08-04 ～ 2026-10-20 · **468 条** · **状态** 成熟（skill: task-dispatch / git-parallel-collaboration / rikkaminis-dev-methodology）
 
 **叙事**：08-07 多对话框并发操作同一 worktree 翻车（native OOM 修复）→ 08-12 多任务并行推进模式确立 → 08-15 T1–T10 十会话派发（平衡点施工）→ 08-18 RC 整改凭编号领取 → 08-22 小号 TF-A..TF-J → 08-23 bug-hunt 五会话 → 09-13 两条纪律固化：**每会话独立 clone 绝不共享 .git** + **两分支同基各一 commit 时第二个必须 rebase**。
 
@@ -2270,10 +2275,21 @@
 | 10-19 19:47 | FIX-D 收口（deep-audit-1032 ISSUE-05 + 07）：`fix/da1032-d-terminal-mainid` @ `af900f2`，CI #2341 绿，停在分支 | 身份链三方逐字符：基线 09b6c12 → 两提交（fa7e45b 主体 + af900f2 所有权守卫回填）→ LOCAL == REMOTE == CI head_sha = af900f26382dd058288a… |
 | 10-19 19:54 | FIX-E 收口（deep-audit-1032 ISSUE-06 P1）：设置屏首屏 reload 线程 + 技能编辑器 remember 键 —— `fix/da1032-e-settings-io-keys` @ `a2106ab0`，CI #39245665334 绿，停在分支 | 身份链三方逐字符：基线 09b6c12 → 两提交（ad733d56 主体 + a2106ab0 告警清理）→ CI run 39245665334 / job 118036843575 success，local ==… |
 | 10-19 20:35 | deep-audit-1032 启动+收口前夜：第二道门（8/8 成立）+ 8→5 支合并派发 + 五支全绿 + 并集树 CI 绿 | 输入：附件 shared-ee3fef8b.md（1306 行 / 84,341 B，ISSUE-01..08）。基线 main 09b6c12（= 报声明 2c8c174 的直接后代，diff 仅 docs/dev-h… |
+| 10-19 20:54 | deep-audit-1032 收口完成（用户令「先更新文档，然后再合并」）：main `c6d426a` + 档案 2012 条 + 7 支待清 | 身份链终态：基线 main 09b6c12（= 报告 2c8c174 + docs，代码零差异）→ 5 支（A c6978d1 / B 6c46f96 / C ad24155 / D af900f2 / E a2106a… |
+| 10-19 22:43 | deep-audit-1033 启动：第二道门（8/8 成立，0 驳回）+ 8→5 支合并派发 | 输入：附件 shared-19af2d68.md（518 行 / 69,668 B，ISSUE-01..08）。基线 main c6d426a——主会话 git rev-parse HEAD 自核与报告声明逐字符一致（免… |
+| 10-19 23:13 | FIX-B 收口（deep-audit-1033 ISSUE-02）：`fix/da1033-b-media-guards` @ `a343b015`，CI #39273447241 绿，停在分支 | 身份链三方逐字符：基线 main c6d426a → 单提交 a343b01524b45a5d8cdc8c48c4405113a6a11a4d → CI run 39273447241（job 118131489194）… |
+| 10-19 23:48 | FIX-C 收口（deep-audit-1033 ISSUE-03 P1）：android-speech --source 相对路径 —— `fix/da1033-c-speech-cwd` @ `d3037a76`，CI #2348 绿，停在分支 | 身份链三方逐字符：基线 main c6d426a7 → 2 提交（生产 + test/门）→ CI run 39275575813（#2348）success @ 2026-10-19T15:10:26Z→15:28:0… |
+| 10-20 00:01 | FIX-D 收口（deep-audit-1033 ISSUE-04：offload 载荷 JSON 契约收敛）—— 分支 CI 绿，停在分支 | 身份链三方逐字符：基线 c6d426a7 → 分支 fix/da1033-d-offload-json @ 9b5af91151126a800b2c430d73d92e4450c4ae51（本地==远端==CI head… |
+| 10-20 00:15 | FIX-E 收口（deep-audit-1033 ISSUE-06 + 07 合支）：`fix/da1033-e-settings-derived-state` @ `1a61b87a`，CI job 绿，停在分支 | 身份链三方逐字符：基线 c6d426a → 单提交 1a61b87a6c7ce6cf6222be1e88946e23884bae80（7 文件 +629/−29）→ LOCAL == REMOTE == CI head_… |
+| 10-20 00:48 | FIX-A 收口（deep-audit-1033 I01+I05+I08）：`fix/da1033-a-ro-guard-mainio` @ `7b1b1722`，分支 CI #2353 绿，停在分支 | 身份链三方逐字符：基线 main c6d426a7 → 两提交（a99827d5 主体 + 7b1b1722 编译修复）→ LOCAL == REMOTE == CI head_sha = 7b1b172282a01f5… |
+| 10-20 00:58 | FIX-A 收口（deep-audit-1033 ISSUE-01 + 05 + 08）：`fix/da1033-a-ro-guard-mainio` @ `7b1b1722`（两提交），CI #2353 绿，停在分支 | 身份链：基线 c6d426a7 → a99827d5（主体）→ 7b1b1722（修 CI 编译事故） → CI run 39284407398（#2353）success；三方逐字符一致。9 文件 +602/−82（7… |
+| 10-20 00:58 | FIX-D 收口（deep-audit-1033 ISSUE-04 P1）：offload 载荷 JSON 契约收敛 —— `fix/da1033-d-offload-json` @ `9b5af911`，CI #2349 绿，停在分支 | 身份链三方逐字符：基线 c6d426a7 → 9b5af9115112…；CI run 39276128510（#2349）/ job 118140794036 success（15:13:57Z→15:36:21Z，2… |
+| 10-20 00:59 | FIX-E 收口（deep-audit-1033 ISSUE-06 + 07 P1 合支）：usage 模型身份取实时配置 + thinking 弹窗活值 —— `fix/da1033-e-settings-derived-state` @ `1a61b87a`，CI #2350 绿，停在分支 | 身份链三方逐字符：基线 c6d426a7 → 1a61b87a6c7c…；CI run 39278816691（#2350）success。7 文件 +629/−29（4 生产 .kt + 2 测试 .kt + 1 门扩… |
+| 10-20 01:19 | deep-audit-1033 收口：五支全绿 → 并集树 `aacdba10` 本地 108/108 + 329/329 → 并集 CI #2354 success（判定停止节点） | 身份链：基线 main c6d426a7（= da1032 收口树）→ 5 支（A 7b1b1722（两提交，修过 CI 编译事故）/ B a343b015 / C d3037a76 / D 9b5af911 / E 1… |
 
 ## 14. CI / 构建 / 发布流水线
 
-**跨度** 2026-08-03 ～ 2026-10-19 · **476 条** · **状态** 稳定（Publish 步骤已加 `if: refs/heads/main` 门控）
+**跨度** 2026-08-03 ～ 2026-10-20 · **485 条** · **状态** 稳定（Publish 步骤已加 `if: refs/heads/main` 门控）
 
 **叙事**：08-04 main 编译被 WebDAV 提交弄坏（连红 4 个 run）→ 08-05 android-latest 被分支构建污染 → workflow 门控修复 → 08-17 **CI 缓存恢复旧 native .so**（Tier 0 真 bug）→ 08-24 gh_ci_wait.sh 工具化 + 重复构建幂等守卫 → 09-10 语法门 grep 大小写坑 → 09-14 workflow_dispatch 并发竞态。**「CI 绿 ≠ 逻辑对」这条纪律就是从这条 saga 长出来的。**
 
@@ -2755,10 +2771,19 @@
 | 10-19 19:47 | FIX-D 收口（deep-audit-1032 ISSUE-05 + 07）：`fix/da1032-d-terminal-mainid` @ `af900f2`，CI #2341 绿，停在分支 | 身份链三方逐字符：基线 09b6c12 → 两提交（fa7e45b 主体 + af900f2 所有权守卫回填）→ LOCAL == REMOTE == CI head_sha = af900f26382dd058288a… |
 | 10-19 19:54 | FIX-E 收口（deep-audit-1032 ISSUE-06 P1）：设置屏首屏 reload 线程 + 技能编辑器 remember 键 —— `fix/da1032-e-settings-io-keys` @ `a2106ab0`，CI #39245665334 绿，停在分支 | 身份链三方逐字符：基线 09b6c12 → 两提交（ad733d56 主体 + a2106ab0 告警清理）→ CI run 39245665334 / job 118036843575 success，local ==… |
 | 10-19 20:35 | deep-audit-1032 启动+收口前夜：第二道门（8/8 成立）+ 8→5 支合并派发 + 五支全绿 + 并集树 CI 绿 | 输入：附件 shared-ee3fef8b.md（1306 行 / 84,341 B，ISSUE-01..08）。基线 main 09b6c12（= 报声明 2c8c174 的直接后代，diff 仅 docs/dev-h… |
+| 10-19 23:13 | FIX-B 收口（deep-audit-1033 ISSUE-02）：`fix/da1033-b-media-guards` @ `a343b015`，CI #39273447241 绿，停在分支 | 身份链三方逐字符：基线 main c6d426a → 单提交 a343b01524b45a5d8cdc8c48c4405113a6a11a4d → CI run 39273447241（job 118131489194）… |
+| 10-19 23:48 | FIX-C 收口（deep-audit-1033 ISSUE-03 P1）：android-speech --source 相对路径 —— `fix/da1033-c-speech-cwd` @ `d3037a76`，CI #2348 绿，停在分支 | 身份链三方逐字符：基线 main c6d426a7 → 2 提交（生产 + test/门）→ CI run 39275575813（#2348）success @ 2026-10-19T15:10:26Z→15:28:0… |
+| 10-20 00:01 | FIX-D 收口（deep-audit-1033 ISSUE-04：offload 载荷 JSON 契约收敛）—— 分支 CI 绿，停在分支 | 身份链三方逐字符：基线 c6d426a7 → 分支 fix/da1033-d-offload-json @ 9b5af91151126a800b2c430d73d92e4450c4ae51（本地==远端==CI head… |
+| 10-20 00:15 | FIX-E 收口（deep-audit-1033 ISSUE-06 + 07 合支）：`fix/da1033-e-settings-derived-state` @ `1a61b87a`，CI job 绿，停在分支 | 身份链三方逐字符：基线 c6d426a → 单提交 1a61b87a6c7ce6cf6222be1e88946e23884bae80（7 文件 +629/−29）→ LOCAL == REMOTE == CI head_… |
+| 10-20 00:48 | FIX-A 收口（deep-audit-1033 I01+I05+I08）：`fix/da1033-a-ro-guard-mainio` @ `7b1b1722`，分支 CI #2353 绿，停在分支 | 身份链三方逐字符：基线 main c6d426a7 → 两提交（a99827d5 主体 + 7b1b1722 编译修复）→ LOCAL == REMOTE == CI head_sha = 7b1b172282a01f5… |
+| 10-20 00:58 | FIX-A 收口（deep-audit-1033 ISSUE-01 + 05 + 08）：`fix/da1033-a-ro-guard-mainio` @ `7b1b1722`（两提交），CI #2353 绿，停在分支 | 身份链：基线 c6d426a7 → a99827d5（主体）→ 7b1b1722（修 CI 编译事故） → CI run 39284407398（#2353）success；三方逐字符一致。9 文件 +602/−82（7… |
+| 10-20 00:58 | FIX-D 收口（deep-audit-1033 ISSUE-04 P1）：offload 载荷 JSON 契约收敛 —— `fix/da1033-d-offload-json` @ `9b5af911`，CI #2349 绿，停在分支 | 身份链三方逐字符：基线 c6d426a7 → 9b5af9115112…；CI run 39276128510（#2349）/ job 118140794036 success（15:13:57Z→15:36:21Z，2… |
+| 10-20 00:59 | FIX-E 收口（deep-audit-1033 ISSUE-06 + 07 P1 合支）：usage 模型身份取实时配置 + thinking 弹窗活值 —— `fix/da1033-e-settings-derived-state` @ `1a61b87a`，CI #2350 绿，停在分支 | 身份链三方逐字符：基线 c6d426a7 → 1a61b87a6c7c…；CI run 39278816691（#2350）success。7 文件 +629/−29（4 生产 .kt + 2 测试 .kt + 1 门扩… |
+| 10-20 01:19 | deep-audit-1033 收口：五支全绿 → 并集树 `aacdba10` 本地 108/108 + 329/329 → 并集 CI #2354 success（判定停止节点） | 身份链：基线 main c6d426a7（= da1032 收口树）→ 5 支（A 7b1b1722（两提交，修过 CI 编译事故）/ B a343b015 / C d3037a76 / D 9b5af911 / E 1… |
 
 ## 15. 开发档案 / 记忆 / 工具链
 
-**跨度** 2026-08-03 ～ 2026-10-19 · **168 条** · **状态** 常态维护（skill: dev-history-sync，每次 dev 会话收尾同步）
+**跨度** 2026-08-03 ～ 2026-10-19 · **169 条** · **状态** 常态维护（skill: dev-history-sync，每次 dev 会话收尾同步）
 
 **叙事**：08-06 经验记忆引擎概念 → 08-08 三平台技能架构固化 → 08-14 档案首次从记忆重建 → 08-16/24/09-04/05/07/08/10/12/13/14 反复重建（**每次重建都在修解析器或脱敏规则**）→ 09-06 知识图谱 + MCP memory → 09-14 日志「可消费性」诊断 → 09-15 sanitize 头部刷新固化。**档案本身是被反复施工的产物，不是一次性导出。**
 
@@ -2932,10 +2957,11 @@
 | 10-18 11:52 | ↳ deep-audit-1025 R1 机验半边完成（用户装 2280 包后令「方便完成的验证验了」） | 装包身份链 ✓：设备 versionName=1.0.0+2280 / versionCode 220002280 / lastUpdateTime 2026-10-18 11:47:09 == release andr… |
 | 10-18 21:10 | backlog 覆盖事故（同族复发第 2 次）：file_write 未加 append 覆盖 ~209 段台账 + 重建完成 | 事故：20:56 用 file_write（未设 append）写 §1027-D 到 shared/backlog.md，整文件被覆写成 25 行（原 ~209 段）。恢复 = backlog.md.bak-20261… |
 | 10-19 19:54 | FIX-E 收口（deep-audit-1032 ISSUE-06 P1）：设置屏首屏 reload 线程 + 技能编辑器 remember 键 —— `fix/da1032-e-settings-io-keys` @ `a2106ab0`，CI #39245665334 绿，停在分支 | 身份链三方逐字符：基线 09b6c12 → 两提交（ad733d56 主体 + a2106ab0 告警清理）→ CI run 39245665334 / job 118036843575 success，local ==… |
+| 10-19 20:54 | deep-audit-1032 收口完成（用户令「先更新文档，然后再合并」）：main `c6d426a` + 档案 2012 条 + 7 支待清 | 身份链终态：基线 main 09b6c12（= 报告 2c8c174 + docs，代码零差异）→ 5 支（A c6978d1 / B 6c46f96 / C ad24155 / D af900f2 / E a2106a… |
 
 ## 16. 会话 / 导航 / 抽屉交互
 
-**跨度** 2026-08-03 ～ 2026-10-19 · **140 条** · **状态** 已闭环（09-01 后未再复现）
+**跨度** 2026-08-03 ～ 2026-10-20 · **143 条** · **状态** 已闭环（09-01 后未再复现）
 
 **叙事**：08-03 空对话残留 → 08-04 左滑历史抽屉 + 新建对话弹窗 → 08-06 系统返回不进 SESSION_LIST + 双击返回 → 08-07 重启后进列表页而非新会话 → 08-18 RC10 深链路径穿越 → 09-01 launch-resume 导航修复 → 09-13 冷打开空白。**「打开应用后我在哪」这个问题被修了 6 次**，每次都是不同的入口（返回键 / 重启 / 深链 / 冷启）。
 
@@ -3081,6 +3107,9 @@
 | 10-19 15:06 | deep-audit-1031 启动：第二道门（8/8 成立）+ 8→4 支合并派发（用户令「走流程」+「不要忘了把小的任务合并」） | 输入：附件 shared-8c2edc89.md（1551 行 / 107,816 B，ISSUE-01..08）。基线 main 2bc07ec（= 1030 收口树，本地工作副本自核一致）。工作区 shared/wo… |
 | 10-19 19:47 | FIX-D 收口（deep-audit-1032 ISSUE-05 + 07）：`fix/da1032-d-terminal-mainid` @ `af900f2`，CI #2341 绿，停在分支 | 身份链三方逐字符：基线 09b6c12 → 两提交（fa7e45b 主体 + af900f2 所有权守卫回填）→ LOCAL == REMOTE == CI head_sha = af900f26382dd058288a… |
 | 10-19 20:35 | deep-audit-1032 启动+收口前夜：第二道门（8/8 成立）+ 8→5 支合并派发 + 五支全绿 + 并集树 CI 绿 | 输入：附件 shared-ee3fef8b.md（1306 行 / 84,341 B，ISSUE-01..08）。基线 main 09b6c12（= 报声明 2c8c174 的直接后代，diff 仅 docs/dev-h… |
+| 10-19 20:54 | deep-audit-1032 收口完成（用户令「先更新文档，然后再合并」）：main `c6d426a` + 档案 2012 条 + 7 支待清 | 身份链终态：基线 main 09b6c12（= 报告 2c8c174 + docs，代码零差异）→ 5 支（A c6978d1 / B 6c46f96 / C ad24155 / D af900f2 / E a2106a… |
+| 10-19 22:43 | deep-audit-1033 启动：第二道门（8/8 成立，0 驳回）+ 8→5 支合并派发 | 输入：附件 shared-19af2d68.md（518 行 / 69,668 B，ISSUE-01..08）。基线 main c6d426a——主会话 git rev-parse HEAD 自核与报告声明逐字符一致（免… |
+| 10-20 00:58 | FIX-A 收口（deep-audit-1033 ISSUE-01 + 05 + 08）：`fix/da1033-a-ro-guard-mainio` @ `7b1b1722`（两提交），CI #2353 绿，停在分支 | 身份链：基线 c6d426a7 → a99827d5（主体）→ 7b1b1722（修 CI 编译事故） → CI run 39284407398（#2353）success；三方逐字符一致。9 文件 +602/−82（7… |
 
 ## 17. 平台适配 / 通知 / 图标 / 权限
 
@@ -3333,7 +3362,7 @@
 
 ## 20. UI 组件 / 设置页 / 交互微调
 
-**跨度** 2026-08-04 ～ 2026-10-19 · **114 条** · **状态** 持续（09-12 参数化面板已合并 main）
+**跨度** 2026-08-04 ～ 2026-10-20 · **115 条** · **状态** 持续（09-12 参数化面板已合并 main）
 
 **叙事**：贯穿全程的「小改动流」：08-04 设置页去箭头 + Chat Menu 三项 + 模型组拖拽排序 → 08-05 底部工具条可配置化（含 footer 按钮失效两轮定位）→ 08-08 移除冗余返回按钮 → 08-09 提供商详情页 v2 重构 → 08-14 聊天体验微调 + 回合组折叠 → 09-12 chat-tuning-panel 参数化。**这类改动单看都不重要，但它们占了档案的相当比例——产品的手感就是这么磨出来的。**
 
@@ -3453,10 +3482,11 @@
 | 10-17 22:05 | 审计背景包 v6 + 提示词 v3 更新（为下一波审计准备，2026-10-17 22:0x） | 位置：/var/minis/mounts/笔记/RikkaMinis审计背景包/（挂载盘，用户笔记）。三份文件：audit-context.md（v6，45 KB）· audit-prompt-v3.md（v3，18 K… |
 | 10-19 11:43 | deep-audit-1030 FIX-B 收口：ISSUE-03 浏览器 UA 单源（池级分支 + 面板订阅）—— `fix/da1030-b-browser-ua-pool` @ `346e1be`，CI #2320 绿，停在分支 | 身份链：基线 main f7364ec → 单提交 346e1be5700ec5f8dabfed512048c557bf90f45f（4 文件 +476/−18 = 生产 2 / 门 1 / 测试 1 新建）→ 远端 t… |
 | 10-19 19:54 | FIX-E 收口（deep-audit-1032 ISSUE-06 P1）：设置屏首屏 reload 线程 + 技能编辑器 remember 键 —— `fix/da1032-e-settings-io-keys` @ `a2106ab0`，CI #39245665334 绿，停在分支 | 身份链三方逐字符：基线 09b6c12 → 两提交（ad733d56 主体 + a2106ab0 告警清理）→ CI run 39245665334 / job 118036843575 success，local ==… |
+| 10-20 00:59 | FIX-E 收口（deep-audit-1033 ISSUE-06 + 07 P1 合支）：usage 模型身份取实时配置 + thinking 弹窗活值 —— `fix/da1033-e-settings-derived-state` @ `1a61b87a`，CI #2350 绿，停在分支 | 身份链三方逐字符：基线 c6d426a7 → 1a61b87a6c7c…；CI run 39278816691（#2350）success。7 文件 +629/−29（4 生产 .kt + 2 测试 .kt + 1 门扩… |
 
 ## 21. Token 用量 / 成本统计
 
-**跨度** 2026-08-05 ～ 2026-10-16 · **82 条** · **状态** 已闭环（09-09 实时用量 + 预算上限；09-12 parseUsage 修复合并）
+**跨度** 2026-08-05 ～ 2026-10-20 · **83 条** · **状态** 已闭环（09-09 实时用量 + 预算上限；09-12 parseUsage 修复合并）
 
 **叙事**：08-06 TokenUsageSheet 补缓存命中率 → 08-08 双重扣减 + Gemini cache 修复 → 08-25 用量统计优化 A+B → 08-31 LiteLLM 成本层 V2（JSON 价格表 + 用户可编辑）→ **09-12 parseUsage 双重扣减再次出现**（同族复发）。
 
@@ -3544,10 +3574,11 @@
 | 10-15 16:32 | FIX-A4 完成：消息级 token 估算双计/多路不一致 → 收敛为单一 wire 对齐实现（2026-10-15，分支 `fix/audit2-estimate-1015` @ `37533a3a`，CI #2115 绿，停在分支未合并） | 任务：shared/work/verify-audit2-1015/fix-tasks/FIX-A4.md（审计报告 BUG-06）。基线 main 891d755。报告 shared/work/verify-audit… |
 | 10-15 21:19 | FIX-B 收口：audit3 F-02 预算停出环（P0）→ 分支 CI #2131 绿，停在分支（2026-10-15） | 任务：读 shared/work/audit3-1015/fix-tasks/FIX-B.md 执行。基线 main ca8b95d1，分支 fix/audit3-agentloop-1015 @ 09bb9df6，CI… |
 | 10-16 09:59 | FIX-E 收口：fallback 重算预算 + blocked-empty 不记 Success + shell 预算门终态（fix/da1016-agentloop-budget @ d996e19e，CI #2160 绿，停在分支） | 任务：读 shared/work/deep-audit-1016/fix-tasks/FIX-E.md 执行（6a/6b P1 + 5a + 5b/6c 判定）。基线 main 04e74c53；单 commit d99… |
+| 10-20 00:59 | FIX-E 收口（deep-audit-1033 ISSUE-06 + 07 P1 合支）：usage 模型身份取实时配置 + thinking 弹窗活值 —— `fix/da1033-e-settings-derived-state` @ `1a61b87a`，CI #2350 绿，停在分支 | 身份链三方逐字符：基线 c6d426a7 → 1a61b87a6c7c…；CI run 39278816691（#2350）success。7 文件 +629/−29（4 生产 .kt + 2 测试 .kt + 1 门扩… |
 
 ## 22. 人格 / Soul / 提示词 / 技能体系
 
-**跨度** 2026-08-04 ～ 2026-10-19 · **141 条** · **状态** 稳定（技能体系已固化为 12+ 个 skill，跨会话持久）
+**跨度** 2026-08-04 ～ 2026-10-20 · **142 条** · **状态** 稳定（技能体系已固化为 12+ 个 skill，跨会话持久）
 
 **叙事**：08-07 soul.lang 接线 → 08-08 三平台技能架构 + 内置集成显示修复 → 08-09 Soul 默认人格名对齐 → 08-18 RC 整改含技能模块 → 08-26 人格(Soul)模块审计加固 + 技能/权限模块审计 → 08-29/09-04 subagent 跨会话派发 → 09-07 规则体系对照复杂度五纪律。**「给 agent 定语言 + 定运行时 + 定验证框架」这条主线在应用内的投影。**
 
@@ -3694,10 +3725,11 @@
 | 10-19 09:34 | 审计背景包升级 v11/v8 → **v12/v9**（用户令「为下一波审计做准备」+ 背景文件）：基线 `b353317`，两处引用失真被回树取证抓住当场修正 | 位置：挂载 /var/minis/mounts/笔记/RikkaMinis审计背景包/（发给外部审计模型，非本机会话）。终态根目录 = README.md + audit-context.md(v12, 521 行 / … |
 | 10-19 17:56 | deep-audit-1031 收口完成（用户令「合并并整理」）：main `09b6c123` + 文档 2006 条 + 分支清零 | 身份链终态：基线 main 2bc07ec → 4 支 → 并集树 integration/da1031 @ 31206d41e80a（tree 8eb668ff832169b4261e30dc4d58b30bc7cdd… |
 | 10-19 19:54 | FIX-E 收口（deep-audit-1032 ISSUE-06 P1）：设置屏首屏 reload 线程 + 技能编辑器 remember 键 —— `fix/da1032-e-settings-io-keys` @ `a2106ab0`，CI #39245665334 绿，停在分支 | 身份链三方逐字符：基线 09b6c12 → 两提交（ad733d56 主体 + a2106ab0 告警清理）→ CI run 39245665334 / job 118036843575 success，local ==… |
+| 10-20 00:58 | FIX-A 收口（deep-audit-1033 ISSUE-01 + 05 + 08）：`fix/da1033-a-ro-guard-mainio` @ `7b1b1722`（两提交），CI #2353 绿，停在分支 | 身份链：基线 c6d426a7 → a99827d5（主体）→ 7b1b1722（修 CI 编译事故） → CI run 39284407398（#2353）success；三方逐字符一致。9 文件 +602/−82（7… |
 
 ## 23. 语音 / 多模态输入
 
-**跨度** 2026-08-03 ～ 2026-10-19 · **39 条** · **状态** 低优先级维护（语音输入可用，未再重点投入）
+**跨度** 2026-08-03 ～ 2026-10-19 · **40 条** · **状态** 低优先级维护（语音输入可用，未再重点投入）
 
 **叙事**：08-04 语音 UI 移除 → 08-06 语音功能清理（合并 main）→ 08-27 语音输入顺滑度修复 + voice-ime 合并 → 09-12 senseaudio「系统繁忙」实测 + TTFB 30s 通用缺口。**两次「移除」后又两次「修回来」**——语音这条线反复横跳，最终落在「保留但降低优先级」。
 
@@ -3742,6 +3774,7 @@
 | 10-17 10:44 | FIX-E 收口：da1020 ISSUE-05 语音链路四块（fix/da1020-voice-cancel-ua @ 97102a49，CI #2218 绿，停在分支） | 任务：读 shared/work/deep-audit-1020/fix-tasks/FIX-E.md（先读 COMMON/TRIAGE）。报告 fix-reports/FIX-E.md；装置 repo-e/repo/p… |
 | 10-17 13:41 | FIX-G 收口：deep-audit-1021 ISSUE-08（SpeechRecognitionManager 录音中切引擎 → 在途引擎失控）—— fix/da1021-speech-active-engine @ 6b9e39e，CI #2231 绿，停在分支 | 任务：读 shared/work/deep-audit-1021/fix-tasks/COMMON.md + FIX-G.md 并执行（先证再改、分支隔离、自建 repo-g）。报告 fix-reports/FIX-G.… |
 | 10-19 07:48 | FIX-D 收口：deep-audit-1029 ISSUE-05（语音族 UA 缺口）—— `fix/da1029-d-voice-ua` @ `4c7ad80`，CI #39176720024 绿，停在分支 | 身份链：基线 main 83caac6 → 单提交 19ceb02（3 生产 .kt +204/−2 + 测试 +204）→ 门扩展 4c7ad80（provider_ua_parity_check.py +261）→ … |
+| 10-19 23:48 | FIX-C 收口（deep-audit-1033 ISSUE-03 P1）：android-speech --source 相对路径 —— `fix/da1033-c-speech-cwd` @ `d3037a76`，CI #2348 绿，停在分支 | 身份链三方逐字符：基线 main c6d426a7 → 2 提交（生产 + test/门）→ CI run 39275575813（#2348）success @ 2026-10-19T15:10:26Z→15:28:0… |
 
 ## 24. 被否掉的方向（决策记录）
 
