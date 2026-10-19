@@ -4,8 +4,8 @@
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
 - 合并范围：2026-08-03 ～ 2026-10-19，共 78 天
-- 条目总数：1996（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：2838623 / 总行数：36205
+- 条目总数：2006（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：2860869 / 总行数：36417
 
 ---
 
@@ -36198,6 +36198,218 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 **待用户放行**：①合并并集分支进 main（含 .kt 验证面，非纯文本例外）；②清理 6 支远端分支；③文档三件套重建。
 
 **产出**：收口记录 `shared/work/deep-audit-1030/COLLECT.md`；台账 `DISPATCH.md`；5 份报告 `fix-reports/FIX-A..E.md`；backlog §1030-A..E（229 段 / no-触发条件 3 / 豁免 11，机械门 OK）；装置 `repo-x/probe-c|d|e/` 留盘。
+
+<!-- 2026-10-19 13:24:42 -->
+## deep-audit-1030 收尾闭环（用户令「继续推」）：合并 main + main CI 绿 + 文档三件套 + 分支清理 7/7
+
+
+**身份链终态**：基线 main `f7364ec` → 5 支并集树 `integration/da1030 @ 97e73e7`（tree `7145a2bf`）→ 合并 main **`5032e6a`**（**`main^{tree}` == `97e73e7^{tree}` == `7145a2bf` 逐字节一致** = 我看过的树就是线上树）→ 文档合并 **`2bc07ec`** = **当前 main / 远端 main 逐字符一致**。
+
+**main CI**：push 自动触发 **run 39203059280（#2328）success** @ `5032e6a`（05:09:19Z → 05:23:26Z，~14 min）；26 步 `failed=[]` / `skipped=[]`（**Publish 在 main 放行并执行**，release `android-latest` 已更新）；日志判读 `Summary: 108 passed, 0 failed` + `[108/108]` + `ALL 329 CASES PASS` + 含 FAILED 非 PASSED 行 0。并集 CI #2327 与 main CI #2328 是**同一棵树**（`7145a2bf`），两层读数一致。
+
+**文档三件套**（dev-history-sync）：**1996 条 / 78 天**（上轮 1988，+8；10-19 当天 24 条）· SAGAS **24 主题 / orphans 180（9.0%）/ multi4 130**（上轮 128）· 脱敏两轮 `Remaining sensitive: NONE`（main+INDEX 36 处、SAGAS 单独一遍）· 结构检查：**anchors 1996 == 头部声明条目总数 1996**、INDEX rows 1996、78 天节、**outOrder 0**、fences 64 偶、无 NUL。挂载源与仓库副本 sha256 **逐文件 SAME**。
+
+**★ 结构检查口径踩坑（可复用）**：首版自写检查用「`## ` 行数 == 锚点数」判等，实测 **2021 ≠ 1996** —— 因为条目正文里合法地含 `## ` 级小节（只有 h3 才是结构子节）。正确口径是 **`<!-- date time -->` 锚点数 == 头部声明的条目总数 == INDEX 的 `- \`HH:MM\` ` 行数**。别用「## 行数」当条目标题数。
+
+**纯文本例外第 N 次成立**：docs 分支 diff 仅 `docs/dev-history/**`（4 文件 +213/−20）→ 不 dispatch、不等 CI，`--no-ff` 直接合并；**实测 docs push 未触发新 run**（最新 run 仍是 #2328）✓
+
+**分支清理 7/7**（`cleanup_1030.py`，判据 `ahead_by == 0`、fail-closed 拒绝预期外分支）：check 相 7/7 MERGED + 0 预期外 → delete **7/7 http 204**（5 fix + integration + docs）→ 三源：`ls-remote --heads` 只剩 `main` · REST 按名 3/3 **404** · 本地 `fetch --prune` + `branch -D`。**远端终态 = 仅 `main`。**
+
+**产出**：`shared/work/deep-audit-1030/COLLECT.md`（含收尾执行节）；`cleanup_1030.py`（按批次硬编码 EXPECT，跨批复用须改列表）；backlog §1030-A..E（229 段 / no-触发条件 3 / 豁免 11，机械门 OK）。
+
+<!-- 2026-10-19 13:34:25 -->
+## 审计背景包 v12→v13 升级（deep-audit-1030 收口后）
+
+
+**位置**：`mounts/笔记/RikkaMinis审计背景包/`。三件全升：**context v12→v13（146→159 KB / 546 行）· prompt v9→v10（46→50 KB / 360 行）· zip `b353317`→`RikkaMinis-2bc07ec.zip`（16.7 MB / 1642 条目 / 1102 .kt）**。旧版已归档（archive/audit-context-v12.md + audit-prompt-v9.md + RikkaMinis-b353317.zip，sha256 对拍一致后移入）。
+
+**基线**：main `2bc07ec`（da1030 已合并：`5032e6a` merge + `bc62283` docs + `2bc07ec`）；**已核 `src/` 树在 `97e73e7`（并集 CI #2327 绿）与 `2bc07ec` 间零差异** → zip 切任一个都可，背景包行号对应 `2bc07ec`。
+
+**context v13 改动（26 锚点，python 补丁脚本 fail-closed，工作区 `shared/work/audit-pkg-v13/`）**：
+- 头部：基线 2bc07ec + ★1030 又动 22 个生产 .kt（2 新建单源：`OpenAIAuthHeader.kt` / `ScheduledTaskPolicy.kt`）+ 版本链补 v13。
+- §4.1：十七轮硬数据（8/8 成立连续 12 轮、判级 0 修正连续 6 轮、失真降为 1 条引用层）；**两条新链开张**——「编辑保存 merge vs 整条回写」（1030-08 upsert 整条覆盖吞 run-state）+ 「异步槽位无身份守卫」（1030-07 过期 waiter 覆盖新 waiter）；**会话作用域链到第 6 连**（1030-01 晋升漏 WebAppShortcut 重绑）、remember 链到第 11 连、provider 不对称链到第 7 轮（本仓最长链）、有缓存无重预热链第 4 连（**单调 revision 计数器第 2 次固化**：`customRulesRevision`，与 `SoulStore.writeVersion` 同款）；**v13 兑现记录：v12 落点 (e)「单源未接满」连续三轮中靶 + 收口型支首次占过半（5 支中 3 支产出统一出口）**。
+- §5：门 108 / 夹具 329 **连续第三轮冻结**（1030 全部扩展 0 新建）——门增量段落补 8 道扩展判据（作用域化判据、discriminator 锁调用块、cache-write ≤ bump 数、单源接满普查 603 文件）。
+- §6：77→**84 条**（编号自动接续）。
+- §7：1030 再犁段（会话快捷方式 / accessibility recovery / scheduler **三域首次实质被犁**）；latent ㉓–㉗（**㉔ probeAuthHeader 副本的触发条件「FIX-D 合并 main」已满足**——下轮若报请引用本条给统一方案）；落点微调（低犁清单基本原封：appearance/sandbox/notification/about、ui/components、webapp、data/db 迁移链、photos/contacts/calendar handler 主体）。
+- §8.1：1030 三个新样板（异步槽位身份守卫 / 编辑保存 merge-apply / 出站请求头单源）+ 报法。
+
+**prompt v10 改动（6 锚点）**：新 §2.0h 三条（**引用 .kt 必须给完整包路径**（1030 失真 1 条的教训）/ **契约变更类工单必须列「钉住该契约的既有回归锚」**（1030-C 首轮 CI 红教训：`ThinkingRulesRememberKeyTest` 钉字面量键集，任务书漏列）/ **透传类工单判据 = 「与同一实例兄弟路径取值一致」**（1030-D Kimi azureMode=false 教训））；§5 自检 +3 条 v10 项。
+
+**上轮预测对账（1030 实测）**：P2「收口到单源」**兑现**（2 新建单源 + 1 判据单源收敛）；P4 驳回回升**未兑现**（连续 12 轮 0）；P1 低犁区转移**未兑现**（1030 只碰 scheduler 1 个低犁区）；P5 VERIFY 欠账继续攒（三波）。P3/P7/P8 待观察。
+
+**上轮踩坑（复用）**：①`awk printf %.Ns` 按字节截断多字节字符 → 产生非法 UTF-8 → 下游 grep 误判 binary file matches（文件本身 0 NUL、合法 UTF-8，虚惊）——管道截断中文先 iconv -c 或用 python。②补丁锚点 fail-closed 生效一次（`**未被犁过` 实际无前导 `**`），写盘前 assert 中止未损坏文件。③16 MB 级 zip 归档后 sha256 对拍一致再移。
+
+<!-- 2026-10-19 14:01:22 -->
+## deep-audit-1030 装机后独立复核（用户令「应用已含这波修改，开始验证」）2026-10-19
+
+
+**身份链（装机 = 这波代码，三环闭合）**：设备 `versionName=1.0.0+2328` / `lastUpdate 13:37:22 SGT` ← release `android-latest` = `RikkaMinis Android v1.0.0+2328`，asset 创建 **05:23:20Z**（= CI 完成时刻）← CI **#2328 / run 39203059280** `head_sha=5032e6aa59f9` main success（日志首部自读 `Commit: 5032e6aa…`）。本地 `2bc07ec` 与 `5032e6a` 差异**仅 docs** 4 文件。
+
+**独立复跑（不采信报告）**：本批 8 门真树 **8/8 GREEN** · 8 门 selftest 带牙 · 全量 `gate_run --full` **108/108 + ALL 329 CASES PASS（0 sandbox 0 envretry）** · CI 日志自读（108/108、329、含 FAILED 非 PASSED 行 0、8 门留痕、9 个测试类逐条 PASSED≠FAILED）。
+
+**★ 分档差分臂（最强证据，全精确）**：按支把生产文件回退到 `f7364ec` 字节 → 跑全部 8 门，每档**恰好**该支相关门变红、其余 6–7 门绿（零误报），违例逐行指名（如 E 档点名 `:312/:319/:328` 三处未受守卫释放点）；**ARM-D2** 删新建单源 `OpenAIAuthHeader.kt` → 门6 红。还原后 `SHA256_RESTORE=MATCH` + 工作树 0 modified。
+
+**★★ 真机行为级（I03 浏览器 UA 池）端到端通过**：`browser_use set_user_agent` 正是本支新接的 `BrowserAction.SET_USER_AGENT -> handleSetUserAgent` 分支。两次对照——设自定义视口 1280×720 后切 desktop_chrome：**两个 tab 都变桌面 UA 且视口保持 1280×720**；再设非默认 1000×600 后切 mobile_chrome：**两 tab 都变移动 UA 且保持 1000×600**（排除「恰好等于 profile 默认」的巧合）。⇒ 修复前的「只一个 tab 变 UA + 无参 applyViewport 打回 profile 默认」两种后果均已消失。
+
+**新版本运行健康度**：13:37 装机后 1409 行日志，**FATAL/ANR = 0**，与本批模块相关异常 0；`BrowserTabPool: Created tab 0/1` 在册。
+
+**★ 两个可复用发现（已登记）**：①**`gate_run.sh --selftest` 传参顺序坑**——脚本固定发 `python3 <gate> --selftest <repo>`，而 `skill_frontmatter_roundtrip_check.main()` 只在 `--selftest` 为**唯一参数**时进 selftest，否则把它当 root → `FileNotFoundError` 被记成 **FAIL 而非 SANDBOX**（人造红灯；用 `python3 <gate> --selftest` 单参形态 = `SELFTEST=PASS` 14 arms）。CI 走 `test_scan.py` 的 `()` 形态故无此问题。②**release APK 经 R8 混淆**——dex 里 `MinisApp`/`OpenAIProvider` HIT 但 `AccessibilityRecoveryManager`/方法名 MISS，能命中的字符串（`azureMode`/`imageEndpointMode`）旧代码本就有 ⇒ **dex 符号不能作「本批代码在场」取证**；正解 = CI artifact 的 `mapping.txt` 或与旧版 APK 做字符串差集。
+
+**未验证（UI 面手验）**：A 支快捷方式重绑/徽标、A 支技能 frontmatter 回写、B 支面板 radio（V6）、C 支 UA 字段可见性 + thinking 外部写不回滚、D 支 Azure 取模型/直通 UA、E 支 a11y 提示与调度合并 upsert。探测时前台为 systemui（a11y 树不可用）故未驱动 UI。
+
+**报告**：`shared/work/deep-audit-1030/verify-standalone/REPORT-verify-1030.md`（附 APK、各步原始日志、sha256 对拍）。
+
+<!-- 2026-10-19 14:54:40 -->
+## tierflow 密钥提取（5 账号，2026-10-19）
+
+
+**输入**：用户提供 5 个 tierflow 账号（***PHONE*** / ***PHONE*** / ***PHONE*** / ***PHONE*** / ***PHONE***），要求提取密钥并落到挂载文件夹「除笔记外的另外一个」= `mounts/RikkaMinis现状评估-2026-10-11/`。
+
+**流程**（走 skill `tierflow-key-harvest`，全程 API 不碰 UI）：
+1. probe 只读侦查 → 5/5 均为「余额 ¥5.0（礼金）｜轻享版套餐｜按量 Key 0 把｜套餐 Key 无」= 全新号，无存量 Key ⇒ **无需 `--rotate-existing-sub`**（不触发旧 Key 作废风险）。
+2. harvest（`--verify-keys --include-passwords`）→ 每号各建 1 把按量 Key + 1 把套餐 Key，共 10 把。
+3. 认证验证 `GET /v1/models`：**5/5 `verify: 200,200 ALL-OK`**（两把 Key 各 200）。
+4. 写后复验 probe：5/5「按量Key 1 把｜套餐Key has」。
+5. 临时账号清单 `/tmp/tf_acc_1019.txt` 用完即删。
+
+**产物**（两处，sha256 逐字节一致：md `1ce6e9e2…` / csv `860d401c…`）：
+- `mounts/RikkaMinis现状评估-2026-10-11/tierflow-keys-2026-10-19.md` + `.csv`（用户指定位置）
+- `/var/minis/shared/work/tierflow-1019/`（跨会话副本）
+
+**本批套餐号**：SB1261019150050 / SB1261019874408 / SB1261019953984 / SB1261019568144 / SB1261019349793（轻享版 ¥29.9，30 天）。
+
+**口径提醒**：完整 Key 只在创建时返回一次，事后一律打码不可找回 ⇒ 这两个文件是唯一完整副本。接入 `https://tierflow.cn/v1`，模型名只接受 `tierflow` / `tierflow_pro`。
+
+<!-- 2026-10-19 15:06:58 -->
+## deep-audit-1031 启动：第二道门（8/8 成立）+ 8→4 支合并派发（用户令「走流程」+「不要忘了把小的任务合并」）
+
+
+**输入**：附件 `shared-8c2edc89.md`（1551 行 / 107,816 B，ISSUE-01..08）。**基线** main `2bc07ec`（= 1030 收口树，本地工作副本自核一致）。工作区 `shared/work/deep-audit-1031/`（repo 由 `git clone --no-hardlinks` 从 1030 的浅克隆复制，100M，HEAD `2bc07ec` ✓）。
+
+**第二道门（不采信报告行号，全部回树 grep）**：**8/8 缺陷本体成立，0 驳回**；判级 **P0:0 · P1:5（01–05）· P2:3（06–08）**，与报告一致。抽查 26 处锚点命中 **22/26（85%）**。产物：`TRIAGE.md`（§1 逐条证据 / §2 判级 / §3 失真 / §4 行号可信度 / §5 支划分）。
+
+**★ 4 条报告失真（任务书已按真树口径修正）**：
+1. **ISSUE-07 的「Before」片段**把 `OpenAIAuthHeader.kt` 写成已有 `openAIKeyAuthHeader` + `applyOpenAIKeyAuth` 两函数 —— 实际**只有 `applyOpenAIKeyAuth`**，纯函数尚不存在（需新建）。报告的 Before 是它自己的设想的 After。
+2. **ISSUE-02** 建议「新增 `clearSessionGrants`」—— 该函数**已存在**（`:618-620`）且有生产调用点 `ChatViewModel.onCleared()`；真缺口 = 新增 `renameSessionGrants` + `MinisApp.onSessionDeleted` 接线。
+3. **ISSUE-04 测试文件 `DebugOffloadHandlerTest.kt` 未标「(新增)」** —— 该文件不存在（任务书标为新增）。
+4. **路径失真**：`decideImageRoute` 报告写 `service/ModelUseProtocol.kt`，实为 **`sandbox/offload/ModelUseProtocol.kt`**（D 支修法依赖此路径）。
+
+**★ 8 → 4 支合并（用户提醒「小的任务合并」）**：原报告给 6(Batch1)+1+1 = 8 支；按**主题同族 + 文件零交集 + 门零交集**合并为 4 支，**全并行**：
+| 支 | ISSUE | 分支 | session |
+|---|---|---|---|
+| A | 01+03（跨层引用与配置一致性） | `fix/da1031-a-refs-and-config` | `c82d2b60` |
+| B | 02（权限槽位并发 + 会话 grants 生命周期） | `fix/da1031-b-permission-slots` | `162ae0a8` |
+| C | 04+05（沙箱守卫/路径 + 日历区间校验） | `fix/da1031-c-sandbox-guards` | `a929ba57` |
+| D | 06+07+08（UI/Debug 面） | `fix/da1031-d-ui-debug-surface` | `49194905` |
+生产文件 7+3+5+7 互不相交、测试互不相交、门 4 组互不相交。D 支**支内三步顺序**（先 07 → 06 → 08）因三者共用 `ProviderMutationMethods.kt`。**送达 4/4**（回读 marker 齐）。
+
+**★ 三条可复用认识**：
+1. **「反向锁死」这个形态值得进工具箱**：ISSUE-01 的真形态不是「漏改一处」而是 **bug 形状被测试 + 门禁双重逐字钉死**（`ProviderEntryKeyAndPinTest.kt:266-275` 与 `compact_entry_pin_migration_check.py` 的 `VOICE_ARM` 都断言 `staleSeedIds`）→ 修 bug 必须**同步重锚**「钉住该契约的既有回归锚」，否则改对了反而 CI 红。这正是 prompt v10 §2.0h 第 2 条（契约变更必须列既有回归锚）的又一实证。
+2. **id 空间混用是静默空转的常见根**：`ensureVoiceTemplateModels` 拿 `baseModel.id`（裸模型名）比对 `entry.id`（uuid→composite）→ 四路级联 100% 空转；**反证法**最快——看同文件兄弟路径（`removeInstance`/`replaceEntry`/`replaceEntries`）用什么形态，异类者即缺陷。
+3. **只读锁是软件锁这一事实要写进判据**：`PRootKernel.isLinuxPathUnderReadOnlyMount` 的 KDoc 自陈 `-b` 无只读修饰符（shell 可写穿）⇒ 「UI 不加守卫 = 宿主文件真被删」成立；同时暴露 `readonly_mount_write_guard.py` 的 `PATH_PARAMS` 参数名白名单可被「参数名不含 linuxPath」直接绕过（`handleWriteFile(params: JSONObject)`）→ 判据应从「参数名白名单」升级为「函数名 + 写调用」定位。
+
+**派发细节**：`minis-sessions-cli send --async --compact`（会话子代理 = 用户默认口径，**未用 spawn_agent**）；任务书 `fix-tasks/COMMON.md`（机构纪律：分支隔离 / 三层装置 / L1–L4 证据口径 / 必守锚点 / backlog 追加纪律）+ `FIX-A..D.md`；台账 `DISPATCH.md`（含收口 TODO 7 条，其中特别标注**A 支门 × D 支改动交叉复核**：`compact_entry_pin_migration_check.py` 会读 `ModelGroupsScreen.kt`，而 D 支改它 → 合并树上需确认该门仍绿）。
+
+**本批冻结面**：`scan.sh`/`test_scan.py` 施工期冻结；**0 新建门**（4 个既有门扩展）→ **门 108 / 夹具 329 不变**。
+
+**收口待办（等用户叫）**：4 支回报 → 三项核查 → `integration/da1031` 试合并 → 全量 `gate_run --full` + `test_scan` → 并集 CI + 日志判读 → 真机窗口一次开齐（各支 R1）→ 交用户决定合并 main + 清理远端分支。
+
+<!-- 2026-10-19 16:25:52 -->
+## FIX-A 收口（deep-audit-1031 ISSUE-01 + ISSUE-03 合支）：`fix/da1031-a-refs-and-config` @ `86e6979`，CI #2330 绿，停在分支
+
+
+**身份链三方逐字符**：LOCAL == REMOTE == CI `head_sha` = `86e69796e10d47c541dbe9d9bcc0f99388fccc46`（基线 main `2bc07ec`）。单提交 7 文件 +509/−32（3 生产 .kt + 2 测试 .kt + 2 门 .py）。**未合并 main**（含 .kt 验证面，起手权在用户）。
+
+**修法三处**：①`ensureVoiceTemplateModels` 的 `staleSeedIds` 用裸 `baseModel.id` 比对 entry.id 形态的四路清理（memberEntryIds / agentLoop / compact pin / clearStaleSecondaryRefs）→ 100% 空转，改为 `staleEntryIds`（entry.id 形态），`staleSeedIds` 保留供谓词与日志；②`updateEntry` 改名分支补 voice 两条 override prefs 迁移；③`ConfigBuiltins.registerDefaults` 补登记 `defaults.voiceInputGroup/voiceOutputGroup`（此前 0 登记 = 备份导出缺字段 = 恢复静默蒸发）+ `ConfigBackup.remapDefaultsIds` 补两键走 `groupIdMap`；④Stage 1 登记键改**备份原 label**（原用落库后可能已自动改名的 label，与 Stage 1.5 失配 → 思考规则整组丢弃）。
+
+**验证四层**：门 1 `compact_entry_pin_migration_check` **9 arms green**（新增 VOICE_ARM 判据 `staleSeedIds`→`staleEntryIds` + updateEntry voice 迁移 arm，判据挂写入点不挂函数名）· 门 2 `backup_remap_rollup_check` **17 arms matched**（`BACKUP_REMAP_ROLLUP_SELFTEST=PASS`）· **JVM 2×2 探针 `JVM_PROBE_2x2=PASS`**（ff 42 绿 / pf 4 红=新用例逐条咬住生产缺陷 / fp 1 红=证再锚承重 / pp 37 绿=pre-fix 世界内部自洽）· 本地全量 108/108 + test_scan 329/329 · **分支 CI #2330（run 39220703535）success**，job 日志 1,204,592 B 判读：`Summary: 108 passed, 0 failed` + `ALL 329 CASES PASS` + `[1/108]`→`[108/108]` + 两门各留痕 + 含 FAILED 非 PASSED 行 0 + 唯一 skipped = Publish（main 门控正确）。**门 108 / 夹具 329 不变**（两门均为扩展）。
+
+**★ 探针搭建两个真缺陷（都是编译/运行逼出来的）**：①`extract.py` 的块切分正则漏 `re.MULTILINE` → 切片**泄漏进下一顶层声明**（报 `BLOCK LEAKS INTO NEXT DECLARATION`），加「锚点声明之后区块不得再含列 0 顶层声明」自检 fail-closed；②切片**未携带源文件 import** → `ConfigValue` 跨包解析失败，改为 TARGETS 表为每切片携带源里逐字存在的 import + 「import 不在源文件中即 raise」校验。
+
+**登记 backlog §1031-A**（R1 真机三条 / R2 staleSeedIds 双命名负决策 / R3 探针不升格为门 / R4 装置仓外第 4 次 / R5 不动清单 0 diff / R6 施工期跑全量的流程偏离如实登记）；机械门 234 段 / no-触发条件 3 / 豁免 11 OK。
+
+**报告**：`shared/work/deep-audit-1031/fix-reports/FIX-A.md`（8 节）；探针 `probe-a/jvm/`（含 `extract.py`/`run.sh`/`stub/`/`out/`）；CI 日志 `ci-job-2330.log` + 判读脚本 `judge-2330.py`。
+
+<!-- 2026-10-19 16:33:43 -->
+## FIX-C 收口（deep-audit-1031 ISSUE-04 A1/A2/B1/B2 + ISSUE-05 B）：`fix/da1031-c-sandbox-guards` @ `5062174`，CI #2331 绿，停在分支
+
+
+**身份链三方逐字符**：LOCAL == REMOTE == CI `head_sha` = `50621745fdcb66ffdc79e27709b64a4ef65c2701`（基线 `2bc07ec`）。单提交，8 文件 +729/−5（5 生产 .kt + 1 新测试 + 1 扩展测试 + 1 门）。**未合并 main。**
+
+**修法（四缝 + 一缺陷）**：①`FileBrowserViewModel.deleteItem` 新增 `linuxPathOf(item)`（与 `updatePathComponents` 同口径）+ **先**守卫再删；②`AppNavigation` mounted-folder 路由补 `linuxRoot`/`displayPrefix = "/var/minis/mounts/${entry.name}"`（否则守卫在该入口不可达、「Copy Absolute Path」复制宿主路径）；③`DebugRPCHandler.handleWriteFile` 解析 path 后加只读守卫，`-32000` 同家族码（`..` 拒绝/overwrite/encoding/mode 一字未动）；④`DebugOffloadHandler` 新增 top-level `DEBUG_PATH_SUBCOMMANDS` + `normalizeDebugRpcPaths`，走共享 `resolveMaybeRelative`（`buildRpcCall` 签名未动）；⑤`CalendarOffloadHandler` companion 加 `timedEndRepairMs`（`stored==null→null`；`span<=0→+1h`；否则 `newStart+span`）+ `invertedTimedRange`（all-day 豁免，`dtstart==dtend` 是规范行）。
+
+**★ 判据设计关键决策（可复用）**：门 `readonly_mount_write_guard.py` 的 `PATH_PARAMS` 白名单是**按参数名**键控，看不见**模型承载**的写（`item: FileItem` / `params: JSONObject`）。试探加宽到 `item|params` **新命中 3 处合法站点**（`parseAttachments`/`handleModelUseExec`/`postJsonRpc`），其中一处与被保护站点**同文件** ⇒ 文件级豁免会顺手关掉要保护的判据。**改为按「函数名 + 写调用」锚定，并要求守卫在写之前**（`return@launch` 在 delete 之后 = 验尸不是守卫，单独一条违例文案）。这条「白名单按参数名键控 → 漏模型承载的写」是新的缺陷形态，值得进上下文包。
+
+**验证五层**：门 selftest **32 臂**（+9，全带牙）· **差分臂**（三锚点文件逐字节回退 → 门 rc=1 且**恰好**点这三处，零误报；还原 `sha256sum -c` 三文件 OK）· 门真树 rc=0（`3 model-carried write/route site(s) carry the guard in front of the write`）· **JVM 装置 22 例全绿**（真 in-repo 测试 + `extract_slices.py` 逐字切片，带源 sha256）· **变异 5/5 全抓 + 逐字节还原**（M1-M3 门、M4-M5 JVM）· 全量 `gate_run --full` **108/108 GREEN**（0 sandbox 0 env-retry）· `test_scan.py` **ALL 329 CASES PASS**。
+
+**★ 三个装置/判读坑（新，可复用）**：
+1. **JVM 装置类路径顺序**：`android.jar` 自带 `org.json` **Stub!**，排在真 json jar 前面 → `RuntimeException: Stub!`。正解 = `CP="$LIB/json-20240303.jar:$ANDROID_JAR:…"`（json 在前）。
+2. **切片提取器的表达式体截断**：`internal fun f(...): T =` 换行续写时，`_depth==0` 就 break 会把 `=` 之后的内容切掉 → 切片语法错。判据要加「行尾是 `=`/运算符/`(` 则继续」。切片还必须**搬运源文件的平台/JDK import**（`Calendar`/`TimeZone`/`JSONObject`），但过滤掉 `com.rikkaminis.*`/`androidx.*`（那正是装置要绕开的依赖锥）。
+3. **判读脚本截断陷阱（第 N 次新形态）**：首版 CI 判读把 `matches` 截在前 40 条，**108 条门头把额度吃光** → 本支留痕一条都没进结果，"grep 为空"是**脚本截断**不是日志里没有。正解 = 先落原始日志（`l2/job-2331.log`）再逐条断言（`grep_2331.py`）。
+
+**CI 判读**（job 117956375591，日志 1,202,666 B）：26 步全 success（`Publish to Releases` 正确 skipped = 非 main 门控）· `Summary: 108 passed, 0 failed` · `[108/108]` · `ALL 329 CASES PASS` · `readonly_mount_write_guard.py on real repo exits 0` · `[26/108] Read-only-mount write guard` · `DebugOffloadHandlerTest` x10 · `CalendarFreebusyInstancesTest` x14 · `compileReleaseKotlin` x2 · **含 FAILED 不以 PASSED 结尾的行 = 0**。门 108 / 夹具 329 不变。
+
+**登记 backlog §1031-C**（232→233 段，`scan_debt.py notes` 判 OK）：R1 真机行为级（只读挂载删除 / 定时改期）· R2 门判据只覆盖调用序不覆盖控制流（`return@launch`→`Unit` 仍绿）· R3 路由前缀判据用字面串（改常量拼接会假红）· R4 装置在仓外 `probe-c/` · R5 负决策（不放宽白名单，实测依据如上）。
+
+**产出**：报告 `shared/work/deep-audit-1031/fix-reports/FIX-C.md`（8 节 / TODO 0）；装置 `probe-c/`（`jvm/run.sh` + `jvm/extract_slices.py` + `mutations.py` + `run_mutations.sh` + `judge_2331.py` + `grep_2331.py`）；CI 原始日志 `l2/job-2331.log`。
+
+<!-- 2026-10-19 16:38:08 -->
+## FIX-B 收口（deep-audit-1031 ISSUE-02 [P1] 权限槽位并发竞态 + 会话 grants 生命周期）
+
+
+**身份链**：基线 `2bc07ec` → 分支 `fix/da1031-b-permission-slots`，tip **`75b84d09af8dcf553b5ac602e41f75fadfa8aceb`**（两提交：`6e29173` 主体 + `75b84d0` 告警清理）→ **CI run 39221742308 success**（08:17:39Z→08:32:18Z），本地 HEAD == 远端 tip == CI `head_sha` 三方逐字符。**未合并 main**（含 .kt 验证面）。规模 **4 文件 +770/−43**（3 生产 .kt + 1 新测试 .kt），**无新增门**（108 门 / 329 夹具不变）。
+
+**修法三条单一权威**：①三槽位 claim→install 收成受 `slotLock` 保护的原子转换（`SlotClaimed` 哨兵，占位丢则按认领失败 TIMEOUT 收场、绝不覆盖别人的槽）；②三条释放路径（respond* / invokeOnCancellation / 超时）统一经 `clearSlotLocked(token)` 身份守卫释放点；③新增 `renameSessionGrants`（`ConcurrentHashMap.remove` 原子迁移）+ `onSessionDeleted` 接**既有** `clearSessionGrants`。
+
+**★ 差分臂逼出的测试设计教训（本支最有价值一步）**：首版并发用例是**顺序**触发（赢家先装槽、输家才进）→ 新旧树都绿 = **无分辨力**。改成 **8 路 `CountDownLatch(1)` 同时起跑 × 20 轮赛跑**后：修复树 3/3 稳定绿、**改前树 5/5 稳定红**（典型读数「应 7 路被拒」实测 5~6 路 = 多个调用者都以为自己占住槽、其余成孤儿）。可复用纪律：**并发缺陷的用例必须真同时起跑，顺序调用只能证明"能跑到"，不能证明"竞态被消除"**。改前臂用**仓外精简探针**（只含行为用例，避免被 repo 的 `*.kt` 扫描门扫到 + 改前树缺新 API 根本编不过 shipped 测试）。
+
+**其余证据**：邻门 10/10 rc=0 · 全量 `scan.sh` 108/0（SCAN_EXIT=0）· `test_scan` ALL 329 CASES PASS · 变异负控 **3/3 全抓 + 字节还原 sha256 全 MATCH**（MUT-2 锚点曾因三个 respond 共用同一行而不唯一 → 用字段名唯一化）。
+
+**★ CI 判读复用**：`probe-b/ci_judge.py` 踩两坑已修——(a) 本 run 的 job 对象**没有 `logs_url` 字段**，须按 job id 拼 `https://api.github.com/repos/{repo}/actions/jobs/{id}/logs`（写 `j.get("logs_url") or 兜底` 更稳）；(b) **第一跳必须带 Authorization + Accept** 才拿得到 302 Location（裸请求直接 403 无 Location），第二跳 CDN **不得**带 auth。判读口径：`Summary: 108 passed, 0 failed` / `ALL 329 CASES PASS` / 本支 5 例逐条 PASSED / FAILED-不以-PASSED-收尾行 0 / 唯一 skipped = `Publish to Releases`（`Publish` 单测用例名子串陷阱第 N 次复核）。
+
+**★ 绿之后再改 = 必须重赢停止节点**：首轮 CI 绿（`6e29173`，run 39219258472）后，日志里发现本支新测试一条 `Unchecked cast` 编译告警——`@Suppress("UNCHECKED_CAST")` 挂在只做转发的 `grants()/denials()` 上，真正的 `as MutableMap<…>` 在 `sessionMap()` 内。处置 = 抑制挪到转换点 → 本地装置 5/5 绿且编译 0 告警 → 提交 → **重推 + 重跑整轮 CI**（run 39221742308），第二次日志该告警 0 命中。纪律：改动后旧绿作废，不拿旧 run 当新提交的证据。
+
+**产出**：报告 `shared/work/deep-audit-1031/fix-reports/FIX-B.md`（八节 / 19,911 B，§8 列两次 run 与告警清理理由）；backlog §1031-B（R1 真机并发 TIMEOUT + grants 生命周期 / R2 grants 迁移无行为测试 P2 / R3–R5 负决策 / **R6 流程偏离如实登记**：本轮 kotlinc/JVM/全量门未过 `gate_run.sh --exec` 全局锁而同期有 C/D 支产出，实测无 S28 签名故登记为纪律回填）；装置 `probe-b/{jvm,prefix-arm.sh,mutate-b.py,ci_judge.py}`；台账 234 段 / 机械门 OK。
+
+<!-- 2026-10-19 17:01:17 -->
+## FIX-D 收口（deep-audit-1031 D 支：ISSUE-06 + 07 + 08）—— 分支 CI 绿，停在分支
+
+
+**身份链**：基线 main `2bc07ec` → 4 提交（`6cf7058` ISSUE-07 → `54951b3` ISSUE-06 → `bc57d68` ISSUE-08 → **`8a5f68d`** 门判据重绑）→ 分支 `fix/da1031-d-ui-debug-surface`；**远端 tip == 本地 HEAD == CI `head_sha` = `8a5f68d16f846b4896d91311b8dee1f5b6cac4bb`**（判读脚本 `SHA_MATCH=YES`）。**未合并 main**（起手权在用户）。
+
+**CI 二轮**：run **`39224593619`（#2334）success** @ 08:58:41Z（≈17 min）。判读：1 job、`steps_failed=[]`、唯一 skipped = `Publish to Releases`（main 门控正确）；`[1/108]`→`[108/108]`；`Summary: 108 passed, 0 failed`；`ALL 329 CASES PASS`；含 `FAILED` 而不以 `PASSED` 结尾的行 **0**。**门 108 / 夹具 329 不变**（4 步全为扩展既有门/既有测试，0 新建门、未动 `scan.sh`/`test_scan.py`）。
+
+**★★ 本轮最有价值的事故与修法（可复用）**：首轮 CI run `39222298267` 红在 **别人批次的门** `provider_ua_parity_check`（da1030 建），非本支门。根因 = ISSUE-07 把 Azure 鉴权头决定点从 `header("api-key", …)` **字面形态下沉成纯 pair 构造器**（`"api-key" to token`，让 debug 探针与 chat/models 共用同一函数体），而该门把「单源」**编码成具体调用写法的字面量**。**任务书锚点清单漏列了这道钉住同一契约的既有门**（与 1030-C 的 `ThinkingRulesRememberKeyTest` 同族，审计背景包 v10 §2.0h 已有该规则，本批是它在**门**层的复现）。
+**修法（不动代码形态，改判据绑定对象）**：`API_KEY_DECISION_FORMS = ('header("api-key"', '"api-key" to')` —— 本文件**任一**形态算单源，别处**任一**形态算违规（清扫命中项按 `_hit` 报实际形态）；docstring D2 同步；补 pair 形态三臂夹具（干净源 / 缺 `applyOpenAIKeyAuth` / 调用方副本）+ **一条精度夹具**（`debug/LLMRequestLog.kt` 敏感头拒绝清单含裸串 `"api-key"` **不算**决定点）。**刻意不放宽成裸 `"api-key"`**——仓内有两处合法出现裸串（`debug/LLMRequestLog.kt`、`backup/ConfigBackup.kt` 的 key 别名表），放宽即两条假红；故形态串取 `"api-key" to`。实证：gate 真树 rc=0 · selftest PASS 三新臂行为正确（pair 源 0 / pair 副本 1 / pair 缺函数 1）· `test_scan.py` 329/329 · 全量 `scan.sh` 108/0。
+**纪律**：**对被既有门以字面量形态钉住的契约做等价重构前，先跑全量 `scan.sh`**（只跑本支门/本支测试发现不了这类冲突）；**判据绑决定点，不绑调用形态**（同 1027-E 纪律）。
+
+**另两个流程踩坑**：①`git commit -m` 长中文消息在沙箱触发 `syntax error` → 用 `file_write` 写 message 文件 + `git commit -F`。②selftest 夹具块位置漂移致 `old_string not found` → 改字节级替换脚本 + `ast.parse` 校验（fail-closed）。
+
+**产出**：报告 `shared/work/deep-audit-1031/fix-reports/FIX-D.md`（167 行 / 14331 B，§3 第 4 步 + R7 流程缺口 + §8 CI 证据齐）；判读脚本 `probe-d/ci/judge.py`；台账 `shared/backlog.md` **235 段**（§1031-A/C/D/D-补 全 OK，no-触发条件 3 / 豁免 11）。
+
+<!-- 2026-10-19 17:44:29 -->
+## 审计背景包 v13→v14 升级（deep-audit-1031 收口后）
+
+
+**位置**：`mounts/笔记/RikkaMinis审计背景包/`。三件全升：**context v13→v14（159→174 KB / 579 行）· prompt v10→v11（50→54 KB / 375 行）· zip `2bc07ec`→`RikkaMinis-2c8c174.zip`（16.7 MB / 1645 条目 / 1105 .kt）**。旧版归档（archive/audit-context-v13.md + audit-prompt-v10.md + RikkaMinis-2bc07ec.zip，sha256 对拍）。
+
+**基线**：main `2c8c174`（da1031 已合并，8 工单合 4 支 / 31 文件 +2880/−121 / 生产 18·测试 8·门 5 / 3 新测试文件）；**已核 `2c8c174` 与 `origin/integration/da1031 @ 31206d4` 全树零差异**（比文档写的「src/ 同」更强）。门 108 / 夹具 329 **连续第四轮冻结**（5 道门只扩判据）。
+
+**context v14 改动（34 锚点）**：
+- 头部：基线 + ★1031 十八个生产 .kt + 版本 v14。
+- §4.1：**十八轮**硬数据（8/8 成立连续 13 轮、判级 0 修正连续 7 轮、失真**换回内容级** 4 条/85% 命中）；表格标题行口径修正（近十三轮 1019–1031）；**新增元形态链「同族栅栏」**——缺陷形状被门/测试逐字**双重钉死**（1031-01 的 `staleSeedIds`）⇒ 修 bug 必须同步重锚，否则「改对了反而 CI 红」；另两个面：等价重构撞红别人批次的门 ⇒ **判据绑决定点不绑调用形态** + **改被门钉住的契约前先跑全量 scan.sh**。
+- 链加长：会话作用域**第 7 连**（1031-02 grants 迁移/清理两端点）、守卫装错层**第 5/6 连**（只读挂载写守卫缺失 + 定时倒置区间只装 all-day 分支）、白名单漏登**`ConfigBuiltins` 第 4 次**（voice 两组键，恢复静默置 null）、provider 不对称**第 8 轮**、加字段链加子形态 **id 空间混用（比对恒假 → 四路级联 100% 空转）**、锁边界**第 2 例**（claim→install 非原子）。
+- §5：5 门扩展（**判据从「参数名白名单」改为「函数名 + 写调用」，并要求守卫在写之前**——白名单看不见模型承载的写 `item: FileItem`/`params: JSONObject`，新缺陷形态）；`provider_ua_parity_check` 判据重绑（`API_KEY_DECISION_FORMS` 双形态，刻意不放宽成裸串）。
+- §6：92 条（新增 85–92）。
+- §7：**latent 机制首次闭环兑现**——v13 我登记的 **㉔ probeAuthHeader 副本**（触发条件「FIX-D 合并 main」）本轮被 1031-07 报出并收敛为委托 `applyOpenAIKeyAuth`；低犁清单**连续两轮零消耗**（1031 全落已犁区）⇒ 落点微调写明「降 config-backup / 设置屏组编辑火力，压向低犁清单」；latent ㉘–㉝。
+- §8：补写 1030 轮小节（v13 时漏了）+ 1031 合并成「1030–1031」小节——**新失真形态「设想当现状」**（Before 片段把待新建函数写成已存在）+ 「建议新增已存在的函数」+ 新文件未标 (新增) + 行号 85%。
+- §8.1：1031 两条判据设计教训（绑函数名+写调用 / 绑决定点）。
+
+**prompt v11（5 锚点）**：新 §2.0i 四条 + **契约变更须同时扫「既有测试」与「既有门」两层**；§1.1 火力压向低犁清单；§5 自检 +3 条。
+
+**上轮（v13）预测再次对账**：P2「收口到单源」✅ 继续（1031-07 单源收敛 + 1031-08 判据单源）；P1「低犁区转移」❌ 仍未发生（连续两轮零消耗，已在 prompt v11 里显式施压）；P3「P0 回归」未发生（连续 13 轮 0）；P4「驳回回升」未发生（连续 13 轮 0）；P5「VERIFY 欠账」✅ 四波攒着；**P7「次生问题浮现」部分兑现**（1031-D 等价重构撞红 1030 建的门 = 跨批次生面）。
+
+**踩坑（复用）**：①我写进 context 的断言「src/ 与 integration/da1031 零差异」在检验时 `fatal: bad revision`（fetch 分支没建 tracking ref）——补 `git fetch origin refs/heads/X:refs/remotes/origin/X` 后核实；**写进交付物的每句断言都要当场跑一次**。②README 行数口径用 `wc -l`（v13 时我用了 python split 口径，本轮先写 560/374 再修成 579/375）——**行数先量再写**。
 
 ---
 
