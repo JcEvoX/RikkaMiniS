@@ -83,6 +83,17 @@ class DebugOffloadHandler(private val context: Context) : NativeOffloadHandler {
             return NativeOffloadResult(2, "minis-debug $sub: ${e.message}\n")
         }
 
+        // [da1031-C] ISSUE-04 B2: ls/read/write used to forward the raw
+        // positional as `path`, so a relative token reached the RPC handler and
+        // was joined onto the ROOTFS ROOT (`File(rootfsDir, path)`), not the
+        // session cwd — `minis-debug write notes.txt` landed at `/notes.txt`.
+        // Every sibling handler (Config / BrowserUse / ModelUse / Player) runs
+        // the same pure join before its resolver; keep the same instance-wide
+        // reading here. Done as a post-pass on the built RpcCall (buildRpcCall's
+        // signature and call site are pinned by offload_cli_args_check D7/D8 —
+        // do not inline this into it).
+        normalizeDebugRpcPaths(sub, rpc.params, request.cwd)
+
         // [da1028-A] Output shaping for the pass-through subcommands reads the
         // GLOBAL slice only (tokens before the subcommand): everything after
         // `exec` / `shizuku` / `model-use` belongs to the child process, so a
@@ -482,4 +493,38 @@ included). The handler reads it from the same file the server uses
 configuration needed.
 """
     }
+}
+
+/**
+ * [da1031-C] Subcommands whose single positional IS a file path — the only ones
+ * `normalizeDebugRpcPaths` may rewrite (see there for why).
+ */
+internal val DEBUG_PATH_SUBCOMMANDS = setOf("ls", "read", "write")
+
+/**
+ * [da1031-C] Relative → absolute join for a `ls` / `read` / `write` positional:
+ * `null` when this subcommand takes no path positional, or the caller omitted
+ * it (such a call keeps the RPC default — resolve against the resolved cwd /
+ * rootfs — which is what `minis-debug ls` with no argument relies on). Pure
+ * String→String? so the subcommand scoping and the pass-through cases are
+ * JVM-testable without an RPC round trip.
+ */
+internal fun debugPathFor(sub: String, rawPath: String, cwd: String): String? =
+    if (sub in DEBUG_PATH_SUBCOMMANDS && rawPath.isNotEmpty()) {
+        resolveMaybeRelative(rawPath, cwd)
+    } else null
+
+/**
+ * [da1031-C] ISSUE-04 B2 — post-pass over the built RPC params: `ls` / `read` /
+ * `write` take a path positional, and a RELATIVE one used to reach
+ * DebugRPCHandler verbatim, where it was joined onto the rootfs ROOT instead of
+ * the session cwd. Normalizing here keeps DebugRPCHandler's own contract
+ * (absolute paths only) intact while making the CLI behave like every sibling
+ * handler (Config / BrowserUse / ModelUse / Player) — they all route file args
+ * through [resolveMaybeRelative], so the same relative token reads the same
+ * file from the same instance.
+ */
+internal fun normalizeDebugRpcPaths(sub: String, params: JSONObject, cwd: String) {
+    val normalized = debugPathFor(sub, params.optString("path"), cwd) ?: return
+    params.put("path", normalized)
 }

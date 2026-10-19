@@ -881,6 +881,20 @@ fun AppNavigation(
                             Routes.fileBrowser(
                                 rootPath = hostPath,
                                 rootLabel = entry.name,
+                                // [da1031-C] ISSUE-04 A2: this entry is the only
+                                // fileBrowser route that passed no linux prefix,
+                                // so listings bypassed the PRoot resolver and the
+                                // "Copy Absolute Path" + read-only-mount guard
+                                // both worked on a host path (or nothing). Pass
+                                // /var/minis/mounts/<name> for both roles — the
+                                // literal mirrors PRootKernel's private
+                                // MOUNTS_LINUX_PREFIX, kept private on purpose
+                                // (single owner: PRootKernel). An unbound prefix
+                                // resolves to null at list time and the VM falls
+                                // back to rootPath, so this cannot regress the
+                                // listing.
+                                linuxRoot = "/var/minis/mounts/${entry.name}",
+                                displayPrefix = "/var/minis/mounts/${entry.name}",
                             ),
                         )
                     } else {

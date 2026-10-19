@@ -947,6 +947,16 @@ class DebugRPCHandler(private val context: Context) {
         val overwrite = params.optBoolean("overwrite", true)
         val modeStr = params.optString("mode", "0644")
 
+        // [da1031-C] ISSUE-04 B1: resolveHostPath lands on the real host file
+        // behind a bind mount, and T219's read-only mount lock is software-only
+        // — without this check `minis-debug write /var/minis/mounts/<ro>/f`
+        // modified a Locked mount's files. Same guard the write tools call
+        // before touching disk; -32000 = the family's server error code (the
+        // "File exists and overwrite=false" refusal below uses it too).
+        if (PRootKernel.isLinuxPathUnderReadOnlyMount(path)) {
+            throw RPCException(-32000, "Read-only mount: '$path' is not writable")
+        }
+
         // Pre-boot fallback: resolveHostPath returns null until proot boots
         // (it lazy-initializes its RootfsManager). Test harnesses commonly
         // want to stage files BEFORE booting, so route through the rootfs
