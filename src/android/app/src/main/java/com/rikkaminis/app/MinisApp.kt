@@ -543,6 +543,16 @@ class MinisApp : Application(), ImageLoaderFactory {
                 // StateFlow when `prefs` is still null (mutate's `prefs?.let`),
                 // and this lambda only fires at runtime, long after onCreate.
                 runCatching { com.rikkaminis.app.service.SessionBadgeStore.clear(sid) }
+                // [da1031-B ISSUE-02 裂缝B] Third cleanup on the same hook: the
+                // session-scoped offload permission verdicts. `onCleared()` only
+                // covers the session the user is leaving the screen of, while
+                // this lambda fires for every delete entry point (user delete,
+                // drawer, fork rollback, empty-session sweep) — a session
+                // deleted from the list used to leave its grants/denials behind
+                // for whatever session later reused the id.
+                runCatching {
+                    com.rikkaminis.app.offload.OffloadPermissionManager.clearSessionGrants(sid)
+                }
             },
         )
         providerRepository = ProviderRepository(this)
