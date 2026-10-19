@@ -539,10 +539,15 @@ def check_openai_outbound(provider_src, models_src, auth_src, adapters_src, main
           cache key carries the scheme.
 
       D3  every `OpenAIModelsApi.fetchModels(` call in the adapter file passes
-          `azureMode = instance.azureMode`. Per-call-site forwarding is checked
-          exhaustively (not just the first occurrence) because dropping the
-          argument on the second arm is exactly the deep-audit-1019 ISSUE-04
-          shape: silent, arm-local, and invisible in a single-site grep.
+          `azureMode =`, with a value that matches that arm's CHAT path — either
+          `instance.azureMode` (the OpenAI arm, whose ProviderFactory branch
+          forwards isAzure) or the explicit `false` (Kimi, whose chat branch
+          never forwards it). Per-call-site forwarding is checked exhaustively
+          (not just the first occurrence) because dropping the argument on the
+          second arm is exactly the deep-audit-1019 ISSUE-04 shape: silent,
+          arm-local, and invisible in a single-site grep. And at least one site
+          must forward from the instance, else Azure silently loses its models
+          list while still passing the per-site check.
     """
     v = []
     code_p = blank_strings(strip_comments(provider_src))
@@ -641,6 +646,7 @@ def check_openai_outbound(provider_src, models_src, auth_src, adapters_src, main
             "ModelListProviderAdapters.kt: %s call not found (gate anchors "
             "moved — deliberate edit required)" % api
         )
+    forwarded_from_instance = 0
     for m in sites:
         args = code_a[m.end() - 1:]
         depth = 0
@@ -657,19 +663,40 @@ def check_openai_outbound(provider_src, models_src, auth_src, adapters_src, main
             v.append("ModelListProviderAdapters.kt: %s unbalanced" % api)
             continue
         args = args[:end]
+        line = code_a.count("\n", 0, m.start()) + 1
         if UA_ARG not in args:
             v.append(
                 "ModelListProviderAdapters.kt:%d: %s call drops '%s' "
                 "(da1030 ISSUE-06: the models fetch still gets no UA)"
-                % (code_a.count("\n", 0, m.start()) + 1, api, UA_ARG)
+                % (line, api, UA_ARG)
             )
         if "azureMode" not in args:
             v.append(
                 "ModelListProviderAdapters.kt:%d: %s call drops 'azureMode' "
                 "(da1030 ISSUE-06 裂缝B: this arm's Azure instances still fetch "
-                "the models list with Bearer auth)"
-                % (code_a.count("\n", 0, m.start()) + 1, api)
+                "the models list with Bearer auth)" % (line, api)
             )
+            continue
+        azure_value = re.search(r"azureMode\s*=\s*([A-Za-z0-9_.]+)", args)
+        if azure_value is None or azure_value.group(1) not in (
+            "instance.azureMode", "false"
+        ):
+            v.append(
+                "ModelListProviderAdapters.kt:%d: %s passes an azureMode value "
+                "that is neither `instance.azureMode` nor the explicit `false` "
+                "(da1030 ISSUE-06: the value must mirror that arm's chat path — "
+                "an invented value silently changes which header goes out)"
+                % (line, api)
+            )
+        elif azure_value.group(1) == "instance.azureMode":
+            forwarded_from_instance += 1
+    if sites and forwarded_from_instance == 0:
+        v.append(
+            "ModelListProviderAdapters.kt: no %s call forwards "
+            "`azureMode = instance.azureMode` (da1030 ISSUE-06 裂缝B: Azure "
+            "instances silently lose their models list while every call site "
+            "still looks compliant)" % api
+        )
     return v
 
 
@@ -1183,7 +1210,7 @@ object OpenAIAdapter_ok {
             baseURL,
             context = context,
             customUserAgent = instance.customUserAgent,
-            azureMode = instance.azureMode,
+            azureMode = false,
             forceRefresh = forceRefresh,
         )
     }
@@ -1192,7 +1219,7 @@ object OpenAIAdapter_ok {
 
 BAD_OPENAI_ADAPTERS_DROP_SECOND = GOOD_OPENAI_ADAPTERS.replace(
     """            customUserAgent = instance.customUserAgent,
-            azureMode = instance.azureMode,
+            azureMode = false,
             forceRefresh = forceRefresh,
         )
     }
@@ -1204,6 +1231,14 @@ BAD_OPENAI_ADAPTERS_DROP_SECOND = GOOD_OPENAI_ADAPTERS.replace(
     }
 }
 """,
+)
+
+BAD_OPENAI_ADAPTERS_INVENTED_VALUE = GOOD_OPENAI_ADAPTERS.replace(
+    "            azureMode = false,\n", "            azureMode = true,\n"
+)
+
+BAD_OPENAI_ADAPTERS_ALL_FALSE = GOOD_OPENAI_ADAPTERS.replace(
+    "            azureMode = instance.azureMode,\n", "            azureMode = false,\n"
 )
 
 BAD_OPENAI_ADAPTERS_NO_SITE = """
@@ -1371,6 +1406,14 @@ def selftest():
     bad_ad2 = oai(adapters=BAD_OPENAI_ADAPTERS_DROP_SECOND)
     expect_trip("adapters-second-site-drop fixture (D3)", bad_ad2, "drops 'azureMode'")
     expect_single("adapters-second-site-drop fixture (D3)", bad_ad2, "drops 'azureMode'")
+    bad_ad_invented = oai(adapters=BAD_OPENAI_ADAPTERS_INVENTED_VALUE)
+    expect_trip("adapters-invented-value fixture (D3)", bad_ad_invented,
+                "neither `instance.azureMode`")
+    expect_single("adapters-invented-value fixture (D3)", bad_ad_invented,
+                  "neither `instance.azureMode`")
+    bad_ad_allfalse = oai(adapters=BAD_OPENAI_ADAPTERS_ALL_FALSE)
+    expect_trip("adapters-all-false fixture (D3)", bad_ad_allfalse,
+                "no OpenAIModelsApi.fetchModels call forwards")
     bad_ad_none = oai(adapters=BAD_OPENAI_ADAPTERS_NO_SITE)
     expect_trip("adapters-no-callsite fixture (D3)", bad_ad_none, "call not found")
 

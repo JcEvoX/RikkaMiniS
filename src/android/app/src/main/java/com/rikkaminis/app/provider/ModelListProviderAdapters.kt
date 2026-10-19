@@ -157,8 +157,14 @@ private object KimiModelListAdapter : ModelListProvider {
             // [FIX-1 / F-208] Context forwarded — see the Anthropic adapter note.
             context = context,
             customUserAgent = instance.customUserAgent,
-            // [da1030 ISSUE-06] Same Azure auth requirement as the OpenAI arm.
-            azureMode = instance.azureMode,
+            // [da1030 ISSUE-06] Deliberately NOT `instance.azureMode`: the
+            // Kimi chat path goes through OpenAIProvider WITHOUT passing
+            // isAzure (ProviderFactory ProviderType.kimiCode branch), so chat
+            // is Bearer-only here — the models fetch must match it. Kimi
+            // instances can't legitimately carry the flag (the Azure toggle
+            // needs providerType==openAI && apiKey), so a stale/imported true
+            // must not be allowed to break this one request.
+            azureMode = false,
             forceRefresh = forceRefresh,
         )
     }
