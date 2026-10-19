@@ -438,7 +438,36 @@ fun AppNavigation(
                 // when the launch intent carries one of these actions.
                 // Nothing to do here — see startDestination block below.
             }
-            else -> {}
+            // [da1029-A] Cold-start parity with MainActivity's warm-start
+            // handler (handleDeepLink → OpenAlarmList branch): minis://views/alarm
+            // opens the system Clock app directly. The in-app AlarmListScreen
+            // was a one-button passthrough doing the exact same thing (T297),
+            // so the android-alarm tool envelope keeps emitting this view_url
+            // for existing chat cards.
+            is DeepLinkAction.OpenAlarmList -> {
+                val showAlarms =
+                    android.content.Intent(android.provider.AlarmClock.ACTION_SHOW_ALARMS)
+                        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+                try {
+                    context.startActivity(showAlarms)
+                } catch (_: android.content.ActivityNotFoundException) {
+                    com.rikkaminis.app.logging.AppLogger.warning(
+                        "DeepLink",
+                        "OpenAlarmList: no Clock app handles SHOW_ALARMS",
+                    )
+                }
+            }
+            // [da1029-A] Terminal cases written *by name* instead of a catch-all
+            // `else -> {}`. The old `else` let a new DeepLinkAction subclass fall
+            // silently into the cold-start no-op path — which is exactly how
+            // OpenAlarmList went missing. Naming every remaining subclass makes
+            // the `when` exhaustive: adding one is now a compile error here until
+            // it gets a handler. `initialDeepLink` is `DeepLinkAction?`, so the
+            // null case is named too — without it the compiler rejects the
+            // `when` outright ("must be exhaustive").
+            is DeepLinkAction.OpenShare,
+            is DeepLinkAction.Unknown,
+            null -> {}
         }
     }
 

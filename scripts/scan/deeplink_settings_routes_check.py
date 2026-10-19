@@ -40,6 +40,14 @@ Judged invariants:
      neighbouring `pendingHtmlPreview` subscription must stay reactive — that
      is the shape this file already uses and nothing may "simplify" it back.
   10. Anchors missing in either file = RED (a rename must not retire 8/9).
+  11. [da1029-A] AppNavigation's cold-start `when (initialDeepLink)` dispatch
+      names EVERY `DeepLinkAction` subclass and has no catch-all `else ->`,
+      and its `OpenAlarmList` branch launches
+      `AlarmClock.ACTION_SHOW_ALARMS`. `minis://views/alarm` used to be a
+      silent cold-start no-op because 4 of the 11 subclasses fell into the
+      old `else -> {}`. The neighbouring `quickActionStart` resolver
+      (`else -> null`) is deliberately out of scope — the criterion selects
+      the dispatch block by requiring its dispatch-only OpenTerminal case.
 """
 import re
 import subprocess
@@ -139,6 +147,64 @@ def fail(path, msg):
 # [da1024-E] A second decode of a route argument. Builder-side Uri.encode is
 # NOT covered (the nav graph must keep encoding when it builds a route).
 DECODE_RE = re.compile(r"(?:android\.net\.|java\.net\.)?(?:Uri|URLDecoder)\.decode\s*\(")
+
+# [da1029-A] Every DeepLinkAction subclass the cold-start dispatcher must name.
+# Written out literally on purpose: deriving it from the source would make the
+# criterion vacuous (the file could silently drop a branch and the expectation
+# would follow it down).
+COLD_START_ACTION_CASES = [
+    "OpenShare", "OpenAlarmList", "OpenTerminal",
+    "CreateEnvironmentVariable", "OpenPermissionSettings", "OpenSession",
+    "NewChat", "NewCameraChat", "OpenSettingsScreen",
+    "OpenHtmlPreview", "Unknown",
+]
+
+def when_blocks(code: str, header: str) -> "list[str]":
+    """Brace-bounded text of every `when (<header>) { … }` occurrence.
+
+    String literals are skipped while walking, so a `{`/`}` inside one cannot
+    unbalance the match. Returns [] when the header is absent — callers treat
+    that as a failure (fail-closed), never as a skip.
+    """
+    blocks = []
+    i = 0
+    n = len(code)
+    while True:
+        idx = code.find(header, i)
+        if idx == -1:
+            return blocks
+        brace = code.find("{", idx)
+        if brace == -1:
+            return blocks
+        depth = 0
+        j = brace
+        while j < n:
+            c = code[j]
+            if c == '"':
+                if code.startswith('"""', j):
+                    k = code.find('"""', j + 3)
+                    j = n if k == -1 else k + 3
+                    continue
+                k = j + 1
+                while k < n:
+                    if code[k] == "\\":
+                        k += 2
+                        continue
+                    if code[k] == '"' or code[k] == "\n":
+                        k += 1
+                        break
+                    k += 1
+                j = k
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    blocks.append(code[idx:j + 1])
+                    break
+            j += 1
+        i = brace + 1
 
 def is_comment_line(line: str) -> bool:
     s = line.strip()
@@ -335,6 +401,54 @@ def check(root: Path) -> None:
                  "anchor: this subscription is the shape criterion 9 mirrors, it must not "
                  "be 'simplified' back to .value)")
 
+    # --- 11. [da1029-A] cold-start dispatch names every DeepLinkAction case --
+    # `minis://views/alarm` was a silent no-op on cold start: the sealed family
+    # had 11 subclasses, the dispatch named 7 of them and swallowed the rest in
+    # `else -> {}`, so a new subclass landed in a hole nobody could see.
+    # (The neighbouring `quickActionStart` resolver keeps its `else -> null` —
+    # it is selected out by requiring the dispatch-only OpenTerminal case.)
+    dispatches = [
+        b for b in when_blocks(nav, "when (initialDeepLink)")
+        if "DeepLinkAction.OpenTerminal" in b
+    ]
+    if not dispatches:
+        fail(REL_NAV,
+             "cold-start `when (initialDeepLink)` dispatch block not found "
+             "(renamed or restructured? re-anchor criterion 11, do not drop it)")
+    else:
+        dispatch = dispatches[0]
+        for case in COLD_START_ACTION_CASES:
+            if f"DeepLinkAction.{case}" not in dispatch:
+                fail(REL_NAV,
+                     f"cold-start dispatch has no `is DeepLinkAction.{case}` branch — "
+                     "every sealed subclass must be named (an unnamed case falls into "
+                     "the old catch-all hole, which is exactly how OpenAlarmList broke)")
+        if re.search(r"\belse\s*->", dispatch):
+            fail(REL_NAV,
+                 "cold-start dispatch still ends in a catch-all `else ->` — name the "
+                 "remaining subclasses explicitly so adding one is a compile error here "
+                 "instead of a silent no-op")
+        # The subject is `DeepLinkAction?`; with the catch-all gone the compiler
+        # demands an explicit null branch ("'when' expression must be
+        # exhaustive"). Mirror that at the source layer so the failure is caught
+        # offline instead of on the CI compile pass.
+        if re.search(r"initialDeepLink\s*:\s*DeepLinkAction\s*\?", nav) and \
+                not re.search(r"(?:^|,)\s*null\s*->", dispatch, re.M):
+            fail(REL_NAV,
+                 "cold-start dispatch: `initialDeepLink` is nullable "
+                 "(`DeepLinkAction?`) and the catch-all `else` is gone — the `when` "
+                 "must name the `null` case explicitly (otherwise the compiler "
+                 "rejects it: \"'when' expression must be exhaustive\")")
+        if not re.search(
+            r"is\s+DeepLinkAction\.OpenAlarmList\s*->\s*\{[^}]*"
+            r"AlarmClock\.ACTION_SHOW_ALARMS",
+            dispatch, re.S,
+        ):
+            fail(REL_NAV,
+                 "cold-start dispatch: `is DeepLinkAction.OpenAlarmList` branch must launch "
+                 "AlarmClock.ACTION_SHOW_ALARMS (minis://views/alarm was a cold-start "
+                 "no-op; parity with MainActivity's warm-start handler)")
+
 
 # ---------------- selftest fixtures (minimal synthetic repo) ----------------
 
@@ -386,13 +500,35 @@ object Routes {
     fun mirrorCategoryDetail(categoryId: String) = "mirror_category/${seg(categoryId)}"
 }
 
-suspend fun handleColdStartDeepLink(navController: NavController, initialDeepLink: DeepLinkAction) {
+suspend fun handleColdStartDeepLink(navController: NavController, initialDeepLink: DeepLinkAction?) {
     when (initialDeepLink) {
+        is DeepLinkAction.OpenTerminal -> {
+            navController.navigate(Routes.terminal(initialDeepLink.initCommand))
+        }
+        is DeepLinkAction.OpenSession -> {
+            navController.navigate(Routes.chat(initialDeepLink.sessionId))
+        }
+        is DeepLinkAction.CreateEnvironmentVariable -> {
+            navController.navigate(Routes.ENV_VARS)
+        }
         is DeepLinkAction.OpenSettingsScreen -> {
             runCatching { navController.navigate(initialDeepLink.route) }
                 .onFailure { runCatching { navController.navigate(Routes.SETTINGS) } }
         }
-        else -> {}
+        is DeepLinkAction.OpenPermissionSettings -> {
+            navController.navigate(Routes.PERMISSIONS)
+        }
+        is DeepLinkAction.OpenHtmlPreview -> {}
+        is DeepLinkAction.NewChat,
+        is DeepLinkAction.NewCameraChat -> {}
+        is DeepLinkAction.OpenAlarmList -> {
+            val showAlarms =
+                android.content.Intent(android.provider.AlarmClock.ACTION_SHOW_ALARMS)
+            context.startActivity(showAlarms)
+        }
+        is DeepLinkAction.OpenShare,
+        is DeepLinkAction.Unknown,
+        null -> {}
     }
 }
 
@@ -797,6 +933,103 @@ def selftest() -> None:
             print(f"SELFTEST O (unrelated edit) leaked into the consumer criteria: {noise}")
         else:
             print("SELFTEST O (unrelated edit stays silent) GREEN as expected")
+
+        # --- [da1029-A] criterion 11 ---------------------------------------
+        # fixture P: drop the OpenAlarmList branch -> must fail
+        write_fixture(root, FIXTURE_DLH, FIXTURE_NAV.replace(
+            "        is DeepLinkAction.OpenAlarmList -> {\n"
+            "            val showAlarms =\n"
+            "                android.content.Intent(android.provider.AlarmClock.ACTION_SHOW_ALARMS)\n"
+            "            context.startActivity(showAlarms)\n"
+            "        }\n",
+            "",
+        ), FIXTURE_MAIN)
+        VIOLATIONS.clear()
+        check(root)
+        if not any("OpenAlarmList" in v for v in VIOLATIONS):
+            ok = False
+            print("SELFTEST P (drop OpenAlarmList branch) did not trip criterion 11")
+        else:
+            print("SELFTEST P (drop OpenAlarmList branch) RED as expected")
+
+        # fixture Q: put the catch-all `else -> {}` back -> must fail
+        write_fixture(root, FIXTURE_DLH, FIXTURE_NAV.replace(
+            "        is DeepLinkAction.OpenShare,\n"
+            "        is DeepLinkAction.Unknown,\n        null -> {}",
+            "        else -> {}",
+        ), FIXTURE_MAIN)
+        VIOLATIONS.clear()
+        check(root)
+        if not any("catch-all" in v for v in VIOLATIONS):
+            ok = False
+            print("SELFTEST Q (catch-all else restored) did not trip criterion 11")
+        else:
+            print("SELFTEST Q (catch-all else restored) RED as expected")
+
+        # fixture R: OpenAlarmList branch launches the WRONG Clock action ->
+        # the branch presence alone must not satisfy the criterion.
+        write_fixture(root, FIXTURE_DLH, FIXTURE_NAV.replace(
+            "android.provider.AlarmClock.ACTION_SHOW_ALARMS",
+            "android.provider.AlarmClock.ACTION_SET_ALARM",
+        ), FIXTURE_MAIN)
+        VIOLATIONS.clear()
+        check(root)
+        if not any("ACTION_SHOW_ALARMS" in v for v in VIOLATIONS):
+            ok = False
+            print("SELFTEST R (wrong alarm action) did not trip criterion 11")
+        else:
+            print("SELFTEST R (wrong alarm action) RED as expected")
+
+        # fixture S: precision — a SECOND `when (initialDeepLink)` resolver
+        # carrying `else -> null` (the real `quickActionStart` shape) must not
+        # make criterion 11 speak up: it selects the dispatch block by its
+        # dispatch-only OpenTerminal case.
+        write_fixture(root, FIXTURE_DLH, FIXTURE_NAV.replace(
+            "fun NavGraphBuilder.modelEntryDetailGraph",
+            "fun quickActionStartOf(initialDeepLink: DeepLinkAction): String? =\n"
+            "    when (initialDeepLink) {\n"
+            '        is DeepLinkAction.NewChat -> Routes.chat("x")\n'
+            "        else -> null\n"
+            "    }\n\n"
+            "fun NavGraphBuilder.modelEntryDetailGraph",
+        ), FIXTURE_MAIN)
+        VIOLATIONS.clear()
+        check(root)
+        noise = [v for v in VIOLATIONS if "dispatch" in v]
+        if noise:
+            ok = False
+            print(f"SELFTEST S (resolver else -> null) leaked into criterion 11: {noise}")
+        else:
+            print("SELFTEST S (startDestination resolver stays out of scope) GREEN as expected")
+
+        # fixture T [da1029-A]: nullable subject with the `null ->` case dropped.
+        # The catch-all is gone, so this is a hard compile error in the real
+        # build ("'when' expression must be exhaustive") — the gate mirrors it
+        # offline instead of spending a CI round on it.
+        write_fixture(root, FIXTURE_DLH, FIXTURE_NAV.replace(
+            "        is DeepLinkAction.Unknown,\n        null -> {}\n", "",
+        ), FIXTURE_MAIN)
+        VIOLATIONS.clear()
+        check(root)
+        if not any("nullable" in v for v in VIOLATIONS):
+            ok = False
+            print("SELFTEST T (nullable subject, null case dropped) did not trip criterion 11")
+        else:
+            print("SELFTEST T (nullable subject, null case dropped) RED as expected")
+
+        # fixture U [da1029-A] precision: a NON-nullable subject needs no `null`
+        # branch, so dropping it must stay silent.
+        write_fixture(root, FIXTURE_DLH, FIXTURE_NAV.replace(
+            "initialDeepLink: DeepLinkAction?", "initialDeepLink: DeepLinkAction",
+        ).replace("        is DeepLinkAction.Unknown,\n        null -> {}\n", ""),
+            FIXTURE_MAIN)
+        VIOLATIONS.clear()
+        check(root)
+        if any("nullable" in v for v in VIOLATIONS):
+            ok = False
+            print("SELFTEST U (non-nullable subject) leaked the nullable criterion")
+        else:
+            print("SELFTEST U (non-nullable subject needs no null branch) GREEN as expected")
 
     if not ok:
         sys.exit("DEEPLINK_SETTINGS_ROUTES_SELFTEST=FAIL")

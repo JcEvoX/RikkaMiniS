@@ -44,6 +44,24 @@ class ComposerDraftStoreTest {
     }
 
     @Test
+    fun `round-trip - an existing draft id is reused, not re-minted`() {
+        val kv = FakeKV()
+        // A live draft, seeded exactly as ChatScreen does after the first
+        // keystroke.
+        ComposerDraftStore.saveText(kv, "__new__seed", "half-typed message")
+        var minted = 0
+        // [da1029-A] MainActivity's two New-Chat entries now route through this
+        // function. If it re-minted here, the live slot would be orphaned and
+        // saveText's foreign-id guard would drop the text — the exact defect.
+        // Expectations are literals (never derived from the constant under
+        // test), and `minted` proves the generator was not reached at all.
+        val resolved = ComposerDraftStore.nextDraftId(kv) { minted++; "__new__fresh" }
+        assertEquals("__new__seed", resolved)
+        assertEquals(0, minted)
+        assertEquals("half-typed message", ComposerDraftStore.restoreText(kv, resolved))
+    }
+
+    @Test
     fun `saveText stores text only for the active draft`() {
         val kv = FakeKV()
         val active = ComposerDraftStore.nextDraftId(kv) { nextGen() }

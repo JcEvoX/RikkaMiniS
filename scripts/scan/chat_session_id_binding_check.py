@@ -36,6 +36,13 @@ This gate pins the six audited entry points (deep-audit-1023 ISSUE-06):
 
 Bare route-arg usage at these sites must not come back. `resolveKey` itself
 stays private — `katex_ready_race_check.py` hard-pins its source form.
+
+  MainActivity.kt (deep-audit-1029 ISSUE-01) — criterion 9 below
+    9. New-Chat entries (onStart launch-mode-2 resume + handleDeepLink's
+       NewChat/NewCameraChat branch) resolve the draft id through
+       `ComposerDraftStore.nextDraftId(this)`, never a hand-built
+       `"__new__<uuid>"`. A fresh uuid orphans the live draft slot, and
+       `saveText`'s slot guard then drops the text.
 """
 import argparse
 import re
@@ -49,6 +56,8 @@ REL_SCREEN = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatScree
 REL_NAV = "src/android/app/src/main/java/com/rikkaminis/app/ui/navigation/AppNavigation.kt"
 REL_MOVE = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/MoveToSessionSheet.kt"
 REL_STORE = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatViewModelStore.kt"
+# [da1029-A] criterion 9 — optional (mini-tree fixtures predate it)
+REL_ACTIVITY = "src/android/app/src/main/java/com/rikkaminis/app/MainActivity.kt"
 
 # (start token, end token) pairs isolating a call block; the block must
 # contain `required` and must NOT contain `forbidden`.
@@ -333,6 +342,37 @@ def check(root: Path) -> int:
                 "(`pending.sessionId != activeSessionId`), not the route arg alone"
             )
 
+    # --- 9. [da1029-A] MainActivity's New-Chat entries resolve the draft id
+    #     through the single source (ComposerDraftStore.nextDraftId) ---
+    # Both entries (onStart resume for launch-mode 2, and handleDeepLink's
+    # NewChat/NewCameraChat branch) used to hand-build `"__new__<uuid>"`.
+    # A fresh uuid orphans the live draft slot, and ComposerDraftStore.saveText
+    # is a deliberate no-op for a slot that belongs to a different draft id —
+    # so the typed-but-unsent text was silently thrown away. Same family as
+    # criteria 1-4: an entry point bypassing the one source of truth.
+    #
+    # Optional file: the pre-da1029-0/A mini-tree fixtures write only the four
+    # files above, so a missing activity source is a skip (drift-detector
+    # stance), not a failure. Presence is required by the real repo tree, which
+    # the branch CI always runs.
+    act_path = root / REL_ACTIVITY
+    if act_path.is_file():
+        activity = strip_comments(act_path.read_text(encoding="utf-8"))
+        bare = activity.count("__new__${")
+        if bare:
+            errors.append(
+                f"MainActivity.kt: {bare} bare `\"__new__${{...}}\"` draft-id "
+                "construction(s) — New-Chat entries must resolve through "
+                "`ComposerDraftStore.nextDraftId(this)` (a fresh uuid orphans the "
+                "live draft and its text is dropped by saveText's slot guard)"
+            )
+        resolved = activity.count("ComposerDraftStore.nextDraftId(")
+        if resolved < 2:
+            errors.append(
+                "MainActivity.kt: expected >= 2 `ComposerDraftStore.nextDraftId(` "
+                f"call sites (onStart resume + handleDeepLink quick actions), found {resolved}"
+            )
+
     if errors:
         for e in errors:
             print(f"FAIL {e}")
@@ -356,6 +396,20 @@ object ChatViewModelStore {
     @Synchronized
     fun resolveSessionId(sessionId: String): String =
         resolveKey(sessionId)
+}
+'''
+
+# [da1029-A] criterion 9 fixture: MainActivity's two New-Chat entry points.
+FIXTURE_ACTIVITY = '''package com.rikkaminis.app
+
+class MainActivity {
+    override fun onStart() {
+        val newRoute = Routes.chat(com.rikkaminis.app.data.ComposerDraftStore.nextDraftId(this))
+    }
+
+    private fun handleDeepLink() {
+        val newRoute = Routes.chat(com.rikkaminis.app.data.ComposerDraftStore.nextDraftId(this))
+    }
 }
 '''
 
@@ -508,7 +562,8 @@ def selftest() -> int:
 
     failures = []
 
-    def run_tree(screen: str, nav: str, move: str, store: str) -> "tuple[int, list[str]]":
+    def run_tree(screen: str, nav: str, move: str, store: str,
+                 activity: "str | None" = None) -> "tuple[int, list[str]]":
         with tempfile.TemporaryDirectory() as td:
             tdp = Path(td)
             for rel in (REL_SCREEN, REL_NAV, REL_MOVE, REL_STORE):
@@ -518,6 +573,10 @@ def selftest() -> int:
             (tdp / REL_NAV).write_text(nav, encoding="utf-8")
             (tdp / REL_MOVE).write_text(move, encoding="utf-8")
             (tdp / REL_STORE).write_text(store, encoding="utf-8")
+            if activity is not None:
+                f = tdp / REL_ACTIVITY
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text(activity, encoding="utf-8")
             rc = check(tdp)
             return rc, list(errors)
 
@@ -561,6 +620,37 @@ def selftest() -> int:
         failures.append("MUT-10 resolveSessionId second implementation: gate stayed GREEN (no teeth)")
     else:
         print(f"selftest: MUT-10 non-delegating resolveSessionId -> RED ({len(errs)} violation(s)) OK")
+
+    # --- criterion 9 [da1029-A]: MainActivity draft-id single source --------
+    # Backward compat: the four-file trees above omit MainActivity.kt, and the
+    # criterion must skip them (drift-detector stance) — already proven GREEN.
+    print("selftest: criterion 9 skipped when MainActivity.kt absent (old fixtures) OK")
+
+    rc, errs = run_tree(screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY)
+    if rc != 0:
+        failures.append(f"criterion 9 GREEN fixture unexpectedly red: {errs}")
+    else:
+        print("selftest: criterion 9 GREEN fixture passes")
+
+    for name, act in (
+        (
+            "one bare __new__ uuid left (MUT-16)",
+            FIXTURE_ACTIVITY.replace(
+                "com.rikkaminis.app.data.ComposerDraftStore.nextDraftId(this)",
+                '"__new__${java.util.UUID.randomUUID()}"', 1),
+        ),
+        (
+            "both entries back to a bare uuid (MUT-17)",
+            FIXTURE_ACTIVITY.replace(
+                "com.rikkaminis.app.data.ComposerDraftStore.nextDraftId(this)",
+                '"__new__${java.util.UUID.randomUUID()}"'),
+        ),
+    ):
+        rc, errs = run_tree(screen, nav, move, FIXTURE_STORE, act)
+        if rc == 0:
+            failures.append(f"criterion 9 {name}: gate stayed GREEN (no teeth)")
+        else:
+            print(f"selftest: criterion 9 {name} -> RED ({len(errs)} violation(s)) OK")
 
     if failures:
         print("\nselftest FAILURES:")

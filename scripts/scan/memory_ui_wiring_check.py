@@ -29,6 +29,25 @@ deep-audit-1023 ISSUE-07 gate. Two files, three defect surfaces:
        - the tick bumped on ALL THREE success paths that rewrite the
          backing files (AutoFile save / Write-record save / Write revoke).
 
+  D. [deep-audit-1029 ISSUE-03] MemoryFileEditScreen (same file as A/B) —
+     this screen exists for 200KB+ files, yet its read ran inside
+     `remember { mutableStateOf(memoryRepository.readFile(...)) }` (the
+     composition thread of the first frame) and its save ran inline in the
+     Save click. The criterion set:
+       - `memoryRepository.readFile(` / `.saveFile(` must sit inside a
+         `withContext(Dispatchers.IO)` region (same rule as B, extended to
+         the two edit-screen call sites);
+       - the edit screen must read via a `LaunchedEffect` and write via a
+         coroutine scope (`scope.launch`) rather than inline;
+       - the IO region that writes `saveFile` must also call
+         `SoulStore.refreshCache(` — this raw path bypasses
+         `SoulStore.save()`, so without it a SOUL.md edit leaves
+         `cachedMetadata` / `writeVersion` on the pre-edit values for the
+         chat-bubble header and the Settings → Soul editors (the twin chat
+         memory sheet already refreshes; this screen did not).
+     D is fail-closed on the `MemoryFileEditScreen` anchor: losing the
+     function is gate ROT, not a pass.
+
 Comments are stripped before every judgment (the fix ships with prose
 comments that name each criterion; they must not carry the gate).
 
@@ -133,7 +152,8 @@ def check(screen_src: str, sheet_src: str) -> list:
         sl = brace_slice(scr, m.group(0), from_pos=m.start())
         if sl:
             io_slices.append((m.start(), m.start() + len(sl)))
-    for call in ("memoryRepository.deleteFile(", "memoryRepository.listAllFiles("):
+    for call in ("memoryRepository.deleteFile(", "memoryRepository.listAllFiles(",
+                 "memoryRepository.readFile(", "memoryRepository.saveFile("):
         for m in re.finditer(re.escape(call), scr):
             pos = m.start()
             if not any(a <= pos < b for a, b in io_slices):
@@ -150,6 +170,42 @@ def check(screen_src: str, sheet_src: str) -> list:
                 "withContext(Dispatchers.IO) (state must clear before launch)")
         if "withContext(Dispatchers.IO)" not in confirm:
             errs.append("delete confirm has no withContext(Dispatchers.IO)")
+
+    # ---- D. MemoryFileEditScreen: async read/save + SOUL cache refresh ----
+    # [deep-audit-1029 ISSUE-03] Fail-closed on the function anchor: the two
+    # async-IO call sites and the SOUL refresh live in its body, so a missing
+    # function means the gate can no longer see them at all.
+    edit = brace_slice(scr, "fun MemoryFileEditScreen(")
+    if not edit:
+        errs.append(
+            "MemoryFileEditScreen not found in " + MEM_SCREEN + " — gate ROT "
+            "(its async read/save + SOUL-refresh anchors cannot be judged)")
+    else:
+        if not re.search(r"LaunchedEffect\s*\(", edit):
+            errs.append(
+                "MemoryFileEditScreen has no LaunchedEffect — the initial "
+                "readFile() must run in an effect, not on the composition pass")
+        if "scope.launch" not in edit:
+            errs.append(
+                "MemoryFileEditScreen save is not launched on a coroutine "
+                "scope — saveFile() would block the click thread")
+        save_pos = edit.find("memoryRepository.saveFile(")
+        if save_pos < 0:
+            errs.append("MemoryFileEditScreen has no memoryRepository.saveFile( — gate ROT")
+        else:
+            abs_pos = scr.find("fun MemoryFileEditScreen(") + save_pos
+            holders = [(a, b) for a, b in io_slices if a <= abs_pos < b]
+            # No holder = criterion B already reported saveFile as outside IO;
+            # don't double-report here.
+            if holders:
+                a, b = holders[0]
+                if "SoulStore.refreshCache(" not in scr[a:b]:
+                    errs.append(
+                        "the withContext(Dispatchers.IO) region that writes "
+                        "memoryRepository.saveFile( does not call "
+                        "SoulStore.refreshCache( — a SOUL.md edit from this "
+                        "screen leaves SoulStore.cachedMetadata / writeVersion "
+                        "stale for the chat header and Settings → Soul editors")
 
     # ---- C. autoItems snapshot must rebuild on every in-sheet mutation ----
     tick_decl = re.search(r"var\s+autoItemsRefreshTick\s+by\s+remember", sht)
@@ -209,6 +265,40 @@ private fun MemoryFileRow(
         }
     }
 }
+@Composable
+fun MemoryFileEditScreen(
+    fileName: String,
+    isGlobal: Boolean,
+    memoryRepository: MemoryRepository,
+    onBack: () -> Unit,
+) {
+    var fullBase by remember(fileName) { mutableStateOf("") }
+    var isLoaded by remember(fileName) { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+    LaunchedEffect(fileName) {
+        fullBase = withContext(Dispatchers.IO) { memoryRepository.readFile(fileName) }
+        isLoaded = true
+    }
+    MinisTextButton(onClick = {
+        val newText = state.text.toString()
+        val base = fullBase
+        scope.launch {
+            try {
+                val full = base + newText
+                withContext(Dispatchers.IO) {
+                    memoryRepository.saveFile(fileName, full)
+                    if (fileName == SOUL_FILE_NAME) {
+                        SoulStore.refreshCache(context)
+                    }
+                }
+                fullBase = full
+            } catch (e: Exception) {
+                saveError = e.message
+            }
+        }
+    }) { Text("Save") }
+}
 """
     good_sheet = """
 var autoItemsRefreshTick by remember { mutableStateOf(0) }
@@ -247,6 +337,47 @@ autoItemsRefreshTick++
         "var autoItemsRefreshTick by remember { mutableStateOf(0) }",
         "// autoItemsRefreshTick\nval tick = remember { mutableStateOf(0) }")
 
+    # [deep-audit-1029 ISSUE-03] MemoryFileEditScreen arms (criterion B extended
+    # to read/save, plus criterion D). Anchors are spelled with their exact
+    # fixture indentation so a drift here is caught (the .replace would no-op
+    # and the arm would silently prove nothing — guarded below).
+    EDIT_READ = (
+        "    LaunchedEffect(fileName) {\n"
+        "        fullBase = withContext(Dispatchers.IO) { memoryRepository.readFile(fileName) }\n"
+        "        isLoaded = true\n"
+        "    }\n")
+    EDIT_SAVE_IO = (
+        "                withContext(Dispatchers.IO) {\n"
+        "                    memoryRepository.saveFile(fileName, full)\n")
+    EDIT_REFRESH = (
+        "                    if (fileName == SOUL_FILE_NAME) {\n"
+        "                        SoulStore.refreshCache(context)\n"
+        "                    }\n")
+    # newline-prefixed so the 20-space indented launch in the delete-confirm
+    # fixture is not a substring match (indentation is not a left boundary).
+    EDIT_SCOPE = "\n        scope.launch {\n"
+    for name, frag in (("EDIT_READ", EDIT_READ), ("EDIT_SAVE_IO", EDIT_SAVE_IO),
+                       ("EDIT_REFRESH", EDIT_REFRESH), ("EDIT_SCOPE", EDIT_SCOPE)):
+        if good_screen.count(frag) != 1:
+            print(f"  FAIL selftest fixture drift: {name} matched "
+                  f"{good_screen.count(frag)} time(s) in good_screen, expected 1")
+            return 1
+    # V6: initial read back on the composition pass (and no LaunchedEffect)
+    v6_screen = good_screen.replace(
+        EDIT_READ, "    fullBase = memoryRepository.readFile(fileName)\n")
+    # V7: saveFile back on the click thread (IO wrapper replaced by a plain run)
+    v7_screen = good_screen.replace(
+        EDIT_SAVE_IO,
+        "                run {\n                    memoryRepository.saveFile(fileName, full)\n")
+    # V8: SOUL cache never refreshed
+    v8_screen = good_screen.replace(EDIT_REFRESH, "")
+    # V9: refresh named in prose only (comments are stripped before judging)
+    v9_screen = good_screen.replace(
+        EDIT_REFRESH,
+        "                // refresh the SoulStore cache here\n")
+    # V10: save not launched on a coroutine scope (inline `run`)
+    v10_screen = good_screen.replace(EDIT_SCOPE, "\n        run {\n")
+
     arms = [
         ("compliant pair", good_screen, good_sheet, 0),
         ("V1 row never consumes onDelete", v1_screen, good_sheet, 1),
@@ -255,6 +386,11 @@ autoItemsRefreshTick++
         ("V3 autoItems remember has no refresh key", good_screen, v3_sheet, 1),
         ("V4 only two tick bumps", good_screen, v4_sheet, 1),
         ("V5 tick is prose-only / not a state var", good_screen, v5_sheet, 1),
+        ("V6 edit-screen read on the composition pass", v6_screen, good_sheet, 1),
+        ("V7 edit-screen saveFile outside Dispatchers.IO", v7_screen, good_sheet, 1),
+        ("V8 SOUL cache never refreshed on save", v8_screen, good_sheet, 1),
+        ("V9 SOUL refresh named in prose only", v9_screen, good_sheet, 1),
+        ("V10 save not launched on a coroutine scope", v10_screen, good_sheet, 1),
     ]
     failures = 0
     for name, s1, s2, expect_red in arms:

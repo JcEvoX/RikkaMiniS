@@ -172,15 +172,26 @@ fun MCPIntegrationsScreen(
     }
 
     // FIX 1: edit sheet — same form, pre-filled, with a Delete affordance.
-    editServer?.let { server ->
+    // [da1029-E] `editServer` is a snapshot captured at tap time, and
+    // MCPFormTab seeds its whole field state from it. When the entry changes
+    // behind the sheet's back (a repository write from an OAuth callback, a
+    // paste-import, reloadFromDisk), the stale snapshot kept showing the old
+    // values — and Save then wrote them back over the external change
+    // (1027-E / 1028-C are the same defect in ModelGroupDetailScreen /
+    // EnvVarFormSheet). Resolve the live entry from the listing by id and hand
+    // THAT to the sheet below, so the keyed field states re-seed when the entry
+    // really changed. The elvis fallback keeps the sheet in edit mode when the
+    // entry was deleted meanwhile instead of silently becoming the add flow.
+    editServer?.let { captured ->
+        val liveServer = servers.find { it.id == captured.id } ?: captured
         MCPAddSheet(
             mcpRepository = mcpRepository,
             envVarRepository = envVarRepository,
-            editServer = server,
+            editServer = liveServer,
             onDismiss = { editServer = null },
             onRequestDelete = {
                 editServer = null
-                deleteId = server.id
+                deleteId = liveServer.id
             },
         )
     }
@@ -302,17 +313,28 @@ private fun MCPFormTab(
     // command, else HTTP (we can't distinguish a persisted SSE from HTTP since
     // both are url-only, so an SSE edit defaults to the HTTP affordance — the
     // saved entry is byte-identical either way).
-    var transport by remember { mutableIntStateOf(if (editServer?.isStdio == true) 2 else 0) }
-    var name by remember { mutableStateOf(editServer?.id ?: "") }
-    var note by remember { mutableStateOf(editServer?.note ?: "") }
-    var url by remember { mutableStateOf(editServer?.url ?: "") }
-    var headers by remember { mutableStateOf(mapToLines(editServer?.headers, ": ")) }
-    var command by remember { mutableStateOf(editServer?.command ?: "") }
-    var args by remember { mutableStateOf(editServer?.args?.joinToString(" ") ?: "") }
-    var env by remember { mutableStateOf(mapToLines(editServer?.env, "=")) }
+    // [da1029-E] Every field below is seeded from [editServer] — and the caller
+    // re-resolves that to the LIVE entry (see the MCPAddSheet call site). The
+    // key is the resolved entry itself: `MCPServerConfig` is a data class, so
+    // the key only changes when the entry's contents actually change, i.e. an
+    // external write is picked up, while typing inside the sheet never
+    // re-seeds it. (Keying on `editServer?.id` would miss same-id content
+    // changes; keying on the whole object is the tightest available key.)
+    // Known trade-off: `oauthClientSecret` / `oauthAuthorized` read the
+    // encrypted MCPOAuthStore, so a store-only write (a `.secret` handoff
+    // landing, a token refresh) does not change the key and is not re-seeded —
+    // registering that would mean reading the store on every recomposition.
+    var transport by remember(editServer) { mutableIntStateOf(if (editServer?.isStdio == true) 2 else 0) }
+    var name by remember(editServer) { mutableStateOf(editServer?.id ?: "") }
+    var note by remember(editServer) { mutableStateOf(editServer?.note ?: "") }
+    var url by remember(editServer) { mutableStateOf(editServer?.url ?: "") }
+    var headers by remember(editServer) { mutableStateOf(mapToLines(editServer?.headers, ": ")) }
+    var command by remember(editServer) { mutableStateOf(editServer?.command ?: "") }
+    var args by remember(editServer) { mutableStateOf(editServer?.args?.joinToString(" ") ?: "") }
+    var env by remember(editServer) { mutableStateOf(mapToLines(editServer?.env, "=")) }
     // [T-mcp-startup-timeout] Optional STDIO startup/handshake timeout (seconds).
     // Kept as text so it round-trips; parsed to Int on save; blank = default 60s.
-    var startupTimeout by remember { mutableStateOf(editServer?.startupTimeoutSeconds?.toString() ?: "") }
+    var startupTimeout by remember(editServer) { mutableStateOf(editServer?.startupTimeoutSeconds?.toString() ?: "") }
     var errorText by remember { mutableStateOf<String?>(null) }
 
     // [T-android-mcp-oauth] Static-OAuth fields for a URL transport. Expanded
@@ -320,9 +342,9 @@ private fun MCPFormTab(
     // client secret is loaded from / saved to MCPOAuthStore (encrypted), never
     // shown pre-filled from JSON (it isn't stored there).
     val oauthScope = androidx.compose.runtime.rememberCoroutineScope()
-    var oauthExpanded by remember { mutableStateOf(editServer?.oauth != null) }
-    var oauthClientId by remember { mutableStateOf(editServer?.oauth?.clientId ?: "") }
-    var oauthClientSecret by remember {
+    var oauthExpanded by remember(editServer) { mutableStateOf(editServer?.oauth != null) }
+    var oauthClientId by remember(editServer) { mutableStateOf(editServer?.oauth?.clientId ?: "") }
+    var oauthClientSecret by remember(editServer) {
         mutableStateOf(
             editServer?.id?.let {
                 // [T-mcp-secret-handoff-import] If the in-guest CLI seeded a
@@ -334,15 +356,15 @@ private fun MCPFormTab(
             } ?: "",
         )
     }
-    var oauthAuthEndpoint by remember { mutableStateOf(editServer?.oauth?.authorizationEndpoint ?: "") }
-    var oauthTokenEndpoint by remember { mutableStateOf(editServer?.oauth?.tokenEndpoint ?: "") }
-    var oauthScopes by remember { mutableStateOf(editServer?.oauth?.scopes ?: "") }
+    var oauthAuthEndpoint by remember(editServer) { mutableStateOf(editServer?.oauth?.authorizationEndpoint ?: "") }
+    var oauthTokenEndpoint by remember(editServer) { mutableStateOf(editServer?.oauth?.tokenEndpoint ?: "") }
+    var oauthScopes by remember(editServer) { mutableStateOf(editServer?.oauth?.scopes ?: "") }
     // [T-mcp-redirect-uri-preserve] Custom redirect URI. Optional — blank means
     // the loopback default. Previously dropped on edit (the form neither read
     // nor rewrote it), so a JSON/CLI-supplied redirect_uri silently evaporated
     // on Save. Now round-tripped like the other OAuth fields.
-    var oauthRedirectUri by remember { mutableStateOf(editServer?.oauth?.redirectUri ?: "") }
-    var oauthAuthorized by remember {
+    var oauthRedirectUri by remember(editServer) { mutableStateOf(editServer?.oauth?.redirectUri ?: "") }
+    var oauthAuthorized by remember(editServer) {
         mutableStateOf(
             editServer?.id?.let {
                 com.rikkaminis.app.mcp.oauth.MCPOAuthStore.isAuthorized(context, it)

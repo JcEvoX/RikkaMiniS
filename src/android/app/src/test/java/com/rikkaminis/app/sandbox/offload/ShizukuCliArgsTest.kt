@@ -1,5 +1,6 @@
 package com.rikkaminis.app.sandbox.offload
 
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -29,6 +30,18 @@ import org.junit.Test
  * documents `clear [--user USER_ID] [--cache-only] PACKAGE` (per-package), and
  * AOSP `PackageManagerShellCommand.runClear` routes the flag to
  * `deleteApplicationCacheFilesAsUser`.
+ *
+ * ISSUE-07 `exec` option scope (deep-audit-1029): the trailing tokens of `exec`
+ * are a *shell command*, not an option list, but they were handed to the
+ * top-level parser verbatim. `android-shizuku-cli exec grep -q foo /p` therefore
+ * read `-q` as the output-shaping `--quiet`, and `OffloadOutput.formatBody`
+ * answered a non-zero exit by returning only the `error` object — dropping the
+ * `data` (stdout/stderr/exitCode) that `handleExec` documents it keeps. The
+ * mirror image: `--timeout-ms N`, which `EXEC_HELP` advertises and
+ * `handleExec` reads from the parser, was instead glued into the `sh -c`
+ * command line and executed. The fix splits the two at the argv layer
+ * (`ShizukuArgv.execOptionTokens`): the parser sees the CLI's own tokens, the
+ * shell sees everything else. The contrast arms below pin both directions.
  */
 class ShizukuCliArgsTest {
 
@@ -165,5 +178,120 @@ class ShizukuCliArgsTest {
     fun packageClear_payloadScopeIsHonest() {
         assertEquals("cache-only", clearScope(true))
         assertEquals("data+cache", clearScope(false))
+    }
+
+    // ── ISSUE-07: `exec` payload vs the CLI's own options ──
+
+    /** The parser set the fixed wiring feeds for an `exec` invocation. */
+    private fun execParserTokens(argv: List<String>) =
+        OffloadArgs(
+            splitShizukuArgv(argv).execOptionTokens,
+            booleanFlags = ShizukuOffloadHandler.NO_VALUE_FLAGS,
+        )
+
+    /**
+     * Fissure A — a sub-command's `-q` stays in the shell payload. Expectation
+     * written as the literal argv tail, not as "whatever trailing holds".
+     */
+    @Test
+    fun execSubcommandQuietFlag_staysInTheShellPayload() {
+        val split = splitShizukuArgv(listOf("exec", "grep", "-q", "foo", "/p"))
+        assertEquals("exec", split.group)
+        assertEquals(listOf("grep", "-q", "foo", "/p"), split.trailing)
+        assertEquals(emptyList<String>(), split.execOptionTokens)
+    }
+
+    @Test
+    fun execQuietFlag_noLongerReachesTheOutputShaper() {
+        val argv = listOf("exec", "grep", "-q", "foo", "/p")
+        assertFalse(execParserTokens(argv).hasFlag("q", "quiet"))
+        // Pre-fix shape: the whole argv minus the group went to the parser, so
+        // `-q` became --quiet. Reproduced, not asserted as a wish.
+        val old = OffloadArgs(
+            splitShizukuArgv(argv).withoutGroup,
+            booleanFlags = ShizukuOffloadHandler.NO_VALUE_FLAGS,
+        )
+        assertTrue(old.hasFlag("q", "quiet"))
+    }
+
+    /**
+     * Fissure A, end to end through the shipped formatter: with the pre-fix
+     * parser set the failure body loses `data`; with the fixed set it keeps it.
+     */
+    @Test
+    fun execFailureBody_keepsData() {
+        val envelope = JSONObject()
+            .put("ok", false)
+            .put(
+                "error",
+                JSONObject().put("code", "OPERATION_FAILED").put("message", "exec `grep -q foo /p`"),
+            )
+            .put("data", JSONObject().put("stdout", "out\n").put("exitCode", 1))
+            .toString(2)
+        val argv = listOf("exec", "grep", "-q", "foo", "/p")
+        val fixed = OffloadOutput.formatBody(envelope, execParserTokens(argv))
+        assertTrue(fixed.contains("\"stdout\""))
+        assertTrue(fixed.contains("\"exitCode\""))
+
+        val old = OffloadArgs(
+            splitShizukuArgv(argv).withoutGroup,
+            booleanFlags = ShizukuOffloadHandler.NO_VALUE_FLAGS,
+        )
+        val stripped = OffloadOutput.formatBody(envelope, old)
+        assertFalse(stripped.contains("\"stdout\""))
+        assertTrue(stripped.contains("OPERATION_FAILED"))
+    }
+
+    /** Fissure B — `--timeout-ms N` is the CLI's, not the shell's. */
+    @Test
+    fun execTrailingTimeoutOption_isClaimedByTheCli() {
+        val split = splitShizukuArgv(listOf("exec", "ls", "/p", "--timeout-ms", "5000"))
+        assertEquals(listOf("ls", "/p"), split.trailing)
+        assertEquals(listOf("--timeout-ms", "5000"), split.execOptionTokens)
+        assertEquals("5000", execParserTokens(listOf("exec", "ls", "--timeout-ms", "5000")).get("timeout-ms"))
+    }
+
+    @Test
+    fun execTrailingTimeoutOption_equalsForm() {
+        val argv = listOf("exec", "cmd", "--timeout-ms=2500")
+        val split = splitShizukuArgv(argv)
+        assertEquals(listOf("cmd"), split.trailing)
+        assertEquals(listOf("--timeout-ms=2500"), split.execOptionTokens)
+        assertEquals("2500", execParserTokens(argv).get("timeout-ms"))
+    }
+
+    /** Only a well-formed value is claimed; anything else reaches the shell. */
+    @Test
+    fun execTimeoutOption_nonNumericValueStaysInThePayload() {
+        val split = splitShizukuArgv(listOf("exec", "mytool", "--timeout-ms", "fast"))
+        assertEquals(listOf("mytool", "--timeout-ms", "fast"), split.trailing)
+        assertEquals(emptyList<String>(), split.execOptionTokens)
+        assertEquals(null, execParserTokens(listOf("exec", "mytool", "--timeout-ms", "fast")).get("timeout-ms"))
+    }
+
+    /** Regression anchor: a leading top-level option must not be swept along. */
+    @Test
+    fun execLeadingTopLevelOption_survives() {
+        val argv = listOf("--compact", "exec", "ls")
+        val split = splitShizukuArgv(argv)
+        assertEquals("exec", split.group)
+        assertEquals(listOf("ls"), split.trailing)
+        assertEquals(listOf("--compact"), split.execOptionTokens)
+        assertTrue(execParserTokens(argv).hasFlag("compact"))
+    }
+
+    /**
+     * Non-exec groups are untouched by ISSUE-07: the parser still receives the
+     * whole argv minus the group. `execOptionTokens` is an exec-only slot — for
+     * other groups it mirrors the leading options (`--compact`) and no caller
+     * reads it; the parser set is `withoutGroup`.
+     */
+    @Test
+    fun nonExecGroup_parserSetIsUnchanged() {
+        val split = splitShizukuArgv(listOf("--compact", "package", "list"))
+        assertEquals("package", split.group)
+        assertEquals(listOf("--compact", "list"), split.withoutGroup)
+        assertEquals(listOf("list"), split.trailing)
+        assertEquals(listOf("--compact"), split.execOptionTokens)
     }
 }

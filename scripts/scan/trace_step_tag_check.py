@@ -27,6 +27,11 @@ duration_ms，标签可以直接从结构判定（零调用成本、可复现、
    字段名而没人同步这里，标注器不会报错，它只是**安静地数出 0 次调用**，
    然后给出一个看起来很正常的「本次 run 无写动作」结论。所以门必须钉住
    Kotlin 侧的常量与 `put("<字段名>")` 调用仍然在场。
+   同一面还钉住**构行的锁归属**（`[da1029-C]`）：`write()` 的行构建必须在
+   `synchronized(writeLock)` 内，与 `writeTerminalOnce()` 对称。构行读
+   `activeRunId` / `activeSessionId` 并采样 `clock()`，而 `beginRun` 在同一把锁
+   内成对更新这两个字段 —— 构行在锁外时，一行可能把 A 的 `run_id` 和 B 的
+   `session_id` 拼在一起，且它的 `ts` 会早于并发线程落盘的行（行序与 ts 倒挂）。
 2. **真实 golden trace 端到端** —— 用 `tests/traces/golden/traces/*.jsonl`
    （真实事件形状，不是合成夹具）跑一遍，断言每个 `tool_call` 都被标注到、
    标签全在词表内、无解析失败行。
@@ -430,8 +435,127 @@ def face_golden(root):
     return ok
 
 
+def strip_literals(src):
+    """Empty out string bodies + drop comments before any brace matching.
+
+    The KDoc of `write` quotes `synchronized(writeLock)` / `buildLine` verbatim,
+    so a comment-blind matcher could be satisfied by documentation alone.
+    Returns None when a literal/comment never terminates (caller reports ROT
+    instead of matching garbage).
+    """
+    out, i, n = [], 0, len(src)
+    while i < n:
+        if src.startswith('"""', i):
+            end = src.find('"""', i + 3)
+            if end < 0:
+                return None
+            out.append("~")
+            i = end + 3
+            continue
+        c = src[i]
+        if c == '"':
+            i += 1
+            while i < n and src[i] != '"':
+                i += 2 if src[i] == "\\" else 1
+            if i >= n:
+                return None
+            out.append("~")
+            i += 1
+            continue
+        if src.startswith("//", i):
+            j = src.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if src.startswith("/*", i):
+            j = src.find("*/", i + 2)
+            if j < 0:
+                return None
+            i = j + 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def brace_block_end(code, open_idx):
+    """Index just past the '}' matching the '{' at `open_idx`, or -1."""
+    depth = 0
+    for i in range(open_idx, len(code)):
+        if code[i] == "{":
+            depth += 1
+        elif code[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+# 面 1b 的锚点（[da1029-C / I09]）
+WRITE_DECL = "private fun write("
+TERMINAL_DECL = "private fun writeTerminalOnce("
+LOCK_CALL = "synchronized(writeLock)"
+BUILD_LINE_CALL = "buildLine("
+
+
+def face_lock_scope(src):
+    """面 1b [da1029-C / I09]：构行必须在 writeLock 内 —— 与 writeTerminalOnce 对称。
+
+    `buildLine` 读非 @Volatile 的 activeRunId / activeSessionId 并采样 clock()，
+    而 `beginRun` 是在同一把锁内**成对**更新这两个字段的。构行放在锁外时：
+    本行可能读到半更新的 run 上下文（run_id 来自 A、session_id 来自 B），且
+    采样到的 `ts` 会早于并发线程落盘的行 —— 落盘行序与 ts 倒挂。
+
+    判据落在**锁归属**上（不是 buildLine 的调用形态），所以把构行内联进
+    synchronized 块、或先赋给局部变量，都算通过。
+    """
+    problems = []
+    code = strip_literals(src)
+    if code is None:
+        return ["AgentTraceRecorder.kt: unterminated string/comment literal — cannot "
+                "brace-match write() (ROT — update this gate)"]
+    for decl in (WRITE_DECL, TERMINAL_DECL):
+        start = code.find(decl)
+        if start < 0:
+            problems.append("AgentTraceRecorder.kt: '%s' not found (ROT — update this gate)" % decl)
+            continue
+        open_brace = code.find("{", start)
+        end = brace_block_end(code, open_brace) if open_brace >= 0 else -1
+        if end < 0:
+            problems.append("AgentTraceRecorder.kt: %s body braces do not balance "
+                            "(ROT — update this gate)" % decl)
+            continue
+        body = code[open_brace:end + 1]
+        name = decl[len("private fun "):-1]
+        lock_at = body.find(LOCK_CALL)
+        if lock_at < 0:
+            problems.append("AgentTraceRecorder.kt: %s has no '%s' around the line build — "
+                            "the run context it reads is written under that lock by beginRun"
+                            % (name, LOCK_CALL))
+            continue
+        lock_open = body.find("{", lock_at)
+        lock_end = brace_block_end(body, lock_open) if lock_open >= 0 else -1
+        if lock_end < 0:
+            problems.append("AgentTraceRecorder.kt: %s's synchronized block braces do not "
+                            "balance (ROT — update this gate)" % name)
+            continue
+        builds = [m.start() for m in re.finditer(re.escape(BUILD_LINE_CALL), body)]
+        if not builds:
+            problems.append("AgentTraceRecorder.kt: %s never calls '%s' — the write path "
+                            "cannot be serialized (ROT — update this gate)"
+                            % (name, BUILD_LINE_CALL))
+            continue
+        for p in builds:
+            if not (lock_open < p < lock_end):
+                problems.append("AgentTraceRecorder.kt: '%s' at body offset %d of %s is outside "
+                                "'%s' — a line built while the lock is free can pair run_id from "
+                                "one run with session_id from the next, and its ts can precede "
+                                "lines appended by a concurrent writer"
+                                % (BUILD_LINE_CALL, p, name, LOCK_CALL))
+    return problems
+
+
 def face_schema(root):
-    """面 1：schema 接线 —— Kotlin 侧仍写出标注器依赖的事件名与字段名。"""
+    """面 1：schema 接线 —— Kotlin 侧仍写出标注器依赖的事件名与字段名 + 构行在锁内。"""
     kt = os.path.join(root, "src", "android", "app", "src", "main", "java",
                       "com", "rikkaminis", "app", "tools", "AgentTraceRecorder.kt")
     if not os.path.exists(kt):
@@ -451,6 +575,12 @@ def face_schema(root):
         return False
     print("  ✅ AgentTraceRecorder.kt 仍写出 %d 个事件类型 + %d 个字段"
           % (len(TRACE_REQUIRED_TYPES), len(TRACE_REQUIRED_FIELDS)))
+    lock_problems = face_lock_scope(src)
+    if lock_problems:
+        for p in lock_problems:
+            print("  ❌ " + p)
+        return False
+    print("  ✅ write()/writeTerminalOnce() 的行构建都在 %s 内（锁归属判据）" % LOCK_CALL)
     return True
 
 
@@ -523,13 +653,49 @@ def selftest():
     if not quiet(face_contract):
         fails.append("精度对照：正确期望下契约竟然红了")
 
+    # 牙 4 [da1029-C / I09]：把 write() 的 buildLine 挪到 writeLock 外 -> 接线面红
+    def _kt(lock_scope_write):
+        head = ('const val TYPE_TOOL_CALL = "tool_call"\n'
+                'const val TYPE_TOOL_RESULT = "tool_result"\n'
+                'const val TYPE_TURN_START = "turn_start"\n'
+                'const val TYPE_TURN_END = "turn_end"\n'
+                'put("tool", x)\nput("args", x)\nput("tool_id", x)\nput("success", x)\n')
+        sig = '    private fun write(type: String, block: JSONObject.() -> Unit) {\n'
+        build = '        val line = buildLine(type, block)\n'
+        lock_open = '        synchronized(writeLock) {\n'
+        append = '            runCatching { appendLine(line) }\n'
+        close = '        }\n    }\n'
+        if lock_scope_write:
+            write_fn = sig + lock_open + build + append + close
+        else:
+            write_fn = sig + build + lock_open + append + close
+        terminal = ('    private fun writeTerminalOnce(block: JSONObject.() -> Unit) {\n'
+                    + lock_open + build + append + close)
+        return head + write_fn + terminal
+
+    root = tempfile.mkdtemp(prefix="tst-tag-")
+    kt_dir = os.path.join(root, "src", "android", "app", "src", "main", "java",
+                          "com", "rikkaminis", "app", "tools")
+    os.makedirs(kt_dir)
+    path = os.path.join(kt_dir, "AgentTraceRecorder.kt")
+    with open(path, "w") as fh:
+        fh.write(_kt(lock_scope_write=False))
+    if quiet(face_schema, root):
+        fails.append("牙4：buildLine 被挪到 writeLock 外时，接线面竟然还是绿的")
+    with open(path, "w") as fh:
+        fh.write(_kt(lock_scope_write=True))
+    if not quiet(face_schema, root):
+        fails.append("牙4 精度对照：构行在锁内时接线面竟然红了")
+    shutil.rmtree(root, ignore_errors=True)
+
     if fails:
         for f in fails:
             print("  ❌ " + f)
         print("TRACE_STEP_TAG_SELFTEST=FAIL")
         return 1
     print("  牙1 Kotlin 缺字段 -> 接线面红 / 牙2 空 golden -> 端到端面红 / "
-          "牙3 期望翻反 -> 契约面红；三者互不连坐，正确输入下全绿")
+          "牙3 期望翻反 -> 契约面红 / 牙4 buildLine 出锁 -> 接线面红；"
+          "三者互不连坐，正确输入下全绿")
     print("TRACE_STEP_TAG_SELFTEST=PASS")
     return 0
 

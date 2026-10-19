@@ -24,7 +24,25 @@ object VoiceProviderFactory {
 
     private const val TAG = "VoiceFactory"
 
-    fun make(instance: ProviderInstance, rawApiKey: String?): VoiceProvider? {
+    /**
+     * Build the voice provider for [instance] and give it the instance's
+     * User-Agent override.
+     *
+     * [da1029 I05] The injection is one wrapper around [build] rather than an
+     * assignment inside the branch body on purpose: `build` has 2 early
+     * `return`s plus a 11-arm `when`, and that is exactly the shape that lost
+     * the chat-side override in deep-audit-1019 ISSUE-04 (the factory forwarded
+     * it on some arms and silently dropped it on others). One post-construction
+     * assignment covers every current and future arm, and `it?` keeps the
+     * `kimiCode`/non-voice arms returning null.
+     *
+     * A null/blank value is harmless: [applyUserAgentOverride] falls back to
+     * `MinisUserAgent.DEFAULT`, the same rule the chat providers use.
+     */
+    fun make(instance: ProviderInstance, rawApiKey: String?): VoiceProvider? =
+        build(instance, rawApiKey).also { it?.customUserAgent = instance.customUserAgent }
+
+    private fun build(instance: ProviderInstance, rawApiKey: String?): VoiceProvider? {
         // [T-provider-key-roulette] Rotate at the voice choke point too, so no
         // vendor ever receives the raw multi-key string. A single key comes
         // back cleaned and verbatim, and Xunfei's "appId;apiKey;apiSecret"
