@@ -208,15 +208,20 @@ internal fun SessionEditSheet(
     isRegenerating: Boolean = false,
     onRegenerate: () -> Unit = {},
 ) {
-    var title by remember { mutableStateOf(session.title ?: "") }
-    var selectedCategory by remember { mutableStateOf(session.category) }
+    var title by remember(session.id) { mutableStateOf(session.title ?: "") }
+    var selectedCategory by remember(session.id) { mutableStateOf(session.category) }
     val defaultSessionTitle = stringResource(R.string.session_new_chat_default)
 
     // [T-android-sessionedit-regenerate-button] When a regeneration run writes a
     // new title/category to the DB, `liveSession` updates — mirror those values
     // into the sheet's local edit state so the Title field and Category grid
     // refresh in place (iOS reads the fresh ChatStore session on completion).
-    LaunchedEffect(liveSession.title, liveSession.category) {
+    // [da1032-A] Keys carry liveSession.id too: re-pointing the sheet at another
+    // row must re-seed rather than leave the previous session's text behind.
+    // (`liveSession.title?.let { … }` stays: a null title means "no new title to
+    // mirror", and blanking the field is a different decision — onSave already
+    // substitutes the "New Chat" default.)
+    LaunchedEffect(liveSession.id, liveSession.title, liveSession.category) {
         liveSession.title?.let { title = it }
         selectedCategory = liveSession.category
     }
