@@ -1605,10 +1605,20 @@ private fun WebDavConfigDialog(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var url by remember { mutableStateOf(initial?.url.orEmpty()) }
-    var username by remember { mutableStateOf(initial?.username.orEmpty()) }
-    var password by remember { mutableStateOf(initial?.password.orEmpty()) }
-    var path by remember {
+    // [da1034-B4] The four form states are seeded from `initial`, which arrives
+    // ASYNCHRONOUSLY: the parent starts from `null` and fills it in from
+    // `webDavStore.load()` inside a LaunchedEffect ([deep-audit-1033 I08] — the
+    // load used to run inline in `remember { }`, i.e. on the Main thread). A
+    // keyless `remember` therefore froze the boxes at whatever `initial` held on
+    // the FIRST composition: opening the dialog in the null window showed four
+    // empty fields, and Save wrote those empties back over the real config. Same
+    // shape as the 1028-C form states and the 1033-A dialog seeds — every state
+    // seeded from `initial` re-seeds when `initial` moves. `testing` /
+    // `testResult` / `confirmClearPassword` derive from nothing and stay keyless.
+    var url by remember(initial) { mutableStateOf(initial?.url.orEmpty()) }
+    var username by remember(initial) { mutableStateOf(initial?.username.orEmpty()) }
+    var password by remember(initial) { mutableStateOf(initial?.password.orEmpty()) }
+    var path by remember(initial) {
         mutableStateOf(initial?.path ?: WebDavConfig.DEFAULT_BACKUP_DIR)
     }
     var testing by remember { mutableStateOf(false) }
