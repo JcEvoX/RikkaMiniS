@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Gate: FIX-I (deep-audit-1024 ISSUE-09) — `ModelUseOffloadHandler` must route
-every relative path through [resolveMaybeRelative] (the single join
-implementation defined in `ConfigOffloadHandler.kt`) instead of keeping private,
-drifting copies and cwd-less call chains.
+Gate: FIX-I (deep-audit-1024 ISSUE-09) + FIX-C (deep-audit-1033 ISSUE-03) —
+every path-taking offload handler must route a relative path through
+[resolveMaybeRelative] (the single join implementation defined in
+`ConfigOffloadHandler.kt`) instead of keeping private, drifting copies and
+cwd-less call chains.
 
-The bug (one function, contradicting itself):
+The 1024 bug (one function, contradicting itself):
   - `cmdRun`'s `--output` still refused any relative path with
     `invalid_output_path`, while the SAME `cmdRun` forwarded `request.cwd` for
     `--input` / `--system-file`;
@@ -16,29 +17,61 @@ The bug (one function, contradicting itself):
     `prompt.json` (`{"type":"image_url","image_url":{"url":"chart.png"}}`)
     threw `ImageInputError`.
 
+The 1033 bug (the last handler that never adopted the contract):
+  - `SpeechOffloadHandler.cmdTranscribe` was dispatched as
+    `cmdTranscribe(args, request.sessionId)` — `request.cwd` dropped — and
+    `resolveSourcePath` opened with
+    `if (trimmed.isEmpty() || !trimmed.startsWith("/")) return null`, so
+    `android-speech transcribe --source note.wav` from the shell's cwd always
+    came back `file_exists:false` / `resolved_host_path:""`.
+
 Checks run on comment-stripped text, so prose in a KDoc cannot satisfy them:
-  C1  `readLinuxPath(...)`      body calls `resolveMaybeRelative(`.
-  C2  `cmdRun(...)`             body normalises `--output` through
-                                `resolveMaybeRelative(`.
-  C3  `resolveImageUrl(...)`    body calls `resolveMaybeRelative(`.
-  C4  the file keeps NO inline cwd join (`"$cwd...` string template) — the
-      single implementation may only live in `ConfigOffloadHandler.kt`.
+  ModelUseOffloadHandler.kt
+    C1  `readLinuxPath(...)`      body calls `resolveMaybeRelative(`.
+    C2  `cmdRun(...)`             body normalises `--output` through
+                                  `resolveMaybeRelative(`.
+    C3  `resolveImageUrl(...)`    body calls `resolveMaybeRelative(`.
+    C4  the file keeps NO inline cwd join (`"$cwd...` string template) — the
+        single implementation may only live in `ConfigOffloadHandler.kt`.
+  SpeechOffloadHandler.kt
+    S1  `resolveSourcePath(...)`  body calls `resolveMaybeRelative(`.
+    S2  every `cmdTranscribe(...)` / `resolveSourcePath(...)` occurrence in the
+        file carries `cwd` in its argument list — i.e. the cwd really enters
+        the call chain. Judged on the decision point, not on argument order or
+        on the expression spelling (`request.cwd` and a local `cwd` both count).
+    S3  `resolveSourcePath` no longer decides relative-vs-absolute itself
+        (no `startsWith("/")` in its body) and the file carries no hand-written
+        `"$cwd` join.
+    S4  privacy edge: inside `cmdTranscribe`, the `--source` classifier runs
+        BEFORE the microphone permission gate, and the explicit non-mic branch
+        returns a NON-zero result carrying an error payload — a `--source` the
+        user typed must never be silently swapped for a live mic, and must
+        never come back as a success.
+
+Boundary (documented, not a bug): S4 pins the current literal shape. A refactor
+that moves the error payload into a helper (e.g. `return notSupported(...)`)
+reds the gate; that is fail-closed on purpose — the helper must then be named
+in the criterion.
 
 Usage: python3 scripts/scan/offload_relative_path_unify_check.py [repo_root]
        python3 scripts/scan/offload_relative_path_unify_check.py --selftest
 Exit:  0 = clean, 1 = violation(s), 2 = usage
 """
 import os
+import re
 import shutil
 import sys
 import tempfile
 
 SRC = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload"
 TARGET_REL = SRC + "/ModelUseOffloadHandler.kt"
+SPEECH_REL = SRC + "/SpeechOffloadHandler.kt"
 CALL = "resolveMaybeRelative("
 # A Kotlin string template that joins a cwd itself — the shape that must not
-# reappear in the target file (the join belongs to resolveMaybeRelative).
+# reappear in either target file (the join belongs to resolveMaybeRelative).
 INLINE_JOIN = '"$cwd'
+# Argument lists of the two Speech call-chain links (no nested parens in either).
+CHAIN_RE = re.compile(r"\b(cmdTranscribe|resolveSourcePath)\s*\(([^()]*)\)")
 
 
 def strip_comments(text):
@@ -75,7 +108,10 @@ def strip_comments(text):
                 st[1] += 1
             elif c == "}":
                 if st[1] == 0 and len(stack) > 1:
-                    stack.pop(); i += 1; continue
+                    # closes the `${...}` expression: back into the literal, but
+                    # keep the brace so the text stays balanced for the scanners
+                    # that run after this one
+                    stack.pop(); out.append(c); i += 1; continue
                 st[1] -= 1
             out.append(c); i += 1; continue
         if st[0] == "str":
@@ -94,6 +130,53 @@ def strip_comments(text):
         if text.startswith('"""', i):
             stack.pop(); out.append('"""'); i += 3; continue
         out.append(text[i]); i += 1
+    return "".join(out)
+
+
+def strip_strings(code):
+    """Blank the *contents* of string literals in comment-free code.
+
+    A criterion that scans the whole file for a call site must not be driven by
+    a token that only appears inside a log message — `resolveSourcePath`'s own
+    failure line reads `"resolveSourcePath('$trimmed') failed: ${e.message}"`,
+    which a naive whole-file regex happily matches as a cwd-less call. Template
+    expressions (`${…}`) resume as code, so an interpolated `args.get("input")`
+    stays visible; raw strings are blanked whole.
+    """
+    out = []
+    stack = [["code", 0]]
+    i = 0
+    n = len(code)
+    while i < n:
+        st = stack[-1]
+        if st[0] == "code":
+            if code.startswith('"""', i):
+                stack.append(["raw", 0]); out.append("   "); i += 3; continue
+            c = code[i]
+            if c == '"':
+                stack.append(["str", 0]); out.append(c); i += 1; continue
+            if len(stack) > 1 and c == "{":
+                st[1] += 1
+            elif len(stack) > 1 and c == "}":
+                if st[1] == 0:
+                    # closes the `${…}` we are inside: back to the literal
+                    stack.pop(); out.append(c); i += 1; continue
+                st[1] -= 1
+            out.append(c); i += 1; continue
+        if st[0] == "str":
+            c = code[i]
+            if c == "\\":
+                out.append("  ")
+                i += 2
+                continue
+            if code.startswith("${", i):
+                stack.append(["code", 0]); out.append("${"); i += 2; continue
+            if c == '"':
+                stack.pop(); out.append(c); i += 1; continue
+            out.append(c if c == "\n" else " "); i += 1; continue
+        if code.startswith('"""', i):
+            stack.pop(); out.append('"""'); i += 3; continue
+        out.append(code[i] if code[i] == "\n" else " "); i += 1
     return "".join(out)
 
 
@@ -151,6 +234,11 @@ def declaration_slice(text, marker):
     return text[start:]
 
 
+# NOTE: this second definition shadows the template-aware one above (the module
+# keeps both; the LAST binding wins). Its `in_str` state does not recurse into
+# `${…}`, so a quote nested inside a template expression ends the literal early
+# — harmless for the criteria below (which match tokens, not braces) but do not
+# rely on it for a brace-sensitive criterion without re-checking the slice.
 def declaration_slice(text, marker):
     """Return the `{ ... }` body of the declaration containing `marker`.
 
@@ -223,12 +311,87 @@ def check_source(raw):
     return problems
 
 
+def check_speech_source(raw):
+    """SpeechOffloadHandler.kt half of the contract (deep-audit-1033 FIX-C)."""
+    code = strip_comments(raw)
+    problems = []
+
+    resolver = declaration_slice(code, "fun resolveSourcePath(")
+    cmd_body = declaration_slice(code, "fun cmdTranscribe(")
+
+    # S1 — the resolver delegates the join.
+    if not resolver:
+        problems.append(("S1", "declaration 'fun resolveSourcePath(' not found in the target file"))
+    elif CALL not in resolver:
+        problems.append(("S1", "resolveSourcePath() does not call resolveMaybeRelative() — a "
+                               "relative --source is still refused instead of joined onto cwd"))
+
+    # S2 — the cwd really enters the call chain (decision point, not spelling).
+    chains = CHAIN_RE.findall(strip_strings(code))
+    if not any(name == "cmdTranscribe" for name, _ in chains):
+        problems.append(("S2", "no cmdTranscribe(...) occurrence found — declaration vanished"))
+    for name, args in chains:
+        if "cwd" not in args:
+            problems.append(("S2", "%s(...) drops cwd from its arguments: %s(%s)"
+                             % (name, name, args.strip())))
+
+    # S3 — relative-vs-absolute is the join's decision, and the join is single-source.
+    if resolver and "startsWith(\"/\")" in resolver:
+        problems.append(("S3", "resolveSourcePath() re-implements the relative-vs-absolute "
+                               "decision (startsWith(\"/\") in its body) — it belongs to "
+                               "resolveMaybeRelative()"))
+    if INLINE_JOIN in code:
+        problems.append(("S3", "a hand-written inline cwd join ('\"$cwd...') is back — the "
+                               "join must stay single-source in resolveMaybeRelative()"))
+
+    # S4 — privacy edge: classify --source before asking for the microphone, and
+    # an explicit non-mic source must return an error, never a success.
+    if not cmd_body:
+        problems.append(("S4", "declaration 'fun cmdTranscribe(' not found in the target file"))
+    else:
+        classified = cmd_body.find("sourceIsMic(")
+        mic_gate = cmd_body.find("ensureMicPermission(")
+        if classified < 0:
+            problems.append(("S4", "cmdTranscribe() never classifies --source (sourceIsMic)"))
+        if mic_gate < 0:
+            problems.append(("S4", "cmdTranscribe() never reaches the microphone permission "
+                                   "gate (ensureMicPermission)"))
+        if classified >= 0 and mic_gate >= 0:
+            if mic_gate < classified:
+                problems.append(("S4", "the microphone permission gate runs BEFORE the --source "
+                                       "classifier — an explicit --source can fall through to a "
+                                       "live mic"))
+            else:
+                branch = cmd_body[classified:mic_gate]
+                if '"error"' not in branch:
+                    problems.append(("S4", "the explicit non-mic source branch carries no error "
+                                           "payload before the mic gate"))
+                codes = re.findall(r"return NativeOffloadResult\(\s*(\d+)", branch)
+                if not codes:
+                    problems.append(("S4", "the explicit non-mic source branch never returns a "
+                                           "result before the mic gate"))
+                elif codes[-1] == "0":
+                    problems.append(("S4", "the explicit non-mic source branch returns success "
+                                           "(exit 0) — a missing file must not read as a "
+                                           "transcription"))
+    return problems
+
+
 def check_tree(root):
-    path = os.path.join(root, TARGET_REL)
-    if not os.path.isfile(path):
-        return None, [("C0", "target file missing: %s" % TARGET_REL)]
-    with open(path, "r", encoding="utf-8") as fh:
-        return path, check_source(fh.read())
+    problems = []
+    main_path = os.path.join(root, TARGET_REL)
+    if not os.path.isfile(main_path):
+        problems.append(("C0", "target file missing: %s" % TARGET_REL))
+    else:
+        with open(main_path, "r", encoding="utf-8") as fh:
+            problems.extend(check_source(fh.read()))
+    speech_path = os.path.join(root, SPEECH_REL)
+    if not os.path.isfile(speech_path):
+        problems.append(("S0", "target file missing: %s" % SPEECH_REL))
+    else:
+        with open(speech_path, "r", encoding="utf-8") as fh:
+            problems.extend(check_speech_source(fh.read()))
+    return main_path, problems
 
 
 # ── selftest fixtures ────────────────────────────────────────────────────────
@@ -262,6 +425,45 @@ class ModelUseOffloadHandler {
 }
 '''
 
+# Mirrors the post-fix SpeechOffloadHandler shape (cwd in the chain, join in the
+# resolver, classifier ahead of the mic gate, error payload in between).
+_SPEECH_CLEAN = '''package com.rikkaminis.app.sandbox.offload
+
+class SpeechOffloadHandler(private val context: Context) : NativeOffloadHandler {
+    override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
+        val args = OffloadArgs(request.argv.drop(1))
+        return when (args.positional.firstOrNull()) {
+            "transcribe", "listen" -> cmdTranscribe(args, request.sessionId, request.cwd)
+            else -> NativeOffloadResult(2, "usage")
+        }
+    }
+
+    private fun cmdTranscribe(args: OffloadArgs, sessionId: String?, cwd: String?): NativeOffloadResult {
+        val source = args.get("source")
+        if (source != null && !sourceIsMic(source)) {
+            val resolved = resolveSourcePath(source, sessionId, cwd)
+            val body = JSONObject().put("error", "not_supported")
+                .put("requested_path", source)
+                .toString()
+            return NativeOffloadResult(2, OffloadOutput.formatBody(body, args))
+        }
+        ensureMicPermission(args)?.let { return it }
+        return NativeOffloadResult(0, "ok")
+    }
+
+    private fun resolveSourcePath(source: String, sessionId: String?, cwd: String?): File? {
+        val trimmed = source.trim()
+        if (trimmed.isEmpty()) return null
+        val guestPath = resolveMaybeRelative(trimmed, cwd)
+        return try {
+            PRootKernel.resolvePathForSession(sessionId, guestPath, context)
+        } catch (e: Throwable) {
+            null
+        }
+    }
+}
+'''
+
 _DIRTY_READLINUX = _CLEAN.replace(
     "        val resolved = resolveMaybeRelative(linuxPath, cwd)\n        return resolved",
     '        val resolved = if (!linuxPath.startsWith("/") && !cwd.isNullOrEmpty()) {\n'
@@ -291,27 +493,68 @@ _DIRTY_INLINE_ONLY = _CLEAN.replace(
     "    private fun readLinuxPath(linuxPath: String, cwd: String?): String? {",
 )
 
+# The Before shape of deep-audit-1033 ISSUE-03, verbatim: no join, hard reject.
+_SPEECH_BEFORE = _SPEECH_CLEAN.replace(
+    "        val guestPath = resolveMaybeRelative(trimmed, cwd)\n"
+    "        return try {\n"
+    "            PRootKernel.resolvePathForSession(sessionId, guestPath, context)",
+    "        if (!trimmed.startsWith(\"/\")) return null\n"
+    "        return try {\n"
+    "            PRootKernel.resolvePathForSession(sessionId, trimmed, context)",
+)
 
-def _fixture_root(text):
+# cwd dropped from the dispatch (the one-line defect) — the join stays.
+_SPEECH_NO_CWD = _SPEECH_CLEAN.replace(
+    "cmdTranscribe(args, request.sessionId, request.cwd)",
+    "cmdTranscribe(args, request.sessionId)",
+)
+
+# The microphone gate hoisted above the classifier: the privacy edge reopens.
+_SPEECH_MIC_FIRST = _SPEECH_CLEAN.replace(
+    "        if (source != null && !sourceIsMic(source)) {",
+    "        ensureMicPermission(args)?.let { return it }\n"
+    "        if (source != null && !sourceIsMic(source)) {",
+).replace("\n        ensureMicPermission(args)?.let { return it }\n        return NativeOffloadResult(0, \"ok\")",
+          "\n        return NativeOffloadResult(0, \"ok\")")
+
+# Join present, but a stray hand-written join elsewhere → S3 only.
+_SPEECH_STRAY_JOIN = _SPEECH_CLEAN.replace(
+    "        ensureMicPermission(args)?.let { return it }",
+    '        ensureMicPermission(args)?.let { return it }\n'
+    '        val fallbackJoin = "$cwd/legacy.wav"',
+)
+
+
+def _fixture_root(model_text, speech_text=_SPEECH_CLEAN):
     root = tempfile.mkdtemp(prefix="offload-relpath-gate-selftest-")
-    path = os.path.join(root, TARGET_REL)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(text)
+    for rel, text in ((TARGET_REL, model_text), (SPEECH_REL, speech_text)):
+        path = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
     return root
 
 
 def selftest():
     cases = [
-        ("clean: all three sites delegate to resolveMaybeRelative", _CLEAN, set()),
+        ("clean: all three ModelUse sites delegate to resolveMaybeRelative", _CLEAN, set()),
         ("C1C4: readLinuxPath keeps an inline join", _DIRTY_READLINUX, {"C1", "C4"}),
         ("C2: --output not normalised", _DIRTY_OUTPUT, {"C2"}),
         ("C3: resolveImageUrl has no cwd join", _DIRTY_IMAGE, {"C3"}),
         ("C4 only: all sites clean but a stray inline join remains", _DIRTY_INLINE_ONLY, {"C4"}),
+        ("S1S3: the Speech Before shape (hard relative reject, no join)",
+         _CLEAN, {"S1", "S3"}, _SPEECH_BEFORE),
+        ("S2: the Speech dispatch drops request.cwd", _CLEAN, {"S2"}, _SPEECH_NO_CWD),
+        ("S4: the mic gate runs before the --source classifier",
+         _CLEAN, {"S4"}, _SPEECH_MIC_FIRST),
+        ("S3 only: the Speech join is present but a stray inline join is back",
+         _CLEAN, {"S3"}, _SPEECH_STRAY_JOIN),
     ]
     failures = []
-    for label, text, expected in cases:
-        root = _fixture_root(text)
+    for case in cases:
+        label, model_text, expected = case[0], case[1], case[2]
+        speech_text = case[3] if len(case) > 3 else _SPEECH_CLEAN
+        root = _fixture_root(model_text, speech_text)
         try:
             _, problems = check_tree(root)
         finally:
@@ -325,7 +568,7 @@ def selftest():
     if failures:
         print("❌ selftest failed: %s" % ", ".join(failures))
         return 1
-    print("OFFLOAD_RELATIVE_PATH_UNIFY_SELFTEST=PASS (5 fixtures: 4 violation "
+    print("OFFLOAD_RELATIVE_PATH_UNIFY_SELFTEST=PASS (9 fixtures: 8 violation "
           "shapes caught, clean tree green)")
     return 0
 
@@ -343,13 +586,13 @@ def main():
         return 2
     path, problems = check_tree(root)
     if path is None or problems:
-        print("offload_relative_path_unify_check: %d violation(s) in %s" %
-              (len(problems), TARGET_REL))
+        print("offload_relative_path_unify_check: %d violation(s) in %s + %s" %
+              (len(problems), TARGET_REL, os.path.basename(SPEECH_REL)))
         for cid, msg in problems:
             print("  [%s] %s" % (cid, msg))
         return 1
-    print("offload_relative_path_unify_check: %s — OFFLOAD-RELATIVE-PATH-UNIFY GATE OK"
-          % TARGET_REL)
+    print("offload_relative_path_unify_check: %s + %s — OFFLOAD-RELATIVE-PATH-UNIFY GATE OK"
+          % (TARGET_REL, os.path.basename(SPEECH_REL)))
     return 0
 
 
