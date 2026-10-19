@@ -337,4 +337,52 @@ class SkillFrontmatterPolarityTest {
             written,
         )
     }
+
+    // ── 5. the browser refresh must hand the incoming block over ─────────
+
+    /**
+     * deep-audit-1030 ISSUE-02 — the skills-BROWSER refresh called
+     * `update(id, name, description, version, body)` and omitted `frontmatter`,
+     * so `update()` re-seeded its copy from the on-disk SKILL.md and the
+     * incoming `subagent` / `max_turns` / `allowed_tools` were shadowed by
+     * whatever the disk already said — a catalogue edit under a refactor never
+     * landed, silently. Both polarities are pinned against the exact call shape
+     * the two callers produce:
+     *   - `parsed.frontmatter.ifBlank { null }` (fixed) → the incoming block wins
+     *   - `null` (the omission)                        → the disk block wins
+     * A single-sided assertion would go green on either polarity.
+     */
+    @Test
+    fun `browser refresh hands the incoming block over so it beats the disk copy`() {
+        val fixed = landing(
+            callerFrontmatter = incomingBlock.ifBlank { null },
+            diskContent = diskDocument,
+            name = "Old Name",
+            description = "Old description",
+            version = "1.0.0",
+            body = "Body.",
+        )
+        assertTrue("the incoming budget must land", fixed.contains("max_turns: 50"))
+        assertFalse("the stale disk budget must not survive", fixed.contains("max_turns: 7"))
+        // …and the real consumer reads the extended keys back off the document,
+        // so "landed" means reachable, not merely present in a string.
+        val config = SubagentSkill.parseSubagentConfig(
+            Stub(name = "Old Name", frontmatter = SubagentSkill.extractFrontmatterBlock(fixed)),
+        )
+        assertTrue(config.isSubagent)
+        assertEquals(50, config.maxTurns)
+
+        // The pre-fix call shape: update() re-seeds from readSkillMdFrontmatter(id),
+        // i.e. the on-disk block becomes the merge base.
+        val omitted = landing(
+            callerFrontmatter = null,
+            diskContent = diskDocument,
+            name = "Old Name",
+            description = "Old description",
+            version = "1.0.0",
+            body = "Body.",
+        )
+        assertTrue("the disk budget wins when the block is omitted", omitted.contains("max_turns: 7"))
+        assertFalse(omitted.contains("max_turns: 50"))
+    }
 }

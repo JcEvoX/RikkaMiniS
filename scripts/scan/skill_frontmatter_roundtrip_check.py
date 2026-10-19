@@ -25,6 +25,10 @@ Fix contract asserted here (code anchors, comments stripped before matching):
         different, correct `0 until`)
   arm8  the SKILL.md viewer renders through the repository's single merge exit
         instead of hand-splicing a 3-key block
+  arm9  the skills-BROWSER refresh (re-download of a catalogue SKILL.md) hands
+        the parsed block to update() as well — same contract as arm4/arm8's
+        file path; without it the on-disk block shadowed the incoming one
+        (deep-audit-1030 ISSUE-02)
 
 Usage: python3 scripts/scan/skill_frontmatter_roundtrip_check.py [repo_root]
        python3 scripts/scan/skill_frontmatter_roundtrip_check.py --selftest
@@ -36,6 +40,7 @@ import sys
 REPO_REL = "src/android/app/src/main/java/com/rikkaminis/app"
 SR_REL = REPO_REL + "/data/repository/SkillRepository.kt"
 SM_REL = REPO_REL + "/ui/settings/SkillsManagementScreen.kt"
+SB_REL = REPO_REL + "/ui/settings/MinisSkillsBrowserScreen.kt"
 
 SELFTEST_MARK = "SKILL_FRONTMATTER_ROUNDTRIP_SELFTEST=PASS"
 
@@ -56,6 +61,9 @@ MERGE_WALK_DOUBLED = "for (i in 0 until frontmatterEnd)"
 VIEWER_EXIT = "SkillRepository.mergeFrontmatter("
 VIEWER_SPLICE = 'appendLine("name: '
 DETAIL_PASSES = "frontmatter = parsed.frontmatter.ifBlank { null }"
+# [da1030-A ISSUE-02] the browser refresh call site
+SB_UPDATE_CALL = "skillRepository.update("
+SB_UPDATE_DISCRIMINATOR = "id = targetId"
 
 
 def strip_comments(text):
@@ -154,7 +162,25 @@ def function_body(text_nc, text_masked, signature):
     return None
 
 
-def run_checks_text(sr_text, sm_text):
+def call_arg_block(text, start):
+    """The substring of `text` from `start` (the callee name) through the ')'
+    matching the call's opening '(' — paren-depth walk, braces ignored (a
+    trailing lambda is a separate concern). Returns None when unbalanced."""
+    i = text.find("(", start)
+    if i < 0:
+        return None
+    depth = 0
+    while i < len(text):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+        i += 1
+    return None
+
+def run_checks_text(sr_text, sm_text, sb_text=None):
     sr_nc = strip_comments(sr_text)
     sm_nc = strip_comments(sm_text)
     sr_masked = mask_strings(sr_nc)
@@ -225,13 +251,38 @@ def run_checks_text(sr_text, sm_text):
     check("arm8 update-from-file passes parsed.frontmatter",
           DETAIL_PASSES in sm_nc)
 
+    # arm9 [da1030-A ISSUE-02]: the BROWSE-tab refresh path (re-parse of a
+    # downloaded SKILL.md) must hand the parsed block over as well. Scoped to
+    # the refresh call site — identified by its `id = targetId` argument — so
+    # the unrelated pure-rename call `update(skill.id, name = trimmed)` in the
+    # settings list cannot satisfy (or shadow) the criterion, and so a second
+    # update() call added later in the file cannot silently stand in for it.
+    sb_nc = strip_comments(sb_text if sb_text is not None else "")
+    call_at = sb_nc.find(SB_UPDATE_CALL)
+    call_block = call_arg_block(sb_nc, call_at) if call_at >= 0 else None
+    if call_block is None:
+        check("arm9 browser refresh call site found", False,
+              "'%s' not found in MinisSkillsBrowserScreen.kt (ROT — update this gate)"
+              % SB_UPDATE_CALL)
+    else:
+        check("arm9 browser refresh call site is the resolved-id one",
+              SB_UPDATE_DISCRIMINATOR in call_block,
+              "expected '%s' in the update() arguments (ROT — update this gate)"
+              % SB_UPDATE_DISCRIMINATOR)
+        check("arm9 browser refresh passes parsed.frontmatter",
+              DETAIL_PASSES in call_block,
+              "update() re-seeds from the on-disk SKILL.md when no block is "
+              "passed, so the incoming subagent / max_turns / allowed_tools are "
+              "shadowed by the disk copy")
+
     return failures
 
 
 def run_checks(repo_root):
     sr = open(os.path.join(repo_root, SR_REL), encoding="utf-8").read()
     sm = open(os.path.join(repo_root, SM_REL), encoding="utf-8").read()
-    return run_checks_text(sr, sm)
+    sb = open(os.path.join(repo_root, SB_REL), encoding="utf-8").read()
+    return run_checks_text(sr, sm, sb)
 
 
 # ── selftest fixtures ────────────────────────────────────────────────────
@@ -417,6 +468,40 @@ DIRTY_SM_SPLICE = GOOD_SM.replace(
             append(skill.body)
         }""")
 
+# [da1030-A ISSUE-02] browser-refresh fixture: the call site the gate scopes to
+# is the resolved-id one (`id = targetId`).
+GOOD_SB = '''package com.rikkaminis.app.ui.settings
+
+internal suspend fun refreshFromCatalogue(skillRepository: SkillRepository) {
+    val parsed = skillRepository.parseSkillMdPublic(content)
+    val targetId = resolveUpdateTargetId(rows, slugify(parsed.name), parsed.name) ?: slugify(parsed.name)
+    val updated = withContext(Dispatchers.IO) {
+        skillRepository.update(
+            id = targetId,
+            name = parsed.name,
+            description = parsed.description,
+            version = parsed.version,
+            body = parsed.body,
+            frontmatter = parsed.frontmatter.ifBlank { null },
+        )
+    }
+}
+'''
+
+# The pre-fix shape: the refresh kept its own block and let update() re-seed
+# from the on-disk SKILL.md.
+DIRTY_SB_DROP = GOOD_SB.replace(
+    "            frontmatter = parsed.frontmatter.ifBlank { null },\n", "")
+
+# Precision control: the block is present in the file, but on a DIFFERENT
+# update() call — the criterion is scoped to the refresh site, so this is still
+# a violation (a file-wide `"frontmatter = parsed.frontmatter" in sb_nc` check
+# would have been satisfied here and gone green on the real defect).
+DIRTY_SB_BLOCK_ELSEWHERE = DIRTY_SB_DROP.replace(
+    "    val updated = withContext(Dispatchers.IO) {\n",
+    "    skillRepository.update(id = otherId, frontmatter = parsed.frontmatter.ifBlank { null })\n"
+    "    val updated = withContext(Dispatchers.IO) {\n")
+
 
 def selftest():
     # tempfile.mkdtemp resolves through the guest-tmp translation (host-side
@@ -424,21 +509,23 @@ def selftest():
     # instead; the repo-root wrapper above is the only filesystem path.
     ok = True
 
-    def run(sr_text, sm_text):
-        return run_checks_text(sr_text, sm_text)
+    def run(sr_text, sm_text, sb_text=GOOD_SB):
+        return run_checks_text(sr_text, sm_text, sb_text)
 
     f = run(GOOD_SR, GOOD_SM)
     print("selftest clean tree: %s" % ("PASS" if not f else "FAIL %s" % f))
     ok &= not f
 
-    for label, sr_t, sm_t in [
-        ("polarity reverted", DIRTY_SR_POLARITY, GOOD_SM),
-        ("delimiter walk reverted", DIRTY_SR_WALK, GOOD_SM),
-        ("update() loses frontmatter param", DIRTY_SR_UPDATE, GOOD_SM),
-        ("parseSkillMd stops returning the block", DIRTY_SR_PARSE, GOOD_SM),
-        ("viewer hand-splice returns", GOOD_SR, DIRTY_SM_SPLICE),
+    for label, sr_t, sm_t, sb_t in [
+        ("polarity reverted", DIRTY_SR_POLARITY, GOOD_SM, GOOD_SB),
+        ("delimiter walk reverted", DIRTY_SR_WALK, GOOD_SM, GOOD_SB),
+        ("update() loses frontmatter param", DIRTY_SR_UPDATE, GOOD_SM, GOOD_SB),
+        ("parseSkillMd stops returning the block", DIRTY_SR_PARSE, GOOD_SM, GOOD_SB),
+        ("viewer hand-splice returns", GOOD_SR, DIRTY_SM_SPLICE, GOOD_SB),
+        ("browser refresh drops the block", GOOD_SR, GOOD_SM, DIRTY_SB_DROP),
+        ("browser block on the wrong call", GOOD_SR, GOOD_SM, DIRTY_SB_BLOCK_ELSEWHERE),
     ]:
-        f = run(sr_t, sm_t)
+        f = run(sr_t, sm_t, sb_t)
         red = len(f) > 0
         print("selftest dirty %-38s: %s %s" % (label, "RED" if red else "NOT-RED", f[:1]))
         ok &= red
@@ -457,7 +544,7 @@ def main():
         for f in failures:
             print("  - %s" % f)
         sys.exit(1)
-    print("OK %s + %s (%d arms)" % (SR_REL, SM_REL, 12))
+    print("OK %s + %s + %s (%d arms)" % (SR_REL, SM_REL, SB_REL, 14))
     sys.exit(0)
 
 

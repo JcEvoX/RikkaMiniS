@@ -131,6 +131,20 @@ internal suspend fun ChatViewModel.ensureSession(): String {
         // no-op when no rows match.
         skillRepository?.renameSessionOverrides(fromDraft = sessionId, toReal = session.id)
         mcpRepository?.renameSessionOverrides(fromDraft = sessionId, toReal = session.id)
+        // [da1030-A ISSUE-01] Same hop for the pinned WebApp shortcuts. A
+        // shortcut created from this chat while it was still a draft froze
+        // `__new__<uuid>` into both scope columns (AddToHomeSheet writes
+        // `source.sessionId`); `migrateDraftResources` above just moved the
+        // bytes to the real id and deleted the draft directory, so
+        // WebAppPathResolver.resolveSession() resolves `htmlPath` under a path
+        // that no longer exists and the launcher icon reports "Source
+        // Missing". Contained on purpose: a failed DB write must not abort the
+        // promotion (the typed text is already captured in the draft slot).
+        runCatching {
+            (context.applicationContext as? com.rikkaminis.app.MinisApp)
+                ?.webAppShortcutRepository
+                ?.renameSessionShortcuts(fromDraft = sessionId, toReal = session.id)
+        }
         // Re-point the lazily-created BrowserTabPool if it was already
         // instantiated against the draft key (e.g. user opened the browser
         // sheet before sending a message). Without this, cookies and
