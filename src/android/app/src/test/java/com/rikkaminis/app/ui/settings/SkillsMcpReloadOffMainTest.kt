@@ -331,14 +331,17 @@ class SkillsMcpReloadOffMainTest {
     }
 
     private fun readRepoFile(relative: String): String {
-        var dir: java.io.File? = java.io.File(System.getProperty("user.dir"))
+        // Platform type: under the Android stubs `System.getProperty` is
+        // inferred nullable, and JDK 21's java.io.File(String) is not — pin it
+        // so this helper compiles warning-free (CI logs a `Java type mismatch`
+        // for every shape test that passes it straight through).
+        val cwd = System.getProperty("user.dir") ?: "."
+        var dir: java.io.File? = java.io.File(cwd)
         while (dir != null) {
             val f = java.io.File(dir, relative)
             if (f.exists()) return f.readText()
             dir = dir.parentFile
         }
-        throw java.io.FileNotFoundException(
-            "$relative not found from user.dir=${System.getProperty("user.dir")}",
-        )
+        throw java.io.FileNotFoundException("$relative not found from user.dir=$cwd")
     }
 }
