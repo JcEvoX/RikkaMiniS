@@ -43,6 +43,28 @@ contract, which lives in a different file:
       The criterion is skipped when TerminalScreen.kt is absent (mini-tree
       fixtures that only stage the broker file).
 
+deep-audit-1032 FIX-D (ISSUE-05, P1) added the two terminal deep-link entries,
+which live in a third and fourth file:
+
+  U6  `MainActivity.kt` — the runtime deep-link dispatcher's
+      `is DeepLinkAction.OpenTerminal ->` branch must hand
+      `Routes.terminal(…)` a session id that came out of the alias table
+      (`ChatViewModelStore.resolveSessionId(…)` / `.activeSessionId`, directly
+      or through a local val). A terminal session is not cosmetic: the id
+      selects `minis-sessions/<sid>/` bind mounts and `MINIS_CHAT_SESSION_ID`,
+      so a bare/absent id binds the terminal to the global workspace (or to the
+      orphan `__new__<uuid>` draft key) while the chat it was opened from lives
+      under the promoted id. The criterion is anchored on the branch and the
+      `Routes.terminal(` call inside it, never on a specific argument spelling:
+      `sessionId = <resolved>` and positional `<resolved>` both count.
+  U7  `AppNavigation.kt` — same rule for the cold-start dispatcher's
+      `is DeepLinkAction.OpenTerminal ->` branch (the same user action's second
+      entry point; asymmetry here was the reported "cold has, hot hasn't" gap —
+      in the tree both were missing). `.activeSessionId` is accepted because its
+      getter already resolves through the alias table.
+
+Both are skipped when their file is absent (mini-tree fixtures).
+
 Usage: python3 open_url_broker_scheme_check.py [ROOT]   (ROOT = repo root)
        python3 open_url_broker_scheme_check.py --selftest
 Exit:  0 = gate green, 1 = violations found (or selftest failures).
@@ -212,8 +234,8 @@ RE_LAUNCHED_PENDING = re.compile(r"LaunchedEffect\(\s*pendingUrl\s*\)\s*\{")
 RE_WEB_SCHEME_IF = re.compile(r"if\s*\(\s*MinisOpenUrlBroker\.isWebScheme\(")
 CONSUME_CALL = "MinisOpenUrlBroker.consume()"
 
-def match_brace(code, open_idx):
-    """Index of the '}' matching the '{' at open_idx (string-aware), else -1."""
+def match_delim(code, open_idx, open_ch, close_ch):
+    """Index of the close_ch matching the open_ch at open_idx (string-aware)."""
     depth = 0
     i = open_idx
     n = len(code)
@@ -230,14 +252,18 @@ def match_brace(code, open_idx):
             continue
         if c in ('"', "'"):
             quote = c
-        elif c == "{":
+        elif c == open_ch:
             depth += 1
-        elif c == "}":
+        elif c == close_ch:
             depth -= 1
             if depth == 0:
                 return i
         i += 1
     return -1
+
+def match_brace(code, open_idx):
+    """Index of the '}' matching the '{' at open_idx (string-aware), else -1."""
+    return match_delim(code, open_idx, "{", "}")
 
 def analyse_terminal(code_raw):
     """U5 — the fullscreen terminal may only consume URLs it actually presents."""
@@ -289,7 +315,111 @@ def analyse_terminal(code_raw):
     return results
 
 
-# ---------------------------------------------------------------- selftest ---
+# ------------------------------------------- terminal deep-link entries (U6/U7) ---
+REL_ACTIVITY = "src/android/app/src/main/java/com/rikkaminis/app/MainActivity.kt"
+REL_NAV = "src/android/app/src/main/java/com/rikkaminis/app/ui/navigation/AppNavigation.kt"
+
+# Every terminal route goes through `Routes.terminal(`, whatever the caller.
+RE_TERMINAL_CALL = "Routes.terminal("
+# The deep-link dispatch arm (both files carry exactly one).
+RE_OPEN_TERMINAL_BRANCH = re.compile(r"is\s+DeepLinkAction\.OpenTerminal\s*->\s*\{")
+# A *resolved* session id: the public alias hop, or the store's already-resolved
+# "chat currently on screen" seam. Deliberately not a bare identifier — that is
+# exactly the defect (draft keys reaching the terminal as-is).
+RE_RESOLVED_EXPR = re.compile(
+    r"ChatViewModelStore\s*\.\s*resolveSessionId\s*\(|ChatViewModelStore\s*\.\s*activeSessionId"
+)
+RE_VAL_BIND = re.compile(r"^\s*(?:val|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=")
+# Continuation heuristics for a multi-line binding (`val id = a\n    ?.let { … }`).
+# Same rule as the 1031-C extractor: keep reading while the previous line ends
+# with an operator or the next line starts with one.
+_CONT_SUFFIX = ("=", "?.", ".", ",", "&&", "||", "?:", "+")
+_CONT_PREFIX = ("?.", ".", "?:", "&&", "||", "->", "+")
+
+
+def _binding_statement(lines, i):
+    """`lines[i]` plus its continuation lines, joined (comment-free input)."""
+    out = [lines[i]]
+    while i + 1 < len(lines):
+        cur = out[-1].rstrip()
+        nxt = lines[i + 1].strip()
+        if not nxt:
+            break
+        if cur.endswith(_CONT_SUFFIX) or nxt.startswith(_CONT_PREFIX):
+            out.append(nxt)
+            i += 1
+            continue
+        break
+    return " ".join(out)
+
+
+def resolved_local_names(branch):
+    """Local vals bound from a resolved-session expression inside `branch`."""
+    names = set()
+    lines = branch.splitlines()
+    for i, line in enumerate(lines):
+        m = RE_VAL_BIND.match(line)
+        if not m:
+            continue
+        if RE_RESOLVED_EXPR.search(_binding_statement(lines, i)):
+            names.add(m.group(1))
+    return names
+
+
+def analyse_terminal_deeplink(code_raw, label):
+    """U6/U7 — a terminal deep-link arm must pass a RESOLVED session id.
+
+    Bound to the decision point (which value the terminal route receives), not
+    to one argument spelling: the resolved id may be passed by name
+    (`sessionId = <id>`) or positionally, and may be a local val.
+    """
+    code = strip_comments(code_raw)
+    matches = list(RE_OPEN_TERMINAL_BRANCH.finditer(code))
+    if len(matches) > 1:
+        return [("%sa OpenTerminal branch present" % label, False,
+                 "more than one `is DeepLinkAction.OpenTerminal ->` arm — ambiguous, fail-closed")]
+    if not matches:
+        return [("%sa OpenTerminal branch present" % label, False,
+                 "`is DeepLinkAction.OpenTerminal ->` not found — fail-closed")]
+    m = matches[0]
+    end = match_brace(code, m.end() - 1)
+    if end < 0:
+        return [("%sa OpenTerminal branch present" % label, False,
+                 "unbalanced branch braces — fail-closed")]
+    branch = code[m.end() - 1:end + 1]
+    results = [("%sa OpenTerminal branch present" % label, True, "branch found")]
+
+    idx = branch.find(RE_TERMINAL_CALL)
+    if idx < 0:
+        results.append(("%sb branch navigates to the terminal route" % label, False,
+                        "no `Routes.terminal(` call inside the branch"))
+        return results
+    open_idx = idx + len(RE_TERMINAL_CALL) - 1
+    close_idx = match_delim(branch, open_idx, "(", ")")
+    if close_idx < 0:
+        results.append(("%sb branch navigates to the terminal route" % label, False,
+                        "unbalanced `Routes.terminal(` call — fail-closed"))
+        return results
+    args = branch[open_idx:close_idx + 1]
+    results.append(("%sb branch navigates to the terminal route" % label, True, "call found"))
+
+    names = resolved_local_names(branch)
+    via_call = RE_RESOLVED_EXPR.search(args) is not None
+    via_name = False
+    if names:
+        via_name = re.search(r"\b(?:%s)\b" % "|".join(re.escape(n) for n in sorted(names)), args) is not None
+    ok = via_call or via_name
+    results.append((
+        "%sc terminal sessionId comes from a resolved source" % label, ok,
+        "`Routes.terminal(...)` args carry neither a ChatViewModelStore resolve call "
+        "(alias hop / activeSessionId) nor a local val bound from one — a bare or "
+        "absent id binds the terminal to the draft key / global workspace. args=%r"
+        % args.strip()[:160]
+    ))
+    return results
+
+
+
 GOOD = """package probe
 class B {
     private val _pendingUrl = MutableStateFlow<Uri?>(null)
@@ -424,6 +554,113 @@ fun TerminalScreen(pendingUrl: Uri?) {
 }
 """
 
+GOOD_ACTIVITY_TERMINAL = """package probe
+class MainActivity {
+    private val currentChatSessionId: String? = null
+    fun handleDeepLink(action: DeepLinkAction) {
+        when (action) {
+            is DeepLinkAction.OpenTerminal -> {
+                val terminalSessionId = currentChatSessionId
+                    ?.let { ChatViewModelStore.resolveSessionId(it) }
+                nav.navigate(Routes.terminal(action.initCommand, sessionId = terminalSessionId))
+            }
+            is DeepLinkAction.OpenSession -> {
+                nav.navigate(Routes.chat(action.sessionId))
+            }
+        }
+    }
+}
+"""
+
+# Precision arm: same decision point, a different spelling (positional argument
+# + local val), plus an unrelated terminal navigation elsewhere in the file.
+GOOD_ACTIVITY_TERMINAL_OTHER_FORM = """package probe
+class MainActivity {
+    private val currentChatSessionId: String? = null
+    fun handleDeepLink(action: DeepLinkAction) {
+        when (action) {
+            is DeepLinkAction.OpenTerminal -> {
+                val id = currentChatSessionId?.let { ChatViewModelStore.resolveSessionId(it) }
+                if (id != null) nav.navigate(Routes.terminal(action.initCommand, id))
+            }
+            else -> {}
+        }
+    }
+    fun unrelated() {
+        nav.navigate(Routes.terminal(cmd))
+    }
+}
+"""
+
+BAD_ACTIVITY_TERMINAL_BARE = """package probe
+class MainActivity {
+    fun handleDeepLink(action: DeepLinkAction) {
+        when (action) {
+            is DeepLinkAction.OpenTerminal -> {
+                nav.navigate(Routes.terminal(action.initCommand))
+            }
+        }
+    }
+}
+"""
+
+BAD_ACTIVITY_TERMINAL_UNUSED_RESOLVE = """package probe
+class MainActivity {
+    fun handleDeepLink(action: DeepLinkAction) {
+        when (action) {
+            is DeepLinkAction.OpenTerminal -> {
+                val unused = ChatViewModelStore.resolveSessionId(action.sessionId)
+                nav.navigate(Routes.terminal(action.initCommand, sessionId = action.sessionId))
+            }
+        }
+    }
+}
+"""
+
+BAD_ACTIVITY_TERMINAL_AMBIGUOUS = """package probe
+class MainActivity {
+    fun handleDeepLink(action: DeepLinkAction) {
+        when (action) {
+            is DeepLinkAction.OpenTerminal -> {
+                val id = ChatViewModelStore.resolveSessionId(action.sessionId)
+                nav.navigate(Routes.terminal(action.initCommand, sessionId = id))
+            }
+            is DeepLinkAction.OpenTerminal -> {
+                nav.navigate(Routes.terminal(action.initCommand))
+            }
+        }
+    }
+}
+"""
+
+BAD_NAV_TERMINAL_MISSING_CALL = """package probe
+fun AppNavigation(initialDeepLink: DeepLinkAction) {
+    when (initialDeepLink) {
+        is DeepLinkAction.OpenTerminal -> {
+            navController.safeNavigate()
+        }
+    }
+}
+"""
+
+GOOD_NAV_TERMINAL = """package probe
+fun AppNavigation(initialDeepLink: DeepLinkAction) {
+    when (initialDeepLink) {
+        is DeepLinkAction.OpenTerminal -> {
+            navController.safeNavigate(
+                Routes.terminal(
+                    initialDeepLink.initCommand,
+                    sessionId = ChatViewModelStore.activeSessionId,
+                ),
+            )
+        }
+        is DeepLinkAction.OpenSession -> {
+            navController.safeNavigate(Routes.chat(initialDeepLink.sessionId))
+        }
+    }
+}
+"""
+
 def selftest():
     failures = []
 
@@ -494,6 +731,51 @@ def selftest():
     expect(not d["U5a LaunchedEffect(pendingUrl) block present"],
            "comment-only anchor must NOT read as green (comments must be stripped)")
 
+    # ---- U6/U7 (terminal deep-link arm carries a resolved session id) ----
+    a = as_dict(analyse_terminal_deeplink(GOOD_ACTIVITY_TERMINAL, "U6"))
+    expect(len(a) == 3, "U6 good fixture should produce 3 criteria, got %d" % len(a))
+    for c, ok in a.items():
+        expect(ok, "U6 good fixture must pass %s" % c)
+
+    # precision: positional + local val + an unrelated terminal call elsewhere
+    a = as_dict(analyse_terminal_deeplink(GOOD_ACTIVITY_TERMINAL_OTHER_FORM, "U6"))
+    expect(len(a) == 3, "U6 precision fixture should produce 3 criteria, got %d" % len(a))
+    for c, ok in a.items():
+        expect(ok, "U6 precision fixture must pass %s (call form must not matter)" % c)
+
+    # the pre-fix shape: no session id at all — U6c must be RED, U6a/b stay OK
+    a = as_dict(analyse_terminal_deeplink(BAD_ACTIVITY_TERMINAL_BARE, "U6"))
+    expect(not a["U6c terminal sessionId comes from a resolved source"],
+           "BAD_ACTIVITY_TERMINAL_BARE U6c must be RED (no session id in the call)")
+    expect(a["U6a OpenTerminal branch present"], "BAD_ACTIVITY_TERMINAL_BARE U6a must stay OK")
+    expect(a["U6b branch navigates to the terminal route"],
+           "BAD_ACTIVITY_TERMINAL_BARE U6b must stay OK")
+
+    # a resolve call that is NOT the value passed must not read as green
+    a = as_dict(analyse_terminal_deeplink(BAD_ACTIVITY_TERMINAL_UNUSED_RESOLVE, "U6"))
+    expect(not a["U6c terminal sessionId comes from a resolved source"],
+           "BAD_ACTIVITY_TERMINAL_UNUSED_RESOLVE U6c must be RED (resolve call is not the "
+           "value handed to Routes.terminal)")
+
+    # two OpenTerminal arms = ambiguous → fail-closed on U6a
+    a = as_dict(analyse_terminal_deeplink(BAD_ACTIVITY_TERMINAL_AMBIGUOUS, "U6"))
+    expect(len(a) == 1 and not a["U6a OpenTerminal branch present"],
+           "BAD_ACTIVITY_TERMINAL_AMBIGUOUS must fail-closed on U6a")
+
+    # no branch at all (garbage input) must not read as green
+    a = as_dict(analyse_terminal_deeplink("class X { }", "U6"))
+    expect(len(a) == 1 and not a["U6a OpenTerminal branch present"],
+           "missing branch must fail-closed on U6a")
+
+    a = as_dict(analyse_terminal_deeplink(BAD_NAV_TERMINAL_MISSING_CALL, "U7"))
+    expect(not a["U7b branch navigates to the terminal route"],
+           "BAD_NAV_TERMINAL_MISSING_CALL U7b must be RED (branch without the route call)")
+
+    a = as_dict(analyse_terminal_deeplink(GOOD_NAV_TERMINAL, "U7"))
+    expect(len(a) == 3, "U7 good fixture should produce 3 criteria, got %d" % len(a))
+    for c, ok in a.items():
+        expect(ok, "U7 good fixture must pass %s" % c)
+
     if failures:
         print("OPEN_URL_BROKER_SCHEME_SELFTEST=FAIL")
         for f in failures:
@@ -521,6 +803,13 @@ def main():
             results = results + analyse_terminal(f.read())
     else:
         print("  [--] U5 skipped — %s not staged in this tree" % TERMINAL_REL)
+    for label, rel in (("U6", REL_ACTIVITY), ("U7", REL_NAV)):
+        dpath = os.path.join(root, rel)
+        if os.path.isfile(dpath):
+            with open(dpath, "r", encoding="utf-8") as f:
+                results = results + analyse_terminal_deeplink(f.read(), label)
+        else:
+            print("  [--] %s skipped — %s not staged in this tree" % (label, rel))
     failed = [(c, d) for c, ok, d in results if not ok]
     for c, ok, d in results:
         print("  [%s] %s%s" % ("ok" if ok else "RED", c,

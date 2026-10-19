@@ -43,6 +43,23 @@ stays private — `katex_ready_race_check.py` hard-pins its source form.
        `ComposerDraftStore.nextDraftId(this)`, never a hand-built
        `"__new__<uuid>"`. A fresh uuid orphans the live draft slot, and
        `saveText`'s slot guard then drops the text.
+
+  MainActivity.kt (deep-audit-1032 ISSUE-07, P2) — criteria 10/11 below
+   10. The `currentBackStackEntryFlow.collect { … }` listener (keep-alive
+       presence + `currentChatSessionId` + the crash-recovery prefs write) must
+       feed the id it read from the nav entry through
+       `ChatViewModelStore.resolveSessionId(…)` *before* consuming it, and must
+       still assign `currentChatSessionId = sid`. The route arg stays on
+       `__new__<uuid>` after draft promotion, so the raw read handed
+       SessionActivityTracker an orphan draft session and made a crash restore
+       synthesize `OpenSession("__new__…")` — the user came back to a synthetic
+       draft instead of the conversation.
+   11. `onSaveInstanceState` must put the *resolved* id into the bundle
+       (`KEY_CURRENT_CHAT_SESSION_ID`) for the same reason: it is the value
+       `restoredChatSessionId` replays as a synthesized deep link.
+   Both criteria are fail-closed on a missing/renamed anchor and are scoped to
+   the block they name — a legitimate bare `getString("sessionId")` route-arg
+   read elsewhere in the file must not trip them.
 """
 import argparse
 import re
@@ -163,6 +180,77 @@ def _skip_string_literal(code: str, i: int) -> int:
             return j + 1
         j += 1
     return n
+
+
+def extract_braced_block(code: str, decl_re) -> "str | None":
+    """Body of the `{ … }` block whose opening brace ends `decl_re`'s match.
+
+    Fail-closed: `None` when the anchor is missing or the braces do not
+    balance, so a renamed/relocated anchor surfaces as a violation instead of
+    silently skipping the criterion.
+    """
+    m = decl_re.search(code)
+    if not m:
+        return None
+    open_idx = m.end() - 1
+    if code[open_idx] != "{":
+        return None
+    depth = 0
+    i = open_idx
+    n = len(code)
+    while i < n:
+        c = code[i]
+        if c == '"' or c == "'":
+            i = _skip_string_literal(code, i)
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return code[open_idx:i + 1]
+        i += 1
+    return None
+
+
+# [da1032-D] anchors for MainActivity criteria 10/11.
+RE_NAV_FLOW_COLLECT = re.compile(r"currentBackStackEntryFlow\s*\.\s*collect\s*\{")
+RE_SAVE_INSTANCE = re.compile(r"override\s+fun\s+onSaveInstanceState\s*\(\s*outState\s*:\s*Bundle\s*\)\s*\{")
+# A resolved chat id: the alias hop itself, or the store's already-resolved
+# "chat currently on screen" seam.
+RE_RESOLVED_EXPR = re.compile(
+    r"ChatViewModelStore\s*\.\s*(?:resolveSessionId\s*\(|activeSessionId)"
+)
+# Continuation heuristics for a multi-line binding (`val sid = a\n  ?.let { … }`).
+_CONT_SUFFIX = ("=", "?.", ".", ",", "&&", "||", "?:", "+")
+_CONT_PREFIX = ("?.", ".", "?:", "&&", "||", "->", "+")
+
+
+def _joined_statement(lines, i):
+    """`lines[i]` plus its continuation lines, joined."""
+    out = [lines[i]]
+    while i + 1 < len(lines):
+        cur = out[-1].rstrip()
+        nxt = lines[i + 1].strip()
+        if not nxt:
+            break
+        if cur.endswith(_CONT_SUFFIX) or nxt.startswith(_CONT_PREFIX):
+            out.append(nxt)
+            i += 1
+            continue
+        break
+    return " ".join(out)
+
+
+def resolved_names(text):
+    """Local vals bound from a resolved-session expression inside `text`."""
+    names = set()
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        m = re.match(r"\s*(?:val|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
+        if m and RE_RESOLVED_EXPR.search(_joined_statement(lines, i)):
+            names.add(m.group(1))
+    return names
 
 
 def extract_effect_block(code: str, marker: str) -> "tuple[str, str] | None":
@@ -373,6 +461,70 @@ def check(root: Path) -> int:
                 f"call sites (onStart resume + handleDeepLink quick actions), found {resolved}"
             )
 
+        # --- 10. [da1032-D] the nav back-stack listener resolves the chat id
+        #     before consuming it (keep-alive presence / currentChatSessionId /
+        #     crash-recovery prefs all sit downstream of this one read). ---
+        listener = extract_braced_block(activity, RE_NAV_FLOW_COLLECT)
+        if listener is None:
+            errors.append(
+                "MainActivity.kt: `currentBackStackEntryFlow.collect { … }` block "
+                "not found (renamed or moved? re-anchor criterion 10, do not drop it)"
+            )
+        else:
+            if "getString(\"sessionId\")" not in listener:
+                errors.append(
+                    "MainActivity.kt: the nav listener no longer reads the route "
+                    "`sessionId` — re-anchor criterion 10 rather than letting it pass"
+                )
+            names = resolved_names(listener)
+            field_writes = re.findall(r"currentChatSessionId\s*=\s*([^\n]+)", listener)
+            if not field_writes:
+                errors.append(
+                    "MainActivity.kt: the nav listener must keep assigning "
+                    "`currentChatSessionId = sid` (everything downstream — including "
+                    "onSaveInstanceState and the crash-recovery prefs — reads it)"
+                )
+            for rhs in field_writes:
+                rhs = rhs.strip()
+                ok = RE_RESOLVED_EXPR.search(rhs) is not None or any(
+                    re.search(r"\b%s\b" % re.escape(n), rhs) for n in names
+                )
+                if not ok:
+                    errors.append(
+                        "MainActivity.kt: the nav listener assigns `currentChatSessionId` "
+                        "from an unresolved value (%r) — the route arg stays on "
+                        "`__new__<uuid>` after draft promotion, so keep-alive presence and "
+                        "crash recovery would track an orphan draft. Resolve through "
+                        "`ChatViewModelStore.resolveSessionId(…)` first." % rhs[:120]
+                    )
+            if "resolveSessionId(" not in listener:
+                errors.append(
+                    "MainActivity.kt: the nav listener must resolve the route `sessionId` "
+                    "through `ChatViewModelStore.resolveSessionId(…)` (no alias hop in the "
+                    "listener body at all)"
+                )
+
+        # --- 11. [da1032-D] the saved-state bundle carries the resolved id ---
+        saver = extract_braced_block(activity, RE_SAVE_INSTANCE)
+        if saver is None:
+            errors.append(
+                "MainActivity.kt: `override fun onSaveInstanceState(outState: Bundle) { … }` "
+                "not found (renamed or moved? re-anchor criterion 11, do not drop it)"
+            )
+        else:
+            if "KEY_CURRENT_CHAT_SESSION_ID" not in saver:
+                errors.append(
+                    "MainActivity.kt: onSaveInstanceState no longer persists "
+                    "`KEY_CURRENT_CHAT_SESSION_ID` (crash/LMK restore relies on it)"
+                )
+            elif "resolveSessionId(" not in saver:
+                errors.append(
+                    "MainActivity.kt: onSaveInstanceState must persist the RESOLVED id "
+                    "(`ChatViewModelStore.resolveSessionId(…)`) — the bundle value is "
+                    "replayed as a synthesized OpenSession deep link, so a draft key "
+                    "lands the user in a synthetic draft"
+                )
+
     if errors:
         for e in errors:
             print(f"FAIL {e}")
@@ -400,18 +552,49 @@ object ChatViewModelStore {
 '''
 
 # [da1029-A] criterion 9 fixture: MainActivity's two New-Chat entry points.
+# [da1032-D] criteria 10/11 fixture: the nav back-stack listener and the
+# saved-state bundle.
 FIXTURE_ACTIVITY = '''package com.rikkaminis.app
 
 class MainActivity {
+    private var currentChatSessionId: String? = null
+
     override fun onStart() {
         val newRoute = Routes.chat(com.rikkaminis.app.data.ComposerDraftStore.nextDraftId(this))
+        navController.currentBackStackEntryFlow.collect { entry ->
+            val isChatRoute = entry.destination.route == Routes.CHAT
+            val sid = entry.arguments?.getString("sessionId")
+                ?.takeIf { isChatRoute }
+                ?.let { ChatViewModelStore.resolveSessionId(it) }
+            if (sid != currentChatSessionId) {
+                currentChatSessionId = sid
+            }
+        }
     }
 
     private fun handleDeepLink() {
         val newRoute = Routes.chat(com.rikkaminis.app.data.ComposerDraftStore.nextDraftId(this))
     }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        currentChatSessionId?.let {
+            outState.putString(KEY_CURRENT_CHAT_SESSION_ID, ChatViewModelStore.resolveSessionId(it))
+        }
+    }
 }
 '''
+
+# Precision arm: a legitimate bare `getString("sessionId")` route-arg read
+# elsewhere in the file (the terminal destination reads its own nav arg) must
+# not trip criteria 10/11 — they are scoped to the listener / save block.
+FIXTURE_ACTIVITY_PRECISION = FIXTURE_ACTIVITY.replace(
+    "    private fun handleDeepLink() {",
+    "    private fun terminalArgs(backStackEntry: NavBackStackEntry) {\n"
+    "        val sessionId = backStackEntry.arguments?.getString(\"sessionId\")\n"
+    "    }\n\n"
+    "    private fun handleDeepLink() {",
+)
 
 # Each mutation is (name, fixture-mutator) applied to the GREEN fixture set.
 # The mutated tree MUST go red for the gate to have teeth.
@@ -651,6 +834,58 @@ def selftest() -> int:
             failures.append(f"criterion 9 {name}: gate stayed GREEN (no teeth)")
         else:
             print(f"selftest: criterion 9 {name} -> RED ({len(errs)} violation(s)) OK")
+
+    # --- criteria 10/11 [da1032-D]: resolved id at the nav listener / bundle ---
+    rc, errs = run_tree(screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY_PRECISION)
+    if rc != 0:
+        failures.append(
+            "criteria 10/11 precision fixture unexpectedly red (a bare route-arg read "
+            f"elsewhere must stay legal): {errs}")
+    else:
+        print("selftest: criteria 10/11 precision fixture (unrelated bare route arg) passes")
+
+    for name, act in (
+        (
+            "criterion 10 nav listener back to the bare route id (MUT-18)",
+            FIXTURE_ACTIVITY.replace(
+                "\n                ?.let { ChatViewModelStore.resolveSessionId(it) }", "", 1),
+        ),
+        (
+            "criterion 10 listener assigns an unresolved value (MUT-20)",
+            FIXTURE_ACTIVITY.replace(
+                "                currentChatSessionId = sid",
+                "                currentChatSessionId = entry.arguments?.getString(\"sessionId\")",
+                1),
+        ),
+        (
+            "criterion 11 saved-state back to the bare id (MUT-19)",
+            FIXTURE_ACTIVITY.replace(
+                "outState.putString(KEY_CURRENT_CHAT_SESSION_ID, "
+                "ChatViewModelStore.resolveSessionId(it))",
+                "outState.putString(KEY_CURRENT_CHAT_SESSION_ID, it)", 1),
+        ),
+        (
+            "criterion 11 saved-state drops the bundle key (MUT-21)",
+            FIXTURE_ACTIVITY.replace(
+                "outState.putString(KEY_CURRENT_CHAT_SESSION_ID, "
+                "ChatViewModelStore.resolveSessionId(it))",
+                "outState.putString(KEY_OTHER, it)", 1),
+        ),
+    ):
+        rc, errs = run_tree(screen, nav, move, FIXTURE_STORE, act)
+        if rc == 0:
+            failures.append(f"{name}: gate stayed GREEN (no teeth)")
+        else:
+            print(f"selftest: {name} -> RED ({len(errs)} violation(s)) OK")
+
+    # fail-closed: a renamed anchor must NOT read as green
+    rc, errs = run_tree(
+        screen, nav, move, FIXTURE_STORE,
+        FIXTURE_ACTIVITY.replace("currentBackStackEntryFlow", "currentBackStackEntry"))
+    if rc == 0:
+        failures.append("criterion 10 missing anchor: gate stayed GREEN (fail-closed violated)")
+    else:
+        print(f"selftest: criterion 10 missing anchor -> RED ({len(errs)} violation(s)) OK")
 
     if failures:
         print("\nselftest FAILURES:")

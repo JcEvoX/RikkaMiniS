@@ -372,7 +372,21 @@ fun AppNavigation(
         navController.awaitResumed()
         when (initialDeepLink) {
             is DeepLinkAction.OpenTerminal -> {
-                navController.safeNavigate(Routes.terminal(initialDeepLink.initCommand))
+                // [da1032-D] Symmetric with MainActivity.handleDeepLink and with
+                // onOpenTerminal further down: a terminal opened while a chat is
+                // on screen belongs to THAT session (minis-sessions/<sid>/ bind
+                // mounts + MINIS_CHAT_SESSION_ID), not to the global workspace.
+                // This cold-start dispatcher owns no chat destination, so there
+                // is no route arg to read: the source is the store's documented
+                // "chat currently on screen" seam, whose getter already resolves
+                // a draft key through the alias table. With no chat composed yet
+                // it is null — i.e. exactly the previous behaviour.
+                navController.safeNavigate(
+                    Routes.terminal(
+                        initialDeepLink.initCommand,
+                        sessionId = ChatViewModelStore.activeSessionId,
+                    ),
+                )
             }
             is DeepLinkAction.OpenSession -> {
                 // T-double-chat-fix: on process-death recreation NavController
