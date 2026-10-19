@@ -568,7 +568,16 @@ fun ModelGroupDetailScreen(
                             if (on) {
                                 // Restore last user-selected value verbatim,
                                 // defaulting to 128K for first-time activation.
-                                val restored = group.lastContextLimitTokens
+                                // [da1031-D ISSUE-06] Read the LATEST persisted
+                                // group, not the composition-time snapshot: the
+                                // ON branch previously read `group.
+                                // lastContextLimitTokens`, so a write that landed
+                                // between the last recomposition and this tap
+                                // (minis-config / Debug RPC groups.update / a
+                                // quick OFF→ON before the flow recomposed) was
+                                // overwritten by the stale restore — the 1027-E
+                                // family ("stale snapshot write覆盖外部写入").
+                                val restored = currentGroup().lastContextLimitTokens
                                     ?: DEFAULT_GROUP_CONTEXT_LIMIT_TOKENS
                                 contextLimitTokens = restored
                                 providerRepository.updateGroup(
@@ -581,13 +590,17 @@ fun ModelGroupDetailScreen(
                                 // Stash the current value into lastContextLimitTokens
                                 // before nulling contextLimitTokens, so toggle ON
                                 // can restore it (even after navigating away).
+                                // [da1031-D ISSUE-06] Same latest-persisted read
+                                // as the ON branch: the `?: group.
+                                // lastContextLimitTokens` fallback used the stale
+                                // snapshot and could resurrect a pre-write value.
                                 val stash = contextLimitTokens
                                 contextLimitTokens = null
                                 providerRepository.updateGroup(
                                     currentGroup().copy(
                                         contextLimitTokens = null,
                                         lastContextLimitTokens = stash
-                                            ?: group.lastContextLimitTokens,
+                                            ?: currentGroup().lastContextLimitTokens,
                                     )
                                 )
                             }

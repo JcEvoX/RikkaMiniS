@@ -129,6 +129,20 @@ AUTH_SINGLE_SOURCE_FN = "openAIKeyAuthHeader"
 PROBE_AUTH_FN = "probeAuthHeader"
 APPLY_AUTH_FN = "applyOpenAIKeyAuth"
 AUTH_FORK_TOKENS = ('"api-key"',)
+# ---- [da1031-D ISSUE-06] group session-default fields on every face (C11) ----
+GROUP_LIST_FN = "groupsList"
+GROUP_TO_JSON_FN = "groupToJson"
+GROUP_CREATE_FN = "groupsCreate"
+GROUP_UPDATE_FN = "groupsUpdate"
+# Read/echo faces: JSON keys as emitted by the debug + mutation RPC faces.
+GROUP_RPC_KEYS = ('put("defaultThinkingLevel"', 'put("contextLimitTokens"')
+# Write faces: the same fields must be ACCEPTED by create/update, not just
+# echoed back (an echo-only face is read-only in disguise).
+GROUP_RPC_PARAM_KEYS = ('"defaultThinkingLevel"', '"contextLimitTokens"')
+# Config face (minis-config `groups` collection): snake_case equivalents.
+GROUP_CONFIG_KEYS = ('"default_thinking_level"', '"context_limit_tokens"')
+GROUPS_PATH_MARKER = 'path = "groups"'
+PATH_MARKER_PAT = re.compile(r'path\s*=\s*"')
 # C8: the per-instance dictionary inside the read-only `providers` aggregate.
 PROVIDERS_PATH_MARKER = 'path = "providers"'
 INSTANCE_DICT_MARKER = "linkedMapOf("
@@ -371,7 +385,7 @@ def base_url_write_offsets(code):
 def check_tree(root):
     """Returns (rc, detail dict). rc=0 all green."""
     detail = {"c1": [], "c2": [], "c3": [], "c4": [], "c5": [], "c6": [], "c7": [],
-              "c8": [], "c9": [], "c10": [], "fail_closed": []}
+              "c8": [], "c9": [], "c10": [], "c11": [], "fail_closed": []}
 
     debug_paths = find_files(root, DEBUG_FILE)
     mut_paths = find_files(root, MUTATION_FILE)
@@ -693,8 +707,54 @@ def check_tree(root):
             % (MUTATION_FILE, PROBE_AUTH_FN, AUTH_FORK_TOKENS)
         )
 
+    # ---- C11 ---- [da1031-D ISSUE-06] the group session-default fields live on
+    # every face that reads or writes a group. The config collection already
+    # carried them; the two RPC faces (read `groupsList`, echo `groupToJson`)
+    # and the write path (`groupsCreate`/`groupsUpdate`) did not — so a group's
+    # thinking level / context limit was invisible and unsettable over RPC while
+    # minis-config could set both. Field-set equality is what this arm pins.
+    group_list = extract_function(debug_code, GROUP_LIST_FN)
+    if group_list is None:
+        detail["fail_closed"].append(
+            "%s: %s not found (fail-closed)" % (DEBUG_FILE, GROUP_LIST_FN)
+        )
+    else:
+        missing = [t for t in GROUP_RPC_KEYS if t not in group_list]
+        if missing:
+            detail["c11"].append("%s: %s missing %s" % (DEBUG_FILE, GROUP_LIST_FN, missing))
+    to_json = extract_function(mut_code, GROUP_TO_JSON_FN)
+    if to_json is None:
+        detail["fail_closed"].append(
+            "%s: %s not found (fail-closed)" % (MUTATION_FILE, GROUP_TO_JSON_FN)
+        )
+    else:
+        missing = [t for t in GROUP_RPC_KEYS if t not in to_json]
+        if missing:
+            detail["c11"].append("%s: %s missing %s" % (MUTATION_FILE, GROUP_TO_JSON_FN, missing))
+    for fn in (GROUP_CREATE_FN, GROUP_UPDATE_FN):
+        body = extract_function(mut_code, fn)
+        if body is None:
+            detail["fail_closed"].append("%s: %s not found (fail-closed)" % (MUTATION_FILE, fn))
+            continue
+        missing = [t for t in GROUP_RPC_PARAM_KEYS if t not in body]
+        if missing:
+            detail["c11"].append("%s: %s does not accept %s" % (MUTATION_FILE, fn, missing))
+    groups_idx = cfg_code.find(GROUPS_PATH_MARKER)
+    if groups_idx < 0:
+        detail["fail_closed"].append(
+            "%s: anchor %s not found (fail-closed)" % (CONFIG_BUILTINS_FILE, GROUPS_PATH_MARKER)
+        )
+    else:
+        nxt = PATH_MARKER_PAT.search(cfg_code, groups_idx + len(GROUPS_PATH_MARKER))
+        groups_region = cfg_code[groups_idx: nxt.start()] if nxt else cfg_code[groups_idx:]
+        missing = [t for t in GROUP_CONFIG_KEYS if t not in groups_region]
+        if missing:
+            detail["c11"].append(
+                "%s: groups face missing %s" % (CONFIG_BUILTINS_FILE, missing)
+            )
+
     rc = 0
-    for k in ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "fail_closed"):
+    for k in ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "fail_closed"):
         if detail[k]:
             rc = 1
     return rc, detail
@@ -754,6 +814,19 @@ internal object ProviderDebugMethods {
             put("instances", arr)
         }
     }
+
+    fun groupsList(context: android.content.Context, params: JSONObject): JSONObject {
+        val arr = JSONArray()
+        for (group in listOf<com.rikkaminis.app.data.model.ModelGroupStub>()) {
+            arr.put(JSONObject().apply {
+                put("id", group.id)
+                put("name", group.name)
+                put("defaultThinkingLevel", group.defaultThinkingLevel?.name ?: JSONObject.NULL)
+                put("contextLimitTokens", group.contextLimitTokens ?: JSONObject.NULL)
+            })
+        }
+        return JSONObject().put("groups", arr)
+    }
 }
 '''
 
@@ -806,6 +879,32 @@ internal object ProviderMutationMethods {
         }
         return JSONObject()
     }
+
+    fun groupsCreate(context: android.content.Context, params: JSONObject): JSONObject {
+        val thinking = params.optString("defaultThinkingLevel", "")
+        val rawLimit = params.opt("contextLimitTokens")
+        val group = com.rikkaminis.app.data.model.ModelGroupStub(name = params.optString("name", "New group"))
+        return groupToJson(group)
+    }
+
+    fun groupsUpdate(context: android.content.Context, params: JSONObject): JSONObject {
+        if (params.has("defaultThinkingLevel")) {
+            val t = params.optString("defaultThinkingLevel", "")
+        }
+        if (params.has("contextLimitTokens")) {
+            val raw = params.opt("contextLimitTokens")
+        }
+        val current = com.rikkaminis.app.data.model.ModelGroupStub()
+        return groupToJson(current)
+    }
+
+    private fun groupToJson(group: com.rikkaminis.app.data.model.ModelGroupStub): JSONObject =
+        JSONObject().apply {
+            put("id", group.id)
+            put("name", group.name)
+            put("defaultThinkingLevel", group.defaultThinkingLevel?.name ?: JSONObject.NULL)
+            put("contextLimitTokens", group.contextLimitTokens ?: JSONObject.NULL)
+        }
 }
 
 internal fun probeAuthHeader(azureMode: Boolean, key: String): Pair<String, String> =
@@ -901,6 +1000,25 @@ internal object ConfigBuiltins {
                                     "imageEndpointMode" to ConfigValue.Str(inst.imageEndpointMode.name),
                                     "imageEndpointResolved" to (inst.imageEndpointResolved?.let { ConfigValue.Str(it.name) } ?: ConfigValue.Null),
                                     "customUserAgent" to (inst.customUserAgent?.let { ConfigValue.Str(it) } ?: ConfigValue.Null),
+                                )
+                            )
+                        }
+                    )
+                },
+            )
+        )
+        r.register(
+            ReadOnlyField(
+                path = "groups",
+                reader = {
+                    ConfigValue.Arr(
+                        repo.config.value.modelGroups.map { g ->
+                            ConfigValue.Obj(
+                                linkedMapOf(
+                                    "id" to ConfigValue.Str(g.id),
+                                    "name" to ConfigValue.Str(g.name),
+                                    "default_thinking_level" to (g.defaultThinkingLevel?.let { ConfigValue.Str(it.name) } ?: ConfigValue.Null),
+                                    "context_limit_tokens" to (g.contextLimitTokens?.let { ConfigValue.Num(it.toDouble()) } ?: ConfigValue.Null),
                                 )
                             )
                         }
@@ -1367,6 +1485,81 @@ def run_selftest():
     results.append(("F26-auth-header-file-missing-fail-closed", ok, detail))
     shutil.rmtree(root)
 
+    # --- [da1031-D ISSUE-06] C11: the read face drops a session-default key ---
+    bad_debug = GOOD_DEBUG.replace(
+        '''                put("defaultThinkingLevel", group.defaultThinkingLevel?.name ?: JSONObject.NULL)\n''',
+        "",
+    )
+    assert bad_debug != GOOD_DEBUG, "F27 anchor missing"
+    root = write_fixture(bad_debug, GOOD_MUTATION)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c11"] and only(detail, "c11")
+    results.append(("F27-groupsList-missing-thinking-level-C11", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C11: the mutation echo face stops mirroring the read face ---
+    bad_mut = GOOD_MUTATION.replace(
+        '''            put("defaultThinkingLevel", group.defaultThinkingLevel?.name ?: JSONObject.NULL)
+            put("contextLimitTokens", group.contextLimitTokens ?: JSONObject.NULL)
+''',
+        "",
+    )
+    assert bad_mut != GOOD_MUTATION, "F28 anchor missing"
+    root = write_fixture(GOOD_DEBUG, bad_mut)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c11"] and only(detail, "c11")
+    results.append(("F28-groupToJson-missing-both-keys-C11", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C11: create echoes the fields but never accepts them (read-only in disguise) ---
+    bad_mut = GOOD_MUTATION.replace(
+        '''        val thinking = params.optString("defaultThinkingLevel", "")\n''', "",
+    )
+    assert bad_mut != GOOD_MUTATION, "F29 anchor missing"
+    root = write_fixture(GOOD_DEBUG, bad_mut)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c11"] and only(detail, "c11")
+    results.append(("F29-groupsCreate-does-not-accept-thinking-level-C11", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C11: update accepts neither field ---
+    bad_mut = GOOD_MUTATION.replace(
+        '''        if (params.has("defaultThinkingLevel")) {
+            val t = params.optString("defaultThinkingLevel", "")
+        }
+        if (params.has("contextLimitTokens")) {
+            val raw = params.opt("contextLimitTokens")
+        }
+''',
+        "",
+    )
+    assert bad_mut != GOOD_MUTATION, "F30 anchor missing"
+    root = write_fixture(GOOD_DEBUG, bad_mut)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c11"] and only(detail, "c11")
+    results.append(("F30-groupsUpdate-accepts-neither-field-C11", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C11: the config face loses a key (the asymmetry that started this) ---
+    bad_cfg = GOOD_CONFIG_BUILTINS.replace(
+        '''                                    "default_thinking_level" to (g.defaultThinkingLevel?.let { ConfigValue.Str(it.name) } ?: ConfigValue.Null),
+''', "",
+    )
+    assert bad_cfg != GOOD_CONFIG_BUILTINS, "F31 anchor missing"
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, config_text=bad_cfg)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c11"] and only(detail, "c11")
+    results.append(("F31-config-groups-face-missing-key-C11", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C11: the `path = "groups"` anchor is gone → fail-closed ---
+    bad_cfg = GOOD_CONFIG_BUILTINS.replace('path = "groups"', 'path = "groupz"')
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, config_text=bad_cfg)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["fail_closed"] and only(detail, "fail_closed")
+    results.append(("F32-config-groups-anchor-missing-fail-closed", ok, detail))
+    shutil.rmtree(root)
+
     all_ok = True
     for name, ok, detail in results:
         print("%s %s" % ("PASS" if ok else "FAIL", name))
@@ -1395,9 +1588,9 @@ def main():
               "C2 update guard, C3 key symmetry, C4 collection guard, "
               "C5 mutation predicate floor, C6 azureMode four faces, "
               "C7 probe auth fork, C8 config-face keys, C9 UA visibility, "
-              "C10 auth single source)")
+              "C10 auth single source, C11 group field faces)")
         return 0
-    for k in ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "fail_closed"):
+    for k in ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "fail_closed"):
         for line in detail[k]:
             print("[%s] %s" % (k.upper(), line))
     return 1

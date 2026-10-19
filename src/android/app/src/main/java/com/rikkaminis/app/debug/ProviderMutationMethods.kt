@@ -19,6 +19,7 @@ import com.rikkaminis.app.config.collections.canonicalModelProviderName
 import com.rikkaminis.app.config.collections.normalizeCustomModelId
 import com.rikkaminis.app.data.model.ProviderType
 import com.rikkaminis.app.data.model.RoutingStrategy
+import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.provider.applyUserAgentOverride
 import com.rikkaminis.app.provider.gemini.GeminiBasePath
@@ -562,12 +563,36 @@ internal object ProviderMutationMethods {
         }
         val strategy = parseStrategy(params.optString("strategy", "fallback"))
         val fallback = parseFallback(params.optString("fallbackStrategy", "default"))
+        // [da1031-D ISSUE-06] The group faces had a fifth asymmetry: the create
+        // path silently dropped the session-default fields, so a group made
+        // over the harness could never carry defaultThinkingLevel /
+        // contextLimitTokens (and `groups.list` did not surface them either —
+        // fixed on the read faces in the same batch). Same parse contract as
+        // the config collection (GroupWriteRules: absent = keep default, null
+        // = unlimited, positive = also seeds lastContextLimitTokens; unknown
+        // thinking level = refuse, not silently downgrade).
+        val thinking = params.optString("defaultThinkingLevel", "")
+        val parsedThinking = when {
+            params.isNull("defaultThinkingLevel") || thinking.isEmpty() -> null
+            else -> runCatching { ThinkingLevel.valueOf(thinking.uppercase()) }.getOrNull()
+                ?: throw RPCException(-32602, "Unknown defaultThinkingLevel: $thinking")
+        }
+        val rawLimit = params.opt("contextLimitTokens")
+        val contextLimit = when {
+            rawLimit == null || rawLimit == JSONObject.NULL -> 0
+            else -> (rawLimit as? Int)
+                ?: throw RPCException(-32602, "contextLimitTokens must be an integer")
+        }
+        if (contextLimit < 0) throw RPCException(-32602, "contextLimitTokens must be >= 0")
 
         val group = ModelGroup(
             name = name,
             memberEntryIds = members,
             strategy = strategy,
             fallbackStrategy = fallback,
+            defaultThinkingLevel = parsedThinking,
+            contextLimitTokens = contextLimit.takeIf { it > 0 },
+            lastContextLimitTokens = contextLimit.takeIf { it > 0 },
         )
         repo.addGroup(group)
         return JSONObject().put("group", groupToJson(repo, group))
@@ -605,6 +630,33 @@ internal object ProviderMutationMethods {
         }
         if (params.has("strategy")) updated = updated.copy(strategy = parseStrategy(params.optString("strategy")))
         if (params.has("fallbackStrategy")) updated = updated.copy(fallbackStrategy = parseFallback(params.optString("fallbackStrategy")))
+        // [da1031-D ISSUE-06] Same session-default fields as groupsCreate —
+        // absent = keep the stored value, null / 0 = clear (limit AND its
+        // last-selected memory, mirroring GroupWriteRules.applyContextLimitWrite
+        // — the canonical write face), > 0 = set both. Unknown level / negative
+        // or non-integer limit = refuse (-32602), never silently dropped.
+        if (params.has("defaultThinkingLevel")) {
+            val t = params.optString("defaultThinkingLevel", "")
+            val lvl = when {
+                params.isNull("defaultThinkingLevel") || t.isEmpty() -> null
+                else -> runCatching { ThinkingLevel.valueOf(t.uppercase()) }.getOrNull()
+                    ?: throw RPCException(-32602, "Unknown defaultThinkingLevel: $t")
+            }
+            updated = updated.copy(defaultThinkingLevel = lvl)
+        }
+        if (params.has("contextLimitTokens")) {
+            val raw = params.opt("contextLimitTokens")
+            val v = when {
+                raw == null || raw == JSONObject.NULL -> 0
+                else -> (raw as? Int)
+                    ?: throw RPCException(-32602, "contextLimitTokens must be an integer")
+            }
+            if (v < 0) throw RPCException(-32602, "contextLimitTokens must be >= 0")
+            updated = if (v > 0) updated.copy(
+                contextLimitTokens = v,
+                lastContextLimitTokens = v,
+            ) else updated.copy(contextLimitTokens = null, lastContextLimitTokens = null)
+        }
         repo.updateGroup(updated)
         return JSONObject().put("group", groupToJson(repo, updated))
     }
@@ -677,6 +729,11 @@ internal object ProviderMutationMethods {
             put("fallbackStrategy", group.fallbackStrategy.name)
             put("isDefault", group.id == cfg.defaultPrimaryGroupId)
             put("inAgentLoop", group.id in cfg.agentLoopGroupIds)
+            // [da1031-D ISSUE-06] Key-for-key with groupsList (read face) and
+            // with the config collection's group object: the session-default
+            // thinking level + context limit (null = unlimited).
+            put("defaultThinkingLevel", group.defaultThinkingLevel?.name ?: JSONObject.NULL)
+            put("contextLimitTokens", group.contextLimitTokens ?: JSONObject.NULL)
             val ids = JSONArray()
             for (m in group.memberEntryIds) ids.put(m)
             put("memberEntryIds", ids)

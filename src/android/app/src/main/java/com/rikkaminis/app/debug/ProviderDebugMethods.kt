@@ -235,6 +235,13 @@ internal object ProviderDebugMethods {
                 put("fallbackStrategy", group.fallbackStrategy.name)
                 put("isDefault", isDefault)
                 put("inAgentLoop", group.id in cfg.agentLoopGroupIds)
+                // [da1031-D ISSUE-06] Session-default fields the harness could
+                // read on no face: the group's thinking level and its context
+                // limit (null = unlimited). Same two keys the mutation face's
+                // groupToJson emits and minis-config's `groups` collection
+                // exposes (snake_case there), so all three read faces agree.
+                put("defaultThinkingLevel", group.defaultThinkingLevel?.name ?: JSONObject.NULL)
+                put("contextLimitTokens", group.contextLimitTokens ?: JSONObject.NULL)
                 val ids = JSONArray()
                 for (id in group.memberEntryIds) ids.put(id)
                 put("memberEntryIds", ids)
