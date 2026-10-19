@@ -74,13 +74,13 @@ fun BrowserSettingsSheet(
     val context = LocalContext.current
     val prefs = remember { context.getSharedPreferences("browser_prefs", android.content.Context.MODE_PRIVATE) }
 
-    var selectedProfile by remember {
-        mutableStateOf(
-            prefs.getString("user_agent_profile", "MOBILE_CHROME")
-                ?.let { try { UserAgentProfile.valueOf(it) } catch (_: Exception) { null } }
-                ?: UserAgentProfile.MOBILE_CHROME
-        )
-    }
+    // [da1030-B] Seed from the pool's live flow and key on it: an agent
+    // `set_user_agent` now routes through the pool, and a keyless
+    // `remember { prefs.getString(...) }` snapshot kept rendering the old
+    // radio selection after that switch. The pool restores the same prefs key
+    // at construction, so its initial value is the persisted profile.
+    val poolProfile by tabPool.currentUserAgentProfile.collectAsState()
+    var selectedProfile by remember(poolProfile) { mutableStateOf(poolProfile) }
     var customUA by remember { mutableStateOf(prefs.getString("custom_user_agent", "") ?: "") }
     var showClearConfirm by remember { mutableStateOf(false) }
     var idleTimeoutText by remember {

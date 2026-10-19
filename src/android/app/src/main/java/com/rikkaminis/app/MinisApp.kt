@@ -534,6 +534,15 @@ class MinisApp : Application(), ImageLoaderFactory {
             onSessionDeleted = { sid ->
                 runCatching { skillRepository.clearSessionOverrides(sid) }
                 runCatching { mcpRepository.clearSessionOverrides(sid) }
+                // [da1030-A ISSUE-01 裂缝B] Same one-hook-covers-all-entry-points
+                // contract for the session-list badge queue: without this, a
+                // deleted session's PAUSED badge stayed in SessionBadgeStore
+                // (memory + SharedPreferences) and reappeared on whatever
+                // session later reused the id. Safe before SessionBadgeStore
+                // .init() runs below — `clear` only touches the in-memory
+                // StateFlow when `prefs` is still null (mutate's `prefs?.let`),
+                // and this lambda only fires at runtime, long after onCreate.
+                runCatching { com.rikkaminis.app.service.SessionBadgeStore.clear(sid) }
             },
         )
         providerRepository = ProviderRepository(this)

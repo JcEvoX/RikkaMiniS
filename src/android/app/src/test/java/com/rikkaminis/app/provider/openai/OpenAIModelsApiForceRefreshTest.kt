@@ -1,5 +1,7 @@
 package com.rikkaminis.app.provider.openai
 
+import com.rikkaminis.app.provider.openai.OpenAIModelsApi.buildModelsRequest
+import com.rikkaminis.app.provider.openai.OpenAIModelsApi.modelsCacheKey
 import com.rikkaminis.app.provider.openai.OpenAIModelsApi.shouldConsultCache
 import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.MockResponse
@@ -7,6 +9,8 @@ import okhttp3.mockwebserver.MockWebServer
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -66,6 +70,78 @@ class OpenAIModelsApiForceRefreshTest {
         // forceRefresh values must skip the cache.
         assertFalse(shouldConsultCache(hasContext = false, forceRefresh = true))
         assertFalse(shouldConsultCache(hasContext = false, forceRefresh = false))
+    }
+
+    // -- [da1030 ISSUE-06] Azure auth + UA on the models-list request ---------
+    //
+    // The models fetch used to hard-code `Authorization: Bearer`, so every
+    // Azure instance (which authenticates with `api-key`) got a 401 here, and
+    // the 7-day cache row was keyed on URL+key only, so an Azure and a plain
+    // Bearer instance pointing at the same URL+key shared one row.
+    // [buildModelsRequest] / [modelsCacheKey] are the pure, JVM-testable cores.
+
+    @Test
+    fun `azure mode sends api-key header`() {
+        val request = buildModelsRequest(
+            url = "https://example.openai.azure.com/openai/models",
+            apiKey = "K",
+            azureMode = true,
+            customUserAgent = null,
+        )
+
+        assertEquals("K", request.header("api-key"))
+        assertNull(
+            "an Azure instance must not also send Authorization: Bearer",
+            request.header("Authorization"),
+        )
+    }
+
+    @Test
+    fun `non-azure sends bearer header`() {
+        val request = buildModelsRequest(
+            url = "https://api.example.com/v1/models",
+            apiKey = "K",
+            azureMode = false,
+            customUserAgent = null,
+        )
+
+        assertEquals("Bearer K", request.header("Authorization"))
+        assertNull(
+            "a non-Azure instance must not send the Azure-only api-key header",
+            request.header("api-key"),
+        )
+    }
+
+    @Test
+    fun `models request carries the per-provider UA override`() {
+        val overridden = buildModelsRequest(
+            url = "https://api.example.com/v1/models",
+            apiKey = "K",
+            azureMode = false,
+            customUserAgent = "X/1.0",
+        )
+        assertEquals("X/1.0", overridden.header("User-Agent"))
+
+        // Blank/unset must fall through to the branded default (asserted as
+        // "not the override" rather than against a specific default string, so
+        // this test does not couple to MinisUserAgent's version format).
+        val fallback = buildModelsRequest(
+            url = "https://api.example.com/v1/models",
+            apiKey = "K",
+            azureMode = false,
+            customUserAgent = null,
+        )
+        assertNotEquals("X/1.0", fallback.header("User-Agent"))
+    }
+
+    @Test
+    fun `cache key separates azure from bearer`() {
+        val azure = modelsCacheKey(baseURL = null, apiKey = "K", azureMode = true)
+        val bearer = modelsCacheKey(baseURL = null, apiKey = "K", azureMode = false)
+
+        assertNotEquals("the two auth schemes must not share a cache row", azure, bearer)
+        assertTrue("the key must still carry the api key", azure.contains("K"))
+        assertTrue("the key must still carry the api key", bearer.contains("K"))
     }
 
     // -- End-to-end: forceRefresh=true actually issues the live request --

@@ -64,6 +64,18 @@ VOICE_VENDORS_REL = (
 VOICE_FACTORY_REL = (
     "src/android/app/src/main/java/com/rikkaminis/app/provider/voice/VoiceProviderFactory.kt"
 )
+# -- [da1030 ISSUE-06] OpenAI outbound single-source contract -----------------
+OPENAI_PROVIDER_REL = (
+    "src/android/app/src/main/java/com/rikkaminis/app/provider/openai/OpenAIProvider.kt"
+)
+OPENAI_MODELS_REL = (
+    "src/android/app/src/main/java/com/rikkaminis/app/provider/openai/OpenAIModelsApi.kt"
+)
+OPENAI_AUTH_REL = (
+    "src/android/app/src/main/java/com/rikkaminis/app/provider/openai/OpenAIAuthHeader.kt"
+)
+MAIN_SRC_REL = "src/android/app/src/main/java"
+API_KEY_LITERAL = 'header("api-key"'
 
 CTOR_RE = re.compile(r"\b(AnthropicProvider|GeminiProvider|OpenAIProvider)\s*\(")
 UA_ARG = "customUserAgent ="
@@ -508,6 +520,204 @@ def check_voice(provider_src, vendors_src, factory_src):
     return v
 
 
+def check_openai_outbound(provider_src, models_src, auth_src, adapters_src, main_sources):
+    """[da1030 ISSUE-06] The OpenAI provider's outbound requests must all draw
+    from the same two chokepoints: the UA override and the key-auth header.
+
+      D1  the `/raw-passthrough` builder (the ModelUse direct route) applies
+          `.applyUserAgentOverride(...)` — and does so BEFORE `builder.build()`,
+          the same last-wins placement as the chat/responses builders. It was
+          the one OpenAI builder that never applied it.
+
+      D2  `header("api-key"` exists in exactly ONE place — the package-level
+          `applyOpenAIKeyAuth` in OpenAIAuthHeader.kt — which both
+          `OpenAIProvider.applyKeyAuth` and `OpenAIModelsApi` delegate to. The
+          models fetch used to hard-code `Authorization: Bearer`, so every
+          Azure instance (which authenticates with `api-key`) 401'd, and the
+          7-day cache row was keyed on URL+key so the two auth schemes shared
+          one row. Both halves are asserted: the parameter is threaded, and the
+          cache key carries the scheme.
+
+      D3  every `OpenAIModelsApi.fetchModels(` call in the adapter file passes
+          `azureMode =`, with a value that matches that arm's CHAT path — either
+          `instance.azureMode` (the OpenAI arm, whose ProviderFactory branch
+          forwards isAzure) or the explicit `false` (Kimi, whose chat branch
+          never forwards it). Per-call-site forwarding is checked exhaustively
+          (not just the first occurrence) because dropping the argument on the
+          second arm is exactly the deep-audit-1019 ISSUE-04 shape: silent,
+          arm-local, and invisible in a single-site grep. And at least one site
+          must forward from the instance, else Azure silently loses its models
+          list while still passing the per-site check.
+    """
+    v = []
+    code_p = blank_strings(strip_comments(provider_src))
+    code_m = blank_strings(strip_comments(models_src))
+    code_a = strip_comments(adapters_src)
+    code_auth = strip_comments(auth_src)
+
+    # -- D1 ------------------------------------------------------------------
+    body = decl_body(code_p, "suspend fun rawPassthroughRequest(")
+    if body is None or "builder.build()" not in body:
+        v.append(
+            "OpenAIProvider.kt: 'suspend fun rawPassthroughRequest(' body not "
+            "found (gate anchors moved — deliberate edit required)"
+        )
+    else:
+        at = body.find(".applyUserAgentOverride(")
+        build_at = body.find("builder.build()")
+        if at < 0:
+            v.append(
+                "OpenAIProvider.kt: rawPassthroughRequest never applies "
+                "'.applyUserAgentOverride(' (da1030 ISSUE-06 裂缝A: the "
+                "/raw-passthrough route is the one OpenAI builder that drops "
+                "the per-provider UA, so ModelUse direct calls go out with the "
+                "default UA)"
+            )
+        elif at > build_at:
+            v.append(
+                "OpenAIProvider.kt: rawPassthroughRequest applies the UA "
+                "override AFTER 'builder.build()' (da1030 ISSUE-06 裂缝A: the "
+                "override must sit in the builder chain, after extraHeaders/user "
+                "headers and before build(), or it never reaches the request)"
+            )
+
+    # -- D2a: single source for the api-key header ---------------------------
+    if "fun Request.Builder.applyOpenAIKeyAuth(" not in code_auth:
+        v.append(
+            "OpenAIAuthHeader.kt: 'fun Request.Builder.applyOpenAIKeyAuth(' not "
+            "found (da1030 ISSUE-06 裂缝B: this is the single source the chat "
+            "builders and the models fetcher both delegate to)"
+        )
+    if API_KEY_LITERAL not in code_auth:
+        v.append(
+            "OpenAIAuthHeader.kt: no '%s' literal (da1030 ISSUE-06 裂缝B: the "
+            "Azure branch must live here, not in a caller)" % API_KEY_LITERAL
+        )
+    for rel, text in main_sources:
+        if rel == OPENAI_AUTH_REL:
+            continue
+        if API_KEY_LITERAL in strip_comments(text):
+            v.append(
+                "%s: hard-coded '%s' outside provider/openai/OpenAIAuthHeader.kt "
+                "(da1030 ISSUE-06 裂缝B: the Azure key header has exactly one "
+                "source; a second copy is how the models fetcher ended up "
+                "Bearer-only)" % (rel, API_KEY_LITERAL)
+            )
+
+    # -- D2b: the models fetcher threads + applies azureMode -----------------
+    if "azureMode: Boolean = false" not in code_m:
+        v.append(
+            "OpenAIModelsApi.kt: fetchModels no longer declares "
+            "'azureMode: Boolean = false' (da1030 ISSUE-06 裂缝B: without the "
+            "parameter the adapter cannot forward ProviderInstance.azureMode)"
+        )
+    for fn, why in (
+        ("buildModelsRequest", "the request is built with the hard-coded Bearer "
+                               "path again"),
+        ("modelsCacheKey", "the cache key no longer separates the two auth "
+                           "schemes, so an Azure and a Bearer instance share a row"),
+    ):
+        sites = [m for m in re.finditer(re.escape(fn + "("), code_m)
+                 if not re.search(r"fun\s+$", code_m[max(0, m.start() - 8):m.start()])]
+        if not sites:
+            v.append(
+                "OpenAIModelsApi.kt: no %s(...) call in fetchModels (da1030 "
+                "ISSUE-06 裂缝B: %s)" % (fn, why)
+            )
+            continue
+        for m in sites:
+            args = balanced_slice(code_m, m.end() - 1)
+            if args is None:
+                v.append("OpenAIModelsApi.kt:%d: %s(...) unbalanced"
+                         % (code_m.count("\n", 0, m.start()) + 1, fn))
+            elif "azureMode" not in args:
+                v.append(
+                    "OpenAIModelsApi.kt:%d: %s(...) call does not pass "
+                    "azureMode (da1030 ISSUE-06 裂缝B: %s)"
+                    % (code_m.count("\n", 0, m.start()) + 1, fn, why)
+                )
+
+    # -- D3: every adapter call site forwards azureMode ----------------------
+    api = "OpenAIModelsApi.fetchModels"
+    sites = [m for m in re.finditer(re.escape(api + "("), code_a)
+             if not re.search(r"fun\s+$", code_a[max(0, m.start() - 8):m.start()])]
+    if not sites:
+        v.append(
+            "ModelListProviderAdapters.kt: %s call not found (gate anchors "
+            "moved — deliberate edit required)" % api
+        )
+    forwarded_from_instance = 0
+    for m in sites:
+        args = code_a[m.end() - 1:]
+        depth = 0
+        end = None
+        for k in range(len(args)):
+            if args[k] == "(":
+                depth += 1
+            elif args[k] == ")":
+                depth -= 1
+                if depth == 0:
+                    end = k
+                    break
+        if end is None:
+            v.append("ModelListProviderAdapters.kt: %s unbalanced" % api)
+            continue
+        args = args[:end]
+        line = code_a.count("\n", 0, m.start()) + 1
+        if UA_ARG not in args:
+            v.append(
+                "ModelListProviderAdapters.kt:%d: %s call drops '%s' "
+                "(da1030 ISSUE-06: the models fetch still gets no UA)"
+                % (line, api, UA_ARG)
+            )
+        if "azureMode" not in args:
+            v.append(
+                "ModelListProviderAdapters.kt:%d: %s call drops 'azureMode' "
+                "(da1030 ISSUE-06 裂缝B: this arm's Azure instances still fetch "
+                "the models list with Bearer auth)" % (line, api)
+            )
+            continue
+        azure_value = re.search(r"azureMode\s*=\s*([A-Za-z0-9_.]+)", args)
+        if azure_value is None or azure_value.group(1) not in (
+            "instance.azureMode", "false"
+        ):
+            v.append(
+                "ModelListProviderAdapters.kt:%d: %s passes an azureMode value "
+                "that is neither `instance.azureMode` nor the explicit `false` "
+                "(da1030 ISSUE-06: the value must mirror that arm's chat path — "
+                "an invented value silently changes which header goes out)"
+                % (line, api)
+            )
+        elif azure_value.group(1) == "instance.azureMode":
+            forwarded_from_instance += 1
+    if sites and forwarded_from_instance == 0:
+        v.append(
+            "ModelListProviderAdapters.kt: no %s call forwards "
+            "`azureMode = instance.azureMode` (da1030 ISSUE-06 裂缝B: Azure "
+            "instances silently lose their models list while every call site "
+            "still looks compliant)" % api
+        )
+    return v
+
+
+def collect_main_sources(root):
+    """Every .kt under the main source root as (repo-relative path, source).
+    Feeds the D2a single-source sweep for the api-key header literal."""
+    out = []
+    base = os.path.join(root, MAIN_SRC_REL)
+    for dirpath, _dirnames, filenames in os.walk(base):
+        for name in sorted(filenames):
+            if not name.endswith(".kt"):
+                continue
+            path = os.path.join(dirpath, name)
+            rel = os.path.relpath(path, root).replace(os.sep, "/")
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    out.append((rel, fh.read()))
+            except OSError:
+                continue
+    return out
+
 def run(root):
     if not os.path.isdir(root):
         print("provider_ua_parity_check: not a directory: %s" % root)
@@ -536,13 +746,35 @@ def run(root):
     else:
         print("note: voice family sources not present in this tree — "
               "voice-UA criteria skipped (drift-detector semantics)")
+    # [da1030 ISSUE-06] OpenAI outbound single-source contract (UA on the
+    # passthrough builder + one api-key auth source + azureMode threaded end
+    # to end). Fail-closed: a missing file is a violation, not a skip.
+    openai_provider = read_optional(root, OPENAI_PROVIDER_REL)
+    openai_models = read_optional(root, OPENAI_MODELS_REL)
+    openai_auth = read_optional(root, OPENAI_AUTH_REL)
+    missing = [rel for rel, src in (
+        (OPENAI_PROVIDER_REL, openai_provider),
+        (OPENAI_MODELS_REL, openai_models),
+        (OPENAI_AUTH_REL, openai_auth),
+    ) if src is None]
+    if missing:
+        violations.append(
+            "provider/openai outbound sources missing: %s (da1030 ISSUE-06: the "
+            "UA + api-key single-source contract cannot be judged)" % ", ".join(missing)
+        )
+    else:
+        violations += check_openai_outbound(
+            openai_provider, openai_models, openai_auth, adapters,
+            collect_main_sources(root),
+        )
     if violations:
         print("FAIL provider_ua_parity_check")
         for v in violations:
             print("  " + v)
         return 1
     print("PASS provider_ua_parity_check (UA forwarded on every provider arm, "
-          "Gemini EOF verdict weighs tool payload, voice family carries the UA)")
+          "Gemini EOF verdict weighs tool payload, voice family carries the UA, "
+          "OpenAI outbound shares one api-key source + one UA chokepoint)")
     return 0
 
 
@@ -846,6 +1078,188 @@ BAD_VOICE_FACTORY_NULL = GOOD_VOICE_FACTORY.replace(
     "it?.customUserAgent = null",
 )
 
+# -- [da1030 ISSUE-06] OpenAI outbound fixtures: D1 (passthrough UA), D2a
+#    (single api-key source), D2b (azureMode threaded in the fetcher) and
+#    D3 (every adapter call site forwards azureMode). ------------------------
+
+GOOD_OPENAI_PROVIDER = """
+class OpenAIProvider(
+    private val apiKey: String,
+    private val isAzure: Boolean = false,
+    private val customUserAgent: String? = null,
+) {
+    private fun Request.Builder.applyKeyAuth(token: String): Request.Builder =
+        applyOpenAIKeyAuth(isAzure, token)
+
+    suspend fun rawPassthroughRequest(
+        endpoint: String?,
+        method: String,
+        headers: Map<String, String>,
+    ): ByteArray = withContext(Dispatchers.IO) {
+        val builder = Request.Builder().url(url)
+        val token = getToken()
+        builder.applyKeyAuth(token)
+        builder.header("Content-Type", "application/json")
+        for ((k, v) in extraHeaders) builder.header(k, v)
+        for ((k, v) in headers) builder.header(k, v)
+        builder.applyUserAgentOverride(customUserAgent)
+
+        val response = client.newCall(builder.build()).execute()
+        response.body!!.bytes()
+    }
+}
+"""
+
+BAD_OPENAI_PROVIDER_DROP = GOOD_OPENAI_PROVIDER.replace(
+    "        builder.applyUserAgentOverride(customUserAgent)\n", ""
+)
+
+BAD_OPENAI_PROVIDER_AFTER_BUILD = GOOD_OPENAI_PROVIDER.replace(
+    """        builder.applyUserAgentOverride(customUserAgent)
+
+        val response = client.newCall(builder.build()).execute()""",
+    """        val response = client.newCall(builder.build()).execute()
+        val request = builder.applyUserAgentOverride(customUserAgent)""",
+)
+
+BAD_OPENAI_PROVIDER_RENAMED = GOOD_OPENAI_PROVIDER.replace(
+    "suspend fun rawPassthroughRequest(", "suspend fun rawPassthrough("
+)
+
+GOOD_OPENAI_AUTH = """
+package com.rikkaminis.app.provider.openai
+
+internal fun Request.Builder.applyOpenAIKeyAuth(
+    azure: Boolean,
+    token: String,
+): Request.Builder =
+    if (azure) header("api-key", token) else header("Authorization", "Bearer $token")
+"""
+
+BAD_OPENAI_AUTH_NO_FN = GOOD_OPENAI_AUTH.replace(
+    "internal fun Request.Builder.applyOpenAIKeyAuth(", "internal fun Request.Builder.keyAuth("
+)
+
+GOOD_OPENAI_MODELS = """
+object OpenAIModelsApi {
+    suspend fun fetchModels(
+        apiKey: String,
+        baseURL: String? = null,
+        forceRefresh: Boolean = false,
+        customUserAgent: String? = null,
+        azureMode: Boolean = false,
+    ): List<LLMModel> = withContext(Dispatchers.IO) {
+        val cacheKey = modelsCacheKey(baseURL, apiKey, azureMode)
+        val url = buildURL(baseURL)
+        val request = buildModelsRequest(url, apiKey, azureMode, customUserAgent)
+        emptyList()
+    }
+
+    internal fun buildModelsRequest(
+        url: String,
+        apiKey: String,
+        azureMode: Boolean,
+        customUserAgent: String?,
+    ): Request =
+        Request.Builder()
+            .url(url)
+            .applyOpenAIKeyAuth(azureMode, apiKey)
+            .applyUserAgentOverride(customUserAgent)
+            .build()
+
+    internal fun modelsCacheKey(baseURL: String?, apiKey: String, azureMode: Boolean): String =
+        (baseURL ?: "") + "|" + apiKey + "|" + if (azureMode) "azure" else "bearer"
+}
+"""
+
+BAD_OPENAI_MODELS_NO_PARAM = GOOD_OPENAI_MODELS.replace(
+    "        azureMode: Boolean = false,\n", ""
+)
+
+BAD_OPENAI_MODELS_NO_BUILD_CALL = GOOD_OPENAI_MODELS.replace(
+    "        val request = buildModelsRequest(url, apiKey, azureMode, customUserAgent)\n",
+    "        val request = Request.Builder().url(url).build()\n",
+)
+
+BAD_OPENAI_MODELS_KEY_NOT_THREADED = GOOD_OPENAI_MODELS.replace(
+    "buildModelsRequest(url, apiKey, azureMode, customUserAgent)",
+    "buildModelsRequest(url, apiKey, false, customUserAgent)",
+)
+
+BAD_OPENAI_MODELS_CACHE_NOT_THREADED = GOOD_OPENAI_MODELS.replace(
+    "modelsCacheKey(baseURL, apiKey, azureMode)",
+    "modelsCacheKey(baseURL, apiKey, false)",
+)
+
+GOOD_OPENAI_ADAPTERS = """
+object OpenAIAdapter_ok {
+    fun a(instance: ProviderInstance, apiKey: String, context: Context?): List<LLMModel> {
+        return OpenAIModelsApi.fetchModels(
+            apiKey,
+            instance.effectiveBaseURL,
+            context = context,
+            customUserAgent = instance.customUserAgent,
+            azureMode = instance.azureMode,
+            forceRefresh = forceRefresh,
+        )
+    }
+
+    fun b(instance: ProviderInstance, apiKey: String, context: Context?): List<LLMModel> {
+        return OpenAIModelsApi.fetchModels(
+            apiKey,
+            baseURL,
+            context = context,
+            customUserAgent = instance.customUserAgent,
+            azureMode = false,
+            forceRefresh = forceRefresh,
+        )
+    }
+}
+"""
+
+BAD_OPENAI_ADAPTERS_DROP_SECOND = GOOD_OPENAI_ADAPTERS.replace(
+    """            customUserAgent = instance.customUserAgent,
+            azureMode = false,
+            forceRefresh = forceRefresh,
+        )
+    }
+}
+""",
+    """            customUserAgent = instance.customUserAgent,
+            forceRefresh = forceRefresh,
+        )
+    }
+}
+""",
+)
+
+BAD_OPENAI_ADAPTERS_INVENTED_VALUE = GOOD_OPENAI_ADAPTERS.replace(
+    "            azureMode = false,\n", "            azureMode = true,\n"
+)
+
+BAD_OPENAI_ADAPTERS_ALL_FALSE = GOOD_OPENAI_ADAPTERS.replace(
+    "            azureMode = instance.azureMode,\n", "            azureMode = false,\n"
+)
+
+BAD_OPENAI_ADAPTERS_NO_SITE = """
+object NoOpenAIArm {
+    fun a(instance: ProviderInstance): List<LLMModel> = emptyList()
+}
+"""
+
+GOOD_OTHER_SOURCES = [
+    ("src/android/app/src/main/java/com/rikkaminis/app/provider/openai/OpenAIAuthHeader.kt",
+     GOOD_OPENAI_AUTH),
+    # a sibling provider with a DIFFERENT key header must stay clean
+    ("src/android/app/src/main/java/com/rikkaminis/app/provider/anthropic/AnthropicProvider.kt",
+     'builder.header("x-api-key", key).header("anthropic-version", "2023-06-01")'),
+]
+
+BAD_OTHER_SOURCES_DUPLICATE = GOOD_OTHER_SOURCES + [
+    ("src/android/app/src/main/java/com/rikkaminis/app/provider/openai/OpenAIModelsApi.kt",
+     'Request.Builder().url(url).header("api-key", apiKey).build()'),
+]
+
 def selftest():
     failures = []
 
@@ -941,6 +1355,78 @@ def selftest():
     print("selftest xunfei WS-anchor-moved   -> %d violation(s)" % len(bad_vv_moved))
     print("selftest voice factory drop       -> %d violation(s)" % len(bad_vf_drop))
     print("selftest voice factory null       -> %d violation(s)" % len(bad_vf_null))
+
+    # -- [da1030 ISSUE-06] OpenAI outbound arms ----------------------------
+    def oai(provider=GOOD_OPENAI_PROVIDER, models=GOOD_OPENAI_MODELS,
+            auth=GOOD_OPENAI_AUTH, adapters=GOOD_OPENAI_ADAPTERS,
+            others=GOOD_OTHER_SOURCES):
+        return check_openai_outbound(provider, models, auth, adapters, others)
+
+    good_oai = oai()
+    expect_clean("compliant openai-outbound fixtures", good_oai)
+    # precision: the sibling Anthropic x-api-key line is a DIFFERENT header and
+    # must not be counted as a second api-key source
+    if any("AnthropicProvider.kt" in item for item in good_oai):
+        failures.append("compliant openai fixtures: x-api-key flagged as api-key")
+    print("selftest compliant openai-outbound-> %d violation(s)" % len(good_oai))
+
+    def expect_single(name, v, needle):
+        hits = [i for i in v if needle in i]
+        if len(hits) != 1:
+            failures.append("%s expected exactly 1 x '%s', got %s" % (name, needle, v))
+
+    bad_p_drop = oai(provider=BAD_OPENAI_PROVIDER_DROP)
+    expect_trip("passthrough-UA-drop fixture (D1)", bad_p_drop, "never applies")
+    bad_p_after = oai(provider=BAD_OPENAI_PROVIDER_AFTER_BUILD)
+    expect_trip("passthrough-UA-after-build fixture (D1)", bad_p_after,
+                "AFTER 'builder.build()'")
+    bad_p_renamed = oai(provider=BAD_OPENAI_PROVIDER_RENAMED)
+    expect_trip("passthrough-anchor-moved fixture (D1)", bad_p_renamed, "body not found")
+
+    bad_auth = oai(auth=BAD_OPENAI_AUTH_NO_FN)
+    expect_trip("auth-single-source-missing fixture (D2a)", bad_auth,
+                "applyOpenAIKeyAuth(' not found")
+    bad_dup = oai(others=BAD_OTHER_SOURCES_DUPLICATE)
+    expect_trip("duplicate-api-key-literal fixture (D2a)", bad_dup, "hard-coded")
+
+    bad_m_param = oai(models=BAD_OPENAI_MODELS_NO_PARAM)
+    expect_trip("models-no-azureMode-param fixture (D2b)", bad_m_param, "no longer declares")
+    bad_m_build = oai(models=BAD_OPENAI_MODELS_NO_BUILD_CALL)
+    expect_trip("models-no-build-call fixture (D2b)", bad_m_build,
+                "no buildModelsRequest(...) call")
+    bad_m_key = oai(models=BAD_OPENAI_MODELS_KEY_NOT_THREADED)
+    expect_trip("models-key-not-threaded fixture (D2b)", bad_m_key, "does not pass azureMode")
+    expect_single("models-key-not-threaded fixture (D2b)", bad_m_key, "does not pass azureMode")
+    bad_m_cache = oai(models=BAD_OPENAI_MODELS_CACHE_NOT_THREADED)
+    expect_trip("models-cache-not-threaded fixture (D2b)", bad_m_cache,
+                "does not pass azureMode")
+    expect_single("models-cache-not-threaded fixture (D2b)", bad_m_cache,
+                  "does not pass azureMode")
+
+    bad_ad2 = oai(adapters=BAD_OPENAI_ADAPTERS_DROP_SECOND)
+    expect_trip("adapters-second-site-drop fixture (D3)", bad_ad2, "drops 'azureMode'")
+    expect_single("adapters-second-site-drop fixture (D3)", bad_ad2, "drops 'azureMode'")
+    bad_ad_invented = oai(adapters=BAD_OPENAI_ADAPTERS_INVENTED_VALUE)
+    expect_trip("adapters-invented-value fixture (D3)", bad_ad_invented,
+                "neither `instance.azureMode`")
+    expect_single("adapters-invented-value fixture (D3)", bad_ad_invented,
+                  "neither `instance.azureMode`")
+    bad_ad_allfalse = oai(adapters=BAD_OPENAI_ADAPTERS_ALL_FALSE)
+    expect_trip("adapters-all-false fixture (D3)", bad_ad_allfalse,
+                "no OpenAIModelsApi.fetchModels call forwards")
+    bad_ad_none = oai(adapters=BAD_OPENAI_ADAPTERS_NO_SITE)
+    expect_trip("adapters-no-callsite fixture (D3)", bad_ad_none, "call not found")
+
+    print("selftest openai passthrough drop -> %d violation(s)" % len(bad_p_drop))
+    print("selftest openai passthrough order-> %d violation(s)" % len(bad_p_after))
+    print("selftest openai auth single-src  -> %d violation(s)" % len(bad_auth))
+    print("selftest openai api-key dup      -> %d violation(s)" % len(bad_dup))
+    print("selftest openai models no-param  -> %d violation(s)" % len(bad_m_param))
+    print("selftest openai models no-build  -> %d violation(s)" % len(bad_m_build))
+    print("selftest openai models key thread-> %d violation(s)" % len(bad_m_key))
+    print("selftest openai models cache thr -> %d violation(s)" % len(bad_m_cache))
+    print("selftest openai adapters 2nd arm -> %d violation(s)" % len(bad_ad2))
+    print("selftest openai adapters no-site -> %d violation(s)" % len(bad_ad_none))
 
     print("selftest compliant factory        -> %d violation(s)" % len(good_factory))
     print("selftest compliant gemini         -> %d violation(s)" % len(good_gemini))

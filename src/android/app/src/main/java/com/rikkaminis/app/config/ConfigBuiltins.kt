@@ -1284,6 +1284,12 @@ internal object ConfigBuiltins {
                                     "appendV1Suffix" to ConfigValue.Bool(inst.appendV1Suffix),
                                     "useResponsesAPI" to ConfigValue.Bool(inst.useResponsesAPI),
                                     "azureMode" to ConfigValue.Bool(inst.azureMode),
+                                    // [da1030-C ISSUE-04] Same symmetry as the
+                                    // Debug RPC faces: the image-endpoint
+                                    // picker state is readable here too
+                                    // ([GH#68] keys, instance-field names).
+                                    "imageEndpointMode" to ConfigValue.Str(inst.imageEndpointMode.name),
+                                    "imageEndpointResolved" to (inst.imageEndpointResolved?.let { ConfigValue.Str(it.name) } ?: ConfigValue.Null),
                                     // [fix/da1020-memory-gate-provider-fields]
                                     // Same read shape as the per-instance field
                                     // (empty override → Null = branded default).

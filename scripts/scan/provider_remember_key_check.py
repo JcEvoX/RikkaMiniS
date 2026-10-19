@@ -68,6 +68,28 @@ Criteria (each fail-closed: missing anchor = RED, never silent skip):
       `modelEntries = ...` — a section that is never handed the list cannot key
       on it at all. Anchors missing = RED.
 
+  C12 ThinkingRulesSection [da1030-C ISSUE-05] — the custom-rule loader must
+      also re-read after writes made OUTSIDE this screen (backup restore,
+      repository load, worker restore, `minis-config`). `reloadKey` only moves
+      for edits made on the screen itself, so the screen kept rendering the
+      list it read when it opened and wrote it back on the next edit —
+      reverting the external write. Two arms: (a) the file must subscribe to
+      `customRulesRevision` via `collectAsState()`; (b) the `remember(...)`
+      whose initializer calls `thinkingRulesWithIds(` must key on that
+      revision (allowlist `rulesRevision` / `customRulesRevision`).
+      Anchors missing = RED (re-derive rather than delete).
+
+  C13 ThinkingRuleResolver [da1030-C ISSUE-05] — the revision C12 observes is
+      only as good as its writers: `setAllCustomRules`, `setCustomRules` and
+      `restoreCustomRulesFromJson` must EACH bump `_customRulesRevision`
+      (a mutator that skips the bump re-opens the stale-screen hole for
+      exactly that write path), and the file-level count of cache writes
+      (`customRulesCache = …`) must not exceed the count of bumps — a body with
+      TWO write paths (the null / non-null branches of the restore) needs a
+      bump on each, which a per-body "≥1 bump" test alone cannot see. The
+      `val customRulesRevision` declaration must exist. Fail-closed on a
+      missing mutator body.
+
 Usage:
   python3 provider_remember_key_check.py <repo_root>   # real-tree mode
   python3 provider_remember_key_check.py --selftest    # fixture mode
@@ -96,6 +118,21 @@ REL_APP_NAV = "src/android/app/src/main/java/com/rikkaminis/app/ui/navigation/Ap
 REL_USAGE_STATS = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/UsageStatsScreen.kt"
 # da1028-C
 REL_THINKING_SECTION = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/ThinkingRulesSection.kt"
+# da1030-C
+REL_THINKING_RESOLVER = "src/android/app/src/main/java/com/rikkaminis/app/provider/thinking/ThinkingRuleResolver.kt"
+
+# ---- [da1030-C ISSUE-05] C12 / C13 ----
+# The collected revision local may be named either way; both spellings are the
+# same single source (`ThinkingRuleResolver.customRulesRevision`).
+REVISION_KEY_TOKENS = ("rulesRevision", "customRulesRevision")
+REVISION_SUB_RE = re.compile(r"customRulesRevision[\s\S]{0,160}?collectAsState\s*\(")
+THINKING_LOADER_CALLEE = "thinkingRulesWithIds("
+RESOLVER_MUTATORS = ("setAllCustomRules", "setCustomRules", "restoreCustomRulesFromJson")
+RESOLVER_REVISION_DECL_RE = re.compile(r"\bval\s+customRulesRevision\b")
+RESOLVER_BUMP_RE = re.compile(r"customRulesRevision\.value\s*\+=")
+# A cache WRITE (`customRulesCache = …`), distinct from the field declaration
+# (`private var customRulesCache: Map<…> = …`) and from passing it as an arg.
+CACHE_WRITE_RE = re.compile(r"\bcustomRulesCache\s*=\s*[A-Za-z_]")
 
 # C6c — value families a remember initializer can derive from in
 # ModelEntryDetailScreen. Reading any of them makes the call site
@@ -261,6 +298,39 @@ def find_call_site(code, name):
             return -1
         if "fun " not in code[max(0, idx - 40):idx]:
             return idx
+
+def func_body(code, name):
+    """Balanced-brace body of `fun <name>(...) { … }` (string-aware), or None
+    (fail-closed) when the declaration or its closing brace cannot be found.
+    Called with comment-stripped code."""
+    m = re.search(r"\bfun\s+" + re.escape(name) + r"\s*\(", code)
+    if not m:
+        return None
+    start = code.find("{", m.end())
+    if start < 0:
+        return None
+    depth = 0
+    i, n = start, len(code)
+    in_str = False
+    while i < n:
+        c = code[i]
+        if in_str:
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return code[start:i + 1]
+        i += 1
+    return None
 
 
 def check_provider_list(code):
@@ -594,6 +664,57 @@ def check_thinking_rules(code):
                         "all %d %s remember call(s) key on %s"
                         % (len(hits), label, " + ".join(required))
                         if not bad else "; ".join(bad)))
+    # C12 [da1030-C ISSUE-05] — the loader must observe EXTERNAL rule writes.
+    bad = []
+    if not REVISION_SUB_RE.search(code):
+        bad.append("no `customRulesRevision` → `collectAsState()` subscription (fail-closed: "
+                   "the section cannot observe rules written outside this screen)")
+    loader_hits = [c for c in calls if THINKING_LOADER_CALLEE in c[3]]
+    if not loader_hits:
+        bad.append("no `remember(...)` whose initializer calls %s (fail-closed: the loader "
+                   "was reworked — re-derive this criterion)" % THINKING_LOADER_CALLEE)
+    for line_no, keys, _span, _init in loader_hits:
+        if keys is None:
+            bad.append("L%d: keyless remember loads the custom rules" % line_no)
+            continue
+        if not any(tok in keys for tok in REVISION_KEY_TOKENS):
+            bad.append("L%d: keys=[%s] missing the rules-revision key (%s)"
+                       % (line_no, " ".join(keys.split()), " / ".join(REVISION_KEY_TOKENS)))
+    results.append(("C12", not bad,
+                    "section subscribes to customRulesRevision and keys the loader on it"
+                    if not bad else "; ".join(bad)))
+    return results
+
+def check_thinking_resolver(code):
+    """C13 [da1030-C ISSUE-05] — every custom-rule mutator bumps the revision.
+
+    Two arms: (a) each named mutator body carries at least one bump, and
+    (b) the file-level cache-write count does not exceed the bump count. Arm (b)
+    is what catches a multi-path body (the restore's null / non-null branches)
+    where one branch lost its bump but the body still looks fine to arm (a).
+
+    Fail-closed per mutator: a missing body means the mutator was renamed or
+    moved, so this criterion must be re-derived rather than silently pass."""
+    results = []
+    bad = []
+    if not RESOLVER_REVISION_DECL_RE.search(code):
+        bad.append("no `val customRulesRevision` declaration (fail-closed)")
+    for name in RESOLVER_MUTATORS:
+        body = func_body(code, name)
+        if body is None:
+            bad.append("%s body not found (fail-closed)" % name)
+            continue
+        if not RESOLVER_BUMP_RE.search(body):
+            bad.append("%s does not bump customRulesRevision" % name)
+    writes = len(CACHE_WRITE_RE.findall(code))
+    bumps = len(RESOLVER_BUMP_RE.findall(code))
+    if bumps < writes:
+        bad.append("customRulesCache is written %d time(s) but bumped %d time(s) — a mutation "
+                   "path does not notify the UI" % (writes, bumps))
+    results.append(("C13", not bad,
+                    "all %d custom-rule mutators bump customRulesRevision "
+                    "(%d cache writes / %d bumps)" % (len(RESOLVER_MUTATORS), writes, bumps)
+                    if not bad else "; ".join(bad)))
     return results
 
 CHECKERS = (
@@ -607,6 +728,7 @@ CHECKERS = (
     (REL_APP_NAV, check_app_navigation),
     (REL_USAGE_STATS, check_usage_stats),
     (REL_THINKING_SECTION, check_thinking_rules),
+    (REL_THINKING_RESOLVER, check_thinking_resolver),
 )
 
 
@@ -920,7 +1042,8 @@ fun ThinkingRulesSection(
 ) {
     var reloadKey by remember { mutableStateOf(0) }
     var defaultsExpanded by remember { mutableStateOf(false) }
-    val customRulesAndIds = remember(instance.id, reloadKey) {
+    val rulesRevision by ThinkingRuleResolver.customRulesRevision.collectAsState()
+    val customRulesAndIds = remember(instance.id, reloadKey, rulesRevision) {
         providerRepository.thinkingRulesWithIds(instance.id)
     }
     val builtIns = remember(instance.id, instance.customBaseURL, instance.appendV1Suffix, modelEntries, reloadKey) {
@@ -957,10 +1080,89 @@ fun unrelated() {}
 # loader and two pure-UI flags, one keyless) must leave the gate green —
 # otherwise "any keyless remember reds" would masquerade as coverage.
 FIX_THINKING_PRECISION_UNRELATED = FIX_THINKING_CLEAN.replace(
-    "    val customRulesAndIds = remember(instance.id, reloadKey) {",
-    "    var editorRequest by remember { mutableStateOf<ThinkingRuleEditorRequest?>(null) }\n"
-    "    val customRulesAndIds = remember {",
+    "    var defaultsExpanded by remember { mutableStateOf(false) }",
+    "    var defaultsExpanded by remember { mutableStateOf(false) }\n"
+    "    var editorTick by remember { mutableStateOf(0) }",
 )
+
+# --- da1030-C ISSUE-05 fixtures: C12 / C13 --------------------------------
+
+FIX_THINKING_NO_REVISION_KEY = FIX_THINKING_CLEAN.replace(
+    "remember(instance.id, reloadKey, rulesRevision)",
+    "remember(instance.id, reloadKey)")
+
+FIX_THINKING_NO_SUBSCRIPTION = FIX_THINKING_CLEAN.replace(
+    "    val rulesRevision by ThinkingRuleResolver.customRulesRevision.collectAsState()\n", "")
+
+FIX_THINKING_RESOLVER_CLEAN = """package com.rikkaminis.app.provider.thinking
+
+object ThinkingRuleResolver {
+    @Volatile
+    private var customRulesCache: Map<String, List<ThinkingRule>> = emptyMap()
+
+    private val _customRulesRevision = MutableStateFlow(0L)
+
+    val customRulesRevision: StateFlow<Long> = _customRulesRevision.asStateFlow()
+
+    @Synchronized
+    fun setAllCustomRules(byInstance: Map<String, List<ThinkingRule>>) {
+        customRulesCache = byInstance
+        _customRulesRevision.value += 1
+    }
+
+    @Synchronized
+    fun setCustomRules(instanceId: String, rules: List<ThinkingRule>) {
+        customRulesCache = withInstanceRules(customRulesCache, instanceId, rules)
+        _customRulesRevision.value += 1
+    }
+
+    @Synchronized
+    fun restoreCustomRulesFromJson(instanceId: String, field: JSONArray?): Int {
+        if (instanceId.isBlank()) return 0
+        if (field == null) {
+            customRulesCache = withInstanceRules(customRulesCache, instanceId, emptyList())
+            _customRulesRevision.value += 1
+            return 0
+        }
+        val rules = (0 until field.length()).mapNotNull { i ->
+            val o = field.optJSONObject(i) ?: return@mapNotNull null
+            ThinkingRuleCoding.decodeRuleJson(o)
+        }
+        customRulesCache = withInstanceRules(customRulesCache, instanceId, rules)
+        _customRulesRevision.value += 1
+        return rules.size
+    }
+
+    private fun withInstanceRules(
+        cache: Map<String, List<ThinkingRule>>,
+        instanceId: String,
+        rules: List<ThinkingRule>,
+    ): Map<String, List<ThinkingRule>> = cache.toMutableMap().apply {
+        if (rules.isEmpty()) remove(instanceId) else put(instanceId, rules)
+    }
+}
+"""
+
+FIX_RESOLVER_NO_BUMP_SETALL = FIX_THINKING_RESOLVER_CLEAN.replace(
+    """    fun setAllCustomRules(byInstance: Map<String, List<ThinkingRule>>) {
+        customRulesCache = byInstance
+        _customRulesRevision.value += 1
+    }""",
+    """    fun setAllCustomRules(byInstance: Map<String, List<ThinkingRule>>) {
+        customRulesCache = byInstance
+    }""",
+)
+
+FIX_RESOLVER_NO_BUMP_RESTORE = FIX_THINKING_RESOLVER_CLEAN.replace(
+    """        customRulesCache = withInstanceRules(customRulesCache, instanceId, rules)
+        _customRulesRevision.value += 1
+        return rules.size""",
+    """        customRulesCache = withInstanceRules(customRulesCache, instanceId, rules)
+        return rules.size""",
+)
+
+FIX_RESOLVER_NO_DECL = FIX_THINKING_RESOLVER_CLEAN.replace(
+    "    val customRulesRevision: StateFlow<Long> = _customRulesRevision.asStateFlow()\n", "")
 
 CLEAN_TREE = {
     REL_PROVIDER_LIST: FIX_PROVIDER_LIST_CLEAN,
@@ -973,12 +1175,20 @@ CLEAN_TREE = {
     REL_APP_NAV: FIX_APPNAV_CLEAN,
     REL_USAGE_STATS: FIX_USAGE_STATS_CLEAN,
     REL_THINKING_SECTION: FIX_THINKING_CLEAN,
+    REL_THINKING_RESOLVER: FIX_THINKING_RESOLVER_CLEAN,
 }
 
 
 def variant(rel, text):
     files = dict(CLEAN_TREE)
     files[rel] = text
+    return files
+
+
+def missing(rel):
+    """Clean tree minus [rel] — the file-absent (fail-closed) arm."""
+    files = dict(CLEAN_TREE)
+    del files[rel]
     return files
 
 
@@ -1108,7 +1318,22 @@ def run_selftest():
     run_case("c11-precision-unrelated-remember-green", 0,
              variant(REL_THINKING_SECTION, FIX_THINKING_PRECISION_UNRELATED), failures)
     run_case("failclosed-missing-thinking-anchor", 1,
-             variant(REL_THINKING_SECTION, FIX_THINKING_MISSING_ANCHOR), failures, ("C11a", "C11b"))
+             variant(REL_THINKING_SECTION, FIX_THINKING_MISSING_ANCHOR), failures,
+             ("C11a", "C11b", "C12"))
+    # --- da1030-C: C12 (external rule writes must re-key the loader) -------
+    run_case("c12-loader-no-revision-key", 1,
+             variant(REL_THINKING_SECTION, FIX_THINKING_NO_REVISION_KEY), failures, ("C12",))
+    run_case("c12-no-revision-subscription", 1,
+             variant(REL_THINKING_SECTION, FIX_THINKING_NO_SUBSCRIPTION), failures, ("C12",))
+    # --- da1030-C: C13 (every mutator bumps the revision) ------------------
+    run_case("c13-setall-no-bump", 1,
+             variant(REL_THINKING_RESOLVER, FIX_RESOLVER_NO_BUMP_SETALL), failures, ("C13",))
+    run_case("c13-restore-no-bump", 1,
+             variant(REL_THINKING_RESOLVER, FIX_RESOLVER_NO_BUMP_RESTORE), failures, ("C13",))
+    run_case("c13-no-revision-declaration", 1,
+             variant(REL_THINKING_RESOLVER, FIX_RESOLVER_NO_DECL), failures, ("C13",))
+    run_case("failclosed-missing-thinking-resolver", 1,
+             missing(REL_THINKING_RESOLVER), failures, ("FILE",))
     run_case("c11c-detail-call-site-undrilled", 1,
              variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_NO_SECTION_ARGS), failures, ("C11c",))
     if failures:

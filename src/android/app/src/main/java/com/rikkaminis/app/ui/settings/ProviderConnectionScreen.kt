@@ -103,6 +103,21 @@ fun ProviderConnectionScreen(
         )
     }
 
+    fun saveUserAgentSetting() {
+        // [da1030-C ISSUE-04] Dedicated saver for the User-Agent field. The
+        // base-URL field's saveBaseURLSettings() also rewrites customUserAgent
+        // in the same instance.copy — harmless there, but the UA field now also
+        // renders for openRouter instances, where customBaseURL has no editor
+        // and must not be rewritten as a side effect of an unrelated edit.
+        providerRepository.updateInstance(
+            instance.copy(customUserAgent = customUserAgent.ifBlank { null })
+        )
+        AppLogger.info(
+            TAG,
+            "Saved user agent for ${instance.id}: ua='${customUserAgent.ifBlank { "<default>" }}'",
+        )
+    }
+
     SettingsScaffold(
         title = instance.label,
         onBack = onBack,
@@ -176,34 +191,36 @@ fun ProviderConnectionScreen(
                             )
                         }
                     }
-                    // [da1023-C] Align the field's visibility with the
-                    // ProvidersCollection write contract: customUserAgent is
-                    // writable exactly when credentialType == apiKey (OAuth
-                    // instances are rejected with the OAuth message). The old
-                    // providerType openAI||anthropic gate showed the field on
-                    // OAuth-authenticated instances the write path refuses,
-                    // and hid it on apiKey xAI/kimiCode instances the write
-                    // path accepts.
-                    val showUserAgentField = customUserAgentWritable(instance.credentialType)
-                    if (showUserAgentField) {
-                        Column(modifier = Modifier.padding(vertical = 8.dp)) {
-                            Text(
-                                text = stringResource(R.string.provider_detail_custom_user_agent),
-                                style = MaterialTheme.typography.bodyLarge,
-                            )
-                            Spacer(Modifier.height(4.dp))
-                            SectionTextField(
-                                value = customUserAgent,
-                                onValueChange = { customUserAgent = it },
-                                singleLine = true,
-                                placeholder = stringResource(R.string.provider_detail_custom_user_agent_placeholder),
-                                fieldModifier = Modifier
-                                    .bringIntoViewOnFocus()
-                                    .onFocusChanged { focusState ->
-                                        if (!focusState.isFocused) saveBaseURLSettings()
-                                    },
-                            )
-                        }
+                }
+            }
+        }
+
+        // ─── Custom User-Agent ──────────────────────────────────────
+        // [da1030-C ISSUE-04] This field used to live INSIDE the
+        // `!= openRouter` block above, so an openRouter instance could neither
+        // see nor edit it — while ProviderFactory already hands
+        // instance.customUserAgent to OpenAIProvider on that arm (openRouter
+        // pins only its BASE URL), and the write contract
+        // (ProvidersCollection.customUserAgentWritable) gates on credentialType
+        // alone. The credentialType gate stays ([da1023-C]): the writer refuses
+        // OAuth instances.
+        if (customUserAgentWritable(instance.credentialType)) {
+            SettingsSection(
+                header = stringResource(R.string.provider_detail_custom_user_agent),
+            ) {
+                SettingsCardBlock {
+                    Column(modifier = Modifier.padding(vertical = 8.dp)) {
+                        SectionTextField(
+                            value = customUserAgent,
+                            onValueChange = { customUserAgent = it },
+                            singleLine = true,
+                            placeholder = stringResource(R.string.provider_detail_custom_user_agent_placeholder),
+                            fieldModifier = Modifier
+                                .bringIntoViewOnFocus()
+                                .onFocusChanged { focusState ->
+                                    if (!focusState.isFocused) saveUserAgentSetting()
+                                },
+                        )
                     }
                 }
             }

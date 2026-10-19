@@ -38,6 +38,18 @@ I04 (SkillRepository.kt, deep-audit-1029)
   `synchronized(addLock)` block (criterion on lock ownership, not on the shape
   of the right-hand side).
 
+I01/I02 (deep-audit-1030, FIX-A)
+  `ensureSession()`'s `if (isDraft)` block already re-points the skill / mcp
+  overrides and the BrowserTabPool onto the real session id, but had no hook
+  for the pinned WebApp shortcuts: their `scope_context` / `source_session_id`
+  were frozen at pin time (`__new__<uuid>`), and `migrateDraftResources` deletes
+  the draft directory the resolver reads through — the launcher icon reports
+  "Source Missing" forever. Symmetrically, MinisApp's `onSessionDeleted` hook
+  reaps the skill / mcp overrides but left the session-list badge queue behind,
+  so a deleted session's PAUSED badge re-surfaced on whatever session reused
+  the id. Rules: the draft block calls `renameSessionShortcuts(`, and the
+  `onSessionDeleted` lambda body calls `SessionBadgeStore.clear(`.
+
 Usage: python3 scripts/scan/skill_restore_session_cleanup_check.py [repo_root]
        python3 scripts/scan/skill_restore_session_cleanup_check.py --selftest
 Exit:  0 = clean, 1 = violation(s), 2 = usage/ROT
@@ -49,6 +61,7 @@ import sys
 SKILL_REPO_REL = "src/android/app/src/main/java/com/rikkaminis/app/data/repository/SkillRepository.kt"
 CHAT_REPO_REL = "src/android/app/src/main/java/com/rikkaminis/app/data/repository/ChatRepository.kt"
 MINIS_APP_REL = "src/android/app/src/main/java/com/rikkaminis/app/MinisApp.kt"
+CHAT_ENTRY_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatSessionEntryExt.kt"
 
 ADD_DECL = "fun add("
 ADD_SIG_END = "): Skill? {"
@@ -68,6 +81,13 @@ MCP_NEW = "mcpRepository = MCPRepository("
 RECORD_DECL = "fun recordSkillUse("
 RECORD_LOCK = "synchronized(addLock)"
 SKILLS_ASSIGN = "_skills.value ="
+
+# [da1030-A ISSUE-01]
+ENSURE_DECL = "internal suspend fun ChatViewModel.ensureSession("
+DRAFT_IF = "if (isDraft) {"
+RENAME_SHORTCUTS = "renameSessionShortcuts("
+ON_SESSION_DELETED = "onSessionDeleted = { sid ->"
+BADGE_CLEAR = "SessionBadgeStore.clear("
 
 
 def lines_of(src, needle):
@@ -305,6 +325,98 @@ def check_minis_app(src):
         v.append("MinisApp.kt: onSessionDeleted callback does not call clearSessionOverrides")
     return v
 
+def check_chat_entry(src):
+    """Arm 6 [da1030-A / I01]: `ensureSession`'s draft-promotion block must
+    re-point the pinned WebApp shortcuts onto the real session id.
+
+    A shortcut pinned from a draft chat stores `__new__<uuid>` in both scope
+    columns, and `migrateDraftResources` (called a few lines above) moves the
+    session tree to the real id and deletes the draft directory. Every reader
+    resolves `htmlPath` through `minis-sessions/<scope_context>/attachments`,
+    so without this hop the pinned launcher icon points at a directory that no
+    longer exists ("Source Missing") and nothing else ever rewrites the row.
+
+    The criterion is scoped to the `if (isDraft)` block on purpose: a call
+    placed outside it (e.g. before the guard) would fire for real sessions too
+    and, on the draft path, would run after the promotion window.
+    """
+    v = []
+    code = strip_literals(src)
+    if code is None:
+        v.append("ChatSessionEntryExt.kt: unterminated string/comment literal — cannot "
+                 "brace-match ensureSession (ROT — update this gate)")
+        return v
+    start = code.find(ENSURE_DECL)
+    if start < 0:
+        v.append("ChatSessionEntryExt.kt: '%s' not found (ROT — update this gate)" % ENSURE_DECL)
+        return v
+    open_brace = code.find("{", start)
+    if open_brace < 0:
+        v.append("ChatSessionEntryExt.kt: ensureSession has no body brace (ROT — update this gate)")
+        return v
+    end = brace_block_end(code, open_brace)
+    if end < 0:
+        v.append("ChatSessionEntryExt.kt: ensureSession body braces do not balance "
+                 "(ROT — update this gate)")
+        return v
+    body = code[open_brace:end + 1]
+
+    draft_at = body.find(DRAFT_IF)
+    if draft_at < 0:
+        v.append("ChatSessionEntryExt.kt: ensureSession has no '%s' block (ROT — update this gate)"
+                 % DRAFT_IF)
+        return v
+    draft_open = body.find("{", draft_at)
+    draft_end = brace_block_end(body, draft_open) if draft_open >= 0 else -1
+    if draft_end < 0:
+        v.append("ChatSessionEntryExt.kt: ensureSession's '%s' braces do not balance "
+                 "(ROT — update this gate)" % DRAFT_IF)
+        return v
+    draft_body = body[draft_open:draft_end + 1]
+
+    if RENAME_SHORTCUTS not in draft_body:
+        v.append("ChatSessionEntryExt.kt: ensureSession's '%s' block does not call '%s' — a "
+                 "shortcut pinned on the draft keeps scope_context = __new__* and resolves "
+                 "under the draft directory migrateDraftResources just deleted "
+                 "(launcher icon: \"Source Missing\")" % (DRAFT_IF, RENAME_SHORTCUTS))
+    return v
+
+def check_minis_app_badge(src):
+    """Arm 7 [da1030-A / I01 裂缝B]: the `onSessionDeleted` lambda must drop the
+    deleted session's badge queue as well.
+
+    `SessionBadgeStore.clear` removes the id from the in-memory StateFlow AND
+    from SharedPreferences; without the hook a deleted session's PAUSED badge
+    survived the process and re-surfaced on whatever session later reused the
+    id. The criterion is scoped to the lambda body: a stray call elsewhere in
+    `onCreate` would not run on the delete path.
+    """
+    v = []
+    code = strip_literals(src)
+    if code is None:
+        v.append("MinisApp.kt: unterminated string/comment literal — cannot brace-match "
+                 "onSessionDeleted (ROT — update this gate)")
+        return v
+    at = code.find(ON_SESSION_DELETED)
+    if at < 0:
+        v.append("MinisApp.kt: '%s' not found (ROT — update this gate)" % ON_SESSION_DELETED)
+        return v
+    open_brace = code.find("{", at)
+    if open_brace < 0:
+        v.append("MinisApp.kt: onSessionDeleted lambda has no brace (ROT — update this gate)")
+        return v
+    end = brace_block_end(code, open_brace)
+    if end < 0:
+        v.append("MinisApp.kt: onSessionDeleted lambda braces do not balance "
+                 "(ROT — update this gate)")
+        return v
+    body = code[open_brace:end + 1]
+    if BADGE_CLEAR not in body:
+        v.append("MinisApp.kt: onSessionDeleted does not call '%s' — a deleted session's "
+                 "badge queue (memory + SharedPreferences) survives the delete and "
+                 "re-surfaces on whatever session reuses the id" % BADGE_CLEAR)
+    return v
+
 
 def read(root, rel):
     path = os.path.join(root, rel)
@@ -320,10 +432,12 @@ def run(root):
         skill = read(root, SKILL_REPO_REL)
         chat = read(root, CHAT_REPO_REL)
         app = read(root, MINIS_APP_REL)
+        entry = read(root, CHAT_ENTRY_REL)
     except OSError as exc:
         print("skill_restore_session_cleanup_check: cannot read sources: %s" % exc)
         return 2
-    violations = check_skill_repo(skill) + check_chat_repo(chat) + check_minis_app(app)
+    violations = (check_skill_repo(skill) + check_chat_repo(chat) + check_minis_app(app)
+                  + check_chat_entry(entry) + check_minis_app_badge(app))
     if violations:
         print("FAIL skill_restore_session_cleanup_check")
         for v in violations:
@@ -491,11 +605,67 @@ class MinisApp : Application() {
             onSessionDeleted = { sid ->
                 runCatching { skillRepository.clearSessionOverrides(sid) }
                 runCatching { mcpRepository.clearSessionOverrides(sid) }
+                runCatching { SessionBadgeStore.clear(sid) }
             },
         )
     }
 }
 """
+
+# [da1030-A / I01 裂缝B] the badge queue left behind by the pre-fix hook.
+BAD_APP_NO_BADGE = GOOD_APP.replace(
+    "                runCatching { SessionBadgeStore.clear(sid) }\n", "")
+
+# Precision control: a call that exists, but NOT on the delete path — the
+# criterion must be scoped to the lambda body, not to the file.
+BAD_APP_BADGE_ELSEWHERE = GOOD_APP.replace(
+    "                runCatching { SessionBadgeStore.clear(sid) }\n", "").replace(
+    "    override fun onCreate() {\n",
+    "    override fun onCreate() {\n        SessionBadgeStore.clear(\"unrelated\")\n")
+
+# [da1030-A / I01] draft-promotion fixture. The `if (isDraft)` block carries
+# the full hop set the production file has.
+GOOD_ENTRY = """
+internal suspend fun ChatViewModel.ensureSession(): String {
+    if (realSessionId.isNotEmpty()) return realSessionId
+    val session = chatRepository.createSession(modelId = modelId)
+    realSessionId = session.id
+    if (isDraft) {
+        ChatViewModelStore.rename(sessionId, session.id)
+        migrateDraftResources(fromDraft = sessionId, toReal = session.id)
+        skillRepository?.renameSessionOverrides(fromDraft = sessionId, toReal = session.id)
+        mcpRepository?.renameSessionOverrides(fromDraft = sessionId, toReal = session.id)
+        runCatching {
+            (context.applicationContext as? MinisApp)
+                ?.webAppShortcutRepository
+                ?.renameSessionShortcuts(fromDraft = sessionId, toReal = session.id)
+        }
+        _browserTabPoolRef?.setSession(session.id)
+    }
+    return realSessionId
+}
+"""
+
+BAD_ENTRY_DROP_SHORTCUTS = GOOD_ENTRY.replace(
+    """        runCatching {
+            (context.applicationContext as? MinisApp)
+                ?.webAppShortcutRepository
+                ?.renameSessionShortcuts(fromDraft = sessionId, toReal = session.id)
+        }
+""", "")
+
+# Precision control: the call exists but sits OUTSIDE the `if (isDraft)` guard
+# (it would then also fire for already-real sessions, in the wrong window).
+BAD_ENTRY_OUTSIDE_DRAFT = GOOD_ENTRY.replace(
+    """        runCatching {
+            (context.applicationContext as? MinisApp)
+                ?.webAppShortcutRepository
+                ?.renameSessionShortcuts(fromDraft = sessionId, toReal = session.id)
+        }
+""", "").replace(
+    "    return realSessionId\n}",
+    "    webAppShortcutRepository?.renameSessionShortcuts(sessionId, session.id)\n"
+    "    return realSessionId\n}")
 
 BAD_APP_ORDER = """
 class MinisApp : Application() {
@@ -557,6 +727,31 @@ def selftest():
     bad_app = check_minis_app(BAD_APP_ORDER)
     expect_trip("late-wiring fixture (ISSUE-10)", bad_app, "AFTER chatRepository", failures)
 
+    # [da1030-A / I01 裂缝B]
+    bad_badge = check_minis_app_badge(BAD_APP_NO_BADGE)
+    bad_badge_elsewhere = check_minis_app_badge(BAD_APP_BADGE_ELSEWHERE)
+    good_badge = check_minis_app_badge(GOOD_APP)
+    if good_badge:
+        failures.append("compliant MinisApp badge fixture is not clean: %r" % good_badge)
+    expect_trip("no-badge-clear fixture (I01 裂缝B)", bad_badge, "does not call", failures)
+    expect_trip("no-badge-clear fixture (I01 裂缝B)", bad_badge, "SessionBadgeStore.clear(",
+                failures)
+    expect_trip("badge-clear-outside-lambda fixture (I01 裂缝B)", bad_badge_elsewhere,
+                "does not call", failures)
+
+    # [da1030-A / I01] draft promotion re-points the WebApp shortcuts
+    good_entry = check_chat_entry(GOOD_ENTRY)
+    if good_entry:
+        failures.append("compliant ChatSessionEntryExt fixture is not clean: %r" % good_entry)
+    bad_entry = check_chat_entry(BAD_ENTRY_DROP_SHORTCUTS)
+    bad_entry_outside = check_chat_entry(BAD_ENTRY_OUTSIDE_DRAFT)
+    expect_trip("dropped-renameSessionShortcuts fixture (I01)", bad_entry,
+                "renameSessionShortcuts(", failures)
+    expect_trip("dropped-renameSessionShortcuts fixture (I01)", bad_entry,
+                "Source Missing", failures)
+    expect_trip("renameSessionShortcuts-outside-isDraft fixture (I01)", bad_entry_outside,
+                "does not call", failures)
+
     print("selftest compliant skill repo    -> %d violation(s)" % len(good_skill))
     print("selftest raw-slugify skill repo  -> %d violation(s)" % len(bad_slug))
     print("selftest dropped-id skill repo   -> %d violation(s)" % len(bad_drop))
@@ -568,6 +763,11 @@ def selftest():
     print("selftest unwired-hook chat repo  -> %d violation(s)" % len(bad_chat))
     print("selftest compliant MinisApp      -> %d violation(s)" % len(good_app))
     print("selftest late-wiring MinisApp    -> %d violation(s)" % len(bad_app))
+    print("selftest MinisApp badge kept     -> %d violation(s)" % len(bad_badge))
+    print("selftest MinisApp badge elsewhere-> %d violation(s)" % len(bad_badge_elsewhere))
+    print("selftest compliant entry ext     -> %d violation(s)" % len(good_entry))
+    print("selftest dropped webapp re-point -> %d violation(s)" % len(bad_entry))
+    print("selftest re-point outside draft  -> %d violation(s)" % len(bad_entry_outside))
 
     if failures:
         for f in failures:

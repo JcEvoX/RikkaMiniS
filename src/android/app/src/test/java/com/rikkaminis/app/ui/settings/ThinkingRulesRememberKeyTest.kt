@@ -94,12 +94,19 @@ class ThinkingRulesRememberKeyTest {
     // -- precision control: nothing else in the section may be dragged along --
 
     @Test
-    fun `the Room loader and the pure UI flags keep their original keys`() {
+    fun `the Room loader keys its own data sources and the pure UI flags stay keyless`() {
         val code = codeOnly(section)
         assertEquals(
             "customRulesAndIds comes from the Room DAO, not from config — keying it on " +
-                "modelEntries would re-query Room on every catalog refresh",
-            setOf("instance.id", "reloadKey"),
+                "modelEntries would re-query Room on every catalog refresh. The one key " +
+                "beyond the screen-local pair is the resolver's revision: the same cache is " +
+                "rewritten from OUTSIDE this screen (backup restore, repository load, worker " +
+                "restore, minis-config), and without a key that moves on those writes the " +
+                "screen keeps the list it read when it opened and writes it back on the next " +
+                "edit — reverting the external write ([da1030-C ISSUE-05]). The revision only " +
+                "moves on cache mutations, so it costs no extra Room query on a catalog " +
+                "refresh.",
+            setOf("instance.id", "reloadKey", "rulesRevision"),
             rememberKeys(code, "val customRulesAndIds = remember"),
         )
         for (flag in listOf("reloadKey", "defaultsExpanded")) {
