@@ -4,6 +4,7 @@ import com.rikkaminis.app.data.model.ImageEndpointMode
 import com.rikkaminis.app.data.model.ProviderCredential
 import com.rikkaminis.app.data.model.ProviderInstance
 import com.rikkaminis.app.data.model.ProviderType
+import com.rikkaminis.app.provider.openai.openAIKeyAuthHeader
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -122,6 +123,45 @@ class ProviderRpcSymmetryTest {
         val (name, value) = probeAuthHeader(azureMode = false, key = "sk-test")
         assertEquals("Authorization", name)
         assertEquals("Bearer sk-test", value)
+    }
+
+    // -- [da1031-D ISSUE-07] the two faces are ONE body: `probeAuthHeader` is a
+    // -- thin wrapper over `openAIKeyAuthHeader`, so both must answer identically.
+    // -- Expectations are literals (never derived from the branch under test).
+
+    @Test
+    fun openAIKeyAuthHeader_azurePicksApiKeyHeader() {
+        val (name, value) = openAIKeyAuthHeader(azure = true, token = "sk-direct")
+        assertEquals("api-key", name)
+        assertEquals("sk-direct", value)
+    }
+
+    @Test
+    fun openAIKeyAuthHeader_nonAzurePicksBearerHeader() {
+        val (name, value) = openAIKeyAuthHeader(azure = false, token = "sk-direct")
+        assertEquals("Authorization", name)
+        assertEquals("Bearer sk-direct", value)
+    }
+
+    @Test
+    fun probeAuthHeader_delegatesToOpenAIKeyAuthHeader_azureBranch() {
+        assertEquals(
+            openAIKeyAuthHeader(azure = true, token = "sk-delegated"),
+            probeAuthHeader(azureMode = true, key = "sk-delegated"),
+        )
+        assertEquals("api-key" to "sk-delegated", probeAuthHeader(azureMode = true, key = "sk-delegated"))
+    }
+
+    @Test
+    fun probeAuthHeader_delegatesToOpenAIKeyAuthHeader_bearerBranch() {
+        assertEquals(
+            openAIKeyAuthHeader(azure = false, token = "sk-delegated"),
+            probeAuthHeader(azureMode = false, key = "sk-delegated"),
+        )
+        assertEquals(
+            "Authorization" to "Bearer sk-delegated",
+            probeAuthHeader(azureMode = false, key = "sk-delegated"),
+        )
     }
 
     @Test

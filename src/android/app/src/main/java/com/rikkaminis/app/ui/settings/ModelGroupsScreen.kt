@@ -386,6 +386,13 @@ fun ModelGroupsScreen(
                                 // signals like the default group does. Users can
                                 // raise or clear it in the group detail screen.
                                 contextLimitTokens = DEFAULT_GROUP_CONTEXT_LIMIT_TOKENS,
+                                // [da1031-D ISSUE-06] Cross-layer asymmetry fix:
+                                // the four-way sync for a new field means the UI
+                                // create path must also seed the "last selected"
+                                // memory (the toggle ON→OFF→ON restore reads it),
+                                // same value as contextLimitTokens. The Debug RPC
+                                // groupsCreate gets the same field in this batch.
+                                lastContextLimitTokens = DEFAULT_GROUP_CONTEXT_LIMIT_TOKENS,
                             )
                             providerRepository.addGroup(newGroup)
                             // Auto-set as primary default if it's the first group.

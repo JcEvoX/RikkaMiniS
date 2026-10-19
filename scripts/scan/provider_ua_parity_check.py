@@ -76,6 +76,18 @@ OPENAI_AUTH_REL = (
 )
 MAIN_SRC_REL = "src/android/app/src/main/java"
 API_KEY_LITERAL = 'header("api-key"'
+# [da1031-D ISSUE-07] The Azure key-header decision has two equivalent shapes,
+# because one body now serves both the okhttp builders and the debug
+# connectivity probe (the probe returns the pair as strings, so it never calls
+# header(...) itself):
+#   * builder form: header("api-key", token) inside applyOpenAIKeyAuth
+#   * pair form   : "api-key" to token, returned by openAIKeyAuthHeader
+# Either one counts as THE single source *in OpenAIAuthHeader.kt*; neither may
+# appear anywhere else. The contract is the decision, not the call shape.
+# NOTE: the pair form must stay as tight as this — a bare '"api-key"' would
+# false-positive on the sensitive-header deny-lists in debug/LLMRequestLog.kt
+# and backup/ConfigBackup.kt.
+API_KEY_DECISION_FORMS = (API_KEY_LITERAL, '"api-key" to')
 
 CTOR_RE = re.compile(r"\b(AnthropicProvider|GeminiProvider|OpenAIProvider)\s*\(")
 UA_ARG = "customUserAgent ="
@@ -529,9 +541,13 @@ def check_openai_outbound(provider_src, models_src, auth_src, adapters_src, main
           the same last-wins placement as the chat/responses builders. It was
           the one OpenAI builder that never applied it.
 
-      D2  `header("api-key"` exists in exactly ONE place — the package-level
-          `applyOpenAIKeyAuth` in OpenAIAuthHeader.kt — which both
-          `OpenAIProvider.applyKeyAuth` and `OpenAIModelsApi` delegate to. The
+      D2  the Azure key-header decision lives in exactly ONE place — the
+          package-level helper(s) in OpenAIAuthHeader.kt — which the chat
+          builders, `OpenAIModelsApi` and the debug connectivity probe all
+          delegate to; two shapes count as that one source (`header("api-key",
+          …)` on the builder side, `"api-key" to …` for the probe, which returns
+          the header pair as strings and never builds a request), while a
+          SECOND copy is refused in either shape. The
           models fetch used to hard-code `Authorization: Bearer`, so every
           Azure instance (which authenticates with `api-key`) 401'd, and the
           7-day cache row was keyed on URL+key so the two auth schemes shared
@@ -588,20 +604,23 @@ def check_openai_outbound(provider_src, models_src, auth_src, adapters_src, main
             "found (da1030 ISSUE-06 裂缝B: this is the single source the chat "
             "builders and the models fetcher both delegate to)"
         )
-    if API_KEY_LITERAL not in code_auth:
+    if not any(form in code_auth for form in API_KEY_DECISION_FORMS):
         v.append(
-            "OpenAIAuthHeader.kt: no '%s' literal (da1030 ISSUE-06 裂缝B: the "
-            "Azure branch must live here, not in a caller)" % API_KEY_LITERAL
+            "OpenAIAuthHeader.kt: no Azure api-key decision (%s) present "
+            "(da1030 ISSUE-06 裂缝B: the Azure branch must live here, not in a "
+            "caller)" % " | ".join(API_KEY_DECISION_FORMS)
         )
     for rel, text in main_sources:
         if rel == OPENAI_AUTH_REL:
             continue
-        if API_KEY_LITERAL in strip_comments(text):
+        _body = strip_comments(text)
+        _hit = next((f for f in API_KEY_DECISION_FORMS if f in _body), None)
+        if _hit is not None:
             v.append(
                 "%s: hard-coded '%s' outside provider/openai/OpenAIAuthHeader.kt "
                 "(da1030 ISSUE-06 裂缝B: the Azure key header has exactly one "
                 "source; a second copy is how the models fetcher ended up "
-                "Bearer-only)" % (rel, API_KEY_LITERAL)
+                "Bearer-only)" % (rel, _hit)
             )
 
     # -- D2b: the models fetcher threads + applies azureMode -----------------
@@ -1140,6 +1159,42 @@ BAD_OPENAI_AUTH_NO_FN = GOOD_OPENAI_AUTH.replace(
     "internal fun Request.Builder.applyOpenAIKeyAuth(", "internal fun Request.Builder.keyAuth("
 )
 
+# [da1031-D ISSUE-07] the pair shape of the same single source.
+GOOD_OPENAI_AUTH_PAIR = """
+package com.rikkaminis.app.provider.openai
+
+internal fun openAIKeyAuthHeader(azure: Boolean, token: String): Pair<String, String> =
+    if (azure) "api-key" to token else "Authorization" to "Bearer $token"
+
+internal fun Request.Builder.applyOpenAIKeyAuth(
+    azure: Boolean,
+    token: String,
+): Request.Builder =
+    openAIKeyAuthHeader(azure, token).let { (name, value) -> header(name, value) }
+"""
+
+BAD_OPENAI_AUTH_PAIR_NO_FN = GOOD_OPENAI_AUTH_PAIR.replace(
+    "internal fun Request.Builder.applyOpenAIKeyAuth(",
+    "internal fun Request.Builder.keyAuth(",
+)
+
+GOOD_OTHER_SOURCES_PAIR = [
+    ("src/android/app/src/main/java/com/rikkaminis/app/provider/openai/OpenAIAuthHeader.kt",
+     GOOD_OPENAI_AUTH_PAIR),
+    # a sibling provider with a DIFFERENT key header must stay clean
+    ("src/android/app/src/main/java/com/rikkaminis/app/provider/anthropic/AnthropicProvider.kt",
+     'builder.header("x-api-key", key).header("anthropic-version", "2023-06-01")'),
+    # a sensitive-header deny-list that merely contains the bare string
+    # "api-key" is NOT a header decision and must stay clean
+    ("src/android/app/src/main/java/com/rikkaminis/app/debug/LLMRequestLog.kt",
+     'private val SENSITIVE_HEADERS = setOf("authorization", "x-api-key", "api-key", "cookie")'),
+]
+
+BAD_OTHER_SOURCES_DUPLICATE_PAIR = GOOD_OTHER_SOURCES_PAIR + [
+    ("src/android/app/src/main/java/com/rikkaminis/app/provider/openai/OpenAIModelsApi.kt",
+     'val pair = "api-key" to apiKey'),
+]
+
 GOOD_OPENAI_MODELS = """
 object OpenAIModelsApi {
     suspend fun fetchModels(
@@ -1389,6 +1444,20 @@ def selftest():
     bad_dup = oai(others=BAD_OTHER_SOURCES_DUPLICATE)
     expect_trip("duplicate-api-key-literal fixture (D2a)", bad_dup, "hard-coded")
 
+    # [da1031-D ISSUE-07] the pair shape is the SAME single source, not a leak
+    good_oai_pair = oai(auth=GOOD_OPENAI_AUTH_PAIR, others=GOOD_OTHER_SOURCES_PAIR)
+    expect_clean("compliant openai-outbound (pair form) fixtures", good_oai_pair)
+    # precision: neither the sibling provider nor the deny-list counts as a copy
+    if any("AnthropicProvider.kt" in item or "LLMRequestLog.kt" in item
+           for item in good_oai_pair):
+        failures.append("pair-form fixtures: sibling/deny-list line flagged as api-key")
+    bad_auth_pair = oai(auth=BAD_OPENAI_AUTH_PAIR_NO_FN, others=GOOD_OTHER_SOURCES_PAIR)
+    expect_trip("auth-single-source-missing (pair form, D2a)", bad_auth_pair,
+                "applyOpenAIKeyAuth(' not found")
+    bad_dup_pair = oai(auth=GOOD_OPENAI_AUTH_PAIR, others=BAD_OTHER_SOURCES_DUPLICATE_PAIR)
+    expect_trip("duplicate-api-key-pair fixture (D2a)", bad_dup_pair, "hard-coded")
+    expect_single("duplicate-api-key-pair fixture (D2a)", bad_dup_pair, "hard-coded")
+
     bad_m_param = oai(models=BAD_OPENAI_MODELS_NO_PARAM)
     expect_trip("models-no-azureMode-param fixture (D2b)", bad_m_param, "no longer declares")
     bad_m_build = oai(models=BAD_OPENAI_MODELS_NO_BUILD_CALL)
@@ -1421,6 +1490,9 @@ def selftest():
     print("selftest openai passthrough order-> %d violation(s)" % len(bad_p_after))
     print("selftest openai auth single-src  -> %d violation(s)" % len(bad_auth))
     print("selftest openai api-key dup      -> %d violation(s)" % len(bad_dup))
+    print("selftest api-key pair-form src   -> %d violation(s)" % len(good_oai_pair))
+    print("selftest api-key pair-form dup   -> %d violation(s)" % len(bad_dup_pair))
+    print("selftest api-key pair-form nofn  -> %d violation(s)" % len(bad_auth_pair))
     print("selftest openai models no-param  -> %d violation(s)" % len(bad_m_param))
     print("selftest openai models no-build  -> %d violation(s)" % len(bad_m_build))
     print("selftest openai models key thread-> %d violation(s)" % len(bad_m_key))
