@@ -348,4 +348,90 @@ class ThinkingRuleEditorPreserveTest {
         assertFalse(body.has("thinking"))
         assertFalse(body.has("reasoning_effort"))
     }
+
+    // ── C. [da1033-I07] the dialog is seeded from the LIVE rule ──
+    //
+    // Source-shape assertions. The Compose screens cannot be compiled here (no Android
+    // SDK), so the decision these two files encode — "Save must not write back the copy
+    // the dialog opened with" — is pinned textually. The form-flexible half of the same
+    // decision is graded by `provider_remember_key_check.py` C14 / C15; these literals
+    // are the anchors, so they are expected values written out, not derived.
+
+    /** The nine form states `provider_remember_key_check.py` C14 grades. */
+    private val seedKeyedFormStates = listOf(
+        "label", "allModels", "pattern", "choice", "formatChanged",
+        "sendOffValue", "offValue", "path", "customValues",
+    )
+
+    @Test
+    fun editorFormStates_keyOnTheSeedTheyRead() {
+        val code = readRepoFile(EDITOR_REL)
+        for (field in seedKeyedFormStates) {
+            assertTrue(
+                "`var $field` is seeded from `seed`; without the key an external write " +
+                    "(minis-config / Debug RPC / backup restore) leaves the dialog on the " +
+                    "copy it opened with, and Save writes that copy back over it",
+                code.contains("var $field by remember(seed)"),
+            )
+        }
+    }
+
+    @Test
+    fun editorTransientUiFlag_staysKeyless() {
+        // Precision control: the criterion grades seed-derived form state, not
+        // "every remember must carry a key".
+        assertTrue(
+            "the dropdown-open flag derives from nothing and must stay keyless",
+            readRepoFile(EDITOR_REL).contains("var formatMenuOpen by remember {"),
+        )
+    }
+
+    @Test
+    fun editorDialog_isHandedTheLiveRule() {
+        val code = readRepoFile(SECTION_REL)
+        for (anchor in listOf(
+            "val editorLiveIndex = editorRequest?.existingId?.let { customIds.indexOf(it) } ?: -1",
+            "val liveSeed = if (req.existingId != null && !req.isNew && editorLiveIndex >= 0) {",
+            "customRules[editorLiveIndex]",
+            "request = req.copy(seed = liveSeed),",
+            "if (req?.existingId != null && editorLiveIndex < 0) editorRequest = null",
+        )) {
+            assertTrue("call-site anchor missing: $anchor", code.contains(anchor))
+        }
+    }
+
+    @Test
+    fun editorNewRulePaths_stillSeedThemselves() {
+        // "Add rule" and "Copy of ..." carry no existingId: the `!req.isNew` guard in the
+        // resolution is what keeps them on their own seed instead of a lookup.
+        val code = readRepoFile(SECTION_REL)
+        assertTrue(code.contains("!req.isNew"))
+        assertTrue(
+            "both new-rule entry points must keep existingId = null",
+            code.split("existingId = null").size - 1 >= 2,
+        )
+    }
+
+    /**
+     * Walk up from the test working directory to the repo root containing [relative].
+     * Gradle sets user.dir to the module dir; a sandbox JVM run can start anywhere
+     * under the repo — no fixed depth works.
+     */
+    private fun readRepoFile(relative: String): String {
+        val cwd = System.getProperty("user.dir") ?: "."
+        var dir: java.io.File? = java.io.File(cwd)
+        while (dir != null) {
+            val f = java.io.File(dir, relative)
+            if (f.exists()) return f.readText()
+            dir = dir.parentFile
+        }
+        throw java.io.FileNotFoundException("$relative not found from user.dir=$cwd")
+    }
+
+    private companion object {
+        const val EDITOR_REL =
+            "app/src/main/java/com/rikkaminis/app/ui/settings/ThinkingRuleEditor.kt"
+        const val SECTION_REL =
+            "app/src/main/java/com/rikkaminis/app/ui/settings/ThinkingRulesSection.kt"
+    }
 }

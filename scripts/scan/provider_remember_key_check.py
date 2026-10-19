@@ -90,6 +90,28 @@ Criteria (each fail-closed: missing anchor = RED, never silent skip):
       `val customRulesRevision` declaration must exist. Fail-closed on a
       missing mutator body.
 
+  C14 ThinkingRuleEditor [da1033-I07] — the dialog's nine form states are seeded
+      from `seed`, so each `remember(...)` whose initializer reads a `seed.<field>`
+      must carry a key that can tell one seed from another. Without it an external
+      write (minis-config / Debug RPC / backup restore) left the dialog on the copy
+      it opened with and Save wrote that copy back over the newer rule.
+      Graded on the DECISION ("does this form state re-initialise when the rule it
+      was seeded from changes"), not the spelling: `remember(seed)` and
+      `remember(request.existingId, seed.wireFormat)` both count, a key that never
+      moves with the seed (`remember(request.existingId)`) does not. Only the
+      initializer counts as a read — counting the key list would be tautological.
+      Fail-closed when no remember derives from `seed.` at all (editor reworked).
+
+  C15 ThinkingRulesSection [da1033-I07] — the dialog must be handed the rule as it
+      is NOW, not the snapshot `editorRequest` captured when the row was tapped.
+      Two arms: (a) the call's `request` argument is seeded from the LIVE columns
+      (`customRules` / `customIds`) and that derivation is selected by the captured
+      `existingId` — inline, or through a local declared for it; handing over the
+      raw captured request is what reverted the external write. (b) a
+      `LaunchedEffect` closes the dialog when the resolution says the rule is gone
+      (state must not be written during composition). New-rule paths (`isNew` / `existingId == null`) seed from
+      the request itself and must NOT be flagged.
+
 Usage:
   python3 provider_remember_key_check.py <repo_root>   # real-tree mode
   python3 provider_remember_key_check.py --selftest    # fixture mode
@@ -120,6 +142,8 @@ REL_USAGE_STATS = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/
 REL_THINKING_SECTION = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/ThinkingRulesSection.kt"
 # da1030-C
 REL_THINKING_RESOLVER = "src/android/app/src/main/java/com/rikkaminis/app/provider/thinking/ThinkingRuleResolver.kt"
+# da1033-E (I06 / I07)
+REL_THINKING_EDITOR = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/ThinkingRuleEditor.kt"
 
 # ---- [da1030-C ISSUE-05] C12 / C13 ----
 # The collected revision local may be named either way; both spellings are the
@@ -130,6 +154,17 @@ THINKING_LOADER_CALLEE = "thinkingRulesWithIds("
 RESOLVER_MUTATORS = ("setAllCustomRules", "setCustomRules", "restoreCustomRulesFromJson")
 RESOLVER_REVISION_DECL_RE = re.compile(r"\bval\s+customRulesRevision\b")
 RESOLVER_BUMP_RE = re.compile(r"customRulesRevision\.value\s*\+=")
+# C14 — the seed-derived form states of ThinkingRuleEditorDialog.
+SEED_FIELD_RE = re.compile(r"\bseed\.[A-Za-z_][A-Za-z0-9_]*")
+
+# C15 — live-seed resolution in ThinkingRulesSection.
+DIALOG_CALLEE = "ThinkingRuleEditorDialog"  # no paren: find_call_site appends one
+# `seed = <local>` inside the dialog call — the local must read the live columns.
+HOISTED_SEED_RE = re.compile(r"\bseed\s*=\s*([A-Za-z_][A-Za-z0-9_]*)")
+# (c) the close-on-vanished effect and the test that drives it.
+CLOSE_EFFECT_RE = re.compile(
+    r"LaunchedEffect\s*\([\s\S]{0,300}?\)[\s\S]{0,120}?\{[\s\S]{0,900}?editorRequest\s*=\s*null")
+VANISHED_TEST_RE = re.compile(r"<\s*0|==\s*-1|!in\b|==\s*null|isEmpty\(\)|isNotEmpty\(\)")
 # A cache WRITE (`customRulesCache = …`), distinct from the field declaration
 # (`private var customRulesCache: Map<…> = …`) and from passing it as an arg.
 CACHE_WRITE_RE = re.compile(r"\bcustomRulesCache\s*=\s*[A-Za-z_]")
@@ -717,6 +752,136 @@ def check_thinking_resolver(code):
                     if not bad else "; ".join(bad)))
     return results
 
+def check_thinking_editor(code):
+    """C14 [da1033-I07] — every seed-derived form state re-initialises with its seed.
+
+    Graded on the decision point, not the spelling: a key of `seed` itself, of the
+    exact `seed.<field>` the initializer reads, or of `request.seed`, all count; a key
+    that cannot move when the seed changes (e.g. `request.existingId` alone) does not.
+    Only the initializer counts as a read (same rule as C8/C9/C11) — counting the key
+    list would make the criterion tautological. Keyless counts as a miss.
+
+    Fail-closed: no seed-derived remember at all means the editor was reworked and
+    this criterion can no longer see what it guards → RED."""
+    results = []
+    calls = iter_remember_calls(code, "remember")
+    derived = 0
+    bad = []
+    for line_no, keys, _span, init in calls:
+        sources = sorted(set(SEED_FIELD_RE.findall(init)))
+        if not sources:
+            continue
+        derived += 1
+        if keys is None:
+            bad.append("L%d: keyless remember derives from %s" % (line_no, ",".join(sources)))
+            continue
+        tokens = [t.strip() for t in keys.split(",")]
+        seed_keyed = any(t == "seed" or t.endswith(".seed") for t in tokens)
+        if not seed_keyed and not all(src in keys for src in sources):
+            bad.append("L%d: initializer derives from %s but keys=[%s] cannot tell one seed "
+                       "from another" % (line_no, ",".join(sources), " ".join(keys.split())))
+    if derived == 0:
+        results.append(("C14", False,
+                        "no remember call in ThinkingRuleEditor derives from `seed.` "
+                        "(fail-closed: the dialog was reworked, re-derive this criterion)"))
+        return results
+    results.append(("C14", not bad,
+                    "all %d seed-derived remember call(s) key on the seed they read" % derived
+                    if not bad else "; ".join(bad)))
+    return results
+
+def _seed_assignment_text(code, name):
+    """The text of `val <name> = …` up to the end of its statement.
+
+    Multi-line initializers (an `if`/`when` expressing the seed) end at the first
+    non-blank line indented no deeper than the declaration itself; a single-line one
+    ends at its own newline. Returns None when the declaration is absent."""
+    m = re.search(r"\bval\s+" + re.escape(name) + r"\s*=", code)
+    if not m:
+        return None
+    line_start = code.rfind("\n", 0, m.start()) + 1
+    indent = len(code[line_start:m.start() + len("val " + name)])
+    base = code[line_start:].split("\n")[0]
+    base_indent = len(base) - len(base.lstrip(" \t"))
+    out = [base]
+    for line in code[line_start:].split("\n")[1:]:
+        if line.strip() and (len(line) - len(line.lstrip(" \t"))) <= base_indent:
+            break
+        out.append(line)
+    return "\n".join(out)
+
+def check_thinking_dialog_seed(code):
+    """C15 [da1033-I07] — the editor dialog is handed the LIVE rule, not the snapshot.
+
+    Two arms, both graded on the decision rather than the spelling:
+
+      (a) the `request` handed to `ThinkingRuleEditorDialog(` is seeded from the
+          live rule columns (`customRules` / `customIds`) AND that derivation reads
+          the captured `existingId` — either inline in the argument, or through a
+          local declared for the purpose. Handing over the raw captured request is
+          what let Save write the opening snapshot back over an external edit.
+      (b) a `LaunchedEffect` closes the dialog when the resolution says the rule is
+          gone. Deleting the rule externally must not be undone by Save
+          resurrecting it, and state must not be written during composition.
+
+    New-rule paths are deliberately NOT graded: they carry `existingId == null` /
+    `isNew` and seed from the request itself, so they cannot be "stale"."""
+    results = []
+    pos = find_call_site(code, DIALOG_CALLEE)
+    if pos < 0:
+        results.append(("C15a", False,
+                        "anchor `ThinkingRuleEditorDialog(` call not found (fail-closed: "
+                        "the dialog was dropped or renamed — re-derive this criterion)"))
+        results.append(("C15b", False, "no dialog call site to close (fail-closed)"))
+        return results
+
+    args = call_args(code, pos)
+    if args is None:
+        results.append(("C15a", False,
+                        "ThinkingRuleEditorDialog( has no balanced argument list (fail-closed)"))
+    else:
+        derivation = args
+        note = "inline"
+        if "customRules" not in args and "customIds" not in args:
+            m = HOISTED_SEED_RE.search(args)
+            seg = _seed_assignment_text(code, m.group(1)) if m else None
+            if seg is not None:
+                derivation = seg
+                note = "via `val %s =`" % m.group(1)
+        live = "customRules" in derivation or "customIds" in derivation
+        by_id = "existingId" in derivation
+        if live and by_id:
+            detail = ("ThinkingRuleEditorDialog( is seeded from the live rules and "
+                      "selected by the captured existingId (%s)" % note)
+            ok = True
+        elif not live:
+            detail = ("the `request` handed to ThinkingRuleEditorDialog( does not read the "
+                      "live `customRules` / `customIds` — it is the snapshot captured when "
+                      "the row was tapped, so Save writes it back over any external edit")
+            ok = False
+        else:
+            detail = ("the dialog is seeded from the live rules but the captured "
+                      "`existingId` does not select among them — the dialog would edit "
+                      "whichever rule happens to be first")
+            ok = False
+        results.append(("C15a", ok, detail))
+
+    m = CLOSE_EFFECT_RE.search(code)
+    if not m:
+        results.append(("C15b", False,
+                        "no LaunchedEffect assigning `editorRequest = null` — a rule "
+                        "deleted while the dialog is open would be resurrected by Save"))
+    elif not VANISHED_TEST_RE.search(m.group(0)):
+        results.append(("C15b", False,
+                        "the close effect does not test the resolved index for existence "
+                        "(`< 0` / `== -1` / `!in`) — it would close the dialog "
+                        "unconditionally"))
+    else:
+        results.append(("C15b", True,
+                        "a LaunchedEffect closes the dialog when the live lookup says the "
+                        "rule is gone"))
+    return results
+
 CHECKERS = (
     (REL_PROVIDER_LIST, check_provider_list),
     (REL_SHEET, check_sheet),
@@ -729,6 +894,8 @@ CHECKERS = (
     (REL_USAGE_STATS, check_usage_stats),
     (REL_THINKING_SECTION, check_thinking_rules),
     (REL_THINKING_RESOLVER, check_thinking_resolver),
+    (REL_THINKING_SECTION, check_thinking_dialog_seed),
+    (REL_THINKING_EDITOR, check_thinking_editor),
 )
 
 
@@ -1052,6 +1219,36 @@ fun ThinkingRulesSection(
     val sampleModelId = remember(instance.id, modelEntries, reloadKey) {
         providerRepository.firstModelId(instance.id)
     }
+    // da1033-I07: the dialog edits the LIVE rule, not the tapped snapshot.
+    val editorLiveIndex = editorRequest?.existingId?.let { customIds.indexOf(it) } ?: -1
+    LaunchedEffect(editorRequest?.existingId, editorLiveIndex) {
+        val req = editorRequest
+        if (req?.existingId != null && editorLiveIndex < 0) editorRequest = null
+    }
+    editorRequest?.let { req ->
+        val liveSeed = if (req.existingId != null && !req.isNew && editorLiveIndex >= 0) {
+            customRules[editorLiveIndex]
+        } else {
+            req.seed
+        }
+        ThinkingRuleEditorDialog(
+            request = req.copy(seed = liveSeed),
+            onDismiss = { editorRequest = null },
+            onSave = { rule ->
+                providerRepository.saveThinkingRule(instance.id, rule, id = req.existingId)
+                editorRequest = null
+                reloadKey++
+            },
+        )
+    }
+    // New-rule path: no live id to resolve — seeds itself.
+    editorRequest = ThinkingRuleEditorRequest(
+        existingId = null,
+        seed = ThinkingRule(kind = ThinkingRule.Kind.CUSTOM, label = ""),
+        isNew = true,
+    )
+    val customRules = customRulesAndIds.first
+    val customIds = customRulesAndIds.second
 }
 """
 
@@ -1079,6 +1276,54 @@ fun unrelated() {}
 # Precision control: touching a remember this criterion does NOT own (a Room
 # loader and two pure-UI flags, one keyless) must leave the gate green —
 # otherwise "any keyless remember reds" would masquerade as coverage.
+# da1033-I07 (C15) fixtures.
+
+# The pre-fix dialog region: a snapshot request, no live lookup, no close effect.
+FIX_THINKING_PREFIX_DIALOG = FIX_THINKING_CLEAN.replace(
+    """    val editorLiveIndex = editorRequest?.existingId?.let { customIds.indexOf(it) } ?: -1
+    LaunchedEffect(editorRequest?.existingId, editorLiveIndex) {
+        val req = editorRequest
+        if (req?.existingId != null && editorLiveIndex < 0) editorRequest = null
+    }
+    editorRequest?.let { req ->
+        val liveSeed = if (req.existingId != null && !req.isNew && editorLiveIndex >= 0) {
+            customRules[editorLiveIndex]
+        } else {
+            req.seed
+        }
+        ThinkingRuleEditorDialog(
+            request = req.copy(seed = liveSeed),""",
+    """    editorRequest?.let { req ->
+        ThinkingRuleEditorDialog(
+            request = req,""")
+
+FIX_THINKING_DIALOG_STALE_REQUEST = FIX_THINKING_CLEAN.replace(
+    "request = req.copy(seed = liveSeed),", "request = req,")
+
+FIX_THINKING_NO_CLOSE_EFFECT = FIX_THINKING_CLEAN.replace(
+    """    LaunchedEffect(editorRequest?.existingId, editorLiveIndex) {
+        val req = editorRequest
+        if (req?.existingId != null && editorLiveIndex < 0) editorRequest = null
+    }
+""", "")
+
+# Seeded from the live list but NOT selected by the captured id: the dialog would
+# edit whichever rule happens to be first.
+FIX_THINKING_SEED_NOT_BY_ID = FIX_THINKING_CLEAN.replace(
+    """        val liveSeed = if (req.existingId != null && !req.isNew && editorLiveIndex >= 0) {
+            customRules[editorLiveIndex]
+        } else {
+            req.seed
+        }""",
+    "        val liveSeed = customRules.first()")
+
+# Precision: the NEW-rule path seeds itself by design (no live id to resolve) —
+# a criterion that graded every `ThinkingRuleEditorRequest(` construction would
+# red here, so this fixture proves C15 only grades the dialog call site.
+FIX_THINKING_NEW_RULE_SEED = FIX_THINKING_CLEAN.replace(
+    'seed = ThinkingRule(kind = ThinkingRule.Kind.CUSTOM, label = ""),',
+    'seed = builtInRule.copy(kind = ThinkingRule.Kind.CUSTOM, label = "Copy of " + builtInRule.label),')
+
 FIX_THINKING_PRECISION_UNRELATED = FIX_THINKING_CLEAN.replace(
     "    var defaultsExpanded by remember { mutableStateOf(false) }",
     "    var defaultsExpanded by remember { mutableStateOf(false) }\n"
@@ -1164,6 +1409,55 @@ FIX_RESOLVER_NO_BUMP_RESTORE = FIX_THINKING_RESOLVER_CLEAN.replace(
 FIX_RESOLVER_NO_DECL = FIX_THINKING_RESOLVER_CLEAN.replace(
     "    val customRulesRevision: StateFlow<Long> = _customRulesRevision.asStateFlow()\n", "")
 
+# --- da1033-I07 (C14) fixtures: ThinkingRuleEditor seed-keyed form states ----
+
+FIX_THINKING_EDITOR_CLEAN = """package com.rikkaminis.app.ui.settings
+
+@Composable
+fun ThinkingRuleEditorDialog(request: ThinkingRuleEditorRequest, onDismiss: () -> Unit) {
+    val seed = request.seed
+    var label by remember(seed) { mutableStateOf(seed.label) }
+    var allModels by remember(seed) { mutableStateOf(seed.scope is ThinkingRule.Scope.AllModels) }
+    var pattern by remember(seed) {
+        mutableStateOf((seed.scope as? ThinkingRule.Scope.ModelPattern)?.pattern ?: "")
+    }
+    var choice by remember(seed) { mutableStateOf(FormatChoice.from(seed.wireFormat)) }
+    var formatChanged by remember(seed) { mutableStateOf(false) }
+    var sendOffValue by remember(seed) { mutableStateOf(formatOffValue(seed.wireFormat) != null) }
+    var offValue by remember(seed) { mutableStateOf(formatOffValue(seed.wireFormat) ?: "") }
+    var path by remember(seed) { mutableStateOf(formatPath(seed.wireFormat) ?: "") }
+    var customValues by remember(seed) { mutableStateOf(customEditableValues(seed.wireFormat)) }
+    var formatMenuOpen by remember { mutableStateOf(false) }
+}
+"""
+
+FIX_THINKING_EDITOR_KEYLESS_LABEL = FIX_THINKING_EDITOR_CLEAN.replace(
+    "var label by remember(seed) { mutableStateOf(seed.label) }",
+    "var label by remember { mutableStateOf(seed.label) }")
+
+FIX_THINKING_EDITOR_FOREIGN_KEY = FIX_THINKING_EDITOR_CLEAN.replace(
+    "var offValue by remember(seed) { mutableStateOf(formatOffValue(seed.wireFormat) ?: \"\") }",
+    "var offValue by remember(request.existingId) { mutableStateOf(formatOffValue(seed.wireFormat) ?: \"\") }")
+
+# Precision: the decision point is "does the key move with the seed", not the
+# spelling — the exact-field key and the two-key form must stay green.
+FIX_THINKING_EDITOR_FIELD_KEYED = FIX_THINKING_EDITOR_CLEAN.replace(
+    "var label by remember(seed) { mutableStateOf(seed.label) }",
+    "var label by remember(request.existingId, seed.label) { mutableStateOf(seed.label) }").replace(
+    "var customValues by remember(seed) { mutableStateOf(customEditableValues(seed.wireFormat)) }",
+    "var customValues by remember(seed.wireFormat) { mutableStateOf(customEditableValues(seed.wireFormat)) }")
+
+# Precision: a transient UI flag derives from nothing and stays keyless; the
+# `formatChanged` latch derives from nothing either, so neither is graded here.
+FIX_THINKING_EDITOR_KEYLESS_UI_FLAGS = FIX_THINKING_EDITOR_CLEAN.replace(
+    "var formatChanged by remember(seed) { mutableStateOf(false) }",
+    "var formatChanged by remember { mutableStateOf(false) }")
+
+FIX_THINKING_EDITOR_MISSING_ANCHOR = """package com.rikkaminis.app.ui.settings
+
+fun unrelated() {}
+"""
+
 CLEAN_TREE = {
     REL_PROVIDER_LIST: FIX_PROVIDER_LIST_CLEAN,
     REL_SHEET: FIX_SHEET_CLEAN,
@@ -1176,6 +1470,7 @@ CLEAN_TREE = {
     REL_USAGE_STATS: FIX_USAGE_STATS_CLEAN,
     REL_THINKING_SECTION: FIX_THINKING_CLEAN,
     REL_THINKING_RESOLVER: FIX_THINKING_RESOLVER_CLEAN,
+    REL_THINKING_EDITOR: FIX_THINKING_EDITOR_CLEAN,
 }
 
 
@@ -1319,7 +1614,7 @@ def run_selftest():
              variant(REL_THINKING_SECTION, FIX_THINKING_PRECISION_UNRELATED), failures)
     run_case("failclosed-missing-thinking-anchor", 1,
              variant(REL_THINKING_SECTION, FIX_THINKING_MISSING_ANCHOR), failures,
-             ("C11a", "C11b", "C12"))
+             ("C11a", "C11b", "C12", "C15a", "C15b"))
     # --- da1030-C: C12 (external rule writes must re-key the loader) -------
     run_case("c12-loader-no-revision-key", 1,
              variant(REL_THINKING_SECTION, FIX_THINKING_NO_REVISION_KEY), failures, ("C12",))
@@ -1336,6 +1631,32 @@ def run_selftest():
              missing(REL_THINKING_RESOLVER), failures, ("FILE",))
     run_case("c11c-detail-call-site-undrilled", 1,
              variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_NO_SECTION_ARGS), failures, ("C11c",))
+    # --- da1033-I07: C15 (the dialog is handed the LIVE rule) ---------------
+    run_case("c15-prefix-dialog-snapshot", 1,
+             variant(REL_THINKING_SECTION, FIX_THINKING_PREFIX_DIALOG), failures,
+             ("C15a", "C15b"))
+    run_case("c15-dialog-stale-request", 1,
+             variant(REL_THINKING_SECTION, FIX_THINKING_DIALOG_STALE_REQUEST), failures, ("C15a",))
+    run_case("c15-no-close-effect", 1,
+             variant(REL_THINKING_SECTION, FIX_THINKING_NO_CLOSE_EFFECT), failures, ("C15b",))
+    run_case("c15-seed-not-by-id", 1,
+             variant(REL_THINKING_SECTION, FIX_THINKING_SEED_NOT_BY_ID), failures, ("C15a",))
+    # precision: the new-rule path seeds itself and must NOT be flagged
+    run_case("c15-new-rule-seed-precision", 0,
+             variant(REL_THINKING_SECTION, FIX_THINKING_NEW_RULE_SEED), failures)
+    # --- da1033-I07: C14 (ThinkingRuleEditor seed keys) --------------------
+    run_case("c14-editor-keyless-label", 1,
+             variant(REL_THINKING_EDITOR, FIX_THINKING_EDITOR_KEYLESS_LABEL), failures, ("C14",))
+    run_case("c14-editor-foreign-key", 1,
+             variant(REL_THINKING_EDITOR, FIX_THINKING_EDITOR_FOREIGN_KEY), failures, ("C14",))
+    run_case("c14-editor-field-keyed-precision", 0,
+             variant(REL_THINKING_EDITOR, FIX_THINKING_EDITOR_FIELD_KEYED), failures)
+    run_case("c14-editor-keyless-ui-flags-precision", 0,
+             variant(REL_THINKING_EDITOR, FIX_THINKING_EDITOR_KEYLESS_UI_FLAGS), failures)
+    run_case("failclosed-missing-thinking-editor", 1,
+             missing(REL_THINKING_EDITOR), failures, ("FILE",))
+    run_case("failclosed-missing-editor-anchor", 1,
+             variant(REL_THINKING_EDITOR, FIX_THINKING_EDITOR_MISSING_ANCHOR), failures, ("C14",))
     if failures:
         print("SELFTEST FAILURES:")
         for f in failures:
