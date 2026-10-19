@@ -4,8 +4,8 @@
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
 - 合并范围：2026-08-03 ～ 2026-10-19，共 78 天
-- 条目总数：1976（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：2794140 / 总行数：35813
+- 条目总数：1988（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：2821803 / 总行数：36043
 
 ---
 
@@ -35806,6 +35806,236 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 - **★ 判读脚本坑（新）**：`union_ci_judge.py` 初版把 Publish 断言写死为 `skipped`（分支口径）→ 在 main 上假红。改为**分支感知**（main → 期望 `success`；非 main → `skipped`）。
 - 三项核查证据（合并前）：diff 34 文件 +3997/−95 无夹带/零冲突标记 · 本地 `gate_run --full` 108/108 · CI `head_sha` 三方一致 · 8 门带牙复验。
 - **待办**：文档三件套重建（dev-history-sync）+ 悬空分支清理（预计 4 支：3 fix + 1 integration），均待用户放行。
+
+<!-- 2026-10-19 03:08:25 -->
+## deep-audit-1028 全流程闭环（用户令「合并」「一并做」）：合并 + main CI 绿 + 分支清理 + 文档三件套
+
+
+**身份链终态**：main `889d645` →（代码合并 `83caac6`）→（文档合并 **`05f6fc435910506f9d8c40300db9d57532772328`**）。远端只剩 `main`。
+
+**① 合并**（用户令「合并」）：`integration/da1028 @ 6e6fc9a`（tree `a777fc76`）`--no-ff` → main `83caac6`，**main tree == 并集 CI 验证过的树逐字节一致**；推送 `889d645..83caac6`。
+**② main CI**：run **39155775665**（#2310）**success**（push 自动触发），job 日志 1,194,662 B 判读**全判据 PASS**（108 门 / ALL 329 CASES / 8 个新测试类逐条 PASSED / 假 FAILED 行 0）；**Publish 在 main 上 `success`** → 滚动 release `android-latest` = `v1.0.0+2310`（门控放行，非 skipped）。
+**③ 分支清理**（用户令「一并做」）：**5 支删除**（`loose_ends_1028.py` check → `cleanup_1028.py`，判据 `ahead_by==0`，fail-closed 拒绝预期外分支）：3×`fix/da1028-*` + `integration/da1028` + `docs/dev-history-1028`，全 http 204。**三源核实**：`ls-remote --heads` 只剩 main · REST 按名探测 4/4 → 404 · 本地跟踪 ref 已清（`fetch --prune` + `update-ref -d`）。
+**④ 文档三件套**（用户令「一并做」）：重建 **1976 条 / 78 天**（前值 1969/77，单调增无丢失）；SAGAS 24 主题 / orphans 180 / multi4 128；脱敏两轮 **`Remaining sensitive: NONE`**（main+INDEX 36 处 / SAGAS 0）；结构检查全过（main anchors 1976 == header 1976 · outOrder 0 · fences 82 偶）；README 计数 1969/77 → **1976/78** 两处更新。
+**⑤ 纯文本例外再次成立**：diff 面仅 `docs/dev-history/**`（4 文件 +186/−23）→ 不 dispatch、不等 CI，`--no-ff` 直接合并 → main `05f6fc4`；**实测 docs 的 main push 未触发新 run**（CI 桥仍指 39155775665）✓。
+
+**★ 判读脚本坑（新）**：`union_ci_judge.py` 把 Publish 断言写死 `skipped`（分支口径），在 main 上假红 → 改为**分支感知**（main → `success`；非 main → `skipped`）。凡「同一 workflow 在 main 与非 main 行为不同」的判据都要先问清线上口径。
+
+<!-- 2026-10-19 03:13:25 -->
+## 审计背景包 v11/v8 升级完成（用户令「为下一步的审计做准备：背景文件+提示词挂到文件夹子文件夹」）
+
+
+**交付位置**：`/var/minis/mounts/笔记/RikkaMinis审计背景包/`（= 挂载「笔记」的子文件夹）
+- `audit-context.md` = **v11**（473 行 / 133918 B，sha256 `0cc7f71e…1acfff`）
+- `audit-prompt-v8.md` = **v8**（323 行 / 44259 B，sha256 `e9a937f0…392566`）
+- `RikkaMinis-83caac6.zip` = **本目录首次自带源码 zip**（16.5 MB / 1635 条目，`git archive --prefix=RikkaMinis-83caac6/ 83caac6` 直切基线；抽 3 文件与 `git show 83caac6:<path>` 逐字节 MATCH）
+- `README.md` 重写（版本表 + 基线口径 + 用法 + 维护动作）；旧版 v10/v7 在 `archive/`（根目录已无 v7）
+
+**基线切换**：889d645 → **`83caac6`**（1028 收口树；其上文档提交 `05f6fc4`，`src/` 树两提交间**零差异** ⇒ zip 切任一个都可，实测 `git diff --stat 83caac6 05f6fc4` 仅 docs/dev-history 4 文件）。
+
+**v11 增量（33 处定点补丁）**：身份链/18 个被改 `.kt` 行号漂移警告 + 版本行；§1 规模 1095 `.kt`（481 JVM 测试）/ main 601 `.kt` 21.5 万行；§4.1 改「十五轮硬数据」+ 指标表（连续 10 轮 0 P0 / 连续第四轮判级 0 修正 / 报告失真两种旧形态回潮）+ **6 条链延伸**（守卫装错层→锁装错层第 4 连、remember 键第 8/9 连「键存在但元素不全」、注册表漏登第 3 连、primed 缓存第 3 次同形、有界读换轴「API 版本越界」、清理缺口第 5 连、双观察者第 2 连「深链+单次 effect」）；§5 新增「1028 轮增量」（**0 新建门 / 8 道扩展 / 门 108 夹具 329 不变**，含「门级差分探针」作为最强证据形态）；§6 负决策 54→**64** 条（55–64：writeVersion 判据严格、valueText 键取舍、第二份 pruner 不合并、body 摘要备选、run.sh 绝对路径、androidTest 未验、门行号=剥注释行号、editingEntry=null 未采纳、Live Updates 未同步、R1 真机未验）；§7 基线支数 180 + 1028 再犁段（`agent`/`logging`/`offload`/`debug` 四包**首次被犁**）+ latent ⑰⑱⑲ + 落点 **(e)「既有单源未接满」的调用点普查**（1028 最值钱的搜法：单源已在、调用点没接）；§8 新增「1028 没有新形态、两种旧形态回潮」块；§8.1 新增 3 条机制样板（双向对表 / 外部写回流两种形态 / 终止与消费路径全枚举）。
+
+**v8 增量（10 处定点补丁）**：标题/基线对齐/校准数字（连续十轮成立、连续四轮 0 修正）/§6 负决策数 64；§1.1 落点第 5 项（既有单源未接满）+ v8 边际变化段；**新增 §2.0f**（1028 失真=两种旧形态回潮：①路径前缀猜错 `data/SoulStore.kt` 实为 `agent/SoulStore.kt` ②调用点计数虚高 11→实测 9 且把同族第二实现算成调用点）+ 两道硬动作；§5 自检清单 +2 项。
+
+**★ 事故与纪律（首版踩坑，已写进 README 维护节）**：首版用**整文件 `file_write` 覆写了根目录 `audit-context.md`**（去年同款家族第 N 次），靠 `archive/audit-context-v10.md` 恢复。**新纪律：背景包只许「工作副本 + 逐处锚点唯一命中的 fail-closed 补丁脚本 + sha256 对拍 + `cp -p` 装机」**，禁止整文件重写；zip 一律 `git archive` 直切基线 commit。
+**装置细节**：补丁脚本两次因锚点细微差异（全角 `（d）` vs ASCII `(d)`、`|` 前空格）+ 自身字符串内 ASCII 引号（`"把代码改回旧形状"` 截断 Python 字符串）失败 —— **fail-closed 设计与逐条 count 断言把这三类问题全挡在写盘之前**，零覆盖。
+**另一处自伤**：v8 新落点插错位置（§1.1 编号 1/2/3/5/4），用 `fix_order.py` 换段复原为 1..5。
+
+<!-- 2026-10-19 03:35:39 -->
+## deep-audit-1028 真机验证（部分闭环，余项攒波统一验）
+
+
+**装机**：v1.0.0+2310（versionCode 220002310）@ 03:16 == main CI #2310 @ `83caac6` 产物；行为级旁证 = `background.overlay` 可读（旧包必报 unknown_path）。
+
+**已验（机械证据）**：①I03b overlay 注册 get+topic-help 双证，**三源一致**（registry false == DEFAULT_BG_OVERLAY_ENABLED false == `applyOverlayState enabled=false`，证明注册指向同一 prefs key）；②I03a envvars / I04 logs.enabled 注册面可读；③I04 读路径 `get soul.body` ↔ SOUL.md 逐字一致；④I01 并发往返 10/10 落库、`cancel --all pending_cleared:10` 逐位吻合、无死锁；⑤启动后健康（无崩溃、error-snapshot 停在装包前、E 行全系统噪声）。
+
+**结构性不可验**：I07/I08 = MinisApp.kt:668-69 **DEBUG-only，release 不装 DebugServer 与 handler**（另 I07 的 NoSuchMethodError 只在 Android 8–12，本机 API 35 命中不到）；I05 = `pruneShareDir` 无日志桩 + camera-photos/photos-export 在 filesDir 私有（shell uid 不可读），行为面只剩「拍照/导出不炸」。
+
+**余项**：4 项用户手验（I06 深链热启动 / I04 Soul 回流 / I02 thinking rules / I03a 备份导出 grep envvars.privacyMode）已带触发条件+步骤登记 **backlog §1028-VERIFY**（216 段，机械门 OK；触发=下一波修复合并装机后统一验，用户 2026-10-19 指示「先放着，攒波」）。
+
+**★ 新判据（已补进 sandbox-limits.md A19）**：并发跑 offload 工具（≥5 路）**输出丢但动作照常执行完**——10 路 schedule 只回显 5 个 id、库里 10 条全落库；阈值与工具无关与路数有关（3 路 0 丢/6 路丢 2/8 路丢 3~4/20 路丢 12）。⇒ 并发 burst 里「无输出」≠「无副作用」，**绝不按输出缺失重试写操作**；写类 offload 一律串行。
+
+<!-- 2026-10-19 07:41:37 -->
+## deep-audit-1029 FIX-B 收口：ISSUE-03（记忆编辑屏主线程同步 IO + SOUL 缓存回流）—— `fix/da1029-b-memory-io` @ `98c0fc5`，CI #39176155210 绿，停在分支
+
+
+**身份链**：基线 main `83caac6` → 单提交 **`98c0fc59e2cbe307b5e539853dc2a2608b4988e8`**（3 文件 +254/−26）→ branch dispatch CI **39176155210 success**，本地 HEAD == 远端 tip == CI `head_sha` **三方逐字符一致**。**未合并 main**。报告 `fix-reports/FIX-B.md`（8 节 / TODO 0 / 224 行）；backlog **§1029-B**（R1–R8，机械门 216→**217 段**，判 OK，no-触发条件 仍 3）。
+
+**修法**：①**裂口 A（P1）** `MemoryFileEditScreen` 两处阻塞 IO 上主线程 —— `remember(fileName){mutableStateOf(memoryRepository.readFile(...))}`（首帧组合期）与 Save `onClick` 内 `saveFile`。改为 `LaunchedEffect(fileName){ withContext(IO){ readFile } }` + `rememberCoroutineScope().launch{ withContext(IO){ saveFile } }`，Toast/状态赋值留在 IO 块**外**（scope 是 Main 派发）。同屏两个邻居（`listAllFiles`/`deleteFile`）**早已**包 IO = 「接了一半」同族（1023-B/C 家族）。②**裂口 B（P2）** raw `saveFile` 绕 `SoulStore.save` 且**未** `SoulStore.refreshCache` → `cachedMetadata`/1028-B 的 `writeVersion` 停在旧值；补 `if (fileName == SOUL_FILE_NAME) SoulStore.refreshCache(context)`（复用既有 `SOUL_FILE_NAME` 单源常量，未新增 `"SOUL.md"` 字面量），**孪生屏 `SessionMemorySheet.kt:210-226` 早已正确调** = 又一例「同一单源、一个调用点没接」。③**异步读的首帧空串**：工单点名核实 → viewer 无害，但 **Edit 入口有害**（空 base 上编辑后 Save 会把键入 splice 进 `""` 覆盖真文件）= 数据丢失；加**单标志**门控 `IconButton(enabled = isLoaded, ...)`（1 行 diff、零重排，非状态机）。
+
+**门**：`memory_ui_wiring_check.py` **0 新建门** —— 判据 B 调用点集追加 `readFile`/`saveFile`（规则本体复用）；**新判据 D**（`MemoryFileEditScreen`：`LaunchedEffect` + `scope.launch` + saveFile 所在 IO 区域必含 `SoulStore.refreshCache(`，**fail-closed on 函数锚点**）。selftest 夹具 **7 → 12 臂**（V6–V10）。带牙标记沿用 `MEMORY_UI_WIRING_SELFTEST=PASS`。**门先于修复落地 = 红**：真树差分 pre RED（逐条指名 readFile/saveFile 在 IO 外 + 无 LaunchedEffect/scope.launch）→ post GREEN（两个臂都是**真源码、零夹具**）。
+
+**装置四层读数**：门 selftest **12 臂 PASS** · 真树 rc=0（对照 PRE rc=1）· 邻门子集 **GREEN** · 行为层 **JVM 5 tests PASS**（**逐字编译真生产 `MemoryRepository.kt`**，4 个 android 面 stub，其中 **`SoulStore` stub 由 `gen_stubs.py` 从真源码生成**（正则抽 `const val FILE_NAME`，命中≠1 即拒写）—— 否则「断言 `SoulStore.FILE_NAME=="SOUL.md"`」测的是 stub = 标准自指陷阱）· 形状层 pre/post 双臂 + 6 臂 selftest · 变异矩阵 **M1–M5 全按预期**（M4 Toast 进 IO / M5 去 Edit 门控 = **门绿形状红**的刻意分层）。CI 日志 1,188,029 B：26 步 `failed=[]`、唯一 skipped `Publish to Releases`（main 门控）、`[108/108]` 门头 108 个 distinct、`Summary: 108 passed, 0 failed`、`ALL 329 CASES PASS`、两个新用例逐条 PASSED、含 `FAILED` 而不含 `PASSED` 的行 **0**。
+
+**★ 本轮三条可复用教训（装置层）**：
+1. **`.replace` 锚点的缩进必须逐字符对拍** —— 首版把 16/20 空格写成 12/16，锚点静默命中 0 次 = 空臂；已加**夹具漂移守卫**（四段锚点在夹具里不是恰好 1 次即 `return 1`）当场抓红。
+2. **隐式缩进不是左边界** —— `"        scope.launch {\n"`（8 空格）在夹具里命中 **2** 次，因为 20 空格缩进那行**包含**这 8 空格子串。凡以空白开头的锚点**必须带前导 `\n`**。
+3. **门有「位置参数」与 `--root` 两种调用形态** —— `extra_days_container_guard.py --root X` **静默扫 0 文件并报假红**（`found 0 EXTRA_DAYS writers`；该门在基线也一样红，说明是调用形态错、不是代码坏），`scan.sh` 用的是位置参数。判读任何门输出前先看 `scan.sh` 的调用形态；`gate_run.sh` 的回退会自动兜住，**手动裸跑不会**。
+
+**装置耐久性（新）**：JVM 探针 ①运行时 classpath 缺 `kotlin-stdlib.jar`（`NoClassDefFoundError: kotlin/jvm/internal/Intrinsics`，kotlinc 能编但 java 跑不了）；②`set -eu` 下 `java … ; rc=$?` 会被 `set -e` **提前终止**（脚本静默停、日志写一半）→ 改 `java … || rc=$?`。绝对路径解析（1028-B 教训）继续保留。
+
+**残留（R1–R8 全带触发条件）**：R1 真机三条行为级（200KB 打开不卡 / 编辑 SOUL.md 后 Settings → Soul 当场跟随 / Toast 时序不变）· R2 `MemoryRepository` 仍同步 API · R3 孪生屏 `SessionMemorySheet.saveFile` 仍同步（半径外）· R4 连点 Save 的并发窗口（字节相同、后果为零，登记不修）· R5 门的 `enabled = isLoaded` 是形状判据（等价写法会红）· R6 装置层级（UI 半边无编译面）· R7 Toast 位置只在形状层（门层刻意不查）· R8 `isLoaded` 是本支新增行为（工单列为可选项）。
+
+<!-- 2026-10-19 07:45:41 -->
+## FIX-F 收口：deep-audit-1029 ISSUE-07（`android-shizuku-cli exec` 选项作用域，两裂口均 P1）—— `fix/da1029-f-shizuku-argv` @ `df76dfc`，CI #39176352125 绿，停在分支
+
+
+**身份链**：基线 main `83caac6` → 分支 `fix/da1029-f-shizuku-argv` @ **`df76dfc85bdf24e4046bc25ad9626b93df4f4d2a`**（父 = 基线，单提交，3 文件 +350/−8 = 1 生产 `.kt` + 1 测试 `.kt` + 1 门 `.py`）→ 远端 tip == 本地 HEAD == CI `head_sha` **三方逐字符一致**。CI = `workflow_dispatch` **39176352125 success**（23:24:06Z → 23:41:05Z，16.9 min，**26 步 0 失败**，唯一 skipped = Publish 非 main 门控）。**未合并 main**。报告 `shared/work/deep-audit-1029/fix-reports/FIX-F.md`（8 节 / TODO 0）；backlog **§1029-F**（appended，219 → **220 段**，机械门判 OK）。
+
+**缺陷（报告 0 失真，行号全中）**：①`handle` 用 `split.withoutGroup`（全 argv 去 group）构造 parser → `exec grep -q foo /p` 的 `-q` 被 `OffloadArgs.kt:70` 收成 flag → 命中 `OffloadOutput.formatBody` 的 `hasFlag("q","quiet")` → **非 0 退出时只回 `error`、丢掉整个 `data`**（与 `handleExec` :961-963 明文承诺相反；= 1028-A DebugOffloadHandler 同族第 5 次）；②`EXEC_HELP` 承诺的 `--timeout-ms N` 被 `rest.joinToString(" ")` 拼进 `sh -c` 执行、且 parser 永远读不到（默认 30s 生效）。
+**修法**：`ShizukuArgv` 增 `execOptionTokens`（默认 `emptyList()`）→ `splitShizukuArgv` 在 `group == "exec"` 时把 `trailing` 交给新 helper `stripExecTimeoutTokens`（返回 `(干净载荷, CLI 自己的选项)`）→ `handle` 的 parser 按 group 分流（exec 用 `execOptionTokens`，其余仍 `withoutGroup`）→ `EXEC_HELP` Notes 补三行。`:75` 的 `rest` 行与 `handleExec` **逐字未动**（门的判据 9/11 锚点硬约束）。**只认良构数字值**：非数字 `--timeout-ms fast` / 结尾裸 `--timeout-ms` 留在载荷交给 shell（过度剥离会静默啃子命令参数）。
+
+**★ 本支可复用手法（四条）**：
+1. **「锚点必须逐字保留」与「必须改这一行」的冲突解法 = `if/else` 分支**：判据 1 要求源码逐字含 `OffloadArgs(split.withoutGroup, booleanFlags = noValueFlagsFor(group))`，而修法要求 exec 换集合 → 写成 `if (group == "exec") { OffloadArgs(split.execOptionTokens, …) } else { OffloadArgs(split.withoutGroup, …) }`，**锚点在 else 分支原样存活**，判据 1 与判据 13 同时绿。凡「既有门锚点 = 缺陷行」的工单都用这招。
+2. **变异矩阵的「层归属」要诚实标注，且要设计出「仅 JVM 红」的臂**：M1（去掉数字校验）/M2（`-` token 泄漏进 parser 槽）/M4（过度隔离丢 leading）→ **门绿 + JVM 红**（形状没变、语义坏了）；M3（`handle` 恢复 `withoutGroup`）/M5（剥离从不接线）→ **门红 + JVM 侧 `EXTRACT-REFUSED`**（wiring 在不可编类里，见 3）。`pre` 镜像臂同样落在**装置拒绝层**（`REFUSING: not the fixed tree` 列四个缺失锚点）——不是测试级红，报告里如实分开写。
+3. **extract 装置的 fail-closed 要分两档**：**前置 `FIXED_SHAPE` 检查**（在切片之前跑，报「这不是固定树」而不是「第一个找不到的锚点」）+ 每块 `anchor count != 1` 即拒。前者让 pre 臂的读数可读（点名 4 个缺失形状），后者防锚点漂移静默改错地方。
+4. **身份断言的粒度选择**：`extract.py` 只断言**存在性**（`stripExecTimeoutTokens(tail)` 被调用、`execOptionTokens = ` 槽位在），**不断言组合语义**（`leading + execOptions`）——否则 M4 这类语义变异会被装置拒绝掉而不是被测试抓住，JVM 层就失去了「测试真的有牙」的证据。职责划分：装置拒「错文件」，测试抓「对形状里的错行为」。
+
+**装置**：仓外 `probe-f/` + 软链 `repo-f/probe`（`.git/info/exclude`）；`extract.py`（按字节切 10 块 + `OffloadArgs/OffloadOutput` 逐字副本 + `AppLogger` stub，每块打印 sha256）→ `run.sh`（单次 kotlinc 一次性喂全部文件 + `JUnitCore`，**tree 参数化**）→ `arm.sh`/`mutations.sh`/`mut.py`（只做字节编辑 + sha256 对拍，不碰 git 不编译）。四层读数：门真树 **13/13 rc=0** · 门 selftest **13 breaker + 2 extra 全精确红**（新标记 `SHIZUKU_ARGS_SELFTEST=PASS criteria=13 breakers=13 extra=2`）· JVM **OK (22 tests)**（14 既有 + 8 新）· 变异 5 臂还原 5/5 sha256 一致 + 复绿 + `handler sha256 MATCHES HEAD blob`。邻门子集 `--subset --changed` **1/1 GREEN**；3 道 `rglob("*.kt")` 门直接跑 rc=0，**实测 py3.12 rglob 不跟随目录软链**（probe `.kt` 可见数 0、全树仍 1095）。
+
+**★ 两处口径偏差（已登记 §1029-F R4）**：①工单说「新增判据 12」，但该门判据 12 早已存在（`--data` opt-out）→ 实际新增为**判据 13**，顺手补齐 docstring 缺失的 8–12（历史漂移）；②本门独有的 selftest 标记**只在本地可见、CI 日志看不到**（`test_scan.py` 只回显自己的断言句）→ CI 侧带牙证据以 `✅ shizuku_args_check selftest has teeth (gate flips red on every criterion)` 为准；要让新标记进 CI 需改共享的 `test_scan.py`（本轮冻结，未改）。
+**同族扫描**：全 `sandbox/offload/` 只有 `ShizukuOffloadHandler.kt` 一处构建 `sh -c` 命令行，兄弟 `DebugOffloadHandler.kt` 已由 1028-A 做隔离 → **无第三处同缺陷**（半径不扩）。
+
+<!-- 2026-10-19 07:48:42 -->
+## FIX-D 收口：deep-audit-1029 ISSUE-05（语音族 UA 缺口）—— `fix/da1029-d-voice-ua` @ `4c7ad80`，CI #39176720024 绿，停在分支
+
+
+**身份链**：基线 main `83caac6` → 单提交 `19ceb02`（3 生产 .kt +204/−2 + 测试 +204）→ 门扩展 `4c7ad80`（provider_ua_parity_check.py +261）→ CI run 39176720024 success，本地==远端==CI head_sha 三方逐字符。**未合并 main**。报告 `fix-reports/FIX-D.md`（8 节）；backlog §1029-D（221 段，机械门 OK）。
+
+**修法**：①`VoiceProvider` 增构造参数 `var customUserAgent: String? = null`（11 子类 3 参 super 不动），`executeRequest`（全家族唯一 HTTP 出口）接 `applyUserAgentOverride(customUserAgent)`；②讯飞 TTS WebSocket（唯一绕过 executeRequest 的语音请求）同接；③`VoiceProviderFactory.make` 改 `build(...).also { it?.customUserAgent = instance.customUserAgent }` 单点注入（build 内 2 early return + 11 臂 when）。**语义核实**：对话链路全走单参形态（null/blank → 主动写 `Minis/<ver>` 品牌 UA），语音侧同形 → 无 UA 时语音从 okhttp/4.12.0 变 Minis/ 是有意的行为变化。报告失真 1 条：单源 `provider/UserAgentHeader.kt` 不存在，实为 `UserAgentOverride.kt:29`。
+
+**★ 最值钱的装置手法：JVM 行为层跑「真实生产文件全量编译」而非切片**——voice 三件 + VoiceModels + UserAgentOverride + CallCancellation + GeminiBasePath + KeyRoulette 逐字节副本 × 手写 android stub（Log/Base64/Build/BuildConfig + ProviderInstance/LLMModel 最小 stub）× **真实测试文件字节切片**（extract.py fail-closed）× okhttp 4.12.0+mockwebserver（Maven Central 现拉，落 probe/jvm/libs）→ post 9/9 GREEN（MockWebServer 真网络断言线上 UA 头）。baseline 臂 COMPILE-FAILED `unresolved reference 'customUserAgent'` = 属性新增的证据。负控 5 臂（mutate.py 字节编辑+锚点恰好命中断言，变异只落 probe/jvm/mut/ 副本，**git 工作树零接触**，无需还原/sha256 对拍）+ 门级差分（真源码树，post 干净/4 臂各中）。CI 日志判读：新测试 9/9 逐条 `MemoryGateAndProviderUaTest > … PASSED`、`Summary: 108 passed, 0 failed`、`ALL 329 CASES PASS`、FAILED 非 PASSED 结尾行 0。
+
+**★ 装置坑（新，写进经验）**：**形状钉测试 `readRepoFile` 按 user.dir 向上找文件 → 变异臂读到原始工作树而非变异副本**（m2 首跑假绿：WS 无行为测试、形状钉读 pristine 文件 → 9/9 全绿）。修法 = run.sh 把 java cwd 指向变异副本根。判据矛盾（期望红却绿）= 装置咬合不良的信号。另两个小坑：门 selftest 期望串要与门真实措辞逐字对齐（差一词假红）；切片 `@Test` 期望数首版写 7（实 9）被 fail-closed 当场抓红。
+
+<!-- 2026-10-19 07:50:39 -->
+## FIX-C 收口：deep-audit-1029 ISSUE-04 + ISSUE-09（锁外写回 / 同文件不对称）—— `fix/da1029-c-lock-scope` @ `c09bbe9`，CI #39176651703 绿，停在分支
+
+
+**身份链**：基线 `83caac6` → 分支 @ **`c09bbe92630d8fbfb5cd7d4c1736aeffbbd3d518`**（父=基线，单提交，6 文件 +495/−6）→ CI run 39176651703 success，本地 HEAD == 远端 tip == CI head_sha 三方逐字符一致。**未合并 main**（.kt 验证面，起手权在用户）。报告 `fix-reports/FIX-C.md`（7 节）；backlog §1029-C（221→222 段，shared_append 安全追加）。
+
+**修法**：①I04 `recordSkillUse` 发布点移进 `synchronized(addLock)`（`val next = synchronized(...){...}` + 锁外 `_skills.value = next` → 块内 `_skills.value = mapped`），注释补 `[da1029-C]`；②I09 `write()` 的 `buildLine` 移进 `synchronized(writeLock)`，与 `writeTerminalOnce` 对称。
+
+**★ 本支可复用手法（四条，下批照抄）**：
+1. **真源差分探针（真源码、零夹具）**：`git worktree add` 基线 commit → 同两门跑基线树 → 双 RED 且逐条指名本支新增判据（I04「publishes only OUTSIDE」/ I09「buildLine at body offset 21 of write is outside」）；修好树同两门 GREEN。比夹具强：证明门能分辨真实代码形状。
+2. **JVM 差分臂的「基线 shipped 测试仍全绿」**：基线树 JVM=FAIL 时 shipped 旧测试 46+10 全 OK、只有新探针测试 2/2 红 → 分辨力在新探针，不在别处（红集 = 本支两条后果逐条指名）。
+3. **clock/ts 探针把「构行在锁外」撑成确定时序**：线程 A 采样 ts=100 后等 B 写完（ts=200）再落盘；修好前 sink=[50,200,100]（ts 倒挂）/ 修好后 [50,100,200]。期望值 `assertEquals(listOf(50L,100L,200L), events.map{it.getLong("ts")})` 写死字面量——CI 变异 m2 实测 `expected:<[50,100,200]> but was:<[50,200,100]>`。这是「ts 采样与落盘行序可倒挂」的 1:1 机械证据，且两个方向都确定（修好侧 B 被 monitor 挡住，1s 宽限后 A 先落盘）。
+4. **受控写窗口（BlockingSkillStore：首写 gate+release）**：把 `recordSkillUse` 的「compute-under-lock, publish-after」从罕见 interleave 变成确定时序——判别臂（第二线程在窗口内跑完=失败，锁归属）+ 语义臂（镜像落后一次自增 / 并发 add 被抹）双层。mut1 实测两条语义臂全中。
+
+**变异矩阵（5 条，字节级 + sha256 还原全 MATCH）**：m1 publish-outside → 门+JVM 双红（两条语义臂）；m2 buildline-unlocked → 门+JVM 双红（ts 倒挂字面量）；m3 `_skills.value = _skills.value`（形状合法、语义死）→ **门绿 JVM 红=分层归因**；m4 同锁不同 RHS（内联 map）→ 双绿 = 门判据刻意落在锁归属而非 RHS 形状；m5 `writeTerminalOnce` 出锁 → 门+JVM 双红（既有 `concurrent terminal writes produce exactly one trace_end` 抓住 return 出锁后的双写）。
+
+**门扩展（0 新建，门 108 / 夹具 329 不变）**：`skill_restore` arm4（剥注释+字符串→括号配平定位 `recordSkillUse` 函数体；`_skills.value =` 必须在 `synchronized(addLock)` 块内且锁外无残留；判据在锁归属）+ `trace_step_tag` face_schema 追加（`write`/`writeTerminalOnce` 的 `buildLine(` 都须在 `synchronized(writeLock)` 内）。selftest 均带新牙 + 精度对照（合规夹具 0 violation 硬断言）。
+
+**★ 装置坑（4 条新，可复用）**：
+1. **JVM 探针 `-Duser.dir` 须指 `src/android/app`**（shipped `readRepoFile()` 以 `app/src/main/java/...` 模块相对解析）——与 1028-B 的「相对路径会炸 JVM 主类加载」同族但**另一层**（那次是 repo 根须绝对，这次是模块根须对）。
+2. **kotlin-stdlib 必须进运行时 classpath**（kotlinc 编译自带、`java` 运行不带）→ `NoClassDefFoundError: kotlin/jvm/internal/Intrinsics` / `Ref$BooleanRef`。
+3. **mut.sh 必须在施加变异后重新 extract.py**——否则 JVM 红是「陈旧切片」假象（首版 m1 JVM=GREEN 即此）；负控臂的红必须来自被测变异本身。
+4. `beginRun` 的 `prompt` 是**必填参**（报告与既有测试都没提）；kotlinc 一次 4 处 `no value passed for parameter 'prompt'`。
+
+**装置布局**：`repo-c/probe/`（extract.py / run.sh / mut.py / mut.sh / ci_judge.py / sources/*.snap，git-excluded）；生成 .kt 落 `/var/minis/shared/work/deep-audit-1029/probe-work-c/`（仓外 + 不在 /tmp，防 rglob(\*.kt) 门与收割）。
+
+**CI 判读**（probe/ci_judge.py，job log 1,191,961 B）：`Summary: 108 passed, 0 failed`、`[108/108]`、`ALL 329 CASES PASS`、3 个新 shipped 测试逐条 PASSED、FAILED 且非 PASSED 结尾行 = 0、Publish skipped（main 门控）。
+
+**残留**：backlog §1029-C R1–R5（机械门 222 段 OK）；R2 = `delete()` `:411` 锁外发布登记不修（单线程顺序发布，无并发窗口——报告 I09 M4 表把它误标为 `remove()` 的锁外写，已进 TRIAGE）。
+
+<!-- 2026-10-19 07:54:59 -->
+## FIX-E 收口：deep-audit-1029 I06+I08（UI 状态同步支）—— fix/da1029-e-ui-state @ be75a09，CI #39177457402 绿，停在分支
+
+
+**身份链**：基线 main `83caac6`（da1028 收口树）→ 分支 `fix/da1029-e-ui-state` @ **`be75a098fc2ab67a5723c17e797ed3370ee77abe`**（单提交，4 文件 +658/−30 = 2 生产 .kt + 2 门）→ 远端 tip == 本地 HEAD == CI head_sha **三方逐字符一致**。CI = workflow_dispatch **39177457402 success**（23:39:50Z 派发 → 23:51:38Z 完成）。**未合并 main**（含 .kt 验证面，起手权在用户）。报告 `shared/work/deep-audit-1029/fix-reports/FIX-E.md`（8 节 / CI 附录已回填）；backlog **§1029-E**（R1–R8，218→219 段，机械门 OK，no-触发条件 仍 3）。
+
+**修法**：①I06 P1 `MCPIntegrationsScreen`：编辑弹窗改编辑 **live 条目**（调用处 `servers.find { it.id == captured.id } ?: captured` elvis 回退 + `editServer = liveServer` 传入）+ **17 个字段状态全部带键** `remember(editServer)`（MCPServerConfig 是 data class，键在对象上 = 内容变则键变；1027-E/1028-C 同族第 10 次）。②I08 P2 `BrowserSettingsSheet`：订阅 session 对 + `when` 逐源门控派生 effective 对（**逐字镜像 `resolvedViewportSize()` 的 pool 口径**，半设源 [0,0,0,900] 边界由 JVM 矩阵逼出）+ 宽高/editor 键在 effective 值 + 四动作先 `resetSessionViewport()` 再 `setGlobalViewport()`；`cookieFilterText` 保持无键（V5 回归锚）。
+
+**验证五层**：门 selftest 双 GREEN（新臂 8+8 fail-closed）· 真树双 GREEN（门1 计 17 键）· **差分 pre 臂 = 真源码**（git 83caac6 逐文件导出，pre 红 17+9 条、post 绿）· JVM `OK (8 tests)` + `PROBE_E=PASS`（effective×pool 8 例矩阵一致；sheet 谎报 UA default 4 例全消）· 变异 7/7 分层翻红（m1 门2+JVM / m2 gate2 / m3 仅 JVM / m4-m6 gate1 / m7 gate2），还原 sha256 MATCH。CI：job 日志 1,191,658 B，`Summary: 108 passed, 0 failed` + `[108/108]` + `ALL 329 CASES PASS` + 两门 ×3 带牙 + keyed 行 `17 form field state(s) keyed on the entry` + FAILED-非 PASSED 行 0 + Publish 正确 skipped。
+
+**★ 本支装置坑（可复用）**：
+1. **`api()` 返回的是 `urlopen(r)` 的 response 对象**——把 response（或 `full_url` 字符串）传给 `NoRedirect opener.open` 拿不到 302 Location（auth 头丢失 → 403）。logs 下载必须 **fresh Request + add_header("Authorization") 直接传 opener.open**，HTTPError.code=302 时 `e.headers.get("Location")` 才有值。取证手法：先写最小 snippet 打印 `e.code` + 全部 headers，再修主脚本。
+2. `EXPECT_SHA` 防写死：判读脚本改从 `git rev-parse HEAD` + `git ls-remote` 运行时取（LOCAL/REMOTE/RUN 三方在脚本内对拍），写死 sha 会漂。
+3. 门名行 ×3 命中属正常（selftest 夹具里也含门名），计数断言用 `>= n` 不是 `== 1`。
+
+**残留**：R1 真机两条行为级（弹窗重播种 / 视口显示真实生效尺寸 / override 下动作一次生效）；R2 store-only 密钥写不重播种（负决策）；R3 无 mcp.json 文件监听（负决策）；R4 每动作两遍 applyViewport（性能，pool 单入口须新工单）；R5 门名不贴切（改名会破注册）；R6 装置层级（Compose 不可编，完整编译面只在 CI）；R7 装置在仓外 `repo-e-probe/`（`repo-e/probe/README.md` 指路留盘）。
+
+<!-- 2026-10-19 08:10:44 -->
+## FIX-A (deep-audit-1029) 收口：I01 草稿单源 + I02 深链穷举，分支 CI 绿 @ e76330e，停在分支
+
+
+**身份链**：基线 `83caac6` → 2 提交（`5ca7e1a` 修法 + `e76330e` CI 编译红补丁）→ HEAD **`e76330e999e7daa8e9aa62a552b3117492351657`** == 远端 tip == CI #2317 head_sha 三方逐字符。6 文件 +618/−6（生产 2 / 门 2 / 测试 2）。**未合并 main**。
+
+**修法**：①I01 P1：MainActivity 两处 New-Chat 入口（onStart :666 / handleDeepLink :834）裸拼 `"__new__<uuid>"` → `ComposerDraftStore.nextDraftId(this)` 单源（草稿失联 + saveText 槽位守卫丢文本）；②I02：AppNavigation 冷启动 `when(initialDeepLink)` 漏 `OpenAlarmList` + `else -> {}` 掩盖穷举 → 补分支 + 显式终结 + `null -> {}`。
+
+**★ CI 编译红（run 1，本地检测缺口闭合 = 本轮最值钱）**：`when` subject 是 `DeepLinkAction?`（**可空**），去掉 catch-all 后 `null` 未覆盖 → `:app:compileReleaseKotlin FAILED`。修法 = 终结分支补 `null -> {}`。**闭合方式 = 把编译器规则镜像到源码层**：deeplink 门判据 11 加「`initialDeepLink: DeepLinkAction?` 且块内无 `null ->` → 红」+ selftest 臂 T/U。**教训：凡把 `when` 的 `else` 换成显式 case，先查 subject 是否可空 —— 可空必须补 `null` case，否则编译红。**
+
+**★ 装置坑（新，可复用）**：`ci_judge.py` 的 `get()` 在 `with urlopen(...) as r` 块**外** return response —— 块外 `read()` 返回空串，`json.load` 报 `JSONDecodeError: Expecting value: line 1 column 1 (char 0)`（表象像 API/代理故障，实为装置自身 bug）。修法 = 块内 `return r.read()` + `json.loads`。**装置报「响应为空」先怀疑自己的读法再归因网络。**
+
+**★ 可复用手法（4 条）**：
+1. **装置放仓外**（`probe-a/` 而非 `repo-a/probe/`）：装置含生产源码逐字节切片（.kt），仓内三道 `ROOT.rglob("*.kt")` 门会把锚点扫成假红（1028-FIX-C R5 同族第 2 次）。
+2. **负控写成形状无关**（对当前树自校准，`Assume.assumeTrue` 处理缺失形状）→ pre 臂只暴露实质缺陷（4 红），不制造模板红。
+3. **pre 臂用 `git archive <基线>` 直切全树**（603 个 .kt）+ 门/测试从工作树覆盖 → 真 A/B，repo 测试读的是基线 nav。
+4. **门锚点必须带唯一上下文**：`RESOLVED` 全文 2 处，M1 想只改一处必须靠前置注释行定位；16 空格前缀 vs 8 空格是唯一性来源。
+
+**判据与验证**：chat_session 门判据 9（MainActivity 0 裸拼 / ≥2 nextDraftId）；deeplink 门判据 11（11 子类逐个命名 + 无 `else ->` + `null ->` + `ACTION_SHOW_ALARMS` 正则）。**0 新建门，scan.sh/test_scan.py 未动 → 门 108 / 夹具 329 不变**。验证四层：门 selftest 全绿（+7 臂）· 真树 rc=0 · `--subset --changed` 5/5 · 行为层 post 20 绿 / pre 4 红（红集=新增判据集）· 变异 6/6 PASS + blob MATCH。
+
+**残留**：backlog §1029-A（R1 真机行为级 3 条 / R2 热启动侧 `else -> {}` 未收敛 / R3 装置层级 / R4 装置仓外 / R5 报告失真 1 条：`AppNavigation.kt:471` 裸拼不存在 / R6 门行号读法 / R7 判据 9 fail-closed 口径调和点）。
+
+<!-- 2026-10-19 08:40:34 -->
+## deep-audit-1029 全流程闭环（用户令「走流程吧，小任务合并」）：9 工单 → 6 支 → 并集树 CI 绿 @ 933a0eb8
+
+
+**身份链**：基线 main `83caac6`（1028 收口树）→ 6 支 → 并集树 `integration/da1029` @ **`933a0eb8c2fcc7031af63d68dcc054987e6748ad`**（tree `c25d715c`，6 次 `--no-ff` 零冲突）→ 并集 CI **run 39180195781（#2318）success**；本地 HEAD == 远端 tip == CI `head_sha` 三方逐字符一致。**停在并集分支，未合并 main。**
+
+| 支 | ISSUE（判级） | 分支 HEAD | 支 CI |
+|---|---|---|---|
+| A | 01 P1 裸拼 `__new__` · 02 P1 深链穷举 | `e76330e` | 39178218420 success（**先红后绿**：首轮 CI compile 红 → 支修 null case → 重跑绿） |
+| B | 03 P1 主线程 IO | `98c0fc5` | 39176155210 success |
+| C | 04 P1 锁外写 · 09 P2 锁外 buildLine | `c09bbe9` | 39176651703 success |
+| D | 05 P1 语音族 UA | `4c7ad80` | 39176720024 success |
+| E | 06 P1 MCP 表单快照 · 08 P2 视口双源 | `be75a09` | 39177457402 success |
+| F | 07 P1 exec 透传双裂口 | `df76dfc` | 39176352125 success |
+
+**合支 9→6**（按模块内聚 + 三类文件两两零交集）：A=入口/导航 · B=记忆屏 IO · C=锁边界同族 · D=语音 UA · E=UI 状态同步同族 · F=Shizuku argv。27 文件 +2897/−80，零越界，`scan.sh`/`test_scan.py` 施工期 0 支触碰 → 门 **108** / 夹具 **329** 不变。
+
+**验证（三项核查全过）**：并集树 `gate_run --full` **108/108 GREEN**（0 sandbox / 0 env-retry）· `test_scan.py` **ALL 329 CASES PASS** · 并集 CI 日志 1,196,460 B 判读 **ALL CHECKS PASS**（108 门头在册 / 含 `FAILED` 而不以 `PASSED` 结尾的行 **0** / `Publish` = skipped（非 main 口径））· 本批 7 个相关测试类在日志中 **0 条 FAILED**。各支独立证据（门差分真源码臂 pre 红/post 绿 + JVM 双臂 + 变异矩阵 byte-restore sha256 MATCH）逐支到场。
+
+**★ 报告失真 3 条（全在引用层，缺陷本体 9/9 成立 0 驳回）**：①I05 单源路径 `provider/UserAgentHeader.kt:23` → 实为 `provider/UserAgentOverride.kt:29`；②M1「AppNavigation.kt:471 裸拼」误报（实测该文件 0 处）；③I06 字段数 16 → 实测 **17**（多 `oauthClientSecret`，位于多行 `?.let` 块内，主会话单行匹配漏掉）。
+
+**★ 新知识（值得下批复用）**：
+1. **把编译器规则镜像到源码层**（A 支）：`deeplink` 门新增判据「可空 subject + 无 `null ->` 则红」——Compose 编译错（`'when' expression must be exhaustive`）在**本地**就能抓，不必烧一轮 16 min CI。A 支首轮 CI 红正是这类形态违规。
+2. **`readRepoFile` 按 `user.dir` 向上找文件 = 变异臂假绿坑**（D 支）：装置从别的目录启动时会读到**原始树**，变异看起来被"接受"。
+3. **变异施加后必须重新 extract 切片**（C 支）：否则 JVM 跑的是陈旧切片，得到假绿/假红。
+4. **`union_ci_judge.py` 硬编码日志路径有副作用**：跑 1029 判读时把 1028 目录的 `union-ci.log` **覆盖**了（1,191,896 B → 1,196,460 B）。已就地参数化（写 1029 目录）。教训：**收口脚本跨批复用时，输出路径必须参数化**（同族：任何"复制模板脚本"都先 `grep` 绝对路径）。
+
+**待用户放行**：① `integration/da1029` → main（`--no-ff`，含 .kt 验证面 = 非纯文本例外）；② 7 支远端分支清理；③ 文档三件套重建。真机行为级 11 项已归并 `backlog §1029-VERIFY`（与 §1028-VERIFY 同批攒波）。
+
+<!-- 2026-10-19 09:33:46 -->
+## deep-audit-1029 合并 main 完成（用户令「合并」）+ main CI 全绿
+
+
+- **合并**：`integration/da1029 @ 933a0eb8`（tree `c25d715c`）`--no-ff` 合入 main → **`b3533179cd842b13de00cecdf6e93573afbe423a`**（父 = `05f6fc4` docs 提交）；推送 `05f6fc4..b353317`。
+- **★ 子树对拍（本轮唯一与 1028 不同处）**：main 在并集分支基线 `83caac6` 之上还带了 docs 提交 `05f6fc4`，所以**整树 hash 必然不同**（`14dd4899` ≠ `c25d715c`）。正确对拍口径 = **按子树比**：`HEAD:src` == `933a0eb8:src`、`HEAD:scripts` == `933a0eb8:scripts`（逐字节一致），docs 子树保持 `05f6fc4` 原值 ⇒ 「我看过的树就是线上树」的证据依旧成立。**教训：tree 对拍要先问「并集基线与 main 顶端是否同一提交」，不同则降级为子树对拍。**
+- **main CI**：push 自动触发 run **39184187747（#2319）success** @ `b3533179`（01:11:16Z → 01:23:20Z，13 步 failed=[]）；job 日志 1,199,703 B 判读 **ALL CHECKS PASS**：`Summary: 108 passed, 0 failed` · 夹具 `ALL 329 CASES PASS` · 108 门头逐条在册 · 8 个测试类逐条 PASSED（DebugReadFileCompat ×7 / ScheduledNotificationStoreLock ×5 / DebugOffloadHandlerArgv ×7 / SoulStoreWriteVersion ×12 / ConfigBackupEnvvarsAndOverlay ×6 / ShareDirPruneWiring ×8 / DeepLinkReactiveConsume ×6 / ThinkingRulesRememberKey ×4）· 含 `FAILED` 而不以 `PASSED` 结尾的行 **0** · **`Publish to Releases` = success**（main 门控放行，滚动 release 更新）。
+- 三方一致：`head_sha` == 本地 HEAD == `git ls-remote origin main` == `b3533179`。
+- **待办**：7 支远端分支清理（6×`fix/da1029-*` + `integration/da1029`）+ 文档三件套重建（dev-history-sync），均待用户放行。
+
+<!-- 2026-10-19 09:34:21 -->
+## 审计背景包升级 v11/v8 → **v12/v9**（用户令「为下一波审计做准备」+ 背景文件）：基线 `b353317`，两处引用失真被回树取证抓住当场修正
+
+
+**位置**：挂载 `/var/minis/mounts/笔记/RikkaMinis审计背景包/`（发给**外部审计模型**，非本机会话）。终态根目录 = `README.md` + `audit-context.md`(v12, 521 行 / 146,383 B) + `audit-prompt-v9.md`(348 行 / 47,586 B) + `RikkaMinis-b353317.zip`(16,622,047 B / 1636 条目 / 1096 .kt) + `archive/`。挂载版与工作副本 sha256 逐文件一致（ctx `069620f5767cfc09` / prompt `42dc24565170d0e3` / README `1d3a110914d7cbf9` / zip `4773169267526f45`）。
+
+**基线为什么是 `b353317`**：da1029 今早 09:10 收口（`integration/da1029 @ 933a0eb8` 6 次 `--no-ff` 并入 main），`b353317` 的 **src 树与 `933a0eb8` 零差异**（差异只在 `docs/dev-history/` 四文件 186+/23−）→ 拿 main 头当审计基线，路径/行号/门清单与 CI 绿的并集树完全对应。
+
+**v12 相对 v11 的实质增量**：§4.1 再生链 →**十六轮硬数据** + 两条新链（锁边界不对称 · CLI argv 选项作用域）· §5 →**1029 轮增量（0 新门 / 9 道扩展 / 门 108 · 夹具 329 不变）** · §6 →**64…77 条**（新增 `delete()` 锁外发布一族、`--timeout-ms` 过度认领、语音品牌 UA、17 字段带键、装置仓外纪律、收口脚本参数化）· §7 →1029 后再核（饱和区/低犁区收敛） · §8 →**1029 失真三类**（单行匹配漏多行块 16→17 · 统一出口位置猜错第 3 次回潮 · 引用不存在锚点第 2 次）+ 三道硬动作 · §8.1 生成机制候选增补「**编译器可判的形状级缺陷**」。prompt v8→v9：新增 §2.0g（三类失真）、§1.1 落点 6、§3.4 锁归属/单源接满两个新搜法、§5 自检 +3。
+
+**★ 本次最值钱的一步：装机前对本轮新写的事实逐条回树取证（不是转述报告）**——抓到 2 处**引用层失真**（正是 v12 自己在 §8 新写的「同文件兄弟函数张冠李戴」形态）：
+1. v11 以来沿用的「`SkillRepository.remove()` 的 `_skills.value =` 在锁外 `:411`」**错**：该文件**没有 `remove()` 函数**，`:411` 属于 `delete()`；同族实际是 `delete()`(:411) / `update()`(:402) / `setEnabled()`(:417) / `restoreUsageMetadata()`(:439) 四处（1029-C 只修了 `recordSkillUse` :583 起）。报告原文即写成 `remove()`，我差点原样继承。
+2. 「`MainActivity.kt:847` 热启动 `else -> {}` 不收敛」**行号错**：`:847` 是 `startActivity(showAlarms)`；真实的 `else -> {}` 在外层 `when (action)`（`:762`）的 `:854` + 内层 `:829`（`:826` 的 when）。冷启动侧修的是 `AppNavigation` 的 `when (initialDeepLink)`（`:373`）。
+修正后回树复核判据编号（`deeplink` criterion 11 ×8 / `chat_session` criterion 9 ×9 / `shizuku` criterion 13 ×2）与 `MCPIntegrationsScreen` `remember(editServer)` = **17** 全部对上。
+
+**纪律固化（已写进 README 维护段，三条）**：①**改文件前先 archive 先行**（1028 就地改 v11 导致 archive 缺 v11 + v10 是事后抢救，本次已补归档 v11 / prompt v8 / 旧 zip）；②**只许「复制 + 逐处锚点唯一命中」的补丁脚本落地，禁止整文件重写**（v11 首版整文件覆写丢掉 §4.1/§6/§7/§8 增量，逐段回捞）；③**复用上批脚本先 grep 绝对路径**（1029 的 `union_ci_judge.py` 硬编码 1028 路径，把 1028 的 `union-ci.log` 覆盖了）——同一洞察三个时点：改常量查全仓 / 改树查引用 / 复制脚本查路径。
+
+**工具细节**：锚点匹配一律 `lstrip()` 后再 `startswith`（否则漏掉 3 空格缩进的 `> **★ 基线对齐**` 那类行）+ 替换时保留原行缩进；表格行追加后跑「块内 `|` 数一致性」校验（本次 0 异常）。README 的文件行数/条目数**必须现场实测**（旧值 472+/340+ 行、1635 条目全是估值，实测 521/348 行、1636 条目）。
+
+**未做**：不 dispatch、不等 CI（`b353317` 的 main run 39184187747 是 docs-only push 自动触发的，无验证面，按纯文本纪律放着）。
 
 ---
 
