@@ -16,6 +16,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
@@ -24,6 +25,7 @@ import com.rikkaminis.app.ui.util.bringIntoViewOnFocus
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 import com.rikkaminis.app.R
@@ -67,6 +69,8 @@ fun ProviderConnectionScreen(
     var isEditingKey by remember { mutableStateOf(false) }
     var editKeyValue by remember { mutableStateOf("") }
     var keyVisible by remember { mutableStateOf(false) }
+    // [deep-audit-1033 I05] The key save below is a coroutine now.
+    val scope = rememberCoroutineScope()
 
     // [da1023-C] Bind the connection states to instance.id: the old keyless
     // rememberSaveable leaked this instance's URL/UA state into the next
@@ -145,10 +149,20 @@ fun ProviderConnectionScreen(
                         keyVisible = false
                     },
                     onSave = {
-                        providerRepository.saveApiKey(instanceId, editKeyValue)
-                        storedKey = editKeyValue
-                        AppLogger.info(TAG, "Saved API key for ${instance.id}")
-                        isEditingKey = false
+                        // [deep-audit-1033 I05] saveApiKey commits to
+                        // EncryptedSharedPreferences — blocking keystore IO on
+                        // the click's thread (the same defect the audit found
+                        // on the three add-provider screens; this is the fourth
+                        // save path for the same call). The key lands before
+                        // the editor closes, same order as before.
+                        scope.launch {
+                            withContext(Dispatchers.IO) {
+                                providerRepository.saveApiKey(instanceId, editKeyValue)
+                            }
+                            storedKey = editKeyValue
+                            AppLogger.info(TAG, "Saved API key for ${instance.id}")
+                            isEditingKey = false
+                        }
                     },
                 )
             }

@@ -140,6 +140,69 @@ class SandboxPathGuardWiringTest {
         }
     }
 
+    // ── da1033 I01: the read-only *shared folders* refusal ─────────────
+    //
+    // The browser lists everything under `/var/minis`, which includes the two
+    // folders the settings screen labels Read-Only (Skills / Memory). Refusing
+    // read-only *mounts* is not enough there: `writable = false` used to reach
+    // only the AccessBadge, so the trash icon really deleted SOUL.md /
+    // GLOBAL.md / SKILL.md. Four properties keep that from coming back; the
+    // third is what makes the first two worth anything (a literal second path
+    // list would drift exactly like the registry it copies).
+
+    @Test
+    fun `browser delete refuses both read-only domains before it deletes`() {
+        val body = declarationSlice(readRepoFile(FILE_BROWSER), "fun deleteItem(")
+        assertTrue(
+            "deleteItem() lost the read-only mount refusal:\n$body",
+            body.contains("isLinuxPathUnderReadOnlyMount("),
+        )
+        assertTrue(
+            "deleteItem() lost the read-only shared-folder refusal (the I01 defect):\n$body",
+            body.contains("isLinuxPathUnderReadOnlySharedDir("),
+        )
+        val deleteAt = body.indexOf("deleteRecursively()")
+        assertTrue("the delete call is gone from deleteItem():\n$body", deleteAt > 0)
+        val mountAt = body.indexOf("isLinuxPathUnderReadOnlyMount(")
+        val sharedAt = body.indexOf("isLinuxPathUnderReadOnlySharedDir(")
+        assertTrue("the mount refusal must run before the delete:\n$body", mountAt in 0 until deleteAt)
+        assertTrue("the shared-folder refusal must run before the delete:\n$body", sharedAt in 0 until deleteAt)
+    }
+
+    @Test
+    fun `the shared-folder predicate derives its roots from the registry`() {
+        val roots = declarationSlice(readRepoFile(REGISTRY_SCREEN), "val readOnlyLinuxPaths")
+        assertTrue(
+            "readOnlyLinuxPaths must derive from the registry entries:\n$roots",
+            roots.contains("entries.filterNot { it.writable }"),
+        )
+        assertFalse(
+            "readOnlyLinuxPaths must not carry a second path list:\n$roots",
+            roots.contains("/var/minis/"),
+        )
+    }
+
+    @Test
+    fun `the shared-folder matcher normalizes both sides and matches whole segments`() {
+        val body = declarationSlice(readRepoFile(REGISTRY_SCREEN), "fun isUnderReadOnlyLinuxRoot(")
+        assertTrue("the matcher must normalize the target:\n$body", body.contains("normalizeLinuxPath(linuxPath)"))
+        assertTrue("the matcher must normalize the root it compares against:\n$body", body.contains("normalizeLinuxPath(root)"))
+        assertTrue(
+            "the matcher must compare whole path segments, not raw prefixes:\n$body",
+            body.contains("startsWith(\"\$base/\")"),
+        )
+        assertFalse("the matcher must not prefix-match the raw path:\n$body", body.contains("linuxPath.startsWith("))
+    }
+
+    @Test
+    fun `the shared-folder rule is not a second read-only-mount rule`() {
+        val src = readRepoFile(REGISTRY_SCREEN)
+        assertFalse(
+            "SharedFoldersScreen.kt must call PRootKernel's mount guard, not re-declare it",
+            src.contains("fun isLinuxPathUnderReadOnlyMount("),
+        )
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────
 
     private fun readRepoFile(relative: String): String {
@@ -210,6 +273,10 @@ class SandboxPathGuardWiringTest {
     private companion object {
         private const val PROOT_KERNEL =
             "src/android/app/src/main/java/com/rikkaminis/app/sandbox/PRootKernel.kt"
+        private const val FILE_BROWSER =
+            "src/android/app/src/main/java/com/rikkaminis/app/ui/sandbox/FileBrowserViewModel.kt"
+        private const val REGISTRY_SCREEN =
+            "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/SharedFoldersScreen.kt"
         private const val MODEL_USE =
             "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ModelUseOffloadHandler.kt"
         private const val FASTIO =
