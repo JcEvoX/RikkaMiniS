@@ -155,8 +155,18 @@ fun SkillsManagementScreen(
     // the active chat (e.g. via shell `git clone` into skillsDir, which
     // bypasses the SKILL.md file_write hook) is picked up the moment the
     // user opens this list, instead of requiring a process restart.
+    // [fix/da1032-e] reloadFromDisk() re-scans the SQLite registry AND walks
+    // skillsDir on disk (SkillRepository.loadAll: rawQuery + per-row
+    // parseSkillMdOnDisk + listFiles). Doing that inline in LaunchedEffect ran
+    // the whole scan on the Main dispatcher every time the screen appeared —
+    // the Settings-screen jank/ANR shape [audit-1032 ISSUE-06]. Same treatment
+    // the paste-import branch below already uses: keep the call, move its
+    // thread. The StateFlow update inside is thread-safe, and nothing after
+    // this effect reads the result synchronously.
     LaunchedEffect(Unit) {
-        skillRepository.reloadFromDisk()
+        withContext(Dispatchers.IO) {
+            skillRepository.reloadFromDisk()
+        }
     }
 
     SettingsScaffold(
@@ -638,7 +648,18 @@ fun SkillDetailScreen(
     // affordances and avoids the layout jiggle the inline OutlinedTextField
     // caused on a row that's otherwise quiet.
     var showEditNameDialog by remember { mutableStateOf(false) }
-    var editName by remember { mutableStateOf(skill.name) }
+    // Keys [skill.id, skill.name]: this screen re-resolves `skill` from the
+    // repository StateFlow, so the SAME composition can see skill.name change
+    // (an agent / CLI edit to the SKILL.md frontmatter is re-synced into the
+    // row by loadAll → SkillMetadataSync.reconcile, and the post-tool hook
+    // fires reloadFromDisk while this screen is open). The dialog drafts from
+    // skill.name at first composition, so an un-keyed remember handed the
+    // dialog the pre-edit name: confirming the rename wrote the OLD name back
+    // over the external edit (snapshot deadlock, [audit-1032 ISSUE-06]).
+    // Cross-skill staleness is NOT the path here — each skill detail is its own
+    // nav entry (composable(SKILL_DETAIL) per skillId), so it gets a fresh
+    // composition; skill.id is keyed anyway as the "keys the source" anchor.
+    var editName by remember(skill.id, skill.name) { mutableStateOf(skill.name) }
 
     // T154: replace stub state. Each update action drives `updateStatus` which
     // surfaces inline feedback ("Updating…" / stringResource(R.string.skill_detail_updated) / "Failed: …") next to
@@ -1265,7 +1286,16 @@ fun SkillFileViewerScreen(
     }
 
     var isEditing by remember { mutableStateOf(false) }
-    var editContent by remember(skillId, relativePath) { mutableStateOf(initialContent) }
+    // Key [skill.updatedAt] added [fix/da1032-e]: initialContent re-derives
+    // from skill.updatedAt, but this remember didn't — so an out-of-band edit
+    // (agent file_write / shell sed while this screen is open) bumped
+    // updatedAt, initialContent recomputed fresh, and editContent kept the
+    // pre-edit snapshot forever (editor snapshot deadlock, [audit-1032
+    // ISSUE-06]); a same-path sibling edit also leaked into a freshly opened
+    // editor. key1/key2 line literals are pinned by
+    // skill_frontmatter_roundtrip_check.py / skill_file_save_result_check.py
+    // — keys were appended, prefixes untouched.
+    var editContent by remember(skillId, relativePath, skill.updatedAt) { mutableStateOf(initialContent) }
 
     // [fix/da1021-issue06] Save failures used to be silently discarded: the
     // return values of importFromContent / writeSkillFile were dropped and the
