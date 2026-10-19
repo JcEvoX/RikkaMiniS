@@ -183,6 +183,33 @@ class ProviderEntryKeyAndPinTest {
     }
 
     @Test
+    fun `updateEntry migrates the voice overrides inside the rename branch`() {
+        // [da1031-A] The two prefs-held voice overrides are the same class of
+        // per-device secondary reference as lastUsedEntryId — a rename without
+        // migrating them leaves the voice panel pointing at an entry id the
+        // repository no longer resolves (silent fallback to the group binding).
+        val body = bodyOf(repositorySource(), "fun updateEntry(")
+        assertTrue(
+            body.contains("if (voiceInputOverrideEntryId == oldKey) voiceInputOverrideEntryId = newUuid"),
+        )
+        assertTrue(
+            body.contains("if (voiceOutputOverrideEntryId == oldKey) voiceOutputOverrideEntryId = newUuid"),
+        )
+        // Judged on the write points, not the function name: the rewrites must
+        // sit INSIDE `if (renamed)` — the migration would otherwise fire on
+        // every update, not just renames. decideCompactPinMigration( is still
+        // inside the block, so ordering against it bounds the block from the
+        // right without re-walking braces.
+        val renameIdx = body.indexOf("if (renamed)")
+        val voiceInIdx = body.indexOf("if (voiceInputOverrideEntryId == oldKey)")
+        val voiceOutIdx = body.indexOf("if (voiceOutputOverrideEntryId == oldKey)")
+        val pinIdx = body.indexOf("decideCompactPinMigration(")
+        assertTrue(renameIdx in 0 until voiceInIdx)
+        assertTrue(voiceInIdx < voiceOutIdx)
+        assertTrue(voiceOutIdx < pinIdx)
+    }
+
+    @Test
     fun `removeEntry clears the compact pin it just orphaned`() {
         val body = bodyOf(repositorySource(), "fun removeEntry(")
         assertTrue(body.contains("decideCompactPinCleanup("))
@@ -268,10 +295,15 @@ class ProviderEntryKeyAndPinTest {
         val guard = body.indexOf("if (staleSeedIds.isNotEmpty())")
         assertTrue("the stale-seed guard must still be the entry point", guard >= 0)
         val block = body.substring(guard)
-        assertTrue(block.contains("memberEntryIds.removeAll { it in staleSeedIds }"))
-        assertTrue(block.contains("config.agentLoopModelEntryIds.removeAll { it in staleSeedIds }"))
+        // [da1031-A] the cascade must compare ENTRY ids — staleEntryIds, the
+        // uuid/composite form every secondary reference is stored in. The
+        // pre-fix spelling (bare staleSeedIds = baseModel.id values) made all
+        // four routes a silent no-op.
+        assertTrue(block.contains("val staleEntryIds"))
+        assertTrue(block.contains("memberEntryIds.removeAll { it in staleEntryIds }"))
+        assertTrue(block.contains("config.agentLoopModelEntryIds.removeAll { it in staleEntryIds }"))
         assertTrue(block.contains("decideCompactPinCleanup("))
-        assertTrue(block.contains("clearStaleSecondaryRefs(staleSeedIds)"))
+        assertTrue(block.contains("clearStaleSecondaryRefs(staleEntryIds)"))
     }
 
     @Test

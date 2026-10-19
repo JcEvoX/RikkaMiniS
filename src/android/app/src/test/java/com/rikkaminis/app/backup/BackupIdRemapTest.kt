@@ -54,6 +54,8 @@ class BackupIdRemapTest {
         for (path in listOf(
             "defaults.primaryGroup",
             "defaults.subGroup",
+            "defaults.voiceInputGroup",
+            "defaults.voiceOutputGroup",
             "defaults.agentLoopGroups",
             "defaults.agentLoopEntries",
             "runtime.compactModelEntryId",
@@ -100,6 +102,72 @@ class BackupIdRemapTest {
     fun remapDefaultsIds_unknownPathReturnsInput() {
         val v = ConfigValue.Str("whatever")
         assertSame(v, remapDefaultsIds("runtime.memoryInjectLines", v, mapOf("x" to "y"), mapOf("x" to "y")))
+    }
+
+    // ── [da1031-A] voice group bindings ───────────────────────────────────
+
+    @Test
+    fun remapDefaultsIds_rewritesVoiceInputGroup() {        val out = remapDefaultsIds(
+            path = "defaults.voiceInputGroup",
+            value = ConfigValue.Str("aaaaaaaa-1111-1111-1111-111111111111"),
+            groupIdMap = mapOf("aaaaaaaa-1111-1111-1111-111111111111" to "bbbbbbbb-2222-2222-2222-222222222222"),
+            entryIdMap = emptyMap(),
+        )
+        assertEquals(ConfigValue.Str("bbbbbbbb-2222-2222-2222-222222222222"), out)
+    }
+
+    @Test
+    fun remapDefaultsIds_rewritesVoiceOutputGroup() {
+        val out = remapDefaultsIds(
+            path = "defaults.voiceOutputGroup",
+            value = ConfigValue.Str("cccccccc-1111-1111-1111-111111111111"),
+            groupIdMap = mapOf("cccccccc-1111-1111-1111-111111111111" to "dddddddd-2222-2222-2222-222222222222"),
+            entryIdMap = emptyMap(),
+        )
+        assertEquals(ConfigValue.Str("dddddddd-2222-2222-2222-222222222222"), out)
+    }
+
+    @Test
+    fun remapDefaultsIds_voiceGroupMissingFromMapKeepsValue() {
+        // Same "pass through, let the writer report unknown" contract as the
+        // compact pin: no rewrite, no drop.
+        val v = ConfigValue.Str("eeeeeeee-1111-1111-1111-111111111111")
+        assertEquals(
+            v,
+            remapDefaultsIds(
+                path = "defaults.voiceInputGroup",
+                value = v,
+                groupIdMap = mapOf("ffffffff-ffff-ffff-ffff-ffffffffffff" to "g-new"),
+                entryIdMap = emptyMap(),
+            ),
+        )
+    }
+
+    @Test
+    fun remapDefaultsIds_voiceGroupNeverRoutesThroughEntryMap() {
+        // Discriminator: a group uuid that is a key in the ENTRY map must NOT
+        // be rewritten through it. If someone moves the voice keys onto the
+        // entryIdMap branch (or the bare `else` drops them entirely), this
+        // turns the silent misroute into a red test.
+        val v = ConfigValue.Str("eeeeeeee-1111-1111-1111-111111111111")
+        assertEquals(
+            v,
+            remapDefaultsIds(
+                path = "defaults.voiceInputGroup",
+                value = v,
+                groupIdMap = emptyMap(),
+                entryIdMap = mapOf("eeeeeeee-1111-1111-1111-111111111111" to "e-new"),
+            ),
+        )
+        assertEquals(
+            v,
+            remapDefaultsIds(
+                path = "defaults.voiceOutputGroup",
+                value = v,
+                groupIdMap = emptyMap(),
+                entryIdMap = mapOf("eeeeeeee-1111-1111-1111-111111111111" to "e-new"),
+            ),
+        )
     }
 
     // ── remapSessionBindingJson ────────────────────────────────────────────

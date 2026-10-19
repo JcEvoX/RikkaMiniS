@@ -709,6 +709,15 @@ class ProviderRepository(private val context: Context) {
                 .map { it.baseModel.id }
                 .filter { it !in templateById }
             if (staleSeedIds.isNotEmpty()) {
+                // [da1031-A] The stale-seed ids are bare baseModel.id values, but
+                // every secondary reference hangs off the entry id (uuid,
+                // canonicalized to the composite "{instanceId}/{modelId}" shape
+                // by toSnapshot). Comparing bare ids against entry ids made the
+                // whole cascade below a no-op.
+                val staleEntryIds = instanceEntries
+                    .filter { it.baseModel.isVoiceTemplateSeedShape }
+                    .filter { it.baseModel.id !in templateById }
+                    .map { it.id }
                 config.modelEntries.removeAll {
                     it.providerInstanceId == instance.id && it.baseModel.id in staleSeedIds
                 }
@@ -717,13 +726,13 @@ class ProviderRepository(private val context: Context) {
                 // members, agent-loop pins, the compact pin and the per-device
                 // lastUsed / voice references.
                 for (group in config.modelGroups) {
-                    group.memberEntryIds.removeAll { it in staleSeedIds }
+                    group.memberEntryIds.removeAll { it in staleEntryIds }
                 }
-                config.agentLoopModelEntryIds.removeAll { it in staleSeedIds }
-                if (decideCompactPinCleanup(AgentRuntimeLimitsPrefs.compactModelEntryId(), staleSeedIds)) {
+                config.agentLoopModelEntryIds.removeAll { it in staleEntryIds }
+                if (decideCompactPinCleanup(AgentRuntimeLimitsPrefs.compactModelEntryId(), staleEntryIds)) {
                     AgentRuntimeLimitsPrefs.save(context, compactModelEntryId = "")
                 }
-                clearStaleSecondaryRefs(staleSeedIds)
+                clearStaleSecondaryRefs(staleEntryIds)
                 changed = true
                 android.util.Log.i("ProviderRepo", "[VoiceTemplateMigrate] ${instance.label}: removed stale voice entries: ${staleSeedIds.sorted()}")
             }
@@ -1493,6 +1502,11 @@ class ProviderRepository(private val context: Context) {
                 // next new chat still falls back to "the model I was just
                 // using" instead of the newest-provider fallback.
                 if (lastUsedEntryId == oldKey) lastUsedEntryId = newUuid
+                // [da1031-A] Voice overrides (prefs) are the same class of
+                // per-device secondary reference as lastUsedEntryId above —
+                // rename migrates them too.
+                if (voiceInputOverrideEntryId == oldKey) voiceInputOverrideEntryId = newUuid
+                if (voiceOutputOverrideEntryId == oldKey) voiceOutputOverrideEntryId = newUuid
                 // [da1023-C] KEY_COMPACT_MODEL_ENTRY_ID (AgentRuntimeLimitsPrefs)
                 // is a prefs-level secondary reference to this entry — same
                 // class as the lastUsedEntryId rewrite above, but it lives
