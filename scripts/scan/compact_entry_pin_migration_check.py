@@ -42,7 +42,10 @@ to four, and from the pin alone to the prefs-held references next to it:
   Arm 6  `ProviderRepository.ensureVoiceTemplateModels` — dissolving a stale
          seed entry runs the SAME cascade (group members / agent-loop pins /
          pin / per-device refs); previously it cleaned nothing but the entry
-         row itself.
+         row itself. [da1031-A] the cascade now compares ENTRY ids
+         (`staleEntryIds` — the uuid/composite form every secondary ref is
+         stored in); the bare `baseModel.id` spelling made all four routes a
+         silent no-op.
   Arm 7  the per-device applier (`clearStaleSecondaryRefs`) clears all three
          of `lastUsedEntryId` / `voiceInputOverrideEntryId` /
          `voiceOutputOverrideEntryId` through the shared `decideStaleRefCleanup`
@@ -53,6 +56,18 @@ to four, and from the pin alone to the prefs-held references next to it:
          strongly-held `OnSharedPreferenceChangeListener` (the `remember{}`
          snapshot alone left the row showing an id the repository no longer
          resolves after an external write / backup restore / cascade reset).
+
+deep-audit-1031 ISSUE-01 (P1) added arm 9:
+
+  Arm 9  `updateEntry`'s rename branch migrates the two prefs-held voice
+         overrides (`voiceInputOverrideEntryId` / `voiceOutputOverrideEntryId`)
+         — the same class of per-device secondary reference as
+         `lastUsedEntryId`. Judged on the WRITE POINTS (the `== oldKey`
+         comparisons and the `= newUuid` rewrites) inside `if (renamed)`, not
+         on the function name: a second rename path that forks the migration
+         must carry its own write points, and a rename of this function keeps
+         the criterion alive as long as the write points stay inside the
+         rename branch.
 
 Usage: python3 scripts/scan/compact_entry_pin_migration_check.py [ROOT]
        python3 scripts/scan/compact_entry_pin_migration_check.py --root ROOT
@@ -99,15 +114,19 @@ REPLACE_ARM = (
     "clearStaleSecondaryRefs(prunedEntryIds)",
 )
 
-# Arm 6: ensureVoiceTemplateModels' stale-seed branch.
+# Arm 6: ensureVoiceTemplateModels' stale-seed branch. [da1031-A] the cascade
+# must compare ENTRY ids (staleEntryIds — the uuid/composite form every
+# secondary reference is stored in); bare baseModel.id values made all four
+# routes a silent no-op, and the old spelling was pinned by the test below.
 VOICE_GUARD = "if (staleSeedIds.isNotEmpty())"
 VOICE_ARM = (
-    "config.agentLoopModelEntryIds.removeAll { it in staleSeedIds }",
-    "group.memberEntryIds.removeAll { it in staleSeedIds }",
+    "val staleEntryIds",
+    "config.agentLoopModelEntryIds.removeAll { it in staleEntryIds }",
+    "group.memberEntryIds.removeAll { it in staleEntryIds }",
     "decideCompactPinCleanup(",
     PIN_READ,
     PIN_RESET,
-    "clearStaleSecondaryRefs(staleSeedIds)",
+    "clearStaleSecondaryRefs(staleEntryIds)",
 )
 
 # Arm 7: the per-device applier's BODY (so an emptied helper cannot pass).
@@ -133,6 +152,19 @@ UI_ARM = (
 # function, i.e. the pin edit rides along with the cascade it mirrors.
 UPDATE_AFTER = "if (renamed)"
 REMOVE_AFTER = "config.agentLoopModelEntryIds.removeAll { it == entryId }"
+
+# Arm 9: updateEntry's rename branch must migrate the two prefs-held voice
+# overrides. The criterion hangs on the WRITE POINTS (the `== oldKey`
+# comparisons and the `= newUuid` rewrites) inside `if (renamed)` — family
+# lesson (deep-audit-1030-E): a second release/clean-up path forks silently
+# unless the criterion is bound to the point where the write happens, not to a
+# function name a refactor can rename around.
+VOICE_RENAME_ARM = (
+    "voiceInputOverrideEntryId == oldKey",
+    "voiceInputOverrideEntryId = newUuid",
+    "voiceOutputOverrideEntryId == oldKey",
+    "voiceOutputOverrideEntryId = newUuid",
+)
 
 
 def code_only(text):
@@ -286,6 +318,9 @@ def run_checks(root, rel=REPO_REL):
     out += check_body(src, rel, CLEAR_HEADER, "7", CLEAR_ARM, "clearStaleSecondaryRefs")
     if DECIDE_STALE_ARM not in body_all:
         out.append((rel, 0, "7", "helper missing: `%s`" % DECIDE_STALE_ARM))
+    for needle in VOICE_RENAME_ARM:
+        out += check_inside(src, rel, "fun updateEntry(", "9", UPDATE_AFTER,
+                            needle, "updateEntry rename branch voice overrides")
     return out
 
 
@@ -335,17 +370,21 @@ PR_OK = """class ProviderRepository(private val context: Context) {
             .map { it.baseModel.id }
             .filter { it !in templateById }
         if (staleSeedIds.isNotEmpty()) {
+            val staleEntryIds = instanceEntries
+                .filter { it.baseModel.isVoiceTemplateSeedShape }
+                .filter { it.baseModel.id !in templateById }
+                .map { it.id }
             config.modelEntries.removeAll {
                 it.providerInstanceId == instance.id && it.baseModel.id in staleSeedIds
             }
             for (group in config.modelGroups) {
-                group.memberEntryIds.removeAll { it in staleSeedIds }
+                group.memberEntryIds.removeAll { it in staleEntryIds }
             }
-            config.agentLoopModelEntryIds.removeAll { it in staleSeedIds }
-            if (decideCompactPinCleanup(AgentRuntimeLimitsPrefs.compactModelEntryId(), staleSeedIds)) {
+            config.agentLoopModelEntryIds.removeAll { it in staleEntryIds }
+            if (decideCompactPinCleanup(AgentRuntimeLimitsPrefs.compactModelEntryId(), staleEntryIds)) {
                 AgentRuntimeLimitsPrefs.save(context, compactModelEntryId = "")
             }
-            clearStaleSecondaryRefs(staleSeedIds)
+            clearStaleSecondaryRefs(staleEntryIds)
             changed = true
         }
     }
@@ -376,6 +415,8 @@ PR_OK = """class ProviderRepository(private val context: Context) {
         if (renamed) {
             val oldKey = decision.oldKey
             if (lastUsedEntryId == oldKey) lastUsedEntryId = newUuid
+            if (voiceInputOverrideEntryId == oldKey) voiceInputOverrideEntryId = newUuid
+            if (voiceOutputOverrideEntryId == oldKey) voiceOutputOverrideEntryId = newUuid
             decideCompactPinMigration(
                 pinEntryId = AgentRuntimeLimitsPrefs.compactModelEntryId(),
                 oldKey = oldKey,
@@ -497,6 +538,21 @@ PR_BAD_CLEANUP_OUTSIDE_ELSE = PR_OK.replace(
 # Regression shape G: ensureVoiceTemplateModels dissolved the seeds but cleaned
 # only the entry rows (the ISSUE-03 path-B pre-fix world).
 _VOICE_CASCADE = """            for (group in config.modelGroups) {
+                group.memberEntryIds.removeAll { it in staleEntryIds }
+            }
+            config.agentLoopModelEntryIds.removeAll { it in staleEntryIds }
+            if (decideCompactPinCleanup(AgentRuntimeLimitsPrefs.compactModelEntryId(), staleEntryIds)) {
+                AgentRuntimeLimitsPrefs.save(context, compactModelEntryId = "")
+            }
+            clearStaleSecondaryRefs(staleEntryIds)
+"""
+PR_BAD_NO_VOICE_CASCADE = PR_OK.replace(_VOICE_CASCADE, "")
+
+# Regression shape L (da1031-A): the cascade restored to the pre-fix spelling —
+# bare baseModel.id values compared against entry-id references (all four
+# routes a silent no-op). Arm 6's re-anchored criterion must catch exactly
+# this shape, including the missing `val staleEntryIds` declaration.
+_VOICE_CASCADE_BARE = """            for (group in config.modelGroups) {
                 group.memberEntryIds.removeAll { it in staleSeedIds }
             }
             config.agentLoopModelEntryIds.removeAll { it in staleSeedIds }
@@ -505,7 +561,35 @@ _VOICE_CASCADE = """            for (group in config.modelGroups) {
             }
             clearStaleSecondaryRefs(staleSeedIds)
 """
-PR_BAD_NO_VOICE_CASCADE = PR_OK.replace(_VOICE_CASCADE, "")
+_VOICE_DECL = """            val staleEntryIds = instanceEntries
+                .filter { it.baseModel.isVoiceTemplateSeedShape }
+                .filter { it.baseModel.id !in templateById }
+                .map { it.id }
+"""
+PR_BAD_BARE_SEED_IDS = PR_OK.replace(_VOICE_DECL, "").replace(_VOICE_CASCADE, _VOICE_CASCADE_BARE)
+
+# Regression shape M (da1031-A): updateEntry renamed but did NOT migrate the
+# two prefs-held voice overrides (they dangle and the voice panel silently
+# falls back to the group binding).
+_VOICE_RENAME_BLOCK = """            if (voiceInputOverrideEntryId == oldKey) voiceInputOverrideEntryId = newUuid
+            if (voiceOutputOverrideEntryId == oldKey) voiceOutputOverrideEntryId = newUuid
+"""
+PR_BAD_NO_VOICE_RENAME = PR_OK.replace(_VOICE_RENAME_BLOCK, "")
+
+# Regression shape N: the voice overrides migrated OUTSIDE `if (renamed)` —
+# the migration would fire on every update, not just renames.
+PR_BAD_VOICE_RENAME_OUTSIDE = PR_OK.replace(_VOICE_RENAME_BLOCK, "").replace(
+    """            )?.let { migrated ->
+                AgentRuntimeLimitsPrefs.save(context, compactModelEntryId = migrated)
+            }
+        }
+""",
+    """            )?.let { migrated ->
+                AgentRuntimeLimitsPrefs.save(context, compactModelEntryId = migrated)
+            }
+        }
+""" + _VOICE_RENAME_BLOCK,
+)
 
 # Regression shape H: the applier is called everywhere but its body is empty —
 # a call-site-only arm must not be satisfiable that way.
@@ -589,7 +673,7 @@ def selftest():
             print("  [FAIL] fixed fixture not clean: %s" % (c[0],))
             ok = False
         else:
-            print("  [OK]   fixed fixture: all 8 arms clean")
+            print("  [OK]   fixed fixture: all 9 arms clean")
 
         # 2) pre-fix shape → arm 1 must fire on the missing migration.
         write(PR_BAD_NO_MIGRATION)
@@ -638,8 +722,25 @@ def selftest():
         write(PR_OK, UI_BAD_WRONG_PREFS)
         ok &= _report("ui-wrong-prefs", "arm 8", run_all(tmp), ("8",))
 
-        # 13) ROT control: both files missing must be reported, never silently
-        # green (one finding per file, so a half-populated tree cannot pass).
+        # 14) [da1031-A] arm 6 re-anchored: the bare-seed spelling (all four
+        # routes a no-op) must be red, including the missing declaration.
+        write(PR_BAD_BARE_SEED_IDS)
+        ok &= _report("bare-seed-ids", "arm 6", run_all(tmp), ("6",),
+                      contains="staleEntryIds")
+
+        # 15) [da1031-A] updateEntry rename must migrate the voice overrides.
+        write(PR_BAD_NO_VOICE_RENAME)
+        ok &= _report("no-voice-rename", "arm 9", run_all(tmp), ("9",),
+                      contains="voiceInputOverrideEntryId == oldKey")
+
+        # 16) voice overrides migrated outside `if (renamed)` → containment.
+        write(PR_BAD_VOICE_RENAME_OUTSIDE)
+        ok &= _report("voice-rename-outside", "arm 9", run_all(tmp), ("9",),
+                      contains="must sit INSIDE")
+
+        # 17) ROT control (LAST: it wipes the fixture tree): both files missing
+        # must be reported, never silently green (one finding per file, so a
+        # half-populated tree cannot pass).
         shutil.rmtree(tmp)
         os.makedirs(tmp)
         c = run_all(tmp)
@@ -676,7 +777,7 @@ def main():
         return 2
     checks = run_all(root)
     if not checks:
-        print("compact_entry_pin_migration_check: OK (8 arms green)")
+        print("compact_entry_pin_migration_check: OK (9 arms green)")
         return 0
     for rel, line, arm, msg in checks:
         print("%s:%s [arm %s] %s" % (rel, line, arm, msg))

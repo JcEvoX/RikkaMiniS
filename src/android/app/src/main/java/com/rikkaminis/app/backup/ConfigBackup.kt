@@ -1011,8 +1011,15 @@ object ConfigBackup {
                             it.providerType.name == obj.optString("providerType", "")
                     }?.id
                     if (instId != null) {
+                        // [da1031-A] Key by the BACKUP's original label, not the
+                        // possibly auto-renamed one: Stage 1.5 looks rules up by
+                        // the (providerType, providerLabel) pair the rules export
+                        // carried, and importInstanceJSON's conflict rename
+                        // ("$label ($suffix)") never appears there. Keying by
+                        // resolvedLabel made every renamed import lose its whole
+                        // thinking-rules group.
                         providerKeyToId[
-                            obj.optString("providerType", "") + "\u0000" + resolvedLabel
+                            obj.optString("providerType", "") + "\u0000" + label
                         ] = instId
                     }
                 } catch (t: Throwable) {
@@ -1875,7 +1882,8 @@ object ConfigBackup {
 /**
  * Rewrite the source group/entry ids embedded in a `defaults.*` field to the
  * ids minted during this import. Group-typed fields
- * (primaryGroup / subGroup / agentLoopGroups) map through [groupIdMap];
+ * (primaryGroup / subGroup / voiceInputGroup / voiceOutputGroup /
+ * agentLoopGroups) map through [groupIdMap];
  * agentLoopEntries and `runtime.compactModelEntryId` (the pinned compaction
  * model) map through [entryIdMap]. Everything else is returned
  * unchanged. Unmapped ids are passed through so the field's own writer can
@@ -1887,6 +1895,8 @@ object ConfigBackup {
  * "not reachable — follow the session chain" with a single INFO line, so a
  * restore onto another install silently dropped the user's pinned compaction
  * model instead of failing loudly.
+ * [da1031-A] The two voice-group bindings were absent here for the same
+ * reason *and* absent from the registry, so a restore dropped them twice over.
  */
 internal fun remapDefaultsIds(
     path: String,
@@ -1895,7 +1905,7 @@ internal fun remapDefaultsIds(
     entryIdMap: Map<String, String>,
 ): ConfigValue {
     val map = when (path) {
-        "defaults.primaryGroup", "defaults.subGroup", "defaults.agentLoopGroups" -> groupIdMap
+        "defaults.primaryGroup", "defaults.subGroup", "defaults.voiceInputGroup", "defaults.voiceOutputGroup", "defaults.agentLoopGroups" -> groupIdMap
         "defaults.agentLoopEntries", "runtime.compactModelEntryId" -> entryIdMap
         else -> return value
     }

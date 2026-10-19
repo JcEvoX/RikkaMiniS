@@ -392,8 +392,35 @@ class FileBrowserViewModel(
         loadItems()
     }
 
+    /**
+     * [da1031-C] Linux (PRoot) path of [item] — the same root + relativePath +
+     * name mapping [updatePathComponents] uses for currentLinuxPath, so the
+     * read-only-mount guard sees the path the agent / shell sees. Null when
+     * this browser has no linux root: nothing guest-visible to guard then.
+     */
+    private fun linuxPathOf(item: FileItem): String? =
+        (displayLinuxPrefix ?: linuxRootPath)?.let { root ->
+            val base = root.trimEnd('/')
+            if (relativePath.isEmpty()) "$base/${item.name}"
+            else "$base/$relativePath/${item.name}"
+        }
+
     fun deleteItem(item: FileItem) {
         viewModelScope.launch(Dispatchers.IO) {
+            // [da1031-C] ISSUE-04 A1: guard BEFORE deleting. T219's read-only
+            // mount lock is software-only (PRoot `-b` has no read-only
+            // modifier) and File.delete() works on the HOST path, which that
+            // lock never covers — without this check a Locked mount's files
+            // were really deleted from the UI. Same refusal wording family as
+            // DebugRPCHandler's handleWriteFile guard.
+            linuxPathOf(item)?.let { lp ->
+                if (com.rikkaminis.app.sandbox.PRootKernel.isLinuxPathUnderReadOnlyMount(lp)) {
+                    _uiState.value = _uiState.value.copy(
+                        errorMessage = "Read-only mount: ${item.name} cannot be deleted",
+                    )
+                    return@launch
+                }
+            }
             try {
                 // T10-L5: File.delete()/deleteRecursively() return false instead
                 // of throwing on a read-only mount or missing permission. The

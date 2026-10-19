@@ -1505,6 +1505,55 @@ internal object ConfigBuiltins {
                 },
             )
         )
+        // [da1031-A] The two voice-group bindings are defaults.* references
+        // exactly like primaryGroup/subGroup above. They were never
+        // registered, so ConfigRegistry.exportJSON() — the source of the
+        // backup's `fields` section — could not carry them and a restore
+        // silently dropped both bindings.
+        r.register(
+            ClosureField(
+                path = "defaults.voiceInputGroup",
+                displayName = "Default voice input group",
+                description = "Group that resolves the voice-INPUT model. Empty string clears the default.",
+                valueSchema = ConfigSchema.Str(maxLength = 200),
+                risk = ConfigRisk.SENSITIVE,
+                revertable = true,
+                reader = { ConfigValue.Str(repo.voiceInputGroupId ?: "") },
+                writer = { v ->
+                    val s = (v as? ConfigValue.Str)?.value ?: throw ConfigError.TypeMismatch("string")
+                    if (s.isEmpty()) {
+                        repo.voiceInputGroupId = null
+                    } else {
+                        if (repo.config.value.modelGroups.none { it.id == s }) {
+                            throw ConfigError.InvalidValue("No group with id $s")
+                        }
+                        repo.voiceInputGroupId = s
+                    }
+                },
+            )
+        )
+        r.register(
+            ClosureField(
+                path = "defaults.voiceOutputGroup",
+                displayName = "Default voice output group",
+                description = "Group that resolves the voice-OUTPUT model. Empty string clears the default.",
+                valueSchema = ConfigSchema.Str(maxLength = 200),
+                risk = ConfigRisk.SENSITIVE,
+                revertable = true,
+                reader = { ConfigValue.Str(repo.voiceOutputGroupId ?: "") },
+                writer = { v ->
+                    val s = (v as? ConfigValue.Str)?.value ?: throw ConfigError.TypeMismatch("string")
+                    if (s.isEmpty()) {
+                        repo.voiceOutputGroupId = null
+                    } else {
+                        if (repo.config.value.modelGroups.none { it.id == s }) {
+                            throw ConfigError.InvalidValue("No group with id $s")
+                        }
+                        repo.voiceOutputGroupId = s
+                    }
+                },
+            )
+        )
         r.register(
             ClosureField(
                 path = "defaults.agentLoopEntries",

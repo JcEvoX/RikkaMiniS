@@ -145,6 +145,17 @@ internal suspend fun ChatViewModel.ensureSession(): String {
                 ?.webAppShortcutRepository
                 ?.renameSessionShortcuts(fromDraft = sessionId, toReal = session.id)
         }
+        // [da1031-B ISSUE-02 裂缝B] Same hop for the session-scoped offload
+        // permission verdicts (sessionGrants / sessionDenials). A tool the user
+        // allowed on this draft chat was keyed under `__new__<uuid>`; after the
+        // promotion nothing resolves that key any more, so the decision was
+        // silently dropped and the same tool asked again under the real id.
+        // Contained like the shortcut hop above: a failure here must not abort
+        // the promotion.
+        runCatching {
+            com.rikkaminis.app.offload.OffloadPermissionManager
+                .renameSessionGrants(fromDraft = sessionId, toReal = session.id)
+        }
         // Re-point the lazily-created BrowserTabPool if it was already
         // instantiated against the draft key (e.g. user opened the browser
         // sheet before sending a message). Without this, cookies and

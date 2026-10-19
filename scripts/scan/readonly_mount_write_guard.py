@@ -674,6 +674,109 @@ def check_share_toast_hop(root):
             )
     return violations, rot, sites, notes
 
+
+# ── criterion 5: guard-call SHAPE at the model-carried write sites ──────────
+#
+# [da1031-C] ISSUE-04. The whitelist above is keyed on the PARAMETER NAME, so it
+# cannot see a write that arrives through a model — `deleteItem(item: FileItem)`
+# and `handleWriteFile(params: JSONObject)`. Widening that whitelist was
+# rejected on evidence: measured on this tree it newly flags three legitimate
+# sites (`parseAttachments` / `handleModelUseExec` / `postJsonRpc`), and one of
+# them shares its FILE with a site this criterion exists to protect — a
+# file-level exemption would therefore silently disable the check it was added
+# for. Anchor on the FUNCTION NAME plus the write call instead, and require the
+# guard to PRECEDE the write: a `return@launch` after the delete is not a guard,
+# it is a post-mortem.
+GUARD_SITES = (
+    (
+        "ui/sandbox/FileBrowserViewModel.kt",
+        "deleteItem",
+        re.compile(r"\.deleteRecursively\s*\(|\.delete\s*\("),
+        "deleting a listed item's host file",
+    ),
+    (
+        "debug/DebugRPCHandler.kt",
+        "handleWriteFile",
+        re.compile(r"\.writeBytes\s*\("),
+        "overwriting a host file behind resolveHostPath",
+    ),
+)
+
+# [da1031-C] The route that opens a mounted folder must hand the browser the
+# guest-side prefix. Without it the browser works on a host path, so the guard
+# above never sees a mount path at all — it is unreachable from that entry
+# (and "Copy Absolute Path" copies the host path).
+MOUNT_ROUTE = (
+    "ui/navigation/AppNavigation.kt",
+    "Routes.fileBrowser(",
+    'linuxRoot = "/var/minis/mounts/',
+)
+
+
+def check_guard_call_shape(root):
+    """Returns (violations, rot, sites, notes).
+
+    [PARTIAL] convention, same as [check_blocking_io]: a tree that carries none
+    of these anchors is a synthetic fixture tree (the frozen `test_scan.py`
+    shape), not a regression. As soon as one anchor is present, a missing one is
+    ROT — the criterion lost its subject and says so instead of checking nothing.
+    """
+    anchors = [(rel, fn, rx, label) for rel, fn, rx, label in GUARD_SITES]
+    route_rel, route_anchor, route_needle = MOUNT_ROUTE
+    present = [a for a in anchors if read(root, a[0])]
+    if read(root, route_rel):
+        present.append(MOUNT_ROUTE)
+    if not present:
+        return [], [], 0, [
+            "[PARTIAL] the read-only-mount guard anchors (FileBrowserViewModel / "
+            "DebugRPCHandler / AppNavigation) are absent from this tree — skipped"
+        ]
+
+    violations, rot, sites = [], [], 0
+    for rel, fn, rx, label in anchors:
+        src = read(root, rel)
+        if not src:
+            rot.append(f"{rel}: lost its anchor for {fn}() — criterion 5 cannot run")
+            continue
+        bodies = [body for name, _params, body in functions(strip_comments(src)) if name == fn]
+        if not bodies:
+            rot.append(f"{rel}: no definition of {fn}() — renamed? criterion 5 lost its subject")
+            continue
+        sites += 1
+        body = bodies[0]
+        guard_at = body.find(GUARD)
+        write = rx.search(body)
+        if write is None:
+            rot.append(f"{rel}:{fn}() — the write call is gone; criterion 5 lost its subject")
+            continue
+        if guard_at < 0:
+            violations.append(f"{rel}:{fn}() — {label} without calling {GUARD})")
+        elif guard_at > write.start():
+            violations.append(
+                f"{rel}:{fn}() — {GUARD}) runs AFTER the write it is meant to refuse; "
+                f"move it in front of it"
+            )
+
+    route_src = read(root, route_rel)
+    if not route_src:
+        rot.append(f"{route_rel}: lost its anchor — criterion 5 cannot run")
+        return violations, rot, sites, []
+    # Literal-preserving view: the needle lives inside a string literal, which
+    # the default (collapsing) view replaces with `""`.
+    route_text = strip_comments(route_src, collapse_literals=False)
+    if route_anchor not in route_text:
+        rot.append(f"{route_rel}: no {route_anchor} call — criterion 5 lost its subject")
+        return violations, rot, sites, []
+    sites += 1
+    if route_needle not in route_text:
+        violations.append(
+            f"{route_rel} — the mounted-folder browse route opens the file browser "
+            f"without a guest-side prefix ({route_needle!r} missing): the read-only "
+            f"guard and Copy Absolute Path never see /var/minis/mounts/<name>/…"
+        )
+    return violations, rot, sites, []
+
+
 # ── selftest ────────────────────────────────────────────────────────────────
 
 FILLER_GUARD = "isLinuxPathUnderReadOnlyMount("
@@ -953,16 +1056,125 @@ def _share_receiver(shape="io", toast_hop="hop"):
     )
 
 
+BROWSER_GUARD_BODY = (
+    "        linuxPathOf(item)?.let { lp ->\n"
+    "            if (PRootKernel.isLinuxPathUnderReadOnlyMount(lp)) {\n"
+    "                return@launch\n"
+    "            }\n"
+    "        }\n"
+)
+
+
+def _file_browser_vm(shape="guard"):
+    """Criterion-5 anchor: the delete path of a listed item.
+
+    [shape] guard (default) / direct (no guard) / late (guard AFTER the delete —
+    the post-mortem shape) / renamed (function renamed away → ROT).
+    """
+    guard = "" if shape == "direct" else BROWSER_GUARD_BODY
+    head, tail = ("", guard) if shape == "late" else (guard, "")
+    fn = "deleteEntry" if shape == "renamed" else "deleteItem"
+    return (
+        "package com.rikkaminis.app.ui.sandbox\n"
+        "\n"
+        "class FileBrowserViewModel {\n"
+        "    private fun linuxPathOf(item: FileItem): String? = null\n"
+        "\n"
+        f"    fun {fn}(item: FileItem) {{\n"
+        "        viewModelScope.launch(Dispatchers.IO) {\n"
+        + head +
+        "            try {\n"
+        "                val deleted = if (item.isDirectory) "
+        "item.file.deleteRecursively() else item.file.delete()\n"
+        "            } catch (e: Exception) {\n"
+        "            }\n"
+        + tail +
+        "        }\n"
+        "    }\n"
+        "}\n"
+    )
+
+
+RPC_GUARD_BODY = (
+    "        if (PRootKernel.isLinuxPathUnderReadOnlyMount(path)) {\n"
+    "            throw RPCException(-32000, \"Read-only mount: '$path' is not writable\")\n"
+    "        }\n"
+)
+
+
+def _debug_rpc(shape="guard"):
+    """Criterion-5 anchor: the RPC write path (`params` is not a whitelisted
+    parameter name, which is exactly why this criterion is keyed on the
+    function name)."""
+    guard = "" if shape == "direct" else RPC_GUARD_BODY
+    fn = "handleWrite" if shape == "renamed" else "handleWriteFile"
+    return (
+        "package com.rikkaminis.app.debug\n"
+        "\n"
+        "class DebugRPCHandler {\n"
+        f"    private fun {fn}(params: JSONObject) {{\n"
+        + guard +
+        "        val hostFile = PRootKernel.resolveHostPath(path) ?: File(path)\n"
+        "        hostFile.writeBytes(content.toByteArray())\n"
+        "    }\n"
+        "}\n"
+    )
+
+
+def _app_nav(shape="guard"):
+    """Criterion-5 anchor: the mounted-folder browse route's guest prefix.
+
+    [shape] guard (route carries the prefix) / no_prefix (host path only — the
+    guard above then never sees a mount path) / no_route (no fileBrowser call at
+    all → ROT).
+    """
+    if shape == "no_route":
+        call = ""
+    elif shape == "no_prefix":
+        call = (
+            "        navController.safeNavigate(\n"
+            "            Routes.fileBrowser(\n"
+            "                rootPath = hostPath,\n"
+            "                rootLabel = entry.name,\n"
+            "            ),\n"
+            "        )\n"
+        )
+    else:
+        call = (
+            "        navController.safeNavigate(\n"
+            "            Routes.fileBrowser(\n"
+            "                rootPath = hostPath,\n"
+            "                rootLabel = entry.name,\n"
+            '                linuxRoot = "/var/minis/mounts/${entry.name}",\n'
+            '                displayPrefix = "/var/minis/mounts/${entry.name}",\n'
+            "            ),\n"
+            "        )\n"
+        )
+    return (
+        "package com.rikkaminis.app.ui.navigation\n"
+        "\n"
+        "class AppNavigation {\n"
+        "    private fun mountedFolderDetail(hostPath: String?) {\n"
+        + call +
+        "    }\n"
+        "}\n"
+    )
+
+
 def write_io_fixture(root, store_shape="io", log_shape="io", store_fn="probeWritable",
                      drop_store=False, drop_log=False, data_pkg=True, ui_pkg=True,
                      keep_pkgs_when_dropped=True, share_shape="io", drop_share=False,
-                     toast_hop="hop", rootfs_shape="io", drop_rootfs=False):
+                     toast_hop="hop", rootfs_shape="io", drop_rootfs=False,
+                     browser_shape="guard", rpc_shape="guard", nav_shape="guard",
+                     drop_guard_anchors=False):
     """A `com/rikkaminis/app` tree carrying both criterion-2 targets.
 
     [keep_pkgs_when_dropped] leaves an unrelated file in the package whose anchor
     was dropped, which is what a *moved* file looks like (ROT). With it off, the
     package is gone too, which is what a synthetic fixture tree looks like
-    ([PARTIAL] — the frozen `test_scan.py` shape).
+    ([PARTIAL] — the frozen `test_scan.py` shape). [drop_guard_anchors] removes
+    criterion 5's three anchors outright, which is the same [PARTIAL] shape for
+    that criterion.
     """
     app = os.path.join(root, APP_REL)
     files = {}
@@ -994,6 +1206,14 @@ def write_io_fixture(root, store_shape="io", log_shape="io", store_fn="probeWrit
         files.pop("data/MountRegistry.kt", None)
     if not ui_pkg:
         files.pop("ui/settings/OtherScreen.kt", None)
+    # Criterion 5's anchors belong to the same "did this tree ever ship the
+    # package?" question: in the synthetic shape (keep_pkgs_when_dropped=False)
+    # writing FileBrowserViewModel.kt would make `ui/sandbox/` exist again and
+    # trip criterion 4's moved-file rot guard.
+    if not drop_guard_anchors and keep_pkgs_when_dropped:
+        files["ui/sandbox/FileBrowserViewModel.kt"] = _file_browser_vm(browser_shape)
+        files["debug/DebugRPCHandler.kt"] = _debug_rpc(rpc_shape)
+        files["ui/navigation/AppNavigation.kt"] = _app_nav(nav_shape)
     for rel, text in files.items():
         path = os.path.join(app, *rel.split("/"))
         if not os.path.isdir(os.path.dirname(path)):
@@ -1075,6 +1295,26 @@ def selftest():
     run("a tree that never shipped the rootfs ViewModel package is skipped, not failed", False,
         "[PARTIAL]", drop_rootfs=True, keep_pkgs_when_dropped=False)
 
+    # ── criterion 5 (da1031-C) ──────────────────────────────────────────────
+    run("the mounted-folder browser keeps the read-only guard in front of the delete", False,
+        "model-carried write/route site(s) carry the guard")
+    run("a delete that skips the read-only guard is caught", True,
+        "FileBrowserViewModel.kt:deleteItem(", browser_shape="direct")
+    run("a guard placed AFTER the delete is caught (post-mortem is not a guard)", True,
+        "runs AFTER the write", browser_shape="late")
+    run("a renamed deleteItem is a rot failure, not a silent skip", True,
+        "no definition of deleteItem(", browser_shape="renamed")
+    run("an RPC write that skips the read-only guard is caught", True,
+        "DebugRPCHandler.kt:handleWriteFile(", rpc_shape="direct")
+    run("a renamed handleWriteFile is a rot failure, not a silent skip", True,
+        "no definition of handleWriteFile(", rpc_shape="renamed")
+    run("a mounted-folder route that drops the guest prefix is caught", True,
+        "without a guest-side prefix", nav_shape="no_prefix")
+    run("a route whose fileBrowser call was removed is a rot failure", True,
+        "no Routes.fileBrowser( call", nav_shape="no_route")
+    run("a tree that never shipped the criterion-5 anchors is skipped, not failed", False,
+        "[PARTIAL] the read-only-mount guard anchors", drop_guard_anchors=True)
+
     print("=== readonly_mount_write_guard --selftest ===")
     failed = 0
     for name, ok, note in results:
@@ -1096,6 +1336,7 @@ def main():
     violations, checked, files, exempt_used = scan(root)
     io_violations, io_rot, io_sites, io_notes = check_blocking_io(root)
     hop_violations, hop_rot, hop_sites, hop_notes = check_share_toast_hop(root)
+    shape_violations, shape_rot, shape_sites, shape_notes = check_guard_call_shape(root)
 
     rot = []
     if files < 20:
@@ -1104,12 +1345,13 @@ def main():
         rot.append(f"only {checked} path-parameter write sites found — the detector stopped matching?")
     rot += io_rot
     rot += hop_rot
+    rot += shape_rot
     if rot:
         print("ROT — the guard can no longer see what it is supposed to check:")
         for r in rot:
             print(f"  ✗ {r}")
         return 1
-    for n in io_notes + hop_notes:
+    for n in io_notes + hop_notes + shape_notes:
         print(f"  {n}")
     if violations or io_violations:
         print("Unguarded host-file writes:")
@@ -1119,12 +1361,21 @@ def main():
         print("UI calls left on the wrong thread:")
         for v in hop_violations:
             print(f"  ✗ {v}")
-    if violations or io_violations or hop_violations:
+    if shape_violations:
+        print("Read-only-mount guard not wired at the model-carried write site:")
+        for v in shape_violations:
+            print(f"  ✗ {v}")
+    if violations or io_violations or hop_violations or shape_violations:
         return 1
     print(f"OK: {checked} path-parameter write site(s) guarded ({files} files scanned)")
     print(f"    {io_sites} blocking-IO call site(s) inside Dispatchers.IO")
     if hop_sites:
         print(f"    {hop_sites} share UI hand-off verified on a Looper thread")
+    if shape_sites:
+        print(
+            f"    {shape_sites} model-carried write/route site(s) carry the guard "
+            f"in front of the write"
+        )
     for rel, reason in sorted(exempt_used.items()):
         print(f"  · exempt {rel}: {reason}")
     return 0

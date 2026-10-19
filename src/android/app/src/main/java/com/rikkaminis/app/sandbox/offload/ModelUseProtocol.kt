@@ -337,6 +337,34 @@ internal object ModelUseProtocol {
     }
 
     /**
+     * [da1031-D ISSUE-08] Can an instance of this provider/credential pair be
+     * served by an OpenAI Images API endpoint at all?
+     *
+     * These are the three provider/credential legs of [decideImageRoute],
+     * extracted so the judge has exactly one body. `QuickTestSheet` used to
+     * re-decide eligibility with its own copy of the rule (`providerType ==
+     * openAI`), so an OpenRouter / xAI image model was refused on the card
+     * while the worker would have routed it fine.
+     *
+     * OAuth credentials are excluded: the Images API is authenticated with an
+     * API key, not the OAuth bearer the chat path may carry.
+     */
+    fun supportsImageApiRoute(
+        providerType: ProviderType?,
+        credentialType: ProviderCredential?,
+        isOpenAiCompatibleProvider: Boolean,
+    ): Boolean {
+        if (!isOpenAiCompatibleProvider) return false
+        if (providerType != ProviderType.openAI &&
+            providerType != ProviderType.openRouter &&
+            providerType != ProviderType.xAI
+        ) {
+            return false
+        }
+        return credentialType != ProviderCredential.oauth
+    }
+
+    /**
      * Where should an image-output model send this `run` call?
      *
      * Ported verbatim from `:app`'s `tryImageGenerationRoute`, with the
@@ -355,16 +383,13 @@ internal object ModelUseProtocol {
         imageEndpointResolved: ImageEndpointMode?,
         endpointOverride: ImageEndpointMode?,
     ): ImageRoute {
-        // Only OpenAI-compatible API-key instances have an Images API.
-        if (!isOpenAiCompatibleProvider) return ImageRoute.ChatPath
-        if (outputModalities.none { it.equals("image", ignoreCase = true) }) return ImageRoute.ChatPath
-        if (providerType != ProviderType.openAI &&
-            providerType != ProviderType.openRouter &&
-            providerType != ProviderType.xAI
-        ) {
+        // Only OpenAI-compatible API-key instances have an Images API. The
+        // provider/credential legs live in [supportsImageApiRoute] (single
+        // source — the QuickTest card calls the same function).
+        if (!supportsImageApiRoute(providerType, credentialType, isOpenAiCompatibleProvider)) {
             return ImageRoute.ChatPath
         }
-        if (credentialType == ProviderCredential.oauth) return ImageRoute.ChatPath
+        if (outputModalities.none { it.equals("image", ignoreCase = true) }) return ImageRoute.ChatPath
 
         val pure = isPureImageGenerator(outputModalities)
         // [F-10 gap 1] A pure image generator WITHOUT `-o <media ext>` used to

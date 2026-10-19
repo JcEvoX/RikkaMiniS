@@ -29,6 +29,24 @@ one field/artifact points at something that no longer exists on the target":
      one artifact a device transfer cannot regenerate. Symmetrically,
      deleteFile guarded GLOBAL.md / SOUL.md but not the rollup.
 
+  D. VOICE GROUP BINDINGS (ConfigBuiltins.registerDefaults + remapDefaultsIds)
+     [da1031-A] `defaults.voiceInputGroup` / `defaults.voiceOutputGroup` are
+     group-id references exactly like `defaults.primaryGroup`, but they were
+     missing from BOTH the registry (so exportJSON() never carried them in the
+     backup's `fields` section) and `remapDefaultsIds` (so a restore that did
+     carry them left them pointing at the source install's group id). Either
+     way NULL on the target — the voice panel silently falls back to the
+     System engine. Both halves are needed: registering without remapping
+     heals nothing, remapping without registering never sees a value.
+
+  E. THINKING-RULE RE-ATTACH KEY (ConfigBackup.import Stage 1 vs Stage 1.5)
+     [da1031-A] rules ride a (providerType, providerLabel) key. Stage 1 used
+     to register with the label importInstanceJSON RESOLVED (auto-renamed to
+     "$label ($suffix)" on a collision) while Stage 1.5 looks up the backup's
+     ORIGINAL providerLabel — on any install that already had the provider,
+     the whole thinking-rules group was silently dropped. Both sides must
+     spell the backup's own label.
+
 Registered gates assert the ROUTING/PRESENCE of the decision, not the absence
 of a spelling, so a refactor that keeps the contract is a deliberate edit here.
 
@@ -44,6 +62,7 @@ import sys
 
 CFG_REL = "src/android/app/src/main/java/com/rikkaminis/app/backup/ConfigBackup.kt"
 MEM_REL = "src/android/app/src/main/java/com/rikkaminis/app/data/repository/MemoryRepository.kt"
+BUILTINS_REL = "src/android/app/src/main/java/com/rikkaminis/app/config/ConfigBuiltins.kt"
 
 COMPACT_PATH = '"runtime.compactModelEntryId"'
 ROLLUP_ARG = "com.rikkaminis.app.workspace.MemoryRollupEngine.ROLLUP_FILE"
@@ -51,6 +70,30 @@ REMAP_SESSION_CALL = "remapSessionBindingJson("
 MEM_PACK_CALL = "memoryBackupEntries("
 ROLLUP_GUARD = "if (name == ROLLUP_FILE) return false"
 SAVE_BY_NAME = "memoryRepo.saveFile(name, content)"
+
+# ── [da1031-A] ISSUE-03: the two voice-group bindings ────────────────────
+# D. VOICE GROUP BINDINGS (registry + remapDefaultsIds + thinking-rule key)
+#    `defaults.voiceInputGroup` / `defaults.voiceOutputGroup` are group-id
+#    references exactly like `defaults.primaryGroup`, but they were missing
+#    from BOTH the registry (so ConfigRegistry.exportJSON() never carried them
+#    in the backup's `fields` section) and `remapDefaultsIds` (so a restore
+#    that did carry them left them pointing at the source install's group id).
+#    NULL on the target either way — the voice panel silently falls back to the
+#    System engine. Both halves are needed: registering without remapping heals
+#    nothing, remapping without registering never sees a value.
+VOICE_GROUP_PATHS = ("defaults.voiceInputGroup", "defaults.voiceOutputGroup")
+VOICE_GROUP_READERS = ("repo.voiceInputGroupId ?: \"\"", "repo.voiceOutputGroupId ?: \"\"")
+
+# E. THINKING-RULE RE-ATTACH KEY (Stage 1 registration vs Stage 1.5 lookup)
+#    Rules ride a (providerType, providerLabel) key. Stage 1 used to register
+#    the key with the label importInstanceJSON RESOLVED (auto-renamed to
+#    "$label ($suffix)" on a collision), while Stage 1.5 looks up the backup's
+#    original providerLabel — so on any install that already had the provider,
+#    the whole thinking-rules group was dropped. Both sides must spell the
+#    backup's own label.
+STAGE1_KEY_CALL = "providerKeyToId["
+STAGE1_KEY_END = "] = instId"
+STAGE15_LOOKUP = 'providerKeyToId["$type\\u0000$label"]'
 
 
 def code_only(text):
@@ -209,15 +252,121 @@ def check_delete_guard(src):
     return []
 
 
-def check(root, raw_cfg=None, raw_mem=None):
+def check_voice_group_remap(src):
+    """D2: remapDefaultsIds must route both voice group paths to groupIdMap."""
+    body = function_text(src, "fun remapDefaultsIds(")
+    if body is None:
+        return [(CFG_REL, 0, "remapDefaultsIds( not found — gate ROT")]
+    when = body.find("when (path)")
+    if when < 0:
+        return [(CFG_REL, 0, "remapDefaultsIds no longer branches on `path` — gate ROT")]
+    end = _balanced(body, body.find("{", when), "{", "}")
+    branch = body[when:end if end > 0 else len(body)]
+    out = []
+    for path in VOICE_GROUP_PATHS:
+        routed = False
+        for line in branch.split("\n"):
+            code = line.split("//")[0]
+            if ('"%s"' % path) in code and "->" in code:
+                if "groupIdMap" in code.split("->", 1)[1]:
+                    routed = True
+        if not routed:
+            out.append((
+                CFG_REL,
+                line_of(src, src.find("fun remapDefaultsIds(")),
+                "remapDefaultsIds does not route \"%s\" to groupIdMap — a restored "
+                "install keeps the source install's group id and the voice binding dangles" % path,
+            ))
+    return out
+
+
+def check_voice_defaults_registered(src_builtins):
+    """D1: registerDefaults must register both voice group bindings, reading
+    and writing the repository properties (a registered field that does not
+    touch the repo would export "" forever)."""
+    body = function_text(src_builtins, "fun registerDefaults(")
+    if body is None:
+        return [(BUILTINS_REL, 0, "registerDefaults( not found — gate ROT")]
+    code = code_only(body)
+    base = line_of(src_builtins, src_builtins.find("fun registerDefaults("))
+    out = []
+    for path, reader in zip(VOICE_GROUP_PATHS, VOICE_GROUP_READERS):
+        if ('path = "%s"' % path) not in code:
+            out.append((
+                BUILTINS_REL,
+                base,
+                "\"%s\" is not registered in ConfigBuiltins.registerDefaults — "
+                "the backup `fields` section cannot carry it and a restore drops "
+                "the voice binding" % path,
+            ))
+        elif reader not in code:
+            out.append((
+                BUILTINS_REL,
+                base,
+                "\"%s\" is registered but its reader does not read %s — the field "
+                "exports a constant instead of the live binding" % (path, reader.split(" ?:")[0].strip()),
+            ))
+    return out
+
+
+def _provider_key_assignment(src):
+    """The `providerKeyToId[…] = instId` Stage-1 assignment text (code only)."""
+    body = function_text(src, "    suspend fun import(")
+    if body is None:
+        return None
+    i = body.find(STAGE1_KEY_CALL)
+    if i < 0:
+        return None
+    j = body.find(STAGE1_KEY_END, i)
+    if j < 0:
+        return None
+    return code_only(body[i:j])
+
+
+def check_thinking_rule_key(src):
+    """E: Stage 1 must key by the BACKUP's original label (Stage 1.5 looks the
+    (providerType, providerLabel) pair up — never the rename result), and the
+    Stage 1.5 lookup must keep the same key shape."""
+    body = function_text(src, "    suspend fun import(")
+    if body is None:
+        return [(CFG_REL, 0, "import( not found — gate ROT")]
+    base = line_of(src, src.find("    suspend fun import("))
+    key = _provider_key_assignment(src)
+    if key is None:
+        return [(CFG_REL, base,
+                 "Stage 1 no longer registers " + STAGE1_KEY_CALL + "…" + STAGE1_KEY_END +
+                 " — thinking rules can never re-attach to a restored provider")]
+    if "resolvedLabel" in key:
+        return [(CFG_REL, base,
+                 "Stage 1 keys the thinking-rule lookup by the auto-renamed label "
+                 "(resolvedLabel) — Stage 1.5 looks up the backup's original "
+                 "(providerType, providerLabel) pair, so a label-conflict import "
+                 "silently loses its whole thinking-rules group")]
+    if "+ label" not in key:
+        return [(CFG_REL, base,
+                 "Stage 1 provider key no longer uses the backup's original label")]
+    if STAGE15_LOOKUP not in code_only(body):
+        return [(CFG_REL, base,
+                 "Stage 1.5 no longer looks up " + STAGE15_LOOKUP +
+                 " — the two sides of the (providerType, providerLabel) contract diverged")]
+    return []
+
+
+def check(root, raw_cfg=None, raw_mem=None, raw_builtins=None):
     if raw_cfg is None:
         with open(os.path.join(root, CFG_REL), encoding="utf-8") as f:
             raw_cfg = f.read()
     if raw_mem is None:
         with open(os.path.join(root, MEM_REL), encoding="utf-8") as f:
             raw_mem = f.read()
+    if raw_builtins is None:
+        with open(os.path.join(root, BUILTINS_REL), encoding="utf-8") as f:
+            raw_builtins = f.read()
     out = []
     out += check_remap_defaults(raw_cfg)
+    out += check_voice_group_remap(raw_cfg)
+    out += check_voice_defaults_registered(raw_builtins)
+    out += check_thinking_rule_key(raw_cfg)
     out += check_import_chat_sections(raw_cfg)
     out += check_memory_pack(raw_cfg)
     out += check_restore_writeback(raw_cfg)
@@ -235,17 +384,22 @@ def selftest(root):
         cfg = f.read()
     with open(os.path.join(root, MEM_REL), encoding="utf-8") as f:
         mem = f.read()
+    with open(os.path.join(root, BUILTINS_REL), encoding="utf-8") as f:
+        bui = f.read()
 
     def on_cfg(fn):
-        return lambda c, m: fn(c)
+        return lambda c, m, b, _fn=fn: _fn(c)
 
     def on_mem(fn):
-        return lambda c, m: fn(m)
+        return lambda c, m, b, _fn=fn: _fn(m)
+
+    def on_bui(fn):
+        return lambda c, m, b, _fn=fn: _fn(b)
 
     arms = []
 
-    def arm(name, crit, cfg=cfg, mem=mem):
-        arms.append((name, crit, cfg, mem))
+    def arm(name, crit, cfg=cfg, mem=mem, bui=bui):
+        arms.append((name, crit, cfg, mem, bui))
 
     def sub_once(text, old, new):
         assert text.count(old) >= 1, "fixture anchor missing: " + old
@@ -322,14 +476,63 @@ def selftest(root):
         mem=sub_once(mem, "        " + ROLLUP_GUARD + "\n", ""),
     )
 
+    # ── [da1031-A] arms 9-13 ─────────────────────────────────────────────
+    # 9. voice group binding dropped from remapDefaultsIds' group branch.
+    arm(
+        "M9 voiceInputGroup not routed",
+        on_cfg(check_voice_group_remap),
+        cfg=sub_once(cfg, '"defaults.voiceInputGroup", ', ""),
+    )
+    # 9b. routed to the WRONG map.
+    arm(
+        "M9b voiceOutputGroup routed to entryIdMap",
+        on_cfg(check_voice_group_remap),
+        cfg=sub_once(cfg,
+                     '"defaults.voiceOutputGroup", "defaults.agentLoopGroups" -> groupIdMap',
+                     '"defaults.agentLoopGroups" -> groupIdMap\n        "defaults.voiceOutputGroup" -> entryIdMap'),
+    )
+    # 10. registration dropped (path re-spelled → resolveField/exportJSON miss).
+    arm(
+        "M10 voiceOutputGroup unregistered",
+        on_bui(check_voice_defaults_registered),
+        bui=sub_once(bui, 'path = "defaults.voiceOutputGroup",', 'path = "defaults.voiceOutputGroupUnused",'),
+    )
+    # 10b. registered but reading a constant instead of the repo property.
+    arm(
+        "M10b voiceInputGroup reader detached",
+        on_bui(check_voice_defaults_registered),
+        bui=sub_once(bui, 'reader = { ConfigValue.Str(repo.voiceInputGroupId ?: "") },',
+                     'reader = { ConfigValue.Str("") },'),
+    )
+    # 11. Stage 1 keyed by the auto-renamed label again (the ISSUE-03-B defect).
+    arm(
+        "M11 stage1 keyed by resolvedLabel",
+        on_cfg(check_thinking_rule_key),
+        cfg=sub_once(cfg, 'obj.optString("providerType", "") + "\\u0000" + label',
+                     'obj.optString("providerType", "") + "\\u0000" + resolvedLabel'),
+    )
+    # 11b. Stage 1.5 lookup diverged from the Stage 1 key.
+    arm(
+        "M11b stage15 lookup diverged",
+        on_cfg(check_thinking_rule_key),
+        cfg=sub_once(cfg, 'providerKeyToId["$type\\u0000$label"]',
+                     'providerKeyToId["$type\\u0000" + resolvedLabelFor(label)]'),
+    )
+    # 11c. Stage 1 key registration removed entirely.
+    arm(
+        "M11c stage1 registration removed",
+        on_cfg(check_thinking_rule_key),
+        cfg=sub_once(cfg, STAGE1_KEY_CALL, "providerKeyMap["),
+    )
+
     failures = []
-    for name, crit, c, m in arms:
-        violations = check(root, raw_cfg=c, raw_mem=m)
+    for name, crit, c, m, b in arms:
+        violations = check(root, raw_cfg=c, raw_mem=m, raw_builtins=b)
         if crit is None:
             if violations:
                 failures.append("%s: expected GREEN, got %r" % (name, violations))
             continue
-        expected = crit(c, m)
+        expected = crit(c, m, b)
         if not expected:
             failures.append("%s: criterion did not fire (dead tooth)" % name)
             continue

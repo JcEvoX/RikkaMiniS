@@ -409,10 +409,21 @@ private fun AudioReplyContent(data: ByteArray) {
         isReady = true
         play()
     }
+    // [da1031-D ISSUE-08] The clip's lifetime is bound to the file key itself,
+    // not to the composable: a re-test replaces `file` (remember(data)) and
+    // this keyed effect deletes the clip that just went out of use. The old
+    // Unit-keyed effect only ever saw the LAST file, so every re-test leaked
+    // its predecessor in cacheDir. Registration order keeps the teardown order
+    // of the original block: reverse-dispose releases the player first, then
+    // deletes the clip.
+    androidx.compose.runtime.DisposableEffect(file) {
+        onDispose {
+            runCatching { file.delete() }
+        }
+    }
     androidx.compose.runtime.DisposableEffect(Unit) {
         onDispose {
             runCatching { player.release() }
-            runCatching { file.delete() }
         }
     }
 
@@ -569,7 +580,19 @@ private suspend fun performTest(
         }
 
         QuickTestKind.IMAGE_GEN -> {
-            if (instance.providerType != com.rikkaminis.app.data.model.ProviderType.openAI) {
+            // [da1031-D ISSUE-08] Eligibility is ModelUseProtocol's call now —
+            // the same predicate the worker applies inside decideImageRoute.
+            // The old hardcode (`providerType == openAI`) refused an OpenRouter
+            // / xAI image model on this card even though the worker routes it
+            // fine, so the card lied about the provider's capability.
+            if (!com.rikkaminis.app.sandbox.offload.ModelUseProtocol.supportsImageApiRoute(
+                    providerType = instance.providerType,
+                    credentialType = instance.credentialType,
+                    isOpenAiCompatibleProvider =
+                        com.rikkaminis.app.sandbox.offload.ModelUseProtocol
+                            .isOpenAiCompatibleProviderType(instance.providerType),
+                )
+            ) {
                 return@withContext failure(context.getString(R.string.quicktest_image_unsupported))
             }
             runCatching {
@@ -583,6 +606,25 @@ private suspend fun performTest(
                     quality = null,
                 )) {
                     is com.rikkaminis.app.sandbox.offload.ProviderExecutionGateway.SendResult.Success -> {
+                        // [da1031-D ISSUE-08] The worker's auto-probe answer rides
+                        // back on the raw result; the model-use offload path
+                        // persists it (ModelUseOffloadHandler), this card used to
+                        // drop it — so every image test re-probed from scratch.
+                        // Same rule as there: write only a non-empty, known mode,
+                        // ignore anything else; a cache write must never turn a
+                        // successful test into a failure.
+                        runCatching {
+                            org.json.JSONObject(r.rawJson)
+                                .optString("image_endpoint_resolved", "")
+                                .takeIf { it.isNotEmpty() }
+                                ?.let { cached ->
+                                    com.rikkaminis.app.data.model.ImageEndpointMode.values()
+                                        .firstOrNull { it.name == cached }
+                                        ?.let { mode ->
+                                            providerRepository.setImageEndpointResolved(instance.id, mode)
+                                        }
+                                }
+                        }
                         val img = r.response.mediaAttachments.firstOrNull {
                             it.type == LLMMediaAttachment.MediaType.IMAGE
                         } ?: return@runCatching failure(context.getString(R.string.quicktest_no_image))

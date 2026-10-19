@@ -51,6 +51,10 @@ Selftest：≥4 夹具，每条判据至少一个「恰好被它打破」的形�
       含 `azureMode`，且认证头来源在允许清单内
       （`probeAuthHeader(` / 共享单源 `applyOpenAIKeyAuth(` / 字面 `"api-key"`）。
       允许清单是刻意的：单源化落地后形状合法，但「不分叉地一律 Bearer」必须红。
+  C10 [da1031-D ISSUE-07] 认证头**只有一个本体**：OpenAIAuthHeader.kt 必须定义
+      `openAIKeyAuthHeader(…)`，且它的 `applyOpenAIKeyAuth` 与 debug 面的
+      `probeAuthHeader` 都必须**委托**它、自己不再内联 `"api-key"` 字面（表达式体
+      函数用 decl_window 取窗口，extract_function 的括号配平取不到）。
   C8  config 面（ConfigBuiltins.kt）`providers` 的**实例字典块**（`path =
       "providers"` 之后最近的 `linkedMapOf(`，括号配平）含 `"azureMode"` /
       `"imageEndpointMode"` / `"imageEndpointResolved"` 三键（与 Debug RPC 的
@@ -119,6 +123,26 @@ AZURE_MODE_PARSE = re.compile(r'optBoolean\(\s*"azureMode"')
 # C7 allowlist: the azure/bearer fork may come from the local pure helper (with its
 # own single literal), from a shared single-source helper, or be written inline.
 PROBE_AUTH_ROUTE_TOKENS = ("probeAuthHeader(", "applyOpenAIKeyAuth(", '"api-key"')
+# ---- [da1031-D ISSUE-07] the fork has exactly one body (C10) ----
+AUTH_HEADER_FILE = "OpenAIAuthHeader.kt"
+AUTH_SINGLE_SOURCE_FN = "openAIKeyAuthHeader"
+PROBE_AUTH_FN = "probeAuthHeader"
+APPLY_AUTH_FN = "applyOpenAIKeyAuth"
+AUTH_FORK_TOKENS = ('"api-key"',)
+# ---- [da1031-D ISSUE-06] group session-default fields on every face (C11) ----
+GROUP_LIST_FN = "groupsList"
+GROUP_TO_JSON_FN = "groupToJson"
+GROUP_CREATE_FN = "groupsCreate"
+GROUP_UPDATE_FN = "groupsUpdate"
+# Read/echo faces: JSON keys as emitted by the debug + mutation RPC faces.
+GROUP_RPC_KEYS = ('put("defaultThinkingLevel"', 'put("contextLimitTokens"')
+# Write faces: the same fields must be ACCEPTED by create/update, not just
+# echoed back (an echo-only face is read-only in disguise).
+GROUP_RPC_PARAM_KEYS = ('"defaultThinkingLevel"', '"contextLimitTokens"')
+# Config face (minis-config `groups` collection): snake_case equivalents.
+GROUP_CONFIG_KEYS = ('"default_thinking_level"', '"context_limit_tokens"')
+GROUPS_PATH_MARKER = 'path = "groups"'
+PATH_MARKER_PAT = re.compile(r'path\s*=\s*"')
 # C8: the per-instance dictionary inside the read-only `providers` aggregate.
 PROVIDERS_PATH_MARKER = 'path = "providers"'
 INSTANCE_DICT_MARKER = "linkedMapOf("
@@ -324,6 +348,31 @@ def enclosing_function(code, pos):
     return best
 
 
+# Top-level declaration start: the optional visibility/suspend words, then
+# fun/val/object/class/interface. Used to bound a declaration's window.
+TOP_DECL_PAT = re.compile(
+    r"\n(?=(?:internal\s+|private\s+|public\s+|suspend\s+|internal\s+suspend\s+)*"
+    r"(?:fun|val|object|class|interface|enum class|data class)\b)"
+)
+
+
+def decl_window(code, name):
+    """Text of a top-level declaration named [name], from its ``fun`` keyword to
+    the next top-level declaration. ``extract_function`` cannot serve here: the
+    auth single-source faces are EXPRESSION-BODY functions (``= …``), so a
+    brace matcher would run into the next block's braces and return the wrong
+    span. Extension receivers (``fun Request.Builder.applyOpenAIKeyAuth(``) are
+    matched too."""
+    m = re.search(
+        r"\bfun\s+(?:[A-Za-z_][\w.]*\.)?" + re.escape(name) + r"\s*\(", code
+    )
+    if not m:
+        return None
+    rest = code[m.end():]
+    nxt = TOP_DECL_PAT.search(rest)
+    return rest[: nxt.start()] if nxt else rest
+
+
 def base_url_write_offsets(code):
     """Sorted offsets of every customBaseURL write site (see BASE_URL_WRITE_PATS)."""
     offs = set()
@@ -336,7 +385,7 @@ def base_url_write_offsets(code):
 def check_tree(root):
     """Returns (rc, detail dict). rc=0 all green."""
     detail = {"c1": [], "c2": [], "c3": [], "c4": [], "c5": [], "c6": [], "c7": [],
-              "c8": [], "c9": [], "fail_closed": []}
+              "c8": [], "c9": [], "c10": [], "c11": [], "fail_closed": []}
 
     debug_paths = find_files(root, DEBUG_FILE)
     mut_paths = find_files(root, MUTATION_FILE)
@@ -608,8 +657,104 @@ def check_tree(root):
                     % (CONNECTION_SCREEN_FILE, UA_WRITABLE_TOKEN)
                 )
 
+    # ---- C10 ---- [da1031-D ISSUE-07] the azure/bearer fork has ONE body
+    # Two faces of the same decision: `openAIKeyAuthHeader` (the shared pair
+    # builder) and the debug probe's `probeAuthHeader`. Both must be thin
+    # wrappers — a face that carries its own `"api-key"` literal is the second
+    # copy this arm exists to catch (C7 only pins WHERE the probe's header
+    # comes from, this pins that there is one body behind it).
+    auth_paths = find_files(root, AUTH_HEADER_FILE)
+    if len(auth_paths) != 1:
+        detail["fail_closed"].append(
+            "expected exactly one %s, found %d" % (AUTH_HEADER_FILE, len(auth_paths))
+        )
+    else:
+        with open(auth_paths[0], encoding="utf-8") as f:
+            auth_code = strip_comments(f.read())
+        if re.search(r"\bfun\s+" + AUTH_SINGLE_SOURCE_FN + r"\s*\(", auth_code) is None:
+            detail["c10"].append(
+                "%s: %s(…) is not defined — callers cannot delegate to a missing "
+                "single source (fail-closed)" % (AUTH_HEADER_FILE, AUTH_SINGLE_SOURCE_FN)
+            )
+        apply_win = decl_window(auth_code, APPLY_AUTH_FN)
+        if apply_win is None:
+            detail["fail_closed"].append(
+                "%s: %s not found (fail-closed)" % (AUTH_HEADER_FILE, APPLY_AUTH_FN)
+            )
+        elif AUTH_SINGLE_SOURCE_FN + "(" not in apply_win:
+            detail["c10"].append(
+                "%s: %s does not delegate to %s(…)"
+                % (AUTH_HEADER_FILE, APPLY_AUTH_FN, AUTH_SINGLE_SOURCE_FN)
+            )
+        elif any(tok in apply_win for tok in AUTH_FORK_TOKENS):
+            detail["c10"].append(
+                "%s: %s still inlines the azure/bearer literal(s) %s"
+                % (AUTH_HEADER_FILE, APPLY_AUTH_FN, AUTH_FORK_TOKENS)
+            )
+    probe_win = decl_window(mut_code, PROBE_AUTH_FN)
+    if probe_win is None:
+        detail["fail_closed"].append(
+            "%s: %s not found (fail-closed)" % (MUTATION_FILE, PROBE_AUTH_FN)
+        )
+    elif AUTH_SINGLE_SOURCE_FN + "(" not in probe_win:
+        detail["c10"].append(
+            "%s: %s does not delegate to %s(…) — the debug fork is back"
+            % (MUTATION_FILE, PROBE_AUTH_FN, AUTH_SINGLE_SOURCE_FN)
+        )
+    elif any(tok in probe_win for tok in AUTH_FORK_TOKENS):
+        detail["c10"].append(
+            "%s: %s still inlines the azure/bearer literal(s) %s"
+            % (MUTATION_FILE, PROBE_AUTH_FN, AUTH_FORK_TOKENS)
+        )
+
+    # ---- C11 ---- [da1031-D ISSUE-06] the group session-default fields live on
+    # every face that reads or writes a group. The config collection already
+    # carried them; the two RPC faces (read `groupsList`, echo `groupToJson`)
+    # and the write path (`groupsCreate`/`groupsUpdate`) did not — so a group's
+    # thinking level / context limit was invisible and unsettable over RPC while
+    # minis-config could set both. Field-set equality is what this arm pins.
+    group_list = extract_function(debug_code, GROUP_LIST_FN)
+    if group_list is None:
+        detail["fail_closed"].append(
+            "%s: %s not found (fail-closed)" % (DEBUG_FILE, GROUP_LIST_FN)
+        )
+    else:
+        missing = [t for t in GROUP_RPC_KEYS if t not in group_list]
+        if missing:
+            detail["c11"].append("%s: %s missing %s" % (DEBUG_FILE, GROUP_LIST_FN, missing))
+    to_json = extract_function(mut_code, GROUP_TO_JSON_FN)
+    if to_json is None:
+        detail["fail_closed"].append(
+            "%s: %s not found (fail-closed)" % (MUTATION_FILE, GROUP_TO_JSON_FN)
+        )
+    else:
+        missing = [t for t in GROUP_RPC_KEYS if t not in to_json]
+        if missing:
+            detail["c11"].append("%s: %s missing %s" % (MUTATION_FILE, GROUP_TO_JSON_FN, missing))
+    for fn in (GROUP_CREATE_FN, GROUP_UPDATE_FN):
+        body = extract_function(mut_code, fn)
+        if body is None:
+            detail["fail_closed"].append("%s: %s not found (fail-closed)" % (MUTATION_FILE, fn))
+            continue
+        missing = [t for t in GROUP_RPC_PARAM_KEYS if t not in body]
+        if missing:
+            detail["c11"].append("%s: %s does not accept %s" % (MUTATION_FILE, fn, missing))
+    groups_idx = cfg_code.find(GROUPS_PATH_MARKER)
+    if groups_idx < 0:
+        detail["fail_closed"].append(
+            "%s: anchor %s not found (fail-closed)" % (CONFIG_BUILTINS_FILE, GROUPS_PATH_MARKER)
+        )
+    else:
+        nxt = PATH_MARKER_PAT.search(cfg_code, groups_idx + len(GROUPS_PATH_MARKER))
+        groups_region = cfg_code[groups_idx: nxt.start()] if nxt else cfg_code[groups_idx:]
+        missing = [t for t in GROUP_CONFIG_KEYS if t not in groups_region]
+        if missing:
+            detail["c11"].append(
+                "%s: groups face missing %s" % (CONFIG_BUILTINS_FILE, missing)
+            )
+
     rc = 0
-    for k in ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "fail_closed"):
+    for k in ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "fail_closed"):
         if detail[k]:
             rc = 1
     return rc, detail
@@ -669,6 +814,19 @@ internal object ProviderDebugMethods {
             put("instances", arr)
         }
     }
+
+    fun groupsList(context: android.content.Context, params: JSONObject): JSONObject {
+        val arr = JSONArray()
+        for (group in listOf<com.rikkaminis.app.data.model.ModelGroupStub>()) {
+            arr.put(JSONObject().apply {
+                put("id", group.id)
+                put("name", group.name)
+                put("defaultThinkingLevel", group.defaultThinkingLevel?.name ?: JSONObject.NULL)
+                put("contextLimitTokens", group.contextLimitTokens ?: JSONObject.NULL)
+            })
+        }
+        return JSONObject().put("groups", arr)
+    }
 }
 '''
 
@@ -721,10 +879,36 @@ internal object ProviderMutationMethods {
         }
         return JSONObject()
     }
+
+    fun groupsCreate(context: android.content.Context, params: JSONObject): JSONObject {
+        val thinking = params.optString("defaultThinkingLevel", "")
+        val rawLimit = params.opt("contextLimitTokens")
+        val group = com.rikkaminis.app.data.model.ModelGroupStub(name = params.optString("name", "New group"))
+        return groupToJson(group)
+    }
+
+    fun groupsUpdate(context: android.content.Context, params: JSONObject): JSONObject {
+        if (params.has("defaultThinkingLevel")) {
+            val t = params.optString("defaultThinkingLevel", "")
+        }
+        if (params.has("contextLimitTokens")) {
+            val raw = params.opt("contextLimitTokens")
+        }
+        val current = com.rikkaminis.app.data.model.ModelGroupStub()
+        return groupToJson(current)
+    }
+
+    private fun groupToJson(group: com.rikkaminis.app.data.model.ModelGroupStub): JSONObject =
+        JSONObject().apply {
+            put("id", group.id)
+            put("name", group.name)
+            put("defaultThinkingLevel", group.defaultThinkingLevel?.name ?: JSONObject.NULL)
+            put("contextLimitTokens", group.contextLimitTokens ?: JSONObject.NULL)
+        }
 }
 
 internal fun probeAuthHeader(azureMode: Boolean, key: String): Pair<String, String> =
-    if (azureMode) "api-key" to key else "Authorization" to "Bearer $key"
+    openAIKeyAuthHeader(azure = azureMode, token = key)
 
 internal fun instanceJsonCore(inst: ProviderInstanceFix, hasCredential: Boolean, entryCount: Int): JSONObject =
     JSONObject().apply {
@@ -823,6 +1007,25 @@ internal object ConfigBuiltins {
                 },
             )
         )
+        r.register(
+            ReadOnlyField(
+                path = "groups",
+                reader = {
+                    ConfigValue.Arr(
+                        repo.config.value.modelGroups.map { g ->
+                            ConfigValue.Obj(
+                                linkedMapOf(
+                                    "id" to ConfigValue.Str(g.id),
+                                    "name" to ConfigValue.Str(g.name),
+                                    "default_thinking_level" to (g.defaultThinkingLevel?.let { ConfigValue.Str(it.name) } ?: ConfigValue.Null),
+                                    "context_limit_tokens" to (g.contextLimitTokens?.let { ConfigValue.Num(it.toDouble()) } ?: ConfigValue.Null),
+                                )
+                            )
+                        }
+                    )
+                },
+            )
+        )
     }
 }
 '''
@@ -854,13 +1057,39 @@ fun ProviderConnectionScreen(instance: ProviderInstance, providerRepository: Pro
 '''
 
 
+# ---------------------------------------------------------------------------
+# [da1031-D ISSUE-07] Auth single-source fixture: the shared pair builder
+# `openAIKeyAuthHeader` plus a delegating `applyOpenAIKeyAuth` — the required
+# two-face shape on the provider/openai side. Defaults for every fixture root
+# (write_fixture writes it unless omit_auth=True).
+# ---------------------------------------------------------------------------
+
+GOOD_AUTH_HEADER = '''package com.rikkaminis.app.provider.openai
+
+import okhttp3.Request
+
+internal fun openAIKeyAuthHeader(azure: Boolean, token: String): Pair<String, String> =
+    if (azure) "api-key" to token else "Authorization" to "Bearer $token"
+
+internal fun Request.Builder.applyOpenAIKeyAuth(
+    azure: Boolean,
+    token: String,
+): Request.Builder =
+    openAIKeyAuthHeader(azure, token).let { (name, value) -> header(name, value) }
+'''
+
 def write_fixture(debug_text, mutation_text, collection_text=None,
-                  config_text=None, connection_text=None):
+                  config_text=None, connection_text=None,
+                  auth_text=None, omit_auth=False):
     root = tempfile.mkdtemp(prefix="rpcsym-")
     os.makedirs(os.path.join(root, "src", "debug"))
     os.makedirs(os.path.join(root, "src", "collections"))
     os.makedirs(os.path.join(root, "src", "config"))
     os.makedirs(os.path.join(root, "src", "ui"))
+    if not omit_auth:
+        os.makedirs(os.path.join(root, "src", "provider"))
+        with open(os.path.join(root, "src", "provider", AUTH_HEADER_FILE), "w", encoding="utf-8") as f:
+            f.write(GOOD_AUTH_HEADER if auth_text is None else auth_text)
     with open(os.path.join(root, "src", "debug", DEBUG_FILE), "w", encoding="utf-8") as f:
         f.write(debug_text)
     with open(os.path.join(root, "src", "debug", MUTATION_FILE), "w", encoding="utf-8") as f:
@@ -1208,6 +1437,129 @@ def run_selftest():
     results.append(("F22-config-providers-anchor-missing-fail-closed", ok, detail))
     shutil.rmtree(root)
 
+    # --- [da1031-D ISSUE-07] C10: the probe grows its own azure/bearer fork ---
+    bad_mut = GOOD_MUTATION.replace(
+        '''internal fun probeAuthHeader(azureMode: Boolean, key: String): Pair<String, String> =
+    openAIKeyAuthHeader(azure = azureMode, token = key)''',
+        '''internal fun probeAuthHeader(azureMode: Boolean, key: String): Pair<String, String> =
+    if (azureMode) "api-key" to key else "Authorization" to "Bearer $key"''',
+    )
+    assert bad_mut != GOOD_MUTATION, "F23 anchor missing"
+    root = write_fixture(GOOD_DEBUG, bad_mut)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c10"] and only(detail, "c10")
+    results.append(("F23-probe-auth-fork-re-inlined-C10", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C10: applyOpenAIKeyAuth stops delegating (second body on the okhttp face) ---
+    bad_auth = GOOD_AUTH_HEADER.replace(
+        '''): Request.Builder =
+    openAIKeyAuthHeader(azure, token).let { (name, value) -> header(name, value) }''',
+        '''): Request.Builder =
+    if (azure) header("api-key", token) else header("Authorization", "Bearer $token")''',
+    )
+    assert bad_auth != GOOD_AUTH_HEADER, "F24 anchor missing"
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, auth_text=bad_auth)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c10"] and only(detail, "c10")
+    results.append(("F24-apply-auth-not-delegating-C10", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C10: the shared pair builder vanishes (callers delegate to nothing) ---
+    bad_auth = GOOD_AUTH_HEADER.replace(
+        '''internal fun openAIKeyAuthHeader(azure: Boolean, token: String): Pair<String, String> =
+    if (azure) "api-key" to token else "Authorization" to "Bearer $token"
+
+''', "")
+    assert "fun openAIKeyAuthHeader(" not in bad_auth, "F25 anchor missing"
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, auth_text=bad_auth)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c10"] and only(detail, "c10")
+    results.append(("F25-auth-single-source-undefined-C10", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C10: the auth file itself is gone → fail-closed ---
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, omit_auth=True)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["fail_closed"] and only(detail, "fail_closed")
+    results.append(("F26-auth-header-file-missing-fail-closed", ok, detail))
+    shutil.rmtree(root)
+
+    # --- [da1031-D ISSUE-06] C11: the read face drops a session-default key ---
+    bad_debug = GOOD_DEBUG.replace(
+        '''                put("defaultThinkingLevel", group.defaultThinkingLevel?.name ?: JSONObject.NULL)\n''',
+        "",
+    )
+    assert bad_debug != GOOD_DEBUG, "F27 anchor missing"
+    root = write_fixture(bad_debug, GOOD_MUTATION)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c11"] and only(detail, "c11")
+    results.append(("F27-groupsList-missing-thinking-level-C11", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C11: the mutation echo face stops mirroring the read face ---
+    bad_mut = GOOD_MUTATION.replace(
+        '''            put("defaultThinkingLevel", group.defaultThinkingLevel?.name ?: JSONObject.NULL)
+            put("contextLimitTokens", group.contextLimitTokens ?: JSONObject.NULL)
+''',
+        "",
+    )
+    assert bad_mut != GOOD_MUTATION, "F28 anchor missing"
+    root = write_fixture(GOOD_DEBUG, bad_mut)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c11"] and only(detail, "c11")
+    results.append(("F28-groupToJson-missing-both-keys-C11", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C11: create echoes the fields but never accepts them (read-only in disguise) ---
+    bad_mut = GOOD_MUTATION.replace(
+        '''        val thinking = params.optString("defaultThinkingLevel", "")\n''', "",
+    )
+    assert bad_mut != GOOD_MUTATION, "F29 anchor missing"
+    root = write_fixture(GOOD_DEBUG, bad_mut)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c11"] and only(detail, "c11")
+    results.append(("F29-groupsCreate-does-not-accept-thinking-level-C11", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C11: update accepts neither field ---
+    bad_mut = GOOD_MUTATION.replace(
+        '''        if (params.has("defaultThinkingLevel")) {
+            val t = params.optString("defaultThinkingLevel", "")
+        }
+        if (params.has("contextLimitTokens")) {
+            val raw = params.opt("contextLimitTokens")
+        }
+''',
+        "",
+    )
+    assert bad_mut != GOOD_MUTATION, "F30 anchor missing"
+    root = write_fixture(GOOD_DEBUG, bad_mut)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c11"] and only(detail, "c11")
+    results.append(("F30-groupsUpdate-accepts-neither-field-C11", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C11: the config face loses a key (the asymmetry that started this) ---
+    bad_cfg = GOOD_CONFIG_BUILTINS.replace(
+        '''                                    "default_thinking_level" to (g.defaultThinkingLevel?.let { ConfigValue.Str(it.name) } ?: ConfigValue.Null),
+''', "",
+    )
+    assert bad_cfg != GOOD_CONFIG_BUILTINS, "F31 anchor missing"
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, config_text=bad_cfg)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c11"] and only(detail, "c11")
+    results.append(("F31-config-groups-face-missing-key-C11", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C11: the `path = "groups"` anchor is gone → fail-closed ---
+    bad_cfg = GOOD_CONFIG_BUILTINS.replace('path = "groups"', 'path = "groupz"')
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, config_text=bad_cfg)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["fail_closed"] and only(detail, "fail_closed")
+    results.append(("F32-config-groups-anchor-missing-fail-closed", ok, detail))
+    shutil.rmtree(root)
+
     all_ok = True
     for name, ok, detail in results:
         print("%s %s" % ("PASS" if ok else "FAIL", name))
@@ -1235,9 +1587,10 @@ def main():
         print("provider_rpc_symmetry: ALL GREEN (C1 predicate single-source, "
               "C2 update guard, C3 key symmetry, C4 collection guard, "
               "C5 mutation predicate floor, C6 azureMode four faces, "
-              "C7 probe auth fork, C8 config-face keys, C9 UA visibility)")
+              "C7 probe auth fork, C8 config-face keys, C9 UA visibility, "
+              "C10 auth single source, C11 group field faces)")
         return 0
-    for k in ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "fail_closed"):
+    for k in ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "fail_closed"):
         for line in detail[k]:
             print("[%s] %s" % (k.upper(), line))
     return 1

@@ -282,6 +282,14 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
             ?: return NativeOffloadResult(2, "android-calendar: invalid --start '$startStr'\n")
         val endMs = args.get("end")?.let { if (isAllDay) parseDateUtc(it) else parseDate(it) }
             ?: (startMs + 60 * 60 * 1000L)
+        // [da1031-C] ISSUE-05 B: an explicit --end at or before --start used to
+        // be written as-is → DTSTART > DTEND, and the provider then hides the
+        // row from list/instances/freebusy (the all-day half of this shape was
+        // fixed in da1017-D2). Only TIMED ranges are a contradiction — all-day
+        // canonical rows are dtstart == dtend (see allDayEndRepairMs).
+        if (invertedTimedRange(isAllDay, startMs, endMs)) {
+            return NativeOffloadResult(2, "android-calendar create: --end must be after --start\n")
+        }
         // Notes — apple-calendar uses --notes; --description kept as alias.
         val notes = args.get("notes") ?: args.get("description")
         val alarmMinutes = args.getInt("alarm")
@@ -403,6 +411,16 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
                 values.put(CalendarContract.Events.DTEND, it)
             }
         }
+        // [da1031-C] ISSUE-05 B: same stale-DTEND hazard for TIMED events —
+        // moving --start without --end used to leave the old DTEND behind, and
+        // the provider hides any row whose dtend precedes its dtstart. Keep the
+        // stored duration; degenerate/unreadable stored span falls back to
+        // doCreate's 1h default (timedEndRepairMs).
+        if (!isAllDay && newStartMs != null && newEndMs == null) {
+            timedEndRepairMs(stored?.startMs, stored?.endMs, newStartMs)?.let {
+                values.put(CalendarContract.Events.DTEND, it)
+            }
+        }
         // --calendar / --calendar-id: move event to a different calendar.
         // resolveCalendarIdOptional lets either flag be absent without falling
         // back to pickWritableCalendar (which would mean "always move" — not
@@ -414,19 +432,67 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
             return NativeOffloadResult(2, "android-calendar update: nothing to update — supply at least one field flag\n")
         }
 
+        // [da1031-C] ISSUE-05 B: an --id that matches no row used to fall
+        // through with rows=0 and STILL (a) write the orphan reminder and
+        // (b) answer {"updated": true} with exit 0 — a silent lie. Same
+        // {error: not_found} shape doDelete uses (findEventRow also returns
+        // null when the row exists but this app cannot read it — no
+        // READ_CALENDAR / OEM privacy layer — and guessing the stored
+        // semantics is what da1017-D2 was about, so "not found" is the honest
+        // answer there too).
+        if (stored == null) {
+            val body = JSONObject().put("error", "not_found")
+                .put("id", id)
+                .put("message", "No event with id=$id (already deleted, or not visible to this app).")
+                .toString()
+            return NativeOffloadResult(1, OffloadOutput.formatBody(body, args) + "\n")
+        }
+
+        // [da1031-C] ISSUE-05 B: refuse a TIMED range that still ends at or
+        // before it starts once the request is resolved — an explicitly
+        // inverted --end, or an unreadable/degenerate stored row the repairs
+        // above could not replace. Fires only when the caller actually touched
+        // the range (--start / --end present): a title-only update of a
+        // pre-existing inverted row keeps working (editing notes must not be
+        // blocked by legacy data this app itself once wrote).
+        if (newStartMs != null || newEndMs != null) {
+            val effectiveStart = newStartMs ?: stored.startMs
+            val effectiveEnd = newEndMs ?: values.getAsLong(CalendarContract.Events.DTEND) ?: stored.endMs
+            if (invertedTimedRange(isAllDay, effectiveStart, effectiveEnd)) {
+                return NativeOffloadResult(2, "android-calendar update: --end must be after --start\n")
+            }
+        }
+
         return try {
             val updated = if (values.size() > 0) {
                 val uri = CalendarContract.Events.CONTENT_URI.buildUpon()
                     .appendPath(id.toString()).build()
                 context.contentResolver.update(uri, values, null, null)
             } else 0
+            // [da1031-C] ISSUE-05 B: an --id that matches no row used to fall
+            // through with rows=0 and STILL (a) write the orphan reminder and
+            // (b) answer {"updated": true} with exit 0 — a silent lie. Report
+            // the same {error: not_found} shape doDelete uses, before any
+            // reminder write.
+            if (values.size() > 0 && updated <= 0) {
+                val body = JSONObject().put("error", "not_found")
+                    .put("id", id)
+                    .put("message", "No event with id=$id (already deleted, or not visible to this app).")
+                    .toString()
+                return NativeOffloadResult(1, OffloadOutput.formatBody(body, args) + "\n")
+            }
             if (alarmMinutes != null && alarmMinutes >= 0) {
                 replaceReminder(id, alarmMinutes)
             }
             AppLogger.info(TAG, "update: id=$id rows=$updated alarm=$alarmMinutes")
             val data = JSONObject()
                 .put("id", id)
-                .put("updated", updated > 0 || alarmMinutes != null)
+                // Reachable set here: values>0 → updated>0 (checked above), or
+                // values==0 with an alarm (values==0 && alarm==null returned 2
+                // earlier) — so true is now honest, not the old
+                // `updated > 0 || alarmMinutes != null` that a rows=0 fall-through
+                // also satisfied.
+                .put("updated", true)
                 .put("rows", updated)
             if (alarmMinutes != null && alarmMinutes >= 0) data.put("alarm_minutes_before", alarmMinutes)
             NativeOffloadResult(0, OffloadOutput.formatBody(data.toString(2), args) + "\n")
@@ -1040,6 +1106,35 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
             } else 0L
             return newStartMs + span
         }
+
+        /**
+         * [da1031-C] TIMED counterpart of [allDayEndRepairMs]: DTEND to write
+         * when a timed event's DTSTART moves without `--end`. Same shape —
+         * keep the stored duration; a degenerate stored span (end <= start,
+         * e.g. a legacy inverted row) falls back to doCreate's 1h default
+         * rather than manufacturing a 0-duration row. A row whose DTSTART or
+         * DTEND could not be read returns null: the caller then leaves DTEND
+         * alone instead of inventing a window we cannot verify.
+         */
+        internal fun timedEndRepairMs(storedStartMs: Long?, storedEndMs: Long?, newStartMs: Long): Long? {
+            if (storedStartMs == null || storedEndMs == null) return null
+            val span = storedEndMs - storedStartMs
+            if (span <= 0) return newStartMs + 60L * 60 * 1000
+            return newStartMs + span
+        }
+
+        /**
+         * [da1031-C] A TIMED `[start, end)` is contradictory when it ends at or
+         * before it starts — the provider then hides the row from
+         * list/instances/freebusy (same filter as the all-day case fixed in
+         * [da1017-D2]). All-day rows are exempt: the canonical single-day row
+         * is stored as dtstart == dtend, so an all-day end equal to its start
+         * is the CORRECT shape, not a contradiction. Pure so the truth table is
+         * JVM-testable next to [updateUsesAllDaySemantics].
+         */
+        internal fun invertedTimedRange(isAllDay: Boolean, startMs: Long?, endMs: Long?): Boolean =
+            !isAllDay && startMs != null && endMs != null && endMs <= startMs
+
 
         private const val HELP = """android-calendar — list, create, update, delete events; query free/busy
                                     (mirrors apple-calendar)

@@ -154,6 +154,89 @@ class CalendarFreebusyInstancesTest {
         assertTrue(body.contains("CalendarContract.Events.DTEND"))
     }
 
+    // ── part 3: timed ranges (da1031-C) ──────────────────────────────────────
+
+    @Test
+    fun `timed DTEND repair keeps the stored duration`() {
+        // stored 1_795_651_200_000 → 1_795_656_600_000 (90 min span) moved to
+        // 1_795_655_400_000: the repaired end keeps the 90 min duration.
+        assertEquals(
+            1_795_660_800_000L,
+            CalendarOffloadHandler.timedEndRepairMs(1_795_651_200_000L, 1_795_656_600_000L, 1_795_655_400_000L),
+        )
+        // degenerate stored span (end == start, e.g. a legacy inverted row)
+        // degrades to doCreate's 1h default — never to a 0-duration row.
+        assertEquals(
+            1_795_659_000_000L,
+            CalendarOffloadHandler.timedEndRepairMs(1_795_651_200_000L, 1_795_651_200_000L, 1_795_655_400_000L),
+        )
+        // inverted stored span (end < start) must not carry a negative span
+        assertEquals(
+            1_795_659_000_000L,
+            CalendarOffloadHandler.timedEndRepairMs(1_795_651_200_000L, 1_795_564_800_000L, 1_795_655_400_000L),
+        )
+        // A row whose DTSTART/DTEND could not be read stays untouched (null):
+        // better an unverified old end than an invented one.
+        assertEquals(null, CalendarOffloadHandler.timedEndRepairMs(null, null, 1_795_655_400_000L))
+        assertEquals(
+            null,
+            CalendarOffloadHandler.timedEndRepairMs(1_795_651_200_000L, null, 1_795_655_400_000L),
+        )
+    }
+
+    @Test
+    fun `the timed repair always lands its end after the new start`() {
+        for (storedEnd in listOf(1_795_656_600_000L, 1_795_651_200_000L, 1_795_564_800_000L)) {
+            val repaired = CalendarOffloadHandler.timedEndRepairMs(1_795_651_200_000L, storedEnd, 1_795_655_400_000L)
+            assertTrue("repaired end must follow the moved start", repaired != null && repaired > 1_795_655_400_000L)
+        }
+    }
+
+    @Test
+    fun `inverted timed ranges are refused while all-day stays canonical`() {
+        assertTrue(CalendarOffloadHandler.invertedTimedRange(false, 1_795_651_200_000L, 1_795_651_200_000L))
+        assertTrue(CalendarOffloadHandler.invertedTimedRange(false, 1_795_651_200_000L, 1_795_564_800_000L))
+        assertFalse(CalendarOffloadHandler.invertedTimedRange(false, 1_795_651_200_000L, 1_795_656_600_000L))
+        // All-day rows: the provider stores dtstart == dtend (canonical
+        // single-day shape), so end == start is CORRECT there, and the
+        // repair always lands end after start — never a contradiction.
+        assertFalse(CalendarOffloadHandler.invertedTimedRange(true, 1_795_651_200_000L, 1_795_651_200_000L))
+        assertFalse(CalendarOffloadHandler.invertedTimedRange(true, 1_795_651_200_000L, 1_795_564_800_000L))
+        // Missing bound: nothing to judge (the repair/1h default decides).
+        assertFalse(CalendarOffloadHandler.invertedTimedRange(false, null, 1_795_656_600_000L))
+        assertFalse(CalendarOffloadHandler.invertedTimedRange(false, 1_795_651_200_000L, null))
+    }
+
+    @Test
+    fun `create and update refuse an inverted timed range before writing`() {
+        val handler = readHandlerSource()
+        val create = memberSlice(handler, "private fun doCreate(")
+        val update = memberSlice(handler, "private fun doUpdate(")
+        for ((label, body) in listOf("doCreate" to create, "doUpdate" to update)) {
+            assertTrue(
+                "$label must route through the shared inverted predicate",
+                body.contains("invertedTimedRange("),
+            )
+        }
+        assertTrue(create.contains("hasFlag(\"all-day\")"))
+        assertTrue(update.contains("hasFlag(\"all-day\")"))
+    }
+
+    @Test
+    fun `update moves the timed repair next to the all-day repair`() {
+        val body = memberSlice(readHandlerSource(), "private fun doUpdate(")
+        assertTrue(body.contains("allDayEndRepairMs("))
+        assertTrue(body.contains("timedEndRepairMs("))
+        // The defect: an orphan reminder + updated=true with exit 0 on a
+        // rows=0 fall-through. The not_found answer must come BEFORE the
+        // reminder write.
+        val beforeReminder = body.substringBefore("replaceReminder(")
+        assertTrue(
+            "the rows=0 fall-through must be refused before any reminder write",
+            beforeReminder.contains("not_found"),
+        )
+    }
+
     @Test
     fun `help documents --all-day for update`() {
         val src = readHandlerSource()
