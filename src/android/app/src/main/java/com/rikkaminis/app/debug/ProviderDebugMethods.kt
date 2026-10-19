@@ -96,6 +96,11 @@ internal object ProviderDebugMethods {
                 put("customBaseURL", inst.customBaseURL ?: JSONObject.NULL)
                 put("appendV1Suffix", inst.appendV1Suffix)
                 put("useResponsesAPI", inst.useResponsesAPI)
+                // [da1030-C ISSUE-04] Azure auth shape was invisible on this
+                // face: the debug listing (and the mutation response built by
+                // instanceJsonCore) reported 14 keys without it, so a harness
+                // could not tell a Bearer instance from an api-key one.
+                put("azureMode", inst.azureMode)
                 // [GH#68] Surface the image-endpoint picker state so harnesses
                 // can verify persistence across restarts.
                 put("imageEndpointMode", inst.imageEndpointMode.name)

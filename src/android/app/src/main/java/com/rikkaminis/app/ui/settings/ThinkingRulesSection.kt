@@ -23,6 +23,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -39,6 +40,7 @@ import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.model.ProviderInstance
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.provider.thinking.ThinkingRule
+import com.rikkaminis.app.provider.thinking.ThinkingRuleResolver
 
 /**
  * [T-android-thinking-rules-phase2 §3 / parity with iOS ThinkingRulesSection.swift]
@@ -97,7 +99,17 @@ fun ThinkingRulesSection(
     var defaultsExpanded by remember { mutableStateOf(false) }
     var editorRequest by remember { mutableStateOf<ThinkingRuleEditorRequest?>(null) }
 
-    val customRulesAndIds = remember(instance.id, reloadKey) {
+    // [da1030-C ISSUE-05] reloadKey only covers mutations made ON this screen;
+    // the custom-rule cache is also rewritten from outside it (backup restore,
+    // repository load, worker restore, minis-config). Without a key that moves
+    // on those writes this screen keeps the list it read when it opened and
+    // writes it back on the next edit/delete — reverting the external write.
+    // The resolver's revision moves on every cache mutation, so it is the
+    // honest dependency for "re-read the rules"; keying on it (a Long, already
+    // in memory) is cheaper and less brittle than replaying every writer.
+    val rulesRevision by ThinkingRuleResolver.customRulesRevision.collectAsState()
+
+    val customRulesAndIds = remember(instance.id, reloadKey, rulesRevision) {
         providerRepository.thinkingRulesWithIds(instance.id)
     }
     val customRules = customRulesAndIds.first

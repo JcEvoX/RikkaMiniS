@@ -82,6 +82,9 @@ class ProviderRpcSymmetryTest {
         "customBaseURL",
         "appendV1Suffix",
         "useResponsesAPI",
+        // [da1030-C ISSUE-04] Azure auth shape: readable on both RPC faces and
+        // writable on both, so a create→list→update round trip cannot drop it.
+        "azureMode",
         "imageEndpointMode",
         "imageEndpointResolved",
         "customUserAgent",
@@ -94,6 +97,31 @@ class ProviderRpcSymmetryTest {
     fun instanceJsonCore_coversAllInstanceLevelKeys() {
         val json = instanceJsonCore(instance(), hasCredential = false, entryCount = 7)
         assertEquals(expectedKeys, json.keySet().toSet())
+    }
+
+    @Test
+    fun instanceJsonCore_azureModeAlwaysPresent() {
+        // Literal expectation: a mutation response must answer `false` for a
+        // fresh instance, not omit the key. Deriving the expectation from
+        // azureMode's own default would let a "drop the key" regression PASS.
+        val json = instanceJsonCore(instance(), hasCredential = false, entryCount = 0)
+        assertEquals(false, json.getBoolean("azureMode"))
+    }
+
+    // ---- 3. InstancesTest auth fork: azureMode picks the header shape ----
+
+    @Test
+    fun probeAuthHeader_azureModeUsesApiKeyHeader() {
+        val (name, value) = probeAuthHeader(azureMode = true, key = "sk-test")
+        assertEquals("api-key", name)
+        assertEquals("sk-test", value)
+    }
+
+    @Test
+    fun probeAuthHeader_nonAzureUsesBearerHeader() {
+        val (name, value) = probeAuthHeader(azureMode = false, key = "sk-test")
+        assertEquals("Authorization", name)
+        assertEquals("Bearer sk-test", value)
     }
 
     @Test

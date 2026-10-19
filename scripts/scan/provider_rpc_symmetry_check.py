@@ -37,6 +37,30 @@ provider_rpc_symmetry_check.py — deep-audit-1025 FIX-I gate
 Selftest：≥4 夹具，每条判据至少一个「恰好被它打破」的形态。
 注：C5 与 C1/C2 共享同一 token，协同变化（见 F10 注释）——它作为「下限守卫」
 而非独立可分辨判据存在，报告里如实分层。
+
+[da1030-C ISSUE-04] 第四组：实例字段在**四张脸**上的可见性/可写性对称。
+实例级字段只有同时出现在「读两面（debug 列表 + mutation 响应）」「写两面
+（create + update）」才算接通；缺哪面都在另一面撒谎。
+
+  C6  azureMode 四面对称：
+      - instancesList 每实例块含 `put("azureMode"`；
+      - instanceJsonCore apply 块含 `put("azureMode"`；
+      - instancesCreate / instancesUpdate 体含 `azureMode` 且按
+        `optBoolean("azureMode"` 解析（缺 = 该字段对 harness 只读不可写）。
+  C7  instancesTest 的认证头分叉：函数体必须**按 instance.azureMode 分叉**——
+      含 `azureMode`，且认证头来源在允许清单内
+      （`probeAuthHeader(` / 共享单源 `applyOpenAIKeyAuth(` / 字面 `"api-key"`）。
+      允许清单是刻意的：单源化落地后形状合法，但「不分叉地一律 Bearer」必须红。
+  C8  config 面（ConfigBuiltins.kt）`providers` 的**实例字典块**（`path =
+      "providers"` 之后最近的 `linkedMapOf(`，括号配平）含 `"azureMode"` /
+      `"imageEndpointMode"` / `"imageEndpointResolved"` 三键（与 Debug RPC 的
+      实例键集对齐）。锚点缺失 = fail-closed 红。
+  C9  ProviderConnectionScreen.kt 的 customUserAgent 可见性：`customUserAgentWritable(`
+      必须存在（fail-closed），且**不得**落在
+      `if (instance.providerType != ProviderType.openRouter)` 的块体内——UA 覆盖
+      在 ProviderFactory 的 openRouter 臂上同样生效，藏在 base-URL 门控里 = 用户
+      改不到一个真被发送的字段。守卫块整体消失同样 fail-closed 红（须重新推导）。
+
 用法：
   python3 provider_rpc_symmetry_check.py <repo_root>   # 真树模式（位置参数）
   python3 provider_rpc_symmetry_check.py --selftest    # 夹具模式
@@ -85,6 +109,25 @@ BASE_URL_GUARD_TOKENS = (
 # Baseline use-count floor in ProviderMutationMethods.kt (create + update + def).
 MUTATION_PREDICATE_MIN_USES = 3
 FUN_DECL_PAT = re.compile(r"\bfun\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+# ---- [da1030-C ISSUE-04] instance-field face symmetry (C6-C9) ----
+CONFIG_BUILTINS_FILE = "ConfigBuiltins.kt"
+CONNECTION_SCREEN_FILE = "ProviderConnectionScreen.kt"
+AZURE_MODE_TOKEN = "azureMode"
+AZURE_MODE_PUT = 'put("azureMode"'
+AZURE_MODE_PARSE = re.compile(r'optBoolean\(\s*"azureMode"')
+# C7 allowlist: the azure/bearer fork may come from the local pure helper (with its
+# own single literal), from a shared single-source helper, or be written inline.
+PROBE_AUTH_ROUTE_TOKENS = ("probeAuthHeader(", "applyOpenAIKeyAuth(", '"api-key"')
+# C8: the per-instance dictionary inside the read-only `providers` aggregate.
+PROVIDERS_PATH_MARKER = 'path = "providers"'
+INSTANCE_DICT_MARKER = "linkedMapOf("
+CONFIG_FACE_KEY_TOKENS = ('"azureMode"', '"imageEndpointMode"', '"imageEndpointResolved"')
+# C9: the base-URL gate the User-Agent field must NOT live inside.
+OPENROUTER_UI_GUARD = re.compile(
+    r"if\s*\(\s*instance\.providerType\s*!=\s*ProviderType\.openRouter\s*\)"
+)
+UA_WRITABLE_TOKEN = "customUserAgentWritable("
 
 
 def strip_comments(text):
@@ -211,6 +254,66 @@ def put_keys(block):
     return set(PUT_KEY_PAT.findall(block))
 
 
+def brace_block_after(code, idx):
+    """The `{ … }` body starting at the first `{` at or after [idx] (balanced,
+    string-aware). None when unbalanced/missing."""
+    start = code.find("{", idx)
+    if start < 0:
+        return None
+    depth = 0
+    i, n = start, len(code)
+    in_str = False
+    while i < n:
+        c = code[i]
+        if in_str:
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    return code[start:i + 1]
+        i += 1
+    return None
+
+
+def paren_block_after(code, idx):
+    """The `( … )` block starting at the first `(` at or after [idx] (balanced,
+    string-aware). None when unbalanced/missing."""
+    start = code.find("(", idx)
+    if start < 0:
+        return None
+    depth = 0
+    i, n = start, len(code)
+    in_str = False
+    while i < n:
+        c = code[i]
+        if in_str:
+            if c == "\\":
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    return code[start:i + 1]
+        i += 1
+    return None
+
+
 def enclosing_function(code, pos):
     """Name of the last ``fun <name>(`` declared before ``pos`` in
     comment-stripped code. Returns None (fail-closed) when the write site sits
@@ -232,7 +335,8 @@ def base_url_write_offsets(code):
 
 def check_tree(root):
     """Returns (rc, detail dict). rc=0 all green."""
-    detail = {"c1": [], "c2": [], "c3": [], "c4": [], "c5": [], "fail_closed": []}
+    detail = {"c1": [], "c2": [], "c3": [], "c4": [], "c5": [], "c6": [], "c7": [],
+              "c8": [], "c9": [], "fail_closed": []}
 
     debug_paths = find_files(root, DEBUG_FILE)
     mut_paths = find_files(root, MUTATION_FILE)
@@ -304,6 +408,8 @@ def check_tree(root):
             )
 
     # ---- C3 ----
+    per_inst_block = None
+    core_block = None
     list_body = extract_function(debug_code, "instancesList")
     if list_body is None:
         detail["fail_closed"].append("instancesList not found in %s" % DEBUG_FILE)
@@ -394,8 +500,116 @@ def check_tree(root):
             % (mut_uses, MUTATION_PREDICATE_MIN_USES)
         )
 
+    # ---- C6 ---- [da1030-C ISSUE-04] azureMode on all four faces
+    if per_inst_block is None:
+        detail["c6"].append("instancesList per-instance block not extractable (fail-closed)")
+    elif AZURE_MODE_PUT not in per_inst_block:
+        detail["c6"].append(
+            "%s: instancesList per-instance block lacks %s (read face 1/2)"
+            % (DEBUG_FILE, AZURE_MODE_PUT)
+        )
+    if core_block is None:
+        detail["c6"].append("instanceJsonCore apply block not extractable (fail-closed)")
+    elif AZURE_MODE_PUT not in core_block:
+        detail["c6"].append(
+            "%s: instanceJsonCore apply block lacks %s (read face 2/2)"
+            % (MUTATION_FILE, AZURE_MODE_PUT)
+        )
+    if create_body is None:
+        detail["c6"].append("instancesCreate body not extractable (fail-closed)")
+    elif AZURE_MODE_TOKEN not in create_body or not AZURE_MODE_PARSE.search(create_body):
+        detail["c6"].append(
+            "%s: instancesCreate does not parse/store azureMode (write face 1/2)"
+            % MUTATION_FILE
+        )
+    if update_body is None:
+        detail["c6"].append("instancesUpdate body not extractable (fail-closed)")
+    elif AZURE_MODE_TOKEN not in update_body or not AZURE_MODE_PARSE.search(update_body):
+        detail["c6"].append(
+            "%s: instancesUpdate does not parse/store azureMode (write face 2/2)"
+            % MUTATION_FILE
+        )
+
+    # ---- C7 ---- [da1030-C ISSUE-04] probe auth-header fork
+    test_body = extract_function(mut_code, "instancesTest")
+    if test_body is None:
+        detail["fail_closed"].append("instancesTest not found in %s" % MUTATION_FILE)
+    else:
+        if AZURE_MODE_TOKEN not in test_body:
+            detail["c7"].append(
+                "instancesTest does not key the auth header on the instance's azureMode"
+            )
+        elif not any(tok in test_body for tok in PROBE_AUTH_ROUTE_TOKENS):
+            detail["c7"].append(
+                "instancesTest auth header is not sourced from any accepted fork shape %s"
+                % (PROBE_AUTH_ROUTE_TOKENS,)
+            )
+
+    # ---- C8 ---- [da1030-C ISSUE-04] config face carries the same instance keys
+    cfg_paths = find_files(root, CONFIG_BUILTINS_FILE)
+    if len(cfg_paths) != 1:
+        detail["fail_closed"].append(
+            "expected exactly one %s, found %d" % (CONFIG_BUILTINS_FILE, len(cfg_paths))
+        )
+    else:
+        with open(cfg_paths[0], encoding="utf-8") as f:
+            cfg_code = strip_comments(f.read())
+        path_idx = cfg_code.find(PROVIDERS_PATH_MARKER)
+        if path_idx < 0:
+            detail["fail_closed"].append(
+                "%s: anchor %s not found (fail-closed)" % (CONFIG_BUILTINS_FILE, PROVIDERS_PATH_MARKER)
+            )
+        else:
+            dict_idx = cfg_code.find(INSTANCE_DICT_MARKER, path_idx)
+            instance_dict = None if dict_idx < 0 else paren_block_after(cfg_code, dict_idx)
+            if instance_dict is None:
+                detail["fail_closed"].append(
+                    "%s: %s block after %s not found (fail-closed)"
+                    % (CONFIG_BUILTINS_FILE, INSTANCE_DICT_MARKER, PROVIDERS_PATH_MARKER)
+                )
+            else:
+                missing = [t for t in CONFIG_FACE_KEY_TOKENS if t not in instance_dict]
+                if missing:
+                    detail["c8"].append(
+                        "%s: providers instance dict missing %s"
+                        % (CONFIG_BUILTINS_FILE, missing)
+                    )
+
+    # ---- C9 ---- [da1030-C ISSUE-04] User-Agent visibility on the connection screen
+    conn_paths = find_files(root, CONNECTION_SCREEN_FILE)
+    if len(conn_paths) != 1:
+        detail["fail_closed"].append(
+            "expected exactly one %s, found %d" % (CONNECTION_SCREEN_FILE, len(conn_paths))
+        )
+    else:
+        with open(conn_paths[0], encoding="utf-8") as f:
+            conn_code = strip_comments(f.read())
+        if UA_WRITABLE_TOKEN not in conn_code:
+            detail["c9"].append(
+                "%s: %s not present (fail-closed: the UA visibility gate must stay "
+                "anchored and re-derived, not deleted)"
+                % (CONNECTION_SCREEN_FILE, UA_WRITABLE_TOKEN)
+            )
+        guard_spans = []
+        for m in OPENROUTER_UI_GUARD.finditer(conn_code):
+            body = brace_block_after(conn_code, m.end())
+            if body is not None:
+                guard_spans.append(body)
+        if not guard_spans:
+            detail["fail_closed"].append(
+                "%s: %s guard block not found (fail-closed)"
+                % (CONNECTION_SCREEN_FILE, "instance.providerType != ProviderType.openRouter")
+            )
+        for body in guard_spans:
+            if UA_WRITABLE_TOKEN in body:
+                detail["c9"].append(
+                    "%s: %s sits INSIDE the `!= openRouter` base-URL gate — openRouter "
+                    "instances cannot see/edit a User-Agent the request path honors"
+                    % (CONNECTION_SCREEN_FILE, UA_WRITABLE_TOKEN)
+                )
+
     rc = 0
-    for k in ("c1", "c2", "c3", "c4", "c5", "fail_closed"):
+    for k in ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "fail_closed"):
         if detail[k]:
             rc = 1
     return rc, detail
@@ -441,6 +655,7 @@ internal object ProviderDebugMethods {
                 put("customBaseURL", inst.customBaseURL ?: JSONObject.NULL)
                 put("appendV1Suffix", inst.appendV1Suffix)
                 put("useResponsesAPI", inst.useResponsesAPI)
+                put("azureMode", inst.azureMode)
                 put("imageEndpointMode", inst.imageEndpointMode.name)
                 put("imageEndpointResolved", inst.imageEndpointResolved?.name ?: JSONObject.NULL)
                 put("customUserAgent", inst.customUserAgent ?: JSONObject.NULL)
@@ -467,6 +682,7 @@ internal object ProviderMutationMethods {
     fun instancesCreate(context: android.content.Context, params: JSONObject): JSONObject {
         val type = ProviderType.openAI
         val customBaseURL: String? = null
+        val azureMode = params.optBoolean("azureMode", false)
         // [da1023-C] guard comment (verbatim-ish)
         if (customBaseURL != null && !type.supportsCustomBaseURL) {
             throw RPCException(-32602, "customBaseURL is not supported for providerType=openRouter")
@@ -476,6 +692,7 @@ internal object ProviderMutationMethods {
 
     fun instancesUpdate(context: android.content.Context, params: JSONObject): JSONObject {
         val current = ProviderInstanceFix()
+        val azureMode = if (params.has("azureMode")) params.optBoolean("azureMode", current.azureMode) else current.azureMode
         if (params.has("customBaseURL") && !params.isNull("customBaseURL")) {
             val newBase = params.optString("customBaseURL", "").ifEmpty { null }
             if (newBase != null && !current.providerType.supportsCustomBaseURL) {
@@ -488,7 +705,26 @@ internal object ProviderMutationMethods {
     private fun instanceToJson(inst: com.rikkaminis.app.data.model.ProviderInstanceStub): JSONObject {
         return instanceJsonCore(inst, false, 0)
     }
+
+    suspend fun instancesTest(context: android.content.Context, params: JSONObject): JSONObject {
+        val instance = current()
+        val key: String? = null
+        val builder = okhttp3.Request.Builder().url(probeURL).get()
+        when (instance.providerType) {
+            ProviderType.anthropic -> if (!key.isNullOrEmpty()) builder.header("x-api-key", key)
+            ProviderType.openAI -> if (!key.isNullOrEmpty()) {
+                val (name, value) = probeAuthHeader(instance.azureMode, key)
+                builder.header(name, value)
+            }
+            ProviderType.openRouter -> if (!key.isNullOrEmpty()) builder.header("Authorization", "Bearer $key")
+            ProviderType.gemini -> { }
+        }
+        return JSONObject()
+    }
 }
+
+internal fun probeAuthHeader(azureMode: Boolean, key: String): Pair<String, String> =
+    if (azureMode) "api-key" to key else "Authorization" to "Bearer $key"
 
 internal fun instanceJsonCore(inst: ProviderInstanceFix, hasCredential: Boolean, entryCount: Int): JSONObject =
     JSONObject().apply {
@@ -500,6 +736,7 @@ internal fun instanceJsonCore(inst: ProviderInstanceFix, hasCredential: Boolean,
         put("customBaseURL", inst.customBaseURL ?: JSONObject.NULL)
         put("appendV1Suffix", inst.appendV1Suffix)
         put("useResponsesAPI", inst.useResponsesAPI)
+        put("azureMode", inst.azureMode)
         put("imageEndpointMode", inst.imageEndpointMode.name)
         put("imageEndpointResolved", inst.imageEndpointResolved?.name ?: JSONObject.NULL)
         put("customUserAgent", inst.customUserAgent ?: JSONObject.NULL)
@@ -555,10 +792,75 @@ internal class ProvidersCollection {
 GOOD_MUTATION = GOOD_MUTATION.replace("ProviderInstanceFix", "com.rikkaminis.app.data.model.ProviderInstanceStub")
 
 
-def write_fixture(debug_text, mutation_text, collection_text=None):
+# ---------------------------------------------------------------------------
+# [da1030-C ISSUE-04] Config-face fixture: the read-only `providers` aggregate
+# instance dictionary (mirrors ConfigBuiltins.registerProviderCollections).
+# ---------------------------------------------------------------------------
+
+GOOD_CONFIG_BUILTINS = '''package com.rikkaminis.app.config
+
+internal object ConfigBuiltins {
+    private fun registerProviderCollections(r: ConfigRegistry) {
+        r.register(
+            ReadOnlyField(
+                path = "providers",
+                reader = {
+                    val instances = providerRepo.config.value.instances
+                    ConfigValue.Arr(
+                        instances.map { inst ->
+                            ConfigValue.Obj(
+                                linkedMapOf(
+                                    "id" to ConfigValue.Str(inst.id),
+                                    "useResponsesAPI" to ConfigValue.Bool(inst.useResponsesAPI),
+                                    "azureMode" to ConfigValue.Bool(inst.azureMode),
+                                    "imageEndpointMode" to ConfigValue.Str(inst.imageEndpointMode.name),
+                                    "imageEndpointResolved" to (inst.imageEndpointResolved?.let { ConfigValue.Str(it.name) } ?: ConfigValue.Null),
+                                    "customUserAgent" to (inst.customUserAgent?.let { ConfigValue.Str(it) } ?: ConfigValue.Null),
+                                )
+                            )
+                        }
+                    )
+                },
+            )
+        )
+    }
+}
+'''
+
+# ---------------------------------------------------------------------------
+# [da1030-C ISSUE-04] Connection-screen fixture: the base-URL gate and the
+# User-Agent gate as SEPARATE sibling guards (the required shape).
+# ---------------------------------------------------------------------------
+
+GOOD_CONNECTION = '''package com.rikkaminis.app.ui.settings
+
+@Composable
+fun ProviderConnectionScreen(instance: ProviderInstance, providerRepository: ProviderRepository) {
+    var customBaseURL by rememberSaveable(instance.id, instance.customBaseURL) { mutableStateOf(instance.customBaseURL ?: "") }
+    var customUserAgent by rememberSaveable(instance.id, instance.customUserAgent) { mutableStateOf(instance.customUserAgent ?: "") }
+    Column {
+        if (instance.providerType != ProviderType.openRouter) {
+            SettingsSection(header = "Base URL") {
+                SectionTextField(value = customBaseURL)
+            }
+        }
+        if (customUserAgentWritable(instance.credentialType)) {
+            SettingsSection(header = "User-Agent") {
+                SectionTextField(value = customUserAgent)
+            }
+        }
+    }
+}
+'''
+
+
+def write_fixture(debug_text, mutation_text, collection_text=None,
+                  config_text=None, connection_text=None):
     root = tempfile.mkdtemp(prefix="rpcsym-")
     os.makedirs(os.path.join(root, "src", "debug"))
     os.makedirs(os.path.join(root, "src", "collections"))
+    os.makedirs(os.path.join(root, "src", "config"))
+    os.makedirs(os.path.join(root, "src", "ui"))
     with open(os.path.join(root, "src", "debug", DEBUG_FILE), "w", encoding="utf-8") as f:
         f.write(debug_text)
     with open(os.path.join(root, "src", "debug", MUTATION_FILE), "w", encoding="utf-8") as f:
@@ -567,6 +869,12 @@ def write_fixture(debug_text, mutation_text, collection_text=None):
         collection_text = GOOD_COLLECTION
     with open(os.path.join(root, "src", "collections", PROVIDERS_COLLECTION_FILE), "w", encoding="utf-8") as f:
         f.write(collection_text)
+    config_text = GOOD_CONFIG_BUILTINS if config_text is None else config_text
+    with open(os.path.join(root, "src", "config", CONFIG_BUILTINS_FILE), "w", encoding="utf-8") as f:
+        f.write(config_text)
+    connection_text = GOOD_CONNECTION if connection_text is None else connection_text
+    with open(os.path.join(root, "src", "ui", CONNECTION_SCREEN_FILE), "w", encoding="utf-8") as f:
+        f.write(connection_text)
     return root
 
 
@@ -779,6 +1087,127 @@ def run_selftest():
     results.append(("F14-update-message-near-miss-constant-C2", ok, detail))
     shutil.rmtree(root)
 
+    # --- [da1030-C ISSUE-04] C6: azureMode read faces (list + mutation JSON) ---
+
+    def only(detail, key):
+        """True when [key] is the ONLY criterion that fired."""
+        return not any(detail[k] for k in detail if k != key)
+
+    bad_debug = GOOD_DEBUG.replace('                put("azureMode", inst.azureMode)\n', "")
+    bad_mut = GOOD_MUTATION.replace('        put("azureMode", inst.azureMode)\n', "")
+    assert bad_debug != GOOD_DEBUG and bad_mut != GOOD_MUTATION, "F15 anchor missing"
+    root = write_fixture(bad_debug, bad_mut)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c6"] and only(detail, "c6")
+    results.append(("F15-azureMode-invisible-on-both-read-faces-C6", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C6: azureMode write faces (create + update) ---
+    bad_mut = GOOD_MUTATION.replace(
+        '        val azureMode = params.optBoolean("azureMode", false)\n', "")
+    bad_mut = bad_mut.replace(
+        '        val azureMode = if (params.has("azureMode")) params.optBoolean("azureMode", current.azureMode) else current.azureMode\n',
+        "")
+    assert "val azureMode = params.optBoolean" not in bad_mut, "F16 anchor missing"
+    root = write_fixture(GOOD_DEBUG, bad_mut)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c6"] and only(detail, "c6")
+    results.append(("F16-azureMode-not-writable-C6", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C7: probe falls back to unconditional Bearer ---
+    bad_mut = GOOD_MUTATION.replace(
+        '''            ProviderType.openAI -> if (!key.isNullOrEmpty()) {
+                val (name, value) = probeAuthHeader(instance.azureMode, key)
+                builder.header(name, value)
+            }
+''',
+        '''            ProviderType.openAI -> if (!key.isNullOrEmpty()) builder.header("Authorization", "Bearer $key")
+''',
+    )
+    assert "probeAuthHeader(instance.azureMode, key)" not in bad_mut, "F17 anchor missing"
+    root = write_fixture(GOOD_DEBUG, bad_mut)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c7"] and only(detail, "c7")
+    results.append(("F17-probe-unconditional-bearer-C7", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C8: config face drops the image-endpoint keys ---
+    bad_cfg = GOOD_CONFIG_BUILTINS.replace(
+        '''                                    "imageEndpointMode" to ConfigValue.Str(inst.imageEndpointMode.name),
+                                    "imageEndpointResolved" to (inst.imageEndpointResolved?.let { ConfigValue.Str(it.name) } ?: ConfigValue.Null),
+''', "")
+    assert bad_cfg != GOOD_CONFIG_BUILTINS, "F18 anchor missing"
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, config_text=bad_cfg)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c8"] and only(detail, "c8")
+    results.append(("F18-config-face-missing-imageEndpoint-keys-C8", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C9: UA visibility gate nested back inside the base-URL gate ---
+    bad_conn = GOOD_CONNECTION.replace(
+        '''        if (customUserAgentWritable(instance.credentialType)) {
+            SettingsSection(header = "User-Agent") {
+                SectionTextField(value = customUserAgent)
+            }
+        }
+''', "")
+    bad_conn = bad_conn.replace(
+        '''                SectionTextField(value = customBaseURL)
+            }
+        }
+''',
+        '''                SectionTextField(value = customBaseURL)
+            }
+            if (customUserAgentWritable(instance.credentialType)) {
+                SettingsSection(header = "User-Agent") {
+                    SectionTextField(value = customUserAgent)
+                }
+            }
+        }
+''',
+    )
+    assert bad_conn.count("customUserAgentWritable(") == 1, "F19 anchor missing"
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, connection_text=bad_conn)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c9"] and only(detail, "c9")
+    results.append(("F19-ua-gate-inside-openrouter-block-C9", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C9: visibility gate deleted entirely → fail-closed (anchor must be re-derived) ---
+    bad_conn = GOOD_CONNECTION.replace(
+        "if (customUserAgentWritable(instance.credentialType)) {", "if (true) {")
+    assert "customUserAgentWritable(" not in bad_conn, "F20 anchor missing"
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, connection_text=bad_conn)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c9"] and not detail["fail_closed"]
+    results.append(("F20-ua-visibility-anchor-deleted-C9", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C9: base-URL guard block gone → fail-closed ---
+    bad_conn = GOOD_CONNECTION.replace(
+        '''        if (instance.providerType != ProviderType.openRouter) {
+            SettingsSection(header = "Base URL") {
+                SectionTextField(value = customBaseURL)
+            }
+        }
+''', "")
+    assert "ProviderType.openRouter" not in bad_conn, "F21 anchor missing"
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, connection_text=bad_conn)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["fail_closed"] and only(detail, "fail_closed")
+    results.append(("F21-openrouter-ui-guard-missing-fail-closed", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C8: `providers` path anchor gone → fail-closed ---
+    bad_cfg = GOOD_CONFIG_BUILTINS.replace('path = "providers"', 'path = "providersX"')
+    assert 'path = "providers"' not in bad_cfg, "F22 anchor missing"
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, config_text=bad_cfg)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["fail_closed"] and only(detail, "fail_closed")
+    results.append(("F22-config-providers-anchor-missing-fail-closed", ok, detail))
+    shutil.rmtree(root)
+
     all_ok = True
     for name, ok, detail in results:
         print("%s %s" % ("PASS" if ok else "FAIL", name))
@@ -805,9 +1234,10 @@ def main():
     if rc == 0:
         print("provider_rpc_symmetry: ALL GREEN (C1 predicate single-source, "
               "C2 update guard, C3 key symmetry, C4 collection guard, "
-              "C5 mutation predicate floor)")
+              "C5 mutation predicate floor, C6 azureMode four faces, "
+              "C7 probe auth fork, C8 config-face keys, C9 UA visibility)")
         return 0
-    for k in ("c1", "c2", "c3", "c4", "c5", "fail_closed"):
+    for k in ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "fail_closed"):
         for line in detail[k]:
             print("[%s] %s" % (k.upper(), line))
     return 1

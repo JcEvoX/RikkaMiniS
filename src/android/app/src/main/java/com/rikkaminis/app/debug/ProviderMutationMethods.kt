@@ -65,6 +65,13 @@ internal object ProviderMutationMethods {
         val appendV1Suffix = params.optBoolean("appendV1Suffix", true)
         val isEnabled = params.optBoolean("isEnabled", true)
         val useResponsesAPI = params.optBoolean("useResponsesAPI", false)
+        // [da1030-C ISSUE-04] Azure OpenAI mode was readable on neither face
+        // (the field was missing from instanceJsonCore/instancesList) and
+        // writable on neither (create/update ignored it), so an automation
+        // harness could not set or observe the auth-header shape the request
+        // path honors (isAzure → `api-key` instead of `Authorization: Bearer`,
+        // ProviderFactory). Parsed with the same default as the instance field.
+        val azureMode = params.optBoolean("azureMode", false)
         // [T-provider-no-static-seed] Default OFF: a fresh provider starts with
         // an empty model list; refreshModels() populates it from upstream.
         // Kept as an explicit opt-in for callers that know what they're doing
@@ -101,6 +108,7 @@ internal object ProviderMutationMethods {
             customBaseURL = customBaseURL,
             appendV1Suffix = appendV1Suffix,
             useResponsesAPI = useResponsesAPI,
+            azureMode = azureMode,
             customUserAgent = customUserAgent,
         )
 
@@ -177,6 +185,13 @@ internal object ProviderMutationMethods {
             }
         } else current.imageEndpointMode
 
+        // [da1030-C ISSUE-04] Optional azureMode patch. Same opt-in shape as
+        // imageEndpointMode above (absent key = leave alone); NOT gated on
+        // providerType, mirroring the instance field itself — the flag is read
+        // only on the openAI arm, but the read/write faces must agree on where
+        // it lives so a create→list→update round trip cannot lose it.
+        val azureMode = if (params.has("azureMode")) params.optBoolean("azureMode", current.azureMode) else current.azureMode
+
         val updated = current.copy(
             label = if (params.has("label")) params.optString("label", current.label) else current.label,
             customBaseURL = if (params.has("customBaseURL")) {
@@ -187,6 +202,7 @@ internal object ProviderMutationMethods {
             useResponsesAPI = if (params.has("useResponsesAPI")) params.optBoolean("useResponsesAPI", current.useResponsesAPI) else current.useResponsesAPI,
             isEnabled = if (params.has("isEnabled")) params.optBoolean("isEnabled", current.isEnabled) else current.isEnabled,
             customUserAgent = customUserAgent,
+            azureMode = azureMode,
             imageEndpointMode = imageEndpointMode,
             imageEndpointResolved = if (params.has("imageEndpointMode") && imageEndpointMode != ImageEndpointMode.auto) {
                 null
@@ -264,7 +280,14 @@ internal object ProviderMutationMethods {
             .applyUserAgentOverride(instance.customUserAgent)
         when (instance.providerType) {
             ProviderType.anthropic -> if (!key.isNullOrEmpty()) builder.header("x-api-key", key).header("anthropic-version", "2023-06-01")
-            ProviderType.openAI -> if (!key.isNullOrEmpty()) builder.header("Authorization", "Bearer $key")
+            ProviderType.openAI -> if (!key.isNullOrEmpty()) {
+                // [da1030-C ISSUE-04] Azure mode switches the auth header shape
+                // (`api-key: <key>` instead of `Authorization: Bearer <key>`) —
+                // unconditional Bearer reported azureMode=true instances as
+                // failing auth when a real request from them would succeed.
+                val (name, value) = probeAuthHeader(instance.azureMode, key)
+                builder.header(name, value)
+            }
             ProviderType.openRouter -> if (!key.isNullOrEmpty()) builder.header("Authorization", "Bearer $key")
             ProviderType.gemini -> { /* key in URL */ }
             // xAI: OpenAI-compat bearer header. Manual API key OR OAuth
@@ -681,6 +704,11 @@ internal fun instanceJsonCore(inst: ProviderInstance, hasCredential: Boolean, en
         put("customBaseURL", inst.customBaseURL ?: JSONObject.NULL)
         put("appendV1Suffix", inst.appendV1Suffix)
         put("useResponsesAPI", inst.useResponsesAPI)
+        // [da1030-C ISSUE-04] Symmetric with instancesList — the Azure auth
+        // shape is part of the instance state the mutation face must
+        // round-trip, or a harness writing azureMode=true sees the response
+        // (and the next listing) deny it.
+        put("azureMode", inst.azureMode)
         // [GH#68] Mirror the instancesList keys so a mutation response and the
         // debug listing round-trip without losing the image-endpoint state.
         put("imageEndpointMode", inst.imageEndpointMode.name)
@@ -704,6 +732,23 @@ internal fun instanceJsonCore(inst: ProviderInstance, hasCredential: Boolean, en
  */
 internal val ProviderType.supportsCustomBaseURL: Boolean
     get() = this != ProviderType.openRouter
+
+/**
+ * [da1030-C ISSUE-04] Auth-header (name, value) pair for the connectivity
+ * probe — the Azure fork of [com.rikkaminis.app.provider.openai.OpenAIProvider]'s
+ * `applyKeyAuth` (`api-key` vs `Authorization: Bearer`). Pure on purpose so the
+ * fork is assertable in a JVM unit test (ProviderRpcSymmetryTest) and so the
+ * gate `provider_rpc_symmetry_check.py` (C7) can pin that `instancesTest` keys
+ * the header on the instance's `azureMode`.
+ *
+ * ponytail: 该分叉在此最小内联（`applyKeyAuth` 是 OpenAIProvider 的 private
+ * 扩展函数、`isAzure` 是它的构造参数，debug 探测面调不到）| 天花板: 第二份
+ * auth-header 分叉，与 provider/openai 的副本各自演化 | 升级触发: 共享单源
+ * （provider/openai/OpenAIAuthHeader.kt 的 applyOpenAIKeyAuth，见 deep-audit-1030
+ * FIX-D）落进本树后，本函数体改为委托它、由 C7 的允许清单接住。
+ */
+internal fun probeAuthHeader(azureMode: Boolean, key: String): Pair<String, String> =
+    if (azureMode) "api-key" to key else "Authorization" to "Bearer $key"
 
 /**
  * [deep-audit-1024 ISSUE-02] Connectivity-probe URL for `provider.instances.test`.
