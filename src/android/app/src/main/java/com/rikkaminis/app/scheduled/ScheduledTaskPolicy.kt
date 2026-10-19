@@ -182,6 +182,45 @@ object ScheduledTaskTransitions {
         return file.copy(tasks = file.tasks.toMutableList().also { it[idx] = updated })
     }
 
+    /**
+     * Apply an editor save: the editable SPEC fields come from [task], every
+     * run-state field stays whatever the store already holds.
+     *
+     * Why this exists (deep-audit-1030 ISSUE-08): the editor used to hand its
+     * whole record to `upsertTask`, which wrote it over the stored one. But a
+     * `ScheduledTask` carries run state (`lastRunDate` / `lastResult` /
+     * `failStreak` / `suspendedByFuse`) and `enabled` in the SAME record, and
+     * the editor snapshot is taken when the screen opens. Any run (including a
+     * fuse trip) that settles during the edit window — up to the full 60 s
+     * prompt budget — was silently erased by the save. Editorial intent is
+     * "change the spec"; run state is owned by the runner and [ScheduledTasksStore],
+     * so a save must not be able to speak about it at all.
+     *
+     * `enabled` is deliberately NOT carried over either: the editor has no
+     * switch for it (the row switch in ScheduledTasksScreen is the explicit
+     * control, and the editor's own snapshot is a copy of it), so a stale copy
+     * is the only thing that field could contribute — and it would defeat a
+     * fuse trip or a manual disable that happened mid-edit.
+     *
+     * An unknown id is appended as-is: a brand-new task has no run state to
+     * preserve, and the editor already seeds new tasks disabled (brief §5.4).
+     */
+    fun mergeUpsertTask(file: ScheduledTasksFile, task: ScheduledTask): ScheduledTasksFile {
+        val idx = file.tasks.indexOfFirst { it.id == task.id }
+        if (idx < 0) return file.copy(tasks = file.tasks + task)
+        val existing = file.tasks[idx]
+        val merged = existing.copy(
+            title = task.title,
+            prompt = task.prompt,
+            windowStart = task.windowStart,
+            windowEnd = task.windowEnd,
+            maxTurns = task.maxTurns,
+            deadlineSec = task.deadlineSec,
+            maxEstimatedTokens = task.maxEstimatedTokens,
+        )
+        return file.copy(tasks = file.tasks.toMutableList().also { it[idx] = merged })
+    }
+
     private fun clearMarker(file: ScheduledTasksFile, taskId: String): ScheduledTasksFile =
         if (file.running?.taskId == taskId) file.copy(running = null) else file
 }

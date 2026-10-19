@@ -32,6 +32,23 @@ shape before:
    and holds the status branches to rendering through that table instead of
    keeping a second copy.
 
+4. [deep-audit-1030 ISSUE-07 裂缝A] "is our service listed as enabled?" must have
+   ONE implementation. `A11yState.isServiceEnabled` kept its own
+   `split(':')`/`equals(...)` matcher while `AccessibilityRecoveryManager
+   .isRevokedIn` — the predicate the repair path uses — also accepted the
+   framework's abbreviated `pkg/.Class` spelling. The settings screen could
+   therefore report "disabled" for a service that was bound and healthy, and the
+   master switch was consulted on only one of the two paths.
+
+5. [deep-audit-1030 ISSUE-07 裂缝B] The repair-prompt slot must carry an owner
+   identity and a lock. `continuation` is published by the waiting coroutine and
+   taken by `respond` on the UI thread, while the timeout and cancellation paths
+   tear it down; with no owner id a LATE teardown dismissed the prompt a newer
+   waiter had just published, leaving that waiter parked for its full timeout.
+   (In this build the a11y tools are serial, so two concurrent `awaitDecision`s
+   are not reachable — the reachable interleave is `respond` vs. timeout /
+   cancellation, which is what these arms pin.)
+
 Losing any anchor FAILS loudly (exit 1) rather than passing silently — a probe
 that cannot find its subject must not report success.
 
@@ -287,6 +304,142 @@ def scan_status_tables(raw):
     return bad
 
 
+# ── deep-audit-1030 ISSUE-07 ────────────────────────────────────────────────
+# 4. ONE listing predicate. `A11yState.isServiceEnabled` used to carry its own
+#    `split(':')`/`equals("<pkg>/<fq class>")` matcher while
+#    `AccessibilityRecoveryManager.isRevokedIn` (the repair path) matched the
+#    framework's abbreviated `pkg/.Class` form too. Same fact, two matchers, and
+#    they drifted: the settings screen could report "disabled" for a service that
+#    is bound and healthy. Both halves are asserted (local matcher gone; both
+#    readers route through the shared predicate) — a revert of either one is red.
+#
+# 5. Prompt-slot identity. `continuation` is written by the waiter and read by
+#    `respond` (UI thread); the teardown paths (timeout, cancellation) used to
+#    clear it unconditionally, so a LATE teardown could dismiss the dialog a
+#    newer waiter had just published — leaving that waiter parked for its whole
+#    timeout. The token + lock shape is asserted here; see the gate's KDoc note
+#    on why the concurrency itself is not reachable in this build.
+# ────────────────────────────────────────────────────────────────────────────
+
+A11Y_STATE = f"{PKG}/accessibility/A11yState.kt"
+A11Y_RECOVERY = f"{PKG}/accessibility/AccessibilityRecoveryManager.kt"
+
+# The removed local matcher, named so a revert reads as red.
+LOCAL_MATCH_ANCHORS = ("split(':')", "equals(expected")
+SHARED_JUDGE = "AccessibilityRecoveryManager.isRevokedIn("
+MASTER_SWITCH = "A11yState.isMasterSwitchOn("
+SLOT_DECL = "var continuation: Continuation<Decision>?"
+SLOT_LOCK_DECL = "private val slotLock = Any()"
+SLOT_RELEASE = "_pendingPrompt.value = null"
+SLOT_RELEASE_WINDOW = 8
+SLOT_STOPS = ("    suspend fun ", "    fun ", "    private fun ", "    internal fun ", "    @")
+
+
+def scan_judge_single_source(state_raw, recovery_raw):
+    """Findings for the listing predicate being single-sourced (empty = clean)."""
+    bad = []
+    state = code_only(state_raw)
+    body = slice_body(state, "fun isServiceEnabled(")
+    if body is None:
+        bad.append("A11yState.isServiceEnabled() not found — the probe lost its subject")
+    else:
+        if SHARED_JUDGE not in body:
+            bad.append("A11yState.isServiceEnabled no longer routes through "
+                       "AccessibilityRecoveryManager.isRevokedIn — the listing predicate is "
+                       "implemented a second time, which is exactly the shape that drifted")
+        for anchor in LOCAL_MATCH_ANCHORS:
+            if anchor in body:
+                bad.append(f"A11yState.isServiceEnabled carries a local entry matcher ({anchor!r}) "
+                           "— the fully-qualified-only spelling misses `pkg/.Class`, so a healthy "
+                           "service reads as disabled while the repair path says otherwise")
+        if "isMasterSwitchOn(" not in body:
+            bad.append("A11yState.isServiceEnabled no longer consults the accessibility master "
+                       "switch (a service bound with accessibility globally off receives nothing)")
+
+    recovery = code_only(recovery_raw)
+    body = slice_body(recovery, "fun isGrantRevoked(")
+    if body is None:
+        bad.append("AccessibilityRecoveryManager.isGrantRevoked() not found — the probe lost its subject")
+    elif MASTER_SWITCH not in body:
+        bad.append("isGrantRevoked does not short-circuit on A11yState.isMasterSwitchOn — with "
+                   "accessibility globally off it reports a healthy grant while the service "
+                   "receives no events (the drift this single-source rule exists to stop)")
+    return bad
+
+
+def release_guard_gaps(text):
+    """Every release of the prompt slot must sit under a token comparison.
+
+    Decomposition-independent on purpose: the family lesson (see
+    `claim_release_guard`) is that a shared run-state flag loses its ownership
+    guard the moment a SECOND release path is written without one, so the
+    criterion is attached to the write itself, wherever it lives.
+    """
+    lines = text.split("\n")
+    hits = [i for i, line in enumerate(lines) if SLOT_RELEASE in line]
+    if not hits:
+        return [f"the prompt slot has no release site (`{SLOT_RELEASE}` is gone) — the probe "
+                "lost its subject"]
+    bad = []
+    for i in hits:
+        window = "\n".join(lines[max(0, i - SLOT_RELEASE_WINDOW):i + 1])
+        if "promptToken != " not in window:
+            bad.append(f"the slot release (`{SLOT_RELEASE}`, line {i + 1}) is not "
+                       "ownership-guarded — a late teardown can dismiss the prompt a NEWER "
+                       "waiter is showing")
+    return bad
+
+
+def scan_slot_identity(recovery_raw):
+    """Findings for the repair-prompt slot's identity + lock (empty = clean)."""
+    text = code_only(recovery_raw)
+    bad = []
+    decl = next((l for l in text.split("\n") if SLOT_DECL in l), None)
+    if decl is None:
+        bad.append(f"the repair-prompt slot ({SLOT_DECL}) is gone — nothing arbitrates the dialog")
+    elif "@Volatile" not in decl:
+        bad.append("the prompt slot is no longer @Volatile — `respond` reads it on the UI thread "
+                   "while the waiter writes it on the agent's")
+    if SLOT_LOCK_DECL not in text:
+        bad.append(f"the prompt slot has no lock ({SLOT_LOCK_DECL}) — publish / cleanup / respond "
+                   "can interleave")
+
+    await_body = slice_body(text, "private suspend fun awaitDecision(", SLOT_STOPS)
+    if await_body is None:
+        bad.append("awaitDecision() not found — the probe lost its subject")
+    else:
+        claim = "++promptToken" in await_body or "promptToken += 1" in await_body
+        if not claim:
+            bad.append("awaitDecision no longer claims a prompt token — with no owner id a late "
+                       "teardown from an expired waiter can clear a NEWER waiter's prompt")
+        elif "synchronized(slotLock) { ++promptToken }" not in await_body:
+            bad.append("awaitDecision claims its token outside the lock")
+        if claim and "val accepted = synchronized(slotLock) {" not in await_body:
+            bad.append("awaitDecision publishes the slot without the lock — the publish can race "
+                       "`respond` and a cleanup")
+        if "invokeOnCancellation" not in await_body:
+            bad.append("awaitDecision dropped invokeOnCancellation — a cancelled caller leaves the "
+                       "dialog on screen and the slot owned by nobody")
+        elif "clearSlotIfOwner(token)" not in await_body:
+            bad.append("awaitDecision's teardown is not token-guarded (expected "
+                       "`clearSlotIfOwner(token)`) — it must clear the slot only while it still "
+                       "owns it")
+
+    bad.extend(release_guard_gaps(text))
+
+    respond_body = slice_body(text, "fun respond(", SLOT_STOPS)
+    if respond_body is None:
+        bad.append("respond() not found — the probe lost its subject")
+    else:
+        if "runCatching" not in respond_body:
+            bad.append("respond resumes without runCatching — an already-cancelled continuation "
+                       "throws straight through the UI callback")
+        if "val taken = synchronized(slotLock) {" not in respond_body:
+            bad.append("respond takes the slot outside the lock — it can interleave with a "
+                       "cleanup and hand the decision to the wrong waiter")
+    return bad
+
+
 def selftest():
     """Negative controls: each section must reject its own mutated fixture and
     accept the clean one. A gate that cannot fail is not a gate."""
@@ -394,6 +547,99 @@ def selftest():
 
     clean_status = status_fixture()
 
+    # ── deep-audit-1030 ISSUE-07: one listing predicate, one owned slot ──
+    clean_judge_state = (
+        "object A11yState {\n"
+        "    fun isServiceEnabled(context: Context): Boolean {\n"
+        "        if (!isMasterSwitchOn(context)) return false\n"
+        "        val enabled = Settings.Secure.getString(\n"
+        "            context.contentResolver,\n"
+        "            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,\n"
+        "        ) ?: return false\n"
+        "        return !AccessibilityRecoveryManager.isRevokedIn(\n"
+        "            enabled,\n"
+        "            context.packageName,\n"
+        "            MinisAccessibilityService::class.java.name,\n"
+        "        )\n"
+        "    }\n"
+        "\n"
+        "    fun isMasterSwitchOn(context: Context): Boolean {\n"
+        "        return true\n"
+        "    }\n"
+        "}\n"
+    )
+    clean_judge_recovery = (
+        "object AccessibilityRecoveryManager {\n"
+        "    fun isGrantRevoked(context: Context): Boolean {\n"
+        "        if (A11yState.isMasterSwitchOn(context)) {\n"
+        "            return isRevokedIn(\n"
+        "                enabledValue = raw,\n"
+        "                pkg = context.packageName,\n"
+        "                serviceClass = MinisAccessibilityService::class.java.name,\n"
+        "            )\n"
+        "        } else {\n"
+        "            return true\n"
+        "        }\n"
+        "    }\n"
+        "\n"
+        "    fun isRevokedIn(enabledValue: String?, pkg: String, serviceClass: String): Boolean = true\n"
+        "}\n"
+    )
+    clean_slot = (
+        "object AccessibilityRecoveryManager {\n"
+        "    private val slotLock = Any()\n"
+        "\n"
+        "    @Volatile private var continuation: Continuation<Decision>? = null\n"
+        "\n"
+        "    private var promptToken: Long = 0L\n"
+        "\n"
+        "    private suspend fun awaitDecision(prompt: RepairPrompt): Decision {\n"
+        "        val token = synchronized(slotLock) { ++promptToken }\n"
+        "        val decision = withTimeoutOrNull(PROMPT_TIMEOUT_MS) {\n"
+        "            suspendCancellableCoroutine<Decision> { cont ->\n"
+        "                val accepted = synchronized(slotLock) {\n"
+        "                    if (promptToken != token) {\n"
+        "                        false\n"
+        "                    } else {\n"
+        "                        continuation = cont\n"
+        "                        true\n"
+        "                    }\n"
+        "                }\n"
+        "                if (!accepted) {\n"
+        "                    runCatching { cont.resume(Decision.CANCEL) }\n"
+        "                    return@suspendCancellableCoroutine\n"
+        "                }\n"
+        "                cont.invokeOnCancellation { clearSlotIfOwner(token) }\n"
+        "            }\n"
+        "        }\n"
+        "        if (decision == null) {\n"
+        "            clearSlotIfOwner(token)\n"
+        "        }\n"
+        "        return decision ?: Decision.CANCEL\n"
+        "    }\n"
+        "\n"
+        "    private fun clearSlotIfOwner(token: Long) {\n"
+        "        synchronized(slotLock) { clearSlotLocked(token) }\n"
+        "    }\n"
+        "\n"
+        "    private fun clearSlotLocked(token: Long): Continuation<Decision>? {\n"
+        "        if (promptToken != token) return null\n"
+        "        val taken = continuation\n"
+        "        continuation = null\n"
+        "        _pendingPrompt.value = null\n"
+        "        return taken\n"
+        "    }\n"
+        "\n"
+        "    fun respond(decision: Decision) {\n"
+        "        val taken = synchronized(slotLock) {\n"
+        "            val token = ++promptToken\n"
+        "            clearSlotLocked(token)\n"
+        "        }\n"
+        "        runCatching { taken?.resume(decision) }\n"
+        "    }\n"
+        "}\n"
+    )
+
     cases = [
         ("service/clean", clean_service),
         ("service/resultRef is back", clean_service.replace(
@@ -446,17 +692,50 @@ def selftest():
         ("status/table literal lost", clean_status.replace(_table("SCROLL", [
             ("node", "a11y_cli: scroll node %s"), ("xy", "a11y_cli: scroll at (%s)"),
             ("to-text", 'a11y_cli: scrolling to \\"%s\\"')]), "")),
+        # ── one listing predicate (deep-audit-1030 ISSUE-07 裂缝A) ──
+        ("judge/clean", (clean_judge_state, clean_judge_recovery)),
+        # The pre-fix shape: the screen keeps its own fully-qualified-only matcher.
+        ("judge/state keeps its own entry matcher", (clean_judge_state.replace(
+            "        return !AccessibilityRecoveryManager.isRevokedIn(\n",
+            '        val expected = "${context.packageName}/${MinisAccessibilityService::class.java.name}"\n'
+            "        return enabled.split(':').any { it.equals(expected, ignoreCase = true) }\n"), clean_judge_recovery)),
+        ("judge/state drops the master switch", (clean_judge_state.replace(
+            "        if (!isMasterSwitchOn(context)) return false\n", ""), clean_judge_recovery)),
+        ("judge/arm drops the master-switch short circuit", (clean_judge_state, clean_judge_recovery.replace(
+            "if (A11yState.isMasterSwitchOn(context)) {", "if (true) {"))),
+        # ── prompt-slot identity + lock (deep-audit-1030 ISSUE-07 裂缝B) ──
+        ("slot/clean", clean_slot),
+        ("slot/loses @Volatile", clean_slot.replace(
+            "@Volatile private var continuation", "private var continuation")),
+        ("slot/teardown is unconditional again", clean_slot.replace(
+            "        if (promptToken != token) return null\n", "")),
+        ("slot/respond resumes without runCatching", clean_slot.replace(
+            "runCatching { taken?.resume(decision) }", "taken?.resume(decision)")),
+        ("slot/never claims a token", clean_slot.replace(
+            "val token = synchronized(slotLock) { ++promptToken }", "val token = 0L")),
+        ("slot/drops invokeOnCancellation", clean_slot.replace(
+            "                cont.invokeOnCancellation { clearSlotIfOwner(token) }\n", "")),
+        ("slot/publishes without the lock", clean_slot.replace(
+            "                val accepted = synchronized(slotLock) {", "                val accepted = run {")),
+        ("slot/respond outside the lock", clean_slot.replace(
+            "        val taken = synchronized(slotLock) {", "        val taken = run {")),
     ]
 
     print("a11y_handler_contract_check --selftest")
     failures = 0
     status_failures = 0
+    judge_failures = 0
+    slot_failures = 0
     for name, fixture in cases:
         expect_clean = name.endswith("/clean")
         if name.startswith("service/"):
             bad = scan_service(fixture)
         elif name.startswith("status/"):
             bad = scan_status_tables(fixture)
+        elif name.startswith("judge/"):
+            bad = scan_judge_single_source(*fixture)
+        elif name.startswith("slot/"):
+            bad = scan_slot_identity(fixture)
         else:
             bad = scan_handler(fixture)
         ok = (not bad) if expect_clean else bool(bad)
@@ -465,8 +744,14 @@ def selftest():
             failures += 1
             if name.startswith("status/"):
                 status_failures += 1
+            elif name.startswith("judge/"):
+                judge_failures += 1
+            elif name.startswith("slot/"):
+                slot_failures += 1
     print(f"  {'✅ selftest passed' if not failures else f'❌ selftest failures: {failures}'}")
     print(f"A11Y_STATUS_SELFTEST={'PASS' if status_failures == 0 else 'FAIL'}")
+    print(f"A11Y_JUDGE_SINGLE_SOURCE_SELFTEST={'PASS' if judge_failures == 0 else 'FAIL'}")
+    print(f"A11Y_SLOT_IDENTITY_SELFTEST={'PASS' if slot_failures == 0 else 'FAIL'}")
     return 1 if failures else 0
 
 
@@ -489,6 +774,35 @@ def main():
             continue
         with open(path, encoding="utf-8") as f:
             bad = scan(f.read())
+        if bad:
+            print(f"❌ {label}")
+            for b in bad:
+                print(f"   - {b}")
+            total += len(bad)
+        else:
+            print(f"✅ {label}")
+
+    # Multi-file faces: the fact lives in one place, its readers in another.
+    for label, rels, scan in (
+        ("accessibility listing predicate (single source: A11yState ↔ recovery)",
+         (A11Y_STATE, A11Y_RECOVERY), scan_judge_single_source),
+        ("AccessibilityRecoveryManager (prompt slot: identity + lock)",
+         (A11Y_RECOVERY,), scan_slot_identity),
+    ):
+        texts = []
+        gap = False
+        for rel in rels:
+            path = os.path.join(root, rel)
+            if not os.path.isfile(path):
+                print(f"❌ {rel}: missing")
+                total += 1
+                gap = True
+                break
+            with open(path, encoding="utf-8") as f:
+                texts.append(f.read())
+        if gap:
+            continue
+        bad = scan(*texts)
         if bad:
             print(f"❌ {label}")
             for b in bad:

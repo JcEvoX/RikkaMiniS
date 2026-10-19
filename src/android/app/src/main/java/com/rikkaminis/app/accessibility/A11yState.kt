@@ -30,15 +30,27 @@ object A11yState {
      * some OEM builds; a missing value is treated as ON so the check degrades
      * to the pre-existing list-only behaviour rather than reporting "disabled"
      * on a device that never wrote the flag.
+     *
+     * Single source of truth for the *listing* half: the entry matching lives in
+     * [AccessibilityRecoveryManager.isRevokedIn] — the same predicate the repair
+     * path ([AccessibilityRecoveryManager.isGrantRevoked]) uses. This used to be
+     * a local `split(':').any { it.equals("<pkg>/<fq class>") }`, which only
+     * accepted the fully-qualified `pkg/pkg.Class` spelling while the framework
+     * may normalize to `pkg/.Class` — so this screen could report "disabled" for
+     * a healthy, connected service, and the two callers of this fact drifted
+     * apart. Do NOT reintroduce a local match here.
      */
     fun isServiceEnabled(context: Context): Boolean {
         if (!isMasterSwitchOn(context)) return false
-        val expected = "${context.packageName}/${MinisAccessibilityService::class.java.name}"
         val enabled = Settings.Secure.getString(
             context.contentResolver,
             Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
         ) ?: return false
-        return enabled.split(':').any { it.equals(expected, ignoreCase = true) }
+        return !AccessibilityRecoveryManager.isRevokedIn(
+            enabled,
+            context.packageName,
+            MinisAccessibilityService::class.java.name,
+        )
     }
 
     /**
