@@ -37,6 +37,7 @@ import com.rikkaminis.app.deeplink.DeepLinkHandler
 
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.service.SessionActivityTracker
+import com.rikkaminis.app.ui.chat.ChatViewModelStore
 import com.rikkaminis.app.ui.NewerDatabaseGuidanceScreen
 import com.rikkaminis.app.ui.navigation.AppNavigation
 import com.rikkaminis.app.ui.navigation.coldStartRestoreAllowed
@@ -569,7 +570,19 @@ class MainActivity : ComponentActivity() {
                     val job = lifecycleScope.launch {
                         navController.currentBackStackEntryFlow.collect { entry ->
                             val isChatRoute = entry.destination.route == Routes.CHAT
-                            val sid = entry.arguments?.getString("sessionId").takeIf { isChatRoute }
+                            // [da1032-D] The route arg can still be a draft key
+                            // (`__new__<uuid>`) after the first send promoted the
+                            // chat to a real row — the screen keeps its original
+                            // nav arg for its whole lifetime. Everything below
+                            // (keep-alive presence, the tracked currentChatSessionId,
+                            // the crash-recovery file) then points at an orphan
+                            // draft key: SessionActivityTracker holds a session that
+                            // no row owns, and a crash restore lands the user back
+                            // in a synthetic draft. Resolve once, here, through the
+                            // same alias table the rest of the app uses.
+                            val sid = entry.arguments?.getString("sessionId")
+                                ?.takeIf { isChatRoute }
+                                ?.let { ChatViewModelStore.resolveSessionId(it) }
                             val previous = currentChatSessionId
                             if (sid != previous) {
                                 if (previous != null) {
@@ -630,7 +643,13 @@ class MainActivity : ComponentActivity() {
     override fun onSaveInstanceState(outState: Bundle) {
         super.onSaveInstanceState(outState)
         currentChatSessionId?.let {
-            outState.putString(KEY_CURRENT_CHAT_SESSION_ID, it)
+            // [da1032-D] Second line of defence for the same draft-key family:
+            // whatever writer put an id in [currentChatSessionId], the bundle
+            // carries the canonical one. The nav listener above already resolves
+            // before storing, so this is normally a no-op pass-through — it
+            // matters for any other writer and for ids restored from an older
+            // bundle through [restoredChatSessionId].
+            outState.putString(KEY_CURRENT_CHAT_SESSION_ID, ChatViewModelStore.resolveSessionId(it))
         }
     }
 
@@ -761,7 +780,16 @@ class MainActivity : ComponentActivity() {
         val nav = navController ?: return
         when (action) {
             is DeepLinkAction.OpenTerminal -> {
-                nav.navigate(Routes.terminal(action.initCommand))
+                // [da1032-D] Terminal sessions are bound to the chat session id
+                // (minis-sessions/<sid>/ bind mounts + MINIS_CHAT_SESSION_ID),
+                // so a hot deep link must carry the *resolved* id of the chat
+                // currently on screen — not the raw field, which can still be a
+                // draft key, and not nothing, which binds the terminal to the
+                // global workspace while the user is inside a chat. Same alias
+                // hop as AppNavigation's onOpenTerminal.
+                val terminalSessionId = currentChatSessionId
+                    ?.let { ChatViewModelStore.resolveSessionId(it) }
+                nav.navigate(Routes.terminal(action.initCommand, sessionId = terminalSessionId))
             }
             is DeepLinkAction.OpenSession -> {
                 // T-double-chat-fix (secondary): mirror AppNavigation's

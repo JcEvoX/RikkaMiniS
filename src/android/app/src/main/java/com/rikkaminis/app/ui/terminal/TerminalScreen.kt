@@ -64,6 +64,7 @@ import com.rikkaminis.app.sandbox.TerminalSession
 import com.rikkaminis.app.terminal.MinisOpenUrlBroker
 import com.termux.view.TerminalView
 import com.termux.view.TerminalViewClient
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 // iOS-matched palette
@@ -102,7 +103,26 @@ fun TerminalScreen(
     LaunchedEffect(Unit) {
         if (!terminalSession.isRunning) terminalSession.start(sessionId = sessionId)
         if (!initCommand.isNullOrBlank()) {
-            kotlinx.coroutines.delay(500)
+            // [da1032-D] Wait for READY, never a fixed wall-clock guess. RUNNING
+            // is published by TerminalSession only after its `cd /var/minis &&
+            // clear\r` preamble has been written, so this ordering guarantees
+            // the preamble is ahead of the prefill in the PTY input queue. The
+            // old `delay(500)` raced a boot that takes ≥500 ms routinely (PRoot
+            // boot + a 300 ms delay before the preamble): the prefill then
+            // landed first and the two writes merged into one line that the
+            // shell executed — `clear` erased it in the best case.
+            //
+            // ponytail: no boot timeout — if the PTY never becomes RUNNING
+            // (failed start leaves STOPPED/BOOTING) this suspends until the
+            // screen is disposed and the effect is cancelled, which is exactly
+            // what happens today. 天花板: a start() that fails silently keeps
+            // the prefill invisible. 升级触发: a real-device report of "deep
+            // link terminal opens but never shows the command" while the
+            // session state is STOPPED.
+            terminalSession.state.first { it == TerminalSession.State.RUNNING }
+            // A short settle for the interactive shell to consume the preamble
+            // (cd + clear) before the prefill is echoed under it.
+            kotlinx.coroutines.delay(100)
             // Strip control characters that would execute commands (CR, LF, ESC, etc.)
             // before sending to the PTY — defense-in-depth alongside DeepLinkHandler's
             // sanitization. The initCommand is meant to pre-fill visible text, not

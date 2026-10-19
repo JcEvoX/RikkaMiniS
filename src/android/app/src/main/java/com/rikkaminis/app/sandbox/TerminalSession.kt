@@ -179,17 +179,51 @@ class TerminalSession(private val context: Context) {
                 }
 
                 termuxSession = session
-                _state.value = State.RUNNING
                 liveSessions.add(WeakReference(this@TerminalSession))
                 Log.i(TAG, "Termux PTY started: cols=$cols rows=$rows sessionId=$sessionId")
 
                 // If a session is active, cd into its workspace so the user lands
                 // in a familiar directory (mirrors legacy behaviour).
+                //
+                // [da1032-D] This preamble MUST reach the PTY before anything
+                // else is typed into it, so it is written while the state is
+                // still BOOTING. It used to run 300 ms *after*
+                // `_state.value = State.RUNNING`, while the screen prefilled
+                // `initCommand` a fixed 500 ms after start(): only 200 ms of
+                // margin against `PRootKernel.boot()`. Whenever boot overran
+                // that, the prefill bytes were queued FIRST and the two writes
+                // coalesced into a single input line —
+                // `<prefill>cd /var/minis && clear` + CR — which the interactive
+                // shell then EXECUTED as one command (the prefill is only ever
+                // supposed to be visible text, never a command), and `clear`
+                // wiped the screen on top of that. Sanitising the prefill
+                // cannot prevent this: the CR that submits the line belongs to
+                // this very write.
                 if (sessionId != null) {
                     kotlinx.coroutines.delay(300)
                     val initCmd = "cd /var/minis && clear\r".toByteArray()
                     session.write(initCmd, 0, initCmd.size) // (text, offset, length)
                 }
+
+                // [da1032-D] RUNNING is published only NOW, so its meaning
+                // upgrades from "the PTY process exists" to "the PTY is ready —
+                // the optional cd/clear preamble has been injected". Consumers
+                // gate on it before typing (the screen's prefill, the
+                // AndroidView attach), which is what makes the preamble the
+                // first thing the shell reads instead of racing it.
+                //
+                // The generation is re-checked first for the same reason as the
+                // two earlier guards: stop() cannot cancel this coroutine, so a
+                // teardown (or a newer start()) during the 300 ms delay above
+                // must not resurrect an already-killed PTY as RUNNING.
+                if (myGeneration != startGeneration.get()) {
+                    Log.i(TAG, "start() superseded before RUNNING — killing PTY")
+                    killTermuxProcessTree(session)
+                    termuxSession = null
+                    _state.value = State.STOPPED
+                    return@launch
+                }
+                _state.value = State.RUNNING
             } catch (t: Throwable) {
                 Log.e(TAG, "Failed to start Termux PTY session", t)
                 // [audit-0917] Kill and release a PTY that was already assigned
