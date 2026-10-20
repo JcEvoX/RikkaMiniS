@@ -78,6 +78,8 @@ import androidx.compose.ui.unit.sp
 import com.rikkaminis.app.browser.BrowserHistoryStore
 import com.rikkaminis.app.browser.BrowserTabPool
 import com.rikkaminis.app.browser.UserAgentProfile
+import com.rikkaminis.app.browser.normalizeBrowserUrl
+import com.rikkaminis.app.browser.resolveBrowserAddressInput
 import com.rikkaminis.app.ui.chat.StandardChatSheet
 import com.rikkaminis.app.ui.components.sanitizeSingleLineInput
 import kotlinx.coroutines.launch
@@ -258,7 +260,10 @@ fun BrowserSheet(
                             keyboardActions = KeyboardActions(onGo = {
                                 val trimmed = urlInput.trim()
                                 if (trimmed.isNotEmpty()) {
-                                    val normalized = normalizeURLInput(trimmed)
+                                    // [dv15-B3] single source: the decision
+                                    // (URL vs. search) and the URL's spelling
+                                    // both live in BrowserUtil now.
+                                    val normalized = resolveBrowserAddressInput(trimmed, ::googleSearchUrl)
                                     selectedTab?.manager?.loadURL(normalized)
                                     urlInput = normalized
                                 }
@@ -459,7 +464,10 @@ fun BrowserSheet(
             onNavigate = { url ->
                 scope.launch {
                     val tab = selectedTab ?: tabPool.newTabFromUI()
-                    tab?.manager?.loadURL(url)
+                    // [dv15-B3] history entries are already absolute, so this
+                    // is the shared normalizer as a no-op guard — the point is
+                    // that the sheet no longer owns a second spelling of it.
+                    tab?.manager?.loadURL(normalizeBrowserUrl(url))
                     showHistory = false
                 }
             },
@@ -625,12 +633,14 @@ private fun AgentBrowsingOverlay(accent: Color, onTakeover: () -> Unit) {
     }
 }
 
-/** Normalize URL input: search terms → Google search, bare domains → https:// prefix. */
-private fun normalizeURLInput(input: String): String {
-    val trimmed = input.trim()
-    if (trimmed.contains("://")) return trimmed
-    if (trimmed.contains(' ') || !trimmed.contains('.')) {
-        return "https://www.google.com/search?q=${java.net.URLEncoder.encode(trimmed, "UTF-8")}"
-    }
-    return "https://$trimmed"
-}
+/**
+ * [dv15-B3] The address bar's search-engine URL.
+ *
+ * This is the one part of the address-bar decision that is a product choice
+ * rather than a URL-syntax rule, so it stays in the UI layer: the syntax half
+ * (is this a URL? how is it spelled?) lives in
+ * `com.rikkaminis.app.browser.resolveBrowserAddressInput` /
+ * `normalizeBrowserUrl`, and is JVM-tested.
+ */
+private fun googleSearchUrl(query: String): String =
+    "https://www.google.com/search?q=" + java.net.URLEncoder.encode(query, "UTF-8")
