@@ -203,6 +203,44 @@ class SandboxPathGuardWiringTest {
         )
     }
 
+    // ── dv15-B1 B-06: every fileBrowser route declares its linux root ──
+    //
+    // `readonly_mount_write_guard.py` (frozen) only pins that AppNavigation
+    // keeps `Routes.fileBrowser(` and the mounts literal; it cannot assert
+    // "every route passes a linuxRoot" — that criterion lives here, reading
+    // the real tree. B-06 was the rootfs-management entry rendering the
+    // Alpine placeholder dirs instead of the bind mounts; the session entry
+    // is the one documented host-based exemption.
+
+    @Test
+    fun `every fileBrowser route passes a linuxRoot except the host-based session entry`() {
+        val sites = callSlices(readRepoFile(APP_NAV), "Routes.fileBrowser(")
+        assertTrue(
+            "Routes.fileBrowser( call sites drifted (dead literal: exactly 4):\n$sites",
+            sites.size == 4,
+        )
+        val rooted = sites.filter { it.contains("linuxRoot = ") }
+        val bare = sites.filterNot { it.contains("linuxRoot = ") }
+        assertTrue("expected 3 rooted routes:\n$rooted", rooted.size == 3)
+        assertTrue("expected exactly 1 bare route:\n$bare", bare.size == 1)
+        assertTrue(
+            "shared-folder route lost its linuxRoot:\n$rooted",
+            rooted.any { it.contains("linuxRoot = \"/var/minis/\$folderId\"") },
+        )
+        assertTrue(
+            "mounts route lost its linuxRoot:\n$rooted",
+            rooted.any { it.contains("linuxRoot = \"/var/minis/mounts/\${entry.name}\"") },
+        )
+        assertTrue(
+            "rootfs route lost its linuxRoot (the B-06 defect):\n$rooted",
+            rooted.any { it.contains("linuxRoot = \"/\"") },
+        )
+        assertTrue(
+            "the bare route is not the session entry (displayPrefix marker):\n$bare",
+            bare.all { it.contains("displayPrefix = \"/var/minis\"") },
+        )
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────
 
     private fun readRepoFile(relative: String): String {
@@ -270,6 +308,79 @@ class SandboxPathGuardWiringTest {
         }
         return sb.toString()
     }
+
+    /** Comment-stripped call-site slices for [marker], cut at its balanced closing paren. */
+    private fun callSlices(src: String, marker: String): List<String> {
+        val code = stripComments(src)
+        val sites = mutableListOf<String>()
+        var from = 0
+        while (true) {
+            val at = code.indexOf(marker, from)
+            if (at < 0) break
+            var depth = 0
+            var end = -1
+            var i = at + marker.length - 1 // at the marker's '('
+            var quote: Char? = null
+            while (i < code.length) {
+                val c = code[i]
+                if (quote != null) {
+                    if (c == '\\') { i += 2; continue }
+                    if (c == quote) quote = null
+                    i++
+                    continue
+                }
+                when (c) {
+                    '"', '\'' -> quote = c
+                    '(' -> depth++
+                    ')' -> {
+                        depth--
+                        if (depth == 0) { end = i; break }
+                    }
+                }
+                i++
+            }
+            assertTrue("unbalanced parens for $marker at offset $at", end > 0)
+            sites.add(code.substring(at, end + 1))
+            from = end + 1
+        }
+        return sites
+    }
+
+    /** Removes // and block comments (nesting-aware) while keeping string literals. */
+    private fun stripComments(src: String): String {
+        val sb = StringBuilder()
+        var i = 0
+        var quote: Char? = null
+        while (i < src.length) {
+            val c = src[i]
+            if (quote != null) {
+                sb.append(c)
+                if (c == '\\' && i + 1 < src.length) { sb.append(src[i + 1]); i += 2; continue }
+                if (c == quote) quote = null
+                i++
+                continue
+            }
+            if (c == '"' || c == '\'') { quote = c; sb.append(c); i++; continue }
+            if (c == '/' && i + 1 < src.length && src[i + 1] == '/') {
+                while (i < src.length && src[i] != '\n') i++
+                continue
+            }
+            if (c == '/' && i + 1 < src.length && src[i + 1] == '*') {
+                var nest = 1
+                i += 2
+                while (i < src.length && nest > 0) {
+                    if (src[i] == '*' && i + 1 < src.length && src[i + 1] == '/') { nest--; i += 2 }
+                    else if (src[i] == '/' && i + 1 < src.length && src[i + 1] == '*') { nest++; i += 2 }
+                    else i++
+                }
+                continue
+            }
+            sb.append(c)
+            i++
+        }
+        return sb.toString()
+    }
+
     private companion object {
         private const val PROOT_KERNEL =
             "src/android/app/src/main/java/com/rikkaminis/app/sandbox/PRootKernel.kt"
@@ -281,5 +392,7 @@ class SandboxPathGuardWiringTest {
             "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ModelUseOffloadHandler.kt"
         private const val FASTIO =
             "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/FastioOffloadHandler.kt"
+        private const val APP_NAV =
+            "src/android/app/src/main/java/com/rikkaminis/app/ui/navigation/AppNavigation.kt"
     }
 }
