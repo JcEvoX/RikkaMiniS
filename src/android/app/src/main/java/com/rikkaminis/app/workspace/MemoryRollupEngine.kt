@@ -51,6 +51,53 @@ object MemoryRollupEngine {
     /** Rollup product file name, living next to GLOBAL.md in the memory dir. */
     const val ROLLUP_FILE = "MEMORY-ROLLUP.md"
 
+    // ── Candidate口径 (single source) ────────────────────────────────────
+
+    /**
+     * Daily-log file names are exactly `YYYY-MM-DD.md`. Kept here as the single
+     * copy: the executor ([com.rikkaminis.app.workspace.MemoryRollupRunner]) and
+     * the system-prompt size hint
+     * ([com.rikkaminis.app.data.repository.MemoryRepository]) must judge
+     * candidacy identically — when they diverged, the prompt kept naming an
+     * already-distilled log as the largest pending one and the agent burned a
+     * memory_rollup call per turn to be told SKIPPED_ALREADY.
+     * ([dv15-A4] deep-audit-1036 A-07)
+     */
+    private val DATE_FILE_PATTERN = Regex("\\d{4}-\\d{2}-\\d{2}")
+
+    /**
+     * Whether [fileName] is a *past*, non-empty daily log — the shape both
+     * sides agree on, regardless of whether it was distilled yet.
+     *
+     * [todayStr] is `yyyy-MM-dd` in the caller's timezone: today (and any
+     * future-dated file) is still being written, so it is never a candidate.
+     * ISO dates compare lexicographically, which is the cutoff the executor has
+     * always used.
+     */
+    fun isPastDailyLog(fileName: String, byteSize: Long, todayStr: String): Boolean {
+        val datePart = fileName.removeSuffix(".md")
+        if (!DATE_FILE_PATTERN.matches(datePart)) return false
+        if (datePart >= todayStr) return false
+        return byteSize > 0L
+    }
+
+    /**
+     * Whether [fileName] is a log the rollup would actually select right now: a
+     * past, non-empty daily log that no existing rollup section covers yet.
+     * A candidate for both sides — the executor's picker and the prompt-side
+     * size hint — so the hint can only ever name a file the executor would not
+     * answer with SKIPPED_ALREADY.
+     */
+    fun isRollupCandidate(
+        fileName: String,
+        byteSize: Long,
+        todayStr: String,
+        rollupContent: String,
+    ): Boolean {
+        if (!isPastDailyLog(fileName, byteSize, todayStr)) return false
+        return !hasRollupForDate(rollupContent, fileName.removeSuffix(".md"))
+    }
+
     private val TIMESTAMP_MARKER = Regex("""<!-- (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) -->\s*\n?""")
 
     // ── Entry splitting ──────────────────────────────────────────────────
