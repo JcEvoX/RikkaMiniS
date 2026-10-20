@@ -4,6 +4,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 import java.io.File
 
@@ -127,9 +128,140 @@ class ModelUseEnvelopeDialectTest {
         assertNull(ModelUseProtocol.parseCustomEndpointPath("not json at all"))
     }
 
+    // ── [dv14-A4] ISSUE-08: the IMAGE passthrough dialect, one source ────
+    //
+    // Same defect one layer over: implicit top-level keys (minus the reserved
+    // set) + the explicit `extra_body` / `extra_headers` / `endpoint_path`
+    // envelope was written THREE times, each copy with its own 17-key
+    // `imageReservedKeys` set, and two of the three copies were already
+    // unreachable (one dead, one feeding a reader nobody called).
+    // `ModelUseProtocol.parseImagePassthrough` is the single source now.
+
+    @Test
+    fun `implicit top-level keys fold into the body and reserved keys never do`() {
+        val spec = ModelUseProtocol.parseImagePassthrough(
+            """{"prompt":"a cat","image":"data:image/png;base64,AAA","size":"1024x1024","n":1}""",
+        )
+        // `prompt`, `size` and `n` are schema keys the image call already
+        // consumes — they must NOT be smuggled into the passthrough body.
+        assertEquals(mapOf("image" to "data:image/png;base64,AAA"), spec.body)
+        assertTrue("no warning expected: ${spec.warnings}", spec.warnings.isEmpty())
+        assertTrue(spec.headers.isEmpty())
+        assertNull(spec.endpointPath)
+    }
+
+    @Test
+    fun `an explicit extra_body beats an implicit top-level key of the same name`() {
+        val spec = ModelUseProtocol.parseImagePassthrough(
+            """{"image":"implicit","extra_body":{"image":"explicit","seed":7}}""",
+        )
+        assertEquals("explicit", spec.body["image"])
+        assertEquals(7, (spec.body["seed"] as Number).toInt())
+        assertEquals(2, spec.body.size)
+        assertTrue("no warning expected: ${spec.warnings}", spec.warnings.isEmpty())
+    }
+
+    @Test
+    fun `a nested extra_body value travels verbatim, not stringified`() {
+        val spec = ModelUseProtocol.parseImagePassthrough(
+            """{"extra_body":{"plugins":[{"id":"web"}],"watermark":false}}""",
+        )
+        assertEquals("""[{"id":"web"}]""", spec.body["plugins"].toString())
+        assertEquals(false, spec.body["watermark"])
+    }
+
+    @Test
+    fun `a non-object extra_body is reported instead of silently dropped`() {
+        // Before: the worker read `optJSONObject("extra_body")`, so an array
+        // (or a string) was dropped with ZERO feedback — the exact silent
+        // shape da1019 fixed for extra_headers.
+        for (json in listOf("""{"image":"x","extra_body":["a"]}""", """{"image":"x","extra_body":"y"}""")) {
+            val spec = ModelUseProtocol.parseImagePassthrough(json)
+            assertEquals(mapOf("image" to "x"), spec.body)
+            assertEquals("exactly one warning for <$json>", 1, spec.warnings.size)
+            assertTrue(
+                "the warning must name the actual type: ${spec.warnings}",
+                spec.warnings[0].startsWith("extra_body is not a JSON object (actual type: "),
+            )
+        }
+    }
+
+    @Test
+    fun `extra_headers and endpoint_path are part of the same parse`() {
+        val spec = ModelUseProtocol.parseImagePassthrough(
+            """{"extra_headers":{"x-a":"1"},"endpoint_path":" /v2/images "}""",
+        )
+        assertEquals(mapOf("x-a" to "1"), spec.headers)
+        assertEquals("/v2/images", spec.endpointPath)
+        assertTrue(spec.body.isEmpty())
+        assertTrue("no warning expected: ${spec.warnings}", spec.warnings.isEmpty())
+    }
+
+    @Test
+    fun `endpoint_path is reserved so it never leaks into the body`() {
+        val spec = ModelUseProtocol.parseImagePassthrough(
+            """{"endpoint_path":"/v2/images","image_endpoint":"/v1/i","endpoint":"chat"}""",
+        )
+        assertTrue("every key here is reserved: ${spec.body}", spec.body.isEmpty())
+        assertEquals("/v2/images", spec.endpointPath)
+        assertNull(ModelUseProtocol.parseImagePassthrough("""{"endpoint_path":"   "}""").endpointPath)
+    }
+
+    @Test
+    fun `non-json input yields the empty spec`() {
+        val spec = ModelUseProtocol.parseImagePassthrough("just a prompt")
+        assertTrue(spec.body.isEmpty())
+        assertTrue(spec.headers.isEmpty())
+        assertNull(spec.endpointPath)
+        assertTrue(spec.warnings.isEmpty())
+    }
+
+    @Test
+    fun `both processes delegate the image dialect to ModelUseProtocol`() {
+        // Fail-closed on purpose: a structural check that silently skips when
+        // it cannot find the tree is not evidence (the sibling envelope check
+        // still returns early — registered, not changed here).
+        val handlerRel =
+            "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ModelUseOffloadHandler.kt"
+        val serviceRel =
+            "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ModelExecutionService.kt"
+        val handler = readRepoFile(handlerRel) ?: run {
+            fail("cannot locate $handlerRel from user.dir=${System.getProperty("user.dir")}")
+            return
+        }
+        val service = readRepoFile(serviceRel) ?: run {
+            fail("cannot locate $serviceRel from user.dir=${System.getProperty("user.dir")}")
+            return
+        }
+        // The worker owns the image path (`decideImageRoute` is called there),
+        // so it must go through the single parser rather than its own copy.
+        assertTrue(
+            "ModelExecutionService.kt must parse the image dialect via ModelUseProtocol",
+            service.contains("ModelUseProtocol.parseImagePassthrough("),
+        )
+        val keyDef = Regex("""\bval\s+(imageReservedKeys|IMAGE_PASSTHROUGH_RESERVED_KEYS)\b""")
+        for ((name, text) in listOf("ModelUseOffloadHandler.kt" to handler, "ModelExecutionService.kt" to service)) {
+            assertFalse(
+                "$name defines a second reserved-key set — it belongs to ModelUseProtocol alone",
+                keyDef.containsMatchIn(text),
+            )
+            assertFalse(
+                "$name re-reads extra_body silently again (optJSONObject drop)",
+                text.contains("""optJSONObject("extra_body")"""),
+            )
+        }
+    }
+
     // ── structural: one implementation, two delegating call sites ────────
 
     private fun readRepoFile(relative: String): String? {
+        // [dv14-A4] ISSUE-08: -Dprobe.repo first, so the structural checks can
+        // be driven deterministically outside Gradle (the sandbox arms point it
+        // at a tree; Gradle leaves it unset and the walk below resolves).
+        System.getProperty("probe.repo")?.let { probe ->
+            val f = File(probe, relative)
+            if (f.exists()) return f.readText()
+        }
         var dir: File? = File(System.getProperty("user.dir"))
         while (dir != null) {
             val f = File(dir, relative)
