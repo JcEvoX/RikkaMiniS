@@ -1238,6 +1238,17 @@ private fun relativeTime(millis: Long): String {
 
 // ─── Skill File Viewer Screen (full page, matching iOS) ─────────────────────
 
+// [dv14-B5] Pure single source for what the file viewer shows and what the
+// Edit button seeds: SKILL.md renders the in-memory frontmatter merge; a
+// sibling file renders the asynchronously loaded disk base (blank until the
+// read lands). Extracted so the isSkillMd × loaded matrix is JVM-testable.
+internal fun skillFileViewerContent(
+    isSkillMd: Boolean,
+    mergedFrontmatter: String,
+    loadedDiskBase: String?,
+): String =
+    if (isSkillMd) mergedFrontmatter else loadedDiskBase ?: ""
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SkillFileViewerScreen(
@@ -1259,8 +1270,11 @@ fun SkillFileViewerScreen(
     val fileName = relativePath.substringAfterLast('/')
 
     // For SKILL.md, reconstruct from the in-memory record (so frontmatter
-    // edits stay in sync with DB metadata). For sibling files, read straight
-    // from disk.
+    // edits stay in sync with DB metadata). For sibling files the disk read
+    // used to run inside this remember — i.e. synchronously on the
+    // composition thread of every recomposition ([dv14-B5]) — so it now
+    // rides the async loader below and this branch seeds "" (rendered
+    // harmlessly until the read lands).
     val initialContent = remember(skillId, relativePath, skill.updatedAt) {
         if (isSkillMd) {
             // [fix/da1023-E] Reconstruct through the repository's single merge
@@ -1281,7 +1295,10 @@ fun SkillFileViewerScreen(
                 body = skill.body,
             )
         } else {
-            skillRepository.readSkillFile(skillId, relativePath) ?: ""
+            // [dv14-B5] Placeholder only — the real disk content is loaded
+            // asynchronously below; "" renders harmlessly in the read-only
+            // viewer until the read lands.
+            ""
         }
     }
 
@@ -1296,6 +1313,27 @@ fun SkillFileViewerScreen(
     // skill_frontmatter_roundtrip_check.py / skill_file_save_result_check.py
     // — keys were appended, prefixes untouched.
     var editContent by remember(skillId, relativePath, skill.updatedAt) { mutableStateOf(initialContent) }
+
+    // [dv14-B5] The sibling-file disk read moved off the composition thread,
+    // mirroring MemoryFileEditScreen ([deep-audit-1029 ISSUE-03]): the read
+    // rides a `withContext(Dispatchers.IO)` inside a `LaunchedEffect` (the
+    // same re-read keys the old remember had) and `isLoaded` gates the Edit
+    // button — a tap before the read lands would open the editor against a
+    // blank base and a Save could overwrite the real file with "".
+    // Deliberately a single flag (no state machine); keyed on the same triple
+    // as the content remembers so any key change re-arms the gate.
+    var loadedDiskBase by remember(skillId, relativePath, skill.updatedAt) { mutableStateOf<String?>(null) }
+    var isLoaded by remember(skillId, relativePath, skill.updatedAt) { mutableStateOf(isSkillMd) }
+    LaunchedEffect(skillId, relativePath, skill.updatedAt) {
+        if (isSkillMd) return@LaunchedEffect
+        loadedDiskBase = withContext(Dispatchers.IO) {
+            skillRepository.readSkillFile(skillId, relativePath) ?: ""
+        }
+        isLoaded = true
+    }
+    // What the read-only viewer renders and what the Edit button seeds —
+    // resolved through the pure single source below.
+    val displayContent = skillFileViewerContent(isSkillMd, initialContent, loadedDiskBase)
 
     // [fix/da1021-issue06] Save failures used to be silently discarded: the
     // return values of importFromContent / writeSkillFile were dropped and the
@@ -1356,10 +1394,16 @@ fun SkillFileViewerScreen(
                             }
                         }) { Text(stringResource(R.string.skill_file_save)) }
                     } else {
-                        MinisTextButton(onClick = {
-                            editContent = initialContent
-                            isEditing = true
-                        }) { Text(stringResource(R.string.skill_file_edit)) }
+                        // [dv14-B5] Gated on the async read: the editor seeds
+                        // from the loaded disk base, so entering before the
+                        // read lands would edit an empty base.
+                        MinisTextButton(
+                            enabled = isLoaded,
+                            onClick = {
+                                editContent = displayContent
+                                isEditing = true
+                            },
+                        ) { Text(stringResource(R.string.skill_file_edit)) }
                     }
                 },
             )
@@ -1400,13 +1444,13 @@ fun SkillFileViewerScreen(
                 item {
                     if (renderAsMarkdown) {
                         MarkdownText(
-                            markdown = initialContent,
+                            markdown = displayContent,
                             color = MaterialTheme.colorScheme.onSurface,
                             style = MaterialTheme.typography.bodySmall,
                         )
                     } else {
                         Text(
-                            initialContent,
+                            displayContent,
                             style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                             color = MaterialTheme.colorScheme.onSurface,
                         )
