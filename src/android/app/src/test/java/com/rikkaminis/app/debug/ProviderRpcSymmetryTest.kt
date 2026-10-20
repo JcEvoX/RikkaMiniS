@@ -9,6 +9,7 @@ import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 /**
@@ -195,5 +196,36 @@ class ProviderRpcSymmetryTest {
     fun instanceJsonCore_presentCustomBaseURLCarriesValue() {
         val json = instanceJsonCore(instance(base = "https://api.example.com"), hasCredential = false, entryCount = 0)
         assertEquals("https://api.example.com", json.getString("customBaseURL"))
+    }
+
+    // ---- 4. [fix/dv16-a A-07] parseImageEndpointMode: shared value domain ----
+    //
+    // The create face previously dropped the imageEndpointMode key entirely
+    // (only the update face accepted it), so a create→list→update round trip
+    // could not express the endpoint shape the request path honors. The parse
+    // is now one shared helper; the accepted token set (Kotlin enum names AND
+    // wire SerialName) and the error wording are pinned with literals.
+
+    @Test
+    fun parseImageEndpointMode_acceptsEnumNamesAndWireTokens() {
+        assertEquals(ImageEndpointMode.auto, parseImageEndpointMode("auto"))
+        assertEquals(ImageEndpointMode.imagesGenerations, parseImageEndpointMode("imagesGenerations"))
+        assertEquals(ImageEndpointMode.imagesGenerations, parseImageEndpointMode("images_generations"))
+        assertEquals(ImageEndpointMode.chatCompletions, parseImageEndpointMode("chatCompletions"))
+        assertEquals(ImageEndpointMode.chatCompletions, parseImageEndpointMode("chat_completions"))
+    }
+
+    @Test
+    fun parseImageEndpointMode_refusesUnknownTokenWithUpdateWording() {
+        try {
+            parseImageEndpointMode("nope")
+            fail("expected RPCException")
+        } catch (expected: RPCException) {
+            assertEquals(-32602, expected.code)
+            assertEquals(
+                "imageEndpointMode must be auto | images_generations | chat_completions (got 'nope')",
+                expected.message,
+            )
+        }
     }
 }

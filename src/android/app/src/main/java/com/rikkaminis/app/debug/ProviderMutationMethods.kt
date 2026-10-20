@@ -4,8 +4,10 @@ import android.content.Context
 import com.rikkaminis.app.MinisApp
 import com.rikkaminis.app.config.collections.CUSTOM_BASE_URL_OPENROUTER_MESSAGE
 import com.rikkaminis.app.config.collections.CUSTOM_USER_AGENT_OAUTH_MESSAGE
+import com.rikkaminis.app.config.collections.applyContextLimitWrite
 import com.rikkaminis.app.config.collections.canonicalModelProviderName
 import com.rikkaminis.app.config.collections.customUserAgentWritable
+import com.rikkaminis.app.config.collections.mutatedGroupCopy
 import com.rikkaminis.app.config.collections.normalizeCustomModelId
 import com.rikkaminis.app.data.model.FallbackStrategy
 import com.rikkaminis.app.data.model.ImageEndpointMode
@@ -74,6 +76,17 @@ internal object ProviderMutationMethods {
         // path honors (isAzure → `api-key` instead of `Authorization: Bearer`,
         // ProviderFactory). Parsed with the same default as the instance field.
         val azureMode = params.optBoolean("azureMode", false)
+        // [fix/dv16-a A-07] Optional imageEndpointMode at create time — the
+        // same key the update face accepts (gate C14 pins the two write faces
+        // to the same key set), with the same parse / value domain / error
+        // wording via the shared [parseImageEndpointMode]. A fresh instance
+        // has no cached probe result, so imageEndpointResolved stays at its
+        // null default: for auto the first image request probes the endpoint,
+        // for a forced non-auto mode nothing is cached (update's
+        // clear-on-force has nothing to clear here).
+        val imageEndpointMode = if (params.has("imageEndpointMode")) {
+            parseImageEndpointMode(params.optString("imageEndpointMode", "auto"))
+        } else ImageEndpointMode.auto
         // [T-provider-no-static-seed] Default OFF: a fresh provider starts with
         // an empty model list; refreshModels() populates it from upstream.
         // Kept as an explicit opt-in for callers that know what they're doing
@@ -111,6 +124,7 @@ internal object ProviderMutationMethods {
             appendV1Suffix = appendV1Suffix,
             useResponsesAPI = useResponsesAPI,
             azureMode = azureMode,
+            imageEndpointMode = imageEndpointMode,
             customUserAgent = customUserAgent,
         )
 
@@ -178,13 +192,11 @@ internal object ProviderMutationMethods {
         // name or the wire SerialName (images_generations / chat_completions).
         // Forcing a non-auto mode clears the cached probe result, mirroring the
         // picker UI, so a stale auto-probe can't shadow the user's choice.
+        // [fix/dv16-a A-07] The parse lives in [parseImageEndpointMode] so the
+        // create face (which previously dropped this key entirely) accepts the
+        // identical value domain and error wording.
         val imageEndpointMode = if (params.has("imageEndpointMode")) {
-            when (val raw = params.optString("imageEndpointMode", "")) {
-                "auto" -> ImageEndpointMode.auto
-                "imagesGenerations", "images_generations" -> ImageEndpointMode.imagesGenerations
-                "chatCompletions", "chat_completions" -> ImageEndpointMode.chatCompletions
-                else -> throw RPCException(-32602, "imageEndpointMode must be auto | images_generations | chat_completions (got '$raw')")
-            }
+            parseImageEndpointMode(params.optString("imageEndpointMode", ""))
         } else current.imageEndpointMode
 
         // [da1030-C ISSUE-04] Optional azureMode patch. Same opt-in shape as
@@ -631,10 +643,11 @@ internal object ProviderMutationMethods {
         if (params.has("strategy")) updated = updated.copy(strategy = parseStrategy(params.optString("strategy")))
         if (params.has("fallbackStrategy")) updated = updated.copy(fallbackStrategy = parseFallback(params.optString("fallbackStrategy")))
         // [da1031-D ISSUE-06] Same session-default fields as groupsCreate —
-        // absent = keep the stored value, null / 0 = clear (limit AND its
-        // last-selected memory, mirroring GroupWriteRules.applyContextLimitWrite
-        // — the canonical write face), > 0 = set both. Unknown level / negative
-        // or non-integer limit = refuse (-32602), never silently dropped.
+        // absent = keep the stored value, null / 0 = clear the limit (the
+        // last-selected memory is KEPT — see the canonical write face
+        // GroupWriteRules.applyContextLimitWrite below), > 0 = set both.
+        // Unknown level / negative or non-integer limit = refuse (-32602),
+        // never silently dropped.
         if (params.has("defaultThinkingLevel")) {
             val t = params.optString("defaultThinkingLevel", "")
             val lvl = when {
@@ -652,10 +665,17 @@ internal object ProviderMutationMethods {
                     ?: throw RPCException(-32602, "contextLimitTokens must be an integer")
             }
             if (v < 0) throw RPCException(-32602, "contextLimitTokens must be >= 0")
-            updated = if (v > 0) updated.copy(
-                contextLimitTokens = v,
-                lastContextLimitTokens = v,
-            ) else updated.copy(contextLimitTokens = null, lastContextLimitTokens = null)
+            // [fix/dv16-a A-06] The comment above used to claim this mirrored
+            // GroupWriteRules.applyContextLimitWrite, but the clear branch ALSO
+            // nulled lastContextLimitTokens — the canonical write face KEEPS
+            // the "last selected" memory (the UI's OFF branch stashes rather
+            // than erases), so an update that cleared the limit wiped the value
+            // the next OFF→ON toggle should have restored (it snapped back to
+            // the 128K default instead). Route through the canonical rule, via
+            // the shared copy-on-mutate core: applyContextLimitWrite mutates in
+            // place, and `updated` may still be the live object when no
+            // earlier branch copied it.
+            updated = mutatedGroupCopy(updated) { applyContextLimitWrite(it, v) }
         }
         repo.updateGroup(updated)
         return JSONObject().put("group", groupToJson(repo, updated))
@@ -826,6 +846,23 @@ internal fun probeAuthHeader(azureMode: Boolean, key: String): Pair<String, Stri
  * The other four arms (openAI/xAI/kimiCode, plus openRouter's versionless base) already
  * guarded on `endsWith("/v1")` — the asymmetry was the defect, not a design choice.
  */
+// [fix/dv16-a A-07] Single parse for the optional imageEndpointMode patch —
+// shared by instancesCreate and instancesUpdate so the two write faces accept
+// the identical value domain and error wording (the create face previously
+// dropped the key entirely, so a create→list→update round trip could not
+// express the endpoint shape the request path honors). Accepts the Kotlin
+// enum name or the wire SerialName, mirroring the picker UI tokens.
+internal fun parseImageEndpointMode(raw: String): ImageEndpointMode =
+    when (raw) {
+        "auto" -> ImageEndpointMode.auto
+        "imagesGenerations", "images_generations" -> ImageEndpointMode.imagesGenerations
+        "chatCompletions", "chat_completions" -> ImageEndpointMode.chatCompletions
+        else -> throw RPCException(
+            -32602,
+            "imageEndpointMode must be auto | images_generations | chat_completions (got '$raw')",
+        )
+    }
+
 internal fun providerProbeUrl(type: ProviderType, baseURL: String, key: String?): String =
     when (type) {
         ProviderType.anthropic ->

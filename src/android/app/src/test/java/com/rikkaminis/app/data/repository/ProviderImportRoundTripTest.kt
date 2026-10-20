@@ -3,6 +3,9 @@ package com.rikkaminis.app.data.repository
 import com.rikkaminis.app.data.model.LLMModel
 import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.model.ModelOverrides
+import com.rikkaminis.app.data.model.ProviderCredential
+import com.rikkaminis.app.data.model.ProviderInstance
+import com.rikkaminis.app.data.model.ProviderType
 import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -243,5 +246,49 @@ class ProviderImportRoundTripTest {
         val r2 = convertThinkingRule(legacy)
         assertFalse(r2.has("reasoningEchoJson"))
         assertEquals("", r2.optString("reasoningEchoJson", ""))
+    }
+
+    // ------------------------------------------------------------------
+    // [fix/dv16-a A-08] The merge path applies the SAME instance-field write
+    // face the append path uses ([readImportInstanceFields] /
+    // [applyImportInstanceFields] in ProviderRepository.kt — driven directly
+    // in ProviderRunConfigRoundTripTest). This file pins the merge-side
+    // contract that motivated the seam: a same-(type,label) restore must carry
+    // the backup's instance-config onto the existing instance, and the merge
+    // match key (providerType + label) must stay untouched — the caller
+    // resolves the label BEFORE this write face runs.
+    // ------------------------------------------------------------------
+    @Test
+    fun mergeWriteFace_carriesInstanceConfigOntoExistingInstance() {
+        // Faithful shape of the merge write face: decode the payload via the
+        // shared seam, apply onto the existing (live) instance.
+        val existing = ProviderInstance(
+            id = "live-1",
+            label = "OpenAI",
+            providerType = ProviderType.openAI,
+            credentialType = ProviderCredential.apiKey,
+            customBaseURL = "https://old.example.com",
+        )
+        val payload = JSONObject()
+            .put("providerType", "openAI")
+            .put("label", "OpenAI")
+            .put("customBaseURL", "https://relay.example.com")
+            .put("appendV1Suffix", false)
+            .put("useResponsesAPI", true)
+            .put("isEnabled", false)
+            .put("pinned", true)
+        val f = readImportInstanceFields(payload)
+        val updated = applyImportInstanceFields(existing, f)
+
+        // the backup's values win (restore-is-restore)
+        assertEquals("https://relay.example.com", updated.customBaseURL)
+        assertEquals(false, updated.appendV1Suffix)
+        assertEquals(true, updated.useResponsesAPI)
+        assertEquals(false, updated.isEnabled)
+        assertEquals(true, updated.pinned)
+        // merge match key + identity untouched
+        assertEquals("live-1", updated.id)
+        assertEquals("OpenAI", updated.label)
+        assertEquals(ProviderType.openAI, updated.providerType)
     }
 }
