@@ -181,15 +181,26 @@ class UserRowVisibilityParityTest {
         val rowGate = ui.indexOf("if (userRowHasVisibleContent(message.content, message.imageUris, message.attachmentUris)) {")
         val captionGuard = ui.indexOf("if (message.content.isNotBlank()) {")
         val captionGuardEnd = ui.indexOf("} // end caption-only guard ([B-05 deep-audit-1037])")
-        val withdrawGate = ui.indexOf("if (isQueued && onWithdraw != null) {")
         assertTrue("row gate must exist", rowGate >= 0)
         assertTrue("caption guard must exist", captionGuard > rowGate)
         assertTrue("caption guard must be closed", captionGuardEnd > captionGuard)
-        assertTrue("withdraw gate must exist", withdrawGate >= 0)
+        // The withdraw GATE is the isQueued occurrence AFTER the caption-only
+        // block closes. The first one (inside the block, ChatUserMessageUI.kt
+        // :412) is the queued bubble's dashed-state modifier, not the button.
+        val withdrawGate = ui.indexOf("if (isQueued && onWithdraw != null) {", captionGuardEnd)
         assertTrue(
-            "the withdraw button must sit OUTSIDE the caption-only guard " +
-                "(rowGate=$rowGate caption=$captionGuard end=$captionGuardEnd withdraw=$withdrawGate)",
+            "the withdraw button must sit OUTSIDE the caption-only guard",
             withdrawGate > captionGuardEnd,
+        )
+        // Mirror of the gate's V3 criterion: the button's own condition
+        // (walk back to the nearest `if (` from the contentDescription) must
+        // not re-introduce the caption gate.
+        val btn = ui.indexOf("chat_withdraw_queued")
+        assertTrue("withdraw button must exist", btn > withdrawGate)
+        val cond = ui.substring(ui.lastIndexOf("if (", btn), btn)
+        assertTrue(
+            "the withdraw button's guard must not gate on the caption",
+            !cond.contains("content.isNotBlank"),
         )
     }
 

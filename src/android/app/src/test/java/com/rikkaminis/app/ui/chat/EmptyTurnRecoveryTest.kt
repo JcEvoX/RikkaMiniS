@@ -297,8 +297,14 @@ class EmptyTurnRecoveryTest {
         // filter (`trimStart().startsWith("<system-reminder>")`) recognises it.
         assertTrue(EmptyTurnRecovery.REMINDER.trimStart().startsWith("<system-reminder>"))
         assertTrue(EmptyTurnRecovery.REMINDER.trimEnd().endsWith("</system-reminder>"))
+        // [B-05 deep-audit-1037] The synthetic-row filter moved into the ONE
+        // shared predicate (`userPartsJsonHasVisibleContent` in
+        // ChatTranscriptRebuild.kt); the ViewModel's visible-row loop asks it
+        // instead of re-spelling the check inline.
+        val rebuild = readRepoFile("src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatTranscriptRebuild.kt")
+        assertTrue(rebuild.contains("startsWith(\"<system-reminder>\")"))
         val vm = readRepoFile("src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatViewModel.kt")
-        assertTrue(vm.contains("trimStart().startsWith(\"<system-reminder>\")"))
+        assertTrue(vm.contains("userPartsJsonHasVisibleContent("))
     }
 
     /** Walks up from user.dir so the test runs from the module dir or the repo root. */
