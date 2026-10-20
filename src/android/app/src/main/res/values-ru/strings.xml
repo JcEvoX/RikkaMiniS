@@ -336,6 +336,9 @@
     <string name="browser_history_clear">Очистить</string>
     <string name="browser_history_done">Готово</string>
     <string name="browser_history_search">Поиск по истории</string>
+    <string name="browser_history_today">Сегодня</string>
+    <string name="browser_history_yesterday">Вчера</string>
+    <string name="browser_history_results">Результаты</string>
     <string name="browser_history_empty_title">История просмотров пуста</string>
     <string name="browser_history_empty_subtitle">История хранится 7 дней</string>
     <string name="browser_history_clear_dialog_title">Очистить историю просмотров?</string>

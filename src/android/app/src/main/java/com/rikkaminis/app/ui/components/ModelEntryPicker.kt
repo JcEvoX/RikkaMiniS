@@ -29,6 +29,8 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -39,6 +41,7 @@ import androidx.compose.ui.unit.dp
 import androidx.annotation.StringRes
 import com.rikkaminis.app.data.model.LLMModel
 import com.rikkaminis.app.data.model.ModelEntry
+import com.rikkaminis.app.data.model.ProviderConfig
 import com.rikkaminis.app.data.model.ProviderInstance
 import com.rikkaminis.app.ui.theme.ProviderAccents
 import com.rikkaminis.app.data.model.ProviderType
@@ -78,6 +81,64 @@ enum class PickerModalityFilter {
     fun systemEntries(): List<ModelEntry> = when (this) {
         AUDIO_INPUT -> listOf(SystemVoiceEntries.asrOnline, SystemVoiceEntries.asrOffline)
         AUDIO_OUTPUT -> listOf(SystemVoiceEntries.tts)
+    }
+}
+
+/**
+ * Ids of the provider instances that can appear in the picker — the identity
+ * of the instance list, and nothing else.
+ *
+ * [deep-audit-v14 ISSUE-05] Pure (no Context, no Compose) on purpose: this is
+ * the value a `remember` must be keyed on, and keeping it a plain function is
+ * what lets `CollapsedInstanceIdsContractTest` pin the decision on the JVM
+ * instead of asserting it on the source text.
+ */
+internal fun providerInstanceIds(config: ProviderConfig): Set<String> =
+    config.instances.map { it.id }.toSet()
+
+/**
+ * Initial value of the collapsed-provider state.
+ *
+ * [defaultExpanded] is the `[T-android-provider-voice]` contract: in a voice
+ * scenario (`modalityFilter != null`) every section starts expanded, because
+ * folding all-but-one of a multi-voice provider (Azure ~39, MiMo 9) hides the
+ * very candidates the user opened the picker for (iOS d4e3798f
+ * `seedCollapse`). Outside a voice scenario everything starts collapsed,
+ * mirroring the pre-refactor behaviour.
+ */
+internal fun collapsedInstanceIdsSeed(
+    instanceIds: Set<String>,
+    defaultExpanded: Boolean,
+): Set<String> = if (defaultExpanded) emptySet() else instanceIds
+
+/**
+ * [deep-audit-v14 ISSUE-05] Shared source for the picker's collapsed-provider
+ * state — the two screens that render [modelEntryPickerItems]
+ * (`AddModelsToGroupScreen`, `AgentLoopAddSheets`) both held their own
+ * `remember(config) { … }` copy.
+ *
+ * Keying that `remember` on the whole [ProviderConfig] was wrong: the config is
+ * a fresh object after *any* write (a Quick Test persisting the resolved image
+ * endpoint, `refreshModels` landing its result, a DTO → `StateFlow` re-emit),
+ * so an unrelated field change wiped the user's expand/collapse choice. The
+ * state is seeded from the instance-id **set**, whose value equality ignores
+ * everything that is not an instance add/remove — the same shape the correct
+ * twin in `ChatModelPickerSheet` uses (`remember(allInstanceIds)`).
+ *
+ * An instance genuinely added/removed re-seeds the whole set, i.e. a new
+ * provider starts collapsed. That matches the twin and the pre-refactor
+ * "everything starts collapsed" behaviour; merging the newcomer into the
+ * existing set instead would need the state to outlive the sheet, which it
+ * does not (the screen owns it).
+ */
+@Composable
+fun rememberCollapsedInstanceIds(
+    config: ProviderConfig,
+    defaultExpanded: Boolean = false,
+): MutableState<Set<String>> {
+    val instanceIds = remember(config) { providerInstanceIds(config) }
+    return remember(instanceIds, defaultExpanded) {
+        mutableStateOf(collapsedInstanceIdsSeed(instanceIds, defaultExpanded))
     }
 }
 

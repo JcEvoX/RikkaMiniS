@@ -43,6 +43,7 @@ import androidx.compose.ui.unit.dp
 import com.rikkaminis.app.R
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.ui.components.modelEntryPickerItems
+import com.rikkaminis.app.ui.components.rememberCollapsedInstanceIds
 import com.rikkaminis.app.ui.components.MinisButton
 import com.rikkaminis.app.ui.components.MinisTextButton
 import com.rikkaminis.app.ui.theme.ChatColors
@@ -81,9 +82,7 @@ fun AddAgentLoopModelsScreen(
 
     val searchQuery = remember { mutableStateOf("") }
     var selectedIds by remember { mutableStateOf(setOf<String>()) }
-    val collapsedInstanceIds = remember(config) {
-        mutableStateOf(config.instances.map { it.id }.toSet())
-    }
+    val collapsedInstanceIds = rememberCollapsedInstanceIds(config)
 
     Scaffold(
         topBar = {

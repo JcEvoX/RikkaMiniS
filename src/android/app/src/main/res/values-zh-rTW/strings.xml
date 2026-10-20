@@ -177,6 +177,9 @@
     <string name="browser_history_clear">清除</string>
     <string name="browser_history_done">完成</string>
     <string name="browser_history_search">搜尋歷史</string>
+    <string name="browser_history_today">今天</string>
+    <string name="browser_history_yesterday">昨天</string>
+    <string name="browser_history_results">搜尋結果</string>
     <string name="browser_history_empty_title">沒有瀏覽紀錄</string>
     <string name="browser_history_empty_subtitle">歷史紀錄保留 7 天</string>
     <string name="browser_history_clear_dialog_title">清除瀏覽紀錄？</string>

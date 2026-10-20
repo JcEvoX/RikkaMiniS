@@ -178,6 +178,10 @@ REL_THINKING_EDITOR = "src/android/app/src/main/java/com/rikkaminis/app/ui/setti
 # da1034-B4 (B-07 / B-08)
 REL_ENVVAR_SCREEN = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/EnvironmentVariablesScreen.kt"
 REL_BACKUP_SCREEN = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/BackupSettingsScreen.kt"
+# da1034-B4 (B-05 / B-06)
+REL_ADD_MODELS = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/AddModelsToGroupScreen.kt"
+REL_AGENT_LOOP_SHEETS = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/AgentLoopAddSheets.kt"
+REL_MODEL_ENTRY_PICKER = "src/android/app/src/main/java/com/rikkaminis/app/ui/components/ModelEntryPicker.kt"
 
 # ---- [da1030-C ISSUE-05] C12 / C13 ----
 # The collected revision local may be named either way; both spellings are the
@@ -1039,6 +1043,216 @@ def check_webdav_dialog(code):
                     "seeded from" % derived if not bad else "; ".join(bad)))
     return results
 
+# ---- [da1034-B4] C18 / C19 ----
+# The picker's collapse state ("which provider sections are folded"). Both
+# screens that render `modelEntryPickerItems` seeded their own
+#   `val collapsedInstanceIds = remember(config) { mutableStateOf(
+#        if (modalityFilter != null) emptySet() else config.instances.map { it.id }.toSet()) }`
+# copy, keyed on the whole `ProviderConfig`. The config is a fresh object after
+# ANY write (a Quick Test persisting the resolved image endpoint, refreshModels
+# landing its result, a DTO → StateFlow re-emit), so an unrelated field change
+# wiped the user's expand/collapse choice. C18 grades the two call sites, C19
+# the shared single source that replaced them.
+COLLAPSED_DECL_RE = re.compile(r"\bval\s+collapsedInstanceIds\s*(?::[^=\n]*)?(?:by|=)\s*")
+COLLAPSED_SINGLE_SOURCE = "rememberCollapsedInstanceIds"
+# Derivation from the instance LIST. `.instances.size` / `.instances.count` are
+# deliberately NOT identity — that is the same mistake as a size-only refresh
+# key — while anything else rooted at `<x>.instances` (`.map`, `.filter`,
+# `.toSet`, `.firstOrNull`) counts.
+INSTANCES_DERIVATION_RE = re.compile(
+    r"\.\s*instances\b(?!\s*\.\s*(?:size|count|isNotEmpty|isEmpty)\b)")
+VAL_DECL_RE = re.compile(r"\b(?:val|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=\n]*)?(?:by|=)\s*")
+IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+IDENT_CALL_ONLY_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+
+def brace_span(text, open_idx):
+    """(open, end) of the balanced `{ … }` whose `{` is at [open_idx]."""
+    depth, i, n = 1, open_idx + 1, len(text)
+    while i < n and depth:
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+        i += 1
+    return text[open_idx:i]
+
+
+def paren_span(text, open_idx):
+    """Index just past the `)` matching the `(` at [open_idx]."""
+    depth, i, n = 0, open_idx, len(text)
+    while i < n:
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def statement_tail(code, pos, limit=600):
+    """Text of the expression starting at [pos] up to the end of the statement
+    (a newline at zero paren/brace depth that is not a continuation)."""
+    i = min(len(code), pos)
+    n = min(len(code), pos + limit)
+    while i < n and code[i] in " \t\r\n":
+        i += 1
+    pos = i
+    depth = 0
+    while i < n:
+        c = code[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif c == "\n" and depth == 0:
+            nxt = code[i + 1:].lstrip(" \t")
+            if not nxt.startswith((".", "?", ":", "&&", "||", ")", "}")):
+                break
+        i += 1
+    return code[pos:i]
+
+
+def value_sources(code):
+    """name -> initializer/body text for file-local `val`/`var` declarations and
+    `fun`s, so a key can be resolved to the thing it is derived from."""
+    decls = {}
+    for m in VAL_DECL_RE.finditer(code):
+        decls.setdefault(m.group(1), statement_tail(code, m.end()))
+    for m in re.finditer(r"\bfun\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", code):
+        name = m.group(1)
+        tail = code[m.end() - 1:]
+        if not tail.startswith("("):
+            continue
+        end = paren_span(tail, 0)
+        rest = tail[end:]
+        eq = rest.find("=")
+        brace = rest.find("{")
+        if eq >= 0 and (brace < 0 or eq < brace):
+            decls.setdefault(name, statement_tail(rest, eq + 1))
+        elif brace >= 0:
+            decls.setdefault(name, brace_span(rest, brace))
+    return decls
+
+
+def derives_from_instances(expr, decls, depth=0, seen=None):
+    """Does [expr] derive from an instance LIST, directly or through the
+    file-local values / helpers it names? Resolved by NAME, not by a hardcoded
+    helper name, so renaming the single source does not silently open the gate
+    (da1034-A2 lesson: grade the decision, not the spelling)."""
+    if not expr:
+        return False
+    if INSTANCES_DERIVATION_RE.search(expr):
+        return True
+    if depth >= 4:
+        return False
+    seen = seen or set()
+    for name in set(IDENT_RE.findall(expr)):
+        if name in seen:
+            continue
+        sub = decls.get(name)
+        if sub is None:
+            continue
+        if derives_from_instances(sub, decls, depth + 1, seen | {name}):
+            return True
+    return False
+
+
+def check_collapsed_screen(code):
+    """C18 [da1034-B4] — the picker collapse state survives a non-identity config write.
+
+    Graded on the DECISION (does this state re-seed only when the instance set
+    changes), not the spelling: delegating to the shared single source counts,
+    an inline `remember(config.instances.map { … }.toSet())` counts, and so does
+    any local the key list names that resolves back to `<x>.instances`.
+    Fail-closed when the declaration is gone (screen reworked)."""
+    results = []
+    m = COLLAPSED_DECL_RE.search(code)
+    if not m:
+        results.append(("C18", False,
+                        "no `val collapsedInstanceIds = …` declaration (fail-closed: the "
+                        "screen was reworked — re-derive this criterion)"))
+        return results
+    head = code[m.end():].lstrip()
+    if head.startswith(COLLAPSED_SINGLE_SOURCE + "("):
+        results.append(("C18", True,
+                        "seeds the collapse state through the shared single source "
+                        "rememberCollapsedInstanceIds(…) instead of a private copy"))
+        return results
+    if not re.match(r"remember\s*[({]", head):
+        results.append(("C18", False,
+                        "collapsedInstanceIds is seeded by `%s…` — the gate grades a "
+                        "remember(...) seed or the shared helper (fail-closed)"
+                        % " ".join(head[:60].split())))
+        return results
+    _ln, keys, _span, _init = iter_remember_calls(head, "remember")[0]
+    if keys is None:
+        results.append(("C18", False,
+                        "keyless `remember { … }`: the collapse state can never observe "
+                        "a provider instance being added or removed"))
+        return results
+    flat = " ".join(keys.split())
+    if derives_from_instances(keys, value_sources(code)):
+        results.append(("C18", True,
+                        "keys=[%s] resolve back to the instance list, so a config re-emit "
+                        "that changes no instance while the user is picking no longer "
+                        "resets every open section" % flat))
+    else:
+        results.append(("C18", False,
+                        "keys=[%s] derive from neither the instance list nor anything "
+                        "derived from it — an unrelated config write (Quick Test "
+                        "persisting imageEndpointResolved, refreshModels landing, a DTO → "
+                        "StateFlow emit) resets every open section" % flat))
+    return results
+
+
+def check_collapsed_helper(code):
+    """C19 [da1034-B4] — the shared single source keys its state on the id set.
+
+    The screen criterion (C18) accepts delegation, so the real decision lives
+    here: the state-producing `remember` (the one whose lambda builds a
+    `mutableStateOf`) must key on something derived from the instance list.
+    Fail-closed when the helper, its state remember, or any `<x>.instances`
+    derivation in the file is gone."""
+    results = []
+    body = func_body(code, COLLAPSED_SINGLE_SOURCE)
+    if body is None:
+        results.append(("C19", False,
+                        "no `fun rememberCollapsedInstanceIds(` body found (fail-closed: "
+                        "the shared single source was dropped or renamed — re-derive this "
+                        "criterion)"))
+        return results
+    decls = value_sources(code)
+    states = [(ln, keys) for ln, keys, _span, init in iter_remember_calls(body)
+              if "mutableStateOf" in init]
+    if not states:
+        results.append(("C19", False,
+                        "rememberCollapsedInstanceIds no longer produces its state through "
+                        "`remember { mutableStateOf(…) }` (fail-closed: re-derive)"))
+        return results
+    bad = []
+    for ln, keys in states:
+        if keys is None:
+            bad.append("L%d: keyless state — the collapse set is frozen at the first "
+                       "composition" % ln)
+            continue
+        flat = " ".join(keys.split())
+        if not derives_from_instances(keys, decls):
+            bad.append("L%d: state keys=[%s] are not derivable from the instance list — a "
+                       "config re-emit that adds/removes no instance resets the sections"
+                       % (ln, flat))
+    if not any(v and INSTANCES_DERIVATION_RE.search(v) for v in decls.values()):
+        bad.append("nothing in this file derives from `<x>.instances` at all — the state is "
+                   "not seeded from the instance set (fail-closed)")
+    results.append(("C19", not bad,
+                    "the shared collapse state re-seeds only with the instance-id set"
+                    if not bad else "; ".join(bad)))
+    return results
+
 CHECKERS = (
     (REL_PROVIDER_LIST, check_provider_list),
     (REL_SHEET, check_sheet),
@@ -1055,6 +1269,9 @@ CHECKERS = (
     (REL_THINKING_EDITOR, check_thinking_editor),
     (REL_ENVVAR_SCREEN, check_envvar_screen),
     (REL_BACKUP_SCREEN, check_webdav_dialog),
+    (REL_ADD_MODELS, check_collapsed_screen),
+    (REL_AGENT_LOOP_SHEETS, check_collapsed_screen),
+    (REL_MODEL_ENTRY_PICKER, check_collapsed_helper),
 )
 
 
@@ -1747,6 +1964,135 @@ FIX_BACKUP_MISSING_ANCHOR = """package com.rikkaminis.app.ui.settings
 fun unrelated() {}
 """
 
+# --- da1034-B4 fixtures: C18 (call sites) / C19 (shared single source) -----
+
+FIX_ADD_MODELS_CLEAN = """package com.rikkaminis.app.ui.settings
+
+@Composable
+fun AddModelsToGroupScreen(modalityFilter: PickerModalityFilter? = null) {
+    val collapsedInstanceIds = rememberCollapsedInstanceIds(
+        config = config,
+        defaultExpanded = modalityFilter != null,
+    )
+}
+"""
+
+FIX_AGENT_LOOP_SHEETS_CLEAN = """package com.rikkaminis.app.ui.settings
+
+@Composable
+fun AgentLoopGroupsSheet(config: ProviderConfig) {
+    val collapsedInstanceIds = rememberCollapsedInstanceIds(config)
+}
+"""
+
+FIX_MODEL_ENTRY_PICKER_CLEAN = """package com.rikkaminis.app.ui.components
+
+internal fun providerInstanceIds(config: ProviderConfig): Set<String> =
+    config.instances.map { it.id }.toSet()
+
+internal fun collapsedInstanceIdsSeed(instanceIds: Set<String>, defaultExpanded: Boolean): Set<String> =
+    if (defaultExpanded) emptySet() else instanceIds
+
+@Composable
+fun rememberCollapsedInstanceIds(
+    config: ProviderConfig,
+    defaultExpanded: Boolean = false,
+): MutableState<Set<String>> {
+    val instanceIds = remember(config) { providerInstanceIds(config) }
+    return remember(instanceIds, defaultExpanded) {
+        mutableStateOf(collapsedInstanceIdsSeed(instanceIds, defaultExpanded))
+    }
+}
+"""
+
+# C18 — a screen that kept its own copy keyed on the whole config object.
+FIX_ADD_MODELS_BARE_CONFIG_KEY = FIX_ADD_MODELS_CLEAN.replace(
+    """    val collapsedInstanceIds = rememberCollapsedInstanceIds(
+        config = config,
+        defaultExpanded = modalityFilter != null,
+    )""",
+    """    val collapsedInstanceIds = remember(config) {
+        mutableStateOf(
+            if (modalityFilter != null) emptySet()
+            else config.instances.map { it.id }.toSet(),
+        )
+    }""")
+
+FIX_ADD_MODELS_KEYLESS = FIX_ADD_MODELS_CLEAN.replace(
+    """    val collapsedInstanceIds = rememberCollapsedInstanceIds(
+        config = config,
+        defaultExpanded = modalityFilter != null,
+    )""",
+    """    val collapsedInstanceIds = remember {
+        mutableStateOf(config.instances.map { it.id }.toSet())
+    }""")
+
+# a key that never moves with the instance list (only the voice flag)
+FIX_ADD_MODELS_FLAG_ONLY_KEY = FIX_ADD_MODELS_CLEAN.replace(
+    """    val collapsedInstanceIds = rememberCollapsedInstanceIds(
+        config = config,
+        defaultExpanded = modalityFilter != null,
+    )""",
+    """    val collapsedInstanceIds = remember(modalityFilter != null) {
+        mutableStateOf(config.instances.map { it.id }.toSet())
+    }""")
+
+FIX_ADD_MODELS_MISSING_ANCHOR = """package com.rikkaminis.app.ui.settings
+
+fun unrelated() {}
+"""
+
+# the second call site, same defect (a per-file criterion must cover both)
+FIX_AGENT_LOOP_BARE_CONFIG_KEY = FIX_AGENT_LOOP_SHEETS_CLEAN.replace(
+    "val collapsedInstanceIds = rememberCollapsedInstanceIds(config)",
+    """val collapsedInstanceIds = remember(config) {
+        mutableStateOf(config.instances.map { it.id }.toSet())
+    }""")
+
+# an accepted alternative shape: the derivation stays inline at the call site
+FIX_ADD_MODELS_INLINE_DERIVATION = FIX_ADD_MODELS_CLEAN.replace(
+    """    val collapsedInstanceIds = rememberCollapsedInstanceIds(
+        config = config,
+        defaultExpanded = modalityFilter != null,
+    )""",
+    """    val instanceIds = config.instances.map { it.id }.toSet()
+    val collapsedInstanceIds = remember(instanceIds, modalityFilter != null) {
+        mutableStateOf(collapsedInstanceIdsSeed(instanceIds, modalityFilter != null))
+    }""")
+
+# a call site that also holds an unrelated keyless remember must stay green
+FIX_ADD_MODELS_UNRELATED_REMEMBER = FIX_ADD_MODELS_CLEAN.replace(
+    """    val collapsedInstanceIds = rememberCollapsedInstanceIds(
+        config = config,
+        defaultExpanded = modalityFilter != null,
+    )""",
+    """    val collapsedInstanceIds = rememberCollapsedInstanceIds(
+        config = config,
+        defaultExpanded = modalityFilter != null,
+    )
+    val scratch = remember { mutableStateOf("") }
+    val unrelated = remember(config) { config.modelEntries }""")
+
+# C19 — the single source is keyed on the whole config instead of the id set.
+FIX_PICKER_STATE_BARE_CONFIG_KEY = FIX_MODEL_ENTRY_PICKER_CLEAN.replace(
+    "    return remember(instanceIds, defaultExpanded) {",
+    "    return remember(config, defaultExpanded) {")
+
+FIX_PICKER_STATE_KEYLESS = FIX_MODEL_ENTRY_PICKER_CLEAN.replace(
+    "    return remember(instanceIds, defaultExpanded) {",
+    "    return remember {")
+
+# the id set is only counted — the same mistake as a size-only refresh key
+FIX_PICKER_SIZE_ONLY_KEY = FIX_MODEL_ENTRY_PICKER_CLEAN.replace(
+    "val instanceIds = remember(config) { providerInstanceIds(config) }",
+    "val instanceIds = remember(config) { config.instances.size }")
+
+FIX_PICKER_MISSING_HELPER = """package com.rikkaminis.app.ui.components
+
+internal fun providerInstanceIds(config: ProviderConfig): Set<String> =
+    config.instances.map { it.id }.toSet()
+"""
+
 CLEAN_TREE = {
     REL_PROVIDER_LIST: FIX_PROVIDER_LIST_CLEAN,
     REL_SHEET: FIX_SHEET_CLEAN,
@@ -1762,6 +2108,9 @@ CLEAN_TREE = {
     REL_THINKING_EDITOR: FIX_THINKING_EDITOR_CLEAN,
     REL_ENVVAR_SCREEN: FIX_ENVVAR_CLEAN,
     REL_BACKUP_SCREEN: FIX_BACKUP_CLEAN,
+    REL_ADD_MODELS: FIX_ADD_MODELS_CLEAN,
+    REL_AGENT_LOOP_SHEETS: FIX_AGENT_LOOP_SHEETS_CLEAN,
+    REL_MODEL_ENTRY_PICKER: FIX_MODEL_ENTRY_PICKER_CLEAN,
 }
 
 
@@ -1971,6 +2320,31 @@ def run_selftest():
              variant(REL_BACKUP_SCREEN, FIX_BACKUP_MISSING_ANCHOR), failures, ("C17",))
     run_case("failclosed-missing-backup-file", 1,
              missing(REL_BACKUP_SCREEN), failures, ("FILE",))
+    # --- da1034-B4: C18 / C19 (the picker collapse state) -------------------
+    run_case("c18-add-models-bare-config-key", 1,
+             variant(REL_ADD_MODELS, FIX_ADD_MODELS_BARE_CONFIG_KEY), failures, ("C18",))
+    run_case("c18-agent-loop-bare-config-key", 1,
+             variant(REL_AGENT_LOOP_SHEETS, FIX_AGENT_LOOP_BARE_CONFIG_KEY), failures, ("C18",))
+    run_case("c18-add-models-keyless", 1,
+             variant(REL_ADD_MODELS, FIX_ADD_MODELS_KEYLESS), failures, ("C18",))
+    run_case("c18-add-models-flag-only-key", 1,
+             variant(REL_ADD_MODELS, FIX_ADD_MODELS_FLAG_ONLY_KEY), failures, ("C18",))
+    run_case("c18-add-models-inline-derivation", 0,
+             variant(REL_ADD_MODELS, FIX_ADD_MODELS_INLINE_DERIVATION), failures)
+    run_case("c18-add-models-unrelated-remember", 0,
+             variant(REL_ADD_MODELS, FIX_ADD_MODELS_UNRELATED_REMEMBER), failures)
+    run_case("failclosed-missing-add-models-anchor", 1,
+             variant(REL_ADD_MODELS, FIX_ADD_MODELS_MISSING_ANCHOR), failures, ("C18",))
+    run_case("c19-picker-state-bare-config-key", 1,
+             variant(REL_MODEL_ENTRY_PICKER, FIX_PICKER_STATE_BARE_CONFIG_KEY), failures, ("C19",))
+    run_case("c19-picker-state-keyless", 1,
+             variant(REL_MODEL_ENTRY_PICKER, FIX_PICKER_STATE_KEYLESS), failures, ("C19",))
+    run_case("c19-picker-size-only-key", 1,
+             variant(REL_MODEL_ENTRY_PICKER, FIX_PICKER_SIZE_ONLY_KEY), failures, ("C19",))
+    run_case("failclosed-missing-picker-helper", 1,
+             variant(REL_MODEL_ENTRY_PICKER, FIX_PICKER_MISSING_HELPER), failures, ("C19",))
+    run_case("failclosed-missing-picker-file", 1,
+             missing(REL_MODEL_ENTRY_PICKER), failures, ("FILE",))
     if failures:
         print("SELFTEST FAILURES:")
         for f in failures:
