@@ -181,7 +181,7 @@ class SelectionController {
     private val tableActionsByMessage =
         androidx.compose.runtime.mutableStateMapOf<
             String,
-            androidx.compose.runtime.SnapshotStateMap<Int, TableActions>
+            androidx.compose.runtime.snapshots.SnapshotStateMap<Int, TableActions>
         >()
 
     /** Publish a table's actions for (messageId, tableIndex) (called while it's composed). */

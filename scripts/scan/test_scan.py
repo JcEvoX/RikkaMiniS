@@ -3066,7 +3066,7 @@ def test_dv16_chat_ui_interaction():
                  "    class TableActions(val copyTableMarkdown: () -> Unit)\n"
                  "    private val tableActionsByMessage =\n"
                  "        androidx.compose.runtime.mutableStateMapOf<\n"
-                 "            String, androidx.compose.runtime.SnapshotStateMap<Int, TableActions>\n"
+                 "            String, androidx.compose.runtime.snapshots.SnapshotStateMap<Int, TableActions>\n"
                  "        >()\n"
                  "    fun rememberTableActions(messageId: String, tableIndex: Int, actions: TableActions) {\n"
                  "        tableActionsByMessage.getOrPut(messageId) {\n"
