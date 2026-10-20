@@ -122,6 +122,93 @@ def scan_player_session_path(root):
     return problems
 
 
+# ── [da1034-A2 ISSUE-03] R4: Shizuku privileged path operands ───────────────
+# The Shizuku service runs OUTSIDE the sandbox: a guest path handed to
+# `ls`/`rm`/`cp`/`pm install` is a silent no-op (host `/var/minis/...` does not
+# exist) while a host-only path works — the mirror image of the Speech
+# host-read escape. The criterion is the decision point, not a function name:
+# (a) the operand the privileged command receives must not be the raw argument,
+# (b) a path that does not resolve must refuse instead of falling back to the
+# raw spelling, and (c) the file must actually map guest → host somewhere.
+SHIZUKU_HANDLER_REL = os.path.join(OFFLOAD_REL, "ShizukuOffloadHandler.kt")
+
+SHIZUKU_PATH_SUBJECTS = (
+    ("fileLs", ("path",)),
+    ("fileRm", ("path",)),
+    ("filePullPush", ("src", "dst")),
+    ("packageInstall", ("apk",)),
+)
+
+
+def _mask_strings(text):
+    """Blank out string-literal bodies (quotes kept) so an identifier named in a
+    user-facing message is not read as a command operand."""
+    out = []
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            out.append('"')
+            i += 1
+            while i < len(text) and text[i] != '"':
+                if text[i] == "\\":
+                    i += 1
+                out.append(" ")
+                i += 1
+            out.append('"')
+            i += 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _command_operands(body):
+    """Identifiers handed to a privileged command inside a function body."""
+    masked = _mask_strings(body)
+    names = set(m.group(1) for m in re.finditer(r"\bcmd\.add\(\s*([A-Za-z_]\w*)\s*\)", masked))
+    for line in masked.splitlines():
+        if "arrayOf(" in line:
+            names.update(w for w in re.findall(r"[A-Za-z_]\w*", line) if w != "arrayOf")
+    return names
+
+
+def scan_shizuku_paths(root):
+    """R4: `file` / `package install` operands must be resolved guest→host."""
+    problems = []
+    path = os.path.join(root, SHIZUKU_HANDLER_REL)
+    if not os.path.isfile(path):
+        return ["%s: missing — cannot verify privileged path resolution" % SHIZUKU_HANDLER_REL]
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        code = strip_comments(fh.read())
+    if "resolvePathForSession(" not in code:
+        problems.append(
+            "%s: no PRootKernel.resolvePathForSession(...) — the Shizuku service runs outside "
+            "the sandbox, so every guest path it receives is a silent no-op" % SHIZUKU_HANDLER_REL
+        )
+    for fn, raw_params in SHIZUKU_PATH_SUBJECTS:
+        body = _fun_body(code, r"\bfun\s+%s\s*\(" % re.escape(fn))
+        if body is None:
+            problems.append(
+                "%s: `%s` not found — the privileged path surface moved (fail-closed)"
+                % (SHIZUKU_HANDLER_REL, fn)
+            )
+            continue
+        leaked = sorted(p for p in raw_params if p in _command_operands(body))
+        if leaked:
+            problems.append(
+                "%s: %s hands the raw argument(s) %s to the privileged command — translate "
+                "through the session resolver first"
+                % (SHIZUKU_HANDLER_REL, fn, ", ".join("`%s`" % p for p in leaked))
+            )
+        if not re.search(r"\?:\s*return\s+errEnvelope\(", body):
+            problems.append(
+                "%s: %s has no fail-closed refusal for an unresolvable path (null must refuse, "
+                "not fall back to the raw spelling)" % (SHIZUKU_HANDLER_REL, fn)
+            )
+    return problems
+
+
 def strip_comments(text):
     """Blank out // and /* */ comment content, keeping line structure."""
     out = []
@@ -498,6 +585,96 @@ object MediaPlayerManager {
         print("❌ selftest failed: %s" % ", ".join(player_failures))
         return 1
     print("PLAYER_PATH_SELFTEST=PASS (4 fixtures: 3 violations caught, 1 clean tree green)")
+
+    # ── [da1034-A2 ISSUE-03] R4: Shizuku privileged path fixtures ──────────
+    # One dirty arm per decision the criterion makes: the raw operand reaching
+    # the privileged command (file group and cp), the missing fail-closed
+    # refusal, and the vanished guest→host mapping. Anchors are unique or
+    # first-occurrence-scoped, so each arm breaks exactly one thing.
+    SHIZUKU_OK = """package com.rikkaminis.app.sandbox.offload
+
+class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler {
+    private fun shizukuHostPath(raw: String, request: NativeOffloadRequest): String? {
+        val guestPath = resolveMaybeRelative(raw.trim(), request.cwd)
+        return PRootKernel.resolvePathForSession(request.sessionId, guestPath, context)?.absolutePath
+    }
+
+    private fun fileLs(path: String?, args: OffloadArgs, request: NativeOffloadRequest): NativeOffloadResult {
+        if (path.isNullOrBlank()) return errEnvelope("INVALID_ARGS", "file ls <path>", args)
+        val host = shizukuHostPath(path, request)
+            ?: return errEnvelope("PATH_NOT_RESOLVED", "file ls: '$path' does not resolve", args)
+        val cmd = mutableListOf("ls")
+        cmd.add(host)
+        return ok(ShizukuManager.runProcess(cmd.toTypedArray()))
+    }
+
+    private fun fileRm(path: String?, args: OffloadArgs, request: NativeOffloadRequest): NativeOffloadResult {
+        val host = shizukuHostPath(path, request)
+            ?: return errEnvelope("PATH_NOT_RESOLVED", "file rm: '$path' does not resolve", args)
+        val cmd = mutableListOf("rm")
+        cmd.add(host)
+        return ok(ShizukuManager.runProcess(cmd.toTypedArray()))
+    }
+
+    private fun filePullPush(src: String?, dst: String?, args: OffloadArgs, request: NativeOffloadRequest, pull: Boolean): NativeOffloadResult {
+        val srcHost = shizukuHostPath(src, request)
+            ?: return errEnvelope("PATH_NOT_RESOLVED", "src '$src' does not resolve", args)
+        val dstHost = shizukuHostPath(dst, request)
+            ?: return errEnvelope("PATH_NOT_RESOLVED", "dst '$dst' does not resolve", args)
+        return ok(ShizukuManager.runProcess(arrayOf("cp", "-r", srcHost, dstHost)))
+    }
+
+    private fun packageInstall(apk: String?, args: OffloadArgs, request: NativeOffloadRequest): NativeOffloadResult {
+        val apkHost = shizukuHostPath(apk, request)
+            ?: return errEnvelope("PATH_NOT_RESOLVED", "package install: '$apk' does not resolve", args)
+        val cmd = mutableListOf("pm", "install")
+        cmd.add(apkHost)
+        return ok(ShizukuManager.runProcess(cmd.toTypedArray()))
+    }
+}
+"""
+
+    def shizuku_fixture_root(text):
+        root = tempfile.mkdtemp(prefix="offload-gate-selftest-shizuku-")
+        path = os.path.join(root, SHIZUKU_HANDLER_REL)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return root
+
+    shizuku_arms = [
+        ("R4 clean: resolved operands + refusal on null", None, True),
+        ("R4 dirty: `file ls` hands the raw `path` to the command",
+         ("cmd.add(host)", "cmd.add(path)"), False),
+        ("R4 dirty: `cp` receives the raw src/dst",
+         ('arrayOf("cp", "-r", srcHost, dstHost)', 'arrayOf("cp", "-r", src, dst)'), False),
+        ("R4 dirty: no fail-closed refusal when the path does not resolve",
+         ("?: return errEnvelope(", '?: ""'), False),
+        ("R4 dirty: the guest→host mapping is gone",
+         ("PRootKernel.resolvePathForSession(", "PRootKernel.resolveHostPath("), False),
+    ]
+    shizuku_failures = []
+    for label, mutation, expect_clean in shizuku_arms:
+        if mutation is not None and mutation[0] not in SHIZUKU_OK:
+            print("  [FAIL] %s: anchor not found in fixture" % label)
+            shizuku_failures.append(label)
+            continue
+        text = SHIZUKU_OK if mutation is None else SHIZUKU_OK.replace(mutation[0], mutation[1], 1)
+        root = shizuku_fixture_root(text)
+        try:
+            problems = scan_shizuku_paths(root)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+        clean = not problems
+        ok = clean == expect_clean
+        print("  [%s] %s%s" % ("PASS" if ok else "FAIL", label,
+                               "" if ok else "  → problems=%s" % problems))
+        if not ok:
+            shizuku_failures.append(label)
+    if shizuku_failures:
+        print("❌ selftest failed: %s" % ", ".join(shizuku_failures))
+        return 1
+    print("SHIZUKU_PATH_SELFTEST=PASS (5 fixtures: 4 violations caught, 1 clean tree green)")
     return 0
 
 
@@ -513,6 +690,7 @@ def main():
         return 2
     scanned, problems = check_tree(root)
     problems.extend(scan_player_session_path(root))
+    problems.extend(scan_shizuku_paths(root))
     if problems:
         print("offload_host_path_check: %d handler file(s) scanned, %d violation(s)" % (scanned, len(problems)))
         return 1

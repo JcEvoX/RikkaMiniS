@@ -146,6 +146,31 @@ def line_of(src, needle):
     return src.count("\n", 0, i) + 1 if i >= 0 else 0
 
 
+def _call_literal(src, list_name):
+    """The innermost `arrayOf(...)` argument list that names `list_name`.
+
+    Decision-point binding: the direction must be chosen inside the very
+    argument list that names the netpolicy list — a direction flipped somewhere
+    else in the file is not this call site.
+    """
+    i = src.find('"%s"' % list_name)
+    if i < 0:
+        return None
+    j = src.rfind("arrayOf(", 0, i)
+    if j < 0:
+        return None
+    depth, k = 0, j
+    while k < len(src):
+        if src[k] == "(":
+            depth += 1
+        elif src[k] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        k += 1
+    return src[j:k + 1]
+
+
 def analyse(src):
     """-> list of (criterion, ok, line, note).
 
@@ -290,6 +315,48 @@ def analyse(src):
             "execOptionTokens = " in src,
         ),
     ))
+    # ── deep-audit-1034 ISSUE-04: netpolicy direction + uid resolution ─────
+    # 14. `restrict-background-whitelist` EXEMPTS a uid from the background
+    #     restriction, so `restrict` must REMOVE from that list and `allow` ADD
+    #     to it; `restrict-background-blacklist` runs the other way. The shipped
+    #     code had the wifi pair inverted, so `network restrict --wifi` kept the
+    #     package online (and `network allow --wifi` cut it off).
+    wl = _call_literal(src, "restrict-background-whitelist")
+    bl = _call_literal(src, "restrict-background-blacklist")
+    wl_ok = wl is not None and 'if (restrict) "remove" else "add"' in wl
+    bl_ok = bl is not None and 'if (restrict) "add" else "remove"' in bl
+    results.append((
+        "14 netpolicy list direction follows the restrict flag",
+        wl_ok and bl_ok,
+        line_of(src, "restrict-background-whitelist"),
+        "whitelist=%s blacklist=%s"
+        % ("remove-on-restrict" if wl_ok else "MISSING or INVERTED",
+           "add-on-restrict" if bl_ok else "MISSING or INVERTED"),
+    ))
+
+    # 15. An unresolvable uid must refuse, never fall back to uid 0 (root).
+    #     `pkgUid` used to end in `?: "0"`, so `network restrict <typo>` ran
+    #     `cmd netpolicy … 0` and reported success while changing root's policy,
+    #     and `network stats <typo>` printed root's traffic as the package's.
+    #     Scope: the two callers + the resolver — `?: -1` elsewhere in the file
+    #     (screen metrics, package-list importance) is legitimate.
+    net_restrict = function_body(src, "networkRestrict") or ""
+    net_stats = function_body(src, "networkStats") or ""
+    restrict_refuses = re.search(
+        r"pkgUid\(pkg\)\s*\?:\s*return\s+errEnvelope\(", net_restrict) is not None
+    stats_refuses = re.search(
+        r"pkgUid\(pkg\)\?\.toIntOrNull\(\)\s*\?:\s*return\s+errEnvelope\(", net_stats) is not None
+    resolver_nullable = re.search(
+        r"internal fun extractUidFromDumpsys\([^)]*\)\s*:\s*String\?\s*=", src) is not None
+    no_zero_fallback = '?: "0"' not in src
+    no_neg_one = "?: -1" not in net_stats
+    results.append((
+        "15 unresolvable uid refuses instead of aiming at root",
+        restrict_refuses and stats_refuses and resolver_nullable and no_zero_fallback and no_neg_one,
+        line_of(src, "val uid = pkgUid(pkg)"),
+        "restrict-refuses=%s stats-refuses=%s resolver-String?=%s no-zero=%s no-minus-one=%s"
+        % (restrict_refuses, stats_refuses, resolver_nullable, no_zero_fallback, no_neg_one),
+    ))
     return results
 
 
@@ -331,6 +398,31 @@ class ShizukuOffloadHandler {
         return run(args.get("data", "d") ?: "")
     }
 
+    private fun networkRestrict(pkg: String?, args: OffloadArgs, restrict: Boolean): NativeOffloadResult {
+        if (pkg.isNullOrBlank()) return errEnvelope("INVALID_ARGS", "network restrict <pkg>", args)
+        val uid = pkgUid(pkg)
+            ?: return errEnvelope("OPERATION_FAILED", "network restrict: no uid for '$pkg'", args)
+        if (args.hasFlag("wifi")) {
+            val r = ShizukuManager.runProcess(arrayOf("cmd", "netpolicy",
+                if (restrict) "remove" else "add", "restrict-background-whitelist", uid))
+            return ok(r)
+        }
+        return run(arrayOf("cmd", "netpolicy",
+            if (restrict) "add" else "remove", "restrict-background-blacklist", uid))
+    }
+
+    private fun networkStats(pkg: String?, args: OffloadArgs): NativeOffloadResult {
+        val uid = pkgUid(pkg)?.toIntOrNull()
+            ?: return errEnvelope("OPERATION_FAILED", "network stats: no uid for '$pkg'", args)
+        val (rx, tx) = parseNetstats("", uid)
+        return ok(listOf(rx, tx))
+    }
+
+    private fun pkgUid(pkg: String): String? {
+        val r = ShizukuManager.runProcess(arrayOf("dumpsys", "package", pkg))
+        return extractUidFromDumpsys(r.stdout)
+    }
+
     private fun handleNotification(rest: List<String>, args: OffloadArgs): Int {
         return notificationChannel(args.positional.drop(1), args)
     }
@@ -342,7 +434,7 @@ class ShizukuOffloadHandler {
     }
 
     companion object {
-        internal val NO_VALUE_FLAGS = setOf("block", "unblock", "cache-only", "data")
+        internal val NO_VALUE_FLAGS = setOf("block", "unblock", "cache-only", "data", "all", "background", "wifi")
     }
 }
 
@@ -395,6 +487,9 @@ private fun isExecTimeoutValue(value: String): Boolean =
 
 internal fun firstPositionalIndex(argv: List<String>, booleanFlags: Set<String>): Int = 0
 
+internal fun extractUidFromDumpsys(dumpsysOutput: String): String? =
+    Regex("""userId=(\\d+)""").find(dumpsysOutput)?.groupValues?.get(1)
+
 internal fun encodeInputText(text: String): String =
     text.replace(" ", "%s").replace("'", "")
 
@@ -412,20 +507,25 @@ internal fun clearScope(cacheOnly: Boolean): String = if (cacheOnly) "cache-only
 # criterion index (1-based) -> (mutation, expected broken criteria)
 BREAKERS = {
     1: ("OffloadArgs(split.withoutGroup, booleanFlags = noValueFlagsFor(group))", "OffloadArgs(split.withoutGroup)"),
-    2: ('setOf("block", "unblock", "cache-only", "data")',
-        'setOf("block", "unblock", "cache-only", "data", "importance")'),
+    2: ('setOf("block", "unblock", "cache-only", "data", "all", "background", "wifi")',
+        'setOf("block", "unblock", "cache-only", "data", "all", "background", "wifi", "importance")'),
     3: ('text.replace(" ", "%s")', "text.replace(' ', '%')"),
     4: ('cmd.add("--cache-only")', 'cmd.add("--cache-only") // kept'),  # replaced below
     5: ("notificationChannel(args.positional.drop(1), args)", "notificationChannel(rest.drop(1), args)"),
     6: ("pos.getOrNull(1)", "rest.getOrNull(1)"),
     7: ("clearScope(cacheOnly)", "clearScope(false)"),
-    8: ('setOf("block", "unblock", "cache-only", "data")', 'setOf("block", "unblock", "data")'),
+    8: ('setOf("block", "unblock", "cache-only", "data", "all", "background", "wifi")',
+        'setOf("block", "unblock", "data", "all", "background", "wifi")'),
     9: ("val group = split.group ?: return", "val group = argv[0]"),
     10: ("val sub = args.positional.firstOrNull()", "val sub = rest.firstOrNull()"),
     11: ('rest.joinToString(" ")', 'args.positional.joinToString(" ")'),
     12: ('NO_VALUE_FLAGS - "data"', 'NO_VALUE_FLAGS'),
     13: ("if (group == EXEC_GROUP) stripExecTimeoutTokens(tail) else tail to emptyList()",
          "if (group == EXEC_GROUP) tail to emptyList() else tail to emptyList()"),
+    14: ('if (restrict) "remove" else "add", "restrict-background-whitelist", uid',
+         'if (restrict) "add" else "remove", "restrict-background-whitelist", uid'),
+    15: ("val uid = pkgUid(pkg)\n            ?: return errEnvelope",
+         'val uid = pkgUid(pkg) ?: "0"\n            ?: return errEnvelope'),
 }
 
 # Criterion 13 bundles three anchors (helper present / splitter runs it / the
@@ -435,11 +535,19 @@ BREAKERS = {
 EXTRA_BREAKERS = [
     ("13b handle feeds the parser the whole argv again",
      "OffloadArgs(split.execOptionTokens, booleanFlags = noValueFlagsFor(group))",
-     "OffloadArgs(split.withoutGroup, booleanFlags = noValueFlagsFor(group))"),
+     "OffloadArgs(split.withoutGroup, booleanFlags = noValueFlagsFor(group))", "13 "),
     ("13c the helper is gone (renamed)",
      "internal fun stripExecTimeoutTokens(tokens: List<String>): Pair<List<String>, List<String>> {",
      "internal fun stripExecTimeoutTokensRenamed(tokens: List<String>): "
-     "Pair<List<String>, List<String>> {"),
+     "Pair<List<String>, List<String>> {", "13 "),
+    # Criterion 15 fuses the two callers and the resolver; each half gets its own
+    # arm so no sub-condition can rot into dead text.
+    ("15b the stats caller falls back instead of refusing",
+     "val uid = pkgUid(pkg)?.toIntOrNull()\n            ?: return errEnvelope",
+     'val uid = pkgUid(pkg)?.toIntOrNull() ?: -1\n            ?: return errEnvelope', "15 "),
+    ("15c the resolver falls back to root's uid",
+     r'Regex("""userId=(\d+)""").find(dumpsysOutput)?.groupValues?.get(1)',
+     r'Regex("""userId=(\d+)""").find(dumpsysOutput)?.groupValues?.get(1) ?: "0"', "15 "),
 ]
 # criterion 4 has two halves; break the global-trim half explicitly
 BREAKERS[4] = (
@@ -481,11 +589,15 @@ def selftest():
         else:
             print("  [OK] breaker %d -> red on %r%s" % (idx, target, "" if len(red) == 1 else " (+%d side)" % (len(red) - 1)))
 
-    target13 = next((c for c in names if c.startswith("13 ")), None)
-    for label, old, new in EXTRA_BREAKERS:
-        if target13 is None:
-            failures.append("%s: criterion 13 is gone from analyse()" % label)
-            print("  [FAIL] %s: criterion 13 not evaluated" % label)
+    # Each arm names the criterion family it must flip (2nd element = prefix);
+    # the table can only flip one criterion per entry, so sub-conditions of a
+    # bundled criterion get their own arms here — otherwise they could rot into
+    # dead text that no fixture proves live.
+    for label, old, new, prefix in EXTRA_BREAKERS:
+        target = next((c for c in names if c.startswith(prefix)), None)
+        if target is None:
+            failures.append("%s: criterion %r is gone from analyse()" % (label, prefix))
+            print("  [FAIL] %s: criterion %r not evaluated" % (label, prefix))
             continue
         if old not in COMPLIANT:
             failures.append("%s: anchor not found in fixture" % label)
@@ -493,11 +605,11 @@ def selftest():
             continue
         res = analyse(strip_comments(COMPLIANT.replace(old, new, 1)))
         red = [c for c, ok, _, _ in res if not ok]
-        if target13 in red:
-            print("  [OK] breaker %s -> red on %r%s" % (label, target13, "" if len(red) == 1 else " (+%d side)" % (len(red) - 1)))
+        if target in red:
+            print("  [OK] breaker %s -> red on %r%s" % (label, target, "" if len(red) == 1 else " (+%d side)" % (len(red) - 1)))
         else:
-            failures.append("breaker %s did not turn %r red (red=%s)" % (label, target13, red))
-            print("  [FAIL] breaker %s -> %r stayed green (red=%s)" % (label, target13, red))
+            failures.append("breaker %s did not turn %r red (red=%s)" % (label, target, red))
+            print("  [FAIL] breaker %s -> %r stayed green (red=%s)" % (label, target, red))
     if not failures:
         print("SHIZUKU_ARGS_SELFTEST=PASS criteria=%d breakers=%d extra=%d"
               % (len(base), len(BREAKERS), len(EXTRA_BREAKERS)))

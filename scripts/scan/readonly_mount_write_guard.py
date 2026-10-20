@@ -1398,13 +1398,172 @@ def _backup_screen(shape="io"):
     )
 
 
+# ── Criterion 6 (deep-audit-1034 A2 / ISSUE-02): the SAF provider's own root ──
+# `documentId` arrives in the caller's spelling ("/", " ", "shared"), so two
+# decisions must be taken on the NORMALISED id rather than the raw string:
+#   D1 the root test — a client passing "/" must not receive the top-level
+#      listing (the TOP_LEVEL filter was skipped, so every internal filesDir
+#      entry leaked into the Files app)
+#   D2 the top-level test — the whitelist directories themselves must not be
+#      removed (`deleteDocument("shared")` used to `deleteRecursively()` the
+#      whole shared tree).
+DOCUMENTS_PROVIDER_REL = "providers/MinisDocumentsProvider.kt"
+DOC_RAW_ROOT_TEST = re.compile(r"\bparentDocumentId\s*\.\s*isEmpty\(\)")
+DOC_NORMALISED_ARG = re.compile(r"[A-Za-z_]\w*\(\s*parentDocumentId\s*[,)]")
+TOPLEVEL_DECISION = re.compile(
+    # Both spellings of the separator are live Kotlin: `contains("/")` and
+    # `contains('/')` — production uses the char form, the fixtures the string
+    # form, and a criterion that only knew one of them reported the real tree
+    # red on its first run.
+    r"""(?:contains|startsWith|endsWith|indexOf|lastIndexOf)\(\s*(?:'/'|"/")\s*\)"""
+    r"""|split\(\s*(?:'/'|"/")\s*[,)]"""
+    r"""|trim\(\s*(?:'/'|"/")\s*\)"""
+)
+
+_DOCUMENTS_PROVIDER = '''package com.rikkaminis.app.providers
+
+class MinisDocumentsProvider : DocumentsProvider() {
+    private fun normalizeDocId(id: String): String = id.trim().trim('/')
+
+    internal fun isTopLevelDocId(id: String): Boolean = !normalizeDocId(id).contains("/")
+
+    private fun readOnlyTopOf(clean: String): String? = clean.split("/").firstOrNull()
+
+    override fun queryChildDocuments(
+        parentDocumentId: String,
+        projection: Array<String>?,
+    ): Cursor {
+        val cleanParent = @ROOT@
+        val isRoot = cleanParent.isEmpty()
+        for (child in parent.listFiles()?.toList() ?: emptyList()) {
+            if (isRoot && child.name !in TOP_LEVEL) continue
+        }
+        return cursor
+    }
+
+    override fun deleteDocument(documentId: String) {
+        val file = resolveDoc(documentId)
+        val clean = normalizeDocId(documentId)
+        if (clean.isEmpty()) throw UnsupportedOperationException("Provider root cannot be deleted")
+        val top = readOnlyTopOf(clean)
+        if (top != null) throw UnsupportedOperationException("$top is read-only")
+        @TOPLEVEL@
+        if (!file.deleteRecursively()) throw FileNotFoundException("Failed to delete $documentId")
+    }
+
+    override fun renameDocument(documentId: String, displayName: String): String {
+        val clean = normalizeDocId(documentId)
+        if (clean.isEmpty()) throw UnsupportedOperationException("Provider root cannot be renamed")
+        val top = readOnlyTopOf(clean)
+        if (top != null) throw UnsupportedOperationException("$top is read-only")
+        @TOPLEVEL@
+        if (!file.renameTo(target)) throw FileNotFoundException("Failed to rename $documentId")
+        return documentIdFor(target)
+    }
+}
+'''
+
+_DOC_TOPLEVEL_GUARD = """if (isTopLevelDocId(documentId)) {
+            throw UnsupportedOperationException("Top-level '$clean' cannot be removed")
+        }"""
+
+
+def _documents_provider(shape="clean"):
+    root_expr = "parentDocumentId" if shape == "raw_root" else "normalizeDocId(parentDocumentId)"
+    guard = "" if shape == "no_toplevel_guard" else _DOC_TOPLEVEL_GUARD
+    return (_DOCUMENTS_PROVIDER.replace("@ROOT@", root_expr).replace("@TOPLEVEL@", guard))
+
+
+def check_documents_provider(root):
+    """(violations, rot, sites, notes) — criterion 6's two decisions."""
+    violations, rot, notes = [], [], []
+    path = os.path.join(root, APP_REL, DOCUMENTS_PROVIDER_REL)
+    pkg = os.path.dirname(path)
+    if not os.path.isfile(path):
+        if os.path.isdir(pkg) and os.listdir(pkg):
+            rot.append(
+                "%s lost its anchor (the providers package is there, the file is not)"
+                % DOCUMENTS_PROVIDER_REL
+            )
+        else:
+            notes.append(
+                "[PARTIAL] the read-only-mount provider anchors — this tree never shipped "
+                "%s" % DOCUMENTS_PROVIDER_REL
+            )
+        return violations, rot, 0, notes
+
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        raw = fh.read()
+    # Two views: the collapsed one for the call/argument shapes (a guard call
+    # quoted in prose must not count), the literal-preserving one for the
+    # '/'-ness decision — the separator *is* a literal, so collapsing it would
+    # hide the very thing D2 looks for.
+    text = strip_comments(raw)
+    literals = strip_comments(raw, collapse_literals=False)
+    fns = {name: body for name, _params, body in functions(text)}
+    sites = 0
+
+    # D1 — the root test consumes a normalised id, never the raw parameter.
+    if "queryChildDocuments" not in fns:
+        rot.append("%s: `queryChildDocuments` is gone — the root decision moved"
+                   % DOCUMENTS_PROVIDER_REL)
+    else:
+        body = fns["queryChildDocuments"]
+        sites += 1
+        if DOC_RAW_ROOT_TEST.search(body):
+            violations.append(
+                "%s:queryChildDocuments — the root test runs on the RAW documentId "
+                "(`parentDocumentId.isEmpty()`), so \"/\" skips the top-level filter"
+                % DOCUMENTS_PROVIDER_REL
+            )
+        elif not DOC_NORMALISED_ARG.search(body):
+            violations.append(
+                "%s:queryChildDocuments — the document id is never normalised before the "
+                "root test" % DOCUMENTS_PROVIDER_REL
+            )
+
+    # D2 — delete/rename refuse a top-level entry through that same decision. The
+    # decision is *discovered* (any Boolean-returning function whose own body
+    # expresses the '/'-ness test), never hard-coded by name, so renaming the
+    # helper cannot silently free the top level again; requiring the Boolean
+    # return type keeps an unrelated string helper (`…TopOf`) from standing in
+    # for the decision.
+    top_names = set()
+    for m in re.finditer(r"\bfun\s+(\w+)\s*\([^)]*\)\s*:\s*Boolean\b", literals):
+        window = literals[m.end():m.end() + 200]
+        window = re.split(r"\n\s*\n|\n\s*(?:internal |private |public |override )?fun ", window)[0]
+        if TOPLEVEL_DECISION.search(window):
+            top_names.add(m.group(1))
+    for fn in ("deleteDocument", "renameDocument"):
+        if fn not in fns:
+            rot.append("%s: `%s` is gone — the top-level decision moved"
+                       % (DOCUMENTS_PROVIDER_REL, fn))
+            continue
+        body = fns[fn]
+        sites += 1
+        test_used = any(re.search(r"\b%s\s*\(" % re.escape(n), body) for n in top_names)
+        refuses = "UnsupportedOperationException(" in body or "errEnvelope(" in body
+        if not test_used:
+            violations.append(
+                "%s:%s — no top-level refusal: a whitelist directory itself can still be "
+                "removed, taking the whole tree with it" % (DOCUMENTS_PROVIDER_REL, fn)
+            )
+        elif not refuses:
+            violations.append(
+                "%s:%s — the top-level test is evaluated but nothing refuses on it"
+                % (DOCUMENTS_PROVIDER_REL, fn)
+            )
+    return violations, rot, sites, notes
+
+
 def write_io_fixture(root, store_shape="io", log_shape="io", store_fn="probeWritable",
                      drop_store=False, drop_log=False, data_pkg=True, ui_pkg=True,
                      keep_pkgs_when_dropped=True, share_shape="io", drop_share=False,
                      toast_hop="hop", rootfs_shape="io", drop_rootfs=False,
                      browser_shape="guard", rpc_shape="guard", nav_shape="guard",
                      drop_guard_anchors=False,
-                     onboarding_shape="io", add_model_shape="io", backup_shape="io"):
+                     onboarding_shape="io", add_model_shape="io", backup_shape="io",
+                     provider_shape="clean"):
     """A `com/rikkaminis/app` tree carrying both criterion-2 targets.
 
     [keep_pkgs_when_dropped] leaves an unrelated file in the package whose anchor
@@ -1462,6 +1621,17 @@ def write_io_fixture(root, store_shape="io", log_shape="io", store_fn="probeWrit
     if not drop_log or keep_pkgs_when_dropped:
         files["ui/settings/AddCustomModelScreen.kt"] = _add_model_screen(add_model_shape)
         files["ui/settings/BackupSettingsScreen.kt"] = _backup_screen(backup_shape)
+    # [deep-audit-1034 A2 / ISSUE-02] criterion 6's subject. `absent` keeps the
+    # package populated (a *moved* file — ROT); `never_shipped` drops the package
+    # too, which is the synthetic shape ([PARTIAL], same as the frozen fixture
+    # `test_scan.py` builds).
+    if provider_shape != "never_shipped":
+        if provider_shape != "absent":
+            files["providers/MinisDocumentsProvider.kt"] = _documents_provider(provider_shape)
+        elif keep_pkgs_when_dropped:
+            files["providers/OtherProvider.kt"] = (
+                "package com.rikkaminis.app.providers\n\nclass OtherProvider\n"
+            )
     for rel, text in files.items():
         path = os.path.join(app, *rel.split("/"))
         if not os.path.isdir(os.path.dirname(path)):
@@ -1585,6 +1755,17 @@ def selftest():
     run("the two refusals may be written in either order", False,
         browser_shape="shared_first")
 
+    # ── criterion 6 (da1034 A2 / ISSUE-02): the SAF provider's own root ─────
+    run("a provider that judges the raw documentId as the root is caught", True,
+        "queryChildDocuments", provider_shape="raw_root")
+    run("a provider whose delete/rename never refuses a top-level entry is caught", True,
+        "deleteDocument", provider_shape="no_toplevel_guard")
+    run("a provider file that moved out of a populated package is a rot failure", True,
+        "lost its anchor", provider_shape="absent")
+    run("a tree that never shipped the provider is a skip, not a failure", False,
+        "[PARTIAL]", provider_shape="never_shipped")
+    run("the clean provider tree passes", False)
+
     print("=== readonly_mount_write_guard --selftest ===")
     failed = 0
     for name, ok, note in results:
@@ -1607,6 +1788,7 @@ def main():
     io_violations, io_rot, io_sites, io_notes = check_blocking_io(root)
     hop_violations, hop_rot, hop_sites, hop_notes = check_share_toast_hop(root)
     shape_violations, shape_rot, shape_sites, shape_notes = check_guard_call_shape(root)
+    doc_violations, doc_rot, doc_sites, doc_notes = check_documents_provider(root)
 
     rot = []
     if files < 20:
@@ -1616,12 +1798,13 @@ def main():
     rot += io_rot
     rot += hop_rot
     rot += shape_rot
+    rot += doc_rot
     if rot:
         print("ROT — the guard can no longer see what it is supposed to check:")
         for r in rot:
             print(f"  ✗ {r}")
         return 1
-    for n in io_notes + hop_notes + shape_notes:
+    for n in io_notes + hop_notes + shape_notes + doc_notes:
         print(f"  {n}")
     if violations or io_violations:
         print("Unguarded host-file writes:")
@@ -1635,7 +1818,11 @@ def main():
         print("Read-only-mount guard not wired at the model-carried write site:")
         for v in shape_violations:
             print(f"  ✗ {v}")
-    if violations or io_violations or hop_violations or shape_violations:
+    if doc_violations:
+        print("SAF provider root decisions taken on the raw document id:")
+        for v in doc_violations:
+            print(f"  ✗ {v}")
+    if violations or io_violations or hop_violations or shape_violations or doc_violations:
         return 1
     print(f"OK: {checked} path-parameter write site(s) guarded ({files} files scanned)")
     print(f"    {io_sites} blocking-IO call site(s) inside Dispatchers.IO")
@@ -1645,6 +1832,10 @@ def main():
         print(
             f"    {shape_sites} model-carried write/route site(s) carry the guard "
             f"in front of the write"
+        )
+    if doc_sites:
+        print(
+            f"    {doc_sites} SAF provider decision(s) taken on the normalised document id"
         )
     for rel, reason in sorted(exempt_used.items()):
         print(f"  · exempt {rel}: {reason}")
