@@ -1000,6 +1000,7 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
             daysRaw = args.getInt("days"),
             startRaw = args.get("start"),
             endRaw = args.get("end"),
+            daysText = args.get("days"),
         ) { parseDate(it) }
 
     private fun parseDate(s: String): Long? {
@@ -1314,6 +1315,11 @@ internal sealed class PhotoRange {
  * covers the whole day via [alignDateOnlyEndMs], `--days N` walks local days
  * via [daysAgoStartOfDayMs]) that deep-audit-1016c fixed here.
  *
+ * [dv14-A3] ISSUE-05: `--days` is read both as an integer ([daysRaw]) and as
+ * the raw string ([daysText]) so a supplied-but-unreadable value ("7d",
+ * "last-week") is refused by name instead of reading as absent and answering
+ * the ENTIRE library.
+ *
  * [parse] is injected so the core stays free of the handler's SimpleDateFormat
  * list and can be driven with a fixed clock in JVM tests.
  */
@@ -1323,8 +1329,17 @@ internal fun resolvePhotoRange(
     daysRaw: Int?,
     startRaw: String?,
     endRaw: String?,
+    daysText: String?,
     parse: (String) -> Long?,
 ): PhotoRange {
+    // [dv14-A3] ISSUE-05: `--days 7d` / `--days last-week` used to read as
+    // "absent" (getInt → toIntOrNull → null) and resolved to Window(null, null)
+    // → "no filter" → the whole photo library. Refuse it by name, same contract
+    // as --start/--end below. Absent (`--days` given no value) and
+    // non-positive integers keep their historical readings (degrade to 7).
+    if (daysText != null && daysText.isNotBlank() && daysText.toIntOrNull() == null) {
+        return PhotoRange.Invalid("--days", daysText)
+    }
     if (daysRaw != null) {
         val n = if (daysRaw <= 0) 7 else daysRaw
         return PhotoRange.Window(daysAgoStartOfDayMs(nowMs, n, zone), nowMs)
@@ -1345,6 +1360,22 @@ internal fun resolvePhotoRange(
     }
     return PhotoRange.Window(startMs, endMs)
 }
+
+/**
+ * [dv14-A3] ISSUE-05 back-compat overload: the pre-daysText positional shape
+ * (`…, endRaw, parse`), kept so every existing call site compiles unchanged.
+ * It carries no raw string and therefore holds no refusal — the core above is
+ * the one that decides. Declared AFTER the core so shape-based readers (the
+ * scan gates slice a member by its first declaration) still see the core.
+ */
+internal fun resolvePhotoRange(
+    nowMs: Long,
+    zone: TimeZone,
+    daysRaw: Int?,
+    startRaw: String?,
+    endRaw: String?,
+    parse: (String) -> Long?,
+): PhotoRange = resolvePhotoRange(nowMs, zone, daysRaw, startRaw, endRaw, null, parse)
 
 // ── [da1034-A3] ISSUE-05 pure export-shape helpers ────────────────────────────
 // Same split as the date helpers above: top-level, zero Android deps, so the
