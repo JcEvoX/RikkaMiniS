@@ -275,6 +275,16 @@ def analyse_store(code):
     string and a removed (already fired) alarm id came back on the next write.
     Contract: `lock` is declared inside the companion object, and both read
     entry points hold `synchronized(lock)` in their own body.
+
+    [dv15-A3] Same-id ledger semantics: add() is an idempotent upsert (a
+    re-schedule must replace its previous row — AlarmManager FLAG_UPDATE_CURRENT
+    already replaced the alarm) and remove() clears EVERY row with the id (the
+    receiver's fire path and cancel --id both want the whole id gone; a
+    first-match `return` leaves the duplicates behind as ghost rows). Both
+    entry points must route through the single helper removeAllById — bound to
+    the decision, not the writing: removeIf/replaceAll count as equivalent
+    inline forms, and the helper body must not return from inside its scan
+    loop.
     """
     res = []
     comp = companion_span(code)
@@ -307,6 +317,43 @@ def analyse_store(code):
                    else "body has no `synchronized(lock)`")),
             _line(code, sp[0]) if sp else 0,
         ))
+
+    # [dv15-A3] Same-id ledger semantics (see the docstring above). Anchored on
+    # the add()/remove() declaration bodies and the single helper definition.
+    idem_accept = re.compile(r"\b(removeAllById|removeIf|replaceAll)\s*\(")
+    add_sp = fun_span(code, "add")
+    rem_sp = fun_span(code, "remove")
+    help_sp = fun_span(code, "removeAllById")
+    add_ok = bool(add_sp) and bool(idem_accept.search(code[add_sp[0]:add_sp[1]]))
+    rem_ok = bool(rem_sp) and bool(idem_accept.search(code[rem_sp[0]:rem_sp[1]]))
+    help_body = code[help_sp[0]:help_sp[1]] if help_sp else ""
+    n_returns = len(re.findall(r"\breturn\b", help_body))
+    help_ok = bool(help_sp) and ".remove(" in help_body and n_returns == 1
+    idem_ok = add_ok and rem_ok and help_ok
+    if idem_ok:
+        idem_detail = ("add()/remove() both route same-id handling through the "
+                       "single helper; helper clears every match (single return)")
+    elif not help_sp:
+        idem_detail = "single-source helper removeAllById( not found (anchor drift)"
+    else:
+        missing = []
+        if not add_sp:
+            missing.append("fun add( not found")
+        elif not add_ok:
+            missing.append("add() does not route same-id dedup through the single helper (bare put?)")
+        if not rem_sp:
+            missing.append("fun remove( not found")
+        elif not rem_ok:
+            missing.append("remove() does not route same-id cleanup through the single helper (first-match-only?)")
+        if help_sp and (n_returns != 1 or ".remove(" not in help_body):
+            missing.append("removeAllById body must clear EVERY match (no early return inside the scan loop)")
+        idem_detail = "; ".join(missing)
+    res.append((
+        "store: same-id ledger semantics (add replaces, remove clears all, one helper)",
+        idem_ok,
+        idem_detail,
+        _line(code, help_sp[0]) if help_sp else (_line(code, add_sp[0]) if add_sp else 0),
+    ))
     return res
 
 
@@ -423,7 +470,17 @@ COMPLIANT_STORE = '''package com.rikkaminis.app.offload
 class ScheduledNotificationStore {
     fun add(id: String) {
         synchronized(lock) {
-            raw = (raw ?: "") + id
+            removeAllById(rawList, id)
+            rawList.put(id)
+        }
+    }
+
+    fun remove(id: String): Boolean {
+        synchronized(lock) {
+            if (removeAllById(rawList, id)) {
+                return true
+            }
+            return false
         }
     }
 
@@ -439,7 +496,21 @@ class ScheduledNotificationStore {
     companion object {
         private val lock = Any()
         private var raw: String? = null
+        private var rawList: org.json.JSONArray = org.json.JSONArray()
     }
+}
+
+internal fun removeAllById(list: org.json.JSONArray, id: String): Boolean {
+    var removed = false
+    var i = list.length() - 1
+    while (i >= 0) {
+        if (list.getJSONObject(i).optString("id") == id) {
+            list.remove(i)
+            removed = true
+        }
+        i--
+    }
+    return removed
 }
 '''
 
@@ -462,6 +533,21 @@ STORE_BREAKERS = {
     "load-all-renamed": (
         [("    fun loadAll(): String = synchronized(lock) {", "    fun readAll(): String = synchronized(lock) {")],
         "store: loadAll() body holds synchronized(lock)",
+    ),
+    "add-no-dedupe": (
+        [("            removeAllById(rawList, id)\n            rawList.put(id)",
+          "            rawList.put(id)")],
+        "store: same-id ledger semantics (add replaces, remove clears all, one helper)",
+    ),
+    "remove-first-only": (
+        [("            if (removeAllById(rawList, id)) {\n                return true\n            }\n            return false",
+          "            for (i in 0 until rawList.length()) {\n                if (rawList.getJSONObject(i).optString(\"id\") == id) {\n                    rawList.remove(i)\n                    return true\n                }\n            }\n            return false")],
+        "store: same-id ledger semantics (add replaces, remove clears all, one helper)",
+    ),
+    "helper-first-match-return": (
+        [("        if (list.getJSONObject(i).optString(\"id\") == id) {\n            list.remove(i)\n            removed = true\n        }",
+          "        if (list.getJSONObject(i).optString(\"id\") == id) {\n            list.remove(i)\n            return true\n        }")],
+        "store: same-id ledger semantics (add replaces, remove clears all, one helper)",
     ),
 }
 
