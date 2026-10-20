@@ -29,6 +29,21 @@ object ArtifactBackupScope {
      *  from the artifact backup (regenerable environment payloads). */
     private val EXCLUDED_DIRS = setOf("sandbox-env")
 
+    /** Directory names that are NEVER artifacts, at ANY depth.
+     *
+     *  [da1034-A1] `MCPOAuthStore.bridgeDir` is `<minis-global/mcp-servers>/oauth`
+     *  — the in-guest token bridge for `minis-mcp-cli`. It holds LIVE
+     *  credentials in plaintext: `<server>.json` carries `access_token` /
+     *  `refresh_token` / `client_secret` / `token_endpoint` / `client_id` /
+     *  `resource`, and a pending `<server>.secret` handoff file carries the
+     *  client secret itself. `includeSecrets=false` gates the provider /
+     *  envVar / mcpServers JSON sections but NOT this archive, so the
+     *  auto-backup (and every WebDAV copy of it) was shipping those tokens
+     *  verbatim. The walk drops the directory by name, at every level rather
+     *  than only at a root, because the same walker runs over the mcp root
+     *  whose bridge dir is one level below `minis-global/`. */
+    private val DENIED_DIRS = setOf("oauth")
+
     /** File extensions that count as artifacts. Text-only: the automatic
      *  backup must not silently grow into a media hoarder. */
     val DEFAULT_ALLOWED_EXTENSIONS = setOf(
@@ -82,6 +97,9 @@ object ArtifactBackupScope {
             val children = dir.listFiles() ?: return
             for (child in children.sortedBy { it.name }) {
                 if (child.isDirectory) {
+                    // [da1034-A1] Credential directories are dropped wherever
+                    // they appear in the tree — see DENIED_DIRS.
+                    if (child.name in DENIED_DIRS) continue
                     // Only the shared root has environment payloads; nested
                     // directories are always walked.
                     if (prefix.isEmpty() && child.name in EXCLUDED_DIRS) continue
