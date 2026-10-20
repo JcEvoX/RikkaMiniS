@@ -96,9 +96,17 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
         // promises to keep. Every other group still parses the full argv minus
         // the group.
         val args = if (group == "exec") {
-            OffloadArgs(split.execOptionTokens, booleanFlags = noValueFlagsFor(group))
+            OffloadArgs(
+                split.execOptionTokens,
+                booleanFlags = noValueFlagsFor(group),
+                valueShortOptions = SHIZUKU_VALUE_SHORT_OPTIONS,
+            )
         } else {
-            OffloadArgs(split.withoutGroup, booleanFlags = noValueFlagsFor(group))
+            OffloadArgs(
+                split.withoutGroup,
+                booleanFlags = noValueFlagsFor(group),
+                valueShortOptions = SHIZUKU_VALUE_SHORT_OPTIONS,
+            )
         }
         // `exec` joins the tokens *after* the group into one shell command, so a
         // leading option must never leak into the command string.
@@ -1492,6 +1500,21 @@ internal fun clearScope(cacheOnly: Boolean): String = if (cacheOnly) "cache-only
  * opts out. `--data=<uri>` keeps working under both readings — `--key=value`
  * is classified before the switch rule.
  */
+/**
+ * [dv15-A1 A-02] The single-dash options that take a value, declared once for
+ * every group: `-a <intent>` / `-d <uri>` / `-p <package>` / `-c <component>`
+ * ([ShizukuOffloadHandler.activityStart] forwards each to `am start`, spelled
+ * with the same letters). Before this the parser read `-a foo` as the FLAG `a`
+ * plus a stray positional `foo`, so `activity start -p com.x` launched nothing
+ * and `activityStart` never called [OffloadArgs.get] for that key.
+ *
+ * The long spellings (`--action`, `--package`, …) are NOT here: they were
+ * already value-looking by the `--key value` rule. None of these four is a
+ * boolean flag in [ShizukuOffloadHandler.NO_VALUE_FLAGS], so the declared-flag
+ * precedence in [OffloadArgs] leaves them free to take a value.
+ */
+internal val SHIZUKU_VALUE_SHORT_OPTIONS = setOf("a", "d", "p", "c")
+
 internal fun noValueFlagsFor(group: String?): Set<String> =
     if (group == "activity") ShizukuOffloadHandler.NO_VALUE_FLAGS - "data"
     else ShizukuOffloadHandler.NO_VALUE_FLAGS

@@ -47,6 +47,17 @@ one field/artifact points at something that no longer exists on the target":
      the whole thinking-rules group was silently dropped. Both sides must
      spell the backup's own label.
 
+   F. ROLLUP CANDIDATE口径 SINGLE SOURCE (MemoryRepository.dailyLogSizes vs
+      MemoryRollupRunner.pickLargestEligibleDate)
+      [dv15-A4] The prompt-side size hint filtered with three literal file
+      names only (GLOBAL.md / MEMORY-ROLLUP.md / SOUL.md) while the executor
+      additionally required a past date shape and no existing rollup section.
+      An already-distilled log therefore stayed "the largest daily log"
+      forever: the system prompt re-suggested memory_rollup on every turn and
+      the agent burned a call to be told SKIPPED_ALREADY. Both sides now judge
+      candidacy with one predicate; this criterion asserts the routing plus the
+      three decisions that predicate must keep.
+
 Registered gates assert the ROUTING/PRESENCE of the decision, not the absence
 of a spelling, so a refactor that keeps the contract is a deliberate edit here.
 
@@ -94,6 +105,24 @@ VOICE_GROUP_READERS = ("repo.voiceInputGroupId ?: \"\"", "repo.voiceOutputGroupI
 STAGE1_KEY_CALL = "providerKeyToId["
 STAGE1_KEY_END = "] = instId"
 STAGE15_LOOKUP = 'providerKeyToId["$type\\u0000$label"]'
+
+# F. ROLLUP CANDIDATE口径 SINGLE SOURCE
+#    The hint (MemoryRepository.dailyLogSizes) and the executor
+#    (MemoryRollupRunner.pickLargestEligibleDate) must judge candidacy through
+#    the SAME predicate. The criterion is anchored on the decision — the hint's
+#    filter chain routes through the shared predicate, the predicate expresses
+#    date shape + today boundary + already-distilled, and the executor neither
+#    re-spells the date pattern nor bypasses the predicate.
+ENGINE_REL = "src/android/app/src/main/java/com/rikkaminis/app/workspace/MemoryRollupEngine.kt"
+RUNNER_REL = "src/android/app/src/main/java/com/rikkaminis/app/workspace/MemoryRollupRunner.kt"
+HINT_CALL = "com.rikkaminis.app.workspace.MemoryRollupEngine.isRollupCandidate("
+EXEC_CALL = "MemoryRollupEngine.isRollupCandidate("
+CANDIDATE_DEF = "fun isRollupCandidate("
+PAST_LOG_DEF = "fun isPastDailyLog("
+PAST_LOG_CALL = "isPastDailyLog("
+DATE_PATTERN = 'Regex("\\\\d{4}-\\\\d{2}-\\\\d{2}")'
+HINT_DEF = "private fun dailyLogSizes("
+PICK_DEF = "private fun pickLargestEligibleDate("
 
 
 def code_only(text):
@@ -352,7 +381,74 @@ def check_thinking_rule_key(src):
     return []
 
 
-def check(root, raw_cfg=None, raw_mem=None, raw_builtins=None):
+def check_rollup_candidate_single_source(mem, eng, runner):
+    """F: the rollup candidacy口径 must have ONE definition.
+
+    [dv15-A4] The prompt-side size hint and the executor used to spell the
+    date shape and the "already distilled" cutoff themselves; the hint's copy
+    had lost both, so an already-distilled log stayed "the largest daily log"
+    and the agent was told to roll it up every turn. Anchored on the decision,
+    not on a spelling: the hint must route through the shared predicate, the
+    predicate must still decide date shape + today boundary + already
+    distilled, and the executor must not carry its own copy of the pattern.
+    """
+    out = []
+
+    # 1. the shared predicate exists and keeps all three decisions.
+    pred = function_text(eng, CANDIDATE_DEF)
+    past = function_text(eng, PAST_LOG_DEF)
+    if pred is None or past is None:
+        out.append((ENGINE_REL, 0,
+                    "isRollupCandidate / isPastDailyLog not found - gate ROT"))
+    else:
+        if CANDIDATE_DEF not in eng:
+            out.append((ENGINE_REL, 0, CANDIDATE_DEF + " not found - gate ROT"))
+        body = code_only(pred)
+        if PAST_LOG_CALL not in body or "hasRollupForDate(" not in body:
+            out.append((ENGINE_REL, line_of(eng, eng.find(CANDIDATE_DEF)),
+                        "the shared candidate predicate no longer decides the date "
+                        "shape and the already-distilled cutoff together - the hint "
+                        "and the executor can diverge again"))
+        shape = code_only(past)
+        lost = []
+        if "DATE_FILE_PATTERN" not in shape:
+            lost.append("date shape")
+        if not re.search(r">=\s*todayStr", shape):
+            lost.append("today/future boundary")
+        if DATE_PATTERN not in eng:
+            lost.append("single date-pattern definition")
+        if lost:
+            out.append((ENGINE_REL, line_of(eng, eng.find(PAST_LOG_DEF)),
+                        "the past-log shape test lost: " + ", ".join(lost)))
+
+    # 2. the prompt-side hint routes through the shared predicate.
+    hint = function_text(mem, HINT_DEF)
+    if hint is None:
+        out.append((MEM_REL, 0, "dailyLogSizes( not found - gate ROT"))
+    elif HINT_CALL not in code_only(hint):
+        out.append((MEM_REL, line_of(mem, mem.find(HINT_DEF)),
+                    "dailyLogSizes no longer judges candidacy with " + HINT_CALL +
+                    " - the system prompt can name a log the executor answers with "
+                    "SKIPPED_ALREADY"))
+
+    # 3. the executor shares it and does not re-spell the date pattern.
+    pick = function_text(runner, PICK_DEF)
+    if pick is None:
+        out.append((RUNNER_REL, 0, "pickLargestEligibleDate( not found - gate ROT"))
+    elif EXEC_CALL not in code_only(pick):
+        out.append((RUNNER_REL, line_of(runner, runner.find(PICK_DEF)),
+                    "pickLargestEligibleDate no longer uses " + EXEC_CALL +
+                    " - the executor's candidacy口径 is independent of the hint again"))
+    if DATE_PATTERN in code_only(runner):
+        out.append((RUNNER_REL, line_of(runner, runner.find(DATE_PATTERN)),
+                    "the executor re-spells the date pattern (" + DATE_PATTERN +
+                    ") instead of sourcing it from MemoryRollupEngine - the two "
+                    "copies can drift apart again"))
+    return out
+
+
+def check(root, raw_cfg=None, raw_mem=None, raw_builtins=None, raw_engine=None,
+          raw_runner=None):
     if raw_cfg is None:
         with open(os.path.join(root, CFG_REL), encoding="utf-8") as f:
             raw_cfg = f.read()
@@ -362,6 +458,12 @@ def check(root, raw_cfg=None, raw_mem=None, raw_builtins=None):
     if raw_builtins is None:
         with open(os.path.join(root, BUILTINS_REL), encoding="utf-8") as f:
             raw_builtins = f.read()
+    if raw_engine is None:
+        with open(os.path.join(root, ENGINE_REL), encoding="utf-8") as f:
+            raw_engine = f.read()
+    if raw_runner is None:
+        with open(os.path.join(root, RUNNER_REL), encoding="utf-8") as f:
+            raw_runner = f.read()
     out = []
     out += check_remap_defaults(raw_cfg)
     out += check_voice_group_remap(raw_cfg)
@@ -371,6 +473,7 @@ def check(root, raw_cfg=None, raw_mem=None, raw_builtins=None):
     out += check_memory_pack(raw_cfg)
     out += check_restore_writeback(raw_cfg)
     out += check_delete_guard(raw_mem)
+    out += check_rollup_candidate_single_source(raw_mem, raw_engine, raw_runner)
     return out
 
 
@@ -386,20 +489,33 @@ def selftest(root):
         mem = f.read()
     with open(os.path.join(root, BUILTINS_REL), encoding="utf-8") as f:
         bui = f.read()
+    with open(os.path.join(root, ENGINE_REL), encoding="utf-8") as f:
+        eng = f.read()
+    with open(os.path.join(root, RUNNER_REL), encoding="utf-8") as f:
+        runner = f.read()
 
     def on_cfg(fn):
-        return lambda c, m, b, _fn=fn: _fn(c)
+        return lambda c, m, b, e, r, _fn=fn: _fn(c)
 
     def on_mem(fn):
-        return lambda c, m, b, _fn=fn: _fn(m)
+        return lambda c, m, b, e, r, _fn=fn: _fn(m)
 
     def on_bui(fn):
-        return lambda c, m, b, _fn=fn: _fn(b)
+        return lambda c, m, b, e, r, _fn=fn: _fn(b)
+
+    def on_engine(fn):
+        return lambda c, m, b, e, r, _fn=fn: _fn(e)
+
+    def on_runner(fn):
+        return lambda c, m, b, e, r, _fn=fn: _fn(r)
+
+    def on_rollup(fn):
+        return lambda c, m, b, e, r, _fn=fn: _fn(m, e, r)
 
     arms = []
 
-    def arm(name, crit, cfg=cfg, mem=mem, bui=bui):
-        arms.append((name, crit, cfg, mem, bui))
+    def arm(name, crit, cfg=cfg, mem=mem, bui=bui, eng=eng, runner=runner):
+        arms.append((name, crit, cfg, mem, bui, eng, runner))
 
     def sub_once(text, old, new):
         assert text.count(old) >= 1, "fixture anchor missing: " + old
@@ -525,14 +641,58 @@ def selftest(root):
         cfg=sub_once(cfg, STAGE1_KEY_CALL, "providerKeyMap["),
     )
 
+    # ── [dv15-A4] arms 12-16: rollup candidacy single source ─────────────
+    # 12. the prompt-side hint goes back to filtering literal file names
+    #     (the pre-fix shape: GLOBAL.md / MEMORY-ROLLUP.md / SOUL.md only).
+    arm(
+        "M12 hint drops the shared candidate predicate",
+        on_rollup(check_rollup_candidate_single_source),
+        mem=sub_once(mem, HINT_CALL, "isDailyLogForRollupLegacy("),
+    )
+    # 13. the shared predicate loses the already-distilled cutoff.
+    arm(
+        "M13 candidate predicate ignores the rollup file",
+        on_rollup(check_rollup_candidate_single_source),
+        eng=sub_once(eng, "hasRollupForDate(rollupContent,", "rollupIgnored("),
+    )
+    # 14. the past-log shape test loses the today/future boundary.
+    arm(
+        "M14 today boundary dropped",
+        on_rollup(check_rollup_candidate_single_source),
+        eng=sub_once(eng, "if (datePart >= todayStr) return false",
+                     'if (datePart >= "9999-99-99") return false'),
+    )
+    # 15. the executor re-spells the date pattern instead of sourcing it.
+    arm(
+        "M15 executor re-spells the date pattern",
+        on_rollup(check_rollup_candidate_single_source),
+        runner=sub_once(
+            runner,
+            'private const val TAG = "MemoryRollupRunner"',
+            'private const val TAG = "MemoryRollupRunner"\n'
+            '        private val DATE_FILE_PATTERN = Regex("\\\\d{4}-\\\\d{2}-\\\\d{2}")',
+        ),
+    )
+    # 16. the executor's picker bypasses the shared predicate.
+    arm(
+        "M16 executor picker bypasses the shared predicate",
+        on_rollup(check_rollup_candidate_single_source),
+        runner=sub_once(
+            runner,
+            "if (!MemoryRollupEngine.isRollupCandidate(f.name, f.length(), todayStr, rollupContent)) {",
+            "if (!isDailyLogLegacy(f.name)) {",
+        ),
+    )
+
     failures = []
-    for name, crit, c, m, b in arms:
-        violations = check(root, raw_cfg=c, raw_mem=m, raw_builtins=b)
+    for name, crit, c, m, b, e, r in arms:
+        violations = check(root, raw_cfg=c, raw_mem=m, raw_builtins=b, raw_engine=e,
+                           raw_runner=r)
         if crit is None:
             if violations:
                 failures.append("%s: expected GREEN, got %r" % (name, violations))
             continue
-        expected = crit(c, m, b)
+        expected = crit(c, m, b, e, r)
         if not expected:
             failures.append("%s: criterion did not fire (dead tooth)" % name)
             continue

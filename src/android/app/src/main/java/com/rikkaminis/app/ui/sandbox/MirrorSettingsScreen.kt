@@ -69,7 +69,6 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -343,9 +342,16 @@ object MirrorSpeedTestViewModel {
                 var completed = 0
                 val list = mutableListOf<MirrorTestResult>()
 
+                // [dv15-B2 / B-02] Progress must advance as each probe settles.
+                // The previous `deferred.awaitAll()` held this loop back until the
+                // last latency came in, so the bar sat at 0 and jumped to 100 —
+                // and on a slow or dead mirror that is the whole timeout, which is
+                // why the tap read as ignored. Concurrency is unchanged: every
+                // async is still launched up front, only the order in which the
+                // completions are observed changed.
                 val deferred = mirrors.map { mirror -> async { testMirror(mirror) } }
-                val results = deferred.awaitAll()
-                for (r in results) {
+                for (d in deferred) {
+                    val r = d.await()
                     completed++
                     list.add(r)
                     val p = completed.toFloat() / total.toFloat()
@@ -353,9 +359,26 @@ object MirrorSpeedTestViewModel {
                 }
 
                 val sorted = list.sortedWith(latencyComparator)
+                // [da1022-F] Same auto-select contract as runAllTests: a speed
+                // test has to reach the rootfs config, not stop at the results
+                // map. The previous body recorded the results and returned, so the
+                // mirror the user had just measured was never selected, persisted
+                // or applied — the `context` parameter sat unused, which is what
+                // made the truncation invisible.
+                val autoApplied = mutableListOf<MirrorCategory>()
                 withContext(Dispatchers.Main) {
                     this@MirrorSpeedTestViewModel.results[category] = sorted
+                    for ((cat, fastest) in autoSelectFastest(mapOf(category to sorted)) { selectedMirrorId[it] != null }) {
+                        selectedMirrorId[cat] = fastest.mirror.id
+                        useCustomMirror[cat] = true
+                        persist(context, cat)
+                        autoApplied += cat
+                    }
                 }
+                // applyMirror is disk IO — same split as runAllTests /
+                // selectMirror / setUseCustom: state writes on Main, the rootfs
+                // write off it.
+                for (cat in autoApplied) applyMirror(context, cat)
             } finally {
                 // T10-L8: NonCancellable is required — a plain withContext in
                 // the finally of a cancelled job throws JobCancellationException
@@ -790,7 +813,6 @@ fun MirrorCategoryDetailScreen(
             )
 
             val selected = vm.selectedMirror(category)
-            val useCustomEnabled = selected != null
             ListItem(
                 headlineContent = { Text(stringResource(R.string.mirror_use_mirror_toggle)) },
                 trailingContent = {
@@ -799,7 +821,16 @@ fun MirrorCategoryDetailScreen(
                         onCheckedChange = { checked ->
                             vm.setUseCustom(context, category, checked)
                         },
-                        enabled = useCustomEnabled,
+                        // [dv15-B2 / B-02] Always enabled. The previous
+                        // `enabled = selected != null` required picking a mirror
+                        // before the switch could be touched, which forced one
+                        // order of operations and left the switch looking dead.
+                        // Both directions are safe with no selection —
+                        // setUseCustom persists the flag and its IO branch
+                        // no-ops (applyMirror returns early without a selection,
+                        // restoreOfficial returns early without a .bak), and
+                        // selectMirror re-applies once the flag is already on.
+                        enabled = true,
                     )
                 },
             )

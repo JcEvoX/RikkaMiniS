@@ -10,6 +10,9 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
 
 /**
@@ -333,5 +336,116 @@ class MemoryRepositoryTest {
             "SOUL.md must never be named as a daily log",
             summary.contains(SoulStore.FILE_NAME),
         )
+    }
+
+    // ── [dv15-A4] candidate口径 must match the rollup executor ──────────────
+    // Pre-fix the filter only dropped three literal file names, so a log that
+    // already had a MEMORY-ROLLUP.md section stayed the "largest daily log"
+    // forever: the system prompt re-suggested memory_rollup for it on every
+    // turn, and the agent burned a call to be told SKIPPED_ALREADY. The
+    // candidate set now comes from the same predicate the executor uses.
+    // (deep-audit-1036 A-07)
+
+    /** Today as the repository computes it — same formatter, so timezone-stable. */
+    private fun todayStamp(): String =
+        SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+
+    @Test
+    fun dailyLogSizes_excludesAlreadyDistilledLog() {
+        memoryDir.mkdirs()
+        File(memoryDir, "2026-10-12.md").writeText("x".repeat(500))
+        File(memoryDir, "2026-10-13.md").writeText("y".repeat(5000))
+        File(memoryDir, MemoryRollupEngine.ROLLUP_FILE).writeText(
+            "## Rollup 2026-10-13\n### 经验与知识点\n- 已蒸馏\n",
+        )
+
+        val repo = MemoryRepository(memoryDir)
+        val summary = repo.dailyLogSizeSummary()
+
+        assertNotNull(summary)
+        assertTrue(
+            "the still-pending log must be the one named",
+            summary!!.contains("2026-10-12.md"),
+        )
+        assertFalse(
+            "2026-10-13.md is already distilled — it is not pending",
+            summary.contains("2026-10-13.md"),
+        )
+        assertEquals(
+            "largest PENDING log is the 500-byte file, not the distilled 5000-byte one",
+            500L,
+            repo.largestDailyLogBytes(),
+        )
+    }
+
+    @Test
+    fun dailyLogSizes_excludesNonDateMarkdown() {
+        memoryDir.mkdirs()
+        File(memoryDir, "2026-10-12.md").writeText("x".repeat(500))
+        File(memoryDir, "notes.md").writeText("n".repeat(9000)) // biggest, but not a daily log
+
+        val repo = MemoryRepository(memoryDir)
+        val summary = repo.dailyLogSizeSummary()
+
+        assertNotNull(summary)
+        assertTrue(summary!!.contains("2026-10-12.md"))
+        assertFalse(
+            "a non-date markdown file is not a daily log",
+            summary.contains("notes.md"),
+        )
+        assertEquals(500L, repo.largestDailyLogBytes())
+    }
+
+    @Test
+    fun dailyLogSizes_excludesToday() {
+        memoryDir.mkdirs()
+        File(memoryDir, "2026-10-12.md").writeText("x".repeat(500))
+        File(memoryDir, "${todayStamp()}.md").writeText("t".repeat(9000)) // today: still being written
+
+        val repo = MemoryRepository(memoryDir)
+        val summary = repo.dailyLogSizeSummary()
+
+        assertNotNull(summary)
+        assertTrue(summary!!.contains("2026-10-12.md"))
+        assertFalse(
+            "today's log is still being written — never the largest pending one",
+            summary.contains(todayStamp()),
+        )
+        assertEquals(500L, repo.largestDailyLogBytes())
+    }
+
+    @Test
+    fun dailyLogSizes_allDistilled_returnsNullNotThrow() {
+        memoryDir.mkdirs()
+        File(memoryDir, "2026-10-12.md").writeText("x".repeat(9000))
+        File(memoryDir, MemoryRollupEngine.ROLLUP_FILE).writeText(
+            "## Rollup 2026-10-12\n- 已蒸馏\n",
+        )
+
+        val repo = MemoryRepository(memoryDir)
+
+        assertNull(
+            "every dated log is distilled — nothing pending",
+            repo.dailyLogSizeSummary(),
+        )
+        assertEquals("no pending log → 0L", 0L, repo.largestDailyLogBytes())
+    }
+
+    @Test
+    fun dailyLogSizes_isReadOnly() {
+        memoryDir.mkdirs()
+        val log = File(memoryDir, "2026-10-12.md")
+        log.writeText("x".repeat(500))
+        val rollup = File(memoryDir, MemoryRollupEngine.ROLLUP_FILE)
+        rollup.writeText("## Rollup 2026-10-11\n- 已蒸馏\n")
+        val logBefore = log.readText()
+        val rollupBefore = rollup.readText()
+
+        val repo = MemoryRepository(memoryDir)
+        repo.dailyLogSizeSummary()
+        repo.largestDailyLogBytes()
+
+        assertEquals("the statistics path must not rewrite the log", logBefore, log.readText())
+        assertEquals("nor the rollup file it reads", rollupBefore, rollup.readText())
     }
 }

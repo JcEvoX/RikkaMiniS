@@ -2,8 +2,6 @@ package com.rikkaminis.app.ui.settings
 
 import android.app.Activity
 import android.content.Context
-import android.content.Intent
-import android.provider.Settings
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
@@ -31,7 +29,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.rikkaminis.app.R
-import com.rikkaminis.app.accessibility.MinisAccessibilityService
 import com.rikkaminis.app.accessibility.RestrictedSettingsManager
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.offload.OffloadPermissionManager
@@ -65,7 +62,13 @@ fun OffloadPermissionScreen(
 
     val context = LocalContext.current
 
-    var a11yEnabled by remember { mutableStateOf(isA11yServiceEnabled(context)) }
+    // [dv15-B2 / B-08] One classification drives all three a11y states (see
+    // A11yStatus). "Ready" now means the service is actually bound, so a
+    // listed-but-killed service reports DEGRADED instead of reporting
+    // "enabled" and hiding both rescue cards below.
+    var a11yEnabled by remember { mutableStateOf(a11yStatusOf(context) == A11yStatus.READY) }
+    var a11yDegraded by remember { mutableStateOf(false) }
+    var a11yRevoked by remember { mutableStateOf(false) }
     // [T-android-restricted-settings] Android 13+ refuses to arm the
     // accessibility toggle for installs flagged as restricted; surfaced below
     // so the "Open accessibility settings" action doesn't dead-end.
@@ -77,7 +80,15 @@ fun OffloadPermissionScreen(
         // Re-poll once a second so coming back from system Accessibility
         // settings flips the row without a manual refresh.
         while (true) {
-            a11yEnabled = isA11yServiceEnabled(context) || MinisAccessibilityService.getInstance() != null
+            // [dv15-B2 / B-08] Was `isA11yServiceEnabled(context) || getInstance() != null`,
+            // which reported a listed-but-killed service as enabled (the ROM kills
+            // the process while Settings.Secure keeps the entry) — that hid the
+            // settings entry point and the two rescue cards. The connected fallback
+            // survives inside classifyA11yStatus.
+            val status = a11yStatusOf(context)
+            a11yEnabled = status == A11yStatus.READY
+            a11yDegraded = status == A11yStatus.DEGRADED
+            a11yRevoked = status == A11yStatus.REVOKED
             // Re-probed each tick so the section disappears by itself once the
             // user allows restricted settings and returns.
             a11yRestricted = !a11yEnabled && RestrictedSettingsManager.isRestricted(context)
@@ -203,6 +214,16 @@ fun OffloadPermissionScreen(
                 )
             }
         }
+
+        // [dv15-B2 / B-08] The two self-rescue cards used to exist ONLY in
+        // SystemPermissionsScreen, which has no navigation entry point — so a
+        // user whose grant was force-stopped, or whose ROM killed the service,
+        // reached this screen and found no way to repair it.
+        A11yRevokedRepairSection(
+            revoked = a11yRevoked,
+            shizukuReady = shizukuSnap.state == ShizukuManager.State.READY,
+        )
+        A11yOemKeepAliveSection(degraded = a11yDegraded)
 
         IntegrationSection(
             iconVector = Icons.Outlined.Shield,
@@ -483,27 +504,6 @@ private fun levelColor(level: OffloadPermissionManager.PermissionLevel): Color =
     OffloadPermissionManager.PermissionLevel.BYPASS -> MaterialTheme.colorScheme.primary
     OffloadPermissionManager.PermissionLevel.ASK_ONCE -> MaterialTheme.colorScheme.tertiary
     OffloadPermissionManager.PermissionLevel.NOT_ALLOWED -> MaterialTheme.colorScheme.error
-}
-
-private fun isA11yServiceEnabled(context: Context): Boolean =
-    com.rikkaminis.app.accessibility.A11yState.isServiceEnabled(context)
-
-private fun openAccessibilitySettings(context: Context) {
-    try {
-        context.startActivity(
-            Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
-        )
-    } catch (_: Throwable) {
-        try {
-            context.startActivity(
-                Intent(Settings.ACTION_SETTINGS).apply {
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                }
-            )
-        } catch (_: Throwable) {}
-    }
 }
 
 // [T-android-restricted-settings] "Allow restricted settings" lives in the

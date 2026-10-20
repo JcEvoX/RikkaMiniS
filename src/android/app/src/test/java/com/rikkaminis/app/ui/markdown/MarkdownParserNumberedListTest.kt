@@ -110,4 +110,60 @@ class MarkdownParserNumberedListTest {
         assertEquals(2, list.startNumber)
         assertEquals(listOf("缩进项"), list.items.map { it.content })
     }
+
+    // ── [dv15/B-07] continuation-line merging ─────────────────────────────
+    // The bullet loop has merged two-space continuations since
+    // fix/audit-0917-b9; the numbered loop did not, so a wrapped item ended the
+    // list at the wrap and the tail rendered as its own paragraph. Literals
+    // below come from a real run of the fixed parser (probe-b4/jvm/deep-post.log).
+
+    @Test
+    fun `indented continuation line joins the item content`() {
+        val b = blocks("1. 第一项\n  续行内容\n2. 第二项")
+        assertEquals(1, b.size)
+        val list = b[0] as Block.NumberedList
+        assertEquals(1, list.startNumber)
+        assertEquals(listOf("第一项\n续行内容", "第二项"), list.items.map { it.content })
+    }
+
+    @Test
+    fun `two indented continuation lines join in order`() {
+        val list = blocks("1. 第一项\n  续行一\n  续行二\n2. 第二项")[0] as Block.NumberedList
+        assertEquals(listOf("第一项\n续行一\n续行二", "第二项"), list.items.map { it.content })
+    }
+
+    @Test
+    fun `deeper numbered marker is a new item not continuation text`() {
+        val list = blocks("1. 第一项\n  2. 新项")[0] as Block.NumberedList
+        assertEquals(listOf("第一项", "新项"), list.items.map { it.content })
+    }
+
+    @Test
+    fun `indented fence under an item stays a code block`() {
+        val b = blocks("1. 第一项\n  ```\n  code\n  ```\n后文")
+        assertEquals(3, b.size)
+        assertEquals(listOf("第一项"), (b[0] as Block.NumberedList).items.map { it.content })
+        val code = b[1] as Block.CodeBlock
+        assertEquals("", code.language)
+        assertEquals("  code", code.code)
+        assertEquals("后文", (b[2] as Block.Paragraph).content)
+    }
+
+    @Test
+    fun `indented bullet under an item merges - mirrors the bullet loop`() {
+        // The numbered loop is the mirror of the bullet loop in the same file:
+        // each excludes only ITS OWN marker type, so an indented bullet is
+        // continuation text of the item above — the mirror of the bullet loop,
+        // which merges an indented numbered marker.
+        val list = blocks("1. 第一项\n  - 子弹")[0] as Block.NumberedList
+        assertEquals(listOf("第一项\n- 子弹"), list.items.map { it.content })
+    }
+
+    @Test
+    fun `unindented tail line still ends the list`() {
+        val b = blocks("1. a\nb")
+        assertEquals(2, b.size)
+        assertTrue(b[0] is Block.NumberedList)
+        assertEquals("b", (b[1] as Block.Paragraph).content)
+    }
 }

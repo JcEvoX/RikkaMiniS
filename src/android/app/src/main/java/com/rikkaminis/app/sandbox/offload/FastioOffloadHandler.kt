@@ -731,6 +731,17 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
             )
         }
 
+        // [dv15-A2] A-04: the archive path's LAST segment is deliberately left
+        // unresolved by GuestPathMapper (that is what keeps `rm <link>` working),
+        // so a symbolic link sitting here would make newOutputStream WRITE
+        // THROUGH it to whatever host path it names — `--force` is what made that
+        // reachable. Refuse the link itself (exit 2). Without `--force` a link is
+        // already refused above as `already_exists`; this guard is what stops the
+        // `--force` write-through.
+        if (Files.isSymbolicLink(archivePath)) {
+            return refuseLinkedArchive(entry, "write", startedNs, args)
+        }
+
         val outcome = TarCreateOutcome()
         try {
             Files.createDirectories(archivePath.parent)
@@ -805,6 +816,14 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
             )
         }
 
+        // [dv15-A2] A-04: the two checks above are NOFOLLOW, so a link passes
+        // both of them; openArchive's newInputStream is NOT NOFOLLOW, so it would
+        // READ THROUGH the link to whatever host path it names. Same boundary as
+        // the write side — refuse the link instead of following it.
+        if (Files.isSymbolicLink(archivePath)) {
+            return refuseLinkedArchive(entry, "read", startedNs, args)
+        }
+
         val destPath = Paths.get(dest.hostPath)
         val budget = tarEntryBudget(args)
         val validation = TarExtractOutcome()
@@ -851,12 +870,51 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
         failed: Boolean,
         startedNs: Long,
         args: OffloadArgs,
+    ): NativeOffloadResult = finishTarWith(entry, if (failed) 1 else 0, startedNs, args)
+
+    /**
+     * [dv15-A2] A-04: [finishTar] with an explicit exit code and the same body
+     * shape, because "the archive path itself is unusable" is a usage error
+     * (exit 2) and not the plain failure (exit 1) the boolean can express.
+     */
+    private fun finishTarWith(
+        entry: JSONObject,
+        exitCode: Int,
+        startedNs: Long,
+        args: OffloadArgs,
     ): NativeOffloadResult {
         val body = JSONObject()
             .put("results", JSONArray().put(entry))
             .put("elapsed_ms", (System.nanoTime() - startedNs) / 1_000_000)
-        return NativeOffloadResult(if (failed) 1 else 0, OffloadOutput.formatBody(body.toString(2), args) + "\n")
+        return NativeOffloadResult(exitCode, OffloadOutput.formatBody(body.toString(2), args) + "\n")
     }
+
+    /**
+     * [dv15-A2] A-04: the archive path is a symbolic link. GuestPathMapper leaves
+     * the LAST segment of a guest path unresolved on purpose (that is what keeps
+     * `rm <link>` working), so the archive path is a host path whose final
+     * component may be a link to ANY host file: `newOutputStream` would write
+     * through it (create, reachable with `--force`) and `newInputStream` would
+     * read through it (extract). That crosses the guest/host boundary this
+     * handler exists to enforce. The link itself is refused (exit 2) rather than
+     * resolved or deleted — resolving would lose `rm <link>` semantics, and
+     * deleting would clobber a path the caller never named.
+     */
+    private fun refuseLinkedArchive(
+        entry: JSONObject,
+        verb: String,
+        startedNs: Long,
+        args: OffloadArgs,
+    ): NativeOffloadResult = finishTarWith(
+        entry.put("error", "unsafe_archive_path").put(
+            "detail",
+            "'${entry.getString("archive")}' is a symbolic link; fastio tar refuses to $verb through it. " +
+                "Remove the link first, or name a path whose last segment is a real file.",
+        ),
+        2,
+        startedNs,
+        args,
+    )
 
     /**
      * Write-path policy, applied AFTER translation and BEFORE the target is

@@ -136,16 +136,29 @@ class MemoryRepository(private val memoryDir: File) {
     }
 
     private fun dailyLogSizes(): List<Pair<String, Long>> {
+        // [dv15-A4] The candidate口径 must match the rollup executor
+        // (MemoryRollupRunner.pickLargestEligibleDate): a past, non-empty
+        // YYYY-MM-DD.md with no rollup section yet — judged by the shared
+        // MemoryRollupEngine.isRollupCandidate. Before this the filter only
+        // dropped three file-name literals, so an ALREADY-DISTILLED log stayed
+        // the "largest daily log" forever: every turn the system prompt
+        // re-suggested memory_rollup for it and the agent got SKIPPED_ALREADY
+        // back. Reading MEMORY-ROLLUP.md here is the price of judging candidacy
+        // the same way the executor does; the statistics stay read-only.
+        val todayStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+        val rollupContent = File(memoryDir, ROLLUP_FILE)
+            .takeIf { it.isFile }
+            ?.let { runCatching { it.readText() }.getOrDefault("") }
+            .orEmpty()
         return memoryDir.listFiles()
+            ?.filter { it.isFile }
             ?.filter {
-                it.extension == "md" &&
-                    it.name != GLOBAL_FILE &&
-                    it.name != ROLLUP_FILE &&
-                    // Same exclusion as readRecentDailyLogs below: SOUL.md
-                    // lives in this directory but is not a daily log —
-                    // counting it could name it as "largest daily log" and
-                    // mislead the memory_rollup suggestion.
-                    it.name != SOUL_FILE
+                com.rikkaminis.app.workspace.MemoryRollupEngine.isRollupCandidate(
+                    it.name,
+                    it.length(),
+                    todayStr,
+                    rollupContent,
+                )
             }
             ?.map { it.name to it.length() }
             ?.sortedByDescending { it.second }

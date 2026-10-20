@@ -33,6 +33,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -67,7 +68,18 @@ fun BrowserDownloadsSheet(
 
     // Terminal entries stop counting toward the badge once the user has
     // actually looked at the panel.
-    LaunchedEffect(Unit) { tabPool.markDownloadsSeen() }
+    //
+    // [dv15-B3] ...and that must hold for as long as the panel is open, not
+    // only at the instant it opens. Before: a one-shot `LaunchedEffect(Unit)`
+    // marked whatever was terminal right then; a download that finished while
+    // the panel was up stayed `seen = false`, so the toolbar badge lit up
+    // behind the open panel and stayed lit after closing it (until the next
+    // open). The effect now re-runs whenever a pass is owed — the decision is
+    // pure and JVM-tested (`pendingDownloadSeenPass`) — and every pass is the
+    // same idempotent `markDownloadsSeen()`, so a list with nothing left to
+    // mark yields an equal list and cannot loop.
+    val needsSeenPass = remember(downloads) { pendingDownloadSeenPass(downloads) }
+    LaunchedEffect(needsSeenPass) { if (needsSeenPass) tabPool.markDownloadsSeen() }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -247,3 +259,20 @@ private fun openDownloadedFile(context: Context, entry: BrowserTabPool.DownloadE
         android.util.Log.w("BrowserDownloads", "open failed: ${e.message}")
     }
 }
+
+/**
+ * [dv15-B3] Does the open panel owe the store a "mark terminal entries seen"
+ * pass for this list?
+ *
+ * True iff some terminal entry is still unseen. Top-level and free of
+ * Compose/Android on purpose: this is the decision that was missing — the
+ * panel used to make exactly one pass, at open time — so it is the part a JVM
+ * test can run for real (`BrowserDownloadsSeenTest`), instead of asserting on
+ * source text.
+ *
+ * In-flight entries are ignored: they are not terminal, `markDownloadsSeen()`
+ * would not touch them, and keying on them would re-run the pass on every
+ * progress byte.
+ */
+internal fun pendingDownloadSeenPass(downloads: List<BrowserTabPool.DownloadEntry>): Boolean =
+    downloads.any { it.state != BrowserTabPool.DownloadState.DOWNLOADING && !it.seen }

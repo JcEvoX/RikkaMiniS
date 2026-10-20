@@ -132,7 +132,12 @@ class ConfigOffloadHandler(private val context: Context) : NativeOffloadHandler 
 
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
         // argv[0] is the program name; subcommand and options follow.
-        val args = OffloadArgs(request.argv.drop(1))
+        // [dv15-A1 A-02] `-f/-p/-s` are this command's declared value-taking
+        // short options (see the `get("filter", "f")` reads below): `-f pinned`
+        // used to parse as the FLAG `f` plus a stray positional `pinned`, so
+        // the filter was silently dropped and the caller got the unfiltered
+        // list with exit 0.
+        val args = OffloadArgs(request.argv.drop(1), valueShortOptions = setOf("f", "p", "s"))
         if (args.hasFlag("h", "help")) {
             return NativeOffloadResult(EXIT_OK, OffloadOutput.formatBody(HELP_TEXT, args) + "\n")
         }

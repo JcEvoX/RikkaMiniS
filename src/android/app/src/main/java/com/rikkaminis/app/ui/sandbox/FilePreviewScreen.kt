@@ -19,6 +19,7 @@ import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -46,6 +47,7 @@ import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Print
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -68,6 +70,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -80,6 +83,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.FileProvider
 import com.rikkaminis.app.browser.SafeWebViewClient
 import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.ui.components.ImageGalleryItem
 import com.rikkaminis.app.ui.components.rememberIosBounceOverscrollEffect
 import com.rikkaminis.app.ui.markdown.MarkdownText
 import com.rikkaminis.app.ui.media.InlineAudioPlayer
@@ -159,12 +163,36 @@ fun FilePreviewScreen(
         // [fix/audit-b17 / T10-L9] collectImageGallery lists the parent
         // directory and stats every sibling — that used to run inside
         // remember{} on the main thread during composition.
-        val galleryState = produceState(
-            initialValue = emptyList<com.rikkaminis.app.ui.components.ImageGalleryItem>() to 0,
+        // [deep-audit-1036 B-01] The initial value used to be an EMPTY list,
+        // which is indistinguishable from "collected, nothing to show": the
+        // first frame rendered ImageGalleryViewer with zero items, and its
+        // defensive empty-items branch (LaunchedEffect { onDismiss() }) closed
+        // the preview before the off-main scan ever landed. `null` = "still
+        // collecting", a distinct state from any loaded result. And a loaded
+        // result is never empty: collectImageGallery falls back to a 1-item
+        // list (just the tapped file) when the parent dir can't be listed, so
+        // the viewer's empty branch stays reachable only for its other
+        // callers, never from this route.
+        val galleryState = produceState<Pair<List<ImageGalleryItem>, Int>?>(
+            initialValue = null,
             item.file.absolutePath,
         ) {
             value = withContext(Dispatchers.IO) { collectImageGallery(item.file) }
         }.value
+        if (galleryState == null) {
+            // Loading placeholder — same full-bleed dark surface as the viewer
+            // itself, so the hand-off does not flash the file browser behind
+            // it. Never handed to the gallery as an empty list.
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black),
+                contentAlignment = Alignment.Center,
+            ) {
+                CircularProgressIndicator(color = Color.White)
+            }
+            return
+        }
         com.rikkaminis.app.ui.components.ImageGalleryViewer(
             items = galleryState.first,
             startIndex = galleryState.second,
