@@ -40,6 +40,62 @@ import java.util.TimeZone
  *   android-calendar freebusy --start <ISO> --end <ISO>
  *   android-calendar calendars                List writable calendars
  */
+// ── [da1034-A4] ISSUE-07: an explicit calendar selector never silently misses ──
+//
+// `--calendar <name>` / `--calendar-id <id>` on a WRITE used to fall back to the
+// auto-pick heuristic whenever the selector matched no writable calendar. Two
+// user-visible outcomes: `create` wrote the event into a calendar the caller
+// never named, and `update` silently MOVED an existing event into the
+// auto-picked calendar (so a typo in a script re-filed the user's events). The
+// mapping from (selector, writable calendars) to an outcome is pure, so it
+// lives here — top-level, not a companion member — and is asserted off-device
+// (CalendarSelectorTest, plus a standalone slice run in the JVM harness).
+//
+// Read paths keep the old tolerance on purpose: `list --calendar NAME` is a
+// FILTER, so "matches nothing" is a legitimate empty answer, not a typo to
+// refuse. Only the write paths consume [CalendarSelection.Unmatched].
+
+/** The parts of a writable calendar that explicit-selector matching needs. */
+internal data class CalendarRef(val id: Long, val displayName: String)
+
+/** Outcome of matching an explicit selector against the writable calendars. */
+internal sealed class CalendarSelection {
+    /** The selector matched this writable calendar. */
+    data class Matched(val id: Long) : CalendarSelection()
+
+    /** The selector was supplied but matched no writable calendar. */
+    object Unmatched : CalendarSelection()
+}
+
+/**
+ * Resolve an explicit `--calendar-id` / `--calendar` selector against [cals].
+ *
+ * `--calendar-id` wins over `--calendar` (the order callers already rely on),
+ * and the name match stays case-insensitive `contains` (apple-calendar
+ * parity). Returns null when NEITHER flag was supplied — the caller then owns
+ * the auto-pick decision, which is what makes an unqualified
+ * `android-calendar create` keep working. A non-null [CalendarSelection]
+ * is a decision the caller must honour: [CalendarSelection.Unmatched] means
+ * refuse, not "pick something for them".
+ */
+internal fun resolveExplicitCalendar(
+    cals: List<CalendarRef>,
+    calendarId: Long?,
+    calendarName: String?,
+): CalendarSelection? {
+    if (calendarId == null && calendarName == null) return null
+    if (calendarId != null) {
+        return if (cals.any { it.id == calendarId }) {
+            CalendarSelection.Matched(calendarId)
+        } else {
+            CalendarSelection.Unmatched
+        }
+    }
+    if (calendarName == null) return null
+    val hit = cals.firstOrNull { it.displayName.contains(calendarName, ignoreCase = true) }
+    return if (hit != null) CalendarSelection.Matched(hit.id) else CalendarSelection.Unmatched
+}
+
 class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandler {
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
         val args = OffloadArgs(request.argv.drop(1), booleanFlags = setOf("today", "all-day"))
@@ -156,6 +212,11 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
             )
         // --limit is the apple-calendar name; --max kept as alias.
         val limit = args.getInt("limit") ?: args.getInt("max") ?: DEFAULT_LIMIT
+        // [da1034-A4] ISSUE-07: `list --calendar NAME` is a FILTER, not a target
+        // selection — "matches nothing" is a legitimate empty answer (below),
+        // so the write paths' new calendar_not_found refusal deliberately does
+        // NOT apply here. Same contains/ignoreCase semantics as the write-side
+        // name match.
         val calFilter = args.get("calendar")
 
         // [sweep1014-B25a] Query CalendarContract.Instances instead of Events:
@@ -301,7 +362,10 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
         val notes = args.get("notes") ?: args.get("description")
         val alarmMinutes = args.getInt("alarm")
 
-        val calendarId = resolveCalendarId(args) ?: return missingCalendarError(args)
+        val calendarId = when (val target = requireCalendarTarget(args)) {
+            is CalendarTarget.Id -> target.value
+            is CalendarTarget.Refused -> return target.result
+        }
 
         val values = ContentValues().apply {
             put(CalendarContract.Events.CALENDAR_ID, calendarId)
@@ -429,10 +493,15 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
             }
         }
         // --calendar / --calendar-id: move event to a different calendar.
-        // resolveCalendarIdOptional lets either flag be absent without falling
-        // back to pickWritableCalendar (which would mean "always move" — not
-        // what update should do).
-        resolveCalendarIdOptional(args)?.let { values.put(CalendarContract.Events.CALENDAR_ID, it) }
+        // optionalCalendarTarget keeps "flag absent ⇒ no move" (a move would
+        // mean "always move" — not what update should do) while refusing an
+        // explicit selector that matches nothing: the old fall-through MOVED
+        // the event into the auto-picked calendar.
+        when (val target = optionalCalendarTarget(args)) {
+            null -> Unit
+            is CalendarTarget.Id -> values.put(CalendarContract.Events.CALENDAR_ID, target.value)
+            is CalendarTarget.Refused -> return target.result
+        }
         val alarmMinutes = args.getInt("alarm")
 
         if (values.size() == 0 && alarmMinutes == null) {
@@ -728,34 +797,86 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
             endRaw = args.get("end"),
         ) { s, nowMs, z -> parseDateInZone(s, nowMs, z) }
 
-    /**
-     * Resolve the target calendar for create: --calendar-id wins, then a
-     * --calendar name lookup (case-insensitive contains, mirrors iOS), then
-     * the auto-pick heuristic. Returns null only when none of these apply
-     * (no writable calendar at all).
-     */
-    private fun resolveCalendarId(args: OffloadArgs): Long? {
-        args.getLong("calendar-id")?.let { return it }
-        args.get("calendar")?.let { name ->
-            val cals = listWritableCalendars()
-            for (i in 0 until cals.length()) {
-                val c = cals.getJSONObject(i)
-                if (c.optString("display_name").contains(name, ignoreCase = true)) {
-                    return c.optLong("id", -1L).takeIf { it > 0 }
-                }
-            }
-            // Named calendar not found → fall through to auto-pick rather than fail
-            // hard, matching apple-calendar's silent fallback.
-            AppLogger.warning(TAG, "--calendar '$name' not matched; falling back to auto-pick")
+    /** Writable calendars as the pure selector matcher sees them. */
+    private fun writableCalendarRefs(cals: JSONArray): List<CalendarRef> {
+        val out = ArrayList<CalendarRef>(cals.length())
+        for (i in 0 until cals.length()) {
+            val c = cals.getJSONObject(i)
+            out.add(CalendarRef(id = c.optLong("id", -1L), displayName = c.optString("display_name")))
         }
-        return pickWritableCalendar()
+        return out
     }
 
-    /** Like [resolveCalendarId] but returns null when no flag was supplied
-     *  at all (used by update so absence of the flag doesn't trigger a move). */
-    private fun resolveCalendarIdOptional(args: OffloadArgs): Long? {
+    /**
+     * [da1034-A4] ISSUE-07: the target calendar for a WRITE. Resolution order
+     * is unchanged — an explicit `--calendar-id`, then a `--calendar` name
+     * (case-insensitive contains), then the auto-pick heuristic when NEITHER
+     * flag was supplied — but an explicit selector that matches nothing now
+     * returns a refusal ([CalendarTarget.Refused]) instead of writing into the
+     * auto-picked calendar. The device having no writable calendar at all keeps
+     * the historical `calendar_no_account` answer.
+     */
+    private fun requireCalendarTarget(args: OffloadArgs): CalendarTarget {
+        val cals = listWritableCalendars()
+        when (val sel = resolveExplicitCalendar(writableCalendarRefs(cals), args.getLong("calendar-id"), args.get("calendar"))) {
+            is CalendarSelection.Matched -> return CalendarTarget.Id(sel.id)
+            is CalendarSelection.Unmatched ->
+                return CalendarTarget.Refused(
+                    if (cals.length() == 0) missingCalendarError(args) else calendarNotFoundError(args, cals),
+                )
+            null -> Unit
+        }
+        val picked = pickWritableCalendar(cals)
+            ?: return CalendarTarget.Refused(missingCalendarError(args))
+        return CalendarTarget.Id(picked)
+    }
+
+    /** [requireCalendarTarget] but null when NEITHER flag was supplied, so
+     *  update keeps its "absence of the flag doesn't move the event" contract.
+     *  An explicit selector that matches nothing still refuses. */
+    private fun optionalCalendarTarget(args: OffloadArgs): CalendarTarget? {
         if (args.get("calendar-id") == null && args.get("calendar") == null) return null
-        return resolveCalendarId(args)
+        return requireCalendarTarget(args)
+    }
+
+    /** Resolution outcome for a write: a calendar id, or a ready-to-send refusal. */
+    private sealed class CalendarTarget {
+        data class Id(val value: Long) : CalendarTarget()
+        data class Refused(val result: NativeOffloadResult) : CalendarTarget()
+    }
+
+    /**
+     * [da1034-A4] ISSUE-07: an explicit `--calendar` / `--calendar-id` that
+     * matches no writable calendar. Refusing (exit 1, structured) is the fix:
+     * the previous fall-through wrote the event into whatever calendar the
+     * auto-pick heuristic preferred. `available` carries the ids the caller
+     * could have meant, so the next call can be correct without a round trip.
+     */
+    private fun calendarNotFoundError(args: OffloadArgs, cals: JSONArray): NativeOffloadResult {
+        val idSel = args.getLong("calendar-id")
+        val nameSel = args.get("calendar")
+        val available = JSONArray()
+        for (i in 0 until cals.length()) {
+            val c = cals.getJSONObject(i)
+            available.put(
+                JSONObject()
+                    .put("id", c.optLong("id", -1L))
+                    .put("display_name", c.optString("display_name"))
+                    .put("account_name", c.optString("account_name")),
+            )
+        }
+        val body = JSONObject()
+            .put("error", "calendar_not_found")
+            .put(
+                "message",
+                "No writable calendar matches " +
+                    (if (idSel != null) "--calendar-id $idSel" else "--calendar '$nameSel'") +
+                    ". Nothing was written — pick an id from `available`, or drop the flag to use the auto-picked calendar. Run `android-calendar calendars` to list them.",
+            )
+            .put("available", available)
+        if (idSel != null) body.put("calendar_id", idSel)
+        if (nameSel != null) body.put("calendar", nameSel)
+        return NativeOffloadResult(1, OffloadOutput.formatBody(body.toString(), args) + "\n")
     }
 
     private fun missingCalendarError(args: OffloadArgs): NativeOffloadResult =
@@ -826,9 +947,11 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
      *   2. Any com.google account
      *   3. Any IS_PRIMARY=1
      *   4. First writable calendar
+     *
+     * Takes the already-enumerated [cals] ([requireCalendarTarget] needs the
+     * same list for its refusal payload), so a write performs one enumeration.
      */
-    private fun pickWritableCalendar(): Long? {
-        val cals = listWritableCalendars()
+    private fun pickWritableCalendar(cals: JSONArray): Long? {
         if (cals.length() == 0) return null
         fun score(obj: JSONObject): Int {
             var s = 0

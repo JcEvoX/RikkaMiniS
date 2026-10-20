@@ -83,7 +83,12 @@ class NotificationOffloadHandler(private val context: Context) : NativeOffloadHa
                 "send", "schedule" -> handleSend(args)
                 "clear" -> {
                     nm.cancelAll()
-                    NativeOffloadResult(0, OffloadOutput.formatBody("All notifications cleared.", args) + "\n")
+                    // [da1034-A4] ISSUE-08: JSON payload, not the sentence
+                    // `All notifications cleared.` (which formatBody passed
+                    // through untouched). `cleared: "all"` mirrors the sibling
+                    // `cancel --all` payload (`cancelled: "all"`).
+                    val data = JSONObject().put("cleared", "all")
+                    NativeOffloadResult(0, OffloadOutput.formatBody(data.toString(2), args) + "\n")
                 }
                 "list" -> handleList(args)
                 "pending" -> handlePending(args)

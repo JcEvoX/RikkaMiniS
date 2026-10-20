@@ -62,6 +62,23 @@ handler that forgot to declare its own):
      arrives at the call site as a variable: N1 (first argument) and N2
      (`return <literal>`).
 
+[da1034-A4] addition (ISSUE-08 — the same payload contract, in the rest of
+   the offload surface; and N2 is now scoped to the *helper*):
+
+  8. The payload-file list grows from two handlers to eight: `near`'s defect
+     was not unique to Photos. Location's `geocode` printed an English
+     sentence on an empty geocode (exit 0) and bare address lines otherwise —
+     a top-level type that flipped with the result; its uncaught handler, the
+     notification/clipboard success messages, Open's `Opened: <url>` and
+     Fastio's `usage()` all handed prose to `formatBody`. Every one of them
+     must now carry JSON.
+  9. N2 judges the *helper*, not the whole file: a `return <literal>` only
+     counts when the function is the one whose result reaches `formatBody`
+     (`formatBody(nearPhotos(…))`). The whole-file reading demanded ten
+     rewrites of `FastioOffloadHandler`'s reason-code pairs
+     (`return "not_found" to "…"`), which are not payloads — a rule that
+     judges spelling instead of the defect. N1 stays whole-file.
+
 Comment-aware: judgements run on code-only text, so a comment quoting a
 forbidden pattern cannot satisfy the gate (and deleting a pinned line cannot
 be masked by prose).
@@ -83,6 +100,21 @@ FASTIO = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/Fasti
 OUTPUT = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/OffloadOutput.kt"
 SPEAK = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/SpeakOffloadHandler.kt"
 PHOTOS = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/PhotosOffloadHandler.kt"
+
+# [da1034-A4] ISSUE-08: every handler that ships a `formatBody` payload. Kept
+# explicit rather than a glob over the offload dir: a glob would also drag in
+# the exit-2 `"…\n$HELP"` strings (Shizuku, ModelUse …) that deliberately never
+# touch formatBody, and `payload_findings` would flag them.
+PAYLOAD_FILES = [
+    PHOTOS,
+    CONTACTS,
+    "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/CalendarOffloadHandler.kt",
+    "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/LocationOffloadHandler.kt",
+    "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/NotificationOffloadHandler.kt",
+    "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ClipboardOffloadHandler.kt",
+    "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/OpenOffloadHandler.kt",
+    FASTIO,
+]
 
 # (id, kind, needle) — kind: "req" exact substring / "forbid" exact substring /
 # "req_re" / "forbid_re" required-or-forbidden regex / "count_re" (needle = (re, n))
@@ -379,13 +411,20 @@ def describe(findings) -> str:
 # `"""{"error":…}"""` form, or a template with an interpolated object).
 #
 # Two sites, because the defect has two spellings:
-#   N1 — the first argument of every `formatBody(` call in the two files.
-#   N2 — every `return <literal>` in the two files: the Photos payload is
-#        produced by the String-returning `nearPhotos`, so at the call site it
-#        is just a variable — N1 alone would be blind to it (this gate exists
-#        because the *review* proposed N1 only).
+#   N1 — the first argument of every `formatBody(` call in the payload files.
+#   N2 — every `return <literal>` inside a *payload helper*: a function whose
+#        result is the first argument of a `formatBody(` call (the Photos
+#        payload is produced by the String-returning `nearPhotos`, so at the
+#        call site it is just a variable — N1 alone would be blind to it; this
+#        gate exists because the *review* proposed N1 only).
 #
-# Letter N is free: C / K / B / F / O / S / D / J are the other arms.
+# [da1034-A4] ISSUE-08 widened the file list to every handler that ships a
+# formatBody payload, and that is what forced N2's scope to be the *helper*
+# rather than the whole file: `FastioOffloadHandler` returns bare literals from
+# ten non-payload helpers (`return "not_found" to "…"` — a reason-code Pair that
+# later becomes the JSON envelope, not a payload), so the whole-file reading
+# demanded ten rewrites of working code. N2 now judges the defect (a literal
+# that reaches formatBody) instead of the spelling (any literal return).
 _STR_LIT_RE = re.compile(r'"(?:[^"\\\n]|\\.)*"')
 _RAW_LIT_RE = re.compile(r'"""(?:[^"]|"(?!""))*"""')
 
@@ -443,6 +482,50 @@ def _is_json_literal(lit: str) -> bool:
     return "{" in core or "[" in core
 
 
+def _payload_helper_bodies(code: str, name: str):
+    """Body text of `fun <name>(…)`, or None (declared elsewhere / expression
+    body — an expression body has no `return` statement to judge)."""
+    m = re.search(r"\bfun\s+(?:<[^>]*>\s*)?(?:[\w.]+\.)?" + re.escape(name) + r"\s*\(", code)
+    if not m:
+        return None
+    i, depth = m.end() - 1, 0
+    while i < len(code):
+        if code[i] == "(":
+            depth += 1
+        elif code[i] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    j = code.find("{", i)
+    if j < 0:
+        return None
+    # An expression body (`fun f(...): T = expr`) has no `return` statement to
+    # judge — and the next `{` after its parameter list belongs to a LATER
+    # function, so without this the rule would read the neighbour's body and
+    # mislabel its findings as this function's.
+    eq = code.find("=", i)
+    if 0 <= eq < j:
+        return None
+    depth, k = 0, j
+    while k < len(code):
+        if code[k] == "{":
+            depth += 1
+        elif code[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return code[j:k + 1]
+        k += 1
+    return None
+
+
+def _payload_helper_names(code: str) -> list:
+    """Names of the functions whose result is fed to `formatBody(` — the N2
+    scope. Sorted so fixture output is stable."""
+    names = {m.group(1) for m in re.finditer(r"formatBody\(\s*([A-Za-z_]\w*)\s*\(", code)}
+    return sorted(names)
+
+
 def payload_findings(label: str, src: str) -> list:
     """N1 / N2 for one payload file (code-only text, comments stripped)."""
     findings = []
@@ -458,19 +541,30 @@ def payload_findings(label: str, src: str) -> list:
             findings.append(("N1", "unreadable literal", label))
         elif not _is_json_literal(lit):
             findings.append(("N1", "bare non-JSON payload literal", label + ": " + lit[:70]))
-    for m in re.finditer(r"\breturn\s+(?=\")", code):
-        lit = _literal_at(code, m.end())
-        if lit is None:
-            findings.append(("N2", "unreadable literal", label))
-        elif not _is_json_literal(lit):
-            findings.append(("N2", "bare non-JSON payload return", label + ": " + lit[:70]))
+    for name in _payload_helper_names(code):
+        body = _payload_helper_bodies(code, name)
+        if body is None:
+            continue
+        for m in re.finditer(r"\breturn\s+(?=\")", body):
+            lit = _literal_at(body, m.end())
+            if lit is None:
+                findings.append(("N2", "unreadable literal", f"{label}: {name}()"))
+            elif not _is_json_literal(lit):
+                findings.append(
+                    ("N2", "bare non-JSON payload return", f"{label}: {name}() " + lit[:70]))
     return findings
 
 
-def check_offload_json(photos_src: str, contacts_src: str) -> list:
-    """[da1033-D] ISSUE-04 rules for the two payload files, comment-aware."""
-    return (payload_findings("PhotosOffloadHandler.kt", photos_src)
-            + payload_findings("ContactsOffloadHandler.kt", contacts_src))
+def check_offload_json(*files) -> list:
+    """[da1033-D] ISSUE-04 + [da1034-A4] ISSUE-08 rules for the payload files.
+
+    [files] is (label, source) pairs; every one of them gets N1, and N2 where a
+    payload helper exists.
+    """
+    out = []
+    for label, src in files:
+        out += payload_findings(label, src)
+    return out
 
 
 # ── selftest: every rule must have a tooth, and the green arm must pass ──────
@@ -825,6 +919,102 @@ GREEN_PAYLOAD_CONTACTS = r"""
     }
 """.replace("@Q3@", '"' * 3)
 
+# [da1034-A4] ISSUE-08 — the six files the rule set grew to cover. One green
+# fixture per shape family so every new arm has a clean control next to it.
+GREEN_PAYLOAD_LOCATION = r"""
+    private fun handle(request: NativeOffloadRequest): NativeOffloadResult {
+        return try {
+            when (val sub = request.argv.getOrNull(1)) {
+                "current" -> current(args)
+                else -> NativeOffloadResult(2, OffloadOutput.formatBody(
+                    JSONObject().put("error", "usage").toString(), args) + "\n")
+            }
+        } catch (e: Throwable) {
+            // A prose payload quoted in a comment must not trip the gate:
+            // formatBody("android-location: ${e.message ?: "unknown error"}", args)
+            val body = JSONObject()
+                .put("error", "uncaught")
+                .put("message", e.message ?: "unknown error")
+                .toString()
+            NativeOffloadResult(1, OffloadOutput.formatBody(body, args) + "\n")
+        }
+    }
+
+    private fun reverseGeocodeJson(lat: Double, lon: Double, lines: List<String>): JSONObject {
+        val arr = JSONArray()
+        lines.forEach { arr.put(it) }
+        return JSONObject()
+            .put("latitude", lat)
+            .put("longitude", lon)
+            .put("address", lines.joinToString(", "))
+            .put("count", lines.size)
+    }
+
+    private fun geocode(lat: Double, lon: Double, args: OffloadArgs): NativeOffloadResult {
+        val lines = listOf<String>()
+        return NativeOffloadResult(
+            0,
+            OffloadOutput.formatBody(reverseGeocodeJson(lat, lon, lines).toString(2), args) + "\n",
+        )
+    }
+"""
+
+GREEN_PAYLOAD_SIDE_EFFECTS = r"""
+    private fun doSet(cm: ClipboardManager, args: OffloadArgs): NativeOffloadResult {
+        val label = args.get("label") ?: "RikkaMinis"
+        val setData = JSONObject()
+            .put("copied", true)
+            .put("characters", 5)
+            .put("label", label)
+        return NativeOffloadResult(0, OffloadOutput.formatBody(setData.toString(2), args) + "\n")
+    }
+
+    private fun doClear(cm: ClipboardManager, args: OffloadArgs): NativeOffloadResult {
+        // formatBody("Clipboard cleared.", args) — a comment, not a payload
+        val clearData = JSONObject().put("cleared", true)
+        return NativeOffloadResult(0, OffloadOutput.formatBody(clearData.toString(2), args) + "\n")
+    }
+
+    private fun openUrl(url: String, args: OffloadArgs): NativeOffloadResult {
+        val openData = JSONObject().put("opened", true).put("url", url)
+        return NativeOffloadResult(0, OffloadOutput.formatBody(openData.toString(2), args) + "\n")
+    }
+
+    private fun clearAll(nm: NotificationManager, args: OffloadArgs): NativeOffloadResult {
+        val notifyData = JSONObject().put("cleared", "all")
+        return NativeOffloadResult(0, OffloadOutput.formatBody(notifyData.toString(2), args) + "\n")
+    }
+"""
+
+GREEN_PAYLOAD_CALENDAR = r"""
+    private fun doList(cals: List<CalendarRef>, args: OffloadArgs): NativeOffloadResult {
+        val events = JSONArray()
+        val data = JSONObject()
+            .put("events", events)
+            .put("count", events.length())
+        // A prose payload quoted in a comment must not trip the gate:
+        // formatBody("android-calendar: no writable calendar", args)
+        return NativeOffloadResult(0, OffloadOutput.formatBody(data.toString(2), args) + "\n")
+    }
+"""
+
+GREEN_PAYLOAD_FASTIO_USAGE = r"""
+    private fun usage(reason: String, args: OffloadArgs): String =
+        OffloadOutput.formatBody(usageText(reason), args) + "\n"
+
+    private fun usageText(reason: String): String = JSONObject()
+        .put("error", "usage")
+        .put("message", reason)
+        .put("help", HELP)
+        .toString()
+
+    private fun banner(reason: String): String {
+        // Not a formatBody argument ⇒ N2 must NOT judge it (precision control
+        // for the scope narrowing).
+        return "minis-fastio: " + reason
+    }
+"""
+
 def selftest() -> int:
     # Each case mutates ONE arm and names the rules it must trip. The expected
     # sets are written by hand from the rule table (never derived from a run:
@@ -1163,7 +1353,93 @@ def selftest() -> int:
             print(f"SELFTEST-FAIL: {label}: mutation did not apply to any arm")
             failures += 1
             continue
-        got = {rid for rid, _, _ in check_offload_json(photos_src, contacts_src)}
+        got = {rid for rid, _, _ in check_offload_json(
+            ("PhotosOffloadHandler.kt", photos_src),
+            ("ContactsOffloadHandler.kt", contacts_src))}
+        if got != want:
+            print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
+            failures += 1
+    # [da1034-A4] ISSUE-08 — the rule set grew from 2 files to 8, so the arms
+    # below are the teeth for the six newly covered ones. One mutation per
+    # spelling the real tree shipped (the bare sentence at the call site, the
+    # sentence behind an interpolation, the prose return of a payload helper)
+    # and one per file, each against its own green control above.
+    red_cases_payload_a4 = [
+        ("the location uncaught branch reverts to the sentence",
+         GREEN_PAYLOAD_LOCATION.replace(
+             "OffloadOutput.formatBody(body, args)",
+             'OffloadOutput.formatBody("android-location: unknown error", args)'),
+         {"N1"}),
+        ("the reverse geocode reverts to the English sentence",
+         GREEN_PAYLOAD_LOCATION.replace(
+             "OffloadOutput.formatBody(reverseGeocodeJson(lat, lon, lines).toString(2), args)",
+             'OffloadOutput.formatBody("No address found for ($lat, $lon).", args)'),
+         {"N1"}),
+        ("the reverse geocode helper returns prose",
+         GREEN_PAYLOAD_LOCATION.replace('return JSONObject()\n            .put("latitude", lat)',
+                                        'return "No address found for ($lat, $lon)."\n        // .put("latitude", lat)'),
+         {"N2"}),
+        ("the expression-built address lines are left alone (rule boundary)",
+         GREEN_PAYLOAD_LOCATION.replace(
+             "OffloadOutput.formatBody(reverseGeocodeJson(lat, lon, lines).toString(2), args)",
+             'OffloadOutput.formatBody(lines.joinToString("\\n"), args)'),
+         set()),
+        ("the calendar list payload reverts to the prose sentence",
+         GREEN_PAYLOAD_CALENDAR.replace(
+             "OffloadOutput.formatBody(data.toString(2), args)",
+             'OffloadOutput.formatBody("android-calendar: no writable calendar", args)'),
+         {"N1"}),
+        ("the clipboard set reverts to the prose sentence",
+         GREEN_PAYLOAD_SIDE_EFFECTS.replace(
+             "OffloadOutput.formatBody(setData.toString(2), args)",
+             'OffloadOutput.formatBody("Copied 5 characters to clipboard.", args)'),
+         {"N1"}),
+        ("the clipboard clear reverts to the prose sentence",
+         GREEN_PAYLOAD_SIDE_EFFECTS.replace(
+             "OffloadOutput.formatBody(clearData.toString(2), args)",
+             'OffloadOutput.formatBody("Clipboard cleared.", args)'),
+         {"N1"}),
+        ("the open success reverts to the Opened: sentence",
+         GREEN_PAYLOAD_SIDE_EFFECTS.replace(
+             "OffloadOutput.formatBody(openData.toString(2), args)",
+             'OffloadOutput.formatBody("Opened: $url", args)'),
+         {"N1"}),
+        ("the notification clear reverts to the prose sentence",
+         GREEN_PAYLOAD_SIDE_EFFECTS.replace(
+             "OffloadOutput.formatBody(notifyData.toString(2), args)",
+             'OffloadOutput.formatBody("All notifications cleared.", args)'),
+         {"N1"}),
+        ("a non-payload helper is handed to formatBody and its prose return is caught",
+         GREEN_PAYLOAD_SIDE_EFFECTS.replace(
+             "OffloadOutput.formatBody(openData.toString(2), args)",
+             "OffloadOutput.formatBody(localSummary(), args)").replace(
+             "    private fun openUrl",
+             '    private fun localSummary(): String {\n'
+             '        return "clipboard: ok"\n'
+             '    }\n\n'
+             "    private fun openUrl"),
+         {"N2"}),
+        ("the fastio usage reverts to the inline prose payload",
+         GREEN_PAYLOAD_FASTIO_USAGE.replace(
+             "OffloadOutput.formatBody(usageText(reason), args)",
+             'OffloadOutput.formatBody("minis-fastio: " + reason + "\\n" + HELP, args)'),
+         {"N1"}),
+        ("the usage payload helper reverts to a prose return",
+         GREEN_PAYLOAD_FASTIO_USAGE.replace(
+             "    private fun usageText(reason: String): String = JSONObject()\n",
+             '    private fun usageText(reason: String): String {\n'
+             '        return "minis-fastio: " + reason\n'
+             '    }\n\n'
+             '    private fun unusedText(reason: String): String = JSONObject()\n'),
+         {"N2"}),
+    ]
+    for label, src, want in red_cases_payload_a4:
+        if src in (GREEN_PAYLOAD_LOCATION, GREEN_PAYLOAD_SIDE_EFFECTS,
+                   GREEN_PAYLOAD_FASTIO_USAGE, GREEN_PAYLOAD_CALENDAR):
+            print(f"SELFTEST-FAIL: {label}: mutation did not apply to any arm")
+            failures += 1
+            continue
+        got = {rid for rid, _, _ in check_offload_json(("fixture.kt", src))}
         if got != want:
             print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
             failures += 1
@@ -1172,7 +1448,16 @@ def selftest() -> int:
     clean_flags = check_flag_set(GREEN_OUTPUT, GREEN_SPEAK)
     clean_debug = check_debug(GREEN_DEBUG)
     clean_sessions = check_sessions(GREEN_SESSIONS)
-    clean_payload = check_offload_json(GREEN_PAYLOAD_PHOTOS, GREEN_PAYLOAD_CONTACTS)
+    clean_payload = check_offload_json(
+        ("PhotosOffloadHandler.kt", GREEN_PAYLOAD_PHOTOS),
+        ("ContactsOffloadHandler.kt", GREEN_PAYLOAD_CONTACTS),
+        ("CalendarOffloadHandler.kt", GREEN_PAYLOAD_CALENDAR),
+        ("LocationOffloadHandler.kt", GREEN_PAYLOAD_LOCATION),
+        ("ClipboardOffloadHandler.kt", GREEN_PAYLOAD_SIDE_EFFECTS),
+        ("NotificationOffloadHandler.kt", GREEN_PAYLOAD_SIDE_EFFECTS),
+        ("OpenOffloadHandler.kt", GREEN_PAYLOAD_SIDE_EFFECTS),
+        ("FastioOffloadHandler.kt", GREEN_PAYLOAD_FASTIO_USAGE),
+    )
     if clean or clean_flags or clean_debug or clean_sessions or clean_payload:
         print(f"SELFTEST-FAIL: green fixtures must produce no findings, "
               f"got {describe(clean + clean_flags + clean_debug + clean_sessions + clean_payload)}")
@@ -1205,14 +1490,20 @@ def main(argv):
     speak_path = root / SPEAK
     debug_path = root / DEBUG_HANDLER
     sessions_path = root / SESSIONS
-    photos_path = root / PHOTOS
     if not contacts_path.is_file() or not config_path.is_file() \
             or not browseruse_path.is_file() or not fastio_path.is_file() \
             or not output_path.is_file() or not speak_path.is_file() \
-            or not debug_path.is_file() or not sessions_path.is_file() \
-            or not photos_path.is_file():
+            or not debug_path.is_file() or not sessions_path.is_file():
         print(f"GATE-FAIL: handler source not found under {root}")
         return 1
+    # fail-closed: a payload file that moves (or is renamed) must be a red
+    # gate, not a silently narrower rule set.
+    payload_files = []
+    for rel in PAYLOAD_FILES:
+        if not (root / rel).is_file():
+            print(f"GATE-FAIL: payload source not found: {rel} under {root}")
+            return 1
+        payload_files.append((rel, (root / rel).read_text(encoding="utf-8")))
     findings = check_text(contacts_path.read_text(encoding="utf-8"),
                           config_path.read_text(encoding="utf-8"),
                           browseruse_path.read_text(encoding="utf-8"),
@@ -1221,8 +1512,7 @@ def main(argv):
                                speak_path.read_text(encoding="utf-8"))
     findings += check_debug(debug_path.read_text(encoding="utf-8"))
     findings += check_sessions(sessions_path.read_text(encoding="utf-8"))
-    findings += check_offload_json(photos_path.read_text(encoding="utf-8"),
-                                   contacts_path.read_text(encoding="utf-8"))
+    findings += check_offload_json(*payload_files)
     if findings:
         print("offload_cli_args_check: FAIL")
         print(describe(findings))
@@ -1232,7 +1522,7 @@ def main(argv):
           "OUTPUT_FLAGS covers help/h, speak declares stop/status, "
           "sessions date bounds funneled + refuse invalid, "
           "debug pass-through argv verbatim + global-only output shaping, "
-          "photos/contacts payloads are JSON)")
+          "8/8 payload files hand formatBody JSON (N1 whole-file, N2 payload helpers))")
     return 0
 
 

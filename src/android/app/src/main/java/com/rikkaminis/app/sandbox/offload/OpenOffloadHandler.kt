@@ -90,7 +90,10 @@ class OpenOffloadHandler(private val context: Context) : NativeOffloadHandler {
             val resolved = intent.resolveActivity(context.packageManager)
             Log.d(TAG, "startActivity url='$url' action=${intent.action} resolved=${resolved?.flattenToShortString()}")
             context.startActivity(intent)
-            NativeOffloadResult(0, OffloadOutput.formatBody("Opened: $url", args) + "\n")
+            // [da1034-A4] ISSUE-08: JSON payload, not `Opened: <url>`. Sibling
+            // error branches already carry `url`, so the success payload does too.
+            val data = JSONObject().put("opened", true).put("url", url)
+            NativeOffloadResult(0, OffloadOutput.formatBody(data.toString(2), args) + "\n")
         } catch (e: ActivityNotFoundException) {
             Log.w(TAG, "no handler for '$url'")
             maybeFallback(url, e, args)
