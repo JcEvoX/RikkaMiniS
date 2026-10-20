@@ -262,7 +262,7 @@ class ModelUseEnvelopeDialectTest {
             val f = File(probe, relative)
             if (f.exists()) return f.readText()
         }
-        var dir: File? = File(System.getProperty("user.dir"))
+        var dir: File? = System.getProperty("user.dir")?.let { File(it) }
         while (dir != null) {
             val f = File(dir, relative)
             if (f.exists()) return f.readText()
