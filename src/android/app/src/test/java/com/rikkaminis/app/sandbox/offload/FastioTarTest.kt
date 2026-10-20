@@ -7,6 +7,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.InputStream
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
@@ -669,6 +670,136 @@ class FastioTarTest {
 
         assertTrue(out.truncated)
         assertEquals(3L, out.visited)
+    }
+
+    // ── dv14-A2: a member that dies mid-copy must not corrupt the archive ───
+
+    @Test
+    fun `an entry whose read dies immediately still fills its declared payload`() {
+        val root = Files.createTempDirectory("fastio-tar-readfail")
+        // A directory: Files.size succeeds (so the header can be written — the
+        // declared size is the directory's own), while the read fails at once
+        // with "Is a directory". This is the narrow window where a header used
+        // to go out with nothing behind it: the old code recorded the error and
+        // returned with only the 512-byte header in the stream.
+        val notAFile = Files.createDirectory(root.resolve("dir-entry"))
+        val declared = Files.size(notAFile)
+
+        val sink = ByteArrayOutputStream()
+        val out = TarCreateOutcome()
+        writeRegular(sink, "dir-entry", notAFile, out)
+
+        assertEquals(1, out.errors.size)
+        assertEquals(0L, out.files)
+        assertEquals(0L, out.bytes)
+        // header + the whole declared payload (all zeros) + padding, so the
+        // next member still starts on a block boundary.
+        assertEquals((512 + declared + pad(declared)).toInt(), sink.size())
+        val bytes = sink.toByteArray()
+        for (i in 512 until (512 + declared).toInt()) {
+            assertEquals("byte $i of the declared payload", 0, bytes[i].toInt())
+        }
+        for (i in (512 + declared).toInt() until bytes.size) {
+            assertEquals("pad byte $i", 0, bytes[i].toInt())
+        }
+    }
+
+    @Test
+    fun `a member whose stream shrinks mid-copy is zero-filled to its declared size`() {
+        val root = Files.createTempDirectory("fastio-tar-shrank")
+        val big = root.resolve("big.bin")
+        Files.write(big, ByteArray(1000) { 'A'.code.toByte() })
+
+        val sink = ByteArrayOutputStream()
+        val out = TarCreateOutcome()
+        // The file on disk really is 1000 bytes (that is what the header
+        // declares), but the stream hands over 5 and then reports EOF — a file
+        // truncated while the archive was being written.
+        writeRegular(sink, "big.bin", big, out, fiveBytesThenEof())
+
+        assertEquals(1, out.errors.size)
+        assertTrue(out.errors[0], out.errors[0].contains("file shrank"))
+        // The member is not counted as archived, but the stream stays whole.
+        assertEquals(0L, out.files)
+        assertEquals(0L, out.bytes)
+
+        val bytes = sink.toByteArray()
+        // header(512) + 5 real bytes + 995 zero bytes + 24 padding = 1536.
+        assertEquals(1536, bytes.size)
+        for (i in 0 until 5) assertEquals("byte $i", 'A'.code, bytes[512 + i].toInt())
+        for (i in 5 until 1000) assertEquals("byte $i must be the zero fill", 0, bytes[512 + i].toInt())
+        for (i in 1000 until 1024) assertEquals("pad byte $i", 0, bytes[512 + i].toInt())
+    }
+
+    @Test
+    fun `a member whose stream throws mid-copy stays aligned and the next member extracts`() {
+        val root = Files.createTempDirectory("fastio-tar-threw")
+        val big = root.resolve("big.bin")
+        Files.write(big, ByteArray(1000) { 'A'.code.toByte() })
+        val after = root.resolve("after.txt")
+        Files.write(after, "tail".toByteArray())
+
+        val sink = ByteArrayOutputStream()
+        val out = TarCreateOutcome()
+        writeRegular(sink, "big.bin", big, out, fiveBytesThenThrow())
+        writeRegular(sink, "after.txt", after, out)
+        sink.write(ByteArray(1024)) // the two end blocks a complete archive has
+
+        assertEquals(1, out.errors.size)
+        assertTrue(out.errors[0], out.errors[0].contains("disk on fire"))
+        assertEquals(1L, out.files) // only after.txt really landed
+        assertEquals(4L, out.bytes)
+
+        val bytes = sink.toByteArray()
+        // 1536 (padded shrank member) + 512 + 4 + 508 + 1024 (end blocks).
+        assertEquals(3584, bytes.size)
+
+        val members = readMembers(bytes)
+        assertEquals(listOf("big.bin", "after.txt"), members.map { it.name })
+        assertEquals(listOf(1000L, 4L), members.map { it.size })
+
+        val dest = root.resolve("out")
+        val validation = TarExtractOutcome()
+        assertTrue(
+            "engine's own archive must still validate: ${validation.errors}",
+            tarValidate(ByteArrayInputStream(bytes), dest, 1000L, validation),
+        )
+
+        val extracted = TarExtractOutcome()
+        tarExtract(ByteArrayInputStream(bytes), dest, false, 1000L, extracted)
+        assertTrue("errors: ${extracted.errors}", extracted.errors.isEmpty())
+        assertEquals("tail", Files.readAllBytes(dest.resolve("after.txt")).decodeToString())
+
+        val padded = Files.readAllBytes(dest.resolve("big.bin"))
+        assertEquals(1000, padded.size)
+        for (i in 0 until 5) assertEquals('A'.code.toByte(), padded[i])
+        for (i in 5 until 1000) assertEquals("byte $i of the extracted member", 0, padded[i].toInt())
+    }
+
+    /** Hand over 5 bytes and then report EOF, like a file truncated mid-read. */
+    private fun fiveBytesThenEof(): InputStream = object : InputStream() {
+        private var served = 0
+        override fun read(): Int = throw UnsupportedOperationException()
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (served >= 5) return -1
+            val n = minOf(len, 5 - served)
+            b.fill('A'.code.toByte(), off, off + n)
+            served += n
+            return n
+        }
+    }
+
+    /** Hand over 5 bytes and then fail with an IOException, like a dying disk. */
+    private fun fiveBytesThenThrow(): InputStream = object : InputStream() {
+        private var served = 0
+        override fun read(): Int = throw UnsupportedOperationException()
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (served >= 5) throw java.io.IOException("disk on fire")
+            val n = minOf(len, 5 - served)
+            b.fill('A'.code.toByte(), off, off + n)
+            served += n
+            return n
+        }
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────
