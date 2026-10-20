@@ -100,9 +100,33 @@ class OffloadPayloadJsonShapeTest {
 
     // ── helpers ───────────────────────────────────────────────────────────
 
-    /** Comments out, so an assertion never judges the explanation. */
-    private fun codeOnly(src: String): String =
-        Regex("""//[^\n]*|/\*(?:.|\n)*?\*/""").replace(src, "")
+    /**
+     * Comments out, so an assertion never judges the explanation.
+     *
+     * Hand-written linear scan on purpose: the regex form (a line-comment
+     * alternative plus a lazy block-comment match) recurses once per character
+     * of a block comment, so on the 64 KB FastioOffloadHandler it blew the JVM
+     * stack (StackOverflowError in Pattern$LazyLoop) — measured on CI, where
+     * the test JVM's stack is smaller than the one this fix was written on.
+     */
+    private fun codeOnly(src: String): String {
+        val out = StringBuilder(src.length)
+        var i = 0
+        while (i < src.length) {
+            val c = src[i]
+            if (c == '/' && i + 1 < src.length && src[i + 1] == '/') {
+                while (i < src.length && src[i] != '\n') i++
+            } else if (c == '/' && i + 1 < src.length && src[i + 1] == '*') {
+                i += 2
+                while (i + 1 < src.length && !(src[i] == '*' && src[i + 1] == '/')) i++
+                i = if (i + 2 > src.length) src.length else i + 2
+            } else {
+                out.append(c)
+                i++
+            }
+        }
+        return out.toString()
+    }
 
     private fun read(name: String): String {
         val f = File(repoRoot(), "$offload/$name")
@@ -125,8 +149,8 @@ class OffloadPayloadJsonShapeTest {
         val lines = src.lines()
         val start = lines.indexOfFirst { it.contains(marker) }
         assertTrue("marker not found: $marker", start >= 0)
-        val end = (start + 1 until lines.size).firstOrNull { i ->
-            val t = lines[i]
+        val end = (start + 1 until lines.size).firstOrNull { idx ->
+            val t = lines[idx]
             val indent = t.length - t.trimStart(' ').length
             indent in 1..4 && t.trim().isNotEmpty() && !t.trim().startsWith("//") &&
                 !t.trim().startsWith("*") &&
