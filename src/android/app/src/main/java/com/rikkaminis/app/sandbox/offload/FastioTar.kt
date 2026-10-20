@@ -141,28 +141,67 @@ internal fun tarCreate(
     sink.flush()
 }
 
-private fun writeRegular(sink: OutputStream, name: String, file: Path, out: TarCreateOutcome) {
+internal fun writeRegular(
+    sink: OutputStream,
+    name: String,
+    file: Path,
+    out: TarCreateOutcome,
+    input: InputStream? = null,
+) {
     val size = try {
         Files.size(file)
     } catch (e: Exception) {
         out.errors.add("$name: ${e.message}")
         return
     }
-    writeHeader(sink, header(name, '0', size, modeOf(file), mtimeOf(file), ""))
-    out.visited++
-    try {
-        Files.newInputStream(file).use { input -> copy(input, sink, size) }
+    // Open BEFORE the header goes out: an entry that cannot be read leaves the
+    // stream untouched (same order as writeLink). Writing the header first
+    // would declare a payload the stream never receives — every later member
+    // and the end blocks would be swallowed as this entry's data, and the
+    // whole archive after it is garbage to a real reader. [input] is a test
+    // seam: production callers open the real file here.
+    val stream = input ?: try {
+        Files.newInputStream(file)
     } catch (e: Exception) {
         out.errors.add("$name: ${e.message}")
         return
     }
-    // Every member's payload is padded to a 512-byte boundary — without this
-    // the next header starts mid-block and the whole archive after it is
-    // garbage to a real reader (and to ours).
-    val pad = ((BLOCK_SIZE - (size % BLOCK_SIZE)) % BLOCK_SIZE).toInt()
-    if (pad > 0) sink.write(ByteArray(pad))
-    out.files++
-    out.bytes += size
+    stream.use {
+        writeHeader(sink, header(name, '0', size, modeOf(file), mtimeOf(file), ""))
+        out.visited++
+        // Count what actually reaches the sink, so a mid-copy failure can be
+        // padded back to the declared size instead of desyncing the stream.
+        var written = 0L
+        val counted = object : OutputStream() {
+            override fun write(b: Int) {
+                sink.write(b)
+                written += 1
+            }
+
+            override fun write(b: ByteArray, off: Int, len: Int) {
+                sink.write(b, off, len)
+                written += len
+            }
+        }
+        try {
+            copy(stream, counted, size)
+        } catch (e: Exception) {
+            out.errors.add("$name: ${e.message}")
+            // The header already declared `size` bytes: zero-fill the short
+            // payload and restore the 512-byte boundary (GNU tar's "file
+            // shrank, padding with zeros" contract), or every later member is
+            // garbage. The fill is guarded so a sink that is itself failing
+            // (disk full) cannot mask the read error — the actual finding.
+            runCatching {
+                writeZeros(sink, size - written)
+                writeZeros(sink, boundaryPad(size).toLong())
+            }
+            return
+        }
+        writeZeros(sink, boundaryPad(size).toLong())
+        out.files++
+        out.bytes += size
+    }
 }
 
 private fun writeLink(sink: OutputStream, name: String, file: Path, out: TarCreateOutcome) {
@@ -961,6 +1000,22 @@ private fun copy(input: InputStream, sink: OutputStream, size: Long) {
         left -= read
     }
 }
+
+/** Zero-fill [count] bytes in COPY_BUFFER chunks — never one huge allocation. */
+private fun writeZeros(sink: OutputStream, count: Long) {
+    if (count <= 0) return
+    val chunk = ByteArray(minOf(count, COPY_BUFFER.toLong()).toInt())
+    var left = count
+    while (left > 0) {
+        val n = minOf(left, chunk.size.toLong()).toInt()
+        sink.write(chunk, 0, n)
+        left -= n
+    }
+}
+
+/** Bytes of padding that take a payload of [size] to the 512-byte boundary. */
+private fun boundaryPad(size: Long): Int =
+    ((BLOCK_SIZE - (size % BLOCK_SIZE)) % BLOCK_SIZE).toInt()
 
 // ── constants ───────────────────────────────────────────────────────────────
 

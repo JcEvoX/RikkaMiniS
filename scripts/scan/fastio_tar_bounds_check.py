@@ -92,6 +92,71 @@ def check_handler(src):
     return v
 
 
+# ── [dv14-A2] writeRegular: open-before-header + short-payload refill ───────
+#
+# The header declares `size` bytes of payload. Two consequences:
+#   1. If the entry cannot be OPENED, no header may be written — writeLink's
+#      order (fail the read, then write the header). Writing the header first
+#      declares a payload the stream never receives, and every later member
+#      and the end blocks are swallowed as this entry's data.
+#   2. If the copy dies MID-WAY, the short payload must be zero-filled back to
+#      the declared `size` and the 512-byte boundary restored (GNU tar's
+#      "file shrank, padding with zeros" contract), and the failure must still
+#      land in out.errors — a truncated archive must not exit 0.
+# The refill is guarded (runCatching): a sink that is itself failing (disk
+# full) must not mask the read error that is the actual finding.
+#
+# Scope note: these criteria read ONLY FastioTar.kt. The gate's other view
+# reads FastioOffloadHandler.kt, which is another work package's file — do not
+# extend these checks onto it. The refill token matches `writeZeros(` or an
+# inlined `sink.write(`; a refactor that renames the helper is a deliberate
+# edit to this gate, not a silent pass.
+def tar_fun_body(src, name):
+    start = src.find("fun %s(" % name)
+    if start < 0:
+        return None
+    end = src.find("\nprivate fun ", start + 1)
+    if end < 0:
+        end = src.find("\ninternal fun ", start + 1)
+    return src[start:end] if end > start else src[start:]
+
+
+def check_write_regular(src):
+    v = []
+    body = tar_fun_body(src, "writeRegular")
+    if body is None:
+        return ["writeRegular must exist in FastioTar.kt (required function missing)"]
+    open_at = body.find("Files.newInputStream")
+    header_at = body.find("writeHeader(")
+    if open_at < 0:
+        v.append("writeRegular must open the entry's input stream (Files.newInputStream missing)")
+    if header_at < 0:
+        v.append("writeRegular must write a ustar header")
+    if open_at >= 0 and header_at >= 0 and open_at > header_at:
+        v.append(
+            "writeRegular writes the header BEFORE opening the input stream - an entry "
+            "that cannot be read leaves a declared-but-unwritten payload in the stream"
+        )
+    copy_at = body.find("copy(")
+    if copy_at < 0:
+        v.append("writeRegular must stream the payload through copy(")
+        return v
+    catch_at = body.find("catch (", copy_at)
+    if catch_at < 0:
+        v.append("writeRegular must guard the payload copy with a catch")
+        return v
+    ret_at = body.find("return", catch_at)
+    catch_seg = body[catch_at : ret_at + 1 if ret_at >= 0 else catch_at + 800]
+    if "out.errors.add" not in catch_seg:
+        v.append("the copy-failure catch must still record out.errors (truncation must not exit 0)")
+    has_refill = "writeZeros(" in catch_seg or "sink.write(" in catch_seg
+    if not has_refill:
+        v.append("the copy-failure catch must zero-fill the short payload back to the declared size")
+    elif "runCatching" not in catch_seg:
+        v.append("the copy-failure refill must be guarded so a failing sink cannot mask the read error")
+    return v
+
+
 def run(root):
     violations = []
     tar_path = os.path.join(root, TAR_REL)
@@ -99,7 +164,9 @@ def run(root):
     if not os.path.isfile(tar_path):
         return 2
     with open(tar_path, encoding="utf-8") as f:
-        violations += check_tar(f.read())
+        tar_src = f.read()
+    violations += check_tar(tar_src)
+    violations += check_write_regular(tar_src)
     if not os.path.isfile(handler_path):
         return 2
     with open(handler_path, encoding="utf-8") as f:
@@ -178,6 +245,112 @@ BAD_HANDLER_FALSE = GOOD_HANDLER.replace(
     "return finishTar(deniedEntry(archiveRaw, archiveResolution), false, startedNs, args)",
 )
 
+# ── [dv14-A2] writeRegular fixtures ──────────────────────────────────────────
+
+# compliant shape: open BEFORE the header, and the copy-failure catch both
+# records the error and zero-fills the short payload under a guard.
+GOOD_REGULAR = """
+internal fun writeRegular(
+    sink: OutputStream,
+    name: String,
+    file: Path,
+    out: TarCreateOutcome,
+    input: InputStream? = null,
+) {
+    val size = try {
+        Files.size(file)
+    } catch (e: Exception) {
+        out.errors.add("$name: ${e.message}")
+        return
+    }
+    val stream = input ?: try {
+        Files.newInputStream(file)
+    } catch (e: Exception) {
+        out.errors.add("$name: ${e.message}")
+        return
+    }
+    stream.use {
+        writeHeader(sink, header(name, '0', size, modeOf(file), mtimeOf(file), ""))
+        out.visited++
+        var written = 0L
+        val counted = object : OutputStream() {
+            override fun write(b: Int) { sink.write(b); written += 1 }
+            override fun write(b: ByteArray, off: Int, len: Int) { sink.write(b, off, len); written += len }
+        }
+        try {
+            copy(stream, counted, size)
+        } catch (e: Exception) {
+            out.errors.add("$name: ${e.message}")
+            runCatching {
+                writeZeros(sink, size - written)
+                writeZeros(sink, boundaryPad(size).toLong())
+            }
+            return
+        }
+        writeZeros(sink, boundaryPad(size).toLong())
+        out.files++
+        out.bytes += size
+    }
+}
+"""
+
+# pre-fix shape: the header goes out before the stream is opened — an entry
+# that cannot be read leaves a declared-but-unwritten payload in the stream.
+BAD_REGULAR_OLD_ORDER = """
+internal fun writeRegular(sink: OutputStream, name: String, file: Path, out: TarCreateOutcome) {
+    val size = try {
+        Files.size(file)
+    } catch (e: Exception) {
+        out.errors.add("$name: ${e.message}")
+        return
+    }
+    writeHeader(sink, header(name, '0', size, modeOf(file), mtimeOf(file), ""))
+    out.visited++
+    try {
+        Files.newInputStream(file).use { s -> copy(s, sink, size) }
+    } catch (e: Exception) {
+        out.errors.add("$name: ${e.message}")
+        return
+    }
+    val pad = ((BLOCK_SIZE - (size % BLOCK_SIZE)) % BLOCK_SIZE).toInt()
+    if (pad > 0) sink.write(ByteArray(pad))
+    out.files++
+    out.bytes += size
+}
+"""
+
+# half-fix: open-before-header restored, but the copy-failure catch swallows
+# without refilling the declared payload — the archive after this member is
+# still garbage to a real reader.
+BAD_REGULAR_NO_REFILL = GOOD_REGULAR.replace(
+    """            runCatching {
+                writeZeros(sink, size - written)
+                writeZeros(sink, boundaryPad(size).toLong())
+            }
+            return""",
+    "            return",
+)
+
+# unguarded refill: the short payload is filled, but a sink that is itself
+# failing (disk full) would mask the read error with its own IOException.
+BAD_REGULAR_UNGUARDED = GOOD_REGULAR.replace(
+    """            runCatching {
+                writeZeros(sink, size - written)
+                writeZeros(sink, boundaryPad(size).toLong())
+            }
+            return""",
+    """            writeZeros(sink, size - written)
+            writeZeros(sink, boundaryPad(size).toLong())
+            return""",
+)
+
+# silent truncation: the payload is refilled but the read error never lands
+# in out.errors, so the handler reports exit 0 for a mangled archive.
+BAD_REGULAR_SILENT = GOOD_REGULAR.replace(
+    '            out.errors.add("$name: ${e.message}")\n            runCatching {',
+    "            runCatching {",
+)
+
 
 def selftest():
     failures = []
@@ -216,6 +389,40 @@ def selftest():
     )
     expect_trip("single-site fixture", bad_single, "expected >= 2 finishTar")
 
+    # ── [dv14-A2] writeRegular ──────────────────────────────────────────────
+    good_regular = check_write_regular(GOOD_REGULAR)
+    expect_clean("compliant writeRegular fixture", good_regular)
+    bad_regular_order = check_write_regular(BAD_REGULAR_OLD_ORDER)
+    expect_trip(
+        "header-before-open fixture (dv14-A2)",
+        bad_regular_order,
+        "BEFORE opening the input stream",
+    )
+    bad_regular_norefill = check_write_regular(BAD_REGULAR_NO_REFILL)
+    expect_trip(
+        "copy-failure-without-refill fixture (dv14-A2)",
+        bad_regular_norefill,
+        "zero-fill the short payload",
+    )
+    bad_regular_unguarded = check_write_regular(BAD_REGULAR_UNGUARDED)
+    expect_trip(
+        "unguarded-refill fixture (dv14-A2)",
+        bad_regular_unguarded,
+        "must be guarded",
+    )
+    bad_regular_silent = check_write_regular(BAD_REGULAR_SILENT)
+    expect_trip(
+        "silent-truncation fixture (dv14-A2)",
+        bad_regular_silent,
+        "must still record out.errors",
+    )
+    bad_regular_missing = check_write_regular("object FastioTar { }")
+    expect_trip(
+        "missing-writeRegular fixture (dv14-A2)",
+        bad_regular_missing,
+        "required function missing",
+    )
+
     print("selftest compliant tar          -> %d violation(s)" % len(good_tar))
     print("selftest compliant handler      -> %d violation(s)" % len(good_handler))
     print("selftest stale ceiling         -> %d violation(s)" % len(bad_stale))
@@ -224,6 +431,10 @@ def selftest():
     print("selftest no NUL reserve        -> %d violation(s)" % len(bad_nul))
     print("selftest denied-with-false      -> %d violation(s)" % len(bad_false))
     print("selftest single-site handler    -> %d violation(s)" % len(bad_single))
+    print("selftest compliant writeRegular -> %d violation(s)" % len(good_regular))
+    print("selftest writeRegular shapes    -> %d / %d / %d / %d / %d violation(s)"
+          % (len(bad_regular_order), len(bad_regular_norefill), len(bad_regular_unguarded),
+             len(bad_regular_silent), len(bad_regular_missing)))
 
     if failures:
         for f in failures:
