@@ -30,8 +30,12 @@ import org.junit.Test
  */
 class ImageGalleryWindowContractTest {
 
-    // FLAG_LAYOUT_NO_LIMITS = 0x00000100
-    private val flagLayoutNoLimits: Int = 0x00000100
+    // FLAG_LAYOUT_NO_LIMITS = 0x00000200 — NOT 0x00000100 (that is
+    // FLAG_LAYOUT_IN_SCREEN; the first CI run red-flagged exactly this:
+    // expected -2147483392 (0x80000100, wrong memory) vs was -2147483136
+    // (0x80000200, real android.jar). Dead literals stay, values from CI
+    // ground truth.
+    private val flagLayoutNoLimits: Int = 0x00000200
     // FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS = 0x80000000 (Int.MIN_VALUE as Int)
     private val flagDrawsSystemBarBackgrounds: Int = 0x80000000.toInt()
 
@@ -52,7 +56,8 @@ class ImageGalleryWindowContractTest {
     }
 
     @Test fun dialogWindowFlagsComposeToTheExactExpectedValue() {
-        // 0x00000100 or 0x80000000 == 0x80000100 — dead literal.
-        assertEquals(0x80000100.toInt(), galleryDialogWindowFlags())
+        // 0x00000200 or 0x80000000 == 0x80000200 — dead literal, verified
+        // against CI ground truth (was:<-2147483136>).
+        assertEquals(0x80000200.toInt(), galleryDialogWindowFlags())
     }
 }
