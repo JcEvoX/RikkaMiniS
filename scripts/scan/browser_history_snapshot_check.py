@@ -284,6 +284,134 @@ def reads_identity(expr: str, bodies: dict, depth: int = 0) -> bool:
             return True
     return False
 
+# ── B1, reversed (dv15-B3) ────────────────────────────────────────────────
+#
+# The old B1 arm asked a spelling question: "does the snapshot memo's key text
+# mention a tick/revision/version identifier?" (IDENTITY_RE). The defect shape
+# answered it perfectly:
+#
+#     var historyRefreshTick by remember { mutableStateOf(0) }
+#     val allEntries = remember(historyRefreshTick) { historyStore.getEntries() }
+#
+# ...a panel-local counter that only this sheet's own callbacks advance, so a
+# record() from another browser session (or the 7-day retention prune) never
+# invalidated the read. The gate called that green: the criterion pinned the
+# defect as legal, same family as `mcp_oauth_lifecycle_check` in the 1035 round.
+#
+# B1 now judges the DECISION instead of the spelling:
+#   (1) the key must NOT name panel-local state declared in this file
+#       (`var x by remember { … }` / `remember { mutableStateOf(…) }`) — such a
+#       signal can only be advanced from inside the sheet, which is the defect;
+#   (2) the key must trace to the store: it reads `<store>.<member>` itself, or
+#       names an identifier whose declaration reads one, or names a State-typed
+#       parameter / a `collectAsState()`-derived local (a State the store hands
+#       in — accepted by contract, and the only branch whose owner this file
+#       cannot see);
+#   (3) when the trace lands on `<store>.<member>`, the store file must declare
+#       that member as observable state (`StateFlow` / `MutableStateFlow` /
+#       `State`), so "keyed on a store constant that can never change" cannot
+#       pass either.
+# Accepted spellings of the same decision (all three are exercised in the
+# selftest):
+#     val allEntries = remember(historyStore.revision) { historyStore.getEntries() }
+#     val revision by historyStore.revision.collectAsState()
+#     val allEntries = remember(revision) { historyStore.getEntries() }
+# Rejected:
+#     var historyRefreshTick by remember { mutableStateOf(0) }; remember(historyRefreshTick) { … }
+DECL_RE = re.compile(
+    r"\b(?:val|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=\n]*)?\s*(?:by|=)\s*"
+    r"([^\n]*(?:\n\s*\.[^\n]*)*)")
+PANEL_LOCAL_STATE_RES = (
+    r"\b(?:val|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=\n]*)?\s*by\s+remember\s*\{",
+    r"\b(?:val|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=\n]*)?\s*=\s*remember(?:Saveable)?\s*"
+    r"\{[^}]*\bmutable[A-Za-z]*State\w*Of\b",
+    r"\b(?:val|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=\n]*)?\s*(?:by|=)\s*"
+    r"mutable[A-Za-z]*State\w*Of\b",
+)
+OBSERVABLE_STATE_RE = re.compile(
+    r"\bval\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*"
+    r"(?:MutableStateFlow|StateFlow|MutableState|State)\s*[<(]")
+
+def store_receiver(text: str):
+    """The store the sheet reads, taken from `X.getEntries()`."""
+    m = re.search(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*getEntries\s*\(", text)
+    return m.group(1) if m else None
+
+def store_member_refs(text: str, receiver: str):
+    """`<receiver>.<member>` names read inside [text]."""
+    return set(re.findall(
+        r"\b" + re.escape(receiver) + r"\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)", text))
+
+def panel_local_state_names(sheet: str):
+    """Identifiers this file declares as its own remember/mutableStateOf state."""
+    names = set()
+    for pat in PANEL_LOCAL_STATE_RES:
+        names |= set(re.findall(pat, sheet))
+    return names
+
+def derived_state_names(sheet: str):
+    """Locals bound to a flow/State read (`… collectAsState()`)."""
+    names = set()
+    for m in DECL_RE.finditer(sheet):
+        if "collectAsState" in m.group(2):
+            names.add(m.group(1))
+    return names
+
+def state_typed_params(sheet: str):
+    """Parameters typed as Compose State — a signal the caller (the store
+    owner) hands in."""
+    names = set()
+    for m in re.finditer(r"fun\s+[A-Za-z_][A-Za-z0-9_]*\s*\(", sheet):
+        tail = sheet[m.end() - 1:]
+        s, e = paren_span(tail, 0)
+        for pm in re.finditer(
+                r"\b([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?:Mutable)?State\s*<", tail[s + 1:e - 1]):
+            names.add(pm.group(1))
+    return names
+
+def observable_store_members(store: str):
+    """Members the store file declares as observable state."""
+    return set(OBSERVABLE_STATE_RE.findall(store))
+
+def memo_key_problem(sheet: str, memo_keys: str, store: str):
+    """None when the snapshot key is owned by store-provided state, else the
+    reason it is not — see the B1 block comment for the criterion."""
+    receiver = store_receiver(sheet)
+    if receiver is None:
+        return ("has no store to belong to (the sheet never calls `x.getEntries()`) "
+                "-- re-point this criterion")
+    ids = set(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", memo_keys))
+
+    local = sorted(ids & panel_local_state_names(sheet))
+    if local:
+        return ("is panel-local state this file declares (`" + local[0] + "` via "
+                "remember/mutableStateOf) -- only this sheet's own callbacks can "
+                "advance it, so a record() from another session or the retention "
+                "prune cannot invalidate the read")
+
+    members = store_member_refs(memo_keys, receiver)
+    via_binding = set()
+    for m in DECL_RE.finditer(sheet):
+        if m.group(1) in ids:
+            refs = store_member_refs(m.group(2), receiver)
+            if refs:
+                via_binding.add(m.group(1))
+                members |= refs
+    direct = bool(store_member_refs(memo_keys, receiver))
+    provided = ids & (derived_state_names(sheet) | state_typed_params(sheet))
+    if not (direct or via_binding or provided):
+        return ("does not read state the store owns -- key it on e.g. "
+                "`historyStore.<revision>` or a local "
+                "`val r by historyStore.<revision>.collectAsState()`")
+
+    observable = observable_store_members(store)
+    if members and not (members & observable):
+        return ("reads " + ", ".join(sorted(receiver + "." + m for m in members))
+                + ", but the store declares none of those as observable state "
+                  "(`StateFlow`/`MutableStateFlow`/`State`) -- a key that can "
+                  "never change cannot invalidate anything")
+    return None
+
 
 def sync_entries_spans(body: str):
     spans = []
@@ -322,8 +450,14 @@ def check_arms(clean: str):
     return problems
 
 
-def check_sheet_arms(sheet: str, bodies: dict):
-    """B1 — the derived list is keyed on a refresh signal and memoized read."""
+def check_sheet_arms(sheet: str, bodies: dict, store: str = ""):
+    """B1 — the derived list is memoized once per store-owned refresh signal.
+
+    The memo key criterion is the reversed one: it must be owned by state the
+    store provides, not by panel-local `remember` state that happens to be
+    named `…tick`/`…revision` — see the B1 block comment above for the exact
+    judgment and the spellings it accepts.
+    """
     problems = []
 
     keys = remember_key(sheet, KEY_DECL)
@@ -337,19 +471,19 @@ def check_sheet_arms(sheet: str, bodies: dict):
     memo_name, memo_keys = snapshot_memo(sheet)
     if memo_name is None:
         problems.append(
-            "B1: no `val <snapshot> = remember(<refresh signal>) { historyStore.getEntries() }` "
-            "-- the store is read inside a key instead of once per refresh, so every "
-            "recomposition re-sorts the whole history")
+            "B1: no `val <snapshot> = remember(<store-owned refresh signal>) { "
+            "historyStore.getEntries() }` -- the store is read inside a key instead of "
+            "once per refresh, so every recomposition re-sorts the whole history")
     else:
         if memo_name not in keys:
             problems.append(
                 "B1: the `" + KEY_DECL + "` key list (%s) does not reference the snapshot "
                 "memo `%s`, so it is not derived from the memoized read" % (keys.strip(), memo_name))
-        if not reads_identity(memo_keys, bodies):
+        key_problem = memo_key_problem(sheet, memo_keys, store)
+        if key_problem:
             problems.append(
-                "B1: the snapshot memo `" + memo_name + "` is keyed on `%s`, which carries "
-                "no refresh signal -- nothing can invalidate the read, so the list is "
-                "frozen for the lifetime of the sheet" % memo_keys.strip())
+                "B1: the snapshot memo `" + memo_name + "` is keyed on `%s`, which %s"
+                % (memo_keys.strip(), key_problem))
 
     if not reads_identity(keys, bodies):
         problems.append(
@@ -418,6 +552,8 @@ def check_locale_keys(root: Path):
 STORE_COMPLIANT = '''
 class BrowserHistoryStore {
     private val entries = mutableListOf<Entry>()
+    // [dv15-B3 fixture] the observable mutation counter the sheet keys on
+    val revision: StateFlow<Int> = MutableStateFlow(0)
     fun record(url: String, title: String) {
         synchronized(entries) { entries.add(Entry(url = url, title = title)) }
         save()
@@ -448,13 +584,13 @@ fun BrowserHistorySheet(historyStore: BrowserHistoryStore, onDismiss: () -> Unit
     val todayLabel = stringResource(R.string.browser_history_today)
     val yesterdayLabel = stringResource(R.string.browser_history_yesterday)
     val resultsLabel = stringResource(R.string.browser_history_results)
-    var historyRefreshTick by remember { mutableStateOf(0) }
-    val allEntries = remember(historyRefreshTick) { historyStore.getEntries() }
+    val revision by historyStore.revision.collectAsState()
+    val allEntries = remember(revision) { historyStore.getEntries() }
     val entries = remember(searchQuery, todayLabel, yesterdayLabel, resultsLabel, historySnapshotKey(allEntries)) {
         if (searchQuery.isBlank()) historyStore.groupedByDay(todayLabel, yesterdayLabel)
         else mapOf(resultsLabel to historyStore.search(searchQuery))
     }
-    MinisTextButton(onClick = { historyStore.clear(); historyRefreshTick++ }, enabled = allEntries.isNotEmpty())
+    MinisTextButton(onClick = { historyStore.clear() }, enabled = allEntries.isNotEmpty())
 }
 '''
 # the key helper lives with the store, as it does in the real tree
@@ -470,9 +606,44 @@ fun BrowserHistorySheet(historyStore: BrowserHistoryStore, onDismiss: () -> Unit
 '''
 
 SHEET_PREFIX_FIXED = SHEET_PREFIX + '''
+    val revision by historyStore.revision.collectAsState()
+    val allEntries = remember(revision) { historyStore.getEntries() }
+'''
+
+# [dv15-B3] the shape the reversed B1 must reject: the memo key is a counter
+# this sheet owns, so nothing the store does on its own can advance it.
+SHEET_DEFECT_TICK = SHEET_PREFIX + '''
     var historyRefreshTick by remember { mutableStateOf(0) }
     val allEntries = remember(historyRefreshTick) { historyStore.getEntries() }
+    val entries = remember(searchQuery, historySnapshotKey(allEntries)) {
+        mapOf("x" to historyStore.search(searchQuery))
+    }
+}
 '''
+
+# [dv15-B3] accepted spelling: the key reads the store member directly.
+SHEET_DIRECT_STORE_KEY = SHEET_PREFIX + '''
+    val allEntries = remember(historyStore.revision) { historyStore.getEntries() }
+    val entries = remember(searchQuery, historySnapshotKey(allEntries)) {
+        mapOf("x" to historyStore.search(searchQuery))
+    }
+}
+'''
+
+# [dv15-B3] near-miss: the key names a store member that is NOT observable.
+SHEET_NONOBSERVABLE_KEY = SHEET_PREFIX + '''
+    val allEntries = remember(historyStore.entriesVersion) { historyStore.getEntries() }
+    val entries = remember(searchQuery, historySnapshotKey(allEntries)) {
+        mapOf("x" to historyStore.search(searchQuery))
+    }
+}
+'''
+
+# the store variant that pairs with SHEET_NONOBSERVABLE_KEY: same shape, but the
+# counter is a plain Int, so a key reading it can never change.
+STORE_PLAIN_COUNTER = STORE_COMPLIANT.replace(
+    "    val revision: StateFlow<Int> = MutableStateFlow(0)",
+    "    val entriesVersion: Int = 0")
 
 # the pre-fix shapes, quoted from the audit
 SHEET_PREFIX_BROKEN = SHEET_PREFIX + '''
@@ -526,45 +697,54 @@ def _selftest_store_arms():
 
 
 def _selftest_sheet_arms():
-    bodies = function_bodies(strip_comments_and_strings(STORE_COMPLIANT + STORE_KEY_HELPER))
+    store_clean = strip_comments_and_strings(STORE_COMPLIANT + STORE_KEY_HELPER)
+    plain_clean = strip_comments_and_strings(STORE_PLAIN_COUNTER + STORE_KEY_HELPER)
+    bodies = function_bodies(store_clean)
     cases = [
-        ("B1 compliant (snapshot memo + key helper)",
-         SHEET_COMPLIANT, []),
-        ("B2 compliant (inline identity read)", SHEET_PREFIX_FIXED + '''
+        ("B1 compliant (store-owned signal, collected)",
+         SHEET_COMPLIANT, store_clean, []),
+        ("B2 compliant (key reads the store member directly)",
+         SHEET_DIRECT_STORE_KEY, store_clean, []),
+        ("B3 compliant (inline identity read)",
+         SHEET_PREFIX_FIXED + '''
     val entries = remember(searchQuery, allEntries.size, allEntries.firstOrNull()?.id) {
         mapOf("x" to historyStore.search(searchQuery))
     }
 }
-''', []),
-        ("B3 pre-fix shape (store read inside the key)",
-         SHEET_PREFIX_BROKEN, ["B1"]),
-        ("B4 memo present, size-only key",
+''', store_clean, []),
+        ("B4 pre-fix shape (store read inside the key)",
+         SHEET_PREFIX_BROKEN, store_clean, ["B1"]),
+        ("B5 memo present, size-only key",
          SHEET_PREFIX_FIXED + '''
     val entries = remember(searchQuery, allEntries.size) {
         mapOf("x" to historyStore.search(searchQuery))
     }
 }
-''', ["B1"]),
-        ("B5 memo keyed on a constant (no refresh signal)",
+''', store_clean, ["B1"]),
+        ("B6 memo keyed on a constant (no refresh signal)",
          SHEET_PREFIX + '''
     val allEntries = remember { historyStore.getEntries() }
     val entries = remember(searchQuery, allEntries.firstOrNull()?.id) {
         mapOf("x" to historyStore.search(searchQuery))
     }
 }
-''', ["B1"]),
-        ("B6 keyless derived list",
+''', store_clean, ["B1"]),
+        ("B7 keyless derived list",
          SHEET_PREFIX_FIXED + '''
     val entries = remember {
         mapOf("x" to historyStore.search(searchQuery))
     }
 }
-''', ["B1"]),
+''', store_clean, ["B1"]),
+        ("B8 panel-local tick as the memo key (dv15-B3 defect)",
+         SHEET_DEFECT_TICK, store_clean, ["B1"]),
+        ("B9 memo keyed on a non-observable store member",
+         SHEET_NONOBSERVABLE_KEY, plain_clean, ["B1"]),
     ]
     ok = True
-    for name, src, want in cases:
+    for name, src, store_src, want in cases:
         clean = strip_comments_and_strings(src)
-        problems = check_sheet_arms(clean, bodies)
+        problems = check_sheet_arms(clean, bodies, store_src)
         got = sorted({p.split(":")[0] for p in problems})
         mark = "ok" if got == sorted(want) else "FAIL"
         if mark == "FAIL":
@@ -574,7 +754,8 @@ def _selftest_sheet_arms():
         for p in problems:
             print("      - " + p)
 
-    problems = check_sheet_arms(strip_comments_and_strings("fun other() {}"), bodies)
+    problems = check_sheet_arms(
+        strip_comments_and_strings("fun other() {}"), bodies, store_clean)
     if not problems:
         print("  selftest B0 no-declaration: expected explicit red, got GREEN -- FAIL")
         ok = False
@@ -681,7 +862,7 @@ def main() -> int:
     sheet_code = strip_comments_and_strings(sheet_raw)
 
     problems += check_arms(store_code)
-    problems += check_sheet_arms(sheet_code, function_bodies(store_code + sheet_code))
+    problems += check_sheet_arms(sheet_code, function_bodies(store_code + sheet_code), store_code)
     problems += check_bucket_literals(strip_comments_only(sheet_raw), strip_comments_only(store_raw))
     problems += check_locale_keys(ROOT)
 
@@ -693,8 +874,9 @@ def main() -> int:
     print("OK: BrowserHistoryStore.save() snapshots entries inside "
           "synchronized(entries) and never iterates the live list outside "
           "the monitor (JSON build + file write stay outside the lock); "
-          "BrowserHistorySheet reads the store once per refresh tick and keys "
-          "its derived list on a refresh signal, with the bucket headers "
+          "BrowserHistorySheet reads the store once per refresh and keys its "
+          "derived list on a refresh signal the STORE owns (a panel-local "
+          "tick/revision counter is rejected), with the bucket headers "
           "localized in all locales that ship the family")
     return 0
 
