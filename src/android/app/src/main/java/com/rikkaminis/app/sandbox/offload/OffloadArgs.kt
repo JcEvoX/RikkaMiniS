@@ -16,6 +16,12 @@ package com.rikkaminis.app.sandbox.offload
  * Two shapes the "is the next token a value?" decision must not get wrong:
  *   - a NEGATIVE NUMBER is a value, not the next flag (`--lat -33.86`);
  *   - a declared value-taking short option consumes its value (`-f pinned`).
+ *
+ * The mirror-image question — "is this token a dash NUMBER or a short option?"
+ * — is answered by the same principle in reverse: a token spelled like a
+ * negative number is a short option ONLY when the handler declared its name
+ * ([booleanFlags] / [OffloadOutput.OUTPUT_FLAGS]), so `-33.86` stays the
+ * caller's value while `package list -3` (declared `"3"`) stays a switch.
  */
 internal class OffloadArgs(
     argv: List<String>,
@@ -72,7 +78,21 @@ internal class OffloadArgs(
                         i++
                     }
                 }
-                a.startsWith("-") && a.length > 1 -> {
+                // [dv16-A A-02] A negative number is the CALLER'S VALUE, not a
+                // short option name: `android-photos near -33.86 151.21` used
+                // to read `-33.86` as the flag `33.86`, so the latitude
+                // vanished and the positionals shifted by one (the command
+                // then refused with "missing argument", or — worse, when a
+                // later token filled the slot — answered for ANOTHER place).
+                // The exception is a name the handler DECLARED, which is the
+                // only thing that makes a digit-spelled short flag legal:
+                // `android-shizuku-cli package list -3` reaches
+                // `hasFlag("third-party", "3")` through this same branch.
+                // Deciding by the declared vocabulary (not by the token's
+                // shape) is what keeps `-33.86` a value everywhere while `-3`
+                // stays a flag where it is declared.
+                a.startsWith("-") && a.length > 1 &&
+                    (!isNegativeNumberToken(a) || a.substring(1) in effectiveBooleanFlags) -> {
                     val name = a.substring(1)
                     // [dv15-A1 A-02] A declared value-taking short option takes
                     // the next token as its value, exactly like its long form:

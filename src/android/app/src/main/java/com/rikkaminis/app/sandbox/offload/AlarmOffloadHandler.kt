@@ -297,6 +297,13 @@ class AlarmOffloadHandler(private val context: Context) : NativeOffloadHandler {
             val date = runCatching {
                 val sdf = SimpleDateFormat(pat, Locale.US)
                 if (pat.endsWith("'Z'")) sdf.timeZone = TimeZone.getTimeZone("UTC")
+                // [dv16-A A-01] Strict, like the sessions funnel
+                // (parseSessionsDate): lenient mode silently ROLLS an
+                // out-of-range field over (`2026-02-30T14:00` → March 2),
+                // so a mistyped alarm time was accepted as another minute
+                // instead of being refused. HH:MM keeps its own explicit
+                // range check in parseHHMM.
+                sdf.isLenient = false
                 sdf.parse(s)
             }.getOrNull() ?: continue
             val cal = Calendar.getInstance().apply { time = date }

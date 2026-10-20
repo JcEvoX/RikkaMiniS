@@ -477,6 +477,12 @@ class NotificationOffloadHandler(private val context: Context) : NativeOffloadHa
             try {
                 val sdf = SimpleDateFormat(pat, Locale.US).apply {
                     timeZone = if (pat.endsWith("'Z'")) TimeZone.getTimeZone("UTC") else TimeZone.getDefault()
+                    // [dv16-A A-01] Strict, like the sessions funnel
+                    // (parseSessionsDate): lenient mode silently ROLLS an
+                    // out-of-range field over (`2026-02-30T10:00` → March 2),
+                    // so a mistyped `--at` was accepted as a different
+                    // instant instead of being refused.
+                    isLenient = false
                 }
                 return sdf.parse(s)?.time
             } catch (_: Throwable) {}
