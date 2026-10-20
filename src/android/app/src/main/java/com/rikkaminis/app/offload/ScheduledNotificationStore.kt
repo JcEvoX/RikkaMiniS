@@ -78,6 +78,14 @@ internal class ScheduledNotificationStore(
     fun add(entry: JSONObject) {
         synchronized(lock) {
             val list = loadAll()
+            // [dv15-A3] Idempotent upsert. scheduleDeferred re-registers the same
+            // id with FLAG_UPDATE_CURRENT (NotificationOffloadHandler replaces the
+            // AlarmManager alarm in place), so scheduling the same id again is a
+            // RE-ARM, not a second alarm. The ledger must mirror that: drop the
+            // previous row(s) for this id before appending, or `pending` grows one
+            // ghost row per re-schedule and those rows also survive fire/cancel
+            // (remove() used to clear only the first).
+            removeAllById(list, entry.optString("id"))
             list.put(entry)
             val capped = if (list.length() > MAX_ENTRIES) sweepExpiredIn(list) else list
             if (capped.length() > MAX_ENTRIES) {
@@ -92,15 +100,21 @@ internal class ScheduledNotificationStore(
         }
     }
 
+    /**
+     * [dv15-A3] Removes EVERY row with this id, not just the first. Rows sharing
+     * an id are ghosts of ONE logical alarm: the AlarmManager side keeps only the
+     * latest pending intent for that id (same requestCode, FLAG_UPDATE_CURRENT),
+     * so deleting the first match and returning left the duplicates behind —
+     * both callers (the receiver's fire path and cancel --id) want the whole id
+     * gone. Returns whether anything was removed; unchanged for the normal
+     * single-row case.
+     */
     fun remove(id: String): Boolean {
         synchronized(lock) {
             val list = loadAll()
-            for (i in 0 until list.length()) {
-                if (list.getJSONObject(i).optString("id") == id) {
-                    list.remove(i)
-                    prefs.edit().putString(KEY, list.toString()).apply()
-                    return true
-                }
+            if (removeAllById(list, id)) {
+                prefs.edit().putString(KEY, list.toString()).apply()
+                return true
             }
             return false
         }
@@ -182,4 +196,32 @@ internal class ScheduledNotificationStore(
         private const val KEY = "scheduled"
         private const val MAX_ENTRIES = 1_000
     }
+}
+
+/**
+ * [dv15-A3] Single source for "locate by id and drop EVERY match" on the
+ * ledger array. Both [ScheduledNotificationStore.add] (idempotent upsert — a
+ * re-schedule replaces its previous row, mirroring AlarmManager's
+ * FLAG_UPDATE_CURRENT replace) and [ScheduledNotificationStore.remove] (bulk
+ * clear for the fire and cancel paths) must go through this one helper;
+ * scripts/scan/router_lock_check.py pins that contract by name.
+ *
+ * Pure org.json manipulation, no Android types — JVM unit tests exercise it
+ * directly (ScheduledNotificationStoreIdempotencyTest) without a prefs double.
+ *
+ * Iterates BACKWARD so removing the current element never shifts the indices
+ * still to visit, and keeps scanning after a match: an early return after the
+ * first hit is exactly the ghost-row defect this exists to prevent.
+ */
+internal fun removeAllById(list: JSONArray, id: String): Boolean {
+    var removed = false
+    var i = list.length() - 1
+    while (i >= 0) {
+        if (list.getJSONObject(i).optString("id") == id) {
+            list.remove(i)
+            removed = true
+        }
+        i--
+    }
+    return removed
 }
