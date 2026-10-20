@@ -54,6 +54,12 @@
     <!-- T36: WRITE_CONTACTS — required by `android-contacts delete <id>`. -->
     <uses-permission android:name="android.permission.WRITE_CONTACTS" />
     <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <!-- [da1034-A3] ISSUE-06: the video half of the A13+ granular media pair.
+         Without it MediaStore.Video is filtered to zero rows for this app, so
+         `android-photos` saw a device with clips as empty. Bare shape, same as
+         the images grant above — no maxSdkVersion, because the pair replaced
+         READ_EXTERNAL_STORAGE on API 33+ (that one is capped separately below). -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
     <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
     <uses-permission android:name="android.permission.ACCESS_MEDIA_LOCATION" />
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />

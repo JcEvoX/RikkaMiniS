@@ -11,7 +11,6 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.asPaddingValues
@@ -51,6 +50,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.rikkaminis.app.R
 import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.ui.theme.ChatColors
 import kotlinx.coroutines.delay
 
 /**
@@ -75,7 +75,13 @@ fun WebPreviewFullscreenScreen(
 ) {
     val context = LocalContext.current
     val view = LocalView.current
-    val darkTheme = isSystemInDarkTheme()
+    // [da1034-B2 / B-03] Same single source as WebPreviewBottomSheet.kt /
+    // KaTeXView.kt: ChatColors.isDark follows the in-app theme override while
+    // isSystemInDarkTheme() only tracks the system setting. The icon appearance
+    // applied below is constant (the WebView paints pure black behind the
+    // swipe-revealed bars), so this swap only realigns when the effect restarts
+    // — it removes a second, disagreeing authority on "dark" from this screen.
+    val darkTheme = ChatColors.isDark
 
     LaunchedEffect(holder) {
         holder.startIfNeeded()

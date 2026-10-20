@@ -76,6 +76,28 @@ reports the un-keyed ones by line. Keyed-on-the-entry is required rather than
 any key: `remember(nonce)` would satisfy "has a key" while still never
 re-seeding.
 
+[da1034-A1] Two more criteria extend the same credential invariant to the
+backup surface — the artifact archive is NOT gated by `includeSecrets`:
+
+  A1  `ArtifactBackupScope` must keep a deny-set of credential directory names
+      (literal `setOf("oauth")`) AND actually consult it while walking, at
+      every level. The MCP OAuth bridge (`mcp-servers/oauth/<server>.json` —
+      access_token / refresh_token / client_secret in plaintext, plus a
+      pending `<server>.secret` handoff) lives under the mcp artifact root, so
+      without this the daily auto-backup and every WebDAV copy of it shipped
+      live bearer tokens. Anchored on the declaration + the `child.name in …`
+      skip so a comment cannot satisfy it and a renaming cannot silently
+      unhook it.
+  A2  `ConfigBackup.import`'s artifact stage must run `stripMcpOAuthEntries(`
+      BEFORE `ArtifactArchiver.extractZipByPrefix(`, the predicate
+      (`isMcpOAuthEntryName`) must pin both the "mcp" and "oauth" segments,
+      and the drop must be reported through `skipped`. A restore of an archive
+      written by a pre-fix build (or crafted by hand) would otherwise
+      overwrite this device's LIVE token bridge — fixing the exporter cannot
+      protect archives that already exist.
+
+Both are fail-closed: sources that cannot be read are a violation.
+
 Usage: python3 scripts/scan/mcp_oauth_lifecycle_check.py [repo_root]
        python3 scripts/scan/mcp_oauth_lifecycle_check.py --selftest
 Exit:  0 = clean, 1 = violation(s), 2 = usage/ROT
@@ -97,6 +119,18 @@ UI_ENTRY_PARAM = "editServer"
 UI_KEY_TOKENS = (UI_ENTRY_PARAM, "liveServer")
 UI_LIVE_PASS = "editServer = "
 UI_RESOLVE_PARAM = "MCPAddSheet"
+
+# [da1034-A1] artifact-backup surface.
+SCOPE_REL = "src/android/app/src/main/java/com/rikkaminis/app/backup/ArtifactBackupScope.kt"
+CONFIG_BACKUP_REL = "src/android/app/src/main/java/com/rikkaminis/app/backup/ConfigBackup.kt"
+OAUTH_DENY_LITERAL = "oauth"
+OAUTH_ENTRY_PREDICATE = "isMcpOAuthEntryName"
+OAUTH_STRIP_HELPER = "stripMcpOAuthEntries"
+OAUTH_EXTRACT_CALL = "ArtifactArchiver.extractZipByPrefix("
+OAUTH_SKIP_REPORT = "oauth bridge entries"
+DENIED_SET_RE = re.compile(
+    r'val\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*setOf\(\s*"' + OAUTH_DENY_LITERAL + r'"\s*\)'
+)
 
 CONVERGE_DECL = "reconcileForServer("
 DECIDE_DECL = "decideReconcileAction("
@@ -176,6 +210,38 @@ def mask(src):
             i += 1
     return "".join(out)
 
+
+def mask_comments(src):
+    """Like [mask] but KEEPS string-literal contents (comments only).
+
+    The [da1034-A1] criteria are anchored on real string literals
+    (`setOf("oauth")`, "mcp", "oauth"), which [mask] blanks out — so those two
+    checks mask comments only, while structural checks that must ignore log
+    text keep using [mask].
+    """
+    out = list(src)
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            while i < n and src[i] != "\n":
+                out[i] = " "
+                i += 1
+        elif c == "/" and i + 1 < n and src[i + 1] == "*":
+            out[i] = out[i + 1] = " "
+            i += 2
+            while i < n and not (src[i] == "*" and i + 1 < n and src[i + 1] == "/"):
+                if src[i] != "\n":
+                    out[i] = " "
+                i += 1
+            if i < n:
+                out[i] = " "
+                if i + 1 < n:
+                    out[i + 1] = " "
+                i += 2
+        else:
+            i += 1
+    return "".join(out)
 
 def line_of(code, index):
     return code.count("\n", 0, index) + 1
@@ -452,6 +518,123 @@ def check_ui(code):
     return v, enforced
 
 
+def check_backup_scope(code):
+    """[da1034-A1] A1 — the artifact walk must drop the MCP oauth bridge dir.
+
+    [code] is comment-masked: the deny-set literal and the skip must both be
+    real code, so a comment cannot satisfy them.
+    """
+    v = []
+    m = DENIED_SET_RE.search(code)
+    if not m:
+        v.append(
+            "ArtifactBackupScope.kt: no `<val> = setOf(\"" + OAUTH_DENY_LITERAL
+            + "\")` deny-set — the MCP OAuth token bridge "
+            "(mcp-servers/oauth/<server>.json holds LIVE access_token / refresh_token "
+            "/ client_secret in plaintext) is selected into the artifact archive "
+            "again, and from there into every auto-backup and WebDAV copy"
+        )
+        return v
+    name = m.group(1)
+    guard = "child.name in %s" % name
+    at = code.find(guard)
+    if at < 0:
+        v.append(
+            "ArtifactBackupScope.kt: %s is declared but the walk never skips on it "
+            "(no `%s`) — the deny-set is inert" % (name, guard)
+        )
+    elif "continue" not in code[at:at + 120]:
+        v.append(
+            "ArtifactBackupScope.kt: `%s` (line %d) is not a `continue` skip — the "
+            "walk still descends into the credential directory"
+            % (guard, line_of(code, at))
+        )
+    return v
+
+def check_backup_import(scoped, masked):
+    """[da1034-A1] A2 — Stage 9 must drop mcp/oauth entries before extraction.
+
+    [scoped] keeps string literals (predicate body + report message); [masked]
+    blanks them and is used for the structural call-site ordering.
+    """
+    v = []
+    decl = re.search(r"\bfun\s+" + re.escape(OAUTH_ENTRY_PREDICATE) + r"\s*\(", scoped)
+    if not decl:
+        v.append(
+            "ConfigBackup.kt: no `fun " + OAUTH_ENTRY_PREDICATE + "(` — a restore can "
+            "no longer tell a bridge entry from a data file, and a pre-fix archive "
+            "rewrites this device's live token bridge verbatim"
+        )
+    else:
+        body = body_at(scoped, decl.start())
+        if body is None or ('"mcp"') not in body or ('"' + OAUTH_DENY_LITERAL + '"') not in body:
+            v.append(
+                "ConfigBackup.kt: `" + OAUTH_ENTRY_PREDICATE + "` body must pin BOTH "
+                "the \"mcp\" and \"" + OAUTH_DENY_LITERAL + "\" segments — a "
+                "predicate that matches nothing (or everything) is not a guard"
+            )
+    imp = body_of(masked, "import")
+    if imp is None:
+        v.append("ConfigBackup.kt: no `fun import(` body to inspect")
+    else:
+        f = imp.find(OAUTH_STRIP_HELPER + "(")
+        x = imp.find(OAUTH_EXTRACT_CALL)
+        if f < 0:
+            v.append(
+                "ConfigBackup.kt: import() never calls `" + OAUTH_STRIP_HELPER + "(` — "
+                "the artifact archive is extracted as-is"
+            )
+        elif x < 0:
+            v.append(
+                "ConfigBackup.kt: import() no longer calls `" + OAUTH_EXTRACT_CALL
+                + "` — the artifact stage moved; re-anchor this gate"
+            )
+        elif f > x:
+            v.append(
+                "ConfigBackup.kt: `" + OAUTH_STRIP_HELPER + "(` runs AFTER `"
+                + OAUTH_EXTRACT_CALL + "` (lines %d/%d relative to import) — extraction "
+                "already wrote the live token bridge; the filter must come first"
+                % (imp[:f].count("\n") + 1, imp[:x].count("\n") + 1)
+            )
+        # [da1034-A1] Wiring the filter is not enough — extraction must CONSUME
+        # the filtered archive. Binding `filtered` and then extracting the raw
+        # temp zip keeps every bridge entry in the stream; the two criteria
+        # above are blind to the operand (caught by mutation m2 in
+        # probe-a1/mut/mutations.log).
+        if f >= 0 and x >= 0:
+            m_strip = re.search(
+                re.escape(OAUTH_STRIP_HELPER)
+                + r"\s*\(\s*(?:[A-Za-z_]\w*\s*=\s*)?[\w.]+\s*,\s*"
+                + r"(?:[A-Za-z_]\w*\s*=\s*)?([A-Za-z_]\w*)\s*\)",
+                imp,
+            )
+            if m_strip is None:
+                v.append(
+                    "ConfigBackup.kt: `" + OAUTH_STRIP_HELPER + "(` call shape not understood "
+                    "— cannot tell which archive reaches `" + OAUTH_EXTRACT_CALL + "`; bind "
+                    "the output as `" + OAUTH_STRIP_HELPER + "(src, dst)` (fail-closed, "
+                    "re-anchor this gate if the call was intentionally reshaped)"
+                )
+            else:
+                dst = m_strip.group(1)
+                if not re.search(
+                    re.escape(OAUTH_EXTRACT_CALL) + r"\s*" + re.escape(dst) + r"\b",
+                    imp[m_strip.end():],
+                ):
+                    v.append(
+                        "ConfigBackup.kt: import() extracts something other than the filtered "
+                        "archive — `" + OAUTH_EXTRACT_CALL + dst + ", …)` must be the "
+                        "oauth-stripped zip; the raw temp zip still carries the mcp/oauth "
+                        "bridge entries"
+                    )
+    imp_scoped = body_of(scoped, "import")
+    if imp_scoped is not None and OAUTH_SKIP_REPORT not in imp_scoped:
+        v.append(
+            "ConfigBackup.kt: import() drops bridge entries without reporting it — "
+            "\"" + OAUTH_SKIP_REPORT + "\" must reach `skipped`"
+        )
+    return v
+
 def read(root, rel):
     with open(os.path.join(root, rel), "r", encoding="utf-8") as fh:
         return fh.read()
@@ -468,6 +651,18 @@ def run(root):
         print("mcp_oauth_lifecycle_check: cannot read sources: %s" % exc)
         return 2
     violations = check_store(store) + check_repo(repo)
+    # [da1034-A1] artifact-backup surface (fail-closed: unreadable = violation).
+    try:
+        scope_raw = read(root, SCOPE_REL)
+        backup_raw = read(root, CONFIG_BACKUP_REL)
+    except OSError as exc:
+        violations.append(
+            "[da1034-A1] cannot read the artifact-backup sources (%s) — the oauth "
+            "token bridge is no longer guarded on the backup path" % exc
+        )
+    else:
+        violations += check_backup_scope(mask_comments(scope_raw))
+        violations += check_backup_import(mask_comments(backup_raw), mask(backup_raw))
     ui_path = os.path.join(root, UI_REL)
     ui_keyed = None
     if os.path.exists(ui_path):
@@ -487,7 +682,8 @@ def run(root):
     note = "" if ui_keyed is None else "; %d form field state(s) keyed on the entry" % ui_keyed
     print(
         "PASS mcp_oauth_lifecycle_check (one reconcile point; add/update/import "
-        "all wired; no secret-only cleanup path; edit sheet edits the live entry%s)"
+        "all wired; no secret-only cleanup path; edit sheet edits the live entry; "
+        "oauth bridge never archived and never restored%s)"
         % note
     )
     return 0
@@ -715,6 +911,90 @@ private fun MCPFormTab(""",
 )
 
 
+# -- [da1034-A1] artifact-backup fixtures ------------------------------------
+
+GOOD_SCOPE = """
+object ArtifactBackupScope {
+    private val EXCLUDED_DIRS = setOf("sandbox-env")
+    private val DENIED_DIRS = setOf("oauth")
+
+    private fun walk(dir: java.io.File, prefix: String, out: MutableList<String>) {
+        val children = dir.listFiles() ?: return
+        for (child in children.sortedBy { it.name }) {
+            if (child.isDirectory) {
+                if (child.name in DENIED_DIRS) continue
+                if (prefix.isEmpty() && child.name in EXCLUDED_DIRS) continue
+                walk(child, prefix + "/" + child.name, out)
+                continue
+            }
+            out.add(prefix + "/" + child.name)
+        }
+    }
+}
+"""
+DENY_VAL = "    private val DENIED_DIRS = setOf(\"oauth\")\n"
+DENY_GUARD = "                if (child.name in DENIED_DIRS) continue\n"
+BAD_SCOPE_NO_DENY = GOOD_SCOPE.replace(DENY_VAL, "").replace(DENY_GUARD, "")
+BAD_SCOPE_DEAD_DENY = GOOD_SCOPE.replace(DENY_GUARD, "")
+BAD_SCOPE_COMMENT_ONLY = GOOD_SCOPE.replace(DENY_VAL, "// DENIED_DIRS was here\n").replace(DENY_GUARD, "")
+
+GOOD_BACKUP = """
+object ConfigBackup {
+    suspend fun import(tmp: java.io.File, artifactRoots: List<java.io.File>?, skipped: ArrayList<String>) {
+        val destByPrefix = HashMap<String, java.io.File>()
+        for (root in artifactRoots!!) {
+            val prefix = if (root.name == "mcp-servers") "mcp" else "shared"
+            destByPrefix[prefix] = root
+        }
+        val filtered = java.io.File.createTempFile("artifact-restore-", ".zip")
+        try {
+            val oauthDropped = stripMcpOAuthEntries(tmp, filtered)
+            if (oauthDropped > 0) {
+                skipped.add("artifacts: skipped $oauthDropped oauth bridge entries")
+            }
+            artifactFilesImported = ArtifactArchiver.extractZipByPrefix(filtered, destByPrefix)
+        } finally {
+            runCatching { filtered.delete() }
+        }
+    }
+
+    internal fun stripMcpOAuthEntries(src: java.io.File, dst: java.io.File): Int {
+        if (isMcpOAuthEntryName(src.name)) return 0
+        return 1
+    }
+
+    internal fun isMcpOAuthEntryName(name: String): Boolean {
+        val segs = ArrayList<String>(4)
+        for (seg in name.split('/')) {
+            if (seg.isEmpty() || seg == ".") continue
+            segs.add(seg)
+        }
+        return segs.size >= 2 && segs[0] == "mcp" && segs[1] == "oauth"
+    }
+}
+"""
+WIRED = """            val oauthDropped = stripMcpOAuthEntries(tmp, filtered)
+            if (oauthDropped > 0) {
+                skipped.add("artifacts: skipped $oauthDropped oauth bridge entries")
+            }
+            artifactFilesImported = ArtifactArchiver.extractZipByPrefix(filtered, destByPrefix)"""
+BAD_BACKUP_NO_WIRING = GOOD_BACKUP.replace(WIRED, "            artifactFilesImported = ArtifactArchiver.extractZipByPrefix(tmp, destByPrefix)")
+BAD_BACKUP_AFTER_EXTRACT = GOOD_BACKUP.replace(
+    WIRED,
+    """            artifactFilesImported = ArtifactArchiver.extractZipByPrefix(filtered, destByPrefix)
+            val oauthDropped = stripMcpOAuthEntries(tmp, filtered)
+            if (oauthDropped > 0) {
+                skipped.add("artifacts: skipped $oauthDropped oauth bridge entries")
+            }""")
+BAD_BACKUP_HOLLOW_PREDICATE = GOOD_BACKUP.replace(
+    'segs[0] == "mcp" && segs[1] == "oauth"', 'segs[0] == "mcp" && segs[1] == "nope"')
+BAD_BACKUP_NO_REPORT = GOOD_BACKUP.replace(
+    '                skipped.add("artifacts: skipped $oauthDropped oauth bridge entries")\n', "")
+# [da1034-A1] 变异 m2 的形状：filter 仍在、顺序也对，但抽取吃的是原始 tmp。
+BAD_BACKUP_EXTRACT_RAW = GOOD_BACKUP.replace(
+    "ArtifactArchiver.extractZipByPrefix(filtered, destByPrefix)",
+    "ArtifactArchiver.extractZipByPrefix(tmp, destByPrefix)")
+
 def selftest():
     failures = []
 
@@ -757,6 +1037,40 @@ def selftest():
 
     r_secret = check_repo(mask(BAD_REPO_SECRET_VERB))
     expect_trip("repository-secret-only-verb fixture", r_secret, "uses `setClientSecret(")
+
+    # [da1034-A1] artifact-backup arms
+    good_scope = check_backup_scope(mask_comments(GOOD_SCOPE))
+    expect_clean("compliant artifact scope fixture", good_scope)
+
+    b_nodeny = check_backup_scope(mask_comments(BAD_SCOPE_NO_DENY))
+    expect_trip("scope without deny-set", b_nodeny, 'no `<val> = setOf("oauth")` deny-set')
+
+    b_dead = check_backup_scope(mask_comments(BAD_SCOPE_DEAD_DENY))
+    expect_trip("scope with an inert deny-set", b_dead, "the walk never skips on it")
+
+    b_comment = check_backup_scope(mask_comments(BAD_SCOPE_COMMENT_ONLY))
+    expect_trip("scope whose deny-set is only a comment", b_comment,
+                'no `<val> = setOf("oauth")` deny-set')
+
+    good_backup = check_backup_import(mask_comments(GOOD_BACKUP), mask(GOOD_BACKUP))
+    expect_clean("compliant backup import fixture", good_backup)
+
+    b_nowire = check_backup_import(mask_comments(BAD_BACKUP_NO_WIRING), mask(BAD_BACKUP_NO_WIRING))
+    expect_trip("import extracting the raw archive", b_nowire, "never calls `stripMcpOAuthEntries(`")
+
+    b_after = check_backup_import(mask_comments(BAD_BACKUP_AFTER_EXTRACT), mask(BAD_BACKUP_AFTER_EXTRACT))
+    expect_trip("filter running after extraction", b_after, "runs AFTER")
+
+    b_hollow = check_backup_import(mask_comments(BAD_BACKUP_HOLLOW_PREDICATE), mask(BAD_BACKUP_HOLLOW_PREDICATE))
+    expect_trip("predicate that matches nothing", b_hollow, "must pin BOTH")
+
+    b_noreport = check_backup_import(mask_comments(BAD_BACKUP_NO_REPORT), mask(BAD_BACKUP_NO_REPORT))
+    expect_trip("silent oauth drop", b_noreport, "must reach `skipped`")
+
+    # [da1034-A1] 变异 m2 的形状：filter 在、顺序对，但抽取吃的是原始 tmp
+    b_raw = check_backup_import(mask_comments(BAD_BACKUP_EXTRACT_RAW), mask(BAD_BACKUP_EXTRACT_RAW))
+    expect_trip("extraction consuming the raw archive", b_raw,
+                "extracts something other than the filtered archive")
 
     # [da1029-E] UI arms
     good_ui, good_ui_keyed = check_ui(mask(GOOD_UI))
@@ -810,6 +1124,9 @@ def selftest():
           % (len(good_ui), good_ui_keyed))
     print("selftest UI arms (unkeyed/snapshot/not-passed/no-fallback/renamed-form) -> %d/%d/%d/%d/%d violation(s)"
           % (len(u_unkeyed), len(u_snap), len(u_pass), len(u_fall), len(u_form)))
+    print("selftest oauth-backup arms (deny-set/dead-deny/comment-only/no-wiring/after-extract/hollow-pred/silent-drop/extract-raw) -> %d/%d/%d/%d/%d/%d/%d/%d violation(s)"
+          % (len(b_nodeny), len(b_dead), len(b_comment), len(b_nowire), len(b_after),
+             len(b_hollow), len(b_noreport), len(b_raw)))
 
     if failures:
         for item in failures:

@@ -173,6 +173,57 @@ fun fontScaleForLevel(level: Int): Float {
     return if (idx < 0) 1.0f else fontScaleMultipliers[idx]
 }
 
+/**
+ * [da1034-B1 / B-02] The single place that turns a language code into "the app
+ * is now in this language": persist it, then push it into the running process.
+ *
+ * Both halves are load-bearing and they must not drift apart. The pref alone
+ * only moves the switch in Settings → Appearance; on API 33+ the live app
+ * locale is `LocaleManager.applicationLocales` (see
+ * [com.rikkaminis.app.MainActivity.applySavedLanguage], which re-asserts the
+ * stored value on every onCreate) and on API < 33 it is read from this same
+ * pref by [com.rikkaminis.app.i18n.LocaleWrap.wrap] from `attachBaseContext`.
+ *
+ * Why it is a named function: the two halves used to live inline in the
+ * in-screen language chooser, so a write to [KEY_LANGUAGE] from *outside* that
+ * chooser — backup restore, `minis-config set appearance.language`, a WebDAV
+ * restore — moved the row's checkmark and left the process in the previous
+ * language until the user tapped a language row again. Every writer now calls
+ * this one function, so "the stored language changed" and "the app is in that
+ * language" cannot disagree.
+ */
+internal fun applyLanguageChange(context: Context, prefs: SharedPreferences, code: String) {
+    // Order matters and is asserted by AppearanceLocaleSyncTest: persist first,
+    // then apply. On API < 33 the recreate() below re-reads the pref from
+    // attachBaseContext, so applying before writing would re-create the Activity
+    // in the OLD language.
+    prefs.edit().putString(KEY_LANGUAGE, code).apply()
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        val lm = context.getSystemService(LocaleManager::class.java)
+        val desired = if (code.isEmpty()) {
+            LocaleList.getEmptyLocaleList()
+        } else {
+            LocaleList.forLanguageTags(code)
+        }
+        // Pushing the locale we already have is not free — a real change makes
+        // the framework re-create every Activity's resources — and the listener
+        // path calls this for every external write of the same key, so compare
+        // first. (Same shape as MainActivity.applySavedLanguage.)
+        if (lm != null && lm.applicationLocales.toLanguageTags() != desired.toLanguageTags()) {
+            lm.applicationLocales = desired
+        }
+    } else {
+        // T-n01-andmenu-l10n: pre-Tiramisu has no
+        // LocaleManager. The new language is read
+        // from SharedPreferences by
+        // [LocaleWrap.wrap] on the next
+        // attachBaseContext call, so recreate the
+        // Activity so its base Configuration picks
+        // up the change immediately.
+        (context as? android.app.Activity)?.recreate()
+    }
+}
+
 @Composable
 fun AppearanceScreen(
     onBack: () -> Unit,
@@ -220,7 +271,24 @@ fun AppearanceScreen(
                 KEY_FONT_CHAT_INPUT -> chatInputLevel = prefs.getInt(key, 0)
                 KEY_FONT_MESSAGE -> messageLevel = prefs.getInt(key, 0)
                 KEY_FONT_APP_BASE -> appBaseLevel = prefs.getInt(key, 0)
-                KEY_LANGUAGE -> selectedLanguage = prefs.getString(key, "") ?: ""
+                KEY_LANGUAGE -> {
+                    val code = prefs.getString(key, "") ?: ""
+                    // [da1034-B1 / B-02] An external write (backup restore,
+                    // `minis-config set appearance.language`, WebDAV restore)
+                    // used to stop here: the row's checkmark moved and the
+                    // process kept the old language until the user re-picked a
+                    // row by hand. Apply it through the same single-source
+                    // function the chooser uses.
+                    // The guard is what keeps the chooser's own write from
+                    // applying twice (onSelect already applied it, and on API <
+                    // 33 a second pass would recreate the Activity again); a
+                    // genuine external write always differs from the state we
+                    // are showing, so it is never skipped.
+                    if (code != selectedLanguage) {
+                        selectedLanguage = code
+                        applyLanguageChange(context, prefs, code)
+                    }
+                }
             }
         }
         prefs.registerOnSharedPreferenceChangeListener(listener)
@@ -574,24 +642,10 @@ fun AppearanceScreen(
                     selected = selectedLanguage == lang.code,
                     onSelect = {
                         selectedLanguage = lang.code
-                        prefs.edit().putString(KEY_LANGUAGE, lang.code).apply()
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            val lm = context.getSystemService(LocaleManager::class.java)
-                            lm?.applicationLocales = if (lang.code.isEmpty()) {
-                                LocaleList.getEmptyLocaleList()
-                            } else {
-                                LocaleList.forLanguageTags(lang.code)
-                            }
-                        } else {
-                            // T-n01-andmenu-l10n: pre-Tiramisu has no
-                            // LocaleManager. The new language is read
-                            // from SharedPreferences by
-                            // [LocaleWrap.wrap] on the next
-                            // attachBaseContext call, so recreate the
-                            // Activity so its base Configuration picks
-                            // up the change immediately.
-                            (context as? android.app.Activity)?.recreate()
-                        }
+                        // [da1034-B1 / B-02] One call, not two halves: the
+                        // pref write and the live-locale push are shared with
+                        // the external-write path in the prefs listener below.
+                        applyLanguageChange(context, prefs, lang.code)
                     },
                     leading = {
                         Text(lang.flag, fontSize = 22.sp, modifier = Modifier.width(30.dp))

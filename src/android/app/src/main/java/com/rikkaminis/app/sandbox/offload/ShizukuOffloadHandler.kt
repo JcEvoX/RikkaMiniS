@@ -6,6 +6,7 @@ import com.rikkaminis.app.offload.ShizukuManager
 import com.rikkaminis.app.sandbox.NativeOffloadHandler
 import com.rikkaminis.app.sandbox.NativeOffloadRequest
 import com.rikkaminis.app.sandbox.NativeOffloadResult
+import com.rikkaminis.app.sandbox.PRootKernel
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -38,6 +39,23 @@ import org.json.JSONObject
  * flags via [OffloadOutput.formatBody], and `--format json|text|csv`
  * (text is the default; csv is wired only on `package list`).
  */
+
+/**
+ * [da1034-A2 ISSUE-04] Pure uid extraction from `dumpsys package <pkg>` output.
+ *
+ * Returns the first `userId=<digits>` capture, or **null** when the dump
+ * carries none (unknown/uninstalled package, dumpsys failure). Callers must
+ * treat null as a refusal: the old inline version fell back to `"0"`, which
+ * aimed `cmd netpolicy` at uid 0 (root) for every unresolvable package and
+ * made `network stats` report root's traffic as the package's.
+ *
+ * Top-level (not a private companion member) so the JVM unit test can pin it
+ * without the handler's Android dependencies — same split as
+ * `resolveMaybeRelative` in ConfigOffloadHandler.kt.
+ */
+internal fun extractUidFromDumpsys(dumpsysOutput: String): String? =
+    Regex("""userId=(\d+)""").find(dumpsysOutput)?.groupValues?.get(1)
+
 class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler {
 
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
@@ -117,7 +135,7 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
         return try {
             when (group) {
                 "help", "--help", "-h" -> ok(HELP)
-                "package" -> handlePackage(rest, args)
+                "package" -> handlePackage(rest, args, request)
                 "permission" -> handlePermission(rest, args)
                 "activity" -> handleActivity(rest, args)
                 "display" -> handleDisplay(rest, args)
@@ -126,7 +144,7 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
                 "network" -> handleNetwork(rest, args)
                 "input" -> handleInput(rest, args)
                 "notification" -> handleNotification(rest, args)
-                "file" -> handleFile(rest, args)
+                "file" -> handleFile(rest, args, request)
                 "device" -> handleDevice(rest, args)
                 "exec" -> handleExec(rest, args)
                 else -> NativeOffloadResult(
@@ -171,12 +189,12 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
     }
 
     // ─── Group: package ────────────────────────────────────────────────────
-    private fun handlePackage(rest: List<String>, args: OffloadArgs): NativeOffloadResult {
+    private fun handlePackage(rest: List<String>, args: OffloadArgs, request: NativeOffloadRequest): NativeOffloadResult {
         val sub = args.positional.firstOrNull() ?: return ok(PACKAGE_HELP)
         return when (sub) {
             "list" -> packageList(args)
             "info" -> packageInfo(args.positional.getOrNull(1), args)
-            "install" -> packageInstall(args.positional.getOrNull(1), args)
+            "install" -> packageInstall(args.positional.getOrNull(1), args, request)
             "uninstall" -> packageUninstall(args.positional.getOrNull(1), args)
             "enable" -> packageEnableDisable(args.positional.getOrNull(1), args, enable = true)
             "disable" -> packageEnableDisable(args.positional.getOrNull(1), args, enable = false)
@@ -221,14 +239,25 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
         return okEnvelope(d, args)
     }
 
-    private fun packageInstall(apk: String?, args: OffloadArgs): NativeOffloadResult {
+    private fun packageInstall(apk: String?, args: OffloadArgs, request: NativeOffloadRequest): NativeOffloadResult {
         if (apk.isNullOrBlank()) return errEnvelope("INVALID_ARGS", "package install <apkPath>", args)
+        // [da1034-A2 ISSUE-03] `pm install` runs outside the sandbox, so a
+        // guest path (the only kind the agent can produce) must be translated
+        // first — the raw spelling used to fail with "file not found" even
+        // though the APK was sitting right there in /var/minis/workspace.
+        val apkHost = shizukuHostPath(apk, request)
+            ?: return errEnvelope(
+                "PATH_NOT_RESOLVED",
+                "package install: '$apk' does not resolve inside this session's sandbox mounts. " +
+                    "Copy the APK into the sandbox (e.g. /var/minis/workspace/) and pass that path; relative paths resolve against the shell cwd.",
+                args,
+            )
         val cmd = mutableListOf("pm", "install")
         if (args.hasFlag("replace", "r")) cmd.add("-r") else cmd.add("-r")  // default -r
         if (args.hasFlag("downgrade")) cmd.add("-d")
         if (args.hasFlag("grant-permissions")) cmd.add("-g")
         args.get("user")?.let { cmd.addAll(listOf("--user", it)) }
-        cmd.add(apk)
+        cmd.add(apkHost)
         val r = ShizukuManager.runProcess(cmd.toTypedArray(), timeoutMs = 60_000)
         return if (r.exitCode == 0 && r.stdout.contains("Success")) {
             okEnvelope(JSONObject().put("installed", apk), args)
@@ -651,6 +680,17 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
 
     private fun networkRestrict(pkg: String?, args: OffloadArgs, restrict: Boolean): NativeOffloadResult {
         if (pkg.isNullOrBlank()) return errEnvelope("INVALID_ARGS", "network ${if (restrict) "restrict" else "allow"} <pkg>", args)
+        // [da1034-A2 ISSUE-04] Resolve the uid ONCE, before any arm runs, and
+        // fail closed when it cannot be resolved. The old `?: "0"` fallback
+        // (see pkgUid) silently aimed `cmd netpolicy` at uid 0 — i.e. at root —
+        // for unknown packages, so "restrict <typo>" reported every arm as
+        // success while changing root's policy.
+        val uid = pkgUid(pkg)
+            ?: return errEnvelope(
+                "OPERATION_FAILED",
+                "network ${if (restrict) "restrict" else "allow"}: could not resolve a uid for '$pkg' (is it installed?)",
+                args,
+            )
         val results = JSONObject()
         val all = args.hasFlag("all")
         if (args.hasFlag("background") || all) {
@@ -661,13 +701,18 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
         }
         if (args.hasFlag("wifi") || all) {
             // cmd netpolicy is the modern surface; older devices use `cmd netpolicy set restrict-background`
+            // [da1034-A2 ISSUE-04] `restrict-background-whitelist` EXEMPTS a uid
+            // from the background restriction, so restricting must REMOVE from
+            // the exemption list and allowing must ADD to it. The directions
+            // were inverted: `network restrict --wifi` whitelisted the package
+            // (keeping it online) and `network allow --wifi` blacklisted it.
             val r = ShizukuManager.runProcess(arrayOf("cmd", "netpolicy",
-                if (restrict) "add" else "remove", "restrict-background-whitelist", pkgUid(pkg)))
+                if (restrict) "remove" else "add", "restrict-background-whitelist", uid))
             results.put("wifi", r.exitCode == 0)
         }
         if (args.hasFlag("data") || all) {
             val r = ShizukuManager.runProcess(arrayOf("cmd", "netpolicy",
-                if (restrict) "add" else "remove", "restrict-background-blacklist", pkgUid(pkg)))
+                if (restrict) "add" else "remove", "restrict-background-blacklist", uid))
             results.put("data", r.exitCode == 0)
         }
         return okEnvelope(results, args)
@@ -678,16 +723,24 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
         // dumpsys netstats detail; surface the per-uid block.
         val r = ShizukuManager.runProcess(arrayOf("dumpsys", "netstats", "detail"), timeoutMs = 10_000)
         if (r.exitCode != 0) return errEnvelope("OPERATION_FAILED", failMessage(r), args)
-        val uid = pkgUid(pkg).toIntOrNull() ?: -1
+        // [da1034-A2 ISSUE-04] `?: -1` used to print uid -1 with a 0/0 reading
+        // as if it were real data for the package; refuse instead. (Root's
+        // traffic was never reportable either — the old `?: "0"` in pkgUid
+        // made every unknown package "uid 0".)
+        val uid = pkgUid(pkg)?.toIntOrNull()
+            ?: return errEnvelope(
+                "OPERATION_FAILED",
+                "network stats: could not resolve a uid for '$pkg' (is it installed?)",
+                args,
+            )
         val (rx, tx) = parseNetstats(r.stdout, uid)
         val obj = JSONObject().put("package", pkg).put("uid", uid).put("rx_bytes", rx).put("tx_bytes", tx)
         return okEnvelope(obj, args)
     }
 
-    private fun pkgUid(pkg: String): String {
+    private fun pkgUid(pkg: String): String? {
         val r = ShizukuManager.runProcess(arrayOf("dumpsys", "package", pkg), timeoutMs = 6_000)
-        val m = Regex("""userId=(\d+)""").find(r.stdout)
-        return m?.groupValues?.get(1) ?: "0"
+        return extractUidFromDumpsys(r.stdout)
     }
 
     // ─── Group: input ─────────────────────────────────────────────────────
@@ -847,46 +900,106 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
     }
 
     // ─── Group: file ──────────────────────────────────────────────────────
-    private fun handleFile(rest: List<String>, args: OffloadArgs): NativeOffloadResult {
+    private fun handleFile(rest: List<String>, args: OffloadArgs, request: NativeOffloadRequest): NativeOffloadResult {
         val sub = args.positional.firstOrNull() ?: return ok(FILE_HELP)
         return when (sub) {
-            "ls" -> fileLs(args.positional.getOrNull(1), args)
-            "pull" -> filePullPush(args.positional.getOrNull(1), args.positional.getOrNull(2), args, pull = true)
-            "push" -> filePullPush(args.positional.getOrNull(1), args.positional.getOrNull(2), args, pull = false)
-            "rm" -> fileRm(args.positional.getOrNull(1), args)
+            "ls" -> fileLs(args.positional.getOrNull(1), args, request)
+            "pull" -> filePullPush(args.positional.getOrNull(1), args.positional.getOrNull(2), args, request, pull = true)
+            "push" -> filePullPush(args.positional.getOrNull(1), args.positional.getOrNull(2), args, request, pull = false)
+            "rm" -> fileRm(args.positional.getOrNull(1), args, request)
             "help", "--help", "-h" -> ok(FILE_HELP)
             else -> NativeOffloadResult(2, "file: unknown subcommand '$sub'\n$FILE_HELP")
         }
     }
 
-    private fun fileLs(path: String?, args: OffloadArgs): NativeOffloadResult {
+    /**
+     * [da1034-A2 ISSUE-03] Guest → host path translation for the `file` group.
+     *
+     * The agent lives inside the PRoot sandbox: paths it writes are GUEST
+     * paths (`/var/minis/workspace/x.apk`, `shared/../report.md`, …). The
+     * Shizuku service runs OUTSIDE the sandbox on the real filesystem, so
+     * handing the guest spelling straight to `cp`/`ls`/`rm` used to make every
+     * sandbox path a silent no-op (host `/var/minis/...` does not exist)
+     * while host-only paths worked — the exact mirror image of the
+     * [SpeechOffloadHandler.resolveSourcePath] bug class. Single source, no
+     * second implementation: [resolveMaybeRelative] joins cwd + relative,
+     * [PRootKernel.resolvePathForSession] maps the guest path to the session's
+     * host tree and refuses anything outside the sandbox's mounts. Return null
+     * = fail closed (PATH_NOT_RESOLVED); there is deliberately no
+     * "pass the raw string through" fallback, same as [PhotosOffloadHandler]'s
+     * "host paths are refused instead of being read straight off the host".
+     */
+    private fun shizukuHostPath(raw: String, request: NativeOffloadRequest): String? {
+        val guestPath = resolveMaybeRelative(raw.trim(), request.cwd)
+        return try {
+            PRootKernel.resolvePathForSession(request.sessionId, guestPath, context)?.absolutePath
+        } catch (t: Throwable) {
+            AppLogger.warning(TAG, "shizukuHostPath('$raw') failed: ${t.message}")
+            null
+        }
+    }
+
+    private fun fileLs(path: String?, args: OffloadArgs, request: NativeOffloadRequest): NativeOffloadResult {
         if (path.isNullOrBlank()) return errEnvelope("INVALID_ARGS", "file ls <path>", args)
+        val host = shizukuHostPath(path, request)
+            ?: return errEnvelope(
+                "PATH_NOT_RESOLVED",
+                "file ls: '$path' does not resolve inside this session's sandbox mounts. " +
+                    "Paths are sandbox paths (e.g. /var/minis/workspace/<file>); relative paths resolve against the shell cwd.",
+                args,
+            )
         val cmd = mutableListOf("ls")
         if (args.hasFlag("long", "l")) cmd.add("-la") else cmd.add("-1")
         if (args.hasFlag("recursive", "r")) cmd.add("-R")
-        cmd.add(path)
+        cmd.add(host)
         val r = ShizukuManager.runProcess(cmd.toTypedArray(), timeoutMs = 8_000)
         return if (r.exitCode == 0) ok(r.stdout + "\n")
         else errEnvelope("OPERATION_FAILED", failMessage(r), args)
     }
 
-    private fun filePullPush(src: String?, dst: String?, args: OffloadArgs, pull: Boolean): NativeOffloadResult {
+    private fun filePullPush(
+        src: String?,
+        dst: String?,
+        args: OffloadArgs,
+        request: NativeOffloadRequest,
+        pull: Boolean,
+    ): NativeOffloadResult {
         if (src.isNullOrBlank() || dst.isNullOrBlank()) {
             return errEnvelope("INVALID_ARGS", "file ${if (pull) "pull" else "push"} <src> <dst>", args)
         }
+        // [da1034-A2 ISSUE-03] Both operands are guest paths; translate each
+        // through the session resolver before it reaches the privileged `cp`.
+        val srcHost = shizukuHostPath(src, request)
+            ?: return errEnvelope(
+                "PATH_NOT_RESOLVED",
+                "file ${if (pull) "pull" else "push"}: src '$src' does not resolve inside this session's sandbox mounts.",
+                args,
+            )
+        val dstHost = shizukuHostPath(dst, request)
+            ?: return errEnvelope(
+                "PATH_NOT_RESOLVED",
+                "file ${if (pull) "pull" else "push"}: dst '$dst' does not resolve inside this session's sandbox mounts.",
+                args,
+            )
         // Use cp via Shizuku — works for both directions because the
         // Shizuku service has full FS access, while our own uid usually
         // does not for /Android/data/* paths.
-        val r = ShizukuManager.runProcess(arrayOf("cp", "-r", src, dst), timeoutMs = 30_000)
+        val r = ShizukuManager.runProcess(arrayOf("cp", "-r", srcHost, dstHost), timeoutMs = 30_000)
         return if (r.exitCode == 0) okEnvelope(JSONObject().put("src", src).put("dst", dst), args)
         else errEnvelope("OPERATION_FAILED", failMessage(r), args)
     }
 
-    private fun fileRm(path: String?, args: OffloadArgs): NativeOffloadResult {
+    private fun fileRm(path: String?, args: OffloadArgs, request: NativeOffloadRequest): NativeOffloadResult {
         if (path.isNullOrBlank()) return errEnvelope("INVALID_ARGS", "file rm <path>", args)
+        val host = shizukuHostPath(path, request)
+            ?: return errEnvelope(
+                "PATH_NOT_RESOLVED",
+                "file rm: '$path' does not resolve inside this session's sandbox mounts.",
+                args,
+            )
         val cmd = mutableListOf("rm")
         if (args.hasFlag("recursive", "r")) cmd.add("-rf") else cmd.add("-f")
-        cmd.add(path)
+        cmd.add(host)
         val r = ShizukuManager.runProcess(cmd.toTypedArray())
         return if (r.exitCode == 0) okEnvelope(JSONObject().put("removed", path), args)
         else errEnvelope("OPERATION_FAILED", failMessage(r), args)

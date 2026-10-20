@@ -41,8 +41,16 @@ HANDLER_REL = os.path.join(
 LITERAL_RE = re.compile(r'"""(?:.|\n)*?"""|"(?:[^"\\\n]|\\.)*"')
 COMPARISON_RE = re.compile(r"[<>=!]+\s*[?$]")
 NULL_GUARD_RE = re.compile(r"IS\s+NULL", re.IGNORECASE)
+# Comments are stripped before the rule-C read-path check: the gate must judge
+# the decision point, not prose that merely names it (the handler legitimately
+# explains IN a comment why the read path does NOT refuse).
+COMMENT_RE = re.compile(r"//[^\n]*|/\*(?:.|\n)*?\*/")
+
+def strip_comments(src):
+    return COMMENT_RE.sub("", src)
 
 RULE_A_CODE = 'predicate-on-nullable-column'
+RULE_C_CODE = 'explicit-calendar-selector'
 
 
 def iter_kotlin_files(root):
@@ -109,6 +117,52 @@ def rule_b(src):
     return problems
 
 
+def rule_c(src):
+    """[da1034-A4] ISSUE-07 — a WRITE that NAMES a calendar must refuse, not
+    silently write somewhere else.
+
+    `--calendar <name>` / `--calendar-id <id>` used to fall through to the
+    auto-pick heuristic when it matched no writable calendar, so `create` wrote
+    into a calendar the caller never named and `update` MOVED an existing event
+    into the auto-picked one. Scoped to the handler file (like rule_b) and gated
+    on the write surface being present, so the older minimal freebusy fixtures
+    stay unaffected.
+
+    Every criterion is anchored on a decision point rather than a spelling, and
+    each is fail-closed: rename the machinery away and the rule goes red instead
+    of going silent.
+    """
+    if "fun doCreate(" not in src and "fun doUpdate(" not in src:
+        return []
+    problems = []
+    if "resolveExplicitCalendar(" not in src:
+        problems.append("resolveExplicitCalendar() is gone — the explicit-selector decision has no single source")
+    if not re.search(r"CalendarSelection\.Unmatched\s*->", src):
+        problems.append("no branch consumes CalendarSelection.Unmatched — a selector miss is not decided anywhere")
+    if "CalendarTarget.Refused(" not in src:
+        problems.append("CalendarTarget.Refused( is never constructed — a selector miss does not become a refusal")
+    if "calendar_not_found" not in src:
+        problems.append("no calendar_not_found payload — the refusal is not structured")
+    if "pickWritableCalendar()" in src:
+        problems.append("pickWritableCalendar() is called with no calendars — the old silent auto-pick fallback")
+    if "falling back to auto-pick" in src:
+        problems.append("the 'falling back to auto-pick' log line is back")
+    for marker, resolver in (("private fun doCreate(", "requireCalendarTarget("),
+                             ("private fun doUpdate(", "optionalCalendarTarget(")):
+        body = member_slice(src, marker)
+        if body is None:
+            problems.append(f"{marker[:-1]} not found — the write surface moved")
+        elif resolver not in body:
+            problems.append(f"{marker[:-1]} does not route through {resolver}")
+    listing = member_slice(src, "private fun doList(")
+    if listing is not None:
+        listing = strip_comments(listing)
+        if ("calendar_not_found" in listing or "CalendarTarget.Refused(" in listing
+                or "CalendarSelection.Unmatched" in listing):
+            problems.append("doList refuses an unmatched --calendar — on the read path a miss is a"
+                            " legitimate empty answer, not a typo to refuse")
+    return problems
+
 def run(root, verbose=True):
     failures = []
     for path in iter_kotlin_files(root):
@@ -120,6 +174,8 @@ def run(root, verbose=True):
         if os.path.normpath(rel) == os.path.normpath(HANDLER_REL):
             for problem in rule_b(src):
                 failures.append(f"{rel}: [{RULE_A_CODE}] freebusy path: {problem}")
+            for problem in rule_c(src):
+                failures.append(f"{rel}: [{RULE_C_CODE}] {problem}")
     if verbose:
         for line in failures:
             print(line)
@@ -187,6 +243,89 @@ class OtherHandler {
 }
 '''
 
+# [da1034-A4] ISSUE-07 fixtures — a write that names a calendar must refuse
+# instead of falling through to the auto-pick heuristic.
+GREEN_SELECTOR_HANDLER = '''
+package x
+
+internal sealed class CalendarSelection {
+    data class Matched(val id: Long) : CalendarSelection()
+    object Unmatched : CalendarSelection()
+}
+
+internal fun resolveExplicitCalendar(cals: List<CalendarRef>, calendarId: Long?, calendarName: String?): CalendarSelection? {
+    if (calendarId == null && calendarName == null) return null
+    if (calendarId != null) {
+        return if (cals.any { it.id == calendarId }) CalendarSelection.Matched(calendarId) else CalendarSelection.Unmatched
+    }
+    return CalendarSelection.Unmatched
+}
+
+class CalendarOffloadHandler {
+    private fun doCreate(args: OffloadArgs): NativeOffloadResult {
+        val calendarId = when (val target = requireCalendarTarget(args)) {
+            is CalendarTarget.Id -> target.value
+            is CalendarTarget.Refused -> return target.result
+        }
+        return NativeOffloadResult(0, calendarId.toString())
+    }
+
+    private fun doUpdate(args: OffloadArgs): NativeOffloadResult {
+        when (val target = optionalCalendarTarget(args)) {
+            null -> Unit
+            is CalendarTarget.Id -> values.put(CalendarContract.Events.CALENDAR_ID, target.value)
+            is CalendarTarget.Refused -> return target.result
+        }
+        return NativeOffloadResult(0, "ok")
+    }
+
+    private fun doList(args: OffloadArgs): NativeOffloadResult {
+        val calFilter = args.get("calendar")
+        return NativeOffloadResult(0, calFilter ?: "")
+    }
+
+    private fun requireCalendarTarget(args: OffloadArgs): CalendarTarget {
+        when (val sel = resolveExplicitCalendar(refs, args.getLong("calendar-id"), args.get("calendar"))) {
+            is CalendarSelection.Matched -> return CalendarTarget.Id(sel.id)
+            is CalendarSelection.Unmatched -> return CalendarTarget.Refused(calendarNotFoundError(args))
+            null -> Unit
+        }
+        return CalendarTarget.Id(pickWritableCalendar(cals) ?: 0L)
+    }
+
+    private fun calendarNotFoundError(args: OffloadArgs): NativeOffloadResult =
+        NativeOffloadResult(1, OffloadOutput.formatBody(JSONObject().put("error", "calendar_not_found").toString(), args))
+
+    private fun pickWritableCalendar(cals: JSONArray): Long? = null
+
+    private sealed class CalendarTarget {
+        data class Id(val value: Long) : CalendarTarget()
+        data class Refused(val result: NativeOffloadResult) : CalendarTarget()
+    }
+}
+'''
+
+SELECTOR_FALLBACK_HANDLER = GREEN_SELECTOR_HANDLER.replace(
+    '''        val calendarId = when (val target = requireCalendarTarget(args)) {
+            is CalendarTarget.Id -> target.value
+            is CalendarTarget.Refused -> return target.result
+        }''',
+    '        val calendarId = pickWritableCalendar()')
+
+SELECTOR_UNHANDLED_HANDLER = GREEN_SELECTOR_HANDLER.replace(
+    "            is CalendarSelection.Unmatched -> return CalendarTarget.Refused(calendarNotFoundError(args))",
+    "            is CalendarSelection.Unmatched -> Unit")
+
+SELECTOR_FILTER_REFUSES_HANDLER = GREEN_SELECTOR_HANDLER.replace(
+    '        val calFilter = args.get("calendar")',
+    '        val calFilter = args.get("calendar") ?: "calendar_not_found"')
+
+SELECTOR_RENAMED_PAYLOAD_HANDLER = GREEN_SELECTOR_HANDLER.replace(
+    '"calendar_not_found"', '"not_found"')
+
+SELECTOR_RENAMED_DECISION_HANDLER = GREEN_SELECTOR_HANDLER.replace(
+    "resolveExplicitCalendar(", "resolveCalendarSelector(")
+
 
 def write_fixture(root, name, body, handler_rel=True):
     rel = HANDLER_REL if handler_rel else os.path.join(MAIN_ROOT, "com", "rikkaminis", "app", "other", name)
@@ -214,6 +353,31 @@ def selftest():
             print(f"[{'PASS' if passed else 'FAIL'}] selftest: {label} "
                   f"(expected {'red' if expect_failures else 'green'}, got {len(failures)} violation(s))")
             for f in failures:
+                print(f"        {f}")
+            ok = ok and passed
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+    # [da1034-A4] rule C — one control plus one arm per criterion. Each arm
+    # asserts rule C specifically (not merely "something went red"): an arm that
+    # trips rule A/B instead would leave rule C toothless and still look green.
+    selector_cases = [
+        ("selector machinery intact (rule C control)", GREEN_SELECTOR_HANDLER, False),
+        ("a write falls back to the auto-pick", SELECTOR_FALLBACK_HANDLER, True),
+        ("the selector miss stops being handled", SELECTOR_UNHANDLED_HANDLER, True),
+        ("the read path (list filter) starts refusing", SELECTOR_FILTER_REFUSES_HANDLER, True),
+        ("the refusal payload loses its name", SELECTOR_RENAMED_PAYLOAD_HANDLER, True),
+        ("the selector decision loses its single source", SELECTOR_RENAMED_DECISION_HANDLER, True),
+    ]
+    for label, body, expect_red in selector_cases:
+        root = tempfile.mkdtemp(prefix="calgate-c-")
+        try:
+            write_fixture(root, "CalendarOffloadHandler.kt", body, handler_rel=True)
+            failures = run(root, verbose=False)
+            hit = [f for f in failures if RULE_C_CODE in f]
+            passed = (len(hit) > 0) == expect_red
+            print(f"[{'PASS' if passed else 'FAIL'}] selftest: {label} "
+                  f"(rule C expected {'red' if expect_red else 'green'}, got {len(hit)} rule-C violation(s))")
+            for f in hit:
                 print(f"        {f}")
             ok = ok and passed
         finally:

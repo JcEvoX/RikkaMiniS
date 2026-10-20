@@ -86,9 +86,211 @@ SPEC_FIELDS = (
 WHOLE_RECORD_ASSIGN = re.compile(r"(?:it|tasks)\[idx\]\s*=\s*task\b")
 NAMED_ARG_RE = re.compile(r"\b([A-Za-z_]\w*)\s*=(?!=)")
 
+# ── deep-audit-1034 B-04 (S3) ───────────────────────────────────────────────
+# The edit screen's two remaining silent states (reported 2026-10-20):
+#   * record gone → the form kept its defaults with `original == null`: Save
+#     could never enable (a dead button) while Delete stayed live on an id that
+#     no longer exists. The screen said nothing about why.
+#   * window inverted (start >= end, both halves parse) → the start field's
+#     `isError = !startOk` left BOTH fields unmarked while `windowOk == false`
+#     silently kept Save disabled.
+# The criteria (S3) require: the id-keyed load raises `recordMissing` on the
+# not-found path, the flag is a remembered `var`, canSave gates on it, an
+# `if (recordMissing) { … return }` render gate keeps Save/Delete unreachable
+# in the not-found screen, and the start field's isError binds the inverted
+# window. The load spelling is an anchor — if it changes, ROT instead of
+# passing vacuously.
+
 # S2: the accepted spelling, pinned literally (whitespace-insensitive).
 CAN_SAVE_RE = re.compile(r"val canSave\s*=")
 CAN_SAVE_FORMS = ("(isNew||original!=null)", "(original!=null||isNew)")
+
+# ── deep-audit-1034 B-04 ────────────────────────────────────────────────────
+# Two more silent states of the edit screen (reported 2026-10-20):
+#   * record gone → the form rendered its defaults with `original == null`, so
+#     Save could never enable (a dead button) while Delete stayed live on an id
+#     that no longer exists; the screen said nothing.
+#   * window inverted (start >= end, both halves parse) → `isError = !startOk`
+#     left BOTH fields unmarked while `windowOk == false` silently kept Save
+#     disabled: a valid-looking window that never saves.
+# The subject is the id-keyed load in ScheduledTaskEditScreen; the load spelling
+# is an anchor — if it changes, ROT instead of passing vacuously.
+# ────────────────────────────────────────────────────────────────────────────
+
+MISSING_FLAG = "recordMissing"
+MISSING_LOAD_RE = re.compile(r"firstOrNull *\{ *it\.id *== *taskId *\}")
+MISSING_DECL_RE = re.compile(r"var +recordMissing +by +remember")
+LOAD_EFFECT_HEAD = "LaunchedEffect(taskId)"
+START_FIELD_ANCHOR = "R.string.scheduled_field_window_start"
+
+
+def lambda_body(scan, head):
+    """Body of the first trailing lambda attached to `head`, or None.
+
+    `head` is e.g. `LaunchedEffect(taskId)`; the body is the `{ … }` that
+    follows it, brace-matched. Input is strip_code output, so offsets line up
+    with the raw file."""
+    m = re.search(re.escape(head), scan)
+    if m is None:
+        return None
+    j = m.end()
+    while j < len(scan) and scan[j].isspace():
+        j += 1
+    if j >= len(scan) or scan[j] != "{":
+        return None
+    depth = 0
+    for k in range(j, len(scan)):
+        if scan[k] == "{":
+            depth += 1
+        elif scan[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return scan[j + 1:k]
+    return None
+
+
+def start_field_args(scan):
+    """Args of the SectionTextField right after the `window_start` RowLabel, or
+    None. The start field is where an inverted window must become visible."""
+    m = re.search(re.escape(START_FIELD_ANCHOR), scan)
+    if m is None:
+        return None
+    m2 = re.compile(r"SectionTextField *\(").search(scan, m.end())
+    if m2 is None:
+        return None
+    i = m2.end() - 1
+    depth = 0
+    for k in range(i, len(scan)):
+        if scan[k] == "(":
+            depth += 1
+        elif scan[k] == ")":
+            depth -= 1
+            if depth == 0:
+                return scan[i + 1:k]
+    return None
+
+
+def scan_edit_screen_guards(screen_raw):
+    """S3 — a gone record must not keep a live Delete on a dead id behind a Save
+    that can never enable, and an inverted window must be visible on the form,
+    not only as a silently disabled button."""
+    scan = strip_code(screen_raw)
+    bad = []
+
+    # Subject anchor: the id-keyed load. If the spelling changed, ROT loudly.
+    if not MISSING_LOAD_RE.search(scan):
+        return [
+            "%s: no `firstOrNull { it.id == taskId }` load left in ScheduledTaskEditScreen — "
+            "the subject of the not-found criteria is gone (update this gate's detection)"
+            % EDIT_SCREEN_REL
+        ]
+
+    # (1) the not-found branch must surface the condition, not just drop it.
+    effect = lambda_body(scan, LOAD_EFFECT_HEAD)
+    if effect is None:
+        bad.append(
+            "%s: no `%s { … }` body parseable — the load effect changed shape "
+            "(update this gate's detection)" % (EDIT_SCREEN_REL, LOAD_EFFECT_HEAD)
+        )
+    elif "recordMissing=true" not in re.sub(r"\s+", "", effect):
+        bad.append(
+            "%s: the edit-target load no longer raises `%s` on the not-found path — a deleted "
+            "record renders the form's defaults again: Save locked for good "
+            "(`original == null`) while Delete stays live on an id that no longer exists"
+            % (EDIT_SCREEN_REL, MISSING_FLAG)
+        )
+
+    # (2) the flag must be a remembered `var` — the render gate below reads it.
+    if not MISSING_DECL_RE.search(scan):
+        bad.append(
+            "%s: no `var %s by remember` — the not-found state is not remembered, so the "
+            "render gate cannot hold across recompositions" % (EDIT_SCREEN_REL, MISSING_FLAG)
+        )
+
+    # (3) Save must not depend on the not-found screen staying put: the flag
+    # gates canSave directly (belt to `original != null`'s braces).
+    m = CAN_SAVE_RE.search(scan)
+    if m is None:
+        bad.append(
+            "%s: no `val canSave =` — the save gate is missing entirely" % EDIT_SCREEN_REL
+        )
+    else:
+        statement = scan[m.end():].split("\n\n")[0]
+        if "!" + MISSING_FLAG not in re.sub(r"\s+", "", statement):
+            bad.append(
+                "%s: canSave does not gate on `%s` — the not-found render path would be the "
+                "only thing keeping Save unreachable, and rendering paths get refactored away"
+                % (EDIT_SCREEN_REL, MISSING_FLAG)
+            )
+
+    # (4) the not-found state must be rendered as an explicit screen with one
+    # way out — no Save/Delete shell in that branch.
+    gate = None
+    for gm in re.finditer(r"if *\(%s *\)" % MISSING_FLAG, scan):
+        j = gm.end()
+        while j < len(scan) and scan[j] != "{":
+            if not scan[j].isspace():
+                break
+            j += 1
+        if j < len(scan) and scan[j] == "{":
+            depth = 0
+            for k in range(j, len(scan)):
+                if scan[k] == "{":
+                    depth += 1
+                elif scan[k] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        body = scan[j + 1:k]
+                        if "return" in re.sub(r"\s+", "", body):
+                            gate = body
+                        break
+        if gate is not None:
+            break
+    if gate is None:
+        bad.append(
+            "%s: no `if (%s) { … return }` render gate — the not-found state is set but never "
+            "rendered, so the dead Save / live Delete form is back"
+            % (EDIT_SCREEN_REL, MISSING_FLAG)
+        )
+    else:
+        normalized_gate = re.sub(r"\s+", "", gate)
+        for excluded in ("MinisButton(", "SectionTextField("):
+            if excluded in normalized_gate:
+                bad.append(
+                    "%s: the not-found screen renders a `%s` — only the explanation and one "
+                    "way out belong there; Save/Delete must stay unreachable when the record "
+                    "is gone" % (EDIT_SCREEN_REL, excluded.rstrip("("))
+                )
+
+    # (5) an inverted window must be visible on the form, not only as a
+    # disabled Save: the start field's isError has to bind more than its own
+    # parse.
+    args = start_field_args(scan)
+    if args is None:
+        bad.append(
+            "%s: the `%s` field could not be located — the inverted-window visibility "
+            "criterion is blind (update this gate's detection)"
+            % (EDIT_SCREEN_REL, START_FIELD_ANCHOR)
+        )
+    else:
+        em = re.search(r"isError\s*=", args)
+        if em is None:
+            bad.append(
+                "%s: the start field has no isError binding — a window whose halves parse but "
+                "invert (start >= end) is invisible on the form while Save silently stays "
+                "disabled" % EDIT_SCREEN_REL
+            )
+        else:
+            normalized_arg = re.sub(r"\s+", "", args[em.end():].split(",")[0])
+            if "windowInverted" not in normalized_arg and "windowOk" not in normalized_arg:
+                bad.append(
+                    "%s: the start field's isError only flags its own parse (`%s`) — an "
+                    "inverted window (both halves parse, start >= end) leaves both fields "
+                    "unmarked while windowOk == false silently disables Save"
+                    % (EDIT_SCREEN_REL, normalized_arg or "!startOk")
+                )
+    return bad
+
 
 
 def copy_arg_names(body):
@@ -274,6 +476,68 @@ def selftest():
         "    }\n"
         "}\n"
     )
+    # deep-audit-1034 B-04: the not-found state + inverted-window visibility.
+    # Built as prefix / render-gate / suffix so a mutation can drop the gate
+    # wholesale without carrying a copy of it around.
+    edit_prefix = (
+        "fun ScheduledTaskEditScreen(taskId: String?, onDone: () -> Unit) {\n"
+        "    val isNew = taskId == null\n"
+        "    var original by remember { mutableStateOf<ScheduledTask?>(null) }\n"
+        "    var recordMissing by remember { mutableStateOf(false) }\n"
+        "\n"
+        "    if (!isNew) {\n"
+        "        LaunchedEffect(taskId) {\n"
+        "            val loaded = file.tasks.firstOrNull { it.id == taskId }\n"
+        "            if (loaded == null) {\n"
+        "                recordMissing = true\n"
+        "            } else {\n"
+        "                original = loaded\n"
+        "                recordMissing = false\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
+        "\n"
+        "    val startOk = parse(windowStart) != null\n"
+        "    val endOk = parse(windowEnd) != null\n"
+        "    val windowOk = startOk && endOk && start < end\n"
+        "    val windowInverted = startOk && endOk && !windowOk\n"
+        "    val canSave = !recordMissing && prompt.isNotBlank() && windowOk && turnsOk && deadlineOk &&\n"
+        "        tokensOk && (isNew || original != null)\n"
+        "\n"
+    )
+    edit_gate = (
+        "    if (recordMissing) {\n"
+        "        SettingsScaffold(\n"
+        "            title = stringResource(R.string.scheduled_edit_title),\n"
+        "            navigation = {\n"
+        "                MinisTextButton(onClick = onDone) {\n"
+        "                    Text(stringResource(R.string.common_back))\n"
+        "                }\n"
+        "            },\n"
+        "        ) {\n"
+        "            SettingsSection {\n"
+        "                SettingsCardBlock {\n"
+        "                    Text(text = stringResource(R.string.scheduled_edit_missing_body))\n"
+        "                }\n"
+        "            }\n"
+        "        }\n"
+        "        return\n"
+        "    }\n"
+        "\n"
+    )
+    edit_suffix = (
+        "    SettingsSection {\n"
+        "        RowLabel(text = stringResource(R.string.scheduled_field_window_start))\n"
+        "        SectionTextField(\n"
+        "            value = windowStart,\n"
+        "            onValueChange = { windowStart = it },\n"
+        "            isError = !startOk || windowInverted,\n"
+        "            singleLine = true,\n"
+        "        )\n"
+        "    }\n"
+        "}\n"
+    )
+    edit_screen = edit_prefix + edit_gate + edit_suffix
 
     cases = [
         ("store/clean", (clean_store, clean_merge), scan_merge_semantics),
@@ -300,12 +564,29 @@ def selftest():
         ("screen/snapshot gate dropped", clean_screen.replace(
             "\n        (isNew || original != null)", ""), scan_can_save_gate),
         ("screen/no canSave at all", clean_screen.replace("val canSave", "val maySave"), scan_can_save_gate),
+        ("editguard/clean", edit_screen, scan_edit_screen_guards),
+        ("editguard/not-found branch dropped", edit_screen.replace(
+            "                recordMissing = true\n", ""), scan_edit_screen_guards),
+        ("editguard/flag not remembered", edit_screen.replace(
+            "var recordMissing by remember", "var recordMissing ="), scan_edit_screen_guards),
+        ("editguard/canSave guard dropped", edit_screen.replace(
+            "!recordMissing && ", ""), scan_edit_screen_guards),
+        ("editguard/not-found render removed", edit_prefix + edit_suffix, scan_edit_screen_guards),
+        ("editguard/not-found screen keeps a save shell", edit_screen.replace(
+            "                Text(text = stringResource(R.string.scheduled_edit_missing_body))\n",
+            "                Text(text = stringResource(R.string.scheduled_edit_missing_body))\n"
+            "                SectionTextField(value = prompt)\n"), scan_edit_screen_guards),
+        ("editguard/start isError reverted to its own parse", edit_screen.replace(
+            "isError = !startOk || windowInverted", "isError = !startOk"), scan_edit_screen_guards),
+        ("editguard/subject load renamed", edit_screen.replace(
+            "it.id == taskId", "it.id == otherId"), scan_edit_screen_guards),
     ]
 
     print("scheduled_store_release_guard --selftest")
     failures = 0
     merge_failures = 0
     cansave_failures = 0
+    editguard_failures = 0
     for name, fixture, scan in cases:
         args = fixture if isinstance(fixture, tuple) else (fixture,)
         bad = scan(*args)
@@ -315,11 +596,14 @@ def selftest():
             failures += 1
             if name.startswith("merge/") or name.startswith("store/"):
                 merge_failures += 1
+            elif name.startswith("editguard/"):
+                editguard_failures += 1
             else:
                 cansave_failures += 1
     print(f"  {'✅ selftest passed' if not failures else f'❌ selftest failures: {failures}'}")
     print(f"SCHEDULED_MERGE_SELFTEST={'PASS' if merge_failures == 0 else 'FAIL'}")
     print(f"SCHEDULED_CANSAVE_SELFTEST={'PASS' if cansave_failures == 0 else 'FAIL'}")
+    print(f"SCHEDULED_EDITGUARD_SELFTEST={'PASS' if editguard_failures == 0 else 'FAIL'}")
     return 1 if failures else 0
 
 
@@ -498,7 +782,7 @@ def main():
               % (merge_rel or "the merge"))
     screen_raw = read_optional(root, EDIT_SCREEN_REL)
     if screen_raw is None:
-        print("SKIP: %s not in this tree — the canSave criterion does not apply here"
+        print("SKIP: %s not in this tree — the canSave / not-found criteria do not apply here"
               % EDIT_SCREEN_REL)
     else:
         s2 = scan_can_save_gate(screen_raw)
@@ -507,6 +791,13 @@ def main():
         else:
             print("OK: ScheduledTaskEditScreen.canSave waits for the loaded snapshot "
                   "before an edit may be saved")
+        s3 = scan_edit_screen_guards(screen_raw)
+        if s3:
+            findings.extend(s3)
+        else:
+            print("OK: ScheduledTaskEditScreen surfaces a gone record (explicit not-found "
+                  "screen; Save and Delete unreachable there) and flags an inverted window "
+                  "on the form rather than leaving Save silently disabled")
 
     if rot:
         print("ROT: %s" % STORE_REL)

@@ -67,6 +67,9 @@ SRC = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload"
 TARGET_REL = SRC + "/ModelUseOffloadHandler.kt"
 SPEECH_REL = SRC + "/SpeechOffloadHandler.kt"
 CALL = "resolveMaybeRelative("
+# deep-audit-1034 A2 / ISSUE-03: the same single-source contract, third target —
+# the Shizuku handler resolves the paths it hands to the privileged service.
+SHIZUKU_REL = SRC + "/ShizukuOffloadHandler.kt"
 # A Kotlin string template that joins a cwd itself — the shape that must not
 # reappear in either target file (the join belongs to resolveMaybeRelative).
 INLINE_JOIN = '"$cwd'
@@ -377,6 +380,46 @@ def check_speech_source(raw):
     return problems
 
 
+def check_shizuku_source(raw):
+    """ShizukuOffloadHandler.kt half of the contract (deep-audit-1034 A2 / ISSUE-03).
+
+    The Shizuku service runs OUTSIDE the sandbox: the paths this handler hands to
+    `ls`/`rm`/`cp`/`pm install` must be guest→host translated first. The join is
+    single-source ([resolveMaybeRelative]), the session is what makes the mapping
+    possible at all, and a path that does not resolve must refuse.
+    """
+    code = strip_comments(raw)
+    problems = []
+    resolver = declaration_slice(code, "private fun shizukuHostPath(")
+
+    # Z1 — the guest→host translation delegates the join to the single source.
+    if not resolver:
+        problems.append(("Z1", "declaration 'private fun shizukuHostPath(' not found in the target file"))
+    elif CALL not in resolver:
+        problems.append(("Z1", "shizukuHostPath() does not call resolveMaybeRelative() — a relative "
+                               "path handed to the privileged service cannot be joined onto cwd"))
+
+    # Z2 — the cwd really enters the chain (decision point, not spelling).
+    if resolver and "request.cwd" not in resolver:
+        problems.append(("Z2", "shizukuHostPath() never passes request.cwd — a relative path has "
+                               "nothing to resolve against"))
+
+    # Z3 — a guest path cannot be used by an out-of-sandbox service: map it into
+    #      this session's host tree, or the operand is a silent no-op.
+    if resolver and "resolvePathForSession(" not in resolver:
+        problems.append(("Z3", "shizukuHostPath() does not resolve through "
+                               "PRootKernel.resolvePathForSession — a guest path cannot reach the "
+                               "Shizuku service's host filesystem"))
+
+    # Z4 — relative-vs-absolute is the join's decision, and the join is single-source.
+    if resolver and 'startsWith("/")' in resolver:
+        problems.append(("Z4", "shizukuHostPath() re-implements the relative-vs-absolute decision "
+                               "(startsWith(\"/\") in its body) — it belongs to resolveMaybeRelative()"))
+    if INLINE_JOIN in code:
+        problems.append(("Z4", "a hand-written inline cwd join ('\"$cwd...') is back — the join must "
+                               "stay single-source in resolveMaybeRelative()"))
+    return problems
+
 def check_tree(root):
     problems = []
     main_path = os.path.join(root, TARGET_REL)
@@ -391,6 +434,12 @@ def check_tree(root):
     else:
         with open(speech_path, "r", encoding="utf-8") as fh:
             problems.extend(check_speech_source(fh.read()))
+    shizuku_path = os.path.join(root, SHIZUKU_REL)
+    if not os.path.isfile(shizuku_path):
+        problems.append(("Z0", "target file missing: %s" % SHIZUKU_REL))
+    else:
+        with open(shizuku_path, "r", encoding="utf-8") as fh:
+            problems.extend(check_shizuku_source(fh.read()))
     return main_path, problems
 
 
@@ -525,9 +574,51 @@ _SPEECH_STRAY_JOIN = _SPEECH_CLEAN.replace(
 )
 
 
-def _fixture_root(model_text, speech_text=_SPEECH_CLEAN):
+_SHIZUKU_CLEAN = '''package com.rikkaminis.app.sandbox.offload
+
+class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler {
+    private fun shizukuHostPath(raw: String, request: NativeOffloadRequest): String? {
+        val guestPath = resolveMaybeRelative(raw.trim(), request.cwd)
+        return PRootKernel.resolvePathForSession(request.sessionId, guestPath, context)?.absolutePath
+    }
+
+    private fun fileLs(path: String?, request: NativeOffloadRequest): NativeOffloadResult {
+        val host = shizukuHostPath(path, request)
+            ?: return errEnvelope("PATH_NOT_RESOLVED", "file ls: '$path' does not resolve", args)
+        return ok(ShizukuManager.runProcess(arrayOf("ls", host)))
+    }
+}
+'''
+# The base shape: no shared join at all (a relative path dies) — and with the
+# join gone the cwd is gone too, so both Z1 and Z2 fire (same shape as S1S3).
+_SHIZUKU_NO_JOIN = _SHIZUKU_CLEAN.replace(
+    "resolveMaybeRelative(raw.trim(), request.cwd)",
+    "raw.trim()",
+)
+# The join is there but the cwd is not passed: a relative path has nothing to
+# resolve against.
+_SHIZUKU_NO_CWD = _SHIZUKU_CLEAN.replace(
+    "resolveMaybeRelative(raw.trim(), request.cwd)",
+    'resolveMaybeRelative(raw.trim(), "")',
+)
+# Resolved into the guest spelling: the out-of-sandbox service would get a path
+# that does not exist on the host.
+_SHIZUKU_GUEST_ONLY = _SHIZUKU_CLEAN.replace(
+    "PRootKernel.resolvePathForSession(",
+    "PRootKernel.resolveHostPath(",
+)
+# A second relative-vs-absolute decision grown inside the resolver.
+_SHIZUKU_INLINE_DECISION = _SHIZUKU_CLEAN.replace(
+    "val guestPath = resolveMaybeRelative(raw.trim(), request.cwd)",
+    'val guestPath = if (raw.startsWith("/")) raw '
+    "else resolveMaybeRelative(raw.trim(), request.cwd)",
+)
+
+
+def _fixture_root(model_text, speech_text=_SPEECH_CLEAN, shizuku_text=_SHIZUKU_CLEAN):
     root = tempfile.mkdtemp(prefix="offload-relpath-gate-selftest-")
-    for rel, text in ((TARGET_REL, model_text), (SPEECH_REL, speech_text)):
+    for rel, text in ((TARGET_REL, model_text), (SPEECH_REL, speech_text),
+                      (SHIZUKU_REL, shizuku_text)):
         path = os.path.join(root, rel)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
@@ -549,12 +640,22 @@ def selftest():
          _CLEAN, {"S4"}, _SPEECH_MIC_FIRST),
         ("S3 only: the Speech join is present but a stray inline join is back",
          _CLEAN, {"S3"}, _SPEECH_STRAY_JOIN),
+        # ── [da1034-A2 ISSUE-03] the Shizuku half ──────────────────────────
+        ("Z1Z2: the Shizuku resolver drops the shared join (and the cwd with it)",
+         _CLEAN, {"Z1", "Z2"}, _SPEECH_CLEAN, _SHIZUKU_NO_JOIN),
+        ("Z2: the Shizuku resolver never passes request.cwd",
+         _CLEAN, {"Z2"}, _SPEECH_CLEAN, _SHIZUKU_NO_CWD),
+        ("Z3: the Shizuku resolver keeps the guest spelling",
+         _CLEAN, {"Z3"}, _SPEECH_CLEAN, _SHIZUKU_GUEST_ONLY),
+        ("Z4: a second relative-vs-absolute decision inside the resolver",
+         _CLEAN, {"Z4"}, _SPEECH_CLEAN, _SHIZUKU_INLINE_DECISION),
     ]
     failures = []
     for case in cases:
         label, model_text, expected = case[0], case[1], case[2]
         speech_text = case[3] if len(case) > 3 else _SPEECH_CLEAN
-        root = _fixture_root(model_text, speech_text)
+        shizuku_text = case[4] if len(case) > 4 else _SHIZUKU_CLEAN
+        root = _fixture_root(model_text, speech_text, shizuku_text)
         try:
             _, problems = check_tree(root)
         finally:
@@ -568,7 +669,7 @@ def selftest():
     if failures:
         print("❌ selftest failed: %s" % ", ".join(failures))
         return 1
-    print("OFFLOAD_RELATIVE_PATH_UNIFY_SELFTEST=PASS (9 fixtures: 8 violation "
+    print("OFFLOAD_RELATIVE_PATH_UNIFY_SELFTEST=PASS (13 fixtures: 12 violation "
           "shapes caught, clean tree green)")
     return 0
 
@@ -591,8 +692,9 @@ def main():
         for cid, msg in problems:
             print("  [%s] %s" % (cid, msg))
         return 1
-    print("offload_relative_path_unify_check: %s + %s — OFFLOAD-RELATIVE-PATH-UNIFY GATE OK"
-          % (TARGET_REL, os.path.basename(SPEECH_REL)))
+    print("offload_relative_path_unify_check: %s + %s + %s — "
+          "OFFLOAD-RELATIVE-PATH-UNIFY GATE OK"
+          % (TARGET_REL, os.path.basename(SPEECH_REL), os.path.basename(SHIZUKU_REL)))
     return 0
 
 

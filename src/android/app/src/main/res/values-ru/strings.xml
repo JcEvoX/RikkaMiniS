@@ -1600,6 +1600,7 @@
     <string name="scheduled_delete_title">Удалить запланированную задачу?</string>
     <string name="scheduled_delete_body">«%1$s» будет удалена безвозвратно.</string>
     <string name="scheduled_fuse_notification_title">Запланированная задача приостановлена</string>
+    <string name="scheduled_edit_missing_body">Эта задача больше не существует. Возможно, она была удалена, пока этот экран был открыт.</string>
     <string name="scheduled_fuse_notification_body">«%1$s» не удавался %2$d раз подряд и отключён. Возобновите его в настройках.</string>
 
     <string name="backup_passphrase_title">Зашифрованная резервная копия</string>

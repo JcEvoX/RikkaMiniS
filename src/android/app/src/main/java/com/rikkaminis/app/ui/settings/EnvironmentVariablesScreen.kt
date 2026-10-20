@@ -218,6 +218,20 @@ fun EnvironmentVariablesScreen(
 
     // Add/Edit sheet
     if (showAddSheet || editEntryId != null) {
+        // [da1034-B4] The edit target is resolved from the LIVE list below, so when
+        // the entry disappears while the sheet is up (minis-config
+        // `remove envvars.<KEY>` / backup restore), `editing` resolves to null while
+        // `editEntryId` stays non-null — the sheet silently flips to new-variable
+        // semantics (`isEditing == false`) and Save creates a brand-new entry under
+        // the key the user believes they are editing. Close instead; same decision
+        // as ThinkingRulesSection's editorRequest close (C15b) and
+        // ManageProviderModelsSheet's auto-dismiss (C3). Effect (not composition):
+        // state must not be written during composition.
+        LaunchedEffect(editEntryId, entries) {
+            if (editTargetVanished(entries, editEntryId)) {
+                editEntryId = null
+            }
+        }
         val editing = editEntryId?.let { id -> entries.find { it.id == id } }
         EnvVarFormSheet(
             editEntry = editing,
@@ -255,6 +269,28 @@ fun EnvironmentVariablesScreen(
             },
         )
     }
+}
+
+
+/**
+ * [da1034-B4] Decision point of the edit-sheet disappearance recheck: the sheet is
+ * opened for an id (`editEntryId`), never for an entry, so the target is re-resolved
+ * from the live list on every composition. `true` means the id the sheet was opened
+ * for is no longer in the list — an external delete (`minis-config remove
+ * envvars.<KEY>`, backup restore, the row's own delete confirm) landed while the
+ * sheet was open — and the caller closes the sheet instead of letting
+ * `EnvVarFormSheet` reinterpret the same id as a new variable.
+ *
+ * `editEntryId == null` is the pure "Add" mode (`showAddSheet`) and is never a
+ * disappearance. Kept as a pure function so the decision can be run for real in a
+ * JVM test (the Compose side is only wiring).
+ */
+internal fun editTargetVanished(
+    entries: List<EnvVarRepository.EnvVarEntry>,
+    editEntryId: String?,
+): Boolean {
+    if (editEntryId == null) return false
+    return entries.none { it.id == editEntryId }
 }
 
 

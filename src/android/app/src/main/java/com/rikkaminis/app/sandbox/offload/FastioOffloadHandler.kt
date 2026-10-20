@@ -936,7 +936,20 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
             .put("detail", denied.detail)
 
     private fun usage(reason: String, args: OffloadArgs): String =
-        OffloadOutput.formatBody("minis-fastio: $reason\n$HELP", args) + "\n"
+        // [da1034-A4] ISSUE-08: every caller is an exit-2 usage error, so the
+        // payload is the JSON envelope the error paths use — prose (plus a
+        // bare HELP dump) passed through formatBody untouched and broke a
+        // `jq` / `json.loads` reader. `help` keeps the full HELP text
+        // reachable; `--quiet` now returns just the `error` field, like every
+        // other envelope in this repo.
+        OffloadOutput.formatBody(
+            JSONObject()
+                .put("error", "usage")
+                .put("message", reason)
+                .put("help", HELP)
+                .toString(),
+            args,
+        ) + "\n"
 
     /**
      * Refuse an option this subcommand does not implement. Without this a typo
