@@ -20,8 +20,18 @@ Judged by CODE anchors (comments stripped first — never anchor on comments):
       bare `provides sessionId` forbidden
 
   SessionSkillsSheet.kt
-    * `remember(skills, sessionId)` present (seed must re-derive on id change);
-      `remember(skills) {` (keyless on id) forbidden
+    * the seed must MERGE (mirrors SessionMcpsSheet):
+      `remember(sessionId)` (fresh map per session id) present +
+      `LaunchedEffect(skills, sessionId)` present (re-runs on id change);
+      the rebuild shape `overrides = remember(skills…` (whole map re-derived
+      from the live list — one SQLite read per skill, per emission, inside
+      composition) and the keyless `overrides = remember {` are both forbidden
+
+  [da1034-b3] Until this revision the SessionSkillsSheet criterion was the
+  REBUILD shape (`remember(skills, sessionId) { … isEnabledForSession … }`) —
+  the gate itself pinned the defect in place and made the two sheets
+  contradictory (the Mcps criterion already demanded the incremental merge).
+  Both sheets are now judged by the same incremental-merge shape.
 
   SessionMcpsSheet.kt
     * `remember(sessionId)` (fresh map per session id) present;
@@ -308,16 +318,37 @@ def check_sessions_shared(code, findings):
 
 
 def check_skills_sheet(code, findings):
+    """[da1034-b3] Same incremental-merge criterion as [check_mcps_sheet].
+
+    The previous criterion required the REBUILD shape
+    (`overrides = remember(skills, sessionId) { … }`), so this gate held the
+    defect in place and directly contradicted the Mcps criterion below: the
+    rebuild re-derived the whole map from the live list on every emission —
+    one `isEnabledForSession` SQLite read per skill, inside composition — and
+    threw away any toggle the user had already flipped in the open sheet. The
+    two sheets are checked by the same shape now.
+    """
     code = strip_comments(code)
-    if not re.search(r"overrides\s*=\s*remember\s*\(\s*skills\s*,\s*sessionId\s*\)", code):
+    if not re.search(r"overrides\s*=\s*remember\s*\(\s*sessionId\s*\)", code):
         findings.append(
-            "SessionSkillsSheet.kt: overrides `remember` must be keyed on sessionId "
-            "(expected `overrides = remember(skills, sessionId)`) — otherwise the map keeps the "
-            "pre-promotion __new__ seeds"
+            "SessionSkillsSheet.kt: overrides map must be keyed on sessionId "
+            "(expected `overrides = remember(sessionId)`) — a map rebuilt from the live skills "
+            "list keeps the pre-promotion __new__ seeds and re-runs the seed per emission"
         )
-    if re.search(r"overrides\s*=\s*remember\s*\(\s*skills\s*\)\s*\{", code):
+    if re.search(r"overrides\s*=\s*remember\s*\(\s*skills", code):
         findings.append(
-            "SessionSkillsSheet.kt: `overrides = remember(skills) {` still present — keyless on sessionId"
+            "SessionSkillsSheet.kt: `overrides = remember(skills…)` full rebuild still present — "
+            "every skills StateFlow emission re-derives the map and runs one isEnabledForSession "
+            "SQLite read per skill inside composition; seed by merging into a sessionId-keyed map "
+            "instead (mirrors SessionMcpsSheet)"
+        )
+    if re.search(r"overrides\s*=\s*remember\s*\{", code):
+        findings.append("SessionSkillsSheet.kt: keyless `overrides = remember {` still present")
+    if not re.search(r"LaunchedEffect\s*\(\s*skills\s*,\s*sessionId\s*\)", code):
+        findings.append(
+            "SessionSkillsSheet.kt: seeding effect must re-run on sessionId change "
+            "(expected `LaunchedEffect(skills, sessionId)`) — otherwise a promoted draft keeps "
+            "the __new__ seeds and never re-derives from the real id"
         )
     return findings
 
@@ -458,13 +489,22 @@ fun ChatScreen() {
 }
 """
 
+# [da1034-b3] OK = incremental merge into a sessionId-keyed map (mirrors
+# FIX_MCPS_OK). The comment names the old shape on purpose: the scanner must
+# judge code, never comments.
 FIX_SKILLS_OK = """\
 fun SessionSkillsSheet(sessionId: String, repo: SkillRepository) {
     val skills by repo.skills.collectAsState()
-    val overrides = remember(skills, sessionId) {
-        mutableStateMapOf<String, Boolean>().apply {
-            for (skill in skills) put(skill.id, repo.isEnabledForSession(skill.id, sessionId))
-        }
+    // `remember(skills, sessionId) { … }` was the OLD rebuild form (comment trap)
+    val overrides = remember(sessionId) {
+        mutableStateMapOf<String, Boolean>()
+    }
+    LaunchedEffect(skills, sessionId) {
+        mergeSessionOverrides(
+            liveIds = skills.map { it.id },
+            overrides = overrides,
+            lookup = { repo.isEnabledForSession(it, sessionId) },
+        )
     }
     // a different remember keyed only on skills stays LEGAL (search filter)
     val filteredSkills by remember(skills) {
@@ -473,14 +513,30 @@ fun SessionSkillsSheet(sessionId: String, repo: SkillRepository) {
 }
 """
 
+# [da1034-b3] the pre-fix shape — this was the gate's OK fixture until the
+# criterion was corrected.
 FIX_SKILLS_DIRTY = """\
 fun SessionSkillsSheet(sessionId: String, repo: SkillRepository) {
     val skills by repo.skills.collectAsState()
-    // remember(skills) { ... } — keyless on sessionId (comment trap: the
-    // scanner must judge code, not this comment)
-    val overrides = remember(skills) {
+    val overrides = remember(skills, sessionId) {
         mutableStateMapOf<String, Boolean>().apply {
             for (skill in skills) put(skill.id, repo.isEnabledForSession(skill.id, sessionId))
+        }
+    }
+}
+"""
+
+FIX_SKILLS_KEYLESS = """\
+fun SessionSkillsSheet(sessionId: String, repo: SkillRepository) {
+    val skills by repo.skills.collectAsState()
+    val overrides = remember {
+        mutableStateMapOf<String, Boolean>()
+    }
+    LaunchedEffect(skills, sessionId) {
+        for (skill in skills) {
+            if (skill.id !in overrides) {
+                overrides[skill.id] = repo.isEnabledForSession(skill.id, sessionId)
+            }
         }
     }
 }
@@ -601,7 +657,10 @@ def selftest():
         # (name, chatscreen, skills, mcps, expect_clean)
         ("compliant tree", FIX_CHATSCEEN_OK, FIX_SKILLS_OK, FIX_MCPS_OK, True),
         ("dirty chatscreen (bare sessionId everywhere)", FIX_CHATSCEEN_DIRTY, FIX_SKILLS_OK, FIX_MCPS_OK, False),
-        ("dirty skills sheet (remember(skills))", FIX_CHATSCEEN_OK, FIX_SKILLS_DIRTY, FIX_MCPS_OK, False),
+        # [da1034-b3] the skills arms flipped direction: the rebuild shape is
+        # now the dirty one, the merge shape the clean one.
+        ("dirty skills sheet (rebuild on skills+sessionId)", FIX_CHATSCEEN_OK, FIX_SKILLS_DIRTY, FIX_MCPS_OK, False),
+        ("dirty skills sheet (keyless remember)", FIX_CHATSCEEN_OK, FIX_SKILLS_KEYLESS, FIX_MCPS_OK, False),
         ("dirty mcps sheet (keyless remember + effect key)", FIX_CHATSCEEN_OK, FIX_SKILLS_OK, FIX_MCPS_DIRTY, False),
         # per-violation precision: exactly one finding each
         ("only markdown site dirty", FIX_CHATSCEEN_DIRTY, FIX_SKILLS_OK, FIX_MCPS_OK, False),
@@ -673,6 +732,36 @@ def selftest():
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
+    # [da1034-b3] the skills arms must name their own anchors and only theirs;
+    # the OK fixture's comment names the old shape (comment trap) and must stay clean.
+    for name, sk, must_mention, must_not_mention, want_count in (
+        ("skills rebuild shape", FIX_SKILLS_DIRTY,
+         ["SessionSkillsSheet", "remember(skills", "LaunchedEffect(skills, sessionId)"],
+         ["keyless"], 3),
+        ("skills keyless shape", FIX_SKILLS_KEYLESS,
+         ["SessionSkillsSheet", "keyless"],
+         ["remember(skills", "LaunchedEffect(skills, sessionId)"], 2),
+    ):
+        root = make_tree(FIX_CHATSCEEN_OK, sk, FIX_MCPS_OK)
+        try:
+            findings = check(root)
+            joined = " | ".join(findings)
+            for hit in must_mention:
+                if hit not in joined:
+                    ok = False
+                    print(f"[selftest FAIL] precision {name}: missing `{hit}` in findings")
+            for hit in must_not_mention:
+                if hit in joined:
+                    ok = False
+                    print(f"[selftest FAIL] precision {name}: unexpected `{hit}` in findings")
+            if len(findings) != want_count:
+                ok = False
+                print(f"[selftest FAIL] precision {name}: expected {want_count} finding(s), got {len(findings)}: {findings}")
+            else:
+                print(f"[selftest ok] precision {name}: exactly {want_count} finding(s), anchors named")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
     # precision: dirty tree findings must name the right anchors
     root = make_tree(FIX_CHATSCEEN_DIRTY, FIX_SKILLS_OK, FIX_MCPS_OK)
     try:
@@ -722,7 +811,8 @@ def main():
             print(f"  - {f}")
         return 1
     print("session_sheet_id_binding_check: OK (4 session-scoped call blocks + LocalMarkdownSessionId "
-          "active-bound, SessionEditSheet call args wired, both sheets + edit-sheet keys id-keyed)")
+          "active-bound, SessionEditSheet call args wired, both sheets id-keyed with incremental "
+          "seeding, edit-sheet keys id-keyed)")
     return 0
 
 
