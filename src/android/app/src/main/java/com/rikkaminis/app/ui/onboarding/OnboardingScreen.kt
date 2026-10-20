@@ -2,6 +2,9 @@ package com.rikkaminis.app.ui.onboarding
 
 import com.rikkaminis.app.R
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.platform.LocalContext
+import com.rikkaminis.app.MinisApp
+import com.rikkaminis.app.logging.AppLogger
 import androidx.compose.foundation.background
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.clickable
@@ -54,6 +57,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import com.rikkaminis.app.ui.components.MinisTextButton
+
+private const val TAG = "OnboardingScreen"
 
 /**
  * Multi-step onboarding flow shown on first launch.
@@ -111,6 +116,15 @@ private fun ApiKeyStep(
     onSkip: () -> Unit,
 ) {
     val scope = rememberCoroutineScope()
+    // [da1034-B1 / B-01] The post-save model fetch must outlive THIS step.
+    // `saved` unlocks Next a few lines down and the next tap moves to the
+    // picker, which disposes ApiKeyStep — a refresh launched on [scope] is
+    // cancelled mid-flight, the provider is saved with an empty model list and
+    // the picker has no retry. Same shape as AddProviderScreen's
+    // [T-provider-save-refresh] (deep-audit-1033 I05): the fetch runs on
+    // MinisApp's application scope when it is reachable.
+    val appContext = LocalContext.current.applicationContext
+    val appScope = (appContext as? MinisApp)?.applicationScope
     var selectedType by remember { mutableStateOf(ProviderType.anthropic) }
     var apiKey by remember { mutableStateOf("") }
     var saved by remember { mutableStateOf(false) }
@@ -217,9 +231,26 @@ private fun ApiKeyStep(
                                 // the real upstream /v1/models list. The onboarding's
                                 // ModelSelectionStep shows what's fetched; the picker's
                                 // stale-while-revalidate covers the rest.
-                                // Fire-and-forget on this screen's scope: `saved` (and
-                                // the Next button) must not wait for the network fetch.
-                                scope.launch { providerRepository.refreshModels(instance) }
+                                // Fire-and-forget: `saved` (and the Next button) must not
+                                // wait for the network fetch.
+                                // [da1034-B1 / B-01] ... and it must not be cancelled by
+                                // the screen it was started from: Next disposes this step
+                                // immediately after `saved` flips. Launch on the app scope;
+                                // the step's own scope is only a last-resort fallback so a
+                                // null app scope degrades to the old (cancellable)
+                                // behaviour instead of dropping the fetch.
+                                if (appScope == null) {
+                                    // refuse-instead-of-guess: the cast cannot fail in
+                                    // production (MinisApp IS the Application), so surface
+                                    // it loudly rather than skipping the refresh silently.
+                                    AppLogger.warning(
+                                        TAG,
+                                        "applicationContext is ${appContext::class.java.name}, " +
+                                            "not MinisApp — model refresh for ${instance.id} " +
+                                            "falls back to this step's scope",
+                                    )
+                                }
+                                (appScope ?: scope).launch { providerRepository.refreshModels(instance) }
                                 saved = true
                             } finally {
                                 saving = false

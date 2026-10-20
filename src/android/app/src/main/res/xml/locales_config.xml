@@ -2,9 +2,18 @@
 <locale-config xmlns:android="http://schemas.android.com/apk/res/android">
     <locale android:name="en"/>
     <locale android:name="zh"/>
+    <!-- [da1034-B1 / B-02] Two mirror-image registration defects, fixed in one
+         edit. `zh-TW` ships a full 1568-key translation in values-zh-rTW/ but
+         was never registered, so the system per-app language picker never
+         offered Chinese (Traditional) — the strings existed and were
+         unreachable. `fr` was the opposite: registered, with no values-fr/
+         directory anywhere in res/, so pure-français users who picked it from
+         the system picker landed on the English default with no signal.
+         Registration must track the resource directories that actually ship —
+         scripts/scan/i18n_check.py now enforces exactly that. -->
+    <locale android:name="zh-TW"/>
     <locale android:name="ja"/>
     <locale android:name="ko"/>
-    <locale android:name="fr"/>
     <locale android:name="de"/>
     <locale android:name="ru"/>
 </locale-config>
