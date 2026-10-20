@@ -96,6 +96,48 @@ internal fun resolveExplicitCalendar(
     return if (hit != null) CalendarSelection.Matched(hit.id) else CalendarSelection.Unmatched
 }
 
+/**
+ * [dv15-A2] A-03: what the caller actually WROTE for the calendar selector.
+ *
+ * "Was the flag written?" and "is the value an id?" used to be answered by two
+ * different readers of the same argument — an existence test
+ * (`args.get("calendar-id") == null`) on the update path and
+ * `getLong("calendar-id")` on the create path. They disagree on a non-numeric
+ * value: `--calendar-id work` reads as "written" (update therefore treats the
+ * selector as explicit) while parsing to `null` (create sees no explicit
+ * selector at all). Classifying the raw string once keeps the two answers apart
+ * and gives [Unreadable] a decision of its own: refuse it, do not guess that the
+ * caller meant a display name.
+ */
+internal sealed class CalendarSelector {
+    /** Neither `--calendar-id` nor `--calendar` was supplied. */
+    object Absent : CalendarSelector()
+
+    /** A numeric `--calendar-id`. */
+    data class ById(val id: Long) : CalendarSelector()
+
+    /** A `--calendar` display-name substring. */
+    data class ByName(val name: String) : CalendarSelector()
+
+    /** `--calendar-id` was supplied but its value is not a number. */
+    data class Unreadable(val raw: String) : CalendarSelector()
+}
+
+/**
+ * [dv15-A2] A-03: single source for "which selector did the caller write?".
+ * Precedence is unchanged (`--calendar-id` before `--calendar`); a
+ * `--calendar-id` that does not parse as a number is [CalendarSelector.Unreadable]
+ * and is never retried as a name (refuse-instead-of-guess).
+ */
+internal fun resolveCalendarSelector(rawId: String?, rawName: String?): CalendarSelector {
+    if (rawId != null) {
+        val id = rawId.toLongOrNull()
+        return if (id != null) CalendarSelector.ById(id) else CalendarSelector.Unreadable(rawId)
+    }
+    if (rawName != null) return CalendarSelector.ByName(rawName)
+    return CalendarSelector.Absent
+}
+
 class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandler {
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
         val args = OffloadArgs(request.argv.drop(1), booleanFlags = setOf("today", "all-day"))
@@ -818,10 +860,23 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
      * returns a refusal ([CalendarTarget.Refused]) instead of writing into the
      * auto-picked calendar. The device having no writable calendar at all keeps
      * the historical `calendar_no_account` answer.
+     *
+     * [dv15-A2] A-03: "the flag was not written" and "the flag was written but
+     * is not an id" are DIFFERENT answers now. [resolveCalendarSelector]
+     * classifies the raw string before any id is parsed, so `--calendar-id work`
+     * refuses (exit 2, naming the raw value) instead of reading as "no selector"
+     * and silently writing into the auto-picked calendar. The auto-pick itself
+     * is untouched: it still runs only when neither flag was supplied.
      */
     private fun requireCalendarTarget(args: OffloadArgs): CalendarTarget {
         val cals = listWritableCalendars()
-        when (val sel = resolveExplicitCalendar(writableCalendarRefs(cals), args.getLong("calendar-id"), args.get("calendar"))) {
+        val selector = resolveCalendarSelector(args.get("calendar-id"), args.get("calendar"))
+        if (selector is CalendarSelector.Unreadable) {
+            return CalendarTarget.Refused(unreadableSelectorError(selector, args))
+        }
+        val id = (selector as? CalendarSelector.ById)?.id
+        val name = (selector as? CalendarSelector.ByName)?.name
+        when (val sel = resolveExplicitCalendar(writableCalendarRefs(cals), id, name)) {
             is CalendarSelection.Matched -> return CalendarTarget.Id(sel.id)
             is CalendarSelection.Unmatched ->
                 return CalendarTarget.Refused(
@@ -836,9 +891,12 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
 
     /** [requireCalendarTarget] but null when NEITHER flag was supplied, so
      *  update keeps its "absence of the flag doesn't move the event" contract.
-     *  An explicit selector that matches nothing still refuses. */
+     *  An explicit selector that matches nothing still refuses — and so does an
+     *  explicit `--calendar-id` whose value is not an id ([dv15-A2] A-03: the
+     *  old existence test here read `--calendar-id work` as "written", so update
+     *  MOVED the event into the auto-picked calendar with exit 0). */
     private fun optionalCalendarTarget(args: OffloadArgs): CalendarTarget? {
-        if (args.get("calendar-id") == null && args.get("calendar") == null) return null
+        if (resolveCalendarSelector(args.get("calendar-id"), args.get("calendar")) is CalendarSelector.Absent) return null
         return requireCalendarTarget(args)
     }
 
@@ -849,11 +907,42 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
     }
 
     /**
+     * [dv15-A2] A-03: `--calendar-id` was written but its value is not an id.
+     * Refuse (exit 2, nothing written) and name the raw value: the pre-fix code
+     * either auto-picked a calendar (create) or MOVED the event into the
+     * auto-picked one (update), both with exit 0 and no hint that the flag had
+     * been ignored. Reading `work` as a display name would be a second guess of
+     * the same kind, so that is not attempted.
+     */
+    private fun unreadableSelectorError(
+        selector: CalendarSelector.Unreadable,
+        args: OffloadArgs,
+    ): NativeOffloadResult =
+        NativeOffloadResult(
+            2,
+            OffloadOutput.formatBody(
+                JSONObject()
+                    .put("error", "calendar_bad_selector")
+                    .put("selector", selector.raw)
+                    .put(
+                        "message",
+                        "--calendar-id '${selector.raw}' is not a calendar id. Nothing was written — pass a numeric id (run `android-calendar calendars` for the list), or use --calendar <name> to match a display name.",
+                    )
+                    .toString(),
+                args,
+            ) + "\n",
+        )
+
+    /**
      * [da1034-A4] ISSUE-07: an explicit `--calendar` / `--calendar-id` that
      * matches no writable calendar. Refusing (exit 1, structured) is the fix:
      * the previous fall-through wrote the event into whatever calendar the
      * auto-pick heuristic preferred. `available` carries the ids the caller
      * could have meant, so the next call can be correct without a round trip.
+     *
+     * [dv15-A2] A-03: the clause that names the selector is now built from the
+     * SAME [resolveCalendarSelector] classification the routing used, so it can
+     * no longer print a bare `null` for a selector that was never written.
      */
     private fun calendarNotFoundError(args: OffloadArgs, cals: JSONArray): NativeOffloadResult {
         val idSel = args.getLong("calendar-id")
@@ -868,13 +957,17 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
                     .put("account_name", c.optString("account_name")),
             )
         }
+        val described = when (val sel = resolveCalendarSelector(args.get("calendar-id"), args.get("calendar"))) {
+            is CalendarSelector.ById -> "--calendar-id ${sel.id}"
+            is CalendarSelector.ByName -> "--calendar '${sel.name}'"
+            is CalendarSelector.Unreadable -> "--calendar-id '${sel.raw}'"
+            CalendarSelector.Absent -> "the requested selector"
+        }
         val body = JSONObject()
             .put("error", "calendar_not_found")
             .put(
                 "message",
-                "No writable calendar matches " +
-                    (if (idSel != null) "--calendar-id $idSel" else "--calendar '$nameSel'") +
-                    ". Nothing was written — pick an id from `available`, or drop the flag to use the auto-picked calendar. Run `android-calendar calendars` to list them.",
+                "No writable calendar matches $described. Nothing was written — pick an id from `available`, or drop the flag to use the auto-picked calendar. Run `android-calendar calendars` to list them.",
             )
             .put("available", available)
         if (idSel != null) body.put("calendar_id", idSel)

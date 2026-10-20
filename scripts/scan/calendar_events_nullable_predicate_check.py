@@ -325,8 +325,9 @@ def rule_c(src):
     problems = []
     if "resolveExplicitCalendar(" not in src:
         problems.append("resolveExplicitCalendar() is gone — the explicit-selector decision has no single source")
-    if not re.search(r"CalendarSelection\.Unmatched\s*->", src):
-        problems.append("no branch consumes CalendarSelection.Unmatched — a selector miss is not decided anywhere")
+    if not re.search(r"CalendarSelection\.Unmatched\s*->\s*return CalendarTarget\.Refused\(", src):
+        problems.append("no branch turns CalendarSelection.Unmatched into a refusal — a selector miss is"
+                        " either undecided or falls through to the auto-pick (`-> Unit` also lands here)")
     if "CalendarTarget.Refused(" not in src:
         problems.append("CalendarTarget.Refused( is never constructed — a selector miss does not become a refusal")
     if "calendar_not_found" not in src:
@@ -349,6 +350,45 @@ def rule_c(src):
                 or "CalendarSelection.Unmatched" in listing):
             problems.append("doList refuses an unmatched --calendar — on the read path a miss is a"
                             " legitimate empty answer, not a typo to refuse")
+    # [dv15-A2] A-03: "the flag was not written" and "the flag was written but is
+    # not an id" must be DIFFERENT answers. The pre-fix shape answered the first
+    # with a raw existence test and the second with getLong(), so
+    # `--calendar-id work` read as "written" (update therefore treated the
+    # selector as explicit) while parsing to null (create saw no selector at
+    # all) — and BOTH paths silently used, or MOVED the event to, the auto-picked
+    # calendar with exit 0.
+    # Every criterion is anchored on that decision, not on a spelling: the raw
+    # string must be read, parsed as a NULLABLE number, and its unparseable case
+    # must carry a refusal of its own that reaches the write path. The two names
+    # this rule shares with the production code (resolveCalendarSelector() /
+    # CalendarSelector.Unreadable) follow the same convention as
+    # resolveExplicitCalendar() above — they are written into the handler AND
+    # into this gate, so renaming one without the other is a deliberate gate
+    # edit rather than a silent pass.
+    # Judged on CODE, not prose (same reason strip_comments is used for the
+    # read-path check above): the handler legitimately explains the old shape in
+    # a comment, and a gate that trips on its own documentation pushes the next
+    # reader to delete the explanation instead of keeping it.
+    code = strip_comments(src)
+    if not re.search(r'get\(\s*"calendar-id"\s*\)', code):
+        problems.append("the raw --calendar-id string is never read — getLong() alone cannot tell"
+                        " 'not written' from 'written but not a number'")
+    if "toLongOrNull()" not in code:
+        problems.append("no nullable parse of the raw --calendar-id — an unparseable value collapses"
+                        " into the same null as 'not written'")
+    if "calendar_bad_selector" not in code:
+        problems.append("no calendar_bad_selector payload — a written-but-unparseable selector has no"
+                        " refusal of its own (refuse it, do not guess a display name)")
+    target = member_slice(src, "private fun requireCalendarTarget(")
+    if target is None:
+        problems.append("requireCalendarTarget not found — the write-path selector decision moved")
+    elif not re.search(r"CalendarSelector\.Unreadable[\s\S]{0,240}?return CalendarTarget\.Refused\(",
+                       strip_comments(target)):
+        problems.append("an unreadable --calendar-id does not reach a refusal on the write path —"
+                        " it falls through to the auto-pick")
+    if re.search(r'get\(\s*"calendar-id"\s*\)\s*==\s*null', code):
+        problems.append("the flag's existence is tested with `== null` on the raw string — a"
+                        " non-numeric --calendar-id reads as 'not written' again")
     return problems
 
 def run(root, verbose=True):
@@ -458,6 +498,22 @@ internal fun resolveExplicitCalendar(cals: List<CalendarRef>, calendarId: Long?,
     return CalendarSelection.Unmatched
 }
 
+internal sealed class CalendarSelector {
+    object Absent : CalendarSelector()
+    data class ById(val id: Long) : CalendarSelector()
+    data class ByName(val name: String) : CalendarSelector()
+    data class Unreadable(val raw: String) : CalendarSelector()
+}
+
+internal fun resolveCalendarSelector(rawId: String?, rawName: String?): CalendarSelector {
+    if (rawId != null) {
+        val id = rawId.toLongOrNull()
+        return if (id != null) CalendarSelector.ById(id) else CalendarSelector.Unreadable(rawId)
+    }
+    if (rawName != null) return CalendarSelector.ByName(rawName)
+    return CalendarSelector.Absent
+}
+
 class CalendarOffloadHandler {
     private fun doCreate(args: OffloadArgs): NativeOffloadResult {
         val calendarId = when (val target = requireCalendarTarget(args)) {
@@ -482,13 +538,27 @@ class CalendarOffloadHandler {
     }
 
     private fun requireCalendarTarget(args: OffloadArgs): CalendarTarget {
-        when (val sel = resolveExplicitCalendar(refs, args.getLong("calendar-id"), args.get("calendar"))) {
+        val selector = resolveCalendarSelector(args.get("calendar-id"), args.get("calendar"))
+        if (selector is CalendarSelector.Unreadable) {
+            return CalendarTarget.Refused(unreadableSelectorError(selector, args))
+        }
+        val id = (selector as? CalendarSelector.ById)?.id
+        val name = (selector as? CalendarSelector.ByName)?.name
+        when (val sel = resolveExplicitCalendar(refs, id, name)) {
             is CalendarSelection.Matched -> return CalendarTarget.Id(sel.id)
             is CalendarSelection.Unmatched -> return CalendarTarget.Refused(calendarNotFoundError(args))
             null -> Unit
         }
         return CalendarTarget.Id(pickWritableCalendar(cals) ?: 0L)
     }
+
+    private fun optionalCalendarTarget(args: OffloadArgs): CalendarTarget? {
+        if (resolveCalendarSelector(args.get("calendar-id"), args.get("calendar")) is CalendarSelector.Absent) return null
+        return requireCalendarTarget(args)
+    }
+
+    private fun unreadableSelectorError(selector: CalendarSelector.Unreadable, args: OffloadArgs): NativeOffloadResult =
+        NativeOffloadResult(2, OffloadOutput.formatBody(JSONObject().put("error", "calendar_bad_selector").toString(), args))
 
     private fun calendarNotFoundError(args: OffloadArgs): NativeOffloadResult =
         NativeOffloadResult(1, OffloadOutput.formatBody(JSONObject().put("error", "calendar_not_found").toString(), args))
@@ -522,6 +592,28 @@ SELECTOR_RENAMED_PAYLOAD_HANDLER = GREEN_SELECTOR_HANDLER.replace(
 
 SELECTOR_RENAMED_DECISION_HANDLER = GREEN_SELECTOR_HANDLER.replace(
     "resolveExplicitCalendar(", "resolveCalendarSelector(")
+
+# [dv15-A2] A-03 arms — one per new criterion in rule C. Each restores exactly
+# ONE of the ways the pre-fix shape answered "was the flag written?" from the
+# parsed value instead of from the raw string.
+SELECTOR_NO_RAW_READ = GREEN_SELECTOR_HANDLER.replace(
+    'args.get("calendar-id")', 'args.getLong("calendar-id")')
+
+SELECTOR_NO_NULLABLE_PARSE = GREEN_SELECTOR_HANDLER.replace(
+    "toLongOrNull()", "toLong()")
+
+SELECTOR_NO_BAD_SELECTOR_PAYLOAD = GREEN_SELECTOR_HANDLER.replace(
+    '"calendar_bad_selector"', '"calendar_not_found"')
+
+SELECTOR_UNREADABLE_NOT_REFUSED = GREEN_SELECTOR_HANDLER.replace(
+    '''        if (selector is CalendarSelector.Unreadable) {
+            return CalendarTarget.Refused(unreadableSelectorError(selector, args))
+        }
+''', "")
+
+SELECTOR_EXISTENCE_TEST = GREEN_SELECTOR_HANDLER.replace(
+    'if (resolveCalendarSelector(args.get("calendar-id"), args.get("calendar")) is CalendarSelector.Absent) return null',
+    'if (args.get("calendar-id") == null && args.get("calendar") == null) return null')
 
 
 # [dv14-A3] rules D + E fixtures. A synthetic handler carrying: a pure
@@ -663,6 +755,11 @@ def selftest():
         ("the read path (list filter) starts refusing", SELECTOR_FILTER_REFUSES_HANDLER, True),
         ("the refusal payload loses its name", SELECTOR_RENAMED_PAYLOAD_HANDLER, True),
         ("the selector decision loses its single source", SELECTOR_RENAMED_DECISION_HANDLER, True),
+        ("the raw --calendar-id string stops being read", SELECTOR_NO_RAW_READ, True),
+        ("the raw selector is parsed without a nullable parse", SELECTOR_NO_NULLABLE_PARSE, True),
+        ("the written-but-unparseable selector loses its payload", SELECTOR_NO_BAD_SELECTOR_PAYLOAD, True),
+        ("an unreadable selector stops being refused on the write path", SELECTOR_UNREADABLE_NOT_REFUSED, True),
+        ("the flag's existence is tested on the raw string again", SELECTOR_EXISTENCE_TEST, True),
     ]
     for label, body, expect_red in selector_cases:
         root = tempfile.mkdtemp(prefix="calgate-c-")
