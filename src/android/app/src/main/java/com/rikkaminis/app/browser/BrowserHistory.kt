@@ -2,6 +2,9 @@ package com.rikkaminis.app.browser
 
 import android.content.Context
 import android.util.Log
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.update
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -17,6 +20,16 @@ class BrowserHistoryStore private constructor(private val context: Context) {
         private const val TAG = "BrowserHistory"
         private const val MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000L // 7 days
         private const val FILENAME = "browser_history.json"
+
+        /**
+         * [dv15-B3] Stand-in for `_revision` on instances whose constructor
+         * never ran: `BrowserHistorySnapshotTest` allocates the store with
+         * `Unsafe.allocateInstance` (private constructor, Context-bound) and
+         * then calls `record()` on it, so every instance field it did not set
+         * is null there. Substituting a real flow keeps those paths on one
+         * code path instead of special-casing "am I a fake".
+         */
+        private val revisionPlaceholder = MutableStateFlow(0)
 
         @Volatile
         private var instance: BrowserHistoryStore? = null
@@ -38,6 +51,28 @@ class BrowserHistoryStore private constructor(private val context: Context) {
 
     private val entries = mutableListOf<Entry>()
 
+    /**
+     * [dv15-B3] Store-owned refresh signal: bumped by every mutation of
+     * [entries], so a panel can key its memoized snapshot on it and be
+     * invalidated exactly when the list actually changed — including changes
+     * this panel did not make (a `record()` from another browser session, the
+     * 7-day retention prune).
+     *
+     * Nullable on purpose: `BrowserHistorySnapshotTest` allocates the store
+     * with `Unsafe.allocateInstance`, which skips the constructor, and its
+     * concurrency case calls `record()` on that instance — so the bump path
+     * must tolerate the field being null. Reads and writes go through
+     * [revision] / [bumpRevision], which substitute [revisionPlaceholder].
+     */
+    private val _revision: MutableStateFlow<Int>? = MutableStateFlow(0)
+
+    /** Observable count of this store's mutations — see [_revision]. */
+    val revision: StateFlow<Int> get() = _revision ?: revisionPlaceholder
+
+    private fun bumpRevision() {
+        (_revision ?: revisionPlaceholder).update { it + 1 }
+    }
+
     init {
         load()
     }
@@ -51,6 +86,10 @@ class BrowserHistoryStore private constructor(private val context: Context) {
             entries.add(Entry(url = url, title = title))
             pruneOldLocked()
         }
+        // [dv15-B3] entries changed (the early return above is the only path
+        // that reaches here without a change) — let observers see it before
+        // the flash write, which is the slow half.
+        bumpRevision()
         save()
     }
 
@@ -90,7 +129,14 @@ class BrowserHistoryStore private constructor(private val context: Context) {
     }
 
     fun clear() {
-        synchronized(entries) { entries.clear() }
+        // [dv15-B3] bump only when something was actually dropped: observers
+        // do not need a recomposition for a no-op clear.
+        val hadEntries = synchronized(entries) {
+            val had = entries.isNotEmpty()
+            entries.clear()
+            had
+        }
+        if (hadEntries) bumpRevision()
         save()
     }
 
@@ -149,6 +195,9 @@ class BrowserHistoryStore private constructor(private val context: Context) {
                 ))
             }
             pruneOld()
+            // [dv15-B3] a load that found a file changed `entries` — and the
+            // retention prune above can drop rows on its own.
+            bumpRevision()
         } catch (e: Exception) {
             Log.w(TAG, "Failed to load history: ${e.message}")
         }

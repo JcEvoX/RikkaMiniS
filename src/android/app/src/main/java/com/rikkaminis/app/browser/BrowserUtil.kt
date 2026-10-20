@@ -113,9 +113,60 @@ internal fun cookieString(raw: Map<String, Any?>, vararg aliases: String): Strin
 internal fun normalizeBrowserUrl(raw: String): String {
     val trimmed = raw.trim()
     if (trimmed.isEmpty()) return trimmed
-    val scheme = Regex("^[A-Za-z][A-Za-z0-9+.\\-]*:($|[^0-9])")
-    if (scheme.containsMatchIn(trimmed)) return trimmed
+    if (BROWSER_SCHEME_RE.containsMatchIn(trimmed)) return trimmed
     return "https://$trimmed"
+}
+
+/**
+ * [dv15-B3] RFC 3986 scheme — see [normalizeBrowserUrl] for why matching the
+ * scheme (rather than looking for `://`) is what keeps opaque schemes like
+ * `about:blank` intact.
+ *
+ * Promoted to a named constant because a second reader appeared. The address
+ * bar used to carry its own normalizer that tested for `"://"` instead, so
+ * every opaque scheme fell through to the wrong branch: `about:blank` was
+ * searched for, `mailto:a@b.com` became `https://mailto:a@b.com`. "Does this
+ * input carry a scheme" now has exactly one definition and two readers.
+ */
+private val BROWSER_SCHEME_RE = Regex("^[A-Za-z][A-Za-z0-9+.\\-]*:($|[^0-9])")
+
+/**
+ * [dv15-B3] Address-bar input: a URL to load, or a phrase to search?
+ *
+ * The address bar used to answer this itself, and its answer disagreed with
+ * [normalizeBrowserUrl] about what a scheme looks like (see
+ * [BROWSER_SCHEME_RE]). Recognising a URL and spelling one are two halves of
+ * the same rule, so they live together.
+ *
+ * A phrase is anything with a space (`kotlin coroutines`) or a single word
+ * with no dot (`kotlin`); a bare host always carries a dot (`google.com`,
+ * `127.0.0.1:8080`). `localhost:8080` (host + port, no dot) stays a phrase —
+ * that is the pre-existing behaviour, and widening it is out of this fix's
+ * blast radius (report §5).
+ */
+internal fun looksLikeBrowserUrl(raw: String): Boolean {
+    val trimmed = raw.trim()
+    if (trimmed.isEmpty()) return false
+    if (BROWSER_SCHEME_RE.containsMatchIn(trimmed)) return true
+    return !trimmed.contains(' ') && trimmed.contains('.')
+}
+
+/**
+ * [dv15-B3] The address bar's whole decision, in one place.
+ *
+ * `searchUrlFor` is a parameter rather than a constant: the search engine's
+ * URL is a product choice owned by the UI layer, while "is this a URL?" and
+ * "how is a URL spelled?" are syntax rules that must each have exactly one
+ * answer. Keeping it out also keeps this function pure, so a JVM test can pin
+ * the decision with a recording lambda instead of asserting on a Google URL.
+ *
+ * This is an entry point, not a second normalizer: the URL branch delegates to
+ * [normalizeBrowserUrl], which remains the only thing that spells a URL.
+ */
+internal fun resolveBrowserAddressInput(raw: String, searchUrlFor: (String) -> String): String {
+    val trimmed = raw.trim()
+    if (trimmed.isEmpty()) return trimmed
+    return if (looksLikeBrowserUrl(trimmed)) normalizeBrowserUrl(trimmed) else searchUrlFor(trimmed)
 }
 
 /**

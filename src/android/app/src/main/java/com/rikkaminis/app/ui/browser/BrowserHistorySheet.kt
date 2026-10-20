@@ -29,6 +29,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -62,18 +63,29 @@ fun BrowserHistorySheet(
     val yesterdayLabel = stringResource(R.string.browser_history_yesterday)
     val resultsLabel = stringResource(R.string.browser_history_results)
 
-    // [deep-audit-v14 ISSUE-08] The store is a plain in-memory list with no
-    // observable revision, so the sheet owns the refresh signal.
+    // [deep-audit-v14 ISSUE-08] The store is a plain in-memory list, so the
+    // sheet must supply a refresh signal.
     //
     // Before: `remember(searchQuery, historyStore.getEntries().size)` read the
     // whole store — a full sort + copy — three times per recomposition (the
     // key here, the body again, and the Clear button's `enabled`), and a
     // size-only key cannot see an equal-length replacement (a record that
     // pushes one out of the 7-day window leaves the count unchanged, so the
-    // list went stale). Now the store is read ONCE per refresh tick and the
-    // list is keyed on the snapshot's identity — see `historySnapshotKey`.
-    var historyRefreshTick by remember { mutableStateOf(0) }
-    val allEntries = remember(historyRefreshTick) { historyStore.getEntries() }
+    // list went stale). The store is now read ONCE per refresh and the list is
+    // keyed on the snapshot's identity — see `historySnapshotKey`.
+    //
+    // [dv15-B3] ...and the refresh signal is the STORE's, not this sheet's.
+    // Before: `var historyRefreshTick by remember { mutableStateOf(0) }`, bumped
+    // only by the clear-confirm dialog below. A panel-local counter cannot see
+    // the store change on its own — a `record()` from another browser session,
+    // or the 7-day retention prune — so the list stayed stale for the whole
+    // lifetime of the sheet. `BrowserHistoryStore.revision` increments on every
+    // mutation, so keying on it invalidates the read exactly when it changed.
+    // Graded by `scripts/scan/browser_history_snapshot_check.py` arm B1, which
+    // judges this decision (signal owned by the store) rather than the
+    // spelling of the key.
+    val revision by historyStore.revision.collectAsState()
+    val allEntries = remember(revision) { historyStore.getEntries() }
 
     val entries = remember(
         searchQuery,
@@ -223,10 +235,8 @@ fun BrowserHistorySheet(
             confirmButton = {
                 MinisTextButton(onClick = {
                     historyStore.clear()
-                    // [deep-audit-v14 ISSUE-08] the store just changed under the
-                    // snapshot above — without this the list would keep showing
-                    // the cleared entries until the sheet is reopened.
-                    historyRefreshTick++
+                    // [dv15-B3] no local bump needed any more: clear() advances
+                    // the store's revision, which the snapshot key above reads.
                     showClearConfirm = false
                 }) {
                     Text(stringResource(R.string.browser_history_clear), color = MaterialTheme.colorScheme.error)

@@ -1,7 +1,9 @@
 package com.rikkaminis.app.browser
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -294,5 +296,70 @@ class BrowserUtilTest {
         assertEquals("about:blank", normalizeBrowserUrl("  about:blank  "))
         assertEquals("", normalizeBrowserUrl(""))
         assertEquals("", normalizeBrowserUrl("   "))
+    }
+
+    // ── address bar: URL to load, or phrase to search? (dv15-B3) ───────────
+    //
+    // Before: `BrowserSheet` carried its own copy (`normalizeURLInput`) that
+    // recognised a scheme by looking for `"://"`, so every opaque scheme fell
+    // into the wrong branch — `about:blank` was searched for, and
+    // `mailto:a@b.com` became `https://mailto:a@b.com`. The copy is gone; the
+    // decision now sits next to the spelling rule it has to agree with.
+
+    @Test fun `looksLikeBrowserUrl accepts schemes and bare hosts`() {
+        assertTrue(looksLikeBrowserUrl("https://example.com"))
+        assertTrue(looksLikeBrowserUrl("HTTP://EXAMPLE.COM"))
+        assertTrue(looksLikeBrowserUrl("about:blank"))
+        assertTrue(looksLikeBrowserUrl("data:text/html,<b>x</b>"))
+        assertTrue(looksLikeBrowserUrl("mailto:a@b.c"))
+        assertTrue(looksLikeBrowserUrl("file:/data/local/x.html"))
+        assertTrue(looksLikeBrowserUrl("javascript:void(0)"))
+        assertTrue(looksLikeBrowserUrl("minis://workspace/a.html"))
+        assertTrue(looksLikeBrowserUrl("intent://x#Intent;end"))
+        assertTrue(looksLikeBrowserUrl("example.com"))
+        assertTrue(looksLikeBrowserUrl("127.0.0.1:8080/x"))
+        assertTrue(looksLikeBrowserUrl("  example.com  "))
+    }
+
+    @Test fun `looksLikeBrowserUrl rejects phrases`() {
+        assertFalse(looksLikeBrowserUrl("kotlin"))
+        assertFalse(looksLikeBrowserUrl("weather today"))
+        assertFalse(looksLikeBrowserUrl(""))
+        assertFalse(looksLikeBrowserUrl("   "))
+        // host:port with no dot keeps the pre-existing search behaviour
+        assertFalse(looksLikeBrowserUrl("localhost:8080"))
+    }
+
+    @Test fun `address bar keeps opaque schemes intact instead of searching`() {
+        val search: (String) -> String = { "SEARCH:$it" }
+        assertEquals("about:blank", resolveBrowserAddressInput("about:blank", search))
+        assertEquals(
+            "data:text/html,<b>x</b>",
+            resolveBrowserAddressInput("data:text/html,<b>x</b>", search),
+        )
+        assertEquals("mailto:a@b.c", resolveBrowserAddressInput("mailto:a@b.c", search))
+        assertEquals("file:/data/local/x.html", resolveBrowserAddressInput("file:/data/local/x.html", search))
+        assertEquals("minis://workspace/a.html", resolveBrowserAddressInput("minis://workspace/a.html", search))
+    }
+
+    @Test fun `address bar spells bare hosts through the single normalizer`() {
+        val search: (String) -> String = { "SEARCH:$it" }
+        assertEquals("https://example.com", resolveBrowserAddressInput("example.com", search))
+        assertEquals("https://127.0.0.1:8080/x", resolveBrowserAddressInput("127.0.0.1:8080/x", search))
+        assertEquals("https://example.com", resolveBrowserAddressInput("  example.com  ", search))
+    }
+
+    @Test fun `address bar hands phrases to the search callback verbatim`() {
+        val seen = ArrayList<String>()
+        val search: (String) -> String = { q -> seen.add(q); "SEARCH:$q" }
+        assertEquals("SEARCH:kotlin", resolveBrowserAddressInput("kotlin", search))
+        assertEquals("SEARCH:weather today", resolveBrowserAddressInput("weather today", search))
+        assertEquals(listOf("kotlin", "weather today"), seen)
+    }
+
+    @Test fun `address bar passes blanks through without searching`() {
+        val search: (String) -> String = { "SEARCH:$it" }
+        assertEquals("", resolveBrowserAddressInput("", search))
+        assertEquals("", resolveBrowserAddressInput("   ", search))
     }
 }

@@ -2,6 +2,7 @@ package com.rikkaminis.app.browser
 
 import java.lang.reflect.Method
 import java.util.Collections
+import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -160,5 +161,92 @@ class BrowserHistorySnapshotTest {
         blocker.join()
         saveThread.join(5_000)
         assertFalse("save() never completed once the monitor was released", saveThread.isAlive)
+    }
+
+    // ── store-owned refresh signal (dv15-B3) ───────────────────────────────
+
+    /**
+     * Installs a real counter where the constructor would have put one.
+     *
+     * `_revision` is nullable precisely because instances built here skipped
+     * the constructor — the store substitutes a static placeholder on those,
+     * which is what [recordOnAConstructorSkippedInstanceDoesNotThrow] pins.
+     */
+    @Suppress("PrivateApi")
+    private fun installRevision(store: BrowserHistoryStore, flow: MutableStateFlow<Int>) {
+        val f = BrowserHistoryStore::class.java.getDeclaredField("_revision")
+        f.isAccessible = true
+        f.set(store, flow)
+    }
+
+    /**
+     * `BrowserHistorySheet` keys its memoized snapshot on
+     * `historyStore.revision` instead of a panel-local counter, so the counter
+     * must advance on every mutation that can change `getEntries()`.
+     *
+     * Expectations are written as literals on purpose: deriving them from the
+     * store's own constants would let a mutation move the expectation with it
+     * and pass.
+     */
+    @Test
+    fun revisionAdvancesOnRecordAndClear() {
+        val store = allocateStore()
+        val spy = SpyList()
+        installEntries(store, spy)
+        val revision = MutableStateFlow(0)
+        installRevision(store, revision)
+
+        store.record("https://a.example/1", "t")
+        assertEquals(1, revision.value)
+        store.record("https://a.example/2", "t")
+        assertEquals(2, revision.value)
+        store.clear()
+        assertEquals(3, revision.value)
+    }
+
+    /** A consecutive repeat is not stored, so it must not re-notify observers. */
+    @Test
+    fun aRepeatedVisitDoesNotAdvanceRevision() {
+        val store = allocateStore()
+        val spy = SpyList()
+        installEntries(store, spy)
+        val revision = MutableStateFlow(0)
+        installRevision(store, revision)
+
+        store.record("https://a.example/1", "t")
+        store.record("https://a.example/1", "t")
+
+        assertEquals(1, revision.value)
+        assertEquals(1, spy.backing.size)
+    }
+
+    /** Nothing dropped ⇒ nothing to invalidate. */
+    @Test
+    fun clearingAnAlreadyEmptyStoreDoesNotAdvanceRevision() {
+        val store = allocateStore()
+        val spy = SpyList()
+        installEntries(store, spy)
+        val revision = MutableStateFlow(0)
+        installRevision(store, revision)
+
+        store.clear()
+
+        assertEquals(0, revision.value)
+    }
+
+    /**
+     * The constructor-skipped path every test in this class walks: `_revision`
+     * is null here, and `record()` must still store the visit instead of
+     * NPE-ing on the way through the bump.
+     */
+    @Test
+    fun recordOnAConstructorSkippedInstanceDoesNotThrow() {
+        val store = allocateStore()
+        val spy = SpyList()
+        installEntries(store, spy)
+
+        store.record("https://b.example/1", "t")
+
+        assertEquals(1, spy.backing.size)
     }
 }
