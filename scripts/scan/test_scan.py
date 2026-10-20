@@ -2987,6 +2987,166 @@ def test_trace_step_tag():
     shutil.rmtree(root)
 
 
+def test_dv16_chat_ui_interaction():
+    print("━━━ chat_ui_interaction_check (dv16 FIX-4) ━━━")
+    # Three defect families pinned by one gate (B-01 unread isMcp descriptor,
+    # B-02 table copy actions missing from the main-chat toolbar + bare
+    # messageId registry key, B-06 tautological swipe eligibility re-derived
+    # inside an already-guarded branch). The fixtures below are the ground
+    # truth for the load-bearing criteria: each bad tree must flip the gate
+    # red, and the real tree must stay green.
+    script = "chat_ui_interaction_check.py"
+
+    proc = subprocess.run(
+        [sys.executable, os.path.join(SCRIPT_DIR, script), "--selftest"],
+        capture_output=True, text=True,
+    )
+    selftest_out = (proc.stdout or "") + (proc.stderr or "")
+    check("chat UI gate selftest has teeth (CHAT_UI_INTERACTION_SELFTEST=PASS)",
+          proc.returncode == 0 and "CHAT_UI_INTERACTION_SELFTEST=PASS" in selftest_out,
+          selftest_out[-320:])
+
+    rc, out = run_scanner(script, REPO_ROOT)
+    check("chat UI gate on real repo exits 0", rc == 0, out[-320:])
+
+    models = ("src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatModels.kt",
+              "package com.rikkaminis.app.ui.chat\n"
+              "data class SlashCommand(\n"
+              "    val id: String,\n"
+              "    val isSkill: Boolean = false,\n"
+              "    val isMcp: Boolean = false,\n"
+              ")\n")
+    token = ("src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatSlashTokenExt.kt",
+             "package com.rikkaminis.app.ui.chat\n"
+             "fun ChatViewModel.executeSlashCommand(cmd: SlashCommand): String {\n"
+             "    if (cmd.isSkill) { resetSlashMenuState(); return fillComposerWithSlashTitle(cmd, saved) }\n"
+             "    if (cmd.isMcp) { resetSlashMenuState(); return fillComposerWithSlashTitle(cmd, saved) }\n"
+             "    return \"\"\n"
+             "}\n")
+    inp = ("src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatInputArea.kt",
+           "package com.rikkaminis.app.ui.chat\n"
+           "@Composable\n"
+           "fun ChatInputArea() {\n"
+           "    val swipeThresholdPxState = rememberUpdatedState(\n"
+           "        with(LocalDensity.current) { sendSwipeThresholdDp.dp.toPx() },\n"
+           "    )\n"
+           "    val canSwipeSendNow: () -> Boolean = {\n"
+           "        inputFieldValue.text.isNotBlank() || attachments.isNotEmpty()\n"
+           "    }\n"
+           "    val isInstalledRow = cmd.isSkill || cmd.isMcp\n"
+           "    Box(modifier = Modifier.pointerInput(Unit) {\n"
+           "        awaitEachGesture {\n"
+           "            var totalDy = 0f\n"
+           "            if (totalDy < 0) {\n"
+           "                if (canSwipeSendNow()) {\n"
+           "                    sendSwipeProgress = (-totalDy / swipeThresholdPxState.value).coerceIn(0f, 1f)\n"
+           "                }\n"
+           "            }\n"
+           "            val swipedUp = claimed && totalDy < 0\n"
+           "            if (swipedUp && canSwipeSendNow()) {\n"
+           "                performSendOrEnqueue()\n"
+           "                sendSwipeProgress = 0f\n"
+           "            } else if (swipedUp && !canSwipeSendNow() && !inputFocused) {\n"
+           "                sendSwipeProgress = 0f\n"
+           "            }\n"
+           "        }\n"
+           "    }) { Column { } }\n"
+           "}\n")
+    gesture = ("src/android/app/src/main/java/com/rikkaminis/app/ui/chat/MinisTextKitGesture.kt",
+               "package com.rikkaminis.app.ui.chat\n"
+               "@Composable\n"
+               "fun MinisSelectionToolbarHost(controller: SelectionController) {\n"
+               "    Row {\n"
+               "        val tableActions = controller.selectionTableActions()\n"
+               "    }\n"
+               "}\n")
+    selection = ("src/android/app/src/main/java/com/rikkaminis/app/ui/chat/MinisTextKitSelection.kt",
+                 "package com.rikkaminis.app.ui.chat\n"
+                 "class SelectionController {\n"
+                 "    class TableActions(val copyTableMarkdown: () -> Unit)\n"
+                 "    private val tableActionsByMessage =\n"
+                 "        androidx.compose.runtime.mutableStateMapOf<\n"
+                 "            String, androidx.compose.runtime.snapshots.SnapshotStateMap<Int, TableActions>\n"
+                 "        >()\n"
+                 "    fun rememberTableActions(messageId: String, tableIndex: Int, actions: TableActions) {\n"
+                 "        tableActionsByMessage.getOrPut(messageId) {\n"
+                 "            androidx.compose.runtime.mutableStateMapOf()\n"
+                 "        }[tableIndex] = actions\n"
+                 "    }\n"
+                 "    fun forgetTableActions(messageId: String, tableIndex: Int) { }\n"
+                 "    fun selectionTableActions(): TableActions? {\n"
+                 "        val msgId = singleMessageId() ?: return null\n"
+                 "        return tableActionsByMessage[msgId]?.get(0)\n"
+                 "    }\n"
+                 "}\n")
+    stream = ("src/android/app/src/main/java/com/rikkaminis/app/ui/chat/StreamingMarkdownText.kt",
+              "package com.rikkaminis.app.ui.chat\n"
+              "@Composable\n"
+              "private fun RenderTable(block: MdBlock.Table) {\n"
+              "    val messageId = LocalShardId.current?.messageId\n"
+              "    val tableSlotAllocator = LocalShardSubIndexAllocator.current\n"
+              "    val tableIndex = remember { tableSlotAllocator?.next() ?: 0 }\n"
+              "    selectionController.rememberTableActions(messageId, tableIndex, actions)\n"
+              "}\n")
+    mdtoolbar = ("src/android/app/src/main/java/com/rikkaminis/app/ui/chat/MinisMarkdownTextToolbar.kt",
+                 "package com.rikkaminis.app.ui.chat\n"
+                 "@Composable\n"
+                 "fun MinisMarkdownTextToolbarHost(toolbar: Toolbar) {\n"
+                 "    val tableActions = toolbar.selectionController?.selectionTableActions()\n"
+                 "}\n")
+
+    def tree(**over):
+        files = dict([models, token, inp, gesture, selection, stream, mdtoolbar])
+        files.update(over)
+        return make_tree(files)
+
+    # B-01: an MCP row tap must not fall through to the action dispatch
+    root = tree(**{token[0]: token[1].replace(
+        "    if (cmd.isMcp) { resetSlashMenuState(); return fillComposerWithSlashTitle(cmd, saved) }\n", "")})
+    rc, out = run_scanner(script, root)
+    check("missing isMcp branch caught (exit 1)", rc == 1 and "[A2]" in out, f"exit={rc}\n{out[-320:]}")
+    shutil.rmtree(root)
+
+    # B-02a: the main-chat toolbar must be wired to the table actions
+    root = tree(**{gesture[0]: gesture[1].replace(
+        "        val tableActions = controller.selectionTableActions()\n", "")})
+    rc, out = run_scanner(script, root)
+    check("main-chat table wiring dropped caught (exit 1)",
+          rc == 1 and "[B1]" in out, f"exit={rc}\n{out[-320:]}")
+    shutil.rmtree(root)
+
+    # B-02b: the registry key must carry the table dimension
+    root = tree(**{selection[0]: selection[1].replace(
+        "fun rememberTableActions(messageId: String, tableIndex: Int, actions: TableActions)",
+        "fun rememberTableActions(messageId: String, actions: TableActions)")})
+    rc, out = run_scanner(script, root)
+    check("bare-messageId table key caught (exit 1)",
+          rc == 1 and "[B3]" in out, f"exit={rc}\n{out[-320:]}")
+    shutil.rmtree(root)
+
+    # B-06: the tautological eligibility re-derivation inside its own guard
+    root = tree(**{inp[0]: inp[1].replace(
+        "            if (swipedUp && canSwipeSendNow()) {\n",
+        "            if (swipedUp && canSwipeSendNow()) {\n"
+        "                val canSendNow = canSwipeSendNow() || attachments.isNotEmpty()\n")})
+    rc, out = run_scanner(script, root)
+    check("nested dead-branch shape caught (exit 1)",
+          rc == 1 and "[C3]" in out, f"exit={rc}\n{out[-320:]}")
+    shutil.rmtree(root)
+
+    # B-06b: a frozen threshold capture (no rememberUpdatedState) must be caught
+    root = tree(**{inp[0]: inp[1].replace(
+        "    val swipeThresholdPxState = rememberUpdatedState(\n"
+        "        with(LocalDensity.current) { sendSwipeThresholdDp.dp.toPx() },\n"
+        "    )\n",
+        "    val swipeThresholdPxState = with(LocalDensity.current) { sendSwipeThresholdDp.dp.toPx() }\n")})
+    rc, out = run_scanner(script, root)
+    check("frozen swipe threshold caught (exit 1)",
+          rc == 1 and "[C4]" in out, f"exit={rc}\n{out[-320:]}")
+    shutil.rmtree(root)
+
+
+
 def main():
     print("╔══════════════════════════════════════════════════╗")
     print("║  Scan Self-Test (fixture ground truth)          ║")
@@ -3031,6 +3191,7 @@ def main():
     test_da1026_gates()
     test_da1026_arch_gates()
     test_trace_step_tag()
+    test_dv16_chat_ui_interaction()
     test_da1017_external_fixtures()
     test_real_repo()
     print("")

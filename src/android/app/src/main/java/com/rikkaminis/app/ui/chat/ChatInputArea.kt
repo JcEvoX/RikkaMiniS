@@ -185,6 +185,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.compositionLocalOf
@@ -431,13 +432,31 @@ internal fun ChatInputArea(
     // Live fingertip position inside the input bar (px). Hint floats ~60dp
     // above this point so it isn't hidden under the user's thumb.
     var sendSwipeLocation by remember { mutableStateOf(Offset.Zero) }
-    val swipeThresholdPx = with(LocalDensity.current) { sendSwipeThresholdDp.dp.toPx() }
+    val swipeThresholdPxState = rememberUpdatedState(
+        with(LocalDensity.current) { sendSwipeThresholdDp.dp.toPx() },
+    )
+    // [fix/dv16-b] rememberUpdatedState, not a plain val capture: a dynamic
+    // ChatTuning adjustment of the threshold must reach the gesture without
+    // restarting pointerInput(Unit), which freezes the first composition's px.
     // Match iOS: haptic + capsule full-opacity + release-fires-send all
     // engage at this fraction (below 1.0 so user gets earlier confirmation).
     val swipeArmFraction = 0.8f
     val swipeHapticOffsetPx = with(LocalDensity.current) { 60.dp.toPx() }
     val swipeArrowHalfPx = with(LocalDensity.current) { 17.dp.toPx() }
     val swipeHaptics = androidx.compose.ui.platform.LocalHapticFeedback.current
+
+    // [fix/dv16-b] Single send-eligibility predicate for the swipe-up gesture.
+    // The three decision sites (drag hint / release-send / empty-input
+    // keyboard) each used to re-derive it — the release branch even re-derived
+    // it INSIDE an already-`hasText`-guarded block, a dead branch that routed
+    // attachment-only drags to the keyboard instead of sending them. Reads the
+    // field's own TextFieldValue (the single-writer truth the user sees, never
+    // staler than the debounced VM string) + the live attachment list, both at
+    // call time — the gesture block is a long-lived pointerInput(Unit) closure,
+    // so eligibility must be read per-event, not captured once per composition.
+    val canSwipeSendNow: () -> Boolean = {
+        inputFieldValue.text.isNotBlank() || attachments.isNotEmpty()
+    }
 
 
     val performSendOrEnqueue: () -> Unit = handler@{
@@ -610,13 +629,22 @@ internal fun ChatInputArea(
                                 .verticalScrollbar(slashListState),
                         ) {
                         itemsIndexed(filteredSlashCommands, key = { _, c -> c.id }) { index, cmd ->
-                            // Section divider between builtins and
-                            // installed Skills (mirrors iOS divider
-                            // at the first skill row). Drawn as the
-                            // top of the skill row, not between every
-                            // row — keeps the menu visually grouped
-                            // without splitting every command.
-                            if (cmd.isSkill && index > 0 && !filteredSlashCommands[index - 1].isSkill) {
+                            // Section divider between builtins and the
+                            // installed rows (skills + MCP servers —
+                            // mirrors iOS divider at the first installed
+                            // row). Drawn as the top of the row, not
+                            // between every row — keeps the menu visually
+                            // grouped without splitting every command.
+                            // [fix/dv16-b] MCP rows live in the installed
+                            // section too (they come after the skills), so
+                            // the divider condition is the shared installed
+                            // predicate — a bare isSkill test left the first
+                            // MCP row visually merged into the skill group.
+                            val isInstalledRow = cmd.isSkill || cmd.isMcp
+                            val prevIsInstalledRow = index > 0 &&
+                                (filteredSlashCommands[index - 1].isSkill ||
+                                    filteredSlashCommands[index - 1].isMcp)
+                            if (isInstalledRow && index > 0 && !prevIsInstalledRow) {
                                 HorizontalDivider(
                                     thickness = 0.5.dp,
                                     color = ChatColors.toolBorder,
@@ -642,7 +670,8 @@ internal fun ChatInputArea(
                                                 // LIVE input so an action command keeps the
                                                 // user's body text instead of wiping it.
                                                 viewModel.setInputText(viewModel.executeSlashCommand(cmd, inputText))
-                                                // For Skill rows, "/<name> "
+                                                // For the typing-aid rows
+                                                // (skill + MCP), "/<name> "
                                                 // is a typing aid — the user
                                                 // still needs to type
                                                 // arguments. Bring the IME
@@ -650,7 +679,11 @@ internal fun ChatInputArea(
                                                 // they can keep typing
                                                 // without an extra tap on
                                                 // the composer.
-                                                if (cmd.isSkill) {
+                                                // [fix/dv16-b] MCP rows are
+                                                // typing aids too — a bare
+                                                // isSkill test dropped the
+                                                // keyboard on an MCP tap.
+                                                if (cmd.isSkill || cmd.isMcp) {
                                                     try {
                                                         inputFocusRequester.requestFocus()
                                                     } catch (_: IllegalStateException) {
@@ -970,13 +1003,12 @@ internal fun ChatInputArea(
                             }
                             change.consume()
                             if (totalDy < 0) {
-                                // Swiping up. Show hint only when there
-                                // is text to send; otherwise keep the
-                                // overlay hidden and defer keyboard
-                                // activation to onEnd.
-                                val hasText = inputText.isNotBlank()
-                                if (hasText) {
-                                    val newProgress = (-totalDy / swipeThresholdPx).coerceIn(0f, 1f)
+                                // Swiping up. Show the hint only when there is
+                                // something to send (text or attachments);
+                                // otherwise keep the overlay hidden and defer
+                                // keyboard activation to onEnd.
+                                if (canSwipeSendNow()) {
+                                    val newProgress = (-totalDy / swipeThresholdPxState.value).coerceIn(0f, 1f)
                                     if (newProgress >= swipeArmFraction && sendSwipeProgress < swipeArmFraction) {
                                         swipeHaptics.performHapticFeedback(
                                             androidx.compose.ui.hapticfeedback.HapticFeedbackType.LongPress,
@@ -992,14 +1024,14 @@ internal fun ChatInputArea(
                                 sendSwipeProgress = 0f
                             }
                         }
-                        // Drag ended (finger up or pointer cancel).
-                        val hasText = inputText.isNotBlank()
+                        // Drag ended (finger up or pointer cancel). One shared
+                        // eligibility predicate: swiped up with something to
+                        // send → send (or enqueue during streaming); swiped up
+                        // with NOTHING to send and no focus → pop the keyboard.
                         val swipedUp = claimed && totalDy < 0 &&
                             kotlin.math.abs(totalDy) > kotlin.math.abs(totalDx)
-                        if (swipedUp && hasText) {
-                            val attachmentsCount = viewModel.attachments.value.size
-                            val canSendNow = hasText || attachmentsCount > 0
-                            if (sendSwipeProgress >= swipeArmFraction && canSendNow) {
+                        if (swipedUp && canSwipeSendNow()) {
+                            if (sendSwipeProgress >= swipeArmFraction) {
                                 // T-drag-send-queue: route through the
                                 // shared send-or-enqueue handler so a
                                 // drag-to-send during streaming enqueues
@@ -1010,7 +1042,7 @@ internal fun ChatInputArea(
                                 performSendOrEnqueue()
                             }
                             sendSwipeProgress = 0f
-                        } else if (swipedUp && !hasText && !inputFocused) {
+                        } else if (swipedUp && !canSwipeSendNow() && !inputFocused) {
                             // Empty input + collapsed keyboard -> bring
                             // up the keyboard. If the keyboard is
                             // already open, do nothing so a stray drag
