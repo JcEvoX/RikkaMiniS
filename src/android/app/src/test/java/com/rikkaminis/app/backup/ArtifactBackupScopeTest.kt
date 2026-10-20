@@ -12,6 +12,11 @@ import java.io.File
  * deliberately skipped (oversized, non-text, excluded dirs), and the zip
  * prefix-routing that lands "shared/…" and "mcp/…" entries in their roots on
  * restore — with traversal/absolute-path entries rejected.
+ *
+ * [da1034-A1] Also pins the credential edge: the MCP OAuth token bridge
+ * (`mcp-servers/oauth/` — live bearer tokens + client secrets in plaintext)
+ * must never be selected/archived, and a restore of an archive that still
+ * carries it (pre-fix backup) must not clobber the live bridge.
  */
 class ArtifactBackupScopeTest {
 
@@ -204,6 +209,189 @@ class ArtifactBackupScopeTest {
             }
         } finally {
             out.deleteRecursively()
+        }
+    }
+
+    // ── [da1034-A1] credential edge: the MCP OAuth token bridge ──────────
+
+    @Test
+    fun oauthBridgeDirIsNeverSelectedAtAnyDepth() {
+        val sharedRoot = File.createTempFile("scope-oauth-shared", "").apply { delete(); mkdirs() }
+        val mcpRoot = File.createTempFile("scope-oauth-mcp", "").apply { delete(); mkdirs() }
+        try {
+            writeFile(sharedRoot, "report.md", 10)
+            writeFile(sharedRoot, "tools/scan.py", 10)
+            // [da1034-A1] the deny-list is name-based at every level, so a
+            // shared-side dir of the same name is dropped too — see the
+            // negative-decision note in the fix report.
+            writeFile(sharedRoot, "oauth/notes.md", 10)
+            // the real bridge dir: <mcp-servers>/oauth/<server>.json holds
+            // access_token / refresh_token / client_secret in plaintext
+            writeFile(mcpRoot, "oauth/linear.json", 40)
+            writeFile(mcpRoot, "oauth/linear.secret", 8)
+            writeFile(mcpRoot, "servers.json", 5)
+            writeFile(mcpRoot, "knowledge.jsonl", 7)
+            writeFile(mcpRoot, "group/oauth/nested.json", 9)
+
+            val sharedSel = ArtifactBackupScope.select(sharedRoot)
+            assertEquals(listOf("report.md", "tools/scan.py"), sharedSel.files.map { it.relPath })
+
+            val mcpSel = ArtifactBackupScope.select(
+                mcpRoot, allowedExtensions = setOf("json", "jsonl", "md"),
+            )
+            assertEquals(
+                listOf("knowledge.jsonl", "servers.json"),
+                mcpSel.files.map { it.relPath },
+            )
+
+            val zip = File.createTempFile("scope-oauth-zip", ".zip").apply { delete() }
+            try {
+                java.util.zip.ZipOutputStream(zip.outputStream()).use { zos ->
+                    ArtifactArchiver.writeEntries(zos, sharedRoot, sharedSel.files, "shared/")
+                    ArtifactArchiver.writeEntries(zos, mcpRoot, mcpSel.files, "mcp/")
+                }
+                val names = ArrayList<String>()
+                java.util.zip.ZipFile(zip).use { zf ->
+                    val it = zf.entries()
+                    while (it.hasMoreElements()) names.add(it.nextElement().name)
+                }
+                assertEquals(
+                    listOf(
+                        "mcp/knowledge.jsonl",
+                        "mcp/servers.json",
+                        "shared/report.md",
+                        "shared/tools/scan.py",
+                    ),
+                    names.sorted(),
+                )
+                assertFalse(names.any { it.contains("oauth") })
+                // [da1034-A1] 必须保住：shared 侧与 mcp 数据文件的字节逐字节不变
+                // （writeFile 写入 size 个 'a'，这里按字面量断言，不从被测代码推导）
+                java.util.zip.ZipFile(zip).use { zf ->
+                    assertEquals(
+                        "aaaaaaaaaa",
+                        zf.getInputStream(zf.getEntry("shared/report.md")).readBytes()
+                            .toString(Charsets.UTF_8),
+                    )
+                    assertEquals(
+                        "aaaaaaaaaa",
+                        zf.getInputStream(zf.getEntry("shared/tools/scan.py")).readBytes()
+                            .toString(Charsets.UTF_8),
+                    )
+                    assertEquals(
+                        "aaaaa",
+                        zf.getInputStream(zf.getEntry("mcp/servers.json")).readBytes()
+                            .toString(Charsets.UTF_8),
+                    )
+                    assertEquals(
+                        "aaaaaaa",
+                        zf.getInputStream(zf.getEntry("mcp/knowledge.jsonl")).readBytes()
+                            .toString(Charsets.UTF_8),
+                    )
+                }
+            } finally {
+                zip.delete()
+            }
+        } finally {
+            sharedRoot.deleteRecursively(); mcpRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun sandboxEnvExclusionStillHoldsNextToOauthDenyList() {
+        val root = File.createTempFile("scope-both", "").apply { delete(); mkdirs() }
+        try {
+            writeFile(root, "keep.md", 10)
+            writeFile(root, "sandbox-env/apk-world.txt", 10)
+            writeFile(root, "oauth/token.json", 10)
+            // nested sandbox-env is still walked (root-only exclusion), while
+            // the oauth deny-list applies at any depth
+            writeFile(root, "nested/sandbox-env/notes.md", 10)
+            writeFile(root, "nested/oauth/notes.md", 10)
+
+            val sel = ArtifactBackupScope.select(root)
+            assertEquals(
+                listOf("keep.md", "nested/sandbox-env/notes.md"),
+                sel.files.map { it.relPath },
+            )
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun mcpOAuthEntryNameRecognisesEveryRouteIntoTheBridgeDir() {
+        assertTrue(ConfigBackup.isMcpOAuthEntryName("mcp/oauth/linear.json"))
+        assertTrue(ConfigBackup.isMcpOAuthEntryName("mcp/oauth/"))
+        assertTrue(ConfigBackup.isMcpOAuthEntryName("mcp//oauth/linear.json"))
+        assertTrue(ConfigBackup.isMcpOAuthEntryName("mcp/./oauth/linear.json"))
+        assertTrue(ConfigBackup.isMcpOAuthEntryName("./mcp/oauth/linear.json"))
+        assertFalse(ConfigBackup.isMcpOAuthEntryName("mcp/servers.json"))
+        assertFalse(ConfigBackup.isMcpOAuthEntryName("mcp/servers/oauth.json"))
+        assertFalse(ConfigBackup.isMcpOAuthEntryName("shared/oauth/notes.md"))
+        assertFalse(ConfigBackup.isMcpOAuthEntryName("oauth/linear.json"))
+    }
+
+    @Test
+    fun stage9FilterKeepsRestoreFromClobberingTheLiveBridge() {
+        val mcpRoot = File.createTempFile("stage9-mcp", "").apply { delete(); mkdirs() }
+        val sharedRoot = File.createTempFile("stage9-shared", "").apply { delete(); mkdirs() }
+        try {
+            // this device's live bridge + a normal mcp data file
+            writeFile(mcpRoot, "servers.json", 5)
+            File(mcpRoot, "oauth").mkdirs()
+            val liveBridge = File(mcpRoot, "oauth/linear.json").apply { writeText("LIVE") }
+            assertFalse(File(mcpRoot, "oauth/linear.secret").exists())
+
+            val zip = File.createTempFile("stage9-zip", ".zip").apply { delete() }
+            val filtered = File.createTempFile("stage9-filtered", ".zip").apply { delete() }
+            val dests = mapOf("mcp" to mcpRoot, "shared" to sharedRoot)
+            try {
+                // an archive written by a PRE-FIX build: bridge entries intact
+                java.util.zip.ZipOutputStream(zip.outputStream()).use { zos ->
+                    zos.putNextEntry(java.util.zip.ZipEntry("mcp/oauth/linear.json"))
+                    zos.write("STALE".toByteArray()); zos.closeEntry()
+                    zos.putNextEntry(java.util.zip.ZipEntry("mcp/oauth/linear.secret"))
+                    zos.write("stale-secret".toByteArray()); zos.closeEntry()
+                    zos.putNextEntry(java.util.zip.ZipEntry("mcp/servers.json"))
+                    zos.write("S".toByteArray()); zos.closeEntry()
+                    zos.putNextEntry(java.util.zip.ZipEntry("shared/report.md"))
+                    zos.write("R".toByteArray()); zos.closeEntry()
+                }
+
+                // negative control: without the Stage 9 filter the archive
+                // really does overwrite the live bridge (so the test has teeth)
+                val wouldClobber = ArtifactArchiver.extractZipByPrefix(zip, dests)
+                assertEquals(4, wouldClobber)
+                assertEquals("STALE", liveBridge.readText())
+
+                liveBridge.writeText("LIVE")
+                File(mcpRoot, "oauth/linear.secret").delete()
+                assertEquals(2, ConfigBackup.stripMcpOAuthEntries(zip, filtered))
+                assertEquals(2, ArtifactArchiver.extractZipByPrefix(filtered, dests))
+
+                assertEquals("LIVE", liveBridge.readText())
+                assertFalse(File(mcpRoot, "oauth/linear.secret").exists())
+                assertEquals("S", File(mcpRoot, "servers.json").readText())
+                assertEquals("R", File(sharedRoot, "report.md").readText())
+
+                // a post-fix archive carries no bridge entries → nothing dropped
+                val clean = File.createTempFile("stage9-clean", ".zip").apply { delete() }
+                val cleanOut = File.createTempFile("stage9-clean-out", ".zip").apply { delete() }
+                try {
+                    java.util.zip.ZipOutputStream(clean.outputStream()).use { zos ->
+                        zos.putNextEntry(java.util.zip.ZipEntry("mcp/servers.json"))
+                        zos.write("S".toByteArray()); zos.closeEntry()
+                    }
+                    assertEquals(0, ConfigBackup.stripMcpOAuthEntries(clean, cleanOut))
+                } finally {
+                    clean.delete(); cleanOut.delete()
+                }
+            } finally {
+                zip.delete(); filtered.delete()
+            }
+        } finally {
+            mcpRoot.deleteRecursively(); sharedRoot.deleteRecursively()
         }
     }
 }

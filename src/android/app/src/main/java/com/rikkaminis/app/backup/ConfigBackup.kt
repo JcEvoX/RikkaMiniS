@@ -1471,7 +1471,28 @@ object ConfigBackup {
                             val prefix = if (root.name == "mcp-servers") "mcp" else "shared"
                             destByPrefix[prefix] = root
                         }
-                        artifactFilesImported = ArtifactArchiver.extractZipByPrefix(tmp, destByPrefix)
+                        // [da1034-A1] Pre-fix archives (and any hand-crafted
+                        // one) can still carry "mcp/oauth/…" bridge entries —
+                        // live bearer tokens. extractZipByPrefix writes
+                        // entries verbatim, so the ONLY safe place to drop
+                        // them is BEFORE extraction: restoring an old backup
+                        // must never overwrite this device's live token
+                        // bridge. The archive the exporter writes is already
+                        // oauth-free (ArtifactBackupScope.DENIED_DIRS); this
+                        // filter is the restore-side second wall.
+                        val filtered = java.io.File.createTempFile("artifact-restore-", ".zip")
+                        try {
+                            val oauthDropped = stripMcpOAuthEntries(tmp, filtered)
+                            if (oauthDropped > 0) {
+                                skipped.add(
+                                    "artifacts: skipped $oauthDropped oauth bridge entries"
+                                )
+                            }
+                            artifactFilesImported =
+                                ArtifactArchiver.extractZipByPrefix(filtered, destByPrefix)
+                        } finally {
+                            runCatching { filtered.delete() }
+                        }
                     } finally {
                         runCatching { tmp.delete() }
                     }
@@ -1706,6 +1727,70 @@ object ConfigBackup {
      * text / toolUse.input / toolResult.output so no part type can
      * dominate. Returns null when nothing textual survives.
      */
+    /**
+     * [da1034-A1] Copy [src] to [dst] entry-by-entry, DROPPING every entry
+     * that lands in the MCP OAuth bridge namespace — the plaintext token
+     * bridge (`MCPOAuthStore.bridgeDir`, mounted in-guest as
+     * /var/minis/mcp-servers/oauth). Pre-fix archives carry it verbatim
+     * (`includeSecrets=false` never gated this zip), so a restore would
+     * overwrite this device's live token bridge with whatever the source
+     * device had. Returns the number of dropped entries (0 for a clean
+     * archive — the exporter no longer writes them in the first place).
+     * Pure JVM; a write failure propagates to the Stage 9 catch which reports
+     * it through `skipped` instead of half-restoring.
+     */
+    internal fun stripMcpOAuthEntries(src: java.io.File, dst: java.io.File): Int {
+        // [da1034-A1] Both operands are private temp files this process just
+        // created, so this refusal is unreachable today — it is here because
+        // the repo's write contract (`readonly_mount_write_guard`) applies to
+        // every write whose target is a path parameter, and a future caller
+        // must not be able to route this copy into a read-only mount by
+        // reusing the helper.
+        if (com.rikkaminis.app.sandbox.PRootKernel.isLinuxPathUnderReadOnlyMount(dst.absolutePath)) {
+            throw java.io.IOException(
+                "refusing to write the oauth-filtered archive under a read-only mount"
+            )
+        }
+        var dropped = 0
+        java.io.FileOutputStream(dst).use { fos ->
+            java.util.zip.ZipOutputStream(fos.buffered()).use { zos ->
+                java.util.zip.ZipFile(src).use { zf ->
+                    val entries = zf.entries()
+                    while (entries.hasMoreElements()) {
+                        val entry = entries.nextElement()
+                        if (isMcpOAuthEntryName(entry.name)) {
+                            dropped++
+                            continue
+                        }
+                        zos.putNextEntry(java.util.zip.ZipEntry(entry.name))
+                        zf.getInputStream(entry).use { it.copyTo(zos) }
+                        zos.closeEntry()
+                    }
+                }
+            }
+        }
+        return dropped
+    }
+
+    /**
+     * [da1034-A1] True when a zip entry belongs to the MCP OAuth bridge
+     * namespace ("mcp/oauth/…"). Compared segment-wise with empty and "."
+     * segments collapsed, so "mcp//oauth/x.json", "mcp/./oauth/x.json" and
+     * "./mcp/oauth/x.json" all resolve to the same destination and are all
+     * refused — a name that would land inside the live token bridge dir is
+     * dropped, never parsed-then-trusted. ".." never reaches here from a
+     * trusted writer and is rejected wholesale (with absolute paths and
+     * backslashes) by [ArtifactArchiver.extractZipByPrefix].
+     */
+    internal fun isMcpOAuthEntryName(name: String): Boolean {
+        val segs = ArrayList<String>(4)
+        for (seg in name.split('/')) {
+            if (seg.isEmpty() || seg == ".") continue
+            segs.add(seg)
+        }
+        return segs.size >= 2 && segs[0] == "mcp" && segs[1] == "oauth"
+    }
+
     /**
      * [review G1] Strip secret-bearing values from an [exportServerJSON]
      * document. exportServerJSON emits the importable wrapper shape
