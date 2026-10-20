@@ -49,26 +49,15 @@ internal suspend fun ChatViewModel.truncateBeforeEdit(messageId: String) {
     var cutoffSortOrder = -1
     for (entity in dbMessages) {
         if (entity.role == "user") {
-            val hasText = try {
-                val arr = org.json.JSONArray(entity.partsJson)
-                (0 until arr.length()).any { i ->
-                    val o = arr.getJSONObject(i)
-                    // [T-android-retry-attachment-loss] Exclude the now-
-                    // persisted <user-attached-files> XML text part so this
-                    // "is this a visible user bubble?" count stays identical
-                    // to pre-XML-persistence behaviour. An attachments-only
-                    // turn must NOT flip to hasText just because the XML
-                    // inventory is now a text part — that would shift the
-                    // retry/edit cutoff onto the wrong message.
-                    // [T-ios-retry-anchor-synthetic-user] Likewise exclude
-                    // resume()'s synthetic stop-continue <system-reminder>
-                    // user row — it has no UI bubble, so counting it shifts
-                    // the cutoff one user message too early.
-                    o.optString("type") == "text" &&
-                        stripAttachedFilesXml(o.optString("value", "")).isNotBlank() &&
-                        !o.optString("value", "").trimStart().startsWith("<system-reminder>")
-                }
-            } catch (_: Exception) { true }
+            // [T-android-retry-attachment-loss] The XML inventory text part
+            // does NOT make a row visible; [T-ios-retry-anchor-synthetic-user]
+            // the resume() synthetic <system-reminder> row does not either.
+            // [B-05 deep-audit-1037] A mediaRef part (an attachment) DOES.
+            // One shared predicate with the retry walk (ChatViewModel
+            // retryFromMessage) — the old text-only copy disagreed with it for
+            // pure-attachment rows, so the two cutoffs landed on different
+            // rows and the truncation cut the wrong turn.
+            val hasText = userPartsJsonHasVisibleContent(entity.partsJson)
             if (hasText) {
                 if (visibleUserCount == visibleUserIndex) {
                     // ChatDao.deleteMessagesAfter is `sort_order >= <bound>` —
@@ -311,16 +300,13 @@ internal suspend fun ChatViewModel.drainQueuedPrompts(
         Log.i(ChatViewModel.TAG, "📨[DRAIN] Draining ${queued.size} queued prompt(s): " +
             queued.joinToString(", ") { "${it.id}=\"${it.text.take(20)}...\"" })
 
-        // Flip isQueued=false on corresponding chat messages so they render as sent.
-        // T189: also clear queuedPromptId so a later retry of this bubble
-        // doesn't try to drop a phantom queue entry (and so the field state
-        // matches what retryFromMessage's truncate path now produces).
+        // [B-04 deep-audit-1037] The placeholder bubbles are NOT un-queued in
+        // place anymore: once the merged row is persisted they are REMOVED and
+        // replaced by the single user bubble below. The old path flipped the
+        // placeholders to isQueued=false and kept them — N rows on screen
+        // where the DB had 1 — so the retry/edit cutoff counts (which walk
+        // user rows) disagreed with the DB and truncated the wrong turn.
         val queuedIds = queued.map { it.id }.toSet()
-        _messages.value = _messages.value.map { m ->
-            if (m.queuedPromptId != null && queuedIds.contains(m.queuedPromptId)) {
-                m.copy(isQueued = false, queuedPromptId = null)
-            } else m
-        }
 
         // Build a combined user message (text + images from all queued prompts).
         // Persist as a single row.
@@ -348,9 +334,30 @@ internal suspend fun ChatViewModel.drainQueuedPrompts(
         }
         prepared.attachedFilesXml?.let { combinedParts.add(AgentContentPart.Text(it)) }
 
+        // [B-04 deep-audit-1037] Empty-content guard — same shape as the twin
+        // injectQueuedPromptsAsNewTurn's guard. Every queued prompt produced
+        // no content (no text, no attachment survived prepareUserAttachments);
+        // persisting an empty user row is a deterministic provider 400. The
+        // queue was already emptied above, so the placeholder bubbles must go
+        // too (leaving them behind produced dashes with no queue entry —
+        // never drained, never withdrawable otherwise).
+        if (combinedParts.isEmpty()) {
+            AppLogger.warning(
+                ChatViewModel.TAG_STREAM,
+                "drainQueuedPrompts: ${queued.size} queued prompt(s) produced no content, skipping",
+            )
+            withContext(Dispatchers.Main) {
+                removeQueuedPlaceholders(queuedIds)
+            }
+            return null
+        }
+
         val userText = combinedText.toString()
         val userPartsJson = buildUserPartsJson(userText, prepared.mediaRefPartsJson, prepared.attachedFilesXml)
-        chatRepository.appendMessage(sid, "user", userPartsJson)
+        // [B-04 deep-audit-1037] Bind the appended entity: its id is what the
+        // user bubble and the agentHistory entry carry, so the retry/edit
+        // cutoff walk and the compaction anchors can resolve this turn.
+        val userEntity = chatRepository.appendMessage(sid, "user", userPartsJson)
 
         // [T-consecutive-user-bridge] The prior runAgentLoop may have
         // exited with agentHistory ending on user(tool_result) — e.g. the
@@ -367,7 +374,28 @@ internal suspend fun ChatViewModel.drainQueuedPrompts(
             content = userText,
             imageParts = prepared.imageParts,
             contentParts = combinedParts,
+            // [B-04 deep-audit-1037] The twin inject path's agentHistory entry
+            // carries dbMessageId — without it the compaction anchors skip this
+            // turn (isPersistedUserPrompt resolves through the id).
+            dbMessageId = userEntity.id,
         ))
+
+        // [B-04 deep-audit-1037] Converge the UI with the DB: the N queued
+        // placeholder bubbles collapse into the ONE merged user row that was
+        // just persisted (id = userEntity.id, isQueued=false by default, no
+        // queue entry to go stale). Same shape as the inject path's finalize
+        // step — on Main, placeholders dropped through the single funnel.
+        withContext(Dispatchers.Main) {
+            removeQueuedPlaceholders(queuedIds)
+            _messages.value = _messages.value + ChatMessage(
+                id = userEntity.id,
+                role = "user",
+                content = userText,
+                imageUris = prepared.imageUris,
+                attachmentNames = prepared.attachmentNames,
+                attachmentUris = prepared.nonImageUris,
+            )
+        }
 
         try {
             // [P0-fallback-reentry] Re-anchor to the class-level
