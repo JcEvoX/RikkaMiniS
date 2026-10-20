@@ -65,6 +65,20 @@ the same invariant from the other end — "the sheet edits what is on disk":
       rolled back by Save — the reconcile this gate defends was undone by the
       UI. The elvis fallback is required so an entry deleted meanwhile does
       not silently turn the edit sheet into the add flow.
+
+  [dv14-B3] U1 was found pinning the DEFECT as the only legal shape: the elvis
+  keeps the edit sheet open when the entry was deleted externally (reloadFrom
+  Disk / paste-import land while the sheet is open), and Save then stores
+  setClientSecret under a deleted id — orphan credentials against the
+  MCPRepository.kt invariant "credentials exist iff the saved config is a
+  configured URL-transport OAuth server" — while update() returns false and is
+  silently dropped. The elvis is now ALLOWED but no longer sufficient on its
+  own: the call site must also CLOSE the sheet when the listing no longer
+  contains the captured id, via a `LaunchedEffect` keyed on the listing whose
+  body checks `servers.none { … }` and sets `editServer = null` (keyed on the
+  listing so a change re-launches with the fresh value; state is mutated from
+  the effect, never inline in composition). Both legal shapes pass:
+  elvis + close effect (transitional), or no elvis + close effect.
   U2  every `var … by remember` in `MCPFormTab` whose initializer mentions
       `editServer` must be keyed on that entry, so a changed entry re-seeds
       the field states instead of leaving the old values on screen (1027-E
@@ -75,6 +89,13 @@ exactly what drifts. The check walks every `remember` in the function body and
 reports the un-keyed ones by line. Keyed-on-the-entry is required rather than
 any key: `remember(nonce)` would satisfy "has a key" while still never
 re-seeding.
+
+U3 ([dv14-B3]) — the form must not store credentials under a deleted id: every
+function body in the UI file that calls `setClientSecret(` (both the Authorize
+and the Save click handlers) must also check the listing still contains the id
+(`servers.value.none { it.id == … }` guard), refusing instead of aiming at a
+deleted id. A save refused at the guard writes no secret, calls no
+`add`/`update`, and never reaches `onDone()`.
 
 [da1034-A1] Two more criteria extend the same credential invariant to the
 backup surface — the artifact archive is NOT gated by `includeSecrets`:
@@ -502,19 +523,70 @@ def check_ui(code):
         return v, enforced
     live_name = resolve.group(1)
     tail = code[resolve.end():resolve.end() + 40].lstrip()
-    if not tail.startswith("?:"):
-        v.append(
-            "MCPIntegrationsScreen.kt: the live-entry lookup has no `?: ` "
-            "fallback — an entry deleted while the sheet is open would pass "
-            "null to %s, silently turning the edit sheet into the add flow"
-            % UI_RESOLVE_PARAM
-        )
+    # [dv14-B3] close-on-disappear. The elvis alone used to be REQUIRED here —
+    # that pinned the defect as the only legal shape (see docstring). Now the
+    # elvis is allowed, but the call site must also CLOSE the sheet when the
+    # listing no longer contains the captured id: a LaunchedEffect keyed on the
+    # listing whose body checks `servers.none { … }` and sets `editServer =
+    # null`.
+    close = re.search(
+        r"LaunchedEffect\([^)]*" + re.escape(UI_LIST_HOLDER) + r"[^)]*\)\s*\{"
+        r"[^{}]*" + re.escape(UI_LIST_HOLDER) + r"\.none\s*\{[^{}]*\}"
+        r"[^{}]*" + re.escape(UI_ENTRY_PARAM) + r"\s*=\s*null",
+        code,
+    )
+    if close is None:
+        if tail.startswith("?:"):
+            v.append(
+                "MCPIntegrationsScreen.kt: the elvis fallback keeps the edit "
+                "sheet open after the entry was deleted externally, and no "
+                "close-on-disappear effect was found — Save then stores "
+                "setClientSecret under a deleted id (orphan credentials) while "
+                "update() returns false and is silently dropped. Require a "
+                "LaunchedEffect keyed on the listing whose body checks "
+                "`servers.none { … }` and sets `editServer = null`"
+            )
+        else:
+            v.append(
+                "MCPIntegrationsScreen.kt: the live-entry lookup has no `?: ` "
+                "fallback and no close-on-disappear effect — an entry deleted "
+                "while the sheet is open would pass null to %s, silently "
+                "turning the edit sheet into the add flow"
+                % UI_RESOLVE_PARAM
+            )
     if "%s%s," % (UI_LIVE_PASS, live_name) not in code:
         v.append(
             "MCPIntegrationsScreen.kt: `%s` is resolved but never passed as "
             "`%s%s` — the sheet still receives the snapshot"
             % (live_name, UI_LIVE_PASS, live_name)
         )
+
+    # [dv14-B3] U3 — the form must not store credentials under a deleted id.
+    # Per call site: every `setClientSecret(` in the form body (Authorize, Save)
+    # must have a presence guard between its own click handler's start and the
+    # call (`servers.value.none { … }`), refusing instead of aiming at a
+    # deleted id. A body-level check is not enough — one handler's guard would
+    # satisfy the other's removal (m2 caught that). Fail-closed the other way:
+    # no call sites = nothing to orphan.
+    guard_pat = re.escape(UI_LIST_HOLDER) + r"\.value\.none \{"
+    for occ in re.finditer(re.escape(SECRET_ONLY_VERB), body):
+        span_start = body.rfind("onClick", 0, occ.start())
+        if span_start < 0:
+            span_start = 0
+        if not re.search(guard_pat, body[span_start:occ.start()]):
+            v.append(
+                "MCPIntegrationsScreen.kt:%d: the form stores credentials via "
+                "`%s` but the click handler never checks the listing still "
+                "contains the id (no `%s` before the call) — an entry deleted "
+                "while the sheet was open gets orphan credentials, and "
+                "update() returns false and is silently dropped"
+                % (
+                    line_of(code, body_off + occ.start()),
+                    SECRET_ONLY_VERB,
+                    UI_LIST_HOLDER + ".value.none {",
+                )
+            )
+            break
     return v, enforced
 
 
@@ -853,6 +925,9 @@ fun MCPIntegrationsScreen(mcpRepository: MCPRepository) {
     if (editServer != null) {
         editServer?.let { captured ->
             val liveServer = servers.find { it.id == captured.id } ?: captured
+            LaunchedEffect(captured.id, servers) {
+                if (servers.none { it.id == captured.id }) editServer = null
+            }
             MCPAddSheet(
                 mcpRepository = mcpRepository,
                 editServer = liveServer,
@@ -871,6 +946,15 @@ private fun MCPFormTab(editServer: MCPRepository.MCPServerConfig?) {
         mutableStateOf(editServer?.id?.let { MCPOAuthStore.clientSecret(context, it) } ?: "")
     }
     var errorText by remember { mutableStateOf<String?>(null) }
+    fun save() {
+        if (isEdit && servers.value.none { it.id == server.id }) {
+            AppLogger.warning("MCPSheet", "deleted while open; save refused")
+            return
+        }
+        com.rikkaminis.app.mcp.oauth.MCPOAuthStore.setClientSecret(
+            context, server.id, null,
+        )
+    }
 }
 """
 
@@ -889,10 +973,33 @@ BAD_UI_SNAPSHOT = GOOD_UI.replace(
 # live value resolved but never passed through
 BAD_UI_NOT_PASSED = GOOD_UI.replace("editServer = liveServer,", "editServer = captured,")
 
-# resolved without the elvis fallback (deleted entry ⇒ add flow)
-BAD_UI_NO_FALLBACK = GOOD_UI.replace(
+# [dv14-B3] the orphan-credential shape: elvis keeps the sheet in edit mode and
+# the close-on-disappear effect is gone — Save writes setClientSecret under a
+# deleted id while update() returns false, silently dropped
+BAD_UI_ORPHAN = GOOD_UI.replace(
+    """            LaunchedEffect(captured.id, servers) {
+                if (servers.none { it.id == captured.id }) editServer = null
+            }
+""",
+    "",
+)
+
+# resolved without the elvis fallback AND without the close effect (deleted
+# entry ⇒ add flow AND orphan credentials)
+BAD_UI_NO_FALLBACK = BAD_UI_ORPHAN.replace(
     "servers.find { it.id == captured.id } ?: captured",
     "servers.find { it.id == captured.id }",
+)
+
+# [dv14-B3] U3: the form stores credentials but never checks the listing still
+# contains the id (the presence guard is gone)
+BAD_UI_NO_REFUSE = GOOD_UI.replace(
+    """        if (isEdit && servers.value.none { it.id == server.id }) {
+            AppLogger.warning("MCPSheet", "deleted while open; save refused")
+            return
+        }
+""",
+    "",
 )
 
 # the form is gone entirely (anchor drift)
@@ -1091,6 +1198,20 @@ def selftest():
     u_form, _ = check_ui(mask(BAD_UI_NO_FORM))
     expect_trip("renamed form fixture", u_form, "field-state keys this check pins is gone")
 
+    # [dv14-B3] close-on-disappear arms
+    u_orphan, _ = check_ui(mask(BAD_UI_ORPHAN))
+    expect_trip("orphan-credential fixture (elvis, no close effect)", u_orphan,
+                "no close-on-disappear effect was found")
+
+    u_orphan_noelvis, _ = check_ui(mask(BAD_UI_NO_FALLBACK))
+    expect_trip("no-fallback fixture (no elvis, no close effect)", u_orphan_noelvis,
+                "has no `?: ` fallback")
+
+    # [dv14-B3] U3 arms
+    u_norefuse, _ = check_ui(mask(BAD_UI_NO_REFUSE))
+    expect_trip("credential store without presence guard", u_norefuse,
+                "never checks the listing still contains the id")
+
     expect_clean("comment describing the old shape",
                  check_ui(mask(COMMENTED_UI))[0])
     expect_trip("comment claiming a fix", check_ui(mask(LYING_UI))[0], "has no key on that entry")
@@ -1124,6 +1245,8 @@ def selftest():
           % (len(good_ui), good_ui_keyed))
     print("selftest UI arms (unkeyed/snapshot/not-passed/no-fallback/renamed-form) -> %d/%d/%d/%d/%d violation(s)"
           % (len(u_unkeyed), len(u_snap), len(u_pass), len(u_fall), len(u_form)))
+    print("selftest dv14-B3 arms (orphan/no-fallback-no-close/no-refuse-guard) -> %d/%d/%d violation(s)"
+          % (len(u_orphan), len(u_orphan_noelvis), len(u_norefuse)))
     print("selftest oauth-backup arms (deny-set/dead-deny/comment-only/no-wiring/after-extract/hollow-pred/silent-drop/extract-raw) -> %d/%d/%d/%d/%d/%d/%d/%d violation(s)"
           % (len(b_nodeny), len(b_dead), len(b_comment), len(b_nowire), len(b_after),
              len(b_hollow), len(b_noreport), len(b_raw)))

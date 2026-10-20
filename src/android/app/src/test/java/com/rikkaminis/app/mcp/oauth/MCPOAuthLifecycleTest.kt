@@ -8,6 +8,8 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.File
+import java.io.FileNotFoundException
 
 /**
  * [da1024-D] deep-audit-1024 ISSUE-04 — MCP OAuth credential/bridge lifecycle.
@@ -169,5 +171,97 @@ class MCPOAuthLifecycleTest {
         )
         assertNull(McpPkce.canonicalResourceUri("not a url"))
         assertNull(McpPkce.canonicalResourceUri(null))
+    }
+
+    // -- edit sheet wiring ([dv14-B3]) ---------------------------------------
+
+    /**
+     * The orphan-credential half lives in the edit sheet's composable body, so
+     * it cannot be driven off-device (no Context is faked here on purpose, and
+     * the store needs EncryptedSharedPreferences). Assert on the SOURCE of the
+     * declaration that carries the decision instead — the same technique as
+     * PhotosImportShapeTest / SessionPathResolutionTest, so CI runs it.
+     */
+    private val editSheet =
+        "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/MCPIntegrationsScreen.kt"
+
+    private fun repoRoot(): File {
+        System.getProperty("probe.repo")?.let { return File(it) }
+        var dir: File? = File(System.getProperty("user.dir"))
+        while (dir != null) {
+            if (File(dir, editSheet).exists()) return dir
+            dir = dir.parentFile
+        }
+        throw FileNotFoundException("repo root not found from user.dir=${System.getProperty("user.dir")}")
+    }
+
+    private fun readEditSheet(): String {
+        val f = File(repoRoot(), editSheet)
+        if (!f.exists()) throw FileNotFoundException(f.path)
+        return f.readText()
+    }
+
+    @Test
+    fun `the open edit sheet closes itself when the entry disappears`() {
+        val lines = readEditSheet().lines()
+        val start = lines.indexOfFirst { it.contains("LaunchedEffect(captured.id, servers) {") }
+        assertTrue("close-on-disappear effect missing", start >= 0)
+        val effect = lines.subList(start, minOf(start + 4, lines.size)).joinToString("\n")
+        assertTrue(
+            "the effect must re-launch on the LISTING, not only on the id",
+            effect.contains("LaunchedEffect(captured.id, servers) {"),
+        )
+        assertTrue(
+            "the effect must test the live listing and clear the selection",
+            effect.contains("if (servers.none { it.id == captured.id }) editServer = null"),
+        )
+    }
+
+    @Test
+    fun `a deleted entry keeps showing the captured entry instead of the add flow`() {
+        assertTrue(
+            "the tap-time fallback must survive: without it a deleted entry flips the sheet into the add flow",
+            readEditSheet().contains("servers.find { it.id == captured.id } ?: captured"),
+        )
+    }
+
+    @Test
+    fun `no credential write is aimed at an id that left the listing`() {
+        val src = readEditSheet()
+        val callSites = Regex("MCPOAuthStore\\.setClientSecret\\(").findAll(src).map { it.range.first }.toList()
+        assertEquals("the edit sheet is the only place that stores a client secret", 2, callSites.size)
+        for (at in callSites) {
+            val handlerStart = src.lastIndexOf("onClick = {", at)
+            assertTrue("setClientSecret outside a button handler", handlerStart in 0 until at)
+            val handler = src.substring(handlerStart, at)
+            assertTrue(
+                "the handler must refuse an id that is no longer listed",
+                handler.contains("if (isEdit && mcpRepository.servers.value.none { it.id =="),
+            )
+            assertTrue("the refusal must abort the handler", handler.contains("return@MinisTextButton"))
+            assertTrue("the refusal must be logged", handler.contains("AppLogger.warning("))
+        }
+    }
+
+    @Test
+    fun `the form fields stay keyed on the entry so a reopen re-seeds them`() {
+        // [U2] 17 keyed field states — the orphan fix must not disturb them.
+        assertEquals(17, Regex("remember\\(editServer\\)").findAll(readEditSheet()).count())
+    }
+
+    @Test
+    fun `editServer is cleared only by the close effect or a dismissal callback`() {
+        val src = readEditSheet()
+        val occurrences = Regex("editServer\\s*=\\s*null").findAll(src).map { it.range.first }.toList()
+        assertTrue("the sheet must have its dismissal paths", occurrences.size >= 4)
+        for (at in occurrences) {
+            // Passed as an argument to MCPAddSheet, not a mutation.
+            if (Regex("^editServer\\s*=\\s*null\\s*,").containsMatchIn(src.substring(at))) continue
+            val before = src.substring(maxOf(0, at - 600), at)
+            val inEffect = before.contains("LaunchedEffect(captured.id, servers) {") &&
+                !before.substringAfterLast("LaunchedEffect(captured.id, servers) {").contains("\n        }")
+            val inDismissal = before.contains("onDismiss") || before.contains("onRequestDelete")
+            assertTrue("editServer = null outside the close effect / a dismissal callback", inEffect || inDismissal)
+        }
     }
 }
