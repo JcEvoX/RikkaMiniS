@@ -58,6 +58,60 @@ class OffloadArgsValueBindingTest {
         assertTrue(short.hasFlag("v"))
     }
 
+    // ── [dv16-A A-02] a negative number is a POSITIONAL, not a short option ──
+
+    @Test
+    fun `decimal coordinates stay in the positional list`() {
+        // `android-photos near -33.86 -122.41` / `android-weather -33.86 -122.41`:
+        // the single-dash branch read `-33.86` as the short option `33.86`, so
+        // the coordinate vanished from the positional list and the command
+        // either refused ("missing argument") or — once a later token filled
+        // the slot — answered for ANOTHER place.
+        val args = OffloadArgs(listOf("near", "-33.86", "-122.41"))
+        assertEquals(listOf("near", "-33.86", "-122.41"), args.positional)
+        assertFalse(args.hasFlag("33.86"))
+        assertFalse(args.hasFlag("122.41"))
+    }
+
+    @Test
+    fun `an undeclared digit switch is a negative number, a declared one is a switch`() {
+        // `android-shizuku-cli package list -3` (third-party) reads
+        // hasFlag("third-party", "3") through this same branch, and the shizuku
+        // handler DECLARES "3" — a declared name is the only thing that makes a
+        // digit-spelled short flag legal (the declared vocabulary decides, not
+        // the token's shape). Without the declaration the same token is the
+        // caller's value.
+        val declared = OffloadArgs(listOf("package", "list", "-3"), booleanFlags = setOf("3"))
+        assertTrue(declared.hasFlag("3"))
+        assertEquals(listOf("package", "list"), declared.positional)
+
+        val undeclared = OffloadArgs(listOf("package", "list", "-3"))
+        assertFalse(undeclared.hasFlag("3"))
+        assertEquals(listOf("package", "list", "-3"), undeclared.positional)
+    }
+
+    @Test
+    fun `the value short options keep the dv15-A1 contract`() {
+        val f = OffloadArgs(listOf("-f", "pinned"), valueShortOptions = setOf("f"))
+        assertEquals("pinned", f.get("f"))
+        assertFalse(f.hasFlag("f"))
+        assertTrue(f.positional.isEmpty())
+
+        // A declared BOOLEAN wins over a value declaration: `-q` stays --quiet.
+        val q = OffloadArgs(listOf("-q"), booleanFlags = setOf("q"), valueShortOptions = setOf("q"))
+        assertTrue(q.hasFlag("q"))
+        assertNull(q.get("q"))
+    }
+
+    @Test
+    fun `a trailing double dash keeps its reading`() {
+        // `--` is not a separator in this parser (unchanged by this fix): a
+        // trailing one is an empty-key flag, and the tokens before it keep
+        // their positions.
+        val args = OffloadArgs(listOf("list", "--"))
+        assertEquals(listOf("list"), args.positional)
+    }
+
     @Test
     fun `the equals spelling is untouched`() {
         val args = OffloadArgs(listOf("--lat=-33.86"))
