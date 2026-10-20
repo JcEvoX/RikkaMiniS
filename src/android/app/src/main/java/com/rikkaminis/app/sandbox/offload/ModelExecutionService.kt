@@ -1928,11 +1928,11 @@ class ModelExecutionService : Service() {
      * [dv14-A4] ISSUE-08: this used to carry its OWN copy of the dialect — a
      * private `IMAGE_PASSTHROUGH_RESERVED_KEYS` mirroring the app side's
      * `imageReservedKeys` (three copies of the same 17 keys, one of them
-     * dead), a local implicit-keys loop, and its own `optJSONObject(…)` read
-     * of `extra_body` that dropped a present-but-not-an-object value with
-     * ZERO warning
-     * (the exact silent shape da1019 fixed for `extra_headers` — the comment
-     * below about a THIRD copy was true twice over, and this was one of them).
+     * dead), a local implicit-keys loop, and its own zero-warning
+     * `optJSONObject(…)` read of `extra_body` that dropped a
+     * present-but-not-an-object value — the exact silent shape da1019 fixed
+     * for `extra_headers` (the old comment below about a THIRD copy was true
+     * twice over, and this was one of them).
      *
      * [fix/audit-s3m2] Another earlier copy expected an `image_passthrough`
      * envelope that NO caller ever wrote (dead dialect — grep found that line
