@@ -215,12 +215,15 @@ fun AddToHomeSheet(
         }
     }
 
-    var titleText by remember { mutableStateOf("") }
-    LaunchedEffect(parsedTitle, fileName) {
-        if (titleText.isBlank()) {
-            titleText = parsedTitle?.takeIf { it.isNotBlank() }
-                ?: fileName.removeSuffix(".html").removeSuffix(".htm")
-        }
+    // [dv14-B2] The field is seeded from the de-suffixed file name up front;
+    // the async parsed <title> backfills it only while the user hasn't typed
+    // anything of their own. (Pre-fix: an empty initial value raced the async
+    // parse — the first frame blanked the field from fileName, so the parsed
+    // <title> was silently dropped 100% of the time.)
+    var titleText by remember(fileName) { mutableStateOf(webAppTitleFallback(fileName)) }
+    var userEditedTitle by remember { mutableStateOf(false) }
+    LaunchedEffect(parsedTitle) {
+        webAppTitleBackfill(parsedTitle, userEditedTitle)?.let { titleText = it }
     }
 
     var selectedIcon by remember { mutableStateOf<IconChoice>(IconChoice.Preset(IconPreset.Globe)) }
@@ -267,7 +270,10 @@ fun AddToHomeSheet(
                 )
                 OutlinedTextField(
                     value = titleText,
-                    onValueChange = { titleText = sanitizeSingleLineInput(it) },
+                    onValueChange = {
+                        userEditedTitle = true
+                        titleText = sanitizeSingleLineInput(it)
+                    },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
@@ -759,4 +765,22 @@ internal fun sanitizeFileName(fileName: String): String? {
         "", ".", ".." -> null
         else -> last
     }
+}
+
+/**
+ * [dv14-B2] Initial title: the de-suffixed file name. Pure (zero Android
+ * deps) so the seed decision is JVM-testable.
+ */
+internal fun webAppTitleFallback(fileName: String): String =
+    fileName.removeSuffix(".html").removeSuffix(".htm")
+
+/**
+ * [dv14-B2] Backfill decision: the async parsed `<title>` may replace the
+ * seed only while the user hasn't edited the field and the parse produced a
+ * non-blank title; returns null = keep the current field value. Pure.
+ */
+internal fun webAppTitleBackfill(parsedTitle: String?, userEditedTitle: Boolean): String? {
+    if (userEditedTitle) return null
+    if (parsedTitle.isNullOrBlank()) return null
+    return parsedTitle
 }

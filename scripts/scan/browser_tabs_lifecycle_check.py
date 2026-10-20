@@ -22,16 +22,33 @@ cannot satisfy any criterion):
       orphan browser-tabs cleanup itself is session-shape guarded
       (`looksLikeSessionId` OR `__new__` prefix branch present).
 
+[fix/dv14-B2] C4 — the pool's own teardown ordering, checked in
+BrowserTabPool.kt (ONLY the pool file; the store criteria above are
+unaffected):
+  C4a `dispose()` must NOT call `saveState(` (or re-persist to disk): the
+      unconditional saveState() in dispose resurrected a just-deleted
+      session's browser_tabs/<sid>.json on disk;
+  C4b dispose() must still destroy tabs (release half must survive);
+  C4c onTrimMemory / evictIdleTabs must assign the evicted tab's URL into
+      savedURLs AFTER `destroyTab(` — destroyTab removes the entry, so an
+      assignment made before it was silently wiped and the URL was lost.
+  Fail-closed: missing dispose/trim/evict bodies, a missing destroyTab call
+  or a missing savedURLs assignment = red, never a silent skip.
+
 Usage: python3 browser_tabs_lifecycle_check.py <repo_root>
        python3 browser_tabs_lifecycle_check.py --root <repo_root>
        python3 browser_tabs_lifecycle_check.py --selftest
 Exit 0 = pass, 1 = violation, 2 = usage error.
 """
 import os
+import re
 import sys
 
 PKG = "src/android/app/src/main/java/com/rikkaminis/app/data/storage"
 TARGET = "SessionFileStore.kt"
+# [fix/dv14-B2] C4's scan target: ONLY the pool file (scope discipline —
+# the store criteria C1-C3 read SessionFileStore.kt and stay untouched).
+POOL_REL = "src/android/app/src/main/java/com/rikkaminis/app/browser/BrowserTabPool.kt"
 MARKER = "BROWSER_TABS_SELFTEST=PASS"
 
 
@@ -160,6 +177,135 @@ def check_source(source: str) -> list:
     return errs
 
 
+# --- [fix/dv14-B2] C4: pool teardown ordering (separate function — the
+# C1-C3 criteria read SessionFileStore.kt; C4 reads BrowserTabPool.kt only).
+
+def check_pool_source(pool_src: str) -> list:
+    """[fix/dv14-B2] C4 — dispose() must not re-persist; the evicted tab's
+    URL must be stored AFTER destroyTab. Fail-closed throughout."""
+    code = strip_comments(pool_src)
+    errs = []
+    disp = slice_body(code, "fun dispose")
+    if not disp:
+        errs.append("C4: fun dispose( body not extractable (fail-closed)")
+    else:
+        if "saveState(" in disp:
+            errs.append("C4: dispose() must not call saveState( (deleted sessions were being resurrected)")
+        if "destroyTab(" not in disp:
+            errs.append("C4: dispose() no longer destroys tabs (fail-closed)")
+    for fn in ("fun onTrimMemory", "fun evictIdleTabs"):
+        body = slice_body(code, fn)
+        label = fn[4:]
+        if not body:
+            errs.append(f"C4: {label} body not extractable (fail-closed)")
+            continue
+        dpos = body.find("destroyTab(")
+        if dpos < 0:
+            errs.append(f"C4: {label} does not call destroyTab( (fail-closed)")
+            continue
+        w = re.search(r"savedURLs\[[^\]]*\]\s*=", body)
+        if not w:
+            errs.append(f"C4: {label} never assigns the evicted tab's URL into savedURLs (fail-closed)")
+        elif w.start() < dpos:
+            errs.append(f"C4: {label} assigns savedURLs before destroyTab( — destroyTab's remove wipes the entry")
+    return errs
+
+
+# --- [fix/dv14-B2] C4 fixtures (pool teardown ordering) ---
+# Mirrors the production shapes at the decision points only: capture url →
+# destroyTab → store; dispose releases without re-persisting.
+
+POOL_COMPLIANT = """package com.rikkaminis.app.browser
+
+class BrowserTabPool(context: Context) {
+    private val savedURLs = mutableMapOf<Int, String>()
+    private val _tabs = MutableStateFlow<List<Tab>>(emptyList())
+
+    private fun destroyTab(tabs: MutableList<Tab>, tab: Tab) {
+        tabs.remove(tab)
+        // destroyTab removes the entry — storing before this call loses it.
+        savedURLs.remove(tab.id)
+        tab.manager.destroy()
+    }
+
+    fun dispose() {
+        evictionJob?.cancel()
+        evictionJob = null
+        val current = _tabs.value
+        if (current.isNotEmpty()) {
+            val mutable = current.toMutableList()
+            for (tab in current) {
+                destroyTab(mutable, tab)
+            }
+            _tabs.value = emptyList()
+        }
+    }
+
+    override fun onTrimMemory(level: Int) {
+        val victims = _tabs.value.filter { isLongIdle(it) }
+        val currentTabs = _tabs.value.toMutableList()
+        for (tab in victims) {
+            val url = tab.manager.currentURL.value
+            destroyTab(currentTabs, tab)
+            rememberEvictedUrl(url)?.let { savedURLs[tab.id] = it }
+        }
+        _tabs.value = currentTabs
+        saveState()
+    }
+
+    fun evictIdleTabs() {
+        val currentTabs = _tabs.value.toMutableList()
+        val toRemove = currentTabs.filter { !it.inUse }
+        for (tab in toRemove) {
+            val url = tab.manager.currentURL.value
+            destroyTab(currentTabs, tab)
+            rememberEvictedUrl(url)?.let { savedURLs[tab.id] = it }
+        }
+        if (toRemove.isNotEmpty()) {
+            _tabs.value = currentTabs
+            saveState()
+        }
+    }
+}
+"""
+
+# C4a: the pre-fix dispose re-persisted the (possibly just-deleted) session.
+POOL_V_DISPOSE_SAVE = POOL_COMPLIANT.replace(
+    "            _tabs.value = emptyList()\n        }\n    }\n\n    override fun onTrimMemory",
+    "            _tabs.value = emptyList()\n        }\n        saveState()\n    }\n\n    override fun onTrimMemory",
+)
+
+# C4c: URL stored BEFORE destroyTab — silently wiped by its remove().
+POOL_V_TRIM_ORDER = POOL_COMPLIANT.replace(
+    "        for (tab in victims) {\n"
+    "            val url = tab.manager.currentURL.value\n"
+    "            destroyTab(currentTabs, tab)\n"
+    "            rememberEvictedUrl(url)?.let { savedURLs[tab.id] = it }\n",
+    "        for (tab in victims) {\n"
+    "            val url = tab.manager.currentURL.value\n"
+    "            rememberEvictedUrl(url)?.let { savedURLs[tab.id] = it }\n"
+    "            destroyTab(currentTabs, tab)\n",
+)
+
+# C4c: evict path forgets the evicted tab's URL entirely.
+POOL_V_EVICT_NO_STORE = POOL_COMPLIANT.replace(
+    "        for (tab in toRemove) {\n"
+    "            val url = tab.manager.currentURL.value\n"
+    "            destroyTab(currentTabs, tab)\n"
+    "            rememberEvictedUrl(url)?.let { savedURLs[tab.id] = it }\n"
+    "        }\n",
+    "        for (tab in toRemove) {\n"
+    "            destroyTab(currentTabs, tab)\n"
+    "        }\n",
+)
+
+# C4b: dispose keeps re-persisting nothing but stops releasing the tabs.
+POOL_V_DISPOSE_NO_DESTROY = POOL_COMPLIANT.replace(
+    "            for (tab in current) {\n                destroyTab(mutable, tab)\n            }\n",
+    "            for (tab in current) {\n                Log.i(TAG, \"dispose(): destroyed tab ${tab.id}\")\n            }\n",
+)
+
+
 def selftest() -> int:
     compliant = """package com.rikkaminis.app.data.storage
 
@@ -277,6 +423,28 @@ class SessionFileStore internal constructor(
             failures += 1
         else:
             print(f"  OK {name}: {errs if errs else 'green'}")
+
+    # --- [fix/dv14-B2] C4 arms: pool teardown ordering (own fixtures) ---
+    pool_arms = [
+        ("C4 compliant pool", POOL_COMPLIANT, []),
+        ("C4a dispose re-persists saveState()", POOL_V_DISPOSE_SAVE, ["C4"]),
+        ("C4c trim stores the URL before destroyTab", POOL_V_TRIM_ORDER, ["C4"]),
+        ("C4c evict drops the URL assignment", POOL_V_EVICT_NO_STORE, ["C4"]),
+        ("C4b dispose no longer destroys tabs", POOL_V_DISPOSE_NO_DESTROY, ["C4"]),
+    ]
+    for name, sample, expect in pool_arms:
+        errs = check_pool_source(sample)
+        if expect == [] and errs:
+            print(f"  FAIL {name}: expected green, got {errs}")
+            failures += 1
+        elif expect != [] and not errs:
+            print(f"  FAIL {name}: expected red, got green")
+            failures += 1
+        elif expect != [] and not any(err.startswith(c) for c in expect for err in errs):
+            print(f"  FAIL {name}: expected {expect}, got {errs}")
+            failures += 1
+        else:
+            print(f"  OK {name}: {errs if errs else 'green'}")
     if failures:
         print(f"SELFTEST FAILED ({failures} arms)")
         return 1
@@ -307,12 +475,20 @@ def main() -> int:
         print(f"browser_tabs_lifecycle_check RED: cannot read {TARGET}: {e}")
         return 1
     errs = check_source(src)
+    # [fix/dv14-B2] C4 — real tree must carry the pool file (fail-closed).
+    pool_path = os.path.join(root, POOL_REL)
+    try:
+        pool_src = open(pool_path).read()
+    except OSError as e:
+        errs.append(f"C4: cannot read BrowserTabPool.kt: {e}")
+    else:
+        errs += check_pool_source(pool_src)
     if errs:
         print("browser_tabs_lifecycle_check RED:")
         for e in errs:
             print(f"  - {e}")
         return 1
-    print("browser_tabs_lifecycle_check OK (3 criteria)")
+    print("browser_tabs_lifecycle_check OK (4 criteria: C1-C3 store lifecycle + C4 pool teardown ordering)")
     return 0
 
 

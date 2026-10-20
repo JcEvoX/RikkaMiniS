@@ -1402,6 +1402,13 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
      * low-memory callback and destroy every tab's WebView. Call when the owning
      * ViewModel is cleared / the app no longer needs browser tabs. After this
      * the pool must not be used again (create a fresh instance instead).
+     *
+     * [dv14-B2] dispose() must NOT re-persist tab state: each tab already
+     * saved its state in real time on navigate/create/close/evict, and the
+     * owning session's files may have just been deleted (SessionFileStore
+     * deleteSessionFiles) — an unconditional saveState() here resurrected
+     * the deleted session's browser_tabs/<sid>.json (plaintext URLs) on
+     * disk.
      */
     fun dispose() {
         evictionJob?.cancel()
@@ -1417,7 +1424,6 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
             }
             _tabs.value = emptyList()
         }
-        saveState()
     }
 
     // -- ComponentCallbacks2 (low-memory handling) --
@@ -1475,8 +1481,11 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
         val currentTabs = _tabs.value.toMutableList()
         for (tab in victims) {
             val url = tab.manager.currentURL.value
-            if (url.isNotEmpty()) savedURLs[tab.id] = url
             destroyTab(currentTabs, tab)
+            // [dv14-B2] Assign AFTER destroyTab: destroyTab removes the tab's
+            // savedURLs entry, so an assignment made before it was silently
+            // wiped and the evicted tab's URL was lost.
+            rememberEvictedUrl(url)?.let { savedURLs[tab.id] = it }
             Log.i(TAG, "Trimmed tab ${tab.id} (level $level)")
         }
         _tabs.value = currentTabs
@@ -1500,8 +1509,10 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
         val toRemove = currentTabs.filter { !it.inUse && (now - it.lastActivityDate.time) >= timeoutMs }
         for (tab in toRemove) {
             val url = tab.manager.currentURL.value
-            if (url.isNotEmpty()) savedURLs[tab.id] = url
             destroyTab(currentTabs, tab)
+            // [dv14-B2] Same ordering fix as onTrimMemory: the URL must be
+            // stored after destroyTab, which removes the savedURLs entry.
+            rememberEvictedUrl(url)?.let { savedURLs[tab.id] = it }
             Log.i(TAG, "Evicted idle tab ${tab.id}")
         }
         if (toRemove.isNotEmpty()) {
@@ -1661,11 +1672,10 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
             val file = File(dir, "$sid.json")
             val json = JSONObject()
             val urlsJson = JSONObject()
-            for (tab in _tabs.value) {
-                val url = tab.manager.currentURL.value
-                if (url.isNotEmpty()) urlsJson.put(tab.id.toString(), url)
-            }
-            for ((id, url) in savedURLs) {
+            for ((id, url) in mergedTabUrls(
+                _tabs.value.map { Pair(it.id, it.manager.currentURL.value) },
+                savedURLs,
+            )) {
                 urlsJson.put(id.toString(), url)
             }
             json.put("tabURLs", urlsJson)
@@ -1850,3 +1860,28 @@ internal object BrowserSessionBinding {
         return if (w > 0 && h > 0) Viewport(w, h) else Viewport(0, 0)
     }
 }
+
+/**
+ * [dv14-B2] Pure merge used by saveState(): live tab URLs first (blank URLs
+ * skipped), then the evicted-tab entries — a later entry wins on id conflict,
+ * matching the previous JSONObject put-over-put behaviour. Kept as a pure
+ * top-level function so the savedURLs→disk face is JVM-testable.
+ */
+internal fun mergedTabUrls(
+    liveUrls: List<Pair<Int, String>>,
+    evictedUrls: Map<Int, String>,
+): Map<Int, String> {
+    val out = LinkedHashMap<Int, String>()
+    for ((id, url) in liveUrls) {
+        if (url.isNotEmpty()) out[id] = url
+    }
+    out.putAll(evictedUrls)
+    return out
+}
+
+/**
+ * [dv14-B2] The evicted tab's URL is only worth remembering when it is
+ * non-blank — pure form of the `if (url.isNotEmpty())` guard used by the
+ * trim / idle-evict paths (stored AFTER destroyTab, see the call sites).
+ */
+internal fun rememberEvictedUrl(url: String): String? = url.takeIf { it.isNotEmpty() }

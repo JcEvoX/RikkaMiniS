@@ -173,6 +173,101 @@ class BrowserSessionBindingTest {
         )
     }
 
+    // ── [dv14-B2] savedURLs semantics + pool teardown ordering ──────────
+
+    @Test
+    fun `a blank evicted url is not remembered`() {
+        assertEquals("blank urls must not enter savedURLs", null, rememberEvictedUrl(""))
+    }
+
+    @Test
+    fun `a real evicted url is remembered verbatim`() {
+        assertEquals(
+            "the evicted tab's url must survive verbatim",
+            "https://example.com/a?b=1",
+            rememberEvictedUrl("https://example.com/a?b=1"),
+        )
+    }
+
+    @Test
+    fun `dispose must not re-persist the pool state`() {
+        val body = memberSlice(readRepoFile(TabPoolPath), "fun dispose(")
+        assertFalse(
+            "dispose() must not call saveState() — an unconditional write here " +
+                "resurrects a just-deleted session's browser_tabs/<sid>.json:\n$body",
+            body.contains("saveState("),
+        )
+        assertTrue(
+            "dispose() must still release the tabs it owns:\n$body",
+            body.contains("destroyTab("),
+        )
+    }
+
+    @Test
+    fun `trim and idle eviction store the url after destroyTab`() {
+        val src = readRepoFile(TabPoolPath)
+        for (fn in listOf("fun onTrimMemory(", "fun evictIdleTabs(")) {
+            val body = memberSlice(src, fn)
+            val destroy = body.indexOf("destroyTab(")
+            val store = Regex("savedURLs\\[[^\\]]*\\]\\s*=").find(body)?.range?.first ?: -1
+            assertTrue("$fn no longer calls destroyTab(:\n$body", destroy >= 0)
+            assertTrue(
+                "$fn no longer stores the evicted tab's url into savedURLs:\n$body",
+                store >= 0,
+            )
+            assertTrue(
+                "$fn stores the url BEFORE destroyTab( — destroyTab removes the " +
+                    "entry, so the url is silently wiped:\n$body",
+                store > destroy,
+            )
+        }
+    }
+
+    @Test
+    fun `a deleted session's url is not written back by dispose`() {
+        // Model of the two teardown orders, with destroyTab's remove() mirrored:
+        // the production order (store after destroy) keeps the evicted url; the
+        // pre-fix order (store before destroy) lost it.
+        val productionOrder = LinkedHashMap<Int, String>()
+        val id = 7
+        productionOrder[id] = "https://kept.example"
+        productionOrder.remove(id) // destroyTab's savedURLs.remove(tab.id)
+        rememberEvictedUrl("https://kept.example")?.let { productionOrder[id] = it }
+        assertEquals(
+            "the evicted tab's url must still be known after teardown",
+            "https://kept.example",
+            productionOrder[id],
+        )
+
+        val preFixOrder = LinkedHashMap<Int, String>()
+        preFixOrder[id] = "https://kept.example"
+        rememberEvictedUrl("https://kept.example")?.let { preFixOrder[id] = it }
+        preFixOrder.remove(id) // destroyTab runs after the store in the pre-fix shape
+        assertEquals(
+            "the pre-fix order loses the url — this arm documents the defect",
+            null,
+            preFixOrder[id],
+        )
+    }
+
+    @Test
+    fun `saveState merge keeps evicted urls and skips blank live urls`() {
+        val merged = mergedTabUrls(
+            listOf(Pair(1, "https://live.example"), Pair(2, ""), Pair(3, "https://shared.example")),
+            mapOf(4 to "https://evicted.example", 3 to "https://evicted-wins.example"),
+        )
+        assertEquals(
+            "live tab urls are kept, blanks dropped, evicted entries retained — " +
+                "a later entry wins on id conflict",
+            mapOf(
+                1 to "https://live.example",
+                3 to "https://evicted-wins.example",
+                4 to "https://evicted.example",
+            ),
+            merged,
+        )
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────
 
     private fun readRepoFile(relative: String): String {

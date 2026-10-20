@@ -14,6 +14,18 @@ cleanup closure:
   arm4: AddToHomeSheet.kt pin-failure branch must delete the DB row
         (`webAppShortcutRepository.delete(entity.id)`).
 
+[dv14-B2] ISSUE-07 — the title field used to start blank and be filled by a
+first-frame `LaunchedEffect` from the de-suffixed file name; the async parsed
+`<title>` then arrived to a non-blank field and was dropped 100% of the time.
+arm7 pins the decision point (only AddToHomeSheet.kt):
+
+  arm7: the title field is seeded from the file name (`var titleText by
+        remember(<fileName>)` with the seed deriving from fileName), and the
+        `LaunchedEffect(parsedTitle)` backfill is guarded by a user-edited
+        flag that the text-field writer flips (`userEditedTitle = true`) —
+        so a late parse can neither win the race against the seed nor
+        overwrite what the user typed.
+
 [da1032-A] ISSUE-01 — the fullscreen toggle used to have TWO sources (a
 plain `Boolean` field on the Activity plus a `remember(initialFullscreen)`
 copy inside `WebAppHost`). Two arms pin the *decision point* instead of the
@@ -171,6 +183,19 @@ fun AddToHomeSheet(source: WebAppSource, onDismiss: () -> Unit) {
     DisposableEffect(Unit) {
         onDispose { cleanupCopiedAttachment() }
     }
+    var parsedTitle by remember { mutableStateOf<String?>(null) }
+    var titleText by remember(fileName) { mutableStateOf(webAppTitleFallback(fileName)) }
+    var userEditedTitle by remember { mutableStateOf(false) }
+    LaunchedEffect(parsedTitle) {
+        webAppTitleBackfill(parsedTitle, userEditedTitle)?.let { titleText = it }
+    }
+    OutlinedTextField(
+        value = titleText,
+        onValueChange = {
+            userEditedTitle = true
+            titleText = sanitizeSingleLineInput(it)
+        },
+    )
     OutlinedButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }
     scope.launch {
         if (ok) {
@@ -183,6 +208,23 @@ fun AddToHomeSheet(source: WebAppSource, onDismiss: () -> Unit) {
     }
 }
 """
+
+# [dv14-B2] arm7 violations (sheet only; arm3/arm4 anchors untouched):
+#  - the backfill effect ignores the user-edited guard (a late parse wins);
+#  - the text-field writer never flips the guard;
+#  - the field is seeded empty again (the pre-fix race).
+VIOLATION_ARM7_UNGUARDED_BACKFILL = COMPLIANT_SHEET.replace(
+    "        webAppTitleBackfill(parsedTitle, userEditedTitle)?.let { titleText = it }",
+    "        titleText = parsedTitle ?: titleText",
+)
+VIOLATION_ARM7_WRITER_NO_FLAG = COMPLIANT_SHEET.replace(
+    "            userEditedTitle = true\n",
+    "",
+)
+VIOLATION_ARM7_EMPTY_SEED = COMPLIANT_SHEET.replace(
+    "mutableStateOf(webAppTitleFallback(fileName))",
+    'mutableStateOf("")',
+)
 
 
 def strip_comments(src: str) -> str:
@@ -361,6 +403,53 @@ def check_sheet_arm4(src: str) -> bool:
     return "webAppShortcutRepository.delete(entity.id)" in code
 
 
+def _brace_block(code: str, open_idx: int) -> str:
+    depth = 0
+    for j in range(open_idx, len(code)):
+        if code[j] == "{":
+            depth += 1
+        elif code[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return code[open_idx:j + 1]
+    return code[open_idx:]
+
+
+def check_sheet_arm7(src: str) -> bool:
+    """[dv14-B2] Title seed + guarded backfill (AddToHomeSheet.kt only).
+
+    Decision points, not call shapes:
+      - the `titleText` snapshot state is seeded from the file name (so the
+        very first composition already shows the fallback title and a slow
+        async parse cannot win the race by blanking the field);
+      - the text-field writer flips the user-edited guard;
+      - the `LaunchedEffect(parsedTitle)` body is guarded by that flag.
+    Fail-closed on any missing anchor."""
+    code = strip_comments(src)
+    if "titleText" not in code or "parsedTitle" not in code:
+        return False
+    m = re.search(r"\bvar\s+titleText\s+by\s+remember\s*\(", code)
+    if not m:
+        return False
+    open_idx = code.index("(", m.start())
+    seed = _paren_block(code, open_idx)
+    seed_end = open_idx + len(seed)
+    init_brace = code.find("{", seed_end)
+    init = _brace_block(code, init_brace) if init_brace >= 0 else ""
+    if "fileName" not in init:
+        return False
+    if "userEditedTitle" not in code:
+        return False
+    if not re.search(r"userEditedTitle\s*=\s*true", code):
+        return False
+    eff = re.search(r"LaunchedEffect\s*\(\s*parsedTitle[^)]*\)", code)
+    if not eff:
+        return False
+    brace = code.find("{", eff.end())
+    body = _brace_block(code, brace) if brace >= 0 else ""
+    return "userEditedTitle" in body
+
+
 def run_on_tree(root: str) -> int:
     failures = []
     act_path = os.path.join(root, ACTIVITY_REL)
@@ -384,12 +473,15 @@ def run_on_tree(root: str) -> int:
         failures.append("arm5")
     if not check_activity_arm6(act):
         failures.append("arm6")
+    if not check_sheet_arm7(sheet):
+        failures.append("arm7")
 
     if failures:
         print(f"[webapp-asset-url] FAIL arms={','.join(failures)}")
         return 1
-    print("[webapp-asset-url] PASS all 6 arms "
-          "(asset-url single source ×2, sheet cleanup ×2, fullscreen single source ×2)")
+    print("[webapp-asset-url] PASS all 7 arms "
+          "(asset-url single source ×2, sheet cleanup ×2, fullscreen single source ×2, "
+          "title seed + user-edit guard ×1)")
     return 0
 
 
@@ -411,6 +503,12 @@ def selftest() -> int:
              VIOLATION_ARM5_SECOND_COPY, COMPLIANT_SHEET, False),
             ("arm6-violation callback never writes the state",
              VIOLATION_ARM6_SILENT_CALLBACK, COMPLIANT_SHEET, False),
+            ("arm7-violation unguarded backfill overwrites the field",
+             COMPLIANT_ACTIVITY, VIOLATION_ARM7_UNGUARDED_BACKFILL, False),
+            ("arm7-violation writer never flips the guard",
+             COMPLIANT_ACTIVITY, VIOLATION_ARM7_WRITER_NO_FLAG, False),
+            ("arm7-violation empty seed (pre-fix race)",
+             COMPLIANT_ACTIVITY, VIOLATION_ARM7_EMPTY_SEED, False),
         ]
         for name, act, sheet, expected_pass in cases:
             tree = os.path.join(tmp, name.replace(" ", "_").replace("(", "").replace(")", ""))
@@ -446,6 +544,22 @@ def selftest() -> int:
             else:
                 print(f"[webapp-asset-url] SELFTEST FAIL precision {name}: "
                       f"got arm5 red={bad5}, arm6 red={bad6} (want {want})")
+                ok = False
+        # [dv14-B2] arm7 precision: each targeted title violation trips arm7
+        # only (arm3 cleanup + arm4 pin-failure stay green).
+        for name, sheet in (
+            ("unguarded backfill", VIOLATION_ARM7_UNGUARDED_BACKFILL),
+            ("writer without the flag", VIOLATION_ARM7_WRITER_NO_FLAG),
+            ("empty seed", VIOLATION_ARM7_EMPTY_SEED),
+        ):
+            bad7 = not check_sheet_arm7(sheet)
+            others = check_sheet_arm3(sheet) and check_sheet_arm4(sheet)
+            if bad7 and others:
+                print(f"[webapp-asset-url] selftest ok precision {name}: "
+                      f"arm7 red={bad7}, arm3/arm4 green")
+            else:
+                print(f"[webapp-asset-url] SELFTEST FAIL precision {name}: "
+                      f"arm7 red={bad7}, arm3/arm4 green={others}")
                 ok = False
         if ok:
             print("WEBAPP_ASSET_URL_CLEANUP_SELFTEST=PASS")
