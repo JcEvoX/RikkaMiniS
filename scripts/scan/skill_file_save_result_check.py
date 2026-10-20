@@ -22,6 +22,26 @@ a spelling — a refactor that keeps the contract is a deliberate gate edit):
   arm4  `withContext(Dispatchers.IO)` is present in the screen
   arm5  the `preferredId = skillId` pin survives (audit-1015-b4-2 contract)
 
+[dv14-B5] arm6 (independent check function `run_offmain_checks`) — the
+sibling-file disk read must ride IO off the composition thread (the twin of
+MemoryManagementScreen's [deep-audit-1029 ISSUE-03] fix):
+
+  arm6a `skillRepository.readSkillFile(` sits inside a balanced
+        `withContext(Dispatchers.IO)` block (not inside the `remember {}`
+        composition lambda — that ran the read on the main thread of every
+        recomposition)
+  arm6b the read is triggered from a `LaunchedEffect` block (async load,
+        not a synchronous composition-phase call)
+  arm6c the Edit button is gated with `enabled = isLoaded` (a tap before the
+        read lands would open the editor against a blank base and a Save
+        could overwrite the real file with "")
+
+arm2's discovery is anchored on the `val ok =` binding (then the
+`withContext(` that immediately follows it) rather than on the first
+`withContext(` in the screen — the [dv14-B5] async-read `withContext` in the
+`LaunchedEffect` must not shadow the save's context. The asserted contract is
+unchanged.
+
 Usage: python3 scripts/scan/skill_file_save_result_check.py [repo_root]
        python3 scripts/scan/skill_file_save_result_check.py --selftest
 Exit:  0 = clean, 1 = violation(s), 2 = usage
@@ -131,6 +151,74 @@ def balanced_block(text, after_idx, opener="{"):
     return text[i : close + 1]
 
 
+def block_span(text, after_idx, opener="{"):
+    """(start, end) of the {...} block whose '{' is the first non-ws char
+    at/after after_idx, or None."""
+    i = skip_ws(text, after_idx)
+    if i >= len(text) or text[i] != opener:
+        return None
+    close = find_matching_brace(text, i)
+    if close < 0:
+        return None
+    return (i, close)
+
+
+def enclosing_io_block(text, read_idx):
+    """Span of the withContext(Dispatchers.IO) block containing read_idx."""
+    idx = text.find("withContext(Dispatchers.IO)")
+    while idx >= 0:
+        open_paren = text.find("(", idx)
+        close_paren = text.find(")", open_paren)
+        span = block_span(text, close_paren + 1)
+        if span and span[0] < read_idx <= span[1]:
+            return span
+        idx = text.find("withContext(Dispatchers.IO)", idx + 1)
+    return None
+
+
+def enclosing_launched_effect(text, read_idx):
+    """Span of the LaunchedEffect block containing read_idx."""
+    idx = text.find("LaunchedEffect(")
+    while idx >= 0:
+        open_paren = text.find("(", idx)
+        close_paren = text.find(")", open_paren)
+        span = block_span(text, close_paren + 1)
+        if span and span[0] < read_idx <= span[1]:
+            return span
+        idx = text.find("LaunchedEffect(", idx + 1)
+    return None
+
+
+def run_offmain_checks(seg):
+    """[dv14-B5] arm6: the sibling-file disk read rides IO off the
+    composition thread, and the Edit button is gated until it lands.
+    Independent of run_checks (different fixtures) so a refactor of the save
+    path cannot hollow these criteria and vice versa."""
+    failures = []
+    read_idx = seg.find("readSkillFile(")
+
+    # arm6a: the read sits inside a withContext(Dispatchers.IO) block
+    arm_a = enclosing_io_block(seg, read_idx) is not None
+    if not arm_a:
+        failures.append(
+            "arm6a: skillRepository.readSkillFile( must sit inside a "
+            "withContext(Dispatchers.IO) block, not in the remember {} composition lambda"
+        )
+
+    # arm6b: the read is triggered from a LaunchedEffect block
+    arm_b = enclosing_launched_effect(seg, read_idx) is not None
+    if not arm_b:
+        failures.append(
+            "arm6b: the readSkillFile( read must be triggered from a LaunchedEffect block"
+        )
+
+    # arm6c: Edit button gated on the async load
+    if "enabled = isLoaded" not in seg:
+        failures.append("arm6c: the Edit button must be gated with 'enabled = isLoaded'")
+
+    return failures
+
+
 def run_checks(seg):
     failures = []
 
@@ -148,16 +236,20 @@ def run_checks(seg):
     # arm2: save is bound via `val ok = withContext(...) { ... }` and both
     # importFromContent and writeSkillFile live in that block. (The IO
     # dispatcher itself is arm4's contract, so a dispatcher-only mutation
-    # flips exactly arm4.)
+    # flips exactly arm4.) [dv14-B5] Discovery anchors on the `val ok =`
+    # binding + the withContext immediately following it, not the first
+    # withContext in the screen: the async-read withContext inside the
+    # LaunchedEffect ([dv14-B5]) must not shadow the save's context.
     arm2 = False
-    ctx = seg.find("withContext(")
-    if ctx >= 0:
-        pre = seg[max(0, ctx - 40) : ctx]
-        open_paren = seg.find("(", ctx)
-        close_paren = seg.find(")", open_paren)
-        blk = balanced_block(seg, close_paren + 1)
-        arm2 = OK_BINDING in pre and blk is not None \
-            and CONSUME_IMPORT in blk and "writeSkillFile(" in blk
+    idx_ok = seg.find(OK_BINDING)
+    if idx_ok >= 0:
+        ctx = seg.find("withContext(", idx_ok)
+        if ctx >= 0 and ctx - (idx_ok + len(OK_BINDING)) <= 8:
+            open_paren = seg.find("(", ctx)
+            close_paren = seg.find(")", open_paren)
+            blk = balanced_block(seg, close_paren + 1)
+            arm2 = blk is not None \
+                and CONSUME_IMPORT in blk and "writeSkillFile(" in blk
     if not arm2:
         failures.append(
             "arm2: save must run inside 'val ok = withContext(Dispatchers.IO) { ... }' "
@@ -294,6 +386,69 @@ V4 = COMPLIANT.replace("withContext(Dispatchers.IO)", "withContext(Dispatchers.D
 V5 = COMPLIANT.replace("preferredId = skillId,", 'preferredId = "other",')
 
 
+# -- [dv14-B5] arm6 fixtures (trimmed mirror of the async-read wiring) --
+
+OFFMAIN_COMPLIANT = """fun SkillFileViewerScreen(skillId: String, relativePath: String, onBack: () -> Unit) {
+    val isSkillMd = relativePath.equals("SKILL.md", ignoreCase = true)
+    val initialContent = remember(skillId, relativePath, skill.updatedAt) {
+        if (isSkillMd) { SkillRepository.mergeFrontmatter() } else { "" }
+    }
+    var loadedDiskBase by remember(skillId, relativePath, skill.updatedAt) { mutableStateOf<String?>(null) }
+    var isLoaded by remember(skillId, relativePath, skill.updatedAt) { mutableStateOf(isSkillMd) }
+    LaunchedEffect(skillId, relativePath, skill.updatedAt) {
+        if (isSkillMd) return@LaunchedEffect
+        loadedDiskBase = withContext(Dispatchers.IO) {
+            skillRepository.readSkillFile(skillId, relativePath) ?: ""
+        }
+        isLoaded = true
+    }
+    var isEditing by remember { mutableStateOf(false) }
+    Scaffold(
+        topBar = {
+            actions = {
+                if (isEditing) {
+                    MinisTextButton(onClick = { }) { Text(stringResource(R.string.skill_file_save)) }
+                } else {
+                    MinisTextButton(
+                        enabled = isLoaded,
+                        onClick = {
+                            editContent = displayContent
+                            isEditing = true
+                        },
+                    ) { Text(stringResource(R.string.skill_file_edit)) }
+                }
+            }
+        },
+    ) { padding -> if (isEditing) { DialogTextField() } else { LazyColumn() } }
+}
+"""
+
+# W1: read moved back into the remember lambda (sync main-thread read,
+# no LaunchedEffect) -> arm6a + arm6b red, arm6c green
+OFFMAIN_W1 = OFFMAIN_COMPLIANT.replace(
+    """    LaunchedEffect(skillId, relativePath, skill.updatedAt) {
+        if (isSkillMd) return@LaunchedEffect
+        loadedDiskBase = withContext(Dispatchers.IO) {
+            skillRepository.readSkillFile(skillId, relativePath) ?: ""
+        }
+        isLoaded = true
+    }
+""",
+    """    loadedDiskBase = remember(skillId, relativePath, skill.updatedAt) {
+        skillRepository.readSkillFile(skillId, relativePath) ?: ""
+    }
+""",
+)
+
+# W2: read rides Dispatchers.Default instead of IO -> arm6a red only
+OFFMAIN_W2 = OFFMAIN_COMPLIANT.replace(
+    "withContext(Dispatchers.IO)", "withContext(Dispatchers.Default)"
+)
+
+# W3: Edit gate dropped -> arm6c red only
+OFFMAIN_W3 = OFFMAIN_COMPLIANT.replace("enabled = isLoaded,", "enabled = true,")
+
+
 def selftest():
     failures = []
     # compliant fixture: all arms green
@@ -309,12 +464,29 @@ def selftest():
         red = [a for a in all_arms if any(a in x for x in got)]
         if red != [arm]:
             failures.append("%s: expected exactly [%s] red, got %s" % (name, arm, red))
+    # [dv14-B5] arm6 fixtures: offmain compliant green + per-mutation teeth
+    f6 = run_offmain_checks(strip_comments(OFFMAIN_COMPLIANT))
+    if f6:
+        failures.append("offmain compliant fixture unexpectedly red: %s" % f6)
+    off_expectations = [
+        ("W1", OFFMAIN_W1, ["arm6a", "arm6b"]),
+        ("W2", OFFMAIN_W2, ["arm6a"]),
+        ("W3", OFFMAIN_W3, ["arm6c"]),
+    ]
+    for name, fixture, arms in off_expectations:
+        got = run_offmain_checks(strip_comments(fixture))
+        red = [a for a in ["arm6a", "arm6b", "arm6c"] if any(a in x for x in got)]
+        if red != arms:
+            failures.append("%s: expected exactly %s red, got %s" % (name, arms, red))
     if failures:
         for x in failures:
             print("SELFTEST FAIL: " + x)
         print("SKILL_FILE_SAVE_RESULT_SELFTEST=FAIL")
         return 1
-    print("selftest OK: compliant green + 5 violation fixtures each flip exactly their own arm")
+    print(
+        "selftest OK: compliant green + 5 violation fixtures each flip exactly "
+        "their own arm + offmain green + 3 offmain fixtures each flip their own arm"
+    )
     print("SKILL_FILE_SAVE_RESULT_SELFTEST=PASS")
     return 0
 
@@ -325,13 +497,13 @@ def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     root = args[0] if args else "."
     seg = screen_segment(root)
-    failures = run_checks(seg)
+    failures = run_checks(seg) + run_offmain_checks(seg)
     if failures:
         print("skill_file_save_result_check: %d violation(s) in %s" % (len(failures), TARGET_REL))
         for x in failures:
             print("  - " + x)
         return 1
-    print("skill_file_save_result_check: OK (5/5 arms) on %s" % TARGET_REL)
+    print("skill_file_save_result_check: OK (5/5 arms + offmain 3/3) on %s" % TARGET_REL)
     return 0
 
 
