@@ -94,6 +94,35 @@ class MirrorAutoSelectTest {
     }
 
     @Test
+    fun singleCategoryTestSelectsTheMeasuredMirror() {
+        // [dv15-B2 / B-02] runTest feeds exactly this shape — a one-entry map for
+        // the category the user tapped. The decision must pick that mirror, so
+        // the single-category speed test ends up in the rootfs config the same
+        // way the full test does.
+        val sorted = mapOf(
+            MirrorCategory.NPM to listOf(
+                result("npm.fast", MirrorCategory.NPM, 80),
+                result("npm.slow", MirrorCategory.NPM, 900),
+            ),
+        )
+        val decisions = autoSelectFastest(sorted) { false }
+        assertEquals(1, decisions.size)
+        assertEquals(MirrorCategory.NPM, decisions[0].first)
+        assertEquals("npm.fast", decisions[0].second.mirror.id)
+    }
+
+    @Test
+    fun singleCategoryTestLeavesAStandingSelectionAlone() {
+        // The same contract as skipsCategoriesWithPriorSelection, applied to the
+        // one-category map the single-category test builds: a mirror the user
+        // picked by hand must survive pressing "test".
+        val sorted = mapOf(
+            MirrorCategory.NPM to listOf(result("npm.fast", MirrorCategory.NPM, 80)),
+        )
+        assertTrue(autoSelectFastest(sorted) { it == MirrorCategory.NPM }.isEmpty())
+    }
+
+    @Test
     fun failureResultsSortAfterSuccesses() {
         // The caller feeds `sorted` (already ordered by the latency comparator);
         // the decision must take the FIRST successful entry, not the overall
