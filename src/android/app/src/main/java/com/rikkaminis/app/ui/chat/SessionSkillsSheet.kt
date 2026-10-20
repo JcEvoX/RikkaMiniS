@@ -17,6 +17,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -55,29 +56,41 @@ fun SessionSkillsSheet(
 ) {
     val skills by skillRepository.skills.collectAsState()
 
-    // [T-android-session-skill-override-init-timing] Key the seed on `skills`
-    // so the override map re-derives when the live skills list arrives.
-    // A keyless `remember {}` seeds once from the possibly-empty first-
-    // composition list and then never re-runs, so every row's switch is stuck
-    // at the global default (the same stale-override race already fixed in
-    // SessionMcpsSheet — keeping the two sheets symmetric). Mirrors iOS
-    // ed861471 (T-ios-session-skill-override-init-timing) for the
-    // initial-state half of that fix; the per-draft id binding half is
-    // already covered on Android by the `__new__<uuid>` route arg (every
-    // draft has its own stable session id), unlike iOS which previously
-    // coerced nil to "" and bled overrides across drafts.
-    // [da1022-b] Key the seed on `sessionId` as well: when the draft session
+    // [T-android-session-skill-override-init-timing] The seed must re-derive
+    // once the live skills list arrives: a keyless `remember {}` seeds from
+    // the possibly-empty first-composition list and then never re-runs, so
+    // every row's switch is stuck at the global default (the same stale-
+    // override race already fixed in SessionMcpsSheet — keeping the two
+    // sheets symmetric). Mirrors iOS ed861471 (T-ios-session-skill-override-
+    // init-timing) for the initial-state half of that fix; the per-draft id
+    // binding half is already covered on Android by the `__new__<uuid>` route
+    // arg (every draft has its own stable session id), unlike iOS which
+    // previously coerced nil to "" and bled overrides across drafts.
+    // [da1022-b] Key the map identity on `sessionId`: when the draft session
     // is promoted (first send), the caller re-composes with the real session
-    // id and this map must re-derive from the real id's stored overrides —
-    // otherwise the sheet keeps showing (and the toggles keep writing against)
-    // the pre-promotion `__new__…` key. Mirrors the sessionId key added here
-    // to both sheets.
-    val overrides = remember(skills, sessionId) {
-        mutableStateMapOf<String, Boolean>().apply {
-            for (skill in skills) {
-                put(skill.id, skillRepository.isEnabledForSession(skill.id, sessionId))
-            }
-        }
+    // id, so a FRESH map must be built and re-seeded from the real id's
+    // stored overrides — otherwise the sheet keeps showing (and the toggles
+    // keep writing against) the pre-promotion `__new__…` key. Same reasoning
+    // as the sessionId key added to both sheets.
+    // [da1034-b3] Seed by MERGING into that live map (mirrors SessionMcpsSheet's
+    // [audit-0917] merge) instead of rebuilding it inside
+    // `remember(skills, sessionId)`: the rebuild ran one `isEnabledForSession`
+    // SQLite read per skill on EVERY skills StateFlow emission — inside
+    // composition — and threw away any toggle the user had already flipped in
+    // the open sheet (the row snapped back to the stored value until the
+    // write landed, and an emission arriving between flip and write reverted
+    // the switch outright). The merge only fills in ids that are missing, so
+    // an open sheet keeps in-flight toggles, and rows for skills that were
+    // removed are dropped so a later re-add re-seeds from storage.
+    val overrides = remember(sessionId) {
+        mutableStateMapOf<String, Boolean>()
+    }
+    LaunchedEffect(skills, sessionId) {
+        mergeSessionOverrides(
+            liveIds = skills.map { it.id },
+            overrides = overrides,
+            lookup = { skillRepository.isEnabledForSession(it, sessionId) },
+        )
     }
 
     var searchQuery by remember { mutableStateOf("") }
@@ -196,6 +209,36 @@ fun SessionSkillsSheet(
             }
         }
     }
+}
+
+/**
+ * [da1034-b3] Pure seeding merge for [SessionSkillsSheet]'s per-session
+ * override map. Extracted to a top-level function so the merge semantics can
+ * be unit-tested on the JVM without a Compose/Android runtime (see
+ * `SessionSkillOverrideMergeTest`).
+ *
+ * Contract — deliberately identical to `SessionMcpsSheet`'s seeding effect:
+ *  - an id already present in [overrides] is never overwritten, so a toggle
+ *    the user flipped in the still-open sheet survives the live list
+ *    re-emitting (the write that persists it may not have landed yet);
+ *  - ids that are missing get seeded exactly once, through [lookup] (which
+ *    reads the stored per-session value);
+ *  - ids that vanished from [liveIds] are dropped, so re-adding the same
+ *    skill later re-seeds from storage instead of resurrecting a stale
+ *    toggle.
+ */
+internal fun mergeSessionOverrides(
+    liveIds: List<String>,
+    overrides: MutableMap<String, Boolean>,
+    lookup: (String) -> Boolean,
+) {
+    for (id in liveIds) {
+        if (id !in overrides) {
+            overrides[id] = lookup(id)
+        }
+    }
+    val live = liveIds.toHashSet()
+    overrides.keys.retainAll(live)
 }
 
 @Composable
