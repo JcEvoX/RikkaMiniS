@@ -1647,6 +1647,7 @@
     <string name="scheduled_delete_title">Geplante Aufgabe löschen?</string>
     <string name="scheduled_delete_body">„%1$s“ wird endgültig gelöscht.</string>
     <string name="scheduled_fuse_notification_title">Geplante Aufgabe pausiert</string>
+    <string name="scheduled_edit_missing_body">Diese Aufgabe existiert nicht mehr. Möglicherweise wurde sie gelöscht, während dieser Bildschirm geöffnet war.</string>
     <string name="scheduled_fuse_notification_body">„%1$s“ ist %2$d-mal hintereinander fehlgeschlagen und wurde deaktiviert. In den Einstellungen fortsetzbar.</string>
 
     <string name="backup_passphrase_title">Verschlüsseltes Backup</string>

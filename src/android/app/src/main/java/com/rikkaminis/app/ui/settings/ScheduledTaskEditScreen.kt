@@ -70,21 +70,60 @@ fun ScheduledTaskEditScreen(
     // same-day gate or silently clear a tripped fuse (resume stays manual).
     var original by remember { mutableStateOf<ScheduledTask?>(null) }
     var showDeleteConfirm by remember { mutableStateOf(false) }
+    // [da1034-B2 / B-04] The edit target can already be gone when this screen
+    // composes (deleted from the list, or by a concurrent deleteTask on another
+    // surface). Without an explicit not-found state the form kept its defaults
+    // with Save locked for good (`original == null`) while Delete stayed live
+    // on an id that no longer exists.
+    var recordMissing by remember { mutableStateOf(false) }
 
     if (!isNew) {
         LaunchedEffect(taskId) {
             val file = ScheduledTasksStore.load(context)
-            file.tasks.firstOrNull { it.id == taskId }?.let { t ->
-                title = t.title
-                prompt = t.prompt
-                windowStart = t.windowStart
-                windowEnd = t.windowEnd
-                maxTurns = t.maxTurns.toString()
-                deadlineSec = t.deadlineSec.toString()
-                maxEstimatedTokens = t.maxEstimatedTokens.toString()
-                original = t
+            val loaded = file.tasks.firstOrNull { it.id == taskId }
+            if (loaded == null) {
+                // [da1034-B2 / B-04] Not-found branch: no record to load, so the
+                // screen must say so instead of staying on the inert form.
+                recordMissing = true
+            } else {
+                title = loaded.title
+                prompt = loaded.prompt
+                windowStart = loaded.windowStart
+                windowEnd = loaded.windowEnd
+                maxTurns = loaded.maxTurns.toString()
+                deadlineSec = loaded.deadlineSec.toString()
+                maxEstimatedTokens = loaded.maxEstimatedTokens.toString()
+                original = loaded
+                recordMissing = false
             }
         }
+    }
+
+    // [da1034-B2 / B-04] Explicit not-found rendering. The sibling detail
+    // screens (ProviderDetailScreen / ModelGroupDetailScreen / MountDetailScreen)
+    // silently call onBack() when their record is gone, which reads as a dropped
+    // tap; here we name the cause and leave exactly one way out — no Save, no
+    // Delete (both would either write over nothing or delete a dead id).
+    if (recordMissing) {
+        SettingsScaffold(
+            title = stringResource(R.string.scheduled_edit_title),
+            onBack = null, // single explicit action in the navigation slot
+            navigation = {
+                MinisTextButton(onClick = onDone) {
+                    Text(stringResource(R.string.common_back))
+                }
+            },
+        ) {
+            SettingsSection(header = stringResource(R.string.scheduled_section_identity)) {
+                SettingsCardBlock {
+                    Text(
+                        text = stringResource(R.string.scheduled_edit_missing_body),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+            }
+        }
+        return
     }
 
     // Strict HH:MM both halves, start < end (half-open windows, no midnight
@@ -94,6 +133,12 @@ fun ScheduledTaskEditScreen(
     val windowOk = startOk && endOk &&
         ScheduledTaskPolicy.parseWindowMinuteOfDay(windowStart)!! <
         ScheduledTaskPolicy.parseWindowMinuteOfDay(windowEnd)!!
+    // [da1034-B2 / B-04] Both halves parse but the window is inverted
+    // (`start >= end`): the old `isError = !startOk` left BOTH fields unmarked
+    // while `windowOk == false` silently kept Save disabled. Flag the start
+    // field; the section footer already spells out the "start before end" rule,
+    // so no extra error line is needed.
+    val windowInverted = startOk && endOk && !windowOk
     val turnsValue = maxTurns.toIntOrNull()
     val deadlineValue = deadlineSec.toIntOrNull()
     val tokensValue = maxEstimatedTokens.toLongOrNull()
@@ -106,8 +151,11 @@ fun ScheduledTaskEditScreen(
     // write those defaults over the stored spec (the store merges run state now,
     // but the spec fields would still come from the untouched form). A brand-new
     // task has no record to wait for, so `isNew` keeps it savable.
-    val canSave = prompt.isNotBlank() && windowOk && turnsOk && deadlineOk && tokensOk &&
-        (isNew || original != null)
+    // [da1034-B2 / B-04] `!recordMissing` is the belt to `original != null`'s
+    // braces: the not-found screen returns before this button is composed, but
+    // the enabled flag must never depend on that rendering path staying put.
+    val canSave = !recordMissing && prompt.isNotBlank() && windowOk && turnsOk && deadlineOk &&
+        tokensOk && (isNew || original != null)
 
     if (showDeleteConfirm) {
         AlertDialog(
@@ -177,7 +225,7 @@ fun ScheduledTaskEditScreen(
                         SectionTextField(
                             value = windowStart,
                             onValueChange = { windowStart = it },
-                            isError = !startOk,
+                            isError = !startOk || windowInverted,
                             singleLine = true,
                         )
                     }

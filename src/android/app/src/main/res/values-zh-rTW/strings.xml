@@ -1647,6 +1647,7 @@
     <string name="scheduled_delete_title">刪除排程任務？</string>
     <string name="scheduled_delete_body">「%1$s」將被永久刪除。</string>
     <string name="scheduled_fuse_notification_title">排程任務已暫停</string>
+    <string name="scheduled_edit_missing_body">該任務已不存在，可能是在本頁開啟期間被刪除的。</string>
     <string name="scheduled_fuse_notification_body">「%1$s」連續失敗 %2$d 次，已自動停用。可於設定中恢復。</string>
 
     <string name="backup_passphrase_title">加密備份套件</string>

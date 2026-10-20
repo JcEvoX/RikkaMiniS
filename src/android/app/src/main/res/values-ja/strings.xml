@@ -1645,6 +1645,7 @@
     <string name="scheduled_delete_title">定時タスクを削除しますか？</string>
     <string name="scheduled_delete_body">「%1$s」は完全に削除されます。</string>
     <string name="scheduled_fuse_notification_title">定時タスクを停止しました</string>
+    <string name="scheduled_edit_missing_body">このタスクは存在しません。この画面を開いている間に削除された可能性があります。</string>
     <string name="scheduled_fuse_notification_body">「%1$s」が %2$d 回連続で失敗したため停止しました。設定から再開できます。</string>
 
     <string name="backup_passphrase_title">暗号化されたバックアップ</string>
