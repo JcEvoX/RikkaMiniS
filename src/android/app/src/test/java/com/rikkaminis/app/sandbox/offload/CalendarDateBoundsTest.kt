@@ -77,6 +77,7 @@ class CalendarDateBoundsTest {
         days: Int? = null,
         start: String? = null,
         end: String? = null,
+        daysText: String? = null,
     ): Pair<Long, Long>? = CalendarOffloadHandler.resolveRangePure(
         nowMs = nowMs,
         zone = zone,
@@ -85,6 +86,7 @@ class CalendarDateBoundsTest {
         startRaw = start,
         endRaw = end,
         parse = { s, now, z -> parseLikeProduction(s, now, z) },
+        daysText = daysText,
     )
 
     // ─── B-1: bare-date --end is inclusive end-of-day (zero-width repair) ──
@@ -176,6 +178,83 @@ class CalendarDateBoundsTest {
         val (s, e) = range(now, shanghai, days = 0)!!
         assertEquals(1_791_561_600_000L, s) // 2026-10-10 00:00 +08
         assertEquals(now, e)
+    }
+
+    // ─── B-8: an unreadable --days is refused ([dv14-A3] ISSUE-05) ──────────
+    // MUT-B8 (drop the daysText guard) must flip these red.
+
+    @Test
+    fun `unreadable days is refused instead of silently narrowing to 24 hours`() {
+        // The defect: getInt("days") answers null for "7d" exactly as it does
+        // for an absent flag, so `list --days 7d` answered the last 24 hours —
+        // six of the seven days the caller named, dropped in silence.
+        val now = 1_792_166_400_000L
+        assertNull(range(now, shanghai, daysText = "7d"))
+        assertNull(range(now, shanghai, daysText = "last-week"))
+        assertNull(range(now, shanghai, days = null, start = "2026-10-16", daysText = "7d"))
+    }
+
+    @Test
+    fun `an absent or readable days keeps its window`() {
+        val now = 1_792_166_400_000L // 2026-10-17 00:00 +08
+        // Absent: the flag never carried a value — last 24 hours, unchanged.
+        val (s0, e0) = range(now, shanghai, daysText = null)!!
+        assertEquals(now - 24 * 60 * 60 * 1000L, s0)
+        assertEquals(now, e0)
+        // Blank is the same "no value" case, not an unreadable one.
+        assertEquals(now - 24 * 60 * 60 * 1000L, range(now, shanghai, daysText = "  ")!!.first)
+        // Readable: the same 7-day window the `days = 0` arm pins above.
+        val (s7, e7) = range(now, shanghai, days = 7, daysText = "7")!!
+        assertEquals(1_791_561_600_000L, s7) // 2026-10-10 00:00 +08
+        assertEquals(now, e7)
+        // A non-positive integer still degrades to 7 (daysText agrees it is one).
+        assertEquals(1_791_561_600_000L, range(now, shanghai, days = 0, daysText = "0")!!.first)
+    }
+
+    // ─── B-9: the write paths need READ as well as WRITE ([dv14-A3] I-06) ───
+
+    @Test
+    fun `a write predicate needs read as well as write`() {
+        // Every calendar write reads the provider first (listWritableCalendars /
+        // findEventRow); with WRITE granted alone those reads throw
+        // SecurityException into an empty answer, so the write reported
+        // calendar_no_account / not_found for a permission problem.
+        assertTrue(CalendarOffloadHandler.calendarSatisfied(read = true, write = true, needsWrite = true))
+        assertFalse(CalendarOffloadHandler.calendarSatisfied(read = false, write = true, needsWrite = true))
+        assertFalse(CalendarOffloadHandler.calendarSatisfied(read = true, write = false, needsWrite = true))
+        // The read paths keep the minimum-permission contract.
+        assertTrue(CalendarOffloadHandler.calendarSatisfied(read = true, write = false, needsWrite = false))
+        assertFalse(CalendarOffloadHandler.calendarSatisfied(read = false, write = true, needsWrite = false))
+    }
+
+    @Test
+    fun `every writing subcommand decides on both permissions and requests both`() {
+        val src = readHandlerSource()
+        for (marker in listOf("private fun doCreate(", "private fun doUpdate(", "private fun doDelete(")) {
+            val body = memberSlice(src, marker)
+            assertTrue(
+                "$marker must gate on READ and WRITE",
+                body.contains("satisfied = { calendarSatisfied(hasRead(), hasWrite(), needsWrite = true) }"),
+            )
+            assertTrue("$marker must request READ_CALENDAR too", body.contains("Manifest.permission.READ_CALENDAR"))
+        }
+    }
+
+    @Test
+    fun `the read only subcommands never ask for write`() {
+        val src = readHandlerSource()
+        for (marker in listOf("private fun doList(", "private fun doFreebusy(", "private fun doListCalendars(")) {
+            val body = memberSlice(src, marker)
+            assertFalse("$marker must not request WRITE_CALENDAR", body.contains("WRITE_CALENDAR"))
+            assertFalse("$marker must not gate on write", body.contains("needsWrite = true"))
+        }
+    }
+
+    @Test
+    fun `the handler hands the pure core the raw days string`() {
+        val body = memberSlice(readHandlerSource(), "private fun resolveDateRange(")
+        assertTrue("resolveDateRange must forward the raw --days string", body.contains("daysText = args.get(\"days\")"))
+        assertTrue("resolveDateRange must keep the integer read", body.contains("daysRaw = args.getInt(\"days\")"))
     }
 
     // ─── B-5: unchanged contracts (swap, defaults, error semantics) ─────────

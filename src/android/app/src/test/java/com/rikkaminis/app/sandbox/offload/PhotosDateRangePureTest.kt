@@ -223,6 +223,78 @@ class PhotosDateRangePureTest {
         )
     }
 
+    // ── resolvePhotoRange `--days` refusal ([dv14-A3] ISSUE-05) ────────────
+
+    @Test
+    fun `a supplied but unreadable --days is refused instead of answering the library`() {
+        // The defect: getInt("days") answers null for "7d" exactly as it does for
+        // an absent flag, so the window resolved to (null, null) = "no filter"
+        // and `android-photos list --days 7d` returned the ENTIRE library, exit 0.
+        assertEquals(
+            PhotoRange.Invalid("--days", "7d"),
+            resolvePhotoRange(
+                nowMs = 1792166400000L, zone = utc, daysRaw = null, startRaw = null, endRaw = null,
+                parse = fakeParse, daysText = "7d",
+            ),
+        )
+        assertEquals(
+            PhotoRange.Invalid("--days", "last-week"),
+            resolvePhotoRange(
+                nowMs = 1792166400000L, zone = utc, daysRaw = null, startRaw = null, endRaw = null,
+                parse = fakeParse, daysText = "last-week",
+            ),
+        )
+        assertEquals(
+            PhotoRange.Invalid("--days", "7.5"),
+            resolvePhotoRange(
+                nowMs = 1792166400000L, zone = utc, daysRaw = null, startRaw = null, endRaw = null,
+                parse = fakeParse, daysText = "7.5",
+            ),
+        )
+    }
+
+    @Test
+    fun `an absent or readable --days keeps its window`() {
+        // Absent (flag given no value / never passed): no filter, unchanged.
+        assertEquals(
+            PhotoRange.Window(null, null),
+            resolvePhotoRange(
+                nowMs = 1792166400000L, zone = utc, daysRaw = null, startRaw = null, endRaw = null,
+                parse = fakeParse, daysText = null,
+            ),
+        )
+        assertEquals(
+            PhotoRange.Window(null, null),
+            resolvePhotoRange(
+                nowMs = 1792166400000L, zone = utc, daysRaw = null, startRaw = null, endRaw = null,
+                parse = fakeParse, daysText = "   ",
+            ),
+        )
+        // Readable integer string: the same 7-day window as daysRaw = 7.
+        assertEquals(
+            PhotoRange.Window(1791518400000L, 1792166400000L),
+            resolvePhotoRange(
+                nowMs = 1792166400000L, zone = ny, daysRaw = 7, startRaw = null, endRaw = null,
+                parse = fakeParse, daysText = "7",
+            ),
+        )
+        // A non-positive integer keeps the historical degrade-to-7 reading.
+        assertEquals(
+            PhotoRange.Window(1791518400000L, 1792166400000L),
+            resolvePhotoRange(
+                nowMs = 1792166400000L, zone = ny, daysRaw = 0, startRaw = null, endRaw = null,
+                parse = fakeParse, daysText = "0",
+            ),
+        )
+    }
+
+    @Test
+    fun `the handler hands the pure core the raw days string`() {
+        val body = memberSlice(readRepoFile(HANDLER_REL), "private fun resolveDateRange(")
+        assertTrue("the raw --days string must reach the core", body.contains("daysText = args.get(\"days\")"))
+        assertTrue("the integer read stays alongside it", body.contains("daysRaw = args.getInt(\"days\")"))
+    }
+
     // ── the query surface (da1032-C ISSUE-04) ─────────────────────────────
 
     @Test
