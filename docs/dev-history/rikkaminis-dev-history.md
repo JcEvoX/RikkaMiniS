@@ -1,11 +1,11 @@
-# RikkaMinis 开发日志合并导出（2026-08-03 ～ 2026-10-20）
+# RikkaMinis 开发日志合并导出（2026-08-03 ～ 2026-10-21）
 
 > 📌 **注意**：本文件是 raw dump（归档快照，按时间正序排列）。
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
-- 合并范围：2026-08-03 ～ 2026-10-20，共 79 天
-- 条目总数：2061（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：3000709 / 总行数：37454
+- 合并范围：2026-08-03 ～ 2026-10-21，共 80 天
+- 条目总数：2072（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：3018832 / 总行数：37600
 
 ---
 
@@ -37447,6 +37447,152 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 **收尾**：backlog 新增 8 段（§1036-A1..B4）；**§1036-B2 由主会话补登**（该支报告有 R1–R6 但漏写台账，用 `shared_append.sh` 追加，276→277 段）；机械门 277 段 / no-触发条件 4（全是既有段，本批 0 命中）/ 豁免 11。真机行为级残留统一归 `§1036-VERIFY` 批（8 支各 R1）。
 
 **产物**：`shared/work/deep-audit-1036/{COLLECT.md, TRIAGE.md, COMMON.md, DISPATCH.md, check_diff.py, collect_ci_verify.py, fetch_job_log.py, build_union.sh, l2/job-39421989941{,-a2}.log, fix-tasks/, fix-reports/}`。
+
+<!-- 2026-10-20 21:26:10 -->
+## 背景包 v19 + 提问模板 v16-A/B（配额换代：命中质量四问）—— 2026-10-20 深夜
+
+
+**触发**：用户「为下一次做准备，刚刚的这份出来已经被消化了」。上一轮 = **deep-audit-1036（v15 波）**：REPORT-A 8 + REPORT-B 8 → 第二道门 **16/16 成立、0 驳回** → 8 支 `fix/dv15-*`（46 文件 +4357/−325，跨支文件交集 0）→ 并集 `integration/dv15` @ `7841303`，并集 CI **#2399 success**（attempt 1 红 = FastioTarTest 顺序 flake 第 7 次，与本批零交集）→ **已并入 main `66d0325`** → HEAD **`7c38a79d`**（仅多档案 docs）。
+
+**★ 两个可量化指标的验证（本轮最值钱）**：
+1. **§2.9 自补材料纪律（v18 新增）→ 生效**：Before 原文抽样 **16 处逐字符命中**、失真密度 **0.75 → 0.44 条/工单**。
+2. **低犁区硬配额 → 与产出价值脱钩，退役**：连续四批未达标（1033 ≈一半 / 1034 B 2/8 / 1035 B 2/8 / 1036 B **0/8**），同期成立率始终 16/16。**落点（去过哪）≠ 产出价值（找到什么）**——低犁区低犁是因为缺陷密度本来就低。→ 我自己上版 README 预写的判据「再退档就换切法、不再加配额」兑现，但**换的不是切法是指标**：切法（A/B 面）三轮跨界 0，没必要动。
+
+**产物（`mounts/笔记/RikkaMinis审计背景包/`）**：`audit-context.md` **v19**（~590 行 / 123 KB）· `audit-prompt-v16-A/B.md`（各 23 KB）· `task-A.md` / `task-B.md`（各 150 KB）· **新 zip `RikkaMinis-7c38a79.zip`**（1680 条目 / 1138 .kt）· README。archive 36 件（131 MB）。旧版 v18/v15/57c9619.zip 已归档。
+
+**模板 v16 的改动**：**§1.2 配额换代** = 「命中质量四问」（触发路径可指认 / 独立验证手段 / 边界三行可写 / 同族 ≥3 兄弟实现），四问全过才算有效工单，核实方按四问打分；低犁清单降为提示。§2 九条 → **十一条**：**§2.10 机制断言强度分级**（写「永不/必然/永久」前先找能改变它的路径；写「被吞」前把全部终止条件逐行列出 —— 残余失真就是「方向对但项错」）；**§2.11 同一操作所有承载路径列全**（grep 参数名按调用者分组逐条判定）。自检清单 +4/−1。
+
+**背景包 v19 的增量**：新形状 **27**（系统层同 id 幂等替换 vs 应用层记账无条件追加 → 幽灵行，1036-A5）；§5 记入 1036 的 7+ 道门增量（第三例「门把缺陷钉成合法」= browser_history_snapshot_check 方向修正；一处「牙齿来自偶然」被新构造点打破后收紧）；§8.3 失真形态 +1（数字与机制断言）；§8.7 7→8 条；负决策 **126→138**（**#127 FastioTarTest flake 第 7 次，用户已拍板「生产侧排序，随下一批施工执行」—— backlog 挂三批的升级触发首次兑现**）；§7 落点指标退役记录 + 新增**反向指标**（同一文件被连续三波犁过仍出新缺陷 = 复杂度热点，优先级反而更高）。
+
+**下一轮观察点（已预写）**：①命中质量四问可操作性（若「全过但坏工单」或「好工单被误杀」→ 调权重不回退）；②失真率 0.44→若 <0.3 收敛，若回升先查 2.10/2.11 是否太重；③切法三轮跨界 0，仅当 >1/3 跨界才重切。
+**下一批施工欠账**：#127 FastioTar 排序（随下一批一起）+ 远端 9 个非 main 分支清理（8 fix/dv15-* + integration/dv15，ahead_by==0 待核）。
+
+<!-- 2026-10-20 21:44:10 -->
+## deep-audit-1036 全批闭环（2026-10-20 晚）：main `7c38a79d` + main CI #2400 success（Publish 执行）+ 档案 2061 条 + 分支清理 9/9
+
+
+**合并链**（用户令「合并吧」）：三项核查（46 文件逐文件过 / 冻结面 0 触碰 / 本地 HEAD==远端==CI head_sha / 独立证据 = 并集树本地 108 门+329 夹具双绿）→ 代码并集 `--no-ff` 合入 main **`66d03257`**（合并树与并集树**逐字节一致**）→ **main CI #2400 首跑红 = FastioTarTest 顺序 flake 第 8 次复发**（`FastioTarTest.kt:149`，同树并集 CI attempt 2 曾绿）→ 重跑 attempt 2 **success**（`bad=[]`，**`skipped=[]` = Publish 在 main 已执行**）→ 发布资产实证：**`RikkaMinis Android v1.0.0+2400`** + `RikkaMinis-arm64-v8a.apk`（14,423,025 B）→ attempt 2 日志判读（1,277,416 B）：`Summary: 108 passed, 0 failed` + 门头互异 108 + ALL 329 + FAILED非PASSED=0。
+
+**flake 拍板已登记**：用户「方案①' 生产侧排序，等下一批审计报告打包一起处理」→ backlog **§1036-FLAKE**（278 段，机械门 OK；触发条件三件套齐：v16 波次到达 / 下次 CI 判红先到者触发；触发后方案已定形 = **按目录层级排序递归**，禁全树收集，测试一字不动）。
+
+**档案三件套重建**（用户令「趁等着的时间把文档也更新了」）：**2061 条 / 79 天**（2047→2061，+今日 1036 轮条目），`anchors=2061`（=header）/ 乱序 0 / fences 偶 / NUL 0，脱敏 INDEX 39 处替换 `Remaining sensitive: NONE`，SAGAS 24 主题（orphans 185 / multi4 143）；三件套与挂载源 sha256 逐文件 SAME；README 计数 2047→2061；`docs/dev-history-1036` 纯文本例外合入 main **`7c38a79d`**（不 dispatch / 不等 CI）。LOCAL == REMOTE = `7c38a79d4f9755bb68eeee1bccb4b4e1dcfd05a8`。
+
+**分支清理 9/9**（用户令「该清理的清理」）：`cleanup_1036.py check` 全量核验（merged=9 / extra=NONE / CHECK_PASS）→ `delete` → **9/9 http 204**；本地分支只剩 main，remote-tracking 只剩 origin/main（PRoot 下 `update-ref -d` 逐条清）。**三源核实**：①REST 按名探测 **9/9 → 404**；②`ls-remote --heads` 只剩 main；③local==remote=7c38a79d。
+
+**本批遗留**：①§1036-VERIFY 真机行为级欠账（8 支各 R1，等下次真机窗口）；②§1036-FLAKE 待下一批打包（修法已定形）；③dev-history-sync skill 的 SKILL.md 引用 `check_dev_history.py` **不存在**（脚本清单只有 rebuild/sanitize/build_sagas/两个 test_*）——结构体检用内联 python（timestamped 锚点按 `<!-- YYYY-MM-DD HH:MM:SS -->` 格式匹配，**不要用 `### [date time]` 正则**，合订本条目头无时间戳括号）。skill 漂移登记不修（触发条件 = 下次有人按 SKILL.md 找不到该脚本时补）。
+
+<!-- 2026-10-20 23:26:14 -->
+## 2026-10-20 23:26:14
+
+<!-- 2026-10-20 23:35:00 -->
+## deep-audit-1037（v16 波）启动：第二道门 16/16 成立 + 17 项（含 §1036-FLAKE 兑现）→ 6 支派发完成
+
+
+**输入**：`attachments/uploads/Audit_Report_V16_A.md`（82,870 B）+ `Rikkaminis_Audit_Report_V16_B.md`（86,912 B）。**基线** main `7c38a79d4f9755bb68eeee1bccb4b4e1dcfd05a8`（与报告声明逐字符一致；远端只剩 main，前批 9 支清理已核实）。工作区 `shared/work/deep-audit-1037/`（REPORT-A/B.md 已落盘）。
+
+**第二道门**（回真树逐条核证，`COLLECT.md`）：**16/16 成立、0 驳回**；判级 **P1×12 · P2×4 · P0×0**（与报告一致 0 修正）。
+**报告失真 6 条**（下传任务书，禁照抄）：①**A-02 修法自相矛盾**（报告「修法方向」`&& !isNegativeNumberToken(a)` 会破坏 `package list -3`——`NO_VALUE_FLAGS` 不含 "3"，-3 靠无守卫单横线分支；钉死形式 = `(!isNegativeNumberToken(a) || a.substring(1) in effectiveBooleanFlags)`）②A-03 `resolvePathForSession` 行号 1632→真 901 ③A-08 KDoc 漂移（声称写 base URL 实则只写 apiKey，顺路修）④A-05 "customized 徽标" 不存在（0 命中）⑤B-03 双向影响面（高末条真底部也判 false）⑥B 面三新门合并为 1 个 `chat_ui_interaction_check.py`（唯一 FIX-4 做注册，避免多支并发改 scan.sh）。
+
+**分支方案（用户令「小的合并」+「别忘了攒着的」）**：17 项 → **6 支**（生产/测试/门三列两两不交）：
+FIX-1 `dv16-a-offload-hardening`（A-01+A-02+**§1036-FLAKE 兑现**：FastioTar 自写按层排序递归，禁全树收集，FastioTarTest 一字不动）· FIX-2 `dv16-a-debug-modeluse-skill`（A-03/04/05）· FIX-3 `dv16-a-provider-config`（A-06/07/08）· FIX-4 `dv16-b-chat-ui-interaction`（B-01/02/06 + **唯一新建门+注册**，门 108→109）· FIX-5 `dv16-b-chat-stream-persist`（B-03/04/05）· FIX-6 `dv16-b-browser-memory`（B-07/08）。
+
+**派发**：`minis-sessions-cli send --async` 6/6 送达并开工（回读验证：任务书正确 + 各 18-21 条 assistant 消息）：
+FIX-1 `de1757d6` / FIX-2 `b5844632` / FIX-3 `131bd094` / FIX-4 `4acf26a2` / FIX-5 `18e6a93f` / FIX-6 `7882fd82`（完整 id 在 `DISPATCH.md`）。
+
+**收口清单**（`DISPATCH.md`）：回报→三方 sha 核对→并集 `integration/dv16`→本地 109 门+夹具→并集 CI→交用户（合并起手权在用户）。预登记：§1037-VERIFY 真机欠账；升级触发（B-06/07/08 真机高频→升 P1；FLAKE 修后再红→重开）。
+
+## 2026-10-21
+
+<!-- 2026-10-21 00:45:00 -->
+## FIX-3 收口（deep-audit-1037 / dv16 波 A-06+A-07+A-08）：`fix/dv16-a-provider-config` @ `97e2655c`，CI #2406 绿，停在分支
+
+
+**身份链三方逐字符**：基线 main `7c38a79d` → 单提交 `97e2655c069a30da6032924736b36b252278e0ef` → CI **#2406（run 39456718375，job 118745416546，26 步）success**（~17 min），本地 == ls-remote == CI head_sha。10 文件 +1007/−52；**门 108 / 夹具 329 不变**（两门均为扩展）。**未合并 main**（含 .kt 验证面）。
+
+**修法**：①A-06 groupsUpdate context-limit 路由修正（+`contextLimitTokens >= 0` 校验）+ GroupsCollection entries/members 解码、member-entry-id 共享；②A-07 instancesCreate/Update 接受可选 `imageEndpointMode`（Kotlin enum 名或 wire SerialName）+ 共享 `parseImageEndpointMode` + ProvidersCollection fields 加 imageEndpointMode/imageEndpointResolved；③A-08 ProviderRepository merge 路径 run-config 字段恢复 + 共享 seam `readRunConfigFields`/`readImportInstanceFields`。
+
+**验证四层**：L1 `scan.sh` **108/108** + `test_scan.py` **ALL 329 CASES PASS**；两门 selftest 带牙（rpc 40 PASS / import 6 arms PASS），真树 ALL GREEN + clean(6 arms)。L1 PRE 臂：`git worktree add ../pre-tree HEAD` 基线树，两门全部精确红（门有牙）。L3 切片探针（`probe-l3/`，kotlinc+JUnitCore，切片逐字来自真树）POST **8/8 OK** + **变异负控 m1/m2/m3 RED-PRECISE + RESTORED=True**（m3 只红 `a06_clearViaMutatedGroupCopyKeepsTheMemory`，offload 原文确认）。L4 `ci_judge.py` **13/13 ALL-GREEN**（steps bad=[] / 唯一 skipped=Publish（main 门控）/ `Summary: 108 passed, 0 failed`（9 条 Summary 中锁 108 字面量）/ `ALL 329 CASES PASS` / 108 互异门头 / e:0 / 游离 FAILED=0 / 4 测试类 PASSED）。
+
+**★ L3 探针脚本教训（可复用，同族复发第 2 次）**：①stdlib 探测用了一次完整 kotlinc 编译到 /dev/null = 纯浪费一整轮编译（用户指出「跑的时间长的有点不正常」）——**jar 定位一律 `find`，永不调 kotlinc**；②**表达式体函数（`= …`）会被大括号匹配截断在第一个 lambda**——切片提取一律按「下一个顶层声明」边界，不按 brace walker；③kotlinc classpath 必须显式含 junit jar，漏了报 unresolved reference 'junit'（表象像 import 没写）。
+
+**登记**：报告 `fix-reports/FIX-3.md`（八节，§8 已回填）；backlog **§1037-A**（shared_append 278→279 段，机械门 OK；R1 真机行为级含 minis-config 运行时未自证 / R2 真机窗口自证 / R3 mutation RPC 面静默过滤口径 / R4 A-08 恢复即写回负决策 / R5 双重拷贝，全带触发条件）；DISPATCH.md FIX-3 已标收口。**停止节点达成（分支 CI 绿），未合并 main，起手权在用户。**
+
+<!-- 2026-10-21 00:48:04 -->
+## FIX-1 收口（deep-audit-1037 / dv16-A 支）：A-01 宽松日期解析 + A-02 负数位置参数 + §1036-FLAKE 归档顺序 —— `fix/dv16-a-offload-hardening` @ `3db9dc778fe71f747b965124dc88c9fe3d59a127`，CI run 39457048630 **success**，停在分支
+
+
+**身份链三方逐字符**：基线 main `7c38a79d` → 3 提交（`dcab1377` 生产 / `cd12a67e` 测试 / `3db9dc77` 门）→ **本地 == `ls-remote` == CI `head_sha`** = `3db9dc778fe71f747b965124dc88c9fe3d59a127`。**13 文件 +647/−37**（生产 7 文件 +152/−37 · 测试 3 +125 · 门 3 +370）；**门 108 / 夹具 329 不变**（0 新建门、0 改 `scan.sh`/`test_scan.py`）。**未合并 main**（含 .kt 验证面）。
+
+**修法**：①**A-01** 四处 `SimpleDateFormat` 补 `isLenient = false`（Photos `parseDate` / Calendar `parseDateInZone` / Notification `parseIso` / Alarm `parseTimeArg`，参照 `SessionsOffloadHandler.parseSessionsDate`）——默认宽松模式把越界字段**静默滚动**（`2026-02-30`→3 月 2 日、`2026-13-40`→2027-02-09、`25:00`→次日 01:00），于是误拼的 `--start/--end/--at` **不是被拒而是答了另一天**。②**A-02** `OffloadArgs` 顶层单横线分支改为「未声明的负数值算位置参数」：`… && (!isNegativeNumberToken(a) || a.substring(1) in effectiveBooleanFlags)`，并让 `ShizukuOffloadHandler` **声明** `"3"`（保住 `package list -3`）——★ 报告写的「直接收紧为 `!isNegativeNumberToken(a)`」照抄会打断该开关，任务书已预警、按钉死形式实施。③**§1036-FLAKE**：`FastioTar` 新增 `writeTree` **逐层排序递归**（`newDirectoryStream().use { it.toList().sortedBy { c -> c.fileName.toString() } }`），目录头先写（pre-order）、`charge()` 未变、返回 false 逐层中止整树（walker TERMINATE 等价）；**逐层**而非全树收集 = O(扇出)/层，避开 `DEFAULT_MAX_ENTRIES=2000000` 的缓冲爆内存；**`FastioTarTest.kt` 一字未动**，其余 5 处 `walkFileTree` 按半径纪律不动（登记）。
+
+**验证四层**：L1 全量门 **108 passed / 0 failed** + `test_scan` **ALL 329 CASES PASS** + 三门 selftest 带牙/真树 GREEN；L2 邻门 **6/6**（含 `calendar_events_nullable_predicate` 只吃 `--root`，直接给位置参数 rc=2 是接口形态非失败）；L3 **真码切片探针**（非手抄）：`check_date.py` DATE_PROBE=PASS（同一批 103 样本：pre 17 null → post 44 null，多出的全是越界样本；**合法输入 103 行逐字不变**）· `check_tar.py` TAR_PROBE=PASS（成员名序 == 写死字面量、两次遍历逐字节同、与创建顺序无关、mkfifo 特殊文件计数）· `check_args.py` ARGS_PROBE=PASS（43 条期望）· `StrictCheck.kt` 独立语义臂（lenient 滚 / strict null / 合法日期一致）；L4 CI 判读 `judge_ci.py` **16 条断言 ALL PASS**（日志 1,276,147 B）：`Summary: 108 passed, 0 failed`（该日志另有 5/6/10/13/18/25 小套件 Summary ⇒ 判据锁 `108/0` 字面量）· `ALL 329 CASES PASS` · 互异 `[N/108]` = **108** · 三门真树留痕 · 编译错 0 · 含 FAILED 不以 PASSED 结尾 = 0 · **7 条新用例逐条 PASSED**。
+
+**★ 首轮 CI 红（run 39454553501，5863 用例 1 失败）= 我自己的用例缺陷，不是生产码**：新加差分测试的 λ 契约错了——`resolvePhotoRange(..., parse)` 的注入契约是「不可读 → `null`」，而 strict 模式下 `SimpleDateFormat.parse` 对越界字段是**抛异常**（lenient 则是滚过去），两种模式都不能直接当 λ 用。修法 = `runCatching { … }.getOrNull()`（与 shipped `parseDate` 的 try/catch 同形）+ 先用独立探针 `StrictCheck.kt` 证语义再推。**教训：写注入式回调的用例前，先把契约写成一句「打不出来的输入返回什么」，别假设 null。** 规则回查 = **弱命中**（无强家族）。
+**★ 第二处自伤（提交手术）**：`git commit --amend` 打到了 HEAD（当时是**门**提交）而非测试提交 ⇒ 门提交夹带测试修复；修法 = `git reset --mixed <test-commit>` 后分别 amend（测试）/ commit（门），逐提交 `git show --stat` 核对归位。
+**★ 第三处（门判据绑写法，同族第 N 处）**：① 裸名 `Files.walkFileTree` 判定命中了 `writeTree` 上方 KDoc 里「Replaces `Files.walkFileTree`」⇒ 假红 → 改绑**调用形态** `Files.walkFileTree(`；② `\.sorted[A-Za-z]*\(` 不认尾随 lambda `sortedBy { … }` ⇒ 假红 → 改 `\.sorted[A-Za-z]*\s*[({]`，并补「只提到 walker 必须仍干净」的臂防再犯。规则回查 = **召回问题（词汇命中）**，规则已存在 ⇒ 只加固事发面，不写新条目。
+
+**登记**：报告 `fix-reports/FIX-1.md`（八节，CI verdict 已回填）；backlog **§1037-FIX1**（`shared_append.sh` 追加 280→281 段，机械门判 **OK**；R1 真机行为级 = 四条命令的拒绝文案 + `photos near -33.86 -122.41` 双负数 / R2 `CalendarDateBoundsTest` 副本未同步旗标 / R3 其余 5 处 walkFileTree / R4 fastio 5 测试以 CI 为准 / R5 `--` 非分隔符 / R6 装置耐久，全带触发条件）。**段落名说明**：`§1037-A` 已被同批 FIX-3（`fix/dv16-a-provider-config`）占用，故以分支名后缀登记。装置 `probe-1/{jvm,ci}`（含两轮 CI 日志）。**停止节点达成（分支 CI 绿），未合并 main。**
+
+<!-- 2026-10-21 00:59:31 -->
+## FIX-2 收口（deep-audit-1037 v16 波，A-03+A-04+A-05）：`fix/dv16-a-debug-modeluse-skill` @ `fe03ecb5`，CI #2411 ALL GREEN，停在分支
+
+
+**身份链三方逐字符**：基线 main `7c38a79d` → 4 提交（`2b9309ff` 生产 / `0d60f3e4` 测试 / `79251553` 门 / `fe03ecb5` CI 编译修复）→ 本地 == `ls-remote` == CI `head_sha` = `fe03ecb511dff78ed139c9b80b6ddfde8f2fde8f`。**门 108 / 夹具 329 不变**（三门扩展，scan.sh/test_scan.py 冻结未触碰）。
+
+**修法**：①A-03 debug RPC 会话作用域——`normalizeDebugRpcPaths` 后注入 `sessionId`，`ls/read/write` 经 `resolvePathForSession`（pre-boot `?: run { rootfsDir }` 兜底逐字保留）；②A-04 单一 `providerMatches`（精确/不分大小写/trim，label/id/typeName 三面），`cmdList` 子串口径删除、`cmdSearch` 补读；③A-05 sparse-clear（覆盖值等于全局 ⇒ DELETE，镜像 MCPRepository twin）。
+
+**★ 首轮 CI #2402 红 = 我新加的两个测试文件的编译错误（同日第 2 次复发「本地探针只编自己的副本、仓库测试文件从未本地编译」）**：①注入 resolver lambda 返回 `String` vs 签名 `(String) -> File?`；②反引号测试名含点号 `model.provider`。修复 = **桩签名编译**（真实签名桩 ×2 resolver + 既有生产符号补齐 + 纯函数逐字提取，2 分钟）本地 0 错误后推 `fe03ecb5` → CI **#2411 success / JUDGE ALL GREEN 12/12**（job `118753654933`，26 步 `steps_bad=[]`，唯一 skipped = Publish；三门**注册标记**在册；三测试类 17/9/15 PASSED）。
+
+**★ 判读脚本两处口径错（已修进 probe-2/judge_ci.py）**：①门头正则锚 `^` 没剥 CI 时间戳前缀 `^\S+Z\s+` ⇒ 假 0；②门标记查**新增未注册**标记（DEBUG_SESSION_PATH/MODELUSE_PROVIDER_MATCHER）而非 test_scan **注册**标记（`SELFTEST=PASS (7 fixtures…)`/`MODELUSE_PROTO_SELFTEST=PASS`）⇒ 假 missing——test_scan 在 CI 只回显注册标记行。红轮下的 6 个 FAIL 全是 unit-test 步骤失败的下游。
+
+**登记**：报告 `fix-reports/FIX-2.md`（8 节含 CI round trip）；backlog **§1037-A2**（R1–R8 全带触发条件，280 段 `scan_debt` 判 OK，快照 164135）；LEARNINGS **LRN-20261020-D1 扩展**（同日复发 2：push 前必跑桩编译，别等 CI 轮次）。**停止节点达成（分支 CI 绿，head_sha 逐字符一致）。未合并 main（含 .kt 验证面，起手权在主会话）。**
+
+<!-- 2026-10-21 01:05:43 -->
+## 经验教训（可复用）
+
+- **FastioTarTest flake 是纯随机的，4 连红不代表确定性**（2026-10-20 #2401 实证：同树 a1/a2/a3 红、a4 绿）。归因纪律：先建**零差异对照臂**（从 main tip 切 probe 支，同窗 dispatch）——#2408（=main 逐字节）success ⇒ 一次驳倒「环境变了」；再靠同树重跑绿驳倒「套件组成确定性翻转」。代价 = 3 轮 CI ≈ 51 min，但省下的是错误归因（差点把 flake 记成「我的新测试类引起的」）。
+- **日志判据三形态（已固化进 `probe-6/judge_ci.py`）**：①`Summary:` 行带 `║` 前缀（子串匹配，不锚行首）；②裸 `e: ` 命中 `Build Date: `/`Image: `/`mode: ` 元数据（一次 63 假阳性），精确形态 `^\S+Z e: `；③skipped 步骤不落日志，Publish-skippedness 只能取 API `steps[].conclusion`。
+- **逐字切片探针的数据类坑**：`slice_balanced` 对 `internal data class X(...)` 会一路吃到后续第一个函数的闭括号（数据类无 `{}`）⇒ 切片含两份函数 → kotlinc conflicting overloads。修法 = 无括号声明按 `)` 收口 + 断言 `count("fun ") == 0`。
+- **ash 不支持 brace expansion**：`mkdir -p a/{src,pre,logs}` 会创建字面目录 `{src,pre,logs}`，后续写文件报 No such file（本次踩一次）。
+
+<!-- 2026-10-21 01:19:49 -->
+## FIX-5 收口（deep-audit-1037 / dv16 波 B 支）：chat 流式持久化三缺陷 —— `fix/dv16-b-chat-stream-persist` @ `d34d9928`，CI #2413 绿，停在分支
+
+
+**身份链三方逐字符**：基线 main `7c38a79d` → 4 提交（`4e8ee68d` 生产 / `272f8ffa` 测试+门 / `9d7532cc` 测试 re-anchor / `d34d9928` fastio flake 兑现）→ 本地==远端==CI checkout = `d34d992810500a05f60700ee6f6657d7b4738bf6`。**10 文件 +1784/−91**（生产 5 / 测试 3 新增+2 re-anchor / 门 2）；**门 108 / 夹具 329 不变**。**未合并 main**（含 .kt 验证面）。
+
+**修法**：①B-03 判底方向反置——`ChatScreen.kt:1373` 旧公式 `stoppedIdx >= stoppedTotal-2`（stoppedIdx=视口顶部索引）多行可见时到底恒 false（漏跟）/高末条顶部贴顶判 true（回扯）→ 收敛为新纯函数 `isListAtBottom`（`ChatScreen.kt:5310`，distance = viewportEnd - bottomEdge，`>=0 && <= threshold`），两处消费点改用，阈值从零消费变为被读 2 次。②B-04 drain 丢返回值——`ChatQueueInterruption.kt:353` `chatRepository.appendMessage(...)` 语句位返回值丢弃 + N 条占位气泡原地翻 isQueued 不收敛（库里 1 条合并行 vs 屏上 N 条）→ `val userEntity = appendMessage(...)` 绑定 + `dbMessageId` 回填 + UI 收敛为 1 条合并气泡 + `combinedParts.isEmpty()` 早退守卫（双生路径同形）。③B-05 纯附件可见性——共享谓词 `userRowHasVisibleContent`（UI 侧字符串）+ `userPartsJsonHasVisibleContent`（DB 侧 JSON，含 system-reminder 排除 + stripAttachedFilesXml）落在 ChatTranscriptRebuild.kt，5 处调用点改用（transcript/viewmodel×2/queue/bubble），撤回按钮移出 caption 门控。
+
+**CI 三轮**：#2405 红（2 断言失败）→ #2412 红（FastioTar flake 第 9 次）→ **#2413 绿**（26 步 ok，versionCode=220002413，108 门+329 夹具+新测试 15+11+21 PASSED，FastioTarTest 31 PASSED = flake 修好，EmptyTurnRecovery 18 PASSED = re-anchor 绿）。
+
+**★ 两个可复用教训**：
+1. **既有 shipped 测试钉旧实现形状（同族第 N 次，1032 C 支 PhotosImportShapeTest 先例）**：`EmptyTurnRecoveryTest:301` 钉 `ChatViewModel.kt` 含 `trimStart().startsWith("<system-reminder>")` 旧拼写；B-05 把该过滤收进单源共享谓词（**语义零损失**，ChatTranscriptRebuild.kt:70 完整保留 system-reminder 排除）⇒ 测试红。修法 = **re-anchor 到单源新位置**（断言共享谓词文件含该排除 + ViewModel 问共享谓词），不回退修复。判据：先核「语义是否真的由共享层保留」再 re-anchor。
+2. **结构断言的 indexOf 锚错（我自己的测试）**：`ChatUserMessageUI.kt` 有两处 `if (isQueued && onWithdraw != null)`——`:412` 是 caption 块内的 bubbleModifier（虚线态），`:437` 才是撤回按钮本体。无起始索引的 `indexOf` 命中第一处 ⇒ 断言「撤回按钮在 caption 块内」假红，**生产结构本身正确**（门 V3 按 `chat_withdraw_queued` 锚 + walk-back 条件判定，真树绿）。修法 = `indexOf(..., captionGuardEnd)` 取 end-marker 之后的 occurrence + V3-mirror 检查（从 contentDescription walk-back 到最近 `if (`，断言条件不含 caption 门）——**绑决定点，不绑写法**。
+3. **FastioTar flake 触发兑现**：backlog §1036-FLAKE「下次 CI 判红先到」在 #2412 命中（早于下一波审计），用户已拍板的生产侧排序当场落地——`Files.walkFileTree` 换 `walkSorted`（每目录子项字典序，被替换 visitor 语义逐条保留：每 entry 恰一次 charge 且先于写 / 目录头先于内容 / 符号链接写为 LINK 永不跟随 / 无法 stat 或列目录报错后继续 / TERMINATE 全断）。**§1036-FLAKE 可关闭**。
+4. **CI 判读形态坑**：`discarded-return guard` 的日志标记带连字符（`✅ discarded-return guard: ...`），grep 文件名 `discarded_return_guard` 0 命中——判读前先 grep 一条真样本取形态（同族教训再证）。job 日志下载到的是 **zip 包**（PK 头，内含各步骤 .txt），判读要解包后逐 step 读，不能 grep zip 本体。
+
+**登记**：报告 `shared/work/deep-audit-1037/fix-reports/FIX-5.md`（8 节含 CI 三轮全证据）；backlog **§1037-B**（R1 真机三条 / R2 同族扫描 / R3 判据绑形态 / R4 flake 已修 / R5 shipped 测试钉旧落点，全带触发条件），机械门 284 段 / no-触发条件 4 / 本段判 OK。装置 `probe-5/`（apply_fastio_walk.py 幂等补丁 · logs/ · evidence/ · ci/ 含 find_run.py + 三个 job 日志解包）。**停止节点达成（分支 CI 绿），未合并 main。**
+
+<!-- 2026-10-21 01:50:00 -->
+## deep-audit-1037 收口：并集 `integration/dv16` @ `660803f6` + 并集 CI #2414 success，停在分支（未合并 main）
+
+
+**六支身份链三方核对**（本地==ls-remote==CI head_sha）：FIX-1 `3db9dc77` #2407 · FIX-2 **`fe03ecb5`** #2411（报告落后 1 提交：CI 编译错后追了 `fe03ecb` 只动 2 测试文件 3 行）· FIX-3 `97e2655c` #2406 · FIX-4 `706508ff` #2410 · FIX-5 `d34d9928` #2413 · FIX-6 `c43c6774` #2401(a4)。全 success。
+
+**★ FLAKE 双实现交集（本批唯一冲突）**：FIX-1（`writeTree`，任务书指定 owner，门锚定）与 FIX-5（`walkSorted`，其 CI 被 flake 挡路后自实现）都兑现了 §1036-FLAKE —— `FastioTar.kt` 是 62 文件中唯一跨支交集。**并集裁决：保留 FIX-1 的 `writeTree`**（owner + 门锚定 + 零依赖），解析后 hash-object == FIX-1 blob 逐字节。FastioTarTest 一字未动（冻结面 ✓）。
+
+**并集树**：6 次 `--no-ff` @ **`660803f6fdb905b05da1f85c5a6f4f1131d98a1a`**，61 文件 +6982/−352。核查：无冲突标记 / `ChatScreen.kt` println 计数与基线持平（4=4 非新残留）/ 冻结面全清 / 逐支「本支文件集在并集逐字节一致」6/6。本地 **scan.sh 109 passed / 0 failed**（109 门头互异）+ **test_scan ALL 336 CASES PASS**。
+
+**并集 CI #2414（id 39513728381）success**：26 步唯一 skipped=Publish（main 门控）、head_sha 在册×4、`Summary: 109 passed, 0 failed`、`ALL 336 CASES PASS`、互异 `[N/109]`=109、编译错 0、游离 FAILED=0、本批 17 个新测试类 **248 例全 PASSED 0 红**（各支带牙标记在册，含 discarded-return/stale-closure 两门用连字符名）。**FastioTarTest 顺序 flake 在本轮从根上消失（§1036-FLAKE 兑现生效）**。
+
+**报告失真补充**（收口期）：⑦FIX-6 B-08 可调范围 `20..2000`→真树 `50..500`（文档面，本体按真树修）；⑧FIX-2 身份链过期（时序非失真）。收口记录在 `COLLECT.md §9`。
+
+**残留**：§1037-{A,A2,FIX1,B,FIX4,FIX6} 已由各支入 backlog（R1 真机行为级欠账集中等 §1037-VERIFY 窗口：严格日期拒绝 / debug ls 不串会话 / MCP 行填入框 / 主聊天复制表格 / 纯附件上滑 / OAuth 标签不复活 / 记忆面板显示真实注入量）。backlog 待并段：FIX-1 §1037-FIX1 命名冲突已自注明。
+
+**状态**：分支 CI 绿 = 停止节点达成；**未合并 main，起手权在用户**。远端非 main 分支现为 6×fix/dv16-* + integration/dv16（清理等用户放行后做 check→delete→三源核实）。
+
+<!-- 2026-10-21 07:35:56 -->
+## 2026-10-21 07:35:56
 
 ---
 
