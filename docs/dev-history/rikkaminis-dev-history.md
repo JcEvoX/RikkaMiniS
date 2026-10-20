@@ -4,8 +4,8 @@
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
 - 合并范围：2026-08-03 ～ 2026-10-20，共 79 天
-- 条目总数：2046（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：2973440 / 总行数：37244
+- 条目总数：2047（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：2974930 / 总行数：37256
 
 ---
 
@@ -37237,6 +37237,18 @@ DISPATCH.md 已替换为第二批 id（第一批 0 残留）。**收口时认这
 **产物**：`shared/work/deep-audit-1035/{COLLECT.md, TRIAGE.md, COMMON.md, DISPATCH.md, REPORT-A/B.md, issues/, fix-tasks/FIX-A1..B5.md, fix-reports/FIX-A1..B5.md, verify_branches.py, collect_verify.py, check_diff.py, judge_union_1035.py, ci_job.py, runs_map.py, l2/}`。
 
 **停止节点已达成（九支 + 并集 CI 全绿），未合并 main**——全批含 `.kt` 验证面，合并起手权在用户。后续（待放行）：三项核查 → docs/代码入 main → main CI → 分支清理（9 支 + integration）。
+
+<!-- 2026-10-20 15:09:47 -->
+## deep-audit-v14 合并 main 完成（用户令「合并」）：main `71882a8e` + main CI #2388 success + 档案 2046 条 + 分支清理 10/10
+
+
+**执行顺序**（沿用 da1034 的「文档先合、代码后合」）：三项核查（diff 56 文件逐文件过 / 冲突标记 0 / 冻结面 0 触碰 / 本地 HEAD == 并集 CI `head_sha` / 独立证据 = 新树本地双绿）→ 档案三件套重建 → docs 先合 main **`1e7196a`**（纯文本例外：不 dispatch、不等 CI）→ 代码并集合入 main **`71882a8e`**（**排除 docs 后与并集树零差异** = 看过的树就是线上树）→ push 触发 **main CI #2388（run `39381768295`）success**，26 步 `steps_not_ok=[]`、**`skipped=[]`**（Publish 在 main 已执行）→ 日志全量判读：`Summary: 108 passed, 0 failed` · **108 个互异门头** · `ALL 329 CASES PASS` · 游离 `FAILED` 0 · 编译错 0 · **11 道被改门 + 16 个测试类全留痕**。
+
+**档案**：三件套重建 **79 天 / 2046 条**（2035 → +11，含本批九支条目），`anchors=2046` / `outOrder=0` / `fences=60` 偶 / NUL 0，脱敏两轮（主文件 + SAGAS）`Remaining sensitive: NONE`，三件套与挂载源 **sha256 逐文件 SAME**；README 计数 2035→2046。纯文本例外成立（仅 `docs/**`）。
+
+**分支清理 10/10**：`cleanup_1035.py`（`ahead_by == 0` 判据，fail-closed + 意外分支拒删）先 `check` 全量核验 `merged=10 refused=0 extra=NONE`，再 `delete` → **10/10 已删**（9 fix + integration）。docs 分支只在本地（未推远端）。**三源核实**：①REST 按名探测 3/3 → 404；②`ls-remote --heads` → **只剩 main**；③本地跟踪 ref 已清（`git remote prune` 未生效，改用 `git update-ref -d` 逐条删）→ `branch -r` 仅 `origin/main`、本地仅 `main`。**`LOCAL == REMOTE` = `71882a8ef7d09d78874d01c23e178ebcdf3dd54a`**。
+
+**本批自伤登记（第 2 条发现于合 main 之前，已修）**：`git remote prune origin` 与 `fetch --prune` 在 PRoot 下**都不清理陈旧 remote-tracking ref**（无报错、无输出、ref 照旧）——显式 `git update-ref -d` 才生效。与 S33（断链 symlink 污染 fetch）同属「PRoot 下 git 元数据维护不由标准命令负责」这一族。
 
 ---
 
