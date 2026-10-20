@@ -248,6 +248,56 @@ def check_write_regular(src):
     return v
 
 
+# ── [dv16-A FLAKE] the create traversal must emit members in a decided order ─
+#
+# `FastioTarTest > a relative argument produces relative member names…` went red
+# in EIGHT separate CI runs on nothing but member ORDER: `Files.walkFileTree`
+# hands the entries over in the directory stream's own order (ext4/f2fs hash
+# order), so the same tree produced different archive bytes between runs. The
+# decided fix (user, 2026-10-20) is production-side: list each level, sort it,
+# then visit in order — one level at a time, so the streaming contract survives
+# (header before its members; no whole-tree buffer against
+# DEFAULT_MAX_ENTRIES = 2,000,000).
+#
+# Two decision points are pinned, both bound to the DECISION and not a spelling:
+#   (a) the create side does not walk with Files.walkFileTree;
+#   (b) the traversal orders the entries of each level before visiting them
+#       (`sortedBy` / `sorted()` / `sortedWith` / `sortedByDescending` … all
+#       count — what must exist is "a sort applied to the listing").
+# Scoped to the create members only (tarCreate + writeTree): FastioTar.kt also
+# has an extract side, and extract order is the archive's own, not ours.
+CREATE_WALK = "Files.walkFileTree("
+LISTING_RE = re.compile(r"newDirectoryStream\(|Files\.list\(")
+# Bound to the DECISION (a sort is applied to the listing), not to a spelling:
+# `sortedBy { … }` (trailing lambda) and `sorted()` / `sortedWith(cmp)` all count.
+SORT_RE = re.compile(r"\.sorted[A-Za-z]*\s*[({]")
+
+
+def check_create_traversal(src):
+    v = []
+    scope_parts = []
+    for name in ("tarCreate", "writeTree"):
+        body = tar_fun_body(src, name)
+        if body is None:
+            v.append("the create traversal cannot be sliced (%s is gone) — re-point this rule "
+                     "before trusting it" % name)
+            return v
+        scope_parts.append(body)
+    if CREATE_WALK in "\n".join(scope_parts):
+        v.append("the create traversal walks with Files.walkFileTree — member order is then "
+                  "whatever the directory stream hands over, so the same tree archives differently "
+                  "between runs (the FastioTarTest order flake)")
+    tree = tar_fun_body(src, "writeTree")
+    if not LISTING_RE.search(tree):
+        v.append("writeTree no longer lists the directory itself — re-read this rule before "
+                  "trusting the order criterion")
+        return v
+    if not SORT_RE.search(tree):
+        v.append("writeTree never orders the entries of a level — the archive member order is "
+                  "undecided again")
+    return v
+
+
 def run(root):
     violations = []
     tar_path = os.path.join(root, TAR_REL)
@@ -258,6 +308,7 @@ def run(root):
         tar_src = f.read()
     violations += check_tar(tar_src)
     violations += check_write_regular(tar_src)
+    violations += check_create_traversal(tar_src)
     if not os.path.isfile(handler_path):
         return 2
     with open(handler_path, encoding="utf-8") as f:
@@ -479,6 +530,56 @@ BAD_REGULAR_SILENT = GOOD_REGULAR.replace(
 )
 
 
+# ── [dv16-A FLAKE] create-side ordering fixtures ────────────────────────────
+GOOD_TREE = """
+internal fun tarCreate(
+    sink: OutputStream,
+    roots: List<Pair<Path, String>>,
+    maxEntries: Long,
+    out: TarCreateOutcome,
+) {
+    for ((path, memberPrefix) in roots) {
+        writeTree(sink, path, tarMemberName(memberPrefix), path, maxEntries, out)
+    }
+}
+
+private fun writeTree(
+    sink: OutputStream,
+    dir: Path,
+    rootName: String,
+    root: Path,
+    maxEntries: Long,
+    out: TarCreateOutcome,
+): Boolean {
+    val children = Files.newDirectoryStream(dir).use { stream ->
+        stream.toList().sortedBy { it.fileName.toString() }
+    }
+    for (child in children) {
+        if (!writeTree(sink, child, rootName, root, maxEntries, out)) return false
+    }
+    return true
+}
+"""
+
+# the pre-fix shape: the walker decides the order (directory hash order).
+BAD_TREE_WALK = GOOD_TREE.replace(
+    "    val children = Files.newDirectoryStream(dir).use { stream ->\n"
+    "        stream.toList().sortedBy { it.fileName.toString() }\n"
+    "    }",
+    "    val children = ArrayList<Path>()\n"
+    "    Files.walkFileTree(dir, object : SimpleFileVisitor<Path>() {})",
+)
+
+# listed, but never ordered: the members come out in stream order again.
+BAD_TREE_UNSORTED = GOOD_TREE.replace(
+    "        stream.toList().sortedBy { it.fileName.toString() }",
+    "        stream.toList()",
+)
+
+# marker gone: the rule must fail closed, not silently pass.
+BAD_TREE_RENAMED = GOOD_TREE.replace("private fun writeTree(", "private fun walkDir(")
+
+
 def selftest():
     failures = []
 
@@ -589,6 +690,24 @@ def selftest():
         bad_regular_missing,
         "required function missing",
     )
+
+    # ── [dv16-A FLAKE] the create traversal must decide the member order ─────
+    good_tree = check_create_traversal(GOOD_TREE)
+    expect_clean("compliant create traversal", good_tree)
+    bad_tree_walk = check_create_traversal(BAD_TREE_WALK)
+    expect_trip("walker-order fixture (FLAKE)", bad_tree_walk, "walks with Files.walkFileTree")
+    bad_tree_unsorted = check_create_traversal(BAD_TREE_UNSORTED)
+    expect_trip("unsorted fixture (FLAKE)", bad_tree_unsorted, "never orders the entries")
+    bad_tree_renamed = check_create_traversal(BAD_TREE_RENAMED)
+    expect_trip("renamed-traversal fixture (FLAKE)", bad_tree_renamed, "cannot be sliced")
+    # the order criterion must not fire on a file that merely MENTIONS the walker
+    # (FastioTar.kt documents the replacement in a KDoc right above writeTree):
+    expect_clean("walker mentioned in a doc comment",
+                 check_create_traversal(GOOD_TREE.replace(
+                     "private fun writeTree(",
+                     "* Replaces `Files.walkFileTree`, which yields the entries in\n"
+                     " * whatever order the directory stream hands them over.\n"
+                     " */\nprivate fun writeTree(")))
 
     print("selftest compliant tar          -> %d violation(s)" % len(good_tar))
     print("selftest compliant handler      -> %d violation(s)" % len(good_handler))

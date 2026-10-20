@@ -2,10 +2,13 @@ package com.rikkaminis.app.sandbox.offload
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
 import java.io.FileNotFoundException
+import java.text.SimpleDateFormat
+import java.util.Locale
 import java.util.TimeZone
 
 /**
@@ -342,6 +345,52 @@ class PhotosDateRangePureTest {
         assertTrue(
             "height must be emitted from the HEIGHT column (index $heightIdx)",
             body.contains("put(\"height\", c.getInt($heightIdx))"),
+        )
+    }
+
+    // ── [dv16-A A-01] the shipped photo parser is strict ───────────────────
+
+    @Test
+    fun `the shipped photo parser refuses an out-of-range bound`() {
+        val body = memberSlice(readRepoFile(HANDLER_REL), "private fun parseDate(")
+        assertTrue(body.contains("SimpleDateFormat"))
+        assertTrue(body.contains("\"yyyy-MM-dd\"")) // the bare-date pattern survives
+        assertTrue(
+            "parseDate must parse strictly (isLenient = false): the lenient default ROLLS " +
+                "2026-02-30 over to March 2, so a mistyped --start/--end answers for another day",
+            body.contains("isLenient = false"),
+        )
+    }
+
+    @Test
+    fun `a strict bound parse turns a rolled-over date into a refusal`() {
+        // Differential: the SAME token through the two modes of the same JDK
+        // parser. Lenient parses it (to a day nobody spelled), strict does not —
+        // and the resolve layer then refuses instead of filtering the library
+        // on the wrong day. The shipped parser's own mode is pinned above.
+        //
+        // Both lambdas honour the injected-parse contract `(String) -> Long?`:
+        // a token it cannot read is null, never a thrown ParseException — which
+        // is exactly what the shipped `parseDate` does (each pattern attempt is
+        // wrapped, and strict mode reports an out-of-range field by THROWING).
+        val lenient: (String) -> Long? = { raw ->
+            runCatching { SimpleDateFormat("yyyy-MM-dd", Locale.US).parse(raw)?.time }.getOrNull()
+        }
+        val strict: (String) -> Long? = { raw ->
+            runCatching {
+                SimpleDateFormat("yyyy-MM-dd", Locale.US).apply { isLenient = false }.parse(raw)?.time
+            }.getOrNull()
+        }
+        assertTrue("lenient mode rolls 2026-13-40 forward", lenient("2026-13-40") != null)
+        assertNull("strict mode refuses 2026-13-40", strict("2026-13-40"))
+        assertEquals(
+            PhotoRange.Invalid("--start", "2026-13-40"),
+            resolvePhotoRange(1792166400000L, utc, null, "2026-13-40", null, null, strict),
+        )
+        // …and the other bound is refused by name too.
+        assertEquals(
+            PhotoRange.Invalid("--end", "2026-13-40"),
+            resolvePhotoRange(1792166400000L, utc, null, null, "2026-13-40", null, strict),
         )
     }
 

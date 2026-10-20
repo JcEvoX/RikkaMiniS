@@ -1151,6 +1151,13 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
             try {
                 val sdf = SimpleDateFormat(f, Locale.US).apply {
                     timeZone = if (f.endsWith("'Z'")) TimeZone.getTimeZone("UTC") else zone
+                    // [dv16-A A-01] Strict, like the sessions funnel
+                    // (parseSessionsDate): lenient mode silently ROLLS an
+                    // out-of-range field over (`2026-02-30` → March 2), so a
+                    // mistyped `--start` / `--end` answered for a DIFFERENT
+                    // day instead of being refused. The relative shorthands
+                    // (`-7d`) and the pattern list are untouched.
+                    isLenient = false
                 }
                 return sdf.parse(s)?.time
             } catch (_: Throwable) {}

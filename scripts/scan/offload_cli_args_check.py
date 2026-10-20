@@ -429,6 +429,67 @@ def check_args(args_src: str) -> list:
         elif kind == "forbid_re":
             if re.search(needle, args):
                 findings.append((rid, "present", needle))
+    findings += violations_dash_branch(args)
+    return findings
+
+
+# ── [dv16-A A-02] the top-level single-dash branch ──────────────────────────
+# A8 above forbids ONE spelling of the unguarded branch (`… > 1 -> fs.add(`).
+# It cannot see the guard being *removed* from the block-bodied branch this
+# parser actually uses: a negative number is then read as a short option named
+# after its digits (`-33.86` → flag `33.86`), the positionals shift by one, and
+# `android-photos near -33.86 151.21` answers about another place (or refuses
+# with "missing argument"). So the decision point itself is pinned: the branch
+# condition must carry a negative-number exception AND the declared-flag escape
+# that keeps a digit-spelled switch legal where a handler declares it
+# (`android-shizuku-cli package list -3`, declared in NO_VALUE_FLAGS).
+DASH_BRANCH_MARKER = 'a.startsWith("-") && a.length > 1'
+DASH_BRANCH_NEGATIVE = "isNegativeNumberToken"
+DASH_BRANCH_DECLARED = "effectiveBooleanFlags"
+
+
+def dash_branch_condition(args_src):
+    """Condition text of the top-level single-dash branch: from the marker up to
+    the `->` that opens the branch body. Depth-aware, so a `->` inside a nested
+    lambda cannot end it early, and blind to string literals, so the `"-"`
+    argument cannot either. None when the branch is not there at all
+    (fail-closed — a rename must fail this gate, not skip it)."""
+    i = args_src.find(DASH_BRANCH_MARKER)
+    if i < 0:
+        return None
+    depth = 0
+    j = i
+    while j < len(args_src):
+        c = args_src[j]
+        if c == '"':
+            k = args_src.find('"', j + 1)
+            j = len(args_src) if k < 0 else k + 1
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "-" and args_src.startswith("->", j) and depth == 0:
+            return args_src[i:j]
+        j += 1
+    return None
+
+
+def violations_dash_branch(args_src):
+    """The branch must decide by the DECLARED vocabulary, not by the token's
+    shape — that is what keeps `-33.86` a value everywhere while `-3` stays a
+    switch where a handler declared it."""
+    findings = []
+    cond = dash_branch_condition(args_src)
+    if cond is None:
+        findings.append(("A9", "single-dash branch missing", DASH_BRANCH_MARKER))
+        return findings
+    if DASH_BRANCH_NEGATIVE not in cond:
+        findings.append(("A9", "no negative-number exception in the branch condition",
+                         DASH_BRANCH_MARKER))
+    if DASH_BRANCH_DECLARED not in cond:
+        findings.append(("A9", "no declared-flag escape in the branch condition",
+                         DASH_BRANCH_DECLARED))
     return findings
 
 
@@ -876,6 +937,13 @@ internal class OffloadArgs(
         val value = valueTokenOrNull(argv.getOrNull(i + 1))
         if (name in valueShortOptions && name !in effectiveBooleanFlags && value != null) {
             vs[name] = value
+        }
+        when {
+            a.startsWith("-") && a.length > 1 &&
+                (!isNegativeNumberToken(a) || a.substring(1) in effectiveBooleanFlags) -> {
+                fs.add(a.substring(1))
+            }
+            else -> pos.add(a)
         }
     }
 
@@ -1658,6 +1726,15 @@ def selftest() -> int:
         ("dashed token joins the positionals",
          GREEN_ARGS + '\n    val probe = a.startsWith("-") && a.length > 1 -> fs.add(a)',
          {"A8"}),
+        ("single-dash branch loses its negative-number exception",
+         GREEN_ARGS.replace(
+             'a.startsWith("-") && a.length > 1 &&\n'
+             '                (!isNegativeNumberToken(a) || a.substring(1) in effectiveBooleanFlags) -> {',
+             'a.startsWith("-") && a.length > 1 -> {'),
+         {"A9"}),
+        ("single-dash branch renamed away",
+         GREEN_ARGS.replace('a.startsWith("-") && a.length > 1', 'a.startsWith("-") && a.size > 1'),
+         {"A9"}),
     ]:
         if args_src == GREEN_ARGS:
             print(f"SELFTEST-FAIL: {label}: mutation did not apply to any arm")
