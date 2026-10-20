@@ -2135,6 +2135,23 @@ private fun RenderTable(block: MdBlock.Table) {
     val shardIdForTable = LocalShardId.current
     val messageId = shardIdForTable?.messageId
 
+    // [fix/dv16-b] Table-level registration key: each table gets a stable
+    // per-slot index within its fragment (the same allocator MdText uses),
+    // so same-message tables publish under distinct (messageId, tableIndex)
+    // keys. The old bare-messageId key let the LAST table overwrite the
+    // first, and a table leaving composition dropped its sibling's entry.
+    val tableSlotAllocator = LocalShardSubIndexAllocator.current
+    val tableIndex = remember { tableSlotAllocator?.next() ?: 0 }
+    // [fix/dv16-b] Scope the cell shards under THIS table: cells read the
+    // ambient [LocalShardId], so overriding its shard id with the table scope
+    // makes every cell register under "tbl:<index>#<sub>" — how
+    // selectionTableActions() resolves which table a selection belongs to.
+    // A null ambient id means the table participates in no selection anyway;
+    // providing null there is observationally identical to not providing.
+    val tableScopedShardId = shardIdForTable?.copy(
+        shardId = "$TABLE_SHARD_SCOPE_PREFIX$tableIndex",
+    )
+
     // [T-android-table-hscroll-preserve] Stable identity-keyed ScrollState so
     // streaming re-parses / the live→frozen branch move don't reset the user's
     // horizontal offset (see TableHScrollStates). Falls back to an anonymous
@@ -2148,7 +2165,10 @@ private fun RenderTable(block: MdBlock.Table) {
     }
     if (selectionController != null && messageId != null) {
         // Re-register whenever the inputs that the actions close over change.
-        androidx.compose.runtime.DisposableEffect(selectionController, messageId, block.raw) {
+        // [fix/dv16-b] tableIndex is part of the identity: a slot migration
+        // (live→frozen handoff) re-registers under the new key and forgets
+        // only its own old one.
+        androidx.compose.runtime.DisposableEffect(selectionController, messageId, block.raw, tableIndex) {
             val actions = SelectionController.TableActions(
                 copyTableMarkdown = {
                     val md = block.raw
@@ -2200,11 +2220,19 @@ private fun RenderTable(block: MdBlock.Table) {
                     Unit
                 },
             )
-            selectionController.rememberTableActions(messageId, actions)
-            onDispose { selectionController.forgetTableActions(messageId) }
+            selectionController.rememberTableActions(messageId, tableIndex, actions)
+            onDispose { selectionController.forgetTableActions(messageId, tableIndex) }
         }
     }
 
+    // [fix/dv16-b] Provide the table-scoped shard id for the whole subtree so
+    // every cell registers under "tbl:<index>#<sub>" (that scope is what lets
+    // selectionTableActions() resolve the table under a selection). When no
+    // ambient id was supplied (non-chat contexts) this is observationally
+    // identical to the previous unscoped render — null either way.
+    androidx.compose.runtime.CompositionLocalProvider(
+        LocalShardId provides (tableScopedShardId ?: shardIdForTable),
+    ) {
     // BoxWithConstraints (OUTSIDE horizontalScroll) reads the real viewport width —
     // inside a horizontalScroll container, maxWidth would be Constraints.Infinity.
     androidx.compose.foundation.layout.BoxWithConstraints(
@@ -2372,6 +2400,7 @@ private fun RenderTable(block: MdBlock.Table) {
             )
         }
         }
+    }
     }
 }
 

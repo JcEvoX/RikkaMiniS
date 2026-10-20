@@ -14,6 +14,21 @@ import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.text.TextLayoutResult
 
 /**
+ * [fix/dv16-b] RenderTable overrides the ambient shard id with a scope built
+ * from this prefix so every cell in one table registers under a table-scoped
+ * id ("tbl:<index>#<sub>") — that is how [SelectionController.selectionTableActions]
+ * resolves which table a selection belongs to.
+ */
+internal const val TABLE_SHARD_SCOPE_PREFIX = "tbl:"
+
+/**
+ * [T-android-markdown-longtext-selection-broken] Separator MdText appends the
+ * per-slot sub-index with ("base#sub"). Referenced here so the table-scope
+ * parser and the MdText composer can't drift apart.
+ */
+internal const val SHARD_SUB_INDEX_SEPARATOR = "#"
+
+/**
  * MinisTextKit — a self-contained text selection layer that survives
  * LazyColumn item recycling.
  *
@@ -143,8 +158,9 @@ class SelectionController {
      * currently under selection, so the SINGLE selection toolbar can append
      * "Copy Table" / "Copy Table Image" alongside Copy / Copy Markdown / etc.
      * (instead of the table rendering a second, separate popup). A
-     * [RenderTable] publishes its [TableActions] keyed by messageId while it's
-     * composed; the toolbar reads them for the selected message.
+     * [RenderTable] publishes its [TableActions] keyed by (messageId,
+     * tableIndex) while it's composed; the toolbar reads them for the table
+     * the selection sits in.
      *
      * [copyTableMarkdown] returns the table's exact markdown source.
      * [copyTableImage] captures + clipboards the rendered table bitmap.
@@ -154,27 +170,72 @@ class SelectionController {
         val copyTableImage: () -> Unit,
     )
 
+    /**
+     * [fix/dv16-b] Table-level registration key. The registry used to be
+     * keyed by the bare messageId: with more than one table in the same
+     * message the later table overwrote the earlier one, and a table leaving
+     * composition dropped its sibling's registration (a `remove(messageId)`
+     * takes whatever is stored, including the still-composed table's entry).
+     * Two levels: messageId → tableIndex → actions.
+     */
     private val tableActionsByMessage =
-        androidx.compose.runtime.mutableStateMapOf<String, TableActions>()
+        androidx.compose.runtime.mutableStateMapOf<
+            String,
+            androidx.compose.runtime.SnapshotStateMap<Int, TableActions>
+        >()
 
-    /** Publish a table's actions for [messageId] (called while it's composed). */
-    fun rememberTableActions(messageId: String, actions: TableActions) {
-        tableActionsByMessage[messageId] = actions
-    }
-
-    /** Drop a table's actions when it leaves composition. */
-    fun forgetTableActions(messageId: String) {
-        tableActionsByMessage.remove(messageId)
+    /** Publish a table's actions for (messageId, tableIndex) (called while it's composed). */
+    fun rememberTableActions(messageId: String, tableIndex: Int, actions: TableActions) {
+        val perMessage = tableActionsByMessage.getOrPut(messageId) {
+            androidx.compose.runtime.mutableStateMapOf()
+        }
+        perMessage[tableIndex] = actions
     }
 
     /**
-     * Table actions for the message under the active single-message selection,
-     * or null when there's no selection, it spans messages, or that message has
-     * no table composed.
+     * Drop a table's actions when it leaves composition. Scoped to
+     * (messageId, tableIndex): a sibling table's registration for the same
+     * message stays intact (the bare-messageId `remove` used to take it).
+     */
+    fun forgetTableActions(messageId: String, tableIndex: Int) {
+        val perMessage = tableActionsByMessage[messageId] ?: return
+        perMessage.remove(tableIndex)
+        if (perMessage.isEmpty()) tableActionsByMessage.remove(messageId)
+    }
+
+    /**
+     * Table actions for the table under the active single-message selection,
+     * or null when there's no selection, it spans messages, the selection
+     * doesn't sit inside a table cell, or that table is not composed.
+     *
+     * [fix/dv16-b] The table under the selection is resolved from the
+     * selection's shard id: [RenderTable] scopes its cell shards under
+     * [TABLE_SHARD_SCOPE_PREFIX] (via the ambient [LocalShardId] override),
+     * so a selection inside a table cell carries a resolvable table index.
      */
     fun selectionTableActions(): TableActions? {
         val msgId = singleMessageId() ?: return null
-        return tableActionsByMessage[msgId]
+        val sel = selection.value ?: return null
+        val perMessage = tableActionsByMessage[msgId] ?: return null
+        // Either endpoint may carry the table scope (start outside / end
+        // inside a cell, or the reverse), so consult both.
+        for (endpoint in listOf(sel.start, sel.end)) {
+            val tableIndex = tableIndexFromShard(endpoint.shard.shardId) ?: continue
+            perMessage[tableIndex]?.let { return it }
+        }
+        return null
+    }
+
+    /**
+     * [fix/dv16-b] Parse the table index out of a table-scoped shard id
+     * ("tbl:<index>#<sub>"). Null when the shard is not scoped to a table —
+     * a selection that starts outside any table cell exposes no table actions.
+     */
+    private fun tableIndexFromShard(shardId: String): Int? {
+        if (!shardId.startsWith(TABLE_SHARD_SCOPE_PREFIX)) return null
+        val core = shardId.substringBefore(SHARD_SUB_INDEX_SEPARATOR)
+            .removePrefix(TABLE_SHARD_SCOPE_PREFIX)
+        return core.toIntOrNull()
     }
 
     /**
