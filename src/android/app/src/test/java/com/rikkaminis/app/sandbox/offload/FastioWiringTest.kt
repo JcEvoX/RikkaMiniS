@@ -1,5 +1,7 @@
 package com.rikkaminis.app.sandbox.offload
 
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.File
@@ -246,7 +248,74 @@ class FastioWiringTest {
                 "and `--key value` would swallow it into `values`",
             handler.contains("'f' -> Unit   // the archive value stays a positional"),
         )
+        // [dv14-A1] ISSUE-04: the raw-argv scan must consult the SAME boolean
+        // set the shared parse will use — knowing only OUTPUT_FLAGS let a
+        // leading `--force` / `--verbose` / `--create` eat the `tar` token as
+        // its value, so `isTarCommand` came out false and this very expander
+        // (which is guarded on it) never ran.
+        assertTrue(
+            "the subcommand scan must consult fastioBooleanFlags AND keep the global output flags",
+            handler.contains(
+                "val noValue = OffloadOutput.OUTPUT_FLAGS + fastioBooleanFlags(isTarCommand = true)",
+            ),
+        )
     }
+
+    // ── [dv14-A1] ISSUE-04: the scan's verdicts, as behaviour ────────────────
+    //
+    // The scan is pure (a List<String> in, a token out), so the whole class of
+    // "the option took the subcommand slot" failures is pinnable here instead of
+    // on a device: only the declared boolean names may be value-less, everything
+    // else keeps the parser's greedy `--key value` rule.
+
+    @Test
+    fun `a leading boolean option never swallows the tar subcommand`() {
+        assertEquals("tar", scan("--force", "tar", "-xf", "a.tar"))
+        assertEquals("tar", scan("--verbose", "tar", "-cf", "a.tar", "x"))
+        assertEquals("tar", scan("--create", "tar", "x", "-f", "a.tar"))
+        assertEquals("tar", scan("--compact", "tar", "-cf", "a.tar", "x"))
+        assertEquals("tar", scan("--ignore-case", "tar", "-xf", "a.tar"))
+        assertEquals("tar", scan("-q", "tar", "-cf", "a.tar", "x"))
+    }
+
+    @Test
+    fun `the find-style single-dash spellings are modelled too`() {
+        // `-limit 10` is rewritten to `--limit 10` before the parse, so the scan
+        // has to consume the same value the parser will.
+        assertEquals("tar", scan("-limit", "10", "tar", "-xf", "a.tar"))
+        assertEquals("tar", scan("-ignore-case", "tar", "-xf", "a.tar"))
+        assertNull(scan("-limit", "10"))
+    }
+
+    @Test
+    fun `an undeclared option still consumes its value`() {
+        assertEquals("a.tar", scan("--unknown", "value", "a.tar"))
+        assertNull(scan("--unknown", "value"))
+        assertEquals("rm", scan("--force", "rm", "--recursive", "/tmp/x"))
+    }
+
+    @Test
+    fun `the cluster expander runs behind a leading boolean option`() {
+        assertEquals(
+            listOf("--force", "tar", "--create", "a.tar", "src"),
+            FastioOffloadHandler.normalizeTarShorts(listOf("--force", "tar", "-cf", "a.tar", "src")),
+        )
+        assertEquals(
+            listOf("--force", "tar", "--extract", "a.tar", "--directory", "dst"),
+            FastioOffloadHandler.normalizeTarShorts(listOf("--force", "tar", "-xf", "a.tar", "-C", "dst")),
+        )
+    }
+
+    @Test
+    fun `the cluster expander still ignores a non-tar first token`() {
+        assertEquals(
+            listOf("rm", "-rf", "/tmp/x"),
+            FastioOffloadHandler.normalizeTarShorts(listOf("rm", "-rf", "/tmp/x")),
+        )
+    }
+
+    private fun scan(vararg argv: String): String? =
+        FastioOffloadHandler.firstSubcommandToken(argv.toList())
 
     /** Source text of one private member function (up to the next one / section). */
     private fun bodyOf(handler: String, funName: String): String {
@@ -540,8 +609,25 @@ class FastioWiringTest {
         assertTrue("the write-gate probe must fail once tar no longer gates", failed)
     }
 
-    // ── source location (same technique as DatabaseVersionGuardTest) ─────────
+    @Test
+    fun `negative control - a scan that forgets the boolean flag set fails the spelling probe`() {
+        val original = source(handlerFile)
+        val mutated = original.replace(
+            "val noValue = OffloadOutput.OUTPUT_FLAGS + fastioBooleanFlags(isTarCommand = true)",
+            "val noValue = OffloadOutput.OUTPUT_FLAGS",
+        )
+        assertTrue("the combined no-value set must exist to be narrowed", mutated != original)
 
+        var failed = false
+        try {
+            assertTarOptionSpelling(mutated)
+        } catch (_: AssertionError) {
+            failed = true
+        }
+        assertTrue("the spelling probe must fail once the scan stops consulting the flag set", failed)
+    }
+
+    // ── source location (same technique as DatabaseVersionGuardTest) ─────────
     private fun source(rel: String): String = sourceFile(rel).readText()
 
     private fun sourceFile(rel: String): File {

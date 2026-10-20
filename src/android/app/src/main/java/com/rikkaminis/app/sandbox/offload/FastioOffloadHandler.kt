@@ -1053,13 +1053,38 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
          * set and the expander can never drift apart.
          */
         internal fun firstSubcommandToken(rawArgv: List<String>): String? {
+            // [dv14-A1] ISSUE-04: the "takes no value" set must mirror the ONE
+            // the shared parse will actually use. OffloadArgs treats every name
+            // in `effectiveBooleanFlags` (declared `booleanFlags` +
+            // [OffloadOutput.OUTPUT_FLAGS]) as a bare flag, so this scan must
+            // too: [fastioBooleanFlags] is passed `isTarCommand = true` — the
+            // superset — because this scan runs BEFORE the subcommand is known.
+            // It used to know only about OUTPUT_FLAGS, so a leading `--force` /
+            // `--verbose` / `--create` swallowed `tar` as if it were that
+            // option's value: `isTarCommand` came out false, [normalizeTarShorts]
+            // bailed out, and both the `-cf`/`-xf` expansion and the tar-only
+            // boolean verbs went missing (`minis-fastio --force tar -xf a.tar`
+            // failed with exit 2).
+            //
+            // The `find`-style single-dash longs ([SHORT_LONG_OPTIONS]) are
+            // modelled too: [normalizeLongOptionSpelling] rewrites them to their
+            // `--` spelling before the parse, so `-limit 10 tar …` names `tar`
+            // here even though the raw token still carries one dash.
+            val noValue = OffloadOutput.OUTPUT_FLAGS + fastioBooleanFlags(isTarCommand = true)
             var i = 0
             while (i < rawArgv.size) {
                 val token = rawArgv[i]
                 if (!token.startsWith("-") || token == "-") return token
-                val consumesValue = token.startsWith("--") &&
-                    !token.contains('=') &&
-                    token.substring(2) !in OffloadOutput.OUTPUT_FLAGS &&
+                // `--key` and a rewritten `-limit` share the key namespace: the
+                // rewrite produces `--limit`, so the value decision is the same
+                // "is the long name a boolean flag" test for both spellings.
+                val key = when {
+                    token.startsWith("--") && !token.contains('=') -> token.substring(2)
+                    token in SHORT_LONG_OPTIONS && !token.contains('=') -> token.substring(1)
+                    else -> null
+                }
+                val consumesValue = key != null &&
+                    key !in noValue &&
                     rawArgv.getOrNull(i + 1)?.startsWith("-") == false
                 i += if (consumesValue) 2 else 1
             }
