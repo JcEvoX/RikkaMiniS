@@ -4,11 +4,9 @@ import java.io.EOFException
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.charset.StandardCharsets
-import java.nio.file.FileVisitResult
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
-import java.nio.file.SimpleFileVisitor
 import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.attribute.FileTime
 import java.nio.file.attribute.PosixFilePermission
@@ -101,37 +99,7 @@ internal fun tarCreate(
             continue
         }
         try {
-            Files.walkFileTree(
-                path,
-                object : SimpleFileVisitor<Path>() {
-                    override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult {
-                        if (charge(out, maxEntries)) return FileVisitResult.TERMINATE
-                        val entry = memberNameFor(name, path, dir)
-                        writeHeader(sink, header(entry + "/", '5', 0L, dirMode(dir), mtimeOf(attrs), ""))
-                        out.dirs++
-                        return FileVisitResult.CONTINUE
-                    }
-
-                    override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
-                        if (charge(out, maxEntries)) return FileVisitResult.TERMINATE
-                        val entry = memberNameFor(name, path, file)
-                        if (attrs.isSymbolicLink) {
-                            writeLink(sink, entry, file, out)
-                        } else if (attrs.isRegularFile) {
-                            writeRegular(sink, entry, file, out)
-                        } else {
-                            out.skippedSpecial++
-                            if (out.skippedNames.size < MAX_REPORTED_SKIPS) out.skippedNames.add(entry)
-                        }
-                        return FileVisitResult.CONTINUE
-                    }
-
-                    override fun visitFileFailed(file: Path, exc: java.io.IOException): FileVisitResult {
-                        out.errors.add("$file: ${exc.message}")
-                        return FileVisitResult.CONTINUE
-                    }
-                },
-            )
+            writeTree(sink, path, name, path, maxEntries, out)
         } catch (e: Exception) {
             out.errors.add("$memberPrefix: ${e.message}")
         }
@@ -139,6 +107,99 @@ internal fun tarCreate(
     // Two zero blocks end the archive; readers stop on the first one.
     sink.write(ByteArray(BLOCK_SIZE * 2))
     sink.flush()
+}
+
+/**
+ * [deep-audit-1037 FIX-1 §1036-FLAKE] Write one directory tree, in a
+ * DETERMINISTIC member order: the directory's own header first (pre-order, so
+ * a reader creates the directory before anything inside it), then each child
+ * in ascending name order, recursing into sub-directories in place.
+ *
+ * Replaces `Files.walkFileTree`, which yields the entries in whatever order
+ * the underlying directory stream hands them over (ext4/f2fs hash order) — so
+ * the SAME tree produced different archive bytes between runs, and
+ * `FastioTarTest`'s literal member list
+ * (`src/`, `src/f1.txt`, `src/sub/`, `src/sub/f3.txt`) went red in eight
+ * separate CI runs on nothing but that ordering.
+ *
+ * Sorting ONE LEVEL at a time is what keeps the streaming contract: a
+ * directory's header is written before it is descended into, so the plain
+ * lexicographic order of the sibling names already puts every directory (and
+ * therefore its whole subtree) where a sorted member list expects it — no
+ * cross-level comparator, no whole-tree buffer. Collecting the tree first and
+ * sorting it would cost O(entries) memory against
+ * `DEFAULT_MAX_ENTRIES` = 2,000,000; this is O(fan-out) per level.
+ *
+ * Semantics carried over from the walker, unchanged:
+ *   - symlinks are written AS LINKS and never followed (the attributes are
+ *     read with NOFOLLOW, so a link-to-directory is a `visitFile` shape);
+ *   - anything that is neither a regular file, a directory nor a symlink is
+ *     counted in [TarCreateOutcome.skippedSpecial] with the same
+ *     [MAX_REPORTED_SKIPS] name cap;
+ *   - a single unreadable entry is recorded in [TarCreateOutcome.errors] and
+ *     the rest of the tree is still archived (visitFileFailed's CONTINUE);
+ *   - [charge] is called at the same points, and `false` means "budget
+ *     exhausted" — the caller must stop the WHOLE traversal, which is what
+ *     the walker's `TERMINATE` did.
+ *
+ * @return false when the entry budget was hit and the caller must not emit
+ *   anything further.
+ */
+private fun writeTree(
+    sink: OutputStream,
+    dir: Path,
+    rootName: String,
+    root: Path,
+    maxEntries: Long,
+    out: TarCreateOutcome,
+): Boolean {
+    // The walker's order, kept: read the attributes, open the directory
+    // stream, and only then charge + write the header — so a directory that
+    // cannot be read or listed leaves no header claiming it was archived.
+    val attrs = try {
+        Files.readAttributes(dir, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+    } catch (e: Exception) {
+        out.errors.add("$dir: ${e.message}")
+        return true
+    }
+    val children = try {
+        Files.newDirectoryStream(dir).use { stream ->
+            stream.toList().sortedBy { it.fileName.toString() }
+        }
+    } catch (e: Exception) {
+        out.errors.add("$dir: ${e.message}")
+        return true
+    }
+    if (charge(out, maxEntries)) return false
+    val entry = memberNameFor(rootName, root, dir)
+    writeHeader(sink, header(entry + "/", '5', 0L, dirMode(dir), mtimeOf(attrs), ""))
+    out.dirs++
+    for (child in children) {
+        if (Files.isSymbolicLink(child)) {
+            if (charge(out, maxEntries)) return false
+            writeLink(sink, memberNameFor(rootName, root, child), child, out)
+            continue
+        }
+        val childAttrs = try {
+            Files.readAttributes(child, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+        } catch (e: Exception) {
+            out.errors.add("$child: ${e.message}")
+            continue
+        }
+        if (childAttrs.isDirectory) {
+            if (!writeTree(sink, child, rootName, root, maxEntries, out)) return false
+            continue
+        }
+        if (charge(out, maxEntries)) return false
+        val childEntry = memberNameFor(rootName, root, child)
+        if (childAttrs.isRegularFile) {
+            writeRegular(sink, childEntry, child, out)
+        } else {
+            out.skippedSpecial++
+            if (out.skippedNames.size < MAX_REPORTED_SKIPS) out.skippedNames.add(childEntry)
+        }
+    }
+    return true
 }
 
 internal fun writeRegular(

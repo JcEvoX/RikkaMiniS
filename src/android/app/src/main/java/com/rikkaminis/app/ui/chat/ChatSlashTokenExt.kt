@@ -116,6 +116,33 @@ internal val availableSlashCommands: List<SlashCommand> = listOf(
 )
 
 /**
+ * [T-android-slash-menu-align-ios-prepend] Shared composer-fill for the
+ * typing-aid rows (skill + MCP): over-content (the menu was opened via the
+ * "/" button, so [savedInputBeforeSlash] holds the user's original text)
+ * prepends "/<title> " to the original with the caret right after the prefix;
+ * typed-"/" (no saved original) just fills "/<title> ". Returns the text the
+ * composer should hold. One copy so the two typing-aid branches can't drift.
+ */
+private fun ChatViewModel.fillComposerWithSlashTitle(cmd: SlashCommand, saved: String?): String {
+    val prefix = "/${cmd.title} "
+    return if (saved != null) {
+        _pendingCaret.value = prefix.length
+        prefix + saved
+    } else {
+        prefix
+    }
+}
+
+/** Close the slash menu and drop the over-content snapshot. Shared by the
+ *  typing-aid branches and the action dispatch below — the three state
+ *  writes used to be copied verbatim at every exit of executeSlashCommand. */
+private fun ChatViewModel.resetSlashMenuState() {
+    savedInputBeforeSlash = null
+    _showSlashMenu.value = false
+    _slashMenuSelectedIndex.value = -1
+}
+
+/**
  * Execute a slash command. Returns the text the composer should hold
  * afterward (caret via [pendingCaret] when relevant).
  *
@@ -138,27 +165,22 @@ fun ChatViewModel.executeSlashCommand(cmd: SlashCommand, currentInput: String = 
     // the existing SKILL.md fragment injection in runAgentLoop.
     if (cmd.isSkill) {
         AppLogger.info(ChatViewModel.TAG, "[Slash] tap skill id=${cmd.id} title=${cmd.title} → composer fill only")
-        savedInputBeforeSlash = null
-        _showSlashMenu.value = false
-        _slashMenuSelectedIndex.value = -1
-        val prefix = "/${cmd.title} "
-        // [T-android-slash-menu-align-ios-prepend] iOS parity: over-content
-        // (saved != null) → PREPEND "/<skill> " to the original, so the
-        // composer reads "/<skill> <original>" with the original as args,
-        // caret right after the prefix (before the original). Typed-"/"
-        // (saved == null) → just "/<skill> " (the input WAS the partial
-        // command). Trailing space lets the user type "/<skill> <args>".
-        return if (saved != null) {
-            _pendingCaret.value = prefix.length
-            prefix + saved
-        } else {
-            prefix
-        }
+        resetSlashMenuState()
+        return fillComposerWithSlashTitle(cmd, saved)
+    }
+    // [T-mcp-integration-android] MCP rows are the same typing aid as skill
+    // rows: fill the composer with "/<server> " and dismiss the menu — the
+    // actual discovery/call happens model-side via minis-mcp-cli.
+    // [fix/dv16-b] isMcp was written but never read: an MCP tap fell into
+    // the action dispatch below, whose unrecognized-id arm returned "" and
+    // WIPED the composer instead of filling it with the server name.
+    if (cmd.isMcp) {
+        AppLogger.info(ChatViewModel.TAG, "[Slash] tap mcp id=${cmd.id} title=${cmd.title} → composer fill only")
+        resetSlashMenuState()
+        return fillComposerWithSlashTitle(cmd, saved)
     }
     AppLogger.info(ChatViewModel.TAG, "[Slash] tap id=${cmd.id} title=${cmd.title} streaming=${_isStreaming.value} compacting=${_isCompacting.value}")
-    savedInputBeforeSlash = null
-    _showSlashMenu.value = false
-    _slashMenuSelectedIndex.value = -1
+    resetSlashMenuState()
 
     when (cmd.id) {
         "memory" -> toggleMemoryEnabled()

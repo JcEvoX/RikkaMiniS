@@ -1015,6 +1015,15 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
             try {
                 val sdf = SimpleDateFormat(p, Locale.US).apply {
                     timeZone = if (p.endsWith("'Z'")) TimeZone.getTimeZone("UTC") else TimeZone.getDefault()
+                    // [dv16-A A-01] Strict, like the sessions funnel
+                    // (parseSessionsDate): the default lenient mode silently
+                    // ROLLS an out-of-range field over (`2026-02-30` becomes
+                    // March 2, `2026-13-01` next January), so a mistyped bound
+                    // answered for a DIFFERENT day instead of being refused.
+                    // Only overflow/roll-over changes: digit counts, the
+                    // pattern list, zone handling and the date-only form are
+                    // untouched.
+                    isLenient = false
                 }
                 return sdf.parse(s)?.time
             } catch (_: Throwable) {}

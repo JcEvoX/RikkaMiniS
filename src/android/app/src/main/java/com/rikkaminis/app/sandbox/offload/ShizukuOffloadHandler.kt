@@ -1239,7 +1239,9 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
          * the package as the value of the switch and then reported "package
          * clear <packageName>" for a perfectly good command). The handler gate
          * (`scripts/scan/shizuku_args_check.py`) now cross-checks the set
-         * against every `hasFlag("…")` long name in this file.
+         * against every `hasFlag("…")` long name in this file (that check
+         * reads names of two characters or more, which is why the digit
+         * spelling below is not part of it).
          *
          * Only pure switches belong here: `--importance` takes a value and must
          * stay out (declaring it would leave `3` as a stray positional).
@@ -1249,8 +1251,11 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
         internal val NO_VALUE_FLAGS = setOf(
             // permission appops / notification channel
             "block", "unblock",
-            // package
-            "system", "third-party", "disabled",
+            // package — `3` is the short spelling of `third-party`
+            // (`pm list packages -3`); it is declared so the parser can tell
+            // the SWITCH `-3` from a negative number used as a value
+            // ([OffloadArgs], dv16-A A-02). Nothing else here is a digit.
+            "system", "third-party", "3", "disabled",
             "replace", "downgrade", "grant-permissions", "keep-data", "cache-only",
             // permission
             "granted", "denied", "dangerous",

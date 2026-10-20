@@ -82,6 +82,84 @@ IMAGE_KEY_DEF_RE = re.compile(
 )
 SILENT_IMAGE_BRANCH = 'optJSONObject("extra_body")'
 
+# ── [dv16-A04] the --provider matcher must live once ───────────────────────
+# list / search / run each answered `--provider` differently: list substring-
+# matched model.provider+label (case-sensitive), search never read the option
+# it documents, run matched label/id exactly. The fix is a single top-level
+# `providerMatches(query, label, id, typeName)` every subcommand calls.
+PROVIDER_MATCHER = "providerMatches("
+PROVIDER_SUBJECTS = ("cmdList", "cmdSearch", "resolveEntry")
+PROVIDER_SEARCH_FLAG = 'args.get("provider")'
+PROVIDER_FILTER_GUARD = "if (providerFilter != null)"
+PROVIDER_HANDLER_REL = CALLER_RELS[1]
+
+
+def fun_body(text, name):
+    """Body of the first `fun <name>(` in [text] (brace-balanced), or None."""
+    m = re.search(r"\bfun\s+%s\s*\(" % re.escape(name), text)
+    if not m:
+        return None
+    open_brace = text.find("{", m.end())
+    if open_brace < 0:
+        return None
+    depth = 0
+    for i in range(open_brace, len(text)):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_brace:i + 1]
+    return None
+
+
+def check_provider(root):
+    """[dv16-A04] Every `--provider` reader goes through one matcher.
+
+    Fail-closed: a body that cannot be delimited (member renamed / moved) is a
+    violation, not a silent pass.
+    """
+    v = []
+    path = os.path.join(root, PROVIDER_HANDLER_REL)
+    name = os.path.basename(PROVIDER_HANDLER_REL)
+    if not os.path.exists(path):
+        return ["%s: NOT FOUND at %s — cannot verify the --provider matcher" % (name, path)]
+    src = code_only(open(path, encoding="utf-8").read())
+
+    if src.count("fun %s" % PROVIDER_MATCHER) != 1:
+        v.append(
+            "%s: expected exactly ONE 'fun %s' definition — %d found (a second "
+            "--provider decision is the pre-fix shape)"
+            % (name, PROVIDER_MATCHER.rstrip("("), src.count("fun %s" % PROVIDER_MATCHER))
+        )
+    for subject in PROVIDER_SUBJECTS:
+        body = fun_body(src, subject)
+        if body is None:
+            v.append(
+                "%s: `%s` could not be delimited — fail-closed (member renamed or "
+                "moved?)" % (name, subject)
+            )
+            continue
+        if PROVIDER_MATCHER not in body:
+            v.append(
+                "%s: %s does not call the single %s — its own --provider opinion "
+                "is back (list/search/run drift)" % (name, subject, PROVIDER_MATCHER.rstrip("("))
+            )
+    search = fun_body(src, "cmdSearch")
+    if search is not None:
+        if PROVIDER_SEARCH_FLAG not in search:
+            v.append(
+                "%s: cmdSearch does not read %s — the flag is documented and "
+                "ignored again" % (name, PROVIDER_SEARCH_FLAG)
+            )
+        if PROVIDER_FILTER_GUARD not in search:
+            v.append(
+                "%s: cmdSearch has no provider filter decision point (%s) — the "
+                "read flag would be dropped" % (name, PROVIDER_FILTER_GUARD)
+            )
+    return v
+
 
 def code_only(text):
     """Text with comments removed — presence checks must not be satisfiable
@@ -217,6 +295,29 @@ def check(root):
 GOOD_CALLER = """\
 package p
 class C {
+    private fun cmdList(args: OffloadArgs): NativeOffloadResult {
+        val providerFilter = args.get("provider")
+        if (providerFilter != null) {
+            entries = entries.filter { providerMatches(providerFilter, it.label, it.id, it.typeName) }
+        }
+        return NativeOffloadResult(0, "")
+    }
+
+    private fun cmdSearch(args: OffloadArgs): NativeOffloadResult {
+        val providerFilter = args.get("provider")
+        if (providerFilter != null) {
+            matches = matches.filter { providerMatches(providerFilter, it.label, it.id, it.typeName) }
+        }
+        return NativeOffloadResult(0, "")
+    }
+
+    private fun resolveEntry(idOrName: String, providerFilter: String? = null): ModelEntry? {
+        val pool = if (providerFilter.isNullOrEmpty()) all else {
+            all.filter { providerMatches(providerFilter, it.label, it.id, it.typeName) }
+        }
+        return null
+    }
+
     private fun parseExtraHeaders(inputJson: String, warnings: MutableList<String>): Map<String, String> =
         ModelUseProtocol.parseExtraHeaders(inputJson, warnings)
 
@@ -225,6 +326,11 @@ class C {
 
     private fun applyImagePassthrough(inputJson: String): Map<String, Any?> =
         ModelUseProtocol.parseImagePassthrough(inputJson).body
+}
+
+internal fun providerMatches(query: String, label: String, id: String, typeName: String): Boolean {
+    val q = query.trim().lowercase()
+    return label.trim().lowercase() == q
 }
 """
 
@@ -298,6 +404,28 @@ object ModelUseProtocol {
 """
 
 
+# [dv16-A04] the pre-fix shapes: one subcommand drops the shared matcher, and
+# cmdSearch ignores the flag it documents.
+GOOD_CALLER_LIST_SUBSTRING = GOOD_CALLER.replace(
+    "            entries = entries.filter { providerMatches(providerFilter, it.label, it.id, it.typeName) }",
+    "            entries = entries.filter { it.provider.lowercase().contains(providerFilter.lowercase()) }",
+)
+
+GOOD_CALLER_SEARCH_NO_FLAG = GOOD_CALLER.replace(
+    '        val providerFilter = args.get("provider")\n'
+    "        if (providerFilter != null) {\n"
+    "            matches = matches.filter { providerMatches(providerFilter, it.label, it.id, it.typeName) }\n"
+    "        }\n",
+    "",
+)
+
+GOOD_CALLER_TWO_MATCHERS = GOOD_CALLER.replace(
+    "class C {",
+    "class C {\n"
+    "    private fun providerMatches(q: String, label: String): Boolean = label == q\n",
+)
+
+
 def write(root, rel, text):
     p = os.path.join(root, rel)
     os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -311,7 +439,7 @@ def selftest():
     ok = True
 
     def run(root):
-        violations = check(root)
+        violations = check(root) + check_provider(root)
         return violations
 
     # fixture 1: good tree → exit 0
@@ -394,8 +522,49 @@ class C {
             ok = False
             print("SELFTEST-FAIL a caller without the image delegation must be caught:", bad)
 
+    # [dv16-A04] fixture 8: a subcommand rolls its own --provider filter
+    # (list's pre-fix substring match) → must FAIL on the shared-matcher arm
+    with tempfile.TemporaryDirectory() as root:
+        write(root, PROTO_REL, GOOD_PROTO)
+        write(root, CALLER_RELS[0], GOOD_CALLER)
+        write(root, CALLER_RELS[1], GOOD_CALLER_LIST_SUBSTRING)
+        bad = run(root)
+        if not any("cmdList does not call the single providerMatches" in b for b in bad):
+            ok = False
+            print("SELFTEST-FAIL a hand-rolled list filter must be caught:", bad)
+
+    # [dv16-A04] fixture 9: cmdSearch drops the documented --provider flag
+    with tempfile.TemporaryDirectory() as root:
+        write(root, PROTO_REL, GOOD_PROTO)
+        write(root, CALLER_RELS[0], GOOD_CALLER)
+        write(root, CALLER_RELS[1], GOOD_CALLER_SEARCH_NO_FLAG)
+        bad = run(root)
+        if not any('cmdSearch does not read args.get("provider")' in b for b in bad):
+            ok = False
+            print("SELFTEST-FAIL an ignored search flag must be caught:", bad)
+
+    # [dv16-A04] fixture 10: a second matcher definition (the drift source)
+    with tempfile.TemporaryDirectory() as root:
+        write(root, PROTO_REL, GOOD_PROTO)
+        write(root, CALLER_RELS[0], GOOD_CALLER)
+        write(root, CALLER_RELS[1], GOOD_CALLER_TWO_MATCHERS)
+        bad = run(root)
+        if not any("expected exactly ONE" in b for b in bad):
+            ok = False
+            print("SELFTEST-FAIL a duplicated matcher must be caught:", bad)
+
+    # [dv16-A04] fixture 11: fail-closed — the handler file is gone
+    with tempfile.TemporaryDirectory() as root:
+        write(root, PROTO_REL, GOOD_PROTO)
+        write(root, CALLER_RELS[0], GOOD_CALLER)
+        bad = run(root) + check_provider(root)
+        if not any("cannot verify the --provider matcher" in b for b in bad):
+            ok = False
+            print("SELFTEST-FAIL a missing handler file must not pass silently:", bad)
+
     if ok:
         print("MODELUSE_PROTO_SELFTEST=PASS")
+        print("MODELUSE_PROVIDER_MATCHER_SELFTEST=PASS (4 fixtures: 3 violations caught, 1 fail-closed)")
         return 0
     return 1
 
@@ -408,7 +577,7 @@ def main():
         print(__doc__)
         sys.exit(2)
     root = args[0] if args else os.getcwd()
-    violations = check(root)
+    violations = check(root) + check_provider(root)
     if violations:
         print("modeluse_proto_single_source_check: %d violation(s)" % len(violations))
         for v in violations:

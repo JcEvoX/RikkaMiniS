@@ -221,6 +221,56 @@ class SkillRestorePolicyTest {
         )
     }
 
+    // -- [dv16-A05] sparse-clear decision + source wiring --
+
+    @Test
+    fun sparseClear_equalsGlobal_deletesTheOverrideRow() {
+        // (true, true) / (false, false): the session value equals the CURRENT
+        // global default → DELETE the row so a later global flip propagates.
+        assertTrue(shouldDeleteSessionSkillOverride(true, true))
+        assertTrue(shouldDeleteSessionSkillOverride(false, false))
+    }
+
+    @Test
+    fun divergentValue_writesTheOverrideRow() {
+        // Session value genuinely diverges from the global default → keep
+        // (write) the row.
+        assertFalse(shouldDeleteSessionSkillOverride(true, false))
+        assertFalse(shouldDeleteSessionSkillOverride(false, true))
+    }
+
+    @Test
+    fun unknownSkill_conservativelyWritesTheRow() {
+        // globalEnabled == null (skill not in memory yet) → never delete;
+        // the row is written so the toggle survives the load.
+        assertFalse(shouldDeleteSessionSkillOverride(null, true))
+        assertFalse(shouldDeleteSessionSkillOverride(null, false))
+    }
+
+    @Test
+    fun setSessionOverride_hasTheSparseClearBranch() {
+        val src = readRepoFile(
+            "src/android/app/src/main/java/com/rikkaminis/app/data/repository/SkillRepository.kt",
+        )
+        val fn = memberSlice(setSessionOverrideMarker, src)
+        assertTrue(
+            "setSessionOverride must DELETE the row when the value equals the global default",
+            fn.contains("DELETE FROM session_skill_overrides WHERE session_id=? AND skill_id=?"),
+        )
+        assertTrue(
+            "the DELETE branch must be decided by the shared pure decision",
+            fn.contains("shouldDeleteSessionSkillOverride("),
+        )
+        assertTrue(
+            "the global default must be read from the in-memory skill list first",
+            fn.contains("_skills.value.find { it.id == skillId }?.isEnabled"),
+        )
+        assertTrue(
+            "the divergent branch must still write the row",
+            fn.contains("INSERT OR REPLACE INTO session_skill_overrides"),
+        )
+    }
+
     private fun readRepoFile(relative: String): String {
         var dir: java.io.File? = java.io.File(System.getProperty("user.dir"))
         while (dir != null) {
@@ -231,5 +281,24 @@ class SkillRestorePolicyTest {
         throw java.io.FileNotFoundException(
             "$relative not found from user.dir=${System.getProperty("user.dir")}",
         )
+    }
+
+    /** Lines of the member declared at [marker], up to the next sibling member. */
+    private fun memberSlice(marker: String, src: String): String {
+        val lines = src.lines()
+        val start = lines.indexOfFirst { it.contains(marker) }
+        assertTrue("marker not found: $marker", start >= 0)
+        val end = (start + 1 until lines.size).firstOrNull { i ->
+            val line = lines[i]
+            val indent = line.takeWhile { it == ' ' }.length
+            indent <= 4 && line.isNotBlank() && !line.trimStart().startsWith("//") &&
+                !line.trimStart().startsWith("*") &&
+                Regex("^(private|internal|public|protected|fun|val|var|@)").containsMatchIn(line.trimStart())
+        } ?: lines.size
+        return lines.subList(start, end).joinToString("\n")
+    }
+
+    private companion object {
+        const val setSessionOverrideMarker = "fun setSessionOverride(sessionId: String, skillId: String, enabled: Boolean)"
     }
 }

@@ -7,6 +7,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 /**
@@ -165,6 +166,171 @@ class DebugOffloadHandlerTest {
         )
     }
 
+    @Test
+    fun `handle forwards the caller session id to the path-scoped subcommands`() {
+        val body = memberSlice(
+            readRepoFile(HANDLER_REL),
+            "override fun handle(request: NativeOffloadRequest)",
+        )
+        // [dv16-A03] ls/read/write are session-scoped in the PRoot layout:
+        // without the caller's session id the RPC handler's global resolver
+        // would search every session tree. The passthrough must gate on the
+        // session-scoped subcommand set AND the request's session id.
+        assertTrue(
+            "the passthrough must gate on SESSION_SCOPED_SUBCOMMANDS",
+            body.contains("sub in SESSION_SCOPED_SUBCOMMANDS"),
+        )
+        assertTrue(
+            "the passthrough must gate on request.sessionId being present",
+            body.contains("request.sessionId.isNullOrBlank()"),
+        )
+        assertTrue(
+            "the session id must reach the rpc params",
+            body.contains("rpc.params.put(\"sessionId\", request.sessionId)"),
+        )
+    }
+
+    @Test
+    fun `the rpc file-system handlers resolve session-scoped and never bare-global`() {
+        val src = readRepoFile(RPC_REL)
+        for (marker in listOf("private fun handleLS(", "private fun handleReadFile(", "private fun handleWriteFile(")) {
+            val body = memberSlice(src, marker)
+            assertTrue("$marker must resolve through resolvePathForSession", body.contains("PRootKernel.resolvePathForSession("))
+            assertFalse(
+                "$marker must not fall back to the bare global resolveHostPath (searches every session tree)",
+                body.contains("PRootKernel.resolveHostPath("),
+            )
+        }
+        // The session id comes from the rpc params (forwarded by the offload
+        // handler or sent by an external JSON-RPC client); a blank one stays
+        // null so the historical global behaviour survives for session-less
+        // callers.
+        val ls = memberSlice(src, "private fun handleLS(")
+        assertTrue(ls.contains("params.optString(\"sessionId\", \"\").ifBlank { null }"))
+    }
+
+    @Test
+    fun `handleWriteFile keeps the pre-boot rootfsDir fallback`() {
+        val body = memberSlice(readRepoFile(RPC_REL), "private fun handleWriteFile(")
+        assertTrue(
+            "the pre-boot staging path must keep the rootfsDir fallback",
+            body.contains("File(rootfsDir, path.removePrefix(\"/\"))"),
+        )
+        assertTrue(
+            "the read-only mount refusal must stay in front of the write",
+            body.contains("isLinuxPathUnderReadOnlyMount(path)"),
+        )
+    }
+
+    // ── part 4: the session-vs-global resolution, real temp dirs ────────────
+    // [dv16-A03] drives the pure resolvers the production call sites use —
+    // with REAL files, so the boot-state differences and the cross-session
+    // misread the fix removes are demonstrated, not inferred from reading.
+
+    private fun sessionDirsRoot(): File {
+        val root = java.nio.file.Files.createTempDirectory("dv16-a03-probe-").toFile()
+        File(root, "minis-sessions/sess-A/workspace").mkdirs()
+        File(root, "minis-sessions/sess-B/workspace").mkdirs()
+        return root
+    }
+
+    @Test
+    fun `a session-scoped read only sees its own session tree`() {
+        val root = sessionDirsRoot()
+        File(root, "minis-sessions/sess-A/workspace/notes.txt").writeText("A's file")
+        File(root, "minis-sessions/sess-B/workspace/notes.txt").writeText("B's file")
+        var globalCalls = 0
+        val resolved = com.rikkaminis.app.sandbox.resolveSessionGuestHostPath(
+            sessionId = "sess-A",
+            linuxPath = "/var/minis/workspace/notes.txt",
+            filesDir = root,
+            perSessionSubdirs = setOf("workspace"),
+            resolveGlobal = { globalCalls++; null },
+        )
+        assertEquals(
+            File(root, "minis-sessions/sess-A/workspace/notes.txt").canonicalPath,
+            resolved!!.canonicalPath,
+        )
+        assertEquals("a session hit must never consult the global resolver", 0, globalCalls)
+    }
+
+    @Test
+    fun `a session miss stays inside the session tree and never crosses over`() {
+        val root = sessionDirsRoot()
+        // Only sess-B has the file. From sess-C (no dir yet) the resolver
+        // must hand back sess-C's own path (a valid WRITE target) and must
+        // NOT answer with B's file.
+        File(root, "minis-sessions/sess-B/workspace/notes.txt").writeText("B's file")
+        val resolved = com.rikkaminis.app.sandbox.resolveSessionGuestHostPath(
+            sessionId = "sess-C",
+            linuxPath = "/var/minis/workspace/notes.txt",
+            filesDir = root,
+            perSessionSubdirs = setOf("workspace"),
+            resolveGlobal = { fail("global resolver must not be consulted for a session-scoped path"); null },
+        )
+        assertEquals(
+            File(root, "minis-sessions/sess-C/workspace/notes.txt").canonicalPath,
+            resolved!!.canonicalPath,
+        )
+        assertFalse("sess-C has no file yet (read: absent; write: lands in its own tree)", resolved.exists())
+    }
+
+    @Test
+    fun `the bare global resolver misreads across sessions (pre-fix defect)`() {
+        val root = sessionDirsRoot()
+        // Only sess-B has the file — the pre-fix call path
+        // (resolveHostPath, no session id) picks it up for EVERY session.
+        File(root, "minis-sessions/sess-B/workspace/notes.txt").writeText("B's file")
+        val global = com.rikkaminis.app.sandbox.resolveGuestHostPath(
+            linuxPath = "/var/minis/workspace/notes.txt",
+            bindMounts = emptyMap(),
+            perSessionSubdirs = setOf("workspace"),
+            sessionsRoot = File(root, "minis-sessions"),
+            rootfsDir = null,
+        )
+        assertEquals("B's file", global!!.readText())
+    }
+
+    @Test
+    fun `a path outside the session scopes keeps the global resolver`() {
+        val root = sessionDirsRoot()
+        var globalCalls = 0
+        val resolved = com.rikkaminis.app.sandbox.resolveSessionGuestHostPath(
+            sessionId = "sess-A",
+            linuxPath = "/tmp/shared.json",
+            filesDir = root,
+            perSessionSubdirs = setOf("workspace"),
+            resolveGlobal = { globalCalls++; File("/global-root", it.removePrefix("/")) },
+        )
+        assertEquals(File("/global-root/tmp/shared.json").path, resolved?.path)
+        assertEquals(1, globalCalls)
+    }
+
+    @Test
+    fun `pre-boot the global resolver is null and the session path is still a write target`() {
+        val root = java.nio.file.Files.createTempDirectory("dv16-a03-preboot-").toFile()
+        // minis-sessions does not exist yet; the rootfs is not initialized.
+        val global = com.rikkaminis.app.sandbox.resolveGuestHostPath(
+            linuxPath = "/var/minis/workspace/stage.json",
+            bindMounts = emptyMap(),
+            perSessionSubdirs = setOf("workspace"),
+            sessionsRoot = File(root, "minis-sessions"),
+            rootfsDir = null,
+        )
+        assertNull("pre-boot global resolution returns null (handleWriteFile falls back to rootfsDir)", global)
+        val session = com.rikkaminis.app.sandbox.resolveSessionGuestHostPath(
+            sessionId = "sess-A",
+            linuxPath = "/var/minis/workspace/stage.json",
+            filesDir = root,
+            perSessionSubdirs = setOf("workspace"),
+            resolveGlobal = { fail("session-scoped boot-less resolution must stay in the session tree"); null },
+        )
+        assertEquals(
+            File(root, "minis-sessions/sess-A/workspace/stage.json").canonicalPath,
+            session!!.canonicalPath,
+        )
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────────
 
     private fun readRepoFile(relative: String): String {
@@ -195,5 +361,7 @@ class DebugOffloadHandlerTest {
     private companion object {
         const val HANDLER_REL =
             "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/DebugOffloadHandler.kt"
+        const val RPC_REL =
+            "src/android/app/src/main/java/com/rikkaminis/app/debug/DebugRPCHandler.kt"
     }
 }

@@ -339,6 +339,104 @@ def violations_photos(src, label):
     return bad
 
 
+# ── [dv16-A A-01] strict date parsing ───────────────────────────────────────
+# A date that decides a DAY must not come back as a DIFFERENT day: in the
+# default lenient mode SimpleDateFormat silently ROLLS an out-of-range field
+# over (`2026-02-30` → March 2, `2026-13-01` → next January), so a mistyped
+# `--start` / `--end` / `--at` answered for another day instead of being
+# refused. SessionsOffloadHandler.kt:561 is the one parser that got this right;
+# these are its four siblings.
+NOTIFICATION_REL = (
+    "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/NotificationOffloadHandler.kt"
+)
+ALARM_REL = (
+    "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/AlarmOffloadHandler.kt"
+)
+
+# (file, member marker, what the parsed value decides)
+STRICT_DATE_PARSERS = (
+    (PHOTOS_REL, "private fun parseDate(", "--start/--end"),
+    (CALENDAR_REL, "internal fun parseDateInZone(", "--start/--end"),
+    (NOTIFICATION_REL, "private fun parseIso(", "--at"),
+    (ALARM_REL, "private fun parseTimeArg(", "the alarm time"),
+)
+
+STRICT_PARSE_FLAG = "isLenient = false"
+
+
+def member_body(src, marker):
+    """Brace-balanced text of the member declared at [marker]; None if it is not
+    there. Indentation-based slicing is not enough here — the Calendar parser is
+    followed by a `companion object` block, which the sibling scan would swallow
+    (the flag could then live anywhere in the rest of the file)."""
+    start = src.find(marker)
+    if start < 0:
+        return None
+    line_start = src.rfind("\n", 0, start) + 1
+    open_brace = src.find("{", start)
+    if open_brace < 0:
+        return None
+    depth = 0
+    i = open_brace
+    while i < len(src):
+        c = src[i]
+        if c == '"':
+            if src.startswith('"""', i):
+                k = src.find('"""', i + 3)
+                i = len(src) if k < 0 else k + 3
+                continue
+            i += 1
+            while i < len(src) and src[i] != '"':
+                i += 2 if src[i] == "\\" else 1
+        elif c == "'":
+            i += 1
+            while i < len(src) and src[i] != "'":
+                i += 2 if src[i] == "\\" else 1
+        elif c == "/" and src.startswith("//", i):
+            nxt = src.find("\n", i)
+            if nxt < 0:
+                break
+            i = nxt
+        elif c == "/" and src.startswith("/*", i):
+            k = src.find("*/", i + 2)
+            if k < 0:
+                break
+            i = k + 1
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return src[line_start:i + 1]
+        i += 1
+    return None
+
+
+def violations_strict_date_parser(src, label, marker, what):
+    """The parser must not run in the default (lenient) mode.
+
+    Bound to the DECISION, not to a spelling: the flag may sit anywhere inside
+    the parser (after the pattern list, inside the `apply {}`, before the parse
+    call). Fail-closed in both directions — a parser that cannot be sliced out
+    is a finding, and so is one that no longer builds a SimpleDateFormat at all
+    (that is a rewrite of the decision this gate pins)."""
+    bad = []
+    body = member_body(src, marker)
+    if body is None:
+        bad.append("%s:1: %s is gone — the strict-date decision this gate pins cannot be "
+                   "read; re-point the marker" % (label, marker.strip()))
+        return bad
+    if "SimpleDateFormat" not in body or ".parse(" not in body:
+        bad.append("%s:1: %s no longer parses with a SimpleDateFormat — re-read this rule "
+                   "before trusting it" % (label, marker.strip()))
+        return bad
+    if STRICT_PARSE_FLAG not in body:
+        bad.append("%s:1: %s parses %s in the DEFAULT LENIENT mode — an out-of-range field is "
+                   "rolled over (2026-02-30 → March 2) and the command answers for a DIFFERENT "
+                   "day instead of refusing" % (label, marker.strip(), what))
+    return bad
+
+
 def check(repo_root):
     bad = []
     for rel, fn in ((SCHEDULER_REL, violations_scheduler), (CALENDAR_REL, violations_calendar),
@@ -350,6 +448,16 @@ def check(repo_root):
         with open(path, encoding="utf-8") as fh:
             src = fh.read()
         bad.extend(fn(src, rel))
+    # [dv16-A A-01] the strictness of every offload date parser, on the same
+    # is-it-really-there footing: the function body is sliced out and the flag
+    # must be inside it.
+    for rel, marker, what in STRICT_DATE_PARSERS:
+        path = os.path.join(repo_root, rel)
+        if not os.path.isfile(path):
+            bad.append("%s:1: ROT — file not found under %s" % (rel, repo_root))
+            continue
+        with open(path, encoding="utf-8") as fh:
+            bad.extend(violations_strict_date_parser(fh.read(), rel, marker, what))
     return bad
 
 
@@ -626,6 +734,34 @@ BAD_PHOTOS_LIST_NO_BRANCH = GOOD_PHOTOS.replace(
 
 SELFTEST_MARK = "SELFTEST=PASS (schedule-date-source: 2 files x 2 arms, teeth on every criterion)"
 
+# ── [dv16-A A-01] fixtures for the strict-parser criterion ─────────────────
+GOOD_STRICT_PARSER = """
+class FakeHandler {
+    private fun parseDate(s: String): Long? {
+        for (p in patterns) {
+            try {
+                val sdf = SimpleDateFormat(p, Locale.US).apply {
+                    timeZone = if (p.endsWith("'Z'")) TimeZone.getTimeZone("UTC") else TimeZone.getDefault()
+                    isLenient = false
+                }
+                return sdf.parse(s)?.time
+            } catch (e: Exception) {
+                continue
+            }
+        }
+        return null
+    }
+}
+"""
+
+BAD_LENIENT_PARSER = GOOD_STRICT_PARSER.replace("                    isLenient = false\n", "")
+
+BAD_PARSER_REWRITTEN = GOOD_STRICT_PARSER.replace("SimpleDateFormat", "MyFormats")
+
+BAD_PARSER_RENAMED = GOOD_STRICT_PARSER.replace("private fun parseDate(", "private fun parseDay(")
+
+STRICT_PARSERS_MARK = "STRICT_DATE_PARSERS_SELFTEST=PASS (4 parsers x 4 arms)"
+
 
 def run_selftest():
     cases = [
@@ -643,6 +779,16 @@ def run_selftest():
         ("photos/no-inversion-refusal", violations_photos(BAD_PHOTOS_NO_INVERT, "fixture"), ">0"),
         ("photos/album-drops-size", violations_photos(BAD_PHOTOS_ALBUM_NO_SIZE, "fixture"), ">0"),
         ("photos/list-loses-branch", violations_photos(BAD_PHOTOS_LIST_NO_BRANCH, "fixture"), ">0"),
+        # [dv16-A A-01] the strict-date-parser criterion: compliant fixture is
+        # clean, and a lenient / rewritten / renamed parser each trip it.
+        ("parsers/strict", violations_strict_date_parser(
+            GOOD_STRICT_PARSER, "fixture", "private fun parseDate(", "--start/--end"), 0),
+        ("parsers/lenient", violations_strict_date_parser(
+            BAD_LENIENT_PARSER, "fixture", "private fun parseDate(", "--start/--end"), ">0"),
+        ("parsers/rewritten", violations_strict_date_parser(
+            BAD_PARSER_REWRITTEN, "fixture", "private fun parseDate(", "--start/--end"), ">0"),
+        ("parsers/renamed", violations_strict_date_parser(
+            BAD_PARSER_RENAMED, "fixture", "private fun parseDate(", "--start/--end"), ">0"),
     ]
     problems = []
     for name, bad, expected in cases:
@@ -707,6 +853,34 @@ def run_selftest():
     if not any("reports which bound was invalid" in b
                for b in violations_photos(BAD_PHOTOS_LIST_NO_BRANCH, "fixture")):
         problems.append("photos/list-loses-branch: the refusal-message rule did not fire")
+
+    # [dv16-A A-01] each branch of the strict-parser criterion proves itself,
+    # and precise failure modes are distinguished (lenient vs rewritten vs
+    # renamed) so a neutered rule cannot pass as "some finding fired".
+    if not any("DEFAULT LENIENT mode" in b
+               for b in violations_strict_date_parser(BAD_LENIENT_PARSER, "fixture",
+                                                      "private fun parseDate(", "--start/--end")):
+        problems.append("parsers/lenient: the lenient-mode rule did not fire")
+    if any("DEFAULT LENIENT mode" in b
+           for b in violations_strict_date_parser(GOOD_STRICT_PARSER, "fixture",
+                                                  "private fun parseDate(", "--start/--end")):
+        problems.append("parsers/strict: the lenient rule fired on the compliant fixture")
+    if not any("no longer parses with a SimpleDateFormat" in b
+               for b in violations_strict_date_parser(BAD_PARSER_REWRITTEN, "fixture",
+                                                      "private fun parseDate(", "--start/--end")):
+        problems.append("parsers/rewritten: the decision-rewrite rule did not fire")
+    if not any("is gone" in b
+               for b in violations_strict_date_parser(BAD_PARSER_RENAMED, "fixture",
+                                                      "private fun parseDate(", "--start/--end")):
+        problems.append("parsers/renamed: the fail-closed marker rule did not fire")
+    # …and the flag may sit anywhere inside the parser, not only in the apply{}:
+    if violations_strict_date_parser(
+            GOOD_STRICT_PARSER.replace(
+                "                    isLenient = false\n", "").replace(
+                "                return sdf.parse(s)?.time",
+                "                sdf.isLenient = false\n                return sdf.parse(s)?.time"),
+            "fixture", "private fun parseDate(", "--start/--end"):
+        problems.append("parsers/anywhere: a flag outside the apply{} was reported as missing")
 
     if problems:
         print("SELFTEST=FAIL")

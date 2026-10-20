@@ -59,6 +59,15 @@ class GroupsCollection(
         // ids, collapses duplicates (see parseMemberEntryIds).
         val members = entryArr?.let { parseMemberEntryIds(it).toMutableList() }
             ?: mutableListOf()
+        // [fix/dv16-a A-06] Same entry-id existence check as the entries
+        // writer ([requireKnownEntryIds]) — `add` used to accept groups whose
+        // members referenced nonexistent entry ids, a shape the write face
+        // rejected. The only caller of `add` is the bridge's collection
+        // add/remove route (interactive minis-config writes); the backup
+        // restore adds groups via repo.addGroup with members it has just
+        // remapped onto existing entries, so no legal forward-reference path
+        // goes through here.
+        requireKnownEntryIds(members)
 
         val strategy = (obj["strategy"] as? ConfigValue.Str)?.value?.let {
             runCatching { RoutingStrategy.valueOf(it) }.getOrNull()
@@ -130,6 +139,20 @@ class GroupsCollection(
     // [fix/da1023-D] member-entry-id decode moved to GroupWriteRules.
     // parseMemberEntryIds (pure, shared by `add` and `entries` — the
     // top-level function in the same package binds at both call sites).
+
+    // [fix/dv16-a A-06] Single entry-id existence check shared by `add` and
+    // the entries writer (the writer's inline loop moved here so the two
+    // write faces cannot drift; same error wording). The check lives on the
+    // collection (not the mutation RPC) because the `add` payload's only
+    // caller is the bridge's collection add/remove route — the backup restore
+    // adds groups via repo.addGroup directly with members it has just
+    // remapped, so no legal forward-reference path is blocked.
+    private fun requireKnownEntryIds(ids: List<String>) {
+        val valid = repo.config.value.modelEntries.map { it.id }.toSet()
+        for (eid in ids) {
+            if (eid !in valid) throw ConfigError.InvalidValue("Unknown model entry uuid: $eid")
+        }
+    }
 
     private fun nameField(id: String): ConfigField =
         ClosureField(
@@ -288,10 +311,9 @@ class GroupsCollection(
                 val arr = (v as? ConfigValue.Arr)?.value ?: throw ConfigError.TypeMismatch("array")
                 // [fix/da1023-D] strict decode + dedup (see parseMemberEntryIds).
                 val ids = parseMemberEntryIds(arr)
-                val valid = repo.config.value.modelEntries.map { it.id }.toSet()
-                for (eid in ids) {
-                    if (eid !in valid) throw ConfigError.InvalidValue("Unknown model entry uuid: $eid")
-                }
+                // [fix/dv16-a A-06] The existence check moved to the shared
+                // [requireKnownEntryIds] so `add` enforces the same rule.
+                requireKnownEntryIds(ids)
                 mutate(id) {
                     it.memberEntryIds.clear()
                     it.memberEntryIds.addAll(ids)

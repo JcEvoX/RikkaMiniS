@@ -152,6 +152,19 @@ OPENROUTER_UI_GUARD = re.compile(
     r"if\s*\(\s*instance\.providerType\s*!=\s*ProviderType\.openRouter\s*\)"
 )
 UA_WRITABLE_TOKEN = "customUserAgentWritable("
+# ---- [fix/dv16-a A-06] group write face entry-id existence check (C12-C13) ----
+GROUPS_COLLECTION_FILE = "GroupsCollection.kt"
+GROUP_RULES_FILE = "GroupWriteRules.kt"
+ENTRY_ID_HELPER = "requireKnownEntryIds"
+ENTRY_ID_MSG = "Unknown model entry uuid"
+# ---- [fix/dv16-a A-07] the two instance write faces must accept the same
+# optional key set (C14); the collection face must register + parse the same
+# keys (C15). ----
+INSTANCE_OPTIONAL_KEYS = (
+    '"imageEndpointMode"', '"azureMode"', '"useResponsesAPI"',
+    '"appendV1Suffix"', '"isEnabled"', '"customUserAgent"', '"customBaseURL"',
+)
+IMAGE_KEYS = ("imageEndpointMode", "imageEndpointResolved")
 
 
 def strip_comments(text):
@@ -356,6 +369,21 @@ TOP_DECL_PAT = re.compile(
 )
 
 
+def member_window(code, name):
+    """Text of a class-member declaration named [name], from its ``fun``
+    keyword to the next member declaration. Needed for C15's fields-list
+    check: ``fields(forId)`` may be an EXPRESSION-BODY function
+    (``= listOf(…)``) in fixtures and a block body on the real tree, so
+    ``extract_function`` (brace matcher) would run into the next reader
+    lambda's braces and return the wrong span."""
+    m = re.search(r"\bfun\s+" + re.escape(name) + r"\s*\(", code)
+    if not m:
+        return None
+    rest = code[m.end():]
+    nxt = re.search(r"\n    (?:private |internal |override |@)", rest)
+    return rest[: nxt.start()] if nxt else rest
+
+
 def decl_window(code, name):
     """Text of a top-level declaration named [name], from its ``fun`` keyword to
     the next top-level declaration. ``extract_function`` cannot serve here: the
@@ -385,7 +413,8 @@ def base_url_write_offsets(code):
 def check_tree(root):
     """Returns (rc, detail dict). rc=0 all green."""
     detail = {"c1": [], "c2": [], "c3": [], "c4": [], "c5": [], "c6": [], "c7": [],
-              "c8": [], "c9": [], "c10": [], "c11": [], "fail_closed": []}
+              "c8": [], "c9": [], "c10": [], "c11": [], "c12": [], "c13": [],
+              "c14": [], "c15": [], "fail_closed": []}
 
     debug_paths = find_files(root, DEBUG_FILE)
     mut_paths = find_files(root, MUTATION_FILE)
@@ -753,8 +782,154 @@ def check_tree(root):
                 "%s: groups face missing %s" % (CONFIG_BUILTINS_FILE, missing)
             )
 
+    # ---- C12 ---- [fix/dv16-a A-06] groupsUpdate routes the context-limit
+    # write through the canonical face, and the clear branch does NOT null the
+    # "last selected" memory. The canonical write face
+    # (GroupWriteRules.applyContextLimitWrite) KEEPS lastContextLimitTokens on
+    # a clear — the UI's OFF branch stashes rather than erases — so an update
+    # that nulled it made the next OFF→ON toggle snap back to the 128K default
+    # instead of the last value the user set.
+    groups_update = extract_function(mut_code, GROUP_UPDATE_FN)
+    if groups_update is None:
+        detail["fail_closed"].append(
+            "%s: %s not found (fail-closed)" % (MUTATION_FILE, GROUP_UPDATE_FN)
+        )
+    else:
+        if "lastContextLimitTokens = null" in groups_update:
+            detail["c12"].append(
+                "%s: %s clears lastContextLimitTokens in the contextLimitTokens branch "
+                "— the canonical write face (applyContextLimitWrite) keeps the "
+                "last-selected memory the UI restores on an OFF→ON toggle"
+                % (MUTATION_FILE, GROUP_UPDATE_FN)
+            )
+        if "applyContextLimitWrite(" not in groups_update:
+            detail["c12"].append(
+                "%s: %s does not route the context-limit write through the canonical "
+                "applyContextLimitWrite face (single source for clear/seed semantics)"
+                % (MUTATION_FILE, GROUP_UPDATE_FN)
+            )
+
+    # ---- C13 ---- [fix/dv16-a A-06] the group write face's entry-id existence
+    # check must be ONE implementation (the shared helper) reached from both
+    # `add` and the entries writer — `add` used to accept groups whose members
+    # referenced nonexistent entry ids while the entries writer rejected them.
+    groups_paths = find_files(root, GROUPS_COLLECTION_FILE)
+    rules_paths = find_files(root, GROUP_RULES_FILE)
+    if len(groups_paths) != 1 or len(rules_paths) != 1:
+        detail["fail_closed"].append(
+            "expected exactly one %s and one %s, found %d/%d"
+            % (GROUPS_COLLECTION_FILE, GROUP_RULES_FILE, len(groups_paths), len(rules_paths))
+        )
+    else:
+        with open(groups_paths[0], encoding="utf-8") as f:
+            groups_code = strip_comments(f.read())
+        with open(rules_paths[0], encoding="utf-8") as f:
+            rules_code = strip_comments(f.read())
+        n_msg = groups_code.count(ENTRY_ID_MSG) + rules_code.count(ENTRY_ID_MSG)
+        if n_msg == 0:
+            detail["fail_closed"].append(
+                "%s: entry-id existence message %r not found (fail-closed)"
+                % (GROUPS_COLLECTION_FILE, ENTRY_ID_MSG)
+            )
+        elif n_msg != 1:
+            detail["c13"].append(
+                "entry-id existence error message appears %d times across %s/%s "
+                "— the write face must keep exactly one implementation"
+                % (n_msg, GROUPS_COLLECTION_FILE, GROUP_RULES_FILE)
+            )
+        else:
+            helper_pat = re.compile(r"fun\s+" + re.escape(ENTRY_ID_HELPER) + r"\s*\(")
+            if not (helper_pat.search(groups_code) or helper_pat.search(rules_code)):
+                detail["fail_closed"].append(
+                    "%s not found (fail-closed) — the single implementation moved; "
+                    "update this gate" % ENTRY_ID_HELPER
+                )
+        coll_add = extract_function(groups_code, "add")
+        if coll_add is None:
+            detail["fail_closed"].append(
+                "%s: add not found (fail-closed)" % GROUPS_COLLECTION_FILE
+            )
+        elif ENTRY_ID_HELPER + "(" not in coll_add:
+            detail["c13"].append(
+                "%s: add does not run the shared entry-id existence check (%s) — it "
+                "accepts groups whose members reference nonexistent entry ids"
+                % (GROUPS_COLLECTION_FILE, ENTRY_ID_HELPER)
+            )
+        entries_win = decl_window(groups_code, "entriesField")
+        if entries_win is None:
+            detail["fail_closed"].append(
+                "%s: entriesField not found (fail-closed)" % GROUPS_COLLECTION_FILE
+            )
+        elif ENTRY_ID_HELPER + "(" not in entries_win:
+            detail["c13"].append(
+                "%s: entriesField no longer routes through the shared entry-id "
+                "existence check (%s)" % (GROUPS_COLLECTION_FILE, ENTRY_ID_HELPER)
+            )
+
+    # ---- C14 ---- [fix/dv16-a A-07] the two instance write faces must accept
+    # the SAME optional key set — the create face previously dropped
+    # imageEndpointMode entirely while the update face accepted it (an
+    # input/output asymmetry: instanceJsonCore already emitted the keys).
+    for key in INSTANCE_OPTIONAL_KEYS:
+        if create_body is not None and key not in create_body:
+            detail["c14"].append(
+                "%s: instancesCreate does not accept %s while instancesUpdate does "
+                "— the two write faces must accept the same key set"
+                % (MUTATION_FILE, key)
+            )
+        if update_body is not None and key not in update_body:
+            detail["c14"].append(
+                "%s: instancesUpdate does not accept %s while instancesCreate does"
+                % (MUTATION_FILE, key)
+            )
+
+    # ---- C15 ---- [fix/dv16-a A-07] the minis-config collection face must
+    # register + parse the same instance keys the RPC write faces accept:
+    # fields(forId) must list the image-endpoint fields and add() must decode
+    # the writable one (before the fix both were missing, so the read/write
+    # faces disagreed on where the keys live). The cached probe result stays a
+    # derived read-only field on this face.
+    img_coll_paths = find_files(root, PROVIDERS_COLLECTION_FILE)
+    if len(img_coll_paths) != 1:
+        detail["fail_closed"].append(
+            "expected exactly one %s, found %d" % (PROVIDERS_COLLECTION_FILE, len(img_coll_paths))
+        )
+    else:
+        with open(img_coll_paths[0], encoding="utf-8") as f:
+            img_coll_code = strip_comments(f.read())
+        img_fields = member_window(img_coll_code, "fields")
+        if img_fields is None:
+            detail["fail_closed"].append(
+                "%s: fields not found (fail-closed)" % PROVIDERS_COLLECTION_FILE
+            )
+        else:
+            missing = [k for k in IMAGE_KEYS if k not in img_fields]
+            if missing:
+                detail["c15"].append(
+                    "%s: fields does not register providers.<id>.%s"
+                    % (PROVIDERS_COLLECTION_FILE, missing)
+                )
+        img_add = extract_function(img_coll_code, "add")
+        if img_add is None:
+            detail["fail_closed"].append(
+                "%s: add not found (fail-closed)" % PROVIDERS_COLLECTION_FILE
+            )
+        elif IMAGE_KEYS[0] not in img_add:
+            detail["c15"].append(
+                "%s: add does not decode %s — the write face must accept the same "
+                "keys the RPC create face does" % (PROVIDERS_COLLECTION_FILE, IMAGE_KEYS[0])
+            )
+        resolved_win = decl_window(img_coll_code, "imageEndpointResolved")
+        if resolved_win is None or "ReadOnlyField" not in resolved_win:
+            detail["c15"].append(
+                "%s: imageEndpointResolved must stay a derived read-only field on the "
+                "collection face (it is written by the auto-probe, never directly)"
+                % PROVIDERS_COLLECTION_FILE
+            )
+
     rc = 0
-    for k in ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "fail_closed"):
+    for k in ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11",
+              "c12", "c13", "c14", "c15", "fail_closed"):
         if detail[k]:
             rc = 1
     return rc, detail
@@ -839,8 +1014,13 @@ internal object ProviderMutationMethods {
 
     fun instancesCreate(context: android.content.Context, params: JSONObject): JSONObject {
         val type = ProviderType.openAI
-        val customBaseURL: String? = null
+        val customBaseURL: String? = params.optString("customBaseURL", "").ifEmpty { null }
         val azureMode = params.optBoolean("azureMode", false)
+        val useResponsesAPI = params.optBoolean("useResponsesAPI", false)
+        val appendV1Suffix = params.optBoolean("appendV1Suffix", true)
+        val isEnabled = params.optBoolean("isEnabled", true)
+        val customUserAgent = params.optString("customUserAgent", "").ifEmpty { null }
+        val imageEndpointMode = if (params.has("imageEndpointMode")) parseImageEndpointMode(params.optString("imageEndpointMode", "auto")) else com.rikkaminis.app.data.model.ImageEndpointMode.auto
         // [da1023-C] guard comment (verbatim-ish)
         if (customBaseURL != null && !type.supportsCustomBaseURL) {
             throw RPCException(-32602, "customBaseURL is not supported for providerType=openRouter")
@@ -851,6 +1031,11 @@ internal object ProviderMutationMethods {
     fun instancesUpdate(context: android.content.Context, params: JSONObject): JSONObject {
         val current = ProviderInstanceFix()
         val azureMode = if (params.has("azureMode")) params.optBoolean("azureMode", current.azureMode) else current.azureMode
+        val imageEndpointMode = if (params.has("imageEndpointMode")) parseImageEndpointMode(params.optString("imageEndpointMode", "")) else current.imageEndpointMode
+        val useResponsesAPI = if (params.has("useResponsesAPI")) params.optBoolean("useResponsesAPI", current.useResponsesAPI) else current.useResponsesAPI
+        val appendV1Suffix = if (params.has("appendV1Suffix")) params.optBoolean("appendV1Suffix", current.appendV1Suffix) else current.appendV1Suffix
+        val isEnabled = if (params.has("isEnabled")) params.optBoolean("isEnabled", current.isEnabled) else current.isEnabled
+        val customUserAgent = if (params.has("customUserAgent")) params.optString("customUserAgent", "") else current.customUserAgent
         if (params.has("customBaseURL") && !params.isNull("customBaseURL")) {
             val newBase = params.optString("customBaseURL", "").ifEmpty { null }
             if (newBase != null && !current.providerType.supportsCustomBaseURL) {
@@ -888,12 +1073,15 @@ internal object ProviderMutationMethods {
     }
 
     fun groupsUpdate(context: android.content.Context, params: JSONObject): JSONObject {
+        var limitValue = 0
         if (params.has("defaultThinkingLevel")) {
             val t = params.optString("defaultThinkingLevel", "")
         }
         if (params.has("contextLimitTokens")) {
             val raw = params.opt("contextLimitTokens")
+            limitValue = 0
         }
+        current = com.rikkaminis.app.config.collections.mutatedGroupCopy(current) { applyContextLimitWrite(it, limitValue) }
         val current = com.rikkaminis.app.data.model.ModelGroupStub()
         return groupToJson(current)
     }
@@ -931,11 +1119,68 @@ internal fun instanceJsonCore(inst: ProviderInstanceFix, hasCredential: Boolean,
 
 internal val ProviderType.supportsCustomBaseURL: Boolean
     get() = this != ProviderType.openRouter
+
+internal fun parseImageEndpointMode(raw: String): com.rikkaminis.app.data.model.ImageEndpointMode =
+    when (raw) {
+        "auto" -> com.rikkaminis.app.data.model.ImageEndpointMode.auto
+        "imagesGenerations", "images_generations" -> com.rikkaminis.app.data.model.ImageEndpointMode.imagesGenerations
+        "chatCompletions", "chat_completions" -> com.rikkaminis.app.data.model.ImageEndpointMode.chatCompletions
+        else -> throw RPCException(-32602, "imageEndpointMode must be auto | images_generations | chat_completions (got '$raw')")
+    }
 '''
 
 # ---------------------------------------------------------------------------
 # [da1026-ISSUE-05] Collection-face fixture (ProvidersCollection.kt shape).
 # ---------------------------------------------------------------------------
+
+GOOD_GROUP_RULES = '''package com.rikkaminis.app.config.collections
+
+internal fun applyContextLimitWrite(g: ModelGroup, tokens: Int) {
+    if (tokens > 0) {
+        g.contextLimitTokens = tokens
+        g.lastContextLimitTokens = tokens
+    } else {
+        g.contextLimitTokens = null
+    }
+}
+
+internal fun parseMemberEntryIds(arr: List<ConfigValue>): List<String> = emptyList()
+'''
+
+GOOD_GROUPS = '''package com.rikkaminis.app.config.collections
+
+internal class GroupsCollection {
+    override fun add(payload: ConfigValue): String {
+        val entryArr = (payload as? ConfigValue.Arr)?.value
+        val members = entryArr?.let { parseMemberEntryIds(it).toMutableList() } ?: mutableListOf()
+        requireKnownEntryIds(members)
+        val group = ModelGroup(name = "g", memberEntryIds = members)
+        repo.addGroup(group)
+        return group.id
+    }
+
+    private fun requireKnownEntryIds(ids: List<String>) {
+        val valid = repo.config.value.modelEntries.map { it.id }.toSet()
+        for (eid in ids) {
+            if (eid !in valid) throw ConfigError.InvalidValue("Unknown model entry uuid: $eid")
+        }
+    }
+
+    private fun entriesField(id: String): ConfigField =
+        ClosureField(
+            path = "groups." + id + ".entries",
+            writer = { v ->
+                val arr = (v as? ConfigValue.Arr)?.value ?: throw ConfigError.TypeMismatch("array")
+                val ids = parseMemberEntryIds(arr)
+                requireKnownEntryIds(ids)
+                mutate(id) {
+                    it.memberEntryIds.clear()
+                    it.memberEntryIds.addAll(ids)
+                }
+            },
+        )
+}
+'''
 
 GOOD_COLLECTION = '''package com.rikkaminis.app.config.collections
 
@@ -943,14 +1188,22 @@ internal class ProvidersCollection {
     override fun add(payload: ConfigValue): String {
         val providerType = resolveType(payload)
         val customBaseURL = resolveAddCustomBaseURL(rawBase(payload), providerType)
+        val imageEndpointMode = imageEndpointModeFromToken(rawToken(payload)) ?: ImageEndpointMode.auto
         val instance = ProviderInstance(
             id = newId(),
             label = label,
             customBaseURL = customBaseURL,
+            imageEndpointMode = imageEndpointMode,
         )
         repo.addInstance(instance)
         return instance.id
     }
+
+    override fun fields(forId: String): List<ConfigField> = listOf(
+        customBaseURL(forId),
+        imageEndpointMode(forId),
+        imageEndpointResolved(forId),
+    )
 
     private fun customBaseURL(id: String): ConfigField =
         ClosureField(
@@ -966,6 +1219,28 @@ internal class ProvidersCollection {
                     throw ConfigError.InvalidValue("customBaseURL is not supported for providerType=openRouter")
                 }
                 mutate(id) { it.copy(customBaseURL = s.ifEmpty { null }) }
+            },
+        )
+
+    private fun imageEndpointMode(id: String): ConfigField =
+        ClosureField(
+            path = "providers." + id + ".imageEndpointMode",
+            reader = {
+                val inst = repo.instance(id) ?: return@ClosureField ConfigValue.Null
+                ConfigValue.Str(imageEndpointModeToToken(inst.imageEndpointMode))
+            },
+            writer = { v ->
+                val s = (v as? ConfigValue.Str)?.value ?: throw ConfigError.TypeMismatch("string")
+                mutate(id) { it.copy(imageEndpointMode = imageEndpointModeFromToken(s) ?: ImageEndpointMode.auto) }
+            },
+        )
+
+    private fun imageEndpointResolved(id: String): ConfigField =
+        ReadOnlyField(
+            path = "providers." + id + ".imageEndpointResolved",
+            reader = {
+                val inst = repo.instance(id) ?: return@ReadOnlyField ConfigValue.Null
+                ConfigValue.Null
             },
         )
 }
@@ -1080,7 +1355,7 @@ internal fun Request.Builder.applyOpenAIKeyAuth(
 
 def write_fixture(debug_text, mutation_text, collection_text=None,
                   config_text=None, connection_text=None,
-                  auth_text=None, omit_auth=False):
+                  auth_text=None, omit_auth=False, groups_text=None, rules_text=None):
     root = tempfile.mkdtemp(prefix="rpcsym-")
     os.makedirs(os.path.join(root, "src", "debug"))
     os.makedirs(os.path.join(root, "src", "collections"))
@@ -1098,6 +1373,12 @@ def write_fixture(debug_text, mutation_text, collection_text=None,
         collection_text = GOOD_COLLECTION
     with open(os.path.join(root, "src", "collections", PROVIDERS_COLLECTION_FILE), "w", encoding="utf-8") as f:
         f.write(collection_text)
+    # [fix/dv16-a A-06] the group write face (C13) — always the good shape;
+    # C13-specific teeth mutate these via the groups_text rules_text params.
+    with open(os.path.join(root, "src", "collections", GROUPS_COLLECTION_FILE), "w", encoding="utf-8") as f:
+        f.write(GOOD_GROUPS if groups_text is None else groups_text)
+    with open(os.path.join(root, "src", "collections", GROUP_RULES_FILE), "w", encoding="utf-8") as f:
+        f.write(GOOD_GROUP_RULES if rules_text is None else rules_text)
     config_text = GOOD_CONFIG_BUILTINS if config_text is None else config_text
     with open(os.path.join(root, "src", "config", CONFIG_BUILTINS_FILE), "w", encoding="utf-8") as f:
         f.write(config_text)
@@ -1332,6 +1613,8 @@ def run_selftest():
     shutil.rmtree(root)
 
     # --- C6: azureMode write faces (create + update) ---
+    # (the same mutation also trips C14 — the new key-parity gate sees the same
+    # missing key — so the ok check tolerates c14, still pins c6)
     bad_mut = GOOD_MUTATION.replace(
         '        val azureMode = params.optBoolean("azureMode", false)\n', "")
     bad_mut = bad_mut.replace(
@@ -1340,7 +1623,7 @@ def run_selftest():
     assert "val azureMode = params.optBoolean" not in bad_mut, "F16 anchor missing"
     root = write_fixture(GOOD_DEBUG, bad_mut)
     rc, detail = check_tree(root)
-    ok = rc == 1 and detail["c6"] and only(detail, "c6")
+    ok = rc == 1 and detail["c6"] and not detail["c15"] and not detail["fail_closed"]
     results.append(("F16-azureMode-not-writable-C6", ok, detail))
     shutil.rmtree(root)
 
@@ -1529,6 +1812,7 @@ def run_selftest():
         }
         if (params.has("contextLimitTokens")) {
             val raw = params.opt("contextLimitTokens")
+            limitValue = 0
         }
 ''',
         "",
@@ -1560,6 +1844,103 @@ def run_selftest():
     results.append(("F32-config-groups-anchor-missing-fail-closed", ok, detail))
     shutil.rmtree(root)
 
+    # --- [fix/dv16-a A-06] C12: the clear branch wins back its old shape and
+    # nulls lastContextLimitTokens (the exact regression the gate exists for).
+    bad_mut = GOOD_MUTATION.replace(
+        '        current = com.rikkaminis.app.config.collections.mutatedGroupCopy(current) { applyContextLimitWrite(it, limitValue) }\n',
+        '        current = current.copy(contextLimitTokens = null, lastContextLimitTokens = null)\n',
+    )
+    assert bad_mut != GOOD_MUTATION, "F33 anchor missing"
+    root = write_fixture(GOOD_DEBUG, bad_mut)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c12"] and only(detail, "c12")
+    results.append(("F33-groupsUpdate-clears-lastContextLimitTokens-C12", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C12: binding-decisions-not-spelling — the canonical write face applied
+    # through a plain working copy (different spelling, same decision) must stay
+    # green.
+    alt_mut = GOOD_MUTATION.replace(
+        '        current = com.rikkaminis.app.config.collections.mutatedGroupCopy(current) { applyContextLimitWrite(it, limitValue) }\n',
+        '        current = current.copy()\n'
+        '        com.rikkaminis.app.config.collections.applyContextLimitWrite(current, limitValue)\n',
+    )
+    assert alt_mut != GOOD_MUTATION, "F34 anchor missing"
+    root = write_fixture(GOOD_DEBUG, alt_mut)
+    rc, detail = check_tree(root)
+    results.append(("F34-context-limit-alt-spelling-green", rc == 0, detail))
+    shutil.rmtree(root)
+
+    # --- [fix/dv16-a A-06] C13: `add` stops running the shared existence check
+    # (the exact hole the gate exists for) → only C13 red.
+    bad_groups = GOOD_GROUPS.replace("        requireKnownEntryIds(members)\n", "")
+    assert bad_groups != GOOD_GROUPS, "F35 anchor missing"
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, groups_text=bad_groups)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c13"] and only(detail, "c13")
+    results.append(("F35-add-skips-shared-entry-id-check-C13", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C13: a second copy of the existence check appears (the drift the
+    # single-source criterion catches) → only C13 red.
+    dup_rules = GOOD_GROUP_RULES + (
+        '\ninternal fun legacyEntryGuard(ids: List<String>) {\n'
+        '    for (e in ids) {\n'
+        '        if (e.isEmpty()) throw ConfigError.InvalidValue("Unknown model entry uuid: $e")\n'
+        '    }\n'
+        '}\n'
+    )
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, rules_text=dup_rules)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c13"] and only(detail, "c13")
+    results.append(("F36-second-entry-id-check-copy-C13", ok, detail))
+    shutil.rmtree(root)
+
+    # --- [fix/dv16-a A-07] C14: the create face drops imageEndpointMode again
+    # (the asymmetry the gate exists for) → only C14 red.
+    bad_mut = GOOD_MUTATION.replace(
+        '        val imageEndpointMode = if (params.has("imageEndpointMode")) parseImageEndpointMode(params.optString("imageEndpointMode", "auto")) else com.rikkaminis.app.data.model.ImageEndpointMode.auto\n',
+        "",
+    )
+    assert bad_mut != GOOD_MUTATION, "F37 anchor missing"
+    root = write_fixture(GOOD_DEBUG, bad_mut)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c14"] and only(detail, "c14")
+    results.append(("F37-create-drops-imageEndpointMode-C14", ok, detail))
+    shutil.rmtree(root)
+
+    # --- [fix/dv16-a A-07] C15: the collection face stops registering the
+    # derived probe field → only C15 red.
+    bad_coll = GOOD_COLLECTION.replace("        imageEndpointResolved(forId),\n", "")
+    assert bad_coll != GOOD_COLLECTION, "F38 anchor missing"
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, collection_text=bad_coll)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c15"] and only(detail, "c15")
+    results.append(("F38-fields-missing-resolved-key-C15", ok, detail))
+    shutil.rmtree(root)
+
+    # --- C15: the collection add stops decoding the writable image key ---
+    bad_coll = GOOD_COLLECTION.replace(
+        "        val imageEndpointMode = imageEndpointModeFromToken(rawToken(payload)) ?: ImageEndpointMode.auto\n"
+        "        val instance = ProviderInstance(\n"
+        "            id = newId(),\n"
+        "            label = label,\n"
+        "            customBaseURL = customBaseURL,\n"
+        "            imageEndpointMode = imageEndpointMode,\n"
+        "        )\n",
+        "        val instance = ProviderInstance(\n"
+        "            id = newId(),\n"
+        "            label = label,\n"
+        "            customBaseURL = customBaseURL,\n"
+        "        )\n",
+    )
+    assert bad_coll != GOOD_COLLECTION, "F39 anchor missing"
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, collection_text=bad_coll)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c15"] and only(detail, "c15")
+    results.append(("F39-add-does-not-decode-imageEndpointMode-C15", ok, detail))
+    shutil.rmtree(root)
+
     all_ok = True
     for name, ok, detail in results:
         print("%s %s" % ("PASS" if ok else "FAIL", name))
@@ -1588,9 +1969,12 @@ def main():
               "C2 update guard, C3 key symmetry, C4 collection guard, "
               "C5 mutation predicate floor, C6 azureMode four faces, "
               "C7 probe auth fork, C8 config-face keys, C9 UA visibility, "
-              "C10 auth single source, C11 group field faces)")
+              "C10 auth single source, C11 group field faces, "
+              "C12 context-limit canonical face, C13 entry-id check single-source, "
+              "C14 instance key parity, C15 collection image keys)")
         return 0
-    for k in ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11", "fail_closed"):
+    for k in ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11",
+              "c12", "c13", "c14", "c15", "fail_closed"):
         for line in detail[k]:
             print("[%s] %s" % (k.upper(), line))
     return 1

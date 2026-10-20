@@ -323,6 +323,28 @@ class CalendarFreebusyInstancesTest {
         )
     }
 
+    // ── [dv16-A A-01] the shipped calendar parser is strict ────────────────
+
+    @Test
+    fun `the shipped calendar parser refuses an out-of-range date instead of rolling it over`() {
+        val body = memberSlice(readHandlerSource(), "internal fun parseDateInZone(")
+        // Java's SimpleDateFormat is LENIENT by default: an out-of-range field
+        // is ROLLED FORWARD (`2026-02-30` → March 2, `2026-13-01` → next
+        // January), so a mistyped --start/--end answered for a DIFFERENT day
+        // instead of being refused. This is the same decision the sessions
+        // funnel (parseSessionsDate) already carried — the only parser that had
+        // it before this change.
+        assertTrue(
+            "parseDateInZone must parse strictly (isLenient = false)",
+            body.contains("isLenient = false"),
+        )
+        // The flag was added WITHOUT touching what the tests above mirror: the
+        // relative-offset branch and the format list are the same ones.
+        assertTrue(body.contains("^([+-]?)(\\d+)([dhm])$"))
+        assertTrue(body.contains("SimpleDateFormat"))
+        assertTrue(body.contains("\"yyyy-MM-dd\""))
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────────
 
     private fun readHandlerSource(): String =

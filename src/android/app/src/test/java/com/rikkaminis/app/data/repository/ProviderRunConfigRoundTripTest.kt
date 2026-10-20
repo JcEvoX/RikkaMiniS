@@ -168,4 +168,106 @@ class ProviderRunConfigRoundTripTest {
         assertEquals(src.imageEndpointResolved, back.imageEndpointResolved)
         assertEquals(src.pinned, back.pinned)
     }
+
+    // ---- [fix/dv16-a A-08] shared instance-field seam (append + merge) ----
+    //
+    // Before the seam the merge path (same-(type,label) restore) decoded NONE
+    // of the instance-config fields, so a restore onto an existing provider
+    // dropped the base URL / format toggles / run-config while the append path
+    // restored them. The seam is now one decode + one apply, driven here with
+    // hardcoded literals.
+
+    private val fullPayload = JSONObject()
+        .put("customBaseURL", "https://relay.example.com")
+        .put("appendV1Suffix", false)
+        .put("useResponsesAPI", true)
+        .put("customUserAgent", "claude-cli/1.0")
+        .put("isEnabled", false)
+        .put("azureMode", true)
+        .put("imageEndpointMode", "chatCompletions")
+        .put("imageEndpointResolved", "imagesGenerations")
+        .put("pinned", true)
+
+    @Test
+    fun readImportInstanceFields_missingKeysFallBackToDefaults() {
+        val f = readImportInstanceFields(JSONObject())
+
+        assertNull(f.customBaseURL)
+        assertEquals(true, f.appendV1Suffix)
+        assertEquals(false, f.useResponsesAPI)
+        assertNull(f.customUserAgent)
+        assertTrue(f.runConfig.isEnabled)
+        assertFalse(f.runConfig.azureMode)
+        assertEquals(ImageEndpointMode.auto, f.runConfig.imageEndpointMode)
+        assertNull(f.runConfig.imageEndpointResolved)
+        assertFalse(f.runConfig.pinned)
+    }
+
+    @Test
+    fun readImportInstanceFields_decodesFullPayload() {
+        val f = readImportInstanceFields(fullPayload)
+
+        assertEquals("https://relay.example.com", f.customBaseURL)
+        assertEquals(false, f.appendV1Suffix)
+        assertEquals(true, f.useResponsesAPI)
+        assertEquals("claude-cli/1.0", f.customUserAgent)
+        assertFalse(f.runConfig.isEnabled)
+        assertTrue(f.runConfig.azureMode)
+        assertEquals(ImageEndpointMode.chatCompletions, f.runConfig.imageEndpointMode)
+        assertEquals(ImageEndpointMode.imagesGenerations, f.runConfig.imageEndpointResolved)
+        assertTrue(f.runConfig.pinned)
+    }
+
+    @Test
+    fun applyImportInstanceFields_restoresAllFieldsOntoExistingInstance() {
+        val base = ProviderInstance(
+            id = "live-1",
+            label = "OpenAI",
+            providerType = ProviderType.openAI,
+            credentialType = ProviderCredential.apiKey,
+            customBaseURL = "https://old.example.com",
+            appendV1Suffix = true,
+            useResponsesAPI = false,
+            isEnabled = true,
+            azureMode = false,
+        )
+
+        val updated = applyImportInstanceFields(base, readImportInstanceFields(fullPayload))
+
+        // restore fields written
+        assertEquals("https://relay.example.com", updated.customBaseURL)
+        assertEquals(false, updated.appendV1Suffix)
+        assertEquals(true, updated.useResponsesAPI)
+        assertEquals("claude-cli/1.0", updated.customUserAgent)
+        assertEquals(false, updated.isEnabled)
+        assertEquals(true, updated.azureMode)
+        assertEquals(ImageEndpointMode.chatCompletions, updated.imageEndpointMode)
+        assertEquals(ImageEndpointMode.imagesGenerations, updated.imageEndpointResolved)
+        assertEquals(true, updated.pinned)
+        // identity + merge-match key untouched
+        assertEquals("live-1", updated.id)
+        assertEquals("OpenAI", updated.label)
+        assertEquals(ProviderType.openAI, updated.providerType)
+        assertEquals(ProviderCredential.apiKey, updated.credentialType)
+        assertEquals(base.createdAt, updated.createdAt)
+        // copy-on-write: the caller's (live) object untouched
+        assertEquals("https://old.example.com", base.customBaseURL)
+        assertEquals(true, base.isEnabled)
+    }
+
+    @Test
+    fun applyImportInstanceFields_noChangeYieldsEqualButDetachedCopy() {
+        val base = ProviderInstance(
+            id = "i1",
+            label = "L",
+            providerType = ProviderType.openAI,
+            credentialType = ProviderCredential.apiKey,
+        )
+        val updated = applyImportInstanceFields(base, readImportInstanceFields(JSONObject()))
+
+        // merge path skips the persist when nothing changed — the structural
+        // equality IS the decision point's input.
+        assertEquals(base, updated)
+        assertTrue(updated !== base)
+    }
 }

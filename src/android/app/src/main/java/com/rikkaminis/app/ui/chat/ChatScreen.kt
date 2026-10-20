@@ -1008,7 +1008,12 @@ fun ChatScreen(
             } else {
                 val viewportEnd = info.viewportEndOffset
                 val last = info.visibleItemsInfo.maxByOrNull { it.index }
-                last != null && last.offset + last.size <= viewportEnd
+                // [B-03 deep-audit-1037] The threshold is now actually
+                // consumed: the old arm had no threshold term at all (the
+                // remember key was captured but never read inside this body),
+                // so the scrollNearBottomDp knob did nothing on this arm.
+                last != null &&
+                    isListAtBottom(last.offset, last.size, viewportEnd, nearBottomThresholdPx.toInt())
             }
             // T-android-jank-profile: was logging on every scroll frame (this
             // is a derivedStateOf body — it re-runs when any of
@@ -1364,15 +1369,29 @@ fun ChatScreen(
                     // letting the anchor-guard yank the reader (the observed
                     // "output-end jump"). Reading the raw index/offset is
                     // authoritative and settles in the same snapshot.
-                    val stoppedIdx = listState.firstVisibleItemIndex
-                    val stoppedTotal = listState.layoutInfo.totalItemsCount
-                    // [forward-stable] Forward list: at bottom ⇔ the viewport
-                    // reaches the last rows (sentinel index = total-1) with a
-                    // small scroll offset. Raw index/offset are authoritative
-                    // here — the cached isNearBottom can lag a snapshot.
-                    val stoppedAtBottom = stoppedTotal > 0 &&
-                        stoppedIdx >= stoppedTotal - 2 &&
-                        listState.firstVisibleItemScrollOffset <= nearBottomThresholdPx.toInt()
+                    // [B-03 deep-audit-1037] The old verdict compared the
+                    // viewport-TOP index (`firstVisibleItemIndex`) against
+                    // `total - 2` — a reversed formula left over from the
+                    // reverseLayout era. On a forward list with a multi-row
+                    // viewport it read FALSE at the true bottom (new rows no
+                    // longer auto-followed after a drag) and TRUE when a tall
+                    // last item's top was at the viewport top (a reader got
+                    // yanked back mid-read). The verdict now reads the same
+                    // raw layoutInfo snapshot as isNearBottom — authoritative
+                    // at drag-stop, unlike the cached derived state — through
+                    // the ONE shared bottom test (sentinel arm + threshold).
+                    val info = listState.layoutInfo
+                    val stoppedTotal = info.totalItemsCount
+                    val sentinel = if (stoppedTotal > 0) {
+                        info.visibleItemsInfo.firstOrNull { it.index == stoppedTotal - 1 }
+                    } else null
+                    val last = info.visibleItemsInfo.maxByOrNull { it.index }
+                    val stoppedAtBottom = stoppedTotal > 0 && (
+                        sentinel != null ||
+                            (last != null && isListAtBottom(
+                                last.offset, last.size, info.viewportEndOffset, nearBottomThresholdPx.toInt(),
+                            ))
+                        )
                     // [forward-stable] Drag end flips the mode: sentinel in
                     // view → follow; scrolled away → detach (nothing may yank).
                     // Maintains the mode for the explicit-intent consumer above.
@@ -5266,6 +5285,37 @@ private fun followEventLabel(event: FollowEvent): String = when (event) {
     is FollowEvent.Retry -> "Retry"
     is FollowEvent.FabDown -> "FabDown"
     is FollowEvent.ImeViewportChanged -> "ImeViewportChanged"
+}
+
+/**
+ * [B-03 deep-audit-1037] The ONE bottom verdict, shared by the derived
+ * `isNearBottom` state and the `DragInteraction.Stop` handler. "At bottom" =
+ * the last visible row's bottom edge sits within [thresholdPx] of the
+ * viewport end. Callers add the sentinel arm on top (sentinel row visible ⇒
+ * at bottom regardless of measurement) — the sentinel is a 5dp spacer one
+ * past the last message row and is only measurable when the user really is
+ * at the bottom, so it cannot be fooled by a tall last item (the T173
+ * failure mode of the old gap test).
+ *
+ * Before this function the two callers each carried their own copy, and the
+ * DragStop copy compared the viewport-TOP index (`firstVisibleItemIndex`)
+ * against `total - 2` — a reversed formula left over from the reverseLayout
+ * era that read FALSE at the true bottom (streaming stopped following) and
+ * TRUE when a tall last item's top reached the viewport top (a reader got
+ * yanked back). [LazyListItemInfo.size] is the FULL item height, so
+ * "bottom edge within threshold of the viewport end" is scroll-depth aware.
+ *
+ * Pure: no Compose / Android dependencies, JVM-testable.
+ */
+internal fun isListAtBottom(
+    lastVisibleOffsetPx: Int,
+    lastVisibleSizePx: Int,
+    viewportEndOffsetPx: Int,
+    thresholdPx: Int,
+): Boolean {
+    val bottomEdge = lastVisibleOffsetPx + lastVisibleSizePx
+    val distance = viewportEndOffsetPx - bottomEdge
+    return distance >= 0 && distance <= thresholdPx
 }
 
 /**

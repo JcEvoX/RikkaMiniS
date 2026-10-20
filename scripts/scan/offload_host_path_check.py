@@ -67,6 +67,21 @@ PLAYER_MANAGER_REL = os.path.join(
     "offload", "MediaPlayerManager.kt",
 )
 
+# ── [dv16-A03] R5: debug RPC file-system paths must be session-scoped ───────
+# `minis-debug ls|read|write` built their JSON-RPC params without the caller's
+# session id, and DebugRPCHandler resolved every path through the bare global
+# `PRootKernel.resolveHostPath` — which searches EVERY minis-sessions/<id>/
+# tree for an existing match, then the rootfs. So a session-relative `ls .`
+# listed whichever session's file matched first, and a new file landed in the
+# rootfs ghost dir the session's shell (bound to its own tree) cannot see.
+# Same family as R3 (player) and the Speech:245 host-read escape.
+DEBUG_RPC_REL = os.path.join(
+    "src", "android", "app", "src", "main", "java", "com", "rikkaminis", "app",
+    "debug", "DebugRPCHandler.kt",
+)
+DEBUG_OFFLOAD_REL = os.path.join(OFFLOAD_REL, "DebugOffloadHandler.kt")
+DEBUG_PATH_SUBJECTS = ("handleLS", "handleReadFile", "handleWriteFile")
+
 
 def _fun_body(text, header_pat):
     """Body of the first function matching header_pat (brace-balanced), or None."""
@@ -208,6 +223,72 @@ def scan_shizuku_paths(root):
             )
     return problems
 
+
+def scan_debug_session_path(root):
+    """R5 [dv16-A03]: the debug file surface must resolve session-scoped.
+
+    Fail-closed: a file that cannot be delimited (moved class / renamed
+    member / lost anchor) is a violation, not a silent pass.
+    """
+    problems = []
+    rpc_path = os.path.join(root, DEBUG_RPC_REL)
+    if not os.path.isfile(rpc_path):
+        return ["%s: missing — cannot verify debug session-path wiring" % DEBUG_RPC_REL]
+    with open(rpc_path, encoding="utf-8", errors="replace") as fh:
+        rpc = strip_comments(fh.read())
+
+    for fn in DEBUG_PATH_SUBJECTS:
+        body = _fun_body(rpc, r"\bfun\s+%s\s*\(" % re.escape(fn))
+        if body is None:
+            problems.append(
+                "%s: `%s` could not be delimited — fail-closed (signature moved?)"
+                % (DEBUG_RPC_REL, fn)
+            )
+            continue
+        if "resolvePathForSession(" not in body:
+            problems.append(
+                "%s: %s does not resolve through PRootKernel.resolvePathForSession — the per-session "
+                "bind mounts are bypassed (cross-session read / rootfs ghost write)"
+                % (DEBUG_RPC_REL, fn)
+            )
+        if "PRootKernel.resolveHostPath(" in body:
+            problems.append(
+                "%s: %s still calls the bare global resolveHostPath — it scans every "
+                "minis-sessions/<id>/ tree for an existing match (cross-session misread)"
+                % (DEBUG_RPC_REL, fn)
+            )
+    if "resolvePathForSession(" not in rpc:
+        problems.append(
+            "%s: no PRootKernel.resolvePathForSession(...) anywhere — the debug file surface "
+            "lost its session-scoped resolver" % DEBUG_RPC_REL
+        )
+
+    offload_path = os.path.join(root, DEBUG_OFFLOAD_REL)
+    if not os.path.isfile(offload_path):
+        return problems + [
+            "%s: missing — cannot verify the session-id passthrough" % DEBUG_OFFLOAD_REL
+        ]
+    with open(offload_path, encoding="utf-8", errors="replace") as fh:
+        offload = strip_comments(fh.read())
+    handle = _fun_body(offload, r"\boverride\s+fun\s+handle\s*\(")
+    if handle is None:
+        problems.append(
+            "%s: `override fun handle` could not be delimited — fail-closed" % DEBUG_OFFLOAD_REL
+        )
+    elif "request.sessionId" not in handle:
+        problems.append(
+            "%s: `request.sessionId` never reaches the rpc request — ls/read/write cannot be "
+            "session-scoped (the handler's global resolver would search every session tree)"
+            % DEBUG_OFFLOAD_REL
+        )
+    # The decision, not the spelling: any gate that binds the passthrough to a
+    # named session-scoped subcommand set (or its literal) satisfies this.
+    if "SESSION_SCOPED_SUBCOMMANDS" not in offload and 'setOf("ls", "read", "write")' not in offload:
+        problems.append(
+            "%s: the session-scoped subcommand gate is gone — the passthrough is not bound to a "
+            "decision and could leak into pass-through subcommands" % DEBUG_OFFLOAD_REL
+        )
+    return problems
 
 def strip_comments(text):
     """Blank out // and /* */ comment content, keeping line structure."""
@@ -675,6 +756,151 @@ class ShizukuOffloadHandler(private val context: Context) : NativeOffloadHandler
         print("❌ selftest failed: %s" % ", ".join(shizuku_failures))
         return 1
     print("SHIZUKU_PATH_SELFTEST=PASS (5 fixtures: 4 violations caught, 1 clean tree green)")
+
+    # ── [dv16-A03] R5: debug RPC session-path fixtures ─────────────────────
+    # One dirty arm per decision the criterion makes: the bare global resolver
+    # restored in a handler, the session resolver dropped without a global
+    # call, the handler anchor renamed (fail-closed), the session id never
+    # forwarded by the offload handler, and the subcommand gate removed.
+    DEBUG_RPC_OK = """package com.rikkaminis.app.debug
+
+class DebugRPCHandler(private val context: Context) {
+    private fun handleLS(params: JSONObject): Any {
+        val sessionId = params.optString("sessionId", "").ifBlank { null }
+        val hostFile = PRootKernel.resolvePathForSession(sessionId, path, context)
+            ?: throw RPCException(-32602, "Cannot resolve path: $path")
+        return hostFile
+    }
+
+    private fun handleReadFile(params: JSONObject): JSONObject {
+        val sessionId = params.optString("sessionId", "").ifBlank { null }
+        val hostFile = PRootKernel.resolvePathForSession(sessionId, path, context)
+            ?: throw RPCException(-32602, "Cannot resolve path: $path")
+        return JSONObject()
+    }
+
+    private fun handleWriteFile(params: JSONObject): JSONObject {
+        val sessionId = params.optString("sessionId", "").ifBlank { null }
+        val hostFile = PRootKernel.resolvePathForSession(sessionId, path, context) ?: run {
+            val rootfsDir = RootfsManager.getInstance(context).rootfsDir
+            File(rootfsDir, path.removePrefix("/"))
+        }
+        return JSONObject()
+    }
+}
+"""
+
+    DEBUG_OFFLOAD_OK = """package com.rikkaminis.app.sandbox.offload
+
+class DebugOffloadHandler(private val context: Context) : NativeOffloadHandler {
+    private val SESSION_SCOPED_SUBCOMMANDS = setOf("ls", "read", "write")
+
+    override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
+        if (sub in SESSION_SCOPED_SUBCOMMANDS && !request.sessionId.isNullOrBlank()) {
+            rpc.params.put("sessionId", request.sessionId)
+        }
+        return postJsonRpc(rpc.method, rpc.params)
+    }
+}
+"""
+
+    def debug_fixture_root(rpc_text, offload_text=None, rpc_present=True):
+        root = tempfile.mkdtemp(prefix="offload-gate-selftest-debug-")
+        if rpc_present:
+            path = os.path.join(root, DEBUG_RPC_REL)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(rpc_text)
+        if offload_text is not None:
+            path = os.path.join(root, DEBUG_OFFLOAD_REL)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(offload_text)
+        return root
+
+    debug_arms = [
+        ("R5 clean: session-scoped handlers + id forwarded", DEBUG_RPC_OK, DEBUG_OFFLOAD_OK,
+         None, True),
+        ("R5 dirty: a handler keeps a bare global resolveHostPath",
+         DEBUG_RPC_OK.replace(
+             "        val hostFile = PRootKernel.resolvePathForSession(sessionId, path, context)\n"
+             "            ?: throw RPCException(-32602, \"Cannot resolve path: $path\")\n"
+             "        return JSONObject()\n    }\n\n"
+             "    private fun handleWriteFile",
+             "        val hostFile = PRootKernel.resolvePathForSession(sessionId, path, context)\n"
+             "            ?: throw RPCException(-32602, \"Cannot resolve path: $path\")\n"
+             "        val legacy = PRootKernel.resolveHostPath(path)\n"
+             "        return JSONObject()\n    }\n\n"
+             "    private fun handleWriteFile"),
+         DEBUG_OFFLOAD_OK, "still calls the bare global resolveHostPath", False),
+        ("R5 dirty: the session resolver dropped without a global call",
+         DEBUG_RPC_OK.replace(
+             "        val sessionId = params.optString(\"sessionId\", \"\").ifBlank { null }\n"
+             "        val hostFile = PRootKernel.resolvePathForSession(sessionId, path, context)\n"
+             "            ?: throw RPCException(-32602, \"Cannot resolve path: $path\")\n"
+             "        return JSONObject()",
+             "        val hostFile = PRootKernel.resolveGuestHostPath(path)\n"
+             "        return JSONObject()", 1),
+         DEBUG_OFFLOAD_OK, "does not resolve through PRootKernel.resolvePathForSession", False),
+        ("R5 dirty: a handler anchor renamed (fail-closed)", DEBUG_RPC_OK,
+         DEBUG_OFFLOAD_OK, "could not be delimited", False),
+        ("R5 dirty: the offload handler never forwards request.sessionId",
+         DEBUG_RPC_OK,
+         DEBUG_OFFLOAD_OK.replace(
+             "        if (sub in SESSION_SCOPED_SUBCOMMANDS && !request.sessionId.isNullOrBlank()) {\n"
+             "            rpc.params.put(\"sessionId\", request.sessionId)\n"
+             "        }\n", ""),
+         "never reaches the rpc request", False),
+        ("R5 dirty: the session-scoped subcommand gate removed",
+         DEBUG_RPC_OK,
+         DEBUG_OFFLOAD_OK.replace('SESSION_SCOPED_SUBCOMMANDS = setOf("ls", "read", "write")',
+                                  'PATH_SUBS = setOf("ls")')
+                        .replace("sub in SESSION_SCOPED_SUBCOMMANDS", "sub in PATH_SUBS"),
+         "session-scoped subcommand gate is gone", False),
+    ]
+    debug_failures = []
+    for label, rpc_text, offload_text, needle, expect_clean in debug_arms:
+        if label.startswith("R5 dirty: a handler anchor renamed"):
+            rpc_text = DEBUG_RPC_OK.replace("private fun handleLS(", "private fun handleLs(")
+        root = debug_fixture_root(rpc_text, offload_text)
+        try:
+            problems = scan_debug_session_path(root)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+        ok = (not problems) == expect_clean
+        if ok and needle is not None:
+            ok = any(needle in p for p in problems)
+        print("  [%s] %s%s" % ("PASS" if ok else "FAIL", label,
+                               "" if ok else "  → problems=%s" % problems))
+        if not ok:
+            debug_failures.append(label)
+    # Fail-closed: a missing DebugRPCHandler.kt is a violation, not a skip.
+    root = debug_fixture_root(DEBUG_RPC_OK, DEBUG_OFFLOAD_OK, rpc_present=False)
+    try:
+        problems = scan_debug_session_path(root)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    if not problems:
+        debug_failures.append("R5 fail-closed: missing DebugRPCHandler.kt was not reported")
+        print("  [FAIL] R5 fail-closed: missing DebugRPCHandler.kt was not reported")
+    else:
+        print("  [PASS] R5 fail-closed: missing DebugRPCHandler.kt is a violation")
+    # Fail-closed: a missing offload handler is a violation too.
+    root = debug_fixture_root(DEBUG_RPC_OK, None)
+    try:
+        problems = scan_debug_session_path(root)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    if not problems:
+        debug_failures.append("R5 fail-closed: missing DebugOffloadHandler.kt was not reported")
+        print("  [FAIL] R5 fail-closed: missing DebugOffloadHandler.kt was not reported")
+    else:
+        print("  [PASS] R5 fail-closed: missing DebugOffloadHandler.kt is a violation")
+    if debug_failures:
+        print("❌ selftest failed: %s" % ", ".join(debug_failures))
+        return 1
+    print("DEBUG_SESSION_PATH_SELFTEST=PASS (6 fixtures + 2 fail-closed: "
+          "5 violations caught, 1 clean tree green)")
     return 0
 
 
@@ -691,6 +917,7 @@ def main():
     scanned, problems = check_tree(root)
     problems.extend(scan_player_session_path(root))
     problems.extend(scan_shizuku_paths(root))
+    problems.extend(scan_debug_session_path(root))
     if problems:
         print("offload_host_path_check: %d handler file(s) scanned, %d violation(s)" % (scanned, len(problems)))
         return 1
