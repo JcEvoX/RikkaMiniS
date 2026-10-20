@@ -72,7 +72,15 @@ class LocationOffloadHandler(private val context: Context) : NativeOffloadHandle
             }
         } catch (e: Throwable) {
             AppLogger.warning(TAG, "uncaught: ${e.message}")
-            NativeOffloadResult(1, OffloadOutput.formatBody("android-location: ${e.message ?: "unknown error"}", args) + "\n")
+            // [da1034-A4] ISSUE-08: the payload is JSON even on the failure
+            // path — this used to emit the bare sentence
+            // `android-location: <msg>`, which passes through formatBody
+            // untouched and breaks a `jq` / `json.loads` reader.
+            val body = JSONObject()
+                .put("error", "uncaught")
+                .put("message", e.message ?: "unknown error")
+                .toString()
+            NativeOffloadResult(1, OffloadOutput.formatBody(body, args) + "\n")
         }
     }
 
@@ -318,15 +326,46 @@ class LocationOffloadHandler(private val context: Context) : NativeOffloadHandle
         return json.toString(2)
     }
 
+    /**
+     * [da1034-A4] ISSUE-08: reverse-geocode payload — ONE shape for both
+     * outcomes. This used to be two different payload types: an English
+     * sentence with exit 0 when the geocoder returned nothing (the common
+     * outcome on devices without a Google geocoder) and bare address lines
+     * joined by "\n" when it returned something — so a downstream reader had
+     * to guess the top-level type, and the empty case was not JSON at all
+     * (same defect 1033-D fixed for `android-photos near`). Keys mirror the
+     * sibling `forward` payload (latitude / longitude / address) so both
+     * directions of the geocode read the same way.
+     */
+    private fun reverseGeocodeJson(lat: Double, lon: Double, lines: List<String>): JSONObject {
+        val arr = JSONArray()
+        lines.forEach { arr.put(it) }
+        return JSONObject()
+            .put("latitude", lat)
+            .put("longitude", lon)
+            .put("address", lines.joinToString(", "))
+            .put("address_lines", arr)
+            .put("count", lines.size)
+    }
+
     private fun geocode(lat: Double, lon: Double, args: OffloadArgs): NativeOffloadResult {
         return try {
             val geocoder = Geocoder(context, Locale.getDefault())
             @Suppress("DEPRECATION")
             val addrs = geocoder.getFromLocation(lat, lon, 1)
             val addr = addrs?.firstOrNull()
-                ?: return NativeOffloadResult(0, OffloadOutput.formatBody("No address found for ($lat, $lon).", args) + "\n")
-            val lines = (0..addr.maxAddressLineIndex).map { addr.getAddressLine(it) }
-            NativeOffloadResult(0, OffloadOutput.formatBody(lines.joinToString("\n"), args) + "\n")
+            // getAddressLine returns null for sparse indexes; normalize once so
+            // neither the JSON array nor the text rendering carries a literal
+            // "null" (the old `joinToString("\n")` over nulls printed "null").
+            val lines = if (addr == null) {
+                emptyList()
+            } else {
+                (0..addr.maxAddressLineIndex).map { addr.getAddressLine(it).orEmpty() }
+            }
+            NativeOffloadResult(
+                0,
+                OffloadOutput.formatBody(reverseGeocodeJson(lat, lon, lines).toString(2), args) + "\n",
+            )
         } catch (e: Throwable) {
             val body = """{"error":"geocoder_unavailable","message":"Reverse geocoding failed: ${e.message}. This device may lack a geocoder backend."}"""
             NativeOffloadResult(1, OffloadOutput.formatBody(body, args) + "\n")

@@ -114,16 +114,22 @@ class ClipboardOffloadHandler(private val context: Context) : NativeOffloadHandl
         }
         val label = args.get("label") ?: "RikkaMinis"
         cm.setPrimaryClip(ClipData.newPlainText(label, text))
-        return NativeOffloadResult(
-            0,
-            OffloadOutput.formatBody("Copied ${text.length} characters to clipboard.", args) + "\n",
-        )
+        // [da1034-A4] ISSUE-08: JSON payload, not `Copied N characters to
+        // clipboard.` (formatBody passes prose through untouched, so a
+        // `jq` / `json.loads` reader broke on every successful set).
+        val data = JSONObject()
+            .put("copied", true)
+            .put("characters", text.length)
+            .put("label", label)
+        return NativeOffloadResult(0, OffloadOutput.formatBody(data.toString(2), args) + "\n")
     }
 
     private fun doClear(cm: ClipboardManager, args: OffloadArgs): NativeOffloadResult {
         if (!isAppForeground()) return backgroundError(args)
         cm.setPrimaryClip(ClipData.newPlainText("", ""))
-        return NativeOffloadResult(0, OffloadOutput.formatBody("Clipboard cleared.", args) + "\n")
+        // [da1034-A4] ISSUE-08: JSON payload, not `Clipboard cleared.`
+        val data = JSONObject().put("cleared", true)
+        return NativeOffloadResult(0, OffloadOutput.formatBody(data.toString(2), args) + "\n")
     }
 
     /**
