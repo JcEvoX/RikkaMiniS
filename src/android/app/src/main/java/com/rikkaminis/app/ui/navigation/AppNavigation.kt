@@ -1152,6 +1152,18 @@ fun AppNavigation(
                         Routes.fileBrowser(
                             rootPath = rootfs.rootfsDir.absolutePath,
                             rootLabel = "/",
+                            // [deep-audit-1036 B-06] This was the only
+                            // fileBrowser route that passed no linux root, so
+                            // every listing walked the rootfs tarball directly.
+                            // The bind mounts live under /var/minis/* inside
+                            // the guest: without re-routing, those entries
+                            // show Alpine's empty placeholder dirs instead of
+                            // the real backing content. Same shape as CHAT_FILES
+                            // ([da1031-C] T121), which roots at the same
+                            // rootfsDir with linuxRootPath = "/" — an unbound
+                            // prefix resolves to null and the VM falls back
+                            // to rootPath, so the root listing is unchanged.
+                            linuxRoot = "/",
                         ),
                     )
                 },
