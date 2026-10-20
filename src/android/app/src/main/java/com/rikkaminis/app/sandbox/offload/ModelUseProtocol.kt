@@ -177,6 +177,89 @@ internal object ModelUseProtocol {
         return if (raw.startsWith("/")) raw else null
     }
 
+    // ── image passthrough dialect ───────────────────────────────────────────
+    //
+    // [dv14-A4] ISSUE-08: implicit top-level keys + the explicit
+    // `extra_body` / `extra_headers` / `endpoint_path` envelope. This dialect
+    // was spelled THREE times — here (for the raw-passthrough envelope),
+    // in `ModelUseOffloadHandler` (app side) and in `ModelExecutionService`
+    // (the worker's image call) — and each copy carried its own 17-key
+    // `imageReservedKeys` set. Two of the three copies were already unused
+    // (one was dead code, the other only fed a reader nobody called), so the
+    // next dialect change would have landed in one copy and silently missed
+    // the rest. The set and the parser live here only; both remaining call
+    // sites go through them.
+
+    /**
+     * Result of [parseImagePassthrough] — what one `input_json` says about the
+     * image request, with every ignored/downgraded field reported.
+     */
+    data class ImagePassthroughSpec(
+        /** Implicit top-level keys with the explicit `extra_body` merged over them. */
+        val body: Map<String, Any?> = emptyMap(),
+        val headers: Map<String, String> = emptyMap(),
+        /** Top-level `endpoint_path`, trimmed; null when absent or blank. */
+        val endpointPath: String? = null,
+        /**
+         * Ignored / downgraded fields. The worker used to read `extra_body`
+         * with `optJSONObject`, so a present-but-not-an-object value was
+         * dropped with ZERO feedback — the same silent shape
+         * [parseExtraHeaders] fixed in da1019.
+         */
+        val warnings: List<String> = emptyList(),
+    )
+
+    /**
+     * Keys the image schema already interprets itself — never treated as
+     * implicit passthrough body fields, so existing callers' structure and
+     * behavior is unchanged. An explicit `extra_body` can still re-introduce
+     * any of them: explicit beats implicit. Mirrors iOS
+     * ModelUseOffloadBridge.imageReservedKeys.
+     *
+     * [dv14-A4] ISSUE-08: `internal` (was `private`) so there is exactly ONE
+     * of these; the copies in `ModelUseOffloadHandler` and
+     * `ModelExecutionService` are deleted, and
+     * `modeluse_proto_single_source_check.py` fails if one grows back.
+     */
+    internal val imageReservedKeys: Set<String> = setOf(
+        "messages", "model", "chat_model", "prompt", "n", "number_of_images",
+        "size", "image_size", "quality", "generation_config", "endpoint",
+        "image_endpoint", "endpoint_path", "extra_body", "extra_headers",
+        "stream", "temperature", "max_tokens",
+    )
+
+    /**
+     * Parse the image passthrough extras out of `input_json`:
+     *
+     *  - every top-level key NOT in [imageReservedKeys] folds into [ImagePassthroughSpec.body];
+     *  - the explicit `extra_body` object is merged OVER those, so an explicit
+     *    field wins over an implicit one of the same name (the in-process
+     *    dialect, preserved verbatim);
+     *  - `extra_headers` (string map) and `endpoint_path` are the explicit envelope.
+     *
+     * Values stay raw org.json nodes so the provider's `body.put(k, v)`
+     * re-serializes them faithfully, nested arrays/objects included.
+     * Non-JSON input yields the empty spec, as before.
+     */
+    fun parseImagePassthrough(inputJson: String): ImagePassthroughSpec {
+        val warnings = mutableListOf<String>()
+        val obj = try {
+            val t = inputJson.trim()
+            if (t.startsWith("{")) JSONObject(t) else null
+        } catch (_: Throwable) { null } ?: return ImagePassthroughSpec()
+        val body = LinkedHashMap<String, Any?>()
+        for (key in obj.keys()) {
+            if (key in imageReservedKeys) continue
+            body[key] = obj.opt(key)
+        }
+        // The shared reader — and the reason `extra_body:wrong-type` now says
+        // so instead of vanishing.
+        for ((key, value) in parseChatExtraBody(inputJson, warnings)) body[key] = value
+        val headers = parseExtraHeaders(inputJson, warnings)
+        val endpointPath = obj.optString("endpoint_path", "").trim().takeIf { it.isNotEmpty() }
+        return ImagePassthroughSpec(body, headers, endpointPath, warnings)
+    }
+
     // ── provider shape (which implementation a type gets) ────────────────────
     //
     // [fix/da1015-modeluse-proc] `:app` used to answer "is this an
@@ -499,18 +582,11 @@ internal object ModelUseProtocol {
     // implementation), the app keeps CLI shaping and file IO, and the WORKER
     // owns the HTTP call.
 
-    /**
-     * Keys the handler already interprets itself — never treated as implicit
-     * passthrough body fields, so existing callers' structure/behavior is
-     * unchanged. (Explicit `extra_body` can still re-introduce any of these.)
-     * Mirrors iOS ModelUseOffloadBridge.imageReservedKeys.
-     */
-    private val imageReservedKeys: Set<String> = setOf(
-        "messages", "model", "chat_model", "prompt", "n", "number_of_images",
-        "size", "image_size", "quality", "generation_config", "endpoint",
-        "image_endpoint", "endpoint_path", "extra_body", "extra_headers",
-        "stream", "temperature", "max_tokens",
-    )
+    // [dv14-A4] ISSUE-08: the reserved-key set now lives in the image
+    // passthrough dialect section above, next to [parseImagePassthrough] —
+    // ONE definition shared by this reader and the worker's image call. The
+    // copies in `ModelUseOffloadHandler` / `ModelExecutionService` are gone,
+    // and `modeluse_proto_single_source_check.py` fails if one grows back.
 
     /**
      * Explicit passthrough envelope: verbatim body/headers/endpoint, raw
