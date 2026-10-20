@@ -41,6 +41,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import android.content.Context
 import com.rikkaminis.app.R
+import com.rikkaminis.app.data.AgentRuntimeLimitsPrefs
 import com.rikkaminis.app.data.repository.MemoryRepository
 import com.rikkaminis.app.ui.settings.SettingsSection
 import com.rikkaminis.app.ui.settings.SettingsValueRow
@@ -565,19 +566,22 @@ internal fun autoItemFor(
 /**
  * [deep-audit-1023 ISSUE-07] Pure half of [buildAutoInjectedItems] for the
  * daily logs. Returns null when the log has no content — an empty day is not
- * an "auto-injected" item at all. The `>200` injection cap spelled out here is
- * what the sheet shows as `N/M lines injected`, so a stale snapshot used to
- * under-report the log the user had just grown.
+ * an "auto-injected" item at all. The injection cap comes from [maxInjectLines]
+ * (the caller passes [AgentRuntimeLimitsPrefs.memoryInjectLines] via the
+ * default arg), so the sheet tracks the user-tunable injection budget instead
+ * of a hard-coded cap; a stale snapshot used to under-report the log the
+ * user had just grown.
  */
 internal fun dailyAutoItemFor(
     fileName: String,
     displayName: String,
     content: String,
+    maxInjectLines: Int = AgentRuntimeLimitsPrefs.memoryInjectLines(),
 ): AutoItem? {
     if (content.isBlank()) return null
     val lineCount = content.lines().size
-    val injected = minOf(lineCount, 200)
-    val detail = if (lineCount > 200) "$injected/$lineCount lines injected" else "$lineCount lines (full)"
+    val injected = minOf(lineCount, maxInjectLines)
+    val detail = if (lineCount > maxInjectLines) "$injected/$lineCount lines injected" else "$lineCount lines (full)"
     return AutoItem(
         name = displayName,
         detail = detail,
@@ -625,6 +629,7 @@ private fun buildAutoInjectedItems(context: Context, memoryRepository: MemoryRep
             fileName = fileName,
             displayName = "$label — $fileName",
             content = memoryRepository.readFile(fileName),
+            maxInjectLines = AgentRuntimeLimitsPrefs.memoryInjectLines(),
         )?.let { items.add(it) }
     }
 

@@ -35,6 +35,15 @@ unaffected):
   Fail-closed: missing dispose/trim/evict bodies, a missing destroyTab call
   or a missing savedURLs assignment = red, never a silent skip.
 
+[fix/dv16-B7] C4d — window.open / window.close must persist too. The pool
+persists on every tab mutation EXCEPT `handleNewWindow` / `handleCloseWindow`
+(the only two paths that changed `_tabs` / `_selectedTabId` without calling
+saveState()): a JS window.open tab (OAuth popups are the largest traffic) or
+a window.close()'d tab resurrected from / vanished out of
+browser_tabs/<sid>.json on session reload, and selectedTabId could point at
+a destroyed tab. Both bodies must carry `saveState(` (fail-closed: an
+unextractable body = red, never a silent skip).
+
 Usage: python3 browser_tabs_lifecycle_check.py <repo_root>
        python3 browser_tabs_lifecycle_check.py --root <repo_root>
        python3 browser_tabs_lifecycle_check.py --selftest
@@ -208,6 +217,19 @@ def check_pool_source(pool_src: str) -> list:
             errs.append(f"C4: {label} never assigns the evicted tab's URL into savedURLs (fail-closed)")
         elif w.start() < dpos:
             errs.append(f"C4: {label} assigns savedURLs before destroyTab( — destroyTab's remove wipes the entry")
+
+    # --- [fix/dv16-B7] C4d: window.open / window.close must persist too ---
+    for fn in ("fun handleNewWindow", "fun handleCloseWindow"):
+        body = slice_body(code, fn)
+        label = fn[4:]
+        if not body:
+            errs.append(f"C4d: {label} body not extractable (fail-closed)")
+            continue
+        if "saveState(" not in body:
+            errs.append(
+                f"C4d: {label} changes tab state but never calls saveState( — "
+                "window.open/close tabs resurrect from the stale state file "
+                "(and selectedTabId can point at a destroyed tab)")
     return errs
 
 
@@ -266,6 +288,35 @@ class BrowserTabPool(context: Context) {
             saveState()
         }
     }
+
+    // [fix/dv16-B7] C4d: window.open / window.close persist like every other
+    // mutation path (mirrors the production shapes at the decision points).
+    private fun handleNewWindow(resultMsg: Message) {
+        val currentTabs = _tabs.value.toMutableList()
+        if (currentTabs.size >= MAX_TABS) {
+            return
+        }
+        val id = nextTabId++
+        currentTabs.add(Tab(id = id, manager = manager))
+        _tabs.value = currentTabs
+        _selectedTabId.value = id
+        saveState()
+        resultMsg.sendToTarget()
+    }
+
+    private fun handleCloseWindow(manager: BrowserUseManager) {
+        val currentTabs = _tabs.value.toMutableList()
+        val idx = currentTabs.indexOfFirst { it.manager === manager }
+        if (idx >= 0) {
+            val closedId = currentTabs[idx].id
+            destroyTab(currentTabs, currentTabs[idx])
+            _tabs.value = currentTabs
+            if (_selectedTabId.value == closedId && currentTabs.isNotEmpty()) {
+                _selectedTabId.value = currentTabs.first().id
+            }
+            saveState()
+        }
+    }
 }
 """
 
@@ -303,6 +354,23 @@ POOL_V_EVICT_NO_STORE = POOL_COMPLIANT.replace(
 POOL_V_DISPOSE_NO_DESTROY = POOL_COMPLIANT.replace(
     "            for (tab in current) {\n                destroyTab(mutable, tab)\n            }\n",
     "            for (tab in current) {\n                Log.i(TAG, \"dispose(): destroyed tab ${tab.id}\")\n            }\n",
+)
+
+# [fix/dv16-B7] C4d: window.open forgets to persist the new tab state.
+POOL_V_NEWWIN_NOSAVE = POOL_COMPLIANT.replace(
+    "        _selectedTabId.value = id\n        saveState()\n        resultMsg.sendToTarget()",
+    "        _selectedTabId.value = id\n        resultMsg.sendToTarget()",
+)
+
+# [fix/dv16-B7] C4d: window.close forgets to persist the teardown.
+POOL_V_CLOSEWIN_NOSAVE = POOL_COMPLIANT.replace(
+    "            if (_selectedTabId.value == closedId && currentTabs.isNotEmpty()) {\n"
+    "                _selectedTabId.value = currentTabs.first().id\n"
+    "            }\n"
+    "            saveState()\n",
+    "            if (_selectedTabId.value == closedId && currentTabs.isNotEmpty()) {\n"
+    "                _selectedTabId.value = currentTabs.first().id\n"
+    "            }\n",
 )
 
 
@@ -431,6 +499,8 @@ class SessionFileStore internal constructor(
         ("C4c trim stores the URL before destroyTab", POOL_V_TRIM_ORDER, ["C4"]),
         ("C4c evict drops the URL assignment", POOL_V_EVICT_NO_STORE, ["C4"]),
         ("C4b dispose no longer destroys tabs", POOL_V_DISPOSE_NO_DESTROY, ["C4"]),
+        ("C4d window.open forgets saveState", POOL_V_NEWWIN_NOSAVE, ["C4d"]),
+        ("C4d window.close forgets saveState", POOL_V_CLOSEWIN_NOSAVE, ["C4d"]),
     ]
     for name, sample, expect in pool_arms:
         errs = check_pool_source(sample)
@@ -488,7 +558,7 @@ def main() -> int:
         for e in errs:
             print(f"  - {e}")
         return 1
-    print("browser_tabs_lifecycle_check OK (4 criteria: C1-C3 store lifecycle + C4 pool teardown ordering)")
+    print("browser_tabs_lifecycle_check OK (criteria: C1-C3 store lifecycle + C4/C4d pool teardown + window.open/close persistence)")
     return 0
 
 
