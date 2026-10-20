@@ -80,6 +80,15 @@ class SessionsOffloadHandler(
                     )
                 }
             }
+        } catch (e: InvertedDateWindow) {
+            // [dv15-A1 A-08] Both bounds parsed, but the window is inside out:
+            // refused with the SAME envelope + exit 2 as the unreadable-date
+            // case below, instead of answering exit 0 with an empty history.
+            val err = errorEnvelope(sub, "INVALID_ARGS", e.message ?: "invalid date window")
+            NativeOffloadResult(
+                EXIT_INVALID_ARGS,
+                OffloadOutput.formatBody(err.toString(2), args) + "\n" + HELP_TEXT,
+            )
         } catch (e: InvalidDateArg) {
             // [da1032-C] ISSUE-08: a date flag the caller supplied that this
             // command cannot read refuses the command, instead of silently
@@ -345,7 +354,10 @@ class SessionsOffloadHandler(
     private fun resolveDateBounds(args: OffloadArgs): Pair<Long?, Long?> {
         val startMs = sessionsDateBound("--start", args.get("start")) { parseSessionsDate(it) }
         val endMs = sessionsDateBound("--end", args.get("end")) { parseEndDate(it) }
-        return startMs to endMs
+        // [dv15-A1 A-08] Both bounds readable but inside out — see
+        // [sessionsDateWindow]. Kept in the same funnel as the unreadable-flag
+        // refusal so one catch answers both with INVALID_ARGS + exit 2.
+        return sessionsDateWindow(startMs, endMs, args.get("start"), args.get("end"))
     }
 
     /**
@@ -491,6 +503,49 @@ EXAMPLES:
  */
 internal class InvalidDateArg(flag: String, raw: String) :
     Exception("$flag '$raw' is not a YYYY-MM-DD date (e.g. 2026-10-19).")
+
+/**
+ * [dv15-A1 A-08] Both bounds readable, but `--end` lands before `--start`.
+ *
+ * Its own class rather than a reuse of [InvalidDateArg] because the message has
+ * to be true: `InvalidDateArg`'s text says the value "is not a YYYY-MM-DD
+ * date", which is FALSE here — both dates parsed fine and only the pair is
+ * impossible. An agent told its well-formed date is malformed would keep
+ * rewriting the wrong thing. [SessionsOffloadHandler.handle] answers this class
+ * with the SAME `INVALID_ARGS` envelope + exit 2 as the unreadable-date case.
+ */
+internal class InvertedDateWindow(startRaw: String, endRaw: String) :
+    Exception(
+        "--end '$endRaw' is before --start '$startRaw': the window can match nothing " +
+            "(swap the bounds, or widen --start / --end)"
+    )
+
+/**
+ * [dv15-A1 A-08] The `--start` / `--end` window, refused when it is inside out.
+ *
+ * `resolveDateBounds` feeds this: two readable bounds, neither of them the
+ * problem on its own, but `endMs < startMs` makes the query
+ * (`lastActive >= start AND lastActive <= end`) unsatisfiable. The command used
+ * to answer exit 0 with `{"count":0,"sessions":[]}`, which the caller reads as
+ * "nothing happened in that period" — an impossible window reported as an empty
+ * history. Photos ([PhotoRange.Invalid]) and Calendar already refuse it;
+ * Sessions was the last one answering success.
+ *
+ * Strict `<`, deliberately: `--start X --end X` stays legal, because
+ * [parseEndDate] aligns the end to that day's 23:59:59.999, so a single-day
+ * window keeps `endMs > startMs` and must not become an error.
+ */
+internal fun sessionsDateWindow(
+    startMs: Long?,
+    endMs: Long?,
+    startRaw: String?,
+    endRaw: String?,
+): Pair<Long?, Long?> {
+    if (startMs != null && endMs != null && endMs < startMs) {
+        throw InvertedDateWindow(startRaw.orEmpty(), endRaw.orEmpty())
+    }
+    return startMs to endMs
+}
 
 /**
  * [da1032-C] ISSUE-08: the date parser for the `--start` / `--end` flags.
