@@ -92,6 +92,97 @@ def check_handler(src):
     return v
 
 
+# ── [dv15-A2] A-04: the archive FILE itself must not be followed ─────────────
+#
+# GuestPathMapper leaves the LAST segment of a guest path unresolved on purpose
+# (that is what keeps `rm <link>` working), so the archive path is a host path
+# whose final component may be a symbolic link to ANY host file. Two opens make
+# that reachable: Files.newOutputStream(archivePath) in tarCreateInto (write
+# through the link — `--force` is what let it through) and the input stream the
+# extract side reads with (read through the link). Both cross the guest/host
+# boundary this handler exists to enforce.
+#
+# The decision point is "before the archive file is opened", and TWO shapes
+# satisfy it: an explicit Files.isSymbolicLink(...) refusal, or an open that asks
+# for LinkOption.NOFOLLOW_LINKS. Both are accepted (the check binds the decision,
+# not a spelling) and it is required on BOTH paths — a guard on one half only is
+# the pre-fix escape, half-closed. The explicit-refusal shape must also carry a
+# structured payload, otherwise the link is noticed and then followed anyway.
+#
+# member_slice note: tar_fun_body() above cuts at "\nprivate fun ", which a class
+# member (indented) never matches, so it returns the rest of the file. Slicing on
+# the declaration's own indent keeps the scope tight — and scope is the point
+# here, because "a guard exists somewhere in the file" is not the property under
+# test.
+ARCHIVE_LINK_GUARD = "Files.isSymbolicLink("
+NOFOLLOW_OPEN_RE = re.compile(r"new(?:Input|Output)Stream\([^)\n]*NOFOLLOW_LINKS")
+ARCHIVE_GUARD_PAYLOAD = "unsafe_archive_path"
+DECL_KEYWORDS = ("private ", "internal ", "public ", "protected ", "override ", "fun ",
+                 "class ", "object ", "}")
+
+
+def handler_member(src, name):
+    start = src.find("fun %s(" % name)
+    if start < 0:
+        return None
+    line_start = src.rfind("\n", 0, start) + 1
+    indent = len(src[line_start:start]) - len(src[line_start:start].lstrip(" "))
+    lines = src[line_start:].split("\n")
+    out = [lines[0]]
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped:
+            ind = len(line) - len(line.lstrip(" "))
+            if ind <= indent and stripped.startswith(DECL_KEYWORDS):
+                break
+        out.append(line)
+    return "\n".join(out)
+
+
+def archive_open_guard_shape(src, name, extra_opener=None):
+    """'refuse' / 'nofollow' / None for the member that opens the archive.
+
+    extra_opener lets the read side put its NOFOLLOW open in the helper that
+    actually calls newInputStream (openArchive) instead of in the member — that
+    is the same decision made one call deeper, so it counts.
+    """
+    body = handler_member(src, name)
+    if body is None:
+        return "missing"
+    if ARCHIVE_LINK_GUARD in body:
+        return "refuse"
+    if NOFOLLOW_OPEN_RE.search(body):
+        return "nofollow"
+    if extra_opener:
+        opener = handler_member(src, extra_opener)
+        if opener is not None and NOFOLLOW_OPEN_RE.search(opener):
+            return "nofollow"
+    return None
+
+
+def check_archive_open_guard(src):
+    v = []
+    shapes = {}
+    for name, extra in (("tarCreateInto", None), ("tarExtractFrom", "openArchive")):
+        shape = archive_open_guard_shape(src, name, extra_opener=extra)
+        if shape == "missing":
+            v.append("%s must exist in FastioOffloadHandler.kt (required function missing)" % name)
+            continue
+        shapes[name] = shape
+        if shape is None:
+            v.append(
+                "%s opens the archive path without a NOFOLLOW-level guard — a symbolic link at the"
+                " archive path would be followed (write-through on create, read-through on extract)"
+                % name
+            )
+    if "refuse" in shapes.values() and ARCHIVE_GUARD_PAYLOAD not in src:
+        v.append(
+            "a symlink at the archive path is detected but not refused — no %s payload"
+            % ARCHIVE_GUARD_PAYLOAD
+        )
+    return v
+
+
 # ── [dv14-A2] writeRegular: open-before-header + short-payload refill ───────
 #
 # The header declares `size` bytes of payload. Two consequences:
@@ -170,7 +261,9 @@ def run(root):
     if not os.path.isfile(handler_path):
         return 2
     with open(handler_path, encoding="utf-8") as f:
-        violations += check_handler(f.read())
+        handler_src = f.read()
+    violations += check_handler(handler_src)
+    violations += check_archive_open_guard(handler_src)
     if violations:
         for v in violations:
             print("VIOLATION " + v)
@@ -230,12 +323,46 @@ private fun handleTar(request: NativeOffloadRequest): NativeOffloadResult {
     }
 }
 
+private fun tarCreateInto(entry: JSONObject, archivePath: Path): NativeOffloadResult {
+    if (Files.isSymbolicLink(archivePath)) {
+        return refuseLinkedArchive(entry, "write", startedNs, args)
+    }
+    val raw = Files.newOutputStream(archivePath)
+    return finishTar(entry, outcome.errors.isNotEmpty(), startedNs, args)
+}
+
 private fun tarExtractFrom(entry: JSONObject, archivePath: Path): NativeOffloadResult {
     val destResolution = GuestPathMapper.resolve(destRaw, request.cwd, bindings)
     if (destResolution is GuestPathMapper.Resolution.Denied) {
         return finishTar(deniedEntry(destRaw, destResolution), true, startedNs, args)
     }
+    if (Files.isSymbolicLink(archivePath)) {
+        return refuseLinkedArchive(entry, "read", startedNs, args)
+    }
     return finishTar(entry, outcome.errors.isNotEmpty(), startedNs, args)
+}
+
+private fun refuseLinkedArchive(entry: JSONObject, verb: String, startedNs: Long, args: OffloadArgs): NativeOffloadResult =
+    finishTarWith(entry.put("error", "unsafe_archive_path"), 2, startedNs, args)
+"""
+
+# [dv15-A2] A-04, the OTHER accepted shape: no explicit isSymbolicLink() check —
+# the opens themselves ask for NOFOLLOW_LINKS, and the read side's open lives one
+# call deeper (openArchive). If this fixture went red, the criterion would be
+# pinning a spelling instead of the decision.
+GOOD_HANDLER_NOFOLLOW = """
+private fun tarCreateInto(entry: JSONObject, archivePath: Path): NativeOffloadResult {
+    val raw = Files.newOutputStream(archivePath, LinkOption.NOFOLLOW_LINKS)
+    return finishTar(entry, outcome.errors.isNotEmpty(), startedNs, args)
+}
+
+private fun tarExtractFrom(entry: JSONObject, archivePath: Path): NativeOffloadResult {
+    return openArchive(archivePath, gzip).use { tarExtract(it, destPath, force, budget, outcome) }
+}
+
+private fun openArchive(path: Path, gzip: Boolean): java.io.InputStream {
+    val raw = Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS)
+    return if (gzip) GZIPInputStream(raw) else raw
 }
 """
 
@@ -388,6 +515,46 @@ def selftest():
         )
     )
     expect_trip("single-site fixture", bad_single, "expected >= 2 finishTar")
+
+    # ── [dv15-A2] A-04: the archive opens must not follow a link ────────────
+    good_guard = check_archive_open_guard(GOOD_HANDLER)
+    expect_clean("compliant archive-open guard fixture", good_guard)
+
+    # the OTHER accepted shape must stay clean: no explicit check, the opens ask
+    # for NOFOLLOW (and the read side's open sits one call deeper). If this went
+    # red the criterion would be pinning a spelling, not the decision.
+    expect_clean("NOFOLLOW-open shape fixture (dv15-A2)",
+                 check_archive_open_guard(GOOD_HANDLER_NOFOLLOW))
+
+    bad_guard_create = check_archive_open_guard(
+        GOOD_HANDLER.replace(
+            """    if (Files.isSymbolicLink(archivePath)) {
+        return refuseLinkedArchive(entry, "write", startedNs, args)
+    }
+""", "")
+    )
+    expect_trip("create-side guard removed (dv15-A2)", bad_guard_create,
+                "tarCreateInto opens the archive path")
+
+    bad_guard_extract = check_archive_open_guard(
+        GOOD_HANDLER.replace(
+            """    if (Files.isSymbolicLink(archivePath)) {
+        return refuseLinkedArchive(entry, "read", startedNs, args)
+    }
+""", "")
+    )
+    expect_trip("extract-side guard removed (dv15-A2)", bad_guard_extract,
+                "tarExtractFrom opens the archive path")
+
+    bad_guard_payload = check_archive_open_guard(
+        GOOD_HANDLER.replace('"unsafe_archive_path"', '"unsafe_path"')
+    )
+    expect_trip("guard-without-payload fixture (dv15-A2)", bad_guard_payload,
+                "detected but not refused")
+
+    bad_guard_missing = check_archive_open_guard("object FastioOffloadHandler { }")
+    expect_trip("missing archive-open members (dv15-A2)", bad_guard_missing,
+                "required function missing")
 
     # ── [dv14-A2] writeRegular ──────────────────────────────────────────────
     good_regular = check_write_regular(GOOD_REGULAR)
