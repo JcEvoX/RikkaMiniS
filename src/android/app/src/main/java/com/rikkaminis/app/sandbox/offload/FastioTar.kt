@@ -8,7 +8,6 @@ import java.nio.file.FileVisitResult
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Path
-import java.nio.file.SimpleFileVisitor
 import java.nio.file.attribute.BasicFileAttributes
 import java.nio.file.attribute.FileTime
 import java.nio.file.attribute.PosixFilePermission
@@ -101,37 +100,7 @@ internal fun tarCreate(
             continue
         }
         try {
-            Files.walkFileTree(
-                path,
-                object : SimpleFileVisitor<Path>() {
-                    override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult {
-                        if (charge(out, maxEntries)) return FileVisitResult.TERMINATE
-                        val entry = memberNameFor(name, path, dir)
-                        writeHeader(sink, header(entry + "/", '5', 0L, dirMode(dir), mtimeOf(attrs), ""))
-                        out.dirs++
-                        return FileVisitResult.CONTINUE
-                    }
-
-                    override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
-                        if (charge(out, maxEntries)) return FileVisitResult.TERMINATE
-                        val entry = memberNameFor(name, path, file)
-                        if (attrs.isSymbolicLink) {
-                            writeLink(sink, entry, file, out)
-                        } else if (attrs.isRegularFile) {
-                            writeRegular(sink, entry, file, out)
-                        } else {
-                            out.skippedSpecial++
-                            if (out.skippedNames.size < MAX_REPORTED_SKIPS) out.skippedNames.add(entry)
-                        }
-                        return FileVisitResult.CONTINUE
-                    }
-
-                    override fun visitFileFailed(file: Path, exc: java.io.IOException): FileVisitResult {
-                        out.errors.add("$file: ${exc.message}")
-                        return FileVisitResult.CONTINUE
-                    }
-                },
-            )
+            walkSorted(path, path, name, maxEntries, out, sink)
         } catch (e: Exception) {
             out.errors.add("$memberPrefix: ${e.message}")
         }
@@ -202,6 +171,66 @@ internal fun writeRegular(
         out.files++
         out.bytes += size
     }
+}
+
+/**
+ * Deterministic pre-order walk used by [tarCreate]: the entries of each
+ * directory are visited in lexicographic name order, so the same tree always
+ * produces the same member order. [Files.walkFileTree] visits entries in the
+ * filesystem's directory-listing order, which drifts between machines and
+ * made the archive bytes non-reproducible (CI flaked on the sorted-order
+ * expectation). Semantics are exactly the [Files.walkFileTree] shapes this
+ * replaces: charge before every entry, a directory header before its
+ * contents, symlinks written AS LINKS and never followed, a name that cannot
+ * be stat'ed or listed is reported and the walk continues, TERMINATE aborts
+ * the walk.
+ */
+private fun walkSorted(
+    dir: Path,
+    root: Path,
+    rootName: String,
+    maxEntries: Long,
+    out: TarCreateOutcome,
+    sink: OutputStream,
+): FileVisitResult {
+    if (charge(out, maxEntries)) return FileVisitResult.TERMINATE
+    val entry = memberNameFor(rootName, root, dir)
+    writeHeader(sink, header(entry + "/", '5', 0L, dirMode(dir), mtimeOf(dir), ""))
+    out.dirs++
+    val children = try {
+        Files.newDirectoryStream(dir).use { stream ->
+            stream.asSequence().sortedBy { it.fileName.toString() }.toList()
+        }
+    } catch (e: java.io.IOException) {
+        out.errors.add("$dir: ${e.message}")
+        return FileVisitResult.CONTINUE
+    }
+    for (child in children) {
+        val attrs = try {
+            Files.readAttributes(child, BasicFileAttributes::class.java, LinkOption.NOFOLLOW_LINKS)
+        } catch (e: java.io.IOException) {
+            out.errors.add("$child: ${e.message}")
+            continue
+        }
+        if (attrs.isSymbolicLink) {
+            if (charge(out, maxEntries)) return FileVisitResult.TERMINATE
+            writeLink(sink, memberNameFor(rootName, root, child), child, out)
+        } else if (attrs.isDirectory) {
+            if (walkSorted(child, root, rootName, maxEntries, out, sink) == FileVisitResult.TERMINATE) {
+                return FileVisitResult.TERMINATE
+            }
+        } else if (attrs.isRegularFile) {
+            if (charge(out, maxEntries)) return FileVisitResult.TERMINATE
+            writeRegular(sink, memberNameFor(rootName, root, child), child, out)
+        } else {
+            if (charge(out, maxEntries)) return FileVisitResult.TERMINATE
+            out.skippedSpecial++
+            if (out.skippedNames.size < MAX_REPORTED_SKIPS) {
+                out.skippedNames.add(memberNameFor(rootName, root, child))
+            }
+        }
+    }
+    return FileVisitResult.CONTINUE
 }
 
 private fun writeLink(sink: OutputStream, name: String, file: Path, out: TarCreateOutcome) {
