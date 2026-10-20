@@ -465,4 +465,135 @@ class MarkdownParserBlockStructureTest {
             assertTrue(!h.content.startsWith("#"))
         }
     }
+
+    // ── [dv15/B-07] glued block starts behind a paragraph ─────────────────
+    // A block start with NO blank line before it. The paragraph loop's break
+    // set used to be narrower than the block rules themselves (`# ` only, no
+    // table probe), so the start line was collected as paragraph text and the
+    // block never materialised. Expectations below are literal values captured
+    // from a real run of the fixed parser (probe-b4/jvm/post/driver-post.log),
+    // not derived from the source or from the chat-side twin.
+
+    @Test
+    fun `level 2 heading glued to a paragraph splits it`() {
+        val b = parse("正文段落。\n## 二级标题")
+        assertEquals(2, b.size)
+        assertEquals("正文段落。", (b[0] as Block.Paragraph).content)
+        assertEquals(Block.Heading(2, "二级标题"), b[1])
+    }
+
+    @Test
+    fun `level 6 heading glued to a paragraph splits it`() {
+        val b = parse("正文段落。\n###### 六级标题")
+        assertEquals(2, b.size)
+        assertEquals("正文段落。", (b[0] as Block.Paragraph).content)
+        assertEquals(Block.Heading(6, "六级标题"), b[1])
+    }
+
+    @Test
+    fun `level 1 heading glued to a paragraph still splits - parity anchor`() {
+        // Passed before the fix too: this is the anchor proving the new break
+        // widens the old one rather than replacing it with something else.
+        val b = parse("正文段落。\n# 一级标题")
+        assertEquals(2, b.size)
+        assertEquals("正文段落。", (b[0] as Block.Paragraph).content)
+        assertEquals(Block.Heading(1, "一级标题"), b[1])
+    }
+
+    @Test
+    fun `hash without space and seven hashes stay glued prose`() {
+        // The break uses the same predicate as the heading rule, so lines the
+        // rule refuses stay prose — this file's contrast anchor.
+        assertEquals(
+            "正文段落。\n#nospace 标签",
+            (parse("正文段落。\n#nospace 标签")[0] as Block.Paragraph).content,
+        )
+        assertEquals(
+            "正文段落。\n####### seven",
+            (parse("正文段落。\n####### seven")[0] as Block.Paragraph).content,
+        )
+    }
+
+    @Test
+    fun `indented heading line splits off as its own paragraph`() {
+        // Break tests the TRIMMED line (the pre-fix `trimStart().startsWith`
+        // shape, and the twin's `isAtxHeading(t)`), while the heading RULE reads
+        // the raw column-0 line — an indented heading therefore splits the
+        // paragraph and renders as a paragraph, exactly as level 1 always did.
+        val b = parse("text\n  # indented heading")
+        assertEquals(2, b.size)
+        assertEquals("text", (b[0] as Block.Paragraph).content)
+        assertEquals("  # indented heading", (b[1] as Block.Paragraph).content)
+    }
+
+    @Test
+    fun `table glued to a paragraph becomes a table`() {
+        val b = parse("说明文字\n| a | b |\n|---|---|\n| 1 | 2 |")
+        assertEquals(2, b.size)
+        assertEquals("说明文字", (b[0] as Block.Paragraph).content)
+        val t = b[1] as Block.Table
+        assertEquals(listOf("a", "b"), t.headers)
+        assertEquals(listOf(MarkdownParser.Alignment.LEFT, MarkdownParser.Alignment.LEFT), t.alignments)
+        assertEquals(listOf(listOf("1", "2")), t.rows)
+    }
+
+    @Test
+    fun `aligned table glued to a paragraph keeps its alignment`() {
+        val b = parse("说明文字\nl|c|r\n:---|:---:|---:\nx|y|z")
+        assertEquals(2, b.size)
+        assertEquals("说明文字", (b[0] as Block.Paragraph).content)
+        val t = b[1] as Block.Table
+        assertEquals(listOf("l", "c", "r"), t.headers)
+        assertEquals(
+            listOf(
+                MarkdownParser.Alignment.LEFT,
+                MarkdownParser.Alignment.CENTER,
+                MarkdownParser.Alignment.RIGHT,
+            ),
+            t.alignments,
+        )
+        assertEquals(listOf(listOf("x", "y", "z")), t.rows)
+    }
+
+    @Test
+    fun `pipe-less header glued pair is a single column table`() {
+        // The break reuses the Table rule's own predicate (`|` in header OR
+        // separator), so this pair parses the same way it does behind a blank
+        // line: single-column table, no rows.
+        val b = parse("说明文字\nabc\n|---|")
+        assertEquals(2, b.size)
+        assertEquals("说明文字", (b[0] as Block.Paragraph).content)
+        val t = b[1] as Block.Table
+        assertEquals(listOf("abc"), t.headers)
+        assertEquals(emptyList<List<String>>(), t.rows)
+    }
+
+    @Test
+    fun `tab after marker quote glued to a paragraph splits it`() {
+        // `>` + TAB is a quote (the twin's `isBlockquoteLine` width); the old
+        // rule only accepted `"> "` or a bare `">"`, so this line was swallowed
+        // as paragraph text. The marker is stripped, the tab is content.
+        val b = parse("正文段落。\n>\t制表符引用")
+        assertEquals(2, b.size)
+        assertEquals("正文段落。", (b[0] as Block.Paragraph).content)
+        val q = b[1] as Block.Blockquote
+        assertEquals(listOf<Block>(Block.Paragraph("\t制表符引用")), q.blocks)
+    }
+
+    @Test
+    fun `comparison-initial glued line is still prose`() {
+        // ">= 5" is not a quote: the predicate needs space/TAB/EOL after `>`.
+        assertEquals(
+            "正文段落。\n>= 5 比较运算",
+            (parse("正文段落。\n>= 5 比较运算")[0] as Block.Paragraph).content,
+        )
+    }
+
+    @Test
+    fun `bare marker glued to a paragraph starts the quote`() {
+        val b = parse("正文段落。\n>\n> 引用内容")
+        assertEquals(2, b.size)
+        assertEquals("正文段落。", (b[0] as Block.Paragraph).content)
+        assertEquals(listOf<Block>(Block.Paragraph("引用内容")), (b[1] as Block.Blockquote).blocks)
+    }
 }
