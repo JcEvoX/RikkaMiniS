@@ -94,7 +94,7 @@ class ModelUseProviderFilterTest {
     }
 
     @Test
-    fun `cmdList no longer substring-matches model.provider`() {
+    fun `cmdList no longer substring-matches the model provider field`() {
         val body = memberSlice(readRepoFile(HANDLER_REL), "private fun cmdList(")
         assertFalse(
             "the case-sensitive substring match on model.provider is the pre-fix coincidence",

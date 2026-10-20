@@ -300,9 +300,9 @@ class DebugOffloadHandlerTest {
             linuxPath = "/tmp/shared.json",
             filesDir = root,
             perSessionSubdirs = setOf("workspace"),
-            resolveGlobal = { globalCalls++; "global:$it" },
+            resolveGlobal = { globalCalls++; File("/global-root", it.removePrefix("/")) },
         )
-        assertEquals("global:/tmp/shared.json", resolved)
+        assertEquals(File("/global-root/tmp/shared.json").path, resolved?.path)
         assertEquals(1, globalCalls)
     }
 
