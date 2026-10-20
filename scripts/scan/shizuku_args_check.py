@@ -182,12 +182,17 @@ def analyse(src):
     flags = re.search(r"val\s+NO_VALUE_FLAGS\s*=\s*setOf\(([^)]*)\)", src)
     names = set(re.findall(r'"([^"]+)"', flags.group(1))) if flags else set()
 
-    anchor = "OffloadArgs(split.withoutGroup, booleanFlags = noValueFlagsFor(group))"
+    # [dv15-A1 A-02] `-a/-d/-p/-c` take values, so the parser must be told: the
+    # criterion pins that DECISION at BOTH sites (the declared switches and the
+    # declared value-taking shorts travel with the call) rather than one
+    # spellable line, so a reformat that keeps the behaviour stays green.
+    switches = "booleanFlags = noValueFlagsFor(group)"
+    shorts = "valueShortOptions = SHIZUKU_VALUE_SHORT_OPTIONS"
     results.append((
         "1 parser receives declared switches (per group)",
-        anchor in src,
-        line_of(src, "OffloadArgs(split.withoutGroup"),
-        "expected `%s`" % anchor,
+        src.count(switches) == 2 and src.count(shorts) == 2,
+        line_of(src, "split.withoutGroup"),
+        "expected 2x `%s` and 2x `%s`" % (switches, shorts),
     ))
     results.append((
         "2 NO_VALUE_FLAGS covers switches, excludes value flags",
@@ -301,7 +306,7 @@ def analyse(src):
     strip_body = function_body(src, "stripExecTimeoutTokens")
     splitter_body = function_body(src, "splitShizukuArgv") or ""
     strips_in_splitter = "stripExecTimeoutTokens(" in splitter_body
-    parser_uses_exec_tokens = "OffloadArgs(split.execOptionTokens" in handle_body
+    parser_uses_exec_tokens = "split.execOptionTokens" in handle_body
     results.append((
         "13 exec trims its own options out of the shell payload",
         strip_body is not None and strips_in_splitter and parser_uses_exec_tokens
@@ -357,10 +362,25 @@ def analyse(src):
         "restrict-refuses=%s stats-refuses=%s resolver-String?=%s no-zero=%s no-minus-one=%s"
         % (restrict_refuses, stats_refuses, resolver_nullable, no_zero_fallback, no_neg_one),
     ))
+    # [dv15-A1 A-02] the value-taking short options are declared ONCE and that
+    # declaration is what both call sites pass. Fail-closed: the set must be
+    # exactly {a, d, p, c} — the four letters `activity start` forwards to
+    # `am start`. A missing/renamed declaration makes `-p com.x` a flag plus a
+    # stray positional, i.e. the launch silently does nothing.
+    short_set = re.search(r'internal val SHIZUKU_VALUE_SHORT_OPTIONS = setOf\(([^)]*)\)', src)
+    short_names = set(re.findall(r'"([^"]+)"', short_set.group(1))) if short_set else set()
+    results.append((
+        "16 short options that take a value are declared once",
+        short_names == {"a", "d", "p", "c"},
+        line_of(src, "SHIZUKU_VALUE_SHORT_OPTIONS"),
+        "declared=%s" % (sorted(short_names) if short_set else "MISSING"),
+    ))
     return results
 
 
 COMPLIANT = '''package com.rikkaminis.app.sandbox.offload
+
+internal val SHIZUKU_VALUE_SHORT_OPTIONS = setOf("a", "d", "p", "c")
 
 class ShizukuOffloadHandler {
     private fun handle(request: Any) {
@@ -368,9 +388,17 @@ class ShizukuOffloadHandler {
         val split = splitShizukuArgv(argv)
         val group = split.group ?: return
         val args = if (group == "exec") {
-            OffloadArgs(split.execOptionTokens, booleanFlags = noValueFlagsFor(group))
+            OffloadArgs(
+                split.execOptionTokens,
+                booleanFlags = noValueFlagsFor(group),
+                valueShortOptions = SHIZUKU_VALUE_SHORT_OPTIONS,
+            )
         } else {
-            OffloadArgs(split.withoutGroup, booleanFlags = noValueFlagsFor(group))
+            OffloadArgs(
+                split.withoutGroup,
+                booleanFlags = noValueFlagsFor(group),
+                valueShortOptions = SHIZUKU_VALUE_SHORT_OPTIONS,
+            )
         }
         val rest = if (group == "exec") split.trailing else split.withoutGroup
         val sub = args.positional.firstOrNull()
@@ -506,7 +534,8 @@ internal fun clearScope(cacheOnly: Boolean): String = if (cacheOnly) "cache-only
 
 # criterion index (1-based) -> (mutation, expected broken criteria)
 BREAKERS = {
-    1: ("OffloadArgs(split.withoutGroup, booleanFlags = noValueFlagsFor(group))", "OffloadArgs(split.withoutGroup)"),
+    1: ("                split.withoutGroup,\n                booleanFlags = noValueFlagsFor(group),\n",
+        "                split.withoutGroup,\n"),
     2: ('setOf("block", "unblock", "cache-only", "data", "all", "background", "wifi")',
         'setOf("block", "unblock", "cache-only", "data", "all", "background", "wifi", "importance")'),
     3: ('text.replace(" ", "%s")', "text.replace(' ', '%')"),
@@ -534,8 +563,8 @@ BREAKERS = {
 # sub-condition could be dead text that no fixture proves live.
 EXTRA_BREAKERS = [
     ("13b handle feeds the parser the whole argv again",
-     "OffloadArgs(split.execOptionTokens, booleanFlags = noValueFlagsFor(group))",
-     "OffloadArgs(split.withoutGroup, booleanFlags = noValueFlagsFor(group))", "13 "),
+     "                split.execOptionTokens,\n",
+     "                split.withoutGroup,\n", "13 "),
     ("13c the helper is gone (renamed)",
      "internal fun stripExecTimeoutTokens(tokens: List<String>): Pair<List<String>, List<String>> {",
      "internal fun stripExecTimeoutTokensRenamed(tokens: List<String>): "
@@ -557,6 +586,10 @@ BREAKERS[4] = (
     '    val cmd = mutableListOf("pm", "trim-caches", "1G")',
 )
 
+
+# criterion 16: the declaration itself (a dropped letter = a dead short option)
+BREAKERS[16] = ('internal val SHIZUKU_VALUE_SHORT_OPTIONS = setOf("a", "d", "p", "c")',
+                'internal val SHIZUKU_VALUE_SHORT_OPTIONS = setOf("a", "d", "p")')
 
 def selftest():
     print("── selftest: compliant fixture must be green, each breaker must go red ──")

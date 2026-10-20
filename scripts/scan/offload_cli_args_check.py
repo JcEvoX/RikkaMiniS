@@ -101,6 +101,8 @@ OUTPUT = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/Offlo
 SPEAK = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/SpeakOffloadHandler.kt"
 PHOTOS = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/PhotosOffloadHandler.kt"
 NOTIFICATION = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/NotificationOffloadHandler.kt"
+# [dv15-A1 A-01/A-02] the shared parser every handler goes through.
+ARGS = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/OffloadArgs.kt"
 
 # [da1034-A4] ISSUE-08: every handler that ships a `formatBody` payload. Kept
 # explicit rather than a glob over the offload dir: a glob would also drag in
@@ -144,6 +146,31 @@ CONFIG_RULES = [
     ("K6", "req", "val resolved = resolveMaybeRelative(linuxPath, cwd)"),
     ("K7", "count_re", (r"readLinuxPath\(fileArg, request\.sessionId, request\.cwd\)", 3)),
     ("K8", "forbid_re", r"readLinuxPath\(fileArg, request\.sessionId\)(?!,)"),
+    # [dv15-A1 A-02] the short options this handler reads as values must be
+    # DECLARED at its parser call, or `-f pinned` silently becomes flag + stray
+    # positional (the filter is dropped and the unfiltered list is returned).
+    ("K9", "req", 'valueShortOptions = setOf("f", "p", "s")'),
+]
+
+# [dv15-A1 A-01/A-02] the shared parser's two value-binding decisions.
+#   A-01: a token starting with `-` was never a value, so `--lat -33.86` left
+#         `lat` UNSET and the number became a stray flag — the query then ran
+#         unconstrained (the caller's `getDouble("lat")` returned null).
+#   A-02: a single-dash option was ALWAYS a flag, so `-f pinned` dropped
+#         `pinned` into the positionals and the command behaved as if the
+#         option had not been given.
+# The needles pin the DECISION (the negative-number predicate, the declared
+# branch that writes into `values`), not a spelling: a rewrite that keeps the
+# behaviour passes, the old coarse branches fail closed.
+ARGS_RULES = [
+    ("A1", "req", "private fun valueTokenOrNull(token: String?): String? ="),
+    ("A2", "req", 'token?.takeIf { !it.startsWith("-") || isNegativeNumberToken(it) }'),
+    ("A3", "req", "private fun isNegativeNumberToken(token: String): Boolean ="),
+    ("A4", "req", "token.length > 1 && token[0] == '-' && token[1].isDigit()"),
+    ("A5", "req", "private val valueShortOptions: Set<String> = emptySet(),"),
+    ("A6", "req", "if (name in valueShortOptions && name !in effectiveBooleanFlags && value != null) {"),
+    ("A7", "req", "vs[name] = value"),
+    ("A8", "forbid_re", r'a\.startsWith\("-"\) && a\.length > 1 -> fs\.add\('),
 ]
 
 # [da1026-B] OffloadOutput.OUTPUT_FLAGS must cover the universal help flags;
@@ -250,6 +277,19 @@ SESSIONS_RULES = [
     ("J13", "forbid_re", r"parseEndDate\(args\.get\(\"end\"\)\)"),
     ("J14", "req", '"send" -> cmdSend(args)'),
     ("J15", "count_re", (r"throw InvalidDateArg\(flag, raw\)", 1)),
+    # [dv15-A1 A-08] both bounds readable but inside out: the query
+    # (`lastActive >= start AND lastActive <= end`) can match nothing, and the
+    # command used to answer exit 0 with {"count":0,"sessions":[]} — read by the
+    # caller as "no history in that period". J17 pins the STRICT comparison
+    # (`--start X --end X` stays legal: parseEndDate aligns the end to that
+    # day's 23:59:59.999), J18 fails closed on the non-strict variant, J19 pins
+    # the delegation (both raws travel with the bounds for the message) and J20
+    # the refusal itself.
+    ("J16", "req", "internal fun sessionsDateWindow("),
+    ("J17", "count_re", (r"endMs < startMs", 1)),
+    ("J18", "forbid_re", r"endMs <="),
+    ("J19", "count_re", (r'return sessionsDateWindow\(startMs, endMs, args\.get\("start"\), args\.get\("end"\)\)', 1)),
+    ("J20", "req", "throw InvertedDateWindow("),
 ]
 
 
@@ -359,6 +399,35 @@ def check_debug(debug_src: str) -> list:
                 findings.append((rid, "present", needle))
         elif kind == "forbid_re":
             if re.search(needle, debug):
+                findings.append((rid, "present", needle))
+    return findings
+
+
+def check_args(args_src: str) -> list:
+    """[dv15-A1 A-01/A-02] rules for the shared OffloadArgs parser, on
+    comment-stripped text.
+
+    Fail-closed by construction: every needle is a `req` (missing → finding), a
+    `forbid` (present → finding), a `count_re`, or a `forbid_re`. A parser
+    rewrite that drops the value-binding decisions lands as findings rather
+    than as a silently empty rule set.
+    """
+    findings = []
+    args = code_only(args_src)
+    for rid, kind, needle in ARGS_RULES:
+        if kind in ("req", "forbid"):
+            hit = needle in args
+            if kind == "req" and not hit:
+                findings.append((rid, "missing", needle))
+            if kind == "forbid" and hit:
+                findings.append((rid, "present", needle))
+        elif kind == "count_re":
+            pattern, want = needle
+            got = len(re.findall(pattern, args))
+            if got != want:
+                findings.append((rid, f"count {got} != {want}", pattern))
+        elif kind == "forbid_re":
+            if re.search(needle, args):
                 findings.append((rid, "present", needle))
     return findings
 
@@ -715,6 +784,8 @@ GREEN_CONFIG = """
         readLinuxPath(fileArg, request.sessionId, request.cwd) ?: return errorResult(
             args, EXIT_INVALID_ARGS, "INVALID_ARGS", "--file: could not read value")
     }
+    private fun parseConfigArgs(argv: List<String>): OffloadArgs =
+        OffloadArgs(argv, valueShortOptions = setOf("f", "p", "s"))
     private fun readLinuxPath(linuxPath: String, sessionId: String?, cwd: String?): String? {
         val resolved = resolveMaybeRelative(linuxPath, cwd)
         val hostFile: File = PRootKernel.resolvePathForSession(sessionId, resolved, context) ?: return null
@@ -793,6 +864,29 @@ GREEN_FASTIO = """
 # [da1026-B] green fixtures for the OUTPUT_FLAGS / speak arms. The declared set
 # is written out literally (never `OffloadOutput.OUTPUT_FLAGS + ...`), so the
 # fixture states the wanted contract instead of restating the code.
+GREEN_ARGS = """
+internal class OffloadArgs(
+    argv: List<String>,
+    booleanFlags: Set<String> = emptySet(),
+    private val valueShortOptions: Set<String> = emptySet(),
+) {
+    init {
+        val effectiveBooleanFlags = booleanFlags + OffloadOutput.OUTPUT_FLAGS
+        val vs = mutableMapOf<String, String>()
+        val value = valueTokenOrNull(argv.getOrNull(i + 1))
+        if (name in valueShortOptions && name !in effectiveBooleanFlags && value != null) {
+            vs[name] = value
+        }
+    }
+
+    private fun valueTokenOrNull(token: String?): String? =
+        token?.takeIf { !it.startsWith("-") || isNegativeNumberToken(it) }
+
+    private fun isNegativeNumberToken(token: String): Boolean =
+        token.length > 1 && token[0] == '-' && token[1].isDigit()
+}
+"""
+
 GREEN_OUTPUT = """
 internal object OffloadOutput {
     val OUTPUT_FLAGS: Set<String> = setOf("compact", "quiet", "q", "help", "h")
@@ -916,7 +1010,7 @@ class SessionsOffloadHandler {
     private fun resolveDateBounds(args: OffloadArgs): Pair<Long?, Long?> {
         val startMs = sessionsDateBound("--start", args.get("start")) { parseSessionsDate(it) }
         val endMs = sessionsDateBound("--end", args.get("end")) { parseEndDate(it) }
-        return startMs to endMs
+        return sessionsDateWindow(startMs, endMs, args.get("start"), args.get("end"))
     }
 
     private fun parseEndDate(raw: String?): Long? {
@@ -936,6 +1030,21 @@ internal class InvalidDateArg(flag: String, raw: String) :
 internal fun parseSessionsDate(raw: String?): Long? {
     if (raw.isNullOrBlank()) return null
     return null
+}
+
+internal class InvertedDateWindow(startRaw: String, endRaw: String) :
+    IllegalArgumentException("--end '$endRaw' is before --start '$startRaw'")
+
+internal fun sessionsDateWindow(
+    startMs: Long?,
+    endMs: Long?,
+    startRaw: String?,
+    endRaw: String?,
+): Pair<Long?, Long?> {
+    if (startMs != null && endMs != null && endMs < startMs) {
+        throw InvertedDateWindow(startRaw.orEmpty(), endRaw.orEmpty())
+    }
+    return startMs to endMs
 }
 
 internal fun sessionsDateBound(flag: String, raw: String?, parse: (String) -> Long?): Long? {
@@ -1468,6 +1577,96 @@ def selftest() -> int:
         if got != want:
             print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
             failures += 1
+    # [dv15-A1 A-01] K9 tooth — the config parser must be BUILT with the
+    # value-taking short options; expectation written by hand from CONFIG_RULES.
+    for label, config_src, want in [
+        ("config value short options dropped",
+         GREEN_CONFIG.replace('valueShortOptions = setOf("f", "p", "s")',
+                              "valueShortOptions = emptySet()"),
+         {"K9"}),
+    ]:
+        if config_src == GREEN_CONFIG:
+            print(f"SELFTEST-FAIL: {label}: mutation did not apply to any arm")
+            failures += 1
+            continue
+        got = {rid for rid, _, _ in check_text(
+            GREEN_CONTACTS, config_src, GREEN_BROWSERUSE, GREEN_FASTIO)}
+        if got != want:
+            print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
+            failures += 1
+    # [dv15-A1 A-08] J16–J20 teeth — the inverted window must exist, be the ONLY
+    # comparison (an `<=` would call an equal window inverted), be reached from
+    # the shared bounds helper, and refuse through its own exception type.
+    for label, sessions_src, want in [
+        ("date window helper renamed",
+         GREEN_SESSIONS.replace("internal fun sessionsDateWindow(",
+                                "internal fun unusedWindow("),
+         {"J16"}),
+        ("inverted window compared with <=",
+         GREEN_SESSIONS.replace("endMs < startMs", "endMs <= startMs"),
+         {"J17", "J18"}),
+        ("window refused with a foreign exception",
+         GREEN_SESSIONS.replace(
+             "throw InvertedDateWindow(startRaw.orEmpty(), endRaw.orEmpty())",
+             'throw IllegalArgumentException("bad window")'),
+         {"J20"}),
+        ("bounds bypass the window",
+         GREEN_SESSIONS.replace(
+             'return sessionsDateWindow(startMs, endMs, args.get("start"), args.get("end"))',
+             "return startMs to endMs"),
+         {"J19"}),
+    ]:
+        if sessions_src == GREEN_SESSIONS:
+            print(f"SELFTEST-FAIL: {label}: mutation did not apply to any arm")
+            failures += 1
+            continue
+        got = {rid for rid, _, _ in check_sessions(sessions_src)}
+        if got != want:
+            print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
+            failures += 1
+    # [dv15-A1 A-01/A-02] ARGS teeth — every value-binding rule has one arm.
+    # Expectations are written by hand from ARGS_RULES, never derived from a run.
+    for label, args_src, want in [
+        ("value token helper gone",
+         GREEN_ARGS.replace("private fun valueTokenOrNull(token: String?): String? =",
+                            "private fun unusedTokenHelper(token: String?): String? ="),
+         {"A1"}),
+        ("a flag is accepted as its own value",
+         GREEN_ARGS.replace(
+             'token?.takeIf { !it.startsWith("-") || isNegativeNumberToken(it) }', "token"),
+         {"A2"}),
+        ("negative-number guard gone",
+         GREEN_ARGS.replace("private fun isNegativeNumberToken(token: String): Boolean =",
+                            "private fun unusedNegativeGuard(token: String): Boolean ="),
+         {"A3"}),
+        ("digit look-ahead dropped",
+         GREEN_ARGS.replace("token.length > 1 && token[0] == '-' && token[1].isDigit()",
+                            "token.length > 1 && token[0] == '-'"),
+         {"A4"}),
+        ("value short options not declared",
+         GREEN_ARGS.replace("private val valueShortOptions: Set<String> = emptySet(),",
+                            "private val otherShortOptions: Set<String> = emptySet(),"),
+         {"A5"}),
+        ("boolean flags win over the value declaration",
+         GREEN_ARGS.replace(
+             "if (name in valueShortOptions && name !in effectiveBooleanFlags && value != null) {",
+             "if (name in valueShortOptions && value != null) {"),
+         {"A6"}),
+        ("value lookup never recorded",
+         GREEN_ARGS.replace("vs[name] = value", "vs.put(name, value)"),
+         {"A7"}),
+        ("dashed token joins the positionals",
+         GREEN_ARGS + '\n    val probe = a.startsWith("-") && a.length > 1 -> fs.add(a)',
+         {"A8"}),
+    ]:
+        if args_src == GREEN_ARGS:
+            print(f"SELFTEST-FAIL: {label}: mutation did not apply to any arm")
+            failures += 1
+            continue
+        got = {rid for rid, _, _ in check_args(args_src)}
+        if got != want:
+            print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
+            failures += 1
     # [da1033-D] ISSUE-04 — each payload spelling has a tooth: the prose return
     # (N2), the prose first argument in a one-line / multi-line / raw-string
     # call (N1), and the unterminated literal (fail-closed, not a silent skip).
@@ -1689,6 +1888,7 @@ def selftest() -> int:
     clean_flags = check_flag_set(GREEN_OUTPUT, GREEN_SPEAK)
     clean_debug = check_debug(GREEN_DEBUG)
     clean_sessions = check_sessions(GREEN_SESSIONS)
+    clean_args = check_args(GREEN_ARGS)
     clean_bindings = check_offload_cli_bindings(
         GREEN_CONTACTS, GREEN_NOTIFICATION_HANDLE, GREEN_FASTIO)
     clean_payload = check_offload_json(
@@ -1736,11 +1936,12 @@ def main(argv):
     debug_path = root / DEBUG_HANDLER
     sessions_path = root / SESSIONS
     notification_path = root / NOTIFICATION
+    args_path = root / ARGS
     if not contacts_path.is_file() or not config_path.is_file() \
             or not browseruse_path.is_file() or not fastio_path.is_file() \
             or not output_path.is_file() or not speak_path.is_file() \
             or not debug_path.is_file() or not sessions_path.is_file() \
-            or not notification_path.is_file():
+            or not notification_path.is_file() or not args_path.is_file():
         print(f"GATE-FAIL: handler source not found under {root}")
         return 1
     # fail-closed: a payload file that moves (or is renamed) must be a red
@@ -1759,6 +1960,7 @@ def main(argv):
                                speak_path.read_text(encoding="utf-8"))
     findings += check_debug(debug_path.read_text(encoding="utf-8"))
     findings += check_sessions(sessions_path.read_text(encoding="utf-8"))
+    findings += check_args(args_path.read_text(encoding="utf-8"))
     findings += check_offload_cli_bindings(contacts_path.read_text(encoding="utf-8"),
                                           notification_path.read_text(encoding="utf-8"),
                                           fastio_path.read_text(encoding="utf-8"))
