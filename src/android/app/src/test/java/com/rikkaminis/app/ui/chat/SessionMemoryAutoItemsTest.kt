@@ -131,6 +131,31 @@ class SessionMemoryAutoItemsTest {
     }
 
     @Test
+    fun dailyCapFollowsExplicitInjectLines() {
+        // [dv16-B08] The cap is the user-tunable injection budget, not a
+        // hard-coded literal: an explicit maxInjectLines must flow into both
+        // the fraction and the (full) branch. With the old hard-coded 200 the
+        // 150-line log at cap 120 showed "150 lines (full)" — a lie.
+        val lines150 = (1..150).joinToString("\n") { "line$it" }
+        val lines300 = (1..300).joinToString("\n") { "line$it" }
+        assertEquals(
+            "120/150 lines injected",
+            dailyAutoItemFor("d.md", "d", lines150, maxInjectLines = 120)!!.detail)
+        assertEquals(
+            "300 lines (full)",
+            dailyAutoItemFor("d.md", "d", lines300, maxInjectLines = 500)!!.detail)
+    }
+
+    @Test
+    fun dailyExplicitCapEqualToLineCountStaysFull() {
+        // cap == lineCount is still "(full)" — only lineCount > cap truncates.
+        val lines120 = (1..120).joinToString("\n") { "line$it" }
+        assertEquals(
+            "120 lines (full)",
+            dailyAutoItemFor("d.md", "d", lines120, maxInjectLines = 120)!!.detail)
+    }
+
+    @Test
     fun dailyRebuiltItemReflectsGrownLogNotStaleCount() {
         // The stale-snapshot failure mode on the daily log: the user grows
         // today's log past the cap inside the sheet; the rebuilt item must

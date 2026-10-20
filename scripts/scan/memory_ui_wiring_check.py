@@ -48,6 +48,19 @@ deep-audit-1023 ISSUE-07 gate. Two files, three defect surfaces:
      D is fail-closed on the `MemoryFileEditScreen` anchor: losing the
      function is gate ROT, not a pass.
 
+  E. [dv16 B-08] SessionMemorySheet.kt — `dailyAutoItemFor` hard-coded the
+     200-line injection cap while the real cap is
+     `AgentRuntimeLimitsPrefs.memoryInjectLines()` (user-tunable): after the
+     user changes the cap the sheet's `N/M lines injected` label lied about
+     what was actually injected. The criterion set:
+       - the function body must not contain the bare `200` literal (the cap
+         flows through the `maxInjectLines` parameter instead);
+       - the signature must carry a `maxInjectLines` parameter (default-arg
+         or explicit-arg form both bind the decision);
+       - the sheet must reference `AgentRuntimeLimitsPrefs.memoryInjectLines()`
+         so the shown cap tracks the real one.
+     Fail-closed on the function anchor: losing it is gate ROT.
+
 Comments are stripped before every judgment (the fix ships with prose
 comments that name each criterion; they must not carry the gate).
 
@@ -224,6 +237,28 @@ def check(screen_src: str, sheet_src: str) -> list:
             f"autoItemsRefreshTick bumped {bumps} time(s), expected >= 3 "
             "(AutoFile save + Write save + Write revoke)")
 
+    # ---- E. [dv16 B-08] dailyAutoItemFor cap follows memoryInjectLines() ----
+    daily = brace_slice(sht, "fun dailyAutoItemFor(")
+    if not daily:
+        errs.append(
+            "E: dailyAutoItemFor not found in " + MEM_SHEET + " — gate ROT "
+            "(its injection-cap anchors cannot be judged)")
+    else:
+        if re.search(r"\b200\b", daily):
+            errs.append(
+                "E: dailyAutoItemFor still hardcodes the 200-line injection "
+                "cap — it must flow through the maxInjectLines parameter "
+                "(AgentRuntimeLimitsPrefs.memoryInjectLines())")
+        if not re.search(r"maxInjectLines\s*:", daily):
+            errs.append(
+                "E: dailyAutoItemFor has no maxInjectLines parameter — the "
+                "sheet cannot follow the user-tunable injection cap")
+    if "AgentRuntimeLimitsPrefs.memoryInjectLines()" not in sht:
+        errs.append(
+            "E: " + MEM_SHEET + " never reads "
+            "AgentRuntimeLimitsPrefs.memoryInjectLines() — the shown cap is "
+            "decoupled from the real injection cap")
+
     return errs
 
 
@@ -308,6 +343,21 @@ val autoItems = remember(memoryRepository, context, autoItemsRefreshTick) {
 autoItemsRefreshTick++
 autoItemsRefreshTick++
 autoItemsRefreshTick++
+
+// [dv16 B-08] compliant dailyAutoItemFor: the cap flows through the
+// maxInjectLines parameter (prefs-backed default), not a hard-coded literal.
+internal fun dailyAutoItemFor(
+    fileName: String,
+    displayName: String,
+    content: String,
+    maxInjectLines: Int = AgentRuntimeLimitsPrefs.memoryInjectLines(),
+): AutoItem? {
+    if (content.isBlank()) return null
+    val lineCount = content.lines().size
+    val injected = minOf(lineCount, maxInjectLines)
+    val detail = if (lineCount > maxInjectLines) "$injected/$lineCount lines injected" else "$lineCount lines (full)"
+    return AutoItem(name = displayName, detail = detail, fileName = fileName, content = content)
+}
 """
 
     v1_screen = good_screen.replace(
@@ -336,6 +386,25 @@ autoItemsRefreshTick++
     v5_sheet = good_sheet.replace(
         "var autoItemsRefreshTick by remember { mutableStateOf(0) }",
         "// autoItemsRefreshTick\nval tick = remember { mutableStateOf(0) }")
+
+    # [dv16 B-08] dailyAutoItemFor arms. Fixture drift guard on the new
+    # replace anchor (a no-op .replace proves nothing).
+    DAILY_PARAM = "    maxInjectLines: Int = AgentRuntimeLimitsPrefs.memoryInjectLines(),\n"
+    DAILY_BODY = (
+        "    val injected = minOf(lineCount, maxInjectLines)\n"
+        "    val detail = if (lineCount > maxInjectLines)")
+    for name, frag in (("DAILY_PARAM", DAILY_PARAM), ("DAILY_BODY", DAILY_BODY)):
+        if good_sheet.count(frag) != 1:
+            print(f"  FAIL selftest fixture drift: {name} matched "
+                  f"{good_sheet.count(frag)} time(s) in good_sheet, expected 1")
+            return 1
+    # V11: the bare 200 literal is back in the function body
+    v11_sheet = good_sheet.replace(
+        DAILY_BODY,
+        "    val injected = minOf(lineCount, 200)\n"
+        "    val detail = if (lineCount > 200)")
+    # V12: the maxInjectLines parameter (and the prefs read with it) is gone
+    v12_sheet = good_sheet.replace(DAILY_PARAM, "")
 
     # [deep-audit-1029 ISSUE-03] MemoryFileEditScreen arms (criterion B extended
     # to read/save, plus criterion D). Anchors are spelled with their exact
@@ -391,6 +460,8 @@ autoItemsRefreshTick++
         ("V8 SOUL cache never refreshed on save", v8_screen, good_sheet, 1),
         ("V9 SOUL refresh named in prose only", v9_screen, good_sheet, 1),
         ("V10 save not launched on a coroutine scope", v10_screen, good_sheet, 1),
+        ("V11 daily cap hardcoded 200 back", good_screen, v11_sheet, 1),
+        ("V12 maxInjectLines parameter dropped", good_screen, v12_sheet, 1),
     ]
     failures = 0
     for name, s1, s2, expect_red in arms:
@@ -403,6 +474,11 @@ autoItemsRefreshTick++
             failures += 1
         else:
             print(f"  OK {name}: {'red: ' + errs[0] if errs else 'green'}")
+    # [dv16 B-08] teeth: the hardcoded-200 arm must red ONLY the E criteria.
+    e11 = check(good_screen, v11_sheet)
+    if not e11 or not all(err.startswith("E:") for err in e11):
+        print(f"  FAIL V11 teeth: expected only E-prefixed errors, got {e11}")
+        failures += 1
     if failures:
         print(f"SELFTEST FAILED ({failures} arms)")
         return 1
