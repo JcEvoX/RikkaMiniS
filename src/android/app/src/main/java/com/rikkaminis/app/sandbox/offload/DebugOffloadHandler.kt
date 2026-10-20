@@ -94,6 +94,22 @@ class DebugOffloadHandler(private val context: Context) : NativeOffloadHandler {
         // do not inline this into it).
         normalizeDebugRpcPaths(sub, rpc.params, request.cwd)
 
+        // [dv16-A03] ls/read/write are session-scoped in the PRoot layout:
+        // workspace/attachments/offloads/browser are PER-SESSION bind mounts,
+        // and the RPC handler's global resolveHostPath searches EVERY session
+        // tree then the rootfs placeholder — a session-relative
+        // `minis-debug ls .` (joined onto the caller's cwd above) would
+        // list/read/write another session's file, or a new file would vanish
+        // into the rootfs ghost dir the session shell cannot see. Forward the
+        // caller's session id so DebugRPCHandler resolves through
+        // resolvePathForSession (session hit ⇒ never falls back globally).
+        // Only the file-system subcommands carry it: `call` keeps its raw
+        // params verbatim, and a null session (interactive terminal) keeps
+        // the historical global behaviour in the handler's sessionId==null arm.
+        if (sub in SESSION_SCOPED_SUBCOMMANDS && !request.sessionId.isNullOrBlank()) {
+            rpc.params.put("sessionId", request.sessionId)
+        }
+
         // [da1028-A] Output shaping for the pass-through subcommands reads the
         // GLOBAL slice only (tokens before the subcommand): everything after
         // `exec` / `shizuku` / `model-use` belongs to the child process, so a
@@ -141,6 +157,12 @@ class DebugOffloadHandler(private val context: Context) : NativeOffloadHandler {
 
     private data class RpcCall(val method: String, val params: JSONObject)
     private class BadArgsException(msg: String) : RuntimeException(msg)
+
+    // [dv16-A03] The subcommands whose `path` operand resolves through the
+    // per-session bind mounts (workspace/attachments/offloads/browser). Pass-
+    // through subcommands (`exec`/`shizuku`/`model-use`) and the raw `call`
+    // escape hatch are not path-scoped to the caller's session.
+    private val SESSION_SCOPED_SUBCOMMANDS = setOf("ls", "read", "write")
 
     private fun buildRpcCall(sub: String, args: OffloadArgs, rawRest: List<String>): RpcCall {
         // [da1028-A] `rest` is the argv slice this subcommand owns — for the

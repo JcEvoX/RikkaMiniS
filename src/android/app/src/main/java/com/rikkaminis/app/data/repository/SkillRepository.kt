@@ -40,6 +40,24 @@ import java.util.zip.ZipOutputStream
  *   - Session overrides in `session_skill_overrides` table
  *   - Prompt fragment generation for system prompt injection
  */
+
+/**
+ * [dv16-A05] Pure decision core of the sparse-clear branch in
+ * [SkillRepository.setSessionOverride]. When the requested value equals the
+ * CURRENT global default, the override row is DELETED instead of pinned — so
+ * a later flip of the global default propagates to the session (a
+ * permanently-pinned row would leave the session stuck at the old value).
+ * `null` global (unknown / not-yet-loaded skill) conservatively keeps the
+ * row (write). Mirrors [MCPRepository.setSessionOverride]'s three branches —
+ * same shape, same precedence; the twin keeps its own copy only because its
+ * SQL names differ (mcp_session_overrides), the decision itself is this
+ * function.
+ *
+ * Top-level (not a member) so it is JVM-testable with zero Android deps.
+ */
+internal fun shouldDeleteSessionSkillOverride(globalEnabled: Boolean?, requestedEnabled: Boolean): Boolean =
+    globalEnabled != null && requestedEnabled == globalEnabled
+
 class SkillRepository(private val context: Context) {
 
     companion object {
@@ -456,11 +474,31 @@ class SkillRepository(private val context: Context) {
         return _skills.value.find { it.id == skillId }?.isEnabled ?: false
     }
 
+    /**
+     * [dv16-A05] Sparse-clear, mirroring [MCPRepository.setSessionOverride]:
+     * when [enabled] equals the skill's CURRENT global enabled, DELETE the
+     * override row instead of pinning it — so a later flip of the global
+     * default propagates to this session (a permanently-pinned row would
+     * leave the session stuck at the old value after the user toggles the
+     * switch back to the global default in [SessionSkillsSheet]). Only store
+     * a row when the session value genuinely diverges from the global
+     * default. Read precedence (override → global → false) in
+     * [isEnabledForSession] is unchanged, and an unknown / not-yet-loaded
+     * skill (`globalEnabled == null`) still writes the row.
+     */
     fun setSessionOverride(sessionId: String, skillId: String, enabled: Boolean) {
-        db.execSQL(
-            "INSERT OR REPLACE INTO session_skill_overrides (session_id, skill_id, is_enabled) VALUES (?, ?, ?)",
-            arrayOf<Any>(sessionId, skillId, if (enabled) 1 else 0)
-        )
+        val globalEnabled = _skills.value.find { it.id == skillId }?.isEnabled
+        if (shouldDeleteSessionSkillOverride(globalEnabled, enabled)) {
+            db.execSQL(
+                "DELETE FROM session_skill_overrides WHERE session_id=? AND skill_id=?",
+                arrayOf(sessionId, skillId)
+            )
+        } else {
+            db.execSQL(
+                "INSERT OR REPLACE INTO session_skill_overrides (session_id, skill_id, is_enabled) VALUES (?, ?, ?)",
+                arrayOf<Any>(sessionId, skillId, if (enabled) 1 else 0)
+            )
+        }
     }
 
     fun clearSessionOverrides(sessionId: String) {

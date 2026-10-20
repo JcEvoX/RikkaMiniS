@@ -70,6 +70,12 @@ RETURN_ADD = "return add("
 PREFERRED_ID = "preferredId ="
 BUNDLED_DECL = "private fun installBundledSkill(dirName: String) {"
 BUNDLED_NEXT = "private fun isAdoptableBundledRow("
+# [dv16-A05] sparse-clear arm
+OVERRIDE_DECL = "fun setSessionOverride(sessionId: String, skillId: String, enabled: Boolean)"
+OVERRIDE_NEXT = "fun clearSessionOverrides("
+DELETE_OVERRIDE = "DELETE FROM session_skill_overrides WHERE session_id=? AND skill_id=?"
+SHARED_DECISION = "shouldDeleteSessionSkillOverride("
+GLOBAL_READ = "_skills.value.find { it.id == skillId }?.isEnabled"
 DELETE_SESSION = "suspend fun deleteSession(id: String): SessionFileStore.DeleteResult? {"
 DELETE_ROW_ONLY = "suspend fun deleteSessionRowOnly(id: String) {"
 INVOKE_HOOK = "onSessionDeleted?.invoke("
@@ -229,6 +235,29 @@ def check_skill_repo(src):
 
     # Arm 4 [da1029-C / I04]: recordSkillUse's write-back shares add()'s lock.
     v.extend(check_record_skill_use_lock(src))
+
+    # Arm 8 [dv16-A05]: setSessionOverride sparse-clears when the requested
+    # value equals the CURRENT global default; the decision lives in the
+    # shared pure function shouldDeleteSessionSkillOverride (the MCP twin's
+    # shape). A pinned row keeps the session stuck at the old value forever.
+    override_slice = slice_between(src, OVERRIDE_DECL, OVERRIDE_NEXT, "SkillRepository.kt", v)
+    if override_slice is not None:
+        if DELETE_OVERRIDE not in override_slice:
+            v.append(
+                "SkillRepository.kt: setSessionOverride does not DELETE the override row when the "
+                "value equals the global default — a pinned row keeps the session stuck at the old "
+                "value after the user toggles back (sparse-clear is the MCP twin's shape)"
+            )
+        if SHARED_DECISION not in override_slice:
+            v.append(
+                "SkillRepository.kt: setSessionOverride does not consult the shared decision "
+                "shouldDeleteSessionSkillOverride — a second decision copy is back"
+            )
+        if GLOBAL_READ not in override_slice:
+            v.append(
+                "SkillRepository.kt: setSessionOverride does not read the CURRENT global default "
+                "before the branch — the row would be pinned even when it matches"
+            )
 
     # Arm 1: add()'s first assignment must resolve the id through the policy.
     add_slice = slice_between(src, ADD_DECL, ADD_SIG_END, "SkillRepository.kt", v)
@@ -501,6 +530,27 @@ internal class SkillRepository(private val context: Context) {
 
     private fun isAdoptableBundledRow(existing: Skill): Boolean = false
 
+    // [dv16-A05] the compliant shape: sparse-clear when the value equals the
+    // CURRENT global default, decided by the shared pure function.
+    fun setSessionOverride(sessionId: String, skillId: String, enabled: Boolean) {
+        val globalEnabled = _skills.value.find { it.id == skillId }?.isEnabled
+        if (shouldDeleteSessionSkillOverride(globalEnabled, enabled)) {
+            db.execSQL(
+                "DELETE FROM session_skill_overrides WHERE session_id=? AND skill_id=?",
+                arrayOf(sessionId, skillId)
+            )
+        } else {
+            db.execSQL(
+                "INSERT OR REPLACE INTO session_skill_overrides (session_id, skill_id, is_enabled) VALUES (?, ?, ?)",
+                arrayOf<Any>(sessionId, skillId, if (enabled) 1 else 0)
+            )
+        }
+    }
+
+    fun clearSessionOverrides(sessionId: String) {
+        db.execSQL("DELETE FROM session_skill_overrides WHERE session_id=?", arrayOf(sessionId))
+    }
+
     fun recordSkillUse(skillId: String) {
         // The mirror must move under the same lock as add().
         synchronized(addLock) {
@@ -559,6 +609,21 @@ BAD_SKILL_NO_LOCK = GOOD_SKILL.replace(
 # Anchor itself gone -> fail-closed, not a silent skip.
 BAD_SKILL_DROP_FUNCTION = GOOD_SKILL.replace(
     "fun recordSkillUse(", "fun recordSkillUseRenamed(")
+
+# [dv16-A05] the pre-fix shape: INSERT OR REPLACE always — a toggled-back
+# session keeps its pinned row forever (the MCP twin sparse-clears; this one
+# didn't).
+BAD_SKILL_PIN_OVERRIDE = GOOD_SKILL.replace(
+    """        val globalEnabled = _skills.value.find { it.id == skillId }?.isEnabled
+        if (shouldDeleteSessionSkillOverride(globalEnabled, enabled)) {
+            db.execSQL(
+                "DELETE FROM session_skill_overrides WHERE session_id=? AND skill_id=?",
+                arrayOf(sessionId, skillId)
+            )
+        } else {
+            db.execSQL(""",
+    """        db.execSQL(""",
+)
 
 GOOD_CHAT = """
 class ChatRepository(
@@ -703,6 +768,7 @@ def selftest():
     bad_publish = check_skill_repo(BAD_SKILL_PUBLISH_OUTSIDE_LOCK)
     bad_nolock = check_skill_repo(BAD_SKILL_NO_LOCK)
     bad_nofunc = check_skill_repo(BAD_SKILL_DROP_FUNCTION)
+    bad_pin = check_skill_repo(BAD_SKILL_PIN_OVERRIDE)
 
     # Precision control: a compliant fixture must be clean, or "everything is
     # red" would masquerade as teeth.
@@ -718,6 +784,11 @@ def selftest():
     expect_trip("publish-outside-lock fixture (I04)", bad_publish, "out of the", failures)
     expect_trip("no-lock fixture (I04)", bad_nolock, "has no 'synchronized(addLock)'", failures)
     expect_trip("dropped-function fixture (I04)", bad_nofunc, "not found (ROT", failures)
+    # [dv16-A05] the pinned-override pre-fix shape fires ONLY the new arm.
+    expect_trip("pinned-override fixture (dv16-A05)", bad_pin, "does not DELETE the override row", failures)
+    expect_trip("pinned-override fixture (dv16-A05)", bad_pin, "shouldDeleteSessionSkillOverride", failures)
+    if any("does not resolve" in v or "publishes" in v or "has no 'synchronized" in v for v in bad_pin):
+        failures.append("pinned-override fixture (dv16-A05) tripped an UNRELATED arm: %r" % bad_pin)
 
     good_chat = check_chat_repo(GOOD_CHAT)
     bad_chat = check_chat_repo(BAD_CHAT_NO_HOOK)
@@ -759,6 +830,7 @@ def selftest():
     print("selftest publish-outside-lock    -> %d violation(s)" % len(bad_publish))
     print("selftest no-lock recordSkillUse  -> %d violation(s)" % len(bad_nolock))
     print("selftest recordSkillUse removed  -> %d violation(s)" % len(bad_nofunc))
+    print("selftest pinned override         -> %d violation(s)" % len(bad_pin))
     print("selftest compliant chat repo     -> %d violation(s)" % len(good_chat))
     print("selftest unwired-hook chat repo  -> %d violation(s)" % len(bad_chat))
     print("selftest compliant MinisApp      -> %d violation(s)" % len(good_app))

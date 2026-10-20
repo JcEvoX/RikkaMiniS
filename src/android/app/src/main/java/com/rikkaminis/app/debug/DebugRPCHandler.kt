@@ -294,7 +294,16 @@ class DebugRPCHandler(private val context: Context) {
         val recursive = params.optBoolean("recursive", false)
         val maxDepth = params.optInt("maxDepth", 3)
 
-        val hostFile = PRootKernel.resolveHostPath(path)
+        // [dv16-A03] The per-session bind mounts (workspace/attachments/
+        // offloads/browser) are NOT in the global bindMounts map, and the
+        // global resolveHostPath searches every minis-sessions/<id>/ tree for
+        // an existing match — an `ls` from one session would list whichever
+        // session's tree came first. The caller's session id (forwarded by
+        // DebugOffloadHandler, or sent directly by an external JSON-RPC
+        // client) scopes the resolution; null keeps the historical global
+        // behaviour for Coil-style callers without a session.
+        val sessionId = params.optString("sessionId", "").ifBlank { null }
+        val hostFile = PRootKernel.resolvePathForSession(sessionId, path, context)
             ?: throw RPCException(-32602, "Cannot resolve path: $path")
 
         if (!hostFile.isDirectory) throw RPCException(-32602, "Not a directory: $path")
@@ -372,7 +381,11 @@ class DebugRPCHandler(private val context: Context) {
         if (path.isEmpty()) throw RPCException(-32602, "Invalid params: 'path' is required")
         if (path.contains("..")) throw RPCException(-32602, "Invalid path: '..' not allowed")
 
-        val hostFile = PRootKernel.resolveHostPath(path)
+        // [dv16-A03] Session-scoped resolution — same shape as handleLS. A
+        // session hit never falls back to the global resolver, so a `read`
+        // from one session cannot pick up another session's same-named file.
+        val sessionId = params.optString("sessionId", "").ifBlank { null }
+        val hostFile = PRootKernel.resolvePathForSession(sessionId, path, context)
             ?: throw RPCException(-32602, "Cannot resolve path: $path")
 
         if (!hostFile.exists()) throw RPCException(-32602, "File not found: $path")
@@ -931,10 +944,14 @@ class DebugRPCHandler(private val context: Context) {
 
     /**
      * Write a file into the proot-mounted Linux namespace. Resolves the
-     * Linux path through PRootKernel.resolveHostPath, creates parent dirs,
-     * writes the bytes, and best-effort applies the requested mode bits.
-     * No fakefs registration is needed — proot reads the host directly,
-     * so the guest sees the file the moment it lands on disk.
+     * Linux path through PRootKernel.resolvePathForSession ([dv16-A03]:
+     * session-scoped when the request carries a `sessionId`, so a write from
+     * one session cannot overwrite another session's same-named file, and a
+     * new session-relative file lands inside that session's tree instead of
+     * the rootfs ghost dir), creates parent dirs, writes the bytes, and
+     * best-effort applies the requested mode bits. No fakefs registration is
+     * needed — proot reads the host directly, so the guest sees the file the
+     * moment it lands on disk.
      */
     private fun handleWriteFile(params: JSONObject): JSONObject {
         val path = params.optString("path").ifEmpty {
@@ -957,11 +974,15 @@ class DebugRPCHandler(private val context: Context) {
             throw RPCException(-32000, "Read-only mount: '$path' is not writable")
         }
 
-        // Pre-boot fallback: resolveHostPath returns null until proot boots
-        // (it lazy-initializes its RootfsManager). Test harnesses commonly
-        // want to stage files BEFORE booting, so route through the rootfs
-        // dir directly when the kernel isn't ready yet.
-        val hostFile = PRootKernel.resolveHostPath(path) ?: run {
+        // Pre-boot fallback: the session resolver returns null until proot
+        // boots (it lazy-initializes its RootfsManager). Test harnesses
+        // commonly want to stage files BEFORE booting, so route through the
+        // rootfs dir directly when the kernel isn't ready yet.
+        // [dv16-A03] Session-scoped resolution — same shape as handleLS; the
+        // pre-boot rootfsDir fallback is unchanged and still catches every
+        // null (unresolvable path or pre-boot), so test staging keeps working.
+        val sessionId = params.optString("sessionId", "").ifBlank { null }
+        val hostFile = PRootKernel.resolvePathForSession(sessionId, path, context) ?: run {
             val rootfsDir = com.rikkaminis.app.sandbox.RootfsManager.getInstance(context).rootfsDir
             File(rootfsDir, path.removePrefix("/"))
         }

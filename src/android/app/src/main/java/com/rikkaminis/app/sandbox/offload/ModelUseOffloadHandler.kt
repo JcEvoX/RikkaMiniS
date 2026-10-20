@@ -62,14 +62,19 @@ class ModelUseOffloadHandler(
     }
 
     private fun cmdList(args: OffloadArgs): NativeOffloadResult {
-        val providerFilter = args.get("provider")?.lowercase()
+        val providerFilter = args.get("provider")
         val modalityFilter = args.get("modality")?.lowercase()
 
         var entries = providerRepository.resolvedAgentLoopEntries()
+        // [dv16-A04] The same single matcher as search/run. This used to be a
+        // case-sensitive substring match on model.provider/label — a filter
+        // that `run --provider` (exact label/id) would then refuse.
         if (providerFilter != null) {
-            entries = entries.filter {
-                it.model.provider.lowercase().contains(providerFilter) ||
-                    providerInstanceLabel(it).lowercase().contains(providerFilter)
+            entries = entries.filter { entry ->
+                val inst = providerRepository.instance(entry.providerInstanceId)
+                inst != null && providerMatches(
+                    providerFilter, inst.label, inst.id, inst.providerType.displayName,
+                )
             }
         }
         if (modalityFilter != null) {
@@ -92,12 +97,25 @@ class ModelUseOffloadHandler(
                 "minis-model-use search: no query. Usage: minis-model-use search <query>\n",
             )
         val q = query.lowercase()
+        val providerFilter = args.get("provider")
         val modalityFilter = args.get("modality")?.lowercase()
 
         var matches = providerRepository.resolvedAgentLoopEntries().filter { entry ->
             entry.model.id.lowercase().contains(q) ||
                 entry.model.displayName.lowercase().contains(q) ||
                 entry.model.provider.lowercase().contains(q)
+        }
+        // [dv16-A04] `--provider` was documented on this subcommand's help
+        // line but never read — the option was consumed into OffloadArgs and
+        // dropped, so `search gpt --provider X` returned every provider's
+        // gpt models. Same single matcher as list/run.
+        if (providerFilter != null) {
+            matches = matches.filter { entry ->
+                val inst = providerRepository.instance(entry.providerInstanceId)
+                inst != null && providerMatches(
+                    providerFilter, inst.label, inst.id, inst.providerType.displayName,
+                )
+            }
         }
         if (modalityFilter != null) {
             matches = matches.filter { matchesModality(it, modalityFilter) }
@@ -917,14 +935,18 @@ class ModelUseOffloadHandler(
     private fun resolveEntry(idOrName: String, providerFilter: String? = null): ModelEntry? {
         val all = providerRepository.resolvedAgentLoopEntries()
 
-        // Apply --provider filter first: match against instance label (case-insensitive)
-        // OR instance UUID. Restricts the lookup pool so the same model_id under
-        // multiple providers can be picked unambiguously.
+        // Apply --provider filter first. [dv16-A04] The same single matcher
+        // as list/search — this pool used to match label/id only, so
+        // `--provider OpenAI` (the value list/search print as their JSON
+        // "provider" field) resolved to nothing and run failed with
+        // "model not found". Restricts the lookup pool so the same model_id
+        // under multiple providers can be picked unambiguously.
         val pool = if (providerFilter.isNullOrEmpty()) all else {
-            val pf = providerFilter.lowercase()
             all.filter { entry ->
                 val inst = providerRepository.instance(entry.providerInstanceId)
-                inst != null && (inst.label.lowercase() == pf || inst.id.lowercase() == pf)
+                inst != null && providerMatches(
+                    providerFilter, inst.label, inst.id, inst.providerType.displayName,
+                )
             }
         }
         if (pool.isEmpty()) return null
@@ -955,9 +977,6 @@ class ModelUseOffloadHandler(
         pool.find { it.model.displayName.lowercase().contains(q) }?.let { return it }
         return null
     }
-
-    private fun providerInstanceLabel(entry: ModelEntry): String =
-        providerRepository.instance(entry.providerInstanceId)?.label.orEmpty()
 
     private fun entryDict(entry: ModelEntry): JSONObject =
         com.rikkaminis.app.offload.ModelUseManager.entryDict(
@@ -1374,6 +1393,13 @@ Run model selection:
   disambiguate when the same model_id is configured under multiple providers.
   Equivalently, pass `--model <model_id> --provider <instance_label>`.
 
+Provider matching (--provider on list/search/run):
+  --provider matches (case-insensitive, exact) the instance label, its id,
+  or the provider type name (e.g. `OpenAI`, `Anthropic`) — the values
+  `list`/`search` print as `instance_label` / `provider_type` in their JSON.
+  A value that matches none of the three faces filters to zero rows (run
+  reports "not found") rather than falling back to unfiltered results.
+
 Input format (OpenAI Chat Completions JSON — the ONLY input format):
   Standard fields (messages, system, temperature, max_tokens,
   generation_config) are AUTOMATICALLY CONVERTED to whatever the selected
@@ -1492,4 +1518,35 @@ internal sealed class SessionScopedPathDecision {
     class Resolved(val file: File) : SessionScopedPathDecision()
     object NotSessionScoped : SessionScopedPathDecision()
     object Rejected : SessionScopedPathDecision()
+}
+
+/**
+ * [dv16-A04] The single `--provider` matcher: one decision shared by `list`,
+ * `search` and `run` (resolveEntry). The three subcommands used to answer
+ * `--provider` differently — list matched model.provider/label as a
+ * case-sensitive substring, search never read the option despite its help
+ * line, and run resolved label/id exactly — so an agent reading `list`'s
+ * JSON and replaying its "provider" field into `run` could hit
+ * "model not found", and `search --provider x` silently returned other
+ * providers' models.
+ *
+ * Semantics: case-insensitive EXACT match (trim + lowercase) against the
+ * provider instance's label, its id, or the provider type's display name.
+ * Those are the three faces a caller can obtain verbatim: "instance_label" /
+ * "provider_type" from the `list`/`search` output, the instance UUID from
+ * `minis-config get models`, and the type name from the settings UI. An
+ * OpenAI-type instance's display name is "OpenAI", the same string the
+ * output prints as its "provider" field — so the read-then-replay workflow
+ * now round-trips. `list`'s old substring match was the historical
+ * coincidence, not a contract; exact is the explainable answer and the same
+ * rule `run` has always used (extended to the type name).
+ *
+ * Top-level (not a member) so it is JVM-testable with zero Android deps.
+ */
+internal fun providerMatches(query: String, label: String, id: String, typeName: String): Boolean {
+    val q = query.trim().lowercase()
+    if (q.isEmpty()) return false
+    return label.trim().lowercase() == q ||
+        id.trim().lowercase() == q ||
+        typeName.trim().lowercase() == q
 }
