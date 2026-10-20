@@ -154,6 +154,65 @@ class OffloadCliArgsTest {
         assertEquals(50, maxOf("list", "10"))
     }
 
+    // ── A''. the legacy `-n` alias really binds a value (dv14-A1, ISSUE-01) ──
+    //
+    // `-n 10` used to leave `10` in the POSITIONAL list (OffloadArgs binds no
+    // value to a single-dash token), so `getInt("max", "n")` could never see it
+    // and `search -n 10 Alice` searched for the name "10" while dropping
+    // "Alice". [ContactsOffloadHandler.bindLegacyShortMax] rewrites the alias to
+    // `--max` before the parse, for the two subcommands that have a page size.
+
+    private fun searchMaxOf(vararg argv: String): Int =
+        ContactsOffloadHandler.listMax(parse(*argv).args, 20)
+
+    @Test
+    fun `legacy -n before the query binds the page size and keeps the query`() {
+        val c = parse("search", "-n", "10", "Alice")
+        assertEquals("search", c.sub)
+        assertEquals("Alice", c.args.positional.getOrNull(1))
+        assertEquals(10, searchMaxOf("search", "-n", "10", "Alice"))
+    }
+
+    @Test
+    fun `legacy -n after the query binds the page size too`() {
+        val c = parse("search", "Alice", "-n", "10")
+        assertEquals("Alice", c.args.positional.getOrNull(1))
+        assertEquals(10, searchMaxOf("search", "Alice", "-n", "10"))
+    }
+
+    @Test
+    fun `legacy -n reaches the list resolver through the parse`() {
+        assertEquals(10, ContactsOffloadHandler.listMax(parse("list", "-n", "10").args))
+    }
+
+    @Test
+    fun `the alias only rewrites a numeric value`() {
+        val c = parse("search", "-n", "Alice")
+        assertEquals("Alice", c.args.positional.getOrNull(1))
+        assertEquals(20, searchMaxOf("search", "-n", "Alice"))
+        assertEquals(
+            listOf("search", "-n", "Alice"),
+            ContactsOffloadHandler.bindLegacyShortMax(listOf("search", "-n", "Alice")),
+        )
+    }
+
+    @Test
+    fun `the alias is only bound for the subcommands that have a page size`() {
+        assertEquals(10L, parse("get", "-n", "10").id!!)
+        assertEquals(
+            listOf("get", "-n", "10"),
+            ContactsOffloadHandler.bindLegacyShortMax(listOf("get", "-n", "10")),
+        )
+    }
+
+    @Test
+    fun `the alias is rewritten behind a leading output flag`() {
+        assertEquals(
+            listOf("--compact", "search", "--max", "10", "Alice"),
+            ContactsOffloadHandler.bindLegacyShortMax(listOf("--compact", "search", "-n", "10", "Alice")),
+        )
+    }
+
     // ── B. `minis-config --file` relative path resolution ───────────────────
 
     @Test
@@ -241,6 +300,25 @@ class OffloadCliArgsTest {
             "help/h must be declared boolean flags or `--help list` swallows the subcommand",
             code.contains("booleanFlags = setOf(\"help\", \"h\")"),
         )
+        // [dv14-A1] ISSUE-01: the page size has ONE resolver, and the legacy
+        // `-n` alias must be bound before the parse or its value takes the
+        // query slot.
+        assertTrue(
+            "doSearch must resolve the page size through listMax (search's documented default)",
+            code.contains("val max = listMax(parsedArgs, 20)"),
+        )
+        assertTrue(
+            "the legacy -n alias must be bound before the parse",
+            code.contains("OffloadArgs(bindLegacyShortMax(argv), booleanFlags"),
+        )
+        assertTrue(
+            "the alias binder must exist as its own pure helper",
+            code.contains("internal fun bindLegacyShortMax(argv: List<String>): List<String> {"),
+        )
+        assertFalse(
+            "the dead alias read must not come back (OffloadArgs never fills values[\"n\"])",
+            code.contains("getInt(\"max\", \"n\")"),
+        )
     }
 
     private fun assertConfigFilePathResolution(src: String) {
@@ -309,6 +387,28 @@ class OffloadCliArgsTest {
             "val needsWrite = rawArgs[0] == \"delete\"",
         )
         assertTrue("the parsed needsWrite line must exist to be removable", mutated != original)
+        assertProbeFails { assertContactsDispatchParsed(mutated) }
+    }
+
+    @Test
+    fun `negative control - the dead -n alias read comes back and the probe fails`() {
+        val original = source(contactsFile)
+        val mutated = original.replace(
+            "val max = listMax(parsedArgs, 20)",
+            "val max = parsedArgs.getInt(\"max\", \"n\") ?: 20",
+        )
+        assertTrue("the resolver call must exist to be removable", mutated != original)
+        assertProbeFails { assertContactsDispatchParsed(mutated) }
+    }
+
+    @Test
+    fun `negative control - unbinding the -n alias fails the probe`() {
+        val original = source(contactsFile)
+        val mutated = original.replace(
+            "OffloadArgs(bindLegacyShortMax(argv), booleanFlags",
+            "OffloadArgs(argv, booleanFlags",
+        )
+        assertTrue("the alias binding must exist to be removable", mutated != original)
         assertProbeFails { assertContactsDispatchParsed(mutated) }
     }
 

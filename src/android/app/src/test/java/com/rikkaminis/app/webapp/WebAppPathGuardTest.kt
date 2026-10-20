@@ -109,4 +109,34 @@ class WebAppPathGuardTest {
         val resolved = PRootKernel.safeResolveWithin(base, "a/../b")
         assertEquals(File(base, "b").canonicalPath, resolved?.canonicalPath)
     }
+
+    // ── [dv14-B2] title seed + backfill decision ────────────────────────
+
+    @Test
+    fun `html and htm suffixes are stripped from the seed`() {
+        assertEquals("page", webAppTitleFallback("page.html"))
+        assertEquals("page", webAppTitleFallback("page.htm"))
+    }
+
+    @Test
+    fun `other suffixes and blank names are kept verbatim`() {
+        assertEquals("notes.txt", webAppTitleFallback("notes.txt"))
+        assertEquals("", webAppTitleFallback(""))
+    }
+
+    @Test
+    fun `a parsed title backfills an untouched field`() {
+        assertEquals("My Page", webAppTitleBackfill("My Page", userEditedTitle = false))
+    }
+
+    @Test
+    fun `a late parsed title never overwrites what the user typed`() {
+        assertNull(webAppTitleBackfill("My Page", userEditedTitle = true))
+    }
+
+    @Test
+    fun `absent or blank parse results keep the seed`() {
+        assertNull(webAppTitleBackfill(null, userEditedTitle = false))
+        assertNull(webAppTitleBackfill("   ", userEditedTitle = false))
+    }
 }

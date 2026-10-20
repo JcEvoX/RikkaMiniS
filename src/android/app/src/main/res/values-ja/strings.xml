@@ -540,6 +540,9 @@
     <string name="browser_history_clear">消去</string>
     <string name="browser_history_done">完了</string>
     <string name="browser_history_search">履歴を検索</string>
+    <string name="browser_history_today">今日</string>
+    <string name="browser_history_yesterday">昨日</string>
+    <string name="browser_history_results">検索結果</string>
     <string name="browser_history_empty_title">閲覧履歴はありません</string>
     <string name="browser_history_empty_subtitle">履歴は 7 日間保持されます</string>
     <string name="browser_history_clear_dialog_title">閲覧履歴を消去しますか？</string>

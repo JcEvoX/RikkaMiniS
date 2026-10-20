@@ -1,5 +1,9 @@
 package com.rikkaminis.app.ui.components
 
+import com.rikkaminis.app.data.model.ProviderConfig
+import com.rikkaminis.app.data.model.ProviderCredential
+import com.rikkaminis.app.data.model.ProviderInstance
+import com.rikkaminis.app.data.model.ProviderType
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -152,5 +156,106 @@ class QuickTestSheetContractTest {
         assertTrue(textBranch.contains("maxTokens = 128,"))
         assertTrue(textBranch.contains("temperature = null,"))
         assertTrue(textBranch.contains("Say hello back in one short, friendly sentence."))
+    }
+
+    // ── [deep-audit-v14 ISSUE-05] shared collapsed-provider state ────────────
+    //
+    // Both screens that render `modelEntryPickerItems` used to keep their own
+    // `val collapsedInstanceIds = remember(config) { mutableStateOf(…config.instances…) }`
+    // copy. `ProviderConfig` is a data class whose `revision` is bumped by
+    // `ProviderRepository.saveConfig` on EVERY mutation (see the T273 note on
+    // the field), so the config object is a different value after any write —
+    // a Quick Test persisting `imageEndpointResolved`, `refreshModels` landing,
+    // a DTO → StateFlow re-emit — and the collapse choice of a user who was
+    // mid-pick was wiped. The state now lives in one shared source; the two
+    // screen shapes are asserted here, the state's key decision is asserted by
+    // calling the pure derivation below.
+
+    private val addModelsRel =
+        "src/main/java/com/rikkaminis/app/ui/settings/AddModelsToGroupScreen.kt"
+    private val agentLoopSheetsRel =
+        "src/main/java/com/rikkaminis/app/ui/settings/AgentLoopAddSheets.kt"
+
+    /** The pre-fix shapes, quoted from the audit (kept verbatim on purpose). */
+    private val collapsedPreFix = """
+        val collapsedInstanceIds = remember(config) {
+            mutableStateOf(
+                if (modalityFilter != null) emptySet()
+                else config.instances.map { it.id }.toSet(),
+            )
+        }
+    """.trimIndent()
+
+    /** Every way the collapse-state wiring can regress — one reason per arm. */
+    private fun collapsedViolations(source: String, expectsVoiceFlag: Boolean): List<String> =
+        buildList {
+            if (!source.contains("rememberCollapsedInstanceIds(")) {
+                add("the screen does not seed the collapse state through the shared single source")
+            }
+            if (source.contains("collapsedInstanceIds = remember(")) {
+                add("the screen still keeps a private collapse-state remember")
+            }
+            if (expectsVoiceFlag && !source.contains("defaultExpanded = modalityFilter != null")) {
+                add("the voice scenario no longer starts fully expanded ([T-android-provider-voice])")
+            }
+        }
+
+    private fun instance(id: String, enabled: Boolean = true) = ProviderInstance(
+        id = id,
+        label = id.uppercase(),
+        providerType = ProviderType.openAI,
+        credentialType = ProviderCredential.apiKey,
+        isEnabled = enabled,
+    )
+
+    @Test
+    fun `the picker screens delegate the collapse state instead of copying it`() {
+        val addModels = sourceText(addModelsRel)
+        val agentLoop = sourceText(agentLoopSheetsRel)
+
+        val viaAdd = collapsedViolations(addModels, expectsVoiceFlag = true)
+        assertEquals("AddModelsToGroupScreen violations: $viaAdd", emptyList<String>(), viaAdd)
+        val viaAgentLoop = collapsedViolations(agentLoop, expectsVoiceFlag = false)
+        assertEquals("AgentLoopAddSheets violations: $viaAgentLoop", emptyList<String>(), viaAgentLoop)
+    }
+
+    @Test
+    fun `the pre-fix collapse shape violates every arm`() {
+        // Teeth: if the probe stopped looking, this fixture would come back clean.
+        val injected = collapsedViolations(collapsedPreFix, expectsVoiceFlag = true)
+        assertEquals("the pre-fix fixture must trip every arm", 3, injected.size)
+        assertTrue(injected.any { it.contains("private collapse-state") })
+        assertTrue(injected.any { it.contains("single source") })
+        assertTrue(injected.any { it.contains("voice scenario") })
+    }
+
+    @Test
+    fun `the collapse state key ignores writes that are not instance changes`() {
+        val before = ProviderConfig(instances = mutableListOf(instance("a"), instance("b")))
+
+        assertEquals(setOf("a", "b"), providerInstanceIds(before))
+
+        // saveConfig bumps `revision` on every mutation: a different config
+        // value, but not a different instance set — the state must survive.
+        val afterUnrelatedWrite = before.copy(revision = before.revision + 1)
+        assertEquals(providerInstanceIds(before), providerInstanceIds(afterUnrelatedWrite))
+
+        // toggling a provider is not an instance add/remove either
+        val toggled = before.copy(instances = mutableListOf(instance("a", enabled = false), instance("b")))
+        assertEquals(providerInstanceIds(before), providerInstanceIds(toggled))
+
+        // an actual add re-seeds (the newcomer starts collapsed), as before
+        val added = before.copy(
+            instances = mutableListOf(instance("a"), instance("b"), instance("c")))
+        assertEquals(setOf("a", "b", "c"), providerInstanceIds(added))
+    }
+
+    @Test
+    fun `the collapse seed starts fully expanded only in a voice scenario`() {
+        // [T-android-provider-voice]: don't fold a 39-voice Azure provider
+        // behind a disclosure when the user opened the picker to pick a voice.
+        assertEquals(emptySet<String>(), collapsedInstanceIdsSeed(setOf("a", "b"), defaultExpanded = true))
+        assertEquals(setOf("a", "b"), collapsedInstanceIdsSeed(setOf("a", "b"), defaultExpanded = false))
+        assertEquals(emptySet<String>(), collapsedInstanceIdsSeed(emptySet(), defaultExpanded = false))
     }
 }

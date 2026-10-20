@@ -100,6 +100,7 @@ FASTIO = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/Fasti
 OUTPUT = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/OffloadOutput.kt"
 SPEAK = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/SpeakOffloadHandler.kt"
 PHOTOS = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/PhotosOffloadHandler.kt"
+NOTIFICATION = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/NotificationOffloadHandler.kt"
 
 # [da1034-A4] ISSUE-08: every handler that ships a `formatBody` payload. Kept
 # explicit rather than a glob over the offload dir: a glob would also drag in
@@ -566,6 +567,100 @@ def check_offload_json(*files) -> list:
         out += payload_findings(label, src)
     return out
 
+# ── [dv14-A1] deep-audit-v14 ISSUE-01 / ISSUE-02 / ISSUE-04: alias bindings ──
+#
+# One process-wide fact ties the three together: OffloadArgs binds NO value to a
+# single-dash token (`-n` becomes a bare flag and its value lands in
+# `positional`), and a `--key` is exempt from the greedy `--key value` branch
+# ONLY when its name is in the declared boolean set. Every defect below is a
+# name the code accepts with none of the value machinery behind it — so the
+# call succeeds with wrong output (exit 0, `jq`-visible) instead of being
+# refused. Each rule pins the DEFINITION (the function that owns the decision),
+# never a call spelling:
+#
+#  V1 ContactsOffloadHandler — `doSearch` must resolve its page size through
+#     `listMax` (the same resolver `doList` uses; `getInt("max", "n")` is the
+#     dead alias spelling and must not come back), and the legacy `-n <N>` form
+#     must be bound by `bindLegacyShortMax` BEFORE the parse, or its value takes
+#     the query slot (`search -n 10 Alice` searched for the name "10").
+#  V2 NotificationOffloadHandler — `handleSend` must decide
+#     deferred-vs-immediate from the RAW `--after` string via `sendDisposition`:
+#     `getInt("after")` collapses "spelled but unreadable" (`--after 5m`) into
+#     "not spelled" and fires the notification immediately with exit 0, and
+#     `scheduleDeferred`'s "--after or --at is required" refusal (unreachable
+#     while the branch was gated on the parsed value) must stay live.
+#  V3 FastioOffloadHandler — `firstSubcommandToken` must consult
+#     `fastioBooleanFlags` (the same set the shared parse uses) while keeping
+#     OUTPUT_FLAGS: knowing only OUTPUT_FLAGS, a leading `--force` / `--verbose`
+#     / `--create` swallowed the `tar` subcommand as its value, so
+#     `isTarCommand` came out false and the `-cf`/`-xf` expansion never ran.
+#
+# Fail-closed by construction: every arm reports its own id when its anchor is
+# absent, so a renamed / restructured / deleted owner function lands as a
+# finding instead of shrinking the rule set silently. Every needle is judged on
+# comment-stripped text (a comment quoting the wanted shape cannot pass) and the
+# bodies come from the same brace matcher the N2 arm uses — an expression body
+# has no owner body to judge and is itself a finding.
+def check_offload_cli_bindings(contacts_src: str, notification_src: str,
+                               fastio_src: str) -> list:
+    """[dv14-A1] the alias-binding rules (V1 contacts, V2 notification, V3 fastio)."""
+    findings = []
+    contacts = code_only(contacts_src)
+    notif = code_only(notification_src)
+    fastio = code_only(fastio_src)
+
+    # V1 — the dead alias read + the resolver wiring.
+    if 'getInt("max", "n")' in contacts:
+        findings.append(
+            ("V1a", "present", 'getInt("max", "n") — OffloadArgs never fills values["n"]'))
+    do_search = _payload_helper_bodies(contacts, "doSearch")
+    if do_search is None:
+        findings.append(("V1b", "missing", "private fun doSearch(parsedArgs: OffloadArgs)"))
+    elif "listMax(" not in do_search:
+        findings.append(("V1b", "missing", "doSearch must resolve its page size through listMax("))
+    parse_contacts = _payload_helper_bodies(contacts, "parseContactsCommand")
+    if parse_contacts is None:
+        findings.append(("V1c", "missing", "internal fun parseContactsCommand(argv: List<String>)"))
+    elif "bindLegacyShortMax(argv)" not in parse_contacts:
+        findings.append(
+            ("V1c", "missing",
+             "parseContactsCommand must bind the legacy -n alias (bindLegacyShortMax(argv))"))
+    if _payload_helper_bodies(contacts, "bindLegacyShortMax") is None:
+        findings.append(
+            ("V1d", "missing", "internal fun bindLegacyShortMax(argv: List<String>): List<String>"))
+
+    # V2 — the deferred decision, its owner function, and its refusal guard.
+    if 'getInt("after")' in notif:
+        findings.append(
+            ("V2a", "present",
+             'getInt("after") erases "spelled but unreadable" into "not spelled"'))
+    handle_send = _payload_helper_bodies(notif, "handleSend")
+    if handle_send is None:
+        findings.append(("V2b", "missing", "private fun handleSend(sub: String, args: OffloadArgs)"))
+    elif "sendDisposition(" not in handle_send:
+        findings.append(("V2b", "missing", "handleSend must decide through sendDisposition("))
+    if _payload_helper_bodies(notif, "sendDisposition") is None:
+        findings.append(
+            ("V2c", "missing",
+             "internal fun sendDisposition(sub: String, rawAfter: String?, rawAt: String?): SendDisposition"))
+    if "android-notification: --after or --at is required\\n" not in notif:
+        findings.append(
+            ("V2d", "missing", "scheduleDeferred's '--after or --at is required' refusal"))
+
+    # V3 — the raw-argv scan must know the same boolean set the parse uses.
+    scan = _payload_helper_bodies(fastio, "firstSubcommandToken")
+    if scan is None:
+        findings.append(("V3c", "missing", "internal fun firstSubcommandToken(rawArgv: List<String>)"))
+    else:
+        if "fastioBooleanFlags(" not in scan:
+            findings.append(
+                ("V3a", "missing", "firstSubcommandToken must consult fastioBooleanFlags("))
+        if "OUTPUT_FLAGS" not in scan:
+            findings.append(
+                ("V3b", "missing",
+                 "firstSubcommandToken must keep excluding OffloadOutput.OUTPUT_FLAGS"))
+    return findings
+
 
 # ── selftest: every rule must have a tooth, and the green arm must pass ──────
 
@@ -583,12 +678,26 @@ GREEN_CONTACTS = """
     }
     companion object {
         internal fun parseContactsCommand(argv: List<String>): ContactsCommand {
-            val args = OffloadArgs(argv, booleanFlags = setOf("help", "h"))
+            val args = OffloadArgs(bindLegacyShortMax(argv), booleanFlags = setOf("help", "h"))
             return ContactsCommand(
                 sub = args.positional.getOrNull(0),
                 id = args.positional.getOrNull(1)?.toLongOrNull(),
                 args = args,
             )
+        }
+        internal fun bindLegacyShortMax(argv: List<String>): List<String> {
+            if ("-n" !in argv) return argv
+            val sub = OffloadArgs(argv, booleanFlags = setOf("help", "h")).positional.getOrNull(0)
+            if (sub != "list" && sub != "search") return argv
+            val out = ArrayList<String>(argv.size)
+            out.add("--max")
+            return out
+        }
+        internal fun doSearch(parsedArgs: OffloadArgs): NativeOffloadResult {
+            val query = searchQueryOf(parsedArgs.positional)
+                ?: return NativeOffloadResult(2, "android-contacts search: missing <query>\n")
+            val max = listMax(parsedArgs, 20)
+            return NativeOffloadResult(0, OffloadOutput.formatBody(arr.toString(2), parsedArgs) + "\n")
         }
         internal fun listMax(parsedArgs: OffloadArgs, default: Int = DEFAULT_LIST_MAX): Int {
             parsedArgs.getInt("max")?.let { return it }
@@ -656,10 +765,13 @@ GREEN_FASTIO = """
     }
     companion object {
         internal fun firstSubcommandToken(rawArgv: List<String>): String? {
+            val noValue = OffloadOutput.OUTPUT_FLAGS + fastioBooleanFlags(isTarCommand = true)
             var i = 0
             while (i < rawArgv.size) {
-                if (!rawArgv[i].startsWith("-")) return rawArgv[i]
-                i += 1
+                val token = rawArgv[i]
+                if (!token.startsWith("-")) return token
+                val consumesValue = token.substring(2) !in noValue
+                i += if (consumesValue) 2 else 1
             }
             return null
         }
@@ -837,6 +949,55 @@ internal fun sessionsDateBound(flag: String, raw: String?, parse: (String) -> Lo
 # shape-faithful: every accepted spelling appears once (variable, JSON builder,
 # helper call, raw JSON literal, expression-into-arrayOf, a prose literal that
 # lives in a COMMENT) plus the two N2 spellings (`return data.toString(2)`).
+# [dv14-A1] green fixture for the notification arm: the deferred decision is
+# taken from the RAW `--after` string, and the "--after or --at is required"
+# refusal stays reachable behind it.
+GREEN_NOTIFICATION_HANDLE = r"""
+    private fun handleSend(sub: String, args: OffloadArgs): NativeOffloadResult {
+        val title = args.get("title") ?: return NativeOffloadResult(2, "android-notification: missing --title\n")
+        val body = args.get("body") ?: ""
+        when (val plan = sendDisposition(sub, args.get("after"), args.get("at"))) {
+            is SendDisposition.Invalid -> return NativeOffloadResult(2, plan.message)
+            is SendDisposition.Deferred -> return scheduleDeferred(title, body, plan.secs, plan.at, args)
+            SendDisposition.Immediate -> Unit
+        }
+        return NativeOffloadResult(0, JSONObject().put("scheduled", "immediate").toString(2) + "\n")
+    }
+
+    private fun scheduleDeferred(
+        title: String,
+        body: String,
+        afterSec: Int?,
+        atStr: String?,
+        args: OffloadArgs,
+    ): NativeOffloadResult {
+        return when {
+            afterSec != null && afterSec <= 0 ->
+                NativeOffloadResult(2, "android-notification: --after must be positive\n")
+            atStr != null -> unreachable()
+            else -> NativeOffloadResult(2, "android-notification: --after or --at is required\n")
+        }
+    }
+
+    companion object {
+        internal sealed class SendDisposition {
+            class Deferred(val secs: Int?, val at: String?) : SendDisposition()
+            class Invalid(val message: String) : SendDisposition()
+            object Immediate : SendDisposition()
+        }
+
+        internal fun sendDisposition(sub: String, rawAfter: String?, rawAt: String?): SendDisposition {
+            val secs = when (rawAfter) {
+                null -> null
+                else -> rawAfter.toIntOrNull() ?: return SendDisposition.Invalid("bad --after\n")
+            }
+            if (secs != null || rawAt != null) return SendDisposition.Deferred(secs, rawAt)
+            if (sub == "schedule") return SendDisposition.Deferred(null, null)
+            return SendDisposition.Immediate
+        }
+    }
+"""
+
 GREEN_PAYLOAD_PHOTOS = r"""
     private fun nearPhotos(lat: Double, lon: Double, radiusKm: Double, max: Int): String {
         val photos = JSONArray()
@@ -1443,11 +1604,93 @@ def selftest() -> int:
         if got != want:
             print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
             failures += 1
+    # [dv14-A1] one arm per spelling the three defects shipped (ISSUE-01/02/04),
+    # each against its own green control: the dead single-dash alias read, the
+    # resolver bypassed, the alias never bound, the parsed `--after` read, the
+    # owner function renamed away, the refusal guard deleted, and the raw-argv
+    # scan knowing too small a boolean set (both halves of it).
+    red_cases_bindings = [
+        ("contacts: doSearch reverts to the dead alias read",
+         GREEN_CONTACTS.replace("val max = listMax(parsedArgs, 20)",
+                                'val max = parsedArgs.getInt("max", "n") ?: 20'),
+         GREEN_NOTIFICATION_HANDLE, GREEN_FASTIO, {"V1a", "V1b"}),
+        ("contacts: doSearch stops reusing the resolver",
+         GREEN_CONTACTS.replace("val max = listMax(parsedArgs, 20)", "val max = 20"),
+         GREEN_NOTIFICATION_HANDLE, GREEN_FASTIO, {"V1b"}),
+        ("contacts: the -n alias stops being bound before the parse",
+         GREEN_CONTACTS.replace("OffloadArgs(bindLegacyShortMax(argv), booleanFlags",
+                                "OffloadArgs(argv, booleanFlags"),
+         GREEN_NOTIFICATION_HANDLE, GREEN_FASTIO, {"V1c"}),
+        ("contacts: the bind helper is renamed",
+         GREEN_CONTACTS.replace(
+             "internal fun bindLegacyShortMax(argv: List<String>): List<String> {",
+             "internal fun unusedBinder(argv: List<String>): List<String> {"),
+         GREEN_NOTIFICATION_HANDLE, GREEN_FASTIO, {"V1d"}),
+        ("notification: handleSend goes back to the parsed read",
+         GREEN_CONTACTS,
+         GREEN_NOTIFICATION_HANDLE.replace(
+             "val plan = sendDisposition(sub, args.get(\"after\"), args.get(\"at\"))",
+             'val plan = args.getInt("after")'),
+         GREEN_FASTIO, {"V2a", "V2b"}),
+        ("notification: handleSend stops consulting the disposition",
+         GREEN_CONTACTS,
+         GREEN_NOTIFICATION_HANDLE.replace(
+             "val plan = sendDisposition(sub, args.get(\"after\"), args.get(\"at\"))",
+             "val plan = SendDisposition.Immediate"),
+         GREEN_FASTIO, {"V2b"}),
+        ("notification: the disposition helper is renamed",
+         GREEN_CONTACTS,
+         GREEN_NOTIFICATION_HANDLE.replace("internal fun sendDisposition(sub: String,",
+                                           "internal fun unusedDisposition(sub: String,"),
+         GREEN_FASTIO, {"V2c"}),
+        ("notification: the required-argument refusal is deleted",
+         GREEN_CONTACTS,
+         GREEN_NOTIFICATION_HANDLE.replace(
+             "android-notification: --after or --at is required\\n",
+             "android-notification: nothing to schedule\\n"),
+         GREEN_FASTIO, {"V2d"}),
+        ("fastio: the scan forgets the boolean flag set",
+         GREEN_CONTACTS, GREEN_NOTIFICATION_HANDLE,
+         GREEN_FASTIO.replace(
+             "val noValue = OffloadOutput.OUTPUT_FLAGS + fastioBooleanFlags(isTarCommand = true)",
+             "val noValue = OffloadOutput.OUTPUT_FLAGS"),
+         {"V3a"}),
+        ("fastio: the scan forgets the global output flags",
+         GREEN_CONTACTS, GREEN_NOTIFICATION_HANDLE,
+         GREEN_FASTIO.replace(
+             "val noValue = OffloadOutput.OUTPUT_FLAGS + fastioBooleanFlags(isTarCommand = true)",
+             "val noValue = fastioBooleanFlags(isTarCommand = true)"),
+         {"V3b"}),
+        ("fastio: the scan becomes an expression body (fail-closed)",
+         GREEN_CONTACTS, GREEN_NOTIFICATION_HANDLE,
+         GREEN_FASTIO.replace(
+             "internal fun firstSubcommandToken(rawArgv: List<String>): String? {",
+             "internal fun firstSubcommandToken(rawArgv: List<String>): String? = rawArgv.firstOrNull {"),
+         {"V3c"}),
+        ("a comment cannot mask the boolean-flag reference",
+         GREEN_CONTACTS, GREEN_NOTIFICATION_HANDLE,
+         GREEN_FASTIO.replace(
+             "val noValue = OffloadOutput.OUTPUT_FLAGS + fastioBooleanFlags(isTarCommand = true)",
+             "// val noValue = Output.OUTPUT_FLAGS + fastioBooleanFlags(true)"),
+         {"V3a", "V3b"}),
+    ]
+    for label, contacts_src, notif_src, fastio_src, want in red_cases_bindings:
+        if contacts_src == GREEN_CONTACTS and notif_src == GREEN_NOTIFICATION_HANDLE \
+                and fastio_src == GREEN_FASTIO:
+            print(f"SELFTEST-FAIL: {label}: mutation did not apply to any arm")
+            failures += 1
+            continue
+        got = {rid for rid, _, _ in check_offload_cli_bindings(contacts_src, notif_src, fastio_src)}
+        if got != want:
+            print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
+            failures += 1
     # the green arms must be fully clean, or every rule is vacuous
     clean = check_text(GREEN_CONTACTS, GREEN_CONFIG, GREEN_BROWSERUSE, GREEN_FASTIO)
     clean_flags = check_flag_set(GREEN_OUTPUT, GREEN_SPEAK)
     clean_debug = check_debug(GREEN_DEBUG)
     clean_sessions = check_sessions(GREEN_SESSIONS)
+    clean_bindings = check_offload_cli_bindings(
+        GREEN_CONTACTS, GREEN_NOTIFICATION_HANDLE, GREEN_FASTIO)
     clean_payload = check_offload_json(
         ("PhotosOffloadHandler.kt", GREEN_PAYLOAD_PHOTOS),
         ("ContactsOffloadHandler.kt", GREEN_PAYLOAD_CONTACTS),
@@ -1458,9 +1701,11 @@ def selftest() -> int:
         ("OpenOffloadHandler.kt", GREEN_PAYLOAD_SIDE_EFFECTS),
         ("FastioOffloadHandler.kt", GREEN_PAYLOAD_FASTIO_USAGE),
     )
-    if clean or clean_flags or clean_debug or clean_sessions or clean_payload:
+    if clean or clean_flags or clean_debug or clean_sessions or clean_bindings or clean_payload:
+        green_findings = (clean + clean_flags + clean_debug + clean_sessions
+                          + clean_bindings + clean_payload)
         print(f"SELFTEST-FAIL: green fixtures must produce no findings, "
-              f"got {describe(clean + clean_flags + clean_debug + clean_sessions + clean_payload)}")
+              f"got {describe(green_findings)}")
         failures += 1
     if failures:
         print(f"SELFTEST: {failures} failing case(s)")
@@ -1490,10 +1735,12 @@ def main(argv):
     speak_path = root / SPEAK
     debug_path = root / DEBUG_HANDLER
     sessions_path = root / SESSIONS
+    notification_path = root / NOTIFICATION
     if not contacts_path.is_file() or not config_path.is_file() \
             or not browseruse_path.is_file() or not fastio_path.is_file() \
             or not output_path.is_file() or not speak_path.is_file() \
-            or not debug_path.is_file() or not sessions_path.is_file():
+            or not debug_path.is_file() or not sessions_path.is_file() \
+            or not notification_path.is_file():
         print(f"GATE-FAIL: handler source not found under {root}")
         return 1
     # fail-closed: a payload file that moves (or is renamed) must be a red
@@ -1512,6 +1759,9 @@ def main(argv):
                                speak_path.read_text(encoding="utf-8"))
     findings += check_debug(debug_path.read_text(encoding="utf-8"))
     findings += check_sessions(sessions_path.read_text(encoding="utf-8"))
+    findings += check_offload_cli_bindings(contacts_path.read_text(encoding="utf-8"),
+                                          notification_path.read_text(encoding="utf-8"),
+                                          fastio_path.read_text(encoding="utf-8"))
     findings += check_offload_json(*payload_files)
     if findings:
         print("offload_cli_args_check: FAIL")
@@ -1522,7 +1772,9 @@ def main(argv):
           "OUTPUT_FLAGS covers help/h, speak declares stop/status, "
           "sessions date bounds funneled + refuse invalid, "
           "debug pass-through argv verbatim + global-only output shaping, "
-          "8/8 payload files hand formatBody JSON (N1 whole-file, N2 payload helpers))")
+          "8/8 payload files hand formatBody JSON (N1 whole-file, N2 payload helpers), "
+          "contacts search -n bound to --max through the one resolver, notification --after "
+          "refuses an unreadable value, fastio subcommand scan knows its boolean flags))")
     return 0
 
 

@@ -324,7 +324,7 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
     private fun doCreate(args: OffloadArgs): NativeOffloadResult {
         ensurePermission(
             permissions = listOf(Manifest.permission.WRITE_CALENDAR, Manifest.permission.READ_CALENDAR),
-            satisfied = { hasWrite() },
+            satisfied = { calendarSatisfied(hasRead(), hasWrite(), needsWrite = true) },
             humanLabel = "write",
             settingsId = Manifest.permission.WRITE_CALENDAR,
             args = args,
@@ -413,7 +413,7 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
     private fun doUpdate(args: OffloadArgs): NativeOffloadResult {
         ensurePermission(
             permissions = listOf(Manifest.permission.WRITE_CALENDAR, Manifest.permission.READ_CALENDAR),
-            satisfied = { hasWrite() },
+            satisfied = { calendarSatisfied(hasRead(), hasWrite(), needsWrite = true) },
             humanLabel = "write",
             settingsId = Manifest.permission.WRITE_CALENDAR,
             args = args,
@@ -583,8 +583,8 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
 
     private fun doDelete(args: OffloadArgs): NativeOffloadResult {
         ensurePermission(
-            permissions = listOf(Manifest.permission.WRITE_CALENDAR),
-            satisfied = { hasWrite() },
+            permissions = listOf(Manifest.permission.WRITE_CALENDAR, Manifest.permission.READ_CALENDAR),
+            satisfied = { calendarSatisfied(hasRead(), hasWrite(), needsWrite = true) },
             humanLabel = "write",
             settingsId = Manifest.permission.WRITE_CALENDAR,
             args = args,
@@ -781,7 +781,9 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
      * as SessionsOffloadHandler.parseEndDate — while datetime inputs keep
      * their explicit instant; missing sides default to last 24h on either
      * side, unchanged). Returns null only when --start/--end are supplied but
-     * unparseable.
+     * unparseable, or when --days is supplied but unreadable ([dv14-A3]
+     * ISSUE-05: "7d" / "last-week" used to read as absent and silently degrade
+     * to the last-24h window — doList's exit-2 answer now covers it).
      *
      * [deep-audit-1016c ISSUE-09B] The decision core is [resolveRangePure]
      * (companion, JVM-tested with pinned DST-day literals); this shell only
@@ -795,6 +797,7 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
             daysRaw = args.getInt("days"),
             startRaw = args.get("start"),
             endRaw = args.get("end"),
+            daysText = args.get("days"),
         ) { s, nowMs, z -> parseDateInZone(s, nowMs, z) }
 
     /** Writable calendars as the pure selector matcher sees them. */
@@ -1122,7 +1125,12 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
          *   arithmetic (the old +24h constant clipped/overshot a 23/25-hour
          *   DST day by exactly 1h).
          * - `--days N` → [N calendar days back at 00:00, now) via
-         *   add(DAY_OF_YEAR, -N); N <= 0 degrades to 7 (unchanged).
+         *   add(DAY_OF_YEAR, -N); N <= 0 degrades to 7 (unchanged). A
+         *   supplied-but-unreadable `--days` ("7d", "last-week") returns null
+         *   ([dv14-A3] ISSUE-05 — it used to read as absent and silently
+         *   degrade to the last-24h window); [daysText] carries the raw string
+         *   so the caller's `args.getInt` miss can be told apart from "the
+         *   flag was never given".
          * - `--start/--end` explicit; missing sides default to last 24h
          *   (unchanged); parse failure → null (error semantics unchanged);
          *   start > end → swapped (unchanged).
@@ -1135,12 +1143,22 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
             daysRaw: Int?,
             startRaw: String?,
             endRaw: String?,
+            daysText: String? = null,
             parse: (String, Long, TimeZone) -> Long?,
         ): Pair<Long, Long>? {
             if (todayFlag) {
                 val s = startOfLocalDay(nowMs, zone)
                 val e = startOfLocalDay(addLocalDays(nowMs, 1, zone), zone)
                 return s to e
+            }
+            // [dv14-A3] ISSUE-05: a supplied-but-unreadable `--days` ("7d",
+            // "last-week") used to read as absent (getInt → toIntOrNull → null)
+            // and silently degraded to the last-24h window, dropping the days
+            // the caller named. Absent (`--days` given no value, i.e. the flag
+            // parsed as boolean) and non-positive integers keep their
+            // historical readings (N <= 0 degrades to 7).
+            if (daysText != null && daysText.isNotBlank() && daysText.toIntOrNull() == null) {
+                return null
             }
             daysRaw?.let { rawDays ->
                 val n = if (rawDays <= 0) 7 else rawDays
@@ -1208,6 +1226,21 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
          */
         internal fun updateUsesAllDaySemantics(explicitAllDay: Boolean, storedAllDay: Boolean?): Boolean =
             explicitAllDay || storedAllDay == true
+
+        /**
+         * [dv14-A3] ISSUE-06: the write-path `satisfied` predicate. Mirrors
+         * ContactsOffloadHandler.hasPermission(needsWrite): a WRITE needs READ
+         * too, because every calendar write first READS the provider —
+         * requireCalendarTarget → listWritableCalendars queries
+         * Calendars.CONTENT_URI and findEventRow queries Events.CONTENT_URI,
+         * and with only WRITE_CALENDAR granted those queries throw
+         * SecurityException that the read helpers swallow into an empty
+         * answer ⇒ the write paths used to report `calendar_no_account` /
+         * `not_found` while satisfied() claimed the permission was fine.
+         * Pure so the truth table is JVM-testable.
+         */
+        internal fun calendarSatisfied(read: Boolean, write: Boolean, needsWrite: Boolean): Boolean =
+            if (needsWrite) read && write else read
 
         /**
          * [da1017-D2] DTEND to write when an all-day event's DTSTART moves

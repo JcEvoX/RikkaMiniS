@@ -212,7 +212,15 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
         // subcommand itself — same convention as the other offload handlers).
         val query = searchQueryOf(parsedArgs.positional)
             ?: return NativeOffloadResult(2, "android-contacts search: missing <query>\n")
-        val max = parsedArgs.getInt("max", "n") ?: 20
+        // [dv14-A1 ISSUE-01] The `-n` short form is bound to `--max` by
+        // [bindLegacyShortMax] before the parse, so `getInt("max", "n")` — the
+        // old spelling here — could never have read it: OffloadArgs puts a
+        // single-dash token in the flag set and NEVER in `values`, so the "n"
+        // alias was dead and the value landed in the positional list, where
+        // `search -n 10 Alice` searched for the name "10" and dropped "Alice".
+        // `listMax` is the ONE resolver (same as doList); 20 is search's
+        // documented default (HELP_TEXT: "default 20" — list's is 50).
+        val max = listMax(parsedArgs, 20)
 
         val projection = arrayOf(
             ContactsContract.Contacts._ID,
@@ -475,12 +483,52 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
          * both the flag and the subcommand vanish ([sweep1014-B26a]).
          */
         internal fun parseContactsCommand(argv: List<String>): ContactsCommand {
-            val args = OffloadArgs(argv, booleanFlags = setOf("help", "h"))
+            val args = OffloadArgs(bindLegacyShortMax(argv), booleanFlags = setOf("help", "h"))
             return ContactsCommand(
                 sub = args.positional.getOrNull(0),
                 id = args.positional.getOrNull(1)?.toLongOrNull(),
                 args = args,
             )
+        }
+
+        /**
+         * [dv14-A1] ISSUE-01: `-n <N>` is the legacy shorthand for `--max <N>`
+         * that [listMax] used to recover from the positional list — the shared
+         * parser binds no value to a single-dash token (`-n` becomes a bare
+         * flag and `10` lands in the positional list), so `search -n 10 Alice`
+         * took the `10` as the QUERY slot and dropped "Alice".
+         *
+         * Rewriting the alias to the value-carrying long spelling here keeps
+         * [OffloadArgs] (shared by every offload handler) untouched and makes
+         * the alias mean the same thing in every position (`-n 10` before or
+         * after the query). Only a numeric value is rewritten, so `search -n
+         * Alice` (a stray flag + a real query) is untouched; only the two
+         * subcommands that HAVE a page size are rewritten, so `get` / `delete`
+         * keep their id slots bit-for-bit (`get -n 10` still read id 10).
+         *
+         * Pure — no Context, no I/O — so both arms stay testable off-device.
+         */
+        internal fun bindLegacyShortMax(argv: List<String>): List<String> {
+            if ("-n" !in argv) return argv
+            // The subcommand may sit behind an option (`--compact list -n 10`),
+            // so ask the parser rather than indexing the raw argv.
+            val sub = OffloadArgs(argv, booleanFlags = setOf("help", "h")).positional.getOrNull(0)
+            if (sub != "list" && sub != "search") return argv
+            val out = ArrayList<String>(argv.size)
+            var i = 0
+            while (i < argv.size) {
+                val token = argv[i]
+                val value = argv.getOrNull(i + 1)
+                if (token == "-n" && value != null && value.toIntOrNull() != null) {
+                    out.add("--max")
+                    out.add(value)
+                    i += 2
+                    continue
+                }
+                out.add(token)
+                i++
+            }
+            return out
         }
 
         /**

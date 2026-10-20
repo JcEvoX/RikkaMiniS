@@ -54,6 +54,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.rikkaminis.app.R
 import com.rikkaminis.app.data.repository.MCPRepository
+import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.ui.components.DialogTextField
 import com.rikkaminis.app.ui.components.MinisTextButton
 
@@ -191,6 +192,19 @@ fun MCPIntegrationsScreen(
     // entry was deleted meanwhile instead of silently becoming the add flow.
     editServer?.let { captured ->
         val liveServer = servers.find { it.id == captured.id } ?: captured
+        // [fix/dv14-B3] The elvis above keeps the sheet in EDIT mode when the
+        // entry was deleted externally while it was open (reloadFromDisk /
+        // paste-import) — and Save then stores setClientSecret under a deleted
+        // id (orphan credentials, against the MCPRepository.kt invariant
+        // "credentials exist iff the saved config is a configured URL-transport
+        // OAuth server") while update() returns false and is silently dropped.
+        // Close the sheet instead. Keyed on (captured.id, servers) so a listing
+        // change re-launches the effect with the FRESH listing (a launch-time
+        // capture of `servers` goes stale the moment the listing changes);
+        // state is mutated from the effect, never inline in composition.
+        LaunchedEffect(captured.id, servers) {
+            if (servers.none { it.id == captured.id }) editServer = null
+        }
         MCPAddSheet(
             mcpRepository = mcpRepository,
             envVarRepository = envVarRepository,
@@ -576,6 +590,22 @@ private fun MCPFormTab(
                                 cfg == null ->
                                     errorText = context.getString(R.string.mcp_form_oauth_incomplete)
                                 else -> {
+                                    // [fix/dv14-B3] Same orphan-credential guard as
+                                    // the Save branch: the authorize flow stores the
+                                    // client secret (and later tokens + the bridge
+                                    // file) under `sid`; if the entry was deleted
+                                    // externally while the sheet was open, that
+                                    // writes credentials under an id that no longer
+                                    // exists. Refuse instead of aiming at a deleted
+                                    // id — the caller's close-on-disappear effect
+                                    // dismisses the sheet.
+                                    if (isEdit && mcpRepository.servers.value.none { it.id == sid }) {
+                                        AppLogger.warning(
+                                            "MCPSheet",
+                                            "MCP server \"$sid\" was deleted while the edit sheet was open; authorize refused",
+                                        )
+                                        return@MinisTextButton
+                                    }
                                     errorText = null
                                     // Persist the secret so the token exchange can
                                     // read it; harmless if the flow is cancelled.
@@ -773,6 +803,19 @@ private fun MCPFormTab(
             MinisTextButton(onClick = onDone) { Text(stringResource(R.string.cancel)) }
             MinisTextButton(onClick = {
                 val server = buildServerFromForm() ?: return@MinisTextButton
+                // [fix/dv14-B3] An entry deleted externally while the sheet was
+                // open must not leave orphan credentials: setClientSecret is
+                // keyed by server.id, and update() returns false when the id is
+                // gone (silently dropped — the save lands nowhere). Refuse
+                // instead: no secret write, no add, no onDone. The caller's
+                // close-on-disappear effect dismisses the sheet.
+                if (isEdit && mcpRepository.servers.value.none { it.id == server.id }) {
+                    AppLogger.warning(
+                        "MCPSheet",
+                        "MCP server \"${server.id}\" was deleted while the edit sheet was open; save refused",
+                    )
+                    return@MinisTextButton
+                }
                 // [T-android-mcp-oauth] Store the client secret in the encrypted
                 // store (keyed by server id) — it never goes into servers.json.
                 // Cleared when the OAuth section is emptied.

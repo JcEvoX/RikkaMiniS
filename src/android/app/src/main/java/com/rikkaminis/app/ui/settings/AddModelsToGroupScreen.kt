@@ -29,6 +29,7 @@ import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.ui.components.PickerModalityFilter
 import com.rikkaminis.app.ui.components.modelEntryPickerItems
+import com.rikkaminis.app.ui.components.rememberCollapsedInstanceIds
 import com.rikkaminis.app.ui.components.MinisButton
 import com.rikkaminis.app.ui.components.MinisTextButton
 
@@ -67,18 +68,23 @@ fun AddModelsToGroupScreen(
     val searchQuery = remember { mutableStateOf("") }
     var selectedIds by remember { mutableStateOf(setOf<String>()) }
     var quickTestEntry by remember { mutableStateOf<com.rikkaminis.app.data.model.ModelEntry?>(null) }
-    val collapsedInstanceIds = remember(config) {
+    val collapsedInstanceIds = rememberCollapsedInstanceIds(
+        config = config,
         // T185: default-collapsed mirrors pre-refactor behaviour. The
         // shared picker auto-expands when search is non-empty so hits
         // remain visible regardless of section state.
         // [T-android-provider-voice] Voice scenario: DON'T collapse — a
         // multi-voice provider (Azure ~39, MiMo 9) would fold all-but-one
         // voice behind a disclosure (iOS d4e3198f seedCollapse fix).
-        mutableStateOf(
-            if (modalityFilter != null) emptySet()
-            else config.instances.map { it.id }.toSet(),
-        )
-    }
+        //
+        // [deep-audit-v14 ISSUE-05] The state itself now lives in the shared
+        // single source (ModelEntryPicker.rememberCollapsedInstanceIds), keyed
+        // on the instance-id SET instead of on the whole config object: a
+        // config re-emit that does not add/remove an instance (a Quick Test
+        // persisting imageEndpointResolved, refreshModels landing, a DTO →
+        // StateFlow emit) used to reset every open section.
+        defaultExpanded = modalityFilter != null,
+    )
 
     Scaffold(
         topBar = {

@@ -66,24 +66,21 @@ class BrowserHistoryStore private constructor(private val context: Context) {
         }
     }
 
-    fun groupedByDay(): Map<String, List<Entry>> {
-        val cal = java.util.Calendar.getInstance()
-        val today = java.util.Calendar.getInstance()
-        val yesterday = java.util.Calendar.getInstance().apply { add(java.util.Calendar.DAY_OF_YEAR, -1) }
-
+    /**
+     * Group entries into day buckets labelled with caller-supplied strings.
+     *
+     * [deep-audit-v14 ISSUE-08] The bucket labels used to be the English
+     * literals `"Today"` / `"Yesterday"` baked in here, which bypassed every
+     * translation (7 locales ship `browser_history_*` keys): a German user saw
+     * "Today" above a fully German list. The labels are now required
+     * parameters rather than `= "Today"` defaults — a default would let a
+     * caller that forgot to pass them silently fall back to English again,
+     * which is the defect this fixes.
+     */
+    fun groupedByDay(todayLabel: String, yesterdayLabel: String): Map<String, List<Entry>> {
+        val now = System.currentTimeMillis()
         return getEntries().groupBy { entry ->
-            cal.timeInMillis = entry.timestamp
-            when {
-                cal.get(java.util.Calendar.YEAR) == today.get(java.util.Calendar.YEAR) &&
-                    cal.get(java.util.Calendar.DAY_OF_YEAR) == today.get(java.util.Calendar.DAY_OF_YEAR) -> "Today"
-                cal.get(java.util.Calendar.YEAR) == yesterday.get(java.util.Calendar.YEAR) &&
-                    cal.get(java.util.Calendar.DAY_OF_YEAR) == yesterday.get(java.util.Calendar.DAY_OF_YEAR) -> "Yesterday"
-                else -> {
-                    val month = cal.get(java.util.Calendar.MONTH) + 1
-                    val day = cal.get(java.util.Calendar.DAY_OF_MONTH)
-                    "$month/${day}"
-                }
-            }
+            browserHistoryDayLabel(entry.timestamp, now, todayLabel, yesterdayLabel)
         }
     }
 
@@ -165,3 +162,56 @@ private fun extractDomain(url: String): String {
         ""
     }
 }
+
+/**
+ * [deep-audit-v14 ISSUE-08] Localized day-bucket label for one history entry.
+ *
+ * Top-level and pure on purpose: it is the part that used to be hardcoded to
+ * English, and being free of `Context`/Compose it is the one part a JVM unit
+ * test can run for real (`BrowserHistorySheetContractTest`) instead of
+ * asserting on source text. [now] is a parameter so "today"/"yesterday" are
+ * deterministic under test.
+ *
+ * Entries older than yesterday keep the numeric `M/D` form — a real
+ * localized date would need a locale-aware formatter, and the buckets are
+ * already disambiguated by year-agnostic ordering (see `groupedByDay`).
+ */
+internal fun browserHistoryDayLabel(
+    timestamp: Long,
+    now: Long,
+    todayLabel: String,
+    yesterdayLabel: String,
+): String {
+    val cal = java.util.Calendar.getInstance().apply { timeInMillis = timestamp }
+    val today = java.util.Calendar.getInstance().apply { timeInMillis = now }
+    val yesterday = (today.clone() as java.util.Calendar).apply {
+        add(java.util.Calendar.DAY_OF_YEAR, -1)
+    }
+    return when {
+        sameCalendarDay(cal, today) -> todayLabel
+        sameCalendarDay(cal, yesterday) -> yesterdayLabel
+        else -> {
+            val month = cal.get(java.util.Calendar.MONTH) + 1
+            val day = cal.get(java.util.Calendar.DAY_OF_MONTH)
+            "$month/$day"
+        }
+    }
+}
+
+private fun sameCalendarDay(a: java.util.Calendar, b: java.util.Calendar): Boolean =
+    a.get(java.util.Calendar.YEAR) == b.get(java.util.Calendar.YEAR) &&
+        a.get(java.util.Calendar.DAY_OF_YEAR) == b.get(java.util.Calendar.DAY_OF_YEAR)
+
+/**
+ * [deep-audit-v14 ISSUE-08] Identity of the history snapshot a derived list was
+ * built from — `(count, newest entry id)`.
+ *
+ * The sheet keys its `remember` on this instead of on the bare count: a
+ * `record()` that also prunes one entry out of the 7-day window leaves the
+ * count unchanged, and a size-only key cannot see that replacement. Pure, so
+ * `BrowserHistorySheetContractTest` pins the "equal count, different content ⇒
+ * different key" decision on the JVM.
+ */
+internal fun historySnapshotKey(entries: List<BrowserHistoryStore.Entry>): Pair<Int, String?> =
+    entries.size to entries.firstOrNull()?.id
+
