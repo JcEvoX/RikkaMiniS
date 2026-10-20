@@ -1923,57 +1923,39 @@ class ModelExecutionService : Service() {
 
     /**
      * Parse image passthrough extras from the input JSON and apply them to
-     * the [OpenAIProvider]. The passthrough injection used to exist on both
-     * sides (the CLI-side copy was deleted with the in-process fallback in
-     * audit3 F-10); this is now the only one.
+     * the [OpenAIProvider].
+     *
+     * [dv14-A4] ISSUE-08: this used to carry its OWN copy of the dialect — a
+     * private `IMAGE_PASSTHROUGH_RESERVED_KEYS` mirroring the app side's
+     * `imageReservedKeys` (three copies of the same 17 keys, one of them
+     * dead), a local implicit-keys loop, and its own zero-warning
+     * `optJSONObject(…)` read of `extra_body` that dropped a
+     * present-but-not-an-object value — the exact silent shape da1019 fixed
+     * for `extra_headers` (the old comment below about a THIRD copy was true
+     * twice over, and this was one of them).
+     *
+     * [fix/audit-s3m2] Another earlier copy expected an `image_passthrough`
+     * envelope that NO caller ever wrote (dead dialect — grep found that line
+     * as the only reference to the key in the whole repo). The live dialect is
+     * implicit top-level keys (not in the reserved set) + explicit
+     * extra_body / extra_headers / endpoint_path, so passthrough extras
+     * survive the worker path too (e.g. the Seedream image-to-image `image`
+     * body field) instead of being silently dropped.
+     *
+     * All of it now lives in [ModelUseProtocol.parseImagePassthrough] — one
+     * implementation, one key set, and warnings this process can surface.
      */
     private fun applyImagePassthrough(
         openAI: com.rikkaminis.app.provider.openai.OpenAIProvider,
         inputJson: String,
         warnings: MutableList<String>,
     ) {
-        val obj = try { val t = inputJson.trim(); if (t.startsWith("{")) JSONObject(t) else null }
-        catch (_: Exception) { null } ?: return
-        // [fix/audit-s3m2] This reader used to expect an `image_passthrough`
-        // envelope that NO caller ever wrote (dead dialect — grep found this
-        // line as the only reference to the key in the whole repo). The
-        // in-process ModelUseOffloadHandler.parseImagePassthrough uses a
-        // different dialect: implicit top-level keys (not in the reserved
-        // set) + explicit extra_body / extra_headers / endpoint_path. Parse
-        // the SAME dialect here so passthrough extras survive the worker
-        // path too (e.g. Seedream image-to-image `image` body field),
-        // instead of being silently dropped.
-        val body = LinkedHashMap<String, Any?>()
-        for (key in obj.keys()) {
-            if (key in IMAGE_PASSTHROUGH_RESERVED_KEYS) continue
-            body[key] = obj.opt(key)
-        }
-        obj.optJSONObject("extra_body")?.let { eb ->
-            for (key in eb.keys()) body[key] = eb.opt(key)
-        }
-        if (body.isNotEmpty()) openAI.imageExtraBody = body
-        // [da1019 ISSUE-01] This was a THIRD copy of the `extra_headers`
-        // dialect inside the worker: `optJSONObject(...)` meant a
-        // present-but-not-an-object value was dropped without a warning here
-        // as well. One parser now, three call sites.
-        val headers = ModelUseProtocol.parseExtraHeaders(inputJson, warnings)
-        if (headers.isNotEmpty()) openAI.imageExtraHeaders = headers
-        obj.optString("endpoint_path", "").trim().takeIf { it.isNotEmpty() }?.let {
-            openAI.imagePathOverride = it
-        }
+        val spec = ModelUseProtocol.parseImagePassthrough(inputJson)
+        if (spec.body.isNotEmpty()) openAI.imageExtraBody = spec.body
+        if (spec.headers.isNotEmpty()) openAI.imageExtraHeaders = spec.headers
+        spec.endpointPath?.let { openAI.imagePathOverride = it }
+        warnings.addAll(spec.warnings)
     }
-
-    /**
-     * Keys consumed by the image-gen schema itself (parseImageGenConfig) or
-     * the chat schema — mirrors ModelUseOffloadHandler.imageReservedKeys.
-     * Any OTHER top-level key in inputJson folds into the passthrough body.
-     */
-    private val IMAGE_PASSTHROUGH_RESERVED_KEYS: Set<String> = setOf(
-        "messages", "model", "chat_model", "prompt", "n", "number_of_images",
-        "size", "image_size", "quality", "generation_config", "endpoint",
-        "image_endpoint", "endpoint_path", "extra_body", "extra_headers",
-        "stream", "temperature", "max_tokens",
-    )
 }
 
 /**

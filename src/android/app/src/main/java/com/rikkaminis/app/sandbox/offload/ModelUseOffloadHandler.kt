@@ -560,18 +560,14 @@ class ModelUseOffloadHandler(
         )
     }
 
-    /**
-     * Keys the handler already interprets itself — never treated as implicit
-     * passthrough body fields, so existing callers' structure/behavior is
-     * unchanged. (Explicit `extra_body` can still re-introduce any of these.)
-     * Mirrors iOS ModelUseOffloadBridge.imageReservedKeys.
-     */
-    private val imageReservedKeys: Set<String> = setOf(
-        "messages", "model", "chat_model", "prompt", "n", "number_of_images",
-        "size", "image_size", "quality", "generation_config", "endpoint",
-        "image_endpoint", "endpoint_path", "extra_body", "extra_headers",
-        "stream", "temperature", "max_tokens",
-    )
+    // [dv14-A4] ISSUE-08: a private `imageReservedKeys` set used to sit here.
+    // It was DEAD — no call site in this file, and the app process no longer
+    // owns the image route (routing has one owner, `decideImageRoute`, called
+    // by the worker) — but it was the second of three copies of the same
+    // 17-key dialect, so the next change to it would have looked authoritative
+    // and gone nowhere. The set lives in [ModelUseProtocol] only; this file
+    // reads the dialect through [ModelUseProtocol.parseImagePassthrough] when
+    // it needs it at all.
 
     // MARK: - Call feedback [T-model-use-passthrough-warnings]
 

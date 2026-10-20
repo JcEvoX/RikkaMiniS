@@ -23,6 +23,42 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
+ * [dv14-A4] ISSUE-07 — ONE address-line assembly for the three geocode
+ * call sites.
+ *
+ * The handler used to spell this out three times, and the copies had already
+ * drifted: `handleForward` kept `getAddressLine`'s nulls, so a sparse index
+ * rendered the literal `"null"` inside `address`; `geocode` used
+ * `.orEmpty()`, which keeps the empty string, so `joinToString(", ")` emitted
+ * a `", "` gap; `buildLocationJson` was a third, differently-shaped copy of
+ * the structured-field order. (`[da1034-A4]` fixed `geocode` only — this is
+ * the same-family third and second sites.)
+ *
+ * Semantics, in one place:
+ *  1. indexed address lines first — blank/null entries dropped, each surviving
+ *     line trimmed;
+ *  2. if that leaves nothing, the structured placemark fields in display order
+ *     (thoroughfare → subLocality → locality → adminArea → countryName), also
+ *     blank-filtered.
+ *
+ * Deliberately PURE JVM (no `android.location.Address`): the shipped
+ * `LocationAddressFormatTest` drives every branch below on the JVM, so the
+ * normalisation cannot drift back one call site at a time.
+ */
+internal fun normalizedAddressLines(raw: List<String?>, fallback: List<String?>): List<String> {
+    val lines = raw.mapNotNull { it?.trim()?.takeIf { s -> s.isNotEmpty() } }
+    if (lines.isNotEmpty()) return lines
+    return fallback.mapNotNull { it?.trim()?.takeIf { s -> s.isNotEmpty() } }
+}
+
+/**
+ * The structured placemark fields, in display order — listed ONCE for all
+ * three call sites (the order itself was a copy before).
+ */
+private fun structuredAddressFields(addr: android.location.Address): List<String?> =
+    listOf(addr.thoroughfare, addr.subLocality, addr.locality, addr.adminArea, addr.countryName)
+
+/**
  * android-location — current location, reverse geocoding, forward geocoding.
  *
  * Mirrors apple-location (NativeOffloads/LocationOffload.m): same three
@@ -312,12 +348,11 @@ class LocationOffloadHandler(private val context: Context) : NativeOffloadHandle
             val addrs = geocoder.getFromLocation(loc.latitude, loc.longitude, 1)
             val addr = addrs?.firstOrNull()
             if (addr != null) {
-                val parts = mutableListOf<String>()
-                addr.thoroughfare?.takeIf { it.isNotBlank() }?.let { parts.add(it) }
-                addr.subLocality?.takeIf { it.isNotBlank() }?.let { parts.add(it) }
-                addr.locality?.takeIf { it.isNotBlank() }?.let { parts.add(it) }
-                addr.adminArea?.takeIf { it.isNotBlank() }?.let { parts.add(it) }
-                addr.countryName?.takeIf { it.isNotBlank() }?.let { parts.add(it) }
+                // [dv14-A4] ISSUE-07: `Location` carries no indexed address
+                // lines, so this is the structured-fields-only outcome — fed
+                // through the SAME assembler as the two geocode call sites
+                // (this used to be a private third copy of the field order).
+                val parts = normalizedAddressLines(emptyList(), structuredAddressFields(addr))
                 if (parts.isNotEmpty()) json.put("address", parts.joinToString(", "))
             }
         } catch (_: Throwable) {
@@ -354,13 +389,21 @@ class LocationOffloadHandler(private val context: Context) : NativeOffloadHandle
             @Suppress("DEPRECATION")
             val addrs = geocoder.getFromLocation(lat, lon, 1)
             val addr = addrs?.firstOrNull()
-            // getAddressLine returns null for sparse indexes; normalize once so
-            // neither the JSON array nor the text rendering carries a literal
-            // "null" (the old `joinToString("\n")` over nulls printed "null").
+            // [dv14-A4] ISSUE-07: `getAddressLine` returns null for sparse
+            // indexes and "" for blank ones; the shared normaliser drops both,
+            // so neither the JSON array nor the text rendering carries a
+            // literal "null" or an empty ", " segment — and it falls back to
+            // the structured fields when the indexed lines carry nothing.
+            // `addr == null` stays empty on purpose: the [da1034-A4] payload
+            // contract (lines = [] / count = 0 / address = "") is pinned by
+            // OffloadPayloadJsonShapeTest and the offload CLI-args gate.
             val lines = if (addr == null) {
                 emptyList()
             } else {
-                (0..addr.maxAddressLineIndex).map { addr.getAddressLine(it).orEmpty() }
+                normalizedAddressLines(
+                    (0..addr.maxAddressLineIndex).map { addr.getAddressLine(it) },
+                    structuredAddressFields(addr),
+                )
             }
             NativeOffloadResult(
                 0,
@@ -438,7 +481,15 @@ class LocationOffloadHandler(private val context: Context) : NativeOffloadHandle
                 return NativeOffloadResult(1, OffloadOutput.formatBody(body, args) + "\n")
             }
             AppLogger.info(TAG, "forward: '$address' → ${addr.latitude},${addr.longitude}")
-            val lines = (0..addr.maxAddressLineIndex).map { addr.getAddressLine(it) }
+            // [dv14-A4] ISSUE-07: this was the copy that kept the nulls —
+            // `(0..maxAddressLineIndex).map { getAddressLine(it) }` produced a
+            // List<String?> and `joinToString(", ")` printed the literal
+            // "null" for every sparse index. Same assembler and same
+            // structured-fields fallback as `geocode` now.
+            val lines = normalizedAddressLines(
+                (0..addr.maxAddressLineIndex).map { addr.getAddressLine(it) },
+                structuredAddressFields(addr),
+            )
             val data = JSONObject()
                 .put("latitude", addr.latitude)
                 .put("longitude", addr.longitude)
