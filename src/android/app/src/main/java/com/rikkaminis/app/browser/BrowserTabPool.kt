@@ -1220,6 +1220,11 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
         currentTabs.add(tab)
         _tabs.value = currentTabs
         _selectedTabId.value = id
+        // [dv16-B7] window.open has no follow-up save path — persist now or
+        // the new tab (and the selected-id switch) resurrects from the stale
+        // state file on reload. Same position as closeTabFromUI: after all
+        // state assignments, before anything else consumes the result.
+        saveState()
 
         // Send the WebView transport back
         val transport = resultMsg.obj as? WebView.WebViewTransport
@@ -1239,6 +1244,11 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
             if (_selectedTabId.value == closedId && currentTabs.isNotEmpty()) {
                 _selectedTabId.value = currentTabs.first().id
             }
+            // [dv16-B7] window.close triggers no later save — persist now or
+            // the closed tab (and the stale selectedTabId) stay in the state
+            // file and resurrect on reload. destroyTab already removed the
+            // URL from savedURLs, so the persisted JSON drops it too.
+            saveState()
             Log.i(TAG, "window.close → destroyed tab $closedId")
         }
     }
