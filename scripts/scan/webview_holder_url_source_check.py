@@ -250,6 +250,16 @@ def analyse(holder_code, sheet_code, gallery_code=None):
             results.append(("W5d mobile else branch consumes mobileViewportSettings()", consumes,
                             "deleting the restore is RED (body must go through the "
                             "single-sourced policy)", None))
+            # A negation at the consumption site flips the polarity just as
+            # hard as a `false` literal did, and the policy value itself stays
+            # green — this arm is what catches it (m7 mutation). Scope: the
+            # two viewport fields only; `desktopMode = !desktopMode` is the
+            # toggle itself and must not trip it.
+            neg = re.search(r"(useWideViewPort|loadWithOverviewMode)\s*=\s*!", body)
+            results.append(("W5e toggleDesktopMode assigns the policy without negation",
+                            neg is None,
+                            "negated assignment (%r) inverts the mobile viewport "
+                            "again" % (neg.group(0) if neg else ""), None))
 
     # --- W6: gallery window contract (dv14-B1) ---
     if gallery_code is not None:
@@ -408,6 +418,19 @@ internal fun mobileViewportSettings(): MobileViewportSettings =
     MobileViewportSettings(useWideViewPort = true, loadWithOverviewMode = true, initialScale = 0)
 """
 
+DESKTOP_NEGATED_HOLDER = GOOD_HOLDER + """
+class DesktopHolder {
+    fun toggleDesktopMode() {
+        val mobile = mobileViewportSettings()
+        webView.settings.useWideViewPort = !mobile.useWideViewPort
+        webView.settings.loadWithOverviewMode = !mobile.loadWithOverviewMode
+        webView.setInitialScale(mobile.initialScale)
+    }
+}
+internal fun mobileViewportSettings(): MobileViewportSettings =
+    MobileViewportSettings(useWideViewPort = true, loadWithOverviewMode = true, initialScale = 0)
+"""
+
 # ---- dv14-B1 fixtures: W6 (gallery window contract) ------------------------
 
 GALLERY_GOOD = """package probe
@@ -520,6 +543,16 @@ def selftest():
     # plain holder (no toggleDesktopMode) must produce NO W5 criteria
     expect(not any(c.startswith("W5") for c, _, _, _ in analyse(GOOD_HOLDER, GOOD_SHEET)),
            "holder without toggleDesktopMode must not emit W5 criteria")
+
+    # bad: policy consumption negated — only W5e RED (the policy itself is
+    # still correct, so W5a/W5c/W5d must stay green: this is the arm that
+    # exists precisely because nothing else catches a polarity negation)
+    dneg = dict((c, ok) for c, ok, _, _ in analyse(DESKTOP_NEGATED_HOLDER, GOOD_SHEET))
+    for c, ok in dneg.items():
+        if c == "W5e toggleDesktopMode assigns the policy without negation":
+            expect(not ok, "negated fixture: %s must be RED" % c)
+        elif c.startswith("W5"):
+            expect(ok, "negated fixture: %s must stay OK" % c)
 
     # ---- dv14-B1: W6 fixtures ----
     dgal = analyse(GOOD_HOLDER, GOOD_SHEET, GALLERY_GOOD)
