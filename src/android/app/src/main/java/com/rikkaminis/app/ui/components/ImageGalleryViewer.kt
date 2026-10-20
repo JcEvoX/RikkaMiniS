@@ -1,6 +1,5 @@
 package com.rikkaminis.app.ui.components
 
-import android.view.WindowManager
 import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
@@ -123,11 +122,17 @@ fun ImageGalleryViewer(
     // for why we don't touch decorFitsSystemWindows on the activity
     // window.
     DisposableEffect(Unit) {
-        // [fix/render-ui F-271] Was `(view.context as? android.app.Activity)?.window`,
-        // which is always null here: `view` is the *dialog's* AndroidComposeView
-        // and the dialog's context chain is ContextThemeWrapper(ContextThemeWrapper(…)),
-        // never an Activity. The walker below is the working form.
-        val window = findDialogWindow(view)
+        // The window controlled here is the HOST activity window: `view` is
+        // the host composition's view (LocalView.current evaluated before
+        // the Dialog below composes), so its context chain reaches the
+        // Activity. The dialog's own view is handled by the inner effect —
+        // only there does the parent chain contain a DialogWindowProvider.
+        // [fix/render-ui F-271] replaced this with findDialogWindow(view),
+        // but the host view's parent chain (ContentFrameLayout →
+        // FitWindowsLinearLayout → DecorView) never contains one, so
+        // `window` was null on every entry and this whole block — hide and
+        // restore — was a silent no-op.
+        val window = (view.context as? android.app.Activity)?.window
         val controller = window?.let { WindowInsetsControllerCompat(it, view) }
         val prevLightStatus = controller?.isAppearanceLightStatusBars
         val prevLightNav = controller?.isAppearanceLightNavigationBars
@@ -179,7 +184,7 @@ fun ImageGalleryViewer(
         DisposableEffect(dialogView) {
             val win = findDialogWindow(dialogView)
             win?.let { w ->
-                w.addFlags(WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS)
+                w.addFlags(galleryDialogWindowFlags())
                 WindowCompat.setDecorFitsSystemWindows(w, false)
                 @Suppress("DEPRECATION")
                 w.statusBarColor = android.graphics.Color.TRANSPARENT
@@ -421,6 +426,18 @@ private fun GalleryPage(
         )
     }
 }
+
+/**
+ * Flags the gallery's Dialog window needs:
+ *  - FLAG_LAYOUT_NO_LIMITS: let the pager extend under the display cutout;
+ *  - FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS: tell the system THIS window paints
+ *    the status/nav-bar background itself — without it the dialog leaves a
+ *    grey band under the status bar even with statusBarColor = TRANSPARENT
+ *    (same contract as WebPreviewFullscreenScreen / WebPreviewBottomSheet).
+ */
+internal fun galleryDialogWindowFlags(): Int =
+    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+        android.view.WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS
 
 /**
  * [fix/render-ui F-271] Find the hosting `Window` of a Compose `Dialog`.

@@ -349,9 +349,10 @@ class WebViewHolder(
             applyShrinkToFit(DESKTOP_VIEWPORT_CSS_WIDTH)
         } else {
             webView.settings.userAgentString = mobileUserAgent
-            webView.settings.useWideViewPort = false
-            webView.settings.loadWithOverviewMode = false
-            webView.setInitialScale(0)
+            val mobile = mobileViewportSettings()
+            webView.settings.useWideViewPort = mobile.useWideViewPort
+            webView.settings.loadWithOverviewMode = mobile.loadWithOverviewMode
+            webView.setInitialScale(mobile.initialScale)
         }
         AppLogger.info(TAG, "toggleDesktopMode → $desktopMode")
         // Clear cache so the site can't serve a cached variant keyed on the
@@ -453,6 +454,24 @@ class WebViewHolder(
 // makes stubbed `Uri.parse` return null instead of throwing, so a test built on
 // `android.net.Uri` would pass while testing nothing.
 // --- begin asset-loader-url-mapping (JVM harness slices this region verbatim) ---
+
+/**
+ * Mobile preview viewport contract, single-sourced so the desktop-toggle
+ * path cannot drift from the init defaults (:127-128): honor the page's
+ * `<meta name="viewport">` (useWideViewPort) and shrink-to-fit
+ * (loadWithOverviewMode), scale reset. Toggling Desktop → Mobile used to
+ * set both to `false` — the exact opposite of the init defaults — which
+ * collapsed `100vh` pages to a zero-height box and locked the layout to a
+ * narrow viewport until the holder was rebuilt (T-htmlpreview-2d5c4f3d).
+ */
+internal data class MobileViewportSettings(
+    val useWideViewPort: Boolean,
+    val loadWithOverviewMode: Boolean,
+    val initialScale: Int,
+)
+
+internal fun mobileViewportSettings(): MobileViewportSettings =
+    MobileViewportSettings(useWideViewPort = true, loadWithOverviewMode = true, initialScale = 0)
 
 internal const val ASSET_LOADER_HOST = "appassets.androidplatform.net"
 
