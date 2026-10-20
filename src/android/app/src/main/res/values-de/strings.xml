@@ -540,6 +540,9 @@
     <string name="browser_history_clear">Löschen</string>
     <string name="browser_history_done">Fertig</string>
     <string name="browser_history_search">Verlauf durchsuchen</string>
+    <string name="browser_history_today">Heute</string>
+    <string name="browser_history_yesterday">Gestern</string>
+    <string name="browser_history_results">Ergebnisse</string>
     <string name="browser_history_empty_title">Kein Browserverlauf</string>
     <string name="browser_history_empty_subtitle">Verlauf wird 7 Tage aufbewahrt</string>
     <string name="browser_history_clear_dialog_title">Browserverlauf löschen?</string>

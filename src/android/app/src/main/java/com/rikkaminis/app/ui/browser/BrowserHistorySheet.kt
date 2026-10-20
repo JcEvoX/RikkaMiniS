@@ -57,9 +57,32 @@ fun BrowserHistorySheet(
     var searchQuery by remember { mutableStateOf("") }
     var showClearConfirm by remember { mutableStateOf(false) }
 
-    val entries = remember(searchQuery, historyStore.getEntries().size) {
-        if (searchQuery.isBlank()) historyStore.groupedByDay()
-        else mapOf("Results" to historyStore.search(searchQuery))
+    val todayLabel = stringResource(R.string.browser_history_today)
+    val yesterdayLabel = stringResource(R.string.browser_history_yesterday)
+    val resultsLabel = stringResource(R.string.browser_history_results)
+
+    // [deep-audit-v14 ISSUE-08] The store is a plain in-memory list with no
+    // observable revision, so the sheet owns the refresh signal.
+    //
+    // Before: `remember(searchQuery, historyStore.getEntries().size)` read the
+    // whole store — a full sort + copy — three times per recomposition (the
+    // key here, the body again, and the Clear button's `enabled`), and a
+    // size-only key cannot see an equal-length replacement (a record that
+    // pushes one out of the 7-day window leaves the count unchanged, so the
+    // list went stale). Now the store is read ONCE per refresh tick and the
+    // list is keyed on the snapshot's identity — see `historySnapshotKey`.
+    var historyRefreshTick by remember { mutableStateOf(0) }
+    val allEntries = remember(historyRefreshTick) { historyStore.getEntries() }
+
+    val entries = remember(
+        searchQuery,
+        todayLabel,
+        yesterdayLabel,
+        resultsLabel,
+        historySnapshotKey(allEntries),
+    ) {
+        if (searchQuery.isBlank()) historyStore.groupedByDay(todayLabel, yesterdayLabel)
+        else mapOf(resultsLabel to historyStore.search(searchQuery))
     }
 
     ModalBottomSheet(
@@ -87,7 +110,7 @@ fun BrowserHistorySheet(
                 )
                 MinisTextButton(
                     onClick = { showClearConfirm = true },
-                    enabled = historyStore.getEntries().isNotEmpty(),
+                    enabled = allEntries.isNotEmpty(),
                 ) {
                     Text(stringResource(R.string.browser_history_clear), color = MaterialTheme.colorScheme.error)
                 }
@@ -199,6 +222,10 @@ fun BrowserHistorySheet(
             confirmButton = {
                 MinisTextButton(onClick = {
                     historyStore.clear()
+                    // [deep-audit-v14 ISSUE-08] the store just changed under the
+                    // snapshot above — without this the list would keep showing
+                    // the cleared entries until the sheet is reopened.
+                    historyRefreshTick++
                     showClearConfirm = false
                 }) {
                     Text(stringResource(R.string.browser_history_clear), color = MaterialTheme.colorScheme.error)

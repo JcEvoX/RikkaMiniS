@@ -467,6 +467,9 @@
     <string name="browser_history_clear">Clear</string>
     <string name="browser_history_done">Done</string>
     <string name="browser_history_search">Search history</string>
+    <string name="browser_history_today">Today</string>
+    <string name="browser_history_yesterday">Yesterday</string>
+    <string name="browser_history_results">Results</string>
     <string name="browser_history_empty_title">No browsing history</string>
     <string name="browser_history_empty_subtitle">History is kept for 7 days</string>
     <string name="browser_history_clear_dialog_title">Clear Browsing History?</string>

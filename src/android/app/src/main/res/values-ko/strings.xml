@@ -540,6 +540,9 @@
     <string name="browser_history_clear">지우기</string>
     <string name="browser_history_done">완료</string>
     <string name="browser_history_search">기록 검색</string>
+    <string name="browser_history_today">오늘</string>
+    <string name="browser_history_yesterday">어제</string>
+    <string name="browser_history_results">검색 결과</string>
     <string name="browser_history_empty_title">브라우징 기록 없음</string>
     <string name="browser_history_empty_subtitle">기록은 7일 동안 보관됩니다</string>
     <string name="browser_history_clear_dialog_title">브라우징 기록을 지우시겠습니까?</string>
