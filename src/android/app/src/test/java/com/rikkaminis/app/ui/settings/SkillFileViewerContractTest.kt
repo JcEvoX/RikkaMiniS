@@ -15,38 +15,50 @@ import java.io.FileNotFoundException
  * a Save could overwrite the real file with "").
  *
  * Two layers:
- *  1. the pure isSkillMd × loaded matrix ([skillFileViewerContent]) — real
- *     JVM execution, expected values hardcoded literals (never derived from
- *     the code under test, so a mutation cannot masquerade as PASS);
+ *  1. the pure isSkillMd × loaded matrix ([skillFileViewerBase]) — real JVM
+ *     execution, expected values hardcoded literals (never derived from the
+ *     code under test, so a mutation cannot masquerade as PASS);
  *  2. the wiring shape — source-shape assertions independently reimplemented
  *     (not shared with the scan gate's helpers), the same approach
  *     SkillFileViewerSaveShapeTest uses for the save path.
  *
- * Regression anchors (must keep passing): the save contract
- * `val ok = withContext(Dispatchers.IO)` + `if (ok)` guard + the
- * `preferredId = skillId` pin.
+ * Regression anchors: the literals a frozen reader test pins
+ * (SkillsMcpReloadOffMainTest.savePathLiterals_untouched /
+ * initialContentAnchorLiteral_survives) plus the save contract
+ * `val ok = withContext(Dispatchers.IO)` + `if (ok)` + `preferredId = skillId`.
  */
 class SkillFileViewerContractTest {
 
     // -- ① pure matrix: what the viewer shows / what the Edit button seeds --
 
     @Test
-    fun skillMd_alwaysRendersTheFrontmatterMerge() {
+    fun skillMd_rendersTheFrontmatterMerge() {
         // SKILL.md: the in-memory merge is the source of truth; the disk base
         // is irrelevant (never read).
-        assertEquals("merged-body", skillFileViewerContent(true, "merged-body", null))
-        assertEquals("merged-body", skillFileViewerContent(true, "merged-body", "disk-text"))
-        assertEquals("", skillFileViewerContent(true, "", "disk-text"))
+        assertEquals("merged-body", skillFileViewerBase(true, { "merged-body" }, null))
+        assertEquals("merged-body", skillFileViewerBase(true, { "merged-body" }, "disk-text"))
+        assertEquals("", skillFileViewerBase(true, { "" }, "disk-text"))
     }
 
     @Test
     fun siblingFile_rendersTheLoadedDiskBase() {
         // Sibling files: the asynchronously loaded base is the source of
         // truth; blank until it lands (and a stale merge is never shown).
-        assertEquals("disk-text", skillFileViewerContent(false, "", "disk-text"))
-        assertEquals("disk-text", skillFileViewerContent(false, "merged", "disk-text"))
-        assertEquals("", skillFileViewerContent(false, "", null))
-        assertEquals("", skillFileViewerContent(false, "merged", null))
+        assertEquals("disk-text", skillFileViewerBase(false, { "merged" }, "disk-text"))
+        assertEquals("", skillFileViewerBase(false, { "merged" }, null))
+    }
+
+    @Test
+    fun skillMd_neverPaysForTheDiskRead_andSiblingsNeverMerge() {
+        // Lazy contract: the merge is evaluated only for SKILL.md, and a
+        // sibling never touches it (there is nothing to merge off).
+        var mergeCalls = 0
+        assertEquals("merged", skillFileViewerBase(true, { mergeCalls++; "merged" }, null))
+        assertEquals(1, mergeCalls)
+
+        mergeCalls = 0
+        assertEquals("disk", skillFileViewerBase(false, { mergeCalls++; "merged" }, "disk"))
+        assertEquals(0, mergeCalls)
     }
 
     // -- ② wiring shape: async read + Edit gate (source-shape assertions) --
@@ -110,17 +122,29 @@ class SkillFileViewerContractTest {
         // The Edit action must be disabled until the read lands.
         val editIdx = segment.indexOf("skill_file_edit")
         assertTrue("screen must host the Edit action", editIdx >= 0)
-        val button = segment.substring(
-            maxOf(0, editIdx - 600),
-            editIdx,
-        )
+        val button = segment.substring(maxOf(0, editIdx - 600), editIdx)
         assertTrue(
             "Edit MinisTextButton must carry enabled = isLoaded",
             button.contains("enabled = isLoaded"),
         )
     }
 
-    // -- ③ regression anchors: the save contract is untouched --
+    // -- ③ regression anchors: literals a frozen reader test pins + the save
+    //       contract must be untouched --
+
+    @Test
+    fun frozenReaderLiterals_survive() {
+        for (literal in listOf(
+            "val initialContent = remember(",
+            "editContent = initialContent",
+            "val contentToSave = editContent",
+        )) {
+            assertTrue(
+                "literal pinned by SkillsMcpReloadOffMainTest must survive: $literal",
+                screen.contains(literal),
+            )
+        }
+    }
 
     @Test
     fun saveContract_untouched() {
