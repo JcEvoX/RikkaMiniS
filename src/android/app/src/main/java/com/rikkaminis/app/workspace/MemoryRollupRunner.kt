@@ -18,7 +18,6 @@ class MemoryRollupRunner(
 ) {
     companion object {
         private const val TAG = "MemoryRollupRunner"
-        private val DATE_FILE_PATTERN = Regex("\\d{4}-\\d{2}-\\d{2}")
         const val DEFAULT_FILE_NAME = MemoryRollupEngine.ROLLUP_FILE
     }
 
@@ -129,17 +128,20 @@ class MemoryRollupRunner(
 
         val eligible = files
             .mapNotNull { f ->
-                val datePart = f.name.removeSuffix(".md")
-                if (!DATE_FILE_PATTERN.matches(datePart)) return@mapNotNull null
-                if (datePart >= todayStr) return@mapNotNull null // today or future — still being written
-                if (f.length() == 0L) return@mapNotNull null
-                if (MemoryRollupEngine.hasRollupForDate(rollupContent, datePart)) return@mapNotNull null
+                // [dv15-A4] Candidacy judged by the shared predicate — the same
+                // one the prompt-side size hint uses (MemoryRepository
+                // .dailyLogSizes). Both sides used to spell the date shape and
+                // the "already distilled" cutoff themselves, and the hint's copy
+                // had lost them.
+                if (!MemoryRollupEngine.isRollupCandidate(f.name, f.length(), todayStr, rollupContent)) {
+                    return@mapNotNull null
+                }
                 val text = runCatching { f.readText() }.getOrNull() ?: return@mapNotNull null
                 val entries = MemoryRollupEngine.extractEntries(text)
                 if (entries.none { MemoryRollupEngine.classify(it) != MemoryRollupEngine.RollupClass.TRANSIENT }) {
                     return@mapNotNull null
                 }
-                f to datePart
+                f to f.name.removeSuffix(".md")
             }
             .sortedWith(compareByDescending<Pair<File, String>> { it.first.length() }.thenBy { it.second })
 
@@ -150,10 +152,10 @@ class MemoryRollupRunner(
         // than a misleading "no log" result.
         return files
             .mapNotNull { f ->
-                val datePart = f.name.removeSuffix(".md")
-                if (!DATE_FILE_PATTERN.matches(datePart)) return@mapNotNull null
-                if (datePart >= todayStr || f.length() == 0L) return@mapNotNull null
-                f to datePart
+                if (!MemoryRollupEngine.isPastDailyLog(f.name, f.length(), todayStr)) {
+                    return@mapNotNull null
+                }
+                f to f.name.removeSuffix(".md")
             }
             .sortedWith(compareByDescending<Pair<File, String>> { it.first.length() }.thenBy { it.second })
             .firstOrNull()
