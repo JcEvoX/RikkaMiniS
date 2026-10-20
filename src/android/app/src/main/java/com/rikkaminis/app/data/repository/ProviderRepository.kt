@@ -2514,36 +2514,33 @@ class ProviderRepository(private val context: Context) {
             resolvedLabel = "$label ($suffix)"
         }
 
-        val customBaseURL = dict.optString("customBaseURL", "").ifEmpty { null }
-        val appendV1 = dict.optBoolean("appendV1Suffix", true)
-        val useResponsesAPI = dict.optBoolean("useResponsesAPI", false)
         // [T-provider-custom-user-agent] Additive: old exports lack the key →
         // empty → null → default UA. Field name matches iOS.
-        val customUserAgent = dict.optString("customUserAgent", "").ifEmpty { null }
         // [RC5 / P0-pinned + GH#68] Restore the run-config fields written by
         // [exportInstanceJSON]. Each defaults to the model's own default when
         // the key is absent (old backup) so nothing crashes and a legacy
         // restore behaves exactly as before. Enum names parsed via
         // runCatching + fallback, mirroring ProviderConfigMapping — an unknown
         // enum name from a future build degrades to auto / no cache instead of
-        // throwing away the whole import. Delegated to the pure
-        // [readRunConfigFields] seam so the round-trip is JVM-testable.
-        val rc = readRunConfigFields(dict)
+        // throwing away the whole import. [fix/dv16-a A-08] The decode lives
+        // in the shared [readImportInstanceFields] seam so the merge path
+        // (same-(type,label) restore) decodes identical fields.
+        val f = readImportInstanceFields(dict)
 
         val instance = ProviderInstance(
             id = java.util.UUID.randomUUID().toString(),
             label = resolvedLabel,
             providerType = providerType,
             credentialType = credentialType,
-            customBaseURL = customBaseURL,
-            appendV1Suffix = appendV1,
-            useResponsesAPI = useResponsesAPI,
-            customUserAgent = customUserAgent,
-            isEnabled = rc.isEnabled,
-            azureMode = rc.azureMode,
-            imageEndpointMode = rc.imageEndpointMode,
-            imageEndpointResolved = rc.imageEndpointResolved,
-            pinned = rc.pinned,
+            customBaseURL = f.customBaseURL,
+            appendV1Suffix = f.appendV1Suffix,
+            useResponsesAPI = f.useResponsesAPI,
+            customUserAgent = f.customUserAgent,
+            isEnabled = f.runConfig.isEnabled,
+            azureMode = f.runConfig.azureMode,
+            imageEndpointMode = f.runConfig.imageEndpointMode,
+            imageEndpointResolved = f.runConfig.imageEndpointResolved,
+            pinned = f.runConfig.pinned,
             // [T-fix-backup-field-evap] Restore the original creation time.
             // Old backups lack the key → fall back to now() so a legacy
             // restore behaves exactly as before. Positive guard: a malformed
@@ -2716,11 +2713,15 @@ class ProviderRepository(private val context: Context) {
      *   - models are upserted by baseModel.id: models the existing instance
      *     lacks are added, models it already has are reused as-is (the local
      *     overrides / customizations win);
-     *   - credentials (apiKey / OAuth / base URL) ARE written onto the
-     *     existing instance via [importInstanceCredentials] — a restore is a
-     *     restore. (An earlier revision of this doc claimed they were
-     *     deliberately NOT touched; that was stale — the code has always
-     *     written them.)
+     *   - credentials (the backup's apiKey — the only credential field
+     *     [importInstanceCredentials] writes) ARE written onto the existing
+     *     instance — a restore is a restore. (An earlier revision of this doc
+     *     claimed they were deliberately NOT touched; that was stale — the
+     *     code has always written them. [fix/dv16-a A-08] The instance-config
+     *     fields (customBaseURL / appendV1Suffix / useResponsesAPI /
+     *     customUserAgent + the five run-config fields) are now written too,
+     *     through the shared [applyImportInstanceFields] face — an earlier
+     *     revision dropped them on this merge path.)
      *
      * @param srcEntryIds the backup-layer `_entryIds` annotation, positionally
      *   paired with the `models` array (same append order — visible and hidden
@@ -2734,9 +2735,12 @@ class ProviderRepository(private val context: Context) {
     /**
      * [T-backup-dedup] Merge an exported provider JSON into the existing
      * instance with the same (type, label), returning its id and a source
-     * entry id → restored entry id map. The backup's credentials (apiKey /
-     * OAuth / Gemini account) are always written onto the existing instance —
-     * a restore is a restore.
+     * entry id → restored entry id map. The backup's credentials (the
+     * apiKey — the only credential field [importInstanceCredentials] writes)
+     * are always written onto the existing instance —
+     * a restore is a restore. [fix/dv16-a A-08] The instance-config fields the
+     * append path decodes are now applied too, through the shared
+     * [applyImportInstanceFields] face.
      */
     fun mergeImportInstanceJSON(
         jsonStr: String,
@@ -2756,6 +2760,19 @@ class ProviderRepository(private val context: Context) {
         // keys with it even when the provider already exists under the same
         // label.
         importInstanceCredentials(dict, existing)
+
+        // [fix/dv16-a A-08] A restore is a restore: the instance-config fields
+        // the append path decodes (customBaseURL / appendV1Suffix /
+        // useResponsesAPI / customUserAgent + the five run-config fields) are
+        // applied onto the existing instance too — through the same shared
+        // write face ([readImportInstanceFields] / [applyImportInstanceFields]),
+        // so a same-(type,label) restore no longer drops them. Same
+        // restore-is-restore contract as the credentials above: the backup's
+        // values win over the local ones (the user's revert path is to edit
+        // the field after the restore, or to re-import after re-editing).
+        val fields = readImportInstanceFields(dict)
+        val updated = applyImportInstanceFields(existing, fields)
+        if (updated != existing) updateInstance(updated)
 
         val entries = parseImportedModelEntries(dict, existing.id)
         val entryMap = HashMap<String, String>()
@@ -2867,6 +2884,60 @@ internal fun readRunConfigFields(dict: org.json.JSONObject): RunConfigSnapshot {
         pinned = dict.optBoolean(RCF_PINNED, false),
     )
 }
+
+// --- [fix/dv16-a A-08] Shared instance-field decode / write face for the two
+// backup restore paths. Top-level in this file (not a ProviderRepository
+// method) so the JVM round-trip tests can drive it without a Context. ---
+
+/**
+ * Single decode point for the instance-config fields of an exported provider
+ * JSON payload — customBaseURL / appendV1Suffix / useResponsesAPI /
+ * customUserAgent + the five run-config fields ([readRunConfigFields]).
+ * Shared by [importInstanceJSON] (fresh append) and [mergeImportInstanceJSON]
+ * (same (type, label) merge) so the two restore paths cannot drift: a field
+ * decoded on the append path decodes identically on the merge path. Before
+ * this seam the merge path decoded NONE of these, so a same-(type,label)
+ * restore silently dropped the user's base URL / format toggles / run-config.
+ */
+internal data class ImportInstanceFields(
+    val customBaseURL: String?,
+    val appendV1Suffix: Boolean,
+    val useResponsesAPI: Boolean,
+    val customUserAgent: String?,
+    val runConfig: RunConfigSnapshot,
+)
+
+internal fun readImportInstanceFields(dict: org.json.JSONObject): ImportInstanceFields =
+    ImportInstanceFields(
+        customBaseURL = dict.optString("customBaseURL", "").ifEmpty { null },
+        appendV1Suffix = dict.optBoolean("appendV1Suffix", true),
+        useResponsesAPI = dict.optBoolean("useResponsesAPI", false),
+        customUserAgent = dict.optString("customUserAgent", "").ifEmpty { null },
+        runConfig = readRunConfigFields(dict),
+    )
+
+/**
+ * Apply the decoded instance-config fields onto [base]. Copy-on-write:
+ * returns a NEW instance, never mutates the caller's object (the object the
+ * config store hands back is the live instance concurrent readers iterate).
+ * Deliberately touches ONLY the restore fields — id / label / providerType /
+ * credentialType / createdAt (the merge match key and the live instance's
+ * identity) are untouched, so the "同名同类型 ⇒ 合并" matching and the
+ * caller-resolved label stay intact.
+ */
+internal fun applyImportInstanceFields(base: ProviderInstance, f: ImportInstanceFields): ProviderInstance =
+    base.copy(
+        customBaseURL = f.customBaseURL,
+        appendV1Suffix = f.appendV1Suffix,
+        useResponsesAPI = f.useResponsesAPI,
+        customUserAgent = f.customUserAgent,
+        isEnabled = f.runConfig.isEnabled,
+        azureMode = f.runConfig.azureMode,
+        imageEndpointMode = f.runConfig.imageEndpointMode,
+        imageEndpointResolved = f.runConfig.imageEndpointResolved,
+        pinned = f.runConfig.pinned,
+    )
+
 
 // --- [da1023-C] Pure entry-key / compact-pin decision helpers. Top-level in
 // this file (not ProviderRepositoryUtils.kt, which other 1023 fix branches

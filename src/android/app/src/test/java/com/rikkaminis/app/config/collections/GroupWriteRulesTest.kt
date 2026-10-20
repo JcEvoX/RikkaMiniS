@@ -126,4 +126,24 @@ class GroupWriteRulesTest {
         assertEquals(null as Int?, g.contextLimitTokens)
         assertEquals(Integer.valueOf(64000), g.lastContextLimitTokens)
     }
+
+    // [fix/dv16-a A-06] The RPC groups.update face routes its context-limit
+    // clear through the same composition the collection uses (mutatedGroupCopy
+    // + applyContextLimitWrite) — pin the composition: clearing on the working
+    // copy keeps the memory, and the live object the caller fetched is
+    // untouched. Before the fix the update face nulled lastContextLimitTokens,
+    // so a CLI write + an OFF→ON toggle round-trip snapped back to the 128K
+    // default instead of the last value the user set.
+    @Test
+    fun `clear via mutatedGroupCopy keeps the memory the update face restores`() {
+        val g = group()
+        g.contextLimitTokens = 64000
+        g.lastContextLimitTokens = 64000
+        val working = mutatedGroupCopy(g) { applyContextLimitWrite(it, 0) }
+        assertEquals(null as Int?, working.contextLimitTokens)
+        assertEquals(Integer.valueOf(64000), working.lastContextLimitTokens)
+        // the live object is untouched (copy-on-mutate contract)
+        assertEquals(Integer.valueOf(64000), g.contextLimitTokens)
+        assertEquals(Integer.valueOf(64000), g.lastContextLimitTokens)
+    }
 }

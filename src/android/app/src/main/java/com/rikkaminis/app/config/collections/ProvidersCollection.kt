@@ -10,6 +10,7 @@ import com.rikkaminis.app.config.fields.ClosureField
 import com.rikkaminis.app.config.fields.HiddenField
 import com.rikkaminis.app.config.fields.ReadOnlyField
 import com.rikkaminis.app.data.model.ProviderCredential
+import com.rikkaminis.app.data.model.ImageEndpointMode
 import com.rikkaminis.app.data.model.ProviderInstance
 import com.rikkaminis.app.data.model.ProviderType
 import com.rikkaminis.app.data.repository.EnvVarRepository
@@ -68,6 +69,8 @@ class ProvidersCollection(
             appendV1Suffix(forId),
             useResponsesAPI(forId),
             azureMode(forId),
+            imageEndpointMode(forId),
+            imageEndpointResolved(forId),
             customUserAgent(forId),
             apiKeyField(forId),
             // OAuth token stays fully hidden — the flow is browser-driven
@@ -138,6 +141,19 @@ class ProvidersCollection(
         val useResponsesAPI = (obj["useResponsesAPI"] as? ConfigValue.Bool)?.value ?: false
         val azureMode = (obj["azureMode"] as? ConfigValue.Bool)?.value ?: false
 
+        // [fix/dv16-a A-07] Optional image-endpoint fields — the same key set
+        // the debug `provider.instances.create` accepts (gate C14 pins the two
+        // write faces to the same keys). Absent = auto / no cached probe (the
+        // current defaults). Same wire tokens as the per-instance field below;
+        // imageEndpointResolved stays at its null default (a fresh instance
+        // has no cached probe result).
+        val imageEndpointMode = (obj["imageEndpointMode"] as? ConfigValue.Str)?.value?.let { raw ->
+            imageEndpointModeFromToken(raw)
+                ?: throw ConfigError.InvalidValue(
+                    "imageEndpointMode must be auto | images_generations | chat_completions (got '$raw')"
+                )
+        } ?: ImageEndpointMode.auto
+
         // [fix/da1020-memory-gate-provider-fields] Same credential rule as the
         // per-instance write field — shared via [customUserAgentWritable], not
         // a second copy. A supplied-but-empty value is treated as absent
@@ -161,6 +177,7 @@ class ProvidersCollection(
             appendV1Suffix = appendV1Suffix,
             useResponsesAPI = useResponsesAPI,
             azureMode = azureMode,
+            imageEndpointMode = imageEndpointMode,
             customUserAgent = customUserAgent,
         )
         repo.addInstance(instance)
@@ -354,6 +371,80 @@ class ProvidersCollection(
                 mutate(id) { it.copy(azureMode = b) }
             },
         )
+
+    // [fix/dv16-a A-07] Image endpoint mode. Mirrors azureMode above; the
+    // write face accepts the same wire tokens as the debug
+    // provider.instances.create/update (gate C14 pins the two write faces to
+    // the same key set) and forcing a non-auto mode clears the cached probe
+    // result — the same decision the update face and the picker UI make, so a
+    // stale auto-probe cannot shadow the user's choice.
+    private fun imageEndpointMode(id: String): ConfigField =
+        ClosureField(
+            path = "providers.$id.imageEndpointMode",
+            displayName = "Image endpoint mode",
+            description = "How image-generation requests are sent: auto (probe) / images_generations / chat_completions.",
+            valueSchema = ConfigSchema.StrEnum(listOf("auto", "images_generations", "chat_completions")),
+            risk = ConfigRisk.NORMAL,
+            revertable = true,
+            reader = {
+                val inst = repo.instance(id) ?: return@ClosureField ConfigValue.Null
+                ConfigValue.Str(imageEndpointModeToToken(inst.imageEndpointMode))
+            },
+            writer = { v ->
+                val s = (v as? ConfigValue.Str)?.value ?: throw ConfigError.TypeMismatch("string")
+                mutate(id) {
+                    val mode = imageEndpointModeFromToken(s)
+                        ?: throw ConfigError.InvalidValue(
+                            "imageEndpointMode must be auto | images_generations | chat_completions (got '$s')"
+                        )
+                    // Forcing a non-auto mode clears the cached probe result
+                    // (mirrors the update face / picker UI); auto keeps
+                    // whatever is cached so the probe result survives.
+                    it.copy(
+                        imageEndpointMode = mode,
+                        imageEndpointResolved = if (mode != ImageEndpointMode.auto) {
+                            null
+                        } else {
+                            it.imageEndpointResolved
+                        },
+                    )
+                }
+            },
+        )
+
+    // [fix/dv16-a A-07] The cached image-endpoint probe result. Derived +
+    // read-only: written by the auto-probe at request time and cleared when
+    // the user forces a non-auto mode — never directly writable (same axis
+    // as the other identity fields).
+    private fun imageEndpointResolved(id: String): ConfigField =
+        ReadOnlyField(
+            path = "providers.$id.imageEndpointResolved",
+            displayName = "Image endpoint (resolved)",
+            description = "Cached probe result for auto mode; null until the first image request probes the endpoint.",
+            valueSchema = ConfigSchema.Str(),
+            reader = {
+                val inst = repo.instance(id) ?: return@ReadOnlyField ConfigValue.Null
+                inst.imageEndpointResolved
+                    ?.let { ConfigValue.Str(imageEndpointModeToToken(it)) }
+                    ?: ConfigValue.Null
+            },
+        )
+
+    // [fix/dv16-a A-07] Wire tokens (`images_generations` / `chat_completions`)
+    // match the iOS SerialName shape + the debug help text; the reader
+    // round-trips identical strings so a read-back write is accepted.
+    private fun imageEndpointModeToToken(mode: ImageEndpointMode): String = when (mode) {
+        ImageEndpointMode.auto -> "auto"
+        ImageEndpointMode.imagesGenerations -> "images_generations"
+        ImageEndpointMode.chatCompletions -> "chat_completions"
+    }
+
+    private fun imageEndpointModeFromToken(token: String): ImageEndpointMode? = when (token) {
+        "auto" -> ImageEndpointMode.auto
+        "images_generations" -> ImageEndpointMode.imagesGenerations
+        "chat_completions" -> ImageEndpointMode.chatCompletions
+        else -> null
+    }
 
     /**
      * [T-android-minisconfig-custom-useragent] Per-provider User-Agent

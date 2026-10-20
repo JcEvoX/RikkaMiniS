@@ -242,6 +242,43 @@ def check_field_completeness(srcs, rels=None):
 
 
 # ----------------------------------------------------------------------
+# Arm 6 — [fix/dv16-a A-08] the merge path must share the append path's
+# instance-field write face
+# ----------------------------------------------------------------------
+SHARED_FIELDS_READER = "readImportInstanceFields("
+SHARED_FIELDS_APPLIER = "applyImportInstanceFields("
+
+
+def check_merge_shares_instance_fields(src, rel=PR_REL):
+    out = []
+    import_body = function_text(src, "fun importInstanceJSON(")
+    if import_body is None:
+        out.append((rel, 0, "6", "importInstanceJSON( not found — gate ROT"))
+    elif SHARED_FIELDS_READER not in code_only(import_body):
+        out.append((rel, line_of(src, src.find("fun importInstanceJSON(")), "6",
+                    "importInstanceJSON no longer decodes the instance-config fields via the "
+                    "shared readImportInstanceFields seam — the append path drifted from the "
+                    "merge path (one decode, two restore paths)"))
+    merge_body = function_text(src, "fun mergeImportInstanceJSON(")
+    if merge_body is None:
+        out.append((rel, 0, "6", "mergeImportInstanceJSON( not found — gate ROT"))
+    else:
+        code = code_only(merge_body)
+        if SHARED_FIELDS_READER not in code or SHARED_FIELDS_APPLIER not in code:
+            out.append((rel, line_of(src, src.find("fun mergeImportInstanceJSON(")), "6",
+                        "merge path does not apply the instance-config fields through the "
+                        "shared write face (readImportInstanceFields + applyImportInstanceFields) "
+                        "— a same-(type,label) restore drops customBaseURL / appendV1Suffix / "
+                        "useResponsesAPI / customUserAgent / the five run-config fields"))
+    n = len(re.findall(r"fun\s+applyImportInstanceFields\s*\(", src))
+    if n != 1:
+        out.append((rel, 0, "6",
+                    "applyImportInstanceFields defined %d times — the instance-field write face "
+                    "must stay single-source" % n))
+    return out
+
+
+# ----------------------------------------------------------------------
 def run_checks(root):
     pr = read(PR_REL, root)
     bm = read(BM_REL, root)
@@ -257,6 +294,7 @@ def run_checks(root):
     checks += check_reasoning_keys(pr, PR_REL, "fun parseImportedModelEntries(", "3", "parseImportedModelEntries", PARSE_ANCHORS)
     checks += check_convert_echo(bm)
     checks += check_field_completeness(srcs)
+    checks += check_merge_shares_instance_fields(pr)
     return checks
 
 
@@ -417,6 +455,73 @@ FIX_PARSE_READDROPPED_BAD = """private fun parseImportedModelEntries(dict: JSONO
 }
 """
 
+# [fix/dv16-a A-08] Shared instance-field decode / write face (append + merge
+# restore paths). Appended to every fixture PR tree so arm 6's single-source
+# definition check is exercisable.
+FIX_HELPERS = """
+internal data class RunConfigSnapshot(
+    val isEnabled: Boolean = true,
+    val azureMode: Boolean = false,
+    val imageEndpointMode: ImageEndpointMode = ImageEndpointMode.auto,
+    val imageEndpointResolved: ImageEndpointMode? = null,
+    val pinned: Boolean = false,
+)
+
+internal fun readRunConfigFields(dict: JSONObject): RunConfigSnapshot = RunConfigSnapshot()
+
+internal data class ImportInstanceFields(
+    val customBaseURL: String?,
+    val appendV1Suffix: Boolean,
+    val useResponsesAPI: Boolean,
+    val customUserAgent: String?,
+    val runConfig: RunConfigSnapshot,
+)
+
+internal fun readImportInstanceFields(dict: JSONObject): ImportInstanceFields =
+    ImportInstanceFields(
+        customBaseURL = dict.optString("customBaseURL", "").ifEmpty { null },
+        appendV1Suffix = dict.optBoolean("appendV1Suffix", true),
+        useResponsesAPI = dict.optBoolean("useResponsesAPI", false),
+        customUserAgent = dict.optString("customUserAgent", "").ifEmpty { null },
+        runConfig = readRunConfigFields(dict),
+    )
+
+internal fun applyImportInstanceFields(base: ProviderInstance, f: ImportInstanceFields): ProviderInstance =
+    base.copy(
+        customBaseURL = f.customBaseURL,
+        appendV1Suffix = f.appendV1Suffix,
+        useResponsesAPI = f.useResponsesAPI,
+        customUserAgent = f.customUserAgent,
+        isEnabled = f.runConfig.isEnabled,
+        azureMode = f.runConfig.azureMode,
+        imageEndpointMode = f.runConfig.imageEndpointMode,
+        imageEndpointResolved = f.runConfig.imageEndpointResolved,
+        pinned = f.runConfig.pinned,
+    )
+"""
+
+# [fix/dv16-a A-08] The append path decodes through the shared seam.
+FIX_IMPORT_OK = """fun importInstanceJSON(jsonStr: String): String? {
+    val dict = JSONObject(jsonStr)
+    val f = readImportInstanceFields(dict)
+    val instance = ProviderInstance(
+        id = newId(),
+        label = resolvedLabel,
+        customBaseURL = f.customBaseURL,
+        appendV1Suffix = f.appendV1Suffix,
+        useResponsesAPI = f.useResponsesAPI,
+        customUserAgent = f.customUserAgent,
+        isEnabled = f.runConfig.isEnabled,
+        azureMode = f.runConfig.azureMode,
+        imageEndpointMode = f.runConfig.imageEndpointMode,
+        imageEndpointResolved = f.runConfig.imageEndpointResolved,
+        pinned = f.runConfig.pinned,
+    )
+    addInstance(instance)
+    return resolvedLabel
+}
+"""
+
 FIX_MERGE_OK = """fun mergeImportInstanceJSON(
     jsonStr: String,
     srcEntryIds: List<String>,
@@ -437,6 +542,12 @@ FIX_MERGE_OK = """fun mergeImportInstanceJSON(
         }
         if (srcId.isNotEmpty()) entryMap[srcId] = resolvedEntryId
     }
+    // [fix/dv16-a A-08] A restore is a restore: the instance-config fields the
+    // append path decodes are applied onto the existing instance too — through
+    // the same shared write face, so the merge path cannot drift.
+    val fields = readImportInstanceFields(dict)
+    val updated = applyImportInstanceFields(existing, fields)
+    if (updated != existing) updateInstance(updated)
     return existing.id to entryMap
 }
 """
@@ -459,6 +570,36 @@ FIX_MERGE_BAD = """fun mergeImportInstanceJSON(
         }
         if (srcId.isNotEmpty()) entryMap[srcId] = resolvedEntryId
     }
+    val fields = readImportInstanceFields(dict)
+    val updated = applyImportInstanceFields(existing, fields)
+    if (updated != existing) updateInstance(updated)
+    return existing.id to entryMap
+}
+"""
+
+# [fix/dv16-a A-08] Arm 6 teeth: the merge path stops applying the shared
+# instance-field write face (the exact regression the arm exists for).
+FIX_MERGE_NOAPPLY_BAD = """fun mergeImportInstanceJSON(
+    jsonStr: String,
+    srcEntryIds: List<String>,
+): Pair<String, Map<String, String>>? {
+    val entries = parseImportedModelEntries(dict, existing.id)
+    val entryMap = HashMap<String, String>()
+    for (i in entries.indices) {
+        val srcId = srcEntryIds.getOrNull(i) ?: ""
+        val entry = entries[i]
+        val hit = _config.value.modelEntries.firstOrNull {
+            it.providerInstanceId == existing.id && it.baseModel.id == entry.baseModel.id
+        }
+        val resolvedEntryId = hit?.id ?: run {
+            addEntry(entry)
+            _config.value.modelEntries.firstOrNull {
+                it.providerInstanceId == existing.id && it.baseModel.id == entry.baseModel.id
+            }?.id ?: compositeEntryKey(existing.id, entry.baseModel.id)
+        }
+        if (srcId.isNotEmpty()) entryMap[srcId] = resolvedEntryId
+    }
+    importInstanceCredentials(dict, existing)
     return existing.id to entryMap
 }
 """
@@ -513,7 +654,7 @@ def build_fixture_tree(tmp, merge_src, export_src, parse_src, convert_src):
     os.makedirs(os.path.join(tmp, APP + "/backup"), exist_ok=True)
     os.makedirs(os.path.join(tmp, APP + "/data/model"), exist_ok=True)
     with open(os.path.join(tmp, PR_REL), "w") as f:
-        f.write(merge_src + "\n" + export_src + "\n" + parse_src)
+        f.write(merge_src + "\n" + export_src + "\n" + parse_src + "\n" + FIX_HELPERS + "\n" + FIX_IMPORT_OK)
     with open(os.path.join(tmp, BM_REL), "w") as f:
         f.write(convert_src)
     with open(os.path.join(tmp, LM_REL), "w") as f:
@@ -539,12 +680,20 @@ def selftest():
         arms = sorted({x[2] for x in v})
         if arms != ["3", "5"]:
             failures.append("read-dropped fixture arms=%r (violations=%r)" % (arms, v))
+    # [fix/dv16-a A-08] Arm 6: the merge path stops applying the shared
+    # instance-field write face → only arm 6 red.
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_NOAPPLY_BAD, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK)
+        v = run_checks(tmp)
+        arms = sorted({x[2] for x in v})
+        if arms != ["6"]:
+            failures.append("merge-noapply fixture arms=%r (violations=%r)" % (arms, v))
     if failures:
         for f in failures:
             print("SELFTEST-FAIL: " + f)
         print("PROVIDER_IMPORT_ID_ROUNDTRIP_SELFTEST=FAIL")
         return 1
-    print("selftest: compliant green / violating red arms 1-5 / read-dropped red arms 3+5")
+    print("selftest: compliant green / violating red arms 1-6 / read-dropped red arms 3+5 / merge-noapply red arm 6")
     print("PROVIDER_IMPORT_ID_ROUNDTRIP_SELFTEST=PASS")
     return 0
 
@@ -564,7 +713,7 @@ def main():
         for rel, line, arm, msg in violations:
             print("  [arm %s] %s:%s — %s" % (arm, rel, line, msg))
         sys.exit(1)
-    print("PROVIDER_IMPORT_ID_ROUNDTRIP: clean (5 arms)")
+    print("PROVIDER_IMPORT_ID_ROUNDTRIP: clean (6 arms)")
     sys.exit(0)
 
 
