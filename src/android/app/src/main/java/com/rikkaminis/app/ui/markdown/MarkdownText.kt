@@ -123,8 +123,8 @@ private fun BlockContent(
         is MarkdownParser.Block.Paragraph -> ParagraphBlock(block.content, color, baseStyle, mathSpans)
         is MarkdownParser.Block.CodeBlock -> CodeBlockView(block)
         is MarkdownParser.Block.Blockquote -> BlockquoteView(block, color, baseStyle, mathSpans)
-        is MarkdownParser.Block.BulletList -> BulletListView(block, color, baseStyle)
-        is MarkdownParser.Block.NumberedList -> NumberedListView(block, color, baseStyle)
+        is MarkdownParser.Block.BulletList -> BulletListView(block, color, baseStyle, mathSpans)
+        is MarkdownParser.Block.NumberedList -> NumberedListView(block, color, baseStyle, mathSpans)
         is MarkdownParser.Block.Table -> TableView(block, color, baseStyle, mathSpans)
         is MarkdownParser.Block.MathBlock -> MathBlockView(latex = block.latex)
         is MarkdownParser.Block.ThematicBreak -> HorizontalDivider(
@@ -315,6 +315,7 @@ private fun BulletListView(
     block: MarkdownParser.Block.BulletList,
     color: Color,
     baseStyle: TextStyle,
+    mathSpans: List<MarkdownParser.MathSpan> = emptyList(),
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         for (item in block.items) {
@@ -338,10 +339,11 @@ private fun BulletListView(
                         modifier = Modifier.padding(end = 8.dp),
                     )
                 }
-                InlineContent(
+                MathAwareInlineContent(
                     text = item.content,
                     color = color,
                     style = baseStyle,
+                    mathSpans = mathSpans,
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -356,6 +358,7 @@ private fun NumberedListView(
     block: MarkdownParser.Block.NumberedList,
     color: Color,
     baseStyle: TextStyle,
+    mathSpans: List<MarkdownParser.MathSpan> = emptyList(),
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         for ((index, item) in block.items.withIndex()) {
@@ -366,10 +369,11 @@ private fun NumberedListView(
                     style = baseStyle,
                     modifier = Modifier.padding(end = 8.dp),
                 )
-                InlineContent(
+                MathAwareInlineContent(
                     text = item.content,
                     color = color,
                     style = baseStyle,
+                    mathSpans = mathSpans,
                     modifier = Modifier.weight(1f),
                 )
             }
@@ -503,6 +507,63 @@ private fun TableCellContent(
 
 // -- Inline Content --
 
+/**
+ * [da1034-b3] Inline content that resolves inline-math placeholders the same
+ * way [ParagraphBlock] and [TableCellContent] do.
+ *
+ * `Block.BulletList` / `Block.NumberedList` come out of the parser's
+ * `restoreMath` pass *with their placeholders intact* (only paragraphs are
+ * re-walked there — see `restoreBlock`), so before this helper existed every
+ * `$…$` inside a list item reached [InlineContent], hit that function's
+ * placeholder-cleanup pass and was dropped without a trace: no KaTeX tile, no
+ * leftover glyph, nothing. Lists nested inside a blockquote are covered for
+ * free because [BlockquoteView] re-enters [BlockContent] with the same span
+ * list.
+ *
+ * Items without a placeholder fall straight through to [InlineContent], so
+ * plain lists (the overwhelming majority of them) don't pay for an extra
+ * Column.
+ */
+@Composable
+private fun MathAwareInlineContent(
+    text: String,
+    color: Color,
+    style: TextStyle,
+    mathSpans: List<MarkdownParser.MathSpan> = emptyList(),
+    modifier: Modifier = Modifier,
+) {
+    if (mathSpans.isEmpty() || !text.contains('￼')) {
+        InlineContent(text = text, color = color, style = style, modifier = modifier)
+        return
+    }
+    val byPlaceholder = remember(mathSpans) { mathSpans.associateBy { it.placeholder } }
+    val regex = remember { Regex("\\uFFFC" + "MATH(\\d+)" + "\\uFFFC") }
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        var cursor = 0
+        for (match in regex.findAll(text)) {
+            val span = byPlaceholder[match.value] ?: continue
+            if (match.range.first > cursor) {
+                val segment = text.substring(cursor, match.range.first)
+                if (segment.isNotBlank()) {
+                    InlineContent(text = segment, color = color, style = style)
+                }
+            }
+            // Inline math: non-display KaTeX, no fillMaxWidth, start-aligned —
+            // the same shape [ParagraphBlock] uses for its inline spans.
+            KaTeXRenderView(latex = span.latex, displayMode = false)
+            cursor = match.range.last + 1
+        }
+        if (cursor < text.length) {
+            val tail = text.substring(cursor)
+            if (tail.isNotBlank()) {
+                InlineContent(text = tail, color = color, style = style)
+            }
+        }
+    }
+}
+
+// -- Inline Content (plain) --
+
 @Composable
 private fun InlineContent(
     text: String,
@@ -514,12 +575,14 @@ private fun InlineContent(
     val inlineCodeColor = MaterialTheme.colorScheme.primary
     val linkColor = MaterialTheme.colorScheme.primary
 
-    // Strip any leftover math placeholders (U+FFFC MATH<n> U+FFFC). The
-    // ParagraphBlock split path resolves them when math spans are
-    // threaded through; lists/headings don't carry the span list (table
-    // cells DO via TableView/TableCell) — collapsing the placeholder here
-    // keeps the U+FFFC sentinel from leaking into the rendered glyph
-    // stream for the paths that can't resolve it.
+    // Strip any leftover math placeholders (U+FFFC MATH<n> U+FFFC). The split
+    // paths ([ParagraphBlock], [TableCellContent] and [MathAwareInlineContent]
+    // — the last one backs both list views) resolve the placeholders they can
+    // before calling in; headings still carry their inline placeholders into
+    // this function because HeadingBlock has no span list to resolve them
+    // with. Collapsing the sentinel here keeps U+FFFC from leaking into the
+    // rendered glyph stream on that path (and on any future one that calls
+    // this helper without spans).
     val cleaned = remember(text) {
         if (text.contains('￼')) {
             text.replace(Regex("\\uFFFCMATH\\d+\\uFFFC"), "")
