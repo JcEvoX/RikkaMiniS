@@ -10,7 +10,6 @@ import android.app.Activity
 import android.view.MotionEvent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -66,6 +65,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.ui.chat.decodeUriPath
+import com.rikkaminis.app.ui.theme.ChatColors
 
 /**
  * Immersive 90%-tall bottom sheet that hosts a [WebViewHolder] for a
@@ -103,7 +103,13 @@ fun WebPreviewBottomSheet(
     val context = LocalContext.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val view = LocalView.current
-    val darkTheme = isSystemInDarkTheme()
+    // [da1034-B2 / B-03] ChatColors.isDark follows the in-app theme override
+    // (Settings -> theme_mode); isSystemInDarkTheme() only tracks the system
+    // setting. The sheet's container is colorScheme.surface, so with a forced
+    // dark app on a light system the surface stayed dark while the status-bar
+    // icons were drawn for a light background (icons invisible on their own
+    // bar). Same single source as KaTeXView.kt / ChatToolDetailUI.kt.
+    val darkTheme = ChatColors.isDark
 
     LaunchedEffect(holder) {
         holder.startIfNeeded()
