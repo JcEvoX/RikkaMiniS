@@ -93,6 +93,33 @@ class MinisDocumentsProvider : DocumentsProvider() {
         internal fun isWithinRoot(rootCanonical: String, targetCanonical: String): Boolean =
             targetCanonical == rootCanonical ||
                 targetCanonical.startsWith(rootCanonical + File.separator)
+
+        // [da1034-A2 ISSUE-02] The two id decisions that used to read the RAW
+        // document id. Clients legitimately address the root as "", " ", "/"
+        // or "//" (DocumentsContract does not normalize), so "isEmpty()" on the
+        // raw string made "/" a *non-root* parent: the TOP_LEVEL whitelist below
+        // was skipped and every internal filesDir entry (mcp-servers, logs, …)
+        // leaked into the Files app listing. Deriving the answer from the one
+        // normalizer keeps a single definition of "the root".
+
+        /** True when [documentId] addresses the provider root, normalized. */
+        internal fun isRootDocId(documentId: String): Boolean =
+            normalizeDocId(documentId).isEmpty()
+
+        /**
+         * True when [documentId] names a top-level entry ITSELF ("shared"),
+         * as opposed to something inside one ("shared/notes.txt").
+         *
+         * The provider's top level is a fixed, structural set: memory/ and
+         * skills/ are read-only (see [readOnlyTopOf]) and shared/ may only
+         * change *within*. A top-level entry therefore cannot be deleted or
+         * renamed away — `deleteDocument("shared")` used to call
+         * `deleteRecursively()` on the whole shared tree.
+         */
+        internal fun isTopLevelDocId(documentId: String): Boolean {
+            val clean = normalizeDocId(documentId)
+            return clean.isNotEmpty() && !clean.contains('/')
+        }
     }
 
     override fun onCreate(): Boolean = true
@@ -138,7 +165,12 @@ class MinisDocumentsProvider : DocumentsProvider() {
         var flags = 0
         if (file.isDirectory) flags = flags or Document.FLAG_DIR_SUPPORTS_CREATE
         else flags = flags or Document.FLAG_SUPPORTS_WRITE
-        flags = flags or Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME
+        // [da1034-A2 ISSUE-02] Advertise DELETE/RENAME only where those
+        // operations are actually allowed — delete/renameDocument refuse
+        // top-level entries themselves, so "shared" must not claim them.
+        if (!isTopLevelDocId(documentId)) {
+            flags = flags or Document.FLAG_SUPPORTS_DELETE or Document.FLAG_SUPPORTS_RENAME
+        }
         return flags
     }
 
@@ -163,7 +195,7 @@ class MinisDocumentsProvider : DocumentsProvider() {
     override fun queryDocument(documentId: String, projection: Array<String>?): Cursor {
         val cursor = MatrixCursor(projection ?: DOCUMENT_PROJECTION)
         val file = resolveDoc(documentId)
-        val displayName = if (documentId.isEmpty()) "Minis" else file.name
+        val displayName = if (isRootDocId(documentId)) "Minis" else file.name
         cursor.newRow()
             .add(Document.COLUMN_DOCUMENT_ID, documentId)
             .add(Document.COLUMN_DISPLAY_NAME, displayName)
@@ -181,14 +213,19 @@ class MinisDocumentsProvider : DocumentsProvider() {
     ): Cursor {
         val cursor = MatrixCursor(projection ?: DOCUMENT_PROJECTION)
         val parent = resolveDoc(parentDocumentId)
-        val isRoot = parentDocumentId.isEmpty()
+        // [da1034-A2 ISSUE-02] Root must be judged on the NORMALIZED id: the
+        // raw isEmpty() let "/" or " " slip through as a non-root parent, the
+        // TOP_LEVEL filter below was skipped, and every internal filesDir entry
+        // (mcp-servers, logs, …) leaked into the Files app listing.
+        val cleanParent = normalizeDocId(parentDocumentId)
+        val isRoot = cleanParent.isEmpty()
         val children = parent.listFiles()?.toList() ?: emptyList()
         for (child in children) {
             val name = child.name
             if (name.startsWith(".")) continue
             if (name in METADATA_BLACKLIST) continue
             if (isRoot && name !in TOP_LEVEL) continue
-            val docId = if (parentDocumentId.isEmpty()) name else "$parentDocumentId/$name"
+            val docId = if (isRoot) name else "$cleanParent/$name"
             cursor.newRow()
                 .add(Document.COLUMN_DOCUMENT_ID, docId)
                 .add(Document.COLUMN_DISPLAY_NAME, name)
@@ -249,6 +286,16 @@ class MinisDocumentsProvider : DocumentsProvider() {
         if (clean.isEmpty()) throw UnsupportedOperationException("Provider root cannot be deleted")
         val top = readOnlyTopOf(clean)
         if (top != null) throw UnsupportedOperationException("$top is read-only")
+        // [da1034-A2 ISSUE-02] A top-level entry itself ("shared") may not be
+        // deleted either — deleteDocument("shared") used to deleteRecursively()
+        // the entire shared tree. Only its children are deletable; the top level
+        // is the provider's fixed structure (memory/, skills/ read-only,
+        // shared/ writable within).
+        if (isTopLevelDocId(documentId)) {
+            throw UnsupportedOperationException(
+                "Top-level '$clean' cannot be deleted; delete its children individually",
+            )
+        }
         if (!file.deleteRecursively()) throw FileNotFoundException("Failed to delete $documentId")
     }
 
@@ -259,6 +306,12 @@ class MinisDocumentsProvider : DocumentsProvider() {
         if (clean.isEmpty()) throw UnsupportedOperationException("Provider root cannot be renamed")
         val top = readOnlyTopOf(clean)
         if (top != null) throw UnsupportedOperationException("$top is read-only")
+        // [da1034-A2 ISSUE-02] Renaming a top-level entry moves the whole tree
+        // (deleteDocument's rename twin) — refused for the same structural
+        // reason: "shared" is the mount's public name, not a movable folder.
+        if (isTopLevelDocId(documentId)) {
+            throw UnsupportedOperationException("Top-level '$clean' cannot be renamed")
+        }
         val safe = displayName.replace("/", "_").replace("..", "_")
         val target = File(file.parentFile, safe)
         if (!file.renameTo(target)) throw FileNotFoundException("Failed to rename $documentId")
