@@ -351,7 +351,13 @@ internal fun UserMessageBubble(
                     )
                 }
 
-                if (message.content.isNotBlank()) {
+                // [B-05 deep-audit-1037] The old condition was content-only,
+                // and it also gated the withdraw button: a pure-attachment
+                // (no caption) queued message rendered no row at all — no
+                // bubble AND no withdraw target. The verdict now goes through
+                // the ONE shared predicate; the withdraw button below is
+                // independent of the caption.
+                if (userRowHasVisibleContent(message.content, message.imageUris, message.attachmentUris)) {
                     // Queued: transparent bg + dashed border + dimmed text +
                     // a red withdraw button alongside. Mirrors iOS
                     // AIChatView.swift queued-bubble overlay.
@@ -361,6 +367,11 @@ internal fun UserMessageBubble(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
+                        // [B-05 deep-audit-1037] The caption-only guard wraps
+                        // just the text bubble — a pure-attachment queued
+                        // message gets the withdraw button without an empty
+                        // caption rect.
+                        if (message.content.isNotBlank()) {
                         val textColor = if (isQueued) secondaryTextColor else MaterialTheme.colorScheme.onSurface
                         val bubbleBg = if (isQueued) Color.Transparent else userBubbleColor
                         val shape = RoundedCornerShape(18.dp)
@@ -422,6 +433,7 @@ internal fun UserMessageBubble(
                                 )
                             }
                         }
+                        } // end caption-only guard ([B-05 deep-audit-1037])
                         if (isQueued && onWithdraw != null) {
                             // T52: bring the withdraw target up to Material's
                             // 44dp recommended minimum so it can be hit

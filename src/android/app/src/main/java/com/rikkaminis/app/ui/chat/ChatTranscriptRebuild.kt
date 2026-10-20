@@ -20,6 +20,64 @@ import java.io.File
 internal data class ToolResultData(val output: String, val success: Boolean)
 
 /**
+ * [B-05 deep-audit-1037] Single source of truth for "does this user row show
+ * anything?" — any of the three visible surfaces (caption text, restored
+ * images, restored non-image attachments) counts. Before this predicate the
+ * five entry points that ask the question each carried their own copy: the
+ * transcript rebuild only checked images, the retry guards only checked
+ * `content.isBlank()`, and the two DB truncation-count walks only counted
+ * non-blank text parts — so a pure-attachment (no caption) user message
+ * disappeared on session reload, could not be retried, and shifted the
+ * retry/edit cutoff onto the wrong row.
+ *
+ * The collections are typed [Collection] so the UI-side call sites can pass
+ * `List<Uri>` and the test harness can pass plain lists — the decision is
+ * "any surface non-empty", never about the element type.
+ */
+internal fun userRowHasVisibleContent(
+    content: String,
+    imageUris: Collection<*>,
+    attachmentUris: Collection<*>,
+): Boolean =
+    content.isNotBlank() || imageUris.isNotEmpty() || attachmentUris.isNotEmpty()
+
+/**
+ * parts_json variant of [userRowHasVisibleContent] for the two DB
+ * truncation-count walks (the edit/retry cutoff search). A persisted user
+ * row is a "visible user turn" iff it carries a `mediaRef` part (an
+ * attachment survived — [T-android-retry-attachment-loss] and
+ * [B-05 deep-audit-1037]) or a text part that is non-blank AFTER the
+ * `<user-attached-files>` XML inventory is stripped and is not the resume()
+ * synthetic `<system-reminder>` row (which has no UI bubble — counting it
+ * shifts the cutoff one user message too early, the
+ * [T-ios-retry-anchor-synthetic-user] contract). toolResult-only rows carry
+ * neither surface and keep not counting.
+ *
+ * Malformed parts keep the pre-fix fail-open semantic of both walks (an
+ * unparsable row still counts as a visible user turn).
+ */
+internal fun userPartsJsonHasVisibleContent(partsJson: String): Boolean {
+    return try {
+        val arr = org.json.JSONArray(partsJson)
+        (0 until arr.length()).any { i ->
+            val o = arr.getJSONObject(i)
+            when (o.optString("type")) {
+                "mediaRef" -> true
+                "text" -> {
+                    val v = o.optString("value", "")
+                    v.isNotBlank() &&
+                        stripAttachedFilesXml(v).isNotBlank() &&
+                        !v.trimStart().startsWith("<system-reminder>")
+                }
+                else -> false
+            }
+        }
+    } catch (_: Exception) {
+        true
+    }
+}
+
+/**
  * Rebuild the ordered UI [ChatMessage] list from parsed DB rows.
  *
  * Pass 1: collect toolResult outputs keyed by toolUseId.
@@ -159,8 +217,12 @@ internal fun buildChatMessagesTranscript(
             }
         }
 
-        // Skip user messages with no visible content
-        if (entity.role == "user" && text.isBlank() && restoredImageUris.isEmpty()) return@mapNotNull null
+        // Skip user messages with no visible content.
+        // [B-05 deep-audit-1037] The old guard only checked images — a pure
+        // non-image attachment user message (restoredAttachmentUris filled,
+        // :151) vanished on session reload. The verdict now goes through the
+        // ONE shared predicate every visible-content entry point uses.
+        if (entity.role == "user" && !userRowHasVisibleContent(text, restoredImageUris, restoredAttachmentUris)) return@mapNotNull null
         // Skip assistant messages that became empty
         if (entity.role == "assistant" && text.isBlank() && blocks.isEmpty()) return@mapNotNull null
         ChatMessage(

@@ -3179,7 +3179,12 @@ class ChatViewModel(
         val message = messages[index]
         // [T-android-tool-autoscroll] Start-of-turn snap — see resume().
         _forceScrollToBottom.tryEmit(Unit)
-        if (message.role != "user" || message.content.isBlank()) return
+        // [B-05 deep-audit-1037] The old guard was content-only: a pure
+        // attachment message (blank caption, attachments present) could never
+        // be retried. The verdict goes through the ONE shared predicate.
+        if (message.role != "user" ||
+            !userRowHasVisibleContent(message.content, message.imageUris, message.attachmentUris)
+        ) return
 
         val initialProvider = currentProvider
         if (initialProvider == null) {
@@ -3279,15 +3284,13 @@ class ChatViewModel(
                     // or the cutoff anchors one user message too early and the
                     // retried bubble (plus the whole last turn) is silently
                     // dropped from the rebuilt history (mirrors the iOS fix).
-                    val hasText = try {
-                        val arr = org.json.JSONArray(entity.partsJson)
-                        (0 until arr.length()).any { i ->
-                            val o = arr.getJSONObject(i)
-                            val v = o.optString("value", "")
-                            o.optString("type") == "text" && v.isNotBlank() &&
-                                !v.trimStart().startsWith("<system-reminder>")
-                        }
-                    } catch (_: Exception) { true }
+                    // [B-05 deep-audit-1037] One shared predicate with
+                    // truncateBeforeEdit: the old text-only copy disagreed with
+                    // the edit path's XML-stripped count for pure-attachment
+                    // rows (non-blank XML inventory text vs stripped-blank), so
+                    // the two cutoffs landed on different rows. A mediaRef part
+                    // (an attachment) IS a visible user turn.
+                    val hasText = userPartsJsonHasVisibleContent(entity.partsJson)
                     if (hasText) {
                         if (visibleUserCount == visibleUserIndex) {
                             cutoffSortOrder = entity.sortOrder + 1
