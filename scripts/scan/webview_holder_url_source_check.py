@@ -31,6 +31,23 @@ The gate enforces:
       (WebPreviewBottomSheet.kt) — guards against "fixing downstream" instead
       of the root cause.
 
+deep-audit-v14 FIX-B1 (ISSUE-01 + ISSUE-02) adds two criteria groups:
+  W5  mobile-mode viewport policy in toggleDesktopMode: the mobile `else`
+      branch must keep `useWideViewPort` / `loadWithOverviewMode` ON — the
+      exact polarity of the init defaults (:127-128). A `= false` revert in
+      the function body is RED; deleting the restore is RED (the body must
+      consume `mobileViewportSettings()`); the policy itself must stay
+      single-sourced and pinned to `true` / `true`.
+  W6  gallery window contract (ui/components/ImageGalleryViewer.kt): the
+      OUTER `DisposableEffect(Unit)` (host composition, before the Dialog)
+      must take its window from the HOST Activity (`view.context as? Activity`)
+      — `findDialogWindow(view)` on the host view walks a parent chain with no
+      DialogWindowProvider and returned null on every entry (silent no-op);
+      the INNER dialog effect must keep `findDialogWindow(dialogView)` and
+      apply `galleryDialogWindowFlags()` (FLAG_LAYOUT_NO_LIMITS |
+      FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS — without the latter the dialog
+      leaves a grey band under the status bar).
+
 Usage: python3 webview_holder_url_source_check.py [ROOT]   (ROOT = repo root)
        python3 webview_holder_url_source_check.py --selftest
 Exit:  0 = gate green, 1 = violations found (or selftest failures).
@@ -41,6 +58,7 @@ import sys
 
 HOLDER_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/preview/WebViewHolder.kt"
 SHEET_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/preview/WebPreviewBottomSheet.kt"
+GALLERY_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/components/ImageGalleryViewer.kt"
 
 ASSIGN_RE = re.compile(r"^\s*currentUrl\s*=\s*(.+?)\s*$")
 
@@ -93,7 +111,63 @@ def strip_comments(src):
     return "\n".join(out)
 
 
-def analyse(holder_code, sheet_code):
+def slice_balanced_body(code, header_marker):
+    """Return the brace-balanced body of the function/effect whose header line
+    contains `header_marker` (first match), or None.
+
+    Runs on comment-stripped code; string-aware (braces inside string
+    literals are skipped). An unterminated block returns everything scanned —
+    callers must treat a missing marker (None) as RED, not skip.
+    """
+    lines = code.splitlines()
+    start = None
+    for idx, line in enumerate(lines):
+        if header_marker in line:
+            start = idx
+            break
+    if start is None:
+        return None
+    depth = 0
+    opened = False
+    buf = []
+    quote = None
+    for line in lines[start:]:
+        i = 0
+        n = len(line)
+        while i < n:
+            c = line[i]
+            if quote is not None:
+                if c == "\\":
+                    i += 2
+                    continue
+                if c == quote:
+                    quote = None
+                i += 1
+                continue
+            if c in ('"', "'"):
+                quote = c
+            elif c == '{':
+                depth += 1
+                opened = True
+            elif c == '}':
+                depth -= 1
+            i += 1
+        buf.append(line)
+        if opened and depth <= 0:
+            return "\n".join(buf)
+    return "\n".join(buf)
+
+
+def window_after(code, marker, size):
+    """Bounded text window starting at `marker` (first match) — for pinning
+    expression-bodied declarations whose body has no braces to slice."""
+    idx = code.find(marker)
+    if idx < 0:
+        return None
+    return code[idx:idx + size]
+
+
+def analyse(holder_code, sheet_code, gallery_code=None):
     """Return [(criterion, ok, detail, line_no_or_None)]."""
     code = strip_comments(holder_code)
     code_lines = code.splitlines()
@@ -145,6 +219,71 @@ def analyse(holder_code, sheet_code):
     ok_pin = 'holder.currentUrl.startsWith("file://")' in sheet
     results.append(("W4b pin entry still gates on holder.currentUrl", ok_pin,
                     "downstream must keep reading the single source", None))
+
+    # --- W5: mobile-mode viewport policy in toggleDesktopMode (dv14-B1) ---
+    # Decision point: the mobile `else` branch must keep the wide viewport +
+    # overview mode ON (exact polarity of the init defaults :127-128).
+    holder_stripped = strip_comments(holder_code)
+    if "fun toggleDesktopMode(" in holder_stripped:
+        body = slice_balanced_body(holder_stripped, "fun toggleDesktopMode(")
+        if body is None:
+            results.append(("W5 toggleDesktopMode body sliceable", False,
+                            "toggleDesktopMode body not found / unterminated", None))
+        else:
+            no_false = ("useWideViewPort = false" not in body
+                        and "loadWithOverviewMode = false" not in body)
+            results.append(("W5a toggleDesktopMode never turns the mobile viewport off", no_false,
+                            "a `useWideViewPort = false` / `loadWithOverviewMode = false` "
+                            "revert in the body is RED", None))
+            n_policy = len(re.findall(r"\bfun\s+mobileViewportSettings\(", holder_stripped))
+            results.append(("W5b mobileViewportSettings defined exactly once", n_policy == 1,
+                            "found %d definitions" % n_policy, None))
+            pin_win = window_after(holder_stripped, "fun mobileViewportSettings", 300)
+            pinned = (pin_win is not None
+                      and "useWideViewPort = true" in pin_win
+                      and "loadWithOverviewMode = true" in pin_win)
+            results.append(("W5c policy stays pinned to useWideViewPort/overview = true", pinned,
+                            "policy body must keep both flags ON (window after the "
+                            "definition, %s)" % ("missing" if pin_win is None else pin_win[:120]),
+                            None))
+            consumes = "mobileViewportSettings()" in body
+            results.append(("W5d mobile else branch consumes mobileViewportSettings()", consumes,
+                            "deleting the restore is RED (body must go through the "
+                            "single-sourced policy)", None))
+
+    # --- W6: gallery window contract (dv14-B1) ---
+    if gallery_code is not None:
+        gallery_stripped = strip_comments(gallery_code)
+        outer = slice_balanced_body(gallery_stripped, "DisposableEffect(Unit)")
+        if outer is None:
+            results.append(("W6 gallery outer DisposableEffect(Unit) sliceable", False,
+                            "outer effect not found / unterminated", None))
+        else:
+            ok_host = "(view.context as? android.app.Activity)?.window" in outer
+            results.append(("W6a gallery outer effect takes the HOST Activity window", ok_host,
+                            "the window must come from view.context as Activity, "
+                            "not from a DialogWindowProvider walk", None))
+            ok_no_walk = "findDialogWindow(view)" not in outer
+            results.append(("W6b outer effect must not call findDialogWindow(view)", ok_no_walk,
+                            "findDialogWindow(view) on the host view walks a chain "
+                            "with no DialogWindowProvider (always null)", None))
+        inner = slice_balanced_body(gallery_stripped, "DisposableEffect(dialogView)")
+        if inner is None:
+            results.append(("W6 gallery inner DisposableEffect(dialogView) sliceable", False,
+                            "inner effect not found / unterminated", None))
+        else:
+            ok_flags_call = "galleryDialogWindowFlags()" in inner
+            results.append(("W6c inner dialog effect applies galleryDialogWindowFlags()", ok_flags_call,
+                            "the dialog window must get FLAG_LAYOUT_NO_LIMITS | "
+                            "FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS", None))
+        n_flags = len(re.findall(r"\bfun\s+galleryDialogWindowFlags\(", gallery_stripped))
+        flags_win = window_after(gallery_stripped, "fun galleryDialogWindowFlags", 300)
+        ok_flags_def = (n_flags == 1 and flags_win is not None
+                        and "FLAG_LAYOUT_NO_LIMITS" in flags_win
+                        and "FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS" in flags_win)
+        results.append(("W6d galleryDialogWindowFlags defined once with both flags", ok_flags_def,
+                        "found %d definitions; both flag constants must stay in the "
+                        "composition" % n_flags, None))
     return results
 
 
@@ -208,6 +347,101 @@ onOpenExternal = { openExternalFromSheet(context, holder.url) }
 onPinToHome = if (holder.isLocalFile) x else null
 """
 
+# ---- dv14-B1 fixtures: W5 (toggleDesktopMode viewport policy) -------------
+
+DESKTOP_GOOD_HOLDER = GOOD_HOLDER + """
+class DesktopHolder {
+    fun toggleDesktopMode() {
+        if (desktopMode) {
+            webView.settings.useWideViewPort = true
+            webView.settings.loadWithOverviewMode = true
+        } else {
+            val mobile = mobileViewportSettings()
+            webView.settings.useWideViewPort = mobile.useWideViewPort
+            webView.settings.loadWithOverviewMode = mobile.loadWithOverviewMode
+            webView.setInitialScale(mobile.initialScale)
+        }
+    }
+}
+internal fun mobileViewportSettings(): MobileViewportSettings =
+    MobileViewportSettings(useWideViewPort = true, loadWithOverviewMode = true, initialScale = 0)
+"""
+
+DESKTOP_FALSE_HOLDER = GOOD_HOLDER + """
+class DesktopHolder {
+    fun toggleDesktopMode() {
+        if (desktopMode) {
+            webView.settings.useWideViewPort = true
+        } else {
+            webView.settings.useWideViewPort = false
+            webView.settings.loadWithOverviewMode = false
+        }
+    }
+}
+internal fun mobileViewportSettings(): MobileViewportSettings =
+    MobileViewportSettings(useWideViewPort = true, loadWithOverviewMode = true, initialScale = 0)
+"""
+
+DESKTOP_POLICY_FLIPPED_HOLDER = GOOD_HOLDER + """
+class DesktopHolder {
+    fun toggleDesktopMode() {
+        val mobile = mobileViewportSettings()
+        webView.settings.useWideViewPort = mobile.useWideViewPort
+        webView.settings.loadWithOverviewMode = mobile.loadWithOverviewMode
+    }
+}
+internal fun mobileViewportSettings(): MobileViewportSettings =
+    MobileViewportSettings(useWideViewPort = false, loadWithOverviewMode = false, initialScale = 0)
+"""
+
+DESKTOP_NO_RESTORE_HOLDER = GOOD_HOLDER + """
+class DesktopHolder {
+    fun toggleDesktopMode() {
+        if (desktopMode) {
+            webView.settings.useWideViewPort = true
+        } else {
+            webView.settings.userAgentString = mobileUserAgent
+        }
+    }
+}
+internal fun mobileViewportSettings(): MobileViewportSettings =
+    MobileViewportSettings(useWideViewPort = true, loadWithOverviewMode = true, initialScale = 0)
+"""
+
+# ---- dv14-B1 fixtures: W6 (gallery window contract) ------------------------
+
+GALLERY_GOOD = """package probe
+val view = LocalView.current
+DisposableEffect(Unit) {
+    val window = (view.context as? android.app.Activity)?.window
+    val controller = window?.let { WindowInsetsControllerCompat(it, view) }
+    controller?.hide(WindowInsetsCompat.Type.systemBars())
+    onDispose { }
+}
+Dialog {
+    val dialogView = LocalView.current
+    DisposableEffect(dialogView) {
+        val win = findDialogWindow(dialogView)
+        win?.let { w -> w.addFlags(galleryDialogWindowFlags()) }
+        onDispose { }
+    }
+}
+internal fun galleryDialogWindowFlags(): Int =
+    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+        android.view.WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS
+"""
+
+GALLERY_WALKER_REVERT = GALLERY_GOOD.replace(
+    "val window = (view.context as? android.app.Activity)?.window",
+    "val window = findDialogWindow(view)")
+
+GALLERY_FLAGS_MISSING = GALLERY_GOOD.replace(
+    "w.addFlags(galleryDialogWindowFlags())", "w.addFlags(WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS)").replace(
+    """internal fun galleryDialogWindowFlags(): Int =
+    android.view.WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+        android.view.WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS
+""", "")
+
 
 def selftest():
     failures = []
@@ -250,13 +484,75 @@ def selftest():
         else:
             expect(ok, "bad3 %s must stay OK" % c)
 
+    # ---- dv14-B1: W5 fixtures ----
+    # good: mobile branch keeps the viewport on via the single-sourced policy
+    dgood = analyse(DESKTOP_GOOD_HOLDER, GOOD_SHEET)
+    for c, ok, detail, _ in dgood:
+        if c.startswith("W5"):
+            expect(ok, "desktop good fixture must pass %s (%s)" % (c, detail))
+
+    # bad: literal false revert in the else branch — W5a RED; W5b/W5c stay OK
+    # (W5d is allowed RED: this fixture also drops the policy consumption,
+    # which W5d legitimately catches on its own)
+    dfalse = dict((c, ok) for c, ok, _, _ in analyse(DESKTOP_FALSE_HOLDER, GOOD_SHEET))
+    for c, ok in dfalse.items():
+        if c == "W5a toggleDesktopMode never turns the mobile viewport off":
+            expect(not ok, "desktop false fixture: %s must be RED" % c)
+        elif c.startswith("W5") and "W5d" not in c:
+            expect(ok, "desktop false fixture: %s must stay OK" % c)
+
+    # bad: policy values flipped to false — W5c RED, wiring still OK
+    dflip = dict((c, ok) for c, ok, _, _ in analyse(DESKTOP_POLICY_FLIPPED_HOLDER, GOOD_SHEET))
+    for c, ok in dflip.items():
+        if c == "W5c policy stays pinned to useWideViewPort/overview = true":
+            expect(not ok, "policy flipped fixture: %s must be RED" % c)
+        elif c.startswith("W5"):
+            expect(ok, "policy flipped fixture: %s must stay OK" % c)
+
+    # bad: restore deleted from the else branch — W5d RED
+    dnorest = dict((c, ok) for c, ok, _, _ in analyse(DESKTOP_NO_RESTORE_HOLDER, GOOD_SHEET))
+    for c, ok in dnorest.items():
+        if c == "W5d mobile else branch consumes mobileViewportSettings()":
+            expect(not ok, "no-restore fixture: %s must be RED" % c)
+        elif c.startswith("W5"):
+            expect(ok, "no-restore fixture: %s must stay OK" % c)
+
+    # plain holder (no toggleDesktopMode) must produce NO W5 criteria
+    expect(not any(c.startswith("W5") for c, _, _, _ in analyse(GOOD_HOLDER, GOOD_SHEET)),
+           "holder without toggleDesktopMode must not emit W5 criteria")
+
+    # ---- dv14-B1: W6 fixtures ----
+    dgal = analyse(GOOD_HOLDER, GOOD_SHEET, GALLERY_GOOD)
+    w6 = [(c, ok) for c, ok, _, _ in dgal if c.startswith("W6")]
+    expect(len(w6) == 4, "gallery fixture should emit 4 W6 criteria, got %d" % len(w6))
+    for c, ok in w6:
+        expect(ok, "gallery good fixture must pass %s" % c)
+
+    dwalk = dict((c, ok) for c, ok, _, _ in analyse(GOOD_HOLDER, GOOD_SHEET, GALLERY_WALKER_REVERT))
+    for c, ok in dwalk.items():
+        if c in ("W6a gallery outer effect takes the HOST Activity window",
+                 "W6b outer effect must not call findDialogWindow(view)"):
+            expect(not ok, "walker revert fixture: %s must be RED" % c)
+        elif c.startswith("W6"):
+            expect(ok, "walker revert fixture: %s must stay OK" % c)
+
+    dflags = dict((c, ok) for c, ok, _, _ in analyse(GOOD_HOLDER, GOOD_SHEET, GALLERY_FLAGS_MISSING))
+    for c, ok in dflags.items():
+        if c in ("W6c inner dialog effect applies galleryDialogWindowFlags()",
+                 "W6d galleryDialogWindowFlags defined once with both flags"):
+            expect(not ok, "flags missing fixture: %s must be RED" % c)
+        elif c.startswith("W6"):
+            expect(ok, "flags missing fixture: %s must stay OK" % c)
+
     if failures:
         print("SELFTEST FAIL:")
         for f in failures:
             print("  - %s" % f)
         return 1
     print("selftest: good=GREEN, direct-assign revert=RED, legacy inline=RED, "
-          "downstream rewrite=RED")
+          "downstream rewrite=RED, desktop viewport false revert=RED, "
+          "policy flip=RED, restore delete=RED, gallery walker revert=RED, "
+          "gallery flags missing=RED")
     return 0
 
 
@@ -270,7 +566,7 @@ def main(argv):
     args = [a for a in argv[1:] if a != "--selftest"]
     root = args[0] if args else "."
     paths = []
-    for rel in (HOLDER_REL, SHEET_REL):
+    for rel in (HOLDER_REL, SHEET_REL, GALLERY_REL):
         p = os.path.join(root, rel)
         if not os.path.isfile(p):
             print("FAIL required file missing: %s" % rel)
@@ -279,7 +575,8 @@ def main(argv):
 
     holder_code = open(paths[0], encoding="utf-8").read()
     sheet_code = open(paths[1], encoding="utf-8").read()
-    results = analyse(holder_code, sheet_code)
+    gallery_code = open(paths[2], encoding="utf-8").read()
+    results = analyse(holder_code, sheet_code, gallery_code)
 
     failed = [(c, d, l) for c, ok, d, l in results if not ok]
     for crit, ok, detail, line in results:
