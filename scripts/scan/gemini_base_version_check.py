@@ -66,6 +66,22 @@ VOICE_CLASS = "GeminiVoiceProvider"
 VOICE_FN = "buildVoiceOutputRequest"
 PROBE_ARM_MARK = "/models"
 
+# [deep-audit-1039 A-05] The voice family's own base normalizations. Both were
+# inline copies with the wrong predicate width:
+#   * Azure: the /cognitiveservices strip ran BEFORE any trailing-slash trim, so
+#     a custom base pasted as `https://…speech.microsoft.com/` never matched and
+#     the endpoint path appended the segment a second time.
+#   * ElevenLabs / Deepgram: `if (!base.contains("/v1")) base += "/v1"` asks
+#     "does this path mention /v1 anywhere", but concatenation needs the segment
+#     as the SUFFIX to end up with exactly one copy.
+VOICE_FACTORY_REL = os.path.join(APP_DIR, "provider", "voice", "VoiceProviderFactory.kt")
+VOICE_NORMALIZER_REL = os.path.join(APP_DIR, "provider", "voice", "VoiceBaseNormalizer.kt")
+VOICE_RULE_FN = "normalizeVersionSegment"
+AZURE_RULE_FN = "normalizeAzureBase"
+VOICE_NORMALIZER_DELEGATE = "VoiceBaseNormalizer."
+BASELINE_VERSION_PREDICATE = 'contains("/v1")'
+VOICE_RULE_CALL_SITES = 2  # ElevenLabs + Deepgram's shared dgBase()
+
 # file -> normalizer function name
 TARGETS = {
     "GeminiProvider.kt": "normalizedBasePath",
@@ -321,7 +337,8 @@ def check_cross_file_sites(root, gemini_bodies):
     return failures
 
 
-def _fixture_voice(fn_body=None, decoy_body=None, fn_name="buildVoiceOutputRequest"):
+def _fixture_voice(fn_body=None, decoy_body=None, fn_name="buildVoiceOutputRequest",
+                  vendors_extra=None):
     gemini = fn_body or (
         "        val base = GeminiBasePath.normalize(effectiveBaseURL())\n"
         '        return "$base/models/$model:generateContent?key="\n'
@@ -343,6 +360,8 @@ def _fixture_voice(fn_body=None, decoy_body=None, fn_name="buildVoiceOutputReque
         + gemini
         + "    }\n"
         "}\n"
+        + (vendors_extra or "")
+        + _VOICE_VENDORS_FIXTURE
     )
 
 
@@ -398,8 +417,135 @@ def _legacy_sibling_body():
     )
 
 
+# --- criterion 6 fixtures (deep-audit-1039 A-05) -------------------------------
+# Bare host names only: the fixtures deliberately avoid "https://" so nothing here
+# can be confused with, or truncated by, comment/string handling.
+_VOICE_VENDORS_FIXTURE = (
+    "\n"
+    "internal object VoiceVendorsFixture {\n"
+    "    fun elevenBase(raw: String?): String =\n"
+    "        VoiceBaseNormalizer.normalizeVersionSegment("
+    'raw, defaultBase = "api.elevenlabs.io")\n'
+    "    fun deepgramBase(raw: String?): String =\n"
+    "        VoiceBaseNormalizer.normalizeVersionSegment("
+    'raw, defaultBase = "api.deepgram.com")\n'
+    "}\n"
+)
+
+_FIXTURE_NORMALIZER_GREEN = (
+    "package com.rikkaminis.app.provider.voice\n"
+    "\n"
+    "internal object VoiceBaseNormalizer {\n"
+    '    fun normalizeVersionSegment(raw: String?, version: String = "/v1", '
+    "defaultBase: String): String {\n"
+    "        val base = raw?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } "
+    "?: defaultBase.trimEnd('/')\n"
+    "        var stripped = base\n"
+    "        while (true) {\n"
+    "            val next = stripped.removeSuffix(version)\n"
+    "            if (next == stripped) break\n"
+    "            stripped = next\n"
+    "        }\n"
+    '        return "$stripped$version"\n'
+    "    }\n"
+    "\n"
+    "    fun normalizeAzureBase(raw: String?): String {\n"
+    "        val base = raw?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } ?: return \"\"\n"
+    "        var stripped = base\n"
+    "        while (true) {\n"
+    "            val next = stripped\n"
+    '                .removeSuffix("/cognitiveservices")\n'
+    '                .removeSuffix("/v1")\n'
+    "                .trimEnd('/')\n"
+    "            if (next == stripped) break\n"
+    "            stripped = next\n"
+    "        }\n"
+    "        return stripped\n"
+    "    }\n"
+    "}\n"
+)
+
+_FIXTURE_FACTORY_GREEN = (
+    "package com.rikkaminis.app.provider.voice\n"
+    "\n"
+    "internal object VoiceProviderFactory {\n"
+    "    fun build(custom: String?, normalized: String, apiKey: String?): Any =\n"
+    "        if (normalized.contains(AZURE_HOST_MARK)) {\n"
+    "            AzureTTSVoiceProvider(\n"
+    '                "instance",\n'
+    "                VoiceBaseNormalizer.normalizeAzureBase(custom)\n"
+    "                    .ifEmpty { AZURE_DEFAULT_HOST },\n"
+    "                apiKey,\n"
+    "            )\n"
+    "        } else {\n"
+    '            OtherVoiceProvider("instance", custom, apiKey)\n'
+    "        }\n"
+    "}\n"
+)
+
+# Dirty variants: each one moves exactly one decision point off the fixed shape.
+_FIXTURE_NORMALIZER_CONTAINS = _FIXTURE_NORMALIZER_GREEN.replace(
+    "        var stripped = base\n"
+    "        while (true) {\n"
+    "            val next = stripped.removeSuffix(version)\n"
+    "            if (next == stripped) break\n"
+    "            stripped = next\n"
+    "        }\n"
+    '        return "$stripped$version"\n',
+    "        var stripped = base\n"
+    "        if (!stripped.contains(version)) stripped += version\n"
+    "        return stripped\n",
+)
+
+_FIXTURE_NORMALIZER_AZURE_NO_TRIM = _FIXTURE_NORMALIZER_GREEN.replace(
+    "        val base = raw?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } ?: return \"\"\n"
+    "        var stripped = base\n"
+    "        while (true) {\n"
+    "            val next = stripped\n"
+    '                .removeSuffix("/cognitiveservices")\n'
+    '                .removeSuffix("/v1")\n'
+    "                .trimEnd('/')\n",
+    "        val base = raw?.trim()?.takeIf { it.isNotEmpty() } ?: return \"\"\n"
+    "        var stripped = base\n"
+    "        while (true) {\n"
+    "            val next = stripped\n"
+    '                .removeSuffix("/cognitiveservices")\n'
+    '                .removeSuffix("/v1")\n',
+)
+
+_FIXTURE_NORMALIZER_RENAMED = _FIXTURE_NORMALIZER_GREEN.replace(
+    "fun normalizeVersionSegment(", "fun collapseVersionSegment("
+)
+
+_FIXTURE_FACTORY_INLINE = _FIXTURE_FACTORY_GREEN.replace(
+    "                VoiceBaseNormalizer.normalizeAzureBase(custom)\n"
+    "                    .ifEmpty { AZURE_DEFAULT_HOST },\n",
+    "                inlineAzureBase(custom),\n",
+) + (
+    "\n"
+    "private fun inlineAzureBase(custom: String?): String {\n"
+    "    var azureBase = custom ?: AZURE_DEFAULT_HOST\n"
+    '    if (azureBase.endsWith("/cognitiveservices")) {\n'
+    '        azureBase = azureBase.removeSuffix("/cognitiveservices")\n'
+    "    }\n"
+    "    return azureBase\n"
+    "}\n"
+)
+
+_FIXTURE_VENDOR_BASELINE = (
+    "\n"
+    "class ElevenLabsVoiceProvider(providerId: String, baseURL: String, apiKey: String?) {\n"
+    "    fun synthesize(voiceId: String): String {\n"
+    "        var base = baseURL.trimEnd('/')\n"
+    '        if (!base.contains("/v1")) base += "/v1"\n'
+    '        return "$base/text-to-speech/$voiceId"\n'
+    "    }\n"
+    "}\n"
+)
+
 def write_fixture(root, partial=False, sibling_body=None, voice_fn_body=None,
-                  decoy_body=None, probe=None, voice_fn_name="buildVoiceOutputRequest"):
+                  decoy_body=None, probe=None, voice_fn_name="buildVoiceOutputRequest",
+                  voice_normalizer=None, voice_factory=None, vendors_extra=None):
     gemini_dir = os.path.join(root, GEMINI_DIR)
     os.makedirs(gemini_dir, exist_ok=True)
     files = {
@@ -443,11 +589,22 @@ def write_fixture(root, partial=False, sibling_body=None, voice_fn_body=None,
             )
             + "}\n"
         ),
-        VOICE_REL: _fixture_voice(voice_fn_body, decoy_body, voice_fn_name),
+        VOICE_REL: _fixture_voice(voice_fn_body, decoy_body, voice_fn_name,
+                                  vendors_extra),
+        VOICE_NORMALIZER_REL: (
+            voice_normalizer if voice_normalizer is not None else _FIXTURE_NORMALIZER_GREEN
+        ),
+        VOICE_FACTORY_REL: (
+            voice_factory if voice_factory is not None else _FIXTURE_FACTORY_GREEN
+        ),
         MUTATION_REL: _fixture_mutation(probe),
     }
     if partial:
         for rel in CROSS_FILE_RELS:
+            files.pop(rel, None)
+        # Criterion 6's targets go too: a partial tree must not half-run the
+        # voice criteria (the mount already names what is missing).
+        for rel in (VOICE_NORMALIZER_REL, VOICE_FACTORY_REL):
             files.pop(rel, None)
     for rel, text in files.items():
         path = os.path.join(root, rel)
@@ -557,6 +714,41 @@ def selftest():
         voice_fn_name="buildOutputRequest",
     )
 
+    # Criterion 6 — the voice family's own base rules (A-05). One green arm, so a
+    # criterion that silently stopped running is caught, then one dirty arm per
+    # decision point (rule shape / Azure trim / factory delegation / vendor sites).
+    run("voice base criteria run on the full fixture tree", False, "voice base criteria 6")
+    run(
+        "the version rule answered by contains() is caught",
+        True,
+        "answer the version question",
+        voice_normalizer=_FIXTURE_NORMALIZER_CONTAINS,
+    )
+    run(
+        "the Azure rule dropping the trailing-slash trim is caught",
+        True,
+        "trims trailing slashes",
+        voice_normalizer=_FIXTURE_NORMALIZER_AZURE_NO_TRIM,
+    )
+    run(
+        "a renamed voice base rule is a rot failure, not a silent skip",
+        True,
+        "not found",
+        voice_normalizer=_FIXTURE_NORMALIZER_RENAMED,
+    )
+    run(
+        "an inline copy of the Azure strip in the factory is caught",
+        True,
+        "inline",
+        voice_factory=_FIXTURE_FACTORY_INLINE,
+    )
+    run(
+        "a vendor re-growing the baseline contains() predicate is caught",
+        True,
+        "substring check is back",
+        vendors_extra=_FIXTURE_VENDOR_BASELINE,
+    )
+
     print("=== gemini_base_version_check --selftest ===")
     failed = 0
     for name, ok, note in results:
@@ -568,6 +760,115 @@ def selftest():
         return 1
     print(f"GEMINI_BASE_VERSION_SELFTEST=PASS ({len(results)} arms)")
     return 0
+
+
+def check_voice_base_normalization(root):
+    """[deep-audit-1039 A-05] The voice family's two base normalizations.
+
+    Decision points, in the order a request hits them:
+
+      1. the rules live in ONE place (`VoiceBaseNormalizer`) and each answers its
+         question by SUFFIX, never by `contains` / `endsWith` on an untrimmed base;
+      2. the Azure arm consumes the normalized base — no second inline copy of the
+         strip, which is how the trailing-slash hole opened;
+      3. both version-segment sites call the shared rule, and no vendor re-grows
+         the baseline `contains("/v1")` predicate.
+    """
+    failures = []
+
+    npath = os.path.join(root, VOICE_NORMALIZER_REL)
+    with open(npath, encoding="utf-8") as f:
+        ntext = strip_comments(f.read())
+
+    bodies = {}
+    for fn in (VOICE_RULE_FN, AZURE_RULE_FN):
+        body = function_body(ntext, fn)
+        if body is None:
+            failures.append(
+                f"{VOICE_NORMALIZER_REL}: `{fn}` not found — the voice base rule moved; "
+                "re-anchor this gate deliberately (a renamed rule must fail loudly, "
+                "not leave the guard silently green)"
+            )
+            print(f"  [ROT] {VOICE_NORMALIZER_REL}: `{fn}` not found")
+            continue
+        bodies[fn] = body
+
+    version_pieces = {
+        "trims trailing slashes before deciding": "trimEnd('/')" in bodies.get(VOICE_RULE_FN, ""),
+        "strips the existing version suffix": "removeSuffix(version)" in bodies.get(VOICE_RULE_FN, ""),
+        "restores exactly one version segment": "$stripped$version" in bodies.get(VOICE_RULE_FN, ""),
+        "answer the version question by contains(": "contains(" not in bodies.get(VOICE_RULE_FN, ""),
+    }
+    if VOICE_RULE_FN in bodies:
+        ok = all(version_pieces.values())
+        print(f"  [{'OK' if ok else 'FAIL'}] {VOICE_RULE_FN}  "
+              + ", ".join(f"{k}={v}" for k, v in version_pieces.items()))
+        for piece, present in version_pieces.items():
+            if not present:
+                failures.append(f"VoiceBaseNormalizer.{VOICE_RULE_FN} does not {piece}")
+
+    azure_pieces = {
+        "trims trailing slashes before deciding": "trimEnd('/')" in bodies.get(AZURE_RULE_FN, ""),
+        "strips the pasted /cognitiveservices segment": 'removeSuffix("/cognitiveservices")' in bodies.get(AZURE_RULE_FN, ""),
+        "strips a pasted complete endpoint (/v1)": 'removeSuffix("/v1")' in bodies.get(AZURE_RULE_FN, ""),
+        "does not decide by endsWith( on a raw base": "endsWith(" not in bodies.get(AZURE_RULE_FN, ""),
+    }
+    if AZURE_RULE_FN in bodies:
+        ok = all(azure_pieces.values())
+        print(f"  [{'OK' if ok else 'FAIL'}] {AZURE_RULE_FN}  "
+              + ", ".join(f"{k}={v}" for k, v in azure_pieces.items()))
+        for piece, present in azure_pieces.items():
+            if not present:
+                failures.append(f"VoiceBaseNormalizer.{AZURE_RULE_FN} does not {piece}")
+
+    # The Azure arm must consume the rule instead of keeping its own copy.
+    fpath = os.path.join(root, VOICE_FACTORY_REL)
+    with open(fpath, encoding="utf-8") as f:
+        ftext = strip_comments(f.read())
+    delegated = len(re.findall(re.escape(VOICE_NORMALIZER_DELEGATE + AZURE_RULE_FN + "("), ftext))
+    ok = delegated == 1
+    print(f"  [{'OK' if ok else 'FAIL'}] VoiceProviderFactory Azure arm consumes the shared rule "
+          f"({delegated} call site)")
+    if not ok:
+        failures.append(
+            f"{VOICE_FACTORY_REL}: {delegated} `{VOICE_NORMALIZER_DELEGATE}{AZURE_RULE_FN}(` call "
+            "site(s) — the Azure base must be normalized by the shared rule exactly once"
+        )
+    for leftover, why in (
+        ('removeSuffix("/cognitiveservices")', "an inline copy of the Azure strip is back"),
+        ('endsWith("/cognitiveservices")', "the baseline endsWith-before-trim shape is back"),
+    ):
+        if leftover in ftext:
+            failures.append(
+                f"{VOICE_FACTORY_REL}: `{leftover}` present — {why}; the rule belongs to "
+                f"VoiceBaseNormalizer.{AZURE_RULE_FN} (App/UI layer must not re-decide it)."
+            )
+            print(f"  [FAIL] {VOICE_FACTORY_REL}: inline `{leftover}`")
+
+    # Both version-segment sites delegate, and no vendor re-grows the predicate.
+    with open(os.path.join(root, VOICE_REL), encoding="utf-8") as f:
+        vtext = strip_comments(f.read())
+    sites = len(re.findall(re.escape(VOICE_NORMALIZER_DELEGATE + VOICE_RULE_FN + "("), vtext))
+    ok = sites == VOICE_RULE_CALL_SITES
+    print(f"  [{'OK' if ok else 'FAIL'}] VoiceProviderVendors version-segment sites routed "
+          f"({sites}/{VOICE_RULE_CALL_SITES})")
+    if not ok:
+        failures.append(
+            f"{VOICE_REL}: {sites} version-segment call site(s) through "
+            f"{VOICE_NORMALIZER_DELEGATE}{VOICE_RULE_FN}( — expected {VOICE_RULE_CALL_SITES} "
+            "(ElevenLabs + Deepgram); a new vendor needs a deliberate re-anchor"
+        )
+    leftovers = vtext.count(BASELINE_VERSION_PREDICATE)
+    ok = leftovers == 0
+    print(f"  [{'OK' if ok else 'FAIL'}] vendors carry no `{BASELINE_VERSION_PREDICATE}` version predicate")
+    if not ok:
+        failures.append(
+            f"{VOICE_REL}: {leftovers}x `{BASELINE_VERSION_PREDICATE}` — the baseline "
+            "substring check is back; it answers `does /v1 appear anywhere`, so a base "
+            "with the segment mid-path goes out versionless"
+        )
+
+    return failures
 
 
 def main():
@@ -646,6 +947,23 @@ def main():
     else:
         print("  [FULL] cross-file criteria 4/5:")
         failures += check_cross_file_sites(root, bodies)
+
+    # Criterion 6 — the voice family's own base rules (A-05). Same partial-tree
+    # rule as 4/5: the frozen test_scan.py fixtures build a gemini-only tree, so
+    # an absent voice normalizer means "fixture-shaped tree", not "rule removed".
+    voice_missing = [
+        rel for rel in (VOICE_NORMALIZER_REL, VOICE_FACTORY_REL)
+        if not os.path.isfile(os.path.join(root, rel))
+    ]
+    if voice_missing or missing:
+        print(
+            "  [PARTIAL] voice base criteria skipped — tree lacks "
+            + ", ".join(voice_missing or list(missing))
+            + " (fixture-shaped tree: criteria 1-5 only)"
+        )
+    else:
+        print("  [FULL] voice base criteria 6 (A-05):")
+        failures += check_voice_base_normalization(root)
 
     print("")
     if failures:
