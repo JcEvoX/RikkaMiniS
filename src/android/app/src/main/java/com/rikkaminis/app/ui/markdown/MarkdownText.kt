@@ -54,6 +54,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import com.rikkaminis.app.ui.DisplayBitmapLimits.limitDisplaySize
 import com.rikkaminis.app.ui.chat.LocalMarkdownSessionId
 import com.rikkaminis.app.ui.chat.rememberMdMediaFile
 import com.rikkaminis.app.ui.media.resolvedMediaSourceKey
@@ -795,10 +797,35 @@ private fun openMediaExternally(context: Context, file: File, mime: String) {
 
 @Composable
 private fun MinisImageBlock(block: MarkdownParser.Block.Image) {
+    val context = LocalContext.current
+    val sessionId = LocalMarkdownSessionId.current
+    // [dv20-B03] Same two seams the chat renderer's image branch and the
+    // video/audio blocks below already use, so the three blocks cannot drift:
+    //  * `model = block.url` (bare) forces the AsyncImage fetcher to resolve
+    //    the host path against the GLOBAL bindMounts map, which is
+    //    last-writer-wins across sessions — inside session A the resolver can
+    //    hand back session B's path and the image renders as a blank 0-height
+    //    box. rememberMdMediaFile resolves it for THIS session, off the main
+    //    thread (produceState + IO).
+    //  * with no ImageRequest, Coil is handed a model with no size hint while
+    //    the column reports an unbounded height, so a tall image (chart
+    //    screenshot, long scan) is decoded at its intrinsic size and can
+    //    exceed the RecordingCanvas draw ceiling — the OOM/215 MB crash that
+    //    DisplayBitmapLimits documents. The ceiling is the shared
+    //    `limitDisplaySize()` extension, not a local copy.
+    // `remember(file, block.url)` keeps the request stable across the
+    // streaming-token recompositions that re-enter this block.
+    val file = rememberMdMediaFile(block.url, sessionId)
     val surfaceBg = MaterialTheme.colorScheme.surfaceVariant
     val borderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
+    val imageRequest = remember(file, block.url) {
+        ImageRequest.Builder(context)
+            .data(file ?: block.url)
+            .limitDisplaySize()
+            .build()
+    }
     AsyncImage(
-        model = block.url,
+        model = imageRequest,
         contentDescription = block.alt.ifEmpty { filenameFromUrl(block.url) },
         contentScale = ContentScale.Fit,
         modifier = Modifier

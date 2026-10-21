@@ -1363,6 +1363,102 @@ def check_media_host_keys(sources):
                         problems.append(
                             "arm8e: the update{} block never re-applies the text "
                             "colour -- a theme flip leaves the viewer on the old one")
+    # 8d (block-level, dv20-B05): the file-level check above only sees "at
+    # least one call in the file", so a SECOND media block could re-introduce
+    # its own resolver and the gate stays green -- exactly the blind spot the
+    # image block lived in (MinisImageBlock had no seam while its video/audio
+    # siblings mounted it). Every media block in the markdown renderer must
+    # mount the seam itself.
+    clean = sources.get(_MARKDOWN_REL)
+    if clean is not None:
+        name = _MARKDOWN_REL.rsplit("/", 1)[-1]
+        block_decls = list(re.finditer(
+            r"fun\s+(\w+)\s*\(\s*block\s*:\s*[\w.]*\.(?:Image|Video|Audio)\s*\)", clean))
+        if not block_decls:
+            problems.append(
+                "arm8d: no media block declarations found in %s -- the "
+                "block-level seam anchor moved, re-point this guard" % name)
+        for m in block_decls:
+            fname = m.group(1)
+            body = function_body(clean, r"fun\s+%s\s*\(" % re.escape(fname))
+            if body and not re.search(r"\brememberMdMediaFile\s*\(", body):
+                problems.append(
+                    "arm8d: %s in %s renders its media without the shared "
+                    "rememberMdMediaFile seam -- the block resolves its own "
+                    "path (or none) while its media siblings mount the seam, "
+                    "so the same markdown renders differently per block type"
+                    % (fname, name))
+
+    # 8f (dv20-B05): every Coil image request in a markdown renderer is
+    # decode-capped through the shared limitDisplaySize() ceiling, and the
+    # image composable is handed the built request -- not the raw url/file.
+    # The bare `model = block.url` shape routes through the AsyncImage fetcher
+    # with no size hint: the vertically-scrollable column leaves Coil's height
+    # constraint unbounded, so a tall image decodes at intrinsic size and can
+    # exceed the RecordingCanvas draw ceiling (DisplayBitmapLimits documents
+    # the crash).
+    def _paren_args(text, idx):
+        p = text.find("(", idx)
+        if p < 0:
+            return None
+        depth = 0
+        for j in range(p, min(len(text), p + 4000)):
+            if text[j] == "(":
+                depth += 1
+            elif text[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    return text[p + 1:j]
+        return None
+
+    for rel in (_STREAM_REL, _MARKDOWN_REL):
+        clean = sources.get(rel)
+        if clean is None:
+            continue
+        name = rel.rsplit("/", 1)[-1]
+        builders = list(re.finditer(r"ImageRequest\s*\.\s*Builder\s*\(", clean))
+        images = list(re.finditer(r"\b(?:Subcompose)?AsyncImage\s*\(", clean))
+        if images and not builders:
+            problems.append(
+                "arm8f: %s hands Coil a model with no ImageRequest construction "
+                "in the file -- the decode-size ceiling anchor moved, re-point "
+                "this guard" % name)
+        for b in builders:
+            nxt = re.search(r"\.build\s*\(", clean[b.start():b.start() + 800])
+            if nxt is None:
+                problems.append(
+                    "arm8f: an ImageRequest in %s is never .build()-finished "
+                    "-- re-point this guard" % name)
+                continue
+            chain = clean[b.start():b.start() + nxt.end()]
+            if "limitDisplaySize" not in chain:
+                problems.append(
+                    "arm8f: an ImageRequest in %s is built without the shared "
+                    "limitDisplaySize() ceiling -- the vertically-scrollable "
+                    "column leaves Coil's height constraint unbounded, so a "
+                    "tall image decodes at intrinsic size and can exceed the "
+                    "RecordingCanvas draw ceiling" % name)
+        for i in images:
+            args = _paren_args(clean, i.start())
+            if args is None:
+                continue
+            mm = re.search(r"\bmodel\s*=\s*([^,\n]+)", args)
+            if mm is None:
+                continue
+            expr = mm.group(1).strip()
+            if re.search(r"\burl\b|block\.url", expr) or expr == "file":
+                problems.append(
+                    "arm8f: an image composable in %s hands Coil the raw media "
+                    "(%s) instead of the built ImageRequest -- the "
+                    "session-scoped resolver and the decode ceiling are both "
+                    "bypassed" % (name, expr))
+            elif re.match(r"^\w+$", expr):
+                decl = re.search(r"val\s+%s\b" % re.escape(expr), clean)
+                if decl is None or "ImageRequest.Builder" not in clean[decl.start():decl.start() + 240]:
+                    problems.append(
+                        "arm8f: the model handed to Coil in %s (%s) has no "
+                        "ImageRequest construction behind it -- the decode-size "
+                        "ceiling is unchecked for this source" % (name, expr))
     return problems
 
 
@@ -1448,6 +1544,18 @@ fun RenderMdAudio(block: MdBlock.Audio) {
         }
     }
 }
+
+@Composable
+fun RenderMdImage(block: MdBlock.Image) {
+    val file = rememberMdMediaFile(block.url, sessionId)
+    val imageRequest = remember(file, block.url) {
+        ImageRequest.Builder(context)
+            .data(file ?: block.url)
+            .limitDisplaySize()
+            .build()
+    }
+    SubcomposeAsyncImage(model = imageRequest)
+}
 '''
     COMPLIANT_MARKDOWN = '''
 @Composable
@@ -1469,6 +1577,20 @@ fun MinisAudioBlock(block: MdBlock.Audio) {
             true
         }
     }
+}
+
+@Composable
+fun MinisImageBlock(block: MdBlock.Image) {
+    val context = LocalContext.current
+    val sessionId = LocalMarkdownSessionId.current
+    val file = rememberMdMediaFile(block.url, sessionId)
+    val imageRequest = remember(file, block.url) {
+        ImageRequest.Builder(context)
+            .data(file ?: block.url)
+            .limitDisplaySize()
+            .build()
+    }
+    AsyncImage(model = imageRequest)
 }
 '''
     COMPLIANT_CHAT = '''
@@ -1589,8 +1711,42 @@ private fun ThinkingFullContentDialog(content: String, onDismiss: () -> Unit) {
         "    val mediaController = remember(filePath) { "
         "android.widget.MediaController(ctx) }")
 
+    # dv20-B05 breakers: the image block (the third media block) loses the
+    # seam / the ceiling / hands Coil the raw media
+    M8d3 = COMPLIANT_MARKDOWN.replace(
+        "    val file = rememberMdMediaFile(block.url, sessionId)\n"
+        "    val imageRequest = remember(file, block.url) {",
+        "    val imageRequest = remember(file, block.url) {")
+    M8d4 = COMPLIANT_MARKDOWN.replace(
+        "    AsyncImage(model = imageRequest)\n}",
+        "    AsyncImage(model = imageRequest)\n}\n\n"
+        "@Composable\n"
+        "fun MinisGifBlock(block: MdBlock.Image) {\n"
+        "    val imageRequest = remember(block.url) {\n"
+        "        ImageRequest.Builder(context)\n"
+        "            .data(block.url)\n"
+        "            .limitDisplaySize()\n"
+        "            .build()\n"
+        "    }\n"
+        "    AsyncImage(model = imageRequest)\n"
+        "}")
+    M8f1 = COMPLIANT_MARKDOWN.replace("            .limitDisplaySize()\n", "")
+    M8f2 = COMPLIANT_MARKDOWN.replace(
+        "AsyncImage(model = imageRequest)", "AsyncImage(model = block.url)")
+    M8f3 = COMPLIANT_STREAM.replace("            .limitDisplaySize()\n", "")
+    P2 = COMPLIANT_MARKDOWN.replace(
+        "fun MinisImageBlock(block: MdBlock.Image) {",
+        "// NEVER: model = block.url with no ImageRequest -- decode ceiling gone\n"
+        "fun MinisImageBlock(block: MdBlock.Image) {")
+
     cases = [
         ("arm8 compliant tree", tree(), None),
+        ("arm8d M8d3 image block loses the seam (dv20-B05 baseline)", tree(markdown=M8d3), "arm8d"),
+        ("arm8d M8d4 a second media block re-introduces its own resolver", tree(markdown=M8d4), "arm8d"),
+        ("arm8f M8f1 image request loses the display ceiling", tree(markdown=M8f1), "arm8f"),
+        ("arm8f M8f2 image block hands Coil the raw media", tree(markdown=M8f2), "arm8f"),
+        ("arm8f M8f3 stream image branch loses the ceiling", tree(stream=M8f3), "arm8f"),
+        ("arm8 precision P2 markdown comments mention the shapes", tree(markdown=P2), None),
         ("arm8a M8a1 inline video host has no key", tree(player=M8a1), "arm8a"),
         ("arm8a M8a2 key does not carry the data source", tree(player=M8a2), "arm8a"),
         ("arm8a M8a3 fullscreen host has no key", tree(player=M8a3), "arm8a"),
@@ -1598,7 +1754,7 @@ private fun ThinkingFullContentDialog(content: String, onDismiss: () -> Unit) {
         ("arm8b M8b2 audio isPlaying loses the file key", tree(player=M8b2), "arm8b"),
         ("arm8b M8b3 audio host gone (fail-closed anchor)", tree(player=M8b3), "arm8b"),
         ("arm8c M8c1 setDataSource back inside remember{}", tree(stream=M8c1), "arm8c"),
-        ("arm8c M8c2 resolver back inside remember{}", tree(markdown=M8c2), "arm8c"),
+        ("arm8c M8c2 resolver back inside remember{}", tree(markdown=M8c2), ["arm8c", "arm8d"]),
         ("arm8d M8d1 resolver off the IO dispatcher", tree(stream=M8d1), "arm8d"),
         ("arm8d M8d2 shared resolver seam gone", tree(markdown=M8d2), "arm8d"),
         ("arm8e M8e1 update{} block removed", tree(chat=M8e1), "arm8e"),
@@ -1619,10 +1775,11 @@ private fun ThinkingFullContentDialog(content: String, onDismiss: () -> Unit) {
             if problems:
                 ok = False
         else:
-            mark = "ok" if arms == {want_arm} else "FAIL"
+            want = {want_arm} if isinstance(want_arm, str) else set(want_arm or ())
+            mark = "ok" if arms == want else "FAIL"
             print(f"  selftest {name}: arms={sorted(arms) or ['GREEN']} "
                   f"(expect exactly {want_arm}) {mark}")
-            if arms != {want_arm}:
+            if arms != want:
                 ok = False
         for p in problems:
             print(f"      - {p}")
