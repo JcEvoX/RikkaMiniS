@@ -187,6 +187,78 @@ def declared_flags(text):
     return set(re.findall(r'"([^"]+)"', body))
 
 
+def value_flag_reads(text):
+    """Keys the handler reads as a VALUE (`args.get*("key")`), with the one-token
+    call body only — `args.get("h", "help")` style lists all land here.
+
+    Note what this deliberately is not: `getBool()` reads `values` too, so a key
+    read with getBool IS a value read here. That is the whole point — while
+    `--visible-only` was declared boolean, `getBool("visible-only")` was exactly
+    the read that always saw "not given"."""
+    keys = set()
+    for call in re.finditer(r'args\.get(?:Int|Long|Double|Bool)?\(([^)]*)\)', text):
+        keys.update(re.findall(r'"([^"]+)"', call.group(1)))
+    return keys
+
+
+SUBJECT_KEY = "visible-only"
+
+
+def scan_flag_value_split(raw):
+    """[deep-audit-1038 A-02] A key declared in `booleanFlags` must not also be
+    read as a VALUE. For a declared boolean the parser binds no value: the
+    caller's spelling becomes a stray positional, the reader sees "not given",
+    and a `?: <default>` folds the request into its own opposite — the one
+    combination that cannot fail loudly."""
+    text = code_only(raw)
+    bad = []
+    declared = declared_flags(text)
+    if declared is None:
+        return ["the handle() booleanFlags declaration is gone — cannot judge the value/flag split"]
+    reads = value_flag_reads(text)
+    if not reads:
+        return ["no args.get*() value read found in the handler — the probe lost its subject"]
+    conflict = sorted(declared & reads)
+    if conflict:
+        bad.append(f"key(s) declared boolean AND read as a value: {conflict} "
+                   "(OffloadArgs binds no value for a declared boolean, so the caller's "
+                   "spelling is dropped and the reader sees 'not given')")
+    if SUBJECT_KEY not in reads:
+        bad.append(f"--{SUBJECT_KEY} is no longer read as a value — the probe lost its subject")
+    return bad
+
+
+def scan_visible_only_read(raw):
+    """[deep-audit-1038 A-02] `uiDump` must read `--visible-only` through the
+    three-way classifier: absent/bare keeps the documented default, a spelled
+    boolean is honoured, and garbage is REFUSED as a usage error instead of
+    being folded into the default (which is what inverted the request)."""
+    text = code_only(raw)
+    bad = []
+    body = member_body(text, "private fun uiDump(")
+    if body is None:
+        return ["uiDump() not found — the probe lost its subject"]
+    if 'VisibleOnlyFlag.resolve(args.get("visible-only"))' not in body:
+        bad.append("uiDump no longer reads --visible-only as a value through VisibleOnlyFlag.resolve")
+    if "VisibleOnlyFlag.Read.Absent -> true" not in body:
+        bad.append("the absent/bare case no longer keeps the documented default (true)")
+    if "is VisibleOnlyFlag.Read.Value -> read.value" not in body:
+        bad.append("a spelled boolean is no longer honoured")
+    marker = "is VisibleOnlyFlag.Read.Invalid -> "
+    at = body.find(marker)
+    if at < 0:
+        bad.append("uiDump no longer refuses a malformed --visible-only")
+    else:
+        tail = body[at + len(marker):]
+        if not tail.startswith("return err("):
+            bad.append("a malformed --visible-only no longer returns an error — it is folded into the default again")
+        elif "${read.raw}" not in tail:
+            bad.append("the refusal no longer echoes the caller's spelling")
+        elif "exit = 2" not in tail:
+            bad.append("the refusal is no longer a usage error (exit 2)")
+    return bad
+
+
 def scan_handler(raw):
     """Findings for AccessibilityOffloadHandler.kt (empty list = clean)."""
     text = code_only(raw)
@@ -202,6 +274,8 @@ def scan_handler(raw):
         if undeclared:
             bad.append(f"flag(s) read with hasFlag() but not declared boolean: {undeclared} "
                        "(OffloadArgs consumes the next token as their value)")
+    bad += scan_flag_value_split(raw)
+    bad += scan_visible_only_read(raw)
 
     body = slice_body(text, "private fun tapText(")
     if body is None:
@@ -496,6 +570,16 @@ def selftest():
         "        return err(args, \"ACTION_FAILED\", \"no tap\")\n"
         "    }\n"
         "\n"
+        "    private fun uiDump(args: OffloadArgs): NativeOffloadResult {\n"
+        "        val depth = args.getInt(\"depth\") ?: 10\n"
+        "        val visibleOnly = when (val read = VisibleOnlyFlag.resolve(args.get(\"visible-only\"))) {\n"
+        "            VisibleOnlyFlag.Read.Absent -> true\n"
+        "            is VisibleOnlyFlag.Read.Value -> read.value\n"
+        "            is VisibleOnlyFlag.Read.Invalid -> return err(args, \"INVALID_ARGS\", \"bad ${read.raw}\", exit = 2)\n"
+        "        }\n"
+        "        return ok(args, JSONObject())\n"
+        "    }\n"
+        "\n"
         "    private fun findByTextOrDesc() {}\n"
     )
 
@@ -665,6 +749,21 @@ def selftest():
             "            return ok(args, JSONObject())\n"
             "        }\n",
             "        if (n.isClickable) n.performAction(ACTION_CLICK)\n")),
+        # ── --visible-only: a declared boolean read as a value (deep-audit-1038 A-02) ──
+        ("handler/boolean flag is also read as a value", clean_handler.replace(
+            'booleanFlags = setOf("help", "contains")',
+            'booleanFlags = setOf("help", "contains", "visible-only")')),
+        ("handler/--visible-only read disappears", clean_handler.replace(
+            'args.get("visible-only")', 'args.get("mode")')),
+        ("handler/uiDump drops the value seam", clean_handler.replace(
+            'VisibleOnlyFlag.resolve(args.get("visible-only"))', 'args.getBool("visible-only")')),
+        ("handler/uiDump folds a malformed value into the default", clean_handler.replace(
+            'is VisibleOnlyFlag.Read.Invalid -> return err(args, "INVALID_ARGS", "bad ${read.raw}", exit = 2)',
+            'is VisibleOnlyFlag.Read.Invalid -> true')),
+        ("handler/uiDump reports the wrong exit code", clean_handler.replace(
+            "exit = 2", "exit = 1")),
+        ("handler/value-read/clean", clean_handler.replace(
+            'args.getInt("depth") ?: 10', 'args.getInt("duration") ?: 10')),
         # ── status labels vs dispatched verbs (deep-audit-1025 ISSUE-03) ──
         ("status/clean", clean_status),
         # A dispatched verb with no label: the overlay falls back to generic text.
@@ -749,9 +848,20 @@ def selftest():
             elif name.startswith("slot/"):
                 slot_failures += 1
     print(f"  {'✅ selftest passed' if not failures else f'❌ selftest failures: {failures}'}")
+    # ── A-02: the conflict arm must isolate the offending key, not smear ──
+    conflict = clean_handler.replace(
+        'booleanFlags = setOf("help", "contains")',
+        'booleanFlags = setOf("help", "contains", "visible-only")')
+    found = scan_flag_value_split(conflict)
+    a02_ok = len(found) == 1 and "visible-only" in found[0]
+    print(f"  {'✅' if a02_ok else '❌'} conflict arm isolates --visible-only (exactly one finding)"
+          if a02_ok else f"  ❌ conflict arm did not isolate --visible-only → {found}")
+    if not a02_ok:
+        failures += 1
     print(f"A11Y_STATUS_SELFTEST={'PASS' if status_failures == 0 else 'FAIL'}")
     print(f"A11Y_JUDGE_SINGLE_SOURCE_SELFTEST={'PASS' if judge_failures == 0 else 'FAIL'}")
     print(f"A11Y_SLOT_IDENTITY_SELFTEST={'PASS' if slot_failures == 0 else 'FAIL'}")
+    print(f"A11Y_VALUE_FLAG_SELFTEST={'PASS' if a02_ok else 'FAIL'}")
     return 1 if failures else 0
 
 
@@ -766,6 +876,10 @@ def main():
         ("MinisAccessibilityService (late screenshot reply)", SERVICE, scan_service),
         ("AccessibilityOffloadHandler (flags + tap outcome)", HANDLER, scan_handler),
         ("AccessibilityOffloadHandler (status verbs == dispatched verbs)", HANDLER, scan_status_tables),
+        ("AccessibilityOffloadHandler (--visible-only reads as a value, not a declared boolean)",
+         HANDLER, scan_flag_value_split),
+        ("AccessibilityOffloadHandler (uiDump refuses a malformed --visible-only with exit 2)",
+         HANDLER, scan_visible_only_read),
     ):
         path = os.path.join(root, rel)
         if not os.path.isfile(path):
