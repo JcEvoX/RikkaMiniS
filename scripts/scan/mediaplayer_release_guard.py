@@ -814,6 +814,7 @@ object MediaPlayerManager {
     ok = run_inline_player_selftest() and ok
     ok = run_inline_player_guards_selftest() and ok
     ok = run_fullscreen_video_window_selftest() and ok
+    ok = run_media_host_keys_selftest() and ok
     return ok
 
 
@@ -1094,6 +1095,549 @@ private fun shareMediaFile(context: android.content.Context, file: File, mime: S
     return ok
 
 
+# ─── Arm 8 (dv19-B02 / dv19-B06): media hosts keyed on their data source ────
+# A native media host (an AndroidView that renders audio/video, or the viewer of
+# a markdown media block) must re-mount on the DATA SOURCE it renders, and must
+# not open or resolve that source during composition. All four hosts of this
+# family carried an unkeyed view or unkeyed playback state, and two markdown
+# renderers still ran setDataSource()/resolveMediaFile() inside remember {} --
+# MediaPlayer.setDataSource opens the fd and parses the container header, and the
+# markdown resolver walks the session tree: both are main-thread IO in
+# composition.
+
+_STREAM_REL = (
+    "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/StreamingMarkdownText.kt"
+)
+_MARKDOWN_REL = (
+    "src/android/app/src/main/java/com/rikkaminis/app/ui/markdown/MarkdownText.kt"
+)
+_CHAT_UI_REL = (
+    "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatAssistantMessageUI.kt"
+)
+
+# What a key must carry to identify a media source: the path/uri a card was
+# handed, the resolved host File, or a named derivation of one.
+_SOURCE_HINT = re.compile(r"\bfilePath\b|\bfile\b|absolutePath|SourceKey\b")
+
+# (file, declaration, label) — hosts whose native view must be re-keyed.
+_VIEW_HOSTS = (
+    (INLINE_PLAYER_REL, r"fun\s+InlineVideoPlayer\s*\(", "InlineVideoPlayer"),
+    (INLINE_PLAYER_REL, r"private\s+fun\s+FullscreenVideoContent\s*\(",
+     "FullscreenVideoContent"),
+)
+
+# (file, declaration, label) — hosts whose playback state must be re-keyed.
+_STATE_HOSTS = (
+    (INLINE_PLAYER_REL, r"fun\s+InlineVideoPlayer\s*\(", "InlineVideoPlayer"),
+    (INLINE_PLAYER_REL, r"fun\s+InlineAudioPlayer\s*\(", "InlineAudioPlayer"),
+    (INLINE_PLAYER_REL, r"private\s+fun\s+FullscreenVideoContent\s*\(",
+     "FullscreenVideoContent"),
+    (_STREAM_REL, r"fun\s+RenderMdAudio\s*\(", "RenderMdAudio"),
+    (_MARKDOWN_REL, r"fun\s+MinisAudioBlock\s*\(", "MinisAudioBlock"),
+)
+
+
+def enclosing_key(clean: str, idx: int):
+    """(args, start, end) of the smallest `key(<args>) { … }` block containing idx."""
+    best = None
+    n = len(clean)
+    for m in re.finditer(r"\bkey\s*\(", clean):
+        open_idx = clean.find("(", m.start())
+        depth, i = 1, open_idx + 1
+        while i < n and depth:
+            if clean[i] == "(":
+                depth += 1
+            elif clean[i] == ")":
+                depth -= 1
+            i += 1
+        if depth:
+            continue
+        args = clean[open_idx + 1:i - 1]
+        brace = clean.find("{", i)
+        if brace < 0:
+            continue
+        start, end = brace_span(clean, brace)
+        if start < idx < end and (best is None or (end - start) < (best[2] - best[1])):
+            best = (args, start, end)
+    return best
+
+
+def arg_lambda_body(text: str, call_idx: int, arg: str):
+    """Body of the `<arg> = { … }` lambda passed to the call at call_idx."""
+    open_idx = text.find("(", call_idx)
+    if open_idx < 0:
+        return None
+    depth, i, n = 1, open_idx + 1, len(text)
+    while i < n and depth:
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+        i += 1
+    args = text[open_idx:i]
+    m = re.search(r"\b%s\s*=\s*\{" % re.escape(arg), args)
+    if not m:
+        return None
+    start, end = brace_span(text, open_idx + m.end() - 1)
+    return text[start:end]
+
+
+def remember_spans(clean: str):
+    """Char spans of every `remember …{ … }` trailing-lambda block."""
+    spans = []
+    n = len(clean)
+    for m in re.finditer(r"\bremember\b", clean):
+        i = m.end()
+        while i < n and clean[i].isspace():
+            i += 1
+        if i < n and clean[i] == "(":
+            depth = 0
+            while i < n:
+                if clean[i] == "(":
+                    depth += 1
+                elif clean[i] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        i += 1
+                        break
+                i += 1
+            while i < n and clean[i].isspace():
+                i += 1
+        if i < n and clean[i] == "{":
+            spans.append(brace_span(clean, i))
+    return spans
+
+
+def io_block_spans(clean: str):
+    """Char spans of every `withContext(Dispatchers.IO) { … }` block."""
+    spans = []
+    for m in re.finditer(r"withContext\s*\(\s*Dispatchers\.IO\s*\)\s*\{", clean):
+        spans.append(brace_span(clean, clean.find("{", m.end() - 1)))
+    return spans
+
+
+def unkeyed_delegates(body: str):
+    """(unkeyed names, total) for every `var x by remember …` state carrier."""
+    bad = []
+    total = 0
+    for m in re.finditer(r"\bvar\s+(\w+)\s+by\s+remember\b", body):
+        total += 1
+        i = m.end()
+        while i < len(body) and body[i].isspace():
+            i += 1
+        if not (i < len(body) and body[i] == "("):
+            bad.append(m.group(1))
+    return bad, total
+
+
+def check_media_host_keys(sources):
+    """Arm 8 (dv19-B02/B06). `sources` maps a file path to its
+    comment/string-stripped text, or None when the file is absent (mini tree ->
+    that sub-arm is skipped)."""
+    problems = []
+
+    # 8a: every media host that renders a view is re-mounted on its data source.
+    for rel, decl, label in _VIEW_HOSTS:
+        clean = sources.get(rel)
+        if clean is None:
+            continue
+        body = function_body(clean, decl)
+        if not body:
+            continue
+        views = [m.start() for m in re.finditer(r"\bAndroidView\s*\(", body)]
+        for v in views:
+            key = enclosing_key(body, v)
+            if key is None:
+                problems.append(
+                    "arm8a: the AndroidView of %s is NOT wrapped in key(...) -- the "
+                    "factory runs once, so a reused composition slot keeps rendering "
+                    "(and, for video, keeps PLAYING) the previous data source while "
+                    "the state around it has already reset; re-point this guard if the "
+                    "host moved" % label)
+            elif not _SOURCE_HINT.search(key[0]):
+                problems.append(
+                    "arm8a: the key(...) around the AndroidView of %s does not carry "
+                    "the data source (args: %r) -- a key derived from anything else "
+                    "never changes when the media does" % (label, key[0].strip()))
+
+    # 8b: no playback state survives a data-source change.
+    for rel, decl, label in _STATE_HOSTS:
+        clean = sources.get(rel)
+        if clean is None:
+            continue
+        body = function_body(clean, decl)
+        if not body:
+            problems.append(
+                "arm8b: `%s` is gone -- the playback-state key contract lost its "
+                "anchor, re-point this guard" % label)
+            continue
+        bad, total = unkeyed_delegates(body)
+        if not total:
+            problems.append(
+                "arm8b: `%s` declares no `var ... by remember` state at all -- "
+                "fail-closed anchor, re-point this guard" % label)
+        elif bad:
+            problems.append(
+                "arm8b: %s keeps %s without a data-source key -- a reused host then "
+                "shows the previous file's play state / position until its own "
+                "callback lands" % (label, ", ".join(sorted(set(bad)))))
+
+    # 8c: no media source is opened or resolved during composition.
+    for rel in (_STREAM_REL, _MARKDOWN_REL):
+        clean = sources.get(rel)
+        if clean is None:
+            continue
+        name = rel.rsplit("/", 1)[-1]
+        spans = remember_spans(clean)
+        for m in re.finditer(
+                r"\b(setDataSource|resolveMediaFile|resolveMdMediaFile)\s*\(", clean):
+            if inside_any(spans, m.start()):
+                problems.append(
+                    "arm8c: %s calls %s(...) inside remember{} -- setDataSource opens "
+                    "the file descriptor and parses the container header and the "
+                    "markdown resolver walks the session directory: both are "
+                    "main-thread IO in the composition phase" % (name, m.group(1)))
+
+    # 8d: the resolver runs on IO, through the one shared seam.
+    for rel in (_STREAM_REL, _MARKDOWN_REL):
+        clean = sources.get(rel)
+        if clean is None:
+            continue
+        name = rel.rsplit("/", 1)[-1]
+        seam_calls = [m for m in re.finditer(r"\brememberMdMediaFile\s*\(", clean)
+                      if not re.search(r"fun\s+$", clean[:m.start()])]
+        if not seam_calls:
+            problems.append(
+                "arm8d: %s no longer resolves through the shared rememberMdMediaFile "
+                "seam (definition aside, no call site) -- a second, synchronous "
+                "resolver per renderer is how this family drifted apart" % name)
+        io = io_block_spans(clean)
+        spans = remember_spans(clean)
+        for m in re.finditer(r"\bresolve(?:Md)?MediaFile\s*\(", clean):
+            if re.search(r"fun\s+$", clean[:m.start()]):
+                continue  # the declaration itself, not a call site
+            if inside_any(spans, m.start()):
+                continue  # already reported by arm8c
+            if not inside_any(io, m.start()):
+                problems.append(
+                    "arm8d: resolve*MediaFile(...) in %s is not inside "
+                    "withContext(Dispatchers.IO) -- the session-directory walk then "
+                    "runs on the composition thread" % name)
+
+    # 8e: the native full-content viewer follows its content instead of being
+    # rebuilt around it (or frozen on it).
+    clean = sources.get(_CHAT_UI_REL)
+    if clean is not None:
+        body = function_body(clean, r"private\s+fun\s+ThinkingFullContentDialog\s*\(")
+        if not body:
+            problems.append(
+                "arm8e: `ThinkingFullContentDialog` is gone -- the full-content "
+                "viewer contract lost its anchor, re-point this guard")
+        else:
+            views = [m.start() for m in re.finditer(r"\bAndroidView\s*\(", body)]
+            if not views:
+                problems.append(
+                    "arm8e: ThinkingFullContentDialog hosts no AndroidView -- "
+                    "re-point this guard")
+            for v in views:
+                key = enclosing_key(body, v)
+                if key is not None and re.search(r"\bcontent\b", key[0]):
+                    problems.append(
+                        "arm8e: the thinking viewer's AndroidView is keyed on its "
+                        "content -- the node holds >100k chars, so rebuilding it on "
+                        "every appended token throws away the reader's scroll offset "
+                        "and selection; sync through update{} instead")
+                upd = arg_lambda_body(body, v, "update")
+                if upd is None:
+                    problems.append(
+                        "arm8e: the thinking viewer's AndroidView has no update{} "
+                        "block -- the factory runs once, so a dialog opened while the "
+                        "block was still streaming (or after a theme flip) keeps the "
+                        "text and colour it was born with")
+                else:
+                    if "content" not in upd:
+                        problems.append(
+                            "arm8e: the update{} block never re-applies `content` -- "
+                            "the viewer stays frozen on its first snapshot")
+                    if "textColor" not in upd:
+                        problems.append(
+                            "arm8e: the update{} block never re-applies the text "
+                            "colour -- a theme flip leaves the viewer on the old one")
+    return problems
+
+
+def run_media_host_keys_selftest() -> bool:
+    """Arm 8 fixtures (dv19-B02/B06). Each dirty case must go red through
+    EXACTLY the expected sub-arm (a fixture that also trips a neighbour means
+    the arms are not separable), the precision case must stay green (comments
+    that mention the forbidden shapes are not the defect), and every fixture is
+    checked against the un-anchored shape it is meant to model."""
+    COMPLIANT_PLAYER = '''
+@Composable
+fun InlineVideoPlayer(filePath: String) {
+    val mediaController = remember(filePath) { android.widget.MediaController(ctx) }
+    var videoAspectRatio by remember(filePath) { mutableStateOf<Float?>(null) }
+    Surface {
+        key(inlineMediaSourceKey(filePath)) {
+            AndroidView(
+                factory = { ctx -> android.widget.VideoView(ctx) },
+                onRelease = { view -> view.stopPlayback() },
+            )
+        }
+    }
+}
+
+@Composable
+fun InlineAudioPlayer(filePath: String) {
+    var isPlaying by remember(filePath) { mutableStateOf(false) }
+    var progress by remember(filePath) { mutableFloatStateOf(0f) }
+    var duration by remember(filePath) { mutableStateOf("0:00") }
+    var position by remember(filePath) { mutableStateOf("0:00") }
+    var error by remember(filePath) { mutableStateOf<String?>(null) }
+    var prepared by remember(filePath) { mutableStateOf(false) }
+    var pendingPlay by remember(filePath) { mutableStateOf(false) }
+}
+
+@Composable
+private fun FullscreenVideoContent(file: File, onDismiss: () -> Unit) {
+    val fileKey = resolvedMediaSourceKey(file)
+    var videoView by remember(fileKey) { mutableStateOf<android.widget.VideoView?>(null) }
+    var isPlaying by remember(fileKey) { mutableStateOf(true) }
+    var durationMs by remember(fileKey) { mutableStateOf(0) }
+    var positionMs by remember(fileKey) { mutableStateOf(0) }
+    var scrubbing by remember(fileKey) { mutableStateOf(false) }
+    var scrubTarget by remember(fileKey) { mutableFloatStateOf(0f) }
+    var showControls by remember(fileKey) { mutableStateOf(true) }
+    var dragOffsetPx by remember(fileKey) { mutableFloatStateOf(0f) }
+    Box {
+        key(resolvedMediaSourceKey(file)) {
+            AndroidView(factory = { ctx -> android.widget.VideoView(ctx) })
+        }
+    }
+}
+'''
+    COMPLIANT_STREAM = '''
+@Composable
+internal fun rememberMdMediaFile(url: String, sessionId: String?): File? {
+    return produceState<File?>(initialValue = null, url, sessionId) {
+        value = withContext(Dispatchers.IO) { resolveMdMediaFile(context, url, sessionId) }
+    }.value
+}
+
+internal fun resolveMdMediaFile(context: Context, url: String, sessionId: String?): File? {
+    return File(url)
+}
+
+@Composable
+fun RenderMdVideo(block: MdBlock.Video) {
+    val file = rememberMdMediaFile(block.url, sessionId)
+    AndroidView(factory = { ctx -> android.widget.VideoView(ctx) })
+}
+
+@Composable
+fun RenderMdAudio(block: MdBlock.Audio) {
+    val file = rememberMdMediaFile(block.url, sessionId)
+    val player = remember(resolvedMediaSourceKey(file)) { MediaPlayer() }
+    var prepared by remember(resolvedMediaSourceKey(file)) { mutableStateOf(false) }
+    var isPlaying by remember(resolvedMediaSourceKey(file)) { mutableStateOf(false) }
+    var positionMs by remember(resolvedMediaSourceKey(file)) { mutableStateOf(0) }
+    LaunchedEffect(player, resolvedMediaSourceKey(file)) {
+        prepared = withContext(Dispatchers.IO) {
+            player.setDataSource(file!!.absolutePath)
+            true
+        }
+    }
+}
+'''
+    COMPLIANT_MARKDOWN = '''
+@Composable
+fun MinisVideoBlock(block: MdBlock.Video) {
+    val file = rememberMdMediaFile(block.url, sessionId)
+    AndroidView(factory = { ctx -> android.widget.VideoView(ctx) })
+}
+
+@Composable
+fun MinisAudioBlock(block: MdBlock.Audio) {
+    val file = rememberMdMediaFile(block.url, sessionId)
+    val player = remember(resolvedMediaSourceKey(file)) { MediaPlayer() }
+    var prepared by remember(resolvedMediaSourceKey(file)) { mutableStateOf(false) }
+    var isPlaying by remember(resolvedMediaSourceKey(file)) { mutableStateOf(false) }
+    var positionMs by remember(resolvedMediaSourceKey(file)) { mutableStateOf(0) }
+    LaunchedEffect(player, resolvedMediaSourceKey(file)) {
+        prepared = withContext(Dispatchers.IO) {
+            player.setDataSource(file!!.absolutePath)
+            true
+        }
+    }
+}
+'''
+    COMPLIANT_CHAT = '''
+@Composable
+private fun ThinkingFullContentDialog(content: String, onDismiss: () -> Unit) {
+    Dialog(onDismissRequest = onDismiss) {
+        AndroidView(
+            factory = { ctx -> android.widget.ScrollView(ctx) },
+            update = { scrollView ->
+                val textView = scrollView.getChildAt(0) as? android.widget.TextView
+                if (textView != null) {
+                    textView.setTextColor(textColor.toArgb())
+                    if (shouldSyncFullContentText(textView.text, content)) {
+                        textView.text = content
+                    }
+                }
+            },
+        )
+    }
+}
+'''
+
+    def tree(player=COMPLIANT_PLAYER, stream=COMPLIANT_STREAM,
+             markdown=COMPLIANT_MARKDOWN, chat=COMPLIANT_CHAT, missing=()):
+        src = {
+            INLINE_PLAYER_REL: player,
+            _STREAM_REL: stream,
+            _MARKDOWN_REL: markdown,
+            _CHAT_UI_REL: chat,
+        }
+        for rel in missing:
+            src[rel] = None
+        return src
+
+    # 8a: the inline video host loses its key / keys on something else.
+    M8a1 = COMPLIANT_PLAYER.replace(
+        """        key(inlineMediaSourceKey(filePath)) {
+            AndroidView(
+                factory = { ctx -> android.widget.VideoView(ctx) },
+                onRelease = { view -> view.stopPlayback() },
+            )
+        }""",
+        """        AndroidView(
+            factory = { ctx -> android.widget.VideoView(ctx) },
+            onRelease = { view -> view.stopPlayback() },
+        )""")
+    M8a2 = COMPLIANT_PLAYER.replace(
+        "key(inlineMediaSourceKey(filePath)) {", "key(mediaController) {")
+    # the fullscreen host loses its key too
+    M8a3 = COMPLIANT_PLAYER.replace(
+        """        key(resolvedMediaSourceKey(file)) {
+            AndroidView(factory = { ctx -> android.widget.VideoView(ctx) })
+        }""",
+        """        AndroidView(factory = { ctx -> android.widget.VideoView(ctx) })""")
+
+    # 8b: one playback state loses its key (the view stays keyed).
+    M8b1 = COMPLIANT_PLAYER.replace(
+        "    var positionMs by remember(fileKey)",
+        "    var positionMs by remember")
+    M8b2 = COMPLIANT_PLAYER.replace(
+        "    var isPlaying by remember(filePath)",
+        "    var isPlaying by remember")
+    # fail-closed anchor: the audio host disappears
+    M8b3 = COMPLIANT_PLAYER.replace("fun InlineAudioPlayer(filePath: String) {",
+                                    "fun inlineAudioPlayerGone(filePath: String) {")
+
+    # 8c: a media source is opened / resolved inside remember {}.
+    M8c1 = COMPLIANT_STREAM.replace(
+        "    val player = remember(resolvedMediaSourceKey(file)) { MediaPlayer() }",
+        "    val player = remember(resolvedMediaSourceKey(file)) {\n"
+        "        MediaPlayer().apply { setDataSource(file!!.absolutePath) }\n"
+        "    }")
+    M8c2 = COMPLIANT_MARKDOWN.replace(
+        "    val file = rememberMdMediaFile(block.url, sessionId)\n"
+        "    val player = remember(resolvedMediaSourceKey(file)) { MediaPlayer() }",
+        "    val file = remember(block.url, sessionId) {\n"
+        "        resolveMediaFile(context, block.url, sessionId)\n"
+        "    }\n"
+        "    val player = remember(resolvedMediaSourceKey(file)) { MediaPlayer() }")
+
+    # 8d: the resolver leaves the IO dispatcher / the shared seam disappears.
+    M8d1 = COMPLIANT_STREAM.replace(
+        "    val file = rememberMdMediaFile(block.url, sessionId)\n"
+        "    val player = remember(resolvedMediaSourceKey(file)) { MediaPlayer() }",
+        "    val file = resolveMdMediaFile(context, block.url, sessionId)\n"
+        "    val player = remember(resolvedMediaSourceKey(file)) { MediaPlayer() }")
+    M8d2 = COMPLIANT_MARKDOWN.replace(
+        "val file = rememberMdMediaFile(block.url, sessionId)",
+        "val file = File(block.url)")
+
+    # 8e: the full-content viewer stops following its content.
+    M8e1 = COMPLIANT_CHAT.replace(
+        """            update = { scrollView ->
+                val textView = scrollView.getChildAt(0) as? android.widget.TextView
+                if (textView != null) {
+                    textView.setTextColor(textColor.toArgb())
+                    if (shouldSyncFullContentText(textView.text, content)) {
+                        textView.text = content
+                    }
+                }
+            },
+""", "")
+    M8e2 = COMPLIANT_CHAT.replace(
+        """        AndroidView(
+            factory = { ctx -> android.widget.ScrollView(ctx) },""",
+        """        key(content) {
+        AndroidView(
+            factory = { ctx -> android.widget.ScrollView(ctx) },""")
+    M8e3 = COMPLIANT_CHAT.replace(
+        "                    textView.setTextColor(textColor.toArgb())\n", "")
+
+    # precision: comments mention the forbidden shapes, the code is compliant.
+    P1 = COMPLIANT_PLAYER.replace(
+        "    val mediaController = remember(filePath) { "
+        "android.widget.MediaController(ctx) }",
+        "    // key(inlineMediaSourceKey(filePath)) is what re-mounts this host\n"
+        "    // NEVER: setDataSource(file.absolutePath) inside remember { }\n"
+        "    val mediaController = remember(filePath) { "
+        "android.widget.MediaController(ctx) }")
+
+    cases = [
+        ("arm8 compliant tree", tree(), None),
+        ("arm8a M8a1 inline video host has no key", tree(player=M8a1), "arm8a"),
+        ("arm8a M8a2 key does not carry the data source", tree(player=M8a2), "arm8a"),
+        ("arm8a M8a3 fullscreen host has no key", tree(player=M8a3), "arm8a"),
+        ("arm8b M8b1 fullscreen positionMs loses the key", tree(player=M8b1), "arm8b"),
+        ("arm8b M8b2 audio isPlaying loses the file key", tree(player=M8b2), "arm8b"),
+        ("arm8b M8b3 audio host gone (fail-closed anchor)", tree(player=M8b3), "arm8b"),
+        ("arm8c M8c1 setDataSource back inside remember{}", tree(stream=M8c1), "arm8c"),
+        ("arm8c M8c2 resolver back inside remember{}", tree(markdown=M8c2), "arm8c"),
+        ("arm8d M8d1 resolver off the IO dispatcher", tree(stream=M8d1), "arm8d"),
+        ("arm8d M8d2 shared resolver seam gone", tree(markdown=M8d2), "arm8d"),
+        ("arm8e M8e1 update{} block removed", tree(chat=M8e1), "arm8e"),
+        ("arm8e M8e2 viewer keyed on its content", tree(chat=M8e2), "arm8e"),
+        ("arm8e M8e3 update{} stops syncing the colour", tree(chat=M8e3), "arm8e"),
+        ("arm8 precision P1 comments mention the shapes", tree(player=P1), None),
+    ]
+    ok = True
+    for name, src, want_arm in cases:
+        problems = check_media_host_keys(
+            {rel: (strip_comments_and_strings(text) if text is not None else None)
+             for rel, text in src.items()})
+        arms = {p.split(":", 1)[0] for p in problems}
+        if want_arm is None:
+            mark = "ok" if not problems else "FAIL"
+            print(f"  selftest {name}: {'RED' if problems else 'GREEN'} "
+                  f"(expect GREEN) {mark}")
+            if problems:
+                ok = False
+        else:
+            mark = "ok" if arms == {want_arm} else "FAIL"
+            print(f"  selftest {name}: arms={sorted(arms) or ['GREEN']} "
+                  f"(expect exactly {want_arm}) {mark}")
+            if arms != {want_arm}:
+                ok = False
+        for p in problems:
+            print(f"      - {p}")
+
+    # mini tree: the media-host files are absent -> judgement skipped
+    if check_media_host_keys(tree(missing=(INLINE_PLAYER_REL, _STREAM_REL,
+                                           _MARKDOWN_REL, _CHAT_UI_REL))):
+        print("  selftest arm8 mini tree (no media-host files): expected GREEN "
+              "(skipped), got RED -- FAIL")
+        ok = False
+    else:
+        print("  selftest arm8 mini tree (no media-host files): GREEN (skipped) ok")
+    return ok
+
+
 def main() -> int:
     if "--selftest" in sys.argv:
         print("mediaplayer_release_guard selftest:")
@@ -1116,6 +1660,13 @@ def main() -> int:
     problems += check_inline_player(inline_clean)
     problems += check_inline_player_guards(inline_clean)
     problems += check_fullscreen_video_window(inline_clean)
+    media_sources = {}
+    for rel in (INLINE_PLAYER_REL, _STREAM_REL, _MARKDOWN_REL, _CHAT_UI_REL):
+        path = ROOT / rel
+        media_sources[rel] = (strip_comments_and_strings(
+            path.read_text(encoding="utf-8", errors="replace"))
+            if path.exists() else None)
+    problems += check_media_host_keys(media_sources)
     if problems:
         print("FAIL: MediaPlayerManager release/lock gaps")
         for p in problems:
@@ -1130,7 +1681,12 @@ def main() -> int:
           "path reports an undeclared path instead of faking a file:// uri; the "
           "fullscreen video Dialog installs a host-window DisposableEffect "
           "before opening and passes FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS to its "
-          "own window")
+          "own window; every media host is wrapped in key(<its data source>) so "
+          "a reused composition slot re-mounts instead of playing the previous "
+          "file, every playback state in those hosts is remembered on that same "
+          "source, no renderer resolves or opens a media source inside "
+          "remember{}, and the full-content thinking viewer follows its content "
+          "through update{} (without keying the node on content)")
     return 0
 
 

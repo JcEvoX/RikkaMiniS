@@ -99,11 +99,18 @@ object VoiceProviderFactory {
                     normalizedBase.contains("tts.speech.microsoft.com") -> {
                         // Strip /cognitiveservices if the user included it — the
                         // provider appends it in the endpoint path.
-                        var azureBase = custom ?: "https://eastasia.tts.speech.microsoft.com"
-                        if (azureBase.endsWith("/cognitiveservices")) {
-                            azureBase = azureBase.removeSuffix("/cognitiveservices")
-                        }
-                        AzureTTSVoiceProvider(instance.id, azureBase, apiKey)
+                        // [deep-audit-1039 A-05] The strip used to run before any
+                        // trailing-slash trim, so a pasted base ending in "/" never
+                        // matched and the endpoint appended a SECOND segment
+                        // (…/cognitiveservices/cognitiveservices/v1 → 404). The
+                        // normalization (incl. the full-endpoint form) now lives in
+                        // VoiceBaseNormalizer.normalizeAzureBase, single source.
+                        AzureTTSVoiceProvider(
+                            instance.id,
+                            VoiceBaseNormalizer.normalizeAzureBase(custom)
+                                .ifEmpty { "https://eastasia.tts.speech.microsoft.com" },
+                            apiKey,
+                        )
                     }
                     normalizedBase.contains("deepgram") ->
                         DeepgramVoiceProvider(instance.id, custom ?: "https://api.deepgram.com", apiKey)

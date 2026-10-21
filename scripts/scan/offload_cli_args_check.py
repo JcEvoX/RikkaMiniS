@@ -88,6 +88,35 @@ Usage:
   python3 scripts/scan/offload_cli_args_check.py <repo_root> --selftest
 Exit 0 = pass, 1 = violation (or selftest failure).
 Success marker on selftest: OFFLOAD_CLI_ARGS_SELFTEST=PASS
+
+[dv19-A1] additions (the same defect family one layer up: a decision read from
+   the WRONG text, or a guard that watches the wrong moment):
+
+ 10. `ContactsOffloadHandler.bindLegacyShortMax` (V1e/V1f/V1g) — the subcommand
+     probe runs BEFORE the alias is bound, so `-n 10` is still an unbound
+     single-dash token there. Probing the raw argv put "10" in `positional[0]`,
+     `sub` came out "10" (neither list nor search), the helper returned the
+     un-rewritten argv and the caller refused with `unknown subcommand '10'`
+     (exit 2) — while the same alias AFTER the subcommand worked. Pinned as a
+     decision: the list handed to the probe is not the caller's argv, the
+     `--max` rewrite is built no later than the probe, and the probed list is
+     the one the function returns.
+ 11. `SessionsOffloadHandler` (J21/J22) — `--wait` was missing from the declared
+     boolean set although the KDoc documents it as `send`'s default mode, so
+     `minis-sessions-cli --wait send --prompt "hi"` bound "send" as the VALUE of
+     `--wait`, left `positional` empty and ran the default `list` subcommand at
+     exit 0. J21 reads the declared SET (membership, not spelling: `wait` must
+     be in it and the value option `--wait-timeout` must not), J22 requires the
+     flag to have its own HELP_TEXT line.
+ 12. `FastioSearch.grepTree` (S1/S2/S3a/S3b) — the caller spends ONE match
+     budget across several roots (`remaining -= outcome.matches.size`), so a
+     later root is walked with `limit == 0`. The cap used to be watched only
+     inside `grepFile`, i.e. at the first MATCHING line: a root of non-matching
+     files was read end to end (up to 8 MiB per file) to list nothing, and the
+     directories it walked through were still charged as visited. Pinned on the
+     `grepTree` body: S1 the entry answers a non-positive budget as capped with
+     NO walk, S2 `preVisitDirectory` consults the cap BEFORE charging, S3a/S3b
+     `visitFile` decides after `grepFile` returned instead of continuing.
 """
 import re
 import sys
@@ -103,6 +132,9 @@ PHOTOS = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/Photo
 NOTIFICATION = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/NotificationOffloadHandler.kt"
 # [dv15-A1 A-01/A-02] the shared parser every handler goes through.
 ARGS = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/OffloadArgs.kt"
+# [dv19-A1 A-03] the grep/find walk engine lives beside the handler; the
+# per-root match budget is enforced there, so the gate has to read it.
+FASTIO_SEARCH = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/FastioSearch.kt"
 
 # [da1034-A4] ISSUE-08: every handler that ships a `formatBody` payload. Kept
 # explicit rather than a glob over the offload dir: a glob would also drag in
@@ -290,6 +322,17 @@ SESSIONS_RULES = [
     ("J18", "forbid_re", r"endMs <="),
     ("J19", "count_re", (r'return sessionsDateWindow\(startMs, endMs, args\.get\("start"\), args\.get\("end"\)\)', 1)),
     ("J20", "req", "throw InvertedDateWindow("),
+    # [dv19-A1 A-02] `--wait` is documented (cmdSend's KDoc) as the DEFAULT mode
+    # of `send`, so it is a spelling callers legitimately write. While `wait` was
+    # missing from the declared boolean set, `--wait send --prompt "hi"` bound
+    # "send" as the VALUE of `--wait`, `positional` came out empty and the
+    # command ran the default `list` subcommand at exit 0 — a wrong answer that
+    # looks like a successful call. J21 reads the declared SET (membership, so
+    # reordering/reformatting cannot trip it) and stays fail-closed on the value
+    # option: declaring `--wait-timeout` boolean would eat its `<sec>`. J22 makes
+    # the flag discoverable — `--wait-timeout`'s line does not satisfy it.
+    ("J21", "decl_re", (r"booleanFlags = setOf\(([^)]*)\)", ['"wait"'], ['"wait-timeout"'])),
+    ("J22", "count_re", (r"(?m)^\s*--wait\s+\S", 1)),
 ]
 
 
@@ -515,6 +558,21 @@ def check_sessions(sessions_src: str) -> list:
             got = len(re.findall(pattern, sessions))
             if got != want:
                 findings.append((rid, f"count {got} != {want}", pattern))
+        elif kind == "decl_re":
+            # [dv19-A1 A-02] judge a declared SET by membership, not spelling:
+            # `needle = (re, names that must be in group(1), names that must not)`.
+            pattern, must, must_not = needle
+            m = re.search(pattern, sessions)
+            if m is None:
+                findings.append((rid, "missing", pattern))
+            else:
+                declared = m.group(1)
+                for name in must:
+                    if name not in declared:
+                        findings.append((rid, f"undeclared {name}", pattern))
+                for name in must_not:
+                    if name in declared:
+                        findings.append((rid, f"must not declare {name}", pattern))
         elif kind == "forbid_re":
             if re.search(needle, sessions):
                 findings.append((rid, "present", needle))
@@ -759,6 +817,40 @@ def check_offload_cli_bindings(contacts_src: str, notification_src: str,
         findings.append(
             ("V1d", "missing", "internal fun bindLegacyShortMax(argv: List<String>): List<String>"))
 
+    # V1e/V1f/V1g — [dv19-A1 A-01] the subcommand probe must read the REWRITTEN
+    # list. The probe runs before the alias is bound, so `-n 10` is still an
+    # unbound single-dash token there: judging the raw argv put "10" in
+    # positional[0], `sub` came out "10" (neither list nor search), the helper
+    # returned the un-rewritten argv and the caller refused with
+    # `unknown subcommand '10'` (exit 2) — while the same alias AFTER the
+    # subcommand worked. Pinned as the decision, not a spelling: the list handed
+    # to the probe is not the caller's argv, the `--max` rewrite is built no
+    # later than the probe, and the probed list is the one the function returns.
+    bind = _payload_helper_bodies(contacts, "bindLegacyShortMax")
+    if bind is not None:
+        probe = re.search(r"OffloadArgs\(\s*([A-Za-z_]\w*)\s*[,)]", bind)
+        if probe is None:
+            findings.append(
+                ("V1e", "missing",
+                 "bindLegacyShortMax must probe the subcommand through OffloadArgs("))
+        else:
+            probed = probe.group(1)
+            if probed == "argv":
+                findings.append(
+                    ("V1e", "present",
+                     "the subcommand probe reads the raw (pre-rewrite) argv"))
+            elif not re.search(r"\breturn\s+" + re.escape(probed) + r"\b", bind):
+                findings.append(
+                    ("V1g", "missing",
+                     f"the probed list ({probed}) must be the list the helper returns"))
+        max_at = bind.find('"--max"')
+        if max_at < 0:
+            findings.append(
+                ("V1f", "missing", 'the `--max` rewrite of the `-n <N>` alias'))
+        elif probe is not None and max_at > probe.start():
+            findings.append(
+                ("V1f", "present", "the `--max` rewrite runs AFTER the subcommand probe"))
+
     # V2 — the deferred decision, its owner function, and its refusal guard.
     if 'getInt("after")' in notif:
         findings.append(
@@ -805,6 +897,97 @@ def check_offload_cli_bindings(contacts_src: str, notification_src: str,
             findings.append(
                 ("V3f", "missing",
                  "firstSubcommandToken must consume the value token (i += 2)"))
+    return findings
+
+
+# ── [dv19-A1 A-03] the match budget is spent per ROOT, not per tree ─────────
+#
+# `grep` (FastioOffloadHandler) carries ONE budget across several roots —
+# `remaining -= outcome.matches.size` — and hands a later root `limit = 0`. The
+# cap used to be watched in exactly one place (`grepFile`, i.e. at the first
+# MATCHING line), so such a root was walked end to end: every non-matching file
+# read (up to MAX_GREP_FILE_BYTES = 8 MiB each) to list nothing, and the
+# directories it descended were still charged as visited (turning a
+# matches_capped result into `truncated` too). Each rule pins one of the three
+# moments a walk can spend that budget, on the `grepTree` body:
+#   S1  the entry: a non-positive budget is answered as capped, with NO walk
+#   S2  preVisitDirectory consults the cap BEFORE charging the directory
+#   S3a/S3b visitFile decides after grepFile returned (the file that filled the
+#       budget ends the walk) instead of continuing unconditionally
+def _brace_block(text: str, marker: str):
+    """Verbatim `{…}` block whose opening brace is the first one after `marker`."""
+    i = text.find(marker)
+    if i < 0:
+        return None
+    j = text.find("{", i)
+    if j < 0:
+        return None
+    depth = 0
+    k = j
+    while k < len(text):
+        if text[k] == "{":
+            depth += 1
+        elif text[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[j:k + 1]
+        k += 1
+    return None
+
+
+def check_fastio_search(fastio_search_src: str) -> list:
+    findings = []
+    src = code_only(fastio_search_src)
+    tree = _payload_helper_bodies(src, "grepTree")
+    if tree is None:
+        findings.append(
+            ("S1", "missing", "internal fun grepTree(…, limit: Int, out: GrepOutcome)"))
+        return findings
+    walk_at = tree.find("Files.walkFileTree(")
+    if walk_at < 0:
+        findings.append(("S1", "missing", "grepTree must walk with Files.walkFileTree("))
+        return findings
+    head = tree[:walk_at]
+    if not re.search(r"limit\s*<=\s*0", head):
+        findings.append(
+            ("S1", "missing",
+             "grepTree must short-circuit a non-positive budget (limit <= 0) before the walk"))
+    elif "matchesCapped = true" not in head:
+        findings.append(
+            ("S1", "missing",
+             "the non-positive-budget branch must answer out.matchesCapped = true"))
+
+    pre = _brace_block(tree, "override fun preVisitDirectory")
+    if pre is None:
+        findings.append(("S2", "missing", "grepTree's preVisitDirectory override"))
+    else:
+        cap_at = pre.find("matchesCapped")
+        charge_at = pre.find("charge(")
+        if cap_at < 0:
+            findings.append(
+                ("S2", "missing", "preVisitDirectory must consult out.matchesCapped"))
+        elif charge_at < 0 or cap_at > charge_at:
+            findings.append(
+                ("S2", "present",
+                 "preVisitDirectory charges the directory before consulting the cap"))
+
+    visit = _brace_block(tree, "override fun visitFile")
+    if visit is None:
+        findings.append(("S3a", "missing", "grepTree's visitFile override"))
+    else:
+        grep_at = visit.find("grepFile(")
+        if grep_at < 0:
+            findings.append(("S3a", "missing", "visitFile must walk files through grepFile("))
+        else:
+            tail = visit[grep_at:]
+            if re.search(r"matchesCapped[\s\S]{0,160}?\bTERMINATE\b", tail) is None:
+                findings.append(
+                    ("S3a", "missing",
+                     "visitFile must terminate once grepFile filled the budget"))
+            if re.search(r"grepFile\([\s\S]{0,240}?return FileVisitResult\.CONTINUE", visit):
+                findings.append(
+                    ("S3b", "present",
+                     "visitFile returns CONTINUE unconditionally after grepFile"))
     return findings
 
 
@@ -856,11 +1039,11 @@ GREEN_CONTACTS = """
         }
         internal fun bindLegacyShortMax(argv: List<String>): List<String> {
             if ("-n" !in argv) return argv
-            val sub = OffloadArgs(argv, booleanFlags = setOf("help", "h")).positional.getOrNull(0)
+            val rewritten = ArrayList<String>(argv.size)
+            rewritten.add("--max")
+            val sub = OffloadArgs(rewritten, booleanFlags = setOf("help", "h")).positional.getOrNull(0)
             if (sub != "list" && sub != "search") return argv
-            val out = ArrayList<String>(argv.size)
-            out.add("--max")
-            return out
+            return rewritten
         }
         internal fun doSearch(parsedArgs: OffloadArgs): NativeOffloadResult {
             val query = searchQueryOf(parsedArgs.positional)
@@ -1088,7 +1271,10 @@ class DebugOffloadHandler {
 GREEN_SESSIONS = """
 class SessionsOffloadHandler {
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
-        val args = OffloadArgs(request.argv.drop(1))
+        val args = OffloadArgs(
+            request.argv.drop(1),
+            booleanFlags = setOf("full", "async", "wait", "help", "h"),
+        )
         return try {
             when (val sub = args.positional.getOrNull(0)) {
                 "list" -> cmdList(args)
@@ -1133,6 +1319,18 @@ class SessionsOffloadHandler {
     companion object {
         private val SUBCOMMANDS = listOf("list", "search", "messages", "send")
         private const val EXIT_INVALID_ARGS = 2
+        private const val HELP_TEXT = \"\"\"
+Usage: minis-sessions-cli <command> [options]
+
+Commands:
+  list                  List recent sessions
+  send                  Send a prompt to a session
+
+Options:
+  --async               (send only) Return immediately with the session id
+  --wait                (send only) Block until the reply completes (default; --async wins)
+  --wait-timeout <sec>  (send only) Give up waiting after <sec> seconds
+\"\"\"
     }
 }
 
@@ -1165,6 +1363,60 @@ internal fun sessionsDateBound(flag: String, raw: String?, parse: (String) -> Lo
 }
 """
 
+
+# [dv19-A1 A-03] green fixture for the grep walk engine: shape-faithful skeleton
+# of `grepTree` after the fix — the entry answers a non-positive budget as capped
+# without walking, `preVisitDirectory` consults the cap before charging, and
+# `visitFile` decides on the cap after `grepFile` returned.
+GREEN_FASTIO_SEARCH = """
+internal fun grepTree(
+    root: Path,
+    rootGuestPath: String,
+    regex: Regex,
+    limit: Int,
+    maxEntries: Long,
+    out: GrepOutcome,
+) {
+    if (limit <= 0) {
+        out.matchesCapped = true
+        return
+    }
+    try {
+        Files.walkFileTree(
+            root,
+            object : SimpleFileVisitor<Path>() {
+                override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult {
+                    if (out.matchesCapped) return FileVisitResult.TERMINATE
+                    if (charge(out, maxEntries)) return FileVisitResult.TERMINATE
+                    return FileVisitResult.CONTINUE
+                }
+
+                override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                    if (charge(out, maxEntries)) return FileVisitResult.TERMINATE
+                    if (out.matchesCapped) return FileVisitResult.TERMINATE
+                    grepFile(file, guestPathFor(root, rootGuestPath, file), regex, limit, out)
+                    return if (out.matchesCapped) {
+                        FileVisitResult.TERMINATE
+                    } else {
+                        FileVisitResult.CONTINUE
+                    }
+                }
+            },
+        )
+    } catch (_: IOException) {
+        out.failures++
+    }
+}
+
+internal fun findTree(
+    root: Path,
+    regex: Regex,
+    limit: Int,
+    out: FindOutcome,
+) {
+    out.matched++
+}
+"""
 
 # [da1033-D] ISSUE-04 green fixtures for the payload-JSON arm. Synthetic but
 # shape-faithful: every accepted spelling appears once (variable, JSON builder,
@@ -1770,6 +2022,21 @@ def selftest() -> int:
              'return sessionsDateWindow(startMs, endMs, args.get("start"), args.get("end"))',
              "return startMs to endMs"),
          {"J19"}),
+        # [dv19-A1 A-02] `--wait` teeth: the declaration must carry it (and must
+        # not swallow the value option), and the flag must be documented.
+        ("--wait dropped from the boolean declaration",
+         GREEN_SESSIONS.replace('setOf("full", "async", "wait", "help", "h")',
+                                'setOf("full", "async", "help", "h")'),
+         {"J21"}),
+        ("the value option --wait-timeout declared boolean",
+         GREEN_SESSIONS.replace('setOf("full", "async", "wait", "help", "h")',
+                                'setOf("full", "async", "wait", "wait-timeout", "help", "h")'),
+         {"J21"}),
+        ("the --wait help line is dropped",
+         GREEN_SESSIONS.replace(
+             "  --wait                (send only) Block until the reply completes "
+             "(default; --async wins)\n", ""),
+         {"J22"}),
     ]:
         if sessions_src == GREEN_SESSIONS:
             print(f"SELFTEST-FAIL: {label}: mutation did not apply to any arm")
@@ -2052,6 +2319,24 @@ def selftest() -> int:
          GREEN_CONTACTS, GREEN_NOTIFICATION_HANDLE,
          GREEN_FASTIO.replace("i += if (consumesValue) 2 else 1", "i += 1"),
          {"V3f"}),
+        # [dv19-A1 A-01] the subcommand probe must read the REWRITTEN list: on the
+        # raw argv `-n 10` is still unbound, so "10" took positional[0] and
+        # `-n 10 list` refused with `unknown subcommand '10'` (exit 2).
+        ("contacts: the subcommand probe reads the raw argv again",
+         GREEN_CONTACTS.replace("OffloadArgs(rewritten, booleanFlags",
+                                "OffloadArgs(argv, booleanFlags"),
+         GREEN_NOTIFICATION_HANDLE, GREEN_FASTIO, {"V1e"}),
+        ("contacts: the --max rewrite moves behind the subcommand probe",
+         GREEN_CONTACTS.replace(
+             'val rewritten = ArrayList<String>(argv.size)\n            rewritten.add("--max")',
+             'val rewritten = ArrayList<String>(argv.size)').replace(
+             '            if (sub != "list" && sub != "search") return argv\n            return rewritten',
+             '            if (sub != "list" && sub != "search") return argv\n'
+             '            rewritten.add("--max")\n            return rewritten'),
+         GREEN_NOTIFICATION_HANDLE, GREEN_FASTIO, {"V1f"}),
+        ("contacts: the probed list is built but not the one returned",
+         GREEN_CONTACTS.replace("            return rewritten\n", "            return argv\n"),
+         GREEN_NOTIFICATION_HANDLE, GREEN_FASTIO, {"V1g"}),
     ]
     for label, contacts_src, notif_src, fastio_src, want in red_cases_bindings:
         if contacts_src == GREEN_CONTACTS and notif_src == GREEN_NOTIFICATION_HANDLE \
@@ -2091,6 +2376,46 @@ def selftest() -> int:
         if got != want:
             print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
             failures += 1
+    # [dv19-A1 A-03] the grep budget teeth. Expectations hand-written from
+    # check_fastio_search's S-table: one arm per moment a walk can spend the
+    # caller's single cross-root budget, plus a fail-closed arm proving the rules
+    # are not vacuous on a file that merely lost the walk.
+    for label, search_src, want in [
+        ("grep entry: a spent budget walks anyway",
+         GREEN_FASTIO_SEARCH.replace(
+             "    if (limit <= 0) {\n        out.matchesCapped = true\n        return\n    }\n", ""),
+         {"S1"}),
+        ("grep entry: the short circuit forgets to call it capped",
+         GREEN_FASTIO_SEARCH.replace(
+             "        out.matchesCapped = true\n        return\n", "        return\n"),
+         {"S1"}),
+        ("grep walk: a directory is entered after the budget is spent",
+         GREEN_FASTIO_SEARCH.replace(
+             "                    if (out.matchesCapped) return FileVisitResult.TERMINATE\n"
+             "                    if (charge(out, maxEntries)) return FileVisitResult.TERMINATE",
+             "                    if (charge(out, maxEntries)) return FileVisitResult.TERMINATE"),
+         {"S2"}),
+        ("grep walk: the file that filled the budget keeps walking",
+         GREEN_FASTIO_SEARCH.replace(
+             "                    return if (out.matchesCapped) {\n"
+             "                        FileVisitResult.TERMINATE\n"
+             "                    } else {\n"
+             "                        FileVisitResult.CONTINUE\n"
+             "                    }",
+             "                    return FileVisitResult.CONTINUE"),
+         {"S3a", "S3b"}),
+        ("fail-closed: the grep engine lost its walk",
+         GREEN_FASTIO_SEARCH.replace("Files.walkFileTree(", "unusedWalk("),
+         {"S1"}),
+    ]:
+        if search_src == GREEN_FASTIO_SEARCH:
+            print(f"SELFTEST-FAIL: {label}: mutation did not apply to any arm")
+            failures += 1
+            continue
+        got = {rid for rid, _, _ in check_fastio_search(search_src)}
+        if got != want:
+            print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
+            failures += 1
     # the green arms must be fully clean, or every rule is vacuous
     clean = check_text(GREEN_CONTACTS, GREEN_CONFIG, GREEN_BROWSERUSE, GREEN_FASTIO)
     clean_flags = check_flag_set(GREEN_OUTPUT, GREEN_SPEAK)
@@ -2100,6 +2425,7 @@ def selftest() -> int:
     clean_album = check_photos_album(GREEN_ALBUM_PHOTOS)
     clean_bindings = check_offload_cli_bindings(
         GREEN_CONTACTS, GREEN_NOTIFICATION_HANDLE, GREEN_FASTIO)
+    clean_search = check_fastio_search(GREEN_FASTIO_SEARCH)
     clean_payload = check_offload_json(
         ("PhotosOffloadHandler.kt", GREEN_PAYLOAD_PHOTOS),
         ("ContactsOffloadHandler.kt", GREEN_PAYLOAD_CONTACTS),
@@ -2111,9 +2437,9 @@ def selftest() -> int:
         ("FastioOffloadHandler.kt", GREEN_PAYLOAD_FASTIO_USAGE),
     )
     if clean or clean_flags or clean_debug or clean_sessions or clean_bindings \
-            or clean_payload or clean_album:
+            or clean_payload or clean_album or clean_search:
         green_findings = (clean + clean_flags + clean_debug + clean_sessions
-                          + clean_bindings + clean_payload + clean_album)
+                          + clean_bindings + clean_payload + clean_album + clean_search)
         print(f"SELFTEST-FAIL: green fixtures must produce no findings, "
               f"got {describe(green_findings)}")
         failures += 1
@@ -2147,11 +2473,13 @@ def main(argv):
     sessions_path = root / SESSIONS
     notification_path = root / NOTIFICATION
     args_path = root / ARGS
+    search_path = root / FASTIO_SEARCH
     if not contacts_path.is_file() or not config_path.is_file() \
             or not browseruse_path.is_file() or not fastio_path.is_file() \
             or not output_path.is_file() or not speak_path.is_file() \
             or not debug_path.is_file() or not sessions_path.is_file() \
-            or not notification_path.is_file() or not args_path.is_file():
+            or not notification_path.is_file() or not args_path.is_file() \
+            or not search_path.is_file():
         print(f"GATE-FAIL: handler source not found under {root}")
         return 1
     # fail-closed: a payload file that moves (or is renamed) must be a red
@@ -2176,6 +2504,7 @@ def main(argv):
                                           notification_path.read_text(encoding="utf-8"),
                                           fastio_path.read_text(encoding="utf-8"))
     findings += check_offload_json(*payload_files)
+    findings += check_fastio_search(search_path.read_text(encoding="utf-8"))
     if findings:
         print("offload_cli_args_check: FAIL")
         print(describe(findings))
@@ -2188,7 +2517,10 @@ def main(argv):
           "8/8 payload files hand formatBody JSON (N1 whole-file, N2 payload helpers), "
           "contacts search -n bound to --max through the one resolver, notification --after "
           "refuses an unreadable value, fastio subcommand scan knows its boolean flags "
-          "and consumes -C, photos --album decision classified (non-numeric --id refuses))")
+          "and consumes -C, photos --album decision classified (non-numeric --id refuses), "
+          "contacts subcommand probe reads the rewritten alias list, sessions declares "
+          "async/wait/help/h and documents --wait, grep budget stops a spent root before "
+          "any file is opened)")
     return 0
 
 

@@ -45,13 +45,29 @@ GRANT_FLAGS = (
 )
 
 # `val <ident> = ...get("path"|"file"|"source")` (any receiver spelling).
-ARG_ASSIGN_RE = re.compile(r'\b(\w+)\s*=\s*[\w.]*get\(\s*"(path|file|source)"')
+# [deep-audit-1039 A-08] The flag-name set used to be path|file|source, so a
+# guest path arriving as --output / --input / --system-file / --cookies-file
+# never entered taint and reached a bare File() unread. Widened to the actual
+# offload flag vocabulary that carries a path operand.
+ARG_NAMES = r'path|file|source|input|output|system-file|cookies-file'
+ARG_ASSIGN_RE = re.compile(r'\b(\w+)\s*=\s*[\w.]*get\(\s*"(%s)"' % ARG_NAMES)
 # A bare `File(<ident>)` / `File(args.get("path"))` construction.
 FILE_IDENT_RE = re.compile(r"\bFile\(\s*([A-Za-z_]\w*)\s*\)")
-FILE_DIRECT_RE = re.compile(r'\bFile\(\s*[^)\n]*get\(\s*"(path|file|source)"')
+FILE_DIRECT_RE = re.compile(r'\bFile\(\s*[^)\n]*get\(\s*"(%s)"' % ARG_NAMES)
+# `<tainted>?.let { File(it) }` — the lambda's implicit `it` is not an
+# identifier form, so FILE_IDENT_RE never saw it.
+FILE_LET_RE = re.compile(r"\bFile\(\s*it\s*\)")
+LET_TAINTED_RE = re.compile(r"\?\.let\s*\{")
 # Guest→host converters: their call is what makes a tainted value SAFE to wrap in File().
+# [deep-audit-1039 A-08] `resolveHostPath` is NOT on this list any more: it is
+# the CROSS-SESSION GLOBAL resolver (PRootKernel.resolveHostPath searches every
+# minis-sessions/<id>/ tree for an existing match, then the rootfs — see the R5
+# ban below). Treating it as a sanitizer made "resolveHostPath(x) → File(x)"
+# invisible to R1, i.e. the exact shape the R5 criterion exists to forbid was
+# whitelisted by this one. Only SESSION-SCOPED converters sanitize.
 RESOLVER_CALL_RE = re.compile(
-    r"\b(?:resolvePathForSession|resolveSourcePath|resolveHostPath|resolveGuestHostPath|readLinuxPath)\("
+    r"\b(?:resolvePathForSession|resolveSourcePath|resolveGuestHostPath|readLinuxPath"
+    r"|sessionAwareHostFile|GuestPathMapper\.resolve)\("
 )
 
 # ── [da1025-A] R3: player session-path wiring ───────────────────────────────
@@ -442,24 +458,57 @@ def tainted_from_args(text):
     expression calls a guest→host resolver, which is exactly the conversion the
     rule is asking for (`val host = resolveSourcePath(raw, sid)` is legitimate;
     `File(host)` after that is fine).
+
+    [deep-audit-1039 A-08] Two changes:
+      * A SESSION-SCOPED resolver sanitizes; the global `resolveHostPath` does
+        not (it searches every session tree — see RESOLVER_CALL_RE).
+      * The pseudo-identifier `it` is tracked per line: a line that opens a
+        scope on a tainted receiver (`p?.let {`) taints `it` FOR THAT LINE, so
+        `File(it)` inside the block is caught the same way `File(p)` on the
+        next line would be. Returning the per-line map (not a final snapshot)
+        is what makes single-line `p?.let { File(it) }` visible: the scope
+        opens and closes on the same line, so a snapshot would have already
+        dropped the binding.
     """
     tainted = {}
+    per_line = {}
     for line in text.splitlines():
+        snapshot = dict(tainted)
         m = ARG_ASSIGN_RE.search(line)
         if m:
             tainted[m.group(1)] = "raw"
+            snapshot[m.group(1)] = "raw"
+            per_line[line] = snapshot
             continue
+        # A scope opened on a tainted receiver taints `it` on this line.
+        let = LET_TAINTED_RE.search(line)
+        if let:
+            recv = line[:let.start()]
+            if any(re.search(r"\b%s\b" % re.escape(t), recv) for t in tainted):
+                tainted["it"] = "raw"
+                snapshot["it"] = "raw"
         a = re.match(r"\s*(?:val|var)\s+(\w+)[^=]*=\s*(.*)$", line)
-        if not a:
-            continue
-        name, expr = a.group(1), a.group(2)
-        if any(re.search(r"\b%s\b" % re.escape(t), expr) for t in tainted):
-            tainted[name] = "resolved" if RESOLVER_CALL_RE.search(expr) else "raw"
-    return tainted
+        if a:
+            name, expr = a.group(1), a.group(2)
+            if any(re.search(r"\b%s\b" % re.escape(t), expr) for t in tainted):
+                tainted[name] = "resolved" if RESOLVER_CALL_RE.search(expr) else "raw"
+                snapshot[name] = tainted[name]
+        per_line[line] = snapshot
+        # A scope that closed on this line drops the `it` binding again.
+        if line.count("{") <= line.count("}"):
+            tainted.pop("it", None)
+    return tainted, per_line
 
 
 def scan_bare_file(rel, text):
-    """R1: args.get(path|file|source) handed to a bare File(...)."""
+    """R1: a guest path from args reaching a bare File(...).
+
+    Three shapes, all of which used to be invisible:
+      * `File(args.get("path"))` inline (FILE_DIRECT_RE);
+      * `val p = args.get("path")` … `File(p)` (one-hop identifier taint);
+      * `p?.let { File(it) }` — the lambda's implicit `it` is not an identifier
+        form, so it is tracked per line (deep-audit-1039 A-08).
+    """
     problems = []
     for i, line in enumerate(text.splitlines(), 1):
         if FILE_DIRECT_RE.search(line):
@@ -467,18 +516,25 @@ def scan_bare_file(rel, text):
                 "%s:%d: args value reaches a bare File(...) — resolve it through "
                 "PRootKernel.resolvePathForSession / GuestPathMapper instead" % (rel, i)
             )
-    assigned = tainted_from_args(text)
+    assigned, per_line = tainted_from_args(text)
+    lines = text.splitlines()
     if assigned:
-        for i, line in enumerate(text.splitlines(), 1):
+        for i, line in enumerate(lines, 1):
+            snapshot = per_line.get(line, assigned)
+            if FILE_LET_RE.search(line) and snapshot.get("it") == "raw":
+                problems.append(
+                    "%s:%d: `File(it)` inside `?.let {}` derives from the guest path argument "
+                    "without passing through a guest→host resolver — no raw host File" % (rel, i)
+                )
+                continue
             for m in FILE_IDENT_RE.finditer(line):
                 ident = m.group(1)
-                if assigned.get(ident) == "raw":
+                if snapshot.get(ident) == "raw":
                     problems.append(
                         "%s:%d: `File(%s)` derives from the guest path argument without passing "
                         "through a guest→host resolver — no raw host File" % (rel, i, ident)
                     )
     return problems
-
 
 def _statement_window(text, start_idx):
     """Text of the statement opened at start_idx (bracket-balanced), or None."""
@@ -617,6 +673,72 @@ class CleanHandler {
 }
 """
 
+# ── [deep-audit-1039 A-08] the three shapes that used to be invisible ────────
+# DIRTY_GLOBAL_AS_SANITIZER: the guest path is "resolved" through the
+# CROSS-SESSION GLOBAL resolver and then wrapped in a bare File. resolveHostPath
+# used to sit in RESOLVER_CALL_RE's whitelist, so the taint was cleared and R1
+# saw nothing — while R5 exists precisely to ban that call shape.
+DIRTY_GLOBAL_AS_SANITIZER = """package com.rikkaminis.app.sandbox.offload
+
+import java.io.File
+
+class DirtyGlobalHandler {
+    private fun handleImport(args: OffloadArgs): NativeOffloadResult {
+        val raw = args.get("path") ?: return NativeOffloadResult(2, "required")
+        val host = PRootKernel.resolveHostPath(raw)
+        val src = File(host)
+        return NativeOffloadResult(0, src.name)
+    }
+}
+"""
+
+# DIRTY_UNLISTED_FLAG: the operand arrives as --output, a flag name ARG_ASSIGN_RE
+# never matched, so it never entered taint at all.
+DIRTY_UNLISTED_FLAG = """package com.rikkaminis.app.sandbox.offload
+
+import java.io.File
+
+class DirtyOutputHandler {
+    private fun handleExport(args: OffloadArgs): NativeOffloadResult {
+        val p = args.get("output")
+            ?: return NativeOffloadResult(2, "required")
+        val dst = File(p)
+        return NativeOffloadResult(0, dst.name)
+    }
+}
+"""
+
+# DIRTY_LET_IT: `p?.let { File(it) }` — the lambda's implicit `it` is not an
+# identifier form, so FILE_IDENT_RE never matched it.
+DIRTY_LET_IT = """package com.rikkaminis.app.sandbox.offload
+
+import java.io.File
+
+class DirtyLetHandler {
+    private fun handleExport(args: OffloadArgs): NativeOffloadResult {
+        val p = args.get("path") ?: return NativeOffloadResult(2, "required")
+        p?.let { File(it).mkdirs() }
+        return NativeOffloadResult(0, "ok")
+    }
+}
+"""
+
+# CLEAN_LET_RESOLVED: the same lambda shape, but the value passes through the
+# session-scoped resolver before File() — the legitimate spelling.
+CLEAN_LET_RESOLVED = """package com.rikkaminis.app.sandbox.offload
+
+class CleanLetHandler {
+    private fun handleExport(args: OffloadArgs, request: NativeOffloadRequest): NativeOffloadResult {
+        val p = args.get("output") ?: return NativeOffloadResult(2, "required")
+        p?.let {
+            val host = PRootKernel.resolvePathForSession(request.sessionId, it, context) ?: return fail()
+            File(host).mkdirs()
+        }
+        return NativeOffloadResult(0, "ok")
+    }
+}
+"""
+
 DIRTY_INTENT = """package com.rikkaminis.app.sandbox.offload
 
 class DirtyIntentHandler {
@@ -689,6 +811,41 @@ def selftest():
         print("❌ selftest failed: %s" % ", ".join(failures))
         return 1
     print("SELFTEST=PASS (7 fixtures: 4 violations caught, 3 clean trees green)")
+
+    # ── [deep-audit-1039 A-08] R1 blind-spot fixtures ───────────────────────
+    # Each arm breaks exactly one of the three shapes that used to pass, plus a
+    # clean arm proving the legitimate spelling of the lambda shape still
+    # passes. Expected problem counts are literals: an arm that fires TWO
+    # criteria is reported as a failure, so "only red on its own criterion" is
+    # mechanically enforced rather than eyeballed.
+    a08_arms = [
+        ("A08 dirty: global resolver used as the sanitizer",
+         DIRTY_GLOBAL_AS_SANITIZER, 1, "without passing through a guest→host resolver"),
+        ("A08 dirty: --output flag never entered taint",
+         DIRTY_UNLISTED_FLAG, 1, "without passing through a guest→host resolver"),
+        ("A08 dirty: File(it) inside ?.let {}",
+         DIRTY_LET_IT, 1, "inside `?.let {}`"),
+        ("A08 clean: ?.let {} with the session resolver",
+         CLEAN_LET_RESOLVED, 0, None),
+    ]
+    a08_failures = []
+    for label, src, expected, needle in a08_arms:
+        root = _fixture_root({"AOffloadHandler.kt": src})
+        try:
+            _, problems = check_tree(root, verbose=False)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+        ok = len(problems) == expected
+        if ok and needle is not None:
+            ok = any(needle in p for p in problems)
+        print("  [%s] %s%s" % ("PASS" if ok else "FAIL", label,
+                               "" if ok else "  → problems=%s" % problems))
+        if not ok:
+            a08_failures.append(label)
+    if a08_failures:
+        print("❌ selftest failed: %s" % ", ".join(a08_failures))
+        return 1
+    print("A08_R1_BLINDSPOT_SELFTEST=PASS (4 fixtures: 3 violations caught, 1 clean tree green)")
 
     # ── [da1025-A] R3: player session-path fixtures ────────────────────────
     # Each dirty fixture breaks exactly one criterion: NO_SESSION keeps the

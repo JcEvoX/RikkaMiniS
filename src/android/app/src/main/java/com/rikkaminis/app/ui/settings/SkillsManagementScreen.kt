@@ -129,6 +129,10 @@ fun SkillsManagementScreen(
     var showAddMenu by remember { mutableStateOf(false) }
     var searchQuery by remember { mutableStateOf("") }
     val context = LocalContext.current
+    // [deep-audit-1039 B-05] Scope for the repository writes the list screen
+    // triggers (delete confirm): they are disk/DB work and must not run on the
+    // Main thread, same rule the import sheet below follows.
+    val scope = rememberCoroutineScope()
 
     // Sort preference — persisted like the file browser's (SharedPreferences,
     // default name ascending). Mirrors iOS skillsList.sortKey/sortAscending.
@@ -317,7 +321,19 @@ fun SkillsManagementScreen(
                                 Spacer(Modifier.width(8.dp))
                                 Switch(
                                     checked = skill.isEnabled,
-                                    onCheckedChange = { skillRepository.setEnabled(skill.id, it) },
+                                    // [deep-audit-1039 B-05] setEnabled is a
+                                    // SQLite UPDATE (+ a StateFlow rewrite of
+                                    // the list): off Main like every other
+                                    // repository write on this screen. The row
+                                    // re-renders through the `skills` flow the
+                                    // screen already collects.
+                                    onCheckedChange = { enabled ->
+                                        scope.launch {
+                                            withContext(Dispatchers.IO) {
+                                                skillRepository.setEnabled(skill.id, enabled)
+                                            }
+                                        }
+                                    },
                                 )
                             }
                         },
@@ -382,7 +398,18 @@ fun SkillsManagementScreen(
             text = { Text(stringResource(R.string.skill_delete_confirm_text)) },
             confirmButton = {
                 MinisTextButton(onClick = {
-                    deleteSkillId?.let { skillRepository.delete(it) }
+                    // [deep-audit-1039 B-05] skillRepository.delete does two
+                    // SQLite DELETEs plus a recursive directory walk — running
+                    // it inline on the click (Main) froze the list for the
+                    // whole delete. Same treatment the import sheet and the
+                    // detail-page delete already use: keep the call, move its
+                    // thread. The StateFlow update inside is thread-safe and
+                    // the row disappears through the collectAsState above.
+                    deleteSkillId?.let { id ->
+                        scope.launch {
+                            withContext(Dispatchers.IO) { skillRepository.delete(id) }
+                        }
+                    }
                     deleteSkillId = null
                 }) { Text(stringResource(R.string.common_delete), color = MaterialTheme.colorScheme.error) }
             },
@@ -960,10 +987,23 @@ fun SkillDetailScreen(
             // Re-list whenever the skill record changes (rescan/update bumps
             // updatedAt, so newly-extracted scripts appear without leaving the
             // screen).
-            val skillFiles = remember(skill.id, skill.updatedAt) {
-                skillRepository.listSkillFiles(skill.id)
-                    .ifEmpty { listOf("SKILL.md") }
+            // [deep-audit-1039 B-05] listSkillFiles is a synchronous
+            // walkTopDown() over the skill's directory — it used to run inside
+            // this remember, i.e. on the composition thread of every
+            // recomposition keyed on (skill.id, skill.updatedAt). Same shape
+            // and same fix as the sibling-file read below ([dv14-B5]): the walk
+            // rides a LaunchedEffect + withContext(Dispatchers.IO), and the
+            // rendered list derives from the loaded base (empty until the walk
+            // lands, which renders as an empty Files section for a few frames).
+            var loadedSkillFiles by remember(skill.id, skill.updatedAt) {
+                mutableStateOf<List<String>?>(null)
             }
+            LaunchedEffect(skill.id, skill.updatedAt) {
+                loadedSkillFiles = withContext(Dispatchers.IO) {
+                    skillRepository.listSkillFiles(skill.id).ifEmpty { listOf("SKILL.md") }
+                }
+            }
+            val skillFiles = loadedSkillFiles ?: emptyList()
             DetailSection(header = "Files") {
                 skillFiles.forEachIndexed { index, relativePath ->
                     if (index > 0) DetailDivider()
@@ -1011,9 +1051,17 @@ fun SkillDetailScreen(
             confirmButton = {
                 MinisTextButton(onClick = {
                     deleted = true
-                    skillRepository.delete(skill.id)
-                    showDeleteDialog = false
-                    onBack()
+                    // [deep-audit-1039 B-05] delete = two SQLite DELETEs plus a
+                    // recursive directory walk; it ran inline on the click
+                    // (Main) here. Same treatment as the list-screen confirm and
+                    // the import sheet: move the thread, keep the sequence
+                    // (`deleted` first so the row stops re-resolving, then the
+                    // repository call, then the pop).
+                    scope.launch {
+                        withContext(Dispatchers.IO) { skillRepository.delete(skill.id) }
+                        showDeleteDialog = false
+                        onBack()
+                    }
                 }) { Text(stringResource(R.string.common_delete), color = MaterialTheme.colorScheme.error) }
             },
             dismissButton = {
@@ -1047,7 +1095,20 @@ fun SkillDetailScreen(
                 val canSave = trimmed.isNotEmpty() && trimmed != skill.name
                 MinisTextButton(
                     onClick = {
-                        if (canSave) skillRepository.update(skill.id, name = trimmed)
+                        // [deep-audit-1039 B-05] update() re-reads the on-disk
+                        // SKILL.md frontmatter, writes the DB row and rewrites
+                        // SKILL.md — all of it ran on the Main thread on this
+                        // click. Wrap like the update-from-file launcher above
+                        // ([FIX-R22 B32a]); the dialog closes immediately, and
+                        // the refreshed row arrives through the StateFlow the
+                        // screen already collects.
+                        if (canSave) {
+                            scope.launch {
+                                withContext(Dispatchers.IO) {
+                                    skillRepository.update(skill.id, name = trimmed)
+                                }
+                            }
+                        }
                         showEditNameDialog = false
                     },
                     enabled = canSave,

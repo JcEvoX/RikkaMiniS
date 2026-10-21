@@ -55,7 +55,8 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import coil.compose.AsyncImage
 import com.rikkaminis.app.ui.chat.LocalMarkdownSessionId
-import com.rikkaminis.app.ui.chat.resolveMdMediaFile
+import com.rikkaminis.app.ui.chat.rememberMdMediaFile
+import com.rikkaminis.app.ui.media.resolvedMediaSourceKey
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -744,21 +745,15 @@ private fun parseInline(
 }
 
 // ─── Media blocks (inline image / video / audio) ────────────────────────────
-
-/**
- * Resolve a URL used in Markdown (`minis://...` or a plain path) to a host
- * File, suitable for MediaPlayer, MediaMetadataRetriever, or file share
- * intents. Returns null when the path can't be resolved or the file is
- * missing.
- *
- * T10-M5: delegates to the chat renderer's session-scoped resolver instead of
- * keeping a second copy of the rules here. With a sessionId the lookup goes
- * straight to that session's directory; without one it can only fall back to
- * the global bind-mount map (last-writer-wins across open chats) and, on a
- * miss, a scan of every `minis-sessions/<id>/` tree.
- */
-private fun resolveMediaFile(context: Context, url: String, sessionId: String?): File? =
-    resolveMdMediaFile(context, url, sessionId)
+//
+// [dv19-B06] The media blocks resolve their URL through the chat renderer's
+// `rememberMdMediaFile` (produceState + Dispatchers.IO) instead of a local
+// synchronous `remember { ... }`. The old private delegate here —
+// `private fun resolveMediaFile(context, url, sessionId) =
+// resolveMdMediaFile(context, url, sessionId)` — became dead code with that
+// change and is gone: the resolution rules live in one place
+// (StreamingMarkdownText.resolveMdMediaFile, which is session-scoped and falls
+// back to the bind-mount map / a full `minis-sessions/<id>/` scan on a miss).
 
 private fun filenameFromUrl(url: String): String {
     val stripped = url.substringBefore('?')
@@ -825,7 +820,14 @@ private fun MinisVideoBlock(block: MarkdownParser.Block.Video) {
     }
     val context = LocalContext.current
     val sessionId = LocalMarkdownSessionId.current
-    val file = remember(block.url, sessionId) { resolveMediaFile(context, block.url, sessionId) }
+    // [dv19-B06] Off-main (produceState + IO) like the chat renderer's
+    // rememberMdMediaFile, instead of `remember(block.url, sessionId) {
+    // resolveMediaFile(...) }`: on a cache miss that resolver walks every
+    // `minis-sessions/<id>/` tree with listFiles()/exists() — a directory
+    // scan in composition, on the main thread, on the first frame of the
+    // block. The consumers below key on the absolute path, so the
+    // null→File transition re-runs them exactly once.
+    val file = rememberMdMediaFile(block.url, sessionId)
     val filename = remember(block.url) { filenameFromUrl(block.url) }
     val surfaceBg = MaterialTheme.colorScheme.surfaceVariant
     val borderColor = MaterialTheme.colorScheme.outline.copy(alpha = 0.3f)
@@ -920,18 +922,20 @@ private fun MinisVideoBlock(block: MarkdownParser.Block.Video) {
 private fun MinisAudioBlock(block: MarkdownParser.Block.Audio) {
     val context = LocalContext.current
     val sessionId = LocalMarkdownSessionId.current
-    val file = remember(block.url, sessionId) { resolveMediaFile(context, block.url, sessionId) }
+    // [dv19-B06] Same off-main resolver as MinisVideoBlock above (see the note
+    // there); this used to run the session-directory scan in composition.
+    val file = rememberMdMediaFile(block.url, sessionId)
     val filename = remember(block.url) { filenameFromUrl(block.url) }
 
-    val player = remember(file?.absolutePath) {
+    val player = remember(resolvedMediaSourceKey(file)) {
         if (file == null) null else MediaPlayer()
     }
-    var prepared by remember(file?.absolutePath) { mutableStateOf(false) }
+    var prepared by remember(resolvedMediaSourceKey(file)) { mutableStateOf(false) }
     // T10-M5: setDataSource() opens and parses the container header — real
     // disk/codec work that used to run inside remember{}, i.e. on the main
     // thread during composition. Open the source together with prepare() on
     // Dispatchers.IO so a cold file can't stall the first frame.
-    LaunchedEffect(player, file?.absolutePath) {
+    LaunchedEffect(player, resolvedMediaSourceKey(file)) {
         val p = player ?: return@LaunchedEffect
         val f = file ?: return@LaunchedEffect
         prepared = withContext(Dispatchers.IO) {
@@ -946,8 +950,8 @@ private fun MinisAudioBlock(block: MarkdownParser.Block.Audio) {
         onDispose { try { player?.release() } catch (_: Throwable) {} }
     }
 
-    var isPlaying by remember { mutableStateOf(false) }
-    var positionMs by remember { mutableStateOf(0) }
+    var isPlaying by remember(resolvedMediaSourceKey(file)) { mutableStateOf(false) }
+    var positionMs by remember(resolvedMediaSourceKey(file)) { mutableStateOf(0) }
     val durationMs = if (prepared && player != null) {
         runCatching { player.duration }.getOrDefault(0)
     } else 0

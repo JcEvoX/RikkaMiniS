@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Gate: FIX-4 (deep-audit-1037, dv16 wave) — chat UI interaction wiring. Three
-defect families, one gate:
+defect families, one gate (plus the dv19-B-01 family, E):
 
 B-01  SlashCommand.isMcp was written but never read: an MCP row tap fell into
       executeSlashCommand's action dispatch, whose unrecognized-id arm returns
@@ -61,10 +61,31 @@ log literal cannot satisfy them:
         enqueue preserved).
     C6  the empty-input keyboard shortcut (!inputFocused) survived.
 
+  ChatInputArea.kt (composer decisions, dv19 wave B-01 — the E family)
+    E1  the content flag of `val <showStop> = isStreaming && !<flag>` must,
+        transitively over `val <name> = …` (<= 4 hops), reach the field's live
+        value (or the shared C1 predicate) and must never reach the debounced
+        VM string.
+    E2  the three sites that act on / leave the composer (slash dismiss, slash
+        command, cross-session transfer) must pass the field's live value. All
+        three must exist: a missing site is fail-closed, since a decision that
+        moved out of the gate's view must not read as "clean".
+    E3  each of those three sites must drop the pending IME-burst flush before
+        it acts on the composer — inline, or through a shared `() -> Unit`
+        helper whose body cancels imeBurstJob (both shapes are legal: the
+        decision is "cancelled before the write", not the spelling).
+
 Boundary (documented, not a bug): C4 pins the rememberUpdatedState decision —
 a refactor that swaps it for a state-holder class must rename the criterion.
 C3's 4-line window is the static approximation of "inside the guarded block";
 a dead branch more than 4 lines below its guard needs the window widened.
+E1 follows identifiers through `val <name> = …` initialisers, so it requires
+that flag (and the values it reads) to stay one-line `val`s — a multi-line
+initialiser reads as "not reached" (fail-closed, never a silent pass).
+E-family scope: the four decisions named in deep-audit-1039 B-01. A NEW
+decision that reads the debounced string needs its own site criterion here —
+the family does not blanket-ban `inputText` (the debounce machinery and the
+field mirroring legitimately read it).
 
 Usage: python3 scripts/scan/chat_ui_interaction_check.py [repo_root]
        python3 scripts/scan/chat_ui_interaction_check.py --selftest
@@ -335,6 +356,218 @@ def slash_memo_findings(inp_c):
                              "line drops (B-05)" % SLASH_MEMO_CALL))
     return problems
 
+# ── E: composer decisions read the LIVE field value (dv19-B1) ────────────────
+#
+# B-01 (dv19 wave): the composer keeps two copies of the draft — the field's own
+# TextFieldValue (`inputFieldValue`, written FIRST on every onValueChange, i.e.
+# exactly what the user sees) and the ViewModel string, which a >8-char IME
+# burst (dictation / large paste) lags by up to 150 ms (the debounce flush). The
+# dv16-B fix routed the swipe gesture to a shared predicate over the live value
+# but left four DECISIONS reading the debounced string:
+#
+#   the 3-state button's content flag  → inside a burst the button renders a red
+#       STOP over a live stream (the tap calls cancelStream and kills the run the
+#       user meant to enqueue) and the idle Send stays dimmed over a composer the
+#       user can see is full;
+#   the slash-menu dismiss argument     → dismissSlashMenu() echoes its argument
+#       back as the composer value ⇒ the just-dictated burst is cleared;
+#   the slash-command argument          → same seam (its value is currently
+#       ignored in favour of savedInputBeforeSlash, but the call site is the
+#       documented "current input" reader and the next reader would inherit it);
+#   the cross-session transfer argument → the move stashes an empty string and
+#       leaves the 150 ms job alive on ChatScreen's scope, so the snapshot lands
+#       on the session the user just left (inputText is per-ViewModel).
+#
+# Criteria — every one bound to a DECISION POINT (a captured variable name or a
+# captured argument expression), never to a whole-line spelling:
+#   E1  the content flag of `val <showStop> = isStreaming && !<flag>` must,
+#       transitively over `val <name> = …` (<= 4 hops), reach the field's live
+#       value or the shared eligibility predicate — and must NOT reach the
+#       debounced string.
+#   E2  the three call arguments must BE the live field read. All three sites
+#       must exist (fail-closed: a missing site = the decision moved).
+#   E3  each of the three sites must drop the pending burst flush before it acts
+#       on the composer — inline (`imeBurstJob?.cancel()`), or through a shared
+#       `() -> Unit` helper whose body cancels the job. Both shapes are legal:
+#       the decision is "cancelled before the write", not the spelling.
+DEBOUNCED_RE = re.compile(r"\binputText\b")
+VAL_DECL_RE = re.compile(r"\bval (\w+)\s*=\s*([^\n]*)")
+PRED_DECL_RE = re.compile(r"\bval (\w+):\s*\(\)\s*->\s*Boolean\s*=\s*\{")
+UNIT_LAMBDA_RE = re.compile(r"\bval (\w+):\s*\(\)\s*->\s*Unit\s*=\s*\{")
+FLAG_USE_RE = re.compile(r"val (\w+)\s*=\s*isStreaming\s*&&\s*!(\w+)")
+CANCEL_RE = re.compile(r"imeBurstJob\s*\?\.\s*cancel\(\)")
+PENDING_RE = re.compile(r"(?<![\w])PendingTransfer\(")
+DISMISS_RE = re.compile(r"dismissSlashMenu\(")
+EXECUTE_RE = re.compile(r"executeSlashCommand\(")
+
+
+def brace_block_at(text, idx):
+    """The innermost `{ … }` slice containing [idx] — the block a statement sits
+    in. Offsets come from the comment-stripped text, so a prose brace in a KDoc
+    cannot land the slice on the wrong block."""
+    depth = 0
+    start = -1
+    for i in range(idx):
+        c = text[i]
+        if c == "{":
+            depth += 1
+            start = i
+        elif c == "}":
+            depth -= 1
+            if depth <= 0:
+                start = -1
+    if start == -1:
+        return ""
+    depth = 0
+    for i in range(start, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return text[start:]
+
+
+def call_arg_spans(text, open_idx):
+    """Top-level argument slices of the call whose `(` sits at [open_idx]."""
+    close = _balanced_paren(text, open_idx)
+    if close is None:
+        return None
+    inner = text[open_idx + 1:close]
+    spans = []
+    depth = 0
+    cur = 0
+    for i, c in enumerate(inner):
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "," and depth == 0:
+            spans.append(inner[cur:i])
+            cur = i + 1
+    spans.append(inner[cur:])
+    return [s.strip() for s in spans]
+
+
+def composer_live_source_findings(inp_c):
+    problems = []
+
+    # ── E1: the 3-state button's content decision ───────────────────────────
+    decls = {m.group(1): m.group(2) for m in VAL_DECL_RE.finditer(inp_c)}
+    pred_m = PRED_DECL_RE.search(inp_c)
+    pred = pred_m.group(1) if pred_m else None
+    flag_m = FLAG_USE_RE.search(inp_c)
+    if flag_m is None:
+        problems.append(("E1", "the 3-state button's content decision "
+                         "(`val <showStop> = isStreaming && !<flag>`) not found — "
+                         "fail-closed"))
+    else:
+        flag = flag_m.group(2)
+        if flag not in decls:
+            problems.append(("E1", "the button's content flag `%s` has no "
+                             "`val %s = …` declaration — fail-closed (keep that flag a "
+                             "one-line val so the decision stays readable)" % (flag, flag)))
+        else:
+            seen = set()
+            frontier = [flag]
+            hops = 0
+            live = False
+            debounced = False
+            while frontier and hops <= 4:
+                nxt = []
+                for name in frontier:
+                    if name in seen:
+                        continue
+                    seen.add(name)
+                    init = decls.get(name)
+                    if init is None:
+                        continue
+                    if "inputFieldValue" in init:
+                        live = True
+                    if DEBOUNCED_RE.search(init):
+                        debounced = True
+                    if pred and re.search(r"\b%s\s*\(" % re.escape(pred), init):
+                        live = True
+                    for ident in re.findall(r"[A-Za-z_]\w*", init):
+                        if ident in decls and ident not in seen:
+                            nxt.append(ident)
+                frontier = nxt
+                hops += 1
+            if debounced:
+                problems.append(("E1", "the button's content decision reads the "
+                                 "DEBOUNCED ViewModel string (inputText) via %s — inside a "
+                                 "dictation/paste burst the button renders a red STOP over "
+                                 "a live stream (the tap cancels the run the user meant to "
+                                 "enqueue) and the idle Send stays dimmed over a full "
+                                 "composer" % sorted(seen)))
+            if not live:
+                problems.append(("E1", "the button's content decision (closure %s) never "
+                                 "reaches the field's live value or the shared eligibility "
+                                 "predicate — it must share that single source" % sorted(seen)))
+
+    # ── E2/E3: the three sites that leave / act on the composer ─────────────
+    sites = []
+    for cid, label, rx in (("E2-dismiss", "dismiss", DISMISS_RE),
+                           ("E2-execute", "execute", EXECUTE_RE),
+                           ("E2-transfer", "transfer", PENDING_RE)):
+        m = rx.search(inp_c)
+        if m is None:
+            problems.append((cid, "the %s site (%s…) is missing — fail-closed (these three "
+                             "decisions must be visible to the gate)" % (label, rx.pattern)))
+            continue
+        sites.append((cid, label, m.end() - 1, call_arg_spans(inp_c, m.end() - 1)))
+
+    for cid, label, open_idx, args in sites:
+        if args is None:
+            problems.append((cid, "unbalanced argument list — fail-closed"))
+            continue
+        if cid == "E2-execute":
+            arg = args[-1] if len(args) >= 2 else None
+        elif cid == "E2-transfer":
+            arg = None
+            for a in args:
+                am = re.match(r"inputText\s*=\s*(.*)$", a, re.S)
+                if am:
+                    arg = am.group(1).strip()
+            if arg is None:
+                problems.append((cid, "no `inputText = …` named argument — fail-closed"))
+                continue
+        else:
+            arg = args[0]
+        if DEBOUNCED_RE.search(arg):
+            problems.append((cid, "the %s site passes the DEBOUNCED ViewModel string "
+                             "(inputText) to the composer — the 150 ms burst window makes "
+                             "it stale (empty right after dictation); it must pass the "
+                             "field's own TextFieldValue" % label))
+        elif "inputFieldValue" not in arg:
+            problems.append((cid, "the %s site passes `%s`, not the field's live value "
+                             "(inputFieldValue.text)" % (label, arg[:60])))
+
+    # ── E3: drop the pending burst flush before acting on the composer ──────
+    helper = None
+    for hm in UNIT_LAMBDA_RE.finditer(inp_c):
+        if CANCEL_RE.search(brace_block_at(inp_c, hm.end())):
+            helper = hm.group(1)
+            break
+    inline_any = False
+    for cid, label, open_idx, _args in sites:
+        block = brace_block_at(inp_c, open_idx)
+        ok = bool(helper and re.search(r"\b%s\s*\(\)" % re.escape(helper), block))
+        if not ok:
+            inline_any = inline_any or bool(CANCEL_RE.search(block))
+            ok = bool(CANCEL_RE.search(block))
+        if not ok:
+            problems.append(("E3", "the %s site does not drop the pending IME-burst flush "
+                             "before it acts on the composer: cancel the job (or call the "
+                             "shared cancel helper) so the 150 ms snapshot cannot commit "
+                             "over the value this site just wrote — after a cross-session "
+                             "transfer it would land on the session the user left" % label))
+    if helper is None and not inline_any:
+        problems.append(("E3", "no pending-burst cancel found anywhere — fail-closed "
+                         "(either a `() -> Unit` helper whose body cancels imeBurstJob, or "
+                         "an inline cancel at each site)"))
+    return problems
 
 
 # ── the gate ─────────────────────────────────────────────────────────────────
@@ -548,6 +781,9 @@ def check_tree(root):
     # ── D1-D3: slash-menu memo wiring (dv17-4 / B-05) ───────────────────────
     problems.extend(slash_memo_findings(inp_c))
 
+    # ── E1-E3: composer decisions read the live field value (dv19-B1) ──────
+    problems.extend(composer_live_source_findings(inp_c))
+
     return INPUT_REL, problems
 
 
@@ -607,6 +843,23 @@ fun ChatInputArea() {
     }
     if (showSlashMenu && filteredSlashCommands.isNotEmpty()) {
         Text(filteredSlashCommands.size.toString())
+        Popup(onDismissRequest = {
+            cancelPendingImeBurst()
+            viewModel.setInputText(viewModel.dismissSlashMenu(inputFieldValue.text))
+        })
+        Row {
+            if (!isThinking) {
+                it.clickable {
+                    cancelPendingImeBurst()
+                    viewModel.setInputText(viewModel.executeSlashCommand(cmd, inputFieldValue.text))
+                }
+            }
+        }
+    }
+    val cancelPendingImeBurst: () -> Unit = {
+        imeBurstJob?.cancel()
+        imeBurstJob = null
+        imeBurstBuffer = null
     }
     val canSwipeSendNow: () -> Boolean = {
         inputFieldValue.text.isNotBlank() || attachments.isNotEmpty()
@@ -658,6 +911,19 @@ fun ChatInputArea() {
     ) {
         Column {
         }
+    }
+    val hasContent = canSwipeSendNow()
+    val showStop = isStreaming && !hasContent
+    if (showMoveSheet) {
+        MoveToSessionSheet(onSelect = { targetId ->
+            cancelPendingImeBurst()
+            ChatViewModelStore.stashPendingTransfer(
+                ChatViewModelStore.PendingTransfer(
+                    inputText = inputFieldValue.text,
+                    attachments = viewModel.attachments.value,
+                ),
+            )
+        })
     }
 }
 """
@@ -933,12 +1199,81 @@ def selftest():
             "    val filteredSlashCommands = if (true) {\n"),
     }), None)
 
+    # ── E1-E3 (dv19-B1): composer decisions read the LIVE field value ────────
+    def expect_exact(name, files, want_violation_ids):
+        """Stricter than expect(): the violation-id SET must match exactly, so a
+        fixture cannot pass by tripping an unrelated criterion (the "only this
+        one turns red" proof each new criterion owes)."""
+        root = tempfile.mkdtemp(prefix="chat-ui-gate-selftest-")
+        try:
+            for rel, content in files.items():
+                path = os.path.join(root, rel)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+            _, problems = check_tree(root)
+            got = {cid for cid, _ in problems}
+            want = set(want_violation_ids)
+            if got != want:
+                failures.append("%s: expected exactly %s, got %s"
+                                % (name, sorted(want), sorted(got)))
+        finally:
+            shutil.rmtree(root)
+
+    # E1: a content flag that reads the debounced VM string flips red
+    expect_exact("E1 debounced button flag", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "    val hasContent = canSwipeSendNow()\n",
+            "    val hasContent = inputText.isNotBlank() || attachments.isNotEmpty()\n"),
+    }), ["E1"])
+    # E1 precision: reading the field's own value is an equally legal shape
+    expect("E1 precision: direct live read", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "    val hasContent = canSwipeSendNow()\n",
+            "    val hasContent = inputFieldValue.text.isNotBlank() || attachments.isNotEmpty()\n"),
+    }), None)
+    # E2: each decision site must pass the live value -- one fixture per site
+    expect_exact("E2 debounced dismiss arg", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "dismissSlashMenu(inputFieldValue.text)", "dismissSlashMenu(inputText)"),
+    }), ["E2-dismiss"])
+    expect_exact("E2 debounced execute arg", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "executeSlashCommand(cmd, inputFieldValue.text)", "executeSlashCommand(cmd, inputText)"),
+    }), ["E2-execute"])
+    expect_exact("E2 debounced transfer arg", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "inputText = inputFieldValue.text,", "inputText = inputText,"),
+    }), ["E2-transfer"])
+    # E2 fail-closed: a site that moved away is reported, never silently skipped
+    expect_exact("E2 missing transfer site", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "ChatViewModelStore.PendingTransfer(", "ChatViewModelStore.MovedTransfer("),
+    }), ["E2-transfer"])
+    # E3: dropping the cancel at one site flips that site red
+    expect_exact("E3 cancel dropped at the transfer site", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "        MoveToSessionSheet(onSelect = { targetId ->\n"
+            "            cancelPendingImeBurst()\n",
+            "        MoveToSessionSheet(onSelect = { targetId ->\n"),
+    }), ["E3"])
+    # E3 precision: inline cancels (no shared helper) are an equally legal shape
+    expect_exact("E3 precision: inline cancels", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "    val cancelPendingImeBurst: () -> Unit = {\n"
+            "        imeBurstJob?.cancel()\n"
+            "        imeBurstJob = null\n"
+            "        imeBurstBuffer = null\n"
+            "    }\n", "").replace(
+            "cancelPendingImeBurst()", "imeBurstJob?.cancel()"),
+    }), [])
+
     if failures:
         print("❌ selftest failed:")
         for f in failures:
             print("   " + f)
         return 1
-    print("CHAT_UI_INTERACTION_SELFTEST=PASS (18 fixtures: clean + 17 violation/precision)")
+    print("CHAT_UI_INTERACTION_SELFTEST=PASS (26 fixtures: clean + 25 violation/precision)")
     return 0
 
 

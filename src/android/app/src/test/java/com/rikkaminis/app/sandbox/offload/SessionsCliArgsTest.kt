@@ -46,12 +46,60 @@ class SessionsCliArgsTest {
     fun newDeclaration_keepsSendSubcommandAndAsyncFlag() {
         val args = OffloadArgs(
             listOf("--async", "send", "--prompt", "hi"),
-            booleanFlags = setOf("full", "async", "help", "h"),
+            booleanFlags = setOf("full", "async", "wait", "help", "h"),
         )
         assertEquals("send", args.positional.first())
         assertTrue(args.hasFlag("async"))
         assertEquals("hi", args.get("prompt"))
         assertEquals(null, args.get("async"))
+    }
+
+    // ── [dv19-A1 A-02] `--wait`, the same defect one flag over ──────────────
+    //
+    // `wait` was missing from that same declaration list. The KDoc of cmdSend
+    // documents `--wait` as the DEFAULT mode, so it is a spelling callers
+    // legitimately write; undeclared, `--wait send --prompt "hi"` stored "send"
+    // as the VALUE of `--wait`, the positional list came out empty, the
+    // subcommand degraded to `list` and the command answered with the session
+    // list at exit 0 — a wrong answer that looks like a successful call.
+
+    /** Old declaration set — reproduces the swallowed-subcommand failure. */
+    @Test
+    fun oldDeclaration_swallowsSendAsWaitValue() {
+        val args = OffloadArgs(
+            listOf("--wait", "send", "--prompt", "hi"),
+            booleanFlags = setOf("full", "async", "help", "h"),
+        )
+        assertEquals("send", args.get("wait")) // greedy consumption
+        assertFalse(args.hasFlag("wait"))
+        assertTrue(args.positional.isEmpty()) // sub degrades to "list"
+        assertEquals("hi", args.get("prompt"))
+    }
+
+    @Test
+    fun newDeclaration_keepsSendSubcommandAndWaitFlag() {
+        val args = OffloadArgs(
+            listOf("--wait", "send", "--prompt", "hi"),
+            booleanFlags = setOf("full", "async", "wait", "help", "h"),
+        )
+        assertEquals("send", args.positional.first())
+        assertTrue(args.hasFlag("wait"))
+        assertFalse(args.hasFlag("async"))
+        assertEquals("hi", args.get("prompt"))
+        assertEquals(null, args.get("wait"))
+    }
+
+    /** `--wait-timeout` is a value option and must keep eating its `<sec>`. */
+    @Test
+    fun waitClearedDoesNotTurnWaitTimeoutIntoAFlag() {
+        val args = OffloadArgs(
+            listOf("--wait", "send", "--prompt", "hi", "--wait-timeout", "30"),
+            booleanFlags = setOf("full", "async", "wait", "help", "h"),
+        )
+        assertEquals("send", args.positional.first())
+        assertEquals(30, args.getInt("wait-timeout"))
+        assertEquals("hi", args.get("prompt"))
+        assertTrue(args.hasFlag("wait"))
     }
 
     /** `--help` / `-h` placed before the subcommand must stay flags, not values. */
@@ -107,8 +155,18 @@ class SessionsCliArgsTest {
     fun booleanFlagsDeclarationWired() {
         val src = handlerFile.readText()
         assertTrue(
-            "the handler must declare async/help/h as boolean flags",
-            src.contains("booleanFlags = setOf(\"full\", \"async\", \"help\", \"h\")"),
+            "the handler must declare async/wait/help/h as boolean flags",
+            src.contains("booleanFlags = setOf(\"full\", \"async\", \"wait\", \"help\", \"h\")"),
+        )
+    }
+
+    /** [dv19-A1 A-02] the flag must be documented, not only implied by KDoc. */
+    @Test
+    fun helpTextListsWaitAsAnOption() {
+        val lines = handlerFile.readText().lines()
+        assertTrue(
+            "--wait must have its own HELP_TEXT option line (not only --wait-timeout)",
+            lines.any { it.trimStart().startsWith("--wait ") && it.contains("(send only)") },
         )
     }
 }

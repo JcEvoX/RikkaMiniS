@@ -143,6 +143,44 @@ Criteria (each fail-closed: missing anchor = RED, never silent skip):
       key list would be tautological). Fail-closed when the dialog is gone or no
       state derives from `initial.` any more (re-derive rather than delete).
 
+  C20/C21 AddCustomModelScreen [da1039-B3 B-03] — the same母题 one level up:
+      the READ half of a stale snapshot. `providerRepository.instance(id)` is a
+      one-shot `_config.value.instances.find { … }` read, so an instance deleted
+      elsewhere (minis-config RPC / Debug RPC / backup restore / another screen)
+      never recomposed this page, its `instance == null` guard never fired, and
+      Save persisted a ModelEntry whose `providerInstanceId` no longer exists
+      (`addEntry` checks duplicates only). C20 = subscribe to
+      `providerRepository.config.collectAsState()` and derive the instance from
+      `config.instances` (the one-shot read must be gone). C21 = the save path
+      must re-check the parent against the LIVE list before the `addEntry` call,
+      because the delete can land between the click and the IO hop.
+
+  C22/C23 ProviderConnectionScreen [da1039-B3 B-04] — the same母题 on the WRITE
+      side. `instance` is the composition-time snapshot, so every
+      `updateInstance(instance.copy(…))` pushed the whole record back: a
+      focus-loss save that ran after a toggle (or after an external write)
+      silently reverted the newer fields, and the first-frame
+      `onFocusChanged(isFocused = false)` Compose delivers on mount made every
+      visit write twice. C22 = a live resolver (`fun currentInstance()` reading
+      `config.instances`) must exist and EVERY `providerRepository.updateInstance`
+      must go through it, directly or via a local assigned from it (decision, not
+      spelling — the snapshot arg is reported by line). C23 = both focus-loss
+      savers must route through the pure `pendingConnectionFieldWrite` decision
+      (normalise blank → null, skip when unchanged) and the base-URL saver must
+      no longer rewrite `customUserAgent` in the same copy.
+
+  C24/C25 the Quick Test target [da1039-B3 B-08] — graded on BOTH screens that
+      host the shared `modelEntryPickerItems` (AddModelsToGroupScreen and the
+      agent-loop add sheet), so the sibling that never wired the channel cannot
+      stay silently different. C24 = the target is held as a `String?` id, the
+      picker wiring stores `it.id` (identity, not the object tapped), and the
+      sheet is hosted with an `onDismiss` that clears the same state. C25 = a
+      `LaunchedEffect` keyed on BOTH the pending id and the list it resolves
+      against, whose body calls the vanished test and clears the state; closing
+      unconditionally does NOT count (same rule as C16). A frozen `ModelEntry`
+      kept feeding "Run again" the config the row had at tap time, and a deleted
+      model left the sheet open against a row that no longer exists.
+
 Usage:
   python3 provider_remember_key_check.py <repo_root>   # real-tree mode
   python3 provider_remember_key_check.py --selftest    # fixture mode
@@ -182,6 +220,9 @@ REL_BACKUP_SCREEN = "src/android/app/src/main/java/com/rikkaminis/app/ui/setting
 REL_ADD_MODELS = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/AddModelsToGroupScreen.kt"
 REL_AGENT_LOOP_SHEETS = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/AgentLoopAddSheets.kt"
 REL_MODEL_ENTRY_PICKER = "src/android/app/src/main/java/com/rikkaminis/app/ui/components/ModelEntryPicker.kt"
+# da1039-B3 (B-03 / B-04 / B-08): the settings screens that read a config object
+# once and then write through it.
+REL_ADD_CUSTOM_MODEL = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/AddCustomModelScreen.kt"
 
 # ---- [da1030-C ISSUE-05] C12 / C13 ----
 # The collected revision local may be named either way; both spellings are the
@@ -206,6 +247,47 @@ VANISHED_TEST_RE = re.compile(r"<\s*0|==\s*-1|!in\b|==\s*null|isEmpty\(\)|isNotE
 # A cache WRITE (`customRulesCache = …`), distinct from the field declaration
 # (`private var customRulesCache: Map<…> = …`) and from passing it as an arg.
 CACHE_WRITE_RE = re.compile(r"\bcustomRulesCache\s*=\s*[A-Za-z_]")
+
+# ---- [da1039-B3] C20..C25: the write-path half of the same母题 -------------
+# C20/C21 — AddCustomModelScreen reads its PARENT INSTANCE. `providerRepository
+# .instance(id)` is a one-shot snapshot (`_config.value.instances.find { … }`):
+# the page never recomposed when the instance was removed externally, so the
+# `instance == null` guard never fired and Save minted an orphan ModelEntry.
+ADD_CUSTOM_SUBSCRIPTION_RE = re.compile(
+    r"providerRepository\s*\.\s*config\s*\.\s*collectAsState\s*\(")
+ADD_CUSTOM_DERIVE_RE = re.compile(
+    r"\bconfig\s*\.\s*instances\s*\.\s*(?:find|firstOrNull)\s*\{")
+ONE_SHOT_INSTANCE_RE = re.compile(r"\bproviderRepository\s*\.\s*instance\s*\(")
+# the save path re-checks the parent against the LIVE list before it writes
+ADD_CUSTOM_LIVE_GUARD_RE = re.compile(
+    r"(?:config\s*\.\s*value\s*\.\s*instances|\.instances\b)[\s\S]{0,160}?"
+    r"\.(?:any|none|indexOfFirst)\s*\{[\s\S]{0,200}?instanceId")
+ADD_ENTRY_CALL_RE = re.compile(r"\bproviderRepository\s*\.\s*addEntry\s*\(")
+
+# C22/C23 — ProviderConnectionScreen writes back the composition-time snapshot.
+LIVE_RESOLVER_NAME = "currentInstance"
+LIVE_RESOLVER_DECL_RE = lambda name: re.compile(r"\bfun\s+" + re.escape(name) + r"\s*\(\s*\)")
+LIVE_RESOLVER_READ_RE = re.compile(
+    r"config\s*\.\s*instances\s*\.\s*(?:find|firstOrNull)\s*\{")
+LIVE_LOCAL_RE = lambda name: re.compile(
+    r"\bval\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*" + re.escape(name) + r"\(\s*\)")
+UPDATE_INSTANCE_RE = re.compile(r"\bproviderRepository\s*\.\s*updateInstance\s*\(")
+# the pure decision the two focus-loss savers route through
+DIRTY_DECISION_NAME = "pendingConnectionFieldWrite"
+DIRTY_DECISION_BODY_RE = re.compile(r"ifBlank\s*\{[\s\S]{0,80}?\}[\s\S]{0,120}?stored")
+DIRTY_SKIP_WRITE_RE = re.compile(
+    r"\?:\s*return\b|if\s*\([\s\S]{0,60}?==\s*null\s*\)\s*\{?\s*return\b")
+SAVER_NAMES = ("saveBaseURLSettings", "saveUserAgentSetting")
+
+# C24/C25 — the Quick Test target must survive an external write/delete.
+QUICK_TEST_ID_RE = re.compile(
+    r"\bvar\s+quickTestEntryId\b[\s\S]{0,160}?mutableStateOf\s*<\s*String\?\s*>")
+QUICK_TEST_RESOLVER_NAME = "liveQuickTestEntry"
+QUICK_TEST_VANISHED_NAME = "quickTestTargetVanished"
+QUICK_TEST_WIRING_RE = re.compile(
+    r"onQuickTest\s*=\s*\{[\s\S]{0,200}?quickTestEntryId\s*=\s*it\.id")
+QUICK_TEST_SHEET_RE = re.compile(r"\bQuickTestSheet\s*\(")
+QUICK_TEST_DISMISS_RE = re.compile(r"onDismiss\s*=\s*\{[\s\S]{0,80}?quickTestEntryId\s*=\s*null")
 
 # C6c — value families a remember initializer can derive from in
 # ModelEntryDetailScreen. Reading any of them makes the call site
@@ -1253,6 +1335,192 @@ def check_collapsed_helper(code):
                     if not bad else "; ".join(bad)))
     return results
 
+def _resolver_window(code, name, limit=220):
+    """Text right after `fun <name>( )` up to the first blank line (where the
+    next declaration starts), so a reverted body cannot borrow a
+    `<x>.instances.find {` match from further down the file. None when the
+    declaration itself is gone."""
+    m = LIVE_RESOLVER_DECL_RE(name).search(code)
+    if not m:
+        return None
+    w = code[m.end():m.end() + limit]
+    cut = w.find("\n\n")
+    return w if cut < 0 else w[:cut]
+
+
+def check_add_custom_model(code):
+    """C20 / C21 [da1039-B3 B-03] — AddCustomModelScreen must read its parent
+    instance reactively and re-check it against the live list before it writes.
+
+    C20 grades the READ decision: subscribe to the config flow and derive the
+    instance from `config.instances`. The one-shot `providerRepository.instance(id)`
+    read is the defect (`_config.value` snapshot — an external delete never
+    recomposes the page, so the `instance == null` guard never fires).
+    C21 grades the WRITE decision: the `addEntry` call must be preceded by an
+    existence test over the live instance list, because `addEntry` only checks
+    for duplicates — a delete landing between the click and the IO hop would
+    otherwise persist an entry pointing at a provider instance that is gone.
+    Fail-closed when the save path has no `addEntry(` call at all."""
+    results = []
+    problems = []
+    if not ADD_CUSTOM_SUBSCRIPTION_RE.search(code):
+        problems.append("no `providerRepository.config.collectAsState()` — the instance is still read "
+                        "as a one-shot snapshot")
+    if not ADD_CUSTOM_DERIVE_RE.search(code):
+        problems.append("the instance is not derived from `config.instances` (fail-closed: re-derive "
+                        "this criterion if the screen was reworked)")
+    if ONE_SHOT_INSTANCE_RE.search(code):
+        problems.append("`providerRepository.instance(` is still called — that read does not subscribe")
+    results.append(("C20", not problems,
+                    "subscribes to the config flow and derives the parent instance from it"
+                    if not problems else "; ".join(problems)))
+
+    entry = ADD_ENTRY_CALL_RE.search(code)
+    if not entry:
+        results.append(("C21", False,
+                        "no `providerRepository.addEntry(` call in the save path (fail-closed: "
+                        "re-derive this criterion)"))
+        return results
+    window = code[max(0, entry.start() - 900):entry.start()]
+    guard = ADD_CUSTOM_LIVE_GUARD_RE.search(window)
+    results.append(("C21", bool(guard),
+                    "the save path re-checks the parent against the live instance list before it writes"
+                    if guard else
+                    "the write is not preceded by a live-instance existence test — a delete landing "
+                    "between the click and the IO hop still persists an orphan ModelEntry"))
+    return results
+
+
+def check_connection_write_path(code):
+    """C22 / C23 [da1039-B3 B-04] — ProviderConnectionScreen must write through
+    the LIVE instance, and a blur that changed nothing must not write.
+
+    C22 grades the write target: `instance` is the composition-time snapshot, so
+    every `updateInstance(instance.copy(…))` pushed the whole record back — a
+    focus-loss save running after a toggle (or after an external minis-config /
+    RPC / backup-restore write) silently reverted the newer fields. The file must
+    declare a live resolver (`fun currentInstance()` reading `config.instances`)
+    and every write must go through it — directly or through a local assigned
+    from it (decision, not spelling). Fail-closed when the resolver or the write
+    calls are gone.
+    C23 grades the skip-if-unchanged decision: Compose delivers
+    `onFocusChanged(isFocused = false)` on the first frame after mounting, so a
+    saver without a dirty test writes (and logs) on every visit. Both savers must
+    route through the pure decision helper, and the base-URL saver must no longer
+    rewrite `customUserAgent` in the same copy (cross-field write)."""
+    results = []
+    window = _resolver_window(code, LIVE_RESOLVER_NAME)
+    reads_live = bool(window is not None and LIVE_RESOLVER_READ_RE.search(window))
+    live_locals = set(LIVE_LOCAL_RE(LIVE_RESOLVER_NAME).findall(code))
+
+    calls = list(UPDATE_INSTANCE_RE.finditer(code))
+    if not calls:
+        results.append(("C22", False,
+                        "no `providerRepository.updateInstance(` call found (fail-closed: re-derive "
+                        "this criterion)"))
+    else:
+        bad = []
+        for m in calls:
+            args = call_args(code, m.end() - 1) or ""
+            if LIVE_RESOLVER_NAME + "(" in args:
+                continue
+            if any(re.search(r"\b" + re.escape(v) + r"\b", args) for v in live_locals):
+                continue
+            bad.append("L%d: `%s` is the composition-time snapshot"
+                       % (code.count("\n", 0, m.start()) + 1, " ".join(args.split())[:70]))
+        if not reads_live:
+            bad.insert(0, "no `fun %s()` resolving from `config.instances` (fail-closed: the live "
+                          "resolver is gone — re-derive this criterion)" % LIVE_RESOLVER_NAME)
+        results.append(("C22", not bad,
+                        "all %d updateInstance writes go through %s(), which reads the live instance"
+                        % (len(calls), LIVE_RESOLVER_NAME) if not bad else "; ".join(bad)))
+
+    problems = []
+    helper = func_body(code, DIRTY_DECISION_NAME)
+    if helper is None or not DIRTY_DECISION_BODY_RE.search(helper):
+        problems.append("no `%s(` decision that compares the normalised edit against the stored value "
+                        "(fail-closed: an always-write helper re-opens the first-frame write)"
+                        % DIRTY_DECISION_NAME)
+    for name in SAVER_NAMES:
+        body = func_body(code, name)
+        if body is None:
+            problems.append("no `fun %s(` body (fail-closed: re-derive this criterion)" % name)
+            continue
+        if DIRTY_DECISION_NAME not in body:
+            problems.append("%s does not route through %s(" % (name, DIRTY_DECISION_NAME))
+        elif not DIRTY_SKIP_WRITE_RE.search(body):
+            problems.append("%s ignores the decision (no early return when the value did not change)"
+                            % name)
+    base_body = func_body(code, SAVER_NAMES[0])
+    if base_body is not None and "customUserAgent" in base_body:
+        problems.append("%s still writes customUserAgent in the same copy (a base-URL blur rewrites "
+                        "an unrelated field)" % SAVER_NAMES[0])
+    results.append(("C23", not problems,
+                    "both focus-loss savers write only when the field changed, and the base-URL saver "
+                    "no longer touches customUserAgent" if not problems else "; ".join(problems)))
+    return results
+
+
+def check_quick_test_target(code):
+    """C24 / C25 [da1039-B3 B-08] — the Quick Test sheet must be opened for an
+    ID resolved against the live entry list, and must close when that ID stops
+    resolving.
+
+    C24 grades the target decision: the state is a `String?` id, the picker
+    wiring stores `it.id` (identity, not the object captured at tap time), the
+    sheet is hosted, and its `onDismiss` resets the same state. A `ModelEntry`
+    snapshot kept feeding "Run again" the config the row had when the lightning
+    bolt was tapped.
+    C25 grades the close-on-vanished decision: a `LaunchedEffect` keyed on BOTH
+    the pending id and the list it resolves against, whose body calls the
+    vanished test and clears the state (closing unconditionally does NOT count —
+    that would dismiss the sheet on any recomposition). Both screens that host
+    the shared picker are graded, so the sibling that never wired the channel
+    cannot stay silently different."""
+    results = []
+    problems = []
+    if not QUICK_TEST_ID_RE.search(code):
+        problems.append("no `var quickTestEntryId` holding a String? id — the target is still the "
+                        "ModelEntry captured when the row was tapped")
+    if not QUICK_TEST_WIRING_RE.search(code):
+        problems.append("no `onQuickTest = { … quickTestEntryId = it.id }` wiring — the row captures "
+                        "the object instead of its identity, or the channel is missing")
+    resolved = []
+    list_ok = False
+    for m in re.finditer(r"\b" + QUICK_TEST_RESOLVER_NAME + r"\s*\(", code):
+        args = call_args(code, m.end() - 1) or ""
+        if "quickTestEntryId" in args:
+            resolved.append(m)
+            if "modelEntries" in args:
+                list_ok = True
+    if not resolved:
+        problems.append("`%s(` is never called with the pending id — the sheet keeps the tapped copy"
+                        % QUICK_TEST_RESOLVER_NAME)
+    elif not list_ok:
+        problems.append("`%s(` does not resolve against `<x>.modelEntries`" % QUICK_TEST_RESOLVER_NAME)
+    if not QUICK_TEST_SHEET_RE.search(code) or not QUICK_TEST_DISMISS_RE.search(code):
+        problems.append("no `QuickTestSheet(` host whose onDismiss clears `quickTestEntryId`")
+    results.append(("C24", not problems,
+                    "the Quick Test target is held as an id, wired from the row identity and resolved "
+                    "against the live entry list" if not problems else "; ".join(problems)))
+
+    close = []
+    for line_no, keys, _span, init in iter_remember_calls(code, "LaunchedEffect"):
+        if QUICK_TEST_VANISHED_NAME not in init or "quickTestEntryId = null" not in init:
+            continue
+        flat = keys or ""
+        if "quickTestEntryId" not in flat or "modelEntries" not in flat:
+            continue
+        close.append(line_no)
+    results.append(("C25", bool(close),
+                    "the sheet closes through a LaunchedEffect keyed on the pending id AND the live "
+                    "entry list (L%s)" % ",".join(str(x) for x in close) if close else
+                    "no `LaunchedEffect(<pending id>, <entry list>)` that clears the state when "
+                    "`%s(` says the target is gone — a deleted model leaves the sheet open"
+                    % QUICK_TEST_VANISHED_NAME))
+    return results
+
+
 CHECKERS = (
     (REL_PROVIDER_LIST, check_provider_list),
     (REL_SHEET, check_sheet),
@@ -1272,6 +1540,11 @@ CHECKERS = (
     (REL_ADD_MODELS, check_collapsed_screen),
     (REL_AGENT_LOOP_SHEETS, check_collapsed_screen),
     (REL_MODEL_ENTRY_PICKER, check_collapsed_helper),
+    # da1039-B3 (B-03 / B-04 / B-08)
+    (REL_ADD_CUSTOM_MODEL, check_add_custom_model),
+    (REL_CONNECTION, check_connection_write_path),
+    (REL_ADD_MODELS, check_quick_test_target),
+    (REL_AGENT_LOOP_SHEETS, check_quick_test_target),
 )
 
 
@@ -1408,9 +1681,33 @@ fun unrelated() {}
 
 FIX_CONNECTION_CLEAN = """package com.rikkaminis.app.ui.settings
 
+fun pendingConnectionFieldWrite(edited: String, stored: String?): String? {
+    val normalized = edited.ifBlank { null }
+    return if (normalized == stored) null else normalized
+}
+
 fun ProviderConnectionScreen(instanceId: String, instance: ProviderInstance) {
     var customBaseURL by rememberSaveable(instance.id, instance.customBaseURL) { mutableStateOf(instance.customBaseURL ?: "") }
     var customUserAgent by rememberSaveable(instance.id, instance.customUserAgent) { mutableStateOf(instance.customUserAgent ?: "") }
+
+    fun currentInstance(): ProviderInstance =
+        config.instances.find { it.id == instanceId } ?: instance
+
+    fun saveBaseURLSettings() {
+        val live = currentInstance()
+        val pending = pendingConnectionFieldWrite(customBaseURL, live.customBaseURL) ?: return
+        providerRepository.updateInstance(live.copy(customBaseURL = pending))
+    }
+
+    fun saveUserAgentSetting() {
+        val live = currentInstance()
+        val pending = pendingConnectionFieldWrite(customUserAgent, live.customUserAgent) ?: return
+        providerRepository.updateInstance(live.copy(customUserAgent = pending))
+    }
+
+    SingleChoiceSegmentedButtonRow {
+        SegmentedButton(onClick = { providerRepository.updateInstance(currentInstance().copy(useResponsesAPI = false)) })
+    }
 }
 """
 
@@ -1423,6 +1720,89 @@ FIX_CONNECTION_NO_UA_KEY = FIX_CONNECTION_CLEAN.replace(
     "var customUserAgent by rememberSaveable(instance.id)")
 
 FIX_CONNECTION_MISSING_ANCHOR = """package com.rikkaminis.app.ui.settings
+
+fun unrelated() {}
+"""
+
+# --- da1039-B3 B-04 variants: the write-path criteria (C22 / C23) ---------
+
+# one write site still pushes the composition-time snapshot
+FIX_CONNECTION_SNAPSHOT_WRITE = FIX_CONNECTION_CLEAN.replace(
+    "providerRepository.updateInstance(currentInstance().copy(useResponsesAPI = false))",
+    "providerRepository.updateInstance(instance.copy(useResponsesAPI = false))")
+
+# the resolver is back to returning the snapshot it captured
+FIX_CONNECTION_NO_RESOLVER = FIX_CONNECTION_CLEAN.replace(
+    """    fun currentInstance(): ProviderInstance =
+        config.instances.find { it.id == instanceId } ?: instance""",
+    "    fun currentInstance(): ProviderInstance = instance")
+
+# the helper exists but no longer compares anything (always writes)
+FIX_CONNECTION_HELPER_ALWAYS_WRITE = FIX_CONNECTION_CLEAN.replace(
+    """    val normalized = edited.ifBlank { null }
+    return if (normalized == stored) null else normalized""",
+    "    return edited.ifBlank { null }")
+
+# the base-URL saver writes unconditionally again (no dirty decision)
+FIX_CONNECTION_NO_DIRTY_GUARD = FIX_CONNECTION_CLEAN.replace(
+    """        val live = currentInstance()
+        val pending = pendingConnectionFieldWrite(customBaseURL, live.customBaseURL) ?: return
+        providerRepository.updateInstance(live.copy(customBaseURL = pending))""",
+    """        val live = currentInstance()
+        providerRepository.updateInstance(live.copy(customBaseURL = customBaseURL.ifBlank { null }))""")
+
+# the cross-field write comes back (a base-URL blur rewrites the UA field)
+FIX_CONNECTION_CROSS_FIELD_WRITE = FIX_CONNECTION_CLEAN.replace(
+    "providerRepository.updateInstance(live.copy(customBaseURL = pending))",
+    """providerRepository.updateInstance(
+            live.copy(customBaseURL = pending, customUserAgent = pending)
+        )""")
+
+# --- da1039-B3 B-03 fixtures: the parent-instance read (C20 / C21) --------
+
+FIX_ADD_CUSTOM_MODEL_CLEAN = """package com.rikkaminis.app.ui.settings
+
+fun AddCustomModelScreen(instanceId: String) {
+    val config by providerRepository.config.collectAsState()
+    val instance = config.instances.find { it.id == instanceId }
+
+    if (instance == null) {
+        LaunchedEffect(Unit) { onBack() }
+        return
+    }
+
+    MinisButton(onClick = {
+        val entry = ModelEntry(providerInstanceId = instanceId, baseModel = model, isCustom = true)
+        scope.launch {
+            val parentStillThere = providerRepository.config.value.instances.any { it.id == instanceId }
+            if (!parentStillThere) {
+                onBack()
+                return@launch
+            }
+            withContext(Dispatchers.IO) { providerRepository.addEntry(entry) }
+            onBack()
+        }
+    })
+}
+"""
+
+# the pre-fix read: a one-shot snapshot that never recomposes on an external delete
+FIX_ADD_CUSTOM_MODEL_SNAPSHOT = FIX_ADD_CUSTOM_MODEL_CLEAN.replace(
+    """    val config by providerRepository.config.collectAsState()
+    val instance = config.instances.find { it.id == instanceId }""",
+    "    val instance = providerRepository.instance(instanceId)")
+
+# read is fixed, the write-time re-check is gone
+FIX_ADD_CUSTOM_MODEL_NO_LIVE_GUARD = FIX_ADD_CUSTOM_MODEL_CLEAN.replace(
+    """            val parentStillThere = providerRepository.config.value.instances.any { it.id == instanceId }
+            if (!parentStillThere) {
+                onBack()
+                return@launch
+            }
+""",
+    "")
+
+FIX_ADD_CUSTOM_MODEL_MISSING_ANCHOR = """package com.rikkaminis.app.ui.settings
 
 fun unrelated() {}
 """
@@ -1974,6 +2354,17 @@ fun AddModelsToGroupScreen(modalityFilter: PickerModalityFilter? = null) {
         config = config,
         defaultExpanded = modalityFilter != null,
     )
+    var quickTestEntryId by remember { mutableStateOf<String?>(null) }
+    modelEntryPickerItems(
+        onQuickTest = { if (!SystemVoiceEntries.isSystemEntryId(it.id)) quickTestEntryId = it.id },
+    )
+    val quickTestEntry = liveQuickTestEntry(quickTestEntryId, config.modelEntries)
+    LaunchedEffect(quickTestEntryId, config.modelEntries) {
+        if (quickTestTargetVanished(quickTestEntryId, config.modelEntries)) quickTestEntryId = null
+    }
+    quickTestEntry?.let { entry ->
+        QuickTestSheet(entry = entry, onDismiss = { quickTestEntryId = null })
+    }
 }
 """
 
@@ -1982,6 +2373,17 @@ FIX_AGENT_LOOP_SHEETS_CLEAN = """package com.rikkaminis.app.ui.settings
 @Composable
 fun AgentLoopGroupsSheet(config: ProviderConfig) {
     val collapsedInstanceIds = rememberCollapsedInstanceIds(config)
+    var quickTestEntryId by remember { mutableStateOf<String?>(null) }
+    modelEntryPickerItems(
+        onQuickTest = { if (!SystemVoiceEntries.isSystemEntryId(it.id)) quickTestEntryId = it.id },
+    )
+    val quickTestEntry = liveQuickTestEntry(quickTestEntryId, config.modelEntries)
+    LaunchedEffect(quickTestEntryId, config.modelEntries) {
+        if (quickTestTargetVanished(quickTestEntryId, config.modelEntries)) quickTestEntryId = null
+    }
+    quickTestEntry?.let { entry ->
+        QuickTestSheet(entry = entry, onDismiss = { quickTestEntryId = null })
+    }
 }
 """
 
@@ -2077,7 +2479,6 @@ FIX_ADD_MODELS_UNRELATED_REMEMBER = FIX_ADD_MODELS_CLEAN.replace(
 FIX_PICKER_STATE_BARE_CONFIG_KEY = FIX_MODEL_ENTRY_PICKER_CLEAN.replace(
     "    return remember(instanceIds, defaultExpanded) {",
     "    return remember(config, defaultExpanded) {")
-
 FIX_PICKER_STATE_KEYLESS = FIX_MODEL_ENTRY_PICKER_CLEAN.replace(
     "    return remember(instanceIds, defaultExpanded) {",
     "    return remember {")
@@ -2092,6 +2493,61 @@ FIX_PICKER_MISSING_HELPER = """package com.rikkaminis.app.ui.components
 internal fun providerInstanceIds(config: ProviderConfig): Set<String> =
     config.instances.map { it.id }.toSet()
 """
+
+# --- da1039-B3 B-08 variants: the Quick Test target (C24 / C25) -----------
+
+# the pre-fix shape: the tapped ModelEntry object, no id, no close effect
+FIX_ADD_MODELS_SNAPSHOT_TARGET = FIX_ADD_MODELS_CLEAN.replace(
+    """    var quickTestEntryId by remember { mutableStateOf<String?>(null) }""",
+    """    var quickTestEntry by remember { mutableStateOf<ModelEntry?>(null) }""").replace(
+    "quickTestEntryId = it.id }", "quickTestEntry = it }").replace(
+    """    val quickTestEntry = liveQuickTestEntry(quickTestEntryId, config.modelEntries)
+    LaunchedEffect(quickTestEntryId, config.modelEntries) {
+        if (quickTestTargetVanished(quickTestEntryId, config.modelEntries)) quickTestEntryId = null
+    }
+""", "").replace(
+    "onDismiss = { quickTestEntryId = null }", "onDismiss = { quickTestEntry = null }")
+
+# the sibling keeps the shared picker but never wires the channel
+FIX_AGENT_LOOP_NO_QUICK_TEST = FIX_AGENT_LOOP_SHEETS_CLEAN.replace(
+    """    var quickTestEntryId by remember { mutableStateOf<String?>(null) }
+    modelEntryPickerItems(
+        onQuickTest = { if (!SystemVoiceEntries.isSystemEntryId(it.id)) quickTestEntryId = it.id },
+    )
+    val quickTestEntry = liveQuickTestEntry(quickTestEntryId, config.modelEntries)
+    LaunchedEffect(quickTestEntryId, config.modelEntries) {
+        if (quickTestTargetVanished(quickTestEntryId, config.modelEntries)) quickTestEntryId = null
+    }
+    quickTestEntry?.let { entry ->
+        QuickTestSheet(entry = entry, onDismiss = { quickTestEntryId = null })
+    }
+""",
+    """    modelEntryPickerItems(
+        emptyTextRes = R.string.agent_loop_section_no_available_models,
+    )
+""")
+
+# no close effect at all: the sheet stays open on a deleted target
+FIX_ADD_MODELS_NO_CLOSE_EFFECT = FIX_ADD_MODELS_CLEAN.replace(
+    """    LaunchedEffect(quickTestEntryId, config.modelEntries) {
+        if (quickTestTargetVanished(quickTestEntryId, config.modelEntries)) quickTestEntryId = null
+    }
+""", "")
+
+# closing unconditionally does NOT count (it would dismiss on any recomposition)
+FIX_ADD_MODELS_UNCONDITIONAL_CLOSE = FIX_ADD_MODELS_CLEAN.replace(
+    """    LaunchedEffect(quickTestEntryId, config.modelEntries) {
+        if (quickTestTargetVanished(quickTestEntryId, config.modelEntries)) quickTestEntryId = null
+    }""",
+    """    LaunchedEffect(quickTestEntryId, config.modelEntries) {
+        quickTestEntryId = null
+    }""")
+
+# keyed on the pending id only: a vanished target that still resolves against a
+# stale list is never noticed
+FIX_ADD_MODELS_NO_LIST_KEY = FIX_ADD_MODELS_CLEAN.replace(
+    "LaunchedEffect(quickTestEntryId, config.modelEntries) {",
+    "LaunchedEffect(quickTestEntryId) {")
 
 CLEAN_TREE = {
     REL_PROVIDER_LIST: FIX_PROVIDER_LIST_CLEAN,
@@ -2111,6 +2567,7 @@ CLEAN_TREE = {
     REL_ADD_MODELS: FIX_ADD_MODELS_CLEAN,
     REL_AGENT_LOOP_SHEETS: FIX_AGENT_LOOP_SHEETS_CLEAN,
     REL_MODEL_ENTRY_PICKER: FIX_MODEL_ENTRY_PICKER_CLEAN,
+    REL_ADD_CUSTOM_MODEL: FIX_ADD_CUSTOM_MODEL_CLEAN,
 }
 
 
@@ -2201,7 +2658,27 @@ def run_selftest():
     run_case("c5-conn-no-ua-key", 1,
              variant(REL_CONNECTION, FIX_CONNECTION_NO_UA_KEY), failures, ("C5", "C5a"))
     run_case("failclosed-missing-conn-anchor", 1,
-             variant(REL_CONNECTION, FIX_CONNECTION_MISSING_ANCHOR), failures, ("C5", "C5a"))
+             variant(REL_CONNECTION, FIX_CONNECTION_MISSING_ANCHOR), failures,
+             ("C5", "C5a", "C22", "C23"))
+    # --- da1039-B3: C20 / C21 (AddCustomModelScreen parent-instance read) --
+    run_case("c20-custom-model-snapshot-read", 1,
+             variant(REL_ADD_CUSTOM_MODEL, FIX_ADD_CUSTOM_MODEL_SNAPSHOT), failures, ("C20",))
+    run_case("c21-custom-model-no-live-guard", 1,
+             variant(REL_ADD_CUSTOM_MODEL, FIX_ADD_CUSTOM_MODEL_NO_LIVE_GUARD), failures, ("C21",))
+    run_case("failclosed-missing-custom-model-anchor", 1,
+             variant(REL_ADD_CUSTOM_MODEL, FIX_ADD_CUSTOM_MODEL_MISSING_ANCHOR), failures,
+             ("C20", "C21"))
+    # --- da1039-B3: C22 / C23 (connection write path) -----------------------
+    run_case("c22-conn-snapshot-write", 1,
+             variant(REL_CONNECTION, FIX_CONNECTION_SNAPSHOT_WRITE), failures, ("C22",))
+    run_case("c22-conn-no-live-resolver", 1,
+             variant(REL_CONNECTION, FIX_CONNECTION_NO_RESOLVER), failures, ("C22",))
+    run_case("c23-conn-helper-always-write", 1,
+             variant(REL_CONNECTION, FIX_CONNECTION_HELPER_ALWAYS_WRITE), failures, ("C23",))
+    run_case("c23-conn-no-dirty-guard", 1,
+             variant(REL_CONNECTION, FIX_CONNECTION_NO_DIRTY_GUARD), failures, ("C23",))
+    run_case("c23-conn-cross-field-write", 1,
+             variant(REL_CONNECTION, FIX_CONNECTION_CROSS_FIELD_WRITE), failures, ("C23",))
     # --- da1026-C: C6 / C6c (entry detail screen) --------------------------
     run_case("c6-entry-keyless-remember", 1,
              variant(REL_ENTRY_DETAIL, FIX_ENTRY_DETAIL_KEYLESS), failures, ("C6",))
@@ -2334,7 +2811,19 @@ def run_selftest():
     run_case("c18-add-models-unrelated-remember", 0,
              variant(REL_ADD_MODELS, FIX_ADD_MODELS_UNRELATED_REMEMBER), failures)
     run_case("failclosed-missing-add-models-anchor", 1,
-             variant(REL_ADD_MODELS, FIX_ADD_MODELS_MISSING_ANCHOR), failures, ("C18",))
+             variant(REL_ADD_MODELS, FIX_ADD_MODELS_MISSING_ANCHOR), failures, ("C18", "C24", "C25"))
+    # --- da1039-B3: C24 / C25 (Quick Test target) ---------------------------
+    run_case("c24-c25-add-models-snapshot-target", 1,
+             variant(REL_ADD_MODELS, FIX_ADD_MODELS_SNAPSHOT_TARGET), failures, ("C24", "C25"))
+    run_case("c24-c25-agent-loop-no-quick-test", 1,
+             variant(REL_AGENT_LOOP_SHEETS, FIX_AGENT_LOOP_NO_QUICK_TEST), failures,
+             ("C24", "C25"))
+    run_case("c25-add-models-no-close-effect", 1,
+             variant(REL_ADD_MODELS, FIX_ADD_MODELS_NO_CLOSE_EFFECT), failures, ("C25",))
+    run_case("c25-add-models-unconditional-close", 1,
+             variant(REL_ADD_MODELS, FIX_ADD_MODELS_UNCONDITIONAL_CLOSE), failures, ("C25",))
+    run_case("c25-add-models-no-list-key", 1,
+             variant(REL_ADD_MODELS, FIX_ADD_MODELS_NO_LIST_KEY), failures, ("C25",))
     run_case("c19-picker-state-bare-config-key", 1,
              variant(REL_MODEL_ENTRY_PICKER, FIX_PICKER_STATE_BARE_CONFIG_KEY), failures, ("C19",))
     run_case("c19-picker-state-keyless", 1,

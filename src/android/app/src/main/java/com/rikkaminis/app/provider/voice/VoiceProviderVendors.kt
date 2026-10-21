@@ -600,8 +600,10 @@ class ElevenLabsVoiceProvider(providerId: String, baseURL: String, apiKey: Strin
         val voiceId = request.model?.takeIf { it.isNotEmpty() }
             ?: request.voice?.takeIf { it.isNotEmpty() }
             ?: DEFAULT_VOICE_ID
-        var base = effectiveBaseURL()
-        if (!base.contains("/v1")) base += "/v1"
+        var base = VoiceBaseNormalizer.normalizeVersionSegment(
+            effectiveBaseURL(),
+            defaultBase = "https://api.elevenlabs.io",
+        )
         val body = JSONObject()
             .put("text", request.input)
             .put("model_id", MODEL_ID)
@@ -629,11 +631,11 @@ class DeepgramVoiceProvider(providerId: String, baseURL: String, apiKey: String?
         private const val DEFAULT_TTS_MODEL = "aura-asteria-en"
     }
 
-    private fun dgBase(): String {
-        var base = effectiveBaseURL()
-        if (!base.contains("/v1")) base += "/v1"
-        return base
-    }
+    private fun dgBase(): String =
+        VoiceBaseNormalizer.normalizeVersionSegment(
+            effectiveBaseURL(),
+            defaultBase = "https://api.deepgram.com",
+        )
 
     override suspend fun synthesize(request: VoiceOutputRequest): ByteArray {
         val model = request.model?.takeIf { it.isNotEmpty() } ?: DEFAULT_TTS_MODEL

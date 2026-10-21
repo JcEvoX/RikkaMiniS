@@ -63,6 +63,30 @@ internal fun isCustomBaseURLWriteAllowed(
     customBaseURL: String?,
 ): Boolean = customBaseURL.isNullOrBlank() || providerType.supportsCustomBaseURL
 
+/**
+ * [deep-audit-1039 A-04] Single-source normalization for the raw
+ * `customBaseURL` input of EVERY write face: the collection field writer, the
+ * `add` payload path ([resolveAddCustomBaseURL]), and the debug
+ * `provider.instances.create/update` faces. Trims surrounding whitespace and
+ * collapses the blank result to `null` (= clear).
+ *
+ * Before this helper the write sites spelled the normalization differently —
+ * `ifEmpty { null }` (blank-but-not-empty survives) and
+ * `takeIf { it.isNotBlank() }` (no trim at all) — so `"   "` passed the
+ * [isCustomBaseURLWriteAllowed] guard on the openRouter arm (blank is a clear,
+ * not a write) and was persisted verbatim, and `"  https://api.x  "` kept its
+ * padding in the stored value. The read side
+ * (`ProviderInstance.effectiveBaseURL`) appended `/v1` to the untrimmed
+ * string, so a padded value produced a request URL like `"   /v1"` — every
+ * request on that instance failed with no config-side error anywhere.
+ *
+ * Semantics: `null` / `""` / `"   "` all normalize to `null`; a padded URL
+ * comes back trimmed. This does NOT change the guard's direction — blank
+ * stays an allowed clear.
+ */
+internal fun normalizeCustomBaseURL(raw: String?): String? =
+    raw?.trim()?.takeIf { it.isNotEmpty() }
+
 // ─── [ARCH-01] Shared model-id / provider-name rules ──────────────────────
 
 /**

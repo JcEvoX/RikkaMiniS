@@ -31,6 +31,7 @@ import kotlinx.coroutines.withContext
 import com.rikkaminis.app.R
 import com.rikkaminis.app.config.collections.customUserAgentWritable
 import com.rikkaminis.app.data.model.ImageEndpointMode
+import com.rikkaminis.app.data.model.ProviderInstance
 import com.rikkaminis.app.data.model.ProviderType
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.logging.AppLogger
@@ -58,6 +59,17 @@ fun ProviderConnectionScreen(
         LaunchedEffect(Unit) { onBack() }
         return
     }
+
+    // [deep-audit-1039 B-04] Resolve the LATEST persisted instance at write
+    // time. `instance` is the composition-time snapshot, so every write below
+    // used to push it back wholesale: a focus-loss save that ran after a toggle
+    // (or after an external minis-config / Debug RPC / backup-restore write)
+    // silently reverted the newer fields to the values this frame composed
+    // with. Same shape as ModelGroupDetailScreen's `currentGroup()`
+    // ([audit-0917]); the `?: instance` arm only applies inside the window
+    // between an external delete and the guard above composing again.
+    fun currentInstance(): ProviderInstance =
+        config.instances.find { it.id == instanceId } ?: instance
 
     // Label editing lives on the detail screen (its title). Here we show the
     // current label so the page has context; connection params are the focus.
@@ -95,31 +107,38 @@ fun ProviderConnectionScreen(
         // configured with appendV1Suffix=false silently flipped back to true.
         // effectiveBaseURL guards double-append, so not touching the flag is
         // safe either way.
-        providerRepository.updateInstance(
-            instance.copy(
-                customBaseURL = customBaseURL.ifBlank { null },
-                customUserAgent = customUserAgent.ifBlank { null },
-            )
-        )
+        //
+        // [deep-audit-1039 B-04] Two changes on top of that: (a) the write is
+        // now skip-if-unchanged, because Compose delivers `isFocused == false`
+        // on the first frame after mounting, so merely opening this page used
+        // to push two unconditional updateInstance writes (and two "Saved …"
+        // log lines) with values nobody edited; (b) the cross-field write of
+        // `customUserAgent` is GONE — the UA field has its own saver
+        // (saveUserAgentSetting) and the base-URL block is hidden for
+        // openRouter, so every UA edit path is still covered, while a
+        // base-URL blur can no longer rewrite an unrelated field.
+        val live = currentInstance()
+        val pending = pendingConnectionFieldWrite(customBaseURL, live.customBaseURL) ?: return
+        providerRepository.updateInstance(live.copy(customBaseURL = pending))
         AppLogger.info(
             TAG,
-            "Saved base URL for ${instance.id}: url='${customBaseURL.ifBlank { "<default>" }}', appendV1=${instance.appendV1Suffix}, ua='${customUserAgent.ifBlank { "<default>" }}'",
+            "Saved base URL for ${live.id}: url='$pending', appendV1=${live.appendV1Suffix}",
         )
     }
 
     fun saveUserAgentSetting() {
-        // [da1030-C ISSUE-04] Dedicated saver for the User-Agent field. The
-        // base-URL field's saveBaseURLSettings() also rewrites customUserAgent
-        // in the same instance.copy — harmless there, but the UA field now also
-        // renders for openRouter instances, where customBaseURL has no editor
-        // and must not be rewritten as a side effect of an unrelated edit.
-        providerRepository.updateInstance(
-            instance.copy(customUserAgent = customUserAgent.ifBlank { null })
-        )
-        AppLogger.info(
-            TAG,
-            "Saved user agent for ${instance.id}: ua='${customUserAgent.ifBlank { "<default>" }}'",
-        )
+        // [da1030-C ISSUE-04] Dedicated saver for the User-Agent field. The UA
+        // field also renders for openRouter instances, where customBaseURL has
+        // no editor and must not be rewritten as a side effect of an unrelated
+        // edit.
+        // [deep-audit-1039 B-04] Same skip-if-unchanged guard as the base-URL
+        // saver: the UA field is mounted on every instance whose credential
+        // type is writable, so the first-frame focus callback used to write —
+        // and log — even when the user never touched the box.
+        val live = currentInstance()
+        val pending = pendingConnectionFieldWrite(customUserAgent, live.customUserAgent) ?: return
+        providerRepository.updateInstance(live.copy(customUserAgent = pending))
+        AppLogger.info(TAG, "Saved user agent for ${live.id}: ua='$pending'")
     }
 
     SettingsScaffold(
@@ -256,7 +275,7 @@ fun ProviderConnectionScreen(
                             selected = !instance.useResponsesAPI,
                             onClick = {
                                 if (instance.useResponsesAPI) {
-                                    providerRepository.updateInstance(instance.copy(useResponsesAPI = false))
+                                    providerRepository.updateInstance(currentInstance().copy(useResponsesAPI = false))
                                 }
                             },
                             shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2),
@@ -265,7 +284,7 @@ fun ProviderConnectionScreen(
                             selected = instance.useResponsesAPI,
                             onClick = {
                                 if (!instance.useResponsesAPI) {
-                                    providerRepository.updateInstance(instance.copy(useResponsesAPI = true))
+                                    providerRepository.updateInstance(currentInstance().copy(useResponsesAPI = true))
                                 }
                             },
                             shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2),
@@ -285,7 +304,7 @@ fun ProviderConnectionScreen(
                     title = stringResource(R.string.provider_detail_azure_openai),
                     checked = instance.azureMode,
                     onCheckedChange = { on ->
-                        providerRepository.updateInstance(instance.copy(azureMode = on))
+                        providerRepository.updateInstance(currentInstance().copy(azureMode = on))
                         AppLogger.info(TAG, "Set azureMode=$on for ${instance.id}")
                     },
                     showDivider = false,
@@ -324,7 +343,7 @@ fun ProviderConnectionScreen(
                             onClick = {
                                 if (mode != ImageEndpointMode.auto) {
                                     providerRepository.updateInstance(
-                                        instance.copy(imageEndpointMode = ImageEndpointMode.auto),
+                                        currentInstance().copy(imageEndpointMode = ImageEndpointMode.auto),
                                     )
                                 }
                             },
@@ -335,7 +354,7 @@ fun ProviderConnectionScreen(
                             onClick = {
                                 if (mode != ImageEndpointMode.imagesGenerations) {
                                     providerRepository.updateInstance(
-                                        instance.copy(imageEndpointMode = ImageEndpointMode.imagesGenerations),
+                                        currentInstance().copy(imageEndpointMode = ImageEndpointMode.imagesGenerations),
                                     )
                                 }
                             },
@@ -346,7 +365,7 @@ fun ProviderConnectionScreen(
                             onClick = {
                                 if (mode != ImageEndpointMode.chatCompletions) {
                                     providerRepository.updateInstance(
-                                        instance.copy(imageEndpointMode = ImageEndpointMode.chatCompletions),
+                                        currentInstance().copy(imageEndpointMode = ImageEndpointMode.chatCompletions),
                                     )
                                 }
                             },
@@ -357,4 +376,24 @@ fun ProviderConnectionScreen(
             }
         }
     }
+}
+
+/**
+ * [deep-audit-1039 B-04] The value a focus-loss save should persist, or null
+ * when there is nothing to write.
+ *
+ * `edited` is the raw text buffer, `stored` the field's value on the instance
+ * as it is persisted right now. Blank input normalises to null (clearing the
+ * override) — that is the one case where a non-null edit legitimately becomes
+ * a null write. Everything else is a plain inequality test, so the first-frame
+ * `onFocusChanged(isFocused = false)` Compose delivers on mount (and every
+ * later blur of an untouched field) becomes a no-op instead of an unconditional
+ * updateInstance + "Saved …" log line.
+ *
+ * Kept a top-level pure function so the JVM test can drive the real decision
+ * rather than a copy of it (same seam as `sliderStepsFor` / `VisibleOnlyFlag`).
+ */
+internal fun pendingConnectionFieldWrite(edited: String, stored: String?): String? {
+    val normalized = edited.ifBlank { null }
+    return if (normalized == stored) null else normalized
 }
