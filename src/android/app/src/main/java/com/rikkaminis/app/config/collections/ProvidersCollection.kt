@@ -309,7 +309,13 @@ class ProvidersCollection(
                 // payload path share one predicate. Blank is a clear, not a
                 // write, so it stays allowed.
                 val inst = repo.instance(id) ?: throw ConfigError.InvalidValue("Provider not found")
-                val newBase = s.ifEmpty { null }
+                // [deep-audit-1039 A-04] Blank is a clear, not a write, so it
+                // stays allowed — but a whitespace-only string must normalize
+                // to that same clear instead of surviving as `"   "` and
+                // reaching the request URL. Normalization is single-sourced in
+                // [normalizeCustomBaseURL] (ProviderWriteRules) so all write
+                // faces agree on one spelling.
+                val newBase = normalizeCustomBaseURL(s)
                 if (!isCustomBaseURLWriteAllowed(inst.providerType, newBase)) {
                     throw ConfigError.InvalidValue(CUSTOM_BASE_URL_OPENROUTER_MESSAGE)
                 }
@@ -581,12 +587,17 @@ internal fun resolveAddCustomUserAgent(
  * (`CUSTOM_BASE_URL_OPENROUTER_MESSAGE`) are single-sourced in
  * `ProviderWriteRules.kt` [ARCH-01]; this file consults them instead of
  * keeping a copy.
+ *
+ * [deep-audit-1039 A-04] Normalization is single-sourced too: the raw value is
+ * trimmed here, so a padded base URL no longer reaches the stored instance
+ * (and thus no longer reaches `effectiveBaseURL`'s `/v1` append). The old
+ * `takeIf { it.isNotBlank() }` admitted `"  https://x  "` verbatim.
  */
 internal fun resolveAddCustomBaseURL(
     raw: String?,
     providerType: ProviderType,
 ): String? {
-    val base = raw?.takeIf { it.isNotBlank() } ?: return null
+    val base = normalizeCustomBaseURL(raw) ?: return null
     if (!providerType.supportsCustomBaseURL) {
         throw ConfigError.InvalidValue(CUSTOM_BASE_URL_OPENROUTER_MESSAGE)
     }

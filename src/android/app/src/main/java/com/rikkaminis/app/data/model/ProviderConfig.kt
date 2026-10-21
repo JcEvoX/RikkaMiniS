@@ -290,10 +290,18 @@ data class ProviderInstance(
     var credentials: MutableList<ProviderCredentialMeta> = mutableListOf(),
 ) {
 
-    /** Returns the effective API base URL, applying v1 suffix if configured. */
+    /**
+     * Returns the effective API base URL, applying v1 suffix if configured.
+     *
+     * [deep-audit-1039 A-04] The stored value is trimmed before use: legacy
+     * rows (and any writer that bypassed the shared normalization) may carry
+     * padding, and appending `/v1` to `"   "` produced `"   /v1"` — a request
+     * URL that fails with no config-side error. A blank value is `null`
+     * (no override), same as an absent one.
+     */
     val effectiveBaseURL: String?
         get() {
-            val base = customBaseURL?.trimEnd('/') ?: return null
+            val base = customBaseURL?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } ?: return null
             return if (appendV1Suffix && !base.endsWith("/v1")) "$base/v1" else base
         }
 

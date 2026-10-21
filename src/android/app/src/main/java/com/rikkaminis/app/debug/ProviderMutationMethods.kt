@@ -8,6 +8,7 @@ import com.rikkaminis.app.config.collections.applyContextLimitWrite
 import com.rikkaminis.app.config.collections.canonicalModelProviderName
 import com.rikkaminis.app.config.collections.customUserAgentWritable
 import com.rikkaminis.app.config.collections.mutatedGroupCopy
+import com.rikkaminis.app.config.collections.normalizeCustomBaseURL
 import com.rikkaminis.app.config.collections.normalizeCustomModelId
 import com.rikkaminis.app.data.model.FallbackStrategy
 import com.rikkaminis.app.data.model.ImageEndpointMode
@@ -65,7 +66,11 @@ internal object ProviderMutationMethods {
         val credentialType = try { ProviderCredential.valueOf(credTypeStr) } catch (_: Exception) {
             throw RPCException(-32602, "Unknown credentialType: $credTypeStr")
         }
-        val customBaseURL = params.optString("customBaseURL", "").ifEmpty { null }
+        // [deep-audit-1039 A-04] Normalization is single-sourced in
+        // [normalizeCustomBaseURL] (ProviderWriteRules) so this face agrees
+        // with the collection faces: the old `ifEmpty { null }` let a
+        // whitespace-only value through the guard below and persisted it.
+        val customBaseURL = normalizeCustomBaseURL(params.optString("customBaseURL", ""))
         val appendV1Suffix = params.optBoolean("appendV1Suffix", true)
         val isEnabled = params.optBoolean("isEnabled", true)
         val useResponsesAPI = params.optBoolean("useResponsesAPI", false)
@@ -182,7 +187,10 @@ internal object ProviderMutationMethods {
         // constant in ProviderWriteRules (gate C2 accepts the literal or the
         // shared constant reference).
         if (params.has("customBaseURL") && !params.isNull("customBaseURL")) {
-            val newBase = params.optString("customBaseURL", "").ifEmpty { null }
+            // [deep-audit-1039 A-04] same single-source normalization as the
+            // create face and the collection faces: `"   "` normalizes to the
+            // clear (null) instead of persisting a blank string.
+            val newBase = normalizeCustomBaseURL(params.optString("customBaseURL", ""))
             if (newBase != null && !current.providerType.supportsCustomBaseURL) {
                 throw RPCException(-32602, CUSTOM_BASE_URL_OPENROUTER_MESSAGE)
             }
@@ -210,7 +218,9 @@ internal object ProviderMutationMethods {
             label = if (params.has("label")) params.optString("label", current.label) else current.label,
             customBaseURL = if (params.has("customBaseURL")) {
                 if (params.isNull("customBaseURL")) null
-                else params.optString("customBaseURL", "").ifEmpty { null }
+                // [deep-audit-1039 A-04] shared normalization: blank ⇒ clear,
+                // padded ⇒ trimmed.
+                else normalizeCustomBaseURL(params.optString("customBaseURL", ""))
             } else current.customBaseURL,
             appendV1Suffix = if (params.has("appendV1Suffix")) params.optBoolean("appendV1Suffix", current.appendV1Suffix) else current.appendV1Suffix,
             useResponsesAPI = if (params.has("useResponsesAPI")) params.optBoolean("useResponsesAPI", current.useResponsesAPI) else current.useResponsesAPI,
