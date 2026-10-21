@@ -412,6 +412,307 @@ def check_inline_player_guards(clean):
     return problems
 
 
+# ── Arm 7: the fullscreen video window contract ([dv17-B08]) ──────────────
+#
+# The fullscreen video Dialog must own both halves of the immersive contract
+# its three siblings already implement (ImageGalleryViewer, the WebPreview
+# fullscreen screen, the WebPreview sheet):
+#   7a  the Dialog's own window calls
+#       addFlags(FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS) -- without the flag the
+#       transparent status/navigation bar colors next to it are ignored and
+#       the system paints its own opaque grey band over the video;
+#   7b  a host-Activity-window DisposableEffect is installed BEFORE the
+#       Dialog(, hiding the HOST window's system bars for the player's
+#       lifetime and restoring them (bars + icon appearance) on dispose --
+#       the dialog-window effect alone cannot cover the window the system
+#       falls back to while the overlay covers the screen.
+# Decision points, not spellings: 7a is bound to the CALL FORM
+# `<target>.addFlags(<args containing the flag constant>)`, so a comment or a
+# bare constant reference cannot satisfy it; 7b is bound to the effect's
+# TARGET (`(view.context as? Activity)?.window`, not findDialogWindow) and to
+# its onDispose restore, so the effect's key choice and formatting stay free.
+# Anchors are fail-closed: a file without `MinisFullscreenVideoPlayer(` or
+# without `FullscreenVideoContent(` cannot be judged => RED (re-point).
+# A mini-tree fixture without the file is skipped (drift detector, not a
+# target).
+
+_BAR_FLAG = "FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS"
+_FULLSCREEN_PLAYER_DECL = r"\bfun\s+MinisFullscreenVideoPlayer\s*\("
+_FULLSCREEN_CONTENT_DECL = r"\bprivate\s+fun\s+FullscreenVideoContent\s*\("
+
+
+def _call_args(text: str, open_idx: int) -> str:
+    """Argument text of the call whose `(` sits at open_idx."""
+    depth, i, n = 1, open_idx + 1, len(text)
+    while i < n and depth:
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+        i += 1
+    return text[open_idx + 1:i - 1]
+
+
+def _addflags_calls(text: str):
+    """[(start, args)] for every `<target>.addFlags(...)` call form."""
+    out = []
+    for m in re.finditer(r"\.\s*addFlags\s*\(", text):
+        open_idx = text.find("(", m.start())
+        out.append((m.start(), _call_args(text, open_idx)))
+    return out
+
+
+def _disposable_effects(text: str):
+    """[(start, end, body, args)] for every `DisposableEffect(...) { ... }`."""
+    out = []
+    for m in re.finditer(r"\bDisposableEffect\s*\(", text):
+        open_idx = text.find("(", m.start())
+        args = _call_args(text, open_idx)
+        close = open_idx + len(args) + 2
+        brace = text.find("{", close)
+        if brace < 0:
+            continue
+        start, end = brace_span(text, brace)
+        out.append((m.start(), end, text[start:end], args))
+    return out
+
+
+def _host_window_effect_effects(text: str):
+    """The DisposableEffects that target the HOST activity window (`as? Activity`
+    + `.window`), as opposed to the Dialog's own window (findDialogWindow)."""
+    out = []
+    for start, end, body, args in _disposable_effects(text):
+        hay = args + " " + body
+        if "findDialogWindow(" in hay:
+            continue
+        if not re.search(r"as\s*\?\s*(?:android\.app\.)?Activity\b", hay):
+            continue
+        if not re.search(r"\.window\b", hay):
+            continue
+        out.append((start, end, body))
+    return out
+
+
+def check_fullscreen_video_window(clean):
+    """Arm 7. Returns problem list."""
+    if clean is None:
+        return []
+    problems = []
+    m = re.search(_FULLSCREEN_PLAYER_DECL, clean)
+    if not m:
+        problems.append(
+            "arm7: no `fun MinisFullscreenVideoPlayer(` in this file -- the fullscreen "
+            "video window contract has no anchor, re-point this guard")
+        return problems
+    brace = clean.find("{", m.end())
+    if brace < 0:
+        problems.append(
+            "arm7: `MinisFullscreenVideoPlayer` has no body -- re-point this guard")
+        return problems
+    p_start, p_end = brace_span(clean, brace)
+    player_body = clean[p_start:p_end]
+
+    # 7b: a host-window effect, installed before the Dialog.
+    dialog_at = player_body.find("Dialog(")
+    if dialog_at < 0:
+        problems.append(
+            "arm7: `MinisFullscreenVideoPlayer` no longer opens a Dialog -- re-point "
+            "this guard")
+    else:
+        host = [e for e in _host_window_effect_effects(player_body) if e[0] < dialog_at]
+        if not host:
+            problems.append(
+                "arm7: MinisFullscreenVideoPlayer has no host-Activity-window "
+                "DisposableEffect before its Dialog( -- ImageGalleryViewer / "
+                "WebPreviewFullscreenScreen / WebPreviewBottomSheet all save+hide the "
+                "HOST window's system bars for the lifetime of the overlay and restore "
+                "them on dispose; without it a swipe-revealed transient bar paints the "
+                "host's default chrome and the host is left in whatever immersive state "
+                "the overlay set")
+        else:
+            body = host[0][2]
+            dispose_at = body.rfind("onDispose")
+            if dispose_at < 0:
+                problems.append(
+                    "arm7: the host-window effect of MinisFullscreenVideoPlayer has no "
+                    "onDispose -- nothing restores the host's system bars when the "
+                    "player closes")
+            else:
+                dispose = body[dispose_at:]
+                if "controller.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())" \
+                        not in dispose:
+                    problems.append(
+                        "arm7: the host-window effect's onDispose does not show the "
+                        "host's system bars again")
+                if "isAppearanceLightStatusBars" not in dispose or \
+                        "isAppearanceLightNavigationBars" not in dispose:
+                    problems.append(
+                        "arm7: the host-window effect's onDispose does not restore the "
+                        "host's status/navigation icon appearance")
+
+    # 7a: the Dialog window declares the draw-behind flag (call form bound).
+    spans = [player_body]
+    content = function_body(clean, _FULLSCREEN_CONTENT_DECL)
+    if content:
+        spans.append(content)
+    else:
+        problems.append(
+            "arm7: `FullscreenVideoContent` is gone -- the Dialog window config has no "
+            "anchor, re-point this guard")
+    flag_ok = any(_BAR_FLAG in args
+                  for span in spans
+                  for _start, args in _addflags_calls(span))
+    if not flag_ok:
+        problems.append(
+            "arm7: the fullscreen video Dialog window never calls "
+            "addFlags(FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS) -- without the flag the "
+            "transparent status/navigation bar colors next to it are ignored and the "
+            "system paints its own opaque grey band over the video")
+    return problems
+
+
+def run_fullscreen_video_window_selftest() -> bool:
+    """Arm 7 fixtures (dv17-B08). Each dirty case must go red AND the expected
+    sub-arm must be the one that fires."""
+    HOST_EFFECT = (
+        "    val hostView = LocalView.current\n"
+        "    DisposableEffect(hostView) {\n"
+        "        val window = (hostView.context as? android.app.Activity)?.window\n"
+        "        if (window == null) {\n"
+        "            onDispose { }\n"
+        "        } else {\n"
+        "            val controller = androidx.core.view.WindowInsetsControllerCompat(window, hostView)\n"
+        "            val previousLightStatusBars = controller.isAppearanceLightStatusBars\n"
+        "            val previousLightNavigationBars = controller.isAppearanceLightNavigationBars\n"
+        "            controller.isAppearanceLightStatusBars = false\n"
+        "            controller.isAppearanceLightNavigationBars = false\n"
+        "            controller.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())\n"
+        "            onDispose {\n"
+        "                controller.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())\n"
+        "                controller.isAppearanceLightStatusBars = previousLightStatusBars\n"
+        "                controller.isAppearanceLightNavigationBars = previousLightNavigationBars\n"
+        "            }\n"
+        "        }\n"
+        "    }\n")
+    DIALOG_FLAG = (
+        "                window.setBackgroundDrawable(ColorDrawable(Color.BLACK))\n"
+        "                window.addFlags(android.view.WindowManager.LayoutParams."
+        "FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)\n"
+        "                window.statusBarColor = Color.TRANSPARENT\n"
+        "                window.navigationBarColor = Color.TRANSPARENT\n")
+
+    COMPLIANT = (
+        "@Composable\n"
+        "fun MinisFullscreenVideoPlayer(file: File, onDismiss: () -> Unit) {\n"
+        + HOST_EFFECT +
+        "    Dialog(\n"
+        "        onDismissRequest = onDismiss,\n"
+        "        properties = DialogProperties(usePlatformDefaultWidth = false),\n"
+        "    ) {\n"
+        "        FullscreenVideoContent(file = file, onDismiss = onDismiss)\n"
+        "    }\n"
+        "}\n"
+        "\n"
+        "@Composable\n"
+        "private fun FullscreenVideoContent(file: File, onDismiss: () -> Unit) {\n"
+        "    DisposableEffect(view) {\n"
+        "        val window = findDialogWindow(view)\n"
+        "        if (window != null) {\n"
+        + DIALOG_FLAG +
+        "            val controller = WindowInsetsControllerCompat(window, window.decorView)\n"
+        "            controller.hide(WindowInsetsCompat.Type.systemBars())\n"
+        "        }\n"
+        "        onDispose {\n"
+        "            val controller = WindowInsetsControllerCompat(window, window.decorView)\n"
+        "            controller.show(WindowInsetsCompat.Type.systemBars())\n"
+        "        }\n"
+        "    }\n"
+        "}\n")
+
+    M7A = COMPLIANT.replace(DIALOG_FLAG,
+                            "                window.setBackgroundDrawable(ColorDrawable(Color.BLACK))\n"
+                            "                window.statusBarColor = Color.TRANSPARENT\n"
+                            "                window.navigationBarColor = Color.TRANSPARENT\n")
+    M7B = COMPLIANT.replace(HOST_EFFECT, "")
+    # the effect is host-shaped but installed INSIDE the Dialog content, i.e.
+    # after `Dialog(` -- the bars must be hidden when the dialog opens, not
+    # after
+    M7C = COMPLIANT.replace(HOST_EFFECT, "").replace(
+        "        FullscreenVideoContent(file = file, onDismiss = onDismiss)\n",
+        "        FullscreenVideoContent(file = file, onDismiss = onDismiss)\n" + HOST_EFFECT)
+    # wrong target: the effect drives the DIALOG window, not the host window
+    M7D = COMPLIANT.replace(
+        "        val window = (hostView.context as? android.app.Activity)?.window\n",
+        "        val window = findDialogWindow(hostView)\n")
+    # empty real onDispose: the bars are never handed back
+    M7E = COMPLIANT.replace(
+        "                controller.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())\n"
+        "                controller.isAppearanceLightStatusBars = previousLightStatusBars\n"
+        "                controller.isAppearanceLightNavigationBars = previousLightNavigationBars\n",
+        "")
+    # wrong flag: addFlags present, but not the draw-behind one
+    M7F = COMPLIANT.replace(
+        "window.addFlags(android.view.WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)",
+        "window.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)")
+
+    # precision: comments may mention the flag / the effect in prose
+    P7 = COMPLIANT.replace(
+        "        properties = DialogProperties(usePlatformDefaultWidth = false),\n",
+        "        // legacy shape lacked addFlags(FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)\n"
+        "        properties = DialogProperties(usePlatformDefaultWidth = false),\n")
+
+    # A mutation that silently stopped applying would read as a false alarm;
+    # name the drift instead.
+    ok = True
+    for label, mut in (("M7A", M7A), ("M7B", M7B), ("M7C", M7C), ("M7D", M7D),
+                       ("M7E", M7E), ("M7F", M7F), ("P7", P7)):
+        if mut == COMPLIANT:
+            print(f"  selftest arm7 {label}: mutation did not apply "
+                  f"(fixture drifted) -- FAIL")
+            ok = False
+
+    cases = [
+        ("arm7 compliant", COMPLIANT, None),
+        ("arm7a M7A flag dropped", M7A, "arm7: the fullscreen video Dialog window"),
+        ("arm7b M7B host effect gone", M7B, "arm7: MinisFullscreenVideoPlayer has no host-Activity-window"),
+        ("arm7b M7C effect moved after the Dialog", M7C, "arm7: MinisFullscreenVideoPlayer has no host-Activity-window"),
+        ("arm7b M7D effect retargeted to the dialog window", M7D, "arm7: MinisFullscreenVideoPlayer has no host-Activity-window"),
+        ("arm7b M7E dispose restores nothing", M7E, "arm7: the host-window effect's onDispose"),
+        ("arm7a M7F addFlags with the wrong flag", M7F, "arm7: the fullscreen video Dialog window"),
+        ("arm7 precision P7 comment mentions the flag", P7, None),
+    ]
+    for name, src, want in cases:
+        problems = check_fullscreen_video_window(strip_comments_and_strings(src))
+        red = len(problems) > 0
+        if want is None:
+            mark = "ok" if not red else "FAIL"
+            print(f"  selftest {name}: {'RED' if red else 'GREEN'} "
+                  f"(expect GREEN) {mark}")
+            if red:
+                ok = False
+        else:
+            fired = any(p.startswith(want) for p in problems)
+            mark = "ok" if (red and fired) else "FAIL"
+            print(f"  selftest {name}: {'RED' if red else 'GREEN'} "
+                  f"(expect RED via {want.split(':')[0]}) {mark}")
+            if not (red and fired):
+                ok = False
+        for p in problems:
+            print(f"      - {p}")
+
+    # mini-tree fixture: InlineMediaPlayer.kt absent -> judgement skipped
+    if check_fullscreen_video_window(None):
+        print("  selftest arm7 mini tree (no InlineMediaPlayer.kt): expected "
+              "GREEN (skipped), got RED -- FAIL")
+        ok = False
+    else:
+        print("  selftest arm7 mini tree (no InlineMediaPlayer.kt): GREEN (skipped) ok")
+    # [dv17-B08] own marker line -- the pinned MEDIAPLAYER_RELEASE_SELFTEST=PASS
+    # above it now covers arms 5+6+7; this line proves arm 7 ran and went green.
+    print("FULLSCREEN_WINDOW_SELFTEST=" + ("PASS" if ok else "FAIL"))
+    return ok
+
+
 def run_selftest() -> bool:
     COMPLIANT = '''
 object MediaPlayerManager {
@@ -512,6 +813,7 @@ object MediaPlayerManager {
 
     ok = run_inline_player_selftest() and ok
     ok = run_inline_player_guards_selftest() and ok
+    ok = run_fullscreen_video_window_selftest() and ok
     return ok
 
 
@@ -813,6 +1115,7 @@ def main() -> int:
         if inline.exists() else None)
     problems += check_inline_player(inline_clean)
     problems += check_inline_player_guards(inline_clean)
+    problems += check_fullscreen_video_window(inline_clean)
     if problems:
         print("FAIL: MediaPlayerManager release/lock gaps")
         for p in problems:
@@ -824,7 +1127,10 @@ def main() -> int:
           "every AndroidView in InlineMediaPlayer.kt releases via "
           "onRelease/stopPlayback and every onDismiss() branch terminates the "
           "player; the audio transport calls are try-guarded and the share "
-          "path reports an undeclared path instead of faking a file:// uri")
+          "path reports an undeclared path instead of faking a file:// uri; the "
+          "fullscreen video Dialog installs a host-window DisposableEffect "
+          "before opening and passes FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS to its "
+          "own window")
     return 0
 
 

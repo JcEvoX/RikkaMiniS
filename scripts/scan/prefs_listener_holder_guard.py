@@ -266,6 +266,13 @@ def inside_on_dispose(text: str, ident: str) -> bool:
 #       must appear BEFORE the read -- an unprimed read is what makes this
 #       screen display, then re-persist, a value from before the write that
 #       triggered the callback
+#   C3g [dv17-b07] the C3 rule generalized to EVERY primed cache: the
+#       (object -> no-arg cached getters) table is derived from the tree
+#       itself (same ARCH-02 primed-cache predicate), and every
+#       change-listener body that reads one of those getters must prime that
+#       object first. B-07 shipped exactly the hard-coded pair's blind spot:
+#       a listener reading AgentRuntimeLimitsPrefs.compactModelEntryId()
+#       without priming was invisible to C3.
 # ==========================================================================
 
 _PRIMING_CFG_PATH = '"runtime.maxConcurrentSessions"'
@@ -384,32 +391,92 @@ def scan_priming(root):
                 else:
                     report.append("  %s: %s re-primed by `%s`" % (rel, obj, ident))
 
-    cap_hits = 0
-    for path, _raw, clean in files:
-        if "ConcurrencyPrefs.PREFS" not in clean:
-            continue
-        rel = path.relative_to(root)
-        for name, body in _listener_bodies(clean):
-            at = body.find(_PRIMING_CAP_READ)
-            if at < 0:
+        cap_hits = 0
+        for path, _raw, clean in files:
+            if "ConcurrencyPrefs.PREFS" not in clean:
                 continue
-            cap_hits += 1
-            prime_at = body.find("ConcurrencyPrefs.prime(")
-            if prime_at < 0 or prime_at > at:
-                problems.append(
-                    "%s: the listener `%s` reads %s before priming the cache -- the read can "
-                    "serve the value from before the write that triggered the callback, and "
-                    "this screen re-persists every knob it shows on Save"
-                    % (rel, name or "<inline>", _PRIMING_CAP_READ)
-                )
-            else:
-                report.append("  %s: listener primes before reading the cap" % rel)
+            rel = path.relative_to(root)
+            for name, body in _listener_bodies(clean):
+                at = body.find(_PRIMING_CAP_READ)
+                if at < 0:
+                    continue
+                cap_hits += 1
+                prime_at = body.find("ConcurrencyPrefs.prime(")
+                if prime_at < 0 or prime_at > at:
+                    problems.append(
+                        "%s: the listener `%s` reads %s before priming the cache -- the read can "
+                        "serve the value from before the write that triggered the callback, and "
+                        "this screen re-persists every knob it shows on Save"
+                        % (rel, name or "<inline>", _PRIMING_CAP_READ)
+                    )
+                else:
+                    report.append("  %s: listener primes before reading the cap" % rel)
 
     if anchored and cap_hits == 0:
         problems.append(
             "no change-listener body reads %s any more -- the ordering criterion has nothing "
             "to check (did the screen stop showing the cap?)" % _PRIMING_CAP_READ
         )
+
+    # ── C3 generalized ([dv17-b07]): every primed cache, every cached read ──
+    # C3 above hard-codes ONE (object, getter) pair (ConcurrencyPrefs +
+    # maxConcurrentSessions). B-07 shipped exactly that blind spot: the
+    # ModelGroupsScreen listener read AgentRuntimeLimitsPrefs.compactModelEntryId()
+    # (a @Volatile-cache getter like any other) without priming first, and the
+    # criterion never fired. The generalized version derives the (object,
+    # no-arg cached getters) table from the tree itself -- same ARCH-02
+    # predicate the self-sync criteria already use -- so a listener body that
+    # reads ANY cached getter of ANY primed cache must prime that cache first.
+    # A getter "derives" a cached field in either shape this codebase uses:
+    #     fun compactModelEntryId(): String = cachedCompactModelEntryId
+    #     fun isEnabled(): Boolean { return cachedEnabled }
+    # Drift posture: content-anchored. A tree whose listeners read no cached
+    # getter is simply out of scope (no fail-closed miss) -- the anchors live
+    # in the listener bodies themselves, and trees without a prefs world
+    # (mini fixtures) never enter the loop.
+    getter_re = re.compile(r"\bfun\s+(\w+)\s*\(\s*\)\s*:\s*[^\n{=]*=\s*(cached\w*)")
+    getter_re_block = re.compile(
+        r"\bfun\s+(\w+)\s*\(\s*\)\s*:[^\n{]*\{[^{}]*?\breturn\s+(cached\w*)")
+    # Pass 1: build the (object -> no-arg cached getters) table tree-wide. The
+    # listener that reads a cached getter almost never lives in the file that
+    # declares the object, so per-file tables would always be empty there.
+    obj_getters = {}
+    for path, _raw, clean in files:
+        for obj, body in _object_bodies(clean):
+            if not (_ARCH02_PRIME_FUN_RE.search(body) and _ARCH02_CACHED_FIELD_RE.search(body)):
+                continue
+            fields = set(_ARCH02_CACHED_FIELD_RE.findall(body))
+            for m in getter_re.finditer(body):
+                if m.group(2) in fields:
+                    obj_getters.setdefault(obj, set()).add(m.group(1))
+            for m in getter_re_block.finditer(body):
+                if m.group(2) in fields:
+                    obj_getters.setdefault(obj, set()).add(m.group(1))
+    if obj_getters:
+        report.append("  cached-getter table: %s" % ", ".join(
+            "%s(%d getters)" % (o, len(g)) for o, g in sorted(obj_getters.items())))
+    cache_reads = 0
+    for path, _raw, clean in files:
+        rel = path.relative_to(root)
+        for name, body in _listener_bodies(clean):
+            for obj, getters in sorted(obj_getters.items()):
+                reads = ["%s.%s()" % (obj, g) for g in sorted(getters)
+                         if ("%s.%s()" % (obj, g)) in body]
+                if not reads:
+                    continue
+                cache_reads += 1
+                first_at = min(body.find(r) for r in reads)
+                prime_at = body.find("%s.prime(" % obj)
+                if prime_at < 0 or prime_at > first_at:
+                    problems.append(
+                        "%s: the listener `%s` reads %s before priming the cache -- the read "
+                        "can serve the value from before the write that triggered the "
+                        "callback (SharedPreferencesImpl dispatch order is unspecified, so "
+                        "this listener can run before %s' own self-sync listener)"
+                        % (rel, name or "<inline>", ", ".join(reads), obj)
+                    )
+                else:
+                    report.append("  %s: listener primes before reading %s" % (rel, obj))
     return report, problems
 
 
@@ -749,6 +816,47 @@ def _selftest():
         )
         return "".join(lines)
 
+    def limits_tree(prime_first=True):
+        """[dv17-b07] A second primed cache (AgentRuntimeLimitsPrefs shape) with a
+        screen listener reading a NON-cap cached getter -- the exact blind spot
+        B-07 shipped: the old C3 only ever checked ConcurrencyPrefs +
+        maxConcurrentSessions(). The object must satisfy the ARCH-02 self-sync
+        criteria so the fixture is otherwise clean."""
+        read = "            compactId = AgentRuntimeLimitsPrefs.compactModelEntryId()\n"
+        prime = "            AgentRuntimeLimitsPrefs.prime(app)\n" if prime_first else ""
+        return HOLD + (
+            "object AgentRuntimeLimitsPrefs {\n"
+            '    const val PREFS = "minis_runtime_limits_prefs"\n'
+            '    const val KEY_COMPACT_MODEL_ENTRY_ID = "compactModelEntryId"\n'
+            "    @Volatile\n"
+            '    private var cachedCompactModelEntryId: String = ""\n'
+            "    private val selfSyncListener =\n"
+            "        SharedPreferences.OnSharedPreferenceChangeListener { changed, _ ->\n"
+            '            cachedCompactModelEntryId = changed.getString(KEY_COMPACT_MODEL_ENTRY_ID, "") ?: ""\n'
+            "        }\n"
+            "    fun compactModelEntryId(): String = cachedCompactModelEntryId\n"
+            "    fun prime(context: Context) {\n"
+            "        val p = context.applicationContext.getSharedPreferences(PREFS, Context.MODE_PRIVATE)\n"
+            "        p.registerOnSharedPreferenceChangeListener(selfSyncListener)\n"
+            '        cachedCompactModelEntryId = p.getString(KEY_COMPACT_MODEL_ENTRY_ID, "") ?: ""\n'
+            "    }\n"
+            "}\n"
+            "class LimitsScreen(private val context: Context) {\n"
+            '    var compactId: String = ""\n'
+            "    fun wire() {\n"
+            "        val app = context.applicationContext\n"
+            "        val prefs = app.getSharedPreferences(AgentRuntimeLimitsPrefs.PREFS, Context.MODE_PRIVATE)\n"
+            "        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->\n"
+            "            if (key == null || key == AgentRuntimeLimitsPrefs.KEY_COMPACT_MODEL_ENTRY_ID) {\n"
+            + prime + read +
+            "            }\n"
+            "        }\n"
+            "        prefs.registerOnSharedPreferenceChangeListener(listener)\n"
+            "        onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }\n"
+            "    }\n"
+            "}\n"
+        )
+
     fixtures = [
         # name, files, expected rc, fragment that must appear ("" = must be green)
         ("clean tree (precision control)",
@@ -763,6 +871,13 @@ def _selftest():
         ("listener reads the cap before priming (C3)",
          {"Cfg.kt": cfg(), "Screen.kt": screen(prime_first=False)},
          1, "reads ConcurrencyPrefs.maxConcurrentSessions() before priming"),
+        # [dv17-b07] generalized C3: non-cap cached getter of a second primed cache.
+        ("listener reads a non-cap cached getter with prime first (C3g)",
+         {"Prefs.kt": limits_tree(prime_first=True)},
+         0, "listener primes before reading AgentRuntimeLimitsPrefs"),
+        ("listener reads a non-cap cached getter before priming (C3g)",
+         {"Prefs.kt": limits_tree(prime_first=False)},
+         1, "reads AgentRuntimeLimitsPrefs.compactModelEntryId() before priming"),
         ("inline registration on the concurrency handle (fail-closed)",
          {"Cfg.kt": inline_reg}, 1, "no resolvable change-listener registration"),
         ("config-path anchor renamed away (fail-closed)",
