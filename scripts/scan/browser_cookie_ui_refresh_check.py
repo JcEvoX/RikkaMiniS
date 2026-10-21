@@ -8,13 +8,32 @@ Issue-07 gate: BrowserSettingsSheet cookie section must
   4. carry a refresh signal (cookieRefreshTick) wired into remember keys and
      bumped at the per-domain and clear-all actions.
 
+[deep-audit-1039 B-07] Family 5 (B1–B2) — the domain list's refresh signal must
+be the STORE's, not the sheet's. The cookie domains are HISTORY domains
+(`historyStore.uniqueDomains()`), so the list changes whenever the history
+changes — including changes this panel causes indirectly: switching UA (or
+Viewport) here reloads the active tab, `BrowserUseManager.onPageFinished`
+records the visit and `historyStore.revision` advances. Keying the list on the
+panel-local `cookieRefreshTick` alone left it on the pre-reload snapshot until
+the sheet was closed and reopened (the [da1022-G] fix wired the tick for
+cookie deletes, which is a different mutation surface). Same shape and same fix
+as `BrowserHistorySheet` ([dv15-B3]): subscribe to `historyStore.revision` and
+feed it into the `allDomains` remember keys. The criterion binds the DECISION
+POINT (the memoized domain read is invalidated by the store's counter), not one
+spelling of the key list.
+
+  B1  the sheet subscribes to `historyStore.revision` via collectAsState.
+  B2  the `allDomains` remember key list includes a value backed by that flow
+      (derived-window check, same technique as V2/V6 — a key that is not fed
+      by the store's flow satisfies "has a key" while never reflecting a
+      record()).
+
 [da1029-E] The same sheet also guards the viewport / session-override pair, so
 the second criteria family below was added here rather than as a new gate (a new
 gate would have to be registered in scan.sh, which is frozen during this batch;
 the name stays `cookie_ui_refresh` because renaming it would break the
 registration — this docstring is the compensating note). The invariant is that
 the panel shows the viewport the pool actually resolves:
-
   V1  the sheet subscribes to BOTH viewport sources — the global pair
       (`customViewportWidth/Height`) and the session override
       (`sessionViewportWidth/Height`, what an agent `set_viewport` writes). The
@@ -51,10 +70,10 @@ the panel shows the viewport the pool actually resolves:
       size — so a session/global custom viewport was clobbered and the other
       tabs kept the old profile.
 
-Families 1-4 are judged by [check] (cookie); V1–V6 by [check_viewport] and V7 by
-[check_pool_ua] — the latter is the first criterion here that reads a second file
-(`BrowserTabPool.kt`). Each family carries its own fixtures; all run on the real
-tree, not on samples.
+Families 1-4 are judged by [check] (cookie); B1–B2 by [check_domain_refresh],
+V1–V6 by [check_viewport] and V7 by [check_pool_ua] — the latter is the first
+criterion here that reads a second file (`BrowserTabPool.kt`). Each family
+carries its own fixtures; all run on the real tree, not on samples.
 
 Code anchors only — comments are stripped before judgment, so a KDoc that
 mentions `removeAllCookies(null)` does not trip the gate.
@@ -375,6 +394,95 @@ def check_pool_ua(source: str) -> list:
     return errs
 
 
+def _remember_key_list(code: str, decl_marker: str):
+    """Ordered key tokens of the `remember(...)` call that follows `decl_marker`
+    (e.g. "val hasCookies = remember"). Paren-matched, so a wrapped key list
+    cannot truncate the way a first-`)` scan would. None when the declaration
+    is absent (caller reports fail-closed)."""
+    idx = code.find(decl_marker)
+    if idx < 0:
+        return None
+    op = code.find("(", idx + len(decl_marker))
+    if op < 0:
+        return None
+    depth = 0
+    i = op
+    while i < len(code):
+        c = code[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    if depth != 0:
+        return None
+    return [k.strip() for k in code[op + 1:i].split(",") if k.strip()]
+
+
+def _revision_backed(code: str, key: str) -> bool:
+    """True when `key` is an identifier whose declaration subscribes to the
+    history store's revision flow (`val <key> by ...revision.collectAsState()`).
+
+    Binds B2 to the DECISION POINT — the key must be fed by the store's counter,
+    not merely exist. A key on a nonce or an unrelated state has no declaration
+    carrying `.revision.collectAsState` and fails this probe."""
+    if not re.fullmatch(r"[A-Za-z_]\w*", key):
+        return False
+    return re.search(
+        r"val\s+%s\s+by\s+[\w.]*revision\s*\.\s*collectAsState" % re.escape(key), code
+    ) is not None
+
+
+def check_domain_refresh(source: str) -> list:
+    """[deep-audit-1039 B-07] B1–B2 — the domain list must follow the store.
+
+    Pre-fix shape (the reason this family exists): `allDomains` was keyed on
+    `(hasCookies, cookieRefreshTick)` — a panel-local counter that never moves
+    when the history store changes, so switching UA/Viewport in the sheet
+    reloaded the tab, `record()` planted the new domain, and the list kept
+    showing the pre-reload snapshot until the sheet was closed and reopened.
+    """
+    code = strip_line_comments(source)
+    errs = []
+
+    if not re.search(r"\.revision\s*\.\s*collectAsState\s*\(\s*\)", code):
+        errs.append(
+            "does not subscribe to `historyStore.revision` — the domain list is "
+            "keyed on panel-local state only, so a reload-driven record() (UA / "
+            "viewport switch) leaves it on the pre-reload snapshot (B1)"
+        )
+        return errs
+
+    for decl_marker, label in (
+        ("val hasCookies = remember", "hasCookies"),
+        ("val allDomains = remember", "allDomains"),
+    ):
+        keys = _remember_key_list(code, decl_marker)
+        if keys is None:
+            errs.append(
+                "`%s` remember declaration not found — the domain-refresh anchor "
+                "lost its subject (ROT: re-point it)" % label
+            )
+            continue
+        if "cookieRefreshTick" not in keys:
+            errs.append(
+                "`%s` remember keys %s dropped `cookieRefreshTick` — the "
+                "panel-local signal still owns cookie deletes / clear-all and "
+                "must stay wired (family 4 regression)" % (label, keys)
+            )
+            continue
+        if not any(_revision_backed(code, k) for k in keys):
+            errs.append(
+                "`%s` is keyed on %s, none of which is fed by "
+                "`historyStore.revision` — the read cannot follow a reload-driven "
+                "record() (B2)" % (label, keys)
+            )
+
+    return errs
+
+
 def check(source: str) -> list:
     src = strip_line_comments(source)
     errs = []
@@ -401,11 +509,25 @@ def check(source: str) -> list:
             errs.append("per-domain delete misses the http://$domain variant")
 
     # 4. refresh signal wired
+    #    [deep-audit-1039 B-07] re-anchored: the literal `remember(cookieRefreshTick)`
+    #    pinned the PRE-fix key list, which the B-07 fix must extend with the
+    #    store's revision value. The decision is "the panel-local tick is still a
+    #    remember key of the cookie-section derivations", judged via the same
+    #    paren-matched key lists family 5 uses; the store-side half is B1/B2.
     if "cookieRefreshTick" not in src:
         errs.append("no cookieRefreshTick refresh signal")
     else:
-        if "remember(cookieRefreshTick)" not in src:
-            errs.append("cookieRefreshTick not used as a remember key")
+        for decl_marker, label in (
+            ("val hasCookies = remember", "hasCookies"),
+            ("val allDomains = remember", "allDomains"),
+        ):
+            keys = _remember_key_list(src, decl_marker)
+            if keys is None:
+                errs.append("`%s` remember declaration not found (family 4)" % label)
+            elif "cookieRefreshTick" not in keys:
+                errs.append(
+                    "`%s` remember keys %s lack cookieRefreshTick" % (label, keys)
+                )
         bumps = src.count("cookieRefreshTick++")
         if bumps < 2:
             errs.append(f"cookieRefreshTick++ bumped {bumps} times, expected >= 2 (per-domain + clear-all)")
@@ -414,8 +536,17 @@ def check(source: str) -> list:
 
 
 def selftest() -> int:
+    # [deep-audit-1039 B-07] the compliant cookie fixture is the POST-fix shape:
+    # the panel-local tick stays a key AND the derivations are keyed on a value
+    # fed by historyStore.revision (subscription + key use).
     compliant = """
-            val hasCookies = remember(cookieRefreshTick) { cookieManager.hasCookies() }
+            val cookieManager = remember { CookieManager.getInstance() }
+            val historyStore = remember { BrowserHistoryStore.getInstance(context) }
+            val historyRevision by historyStore.revision.collectAsState()
+            val hasCookies = remember(cookieRefreshTick, historyRevision) { cookieManager.hasCookies() }
+            val allDomains = remember(hasCookies, cookieRefreshTick, historyRevision) {
+                historyStore.uniqueDomains()
+            }
             val cm = CookieManager.getInstance()
             cm.removeAllCookies {
                 cm.flush()
@@ -601,6 +732,50 @@ def selftest() -> int:
             // use the callback form to persist + bump the tick.
     """ + compliant + good_delete
 
+    # ── [deep-audit-1039 B-07] domain-refresh (B1–B2) fixtures ───────────────
+    # Only-red-its-own-criterion: each dirty fixture below differs from the
+    # compliant shape by exactly one decision.
+    good_domain = """
+            val cookieManager = remember { CookieManager.getInstance() }
+            val historyStore = remember { BrowserHistoryStore.getInstance(context) }
+            val historyRevision by historyStore.revision.collectAsState()
+            val hasCookies = remember(cookieRefreshTick, historyRevision) { cookieManager.hasCookies() }
+            val allDomains = remember(hasCookies, cookieRefreshTick, historyRevision) {
+                historyStore.uniqueDomains()
+            }
+    """
+    domain_arms = [
+        ("B1+B2 compliant (post-fix shape)", good_domain, []),
+        ("B1 no revision subscription (pre-fix shape)",
+         good_domain.replace("            val historyRevision by historyStore.revision.collectAsState()\n", ""),
+         ["does not subscribe to `historyStore.revision`"]),
+        ("precision: the receiver spelling of the subscription is not pinned",
+         good_domain.replace("historyStore.revision.collectAsState()",
+                             "store.revision.collectAsState()"),
+         []),
+        ("B2 allDomains not keyed on the revision-backed value",
+         good_domain.replace("remember(hasCookies, cookieRefreshTick, historyRevision)",
+                             "remember(hasCookies, cookieRefreshTick)"),
+         ["none of which is fed by"]),
+        ("B2 allDomains keyed on a nonce instead",
+         good_domain.replace("remember(hasCookies, cookieRefreshTick, historyRevision)",
+                             "remember(hasCookies, cookieRefreshTick, domainNonce)"),
+         ["none of which is fed by"]),
+        ("B2 hasCookies keeps the stale key list",
+         good_domain.replace("val hasCookies = remember(cookieRefreshTick, historyRevision)",
+                             "val hasCookies = remember(cookieRefreshTick)"),
+         ["none of which is fed by"]),
+        ("family-4 precision: tick dropped from allDomains",
+         good_domain.replace("remember(hasCookies, cookieRefreshTick, historyRevision)",
+                             "remember(hasCookies, historyRevision)"),
+         ["dropped `cookieRefreshTick`"]),
+        ("B1 precision: a comment mentioning revision is not a subscription",
+         good_domain.replace("            val historyRevision by historyStore.revision.collectAsState()\n",
+                             "            // val historyRevision by historyStore.revision.collectAsState()\n"
+                             "            val historyRevision = 0\n"),
+         ["does not subscribe to `historyStore.revision`"]),
+    ]
+
     arms = [
         ("compliant", good_with_comment, []),
         ("V1 callback-less removeAllCookies(null)", bad_nocallback, 1),
@@ -637,6 +812,21 @@ def selftest() -> int:
             print(f"  OK {name}: {errs}")
     for name, sample, needles in pool_arms:
         errs = check_pool_ua(sample)
+        if not needles:
+            if errs:
+                print(f"  FAIL {name}: expected green, got {errs}")
+                failures += 1
+            else:
+                print(f"  OK {name}: green")
+            continue
+        hit = [n for n in needles if not any(n in e for e in errs)]
+        if hit or not errs:
+            print(f"  FAIL {name}: expected {needles}, got {errs}")
+            failures += 1
+        else:
+            print(f"  OK {name}: {errs}")
+    for name, sample, needles in domain_arms:
+        errs = check_domain_refresh(sample)
         if not needles:
             if errs:
                 print(f"  FAIL {name}: expected green, got {errs}")
@@ -692,7 +882,8 @@ def main() -> int:
     errs = check(src)
     vp_errs = check_viewport(src)
     pool_errs = check_pool_ua(pool_src)
-    if errs or vp_errs or pool_errs:
+    domain_errs = check_domain_refresh(src)
+    if errs or vp_errs or pool_errs or domain_errs:
         print("browser_cookie_ui_refresh_check RED on %s (+ %s):" % (TARGET, POOL_TARGET))
         for e in errs:
             print(f"  - {e}")
@@ -700,9 +891,12 @@ def main() -> int:
             print(f"  - [viewport] {e}")
         for e in pool_errs:
             print(f"  - [pool] {e}")
+        for e in domain_errs:
+            print(f"  - [domain-refresh] {e}")
         return 1
     print(f"browser_cookie_ui_refresh_check OK ({TARGET}; cookie refresh + "
-          f"viewport/session-override + UA-pool wiring; {POOL_TARGET} checked too)")
+          f"domain-refresh/store-revision + viewport/session-override + UA-pool "
+          f"wiring; {POOL_TARGET} checked too)")
     return 0
 
 
