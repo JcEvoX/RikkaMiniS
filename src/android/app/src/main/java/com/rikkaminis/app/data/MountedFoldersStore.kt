@@ -303,21 +303,10 @@ class MountedFoldersStore(private val context: Context) {
         }
     }
 
-    private fun resolveVolumeRoot(context: Context, volume: String): String? {
-        if (volume.equals("primary", ignoreCase = true)) {
-            return Environment.getExternalStorageDirectory()?.absolutePath
-        }
-        // Removable storage — match by uuid via StorageManager (API 24+ for
-        // storageVolumes, but `directory` is API 30+. Fall back gracefully
-        // on older devices by walking /storage/<uuid>).
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            val sm = context.getSystemService(Context.STORAGE_SERVICE) as? StorageManager
-            sm?.storageVolumes?.firstOrNull { it.uuid?.equals(volume, ignoreCase = true) == true }
-                ?.directory?.absolutePath?.let { return it }
-        }
-        val fallback = File("/storage/$volume")
-        return if (fallback.isDirectory) fallback.absolutePath else null
-    }
+    // [dv20-A4-A06] The volume-root resolver used to live here as a private
+    // method, twinned by a drifted copy in `PRootKernel`. It is now the single
+    // top-level [resolveVolumeRoot] at the bottom of this file, shared by both
+    // readers — see [resolveVolumeRootDecision] for the union rule.
 
     private fun loadFromDisk() {
         if (!storeFile.isFile) return
@@ -355,6 +344,93 @@ class MountedFoldersStore(private val context: Context) {
         private const val EXTERNALSTORAGE_AUTHORITY = "com.android.externalstorage.documents"
         private val JSON = Json { ignoreUnknownKeys = true; encodeDefaults = true }
     }
+}
+
+/**
+ * [dv20-A4-A06] One candidate volume for [resolveVolumeRootDecision].
+ * [directory] carries the API 30+ `StorageVolume.directory` path; null below
+ * API 30 (the platform does not expose it there) or when the volume has no
+ * directory.
+ */
+internal data class VolumeRootCandidate(val uuid: String?, val directory: String?)
+
+/**
+ * [dv20-A4-A06] Pure core of SAF volume-root resolution — the single place the
+ * decision is made, and the single place the `< API 30` fallback exists.
+ *
+ * Before this, two same-semantics implementations had drifted apart:
+ * `PRootKernel.resolveVolumeRoot` stopped at `volume.directory` (API 30+) and
+ * returned null for removable volumes on API 26–29, while this store's private
+ * copy carried the `File("/storage/<uuid>")` fallback. A folder mounted on a
+ * removable volume therefore resolved here (and landed in
+ * `Entry.resolvedHostPath`) but not in `PRootKernel.applyMountedFoldersSnapshot`,
+ * which re-resolved from scratch — the mount was silently dropped from
+ * `bindMounts` and never got its read-only guard.
+ *
+ * The decision is the UNION of both former shapes — the fallback wins over "no
+ * answer": primary/empty → primary dir; API 30+ volume match with a non-null
+ * directory → that path; everything else (API 26–29 match, API 30+ match whose
+ * directory is null, unknown volume) → `/storage/<uuid>` when it is a real
+ * directory, else null.
+ *
+ * Android-free on purpose: [resolveVolumeRoot] supplies the platform edges and
+ * the JVM probe pins this contract without an Android runtime.
+ */
+internal fun resolveVolumeRootDecision(
+    volumeId: String,
+    sdkInt: Int,
+    primaryDir: String?,
+    volumes: List<VolumeRootCandidate>,
+    fallbackIsDirectory: (String) -> Boolean,
+): String? {
+    if (volumeId.equals("primary", ignoreCase = true) || volumeId.isEmpty()) {
+        return primaryDir
+    }
+    if (sdkInt >= 24) { // StorageManager.storageVolumes
+        for (candidate in volumes) {
+            if (candidate.uuid?.equals(volumeId, ignoreCase = true) == true) {
+                if (sdkInt >= 30) { // StorageVolume.getDirectory
+                    candidate.directory?.let { return it }
+                }
+            }
+        }
+    }
+    // < API 30, and API 30+ volumes whose directory is null: walk the legacy
+    // mount point. Removable volumes expose /storage/<uuid> there even though
+    // StorageVolume.directory is unavailable below API 30.
+    val fallback = "/storage/$volumeId"
+    return if (fallbackIsDirectory(fallback)) fallback else null
+}
+
+/**
+ * [dv20-A4-A06] The one volume-root resolver: platform edges for
+ * [resolveVolumeRootDecision]. `PRootKernel` and this store both call it, so
+ * the two readers of a mount's host path cannot disagree again.
+ */
+internal fun resolveVolumeRoot(context: Context, volumeId: String): String? {
+    val primaryDir = Environment.getExternalStorageDirectory()?.absolutePath
+    val volumes = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+        val sm = context.getSystemService(Context.STORAGE_SERVICE) as? StorageManager
+        sm?.storageVolumes?.map { volume ->
+            VolumeRootCandidate(
+                uuid = volume.uuid,
+                directory = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                    volume.directory?.absolutePath
+                } else {
+                    null
+                },
+            )
+        }.orEmpty()
+    } else {
+        emptyList()
+    }
+    return resolveVolumeRootDecision(
+        volumeId = volumeId,
+        sdkInt = Build.VERSION.SDK_INT,
+        primaryDir = primaryDir,
+        volumes = volumes,
+        fallbackIsDirectory = { File(it).isDirectory },
+    )
 }
 
 /**
