@@ -506,29 +506,41 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
          * subcommands that HAVE a page size are rewritten, so `get` / `delete`
          * keep their id slots bit-for-bit (`get -n 10` still read id 10).
          *
+         * [dv19-A1 A-01] The rewrite runs BEFORE the subcommand probe, and the
+         * probe reads the rewritten list. Deciding on the raw list made the
+         * promise above false in the `before` position: `-n 10` is still an
+         * unbound single-dash token at that point, so "10" landed in
+         * `positional[0]`, `sub` came out `"10"` (neither `list` nor `search`),
+         * the function returned the ORIGINAL argv and the caller refused with
+         * `unknown subcommand '10'` (exit 2) — while `list -n 10` worked. The
+         * probe now sees the same value-carrying spelling the caller gets, so
+         * both positions agree (the alias is position-independent, as KDoc'd).
+         *
          * Pure — no Context, no I/O — so both arms stay testable off-device.
          */
         internal fun bindLegacyShortMax(argv: List<String>): List<String> {
             if ("-n" !in argv) return argv
-            // The subcommand may sit behind an option (`--compact list -n 10`),
-            // so ask the parser rather than indexing the raw argv.
-            val sub = OffloadArgs(argv, booleanFlags = setOf("help", "h")).positional.getOrNull(0)
-            if (sub != "list" && sub != "search") return argv
-            val out = ArrayList<String>(argv.size)
+            val rewritten = ArrayList<String>(argv.size)
             var i = 0
             while (i < argv.size) {
                 val token = argv[i]
                 val value = argv.getOrNull(i + 1)
                 if (token == "-n" && value != null && value.toIntOrNull() != null) {
-                    out.add("--max")
-                    out.add(value)
+                    rewritten.add("--max")
+                    rewritten.add(value)
                     i += 2
                     continue
                 }
-                out.add(token)
+                rewritten.add(token)
                 i++
             }
-            return out
+            // The subcommand may sit behind an option (`--compact list -n 10`),
+            // so ask the parser rather than indexing the raw argv — and ask it
+            // about `rewritten`: on the raw list `-n 10` shifts every slot it
+            // reads ([dv19-A1 A-01]).
+            val sub = OffloadArgs(rewritten, booleanFlags = setOf("help", "h")).positional.getOrNull(0)
+            if (sub != "list" && sub != "search") return argv
+            return rewritten
         }
 
         /**
