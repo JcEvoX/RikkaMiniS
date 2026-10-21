@@ -36,6 +36,26 @@ silently in production before [fix/compact-pregate-exhausted-1016] /
   provably-unreachable one-time invariant break is kept with an explicit
   written criterion instead of being silenced for symmetry.
 
+  plus [fix/compact-timeout-budget-1022] the two levers that keep a long agent
+  run alive when the summary chain is latency-bound (criterion 5). 2026-10-22
+  device log: a run with no new user turn to fold hands the whole agent
+  history to one summary call (estTokens 110 670 / 140 490), and the chain
+  then TIMEOUT'd on every candidate at exactly 30000ms — 25 timeouts, 32
+  "Compact failed", 119 "folded nothing", and 8 runs ended on
+  `finish=length ×3 empty output — giving up` because nothing folded while the
+  hard trim could not hold the context under the window. The members that
+  timed out were the SAME ones that succeeded at 25.0s / 28.2s / 29.1s that
+  day, and they never declare declaresNoEffortTiers (a user-configured relay
+  entry cannot) — so the quiet 30s floor was simply below their real latency
+  on large material. Two properties, both load-bearing:
+    (a) the per-candidate budget takes the summary material size and opens the
+        60s tier above the measured threshold (single-source constant, never a
+        bare literal, and the chain deadline still clamps);
+    (b) a route that timed out inside this chain (host + model, NOT the entry
+        id — three tierflow entries sharing https://tierflow.cn died three
+        times in one chain) is skipped before it is budgeted or sent, so the
+        remaining deadline reaches a candidate that can still answer.
+
 Mechanical criteria:
   1. inside `maybeAutoCompactInLoop`: a single `val verdict = policy.check(...)`
      feeds `ContextCompactor.loopGateOpens(verdict, escalatedFromOffload)`, and
@@ -48,6 +68,10 @@ Mechanical criteria:
   4. each `appendSystemInfo` card in `compactAll` is either preceded by
      `if (!silent)` (between it and the previous card) or carries the explicit
      "Deliberately NOT" criterion.
+  5. the summary chain budget is a function of the material size (material
+     parameter + the large-material tier reading the single-source constant,
+     deadline clamp intact, real estimate at the call site), and a route that
+     already timed out in this chain is skipped before the budget call.
 
 Usage: python3 scripts/scan/compact_decision_gate_check.py [repo_root]
        python3 scripts/scan/compact_decision_gate_check.py --selftest
@@ -79,6 +103,24 @@ CHAIN_STEP = "ContextCompactor.chainFailureAfter("
 CHAIN_TERMINAL = "ContextCompactor.chainTerminalFailure("
 SILENT_GATE = "if (!silent)"
 KEPT_CRITERION = "Deliberately NOT"
+
+# ── criterion 5 [fix/compact-timeout-budget-1022] anchors ────────────────
+# Anchored on decision points (the tier expression, the set membership, the
+# recording), not on whole lines: renaming an identifier must fail loudly via
+# the missing-needle arm, not silently pass.
+BUDGET_FN = "internal fun compactionCandidateBudgetMs("
+MATERIAL_PARAM = "materialTokens: Int"
+LARGE_TIER = "if (declaresNoEffortTiers == true || largeMaterial)"
+LARGE_CONST_REF = "ChatViewModel.COMPACT_SUMMARY_LARGE_MATERIAL_TOKENS"
+DEADLINE_CLAMP = "return minOf(perCandidate, deadlineAt - nowMs)"
+BUDGET_CALL = "val budgetMs = compactionCandidateBudgetMs("
+KEY_FN = "internal fun compactionCandidateKey("
+ROUTE_SET_DECL = "val timedOutRoutes = mutableSetOf<String>()"
+ROUTE_DECL = "val route = compactionCandidateKey("
+ROUTE_MODEL_ARG = "modelId = candidate.model.id"
+ROUTE_SKIP = "if (route in timedOutRoutes)"
+ROUTE_RECORD = "timedOutRoutes.add(route)"
+TIMEOUT_LOG = "summary TIMEOUT after"
 
 # resource ids of the four compactAll cards the silent contract is judged on
 GATED_CARDS = [
@@ -207,6 +249,68 @@ def check(loop, compactor, orch):
                 % (ORCH_FILE, line_of(orch, "R.string." + KEPT_CARD), KEPT_CARD),
             ))
 
+    # ── criterion 5 [fix/compact-timeout-budget-1022] ───────────────────
+    # (a) the per-candidate budget is a function of the summary material size
+    if BUDGET_FN in orch:
+        # whole function body (up to the top-level closing brace), not a fixed
+        # window: a fixed window silently truncates when the KDoc above the
+        # tier grows, and the gate would then report a "missing" tier that is
+        # actually present (self-inflicted false red).
+        budget_body = orch.split(BUDGET_FN, 1)[1].split("\n}\n", 1)[0]
+        need(budget_body, MATERIAL_PARAM, ORCH_FILE, "chain-budget-adaptive",
+             "the budget must take the summary material size")
+        need(budget_body, LARGE_TIER, ORCH_FILE, "chain-budget-adaptive",
+             "a large material must be able to open the 60s tier")
+        need(budget_body, LARGE_CONST_REF, ORCH_FILE, "chain-budget-adaptive",
+             "the threshold must be the single-source constant, not a bare literal")
+        need(budget_body, DEADLINE_CLAMP, ORCH_FILE, "chain-budget-adaptive",
+             "the chain deadline must still clamp every candidate")
+        if re.search(r"materialTokens\s*>\s*\d", budget_body):
+            problems.append((
+                "chain-budget-adaptive",
+                "%s: the material threshold is inlined as a bare number" % ORCH_FILE,
+            ))
+    else:
+        problems.append(("chain-budget-adaptive",
+                         "%s: %s missing" % (ORCH_FILE, BUDGET_FN)))
+    if BUDGET_CALL in orch:
+        args = orch.split(BUDGET_CALL, 1)[1].split(")", 1)[0]
+        parts = [p.strip() for p in args.split(",")]
+        second = parts[1].split("=")[-1].strip() if len(parts) > 1 else ""
+        if not second or re.fullmatch(r"[0-9_]+L?", second):
+            problems.append((
+                "chain-budget-adaptive",
+                "%s: the budget call must pass the real material estimate (got %r) — a literal pins every "
+                "fold into one tier" % (ORCH_FILE, second or "<missing>"),
+            ))
+
+    # (b) a route that timed out inside this chain is not paid for twice
+    for needle, why in (
+        (ROUTE_SET_DECL, "the chain must remember which routes timed out"),
+        (KEY_FN, "the route identity must be a single-source function"),
+        (ROUTE_DECL, "the candidate route must be resolved at the top of the loop body"),
+        (ROUTE_MODEL_ARG, "the route key must carry the model id (host alone is not an identity)"),
+        (ROUTE_SKIP, "a route that already timed out must be skipped"),
+        (ROUTE_RECORD, "the timeout verdict must record its route"),
+    ):
+        need(orch, needle, ORCH_FILE, "chain-timeout-dedup", why)
+    if ROUTE_SKIP in orch and BUDGET_CALL in orch and ROUTE_RECORD in orch:
+        skip_at = orch.find(ROUTE_SKIP)
+        budget_at = orch.find(BUDGET_CALL)
+        timeout_at = orch.find(TIMEOUT_LOG)
+        record_at = orch.find(ROUTE_RECORD)
+        if not skip_at < budget_at:
+            problems.append((
+                "chain-timeout-dedup",
+                "%s: the route skip must precede the budget call — a skipped candidate must not "
+                "consume the chain deadline" % ORCH_FILE,
+            ))
+        if timeout_at < 0 or not timeout_at < record_at:
+            problems.append((
+                "chain-timeout-dedup",
+                "%s: the route must be recorded on the timeout verdict, not before it" % ORCH_FILE,
+            ))
+
     return problems
 
 
@@ -284,6 +388,53 @@ def selftest(root):
             "keep-criterion deleted from the un-gated card",
             "silent-card-contract",
             on_orch(lambda s: s.replace(KEPT_CRITERION, "Silenced", 1)),
+        ),
+        # ── criterion 5 [fix/compact-timeout-budget-1022] ───────────────
+        (
+            "large-material tier dropped from the budget",
+            "chain-budget-adaptive",
+            on_orch(lambda s: s.replace(LARGE_TIER, "if (declaresNoEffortTiers == true) {", 1)),
+        ),
+        (
+            "material threshold inlined as a bare literal",
+            "chain-budget-adaptive",
+            on_orch(lambda s: s.replace(
+                "materialTokens > " + LARGE_CONST_REF, "materialTokens > 2_000", 1,
+            )),
+        ),
+        (
+            "material estimate replaced by a literal at the call site",
+            "chain-budget-adaptive",
+            on_orch(lambda s: s.replace("            estimatedInput,\n", "            0,\n", 1)),
+        ),
+        (
+            "deadline clamp removed from the budget",
+            "chain-budget-adaptive",
+            on_orch(lambda s: s.replace(DEADLINE_CLAMP, "return perCandidate", 1)),
+        ),
+        (
+            "timeout no longer records its route",
+            "chain-timeout-dedup",
+            on_orch(lambda s: s.replace("            " + ROUTE_RECORD + "\n", "", 1)),
+        ),
+        (
+            "route skip removed from the loop",
+            "chain-timeout-dedup",
+            on_orch(lambda s: s.replace(ROUTE_SKIP, "if (false)", 1)),
+        ),
+        (
+            "route identity loses the model id",
+            "chain-timeout-dedup",
+            on_orch(lambda s: s.replace(ROUTE_MODEL_ARG, "instanceId = candidate.instanceContext?.id", 1)),
+        ),
+        (
+            "route skip moved after the budget call",
+            "chain-timeout-dedup",
+            on_orch(lambda s: s.replace(ROUTE_SKIP, "if (false)", 1).replace(
+                "        val started = SystemClock.elapsedRealtime()",
+                "        " + ROUTE_SKIP + " { continue }\n        val started = SystemClock.elapsedRealtime()",
+                1,
+            )),
         ),
     ]
 
