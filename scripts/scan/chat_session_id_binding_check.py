@@ -75,6 +75,9 @@ REL_MOVE = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/MoveToSessi
 REL_STORE = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatViewModelStore.kt"
 # [da1029-A] criterion 9 — optional (mini-tree fixtures predate it)
 REL_ACTIVITY = "src/android/app/src/main/java/com/rikkaminis/app/MainActivity.kt"
+# [deep-audit-1039 A-06] criterion 13 — optional, same stance as criterion 9:
+# the mini-tree fixtures that predate it write only the four files above.
+REL_RUNNER = "src/android/app/src/main/java/com/rikkaminis/app/debug/HeadlessChatRunner.kt"
 
 # (start token, end token) pairs isolating a call block; the block must
 # contain `required` and must NOT contain `forbidden`.
@@ -313,6 +316,48 @@ def _match_brace(code: str, open_idx: int) -> "int | None":
                 return i
         i += 1
     return None
+
+
+# [deep-audit-1039 A-06] anchors for criterion 13 (the headless cancel path).
+RE_RUNNER_CANCEL_DECL = re.compile(r"suspend\s+fun\s+cancel\s*\(")
+RE_RUNNER_RESOLVER_DECL = re.compile(r"private\s+fun\s+viewModelForCancel\s*\(")
+
+
+def _fn_body_after(code: str, decl_re) -> "str | None":
+    """`{ … }` body of the first function whose declaration matches [decl_re].
+
+    Scans past the parameter list, then brace-matches the first `{` after it, so
+    BOTH writing styles are accepted — a block body, and an expression body whose
+    trailing lambda IS the body (`… = withContext(Dispatchers.Main) { }`). The
+    criterion binds the decision point, not one spelling. Fail-closed: `None`
+    when the declaration is absent or the braces do not balance.
+    """
+    m = decl_re.search(code)
+    if not m:
+        return None
+    i = code.find("(", m.end() - 1)
+    if i == -1:
+        return None
+    depth = 0
+    n = len(code)
+    while i < n:
+        c = code[i]
+        if c == '"' or c == "'":
+            i = _skip_string_literal(code, i)
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                i += 1
+                break
+        i += 1
+    open_idx = code.find("{", i)
+    if open_idx == -1:
+        return None
+    end = _match_brace(code, open_idx)
+    return None if end is None else code[open_idx : end + 1]
 
 
 def _remember_derived_body(code: str, expr_start: int) -> "str | None":
@@ -676,6 +721,73 @@ def check(root: Path) -> int:
                 )
             start = j + 1
 
+    # --- 13. [deep-audit-1039 A-06] `cancel` resolves the ViewModel through the
+    #     process-wide store, not just the private provider cache. ---
+    # The cache is written at `providerFor`, i.e. by the RPC path only. A session
+    # whose ViewModel the UI created (the ordinary case — the user opens the chat,
+    # then asks the agent over RPC to stop it) is invisible to that cache, so the
+    # old `cancel` read `false`, stopped nothing, and the stream kept running
+    # against a user who had just pressed stop. `deleteSession` calls cancel
+    # before dropping the row, so the same hole silently dropped its cancel.
+    #
+    # Optional file: the four-file mini-tree fixtures predate it (drift-detector
+    # stance, same as criteria 9-11). The real repo tree always carries it, and
+    # the branch CI runs the real tree, so the criterion is live there.
+    runner_path = root / REL_RUNNER
+    if runner_path.is_file():
+        runner = strip_comments(runner_path.read_text(encoding="utf-8"))
+        cancel_body = _fn_body_after(runner, RE_RUNNER_CANCEL_DECL)
+        if cancel_body is None:
+            errors.append(
+                "HeadlessChatRunner.kt: `suspend fun cancel(` block not found "
+                "(renamed or moved? re-anchor criterion 13, do not drop it)"
+            )
+        else:
+            if "providers[" in cancel_body:
+                errors.append(
+                    "HeadlessChatRunner.kt: `cancel` reads the private provider cache "
+                    "directly — that cache is written by the RPC path only, so a "
+                    "UI-created ViewModel is invisible, nothing is stopped, and cancel "
+                    "reports false. Resolve through `viewModelForCancel(…)`."
+                )
+            if "viewModelForCancel(" not in cancel_body:
+                errors.append(
+                    "HeadlessChatRunner.kt: `cancel` must resolve the ViewModel through "
+                    "`viewModelForCancel(…)` — cache fast path plus store fallback in ONE "
+                    "place, so the resolution order is a property of cancel alone"
+                )
+            if "isStreaming.value" not in cancel_body or "cancelStream()" not in cancel_body:
+                errors.append(
+                    "HeadlessChatRunner.kt: `cancel` no longer reads `isStreaming.value` / "
+                    "calls `cancelStream()` — the return contract (false when nothing was "
+                    "streaming) is part of the RPC surface"
+                )
+        resolver_body = _fn_body_after(runner, RE_RUNNER_RESOLVER_DECL)
+        if resolver_body is None:
+            errors.append(
+                "HeadlessChatRunner.kt: `private fun viewModelForCancel(` block not found "
+                "(renamed or moved? re-anchor criterion 13, do not drop it)"
+            )
+        else:
+            if "ChatViewModelStore.ownerFor(" not in resolver_body:
+                errors.append(
+                    "HeadlessChatRunner.kt: the cancel resolver must fall back to "
+                    "`ChatViewModelStore.ownerFor(…)` — that is the store the UI binds to"
+                )
+            if "ChatViewModelStore.resolveSessionId(" not in resolver_body:
+                errors.append(
+                    "HeadlessChatRunner.kt: the resolver must build the ViewModel with the "
+                    "RESOLVED id (`ChatViewModelStore.resolveSessionId(…)`) — the store's "
+                    "live VM sits under the promoted id, so the raw `__new__<uuid>` draft "
+                    "key would create a second ViewModel"
+                )
+            if "providers[" not in resolver_body:
+                errors.append(
+                    "HeadlessChatRunner.kt: the resolver dropped the private-cache fast "
+                    "path — RPC-driven sessions would rebuild their ViewModel on every "
+                    "cancel"
+                )
+
     if errors:
         for e in errors:
             print(f"FAIL {e}")
@@ -780,6 +892,70 @@ COLD_START_SHAPE_B = (
     "    )\n"
     "}\n"
     "val startDestination = coldStartPlan\n"
+)
+
+# [deep-audit-1039 A-06] criterion 13 fixture: the headless cancel path. Faithful
+# to the production shape (cache fast path first, then the store fallback), but
+# free-standing — the fixture is never compiled.
+FIXTURE_RUNNER = '''package com.rikkaminis.app.debug
+
+class HeadlessChatRunner {
+    private val providers = mutableMapOf<String, Any>()
+
+    suspend fun cancel(context: Context, sessionId: String): Boolean = withContext(Dispatchers.Main) {
+        val vm = viewModelForCancel(context, sessionId) ?: return@withContext false
+        val wasRunning = vm.isStreaming.value
+        if (wasRunning) vm.cancelStream()
+        wasRunning
+    }
+
+    private fun viewModelForCancel(context: Context, sessionId: String): ChatViewModel? {
+        providers[sessionId]?.let { cached ->
+            runCatching { cached[ChatViewModel::class.java] }.getOrNull()?.let { return it }
+        }
+        val owner = runCatching { ChatViewModelStore.ownerFor(sessionId) }.getOrNull() ?: return null
+        val app = app(context)
+        return runCatching {
+            ViewModelProvider(
+                owner,
+                ChatViewModel.factory(
+                    sessionId = ChatViewModelStore.resolveSessionId(sessionId),
+                ),
+            )[ChatViewModel::class.java]
+        }.getOrNull()
+    }
+}
+'''
+
+_R_CANCEL_CALL = ("        val vm = viewModelForCancel(context, sessionId) "
+                  "?: return@withContext false")
+_R_OWNER_LINE = ("        val owner = runCatching { "
+                 "ChatViewModelStore.ownerFor(sessionId) }.getOrNull() ?: return null\n")
+_R_RESOLVED_ARG = "sessionId = ChatViewModelStore.resolveSessionId(sessionId),"
+_R_CACHE_BLOCK = ("        providers[sessionId]?.let { cached ->\n"
+                  "            runCatching { cached[ChatViewModel::class.java] }"
+                  ".getOrNull()?.let { return it }\n"
+                  "        }\n")
+
+# Dirty variants, one per decision point (built fail-closed: a variant that did
+# not change the fixture is a broken mutation, not a passing one).
+FIXTURE_RUNNER_CACHE_ONLY = FIXTURE_RUNNER.replace(
+    _R_CANCEL_CALL,
+    "        val vm = providers[sessionId] as? ChatViewModel "
+    "?: return@withContext false",
+)
+FIXTURE_RUNNER_NO_STORE = FIXTURE_RUNNER.replace(_R_OWNER_LINE, "")
+FIXTURE_RUNNER_RAW_KEY = FIXTURE_RUNNER.replace(_R_RESOLVED_ARG, "sessionId = sessionId,")
+FIXTURE_RUNNER_NO_FASTPATH = FIXTURE_RUNNER.replace(_R_CACHE_BLOCK, "")
+FIXTURE_RUNNER_RENAMED = FIXTURE_RUNNER.replace("suspend fun cancel(", "suspend fun abort(")
+
+_RUNNER_MUTATIONS = (
+    ("cancel back to the private cache only (MUT-R1)", FIXTURE_RUNNER_CACHE_ONLY, _R_CANCEL_CALL),
+    ("resolver drops the store fallback (MUT-R2)", FIXTURE_RUNNER_NO_STORE, _R_OWNER_LINE),
+    ("resolver builds the VM from the raw draft key (MUT-R3)",
+     FIXTURE_RUNNER_RAW_KEY, _R_RESOLVED_ARG),
+    ("resolver drops the cache fast path (MUT-R4)", FIXTURE_RUNNER_NO_FASTPATH, _R_CACHE_BLOCK),
+    ("a renamed cancel anchor (MUT-R5)", FIXTURE_RUNNER_RENAMED, "suspend fun cancel("),
 )
 
 # Each mutation is (name, fixture-mutator) applied to the GREEN fixture set.
@@ -949,7 +1125,8 @@ def selftest() -> int:
     failures = []
 
     def run_tree(screen: str, nav: str, move: str, store: str,
-                 activity: "str | None" = None) -> "tuple[int, list[str]]":
+                 activity: "str | None" = None,
+                 runner: "str | None" = None) -> "tuple[int, list[str]]":
         with tempfile.TemporaryDirectory() as td:
             tdp = Path(td)
             for rel in (REL_SCREEN, REL_NAV, REL_MOVE, REL_STORE):
@@ -963,6 +1140,10 @@ def selftest() -> int:
                 f = tdp / REL_ACTIVITY
                 f.parent.mkdir(parents=True, exist_ok=True)
                 f.write_text(activity, encoding="utf-8")
+            if runner is not None:
+                f = tdp / REL_RUNNER
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text(runner, encoding="utf-8")
             rc = check(tdp)
             return rc, list(errors)
 
@@ -1109,6 +1290,27 @@ def selftest() -> int:
         failures.append("criterion 12 missing anchor: gate stayed GREEN (fail-closed violated)")
     else:
         print(f"selftest: criterion 12 missing anchor -> RED ({len(errs)} violation(s)) OK")
+
+    # --- criterion 13 [deep-audit-1039 A-06]: cancel resolves through the store ---
+    # Backward compat: the four-file trees above omit HeadlessChatRunner.kt, and
+    # the criterion must skip them (drift-detector stance) — already proven GREEN.
+    print("selftest: criterion 13 skipped when HeadlessChatRunner.kt absent (old fixtures) OK")
+
+    rc, errs = run_tree(screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY, FIXTURE_RUNNER)
+    if rc != 0:
+        failures.append(f"criterion 13 GREEN fixture unexpectedly red: {errs}")
+    else:
+        print("selftest: criterion 13 GREEN fixture passes")
+
+    for name, run_fixture, anchor in _RUNNER_MUTATIONS:
+        if run_fixture == FIXTURE_RUNNER:
+            failures.append(f"criterion 13 {name}: mutation is a no-op (anchor not found)")
+            continue
+        rc, errs = run_tree(screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY, run_fixture)
+        if rc == 0:
+            failures.append(f"criterion 13 {name}: gate stayed GREEN (no teeth)")
+        else:
+            print(f"selftest: criterion 13 {name} -> RED ({len(errs)} violation(s)) OK")
 
     if failures:
         print("\nselftest FAILURES:")

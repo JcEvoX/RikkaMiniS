@@ -588,12 +588,66 @@ internal object HeadlessChatRunner {
         vm.revertCompact()
     }
 
+    /**
+     * [deep-audit-1039 A-06] Cancel the stream for [sessionId].
+     *
+     * This used to resolve the ViewModel **only** through [providers], the
+     * private cache `providerFor` writes. That cache is populated by the RPC
+     * entry points (`chat.prompt` / `retry` / …) — it is empty for a session
+     * the **UI** started (ChatScreen binds its VM straight through
+     * [ChatViewModelStore]) and for a draft-key id (`__new__<uuid>`) whose
+     * store lives under the promoted id. `cancel` therefore returned false and
+     * cancelled nothing, while `debug/ChatMutationMethods.deleteSession` calls
+     * it *before* deleting the row — the streaming job kept writing into a
+     * deleted session.
+     *
+     * Resolution now goes through the same single source as every other method
+     * here: [ChatViewModelStore.ownerFor], which resolves the draft alias and
+     * returns the process-wide store the UI binds to. The private cache stays
+     * as the fast path for RPC-driven sessions (a `providers` hit means the
+     * provider object is already built for that exact key) — it is written at
+     * `providerFor` and dropping it would change both performance and the
+     * per-key VM identity the RPC layer relies on.
+     *
+     * Return-value contract is unchanged: false when nothing is streaming.
+     */
     suspend fun cancel(context: Context, sessionId: String): Boolean = withContext(Dispatchers.Main) {
-        val cached = providers[sessionId] ?: return@withContext false
-        val vm = cached[ChatViewModel::class.java]
+        val vm = viewModelForCancel(context, sessionId) ?: return@withContext false
         val wasRunning = vm.isStreaming.value
         if (wasRunning) vm.cancelStream()
         wasRunning
+    }
+
+    /**
+     * Resolve the VM to cancel: the private cache first (the fast path for
+     * RPC-driven sessions), then the process-wide store the UI binds through,
+     * with the draft alias resolved before the VM is built. Kept as one
+     * function so the resolution order is a property of `cancel` alone
+     * (asserted in `HeadlessChatCancelStoreWiringTest`).
+     */
+    private fun viewModelForCancel(context: Context, sessionId: String): ChatViewModel? {
+        providers[sessionId]?.let { cached ->
+            runCatching { cached[ChatViewModel::class.java] }.getOrNull()?.let { return it }
+        }
+        val owner = runCatching { ChatViewModelStore.ownerFor(sessionId) }.getOrNull() ?: return null
+        val app = app(context)
+        return runCatching {
+            ViewModelProvider(
+                owner,
+                ChatViewModel.factory(
+                    // The store's live VM sits under the promoted id, so any
+                    // build that does happen must use the resolved key — the
+                    // raw `__new__<uuid>` draft key would create a second VM.
+                    sessionId = ChatViewModelStore.resolveSessionId(sessionId),
+                    chatRepository = app.chatRepository,
+                    providerRepository = app.providerRepository,
+                    appContext = app.applicationContext,
+                    memoryRepository = app.memoryRepository,
+                    skillRepository = app.skillRepository,
+                    mcpRepository = app.mcpRepository,
+                ),
+            )[ChatViewModel::class.java]
+        }.getOrNull()
     }
 
     /**
