@@ -28,6 +28,18 @@ custom model of those families.
          keys added by this fix AND all original short keys (idempotence:
          a rewrite that keeps only one family must not pass).
 
+  Arm 3  (deep-audit-1038 A-08) A vendor adapter that reuses
+         OpenAIModelsApi.fetchModels for its own vendor base URL must say
+         which family the rows belong to — a non-null `providerName = …`
+         argument OR a post-fetch `.map { … provider = … }` relabel (both
+         accepted; the gate pins the decision, not a spelling). The generic
+         openAI adapter is exempt. Fail-closed: no adapter/wiring detected ⇒
+         red.
+  Arm 4  (deep-audit-1038 A-08) The decision inside OpenAIModelsApi:
+         `providerName: String? = null` stays optional, [resolveProviderName]
+         keeps both halves of the decision, the row construction routes
+         through it, and the cache return path re-labels cached rows.
+
 Usage: python3 scripts/scan/models_provider_field_check.py [root]
        python3 scripts/scan/models_provider_field_check.py --root <root>
        python3 scripts/scan/models_provider_field_check.py --selftest
@@ -35,12 +47,15 @@ Exit:  0 = clean, 1 = violation(s), 2 = usage/ROT
 """
 import argparse
 import os
+import re
 import sys
 import tempfile
 
 APP = "src/android/app/src/main/java/com/rikkaminis/app"
 MC_REL = APP + "/config/collections/ModelsCollection.kt"
 MD_REL = APP + "/provider/ModelsDevApi.kt"
+OA_REL = APP + "/provider/openai/OpenAIModelsApi.kt"
+AD_REL = APP + "/provider/ModelListProviderAdapters.kt"
 
 ARM1_FORBIDDEN = ("provider = instanceId",)
 ARM1_REQUIRED = ("instance.providerType.displayName",)
@@ -76,6 +91,46 @@ def function_text(src, header):
         return None
     end = _balanced(src, brace, "{", "}")
     return None if end < 0 else src[i:end]
+
+
+_DECL_OR_DOC = re.compile(
+    r"(fun\b|val\b|var\b|internal\b|private\b|public\b|override\b|suspend\b|"
+    r"companion\b|object\b|class\b|data\b|/\*\*)")
+
+
+def fn_text(src, header):
+    """Declaration text for EITHER body shape — `{ … }` or `= expression`.
+
+    [function_text] only understands brace bodies; `resolveProviderName` is an
+    expression-bodied one-liner (`… = providerName ?: if (…) "Custom" else
+    "OpenAI"`), so scanning for `{` grabs the *next* function's braces. Here
+    the scan is parenthesis-aware: a `{` at paren depth 0 opens a brace body,
+    a newline at depth 0 followed by a new declaration / `}` / KDoc ends an
+    expression body.
+    """
+    i = src.find(header)
+    if i < 0:
+        return None
+    n = len(src)
+    depth = 0
+    j = i
+    while j < n:
+        c = src[j]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif c == "{":
+            end = _balanced(src, j, "{", "}")
+            return src[i:end] if end > 0 else None
+        elif c == "\n" and depth == 0:
+            k = j + 1
+            while k < n and src[k] in " \t":
+                k += 1
+            if k >= n or src[k] == "}" or _DECL_OR_DOC.match(src, k):
+                return src[i:j]
+        j += 1
+    return src[i:]
 
 
 def map_literal_text(src):
@@ -158,8 +213,189 @@ def check_arm2(src, rel):
     return out
 
 
+def object_blocks(src):
+    """[(name, body_offset, body_text)] for `object <Name> : <Iface> { ... }`.
+
+    Body text is a slice of [src] starting at the object header's end, so a
+    match offset inside a body maps back to the file with `body_offset + off`.
+    """
+    out = []
+    for m in re.finditer(r"\bobject\s+(\w+)\s*:\s*[\w.]+", src):
+        brace = src.find("{", m.end())
+        if brace < 0:
+            continue
+        end = _balanced(src, brace, "{", "}")
+        if end < 0:
+            continue
+        out.append((m.group(1), m.end(), src[m.end():end]))
+    return out
+
+
+def registrations(src):
+    """object name -> ProviderType constant, from the registry wiring lines."""
+    return {m.group(2): m.group(1)
+            for m in re.finditer(
+                r"register\(\s*ProviderType\.(\w+)\s*,\s*(\w+)\s*\)", src)}
+
+
+def openai_call_sites(block):
+    """[(start, end, args)] for OpenAIModelsApi.fetchModels(...) in [block].
+    None => at least one call's argument list is unbalanced (gate ROT)."""
+    out = []
+    for m in re.finditer(r"OpenAIModelsApi\.fetchModels\s*\(", block):
+        end = _balanced(block, m.end() - 1)
+        if end < 0:
+            return None
+        out.append((m.start(), end, block[m.end():end - 1]))
+    return out
+
+
+def adapter_delivers_name(block, call):
+    """Does this call site say which family the rows belong to?
+
+    Two shapes are accepted, so the gate pins the DECISION and not a spelling
+    (same spirit as dv15-A2 accepting both `isSymbolicLink` and a NOFOLLOW
+    open):
+
+      a) a `providerName = <expr>` argument whose value is not the literal
+         `null` (the fetcher takes it), or
+      b) a post-fetch relabel — the call chained into a `.map { }` /
+         `.mapNotNull { }` that assigns `provider = …` — which is
+         behaviourally equivalent and must not be forced into shape (a).
+    """
+    _start, end, args = call
+    m = re.search(r"\bproviderName\s*=\s*([A-Za-z_][\w.]*)", args)
+    # `providerName = null` is the defect spelled politely — it re-declares
+    # the default and hides it from the reader. The value must name something.
+    if m and m.group(1) != "null":
+        return True
+    tail = block[end:]
+    m = re.match(r"\s*\.(map|mapIndexed|mapNotNull)\s*\{", tail)
+    if not m:
+        return False
+    brace = end + m.end() - 1
+    b_end = _balanced(block, brace, "{", "}")
+    if b_end < 0:
+        return False
+    return re.search(r"\bprovider\s*=", block[brace:b_end]) is not None
+
+
+def check_arm3(src, rel):
+    """A vendor adapter that reuses OpenAIModelsApi must name its family.
+
+    Only `ProviderType.openAI`'s own adapter is exempt: its rows are either
+    official OpenAI or an unknown third-party endpoint, and "Custom"/"OpenAI"
+    IS the honest label there. Every other family (Kimi Code) fetches from its
+    own vendor base URL, which the fetcher cannot recognise — let it fall
+    through to "Custom" and the rows stop resolving through
+    ModelsDevApi.providerKeyMap (deep-audit-1038 A-08 / the F-212 failure).
+    """
+    blocks = object_blocks(src)
+    if not blocks:
+        return [(rel, 0, "3",
+                 "no `object X : ModelListProvider` declaration found — gate ROT")]
+    regs = registrations(src)
+    if not regs:
+        return [(rel, 0, "3",
+                 "no `ModelListProviderRegistry.register(ProviderType.X, Y)` "
+                 "wiring found — gate ROT (family of an adapter is unknowable)")]
+    out = []
+    vendor_sites = 0
+    for name, off, body in blocks:
+        calls = openai_call_sites(body)
+        if calls is None:
+            out.append((rel, line_of(src, off), "3",
+                        "%s: OpenAIModelsApi.fetchModels(...) argument list "
+                        "unbalanced — gate ROT" % name))
+            continue
+        if not calls:
+            continue
+        if regs.get(name) == "openAI":
+            # Generic OpenAI-compatible adapter — Custom/OpenAI is its label.
+            continue
+        vendor_sites += len(calls)
+        for start, _end, _args in calls:
+            if adapter_delivers_name(body, (start, _end, _args)):
+                continue
+            out.append((rel, line_of(src, off + start), "3",
+                        "%s delegates to OpenAIModelsApi.fetchModels for its own "
+                        "vendor base URL but supplies no provider name — neither "
+                        "a `providerName = <expr>` argument nor a post-fetch "
+                        "`.map { … provider = … }` relabel. Every returned row is "
+                        "stamped \"Custom\", so ModelsDevApi enrichment can never "
+                        "hit providerKeyMap for it (dv18-A-08)" % name))
+    if vendor_sites == 0 and not out:
+        out.append((rel, 0, "3",
+                    "no non-openAI adapter delegating to OpenAIModelsApi detected "
+                    "— gate ROT (detection lost; this is exactly the shape that "
+                    "let the Kimi rows ship as \"Custom\")"))
+    return out
+
+
+def check_arm4(src, rel):
+    """The `provider` decision in OpenAIModelsApi: optional, single-homed, wired.
+
+    Three ways the A-08 fix can rot without any adapter changing:
+      4a the `providerName` parameter loses its `= null` default (unnamed
+         callers can no longer keep the legacy label — the regression guard
+         the fix ships with),
+      4b [resolveProviderName] loses the legacy half of its decision (the
+         "Custom" branch for unnamed third-party base URLs),
+      4c the row construction stops routing through [resolveProviderName]
+         (the parameter is accepted and then ignored),
+      4d the cache path stops re-labelling rows read back from the
+         48-hour cache (the parameter only reaches freshly parsed rows).
+    """
+    code = code_only(src)
+    out = []
+    head = code.find("suspend fun fetchModels(")
+    if head < 0:
+        return [(rel, 0, "4", "`suspend fun fetchModels(` not found — gate ROT")]
+    sig_end = _balanced(code, head + len("suspend fun fetchModels"))
+    if sig_end < 0:
+        return [(rel, 0, "4", "fetchModels signature unbalanced — gate ROT")]
+    sig = code[head:sig_end]
+    if not re.search(r"providerName\s*:\s*String\?\s*=\s*null", sig):
+        out.append((rel, 0, "4",
+                    "fetchModels no longer declares an optional nullable "
+                    "`providerName: String? = null` — adapters that do NOT name "
+                    "their family must keep the legacy Custom/OpenAI label "
+                    "(dv18-A-08 regression guard)"))
+    body = fn_text(code, "suspend fun fetchModels(")
+    if body is None:
+        out.append((rel, 0, "4", "fetchModels body unbalanced — gate ROT"))
+        return out
+    helper = fn_text(code, "fun resolveProviderName(")
+    if helper is None:
+        out.append((rel, 0, "4",
+                    "`fun resolveProviderName(...)` not found — the single "
+                    "decision point for the row's provider name is gone"))
+    else:
+        for token, why in (("isCustomBase", "the official/third-party input"),
+                           ("providerName", "the caller-supplied family name"),
+                           ('"Custom"', "the legacy third-party label"),
+                           ('"OpenAI"', "the legacy official label")):
+            if token not in helper:
+                out.append((rel, 0, "4",
+                            "resolveProviderName dropped %s (`%s`) — one of the two "
+                            "decisions cannot be made any more (dv18-A-08)"
+                            % (why, token)))
+    if "provider = resolveProviderName(" not in body:
+        out.append((rel, 0, "4",
+                    "the model row's `provider =` no longer calls "
+                    "resolveProviderName(...) — a named caller would be accepted "
+                    "and silently ignored, every row keeping the legacy label "
+                    "(dv18-A-08)"))
+    if "withProviderName(" not in body:
+        out.append((rel, 0, "4",
+                    "the cache return path no longer re-labels cached rows "
+                    "(`withProviderName(...)`) — for the 48-hour cache TTL a named "
+                    "caller still reads rows stamped \"Custom\" (dv18-A-08)"))
+    return out
+
+
 def run_checks(root, rels=None):
-    rels = rels or {"mc": MC_REL, "md": MD_REL}
+    rels = rels or {"mc": MC_REL, "md": MD_REL, "oa": OA_REL, "ad": AD_REL}
     srcs = {k: read(rel, root) for k, rel in rels.items()}
     missing = [(rel, 0, "?", "file not found — gate ROT")
                for k, rel in rels.items() if srcs[k] is None]
@@ -168,6 +404,8 @@ def run_checks(root, rels=None):
     checks = []
     checks += check_arm1(srcs["mc"], rels["mc"])
     checks += check_arm2(srcs["md"], rels["md"])
+    checks += check_arm3(srcs["ad"], rels["ad"])
+    checks += check_arm4(srcs["oa"], rels["oa"])
     return checks
 
 
@@ -261,6 +499,125 @@ FIX_MD_SHORTKEYS_DROPPED = """object ModelsDevApi {
 }
 """
 
+# ----------------------------------------------------------------------
+# Arm 3 / arm 4 fixtures (deep-audit-1038 A-08).
+# ----------------------------------------------------------------------
+AD_FIX_OK = """package probe
+
+import com.rikkaminis.app.provider.openai.OpenAIModelsApi
+
+private object OpenAIModelListAdapter : ModelListProvider {
+    override suspend fun fetchModels(apiKey: String?, instance: ProviderInstance): List<LLMModel> {
+        return OpenAIModelsApi.fetchModels(
+            apiKey,
+            instance.effectiveBaseURL,
+            context = context,
+            customUserAgent = instance.customUserAgent,
+            azureMode = instance.azureMode,
+        )
+    }
+}
+
+private object KimiModelListAdapter : ModelListProvider {
+    override suspend fun fetchModels(apiKey: String?, instance: ProviderInstance): List<LLMModel> {
+        return OpenAIModelsApi.fetchModels(
+            apiKey,
+            baseURL,
+            context = context,
+            customUserAgent = instance.customUserAgent,
+            azureMode = false,
+            providerName = ProviderType.kimiCode.displayName,
+        )
+    }
+}
+
+fun registerModelListProviders() {
+    ModelListProviderRegistry.register(ProviderType.openAI, OpenAIModelListAdapter)
+    ModelListProviderRegistry.register(ProviderType.kimiCode, KimiModelListAdapter)
+}
+"""
+
+# Vendor adapter silently reverts to the defect: no name anywhere.
+AD_NO_NAME = AD_FIX_OK.replace(
+    "            providerName = ProviderType.kimiCode.displayName,\n", "")
+
+# Accepted alternative shape: post-fetch relabel instead of the argument.
+AD_POSTMAP = AD_NO_NAME.replace(
+    "        return OpenAIModelsApi.fetchModels(\n"
+    "            apiKey,\n"
+    "            baseURL,\n"
+    "            context = context,\n"
+    "            customUserAgent = instance.customUserAgent,\n"
+    "            azureMode = false,\n"
+    "        )",
+    "        return OpenAIModelsApi.fetchModels(\n"
+    "            apiKey,\n"
+    "            baseURL,\n"
+    "            context = context,\n"
+    "            customUserAgent = instance.customUserAgent,\n"
+    "            azureMode = false,\n"
+    "        ).map { it.copy(provider = ProviderType.kimiCode.displayName) }")
+
+# Explicit `null` is the same defect spelled politely.
+AD_NULL_NAME = AD_FIX_OK.replace(
+    "providerName = ProviderType.kimiCode.displayName",
+    "providerName = null")
+
+# ROT: only the generic adapter remains — detection is gone.
+AD_NO_VENDOR = AD_FIX_OK.split("private object KimiModelListAdapter")[0] + """fun registerModelListProviders() {
+    ModelListProviderRegistry.register(ProviderType.openAI, OpenAIModelListAdapter)
+}
+"""
+
+OA_FIX_OK = """package probe
+
+object OpenAIModelsApi {
+    suspend fun fetchModels(
+        apiKey: String,
+        baseURL: String? = null,
+        azureMode: Boolean = false,
+        providerName: String? = null,
+    ): List<LLMModel> {
+        val isCustomBase = baseURL != null && !isOfficialOpenAI(baseURL)
+        if (shouldConsultCache()) {
+            cache.load(cacheKey)?.let {
+                return ModelsDevApi.applyGatewayEffortTruth(
+                    it.withProviderName(isCustomBase, providerName), baseURL
+                )
+            }
+        }
+        return listOf(
+            LLMModel(
+                id = id,
+                provider = resolveProviderName(isCustomBase, providerName),
+            )
+        )
+    }
+
+    internal fun resolveProviderName(isCustomBase: Boolean, providerName: String?): String =
+        providerName ?: if (isCustomBase) "Custom" else "OpenAI"
+}
+"""
+
+# 4a: the parameter lost its nullable default.
+OA_NO_DEFAULT = OA_FIX_OK.replace(
+    "providerName: String? = null,", "providerName: String?,")
+
+# 4b: the legacy half of the decision is gone.
+OA_DECISION_BROKEN = OA_FIX_OK.replace(
+    'providerName ?: if (isCustomBase) "Custom" else "OpenAI"',
+    'providerName ?: "OpenAI"')
+
+# 4c: parameter accepted, then ignored at the row construction.
+OA_WIRING_DROPPED = OA_FIX_OK.replace(
+    "provider = resolveProviderName(isCustomBase, providerName),",
+    'provider = if (isCustomBase) "Custom" else "OpenAI",')
+
+# 4d: the cache path stops re-labelling cached rows.
+OA_CACHE_DROPPED = OA_FIX_OK.replace(
+    "it.withProviderName(isCustomBase, providerName), baseURL",
+    "it, baseURL")
+
 
 def _report(checks, fixture_name, label):
     if not checks:
@@ -271,10 +628,20 @@ def _report(checks, fixture_name, label):
     return False
 
 
+def _expect_count(fixture_name, checks, expect, label):
+    """Fail-closed fixture assert: exactly `expect` findings, each named."""
+    if len(checks) != expect:
+        print("  [FAIL] %s: expected %d finding(s), got %d — %s"
+              % (fixture_name, expect, len(checks), [c[3] for c in checks]))
+        return False
+    print("  [OK]   %s (%s)" % (fixture_name, label))
+    return True
+
+
 def selftest():
     ok = True
     with tempfile.TemporaryDirectory() as tmp:
-        rels = {"mc": "mc.kt", "md": "md.kt"}
+        rels = {"mc": "mc.kt", "md": "md.kt", "oa": "oa.kt", "ad": "ad.kt"}
 
         def write(name, text):
             with open(os.path.join(tmp, rels[name]), "w", encoding="utf-8") as f:
@@ -283,6 +650,8 @@ def selftest():
         # 1. Fixed shape: clean.
         write("mc", FIX_MC_OK)
         write("md", FIX_MD_OK)
+        write("oa", OA_FIX_OK)
+        write("ad", AD_FIX_OK)
         ok &= _report(run_checks(tmp, rels), "fixed", "all arms clean")
 
         # 2. Pre-fix shape: arm1 (UUID + no trim) and arm2 (no new keys).
@@ -338,6 +707,40 @@ def selftest():
             else:
                 print("  [OK]   ROT control: missing files reported (%d findings)" % len(rot))
 
+        # ---- Arm 3: vendor adapters must name the family they fetch for ----
+
+        def arm3_of(fixture_name, fixture, expect, label):
+            write("ad", fixture)
+            checks = [c for c in run_checks(tmp, rels) if c[2] == "3"]
+            write("ad", AD_FIX_OK)
+            return _expect_count("arm 3 " + fixture_name, checks, expect, label)
+
+        ok &= arm3_of("no-name", AD_NO_NAME, 1,
+                      "vendor adapter without a provider name trips exactly one")
+        ok &= arm3_of("null-name", AD_NULL_NAME, 1,
+                      "`providerName = null` is the same defect")
+        ok &= arm3_of("post-map", AD_POSTMAP, 0,
+                      "post-fetch relabel accepted (decision, not spelling)")
+        ok &= arm3_of("no-vendor", AD_NO_VENDOR, 1,
+                      "generic-only adapter set still reds (detection lost = ROT)")
+
+        # ---- Arm 4: the naming decision inside OpenAIModelsApi ----
+
+        def arm4_of(fixture_name, fixture, label):
+            write("oa", fixture)
+            checks = [c for c in run_checks(tmp, rels) if c[2] == "4"]
+            write("oa", OA_FIX_OK)
+            return _expect_count("arm 4 " + fixture_name, checks, 1, label)
+
+        ok &= arm4_of("no-default", OA_NO_DEFAULT,
+                      "losing the `= null` default reds (legacy callers would break)")
+        ok &= arm4_of("decision-broken", OA_DECISION_BROKEN,
+                      "dropping the legacy \"Custom\" branch reds")
+        ok &= arm4_of("wiring-dropped", OA_WIRING_DROPPED,
+                      "accepting providerName and ignoring it reds")
+        ok &= arm4_of("cache-dropped", OA_CACHE_DROPPED,
+                      "no longer re-labelling cached rows reds")
+
     print("MODELS_PROVIDER_FIELD_SELFTEST=%s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 
@@ -362,7 +765,7 @@ def main():
 
     checks = run_checks(root)
     if not checks:
-        print("models_provider_field_check: OK (2 arms clean)")
+        print("models_provider_field_check: OK (4 arms clean)")
         return 0
     for rel, line, arm, msg in checks:
         print("%s:%s [arm %s] %s" % (rel, line, arm, msg))
