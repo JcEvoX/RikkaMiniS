@@ -106,7 +106,12 @@ fun BrowserSheet(
     val isLoading = selectedTab?.manager?.isLoading?.collectAsState()?.value ?: false
     val canGoBack = selectedTab?.manager?.canGoBack?.collectAsState()?.value ?: false
     val canGoForward = selectedTab?.manager?.canGoForward?.collectAsState()?.value ?: false
-    val isAgentBusy = tabPool.isAgentBusy
+    // [da1040-B2] Subscribe instead of reading the pool's busy flag once:
+    // busy flips mutate Tab.inUse in place, so `tabs` never re-emits and a
+    // plain getter read here froze every busy affordance for the whole
+    // composition (buttons stayed disabled after the agent finished, or
+    // stayed enabled while it worked).
+    val isAgentBusy by tabPool.agentBusy.collectAsState()
     val userAgentProfile = tabPool.currentUserAgentProfile.collectAsState().value
 
     var urlInput by remember(currentURL) { mutableStateOf(currentURL) }
