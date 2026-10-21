@@ -106,8 +106,27 @@ class SkillsMcpReloadOffMainTest {
         assertEquals(
             "initialContent re-derives on skill.updatedAt; editContent must move with it or " +
                 "an out-of-band edit leaves the editor on the pre-edit snapshot",
-            setOf("skillId", "relativePath", "skill.updatedAt"),
+            setOf("skillId", "relativePath", "skill.updatedAt", "loadedDiskBase"),
             rememberKeys(codeOnly(skillsScreen), "var editContent by remember"),
+        )
+    }
+
+    @Test
+    fun `editContent keys the same sources as the content it seeds from`() {
+        // [dv17-4] deep-audit-1038 B-04. `initialContent` derives from BOTH
+        // skill.updatedAt and the async sibling-file read (loadedDiskBase); the
+        // editor draft was keyed on the first only, so an out-of-band edit that
+        // landed while the editor was open left the draft frozen on the
+        // pre-read snapshot and Save wrote it back over the external write.
+        // Pinning the equality (not just the presence of one key) keeps the two
+        // sets from drifting apart again — the failure mode is always "one
+        // remember grew a key and the sibling didn't".
+        val code = codeOnly(skillsScreen)
+        assertEquals(
+            "the editor draft must seed from the same key set as the content it copies " +
+                "(a key added to one remember and not the other is exactly B-04)",
+            rememberKeys(code, "val initialContent = remember"),
+            rememberKeys(code, "var editContent by remember"),
         )
     }
 
