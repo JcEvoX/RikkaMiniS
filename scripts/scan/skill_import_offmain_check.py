@@ -176,8 +176,8 @@ def inside_io_wrap(text_nc, text_masked):
     return False, "call site is not lexically inside %s { ... }" % OPENER
 
 
-def _io_wrapped_at(text_nc, text_masked, idx):
-    """True when code position `idx` sits inside an OPENER { ... } block.
+def _io_wrapped_at(text_nc, text_masked, idx, openers=(OPENER,)):
+    """True when code position `idx` sits inside an opener-established block.
 
     Brace-depth stack over the masked text; each open brace remembers the
     code text immediately preceding it (same trick as inside_io_wrap).
@@ -187,12 +187,60 @@ def _io_wrapped_at(text_nc, text_masked, idx):
         if ch == "{":
             head = text_nc[:i].rstrip()
             head = head[:-1].rstrip() if head.endswith("{") else head
-            tail = head[-len(OPENER):] if len(head) >= len(OPENER) else ""
-            stack.append(tail == OPENER)
+            stack.append(any(head.endswith(o) for o in openers))
         elif ch == "}":
             if stack:
                 stack.pop()
     return any(stack)
+
+
+IO_OPENERS = (OPENER, "launch(Dispatchers.IO)")
+
+REPO_CALL_RE = re.compile(r"skillRepository\.([A-Za-z_]\w*)\s*\(")
+
+def check_all_repo_calls(files):
+    """arm6 [deep-audit-1039 B-05]: EVERY repository call in the Skills screen
+    runs OFF Main.
+
+    The file had four bare sites (delete from the list confirm, listSkillFiles
+    inside a composition-phase remember, delete + update on the detail screen)
+    while thirteen siblings were wrapped — the same defect class graded one
+    call site at a time, which is how the four were missed. The criterion is
+    the DECISION POINT (the dispatcher the call runs on): a site passes when it
+    is lexically inside `withContext(Dispatchers.IO)` / `launch(Dispatchers.IO)`
+    or when the repository method itself wraps internally (arm 3/4's
+    alternative). Fail-closed when the file has no repository call at all —
+    that means the anchor lost its subject rather than "nothing to judge".
+
+    `skillRepository.skills` (the StateFlow property) is not a call and is
+    excluded by construction: the pattern requires `(` right after the name.
+    """
+    text = files.get(SM_REL)
+    if text is None:
+        return ["missing file %s" % SM_REL]
+    nc = strip_comments(text)
+    masked = mask_strings(nc)
+    repo_text = files.get(SKILL_REPO_REL)
+    hits = list(REPO_CALL_RE.finditer(nc))
+    if not hits:
+        return ["%s: no `skillRepository.<method>(` call site found — the arm6 "
+                "anchor lost its subject (fail-closed)" % SM_REL]
+    failures = []
+    for m in hits:
+        method = m.group(1)
+        line = nc[:m.start()].count("\n") + 1
+        if _io_wrapped_at(nc, masked, m.start(), IO_OPENERS):
+            continue
+        alt = False
+        if repo_text is not None:
+            alt, _ = repo_method_wraps_io(repo_text, method)
+        if not alt:
+            failures.append(
+                "%s: bare (Main-thread) `skillRepository.%s(` at line %d — wrap it "
+                "in withContext(Dispatchers.IO), or move the IO into the repository "
+                "method (the criterion is the dispatcher the call runs on, not the "
+                "spelling)" % (SM_REL, method, line))
+    return failures
 
 
 def all_calls_offline(text_nc, text_masked, call):
@@ -236,8 +284,10 @@ def repo_method_wraps_io(text, name, hops=1):
     """True when `fun <name>(...)` wraps its work inside OPENER.
 
     Handles a block body (brace-matched, comments stripped, strings masked)
-    and ONE expression-body delegation hop (`fun reloadFromDisk() = load()`).
-    Not a call-graph fixpoint — fail-closed when the chain does not resolve.
+    and an expression body — either the wrap itself (`fun f(): X =
+    withContext(Dispatchers.IO) { ... }`, the shape every `suspend fun` in
+    SkillRepository uses) or ONE delegation hop (`fun f() = load()`). Not a
+    call-graph fixpoint — fail-closed when the chain does not resolve.
     """
     nc = strip_comments(text)
     masked = mask_strings(nc)
@@ -252,29 +302,44 @@ def repo_method_wraps_io(text, name, hops=1):
         elif masked[i] == ")":
             depth -= 1
         i += 1
-    j = i
-    while j < len(masked) and masked[j] in " \t\r\n":
-        j += 1
-    if j < len(masked) and masked[j] == "{":
-        body = nc[j:_match_brace(masked, j)]
-        if OPENER in body:
+    # The body starts at the first `{` after the parameter list; an `=`
+    # before it (and not inside the params) means an expression body. The
+    # return-type annotation `: Foo` sits between the two and is skipped by
+    # searching rather than by consuming it.
+    body_open = masked.find("{", i)
+    assign = -1
+    stop = body_open if body_open >= 0 else len(masked)
+    k = i
+    while k < stop:
+        if masked[k] == "=" and masked[k - 1:k] not in ("=", "!", "<", ">") \
+                and masked[k + 1:k + 2] != "=":
+            assign = k
+            break
+        if masked[k] == "\n":
+            break
+        k += 1
+    if assign >= 0:
+        line = nc[assign:].split("\n", 1)[0]
+        if OPENER in line:
             return True, ""
-        if hops > 0:
-            callees = re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(", body)
-            for callee in callees:
-                if callee == name:
-                    continue
-                ok, _ = repo_method_wraps_io(text, callee, hops - 1)
-                if ok:
-                    return True, ""
-        return False, "`%s` body is not inside %s" % (name, OPENER)
-    if j < len(masked) and masked[j] == "=" and masked[j + 1:j + 2] != "=":
-        line = nc[j:].split("\n", 1)[0]
         call = re.search(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(", line)
         if call and hops > 0:
             return repo_method_wraps_io(text, call.group(1), hops - 1)
         return False, "`%s` expression body is not inside %s" % (name, OPENER)
-    return False, "`%s`: body form not recognised" % name
+    if body_open < 0:
+        return False, "`%s`: body form not recognised" % name
+    body = nc[body_open:_match_brace(masked, body_open)]
+    if OPENER in body:
+        return True, ""
+    if hops > 0:
+        callees = re.findall(r"([A-Za-z_][A-Za-z0-9_]*)\s*\(", body)
+        for callee in callees:
+            if callee == name:
+                continue
+            ok, _ = repo_method_wraps_io(text, callee, hops - 1)
+            if ok:
+                return True, ""
+    return False, "`%s` body is not inside %s" % (name, OPENER)
 
 
 def check_paste(text):
@@ -412,6 +477,7 @@ def run_checks_map(files):
     else:
         failures.extend(check_paste(sm))
     failures.extend(check_reload(files))
+    failures.extend(check_all_repo_calls(files))
     failures.extend(check_editor_keys(files))
     failures.extend(check_editor_key_alignment(files))
     return failures
@@ -580,6 +646,60 @@ def _files(sm=None, mcp=None, skill_repo=None, mcp_repo=None):
         MCP_REPO_REL: MCP_REPO_BARE if mcp_repo is None else mcp_repo,
     }
 
+# ── arm6 [deep-audit-1039 B-05] fixtures ─────────────────────────────────
+# Extra call sites appended to the task body (inside the function, before the
+# closing brace), so arms 1-5 stay in their clean shape while arm6 sees them.
+REPO_WRAPS_LIST = '''package com.rikkaminis.app.data.repository
+
+fun listSkillFiles(skillId: String): List<String> {
+    withContext(Dispatchers.IO) {
+        File(skillsDir, skillId).walkTopDown().toList()
+    }
+    return emptyList()
+}
+'''
+
+EXTRA_WRAPPED = (
+    "    scope.launch {\n"
+    "        withContext(Dispatchers.IO) { skillRepository.delete(\"a\") }\n"
+    "    }\n"
+    "    scope.launch {\n"
+    "        withContext(Dispatchers.IO) { skillRepository.listSkillFiles(\"a\") }\n"
+    "    }\n"
+    "    val enabled = skillRepository.skills\n"
+)
+EXTRA_BARE_DELETE = "    skillRepository.delete(\"a\")\n"
+EXTRA_BARE_SETENABLED = "    skillRepository.setEnabled(\"a\", true)\n"
+EXTRA_BARE_LIST = "    val files = skillRepository.listSkillFiles(\"a\")\n"
+EXTRA_LAUNCH_DISPATCHER = (
+    "    scope.launch(Dispatchers.IO) { skillRepository.delete(\"a\") }\n"
+)
+EXTRA_FLOW_ONLY = "    val enabled = skillRepository.skills\n"
+
+ARM6_FIXTURES = [
+    # (label, files, expect_red, needle)
+    ("arm6 clean: extra call sites wrapped",
+     _files(sm=_sm_text(extra=EXTRA_WRAPPED)), False, None),
+    ("arm6 bare delete on Main",
+     _files(sm=_sm_text(extra=EXTRA_BARE_DELETE)), True,
+     "bare (Main-thread) `skillRepository.delete(` at line"),
+    ("arm6 bare setEnabled on Main",
+     _files(sm=_sm_text(extra=EXTRA_BARE_SETENABLED)), True,
+     "bare (Main-thread) `skillRepository.setEnabled(` at line"),
+    ("arm6 bare call whose repo method wraps internally",
+     _files(sm=_sm_text(extra=EXTRA_BARE_LIST), skill_repo=REPO_WRAPS_LIST), False, None),
+    ("arm6 precision: launch(Dispatchers.IO) is off Main too",
+     _files(sm=_sm_text(extra=EXTRA_LAUNCH_DISPATCHER)), False, None),
+    ("arm6 precision: the StateFlow property is not a call site",
+     _files(sm=_sm_text(extra=EXTRA_FLOW_ONLY)), False, None),
+]
+
+def _arm6_fail_closed() -> list:
+    """A screen with no repository CALL at all must be red (fail-closed)."""
+    only_flow = ("package com.rikkaminis.app.ui.settings\n\n"
+                 "fun sample() {\n" + EXTRA_FLOW_ONLY + "}\n")
+    return check_all_repo_calls({SM_REL: only_flow})
+
 
 ISSUE06_FIXTURES = [
     # (label, files, expect_red, needle)
@@ -646,6 +766,25 @@ def selftest():
             "" if good else "  UNEXPECTED %s" % f[:2]))
         ok &= good
 
+    for label, files, expect_red, needle in ARM6_FIXTURES:
+        f = run_checks_map(files)
+        red = len(f) > 0
+        good = (red == expect_red)
+        if good and expect_red and needle:
+            good = any(needle in x for x in f)
+        print("selftest 1039-B05 %-46s: %s%s" % (
+            label, "RED" if red else "CLEAN",
+            "" if good else "  UNEXPECTED %s" % f[:2]))
+        ok &= good
+
+    f = _arm6_fail_closed()
+    red = len(f) > 0
+    good = red and "no `skillRepository.<method>(` call site found" in f[0]
+    print("selftest 1039-B05 %-46s: %s%s" % (
+        "fail-closed when no repository call exists", "RED" if red else "CLEAN",
+        "" if good else "  UNEXPECTED %s" % f[:2]))
+    ok &= good
+
     print(SELFTEST_MARK if ok else "SKILL_IMPORT_OFFMAIN_SELFTEST=FAIL")
     return 0 if ok else 1
 
@@ -667,7 +806,8 @@ def main():
         for f in failures:
             print("  - %s" % f)
         sys.exit(1)
-    print("OK %s (8 arms: paste x2, reload-off-main x2, editor-keys x3, editor-key-alignment x1)" % SM_REL)
+    print("OK %s (10 arms: paste x2, reload-off-main x2, all-repo-calls-off-main x1, "
+          "editor-keys x3, editor-key-alignment x1, arm6 fixture gate)" % SM_REL)
     sys.exit(0)
 
 
