@@ -432,6 +432,37 @@ fun MinisFullscreenVideoPlayer(
     file: File,
     onDismiss: () -> Unit,
 ) {
+    val hostView = LocalView.current
+    // [dv17-b08-host-window-bars] The Dialog below owns its own window, but
+    // while it covers the screen the HOST activity window still owns the
+    // system-bar visibility/appearance the system falls back to (the inner
+    // effect in FullscreenVideoContent only ever sees the Dialog's window via
+    // findDialogWindow). Same save-hide-restore pair as the three sibling
+    // components that got this right — ImageGalleryViewer, the WebPreview
+    // fullscreen screen and the WebPreview sheet — so a swipe-revealed
+    // transient bar paints over our black background instead of the host's
+    // default chrome, and the host is handed back exactly as we found it.
+    DisposableEffect(hostView) {
+        val window = (hostView.context as? android.app.Activity)?.window
+        if (window == null) {
+            onDispose { }
+        } else {
+            val controller = androidx.core.view.WindowInsetsControllerCompat(window, hostView)
+            val previousLightStatusBars = controller.isAppearanceLightStatusBars
+            val previousLightNavigationBars = controller.isAppearanceLightNavigationBars
+            // Dark-background immersive: white icons if the bars ever peek in.
+            controller.isAppearanceLightStatusBars = false
+            controller.isAppearanceLightNavigationBars = false
+            controller.systemBarsBehavior =
+                androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            controller.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+            onDispose {
+                controller.show(androidx.core.view.WindowInsetsCompat.Type.systemBars())
+                controller.isAppearanceLightStatusBars = previousLightStatusBars
+                controller.isAppearanceLightNavigationBars = previousLightNavigationBars
+            }
+        }
+    }
     Dialog(
         onDismissRequest = onDismiss,
         properties = DialogProperties(
@@ -478,6 +509,13 @@ private fun FullscreenVideoContent(file: File, onDismiss: () -> Unit) {
                     android.view.WindowManager.LayoutParams.MATCH_PARENT,
                 )
                 window.setBackgroundDrawable(android.graphics.drawable.ColorDrawable(android.graphics.Color.BLACK))
+                // [dv17-b08-dialog-flags] Tell the system THIS window paints
+                // the system-bar backgrounds itself. Without the flag Android
+                // ignores statusBarColor/navigationBarColor below and fills the
+                // swipe-revealed bar region with its own opaque default — a
+                // grey band under the status bar (same contract as
+                // WebPreviewFullscreenScreen.kt / ImageGalleryViewer.kt).
+                window.addFlags(android.view.WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS)
                 window.statusBarColor = android.graphics.Color.TRANSPARENT
                 window.navigationBarColor = android.graphics.Color.TRANSPARENT
             } catch (_: Throwable) {}
