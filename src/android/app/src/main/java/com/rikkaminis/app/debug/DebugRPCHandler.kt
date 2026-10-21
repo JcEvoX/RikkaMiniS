@@ -1074,6 +1074,12 @@ class DebugRPCHandler(private val context: Context) {
      * Params (one of):
      *   - {"args": ["exec", "id"]}            — argv past `android-shizuku-cli`
      *   - {"command": "exec id"}              — single string, whitespace-split
+     *
+     * [dv18-A05] Deliberately session-less: this drives a device-level
+     * privileged shell where the guest cwd has no meaning, so it keeps
+     * `cwd = "/"` / `sessionId = null` even though [handleModelUseExec] and
+     * [handleSessionsExec] take the caller's scope. Revisit if a caller ever
+     * needs the privileged shell scoped to a chat session.
      */
     private fun handleShizukuExec(params: JSONObject): JSONObject {
         val argvTail: List<String> = when {
@@ -1125,6 +1131,13 @@ class DebugRPCHandler(private val context: Context) {
             else -> throw RPCException(-32602, "Missing 'args' (array) or 'command' (string)")
         }
 
+        // [dv18-A05] The caller's session scope. `minis-debug model-use` runs
+        // through the offload handler, which forwards the shell's cwd and chat
+        // session id; an external JSON-RPC client may send them directly.
+        // Absent ⇒ the pre-fix behaviour (no session, guest root as cwd), so a
+        // relative `--input notes.txt` used to be resolved against "/".
+        val scope = execScopeOf(params.optString("sessionId", ""), params.optString("cwd", ""))
+
         // Optional `input` blob: write to host /tmp and inject `--input <linuxPath>`
         // so the handler reads it via readLinuxPath() exactly like a real shell
         // invocation would. We resolve the host path via PRootKernel to honour
@@ -1152,8 +1165,8 @@ class DebugRPCHandler(private val context: Context) {
                 pid = -1,
                 argv = listOf("minis-model-use") + finalArgv,
                 env = emptyMap(),
-                cwd = "/",
-                sessionId = null,
+                cwd = scope.cwd,
+                sessionId = scope.sessionId,
             )
             val result = handler.handle(request)
             return JSONObject().apply {
@@ -1186,6 +1199,12 @@ class DebugRPCHandler(private val context: Context) {
             else -> throw RPCException(-32602, "Missing 'args' (array) or 'command' (string)")
         }
 
+        // [dv18-A05] Same session scope contract as [handleModelUseExec]: the
+        // sessions CLI is session-aware (it lists/searches/reads chat
+        // transcripts), so a caller that names a session must reach the
+        // handler instead of the historical session-less "global" arm.
+        val scope = execScopeOf(params.optString("sessionId", ""), params.optString("cwd", ""))
+
         AppLogger.info("DebugRPC", "debug.sessions.exec argv=${argvTail.joinToString(" ")}")
         val app = context.applicationContext as com.rikkaminis.app.MinisApp
         val handler = com.rikkaminis.app.sandbox.offload.SessionsOffloadHandler(app.chatRepository, context)
@@ -1193,8 +1212,8 @@ class DebugRPCHandler(private val context: Context) {
             pid = -1,
             argv = listOf("minis-sessions-cli") + argvTail,
             env = emptyMap(),
-            cwd = "/",
-            sessionId = null,
+            cwd = scope.cwd,
+            sessionId = scope.sessionId,
         )
         val result = handler.handle(request)
         return JSONObject().apply {
@@ -1300,3 +1319,40 @@ internal fun readFileSegment(file: File, offset: Long, limit: Int): ByteArray {
         return if (read == out.size) out else out.copyOf(read)
     }
 }
+
+
+/**
+ * [dv18-A05] The session scope a `debug.*.exec` entry point runs its offload
+ * handler under.
+ *
+ * [sessionId] is null for every caller that does not name a chat session — the
+ * historical behaviour (interactive terminals, and clients predating this key)
+ * where the handler's global resolver runs. [cwd] is the guest working
+ * directory a relative operand is joined onto (see
+ * [com.rikkaminis.app.sandbox.offload.resolveMaybeRelative]) and defaults to
+ * the guest root, which is what the exec entry points hardcoded before this
+ * fix — `debug.modelUse.exec` with `--input notes.txt` therefore resolved a
+ * path like `notes.txt` against "/" instead of the caller's directory.
+ */
+internal data class ExecScope(val sessionId: String?, val cwd: String) {
+    companion object {
+        /** The guest root — the pre-fix, session-less default. */
+        const val DEFAULT_CWD = "/"
+    }
+}
+
+/**
+ * [dv18-A05] Pure params → [ExecScope] mapping, shared by every exec entry
+ * point that builds an offload request. Absent/blank values fall back to the
+ * pre-fix behaviour instead of being invented: a blank session id stays null
+ * (the handler's global arm), a blank cwd keeps [ExecScope.DEFAULT_CWD].
+ *
+ * The cwd itself is passed through verbatim: the single relative-path join
+ * ([com.rikkaminis.app.sandbox.offload.resolveMaybeRelative]) is the one place
+ * that decides whether a cwd is usable — it only joins onto an absolute one —
+ * so a second validity rule here would be a second source of truth.
+ */
+internal fun execScopeOf(sessionIdRaw: String?, cwdRaw: String?): ExecScope = ExecScope(
+    sessionId = sessionIdRaw?.trim()?.takeIf { it.isNotEmpty() },
+    cwd = cwdRaw?.trim()?.takeIf { it.isNotEmpty() } ?: ExecScope.DEFAULT_CWD,
+)
