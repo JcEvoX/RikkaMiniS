@@ -288,6 +288,85 @@ def extract_effect_block(code: str, marker: str) -> "tuple[str, str] | None":
     return None
 
 
+RE_START_DEST = re.compile(r"\bval\s+startDestination\s*=")
+RE_REMEMBER_CALL = re.compile(r"remember\s*\(([^)]*)\)\s*\{")
+RE_IDENT = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def _match_brace(code: str, open_idx: int) -> "int | None":
+    """Index of the `}` closing the `{` at [open_idx] (string-literal aware)."""
+    if open_idx < 0 or open_idx >= len(code) or code[open_idx] != "{":
+        return None
+    depth = 0
+    i = open_idx
+    n = len(code)
+    while i < n:
+        c = code[i]
+        if c == '"' or c == "'":
+            i = _skip_string_literal(code, i)
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def _remember_derived_body(code: str, expr_start: int) -> "str | None":
+    """Braced body of the `remember(…) { … }` behind a binding's right-hand side.
+
+    Two legal shapes are accepted: the remember call written inline
+    (`val startDestination = remember(…) { … }`), or a name bound from one
+    (`val plan = remember(…) { … }` → `val startDestination = plan.field`).
+    `None` when neither resolves — callers must fail closed.
+    """
+    line_end = code.find("\n", expr_start)
+    raw = code[expr_start:] if line_end == -1 else code[expr_start:line_end]
+    rhs = raw.strip()
+    m = RE_REMEMBER_CALL.match(rhs)
+    if m:
+        brace = code.find("{", expr_start + (len(raw) - len(raw.lstrip())))
+        end = _match_brace(code, brace)
+        return None if end is None else code[brace:end + 1]
+    m2 = RE_IDENT.match(rhs)
+    if not m2:
+        return None
+    dm = re.search(
+        r"\bval\s+%s\s*=\s*remember\s*\([^)]*\)\s*\{" % re.escape(m2.group(1)), code
+    )
+    if not dm:
+        return None
+    end = _match_brace(code, dm.end() - 1)
+    return None if end is None else code[dm.end() - 1 : end + 1]
+
+
+def _holder_spans(code: str) -> "list[tuple[int, int]]":
+    """Spans of every `remember(…) { … }` / `LaunchedEffect(…) { … }` block.
+
+    Used to answer "does this call sit at the composition top level?" — the
+    one evaluation shape that is NOT single-shot.
+    """
+    spans = []
+    for anchor in ("remember(", "LaunchedEffect("):
+        idx = 0
+        while True:
+            i = code.find(anchor, idx)
+            if i == -1:
+                break
+            brace = code.find("{", i)
+            if brace == -1:
+                break
+            end = _match_brace(code, brace)
+            if end is None:
+                break
+            spans.append((i, end + 1))
+            idx = end + 1
+    return spans
+
+
 def check(root: Path) -> int:
     del errors[:]
     screen_path = root / REL_SCREEN
@@ -525,6 +604,78 @@ def check(root: Path) -> int:
                     "lands the user in a synthetic draft"
                 )
 
+    # --- 12. [deep-audit-1038 B-02] the cold-start route decision is
+    #     SINGLE-SHOT: it must be derived from a `remember(…)` block, never
+    #     evaluated bare at the composition top level. ---
+    # `AppNavigation` recomposes on theme / font-size / system dark-mode
+    # changes (it reads MaterialTheme.colorScheme.background for the NavHost
+    # transition surface), so a bare `val startDestination = when { … }`
+    # re-ran on every recomposition: the pending camera / HTML-preview action
+    # was replayed into a live ChatScreen (reactively consumed since
+    # da1028-C) and the draft id was re-minted once the slot was free —
+    # `startDestination` drift (NavGraph rebuild) plus saveText's slot guard
+    # silently dropping the draft text the user was typing.
+    #
+    # Criterion 9 covers the draft-id SINGLE SOURCE (which factory); this one
+    # covers its SINGLE EVALUATION POINT (once per cold start). Both legal
+    # shapes are accepted — the remember call written inline, or a val bound
+    # from a remember-derived plan — so the criterion binds the decision
+    # point, not one writing style. Fail-closed on a missing / duplicated
+    # `val startDestination =` anchor.
+    dest_hits = list(RE_START_DEST.finditer(nav))
+    if len(dest_hits) != 1:
+        errors.append(
+            "AppNavigation.kt: expected exactly 1 `val startDestination =` cold-start "
+            f"binding, found {len(dest_hits)} (renamed or restructured? re-anchor "
+            "criterion 12, do not drop it)"
+        )
+    else:
+        dest_body = _remember_derived_body(nav, dest_hits[0].end())
+        if dest_body is None:
+            errors.append(
+                "AppNavigation.kt: the cold-start `startDestination` is not derived from "
+                "a `remember(…)` block — a bare evaluation re-runs on every "
+                "recomposition, re-playing the pending camera / preview action into a "
+                "live ChatScreen and re-minting the draft id (`startDestination` drift; "
+                "the typed draft is dropped by saveText's slot guard). Wrap the decision "
+                "in `remember(initialDeepLink) { … }`."
+            )
+        else:
+            missing = []
+            if "nextDraftId" not in dest_body:
+                missing.append("draft-id resolution (`nextDraftId`)")
+            if "setPending" not in dest_body:
+                missing.append("pending-state seeding (`setPending…`)")
+            if missing:
+                errors.append(
+                    "AppNavigation.kt: the `remember(…)`-derived startDestination does "
+                    "not carry " + " / ".join(missing) + " — the cold-start decision "
+                    "moved out of the single-shot block (re-anchor criterion 12, do "
+                    "not drop it)"
+                )
+
+    # 12b — no pending seed may run bare at the composition top level either:
+    # a seed re-added outside the remember block has the same replay defect
+    # even while `startDestination` itself stays inside it.
+    holder_spans = _holder_spans(nav)
+    for call in (
+        "DeepLinkCoordinator.setPendingChatAction(",
+        "DeepLinkCoordinator.setPendingHtmlPreview(",
+    ):
+        start = 0
+        while True:
+            j = nav.find(call, start)
+            if j == -1:
+                break
+            if not any(s <= j < e for s, e in holder_spans):
+                errors.append(
+                    f"AppNavigation.kt: `{call[:-1]}…)` runs at the composition top "
+                    "level — the cold-start pending seed must sit inside the single-shot "
+                    "`remember(initialDeepLink)` block (or a keyed `LaunchedEffect`), "
+                    "otherwise every recomposition re-plays it into a live ChatScreen"
+                )
+            start = j + 1
+
     if errors:
         for e in errors:
             print(f"FAIL {e}")
@@ -594,6 +745,41 @@ FIXTURE_ACTIVITY_PRECISION = FIXTURE_ACTIVITY.replace(
     "        val sessionId = backStackEntry.arguments?.getString(\"sessionId\")\n"
     "    }\n\n"
     "    private fun handleDeepLink() {",
+)
+
+# [deep-audit-1038 B-02] criterion 12 fixtures: the cold-start route decision.
+# Shape A — the remember call assigned inline (the real-tree form).
+COLD_START_SHAPE_A = (
+    "val startDestination = remember(initialDeepLink) {\n"
+    "    coldStartStartDestination(\n"
+    "        initialDeepLink = initialDeepLink,\n"
+    "        nextDraftId = { com.rikkaminis.app.data.ComposerDraftStore.nextDraftId(context) },\n"
+    "        chatRoute = { Routes.chat(it) },\n"
+    "        seedCamera = {\n"
+    "            DeepLinkCoordinator.setPendingChatAction(\n"
+    "                DeepLinkCoordinator.ChatAction.OPEN_CAMERA,\n"
+    "            )\n"
+    "        },\n"
+    "        seedHtmlPreview = { sessionId, resourcePath, title ->\n"
+    "            DeepLinkCoordinator.setPendingHtmlPreview(sessionId, resourcePath, title)\n"
+    "        },\n"
+    "    )\n"
+    "}\n"
+)
+
+# Shape B — a plan bound from remember, then a field projection. Criterion 12
+# must accept it too (decision point, not one writing style).
+COLD_START_SHAPE_B = (
+    "val coldStartPlan = remember(initialDeepLink) {\n"
+    "    coldStartStartDestination(\n"
+    "        initialDeepLink = initialDeepLink,\n"
+    "        nextDraftId = { com.rikkaminis.app.data.ComposerDraftStore.nextDraftId(context) },\n"
+    "        chatRoute = { Routes.chat(it) },\n"
+    "        seedCamera = { DeepLinkCoordinator.setPendingChatAction(DeepLinkCoordinator.ChatAction.OPEN_CAMERA) },\n"
+    "        seedHtmlPreview = { s, p, t -> DeepLinkCoordinator.setPendingHtmlPreview(s, p, t) },\n"
+    "    )\n"
+    "}\n"
+    "val startDestination = coldStartPlan\n"
 )
 
 # Each mutation is (name, fixture-mutator) applied to the GREEN fixture set.
@@ -673,6 +859,22 @@ MUTATIONS = [
             "LaunchedEffect(sessionId, viewModel.currentSessionId, pendingHtmlPreviewState) {",
             "LaunchedEffect(sessionId, viewModel.currentSessionId) {"), nav, move),
     ),
+    (
+        # [deep-audit-1038 B-02] criterion 12: strip the remember wrapper —
+        # the cold-start decision evaluates bare at composition top level.
+        "MUT-22 cold-start startDestination back to a bare evaluation",
+        lambda screen, nav, move: (screen, nav.replace(
+            "val startDestination = remember(initialDeepLink) {",
+            "val startDestination = run {", 1), move),
+    ),
+    (
+        # [deep-audit-1038 B-02] criterion 12b: re-add a pending seed at the
+        # composition top level — same replay defect, different route in.
+        "MUT-23 a pending seed re-added at the composition top level",
+        lambda screen, nav, move: (screen, nav + (
+            "\nval replayedSeed = DeepLinkCoordinator.setPendingHtmlPreview(\"s\", \"/p\", \"t\")\n"),
+         move),
+    ),
 ]
 
 
@@ -729,7 +931,8 @@ def _green_fixtures() -> "tuple[str, str, str]":
         "        Routes.chatFiles(ChatViewModelStore.resolveSessionId(sessionId)),\n"
         "    )\n"
         "},\n"
-    )
+        # [deep-audit-1038 B-02] criterion 12: the single-shot cold-start block.
+    ) + COLD_START_SHAPE_A
     move = (
         "LaunchedEffect(currentSessionId) {\n"
         "    sessions = withContext(Dispatchers.IO) {\n"
@@ -886,6 +1089,26 @@ def selftest() -> int:
         failures.append("criterion 10 missing anchor: gate stayed GREEN (fail-closed violated)")
     else:
         print(f"selftest: criterion 10 missing anchor -> RED ({len(errs)} violation(s)) OK")
+
+    # --- criterion 12 [deep-audit-1038 B-02]: single-shot cold start --------
+    # Shape A is the GREEN fixture above (already exercised by every run above).
+    # Shape B (plan bound from remember, then a projection) must also pass —
+    # criterion 12 binds the decision point, not one writing style.
+    rc, errs = run_tree(
+        screen, nav.replace(COLD_START_SHAPE_A, COLD_START_SHAPE_B), move, FIXTURE_STORE)
+    if rc != 0:
+        failures.append(
+            f"criterion 12 shape B (remember-derived plan) unexpectedly red: {errs}")
+    else:
+        print("selftest: criterion 12 shape B (remember-derived plan) passes")
+
+    # fail-closed: a dropped `val startDestination =` anchor must NOT read green
+    rc, errs = run_tree(
+        screen, nav.replace("val startDestination =", "val dest ="), move, FIXTURE_STORE)
+    if rc == 0:
+        failures.append("criterion 12 missing anchor: gate stayed GREEN (fail-closed violated)")
+    else:
+        print(f"selftest: criterion 12 missing anchor -> RED ({len(errs)} violation(s)) OK")
 
     if failures:
         print("\nselftest FAILURES:")
