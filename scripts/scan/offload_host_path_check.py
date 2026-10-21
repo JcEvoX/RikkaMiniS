@@ -290,6 +290,119 @@ def scan_debug_session_path(root):
         )
     return problems
 
+# ── [dv18-A05] R6: the debug exec entry points must carry the caller's scope ─
+# `debug.modelUse.exec` / `debug.sessions.exec` rebuilt their offload request
+# with a hardcoded `cwd = "/"` and `sessionId = null`, and the forwarder in
+# DebugOffloadHandler handed the RPC only the bare argv. So
+# `minis-debug model-use run --input notes.txt` resolved the relative operand
+# against the guest root, and a caller that named a chat session still reached
+# the session-less "global" arm. Same session-scope family as R5, one layer
+# out: R5 covers the path resolver inside the handler, R6 covers the entry
+# point that decides what the handler is told.
+#
+# Bound to the DECISION, not to a spelling: every `handle*Exec` entry that
+# builds a request must take its scope from the shared parse (so a NEW entry is
+# covered the day it lands), the forwarded call must carry the scope, and the
+# carrier set is asserted as a set.
+DEBUG_EXEC_ENTRY_ANCHORS = ("handleShizukuExec", "handleModelUseExec", "handleSessionsExec")
+# A device-level privileged shell, where the guest cwd has no meaning: this
+# entry deliberately keeps its literal scope (registered negative decision —
+# see backlog §1038A-2 R2). Any other entry is held to the rule.
+DEBUG_EXEC_DEVICE_LEVEL = ("handleShizukuExec",)
+DEBUG_EXEC_SCOPE_CARRIERS = ["model-use", "modelUse"]
+DEBUG_EXEC_SCOPE_PARSE = "execScopeOf("
+DEBUG_EXEC_SCOPE_INJECT = "execScopeParams("
+DEBUG_EXEC_SCOPE_MIN_ENTRIES = 2
+
+
+def _read_code(path):
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        return strip_comments(fh.read())
+
+
+def scan_debug_exec_scope(root):
+    """R6 [dv18-A05]: the debug exec entry points must honour the caller's scope.
+
+    Fail-closed: a missing file, an entry anchor that can no longer be
+    delimited, a lost carrier declaration, or a tree where too few entries
+    build a request (the shape this criterion reads) are violations, not skips.
+    """
+    problems = []
+    rpc_path = os.path.join(root, DEBUG_RPC_REL)
+    if not os.path.isfile(rpc_path):
+        return ["%s: missing — cannot verify the exec entry-point scope" % DEBUG_RPC_REL]
+    rpc = _read_code(rpc_path)
+
+    entries = re.findall(r"\bfun\s+(handle\w+Exec)\s*\(", rpc)
+    for anchor in DEBUG_EXEC_ENTRY_ANCHORS:
+        if anchor not in entries:
+            problems.append(
+                "%s: `%s` is gone — fail-closed (the exec entry points were renamed or moved, so "
+                "the scope criteria below would silently check nothing)" % (DEBUG_RPC_REL, anchor)
+            )
+    checked = 0
+    for fn in entries:
+        if fn in DEBUG_EXEC_DEVICE_LEVEL:
+            continue
+        body = _fun_body(rpc, r"\bfun\s+%s\s*\(" % re.escape(fn))
+        if body is None or "NativeOffloadRequest(" not in body:
+            continue
+        checked += 1
+        if DEBUG_EXEC_SCOPE_PARSE not in body:
+            problems.append(
+                "%s: %s builds a NativeOffloadRequest without the shared scope parse (%s) — an exec "
+                "entry point that invents its own cwd/session cannot honour what the caller forwarded"
+                % (DEBUG_RPC_REL, fn, DEBUG_EXEC_SCOPE_PARSE.rstrip("("))
+            )
+        for pat, what in ((r'cwd\s*=\s*"/"', 'cwd = "/"'),
+                          (r"sessionId\s*=\s*null\b", "sessionId = null")):
+            if re.search(pat, body):
+                problems.append(
+                    "%s: %s still hardcodes %s — the forwarded session/cwd is dropped, so a relative "
+                    "operand resolves against the guest root and a named session falls back to the "
+                    "global arm" % (DEBUG_RPC_REL, fn, what)
+                )
+    if checked < DEBUG_EXEC_SCOPE_MIN_ENTRIES:
+        problems.append(
+            "%s: only %d exec entry point(s) build an offload request — fail-closed (expected >= %d; "
+            "a rewire into a helper would move the scope decision out of this criterion's reach)"
+            % (DEBUG_RPC_REL, checked, DEBUG_EXEC_SCOPE_MIN_ENTRIES)
+        )
+
+    offload_path = os.path.join(root, DEBUG_OFFLOAD_REL)
+    if not os.path.isfile(offload_path):
+        return problems + [
+            "%s: missing — cannot verify the session-scope forwarding" % DEBUG_OFFLOAD_REL
+        ]
+    offload = _read_code(offload_path)
+    handle = _fun_body(offload, r"\boverride\s+fun\s+handle\s*\(")
+    if handle is None:
+        problems.append(
+            "%s: `override fun handle` could not be delimited — fail-closed" % DEBUG_OFFLOAD_REL
+        )
+    elif DEBUG_EXEC_SCOPE_INJECT not in handle:
+        problems.append(
+            "%s: the forwarder no longer adds the caller's scope to a pass-through exec call (%s gone) "
+            "— the RPC side rebuilds the request without a session or cwd"
+            % (DEBUG_OFFLOAD_REL, DEBUG_EXEC_SCOPE_INJECT.rstrip("("))
+        )
+    m = re.search(r"internal\s+val\s+EXEC_SCOPE_SUBCOMMANDS\s*=\s*setOf\(([^)]*)\)", offload)
+    if m is None:
+        problems.append(
+            "%s: EXEC_SCOPE_SUBCOMMANDS is not declared as a set — fail-closed (the carrier decision "
+            "must stay declarative for this criterion to assert it)" % DEBUG_OFFLOAD_REL
+        )
+    else:
+        members = re.findall(r'"([^"]*)"', m.group(1))
+        if sorted(members) != sorted(DEBUG_EXEC_SCOPE_CARRIERS):
+            problems.append(
+                "%s: EXEC_SCOPE_SUBCOMMANDS = %s — the scope may only ride on %s (a raw `call` keeps its "
+                "params verbatim; the device-level shizuku shell has no guest cwd)"
+                % (DEBUG_OFFLOAD_REL, members, DEBUG_EXEC_SCOPE_CARRIERS)
+            )
+    return problems
+
+
 def strip_comments(text):
     """Blank out // and /* */ comment content, keeping line structure."""
     out = []
@@ -896,11 +1009,162 @@ class DebugOffloadHandler(private val context: Context) : NativeOffloadHandler {
         print("  [FAIL] R5 fail-closed: missing DebugOffloadHandler.kt was not reported")
     else:
         print("  [PASS] R5 fail-closed: missing DebugOffloadHandler.kt is a violation")
+    # ── [dv18-A05] R6: debug exec entry-point scope fixtures ────────────────
+    # One dirty arm per decision the criterion makes: a hardcoded cwd, a
+    # dropped session id, the shared parse bypassed, a NEW entry repeating the
+    # defect, the forwarder losing the scope, and the carrier set widened to
+    # the raw `call` escape hatch. Plus fail-closed arms for every anchor the
+    # criterion would otherwise silently stop checking.
+    R6_RPC_OK = """package com.rikkaminis.app.debug
+
+class DebugRPCHandler(private val context: Context) {
+    private fun handleShizukuExec(params: JSONObject): JSONObject {
+        // device-level shell: intentionally session-less
+        val request = NativeOffloadRequest(pid = -1, cwd = "/", sessionId = null)
+        return JSONObject()
+    }
+
+    private fun handleModelUseExec(params: JSONObject): JSONObject {
+        val scope = execScopeOf(params.optString("sessionId", ""), params.optString("cwd", ""))
+        val request = NativeOffloadRequest(pid = -1, cwd = scope.cwd, sessionId = scope.sessionId)
+        return JSONObject()
+    }
+
+    private fun handleSessionsExec(params: JSONObject): JSONObject {
+        val scope = execScopeOf(params.optString("sessionId", ""), params.optString("cwd", ""))
+        val request = NativeOffloadRequest(pid = -1, cwd = scope.cwd, sessionId = scope.sessionId)
+        return JSONObject()
+    }
+
+    private fun handleMinisConfigExec(params: JSONObject): JSONObject {
+        return JSONObject()
+    }
+}
+"""
+
+    R6_INJECT = """        execScopeParams(sub, request.sessionId, request.cwd).forEach { (key, value) ->
+            rpc.params.put(key, value)
+        }
+"""
+
+    R6_OFFLOAD_OK = """package com.rikkaminis.app.sandbox.offload
+
+class DebugOffloadHandler(private val context: Context) : NativeOffloadHandler {
+    override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
+""" + R6_INJECT + """        return postJsonRpc(rpc.method, rpc.params)
+    }
+}
+
+internal val EXEC_SCOPE_SUBCOMMANDS = setOf("model-use", "modelUse")
+
+internal fun execScopeParams(sub: String, sessionId: String?, cwd: String?): Map<String, String> {
+    if (sub !in EXEC_SCOPE_SUBCOMMANDS) return emptyMap()
+    val scope = LinkedHashMap<String, String>()
+    if (!sessionId.isNullOrBlank()) scope["sessionId"] = sessionId
+    if (!cwd.isNullOrBlank()) scope["cwd"] = cwd
+    return scope
+}
+"""
+
+    def _patch_body(text, fn, old, new):
+        """Replace [old] with [new] inside the `fn` body only (fixtures have one member per brace level)."""
+        start = text.index("fun %s(" % fn)
+        end = text.index("\n    }", start)
+        return text[:start] + text[start:end].replace(old, new, 1) + text[end:]
+
+    def exec_fixture_root(rpc_text, offload_text=None, rpc_present=True):
+        root = tempfile.mkdtemp(prefix="offload-gate-selftest-exexec-")
+        if rpc_present:
+            path = os.path.join(root, DEBUG_RPC_REL)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(rpc_text)
+        if offload_text is not None:
+            path = os.path.join(root, DEBUG_OFFLOAD_REL)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(offload_text)
+        return root
+
+    SCOPE_CALL = 'execScopeOf(params.optString("sessionId", ""), params.optString("cwd", ""))'
+    EXEC_REQ = "val request = NativeOffloadRequest(pid = -1, cwd = scope.cwd, sessionId = scope.sessionId)"
+
+    exec_arms = [
+        ("R6 clean: scope-parsed entries + forwarding forwarder",
+         R6_RPC_OK, R6_OFFLOAD_OK, None, True),
+        ('R6 dirty: a scope-taking entry hardcodes cwd = "/"',
+         _patch_body(R6_RPC_OK, "handleModelUseExec", "cwd = scope.cwd", 'cwd = "/"'),
+         R6_OFFLOAD_OK, "still hardcodes cwd", False),
+        ("R6 dirty: a scope-taking entry drops the session id",
+         _patch_body(R6_RPC_OK, "handleSessionsExec", "sessionId = scope.sessionId", "sessionId = null"),
+         R6_OFFLOAD_OK, "still hardcodes sessionId = null", False),
+        ("R6 dirty: the shared scope parse bypassed",
+         _patch_body(R6_RPC_OK, "handleModelUseExec", SCOPE_CALL, 'params.optString("cwd", "/")'),
+         R6_OFFLOAD_OK, "without the shared scope parse", False),
+        ("R6 dirty: a NEW exec entry repeats the defect",
+         _patch_body(R6_RPC_OK, "handleMinisConfigExec", "return JSONObject()",
+                     "val request = NativeOffloadRequest(pid = -1, cwd = \"/\", sessionId = null)"),
+         R6_OFFLOAD_OK, "still hardcodes cwd", False),
+        ("R6 dirty: the forwarder stops carrying the caller's scope",
+         R6_RPC_OK, R6_OFFLOAD_OK.replace(R6_INJECT, ""),
+         "no longer adds the caller's scope", False),
+        ("R6 dirty: the carrier set widened to the raw `call` escape hatch",
+         R6_RPC_OK,
+         R6_OFFLOAD_OK.replace('setOf("model-use", "modelUse")',
+                               'setOf("model-use", "modelUse", "call")'),
+         "may only ride on", False),
+        ("R6 fail-closed: an entry anchor renamed",
+         R6_RPC_OK.replace("private fun handleModelUseExec(", "private fun handleModelUseEntry("),
+         R6_OFFLOAD_OK, "is gone — fail-closed", False),
+        ("R6 fail-closed: the carrier declaration removed",
+         R6_RPC_OK,
+         R6_OFFLOAD_OK.replace('internal val EXEC_SCOPE_SUBCOMMANDS = setOf("model-use", "modelUse")\n', ""),
+         "not declared as a set", False),
+        ("R6 fail-closed: the request construction moved into a helper",
+         R6_RPC_OK.replace(EXEC_REQ, "val request = buildExecRequest(scope)"),
+         R6_OFFLOAD_OK, "only 0 exec entry point(s) build an offload request", False),
+    ]
+    exec_failures = []
+    for label, rpc_text, offload_text, needle, expect_clean in exec_arms:
+        root = exec_fixture_root(rpc_text, offload_text)
+        try:
+            problems = scan_debug_exec_scope(root)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+        ok = (not problems) == expect_clean
+        if ok and needle is not None:
+            ok = any(needle in p for p in problems)
+        print("  [%s] %s%s" % ("PASS" if ok else "FAIL", label,
+                               "" if ok else "  → problems=%s" % problems))
+        if not ok:
+            exec_failures.append(label)
+    # Fail-closed: a missing DebugRPCHandler.kt is a violation, not a skip.
+    for label, rpc_text, offload_text in (
+        ("R6 fail-closed: missing DebugRPCHandler.kt", None, R6_OFFLOAD_OK),
+        ("R6 fail-closed: missing DebugOffloadHandler.kt", R6_RPC_OK, None),
+    ):
+        root = exec_fixture_root(rpc_text, offload_text, rpc_present=rpc_text is not None)
+        try:
+            problems = scan_debug_exec_scope(root)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+        ok = bool(problems)
+        print("  [%s] %s%s" % ("PASS" if ok else "FAIL", label,
+                               "" if ok else "  → problems=%s" % problems))
+        if not ok:
+            exec_failures.append(label)
+
     if debug_failures:
         print("❌ selftest failed: %s" % ", ".join(debug_failures))
         return 1
     print("DEBUG_SESSION_PATH_SELFTEST=PASS (6 fixtures + 2 fail-closed: "
           "5 violations caught, 1 clean tree green)")
+    if exec_failures:
+        print("❌ selftest failed: %s" % ", ".join(exec_failures))
+        return 1
+    _exec_total = len(exec_arms) + 2
+    print("DEBUG_EXEC_SCOPE_SELFTEST=PASS (%d fixtures: %d dirty/fail-closed arms red as expected, "
+          "1 clean tree green)" % (_exec_total, _exec_total - 1))
     return 0
 
 
@@ -918,6 +1182,7 @@ def main():
     problems.extend(scan_player_session_path(root))
     problems.extend(scan_shizuku_paths(root))
     problems.extend(scan_debug_session_path(root))
+    problems.extend(scan_debug_exec_scope(root))
     if problems:
         print("offload_host_path_check: %d handler file(s) scanned, %d violation(s)" % (scanned, len(problems)))
         return 1
