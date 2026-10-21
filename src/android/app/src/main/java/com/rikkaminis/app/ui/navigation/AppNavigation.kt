@@ -593,42 +593,40 @@ fun AppNavigation(
     // idempotent (one-shot consumeBuffer), so no double-inject.
 
     // Pinned-shortcut cold start: when launched via
-     // `minis://session/<id>/<resource-path>`, set the pending HTML
-     // preview synchronously and start NavHost directly at the matching
-     // chat so ChatScreen's LaunchedEffect consumes the pending state on
-     // first composition — no sessions-list flash, no launch-session
-     // preference detour.
-    val htmlShortcut = initialDeepLink as? DeepLinkAction.OpenHtmlPreview
-    // App-icon quick action cold start: mount NavHost directly at a fresh
-    // draft chat, seeding the pending action so ChatScreen consumes it on
-    // its first LaunchedEffect tick. Mirrors the htmlShortcut path —
-    // avoids a sessions-list flash and a duplicate back-stack entry.
-    val quickActionStart: String? = when (initialDeepLink) {
-        is DeepLinkAction.NewCameraChat -> {
-            DeepLinkCoordinator.setPendingChatAction(
-                DeepLinkCoordinator.ChatAction.OPEN_CAMERA,
-            )
-            Routes.chat(com.rikkaminis.app.data.ComposerDraftStore.nextDraftId(context))
-        }
-        is DeepLinkAction.NewChat -> Routes.chat(com.rikkaminis.app.data.ComposerDraftStore.nextDraftId(context))
-        else -> null
-    }
-    val startDestination = when {
-        htmlShortcut != null -> {
-            // Seed coordinator before NavHost composition so ChatScreen sees
-            // the pending state on its very first LaunchedEffect tick.
-            DeepLinkCoordinator.setPendingHtmlPreview(
-                htmlShortcut.sessionId,
-                htmlShortcut.resourcePath,
-                htmlShortcut.title,
-            )
-            Routes.chat(htmlShortcut.sessionId)
-        }
-        quickActionStart != null -> quickActionStart
-        // [remove-session-list] No stock session list: the conversation
-        // drawer is the only session switcher, so cold-start heads straight
-        // into a fresh draft chat (mirrors the New Chat launch mode).
-        else -> Routes.chat(com.rikkaminis.app.data.ComposerDraftStore.nextDraftId(context))
+    // `minis://session/<id>/<resource-path>` or an app-icon quick action,
+    // seed the pending state synchronously and start NavHost directly at the
+    // matching chat so ChatScreen's LaunchedEffect consumes it on first
+    // composition — no sessions-list flash, no launch-session preference
+    // detour.
+    //
+    // [deep-audit-1038 B-02] The cold-start seeding + draft-id minting runs
+    // ONCE per cold start, inside `remember(initialDeepLink)`: this
+    // composable recomposes on theme / font-size / system dark-mode changes
+    // (it reads MaterialTheme.colorScheme.background for the NavHost
+    // transition surface), and the previous bare `val … = when (…)` bindings
+    // re-ran on every pass — replaying the camera / HTML-preview pending
+    // action into a live ChatScreen (reactively consumed since da1028-C)
+    // and re-minting the draft id once the slot was free, which drifted
+    // `startDestination` (NavGraph rebuild) and let saveText's slot guard
+    // drop the draft text the user was typing. `initialDeepLink` is an
+    // immutable MainActivity.onCreate parameter, so the remember key never
+    // changes within one composition lifetime. The decision itself lives in
+    // the Android-free [coldStartStartDestination] seam so plain JVM tests
+    // can count the seed calls.
+    val startDestination = remember(initialDeepLink) {
+        coldStartStartDestination(
+            initialDeepLink = initialDeepLink,
+            nextDraftId = { com.rikkaminis.app.data.ComposerDraftStore.nextDraftId(context) },
+            chatRoute = { Routes.chat(it) },
+            seedCamera = {
+                DeepLinkCoordinator.setPendingChatAction(
+                    DeepLinkCoordinator.ChatAction.OPEN_CAMERA,
+                )
+            },
+            seedHtmlPreview = { sessionId, resourcePath, title ->
+                DeepLinkCoordinator.setPendingHtmlPreview(sessionId, resourcePath, title)
+            },
+        )
     }
     NavHost(
         navController = navController,

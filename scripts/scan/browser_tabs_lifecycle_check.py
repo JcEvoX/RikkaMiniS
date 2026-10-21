@@ -44,6 +44,25 @@ browser_tabs/<sid>.json on session reload, and selectedTabId could point at
 a destroyed tab. Both bodies must carry `saveState(` (fail-closed: an
 unextractable body = red, never a silent skip).
 
+[fix/dv17-1 B-01/B-06] C5/C6 — the same pool file, two "written but never
+consumed / never re-pointed" defects (also read from BrowserTabPool.kt):
+  C5  a detected risk challenge must actually REACH the agent. The four
+      structured fields on BrowserActionResult (riskChallengeDetected /
+      riskChallengeKind / recommendedNextAction / throttleDelayMs) had zero
+      readers in the tree — ChatToolExecutors consumes `result.text` alone —
+      so the renderer must be called in the action-assembly path
+      (`runAcquiredAction`) AND its product merged into the returned text
+      (a `text =` write after the call). Judged on the CALL SHAPE
+      (`BrowserRiskControl.challengeNoticeLine(`), never a bare name, and
+      comments are stripped so a KDoc mention cannot satisfy it.
+  C6  `setSession` must re-point download records onto the new session's
+      workspace when the pool is rebound across a session boundary: the old
+      id must be CAPTURED BEFORE `this.sessionId` is overwritten, the remap
+      must be guarded by an actual id change, must go through the atomic
+      `_downloads` update (never a plain `_downloads.value =` assignment,
+      which races the download/URL writers), and `loadSavedState()` must stay
+      the last step (fail-closed: unextractable bodies = red).
+
 Usage: python3 browser_tabs_lifecycle_check.py <repo_root>
        python3 browser_tabs_lifecycle_check.py --root <repo_root>
        python3 browser_tabs_lifecycle_check.py --selftest
@@ -230,6 +249,59 @@ def check_pool_source(pool_src: str) -> list:
                 f"C4d: {label} changes tab state but never calls saveState( — "
                 "window.open/close tabs resurrect from the stale state file "
                 "(and selectedTabId can point at a destroyed tab)")
+
+    # --- [fix/dv17-1 B-01] C5: a detected risk challenge must reach the agent.
+    # Bound to the call shape (+ the text merge AFTER it), never a bare name:
+    # the defect was exactly that the structured fields were written and never
+    # read, and the only exit ChatToolExecutors reads is result.text.
+    action = slice_body(code, "private suspend fun runAcquiredAction")
+    if not action:
+        errs.append("C5: runAcquiredAction body not extractable (fail-closed)")
+    else:
+        notice_pos = action.find("BrowserRiskControl.challengeNoticeLine(")
+        if notice_pos < 0:
+            errs.append(
+                "C5: runAcquiredAction never renders the detected risk challenge "
+                "(no BrowserRiskControl.challengeNoticeLine( call) — the agent "
+                "sees the challenge page as undistinguished text and retries blindly")
+        elif not re.search(r"\btext\s*=", action[notice_pos:]):
+            errs.append(
+                "C5: the rendered risk notice is never merged into the result text "
+                "(no `text =` write after the challengeNoticeLine( call) — the "
+                "notice is computed and dropped, so the agent still cannot read it")
+        if "BrowserRiskControl." not in action:
+            errs.append("C5: runAcquiredAction no longer consults BrowserRiskControl (fail-closed)")
+
+    # --- [fix/dv17-1 B-06] C6: setSession must re-point download destinations.
+    sess = slice_body(code, "fun setSession")
+    if not sess:
+        errs.append("C6: setSession body not extractable (fail-closed)")
+    else:
+        capture = re.search(r"val\s+\w+\s*=\s*this\.sessionId", sess)
+        assign = re.search(r"this\.sessionId\s*=\s*sessionId", sess)
+        if not capture:
+            errs.append(
+                "C6: setSession never captures the previous session id before rebinding "
+                "(download records under the old workspace can no longer be found)")
+        elif not assign:
+            errs.append("C6: setSession no longer rebinds this.sessionId (fail-closed)")
+        elif capture.start() > assign.start():
+            errs.append(
+                "C6: setSession overwrites this.sessionId BEFORE capturing the old id — "
+                "the old session id is lost and no download path can be re-pointed")
+        if not re.search(r"\w+\s*!=\s*sessionId", sess):
+            errs.append(
+                "C6: setSession re-points downloads without checking the session actually "
+                "changed (a same-id / first bind must stay a byte-identical no-op)")
+        if "_downloads.value =" in sess:
+            errs.append("C6: setSession rewrites _downloads by plain assignment (use _downloads.update { })")
+        if not (re.search(r"remap\w*Download\w*\s*\(", sess)
+                or "updateDownloadEntry(" in sess
+                or "_downloads.update {" in sess):
+            errs.append(
+                "C6: setSession never re-points download destinations onto the new session "
+                "workspace — the draft-promotion path leaves every record pointing at the "
+                "deleted __new__<uuid> directory and its open button dies silently")
     return errs
 
 
@@ -317,8 +389,96 @@ class BrowserTabPool(context: Context) {
             saveState()
         }
     }
+
+    // [fix/dv17-1 B-01] C5: the challenge must be rendered AND merged into the
+    // result text (mirrors the production shapes at the decision points).
+    private suspend fun runAcquiredAction(input: String): String {
+        val result = execute(input)
+        val riskChallenge = detectChallenge(input)
+        val stamped = stampTabId(result, 0)
+        if (riskChallenge != null) {
+            val notice = BrowserRiskControl.challengeNoticeLine(
+                kind = riskChallenge.kind,
+                recommendedNextAction = riskChallenge.recommendedNextAction,
+                throttleDelayMs = 0L,
+            )
+            val text = if (notice != null) {
+                stamped.text + "\\n" + notice
+            } else {
+                stamped.text
+            }
+            return stamped.copy(text = text, riskChallengeDetected = true).text
+        }
+        return stamped.text
+    }
+
+    // [fix/dv17-1 B-06] C6: capture the old id BEFORE rebinding, guard on an
+    // actual change, re-point through the atomic update; loadSavedState() last.
+    fun setSession(sessionId: String) {
+        val previous = this.sessionId
+        this.sessionId = sessionId
+        if (previous != null && previous != sessionId) {
+            _downloads.update { current ->
+                remapDownloadDestinations(
+                    entries = current,
+                    oldDir = File(filesDir, "minis-sessions/$previous/workspace"),
+                    newDir = File(filesDir, "minis-sessions/$sessionId/workspace"),
+                    pathOf = { entry -> entry.destination },
+                    withPath = { entry, path -> entry.copy(destination = path) },
+                )
+            }
+        }
+        _tabs.value.forEach { it.manager.minisSessionId = sessionId }
+        loadSavedState()
+    }
 }
 """
+
+# C5: the notice renderer is called but its product never reaches the text —
+# exactly the "written and dropped" defect this criterion exists for.
+POOL_V_RISK_NOT_MERGED = POOL_COMPLIANT.replace(
+    """            val text = if (notice != null) {
+                stamped.text + "\\n" + notice
+            } else {
+                stamped.text
+            }
+            return stamped.copy(text = text, riskChallengeDetected = true).text""",
+    "            return stamped.copy(riskChallengeDetected = true).text",
+)
+
+# C5: no renderer call at all (regression to the pre-fix shape).
+POOL_V_RISK_NO_CALL = POOL_COMPLIANT.replace(
+    """            val notice = BrowserRiskControl.challengeNoticeLine(
+                kind = riskChallenge.kind,
+                recommendedNextAction = riskChallenge.recommendedNextAction,
+                throttleDelayMs = 0L,
+            )
+""", "")
+
+# C6: baseline shape — no capture, no remap (the draft promotion defect).
+POOL_V_SESSION_NO_REMAP = POOL_COMPLIANT.replace(
+    """        val previous = this.sessionId
+        this.sessionId = sessionId
+        if (previous != null && previous != sessionId) {
+            _downloads.update { current ->
+                remapDownloadDestinations(
+                    entries = current,
+                    oldDir = File(filesDir, "minis-sessions/$previous/workspace"),
+                    newDir = File(filesDir, "minis-sessions/$sessionId/workspace"),
+                    pathOf = { entry -> entry.destination },
+                    withPath = { entry, path -> entry.copy(destination = path) },
+                )
+            }
+        }
+""",
+    "        this.sessionId = sessionId\n",
+)
+
+# C6: the remap exists but goes through a plain assignment (races the writers).
+POOL_V_SESSION_PLAIN_ASSIGN = POOL_COMPLIANT.replace(
+    "            _downloads.update { current ->\n",
+    "            _downloads.value = _downloads.value\n            _downloads.update { current ->\n",
+)
 
 # C4a: the pre-fix dispose re-persisted the (possibly just-deleted) session.
 POOL_V_DISPOSE_SAVE = POOL_COMPLIANT.replace(
@@ -501,6 +661,10 @@ class SessionFileStore internal constructor(
         ("C4b dispose no longer destroys tabs", POOL_V_DISPOSE_NO_DESTROY, ["C4"]),
         ("C4d window.open forgets saveState", POOL_V_NEWWIN_NOSAVE, ["C4d"]),
         ("C4d window.close forgets saveState", POOL_V_CLOSEWIN_NOSAVE, ["C4d"]),
+        ("C5 risk notice rendered but dropped", POOL_V_RISK_NOT_MERGED, ["C5"]),
+        ("C5 risk notice never rendered", POOL_V_RISK_NO_CALL, ["C5"]),
+        ("C6 setSession forgets to re-point downloads", POOL_V_SESSION_NO_REMAP, ["C6"]),
+        ("C6 setSession rewrites _downloads by assignment", POOL_V_SESSION_PLAIN_ASSIGN, ["C6"]),
     ]
     for name, sample, expect in pool_arms:
         errs = check_pool_source(sample)
@@ -519,6 +683,9 @@ class SessionFileStore internal constructor(
         print(f"SELFTEST FAILED ({failures} arms)")
         return 1
     print(MARKER)
+    # [fix/dv17-1 B-01/B-06] separate marker for the consumer/remap criteria —
+    # MARKER above is pinned verbatim by test_scan.py and must not change.
+    print("BROWSER_TABS_RISK_NOTICE_AND_REMAP_SELFTEST=PASS")
     return 0
 
 
@@ -558,7 +725,7 @@ def main() -> int:
         for e in errs:
             print(f"  - {e}")
         return 1
-    print("browser_tabs_lifecycle_check OK (criteria: C1-C3 store lifecycle + C4/C4d pool teardown + window.open/close persistence)")
+    print("browser_tabs_lifecycle_check OK (criteria: C1-C3 store lifecycle + C4/C4d pool teardown + window.open/close persistence + C5 risk notice reaches the agent text + C6 setSession re-points downloads atomically)")
     return 0
 
 

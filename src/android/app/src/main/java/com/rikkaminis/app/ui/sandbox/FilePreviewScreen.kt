@@ -447,7 +447,11 @@ private fun HtmlPreview(item: FileItem) {
     // preview would be permanently blank after a renderer kill (the app itself
     // survives, which is the point of SafeWebViewClient).
     var rendererEpoch by remember(item.file) { mutableStateOf(0) }
-    key(rendererEpoch) {
+    // [dv17-3 B-03] `item.file` must stay in the key: `remember(item.file)`
+    // resets `rendererEpoch` to 0 when the file changes, so a bare
+    // `key(rendererEpoch)` never changes (0→0) and the factory does not
+    // re-run — the screen kept showing the *previous* file's HTML.
+    key(item.file, rendererEpoch) {
     AndroidView(
         modifier = Modifier.fillMaxSize(),
         factory = { ctx ->

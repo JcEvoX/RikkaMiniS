@@ -542,12 +542,33 @@ internal fun ChatInputArea(
             // PopupProperties so its bottom edge sits just above this Column.
             // Tap-outside dismisses via dismissOnClickOutside.
             val showSlashMenu by viewModel.showSlashMenu.collectAsState()
-            val filteredSlashCommands = remember(
-                showSlashMenu,
-                viewModel.slashFilter.collectAsState().value,
-                viewModel.memoryEnabled.collectAsState().value,
-                viewModel.thinkingLevel.collectAsState().value,
-            ) { viewModel.filteredSlashCommands() }
+            // [dv17-4] The list is only ever RENDERED under `showSlashMenu` (the
+            // `if` below), yet it used to be computed on every composition: the
+            // remember ran unconditionally, so entering the chat, switching
+            // sessions or touching a key spent N+M synchronous `db.rawQuery`
+            // calls (one `isEnabledForSession` per skill + per MCP server) on
+            // the main thread and dropped the result on the very next line.
+            // The menu gate now wraps the whole computation — closed menu =
+            // empty list, no query. The keys name the live sources the body
+            // actually reads: `slashFilter` / `memoryEnabled` (built-in rows),
+            // `currentSessionId` and the two repositories' lists (the
+            // per-session override the picker filters on) — so toggling a
+            // skill/MCP for this session, or adding one from disk, refreshes
+            // an open menu. `thinkingLevel` is gone: `/thinking` is no longer
+            // in `availableSlashCommands`, so that key had 0 reads in the body
+            // and only forced a needless recompute + query burst on every
+            // thinking-notch tap.
+            val filteredSlashCommands = if (showSlashMenu) {
+                remember(
+                    viewModel.slashFilter.collectAsState().value,
+                    viewModel.memoryEnabled.collectAsState().value,
+                    viewModel.currentSessionId,
+                    viewModel.skillRepository?.skills?.collectAsState()?.value,
+                    viewModel.mcpRepository?.servers?.collectAsState()?.value,
+                ) { viewModel.filteredSlashCommands() }
+            } else {
+                emptyList()
+            }
 
             if (showSlashMenu && filteredSlashCommands.isNotEmpty()) {
                 val effectiveThinkingLevelState by viewModel.thinkingLevel.collectAsState()

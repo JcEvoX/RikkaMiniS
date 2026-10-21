@@ -1321,7 +1321,18 @@ fun SkillFileViewerScreen(
     // editor. key1/key2 line literals are pinned by
     // skill_frontmatter_roundtrip_check.py / skill_file_save_result_check.py
     // — keys were appended, prefixes untouched.
-    var editContent by remember(skillId, relativePath, skill.updatedAt) { mutableStateOf(initialContent) }
+    // [dv17-4] Key [loadedDiskBase] appended for the same reason one level up
+    // the chain: `initialContent` re-derives from it too (the async
+    // sibling-file read [dv14-B5] moved off the composition thread), yet this
+    // remember didn't carry it — so an out-of-band edit landing while the
+    // editor was OPEN left `initialContent` showing NEW_TEXT while
+    // `editContent` stayed frozen on the pre-read snapshot, and Save wrote
+    // that stale text back over the external write (silent rollback). The two
+    // seed-derived remembers now carry the same key set;
+    // skill_import_offmain_check.py asserts they stay aligned. `loadedDiskBase`
+    // itself deliberately keeps its (skillId, relativePath) keys (not
+    // updatedAt) — see the note at its declaration.
+    var editContent by remember(skillId, relativePath, skill.updatedAt, loadedDiskBase) { mutableStateOf(initialContent) }
 
     // [dv14-B5] `isLoaded` gates the Edit button: a tap before the read lands
     // would open the editor against a blank base and a Save could overwrite
