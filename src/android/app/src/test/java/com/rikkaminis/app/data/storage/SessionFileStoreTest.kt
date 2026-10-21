@@ -267,7 +267,7 @@ class SessionFileStoreTest {
         val draft = "__new__${UUID.randomUUID()}"
         val s = store()
         write(File(s.sessionDir(draft), "tool.bin"), 40)
-        write(File(File(s.mediaRootForTesting(), "2026-01-01"), draft).resolve2("m.bin"), 30)
+        write(File(File(File(s.mediaRootForTesting(), "2026-01-01"), draft), "m.bin"), 30)
 
         val report = s.scanOrphans(emptySet())
 
