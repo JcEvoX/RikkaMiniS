@@ -104,6 +104,7 @@ import com.rikkaminis.app.ui.DisplayBitmapLimits.limitDisplaySize
 import com.rikkaminis.app.sandbox.PRootKernel
 import com.rikkaminis.app.data.ChatTuningPrefs
 import com.rikkaminis.app.ui.theme.ChatColors
+import com.rikkaminis.app.ui.media.resolvedMediaSourceKey
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -1837,9 +1838,14 @@ private fun formatMdMediaMs(ms: Int): String {
  * consumers render against the URL until the File lands and rebuild (their
  * remembered players/requests key on the absolute path, so the null→File
  * transition re-runs them exactly once).
+ *
+ * [dv19-B06] `internal` so the `ui/markdown` renderer (MarkdownText.kt)
+ * shares THIS mechanism instead of re-growing a synchronous copy: its
+ * MinisVideoBlock / MinisAudioBlock still resolved a media URL inside
+ * `remember { }` on the composition thread.
  */
 @Composable
-private fun rememberMdMediaFile(url: String, sessionId: String?): File? {
+internal fun rememberMdMediaFile(url: String, sessionId: String?): File? {
     val context = LocalContext.current
     val resolved by androidx.compose.runtime.produceState<File?>(initialValue = null, url, sessionId) {
         value = withContext(Dispatchers.IO) { resolveMdMediaFile(context, url, sessionId) }
@@ -1945,16 +1951,28 @@ private fun RenderMdAudio(block: MdBlock.Audio) {
     val file = rememberMdMediaFile(block.url, sessionId)
     val filename = remember(block.url) { filenameFromMdUrl(block.url) }
 
-    val player = remember(file?.absolutePath) {
-        if (file == null) null else runCatching {
-            MediaPlayer().apply { setDataSource(file.absolutePath) }
-        }.getOrNull()
+    // [dv19-B06] Same shape as MarkdownText.MinisAudioBlock [T10-M5] — and it
+    // has to be: setDataSource() opens the file descriptor and parses the
+    // container header, real disk/codec work that used to run right here in
+    // composition, on the main thread, for the FIRST frame of every audio
+    // block in the main chat. The player instance is created first so the
+    // DisposableEffect below always owns something to release; the old
+    // `runCatching { MediaPlayer().apply { setDataSource(...) } }` returned
+    // null on a corrupt file and the freshly built native player leaked
+    // until GC.
+    val player = remember(resolvedMediaSourceKey(file)) {
+        if (file == null) null else MediaPlayer()
     }
-    var prepared by remember(file?.absolutePath) { mutableStateOf(false) }
-    LaunchedEffect(player) {
-        if (player == null) return@LaunchedEffect
+    var prepared by remember(resolvedMediaSourceKey(file)) { mutableStateOf(false) }
+    LaunchedEffect(player, resolvedMediaSourceKey(file)) {
+        val p = player ?: return@LaunchedEffect
+        val f = file ?: return@LaunchedEffect
         prepared = withContext(Dispatchers.IO) {
-            runCatching { player.prepare(); true }.getOrElse {
+            runCatching {
+                p.setDataSource(f.absolutePath)
+                p.prepare()
+                true
+            }.getOrElse {
                 android.util.Log.w("MdStream", "audio prepare failed: ${it.message}")
                 false
             }
@@ -1963,8 +1981,11 @@ private fun RenderMdAudio(block: MdBlock.Audio) {
     DisposableEffect(player) {
         onDispose { try { player?.release() } catch (_: Throwable) {} }
     }
-    var isPlaying by remember { mutableStateOf(false) }
-    var positionMs by remember { mutableStateOf(0) }
+    // [dv19-B06] Keyed on the file like `player`/`prepared` above: a reused
+    // composition slot otherwise started the next audio in the previous
+    // file's play state / position.
+    var isPlaying by remember(resolvedMediaSourceKey(file)) { mutableStateOf(false) }
+    var positionMs by remember(resolvedMediaSourceKey(file)) { mutableStateOf(0) }
     val durationMs = if (prepared && player != null) {
         runCatching { player.duration }.getOrDefault(0)
     } else 0

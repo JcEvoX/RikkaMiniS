@@ -1572,6 +1572,28 @@ private fun ThinkingFullContentDialog(content: String, onDismiss: () -> Unit) {
                             )
                         }
                     },
+                    // [dv19-B02] The factory runs once, so a dialog opened
+                    // while the block was still streaming (or after a theme
+                    // flip) kept the text and colour it was born with. Sync
+                    // them here instead of keying the node on `content`: the
+                    // TextView holds >100k chars in this code path and
+                    // rebuilding it on every appended token would reset the
+                    // reader's scroll offset and text selection.
+                    update = { scrollView ->
+                        val textView = scrollView.getChildAt(0) as? android.widget.TextView
+                        if (textView != null) {
+                            textView.setTextColor(textColor.toArgb())
+                            // Setting the same text again forces a full
+                            // re-measure/re-layout of the whole buffer, and
+                            // this block re-runs on every recomposition. Only
+                            // write when it actually changed (TextView keeps
+                            // the exact CharSequence it was handed, so a
+                            // length check settles the common no-op case).
+                            if (shouldSyncFullContentText(textView.text, content)) {
+                                textView.text = content
+                            }
+                        }
+                    },
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f),
@@ -1579,4 +1601,25 @@ private fun ThinkingFullContentDialog(content: String, onDismiss: () -> Unit) {
             }
         }
     }
+}
+
+/**
+ * [dv19-B02] Whether the full-content thinking [android.widget.TextView] must
+ * be handed the text again.
+ *
+ * `AndroidView.update` runs on every recomposition, and this dialog is opened
+ * precisely when the block is huge (>100k chars). Re-assigning an identical
+ * string makes the TextView re-measure and re-layout the whole buffer, so the
+ * `update` block must only write on a real change — while still picking up
+ * every appended token and every theme flip (the reason `update` exists here
+ * at all instead of `key(content)`, which would rebuild the node and reset
+ * the reader's scroll offset and selection).
+ *
+ * Kept as a plain function so the decision is unit-testable without an
+ * Android runtime.
+ */
+internal fun shouldSyncFullContentText(shown: CharSequence?, content: String): Boolean {
+    if (shown == null) return true
+    if (shown.length != content.length) return true
+    return shown.toString() != content
 }
