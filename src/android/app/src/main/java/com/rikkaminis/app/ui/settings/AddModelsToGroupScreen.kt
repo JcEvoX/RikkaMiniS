@@ -25,6 +25,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.res.stringResource
 import com.rikkaminis.app.R
+import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.ui.components.PickerModalityFilter
@@ -67,7 +68,14 @@ fun AddModelsToGroupScreen(
 
     val searchQuery = remember { mutableStateOf("") }
     var selectedIds by remember { mutableStateOf(setOf<String>()) }
-    var quickTestEntry by remember { mutableStateOf<com.rikkaminis.app.data.model.ModelEntry?>(null) }
+    // [deep-audit-1039 B-08] Hold the Quick Test target as an ID, not as the
+    // ModelEntry captured at click time: the sheet stays open across external
+    // writes (minis-config / Debug RPC / backup restore), so a frozen object
+    // kept feeding "Run again" the config the row had when it was tapped, and a
+    // deleted model left the sheet open against a row that no longer exists.
+    // The id is re-resolved against the LIVE list every composition below
+    // (same shape as ModelEntryDetailScreen / EnvironmentVariablesScreen C16).
+    var quickTestEntryId by remember { mutableStateOf<String?>(null) }
     val collapsedInstanceIds = rememberCollapsedInstanceIds(
         config = config,
         // T185: default-collapsed mirrors pre-refactor behaviour. The
@@ -140,7 +148,7 @@ fun AddModelsToGroupScreen(
                 searchPlaceholderRes = R.string.add_models_to_group_search_models,
                 clearContentDescriptionRes = R.string.add_models_to_group_clear,
                 // System virtual entries have no cloud endpoint to smoke-test.
-                onQuickTest = { if (!SystemVoiceEntries.isSystemEntryId(it.id)) quickTestEntry = it },
+                onQuickTest = { if (!SystemVoiceEntries.isSystemEntryId(it.id)) quickTestEntryId = it.id },
                 modalityFilter = modalityFilter,
                 excludeIds = existingIds,
                 systemProviderLabel = systemProviderLabel,
@@ -148,11 +156,42 @@ fun AddModelsToGroupScreen(
         }
     }
 
+    // [deep-audit-1039 B-08] Resolve the target from the LIVE entry list and
+    // close the sheet through a LaunchedEffect (never during composition) when
+    // the id stops resolving — a deleted model must dismiss the sheet instead of
+    // leaving it testing a row that is gone.
+    val quickTestEntry = liveQuickTestEntry(quickTestEntryId, config.modelEntries)
+    LaunchedEffect(quickTestEntryId, config.modelEntries) {
+        if (quickTestTargetVanished(quickTestEntryId, config.modelEntries)) quickTestEntryId = null
+    }
     quickTestEntry?.let { entry ->
         com.rikkaminis.app.ui.components.QuickTestSheet(
             entry = entry,
             providerRepository = providerRepository,
-            onDismiss = { quickTestEntry = null },
+            onDismiss = { quickTestEntryId = null },
         )
     }
 }
+
+/**
+ * [deep-audit-1039 B-08] Resolve a Quick Test target from the LIVE entry list.
+ *
+ * The picker rows hand out IDs; the sheet needs the current object. Resolving
+ * on every composition is what keeps "Run again" on the model as it is now
+ * rather than the copy the row held when the lightning bolt was tapped (the
+ * same reason ModelEntryDetailScreen re-resolves its `entry` this way).
+ *
+ * Top-level pure function: the JVM test drives this decision directly instead
+ * of re-implementing it (same seam as `sliderStepsFor` / `pendingConnectionFieldWrite`).
+ */
+internal fun liveQuickTestEntry(pendingId: String?, entries: List<ModelEntry>): ModelEntry? =
+    pendingId?.let { id -> entries.find { it.id == id } }
+
+/**
+ * [deep-audit-1039 B-08] True when the sheet is open for an id that no longer
+ * resolves. Kept separate from the resolution so the close effect keys on the
+ * decision ("the target vanished") rather than on "the lookup returned null",
+ * which is also true when the sheet was never opened.
+ */
+internal fun quickTestTargetVanished(pendingId: String?, entries: List<ModelEntry>): Boolean =
+    pendingId != null && liveQuickTestEntry(pendingId, entries) == null

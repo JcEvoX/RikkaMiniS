@@ -8,6 +8,7 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.mutableStateOf
@@ -41,7 +42,16 @@ fun AddCustomModelScreen(
     providerRepository: ProviderRepository,
     onBack: () -> Unit,
 ) {
-    val instance = providerRepository.instance(instanceId)
+    // [deep-audit-1039 B-03] Subscribe to the config flow instead of reading a
+    // one-shot snapshot (`providerRepository.instance(instanceId)`): the
+    // snapshot never re-read, so when the parent instance was removed while
+    // this screen was open (minis-config RPC, Debug RPC, backup restore) the
+    // page did not recompose, the `instance == null` guard below never fired,
+    // and Save minted a ModelEntry pointing at an id the instances table no
+    // longer has (addEntry only checks for duplicates). This is the same
+    // subscribe-then-derive shape the other 12 screens in ui/settings use.
+    val config by providerRepository.config.collectAsState()
+    val instance = config.instances.find { it.id == instanceId }
 
     if (instance == null) {
         // [audit-0917] Navigate AFTER composition (see ModelGroupDetailScreen).
@@ -102,6 +112,19 @@ fun AddCustomModelScreen(
                 )
                 scope.launch {
                     try {
+                        // [deep-audit-1039 B-03] The subscription above makes the
+                        // guard fire on the next composition after an external
+                        // delete, but the click can still land in the window
+                        // between that delete and the IO hop below. Re-resolve
+                        // the parent instance at write time and drop the write
+                        // when it is gone: addEntry checks duplicates only, so a
+                        // write here is an orphan ModelEntry by construction.
+                        val parentStillThere = providerRepository.config.value.instances
+                            .any { it.id == instanceId }
+                        if (!parentStillThere) {
+                            onBack()
+                            return@launch
+                        }
                         // [deep-audit-1033 I05] addEntry goes to SQLite on the
                         // caller's thread; saving a custom model used to block
                         // the frame that navigates back.
