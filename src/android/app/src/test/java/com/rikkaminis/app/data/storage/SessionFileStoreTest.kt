@@ -226,4 +226,70 @@ class SessionFileStoreTest {
         s.reclaimOrphans(emptySet())
         assertTrue("fail-safe guard: unknown stems are never reclaimed", stray.exists())
     }
+
+    // ── [da1040-A3] an in-flight draft is live, and draft names are shaped ───
+    // The composer mints `__new__<uuid>` (ComposerDraftStore) before the first
+    // message creates a DB row, and BrowserTabPool writes state under that id.
+    // Both halves must hold at once: the sweep has to RECOGNISE the draft shape
+    // (else a promoted draft's files leak forever) and it has to treat the
+    // ACTIVE draft as live (else the act of recognising deletes the user's
+    // in-flight work).
+
+    private fun storeWithDrafts(vararg draftIds: String): SessionFileStore =
+        SessionFileStore(tmp.newFolder("filesDirDrafts"), { draftIds.toSet() })
+
+    @Test
+    fun `reclaimOrphans keeps the active draft's session dir, media and tab file`() {
+        val draft = "__new__${UUID.randomUUID()}"
+        val other = "__new__${UUID.randomUUID()}"
+        val s = storeWithDrafts(draft)
+
+        val draftDir = write(File(s.sessionDir(draft), "tool.bin"), 40)
+        val draftMedia = write(File(File(File(s.mediaRootForTesting(), "2026-01-01"), draft), "m.bin"), 30)
+        val draftTabs = write(s.browserTabFile(draft), 20)
+        // A draft that is NOT the composer's active slot is ordinary orphan data.
+        val deadDir = write(File(s.sessionDir(other), "tool.bin"), 40)
+        val deadMedia = write(File(File(File(s.mediaRootForTesting(), "2026-01-01"), other), "m.bin"), 30)
+        val deadTabs = write(s.browserTabFile(other), 20)
+
+        s.reclaimOrphans(emptySet())
+
+        assertTrue("active draft's session dir must survive", draftDir.exists())
+        assertTrue("active draft's media must survive", draftMedia.exists())
+        assertTrue("active draft's tab file must survive", draftTabs.exists())
+        assertFalse("inactive draft dir is orphan data", deadDir.exists())
+        assertFalse("inactive draft media is orphan data", deadMedia.exists())
+        assertFalse("inactive draft tab file is orphan data", deadTabs.exists())
+    }
+
+    @Test
+    fun `scanOrphans recognises draft-shaped names once the draft is gone`() {
+        val draft = "__new__${UUID.randomUUID()}"
+        val s = store()
+        write(File(s.sessionDir(draft), "tool.bin"), 40)
+        write(File(File(s.mediaRootForTesting(), "2026-01-01"), draft).resolve2("m.bin"), 30)
+
+        val report = s.scanOrphans(emptySet())
+
+        assertEquals(listOf(draft), report.sessionIds)
+        assertEquals(1, report.sessionDirs)
+        assertEquals(1, report.mediaDirs)
+        assertTrue("draft-shaped footprint must be measured", report.totalBytes > 0)
+    }
+
+    @Test
+    fun `draft-shaped names without a full UUID suffix stay un-reclaimable`() {
+        val s = store()
+        val bare = write(File(File(s.sessionsRoot, "__new__"), "f.bin"), 10)
+        val notUuid = write(File(File(s.sessionsRoot, "__new__not-a-uuid"), "f.bin"), 10)
+        val trailing = write(File(File(s.sessionsRoot, "__new__${UUID.randomUUID()}-extra"), "f.bin"), 10)
+
+        val report = s.scanOrphans(emptySet())
+        s.reclaimOrphans(emptySet())
+
+        assertTrue("fail-safe: only a full UUID behind the prefix qualifies", report.sessionIds.isEmpty())
+        assertTrue("bare route placeholder", bare.exists())
+        assertTrue("non-UUID suffix", notUuid.exists())
+        assertTrue("trailing garbage after the UUID", trailing.exists())
+    }
 }
