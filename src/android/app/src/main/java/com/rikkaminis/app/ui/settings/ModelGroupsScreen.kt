@@ -114,6 +114,16 @@ fun ModelGroupsScreen(
     DisposableEffect(context) {
         val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
             if (key == null || key == AgentRuntimeLimitsPrefs.KEY_COMPACT_MODEL_ENTRY_ID) {
+                // [dv17-b07-prefs-prime] Prime FIRST, then read —
+                // `compactModelEntryId()` returns the @Volatile cache, and
+                // SharedPreferencesImpl dispatches the registered listeners in
+                // unspecified (WeakHashMap bucket) order, so this screen's
+                // listener can run BEFORE AgentRuntimeLimitsPrefs' own
+                // self-sync listener and would otherwise publish the value from
+                // just before the write that triggered it. Same belt as
+                // RuntimeLimitsScreen's [fix/da1026-prefs-priming] primes;
+                // covered by prefs_listener_holder_guard (criterion C3).
+                AgentRuntimeLimitsPrefs.prime(context.applicationContext)
                 compactModelEntryId = AgentRuntimeLimitsPrefs.compactModelEntryId()
             }
         }
