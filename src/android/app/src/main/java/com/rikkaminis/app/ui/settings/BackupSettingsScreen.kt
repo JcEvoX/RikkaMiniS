@@ -68,7 +68,9 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
@@ -1122,6 +1124,19 @@ fun BackupSettingsScreen(
                 },
                 onFetch = { entry ->
                     if (!operationBusy) {
+                        // [deep-audit-1040 B-08] Claim the SAME single gate as
+                        // every other backup path (local SAF export, WebDAV
+                        // upload, restore, delete). This fetch pulls a full
+                        // payload into memory and then writes + rotates
+                        // `filesDir/backup-autos` — the very directory the
+                        // nightly run and every restore also touch — yet it
+                        // used to flip only the dialog-local
+                        // `autoRemoteLoading`. Dismissing the dialog mid-flight
+                        // (its OK button and the back gesture are never gated)
+                        // left "Run Now" / "Restore" / "Export" clickable and
+                        // let two full payloads land on that directory at once
+                        // (and stack on the 512MB heap).
+                        operationBusy = true
                         autoRemoteLoading = true
                         scope.launch {
                             try {
@@ -1174,16 +1189,32 @@ fun BackupSettingsScreen(
                                     context.getString(R.string.auto_backup_fetched),
                                     android.widget.Toast.LENGTH_SHORT,
                                 ).show()
+                            } catch (t: CancellationException) {
+                                // [deep-audit-1040 B-08] The screen went away
+                                // mid-flight and cancelled this launch. Not a
+                                // failure: rethrow so the coroutine really ends
+                                // here instead of falling through to the list
+                                // refresh below (that refresh re-arms
+                                // autoRemoteLoading and fires its own load from
+                                // a scope that is already dead, leaving the
+                                // dialog on a spinner nobody can clear).
+                                throw t
                             } catch (t: Throwable) {
                                 errorMessage = webDavErrorMessage(context, t)
                             } finally {
                                 autoRemoteLoading = false
+                                operationBusy = false
                             }
                             // Refresh the remote list only AFTER the busy flag
                             // is cleared — openAutoRemoteList() re-arms it and
                             // fires its own async load, so ordering matters
                             // (finally above would otherwise clobber it).
-                            openAutoRemoteList()
+                            // `isActive` covers the window between the last
+                            // suspension point and this line: the parent scope
+                            // can be cancelled at any moment, and a refresh
+                            // started from a cancelled scope never reaches its
+                            // own `finally` (stuck spinner again).
+                            if (isActive) openAutoRemoteList()
                         }
                     }
                 },
