@@ -45,6 +45,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -91,6 +92,10 @@ fun MCPIntegrationsScreen(
             mcpRepository.reloadFromDisk()
         }
     }
+
+    // [deep-audit-1040 B-04] Row-level writes (toggle / delete) move off the
+    // main thread; this scope is what they launch into.
+    val scope = rememberCoroutineScope()
 
     var showAddSheet by remember { mutableStateOf(false) }
     // [T-mcp-review-fixes-android] FIX 1: tapping a row opens the form in EDIT
@@ -158,7 +163,18 @@ fun MCPIntegrationsScreen(
                                 Spacer(Modifier.width(8.dp))
                                 Switch(
                                     checked = server.enabled,
-                                    onCheckedChange = { mcpRepository.setEnabled(server.id, it) },
+                                    // [deep-audit-1040 B-04] setEnabled() writes
+                                    // servers.json (tmp file + rename) and republishes
+                                    // the StateFlow — disk I/O that used to run on
+                                    // Main. The Switch stays controlled: the row
+                                    // repaints from the `servers` flow.
+                                    onCheckedChange = { enabled ->
+                                        scope.launch {
+                                            withContext(Dispatchers.IO) {
+                                                mcpRepository.setEnabled(server.id, enabled)
+                                            }
+                                        }
+                                    },
                                 )
                             }
                         },
@@ -225,8 +241,18 @@ fun MCPIntegrationsScreen(
             text = { Text(stringResource(R.string.mcp_delete_message)) },
             confirmButton = {
                 MinisTextButton(onClick = {
-                    mcpRepository.delete(id)
+                    // [deep-audit-1040 B-04] delete() runs a SQLite DELETE,
+                    // rewrites servers.json and purges the OAuth store
+                    // (EncryptedSharedPreferences + bridge file) — all disk.
+                    // The dialog is dismissed first (main thread, immediate) so
+                    // it can't flicker or absorb a second tap while the write
+                    // is in flight.
                     deleteId = null
+                    scope.launch {
+                        withContext(Dispatchers.IO) {
+                            mcpRepository.delete(id)
+                        }
+                    }
                 }) { Text(stringResource(R.string.delete), color = MaterialTheme.colorScheme.error) }
             },
             dismissButton = {
@@ -365,17 +391,35 @@ private fun MCPFormTab(
     val oauthScope = androidx.compose.runtime.rememberCoroutineScope()
     var oauthExpanded by remember(editServer) { mutableStateOf(editServer?.oauth != null) }
     var oauthClientId by remember(editServer) { mutableStateOf(editServer?.oauth?.clientId ?: "") }
-    var oauthClientSecret by remember(editServer) {
-        mutableStateOf(
-            editServer?.id?.let {
-                // [T-mcp-secret-handoff-import] If the in-guest CLI seeded a
-                // client secret via the .secret handoff file, import it first
-                // (into the encrypted store) so it pre-fills; otherwise read the
-                // already-stored secret.
-                com.rikkaminis.app.mcp.oauth.MCPOAuthStore.importPendingClientSecret(context, it)
-                    ?: com.rikkaminis.app.mcp.oauth.MCPOAuthStore.clientSecret(context, it)
-            } ?: "",
-        )
+    // [deep-audit-1040 B-04] `importPendingClientSecret` / `clientSecret`
+    // open EncryptedSharedPreferences (Keystore) and may read-then-delete the
+    // `.secret` handoff file; `isAuthorized` reads the encrypted token blob.
+    // Seeding them inside `remember` ran that I/O on the composition thread on
+    // EVERY re-seed (i.e. on every keystroke that changed the entry), which is
+    // the jank this fix removes. Both now ride a keyed LaunchedEffect on IO and
+    // publish into state; the initial value stays "" / false so the first frame
+    // renders before (not during) the read.
+    var oauthClientSecret by remember(editServer) { mutableStateOf("") }
+    var oauthAuthorizedSeed by remember(editServer) { mutableStateOf(false) }
+    LaunchedEffect(editServer) {
+        val sid = editServer?.id
+        if (sid == null) {
+            oauthClientSecret = ""
+            oauthAuthorizedSeed = false
+            return@LaunchedEffect
+        }
+        // [T-mcp-secret-handoff-import] If the in-guest CLI seeded a client
+        // secret via the .secret handoff file, import it first (into the
+        // encrypted store) so it pre-fills; otherwise read the stored secret.
+        val secret = withContext(Dispatchers.IO) {
+            com.rikkaminis.app.mcp.oauth.MCPOAuthStore.importPendingClientSecret(context, sid)
+                ?: com.rikkaminis.app.mcp.oauth.MCPOAuthStore.clientSecret(context, sid)
+        }
+        val authorized = withContext(Dispatchers.IO) {
+            com.rikkaminis.app.mcp.oauth.MCPOAuthStore.isAuthorized(context, sid)
+        }
+        oauthClientSecret = secret ?: ""
+        oauthAuthorizedSeed = authorized
     }
     var oauthAuthEndpoint by remember(editServer) { mutableStateOf(editServer?.oauth?.authorizationEndpoint ?: "") }
     var oauthTokenEndpoint by remember(editServer) { mutableStateOf(editServer?.oauth?.tokenEndpoint ?: "") }
@@ -385,13 +429,7 @@ private fun MCPFormTab(
     // nor rewrote it), so a JSON/CLI-supplied redirect_uri silently evaporated
     // on Save. Now round-tripped like the other OAuth fields.
     var oauthRedirectUri by remember(editServer) { mutableStateOf(editServer?.oauth?.redirectUri ?: "") }
-    var oauthAuthorized by remember(editServer) {
-        mutableStateOf(
-            editServer?.id?.let {
-                com.rikkaminis.app.mcp.oauth.MCPOAuthStore.isAuthorized(context, it)
-            } ?: false,
-        )
-    }
+    var oauthAuthorized by remember(oauthAuthorizedSeed) { mutableStateOf(oauthAuthorizedSeed) }
     var oauthBusy by remember { mutableStateOf(false) }
 
     fun currentOAuthConfig(): com.rikkaminis.app.mcp.oauth.MCPOAuthConfig? {
@@ -565,8 +603,16 @@ private fun MCPFormTab(
                             onClick = {
                                 val sid = name.trim()
                                 if (sid.isNotEmpty()) {
-                                    com.rikkaminis.app.mcp.oauth.MCPOAuthStore.signOut(context, sid)
+                                    // [deep-audit-1040 B-04] signOut() drops the
+                                    // encrypted token row — Keystore-backed
+                                    // SharedPreferences I/O. The UI flag flips
+                                    // immediately (Main); the write follows on IO.
                                     oauthAuthorized = false
+                                    oauthScope.launch {
+                                        withContext(Dispatchers.IO) {
+                                            com.rikkaminis.app.mcp.oauth.MCPOAuthStore.signOut(context, sid)
+                                        }
+                                    }
                                 }
                             },
                         ) {
@@ -607,13 +653,21 @@ private fun MCPFormTab(
                                         return@MinisTextButton
                                     }
                                     errorText = null
-                                    // Persist the secret so the token exchange can
-                                    // read it; harmless if the flow is cancelled.
-                                    com.rikkaminis.app.mcp.oauth.MCPOAuthStore.setClientSecret(
-                                        context, sid, oauthClientSecret.trim().ifBlank { null },
-                                    )
+                                    val secretValue = oauthClientSecret
                                     oauthBusy = true
                                     oauthScope.launch {
+                                        // [deep-audit-1040 B-04] Persist the secret
+                                        // so the token exchange can read it;
+                                        // harmless if the flow is cancelled. The
+                                        // write opens EncryptedSharedPreferences
+                                        // (Keystore), so it runs on IO — captured
+                                        // above so nothing Compose-owned is read
+                                        // off the main thread.
+                                        withContext(Dispatchers.IO) {
+                                            com.rikkaminis.app.mcp.oauth.MCPOAuthStore.setClientSecret(
+                                                context, sid, secretValue.trim().ifBlank { null },
+                                            )
+                                        }
                                         val result = com.rikkaminis.app.mcp.oauth.MCPOAuthController(context)
                                             .authorize(sid, url.trim(), cfg)
                                         oauthBusy = false
@@ -824,16 +878,27 @@ private fun MCPFormTab(
                 // encrypted client secret forever (the STDIO form never shows
                 // the OAuth section, so nothing could ever clear it). Passing
                 // null on the STDIO path removes the entry.
-                com.rikkaminis.app.mcp.oauth.MCPOAuthStore.setClientSecret(
-                    context, server.id,
-                    if (isUrlTransport && server.oauth != null) {
-                        oauthClientSecret.trim().ifBlank { null }
-                    } else {
-                        null
-                    },
-                )
-                if (isEdit) mcpRepository.update(server) else mcpRepository.add(server)
-                onDone()
+                // [deep-audit-1040 B-04] Save touches Keystore-backed prefs
+                // (setClientSecret), servers.json (update/add → save()) and the
+                // OAuth reconcile (bridge file + chmod) — all disk. Capture the
+                // Compose-owned values here (Main) and do the work on IO; the
+                // navigation callback fires back on Main once it lands, so the
+                // sheet never closes ahead of a failed write.
+                val secretValue = oauthClientSecret
+                oauthScope.launch {
+                    withContext(Dispatchers.IO) {
+                        com.rikkaminis.app.mcp.oauth.MCPOAuthStore.setClientSecret(
+                            context, server.id,
+                            if (isUrlTransport && server.oauth != null) {
+                                secretValue.trim().ifBlank { null }
+                            } else {
+                                null
+                            },
+                        )
+                        if (isEdit) mcpRepository.update(server) else mcpRepository.add(server)
+                    }
+                    onDone()
+                }
             }) { Text(stringResource(R.string.mcp_form_save)) }
         }
     }
@@ -1003,11 +1068,20 @@ private fun MCPImportTab(
         }
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
             MinisTextButton(onClick = onDone) { Text(stringResource(R.string.cancel)) }
+            // [deep-audit-1040 B-04] importJSON rewrites servers.json and
+            // reconciles OAuth for every imported entry — disk + Keystore.
+            // Launched from IO; errorText / onDone are touched back on Main.
+            val importScope = rememberCoroutineScope()
             MinisTextButton(
                 onClick = {
-                    val imported = mcpRepository.importJSON(text)
-                    if (imported.isEmpty()) errorText = context.getString(R.string.mcp_import_none)
-                    else onDone()
+                    val payload = text
+                    importScope.launch {
+                        val imported = withContext(Dispatchers.IO) {
+                            mcpRepository.importJSON(payload)
+                        }
+                        if (imported.isEmpty()) errorText = context.getString(R.string.mcp_import_none)
+                        else onDone()
+                    }
                 },
                 enabled = previewCount > 0,
             ) { Text(stringResource(R.string.mcp_import_submit)) }
