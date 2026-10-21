@@ -230,6 +230,34 @@ class BrowserSettingsCookieRefreshTest {
         )
     }
 
+    /**
+     * A `by` delegate is a LOCAL val, not a hoisted symbol: if the subscription
+     * is written below the remembers that key on it, the real Gradle build dies
+     * with `Unresolved reference 'historyRevision'` (this assertion exists
+     * because exactly that happened on the first CI run — the sandbox has no
+     * Android SDK, so the Compose file itself cannot be compiled here, and
+     * Part B's text analysis is the only local detector for this class).
+     */
+    @Test
+    fun theSubscriptionIsDeclaredBeforeItsConsumers() {
+        val code = sheet.lines().filterNot { it.trimStart().startsWith("//") }.joinToString("\n")
+        val decl = Regex("val\\s+(\\w+)\\s+by\\s+[\\w.]*revision\\s*\\.\\s*collectAsState")
+            .find(code)
+
+        assertTrue("no revision subscription declaration found", decl != null)
+        val declaredAt = decl!!.range.first
+        for (anchor in listOf("val hasCookies = remember", "val allDomains = remember")) {
+            val use = code.indexOf(anchor)
+            assertTrue("$anchor not found", use >= 0)
+            assertTrue(
+                "`${decl.groupValues[1]}` is declared at offset $declaredAt but used by " +
+                    "`$anchor` at $use — a `by` delegate is a local val, so the real " +
+                    "build fails with Unresolved reference",
+                use > declaredAt,
+            )
+        }
+    }
+
     // ── plumbing ────────────────────────────────────────────────────────────
 
     private fun readRepoFile(relative: String): String {
