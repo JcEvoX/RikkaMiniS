@@ -186,13 +186,27 @@ def analyse(src):
     # criterion pins that DECISION at BOTH sites (the declared switches and the
     # declared value-taking shorts travel with the call) rather than one
     # spellable line, so a reformat that keeps the behaviour stays green.
+    # [dv18-A A-01a] re-anchored to EVERY OffloadArgs( construction site: the
+    # two handle sites carry the declared set AND the pre-scan probe must pass
+    # the SAME set (a pre-scan that drops it mis-splits `-p com.x package info`
+    # into a bogus group). Count + decision-point, not one spellable line.
     switches = "booleanFlags = noValueFlagsFor(group)"
     shorts = "valueShortOptions = SHIZUKU_VALUE_SHORT_OPTIONS"
+    naked = [
+        src[:m.start()].count("\n") + 1
+        for m in re.finditer(r"OffloadArgs\(", src)
+        if "valueShortOptions =" not in src[m.start():m.start() + 200]
+    ]
+    pre_scan = re.search(
+        r"firstPositionalIndex\(\s*argv[^)]*SHIZUKU_VALUE_SHORT_OPTIONS", src)
     results.append((
-        "1 parser receives declared switches (per group)",
-        src.count(switches) == 2 and src.count(shorts) == 2,
+        "1 parser receives declared switches (per group); every OffloadArgs threads value shorts",
+        src.count(switches) == 2 and src.count(shorts) == 2
+        and not naked and pre_scan is not None
+        and "valueShortOptions = valueShortOptions" in src,
         line_of(src, "split.withoutGroup"),
-        "expected 2x `%s` and 2x `%s`" % (switches, shorts),
+        "expected 2x `%s` and 2x `%s`; naked constructions=%s; pre-scan passes the set=%s"
+        % (switches, shorts, naked or "none", "yes" if pre_scan else "NO"),
     ))
     results.append((
         "2 NO_VALUE_FLAGS covers switches, excludes value flags",
@@ -471,7 +485,7 @@ internal fun noValueFlagsFor(group: String?): Set<String> =
     else ShizukuOffloadHandler.NO_VALUE_FLAGS
 
 internal fun splitShizukuArgv(argv: List<String>): ShizukuArgv {
-    val index = firstPositionalIndex(argv, ShizukuOffloadHandler.NO_VALUE_FLAGS)
+    val index = firstPositionalIndex(argv, ShizukuOffloadHandler.NO_VALUE_FLAGS, SHIZUKU_VALUE_SHORT_OPTIONS)
     if (index < 0) return ShizukuArgv(null, argv, emptyList(), execOptionTokens = argv)
     val group = argv[index]
     val leading = argv.take(index)
@@ -513,7 +527,14 @@ internal fun stripExecTimeoutTokens(tokens: List<String>): Pair<List<String>, Li
 private fun isExecTimeoutValue(value: String): Boolean =
     value.isNotEmpty() && value.all { it in '0'..'9' }
 
-internal fun firstPositionalIndex(argv: List<String>, booleanFlags: Set<String>): Int = 0
+internal fun firstPositionalIndex(
+    argv: List<String>,
+    booleanFlags: Set<String>,
+    valueShortOptions: Set<String> = emptySet(),
+): Int {
+    val probe = OffloadArgs(argv, booleanFlags = booleanFlags, valueShortOptions = valueShortOptions)
+    return if (probe.positional.isNotEmpty()) 0 else -1
+}
 
 internal fun extractUidFromDumpsys(dumpsysOutput: String): String? =
     Regex("""userId=(\\d+)""").find(dumpsysOutput)?.groupValues?.get(1)
@@ -577,6 +598,16 @@ EXTRA_BREAKERS = [
     ("15c the resolver falls back to root's uid",
      r'Regex("""userId=(\d+)""").find(dumpsysOutput)?.groupValues?.get(1)',
      r'Regex("""userId=(\d+)""").find(dumpsysOutput)?.groupValues?.get(1) ?: "0"', "15 "),
+    # [dv18-A A-01a] criterion 1 was re-anchored to every OffloadArgs(
+    # construction; the pre-scan half gets its own arms — a pre-scan that drops
+    # the set (or a probe that stops threading it) mis-splits
+    # `-p com.x package info` while the handle sites stay correct.
+    ("1b the pre-scan call drops the value-short set",
+     "firstPositionalIndex(argv, ShizukuOffloadHandler.NO_VALUE_FLAGS, SHIZUKU_VALUE_SHORT_OPTIONS)",
+     "firstPositionalIndex(argv, ShizukuOffloadHandler.NO_VALUE_FLAGS)", "1 "),
+    ("1c the pre-scan probe stops threading the value shorts",
+     "val probe = OffloadArgs(argv, booleanFlags = booleanFlags, valueShortOptions = valueShortOptions)",
+     "val probe = OffloadArgs(argv, booleanFlags = booleanFlags)", "1 "),
 ]
 # criterion 4 has two halves; break the global-trim half explicitly
 BREAKERS[4] = (
