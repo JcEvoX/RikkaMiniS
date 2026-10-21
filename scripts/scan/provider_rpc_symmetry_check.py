@@ -74,7 +74,7 @@ Selftest：≥4 夹具，每条判据至少一个「恰好被它打破」的形�
 
 import os
 import re
-import sys
+import sys  # [dv20-a1 A-02] fixture re-anchor
 import json
 import shutil
 import tempfile
@@ -410,11 +410,68 @@ def base_url_write_offsets(code):
     return sorted(offs)
 
 
+def check_group_member_faces(mut_code, debug_code, groups_code):
+    """[dv20-a1 A-02] Two decisions on the group member faces.
+
+    C16 — member-id validity is judged through the ONE shared predicate
+    `SystemVoiceEntries.isKnownGroupMemberId` on every write face
+    (GroupsCollection.requireKnownEntryIds, groupsCreate, groupsUpdate), and the
+    read face (groupsList member rows) resolves the virtual System entries
+    through `SystemVoiceEntries.resolve` instead of dropping them. The
+    sentinels are never persisted, so a face that re-derives "known" from
+    `modelEntries` alone calls every voice-group member unknown.
+
+    C17 — none of those faces re-spells the sentinel id literal; the id has one
+    home, or the five readers drift apart again.
+
+    Returns (v16, v17, fail_closed).
+    """
+    v16, v17, vfc = [], [], []
+    helper = extract_function(groups_code, ENTRY_ID_HELPER)
+    if helper is None:
+        vfc.append("%s: %s not found (fail-closed) — the single implementation moved"
+                   % (GROUPS_COLLECTION_FILE, ENTRY_ID_HELPER))
+    elif "SystemVoiceEntries.isKnownGroupMemberId" not in helper:
+        v16.append(
+            "%s: %s judges member ids from the persisted entry list alone — the "
+            "virtual System voice ids are never persisted, so a voice group written "
+            "by the harness is refused with '%s'; consult "
+            "SystemVoiceEntries.isKnownGroupMemberId (single source)"
+            % (GROUPS_COLLECTION_FILE, ENTRY_ID_HELPER, ENTRY_ID_MSG))
+    for fn in (GROUP_CREATE_FN, GROUP_UPDATE_FN):
+        body = extract_function(mut_code, fn)
+        if body is None:
+            vfc.append("%s: %s not found (fail-closed)" % (MUTATION_FILE, fn))
+        elif "SystemVoiceEntries.isKnownGroupMemberId" not in body:
+            v16.append(
+                "%s: %s filters member ids by the persisted entry list alone — a System "
+                "voice member is silently dropped from the group it was just handed; "
+                "consult SystemVoiceEntries.isKnownGroupMemberId"
+                % (MUTATION_FILE, fn))
+    members = extract_function(debug_code, GROUP_LIST_FN)
+    if members is None:
+        vfc.append("%s: %s not found (fail-closed)" % (DEBUG_FILE, GROUP_LIST_FN))
+    elif "SystemVoiceEntries.resolve(" not in members:
+        v16.append(
+            "%s: %s never resolves a virtual System voice member — the member row is "
+            "silently missing from the group the harness just read back; resolve it "
+            "through SystemVoiceEntries.resolve" % (DEBUG_FILE, GROUP_LIST_FN))
+    for label, code in ((GROUPS_COLLECTION_FILE, groups_code),
+                        (MUTATION_FILE, mut_code),
+                        (DEBUG_FILE, debug_code)):
+        if "__builtin_system_speech__" in code:
+            v17.append(
+                "%s: spells the System sentinel id literal — it must come from "
+                "SystemVoiceEntries, or one of the five readers drifts the moment the "
+                "id changes" % label)
+    return v16, v17, vfc
+
+
 def check_tree(root):
     """Returns (rc, detail dict). rc=0 all green."""
     detail = {"c1": [], "c2": [], "c3": [], "c4": [], "c5": [], "c6": [], "c7": [],
               "c8": [], "c9": [], "c10": [], "c11": [], "c12": [], "c13": [],
-              "c14": [], "c15": [], "fail_closed": []}
+              "c14": [], "c15": [], "c16": [], "c17": [], "fail_closed": []}
 
     debug_paths = find_files(root, DEBUG_FILE)
     mut_paths = find_files(root, MUTATION_FILE)
@@ -866,6 +923,13 @@ def check_tree(root):
                 "existence check (%s)" % (GROUPS_COLLECTION_FILE, ENTRY_ID_HELPER)
             )
 
+    # ---- C16/C17 ---- [dv20-a1 A-02] the group member faces must judge through
+    # the ONE shared predicate, and must not re-spell the sentinel id.
+    v16, v17, vfc = check_group_member_faces(mut_code, debug_code, groups_code)
+    detail["c16"].extend(v16)
+    detail["c17"].extend(v17)
+    detail["fail_closed"].extend(vfc)
+
     # ---- C14 ---- [fix/dv16-a A-07] the two instance write faces must accept
     # the SAME optional key set — the create face previously dropped
     # imageEndpointMode entirely while the update face accepted it (an
@@ -929,7 +993,7 @@ def check_tree(root):
 
     rc = 0
     for k in ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11",
-              "c12", "c13", "c14", "c15", "fail_closed"):
+              "c12", "c13", "c14", "c15", "c16", "c17", "fail_closed"):
         if detail[k]:
             rc = 1
     return rc, detail
@@ -992,6 +1056,7 @@ internal object ProviderDebugMethods {
 
     fun groupsList(context: android.content.Context, params: JSONObject): JSONObject {
         val arr = JSONArray()
+        val resolvedMember = com.rikkaminis.app.data.model.SystemVoiceEntries.resolve("m")
         for (group in listOf<com.rikkaminis.app.data.model.ModelGroupStub>()) {
             arr.put(JSONObject().apply {
                 put("id", group.id)
@@ -1067,6 +1132,7 @@ internal object ProviderMutationMethods {
 
     fun groupsCreate(context: android.content.Context, params: JSONObject): JSONObject {
         val thinking = params.optString("defaultThinkingLevel", "")
+        val membersOk = SystemVoiceEntries.isKnownGroupMemberId("m", emptySet())
         val rawLimit = params.opt("contextLimitTokens")
         val group = com.rikkaminis.app.data.model.ModelGroupStub(name = params.optString("name", "New group"))
         return groupToJson(group)
@@ -1074,6 +1140,7 @@ internal object ProviderMutationMethods {
 
     fun groupsUpdate(context: android.content.Context, params: JSONObject): JSONObject {
         var limitValue = 0
+        val membersOk = SystemVoiceEntries.isKnownGroupMemberId("m", emptySet())
         if (params.has("defaultThinkingLevel")) {
             val t = params.optString("defaultThinkingLevel", "")
         }
@@ -1162,7 +1229,9 @@ internal class GroupsCollection {
     private fun requireKnownEntryIds(ids: List<String>) {
         val valid = repo.config.value.modelEntries.map { it.id }.toSet()
         for (eid in ids) {
-            if (eid !in valid) throw ConfigError.InvalidValue("Unknown model entry uuid: $eid")
+            if (!SystemVoiceEntries.isKnownGroupMemberId(eid, valid)) {
+                throw ConfigError.InvalidValue("Unknown model entry uuid: $eid")
+            }
         }
     }
 
@@ -1352,6 +1421,70 @@ internal fun Request.Builder.applyOpenAIKeyAuth(
 ): Request.Builder =
     openAIKeyAuthHeader(azure, token).let { (name, value) -> header(name, value) }
 '''
+
+# -- [dv20-a1 A-02] group member-face fixtures -------------------------------
+# Self-contained on purpose: the shared GOOD_* fixtures above keep judging
+# exactly what they judged before this batch.
+
+GOOD_MEMBER_FACES_COLL = '''
+package fake.collections
+
+import com.rikkaminis.app.data.model.SystemVoiceEntries
+
+class GroupsCollection {
+    private fun requireKnownEntryIds(ids: List<String>) {
+        val valid = repo.config.value.modelEntries.map { it.id }.toSet()
+        for (eid in ids) {
+            if (!SystemVoiceEntries.isKnownGroupMemberId(eid, valid)) {
+                throw ConfigError.InvalidValue("Unknown model entry uuid: $eid")
+            }
+        }
+    }
+}
+'''
+
+GOOD_MEMBER_FACES_MUT = '''
+package fake.debug
+
+import com.rikkaminis.app.data.model.SystemVoiceEntries
+
+object ProviderMutationMethods {
+    fun groupsCreate(repo: Any, params: Any): Any {
+        val knownEntryIds = repo.config.value.modelEntries.map { it.id }.toSet()
+        if (id.isNotEmpty() && SystemVoiceEntries.isKnownGroupMemberId(id, knownEntryIds)) {
+            members.add(id)
+        }
+        return members
+    }
+
+    fun groupsUpdate(repo: Any, params: Any): Any {
+        val knownIds = repo.config.value.modelEntries.map { it.id }.toSet()
+        if (mid.isNotEmpty() && SystemVoiceEntries.isKnownGroupMemberId(mid, knownIds)) {
+            members.add(mid)
+        }
+        return members
+    }
+}
+'''
+
+GOOD_MEMBER_FACES_DBG = '''
+package fake.debug
+
+import com.rikkaminis.app.data.model.SystemVoiceEntries
+
+object ProviderDebugMethods {
+    fun groupsList(cfg: Any): Any {
+        val members = JSONArray()
+        for (memberId in group.memberEntryIds) {
+            val persisted = cfg.modelEntries.find { it.id == memberId }
+            val entry = persisted ?: SystemVoiceEntries.resolve(memberId) ?: continue
+            members.put(JSONObject().apply { put("entryId", entry.id) })
+        }
+        return members
+    }
+}
+'''
+
 
 def write_fixture(debug_text, mutation_text, collection_text=None,
                   config_text=None, connection_text=None,
@@ -1941,6 +2074,47 @@ def run_selftest():
     results.append(("F39-add-does-not-decode-imageEndpointMode-C15", ok, detail))
     shutil.rmtree(root)
 
+    # --- [dv20-a1 A-02] C16/C17: the group member faces judge through the one
+    # shared predicate, and none of them re-spells the sentinel id.
+    def member_face_arm(label, key, mut, dbg, grp):
+        v16, v17, vfc = check_group_member_faces(mut, dbg, grp)
+        got = {"c16": v16, "c17": v17, "fail_closed": vfc}
+        if key is None:
+            clean = not any(got.values())
+            results.append((label, clean, {} if clean else got))
+            return
+        ok = bool(got[key]) and not any(got[k] for k in got if k != key)
+        results.append((label, ok, got))
+
+    member_face_arm("F40-member-faces-good-green", None,
+                    GOOD_MEMBER_FACES_MUT, GOOD_MEMBER_FACES_DBG, GOOD_MEMBER_FACES_COLL)
+    member_face_arm(
+        "F41-collection-refuses-sentinels-C16", "c16",
+        GOOD_MEMBER_FACES_MUT, GOOD_MEMBER_FACES_DBG,
+        GOOD_MEMBER_FACES_COLL.replace(
+            "!SystemVoiceEntries.isKnownGroupMemberId(eid, valid)", "eid !in valid"))
+    member_face_arm(
+        "F42-create-drops-sentinels-C16", "c16",
+        GOOD_MEMBER_FACES_MUT.replace(
+            "SystemVoiceEntries.isKnownGroupMemberId(id, knownEntryIds)", "id in knownEntryIds"),
+        GOOD_MEMBER_FACES_DBG, GOOD_MEMBER_FACES_COLL)
+    member_face_arm(
+        "F43-list-drops-sentinels-C16", "c16",
+        GOOD_MEMBER_FACES_MUT,
+        GOOD_MEMBER_FACES_DBG.replace(" ?: SystemVoiceEntries.resolve(memberId)", ""),
+        GOOD_MEMBER_FACES_COLL)
+    member_face_arm(
+        "F44-sentinel-literal-respelled-C17", "c17",
+        GOOD_MEMBER_FACES_MUT.replace(
+            "        val knownIds = repo.config.value.modelEntries.map { it.id }.toSet()",
+            "        val pinned = \"__builtin_system_speech__\"\n"
+            "        val knownIds = repo.config.value.modelEntries.map { it.id }.toSet()"),
+        GOOD_MEMBER_FACES_DBG, GOOD_MEMBER_FACES_COLL)
+    member_face_arm(
+        "F45-member-face-anchor-absent-fail-closed", "fail_closed",
+        GOOD_MEMBER_FACES_MUT, GOOD_MEMBER_FACES_DBG,
+        "package fake\n\nclass GroupsCollection {\n}\n")
+
     all_ok = True
     for name, ok, detail in results:
         print("%s %s" % ("PASS" if ok else "FAIL", name))
@@ -1971,10 +2145,11 @@ def main():
               "C7 probe auth fork, C8 config-face keys, C9 UA visibility, "
               "C10 auth single source, C11 group field faces, "
               "C12 context-limit canonical face, C13 entry-id check single-source, "
-              "C14 instance key parity, C15 collection image keys)")
+              "C14 instance key parity, C15 collection image keys, "
+              "C16 group member predicate single-source, C17 no sentinel literal)")
         return 0
     for k in ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11",
-              "c12", "c13", "c14", "c15", "fail_closed"):
+              "c12", "c13", "c14", "c15", "c16", "c17", "fail_closed"):
         for line in detail[k]:
             print("[%s] %s" % (k.upper(), line))
     return 1
