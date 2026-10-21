@@ -356,7 +356,20 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
     // -- Session --
 
     fun setSession(sessionId: String) {
+        // [fix/dv17-1 B-06] Capture the OLD id before it is overwritten: a pool
+        // bound to a draft session (`__new__<uuid>`) carries download records
+        // whose destination is frozen under the draft workspace. When the pool
+        // is re-pointed at the promoted session the draft tree is already gone
+        // (migrateDraftResources moved the bytes and deleted the directory), so
+        // those records' "open" buttons died at their file.exists() guard with
+        // zero feedback. Re-point the paths through the atomic update — a
+        // non-draft rebind (previous == null, or same id) is a byte-identical
+        // no-op, exactly the behavior before this change.
+        val previous = this.sessionId
         this.sessionId = sessionId
+        if (previous != null && previous != sessionId) {
+            remapDownloadsToSession(oldSessionId = previous, newSessionId = sessionId)
+        }
         // [audit-RC13] Pin every live tab's WebView to this chat session so
         // minis:// subresource interception resolves files through
         // resolveSessionHostPath (session-scoped) instead of the global
@@ -528,6 +541,35 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
     fun downloadBadgeCount(entries: List<DownloadEntry>): Int =
         entries.count { it.state == DownloadState.DOWNLOADING || !it.seen }
 
+    /**
+     * [fix/dv17-1 B-06] Re-point every download record that lived under
+     * [oldSessionId]'s workspace onto [newSessionId]'s workspace.
+     *
+     * Called only from [setSession] on a real id change. Both directories are
+     * built from the same shape as [sessionWorkspaceDirOf] — deliberately
+     * WITHOUT mkdirs: the old directory is usually already deleted (recreating
+     * it would resurrect the draft tree), and the new one is created by
+     * migrateDraftResources / the next download.
+     *
+     * ponytail: 只做「路径前缀重指」，不迁字节、不校验新路径是否存在 | 天花板:
+     * 若迁移走的是跨设备 copy 回退（而非 rename），一个正处于 DOWNLOADING 的
+     * 条目其已打开的流仍写在旧 inode 上，重指后的路径会指向别处 | 升级触发:
+     * 真机上出现「晋升后有下载记录但打开仍失败」（rename 语义失效被实测到）。
+     */
+    private fun remapDownloadsToSession(oldSessionId: String, newSessionId: String) {
+        val oldDir = sessionWorkspaceDirOf(oldSessionId)
+        val newDir = sessionWorkspaceDirOf(newSessionId)
+        _downloads.update { current ->
+            remapDownloadDestinations(
+                entries = current,
+                oldDir = oldDir,
+                newDir = newDir,
+                pathOf = { entry -> entry.destination },
+                withPath = { entry, path -> entry.copy(destination = path) },
+            )
+        }
+    }
+
     /** Panel opened — terminal entries stop counting toward the badge. */
     fun markDownloadsSeen() {
         _downloads.update { current ->
@@ -546,9 +588,15 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
      *  so the agent can read and operate on them in follow-up turns. */
     private fun sessionWorkspaceDir(): File? {
         val sid = sessionId ?: return null
-        return File(File(File(context.filesDir, "minis-sessions"), sid), "workspace")
-            .apply { mkdirs() }
+        return sessionWorkspaceDirOf(sid).apply { mkdirs() }
     }
+
+    /** [fix/dv17-1 B-06] Single source of the workspace path shape, shared by
+     *  the live lookup above and the id-keyed remap in [remapDownloadsToSession]
+     *  (which must NOT mkdirs: it names the *old*, usually deleted directory).
+     *  Session does not require the file. */
+    private fun sessionWorkspaceDirOf(sessionId: String): File =
+        File(File(File(context.filesDir, "minis-sessions"), sessionId), "workspace")
 
     /** name.ext → name-1.ext → name-2.ext … until unused. */
     private fun uniqueFile(dir: File, name: String): File {
@@ -928,8 +976,32 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
             val stamped = stampTabId(result.copy(pageURL = tab.manager.currentURL.value), tab.id)
 
             // Stamp risk challenge info onto the result so the agent can react.
+            //
+            // [fix/dv17-1 B-01] Surfacing it through the structured fields
+            // alone was not enough: nothing in the tree read
+            // riskChallengeDetected / riskChallengeKind / recommendedNextAction
+            // (ChatToolExecutors takes `result.text` and nothing else), so a
+            // challenge page reached the model as undistinguished text and it
+            // retried blindly. Merge the one-line notice into `text` — the
+            // only exit the agent can read — via the pure renderer in
+            // BrowserRiskControl, using the same "append a line" shape as
+            // stampTabId. The fields stay written (contract unchanged); the
+            // else branch appends nothing, so the common no-challenge path is
+            // byte-identical to before.
             if (riskChallenge != null) {
+                val notice = BrowserRiskControl.challengeNoticeLine(
+                    kind = riskChallenge.kind,
+                    recommendedNextAction = riskChallenge.recommendedNextAction,
+                    throttleDelayMs = throttleDelayMs,
+                )
+                val text = if (notice != null && !stamped.text.contains(notice)) {
+                    val needsNewline = stamped.text.isNotEmpty() && !stamped.text.endsWith("\n")
+                    stamped.text + (if (needsNewline) "\n" else "") + notice
+                } else {
+                    stamped.text
+                }
                 stamped.copy(
+                    text = text,
                     riskChallengeDetected = true,
                     riskChallengeKind = riskChallenge.kind,
                     recommendedNextAction = riskChallenge.recommendedNextAction,

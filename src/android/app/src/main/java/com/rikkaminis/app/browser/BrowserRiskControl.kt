@@ -189,4 +189,38 @@ internal object BrowserRiskControl {
             else -> null
         }
     }
+
+    /**
+     * [fix/dv17-1 B-01] Renders a detected challenge as one line the agent can
+     * actually read.
+     *
+     * The four structured fields this object feeds into [BrowserActionResult]
+     * (riskChallengeDetected / riskChallengeKind / recommendedNextAction, plus
+     * the throttle) had **no reader anywhere in the tree** — `ChatToolExecutors`
+     * consumes `result.text` and nothing else. So a Cloudflare challenge /
+     * captcha / 429 reached the model as undistinguished page text, and it
+     * retried blindly instead of waiting or handing over to the user. This is
+     * the text-side exit; the fields stay written for other readers.
+     *
+     * Pure and Android-free (JVM-testable). Returns null when either half is
+     * blank, so callers append **nothing** when no challenge was detected —
+     * a `[risk]` line on every browser result would be pure noise for the
+     * model and would blunt the signal on the runs that matter.
+     *
+     * @param kind machine-readable challenge kind (e.g. "cloudflare_challenge")
+     * @param recommendedNextAction the action id the agent should take next
+     * @param throttleDelayMs delay applied before this result returned; 0 when
+     *   the action was not throttled. Surfaced only when positive.
+     */
+    fun challengeNoticeLine(
+        kind: String?,
+        recommendedNextAction: String?,
+        throttleDelayMs: Long
+    ): String? {
+        val normalizedKind = kind?.trim().orEmpty()
+        val action = recommendedNextAction?.trim().orEmpty()
+        if (normalizedKind.isEmpty() || action.isEmpty()) return null
+        val throttleSuffix = if (throttleDelayMs > 0L) " (throttled ${throttleDelayMs}ms)" else ""
+        return "[risk] $normalizedKind — next: $action$throttleSuffix"
+    }
 }
