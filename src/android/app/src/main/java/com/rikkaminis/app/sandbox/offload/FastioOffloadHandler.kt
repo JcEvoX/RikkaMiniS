@@ -50,12 +50,13 @@ import java.util.regex.PatternSyntaxException
  *   minis-fastio tar -xf <a.tar> [-C dir]   write: unpack (tar-slip guarded)
  *
  * The read-only primitives (`du` / `find` / `grep`) are NOT gated — they grant
- * nothing the agent's `file_read` does not already have. Every WRITE primitive
- * is gated by [OffloadGate] under its own permission row (ASK_ONCE by default):
- * `fastio_rm`, `fastio_cp`, `fastio_mv`, `fastio_tar` — one row per write tool,
- * so a user who trusts deletion does not thereby authorise overwriting, and
- * neither of them silently authorises writing an archive out (or expanding one
- * in).
+ * nothing the agent's `file_read` does not already have. The WRITE primitives
+ * are gated by [OffloadGate] under their own rows (`fastio_rm`, `fastio_cp`,
+ * `fastio_mv`, `fastio_tar` — one row per write tool so a per-tool override
+ * stays possible), but their default is BYPASS: [GuestPathMapper] limits their
+ * reachable set to the app's own sandbox, which the guest shell already
+ * reaches unrestricted, so asking per delete bought nothing a shell `rm -rf`
+ * does not already allow. A user who WANTS a prompt can still downgrade a row.
  *
  * ## Guards on the destructive / write paths
  *
@@ -1258,8 +1259,10 @@ Usage:
   minis-fastio mv <src> <dst>          Write: rename (copy+delete only across filesystems).
   minis-fastio tar -cf <a.tar> <path>...   Write: pack into a POSIX ustar archive (-czf to gzip).
   minis-fastio tar -xf <a.tar> [-C dir]    Write: unpack (-xzf to gunzip; -C defaults to the current directory).
-  Every write primitive asks for permission first (Settings → Permissions), each under its
-  own row: minis-fastio (delete) / (copy) / (move) / (archive).
+  The write primitives still pass through OffloadGate (one row each:
+  minis-fastio (delete) / (copy) / (move) / (archive)) so a per-tool override
+  stays possible, but their default level is BYPASS — the reachable set is the
+  app's own sandbox, which the guest shell already writes to unrestricted.
 
 Options:
   -r, --recursive    (rm/cp) descend into directories. `-rf` / `-fr` work too; for `rm`, `-f`

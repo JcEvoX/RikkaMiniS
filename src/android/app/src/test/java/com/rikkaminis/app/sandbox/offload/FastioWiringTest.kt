@@ -48,34 +48,35 @@ class FastioWiringTest {
             app.contains("import com.rikkaminis.app.sandbox.offload.FastioOffloadHandler"),
         )
         assertTrue(
-            "the destructive path must be gated ASK_ONCE (not BYPASS)",
+            "the destructive path must default to BYPASS: its reachable set is " +
+                "the app's own sandbox, which the guest shell already deletes from unprompted",
             permission.contains(
                 "ToolPermissionInfo(\"fastio_rm\", \"minis-fastio (delete)\", " +
-                    "PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE)",
+                    "PermissionCategory.SYSTEM, PermissionLevel.BYPASS)",
             ),
         )
         // Phase 2: one row per write primitive — trusting deletion must not
         // silently authorise overwriting a different file.
         assertTrue(
-            "cp must have its own ASK_ONCE row",
+            "cp must have its own BYPASS row (visible, so the user can re-enable prompts)",
             permission.contains(
                 "ToolPermissionInfo(\"fastio_cp\", \"minis-fastio (copy)\", " +
-                    "PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE)",
+                    "PermissionCategory.SYSTEM, PermissionLevel.BYPASS)",
             ),
         )
         assertTrue(
-            "mv must have its own ASK_ONCE row",
+            "mv must have its own BYPASS row (visible, so the user can re-enable prompts)",
             permission.contains(
                 "ToolPermissionInfo(\"fastio_mv\", \"minis-fastio (move)\", " +
-                    "PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE)",
+                    "PermissionCategory.SYSTEM, PermissionLevel.BYPASS)",
             ),
         )
         // Phase 3: the archive primitive is a write in BOTH directions.
         assertTrue(
-            "tar must have its own ASK_ONCE row",
+            "tar must have its own BYPASS row (visible, so the user can re-enable prompts)",
             permission.contains(
                 "ToolPermissionInfo(\"fastio_tar\", \"minis-fastio (archive)\", " +
-                    "PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE)",
+                    "PermissionCategory.SYSTEM, PermissionLevel.BYPASS)",
             ),
         )
         assertTrue(
@@ -408,15 +409,14 @@ class FastioWiringTest {
     }
 
     @Test
-    fun `negative control - downgrading the permission to BYPASS makes the wiring probe fail`() {
+    fun `negative control - dropping the rm permission row makes the wiring probe fail`() {
         val original = source(permissionFile)
         val mutated = original.replace(
             "ToolPermissionInfo(\"fastio_rm\", \"minis-fastio (delete)\", " +
-                "PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE)",
-            "ToolPermissionInfo(\"fastio_rm\", \"minis-fastio (delete)\", " +
                 "PermissionCategory.SYSTEM, PermissionLevel.BYPASS)",
+            "",
         )
-        assertTrue("the ASK_ONCE entry must exist to be mutated", mutated != original)
+        assertTrue("the rm row must exist to be removable", mutated != original)
 
         var failed = false
         try {
@@ -424,7 +424,53 @@ class FastioWiringTest {
         } catch (_: AssertionError) {
             failed = true
         }
-        assertTrue("the wiring probe must fail on a BYPASS default", failed)
+        assertTrue("the wiring probe must fail without the rm permission row", failed)
+    }
+
+    @Test
+    fun `negative control - re-asking for rm permission makes the wiring probe fail`() {
+        // BYPASS is the posture (see OffloadPermissionManager registry KDoc):
+        // an ASK_ONCE default reintroduces the prompt the agent cannot dismiss
+        // from inside the session, so the probe must reject it.
+        val original = source(permissionFile)
+        val mutated = original.replace(
+            "ToolPermissionInfo(\"fastio_rm\", \"minis-fastio (delete)\", " +
+                "PermissionCategory.SYSTEM, PermissionLevel.BYPASS)",
+            "ToolPermissionInfo(\"fastio_rm\", \"minis-fastio (delete)\", " +
+                "PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE)",
+        )
+        assertTrue("the BYPASS entry must exist to be mutated", mutated != original)
+
+        var failed = false
+        try {
+            assertWired(source(catalogFile), source(appFile), mutated, source(promptFile))
+        } catch (_: AssertionError) {
+            failed = true
+        }
+        assertTrue("the wiring probe must fail on an ASK_ONCE default", failed)
+    }
+
+    @Test
+    fun `negative control - hiding the rm row makes the wiring probe fail`() {
+        // The row must stay visible: per T338 the Settings screen is the only
+        // place a permanent level is set, so hiding it would delete the user's
+        // only path back to a prompt.
+        val original = source(permissionFile)
+        val mutated = original.replace(
+            "ToolPermissionInfo(\"fastio_rm\", \"minis-fastio (delete)\", " +
+                "PermissionCategory.SYSTEM, PermissionLevel.BYPASS)",
+            "ToolPermissionInfo(\"fastio_rm\", \"minis-fastio (delete)\", " +
+                "PermissionCategory.SYSTEM, PermissionLevel.BYPASS, showInSettings = false)",
+        )
+        assertTrue("the visible row must exist to be mutated", mutated != original)
+
+        var failed = false
+        try {
+            assertWired(source(catalogFile), source(appFile), mutated, source(promptFile))
+        } catch (_: AssertionError) {
+            failed = true
+        }
+        assertTrue("the wiring probe must fail on a hidden rm row", failed)
     }
 
     @Test
@@ -483,7 +529,7 @@ class FastioWiringTest {
         val original = source(permissionFile)
         val mutated = original.replace(
             "ToolPermissionInfo(\"fastio_cp\", \"minis-fastio (copy)\", " +
-                "PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE)",
+                "PermissionCategory.SYSTEM, PermissionLevel.BYPASS)",
             "",
         )
         assertTrue("the cp row must exist to be removable", mutated != original)
@@ -556,7 +602,7 @@ class FastioWiringTest {
         val original = source(permissionFile)
         val mutated = original.replace(
             "ToolPermissionInfo(\"fastio_tar\", \"minis-fastio (archive)\", " +
-                "PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE)",
+                "PermissionCategory.SYSTEM, PermissionLevel.BYPASS)",
             "",
         )
         assertTrue("the tar row must exist to be removable", mutated != original)
