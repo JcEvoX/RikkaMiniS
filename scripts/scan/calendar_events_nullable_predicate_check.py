@@ -78,6 +78,7 @@ RULE_A_CODE = 'predicate-on-nullable-column'
 RULE_C_CODE = 'explicit-calendar-selector'
 RULE_D_CODE = 'day-window-refusal'
 RULE_E_CODE = 'write-permission-parity'
+RULE_F_CODE = 'alarm-boundary-symmetry'
 
 # [dv14-A3] Shape-based discovery of `fun` declarations, so the new rules can be
 # written against a *decision* instead of a helper's spelling: rename the pure
@@ -288,6 +289,30 @@ def member_slice(src, marker):
     return "\n".join(lines[start:])
 
 
+def brace_slice(src, marker):
+    """`src` from [marker] to the `}` that balances the first `{` after it.
+
+    Unlike [member_slice] this does not depend on indentation, so it also works
+    for top-level declarations (`resolveAlarmSelector` lives at file scope).
+    """
+    at = src.find(marker)
+    if at < 0:
+        return None
+    open_at = src.find("{", at)
+    if open_at < 0:
+        return None
+    depth = 0
+    for i in range(open_at, len(src)):
+        c = src[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return src[at:i + 1]
+    return None
+
+
 def rule_b(src):
     """The freebusy path must read instances, never events."""
     body = member_slice(src, "private fun doFreebusy(")
@@ -391,6 +416,65 @@ def rule_c(src):
                         " non-numeric --calendar-id reads as 'not written' again")
     return problems
 
+def rule_f(src):
+    """[dv18-A A-04] `--alarm` is written by TWO boundaries (create, update) and
+    both must answer "was the flag written?" from ONE classification of the raw
+    string.
+
+    The pre-fix shape read `args.getInt("alarm")` per writer: "the flag was not
+    given" and "the flag was given with `-5` / `abc`" both became null, so
+    `create --alarm -5` answered exit 0 with the reminder silently dropped and
+    `update --id X --alarm -5` answered `{"updated": true, "rows": 0}` while
+    writing nothing.
+
+    Criteria (each fail-closed on a decision point, not a spelling):
+      F1  the shared classifier exists (`resolveAlarmSelector`) and its body
+          really classifies (nullable parse + the >= 0 bound live THERE);
+      F2  a supplied-but-unusable alarm reaches a refusal (exit 2) in BOTH
+          writers;
+      F3  neither writer re-parses `--alarm` on its own (`getInt("alarm")`).
+    """
+    if "fun doCreate(" not in src and "fun doUpdate(" not in src:
+        return []
+    code = strip_comments(src)
+    problems = []
+    if "resolveAlarmSelector(" not in code:
+        problems.append(
+            "resolveAlarmSelector() is gone — the --alarm decision has no single "
+            "source (the pre-fix per-writer getInt(\"alarm\") read again)"
+        )
+    else:
+        classifier = brace_slice(code, "fun resolveAlarmSelector(")
+        if classifier is None or "toIntOrNull()" not in classifier or ">= 0" not in classifier:
+            problems.append(
+                "resolveAlarmSelector() no longer classifies (nullable parse + "
+                "the >= 0 bound must live in the classifier, not per writer)"
+            )
+    for verb in ("doCreate", "doUpdate"):
+        body = member_slice(code, f"fun {verb}(")
+        if body is None:
+            continue
+        if "resolveAlarmSelector(" not in body:
+            problems.append(
+                f"{verb} does not decide --alarm through resolveAlarmSelector() — "
+                "the two writers answer \"was the flag written?\" separately"
+            )
+        if "getInt(\"alarm\")" in body:
+            problems.append(
+                f"{verb} re-parses --alarm with getInt(\"alarm\") — a supplied "
+                "but unusable value reads as 'not written' again"
+            )
+        if not re.search(
+            r"AlarmSelector\.Unreadable\s*->\s*return NativeOffloadResult\(2,\s*alarmRefusalMessage\(",
+            body,
+        ):
+            problems.append(
+                f"{verb} does not turn AlarmSelector.Unreadable into an exit-2 "
+                "refusal via alarmRefusalMessage — a bad --alarm is ignored again"
+            )
+    return problems
+
+
 def run(root, verbose=True):
     failures = []
     for path in iter_kotlin_files(root):
@@ -408,6 +492,8 @@ def run(root, verbose=True):
                 failures.append(f"{rel}: [{RULE_D_CODE}] {problem}")
             for problem in rule_e(src):
                 failures.append(f"{rel}: [{RULE_E_CODE}] {problem}")
+            for problem in rule_f(src):
+                failures.append(f"{rel}: [{RULE_F_CODE}] {problem}")
         elif os.path.normpath(rel) == os.path.normpath(PHOTOS_REL):
             # [dv14-A3] rule D is the same contract on the photos side; rule E
             # is calendar-only (permissions parity), rule A/B/C never applied here.
@@ -715,6 +801,70 @@ PERM_READ_PATH_ASKS_WRITE = GREEN_DAYS_PERM_HANDLER.replace(
     '''            permissions = listOf(Manifest.permission.READ_CALENDAR, Manifest.permission.WRITE_CALENDAR),
             satisfied = { hasRead() },''')
 
+# [dv18-A A-04] rule F fixtures — the `--alarm` boundary machinery. The
+# classifier is the single source both writers must answer "was --alarm
+# written, and is it usable?" from; the control keeps both writers on it.
+ALARM_CLASSIFIER = '''internal fun resolveAlarmSelector(raw: String?): AlarmSelector {
+    if (raw == null) return AlarmSelector.Absent
+    val minutes = raw.toIntOrNull()
+    return if (minutes != null && minutes >= 0) AlarmSelector.Minutes(minutes) else AlarmSelector.Unreadable(raw)
+}
+'''
+
+ALARM_WRITERS = '''
+class CalendarOffloadHandler {
+    private fun doCreate(args: OffloadArgs): NativeOffloadResult {
+        val alarm = when (val selector = resolveAlarmSelector(args.get("alarm"))) {
+            is AlarmSelector.Unreadable -> return NativeOffloadResult(2, alarmRefusalMessage("create", selector.raw))
+            else -> selector
+        }
+        return insertReminder(args, (alarm as? AlarmSelector.Minutes)?.value)
+    }
+
+    private fun doUpdate(args: OffloadArgs): NativeOffloadResult {
+        val alarm = when (val selector = resolveAlarmSelector(args.get("alarm"))) {
+            is AlarmSelector.Unreadable -> return NativeOffloadResult(2, alarmRefusalMessage("update", selector.raw))
+            else -> selector
+        }
+        return replaceReminder(args, (alarm as? AlarmSelector.Minutes)?.value)
+    }
+}
+'''
+
+GREEN_ALARM_HANDLER = ALARM_CLASSIFIER + ALARM_WRITERS
+
+ALARM_CLASSIFIER_GONE = ALARM_WRITERS
+
+ALARM_CLASSIFIER_NO_CLASSIFY = ALARM_CLASSIFIER.replace(
+    '''    if (raw == null) return AlarmSelector.Absent
+    val minutes = raw.toIntOrNull()
+    return if (minutes != null && minutes >= 0) AlarmSelector.Minutes(minutes) else AlarmSelector.Unreadable(raw)''',
+    '    return AlarmSelector.Absent') + ALARM_WRITERS
+
+ALARM_UPDATE_NO_REFUSAL = ALARM_CLASSIFIER + '''
+class CalendarOffloadHandler {
+    private fun doUpdate(args: OffloadArgs): NativeOffloadResult {
+        val alarm = when (val selector = resolveAlarmSelector(args.get("alarm"))) {
+            else -> selector
+        }
+        return replaceReminder(args, (alarm as? AlarmSelector.Minutes)?.value)
+    }
+}
+'''
+
+ALARM_CREATE_REPARSE = ALARM_CLASSIFIER + '''
+class CalendarOffloadHandler {
+    private fun doCreate(args: OffloadArgs): NativeOffloadResult {
+        val legacy = args.getInt("alarm")
+        val alarm = when (val selector = resolveAlarmSelector(args.get("alarm"))) {
+            is AlarmSelector.Unreadable -> return NativeOffloadResult(2, alarmRefusalMessage("create", selector.raw))
+            else -> selector
+        }
+        return insertReminder(args, (alarm as? AlarmSelector.Minutes)?.value ?: legacy)
+    }
+}
+'''
+
 def write_fixture(root, name, body, handler_rel=True):
     rel = HANDLER_REL if handler_rel else os.path.join(MAIN_ROOT, "com", "rikkaminis", "app", "other", name)
     path = os.path.join(root, rel)
@@ -802,6 +952,33 @@ def selftest():
                 passed = (len(hit) > 0) == expect_red
             print(f"[{'PASS' if passed else 'FAIL'}] selftest: {label} "
                   f"({'rule D/E' if rule is None else rule} expected {'red' if expect_red else 'green'}, "
+                  f"got {len(hit)} violation(s))")
+            for f in hit:
+                print(f"        {f}")
+            ok = ok and passed
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+    # [dv18-A A-04] rule F — one control plus one arm per criterion, each arm
+    # asserting its OWN rule code (same discipline as the D/E block above).
+    for label, body, rule, expect_red in (
+        ("alarm machinery intact (rule F control)", GREEN_ALARM_HANDLER, None, False),
+        ("the shared --alarm classifier is gone", ALARM_CLASSIFIER_GONE, RULE_F_CODE, True),
+        ("the classifier stops classifying", ALARM_CLASSIFIER_NO_CLASSIFY, RULE_F_CODE, True),
+        ("a writer ignores an unusable --alarm", ALARM_UPDATE_NO_REFUSAL, RULE_F_CODE, True),
+        ("a writer re-parses --alarm on its own", ALARM_CREATE_REPARSE, RULE_F_CODE, True),
+    ):
+        root = tempfile.mkdtemp(prefix="calgate-f-")
+        try:
+            write_fixture(root, "CalendarOffloadHandler.kt", body, handler_rel=True)
+            failures = run(root, verbose=False)
+            if rule is None:
+                hit = [f for f in failures if RULE_F_CODE in f]
+                passed = not expect_red and not hit
+            else:
+                hit = [f for f in failures if rule in f]
+                passed = (len(hit) > 0) == expect_red
+            print(f"[{'PASS' if passed else 'FAIL'}] selftest: {label} "
+                  f"({'rule F' if rule is None else rule} expected {'red' if expect_red else 'green'}, "
                   f"got {len(hit)} violation(s))")
             for f in hit:
                 print(f"        {f}")

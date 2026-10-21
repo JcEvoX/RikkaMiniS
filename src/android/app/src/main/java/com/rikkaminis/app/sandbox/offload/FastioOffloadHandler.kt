@@ -1128,6 +1128,14 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
             // modelled too: [normalizeLongOptionSpelling] rewrites them to their
             // `--` spelling before the parse, so `-limit 10 tar …` names `tar`
             // here even though the raw token still carries one dash.
+            //
+            // [dv18-A A-01b] The same "which raw spelling will consume a value"
+            // question applies to the raw single-dash shorts that
+            // [normalizeTarShorts] turns into a value-taking long form
+            // ([SHORT_VALUE_OPTIONS]): `-C /tmp tar -xf a.tar` used to read `-C`
+            // as a bare switch, take `/tmp` for the subcommand and answer
+            // `unknown subcommand '/tmp'` — with `isTarCommand` false, the tar
+            // verbs went undeclared and the `-C`/`-xf` expansion never ran.
             val noValue = OffloadOutput.OUTPUT_FLAGS + fastioBooleanFlags(isTarCommand = true)
             var i = 0
             while (i < rawArgv.size) {
@@ -1141,13 +1149,39 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
                     token in SHORT_LONG_OPTIONS && !token.contains('=') -> token.substring(1)
                     else -> null
                 }
-                val consumesValue = key != null &&
-                    key !in noValue &&
-                    rawArgv.getOrNull(i + 1)?.startsWith("-") == false
+                val nextToken = rawArgv.getOrNull(i + 1)
+                val hasValue = nextToken != null && !nextToken.startsWith("-")
+                val consumesValue = when {
+                    token in SHORT_VALUE_OPTIONS -> hasValue
+                    key != null -> key !in noValue && hasValue
+                    else -> false
+                }
                 i += if (consumesValue) 2 else 1
             }
             return null
         }
+
+        /**
+         * [dv18-A A-01b] Raw single-dash tokens that take a VALUE, i.e. the raw
+         * spellings [normalizeTarShorts] rewrites into a value-taking long form:
+         * `-C <dir>` becomes `--directory <dir>`.
+         *
+         * `-f` is deliberately NOT here, and neither is any other letter: the
+         * expander maps `f` to *nothing* (the archive must stay a positional, as
+         * [normalizeTarShorts] documents) and every other group reads `-f` as
+         * the boolean `--force` alias, so it never consumes the next token in
+         * the parse this scan mirrors. The single-dash LONG spellings are not
+         * here either — they already take a value by the [SHORT_LONG_OPTIONS]
+         * rule above.
+         *
+         * ponytail: only the exact `-C` token is modelled, not a cluster that
+         * carries `C` (`-Cf dir`). | 天花板: an invocation whose value-taking
+         * short option sits inside a cluster AND before the subcommand. |
+         * 升级触发: the first real invocation that does — widen to the cluster
+         * letters the expander knows (`c`/`x`/`z`/`v` take no value, so only `C`
+         * would still qualify).
+         */
+        private val SHORT_VALUE_OPTIONS = setOf("-C")
 
         /**
          * Single-dash long options an agent types out of `find`/`grep` habit,

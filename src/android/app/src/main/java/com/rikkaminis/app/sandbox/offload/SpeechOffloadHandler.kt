@@ -163,7 +163,14 @@ class SpeechOffloadHandler(private val context: Context) : NativeOffloadHandler 
         val maxResults = args.getInt("max") ?: 3
         val durationSec = args.getInt("duration") ?: args.getInt("timeout") ?: 30
         val text = recognize(lang, maxResults, durationSec.toLong())
-        return NativeOffloadResult(0, OffloadOutput.formatBody(text, args) + "\n")
+        // [dv18-A06] `recognize` reports every failure INSIDE the payload it
+        // returns (`{"error": …}` — "no result", recognizer_creation_failed,
+        // the onError message mapping, or the timeout sentence), and that
+        // payload used to be returned with exit 0 unconditionally: a caller
+        // checking `$?` could not tell a failed transcription from a
+        // successful one. The payload stays byte-for-byte what recognize
+        // produced; only the exit code is derived from it.
+        return NativeOffloadResult(transcribeExitCode(text), OffloadOutput.formatBody(text, args) + "\n")
     }
 
     /**
@@ -495,4 +502,36 @@ Notes:
 internal fun sourceIsMic(source: String): Boolean {
     val s = source.trim().lowercase()
     return s.isEmpty() || s == "mic" || s == "system-mic" || s == "system_mic" || s == "microphone"
+}
+
+/**
+ * [dv18-A06] Exit code for a transcribe payload from [SpeechOffloadHandler].
+ *
+ * `recognize` expresses every failure INSIDE the JSON it returns — an `error`
+ * key carrying "no result", "recognizer_creation_failed", the `onError`
+ * mapping ("No speech recognized", "Audio recording error", "Recognizer
+ * busy", …), or "speech recognition timed out after Ns". The payload is
+ * therefore the only signal a caller has, and returning it with exit 0 made a
+ * failure indistinguishable from a success. 1 = the recognition failed,
+ * 0 = the recognizer produced a text result.
+ *
+ * An empty `text` **without** an `error` stays exit 0: the recognizer reported
+ * that it completed, and "nothing was heard" is a result, not a failure of the
+ * call — unlike the `no result` / `ERROR_NO_MATCH` / `ERROR_SPEECH_TIMEOUT`
+ * paths, which arrive as an `error` payload and now exit 1.
+ *
+ * A payload that is not JSON at all exits 1 (fail-closed): the only payloads
+ * this function sees are produced by `recognize`, which always returns JSON,
+ * so anything else is a defect worth surfacing rather than reporting success.
+ *
+ * Top-level (not a companion member) so the JVM test source set can drive it
+ * directly — the same reason [sourceIsMic] and [resolveMaybeRelative] are.
+ */
+internal fun transcribeExitCode(payload: String): Int {
+    val obj = try {
+        JSONObject(payload)
+    } catch (_: Throwable) {
+        return 1
+    }
+    return if (obj.has("error")) 1 else 0
 }

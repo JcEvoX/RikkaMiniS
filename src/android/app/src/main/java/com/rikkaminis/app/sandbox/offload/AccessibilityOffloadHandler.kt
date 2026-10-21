@@ -86,13 +86,21 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
         // `--contains` call died on "missing <text>". Declared here, and the set is
         // asserted against every hasFlag() name in this file by
         // AccessibilityTapTextTest.
+        //
+        // [deep-audit-1038 A-02] A key that is READ AS A VALUE must not be declared
+        // here: `OffloadArgs` binds no value for a declared boolean, so the caller's
+        // spelling is dropped and the reader sees "not given". `visible-only` was
+        // declared and read with `getBool` — the one combination that turns an
+        // explicit `--visible-only false` into the opposite of what was asked.
+        // `VisibleOnlyFlag` below is the value side of that split, and
+        // `a11y_handler_contract_check.py` holds the two sets disjoint.
         val args = OffloadArgs(
             request.argv.drop(1),
             booleanFlags = setOf(
                 "help", "h", "long", "double", "clear", "append",
                 "annotate", "compact", "inline", "b",
                 "clickable", "editable", "scrollable", "checked", "enabled",
-                "visible-only", "auto-scroll", "auto-dismiss", "auto-confirm",
+                "auto-scroll", "auto-dismiss", "auto-confirm",
                 "confirm", "deny", "children", "ancestors",
                 "contains",
             ),
@@ -259,7 +267,26 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
         val svc = svcOrThrow()
         val maxDepth = args.getInt("depth") ?: 10
         val compact = args.hasFlag("compact")
-        val visibleOnly = args.getBool("visible-only") ?: true
+        // [deep-audit-1038 A-02] Tri-state read of `--visible-only`, which is a
+        // VALUE-taking option (see the `booleanFlags` note in `handle`). While it
+        // was declared boolean, `--visible-only false` bound nothing, `false` fell
+        // through as a stray positional, and this read saw "not given" — the
+        // caller's explicit "hide the invisible nodes" silently became "show
+        // everything". Absent (or a bare `--visible-only`, which the parser folds
+        // into the same unset state) keeps the documented default; a spelled
+        // boolean is honoured in either spelling (`--visible-only false` /
+        // `--visible-only=false`); anything else is refused instead of being
+        // folded into the default.
+        val visibleOnly = when (val read = VisibleOnlyFlag.resolve(args.get("visible-only"))) {
+            VisibleOnlyFlag.Read.Absent -> true
+            is VisibleOnlyFlag.Read.Value -> read.value
+            is VisibleOnlyFlag.Read.Invalid -> return err(
+                args,
+                "INVALID_ARGS",
+                "ui dump: --visible-only expects true|false|1|0|yes|no (got \"${read.raw}\")",
+                exit = 2,
+            )
+        }
         val arr = JSONArray()
         for (root in svc.rootNodes()) {
             walkNode(svc.nodeRegistry, root, 0, maxDepth, visibleOnly, compact, arr)
@@ -1294,4 +1321,50 @@ internal object TapTextFlow {
 
     /** `NativeOffloadResult.exitCode == 0` is the CLI's success convention. */
     fun fallbackSucceeded(exitCode: Int): Boolean = exitCode == 0
+}
+
+/**
+ * [deep-audit-1038 A-02] The value side of `--visible-only`.
+ *
+ * Android-free on purpose: `ui dump` is the only reader, and the decision it
+ * makes — absent vs. a spelled boolean vs. garbage — is the part that used to
+ * go silently wrong, so it is pinned on the JVM like [TapTextFlow].
+ *
+ * The accepted words are the ones [OffloadArgs.getBool] already accepts, so a
+ * caller that learned `--visible-only=false` from the parser's own vocabulary
+ * does not meet a second, narrower list here. What is different is the GARBAGE
+ * case: `getBool` answers `null` both for "the caller spelled nothing" and for
+ * "the caller spelled nonsense", which is what let a malformed value fall back
+ * to the default instead of being refused.
+ */
+internal object VisibleOnlyFlag {
+
+    /** What the caller spelled for `--visible-only`. */
+    sealed interface Read {
+        /**
+         * No value bound: either the option was not given, or it was given bare
+         * (`--visible-only`), which the parser folds into the same unset state.
+         * The caller's documented default applies.
+         */
+        object Absent : Read
+
+        /** A legal boolean spelling. */
+        data class Value(val value: Boolean) : Read
+
+        /** A spelling that is not a boolean — refused, never guessed at. */
+        data class Invalid(val raw: String) : Read
+    }
+
+    private val TRUE_WORDS = setOf("true", "1", "yes")
+    private val FALSE_WORDS = setOf("false", "0", "no")
+
+    /** Classify [raw] (the bound value, or null when nothing was bound). */
+    fun resolve(raw: String?): Read {
+        if (raw == null) return Read.Absent
+        return when (raw.lowercase()) {
+            in TRUE_WORDS -> Read.Value(true)
+            in FALSE_WORDS -> Read.Value(false)
+            else -> Read.Invalid(raw)
+        }
+    }
 }

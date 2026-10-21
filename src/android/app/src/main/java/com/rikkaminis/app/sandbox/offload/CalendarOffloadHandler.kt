@@ -138,6 +138,54 @@ internal fun resolveCalendarSelector(rawId: String?, rawName: String?): Calendar
     return CalendarSelector.Absent
 }
 
+/**
+ * [dv18-A A-04] What the caller wrote for `--alarm` (reminder lead time in
+ * minutes).
+ *
+ * `args.getInt("alarm")` answered ONE question for two callers: "is the value a
+ * number?" — so "the flag was not given" and "the flag was given with -5 or
+ * `abc`" both became `null`, and the two writers read that null differently:
+ *
+ *   - `create` skipped the reminder and still answered exit 0 (an alarm silently
+ *     dropped);
+ *   - `update` skipped the reminder, skipped every column write (nothing else to
+ *     change) and still answered `{"updated": true, "rows": 0}` — a lie, because
+ *     its own honesty comment reasoned about `values == 0 && alarm == null` and
+ *     never imagined `values == 0 && alarm < 0`.
+ *
+ * Same shape as [CalendarSelector]: classify the raw string once, give the
+ * unusable case a decision of its own (refuse, never ignore), and let both
+ * writers read the same verdict.
+ */
+internal sealed class AlarmSelector {
+    /** `--alarm` was not supplied: no reminder is written or replaced. */
+    object Absent : AlarmSelector()
+
+    /** A whole number of minutes ≥ 0. */
+    data class Minutes(val value: Int) : AlarmSelector()
+
+    /** `--alarm` was supplied but is not a whole minute count ≥ 0 (`-5`, `abc`). */
+    data class Unreadable(val raw: String) : AlarmSelector()
+}
+
+/**
+ * [dv18-A A-04] Pure form of the `--alarm` decision (no Context), shared by
+ * `create` and `update` so the two boundaries can never disagree again.
+ */
+internal fun resolveAlarmSelector(raw: String?): AlarmSelector {
+    if (raw == null) return AlarmSelector.Absent
+    val minutes = raw.toIntOrNull()
+    return if (minutes != null && minutes >= 0) AlarmSelector.Minutes(minutes)
+    else AlarmSelector.Unreadable(raw)
+}
+
+/**
+ * [dv18-A A-04] The one refusal both writers emit for an unusable `--alarm`, so
+ * `create` and `update` cannot word the same defect differently.
+ */
+internal fun alarmRefusalMessage(verb: String, raw: String): String =
+    "android-calendar $verb: --alarm must be a whole number of minutes >= 0 (got '$raw')\n"
+
 class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandler {
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
         val args = OffloadArgs(request.argv.drop(1), booleanFlags = setOf("today", "all-day"))
@@ -402,7 +450,16 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
         }
         // Notes — apple-calendar uses --notes; --description kept as alias.
         val notes = args.get("notes") ?: args.get("description")
-        val alarmMinutes = args.getInt("alarm")
+        // [dv18-A A-04] One classification for both writers: `--alarm` that is
+        // not a whole minute count >= 0 is refused HERE, before any write, so
+        // `create --alarm -5` cannot answer exit 0 with the reminder silently
+        // dropped (the old `alarmMinutes >= 0` test only guarded the reminder
+        // call and left the rest of create reporting success).
+        val alarm = when (val selector = resolveAlarmSelector(args.get("alarm"))) {
+            is AlarmSelector.Unreadable -> return NativeOffloadResult(2, alarmRefusalMessage("create", selector.raw))
+            else -> selector
+        }
+        val alarmMinutes = (alarm as? AlarmSelector.Minutes)?.value
 
         val calendarId = when (val target = requireCalendarTarget(args)) {
             is CalendarTarget.Id -> target.value
@@ -429,7 +486,7 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
                 NativeOffloadResult(1, OffloadOutput.formatBody(JSONObject().put("error", "insert_failed").put("message", "ContentResolver.insert returned null").toString(), args) + "\n")
             } else {
                 val eventId = uri.lastPathSegment?.toLongOrNull()
-                if (eventId != null && alarmMinutes != null && alarmMinutes >= 0) {
+                if (eventId != null && alarmMinutes != null) {
                     insertReminder(eventId, alarmMinutes)
                 }
                 AppLogger.info(TAG, "create: id=$eventId title='$title' alarm=$alarmMinutes")
@@ -440,7 +497,7 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
                     .put("end", formatIso(endMs))
                     .put("calendar_id", calendarId)
                 if (notes != null) data.put("notes", notes)
-                if (alarmMinutes != null && alarmMinutes >= 0) data.put("alarm_minutes_before", alarmMinutes)
+                if (alarmMinutes != null) data.put("alarm_minutes_before", alarmMinutes)
                 NativeOffloadResult(0, OffloadOutput.formatBody(data.toString(2), args) + "\n")
             }
         } catch (e: SecurityException) {
@@ -544,7 +601,15 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
             is CalendarTarget.Id -> values.put(CalendarContract.Events.CALENDAR_ID, target.value)
             is CalendarTarget.Refused -> return target.result
         }
-        val alarmMinutes = args.getInt("alarm")
+        // [dv18-A A-04] The SAME classification create uses: an `--alarm` that is
+        // not a whole minute count >= 0 is refused here instead of read as
+        // "absent", which used to let `--alarm -5` fall through with nothing else
+        // to change, skip every write and still answer {"updated": true}.
+        val alarm = when (val selector = resolveAlarmSelector(args.get("alarm"))) {
+            is AlarmSelector.Unreadable -> return NativeOffloadResult(2, alarmRefusalMessage("update", selector.raw))
+            else -> selector
+        }
+        val alarmMinutes = (alarm as? AlarmSelector.Minutes)?.value
 
         if (values.size() == 0 && alarmMinutes == null) {
             return NativeOffloadResult(2, "android-calendar update: nothing to update — supply at least one field flag\n")
@@ -599,20 +664,21 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
                     .toString()
                 return NativeOffloadResult(1, OffloadOutput.formatBody(body, args) + "\n")
             }
-            if (alarmMinutes != null && alarmMinutes >= 0) {
+            if (alarmMinutes != null) {
                 replaceReminder(id, alarmMinutes)
             }
             AppLogger.info(TAG, "update: id=$id rows=$updated alarm=$alarmMinutes")
             val data = JSONObject()
                 .put("id", id)
                 // Reachable set here: values>0 → updated>0 (checked above), or
-                // values==0 with an alarm (values==0 && alarm==null returned 2
-                // earlier) — so true is now honest, not the old
-                // `updated > 0 || alarmMinutes != null` that a rows=0 fall-through
-                // also satisfied.
+                // values==0 with a valid --alarm (values==0 && no alarm returned 2
+                // earlier — and an UNUSABLE --alarm is refused before this point by
+                // the same classification create uses) — so true is honest, unlike
+                // the old value that a rows=0 `--alarm -5` fall-through satisfied
+                // too.
                 .put("updated", true)
                 .put("rows", updated)
-            if (alarmMinutes != null && alarmMinutes >= 0) data.put("alarm_minutes_before", alarmMinutes)
+            if (alarmMinutes != null) data.put("alarm_minutes_before", alarmMinutes)
             NativeOffloadResult(0, OffloadOutput.formatBody(data.toString(2), args) + "\n")
         } catch (e: SecurityException) {
             NativeOffloadResult(77, providerBlockedJson("WRITE_CALENDAR", e, args))

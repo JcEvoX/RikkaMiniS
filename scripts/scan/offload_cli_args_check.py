@@ -789,6 +789,45 @@ def check_offload_cli_bindings(contacts_src: str, notification_src: str,
             findings.append(
                 ("V3b", "missing",
                  "firstSubcommandToken must keep excluding OffloadOutput.OUTPUT_FLAGS"))
+        # [dv18-A A-01b] the pre-scan must consume value-taking short options
+        # from a declared set that includes `-C` (tar's --directory): a scan
+        # that skips `-C /tmp` mis-reads `/tmp` as the subcommand, so the tar
+        # verbs never get declared and `--directory` never expands.
+        shorts_decl = re.search(r"SHORT_VALUE_OPTIONS\s*=\s*setOf\(([^)]*)\)", fastio)
+        if shorts_decl is None or "-C" not in shorts_decl.group(1):
+            findings.append(
+                ("V3d", "missing",
+                 "SHORT_VALUE_OPTIONS must be declared and include -C (tar --directory)"))
+        if "SHORT_VALUE_OPTIONS" not in scan:
+            findings.append(
+                ("V3e", "missing", "firstSubcommandToken must consult SHORT_VALUE_OPTIONS"))
+        if not re.search(r"i \+= if \(consumesValue\) 2 else 1", scan):
+            findings.append(
+                ("V3f", "missing",
+                 "firstSubcommandToken must consume the value token (i += 2)"))
+    return findings
+
+
+def check_photos_album(photos_src: str) -> list:
+    """[dv18-A A-03] the --album decision is ONE classification (Absent / ById /
+    ByName / Unreadable): a non-numeric --id refuses (exit 2) instead of
+    silently downgrading to the name branch, and a blank --name refuses
+    instead of running a `LIKE '%%'` full-library scan. handleAlbums (the
+    no-arg listing) stays untouched."""
+    photos = code_only(photos_src)
+    findings = []
+    if "internal fun resolveAlbumSelector(" not in photos:
+        findings.append(("P1", "missing", "the --album decision lost its single classifier"))
+    if not re.search(r"AlbumSelector\.Unreadable\s*->\s*return NativeOffloadResult\(2,\s*albumSelectorRefusal\(",
+                     photos):
+        findings.append(("P2", "missing",
+                         "a non-numeric --id must reach a refusal (albumSelectorRefusal), not the name branch"))
+    resolver = _payload_helper_bodies(photos, "resolveAlbumSelector")
+    if resolver is not None and ("toLongOrNull()" not in resolver or "isNotBlank()" not in resolver):
+        findings.append(("P3", "missing",
+                         "the classifier must nullable-parse --id and blank-check --name"))
+    if "fun handleAlbums(" not in photos:
+        findings.append(("P4", "missing", "handleAlbums (the no-arg listing) is gone"))
     return findings
 
 
@@ -902,11 +941,16 @@ GREEN_FASTIO = """
             while (i < rawArgv.size) {
                 val token = rawArgv[i]
                 if (!token.startsWith("-")) return token
-                val consumesValue = token.substring(2) !in noValue
+                val consumesValue = when {
+                    token in SHORT_VALUE_OPTIONS -> true
+                    token.substring(2) !in noValue -> true
+                    else -> false
+                }
                 i += if (consumesValue) 2 else 1
             }
             return null
         }
+        private val SHORT_VALUE_OPTIONS = setOf("-C")
         internal fun fastioBooleanFlags(isTarCommand: Boolean): Set<String> =
             if (isTarCommand) {
                 setOf("recursive", "force", "ignore-case", "create", "extract", "gzip", "verbose")
@@ -1351,6 +1395,49 @@ GREEN_PAYLOAD_FASTIO_USAGE = r"""
         // for the scope narrowing).
         return "minis-fastio: " + reason
     }
+"""
+
+# [dv18-A A-03] green fixture for the photos --album classification arms. The
+# refusal reachability is written as the real when-branch shape, so a mutation
+# that restores the silent downgrade trips P2.
+GREEN_ALBUM_PHOTOS = """
+    private fun handleAlbum(args: OffloadArgs): NativeOffloadResult {
+        when (val selector = resolveAlbumSelector(args.get("id"), args.get("name"))) {
+            is AlbumSelector.ById -> return ok(listOf(selector.id))
+            is AlbumSelector.ByName -> return ok(listOf(selector.name))
+            is AlbumSelector.Unreadable -> return NativeOffloadResult(2, albumSelectorRefusal(selector))
+            AlbumSelector.Absent -> return NativeOffloadResult(
+                2,
+                "android-photos album: --id <bucket_id> or --name <bucket_name> is required\\n",
+            )
+        }
+    }
+
+    private fun handleAlbums(args: OffloadArgs): NativeOffloadResult {
+        return ok(emptyList())
+    }
+
+internal sealed class AlbumSelector {
+    object Absent : AlbumSelector()
+    data class ById(val id: Long) : AlbumSelector()
+    data class ByName(val name: String) : AlbumSelector()
+    data class Unreadable(val flag: String, val raw: String) : AlbumSelector()
+}
+
+internal fun resolveAlbumSelector(rawId: String?, rawName: String?): AlbumSelector {
+    if (rawId != null) {
+        val id = rawId.toLongOrNull()
+        return if (id != null) AlbumSelector.ById(id) else AlbumSelector.Unreadable("--id", rawId)
+    }
+    if (rawName != null) {
+        return if (rawName.isNotBlank()) AlbumSelector.ByName(rawName)
+        else AlbumSelector.Unreadable("--name", rawName)
+    }
+    return AlbumSelector.Absent
+}
+
+internal fun albumSelectorRefusal(selector: AlbumSelector.Unreadable): String =
+    "android-photos album: " + selector.flag + " '" + selector.raw + "' is not usable\\n"
 """
 
 def selftest() -> int:
@@ -1949,6 +2036,22 @@ def selftest() -> int:
              "val noValue = OffloadOutput.OUTPUT_FLAGS + fastioBooleanFlags(isTarCommand = true)",
              "// val noValue = Output.OUTPUT_FLAGS + fastioBooleanFlags(true)"),
          {"V3a", "V3b"}),
+        # [dv18-A A-01b] the value-short consumption arms — a pre-scan that
+        # drops the declared set (or stops consuming values) mis-reads
+        # `-C /tmp` and loses the tar verbs + `--directory` expansion.
+        ("fastio: the value-short set is undeclared",
+         GREEN_CONTACTS, GREEN_NOTIFICATION_HANDLE,
+         GREEN_FASTIO.replace('private val SHORT_VALUE_OPTIONS = setOf("-C")',
+                              'private val UNUSED_SHORTS = setOf("-C")'),
+         {"V3d"}),
+        ("fastio: the scan stops consulting the value-short set",
+         GREEN_CONTACTS, GREEN_NOTIFICATION_HANDLE,
+         GREEN_FASTIO.replace("token in SHORT_VALUE_OPTIONS -> true", "false -> true"),
+         {"V3e"}),
+        ("fastio: the scan stops consuming values",
+         GREEN_CONTACTS, GREEN_NOTIFICATION_HANDLE,
+         GREEN_FASTIO.replace("i += if (consumesValue) 2 else 1", "i += 1"),
+         {"V3f"}),
     ]
     for label, contacts_src, notif_src, fastio_src, want in red_cases_bindings:
         if contacts_src == GREEN_CONTACTS and notif_src == GREEN_NOTIFICATION_HANDLE \
@@ -1960,12 +2063,41 @@ def selftest() -> int:
         if got != want:
             print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
             failures += 1
+    # [dv18-A A-03] the photos --album classification arms. Expected sets are
+    # hand-written from the P-table (never derived from a run).
+    red_cases_album = [
+        ("photos: the album classifier is gone",
+         GREEN_ALBUM_PHOTOS.replace("internal fun resolveAlbumSelector(",
+                                    "internal fun unusedSelector("),
+         {"P1"}),
+        ("photos: the refusal is dropped",
+         GREEN_ALBUM_PHOTOS.replace(
+             "return NativeOffloadResult(2, albumSelectorRefusal(selector))",
+             "return ok(emptyList())"),
+         {"P2"}),
+        ("photos: the classifier stops classifying",
+         GREEN_ALBUM_PHOTOS.replace("val id = rawId.toLongOrNull()", "val id = rawId.toLong()"),
+         {"P3"}),
+        ("photos: handleAlbums is gone",
+         GREEN_ALBUM_PHOTOS.replace("fun handleAlbums(", "fun unusedAlbums("),
+         {"P4"}),
+    ]
+    for label, photos_src, want in red_cases_album:
+        if photos_src == GREEN_ALBUM_PHOTOS:
+            print(f"SELFTEST-FAIL: {label}: mutation did not apply to any arm")
+            failures += 1
+            continue
+        got = {rid for rid, _, _ in check_photos_album(photos_src)}
+        if got != want:
+            print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
+            failures += 1
     # the green arms must be fully clean, or every rule is vacuous
     clean = check_text(GREEN_CONTACTS, GREEN_CONFIG, GREEN_BROWSERUSE, GREEN_FASTIO)
     clean_flags = check_flag_set(GREEN_OUTPUT, GREEN_SPEAK)
     clean_debug = check_debug(GREEN_DEBUG)
     clean_sessions = check_sessions(GREEN_SESSIONS)
     clean_args = check_args(GREEN_ARGS)
+    clean_album = check_photos_album(GREEN_ALBUM_PHOTOS)
     clean_bindings = check_offload_cli_bindings(
         GREEN_CONTACTS, GREEN_NOTIFICATION_HANDLE, GREEN_FASTIO)
     clean_payload = check_offload_json(
@@ -1978,9 +2110,10 @@ def selftest() -> int:
         ("OpenOffloadHandler.kt", GREEN_PAYLOAD_SIDE_EFFECTS),
         ("FastioOffloadHandler.kt", GREEN_PAYLOAD_FASTIO_USAGE),
     )
-    if clean or clean_flags or clean_debug or clean_sessions or clean_bindings or clean_payload:
+    if clean or clean_flags or clean_debug or clean_sessions or clean_bindings \
+            or clean_payload or clean_album:
         green_findings = (clean + clean_flags + clean_debug + clean_sessions
-                          + clean_bindings + clean_payload)
+                          + clean_bindings + clean_payload + clean_album)
         print(f"SELFTEST-FAIL: green fixtures must produce no findings, "
               f"got {describe(green_findings)}")
         failures += 1
@@ -2038,6 +2171,7 @@ def main(argv):
     findings += check_debug(debug_path.read_text(encoding="utf-8"))
     findings += check_sessions(sessions_path.read_text(encoding="utf-8"))
     findings += check_args(args_path.read_text(encoding="utf-8"))
+    findings += check_photos_album((root / PHOTOS).read_text(encoding="utf-8"))
     findings += check_offload_cli_bindings(contacts_path.read_text(encoding="utf-8"),
                                           notification_path.read_text(encoding="utf-8"),
                                           fastio_path.read_text(encoding="utf-8"))
@@ -2053,7 +2187,8 @@ def main(argv):
           "debug pass-through argv verbatim + global-only output shaping, "
           "8/8 payload files hand formatBody JSON (N1 whole-file, N2 payload helpers), "
           "contacts search -n bound to --max through the one resolver, notification --after "
-          "refuses an unreadable value, fastio subcommand scan knows its boolean flags))")
+          "refuses an unreadable value, fastio subcommand scan knows its boolean flags "
+          "and consumes -C, photos --album decision classified (non-numeric --id refuses))")
     return 0
 
 

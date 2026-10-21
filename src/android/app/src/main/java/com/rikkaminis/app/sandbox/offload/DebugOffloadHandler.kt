@@ -110,6 +110,20 @@ class DebugOffloadHandler(private val context: Context) : NativeOffloadHandler {
             rpc.params.put("sessionId", request.sessionId)
         }
 
+        // [dv18-A05] `model-use` is session-scoped for the same reason
+        // ls/read/write are: ModelUseOffloadHandler joins a relative
+        // `--input` / `--system-file` onto request.cwd and resolves the join
+        // through the session-aware resolver — but this forwarder only ever
+        // sent the bare argv, so the RPC side rebuilt the request with
+        // cwd = "/" and no session, and `minis-debug model-use run --input
+        // notes.txt` resolved against the guest root instead of the caller's
+        // directory. The raw `call` escape hatch keeps its params verbatim
+        // and `shizuku` stays device-level: which subcommands carry the scope
+        // is [execScopeParams]'s decision, not an ad-hoc check here.
+        execScopeParams(sub, request.sessionId, request.cwd).forEach { (key, value) ->
+            rpc.params.put(key, value)
+        }
+
         // [da1028-A] Output shaping for the pass-through subcommands reads the
         // GLOBAL slice only (tokens before the subcommand): everything after
         // `exec` / `shizuku` / `model-use` belongs to the child process, so a
@@ -549,4 +563,36 @@ internal fun debugPathFor(sub: String, rawPath: String, cwd: String): String? =
 internal fun normalizeDebugRpcPaths(sub: String, params: JSONObject, cwd: String) {
     val normalized = debugPathFor(sub, params.optString("path"), cwd) ?: return
     params.put("path", normalized)
+}
+
+/**
+ * [dv18-A05] Subcommands whose forwarded RPC call must carry the caller's
+ * session scope. `model-use` resolves its `--input` / `--system-file`
+ * operands through the same session-aware resolver as ls/read/write, so a
+ * relative operand has to join onto the caller's cwd, not the guest root.
+ *
+ * `call` is deliberately absent: its params are the caller's, verbatim.
+ * `shizuku` drives a device-level privileged shell where the guest cwd has
+ * no meaning. `exec` maps to `debug.shellExecute`, which owns its own
+ * `session` parameter.
+ */
+internal val EXEC_SCOPE_SUBCOMMANDS = setOf("model-use", "modelUse")
+
+/**
+ * [dv18-A05] The params a forwarded exec call adds for [sub]: the caller's
+ * session id (only when present — a session-less interactive terminal keeps
+ * the handler's global arm) and the cwd its relative operands resolve
+ * against. Every other subcommand gets an empty map, so `call` stays
+ * exactly as the caller wrote it.
+ *
+ * Pure String→Map so the membership decision and the blank-value handling
+ * are JVM-testable without an RPC round trip (the same reason
+ * [debugPathFor] is top-level).
+ */
+internal fun execScopeParams(sub: String, sessionId: String?, cwd: String?): Map<String, String> {
+    if (sub !in EXEC_SCOPE_SUBCOMMANDS) return emptyMap()
+    val scope = LinkedHashMap<String, String>()
+    if (!sessionId.isNullOrBlank()) scope["sessionId"] = sessionId
+    if (!cwd.isNullOrBlank()) scope["cwd"] = cwd
+    return scope
 }

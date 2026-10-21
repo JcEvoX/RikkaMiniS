@@ -165,6 +165,17 @@ private object KimiModelListAdapter : ModelListProvider {
             // needs providerType==openAI && apiKey), so a stale/imported true
             // must not be allowed to break this one request.
             azureMode = false,
+            // [dv18-A-08] These rows come from Kimi's OWN vendor base URL,
+            // which OpenAIModelsApi cannot recognise as "official OpenAI" —
+            // without a name they were all stamped "Custom", so
+            // ModelsDevApi's provider-aware enrichment (providerKeyMap) never
+            // hit for them and fell through to the order-dependent
+            // all-providers scan (the F-212 failure). The name is the family's
+            // canonical [ProviderType.displayName] (ARCH-03: the same value
+            // every add surface and the usage grouping write) — no literal
+            // here, so a rename of the family cannot silently drop the rows
+            // out of the key map.
+            providerName = ProviderType.kimiCode.displayName,
             forceRefresh = forceRefresh,
         )
     }
