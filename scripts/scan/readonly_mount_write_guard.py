@@ -901,9 +901,9 @@ MOUNT_READERS = {
 }
 
 
-def _mount_store(shape="io", fn_name="probeWritable"):
+def _mount_store(shape="io", fn_name="probeWritable", volume_shape="single"):
     reader = MOUNT_READERS[shape].replace("@@FN@@", fn_name)
-    return (
+    text = (
         "package com.rikkaminis.app.data\n"
         "\n"
         "import kotlinx.coroutines.Dispatchers\n"
@@ -922,7 +922,30 @@ def _mount_store(shape="io", fn_name="probeWritable"):
         + reader +
         "}\n"
     )
+    # [dv20-A4-A06] The store owns the single definition of the volume-root
+    # resolver; the kernel used to carry a drifted second copy. `VOLUME_ROOT_BODIES`
+    # exists so an arm can drop the definition while keeping the file present.
+    return text + VOLUME_ROOT_BODIES[volume_shape]
 
+VOLUME_ROOT_BODIES = {
+    "single": (
+        "\n"
+        "internal fun resolveVolumeRoot(context: Context, volumeId: String): String? {\n"
+        "    return resolveVolumeRootDecision(volumeId, emptyList())\n"
+        "}\n"
+    ),
+    "none": "",
+}
+
+# The drifted twin the kernel used to carry, standing in a file of its own so
+# criterion 5's anchors stay untouched.
+VOLUME_ROOT_TWIN = (
+    "package com.rikkaminis.app.sandbox\n"
+    "\n"
+    "internal fun resolveVolumeRoot(context: Context, volumeId: String): String? {\n"
+    "    return null\n"
+    "}\n"
+)
 
 LOG_BODIES = {
     "io": (
@@ -1026,7 +1049,7 @@ ROOTFS_BODIES = {
 }
 
 
-def _rootfs_vm(shape="io"):
+def _rootfs_vm(shape="io", verdict_shape="derived"):
     return (
         "package com.rikkaminis.app.ui.sandbox\n"
         "\n"
@@ -1035,9 +1058,43 @@ def _rootfs_vm(shape="io"):
         "import kotlinx.coroutines.withContext\n"
         "\n"
         "class RootfsManagementViewModel {\n"
-        + ROOTFS_BODIES[shape] +
+        + ROOTFS_BODIES[shape] + VERDICT_BODIES[verdict_shape] +
         "}\n"
     )
+
+# [dv20-A4-B03] `ROOTFS_BODIES` varies the blocking-IO decision; the *verdict*
+# decision is a second, orthogonal axis. Every shape carries the derived verdict
+# by default so the existing arms keep testing what they were written for, and
+# `assumed` reverts to "the suspend call returned, therefore success".
+VERDICT_BODIES = {
+    "derived": (
+        "    private fun settleRootfsOperation(manager: RootfsManager, ok: String) {\n"
+        "        when (val terminal = manager.installState.value) {\n"
+        "            is RootfsInstallState.Installed ->\n"
+        "                _uiState.value = _uiState.value.copy(lastOperationSuccess = true)\n"
+        "            is RootfsInstallState.Failed ->\n"
+        "                _uiState.value = _uiState.value.copy(lastOperationSuccess = false)\n"
+        "            else ->\n"
+        "                _uiState.value = _uiState.value.copy(lastOperationSuccess = false)\n"
+        "        }\n"
+        "    }\n"
+        "\n"
+        "    fun verifyRootfsVerdict(manager: RootfsManager) {\n"
+        "        val initial = manager.integritySnapshot()\n"
+        "        if (initial.healthy) {\n"
+        "            _uiState.value = _uiState.value.copy(lastOperationSuccess = true)\n"
+        "        }\n"
+        "    }\n"
+        "\n"
+    ),
+    "assumed": (
+        "    private fun settleRootfsOperation(manager: RootfsManager, ok: String) {\n"
+        "        manager.driveInstall()\n"
+        "        _uiState.value = _uiState.value.copy(lastOperationSuccess = true)\n"
+        "    }\n"
+        "\n"
+    ),
+}
 
 
 def _rootfs_manager():
@@ -1460,7 +1517,8 @@ class MinisDocumentsProvider : DocumentsProvider() {
         if (!file.renameTo(target)) throw FileNotFoundException("Failed to rename $documentId")
         return documentIdFor(target)
     }
-}
+
+@FUNNEL_FUN@}
 '''
 
 _DOC_TOPLEVEL_GUARD = """if (isTopLevelDocId(documentId)) {
@@ -1468,10 +1526,33 @@ _DOC_TOPLEVEL_GUARD = """if (isTopLevelDocId(documentId)) {
         }"""
 
 
+_DOC_FUNNEL_FUN = """    private fun resolveDoc(documentId: String): File {
+        val root = providerRoot()
+        val clean = normalizeDocId(documentId)
+        if (clean.isEmpty()) return root
+        if (clean.contains("..")) throw FileNotFoundException("Invalid path: $documentId")
+@FUNNEL@
+        val target = File(root, clean)
+        return target
+    }
+"""
+
+# [dv20-A4-A07] The whitelist that guarded the listing only, now guarding the one
+# funnel every entry point resolves an id through.
+_DOC_FUNNEL_GUARD = """        val top = clean.substringBefore('/')
+        if (top !in TOP_LEVEL) {
+            throw FileNotFoundException("Not a top-level entry: $documentId")
+        }"""
+
 def _documents_provider(shape="clean"):
     root_expr = "parentDocumentId" if shape == "raw_root" else "normalizeDocId(parentDocumentId)"
     guard = "" if shape == "no_toplevel_guard" else _DOC_TOPLEVEL_GUARD
-    return (_DOCUMENTS_PROVIDER.replace("@ROOT@", root_expr).replace("@TOPLEVEL@", guard))
+    funnel = "" if shape == "funnel_blind" else _DOC_FUNNEL_GUARD
+    return (_DOCUMENTS_PROVIDER
+            .replace("@ROOT@", root_expr)
+            .replace("@TOPLEVEL@", guard)
+            .replace("@FUNNEL_FUN@", _DOC_FUNNEL_FUN)
+            .replace("@FUNNEL@", funnel))
 
 
 def check_documents_provider(root):
@@ -1556,6 +1637,210 @@ def check_documents_provider(root):
     return violations, rot, sites, notes
 
 
+# --- criterion 7/8/9: the three decisions deep-audit-1040 A4 touched ---------
+
+FUN_START = re.compile(
+    r"(?m)^[ \t]*(?:private |internal |public |override |suspend |open )*fun\s+(\w+)"
+)
+VOLUME_ROOT_STORE_REL = "data/MountedFoldersStore.kt"
+ROOTFS_VM_REL = "ui/sandbox/RootfsManagementViewModel.kt"
+VOLUME_ROOT_DEF = re.compile(r"\bfun\s+resolveVolumeRoot\s*\(")
+SUCCESS_CLAIM = re.compile(r"lastOperationSuccess\s*=\s*true\b")
+VERDICT_SOURCE = re.compile(r"\binstallState\b|\bRootfsInstallState\.\w+|\.healthy\b")
+# A funnel is the function that turns a *document id* into a `File` — the one
+# every entry point resolves through. Anchoring on the id parameter rather than
+# on a name (`resolveDoc`) is what makes a rename a rot failure instead of a
+# silent pass.
+FUNNEL_DECL = re.compile(r"\bfun\s+(\w+)\s*\(([^)]*)\)\s*:\s*File\??")
+FUNNEL_ID_PARAM = re.compile(r"\bdocumentId\b")
+FUNNEL_WHITELIST = re.compile(r"!?\s*\bin\s+([A-Z_][A-Z0-9_]*)\b")
+
+
+def _a4_brace_block(text, open_idx):
+    depth = 0
+    k = open_idx
+    while k < len(text):
+        c = text[k]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx:k + 1]
+        k += 1
+    return text[open_idx:]
+
+
+def check_documents_provider_funnel(root):
+    """(violations, rot, sites, notes) — criterion 9 (A-07).
+
+    The whitelist used to guard the LISTING only: `queryChildDocuments` skipped
+    anything outside `TOP_LEVEL` when the parent was root, but every other entry
+    point resolved an arbitrary document id straight to a File — `mcp-servers/…`,
+    `logs/…` and any other filesDir entry were addressable even though they never
+    appear in the Files app. The subject is the funnel, not a call site: guarding
+    it guards every caller at once.
+    """
+    violations, rot, notes = [], [], []
+    path = os.path.join(root, APP_REL, *DOCUMENTS_PROVIDER_REL.split("/"))
+    pkg = os.path.dirname(path)
+    if not os.path.isfile(path):
+        if os.path.isdir(pkg) and os.listdir(pkg):
+            rot.append(
+                "%s lost its anchor (the providers package is there, the file is not)"
+                % DOCUMENTS_PROVIDER_REL
+            )
+        else:
+            notes.append(
+                "[PARTIAL] the provider id->File funnel — this tree never shipped "
+                "%s" % DOCUMENTS_PROVIDER_REL
+            )
+        return violations, rot, 0, notes
+
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        text = strip_comments(fh.read())
+    starts = [m.start() for m in FUN_START.finditer(text)]
+    sites = 0
+    for i, off in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(text)
+        head = text[off:end]
+        brace = head.find("{")
+        decl = FUNNEL_DECL.search(head if brace < 0 else head[:brace])
+        if not decl or not FUNNEL_ID_PARAM.search(decl.group(2)):
+            continue
+        if brace < 0:
+            continue
+        sites += 1
+        body = _a4_brace_block(text, off + brace)
+        if not FUNNEL_WHITELIST.search(body):
+            violations.append(
+                "%s: `%s` turns a document id into a File without judging the "
+                "top-level whitelist — ids outside what the provider exposes are "
+                "reachable" % (DOCUMENTS_PROVIDER_REL, decl.group(1))
+            )
+    if sites == 0:
+        rot.append(
+            "%s: no id->File funnel found — the detector stopped matching "
+            "(the id-taking File returner was renamed or retyped?)"
+            % DOCUMENTS_PROVIDER_REL
+        )
+    return violations, rot, sites, notes
+
+
+def check_volume_root_single_source(root):
+    """(violations, rot, sites, notes) — criterion 7 (A-06).
+
+    The volume-root resolver existed twice — once in the store, once as a
+    drifted copy inside the kernel — so the two readers could disagree about
+    which directory backs a volume. The rule is "exactly one definition, and it
+    lives in the store": a rename that moves the single source *out* of the
+    store is still one definition, and is reported as such rather than silently
+    accepted.
+    """
+    violations, rot, notes = [], [], []
+    anchor = os.path.join(root, APP_REL, *VOLUME_ROOT_STORE_REL.split("/"))
+    pkg = os.path.dirname(anchor)
+    if not os.path.isfile(anchor):
+        if os.path.isdir(pkg) and os.listdir(pkg):
+            rot.append(
+                "%s lost its anchor (the data package is there, the file is not)"
+                % VOLUME_ROOT_STORE_REL
+            )
+        else:
+            notes.append(
+                "[PARTIAL] the single-source volume-root anchor — this tree never "
+                "shipped %s" % VOLUME_ROOT_STORE_REL
+            )
+        return violations, rot, 0, notes
+
+    defs = []
+    for full in app_kt_files(root):
+        with open(full, encoding="utf-8", errors="replace") as fh:
+            text = strip_comments(fh.read())
+        n = len(VOLUME_ROOT_DEF.findall(text))
+        if n:
+            rel = os.path.relpath(full, os.path.join(root, APP_REL)).replace(os.sep, "/")
+            defs.append((rel, n))
+    sites = sum(n for _rel, n in defs)
+    if sites == 0:
+        rot.append(
+            "no definition matching `fun resolveVolumeRoot(` anywhere under "
+            "com/rikkaminis/app — the single source vanished or was renamed"
+        )
+        return violations, rot, 0, notes
+    if sites > 1:
+        where = ", ".join("%s (%d)" % (rel, n) for rel, n in sorted(defs))
+        violations.append(
+            "the volume-root resolver has %d definitions — %s; the two readers "
+            "can disagree about which directory backs a volume" % (sites, where)
+        )
+    elif defs[0][0] != VOLUME_ROOT_STORE_REL:
+        violations.append(
+            "the single volume-root resolver lives in %s, not in %s — the store "
+            "is no longer its source" % (defs[0][0], VOLUME_ROOT_STORE_REL)
+        )
+    return violations, rot, sites, notes
+
+
+def check_rootfs_verdict(root):
+    """(violations, rot, sites, notes) — criterion 8 (B-03).
+
+    `RootfsManager.installIfNeeded()` reports "not enough disk space" by
+    publishing `RootfsInstallState.Failed(...)` and returning normally; it never
+    throws. Awaiting it therefore proves nothing, and the old unconditional
+    `lastOperationSuccess = true` turned "refused, nothing extracted" into a
+    green "installed successfully". The criterion is per function: any function
+    that claims success must also consult an independent verdict source — the
+    published terminal state, or the integrity check's `.healthy`.
+    """
+    violations, rot, notes = [], [], []
+    path = os.path.join(root, APP_REL, *ROOTFS_VM_REL.split("/"))
+    pkg = os.path.dirname(path)
+    if not os.path.isfile(path):
+        if os.path.isdir(pkg) and os.listdir(pkg):
+            rot.append(
+                "%s lost its anchor (the ui/sandbox package is there, the file is not)"
+                % ROOTFS_VM_REL
+            )
+        else:
+            notes.append(
+                "[PARTIAL] the rootfs verdict anchor — this tree never shipped %s"
+                % ROOTFS_VM_REL
+            )
+        return violations, rot, 0, notes
+
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        text = strip_comments(fh.read())
+    starts = [m.start() for m in FUN_START.finditer(text)]
+    sites = 0
+    named = FUN_START.findall(text)
+    for i, off in enumerate(starts):
+        end = starts[i + 1] if i + 1 < len(starts) else len(text)
+        region = text[off:end]
+        if not SUCCESS_CLAIM.search(region):
+            continue
+        sites += 1
+        if not VERDICT_SOURCE.search(region):
+            violations.append(
+                "%s: `%s` claims success (lastOperationSuccess = true) without "
+                "consulting the manager's terminal state — a refused install "
+                "still reports success"
+                % (ROOTFS_VM_REL, named[i] if i < len(named) else "<unknown>")
+            )
+    if SUCCESS_CLAIM.findall(text) and sites == 0:
+        rot.append(
+            "%s: success claims exist but none sat inside a function body — the "
+            "verdict detector stopped matching" % ROOTFS_VM_REL
+        )
+        return violations, rot, 0, notes
+    if sites == 0:
+        rot.append(
+            "%s: no success claim found at all — the verdict detector stopped "
+            "matching (the field was renamed?)" % ROOTFS_VM_REL
+        )
+    return violations, rot, sites, notes
+
+
 def write_io_fixture(root, store_shape="io", log_shape="io", store_fn="probeWritable",
                      drop_store=False, drop_log=False, data_pkg=True, ui_pkg=True,
                      keep_pkgs_when_dropped=True, share_shape="io", drop_share=False,
@@ -1563,7 +1848,8 @@ def write_io_fixture(root, store_shape="io", log_shape="io", store_fn="probeWrit
                      browser_shape="guard", rpc_shape="guard", nav_shape="guard",
                      drop_guard_anchors=False,
                      onboarding_shape="io", add_model_shape="io", backup_shape="io",
-                     provider_shape="clean"):
+                     provider_shape="clean", volume_shape="single",
+                     volume_mirror=False, verdict_shape="derived"):
     """A `com/rikkaminis/app` tree carrying both criterion-2 targets.
 
     [keep_pkgs_when_dropped] leaves an unrelated file in the package whose anchor
@@ -1579,7 +1865,9 @@ def write_io_fixture(root, store_shape="io", log_shape="io", store_fn="probeWrit
         files[f"filler/F{i}.kt"] = _filler(i)
     files["logging/AppLogger.kt"] = _app_logger()
     if not drop_store:
-        files["data/MountedFoldersStore.kt"] = _mount_store(store_shape, store_fn)
+        files["data/MountedFoldersStore.kt"] = _mount_store(store_shape, store_fn, volume_shape)
+        if volume_mirror:
+            files["sandbox/VolumeRootMirror.kt"] = VOLUME_ROOT_TWIN
     elif keep_pkgs_when_dropped:
         files["data/MountRegistry.kt"] = "package com.rikkaminis.app.data\n\nclass MountRegistry\n"
     if not drop_log:
@@ -1594,7 +1882,7 @@ def write_io_fixture(root, store_shape="io", log_shape="io", store_fn="probeWrit
         files["share/ShareHost.kt"] = "package com.rikkaminis.app.share\n\nclass ShareHost\n"
     if not drop_rootfs:
         files["sandbox/RootfsManager.kt"] = _rootfs_manager()
-        files["ui/sandbox/RootfsManagementViewModel.kt"] = _rootfs_vm(rootfs_shape)
+        files["ui/sandbox/RootfsManagementViewModel.kt"] = _rootfs_vm(rootfs_shape, verdict_shape)
     elif keep_pkgs_when_dropped:
         files["ui/sandbox/OtherScreen.kt"] = (
             "package com.rikkaminis.app.ui.sandbox\n\nclass OtherScreen\n"
@@ -1684,6 +1972,21 @@ def selftest():
         "lost its anchor", drop_store=True, drop_log=True)
     run("a tree that never shipped the package is skipped, not failed", False,
         "[PARTIAL]", drop_store=True, drop_log=True, keep_pkgs_when_dropped=False)
+    # [dv20-A4 A-06 / A-07 / B-03] the three decisions this batch touched.
+    run("a single volume-root definition in the store passes", False,
+        "volume-root definition(s)")
+    run("a second volume-root definition elsewhere is caught", True,
+        "volume-root resolver has 2 definitions", volume_mirror=True)
+    run("a store that lost the resolver is a rot failure, not a silent skip", True,
+        "no definition matching", volume_shape="none")
+    run("the id->File funnel judging the exposed top level passes", False,
+        "id->File funnel(s)")
+    run("a funnel that resolves any id straight to a File is caught", True,
+        "without judging the top-level whitelist", provider_shape="funnel_blind")
+    run("a success claim backed by the manager's verdict passes", False,
+        "success claim(s) backed")
+    run("a success claim made without consulting the verdict is caught", True,
+        "without consulting the manager's terminal state", verdict_shape="assumed")
     run("the provider import wrapped in Dispatchers.IO passes", False)
     run("the provider import outside the IO block is caught", True,
         "share/ShareReceiverActivity.kt", share_shape="direct_import")
@@ -1789,6 +2092,9 @@ def main():
     hop_violations, hop_rot, hop_sites, hop_notes = check_share_toast_hop(root)
     shape_violations, shape_rot, shape_sites, shape_notes = check_guard_call_shape(root)
     doc_violations, doc_rot, doc_sites, doc_notes = check_documents_provider(root)
+    funnel_violations, funnel_rot, funnel_sites, funnel_notes = check_documents_provider_funnel(root)
+    vol_violations, vol_rot, vol_sites, vol_notes = check_volume_root_single_source(root)
+    verdict_violations, verdict_rot, verdict_sites, verdict_notes = check_rootfs_verdict(root)
 
     rot = []
     if files < 20:
@@ -1799,12 +2105,16 @@ def main():
     rot += hop_rot
     rot += shape_rot
     rot += doc_rot
+    rot += funnel_rot
+    rot += vol_rot
+    rot += verdict_rot
     if rot:
         print("ROT — the guard can no longer see what it is supposed to check:")
         for r in rot:
             print(f"  ✗ {r}")
         return 1
-    for n in io_notes + hop_notes + shape_notes + doc_notes:
+    for n in (io_notes + hop_notes + shape_notes + doc_notes
+              + funnel_notes + vol_notes + verdict_notes):
         print(f"  {n}")
     if violations or io_violations:
         print("Unguarded host-file writes:")
@@ -1822,10 +2132,26 @@ def main():
         print("SAF provider root decisions taken on the raw document id:")
         for v in doc_violations:
             print(f"  ✗ {v}")
-    if violations or io_violations or hop_violations or shape_violations or doc_violations:
+    if funnel_violations:
+        print("Document ids resolved to a File without judging what the provider exposes:")
+        for v in funnel_violations:
+            print(f"  ✗ {v}")
+    if vol_violations:
+        print("Volume-root resolution defined more than once:")
+        for v in vol_violations:
+            print(f"  ✗ {v}")
+    if verdict_violations:
+        print("Rootfs outcomes claimed without consulting the manager's verdict:")
+        for v in verdict_violations:
+            print(f"  ✗ {v}")
+    if (violations or io_violations or hop_violations or shape_violations or doc_violations
+            or funnel_violations or vol_violations or verdict_violations):
         return 1
     print(f"OK: {checked} path-parameter write site(s) guarded ({files} files scanned)")
     print(f"    {io_sites} blocking-IO call site(s) inside Dispatchers.IO")
+    print(f"    {vol_sites} volume-root definition(s), single source in {VOLUME_ROOT_STORE_REL}")
+    print(f"    {verdict_sites} success claim(s) backed by the manager's verdict")
+    print(f"    {funnel_sites} id->File funnel(s) judging the exposed top level")
     if hop_sites:
         print(f"    {hop_sites} share UI hand-off verified on a Looper thread")
     if shape_sites:

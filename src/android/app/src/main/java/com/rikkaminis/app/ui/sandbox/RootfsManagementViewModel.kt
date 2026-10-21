@@ -60,8 +60,7 @@ class RootfsManagementViewModel : ViewModel() {
                             statusMessage = ctx.getString(R.string.rootfs_msg_finalizing),
                             installProgress = 1f,
                         )
-                    is RootfsInstallState.Installed,
-                    is RootfsInstallState.Failed -> {
+                    is RootfsInstallState.Installed -> {
                         // [fix/render-ui F-277] No `progressJob?.cancel()` here.
                         // Cancelling the job that is currently running this
                         // collector from inside `collect {}` is self-cancellation:
@@ -72,6 +71,25 @@ class RootfsManagementViewModel : ViewModel() {
                         // its own — and `observeInstallProgress` cancels any
                         // previous job before starting a new one.
                         _uiState.value = _uiState.value.copy(installProgress = null)
+                    }
+                    is RootfsInstallState.Failed -> {
+                        // [dv20-A4-B03] This branch used to share the `Installed`
+                        // arm, so a failure only cleared the progress bar. The
+                        // disk-space gate reports itself by publishing
+                        // `Failed(rootfs_insufficient_space)` and RETURNING —
+                        // it does not throw — so `install()` used to fall
+                        // through to `lastOperationSuccess = true` and the
+                        // screen announced "installed successfully" over an
+                        // untouched rootfs. Surface the manager's own message
+                        // (existing error codes pass through unchanged) and
+                        // clear the success flag here, where the verdict is
+                        // published rather than assumed.
+                        _uiState.value = _uiState.value.copy(
+                            isProcessing = false,
+                            lastOperationSuccess = false,
+                            resultMessage = state.error,
+                            installProgress = null,
+                        )
                     }
                 }
             }
@@ -96,6 +114,52 @@ class RootfsManagementViewModel : ViewModel() {
         }
     }
 
+    /**
+     * [dv20-A4-B03] Read the manager's terminal state to decide whether the
+     * operation actually succeeded, instead of assuming success because the
+     * `suspend` call returned normally.
+     *
+     * `RootfsManager.installIfNeeded()` reports its disk-space gate by
+     * publishing `RootfsInstallState.Failed(...)` and returning — it never
+     * throws. Awaiting it therefore proves nothing about the outcome, and the
+     * old unconditional `lastOperationSuccess = true` turned "refused, nothing
+     * extracted" into a green "installed successfully" line. The published
+     * terminal state is the verdict; [failureFallback] covers the shape where
+     * the coroutine returns without a terminal emission at all (treated as
+     * not-installed rather than guessed at).
+     */
+    private fun settleRootfsOperation(
+        manager: RootfsManager,
+        successMessage: String,
+        failureFallback: String,
+    ) {
+        when (val terminal = manager.installState.value) {
+            is RootfsInstallState.Installed ->
+                _uiState.value = _uiState.value.copy(
+                    isProcessing = false,
+                    lastOperationSuccess = true,
+                    resultMessage = successMessage,
+                    installProgress = null,
+                )
+            is RootfsInstallState.Failed ->
+                _uiState.value = _uiState.value.copy(
+                    isProcessing = false,
+                    lastOperationSuccess = false,
+                    // The manager's own message (e.g. the existing
+                    // `rootfs_insufficient_space` resource) passes through.
+                    resultMessage = terminal.error,
+                    installProgress = null,
+                )
+            else ->
+                _uiState.value = _uiState.value.copy(
+                    isProcessing = false,
+                    lastOperationSuccess = false,
+                    resultMessage = failureFallback,
+                    installProgress = null,
+                )
+        }
+    }
+
     fun install(ctx: Context) {
         _uiState.value = _uiState.value.copy(
             isProcessing = true,
@@ -109,11 +173,12 @@ class RootfsManagementViewModel : ViewModel() {
         viewModelScope.launch {
             try {
                 manager.installIfNeeded()
-                _uiState.value = _uiState.value.copy(
-                    isProcessing = false,
-                    lastOperationSuccess = true,
-                    resultMessage = ctx.getString(R.string.rootfs_msg_installed),
-                    installProgress = null,
+                // [dv20-A4-B03] Derive the verdict from what the manager
+                // actually published — see `rootfsOperationVerdict`.
+                settleRootfsOperation(
+                    manager,
+                    successMessage = ctx.getString(R.string.rootfs_msg_installed),
+                    failureFallback = ctx.getString(R.string.rootfs_msg_install_failed),
                 )
                 refresh(ctx)
             } catch (e: Exception) {
@@ -144,11 +209,12 @@ class RootfsManagementViewModel : ViewModel() {
             try {
                 manager.reset()
 
-                _uiState.value = _uiState.value.copy(
-                    isProcessing = false,
-                    lastOperationSuccess = true,
-                    resultMessage = ctx.getString(R.string.rootfs_msg_reset_complete),
-                    installProgress = null,
+                // [dv20-A4-B03] `reset()` ends in `installIfNeeded()`, so the
+                // same silent-failure path applies here.
+                settleRootfsOperation(
+                    manager,
+                    successMessage = ctx.getString(R.string.rootfs_msg_reset_complete),
+                    failureFallback = ctx.getString(R.string.rootfs_msg_reset_failed),
                 )
                 refresh(ctx)
             } catch (e: Exception) {
