@@ -24,6 +24,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.stringResource
@@ -32,6 +33,9 @@ import com.rikkaminis.app.R
 import com.rikkaminis.app.data.repository.MCPRepository
 import com.rikkaminis.app.ui.settings.SettingsRow
 import com.rikkaminis.app.ui.settings.SettingsSection
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Bottom sheet showing all configured MCP servers with per-session
@@ -72,16 +76,25 @@ fun SessionMcpsSheet(
         mutableStateMapOf<String, Boolean>()
     }
     LaunchedEffect(servers, sessionId) {
-        for (server in servers) {
-            if (server.id !in overrides) {
-                overrides[server.id] = mcpRepository.isEnabledForSession(server.id, sessionId)
-            }
+        // [deep-audit-1040 B-04] Same shape as SessionSkillsSheet: the stored
+        // per-session read is a SQLite query per server, so it moves to IO.
+        // Which ids are missing is decided on Main (that reads the snapshot
+        // map); the writes into it stay on Main too.
+        val missing = servers.map { it.id }.filter { it !in overrides }
+        val seeds = withContext(Dispatchers.IO) {
+            missing.associateWith { mcpRepository.isEnabledForSession(it, sessionId) }
         }
+        for (id in missing) overrides[id] = seeds[id] ?: false
         // Drop entries for servers that no longer exist so a later re-add
         // doesn't resurrect a stale toggle.
         val live = servers.mapTo(HashSet()) { it.id }
         overrides.keys.retainAll(live)
     }
+
+    // [deep-audit-1040 B-04] Same shape as SessionSkillsSheet's row toggle:
+    // the Switch flips from the local `overrides` map on Main (zero latency) and
+    // the SQLite write follows on IO.
+    val scope = rememberCoroutineScope()
 
     StandardChatSheet(
         title = stringResource(R.string.session_mcps_title),
@@ -113,7 +126,12 @@ fun SessionMcpsSheet(
                                     checked = overrides[server.id] ?: server.enabled,
                                     onCheckedChange = { enabled ->
                                         overrides[server.id] = enabled
-                                        mcpRepository.setSessionOverride(sessionId, server.id, enabled)
+                                        val serverId = server.id
+                                        scope.launch {
+                                            withContext(Dispatchers.IO) {
+                                                mcpRepository.setSessionOverride(sessionId, serverId, enabled)
+                                            }
+                                        }
                                     },
                                 )
                             },

@@ -24,6 +24,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -37,6 +38,9 @@ import com.rikkaminis.app.ui.components.DialogTextField
 import com.rikkaminis.app.ui.settings.SettingsSection
 import com.rikkaminis.app.ui.settings.SkillRowItem
 import com.rikkaminis.app.ui.components.MinisTextButton
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * Bottom sheet showing all skills with per-session enable/disable toggles.
@@ -86,12 +90,33 @@ fun SessionSkillsSheet(
         mutableStateMapOf<String, Boolean>()
     }
     LaunchedEffect(skills, sessionId) {
+        // [deep-audit-1040 B-04] The seed read is one SQLite query per skill
+        // (`isEnabledForSession` → `db.rawQuery`), and it used to run inline
+        // here — on Main, once per every skills emission. The missing-id set is
+        // computed on Main (it reads the snapshot map), storage is read on IO,
+        // and the seeds are handed back to the pure merge on Main. The merge's
+        // contract is untouched: `lookup` is still only consulted for ids that
+        // are missing from the map, so an in-flight toggle survives an
+        // emission. `?: false` is unreachable (the seeds cover exactly the ids
+        // the merge will ask for) and is only there to keep the lambda total.
+        val liveIds = skills.map { it.id }
+        val seeds = withContext(Dispatchers.IO) {
+            liveIds.filter { it !in overrides }
+                .associateWith { skillRepository.isEnabledForSession(it, sessionId) }
+        }
         mergeSessionOverrides(
-            liveIds = skills.map { it.id },
+            liveIds = liveIds,
             overrides = overrides,
-            lookup = { skillRepository.isEnabledForSession(it, sessionId) },
+            lookup = { seeds[it] ?: false },
         )
     }
+
+    // [deep-audit-1040 B-04] The three write sites below used to call
+    // `setSessionOverride` (a SQLite `INSERT OR REPLACE` per row) inline on
+    // Main — "Enable All" over a filtered list of N skills meant N synchronous
+    // transactions on the UI thread. They now run on IO; the local `overrides`
+    // map is still updated first, on Main, so the Switch has zero latency.
+    val scope = rememberCoroutineScope()
 
     var searchQuery by remember { mutableStateOf("") }
     val filteredSkills by remember(skills) {
@@ -150,9 +175,14 @@ fun SessionSkillsSheet(
                     // user can bulk-toggle the result of a search.
                     MinisTextButton(
                         onClick = {
-                            for (skill in filteredSkills) {
-                                overrides[skill.id] = true
-                                skillRepository.setSessionOverride(sessionId, skill.id, true)
+                            val ids = filteredSkills.map { it.id }
+                            for (id in ids) overrides[id] = true
+                            scope.launch {
+                                withContext(Dispatchers.IO) {
+                                    for (id in ids) {
+                                        skillRepository.setSessionOverride(sessionId, id, true)
+                                    }
+                                }
                             }
                         },
                         contentPadding = androidx.compose.foundation.layout.PaddingValues(
@@ -163,9 +193,14 @@ fun SessionSkillsSheet(
                     }
                     MinisTextButton(
                         onClick = {
-                            for (skill in filteredSkills) {
-                                overrides[skill.id] = false
-                                skillRepository.setSessionOverride(sessionId, skill.id, false)
+                            val ids = filteredSkills.map { it.id }
+                            for (id in ids) overrides[id] = false
+                            scope.launch {
+                                withContext(Dispatchers.IO) {
+                                    for (id in ids) {
+                                        skillRepository.setSessionOverride(sessionId, id, false)
+                                    }
+                                }
                             }
                         },
                         contentPadding = androidx.compose.foundation.layout.PaddingValues(
@@ -197,7 +232,12 @@ fun SessionSkillsSheet(
                                 isEnabled = overrides[skill.id] ?: skill.isEnabled,
                                 onToggle = { enabled ->
                                     overrides[skill.id] = enabled
-                                    skillRepository.setSessionOverride(sessionId, skill.id, enabled)
+                                    val skillId = skill.id
+                                    scope.launch {
+                                        withContext(Dispatchers.IO) {
+                                            skillRepository.setSessionOverride(sessionId, skillId, enabled)
+                                        }
+                                    }
                                 },
                                 showDivider = index < filteredSkills.size - 1,
                             )
