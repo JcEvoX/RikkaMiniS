@@ -367,7 +367,30 @@ class ChatViewModel(
         // 35s summary) gets cut and demoted to last-resort | 升级触发: compact
         // failures reported on members that succeed within 30-60s → raise
         // COMPACT_SUMMARY_CANDIDATE_BUDGET_MS or make it adaptive.
+        // ↑ 触发已命中（2026-10-22，见下方 [fix/compact-timeout-budget-1022] 常量）。
         internal const val COMPACT_SUMMARY_CANDIDATE_BUDGET_MS = 30_000L
+        // [fix/compact-timeout-budget-1022] Material-size adaptive budget — the
+        // upgrade trigger declared on the ponytail note above fired on
+        // 2026-10-22: a long agent run has no new user turn to fold, so the
+        // budget anchor hands the whole agent history to ONE summary call
+        // (estTokens 110670 / 140490 in the range-composition line) and the
+        // chain then TIMEOUT'd on every candidate at exactly 30000ms — 25
+        // timeouts that day, 32 "Compact failed", 119 "folded nothing", and 8
+        // runs ended on `finish=length ×3 empty output — giving up` because
+        // nothing folded while the hard trim could not keep the context under
+        // the window. Those candidates are NOT declared
+        // [LLMModel.declaresNoEffortTiers] — a user-configured relay entry
+        // never declares it — so they drew the 30s quiet floor while their own
+        // success latencies that same day sat at 25.0s / 28.2s / 29.1s: a
+        // working member cut by the wall. The material-size proxy separates
+        // the two measured regimes cleanly (≤ ~700 est tokens → every small
+        // fold succeeded in 6.8–25.1s; ≥ ~2 100 est tokens → all 25 failures),
+        // so anything larger than this threshold takes the noisy 60s budget.
+        // The 120s chain deadline still clamps every candidate, and
+        // within-chain timeout de-duplication ([compactionCandidateKey]) keeps
+        // a chain of same-route members from spending that deadline three
+        // times over.
+        internal const val COMPACT_SUMMARY_LARGE_MATERIAL_TOKENS = 1_000
         // [fix/compact-truncation-guard-1005] Noisy-member adaptation of the
         // per-candidate budget: a member that declares no effort tiers
         // (declaresNoEffortTiers == true → ThinkingLevel.OFF has no wire
