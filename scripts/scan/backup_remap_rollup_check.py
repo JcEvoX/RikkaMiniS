@@ -124,6 +124,25 @@ DATE_PATTERN = 'Regex("\\\\d{4}-\\\\d{2}-\\\\d{2}")'
 HINT_DEF = "private fun dailyLogSizes("
 PICK_DEF = "private fun pickLargestEligibleDate("
 
+# ── [fix/dv18-4 A-07] GROUP RUN-CONFIG RESTORE (Stage 2 same-name merge) ──
+# A backup's groups[] entry carries five run-config fields (strategy /
+# fallbackStrategy / defaultThinkingLevel / contextLimitTokens /
+# lastContextLimitTokens — buildSections writes all of them). The same-name
+# merge branch used to decode NONE of them, so a restore onto an install that
+# already had the group silently reset the user's routing / thinking-level /
+# context-limit choices (Stage 1 restores the instance run-config on a
+# same-label merge; Stage 2 did not — the asymmetry was the defect). Two
+# routing decisions, anchored on the seam names:
+#   G1: the merge branch routes the payload through the shared decode +
+#       apply seam, and BOTH restore paths use the shared decode.
+#   G2: the decode lives in ONE place (readGroupRunConfig) — no restore path
+#       re-decodes the five keys inline — and the seam still decodes all five.
+GROUP_SEAM_READ = "readGroupRunConfig("
+GROUP_SEAM_APPLY = "applyGroupRunConfig("
+GROUP_RUN_KEYS = ("strategy", "fallbackStrategy", "defaultThinkingLevel",
+                  "contextLimitTokens", "lastContextLimitTokens")
+GROUP_INLINE_READS = tuple('"%s"' % k for k in GROUP_RUN_KEYS)
+
 
 def code_only(text):
     """Text with line comments (//…) removed — presence checks below must not be
@@ -447,6 +466,98 @@ def check_rollup_candidate_single_source(mem, eng, runner):
     return out
 
 
+def _import_body(src):
+    body = function_text(src, "    suspend fun import(")
+    if body is None:
+        return None, line_of(src, src.find("    suspend fun import("))
+    return body, line_of(src, src.find("    suspend fun import("))
+
+
+def _merge_branch(src_import_body):
+    """The same-name merge branch (`if (existingGroup != null) { … }`)."""
+    i = src_import_body.find("if (existingGroup != null)")
+    if i < 0:
+        return None
+    brace = src_import_body.find("{", i)
+    if brace < 0:
+        return None
+    end = _balanced(src_import_body, brace, "{", "}")
+    return None if end < 0 else src_import_body[i:end]
+
+
+def check_group_run_config_merge(src):
+    """G1: the same-name merge branch must restore the payload's run-config
+    through the shared seam, and BOTH restore paths must use the shared
+    decode (create + merge)."""
+    body, base = _import_body(src)
+    if body is None:
+        return [(CFG_REL, base, "import( not found — gate ROT")]
+    merge = _merge_branch(body)
+    if merge is None:
+        return [(CFG_REL, base, "same-name merge branch (if (existingGroup != null)) not found — gate ROT")]
+    out = []
+    code = code_only(merge)
+    if GROUP_SEAM_READ not in code:
+        out.append((
+            CFG_REL, base,
+            "the same-name merge branch does not decode the payload's run-config (" +
+            GROUP_SEAM_READ + ") — a restore onto an existing group silently drops "
+            "strategy / fallbackStrategy / defaultThinkingLevel / contextLimitTokens",
+        ))
+    if GROUP_SEAM_APPLY not in code:
+        out.append((
+            CFG_REL, base,
+            "the same-name merge branch does not apply the decoded run-config (" +
+            GROUP_SEAM_APPLY + ") — the merge keeps only the member union and resets "
+            "the group's run-config to whatever the local group had",
+        ))
+    if "updateGroup(" not in code:
+        out.append((CFG_REL, base, "merge branch no longer writes via updateGroup( — gate ROT"))
+    if code_only(body).count(GROUP_SEAM_READ) < 2:
+        out.append((
+            CFG_REL, base,
+            "the create path stopped using the shared group run-config decode (" +
+            GROUP_SEAM_READ + ") — a second inline decode can drift from the merge "
+            "path again",
+        ))
+    return out
+
+
+def check_group_run_config_single_decode(src):
+    """G2: the five run-config keys are decoded in exactly one place — the
+    readGroupRunConfig seam — and the seam still reads all five keys."""
+    body, base = _import_body(src)
+    if body is None:
+        return [(CFG_REL, base, "import( not found — gate ROT")]
+    out = []
+    code = code_only(body)
+    for token in GROUP_INLINE_READS:
+        for fn in ("optString", "optInt", "has", "put"):
+            needle = fn + "(" + token
+            if needle in code:
+                out.append((
+                    CFG_REL,
+                    line_of(src, src.find("    suspend fun import(")) if needle in src else base,
+                    "the import path re-decodes a group run-config key inline (" + needle +
+                    ") instead of going through " + GROUP_SEAM_READ +
+                    " — two decodes for the same payload can drift apart",
+                ))
+    seam = function_text(src, "internal fun readGroupRunConfig(")
+    if seam is None:
+        out.append((CFG_REL, 0, "readGroupRunConfig( not found — gate ROT"))
+    else:
+        seam_code = code_only(seam)
+        for token in GROUP_INLINE_READS:
+            if token not in seam_code:
+                out.append((
+                    CFG_REL,
+                    line_of(src, src.find("internal fun readGroupRunConfig(")),
+                    "the shared group run-config decode no longer reads " + token +
+                    " — the field would be silently dropped on every restore",
+                ))
+    return out
+
+
 def check(root, raw_cfg=None, raw_mem=None, raw_builtins=None, raw_engine=None,
           raw_runner=None):
     if raw_cfg is None:
@@ -474,6 +585,8 @@ def check(root, raw_cfg=None, raw_mem=None, raw_builtins=None, raw_engine=None,
     out += check_restore_writeback(raw_cfg)
     out += check_delete_guard(raw_mem)
     out += check_rollup_candidate_single_source(raw_mem, raw_engine, raw_runner)
+    out += check_group_run_config_merge(raw_cfg)
+    out += check_group_run_config_single_decode(raw_cfg)
     return out
 
 
@@ -684,6 +797,58 @@ def selftest(root):
         ),
     )
 
+    # ── [fix/dv18-4 A-07] arms 17-20: group run-config restore ──────────
+    # 17. the merge branch stops applying the decoded run-config (the A-07
+    #     defect shape: members-only merge). The decode call is still there,
+    #     so exactly the apply criterion + the two-callsite count fire.
+    arm(
+        "M17 merge stops applying run-config",
+        on_cfg(check_group_run_config_merge),
+        cfg=sub_once(
+            cfg,
+            """                    val merged = applyGroupRunConfig(
+                        existingGroup,
+                        readGroupRunConfig(g, warnGroupRunConfig),
+                    ).copy(memberEntryIds = mergedMembers)""",
+            "                    val merged = existingGroup.copy(memberEntryIds = mergedMembers)",
+        ),
+    )
+    # 18. the create path stops using the shared decode (a second, private
+    #     decode can drift from the merge path again).
+    arm(
+        "M18 create path stops using the shared decode",
+        on_cfg(check_group_run_config_merge),
+        cfg=sub_once(
+            cfg,
+            "val runConfig = readGroupRunConfig(g, warnGroupRunConfig)",
+            "val runConfig = readGroupRunConfigLegacy(g, warnGroupRunConfig)",
+        ),
+    )
+    # 19. a run-config key is re-decoded inline in the import path (the two
+    #     decodes can drift apart again).
+    arm(
+        "M19 strategy re-decoded inline",
+        on_cfg(check_group_run_config_single_decode),
+        cfg=sub_once(
+            cfg,
+            "strategy = runConfig.strategy.value,",
+            'strategy = enumOrDefault(g.optString("strategy"), RoutingStrategy.fallback),',
+        ),
+    )
+    # 20. the shared decode loses a key (ROT).
+    arm(
+        "M20 seam stops reading fallbackStrategy",
+        on_cfg(check_group_run_config_single_decode),
+        cfg=sub_once(
+            cfg,
+            """        fallbackStrategy = BackupField(
+            present = g.has("fallbackStrategy"),
+            value = enumOrDefault(g.optString("fallbackStrategy"), FallbackStrategy.default),
+        ),""",
+            "        fallbackStrategy = BackupField(present = false, value = FallbackStrategy.default),",
+        ),
+    )
+
     failures = []
     for name, crit, c, m, b, e, r in arms:
         violations = check(root, raw_cfg=c, raw_mem=m, raw_builtins=b, raw_engine=e,
@@ -732,7 +897,7 @@ def main():
         print("backup_remap_rollup_check: %d violation(s)" % len(violations))
         return 1
     print("backup_remap_rollup_check: OK (compact pin remapped, binding remapped, "
-          "rollup packed + guarded)")
+          "rollup packed + guarded, group run-config restored on same-name merge)")
     return 0
 
 

@@ -45,6 +45,12 @@ import java.io.File
 object ConfigBackup {
     private const val TAG = "ConfigBackup"
 
+    /** [fix/dv18-4 A-07] Warning sink handed to the Android-free group
+     *  run-config decode seam ([readGroupRunConfig]) — a lambda so the decode
+     *  stays JVM-unit-testable: tests capture the message instead of needing
+     *  logcat. */
+    private val warnGroupRunConfig: (String) -> Unit = { Log.w(TAG, it) }
+
     /** Bumped only on breaking payload changes; readers reject newer majors. */
     const val FORMAT_VERSION = 1
 
@@ -1090,8 +1096,25 @@ object ConfigBackup {
                             addedAny = true
                         }
                     }
-                    if (addedAny) {
-                        providerRepo.updateGroup(existingGroup.copy(memberEntryIds = mergedMembers))
+                    // [fix/dv18-4 A-07] A restore is a restore: the group
+                    // section carries the run-config (strategy / fallback /
+                    // per-group thinking level / context limits), so a
+                    // same-name merge must restore it too — the same shape as
+                    // Stage 1's mergeImportInstanceJSON, where a same-label
+                    // restore DOES restore the instance's run-config. Members
+                    // stay a UNION (additive, above); the run-config is
+                    // backup-wins, and the pre-restore snapshot is the
+                    // rollback safety net.
+                    // ponytail: members union + run-config backup-wins | 天花板:
+                    // 用户想「只并成员、保留本地运行配置」时无处表达 | 升级触发:
+                    // 真机反馈恢复后分组配置被改写 ⇒ 在导入 UI 加显式 run-config
+                    // 开关，不在本层猜。
+                    val merged = applyGroupRunConfig(
+                        existingGroup,
+                        readGroupRunConfig(g, warnGroupRunConfig),
+                    ).copy(memberEntryIds = mergedMembers)
+                    if (addedAny || merged != existingGroup) {
+                        providerRepo.updateGroup(merged)
                     }
                     if (srcId.isNotEmpty()) groupIdMap[srcId] = existingGroup.id
                     groupsImported++
@@ -1119,25 +1142,19 @@ object ConfigBackup {
                     resolvedName = "$name ($suffix)"
                 }
                 try {
+                    // [fix/dv18-4 A-07] Same decode as the merge branch above —
+                    // one seam, two appliers (mirrors Stage 1's
+                    // readImportInstanceFields / applyImportInstanceFields).
+                    val runConfig = readGroupRunConfig(g, warnGroupRunConfig)
                     val group = ModelGroup(
                         id = newId,
                         name = resolvedName,
                         memberEntryIds = members,
-                        strategy = enumOrDefault(
-                            g.optString("strategy"),
-                            com.rikkaminis.app.data.model.RoutingStrategy.fallback,
-                        ),
-                        fallbackStrategy = enumOrDefault(
-                            g.optString("fallbackStrategy"),
-                            com.rikkaminis.app.data.model.FallbackStrategy.default,
-                        ),
-                        defaultThinkingLevel = g.optString("defaultThinkingLevel")
-                            .takeIf { it.isNotEmpty() }
-                            ?.let { runCatching { ThinkingLevel.valueOf(it) }.getOrNull() },
-                        contextLimitTokens = if (g.has("contextLimitTokens"))
-                            g.optInt("contextLimitTokens").takeIf { it > 0 } else null,
-                        lastContextLimitTokens = if (g.has("lastContextLimitTokens"))
-                            g.optInt("lastContextLimitTokens").takeIf { it > 0 } else null,
+                        strategy = runConfig.strategy.value,
+                        fallbackStrategy = runConfig.fallbackStrategy.value,
+                        defaultThinkingLevel = runConfig.defaultThinkingLevel.value,
+                        contextLimitTokens = runConfig.contextLimitTokens.value,
+                        lastContextLimitTokens = runConfig.lastContextLimitTokens.value,
                     )
                     providerRepo.addGroup(group)
                     if (srcId.isNotEmpty()) groupIdMap[srcId] = newId
@@ -1595,11 +1612,6 @@ object ConfigBackup {
             for (line in result.skipped) Log.w(TAG, "import skipped — $line")
         }
     }
-
-    /** [enumValueOf] that falls back to [default] instead of throwing on a
-     *  token this build doesn't know (forward-compat with newer backups). */
-    private inline fun <reified T : Enum<T>> enumOrDefault(name: String, default: T): T =
-        runCatching { enumValueOf<T>(name) }.getOrDefault(default)
 
     /** Hard cap on messages carried per session in a chat-history backup. */
     internal const val MAX_CHAT_MESSAGES_PER_SESSION = 200
@@ -2202,4 +2214,107 @@ internal suspend fun importChatSections(
         }
     }
     return chatSessionsImported to chatMessagesImported
+}
+
+// --- [fix/dv18-4 A-07] Model-group run-config seams for the backup import
+// path. The `groups[]` section carries five run-config fields on export
+// (buildSections: strategy / fallbackStrategy / defaultThinkingLevel /
+// contextLimitTokens / lastContextLimitTokens), but the import's same-name
+// merge branch decoded NONE of them — a restore onto an install that already
+// had the group silently reset the user's routing strategy / per-group
+// thinking level / context limit to the defaults (Stage 1 vs Stage 2
+// asymmetry: readImportInstanceFields DOES restore the instance run-config
+// on a same-label merge). Same shape as ProviderRepository's Stage-1 seams:
+// one decode (readGroupRunConfig), two appliers — the create path takes
+// `.value` (decode defaults mirror the pre-existing inline decode byte for
+// byte), the merge path goes through applyGroupRunConfig, which honours
+// [BackupField.present] so a legacy backup's missing keys keep the local
+// group's run-config instead of overwriting it with a null/default.
+// Top-level and Android-free (the warning sink is injected) so the round-trip
+// is JVM-unit-testable without an Android Context. ---
+
+/** [enumValueOf] that falls back to [default] instead of throwing on a
+ *  token this build doesn't know (forward-compat with newer backups). */
+private inline fun <reified T : Enum<T>> enumOrDefault(name: String, default: T): T =
+    runCatching { enumValueOf<T>(name) }.getOrDefault(default)
+
+/**
+ * [fix/dv18-4 A-07] One field decoded from a `groups[]` backup entry.
+ * [present] records whether the payload carried the key AT ALL: a pre-T312
+ * backup has none of the run-config keys, and "absent" must leave the target
+ * group's current value alone (restore is additive for what the backup does
+ * not say) rather than overwrite it with a decode default.
+ */
+internal data class BackupField<T>(val present: Boolean, val value: T)
+
+/** [fix/dv18-4 A-07] The five run-config fields of one `groups[]` entry. */
+internal data class GroupRunConfigSnapshot(
+    val strategy: BackupField<RoutingStrategy>,
+    val fallbackStrategy: BackupField<FallbackStrategy>,
+    val defaultThinkingLevel: BackupField<ThinkingLevel?>,
+    val contextLimitTokens: BackupField<Int?>,
+    val lastContextLimitTokens: BackupField<Int?>,
+)
+
+/**
+ * [fix/dv18-4 A-07] The ONE decode of the group run-config keys, shared by
+ * both restore paths (fresh create + same-name merge) so the two cannot drift.
+ * Decode defaults are the pre-fix inline behaviour: enums fall back to the
+ * model defaults on an unknown token, `defaultThinkingLevel` and both token
+ * limits decode to null when absent/empty/non-positive. [warn] receives one
+ * message when a thinking-level token cannot be parsed — the RESULT is
+ * unchanged either way (a backup from a newer build must not sink the whole
+ * import); the point is that the drop stops being silent.
+ */
+internal fun readGroupRunConfig(g: JSONObject, warn: (String) -> Unit): GroupRunConfigSnapshot {
+    val rawThinking = g.optString("defaultThinkingLevel", "")
+    val thinking = rawThinking
+        .takeIf { it.isNotEmpty() }
+        ?.let { runCatching { ThinkingLevel.valueOf(it) }.getOrNull() }
+    if (rawThinking.isNotEmpty() && thinking == null) {
+        warn(
+            "import: group defaultThinkingLevel \"$rawThinking\" is not a level " +
+                "this build knows — no thinking-level override applied"
+        )
+    }
+    return GroupRunConfigSnapshot(
+        strategy = BackupField(
+            present = g.has("strategy"),
+            value = enumOrDefault(g.optString("strategy"), RoutingStrategy.fallback),
+        ),
+        fallbackStrategy = BackupField(
+            present = g.has("fallbackStrategy"),
+            value = enumOrDefault(g.optString("fallbackStrategy"), FallbackStrategy.default),
+        ),
+        defaultThinkingLevel = BackupField(present = g.has("defaultThinkingLevel"), value = thinking),
+        contextLimitTokens = BackupField(
+            present = g.has("contextLimitTokens"),
+            value = g.optInt("contextLimitTokens").takeIf { it > 0 },
+        ),
+        lastContextLimitTokens = BackupField(
+            present = g.has("lastContextLimitTokens"),
+            value = g.optInt("lastContextLimitTokens").takeIf { it > 0 },
+        ),
+    )
+}
+
+/**
+ * [fix/dv18-4 A-07] Apply a decoded [GroupRunConfigSnapshot] onto [base].
+ * Copy-on-write: returns a NEW group, never mutates [base] (it is the live
+ * object out of config.value that concurrent readers may be iterating). Only
+ * fields the payload actually carried ([BackupField.present]) are
+ * overwritten — an absent key keeps [base]'s value, so restoring a legacy
+ * backup is a no-op on run-config, not a reset. Deliberately does NOT touch
+ * id / name / memberEntryIds: the merge match key, the resolved name and the
+ * member union are the caller's decisions (and updateGroup re-copies the
+ * member list on store).
+ */
+internal fun applyGroupRunConfig(base: ModelGroup, f: GroupRunConfigSnapshot): ModelGroup {
+    val out = base.copy()
+    if (f.strategy.present) out.strategy = f.strategy.value
+    if (f.fallbackStrategy.present) out.fallbackStrategy = f.fallbackStrategy.value
+    if (f.defaultThinkingLevel.present) out.defaultThinkingLevel = f.defaultThinkingLevel.value
+    if (f.contextLimitTokens.present) out.contextLimitTokens = f.contextLimitTokens.value
+    if (f.lastContextLimitTokens.present) out.lastContextLimitTokens = f.lastContextLimitTokens.value
+    return out
 }
