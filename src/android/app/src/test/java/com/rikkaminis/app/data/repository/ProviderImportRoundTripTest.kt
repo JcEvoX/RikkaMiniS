@@ -291,4 +291,106 @@ class ProviderImportRoundTripTest {
         assertEquals("OpenAI", updated.label)
         assertEquals(ProviderType.openAI, updated.providerType)
     }
+
+    // ------------------------------------------------------------------
+    // [fix/dv20-a2 A-08] A restore is a restore — one level below the
+    // instance-config write face above: a model the existing instance ALREADY
+    // has must take the backup's model-level values. [mergeImportedEntryOntoLocal]
+    // is the production decision point (called directly — it is a pure
+    // top-level function in ProviderRepository.kt, exactly like
+    // [readImportInstanceFields] above), and the merge path routes its write
+    // through it.
+    // ------------------------------------------------------------------
+    private fun entry(
+        uuid: String,
+        displayName: String? = null,
+        baseDisplay: String = "GPT-5.5",
+        isHidden: Boolean = false,
+        isCustom: Boolean = false,
+        costTier: Int? = null,
+        userModifiedAt: Long? = null,
+    ) = ModelEntry(
+        providerInstanceId = "inst-1",
+        baseModel = LLMModel(id = "gpt-5.5", displayName = baseDisplay, provider = "OpenAI"),
+        overrides = ModelOverrides(displayName = displayName),
+        isCustom = isCustom,
+        isHidden = isHidden,
+        uuid = uuid,
+        userModifiedAt = userModifiedAt,
+        costTier = costTier,
+    )
+
+    @Test
+    fun mergeRestore_writesBackupModelValuesOntoExistingEntry() {
+        // Local entry already exists and carries user customizations...
+        val local = entry(
+            uuid = "inst-1/gpt-5.5",
+            displayName = "My local name",
+            isHidden = true,
+            costTier = 3,
+            userModifiedAt = 1_700_000_000_000L,
+        )
+        // ...and the backup (the source of truth on a restore) says otherwise.
+        val imported = entry(
+            uuid = "temp-uuid-minted-by-parse",
+            displayName = "Backup name",
+            isHidden = false,
+            isCustom = true,
+            costTier = 1,
+        )
+
+        val restored = mergeImportedEntryOntoLocal(local, imported)
+
+        assertTrue("a differing entry must produce a write", restored != null)
+        // Backup values win (restore-is-restore), including the "absent"
+        // forms — false / null are values, not "leave the local alone".
+        assertEquals("Backup name", restored!!.overrides.displayName)
+        assertEquals(false, restored.isHidden)
+        assertEquals(true, restored.isCustom)
+        assertEquals(1, restored.costTier)
+        // Identity is the LOCAL entry's: entryIdMap / group members /
+        // agentLoop ids all hang off this id.
+        assertEquals("inst-1/gpt-5.5", restored.uuid)
+        assertEquals("inst-1/gpt-5.5", restored.id)
+        // ...and the instance binding (the hit predicate's other half) is not
+        // rewritten by the restore.
+        assertEquals("inst-1", restored.providerInstanceId)
+    }
+
+    @Test
+    fun mergeRestore_identityPinnedEvenWhenBackupCarriesAnotherUuid() {
+        val local = entry(uuid = "inst-1/gpt-5.5")
+        val imported = entry(uuid = "totally-different-uuid", displayName = "Backup")
+        val restored = mergeImportedEntryOntoLocal(local, imported)
+        assertEquals("inst-1/gpt-5.5", restored!!.uuid)
+        // The minted uuid must never leak into the id map.
+        assertFalse(restored.uuid == "totally-different-uuid")
+    }
+
+    @Test
+    fun mergeRestore_isNoOpWhenBackupMatchesLocal() {
+        // Byte-for-byte identical content (uuid pinned by the restore rule,
+        // userModifiedAt included) → nothing to write, and the caller keeps
+        // the existing id: the historical zero-write behavior for unchanged
+        // entries survives the fix.
+        val local = entry(uuid = "inst-1/gpt-5.5", displayName = "same")
+        val imported = entry(uuid = "inst-1/gpt-5.5", displayName = "same")
+        assertNull(mergeImportedEntryOntoLocal(local, imported))
+    }
+
+    @Test
+    fun mergeRestore_carriesBaseModelMetadataToo() {
+        // The whole entry rides the write — not just the overrides bag. A
+        // backup whose base-model metadata was refreshed (new context window /
+        // display name) restores that too.
+        val local = entry(uuid = "inst-1/gpt-5.5", baseDisplay = "GPT-5.5")
+        val imported = entry(
+            uuid = "temp",
+            baseDisplay = "GPT-5.5 (2026 refreshed)",
+        ).copy(baseModel = LLMModel(id = "gpt-5.5", displayName = "GPT-5.5 (2026 refreshed)", provider = "OpenAI", contextWindow = 1_000_000))
+        val restored = mergeImportedEntryOntoLocal(local, imported)!!
+        assertEquals("GPT-5.5 (2026 refreshed)", restored.baseModel.displayName)
+        assertEquals(1_000_000, restored.baseModel.contextWindow)
+        assertEquals("inst-1/gpt-5.5", restored.uuid)
+    }
 }

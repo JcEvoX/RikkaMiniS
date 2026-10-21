@@ -557,7 +557,19 @@ class ProviderRepository(private val context: Context) {
                 )
                 config
             }
-            _config.value = canonical.copy(
+            // [fix/dv20-a2 A-04] Publish AND persist the same object. The
+            // persist face serializes whatever it is handed
+            // ([persistToDbAndMirror] step 1: `json.encodeToString(config)` →
+            // the prefs mirror string, plus the mirror hash stored in DB meta),
+            // so passing the pre-canonicalization `config` wrote the legacy
+            // shape to the mirror while `_config.value` carried the composite
+            // shape — two readers of the same save disagreed (downgrade
+            // reader / mirror-fallback load vs. the live UI), and the mirror's
+            // entry ids + group/agent-loop references stayed in the legacy
+            // form. [persistToDbAndMirror]'s own KDoc already required this
+            // pairing ("using the in-memory pre-call object would leak the
+            // legacy uuid form into [_config.value]").
+            val published = canonical.copy(
                 instances = canonical.instances.toMutableList(),
                 modelEntries = canonical.modelEntries.toMutableList(),
                 modelGroups = canonical.modelGroups.toMutableList(),
@@ -570,9 +582,10 @@ class ProviderRepository(private val context: Context) {
                 // callers see the new value.
                 revision = config.revision + 1,
             )
+            _config.value = published
             persistExecutor.execute {
                 try {
-                    runBlocking { persistToDbAndMirror(config) }
+                    runBlocking { persistToDbAndMirror(published) }
                 } catch (e: Exception) {
                     // In-memory state is already emitted; the next successful
                     // save resyncs mirror + DB (same contract as the old
@@ -2711,8 +2724,15 @@ class ProviderRepository(private val context: Context) {
      *   - the existing instance id is kept, so groups / defaults referencing
      *     the backup's entries remap onto the live instance;
      *   - models are upserted by baseModel.id: models the existing instance
-     *     lacks are added, models it already has are reused as-is (the local
-     *     overrides / customizations win);
+     *     lacks are added; models it already has have the backup's values
+     *     written onto them — a restore is a restore, all the way down
+     *     [fix/dv20-a2 A-08]. The write goes through [updateEntry] (the same
+     *     whole-entry face the UI editor uses) with the existing entry's id
+     *     kept, so the entryIdMap and every reference hanging off it stays
+     *     valid; unchanged entries skip the write (local values identical to
+     *     the backup's are a no-op, and the historical "local wins" reading
+     *     of this bullet was the same stale claim the credentials bullet
+     *     below already corrected).
      *   - credentials (the backup's apiKey — the only credential field
      *     [importInstanceCredentials] writes) ARE written onto the existing
      *     instance — a restore is a restore. (An earlier revision of this doc
@@ -2740,7 +2760,9 @@ class ProviderRepository(private val context: Context) {
      * are always written onto the existing instance —
      * a restore is a restore. [fix/dv16-a A-08] The instance-config fields the
      * append path decodes are now applied too, through the shared
-     * [applyImportInstanceFields] face.
+     * [applyImportInstanceFields] face. [fix/dv20-a2 A-08] The model-level
+     * fields are applied the same way, through the shared whole-entry
+     * [updateEntry] face (identity pinned to the existing entry id).
      */
     fun mergeImportInstanceJSON(
         jsonStr: String,
@@ -2782,7 +2804,27 @@ class ProviderRepository(private val context: Context) {
             val hit = _config.value.modelEntries.firstOrNull {
                 it.providerInstanceId == existing.id && it.baseModel.id == entry.baseModel.id
             }
-            val resolvedEntryId = hit?.id ?: run {
+            val resolvedEntryId = if (hit != null) {
+                // [fix/dv20-a2 A-08] A restore is a restore — the same contract
+                // the instance-config fields got in dv16-a A-08 (same merge
+                // path, one level down): the backup's model-level values are
+                // written onto the existing entry instead of being dropped
+                // behind a successful-looking import. The field set and the
+                // identity rule live in [mergeImportedEntryOntoLocal] (single
+                // source, derived from ModelEntry itself — no whitelist here);
+                // the write goes through [updateEntry], the same whole-entry
+                // face the UI editor uses, so nothing can drift between the
+                // restore path and the editor path.
+                // The returned id is used as-is, not assumed == hit.id: if the
+                // existing entry still carries a legacy uuid, updateEntry's
+                // rename-integrity decision canonicalizes it to the composite
+                // key and the id map must follow. A null return means the
+                // write was rejected and the untouched existing id is still
+                // the correct mapping target. A no-op merge (imported values
+                // already identical) skips the write entirely.
+                val updated = mergeImportedEntryOntoLocal(hit, entry)
+                if (updated == null) hit.id else (updateEntry(updated) ?: hit.id)
+            } else {
                 addEntry(entry)
                 // [T-fix-import-id-roundtrip] addEntry 落盘后 _config.value 已被
                 // saveConfig 的 toSnapshot→toProviderConfig canonicalize 为复合键
@@ -2938,6 +2980,34 @@ internal fun applyImportInstanceFields(base: ProviderInstance, f: ImportInstance
         pinned = f.runConfig.pinned,
     )
 
+
+/**
+ * Merge a parsed import entry into the local entry list, single-sourced so the
+ * merge path's "hit" branch is one decision point (a second copy of this logic
+ * is exactly the drift [applyImportInstanceFields] exists to prevent).
+ *
+ * Semantics — [fix/dv20-a2 A-08] a restore is a restore, one level below
+ * [applyImportInstanceFields]:
+ *  - The backup's model-level values (base model metadata / overrides /
+ *    isCustom / isHidden / costTier) are written onto the existing entry.
+ *  - The entry's identity is kept: [ModelEntry.uuid] stays the local id, so
+ *    entryIdMap / model-group members / agentLoop ids referencing it stay
+ *    valid. (providerInstanceId is equal by construction — the caller's hit
+ *    predicate matches on it.)
+ *  - [ModelEntry.userModifiedAt] is stamped by the writer, not copied from the
+ *    backup (the same rule the UI editor path follows through [updateEntry]).
+ *  - A no-op merge returns null: nothing to write, the caller keeps the
+ *    existing id. That is the unchanged "identical restore does not touch the
+ *    entry" behavior.
+ *
+ * The full field set rides [ModelEntry] itself rather than a hand-written
+ * whitelist here — adding a field to the data class must not need a second
+ * edit in this function (four-way-sync lesson).
+ */
+internal fun mergeImportedEntryOntoLocal(local: ModelEntry, imported: ModelEntry): ModelEntry? {
+    val restored = imported.copy(uuid = local.id)
+    return if (restored == local) null else restored
+}
 
 // --- [da1023-C] Pure entry-key / compact-pin decision helpers. Top-level in
 // this file (not ProviderRepositoryUtils.kt, which other 1023 fix branches

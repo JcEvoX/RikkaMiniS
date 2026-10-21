@@ -279,6 +279,108 @@ def check_merge_shares_instance_fields(src, rel=PR_REL):
 
 
 # ----------------------------------------------------------------------
+# Arm 7 — [fix/dv20-a2 A-08] the merge path's hit branch restores the model
+# entry through the shared write face (nothing dropped, nothing hand-copied)
+# ----------------------------------------------------------------------
+MERGE_FIELDS_HELPER = "mergeImportedEntryOntoLocal("
+ENTRY_WRITE_FACE = "updateEntry("
+
+
+def check_merge_restores_entry_fields(src, rel=PR_REL):
+    """A same-(type,label) merge must apply the backup's model-level values onto
+    the entry it already has.
+
+    Two decision points, both fail-closed:
+      a) the hit branch restores through the shared helper, and the helper is
+         defined exactly once (single source — a second copy is the drift this
+         arm exists to prevent);
+      b) the call site hands over whole entry objects, so adding a field to
+         ModelEntry needs no edit here (a hand-written whitelist at the call
+         site compiles, restores today's fields, and drifts tomorrow);
+      c) the restored entry is actually written back through the shared
+         whole-entry face.
+    """
+    out = []
+    merge_body = function_text(src, "fun mergeImportInstanceJSON(")
+    if merge_body is None:
+        return [(rel, 0, "7", "mergeImportInstanceJSON( not found — gate ROT")]
+    code = code_only(merge_body)
+    if MERGE_FIELDS_HELPER not in code:
+        out.append((rel, line_of(src, src.find("fun mergeImportInstanceJSON(")), "7",
+                    "merge hit branch takes the local entry's id and drops the rest — "
+                    "the backup's model-level values (overrides / isHidden / isCustom / "
+                    "costTier / base model metadata) never reach the entry it matched "
+                    "(%s absent from mergeImportInstanceJSON)" % MERGE_FIELDS_HELPER))
+        return out
+    n = len(re.findall(r"fun\s+mergeImportedEntryOntoLocal\s*\(", src))
+    if n != 1:
+        out.append((rel, 0, "7",
+                    "mergeImportedEntryOntoLocal defined %d times — the entry-level "
+                    "restore face must stay single-source" % n))
+    m = re.search(r"mergeImportedEntryOntoLocal\(([^)]*)\)", code)
+    if m is None:
+        out.append((rel, line_of(src, src.find("fun mergeImportInstanceJSON(")), "7",
+                    "mergeImportedEntryOntoLocal call has no readable argument list — "
+                    "gate ROT"))
+    else:
+        args = m.group(1).strip()
+        if args != "hit, entry":
+            out.append((rel, line_of(src, src.find("fun mergeImportInstanceJSON(")), "7",
+                        "merge hit branch does not hand the whole entry pair to the "
+                        "single-source face (args=%r) — a field whitelist at the call "
+                        "site drifts the moment ModelEntry gains a field" % args))
+    if ENTRY_WRITE_FACE not in code:
+        out.append((rel, line_of(src, src.find("fun mergeImportInstanceJSON(")), "7",
+                    "merge hit branch restores fields but never writes them back — "
+                    "%s absent from mergeImportInstanceJSON" % ENTRY_WRITE_FACE))
+    return out
+
+# ----------------------------------------------------------------------
+# Arm 8 — [fix/dv20-a2 A-04] saveConfig persists exactly what it publishes
+# ----------------------------------------------------------------------
+def check_save_persists_published(src, rel=PR_REL):
+    """The publish and the persist must read the same local.
+
+    [persistToDbAndMirror] serializes its argument into the prefs mirror (and
+    hashes that string into DB meta). Handing it the pre-canonicalization
+    object writes the legacy shape to disk while `_config.value` carries the
+    canonical shape — the mirror and the live store disagree until the next
+    save, and any reader that only sees the mirror (downgrade build, mirror
+    fallback load, backup export reading prefs) gets the stale form.
+
+    Anchored on the callee's argument expression, not the surrounding lines.
+    """
+    out = []
+    body = function_text(src, "fun saveConfig(")
+    if body is None:
+        return [(rel, 0, "8", "saveConfig( not found — gate ROT")]
+    code = code_only(body)
+    calls = re.findall(r"persistToDbAndMirror\(\s*([A-Za-z_]\w*)\s*\)", code)
+    if not calls:
+        out.append((rel, line_of(src, src.find("fun saveConfig(")), "8",
+                    "saveConfig no longer calls persistToDbAndMirror(<ident>) — gate ROT "
+                    "(persist face renamed or fed a non-identifier expression)"))
+        return out
+    if len(calls) != 1:
+        out.append((rel, line_of(src, src.find("fun saveConfig(")), "8",
+                    "saveConfig calls persistToDbAndMirror %d times — the write path "
+                    "must be single-shot" % len(calls)))
+    persists = calls[0]
+    pubs = re.findall(r"_config\.value\s*=\s*([A-Za-z_]\w*)", code)
+    if len(pubs) != 1:
+        out.append((rel, line_of(src, src.find("fun saveConfig(")), "8",
+                    "saveConfig assigns _config.value from %d identifiers (expected 1) — "
+                    "gate cannot tell what was published" % len(pubs)))
+        return out
+    published = pubs[0]
+    if persists != published:
+        out.append((rel, line_of(src, src.find("fun saveConfig(")), "8",
+                    "saveConfig publishes %r but persists %r — the mirror + its stored "
+                    "hash carry a different shape than the running store (canonicalize "
+                    "runs on publish only)" % (published, persists)))
+    return out
+
+# ----------------------------------------------------------------------
 def run_checks(root):
     pr = read(PR_REL, root)
     bm = read(BM_REL, root)
@@ -295,6 +397,8 @@ def run_checks(root):
     checks += check_convert_echo(bm)
     checks += check_field_completeness(srcs)
     checks += check_merge_shares_instance_fields(pr)
+    checks += check_merge_restores_entry_fields(pr)
+    checks += check_save_persists_published(pr)
     return checks
 
 
@@ -458,6 +562,103 @@ FIX_PARSE_READDROPPED_BAD = """private fun parseImportedModelEntries(dict: JSONO
 # [fix/dv16-a A-08] Shared instance-field decode / write face (append + merge
 # restore paths). Appended to every fixture PR tree so arm 6's single-source
 # definition check is exercisable.
+# [fix/dv20-a2 A-08] The single-source entry-restore face the hit branch must
+# route through; fixture copy of the production helper.
+FIX_MERGE_FIELDS_HELPER = """
+internal fun mergeImportedEntryOntoLocal(local: ModelEntry, imported: ModelEntry): ModelEntry? {
+    val restored = imported.copy(uuid = local.id)
+    return if (restored == local) null else restored
+}
+"""
+
+# [fix/dv20-a2 A-04] Compliant saveConfig: publishes and persists the same local.
+FIX_SAVE_CANONICAL = """
+fun saveConfig(config: ProviderConfig) {
+    synchronized(configLock) {
+        val canonical = config.toSnapshot(json).toProviderConfig(json)
+        val published = canonical.copy(revision = config.revision + 1)
+        _config.value = published
+        persistExecutor.execute {
+            runBlocking { persistToDbAndMirror(published) }
+        }
+    }
+}
+"""
+
+# [fix/dv20-a2 A-04] Breaker: publishes the canonical object, persists the raw
+# pre-canonicalization one — the exact baseline shape.
+FIX_SAVE_RAW_BAD = """
+fun saveConfig(config: ProviderConfig) {
+    synchronized(configLock) {
+        val canonical = config.toSnapshot(json).toProviderConfig(json)
+        val published = canonical.copy(revision = config.revision + 1)
+        _config.value = published
+        persistExecutor.execute {
+            runBlocking { persistToDbAndMirror(config) }
+        }
+    }
+}
+"""
+
+# [fix/dv20-a2 A-08] Breaker: the baseline hit-branch shape — id taken, fields
+# dropped.
+FIX_MERGE_ID_ONLY_BAD = """fun mergeImportInstanceJSON(
+    jsonStr: String,
+    srcEntryIds: List<String>,
+): Pair<String, Map<String, String>>? {
+    val entries = parseImportedModelEntries(dict, existing.id)
+    val entryMap = HashMap<String, String>()
+    for (i in entries.indices) {
+        val srcId = srcEntryIds.getOrNull(i) ?: ""
+        val entry = entries[i]
+        val hit = _config.value.modelEntries.firstOrNull {
+            it.providerInstanceId == existing.id && it.baseModel.id == entry.baseModel.id
+        }
+        val resolvedEntryId = hit?.id ?: run {
+            addEntry(entry)
+            _config.value.modelEntries.firstOrNull {
+                it.providerInstanceId == existing.id && it.baseModel.id == entry.baseModel.id
+            }?.id ?: compositeEntryKey(existing.id, entry.baseModel.id)
+        }
+        if (srcId.isNotEmpty()) entryMap[srcId] = resolvedEntryId
+    }
+    val fields = readImportInstanceFields(dict)
+    val updated = applyImportInstanceFields(existing, fields)
+    if (updated != existing) updateInstance(updated)
+    return existing.id to entryMap
+}
+"""
+
+# [fix/dv20-a2 A-08] Breaker: a hand-written field whitelist at the call site —
+# restores today's fields, drifts the moment ModelEntry gains one.
+FIX_MERGE_WHITELIST_BAD = """fun mergeImportInstanceJSON(
+    jsonStr: String,
+    srcEntryIds: List<String>,
+): Pair<String, Map<String, String>>? {
+    val entries = parseImportedModelEntries(dict, existing.id)
+    val entryMap = HashMap<String, String>()
+    for (i in entries.indices) {
+        val srcId = srcEntryIds.getOrNull(i) ?: ""
+        val entry = entries[i]
+        val hit = _config.value.modelEntries.firstOrNull {
+            it.providerInstanceId == existing.id && it.baseModel.id == entry.baseModel.id
+        }
+        val resolvedEntryId = if (hit != null) {
+            updateEntry(hit.copy(overrides = entry.overrides, isHidden = entry.isHidden))
+            hit.id
+        } else {
+            addEntry(entry)
+            compositeEntryKey(existing.id, entry.baseModel.id)
+        }
+        if (srcId.isNotEmpty()) entryMap[srcId] = resolvedEntryId
+    }
+    val fields = readImportInstanceFields(dict)
+    val updated = applyImportInstanceFields(existing, fields)
+    if (updated != existing) updateInstance(updated)
+    return existing.id to entryMap
+}
+"""
+
 FIX_HELPERS = """
 internal data class RunConfigSnapshot(
     val isEnabled: Boolean = true,
@@ -534,7 +735,10 @@ FIX_MERGE_OK = """fun mergeImportInstanceJSON(
         val hit = _config.value.modelEntries.firstOrNull {
             it.providerInstanceId == existing.id && it.baseModel.id == entry.baseModel.id
         }
-        val resolvedEntryId = hit?.id ?: run {
+        val resolvedEntryId = if (hit != null) {
+            val restored = mergeImportedEntryOntoLocal(hit, entry)
+            if (restored == null) hit.id else (updateEntry(restored) ?: hit.id)
+        } else {
             addEntry(entry)
             _config.value.modelEntries.firstOrNull {
                 it.providerInstanceId == existing.id && it.baseModel.id == entry.baseModel.id
@@ -542,9 +746,10 @@ FIX_MERGE_OK = """fun mergeImportInstanceJSON(
         }
         if (srcId.isNotEmpty()) entryMap[srcId] = resolvedEntryId
     }
-    // [fix/dv16-a A-08] A restore is a restore: the instance-config fields the
-    // append path decodes are applied onto the existing instance too — through
-    // the same shared write face, so the merge path cannot drift.
+    // [fix/dv20-a2 A-08] A restore is a restore: the hit branch restores the
+    // backup's model-level values through the single-source helper + the
+    // whole-entry write face. (Arms 7/8 assume this shape as the compliant
+    // baseline; the per-arm breakers below each remove exactly one decision.)
     val fields = readImportInstanceFields(dict)
     val updated = applyImportInstanceFields(existing, fields)
     if (updated != existing) updateInstance(updated)
@@ -564,7 +769,10 @@ FIX_MERGE_BAD = """fun mergeImportInstanceJSON(
         val hit = _config.value.modelEntries.firstOrNull {
             it.providerInstanceId == existing.id && it.baseModel.id == entry.baseModel.id
         }
-        val resolvedEntryId = hit?.id ?: run {
+        val resolvedEntryId = if (hit != null) {
+            val restored = mergeImportedEntryOntoLocal(hit, entry)
+            if (restored == null) hit.id else (updateEntry(restored) ?: hit.id)
+        } else {
             addEntry(entry)
             entry.id
         }
@@ -576,6 +784,10 @@ FIX_MERGE_BAD = """fun mergeImportInstanceJSON(
     return existing.id to entryMap
 }
 """
+
+# [fix/dv20-a2 A-08] Compliant hit branch, used as the arm-8 fixture's carriage.
+FIX_MERGE_FIELDS_OK = FIX_MERGE_OK
+
 
 # [fix/dv16-a A-08] Arm 6 teeth: the merge path stops applying the shared
 # instance-field write face (the exact regression the arm exists for).
@@ -591,7 +803,10 @@ FIX_MERGE_NOAPPLY_BAD = """fun mergeImportInstanceJSON(
         val hit = _config.value.modelEntries.firstOrNull {
             it.providerInstanceId == existing.id && it.baseModel.id == entry.baseModel.id
         }
-        val resolvedEntryId = hit?.id ?: run {
+        val resolvedEntryId = if (hit != null) {
+            val restored = mergeImportedEntryOntoLocal(hit, entry)
+            if (restored == null) hit.id else (updateEntry(restored) ?: hit.id)
+        } else {
             addEntry(entry)
             _config.value.modelEntries.firstOrNull {
                 it.providerInstanceId == existing.id && it.baseModel.id == entry.baseModel.id
@@ -654,11 +869,17 @@ def build_fixture_tree(tmp, merge_src, export_src, parse_src, convert_src):
     os.makedirs(os.path.join(tmp, APP + "/backup"), exist_ok=True)
     os.makedirs(os.path.join(tmp, APP + "/data/model"), exist_ok=True)
     with open(os.path.join(tmp, PR_REL), "w") as f:
-        f.write(merge_src + "\n" + export_src + "\n" + parse_src + "\n" + FIX_HELPERS + "\n" + FIX_IMPORT_OK)
+        f.write(merge_src + "\n" + export_src + "\n" + parse_src + "\n" + FIX_HELPERS
+                + "\n" + FIX_IMPORT_OK + "\n" + FIX_MERGE_FIELDS_HELPER + "\n"
+                + FIX_SAVE_CANONICAL)
     with open(os.path.join(tmp, BM_REL), "w") as f:
         f.write(convert_src)
     with open(os.path.join(tmp, LM_REL), "w") as f:
         f.write(FIX_LM)
+
+
+def _arm_set(tmp):
+    return sorted({x[2] for x in run_checks(tmp)})
 
 
 def selftest():
@@ -688,12 +909,46 @@ def selftest():
         arms = sorted({x[2] for x in v})
         if arms != ["6"]:
             failures.append("merge-noapply fixture arms=%r (violations=%r)" % (arms, v))
+    # [fix/dv20-a2] Arms 7/8: the merge hit branch and the persist argument are
+    # the two decision points this batch added; each fixture reds only its own.
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_FIELDS_OK, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK)
+        got = _arm_set(tmp)
+        if got:
+            failures.append("merge-fields compliant fixture red: %r" % (run_checks(tmp),))
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_ID_ONLY_BAD, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK)
+        got = _arm_set(tmp)
+        if got != ["7"]:
+            failures.append("merge-id-only fixture arms=%r (want ['7'])" % (got,))
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_WHITELIST_BAD, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK)
+        got = _arm_set(tmp)
+        if got != ["7"]:
+            failures.append("merge-whitelist fixture arms=%r (want ['7'])" % (got,))
+    with tempfile.TemporaryDirectory() as tmp:
+        # Arm 8: same compliant merge, breaker lives in saveConfig instead.
+        os.makedirs(os.path.join(tmp, APP + "/data/repository"), exist_ok=True)
+        os.makedirs(os.path.join(tmp, APP + "/backup"), exist_ok=True)
+        os.makedirs(os.path.join(tmp, APP + "/data/model"), exist_ok=True)
+        with open(os.path.join(tmp, PR_REL), "w") as f:
+            f.write(FIX_MERGE_FIELDS_OK + "\n" + FIX_EXPORT_OK + "\n" + FIX_PARSE_OK + "\n"
+                    + FIX_HELPERS + "\n" + FIX_IMPORT_OK + "\n" + FIX_MERGE_FIELDS_HELPER
+                    + "\n" + FIX_SAVE_RAW_BAD)
+        with open(os.path.join(tmp, BM_REL), "w") as f:
+            f.write(FIX_CONVERT_OK)
+        with open(os.path.join(tmp, LM_REL), "w") as f:
+            f.write(FIX_LM)
+        got = _arm_set(tmp)
+        if got != ["8"]:
+            failures.append("save-raw fixture arms=%r (want ['8'])" % (got,))
     if failures:
         for f in failures:
             print("SELFTEST-FAIL: " + f)
         print("PROVIDER_IMPORT_ID_ROUNDTRIP_SELFTEST=FAIL")
         return 1
-    print("selftest: compliant green / violating red arms 1-6 / read-dropped red arms 3+5 / merge-noapply red arm 6")
+    print("selftest: compliant green / violating red arms 1-6 / read-dropped red arms 3+5"
+          " / merge-noapply red arm 6 / merge-id-only+whitelist red arm 7 / save-raw red arm 8")
     print("PROVIDER_IMPORT_ID_ROUNDTRIP_SELFTEST=PASS")
     return 0
 
@@ -713,7 +968,7 @@ def main():
         for rel, line, arm, msg in violations:
             print("  [arm %s] %s:%s — %s" % (arm, rel, line, msg))
         sys.exit(1)
-    print("PROVIDER_IMPORT_ID_ROUNDTRIP: clean (6 arms)")
+    print("PROVIDER_IMPORT_ID_ROUNDTRIP: clean (8 arms)")
     sys.exit(0)
 
 
