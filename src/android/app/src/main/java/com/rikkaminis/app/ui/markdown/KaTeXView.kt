@@ -211,7 +211,12 @@ fun KaTeXRenderView(
         // rendererEpoch discards this AndroidView and re-runs the factory with
         // a fresh WebView, instead of reusing an instance whose Chromium
         // process is gone (every call on such an instance is undefined).
-        key(rendererEpoch) {
+        // [dv17-3 B-03] `cacheKey` must stay in the key: `remember(cacheKey)`
+        // resets `rendererEpoch` to 0 when the key changes (streaming LaTeX
+        // updates / theme flips), so a bare `key(rendererEpoch)` never changes
+        // (0→0) and the AndroidView kept the factory closure capturing the old
+        // `latex` / `isDark`.
+        key(cacheKey, rendererEpoch) {
             AndroidView(
                 factory = { ctx ->
                     WebView(ctx).apply {

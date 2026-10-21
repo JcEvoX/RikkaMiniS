@@ -47,6 +47,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -235,6 +236,18 @@ fun WebPreviewBottomSheet(
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(2.dp))
             }
             Box(modifier = Modifier.fillMaxSize()) {
+                // [dv17-3 B-03] `AndroidView` runs `factory` only when this
+                // node's `key` changes. The holder is swappable while the node
+                // keeps its slot (`rememberWebViewHolder(url)` rebuilds it on a
+                // URL change), so without a key the sheet kept displaying the
+                // *previous* holder's WebView — already `destroy()`ed by the
+                // caller — and the new holder's WebView was never attached.
+                // `key(holder)` re-runs the factory on holder identity change
+                // only. (`update = { }` was the alternative: rejected because
+                // the factory returns the WebView itself, so re-parenting from
+                // `update` would require switching the node to a container
+                // view and moving the touch-listener setup with it.)
+                key(holder) {
                 AndroidView(
                     factory = {
                         // Issue #24: ModalBottomSheet's nested-scroll grabbed
@@ -263,6 +276,7 @@ fun WebPreviewBottomSheet(
                     },
                     modifier = Modifier.fillMaxSize(),
                 )
+                }
             }
         }
     }
