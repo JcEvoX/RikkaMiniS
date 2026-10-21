@@ -342,6 +342,62 @@ def check_editor_keys(files):
     return failures
 
 
+def _remember_keys(nc, marker):
+    """Ordered key tokens of the `remember(...)` call that follows `marker`.
+
+    Paren-matched, so a nested call inside a key (a `collectAsState()` source)
+    cannot truncate the list the way a first-`)` scan would. Returns None when
+    the marker or a balanced key list is absent (caller reports fail-closed).
+    """
+    idx = nc.find(marker)
+    if idx < 0:
+        return None
+    op = nc.find("(", idx + len(marker))
+    if op < 0:
+        return None
+    depth = 0
+    i = op
+    while i < len(nc):
+        c = nc[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    if depth != 0:
+        return None
+    return [k.strip() for k in nc[op + 1:i].split(",") if k.strip()]
+
+
+def check_editor_key_alignment(files):
+    """The editor draft must re-derive on everything the content it seeds from
+    re-derives on (initialContent keys ⊆ editContent keys).
+
+    binds the DECISION POINT (which changes re-seed the draft), not a literal
+    key list: any future key added to one remember and not the match is red.
+    Direction is deliberate — an EXTRA key on the draft is not a defect, a
+    MISSING one is (the draft then freezes on a stale snapshot).
+    """
+    text = files.get(EDITOR_REL)
+    if text is None:
+        return ["missing file %s" % EDITOR_REL]
+    nc = strip_comments(text)
+    initial = _remember_keys(nc, INITIAL_LITERAL)
+    edit = _remember_keys(nc, "var editContent by remember")
+    if not initial or not edit:
+        return ["%s: could not read the initialContent/editContent remember key "
+                "lists — fail-closed" % EDITOR_REL]
+    missing = [k for k in initial if k not in edit]
+    if missing:
+        return ["%s: `editContent` remember keys are missing %s that "
+                "`initialContent` re-derives from — the editor draft freezes on "
+                "the pre-read snapshot and Save writes it back over an "
+                "out-of-band edit" % (EDITOR_REL, missing)]
+    return []
+
+
 def _read(root, rel):
     with open(os.path.join(root, rel), encoding="utf-8") as fh:
         return fh.read()
@@ -357,6 +413,7 @@ def run_checks_map(files):
         failures.extend(check_paste(sm))
     failures.extend(check_reload(files))
     failures.extend(check_editor_keys(files))
+    failures.extend(check_editor_key_alignment(files))
     return failures
 
 
@@ -415,7 +472,8 @@ def _sm_text(
     paste_io=True,
     reload_io=True,
     edit_name_keyed=True,
-    edit_content_keys="skillId, relativePath, skill.updatedAt",
+    edit_content_keys="skillId, relativePath, skill.updatedAt, loadedDiskBase",
+    initial_keys="skillId, relativePath, skill.updatedAt, loadedDiskBase",
     initial_literal=True,
     extra="",
 ):
@@ -439,7 +497,7 @@ def _sm_text(
         "    var editName by remember(skill.id, skill.name) { mutableStateOf(skill.name) }"
     ) if edit_name_keyed else "    var editName by remember { mutableStateOf(skill.name) }"
     initial = (
-        '    val initialContent = remember(skillId, relativePath, skill.updatedAt) { "" }'
+        '    val initialContent = remember(' + initial_keys + ') { "" }'
     ) if initial_literal else (
         '    val contentInit = remember(skillId, relativePath) { "" }'
     )
@@ -548,6 +606,15 @@ ISSUE06_FIXTURES = [
     ("editContent keys lack updatedAt",
      _files(sm=_sm_text(edit_content_keys="skillId, relativePath")),
      True, "lack `updatedAt`"),
+    ("editContent drops loadedDiskBase (B-04 pre-fix shape)",
+     _files(sm=_sm_text(edit_content_keys="skillId, relativePath, skill.updatedAt")),
+     True, "editor draft freezes"),
+    ("precision: extra editor-only key is not a defect",
+     _files(sm=_sm_text(edit_content_keys="skillId, relativePath, skill.updatedAt, loadedDiskBase, draftExtra")),
+     False, None),
+    ("precision: alignment follows the key, not its position",
+     _files(sm=_sm_text(initial_keys="loadedDiskBase, skill.updatedAt, skillId, relativePath")),
+     False, None),
     ("initialContent shape anchor removed",
      _files(sm=_sm_text(initial_literal=False)), True, "shape anchor"),
 ]
@@ -600,7 +667,7 @@ def main():
         for f in failures:
             print("  - %s" % f)
         sys.exit(1)
-    print("OK %s (7 arms: paste x2, reload-off-main x2, editor-keys x3)" % SM_REL)
+    print("OK %s (8 arms: paste x2, reload-off-main x2, editor-keys x3, editor-key-alignment x1)" % SM_REL)
     sys.exit(0)
 
 
