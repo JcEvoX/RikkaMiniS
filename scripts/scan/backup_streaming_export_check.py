@@ -39,6 +39,21 @@ Pins the automatic-backup streaming + fetch-hardening contract:
         silently counting zero and passing — re-point the arm at the new name.
         The count contract is deliberately dumb/greppable (same style as arm4)
         rather than brace-tracking.
+  arm6 (fetch-to-local busy gate + tail liveness, deep-audit-1040 B-08): the
+        `onFetch` handler pulls a full auto-backup payload into memory and then
+        writes + rotates `filesDir/backup-autos` — the same directory the
+        nightly run, the SAF export and every restore touch — but it used to
+        raise only the dialog-local `autoRemoteLoading`, so dismissing the
+        dialog mid-flight left "Run Now" / "Restore" / "Export" live and two
+        full payloads could land on that directory at once. It also ran its
+        post-fetch refresh after the composition (and with it the coroutine
+        scope) was gone. Three decisions are pinned on the handler REGION
+        (located by brace matching, not by a line pattern): the fetch path
+        claims the shared `operationBusy` gate, releases it inside the
+        `finally` of the same region, and only refreshes the list while the
+        coroutine is still alive. Fail-closed: a handler region that cannot be
+        located — or that no longer carries the refresh call — is RED, not a
+        silent zero-count pass; re-point the arm, do not delete it.
 
 Usage:
   python3 backup_streaming_export_check.py <repo_root>   # real tree
@@ -219,6 +234,104 @@ def check_arm5(screen_code):
     return None
 
 
+def _braced_region(src, start):
+    """Text from `start` through the brace that closes the first `{` at or after
+    it, or None when the braces never balance."""
+    open_i = src.find("{", start)
+    if open_i < 0:
+        return None
+    depth = 0
+    for i in range(open_i, len(src)):
+        c = src[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return src[start : i + 1]
+    return None
+
+
+def fetch_handler_region(screen_code):
+    """The `onFetch` handler body, located by brace matching rather than by a
+    whole-line pattern (any of `onFetch = {`, `fun onFetch(...) {` matches).
+
+    Every `onFetch` token whose block opens is considered; the candidate that
+    carries the post-fetch list refresh wins. Returns None when no such region
+    exists — arm6 reports that as anchor drift instead of passing on a zero
+    count.
+    """
+    for m in re.finditer(r"\bonFetch\b", screen_code):
+        region = _braced_region(screen_code, m.start())
+        if region and "openAutoRemoteList(" in region:
+            return region
+    return None
+
+
+LIVENESS_PAT = re.compile(r"\b(?:isActive|isCancelled)\b|\bensureActive\(")
+
+
+def check_arm6(screen_code):
+    """Fetch-to-local rides the shared busy gate; its tail refresh is liveness-guarded.
+
+    deep-audit-1040 B-08 (P1). Three decisions, each pinned on the handler
+    region (brace-located) instead of on a single line:
+
+      1. the fetch path CLAIMS the shared `operationBusy` gate (dismissing the
+         dialog must not leave "Run Now" / "Restore" / "Export" clickable while
+         a full payload is being written into `filesDir/backup-autos`);
+      2. it RELEASES the gate inside the `finally` of the same region, so the
+         release sits on the exit path rather than on the happy path only;
+      3. the tail `openAutoRemoteList()` runs only while the coroutine is still
+         alive (`isActive` / `ensureActive()`), otherwise a torn-down screen
+         re-arms its spinner from a dead scope.
+
+    Fail-closed: an unlocatable handler region, or one that lost the refresh
+    call, is RED — re-point the arm rather than deleting it.
+    """
+    if screen_code is None:
+        return "BackupSettingsScreen.kt not found"
+    if not re.search(r"\bonFetch\b", screen_code):
+        return (
+            "the onFetch fetch-to-local handler vanished (anchor drift) — "
+            "re-point this arm at the renamed handler; do not delete it"
+        )
+    region = fetch_handler_region(screen_code)
+    if region is None:
+        return (
+            "could not locate the onFetch handler region (no block carrying "
+            "openAutoRemoteList() — anchor drift). Re-point this arm; a zero "
+            "count must not read as a pass."
+        )
+    if "operationBusy = true" not in region:
+        return (
+            "fetch-to-local must claim the shared operationBusy gate (the "
+            "payload is written + rotated into filesDir/backup-autos while "
+            "Run Now / Restore / Export stay clickable otherwise)"
+        )
+    finally_i = region.find("finally")
+    if finally_i < 0:
+        return (
+            "fetch-to-local must release the shared operationBusy gate on its "
+            "exit path (no `finally` in the handler region)"
+        )
+    finally_region = _braced_region(region, finally_i) or ""
+    if "operationBusy = false" not in finally_region:
+        return (
+            "fetch-to-local must release the shared operationBusy gate inside "
+            "its `finally` (a release on the happy path only leaks the gate)"
+        )
+    refresh_i = region.find("openAutoRemoteList(")
+    window = region[max(0, refresh_i - 200) : refresh_i]
+    if not LIVENESS_PAT.search(window):
+        return (
+            "the post-fetch openAutoRemoteList() must be liveness-guarded "
+            "(isActive / ensureActive()) — a refresh fired from an already "
+            "cancelled scope re-arms the dialog spinner on a dead composition"
+        )
+    return None
+
+
 def check_all(root):
     auto = read_stripped(root, AUTO_MGR_REL)
     sync = read_stripped(root, SYNC_REL)
@@ -230,6 +343,7 @@ def check_all(root):
         ("arm3", check_arm3(screen)),
         ("arm4", check_arm4(screen)),
         ("arm5", check_arm5(screen)),
+        ("arm6", check_arm6(screen)),
     ):
         if err:
             failures.append(f"{name}: {err}")
@@ -312,11 +426,21 @@ fun BackupSettingsScreen(context: Context) {
         )
     }
     fun onFetch(entry: WebDavSync.AutoBackupEntry) {
-        val stamp = WebDavSync.sanitizeAutoBackupStamp(entry.item.displayName) ?: return
-        val local = File(dir, AutoBackupManager.LOCAL_FILE_PREFIX + stamp + ".json")
-        withContext(Dispatchers.IO) { local.writeText(json) }
-        withContext(Dispatchers.IO) { AutoBackupManager.rotateLocalAutoBackups(context) }
-        autoBackupFiles = withContext(Dispatchers.IO) { AutoBackupManager.listLocal(context) }
+        if (!operationBusy) {
+            operationBusy = true
+            autoRemoteLoading = true
+            try {
+                val stamp = WebDavSync.sanitizeAutoBackupStamp(entry.item.displayName) ?: return
+                val local = File(dir, AutoBackupManager.LOCAL_FILE_PREFIX + stamp + ".json")
+                withContext(Dispatchers.IO) { local.writeText(json) }
+                withContext(Dispatchers.IO) { AutoBackupManager.rotateLocalAutoBackups(context) }
+                autoBackupFiles = withContext(Dispatchers.IO) { AutoBackupManager.listLocal(context) }
+            } finally {
+                autoRemoteLoading = false
+                operationBusy = false
+            }
+            if (scope.isActive) openAutoRemoteList()
+        }
     }
 }
 """
@@ -358,7 +482,7 @@ VIOLATION_FETCH_NO_SANITIZE = COMPLIANT_SCREEN.replace(
 )
 
 VIOLATION_FETCH_NO_ROTATION = COMPLIANT_SCREEN.replace(
-    "        withContext(Dispatchers.IO) { AutoBackupManager.rotateLocalAutoBackups(context) }\n",
+    "                withContext(Dispatchers.IO) { AutoBackupManager.rotateLocalAutoBackups(context) }\n",
     "",
 )
 
@@ -392,6 +516,27 @@ VIOLATION_NO_DISMISS_CLEAR = COMPLIANT_SCREEN.replace(
 VIOLATION_FLAG_RENAMED = COMPLIANT_SCREEN.replace(
     "webDavUploadPending",
     "webDavUploadQueued",
+)
+
+# arm6 (deep-audit-1040 B-08) — fetch-to-local gate + tail liveness.
+VIOLATION_FETCH_NO_BUSY_CLAIM = COMPLIANT_SCREEN.replace(
+    "            operationBusy = true\n            autoRemoteLoading = true\n",
+    "            autoRemoteLoading = true\n",
+)
+
+VIOLATION_FETCH_NO_BUSY_RELEASE = COMPLIANT_SCREEN.replace(
+    "                autoRemoteLoading = false\n                operationBusy = false\n",
+    "                autoRemoteLoading = false\n",
+)
+
+VIOLATION_FETCH_UNGUARDED_REFRESH = COMPLIANT_SCREEN.replace(
+    "            if (scope.isActive) openAutoRemoteList()",
+    "            openAutoRemoteList()",
+)
+
+VIOLATION_FETCH_HANDLER_RENAMED = COMPLIANT_SCREEN.replace(
+    "fun onFetch(entry: WebDavSync.AutoBackupEntry) {",
+    "fun pullRemote(entry: WebDavSync.AutoBackupEntry) {",
 )
 
 
@@ -439,6 +584,10 @@ def selftest():
     ok &= run_fixture("violation-entry-no-flag-clear", expect_ok=False, screen=VIOLATION_NO_ENTRY_CLEAR)
     ok &= run_fixture("violation-dismiss-no-flag-clear", expect_ok=False, screen=VIOLATION_NO_DISMISS_CLEAR)
     ok &= run_fixture("violation-flag-renamed-anchor-drift", expect_ok=False, screen=VIOLATION_FLAG_RENAMED)
+    ok &= run_fixture("violation-fetch-no-busy-claim", expect_ok=False, screen=VIOLATION_FETCH_NO_BUSY_CLAIM)
+    ok &= run_fixture("violation-fetch-no-busy-release", expect_ok=False, screen=VIOLATION_FETCH_NO_BUSY_RELEASE)
+    ok &= run_fixture("violation-fetch-unguarded-refresh", expect_ok=False, screen=VIOLATION_FETCH_UNGUARDED_REFRESH)
+    ok &= run_fixture("violation-fetch-handler-renamed", expect_ok=False, screen=VIOLATION_FETCH_HANDLER_RENAMED)
     print("BACKUP_STREAMING_EXPORT_SELFTEST=" + ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 
@@ -455,7 +604,7 @@ def main():
         for f in failures:
             print("FAIL:", f)
         sys.exit(1)
-    print("backup_streaming_export_check: OK (arm1 + arm2 + arm3 + arm4 + arm5 green)")
+    print("backup_streaming_export_check: OK (arm1 + arm2 + arm3 + arm4 + arm5 + arm6 green)")
 
 
 if __name__ == "__main__":
