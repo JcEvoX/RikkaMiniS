@@ -797,4 +797,87 @@ class OpenMinisBackupCompatTest {
         // 缺键 → 不写（不硬造）
         assertFalse(sessions.getJSONObject(2).has("pinnedAt"))
     }
+
+    // ------------------------------------------------------------------
+    // [deep-audit-1039 A-07] groups[] export-key completeness
+    // ------------------------------------------------------------------
+
+    /**
+     * `convertGroups` 必须把上游 provider_config.json 的 modelGroups 条目里
+     * 的**全部导出键**写进 groups[]。ConfigBackup.buildSections 导出 8 个键
+     * （id/name/memberEntryIds/strategy/fallbackStrategy/defaultThinkingLevel/
+     * contextLimitTokens/lastContextLimitTokens），导入侧 readGroupRunConfig /
+     * applyGroupRunConfig（[fix/dv18-4 A-07]）已能读回其中 5 个 run-config 键；
+     * 这里漏一个，备份恢复就静默重置用户的路由/思考/上下文设置。
+     *
+     * 期望值一律写死字面量（不从被测代码推导）；导出侧键集合由门
+     * openminis_compat_field_parity_check 的 arm4 从 ConfigBackup 派生并钉住。
+     */
+    @Test
+    fun convertGroupsWritesEveryModelGroupExportKey() {
+        val group = JSONObject()
+            .put("id", "g1")
+            .put("name", "Main")
+            .put("memberEntryIds", JSONArray().put("entry-1"))
+            .put("strategy", "loadBalance")
+            .put("fallbackStrategy", "always")
+            .put("defaultThinkingLevel", "MEDIUM")
+            .put("contextLimitTokens", 128000)
+            .put("lastContextLimitTokens", 96000)
+        val pkg = zipOf(
+            "manifest.json" to jsonEntry(plainManifest()),
+            "data/provider_config.json" to jsonEntry(
+                JSONObject().put("modelGroups", JSONArray().put(group))
+            ),
+        )
+        val root = JSONObject(OpenMinisBackupCompat.convert(pkg))
+        val groups = root.getJSONArray("groups")
+        assertEquals(1, groups.length())
+        val g = groups.getJSONObject(0)
+        // 身份与成员
+        assertEquals("g1", g.getString("id"))
+        assertEquals("Main", g.getString("name"))
+        assertEquals("entry-1", g.getJSONArray("memberEntryIds").getString(0))
+        // 路由与回退（导入端读 .name 形态）
+        assertEquals("loadBalance", g.getString("strategy"))
+        assertEquals("always", g.getString("fallbackStrategy"))
+        // 三个 run-config 键 —— 曾整族缺失，现在逐个钉住
+        assertEquals("MEDIUM", g.getString("defaultThinkingLevel"))
+        assertEquals(128000, g.getInt("contextLimitTokens"))
+        assertEquals(96000, g.getInt("lastContextLimitTokens"))
+    }
+
+    /**
+     * 反向臂：三个 run-config 键在上游**缺键**时不得硬造（导入端缺键语义 =
+     * 「本地值优先」，见 ModelGroupRunConfigRestoreTest.legacyBackup…）。
+     * 上游给空串 defaultThinkingLevel / 0 token 时同样不写。
+     */
+    @Test
+    fun convertGroupsOmitsAbsentRunConfigKeys() {
+        val legacy = JSONObject()
+            .put("id", "g1")
+            .put("name", "Main")
+            .put("memberEntryIds", JSONArray().put("entry-1"))
+            .put("strategy", "fallback")
+            .put("defaultThinkingLevel", "")
+            .put("contextLimitTokens", 0)
+            .put("lastContextLimitTokens", 0)
+        val pkg = zipOf(
+            "manifest.json" to jsonEntry(plainManifest()),
+            "data/provider_config.json" to jsonEntry(
+                JSONObject().put("modelGroups", JSONArray().put(legacy))
+            ),
+        )
+        val root = JSONObject(OpenMinisBackupCompat.convert(pkg))
+        val g = root.getJSONArray("groups").getJSONObject(0)
+        // 身份键照写
+        assertEquals("g1", g.getString("id"))
+        assertEquals("fallback", g.getString("strategy"))
+        // 空/零值一律不写（不硬造）
+        assertFalse(g.has("defaultThinkingLevel"))
+        assertFalse(g.has("contextLimitTokens"))
+        assertFalse(g.has("lastContextLimitTokens"))
+        // fallbackStrategy 有默认值语义（导入端 create 路径 default）⇒ 照写
+        assertEquals("default", g.getString("fallbackStrategy"))
+    }
 }
