@@ -30,6 +30,70 @@ import java.util.Locale
 import java.util.TimeZone
 
 /**
+ * [dv18-A A-03] What `--id` / `--name` name, decided once.
+ *
+ * `album` reads two selectors that mean different SQL: `--id` is an exact bucket
+ * id, `--name` is a case-insensitive contains match. Reading them separately
+ * (`getLong("id")` then `get("name")`) made three bad inputs answer a question
+ * the caller never asked:
+ *
+ *   - `--id abc --name Foo` → `getLong` answers null for a non-number, so the
+ *     name branch ran: the caller asked for bucket `abc` and got a name search;
+ *   - `--id abc` alone → "required", which is false — the flag WAS given;
+ *   - `--name ""` → `LIKE '%%'`, i.e. the entire library, exit 0.
+ *
+ * [AlbumSelector.Unreadable] is the third answer the old code had no slot for:
+ * a flag that was supplied but names nothing is REFUSED (exit 2), never guessed
+ * — the same discipline [CalendarSelector] applies to `--calendar-id` and
+ * [SendDisposition] to `--after`.
+ */
+internal sealed class AlbumSelector {
+    /** Neither flag was supplied. */
+    object Absent : AlbumSelector()
+
+    /** `--id <n>`: an exact bucket id. */
+    data class ById(val id: Long) : AlbumSelector()
+
+    /** `--name <text>`: a non-blank name to match. */
+    data class ByName(val name: String) : AlbumSelector()
+
+    /**
+     * A supplied flag that names nothing: `--id abc` (not a number), or
+     * `--name ""` / `--name " "` (an empty pattern matches everything).
+     * [flag] and [raw] exist so the refusal can quote what was actually typed.
+     */
+    data class Unreadable(val flag: String, val raw: String) : AlbumSelector()
+}
+
+/**
+ * [dv18-A A-03] Pure form of the `album` selector decision (no Context). The
+ * name is NOT trimmed: a blank name is refused, a padded one keeps its exact
+ * pattern (only the "matches everything" case was the defect).
+ */
+internal fun resolveAlbumSelector(rawId: String?, rawName: String?): AlbumSelector {
+    if (rawId != null) {
+        val id = rawId.toLongOrNull()
+        return if (id != null) AlbumSelector.ById(id) else AlbumSelector.Unreadable("--id", rawId)
+    }
+    if (rawName != null) {
+        return if (rawName.isNotBlank()) AlbumSelector.ByName(rawName)
+        else AlbumSelector.Unreadable("--name", rawName)
+    }
+    return AlbumSelector.Absent
+}
+
+/**
+ * [dv18-A A-03] The one refusal message for a supplied-but-useless selector, so
+ * both losing shapes name the flag the caller actually typed.
+ */
+internal fun albumSelectorRefusal(selector: AlbumSelector.Unreadable): String =
+    if (selector.flag == "--id") {
+        "android-photos album: --id '${selector.raw}' is not a bucket id (numbers only)\n"
+    } else {
+        "android-photos album: --name must not be blank (an empty pattern matches every photo)\n"
+    }
+
+/**
  * android-photos — query and manage the device photo library via MediaStore.
  *
  * Mirrors apple-photos (NativeOffloads/PhotosOffload.m) — same subcommand
@@ -432,23 +496,39 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
      * case-insensitive contains lookup, mirroring apple-photos. Returns
      * the same shape as `list` so downstream tooling can treat them the
      * same.
+     *
+     * [dv18-A A-03] The selector decision is [resolveAlbumSelector]'s, so a
+     * non-numeric `--id` and a blank `--name` are refused (exit 2) instead of
+     * downgrading to the other branch.
      */
     private fun handleAlbum(args: OffloadArgs): NativeOffloadResult {
-        val bucketId = args.getLong("id")
-        val bucketName = args.get("name")
-        if (bucketId == null && bucketName == null) {
-            return NativeOffloadResult(2, "android-photos album: --id <bucket_id> or --name <bucket_name> is required\n")
-        }
-        val limit = (args.getInt("limit") ?: args.getInt("max") ?: 50).coerceIn(1, 200)
+        // [dv18-A A-03] ONE decision for both selectors: `--id` that is not a
+        // number and `--name` that is blank are REFUSED here (exit 2) instead of
+        // falling through to the name branch / the `LIKE '%%'` full-library scan.
         val selection: String
         val selArgs: Array<String>
-        if (bucketId != null) {
-            selection = "${MediaStore.Images.Media.BUCKET_ID} = ?"
-            selArgs = arrayOf(bucketId.toString())
-        } else {
-            selection = "${MediaStore.Images.Media.BUCKET_DISPLAY_NAME} LIKE ?"
-            selArgs = arrayOf("%${bucketName!!}%")
+        val bucketId: Long?
+        val bucketName: String?
+        when (val selector = resolveAlbumSelector(args.get("id"), args.get("name"))) {
+            is AlbumSelector.ById -> {
+                bucketId = selector.id
+                bucketName = null
+                selection = "${MediaStore.Images.Media.BUCKET_ID} = ?"
+                selArgs = arrayOf(selector.id.toString())
+            }
+            is AlbumSelector.ByName -> {
+                bucketId = null
+                bucketName = selector.name
+                selection = "${MediaStore.Images.Media.BUCKET_DISPLAY_NAME} LIKE ?"
+                selArgs = arrayOf("%${selector.name}%")
+            }
+            is AlbumSelector.Unreadable -> return NativeOffloadResult(2, albumSelectorRefusal(selector))
+            AlbumSelector.Absent -> return NativeOffloadResult(
+                2,
+                "android-photos album: --id <bucket_id> or --name <bucket_name> is required\n",
+            )
         }
+        val limit = (args.getInt("limit") ?: args.getInt("max") ?: 50).coerceIn(1, 200)
         // [sweep1014-B22a-parity] Query photos and videos independently (each
         // capped at [limit]) and merge with the shared mergeMediaLimit, same
         // shape as handleList. The old shared-quota form (photos fill the
