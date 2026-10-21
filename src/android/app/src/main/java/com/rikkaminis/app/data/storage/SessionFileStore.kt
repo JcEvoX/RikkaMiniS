@@ -1,11 +1,23 @@
 package com.rikkaminis.app.data.storage
 
 import android.content.Context
+import com.rikkaminis.app.data.ComposerDraftStore
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.LinkOption
 import java.nio.file.Paths
 import java.nio.file.attribute.BasicFileAttributes
+
+/**
+ * [da1040-A3] Draft-session alias prefix minted by [ComposerDraftStore]
+ * (`__new__<uuid>` — the same 36-char UUID shape behind a fixed prefix).
+ *
+ * Single constant on purpose: the shape predicate below is the ONLY place that
+ * knows the draft namespace. The old call-site `startsWith("__new__")` copy is
+ * how four of five orphan-sweep callers kept the narrower notion of
+ * "session-shaped" and deleted an active draft's files.
+ */
+private const val DRAFT_ID_PREFIX = "__new__"
 
 /**
  * Singular owner of the on-disk footprint attached to a chat session.
@@ -31,8 +43,22 @@ import java.nio.file.attribute.BasicFileAttributes
  */
 class SessionFileStore internal constructor(
     private val filesDirForTestingOrProd: File,
+    /**
+     * [da1040-A3] Ids that already own on-disk state but have NO DB row yet:
+     * the composer's active draft slot (`__new__<uuid>`, minted by
+     * [ComposerDraftStore.nextDraftId] before the first message is sent).
+     *
+     * Threaded in as a *provider* rather than a snapshot so a scan sees the
+     * slot as it is at call time (the slot is re-minted/released while the app
+     * runs). Empty by default: JVM tests and any non-Android construction keep
+     * the DB-only behaviour.
+     */
+    private val activeDraftIds: () -> Set<String> = { emptySet() },
 ) {
-    constructor(context: Context) : this(context.filesDir)
+    constructor(context: Context) : this(
+        context.filesDir,
+        { ComposerDraftStore.activeDraftIds(context) },
+    )
 
     /** Root that holds one subdir per live session: filesDir/minis-sessions/<sid>/. */
     val sessionsRoot: File = File(filesDirForTestingOrProd, "minis-sessions")
@@ -137,6 +163,10 @@ class SessionFileStore internal constructor(
      * trees are not a real shape).
      */
     fun scanMediaOnce(liveSessionIds: Set<String>): MediaScan {
+        // [da1040-A3] The composer's active draft owns media files under a
+        // `__new__<uuid>` leaf; without widening here the walk would count a
+        // live draft's media as reclaimable orphan bytes.
+        val live = withActiveComposerOwner(liveSessionIds)
         if (!mediaRoot.exists()) return MediaScan(emptyMap(), 0, 0L)
         val sizes = mutableMapOf<String, Long>()
         var orphanDirs = 0
@@ -148,7 +178,7 @@ class SessionFileStore internal constructor(
             if (children == null) {
                 // [Bug 2 parity] unreadable dir: assume orphan-leaf candidate
                 // (bytes unknowable — 0) so measurement never silently misses.
-                if (!parentOrphanLeaf && looksLikeSessionId(dir.name) && dir.name !in liveSessionIds) {
+                if (!parentOrphanLeaf && looksLikeSessionId(dir.name) && dir.name !in live) {
                     orphanDirs++
                 }
                 return
@@ -156,7 +186,7 @@ class SessionFileStore internal constructor(
             val isOrphanLeaf = !parentOrphanLeaf &&
                 children.none { it.isDirectory } && // File.isDirectory: same check as the old isOrphanMediaLeaf
                 looksLikeSessionId(dir.name) &&
-                dir.name !in liveSessionIds
+                dir.name !in live
             for (child in children) {
                 val attrs = try {
                     Files.readAttributes(
@@ -174,7 +204,7 @@ class SessionFileStore internal constructor(
                     val key = attrs.fileKey()
                     if (key != null && !seen.add(key)) continue
                     val sid = child.parentFile?.name ?: continue
-                    if (sid in liveSessionIds) {
+                    if (sid in live) {
                         sizes[sid] = (sizes[sid] ?: 0L) + attrs.size()
                     } else if (isOrphanLeaf) {
                         orphanBytes += attrs.size()
@@ -292,32 +322,59 @@ class SessionFileStore internal constructor(
      * never-committed) session. Returns the reclaimable bytes and reclaims them.
      */
     fun reclaimOrphans(liveSessionIds: Set<String>): ReclaimReport {
-        val report = scanOrphans(liveSessionIds)
+        // [da1040-A3] One widening per public entry point; the private helpers
+        // below are reachable only from here, so they inherit [live].
+        val live = withActiveComposerOwner(liveSessionIds)
+        val report = scanOrphans(live)
         with(report) {
             // Delete the scanned session dirs (ids in the report).
             if (sessionIds.isNotEmpty()) {
                 sessionIds.forEach { sessionDir(it).takeIf { d -> d.exists() }?.deleteRecursively() }
             }
             // Re-delete media leaves (walk again; ids may overlap session dirs).
-            deleteOrphanMediaLeaves(liveSessionIds)
+            deleteOrphanMediaLeaves(live)
         }
         // [da1025-D] Also reclaim orphaned browser tab-pool state files
         // (browser_tabs/<sid>.json for deleted sessions) — previously they
         // leaked forever (full visited-URL history of a dead session left on
         // disk, invisible to this sweep).
-        deleteOrphanBrowserTabFiles(liveSessionIds)
+        deleteOrphanBrowserTabFiles(live)
         return report
     }
 
     /**
-     * True if [name] looks like a session directory id. Session ids are always
-     * `UUID.randomUUID().toString()` (36 chars, 4 hyphens). Guarding on this
-     * shape means orphan reclamation can never mistake an unrelated folder or
-     * stray file under minis-sessions/ (or a media date path) for a session and
-     * delete it — fail-safe: unknown-looking names are simply never reclaimed.
+     * True if [name] is a session-shaped id: a bare session UUID
+     * (`UUID.randomUUID().toString()` — 36 chars, 4 hyphens) OR a draft alias
+     * (`__new__<uuid>`, see [DRAFT_ID_PREFIX]).
+     *
+     * [da1040-A3] The draft alias half used to live as a call-site
+     * `startsWith(DRAFT_ID_PREFIX)` branch inside ONE of the five sweep
+     * callers; the other four kept inheriting the narrower notion, so an
+     * in-flight draft's session dir / media leaf looked orphaned. Both shapes
+     * are now decided here and nowhere else.
+     *
+     * Guarding on this shape keeps reclamation fail-safe: an unrelated folder
+     * or stray file under minis-sessions/ (or a media date path) is never
+     * mistaken for a session, and a `__new__` name without a full UUID behind
+     * it (e.g. the bare `__new__` route placeholder) is not exempted either.
      */
     private fun looksLikeSessionId(name: String): Boolean {
-        return name.length == 36 && name.count { it == '-' } == 4
+        val uuid = if (name.startsWith(DRAFT_ID_PREFIX)) name.substring(DRAFT_ID_PREFIX.length) else name
+        return uuid.length == 36 && uuid.count { it == '-' } == 4
+    }
+
+    /**
+     * [da1040-A3] Widen a caller's live-DB-session set with the composer's
+     * active draft id(s). Every public orphan entry point calls this, so no
+     * caller (Storage page, ChatRepository) has to know that a draft owns
+     * files before its DB row exists — the caller's notion of "live" stays
+     * "what the DB says" and this class adds the slot that the DB cannot know
+     * about yet.
+     */
+    private fun withActiveComposerOwner(liveSessionIds: Set<String>): Set<String> {
+        val draftIds = activeDraftIds()
+        if (draftIds.isEmpty()) return liveSessionIds
+        return liveSessionIds + draftIds
     }
 
     /**
@@ -326,8 +383,9 @@ class SessionFileStore internal constructor(
      * banner that the user explicitly confirms before anything is removed.
      */
     fun scanOrphans(liveSessionIds: Set<String>): ReclaimReport {
-        val sessionPart = scanOrphanSessionDirs(liveSessionIds)
-        val media = scanMediaOnce(liveSessionIds)
+        val live = withActiveComposerOwner(liveSessionIds)
+        val sessionPart = scanOrphanSessionDirs(live)
+        val media = scanMediaOnce(live)
         return ReclaimReport(
             sessionIds = sessionPart.sessionIds,
             sessionDirs = sessionPart.sessionDirs,
@@ -343,11 +401,12 @@ class SessionFileStore internal constructor(
      * one media walk total instead of two.
      */
     fun scanOrphanSessionDirs(liveSessionIds: Set<String>): ReclaimReport {
+        val live = withActiveComposerOwner(liveSessionIds)
         val sessionIds = mutableListOf<String>()
         var sessionBytes = 0L
         if (sessionsRoot.exists()) {
             sessionsRoot.listFiles()?.forEach { dir ->
-                if (dir.isDirectory && looksLikeSessionId(dir.name) && dir.name !in liveSessionIds) {
+                if (dir.isDirectory && looksLikeSessionId(dir.name) && dir.name !in live) {
                     sessionIds += dir.name
                     sessionBytes += sizeOf(dir)
                 }
@@ -390,12 +449,14 @@ class SessionFileStore internal constructor(
 
     /**
      * [da1025-D] Delete orphaned browser tab-pool state files:
-     * browser_tabs/<stem>.json where the stem is a session id (UUID shape) or
-     * a draft id (`__new__<uuid>` — BrowserTabPool writes under the draft id
-     * before ChatSessionEntryExt renames it on promotion) and the session is
-     * not among [liveSessionIds]. Same fail-safe shape guard as
-     * [looksLikeSessionId]: unknown-looking stems are never reclaimed, so a
-     * stray file under browser_tabs/ can never be deleted by mistake.
+     * browser_tabs/<stem>.json where the stem is session-shaped (bare UUID or
+     * a draft alias — BrowserTabPool writes under the draft id before
+     * ChatSessionEntryExt renames it on promotion) and is not live.
+     *
+     * [da1040-A3] The draft half is no longer spelled here: it belongs to
+     * [looksLikeSessionId] (single source for "session-shaped"), the same
+     * predicate the session-dir and media sweeps use. A local `startsWith`
+     * copy is exactly how the other four callers missed it.
      *
      * Deliberately NOT counted in [ReclaimReport] (minimal radius): the
      * storage page's "orphan data" banner keeps reporting session+media bytes
@@ -408,7 +469,7 @@ class SessionFileStore internal constructor(
             if (!file.isFile) return@forEach
             val stem = file.name.removeSuffix(".json")
             if (stem == file.name) return@forEach // not a .json state file
-            val isSessionShaped = looksLikeSessionId(stem) || stem.startsWith("__new__")
+            val isSessionShaped = looksLikeSessionId(stem)
             if (isSessionShaped && stem !in liveSessionIds) file.delete()
         }
     }

@@ -289,6 +289,33 @@ QUICK_TEST_WIRING_RE = re.compile(
 QUICK_TEST_SHEET_RE = re.compile(r"\bQuickTestSheet\s*\(")
 QUICK_TEST_DISMISS_RE = re.compile(r"onDismiss\s*=\s*\{[\s\S]{0,80}?quickTestEntryId\s*=\s*null")
 
+# ---- [deep-audit-1040 B-07] C26..C29: the same母题 on ProviderDetailScreen ---
+# The screen derives `instance` per frame for RENDERING; reusing it for WRITES
+# pushed the whole record back, so a write landing after an external edit
+# (minis-config / Debug RPC / backup restore) silently reverted the newer
+# fields. Same single source as ProviderConnectionScreen's `currentInstance()`
+# ([da1039-B3 B-04]) — hence the same helper constants (LIVE_RESOLVER_NAME,
+# LIVE_RESOLVER_READ_RE, LIVE_LOCAL_RE, UPDATE_INSTANCE_RE, _resolver_window).
+PD_EXPORT_RE = re.compile(r"\bexportProviderInstance\s*\(")
+# C27 — the pending delete target: hold identity, not the long-pressed object.
+PD_DELETE_ID_RE = re.compile(
+    r"\bvar\s+entryToDeleteId\b[\s\S]{0,200}?mutableStateOf\s*<\s*String\?\s*>")
+PD_DELETE_OBJECT_RE = re.compile(
+    r"\bvar\s+entryToDelete\b[\s\S]{0,200}?mutableStateOf\s*<\s*"
+    r"(?:com\.[\w.]+\.)?ModelEntry\??\s*>")
+PD_DELETE_RESOLVER_NAME = "liveEntryToDelete"
+PD_DELETE_VANISHED_NAME = "entryDeleteTargetVanished"
+PD_DELETE_WIRING_RE = re.compile(
+    r"onLongClick\s*=\s*\{[\s\S]{0,120}?entryToDeleteId\s*=\s*entry\.id")
+PD_DELETE_HOST_RE = re.compile(r"\bMinisAlertDialog\s*\(")
+PD_DELETE_DISMISS_RE = re.compile(
+    r"onDismissRequest\s*=\s*\{[\s\S]{0,80}?entryToDeleteId\s*=\s*null")
+# C29 — the masked key must be re-read when the stored credential may have moved.
+PD_STORED_KEY = "storedKey"
+PD_REVISION_TOKEN_RE = re.compile(r"\brevision\b")
+PD_LIVE_LIST_RE = re.compile(r"\b(?:allEntries|entries|modelEntries)\b")
+
+
 # C6c — value families a remember initializer can derive from in
 # ModelEntryDetailScreen. Reading any of them makes the call site
 # config-derived, i.e. it must re-key when the entry identity changes.
@@ -1521,10 +1548,124 @@ def check_quick_test_target(code):
     return results
 
 
+def check_provider_detail_live_state(code):
+    """C26 / C27 / C28 / C29 [deep-audit-1040 B-07] — ProviderDetailScreen must
+    resolve its write targets and its pending delete against the LIVE config, and
+    re-read the stored key when the config revision moves.
+
+    C26 grades the write target: every `updateInstance(` / `exportProviderInstance(`
+    call must go through the live resolver, directly or through a local assigned
+    from it (decision, not spelling). Fail-closed when the resolver is gone or
+    when no write call site can be found at all.
+    C27 grades the pending delete target: the state holds a `String?` id, the row
+    wiring stores `entry.id`, the dialog resolves that id against the live
+    catalog, and dismissing clears the same state. The pre-fix `ModelEntry?`
+    object is an explicit red — that shape is what fed the dialog a model that
+    had already been deleted.
+    C28 grades close-on-vanished: a `LaunchedEffect` keyed on the pending id AND
+    the list it resolves against, whose body tests the vanished helper and clears
+    the state. Closing unconditionally does NOT count (that dismisses on any
+    recomposition).
+    C29 grades the credential re-read: a `LaunchedEffect` keyed on the instance
+    id AND a `revision` token, whose body assigns the masked-key state.
+    """
+    results = []
+
+    # --- C26: every write goes through the live resolver --------------------
+    window = _resolver_window(code, LIVE_RESOLVER_NAME)
+    reads_live = bool(window is not None and LIVE_RESOLVER_READ_RE.search(window))
+    live_locals = set(LIVE_LOCAL_RE(LIVE_RESOLVER_NAME).findall(code))
+    calls = [m for m in list(UPDATE_INSTANCE_RE.finditer(code)) + list(PD_EXPORT_RE.finditer(code))
+             if "fun " not in code[max(0, m.start() - 40):m.start()]]
+    if not calls:
+        results.append(("C26", False,
+                        "no `updateInstance(` / `exportProviderInstance(` call found (fail-closed: "
+                        "re-derive this criterion)"))
+    else:
+        bad = []
+        for m in calls:
+            args = call_args(code, m.end() - 1) or ""
+            if LIVE_RESOLVER_NAME + "(" in args:
+                continue
+            if any(re.search(r"\b" + re.escape(v) + r"\b", args) for v in live_locals):
+                continue
+            bad.append("L%d: `%s` is the render-frame object"
+                       % (code.count("\n", 0, m.start()) + 1, " ".join(args.split())[:70]))
+        if not reads_live:
+            bad.insert(0, "no `fun %s()` resolving from `config.instances` (fail-closed: the live "
+                          "resolver is gone — re-derive this criterion)" % LIVE_RESOLVER_NAME)
+        results.append(("C26", not bad,
+                        "all %d write(s) go through %s(), which reads the live instance"
+                        % (len(calls), LIVE_RESOLVER_NAME) if not bad else "; ".join(bad)))
+
+    # --- C27: the pending delete target is an id, resolved live -------------
+    problems = []
+    if not PD_DELETE_ID_RE.search(code):
+        problems.append("no `var entryToDeleteId` holding a String? id — the pending target is "
+                        "still the ModelEntry captured when the row was long-pressed")
+    if PD_DELETE_OBJECT_RE.search(code):
+        problems.append("`var entryToDelete` still holds a `ModelEntry?` object")
+    if not PD_DELETE_WIRING_RE.search(code):
+        problems.append("no `onLongClick = { … entryToDeleteId = entry.id }` wiring — the row "
+                        "stores something other than the entry identity")
+    resolved = []
+    list_ok = False
+    for m in re.finditer(r"\b" + PD_DELETE_RESOLVER_NAME + r"\s*\(", code):
+        args = call_args(code, m.end() - 1) or ""
+        if "entryToDeleteId" in args:
+            resolved.append(m)
+            if PD_LIVE_LIST_RE.search(args):
+                list_ok = True
+    if not resolved:
+        problems.append("`%s(` is never called with the pending id — the dialog keeps the "
+                        "long-pressed copy" % PD_DELETE_RESOLVER_NAME)
+    elif not list_ok:
+        problems.append("`%s(` does not resolve against the live catalog" % PD_DELETE_RESOLVER_NAME)
+    if not PD_DELETE_HOST_RE.search(code) or not PD_DELETE_DISMISS_RE.search(code):
+        problems.append("no `MinisAlertDialog(` host whose onDismiss clears `entryToDeleteId`")
+    results.append(("C27", not problems,
+                    "the delete target is held as an id, wired from the row identity, resolved "
+                    "against the live catalog and cleared on dismiss" if not problems
+                    else "; ".join(problems)))
+
+    # --- C28: the dialog closes when the target vanishes --------------------
+    close = []
+    for line_no, keys, _span, init in iter_remember_calls(code, "LaunchedEffect"):
+        if PD_DELETE_VANISHED_NAME not in init or "entryToDeleteId = null" not in init:
+            continue
+        flat = keys or ""
+        if "entryToDeleteId" not in flat or not PD_LIVE_LIST_RE.search(flat):
+            continue
+        close.append(line_no)
+    results.append(("C28", bool(close),
+                    "the dialog closes through a LaunchedEffect keyed on the pending id AND the "
+                    "live catalog (L%s)" % ",".join(str(x) for x in close) if close else
+                    "no `LaunchedEffect(<pending id>, <catalog>)` that clears the state when "
+                    "`%s(` says the target is gone — a model deleted externally leaves the dialog "
+                    "naming a now-dead id" % PD_DELETE_VANISHED_NAME))
+
+    # --- C29: the masked key re-reads when the revision moves ---------------
+    subs = []
+    for line_no, keys, _span, init in iter_remember_calls(code, "LaunchedEffect"):
+        if PD_STORED_KEY not in init:
+            continue
+        flat = keys or ""
+        if "instanceId" in flat and PD_REVISION_TOKEN_RE.search(flat):
+            subs.append(line_no)
+    results.append(("C29", bool(subs),
+                    "the stored key is re-read by a LaunchedEffect keyed on the instance id AND "
+                    "the config revision (L%s)" % ",".join(str(x) for x in subs) if subs else
+                    "no `LaunchedEffect(instanceId, <x>.revision)` assigning `%s` — an external "
+                    "key write leaves the previous key masked on screen" % PD_STORED_KEY))
+    return results
+
+
 CHECKERS = (
     (REL_PROVIDER_LIST, check_provider_list),
     (REL_SHEET, check_sheet),
     (REL_PROVIDER_DETAIL, check_provider_detail),
+    # [deep-audit-1040 B-07]
+    (REL_PROVIDER_DETAIL, check_provider_detail_live_state),
     (REL_CONNECTION, check_connection),
     (REL_ENTRY_DETAIL, check_entry_detail),
     (REL_GROUP_DETAIL, check_group_detail),
@@ -1614,6 +1755,32 @@ fun unrelated() {}
 
 # --- da1026-C fixtures: the three screens the new criteria guard ----------
 
+# [deep-audit-1040 B-07] The post-fix tail every ProviderDetailScreen fixture
+# carries: a live write resolver, the id-held delete target with its
+# close-on-vanished effect, and the revision-keyed stored-key re-read. Kept in
+# one place so the C7/C11c fixtures and the C26..C29 fixtures can never drift
+# apart on the shape the screen is supposed to have.
+FIX_PD_LIVE_TAIL = """
+fun currentInstance(): ProviderInstance =
+    config.instances.find { it.id == instanceId } ?: instance
+IconButton(onClick = {
+    val live = currentInstance()
+    providerRepository.updateInstance(live.copy(isEnabled = true))
+    val exported = currentInstance()
+    exportProviderInstance(context, providerRepository, exported)
+})
+var entryToDeleteId by remember { mutableStateOf<String?>(null) }
+val entryToDelete = liveEntryToDelete(entryToDeleteId, allEntries)
+LaunchedEffect(entryToDeleteId, allEntries) {
+    if (entryDeleteTargetVanished(entryToDeleteId, allEntries)) entryToDeleteId = null
+}
+LaunchedEffect(instanceId, config.revision) {
+    storedKey = withContext(Dispatchers.IO) { providerRepository.loadApiKey(instanceId) }
+}
+onLongClick = { entryToDeleteId = entry.id }
+MinisAlertDialog(onDismissRequest = { entryToDeleteId = null })
+"""
+
 FIX_PROVIDER_DETAIL_CLEAN = """package com.rikkaminis.app.ui.settings
 
 val allEntries = remember(instanceId, config) { providerRepository.entriesFor(instanceId) }
@@ -1626,7 +1793,7 @@ IconButton(onClick = {
     }
 })
 ThinkingRulesSection(instance = currentInstance, providerRepository = providerRepository, modelEntries = allEntries)
-"""
+""" + FIX_PD_LIVE_TAIL
 
 # the pre-fix shape: toast reads the snapshot captured before the fetch ran
 FIX_PROVIDER_DETAIL_STALE = """package com.rikkaminis.app.ui.settings
@@ -1639,7 +1806,7 @@ IconButton(onClick = {
     }
 })
 ThinkingRulesSection(instance = currentInstance, providerRepository = providerRepository, modelEntries = allEntries)
-"""
+""" + FIX_PD_LIVE_TAIL
 
 # no snapshot read in the args, but also no fresh read: still a stale count
 FIX_PROVIDER_DETAIL_NO_REREAD = """package com.rikkaminis.app.ui.settings
@@ -1653,7 +1820,7 @@ IconButton(onClick = {
     }
 })
 ThinkingRulesSection(instance = currentInstance, providerRepository = providerRepository, modelEntries = allEntries)
-"""
+""" + FIX_PD_LIVE_TAIL
 
 # the accepted alternative shape: state-backed list re-assigned on the refresh path
 FIX_PROVIDER_DETAIL_STATE_BACKED = """package com.rikkaminis.app.ui.settings
@@ -1667,7 +1834,7 @@ IconButton(onClick = {
     }
 })
 ThinkingRulesSection(instance = currentInstance, providerRepository = providerRepository, modelEntries = allEntries)
-"""
+""" + FIX_PD_LIVE_TAIL
 
 # [da1028-C] C11c: the section is called without its entry list, so the keys
 # inside it can never observe a catalog refresh.
@@ -1678,6 +1845,53 @@ FIX_PROVIDER_DETAIL_MISSING_ANCHOR = """package com.rikkaminis.app.ui.settings
 
 fun unrelated() {}
 """
+
+# C26 — a write pushes the render-frame object back instead of the live one.
+FIX_PROVIDER_DETAIL_SNAPSHOT_WRITE = FIX_PROVIDER_DETAIL_CLEAN.replace(
+    "    val live = currentInstance()\n"
+    "    providerRepository.updateInstance(live.copy(isEnabled = true))",
+    "    providerRepository.updateInstance(instance.copy(isEnabled = true))")
+
+# C26 — the export path serialises the render-frame object.
+FIX_PROVIDER_DETAIL_EXPORT_SNAPSHOT = FIX_PROVIDER_DETAIL_CLEAN.replace(
+    "    val exported = currentInstance()\n"
+    "    exportProviderInstance(context, providerRepository, exported)",
+    "    exportProviderInstance(context, providerRepository, instance)")
+
+# C26 — the live resolver itself is gone (fail-closed arm).
+FIX_PROVIDER_DETAIL_NO_RESOLVER = FIX_PROVIDER_DETAIL_CLEAN.replace(
+    "fun currentInstance(): ProviderInstance =", "fun helperNotTheResolver(): ProviderInstance =")
+
+# C27 — the pre-fix shape: the state holds the long-pressed ModelEntry object.
+FIX_PROVIDER_DETAIL_OBJECT_TARGET = (
+    FIX_PROVIDER_DETAIL_CLEAN
+    .replace("var entryToDeleteId by remember { mutableStateOf<String?>(null) }",
+             "var entryToDelete by remember { "
+             "mutableStateOf<com.rikkaminis.app.data.model.ModelEntry?>(null) }")
+    .replace("onLongClick = { entryToDeleteId = entry.id }",
+             "onLongClick = { entryToDelete = entry }")
+    .replace("MinisAlertDialog(onDismissRequest = { entryToDeleteId = null })",
+             "MinisAlertDialog(onDismissRequest = { entryToDelete = null })"))
+
+# C27 — the row stores something other than the entry identity.
+FIX_PROVIDER_DETAIL_NO_ROW_WIRING = FIX_PROVIDER_DETAIL_CLEAN.replace(
+    "onLongClick = { entryToDeleteId = entry.id }",
+    "onLongClick = { pendingEntryLabel = entry.model.displayName }")
+
+# C28 — the target can vanish and the dialog stays up.
+FIX_PROVIDER_DETAIL_NO_CLOSE_EFFECT = FIX_PROVIDER_DETAIL_CLEAN.replace(
+    "LaunchedEffect(entryToDeleteId, allEntries) {\n"
+    "    if (entryDeleteTargetVanished(entryToDeleteId, allEntries)) entryToDeleteId = null\n"
+    "}\n", "")
+
+# C28 — the effect closes on every recomposition instead of on the decision.
+FIX_PROVIDER_DETAIL_UNCONDITIONAL_CLOSE = FIX_PROVIDER_DETAIL_CLEAN.replace(
+    "    if (entryDeleteTargetVanished(entryToDeleteId, allEntries)) entryToDeleteId = null",
+    "    entryToDeleteId = null")
+
+# C29 — the masked key is never re-read after an external credential write.
+FIX_PROVIDER_DETAIL_KEY_NO_REVISION = FIX_PROVIDER_DETAIL_CLEAN.replace(
+    "LaunchedEffect(instanceId, config.revision) {", "LaunchedEffect(instanceId) {")
 
 FIX_CONNECTION_CLEAN = """package com.rikkaminis.app.ui.settings
 
@@ -2697,7 +2911,7 @@ def run_selftest():
              variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_STATE_BACKED), failures)
     run_case("failclosed-missing-detail-anchor", 1,
              variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_MISSING_ANCHOR), failures,
-             ("C7", "C11c"))
+             ("C7", "C11c", "C26", "C27", "C28", "C29"))
     # --- da1027-E: C8 / C9 (field-keyed editors) ---------------------------
     run_case("c8-group-no-name-key", 1,
              variant(REL_GROUP_DETAIL, FIX_GROUP_DETAIL_NO_NAME_KEY), failures, ("C8",))
@@ -2834,6 +3048,24 @@ def run_selftest():
              variant(REL_MODEL_ENTRY_PICKER, FIX_PICKER_MISSING_HELPER), failures, ("C19",))
     run_case("failclosed-missing-picker-file", 1,
              missing(REL_MODEL_ENTRY_PICKER), failures, ("FILE",))
+    # --- da1040-B1: C26..C29 (ProviderDetailScreen live resolution) --------
+    run_case("c26-detail-snapshot-write", 1,
+             variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_SNAPSHOT_WRITE), failures, ("C26",))
+    run_case("c26-detail-export-snapshot", 1,
+             variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_EXPORT_SNAPSHOT), failures, ("C26",))
+    run_case("c26-detail-no-resolver", 1,
+             variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_NO_RESOLVER), failures, ("C26",))
+    run_case("c27-detail-object-delete-target", 1,
+             variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_OBJECT_TARGET), failures, ("C27",))
+    run_case("c27-detail-no-row-wiring", 1,
+             variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_NO_ROW_WIRING), failures, ("C27",))
+    run_case("c28-detail-no-close-effect", 1,
+             variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_NO_CLOSE_EFFECT), failures, ("C28",))
+    run_case("c28-detail-unconditional-close", 1,
+             variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_UNCONDITIONAL_CLOSE), failures,
+             ("C28",))
+    run_case("c29-detail-key-without-revision", 1,
+             variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_KEY_NO_REVISION), failures, ("C29",))
     if failures:
         print("SELFTEST FAILURES:")
         for f in failures:

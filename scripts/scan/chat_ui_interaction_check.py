@@ -783,6 +783,7 @@ def check_tree(root):
 
     # ── E1-E3: composer decisions read the live field value (dv19-B1) ──────
     problems.extend(composer_live_source_findings(inp_c))
+    problems.extend(composer_clear_funnel_findings(inp_c))
 
     return INPUT_REL, problems
 
@@ -861,6 +862,27 @@ fun ChatInputArea() {
         imeBurstJob = null
         imeBurstBuffer = null
     }
+    val clearComposerInput: () -> Unit = {
+        cancelPendingImeBurst()
+        viewModel.setInputText("")
+        inputFieldValue = TextFieldValue("")
+        lastTrueCaretEnd = 0
+    }
+    val performSendOrEnqueue: () -> Unit = handler@{
+        val toSend = inputFieldValue.text
+        if (viewModel.tryExecuteInputAsSlashCommand(toSend)) {
+            clearComposerInput()
+            return@handler
+        }
+        clearComposerInput()
+        viewModel.sendMessage(toSend)
+    }
+    Row {
+        Surface(modifier = Modifier.clickable {
+            viewModel.cancelEdit()
+            clearComposerInput()
+        }) { }
+    }
     val canSwipeSendNow: () -> Boolean = {
         inputFieldValue.text.isNotBlank() || attachments.isNotEmpty()
     }
@@ -923,6 +945,7 @@ fun ChatInputArea() {
                     attachments = viewModel.attachments.value,
                 ),
             )
+            clearComposerInput()
         })
     }
 }
@@ -1009,6 +1032,191 @@ fun MinisMarkdownTextToolbarHost(toolbar: Toolbar) {
     }
 }
 """
+
+
+# ---------------------------------------------------------------------------
+# F (dv20-B03): the composer clear is one funnel
+# ---------------------------------------------------------------------------
+CLEAR_WRITE_RE = re.compile(r"setInputText\s*\(\s*\"\"\s*\)")
+FIELD_WRITE_RE = re.compile(r"\binputFieldValue\s*=")
+CARET_RESET_RE = re.compile(r"\blastTrueCaretEnd\s*=\s*0\b")
+BURST_DROP_RE = re.compile(
+    r"cancelPendingImeBurst\s*\(\s*\)|imeBurstJob\s*\?\.\s*cancel\s*\(\)")
+FUNNEL_LAMBDA_RE = re.compile(r"\bval\s+(\w+)\s*:\s*\(\)\s*->\s*Unit\s*=\s*\{")
+FUNNEL_CONSUMERS = [
+    (re.compile(r"\bviewModel\.sendMessage\s*\("), "send path"),
+    (re.compile(r"\btryExecuteInputAsSlashCommand\s*\("), "slash-command branch"),
+    (re.compile(r"\bstashPendingTransfer\s*\("), "cross-session move"),
+    (re.compile(r"\bviewModel\.cancelEdit\s*\("), "exit-edit pill"),
+]
+
+
+def _innermost_brace_span(text, idx):
+    """(open_idx, close_idx) of the innermost {...} containing [idx]."""
+    depth = 0
+    start = -1
+    for i in range(idx):
+        c = text[i]
+        if c == "{":
+            depth += 1
+            start = i
+        elif c == "}":
+            depth -= 1
+            if depth <= 0:
+                start = -1
+    if start == -1:
+        return None
+    d = 0
+    for j in range(start, len(text)):
+        if text[j] == "{":
+            d += 1
+        elif text[j] == "}":
+            d -= 1
+            if d == 0:
+                return (start, j)
+    return None
+
+
+def composer_clear_funnel_findings(inp_c):
+    """Every composer-clear routes through one shared funnel (dv20-B03).
+
+    The clear entrances used to commit an empty string on their own. That write
+    is suppressed by the ViewModel's StateFlow (equal values do not emit), so
+    the inputText mirror never re-runs and the composer keeps the text the user
+    just sent. The funnel commits the empty string AND resets inputFieldValue +
+    lastTrueCaretEnd, and drops the pending IME burst so a still-alive 150ms
+    flush cannot resurrect the sent text.
+    """
+    problems = []
+    clears = list(CLEAR_WRITE_RE.finditer(inp_c))
+    if not clears:
+        problems.append(("F", "no composer-clear write found in ChatInputArea.kt "
+                              "-- the external-clear anchor moved, re-point this guard"))
+        return problems
+    funnels = []
+    for m in FUNNEL_LAMBDA_RE.finditer(inp_c):
+        ob = inp_c.find("{", m.end() - 1)
+        if ob < 0:
+            continue
+        # ob+1: count the lambda's own opening brace, so the span IS the lambda
+        # body (passing ob would return the enclosing block instead)
+        span = _innermost_brace_span(inp_c, ob + 1)
+        if span is None:
+            continue
+        b0, b1 = span
+        if any(b0 <= c.start() < b1 for c in clears):
+            funnels.append((m.group(1), b0, b1))
+    if not funnels:
+        problems.append(("F", "%d composer-clear write(s) commit the empty string on "
+                              "their own with no shared clear funnel -- the field reset "
+                              "drifts out of the entrances" % len(clears)))
+        return problems
+    if len(funnels) > 1:
+        problems.append(("F", "%d separate composer-clear funnels (%s) -- two clear "
+                              "definitions will drift apart, keep one"
+                              % (len(funnels), ", ".join(f[0] for f in funnels))))
+        return problems
+    fname, f0, f1 = funnels[0]
+    body = inp_c[f0:f1 + 1]
+    if not FIELD_WRITE_RE.search(body):
+        problems.append(("F1", "the clear funnel commits the empty string but never "
+                               "resets inputFieldValue -- the VM write is suppressed "
+                               "when the string is already empty, so the field keeps "
+                               "the text that was just sent"))
+    if not CARET_RESET_RE.search(body):
+        problems.append(("F1", "the clear funnel never resets lastTrueCaretEnd -- a "
+                               "stale caret index survives the clear and lands in the "
+                               "next draft"))
+    if not BURST_DROP_RE.search(body):
+        problems.append(("F1", "the clear funnel does not drop the pending IME burst "
+                               "-- a still-alive 150ms flush commits the snapshot "
+                               "after the clear and resurrects the sent text"))
+    for c in clears:
+        if not (f0 <= c.start() <= f1):
+            line = inp_c.count("\n", 0, c.start()) + 1
+            problems.append(("F2", "a composer-clear at line %d commits the empty "
+                                   "string outside the clear funnel -- the field reset "
+                                   "is bypassed for this entrance" % line))
+    for m in re.finditer(r"\b%s\s*\(\s*\)" % re.escape(fname), inp_c):
+        if m.start() < f0:
+            line = inp_c.count("\n", 0, m.start()) + 1
+            problems.append(("F3", "%s is called at line %d before its declaration -- "
+                                   "a local val lambda cannot be referenced before its "
+                                   "declaration" % (fname, line)))
+    # Direction + same-path rules, measured on the tree this guard was written
+    # against. Block containment alone was too coarse for the send path: the
+    # enclosing lambda also holds the slash-command branch's funnel call, so a
+    # send that skipped the funnel still sat "inside a block that routes through
+    # it" (found by the FIX-B3 mutation run, m5). What the defect actually breaks
+    # is the *sequence on one path*, so each anchor is checked in its measured
+    # direction and must not cross a block boundary or a return.
+    FUNNEL_RULES = {
+        "send path": ("before", 200),
+        "cross-session move": ("after", 400),
+        "exit-edit pill": ("after", 200),
+    }
+    BOUNDARY_RE = re.compile(r"[{}]|\breturn@")
+    call_re = re.compile(r"\b%s\s*\(\s*\)" % re.escape(fname))
+    calls = [m.start() for m in call_re.finditer(inp_c)]
+    for anchor, label in FUNNEL_CONSUMERS:
+        hits = list(anchor.finditer(inp_c))
+        if not hits:
+            problems.append(("F4", "the %s anchor moved -- re-point this guard" % label))
+            continue
+        for h in hits:
+            if label == "slash-command branch":
+                # the funnel must be the FIRST statement of the if-body
+                p = inp_c.find("(", h.end() - 1)
+                close = -1
+                if p >= 0:
+                    depth = 0
+                    for j in range(p, min(len(inp_c), p + 2000)):
+                        if inp_c[j] == "(":
+                            depth += 1
+                        elif inp_c[j] == ")":
+                            depth -= 1
+                            if depth == 0:
+                                close = j
+                                break
+                if close < 0:
+                    problems.append(("F4", "cannot locate the %s condition -- re-point"
+                                           % label))
+                    continue
+                # the call sits inside an `if (...)` condition, so the run of
+                # closing parens that ends the enclosing guard sits between the
+                # call's `)` and the body's `{` -- skip it (measured shape:
+                # `if (viewModel.tryExecuteInputAsSlashCommand(x)) {`)
+                j = close + 1
+                while j < len(inp_c) and inp_c[j] in ") \t\r\n":
+                    j += 1
+                if inp_c[j:j + 1] != "{":
+                    problems.append(("F4", "the %s has no brace body -- re-point"
+                                           % label))
+                    continue
+                ok = call_re.match(inp_c[j + 1:].lstrip()) is not None
+                if not ok:
+                    line = inp_c.count("\n", 0, h.start()) + 1
+                    problems.append(("F4", "the %s at line %d acts on the composer "
+                                           "without routing through %s as the first "
+                                           "statement of its body -- the field reset is "
+                                           "bypassed" % (label, line, fname)))
+                continue
+            direction, reach = FUNNEL_RULES[label]
+            if direction == "before":
+                prev = [c for c in calls if c < h.start()]
+                ok = (bool(prev) and h.start() - prev[-1] < reach
+                      and not BOUNDARY_RE.search(inp_c[prev[-1]:h.start()]))
+            else:
+                nxt = [c for c in calls if c > h.end()]
+                ok = (bool(nxt) and nxt[0] - h.end() < reach
+                      and not BOUNDARY_RE.search(inp_c[h.end():nxt[0]]))
+            if not ok:
+                line = inp_c.count("\n", 0, h.start()) + 1
+                problems.append(("F4", "the %s at line %d acts on the composer without "
+                                       "routing through %s on the same path -- the field "
+                                       "reset is bypassed"
+                                       % (label, line, fname)))
+    return problems
 
 
 def fixtures(**overrides):
@@ -1267,13 +1475,64 @@ def selftest():
             "    }\n", "").replace(
             "cancelPendingImeBurst()", "imeBurstJob?.cancel()"),
     }), [])
+    # ── F1-F4: composer clear is one funnel (dv20-B03) ──────────────────────
+    expect("F1 funnel loses the field reset", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            '        inputFieldValue = TextFieldValue("")\n', ""),
+    }), ["F1"])
+    expect("F1 funnel loses the caret reset", fixtures(**{
+        INPUT_REL: INPUT_F.replace('        lastTrueCaretEnd = 0\n', ""),
+    }), ["F1"])
+    expect("F1 funnel loses the burst drop", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            '        cancelPendingImeBurst()\n        viewModel.setInputText("")',
+            '        viewModel.setInputText("")'),
+    }), ["F1"])
+    expect("F2 clear outside the funnel", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            '        viewModel.sendMessage(toSend)',
+            '        viewModel.setInputText("")\n        viewModel.sendMessage(toSend)'),
+    }), ["F2"])
+    expect("F3 funnel called before its declaration", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "package com.rikkaminis.app.ui.chat\n",
+            "package com.rikkaminis.app.ui.chat\n\n"
+            "val earlyCaller: () -> Unit = { clearComposerInput() }\n"),
+    }), ["F3"])
+    expect("F4 pill routes around the funnel", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            '            viewModel.cancelEdit()\n            clearComposerInput()',
+            '            viewModel.cancelEdit()'),
+    }), ["F4"])
+    expect("F precision: comments mention the shapes", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "    val clearComposerInput: () -> Unit = {",
+            "    // NEVER: setInputText(\"\") alone -- the VM write is suppressed\n"
+            "    // when the string is already empty, so the field keeps the sent text\n"
+            "    val clearComposerInput: () -> Unit = {"),
+    }), [])
+    expect("F4 send path skips the funnel", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            '        clearComposerInput()\n        viewModel.sendMessage(toSend)',
+            '        viewModel.sendMessage(toSend)'),
+    }), ["F4"])
+    expect("F4 slash branch skips the funnel", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            '            clearComposerInput()\n            return@handler',
+            '            return@handler'),
+    }), ["F4"])
+    expect("F4 move-to-session skips the funnel", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            '            clearComposerInput()\n        })',
+            '        })'),
+    }), ["F4"])
 
     if failures:
         print("❌ selftest failed:")
         for f in failures:
             print("   " + f)
         return 1
-    print("CHAT_UI_INTERACTION_SELFTEST=PASS (26 fixtures: clean + 25 violation/precision)")
+    print("CHAT_UI_INTERACTION_SELFTEST=PASS (36 fixtures: clean + 35 violation/precision)")
     return 0
 
 

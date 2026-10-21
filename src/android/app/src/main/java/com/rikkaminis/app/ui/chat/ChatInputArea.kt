@@ -390,6 +390,25 @@ internal fun ChatInputArea(
         imeBurstJob = null
         imeBurstBuffer = null
     }
+    // [dv20-B03] Single funnel for "clear the composer from outside
+    // onValueChange". Every clear entrance used to spell
+    // `viewModel.setInputText("")` on its own, and that write alone is a no-op
+    // on the FIELD: `_inputText` is a StateFlow, so clearing an already-empty
+    // composer is an equal write, it is suppressed, the
+    // `LaunchedEffect(inputText)` above never re-runs, and whatever the user
+    // typed during a >8-char IME burst (still buffered, not yet committed)
+    // stayed in the box after the message had been sent. Clearing is three
+    // writes, not one — drop the pending burst flush, commit the empty string,
+    // and reset the field plus the caret tracker. Declared before its
+    // consumers on purpose: a local `val` lambda cannot be referenced before
+    // its declaration (the 1039-B1 lesson — the compiler rejected the
+    // subscription written after its consumer).
+    val clearComposerInput: () -> Unit = {
+        cancelPendingImeBurst()
+        viewModel.setInputText("")
+        inputFieldValue = androidx.compose.ui.text.input.TextFieldValue("")
+        lastTrueCaretEnd = 0
+    }
     // Paired with imeBurstBuffer: the caret that must be scanned against the
     // FLUSHED text when a debounced burst finally commits. Stored alongside
     // the buffer (not read late from inputFieldValue) so the mention scan in
@@ -490,7 +509,7 @@ internal fun ChatInputArea(
         cancelPendingImeBurst()
         val toSend = inputFieldValue.text
         if (viewModel.tryExecuteInputAsSlashCommand(toSend)) {
-            viewModel.setInputText("")
+            clearComposerInput()
             keyboardController?.hide()
             focusManager.clearFocus()
             return@handler
@@ -502,7 +521,7 @@ internal fun ChatInputArea(
         // AFTER the insert would wrongly read "scrolled into history" for a
         // bottom-anchored sender. Snapshot first, then act.
         val wasScrolledIntoHistory = !isNearBottom.value
-        viewModel.setInputText("")
+        clearComposerInput()
         keyboardController?.hide()
         focusManager.clearFocus()
         viewModel.sendMessage(toSend)
@@ -1408,7 +1427,7 @@ internal fun ChatInputArea(
                         // run locally instead of being sent as a chat
                         // turn. Mirrors iOS performSend().
                         if (viewModel.tryExecuteInputAsSlashCommand(effectiveInput)) {
-                            viewModel.setInputText("")
+                            clearComposerInput()
                             keyboardController?.hide()
                             focusManager.clearFocus()
                             return@handler true
@@ -1424,7 +1443,7 @@ internal fun ChatInputArea(
                         // [P2-scroll-user-send] snapshot BEFORE sendMessage
                         // (insert pushes index 0 → 1; must not read after).
                         val wasScrolledIntoHistory = !isNearBottom.value
-                        viewModel.setInputText("")
+                        clearComposerInput()
                         keyboardController?.hide()
                         focusManager.clearFocus()
                         viewModel.sendMessage(toSend)
@@ -1750,7 +1769,7 @@ internal fun ChatInputArea(
                             color = ChatColors.inputBg,
                             modifier = Modifier.clickable {
                                 viewModel.cancelEdit()
-                                viewModel.setInputText("")
+                                clearComposerInput()
                             },
                         ) {
                             Text(
@@ -1996,7 +2015,7 @@ internal fun ChatInputArea(
                             attachments = viewModel.attachments.value,
                         ),
                     )
-                    viewModel.setInputText("")
+                    clearComposerInput()
                     viewModel.clearAttachments()
                     viewModel.clearShareInjectedFlag()
                     showMoveSheet = false

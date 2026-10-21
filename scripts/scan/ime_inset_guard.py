@@ -195,9 +195,120 @@ def scan_file(path, rel):
     return findings
 
 
+# ─── [deep-audit-1040 B-01] SettingsScaffold must render a back affordance ───
+#
+# `SettingsScaffold` is the shared host this gate already owns (it is in the host
+# table in the module KDoc above). Its `navigationSlot` used to honour ONLY the
+# `navigation` parameter, so the ten call sites that passed just `onBack`
+# (provider detail / connection, storage session, runtime limits, Shizuku and
+# offload permissions, provider add, custom model add, chat tuning) rendered an
+# EMPTY navigation slot — no back arrow at all, even though the parameter KDoc
+# had always promised "the slot falls back to the back arrow iff onBack is set".
+# The system back gesture still worked, which is exactly why it survived review:
+# a user who does not know the gesture had no visible way out of the screen.
+#
+# Same family as the IME class above — a shared host whose contract and whose
+# rendering disagreed, silently — so it is graded at the shared layer instead of
+# one screen at a time.
+#
+# Graded:
+#   B01-SLOT   inside the slot body: BOTH arms exist (`navigation != null` AND
+#              `onBack != null`) and the onBack arm renders an IconButton wired
+#              to `onBack`.
+#   B01-CALLS  the number of production `SettingsScaffold(...)` call sites
+#              passing a non-null `onBack` stays at or above the recorded floor.
+#              Fail-closed in both directions: an anchor that stopped matching
+#              (regex rot) and a screen that lost its back handler both surface
+#              as a drop.
+#
+# Deliberately NOT graded: a top-level screen passing NEITHER parameter keeps an
+# empty slot. That is the documented design (rely on the system back gesture /
+# bottom navigation); flagging it would force a back arrow onto screens that are
+# not drill-downs.
+SCAFFOLD_REL = "com/rikkaminis/app/ui/settings/SettingsComponents.kt"
+NAV_SLOT_DECL_RE = re.compile(r"\bval\s+navigationSlot\s*:")
+NAV_ARM_RE = re.compile(r"\bnavigation\s*!=\s*null\s*->")
+ONBACK_ARM_RE = re.compile(r"\bonBack\s*!=\s*null\s*->")
+ONBACK_RENDER_RE = re.compile(r"IconButton\s*\([\s\S]{0,160}?onClick\s*=\s*onBack\b")
+SCAFFOLD_CALL_RE = re.compile(r"(?<![\w.])SettingsScaffold\s*\(")
+# Capture the VALUE rather than asserting a negative lookahead: `\s*=(?!null)`
+# can backtrack the whitespace and match `onBack = null` anyway (measured: the
+# lookahead form counted 26 of 27 call sites, i.e. essentially every one).
+ONBACK_ARG_RE = re.compile(r"\bonBack\s*=\s*([^,\n)]+)")
+# 10 call sites in 9 files pass `onBack` on 2026-10-21; the floor is one below
+# that so a legitimate merge of two screens does not false-alarm while regex rot
+# (which would collapse the count) still does.
+MIN_ONBACK_CALLSITES = 9
+
+
+def balanced_args(text, open_idx):
+    """Text inside the parenthesis at `open_idx`, or None when unbalanced.
+
+    Comments are stripped before this runs, so a stray paren inside a string
+    literal is the only way it can drift — the same ceiling `strip_comments`
+    documents for the IME half of this gate.
+    """
+    depth = 0
+    for i in range(open_idx, len(text)):
+        ch = text[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx + 1:i]
+    return None
+
+
+def braced_block(text, open_idx):
+    """Body of the brace block starting at `open_idx` (the `{`), exclusive."""
+    depth = 0
+    for i in range(open_idx, len(text)):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx + 1:i]
+    return None
+
+
+def check_scaffold_navigation(text):
+    """B01-* — see the block comment above. Returns [(criterion, ok, detail)]."""
+    results = []
+    m = NAV_SLOT_DECL_RE.search(text)
+    if m is None:
+        results.append(("B01-SLOT", False,
+                        "no `val navigationSlot` in SettingsComponents.kt (fail-closed: the host "
+                        "was reworked — re-derive this criterion)"))
+        return results
+    brace = text.find("{", m.end())
+    slot = braced_block(text, brace) if brace >= 0 else None
+    if slot is None:
+        results.append(("B01-SLOT", False,
+                        "`navigationSlot` has no brace body (fail-closed: re-derive)"))
+        return results
+    problems = []
+    if not NAV_ARM_RE.search(slot):
+        problems.append("the slot no longer honours the custom `navigation` slot")
+    if not ONBACK_ARM_RE.search(slot):
+        problems.append("the slot has no `onBack != null` arm — every screen that passes only "
+                        "`onBack` renders an empty navigation slot again")
+    elif not ONBACK_RENDER_RE.search(slot):
+        problems.append("the `onBack` arm does not render an `IconButton(onClick = onBack)`")
+    results.append(("B01-SLOT", not problems,
+                    "the navigation slot honours the custom slot, and falls back to a back arrow "
+                    "when only `onBack` is set" if not problems else "; ".join(problems)))
+    return results
+
+
 def main():
     root = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else ".")
     violations = []
+    scaffold_violations = []
+    scaffold_seen = False
+    onback_calls = 0
     for sr in SRC_ROOTS:
         for base, _dirs, files in os.walk(os.path.join(root, sr)):
             for fn in sorted(files):
@@ -207,6 +318,43 @@ def main():
                 rel = os.path.relpath(path, os.path.join(root, sr)).replace(os.sep, "/")
                 for line_no, fname in scan_file(path, rel):
                     violations.append(f"{rel}:{line_no}  in {fname}()")
+                # [deep-audit-1040 B-01] the shared settings host's navigation
+                # affordance (see the block comment above the criteria).
+                text = "\n".join(strip_comments(
+                    open(path, encoding="utf-8", errors="replace").read()))
+                if rel == SCAFFOLD_REL:
+                    scaffold_seen = True
+                    for cid, ok, detail in check_scaffold_navigation(text):
+                        if not ok:
+                            scaffold_violations.append("%s  %s" % (cid, detail))
+                for cm in SCAFFOLD_CALL_RE.finditer(text):
+                    args = balanced_args(text, cm.end() - 1)
+                    if args is None:
+                        continue
+                    vm = ONBACK_ARG_RE.search(args)
+                    if vm is not None and vm.group(1).strip() != "null":
+                        onback_calls += 1
+
+    # The call-site floor only applies when the host file is actually in the tree:
+    # test_scan.py builds single-file fixture trees (no SettingsComponents.kt) and
+    # a missing host is not this gate's business — an unconditional floor would
+    # red every one of those exit-0 cases.
+    if scaffold_seen and onback_calls < MIN_ONBACK_CALLSITES:
+        scaffold_violations.append(
+            "B01-CALLS  only %d production `SettingsScaffold(...)` call site(s) pass a non-null "
+            "`onBack` (floor %d) — the anchor stopped matching (re-derive this criterion), or "
+            "screens lost their back handler" % (onback_calls, MIN_ONBACK_CALLSITES))
+
+    if scaffold_violations:
+        print(f"❌ SettingsScaffold navigation guard: {len(scaffold_violations)} violation(s)")
+        print("   The slot used to honour only the custom `navigation` parameter, so every")
+        print("   screen passing just `onBack` rendered an empty navigation slot: no back")
+        print("   arrow, and a user who does not know the system back gesture has no way out.")
+        print("   Fix: keep both arms of the `when` — `navigation != null -> navigation()`")
+        print("        and `onBack != null -> IconButton(onClick = onBack)`.")
+        for v in scaffold_violations:
+            print("     " + v)
+        return 1
 
     if violations:
         print(f"❌ IME-inset guard: {len(violations)} violation(s)")
@@ -224,6 +372,9 @@ def main():
             print("     " + v)
         return 1
     print("✅ IME-inset guard: no unprotected text field in a bare-Scaffold host")
+    if scaffold_seen:
+        print(f"✅ SettingsScaffold navigation guard: {onback_calls} call site(s) pass `onBack`, "
+              "and the slot falls back to a back arrow")
     return 0
 
 

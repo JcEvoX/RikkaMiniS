@@ -151,10 +151,10 @@ class MediaHostSourceKeyTest {
     @Test
     fun `the markdown media blocks resolve through the shared off-main resolver`() {
         // Literals stand for the media blocks each renderer owns, not for the
-        // helper's own definition or its KDoc mentions: StreamingMarkdownText
-        // renders image + video + audio blocks through it (3), MarkdownText
-        // video + audio (2).
-        for ((rel, blocks) in listOf(STREAM to 3, MARKDOWN to 2)) {
+        // helper's own definition or its KDoc mentions: both renderers now run
+        // image + video + audio through it (3 each) -- MarkdownText's image
+        // block was the last one handing Coil a bare host path (dv20-B03 B-05).
+        for ((rel, blocks) in listOf(STREAM to 3, MARKDOWN to 3)) {
             val src = stripComments(readRepoFile(rel))
             assertEquals(
                 "$rel: every media block must resolve via rememberMdMediaFile " +

@@ -5,17 +5,19 @@ import android.net.ConnectivityManager
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
-import android.os.storage.StorageManager
 import android.provider.DocumentsContract
 import android.util.Log
 import com.rikkaminis.app.data.FileMentionIndex
 import com.rikkaminis.app.data.MountedFoldersStore
+import com.rikkaminis.app.data.resolveVolumeRoot
 import java.io.File
 import java.io.IOException
 import java.util.TimeZone
 import kotlin.math.abs
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 /**
  * PRoot configuration holder and command builder.
@@ -266,7 +268,12 @@ object PRootKernel {
         // applyMountedFoldersSnapshot in MinisApp.onCreate ran before boot and
         // its mkdirs went nowhere; this re-run covers the mount entries that
         // were known at app launch.
-        applyMountedFoldersSnapshot(context)
+        //
+        // [dv20-A4-A06] Pin the IO hop at the call site: the snapshot does
+        // blocking host I/O (SAF resolution readdir, rootfs mkdirs, wrapper-
+        // script writes), and bootCriticalSection runs on whatever context its
+        // caller used — it must not depend on that.
+        withContext(Dispatchers.IO) { applyMountedFoldersSnapshot(context) }
 
         // [deep-audit-1016 FIX-C 3a] `bootGate` marks completion here — the
         // flag-before-body ordering (`isBooted = true` used to sit one line
@@ -541,7 +548,10 @@ object PRootKernel {
             val parts = docId.split(':', limit = 2)
             val volumeId = parts.getOrNull(0).orEmpty()
             val relPath = parts.getOrNull(1).orEmpty()
-            val volumeRoot = resolveVolumeRoot(volumeId, context)
+            // [dv20-A4-A06] Single-source volume-root resolution (MountedFoldersStore.kt):
+            // the union rule keeps the < API 30 `/storage/<uuid>` fallback, so a
+            // removable volume resolves here too instead of dropping the mount.
+            val volumeRoot = resolveVolumeRoot(context, volumeId)
             if (volumeRoot == null) {
                 Log.w(TAG, "resolveTreeUriToHostPath: unknown volume '$volumeId' for $treeUriString")
                 null
@@ -601,22 +611,12 @@ object PRootKernel {
         }
     }
 
-    private fun resolveVolumeRoot(volumeId: String, context: Context): String? {
-        if (volumeId.equals("primary", ignoreCase = true) || volumeId.isEmpty()) {
-            return Environment.getExternalStorageDirectory()?.absolutePath
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-            val sm = context.getSystemService(Context.STORAGE_SERVICE) as? StorageManager ?: return null
-            for (volume in sm.storageVolumes) {
-                if (volume.uuid?.equals(volumeId, ignoreCase = true) == true) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        return volume.directory?.absolutePath
-                    }
-                }
-            }
-        }
-        return null
-    }
+    // [dv20-A4-A06] The private `resolveVolumeRoot(volumeId, context)` that used
+    // to live here is gone: it was a drifted twin of MountedFoldersStore's copy
+    // with no < API 30 fallback, so a removable volume (API 26–29) resolved to
+    // null on this side and applyMountedFoldersSnapshot silently dropped the
+    // mount. Both readers now call the single top-level
+    // `resolveVolumeRoot(context, volumeId)` in MountedFoldersStore.kt.
 
     /**
      * Build a POSIX TZ string from the current system timezone.

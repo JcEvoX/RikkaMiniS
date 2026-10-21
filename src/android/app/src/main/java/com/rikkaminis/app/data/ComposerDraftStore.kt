@@ -122,6 +122,22 @@ object ComposerDraftStore {
         if (_snapshot.value?.id == draftId) _snapshot.value = null
     }
 
+    /**
+     * [da1040-A3] Ids whose on-disk footprint must NOT be reclaimed as orphan
+     * data even though no DB row backs them: the composer's current slot owner.
+     *
+     * [nextDraftId] mints `__new__<uuid>` before the first message is sent, and
+     * [saveText] may (re)claim the slot for a real session id while the user
+     * types in an existing chat. Both names own files under
+     * minis-sessions/ , media/ and browser_tabs/ , so the orphan sweep has to
+     * treat them as live. Empty set when the slot is free ([clearDraft]
+     * releases it on promotion and on every blank).
+     */
+    fun activeDraftIds(context: Context): Set<String> {
+        val id = PrefsKV(prefs(context)).getString(KEY_ID) ?: return emptySet()
+        return setOf(id)
+    }
+
     /** Live draft snapshot for the history drawer's "Draft" row. */
     fun observeDraftSnapshot(context: Context): StateFlow<DraftSnapshot?> {
         if (!loaded) {

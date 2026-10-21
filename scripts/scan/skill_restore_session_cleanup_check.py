@@ -447,6 +447,122 @@ def check_minis_app_badge(src):
     return v
 
 
+A05_SWEEP_CALL = "deleteEmptySessions("
+A05_LIVE_SET = "activeSessionIds"
+A05_IO = "Dispatchers.IO"
+
+
+def _a05_balanced(src, open_idx, opener, closer):
+    depth = 0
+    k = open_idx
+    while k < len(src):
+        c = src[k]
+        if c == opener:
+            depth += 1
+        elif c == closer:
+            depth -= 1
+            if depth == 0:
+                return k
+        k += 1
+    return -1
+
+
+def _a05_io_regions(src):
+    """Brace-balanced regions opened by an IO dispatch.
+
+    The `)` + `.name`-hop + `{` walk is deliberate: `CoroutineScope(SupervisorJob()
+    + Dispatchers.IO)` is a *property* initialiser with no block, and treating its
+    far-away next `{` as a region would let an on-main sweep hide inside it.
+    """
+    regions = []
+    token = "Dispatchers.IO"
+    k = src.find(token)
+    while k >= 0:
+        tail = src[k + len(token):]
+        j = 0
+        while j < len(tail) and tail[j] in " \t\r\n":
+            j += 1
+        if j < len(tail) and tail[j] == ")":
+            j += 1
+            while True:
+                while j < len(tail) and tail[j] in " \t\r\n":
+                    j += 1
+                if j < len(tail) and tail[j] == ".":
+                    j += 1
+                    while j < len(tail) and (tail[j].isalnum() or tail[j] == "_"):
+                        j += 1
+                    continue
+                break
+            if j < len(tail) and tail[j] == "{":
+                brace = k + len(token) + j
+                close = _a05_balanced(src, brace, "{", "}")
+                if close > brace:
+                    regions.append((brace, close))
+        k = src.find(token, k + 1)
+    return regions
+
+
+def check_minis_app_sweep(src):
+    """Arm 7 [dv20-A4-A05]: the startup empty-session sweep must be *wired*.
+
+    `ChatRepository.deleteEmptySessions` and `ChatViewModelStore.activeSessionIds`
+    both shipped with zero production callers, so the backstop that clears a
+    session the user opened and closed without typing never ran — the empty rows
+    accumulated in the drawer forever. Three decisions, in the order they can go
+    wrong:
+
+      1. the call exists at all (a helper with no caller is indistinguishable
+         from a feature nobody built);
+      2. it carries the live-session set — sweeping without it deletes the very
+         session the user is in when they reopen the app;
+      3. it runs off the main thread — it is a Room DELETE at cold start.
+    """
+    src = code_only(src)
+    v = []
+    off = src.find(A05_SWEEP_CALL)
+    if off < 0:
+        v.append("MinisApp.kt: no call to '%s' — the startup empty-session "
+                 "backstop never runs" % A05_SWEEP_CALL)
+        return v
+    paren = src.find("(", off)
+    end = _a05_balanced(src, paren, "(", ")") if paren >= 0 else -1
+    args = src[paren:end + 1] if end > paren else src[paren:]
+    if A05_LIVE_SET not in args:
+        v.append("MinisApp.kt: '%s' is called without '%s()' — the sweep would "
+                 "delete the sessions that are still live"
+                 % (A05_SWEEP_CALL, A05_LIVE_SET))
+    if not any(lo <= off <= hi for lo, hi in _a05_io_regions(src)):
+        v.append("MinisApp.kt: '%s' is not inside a '%s' region — it is a Room "
+                 "DELETE at cold start and must not run on the caller's thread"
+                 % (A05_SWEEP_CALL, A05_IO))
+    return v
+
+
+GOOD_APP_SWEEP = """
+class MinisApp : Application() {
+    override fun onCreate() {
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+            runCatching {
+                val swept = chatRepository.deleteEmptySessions(
+                    com.rikkaminis.app.ui.chat.ChatViewModelStore.activeSessionIds(),
+                )
+            }
+        }
+    }
+}
+"""
+
+BAD_APP_SWEEP_UNWIRED = GOOD_APP_SWEEP.replace(
+    "chatRepository.deleteEmptySessions(", "chatRepository.countEmptySessions(")
+
+BAD_APP_SWEEP_NO_LIVE_SET = GOOD_APP_SWEEP.replace(
+    "                    com.rikkaminis.app.ui.chat.ChatViewModelStore.activeSessionIds(),\n", "")
+
+BAD_APP_SWEEP_ON_MAIN = GOOD_APP_SWEEP.replace(
+    "kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {",
+    "kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main).launch {")
+
+
 def read(root, rel):
     path = os.path.join(root, rel)
     with open(path, "r", encoding="utf-8") as fh:
@@ -466,7 +582,8 @@ def run(root):
         print("skill_restore_session_cleanup_check: cannot read sources: %s" % exc)
         return 2
     violations = (check_skill_repo(skill) + check_chat_repo(chat) + check_minis_app(app)
-                  + check_chat_entry(entry) + check_minis_app_badge(app))
+                  + check_chat_entry(entry) + check_minis_app_badge(app)
+                  + check_minis_app_sweep(app))
     if violations:
         print("FAIL skill_restore_session_cleanup_check")
         for v in violations:
@@ -798,6 +915,25 @@ def selftest():
     bad_app = check_minis_app(BAD_APP_ORDER)
     expect_trip("late-wiring fixture (ISSUE-10)", bad_app, "AFTER chatRepository", failures)
 
+    # [dv20-A4-A05] the startup empty-session sweep. Precision control first: the
+    # wired fixture must be clean, or "everything is red" would masquerade as teeth.
+    good_sweep = check_minis_app_sweep(GOOD_APP_SWEEP)
+    bad_sweep_unwired = check_minis_app_sweep(BAD_APP_SWEEP_UNWIRED)
+    bad_sweep_no_live = check_minis_app_sweep(BAD_APP_SWEEP_NO_LIVE_SET)
+    bad_sweep_on_main = check_minis_app_sweep(BAD_APP_SWEEP_ON_MAIN)
+    if good_sweep:
+        failures.append("compliant startup-sweep fixture is not clean: %r" % good_sweep)
+    expect_trip("unwired startup sweep (dv20-A4-A05)", bad_sweep_unwired, "never runs", failures)
+    expect_trip("sweep without the live-session set (dv20-A4-A05)", bad_sweep_no_live,
+                "still live", failures)
+    expect_trip("sweep off the IO region (dv20-A4-A05)", bad_sweep_on_main,
+                "Room DELETE at cold start", failures)
+    # The live-set arm must fire ONLY its own decision: the other two arms would
+    # otherwise mask a regression that left the exclusion set unwired.
+    if len(bad_sweep_no_live) != 1:
+        failures.append("live-set fixture tripped %d arms, expected exactly 1: %r"
+                        % (len(bad_sweep_no_live), bad_sweep_no_live))
+
     # [da1030-A / I01 裂缝B]
     bad_badge = check_minis_app_badge(BAD_APP_NO_BADGE)
     bad_badge_elsewhere = check_minis_app_badge(BAD_APP_BADGE_ELSEWHERE)
@@ -840,6 +976,10 @@ def selftest():
     print("selftest compliant entry ext     -> %d violation(s)" % len(good_entry))
     print("selftest dropped webapp re-point -> %d violation(s)" % len(bad_entry))
     print("selftest re-point outside draft  -> %d violation(s)" % len(bad_entry_outside))
+    print("selftest compliant sweep wiring    -> %d violation(s)" % len(good_sweep))
+    print("selftest unwired startup sweep     -> %d violation(s)" % len(bad_sweep_unwired))
+    print("selftest sweep without live set    -> %d violation(s)" % len(bad_sweep_no_live))
+    print("selftest sweep off the IO region   -> %d violation(s)" % len(bad_sweep_on_main))
 
     if failures:
         for f in failures:

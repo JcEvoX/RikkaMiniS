@@ -58,8 +58,34 @@ object SystemVoiceEntries {
     /** Resolve a group member id to a virtual system entry, or null. */
     fun resolve(memberId: String): ModelEntry? = all.find { it.id == memberId }
 
+    /**
+     * True when [id] lives in the System voice namespace — the PREFIX test, so
+     * it also covers the bare provider id and any `<sentinel>/<model>` member
+     * iOS may write beyond the three entries above.
+     */
     fun isSystemEntryId(id: String): Boolean =
         id.startsWith(SystemVoiceIds.BUILTIN_PROVIDER_ID)
+
+    /**
+     * [dv20-a1 A-02] Single membership judgement for MODEL GROUP member ids:
+     * an id is known when an entry with that id is persisted in
+     * `config.modelEntries`, OR when it is a synthesized System voice entry
+     * ([isSystemEntryId]).
+     *
+     * Every reader of `memberEntryIds` defers to this one predicate — the
+     * ConfigBackup Stage 2 remap, `GroupsCollection.requireKnownEntryIds`, the
+     * `groups` config summary and the two debug group RPCs. Before it each
+     * re-derived "known" from `modelEntries` alone, so the System sentinels
+     * were "unknown" on all five faces (members silently dropped, or an
+     * `Unknown model entry uuid` refusal) even though chat resolves them fine.
+     *
+     * Deliberately the prefix test rather than the three-entry enumeration:
+     * the sentinels are never persisted, so a future System entry would
+     * otherwise need the same five-site edit again. Fail-closed — an id that
+     * is neither persisted nor System is still unknown.
+     */
+    fun isKnownGroupMemberId(memberId: String, persistedEntryIds: Set<String>): Boolean =
+        memberId in persistedEntryIds || isSystemEntryId(memberId)
 
     /**
      * Synthetic instance for pickers that group entries by provider — gives

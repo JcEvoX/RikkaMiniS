@@ -77,6 +77,9 @@ TARGET = "SessionFileStore.kt"
 # [fix/dv14-B2] C4's scan target: ONLY the pool file (scope discipline —
 # the store criteria C1-C3 read SessionFileStore.kt and stay untouched).
 POOL_REL = "src/android/app/src/main/java/com/rikkaminis/app/browser/BrowserTabPool.kt"
+# [da1040-B2] C9's consumer face: the sheet is where a non-reactive busy read
+# freezes the affordances, so the criterion reads it too.
+SHEET_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/browser/BrowserSheet.kt"
 MARKER = "BROWSER_TABS_SELFTEST=PASS"
 
 
@@ -199,8 +202,52 @@ def check_source(source: str) -> list:
     else:
         if "looksLikeSessionId(" not in orphan_body:
             errs.append("C3: orphan browser_tabs cleanup not session-shape guarded")
-        if "__new__" not in orphan_body:
-            errs.append("C3: orphan browser_tabs cleanup misses the __new__ draft branch")
+        # [da1040-A3] The old C3 also demanded a local `__new__` branch HERE.
+        # That spelling is what the defect was made of: four of the five sweep
+        # callers never copied it. Draft coverage is now decided by the shape
+        # predicate itself (C7) and is fail-closed there; a call-site literal
+        # is rejected by C7's single-literal count.
+
+    # --- [da1040-A3] C7: the session-shape predicate carries BOTH shapes ---
+    if not re.search(r"const val DRAFT_ID_PREFIX\s*=\s*\"__new__\"", src):
+        errs.append("C7: the __new__ draft prefix is not declared as a single constant (fail-closed)")
+    lit = len(re.findall(r'"__new__"', src))
+    if lit != 1:
+        errs.append(
+            f'C7: the "__new__" namespace literal appears {lit} times in SessionFileStore '
+            "(expected exactly 1 — inside the shape predicate); a per-call-site copy is "
+            "how four of five sweep callers kept the narrower notion and deleted an "
+            "in-flight draft's files")
+    pred = slice_body(src, "private fun looksLikeSessionId")
+    if not pred:
+        errs.append("C7: looksLikeSessionId body not extractable (fail-closed)")
+    else:
+        if "DRAFT_ID_PREFIX" not in pred:
+            errs.append(
+                "C7: looksLikeSessionId does not cover the __new__ draft alias — an active "
+                "draft's session dir, media leaf and tab file all look orphaned to the sweep")
+        if "36" not in pred or "count {" not in pred:
+            errs.append("C7: looksLikeSessionId no longer enforces the UUID shape (fail-closed)")
+
+    # --- [da1040-A3] C8: every public orphan entry folds the active draft in ---
+    helper = slice_body(src, "private fun withActiveComposerOwner")
+    if not helper:
+        errs.append("C8: withActiveComposerOwner body not extractable (fail-closed)")
+    elif "activeDraftIds()" not in helper:
+        errs.append("C8: the live-set widener no longer consults the active draft provider")
+    if "ComposerDraftStore.activeDraftIds(context)" not in src:
+        errs.append(
+            "C8: the Context constructor does not wire the draft-id provider to "
+            "ComposerDraftStore — a hardcoded/empty provider silently turns the whole "
+            "widening into a no-op and the draft's files stay reclaimable")
+    for fn in ("fun scanMediaOnce", "fun scanOrphanSessionDirs", "fun scanOrphans", "fun reclaimOrphans"):
+        body = slice_body(src, fn)
+        if not body:
+            errs.append(f"C8: {fn[4:]} body not extractable (fail-closed)")
+        elif "withActiveComposerOwner(" not in body:
+            errs.append(
+                f"C8: {fn[4:]} does not widen the live set with the composer's active draft — "
+                "an in-flight draft's files are reclaimable through this entry point")
 
     return errs
 
@@ -534,6 +581,173 @@ POOL_V_CLOSEWIN_NOSAVE = POOL_COMPLIANT.replace(
 )
 
 
+# --- [da1040-B2] C9: the busy signal must be observable -------------------
+# The defect: `Tab.inUse` flips in place (audit-b21 forbids the copy that would
+# make the list change), so `tabs` stays content-equal and StateFlow swallows
+# the emission; a sheet reading a plain getter composed once and froze.
+
+def check_busy_source(pool_src: str, sheet_src: str) -> list:
+    """[da1040-B2] C9 — one funnel for in-use writes, one reactive carrier, and
+    a consumer that subscribes. Fail-closed throughout."""
+    code = strip_comments(pool_src)
+    errs = []
+
+    # C9a: the reactive face exists and no non-reactive getter is back
+    if not re.search(r"private val _agentBusy = MutableStateFlow\(", code):
+        errs.append("C9: no _agentBusy state holder (fail-closed)")
+    if "val agentBusy: StateFlow<Boolean> = _agentBusy.asStateFlow()" not in code:
+        errs.append(
+            "C9: the pool does not expose a reactive agentBusy StateFlow — a busy flip "
+            "cannot reach a collector, so the UI composes once and freezes")
+    if "val isAgentBusy" in code:
+        errs.append(
+            "C9: a non-reactive isAgentBusy getter is back — a consumer reading it never "
+            "recomposes when the agent starts or stops working")
+
+    # C9b: the predicate has exactly one carrier, re-derived from the live list
+    pub = slice_body(code, "private fun publishAgentBusy")
+    if not pub:
+        errs.append("C9: publishAgentBusy body not extractable (fail-closed)")
+    elif "_tabs.value.any { it.inUse }" not in pub:
+        errs.append(
+            "C9: publishAgentBusy no longer re-derives from any-tab-in-use — the published "
+            "flag can drift from Tab.inUse (fail-closed)")
+
+    # C9c: exactly one raw inUse write site, and it is inside the funnel
+    writes = re.findall(r"\w+\.inUse\s*=\s*\w+", code)
+    if len(writes) != 1:
+        errs.append(
+            f"C9: {len(writes)} raw Tab.inUse write sites in the pool (expected exactly 1, "
+            "inside setTabInUse) — a write that bypasses the funnel cannot publish")
+    funnel = slice_body(code, "private fun setTabInUse")
+    if not funnel:
+        errs.append("C9: setTabInUse body not extractable (fail-closed)")
+    elif "publishAgentBusy()" not in funnel:
+        errs.append("C9: setTabInUse does not publish the busy flag")
+
+    # C9d: list publication re-derives too (membership moves with no inUse write)
+    upd = slice_body(code, "private fun updateTabs")
+    if not upd:
+        errs.append("C9: updateTabs body not extractable (fail-closed)")
+    elif "publishAgentBusy()" not in upd:
+        errs.append("C9: updateTabs does not re-derive the busy flag")
+
+    # C9e: audit-b21 red line — the release path must keep the live Tab instance
+    if re.search(r"copy\([^)]*inUse", code):
+        errs.append(
+            "C9: the in-use flip copies the Tab (audit-b21: the copy breaks the identity "
+            "link to in-flight actions, whose release paths then mutate the object the "
+            "pool no longer holds)")
+
+    # C9f: the consumer subscribes
+    sheet = strip_comments(sheet_src)
+    if not re.search(r"by\s+tabPool\.agentBusy\.collectAsState\(\)", sheet):
+        errs.append(
+            "C9: BrowserSheet does not subscribe to the pool's busy flow "
+            "(expected `by tabPool.agentBusy.collectAsState()`)")
+    if "tabPool.isAgentBusy" in sheet:
+        errs.append("C9: BrowserSheet still reads the non-reactive busy getter")
+    return errs
+
+BUSY_COMPLIANT = """package com.rikkaminis.app.browser
+
+class BrowserTabPool(context: Context) {
+    private val _tabs = MutableStateFlow<List<Tab>>(emptyList())
+    val tabs: StateFlow<List<Tab>> = _tabs.asStateFlow()
+    private val _agentBusy = MutableStateFlow(false)
+    val agentBusy: StateFlow<Boolean> = _agentBusy.asStateFlow()
+
+    private fun publishAgentBusy() {
+        _agentBusy.value = _tabs.value.any { it.inUse }
+    }
+
+    private fun setTabInUse(tab: Tab, inUse: Boolean) {
+        tab.inUse = inUse
+        publishAgentBusy()
+    }
+
+    fun releaseAllTabs() {
+        _tabs.value = _tabs.value.map { tab ->
+            setTabInUse(tab, false)
+            tab
+        }
+        publishAgentBusy()
+    }
+
+    private fun updateTabs() {
+        _tabs.value = _tabs.value.toList()
+        publishAgentBusy()
+    }
+}
+"""
+BUSY_SHEET_COMPLIANT = """package com.rikkaminis.app.ui.browser
+
+@Composable
+fun BrowserSheet(tabPool: BrowserTabPool) {
+    val isAgentBusy by tabPool.agentBusy.collectAsState()
+    Button(enabled = !isAgentBusy) { Text("x") }
+}
+"""
+BUSY_V_NO_FLOW = BUSY_COMPLIANT.replace(
+    "    val agentBusy: StateFlow<Boolean> = _agentBusy.asStateFlow()\n", "")
+BUSY_V_GETTER_BACK = BUSY_COMPLIANT.replace(
+    "    val agentBusy: StateFlow<Boolean> = _agentBusy.asStateFlow()",
+    "    val agentBusy: StateFlow<Boolean> = _agentBusy.asStateFlow()\n"
+    "    val isAgentBusy: Boolean get() = _agentBusy.value")
+BUSY_V_STALE_PUBLISH = BUSY_COMPLIANT.replace(
+    "        _agentBusy.value = _tabs.value.any { it.inUse }",
+    "        _agentBusy.value = true")
+BUSY_V_WRITE_BYPASSES_FUNNEL = BUSY_COMPLIANT.replace(
+    "        _tabs.value = _tabs.value.map { tab ->\n"
+    "            setTabInUse(tab, false)\n"
+    "            tab\n"
+    "        }",
+    "        _tabs.value = _tabs.value.map { tab ->\n"
+    "            tab.inUse = false\n"
+    "            tab\n"
+    "        }")
+BUSY_V_FUNNEL_NO_PUBLISH = BUSY_COMPLIANT.replace(
+    "    private fun setTabInUse(tab: Tab, inUse: Boolean) {\n"
+    "        tab.inUse = inUse\n"
+    "        publishAgentBusy()\n"
+    "    }",
+    "    private fun setTabInUse(tab: Tab, inUse: Boolean) {\n"
+    "        tab.inUse = inUse\n"
+    "    }")
+BUSY_V_UPDATETABS_NO_PUBLISH = BUSY_COMPLIANT.replace(
+    "    private fun updateTabs() {\n"
+    "        _tabs.value = _tabs.value.toList()\n"
+    "        publishAgentBusy()\n"
+    "    }",
+    "    private fun updateTabs() {\n"
+    "        _tabs.value = _tabs.value.toList()\n"
+    "    }")
+BUSY_V_COPY_INSTANCE = BUSY_COMPLIANT.replace(
+    "        tab.inUse = inUse\n        publishAgentBusy()",
+    "        publishAgentBusy()").replace(
+    "            setTabInUse(tab, false)",
+    "            val cleared = tab.copy(inUse = false)")
+BUSY_V_NO_PUBLISHER = BUSY_COMPLIANT.replace(
+    "    private fun publishAgentBusy() {\n"
+    "        _agentBusy.value = _tabs.value.any { it.inUse }\n"
+    "    }\n\n", "")
+BUSY_SHEET_V_GETTER = BUSY_SHEET_COMPLIANT.replace(
+    "    val isAgentBusy by tabPool.agentBusy.collectAsState()",
+    "    val isAgentBusy = tabPool.isAgentBusy")
+
+busy_arms = [
+    ("C9 compliant busy signal", BUSY_COMPLIANT, BUSY_SHEET_COMPLIANT, []),
+    ("C9a reactive face removed", BUSY_V_NO_FLOW, BUSY_SHEET_COMPLIANT, ["C9"]),
+    ("C9a non-reactive getter restored", BUSY_V_GETTER_BACK, BUSY_SHEET_COMPLIANT, ["C9"]),
+    ("C9b publish no longer re-derived", BUSY_V_STALE_PUBLISH, BUSY_SHEET_COMPLIANT, ["C9"]),
+    ("C9c write bypasses the funnel", BUSY_V_WRITE_BYPASSES_FUNNEL, BUSY_SHEET_COMPLIANT, ["C9"]),
+    ("C9c funnel stops publishing", BUSY_V_FUNNEL_NO_PUBLISH, BUSY_SHEET_COMPLIANT, ["C9"]),
+    ("C9d updateTabs stops re-deriving", BUSY_V_UPDATETABS_NO_PUBLISH, BUSY_SHEET_COMPLIANT, ["C9"]),
+    ("C9e release copies the Tab (audit-b21)", BUSY_V_COPY_INSTANCE, BUSY_SHEET_COMPLIANT, ["C9"]),
+    ("C9b publisher missing (fail-closed)", BUSY_V_NO_PUBLISHER, BUSY_SHEET_COMPLIANT, ["C9"]),
+    ("C9f sheet reads the getter", BUSY_COMPLIANT, BUSY_SHEET_V_GETTER, ["C9"]),
+]
+
 def selftest() -> int:
     compliant = """package com.rikkaminis.app.data.storage
 
@@ -542,15 +756,48 @@ def selftest() -> int:
  * The doc mentions browser_tabs/<sid>.json and browserTabFile( freely —
  * block comments are stripped, so none of this satisfies any criterion.
  */
+private const val DRAFT_ID_PREFIX = "__new__"
+
 class SessionFileStore internal constructor(
     private val filesDirForTestingOrProd: File,
+    private val activeDraftIds: () -> Set<String> = { emptySet() },
 ) {
+    constructor(context: Context) : this(
+        context.filesDir,
+        { ComposerDraftStore.activeDraftIds(context) },
+    )
     val sessionsRoot: File = File(filesDirForTestingOrProd, "minis-sessions")
     private val mediaRoot: File = File(filesDirForTestingOrProd, "media")
     private val browserTabsRoot: File = File(filesDirForTestingOrProd, "browser_tabs")
 
     fun sessionDir(sessionId: String): File = File(sessionsRoot, sessionId)
     fun browserTabFile(sessionId: String): File = File(browserTabsRoot, "$sessionId.json")
+
+    private fun looksLikeSessionId(name: String): Boolean {
+        val uuid = if (name.startsWith(DRAFT_ID_PREFIX)) name.substring(DRAFT_ID_PREFIX.length) else name
+        return uuid.length == 36 && uuid.count { it == '-' } == 4
+    }
+
+    private fun withActiveComposerOwner(liveSessionIds: Set<String>): Set<String> {
+        val draftIds = activeDraftIds()
+        if (draftIds.isEmpty()) return liveSessionIds
+        return liveSessionIds + draftIds
+    }
+
+    fun scanMediaOnce(liveSessionIds: Set<String>): MediaScan {
+        val live = withActiveComposerOwner(liveSessionIds)
+        return MediaScan(emptyMap(), 0, 0L)
+    }
+
+    fun scanOrphanSessionDirs(liveSessionIds: Set<String>): ReclaimReport {
+        val live = withActiveComposerOwner(liveSessionIds)
+        return ReclaimReport()
+    }
+
+    fun scanOrphans(liveSessionIds: Set<String>): ReclaimReport {
+        val live = withActiveComposerOwner(liveSessionIds)
+        return scanOrphanSessionDirs(live)
+    }
 
     // delete the tab file alongside the session dir (line comment mentions
     // browserTabFile( — stripped, must not satisfy C2 by itself)
@@ -564,9 +811,10 @@ class SessionFileStore internal constructor(
     }
 
     fun reclaimOrphans(liveSessionIds: Set<String>): ReclaimReport {
-        val report = scanOrphans(liveSessionIds)
-        deleteOrphanMediaLeaves(liveSessionIds)
-        deleteOrphanBrowserTabFiles(liveSessionIds)
+        val live = withActiveComposerOwner(liveSessionIds)
+        val report = scanOrphans(live)
+        deleteOrphanMediaLeaves(live)
+        deleteOrphanBrowserTabFiles(live)
         return report
     }
 
@@ -574,7 +822,7 @@ class SessionFileStore internal constructor(
         if (!browserTabsRoot.exists()) return
         browserTabsRoot.listFiles()?.forEach { file ->
             val stem = file.name.removeSuffix(".json")
-            val isSessionShaped = looksLikeSessionId(stem) || stem.startsWith("__new__")
+            val isSessionShaped = looksLikeSessionId(stem)
             if (isSessionShaped && stem !in liveSessionIds) file.delete()
         }
     }
@@ -587,7 +835,7 @@ class SessionFileStore internal constructor(
         "        val sessionDeleted = deleteRecursivelyChecked(sessionDir(sessionId))",
     )
     # V2: orphan reclaim loses the browser_tabs half
-    v2 = compliant.replace("        deleteOrphanBrowserTabFiles(liveSessionIds)\n", "")
+    v2 = compliant.replace("        deleteOrphanBrowserTabFiles(live)\n", "")
     # V3: no browser_tabs at all (regression to the defect status quo)
     v3 = """package com.rikkaminis.app.data.storage
 
@@ -623,10 +871,39 @@ class SessionFileStore internal constructor(
         " */\n"
         "class SessionFileStore",
     )
-    # V5: orphan cleanup loses the __new__ draft branch
+    # V5: the shape predicate loses the draft namespace (C7)
     v5 = compliant.replace(
-        "            val isSessionShaped = looksLikeSessionId(stem) || stem.startsWith(\"__new__\")",
+        "        val uuid = if (name.startsWith(DRAFT_ID_PREFIX)) name.substring(DRAFT_ID_PREFIX.length) else name\n"
+        "        return uuid.length == 36 && uuid.count { it == '-' } == 4",
+        "        return name.length == 36 && name.count { it == '-' } == 4",
+    )
+    # V6: the draft literal is duplicated back at a call site (C7 single source)
+    v6 = compliant.replace(
         "            val isSessionShaped = looksLikeSessionId(stem)",
+        "            val isSessionShaped = looksLikeSessionId(stem) || stem.startsWith(\"__new__\")",
+    )
+    # V7: one orphan entry point stops widening (C8)
+    v7 = compliant.replace(
+        "    fun scanOrphans(liveSessionIds: Set<String>): ReclaimReport {\n"
+        "        val live = withActiveComposerOwner(liveSessionIds)\n",
+        "    fun scanOrphans(liveSessionIds: Set<String>): ReclaimReport {\n",
+    )
+    # V8: the Context constructor wires a hardcoded provider (C8)
+    v8 = compliant.replace(
+        "        { ComposerDraftStore.activeDraftIds(context) },",
+        "        { emptySet() },",
+    )
+    # V9: the widener keeps its shape but stops consulting the provider (C8)
+    v9 = compliant.replace(
+        "        val draftIds = activeDraftIds()\n"
+        "        if (draftIds.isEmpty()) return liveSessionIds\n"
+        "        return liveSessionIds + draftIds",
+        "        return liveSessionIds",
+    )
+    # V10: the orphan body bypasses the shape predicate entirely (C3)
+    v10 = compliant.replace(
+        "            val isSessionShaped = looksLikeSessionId(stem)",
+        "            val isSessionShaped = stem.isNotEmpty()",
     )
 
     arms = [
@@ -635,7 +912,12 @@ class SessionFileStore internal constructor(
         ("V2 orphan reclaim missing browser_tabs", v2, ["C3"]),
         ("V3 regression to defect status quo", v3, ["C1"]),
         ("V4 KDoc-only mention (comment trap)", v4, ["C1", "C2", "C3"]),
-        ("V5 orphan cleanup misses __new__ branch", v5, ["C3"]),
+        ("V5 predicate lost the __new__ draft namespace", v5, ["C7"]),
+        ("V6 draft literal duplicated at a call site", v6, ["C7"]),
+        ("V7 orphan entry stops widening the live set", v7, ["C8"]),
+        ("V8 hardcoded draft provider", v8, ["C8"]),
+        ("V9 widener stops consulting the provider", v9, ["C8"]),
+        ("V10 orphan body bypasses the shape predicate", v10, ["C3"]),
     ]
     failures = 0
     for name, sample, expect in arms:
@@ -679,6 +961,21 @@ class SessionFileStore internal constructor(
             failures += 1
         else:
             print(f"  OK {name}: {errs if errs else 'green'}")
+    # --- [da1040-B2] C9 arms: busy-signal observability (own fixtures) ---
+    for name, p, sh, expect in busy_arms:
+        errs = check_busy_source(p, sh)
+        if expect == [] and errs:
+            print(f"  FAIL {name}: expected green, got {errs}")
+            failures += 1
+        elif expect != [] and not errs:
+            print(f"  FAIL {name}: expected red, got green")
+            failures += 1
+        elif expect != [] and not any(err.startswith(c) for c in expect for err in errs):
+            print(f"  FAIL {name}: expected {expect}, got {errs}")
+            failures += 1
+        else:
+            print(f"  OK {name}: {errs if errs else 'green'}")
+
     if failures:
         print(f"SELFTEST FAILED ({failures} arms)")
         return 1
@@ -718,14 +1015,24 @@ def main() -> int:
         pool_src = open(pool_path).read()
     except OSError as e:
         errs.append(f"C4: cannot read BrowserTabPool.kt: {e}")
+        pool_src = None
     else:
         errs += check_pool_source(pool_src)
+    # [da1040-B2] C9 — the pool AND its consumer face (fail-closed).
+    sheet_path = os.path.join(root, SHEET_REL)
+    try:
+        sheet_src = open(sheet_path).read()
+    except OSError as e:
+        errs.append(f"C9: cannot read BrowserSheet.kt: {e}")
+    else:
+        if pool_src is not None:
+            errs += check_busy_source(pool_src, sheet_src)
     if errs:
         print("browser_tabs_lifecycle_check RED:")
         for e in errs:
             print(f"  - {e}")
         return 1
-    print("browser_tabs_lifecycle_check OK (criteria: C1-C3 store lifecycle + C4/C4d pool teardown + window.open/close persistence + C5 risk notice reaches the agent text + C6 setSession re-points downloads atomically)")
+    print("browser_tabs_lifecycle_check OK (criteria: C1-C3 store lifecycle + C4/C4d pool teardown + window.open/close persistence + C5 risk notice reaches the agent text + C6 setSession re-points downloads atomically + C7 the session-shape predicate alone carries the draft alias + C8 every orphan entry folds the composer's active draft in + C9 the pool's busy signal is funnelled and observable)")
     return 0
 
 

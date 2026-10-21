@@ -65,7 +65,7 @@ Selftest ends with the tooth marker ENVVAR_GROUP_SELFTEST=PASS (missing marker
 import os
 import re
 import shutil
-import sys
+import sys  # [dv20-a1 A-02] fixture re-anchor
 import tempfile
 
 # --------------------------------------------------------------------------
@@ -412,6 +412,49 @@ def check_reverse_anchors(backup_src: str, builtins_src: str) -> str | None:
     return None
 
 
+def check_sentinel_remap(backup_src: str) -> str | None:
+    """Criterion 12 [dv20-a1 A-02]: the Stage 2 group-member remap keeps the
+    virtual System voice ids instead of counting them as dropped members."""
+    text = strip_comments(backup_src)
+    drops = [m.start() for m in re.finditer(r"else\s+droppedMembers\+\+", text)]
+    if not drops:
+        return (
+            "C12 EXTRACT_FAIL: ConfigBackup group-member remap "
+            "(`else droppedMembers++`) not found (fail-closed)"
+        )
+    for pos in drops:
+        if "SystemVoiceEntries.isSystemEntryId" not in text[max(0, pos - 400):pos]:
+            return (
+                "C12 RED: the member remap drops a member whenever the entry map has "
+                "no mapping — the virtual System voice ids are never in that map, so "
+                "every voice-group member counts as a dropped member; the remap must "
+                "consult SystemVoiceEntries.isSystemEntryId (single source)"
+            )
+    if "__builtin_system_speech__" in backup_src:
+        return (
+            "C12 RED: ConfigBackup spells the System sentinel id literal instead of "
+            "going through SystemVoiceEntries — the id must have one home"
+        )
+    return None
+
+def check_group_member_resolution(builtins_src: str) -> str | None:
+    """Criterion 13 [dv20-a1 A-02]: the `groups` config summary resolves the
+    virtual System voice entries instead of emitting a "missing" stub."""
+    text = strip_comments(builtins_src)
+    if "SystemVoiceEntries.resolve(" not in text:
+        return (
+            "C13 RED: the `groups` config summary never calls "
+            "SystemVoiceEntries.resolve — a virtual System voice member is rendered "
+            "as a missing model row even though chat resolves it fine"
+        )
+    if "__builtin_system_speech__" in builtins_src:
+        return (
+            "C13 RED: ConfigBuiltins spells the System sentinel id literal instead of "
+            "going through SystemVoiceEntries — the id must have one home"
+        )
+    return None
+
+
 def check(envvars_path: str, builtins_path: str, groups_path: str,
           backup_path: str | None = None) -> list[str]:
     with open(envvars_path, encoding="utf-8") as f:
@@ -445,6 +488,8 @@ def check(envvars_path: str, builtins_path: str, groups_path: str,
             lambda: check_overlay_registration(cb),
             lambda: check_overlay_single_source(cb),
             lambda: check_reverse_anchors(bk, cb),
+            lambda: check_sentinel_remap(bk),
+            lambda: check_group_member_resolution(cb),
         ):
             r = fn()
             if r is not None:
@@ -622,7 +667,9 @@ object ConfigBuiltins {
                                     "fallback_strategy" to ConfigValue.Str(g.fallbackStrategy.name),
                                     "default_thinking_level" to (g.defaultThinkingLevel?.let { ConfigValue.Str(it) } ?: ConfigValue.Null),
                                     "context_limit_tokens" to (g.contextLimitTokens?.let { ConfigValue.Int(it) } ?: ConfigValue.Null),
-                                    "entries" to ConfigValue.Arr(g.memberEntryIds.map { ConfigValue.Str(it) }),
+                                    "entries" to ConfigValue.Arr(g.memberEntryIds.map { memberId ->
+                                        ConfigValue.Str(SystemVoiceEntries.resolve(memberId)?.id ?: memberId)
+                                    }),
                                 )
                             )
                         }
@@ -636,6 +683,19 @@ object ConfigBuiltins {
 
 
 FIXTURE_BACKUP_OK = '''package fake
+
+private fun remapGroupMembers(
+    entryIdMap: Map<String, String>,
+    srcMembers: List<String>,
+    out: MutableList<String>,
+): Int {
+    var droppedMembers = 0
+    for (old in srcMembers) {
+        val mapped = entryIdMap[old] ?: old.takeIf { SystemVoiceEntries.isSystemEntryId(it) }
+        if (mapped != null) out.add(mapped) else droppedMembers++
+    }
+    return droppedMembers
+}
 
 object ConfigBackup {
     internal val BACKED_UP_SCOPES = setOf(
@@ -981,11 +1041,12 @@ def run_fixtures() -> bool:
     )
 
     # FIX-16 (fail-closed control): the scope set is gone -> C8 + C11 refuse
+    # (the minimal source has no member remap either, so C12 refuses too)
     ok &= full_arm(
         "FIX-16 backup-anchor-absent",
         BUILTINS_OK4,
         "package fake\n\nobject ConfigBackup {\n}\n",
-        ("C8 EXTRACT_FAIL:", "C11 EXTRACT_FAIL:"),
+        ("C8 EXTRACT_FAIL:", "C11 EXTRACT_FAIL:", "C12 EXTRACT_FAIL:"),
     )
 
     # FIX-17 (reverse anchor): a legacy scope is swapped out -> exactly C11
@@ -1004,6 +1065,80 @@ def run_fixtures() -> bool:
         FIXTURE_BACKUP_OK,
         ("C11 RED:",),
     )
+
+    # ── [dv20-a1 A-02] sentinel-preservation arms ─────────────────────────
+    SENTINEL_BACKUP_OK = '''
+package fake.config
+
+import com.rikkaminis.app.data.model.SystemVoiceEntries
+
+object ConfigBackup {
+    private fun remapMembers(entryIdMap: Map<String, String>, srcMembers: List<String>): Int {
+        var droppedMembers = 0
+        for (old in srcMembers) {
+            val mapped = entryIdMap[old]
+                ?: old.takeIf { SystemVoiceEntries.isSystemEntryId(it) }
+            if (mapped != null) members.add(mapped) else droppedMembers++
+        }
+        return droppedMembers
+    }
+}
+'''
+
+    SENTINEL_BUILTINS_OK = '''
+package fake.config
+
+import com.rikkaminis.app.data.model.SystemVoiceEntries
+
+object ConfigBuiltins {
+    fun groupsSummary(entriesById: Map<String, Any>): List<Any> {
+        val entryIds = listOf("a")
+        return entryIds.map { entryId ->
+            val e = entriesById[entryId] ?: SystemVoiceEntries.resolve(entryId)
+            if (e == null) listOf("entry_id", entryId, "missing") else listOf("entry_id", entryId)
+        }
+    }
+}
+'''
+
+    def sentinel_arm(label: str, source: str, fn, want) -> bool:
+        r = fn(source)
+        got = [] if r is None else [r]
+        if want is None:
+            if got:
+                print(f"[SELFTEST] {label}: expected GREEN, got {got}")
+                return False
+            print(f"[SELFTEST] {label}: GREEN as expected")
+            return True
+        if len(got) != 1 or not got[0].startswith(want):
+            print(f"[SELFTEST] {label}: expected exactly one {want!r}, got {got}")
+            return False
+        print(f"[SELFTEST] {label}: red as expected ({got[0]})")
+        return True
+
+    ok &= sentinel_arm("FIX-19 sentinel-preserving remap", SENTINEL_BACKUP_OK,
+                       check_sentinel_remap, None)
+    ok &= sentinel_arm(
+        "FIX-20 remap drops the sentinels",
+        SENTINEL_BACKUP_OK.replace(
+            "                ?: old.takeIf { SystemVoiceEntries.isSystemEntryId(it) }\n", ""),
+        check_sentinel_remap, "C12 RED:")
+    ok &= sentinel_arm("FIX-21 remap anchor absent",
+                       "package fake\n\nobject ConfigBackup {\n}\n",
+                       check_sentinel_remap, "C12 EXTRACT_FAIL:")
+    ok &= sentinel_arm("FIX-22 summary resolves the members", SENTINEL_BUILTINS_OK,
+                       check_group_member_resolution, None)
+    ok &= sentinel_arm(
+        "FIX-23 summary emits the missing stub",
+        SENTINEL_BUILTINS_OK.replace(" ?: SystemVoiceEntries.resolve(entryId)", ""),
+        check_group_member_resolution, "C13 RED:")
+    ok &= sentinel_arm(
+        "FIX-24 sentinel literal re-spelled",
+        SENTINEL_BUILTINS_OK.replace(
+            "        val entryIds = listOf(\"a\")",
+            "        val pinned = \"__builtin_system_speech__\"\n"
+            "        val entryIds = listOf(\"a\")"),
+        check_group_member_resolution, "C13 RED:")
 
     for dd in fds:
         shutil.rmtree(dd, ignore_errors=True)
@@ -1030,7 +1165,7 @@ def main() -> int:
             print(f)
         print(f"envvar_config_group_check: {len(failures)} violation(s)")
         return 1
-    print("envvar_config_group_check: OK (11 criteria green)")
+    print("envvar_config_group_check: OK (13 criteria green)")
     return 0
 
 

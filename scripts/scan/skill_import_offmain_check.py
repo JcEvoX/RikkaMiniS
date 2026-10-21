@@ -33,6 +33,24 @@ gate; no new gate, no new SELFTEST marker):
         `val initialContent = remember` must still be present in the file
         (skill_frontmatter_roundtrip_check.py pins that literal).
 
+deep-audit-1040 B-04 (P1) arms added to the same gate (B2 owns only this gate;
+no new gate, no new SELFTEST marker):
+  arm7  every call to a repository / Keystore-store method that performs disk
+        I/O runs OFF Main — in the MCP settings screen AND in both per-session
+        sheets (SessionSkillsSheet / SessionMcpsSheet). "Performs disk I/O" is
+        derived from the callee's own body (brace-matched, comments stripped,
+        one delegation hop) instead of from a literal method list, so a
+        brand-new IO method invoked bare is caught while a genuinely pure one
+        (`exportServerJSON` / `previewImport` — JSONObject work only) stays
+        legal on Main. Fail-closed twice: a (file, call-prefix) pair with no
+        call site at all means the anchor lost its subject, and a called method
+        with no declaration to judge cannot be proven pure.
+  arm8  the OAuth seeding effect's keys must COVER the draft remember's keys.
+        `remember(editServer)` + `LaunchedEffect(editServer?.id)` resets the
+        draft to "" whenever an edit changes the server but keeps its id, and
+        the reader never re-runs — the form then shows an empty client secret
+        while storage still holds one.
+
 Limits (deliberate, documented so they are not mistaken for coverage):
   * the repository-side alternative resolves the method body plus ONE
     delegation hop (`fun reloadFromDisk() = load()` / `{ loadAll() }`), not a
@@ -377,6 +395,220 @@ def check_reload(files):
     return failures
 
 
+# [deep-audit-1040 B-04] The MCP settings screen plus the two per-session
+# sheets. Same defect class as arm6 one file over.
+MCP_OAUTH_REL = ("src/android/app/src/main/java/com/rikkaminis/app/mcp/oauth/"
+                 "MCPOAuthStore.kt")
+SHEET_SKILLS_REL = ("src/android/app/src/main/java/com/rikkaminis/app/ui/chat/"
+                    "SessionSkillsSheet.kt")
+SHEET_MCPS_REL = ("src/android/app/src/main/java/com/rikkaminis/app/ui/chat/"
+                  "SessionMcpsSheet.kt")
+
+# (screen file, callee prefix, file that declares those methods)
+B04_CALL_SITES = (
+    (MCP_REL, "mcpRepository.", MCP_REPO_REL),
+    (MCP_REL, "MCPOAuthStore.", MCP_OAUTH_REL),
+    (SHEET_SKILLS_REL, "skillRepository.", SKILL_REPO_REL),
+    (SHEET_MCPS_REL, "mcpRepository.", MCP_REPO_REL),
+)
+
+# Tokens that mean "this body reaches the disk (or Keystore-backed prefs)".
+IO_MARKERS = (
+    "File(", "rawQuery(", "execSQL(", "readText(", "writeText(", "readLines(",
+    "mkdirs(", "deleteRecursively(", "renameTo(", "listFiles(", "walkTopDown(",
+    "openFileOutput(", "openFileInput(", "contentResolver",
+    "EncryptedSharedPreferences", "SharedPreferences", ".edit()", "prefs(",
+    "save()", "deleteBridgeFile(", "writeBridgeFile(", "reconcileForServer(",
+)
+
+
+def _fun_body_nc(text_nc, masked, name):
+    """(body text, 'block'|'expr') for `fun <name>(...)`; (None, reason) if the
+    declaration is absent or its body form is not recognised."""
+    m = re.search(r"\bfun\s+%s\s*\(" % re.escape(name), text_nc)
+    if not m:
+        return None, "no `fun %s(` declaration in this file" % name
+    i = m.end()
+    depth = 1
+    while i < len(masked) and depth:
+        if masked[i] == "(":
+            depth += 1
+        elif masked[i] == ")":
+            depth -= 1
+        i += 1
+    body_open = masked.find("{", i)
+    stop = body_open if body_open >= 0 else len(masked)
+    k = i
+    while k < stop:
+        if masked[k] == "=" and masked[k - 1:k] not in ("=", "!", "<", ">") \
+                and masked[k + 1:k + 2] != "=":
+            return text_nc[k:].split("\n", 1)[0], "expr"
+        if masked[k] == "\n":
+            break
+        k += 1
+    if body_open < 0:
+        return None, "`%s`: body form not recognised" % name
+    return text_nc[body_open:_match_brace(masked, body_open)], "block"
+
+
+def method_io_state(text, name, hops=2, _seen=None):
+    """('io'|'pure'|'unknown', reason) — does `fun <name>` reach the disk?
+
+    Direct evidence is an IO_MARKERS token in the body; otherwise follow up to
+    `hops` delegation steps into callees declared in the same file. Callees
+    that are NOT declared here (stdlib collectors, renames) end the walk rather
+    than counting as I/O, so a body that merely maps/filters is not misread.
+    The caller treats 'unknown' as I/O for the *top-level* call site only —
+    that is the fail-closed half of this arm.
+    """
+    seen = set() if _seen is None else _seen
+    if name in seen:
+        return "pure", "recursion"
+    seen.add(name)
+    nc = strip_comments(text)
+    masked = mask_strings(nc)
+    body, kind = _fun_body_nc(nc, masked, name)
+    if body is None:
+        return "unknown", kind
+    for marker in IO_MARKERS:
+        if marker in body:
+            return "io", "`%s` body uses `%s`" % (name, marker)
+    if hops > 0:
+        # Only follow BARE calls (`save()`, `parseImportRoot(x)`). A member call
+        # (`list.add(…)`, `root.keys()`) must not resolve to a same-named
+        # declaration in the repository — that name collision is exactly how
+        # `previewImport` got misread as I/O through `MutableList.add` →
+        # `fun add(server)` → `save()`.
+        for cm in re.finditer(r"(?<![.\w])([A-Za-z_][A-Za-z0-9_]*)\s*\(", body):
+            callee = cm.group(1)
+            if callee == name:
+                continue
+            state, why = method_io_state(text, callee, hops - 1, seen)
+            if state == "io":
+                return "io", why
+    return "pure", "`%s` (%s body) has no I/O marker" % (name, kind)
+
+
+def check_b04_offmain(files):
+    """arm7: every disk-I/O repository / store call in the B-04 files is OFF Main.
+
+    The criterion is the decision point (does this call touch disk, and on
+    which dispatcher does it run), so the repository-side alternative accepted
+    by arms 3/4 also passes: a call site may be bare when the callee wraps its
+    own work in `withContext(Dispatchers.IO)`.
+    """
+    failures = []
+    for screen_rel, prefix, decl_rel in B04_CALL_SITES:
+        text = files.get(screen_rel)
+        if text is None:
+            failures.append("missing file %s" % screen_rel)
+            continue
+        nc = strip_comments(text)
+        masked = mask_strings(nc)
+        hits = list(re.finditer(re.escape(prefix) + r"([A-Za-z_]\w*)\s*\(", nc))
+        if not hits:
+            failures.append(
+                "%s: no `%s<method>(` call site found — the B-04 anchor lost its "
+                "subject (fail-closed)" % (screen_rel, prefix))
+            continue
+        decl = files.get(decl_rel)
+        if decl is None:
+            failures.append(
+                "missing file %s (cannot judge the I/O-ness of the `%s` calls in "
+                "%s)" % (decl_rel, prefix, screen_rel))
+            continue
+        for m in hits:
+            method = m.group(1)
+            state, why = method_io_state(decl, method)
+            if state == "pure":
+                continue
+            if _io_wrapped_at(nc, masked, m.start(), IO_OPENERS):
+                continue
+            alt, _ = repo_method_wraps_io(decl, method)
+            if alt:
+                continue
+            line = nc[:m.start()].count("\n") + 1
+            failures.append(
+                "%s: `%s%s(` at line %d runs on Main while its callee performs "
+                "disk I/O (%s) — wrap it in withContext(Dispatchers.IO), or move "
+                "the IO into the repository/store method (the criterion is the "
+                "dispatcher the call runs on, not the spelling)"
+                % (screen_rel, prefix, method, line, why))
+    return failures
+
+
+def _launched_effects(nc, masked):
+    """[(key tokens, body text)] for every `LaunchedEffect(...) { ... }`."""
+    out = []
+    for m in re.finditer(r"\bLaunchedEffect\s*\(", nc):
+        start = m.end()
+        depth = 1
+        i = start
+        while i < len(masked) and depth:
+            if masked[i] == "(":
+                depth += 1
+            elif masked[i] == ")":
+                depth -= 1
+            i += 1
+        if depth:
+            continue
+        keys = [k.strip() for k in nc[start:i - 1].split(",") if k.strip()]
+        op = masked.find("{", i)
+        if op < 0:
+            continue
+        out.append((keys, nc[op:_match_brace(masked, op)]))
+    return out
+
+
+SEED_DRAFT_MARKERS = (
+    "var oauthClientSecret by remember",
+    "var oauthAuthorizedSeed by remember",
+)
+
+
+def check_seed_effect_keys(files):
+    """arm8: a seed draft's `remember` keys must be COVERED by the keys of the
+    LaunchedEffect that seeds it (direction matters: a narrower effect stops
+    re-running on a change the draft still re-derives on).
+    """
+    text = files.get(MCP_REL)
+    if text is None:
+        return ["missing file %s" % MCP_REL]
+    nc = strip_comments(text)
+    masked = mask_strings(nc)
+    found = False
+    for marker in SEED_DRAFT_MARKERS:
+        idx = nc.find(marker)
+        if idx < 0:
+            continue
+        found = True
+        j = idx + len(marker)
+        while j < len(nc) and nc[j] in " \t":
+            j += 1
+        keys = [] if nc[j:j + 1] == "{" else _remember_keys(nc, marker)
+        if keys is None:
+            keys = []
+        if not keys:
+            return ["%s: `%s` carries no remember key — the draft never re-seeds "
+                    "when the edited server changes" % (MCP_REL, marker)]
+        subject = marker.split(" by ")[0].replace("var ", "")
+        effects = [(k, b) for k, b in _launched_effects(nc, masked)
+                   if "%s =" % subject in b]
+        if len(effects) != 1:
+            return ["%s: expected exactly 1 LaunchedEffect seeding `%s`, found %d "
+                    "— fail-closed" % (MCP_REL, subject, len(effects))]
+        missing = [k for k in keys if k not in effects[0][0]]
+        if missing:
+            return ["%s: `%s` is keyed %s but the LaunchedEffect seeding it is "
+                    "keyed %s (missing %s) — an editServer change that keeps the "
+                    "id resets the draft and the reader never re-runs"
+                    % (MCP_REL, marker, keys, effects[0][0], missing)]
+    if not found:
+        return ["%s: neither OAuth seed draft (`%s`) was found — fail-closed"
+                % (MCP_REL, "` / `".join(SEED_DRAFT_MARKERS))]
+    return []
+
+
 def check_editor_keys(files):
     """arm5: the skill editor's remember keys + shape anchor literal."""
     text = files.get(EDITOR_REL)
@@ -480,12 +712,15 @@ def run_checks_map(files):
     failures.extend(check_all_repo_calls(files))
     failures.extend(check_editor_keys(files))
     failures.extend(check_editor_key_alignment(files))
+    failures.extend(check_b04_offmain(files))
+    failures.extend(check_seed_effect_keys(files))
     return failures
 
 
 def run_checks(repo_root):
     files = {}
-    for rel in (SM_REL, MCP_REL, SKILL_REPO_REL, MCP_REPO_REL):
+    for rel in (SM_REL, MCP_REL, SKILL_REPO_REL, MCP_REPO_REL, MCP_OAUTH_REL,
+                SHEET_SKILLS_REL, SHEET_MCPS_REL):
         try:
             files[rel] = _read(repo_root, rel)
         except OSError:
@@ -580,15 +815,33 @@ def _sm_text(
     )
 
 
-def _mcp_text(reload_io=True):
+def _mcp_text(reload_io=True, oauth_io=True, seed_aligned=True, extra=""):
     body = (
         "        withContext(Dispatchers.IO) {\n"
         "            mcpRepository.reloadFromDisk()\n"
         "        }\n"
     ) if reload_io else "        mcpRepository.reloadFromDisk()\n"
+    oauth = (
+        "    scope.launch {\n"
+        "        withContext(Dispatchers.IO) {\n"
+        "            MCPOAuthStore.setClientSecret(context, id, \"\")\n"
+        "        }\n"
+        "    }\n"
+    ) if oauth_io else "    MCPOAuthStore.setClientSecret(context, id, \"\")\n"
+    effect_key = "editServer" if seed_aligned else "editServer?.id"
     return (
         "package com.rikkaminis.app.ui.settings\n\n"
-        "fun sample() {\n    LaunchedEffect(Unit) {\n" + body + "    }\n}\n"
+        "fun sample() {\n    LaunchedEffect(Unit) {\n" + body + "    }\n"
+        + oauth
+        + "    var oauthClientSecret by remember(editServer) { mutableStateOf(\"\") }\n"
+        + "    LaunchedEffect(" + effect_key + ") {\n"
+        + "        val s = withContext(Dispatchers.IO) {\n"
+        + "            MCPOAuthStore.clientSecret(context, id)\n"
+        + "        }\n"
+        + "        oauthClientSecret = s ?: \"\"\n"
+        + "    }\n"
+        + extra
+        + "}\n"
     )
 
 
@@ -638,12 +891,174 @@ fun load() {
 fun reloadFromDisk() = load()
 '''
 
-def _files(sm=None, mcp=None, skill_repo=None, mcp_repo=None):
+# ── deep-audit-1040 B-04 fixtures ────────────────────────────────────────
+# The chat-side sheets write their per-session overrides through a SQLite
+# `INSERT OR REPLACE` / `DELETE` per row, and seed from one `rawQuery` per row.
+OAUTH_STORE_FIXTURE = '''package com.rikkaminis.app.mcp.oauth
+
+private fun prefs(context: Context): SharedPreferences =
+    EncryptedSharedPreferences.create(context, FILE)
+
+fun clientSecret(context: Context, server: String): String? =
+    prefs(context).getString(secretKey(server), null)
+
+fun setClientSecret(context: Context, server: String, secret: String?) {
+    prefs(context).edit().putString(secretKey(server), secret).apply()
+}
+'''
+
+
+def _sheet_skills_text(seed_io=True, write_io=True):
+    seed = (
+        "        val seeds = withContext(Dispatchers.IO) {\n"
+        "            ids.associateWith { skillRepository.isEnabledForSession(it, sessionId) }\n"
+        "        }\n"
+    ) if seed_io else (
+        "        val seeds = ids.associateWith {\n"
+        "            skillRepository.isEnabledForSession(it, sessionId)\n"
+        "        }\n"
+    )
+    write = (
+        "    scope.launch {\n"
+        "        withContext(Dispatchers.IO) {\n"
+        "            skillRepository.setSessionOverride(sessionId, \"a\", true)\n"
+        "        }\n"
+        "    }\n"
+    ) if write_io else (
+        "    skillRepository.setSessionOverride(sessionId, \"a\", true)\n"
+    )
+    return (
+        "package com.rikkaminis.app.ui.chat\n\n"
+        "fun sample(skills: List<String>, sessionId: String, scope: CoroutineScope) {\n"
+        "    val overrides = mutableStateMapOf<String, Boolean>()\n"
+        "    LaunchedEffect(skills, sessionId) {\n"
+        "        val ids = skills.map { it }\n"
+        + seed
+        + "        mergeSessionOverrides(\n"
+        + "            liveIds = ids,\n"
+        + "            overrides = overrides,\n"
+        + "            lookup = { seeds[it] ?: false },\n"
+        + "        )\n"
+        "    }\n"
+        + write
+        + "}\n"
+    )
+
+
+def _sheet_mcps_text(seed_io=True, write_io=True):
+    seed = (
+        "        val seeds = withContext(Dispatchers.IO) {\n"
+        "            missing.associateWith { mcpRepository.isEnabledForSession(it, sessionId) }\n"
+        "        }\n"
+    ) if seed_io else (
+        "        val seeds = missing.associateWith {\n"
+        "            mcpRepository.isEnabledForSession(it, sessionId)\n"
+        "        }\n"
+    )
+    write = (
+        "    scope.launch {\n"
+        "        withContext(Dispatchers.IO) {\n"
+        "            mcpRepository.setSessionOverride(sessionId, \"a\", true)\n"
+        "        }\n"
+        "    }\n"
+    ) if write_io else (
+        "    mcpRepository.setSessionOverride(sessionId, \"a\", true)\n"
+    )
+    return (
+        "package com.rikkaminis.app.ui.chat\n\n"
+        "fun sample(servers: List<String>, sessionId: String, scope: CoroutineScope) {\n"
+        "    val overrides = mutableStateMapOf<String, Boolean>()\n"
+        "    LaunchedEffect(servers, sessionId) {\n"
+        "        val missing = servers.filter { it !in overrides }\n"
+        + seed
+        + "        for (id in missing) overrides[id] = seeds[id] ?: false\n"
+        "    }\n"
+        + write
+        + "}\n"
+    )
+
+
+# Two declarations of the same entry points, differing only in where the disk
+# access sits: `MCP_REPO_FIX` keeps it in the method bodies (so a bare call site
+# is a real Main-thread I/O), `MCP_REPO_WRAPS_WRITE` wraps it internally (the
+# equivalent fix arms 3/4 accept).
+MCP_REPO_FIX = '''package com.rikkaminis.app.data.repository
+
+fun exportServerJSON(server: MCPServerConfig): String {
+    val o = JSONObject().put(server.id, entryToJson(server))
+    return o.toString(2)
+}
+
+private fun entryToJson(s: MCPServerConfig): JSONObject {
+    val o = JSONObject()
+    o.put("command", s.command)
+    return o
+}
+
+fun previewImport(text: String): Int = parseRoot(text).size
+
+private fun parseRoot(text: String): List<String> {
+    val root = JSONObject(text.trim())
+    return root.keys().asSequence().toList()
+}
+
+fun setEnabled(id: String, enabled: Boolean) {
+    save()
+}
+
+fun setSessionOverride(sessionId: String, mcpId: String, enabled: Boolean) {
+    db.execSQL("INSERT OR REPLACE INTO mcp_session_overrides VALUES (?, ?, ?)", null)
+}
+
+fun isEnabledForSession(mcpId: String, sessionId: String): Boolean {
+    val cursor = db.rawQuery("SELECT is_enabled FROM mcp_session_overrides", null)
+    cursor.close()
+    return false
+}
+
+private fun save() {
+    mcpDir.mkdirs()
+}
+'''
+
+MCP_REPO_WRAPS_WRITE = '''package com.rikkaminis.app.data.repository
+
+fun setEnabled(id: String, enabled: Boolean) {
+    withContext(Dispatchers.IO) {
+        save()
+    }
+}
+
+private fun save() {
+    mcpDir.mkdirs()
+}
+'''
+
+SKILL_REPO_FIX = '''package com.rikkaminis.app.data.repository
+
+fun isEnabledForSession(skillId: String, sessionId: String): Boolean {
+    val cursor = db.rawQuery("SELECT is_enabled FROM session_skill_overrides", null)
+    cursor.close()
+    return false
+}
+
+fun setSessionOverride(sessionId: String, skillId: String, enabled: Boolean) {
+    db.execSQL("INSERT OR REPLACE INTO session_skill_overrides VALUES (?, ?, ?)", null)
+}
+'''
+
+
+def _files(sm=None, mcp=None, skill_repo=None, mcp_repo=None, sheet_skills=None,
+           sheet_mcps=None, oauth_store=None):
     return {
         SM_REL: _sm_text() if sm is None else sm,
         MCP_REL: _mcp_text() if mcp is None else mcp,
         SKILL_REPO_REL: REPO_BARE if skill_repo is None else skill_repo,
         MCP_REPO_REL: MCP_REPO_BARE if mcp_repo is None else mcp_repo,
+        SHEET_SKILLS_REL: (_sheet_skills_text() if sheet_skills is None
+                           else sheet_skills),
+        SHEET_MCPS_REL: _sheet_mcps_text() if sheet_mcps is None else sheet_mcps,
+        MCP_OAUTH_REL: OAUTH_STORE_FIXTURE if oauth_store is None else oauth_store,
     }
 
 # ── arm6 [deep-audit-1039 B-05] fixtures ─────────────────────────────────
@@ -740,6 +1155,64 @@ ISSUE06_FIXTURES = [
 ]
 
 
+# ── arm7/arm8 [deep-audit-1040 B-04] fixtures ────────────────────────────
+B04_FIXTURES = [
+    # (label, files, expect_red, needle)
+    ("b04 clean: every disk-IO call off Main",
+     _files(), False, None),
+    ("b04 bare mcpRepository.setEnabled on Main",
+     _files(mcp=_mcp_text(extra='    mcpRepository.setEnabled("a", true)\n'),
+            mcp_repo=MCP_REPO_FIX),
+     True, "`mcpRepository.setEnabled(` at line"),
+    ("b04 bare MCPOAuthStore.setClientSecret on Main",
+     _files(mcp=_mcp_text(extra='    MCPOAuthStore.setClientSecret(context, "a", "")\n')),
+     True, "`MCPOAuthStore.setClientSecret(` at line"),
+    ("b04 precision: pure exportServerJSON stays legal on Main",
+     _files(mcp=_mcp_text(extra="    val j = mcpRepository.exportServerJSON(server)\n"),
+            mcp_repo=MCP_REPO_FIX),
+     False, None),
+    ("b04 precision: pure previewImport stays legal on Main",
+     _files(mcp=_mcp_text(extra="    val n = mcpRepository.previewImport(text)\n"),
+            mcp_repo=MCP_REPO_FIX),
+     False, None),
+    ("b04 precision: a member call does not resolve to a same-named fun",
+     _files(mcp=_mcp_text(extra="    val n = mcpRepository.previewImport(text)\n"),
+            mcp_repo=MCP_REPO_FIX + "\nprivate fun note() { out.add(1) }\n"),
+     False, None),
+    ("b04 alt branch: the repo method wraps internally",
+     _files(mcp=_mcp_text(extra='    mcpRepository.setEnabled("a", true)\n'),
+            mcp_repo=MCP_REPO_WRAPS_WRITE),
+     False, None),
+    ("b04 fail-closed: no declaration to judge",
+     _files(mcp=_mcp_text(extra="    mcpRepository.wipeEverything()\n"),
+            mcp_repo=MCP_REPO_FIX),
+     True, "no `fun wipeEverything(` declaration"),
+    ("b04 fail-closed: screen without repository calls",
+     _files(mcp="package x\n\nfun a() {}\n"),
+     True, "lost its subject"),
+    ("b04 sheet bare write on Main (skills)",
+     _files(sheet_skills=_sheet_skills_text(write_io=False), skill_repo=SKILL_REPO_FIX),
+     True, "SessionSkillsSheet"),
+    ("b04 sheet bare seed read on Main (skills)",
+     _files(sheet_skills=_sheet_skills_text(seed_io=False), skill_repo=SKILL_REPO_FIX),
+     True, "rawQuery("),
+    ("b04 sheet bare write on Main (mcps)",
+     _files(sheet_mcps=_sheet_mcps_text(write_io=False), mcp_repo=MCP_REPO_FIX),
+     True, "SessionMcpsSheet"),
+    ("b04 sheet bare seed read on Main (mcps)",
+     _files(sheet_mcps=_sheet_mcps_text(seed_io=False), mcp_repo=MCP_REPO_FIX),
+     True, "SessionMcpsSheet"),
+    ("b04 arm8: seed effect keyed narrower than the draft",
+     _files(mcp=_mcp_text(seed_aligned=False)),
+     True, "seeding it is keyed"),
+    ("b04 arm8: un-keyed draft never re-seeds",
+     _files(mcp=_mcp_text().replace(
+         "var oauthClientSecret by remember(editServer) {",
+         "var oauthClientSecret by remember {")),
+     True, "carries no remember key"),
+]
+
+
 def selftest():
     ok = True
     f = run_checks_text(GOOD_SM)
@@ -785,6 +1258,17 @@ def selftest():
         "" if good else "  UNEXPECTED %s" % f[:2]))
     ok &= good
 
+    for label, files, expect_red, needle in B04_FIXTURES:
+        f = run_checks_map(files)
+        red = len(f) > 0
+        good = (red == expect_red)
+        if good and expect_red and needle:
+            good = any(needle in x for x in f)
+        print("selftest 1040-B04 %-46s: %s%s" % (
+            label, "RED" if red else "CLEAN",
+            "" if good else "  UNEXPECTED %s" % f[:2]))
+        ok &= good
+
     print(SELFTEST_MARK if ok else "SKILL_IMPORT_OFFMAIN_SELFTEST=FAIL")
     return 0 if ok else 1
 
@@ -806,8 +1290,10 @@ def main():
         for f in failures:
             print("  - %s" % f)
         sys.exit(1)
-    print("OK %s (10 arms: paste x2, reload-off-main x2, all-repo-calls-off-main x1, "
-          "editor-keys x3, editor-key-alignment x1, arm6 fixture gate)" % SM_REL)
+    print("OK %s (14 arms: paste x2, reload-off-main x2, all-repo-calls-off-main x1, "
+          "editor-keys x3, editor-key-alignment x1, B-04 io-call-off-main x1 "
+          "(MCP screen + both sheets), B-04 seed-effect-keys x1, fixture gates)"
+          % SM_REL)
     sys.exit(0)
 
 

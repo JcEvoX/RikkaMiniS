@@ -812,10 +812,37 @@ internal suspend fun ChatViewModel.generateCompactSummary(conversationText: Stri
     // :691 注释里「halving retry is untouched」契约的反面。真实时序量过：
     // 候选 1/2 回 400 context length、候选 2/2 超时，修复后外层看到的必须是 400。
     var tooLargeFailure: Exception? = null
+    // [fix/compact-timeout-dedup-1022] A TIMEOUT says something about the
+    // ROUTE (host + model), not about the account behind it. 2026-10-22 device
+    // log: three tierflow entries sharing https://tierflow.cn and model
+    // `tierflow` each died at exactly 30000ms inside ONE chain, so the chain
+    // paid the same wall three times and handed the genuinely different member
+    // (codebuddy-cn/hy4-preview) only what the deadline had left — 25 such
+    // chains that day. Remember the routes that timed out in THIS chain and
+    // skip their siblings; the freed deadline goes to a candidate that can
+    // still answer. Route failures (401 / 429 / 5xx) are deliberately NOT
+    // recorded: those are per-credential, and the sibling accounts exist for
+    // exactly them — only the latency verdict is a route property.
+    val timedOutRoutes = mutableSetOf<String>()
     for ((index, step) in chain.withIndex()) {
         val (candidate, entryId) = step
+        val label = if (entryId != null) "entry=$entryId" else "active"
+        val route = compactionCandidateKey(
+            customBaseUrl = candidate.instanceContext?.customBaseURL,
+            instanceId = candidate.instanceContext?.id,
+            modelId = candidate.model.id,
+        )
+        if (route in timedOutRoutes) {
+            AppLogger.info(
+                ChatViewModel.TAG,
+                "[Compact] summary skip candidate=${index + 1}/${chain.size} " +
+                    "($label ${candidate.model.displayName}) — route $route already timed out in this chain",
+            )
+            continue
+        }
         val budgetMs = compactionCandidateBudgetMs(
             candidate.model.declaresNoEffortTiers,
+            estimatedInput,
             SystemClock.elapsedRealtime(),
             deadlineAt,
         )
@@ -832,7 +859,6 @@ internal suspend fun ChatViewModel.generateCompactSummary(conversationText: Stri
         val started = SystemClock.elapsedRealtime()
         val r = withTimeoutOrNull(budgetMs) { sendVia(candidate) }
         val ms = SystemClock.elapsedRealtime() - started
-        val label = if (entryId != null) "entry=$entryId" else "active"
         if (r == null) {
             AppLogger.info(
                 ChatViewModel.TAG,
@@ -842,6 +868,10 @@ internal suspend fun ChatViewModel.generateCompactSummary(conversationText: Stri
             lastFailure = IllegalStateException(
                 "compaction summary timed out after ${budgetMs}ms on ${candidate.model.displayName}",
             )
+            // [fix/compact-timeout-dedup-1022] Latency verdict → route-level:
+            // see the declaration of timedOutRoutes. Sibling entries on the
+            // same host+model are skipped from here on within this chain.
+            timedOutRoutes.add(route)
             continue
         }
         when (r) {
@@ -939,6 +969,12 @@ internal fun ChatViewModel.resolveCompactionPinProvider(entryId: String): LLMPro
  * deadline yields a non-positive budget and the caller's `budgetMs <= 0`
  * branch ends the chain.
  *
+ * [fix/compact-timeout-budget-1022] [materialTokens] is the estimated size of
+ * the summary material this chain will send; above
+ * COMPACT_SUMMARY_LARGE_MATERIAL_TOKENS it opens the same 60s budget the
+ * noisy members get, because the measured success latency on those relays
+ * crowds the 30s floor as soon as the fold material grows.
+ *
  * Top-level (not a ChatViewModel extension) so JVM unit tests call it
  * without instantiating the VM — same pattern as [ordersCompactionCandidates]
  * (the companion consts it reads are compile-time inlined, no Android
@@ -946,15 +982,54 @@ internal fun ChatViewModel.resolveCompactionPinProvider(entryId: String): LLMPro
  */
 internal fun compactionCandidateBudgetMs(
     declaresNoEffortTiers: Boolean?,
+    materialTokens: Int,
     nowMs: Long,
     deadlineAt: Long,
 ): Long {
-    val perCandidate = if (declaresNoEffortTiers == true) {
+    // [fix/compact-timeout-budget-1022] Two independent reasons to admit the
+    // member cannot answer inside the quiet floor: the catalog says its relay
+    // cannot be silenced ([LLMModel.declaresNoEffortTiers] == true), or the
+    // summary material is large enough that the measured success latency
+    // itself crowds the floor (2026-10-22: 25.0s / 28.2s / 29.1s successes on
+    // the same members whose larger folds timed out at exactly 30000ms). See
+    // ChatViewModel.COMPACT_SUMMARY_LARGE_MATERIAL_TOKENS for the measurement.
+    val largeMaterial = materialTokens > ChatViewModel.COMPACT_SUMMARY_LARGE_MATERIAL_TOKENS
+    val perCandidate = if (declaresNoEffortTiers == true || largeMaterial) {
         ChatViewModel.COMPACT_SUMMARY_NOISY_CANDIDATE_BUDGET_MS
     } else {
         ChatViewModel.COMPACT_SUMMARY_CANDIDATE_BUDGET_MS
     }
     return minOf(perCandidate, deadlineAt - nowMs)
+}
+
+/**
+ * [fix/compact-timeout-dedup-1022] Route identity of a compaction candidate:
+ * the host it actually talks to plus the model it asks for. Two entries backed
+ * by the same relay host and the same model are the same route — a timeout on
+ * one predicts the timeout on the other, because the latency comes from the
+ * upstream model, not from the credential (2026-10-22: three tierflow entries
+ * sharing https://tierflow.cn + model `tierflow` all died at 30000ms in one
+ * chain; the account-swapping fallback exists for credential failures, which
+ * arrive as RemoteFailure/Unavailable and are therefore never recorded here).
+ *
+ * [customBaseUrl] is the instance's raw user field; the host is parsed out of
+ * it so `https://tierflow.cn/v1` and `https://tierflow.cn/` collapse together.
+ * Built-in provider types carry no custom base URL — there the instance id
+ * stands in for the host, which keeps distinct instances distinct (their hosts
+ * are not comparable from here, so no cross-instance claim is made). Model
+ * parsing failure falls back to the raw string rather than skipping the field.
+ */
+internal fun compactionCandidateKey(
+    customBaseUrl: String?,
+    instanceId: String?,
+    modelId: String,
+): String {
+    val host = customBaseUrl
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?.let { url -> runCatching { java.net.URI(url).host }.getOrNull() }
+        ?: instanceId
+    return "${host ?: "?"}|$modelId"
 }
 
 /**

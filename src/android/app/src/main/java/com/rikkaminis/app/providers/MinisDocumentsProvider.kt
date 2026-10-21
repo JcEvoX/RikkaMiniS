@@ -134,6 +134,19 @@ class MinisDocumentsProvider : DocumentsProvider() {
         val clean = normalizeDocId(documentId)
         if (clean.isEmpty()) return root
         if (clean.contains("..")) throw FileNotFoundException("Invalid path: $documentId")
+        // [dv20-A4-A07] The top-level whitelist used to guard the LISTING only:
+        // `queryChildDocuments` skipped anything outside TOP_LEVEL when the
+        // parent was root, but every other entry point resolved an arbitrary id
+        // straight to a File — `mcp-servers/…`, `logs/…` and any other internal
+        // filesDir entry were addressable by document id even though they never
+        // appear in the Files app. Judging the id's first segment here (the one
+        // funnel every entry point goes through) keeps a single definition of
+        // what the provider exposes; it is latent today because the provider is
+        // not registered in AndroidManifest.xml, and stays that way.
+        val top = clean.substringBefore('/')
+        if (top !in TOP_LEVEL) {
+            throw FileNotFoundException("Not a top-level entry: $documentId")
+        }
         // [fix-R12 D7] Canonicalize + prefix guard. Previously this refused only a
         // literal ".." ([audit-P3] left canonicalization as a pre-registration
         // obligation); now a symlink or alias resolving outside providerRoot is

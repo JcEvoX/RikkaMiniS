@@ -68,6 +68,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MinisApp : Application(), ImageLoaderFactory {
     /**
@@ -623,8 +624,17 @@ class MinisApp : Application(), ImageLoaderFactory {
         // is not in chat mid-command, so this restart is safe and user-invisible.
         PRootKernel.mountedFoldersStore = mountedFoldersStore
         mountedFoldersStore.onChange = {
-            PRootKernel.applyMountedFoldersSnapshot(this)
-            ExecutionCoordinator.stopCurrentCommand()
+            // [dv20-A4-A06] The snapshot does blocking host I/O (SAF resolution
+            // readdir, rootfs mkdirs, wrapper-script writes) and mount CRUD
+            // fires from Compose onClick on the main thread — hop off Main.
+            // stopCurrentCommand stays AFTER the snapshot so the shells that
+            // the next execute() rebuilds read the updated bind set (both
+            // containers it touches are ConcurrentHashMap, so calling it from
+            // an IO coroutine is safe).
+            applicationScope.launch {
+                withContext(Dispatchers.IO) { PRootKernel.applyMountedFoldersSnapshot(this@MinisApp) }
+                ExecutionCoordinator.stopCurrentCommand()
+            }
         }
         // T219-6: route launch-time seeding through applyMountedFoldersSnapshot
         // so it (a) reads the live store consistently and (b) materializes the
@@ -633,7 +643,11 @@ class MinisApp : Application(), ImageLoaderFactory {
         // applyMountedFoldersSnapshot tolerates that case (mkdirs fails silently
         // and PRootKernel.boot calls applyMountedFoldersSnapshot again at the
         // end of boot to materialize the targets once rootfs is on disk).
-        PRootKernel.applyMountedFoldersSnapshot(this)
+        // [dv20-A4-A06] Same blocking-I/O story as above — the seed hops off
+        // Main instead of freezing onCreate's first frame behind a FUSE readdir.
+        applicationScope.launch {
+            withContext(Dispatchers.IO) { PRootKernel.applyMountedFoldersSnapshot(this@MinisApp) }
+        }
 
         // Register native_offload handlers and start the server eagerly —
         // the server only needs the rootfs tmp directory, which can be
@@ -835,6 +849,33 @@ class MinisApp : Application(), ImageLoaderFactory {
                 }
             }.onFailure {
                 android.util.Log.w("MinisApp", "partial stream recovery retry failed: ${it.message}")
+            }
+        }
+
+        // [dv20-A4-A05] Startup empty-session sweep. `cleanupIfEmptyOnExit()`
+        // hangs off Compose's `onDispose`, which never runs on process death,
+        // task-swipe or a crash — so a message-less row inserted before the
+        // first send lands is stranded forever, and the user sees "sometimes
+        // the empty chat disappears, sometimes it doesn't". The repository
+        // backstop for exactly that (`ChatRepository.deleteEmptySessions`)
+        // had zero production callers, and its exclusion-list source
+        // (`ChatViewModelStore.activeSessionIds()`) was equally unwired.
+        // Runs off-main (Room DELETE) with the live VM ids as the exclusion
+        // set: a cached store means the agent loop may still be streaming,
+        // so those rows are never swept even at zero messages.
+        kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+            runCatching {
+                val swept = chatRepository.deleteEmptySessions(
+                    com.rikkaminis.app.ui.chat.ChatViewModelStore.activeSessionIds(),
+                )
+                if (swept > 0) {
+                    android.util.Log.i("MinisApp", "startup empty-session sweep: $swept row(s)")
+                }
+            }.onFailure {
+                // [audit-0917] Same guarded-scope rule as the badge reconcile:
+                // this scope uses the default handler, so an unguarded Room
+                // failure here would crash the app at cold start.
+                android.util.Log.w("MinisApp", "empty-session sweep failed: ${it.message}")
             }
         }
 

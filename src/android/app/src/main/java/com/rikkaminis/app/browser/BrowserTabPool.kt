@@ -227,8 +227,43 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
     private val _selectedTabId = MutableStateFlow(0)
     val selectedTabId: StateFlow<Int> = _selectedTabId.asStateFlow()
 
-    /** Whether any tab is currently executing an agent action. */
-    val isAgentBusy: Boolean get() = _tabs.value.any { it.inUse }
+    private val _agentBusy = MutableStateFlow(false)
+
+    /**
+     * [da1040-B2] Reactive "some tab is executing an agent action" signal.
+     *
+     * `tabs` cannot carry this: a busy flip mutates [Tab.inUse] IN PLACE
+     * (audit-b21 — replacing the instance with a `copy()` breaks the identity
+     * link to in-flight actions, whose release paths then mutate the object the
+     * pool no longer holds), so the list handed to the StateFlow stays
+     * content-equal to the previous one and `AbstractList.equals` makes the
+     * StateFlow swallow the emission. A UI reading a plain getter therefore
+     * composed once and never recomposed when the agent started or stopped
+     * working — the busy affordances stayed frozen for the whole session.
+     * This flow is re-derived (never guessed) by [publishAgentBusy].
+     */
+    val agentBusy: StateFlow<Boolean> = _agentBusy.asStateFlow()
+
+    /**
+     * [da1040-B2] Single carrier of the busy predicate. Re-derives from the
+     * live tab list, so every writer stays a statement of fact ("this tab is
+     * in use") and the flag cannot drift from [Tab.inUse].
+     */
+    private fun publishAgentBusy() {
+        _agentBusy.value = _tabs.value.any { it.inUse }
+    }
+
+    /**
+     * [da1040-B2] The ONLY writer of [Tab.inUse]. Keeping the write behind one
+     * funnel is what makes "busy flips are observable" a property of the class
+     * instead of a rule every future call site has to remember — the old shape
+     * (`tab.inUse = …` at five sites, plus a list refill that StateFlow
+     * suppresses) is how the signal got lost in the first place.
+     */
+    private fun setTabInUse(tab: Tab, inUse: Boolean) {
+        tab.inUse = inUse
+        publishAgentBusy()
+    }
 
     /** Currently selected tab's manager, or the first tab's if none selected — mirrors iOS activeManager. */
     val activeManager: BrowserUseManager?
@@ -1031,7 +1066,7 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
                 // op on that same tab. [T-browser-use-per-tab-serial-android]
                 tab.inUseGraceJob?.cancel()
                 tab.inUseGraceJob = null
-                tab.inUse = false
+                setTabInUse(tab, false)
             }
             updateTabs()
             saveState()
@@ -1067,12 +1102,12 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
      * reads/writes inUse on Main).
      */
     private fun armImplicitGraceRelease(tab: Tab) {
-        tab.inUse = true
+        setTabInUse(tab, true)
         tab.inUseGraceJob?.cancel()
         tab.inUseGraceJob = evictionScope.launch {
             delay(IMPLICIT_TAB_GRACE_MS)
             withContext(Dispatchers.Main) {
-                tab.inUse = false
+                setTabInUse(tab, false)
                 tab.inUseGraceJob = null
                 tab.lastActivityDate = Date()
                 updateTabs()
@@ -1148,7 +1183,7 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
             // cancels the pending release — it's actively in use again now.
             tab.inUseGraceJob?.cancel()
             tab.inUseGraceJob = null
-            tab.inUse = true
+            setTabInUse(tab, true)
             tab.lastActivityDate = Date()
             _selectedTabId.value = tab.id
             _tabs.value = currentTabs
@@ -1452,9 +1487,15 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
         // kept a copy that never saw those updates. Emit a fresh list — needed
         // for StateFlow to fire — but keep the live Tab instances.
         _tabs.value = _tabs.value.map { tab ->
-            tab.inUse = false
+            setTabInUse(tab, false)
             tab
         }
+        // [da1040-B2] The refill above is content-equal to the previous list, so
+        // `tabs` still emits nothing (that is the point of keeping the live
+        // instances); the busy flag is the observable half, and re-deriving it
+        // once past the swap publishes the settled value instead of the
+        // intermediate one seen mid-map.
+        publishAgentBusy()
         saveState()
     }
 
@@ -1884,6 +1925,11 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
 
     private fun updateTabs() {
         _tabs.value = _tabs.value.toList()
+        // [da1040-B2] Membership and in-place bookkeeping both land here, and
+        // neither can reach a collector through `tabs` (content-equal list).
+        // Re-deriving the busy flag on every publication keeps "is the agent
+        // working" observable even when only `lastActivityDate` moved.
+        publishAgentBusy()
     }
 }
 
