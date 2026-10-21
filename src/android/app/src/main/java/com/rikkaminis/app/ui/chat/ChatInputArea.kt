@@ -376,6 +376,20 @@ internal fun ChatInputArea(
     // nothing pending; the job is cancelled+replaced on every new burst.
     var imeBurstBuffer by remember { mutableStateOf<String?>(null) }
     var imeBurstJob by remember { mutableStateOf<Job?>(null) }
+    // [fix/dv19-b1] Drop the pending burst flush. Called at every point that acts
+    // on — or clears — the composer: send / Enter-send (the two sites that used to
+    // spell these three writes out inline) plus the slash dismiss, the slash
+    // command and the cross-session transfer, each of which now commits the
+    // field's LIVE value instead of the 150 ms-debounced VM string. Committing the
+    // live text makes the snapshot redundant, and leaving the job alive lets a
+    // stale snapshot land on a composer that has since been cleared or handed to
+    // another session (inputText is per-ViewModel, so the late write hit the old
+    // session's composer after a move).
+    val cancelPendingImeBurst: () -> Unit = {
+        imeBurstJob?.cancel()
+        imeBurstJob = null
+        imeBurstBuffer = null
+    }
     // Paired with imeBurstBuffer: the caret that must be scanned against the
     // FLUSHED text when a debounced burst finally commits. Stored alongside
     // the buffer (not read late from inputFieldValue) so the mention scan in
@@ -473,9 +487,7 @@ internal fun ChatInputArea(
         // staler than the buffer or the VM value: onValueChange writes it
         // first on every path, and it is exactly what the user reads on
         // screen.
-        imeBurstJob?.cancel()
-        imeBurstJob = null
-        imeBurstBuffer = null
+        cancelPendingImeBurst()
         val toSend = inputFieldValue.text
         if (viewModel.tryExecuteInputAsSlashCommand(toSend)) {
             viewModel.setInputText("")
@@ -608,7 +620,14 @@ internal fun ChatInputArea(
                         }
                     },
                     onDismissRequest = {
-                        viewModel.setInputText(viewModel.dismissSlashMenu(inputText))
+                        // [fix/dv19-b1] Commit the field's LIVE text: the debounced
+                        // VM string can be empty (or a burst behind) inside the
+                        // 150 ms window, and dismissSlashMenu() echoes that string
+                        // back as the composer's value — clearing the dictation or
+                        // paste the user just made. Drop the pending flush first so
+                        // the stale snapshot cannot restore itself afterwards.
+                        cancelPendingImeBurst()
+                        viewModel.setInputText(viewModel.dismissSlashMenu(inputFieldValue.text))
                     },
                     properties = androidx.compose.ui.window.PopupProperties(
                         focusable = false,
@@ -690,7 +709,13 @@ internal fun ChatInputArea(
                                                 // [T-android-slash-menu-clears-input] Pass the
                                                 // LIVE input so an action command keeps the
                                                 // user's body text instead of wiping it.
-                                                viewModel.setInputText(viewModel.executeSlashCommand(cmd, inputText))
+                                                // [fix/dv19-b1] "LIVE" now means the field's
+                                                // own TextFieldValue: the VM string lags it by
+                                                // the 150 ms burst window, and the pending
+                                                // flush is dropped so it cannot re-commit a
+                                                // snapshot over the post-command value.
+                                                cancelPendingImeBurst()
+                                                viewModel.setInputText(viewModel.executeSlashCommand(cmd, inputFieldValue.text))
                                                 // For the typing-aid rows
                                                 // (skill + MCP), "/<name> "
                                                 // is a typing aid — the user
@@ -1376,9 +1401,7 @@ internal fun ChatInputArea(
                         // re-inject text after the send cleared the composer
                         // (ghost input → double send), and take the send text
                         // from the field's live value — never the snapshot.
-                        imeBurstJob?.cancel()
-                        imeBurstJob = null
-                        imeBurstBuffer = null
+                        cancelPendingImeBurst()
                         val effectiveInput = inputFieldValue.text
                         if (effectiveInput.isBlank() && attachments.isEmpty()) return@handler false
                         // Intercept slash commands so "/compact" et al.
@@ -1859,20 +1882,27 @@ internal fun ChatInputArea(
                     // voice panel, read-replies TTS) removed here.
 
                     // Right: 3-state Send / Enqueue / Stop button (mirrors iOS sendButton).
-                    //   • streaming + hasText  → SEND (routes through viewModel.sendMessage,
+                    //   • streaming + content → SEND (routes through viewModel.sendMessage,
                     //     which dispatches to enqueuePrompt since _isStreaming is true).
                     //     Visual feedback for the queued prompt comes from the dashed
                     //     bubble that ChatViewModel.enqueuePrompt appends to the message
                     //     list — no extra button badge needed (matches iOS).
-                    //   • streaming + !hasText → STOP (cancel current run).
-                    //   • !streaming           → SEND (full color when hasText, dimmed
+                    //   • streaming + !content → STOP (cancel current run).
+                    //   • !streaming           → SEND (full color when content, dimmed
                     //     when empty; same as before).
                     // T180: an attachments-only send (no caption) is a
                     // valid message — mirrors iOS where !attachments.isEmpty
                     // satisfies the composer's send guard. Without this an
                     // image-only "look at this" send is impossible.
-                    val hasText = inputText.isNotBlank()
-                    val hasContent = hasText || attachments.isNotEmpty()
+                    // [fix/dv19-b1] Content comes from the shared eligibility
+                    // predicate (the field's own TextFieldValue + attachments), the
+                    // same read the swipe gesture uses. The old
+                    // `inputText.isNotBlank()` read the 150 ms-debounced VM string,
+                    // so inside a dictation/paste burst the button rendered a red
+                    // STOP over a live stream (a tap then called cancelStream and
+                    // killed the run the user meant to enqueue) and the idle Send
+                    // stayed dimmed over a composer the user could see was full.
+                    val hasContent = canSwipeSendNow()
                     val showStop = isStreaming && !hasContent
                     if (showStop) {
                         Box(
@@ -1953,9 +1983,16 @@ internal fun ChatInputArea(
                 chatRepository = chatRepository,
                 onDismiss = { showMoveSheet = false },
                 onSelect = { targetId ->
+                    // [fix/dv19-b1] Stash the field's LIVE text (the VM string can
+                    // still be a 150 ms burst behind, i.e. exactly empty right
+                    // after dictation) and drop the pending flush: the job is
+                    // launched on ChatScreen's scope, so it outlives this composer
+                    // and would commit the snapshot into the session the user just
+                    // left (inputText is per-ViewModel) after the move cleared it.
+                    cancelPendingImeBurst()
                     ChatViewModelStore.stashPendingTransfer(
                         ChatViewModelStore.PendingTransfer(
-                            inputText = inputText,
+                            inputText = inputFieldValue.text,
                             attachments = viewModel.attachments.value,
                         ),
                     )
