@@ -42,6 +42,20 @@ object OpenAIModelsApi {
         // fetch got a hard 401 on every Azure provider. Threaded from
         // ProviderInstance.azureMode by ModelListProviderAdapters.
         azureMode: Boolean = false,
+        // [dv18-A-08] The family name to stamp on every returned row. A vendor
+        // adapter that reuses this fetcher (Kimi Code) fetches from its OWN
+        // vendor base URL, which this fetcher cannot recognise as "official
+        // OpenAI" — so without this the rows came back labelled "Custom" and
+        // `ModelsDevApi`'s provider-aware enrichment (providerKeyMap) could
+        // never hit for them, dropping them into the order-dependent
+        // all-providers scan (the F-212 failure).
+        //
+        // null keeps the legacy decision verbatim ("Custom" for a third-party
+        // base URL, "OpenAI" for the official ones) — see
+        // [resolveProviderName], the single place that decision is made. The
+        // `isCustomBase` semantics are untouched either way (chat-prefix
+        // filtering, built-in fallback, cache rows, gateway truth).
+        providerName: String? = null,
     ): List<LLMModel> = withContext(Dispatchers.IO) {
         val isCustomBase = baseURL != null && !isOfficialOpenAI(baseURL)
         // For third-party endpoints (vLLM, Ollama, etc.), return empty on failure
@@ -56,7 +70,9 @@ object OpenAIModelsApi {
             // and cap the picker, so the correction is re-applied on the cache path too
             // (it is a no-op for every host we have no measurement for).
             cache.load(ctx, cacheKey)?.let {
-                return@withContext ModelsDevApi.applyGatewayEffortTruth(it, baseURL)
+                return@withContext ModelsDevApi.applyGatewayEffortTruth(
+                    it.withProviderName(isCustomBase, providerName), baseURL
+                )
             }
         }
         val url = buildURL(baseURL)
@@ -144,7 +160,7 @@ object OpenAIModelsApi {
                         LLMModel(
                             id = id,
                             displayName = displayName,
-                            provider = if (isCustomBase) "Custom" else "OpenAI",
+                            provider = resolveProviderName(isCustomBase, providerName),
                             inputModalities = inputModalities,
                             outputModalities = outputModalities,
                             supportsReasoning = if (knownReasoning) true else null,
@@ -183,6 +199,49 @@ object OpenAIModelsApi {
     private fun isOfficialOpenAI(baseURL: String): Boolean {
         val lower = baseURL.lowercase()
         return lower.contains("api.openai.com") || lower.contains("chatgpt.com")
+    }
+
+    /**
+     * [dv18-A-08] The single decision point for the `provider` field of a row
+     * this fetcher returns.
+     *
+     * [providerName] is the family name the caller's adapter identified itself
+     * with (see [fetchModels]); when it is null the legacy decision stands:
+     * a third-party base URL yields "Custom", an official OpenAI endpoint
+     * yields "OpenAI". Extracted — like [shouldConsultCache] — so the decision
+     * is JVM-testable without an Android runtime, and so a caller that wires
+     * the parameter but ignores it is visible in one place.
+     */
+    internal fun resolveProviderName(isCustomBase: Boolean, providerName: String?): String =
+        providerName ?: if (isCustomBase) "Custom" else "OpenAI"
+
+    /**
+     * [dv18-A-08] Re-label rows that came out of a *cache* row rather than the
+     * live parse path: the 48-hour [ProviderModelsCache] row is keyed on
+     * URL+key, so it belongs to the requesting family, but entries written
+     * before the caller started naming itself still carry the old label.
+     * Routes through [resolveProviderName] so the naming decision keeps
+     * exactly one home.
+     *
+     * A null [providerName] returns the SAME list instance — no copy, so the
+     * unnamed (legacy) path is byte-for-byte what it was.
+     *
+     * ponytail: cache rows are only relabelled, never re-enriched — capability
+     *   numbers baked in by the old blind scan survive until the TTL lapses.
+     *   | ceiling: a user who fetched the Kimi list before this fix sees
+     *   wrong context/effort numbers for at most 48h (forceRefresh re-fetches
+     *   immediately and the live path enriches with the right key now).
+     *   | escalate: a report that a Kimi model's context window / effort
+     *   ladder disagrees with models.dev while its provider field is right —
+     *   then the cache path needs `ModelsDevApi.enrichModels` too.
+     */
+    private fun List<LLMModel>.withProviderName(
+        isCustomBase: Boolean,
+        providerName: String?,
+    ): List<LLMModel> {
+        if (providerName == null) return this
+        val name = resolveProviderName(isCustomBase, providerName)
+        return map { it.copy(provider = name) }
     }
 
     /**
