@@ -96,25 +96,34 @@ object OffloadPermissionManager {
         // is already authorized.
         ToolPermissionInfo("a11y_cli", "android-a11y-cli", PermissionCategory.INTEGRATIONS, PermissionLevel.NOT_ALLOWED),
         ToolPermissionInfo("shizuku_cli", "android-shizuku-cli", PermissionCategory.INTEGRATIONS, PermissionLevel.NOT_ALLOWED),
-        // [T-minis-fastio] minis-fastio's DESTRUCTIVE path only (recursive
-        // delete of real host files, no undo). Read-only `du` does not consult
-        // this gate — it grants nothing file_read does not already have.
-        // ASK_ONCE, not NOT_ALLOWED: the tool exists to be used, but a delete
-        // must be seen by the user first. showInSettings stays true so the row
-        // is visible and closable.
-        ToolPermissionInfo("fastio_rm", "minis-fastio (delete)", PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE),
-        // [T-minis-fastio] phase 2 — cp/mv overwrite real host files, so each
-        // gets its OWN row: a user who trusts deletion has not thereby agreed
-        // to let the agent replace a different file. Same ASK_ONCE posture and
-        // same visibility as fastio_rm.
-        ToolPermissionInfo("fastio_cp", "minis-fastio (copy)", PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE),
-        ToolPermissionInfo("fastio_mv", "minis-fastio (move)", PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE),
-        // [T-minis-fastio] phase 3 — `tar` is a write primitive in BOTH
-        // directions (it writes the archive out, or writes everything inside
-        // one), so it gets its own row rather than riding on fastio_cp: a user
-        // who allowed a copy has not thereby allowed an arbitrary archive to be
-        // expanded into the sandbox.
-        ToolPermissionInfo("fastio_tar", "minis-fastio (archive)", PermissionCategory.SYSTEM, PermissionLevel.ASK_ONCE),
+        // [fix/fastio-bypass-1021] minis-fastio's write primitives
+        // (recursive delete / copy / move / archive of real host files).
+        //
+        // BYPASS, matching every other SYSTEM row's *posture*: every fastio
+        // path goes through [GuestPathMapper], whose reachable set is exactly
+        // the app's own sandbox — the same set the guest shell already reaches
+        // unrestricted. A `rm -rf /var/minis/...` typed into the terminal
+        // deletes the same files with no prompt at all, so an ASK_ONCE default
+        // here gated nothing the shell does not already permit. It only added
+        // a prompt the agent cannot clear from inside the session ("allow for
+        // this session" dies with the process).
+        //
+        // Unlike alarm/weather/device_info these rows stay VISIBLE
+        // (showInSettings = true): those tools have no user-meaningful choice,
+        // whereas "ask me before the agent deletes" is a legitimate preference.
+        // Per T338 the Settings screen is the one place a permanent level is
+        // set, so hiding the row would delete the only way back to a prompt.
+        ToolPermissionInfo("fastio_rm", "minis-fastio (delete)", PermissionCategory.SYSTEM, PermissionLevel.BYPASS),
+        // Phase 2: cp/mv — same BYPASS default (same reachable set, same
+        // argument), one row per primitive so a per-tool override stays
+        // possible: a user who wants prompts for deletion has not necessarily
+        // agreed to prompts for overwriting, and vice versa.
+        ToolPermissionInfo("fastio_cp", "minis-fastio (copy)", PermissionCategory.SYSTEM, PermissionLevel.BYPASS),
+        ToolPermissionInfo("fastio_mv", "minis-fastio (move)", PermissionCategory.SYSTEM, PermissionLevel.BYPASS),
+        // Phase 3: tar is a write in BOTH directions; same reasoning, same
+        // treatment. Its tar-slip guard stays (that guard is about
+        // refuse-instead-of-guess, not about user consent).
+        ToolPermissionInfo("fastio_tar", "minis-fastio (archive)", PermissionCategory.SYSTEM, PermissionLevel.BYPASS),
     )
 
     /** Stable session-id used by NativeOffloadHandlers when calling
