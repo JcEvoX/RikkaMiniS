@@ -1554,13 +1554,16 @@ internal data class ShizukuArgv(
  * `android-shizuku-cli --compact package list` die as
  * `unknown subcommand '--compact'`).
  *
- * The switch classification is delegated to [firstPositionalIndex] — the full
- * [ShizukuOffloadHandler.NO_VALUE_FLAGS] set, because a leading option can
- * belong to any group's switch vocabulary and `--data` leading an invocation is
- * not a real shape.
+ * The option classification is delegated to [firstPositionalIndex] — the full
+ * [ShizukuOffloadHandler.NO_VALUE_FLAGS] set (a leading option can belong to any
+ * group's switch vocabulary and `--data` leading an invocation is not a real
+ * shape) **and** the full [SHIZUKU_VALUE_SHORT_OPTIONS] set, for the mirror-image
+ * reason: `-p com.example package info` carries all four value-taking shorts
+ * before the group, so a scan that knows only the switches reads `com.example`
+ * as the group ([dv18-A A-01a]).
  */
 internal fun splitShizukuArgv(argv: List<String>): ShizukuArgv {
-    val index = firstPositionalIndex(argv, ShizukuOffloadHandler.NO_VALUE_FLAGS)
+    val index = firstPositionalIndex(argv, ShizukuOffloadHandler.NO_VALUE_FLAGS, SHIZUKU_VALUE_SHORT_OPTIONS)
     if (index < 0) return ShizukuArgv(null, argv, emptyList(), execOptionTokens = argv)
     val group = argv[index]
     // [deep-audit-1029 ISSUE-07] `exec` owns one trailing option of its own
@@ -1640,11 +1643,27 @@ private fun isExecTimeoutValue(value: String): Boolean =
  * switch or does it take the next token?" rule is exactly how the parser and
  * its callers drift apart — the deep-audit-1020 ISSUE-02 class of bug. A CLI
  * invocation is short, so the prefix walk is free.
+ *
+ * [dv18-A A-01a] `valueShortOptions` must be the SAME set [ShizukuOffloadHandler]
+ * hands its own parser. The walk used to take only `booleanFlags`, so a
+ * value-taking short option leading the invocation was read as a bare switch and
+ * its VALUE became the first positional: `-p com.example package info` reported
+ * the group as `com.example` (unknown subcommand) instead of `package`. Same
+ * rule as the switch set, same reason: this scan is the parser's second reader,
+ * and a second reader with a smaller vocabulary answers a different question.
  */
-internal fun firstPositionalIndex(argv: List<String>, booleanFlags: Set<String>): Int {
+internal fun firstPositionalIndex(
+    argv: List<String>,
+    booleanFlags: Set<String>,
+    valueShortOptions: Set<String> = emptySet(),
+): Int {
     var seen = 0
     for (i in argv.indices) {
-        val count = OffloadArgs(argv.subList(0, i + 1), booleanFlags).positional.size
+        val count = OffloadArgs(
+            argv.subList(0, i + 1),
+            booleanFlags = booleanFlags,
+            valueShortOptions = valueShortOptions,
+        ).positional.size
         if (count > seen) return i
         seen = count
     }
