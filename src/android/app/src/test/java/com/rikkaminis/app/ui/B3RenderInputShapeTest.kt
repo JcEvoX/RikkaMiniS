@@ -42,15 +42,31 @@ class B3RenderInputShapeTest {
         "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatInputArea.kt"
     private val markdownRel =
         "src/android/app/src/main/java/com/rikkaminis/app/ui/markdown/MarkdownText.kt"
-    private val mainRoot = "src/android/app/src/main/java"
+    private val mainRootRel = "src/android/app/src/main/java"
 
     private val funnelDecl = "val clearComposerInput: () -> Unit = {"
 
-    private fun read(rel: String): String {
-        val f = File(rel)
-        assertTrue("missing source file: $rel (cwd=${File(".").absolutePath})", f.isFile)
-        return f.readText()
+    /**
+     * Gradle runs the unit tests with `user.dir` = the module dir
+     * (`src/android/app`), while a local JVM run usually starts at the repo root,
+     * so resolve by walking up until the path exists -- the same idiom
+     * `MediaHostSourceKeyTest.readRepoFile` already uses (the first CI run of this
+     * branch went red on exactly this: the root-relative path only worked
+     * locally).
+     */
+    private fun repoFile(rel: String): File {
+        var dir: File? = File(System.getProperty("user.dir"))
+        while (dir != null) {
+            val f = File(dir, rel)
+            if (f.exists()) return f
+            dir = dir.parentFile
+        }
+        throw AssertionError(
+            "$rel not found from user.dir=${System.getProperty("user.dir")}"
+        )
     }
+
+    private fun read(rel: String): String = repoFile(rel).readText()
 
     /** Drops `//` line comments and `/* */` blocks so doc text cannot satisfy an arm. */
     private fun codeOnly(text: String): String {
@@ -368,8 +384,8 @@ class B3RenderInputShapeTest {
 
     @Test
     fun theSizeCeilingHasExactlyOneDeclaration() {
-        val root = File(mainRoot)
-        assertTrue("source root missing: $mainRoot", root.isDirectory)
+        val root = repoFile(mainRootRel)
+        assertTrue("source root missing: $mainRootRel", root.isDirectory)
         var declarations = 0
         var where = ""
         root.walkTopDown().filter { it.isFile && it.name.endsWith(".kt") }.forEach { f ->
