@@ -33,6 +33,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -187,6 +188,11 @@ fun WebPreviewFullscreenScreen(
                 .fillMaxSize()
                 .background(Color.Black),
         ) {
+            // [dv17-3 B-03] Same missing-key defect as WebPreviewBottomSheet:
+            // `AndroidView` only runs `factory` on first composition (or when
+            // the enclosing `key` changes), so a holder swap left this screen
+            // showing the destroyed WebView of the previous holder.
+            key(holder) {
             AndroidView(
                 factory = {
                     val wv = holder.webView
@@ -202,6 +208,7 @@ fun WebPreviewFullscreenScreen(
                 },
                 modifier = Modifier.fillMaxSize(),
             )
+            }
 
             val navInset = WindowInsets.navigationBars.asPaddingValues()
                 .calculateBottomPadding()

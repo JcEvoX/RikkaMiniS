@@ -59,6 +59,13 @@ import sys
 HOLDER_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/preview/WebViewHolder.kt"
 SHEET_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/preview/WebPreviewBottomSheet.kt"
 GALLERY_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/components/ImageGalleryViewer.kt"
+# dv17-3 (B-03): the other three WebView preview hosts.
+FULLSCREEN_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/preview/WebPreviewFullscreenScreen.kt"
+FILEPREVIEW_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/sandbox/FilePreviewScreen.kt"
+KATEX_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/markdown/KaTeXView.kt"
+
+ANDROIDVIEW_CALL_RE = re.compile(r"\bAndroidView\s*\(")
+KEY_CALL_RE = re.compile(r"\bkey\s*\(")
 
 ASSIGN_RE = re.compile(r"^\s*currentUrl\s*=\s*(.+?)\s*$")
 
@@ -167,7 +174,60 @@ def window_after(code, marker, size):
     return code[idx:idx + size]
 
 
-def analyse(holder_code, sheet_code, gallery_code=None):
+def key_wrapped_blocks(code, callee="AndroidView"):
+    """[(args_text, body_text)] for every `key(...) { … }` whose trailing lambda
+    block calls `callee(`.
+
+    The block lives OUTSIDE the key's paren list (`key(a, b) { … }` is a trailing
+    lambda), so we cannot stop at the matching `)`: we slice the brace-balanced
+    body starting at the `key(` line with the gate's own slicer, which is already
+    string-aware and nesting-aware. Matching is on the CALL SHAPE throughout —
+    never on a bare identifier sitting on a line (a comment or a log string that
+    merely names `AndroidView` must not move the gate).
+    """
+    out = []
+    lines = code.splitlines()
+    for idx, line in enumerate(lines):
+        if not KEY_CALL_RE.search(line):
+            continue
+        body = slice_balanced_body("\n".join(lines[idx:]), line.strip())
+        if body is None:
+            continue
+        if not ANDROIDVIEW_CALL_RE.search(body):
+            continue
+        args = body.split("{", 1)[0]
+        out.append((args, body))
+    return out
+
+
+def androidview_key_criterion(label, code, required_tokens, site):
+    """Criterion tuple: every `AndroidView(` call site in `code` must sit inside a
+    `key(...)` block whose key arguments carry all of `required_tokens`.
+
+    Decision point (not a spelling): the AndroidView node is re-created exactly
+    when the enclosing `key` value changes, so the key must carry the *data
+    source* the factory closes over. Counting the call sites and requiring
+    `wrapped == total` also fails closed when the preview is removed from the
+    file altogether (0 sites ⇒ RED), which a "must contain key(" style pin
+    would silently accept.
+    """
+    stripped = strip_comments(code)
+    total = len(ANDROIDVIEW_CALL_RE.findall(stripped))
+    blocks = key_wrapped_blocks(stripped)
+    wrapped = sum(len(ANDROIDVIEW_CALL_RE.findall(b)) for _a, b in blocks)
+    bad_args = [a.strip() for a, _b in blocks
+                if not all(re.search(r"\b" + re.escape(t) + r"\b", a) for t in required_tokens)]
+    ok = total >= 1 and wrapped == total and not bad_args
+    detail = ("%s: %d AndroidView site(s), %d outside key(...); key(...) args %s; "
+              "required key tokens %s"
+              % (site, total, total - wrapped,
+                 ("missing %r" % bad_args[:1]) if bad_args else "carry them",
+                 list(required_tokens)))
+    return (label, ok, detail, None)
+
+
+def analyse(holder_code, sheet_code, gallery_code=None, filepreview_code=None,
+            katex_code=None, fullscreen_code=None):
     """Return [(criterion, ok, detail, line_no_or_None)]."""
     code = strip_comments(holder_code)
     code_lines = code.splitlines()
@@ -294,6 +354,34 @@ def analyse(holder_code, sheet_code, gallery_code=None):
         results.append(("W6d galleryDialogWindowFlags defined once with both flags", ok_flags_def,
                         "found %d definitions; both flag constants must stay in the "
                         "composition" % n_flags, None))
+
+    # --- W7: preview WebView hosts must key the AndroidView on its data source (dv17-3) ---
+    # `AndroidView(factory = …)` runs `factory` only on first composition, or when
+    # the enclosing `key(...)` value changes. Without a key the node keeps the
+    # WebView it built first while its owner moves on:
+    #   * sheet + fullscreen: the holder is replaceable (rememberWebViewHolder(url)
+    #     rebuilds it on a URL change) while the node keeps its slot ⇒ the screen
+    #     keeps showing the *destroyed* WebView of the old holder;
+    #   * FilePreviewScreen / KaTeXView: `rendererEpoch` is `remember(dataSource)`,
+    #     so on a data-source change it resets to 0 — a bare `key(rendererEpoch)`
+    #     never changes value (0→0) and the factory keeps its stale closure.
+    # The key must therefore carry the data source AND keep the renderer-death
+    # rebuild (`rendererEpoch`) — that path stays live for both hosts.
+    if fullscreen_code is not None:
+        results.append(androidview_key_criterion(
+            "W7a WebPreviewBottomSheet AndroidView is keyed on the holder",
+            sheet_code, ("holder",), "WebPreviewBottomSheet.kt"))
+        results.append(androidview_key_criterion(
+            "W7b WebPreviewFullscreenScreen AndroidView is keyed on the holder",
+            fullscreen_code, ("holder",), "WebPreviewFullscreenScreen.kt"))
+    if filepreview_code is not None:
+        results.append(androidview_key_criterion(
+            "W7c FilePreviewScreen HtmlPreview keys AndroidView on (item.file, rendererEpoch)",
+            filepreview_code, ("item.file", "rendererEpoch"), "FilePreviewScreen.kt"))
+    if katex_code is not None:
+        results.append(androidview_key_criterion(
+            "W7d KaTeXView keys AndroidView on (cacheKey, rendererEpoch)",
+            katex_code, ("cacheKey", "rendererEpoch"), "KaTeXView.kt"))
     return results
 
 
@@ -466,6 +554,99 @@ GALLERY_FLAGS_MISSING = GALLERY_GOOD.replace(
 """, "")
 
 
+# ---- dv17-3 fixtures: W7 (AndroidView data-source keys) --------------------
+
+W7_GOOD_SHEET = GOOD_SHEET + """
+@Composable
+fun Sheet(holder: WebViewHolder) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        key(holder) {
+        AndroidView(factory = { holder.webView }, modifier = Modifier.fillMaxSize())
+        }
+    }
+}
+"""
+
+# the reported shape: node with neither key(…) nor update
+W7_BAD_SHEET = GOOD_SHEET + """
+@Composable
+fun Sheet(holder: WebViewHolder) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        AndroidView(factory = { holder.webView }, modifier = Modifier.fillMaxSize())
+    }
+}
+"""
+
+W7_GOOD_FULLSCREEN = GOOD_SHEET + """
+@Composable
+fun Fullscreen(holder: WebViewHolder) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        key(holder) {
+        AndroidView(factory = { holder.webView }, modifier = Modifier.fillMaxSize())
+        }
+    }
+}
+"""
+
+W7_BAD_FULLSCREEN = GOOD_SHEET + """
+@Composable
+fun Fullscreen(holder: WebViewHolder) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        AndroidView(factory = { holder.webView }, modifier = Modifier.fillMaxSize())
+    }
+}
+"""
+
+W7_GOOD_PREVIEW = """@Composable
+private fun HtmlPreview(item: FileItem) {
+    var rendererEpoch by remember(item.file) { mutableStateOf(0) }
+    key(item.file, rendererEpoch) {
+    AndroidView(
+        modifier = Modifier.fillMaxSize(),
+        factory = { ctx ->
+            WebView(ctx).apply {
+                webViewClient = object : SafeWebViewClient() {
+                    override fun onRendererGone(view: WebView?) {
+                        rendererEpoch += 1
+                    }
+                }
+            }
+        },
+    )
+    }
+}
+"""
+
+# the reported shape: bare rendererEpoch key (resets 0→0 on a file change)
+W7_BAD_PREVIEW = W7_GOOD_PREVIEW.replace("key(item.file, rendererEpoch) {", "key(rendererEpoch) {")
+
+# key present, but the renderer-death rebuild was dropped from it
+W7_PREVIEW_NO_EPOCH = W7_GOOD_PREVIEW.replace("key(item.file, rendererEpoch) {", "key(item.file) {")
+
+W7_GOOD_KATEX = """@Composable
+private fun KaTeXRenderView(latex: String, displayMode: Boolean) {
+    val cacheKey = KaTeXRendererCache.cacheKey(latex, displayMode, false)
+    var rendererEpoch by remember(cacheKey) { mutableStateOf(0) }
+    Box(modifier = Modifier.widthIn(min = 20.dp)) {
+        key(cacheKey, rendererEpoch) {
+            AndroidView(
+                factory = { ctx ->
+                    WebView(ctx).apply {
+                        setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                        if (dead) rendererEpoch += 1
+                    }
+                },
+            )
+        }
+    }
+}
+"""
+
+W7_BAD_KATEX = W7_GOOD_KATEX.replace("key(cacheKey, rendererEpoch) {", "key(rendererEpoch) {")
+
+W7_KATEX_NO_EPOCH = W7_GOOD_KATEX.replace("key(cacheKey, rendererEpoch) {", "key(cacheKey) {")
+
+
 def selftest():
     failures = []
 
@@ -577,6 +758,41 @@ def selftest():
         elif c.startswith("W6"):
             expect(ok, "flags missing fixture: %s must stay OK" % c)
 
+    # ---- dv17-3: W7 fixtures (AndroidView data-source keys) ----
+    def w7(sheet_fx, preview_fx, katex_fx, fullscreen_fx):
+        return dict((c, ok) for c, ok, _, _ in analyse(
+            GOOD_HOLDER, sheet_fx, GALLERY_GOOD,
+            filepreview_code=preview_fx, katex_code=katex_fx,
+            fullscreen_code=fullscreen_fx))
+
+    good7 = w7(W7_GOOD_SHEET, W7_GOOD_PREVIEW, W7_GOOD_KATEX, W7_GOOD_FULLSCREEN)
+    w7_names = [c for c in good7 if c.startswith("W7")]
+    expect(len(w7_names) == 4,
+           "W7 fixture set should emit 4 criteria, got %d" % len(w7_names))
+    for c in w7_names:
+        expect(good7[c], "W7 good fixture must pass %s (%s)" % (c, good7[c] and "" or ""))
+
+    # a holder without both extra code params must not emit W7 at all
+    expect(not any(c.startswith("W7") for c, _, _, _ in analyse(GOOD_HOLDER, GOOD_SHEET)),
+           "analyse without the preview files must not emit W7 criteria")
+
+    # each revert reds exactly its OWN criterion (and disturbs nothing else)
+    w7_cases = [
+        (W7_BAD_SHEET, W7_GOOD_PREVIEW, W7_GOOD_KATEX, W7_GOOD_FULLSCREEN, "W7a"),
+        (W7_GOOD_SHEET, W7_GOOD_PREVIEW, W7_GOOD_KATEX, W7_BAD_FULLSCREEN, "W7b"),
+        (W7_GOOD_SHEET, W7_BAD_PREVIEW, W7_GOOD_KATEX, W7_GOOD_FULLSCREEN, "W7c"),
+        (W7_GOOD_SHEET, W7_GOOD_PREVIEW, W7_BAD_KATEX, W7_GOOD_FULLSCREEN, "W7d"),
+        (W7_GOOD_SHEET, W7_PREVIEW_NO_EPOCH, W7_GOOD_KATEX, W7_GOOD_FULLSCREEN, "W7c"),
+        (W7_GOOD_SHEET, W7_GOOD_PREVIEW, W7_KATEX_NO_EPOCH, W7_GOOD_FULLSCREEN, "W7d"),
+    ]
+    for sheet_fx, preview_fx, katex_fx, fullscreen_fx, red_label in w7_cases:
+        d = w7(sheet_fx, preview_fx, katex_fx, fullscreen_fx)
+        reds = sorted(c for c in d if c.startswith("W7") and not d[c])
+        expect(len(reds) == 1 and reds[0].startswith(red_label),
+               "W7 revert fixture must red exactly %s, got %s" % (red_label, reds))
+        others = sorted(c for c, ok in d.items() if not c.startswith("W7") and not ok)
+        expect(not others, "W7 fixture must not disturb other criteria: %s" % others)
+
     if failures:
         print("SELFTEST FAIL:")
         for f in failures:
@@ -585,7 +801,8 @@ def selftest():
     print("selftest: good=GREEN, direct-assign revert=RED, legacy inline=RED, "
           "downstream rewrite=RED, desktop viewport false revert=RED, "
           "policy flip=RED, restore delete=RED, gallery walker revert=RED, "
-          "gallery flags missing=RED")
+          "gallery flags missing=RED, androidview key removed=RED (4 sites), "
+          "androidview rendererEpoch dropped=RED")
     return 0
 
 
@@ -599,7 +816,8 @@ def main(argv):
     args = [a for a in argv[1:] if a != "--selftest"]
     root = args[0] if args else "."
     paths = []
-    for rel in (HOLDER_REL, SHEET_REL, GALLERY_REL):
+    for rel in (HOLDER_REL, SHEET_REL, GALLERY_REL, FULLSCREEN_REL,
+                FILEPREVIEW_REL, KATEX_REL):
         p = os.path.join(root, rel)
         if not os.path.isfile(p):
             print("FAIL required file missing: %s" % rel)
@@ -609,7 +827,12 @@ def main(argv):
     holder_code = open(paths[0], encoding="utf-8").read()
     sheet_code = open(paths[1], encoding="utf-8").read()
     gallery_code = open(paths[2], encoding="utf-8").read()
-    results = analyse(holder_code, sheet_code, gallery_code)
+    fullscreen_code = open(paths[3], encoding="utf-8").read()
+    filepreview_code = open(paths[4], encoding="utf-8").read()
+    katex_code = open(paths[5], encoding="utf-8").read()
+    results = analyse(holder_code, sheet_code, gallery_code,
+                      filepreview_code=filepreview_code, katex_code=katex_code,
+                      fullscreen_code=fullscreen_code)
 
     failed = [(c, d, l) for c, ok, d, l in results if not ok]
     for crit, ok, detail, line in results:

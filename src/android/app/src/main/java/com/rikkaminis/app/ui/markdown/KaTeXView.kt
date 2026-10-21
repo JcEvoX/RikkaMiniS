@@ -211,7 +211,14 @@ fun KaTeXRenderView(
         // rendererEpoch discards this AndroidView and re-runs the factory with
         // a fresh WebView, instead of reusing an instance whose Chromium
         // process is gone (every call on such an instance is undefined).
-        key(rendererEpoch) {
+        // [dv17-3 B-03] `cacheKey` must stay in the key: `remember(cacheKey)`
+        // resets `rendererEpoch` to 0 when the key changes (streaming LaTeX
+        // updates / theme flips), so a bare `key(rendererEpoch)` never changes
+        // (0→0) and the factory never re-runs — while `renderedBitmap` /
+        // `renderError` below are `remember(cacheKey)` and *do* reset. The row
+        // therefore fell into the "placeholder while rendering" branch and
+        // stayed blank for the new formula, instead of rendering it.
+        key(cacheKey, rendererEpoch) {
             AndroidView(
                 factory = { ctx ->
                     WebView(ctx).apply {
