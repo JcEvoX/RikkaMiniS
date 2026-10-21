@@ -8,6 +8,7 @@ import com.rikkaminis.app.data.model.FallbackStrategy
 import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.model.ModelGroup
 import com.rikkaminis.app.data.model.RoutingStrategy
+import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.data.db.ChatSessionEntity
 import com.rikkaminis.app.data.db.MessageEntity
@@ -17,6 +18,7 @@ import com.rikkaminis.app.data.repository.MCPRepository
 import com.rikkaminis.app.data.repository.MemoryRepository
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.data.repository.SkillRepository
+import com.rikkaminis.app.logging.AppLogger
 import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
@@ -500,10 +502,25 @@ object ConfigBackup {
                             )
                             val prefix = if (isMcpRoot) "mcp" else "shared"
                             artifactSkipped += sel.oversizedSkipped + sel.nonTextSkipped
+                            // [dv20-a1 A-01] A credentials-free export must not
+                            // carry the MCP server config in the clear. This
+                            // artifact face was the one channel that ignored
+                            // `includeSecrets`, so a servers.json with
+                            // headers/env/args-token/url-query rode the "mcp/"
+                            // prefix into the archive while Stage 5 was busy
+                            // stripping those very fields out of the
+                            // `mcpServers` section. The redactor IS Stage 5's
+                            // single source (stripExportedMcpSecrets) — no
+                            // second rule. Gated on `!includeSecrets` so an
+                            // explicit with-credentials export is untouched.
+                            val transform =
+                                if (isMcpRoot && !includeSecrets) ::redactMcpArtifactEntry else null
+                            val dropped = ArrayList<String>()
                             totalBytes += ArtifactArchiver.writeEntries(
-                                zos, root, sel.files, "$prefix/",
+                                zos, root, sel.files, "$prefix/", transform, dropped,
                             )
-                            fileCount += sel.files.size
+                            fileCount += sel.files.size - dropped.size
+                            artifactSkipped += dropped.size
                         }
                     }
                 }
@@ -1077,7 +1094,14 @@ object ConfigBackup {
                 if (srcMembers != null) {
                     for (j in 0 until srcMembers.length()) {
                         val old = srcMembers.optString(j, "")
+                        // [dv20-a1 A-02] A System voice sentinel is virtual —
+                        // it is never in the backup's `modelEntries`, so the
+                        // entry map cannot know it and the member used to be
+                        // counted as dropped. The sentinel id is
+                        // device-independent (byte-identical to iOS), so
+                        // remap fidelity means keeping it verbatim.
                         val mapped = entryIdMap[old]
+                            ?: old.takeIf { SystemVoiceEntries.isSystemEntryId(it) }
                         if (mapped != null) members.add(mapped) else droppedMembers++
                     }
                 }
@@ -1817,6 +1841,33 @@ object ConfigBackup {
      * even with includeSecrets=false. A regression test pins the wrapper
      * shape the export path actually passes.
      */
+    /**
+     * [dv20-a1 A-01] Redact ONE archived artifact entry on its way into a
+     * credentials-free backup. Only `servers.json` — MCPRepository's on-disk
+     * config, `{"mcpServers":{"<id>":{…}}}` under `minis-global/mcp-servers`
+     * — carries credentials, and it is the exact shape the Stage 5 export
+     * section already strips, so this defers to the same
+     * [stripExportedMcpSecrets] instead of growing a second rule. Any other
+     * entry under the mcp root (the jsonl/md data files) passes verbatim.
+     *
+     * Returns **null to drop the entry**: bytes that do not parse must never
+     * be written verbatim into a no-secrets archive (fail closed). A
+     * credential that cannot be redacted is a credential that must not be
+     * exported — and the archive entry name is left to the caller, so restore
+     * routing is unchanged.
+     */
+    internal fun redactMcpArtifactEntry(relPath: String, bytes: ByteArray): ByteArray? {
+        if (relPath.substringAfterLast('/') != "servers.json") return bytes
+        return try {
+            val obj = JSONObject(String(bytes, Charsets.UTF_8))
+            stripExportedMcpSecrets(obj)
+            obj.toString(2).toByteArray(Charsets.UTF_8)
+        } catch (t: Throwable) {
+            AppLogger.warning(TAG, "mcp artifact redaction failed for $relPath: ${t.message}")
+            null
+        }
+    }
+
     internal fun stripExportedMcpSecrets(obj: JSONObject) {
         val inner = obj.optJSONObject("mcpServers")
         if (inner == null) {
