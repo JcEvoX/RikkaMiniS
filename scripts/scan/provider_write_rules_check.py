@@ -30,6 +30,15 @@ silent pass):
       isCustomBaseURLWriteAllowed( — pins ARCH-01's wiring decision, which the
       shape-tolerant symmetry gate intentionally cannot.
 
+  W8  [deep-audit-1039 A-04] `ProviderWriteRules.kt` declares the
+      normalization single source `normalizeCustomBaseURL`, and every
+      customBaseURL write face consumes it instead of spelling its own
+      blank/trim handling. Faces checked: the collection field writer
+      (ProvidersCollection), the add payload path
+      (`resolveAddCustomBaseURL`), and the debug
+      `provider.instances.create` / `instancesUpdate` bodies
+      (ProviderMutationMethods). fail-closed: an unknown/moved anchor is RED.
+
 Usage:  provider_write_rules_check.py <repo-root>
         provider_write_rules_check.py --selftest
 """
@@ -46,6 +55,43 @@ SELFTEST_MARKER = "PROVIDER_WRITE_RULES_SELFTEST=PASS"
 PWR_REL = "src/android/app/src/main/java/com/rikkaminis/app/config/collections/ProviderWriteRules.kt"
 PC_REL = "src/android/app/src/main/java/com/rikkaminis/app/config/collections/ProvidersCollection.kt"
 PM_REL = "src/android/app/src/main/java/com/rikkaminis/app/debug/ProviderMutationMethods.kt"
+PCF_REL = "src/android/app/src/main/java/com/rikkaminis/app/data/model/ProviderConfig.kt"
+
+# [deep-audit-1039 A-04] The normalization single source, and the bare
+# blank-handling spellings the customBaseURL faces used to carry on their own.
+NORMALIZE_DECL = "internal fun normalizeCustomBaseURL"
+NORMALIZE_CALL = "normalizeCustomBaseURL("
+# A customBaseURL write face that still trims/collapses inline is the drift W8
+# exists to stop. The check is scoped to the lines that TOUCH customBaseURL:
+# apiKey / customUserAgent / oauthToken blank handling is a different field's
+# business and must not make this criterion fire (a criterion that reds the
+# tree for an unrelated sibling is a broken criterion, not a strict one).
+INLINE_BLANK_PATTERNS = (
+    ".ifEmpty { null }",
+    "takeIf { it.isNotBlank() }",
+)
+# Faces that must consume the shared helper (label, file-relative path, code).
+# `add` is checked inside ProvidersCollection (resolveAddCustomBaseURL body),
+# so the PC-side entry is the field writer only.
+BASE_URL_FACES = (
+    ("ProvidersCollection.customBaseURL writer", "PC"),
+    ("ProvidersCollection.resolveAddCustomBaseURL", "PC"),
+    ("ProviderMutationMethods.instancesCreate", "PM"),
+    ("ProviderMutationMethods.instancesUpdate", "PM"),
+)
+
+
+def inline_blank_on_base_url_lines(body):
+    """Lines of `body` that mention customBaseURL AND spell blank handling
+    inline — the drift W8 forbids. Lines about other fields are ignored."""
+    offenders = []
+    for line in body.splitlines():
+        if "customBaseURL" not in line:
+            continue
+        for pat in INLINE_BLANK_PATTERNS:
+            if pat in line:
+                offenders.append((line.strip()[:90], pat))
+    return offenders
 
 SRC_SCAN_ROOT = "src/android/app/src/main/java"
 
@@ -176,7 +222,8 @@ def count_decl(root, needle):
 
 
 def check_tree(root):
-    detail = {k: [] for k in ("w1", "w2", "w3", "w4", "w5", "w6", "w7", "fail_closed")}
+    detail = {k: [] for k in ("w1", "w2", "w3", "w4", "w5", "w6", "w7",
+                               "w8", "w9", "fail_closed")}
 
     pwr = read_code(os.path.join(root, PWR_REL))
     pc = read_code(os.path.join(root, PC_REL))
@@ -247,15 +294,105 @@ def check_tree(root):
         if "isCustomBaseURLWriteAllowed(" not in writer:
             detail["w7"].append("customBaseURL writer does not route through isCustomBaseURLWriteAllowed(")
 
+    # ---- W8 [deep-audit-1039 A-04] normalization is single-sourced ----
+    if NORMALIZE_DECL not in pwr:
+        detail["w8"].append("ProviderWriteRules lacks %r (normalization single source)" % NORMALIZE_DECL)
+
+    face_code = {
+        "PC": pc,
+        "PM": pm,
+    }
+    for label, key in BASE_URL_FACES:
+        code = face_code[key]
+        if label.endswith("writer"):
+            body = extract_function(code, "customBaseURL")
+        elif label.endswith("resolveAddCustomBaseURL"):
+            body = extract_function(code, "resolveAddCustomBaseURL")
+        else:
+            body = extract_function(code, label.split(".")[-1])
+        if body is None:
+            detail["fail_closed"].append("%s: face body not found — re-anchor W8" % label)
+            continue
+        if NORMALIZE_CALL not in body:
+            detail["w8"].append("%s does not consume %s" % (label, NORMALIZE_CALL))
+        for line_text, pat in inline_blank_on_base_url_lines(body):
+            detail["w8"].append("%s spells blank handling inline on a customBaseURL line (%r): %s"
+                                % (label, pat, line_text))
+
+    # No other file in the main source set may carry a second normalization
+    # helper: exactly one declaration tree-wide.
+    norm_decls = count_decl(root, NORMALIZE_DECL)
+    if sum(c for _, c in norm_decls) != 1:
+        detail["w8"].append("normalizeCustomBaseURL declared %d times: %s"
+                            % (sum(c for _, c in norm_decls), norm_decls))
+    elif norm_decls[0][0] != PWR_REL:
+        detail["w8"].append("normalizeCustomBaseURL declared in %s, expected %s"
+                            % (norm_decls[0][0], PWR_REL))
+
+    # ---- W9 [deep-audit-1039 A-04] the read side trims before use ----
+    pcf = read_code(os.path.join(root, PCF_REL))
+    if pcf is None:
+        detail["fail_closed"].append("%s missing" % PCF_REL)
+    else:
+        getter = effective_base_getter(pcf)
+        if getter is None:
+            detail["fail_closed"].append("effectiveBaseURL getter not found in ProviderConfig.kt — re-anchor W9")
+        elif ".trim()" not in getter:
+            detail["w9"].append("effectiveBaseURL does not trim the stored value before use")
+        elif "trimEnd('/')" not in getter:
+            detail["w9"].append("effectiveBaseURL lost its trailing-slash collapse")
+
     bad = any(detail[k] for k in detail if k != "fail_closed") or detail["fail_closed"]
     return (1 if bad else 0), detail
+
+
+def effective_base_getter(code):
+    """Body of the `effectiveBaseURL` property getter — brace-matched, because
+    a property getter is not a `fun` and extract_function cannot find it."""
+    i = code.find("val effectiveBaseURL")
+    if i < 0:
+        return None
+    j = code.find("get() {", i)
+    if j < 0:
+        return None
+    k = code.index("{", j)
+    depth = 0
+    while k < len(code):
+        if code[k] == "{":
+            depth += 1
+        elif code[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return code[i:k + 1]
+        k += 1
+    return None
+
+
+def replace_in(rel, old, new):
+    """Selftest fixture builder: replace `old` with `new` in file `rel`.
+    fail-closed — a missing anchor aborts the whole selftest rather than
+    silently producing a fixture that mutates nothing."""
+    def fn(r, text):
+        if r != rel:
+            return text
+        assert old in text, "fixture anchor missing: %r" % old[:60]
+        return text.replace(old, new)
+    return fn
+
+
+def compose(*fns):
+    def fn(r, text):
+        for f in fns:
+            text = f(r, text)
+        return text
+    return fn
 
 
 def run_selftest():
     here = os.path.dirname(os.path.abspath(__file__))
     repo = os.path.abspath(os.path.join(here, "..", ".."))
     real = {}
-    for rel in (PWR_REL, PC_REL, PM_REL):
+    for rel in (PWR_REL, PC_REL, PM_REL, PCF_REL):
         code = read(os.path.join(repo, rel))
         if code is None:
             print("SELFTEST cannot load %s" % rel)
@@ -340,6 +477,105 @@ def run_selftest():
 
     run("S6-shared-rule-missing-W1", helper_removed, ("w1",))
 
+    # ─── [deep-audit-1039 A-04] W8/W9 fixtures ─────────────────────────────
+    # Every fixture is a "breaks exactly this criterion" mutation of the REAL
+    # tree files, so each new criterion has a tooth of its own.
+
+    def run_real(name, mutate_map, expect):
+        root = tempfile.mkdtemp(prefix="pwrselftest-w8-")
+        try:
+            for rel, text in real.items():
+                dest = os.path.join(root, rel)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                mutated = mutate_map(rel, text) if callable(mutate_map) else (
+                    mutate_map[rel] if rel in mutate_map else text)
+                with open(dest, "w", encoding="utf-8") as f:
+                    f.write(mutated)
+            rc, detail = check_tree(root)
+            got = tuple(sorted(k for k in detail if detail[k]))
+            exp = tuple(sorted(expect))
+            ok = (rc == 1 if exp else rc == 0) and got == exp
+            results.append((name, ok, rc, got, exp))
+        finally:
+            shutil.rmtree(root)
+
+    # S7: the shared helper disappears (declaration renamed) — W1 AND W8 red
+    # (W1 pins the declaration list, W8 pins the same declaration by name).
+    def helper_gone2(rel, text):
+        if rel == PWR_REL:
+            return text.replace(
+                "internal fun normalizeCustomBaseURL(raw: String?): String?",
+                "internal fun retiredNormalize(raw: String?): String?")
+        return text
+
+    # NOTE: W1 pins the four ORIGINAL shared-rule declarations and W8 pins the
+    # new helper by name — both read the same file, but W1's list does not
+    # include the helper, so removing it reds W8 only. That asymmetry is
+    # deliberate: W1's list is the ARCH-01 baseline (frozen so an unrelated
+    # rename cannot silently satisfy it), W8 owns the new criterion.
+    run_real("S7-normalize-helper-missing-W8", helper_gone2, ("w8",))
+
+    # S8: the collection writer reverts to its own inline blank handling — W8.
+    run_real("S8-writer-inline-blank-W8", replace_in(
+        PC_REL,
+        "                val newBase = normalizeCustomBaseURL(s)",
+        "                val newBase = s.ifEmpty { null }"), ("w8",))
+
+    # S9: the add path reverts to `takeIf { it.isNotBlank() }` — W8.
+    run_real("S9-add-path-inline-blank-W8", replace_in(
+        PC_REL,
+        "    val base = normalizeCustomBaseURL(raw) ?: return null",
+        "    val base = raw?.takeIf { it.isNotBlank() } ?: return null"), ("w8",))
+
+    # S10: the create face reverts to `ifEmpty { null }` — W8.
+    run_real("S10-create-face-inline-blank-W8", replace_in(
+        PM_REL,
+        '        val customBaseURL = normalizeCustomBaseURL(params.optString("customBaseURL", ""))',
+        '        val customBaseURL = params.optString("customBaseURL", "").ifEmpty { null }'), ("w8",))
+
+    # S11: the update face reverts (guard + copy arm) — W8.
+    def update_face_revert(rel, text):
+        if rel != PM_REL:
+            return text
+        return compose(
+            replace_in(
+                PM_REL,
+                '            val newBase = normalizeCustomBaseURL(params.optString("customBaseURL", ""))',
+                '            val newBase = params.optString("customBaseURL", "").ifEmpty { null }'),
+            replace_in(
+                PM_REL,
+                '                else normalizeCustomBaseURL(params.optString("customBaseURL", ""))',
+                '                else params.optString("customBaseURL", "").ifEmpty { null }'),
+        )(rel, text)
+
+    run_real("S11-update-face-inline-blank-W8", update_face_revert, ("w8",))
+
+    # S12: a SECOND normalization helper appears in another file — W8 (single decl).
+    def second_helper(rel, text):
+        if rel == PM_REL:
+            return text + ("\n\ninternal fun normalizeCustomBaseURL(raw: String?): String? = raw\n")
+        return text
+
+    run_real("S12-second-normalize-helper-W8", second_helper, ("w8",))
+
+    # S13: the read side stops trimming — W9.
+    run_real("S13-getter-drops-trim-W9", replace_in(
+        PCF_REL,
+        "            val base = customBaseURL?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } ?: return null",
+        "            val base = customBaseURL?.trimEnd('/') ?: return null"), ("w9",))
+
+    # S14: the read side keeps the trim but drops the trailing-slash collapse
+    # — W9 (a different tooth of the same criterion).
+    run_real("S14-getter-drops-slash-collapse-W9", replace_in(
+        PCF_REL,
+        "            val base = customBaseURL?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() } ?: return null",
+        "            val base = customBaseURL?.trim()?.takeIf { it.isNotEmpty() } ?: return null"), ("w9",))
+
+    # S15: contrast — a fixture where the helper is consumed on every face and
+    # the getter keeps both guards must stay GREEN (no criterion fires on the
+    # accepted shape).
+    run_real("S15-fixed-shape-green", lambda rel, text: text, ())
+
     all_ok = True
     for name, ok, rc, got, exp in results:
         print("%s %s (rc=%d got=%s exp=%s)" % ("PASS" if ok else "FAIL", name, rc, got, exp))
@@ -361,7 +597,8 @@ def main():
     rc, detail = check_tree(root)
     if rc == 0:
         print("provider_write_rules: ALL GREEN (W1 shared rules, W2/W3 single declaration, "
-              "W4 no literal copies, W5 debug wiring, W6 modelsAdd, W7 writer wiring)")
+              "W4 no literal copies, W5 debug wiring, W6 modelsAdd, W7 writer wiring, "
+              "W8 normalization single-sourced on every write face, W9 read side trims)")
         return 0
     print("provider_write_rules: FAIL")
     print(json.dumps(detail, indent=2))
