@@ -18,6 +18,7 @@ import com.rikkaminis.app.data.repository.MCPRepository
 import com.rikkaminis.app.data.repository.MemoryRepository
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.data.repository.SkillRepository
+import com.rikkaminis.app.logging.AppLogger
 import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
