@@ -214,8 +214,10 @@ fun KaTeXRenderView(
         // [dv17-3 B-03] `cacheKey` must stay in the key: `remember(cacheKey)`
         // resets `rendererEpoch` to 0 when the key changes (streaming LaTeX
         // updates / theme flips), so a bare `key(rendererEpoch)` never changes
-        // (0→0) and the AndroidView kept the factory closure capturing the old
-        // `latex` / `isDark`.
+        // (0→0) and the factory never re-runs — while `renderedBitmap` /
+        // `renderError` below are `remember(cacheKey)` and *do* reset. The row
+        // therefore fell into the "placeholder while rendering" branch and
+        // stayed blank for the new formula, instead of rendering it.
         key(cacheKey, rendererEpoch) {
             AndroidView(
                 factory = { ctx ->
