@@ -5,6 +5,7 @@ import com.rikkaminis.app.MinisApp
 import com.rikkaminis.app.data.model.LLMModel
 import com.rikkaminis.app.data.model.ProviderConfig
 import com.rikkaminis.app.data.model.ProviderType
+import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.repository.ProviderRepository
 import org.json.JSONArray
 import org.json.JSONObject
@@ -249,13 +250,21 @@ internal object ProviderDebugMethods {
             if (includeMembers) {
                 val members = JSONArray()
                 for (memberId in group.memberEntryIds) {
-                    val entry = cfg.modelEntries.find { it.id == memberId } ?: continue
+                    // [dv20-a1 A-02] System voice members are virtual — resolve
+                    // them through the shared sentinel so the harness sees the
+                    // member (with the synthetic "System" provider label)
+                    // instead of a silently missing row. `system` marks the row
+                    // so a caller can tell it from a persisted entry.
+                    val persisted = cfg.modelEntries.find { it.id == memberId }
+                    val entry = persisted ?: SystemVoiceEntries.resolve(memberId) ?: continue
                     val instLabel = cfg.instances.find { it.id == entry.providerInstanceId }?.label
+                        ?: SystemVoiceEntries.syntheticInstance().label
                     members.put(JSONObject().apply {
                         put("entryId", entry.id)
                         put("modelId", entry.baseModel.id)
                         put("displayName", entry.model.displayName)
-                        put("providerLabel", instLabel ?: "")
+                        put("providerLabel", instLabel)
+                        put("system", persisted == null)
                     })
                 }
                 obj.put("members", members)

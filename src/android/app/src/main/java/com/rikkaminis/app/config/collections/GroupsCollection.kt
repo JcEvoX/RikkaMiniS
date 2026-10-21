@@ -10,6 +10,7 @@ import com.rikkaminis.app.config.fields.ClosureField
 import com.rikkaminis.app.data.model.FallbackStrategy
 import com.rikkaminis.app.data.model.ModelGroup
 import com.rikkaminis.app.data.model.RoutingStrategy
+import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.data.repository.ProviderRepository
 
@@ -150,7 +151,15 @@ class GroupsCollection(
     private fun requireKnownEntryIds(ids: List<String>) {
         val valid = repo.config.value.modelEntries.map { it.id }.toSet()
         for (eid in ids) {
-            if (eid !in valid) throw ConfigError.InvalidValue("Unknown model entry uuid: $eid")
+            // [dv20-a1 A-02] The System voice sentinels are legitimate group
+            // members even though they are never persisted (see
+            // SystemVoiceEntries) — judging "known" from `modelEntries` alone
+            // refused every voice group written by the harness. The judgement
+            // is the shared predicate, not a second copy of it, so a truly
+            // unknown id is still refused fail-closed.
+            if (!SystemVoiceEntries.isKnownGroupMemberId(eid, valid)) {
+                throw ConfigError.InvalidValue("Unknown model entry uuid: $eid")
+            }
         }
     }
 

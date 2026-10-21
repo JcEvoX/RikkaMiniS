@@ -15,6 +15,7 @@ import com.rikkaminis.app.config.fields.ReadOnlyField
 import com.rikkaminis.app.data.repository.ChatRepository
 import com.rikkaminis.app.data.repository.EnvVarRepository
 import com.rikkaminis.app.data.repository.ProviderRepository
+import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.model.ThinkingLevel
 import kotlinx.coroutines.runBlocking
 import java.text.SimpleDateFormat
@@ -1403,7 +1404,11 @@ internal object ConfigBuiltins {
                     ConfigValue.Arr(
                         cfg.modelGroups.map { g ->
                             val entries = g.memberEntryIds.map { entryId ->
-                                val e = entriesById[entryId]
+                                // [dv20-a1 A-02] System voice members are
+                                // virtual (never in config.modelEntries) but
+                                // resolve to a real entry — surface the normal
+                                // shape instead of a "missing" stub.
+                                val e = entriesById[entryId] ?: SystemVoiceEntries.resolve(entryId)
                                 if (e == null) {
                                     ConfigValue.Obj(
                                         linkedMapOf(

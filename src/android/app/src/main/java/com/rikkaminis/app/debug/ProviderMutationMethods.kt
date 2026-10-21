@@ -22,6 +22,7 @@ import com.rikkaminis.app.config.collections.canonicalModelProviderName
 import com.rikkaminis.app.config.collections.normalizeCustomModelId
 import com.rikkaminis.app.data.model.ProviderType
 import com.rikkaminis.app.data.model.RoutingStrategy
+import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.provider.applyUserAgentOverride
@@ -580,7 +581,14 @@ internal object ProviderMutationMethods {
             val knownEntryIds = repo.config.value.modelEntries.map { it.id }.toSet()
             for (i in 0 until membersRaw.length()) {
                 val id = membersRaw.optString(i)
-                if (id.isNotEmpty() && id in knownEntryIds) members.add(id)
+                // [dv20-a1 A-02] Shared judgement: the System voice sentinels
+                // are virtual members that never appear in `modelEntries`, and
+                // this face used to drop them silently — a voice group created
+                // over the harness lost its members on the spot. The predicate
+                // is single-source, so a truly unknown id is still dropped.
+                if (id.isNotEmpty() && SystemVoiceEntries.isKnownGroupMemberId(id, knownEntryIds)) {
+                    members.add(id)
+                }
             }
         }
         val strategy = parseStrategy(params.optString("strategy", "fallback"))
@@ -646,7 +654,12 @@ internal object ProviderMutationMethods {
             val members = mutableListOf<String>()
             for (i in 0 until arr.length()) {
                 val mid = arr.optString(i)
-                if (mid.isNotEmpty() && mid in knownIds) members.add(mid)
+                // [dv20-a1 A-02] Same shared judgement as groupsCreate — a
+                // System voice member id is virtual, not unknown, and this
+                // face used to drop it while rewriting the member list.
+                if (mid.isNotEmpty() && SystemVoiceEntries.isKnownGroupMemberId(mid, knownIds)) {
+                    members.add(mid)
+                }
             }
             updated = updated.copy(memberEntryIds = members)
         }

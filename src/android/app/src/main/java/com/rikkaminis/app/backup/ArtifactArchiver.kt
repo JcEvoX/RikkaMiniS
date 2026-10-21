@@ -44,18 +44,38 @@ object ArtifactArchiver {
      * Append [files] as entries to an already-open [ZipOutputStream] — lets a
      * caller pack several roots into ONE archive ([ConfigBackup] packs
      * shared/ + mcp/ that way). [entryPrefix] decorates entry names only.
+     *
+     * [transform] is an optional per-entry hook applied to the bytes read from
+     * disk BEFORE they are written; its result becomes the archived content.
+     * Returning **null DROPS the entry** (fail closed — never a verbatim
+     * fallback) and appends its relPath to [droppedSink] when one is supplied,
+     * so the caller can keep its file/skip accounting honest. A null
+     * [transform] writes every entry verbatim (the pre-[dv20-a1] behaviour).
+     *
+     * Entry names/prefixes are never touched by the hook — a redacted entry
+     * keeps its name, so restore routing and on-disk layout are unchanged.
      */
     fun writeEntries(
         zos: ZipOutputStream,
         root: File,
         files: List<ArtifactBackupScope.SelectedFile>,
         entryPrefix: String = "",
+        transform: ((String, ByteArray) -> ByteArray?)? = null,
+        droppedSink: MutableList<String>? = null,
     ): Long {
         var totalBytes = 0L
         for (f in files) {
             val src = File(root, f.relPath.replace('/', File.separatorChar))
             if (!src.isFile) continue
-            val bytes = src.readBytes() // bounded by MAX_FILE_BYTES per file
+            var bytes = src.readBytes() // bounded by MAX_FILE_BYTES per file
+            if (transform != null) {
+                val transformed = transform(f.relPath, bytes)
+                if (transformed == null) {
+                    droppedSink?.add(f.relPath)
+                    continue
+                }
+                bytes = transformed
+            }
             zos.putNextEntry(ZipEntry(entryPrefix + f.relPath))
             zos.write(bytes)
             zos.closeEntry()
