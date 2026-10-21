@@ -253,6 +253,89 @@ def read(root, rel):
     with open(path, encoding="utf-8") as f:
         return f.read()
 
+# ── D: slash-menu memo wiring (dv17-4 / deep-audit-1038 B-05) ─────────────────
+SLASH_MEMO_DECL = "val filteredSlashCommands"
+SLASH_MEMO_CALL = "viewModel.filteredSlashCommands()"
+# A guard is a CONDITION on showSlashMenu — `if (…showSlashMenu…)`, a negated
+# `!showSlashMenu`, or a conjunction `showSlashMenu && …`. A bare
+# `val showSlashMenu by …collectAsState()` subscription is NOT a guard.
+SLASH_GUARD_RE = re.compile(
+    r"if\s*\(\s*!?\s*showSlashMenu\b|!\s*showSlashMenu\b|showSlashMenu\s*&&")
+
+def _balanced_paren(text, op):
+    """Index of the `)` matching the `(` at `op`; None when unbalanced. The memo
+    keys contain nested calls (`collectAsState()`), so a first-`)` scan would
+    truncate the key list."""
+    depth = 0
+    for i in range(op, len(text)):
+        c = text[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+def slash_memo_findings(inp_c):
+    """The slash list is only ever RENDERED under showSlashMenu, so:
+
+    D1  the memo must not key on `thinkingLevel` — that source has 0 reads in
+        the lambda (the /thinking row left `availableSlashCommands`), so the
+        key only buys a needless recompute + N+M `isEnabledForSession` query
+        burst on every thinking-notch tap;
+    D2  the memo must key on the live sources the body reads — the session
+        scope (currentSessionId/activeSessionId) and the two repository lists
+        the per-session filter walks (call shapes `.skills` / `.servers`);
+    D3  every `viewModel.filteredSlashCommands()` call must sit in a
+        showSlashMenu-gated region: the window from the memo declaration (and
+        800 chars of preceding statement context, so an early-exit shape is
+        legal too) up to the call must contain a guard. Binding the criterion
+        to the CONDITION (not to a specific spelling) keeps both legal shapes
+        open: `if (showSlashMenu) { remember… }` and `if (!showSlashMenu) …`
+        ahead of an ungated-looking call.
+    """
+    problems = []
+    memo = inp_c.find(SLASH_MEMO_DECL)
+    if memo == -1:
+        return [("D-memo", "%s not found — fail-closed (the slash list memo "
+                 "shape drifted?)" % SLASH_MEMO_DECL)]
+    rm = re.search(r"\bremember\s*\(", inp_c[memo:])
+    if rm is None:
+        return [("D-memo", "no remember( after %s — fail-closed" % SLASH_MEMO_DECL)]
+    op = memo + rm.end() - 1
+    close = _balanced_paren(inp_c, op)
+    if close is None:
+        return [("D-memo", "unbalanced remember key list — fail-closed")]
+    keys = inp_c[op + 1:close]
+
+    if re.search(r"\.thinkingLevel\b", keys):
+        problems.append(("D1", "the slash-menu memo keys on thinkingLevel — "
+                         "that source has 0 reads in the lambda (the /thinking row "
+                         "left availableSlashCommands), so every thinking-notch tap "
+                         "buys a needless recompute + N+M isEnabledForSession "
+                         "queries (B-05)"))
+    if not re.search(r"\b(currentSessionId|activeSessionId)\b", keys):
+        problems.append(("D2", "the slash-menu memo keys carry no session scope "
+                         "(currentSessionId/activeSessionId) — an open menu keeps "
+                         "showing the previous session's per-session skill/MCP "
+                         "enablement after ensureSession() lands (B-05)"))
+    for live, label in ((r"\.skills\b", "skill"), (r"\.servers\b", "MCP server")):
+        if not re.search(live, keys):
+            problems.append(("D2", "the slash-menu memo keys carry no %s list "
+                             "— an entry toggled for this session (or added from "
+                             "disk) never refreshes an open menu (B-05)" % label))
+
+    for m in re.finditer(re.escape(SLASH_MEMO_CALL), inp_c):
+        window = inp_c[max(0, memo - 800):m.start()]
+        if not SLASH_GUARD_RE.search(window):
+            problems.append(("D3", "%s runs ungated — the list is only rendered "
+                             "under showSlashMenu, so every composition pays the "
+                             "N+M isEnabledForSession queries for a value the next "
+                             "line drops (B-05)" % SLASH_MEMO_CALL))
+    return problems
+
+
 
 # ── the gate ─────────────────────────────────────────────────────────────────
 
@@ -462,6 +545,9 @@ def check_tree(root):
                              "(!inputFocused) must survive — swiping up with nothing to "
                              "send and no focus pops the keyboard"))
 
+    # ── D1-D3: slash-menu memo wiring (dv17-4 / B-05) ───────────────────────
+    problems.extend(slash_memo_findings(inp_c))
+
     return INPUT_REL, problems
 
 
@@ -507,6 +593,21 @@ fun ChatInputArea() {
     val swipeThresholdPxState = rememberUpdatedState(
         with(LocalDensity.current) { sendSwipeThresholdDp.dp.toPx() },
     )
+    val showSlashMenu by viewModel.showSlashMenu.collectAsState()
+    val filteredSlashCommands = if (showSlashMenu) {
+        remember(
+            viewModel.slashFilter.collectAsState().value,
+            viewModel.memoryEnabled.collectAsState().value,
+            viewModel.currentSessionId,
+            viewModel.skillRepository?.skills?.collectAsState()?.value,
+            viewModel.mcpRepository?.servers?.collectAsState()?.value,
+        ) { viewModel.filteredSlashCommands() }
+    } else {
+        emptyList()
+    }
+    if (showSlashMenu && filteredSlashCommands.isNotEmpty()) {
+        Text(filteredSlashCommands.size.toString())
+    }
     val canSwipeSendNow: () -> Boolean = {
         inputFieldValue.text.isNotBlank() || attachments.isNotEmpty()
     }
@@ -779,12 +880,65 @@ def selftest():
             "                } else if (swipedUp && !canSwipeSendNow()) {"),
     }), ["C6"])
 
+    # ── D1-D3 (dv17-4 / B-05) ───────────────────────────────────────────────
+    # D1: the dead thinkingLevel key is back
+    expect("D1 dead thinkingLevel key", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "            viewModel.memoryEnabled.collectAsState().value,\n",
+            "            viewModel.memoryEnabled.collectAsState().value,\n"
+            "            viewModel.thinkingLevel.collectAsState().value,\n"),
+    }), ["D1"])
+    # D2: session scope dropped from the keys
+    expect("D2 session scope dropped", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "            viewModel.currentSessionId,\n", ""),
+    }), ["D2"])
+    # D2: the two live repository lists dropped from the keys
+    expect("D2 repository lists dropped", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "            viewModel.skillRepository?.skills?.collectAsState()?.value,\n"
+            "            viewModel.mcpRepository?.servers?.collectAsState()?.value,\n", ""),
+    }), ["D2"])
+    # D3: the pre-fix shape — the memo computed unconditionally, with the menu
+    # gate only on the NEXT line (the rendered-value-drop baseline)
+    expect("D3 ungated memo (baseline shape)", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "    val filteredSlashCommands = if (showSlashMenu) {\n"
+            "        remember(\n"
+            "            viewModel.slashFilter.collectAsState().value,\n"
+            "            viewModel.memoryEnabled.collectAsState().value,\n"
+            "            viewModel.currentSessionId,\n"
+            "            viewModel.skillRepository?.skills?.collectAsState()?.value,\n"
+            "            viewModel.mcpRepository?.servers?.collectAsState()?.value,\n"
+            "        ) { viewModel.filteredSlashCommands() }\n"
+            "    } else {\n"
+            "        emptyList()\n"
+            "    }\n",
+            "    val filteredSlashCommands = remember(\n"
+            "        showSlashMenu,\n"
+            "        viewModel.slashFilter.collectAsState().value,\n"
+            "        viewModel.memoryEnabled.collectAsState().value,\n"
+            "        viewModel.currentSessionId,\n"
+            "        viewModel.skillRepository?.skills?.collectAsState()?.value,\n"
+            "        viewModel.mcpRepository?.servers?.collectAsState()?.value,\n"
+            "    ) { viewModel.filteredSlashCommands() }\n"),
+    }), ["D3"])
+    # precision: an early-exit guard is a legal shape (D3 must stay green)
+    expect("D3 precision: early-exit guard accepted", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "    val filteredSlashCommands = if (showSlashMenu) {\n",
+            "    if (!showSlashMenu) {\n"
+            "        return@ChatInputArea\n"
+            "    }\n"
+            "    val filteredSlashCommands = if (true) {\n"),
+    }), None)
+
     if failures:
         print("❌ selftest failed:")
         for f in failures:
             print("   " + f)
         return 1
-    print("CHAT_UI_INTERACTION_SELFTEST=PASS (12 fixtures: clean + 11 violation)")
+    print("CHAT_UI_INTERACTION_SELFTEST=PASS (18 fixtures: clean + 17 violation/precision)")
     return 0
 
 
