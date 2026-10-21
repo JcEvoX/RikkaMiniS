@@ -213,6 +213,61 @@ class OffloadCliArgsTest {
         )
     }
 
+    // ── A'''. the pre-scan reads the REWRITTEN list (dv19-A1, A-01) ──────────
+    //
+    // The alias only bound when it sat AFTER the subcommand: the probe at the
+    // head of [ContactsOffloadHandler.bindLegacyShortMax] asked the parser
+    // about the RAW argv, where `-n 10` is still an unbound single-dash token —
+    // so "10" took positional[0], `sub` came out "10" (neither list nor
+    // search), the function returned the un-rewritten argv and the command
+    // refused with `unknown subcommand '10'` (exit 2). Both positions must now
+    // agree, which is what the KDoc promises.
+
+    @Test
+    fun `legacy -n before the subcommand still names the list subcommand`() {
+        val c = parse("-n", "10", "list")
+        assertEquals("list", c.sub)
+        assertNull(c.id)
+        assertEquals(10, ContactsOffloadHandler.listMax(c.args))
+    }
+
+    @Test
+    fun `legacy -n before the subcommand behind an output flag keeps both`() {
+        val c = parse("--compact", "-n", "10", "list")
+        assertEquals("list", c.sub)
+        assertTrue(c.args.hasFlag("compact"))
+        assertEquals(10, ContactsOffloadHandler.listMax(c.args))
+    }
+
+    @Test
+    fun `legacy -n before search binds the page size and keeps the query`() {
+        val c = parse("-n", "10", "search", "Alice")
+        assertEquals("search", c.sub)
+        assertEquals("Alice", c.args.positional.getOrNull(1))
+        assertEquals(10, ContactsOffloadHandler.listMax(c.args, 20))
+    }
+
+    @Test
+    fun `the leading alias is rewritten to the same spelling the trailing one uses`() {
+        assertEquals(
+            listOf("--max", "10", "list"),
+            ContactsOffloadHandler.bindLegacyShortMax(listOf("-n", "10", "list")),
+        )
+        assertEquals(
+            listOf("list", "--max", "10"),
+            ContactsOffloadHandler.bindLegacyShortMax(listOf("list", "-n", "10")),
+        )
+    }
+
+    @Test
+    fun `a leading non-numeric alias still falls through untouched`() {
+        assertEquals(
+            listOf("-n", "list"),
+            ContactsOffloadHandler.bindLegacyShortMax(listOf("-n", "list")),
+        )
+        assertEquals("list", parse("-n", "list").sub)
+    }
+
     // ── B. `minis-config --file` relative path resolution ───────────────────
 
     @Test

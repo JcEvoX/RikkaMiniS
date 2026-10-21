@@ -195,4 +195,93 @@ class FastioSearchTest {
         assertEquals(1L, out.filesScanned)
         assertEquals(listOf("/ws/small.txt"), out.matches.map { it.guestPath })
     }
+
+    // ── [dv19-A1 A-03] the budget is spent per ROOT, not per tree ────────────
+    //
+    // `grep` (the handler) carries ONE match budget across several roots:
+    // `remaining -= outcome.matches.size`, and the next root is walked with
+    // whatever is left. A root that opens with `limit == 0` used to be walked
+    // end to end — the walk only learned the budget was gone at the first
+    // MATCHING line (grepFile:220), so a root of non-matching files was read in
+    // full (up to 8 MiB per file) to find nothing. The invariant these cases
+    // pin: once the budget is spent, no file is opened and no directory is
+    // entered.
+
+    @Test
+    fun `a root reached with a spent budget is never scanned`() {
+        val first = Files.createTempDirectory("fastio-grep-first")
+        // Three hits for a budget of two: the third is what sets matchesCapped
+        // ("exactly limit matches" is deliberately NOT capped — see the KDoc).
+        Files.write(first.resolve("hits.txt"), "hit\nhit\nhit\n".toByteArray())
+        val second = Files.createTempDirectory("fastio-grep-second")
+        Files.write(second.resolve("a.txt"), "alpha\n".toByteArray())
+        val sub = Files.createDirectory(second.resolve("sub"))
+        Files.write(sub.resolve("b.txt"), "beta\n".toByteArray())
+
+        val firstOut = GrepOutcome()
+        grepTree(first, "/one", Regex("hit"), limit = 2, maxEntries = 1_000, out = firstOut)
+        assertEquals(2, firstOut.matches.size)
+        assertTrue(firstOut.matchesCapped)
+
+        // Exactly what FastioOffloadHandler.grep does with `remaining`.
+        val remaining = 2 - firstOut.matches.size
+        assertEquals(0, remaining)
+        val secondOut = GrepOutcome()
+        grepTree(second, "/two", Regex("hit"), limit = remaining, maxEntries = 1_000, out = secondOut)
+
+        assertTrue(secondOut.matches.isEmpty())
+        assertTrue(secondOut.matchesCapped)
+        assertEquals(0L, secondOut.filesScanned)
+        assertEquals(0L, secondOut.bytesScanned)
+        assertEquals(0L, secondOut.visited)
+    }
+
+    @Test
+    fun `a zero budget lists nothing and opens no file`() {
+        val root = grepFixture()
+        val out = GrepOutcome()
+
+        grepTree(root, "/ws", Regex("two"), limit = 0, maxEntries = 1_000, out = out)
+
+        assertTrue(out.matches.isEmpty())
+        assertTrue(out.matchesCapped)
+        assertEquals(0L, out.filesScanned)
+        assertEquals(0L, out.bytesScanned)
+        assertEquals(0L, out.visited)
+        assertFalse(out.truncated)
+    }
+
+    @Test
+    fun `the file that fills the budget is the last entry charged`() {
+        val root = Files.createTempDirectory("fastio-grep-stop")
+        Files.write(root.resolve("a.txt"), "hit\nhit\nhit\n".toByteArray())
+        Files.write(root.resolve("b.txt"), "hit\nhit\nhit\n".toByteArray())
+        val sub = Files.createDirectory(root.resolve("sub"))
+        Files.write(sub.resolve("c.txt"), "nothing\n".toByteArray())
+        val out = GrepOutcome()
+
+        grepTree(root, "/ws", Regex("hit"), limit = 2, maxEntries = 1_000, out = out)
+
+        // Whichever file the walk reaches first fills the budget; whatever came
+        // next — a sibling file or a subdirectory — is never entered, so the
+        // only charged entries are the root and that one file.
+        assertEquals(2, out.matches.size)
+        assertTrue(out.matchesCapped)
+        assertEquals(1L, out.filesScanned)
+        assertEquals(2L, out.visited)
+        assertFalse(out.truncated)
+    }
+
+    @Test
+    fun `an already capped outcome never enters a directory`() {
+        val root = grepFixture()
+        val out = GrepOutcome()
+        out.matchesCapped = true // as set by the file that filled the budget
+
+        grepTree(root, "/ws", Regex("two"), limit = 100, maxEntries = 1_000, out = out)
+
+        assertEquals(0L, out.visited)
+        assertEquals(0L, out.filesScanned)
+        assertFalse(out.truncated)
+    }
 }
