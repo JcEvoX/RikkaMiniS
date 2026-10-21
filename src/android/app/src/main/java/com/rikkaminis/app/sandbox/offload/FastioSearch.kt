@@ -149,6 +149,13 @@ internal class GrepOutcome : EntryBudget {
  * win on a big tree) and sets [GrepOutcome.matchesCapped], which the caller
  * reports as `truncated`. It can therefore over-report when a tree holds
  * exactly `limit` matches — the safe direction.
+ *
+ * [dv19-A1 A-03] The stop is enforced at all three points a walk can spend
+ * budget, because the caller spends ONE budget across several roots
+ * (`remaining`): a later root is asked for `limit == 0` after an earlier one
+ * used the whole budget, and a scan that only checked the cap inside
+ * [grepFile] walked such a root to the end — reading every non-matching file
+ * (up to [MAX_GREP_FILE_BYTES] each) to find nothing.
  */
 internal fun grepTree(
     root: Path,
@@ -158,11 +165,23 @@ internal fun grepTree(
     maxEntries: Long,
     out: GrepOutcome,
 ) {
+    // A non-positive budget means "list no hit at all": answer as capped
+    // without opening a single file. Without this the walk only learns the
+    // budget is spent at the first MATCHING line, so a root of non-matching
+    // files is read in full.
+    if (limit <= 0) {
+        out.matchesCapped = true
+        return
+    }
     try {
         Files.walkFileTree(
             root,
             object : SimpleFileVisitor<Path>() {
                 override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult {
+                    // Before charging: a spent budget must not keep counting
+                    // directories as visited (that is what turned a
+                    // matches_capped result into `truncated` as well).
+                    if (out.matchesCapped) return FileVisitResult.TERMINATE
                     if (charge(out, maxEntries)) return FileVisitResult.TERMINATE
                     return FileVisitResult.CONTINUE
                 }
@@ -180,7 +199,16 @@ internal fun grepTree(
                     }
                     out.bytesScanned += attrs.size()
                     grepFile(file, guestPathFor(root, rootGuestPath, file), regex, limit, out)
-                    return FileVisitResult.CONTINUE
+                    // [dv19-A1 A-03] The budget can be filled INSIDE this file:
+                    // stop here instead of walking on until some later entry
+                    // notices, so no further directory is descended (and no
+                    // further file opened) after the last match the caller
+                    // asked for.
+                    return if (out.matchesCapped) {
+                        FileVisitResult.TERMINATE
+                    } else {
+                        FileVisitResult.CONTINUE
+                    }
                 }
 
                 override fun visitFileFailed(file: Path, exc: IOException): FileVisitResult {

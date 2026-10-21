@@ -47,11 +47,21 @@ class SessionsOffloadHandler(
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
         // argv[0] is the program name ("minis-sessions-cli"); subcommand
         // and options follow. Drop argv[0] before parsing so positional[0]
-        // is the subcommand name. `full` / `async` / `help` are declared
-        // boolean so `--flag <token>` never greedily consumes the next token
-        // as a value (e.g. `--async send --prompt "hi"` would otherwise
+        // is the subcommand name. `full` / `async` / `wait` / `help` are
+        // declared boolean so `--flag <token>` never greedily consumes the next
+        // token as a value (e.g. `--async send --prompt "hi"` would otherwise
         // swallow "send" as the value of --async and degrade to `list`).
-        val args = OffloadArgs(request.argv.drop(1), booleanFlags = setOf("full", "async", "help", "h"))
+        // [dv19-A1 A-02] `wait` was missing from that list — the same defect one
+        // flag over: `minis-sessions-cli --wait send --prompt "hi"` stored
+        // "send" as the VALUE of `--wait` (the KDoc below documents `--wait` as
+        // the default mode, so it is a spelling callers legitimately write), the
+        // positional list came out empty and the command listed sessions with
+        // exit 0 — a silent wrong answer instead of a dispatch. `--wait-timeout`
+        // stays a value option: declaring IT boolean would eat its `<sec>`.
+        val args = OffloadArgs(
+            request.argv.drop(1),
+            booleanFlags = setOf("full", "async", "wait", "help", "h"),
+        )
         if (args.hasFlag("h", "help")) {
             return NativeOffloadResult(0, OffloadOutput.formatBody(HELP_TEXT, args) + "\n")
         }
@@ -455,6 +465,7 @@ OPTIONS:
   --prompt <text>       (send only) The prompt to send
   --session <id>        (send only) Continue an existing session (default: new)
   --async               (send only) Return immediately with the session id
+  --wait                (send only) Block until the reply completes (default; --async wins)
   --wait-timeout <sec>  (send only) Max wait for --wait completion (default 600)
   --help, -h            Show this help message
   --compact             Minimize JSON output
