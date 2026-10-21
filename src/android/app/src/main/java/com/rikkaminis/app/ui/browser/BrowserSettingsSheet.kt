@@ -383,7 +383,6 @@ fun BrowserSettingsSheet(
             // [fix/da1022-G] hasCookies was a plain local var; keying on a tick state
             // is what makes delete/clear actually refresh the section.
             val cookieManager = remember { CookieManager.getInstance() }
-            val hasCookies = remember(cookieRefreshTick, historyRevision) { cookieManager.hasCookies() }
             val historyStore = remember { com.rikkaminis.app.browser.BrowserHistoryStore.getInstance(context) }
             // [deep-audit-1039 B-07] ...and the refresh signal for the DOMAIN
             // list is the STORE's, not this sheet's. The sheet's own tick only
@@ -394,8 +393,10 @@ fun BrowserSettingsSheet(
             // keyed on the panel tick alone it kept rendering the pre-reload
             // snapshot until the sheet was closed and reopened. Subscribe to
             // the store's counter exactly like BrowserHistorySheet ([dv15-B3])
-            // does and feed it into both remembers below.
+            // does and feed it into both remembers below. (Declared before them
+            // on purpose: a `by` delegate is a local val, not a hoisted symbol.)
             val historyRevision by historyStore.revision.collectAsState()
+            val hasCookies = remember(cookieRefreshTick, historyRevision) { cookieManager.hasCookies() }
             // [fix/da1022-G] Real cookie domains cannot be enumerated on Android
             // (getCookie(url) needs a URL; hasCookies() is just a boolean), so the
             // list is the history domains probed against both schemes — exactly the
