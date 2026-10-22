@@ -911,10 +911,10 @@ class ModelExecutionService : Service() {
         } else null
         val imageParts = jsonObjList(req.optJSONArray("image_parts")).map { obj ->
             com.rikkaminis.app.data.model.LLMMessage.ImagePart(
-                data = obj.optString("data", "").let { b64 ->
-                    if (b64.isNotEmpty()) android.util.Base64.decode(b64, android.util.Base64.DEFAULT)
-                    else ByteArray(0)
-                },
+                // [dv21-A06] Same decode entry as the streaming path and the
+                // `media_files` consumer — a wrapped (RFC 2045) payload used to be
+                // accepted here and rejected there.
+                data = OffloadWireBase64.decode(obj.optString("data", "")) ?: ByteArray(0),
                 mimeType = obj.optString("mime_type", "image/png"),
                 linuxPath = obj.optString("linux_path", "").ifEmpty { null },
             )
@@ -1313,10 +1313,10 @@ class ModelExecutionService : Service() {
             } else null
             val imageParts = jsonObjList(req.optJSONArray("image_parts")).map { obj ->
                 com.rikkaminis.app.data.model.LLMMessage.ImagePart(
-                    data = obj.optString("data", "").let { b64 ->
-                        if (b64.isNotEmpty()) java.util.Base64.getDecoder().decode(b64)
-                        else ByteArray(0)
-                    },
+                    // [dv21-A06] The streaming entry used the strict RFC 4648 decoder
+                    // with no guard: a wrapped payload threw out of the run and a
+                    // malformed one killed the whole stream.
+                    data = OffloadWireBase64.decode(obj.optString("data", "")) ?: ByteArray(0),
                     mimeType = obj.optString("mime_type", "image/png"),
                     linuxPath = obj.optString("linux_path", "").ifEmpty { null },
                 )
@@ -1779,7 +1779,7 @@ class ModelExecutionService : Service() {
                         val error = p.optBoolean("isError", false)
                         val content = getString(p, "content")
                         val imageData: ByteArray? = p.optString("imageDataB64").takeIf { it.isNotBlank() }
-                            ?.let { runCatching { java.util.Base64.getDecoder().decode(it) }.getOrNull() }
+                            ?.let { OffloadWireBase64.decode(it) }
                         val imageMimeType = getString(p, "imageMimeType").ifEmpty { null }
                         val imageLinuxPath = getString(p, "imageLinuxPath").ifEmpty { null }
                         parts.add(com.rikkaminis.app.data.model.AgentContentPart.ToolResult(
@@ -1794,8 +1794,7 @@ class ModelExecutionService : Service() {
                     }
                     "image", "imagedata" -> {
                         val b64 = getString(p, "b64Data")
-                        val data = if (b64.isNotBlank()) { runCatching { java.util.Base64.getDecoder().decode(b64) }.getOrNull() ?: ByteArray(0) }
-                        else ByteArray(0)
+                        val data = OffloadWireBase64.decode(b64) ?: ByteArray(0)
                         val mimeType = getString(p, "mimeType").ifEmpty { "image/png" }
                         val linuxPath = getString(p, "linuxPath").ifEmpty { null }
                         parts.add(com.rikkaminis.app.data.model.AgentContentPart.ImageData(data = data, mimeType = mimeType, linuxPath = linuxPath))

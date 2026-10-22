@@ -170,4 +170,141 @@ class ModelUseProtocolTest {
             )
         }
     }
+
+    // ── [dv21-A06] one decode entry for the offload wire ────────────────────
+    //
+    // The wire carries media as base64 and the producers are not uniform:
+    // `android.util.Base64.encodeToString(..., NO_WRAP)` writes one long line,
+    // `Base64.DEFAULT` wraps at 76 chars. Each consumer hand-rolled its own
+    // decoder, so the SAME field was accepted by one path and rejected by
+    // another — and two of the strict ones threw the exception straight out of
+    // the run (an attachment's malformed base64 discarded the whole reply).
+
+    /** 80 ASCII bytes = "0123456789" x8; base64 is the literal below. */
+    private val wirePayload = "0123456789".repeat(8)
+
+    private companion object {
+        const val WIRE_B64 =
+            "MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODkw" +
+                "MTIzNDU2Nzg5MDEyMzQ1Njc4OTAxMjM0NTY3ODk="
+    }
+
+    @Test
+    fun `a MIME-wrapped payload decodes to the same bytes as the single-line form`() {
+        val wrapped = WIRE_B64.chunked(76).joinToString("\r\n")
+        assertEquals(WIRE_B64, WIRE_B64.chunked(76).joinToString(""))
+        assertEquals(wirePayload, OffloadWireBase64.decode(WIRE_B64)?.toString(Charsets.UTF_8))
+        assertEquals(
+            "the wrapped RFC 2045 form must decode identically — the worker's " +
+                "own DEFAULT-flag encoder can produce it",
+            wirePayload,
+            OffloadWireBase64.decode(wrapped)?.toString(Charsets.UTF_8),
+        )
+    }
+
+    @Test
+    fun `the strict RFC 4648 decoder is what rejects the wrapped form`() {
+        // Teeth: proves the wrapped payload above is exactly the input the old
+        // code (java.util.Base64.getDecoder().decode) could not read.
+        val wrapped = WIRE_B64.chunked(76).joinToString("\r\n")
+        var threw = false
+        try {
+            java.util.Base64.getDecoder().decode(wrapped)
+        } catch (e: IllegalArgumentException) {
+            threw = true
+        }
+        assertTrue("strict RFC 4648 decoding must reject a wrapped payload", threw)
+    }
+
+    @Test
+    fun `a malformed payload yields null instead of throwing`() {
+        assertEquals("an empty field is 'no bytes', not a decode error", null, OffloadWireBase64.decode(""))
+        // A wrong final 4-byte unit is one of the few shapes the MIME decoder
+        // does reject — and it must come back as null, not as an
+        // IllegalArgumentException escaping a mapNotNull.
+        assertEquals(null, OffloadWireBase64.decode("MDEyMzQ1Njc4OTAxMjM0NTY3O"))
+        // The MIME alphabet is deliberately lenient (characters outside the
+        // table are ignored rather than rejected), so the contract pinned here
+        // is "never throws", not "detects every corruption". Record it so a
+        // future change to a strict-round-trip validator is a deliberate edit.
+        assertTrue(
+            OffloadWireBase64.decode("not base64 at all !!!") != null,
+        )
+    }
+
+    @Test
+    fun `every offload-wire consumer decodes through the shared entry`() {
+        val files = listOf(
+            "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ModelUseOffloadHandler.kt",
+            "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ModelExecutionService.kt",
+            "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ChatStreamJsonl.kt",
+        )
+        var checked = 0
+        for (rel in files) {
+            val text = readRepoFile(rel) ?: continue
+            checked++
+            val name = rel.substringAfterLast('/')
+            assertFalse(
+                "$name must not use the strict RFC 4648 decoder on the offload wire",
+                codeOnly(text).contains("java.util.Base64.getDecoder()"),
+            )
+            assertTrue(
+                "$name must decode media through OffloadWireBase64.decode",
+                codeOnly(text).contains("OffloadWireBase64.decode("),
+            )
+        }
+        if (checked == 0) return // tree not on disk
+        val gateway = readRepoFile(
+            "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ProviderExecutionGateway.kt",
+        ) ?: return
+        assertTrue(
+            "the gateway's own MIME decode (pinned by offload_media_b64_wire_check) stays",
+            gateway.contains("java.util.Base64.getMimeDecoder()"),
+        )
+        val helper = readRepoFile(
+            "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/OffloadWireBase64.kt",
+        ) ?: return
+        assertTrue(helper.contains("java.util.Base64.getMimeDecoder()"))
+        assertTrue(helper.contains("runCatching"))
+    }
+
+    /** Drop line and block comments (prose about a removed shape is legal). */
+    private fun codeOnly(src: String): String {
+        val sb = StringBuilder()
+        var i = 0
+        var quote: Char? = null
+        while (i < src.length) {
+            val c = src[i]
+            if (quote != null) {
+                sb.append(c)
+                if (c == '\\' && i + 1 < src.length) {
+                    sb.append(src[i + 1])
+                    i += 2
+                    continue
+                }
+                if (c == quote) quote = null
+                i++
+                continue
+            }
+            if (c == '"' || c == '\'') {
+                quote = c
+                sb.append(c)
+                i++
+                continue
+            }
+            if (c == '/' && i + 1 < src.length && src[i + 1] == '/') {
+                while (i < src.length && src[i] != '\n') i++
+                continue
+            }
+            if (c == '/' && i + 1 < src.length && src[i + 1] == '*') {
+                i += 2
+                while (i < src.length && !(src[i] == '*' && i + 1 < src.length && src[i + 1] == '/')) i++
+                i += 2
+                continue
+            }
+            sb.append(c)
+            i++
+        }
+        return sb.toString()
+    }
 }
