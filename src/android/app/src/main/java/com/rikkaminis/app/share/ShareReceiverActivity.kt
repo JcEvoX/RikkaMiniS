@@ -45,20 +45,20 @@ class ShareReceiverActivity : ComponentActivity() {
         private const val IO_TIMEOUT_MS = 30_000L               // 30 s per file
 
         /**
-         * Process-lifetime cumulative counter of bytes staged for the pending
-         * share, tracked as a companion [java.util.concurrent.atomic.AtomicLong]
-         * (not an instance field) so it survives Activity re-creation
-         * (rotation / low-memory death while the staged files themselves remain
-         * on disk). Resets only when the whole process is reaped, matching the
-         * lifecycle of [SharedShareStore]'s dirty staging files. Guards against
-         * a single user flooding many share intents past [MAX_TOTAL_BYTES]
-         * across Activity instances.
+         * Process-lifetime cumulative budget of bytes staged for the pending
+         * share, owned by the pure [StagedBytesLedger] (companion-scoped, not
+         * an instance field) so it survives Activity re-creation (rotation /
+         * low-memory death while the staged files themselves remain on disk).
+         * Resets only when the whole process is reaped, matching the lifecycle
+         * of [SharedShareStore]'s dirty staging files. Guards against a single
+         * user flooding many share intents past [MAX_TOTAL_BYTES] across
+         * Activity instances.
          */
-        private val totalStagedBytes = java.util.concurrent.atomic.AtomicLong(0)
+        private val stagedBytes = StagedBytesLedger()
 
         /** Reset the cumulative staged-byte counter after the staged set is deleted. */
         fun resetStagedBytes() {
-            totalStagedBytes.set(0L)
+            stagedBytes.reset()
         }
 
         /**
@@ -66,9 +66,13 @@ class ShareReceiverActivity : ComponentActivity() {
          * [SharedShareStore.cleanSharedFiles] (e.g. the provider-import path).
          * Clamped at 0 — over-counting would falsely trip [MAX_TOTAL_BYTES]
          * and reject legitimate shares while nothing is on disk.
+         * [§1042-A-07] The clamp used to be applied to a DISCARDED copy
+         * (`addAndGet(-bytes).coerceAtLeast(0L)` as a statement), so a double
+         * debit drove the real counter negative and the cumulative check
+         * under-counted. The ledger writes the clamped balance back.
          */
         fun debitStagedBytes(bytes: Long) {
-            totalStagedBytes.addAndGet(-bytes).coerceAtLeast(0L)
+            stagedBytes.debit(bytes)
         }
     }
 
@@ -293,10 +297,33 @@ class ShareReceiverActivity : ComponentActivity() {
             is SingleSendDecision.InlineText ->
                 out += PendingShare.Item(PendingShare.Item.Kind.INLINE_TEXT, d.text)
             is SingleSendDecision.AttachText -> {
-                val name = "shared-text-${shortId()}.txt"
-                File(SharedShareStore.sharedFileDirectory(this), name)
-                    .writeText(d.text, Charsets.UTF_8)
-                out += PendingShare.Item(PendingShare.Item.Kind.ATTACHMENT, name)
+                // [§1042-A-07] Text attachments used to skip the staging
+                // budget entirely: no MAX_FILE_BYTES / MAX_TOTAL_BYTES guard
+                // and no credit, so a flood of huge EXTRA_TEXT shares grew the
+                // staging dir past the 500 MB cap the binary path enforces.
+                // Same two guards as copyUriToStaging, decided by the pure
+                // [admitAttachText] core (JVM-pinned) and counted in UTF-8
+                // bytes — the budget is bytes, not characters.
+                val textBytes = attachTextByteCount(d.text)
+                val admission = admitAttachText(
+                    textBytes,
+                    stagedBytes.current(),
+                    MAX_FILE_BYTES,
+                    MAX_TOTAL_BYTES,
+                )
+                when (admission) {
+                    AttachTextAdmission.RejectedPerFile ->
+                        AppLogger.warning(TAG, "AttachText not staged: $textBytes bytes exceeds per-file cap $MAX_FILE_BYTES")
+                    AttachTextAdmission.RejectedCumulative ->
+                        AppLogger.warning(TAG, "AttachText not staged: $textBytes bytes would exceed cumulative cap $MAX_TOTAL_BYTES")
+                    AttachTextAdmission.Admitted -> {
+                        val name = "shared-text-${shortId()}.txt"
+                        File(SharedShareStore.sharedFileDirectory(this), name)
+                            .writeText(d.text, Charsets.UTF_8)
+                        stagedBytes.credit(textBytes)
+                        out += PendingShare.Item(PendingShare.Item.Kind.ATTACHMENT, name)
+                    }
+                }
             }
             is SingleSendDecision.Stream ->
                 streamUri?.let { uri ->
@@ -373,14 +400,14 @@ class ShareReceiverActivity : ComponentActivity() {
                             runCatching { dest.delete() }
                             return null
                         }
-                        if (totalStagedBytes.get() + total > MAX_TOTAL_BYTES) {
+                        if (stagedBytes.current() + total > MAX_TOTAL_BYTES) {
                             AppLogger.warning(TAG, "copyUriToStaging($uri) would exceed cumulative ${MAX_TOTAL_BYTES} bytes")
                             runCatching { dest.delete() }
                             return null
                         }
                         output.write(buf, 0, n)
                     }
-                    totalStagedBytes.addAndGet(total)
+                    stagedBytes.credit(total)
                 }
             }
             name
