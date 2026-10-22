@@ -75,7 +75,21 @@ fun ProviderConnectionScreen(
     // current label so the page has context; connection params are the focus.
 
     var storedKey by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(instanceId) {
+    // [deep-audit-1041 B-01] Also key on `config.revision`. `loadApiKey` has no
+    // revision counter of its own, but every path that writes a key also bumps
+    // the config revision (instancesUpdate RPC / provider import / backup
+    // restore), so it is the available "the stored credential may have moved"
+    // signal — the API key lives in EncryptedSharedPreferences, NOT in a
+    // `ProviderInstance` field, so no config field carries it. Without this an
+    // external write left the previous key on screen, and the user's next
+    // Edit → Save seeded the box from that stale snapshot and wrote it back
+    // over the newer credential. Same form as ProviderDetailScreen's masked-key
+    // re-read ([deep-audit-1040 B-07]).
+    //
+    // The re-read only refreshes `storedKey`; an in-progress draft
+    // (`editKeyValue`) is deliberately NOT clobbered — the user's unsaved text
+    // wins until they cancel or save (see the audit's 不得引入 note).
+    LaunchedEffect(instanceId, config.revision) {
         storedKey = withContext(Dispatchers.IO) { providerRepository.loadApiKey(instanceId) }
     }
     var isEditingKey by remember { mutableStateOf(false) }

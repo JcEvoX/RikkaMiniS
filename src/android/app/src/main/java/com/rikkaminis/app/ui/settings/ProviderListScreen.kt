@@ -37,6 +37,7 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -76,6 +77,23 @@ fun ProviderListScreen(
     val instances = config.instances
     val context = LocalContext.current
 
+    // [deep-audit-1041 B-01] The stored credentials are NOT part of
+    // `ProviderInstance` (they live in EncryptedSharedPreferences), so no config
+    // field carries them. The snapshot therefore has to observe the config
+    // revision — the signal every credential-writing path bumps (instancesUpdate
+    // RPC / provider import / backup restore) — AND to be read OFF the
+    // composition thread: `loadApiKey()` is synchronous encrypted I/O, and
+    // calling it from a `remember` initializer (the pre-fix shape) ran it on the
+    // main thread once per key change, stalling the frame during navigation
+    // ([perf-provider-detail] contract). Read it in an effect, then derive the
+    // rows from the resulting map so the derivation stays cheap.
+    var apiKeyByInstanceId by remember { mutableStateOf<Map<String, String?>>(emptyMap()) }
+    LaunchedEffect(instances, config.revision) {
+        apiKeyByInstanceId = withContext(Dispatchers.IO) {
+            instances.associate { it.id to providerRepository.loadApiKey(it.id) }
+        }
+    }
+
     // [perf-provider-list] Pre-compute per-instance display data once per
     // `instances` change. loadApiKey() hits EncryptedSharedPreferences
     // (synchronous encrypted I/O); naive inline calls inside the forEach
@@ -86,9 +104,12 @@ fun ProviderListScreen(
     // refreshModels changes config.modelEntries WITHOUT changing instances,
     // so keying on instances alone kept the stale snapshot here and a freshly
     // added provider showed modelCount = 0 until an unrelated recomposition.
-    val providerRows: List<ProviderRowData> = remember(instances, config.modelEntries) {
+    // [deep-audit-1041 B-01] Also key on the asynchronously-loaded key map: an
+    // external credential write changes neither `instances` nor `modelEntries`,
+    // so without this key the configured badge / masked key stayed stale.
+    val providerRows: List<ProviderRowData> = remember(instances, config.modelEntries, apiKeyByInstanceId) {
         instances.map { instance ->
-            val apiKey = providerRepository.loadApiKey(instance.id)
+            val apiKey = apiKeyByInstanceId[instance.id]
             val isConfigured = !apiKey.isNullOrBlank()
             ProviderRowData(
                 instance = instance,
