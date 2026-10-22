@@ -49,6 +49,7 @@ import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.model.hasAudioInput
 import com.rikkaminis.app.data.model.hasAudioOutput
 import com.rikkaminis.app.data.model.normalizeModalities
+import com.rikkaminis.app.provider.ModelsDevApi
 
 /**
  * [T-android-provider-voice] First-class modality scoping for the shared
@@ -209,7 +210,7 @@ fun LazyListScope.modelEntryPickerItems(
         .mapNotNull { instance ->
             val entries = availableEntries.filter { entry ->
                 entry.providerInstanceId == instance.id &&
-                    (modalityFilter == null || modalityFilter.matches(entry.model))
+                    (modalityFilter == null || modalityFilter.matches(effectiveModelOf(entry)))
             }
             val filtered = entries.filter { matchesSearch(it) }
             if (filtered.isEmpty()) null else instance to filtered
@@ -379,7 +380,7 @@ fun LazyListScope.modelEntryPickerItems(
                                     // [T-android-provider-voice] Modality chips
                                     // (iOS entryRow modalityBadges: img / audio /
                                     // video / pdf and the -out variants).
-                                    modalityBadges(entry.model).forEach { badge ->
+                                    modalityBadges(effectiveModelOf(entry)).forEach { badge ->
                                         Spacer(Modifier.width(4.dp))
                                         Text(
                                             badge,
@@ -464,6 +465,15 @@ fun modalityBadges(model: LLMModel): List<String> {
     if ("video" in outs) badges.add("video-out")
     return badges
 }
+
+/**
+ * [dv22/B-03] Capability reads (modalities, audio support) must come from the
+ * effective model — models.dev enrichment under the user's overrides — not from
+ * the raw persisted entry: the built-in catalog declares no modality fields, so
+ * `entry.model` reported "text only" for every built-in and the modality filter
+ * silently dropped video/audio entries.
+ */
+private fun effectiveModelOf(entry: ModelEntry): LLMModel = ModelsDevApi.effectiveModel(entry)
 
 /** Provider color dot — same RGB across ChatScreen, AddModelsToGroup, and
  *  the agent-loop sheets so the visual cue stays consistent everywhere. */

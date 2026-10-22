@@ -36,7 +36,9 @@ class MinisImageFetcher(
         // to `c  _primer.md`.
         val stripped = uri.removePrefix("minis://").substringBefore('?')
         val decoded = decodeUriPath(stripped)
-        val linuxPath = "/var/minis/$decoded"
+        // [dv22/B-06] `minis:///var/minis/...` is already an absolute guest path;
+        // prefixing it unconditionally produced `/var/minis//var/minis/...`.
+        val linuxPath = if (decoded.startsWith("/")) decoded else "/var/minis/$decoded"
         val hostFile = PRootKernel.resolveHostPath(linuxPath)
             ?: throw IllegalArgumentException("Cannot resolve path: $linuxPath")
 
@@ -131,7 +133,8 @@ class MinisImageFetcher(
             // falls back to the raw `minis://` URL when that lookup failed.
             val stripped = uri.removePrefix("minis://").substringBefore('?')
             val decoded = decodeUriPath(stripped)
-            val linuxPath = "/var/minis/$decoded"
+            // [dv22/B-06] Same absolute-path guard as the fetch path above.
+            val linuxPath = if (decoded.startsWith("/")) decoded else "/var/minis/$decoded"
             val mtime = try {
                 PRootKernel.resolveHostPath(linuxPath)?.lastModified() ?: 0L
             } catch (_: Throwable) {

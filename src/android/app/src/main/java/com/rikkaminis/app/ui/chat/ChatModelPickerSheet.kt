@@ -273,6 +273,7 @@ import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.ui.browser.BrowserSheet
 import com.rikkaminis.app.ui.theme.ChatColors
 import com.rikkaminis.app.ui.components.MinisTextButton
+import com.rikkaminis.app.provider.ModelsDevApi
 
 // ── [S3-model-picker-rank] begin — pure ranking helpers ──────────────────
 // Extracted verbatim by the JVM harness (scripts/tests), so everything
@@ -1029,7 +1030,7 @@ internal fun ModelPickerSheet(
                                                 // voice seed serving as the collapsed
                                                 // representative is indistinguishable from
                                                 // a chat model.
-                                                com.rikkaminis.app.ui.components.modalityBadges(displayEntry.model).forEach { badge ->
+                                                com.rikkaminis.app.ui.components.modalityBadges(ModelsDevApi.effectiveModel(displayEntry)).forEach { badge ->
                                                     Spacer(Modifier.width(4.dp))
                                                     Text(
                                                         badge,
@@ -1101,7 +1102,7 @@ internal fun ModelPickerSheet(
                                                     )
                                                     // [T-android-provider-voice] Modality
                                                     // chips (iOS entryRow badges).
-                                                    com.rikkaminis.app.ui.components.modalityBadges(entry.model).forEach { badge ->
+                                                    com.rikkaminis.app.ui.components.modalityBadges(ModelsDevApi.effectiveModel(entry)).forEach { badge ->
                                                         Spacer(Modifier.width(4.dp))
                                                         Text(
                                                             badge,

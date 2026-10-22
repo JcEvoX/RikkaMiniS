@@ -23,10 +23,12 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.res.stringResource
+import com.rikkaminis.app.data.model.LLMModel
 import com.rikkaminis.app.data.model.ModelOverrides
 import com.rikkaminis.app.data.model.inferContextWindowTokens
 import com.rikkaminis.app.data.model.normalizeModalityName
 import com.rikkaminis.app.data.repository.ProviderRepository
+import com.rikkaminis.app.provider.ModelsDevApi
 import com.rikkaminis.app.ui.components.RowLabel
 import com.rikkaminis.app.ui.components.SectionTextField
 import com.rikkaminis.app.R
@@ -113,9 +115,16 @@ fun ModelEntryDetailScreen(
     // Defensive normalization: pre-T213 SharedPreferences may hold suffixed strings
     // (`image_input`) saved before the parse-boundary fix, which would silently fail
     // the bare-name `"image" in effectiveInput` checks below.
-    val effectiveInput = (overrides.inputModalities ?: baseModel.inputModalities ?: emptyList())
+    // [dv22/B-03] Capability base = models.dev enrichment under the RAW base,
+    // WITHOUT the user's overrides (the derivation below applies those first, and
+    // so does the save-time diff). Only the modality fields are taken from the
+    // enriched model: displayName / supportsReasoning / contextWindow must keep
+    // comparing against the base the entry actually inherits, otherwise a no-op
+    // save would materialize a registry value as a user override.
+    val capabilityBase = enrichCapabilityBase(baseModel)
+    val effectiveInput = (overrides.inputModalities ?: capabilityBase.inputModalities ?: emptyList())
         .map { it.normalizeModalityName() }
-    val effectiveOutput = (overrides.outputModalities ?: baseModel.outputModalities ?: emptyList())
+    val effectiveOutput = (overrides.outputModalities ?: capabilityBase.outputModalities ?: emptyList())
         .map { it.normalizeModalityName() }
     var imageInput by remember(entry.id, effectiveInput) { mutableStateOf("image" in effectiveInput) }
     var pdfInput by remember(entry.id, effectiveInput) { mutableStateOf("pdf" in effectiveInput) }
@@ -156,7 +165,10 @@ fun ModelEntryDetailScreen(
                     // `previous.copy(...)` keeps every field this screen does
                     // not own.
                     val newOverrides = buildModelEntryOverrides(
-                        baseModel = baseModel,
+                        // Same capability base the switches were seeded from, so
+                        // "user touched nothing" stays a no-op instead of writing
+                        // a modality override that freezes today's registry value.
+                        baseModel = capabilityBase,
                         previous = overrides,
                         displayName = displayName,
                         maxOutputTokensText = maxOutputTokensText,
@@ -366,4 +378,20 @@ fun ModelEntryDetailScreen(
             onDismiss = { showQuickTest = false },
         )
     }
+}
+
+/**
+ * [dv22/B-03] The raw base model with only its modality fields replaced by the
+ * models.dev-registry values. Every other field is left untouched on purpose:
+ * the entry-edit screen compares displayName / supportsReasoning / contextWindow
+ * against what the entry inherits, and enrichment must not turn "unchanged" into
+ * a written override there.
+ */
+private fun enrichCapabilityBase(baseModel: LLMModel): LLMModel {
+    val enriched = ModelsDevApi.enrichModel(baseModel)
+    if (enriched === baseModel) return baseModel
+    return baseModel.copy(
+        inputModalities = enriched.inputModalities ?: baseModel.inputModalities,
+        outputModalities = enriched.outputModalities ?: baseModel.outputModalities,
+    )
 }

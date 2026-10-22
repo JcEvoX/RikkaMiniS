@@ -246,6 +246,9 @@ REL_ADD_MODELS = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/A
 REL_AGENT_LOOP_SHEETS = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/AgentLoopAddSheets.kt"
 REL_MODEL_ENTRY_PICKER = "src/android/app/src/main/java/com/rikkaminis/app/ui/components/ModelEntryPicker.kt"
 REL_MODEL_PICKER_SHEET = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatModelPickerSheet.kt"
+# [dv22/B-03] the remaining capability-reading surfaces
+REL_QUICK_TEST = "src/android/app/src/main/java/com/rikkaminis/app/ui/components/QuickTestSheet.kt"
+REL_CHAT_SCREEN = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatScreen.kt"
 # da1039-B3 (B-03 / B-04 / B-08): the settings screens that read a config object
 # once and then write through it.
 REL_ADD_CUSTOM_MODEL = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/AddCustomModelScreen.kt"
@@ -1885,6 +1888,67 @@ def check_picker_search_gating(code):
                     % " ".join(expr.split())[:110]))
     return results
 
+# ------------------------------------------- capability single source [dv22] --
+# Reads of "what can this model do" that must never come off a raw entry.model.
+CAP_BAN_RES = (
+    (re.compile(r"\.model\s*\.\s*(?:inputModalities|outputModalities)\b"),
+     "modalities read straight off `.model`"),
+    (re.compile(r"\.model\s*\?\.\s*(?:inputModalities|outputModalities)\b"),
+     "modalities read straight off `?.model`"),
+    (re.compile(r"modalityBadges\s*\(\s*[\w.]+\s*\.model\s*\)"),
+     "modalityBadges on the raw model"),
+    (re.compile(r"modalityFilter\s*\.\s*matches\s*\(\s*[\w.]+\s*\.model\s*\)"),
+     "modalityFilter on the raw model"),
+    (re.compile(r"\.model\s*\?\.\s*let\s*\(\s*::\s*nonTextLabelFor"),
+     "non-text label on the raw model"),
+)
+# a local that captures a raw model, then reads capability off the LOCAL
+CAP_LOCAL_RE = re.compile(r"\bval\s+(\w+)\s*=\s*[\w.]+\s*\.model\b")
+CAP_READ_RE = re.compile(r"\b(?:inputModalities|outputModalities|modalityBadges|nonTextLabelFor)\b")
+SINGLE_SOURCE_RE = re.compile(r"\b(?:effectiveModel|enrichModel)\s*\(")
+
+
+def check_capability_single_source(code):
+    """C33 [dv22/B-03] — capability is read from the effective model, one exit.
+
+    The raw `entry.model` is what the user stored, and for every built-in model
+    that is an entry with no modality declaration: enrichment from the models.dev
+    registry happens on top, and the user's overrides on top of that. A surface
+    that reads the raw field therefore shows "text only" for a vision model, and
+    a surface that reads it through a local (`val m = entry.model; m.outputModalities`)
+    appears routed while being wrong.
+
+    Accepted single sources: `ModelsDevApi.effectiveModel(…)` (enrichment +
+    overrides — the renderer's question), `ModelsDevApi.enrichModel(…)` (the
+    registry layer under the overrides — the entry editor's question), or a
+    file-local alias whose body calls one of them.
+    """
+    results = []
+    bad = []
+    for rx, what in CAP_BAN_RES:
+        m = rx.search(code)
+        if m:
+            bad.append(what)
+    for m in CAP_LOCAL_RE.finditer(code):
+        local = re.escape(m.group(1))
+        if (re.search(r"\b%s\s*\.\s*(?:inputModalities|outputModalities)\b" % local, code)
+                or re.search(r"modalityBadges\s*\(\s*%s\s*\)" % local, code)
+                or re.search(r"nonTextLabelFor\s*\(\s*%s\s*\)" % local, code)):
+            bad.append("capability read off the local `%s` captured from `.model`" % m.group(1))
+    if bad:
+        results.append(("C33", False,
+                        "%s — route through ModelsDevApi.effectiveModel(entry)" % "; ".join(sorted(set(bad)))))
+        return results
+    reads = len(CAP_READ_RE.findall(code))
+    if reads and not SINGLE_SOURCE_RE.search(code):
+        results.append(("C33", False,
+                        "reads capability %d time(s) but never calls effectiveModel/enrichModel "
+                        "(fail-closed: the raw entry shows no modalities)" % reads))
+        return results
+    results.append(("C33", True, "capability reads=%d, single source present" % reads))
+    return results
+
+
 CHECKERS = (
     (REL_PROVIDER_LIST, check_provider_list),
     (REL_SHEET, check_sheet),
@@ -1916,6 +1980,13 @@ CHECKERS = (
     (REL_CONNECTION, check_credential_live_source_connection),
     (REL_MODEL_PICKER_SHEET, check_picker_search_gating),
     (REL_MODEL_ENTRY_PICKER, check_picker_search_gating),
+    # dv22-B3 (capability single source)
+    (REL_MODEL_ENTRY_PICKER, check_capability_single_source),
+    (REL_MODEL_PICKER_SHEET, check_capability_single_source),
+    (REL_PROVIDER_DETAIL, check_capability_single_source),
+    (REL_ENTRY_DETAIL, check_capability_single_source),
+    (REL_QUICK_TEST, check_capability_single_source),
+    (REL_CHAT_SCREEN, check_capability_single_source),
 )
 
 
@@ -3119,6 +3190,44 @@ FIX_ADD_MODELS_NO_LIST_KEY = FIX_ADD_MODELS_CLEAN.replace(
     "LaunchedEffect(quickTestEntryId, config.modelEntries) {",
     "LaunchedEffect(quickTestEntryId) {")
 
+# --- dv22-B3: capability single source (C33) --------------------------------
+FIX_QUICK_TEST_CLEAN = """package com.rikkaminis.app.ui.components
+
+fun applicableKinds(entry: ModelEntry): List<String> {
+    val model = ModelsDevApi.effectiveModel(entry)
+    val outputs = (model.outputModalities ?: emptyList()).map { it.normalizeModalityName() }
+    return outputs
+}
+"""
+
+FIX_QUICK_TEST_RAW_LOCAL = FIX_QUICK_TEST_CLEAN.replace(
+    "val model = ModelsDevApi.effectiveModel(entry)",
+    "val model = entry.model")
+
+FIX_QUICK_TEST_RAW_CHAIN = FIX_QUICK_TEST_CLEAN.replace(
+    "val outputs = (model.outputModalities ?: emptyList()).map { it.normalizeModalityName() }",
+    "val outputs = (entry.model.outputModalities ?: emptyList()).map { it.normalizeModalityName() }")
+
+FIX_QUICK_TEST_NO_SOURCE = FIX_QUICK_TEST_CLEAN.replace(
+    "val model = ModelsDevApi.effectiveModel(entry)",
+    "val model = entry.baseModel")
+
+FIX_CHAT_SCREEN_CLEAN = """package com.rikkaminis.app.ui.chat
+
+fun nonTextLabelFor(model: LLMModel): String? {
+    val mods = model.outputModalities.normalizeModalities() ?: emptyList()
+    return mods.firstOrNull()
+}
+
+fun usage(entry: ModelEntry?): String? =
+    entry?.let { nonTextLabelFor(ModelsDevApi.effectiveModel(it)) }
+"""
+
+FIX_CHAT_SCREEN_RAW_LABEL = FIX_CHAT_SCREEN_CLEAN.replace(
+    "entry?.let { nonTextLabelFor(ModelsDevApi.effectiveModel(it)) }",
+    "entry?.model?.let(::nonTextLabelFor)")
+
+
 CLEAN_TREE = {
     REL_PROVIDER_LIST: FIX_PROVIDER_LIST_CLEAN,
     REL_SHEET: FIX_SHEET_CLEAN,
@@ -3139,6 +3248,8 @@ CLEAN_TREE = {
     REL_MODEL_ENTRY_PICKER: FIX_MODEL_ENTRY_PICKER_CLEAN,
     REL_MODEL_PICKER_SHEET: FIX_MODEL_PICKER_SHEET_CLEAN,
     REL_ADD_CUSTOM_MODEL: FIX_ADD_CUSTOM_MODEL_CLEAN,
+    REL_QUICK_TEST: FIX_QUICK_TEST_CLEAN,
+    REL_CHAT_SCREEN: FIX_CHAT_SCREEN_CLEAN,
 }
 
 
@@ -3223,6 +3334,16 @@ def run_selftest():
         "val providerRows", "// val providerRows") + "\n// onTogglePinned = remember(instances) {}\n"
     run_case("comments-do-not-count", 1,
              variant(REL_PROVIDER_LIST, commented), failures, ("C1",))
+    # --- dv22-B3: C33 (capability single source) --------------------------
+    run_case("c33-raw-local-model", 1,
+             variant(REL_QUICK_TEST, FIX_QUICK_TEST_RAW_LOCAL), failures, ("C33",))
+    run_case("c33-raw-model-chain", 1,
+             variant(REL_QUICK_TEST, FIX_QUICK_TEST_RAW_CHAIN), failures, ("C33",))
+    run_case("c33-no-single-source", 1,
+             variant(REL_QUICK_TEST, FIX_QUICK_TEST_NO_SOURCE), failures, ("C33",))
+    run_case("c33-nontext-label-raw", 1,
+             variant(REL_CHAT_SCREEN, FIX_CHAT_SCREEN_RAW_LABEL), failures, ("C33",))
+
     # --- da1026-C: C5 (connection screen) ---------------------------------
     run_case("c5-conn-no-baseurl-key", 1,
              variant(REL_CONNECTION, FIX_CONNECTION_NO_BASEURL_KEY), failures, ("C5", "C5a"))
