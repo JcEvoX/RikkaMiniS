@@ -81,12 +81,22 @@ internal fun rootfsFailureState(
  *
  * Only terminals are treated as replays: a non-terminal current value means an
  * operation really is in flight, and its progress must be mirrored.
+ *
+ * [deep-audit-1043 B-01] [priorTerminal] is nullable because the SECOND caller
+ * has no prior value to offer: the repair settlement (see [rootfsRepairState])
+ * reads the flow exactly once, so its read is a first frame too, but a caller
+ * that never captured the pre-operation value must not be credited with having
+ * compared against it — `null` means "nothing to compare", and the answer is
+ * `false` (treat the frame as live). That is the fail-closed direction: the
+ * pre-B-01 behaviour of surfacing a `Failed` is what a caller who forgot to
+ * capture still gets.
  */
 internal fun isStaleInstallReplay(
     firstFrame: Boolean,
     state: RootfsInstallState,
-    priorTerminal: RootfsInstallState,
+    priorTerminal: RootfsInstallState?,
 ): Boolean = firstFrame &&
+    priorTerminal != null &&
     state === priorTerminal &&
     (state is RootfsInstallState.Installed || state is RootfsInstallState.Failed)
 
@@ -109,6 +119,24 @@ internal fun isStaleInstallReplay(
  * rather than re-listing the fields — the same transition was already written
  * out twice in this file, and a third copy is exactly how the two got out of
  * step in the first place.
+ *
+ * [deep-audit-1043 B-01] A `Failed` the repair did not publish is not its
+ * verdict. `RootfsManager.installState` never leaves a terminal (eight publish
+ * sites, none resets to `Idle`), and `autoRepair()` publishes nothing at all in
+ * Stages 1/2/2.5/2.6 — only the Stage-3 `reset()` does. So when a previous
+ * operation left a `Failed` on the flow, "repair in place succeeded" arrived
+ * here as `terminal == that stale Failed` and the unconditional first arm
+ * reported the old error (e.g. a disk-space refusal from yesterday) over a
+ * repair that had just restored every critical file, and reported it as
+ * `lastOperationSuccess = false`.
+ *
+ * [priorTerminal] is the value the flow was holding when the operation started;
+ * the arm now asks [isStaleInstallReplay] whether the terminal it just read is
+ * that SAME INSTANCE. Instance identity, never text: `RootfsManager` builds a
+ * fresh `Failed` for every verdict it publishes, so a genuine failure during
+ * this repair — including one with the identical message — is a different
+ * instance and still wins. A caller that passes no [priorTerminal] keeps the
+ * pre-fix behaviour (surface the failure), which is the safe default.
  */
 internal fun rootfsRepairState(
     current: RootfsManagementUiState,
@@ -116,8 +144,11 @@ internal fun rootfsRepairState(
     repaired: Boolean,
     repairedMessage: String,
     stillMissingMessage: String,
+    priorTerminal: RootfsInstallState? = null,
 ): RootfsManagementUiState = when {
-    terminal is RootfsInstallState.Failed -> rootfsFailureState(current, terminal.error)
+    terminal is RootfsInstallState.Failed &&
+        !isStaleInstallReplay(firstFrame = true, state = terminal, priorTerminal = priorTerminal) ->
+        rootfsFailureState(current, terminal.error)
     repaired -> current.copy(
         isProcessing = false,
         lastOperationSuccess = true,
@@ -412,6 +443,17 @@ class RootfsManagementViewModel : ViewModel() {
             // bar this method just asked for sat frozen at 0% for the whole
             // (minutes-long) wipe + extract, because nobody was collecting
             // `manager.installState`.
+            // [deep-audit-1043 B-01] The terminal the flow was ALREADY holding
+            // when this repair started. `RootfsManager` never leaves a terminal
+            // and `autoRepair()` publishes nothing before Stage 3, so without
+            // this snapshot the settlement below cannot tell "yesterday's
+            // operation failed" from "this repair failed" — and the stale
+            // `Failed` would outrank the health this repair just restored.
+            // Captured before the subscription (which reads the same value for
+            // its own, unrelated job: gating frames, not adjudicating a
+            // verdict) and before `autoRepair()`, i.e. before anything this
+            // operation does can publish.
+            val priorTerminal = manager.installState.value
             observeInstallProgress(manager, ctx)
             try {
                 val repaired = manager.autoRepair()
@@ -434,6 +476,10 @@ class RootfsManagementViewModel : ViewModel() {
                     repaired,
                     ctx.getString(R.string.rootfs_msg_repaired),
                     ctx.getString(R.string.rootfs_msg_repair_missing, after.missing.joinToString(", ")),
+                    // [deep-audit-1043 B-01] Hand the pre-operation terminal over so
+                    // the helper can tell an inherited `Failed` from one this
+                    // repair published.
+                    priorTerminal = priorTerminal,
                 )
                 refresh(ctx)
             } catch (e: Exception) {
