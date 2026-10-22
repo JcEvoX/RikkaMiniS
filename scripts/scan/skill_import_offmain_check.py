@@ -51,6 +51,19 @@ no new gate, no new SELFTEST marker):
         the reader never re-runs — the form then shows an empty client secret
         while storage still holds one.
 
+deep-audit-1041 B-03 (P1) arm added to the same gate (B3 owns only this
+gate; no new gate, no new SELFTEST marker):
+  arm9  every call to an `EnvVarRepository` method that touches disk runs OFF
+        Main in `EnvironmentVariablesScreen` — the sixth screen of this family
+        (the other five are arms 6/7). "Touches disk" is derived, not listed:
+        `add`/`update`/`delete` reach `saveMetadata().writeText(...)` on
+        `env-vars.json`, and `getValue` reads a field that DECLARES itself as a
+        SharedPreferences store (`_prefs_fields`), so a Keystore-backed read is
+        caught while a genuinely pure `isValidKey` / `isDuplicateKey` stays
+        legal on Main. `produceState` is deliberately NOT an IO opener: its body
+        runs in the composition's coroutine context (Main), which is exactly the
+        half-fix this arm exists to catch.
+
 Limits (deliberate, documented so they are not mistaken for coverage):
   * the repository-side alternative resolves the method body plus ONE
     delegation hop (`fun reloadFromDisk() = load()` / `{ loadAll() }`), not a
@@ -404,12 +417,22 @@ SHEET_SKILLS_REL = ("src/android/app/src/main/java/com/rikkaminis/app/ui/chat/"
 SHEET_MCPS_REL = ("src/android/app/src/main/java/com/rikkaminis/app/ui/chat/"
                   "SessionMcpsSheet.kt")
 
+# [deep-audit-1041 B-03] The env-var screen — the sixth screen of the family.
+ENVVAR_SCREEN_REL = ("src/android/app/src/main/java/com/rikkaminis/app/ui/settings/"
+                     "EnvironmentVariablesScreen.kt")
+ENVVAR_REPO_REL = ("src/android/app/src/main/java/com/rikkaminis/app/data/repository/"
+                   "EnvVarRepository.kt")
+
 # (screen file, callee prefix, file that declares those methods)
 B04_CALL_SITES = (
     (MCP_REL, "mcpRepository.", MCP_REPO_REL),
     (MCP_REL, "MCPOAuthStore.", MCP_OAUTH_REL),
     (SHEET_SKILLS_REL, "skillRepository.", SKILL_REPO_REL),
     (SHEET_MCPS_REL, "mcpRepository.", MCP_REPO_REL),
+)
+
+B03_CALL_SITES = (
+    (ENVVAR_SCREEN_REL, "envVarRepository.", ENVVAR_REPO_REL),
 )
 
 # Tokens that mean "this body reaches the disk (or Keystore-backed prefs)".
@@ -420,6 +443,32 @@ IO_MARKERS = (
     "EncryptedSharedPreferences", "SharedPreferences", ".edit()", "prefs(",
     "save()", "deleteBridgeFile(", "writeBridgeFile(", "reconcileForServer(",
 )
+
+
+PREFS_ACCESS_SUFFIXES = (".getString(", ".getInt(", ".getBoolean(",
+                          ".contains(", ".remove(", ".edit()")
+
+
+def _prefs_fields(text_nc):
+    """Field names whose DECLARATION is a (encrypted) SharedPreferences store.
+
+    Derived from the declaration rather than hard-coded, so renaming
+    `encryptedPrefs` cannot silently disarm the arm, and a `getString` on a
+    JSONObject / Bundle is still read as pure. Matches both the typed form
+    (`val x: SharedPreferences by lazy { ... }`) and the inferred form
+    (`val x = ...EncryptedSharedPreferences...` / `...EncryptedPrefsFactory...`).
+    """
+    names = set()
+    for m in re.finditer(
+            r"\b(?:val|var)\s+([A-Za-z_]\w*)\s*:[^=\n]*\bSharedPreferences\b",
+            text_nc):
+        names.add(m.group(1))
+    for m in re.finditer(
+            r"\b(?:val|var)\s+([A-Za-z_]\w*)\s*=[^\n]*?"
+            r"(?:EncryptedSharedPreferences|EncryptedPrefsFactory)",
+            text_nc):
+        names.add(m.group(1))
+    return names
 
 
 def _fun_body_nc(text_nc, masked, name):
@@ -473,6 +522,14 @@ def method_io_state(text, name, hops=2, _seen=None):
     for marker in IO_MARKERS:
         if marker in body:
             return "io", "`%s` body uses `%s`" % (name, marker)
+    # A read through a field that declares itself as a SharedPreferences store is
+    # disk-backed even when the body carries no IO_MARKERS token (`getValue`'s
+    # whole body is `encryptedPrefs.getString(key, null)`). Derived from the
+    # declaration so neither the field name nor the method name is hard-coded.
+    for field in _prefs_fields(nc):
+        for suffix in PREFS_ACCESS_SUFFIXES:
+            if field + suffix in body:
+                return "io", "`%s` reads the prefs-backed store `%s`" % (name, field)
     if hops > 0:
         # Only follow BARE calls (`save()`, `parseImportRoot(x)`). A member call
         # (`list.add(…)`, `root.keys()`) must not resolve to a same-named
@@ -497,8 +554,33 @@ def check_b04_offmain(files):
     by arms 3/4 also passes: a call site may be bare when the callee wraps its
     own work in `withContext(Dispatchers.IO)`.
     """
+    return check_offmain_calls(files, B04_CALL_SITES, "B-04")
+
+
+def check_b03_offmain(files):
+    """arm9 [deep-audit-1041 B-03]: the env-var screen's repository calls are
+    OFF Main — same criterion as arm7, applied to the sixth screen of the family.
+
+    Runs only when the map MODELS this screen (either key present). The arm1-8
+    fixtures do not, and reporting them red would be a false alarm that hides
+    their own regressions. On the real tree `run_checks` seeds both keys (with
+    value None when a read failed), so an unreadable file is still fail-closed.
+    """
+    if ENVVAR_SCREEN_REL not in files and ENVVAR_REPO_REL not in files:
+        return []
+    return check_offmain_calls(files, B03_CALL_SITES, "B-03")
+
+
+def check_offmain_calls(files, sites, label):
+    """Shared criterion for arms 7 and 9: a call passes when it sits inside an
+    IO opener, or when the callee wraps its own work (repository-side fix).
+
+    Fail-closed twice: a (file, prefix) pair with no call site at all means the
+    anchor lost its subject, and a called method with no declaration to judge
+    cannot be proven pure.
+    """
     failures = []
-    for screen_rel, prefix, decl_rel in B04_CALL_SITES:
+    for screen_rel, prefix, decl_rel in sites:
         text = files.get(screen_rel)
         if text is None:
             failures.append("missing file %s" % screen_rel)
@@ -508,8 +590,8 @@ def check_b04_offmain(files):
         hits = list(re.finditer(re.escape(prefix) + r"([A-Za-z_]\w*)\s*\(", nc))
         if not hits:
             failures.append(
-                "%s: no `%s<method>(` call site found — the B-04 anchor lost its "
-                "subject (fail-closed)" % (screen_rel, prefix))
+                "%s: no `%s<method>(` call site found — the %s anchor lost its "
+                "subject (fail-closed)" % (screen_rel, prefix, label))
             continue
         decl = files.get(decl_rel)
         if decl is None:
@@ -713,6 +795,7 @@ def run_checks_map(files):
     failures.extend(check_editor_keys(files))
     failures.extend(check_editor_key_alignment(files))
     failures.extend(check_b04_offmain(files))
+    failures.extend(check_b03_offmain(files))
     failures.extend(check_seed_effect_keys(files))
     return failures
 
@@ -720,11 +803,17 @@ def run_checks_map(files):
 def run_checks(repo_root):
     files = {}
     for rel in (SM_REL, MCP_REL, SKILL_REPO_REL, MCP_REPO_REL, MCP_OAUTH_REL,
-                SHEET_SKILLS_REL, SHEET_MCPS_REL):
+                SHEET_SKILLS_REL, SHEET_MCPS_REL, ENVVAR_SCREEN_REL,
+                ENVVAR_REPO_REL):
         try:
             files[rel] = _read(repo_root, rel)
         except OSError:
             pass
+    # Seed the arm9 anchors explicitly: an unreadable file must read as
+    # "missing file" (fail-closed), not as "this fixture set does not model the
+    # screen" (which is how `check_b03_offmain` treats an absent key).
+    for rel in (ENVVAR_SCREEN_REL, ENVVAR_REPO_REL):
+        files.setdefault(rel, None)
     return run_checks_map(files)
 
 
@@ -1061,6 +1150,174 @@ def _files(sm=None, mcp=None, skill_repo=None, mcp_repo=None, sheet_skills=None,
         MCP_OAUTH_REL: OAUTH_STORE_FIXTURE if oauth_store is None else oauth_store,
     }
 
+# ── arm9 [deep-audit-1041 B-03] fixtures ─────────────────────────────────
+# `_b03_files()` = the common fixture map plus the env-var screen/declaration.
+# Kept separate from `_files()` on purpose: folding these two entries into the
+# shared map would make every arm1-8 fixture arm9-red (fail-closed on a missing
+# screen) and mask real regressions in those arms.
+ENVVAR_REPO_FIXTURE = '''package com.rikkaminis.app.data.repository
+
+class EnvVarRepository {
+    private val _entries = MutableStateFlow<List<String>>(emptyList())
+
+    private val encryptedPrefs: SharedPreferences by lazy {
+        EncryptedPrefsFactory.safeCreate(context, "env_var_values")
+    }
+
+    private val metadataFile: File
+        get() = File(context.filesDir, "env-vars.json")
+
+    fun isValidKey(key: String): Boolean = KEY_REGEX.matches(key)
+
+    fun isDuplicateKey(key: String): Boolean =
+        _entries.value.any { it.equals(key, ignoreCase = true) }
+
+    fun getValue(key: String): String? = encryptedPrefs.getString(key, null)
+
+    fun add(key: String, value: String): Boolean {
+        _entries.value = _entries.value + key
+        encryptedPrefs.edit().putString(key, value).apply()
+        saveMetadata()
+        return true
+    }
+
+    fun update(id: String, key: String, value: String): Boolean {
+        encryptedPrefs.edit().putString(key, value).apply()
+        saveMetadata()
+        return true
+    }
+
+    fun delete(id: String) {
+        encryptedPrefs.edit().remove(id).apply()
+        saveMetadata()
+    }
+
+    private fun saveMetadata() {
+        metadataFile.writeText("[]")
+    }
+}
+'''
+
+# Same repository, prefs store renamed: the arm must judge the DECLARATION, so a
+# rename cannot disarm it.
+ENVVAR_REPO_RENAMED = ENVVAR_REPO_FIXTURE.replace("encryptedPrefs", "secureStore")
+
+# Same repository whose `getValue` reads a plain in-memory map. `getValue` is
+# then genuinely pure and a bare call site on Main must stay legal — the
+# precision twin of the arm above.
+ENVVAR_REPO_PURE_READ = (
+    ENVVAR_REPO_FIXTURE
+    .replace(
+        '''    private val encryptedPrefs: SharedPreferences by lazy {
+        EncryptedPrefsFactory.safeCreate(context, "env_var_values")
+    }
+''',
+        "    private val valueCache = mutableMapOf<String, String>()\n")
+    .replace(
+        "fun getValue(key: String): String? = encryptedPrefs.getString(key, null)",
+        "fun getValue(key: String): String? = valueCache[key]")
+    .replace("encryptedPrefs.edit().putString(key, value).apply()",
+             "valueCache[key] = value")
+    .replace("encryptedPrefs.edit().remove(id).apply()",
+             "valueCache.remove(id)")
+)
+
+# The repository-side alternative the criterion accepts: `add` wraps its own
+# work, so a bare call site resolves through `repo_method_wraps_io`.
+ENVVAR_REPO_WRAPS = ENVVAR_REPO_FIXTURE.replace(
+    '''    fun add(key: String, value: String): Boolean {
+        _entries.value = _entries.value + key
+        encryptedPrefs.edit().putString(key, value).apply()
+        saveMetadata()
+        return true
+    }
+''',
+    '''    fun add(key: String, value: String): Boolean {
+        withContext(Dispatchers.IO) {
+            saveMetadata()
+        }
+        _entries.value = _entries.value + key
+        return true
+    }
+''')
+
+ENVVAR_SCREEN_TEMPLATE = '''package com.rikkaminis.app.ui.settings
+
+@Composable
+fun EnvironmentVariablesScreen(envVarRepository: EnvVarRepository) {
+    val scope = rememberCoroutineScope()
+    val isValid = envVarRepository.isValidKey(normalizedKey)
+    val isDuplicate = envVarRepository.isDuplicateKey(normalizedKey, excludeId = null)
+%(body)s
+}
+'''
+
+CLEAN_BODY = '''    LaunchedEffect(Unit) {
+        withContext(Dispatchers.IO) { envVarRepository.delete("a") }
+    }
+    val display by produceState("", 1) {
+        value = withContext(Dispatchers.IO) { envVarRepository.getValue("k") ?: "" }
+    }
+    scope.launch {
+        withContext(Dispatchers.IO) { envVarRepository.add("k", "v") }
+    }
+'''
+
+BARE_WRITE_BODY = CLEAN_BODY.replace(
+    "        withContext(Dispatchers.IO) { envVarRepository.add(\"k\", \"v\") }\n",
+    "        envVarRepository.add(\"k\", \"v\")\n")
+
+BARE_READ_BODY = CLEAN_BODY.replace(
+    "        value = withContext(Dispatchers.IO) { envVarRepository.getValue(\"k\") ?: \"\" }\n",
+    "        value = envVarRepository.getValue(\"k\") ?: \"\"\n")
+
+PURE_ONLY_BODY = ""
+
+# No repository CALL at all (only the StateFlow): the anchor lost its subject.
+NO_CALLS_SCREEN = '''package com.rikkaminis.app.ui.settings
+
+@Composable
+fun EnvironmentVariablesScreen(envVarRepository: EnvVarRepository) {
+    val entries by envVarRepository.entries.collectAsState()
+    Text(entries.size.toString())
+}
+'''
+
+def _b03_files(body=CLEAN_BODY, repo=None, screen=None):
+    files = _files()
+    files[ENVVAR_SCREEN_REL] = (
+        ENVVAR_SCREEN_TEMPLATE % {"body": body} if screen is None else screen)
+    files[ENVVAR_REPO_REL] = ENVVAR_REPO_FIXTURE if repo is None else repo
+    return files
+
+
+B03_FIXTURES = [
+    # (label, files, expect_red, needle)
+    ("b03 clean: every env-var IO call off Main",
+     _b03_files(), False, None),
+    ("b03 bare write (add) on Main",
+     _b03_files(body=BARE_WRITE_BODY), True, "`envVarRepository.add(` at line"),
+    ("b03 bare read (getValue) inside produceState",
+     _b03_files(body=BARE_READ_BODY), True, "`envVarRepository.getValue(` at line"),
+    ("b03 precision: pure key checks alone stay legal on Main",
+     _b03_files(body=PURE_ONLY_BODY), False, None),
+    ("b03 precision: the prefs field is judged from its declaration",
+     _b03_files(body=BARE_READ_BODY, repo=ENVVAR_REPO_RENAMED),
+     True, "`envVarRepository.getValue(` at line"),
+    ("b03 precision: a pure getValue over a plain map stays legal",
+     _b03_files(body=BARE_READ_BODY, repo=ENVVAR_REPO_PURE_READ), False, None),
+    ("b03 alt branch: the repository method wraps internally",
+     _b03_files(body=BARE_WRITE_BODY, repo=ENVVAR_REPO_WRAPS), False, None),
+    ("b03 fail-closed: no declaration to judge the callee",
+     _b03_files(body=CLEAN_BODY + '    scope.launch { envVarRepository.wipeAll() }\n'),
+     True, "no `fun wipeAll(` declaration"),
+    ("b03 fail-closed: screen without repository calls",
+     _b03_files(screen=NO_CALLS_SCREEN), True, "lost its subject"),
+    ("b03 fail-closed: declaration file is empty",
+     _b03_files(body=CLEAN_BODY, repo=""),
+     True, "no `fun isValidKey(` declaration"),
+]
+
 # ── arm6 [deep-audit-1039 B-05] fixtures ─────────────────────────────────
 # Extra call sites appended to the task body (inside the function, before the
 # closing brace), so arms 1-5 stay in their clean shape while arm6 sees them.
@@ -1269,6 +1526,17 @@ def selftest():
             "" if good else "  UNEXPECTED %s" % f[:2]))
         ok &= good
 
+    for label, files, expect_red, needle in B03_FIXTURES:
+        f = run_checks_map(files)
+        red = len(f) > 0
+        good = (red == expect_red)
+        if good and expect_red and needle:
+            good = any(needle in x for x in f)
+        print("selftest 1041-B03 %-46s: %s%s" % (
+            label, "RED" if red else "CLEAN",
+            "" if good else "  UNEXPECTED %s" % f[:2]))
+        ok &= good
+
     print(SELFTEST_MARK if ok else "SKILL_IMPORT_OFFMAIN_SELFTEST=FAIL")
     return 0 if ok else 1
 
@@ -1290,9 +1558,10 @@ def main():
         for f in failures:
             print("  - %s" % f)
         sys.exit(1)
-    print("OK %s (14 arms: paste x2, reload-off-main x2, all-repo-calls-off-main x1, "
+    print("OK %s (15 arms: paste x2, reload-off-main x2, all-repo-calls-off-main x1, "
           "editor-keys x3, editor-key-alignment x1, B-04 io-call-off-main x1 "
-          "(MCP screen + both sheets), B-04 seed-effect-keys x1, fixture gates)"
+          "(MCP screen + both sheets), B-04 seed-effect-keys x1, "
+          "B-03 io-call-off-main x1 (env-var screen), fixture gates)"
           % SM_REL)
     sys.exit(0)
 
