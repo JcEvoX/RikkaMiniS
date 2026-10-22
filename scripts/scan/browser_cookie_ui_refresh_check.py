@@ -347,6 +347,122 @@ def check_viewport(source: str) -> list:
     return errs
 
 
+def strip_comments_only(src: str) -> str:
+    """Comment-only masking: string literals are PRESERVED.
+
+    `mask_code` blanks string literals, which is right for the viewport family
+    (a mention inside a string must not count) but wrong for the pref-key
+    criteria: `"custom_user_agent"` IS the decision point there. Comments are
+    still blanked, so a KDoc mentioning a key cannot satisfy a criterion.
+    """
+    out = list(src)
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            while i < n and src[i] != "\n":
+                out[i] = " "
+                i += 1
+        elif c == "/" and i + 1 < n and src[i + 1] == "*":
+            out[i] = out[i + 1] = " "
+            i += 2
+            while i < n and not (src[i] == "*" and i + 1 < n and src[i + 1] == "/"):
+                if src[i] != "\n":
+                    out[i] = " "
+                i += 1
+            if i < n:
+                out[i] = " "
+                if i + 1 < n:
+                    out[i + 1] = " "
+                i += 2
+        elif c == '"':
+            # keep the literal, but skip over it so a "//" inside a string is
+            # not mistaken for a comment
+            i += 1
+            while i < n and src[i] != '"':
+                if src[i] == "\\":
+                    i += 2
+                    continue
+                i += 1
+            i += 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def check_custom_ua_single_source(pool_src: str, sheet_src: str) -> list:
+    """[dv23-B4 B-05] V8 — the stored custom UA string has ONE source.
+
+    The defect: `setUserAgentFromUI(profile, customUA)` assigned
+    `customUserAgentString = customUA` unconditionally, so tapping a
+    non-CUSTOM preset (which passes `null`) CLEARED the string the user had
+    typed; a later `set_user_agent --user-agent custom` then fell back to the
+    platform UA. The sheet's own field is the real source (it persists
+    `custom_user_agent` on every keystroke), so the pool must resolve through
+    that key and must not treat "no opinion" as "clear".
+
+    Anchored on the DECISION (a guarded write, and a resolution through the
+    single source), not on spelling.
+    """
+    code = strip_comments_only(pool_src)
+    errs = []
+
+    setter = slice_from_marker(code, "fun setUserAgentFromUI(")
+    if not setter:
+        errs.append(
+            "no `fun setUserAgentFromUI(` in %s — the sheet's apply path this "
+            "criterion pins is gone (ROT: update this gate)" % POOL_TARGET
+        )
+        return errs
+
+    guard = setter.find("if (customUA != null)")
+    write = setter.find("customUserAgentString = customUA")
+    if guard < 0:
+        errs.append(
+            "`setUserAgentFromUI` assigns the stored custom UA unconditionally — "
+            "a preset tap (which carries no custom string) clears the string the "
+            "user typed, and a later `set_user_agent --user-agent custom` falls "
+            "back to the platform UA (V8)"
+        )
+    elif write < 0:
+        errs.append(
+            "`setUserAgentFromUI` no longer stores the custom UA at all (V8)"
+        )
+    elif write < guard:
+        errs.append(
+            "`setUserAgentFromUI` writes the stored custom UA BEFORE the "
+            "`customUA != null` guard — the guard does not protect the write (V8)"
+        )
+
+    if "storedCustomUserAgent()" not in code:
+        errs.append(
+            "the pool has no single-source resolution for the stored custom UA — "
+            "`customUserAgentString` is a private cache that can lag the sheet's "
+            "last keystroke (V8)"
+        )
+
+    handler = slice_from_marker(code, "fun handleSetUserAgent(")
+    if not handler:
+        errs.append(
+            "no `fun handleSetUserAgent(` in %s (V8)" % POOL_TARGET
+        )
+    elif "storedCustomUserAgent()" not in handler:
+        errs.append(
+            "`handleSetUserAgent` does not resolve CUSTOM through the single "
+            "source — it reads the private cache, which may predate the sheet's "
+            "last keystroke (V8)"
+        )
+
+    sheet = strip_comments_only(sheet_src)
+    if "stageCustomUserAgent(" not in sheet:
+        errs.append(
+            "the settings sheet's UA field does not feed the pool's copy — the "
+            "pool's cache stays stale until Apply, while the sheet persists the "
+            "string on every keystroke (V8)"
+        )
+    return errs
+
+
 def check_pool_ua(source: str) -> list:
     """[da1030-B] V7 — `set_user_agent` must be a pool-level action.
 
@@ -726,7 +842,72 @@ def selftest() -> int:
         ("V7 dispatch block gone",
          good_pool.replace("when (input.action)", "when (input.mode)"),
          ["no `when (input.action)` block"]),
-    ]    # the comment trap: a KDoc mentioning removeAllCookies(null) must NOT trip
+    ]
+
+    # ── [dv23-B4 B-05] V8 arms: the stored custom UA has ONE source ───────
+    # Each dirty fixture differs from the compliant shape by exactly one
+    # decision, so a breaker cannot be satisfied by another criterion.
+    good_ua_pool = """
+        fun setUserAgentFromUI(profile: UserAgentProfile, customUA: String? = null) {
+            userAgentProfile = profile
+            if (customUA != null) {
+                customUserAgentString = customUA.ifEmpty { null }
+            }
+            val effectiveCustomUA =
+                if (profile == UserAgentProfile.CUSTOM) storedCustomUserAgent() else null
+            for (tab in _tabs.value) {
+                tab.manager.setUserAgent(profile, effectiveCustomUA)
+            }
+        }
+
+        private fun storedCustomUserAgent(): String? =
+            customUserAgentString?.ifEmpty { null }
+                ?: context.getSharedPreferences("browser_prefs", Context.MODE_PRIVATE)
+                    .getString("custom_user_agent", null)?.ifEmpty { null }
+
+        private suspend fun handleSetUserAgent(input: BrowserActionInput): BrowserActionResult = withContext(Dispatchers.Main) {
+            val newProfile = input.userAgent
+                ?: return@withContext BrowserActionResult.error("set_user_agent requires --user-agent")
+            val customUA = if (newProfile == UserAgentProfile.CUSTOM) storedCustomUserAgent() else null
+            userAgentProfile = newProfile
+        }
+    """
+    good_ua_sheet = """
+            OutlinedTextField(
+                value = customUA,
+                onValueChange = {
+                    customUA = it
+                    prefs.edit().putString("custom_user_agent", it).apply()
+                    tabPool.stageCustomUserAgent(it)
+                },
+            )
+    """
+    ua_arms = [
+        ("V8 compliant single source", good_ua_pool, good_ua_sheet, []),
+        ("V8 preset tap clears the stored UA",
+         good_ua_pool.replace(
+             "            if (customUA != null) {\n"
+             "                customUserAgentString = customUA.ifEmpty { null }\n"
+             "            }\n",
+             "            customUserAgentString = customUA\n"),
+         good_ua_sheet,
+         ["assigns the stored custom UA unconditionally"]),
+        ("V8 no single-source resolution",
+         good_ua_pool.replace("storedCustomUserAgent()", "customUserAgentString"),
+         good_ua_sheet,
+         ["no single-source resolution"]),
+        ("V8 handler reads the private cache",
+         good_ua_pool.replace(
+             "val customUA = if (newProfile == UserAgentProfile.CUSTOM) storedCustomUserAgent() else null",
+             "val customUA = if (newProfile == UserAgentProfile.CUSTOM) customUserAgentString else null"),
+         good_ua_sheet,
+         ["does not resolve CUSTOM through the single source"]),
+        ("V8 sheet does not feed the pool's copy",
+         good_ua_pool,
+         good_ua_sheet.replace("                    tabPool.stageCustomUserAgent(it)\n", ""),
+         ["does not feed the pool's copy"]),
+    ]
+    # the comment trap: a KDoc mentioning removeAllCookies(null) must NOT trip
     good_with_comment = """
             // [fix/da1022-G] removeAllCookies(null) left no flush and no refresh:
             // use the callback form to persist + bump the tick.
@@ -825,6 +1006,21 @@ def selftest() -> int:
             failures += 1
         else:
             print(f"  OK {name}: {errs}")
+    for name, pool_sample, sheet_sample, needles in ua_arms:
+        errs = check_custom_ua_single_source(pool_sample, sheet_sample)
+        if not needles:
+            if errs:
+                print(f"  FAIL {name}: expected green, got {errs}")
+                failures += 1
+            else:
+                print(f"  OK {name}: green")
+            continue
+        hit = [n for n in needles if not any(n in e for e in errs)]
+        if hit or not errs:
+            print(f"  FAIL {name}: expected {needles}, got {errs}")
+            failures += 1
+        else:
+            print(f"  OK {name}: {errs}")
     for name, sample, needles in domain_arms:
         errs = check_domain_refresh(sample)
         if not needles:
@@ -883,7 +1079,9 @@ def main() -> int:
     vp_errs = check_viewport(src)
     pool_errs = check_pool_ua(pool_src)
     domain_errs = check_domain_refresh(src)
-    if errs or vp_errs or pool_errs or domain_errs:
+    # [dv23-B4 B-05] V8 — the stored custom UA has one source (pool + sheet).
+    ua_errs = check_custom_ua_single_source(pool_src, src)
+    if errs or vp_errs or pool_errs or domain_errs or ua_errs:
         print("browser_cookie_ui_refresh_check RED on %s (+ %s):" % (TARGET, POOL_TARGET))
         for e in errs:
             print(f"  - {e}")
@@ -893,10 +1091,12 @@ def main() -> int:
             print(f"  - [pool] {e}")
         for e in domain_errs:
             print(f"  - [domain-refresh] {e}")
+        for e in ua_errs:
+            print(f"  - [custom-ua] {e}")
         return 1
     print(f"browser_cookie_ui_refresh_check OK ({TARGET}; cookie refresh + "
           f"domain-refresh/store-revision + viewport/session-override + UA-pool "
-          f"wiring; {POOL_TARGET} checked too)")
+          f"wiring + custom-UA single source; {POOL_TARGET} checked too)")
     return 0
 
 

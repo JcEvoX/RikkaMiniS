@@ -270,6 +270,47 @@ class BrowserSessionBindingTest {
 
     // ── helpers ─────────────────────────────────────────────────────────
 
+    @Test
+    fun `the borrow latch is set by the context-only bind and cleared by a full bind`() {
+        val src = readRepoFile(TabPoolPath)
+        val contextOnly = memberSlice(src, "fun bindSessionContextOnly(")
+        val full = memberSlice(src, "fun setSession(")
+        assertTrue(
+            "a context-only bind must latch the borrow:\n$contextOnly",
+            contextOnly.contains("isContextOnlySession = true"),
+        )
+        assertTrue(
+            "a full session bind must take ownership back:\n$full",
+            full.contains("isContextOnlySession = false"),
+        )
+        assertFalse(
+            "a full session bind must not latch the borrow:\n$full",
+            full.contains("isContextOnlySession = true"),
+        )
+    }
+
+    @Test
+    fun `a context-only pool never persists into the borrowed session's tab file`() {
+        val body = memberSlice(readRepoFile(TabPoolPath), "private fun saveState(")
+        val guard = body.indexOf("if (isContextOnlySession) return")
+        assertTrue(
+            "saveState must refuse to persist for a context-only bind:\n$body",
+            guard >= 0,
+        )
+        // The guard has to precede the tab-file access, not merely exist: a
+        // check placed after `File(context.filesDir, ...)` would still let the
+        // borrowed session's file be created/overwritten on the way in.
+        val firstTouch = listOf(
+            body.indexOf("browser_tabs"),
+            body.indexOf("getSharedPreferences"),
+        ).filter { it >= 0 }.minOrNull() ?: -1
+        assertTrue(
+            "the borrow guard must run before the tab file is touched " +
+                "(guard@$guard touch@$firstTouch):\n$body",
+            firstTouch >= 0 && guard < firstTouch,
+        )
+    }
+
     private fun readRepoFile(relative: String): String {
         // Gradle (CI) sets user.dir to the module dir; a sandbox JVM run may
         // start anywhere under the repo — walk up instead of assuming a depth.

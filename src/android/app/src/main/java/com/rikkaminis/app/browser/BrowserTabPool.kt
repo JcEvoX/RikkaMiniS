@@ -281,6 +281,20 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
     private var customUserAgentString: String? = null
 
     private var sessionId: String? = null
+
+    /**
+     * True while this pool only BORROWS the current [sessionId] instead of
+     * owning that session's persisted tabs.
+     *
+     * Set by [bindSessionContextOnly] and cleared by [setSession]. The borrow
+     * exists so the shell's `minis-browser-use` resolves minis:// paths and
+     * downloads inside the *requesting* chat session ([deep-audit-1016 9c]);
+     * borrowing the id used to also make every [saveState] call write the
+     * driver's cross-session tab list into that session's
+     * `filesDir/browser_tabs/<sid>.json` ([dv23-B4 B-04]).
+     */
+    private var isContextOnlySession: Boolean = false
+
     private val savedURLs = mutableMapOf<Int, String>()
 
     /**
@@ -391,6 +405,11 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
     // -- Session --
 
     fun setSession(sessionId: String) {
+        // [dv23-B4 B-04] A full session bind takes ownership of that session's
+        // persisted tabs again, so the borrow latch must be cleared before the
+        // first save (the previous owner of this boolean may have been a
+        // context-only bind — see [isContextOnlySession]).
+        isContextOnlySession = false
         // [fix/dv17-1 B-06] Capture the OLD id before it is overwritten: a pool
         // bound to a draft session (`__new__<uuid>`) carries download records
         // whose destination is frozen under the draft workspace. When the pool
@@ -451,6 +470,11 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
         val decision = BrowserSessionBinding.decideRebind(this.sessionId, sessionId)
         if (!decision.rebind) return
         this.sessionId = sessionId
+        // [dv23-B4 B-04] This pool only BORROWS the requesting session's
+        // context; it does not own that session's persisted tabs. Latch the
+        // borrow so saveState() refuses to write the driver's cross-session
+        // tab list into the chat session's filesDir/browser_tabs/<sid>.json.
+        isContextOnlySession = true
         _tabs.value.forEach { it.manager.minisSessionId = sessionId }
         if (decision.resetViewport) {
             _sessionViewportWidth.value = 0
@@ -1472,12 +1496,45 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
 
     // -- User Agent --
 
+    /**
+     * [dv23-B4 B-05] The stored custom UA string, with `browser_prefs` as the
+     * authority. The settings sheet persists `custom_user_agent` on every
+     * keystroke (it cannot reload every open tab from the text field), so the
+     * in-memory copy is a cache that may lag by one Apply; falling back to
+     * prefs when the cache is empty keeps an agent-driven
+     * `set_user_agent --user-agent custom` from silently using the platform UA
+     * in that window.
+     */
+    private fun storedCustomUserAgent(): String? =
+        customUserAgentString?.ifEmpty { null }
+            ?: context.getSharedPreferences("browser_prefs", Context.MODE_PRIVATE)
+                .getString("custom_user_agent", null)?.ifEmpty { null }
+
+    /**
+     * [dv23-B4 B-05] Cache-only write from the settings sheet's text field.
+     * Live tabs are NOT touched here — they follow on Apply or a preset tap —
+     * but the stored copy must not lag a keystroke behind, because
+     * [handleSetUserAgent] and [createTab] read it without going through the
+     * sheet.
+     */
+    fun stageCustomUserAgent(customUA: String) {
+        customUserAgentString = customUA.ifEmpty { null }
+    }
+
     /** Set user agent from UI settings. Applies to all existing tabs and reloads them. */
     fun setUserAgentFromUI(profile: UserAgentProfile, customUA: String? = null) {
         userAgentProfile = profile
-        customUserAgentString = customUA
+        // [dv23-B4 B-05] `null` means "this caller has no opinion" (a preset tap
+        // carries no custom string), not "clear the stored one": clearing it made
+        // a later `set_user_agent --user-agent custom` fall back to the platform
+        // UA. Only an explicit string replaces it; emptying the field clears it.
+        if (customUA != null) {
+            customUserAgentString = customUA.ifEmpty { null }
+        }
+        val effectiveCustomUA =
+            if (profile == UserAgentProfile.CUSTOM) storedCustomUserAgent() else null
         for (tab in _tabs.value) {
-            tab.manager.setUserAgent(profile, customUA)
+            tab.manager.setUserAgent(profile, effectiveCustomUA)
         }
         // `setUserAgent` resets each tab's layout to the new UA profile's
         // default viewport. Re-apply the resolved viewport so a session or
@@ -1787,7 +1844,10 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
     private suspend fun handleSetUserAgent(input: BrowserActionInput): BrowserActionResult = withContext(Dispatchers.Main) {
         val newProfile = input.userAgent
             ?: return@withContext BrowserActionResult.error("set_user_agent requires --user-agent")
-        val customUA = if (newProfile == UserAgentProfile.CUSTOM) customUserAgentString else null
+        // [dv23-B4 B-05] Single source: the cache is only a cache. `browser_prefs`
+        // is what the settings sheet actually writes, so resolve through it rather
+        // than trusting a copy that may predate the sheet's last keystroke.
+        val customUA = if (newProfile == UserAgentProfile.CUSTOM) storedCustomUserAgent() else null
         userAgentProfile = newProfile
         for (tab in _tabs.value) {
             tab.manager.setUserAgent(newProfile, customUA)
@@ -1809,6 +1869,18 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
     // -- Disk Persistence --
 
     private fun saveState() {
+        // [dv23-B4 B-04] A pool that only BORROWS a session's context (the
+        // process-wide shared pool, bound through bindSessionContextOnly) must
+        // never persist its tab list into that session's
+        // filesDir/browser_tabs/<sid>.json: its tab list is cross-session
+        // residue, and the file it would overwrite belongs to the chat
+        // session's own browser tabs. Early-return here also stops the
+        // "resurrect a deleted session's <sid>.json" path — the shared pool's
+        // sessionId can outlive the session it names, and a later
+        // evictIdleTabs()/onTrimMemory() would otherwise re-create the file
+        // the session deletion removed (breaking the dv14-B2 dispose() guard
+        // for the shared pool).
+        if (isContextOnlySession) return
         val sid = sessionId ?: return
         try {
             val dir = File(context.filesDir, "browser_tabs")

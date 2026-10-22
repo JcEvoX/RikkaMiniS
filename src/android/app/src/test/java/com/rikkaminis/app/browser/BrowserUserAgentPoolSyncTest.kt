@@ -162,6 +162,53 @@ class BrowserUserAgentPoolSyncTest {
 
     // ── helpers ───────────────────────────────────────────────────────────────
 
+    @Test
+    fun aPresetTapDoesNotClearTheStoredCustomUserAgent() {
+        val body = blockAt(poolCode(), "fun setUserAgentFromUI(")
+        val guard = body.indexOf("if (customUA != null) {")
+        val write = body.indexOf("customUserAgentString = customUA.ifEmpty { null }")
+        assertTrue("a null custom UA must mean \"no opinion\":\n$body", guard >= 0)
+        assertTrue(
+            "the stored string must only be replaced inside that guard " +
+                "(guard@$guard write@$write):\n$body",
+            write > guard,
+        )
+        assertFalse(
+            "an unconditional assignment is exactly the clear-on-preset defect:\n$body",
+            body.contains("customUserAgentString = customUA\n"),
+        )
+        assertTrue(
+            "CUSTOM must resolve through the stored value, not the nullable argument:\n$body",
+            body.contains("storedCustomUserAgent()"),
+        )
+    }
+
+    @Test
+    fun theCustomProfileFallsBackToPrefsWhenTheCacheIsEmpty() {
+        val pool = poolCode()
+        val lines = pool.lines()
+        val start = lines.indexOfFirst { it.contains("private fun storedCustomUserAgent(") }
+        assertTrue("storedCustomUserAgent() is missing from the pool", start >= 0)
+        val helper = lines.subList(start, minOf(lines.size, start + 6)).joinToString("\n")
+        assertTrue(
+            "the single source must be the pref key the sheet writes:\n$helper",
+            helper.contains("getString(\"custom_user_agent\", null)"),
+        )
+        assertTrue(
+            "an emptied field must collapse to null, not the empty string:\n$helper",
+            helper.contains(".ifEmpty { null }"),
+        )
+        val handler = blockAt(pool, "fun handleSetUserAgent(")
+        assertTrue(
+            "set_user_agent must resolve CUSTOM through the single source:\n$handler",
+            handler.contains("if (newProfile == UserAgentProfile.CUSTOM) storedCustomUserAgent() else null"),
+        )
+        assertTrue(
+            "the sheet's UA field must feed the pool's copy, not just prefs",
+            sheetCode().contains("tabPool.stageCustomUserAgent("),
+        )
+    }
+
     private fun poolCode(): String = stripLineComments(source(poolRel))
     private fun sheetCode(): String = stripLineComments(source(sheetRel))
 
