@@ -57,6 +57,8 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import com.rikkaminis.app.ui.DisplayBitmapLimits.limitDisplaySize
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -381,10 +383,25 @@ private fun GalleryPage(
     var scale by remember { mutableFloatStateOf(1f) }
     var offsetX by remember { mutableFloatStateOf(0f) }
     var offsetY by remember { mutableFloatStateOf(0f) }
+    val context = LocalContext.current
+    // [fix/dv21-b4-B06] The page handed Coil the raw model (`minis://…`, a
+    // `File`, a `Uri`) with no ImageRequest, so the decode ran with an
+    // unbounded height: the pager box constrains the layout, but a very tall
+    // screenshot still decoded up to its intrinsic size and could exceed the
+    // RecordingCanvas draw ceiling — and this is the surface a user zooms in
+    // on. Explicitly bounded, with the same shared ceiling the markdown
+    // renderers use (`Coil` scales down to it and never up, so ordinary photos
+    // decode exactly as before).
+    val imageRequest = remember(item.model) {
+        ImageRequest.Builder(context)
+            .data(item.model)
+            .limitDisplaySize()
+            .build()
+    }
 
     Box(modifier = Modifier.fillMaxSize()) {
         AsyncImage(
-            model = item.model,
+            model = imageRequest,
             contentDescription = null,
             contentScale = ContentScale.Fit,
             modifier = Modifier

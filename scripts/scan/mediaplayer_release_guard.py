@@ -1115,6 +1115,19 @@ _CHAT_UI_REL = (
     "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatAssistantMessageUI.kt"
 )
 
+# [dv21-B04 B-06] The two non-markdown image surfaces that hand a model to Coil.
+# They are NOT media hosts (no AndroidView/MediaPlayer), so they are not in
+# _VIEW_HOSTS -- but they carry the same decode-ceiling question as arm8f, and
+# one of them used to build its own ImageLoader (thread leak + missing fetcher
+# / mtime keyer, i.e. `minis://` attachments failed to Copy/Share/Save).
+_FULLSCREEN_IMG_REL = (
+    "src/android/app/src/main/java/com/rikkaminis/app/ui/components/FullscreenImageViewer.kt"
+)
+_GALLERY_IMG_REL = (
+    "src/android/app/src/main/java/com/rikkaminis/app/ui/components/ImageGalleryViewer.kt"
+)
+_IMAGE_VIEWER_RELS = (_FULLSCREEN_IMG_REL, _GALLERY_IMG_REL)
+
 # What a key must carry to identify a media source: the path/uri a card was
 # handed, the resolved host File, or a named derivation of one.
 _SOURCE_HINT = re.compile(r"\bfilePath\b|\bfile\b|absolutePath|SourceKey\b")
@@ -1411,7 +1424,7 @@ def check_media_host_keys(sources):
                     return text[p + 1:j]
         return None
 
-    for rel in (_STREAM_REL, _MARKDOWN_REL):
+    for rel in (_STREAM_REL, _MARKDOWN_REL) + _IMAGE_VIEWER_RELS:
         clean = sources.get(rel)
         if clean is None:
             continue
@@ -1459,6 +1472,32 @@ def check_media_host_keys(sources):
                         "arm8f: the model handed to Coil in %s (%s) has no "
                         "ImageRequest construction behind it -- the decode-size "
                         "ceiling is unchecked for this source" % (name, expr))
+
+    # 8f (image viewers, dv21-B04 B-06): the loader must be THE process
+    # singleton and the request must be ceiling-capped. `ImageLoader(context)`
+    # here built a private loader with its own executor (never shut down, one
+    # thread leak per Copy/Share/Save) and none of the components
+    # `MinisApp.newImageLoader()` installs -- so `minis://` models had no
+    # fetcher and an in-place rewritten file had no mtime keyer.
+    for rel in _IMAGE_VIEWER_RELS:
+        clean = sources.get(rel)
+        if clean is None:
+            continue
+        name = rel.rsplit("/", 1)[-1]
+        anchors = list(re.finditer(r"ImageRequest\s*\.\s*Builder\s*\(", clean)) + \
+            list(re.finditer(r"\b(?:Subcompose)?AsyncImage\s*\(", clean))
+        if not anchors:
+            problems.append(
+                "arm8f: no image-request anchor left in %s -- re-point this "
+                "guard" % name)
+            continue
+        for m in re.finditer(r"(?<!Coil\.)\bImageLoader\s*\(", clean):
+            problems.append(
+                "arm8f: %s builds its own ImageLoader -- that loader registers "
+                "none of the components MinisApp.newImageLoader() installs "
+                "(minis:// fetcher, mtime keyer), and its executor is never "
+                "shut down; resolve the process singleton through "
+                "Coil.imageLoader( instead" % name)
     return problems
 
 
@@ -1613,13 +1652,63 @@ private fun ThinkingFullContentDialog(content: String, onDismiss: () -> Unit) {
 }
 '''
 
+    # [dv21-B04 B-06] the two non-markdown image surfaces
+    COMPLIANT_FULLSCREEN = '''
+package com.rikkaminis.app.ui.components
+
+internal suspend fun loadBitmap(context: Context, model: Any): Bitmap? {
+    val loader = Coil.imageLoader(context.applicationContext)
+    val req = ImageRequest.Builder(context)
+        .data(model)
+        .allowHardware(false)
+        .limitDisplaySize()
+        .build()
+    val result = loader.execute(req)
+    return (result as? SuccessResult)?.drawable?.toBitmap()
+}
+'''
+    COMPLIANT_GALLERY = '''
+package com.rikkaminis.app.ui.components
+
+@Composable
+private fun GalleryPage(item: GalleryItem) {
+    val context = LocalContext.current
+    val imageRequest = remember(item.model) {
+        ImageRequest.Builder(context)
+            .data(item.model)
+            .limitDisplaySize()
+            .build()
+    }
+    Box {
+        AsyncImage(model = imageRequest, contentDescription = null)
+    }
+}
+'''
+    # the pre-fix shapes, verbatim
+    M8f4 = COMPLIANT_GALLERY.replace("            .limitDisplaySize()\n", "")
+    M8f5 = COMPLIANT_FULLSCREEN.replace(
+        "Coil.imageLoader(context.applicationContext)",
+        "ImageLoader(context.applicationContext)")
+    M8f6 = COMPLIANT_GALLERY.replace(
+        "AsyncImage(model = imageRequest", "AsyncImage(model = item.url")
+    M8f7 = COMPLIANT_FULLSCREEN.replace("        .limitDisplaySize()\n", "")
+    P3 = COMPLIANT_GALLERY.replace(
+        "    val imageRequest = remember(item.model) {",
+        "    // NEVER: model = item.url -- the decode ceiling disappears\n"
+        "    // NEVER: ImageLoader(context.applicationContext) -- private loader\n"
+        "    val imageRequest = remember(item.model) {")
+
     def tree(player=COMPLIANT_PLAYER, stream=COMPLIANT_STREAM,
-             markdown=COMPLIANT_MARKDOWN, chat=COMPLIANT_CHAT, missing=()):
+             markdown=COMPLIANT_MARKDOWN, chat=COMPLIANT_CHAT,
+             fullscreen=COMPLIANT_FULLSCREEN, gallery=COMPLIANT_GALLERY,
+             missing=()):
         src = {
             INLINE_PLAYER_REL: player,
             _STREAM_REL: stream,
             _MARKDOWN_REL: markdown,
             _CHAT_UI_REL: chat,
+            _FULLSCREEN_IMG_REL: fullscreen,
+            _GALLERY_IMG_REL: gallery,
         }
         for rel in missing:
             src[rel] = None
@@ -1747,6 +1836,11 @@ private fun ThinkingFullContentDialog(content: String, onDismiss: () -> Unit) {
         ("arm8f M8f2 image block hands Coil the raw media", tree(markdown=M8f2), "arm8f"),
         ("arm8f M8f3 stream image branch loses the ceiling", tree(stream=M8f3), "arm8f"),
         ("arm8 precision P2 markdown comments mention the shapes", tree(markdown=P2), None),
+        ("arm8f M8f4 gallery page loses the ceiling (dv21-B04 baseline)", tree(gallery=M8f4), "arm8f"),
+        ("arm8f M8f5 fullscreen viewer builds its own ImageLoader (dv21 baseline)", tree(fullscreen=M8f5), "arm8f"),
+        ("arm8f M8f6 gallery page hands Coil the raw media", tree(gallery=M8f6), "arm8f"),
+        ("arm8f M8f7 fullscreen request loses the ceiling", tree(fullscreen=M8f7), "arm8f"),
+        ("arm8 precision P3 gallery comments mention the shapes", tree(gallery=P3), None),
         ("arm8a M8a1 inline video host has no key", tree(player=M8a1), "arm8a"),
         ("arm8a M8a2 key does not carry the data source", tree(player=M8a2), "arm8a"),
         ("arm8a M8a3 fullscreen host has no key", tree(player=M8a3), "arm8a"),
@@ -1786,7 +1880,8 @@ private fun ThinkingFullContentDialog(content: String, onDismiss: () -> Unit) {
 
     # mini tree: the media-host files are absent -> judgement skipped
     if check_media_host_keys(tree(missing=(INLINE_PLAYER_REL, _STREAM_REL,
-                                           _MARKDOWN_REL, _CHAT_UI_REL))):
+                                           _MARKDOWN_REL, _CHAT_UI_REL,
+                                           _FULLSCREEN_IMG_REL, _GALLERY_IMG_REL))):
         print("  selftest arm8 mini tree (no media-host files): expected GREEN "
               "(skipped), got RED -- FAIL")
         ok = False
@@ -1818,7 +1913,8 @@ def main() -> int:
     problems += check_inline_player_guards(inline_clean)
     problems += check_fullscreen_video_window(inline_clean)
     media_sources = {}
-    for rel in (INLINE_PLAYER_REL, _STREAM_REL, _MARKDOWN_REL, _CHAT_UI_REL):
+    for rel in (INLINE_PLAYER_REL, _STREAM_REL, _MARKDOWN_REL,
+                _CHAT_UI_REL) + _IMAGE_VIEWER_RELS:
         path = ROOT / rel
         media_sources[rel] = (strip_comments_and_strings(
             path.read_text(encoding="utf-8", errors="replace"))
