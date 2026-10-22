@@ -671,6 +671,175 @@ def check_restore_dao_wrapped(src, rel=PR_REL):
     return out
 
 
+
+# ----------------------------------------------------------------------
+# [fix/dv23-a1 §1043-A01-A02] Arm 12 / Arm 13
+# ----------------------------------------------------------------------
+# Arm 12 — publish-order: the list handed to republishThinkingCache(instanceId, X)
+# must be assigned only AFTER the DAO write returned. Assigning it before the
+# write means a failed write (disk full / SQLite lock / IO error) still hands a
+# non-null X to the republish fast path -> the resolver cache and
+# customRulesRevision advance with rules that never reached provider.db.
+#
+# Arm 13 — cold-start guard: every agent-loop read-modify-write mutator must
+# call ensureConfigLoaded() BEFORE reading _config.value, and the read must sit
+# inside the configLock region. During the async load window _config holds an
+# empty placeholder ProviderConfig(), so an unguarded read persists the empty
+# list over the user's real pins.
+
+REPUBLISH_CALL = re.compile(r"republishThinkingCache\(\s*instanceId\s*,\s*(\w+)\s*\)")
+DAO_RULE_WRITE = "providerDao.replaceThinkingRules("
+AGENT_LOOP_READ = re.compile(r"_config\.value\.agentLoop(?:ModelEntryIds|GroupIds)")
+LOAD_GUARD = "ensureConfigLoaded()"
+LOCK_CALL = "synchronized(configLock)"
+
+
+def _fun_bodies(src):
+    """[(name, body, start_idx)] for every `fun` in [src].
+
+    Two body forms are handled: `{ … }` (brace-balanced) and `= <expr>`
+    (expression bodies — `fun addAgentLoopEntry(id: String) = synchronized(lock) {…}`).
+    An expression body is cut at the NEXT `fun` declaration of the same file,
+    which is exact enough for the class-member layout of this file and keeps
+    the whole `synchronized(configLock) { … }` block inside the body.
+    """
+    out = []
+    pat = re.compile(
+        r"(?m)^([ \t]*)(?:(?:private|internal|public|protected|override|suspend|"
+        r"inline|open|final|abstract)\s+)*fun\s+(\w+)\s*\(")
+    decls = list(pat.finditer(src))
+    for n, m in enumerate(decls):
+        popen = src.index("(", m.end() - 1)
+        pend = _balanced(src, popen, "(", ")")
+        if pend < 0:
+            continue
+        i = pend
+        while i < len(src) and src[i] in " \t":
+            i += 1
+        if i < len(src) and src[i] == ":":
+            while i < len(src) and src[i] not in "{=\n":
+                i += 1
+        if i >= len(src):
+            continue
+        if src[i] == "{":
+            end = _balanced(src, i, "{", "}")
+            if end < 0:
+                continue
+            body = src[i:end]
+        elif src[i] == "=":
+            nxt = decls[n + 1].start() if n + 1 < len(decls) else len(src)
+            body = src[i:nxt]
+        else:
+            continue
+        out.append((m.group(2), body, m.start()))
+    return out
+
+
+def _body_line(src, body_start, code, idx):
+    """Absolute line number of an index inside a comment-stripped body.
+
+    code_only() keeps the line count but drops text after `//`, so the line
+    offset is the newline count, not the character offset.
+    """
+    return line_of(src, body_start) + code.count("\n", 0, idx)
+
+
+def check_thinking_rule_publish_order(src, rel=PR_REL):
+    """[fix/dv23-a1 A-01] Arm 12: publish-after-persist ordering.
+
+    The candidate set is DERIVED, not hardcoded: every function that hands a
+    list variable to republishThinkingCache(instanceId, X) AND assigns X.
+    For each candidate the DAO write must exist and must come BEFORE the
+    assignment.
+    """
+    out = []
+    seen = 0
+    for name, body, start in _fun_bodies(src):
+        code = code_only(body)
+        pm = REPUBLISH_CALL.search(code)
+        if not pm:
+            continue
+        var = pm.group(1)
+        assigns = [a.start() for a in re.finditer(
+            r"\b%s\s*=\s*[^=]" % re.escape(var), code)]
+        if not assigns:
+            continue
+        seen += 1
+        first = min(assigns)
+        dao = code.find(DAO_RULE_WRITE)
+        if dao < 0:
+            out.append((rel, _body_line(src, start, code, first), "12",
+                        "%s publishes %s to the resolver cache but never writes the "
+                        "rule set through %s — the published list is not the "
+                        "persisted one (gate ROT: the write face was renamed or "
+                        "removed)" % (name, var, DAO_RULE_WRITE)))
+            continue
+        if first < dao:
+            out.append((rel, _body_line(src, start, code, first), "12",
+                        "%s assigns %s BEFORE %s — when the write throws "
+                        "(disk full / SQLite lock / IO error) the variable is still "
+                        "non-null, so republishThinkingCache takes the 'persisted' "
+                        "fast path and publishes rules that never reached "
+                        "provider.db" % (name, var, DAO_RULE_WRITE)))
+    if not seen:
+        out.append((rel, 0, "12",
+                    "no rule-publishing mutator found — gate ROT "
+                    "(the publish face was renamed or removed)"))
+    return out
+
+
+def check_agent_loop_load_guard(src, rel=PR_REL):
+    """[fix/dv23-a1 A-02] Arm 13: cold-start load guard + lock coverage.
+
+    The candidate set is DERIVED: every function that reads
+    _config.value.agentLoopModelEntryIds / .agentLoopGroupIds. For each:
+      A. ensureConfigLoaded() must be called BEFORE that read;
+      B. the read must sit inside a synchronized(configLock) { … } region.
+    """
+    out = []
+    seen = 0
+    for name, body, start in _fun_bodies(src):
+        code = code_only(body)
+        reads = [m.start() for m in AGENT_LOOP_READ.finditer(code)]
+        if not reads:
+            continue
+        seen += 1
+        first = min(reads)
+        guard = code.find(LOAD_GUARD)
+        if guard < 0:
+            out.append((rel, _body_line(src, start, code, first), "13",
+                        "%s reads the agent-loop pin list without calling %s — "
+                        "during the cold-start async load window _config still "
+                        "holds the empty placeholder ProviderConfig(), so this "
+                        "write persists the empty list over the user's pins"
+                        % (name, LOAD_GUARD)))
+        elif guard > first:
+            out.append((rel, _body_line(src, start, code, guard), "13",
+                        "%s calls %s AFTER reading the agent-loop pin list — the "
+                        "placeholder config is already read by then"
+                        % (name, LOAD_GUARD)))
+        regions = []
+        for m in re.finditer(r"synchronized\(\s*configLock\s*\)\s*\{", code):
+            o = code.index("{", m.start())
+            e = _balanced(code, o, "{", "}")
+            if e > 0:
+                regions.append((o, e))
+        if not regions:
+            out.append((rel, _body_line(src, start, code, first), "13",
+                        "%s reads the agent-loop pin list outside any %s region — "
+                        "the read/write symmetry against the async loader's emit "
+                        "is broken" % (name, LOCK_CALL)))
+        elif not any(o < first < e for o, e in regions):
+            out.append((rel, _body_line(src, start, code, first), "13",
+                        "%s reads the agent-loop pin list BEFORE the %s region — "
+                        "the read is not covered by the lock" % (name, LOCK_CALL)))
+    if not seen:
+        out.append((rel, 0, "13",
+                    "no agent-loop pin mutator found — gate ROT "
+                    "(the read face was renamed or removed)"))
+    return out
+
+
 def run_checks(root):
     pr = read(PR_REL, root)
     bm = read(BM_REL, root)
@@ -692,6 +861,8 @@ def run_checks(root):
     checks += check_merge_preserves_entry_timestamp(pr)
     checks += check_persist_dao_wrapped(pr)
     checks += check_restore_dao_wrapped(pr)
+    checks += check_thinking_rule_publish_order(pr)
+    checks += check_agent_loop_load_guard(pr)
     return checks
 
 
@@ -1352,8 +1523,25 @@ FIX_CONVERT_BAD = """private fun convertThinkingRules(
 """
 
 
+FIX_THINKING_OK = '\n# [fix/dv23-a1 A-01] Arm 12 compliant fixture: publish-after-persist.\nprivate fun republishThinkingCache(instanceId: String, rules: List<ThinkingRule>?) {\n    if (rules != null) {\n        ThinkingRuleResolver.setCustomRules(instanceId, rules)\n        return\n    }\n    republishThinkingCache(instanceId)\n}\n\nfun saveThinkingRule(instanceId: String, rule: ThinkingRule, id: String? = null): String = runBlocking {\n    val ruleId = id ?: "minted"\n    var persistedRules: List<ThinkingRule>? = null\n    runCatching {\n        val existing = providerDao.loadThinkingRules(instanceId).toMutableList()\n        val renumbered = existing.mapIndexed { i, e -> e.copy(sortOrder = i) }\n        providerDao.replaceThinkingRules(instanceId, renumbered)\n        persistedRules = renumbered.map { ThinkingRuleCoding.toRule(it) }\n    }.onFailure { e ->\n        android.util.Log.e("ProviderRepo", "saveThinkingRule failed", e)\n    }\n    republishThinkingCache(instanceId, persistedRules)\n    ruleId\n}\n\nfun deleteThinkingRule(instanceId: String, id: String) = runBlocking {\n    var persistedRules: List<ThinkingRule>? = null\n    runCatching {\n        providerDao.deleteThinkingRule(id)\n        val survivors = providerDao.loadThinkingRules(instanceId)\n            .sortedBy { it.sortOrder }\n            .mapIndexed { i, e -> e.copy(sortOrder = i) }\n        providerDao.replaceThinkingRules(instanceId, survivors)\n        persistedRules = survivors.map { ThinkingRuleCoding.toRule(it) }\n    }.onFailure { e ->\n        android.util.Log.e("ProviderRepo", "deleteThinkingRule failed", e)\n    }\n    republishThinkingCache(instanceId, persistedRules)\n}\n\nfun reorderThinkingRules(instanceId: String, orderedIds: List<String>) = runBlocking {\n    var persistedRules: List<ThinkingRule>? = null\n    runCatching {\n        val byId = providerDao.loadThinkingRules(instanceId).associateBy { it.id }\n        val reordered = orderedIds.mapNotNull { byId[it] }\n            .mapIndexed { i, e -> e.copy(sortOrder = i) }\n        val omitted = byId.values.filter { it.id !in orderedIds }.map { it }\n        providerDao.replaceThinkingRules(instanceId, reordered + omitted)\n        persistedRules = (reordered + omitted).map { ThinkingRuleCoding.toRule(it) }\n    }.onFailure { e ->\n        android.util.Log.e("ProviderRepo", "reorderThinkingRules failed", e)\n    }\n    republishThinkingCache(instanceId, persistedRules)\n}\n'
+
+FIX_THINKING_ASSIGN_BEFORE_BAD = '\nprivate fun republishThinkingCache(instanceId: String, rules: List<ThinkingRule>?) {\n    if (rules != null) {\n        ThinkingRuleResolver.setCustomRules(instanceId, rules)\n        return\n    }\n    republishThinkingCache(instanceId)\n}\n\nfun saveThinkingRule(instanceId: String, rule: ThinkingRule, id: String? = null): String = runBlocking {\n    val ruleId = id ?: "minted"\n    var persistedRules: List<ThinkingRule>? = null\n    runCatching {\n        val existing = providerDao.loadThinkingRules(instanceId).toMutableList()\n        val renumbered = existing.mapIndexed { i, e -> e.copy(sortOrder = i) }\n        persistedRules = renumbered.map { ThinkingRuleCoding.toRule(it) }\n        providerDao.replaceThinkingRules(instanceId, renumbered)\n    }.onFailure { e ->\n        android.util.Log.e("ProviderRepo", "saveThinkingRule failed", e)\n    }\n    republishThinkingCache(instanceId, persistedRules)\n    ruleId\n}\n'
+
+FIX_THINKING_NO_DAO_BAD = '\nprivate fun republishThinkingCache(instanceId: String, rules: List<ThinkingRule>?) {\n    if (rules != null) {\n        ThinkingRuleResolver.setCustomRules(instanceId, rules)\n        return\n    }\n    republishThinkingCache(instanceId)\n}\n\nfun saveThinkingRule(instanceId: String, rule: ThinkingRule, id: String? = null): String = runBlocking {\n    val ruleId = id ?: "minted"\n    var persistedRules: List<ThinkingRule>? = null\n    runCatching {\n        persistedRules = listOf(ThinkingRuleCoding.toRule(rule, "minted", instanceId))\n    }.onFailure { e ->\n        android.util.Log.e("ProviderRepo", "saveThinkingRule failed", e)\n    }\n    republishThinkingCache(instanceId, persistedRules)\n    ruleId\n}\n'
+
+FIX_AGENT_LOOP_OK = '\n# [fix/dv23-a1 A-02] Arm 13 compliant fixture: load guard + lock.\nfun addAgentLoopEntry(entryId: String) = synchronized(configLock) {\n    ensureConfigLoaded()\n    val cur = _config.value.agentLoopModelEntryIds.toList()\n    if (entryId in cur) return@synchronized\n    setAgentLoopEntryIds(cur + entryId)\n}\n\nfun removeAgentLoopEntry(entryId: String) = synchronized(configLock) {\n    ensureConfigLoaded()\n    val cur = _config.value.agentLoopModelEntryIds.toList()\n    if (entryId !in cur) return@synchronized\n    setAgentLoopEntryIds(cur.filterNot { it == entryId })\n}\n\nfun reorderAgentLoopEntries(newOrder: List<String>) = synchronized(configLock) {\n    ensureConfigLoaded()\n    val cur = _config.value.agentLoopModelEntryIds.toList()\n    val reordered = permuteById(cur, newOrder) { it } ?: return@synchronized\n    setAgentLoopEntryIds(reordered)\n}\n'
+
+FIX_AGENT_LOOP_NO_GUARD_BAD = '\nfun addAgentLoopEntry(entryId: String) = synchronized(configLock) {\n    val cur = _config.value.agentLoopModelEntryIds.toList()\n    if (entryId in cur) return@synchronized\n    setAgentLoopEntryIds(cur + entryId)\n}\n\nfun reorderAgentLoopEntries(newOrder: List<String>) = synchronized(configLock) {\n    ensureConfigLoaded()\n    val cur = _config.value.agentLoopModelEntryIds.toList()\n    val reordered = permuteById(cur, newOrder) { it } ?: return@synchronized\n    setAgentLoopEntryIds(reordered)\n}\n'
+
+FIX_AGENT_LOOP_GUARD_AFTER_BAD = '\nfun addAgentLoopEntry(entryId: String) = synchronized(configLock) {\n    val cur = _config.value.agentLoopModelEntryIds.toList()\n    ensureConfigLoaded()\n    if (entryId in cur) return@synchronized\n    setAgentLoopEntryIds(cur + entryId)\n}\n\nfun reorderAgentLoopEntries(newOrder: List<String>) = synchronized(configLock) {\n    ensureConfigLoaded()\n    val cur = _config.value.agentLoopModelEntryIds.toList()\n    val reordered = permuteById(cur, newOrder) { it } ?: return@synchronized\n    setAgentLoopEntryIds(reordered)\n}\n'
+
+FIX_AGENT_LOOP_NO_LOCK_BAD = '\nfun addAgentLoopEntry(entryId: String) = synchronized(configLock) {\n    ensureConfigLoaded()\n    val cur = _config.value.agentLoopModelEntryIds.toList()\n    if (entryId in cur) return@synchronized\n    setAgentLoopEntryIds(cur + entryId)\n}\n\nfun reorderAgentLoopEntries(newOrder: List<String>) {\n    ensureConfigLoaded()\n    val cur = _config.value.agentLoopModelEntryIds.toList()\n    val reordered = permuteById(cur, newOrder) { it } ?: return\n    setAgentLoopEntryIds(reordered)\n}\n'
+
+FIX_AGENT_LOOP_READ_BEFORE_LOCK_BAD = '\nfun addAgentLoopEntry(entryId: String) {\n    val cur = _config.value.agentLoopModelEntryIds.toList()\n    synchronized(configLock) {\n        ensureConfigLoaded()\n        if (entryId in cur) return@synchronized\n        setAgentLoopEntryIds(cur + entryId)\n    }\n}\n\nfun reorderAgentLoopEntries(newOrder: List<String>) = synchronized(configLock) {\n    ensureConfigLoaded()\n    val cur = _config.value.agentLoopModelEntryIds.toList()\n    val reordered = permuteById(cur, newOrder) { it } ?: return@synchronized\n    setAgentLoopEntryIds(reordered)\n}\n'
+
 def build_fixture_tree(tmp, merge_src, export_src, parse_src, convert_src,
-                       update_entry_src=None, persist_src=None, restore_src=None):
+                       update_entry_src=None, persist_src=None, restore_src=None,
+                       thinking_src=None, agentloop_src=None):
     os.makedirs(os.path.join(tmp, APP + "/data/repository"), exist_ok=True)
     os.makedirs(os.path.join(tmp, APP + "/backup"), exist_ok=True)
     os.makedirs(os.path.join(tmp, APP + "/data/model"), exist_ok=True)
@@ -1363,7 +1551,9 @@ def build_fixture_tree(tmp, merge_src, export_src, parse_src, convert_src,
                 + (FIX_UPDATE_ENTRY_OK if update_entry_src is None else update_entry_src)
                 + "\n" + FIX_SAVE_CANONICAL
                 + "\n" + (FIX_PERSIST_OK if persist_src is None else persist_src)
-                + "\n" + (FIX_RESTORE_OK if restore_src is None else restore_src))
+                + "\n" + (FIX_RESTORE_OK if restore_src is None else restore_src)
+                + "\n" + (FIX_THINKING_OK if thinking_src is None else thinking_src)
+                + "\n" + (FIX_AGENT_LOOP_OK if agentloop_src is None else agentloop_src))
     with open(os.path.join(tmp, BM_REL), "w") as f:
         f.write(convert_src)
     with open(os.path.join(tmp, LM_REL), "w") as f:
@@ -1431,7 +1621,13 @@ def selftest():
                     # instead of calling build_fixture_tree, so the compliant
                     # arm-10/11 bodies must be carried explicitly — otherwise
                     # arms 10/11 ROT and the fixture stops isolating arm 8.
-                    + "\n" + FIX_PERSIST_OK + "\n" + FIX_RESTORE_OK)
+                    + "\n" + FIX_PERSIST_OK + "\n" + FIX_RESTORE_OK
+                    # [fix/dv23-a1 §1043-A01-A02] same reason for the new
+                    # arm-12/13 bodies: this fixture hand-builds its tree, so
+                    # the compliant arm-12/13 bodies must be carried
+                    # explicitly — otherwise arms 12/13 ROT and the fixture
+                    # stops isolating arm 8.
+                    + "\n" + FIX_THINKING_OK + "\n" + FIX_AGENT_LOOP_OK)
         with open(os.path.join(tmp, BM_REL), "w") as f:
             f.write(FIX_CONVERT_OK)
         with open(os.path.join(tmp, LM_REL), "w") as f:
@@ -1522,6 +1718,57 @@ def selftest():
             failures.append("restore-missing fixture arms=%r (want ['11'])" % (got,))
         elif not any("gate ROT" in x[3] for x in v):
             failures.append("restore-missing fixture did not report ROT: %r" % (v,))
+    # [fix/dv23-a1 §1043-A01-A02] Arms 12/13: the publish-after-persist
+    # ordering (12) and the cold-start load guard + lock coverage (13). Each
+    # fixture reds only its own arm; the ROT cases are fail-closed.
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_OK, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK,
+                           thinking_src=FIX_THINKING_ASSIGN_BEFORE_BAD)
+        got = _arm_set(tmp)
+        if got != ["12"]:
+            failures.append("thinking-assign-before-dao fixture arms=%r (want ['12'])" % (got,))
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_OK, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK,
+                           thinking_src=FIX_THINKING_NO_DAO_BAD)
+        v = run_checks(tmp)
+        got = sorted({x[2] for x in v})
+        if got != ["12"]:
+            failures.append("thinking-no-dao fixture arms=%r (want ['12'])" % (got,))
+        elif not any("gate ROT" in x[3] for x in v):
+            failures.append("thinking-no-dao fixture did not report ROT: %r" % (v,))
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_OK, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK,
+                           agentloop_src=FIX_AGENT_LOOP_NO_GUARD_BAD)
+        got = _arm_set(tmp)
+        if got != ["13"]:
+            failures.append("agentloop-no-guard fixture arms=%r (want ['13'])" % (got,))
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_OK, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK,
+                           agentloop_src=FIX_AGENT_LOOP_GUARD_AFTER_BAD)
+        got = _arm_set(tmp)
+        if got != ["13"]:
+            failures.append("agentloop-guard-after fixture arms=%r (want ['13'])" % (got,))
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_OK, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK,
+                           agentloop_src=FIX_AGENT_LOOP_NO_LOCK_BAD)
+        got = _arm_set(tmp)
+        if got != ["13"]:
+            failures.append("agentloop-no-lock fixture arms=%r (want ['13'])" % (got,))
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_OK, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK,
+                           agentloop_src=FIX_AGENT_LOOP_READ_BEFORE_LOCK_BAD)
+        got = _arm_set(tmp)
+        if got != ["13"]:
+            failures.append("agentloop-read-before-lock fixture arms=%r (want ['13'])" % (got,))
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_OK, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK,
+                           agentloop_src="")
+        v = run_checks(tmp)
+        got = sorted({x[2] for x in v})
+        if got != ["13"]:
+            failures.append("agentloop-missing fixture arms=%r (want ['13'])" % (got,))
+        elif not any("gate ROT" in x[3] for x in v):
+            failures.append("agentloop-missing fixture did not report ROT: %r" % (v,))
     if failures:
         for f in failures:
             print("SELFTEST-FAIL: " + f)
@@ -1531,7 +1778,9 @@ def selftest():
           " / merge-noapply red arm 6 / merge-id-only+whitelist red arm 7 / save-raw red arm 8"
           " / merge-restamp+update-restamp+update-no-switch+update-missing red arm 9"
           " / persist-bare+persist-mirror-inside+persist-no-mirror red arm 10"
-          " / restore-bare+restore-silent+restore-no-catch+restore-missing red arm 11")
+          " / restore-bare+restore-silent+restore-no-catch+restore-missing red arm 11"
+          " / thinking-assign-before+thinking-no-dao red arm 12"
+          " / agentloop-no-guard+guard-after+no-lock+read-before-lock+missing red arm 13")
     print("PROVIDER_IMPORT_ID_ROUNDTRIP_SELFTEST=PASS")
     return 0
 
@@ -1551,7 +1800,7 @@ def main():
         for rel, line, arm, msg in violations:
             print("  [arm %s] %s:%s — %s" % (arm, rel, line, msg))
         sys.exit(1)
-    print("PROVIDER_IMPORT_ID_ROUNDTRIP: clean (11 arms)")
+    print("PROVIDER_IMPORT_ID_ROUNDTRIP: clean (13 arms)")
     sys.exit(0)
 
 
