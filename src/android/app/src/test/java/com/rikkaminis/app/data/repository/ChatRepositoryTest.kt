@@ -362,6 +362,27 @@ class ChatRepositoryEmptySweepCleanupTest {
         }
 
     @Test
+    fun `one failing hook does not stop the remaining ids`() =
+        kotlinx.coroutines.runBlocking {
+            // A throwing cleanup (e.g. skills.db locked) must not abort the
+            // sweep: the rows are already gone, and the other ids still owe
+            // their cleanup.
+            val dao = ChatRepositoryCreateSessionTest.RecordingDao()
+            dao.emptySweepCandidates = listOf("a", "b", "c")
+            dao.emptySweepDeleted = 3
+            val reported = mutableListOf<String>()
+            val repository = ChatRepository(dao, sessionFiles = null, onSessionDeleted = { id ->
+                if (id == "a") error("clearSessionOverrides exploded")
+                reported.add(id)
+            })
+
+            val swept = repository.deleteEmptySessions()
+
+            assertEquals(3, swept)
+            assertEquals(listOf("b", "c"), reported)
+        }
+
+    @Test
     fun `deleteSession and deleteSessionRowOnly notify once each`() =
         kotlinx.coroutines.runBlocking {
             val dao = ChatRepositoryCreateSessionTest.RecordingDao()
