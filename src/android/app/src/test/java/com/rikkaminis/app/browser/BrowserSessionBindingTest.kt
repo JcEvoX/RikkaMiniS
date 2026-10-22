@@ -270,6 +270,93 @@ class BrowserSessionBindingTest {
 
     // ── helpers ─────────────────────────────────────────────────────────
 
+    @Test
+    fun `the borrow latch is set by the context-only bind and cleared by a full bind`() {
+        val src = readRepoFile(TabPoolPath)
+        val contextOnly = memberSlice(src, "fun bindSessionContextOnly(")
+        val full = memberSlice(src, "fun setSession(")
+        assertTrue(
+            "a context-only bind must latch the borrow:\n$contextOnly",
+            contextOnly.contains("isContextOnlySession = true"),
+        )
+        assertTrue(
+            "a full session bind must take ownership back:\n$full",
+            full.contains("isContextOnlySession = false"),
+        )
+        assertFalse(
+            "a full session bind must not latch the borrow:\n$full",
+            full.contains("isContextOnlySession = true"),
+        )
+    }
+
+    @Test
+    fun `a context-only pool never persists into the borrowed session's tab file`() {
+        val body = stripComments(memberSlice(readRepoFile(TabPoolPath), "private fun saveState("))
+        val guard = body.indexOf("if (isContextOnlySession) return")
+        assertTrue(
+            "saveState must refuse to persist for a context-only bind:\n$body",
+            guard >= 0,
+        )
+        // The guard has to precede the tab-file access, not merely exist: a
+        // check placed after `File(context.filesDir, ...)` would still let the
+        // borrowed session's file be created/overwritten on the way in.
+        // Comments are stripped first: this function's own KDoc names
+        // `filesDir/browser_tabs/<sid>.json`, and a comment cannot count as a
+        // touch (the same comment trap the gates guard against).
+        val firstTouch = listOf(
+            body.indexOf("browser_tabs"),
+            body.indexOf("getSharedPreferences"),
+        ).filter { it >= 0 }.minOrNull() ?: -1
+        assertTrue(
+            "the borrow guard must run before the tab file is touched " +
+                "(guard@$guard touch@$firstTouch):\n$body",
+            firstTouch >= 0 && guard < firstTouch,
+        )
+    }
+
+    /**
+     * Blank out comments while keeping every line (and therefore every
+     * character offset) intact. A mention inside a comment must never satisfy
+     * a criterion — nor be mistaken for one.
+     */
+    private fun stripComments(src: String): String {
+        val out = StringBuilder(src)
+        var i = 0
+        var inLine = false
+        var inBlock = false
+        while (i < src.length) {
+            val c = src[i]
+            val next = if (i + 1 < src.length) src[i + 1] else ' '
+            when {
+                inLine -> {
+                    if (c == '\n') inLine = false else out.setCharAt(i, ' ')
+                }
+                inBlock -> {
+                    if (c == '*' && next == '/') {
+                        out.setCharAt(i, ' ')
+                        out.setCharAt(i + 1, ' ')
+                        inBlock = false
+                        i++
+                    } else if (c != '\n') out.setCharAt(i, ' ')
+                }
+                c == '/' && next == '/' -> {
+                    out.setCharAt(i, ' ')
+                    out.setCharAt(i + 1, ' ')
+                    inLine = true
+                    i++
+                }
+                c == '/' && next == '*' -> {
+                    out.setCharAt(i, ' ')
+                    out.setCharAt(i + 1, ' ')
+                    inBlock = true
+                    i++
+                }
+            }
+            i++
+        }
+        return out.toString()
+    }
+
     private fun readRepoFile(relative: String): String {
         // Gradle (CI) sets user.dir to the module dir; a sandbox JVM run may
         // start anywhere under the repo — walk up instead of assuming a depth.
