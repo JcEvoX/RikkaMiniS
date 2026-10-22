@@ -695,6 +695,9 @@ def check_tree(root):
                          "the shard allocator (a stable per-slot identity within the "
                          "fragment)"))
 
+    # ── H: the streaming block ledger (dv21-B4-B05) ─────────────────────────
+    problems.extend(streaming_block_ledger_findings(stream_c))
+
     # ── swipe block: delimited by the pointerInput lambda ───────────────────
     g_idx = inp_c.find("pointerInput(Unit)")
     if g_idx == -1:
@@ -1003,6 +1006,19 @@ class SelectionController {
 
 STREAM_F = """package com.rikkaminis.app.ui.chat
 
+private const val COLD_PARSE_OFFMAIN_THRESHOLD_CHARS = 2_000
+
+internal object StreamingBlockLedger {
+    data class Published(val blocks: List<MdBlock>, val source: String?)
+    fun seed(blocks: List<MdBlock>?, raw: String): Published =
+        Published(blocks.orEmpty(), if (blocks != null) raw else null)
+    fun publish(computed: List<MdBlock>, raw: String): Published = Published(computed, raw)
+    fun rendered(published: Published, seed: List<MdBlock>?): List<MdBlock> =
+        if (seed != null && published.blocks !== seed) seed else published.blocks
+    fun isConvergedWith(published: Published, raw: String, isStreaming: Boolean): Boolean =
+        !isStreaming && published.source == raw
+}
+
 @Composable
 private fun RenderTable(block: MdBlock.Table) {
     val selectionController = LocalMinisSelectionController.current
@@ -1015,6 +1031,48 @@ private fun RenderTable(block: MdBlock.Table) {
             selectionController.rememberTableActions(messageId, tableIndex, actions)
             onDispose { selectionController.forgetTableActions(messageId, tableIndex) }
         }
+    }
+}
+
+@Composable
+private fun StreamingMarkdownTextBody(
+    content: String,
+    isStreaming: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    val displayContent = content
+    val mdColors = currentMdColors()
+    val warmSeed = remember(displayContent, isStreaming) {
+        MarkdownParseCaches.cachedBlocks(displayContent)
+    }
+    var published by remember {
+        mutableStateOf(StreamingBlockLedger.seed(warmSeed, displayContent))
+    }
+    val blocks = StreamingBlockLedger.rendered(published, warmSeed)
+    LaunchedEffect(displayContent, isStreaming) {
+        if (warmSeed != null) {
+            published = StreamingBlockLedger.seed(warmSeed, displayContent)
+            return@LaunchedEffect
+        }
+        if (StreamingBlockLedger.isConvergedWith(published, displayContent, isStreaming)) {
+            if (displayContent.length >= COLD_PARSE_OFFMAIN_THRESHOLD_CHARS) {
+                MarkdownParseCaches.putBlocks(displayContent, published.blocks)
+            }
+            return@LaunchedEffect
+        }
+        val computed = withContext(Dispatchers.Default) {
+            parseMarkdownBlocks(displayContent).also {
+                MarkdownParseCaches.prewarm(it, mdColors)
+                if (!isStreaming && displayContent.length >= COLD_PARSE_OFFMAIN_THRESHOLD_CHARS) {
+                    MarkdownParseCaches.putBlocks(displayContent, it)
+                }
+            }
+        }
+        published = StreamingBlockLedger.publish(computed, displayContent)
+    }
+    Column(modifier = modifier) {
+        val lastIdx = blocks.size - 1
+        blocks.forEachIndexed { idx, block -> RenderBlock(block) }
     }
 }
 """
@@ -1216,6 +1274,218 @@ def composer_clear_funnel_findings(inp_c):
                                        "routing through %s on the same path -- the field "
                                        "reset is bypassed"
                                        % (label, line, fname)))
+    return problems
+
+
+def _guard_before_brace(text, ob):
+    """The `if (...)` condition whose body opens at [ob], or None when the brace
+    opens a bare block / lambda."""
+    j = ob - 1
+    while j >= 0 and text[j] in " \t\r\n":
+        j -= 1
+    if j < 0 or text[j] != ")":
+        return None
+    depth = 0
+    k = j
+    while k >= 0:
+        if text[k] == ")":
+            depth += 1
+        elif text[k] == "(":
+            depth -= 1
+            if depth == 0:
+                break
+        k -= 1
+    if k < 0:
+        return None
+    if not text[max(0, k - 8):k].rstrip().endswith("if"):
+        return None
+    return text[k + 1:j]
+
+
+def _enclosing_condition_chain(text, idx, floor):
+    """Every `if (...)` condition on the path from [idx] out to [floor].
+
+    A deposit nested inside two conditions (stream ended AND long enough) is
+    governed by BOTH — reading only the innermost one would report a missing
+    `isStreaming` guard on a correctly guarded deposit, and reading only the
+    outermost would let a source check sit on a branch that cannot reach it.
+    Anchoring on enclosing BLOCKS (not on a backward scan for the token `if`)
+    keeps a nested lambda's own parentheses out of the reading."""
+    conds = []
+    cur = idx
+    while cur > floor:
+        span = _innermost_brace_span(text, cur)
+        if span is None or span[0] <= floor:
+            break
+        cond = _guard_before_brace(text, span[0])
+        if cond is not None:
+            conds.append(cond)
+        cur = span[0] - 1
+    return conds
+
+
+BLOCK_STATE_PAIR_RE = re.compile(
+    r"mutableStateOf\s*\(\s*[\w.]+\(\s*[^()]*?\b(displayContent|content)\b\s*\)")
+BARE_LIST_STATE_RE = re.compile(r"mutableStateOf\s*<\s*List\s*<\s*MdBlock\s*>")
+CACHE_PEEK_RE = re.compile(r"\.cachedBlocks\s*\(")
+
+
+def streaming_block_ledger_findings(stream_c):
+    """[dv21-B4-B05] The streaming body's block state must be a (blocks, source)
+    ledger, and the frame where a stream CONVERGES must both re-enter the
+    publishing effect and deposit through a source-checked guard.
+
+    Two field-visible defects came out of the bare `List<MdBlock>` in an unkeyed
+    `remember`:
+
+      (a) a body REUSED for another message drew the outgoing message's blocks
+          for one frame, then re-parsed a list the cache already had (the
+          identity check `blocks === warmSeed` compared against a list it had
+          thrown away, so a HIT was recorded as FROZEN_MISS);
+      (b) the convergence frame never deposited — the deposit is gated on
+          `!isStreaming`, a coroutine already running keeps the `true` it
+          captured, and the effect's only key (`displayContent`) had already
+          reached its final value — so every long streamed answer stayed out of
+          blocksLru and was re-parsed on each scroll-back.
+
+    Four decisions, not four spellings:
+
+      H1  the cache-seeded `remember` is keyed on the streaming flag AS WELL AS
+          the content (a converged frame must re-read a seed it skipped while
+          live);
+      H2  the block state carries the text it was parsed from (no bare
+          `List<MdBlock>` state; the initializer pairs blocks with the content);
+      H3  the publishing `LaunchedEffect` is keyed on the streaming flag too, or
+          the convergence frame never runs at all;
+      H4  a deposit whose list was NOT freshly parsed must consult that list's
+          ledger in its guard — caching a prefix that a cancelled parse left
+          behind is a durable truncated render, worse than a cold cache.
+
+    H4 is deliberately keyed on "the guard names the state that owns the
+    deposited list": a refactor that renames the ledger must keep that property
+    (the guard consults the source), but is free to rename the helper.
+    """
+    problems = []
+
+    # Scope: the ACTIVE renderer only. `MarkdownDocument` / `MarkdownBlockBody`
+    # keep their own bare `List<MdBlock>` state and are RUNTIME-DEAD while
+    # AGGREGATE_MESSAGE_ITEMS is true (the audit's own 失真 #1: this gate must
+    # not demand a change there — the barrier is deliberate).
+    body = declaration_slice(stream_c, "fun StreamingMarkdownTextBody(")
+    body_off = stream_c.find(body)
+    if not body:
+        problems.append(("H", "`StreamingMarkdownTextBody` not found — the streaming "
+                              "renderer this family pins moved, re-point this guard "
+                              "(fail-closed)"))
+        return problems
+
+    seed_keys = None
+    for m in re.finditer(r"\bremember\s*\(", body):
+        op = m.end() - 1
+        cl = _balanced_paren(body, op)
+        if cl is None:
+            continue
+        window = body[cl:cl + 500]
+        if not CACHE_PEEK_RE.search(window):
+            continue
+        seed_keys = body[op + 1:cl]
+        break
+    if seed_keys is None:
+        problems.append(("H1", "no `remember { … cachedBlocks(…) }` seed found — the "
+                               "warm-cache seed anchor moved, re-point this guard"))
+    else:
+        if "isStreaming" not in seed_keys:
+            problems.append(("H1", "the warm-cache seed is not keyed on the streaming "
+                                   "flag (keys: %r) — a stream that converges keeps the "
+                                   "`null` seed cached from its live frames, so the "
+                                   "final frame misses a cache that should hit" % seed_keys.strip()))
+        if not re.search(r"\b(displayContent|content)\b", seed_keys):
+            problems.append(("H1", "the warm-cache seed is not keyed on the content — "
+                                   "a reused body would keep the previous message's seed"))
+
+    # ── H2: the block state carries its source text ─────────────────────────
+    if BARE_LIST_STATE_RE.search(body):
+        problems.append(("H2", "the block state is still a bare `List<MdBlock>` — "
+                               "without the text it was parsed from, a convergence "
+                               "deposit cannot tell its own content from a cancelled "
+                               "prefix, and a reused body cannot tell its own message "
+                               "from the previous one"))
+    elif not BLOCK_STATE_PAIR_RE.search(body):
+        problems.append(("H2", "no block state pairs its blocks with the content it "
+                               "was parsed from (expected `<ledger>(<blocks>, "
+                               "<content>)` in the state initializer) — re-point this "
+                               "guard if the pairing moved"))
+
+    # ── H3/H4: the publishing effect re-enters, and every deposit is guarded ─
+    effect_body = None
+    effect_keys = None
+    for m in re.finditer(r"\bLaunchedEffect\s*\(", body):
+        op = m.end() - 1
+        cl = _balanced_paren(body, op)
+        if cl is None:
+            continue
+        tail = body[cl:cl + 3000]
+        if ".putBlocks(" not in tail:
+            continue
+        effect_keys = body[op + 1:cl]
+        body_start = body.find("{", cl)
+        span = _innermost_brace_span(body, body_start + 1) if body_start >= 0 else None
+        effect_body = body[body_start:span[1] + 1] if span else None
+        effect_body_off = body_start
+        break
+    if effect_body is None:
+        problems.append(("H3", "no publishing `LaunchedEffect` that reaches "
+                               "putBlocks( — the deposit anchor moved, re-point this "
+                               "guard"))
+        return problems
+    if "isStreaming" not in (effect_keys or ""):
+        problems.append(("H3", "the publishing effect is not keyed on the streaming "
+                               "flag (keys: %r) — `displayContent` reaches its final "
+                               "value one throttle tick before the stream ends, so the "
+                               "convergence frame never re-enters and nothing is ever "
+                               "deposited" % (effect_keys or "").strip()))
+    if not re.search(r"\b(displayContent|content)\b", effect_keys or ""):
+        problems.append(("H3", "the publishing effect is not keyed on the content — "
+                               "a reused body would keep the previous message's blocks"))
+
+    floor = effect_body.find("{")
+    for m in re.finditer(r"\.putBlocks\s*\(", effect_body):
+        conds = _enclosing_condition_chain(effect_body, m.start(), floor)
+        cond = " && ".join(conds)
+        line = body_off + body.count("\n", 0, effect_body_off + m.start()) + 1
+        if not conds:
+            problems.append(("H4", "the deposit at line %d has no enclosing condition — "
+                                   "it caches whatever is in hand, so an empty or "
+                                   "stale block list can become the content's cached "
+                                   "parse" % line))
+            continue
+        if "isStreaming" not in cond:
+            problems.append(("H4", "the deposit at line %d is not gated on the stream "
+                                   "having ended — caching a half-parsed prefix under "
+                                   "the final content's key renders a truncated message "
+                                   "from then on" % line))
+            continue
+        if not re.search(r"\b(displayContent|content)\b", cond):
+            problems.append(("H4", "the deposit at line %d does not name the content it "
+                                   "is being cached under" % line))
+            continue
+        # The deposited list: `putBlocks(<content>, <list>)`.
+        op = effect_body.find("(", m.start())
+        args = call_arg_spans(effect_body, op) or []
+        if len(args) < 2:
+            problems.append(("H4", "the deposit at line %d does not pass a block list "
+                                   "— fail-closed" % line))
+            continue
+        deposited = args[1]
+        if deposited in ("it", "computed", "parsed", "blocks"):
+            continue  # a list parsed from the content in hand — safe by construction
+        owner = re.match(r"\s*(\w+)", deposited)
+        if owner is None or owner.group(1) not in cond:
+            problems.append(("H4", "the deposit at line %d caches `%s`, a list this "
+                                   "frame did not parse, but its guard never consults "
+                                   "that list's source — a parse cancelled by a newer "
+                                   "chunk leaves a prefix behind, and caching it is a "
+                                   "durable truncated render" % (line, deposited.strip()[:40])))
     return problems
 
 
@@ -1527,12 +1797,58 @@ def selftest():
             '        })'),
     }), ["F4"])
 
+    # ── H family (B-05): the streaming body's ledger invariants ─────────────
+    # H1: the seed forgets the streaming flag → the convergence frame keeps the
+    #     `null` cached during the live frames.
+    expect("H1 seed not keyed on isStreaming", fixtures(**{
+        STREAM_REL: STREAM_F.replace(
+            "    val warmSeed = remember(displayContent, isStreaming) {",
+            "    val warmSeed = remember(displayContent) {"),
+    }), ["H1"])
+    # H2: the block state collapses back to a bare list.
+    expect("H2 bare List<MdBlock> state", fixtures(**{
+        STREAM_REL: STREAM_F.replace(
+            "    var published by remember {\n"
+            "        mutableStateOf(StreamingBlockLedger.seed(warmSeed, displayContent))\n"
+            "    }\n"
+            "    val blocks = StreamingBlockLedger.rendered(published, warmSeed)\n",
+            "    var blocks by remember { mutableStateOf<List<MdBlock>>(warmSeed.orEmpty()) }\n"),
+    }), ["H2"])
+    # H3: the publishing effect drops the streaming flag from its keys → the
+    #     convergence frame never re-enters.
+    expect("H3 effect not keyed on isStreaming", fixtures(**{
+        STREAM_REL: STREAM_F.replace(
+            "    LaunchedEffect(displayContent, isStreaming) {",
+            "    LaunchedEffect(displayContent) {"),
+    }), ["H3"])
+    # H4a: the convergence deposit loses its ledger guard.
+    expect("H4 deposit guard never names the stream state", fixtures(**{
+        STREAM_REL: STREAM_F.replace(
+            "        if (StreamingBlockLedger.isConvergedWith(published, displayContent, isStreaming)) {",
+            "        if (published.blocks.isNotEmpty()) {"),
+    }), ["H4"])
+    # H4b: the deposit caches a list this frame did not parse, without asking
+    #      where that list came from.
+    expect("H4 deposit of a foreign list", fixtures(**{
+        STREAM_REL: STREAM_F.replace(
+            "                MarkdownParseCaches.putBlocks(displayContent, published.blocks)",
+            "                MarkdownParseCaches.putBlocks(displayContent, stalePrefix)"),
+    }), ["H4"])
+    # H precision: prose mentions the forbidden shapes.
+    expect("H precision: comments mention the old shapes", fixtures(**{
+        STREAM_REL: STREAM_F.replace(
+            "internal object StreamingBlockLedger {",
+            "// NEVER: var blocks by remember { mutableStateOf<List<MdBlock>>(emptyList()) }\n"
+            "// NEVER: putBlocks(displayContent, published.blocks) outside isStreaming\n"
+            "internal object StreamingBlockLedger {"),
+    }), [])
+
     if failures:
         print("❌ selftest failed:")
         for f in failures:
             print("   " + f)
         return 1
-    print("CHAT_UI_INTERACTION_SELFTEST=PASS (36 fixtures: clean + 35 violation/precision)")
+    print("CHAT_UI_INTERACTION_SELFTEST=PASS (42 fixtures: clean + 41 violation/precision)")
     return 0
 
 

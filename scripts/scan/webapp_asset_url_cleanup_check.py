@@ -47,6 +47,23 @@ the private `FloatingToolbar` composable, and `fullscreen` locals in other
 files — the arms are keyed on "a fullscreen-named snapshot state", not on the
 word `fullscreen` itself.
 
+[dv21-B04 B-08] the pin verdict was silent on two carriers and the tile
+decode ran on the composition thread. Three anchors, all on the decision
+point (never on the call spelling):
+
+  arm8a (ShortcutPinner.kt) / arm8b (WebPreviewShortcut.kt): every
+        `requestPinShortcut` call is CAPTURED (its nearest enclosing
+        `runCatching { }` spans the call, so a throwing OEM launcher cannot
+        take the process down), its verdict is classified once through the
+        shared `pinOutcome(`, compared against `ShortcutPinOutcome.REQUESTED`,
+        and a non-REQUESTED answer reaches the user (`webapp_pin_failed`) —
+        `false` and a throw are the same answer to the user.
+  arm9: AddToHomeSheet.kt — no decode (`decodeFileBounded(` /
+        `loadBitmapFromUri(`) inside a `remember(...) { }` block (that is the
+        composition thread), and every decode that lives in a `produceState`
+        block hops off it (`Dispatchers.IO` in the same block). Fail-closed
+        when the sheet carries no decode call at all (anchor moved).
+
 Usage:
   python3 webapp_asset_url_cleanup_check.py <repo_root>   # real tree
   python3 webapp_asset_url_cleanup_check.py --selftest    # fixtures
@@ -62,6 +79,10 @@ import tempfile
 
 ACTIVITY_REL = "src/android/app/src/main/java/com/rikkaminis/app/webapp/WebAppActivity.kt"
 SHEET_REL = "src/android/app/src/main/java/com/rikkaminis/app/webapp/AddToHomeSheet.kt"
+PINNER_REL = "src/android/app/src/main/java/com/rikkaminis/app/webapp/ShortcutPinner.kt"
+PREVIEW_SHORTCUT_REL = (
+    "src/android/app/src/main/java/com/rikkaminis/app/ui/preview/WebPreviewShortcut.kt"
+)
 
 # --- compliant / violation fixture snippets (code-level, not comments) ---
 
@@ -224,6 +245,101 @@ VIOLATION_ARM7_WRITER_NO_FLAG = COMPLIANT_SHEET.replace(
 VIOLATION_ARM7_EMPTY_SEED = COMPLIANT_SHEET.replace(
     "mutableStateOf(webAppTitleFallback(fileName))",
     'mutableStateOf("")',
+)
+
+
+# [dv21-B04 B-08] compliant carriers: one shared verdict, captured call, the
+# decline surfaced. Code-level shapes only.
+COMPLIANT_PINNER = """package com.rikkaminis.app.webapp
+
+object ShortcutPinner {
+    fun pin(context: Context, shortcut: WebAppShortcutEntity): Boolean {
+        val outcome = pinOutcome(
+            runCatching { ShortcutManagerCompat.requestPinShortcut(context, info, null) },
+        )
+        if (outcome != ShortcutPinOutcome.REQUESTED) {
+            Toast.makeText(context, R.string.webapp_pin_failed, Toast.LENGTH_LONG).show()
+        }
+        return outcome == ShortcutPinOutcome.REQUESTED
+    }
+}
+"""
+
+COMPLIANT_PREVIEW_SHORTCUT = """package com.rikkaminis.app.ui.preview
+
+object WebPreviewShortcut {
+    fun pin(context: Context, title: String): Boolean {
+        val outcome = pinOutcome(
+            runCatching { ShortcutManagerCompat.requestPinShortcut(context, info, null) },
+        )
+        Toast.makeText(
+            context,
+            context.getString(
+                if (outcome == ShortcutPinOutcome.REQUESTED) {
+                    R.string.webpreview_pin_to_home_requested
+                } else {
+                    R.string.webapp_pin_failed
+                },
+            ),
+            Toast.LENGTH_SHORT,
+        ).show()
+        return outcome == ShortcutPinOutcome.REQUESTED
+    }
+}
+"""
+
+# [dv21-B04 B-08] arm8 violations (one per carrier, one criterion each):
+#  - the pinner classifies nothing: the verdict is a raw Boolean again, so a
+#    decline is silent (and a throw escapes);
+#  - the preview carrier keeps the verdict but drops the capture, so an OEM
+#    launcher that throws kills the process.
+VIOLATION_ARM8_SILENT_DECLINE = COMPLIANT_PINNER.replace(
+    """        val outcome = pinOutcome(
+            runCatching { ShortcutManagerCompat.requestPinShortcut(context, info, null) },
+        )""",
+    """        val outcome = ShortcutManagerCompat.requestPinShortcut(context, info, null)""",
+).replace(
+    """        if (outcome != ShortcutPinOutcome.REQUESTED) {
+            Toast.makeText(context, R.string.webapp_pin_failed, Toast.LENGTH_LONG).show()
+        }
+        return outcome == ShortcutPinOutcome.REQUESTED""",
+    """        return outcome""",
+)
+VIOLATION_ARM8_NO_CAPTURE = COMPLIANT_PREVIEW_SHORTCUT.replace(
+    "runCatching { ShortcutManagerCompat.requestPinShortcut(context, info, null) }",
+    "ShortcutManagerCompat.requestPinShortcut(context, info, null)",
+)
+
+# [dv21-B04 B-08] arm9 fixture fragment (compliant) + its two violations.
+SHEET_DECODE_TILE = """
+@Composable
+private fun IconTile(path: String) {
+    val bmp by produceState<Bitmap?>(initialValue = null, path) {
+        value = withContext(Dispatchers.IO) {
+            ImageDecoding.decodeFileBounded(path, ICON_MAX_EDGE_PX)?.bitmap
+        }
+    }
+    if (bmp != null) {
+        Image(bitmap = bmp.asImageBitmap(), contentDescription = null)
+    }
+}
+"""
+
+VIOLATION_ARM9_REMEMBER = SHEET_DECODE_TILE.replace(
+    """    val bmp by produceState<Bitmap?>(initialValue = null, path) {
+        value = withContext(Dispatchers.IO) {
+            ImageDecoding.decodeFileBounded(path, ICON_MAX_EDGE_PX)?.bitmap
+        }
+    }""",
+    """    val bmp = remember(path) {
+        ImageDecoding.decodeFileBounded(path, ICON_MAX_EDGE_PX)?.bitmap
+    }""",
+)
+VIOLATION_ARM9_NO_IO = SHEET_DECODE_TILE.replace(
+    """        value = withContext(Dispatchers.IO) {
+            ImageDecoding.decodeFileBounded(path, ICON_MAX_EDGE_PX)?.bitmap
+        }""",
+    """        value = ImageDecoding.decodeFileBounded(path, ICON_MAX_EDGE_PX)?.bitmap""",
 )
 
 
@@ -450,16 +566,114 @@ def check_sheet_arm7(src: str) -> bool:
     return "userEditedTitle" in body
 
 
+DECODE_CALLS = ("decodeFileBounded", "loadBitmapFromUri")
+
+
+def _call_sites(code: str, name: str):
+    """Offsets of `name(` CALLS (the `fun name(` declaration is skipped)."""
+    out = []
+    for m in re.finditer(r"\b" + re.escape(name) + r"\s*\(", code):
+        if re.search(r"\bfun\s+$", code[max(0, m.start() - 12):m.start()]):
+            continue
+        out.append(m.start())
+    return out
+
+
+def _block_body(code: str, header_re: str):
+    """(open_brace, body) for each `header_re` occurrence that opens a lambda."""
+    out = []
+    for m in re.finditer(header_re, code):
+        ob = code.find("(", m.end() - 1) if header_re.endswith(r"\(") else code.find("(", m.start())
+        if ob < 0:
+            continue
+        pb = _paren_block(code, ob)
+        br = code.find("{", ob + len(pb))
+        if br < 0:
+            continue
+        body = _brace_block(code, br)
+        if not body.endswith("}"):
+            continue
+        out.append((br, body))
+    return out
+
+
+def check_pin_arm8(src: str) -> bool:
+    """[dv21-B04 B-08] ONE captured pin attempt whose verdict is surfaced.
+
+    Decision points, not call shapes:
+      - a throwing OEM launcher cannot escape: the call sits inside a
+        `runCatching { }` block;
+      - the answer is classified once by the shared `pinOutcome(` and compared
+        against `REQUESTED` (a bare Boolean is not a verdict — `false` and a
+        throw are the same answer to the user);
+      - a non-REQUESTED answer is visible: the failure string is referenced.
+    Fail-closed when the carrier no longer calls `requestPinShortcut`."""
+    code = strip_comments(src)
+    sites = _call_sites(code, "requestPinShortcut")
+    if not sites:
+        return False
+    captured_spans = []
+    for m in re.finditer(r"\brunCatching\s*\{", code):
+        br = code.index("{", m.start())
+        body = _brace_block(code, br)
+        if body.endswith("}"):
+            captured_spans.append((br, br + len(body)))
+    for s in sites:
+        if not any(a < s < b for a, b in captured_spans):
+            return False
+    if "pinOutcome(" not in code:
+        return False
+    if not re.search(r"ShortcutPinOutcome\s*\.\s*REQUESTED", code):
+        return False
+    return "webapp_pin_failed" in code
+
+
+def check_sheet_arm9(src: str) -> bool:
+    """[dv21-B04 B-08] No decode on the composition thread.
+
+    Two decision points:
+      - nothing decodes inside a `remember(...) { }` body (that body runs on
+        the composition thread — the sheet used to block for the whole
+        read+sample of a 12 Mpx icon);
+      - any decode in a `produceState` body hops off it (`Dispatchers.IO` in
+        the same body; `produceState` otherwise still runs on the composition
+        dispatcher).
+    Fail-closed when the sheet carries no decode call at all (anchor moved)."""
+    code = strip_comments(src)
+    sites = []
+    for name in DECODE_CALLS:
+        sites.extend(_call_sites(code, name))
+    if not sites:
+        return False
+    for br, body in _block_body(code, r"\bremember\s*\("):
+        if any(br < s < br + len(body) for s in sites):
+            return False
+    for br, body in _block_body(code, r"\bproduceState\s*(?:<[^>{]*>)?\s*\("):
+        if any(br < s < br + len(body) for s in sites):
+            if not re.search(r"Dispatchers\s*\.\s*IO", body):
+                return False
+    return True
+
+
 def run_on_tree(root: str) -> int:
     failures = []
     act_path = os.path.join(root, ACTIVITY_REL)
     sheet_path = os.path.join(root, SHEET_REL)
-    for label, path in (("WebAppActivity.kt", act_path), ("AddToHomeSheet.kt", sheet_path)):
+    pinner_path = os.path.join(root, PINNER_REL)
+    preview_path = os.path.join(root, PREVIEW_SHORTCUT_REL)
+    for label, path in (
+        ("WebAppActivity.kt", act_path),
+        ("AddToHomeSheet.kt", sheet_path),
+        ("ShortcutPinner.kt", pinner_path),
+        ("WebPreviewShortcut.kt", preview_path),
+    ):
         if not os.path.exists(path):
             print(f"[webapp-asset-url] FAIL missing file: {label}")
             return 1
     act = open(act_path, encoding="utf-8").read()
     sheet = open(sheet_path, encoding="utf-8").read()
+    pinner = open(pinner_path, encoding="utf-8").read()
+    preview = open(preview_path, encoding="utf-8").read()
 
     if not check_activity_arm1(act):
         failures.append("arm1")
@@ -475,13 +689,20 @@ def run_on_tree(root: str) -> int:
         failures.append("arm6")
     if not check_sheet_arm7(sheet):
         failures.append("arm7")
+    if not check_pin_arm8(pinner):
+        failures.append("arm8a")
+    if not check_pin_arm8(preview):
+        failures.append("arm8b")
+    if not check_sheet_arm9(sheet):
+        failures.append("arm9")
 
     if failures:
         print(f"[webapp-asset-url] FAIL arms={','.join(failures)}")
         return 1
-    print("[webapp-asset-url] PASS all 7 arms "
+    print("[webapp-asset-url] PASS all 10 arms "
           "(asset-url single source ×2, sheet cleanup ×2, fullscreen single source ×2, "
-          "title seed + user-edit guard ×1)")
+          "title seed + user-edit guard ×1, pin verdict ×2, decode off the "
+          "composition thread ×1)")
     return 0
 
 
@@ -510,14 +731,19 @@ def selftest() -> int:
             ("arm7-violation empty seed (pre-fix race)",
              COMPLIANT_ACTIVITY, VIOLATION_ARM7_EMPTY_SEED, False),
         ]
-        for name, act, sheet, expected_pass in cases:
+        def write_tree(name, act, sheet, pinner, preview):
             tree = os.path.join(tmp, name.replace(" ", "_").replace("(", "").replace(")", ""))
-            act_dir = os.path.join(tree, os.path.dirname(ACTIVITY_REL))
-            sheet_dir = os.path.join(tree, os.path.dirname(SHEET_REL))
-            os.makedirs(act_dir, exist_ok=True)
-            os.makedirs(sheet_dir, exist_ok=True)
+            for rel in (ACTIVITY_REL, SHEET_REL, PINNER_REL, PREVIEW_SHORTCUT_REL):
+                os.makedirs(os.path.join(tree, os.path.dirname(rel)), exist_ok=True)
             open(os.path.join(tree, ACTIVITY_REL), "w", encoding="utf-8").write(act)
-            open(os.path.join(tree, SHEET_REL), "w", encoding="utf-8").write(sheet)
+            open(os.path.join(tree, SHEET_REL), "w", encoding="utf-8").write(
+                sheet + SHEET_DECODE_TILE)
+            open(os.path.join(tree, PINNER_REL), "w", encoding="utf-8").write(pinner)
+            open(os.path.join(tree, PREVIEW_SHORTCUT_REL), "w", encoding="utf-8").write(preview)
+            return tree
+
+        for name, act, sheet, expected_pass in cases:
+            tree = write_tree(name, act, sheet, COMPLIANT_PINNER, COMPLIANT_PREVIEW_SHORTCUT)
             rc = run_on_tree(tree)
             passed = rc == 0
             if passed != expected_pass:
@@ -526,6 +752,40 @@ def selftest() -> int:
                 ok = False
             else:
                 print(f"[webapp-asset-url] selftest ok case={name} ({'pass' if passed else 'fail'})")
+        # [dv21-B04 B-08] each targeted violation trips its OWN arm only.
+        for name, pinner, preview, sheet_extra, want in (
+            ("b08-pin-silent-decline", VIOLATION_ARM8_SILENT_DECLINE,
+             COMPLIANT_PREVIEW_SHORTCUT, "", (True, False, False)),
+            ("b08-pin-no-capture", COMPLIANT_PINNER, VIOLATION_ARM8_NO_CAPTURE,
+             "", (False, True, False)),
+            ("b08-decode-in-remember", COMPLIANT_PINNER, COMPLIANT_PREVIEW_SHORTCUT,
+             VIOLATION_ARM9_REMEMBER, (False, False, True)),
+            ("b08-decode-no-io-hop", COMPLIANT_PINNER, COMPLIANT_PREVIEW_SHORTCUT,
+             VIOLATION_ARM9_NO_IO, (False, False, True)),
+        ):
+            tree = os.path.join(tmp, name)
+            for rel in (ACTIVITY_REL, SHEET_REL, PINNER_REL, PREVIEW_SHORTCUT_REL):
+                os.makedirs(os.path.join(tree, os.path.dirname(rel)), exist_ok=True)
+            open(os.path.join(tree, ACTIVITY_REL), "w", encoding="utf-8").write(COMPLIANT_ACTIVITY)
+            open(os.path.join(tree, SHEET_REL), "w", encoding="utf-8").write(
+                COMPLIANT_SHEET + (sheet_extra or SHEET_DECODE_TILE))
+            open(os.path.join(tree, PINNER_REL), "w", encoding="utf-8").write(pinner)
+            open(os.path.join(tree, PREVIEW_SHORTCUT_REL), "w", encoding="utf-8").write(preview)
+            got = (not check_pin_arm8(pinner), not check_pin_arm8(preview),
+                   not check_sheet_arm9(
+                       open(os.path.join(tree, SHEET_REL), encoding="utf-8").read()))
+            others = (check_activity_arm1(COMPLIANT_ACTIVITY)
+                      and check_activity_arm2(COMPLIANT_ACTIVITY)
+                      and check_sheet_arm3(COMPLIANT_SHEET)
+                      and check_sheet_arm4(COMPLIANT_SHEET)
+                      and check_sheet_arm7(COMPLIANT_SHEET))
+            if got == want and others:
+                print(f"[webapp-asset-url] selftest ok {name}: "
+                      f"arm8a/8b/9 red={got}, arm1-7 green")
+            else:
+                print(f"[webapp-asset-url] SELFTEST FAIL {name}: "
+                      f"got={got} want={want} arm1-7 green={others}")
+                ok = False
         # [da1032-A] Precision: the arms must key on the decision point, not on
         # "anything with the word fullscreen goes red". Each *targeted* violation
         # trips its own arm and leaves the other green. The pre-fix double-source

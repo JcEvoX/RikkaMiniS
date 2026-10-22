@@ -10,6 +10,8 @@ import androidx.core.graphics.drawable.IconCompat
 import com.rikkaminis.app.MainActivity
 import com.rikkaminis.app.R
 import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.webapp.ShortcutPinOutcome
+import com.rikkaminis.app.webapp.pinOutcome
 
 /**
  * Helper that pins a `file:///var/minis/...` HTML preview as a launcher
@@ -103,15 +105,30 @@ object WebPreviewShortcut {
             .setIntent(launchIntent)
             .build()
 
-        val ok = ShortcutManagerCompat.requestPinShortcut(context, info, null)
-        AppLogger.info(TAG, "pin shortcut id=$shortcutId requested=$ok")
-        if (ok) {
-            android.widget.Toast.makeText(
-                context,
-                context.getString(R.string.webpreview_pin_to_home_requested),
-                android.widget.Toast.LENGTH_SHORT,
-            ).show()
-        }
+        // [fix/dv21-b4-B08] Two silent failure modes, one of them fatal: an OEM
+        // launcher that throws out of `requestPinShortcut` had no `runCatching`
+        // here (process death), and one that advertises support and then returns
+        // `false` produced no feedback at all — the preview sheet simply closed.
+        // Both now go through the shared verdict
+        // [com.rikkaminis.app.webapp.pinOutcome], which treats `false` as NOT
+        // requested, exactly like [com.rikkaminis.app.webapp.ShortcutPinner].
+        val outcome = pinOutcome(
+            runCatching { ShortcutManagerCompat.requestPinShortcut(context, info, null) },
+        )
+        AppLogger.info(TAG, "pin shortcut id=$shortcutId outcome=$outcome")
+        android.widget.Toast.makeText(
+            context,
+            context.getString(
+                if (outcome == ShortcutPinOutcome.REQUESTED) {
+                    R.string.webpreview_pin_to_home_requested
+                } else {
+                    // Reuse the existing "failed to add" string — no new key, so
+                    // all seven values*/strings.xml stay in sync by construction.
+                    R.string.webapp_pin_failed
+                },
+            ),
+            android.widget.Toast.LENGTH_SHORT,
+        ).show()
     }
 
     private const val TAG = "WebPreviewShortcut"
