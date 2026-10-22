@@ -134,6 +134,9 @@ CHAT = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat"
 MODELS_REL = CHAT + "/ChatModels.kt"
 TOKEN_REL = CHAT + "/ChatSlashTokenExt.kt"
 INPUT_REL = CHAT + "/ChatInputArea.kt"
+# [dv23-B3] ChatScreen is an OPTIONAL read: the minimal fixture trees in
+# test_scan.py never ship it, exactly like the D5/D6 sibling sources.
+SCREEN_REL = CHAT + "/ChatScreen.kt"
 GESTURE_REL = CHAT + "/MinisTextKitGesture.kt"
 SELECTION_REL = CHAT + "/MinisTextKitSelection.kt"
 STREAM_REL = CHAT + "/StreamingMarkdownText.kt"
@@ -733,6 +736,120 @@ def composer_live_source_findings(inp_c):
     return problems
 
 
+# ── G: the composer's text belongs to the composer (dv23-B3) ────────────────
+
+SCREEN_CMD_RE = re.compile(r"ComposerCommand\s*\.\s*(\w+)")
+REQUEST_CMD_RE = re.compile(r"requestComposerCommand\s*\(")
+SHOW_SLASH_RE = re.compile(r"showSlashMenuOverInput\s*\(")
+
+
+def _statement_at(text, idx):
+    """The single source line around [idx] (comment-stripped text)."""
+    start = text.rfind("\n", 0, idx) + 1
+    end = text.find("\n", idx)
+    return text[start:end if end >= 0 else len(text)]
+
+
+def composer_screen_handoff_findings(screen_c, inp_c):
+    """ChatScreen must not resolve or clear the composer's text itself.
+
+    The composer's single writer is ChatInputArea: it alone holds the live
+    field value (`inputFieldValue.text`) and the 150 ms IME-burst job. The
+    slash menu's Popup sets `focusable = false` / `dismissOnClickOutside =
+    false`, so every outside tap, the system back press and the toolbar `/`
+    button reach ChatScreen — and the pre-dv23-B3 code resolved all of them
+    against `viewModel.inputText.value`, the DEBOUNCED snapshot, which rolled a
+    fresh dictation/paste back to a stale string; the clear-chat confirm wrote
+    `setInputText("")`, an equal write MutableStateFlow drops, so the field
+    kept the draft it was supposed to wipe.
+
+    Intents travel to the composer instead (ComposerCommand). ChatScreen.kt is
+    an OPTIONAL read on purpose — the minimal fixture trees in test_scan.py do
+    not ship it.
+    """
+    problems = []
+    if screen_c is None:
+        return problems
+
+    # ── G1: the screen never resolves slash-menu text itself ────────────────
+    for label, rx in (("dismissSlashMenu", DISMISS_RE),
+                      ("showSlashMenuOverInput", SHOW_SLASH_RE)):
+        for m in rx.finditer(screen_c):
+            problems.append(("G1", "ChatScreen resolves `%s` (%s) — the composer owns the "
+                             "live text; raise a ComposerCommand intent instead. Computing "
+                             "\"/ <text>\" from `viewModel.inputText` rolls a dictation/paste "
+                             "that already landed in the field back to the 150 ms-debounced "
+                             "snapshot (and an equal write is dropped by the StateFlow, "
+                             "leaving a stray \"/ \" prefix behind)"
+                             % (label, _statement_at(screen_c, m.start()).strip()[:90])))
+
+    # ── G2: the screen never clears the composer behind the funnel's back ───
+    for m in CLEAR_WRITE_RE.finditer(screen_c):
+        problems.append(("G2", "ChatScreen writes the empty string itself (%s) — an equal "
+                         "write is dropped by the StateFlow whenever the VM string is "
+                         "already \"\", so the field keeps the residual draft; route "
+                         "ComposerCommand.Clear so the three-write funnel runs"
+                         % _statement_at(screen_c, m.start()).strip()[:90]))
+
+    # ── G3: every intent the screen constructs reaches the channel ──────────
+    constructed = {}
+    for m in SCREEN_CMD_RE.finditer(screen_c):
+        stmt = _statement_at(screen_c, m.start())
+        constructed.setdefault(m.group(1), []).append(bool(REQUEST_CMD_RE.search(stmt)))
+    for name in sorted(constructed):
+        if not all(constructed[name]):
+            problems.append(("G3", "`ComposerCommand.%s` is constructed in ChatScreen but "
+                             "not handed to the composer channel on that statement — the "
+                             "intent is dead" % name))
+    if constructed and not re.search(r"\bcomposerCommand\b", inp_c):
+        problems.append(("G3", "ChatScreen raises composer intents but ChatInputArea never "
+                         "consumes the channel — nothing would ever execute them"))
+
+    # ── G4: the composer executes them against its own live state ───────────
+    if not re.search(r"\bcomposerCommand\b", inp_c):
+        return problems
+    collect_m = re.search(r"\bcomposerCommand\s*\.\s*collect\b", inp_c)
+    if collect_m is None:
+        problems.append(("G4", "`composerCommand` is referenced in ChatInputArea but never "
+                         "collected — the channel has no consumer"))
+        return problems
+    ob = inp_c.find("{", collect_m.end())
+    block = brace_block_at(inp_c, ob + 1) if ob >= 0 else ""
+    if not block:
+        problems.append(("G4", "the composerCommand collector has no block — fail-closed"))
+        return problems
+    if "inputFieldValue" not in block:
+        problems.append(("G4", "the composerCommand collector acts without reading the "
+                         "field's live value (`inputFieldValue`) — every intent would be "
+                         "resolved against the debounced ViewModel string again"))
+    helper = None
+    for hm in UNIT_LAMBDA_RE.finditer(inp_c):
+        if CANCEL_RE.search(brace_block_at(inp_c, hm.end())):
+            helper = hm.group(1)
+            break
+    if not (BURST_DROP_RE.search(block)
+            or (helper and re.search(r"\b%s\s*\(\)" % re.escape(helper), block))):
+        problems.append(("G4", "the composerCommand collector does not drop the pending "
+                         "IME-burst flush — a live 150 ms snapshot commits over the value "
+                         "the intent just wrote"))
+    funnel = None
+    for fm in FUNNEL_LAMBDA_RE.finditer(inp_c):
+        fob = inp_c.find("{", fm.end() - 1)
+        if fob < 0:
+            continue
+        if CLEAR_WRITE_RE.search(brace_block_at(inp_c, fob + 1)):
+            funnel = fm.group(1)
+            break
+    if funnel is None:
+        problems.append(("G4", "no composer-clear funnel to route ComposerCommand.Clear "
+                         "into — fail-closed"))
+    elif not re.search(r"\b%s\s*\(\)" % re.escape(funnel), block):
+        problems.append(("G4", "the collector never reaches the clear funnel `%s` — the "
+                         "Clear intent would bypass the three-write reset (empty string + "
+                         "field + caret) and leave the draft on screen" % funnel))
+    return problems
+
+
 # ── the gate ─────────────────────────────────────────────────────────────────
 
 def check_tree(root):
@@ -962,6 +1079,12 @@ def check_tree(root):
     # ── E1-E3: composer decisions read the live field value (dv19-B1) ──────
     problems.extend(composer_live_source_findings(inp_c))
     problems.extend(composer_clear_funnel_findings(inp_c))
+
+    # ── G1-G4: ChatScreen routes composer intents, it does not resolve them ─
+    # (dv23-B3) OPTIONAL read — the minimal fixture trees ship no ChatScreen.
+    screen = read(root, SCREEN_REL)
+    problems.extend(composer_screen_handoff_findings(
+        strip_strings(strip_comments(screen)) if screen is not None else None, inp_c))
 
     return INPUT_REL, problems
 
@@ -1739,6 +1862,72 @@ def streaming_block_ledger_findings(stream_c):
     return problems
 
 
+# [dv23-B3] The fixture tree's ChatScreen: every composer intent is ROUTED
+# through the channel, and the screen never touches the composer's text.
+SCREEN_F = """package com.rikkaminis.app.ui.chat
+
+@Composable
+fun ChatScreen(viewModel: ChatViewModel, onOpenSettings: () -> Unit) {
+    MenuAction(
+        onPick = { pref ->
+            when (pref) {
+                ChatMenuPrefs.SLASH_COMMANDS -> {
+                    viewModel.requestComposerCommand(ComposerCommand.ToggleSlashMenu)
+                }
+                ChatMenuPrefs.EXPORT -> onOpenSettings()
+            }
+        },
+    )
+    ChatList(
+        onTap = {
+            if (slashMenuOpen) {
+                viewModel.requestComposerCommand(ComposerCommand.DismissSlashMenu)
+            }
+        },
+    )
+    BackHandler(enabled = true) {
+        when {
+            slashMenuOpen -> {
+                viewModel.requestComposerCommand(ComposerCommand.DismissSlashMenu)
+            }
+            else -> Unit
+        }
+    }
+    ChatInputArea()
+    ConfirmDialog(
+        onConfirm = {
+            viewModel.clearChat()
+            viewModel.requestComposerCommand(ComposerCommand.Clear)
+        },
+    )
+}
+"""
+
+# [dv23-B3] INPUT_F plus the composer-side consumer of the intent channel:
+# the block that makes G3/G4 observable. Appended (not substituted) so the
+# A-F criteria keep looking at exactly the same text they always did.
+INPUT_G = INPUT_F + """
+@Composable
+private fun ComposerIntentHost(viewModel: ChatViewModel) {
+    LaunchedEffect(Unit) {
+        viewModel.composerCommand.collect { command ->
+            when (command) {
+                ComposerCommand.ToggleSlashMenu -> {
+                    cancelPendingImeBurst()
+                    viewModel.setInputText(viewModel.showSlashMenuOverInput(inputFieldValue.text))
+                }
+                ComposerCommand.DismissSlashMenu -> {
+                    cancelPendingImeBurst()
+                    viewModel.setInputText(viewModel.dismissSlashMenu(inputFieldValue.text))
+                }
+                ComposerCommand.Clear -> clearComposerInput()
+            }
+        }
+    }
+}
+"""
+
+
 def fixtures(**overrides):
     files = {
         MODELS_REL: MODELS_F,
@@ -2179,12 +2368,48 @@ def selftest():
             "internal object StreamingBlockLedger {"),
     }), [])
 
+    # ── G family (dv23-B3): the composer's text belongs to the composer ─────
+    # G clean: every intent is routed, the screen never resolves it itself.
+    # expect() (not expect_exact) because None means "zero problems", which is
+    # itself the exact assertion: any single finding fails the arm.
+    expect("G clean: intents routed, screen resolves nothing",
+           fixtures(**{SCREEN_REL: SCREEN_F, INPUT_REL: INPUT_G}), None)
+    # G1: the pre-fix shape — ChatScreen resolves the menu text from the
+    #     DEBOUNCED ViewModel string.
+    expect_exact("G1 screen resolves the menu text", fixtures(**{
+        SCREEN_REL: SCREEN_F.replace(
+            "    MenuAction(",
+            "    viewModel.setInputText(viewModel.dismissSlashMenu(viewModel.inputText.value))\n"
+            "    MenuAction("),
+        INPUT_REL: INPUT_G,
+    }), ["G1"])
+    # G2: the clear-chat confirm writes the empty string behind the funnel.
+    expect_exact("G2 screen clears the composer itself", fixtures(**{
+        SCREEN_REL: SCREEN_F.replace(
+            "    MenuAction(",
+            "    viewModel.setInputText(\"\")\n    MenuAction("),
+        INPUT_REL: INPUT_G,
+    }), ["G2"])
+    # G3: the screen constructs an intent and drops it (no channel handoff).
+    expect_exact("G3 intent constructed but never routed", fixtures(**{
+        SCREEN_REL: SCREEN_F.replace(
+            "viewModel.requestComposerCommand(ComposerCommand.ToggleSlashMenu)",
+            "ComposerCommand.ToggleSlashMenu"),
+        INPUT_REL: INPUT_G,
+    }), ["G3"])
+    # G4: the consumer drops the Clear arm — the funnel's three writes never run.
+    expect_exact("G4 collector bypasses the clear funnel", fixtures(**{
+        SCREEN_REL: SCREEN_F,
+        INPUT_REL: INPUT_G.replace(
+            "                ComposerCommand.Clear -> clearComposerInput()\n", ""),
+    }), ["G4"])
+
     if failures:
         print("❌ selftest failed:")
         for f in failures:
             print("   " + f)
         return 1
-    print("CHAT_UI_INTERACTION_SELFTEST=PASS (42 fixtures: clean + 41 violation/precision)")
+    print("CHAT_UI_INTERACTION_SELFTEST=PASS (47 fixtures: clean + 46 violation/precision)")
     return 0
 
 
