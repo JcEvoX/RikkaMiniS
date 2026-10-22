@@ -666,13 +666,31 @@ private fun StreamingMarkdownTextBody(
     // the frozen branch below deposits every parse it computes — so scroll-back
     // and close/reopen are HITs too. The peek never computes (lock-only), so a
     // MISS keeps today's off-main behaviour byte-for-byte.
-    val warmSeed = remember(displayContent) {
-        if (isStreaming) null else MarkdownParseCaches.cachedBlocks(displayContent)
+    // [fix/dv21-b4-B05] The seed's key set carries `isStreaming` next to the
+    // content. Keyed on `displayContent` alone, `remember` handed back the
+    // `null` it had cached while the stream was live, so the frame that
+    // CONVERGED (stream ended, content unchanged) never consulted the cache it
+    // was about to populate.
+    val warmSeed = remember(displayContent, isStreaming) {
+        StreamingBlockLedger.warmSeed(displayContent, isStreaming) {
+            MarkdownParseCaches.cachedBlocks(it)
+        }
     }
-    var blocks by remember { mutableStateOf<List<MdBlock>>(warmSeed.orEmpty()) }
-    LaunchedEffect(displayContent) {
+    // [fix/dv21-b4-B05] The block state is a (blocks, source) LEDGER, not a
+    // bare list — see [StreamingBlockLedger] for the two defects the unkeyed
+    // `List<MdBlock>` produced, and why keying it on `displayContent` is NOT
+    // the fix (while streaming the seed is always null, so a keyed reset would
+    // blank the whole message on every throttle tick).
+    var published by remember {
+        mutableStateOf(StreamingBlockLedger.seed(warmSeed, displayContent))
+    }
+    val blocks = StreamingBlockLedger.rendered(published, warmSeed)
+    LaunchedEffect(displayContent, isStreaming) {
         // Seeded from the cache above — this body's first frame is already final.
-        if (warmSeed != null && blocks === warmSeed) {
+        if (warmSeed != null) {
+            if (published.blocks !== warmSeed) {
+                published = StreamingBlockLedger.seed(warmSeed, displayContent)
+            }
             // [T-android-liveness-census] The census lives HERE, not in
             // MarkdownBlockBody: this body is the renderer the aggregate
             // pipeline actually runs (MarkdownBlockBody serves only the
@@ -691,6 +709,33 @@ private fun StreamingMarkdownTextBody(
             }
             return@LaunchedEffect
         }
+        // [fix/dv21-b4-B05] Convergence frame. `isStreaming` is a key of this
+        // effect, so the frame where the stream ends re-enters here with a
+        // FRESH `isStreaming` — the coroutine that was already running keeps
+        // the `true` it captured, which made the deposit below read
+        // `!isStreaming == false` and skip; with the content unchanged the old
+        // single-key effect never ran again either, so every long streamed
+        // answer stayed out of `blocksLru` and re-parsed from scratch on
+        // scroll-back / session re-entry.
+        //
+        // When the live parse already published exactly this content there is
+        // nothing to compute: deposit the list in hand instead of paying an
+        // identical off-main parse. [StreamingBlockLedger.isConvergedWith] is
+        // what makes that safe — a list left over from an EARLIER chunk (its
+        // parse was cancelled when the content last changed) must fall through
+        // to the parse below, because caching a prefix under the final
+        // content's key would render a truncated message from then on.
+        if (StreamingBlockLedger.isConvergedWith(published, displayContent, isStreaming)) {
+            if (displayContent.length >= COLD_PARSE_OFFMAIN_THRESHOLD_CHARS) {
+                MarkdownParseCaches.putBlocks(displayContent, published.blocks)
+                com.rikkaminis.app.logging.AppLogger.debug(
+                    "Perf",
+                    "[Perf][OpenRowWarm] chars=${displayContent.length} " +
+                        "blocks=${published.blocks.size} warm=1",
+                )
+            }
+            return@LaunchedEffect
+        }
         com.rikkaminis.app.diagnostics.Liveness.record(
             if (isStreaming) com.rikkaminis.app.diagnostics.RenderPathCensus.Branch.LIVE_PARSE
             else com.rikkaminis.app.diagnostics.RenderPathCensus.Branch.FROZEN_MISS,
@@ -699,9 +744,8 @@ private fun StreamingMarkdownTextBody(
             parseMarkdownBlocks(displayContent).also {
                 MarkdownParseCaches.prewarm(it, mdColors)
                 // [fix/open-row-first-frame-final] Deposit frozen parses so the
-                // heat survives close/reopen (the live branch already deposits
-                // at its freeze edge; the frozen branch never did, so every
-                // re-entry re-parsed from scratch).
+                // heat survives close/reopen (the frozen branch never did, so
+                // every re-entry re-parsed from scratch).
                 if (!isStreaming && displayContent.length >= COLD_PARSE_OFFMAIN_THRESHOLD_CHARS) {
                     MarkdownParseCaches.putBlocks(displayContent, it)
                 }
@@ -710,7 +754,7 @@ private fun StreamingMarkdownTextBody(
         // If the LE was cancelled while parseMarkdownBlocks was still running
         // (a newer chunk arrived), don't publish stale blocks.
         coroutineContext.ensureActive()
-        blocks = computed
+        published = StreamingBlockLedger.publish(computed, displayContent)
         if (!isStreaming && displayContent.length >= COLD_PARSE_OFFMAIN_THRESHOLD_CHARS) {
             com.rikkaminis.app.logging.AppLogger.debug(
                 "Perf",
@@ -2475,6 +2519,80 @@ internal object StreamRenderProfiler {
         )
         ticks = 0; parseMsSum = 0.0; parseMsMax = 0.0; maxFragLen = 0
     }
+}
+
+/**
+ * [fix/dv21-b4-B05] The block state of [StreamingMarkdownTextBody] as a
+ * (blocks, source) pair, with the four decisions that body makes.
+ *
+ * Before this existed the body kept a bare `List<MdBlock>` in an UNKEYED
+ * `remember`, and two things followed from the missing `source`:
+ *
+ *  1. A body REUSED for another message (lazy-list slot reuse, edit/regenerate
+ *     replacing a frozen row's content) drew the PREVIOUS message's blocks for
+ *     one frame, and — because the seed check was the identity comparison
+ *     `blocks === warmSeed` — a cache that plainly HAD the answer was recorded
+ *     as `FROZEN_MISS` and re-parsed off-main. [rendered] adopts the seed in
+ *     the very composition it is discovered, and the body's effect adopts the
+ *     same list into the state so the identity check stops lying.
+ *  2. The frame where a stream CONVERGES could not deposit: the deposit is
+ *     gated on `!isStreaming`, and a coroutine already running keeps the
+ *     `isStreaming` value it captured at launch (Compose effect lambdas close
+ *     over the composition, not over state) — while the effect's key,
+ *     `displayContent`, had already reached its final value a throttle tick
+ *     earlier, so the effect never ran again. Net: long streamed answers never
+ *     entered `blocksLru`, and every scroll-back / re-entry re-parsed them
+ *     ([MarkdownParseCaches.cachedBlocks] cold) — the opposite of what the
+ *     "freeze-edge handoff" KDoc on `putBlocks` promises.
+ *
+ * `source` is the display text the stored list was parsed FROM. Without it the
+ * convergence deposit cannot tell "this list IS the content on screen" from
+ * "this list is the previous chunk, whose parse was cancelled" — and caching a
+ * prefix under the final content's key is a durable wrong render, far worse
+ * than a cold cache. That is why the state is a pair rather than a list.
+ *
+ * Note what is deliberately NOT here: keying the block state on
+ * `displayContent`. While streaming the seed is always `null`, so a keyed
+ * reset would blank the entire message on every throttle tick (~200-2000 ms) —
+ * the report's own `不得引入` line.
+ *
+ * Pure Kotlin (no Compose, no Android) so the decisions run as JVM unit tests.
+ */
+internal object StreamingBlockLedger {
+
+    /** The block list a body renders, plus the exact text it came from.
+     *  `source == null` = nothing published yet (empty list, no deposit claim). */
+    data class Published(val blocks: List<MdBlock>, val source: String?)
+
+    /** Warm-cache seed for a frame: a live stream is never seeded — its text
+     *  is still growing, so the cache key would only ever be a prefix. */
+    fun warmSeed(raw: String, isStreaming: Boolean, peek: (String) -> List<MdBlock>?): List<MdBlock>? =
+        if (isStreaming) null else peek(raw)
+
+    /** State for a frame that starts from a warm seed. Only a real seed claims
+     *  a source: an empty initial list must not be mistaken for a parse. */
+    fun seed(blocks: List<MdBlock>?, raw: String): Published =
+        Published(blocks.orEmpty(), if (blocks != null) raw else null)
+
+    /** State once an off-main parse is published for [raw]. */
+    fun publish(computed: List<MdBlock>, raw: String): Published = Published(computed, raw)
+
+    /**
+     * The list this composition draws. A seed for the current content wins over
+     * the previous publication (defect 1); with no seed (mid-stream, or a
+     * content that is not cached) the previous list is kept until the parse
+     * publishes, which is what stops a live message from flickering.
+     */
+    fun rendered(published: Published, seed: List<MdBlock>?): List<MdBlock> =
+        if (seed != null && published.blocks !== seed) seed else published.blocks
+
+    /**
+     * Convergence verdict: the stream has ended AND the list in hand is already
+     * a parse of the content on screen, so the frame owes a deposit and nothing
+     * else — no re-parse, no census branch (no new render path happened).
+     */
+    fun isConvergedWith(published: Published, raw: String, isStreaming: Boolean): Boolean =
+        !isStreaming && published.source != null && published.source == raw
 }
 
 
