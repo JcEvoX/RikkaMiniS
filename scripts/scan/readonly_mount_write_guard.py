@@ -870,7 +870,8 @@ def check_guard_call_shape(root):
 # ── selftest ────────────────────────────────────────────────────────────────
 # ── criterion-10 fixture (deep-audit-1041 B-02) ──────────────────────────
 
-def _rootfs_settlement(arms="settled", size="zeroed", repair_subscribes=True):
+def _rootfs_settlement(arms="settled", size="zeroed", repair_subscribes=True,
+                       replay_gate=True, collect="present", repair_verdict=True):
     """The B-02 subject: three lifecycle entry points, one failure terminal.
 
     [arms] settled — every `catch` delegates to the terminal (the shape the fix
@@ -881,6 +882,11 @@ def _rootfs_settlement(arms="settled", size="zeroed", repair_subscribes=True):
     installed-only branch (the "must not introduce" shape).
     [repair_subscribes] False drops `repairRootfs`'s subscription, the third leg
     of the same defect (the bar froze at 0% for a full Stage-3 re-extract).
+    [replay_gate] False is the B-05 pre-fix collector: every frame the StateFlow
+    hands over is applied, including the terminal it replays on subscribe.
+    [collect] "missing" drops the subscription body entirely (the ROT shape).
+    [repair_verdict] False is the B-05 pre-fix settlement: `repairRootfs`
+    branches on `autoRepair()`'s boolean and never reads the published terminal.
     """
     if size == "zeroed":
         decision = (
@@ -917,17 +923,101 @@ def _rootfs_settlement(arms="settled", size="zeroed", repair_subscribes=True):
                 "                installProgress = null,\n"
                 "            )\n"
             ) % tag
+        if fn != "repairRootfs":
+            call = "            manager.%s()\n" % tag
+            after = "            refresh(ctx)\n"
+        elif repair_verdict:
+            # [deep-audit-1042 B-05] the shipped settlement: the manager's
+            # published terminal decides, `autoRepair()`'s boolean is only one
+            # input.
+            call = "            val repaired = manager.autoRepair()\n"
+            after = (
+                "            _uiState.value = rootfsRepairState(\n"
+                "                _uiState.value,\n"
+                "                manager.installState.value,\n"
+                "                repaired,\n"
+                '                "repaired",\n'
+                '                "missing",\n'
+                "            )\n"
+                "            refresh(ctx)\n"
+            )
+        else:
+            # pre-fix shape: `repaired == false` is announced as corruption even
+            # when the manager published `Failed(rootfs_insufficient_space)`.
+            call = "            val repaired = manager.autoRepair()\n"
+            after = (
+                "            _uiState.value = _uiState.value.copy(\n"
+                "                isProcessing = false,\n"
+                "                lastOperationSuccess = repaired,\n"
+                '                resultMessage = if (repaired) "repaired" else "missing",\n'
+                "                installProgress = null,\n"
+                "            )\n"
+                "            refresh(ctx)\n"
+            )
         return (
             "    fun %s(ctx: Ctx) {\n" % fn
             + head
             + "        try {\n"
-            + "            manager.%s()\n" % tag
-            + "            refresh(ctx)\n"
+            + call
+            + after
             + "        } catch (e: Exception) {\n"
             + fail
             + "        }\n"
             + "    }\n"
             + "\n"
+        )
+
+    if collect == "present" and replay_gate:
+        # [deep-audit-1042 B-05] the shipped collector: the terminal the flow
+        # replays on subscribe is recognised and skipped.
+        collector = (
+            "    private fun observeInstallProgress(manager: RootfsManager, ctx: Ctx) {\n"
+            "        progressJob?.cancel()\n"
+            "        progressJob = viewModelScope.launch {\n"
+            "            val priorTerminal = manager.installState.value\n"
+            "            var firstFrame = true\n"
+            "            manager.installState.collect { state ->\n"
+            "                val replay = isStaleInstallReplay(firstFrame, state, priorTerminal)\n"
+            "                firstFrame = false\n"
+            "                if (replay) return@collect\n"
+            "                when (state) {\n"
+            "                    is RootfsInstallState.Failed ->\n"
+            "                        _uiState.value = _uiState.value.copy("
+            "isProcessing = false)\n"
+            "                    else -> Unit\n"
+            "                }\n"
+            "            }\n"
+            "        }\n"
+            "    }\n"
+            "\n"
+        )
+    elif collect == "present":
+        # pre-fix shape: the replayed terminal is applied as a live event
+        collector = (
+            "    private fun observeInstallProgress(manager: RootfsManager, ctx: Ctx) {\n"
+            "        progressJob?.cancel()\n"
+            "        progressJob = viewModelScope.launch {\n"
+            "            manager.installState.collect { state ->\n"
+            "                when (state) {\n"
+            "                    is RootfsInstallState.Installed ->\n"
+            "                        _uiState.value = _uiState.value.copy("
+            "installProgress = null)\n"
+            "                    is RootfsInstallState.Failed ->\n"
+            "                        _uiState.value = _uiState.value.copy("
+            "isProcessing = false)\n"
+            "                    else -> Unit\n"
+            "                }\n"
+            "            }\n"
+            "        }\n"
+            "    }\n"
+            "\n"
+        )
+    else:  # missing — the subscription body is gone (ROT)
+        collector = (
+            "    private fun observeInstallProgress(manager: RootfsManager, ctx: Ctx) {\n"
+            "        progressJob?.cancel()\n"
+            "    }\n"
+            "\n"
         )
 
     return (
@@ -941,15 +1031,26 @@ def _rootfs_settlement(arms="settled", size="zeroed", repair_subscribes=True):
         "        }\n"
         "    }\n"
         "\n"
-        "    private fun observeInstallProgress(manager: RootfsManager, ctx: Ctx) {\n"
-        "        progressJob?.cancel()\n"
-        "    }\n"
-        "\n"
-        "    private fun settleRootfsFailure(ctx: Ctx, tag: String, res: Int, e: Exception) {\n"
+        + collector
+        + "    private fun settleRootfsFailure(ctx: Ctx, tag: String, res: Int, e: Exception) {\n"
         "        logging.log(tag)\n"
         "        _uiState.value = rootfsFailureState(_uiState.value, ctx.getString(res))\n"
         "        refresh(ctx)\n"
         "    }\n"
+        "\n"
+        "    private fun isStaleInstallReplay(\n"
+        "        firstFrame: Boolean,\n"
+        "        state: RootfsInstallState,\n"
+        "        priorTerminal: RootfsInstallState,\n"
+        "    ): Boolean = false\n"
+        "\n"
+        "    private fun rootfsRepairState(\n"
+        "        current: Ctx,\n"
+        "        terminal: RootfsInstallState,\n"
+        "        repaired: Boolean,\n"
+        "        ok: String,\n"
+        "        missing: String,\n"
+        "    ): Ctx = current\n"
         "\n"
         + entry("install", "install", 1, 1)
         + entry("resetRootfs", "reset", 2, 2)
@@ -1173,6 +1274,11 @@ ROOTFS_SETTLEMENT_BODIES = {
     "size_not_zeroed": _rootfs_settlement(size="missing"),
     "size_zeroed_inside_branch": _rootfs_settlement(size="inside_branch"),
     "no_repair_subscription": _rootfs_settlement(repair_subscribes=False),
+    # [deep-audit-1042 B-05] the two halves of criterion 11, each dirty shape
+    # breaking exactly one decision.
+    "replay_applied": _rootfs_settlement(replay_gate=False),
+    "collector_gone": _rootfs_settlement(collect="missing"),
+    "repair_settles_on_boolean": _rootfs_settlement(repair_verdict=False),
 }
 
 # [dv20-A4-B03] `ROOTFS_BODIES` varies the blocking-IO decision; the *verdict*
@@ -1982,6 +2088,141 @@ SIZE_ZEROING = re.compile(
 )
 INSTALLED_BRANCH = re.compile(r"if\s*\([^)]*isInstalled[^)]*\)\s*\{")
 
+# ── Criterion 11 (deep-audit-1042 B-05): the replayed terminal ──────────────
+#
+# `RootfsManager.installState` is a StateFlow whose value never leaves a
+# terminal (eight write sites, not one of them resets to `Idle`), so the value
+# a subscriber receives as its FIRST frame is the previous operation's verdict,
+# not an event. Applying that frame is two defects in one: the stale `Installed`
+# arm wipes the `installProgress` the caller just published, and the stale
+# `Failed` arm clears `isProcessing` — the flag the screen disables Repair/Reset
+# on — so the in-flight guard inverts.
+#
+# Anchored on the DECISION (recognise the frame as a replay), not on a name:
+# either a value captured before `.collect` that the collector consults, or a
+# `dropWhile` in front of it. A collector that subscribes with neither has, by
+# construction, no way to tell a replay from an event.
+INSTALL_STATE_COLLECT = re.compile(r"installState\s*\.\s*collect\s*[\{\(]")
+DROPWHILE_ON_FLOW = re.compile(r"installState\s*\.\s*(?:dropWhile|filterNot)\s*\(")
+# the value the flow is holding before the subscription starts
+PRIOR_CAPTURE = re.compile(r"\bval\s+(\w+)\s*=\s*[\w.]*installState\s*\.\s*value\b")
+# ── the repair settlement must consult the same verdict ─────────────────────
+#
+# `autoRepair()`'s Stage 3 is a full `reset()`, and `installIfNeeded()` reports
+# its disk-space gate by publishing `Failed(rootfs_insufficient_space)` and
+# RETURNING (it never throws). Settling on the boolean alone therefore announces
+# a storage refusal as rootfs corruption. The repair path must read the manager's
+# published terminal, directly or through a helper.
+VERDICT_READ = re.compile(r"\binstallState\s*\.\s*value\b|\bRootfsInstallState\s*\.\s*\w+")
+
+
+def check_rootfs_progress_replay(root):
+    """(violations, rot, sites, notes) — criterion 11 (B-05)."""
+    violations, rot, notes = [], [], []
+    path = os.path.join(root, APP_REL, *ROOTFS_VM_REL.split("/"))
+    pkg = os.path.dirname(path)
+    if not os.path.isfile(path):
+        if os.path.isdir(pkg) and os.listdir(pkg):
+            rot.append(
+                "%s lost its anchor (the ui/sandbox package is there, the file is not)"
+                % ROOTFS_VM_REL
+            )
+        else:
+            notes.append(
+                "[PARTIAL] the rootfs progress-replay anchor — this tree never shipped %s"
+                % ROOTFS_VM_REL
+            )
+        return violations, rot, 0, notes
+
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        text = strip_comments(fh.read())
+
+    if not OBSERVE_PROGRESS_DEF.search(text):
+        rot.append(
+            "%s: no `fun observeInstallProgress(` left — the replay gate has nothing "
+            "to guard" % ROOTFS_VM_REL
+        )
+        return violations, rot, 0, notes
+
+    bodies = {}
+    for name, _params, body in functions(text):
+        bodies.setdefault(name, body)
+
+    # Names whose body reads the manager's published terminal, closed
+    # transitively: the repair settlement may delegate, but the read has to
+    # land somewhere. The progress collector is excluded from the seed: its own
+    # read of `installState.value` is the replay capture, not a settlement
+    # verdict, and `repairRootfs` subscribes to it — counting that would make
+    # every repair path look like it consulted the verdict.
+    reads_verdict = {
+        name for name, body in bodies.items()
+        if name != "observeInstallProgress" and VERDICT_READ.search(body)
+    }
+    growing = True
+    while growing:
+        growing = False
+        for name, body in bodies.items():
+            if name in reads_verdict:
+                continue
+            if any(re.search(r"\b%s\s*\(" % re.escape(n), body) for n in reads_verdict):
+                reads_verdict.add(name)
+                growing = True
+
+    sites = 0
+    collector = bodies.get("observeInstallProgress", "")
+    collects = list(INSTALL_STATE_COLLECT.finditer(collector))
+    # The gate must be consulted *inside* the collector, not merely declared in
+    # some other function of the same file.
+    if not collects:
+        rot.append(
+            "%s: `observeInstallProgress` no longer collects `installState` — the "
+            "replay gate lost its subject (was it moved out of this file?)"
+            % ROOTFS_VM_REL
+        )
+    else:
+        sites += 1
+        gated = bool(DROPWHILE_ON_FLOW.search(collector))
+        if not gated:
+            for m in PRIOR_CAPTURE.finditer(collector):
+                before_collect = m.start() < collects[0].start()
+                consulted = re.search(r"\b%s\b" % re.escape(m.group(1)),
+                                      collector[collects[0].end():])
+                if before_collect and consulted:
+                    gated = True
+                    break
+        if not gated:
+            violations.append(
+                "%s:observeInstallProgress — the collector applies every frame "
+                "`installState` hands it, including the terminal a StateFlow "
+                "REPLAYS on subscribe (the flow never returns to Idle). That "
+                "wipes the `installProgress` the caller just published and clears "
+                "`isProcessing` — the flag the screen disables Repair/Reset on, "
+                "so a second operation can be started over the first. Capture the "
+                "flow's current value before `.collect` and skip that frame (or "
+                "`dropWhile` it away) before touching the UI state" % ROOTFS_VM_REL
+            )
+
+    repair = bodies.get("repairRootfs")
+    if repair is None:
+        rot.append(
+            "%s: no `fun repairRootfs(` left — the settlement criterion lost its "
+            "subject" % ROOTFS_VM_REL
+        )
+    else:
+        sites += 1
+        if "repairRootfs" not in reads_verdict:
+            violations.append(
+                "%s:repairRootfs — settles on `autoRepair()`'s boolean alone. "
+                "Stage 3 of that call is a full reset(), and installIfNeeded() "
+                "reports its disk-space gate by PUBLISHING "
+                "`Failed(rootfs_insufficient_space)` and returning normally — so "
+                "a refusal for lack of storage is announced as rootfs corruption "
+                "(the same verdict `install`/`resetRootfs` already read through "
+                "the manager's terminal)" % ROOTFS_VM_REL
+            )
+
+    return violations, rot, sites, notes
+
 
 def check_rootfs_failure_settlement(root):
     """(violations, rot, sites, notes) — criterion 10 (B-02)."""
@@ -2351,6 +2592,17 @@ def selftest():
     run("repairRootfs without the progress subscription is caught", True,
         "without subscribing to manager.installState", settlement_shape="no_repair_subscription")
 
+    # ── criterion 11 (deep-audit-1042 B-05): the replayed terminal ────────
+    run("a collector that skips the replayed terminal and a repair that reads the "
+        "published verdict pass", False,
+        "rootfs progress/settlement site(s) reading the published verdict")
+    run("a collector that applies the replayed terminal is caught", True,
+        "REPLAYS on subscribe", settlement_shape="replay_applied")
+    run("a collector that no longer subscribes to installState is a rot failure", True,
+        "no longer collects `installState`", settlement_shape="collector_gone")
+    run("a repair that settles on autoRepair's boolean is caught", True,
+        "settles on `autoRepair()`'s boolean alone", settlement_shape="repair_settles_on_boolean")
+
     print("=== readonly_mount_write_guard --selftest ===")
     failed = 0
     for name, ok, note in results:
@@ -2378,6 +2630,7 @@ def main():
     vol_violations, vol_rot, vol_sites, vol_notes = check_volume_root_single_source(root)
     verdict_violations, verdict_rot, verdict_sites, verdict_notes = check_rootfs_verdict(root)
     set_violations, set_rot, set_sites, set_notes = check_rootfs_failure_settlement(root)
+    replay_violations, replay_rot, replay_sites, replay_notes = check_rootfs_progress_replay(root)
 
     rot = []
     if files < 20:
@@ -2392,13 +2645,14 @@ def main():
     rot += vol_rot
     rot += verdict_rot
     rot += set_rot
+    rot += replay_rot
     if rot:
         print("ROT — the guard can no longer see what it is supposed to check:")
         for r in rot:
             print(f"  ✗ {r}")
         return 1
     for n in (io_notes + hop_notes + shape_notes + doc_notes
-              + funnel_notes + vol_notes + verdict_notes + set_notes):
+              + funnel_notes + vol_notes + verdict_notes + set_notes + replay_notes):
         print(f"  {n}")
     if violations or io_violations:
         print("Unguarded host-file writes:")
@@ -2432,14 +2686,20 @@ def main():
         print("Rootfs failure arms that stop short of re-reading the manager:")
         for v in set_violations:
             print(f"  ✗ {v}")
+    if replay_violations:
+        print("Rootfs progress frames applied without recognising the StateFlow replay:")
+        for v in replay_violations:
+            print(f"  ✗ {v}")
     if (violations or io_violations or hop_violations or shape_violations or doc_violations
-            or funnel_violations or vol_violations or verdict_violations or set_violations):
+            or funnel_violations or vol_violations or verdict_violations or set_violations
+            or replay_violations):
         return 1
     print(f"OK: {checked} path-parameter write site(s) guarded ({files} files scanned)")
     print(f"    {io_sites} blocking-IO call site(s) inside Dispatchers.IO")
     print(f"    {vol_sites} volume-root definition(s), single source in {VOLUME_ROOT_STORE_REL}")
     print(f"    {verdict_sites} success claim(s) backed by the manager's verdict")
     print(f"    {set_sites} rootfs failure arm(s) re-reading the manager on exit")
+    print(f"    {replay_sites} rootfs progress/settlement site(s) reading the published verdict")
     print(f"    {funnel_sites} id->File funnel(s) judging the exposed top level")
     if hop_sites:
         print(f"    {hop_sites} share UI hand-off verified on a Looper thread")
