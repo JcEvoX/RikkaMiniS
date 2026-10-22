@@ -53,6 +53,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileInputStream
+import java.io.InputStreamReader
 import java.io.RandomAccessFile
 
 /**
@@ -460,6 +462,7 @@ fun LogDetailScreen(
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var lazyLog by remember(fileName) { mutableStateOf<LazyLogFile?>(null) }
     var loadError by remember(fileName) { mutableStateOf<String?>(null) }
     var loading by remember(fileName) { mutableStateOf(true) }
@@ -509,8 +512,11 @@ fun LogDetailScreen(
                 },
                 actions = {
                     IconButton(onClick = {
+                        // [deep-audit-1041 B-07] Both the existence stat and the
+                        // prep are disk-bound; `shareLogFile` takes them to
+                        // Dispatchers.IO and starts the chooser back here.
                         val file = File(File(context.filesDir, "logs"), fileName)
-                        if (file.exists()) shareLogFile(context, file)
+                        scope.launch { shareLogFile(context, file) }
                     }) {
                         Icon(Icons.Default.Share, contentDescription = stringResource(R.string.common_share))
                     }
@@ -575,43 +581,101 @@ fun LogDetailScreen(
 
 // ─── Share Utilities ───────────────────────────────────────────────────────────
 
-private fun shareLogFile(context: Context, file: File) {
-    try {
-        val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
-        val intent = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_STREAM, uri)
-            // Clip carries the URI in a way that downstream chooser
-            // hosts can introspect for the grant when EXTRA_STREAM
-            // alone isn't enough (Issue #17 — SecurityException
-            // "Permission Denial: opening provider … requires the
-            // provider be exported, or grantUriPermission()").
-            clipData = android.content.ClipData.newRawUri(file.name, uri)
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        val chooser = Intent.createChooser(intent, context.getString(R.string.log_share_chooser))
-        // The chooser itself starts the receiver; on some OEM builds
-        // the grant flag has to live on the outer intent too or the
-        // receiver hits SecurityException reading the content://
-        // FileProvider URI.
-        chooser.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        context.startActivity(chooser)
-    } catch (e: Exception) {
-        // Log the FileProvider failure — earlier this catch silently dropped
-        // the exception and fell back to EXTRA_TEXT, masking config bugs
-        // (e.g. a missing files-path root) as "share works but pastes the
-        // whole file as text body" UX. Now any future regression is one
-        // logcat line away from being root-caused.
-        AppLogger.warning(
-            "LogShare",
-            "FileProvider share failed for ${file.name}: ${e.message} — falling back to EXTRA_TEXT",
-        )
-        val text = try { file.readText().take(100_000) } catch (_: Exception) { return }
-        val intent = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_TEXT, text)
-        }
-        context.startActivity(Intent.createChooser(intent, context.getString(R.string.log_share_chooser)))
-    }
-}
+/**
+ * [deep-audit-1041 B-07] Upper bound on the EXTRA_TEXT fallback body.
+ *
+ * The previous spelling — `file.readText().take(100_000)` — read the WHOLE file
+ * into a single `String` before trimming it. This file's own KDoc a screen up
+ * records what a 33 MB day of agent traffic did to that pattern in the log
+ * viewer; the share fallback was still doing it here. Named constant so the
+ * bound is visible where the reader is written, instead of buried in a call.
+ */
+internal const val LOG_SHARE_MAX_CHARS = 100_000
 
+/**
+ * Read at most [maxChars] characters of [file] for the EXTRA_TEXT fallback —
+ * streamed, so the peak allocation is the cap and not the file size.
+ *
+ * Returns `null` when the file cannot be read at all: the outcome the old
+ * `catch (_: Exception) { return }` produced (share nothing). Character-based,
+ * so `maxChars` keeps the exact meaning `.take(100_000)` had for the
+ * Binder-sized text payload.
+ */
+internal fun readLogShareText(file: File, maxChars: Int = LOG_SHARE_MAX_CHARS): String? =
+    try {
+        FileInputStream(file).use { input ->
+            val reader = InputStreamReader(input, Charsets.UTF_8)
+            val builder = StringBuilder(minOf(maxChars, 64 * 1024))
+            val buffer = CharArray(8 * 1024)
+            while (builder.length < maxChars) {
+                val read = reader.read(buffer, 0, minOf(buffer.size, maxChars - builder.length))
+                if (read <= 0) break
+                builder.append(buffer, 0, read)
+            }
+            builder.toString()
+        }
+    } catch (_: Exception) {
+        null
+    }
+
+/**
+ * Build the share chooser for [file] off the caller's thread, or `null` when
+ * there is nothing to share (file gone, or the fallback read failed).
+ *
+ * [deep-audit-1041 B-07] Every step here is disk-bound — `File.exists()`,
+ * `FileProvider.getUriForFile` and the fallback read — so all of it runs inside
+ * `withContext(Dispatchers.IO)`. Starting the chooser deliberately does NOT
+ * happen here: `startActivity` must run on the caller's (Main) thread, which is
+ * why this returns an Intent for [shareLogFile] to send.
+ */
+private suspend fun buildLogShareChooser(context: Context, file: File): Intent? =
+    withContext(Dispatchers.IO) {
+        // [deep-audit-1041 B-07] This existence stat used to run in the
+        // composable's onClick, on Main.
+        if (!file.exists()) return@withContext null
+        try {
+            val uri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", file)
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                // Clip carries the URI in a way that downstream chooser
+                // hosts can introspect for the grant when EXTRA_STREAM
+                // alone isn't enough (Issue #17 — SecurityException
+                // "Permission Denial: opening provider … requires the
+                // provider be exported, or grantUriPermission()").
+                clipData = android.content.ClipData.newRawUri(file.name, uri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val chooser = Intent.createChooser(intent, context.getString(R.string.log_share_chooser))
+            // The chooser itself starts the receiver; on some OEM builds
+            // the grant flag has to live on the outer intent too or the
+            // receiver hits SecurityException reading the content://
+            // FileProvider URI.
+            chooser.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            chooser
+        } catch (e: Exception) {
+            // Log the FileProvider failure — earlier this catch silently dropped
+            // the exception and fell back to EXTRA_TEXT, masking config bugs
+            // (e.g. a missing files-path root) as "share works but pastes the
+            // whole file as text body" UX. Now any future regression is one
+            // logcat line away from being root-caused.
+            AppLogger.warning(
+                "LogShare",
+                "FileProvider share failed for ${file.name}: ${e.message} — falling back to EXTRA_TEXT",
+            )
+            // [deep-audit-1041 B-07] Bounded: the old spelling read the whole
+            // file into the heap here and only then trimmed it.
+            val text = readLogShareText(file) ?: return@withContext null
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_TEXT, text)
+            }
+            Intent.createChooser(intent, context.getString(R.string.log_share_chooser))
+        }
+    }
+
+private suspend fun shareLogFile(context: Context, file: File) {
+    // Prep runs on Dispatchers.IO inside the builder; the launch stays on Main.
+    val chooser = buildLogShareChooser(context, file) ?: return
+    context.startActivity(chooser)
+}
