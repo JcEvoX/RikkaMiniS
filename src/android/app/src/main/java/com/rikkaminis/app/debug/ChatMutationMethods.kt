@@ -5,6 +5,7 @@ import androidx.core.content.FileProvider
 import com.rikkaminis.app.MinisApp
 import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.service.SessionBadgeStore
+import kotlinx.coroutines.flow.first
 import com.rikkaminis.app.ui.chat.ChatViewModelStore
 import com.rikkaminis.app.ui.chat.InputAttachment
 import org.json.JSONObject
@@ -57,12 +58,37 @@ internal object ChatMutationMethods {
                     skillRepository = app.skillRepository,
                     mcpRepository = app.mcpRepository,
                 ),
-            )[com.rikkaminis.app.ui.chat.ChatViewModel::class.java].also { it.sendMessage(text) }
+            )[com.rikkaminis.app.ui.chat.ChatViewModel::class.java]
+        }
+        // [deep-audit-1043 A-05] Cold-session guard. `loadSession` publishes in
+        // two steps: `_activeEntryId` flips at step 1 (ChatSessionLifecycle:423)
+        // while `_messages` is only assigned at step 2 (:477) and
+        // `_sessionLoaded` flips in that block's `finally` (:786). Dispatching
+        // into the window between them lets the turn start against an empty
+        // in-memory history AND lets step 2's `_messages.value = loaded`
+        // overwrite the just-appended user message — the exact race
+        // `HeadlessChatRunner.prompt` closes with the same latch wait
+        // ([fix/send-dispatch-race]). This entry drives the LIVE (screen-owned)
+        // VM, so it cannot reuse that path; it uses the identical barrier:
+        // OFF Main (the load resumes on Main.immediate — waiting on Main would
+        // deadlock it) and bounded (an unbounded wait pins the RPC connection).
+        val sessionReady = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+            kotlinx.coroutines.withTimeoutOrNull(5000L) { vm.sessionLoaded.first { it } }
+        }
+        if (sessionReady == null) {
+            throw RPCException(-32000, "session_not_loaded_in_5s: $sessionId")
+        }
+        val started = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+            vm.sendMessage(text)
+            // Same-dispatcher read straight after the call: sendMessage claims
+            // `_isStreaming` SYNCHRONOUSLY (after its drop gates), so this
+            // answers "did a run actually start?" without a second suspension.
+            vm.isStreaming.value
         }
         return JSONObject().apply {
             put("ok", true)
             put("sessionId", sessionId)
-            put("isStreaming", vm.isStreaming.value)
+            put("isStreaming", started)
         }
     }
 

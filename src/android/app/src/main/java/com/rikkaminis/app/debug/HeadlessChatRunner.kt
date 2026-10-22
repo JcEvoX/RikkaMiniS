@@ -794,10 +794,35 @@ internal object HeadlessChatRunner {
      * untouched, so this is the seam for verifying cross-model thinking-level
      * transfer. Returns (resolved model displayName, current thinking level
      * name) so callers can assert the transfer without a second round-trip.
+     *
+     * [deep-audit-1043 A-05] The cold-session window: `loadSession` publishes
+     * in two steps — `_activeEntryId` flips at step 1 (ChatSessionLifecycle
+     * :423) while the session row is only re-read and applied at step 2 (:421-
+     * 458) and `_sessionLoaded` flips in that block's `finally` (:786). A
+     * `viewModel(…)` built for a session that is not resident yet therefore
+     * starts its load asynchronously; calling `selectEntry` inside that window
+     * did two things wrong: (1) `_thinkingLevel` was still the constructor
+     * default `OFF`, so `selectEntry` clamped to OFF and this method ECHOED
+     * `"OFF"` to the caller even though the session's stored level is not OFF;
+     * (2) `selectEntry` set `currentModel`/`_activeEntryId` on Main, then the
+     * late `loadSession` step 2 overwrote all of them from the session row it
+     * had already read — the switch silently reverted. Await the latch first,
+     * the same bounded OFF-Main shape as retry/rerun/compact/revertCompact;
+     * a timeout is a structured error, never a guess (a selectEntry that lands
+     * in the window above would report a level that is about to be rolled
+     * back).
      */
     suspend fun selectModel(context: Context, sessionId: String, entryId: String):
         Pair<String, String> = withContext(Dispatchers.Main) {
         val vm = viewModel(context, sessionId)
+        // OFF Main (the load resumes on Main.immediate — waiting on Main would
+        // deadlock it) and bounded (an unbounded wait pins the RPC connection).
+        val sessionReady = withContext(Dispatchers.Default) {
+            withTimeoutOrNull(5000L) { vm.sessionLoaded.first { it } }
+        }
+        if (sessionReady == null) {
+            throw RPCException(-32000, "session_not_loaded_in_5s: $sessionId")
+        }
         vm.selectEntry(entryId)
         // selectEntry sets currentModel/_modelName synchronously.
         vm.modelName.value to vm.thinkingLevel.value.name
