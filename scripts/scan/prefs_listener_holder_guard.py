@@ -680,6 +680,215 @@ def scan_self_priming(root):
     return report, problems
 
 
+# ==========================================================================
+# [dv22-b1] Batch-save screens: key-filtered listeners + snapshot Save.
+#
+# Concern: a Settings screen that (a) backs its controls with Compose state and
+# (b) re-persists EVERY knob it shows in one batched Save. AOSP
+# `SharedPreferencesImpl.apply()` notifies the registered listeners
+# SYNCHRONOUSLY when called on the main thread (`notifyListeners` runs the
+# callbacks inline before `apply` returns -- verified against AOSP android
+# main `SharedPreferencesImpl.java`, `:519 Okay to notify the listeners before
+# it's hit disk`). So inside a Save onClick the FIRST write's callback runs
+# before the later write calls evaluate their arguments. Two defects follow:
+#
+#   * an UNKEYED listener body re-reads every control from prefs, so the
+#     first apply() resets the in-memory edit buffer to the on-disk values
+#     mid-Save, and the later writes persist the RESET values -- Save itself
+#     silently rolls the user's own edits back (RuntimeLimitsScreen pre-fix:
+#     40 states reset by `SubagentPrefs.setEnabled`'s own apply).
+#   * even a KEYED listener that re-reads the whole group under one membership
+#     test (`key in ALL_KEYS`) clears every unsaved edit buffer when an
+#     external single-key write lands (ChatTuningScreen pre-fix: 7 buffers).
+#
+# Criteria (the scope is DERIVED from the tree, never a path list):
+#   C8   in a file that BOTH declares an `OnSharedPreferenceChangeListener` and
+#        calls a `<x>Prefs.save(` whose argument list (nested spans included)
+#        carries >= 2 named arguments (a batch write), every listener body that
+#        assigns >= 2 distinct identifiers must make a key decision:
+#        `when (key)` / `key in ...` / `if (key == ...)`.
+#   C8b  the key decision must be PER KEY: the `when (key)` arm count must be
+#        >= the number of distinct identifiers the listener body assigns (a
+#        `key in` membership form counts as ONE arm). One arm per control is
+#        the AppearanceScreen shape; a whole-group re-read under one test
+#        still destroys the other edit buffers.
+#   C9   inside such a screen's `onClick = { ... }` blocks, every prefs write
+#        call AFTER the first one must not take a listener-assigned identifier
+#        as a bare argument expression -- the first apply() has already reset
+#        those identifiers by the time the later arguments evaluate, so the
+#        write persists the RESET value. The values must come from locals
+#        captured before the first write (the `val pending... = ...` shape).
+#        The FIRST write call is exempt: its arguments evaluate before its own
+#        apply() fires, so direct state reads are safe there (and a screen
+#        whose Save is a single call is safe by construction -- evaluation
+#        order, exactly the ChatTuningScreen save path).
+#
+# Drift: if NO file qualifies as a batch-save screen while the tree still holds
+# Compose state (`mutableStateOf(`) over Prefs getters behind a change
+# listener, the batch-save shape was renamed/removed -- re-point this
+# criterion.
+#
+# Escape hatch: `prefs-listener-ok: <reason>` anywhere in the file exempts the
+# whole file from C8/C8b/C9 (the exemption is reported, not silent).
+# ==========================================================================
+
+_B1_BULK_SAVE_RE = re.compile(r"\b\w*Prefs\.save\s*\(")
+_B1_KEYED_RE = re.compile(
+    r"\bwhen\s*\(\s*key\s*\)|\bkey\s+in\b|\bif\s*\(\s*key\s*==")
+_B1_WRITE_RE = re.compile(r"\b\w*Prefs\.(?:save|setEnabled|setMax\w+)\s*\(")
+_B1_ONCLICK_RE = re.compile(r"\bonClick\s*=\s*\{")
+_B1_ARG_IDENT_RE = re.compile(r"(?<![\w.])([a-zA-Z_]\w*)\s*(?=\s*[,)])")
+_B1_ASSIGN_RE = re.compile(r"(?<![\w.])([a-zA-Z_]\w*)\s*=(?!=)")
+
+def _paren_span(text, open_idx):
+    """Text between the '(' at open_idx and its match (None when unbalanced)."""
+    depth, i, n = 1, open_idx + 1, len(text)
+    while i < n and depth:
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+        i += 1
+    if depth:
+        return None
+    return text[open_idx + 1:i - 1]
+
+def _b1_when_arms(body):
+    """`when (key) { ... }` arm count, at brace depth 0 of the when body.
+
+    Returns None when the body has no `when (key)` (the caller then treats any
+    other key decision -- `key in ...` -- as a single arm), and 0 when the
+    `when (key)` exists but its body cannot be balanced (fail-closed: a broken
+    when is a red, not a silent skip).
+    """
+    m = re.search(r"\bwhen\s*\(\s*key\s*\)\s*\{", body)
+    if not m:
+        return None
+    inner = _brace_body(body, m.end() - 1)
+    if inner is None:
+        return 0
+    arms, depth, i, n = 0, 0, 0, len(inner)
+    while i < n:
+        c = inner[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+        if depth == 0 and inner.startswith("->", i):
+            arms += 1
+            i += 2
+            continue
+        i += 1
+    return arms
+
+def scan_batch_save_screens(root):
+    """[dv22-b1] C8/C8b/C9. Returns (report lines, problems)."""
+    report = []
+    problems = []
+    files = []
+    for path in _kt_files(root):
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        files.append((path, raw, _strip_comments_and_strings(raw)))
+
+    scope = []
+    for path, raw, clean in files:
+        if "OnSharedPreferenceChangeListener" not in clean:
+            continue
+        if ESCAPE_RE.search(raw):
+            report.append(
+                "  %s: exempted from [dv22-b1] by the prefs-listener-ok hatch"
+                % path.relative_to(root))
+            continue
+        for m in _B1_BULK_SAVE_RE.finditer(clean):
+            span = _paren_span(clean, m.end() - 1)
+            if span and len(_B1_ASSIGN_RE.findall(span)) >= 2:
+                scope.append((path, raw, clean))
+                break
+
+    for path, raw, clean in scope:
+        rel = path.relative_to(root)
+        # C8/C8b: every multi-assign listener body decides by key, per key.
+        for name, body in _listener_bodies(clean):
+            idents = set(_B1_ASSIGN_RE.findall(body))
+            if len(idents) < 2:
+                # A single-control listener has nothing to protect.
+                continue
+            if not _B1_KEYED_RE.search(body):
+                problems.append(
+                    "%s: the listener `%s` re-reads %d controls without any key decision -- "
+                    "apply() notifies listeners SYNCHRONOUSLY on the main thread, so this "
+                    "screen's own Save resets every edit buffer mid-write and the later "
+                    "write args persist the RESET values (decide by `key`: one when-arm per "
+                    "control, the AppearanceScreen shape)"
+                    % (rel, name or "<inline>", len(idents))
+                )
+            else:
+                arms = _b1_when_arms(body)
+                if arms is None:
+                    arms = 1  # `key in ...` / `if (key == ...)` -- a single decision
+                if arms < len(idents):
+                    problems.append(
+                        "%s: the listener `%s` decides by key but not PER key (when (key) "
+                        "arms=%s, distinct reset identifiers=%s) -- a whole-group re-read "
+                        "under one arm still clears every unsaved edit buffer when a single "
+                        "key changes"
+                        % (rel, name or "<inline>", arms, sorted(idents))
+                    )
+                else:
+                    report.append(
+                        "  %s: listener re-reads %d control(s) per key (%d when-arms)"
+                        % (rel, len(idents), arms)
+                    )
+
+        # C9: after the first prefs write in an onClick, args must be snapshots.
+        resettable = set()
+        for _n, body in _listener_bodies(clean):
+            resettable |= set(_B1_ASSIGN_RE.findall(body))
+        for m in _B1_ONCLICK_RE.finditer(clean):
+            body = _brace_body(clean, m.end() - 1)
+            if body is None:
+                continue
+            writes = [wm.end() - 1 for wm in _B1_WRITE_RE.finditer(body)]
+            for widx, wopen in enumerate(writes):
+                if widx == 0:
+                    # First write: its args evaluate before its own apply().
+                    continue
+                span = _paren_span(body, wopen)
+                if span is None:
+                    continue
+                bare = sorted(set(_B1_ARG_IDENT_RE.findall(span)) & resettable)
+                if bare:
+                    problems.append(
+                        "%s: a Save write call reads the listener-resettable state (%s) as a "
+                        "direct argument AFTER an earlier apply() in the same onClick -- the "
+                        "screen listener has already reset those values, so this write "
+                        "persists the RESET value. Capture the pending values into locals "
+                        "BEFORE the first write"
+                        % (rel, ", ".join(bare[:8]) + (" ..." if len(bare) > 8 else ""))
+                    )
+            if len(writes) >= 2:
+                report.append(
+                    "  %s: Save writes %d prefs call(s) from a pre-captured snapshot"
+                    % (rel, len(writes))
+                )
+
+    # Drift: scope lost while a prefs-backed Compose screen still exists.
+    if not scope:
+        anchored = any(
+            "OnSharedPreferenceChangeListener" in clean
+            and "mutableStateOf(" in clean
+            and "Prefs" in clean
+            for _p, _r, clean in files
+        )
+        if anchored:
+            problems.append(
+                "no screen qualifies as a batch-save screen although the tree still holds "
+                "Compose state over Prefs getters behind a change listener -- the batch "
+                "`<x>Prefs.save(` call was renamed/removed, re-point the [dv22-b1] criteria"
+            )
+    return report, problems
+
+
 def _selftest():
     """Fixture mode: each fixture is a miniature tree with exactly one defect."""
     import subprocess
@@ -857,6 +1066,97 @@ def _selftest():
             "}\n"
         )
 
+    def bulk_screen(keyed="when", snapshot=True):
+        """[dv22-b1] A miniature batch-save Settings screen. `keyed` picks the
+        listener shape: "when" (per-key arms), "group" (one membership test
+        re-reading the whole group), "none" (unkeyed). `snapshot` picks the
+        Save shape: locals captured before the first write vs. direct state
+        reads in the later write calls."""
+        if keyed == "when":
+            body = (
+                "            when (key) {\n"
+                '                "subagent.enabled" -> subEnabled = prefs.getBoolean(key, false)\n'
+                '                "maxConcurrentSessions" -> maxSessions = ConcurrencyPrefs.maxConcurrentSessions()\n'
+                '                "maxTurns" -> maxTurns = AgentRuntimeLimitsPrefs.maxTurns()\n'
+                '                "guestTmpMaxAgeMin" -> guestTmpMaxAgeMin = AgentRuntimeLimitsPrefs.guestTmpMaxAgeMin()\n'
+                "            }\n"
+            )
+        elif keyed == "group":
+            body = (
+                "            if (key in ALL_KEYS) {\n"
+                "                subEnabled = prefs.getBoolean(key, false)\n"
+                "                maxSessions = ConcurrencyPrefs.maxConcurrentSessions()\n"
+                "                maxTurns = AgentRuntimeLimitsPrefs.maxTurns()\n"
+                "                guestTmpMaxAgeMin = AgentRuntimeLimitsPrefs.guestTmpMaxAgeMin()\n"
+                "            }\n"
+            )
+        else:
+            body = (
+                "            subEnabled = prefs.getBoolean(key, false)\n"
+                "            maxSessions = ConcurrencyPrefs.maxConcurrentSessions()\n"
+                "            maxTurns = AgentRuntimeLimitsPrefs.maxTurns()\n"
+                "            guestTmpMaxAgeMin = AgentRuntimeLimitsPrefs.guestTmpMaxAgeMin()\n"
+            )
+        if snapshot:
+            save = (
+                "            val pendingSub = subEnabled\n"
+                "            val pendingMax = maxSessions\n"
+                "            val pendingTurns = maxTurns\n"
+                "            val pendingTmp = guestTmpMaxAgeMin\n"
+                "            SubagentPrefs.setEnabled(context, pendingSub)\n"
+                "            ConcurrencyPrefs.setMaxConcurrentSessions(context, pendingMax)\n"
+                "            AgentRuntimeLimitsPrefs.save(context = context, maxTurns = pendingTurns, guestTmpMaxAgeMin = pendingTmp)\n"
+            )
+        else:
+            save = (
+                "            SubagentPrefs.setEnabled(context, subEnabled)\n"
+                "            ConcurrencyPrefs.setMaxConcurrentSessions(context, maxSessions)\n"
+                "            AgentRuntimeLimitsPrefs.save(context = context, maxTurns = maxTurns, guestTmpMaxAgeMin = guestTmpMaxAgeMin)\n"
+            )
+        return HOLD + (
+            "class BulkScreen(private val context: Context) {\n"
+            "    var subEnabled: Boolean = false\n"
+            "    var maxSessions: Int = 2\n"
+            "    var maxTurns: Int = 30\n"
+            "    var guestTmpMaxAgeMin: Int = 60\n"
+            "    fun wire() {\n"
+            "        val app = context.applicationContext\n"
+            "        val prefs = app.getSharedPreferences(\"minis_runtime_limits_prefs\", Context.MODE_PRIVATE)\n"
+            "        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->\n"
+            + body +
+            "        }\n"
+            "        prefs.registerOnSharedPreferenceChangeListener(listener)\n"
+            "        onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }\n"
+            "    }\n"
+            "    fun save() {\n"
+            "        onClick = {\n"
+            + save +
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+
+    single_key_screen = HOLD + (
+        "class PinScreen(private val context: Context) {\n"
+        '    var compactId: String = ""\n'
+        "    var other: Int = 0\n"
+        "    fun wire() {\n"
+        "        val prefs = context.applicationContext.getSharedPreferences(\"minis_runtime_limits_prefs\", Context.MODE_PRIVATE)\n"
+        "        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->\n"
+        '            compactId = prefs.getString(key, "") ?: ""\n'
+        "            other = prefs.getInt(key, 0)\n"
+        "        }\n"
+        "        prefs.registerOnSharedPreferenceChangeListener(listener)\n"
+        "        onDispose { prefs.unregisterOnSharedPreferenceChangeListener(listener) }\n"
+        "    }\n"
+        "    fun save() {\n"
+        "        onClick = {\n"
+        "            AgentRuntimeLimitsPrefs.save(context, compactModelEntryId = compactId)\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+    )
+
     fixtures = [
         # name, files, expected rc, fragment that must appear ("" = must be green)
         ("clean tree (precision control)",
@@ -909,6 +1209,24 @@ def _selftest():
         ("primed cache object retains a Context field (C7)",
          {"Prefs.kt": self_sync_src(context_field=True)}, 1,
          "keeps a Context-typed field"),
+        # [dv22-b1] batch-save screen criteria.
+        ("batch-save screen: keyed listener + snapshot Save (C8/C9 control)",
+         {"Cfg.kt": cfg(), "Screen.kt": screen(), "Prefs.kt": self_sync_src(),
+          "Bulk.kt": bulk_screen(keyed="when", snapshot=True)},
+         0, "re-reads 4 control(s) per key"),
+        ("batch-save listener has no key decision (C8)",
+         {"Prefs.kt": self_sync_src(), "Bulk.kt": bulk_screen(keyed="none", snapshot=True)},
+         1, "without any key decision"),
+        ("batch-save listener re-reads the whole group under one membership test (C8b)",
+         {"Prefs.kt": self_sync_src(), "Bulk.kt": bulk_screen(keyed="group", snapshot=True)},
+         1, "decides by key but not PER key"),
+        ("Save reads listener-resettable state after an earlier apply (C9)",
+         {"Prefs.kt": self_sync_src(), "Bulk.kt": bulk_screen(keyed="when", snapshot=False)},
+         1, "as a direct argument AFTER an earlier apply()"),
+        ("single-key write screen stays out of C8 scope (precision control)",
+         {"Cfg.kt": cfg(), "Screen.kt": screen(), "Prefs.kt": self_sync_src(),
+          "Pin.kt": single_key_screen},
+         0, "self-syncs via"),
     ]
 
     ok = True
@@ -1017,6 +1335,13 @@ if _arch02_report:
         print(_line)
     print("")
 
+_b1_report, _b1_problems = scan_batch_save_screens(ROOT)
+if _b1_report:
+    print("Batch-save screens ([dv22-b1] key-filtered listeners + snapshot Save):")
+    for _line in _b1_report:
+        print(_line)
+    print("")
+
 print("SharedPreferences change-listener registrations:")
 for rel, line, kind in sites:
     print(f"  {rel}:{line}  {kind}")
@@ -1051,9 +1376,19 @@ if _arch02_problems:
     print("       (OnSharedPreferenceChangeListener { changed, _ -> <reload> }) and register")
     print("       it once from prime(). See scripts/scan/prefs_listener_holder_guard.py [ARCH-02].")
 
-if problems or _priming_problems or _arch02_problems:
+if _b1_problems:
+    print("\nFAIL: a batch-save screen resets its edit buffers or reads them back mid-Save ([dv22-b1])")
+    for p in _b1_problems:
+        print(f"  - {p}")
+    print("\n  Fix: decide by `key` in the listener (one when-arm per control, the")
+    print("       AppearanceScreen shape) and capture every value Save persists into")
+    print("       locals BEFORE the first write -- apply() notifies the listener")
+    print("       synchronously, so later write args read the RESET state otherwise.")
+
+if problems or _priming_problems or _arch02_problems or _b1_problems:
     sys.exit(1)
 
 print(f"\nOK: all {len(sites)} prefs listener registration(s) strongly held")
 print(f"OK: re-priming criteria green ({len(_priming_report)} re-priming site(s) verified)")
 print(f"OK: self-syncing primed caches ({len(_arch02_report)} cache(s) own their re-priming listener)")
+print(f"OK: batch-save screens green ({len(_b1_report)} [dv22-b1] verification line(s))")

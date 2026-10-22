@@ -54,19 +54,29 @@ fun ChatTuningScreen(onBack: () -> Unit) {
     // listener; without it Save would write back the values captured at open
     // time. The `rememberChatTuning` helper below covers the chat screen's
     // read path — this covers the panel's own edit buffer.
+    // [fix/dv22-b1-prefs-listener-filter] One arm per key: an external
+    // single-key write must only overwrite the buffer for THAT key, never
+    // clear the whole group of unsaved edits (dv22-B-01 family).
     DisposableEffect(context) {
         val prefs = context.applicationContext
             .getSharedPreferences(ChatTuningPrefs.PREFS, android.content.Context.MODE_PRIVATE)
         val listener =
             android.content.SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
-                if (key in ChatTuningPrefs.ALL_KEYS) {
-                    scrollNearBottomDp = ChatTuningPrefs.scrollNearBottomDp(context)
-                    prewarmRowLimit = ChatTuningPrefs.prewarmRowLimit(context)
-                    codePreviewLines = ChatTuningPrefs.codePreviewLines(context)
-                    tablePreviewRows = ChatTuningPrefs.tablePreviewRows(context)
-                    markdownLineHeightSp = ChatTuningPrefs.markdownLineHeightSp(context)
-                    inputMaxLines = ChatTuningPrefs.inputMaxLines(context)
-                    sendSwipeThresholdDp = ChatTuningPrefs.sendSwipeThresholdDp(context)
+                when (key) {
+                    ChatTuningPrefs.KEY_SCROLL_NEAR_BOTTOM_DP ->
+                        scrollNearBottomDp = ChatTuningPrefs.scrollNearBottomDp(context)
+                    ChatTuningPrefs.KEY_PREWARM_ROW_LIMIT ->
+                        prewarmRowLimit = ChatTuningPrefs.prewarmRowLimit(context)
+                    ChatTuningPrefs.KEY_CODE_PREVIEW_LINES ->
+                        codePreviewLines = ChatTuningPrefs.codePreviewLines(context)
+                    ChatTuningPrefs.KEY_TABLE_PREVIEW_ROWS ->
+                        tablePreviewRows = ChatTuningPrefs.tablePreviewRows(context)
+                    ChatTuningPrefs.KEY_MARKDOWN_LINE_HEIGHT_SP ->
+                        markdownLineHeightSp = ChatTuningPrefs.markdownLineHeightSp(context)
+                    ChatTuningPrefs.KEY_INPUT_MAX_LINES ->
+                        inputMaxLines = ChatTuningPrefs.inputMaxLines(context)
+                    ChatTuningPrefs.KEY_SEND_SWIPE_THRESHOLD_DP ->
+                        sendSwipeThresholdDp = ChatTuningPrefs.sendSwipeThresholdDp(context)
                 }
             }
         prefs.registerOnSharedPreferenceChangeListener(listener)
