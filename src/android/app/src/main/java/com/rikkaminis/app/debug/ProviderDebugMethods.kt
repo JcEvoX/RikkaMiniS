@@ -130,7 +130,11 @@ internal object ProviderDebugMethods {
         val visible = if (includeHidden) all else all.filter { !it.isHidden }
         val arr = JSONArray()
         for (entry in visible) {
-            val effective: LLMModel = entry.model
+            // [dv22-A4] Enriched effective model (models.dev first, the
+            // user's overrides second) — the same resolver the model-use
+            // faces use, so this view can no longer disagree with them.
+            val effective: LLMModel =
+                com.rikkaminis.app.provider.ModelsDevApi.effectiveModel(entry)
             arr.put(JSONObject().apply {
                 put("id", entry.id)
                 put("modelId", effective.id)

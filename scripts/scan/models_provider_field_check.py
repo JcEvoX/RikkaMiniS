@@ -40,6 +40,24 @@ custom model of those families.
          keeps both halves of the decision, the row construction routes
          through it, and the cache return path re-labels cached rows.
 
+  Arm 5  (deep-audit-1042 A-04) The four NON-UI answer sites for "what can
+         this model do" must route through the shared enriched resolver
+         (`ModelsDevApi.effectiveModel` = enrich base first, overrides
+         second) instead of reading the raw entry:
+           a) ModelsCollection's `models.<id>.contextWindow` /
+              `maxOutputTokens` readers (they read `overrides ?: baseModel
+              ?: 0`, so 33 of the 39 built-ins answered 0);
+           b) the three Debug RPC views — `chat.models.list`,
+              `provider.models.list` and `ProviderMutationMethods.entryToJson`
+              (`val effective = entry.model` ⇒ null windows / no capability
+              flags over the harness while `minis-model-use list` answered
+              correctly for the same entry).
+         Decision, not spelling: the collection may keep a private alias
+         (the parity test pins its literal call count at exactly 1), and the
+         debug views may use the fully-qualified name — both accepted. The
+         raw `val effective = entry.model` read is not. Fail-closed: a file
+         that disappears or loses its reader/alias anchor ⇒ red (ROT).
+
 Usage: python3 scripts/scan/models_provider_field_check.py [root]
        python3 scripts/scan/models_provider_field_check.py --root <root>
        python3 scripts/scan/models_provider_field_check.py --selftest
@@ -56,6 +74,9 @@ MC_REL = APP + "/config/collections/ModelsCollection.kt"
 MD_REL = APP + "/provider/ModelsDevApi.kt"
 OA_REL = APP + "/provider/openai/OpenAIModelsApi.kt"
 AD_REL = APP + "/provider/ModelListProviderAdapters.kt"
+CDM_REL = APP + "/debug/ChatDebugMethods.kt"
+PDM_REL = APP + "/debug/ProviderDebugMethods.kt"
+PMM_REL = APP + "/debug/ProviderMutationMethods.kt"
 
 ARM1_FORBIDDEN = ("provider = instanceId",)
 ARM1_REQUIRED = ("instance.providerType.displayName",)
@@ -394,8 +415,79 @@ def check_arm4(src, rel):
     return out
 
 
+def _resolver_calls(code):
+    return len(re.findall(r"ModelsDevApi\.effectiveModel\(", code))
+
+# [dv22-A4] The two raw chains the collection readers used to walk.
+MC_RAW_WINDOW = "e.overrides.contextWindow ?: e.baseModel.contextWindow"
+MC_RAW_TOKENS = "e.overrides.maxOutputTokens ?: e.baseModel.maxOutputTokens"
+MC_ALIAS = re.compile(
+    r"private fun effectiveModel\(e: ModelEntry\): LLMModel\s*=\s*"
+    r"ModelsDevApi\.effectiveModel\(e\)")
+
+def check_arm5_mc(src, rel):
+    """ModelsCollection: numeric readers through the shared resolver.
+
+    The collection is allowed to expose one private alias (the parity test
+    pins the literal `ModelsDevApi.effectiveModel(` count at exactly 1, so a
+    second direct call would break that fence anyway) — the decision under
+    test is that the numeric readers read the ENRICHED model, and that the
+    pre-fix `overrides ?: baseModel` chain is gone.
+    """
+    code = code_only(src)
+    out = []
+    if "effectiveModel(e).contextWindow" not in code:
+        out.append((rel, 0, "5",
+                    "models.<id>.contextWindow reader no longer reads the effective "
+                    "model (`effectiveModel(e).contextWindow` absent) — it would fall "
+                    "back to the raw base row again (dv22-A4)"))
+    if "effectiveModel(e).maxOutputTokens" not in code:
+        out.append((rel, 0, "5",
+                    "models.<id>.maxOutputTokens reader no longer reads the effective "
+                    "model (`effectiveModel(e).maxOutputTokens` absent) (dv22-A4)"))
+    if MC_RAW_WINDOW in code:
+        out.append((rel, 0, "5",
+                    "the raw `%s` chain is back — that read skips models.dev, so 33 of "
+                    "the 39 built-ins answer 0 (dv22-A4)" % MC_RAW_WINDOW))
+    if MC_RAW_TOKENS in code:
+        out.append((rel, 0, "5",
+                    "the raw `%s` chain is back (dv22-A4)" % MC_RAW_TOKENS))
+    if not MC_ALIAS.search(code):
+        out.append((rel, 0, "5",
+                    "the private `effectiveModel(e: ModelEntry): LLMModel = "
+                    "ModelsDevApi.effectiveModel(e)` alias is gone — either the shared "
+                    "resolver is no longer used here, or the anchor moved (gate ROT)"))
+    n = _resolver_calls(code)
+    if n != 1:
+        out.append((rel, 0, "5",
+                    "ModelsCollection must carry exactly ONE literal "
+                    "`ModelsDevApi.effectiveModel(` call (the private alias — the parity "
+                    "test pins the same count); found %d. If a second call site is "
+                    "genuinely needed, route it through the alias and update this gate."
+                    % n))
+    return out
+
+def check_arm5_debug(src, rel, view):
+    """A Debug RPC view must answer from the enriched effective model."""
+    code = code_only(src)
+    out = []
+    n = _resolver_calls(code)
+    if n != 1:
+        out.append((rel, 0, "5",
+                    "%s must resolve its effective model through exactly one "
+                    "`ModelsDevApi.effectiveModel(` call; found %d%s"
+                    % (view, n,
+                       " — zero means the raw entry is back (null windows, no "
+                       "capability flags over the harness)" if n == 0 else "")))
+    if re.search(r"val\s+effective(\s*:\s*LLMModel)?\s*=\s*entry\.model", code):
+        out.append((rel, 0, "5",
+                    "%s still treats the raw `entry.model` as the effective model — "
+                    "that read skips models.dev enrichment (dv22-A4)" % view))
+    return out
+
 def run_checks(root, rels=None):
-    rels = rels or {"mc": MC_REL, "md": MD_REL, "oa": OA_REL, "ad": AD_REL}
+    rels = rels or {"mc": MC_REL, "md": MD_REL, "oa": OA_REL, "ad": AD_REL,
+                    "cdm": CDM_REL, "pdm": PDM_REL, "pmm": PMM_REL}
     srcs = {k: read(rel, root) for k, rel in rels.items()}
     missing = [(rel, 0, "?", "file not found — gate ROT")
                for k, rel in rels.items() if srcs[k] is None]
@@ -406,23 +498,41 @@ def run_checks(root, rels=None):
     checks += check_arm2(srcs["md"], rels["md"])
     checks += check_arm3(srcs["ad"], rels["ad"])
     checks += check_arm4(srcs["oa"], rels["oa"])
+    checks += check_arm5_mc(srcs["mc"], rels["mc"])
+    checks += check_arm5_debug(srcs["cdm"], rels["cdm"], "chat.models.list")
+    checks += check_arm5_debug(srcs["pdm"], rels["pdm"], "provider.models.list")
+    checks += check_arm5_debug(srcs["pmm"], rels["pmm"],
+                               "provider.models.add/update read-back (entryToJson)")
     return checks
 
 
 # ----------------------------------------------------------------------
 # Selftest fixtures — minimal Kotlin-shaped files exercising every arm.
 # ----------------------------------------------------------------------
-FIX_MC_OK = """override fun add(payload: ConfigValue): String {
-    val modelIdStr = (obj["model_id"] as? ConfigValue.Str)?.value?.trim()
-        ?: throw ConfigError.InvalidValue("`model_id` required")
-    if (modelIdStr.isEmpty()) throw ConfigError.InvalidValue("`model_id` required")
-    val instance = repo.instance(instanceId)
-        ?: throw ConfigError.InvalidValue("No provider instance with id $instanceId")
-    val model = LLMModel(
-        id = modelIdStr,
-        provider = instance.providerType.displayName,
-    )
-    return repo.addEntry(entry)
+FIX_MC_OK = """object ModelsCollection {
+    private fun effectiveModel(e: ModelEntry): LLMModel =
+        ModelsDevApi.effectiveModel(e)
+
+    private fun effectiveModalities(e: ModelEntry): List<String> =
+        effectiveModel(e).directionalModalities
+
+    fun readers() {
+        val cw = effectiveModel(e).contextWindow ?: 0
+        val mot = effectiveModel(e).maxOutputTokens ?: 0
+    }
+
+    override fun add(payload: ConfigValue): String {
+        val modelIdStr = (obj["model_id"] as? ConfigValue.Str)?.value?.trim()
+            ?: throw ConfigError.InvalidValue("`model_id` required")
+        if (modelIdStr.isEmpty()) throw ConfigError.InvalidValue("`model_id` required")
+        val instance = repo.instance(instanceId)
+            ?: throw ConfigError.InvalidValue("No provider instance with id $instanceId")
+        val model = LLMModel(
+            id = modelIdStr,
+            provider = instance.providerType.displayName,
+        )
+        return repo.addEntry(entry)
+    }
 }
 """
 
@@ -618,6 +728,79 @@ OA_CACHE_DROPPED = OA_FIX_OK.replace(
     "it.withProviderName(isCustomBase, providerName), baseURL",
     "it, baseURL")
 
+# ----------------------------------------------------------------------
+# Arm 5 fixtures (deep-audit-1042 A-04) — the four non-UI bypass sites.
+# ----------------------------------------------------------------------
+MC_A5_OK = """package probe
+
+object ModelsCollection {
+    private fun effectiveModel(e: ModelEntry): LLMModel =
+        ModelsDevApi.effectiveModel(e)
+
+    private fun effectiveModalities(e: ModelEntry): List<String> =
+        effectiveModel(e).directionalModalities
+
+    fun readers() {
+        val cw = effectiveModel(e).contextWindow ?: 0
+        val mot = effectiveModel(e).maxOutputTokens ?: 0
+    }
+}
+"""
+
+# Pre-fix: raw chains, no numeric-reader resolver.
+MC_A5_PREFIX = """package probe
+
+object ModelsCollection {
+    private fun effectiveModalities(e: ModelEntry): List<String> =
+        ModelsDevApi.effectiveModel(e).directionalModalities
+
+    fun readers() {
+        val cw = e.overrides.contextWindow ?: e.baseModel.contextWindow ?: 0
+        val mot = e.overrides.maxOutputTokens ?: e.baseModel.maxOutputTokens ?: 0
+    }
+}
+"""
+
+# Half-fixed: alias kept, but the raw window chain is back.
+MC_A5_RAW_BACK = MC_A5_OK.replace(
+    "val cw = effectiveModel(e).contextWindow ?: 0",
+    "val cw = e.overrides.contextWindow ?: e.baseModel.contextWindow ?: 0")
+
+# Alias dropped in favour of two direct calls — breaks the parity fence too.
+MC_A5_TWO_CALLS = """package probe
+
+object ModelsCollection {
+    fun readers() {
+        val cw = ModelsDevApi.effectiveModel(e).contextWindow ?: 0
+        val mot = ModelsDevApi.effectiveModel(e).maxOutputTokens ?: 0
+    }
+}
+"""
+
+# Alias lost entirely (its own anchor — the ROT arm).
+MC_A5_ALIAS_GONE = MC_A5_OK.replace(
+    "    private fun effectiveModel(e: ModelEntry): LLMModel =\n"
+    "        ModelsDevApi.effectiveModel(e)\n", "")
+
+def _debug_view(effective_line):
+    return """package probe
+
+object View {
+    fun modelsList() {
+        for (entry in visible) {
+            %s
+            put("contextWindow", effective.contextWindow ?: JSONObject.NULL)
+        }
+    }
+}
+""" % effective_line
+
+CDM_A5_OK = _debug_view(
+    "val effective = com.rikkaminis.app.provider.ModelsDevApi.effectiveModel(entry)")
+CDM_A5_PREFIX = _debug_view("val effective = entry.model")
+CDM_A5_EQUIV_RAW = _debug_view(
+    "val effective = entry.baseModel.withOverrides(entry.overrides)")
+
 
 def _report(checks, fixture_name, label):
     if not checks:
@@ -641,17 +824,29 @@ def _expect_count(fixture_name, checks, expect, label):
 def selftest():
     ok = True
     with tempfile.TemporaryDirectory() as tmp:
-        rels = {"mc": "mc.kt", "md": "md.kt", "oa": "oa.kt", "ad": "ad.kt"}
+        rels = {"mc": "mc.kt", "md": "md.kt", "oa": "oa.kt", "ad": "ad.kt",
+                "cdm": "cdm.kt", "pdm": "pdm.kt", "pmm": "pmm.kt"}
 
         def write(name, text):
             with open(os.path.join(tmp, rels[name]), "w", encoding="utf-8") as f:
                 f.write(text)
+
+        # Arm-5 OK baselines for the three debug views.
+        pdm_ok = CDM_A5_OK.replace(
+            "val effective = com.rikkaminis.app.provider."
+            "ModelsDevApi.effectiveModel(entry)",
+            "val effective: LLMModel = com.rikkaminis.app.provider."
+            "ModelsDevApi.effectiveModel(entry)")
+        pmm_ok = CDM_A5_OK  # entryToJson shape: un-annotated `val effective`
 
         # 1. Fixed shape: clean.
         write("mc", FIX_MC_OK)
         write("md", FIX_MD_OK)
         write("oa", OA_FIX_OK)
         write("ad", AD_FIX_OK)
+        write("cdm", CDM_A5_OK)
+        write("pdm", pdm_ok)
+        write("pmm", pmm_ok)
         ok &= _report(run_checks(tmp, rels), "fixed", "all arms clean")
 
         # 2. Pre-fix shape: arm1 (UUID + no trim) and arm2 (no new keys).
@@ -741,6 +936,58 @@ def selftest():
         ok &= arm4_of("cache-dropped", OA_CACHE_DROPPED,
                       "no longer re-labelling cached rows reds")
 
+        # ---- Arm 5: the four non-UI sites route through the resolver ----
+
+        def arm5_of(fixture_name, checks, expect, label):
+            return _expect_count("arm 5 " + fixture_name, checks, expect, label)
+
+        # (a) ModelsCollection numeric readers.
+        write("mc", MC_A5_PREFIX)
+        write("cdm", CDM_A5_OK); write("pdm", pdm_ok); write("pmm", pmm_ok)
+        checks = [c for c in run_checks(tmp, rels) if c[2] == "5" and c[0].endswith("mc.kt")]
+        # 2 reader findings + 2 raw chains + no alias (the modality call keeps
+        # the literal count at 1, so no count finding here) = 5.
+        ok &= arm5_of("mc-pre-fix", checks, 5,
+                      "raw chains + missing readers + no alias reds")
+        write("mc", MC_A5_RAW_BACK)
+        checks = [c for c in run_checks(tmp, rels) if c[2] == "5" and c[0].endswith("mc.kt")]
+        ok &= arm5_of("mc-raw-back", checks, 2,
+                      "the raw window chain trips exactly the pair (missing + present)")
+        write("mc", MC_A5_TWO_CALLS)
+        checks = [c for c in run_checks(tmp, rels) if c[2] == "5" and c[0].endswith("mc.kt")]
+        ok &= arm5_of("mc-two-calls", checks, 2,
+                      "two direct calls + lost alias red the parity-fenced count")
+        write("mc", MC_A5_ALIAS_GONE)
+        checks = [c for c in run_checks(tmp, rels) if c[2] == "5" and c[0].endswith("mc.kt")]
+        ok &= arm5_of("mc-alias-gone", checks, 2,
+                      "a lost alias is its own ROT (anchor + call count)")
+        write("mc", FIX_MC_OK)
+
+        # (b) the three debug views, same parameterised pair of shapes.
+        for name, ok_fixture, pre, view in (
+                ("cdm", CDM_A5_OK, CDM_A5_PREFIX, "chat.models.list"),
+                ("pdm", pdm_ok, CDM_A5_PREFIX, "provider.models.list"),
+                ("pmm", pmm_ok, CDM_A5_PREFIX, "entryToJson")):
+            write(name, pre)
+            checks = [c for c in run_checks(tmp, rels)
+                      if c[2] == "5" and c[0].endswith(rels[name])]
+            ok &= arm5_of(name + "-pre-fix", checks, 2,
+                          "%s reads the raw entry (zero calls + raw val)" % view)
+            write(name, CDM_A5_EQUIV_RAW)
+            checks = [c for c in run_checks(tmp, rels)
+                      if c[2] == "5" and c[0].endswith(rels[name])]
+            ok &= arm5_of(name + "-equiv-raw", checks, 1,
+                          "an equivalent un-enriched rebuild still reds (decision)")
+            write(name, ok_fixture)
+
+        # (c) a second resolver call reds too (count is pinned, ROT-guarded).
+        write("cdm", CDM_A5_OK + CDM_A5_OK)
+        checks = [c for c in run_checks(tmp, rels)
+                  if c[2] == "5" and c[0].endswith("cdm.kt")]
+        ok &= arm5_of("cdm-double", checks, 1,
+                      "a duplicated view reds on the pinned call count alone")
+        write("cdm", CDM_A5_OK)
+
     print("MODELS_PROVIDER_FIELD_SELFTEST=%s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 
@@ -765,7 +1012,7 @@ def main():
 
     checks = run_checks(root)
     if not checks:
-        print("models_provider_field_check: OK (4 arms clean)")
+        print("models_provider_field_check: OK (5 arms clean)")
         return 0
     for rel, line, arm, msg in checks:
         print("%s:%s [arm %s] %s" % (rel, line, arm, msg))
