@@ -140,7 +140,39 @@ private fun liveEffectiveModel(): LLMModel? =
 
 ## 5 CI 判读
 
-（本节在分支 CI 跑完后回填：`head_sha` 三方逐字符、步骤结论、`Summary` 行、门头连续性、`ALL 336`、编译错计数、游离 `FAILED` 计数、新用例逐条 `PASSED`。）
+**绿 run**：`39823833259` / job `119981746088` / attempt 1 / `conclusion=success`，日志 **1,384,591 B**（`probe/ci/job-119981746088.log`）。
+
+**三方 sha 逐字符一致**：本地 HEAD == `git ls-remote` == `run.head_sha` = **`ee63c2b214faa4dbaea452ac518bb032906d1802`**。
+
+判读器 `probe/ci/judge.py` **15/15 PASS**（每条判据取日志/API 真实形态，不猜写法）：
+
+| # | 判据 | 实测 |
+|---|---|---|
+| 1 | `run.head_sha` == 本地 HEAD | 逐字符一致 |
+| 2 | run 结论 | `success` |
+| 3 | 非 success / skipped 之外无失败步骤 | `no failed steps []` |
+| 4 | 唯一 skipped 步骤 | `['Publish to Releases']` = main 门控 ✓ |
+| 5 | 存在 `Summary: 109 passed, 0 failed` | 8 条 Summary 中恰有一条 109/0 |
+| 6 | 无任何 Summary 带非零 failed | `[(25,0),(5,0),(13,0),(5,0),(10,0),(22,0),(10,0),(109,0)]` |
+| 7 | 门头序号连续 | `[1/109] … [109/109]`，109 个 |
+| 8 | 门名互异 | **109 names** |
+| 9 | 夹具 | `✅ ALL 336 CASES PASS` |
+| 10 | kotlinc 错误 | `Z e: ` **0** |
+| 11 | 游离 FAILED（非 PASSED 用例名子串） | **0** |
+| 12 | 新用例 `SystemVoiceMemberResolutionTest` | **10 PASSED / 0 FAILED** |
+| 13 | 被 B-02 触及的 `ThinkingRuleEditorPreserveTest` | **22 PASSED** |
+| 14 | `:app:testReleaseUnitTest` 任务完成 | 是 |
+| 15 | 无 failed 汇总行（绿轮无 completion 行属正常） | 成立 |
+
+**两次失败 run（自伤，全部当场闭环，留痕于 §7 R8/R9）**
+
+1. **`39819718493`** @ `35e77140`：`compileReleaseKotlin` FAILED，10 条错误全由我引入，两个根因——
+   - `ProviderRepository.kt:1314` 用了 `SystemVoiceEntries` 但**没加 import**（B-06 加调用时漏）；
+   - `ChatViewModel.kt:2057-2068` 共 7 条级联（`Unresolved reference 'config'` / 返回类型不匹配 / `minOf` 无候选）：B-07 把 `effectiveContextWindowTokens()` 的局部 `val config = providerRepository.config.value` 删掉了，而下方 `groupLimit` 仍在用它。
+   修法：补 import + 恢复局部 `val config`（`d4a7ceb2`）。
+2. **`39821596848`** @ `d4a7ceb2`：6468 个用例 **1 failed** —— `ThinkingRuleEditorPreserveTest > editorDialog_isHandedTheLiveRule`，报 `call-site anchor missing: if (req?.existingId != null && editorLiveIndex < 0) editorRequest = null`。根因：B-02 给该判定加了 `rulesLoaded &&` 守卫，**既有源码锚点测试按字面量比对**，守卫使字面量失效（`ee63c2b2` 修）。
+
+两次都是「Python 门全绿但 Kotlin 侧红」——**门是形状检查，编译器与既有源码锚点测试是 CI 独有的验证面**。这一条已进 §7 R8。
 
 ---
 
@@ -163,6 +195,8 @@ private fun liveEffectiveModel(): LLMModel? =
 - **R5（P2）**：C34 的 `_is_member_resolution_site` 用词表（`_RESOLUTION_TOKENS`）识别"是否在解析身份"，新出现的解析 API 名需要补词表。触发条件：新增第三种组员解析写法。
 - **R6（P3，已修）**：`_decl_block` 初版吞下一个成员造成假阴性 —— 已由"空行断块"修复，此处只作留痕。
 - **R7（P3）**：B-06 测试里的三个 System 显示名（`System Recognition (Online)` 等）是字面量，若产品改名会红。这是有意的：测试要钉住用户可见文案，而非跟随常量。触发条件：改名时同步改测试（红的正是它）。
+- **R8（P2，自伤已闭环）｜两次 CI 失败都落在「Python 门全绿但 Kotlin 侧红」**：①`39819718493` 编译错 10 条（`ProviderRepository` 漏 `SystemVoiceEntries` 的 import；`effectiveContextWindowTokens` 删了局部 `val config` 但下方仍在用，级联 7 条）；②`39821596848` 单测 1 failed（`ThinkingRuleEditorPreserveTest` 的源码锚点字面量被 B-02 的 `rulesLoaded &&` 守卫打断）。**教训 = 门只能验形状，编译与既有源码锚点测试是 CI 独有的验证面**；改生产文件后必须主动扫一遍"引用该文件的测试里的字面量断言"。**触发条件**：本仓任何一次改生产文件而 Python 门全绿。**触发后方案**：先跑 `git grep -l '<生产文件名>' src/android/app/src/test`，对命中测试逐条 `grep -cF` 其字面量断言（我已用过这个手法，本轮靠它把 5 条锚点缩到 1 条真实失效）。**搁置理由**：还没固化成脚本/门，因为"哪些字面量是锚点"需要判读（本轮粗筛出 92 条假阳性，全是指断言消息或别的变量的 `.contains`）。
+- **R9（P3，留痕）**：判读器 `probe/ci/judge.py` 首版有 3 处形态自伤——门头正则只取门名首词（109 门只剩 83 个互异名）、`N tests completed, M failed` 行在绿轮根本不打印、"头读取"用 `[^━]*` 在含 `━` 的行上截断。修法都是**先 grep 一条真样本取形态再写判据**（与 1042/1043 前几批同族，第 N 次）。触发条件：新写任何日志判据前。
 
 ---
 
