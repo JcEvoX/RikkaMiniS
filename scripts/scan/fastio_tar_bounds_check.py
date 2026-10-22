@@ -452,6 +452,15 @@ def run(root):
         handler_src = f.read()
     violations += check_handler(handler_src)
     violations += check_archive_open_guard(handler_src)
+    search_path = os.path.join(root, SEARCH_REL)
+    copy_path = os.path.join(root, COPY_REL)
+    if not (os.path.isfile(search_path) and os.path.isfile(copy_path)):
+        return 2
+    with open(search_path, encoding="utf-8") as f:
+        search_src = f.read()
+    with open(copy_path, encoding="utf-8") as f:
+        copy_src = f.read()
+    violations += check_special_file_guards(search_src, copy_src)
     if violations:
         for v in violations:
             print("VIOLATION " + v)
@@ -459,6 +468,127 @@ def run(root):
         return 1
     print("GATE=GREEN fastio_tar_bounds")
     return 0
+
+
+# ── [dv23-A6] §1043-A-07: the engines that OPEN an entry must ask first ──────
+#
+# `FastioTar`'s create walk learned this in §1042-A-02 (a top-level FIFO went
+# straight into writeRegular and blocked a worker thread forever). The two
+# sibling engines were never gated, and `find` mislabelled the same entries:
+#   (a) grepTree.visitFile opens the entry (grepFile → Files.newInputStream)
+#       without asking whether it is a regular file;
+#   (b) copyTree.visitFile copies it (Files.copy) the same way;
+#   (c) findTree.visitFile types every entry that is not a link as `f`, while
+#       the help text says `f` means "regular file" — so `find -type f` listed
+#       pipes and sockets the guest cannot open.
+# Measured on this JVM (probe, 2026-10-22): `Files.newInputStream` and
+# `Files.copy` on a WRITER-LESS FIFO never return — open(2) blocks with no
+# timeout — while a unix socket raises ENXIO. Two hits exhaust the 2-thread
+# offload pool and every other tool call stalls.
+#
+# Each criterion binds the DECISION ("is this entry a regular file?") and not a
+# spelling: `when { attrs.isRegularFile -> 'f' }`, `if (!attrs.isRegularFile)`,
+# `if (attrs.isOther)`, `Files.isRegularFile(path, NOFOLLOW_LINKS)` all count.
+# The decision must sit BEFORE the open/copy/consider call in the same
+# visitFile block — a guard after it cannot prevent the open.
+#
+# Scope: each engine is sliced on its own. A guard in `grepTree` must not cover
+# for a missing one in `copyTree` or `findTree` (that symmetry failure is the
+# whole finding). Comments are stripped before slicing for the same reason
+# §1042-A-02 strips them: the fix's own KDoc names isRegularFile, and a gate
+# that reads prose would stay green after the guard was deleted.
+SEARCH_REL = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/FastioSearch.kt"
+COPY_REL = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/FastioCopy.kt"
+
+SPECIAL_GUARD_TOKENS = ("isRegularFile", "isOther")
+# What the guard has to precede, per engine (the call that touches the entry).
+SPECIAL_OPEN_CALLS = {
+    "grepTree": ("grepFile(", "Files.newInputStream"),
+    "findTree": ("consider(",),
+    "copyTree": ("Files.copy(",),
+}
+# Where the answer has to sit, relative to that call:
+#   "before"      - its own statement ahead of an open/copy (grep, cp);
+#   "in-argument" - the TYPE handed to `consider(`, because find never opens
+#                   anything: its whole defect is the label it passes on.
+SPECIAL_GUARD_POSITION = {"grepTree": "before", "findTree": "in-argument", "copyTree": "before"}
+
+
+def kotlin_top_member(src, name):
+    """Slice a COLUMN-0 declaration (`fun name(`) up to the next column-0 line.
+
+    The repo keeps every top-level declaration at indent 0 and every body line
+    indented, so indentation is what delimits the member — the same shape the
+    handler's `handler_member` relies on, without its indent-vs-keyword dance.
+    """
+    start = src.find("fun %s(" % name)
+    if start < 0:
+        return None
+    line_start = src.rfind("\n", 0, start) + 1
+    lines = src[line_start:].split("\n")
+    out = [lines[0]]
+    for line in lines[1:]:
+        # A multi-line signature closes with `) {` at column 0 — that is still
+        # part of the member, not a new declaration.
+        if line and not line[0].isspace() and not line.startswith(")"):
+            break
+        out.append(line)
+    return "\n".join(out)
+
+
+def visit_file_block(src, engine):
+    """The `override fun visitFile(` block of [engine], or None if unsliceable."""
+    body = kotlin_top_member(src, engine)
+    if body is None:
+        return None
+    start = body.find("override fun visitFile(")
+    if start < 0:
+        return None
+    nxt = body.find("override fun ", start + len("override fun visitFile("))
+    return body[start:] if nxt < 0 else body[start:nxt]
+
+
+def check_special_file_guards(search_src, copy_src):
+    v = []
+    engines = (
+        ("FastioSearch.kt", search_src, "grepTree",
+         "grepTree opens every non-link entry"),
+        ("FastioSearch.kt", search_src, "findTree",
+         "findTree types every non-link entry as a regular file"),
+        ("FastioCopy.kt", copy_src, "copyTree",
+         "copyTree copies every non-link entry"),
+    )
+    for fname, raw, engine, why in engines:
+        block = visit_file_block(strip_kotlin_comments(raw), engine)
+        if block is None:
+            v.append("%s: %s's visitFile cannot be sliced - re-point this rule before "
+                     "trusting it" % (fname, engine))
+            continue
+        calls = SPECIAL_OPEN_CALLS[engine]
+        open_at = min((block.find(t) for t in calls if block.find(t) >= 0), default=-1)
+        if open_at < 0:
+            v.append("%s: %s no longer calls %s - re-point this rule before trusting it"
+                     % (fname, engine, " / ".join(calls)))
+            continue
+        mode = SPECIAL_GUARD_POSITION[engine]
+        anywhere = min((block.find(t) for t in SPECIAL_GUARD_TOKENS if block.find(t) >= 0),
+                       default=-1)
+        scope = block[:open_at] if mode == "before" else block[open_at:]
+        guard_at = min((scope.find(t) for t in SPECIAL_GUARD_TOKENS if scope.find(t) >= 0),
+                       default=-1)
+        if guard_at < 0 and mode == "before" and anywhere >= 0:
+            v.append("%s: %s: the regular-file test sits AFTER the call that touches the entry - "
+                     "it cannot prevent the open" % (fname, engine))
+        elif guard_at < 0:
+            tail = (
+                "WITHOUT asking whether it is a regular file - and the help text defines `f` as "
+                "a regular file, so `-type f` lists pipes and sockets the guest cannot open"
+                if mode == "in-argument" else
+                "WITHOUT asking whether it is a regular file - a FIFO with no writer blocks "
+                "open(2) forever and kills an offload worker thread"
+            )
+            v.append("%s: %s: %s %s" % (fname, engine, why, tail))
+    return v
 
 
 # ── selftest fixtures ────────────────────────────────────────────────────────
@@ -811,6 +941,156 @@ BAD_TOPLEVEL_UNCHECKED_SPECIAL = GOOD_TOPLEVEL.replace(
 """, "")
 
 
+# ── [dv23-A6] §1043-A-07 fixtures ───────────────────────────────────────────
+GOOD_SEARCH_FIX = """
+internal fun findTree(
+    root: Path,
+    out: FindOutcome,
+) {
+    try {
+        Files.walkFileTree(
+            root,
+            object : SimpleFileVisitor<Path>() {
+                override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult {
+                    consider(dir, 'd', 0L)
+                    return FileVisitResult.CONTINUE
+                }
+
+                override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                    out.files++
+                    consider(
+                        file,
+                        when {
+                            attrs.isSymbolicLink -> 'l'
+                            attrs.isRegularFile -> 'f'
+                            else -> 'o'
+                        },
+                        attrs.size(),
+                    )
+                    return FileVisitResult.CONTINUE
+                }
+
+                override fun visitFileFailed(file: Path, exc: IOException): FileVisitResult {
+                    return FileVisitResult.CONTINUE
+                }
+            },
+        )
+    } catch (e: Exception) {
+        out.errors.add("$root: ${e.message}")
+    }
+}
+
+internal fun grepTree(
+    root: Path,
+    out: GrepOutcome,
+) {
+    try {
+        Files.walkFileTree(
+            root,
+            object : SimpleFileVisitor<Path>() {
+                override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                    if (attrs.isSymbolicLink) {
+                        out.filesSkippedLink++
+                        return FileVisitResult.CONTINUE
+                    }
+                    if (!attrs.isRegularFile) {
+                        out.filesSkippedSpecial++
+                        return FileVisitResult.CONTINUE
+                    }
+                    grepFile(file, guestPathFor(root, "/ws", file), regex, limit, out)
+                    return FileVisitResult.CONTINUE
+                }
+
+                override fun visitFileFailed(file: Path, exc: IOException): FileVisitResult {
+                    return FileVisitResult.CONTINUE
+                }
+            },
+        )
+    } catch (e: Exception) {
+        out.errors.add("$root: ${e.message}")
+    }
+}
+"""
+
+GOOD_COPY_FIX = """
+internal fun copyTree(src: Path, dst: Path, force: Boolean, out: CopyOutcome) {
+    try {
+        Files.walkFileTree(
+            src,
+            object : SimpleFileVisitor<Path>() {
+                override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                    val target = targetFor(file)
+                    try {
+                        if (!attrs.isRegularFile && !attrs.isSymbolicLink) {
+                            out.errors.add("$file: special file, not copied")
+                            return FileVisitResult.CONTINUE
+                        }
+                        if (attrs.isSymbolicLink) {
+                            Files.createSymbolicLink(target, Files.readSymbolicLink(file))
+                        } else {
+                            Files.copy(file, target)
+                        }
+                        out.files++
+                    } catch (e: Exception) {
+                        out.errors.add("$target: ${e.message}")
+                    }
+                    return FileVisitResult.CONTINUE
+                }
+
+                override fun visitFileFailed(file: Path, exc: IOException): FileVisitResult {
+                    out.errors.add("$file: ${exc.message}")
+                    return FileVisitResult.CONTINUE
+                }
+            },
+        )
+    } catch (e: Exception) {
+        out.errors.add("$src: ${e.message}")
+    }
+}
+"""
+
+GREP_GUARD = """                    if (!attrs.isRegularFile) {
+                        out.filesSkippedSpecial++
+                        return FileVisitResult.CONTINUE
+                    }
+"""
+COPY_GUARD = """                        if (!attrs.isRegularFile && !attrs.isSymbolicLink) {
+                            out.errors.add("$file: special file, not copied")
+                            return FileVisitResult.CONTINUE
+                        }
+"""
+FIND_WHEN = """                        when {
+                            attrs.isSymbolicLink -> 'l'
+                            attrs.isRegularFile -> 'f'
+                            else -> 'o'
+                        },
+"""
+
+# (a) grep: the guard is gone — the engine opens whatever the walk hands it.
+BAD_SEARCH_NO_GREP_GUARD = GOOD_SEARCH_FIX.replace(GREP_GUARD, "")
+# (b) find: back to `if (isSymbolicLink) 'l' else 'f'`.
+BAD_SEARCH_FIND_LABEL = GOOD_SEARCH_FIX.replace(
+    FIND_WHEN, "                        if (attrs.isSymbolicLink) 'l' else 'f',\n"
+)
+# (c) cp: the guard is gone — Files.copy opens the pipe.
+BAD_COPY_NO_GUARD = GOOD_COPY_FIX.replace(COPY_GUARD, "")
+# (d) the guard exists but AFTER the open: it cannot prevent anything.
+BAD_SEARCH_GUARD_AFTER_OPEN = GOOD_SEARCH_FIX.replace(
+    GREP_GUARD + "                    grepFile(",
+    "                    grepFile(",
+).replace(
+    "grepFile(file, guestPathFor(root, \"/ws\", file), regex, limit, out)\n",
+    "grepFile(file, guestPathFor(root, \"/ws\", file), regex, limit, out)\n" + GREP_GUARD,
+)
+# (e) prose only: the guard is replaced by a COMMENT that names it (the reason
+#     the criterion strips comments — §1042-A-02's own scar).
+BAD_SEARCH_COMMENT_ONLY = GOOD_SEARCH_FIX.replace(
+    GREP_GUARD,
+    "                    // a special file is not a regular file (attrs.isRegularFile)\n",
+)
+# (f) marker gone: the rule must fail closed, not silently pass.
+BAD_SEARCH_RENAMED = GOOD_SEARCH_FIX.replace("fun grepTree(", "fun walkGrep(")
+
 def selftest():
     failures = []
 
@@ -961,6 +1241,43 @@ def selftest():
     bad_top_missing = check_toplevel_roots("object FastioTar { }")
     expect_trip("missing-tarCreate fixture (dv22-A2)", bad_top_missing, "required function missing")
 
+    # ── [dv23-A6] §1043-A-07: the read/open engines ask first ──────────────
+    def expect_only(name, v, needle):
+        """Exactly one violation, and it is [needle]: the criterion has a tooth
+        and the OTHER engines stay clean (a guard in one engine must not cover
+        for a missing one in another)."""
+        if len(v) != 1 or needle not in v[0]:
+            failures.append("%s must trip exactly %r, got %s" % (name, needle, v))
+
+    def expect_all_clean(name, v):
+        if v:
+            failures.append("%s must be clean, got %s" % (name, v))
+
+    good_engines = check_special_file_guards(GOOD_SEARCH_FIX, GOOD_COPY_FIX)
+    expect_all_clean("compliant special-file guards (dv23-A6)", good_engines)
+    bad_grep = check_special_file_guards(BAD_SEARCH_NO_GREP_GUARD, GOOD_COPY_FIX)
+    expect_only("grep guard removed (dv23-A6)", bad_grep, "grepTree opens every non-link entry")
+    bad_find = check_special_file_guards(BAD_SEARCH_FIND_LABEL, GOOD_COPY_FIX)
+    expect_only("find label regression (dv23-A6)", bad_find,
+                "findTree types every non-link entry")
+    bad_cp = check_special_file_guards(GOOD_SEARCH_FIX, BAD_COPY_NO_GUARD)
+    expect_only("copy guard removed (dv23-A6)", bad_cp, "copyTree copies every non-link entry")
+    bad_late = check_special_file_guards(BAD_SEARCH_GUARD_AFTER_OPEN, GOOD_COPY_FIX)
+    expect_only("guard-after-open (dv23-A6)", bad_late, "sits AFTER the call")
+    bad_prose = check_special_file_guards(BAD_SEARCH_COMMENT_ONLY, GOOD_COPY_FIX)
+    expect_only("comment-only guard (dv23-A6)", bad_prose, "grepTree opens every non-link entry")
+    bad_renamed = check_special_file_guards(BAD_SEARCH_RENAMED, GOOD_COPY_FIX)
+    expect_only("renamed engine (dv23-A6)", bad_renamed, "cannot be sliced")
+    # the OTHER accepted shape (`isOther`) must stay clean, or the criterion
+    # would be pinning `isRegularFile` the SPELLING rather than the decision.
+    expect_all_clean(
+        "isOther-shaped guard (dv23-A6)",
+        check_special_file_guards(
+            GOOD_SEARCH_FIX.replace("if (!attrs.isRegularFile) {", "if (attrs.isOther) {"),
+            GOOD_COPY_FIX,
+        ),
+    )
+
     print("selftest compliant tar          -> %d violation(s)" % len(good_tar))
     print("selftest compliant handler      -> %d violation(s)" % len(good_handler))
     print("selftest stale ceiling         -> %d violation(s)" % len(bad_stale))
@@ -974,6 +1291,9 @@ def selftest():
           % (len(bad_regular_order), len(bad_regular_norefill), len(bad_regular_unguarded),
              len(bad_regular_silent), len(bad_regular_missing)))
     print("selftest compliant top-level    -> %d violation(s)" % len(good_top))
+    print("selftest special-file guards    -> %d / %d / %d / %d / %d / %d violation(s)"
+          % (len(bad_grep), len(bad_find), len(bad_cp), len(bad_late), len(bad_prose),
+             len(bad_renamed)))
     print("selftest top-level shapes       -> %d / %d / %d / %d / %d / %d / %d / %d violation(s)"
           % (len(bad_top_no_gate), len(bad_top_no_trunc), len(bad_top_continue),
              len(bad_top_after_write), len(bad_top_charges), len(bad_top_ignored),
