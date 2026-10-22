@@ -2,7 +2,8 @@
 
 **分支** `fix/dv22-a5-headless-session-ready` · **基线** `5dd278dae155c1e15f5171386479151603da3d91`（main）
 **工作树** `/var/minis/shared/work/deep-audit-1042/a5/`（私有 worktree，未 clone、未切分支、未碰 golden）
-**规模** 3 文件 +776/−4（生产 1 / 测试 1 / 门 1）；**门 109 → 109（0 新建门，criterion 14 为扩展）/ 夹具 336 不变**；`scan.sh` / `test_scan.py` 冻结面 0 触碰。
+**规模** 4 文件 **+1045/−4**（生产 `debug/HeadlessChatRunner.kt` +138 / 测试新增 367 行 / 门 `chat_session_id_binding_check.py` +271 / 本报告）；**门 109 → 109（0 新建门，criterion 14 为扩展）/ 夹具 336 不变**；`scan.sh` / `test_scan.py` 冻结面 0 触碰。
+**交付 SHA**：源码树 = 分支尖端 CI 在 `b71265e7` 验过的树（逐字节相同，复核命令见 §5）。分支尖端 `HEAD` 与它的差异仅在 `fix-reports/`（报告回填，不参与构建、不在 workflow `paths` 内）。
 
 ---
 
