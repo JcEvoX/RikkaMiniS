@@ -61,6 +61,32 @@ log literal cannot satisfy them:
         enqueue preserved).
     C6  the empty-input keyboard shortcut (!inputFocused) survived.
 
+  ChatInputArea.kt (slash menu, dv17-4 / dv22-B4 — the D family)
+    D-memo  fail-closed anchors: the `val slashMenuPayload` holder + a
+            produceState/LaunchedEffect producer whose body calls
+            `viewModel.filteredSlashCommands()`.
+    D1  the producer must not key on `thinkingLevel` (0 reads in the body).
+    D2  the producer keys carry the session scope + both repository lists.
+    D3  every `viewModel.filteredSlashCommands()` call sits INSIDE the
+            producer (a composition-synchronous compute pays the query
+            burst on Main) and inside a showSlashMenu-gated region.
+    D-IO the producer wraps the call in `withContext(Dispatchers.IO)` —
+            produceState's producer inherits the composition context
+            (Main); without the hop the async shape is cosmetic.
+    D4  the producer keys carry BOTH repositories'
+            sessionOverridesRevision (the override table is not mirrored
+            by .skills/.servers — without the channel an open menu goes
+            stale after a session toggle, B-04).
+  SkillRepository.kt + MCPRepository.kt (OPTIONAL sibling reads)
+    D5  every session-override mutator (setSessionOverride /
+            clearSessionOverrides / renameSessionOverrides) bumps the
+            published sessionOverridesRevision — a write with no
+            invalidation is the B-04 staleness itself.
+  ChatViewModelSlashExt.kt (OPTIONAL sibling read)
+    D6  filteredSlashCommands()'s body has no per-item
+            isEnabledForSession( call — the batched reader is the only
+            shape that keeps the query count constant.
+
   ChatInputArea.kt (composer decisions, dv19 wave B-01 — the E family)
     E1  the content flag of `val <showStop> = isStreaming && !<flag>` must,
         transitively over `val <name> = …` (<= 4 hops), reach the field's live
@@ -86,6 +112,13 @@ E-family scope: the four decisions named in deep-audit-1039 B-01. A NEW
 decision that reads the debounced string needs its own site criterion here —
 the family does not blanket-ban `inputText` (the debounce machinery and the
 field mirroring legitimately read it).
+D-family boundaries (dv22-B4): the producer's argument list is split at the
+first top-level `{` — an arg-list lambda (a shape the producer does not use)
+would read as unbalanced and fail closed. D3's guard window is 1600 chars (the
+async producer sits between the guard and the call). The three files behind
+D5/D6 are OPTIONAL reads — sibling fixtures (test_scan's minimal trees) do
+not ship them; their absence skips D5/D6 rather than failing, and when they
+ARE present the criteria are fail-closed like every other.
 
 Usage: python3 scripts/scan/chat_ui_interaction_check.py [repo_root]
        python3 scripts/scan/chat_ui_interaction_check.py --selftest
@@ -274,14 +307,65 @@ def read(root, rel):
     with open(path, encoding="utf-8") as f:
         return f.read()
 
-# ── D: slash-menu memo wiring (dv17-4 / deep-audit-1038 B-05) ─────────────────
-SLASH_MEMO_DECL = "val filteredSlashCommands"
+# ── D: slash-menu load wiring (dv17-4 / dv22-B4) ──────────────────────────────
+#
+# History: dv17-4 (deep-audit-1038 B-05) gated the compute on showSlashMenu and
+# pinned the session + repository-list keys. dv22-B4 (deep-audit-1042 B-04)
+# found two residues the sync shape could not fix, so this section now binds
+# the DECISIONS:
+#   D1  the producer must not key on `thinkingLevel` (0 reads in the body);
+#   D2  the producer keys must carry the session scope
+#       (currentSessionId/activeSessionId) + the two repository lists the
+#       per-session filter walks (`.skills` / `.servers`);
+#   D3  the menu DATA must be loaded asynchronously: `viewModel.filteredSlash
+#       Commands()` has to sit INSIDE the produceState/LaunchedEffect producer
+#       and inside a showSlashMenu-gated region. A composition-synchronous
+#       compute (the old `remember { … }` shape) runs the query burst on Main
+#       on every keystroke with the menu open — exactly what dv17-4's gate
+#       used to pin as the FIXED shape, so the gate had to move with the code
+#       (gate + code changed together, dv22-B4);
+#   D-IO the producer must cross to `withContext(Dispatchers.IO)` BEFORE the
+#       call — produceState's producer inherits the composition context
+#       (Main), so an unwrapped producer is the same main-thread burst with
+#       extra steps (1041-B3);
+#   D4  the producer keys must carry BOTH repositories' sessionOverrides
+#       Revision — the session-override table is not mirrored by `.skills` /
+#       `.servers`, so without this channel an open menu stays stale after a
+#       toggle in SessionSkillsSheet / SessionMcpsSheet (B-04);
+#   D5  every override-table mutator (setSessionOverride /
+#       clearSessionOverrides / renameSessionOverrides) must bump the
+#       published `sessionOverridesRevision` — a write with no invalidation
+#       is the B-04 staleness itself;
+#   D6  the slash ext's `filteredSlashCommands()` body must not call the
+#       PER-ITEM `isEnabledForSession(` — one query per row is N+M queries
+#       per producer run; the batched `sessionEnablementMap` keeps the count
+#       constant.
+#
+# The three files behind D5/D6 are OPTIONAL reads: sibling fixtures
+# (test_scan.py's minimal trees) do not ship them, and their absence must not
+# fail-closed the A/B/C/E criteria that live in the chat sources. When the
+# files ARE present the D5/D6 criteria are fail-closed like every other.
+
+SLASH_PAYLOAD_DECL = "val slashMenuPayload"
 SLASH_MEMO_CALL = "viewModel.filteredSlashCommands()"
+PRODUCER_RE = re.compile(r"\b(produceState|LaunchedEffect)\s*\(")
+IO_HOP = "withContext(Dispatchers.IO)"
+SLASH_EXT_REL = CHAT + "/ChatViewModelSlashExt.kt"
+SKILL_REPO_REL = ("src/android/app/src/main/java/com/rikkaminis/app/data/"
+                  "repository/SkillRepository.kt")
+MCP_REPO_REL = ("src/android/app/src/main/java/com/rikkaminis/app/data/"
+                "repository/MCPRepository.kt")
+SESSION_MUTATORS = ("fun setSessionOverride(", "fun clearSessionOverrides(",
+                    "fun renameSessionOverrides(")
 # A guard is a CONDITION on showSlashMenu — `if (…showSlashMenu…)`, a negated
 # `!showSlashMenu`, or a conjunction `showSlashMenu && …`. A bare
 # `val showSlashMenu by …collectAsState()` subscription is NOT a guard.
 SLASH_GUARD_RE = re.compile(
     r"if\s*\(\s*!?\s*showSlashMenu\b|!\s*showSlashMenu\b|showSlashMenu\s*&&")
+# The producer between the guard and the call carries the key list + the IO
+# hop; 1600 chars covers it (the dv17-4 window of 800 predates the async
+# producer and truncated the guard's reach).
+SLASH_GUARD_WINDOW = 1600
 
 def _balanced_paren(text, op):
     """Index of the `)` matching the `(` at `op`; None when unbalanced. The memo
@@ -298,63 +382,142 @@ def _balanced_paren(text, op):
                 return i
     return None
 
-def slash_memo_findings(inp_c):
-    """The slash list is only ever RENDERED under showSlashMenu, so:
+def _split_producer(text, op, close):
+    """Split a call into (args, trailing_lambda_body, body_end). Kotlin's
+    trailing lambda lives AFTER the argument list's closing paren
+    (`f(a, b) { … }`), so the args are inside `op..close` and the body starts
+    at the next `{`. body_end is the index of the lambda's closing brace (the
+    exclusive end of "inside the producer"). (args, None, -1) when there is no
+    trailing lambda, (None, None, -1) when braces are unbalanced — both fail
+    closed."""
+    args = text[op + 1:close]
+    j = close + 1
+    while j < len(text) and text[j] in " \t\r\n":
+        j += 1
+    if j >= len(text) or text[j] != "{":
+        return args, None, -1
+    depth = 0
+    for i in range(j, len(text)):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return args, text[j + 1:i], i
+    return None, None, -1
 
-    D1  the memo must not key on `thinkingLevel` — that source has 0 reads in
-        the lambda (the /thinking row left `availableSlashCommands`), so the
-        key only buys a needless recompute + N+M `isEnabledForSession` query
-        burst on every thinking-notch tap;
-    D2  the memo must key on the live sources the body reads — the session
-        scope (currentSessionId/activeSessionId) and the two repository lists
-        the per-session filter walks (call shapes `.skills` / `.servers`);
-    D3  every `viewModel.filteredSlashCommands()` call must sit in a
-        showSlashMenu-gated region: the window from the memo declaration (and
-        800 chars of preceding statement context, so an early-exit shape is
-        legal too) up to the call must contain a guard. Binding the criterion
-        to the CONDITION (not to a specific spelling) keeps both legal shapes
-        open: `if (showSlashMenu) { remember… }` and `if (!showSlashMenu) …`
-        ahead of an ungated-looking call.
-    """
+def slash_memo_findings(inp_c):
+    """D1-D4 + D3/D-IO on the comment-stripped ChatInputArea."""
     problems = []
-    memo = inp_c.find(SLASH_MEMO_DECL)
-    if memo == -1:
-        return [("D-memo", "%s not found — fail-closed (the slash list memo "
-                 "shape drifted?)" % SLASH_MEMO_DECL)]
-    rm = re.search(r"\bremember\s*\(", inp_c[memo:])
-    if rm is None:
-        return [("D-memo", "no remember( after %s — fail-closed" % SLASH_MEMO_DECL)]
-    op = memo + rm.end() - 1
+    decl = inp_c.find(SLASH_PAYLOAD_DECL)
+    if decl == -1:
+        return [("D-memo", "%s not found — fail-closed (the slash menu's "
+                 "async payload holder shape drifted?)" % SLASH_PAYLOAD_DECL)]
+    m = PRODUCER_RE.search(inp_c[decl:])
+    if m is None:
+        return [("D-memo", "no produceState(/LaunchedEffect( after %s — "
+                 "fail-closed (the menu load is composition-synchronous "
+                 "again?)" % SLASH_PAYLOAD_DECL)]
+    op = decl + m.end() - 1
     close = _balanced_paren(inp_c, op)
     if close is None:
-        return [("D-memo", "unbalanced remember key list — fail-closed")]
-    keys = inp_c[op + 1:close]
+        return [("D-memo", "unbalanced producer argument list — fail-closed")]
+    args, body, body_end = _split_producer(inp_c, op, close)
+    if args is None:
+        return [("D-memo", "the producer's trailing lambda is unbalanced — "
+                 "fail-closed")]
+    if body is None:
+        return [("D-memo", "the producer declares no trailing lambda — "
+                 "fail-closed (where does the load run?)")]
 
-    if re.search(r"\.thinkingLevel\b", keys):
-        problems.append(("D1", "the slash-menu memo keys on thinkingLevel — "
-                         "that source has 0 reads in the lambda (the /thinking row "
-                         "left availableSlashCommands), so every thinking-notch tap "
-                         "buys a needless recompute + N+M isEnabledForSession "
-                         "queries (B-05)"))
-    if not re.search(r"\b(currentSessionId|activeSessionId)\b", keys):
-        problems.append(("D2", "the slash-menu memo keys carry no session scope "
-                         "(currentSessionId/activeSessionId) — an open menu keeps "
-                         "showing the previous session's per-session skill/MCP "
-                         "enablement after ensureSession() lands (B-05)"))
+    if re.search(r"\.thinkingLevel\b", args):
+        problems.append(("D1", "the slash-menu producer keys on thinkingLevel — "
+                         "that source has 0 reads in the body (the /thinking row "
+                         "left availableSlashCommands), so every thinking-notch "
+                         "tap buys a needless recompute + a fresh query burst"))
+    if not re.search(r"\b(currentSessionId|activeSessionId)\b", args):
+        problems.append(("D2", "the slash-menu producer keys carry no session "
+                         "scope (currentSessionId/activeSessionId) — an open "
+                         "menu keeps showing the previous session's per-session "
+                         "skill/MCP enablement after ensureSession() lands"))
     for live, label in ((r"\.skills\b", "skill"), (r"\.servers\b", "MCP server")):
-        if not re.search(live, keys):
-            problems.append(("D2", "the slash-menu memo keys carry no %s list "
-                             "— an entry toggled for this session (or added from "
-                             "disk) never refreshes an open menu (B-05)" % label))
+        if not re.search(live, args):
+            problems.append(("D2", "the slash-menu producer keys carry no %s "
+                             "list — an entry toggled for this session (or added "
+                             "from disk) never refreshes an open menu" % label))
+    for chan, label in (
+        (r"skillRepository\?\.sessionOverridesRevision", "skill"),
+        (r"mcpRepository\?\.sessionOverridesRevision", "MCP server"),
+    ):
+        if not re.search(chan, args):
+            problems.append(("D4", "the slash-menu producer keys carry no %s "
+                             "sessionOverridesRevision — the session-override "
+                             "table is not mirrored by the repository list flows, "
+                             "so an open menu stays stale after a session toggle "
+                             "(B-04: a setSessionOverride write never re-emitted "
+                             "anything the keys could see)" % label))
 
-    for m in re.finditer(re.escape(SLASH_MEMO_CALL), inp_c):
-        window = inp_c[max(0, memo - 800):m.start()]
-        if not SLASH_GUARD_RE.search(window):
-            problems.append(("D3", "%s runs ungated — the list is only rendered "
-                             "under showSlashMenu, so every composition pays the "
-                             "N+M isEnabledForSession queries for a value the next "
-                             "line drops (B-05)" % SLASH_MEMO_CALL))
+    if SLASH_MEMO_CALL not in body:
+        problems.append(("D-memo", "the producer body never calls %s — "
+                         "fail-closed (who builds the list?)" % SLASH_MEMO_CALL))
+    elif IO_HOP not in body.split(SLASH_MEMO_CALL)[0]:
+        problems.append(("D-IO", "the producer calls %s without a preceding %s — "
+                         "produceState's producer inherits the composition "
+                         "context (Main), so the query burst stays on the main "
+                         "thread (1041-B3: produceState is NOT an IO context)"
+                         % (SLASH_MEMO_CALL, IO_HOP)))
+    for m2 in re.finditer(re.escape(SLASH_MEMO_CALL), inp_c):
+        if not (op < m2.start() < body_end):
+            problems.append(("D3", "%s runs OUTSIDE the producer — a "
+                     "composition-synchronous compute pays the query burst on "
+                     "Main on every keystroke with the menu open" % SLASH_MEMO_CALL))
+        else:
+            window = inp_c[max(0, m2.start() - SLASH_GUARD_WINDOW):m2.start()]
+            if not SLASH_GUARD_RE.search(window):
+                problems.append(("D3", "%s runs ungated — the list is only "
+                     "rendered under showSlashMenu, so a producer that runs "
+                     "with the menu closed still pays the query burst"
+                     % SLASH_MEMO_CALL))
     return problems
+
+def session_override_channel_findings(skillrepo_c, mcprepo_c):
+    """D5 on the two repository files (optional reads — see the section note)."""
+    problems = []
+    for label, src in (("SkillRepository", skillrepo_c),
+                       ("MCPRepository", mcprepo_c)):
+        if src is None:
+            continue
+        if not re.search(r"val sessionOverridesRevision\b", src):
+            problems.append(("D5", "%s publishes no `sessionOverridesRevision` "
+                             "flow — the session-override table has no "
+                             "invalidation channel for async consumers (B-04)"
+                             % label))
+            continue
+        for mut in SESSION_MUTATORS:
+            body = declaration_slice(src, mut)
+            if not body or not re.search(
+                    r"_sessionOverridesRevision\.value\s*=", body):
+                problems.append(("D5", "%s.%s writes the session-override "
+                                 "table without bumping the revision — the "
+                                 "table moved but no consumer can ever see it "
+                                 "(the B-04 staleness)" % (label, mut.split("(")[0].replace("fun ", ""))))
+    return problems
+
+def slash_ext_batch_findings(slashext_c):
+    """D6 on ChatViewModelSlashExt.kt (optional read — see the section note)."""
+    if slashext_c is None:
+        return []
+    body = declaration_slice(slashext_c, "fun ChatViewModel.filteredSlashCommands(")
+    if not body:
+        return [("D6", "filteredSlashCommands() not found in "
+                 "ChatViewModelSlashExt.kt — fail-closed")]
+    if "isEnabledForSession(" in body:
+        return [("D6", "filteredSlashCommands() still calls the per-item "
+                 "isEnabledForSession( — one query per row is N+M queries "
+                 "per producer run; the batched sessionEnablementMap is the "
+                 "only shape that keeps the query count constant")]
+    return []
 
 # ── E: composer decisions read the LIVE field value (dv19-B1) ────────────────
 #
@@ -781,8 +944,20 @@ def check_tree(root):
                              "(!inputFocused) must survive — swiping up with nothing to "
                              "send and no focus pops the keyboard"))
 
-    # ── D1-D3: slash-menu memo wiring (dv17-4 / B-05) ───────────────────────
+    # ── D1-D4 + D-IO: slash-menu async load wiring (dv17-4 / dv22-B4) ─────
     problems.extend(slash_memo_findings(inp_c))
+    # ── D5/D6: override-table invalidation + batched read (dv22-B4). The
+    # three files are OPTIONAL sibling reads: test_scan's minimal fixture
+    # trees do not ship them, and their absence must not fail-closed the
+    # A/B/C/E criteria that live in the chat sources.
+    skillrepo = read(root, SKILL_REPO_REL)
+    mcprepo = read(root, MCP_REPO_REL)
+    slashext = read(root, SLASH_EXT_REL)
+    problems.extend(session_override_channel_findings(
+        strip_strings(strip_comments(skillrepo)) if skillrepo is not None else None,
+        strip_strings(strip_comments(mcprepo)) if mcprepo is not None else None))
+    problems.extend(slash_ext_batch_findings(
+        strip_strings(strip_comments(slashext)) if slashext is not None else None))
 
     # ── E1-E3: composer decisions read the live field value (dv19-B1) ──────
     problems.extend(composer_live_source_findings(inp_c))
@@ -834,18 +1009,29 @@ fun ChatInputArea() {
         with(LocalDensity.current) { sendSwipeThresholdDp.dp.toPx() },
     )
     val showSlashMenu by viewModel.showSlashMenu.collectAsState()
-    val filteredSlashCommands = if (showSlashMenu) {
-        remember(
+    val slashMenuPayload: androidx.compose.runtime.State<SlashMenuPayload> = if (showSlashMenu) {
+        produceState(
+            initialValue = SlashMenuPayload(),
             viewModel.slashFilter.collectAsState().value,
             viewModel.memoryEnabled.collectAsState().value,
             viewModel.currentSessionId,
             viewModel.skillRepository?.skills?.collectAsState()?.value,
             viewModel.mcpRepository?.servers?.collectAsState()?.value,
-        ) { viewModel.filteredSlashCommands() }
+            viewModel.skillRepository?.sessionOverridesRevision?.collectAsState()?.value,
+            viewModel.mcpRepository?.sessionOverridesRevision?.collectAsState()?.value,
+        ) {
+            withContext(Dispatchers.IO) {
+                value = SlashMenuPayload(
+                    commands = viewModel.filteredSlashCommands(),
+                    loaded = true,
+                )
+            }
+        }
     } else {
-        emptyList()
+        remember { mutableStateOf(SlashMenuPayload()) }
     }
-    if (showSlashMenu && filteredSlashCommands.isNotEmpty()) {
+    val filteredSlashCommands = slashMenuPayload.value.commands
+    if (showSlashMenu && (filteredSlashCommands.isNotEmpty() || !slashMenuPayload.value.loaded)) {
         Text(filteredSlashCommands.size.toString())
         Popup(onDismissRequest = {
             cancelPendingImeBurst()
@@ -950,6 +1136,70 @@ fun ChatInputArea() {
             )
             clearComposerInput()
         })
+    }
+}
+"""
+
+SLASHEXT_F = """package com.rikkaminis.app.ui.chat
+
+internal fun ChatViewModel.filteredSlashCommands(): List<SlashCommand> {
+    val sid = activeSessionId
+    val skillEnablement = skillRepository?.sessionEnablementMap(
+        sid, skillRepository.skills.value.map { it.id }) ?: emptyMap()
+    val mcpEnablement = mcpRepository?.sessionEnablementMap(
+        sid, mcpRepository.servers.value.map { it.id }) ?: emptyMap()
+    val skillRows = skillRepository?.skills?.value
+        ?.filter { skillEnablement[it.id] == true } ?: emptyList()
+    val mcpRows = mcpRepository?.servers?.value
+        ?.filter { mcpEnablement[it.id] == true } ?: emptyList()
+    return skillRows + mcpRows
+}
+"""
+
+SKILLREPO_F = """package com.rikkaminis.app.data.repository
+
+class SkillRepository {
+    private val _sessionOverridesRevision = MutableStateFlow(0L)
+    val sessionOverridesRevision: StateFlow<Long> = _sessionOverridesRevision.asStateFlow()
+
+    fun setSessionOverride(sessionId: String, skillId: String, enabled: Boolean) {
+        db.execSQL("INSERT OR REPLACE INTO session_skill_overrides (session_id, skill_id, is_enabled) VALUES (?, ?, ?)", arrayOf<Any>(sessionId, skillId, 1))
+        _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L
+    }
+
+    fun clearSessionOverrides(sessionId: String) {
+        db.execSQL("DELETE FROM session_skill_overrides WHERE session_id=?", arrayOf(sessionId))
+        _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L
+    }
+
+    fun renameSessionOverrides(fromDraft: String, toReal: String) {
+        if (fromDraft == toReal) return
+        db.execSQL("UPDATE OR REPLACE session_skill_overrides SET session_id=? WHERE session_id=?", arrayOf<Any>(toReal, fromDraft))
+        _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L
+    }
+}
+"""
+
+MCPREPO_F = """package com.rikkaminis.app.data.repository
+
+class MCPRepository {
+    private val _sessionOverridesRevision = MutableStateFlow(0L)
+    val sessionOverridesRevision: StateFlow<Long> = _sessionOverridesRevision.asStateFlow()
+
+    fun setSessionOverride(sessionId: String, mcpId: String, enabled: Boolean) {
+        db.execSQL("INSERT OR REPLACE INTO mcp_session_overrides (session_id, mcp_id, is_enabled) VALUES (?, ?, ?)", arrayOf<Any>(sessionId, mcpId, 1))
+        _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L
+    }
+
+    fun clearSessionOverrides(sessionId: String) {
+        db.execSQL("DELETE FROM mcp_session_overrides WHERE session_id=?", arrayOf(sessionId))
+        _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L
+    }
+
+    fun renameSessionOverrides(fromDraft: String, toReal: String) {
+        if (fromDraft == toReal) return
+        db.execSQL("UPDATE OR REPLACE mcp_session_overrides SET session_id=? WHERE session_id=?", arrayOf<Any>(toReal, fromDraft))
+        _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L
     }
 }
 """
@@ -1498,9 +1748,17 @@ def fixtures(**overrides):
         SELECTION_REL: SELECTION_F,
         STREAM_REL: STREAM_F,
         MDTOOLBAR_REL: MDTOOLBAR_F,
+        # [dv22-B4] the D5/D6 sibling sources: present by default so the
+        # selftest tree mirrors the REAL tree shape; every D5/D6 breaker
+        # below mutates exactly one of them.
+        SLASH_EXT_REL: SLASHEXT_F,
+        SKILL_REPO_REL: SKILLREPO_F,
+        MCP_REPO_REL: MCPREPO_F,
     }
     files.update(overrides)
-    return files
+    # An override of None removes the file from the tree entirely — the
+    # "optional sibling read absent" fixture shape.
+    return {k: v for k, v in files.items() if v is not None}
 
 
 def selftest():
@@ -1525,6 +1783,26 @@ def selftest():
                 if missing:
                     failures.append("%s: expected %s, got %s" %
                                     (name, want_violation_ids, sorted(got)))
+        finally:
+            shutil.rmtree(root)
+
+    def expect_exact(name, files, want_violation_ids):
+        """Stricter than expect(): the violation-id SET must match exactly, so a
+        fixture cannot pass by tripping an unrelated criterion (the "only this
+        one turns red" proof each new criterion owes)."""
+        root = tempfile.mkdtemp(prefix="chat-ui-gate-selftest-")
+        try:
+            for rel, content in files.items():
+                path = os.path.join(root, rel)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+            _, problems = check_tree(root)
+            got = {cid for cid, _ in problems}
+            want = set(want_violation_ids)
+            if got != want:
+                failures.append("%s: expected exactly %s, got %s"
+                                % (name, sorted(want), sorted(got)))
         finally:
             shutil.rmtree(root)
 
@@ -1624,7 +1902,7 @@ def selftest():
             "                } else if (swipedUp && !canSwipeSendNow()) {"),
     }), ["C6"])
 
-    # ── D1-D3 (dv17-4 / B-05) ───────────────────────────────────────────────
+    # ── D family (dv17-4 / dv22-B4) ─────────────────────────────────────────
     # D1: the dead thinkingLevel key is back
     expect("D1 dead thinkingLevel key", fixtures(**{
         INPUT_REL: INPUT_F.replace(
@@ -1632,72 +1910,130 @@ def selftest():
             "            viewModel.memoryEnabled.collectAsState().value,\n"
             "            viewModel.thinkingLevel.collectAsState().value,\n"),
     }), ["D1"])
-    # D2: session scope dropped from the keys
+    # D2: session scope dropped from the producer keys
     expect("D2 session scope dropped", fixtures(**{
         INPUT_REL: INPUT_F.replace(
             "            viewModel.currentSessionId,\n", ""),
     }), ["D2"])
-    # D2: the two live repository lists dropped from the keys
+    # D2: the two live repository lists dropped from the producer keys
     expect("D2 repository lists dropped", fixtures(**{
         INPUT_REL: INPUT_F.replace(
             "            viewModel.skillRepository?.skills?.collectAsState()?.value,\n"
             "            viewModel.mcpRepository?.servers?.collectAsState()?.value,\n", ""),
     }), ["D2"])
-    # D3: the pre-fix shape — the memo computed unconditionally, with the menu
-    # gate only on the NEXT line (the rendered-value-drop baseline)
-    expect("D3 ungated memo (baseline shape)", fixtures(**{
+    # D3: the guard condition removed (menu closed still launches the
+    # producer and pays the query burst)
+    expect("D3 ungated producer", fixtures(**{
         INPUT_REL: INPUT_F.replace(
-            "    val filteredSlashCommands = if (showSlashMenu) {\n"
-            "        remember(\n"
+            "    val slashMenuPayload: androidx.compose.runtime.State<SlashMenuPayload> = if (showSlashMenu) {\n",
+            "    val slashMenuPayload: androidx.compose.runtime.State<SlashMenuPayload> = if (true) {\n"),
+    }), ["D3"])
+    # D-memo: the full revert to the dv17-4 synchronous remember shape — the
+    # payload holder disappears, the gate must fail closed on the anchor
+    # (not silently pass the old spelling)
+    expect("D-memo full revert to the sync remember shape", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "    val slashMenuPayload: androidx.compose.runtime.State<SlashMenuPayload> = if (showSlashMenu) {\n"
+            "        produceState(\n"
+            "            initialValue = SlashMenuPayload(),\n"
             "            viewModel.slashFilter.collectAsState().value,\n"
             "            viewModel.memoryEnabled.collectAsState().value,\n"
             "            viewModel.currentSessionId,\n"
             "            viewModel.skillRepository?.skills?.collectAsState()?.value,\n"
             "            viewModel.mcpRepository?.servers?.collectAsState()?.value,\n"
-            "        ) { viewModel.filteredSlashCommands() }\n"
+            "            viewModel.skillRepository?.sessionOverridesRevision?.collectAsState()?.value,\n"
+            "            viewModel.mcpRepository?.sessionOverridesRevision?.collectAsState()?.value,\n"
+            "        ) {\n"
+            "            withContext(Dispatchers.IO) {\n"
+            "                value = SlashMenuPayload(\n"
+            "                    commands = viewModel.filteredSlashCommands(),\n"
+            "                    loaded = true,\n"
+            "                )\n"
+            "            }\n"
+            "        }\n"
             "    } else {\n"
-            "        emptyList()\n"
-            "    }\n",
+            "        remember { mutableStateOf(SlashMenuPayload()) }\n"
+            "    }\n"
+            "    val filteredSlashCommands = slashMenuPayload.value.commands\n",
             "    val filteredSlashCommands = remember(\n"
-            "        showSlashMenu,\n"
             "        viewModel.slashFilter.collectAsState().value,\n"
             "        viewModel.memoryEnabled.collectAsState().value,\n"
             "        viewModel.currentSessionId,\n"
             "        viewModel.skillRepository?.skills?.collectAsState()?.value,\n"
             "        viewModel.mcpRepository?.servers?.collectAsState()?.value,\n"
             "    ) { viewModel.filteredSlashCommands() }\n"),
-    }), ["D3"])
+    }), ["D-memo"])
+    # D-IO: the producer keeps everything but drops the IO hop — the load is
+    # async in name only, the query burst stays on the composition context
+    # (Main). expect_exact: ONLY this criterion may turn red.
+    expect_exact("D-IO producer without withContext(Dispatchers.IO)", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "            withContext(Dispatchers.IO) {\n"
+            "                value = SlashMenuPayload(\n"
+            "                    commands = viewModel.filteredSlashCommands(),\n"
+            "                    loaded = true,\n"
+            "                )\n"
+            "            }\n",
+            "            value = SlashMenuPayload(\n"
+            "                commands = viewModel.filteredSlashCommands(),\n"
+            "                loaded = true,\n"
+            "            )\n"),
+    }), ["D-IO"])
+    # D4: one repository's override revision dropped from the keys — that
+    # menu goes stale after a toggle in exactly that sheet
+    expect_exact("D4 skill override revision key dropped", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "            viewModel.skillRepository?.sessionOverridesRevision?.collectAsState()?.value,\n",
+            ""),
+    }), ["D4"])
+    # D4: the MCP twin (proves BOTH channels are required, not just one)
+    expect_exact("D4 mcp override revision key dropped", fixtures(**{
+        INPUT_REL: INPUT_F.replace(
+            "            viewModel.mcpRepository?.sessionOverridesRevision?.collectAsState()?.value,\n",
+            ""),
+    }), ["D4"])
+    # D5: one mutator writes the table without bumping the revision
+    expect_exact("D5 setSessionOverride skips the revision bump", fixtures(**{
+        SKILL_REPO_REL: SKILLREPO_F.replace(
+            "        db.execSQL(\"INSERT OR REPLACE INTO session_skill_overrides (session_id, skill_id, is_enabled) VALUES (?, ?, ?)\", arrayOf<Any>(sessionId, skillId, 1))\n"
+            "        _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L\n",
+            "        db.execSQL(\"INSERT OR REPLACE INTO session_skill_overrides (session_id, skill_id, is_enabled) VALUES (?, ?, ?)\", arrayOf<Any>(sessionId, skillId, 1))\n"),
+    }), ["D5"])
+    # D5: the revision flow never existed at all
+    expect("D5 no revision flow at all", fixtures(**{
+        SKILL_REPO_REL: SKILLREPO_F.replace(
+            "    private val _sessionOverridesRevision = MutableStateFlow(0L)\n"
+            "    val sessionOverridesRevision: StateFlow<Long> = _sessionOverridesRevision.asStateFlow()\n"
+            "\n", ""),
+    }), ["D5"])
+    # D6: the ext body regresses to the per-item query shape
+    expect_exact("D6 per-item isEnabledForSession in filteredSlashCommands", fixtures(**{
+        SLASH_EXT_REL: SLASHEXT_F.replace(
+            "    val skillEnablement = skillRepository?.sessionEnablementMap(\n"
+            "        sid, skillRepository.skills.value.map { it.id }) ?: emptyMap()\n",
+            "    val skillRows = skillRepository?.skills?.value\n"
+            "        ?.filter { skillRepository.isEnabledForSession(it.id, sid) }\n"
+            "        ?: emptyList()\n"),
+    }), ["D6"])
+    # D5/D6 optional-read boundary: sibling trees that do not ship the three
+    # files must NOT fail-closed the D family (test_scan's minimal trees are
+    # exactly this shape)
+    expect("D5/D6 optional files absent", fixtures(**{
+        SLASH_EXT_REL: None,
+        SKILL_REPO_REL: None,
+        MCP_REPO_REL: None,
+    }), None)
     # precision: an early-exit guard is a legal shape (D3 must stay green)
     expect("D3 precision: early-exit guard accepted", fixtures(**{
         INPUT_REL: INPUT_F.replace(
-            "    val filteredSlashCommands = if (showSlashMenu) {\n",
+            "    val slashMenuPayload: androidx.compose.runtime.State<SlashMenuPayload> = if (showSlashMenu) {\n",
             "    if (!showSlashMenu) {\n"
             "        return@ChatInputArea\n"
             "    }\n"
-            "    val filteredSlashCommands = if (true) {\n"),
+            "    val slashMenuPayload: androidx.compose.runtime.State<SlashMenuPayload> = if (true) {\n"),
     }), None)
 
     # ── E1-E3 (dv19-B1): composer decisions read the LIVE field value ────────
-    def expect_exact(name, files, want_violation_ids):
-        """Stricter than expect(): the violation-id SET must match exactly, so a
-        fixture cannot pass by tripping an unrelated criterion (the "only this
-        one turns red" proof each new criterion owes)."""
-        root = tempfile.mkdtemp(prefix="chat-ui-gate-selftest-")
-        try:
-            for rel, content in files.items():
-                path = os.path.join(root, rel)
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(content)
-            _, problems = check_tree(root)
-            got = {cid for cid, _ in problems}
-            want = set(want_violation_ids)
-            if got != want:
-                failures.append("%s: expected exactly %s, got %s"
-                                % (name, sorted(want), sorted(got)))
-        finally:
-            shutil.rmtree(root)
-
     # E1: a content flag that reads the debounced VM string flips red
     expect_exact("E1 debounced button flag", fixtures(**{
         INPUT_REL: INPUT_F.replace(

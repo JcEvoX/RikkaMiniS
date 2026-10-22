@@ -148,6 +148,7 @@ import com.rikkaminis.app.config.ChatMenuPrefs
 import com.rikkaminis.app.config.isChatActionAvailable
 import com.rikkaminis.app.data.FileMentionIndex
 import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.provider.ModelsDevApi
 import com.rikkaminis.app.ui.components.MinisAlertDialog
 import com.rikkaminis.app.ui.components.MinisMenu
 import com.rikkaminis.app.ui.components.MinisMenuDivider
@@ -288,6 +289,7 @@ import org.intellij.markdown.ast.ASTNode
 import org.intellij.markdown.ast.getTextInNode
 import com.rikkaminis.app.data.model.LLMModel
 import com.rikkaminis.app.data.model.ModelEntry
+import com.rikkaminis.app.data.model.normalizeModalities
 import com.rikkaminis.app.data.model.ModelGroup
 import com.rikkaminis.app.data.model.ProviderConfig
 import com.rikkaminis.app.data.model.ProviderType
@@ -1953,13 +1955,14 @@ fun ChatScreen(
                     val alt = m.groupValues.getOrNull(1).orEmpty()
                     val src = m.groupValues.getOrNull(2).orEmpty()
                     if (src.isEmpty()) continue
-                    val pathPart = src.substringBefore('?').substringBefore('#')
-                    val ext = pathPart.substringAfterLast('.', "").lowercase()
+                    val pathPart = mediaPathOfUrl(src)
                     // Skip non-image media so the gallery stays still-image only,
                     // matching iOS minisVideoExtensions / minisAudioExtensions.
-                    if (ext in setOf("mp4", "mov", "avi", "mkv", "webm",
-                                     "mp3", "wav", "aac", "flac", "ogg", "m4a")) continue
-                    val title = alt.ifEmpty { pathPart.substringAfterLast('/').ifEmpty { src } }
+                    // [dv22/B-06] Classified through the single media source: the
+                    // old hand-written set missed `m4v`, ordered `?` before `#`
+                    // (so `x.mp4?t=1` leaked in) and never percent-decoded.
+                    if (mediaKindOfUrl(src) != MediaKind.IMAGE) continue
+                    val title = alt.ifEmpty { mediaFileNameOfUrl(src).ifEmpty { src } }
                     refs.add(Ref(msg.id, src, title))
                 }
             }
@@ -4937,7 +4940,11 @@ fun ChatScreen(
         val resolveAudioLabel = stringResource(R.string.model_picker_modality_audio)
         val resolveVideoLabel = stringResource(R.string.model_picker_modality_video)
         fun nonTextLabelFor(model: LLMModel): String? {
-            val mods = model.outputModalities?.map { it.lowercase() } ?: emptyList()
+            // [dv22/B-03] normalizeModalities strips the `_input`/`_output`
+            // suffixes and lowercases; the old bare `.lowercase()` never matched
+            // `image_output`, so a vision model could be bound to an Agent loop
+            // with no "non-text model" warning at all.
+            val mods = model.outputModalities.normalizeModalities() ?: emptyList()
             return when {
                 "image" in mods -> resolveImageLabel
                 "audio" in mods -> resolveAudioLabel
@@ -4958,7 +4965,7 @@ fun ChatScreen(
             onSelectGroup = { groupId ->
                 val group = availableGroups.firstOrNull { it.id == groupId }
                 val firstEntry = group?.memberEntryIds?.firstNotNullOfOrNull(::entryById)
-                val label = firstEntry?.model?.let(::nonTextLabelFor)
+                val label = firstEntry?.let { nonTextLabelFor(ModelsDevApi.effectiveModel(it)) }
                 if (label != null) {
                     pendingNonTextSelection = PendingNonTextSelection.Group(
                         groupId = groupId,
@@ -4972,7 +4979,7 @@ fun ChatScreen(
             },
             onSelectGroupEntry = { groupId, entryId ->
                 val entry = entryById(entryId)
-                val label = entry?.model?.let(::nonTextLabelFor)
+                val label = entry?.let { nonTextLabelFor(ModelsDevApi.effectiveModel(it)) }
                 if (entry != null && label != null) {
                     pendingNonTextSelection = PendingNonTextSelection.GroupEntry(
                         groupId = groupId,
@@ -4987,7 +4994,7 @@ fun ChatScreen(
             },
             onSelectEntry = { entryId ->
                 val entry = entryById(entryId)
-                val label = entry?.model?.let(::nonTextLabelFor)
+                val label = entry?.let { nonTextLabelFor(ModelsDevApi.effectiveModel(it)) }
                 if (entry != null && label != null) {
                     pendingNonTextSelection = PendingNonTextSelection.Entry(
                         entryId = entryId,

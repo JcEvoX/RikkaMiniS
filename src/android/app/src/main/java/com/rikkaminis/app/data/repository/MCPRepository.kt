@@ -32,6 +32,21 @@ import java.io.File
  * invocation); "recent" ordering falls back to recent-add (createdAt desc),
  * which is the best signal Android has locally.
  */
+/**
+ * [dv22-B4] Pure merge core of [MCPRepository.sessionEnablementMap] — mirrors
+ * [mergeSessionSkillEnablement] (the twin keeps its own copy because its SQL
+ * names differ; the decision itself is this function). Precedence identical
+ * to [MCPRepository.isEnabledForSession]: session override row → global
+ * `enabled` → absent (false).
+ */
+internal fun mergeSessionMcpEnablement(
+    ids: List<String>,
+    overrideRows: Map<String, Boolean>,
+    globalEnabled: (id: String) -> Boolean?,
+): Map<String, Boolean> = ids.associateWith { id ->
+    overrideRows[id] ?: globalEnabled(id) ?: false
+}
+
 class MCPRepository(private val context: Context) {
 
     companion object {
@@ -39,6 +54,10 @@ class MCPRepository(private val context: Context) {
         private const val DB_NAME = "mcp.db"
         private const val DB_VERSION = 1
         private const val MAX_MCPS_IN_PROMPT = 20
+        /** [dv22-B4] Ids per batched `IN (…)` SELECT in
+         *  [sessionEnablementMap] — same chunking rationale as
+         *  [SkillRepository] (SQLITE_MAX_VARIABLE_NUMBER = 999). */
+        private const val SESSION_OVERRIDE_QUERY_CHUNK = 400
         // Reuse the skill description cap so MCP notes truncate identically.
         private const val MAX_NOTE_LENGTH = 200
 
@@ -129,6 +148,18 @@ class MCPRepository(private val context: Context) {
 
     private val _servers = MutableStateFlow<List<MCPServerConfig>>(emptyList())
     val servers: StateFlow<List<MCPServerConfig>> = _servers.asStateFlow()
+
+    /**
+     * [dv22-B4] Bumped by every write to `mcp_session_overrides`
+     * ([setSessionOverride] / [clearSessionOverrides] /
+     * [renameSessionOverrides]) — the overrides table is not mirrored by
+     * [servers], so before this channel a session toggle re-emitted nothing
+     * and the slash menu kept a stale server list (B-04). Pure revision
+     * number: collectors re-read the table when this moves, no polling.
+     * Mirrors [SkillRepository.sessionOverridesRevision].
+     */
+    private val _sessionOverridesRevision = MutableStateFlow(0L)
+    val sessionOverridesRevision: StateFlow<Long> = _sessionOverridesRevision.asStateFlow()
 
     private val db: SQLiteDatabase by lazy {
         McpDbHelper(context).writableDatabase
@@ -446,6 +477,34 @@ class MCPRepository(private val context: Context) {
     }
 
     /**
+     * [dv22-B4] Batched twin of [isEnabledForSession]: ONE `IN (…)` SELECT for
+     * the whole id list (chunked at [SESSION_OVERRIDE_QUERY_CHUNK]) instead of
+     * one rawQuery per server — the slash menu walks the full list on every
+     * keystroke, so the per-item shape cost M synchronous queries per producer
+     * run (B-04). Precedence identical via the pure [mergeSessionMcpEnablement]
+     * core. Mirrors [SkillRepository.sessionEnablementMap].
+     */
+    fun sessionEnablementMap(sessionId: String, ids: List<String>): Map<String, Boolean> {
+        if (ids.isEmpty()) return emptyMap()
+        val overrideRows = mutableMapOf<String, Boolean>()
+        ids.chunked(SESSION_OVERRIDE_QUERY_CHUNK).forEach { chunk ->
+            val placeholders = chunk.joinToString(",") { "?" }
+            val cursor = db.rawQuery(
+                "SELECT mcp_id, is_enabled FROM mcp_session_overrides WHERE session_id=? AND mcp_id IN ($placeholders)",
+                arrayOf(sessionId) + chunk.toTypedArray(),
+            )
+            if (cursor.moveToFirst()) {
+                do {
+                    overrideRows[cursor.getString(0)] = cursor.getInt(1) == 1
+                } while (cursor.moveToNext())
+            }
+            cursor.close()
+        }
+        val globals = _servers.value.associate { it.id to it.enabled }
+        return mergeSessionMcpEnablement(ids, overrideRows) { id -> globals[id] }
+    }
+
+    /**
      * [T-mcp-review-fixes-android] FIX 3: sparse-clear to match iOS. When the
      * chosen [enabled] equals the server's CURRENT global enabled, DELETE the
      * override row instead of pinning it — so a later flip of the global
@@ -467,10 +526,14 @@ class MCPRepository(private val context: Context) {
                 arrayOf<Any>(sessionId, mcpId, if (enabled) 1 else 0)
             )
         }
+        // [dv22-B4] The table moved — publish the revision so async consumers
+        // (the slash menu's producer) re-query without polling.
+        _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L
     }
 
     fun clearSessionOverrides(sessionId: String) {
         db.execSQL("DELETE FROM mcp_session_overrides WHERE session_id=?", arrayOf(sessionId))
+        _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L
     }
 
     /**
@@ -488,6 +551,7 @@ class MCPRepository(private val context: Context) {
             "UPDATE OR REPLACE mcp_session_overrides SET session_id=? WHERE session_id=?",
             arrayOf<Any>(toReal, fromDraft),
         )
+        _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L
     }
 
     // -- JSON Import (4 format variants, last-write-wins on name) --

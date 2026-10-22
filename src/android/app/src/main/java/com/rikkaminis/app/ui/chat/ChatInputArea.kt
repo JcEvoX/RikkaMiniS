@@ -579,29 +579,55 @@ internal fun ChatInputArea(
             // sessions or touching a key spent N+M synchronous `db.rawQuery`
             // calls (one `isEnabledForSession` per skill + per MCP server) on
             // the main thread and dropped the result on the very next line.
-            // The menu gate now wraps the whole computation — closed menu =
-            // empty list, no query. The keys name the live sources the body
+            // The gate still wraps the whole computation — closed menu = no
+            // producer, no query. The keys name the live sources the body
             // actually reads: `slashFilter` / `memoryEnabled` (built-in rows),
             // `currentSessionId` and the two repositories' lists (the
-            // per-session override the picker filters on) — so toggling a
-            // skill/MCP for this session, or adding one from disk, refreshes
-            // an open menu. `thinkingLevel` is gone: `/thinking` is no longer
-            // in `availableSlashCommands`, so that key had 0 reads in the body
-            // and only forced a needless recompute + query burst on every
-            // thinking-notch tap.
-            val filteredSlashCommands = if (showSlashMenu) {
-                remember(
+            // per-session override the picker filters on). `thinkingLevel` is
+            // gone: `/thinking` is no longer in `availableSlashCommands`, so
+            // that key had 0 reads in the body.
+            //
+            // [dv22-B4] The compute itself left the composition: it stayed a
+            // synchronous `remember` here, so every keystroke with the menu
+            // open still ran the N+M queries ON MAIN (inside composition), and
+            // `setSessionOverride` writes only the DB table — the `.skills` /
+            // `.servers` flows never re-emitted, so an open menu went stale
+            // after a toggle in SessionSkillsSheet/SessionMcpsSheet. Now:
+            //  - the load runs in a `produceState` producer, with
+            //    `withContext(Dispatchers.IO)` — the producer inherits the
+            //    composition's context (Main), so the IO hop is explicit
+            //    (1041-B3 lesson: produceState is NOT an IO context);
+            //  - the two `sessionOverridesRevision` keys are the new
+            //    invalidation channel: both repositories bump their revision
+            //    on every override-table write, so an open menu refreshes
+            //    after a toggle — no polling;
+            //  - `filteredSlashCommands()` itself is batched (one `IN (…)`
+            //    SELECT per repository — see ChatViewModelSlashExt), so the IO
+            //    cost is a constant two queries per producer run.
+            val slashMenuPayload: androidx.compose.runtime.State<SlashMenuPayload> = if (showSlashMenu) {
+                produceState(
+                    initialValue = SlashMenuPayload(),
                     viewModel.slashFilter.collectAsState().value,
                     viewModel.memoryEnabled.collectAsState().value,
                     viewModel.currentSessionId,
                     viewModel.skillRepository?.skills?.collectAsState()?.value,
                     viewModel.mcpRepository?.servers?.collectAsState()?.value,
-                ) { viewModel.filteredSlashCommands() }
+                    viewModel.skillRepository?.sessionOverridesRevision?.collectAsState()?.value,
+                    viewModel.mcpRepository?.sessionOverridesRevision?.collectAsState()?.value,
+                ) {
+                    withContext(Dispatchers.IO) {
+                        value = SlashMenuPayload(
+                            commands = viewModel.filteredSlashCommands(),
+                            loaded = true,
+                        )
+                    }
+                }
             } else {
-                emptyList()
+                remember { mutableStateOf(SlashMenuPayload()) }
             }
+            val filteredSlashCommands = slashMenuPayload.value.commands
 
-            if (showSlashMenu && filteredSlashCommands.isNotEmpty()) {
+            if (showSlashMenu && (filteredSlashCommands.isNotEmpty() || !slashMenuPayload.value.loaded)) {
                 val effectiveThinkingLevelState by viewModel.thinkingLevel.collectAsState()
                 // [T-thinking-effective-level] The two are DIFFERENT values and
                 // must not be swapped. `effectiveThinkingLevelState` (above) is
@@ -662,6 +688,17 @@ internal fun ChatInputArea(
                         dismissOnClickOutside = false,
                     ),
                 ) {
+                    // [dv22-B4] First open of the menu: the producer has been
+                    // launched but the IO round-trip has not landed yet —
+                    // draw the same fixed frame with a single subdued row so
+                    // the popup does not appear empty-then-jump. Once the
+                    // first load lands, key changes keep the previous value
+                    // (produceState holds it across relaunches), so typing
+                    // never flashes this placeholder again.
+                    if (!slashMenuPayload.value.loaded) {
+                        SlashMenuLoadingPanel()
+                        return@Popup
+                    }
                     // [T-slash-picker-fixed-height port from iOS 73f1b94a]
                     // Locked popup height = 4 rows × 46dp + 8dp = 192dp.
                     // Short lists show empty space below the last row;
@@ -2025,3 +2062,43 @@ internal fun ChatInputArea(
         }
 
 }
+
+/**
+ * [dv22-B4] Async payload of the slash menu. [commands] is the batched IO
+ * result; [loaded] is false only before the FIRST load for the current keys
+ * (initial value / closed menu) — it drives the loading placeholder, never
+ * the empty-vs-populated distinction (an empty `commands` with `loaded == true`
+ * simply renders no popup, exactly like the old synchronous shape).
+ */
+private data class SlashMenuPayload(
+    val commands: List<SlashCommand> = emptyList(),
+    val loaded: Boolean = false,
+)
+
+/**
+ * [dv22-B4] First-load placeholder for the async slash menu: the same locked
+ * frame the list uses ([SLASH_PICKER_FIXED_HEIGHT], 4 rows) with one subdued
+ * "Loading…" row, so the popup's geometry never changes when the data lands.
+ */
+@Composable
+private fun SlashMenuLoadingPanel() {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp)
+            // T240: same thin visible border as the list panel (see the list
+            // Box below) so the placeholder IS the menu frame.
+            .shadow(elevation = 3.dp, shape = RoundedCornerShape(10.dp))
+            .background(ChatColors.inputBg, RoundedCornerShape(10.dp))
+            .border(0.5.dp, ChatColors.toolBorder, RoundedCornerShape(10.dp))
+            .height(SLASH_PICKER_FIXED_HEIGHT),
+        contentAlignment = Alignment.Center,
+    ) {
+        Text(
+            text = stringResource(R.string.common_loading),
+            color = ChatColors.secondaryText,
+            fontSize = 12.sp,
+        )
+    }
+}
+

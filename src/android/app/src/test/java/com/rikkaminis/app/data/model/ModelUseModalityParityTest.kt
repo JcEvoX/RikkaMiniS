@@ -194,6 +194,15 @@ class ModelUseModalityParityTest {
         val manager = readRepoFile(
             "src/android/app/src/main/java/com/rikkaminis/app/offload/ModelUseManager.kt",
         ) ?: return
+        val chatDebug = readRepoFile(
+            "src/android/app/src/main/java/com/rikkaminis/app/debug/ChatDebugMethods.kt",
+        ) ?: return
+        val providerDebug = readRepoFile(
+            "src/android/app/src/main/java/com/rikkaminis/app/debug/ProviderDebugMethods.kt",
+        ) ?: return
+        val providerMutation = readRepoFile(
+            "src/android/app/src/main/java/com/rikkaminis/app/debug/ProviderMutationMethods.kt",
+        ) ?: return
 
         // The offload filter/guards, the config collection and the agent-facing
         // payload must all resolve through ModelsDevApi.effectiveModel.
@@ -215,6 +224,65 @@ class ModelUseModalityParityTest {
             "ModelUseManager must resolve modalities through the shared entry",
             1,
             Regex("""ModelsDevApi\.effectiveModel\(""").findAll(manager).count(),
+        )
+        // [dv22-A4] The three Debug RPC views answer "what can this model do"
+        // too, so they go through the same entry (contextWindow and the
+        // capability booleans over the harness used to read the raw
+        // entry.model and disagree with everything above).
+        assertEquals(
+            "chat.models.list must resolve through the shared entry",
+            1,
+            Regex("""ModelsDevApi\.effectiveModel\(""").findAll(chatDebug).count(),
+        )
+        assertEquals(
+            "provider.models.list must resolve through the shared entry",
+            1,
+            Regex("""ModelsDevApi\.effectiveModel\(""").findAll(providerDebug).count(),
+        )
+        assertEquals(
+            "provider.models.add/update read-back must resolve through the shared entry",
+            1,
+            Regex("""ModelsDevApi\.effectiveModel\(""").findAll(providerMutation).count(),
+        )
+        assertEquals(
+            "no consumer may read the raw entry as the effective model any more",
+            0,
+            Regex("""val\s+effective(\s*:\s*LLMModel)?\s*=\s*entry\.model""").findAll(
+                chatDebug + providerDebug + providerMutation,
+            ).count(),
+        )
+    }
+
+    @Test
+    fun `the collection numeric readers resolve through the shared entry`() {
+        // [dv22-A4] models.<id>.contextWindow / maxOutputTokens used to read
+        // `overrides ?: baseModel ?: 0`, skipping models.dev — 33 of 39
+        // built-ins answered 0. They now go through the collection's private
+        // alias of the shared resolver (the alias is what keeps the literal
+        // call count above at exactly 1).
+        val collection = readRepoFile(
+            "src/android/app/src/main/java/com/rikkaminis/app/config/collections/ModelsCollection.kt",
+        ) ?: return
+        val code = codeOnly(collection)
+        assertTrue(
+            "contextWindow reader must read effectiveModel(e).contextWindow",
+            "effectiveModel(e).contextWindow" in code,
+        )
+        assertTrue(
+            "maxOutputTokens reader must read effectiveModel(e).maxOutputTokens",
+            "effectiveModel(e).maxOutputTokens" in code,
+        )
+        assertFalse(
+            "the raw `overrides ?: baseModel` window chain must be gone",
+            "e.overrides.contextWindow ?: e.baseModel.contextWindow" in code,
+        )
+        assertFalse(
+            "the raw `overrides ?: baseModel` output-token chain must be gone",
+            "e.overrides.maxOutputTokens ?: e.baseModel.maxOutputTokens" in code,
+        )
+        assertTrue(
+            "the alias must delegate to the shared resolver",
+            Regex("""private fun effectiveModel\(e: ModelEntry\): LLMModel\s*=\s*\n?\s*ModelsDevApi\.effectiveModel\(e\)""").containsMatchIn(code),
         )
     }
 

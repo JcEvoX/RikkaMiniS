@@ -437,6 +437,12 @@ class ProviderRepository(private val context: Context) {
      * round-trip). Callers should treat the return value as the new
      * authoritative state — using the in-memory pre-call object would
      * leak the legacy uuid form into [_config.value].
+     *
+     * [fix/dv22-a1 §1042-A-01] Degraded mode: if the DB write fails
+     * (provider.db unavailable), the failure is logged and the JSON mirror
+     * is STILL written — with the DB down, prefs is the only surviving
+     * store. The next launch's hash-mismatch re-import reseeds the DB from
+     * the mirror once the DB opens again.
      */
     private suspend fun persistToDbAndMirror(config: ProviderConfig): ProviderConfig {
         // First serialize without the hash so the meta row reflects the
@@ -448,19 +454,46 @@ class ProviderRepository(private val context: Context) {
         val mirrorHash = hashJsonMirror(mirrorStr)
         val snapshot = config.toSnapshot(json, jsonSyncHash = mirrorHash)
         val t1 = System.nanoTime()
-        providerDao.syncAllIncremental(
-            instances = snapshot.instances,
-            entries = snapshot.entries,
-            groups = snapshot.groups,
-            loopIds = snapshot.loopIds,
-            meta = snapshot.meta,
-        )
+        // [fix/dv22-a1 §1042-A-01] The DAO write used to be BARE here, before
+        // the mirror write below. A provider.db that failed to open
+        // (migration abort — ProviderDatabase has no
+        // fallbackToDestructiveMigration, see MIGRATION_9_10's KDoc) threw
+        // straight out of this function, so the mirror write never ran and
+        // the user's change was lost ENTIRELY: with the DB down, prefs is
+        // the only surviving store, and saveConfig's executor catch logged
+        // "DB+mirror stale" while the mirror was in fact never attempted.
+        // Wrap the DAO call: on failure log loudly and STILL write the
+        // mirror. The mirror carries the new state; on the next launch the
+        // hash-mismatch re-import (loadConfigSuspending) reseeds the DB
+        // from the mirror once the DB opens again, and the next successful
+        // save resyncs meta.json_sync_hash either way.
+        val dbWrite = runCatching {
+            providerDao.syncAllIncremental(
+                instances = snapshot.instances,
+                entries = snapshot.entries,
+                groups = snapshot.groups,
+                loopIds = snapshot.loopIds,
+                meta = snapshot.meta,
+            )
+        }
+        dbWrite.onFailure { e ->
+            android.util.Log.e(
+                "ProviderRepo",
+                "[ProviderStore] DB incremental sync failed (provider.db unavailable?); " +
+                    "writing JSON mirror only — DB stale until next successful save: ${e.message}",
+                e,
+            )
+        }
         val dbMs = (System.nanoTime() - t1) / 1_000_000
+        // [fix/dv22-a1 §1042-A-01] dbOk makes "did the DB row-set actually
+        // land" judgeable from the log line itself, instead of inferring it
+        // from the absence of a follow-up error.
         android.util.Log.i(
             "ProviderPerf",
             "persistToDbAndMirror: entries=${snapshot.entries.size} " +
                 "instances=${snapshot.instances.size} groups=${snapshot.groups.size} " +
-                "mirror=${mirrorStr.length / 1024}KB serialize=${serializeMs}ms db=${dbMs}ms",
+                "mirror=${mirrorStr.length / 1024}KB serialize=${serializeMs}ms db=${dbMs}ms " +
+                "dbOk=${dbWrite.isSuccess}",
         )
         // commit() not apply(): the json_sync_hash we just stored to DB is
         // a hash of THIS mirror string. If apply() queues the disk write
@@ -482,11 +515,22 @@ class ProviderRepository(private val context: Context) {
         // data is not lost.
         val mirrorWritten = prefs.edit().putString("config", mirrorStr).commit()
         if (!mirrorWritten) {
+            // [fix/dv22-a1 §1042-A-01] The old wording asserted the DB had
+            // taken the write. That held when a bare DAO throw made this
+            // branch unreachable; now that a failed DB sync still gets here
+            // (mirror-only degradation is the point), both stores can fail —
+            // and "DB remains authoritative" would be a false reassurance
+            // exactly when the user has lost everything but memory.
             android.util.Log.w(
                 "ProviderRepo",
-                "[ProviderStore] mirror commit() returned false — DB updated " +
-                    "but JSON write rejected (disk full? prefs corruption?); " +
-                    "DB remains authoritative",
+                "[ProviderStore] mirror commit() returned false — " +
+                    if (dbWrite.isSuccess) {
+                        "DB updated but JSON write rejected (disk full? prefs corruption?); " +
+                            "DB remains authoritative"
+                    } else {
+                        "DB sync FAILED as well (see the incremental-sync error above); " +
+                            "neither store took this write — in-memory state only"
+                    },
             )
         }
         // Return canonicalized form so the caller's _config.value reflects
@@ -1073,9 +1117,11 @@ class ProviderRepository(private val context: Context) {
     /**
      * Replace [instanceId]'s custom rules with the rows from a backup,
      * preserving each rule's id and sort_order. Returns the number of rules
-     * restored (0 when [rows] is empty or malformed). A backup section that
-     * carries no rules for this instance is a no-op — restore must never wipe
-     * rules just because an older backup predates the section.
+     * restored (0 when [rows] is empty or malformed, or when persistence
+     * failed — failures are logged, not thrown; [fix/dv22-a1 §1042-A-01]).
+     * A backup section that carries no rules for this instance is a no-op —
+     * restore must never wipe rules just because an older backup predates
+     * the section.
      */
     fun restoreThinkingRules(instanceId: String, rows: org.json.JSONArray): Int = runBlocking {
         val entities = ArrayList<ProviderThinkingRuleEntity>()
@@ -1100,7 +1146,24 @@ class ProviderRepository(private val context: Context) {
             )
         }
         if (entities.isEmpty()) return@runBlocking 0
-        providerDao.replaceThinkingRules(instanceId, entities)
+        // [fix/dv22-a1 §1042-A-01] Same bare-DAO hardening as the nine
+        // sibling functions above ([audit-0909 T4-H1]): a provider.db that
+        // failed to open threw here straight into the backup importer.
+        // Failure is logged and reported as 0 rules restored — the truth:
+        // no rows landed. The republish below only runs on success, so the
+        // resolver cache keeps matching what is actually on disk (on
+        // failure the DB still holds the pre-restore rows).
+        val persisted = runCatching {
+            providerDao.replaceThinkingRules(instanceId, entities)
+        }.onFailure { e ->
+            android.util.Log.e(
+                "ProviderRepo",
+                "[ProviderStore] restoreThinkingRules persistence failed " +
+                    "($instanceId, ${entities.size} rules) — reporting 0 restored: ${e.message}",
+                e,
+            )
+        }.isSuccess
+        if (!persisted) return@runBlocking 0
         republishThinkingCache(instanceId)
         entities.size
     }

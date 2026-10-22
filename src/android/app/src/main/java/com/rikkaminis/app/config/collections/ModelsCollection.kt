@@ -215,7 +215,10 @@ class ModelsCollection(
             revertable = true,
             reader = {
                 val e = entry(id) ?: return@ClosureField ConfigValue.Null
-                ConfigValue.Int(e.overrides.maxOutputTokens ?: e.baseModel.maxOutputTokens ?: 0)
+                // [dv22-A4] Same single source as contextWindow (this one sat
+                // in the same function family and read the raw base model):
+                // models.dev first, the user's override second.
+                ConfigValue.Int(effectiveModel(e).maxOutputTokens ?: 0)
             },
             writer = { v ->
                 val i = (v as? ConfigValue.Int)?.value ?: throw ConfigError.TypeMismatch("int")
@@ -260,8 +263,19 @@ class ModelsCollection(
      *   - an absent list means text on that side, evaluated PER DIRECTION
      *     (a pure image generator keeps `supportsTools = false`).
      */
+    /**
+     * [dv22-A4] The single enriched-model resolver for this collection —
+     * the SAME `ModelsDevApi.effectiveModel` the offload faces and the
+     * agent-facing `minis-model-use` list go through. Private one-line
+     * alias: every "what can this model do" field below funnels through
+     * this one call site (the parity test pins the literal call count at
+     * 1, and the alias keeps that true however many fields need it).
+     */
+    private fun effectiveModel(e: ModelEntry): LLMModel =
+        ModelsDevApi.effectiveModel(e)
+
     private fun effectiveModalities(e: ModelEntry): List<String> =
-        ModelsDevApi.effectiveModel(e).directionalModalities
+        effectiveModel(e).directionalModalities
 
     /** Split the user-supplied flat list into input/output components. */
     private fun decodeModalitiesOverride(names: List<String>): Pair<List<String>, List<String>> {
@@ -354,8 +368,13 @@ class ModelsCollection(
             valueSchema = ConfigSchema.Int(),
             reader = {
                 val e = entry(id) ?: return@ReadOnlyField ConfigValue.Null
-                val effective = e.overrides.contextWindow ?: e.baseModel.contextWindow ?: 0
-                ConfigValue.Int(effective)
+                // [dv22-A4] Route through the shared enriched resolver. The
+                // raw `overrides ?: baseModel ?: 0` chain skipped models.dev
+                // entirely, so every built-in model whose local row carries a
+                // null window reported 0 (33 of the 39 built-ins) even though
+                // the registry knows the real number. Enrichment is a default,
+                // so overrides still win — `withOverrides` applies them second.
+                ConfigValue.Int(effectiveModel(e).contextWindow ?: 0)
             },
         )
 

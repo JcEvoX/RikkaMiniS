@@ -129,6 +129,14 @@ class TerminalSession(private val context: Context) {
         val myGeneration = startGeneration.incrementAndGet()
 
         scope.launch {
+            // [1042-A-03] The PTY THIS attempt created, if it got that far.
+            // Declared outside the try so the failure handler can compare the
+            // slot against a value captured at creation time. The old handler
+            // self-bound the comparison (`termuxSession?.let { s -> if
+            // (termuxSession === s) … }`), which is a tautology: `s` IS
+            // `termuxSession`, so the "ownership" test always passed and the
+            // handler killed a newer attempt's PTY and cleared its state.
+            var createdSession: com.termux.terminal.TerminalSession? = null
             try {
                 PRootKernel.boot(context)
 
@@ -169,6 +177,7 @@ class TerminalSession(private val context: Context) {
                     2_000, // scrollback rows — match RikkaHub default
                     client,
                 )
+                createdSession = session
                 session.updateSize(cols, rows)
 
                 if (myGeneration != startGeneration.get()) {
@@ -231,18 +240,35 @@ class TerminalSession(private val context: Context) {
                 // or the delay above, i.e. AFTER termuxSession was set — the
                 // old handler only flipped the state, orphaning a live shell
                 // process that nothing would ever reap.
-                termuxSession?.let { s ->
-                    // [da1032-D] Release ONLY the slot this attempt owns: a
-                    // newer start() can already have installed its own PTY
-                    // while this coroutine was failing (same ownership family
-                    // as the generation guards above). Killing `s` stays
-                    // unconditional — it is this attempt's dead PTY either way.
-                    if (termuxSession === s) termuxSession = null
+                //
+                // [1042-A-03] Reaping stays keyed on the PTY THIS attempt
+                // created (`createdSession`), not on the slot: a newer start()
+                // can already have installed its own PTY while this coroutine
+                // was failing, and killing what the slot points at (which the
+                // old `termuxSession?.let { s -> if (termuxSession === s) … }`
+                // self-bound form did — `s` IS `termuxSession`, so the guard
+                // was a tautology) would kill the NEW session.
+                //
+                // The shared-state settlement (slot null, liveSessions
+                // unregister, STOPPED publish) is gated the same way: only the
+                // owner of the current slot may touch it. `null === null`
+                // covers "this attempt never attached and the slot is still
+                // empty"; the `else if` covers "this attempt died before
+                // attaching, the slot is empty, and nobody has superseded it"
+                // (a newer start()/stop() bumps startGeneration, so an
+                // unchanged generation means this attempt is still the one
+                // responsible for settling the BOOTING state it published).
+                createdSession?.let { s ->
                     runCatching { killTermuxProcessTree(s) }
                         .onFailure { Log.w(TAG, "cleanup after start failure: ${it.message}") }
                 }
-                liveSessions.removeAll { it.get() === this@TerminalSession || it.get() == null }
-                _state.value = State.STOPPED
+                if (termuxSession === createdSession) {
+                    termuxSession = null
+                    liveSessions.removeAll { it.get() === this@TerminalSession || it.get() == null }
+                    _state.value = State.STOPPED
+                } else if (termuxSession == null && startGeneration.get() == myGeneration) {
+                    _state.value = State.STOPPED
+                }
             }
         }
     }
@@ -588,16 +614,28 @@ class TerminalSession(private val context: Context) {
             // `termuxSession` and the liveSessions entry pointing at a dead
             // session — later attach()/sendInput() calls then targeted a
             // finished process instead of starting a fresh one.
-            startGeneration.incrementAndGet()
-            // [da1032-D] Ownership-gated release: this callback can land after a
-            // newer start() installed its own PTY (e.g. the screen was re-entered
-            // while the old shell was exiting). Clearing the slot unconditionally
-            // would strand the live session — exactly the stale-teardown family
-            // `claim_release_guard.py` watches. The state/bookkeeping lines below
-            // keep their historical behaviour.
-            if (termuxSession === changedSession) termuxSession = null
-            if (_state.value != State.STOPPED) _state.value = State.STOPPED
-            liveSessions.removeAll { it.get() === this@TerminalSession || it.get() == null }
+            //
+            // [1042-A-03] The WHOLE settlement is ownership-gated, not just the
+            // slot clear. This callback can land after a newer start() installed
+            // its own PTY (the screen was re-entered while the old shell was
+            // exiting). Ungated, the stale callback did three things to a live
+            // session it no longer owned:
+            //   · bumped startGeneration — aborting the newer boot coroutine at
+            //     its next `myGeneration != startGeneration.get()` checkpoint,
+            //     i.e. a fresh PTY that dies before it is ever usable;
+            //   · published STOPPED — the screen rendered the new session dead;
+            //   · removed this object's liveSessions entry — the live shell
+            //     stopped receiving timezone/proxy broadcasts.
+            // All four lines are one decision about one slot: if the slot is no
+            // longer ours, the only thing left for this callback to do is log.
+            if (termuxSession === changedSession) {
+                startGeneration.incrementAndGet()
+                termuxSession = null
+                if (_state.value != State.STOPPED) _state.value = State.STOPPED
+                liveSessions.removeAll { it.get() === this@TerminalSession || it.get() == null }
+            } else {
+                Log.i(TAG, "stale session-finished callback ignored — a newer PTY owns the slot")
+            }
         }
         override fun onBell(session: com.termux.terminal.TerminalSession) {}
         override fun onColorsChanged(changedSession: com.termux.terminal.TerminalSession) {}

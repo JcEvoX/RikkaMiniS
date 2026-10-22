@@ -1,6 +1,7 @@
 package com.rikkaminis.app.ui.markdown
 
-import com.rikkaminis.app.ui.chat.decodeUriPath
+import com.rikkaminis.app.ui.chat.MediaKind
+import com.rikkaminis.app.ui.chat.mediaKindOfUrl
 
 /**
  * Lightweight markdown parser that converts raw markdown text into a list of block nodes.
@@ -55,8 +56,10 @@ object MarkdownParser {
     /** Object Replacement Character (U+FFFC) — sentinel used by math placeholders. */
     private const val ORC = '￼'
 
-    private val nativeVideoExts = setOf("mp4", "mov", "m4v", "avi", "mkv", "webm")
-    private val nativeAudioExts = setOf("mp3", "m4a", "wav", "aac", "ogg", "flac")
+    // [dv22/B-06] The extension sets live in one place only
+    // (`ui/chat/MarkdownBlockModel.kt`). This parser classifies through
+    // `mediaKindOfUrl` so the block renderer, the inline split and the image
+    // gallery can never disagree about what counts as video/audio.
 
     /** Regex for a standalone `![alt](url)` node on its own line. */
     private val standaloneImageRegex = Regex("""^\s*!\[([^\]]*)\]\(([^)\s]+)\)\s*$""")
@@ -129,16 +132,13 @@ object MarkdownParser {
      * literal or percent-encoded) still get their real extension. Handles both
      * unencoded names (e.g. `foo#China.mp4`) and encoded ones (`foo%23China.mp4`).
      */
-    private fun mediaBlockFor(alt: String, url: String): Block {
-        val lastSeg = url.substringAfterLast('/')
-        val decoded = decodeUriPath(lastSeg)
-        val ext = decoded.substringAfterLast('.', "").lowercase()
-        return when (ext) {
-            in nativeVideoExts -> Block.Video(alt, url)
-            in nativeAudioExts -> Block.Audio(alt, url)
-            else -> Block.Image(alt, url)
+    private fun mediaBlockFor(alt: String, url: String): Block =
+        // [dv22/B-06] One classifier for every media surface (`ui/chat/MarkdownBlockModel.kt`).
+        when (mediaKindOfUrl(url)) {
+            MediaKind.VIDEO -> Block.Video(alt, url)
+            MediaKind.AUDIO -> Block.Audio(alt, url)
+            MediaKind.IMAGE -> Block.Image(alt, url)
         }
-    }
 
     data class ListItem(val content: String, val checked: Boolean? = null)
 

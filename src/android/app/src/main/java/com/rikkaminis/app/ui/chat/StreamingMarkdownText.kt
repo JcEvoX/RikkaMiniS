@@ -1781,7 +1781,10 @@ internal fun resolveMdMediaFile(context: Context, url: String, sessionId: String
             // URLDecoder.decode threw IllegalArgumentException on `100%.png`
             // during render and turned `a+b.png` into `a b.png`.
             val decoded = decodeUriPath(stripped.removePrefix("minis://"))
-            val linuxPath = "/var/minis/$decoded"
+            // [dv22/B-06] `minis:///var/minis/...` yields an absolute guest path;
+            // prefixing it unconditionally used to produce
+            // `/var/minis//var/minis/...`. Same guard as ChatLinkResolver.
+            val linuxPath = if (decoded.startsWith("/")) decoded else "/var/minis/$decoded"
             // Prefer the session-scoped resolver when the caller supplied a
             // sessionId: the global `bindMounts` map is overwritten every time
             // another session boots its shell, so without sessionId we'd route

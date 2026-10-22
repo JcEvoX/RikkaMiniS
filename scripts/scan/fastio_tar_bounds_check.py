@@ -298,6 +298,142 @@ def check_create_traversal(src):
     return v
 
 
+# ── [dv22-A2] §1042-A-02: the top-level root loop is a walk like any other ───
+#
+# `writeTree` has always charged the entry budget, but the loop around it did
+# not, in three ways that only bite when a ROOT is not a directory:
+#   1. no ceiling — `writeRegular` / `writeLink` on a top-level root bumped
+#      `visited` past `maxEntries` and nothing ever set `truncated`;
+#   2. `writeTree`'s `false` ("budget exhausted, stop the WHOLE traversal")
+#      was discarded, so roots after an exhausted tree were still archived;
+#   3. a top-level FIFO/socket went straight into `writeRegular`, whose
+#      `Files.newInputStream` blocks forever on a pipe with no writer — the
+#      worker thread is dead for the rest of the request.
+#
+# Three decision points are pinned, each against the DECISION:
+#   (a) a budget comparison on `out.visited` exists in the loop and fires
+#       BEFORE that iteration's first write call, setting `truncated` and
+#       `break`ing;
+#   (b) the `writeTree` return value is consumed with its polarity
+#       (`if (!writeTree(…)`) — a bare statement is the pre-fix shape;
+#   (c) the top-level non-directory write is gated on `Files.isRegularFile`
+#       and the non-regular residue is counted (`skippedSpecial++`), matching
+#       the `writeTree` child branch and tarCreate's own KDoc.
+#
+# The gate must NOT charge: `writeRegular` / `writeLink` / `writeTree` each do
+# their own `visited++`, so a `charge(` here would count one entry twice and
+# stop the walk at half the budget. `charge(` inside tarCreate is therefore a
+# violation, not an accepted spelling — that asymmetry (charge here, charge
+# there) is exactly what produces an off-by-N budget nobody can reason about.
+TOPLEVEL_GATE_BLOCK_RE = re.compile(
+    r"if\s*\([^)\n]*\.visited\s*>=\s*maxEntries\s*\)\s*\{(.*?)\}", re.DOTALL
+)
+TOPLEVEL_WRITE_CALLS = ("writeLink(", "writeRegular(", "writeTree(")
+TOPLEVEL_TREE_CONSUMED_RE = re.compile(r"!\s*writeTree\(|writeTree\([^;\n]*?\)\s*==\s*false")
+TOPLEVEL_REGULAR_GATE = "Files.isRegularFile("
+TOPLEVEL_SKIP_COUNT = "skippedSpecial++"
+
+def strip_kotlin_comments(text):
+    """Blank out // and /* */ comments, char-for-char (newlines kept), so a
+    criterion cannot be tripped — or hidden — by prose. Applied by the
+    top-level check only: its pre-fix shape (§1042-A-02) was first reported by
+    a comment that SAID `charge()` while the real call lived in writeTree."""
+    out = list(text)
+    i, n, in_block = 0, len(text), False
+    while i < n:
+        if in_block:
+            if text[i : i + 2] == "*/":
+                out[i] = out[i + 1] = " "
+                i += 2
+                in_block = False
+            else:
+                if text[i] != "\n":
+                    out[i] = " "
+                i += 1
+        elif text[i : i + 2] == "/*":
+            in_block = True
+            out[i] = out[i + 1] = " "
+            i += 2
+        elif text[i : i + 2] == "//":
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            for k in range(i, j):
+                out[k] = " "
+            i = j
+        else:
+            i += 1
+    return "".join(out)
+
+def check_toplevel_roots(src):
+    v = []
+    raw = tar_fun_body(src, "tarCreate")
+    if raw is None:
+        return ["tarCreate must exist in FastioTar.kt (required function missing)"]
+    body = strip_kotlin_comments(raw)
+
+    # (a) the budget gate: exists, stops the walk, and precedes the writes.
+    gate = TOPLEVEL_GATE_BLOCK_RE.search(body)
+    if gate is None:
+        v.append(
+            "tarCreate's root loop has no entry-budget gate — a top-level root (file or "
+            "symlink) is written past maxEntries and truncated is never set"
+        )
+    else:
+        block = gate.group(1)
+        if "truncated = true" not in block:
+            v.append("the root-loop budget gate must set out.truncated (a silent over-budget archive)")
+        if not re.search(r"\bbreak\b", block):
+            v.append(
+                "the root-loop budget gate must break the loop — continuing keeps writing the "
+                "remaining roots after the budget is gone"
+            )
+        first_write = min((body.find(w) for w in TOPLEVEL_WRITE_CALLS if body.find(w) >= 0),
+                          default=-1)
+        if 0 <= first_write < gate.start():
+            v.append(
+                "the root-loop budget gate sits AFTER the first write call — the root that "
+                "exhausts the budget is still archived"
+            )
+    # The gate compares; the writers charge. Charging both double-counts.
+    if re.search(r"\bcharge\(", body):
+        v.append(
+            "tarCreate charges the budget itself — writeRegular/writeLink/writeTree already "
+            "do `visited++`, so the walk stops at half maxEntries (and the gate must only compare)"
+        )
+
+    # (b) writeTree's false means "stop the whole traversal".
+    tree_calls = [m for m in re.finditer(r"writeTree\(", body)]
+    if not tree_calls:
+        v.append("tarCreate no longer calls writeTree — re-point this rule before trusting it")
+    for m in tree_calls:
+        pre = body[max(0, m.start() - 8):m.start()]
+        consumed = re.search(r"!\s*$", pre) is not None
+        if not consumed:
+            consumed = TOPLEVEL_TREE_CONSUMED_RE.search(body, m.start() - 1) is not None
+        if not consumed:
+            v.append(
+                "tarCreate discards writeTree's return value — `false` means the budget ran out "
+                "and the remaining roots must NOT be archived"
+            )
+            break
+
+    # (c) a top-level non-directory is only read when it IS a regular file.
+    regular_at = body.find(TOPLEVEL_REGULAR_GATE)
+    write_regular_at = body.find("writeRegular(")
+    if regular_at < 0:
+        v.append(
+            "tarCreate writes a top-level non-directory without checking Files.isRegularFile — "
+            "a FIFO has no writer, so newInputStream blocks the worker thread forever"
+        )
+    elif write_regular_at >= 0 and regular_at > write_regular_at:
+        v.append("the isRegularFile gate sits AFTER writeRegular — it cannot prevent the open")
+    if TOPLEVEL_SKIP_COUNT not in body:
+        v.append(
+            "a top-level special file (FIFO/socket/device) is not counted in skippedSpecial — "
+            "the archive silently lacks it, against tarCreate's own KDoc"
+        )
+    return v
+
 def run(root):
     violations = []
     tar_path = os.path.join(root, TAR_REL)
@@ -309,6 +445,7 @@ def run(root):
     violations += check_tar(tar_src)
     violations += check_write_regular(tar_src)
     violations += check_create_traversal(tar_src)
+    violations += check_toplevel_roots(tar_src)
     if not os.path.isfile(handler_path):
         return 2
     with open(handler_path, encoding="utf-8") as f:
@@ -579,6 +716,100 @@ BAD_TREE_UNSORTED = GOOD_TREE.replace(
 # marker gone: the rule must fail closed, not silently pass.
 BAD_TREE_RENAMED = GOOD_TREE.replace("private fun writeTree(", "private fun walkDir(")
 
+# ── [dv22-A2] §1042-A-02: top-level root loop fixtures ──────────────────────
+GATE_BLOCK = """        if (out.visited >= maxEntries) {
+            out.truncated = true
+            break
+        }
+"""
+
+GOOD_TOPLEVEL = """
+internal fun tarCreate(
+    sink: OutputStream,
+    roots: List<Pair<Path, String>>,
+    maxEntries: Long,
+    out: TarCreateOutcome,
+) {
+    for ((path, memberPrefix) in roots) {
+        val name = tarMemberName(memberPrefix)
+        if (out.visited >= maxEntries) {
+            out.truncated = true
+            break
+        }
+        if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
+            out.errors.add("$memberPrefix: not found")
+            continue
+        }
+        if (Files.isSymbolicLink(path)) {
+            writeLink(sink, name, path, out)
+            continue
+        }
+        if (!Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)) {
+            if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+                out.skippedSpecial++
+                if (out.skippedNames.size < MAX_REPORTED_SKIPS) out.skippedNames.add(name)
+                continue
+            }
+            writeRegular(sink, name, path, out)
+            continue
+        }
+        try {
+            if (!writeTree(sink, path, name, path, maxEntries, out)) break
+        } catch (e: Exception) {
+            out.errors.add("$memberPrefix: ${e.message}")
+        }
+    }
+    sink.write(ByteArray(BLOCK_SIZE * 2))
+    sink.flush()
+}
+
+private fun writeTree(sink: OutputStream, dir: Path): Boolean = true
+"""
+
+# pre-fix shape (§1042-A-02): no gate at all — roots are written past the budget.
+BAD_TOPLEVEL_NO_GATE = GOOD_TOPLEVEL.replace(GATE_BLOCK, "")
+
+# half-fix: the gate exists but reports nothing.
+BAD_TOPLEVEL_NO_TRUNCATED = GOOD_TOPLEVEL.replace(
+    "            out.truncated = true\n            break", "            break"
+)
+
+# half-fix: the gate keeps SCANNING instead of stopping — later roots still write.
+BAD_TOPLEVEL_CONTINUE = GOOD_TOPLEVEL.replace(
+    "            out.truncated = true\n            break", "            out.truncated = true\n            continue"
+)
+
+# half-fix: the gate lives after the first writer, so the budget-exhausting
+# root itself is still archived.
+BAD_TOPLEVEL_GATE_AFTER_WRITE = GOOD_TOPLEVEL.replace(GATE_BLOCK, "").replace(
+    "            writeLink(sink, name, path, out)\n            continue",
+    "            writeLink(sink, name, path, out)\n            continue\n"
+    "        if (out.visited >= maxEntries) {\n"
+    "            out.truncated = true\n"
+    "            break\n"
+    "        }",
+)
+
+# double-charge shape: the gate charges, the writer charges again.
+BAD_TOPLEVEL_CHARGES = GOOD_TOPLEVEL.replace(
+    GATE_BLOCK, "        if (charge(out, maxEntries)) break\n"
+)
+
+# pre-fix shape: writeTree's budget-exhausted `false` is discarded.
+BAD_TOPLEVEL_IGNORED_RETURN = GOOD_TOPLEVEL.replace(
+    "            if (!writeTree(sink, path, name, path, maxEntries, out)) break",
+    "            writeTree(sink, path, name, path, maxEntries, out)",
+)
+
+# pre-fix shape: a top-level FIFO goes straight into writeRegular.
+BAD_TOPLEVEL_UNCHECKED_SPECIAL = GOOD_TOPLEVEL.replace(
+    """            if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+                out.skippedSpecial++
+                if (out.skippedNames.size < MAX_REPORTED_SKIPS) out.skippedNames.add(name)
+                continue
+            }
+""", "")
+
 
 def selftest():
     failures = []
@@ -709,6 +940,27 @@ def selftest():
                      " * whatever order the directory stream hands them over.\n"
                      " */\nprivate fun writeTree(")))
 
+    # ── [dv22-A2] §1042-A-02: the top-level root loop ───────────────────────
+    good_top = check_toplevel_roots(GOOD_TOPLEVEL)
+    expect_clean("compliant top-level fixture (dv22-A2)", good_top)
+    bad_top_no_gate = check_toplevel_roots(BAD_TOPLEVEL_NO_GATE)
+    expect_trip("no-gate fixture (dv22-A2)", bad_top_no_gate, "no entry-budget gate")
+    bad_top_no_trunc = check_toplevel_roots(BAD_TOPLEVEL_NO_TRUNCATED)
+    expect_trip("silent gate fixture (dv22-A2)", bad_top_no_trunc, "must set out.truncated")
+    bad_top_continue = check_toplevel_roots(BAD_TOPLEVEL_CONTINUE)
+    expect_trip("scan-instead-of-stop fixture (dv22-A2)", bad_top_continue, "must break the loop")
+    bad_top_after_write = check_toplevel_roots(BAD_TOPLEVEL_GATE_AFTER_WRITE)
+    expect_trip("gate-after-write fixture (dv22-A2)", bad_top_after_write, "AFTER the first write")
+    bad_top_charges = check_toplevel_roots(BAD_TOPLEVEL_CHARGES)
+    expect_trip("double-charge fixture (dv22-A2)", bad_top_charges, "charges the budget itself")
+    bad_top_ignored = check_toplevel_roots(BAD_TOPLEVEL_IGNORED_RETURN)
+    expect_trip("discarded-return fixture (dv22-A2)", bad_top_ignored, "discards writeTree's return")
+    bad_top_unchecked = check_toplevel_roots(BAD_TOPLEVEL_UNCHECKED_SPECIAL)
+    expect_trip("unchecked-special fixture (dv22-A2)", bad_top_unchecked,
+                "without checking Files.isRegularFile")
+    bad_top_missing = check_toplevel_roots("object FastioTar { }")
+    expect_trip("missing-tarCreate fixture (dv22-A2)", bad_top_missing, "required function missing")
+
     print("selftest compliant tar          -> %d violation(s)" % len(good_tar))
     print("selftest compliant handler      -> %d violation(s)" % len(good_handler))
     print("selftest stale ceiling         -> %d violation(s)" % len(bad_stale))
@@ -721,6 +973,11 @@ def selftest():
     print("selftest writeRegular shapes    -> %d / %d / %d / %d / %d violation(s)"
           % (len(bad_regular_order), len(bad_regular_norefill), len(bad_regular_unguarded),
              len(bad_regular_silent), len(bad_regular_missing)))
+    print("selftest compliant top-level    -> %d violation(s)" % len(good_top))
+    print("selftest top-level shapes       -> %d / %d / %d / %d / %d / %d / %d / %d violation(s)"
+          % (len(bad_top_no_gate), len(bad_top_no_trunc), len(bad_top_continue),
+             len(bad_top_after_write), len(bad_top_charges), len(bad_top_ignored),
+             len(bad_top_unchecked), len(bad_top_missing)))
 
     if failures:
         for f in failures:

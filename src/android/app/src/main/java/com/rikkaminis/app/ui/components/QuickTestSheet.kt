@@ -58,6 +58,7 @@ import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.model.normalizeModalityName
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.provider.ModelsDevApi
 import com.rikkaminis.app.util.ImageDecoding
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -136,7 +137,11 @@ private class QuickTestRun(val kind: QuickTestKind) {
  * if nothing matches we fall back to text so there is always one test.
  */
 private fun applicableKinds(entry: ModelEntry): List<QuickTestKind> {
-    val model = entry.model
+    // [dv22/B-03] Capability source is the effective model (models.dev enrichment
+    // under the user's overrides), not the raw `entry.model`: the built-in
+    // catalog declares no modality fields, so every built-in looked text-only and
+    // the image/speech/transcription quick tests never showed up.
+    val model = ModelsDevApi.effectiveModel(entry)
     val outputs = (model.outputModalities ?: emptyList()).map { it.normalizeModalityName() }
     val inputs = (model.inputModalities ?: emptyList()).map { it.normalizeModalityName() }
     val kinds = mutableListOf<QuickTestKind>()

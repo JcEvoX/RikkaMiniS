@@ -53,6 +53,11 @@ SHEET_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/preview/WebPrev
 MD_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/StreamingMarkdownText.kt"
 HOLDER_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/preview/WebViewHolder.kt"
 UI_ROOT_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui"
+# [dv22/B-06] the markdown media pipeline: one classifier, one parser, the
+# gallery collector and the image fetcher.
+MEDIA_MODEL_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/MarkdownBlockModel.kt"
+MEDIA_PARSER_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/markdown/MarkdownParser.kt"
+CHAT_SCREEN_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatScreen.kt"
 
 # relpath (repo-root-relative, forward slashes) -> max allowed occurrences
 ALLOWLIST = {
@@ -192,6 +197,144 @@ def analyse(sheet_code, md_code, holder_code, ui_codes):
             results.append(
                 ("F4 no Uri.parse(...).path in %s" % os.path.basename(rel), False,
                  "found %d occurrence(s) — route file:// paths through ui.chat.decodeUriPath" % n, None))
+
+    # --- F5: one media classifier [dv22/B-06] ---------------------------
+    results.extend(check_media_single_source(ui_codes))
+    return results
+
+
+# ------------------------------------------------- media single source [dv22] --
+MEDIA_KIND_FUNS = ("mediaKindOfUrl", "mediaPathOfUrl", "mediaFileNameOfUrl")
+
+
+def _block_after(code, needle):
+    """The `{...}` body that follows the first occurrence of needle ('' if absent)."""
+    i = code.find(needle)
+    if i < 0:
+        return ""
+    j = code.find("{", i)
+    if j < 0:
+        return ""
+    depth = 0
+    for k in range(j, len(code)):
+        ch = code[k]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return code[j:k + 1]
+    return code[j:]
+
+
+def _stmt_after(code, needle, span=400):
+    """The statement that follows needle, cut at the next top-level fun."""
+    i = code.find(needle)
+    if i < 0:
+        return ""
+    tail = code[i:i + span]
+    m = re.search(r"\n(?:internal |private )?fun ", tail[1:])
+    return tail[:m.start() + 1] if m else tail
+
+
+def _declares_media_set(code):
+    """A hand-written media extension set: `setOf(` within reach of an mp4 token."""
+    for m in re.finditer(r"setOf\(", code):
+        if '"mp4"' in code[m.start():m.start() + 240]:
+            return True
+    return False
+
+
+def check_media_single_source(ui_codes):
+    """[dv22/B-06] Markdown media classification must have ONE decision point.
+
+    Before this family, five surfaces each decided "video / audio / image" on
+    their own: the block classifier, the inline splitter, the block parser (its
+    own ext sets), the gallery collector (assumed image) and the image fetcher
+    (assumed image). A URL form that one of them handled (`clip.mp4?t=1`) fell
+    through the others, so the same message rendered as a video card in one path
+    and as a broken image in another. These criteria pin the *decision points*
+    (not the spelling): one extension table, one classifier, query cut before
+    the extension read, `#` cut only for http(s), and absolute-path guards on
+    every minis:// decode.
+    """
+    results = []
+    classifier = ui_codes.get(MEDIA_MODEL_REL)
+    parser = ui_codes.get(MEDIA_PARSER_REL)
+    chat = ui_codes.get(CHAT_SCREEN_REL)
+    cls, par, cht = classifier or "", parser or "", chat or ""
+
+    # F5a: exactly one media extension table, and it lives in the classifier.
+    offenders = []
+    for rel in sorted(ui_codes):
+        if rel == MEDIA_MODEL_REL:
+            continue
+        if rel in (MEDIA_PARSER_REL,) and _declares_media_set(ui_codes[rel]):
+            offenders.append(os.path.basename(rel))
+    has_table = ('nativeVideoExts' in cls and '"mp4"' in cls
+                 and 'nativeAudioExts' in cls and '"mp3"' in cls)
+    ok5a = bool(classifier) and has_table and not offenders
+    results.append((
+        "F5a media extension table declared once, in MarkdownBlockModel.kt",
+        ok5a,
+        "classifier table=%s; other media-side copies=%s" % (has_table, offenders or "none"),
+        None))
+
+    # F5b: one classifier — ext read sits on mediaFileNameOfUrl, which cuts the
+    # query first; the parser owns no ext read and delegates by name.
+    kind_body = _block_after(cls, "fun mediaKindOfUrl")
+    # expression-bodied (no braces): use the statement, not a brace body.
+    name_body = _stmt_after(cls, "fun mediaFileNameOfUrl")
+    path_body = _block_after(cls, "fun mediaPathOfUrl")
+    kind_ok = ("mediaFileNameOfUrl(" in kind_body and "substringAfterLast" in kind_body)
+    name_ok = "mediaPathOfUrl(" in name_body
+    path_ok = "substringBefore('?')" in path_body
+    parser_own_ext = 'substringAfterLast(".", "")' in par or "substringAfterLast('.', "")" in par
+    parser_delegates = "mediaKindOfUrl(" in par
+    ok5b = (bool(kind_body) and bool(name_body) and bool(path_body)
+            and kind_ok and name_ok and path_ok and not parser_own_ext and parser_delegates)
+    results.append((
+        "F5b ext read after query cut, parser delegates to mediaKindOfUrl",
+        ok5b,
+        "kind=%s name=%s path=%s parser_own_ext=%s parser_delegates=%s"
+        % (kind_ok, name_ok, path_ok, parser_own_ext, parser_delegates),
+        None))
+
+    # F5c: `#` is a fragment only for http(s); in a local/minis path it may be
+    # part of the file name (`foo#China.mp4`), so cutting it there mangles files.
+    unguarded = []
+    for m in re.finditer(r"substringBefore\('#", cls):
+        window = cls[max(0, m.start() - 400):m.start()]
+        if 'startsWith("http' not in window:
+            unguarded.append(m.start())
+    parser_hash = "substringBefore('#')" in par
+    chat_chain = "substringBefore('?').substringBefore('#')" in cht
+    ok5c = bool(cls) and not unguarded and not parser_hash and not chat_chain
+    results.append((
+        "F5c '#' cut only inside an http(s) branch; local paths keep it",
+        ok5c,
+        "unguarded_cls=%s parser_cut=%s chat_chain=%s"
+        % (unguarded or "none", parser_hash, chat_chain),
+        None))
+
+    # F5d: `minis:///var/minis/x` decodes to an ABSOLUTE guest path; the sites
+    # that prepend "/var/minis/" must keep absolute paths untouched.
+    guarded = 0
+    unguarded_sites = []
+    for rel in sorted(ui_codes):
+        for line in ui_codes[rel].splitlines():
+            if '"/var/minis/$decoded"' not in line:
+                continue
+            if 'startsWith("/")' in line:
+                guarded += 1
+            else:
+                unguarded_sites.append(os.path.basename(rel))
+    ok5d = not unguarded_sites and guarded >= 1
+    results.append((
+        "F5d decoded minis:// path is absolute-guarded before use",
+        ok5d,
+        "guarded=%d unguarded=%s" % (guarded, unguarded_sites or "none"),
+        None))
     return results
 
 
@@ -270,6 +413,84 @@ fun abs(url: String): String = Uri.parse(url).path.orEmpty()
 """
 
 
+MEDIA_CLASSIFIER_CLEAN = """package probe
+
+internal enum class MediaKind { IMAGE, VIDEO, AUDIO }
+
+internal val nativeVideoExts = setOf("mp4", "mov", "m4v")
+internal val nativeAudioExts = setOf("mp3", "m4a")
+
+internal fun mediaKindOfUrl(url: String): MediaKind {
+    val ext = mediaFileNameOfUrl(url).substringAfterLast('.', "").lowercase()
+    return when (ext) {
+        in nativeVideoExts -> MediaKind.VIDEO
+        in nativeAudioExts -> MediaKind.AUDIO
+        else -> MediaKind.IMAGE
+    }
+}
+
+internal fun mediaPathOfUrl(url: String): String {
+    val noQuery = url.substringBefore('?')
+    return if (noQuery.startsWith("http://") || noQuery.startsWith("https://")) {
+        noQuery.substringBefore('#')
+    } else {
+        noQuery
+    }
+}
+
+internal fun mediaFileNameOfUrl(url: String): String =
+    mediaPathOfUrl(url).substringAfterLast('/')
+"""
+
+MEDIA_PARSER_CLEAN = """package probe
+
+internal fun mediaBlockFor(alt: String, url: String) = when (mediaKindOfUrl(url)) {
+    MediaKind.VIDEO -> "video"
+    MediaKind.AUDIO -> "audio"
+    MediaKind.IMAGE -> "image"
+}
+"""
+
+CHAT_SCREEN_CLEAN = """package probe
+
+internal fun collectImages(src: String): List<String> {
+    val path = mediaPathOfUrl(src)
+    if (mediaKindOfUrl(src) != MediaKind.IMAGE) return emptyList()
+    return listOf(mediaFileNameOfUrl(src))
+}
+"""
+
+IMAGE_FETCHER_CLEAN = """package probe
+
+internal fun resolve(decoded: String): java.io.File {
+    val linuxPath = if (decoded.startsWith("/")) decoded else "/var/minis/$decoded"
+    return java.io.File(linuxPath)
+}
+"""
+
+BREAKER_CLASSIFIER_HASH = MEDIA_CLASSIFIER_CLEAN.replace(
+    "    return if (noQuery.startsWith(\"http://\") || noQuery.startsWith(\"https://\")) {\n"
+    "        noQuery.substringBefore('#')",
+    "    return if (true) {\n"
+    "        noQuery.substringBefore('#')")
+
+BREAKER_PARSER_SET = MEDIA_PARSER_CLEAN.replace(
+    "internal fun mediaBlockFor",
+    "private val parserExts = setOf(\"mp4\", \"mov\")\n\ninternal fun mediaBlockFor")
+
+BREAKER_PARSER_EXT = MEDIA_PARSER_CLEAN.replace(
+    "when (mediaKindOfUrl(url))",
+    "when (url.substringAfterLast('.', \"\"))")
+
+BREAKER_CHAT_CHAIN = CHAT_SCREEN_CLEAN.replace(
+    "val path = mediaPathOfUrl(src)",
+    "val path = src.substringBefore('?').substringBefore('#')")
+
+BREAKER_FETCHER_UNGURARDED = IMAGE_FETCHER_CLEAN.replace(
+    'val linuxPath = if (decoded.startsWith("/")) decoded else "/var/minis/$decoded"',
+    'val linuxPath = "/var/minis/$decoded"')
+
+
 def selftest():
     failures = []
 
@@ -284,6 +505,10 @@ def selftest():
             "src/android/app/src/main/java/com/rikkaminis/app/ui/preview/WebViewHolder.kt": FIXED_HOLDER,
             "src/android/app/src/main/java/com/rikkaminis/app/ui/preview/WebPreviewShortcut.kt": ALLOWLISTED_AS_IS,
             "src/android/app/src/main/java/com/rikkaminis/app/ui/preview/Other.kt": CLEAN_UI_FILE,
+            MEDIA_MODEL_REL: MEDIA_CLASSIFIER_CLEAN,
+            MEDIA_PARSER_REL: MEDIA_PARSER_CLEAN,
+            CHAT_SCREEN_REL: CHAT_SCREEN_CLEAN,
+            "src/android/app/src/main/java/com/rikkaminis/app/ui/MinisImageFetcher.kt": IMAGE_FETCHER_CLEAN,
         }
         if extra:
             ui.update(extra)
@@ -346,6 +571,45 @@ def selftest():
     n_clean = count_uri_parse_path(strip_comments(CLEAN_UI_FILE))
     expect(n_clean == 0, "host/plain Uri.parse uses must not count as violations (got %d)" % n_clean)
 
+    # mutation 6: classifier cuts '#' unconditionally -> F5c red only
+    m6 = analyse(FIXED_SHEET, FIXED_MD, FIXED_HOLDER, dict_of({MEDIA_MODEL_REL: BREAKER_CLASSIFIER_HASH}))
+    d6 = {c: ok for c, ok, _, _ in m6}
+    expect(not d6["F5c '#' cut only inside an http(s) branch; local paths keep it"],
+           "mut6 F5c must be RED when '#' is cut unconditionally")
+    expect(d6["F5a media extension table declared once, in MarkdownBlockModel.kt"],
+           "mut6 F5a must stay GREEN (precision)")
+
+    # mutation 7: parser keeps its own extension set -> F5a red only
+    m7 = analyse(FIXED_SHEET, FIXED_MD, FIXED_HOLDER, dict_of({MEDIA_PARSER_REL: BREAKER_PARSER_SET}))
+    d7 = {c: ok for c, ok, _, _ in m7}
+    expect(not d7["F5a media extension table declared once, in MarkdownBlockModel.kt"],
+           "mut7 F5a must be RED when the parser declares its own set")
+    expect(d7["F5c '#' cut only inside an http(s) branch; local paths keep it"],
+           "mut7 F5c must stay GREEN (precision)")
+
+    # mutation 8: parser reads the extension itself -> F5b red
+    m8 = analyse(FIXED_SHEET, FIXED_MD, FIXED_HOLDER, dict_of({MEDIA_PARSER_REL: BREAKER_PARSER_EXT}))
+    d8 = {c: ok for c, ok, _, _ in m8}
+    expect(not d8["F5b ext read after query cut, parser delegates to mediaKindOfUrl"],
+           "mut8 F5b must be RED when the parser owns an ext read")
+
+    # mutation 9: gallery re-grows the query+fragment chain -> F5c red
+    m9 = analyse(FIXED_SHEET, FIXED_MD, FIXED_HOLDER, dict_of({CHAT_SCREEN_REL: BREAKER_CHAT_CHAIN}))
+    d9 = {c: ok for c, ok, _, _ in m9}
+    expect(not d9["F5c '#' cut only inside an http(s) branch; local paths keep it"],
+           "mut9 F5c must be RED for the chat-side query+fragment chain")
+
+    # mutation 10: fetcher prepends /var/minis/ to an absolute path -> F5d red
+    m10 = analyse(FIXED_SHEET, FIXED_MD, FIXED_HOLDER, dict_of({
+        "src/android/app/src/main/java/com/rikkaminis/app/ui/MinisImageFetcher.kt": BREAKER_FETCHER_UNGURARDED}))
+    d10 = {c: ok for c, ok, _, _ in m10}
+    expect(not d10["F5d decoded minis:// path is absolute-guarded before use"],
+           "mut10 F5d must be RED when the absolute-path guard is dropped")
+
+    # precision: the classifier's mediaBlockFrom must not be judged as a set copy
+    expect(count_uri_parse_path(MEDIA_CLASSIFIER_CLEAN) == 0,
+           "fixture precision: the clean classifier parses no Uri")
+
     if failures:
         print("SELFTEST FAIL:")
         for f in failures:
@@ -353,7 +617,8 @@ def selftest():
         return 1
     print("selftest: fixed-tree=GREEN, sheet-revert=RED, md-revert=RED, "
           "holder-cut-removed=RED, new-offender=RED, stale-allowlist=RED, "
-          "host-precision=GREEN")
+          "host-precision=GREEN, media-hash-cut=RED, media-set-fork=RED, "
+          "media-parser-ext=RED, media-chat-chain=RED, media-abs-guard=RED")
     return 0
 
 

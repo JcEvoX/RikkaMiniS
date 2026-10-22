@@ -117,6 +117,22 @@ class BrowserTabPoolSaveStateTest {
         val body = bodyOf(poolSrc(), "suspend fun closeTabFromUI(")
         assertTrue(
             "closeTabFromUI lost its saveState( — the window.close path mirrors it",
-            body.contains("saveState("))
+            body.contains("saveState(")
+        )
+    }
+
+    // [dv22-B2] The six destroy paths must also re-derive the busy flag after
+    // their _tabs.value write; the full six-path family lives in
+    // BrowserTabPoolBusyPublishTest — this anchor pins the UI close path here
+    // so the persistence probe fails loudly if the busy publish and the
+    // saveState are ever separated.
+    @Test
+    fun `ui close path keeps its busy re-derivation (dv22-B2 sibling anchor)`() {
+        val body = bodyOf(poolSrc(), "suspend fun closeTabFromUI(")
+        assertTrue(
+            "closeTabFromUI lost its publishAgentBusy( — agentBusy freezes at true " +
+                "when the closed tab was the last in-use one and the sheet stays stuck",
+            body.contains("publishAgentBusy(")
+        )
     }
 }

@@ -360,6 +360,161 @@ def _fn_body_after(code: str, decl_re) -> "str | None":
     return None if end is None else code[open_idx : end + 1]
 
 
+# [deep-audit-1042 A-05] criterion 14 — the headless session-ready barrier.
+# `ChatSessionLifecycle.loadSession` is a TWO-STEP publish: step 1 flips
+# `_activeEntryId` (ChatSessionLifecycle:423) and the RPC layer's existing
+# readiness wait keys on it; step 2 reads the messages on IO (:477) and only
+# its `finally` flips `_sessionLoaded` (:786). Every headless entry that hands
+# the ViewModel a message/block id and lets it mutate the in-memory turn state
+# therefore has a window in which the id resolves to nothing:
+# `retryFromMessage` returns on `index < 0`, `rerunFromToolBlock` returns false
+# (or returns TRUE through its degenerate branch while `retryFromMessage`
+# drops), the compactor sees an empty history, and `revertCompact` reads a
+# `_cachedLatestMarker` that is still null. The runner used to report
+# `Completed` for all of that — the wait loop exits immediately because no
+# stream was ever claimed.
+#
+# The criterion binds the DECISION (await the latch before the mutation), not
+# one spelling: the wait must (a) sit in the same member function, (b) precede
+# the mutation call, (c) be wrapped in an off-Main hop — waiting on Main
+# deadlocks the load that flips the latch, and (d) be bounded — an unbounded
+# wait pins the RPC connection forever. The entry set is DERIVED by scanning
+# function bodies for the mutation calls, so a new entry is covered the moment
+# it is written and a renamed one does not silently escape (gate criterion 11
+# of §8.7: never hardcode the member count).
+RE_RUNNER_MEMBER_FUN = re.compile(r"(?m)^    (?:private |internal )?(?:suspend )?fun (\w+)\s*\(")
+RUNNER_STATE_MUTATORS = (
+    "vm.sendMessage(",
+    "vm.retryFromMessage(",
+    "vm.rerunFromToolBlock(",
+    "vm.compactBefore(",
+    "vm.revertCompact(",
+    "vm.runCompactNow(",
+)
+RUNNER_BARRIER_WAIT = "sessionLoaded.first"
+RUNNER_OFFMAIN_HOP = "withContext(Dispatchers.Default)"
+RUNNER_BOUND_WAIT = "withTimeoutOrNull("
+
+
+def _body_span_after(code: str, paren_hint: int) -> "tuple[int, int] | None":
+    """Span `(start, end)` of the `{ … }` following the parameter list.
+
+    Same walk as `_fn_body_after` (past the balanced parameter parentheses,
+    then the first brace block), but keyed on a position instead of a regex,
+    so it can be run over every member declaration of a file. Accepts both a
+    block body and an expression body whose trailing lambda IS the body
+    (`… = withContext(Dispatchers.Main) { … }`). Fail-closed: `None` when the
+    parentheses or braces do not balance.
+    """
+    i = code.find("(", paren_hint)
+    if i == -1:
+        return None
+    depth = 0
+    n = len(code)
+    while i < n:
+        c = code[i]
+        if c == '"' or c == "'":
+            i = _skip_string_literal(code, i)
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                i += 1
+                break
+        i += 1
+    else:
+        return None
+    open_idx = code.find("{", i)
+    if open_idx == -1:
+        return None
+    end = _match_brace(code, open_idx)
+    return None if end is None else (open_idx, end + 1)
+
+
+def _runner_member_spans(code: str) -> "list[tuple[str, int, int]]":
+    """(name, body_start, body_end) for every member function in [code]."""
+    spans = []
+    for m in RE_RUNNER_MEMBER_FUN.finditer(code):
+        span = _body_span_after(code, m.end() - 1)
+        if span is None:
+            continue
+        spans.append((m.group(1), span[0], span[1]))
+    return spans
+
+
+def _offmain_bounded_blocks(prefix: str) -> "list[tuple[int, int]]":
+    """Spans of every `withContext(Dispatchers.Default) { … }` inside [prefix]."""
+    blocks = []
+    pos = 0
+    while True:
+        d = prefix.find(RUNNER_OFFMAIN_HOP, pos)
+        if d == -1:
+            break
+        pos = d + 1
+        brace = prefix.find("{", d)
+        if brace == -1:
+            continue
+        end = _match_brace(prefix, brace)
+        if end is None:
+            continue
+        blocks.append((brace, end + 1))
+    return blocks
+
+
+def _session_barrier_violations(code: str) -> "list[str]":
+    out: "list[str]" = []
+    spans = _runner_member_spans(code)
+    for token in RUNNER_STATE_MUTATORS:
+        idx = 0
+        while True:
+            j = code.find(token, idx)
+            if j == -1:
+                break
+            idx = j + 1
+            owner = None
+            for name, s, e in spans:
+                if s <= j < e:
+                    owner = (name, s)
+                    break
+            if owner is None:
+                out.append(
+                    "HeadlessChatRunner.kt: `%s` no longer sits inside a member "
+                    "function body — criterion 14 cannot prove the caller awaits "
+                    "`sessionLoaded` before it (re-anchor, do not drop it)" % token[:-1]
+                )
+                continue
+            name, body_start = owner
+            prefix = code[body_start:j]
+            if RUNNER_BARRIER_WAIT not in prefix:
+                out.append(
+                    "HeadlessChatRunner.kt: `%s` mutates the ViewModel's in-memory "
+                    "turn state at `%s` without awaiting the `sessionLoaded` latch "
+                    "first — `_activeEntryId` flips at load step 1 and the latch only "
+                    "at step 2's finally, so in that window the id resolves to "
+                    "nothing, the mutation drops silently, and the settle branch "
+                    "reports Completed for a run that never began"
+                    % (name, token[:-1])
+                )
+                continue
+            k = prefix.rfind(RUNNER_BARRIER_WAIT)
+            covered = any(
+                b < k < e and RUNNER_BOUND_WAIT in prefix[b:e]
+                for b, e in _offmain_bounded_blocks(prefix)
+            )
+            if not covered:
+                out.append(
+                    "HeadlessChatRunner.kt: the `sessionLoaded` wait in `%s` is not "
+                    "a BOUNDED OFF-MAIN hop — it must sit inside "
+                    "`withContext(Dispatchers.Default) { withTimeoutOrNull(…) { … } }`. "
+                    "Waiting on Main deadlocks the load that flips the latch; waiting "
+                    "without a timeout pins the RPC connection forever when the load "
+                    "never completes" % name
+                )
+    return out
+
+
 def _remember_derived_body(code: str, expr_start: int) -> "str | None":
     """Braced body of the `remember(…) { … }` behind a binding's right-hand side.
 
@@ -788,6 +943,12 @@ def check(root: Path) -> int:
                     "cancel"
                 )
 
+        # --- 14. [deep-audit-1042 A-05] every headless entry that mutates the
+        #     ViewModel's in-memory turn state awaits the `sessionLoaded`
+        #     latch BEFORE the mutation. Entry set is derived from the call
+        #     sites, so a new entry is covered without editing this gate. ---
+        errors.extend(_session_barrier_violations(runner))
+
     if errors:
         for e in errors:
             print(f"FAIL {e}")
@@ -956,6 +1117,95 @@ _RUNNER_MUTATIONS = (
      FIXTURE_RUNNER_RAW_KEY, _R_RESOLVED_ARG),
     ("resolver drops the cache fast path (MUT-R4)", FIXTURE_RUNNER_NO_FASTPATH, _R_CACHE_BLOCK),
     ("a renamed cancel anchor (MUT-R5)", FIXTURE_RUNNER_RENAMED, "suspend fun cancel("),
+)
+
+# --- criterion 14 [deep-audit-1042 A-05]: the session-ready barrier ----------
+# Faithful to the production shape of the four headless mutation entries: the
+# bounded off-Main wait on `sessionLoaded`, then the mutation, then the
+# "did a run actually start" read. Never compiled — the gate reads text.
+_R_BARRIER_WAIT_BLOCK = (
+    "        val sessionReady = withContext(Dispatchers.Default) {\n"
+    "            withTimeoutOrNull(5000L) { vm.sessionLoaded.first { it } }\n"
+    "        }\n"
+)
+_R_BARRIER_ERROR_BLOCK = (
+    "        if (sessionReady == null) {\n"
+    "            return@withContext PromptResult(status = \"Error\", "
+    "responseText = \"session_not_loaded_in_5s\")\n"
+    "        }\n"
+)
+_R_BARRIER_ENTRY = (
+    "\n"
+    "    suspend fun retry(context: Context, sessionId: String): PromptResult "
+    "= withContext(Dispatchers.Main) {\n"
+    "        val vm = viewModel(context, sessionId)\n"
+    + _R_BARRIER_WAIT_BLOCK
+    + _R_BARRIER_ERROR_BLOCK
+    + "        vm.retryFromMessage(messageId)\n"
+    "        val started = vm.isStreaming.value\n"
+    "        PromptResult(status = if (started) \"Completed\" else \"Error\")\n"
+    "    }\n"
+)
+_R_RUNNER_CLASS_TAIL = "    }\n}\n"
+
+# The green fixture = criterion-13's runner PLUS one barrier-bearing entry.
+# Built fail-closed: a fixture whose tail moved would otherwise produce a
+# silently unclosed class and a vacuous criterion.
+assert FIXTURE_RUNNER.endswith(_R_RUNNER_CLASS_TAIL), "runner fixture tail moved"
+FIXTURE_RUNNER_BARRIER = FIXTURE_RUNNER[: -len("}\n")] + _R_BARRIER_ENTRY + "}\n"
+
+# (name, dirty variant, anchor that must have been replaced)
+_RUNNER_BARRIER_MUTATIONS = (
+    (
+        "sessionLoaded barrier dropped entirely (MUT-B1)",
+        FIXTURE_RUNNER_BARRIER.replace(
+            _R_BARRIER_WAIT_BLOCK + _R_BARRIER_ERROR_BLOCK, ""),
+        _R_BARRIER_WAIT_BLOCK,
+    ),
+    (
+        "the wait runs on Main (MUT-B2)",
+        FIXTURE_RUNNER_BARRIER.replace(
+            _R_BARRIER_WAIT_BLOCK,
+            "        val sessionReady = withContext(Dispatchers.Unconfined) {\n"
+            "            withTimeoutOrNull(5000L) { vm.sessionLoaded.first { it } }\n"
+            "        }\n"),
+        _R_BARRIER_WAIT_BLOCK,
+    ),
+    (
+        "the wait is unbounded (MUT-B3)",
+        FIXTURE_RUNNER_BARRIER.replace(
+            _R_BARRIER_WAIT_BLOCK,
+            "        val sessionReady = withContext(Dispatchers.Default) {\n"
+            "            vm.sessionLoaded.first { it }\n"
+            "        }\n"),
+        _R_BARRIER_WAIT_BLOCK,
+    ),
+    (
+        "the barrier sits AFTER the mutation (MUT-B4)",
+        FIXTURE_RUNNER_BARRIER.replace(
+            "        val vm = viewModel(context, sessionId)\n"
+            + _R_BARRIER_WAIT_BLOCK
+            + _R_BARRIER_ERROR_BLOCK
+            + "        vm.retryFromMessage(messageId)\n",
+            "        val vm = viewModel(context, sessionId)\n"
+            "        vm.retryFromMessage(messageId)\n"
+            + _R_BARRIER_WAIT_BLOCK
+            + _R_BARRIER_ERROR_BLOCK),
+        "        vm.retryFromMessage(messageId)\n" + _R_BARRIER_WAIT_BLOCK,
+    ),
+    (
+        "a second mutation entry without the barrier (MUT-B5, derived set)",
+        FIXTURE_RUNNER_BARRIER[
+            : FIXTURE_RUNNER_BARRIER.rfind("}\n")
+        ] + (
+            "\n    suspend fun compact(context: Context, sessionId: String) "
+            "= withContext(Dispatchers.Main) {\n"
+            "        val vm = viewModel(context, sessionId)\n"
+            "        vm.runCompactNow()\n"
+            "    }\n"
+        ) + "}\n",
+        _R_RUNNER_CLASS_TAIL,
+    ),
 )
 
 # Each mutation is (name, fixture-mutator) applied to the GREEN fixture set.
@@ -1311,6 +1561,27 @@ def selftest() -> int:
             failures.append(f"criterion 13 {name}: gate stayed GREEN (no teeth)")
         else:
             print(f"selftest: criterion 13 {name} -> RED ({len(errs)} violation(s)) OK")
+
+    # --- criterion 14 [deep-audit-1042 A-05]: the session-ready barrier ---
+    # Backward compat: the fixture above (no mutator calls) proves the
+    # criterion stays vacuously GREEN on trees without the entries.
+    print("selftest: criterion 14 vacuous when no mutation entries exist (MUT-R fixtures) OK")
+
+    rc, errs = run_tree(screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY, FIXTURE_RUNNER_BARRIER)
+    if rc != 0:
+        failures.append(f"criterion 14 GREEN fixture unexpectedly red: {errs}")
+    else:
+        print("selftest: criterion 14 GREEN fixture passes")
+
+    for name, run_fixture, anchor in _RUNNER_BARRIER_MUTATIONS:
+        if run_fixture == FIXTURE_RUNNER_BARRIER:
+            failures.append(f"criterion 14 {name}: mutation is a no-op (anchor not found)")
+            continue
+        rc, errs = run_tree(screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY, run_fixture)
+        if rc == 0:
+            failures.append(f"criterion 14 {name}: gate stayed GREEN (no teeth)")
+        else:
+            print(f"selftest: criterion 14 {name} -> RED ({len(errs)} violation(s)) OK")
 
     if failures:
         print("\nselftest FAILURES:")

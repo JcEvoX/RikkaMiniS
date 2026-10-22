@@ -307,6 +307,35 @@ class MarkdownParserBlockStructureTest {
     }
 
     @Test
+    fun `query is stripped before the extension is read`() {
+        // [dv22/B-06] `clip.mp4?t=1` used to fall through to Image: the extension
+        // read produced "mp4?t=1", which is in neither extension set. The query
+        // must be cut first, in the one shared classifier.
+        assertTrue(parse("![clip](minis://workspace/clip.mp4?t=1)\n")[0] is Block.Video)
+        assertTrue(parse("![clip](minis://workspace/clip.mp4?raw=1)\n")[0] is Block.Video)
+        assertTrue(parse("![clip](https://x/clip.mp4?t=1)\n")[0] is Block.Video)
+    }
+
+    @Test
+    fun `hash is a filename character for local media`() {
+        // A local file may legally be named `foo#China.mp4`; cutting `#` on a
+        // minis:// path would mangle it. Only http(s) treats `#` as a fragment.
+        assertTrue(parse("![v](minis://workspace/foo#China.mp4)\n")[0] is Block.Video)
+    }
+
+    @Test
+    fun `absolute guest path media routes by extension`() {
+        assertTrue(parse("![v](/var/minis/workspace/clip.m4v)\n")[0] is Block.Video)
+        assertTrue(parse("![s](/var/minis/workspace/song.wav)\n")[0] is Block.Audio)
+    }
+
+    @Test
+    fun `non-ascii media filename keeps its url`() {
+        val img = parse("![图](minis://workspace/图片.png)\n")[0] as Block.Image
+        assertEquals("minis://workspace/图片.png", img.url)
+    }
+
+    @Test
     fun `image inline with text stays a paragraph`() {
         val p = parse("text ![a](u.png) more\n")[0] as Block.Paragraph
         assertEquals("text ![a](u.png) more", p.content)

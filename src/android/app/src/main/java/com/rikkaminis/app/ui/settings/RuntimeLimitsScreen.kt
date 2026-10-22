@@ -142,11 +142,15 @@ fun RuntimeLimitsScreen(onBack: () -> Unit) {
     // in AppearanceScreen's [T-backup-import-refresh] listener).
     //
     // This screen is the one where staleness is DATA-DESTRUCTIVE rather than
-    // cosmetic: Save writes back all ~34 knobs in one shot, so the sequence
+    // cosmetic: Save writes back all 40 knobs in one shot, so the sequence
     // "open page (old values) → change one slider → Save" silently rolls every
     // other field back to the values captured at open time — and
     // AgentRuntimeLimitsPrefs' write path refreshes its cache, so the rollback
     // takes effect at runtime immediately.
+    // [fix/dv22-b1-prefs-listener-filter] The re-read is now PER KEY (one
+    // `when (key)` arm per control) and Save captures its argument values into
+    // locals BEFORE the first write — see the [dv22-b1] comments at the
+    // listener and at Save for the synchronous-apply mechanics this closes.
     //
     // Deliberately NOT a shared abstraction: the three other screens that need
     // the same treatment each read a different prefs file with a different
@@ -154,59 +158,108 @@ fun RuntimeLimitsScreen(onBack: () -> Unit) {
     // of their key lists to be worth its weight.
     DisposableEffect(context) {
         val app = context.applicationContext
-        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
-            // [fix/da1026-prefs-priming] Prime FIRST, then read. SharedPreferencesImpl
-            // dispatches pending callbacks in unspecified order, so this
-            // screen's listener can run BEFORE ConfigBuiltins' own re-priming
-            // listener — without the primes here the getters below would read
-            // whatever cache state happened to be current, i.e. the value from
-            // before the write that just triggered this callback. And this
-            // screen's Save re-persists every knob it shows, so a stale read
-            // here is not cosmetic: it would silently roll the external write
-            // back on the next Save. (ConfigBuiltins primes too — this is the
+        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+            // [fix/da1026-prefs-priming] Prime FIRST, then read. SharedPreferencesImpl dispatches
+            // pending callbacks in unspecified order, so this screen's listener can run BEFORE
+            // ConfigBuiltins' own re-priming listener -- without the primes here the getters
+            // below would read whatever cache state happened to be current, i.e. the value from
+            // before the write that triggered this callback. And this screen's Save re-persists
+            // every knob it shows, so a stale read here is not cosmetic: it would silently roll
+            // the external write back on the next Save. (ConfigBuiltins primes too -- this is the
             // ordering-independent belt, not a duplicate of the core fix.)
             ConcurrencyPrefs.prime(app)
             AgentRuntimeLimitsPrefs.prime(app)
-            subagentEnabled = SubagentPrefs.isEnabled(context)
-            maxSessions = ConcurrencyPrefs.maxConcurrentSessions()
-            maxTurns = AgentRuntimeLimitsPrefs.maxTurns()
-            maxProviderAttempts = AgentRuntimeLimitsPrefs.maxProviderAttempts()
-            maxToolCalls = AgentRuntimeLimitsPrefs.maxToolCalls()
-            maxShellCommands = AgentRuntimeLimitsPrefs.maxShellCommands()
-            maxCompactionCalls = AgentRuntimeLimitsPrefs.maxCompactionCalls()
-            maxConcurrentTools = AgentRuntimeLimitsPrefs.maxConcurrentTools()
-            runDeadlineMin = AgentRuntimeLimitsPrefs.runDeadlineMinutes()
-            lengthWallContinues = AgentRuntimeLimitsPrefs.lengthWallContinues()
-            eofStubContinues = AgentRuntimeLimitsPrefs.eofStubContinues()
-            deterministicEmptyLimit = AgentRuntimeLimitsPrefs.deterministicEmptyLimit()
-            transientRetries = AgentRuntimeLimitsPrefs.transientRetries()
-            verifyNudges = AgentRuntimeLimitsPrefs.verifyNudges()
-            generationTimeoutMin = AgentRuntimeLimitsPrefs.generationTimeoutMinutes()
-            firstChunkDirectSec = AgentRuntimeLimitsPrefs.firstChunkDirectSec()
-            firstChunkProxySec = AgentRuntimeLimitsPrefs.firstChunkProxySec()
-            providerSlots = AgentRuntimeLimitsPrefs.providerSlots()
-            queueAdmission = AgentRuntimeLimitsPrefs.queueAdmission()
-            autoCompactMinTailTokens = AgentRuntimeLimitsPrefs.autoCompactMinTailTokens()
-            autoCompactMinIntervalMin = AgentRuntimeLimitsPrefs.autoCompactMinIntervalMin()
-            memoryInjectLines = AgentRuntimeLimitsPrefs.memoryInjectLines()
-            memoryRollupInjectKb = AgentRuntimeLimitsPrefs.memoryRollupInjectKb()
-            memorySearchLines = AgentRuntimeLimitsPrefs.memorySearchLines()
-            memoryLookbackDays = AgentRuntimeLimitsPrefs.memoryLookbackDays()
-            imageMaxPerImageMb = AgentRuntimeLimitsPrefs.imageMaxPerImageMb()
-            imageMaxTotalMb = AgentRuntimeLimitsPrefs.imageMaxTotalMb()
-            imageMaxRequestMb = AgentRuntimeLimitsPrefs.imageMaxRequestMb()
-            imageMaxEdgePx = AgentRuntimeLimitsPrefs.imageMaxEdgePx()
-            imageJpegQuality = AgentRuntimeLimitsPrefs.imageJpegQuality()
-            browserNavTimeoutSec = AgentRuntimeLimitsPrefs.browserNavTimeoutSec()
-            browserDomStableSec = AgentRuntimeLimitsPrefs.browserDomStableSec()
-            browserScreenshotQuality = AgentRuntimeLimitsPrefs.browserScreenshotQuality()
-            shellOutputKb = AgentRuntimeLimitsPrefs.shellOutputKb()
-            shellTimeoutSec = AgentRuntimeLimitsPrefs.shellTimeoutSec()
-            guestTmpMaxAgeMin = AgentRuntimeLimitsPrefs.guestTmpMaxAgeMin()
-            guestTmpSweepIntervalSec = AgentRuntimeLimitsPrefs.guestTmpSweepIntervalSec()
-            stallNoProgressSec = AgentRuntimeLimitsPrefs.stallNoProgressSec()
-            shellIdleTimeoutMin = AgentRuntimeLimitsPrefs.shellIdleTimeoutMin()
-            heavyGateTimeoutSec = AgentRuntimeLimitsPrefs.heavyGateTimeoutSec()
+            // [fix/dv22-b1-prefs-listener-filter] Re-read ONLY the control the changed key owns.
+            // AOSP SharedPreferencesImpl.apply() notifies registered listeners
+            // SYNCHRONOUSLY on the main thread (notifyListeners runs the callbacks inline before
+            // apply() returns), and Save writes three prefs files in one onClick -- the first
+            // apply() fires this listener before the later writes evaluate their arguments, so
+            // an unkeyed body that resets every state would make Save itself roll the user's
+            // other edits back to disk values (dv22-B-01). Per-key arms keep the external
+            // refresh behavior (minis-config / backup restore / the agent) for the ONE key that
+            // actually changed without ever touching the 39 other edit buffers.
+            when (key) {
+                SubagentPrefs.KEY_ENABLED ->
+                    subagentEnabled = SubagentPrefs.isEnabled(context)
+                ConcurrencyPrefs.KEY_MAX_CONCURRENT_SESSIONS ->
+                    maxSessions = ConcurrencyPrefs.maxConcurrentSessions()
+                AgentRuntimeLimitsPrefs.KEY_MAX_TURNS ->
+                    maxTurns = AgentRuntimeLimitsPrefs.maxTurns()
+                AgentRuntimeLimitsPrefs.KEY_MAX_PROVIDER_ATTEMPTS ->
+                    maxProviderAttempts = AgentRuntimeLimitsPrefs.maxProviderAttempts()
+                AgentRuntimeLimitsPrefs.KEY_MAX_TOOL_CALLS ->
+                    maxToolCalls = AgentRuntimeLimitsPrefs.maxToolCalls()
+                AgentRuntimeLimitsPrefs.KEY_MAX_SHELL_COMMANDS ->
+                    maxShellCommands = AgentRuntimeLimitsPrefs.maxShellCommands()
+                AgentRuntimeLimitsPrefs.KEY_MAX_COMPACTION_CALLS ->
+                    maxCompactionCalls = AgentRuntimeLimitsPrefs.maxCompactionCalls()
+                AgentRuntimeLimitsPrefs.KEY_MAX_CONCURRENT_TOOLS ->
+                    maxConcurrentTools = AgentRuntimeLimitsPrefs.maxConcurrentTools()
+                AgentRuntimeLimitsPrefs.KEY_RUN_DEADLINE_MIN ->
+                    runDeadlineMin = AgentRuntimeLimitsPrefs.runDeadlineMinutes()
+                AgentRuntimeLimitsPrefs.KEY_LENGTH_WALL_CONTINUES ->
+                    lengthWallContinues = AgentRuntimeLimitsPrefs.lengthWallContinues()
+                AgentRuntimeLimitsPrefs.KEY_EOF_STUB_CONTINUES ->
+                    eofStubContinues = AgentRuntimeLimitsPrefs.eofStubContinues()
+                AgentRuntimeLimitsPrefs.KEY_DETERMINISTIC_EMPTY_LIMIT ->
+                    deterministicEmptyLimit = AgentRuntimeLimitsPrefs.deterministicEmptyLimit()
+                AgentRuntimeLimitsPrefs.KEY_TRANSIENT_RETRIES ->
+                    transientRetries = AgentRuntimeLimitsPrefs.transientRetries()
+                AgentRuntimeLimitsPrefs.KEY_VERIFY_NUDGES ->
+                    verifyNudges = AgentRuntimeLimitsPrefs.verifyNudges()
+                AgentRuntimeLimitsPrefs.KEY_GENERATION_TIMEOUT_MIN ->
+                    generationTimeoutMin = AgentRuntimeLimitsPrefs.generationTimeoutMinutes()
+                AgentRuntimeLimitsPrefs.KEY_FIRST_CHUNK_DIRECT_SEC ->
+                    firstChunkDirectSec = AgentRuntimeLimitsPrefs.firstChunkDirectSec()
+                AgentRuntimeLimitsPrefs.KEY_FIRST_CHUNK_PROXY_SEC ->
+                    firstChunkProxySec = AgentRuntimeLimitsPrefs.firstChunkProxySec()
+                AgentRuntimeLimitsPrefs.KEY_PROVIDER_SLOTS ->
+                    providerSlots = AgentRuntimeLimitsPrefs.providerSlots()
+                AgentRuntimeLimitsPrefs.KEY_QUEUE_ADMISSION ->
+                    queueAdmission = AgentRuntimeLimitsPrefs.queueAdmission()
+                AgentRuntimeLimitsPrefs.KEY_AUTO_COMPACT_MIN_TAIL_TOKENS ->
+                    autoCompactMinTailTokens = AgentRuntimeLimitsPrefs.autoCompactMinTailTokens()
+                AgentRuntimeLimitsPrefs.KEY_AUTO_COMPACT_MIN_INTERVAL_MIN ->
+                    autoCompactMinIntervalMin = AgentRuntimeLimitsPrefs.autoCompactMinIntervalMin()
+                AgentRuntimeLimitsPrefs.KEY_MEMORY_INJECT_LINES ->
+                    memoryInjectLines = AgentRuntimeLimitsPrefs.memoryInjectLines()
+                AgentRuntimeLimitsPrefs.KEY_MEMORY_ROLLUP_INJECT_KB ->
+                    memoryRollupInjectKb = AgentRuntimeLimitsPrefs.memoryRollupInjectKb()
+                AgentRuntimeLimitsPrefs.KEY_MEMORY_SEARCH_LINES ->
+                    memorySearchLines = AgentRuntimeLimitsPrefs.memorySearchLines()
+                AgentRuntimeLimitsPrefs.KEY_MEMORY_LOOKBACK_DAYS ->
+                    memoryLookbackDays = AgentRuntimeLimitsPrefs.memoryLookbackDays()
+                AgentRuntimeLimitsPrefs.KEY_IMAGE_MAX_PER_IMAGE_MB ->
+                    imageMaxPerImageMb = AgentRuntimeLimitsPrefs.imageMaxPerImageMb()
+                AgentRuntimeLimitsPrefs.KEY_IMAGE_MAX_TOTAL_MB ->
+                    imageMaxTotalMb = AgentRuntimeLimitsPrefs.imageMaxTotalMb()
+                AgentRuntimeLimitsPrefs.KEY_IMAGE_MAX_REQUEST_MB ->
+                    imageMaxRequestMb = AgentRuntimeLimitsPrefs.imageMaxRequestMb()
+                AgentRuntimeLimitsPrefs.KEY_IMAGE_MAX_EDGE_PX ->
+                    imageMaxEdgePx = AgentRuntimeLimitsPrefs.imageMaxEdgePx()
+                AgentRuntimeLimitsPrefs.KEY_IMAGE_JPEG_QUALITY ->
+                    imageJpegQuality = AgentRuntimeLimitsPrefs.imageJpegQuality()
+                AgentRuntimeLimitsPrefs.KEY_BROWSER_NAV_TIMEOUT_SEC ->
+                    browserNavTimeoutSec = AgentRuntimeLimitsPrefs.browserNavTimeoutSec()
+                AgentRuntimeLimitsPrefs.KEY_BROWSER_DOM_STABLE_SEC ->
+                    browserDomStableSec = AgentRuntimeLimitsPrefs.browserDomStableSec()
+                AgentRuntimeLimitsPrefs.KEY_BROWSER_SCREENSHOT_QUALITY ->
+                    browserScreenshotQuality = AgentRuntimeLimitsPrefs.browserScreenshotQuality()
+                AgentRuntimeLimitsPrefs.KEY_SHELL_OUTPUT_KB ->
+                    shellOutputKb = AgentRuntimeLimitsPrefs.shellOutputKb()
+                AgentRuntimeLimitsPrefs.KEY_SHELL_TIMEOUT_SEC ->
+                    shellTimeoutSec = AgentRuntimeLimitsPrefs.shellTimeoutSec()
+                AgentRuntimeLimitsPrefs.KEY_GUEST_TMP_MAX_AGE_MIN ->
+                    guestTmpMaxAgeMin = AgentRuntimeLimitsPrefs.guestTmpMaxAgeMin()
+                AgentRuntimeLimitsPrefs.KEY_GUEST_TMP_SWEEP_INTERVAL_SEC ->
+                    guestTmpSweepIntervalSec = AgentRuntimeLimitsPrefs.guestTmpSweepIntervalSec()
+                AgentRuntimeLimitsPrefs.KEY_STALL_NO_PROGRESS_SEC ->
+                    stallNoProgressSec = AgentRuntimeLimitsPrefs.stallNoProgressSec()
+                AgentRuntimeLimitsPrefs.KEY_SHELL_IDLE_TIMEOUT_MIN ->
+                    shellIdleTimeoutMin = AgentRuntimeLimitsPrefs.shellIdleTimeoutMin()
+                AgentRuntimeLimitsPrefs.KEY_HEAVY_GATE_TIMEOUT_SEC ->
+                    heavyGateTimeoutSec = AgentRuntimeLimitsPrefs.heavyGateTimeoutSec()
+            }
         }
         val limitsPrefs = app.getSharedPreferences(AgentRuntimeLimitsPrefs.PREFS, Context.MODE_PRIVATE)
         val concurrencyPrefs = app.getSharedPreferences(ConcurrencyPrefs.PREFS, Context.MODE_PRIVATE)
@@ -241,51 +294,97 @@ fun RuntimeLimitsScreen(onBack: () -> Unit) {
                     // over it. Belt for the write path — the load-bearing fix
                     // for the display half is the re-priming listener in the
                     // DisposableEffect above (and ConfigBuiltins' own listener).
+                    // [fix/dv22-b1-prefs-listener-filter] Capture FIRST, write second. The first
+                    // apply() below notifies this screen's own listener synchronously (see the
+                    // comment in the listener above), so by the time the second and third writes
+                    // evaluate their arguments the 40 state vars have already been re-read from
+                    // disk. Reading the state vars at write time would therefore persist the
+                    // RESET values and silently roll the user's edits back; an immutable local
+                    // snapshot taken before the first write is immune to that reset.
+                    val pendingSubagentEnabled = subagentEnabled
+                    val pendingMaxSessions = maxSessions
+                    val pendingMaxTurns = maxTurns
+                    val pendingMaxProviderAttempts = maxProviderAttempts
+                    val pendingMaxToolCalls = maxToolCalls
+                    val pendingMaxShellCommands = maxShellCommands
+                    val pendingMaxCompactionCalls = maxCompactionCalls
+                    val pendingMaxConcurrentTools = maxConcurrentTools
+                    val pendingRunDeadlineMin = runDeadlineMin
+                    val pendingLengthWallContinues = lengthWallContinues
+                    val pendingEofStubContinues = eofStubContinues
+                    val pendingDeterministicEmptyLimit = deterministicEmptyLimit
+                    val pendingTransientRetries = transientRetries
+                    val pendingVerifyNudges = verifyNudges
+                    val pendingGenerationTimeoutMin = generationTimeoutMin
+                    val pendingFirstChunkDirectSec = firstChunkDirectSec
+                    val pendingFirstChunkProxySec = firstChunkProxySec
+                    val pendingProviderSlots = providerSlots
+                    val pendingQueueAdmission = queueAdmission
+                    val pendingAutoCompactMinTailTokens = autoCompactMinTailTokens
+                    val pendingAutoCompactMinIntervalMin = autoCompactMinIntervalMin
+                    val pendingMemoryInjectLines = memoryInjectLines
+                    val pendingMemoryRollupInjectKb = memoryRollupInjectKb
+                    val pendingMemorySearchLines = memorySearchLines
+                    val pendingMemoryLookbackDays = memoryLookbackDays
+                    val pendingImageMaxPerImageMb = imageMaxPerImageMb
+                    val pendingImageMaxTotalMb = imageMaxTotalMb
+                    val pendingImageMaxRequestMb = imageMaxRequestMb
+                    val pendingImageMaxEdgePx = imageMaxEdgePx
+                    val pendingImageJpegQuality = imageJpegQuality
+                    val pendingBrowserNavTimeoutSec = browserNavTimeoutSec
+                    val pendingBrowserDomStableSec = browserDomStableSec
+                    val pendingBrowserScreenshotQuality = browserScreenshotQuality
+                    val pendingShellOutputKb = shellOutputKb
+                    val pendingShellTimeoutSec = shellTimeoutSec
+                    val pendingGuestTmpMaxAgeMin = guestTmpMaxAgeMin
+                    val pendingGuestTmpSweepIntervalSec = guestTmpSweepIntervalSec
+                    val pendingStallNoProgressSec = stallNoProgressSec
+                    val pendingShellIdleTimeoutMin = shellIdleTimeoutMin
+                    val pendingHeavyGateTimeoutSec = heavyGateTimeoutSec
                     ConcurrencyPrefs.prime(context)
                     AgentRuntimeLimitsPrefs.prime(context)
-                    SubagentPrefs.setEnabled(context, subagentEnabled)
-                    ConcurrencyPrefs.setMaxConcurrentSessions(context, maxSessions)
+                    SubagentPrefs.setEnabled(context, pendingSubagentEnabled)
+                    ConcurrencyPrefs.setMaxConcurrentSessions(context, pendingMaxSessions)
                     AgentRuntimeLimitsPrefs.save(
                         context = context,
-                        maxTurns = maxTurns,
-                        maxProviderAttempts = maxProviderAttempts,
-                        maxToolCalls = maxToolCalls,
-                        maxShellCommands = maxShellCommands,
-                        maxCompactionCalls = maxCompactionCalls,
-                        maxConcurrentTools = maxConcurrentTools,
-                        runDeadlineMinutes = runDeadlineMin,
-                        lengthWallContinues = lengthWallContinues,
-                        eofStubContinues = eofStubContinues,
-                        deterministicEmptyLimit = deterministicEmptyLimit,
-                        transientRetries = transientRetries,
-                        verifyNudges = verifyNudges,
-                        generationTimeoutMinutes = generationTimeoutMin,
-                        firstChunkDirectSec = firstChunkDirectSec,
-                        firstChunkProxySec = firstChunkProxySec,
-                        providerSlots = providerSlots,
-                        queueAdmission = queueAdmission,
-                        // [feat/chat-tuning-panel-b] Group 5 + 6.
-                        autoCompactMinTailTokens = autoCompactMinTailTokens,
-                        autoCompactMinIntervalMin = autoCompactMinIntervalMin,
-                        memoryInjectLines = memoryInjectLines,
-                        memoryRollupInjectKb = memoryRollupInjectKb,
-                        memorySearchLines = memorySearchLines,
-                        memoryLookbackDays = memoryLookbackDays,
-                        imageMaxPerImageMb = imageMaxPerImageMb,
-                        imageMaxTotalMb = imageMaxTotalMb,
-                        imageMaxRequestMb = imageMaxRequestMb,
-                        imageMaxEdgePx = imageMaxEdgePx,
-                        imageJpegQuality = imageJpegQuality,
-                        browserNavTimeoutSec = browserNavTimeoutSec,
-                        browserDomStableSec = browserDomStableSec,
-                        browserScreenshotQuality = browserScreenshotQuality,
-                        shellOutputKb = shellOutputKb,
-                        shellTimeoutSec = shellTimeoutSec,
-                        guestTmpMaxAgeMin = guestTmpMaxAgeMin,
-                        guestTmpSweepIntervalSec = guestTmpSweepIntervalSec,
-                        stallNoProgressSec = stallNoProgressSec,
-                        shellIdleTimeoutMin = shellIdleTimeoutMin,
-                        heavyGateTimeoutSec = heavyGateTimeoutSec,
+                        maxTurns = pendingMaxTurns,
+                        maxProviderAttempts = pendingMaxProviderAttempts,
+                        maxToolCalls = pendingMaxToolCalls,
+                        maxShellCommands = pendingMaxShellCommands,
+                        maxCompactionCalls = pendingMaxCompactionCalls,
+                        maxConcurrentTools = pendingMaxConcurrentTools,
+                        runDeadlineMinutes = pendingRunDeadlineMin,
+                        lengthWallContinues = pendingLengthWallContinues,
+                        eofStubContinues = pendingEofStubContinues,
+                        deterministicEmptyLimit = pendingDeterministicEmptyLimit,
+                        transientRetries = pendingTransientRetries,
+                        verifyNudges = pendingVerifyNudges,
+                        generationTimeoutMinutes = pendingGenerationTimeoutMin,
+                        firstChunkDirectSec = pendingFirstChunkDirectSec,
+                        firstChunkProxySec = pendingFirstChunkProxySec,
+                        providerSlots = pendingProviderSlots,
+                        queueAdmission = pendingQueueAdmission,
+                        autoCompactMinTailTokens = pendingAutoCompactMinTailTokens,
+                        autoCompactMinIntervalMin = pendingAutoCompactMinIntervalMin,
+                        memoryInjectLines = pendingMemoryInjectLines,
+                        memoryRollupInjectKb = pendingMemoryRollupInjectKb,
+                        memorySearchLines = pendingMemorySearchLines,
+                        memoryLookbackDays = pendingMemoryLookbackDays,
+                        imageMaxPerImageMb = pendingImageMaxPerImageMb,
+                        imageMaxTotalMb = pendingImageMaxTotalMb,
+                        imageMaxRequestMb = pendingImageMaxRequestMb,
+                        imageMaxEdgePx = pendingImageMaxEdgePx,
+                        imageJpegQuality = pendingImageJpegQuality,
+                        browserNavTimeoutSec = pendingBrowserNavTimeoutSec,
+                        browserDomStableSec = pendingBrowserDomStableSec,
+                        browserScreenshotQuality = pendingBrowserScreenshotQuality,
+                        shellOutputKb = pendingShellOutputKb,
+                        shellTimeoutSec = pendingShellTimeoutSec,
+                        guestTmpMaxAgeMin = pendingGuestTmpMaxAgeMin,
+                        guestTmpSweepIntervalSec = pendingGuestTmpSweepIntervalSec,
+                        stallNoProgressSec = pendingStallNoProgressSec,
+                        shellIdleTimeoutMin = pendingShellIdleTimeoutMin,
+                        heavyGateTimeoutSec = pendingHeavyGateTimeoutSec,
                     )
                     onBack()
                 },

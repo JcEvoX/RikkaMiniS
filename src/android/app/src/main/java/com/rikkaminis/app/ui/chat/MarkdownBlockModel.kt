@@ -35,22 +35,60 @@ internal sealed class MdBlock(val raw: String) {
     class MathDisplay(raw: String, val latex: String) : MdBlock(raw)
 }
 
-private val nativeVideoExts = setOf("mp4", "mov", "m4v", "avi", "mkv", "webm")
-private val nativeAudioExts = setOf("mp3", "m4a", "wav", "aac", "ogg", "flac")
+/** [dv22/B-06] What a media URL points at, as far as the renderer can tell. */
+internal enum class MediaKind { IMAGE, VIDEO, AUDIO }
 
-private fun mediaBlockFrom(raw: String, alt: String, url: String): MdBlock {
-    // Classify by the last path segment's extension. Decoding first means a
-    // filename like `foo%23China.mp4` or `foo#China.mp4` still resolves to
-    // `.mp4` instead of being swallowed by `substringBefore('#')`.
-    val lastSeg = url.substringAfterLast('/')
-    val decoded = decodeUriPath(lastSeg)
-    val ext = decoded.substringAfterLast('.', "").lowercase()
+/**
+ * [dv22/B-06] Single source of the native media extension sets — the markdown
+ * block classifier, the inline split, the block parser and the image gallery all
+ * read these, so a new format is one edit and no surface can silently lag behind.
+ */
+internal val nativeVideoExts = setOf("mp4", "mov", "m4v", "avi", "mkv", "webm")
+internal val nativeAudioExts = setOf("mp3", "m4a", "wav", "aac", "ogg", "flac")
+
+/**
+ * [dv22/B-06] The single media-classification decision point.
+ *
+ * The query is cut *before* the extension is read, so `clip.mp4?t=1` and
+ * `clip.mp4?raw=1` classify as video instead of falling through to "image"
+ * (whose extension read would otherwise be `mp4?t=1`). The `#` fragment is not
+ * cut here: a local file may legally be named `foo#China.mp4`, and the
+ * extension read below survives it — see [mediaPathOfUrl], which cuts `#` only
+ * for http(s).
+ */
+internal fun mediaKindOfUrl(url: String): MediaKind {
+    val ext = mediaFileNameOfUrl(url).substringAfterLast('.', "").lowercase()
     return when (ext) {
-        in nativeVideoExts -> MdBlock.Video(raw, alt, url)
-        in nativeAudioExts -> MdBlock.Audio(raw, alt, url)
-        else -> MdBlock.Image(raw, alt, url)
+        in nativeVideoExts -> MediaKind.VIDEO
+        in nativeAudioExts -> MediaKind.AUDIO
+        else -> MediaKind.IMAGE
     }
 }
+
+/**
+ * [dv22/B-06] The path part of a media URL: the query always goes, the fragment
+ * goes only for http(s) — in a `minis://` or relative path a `#` belongs to the
+ * filename, so cutting it there would mangle real files.
+ */
+internal fun mediaPathOfUrl(url: String): String {
+    val noQuery = url.substringBefore('?')
+    return if (noQuery.startsWith("http://") || noQuery.startsWith("https://")) {
+        noQuery.substringBefore('#')
+    } else {
+        noQuery
+    }
+}
+
+/** [dv22/B-06] The percent-decoded last path segment — a media URL's display name. */
+internal fun mediaFileNameOfUrl(url: String): String =
+    decodeUriPath(mediaPathOfUrl(url).substringAfterLast('/'))
+
+private fun mediaBlockFrom(raw: String, alt: String, url: String): MdBlock =
+    when (mediaKindOfUrl(url)) {
+        MediaKind.VIDEO -> MdBlock.Video(raw, alt, url)
+        MediaKind.AUDIO -> MdBlock.Audio(raw, alt, url)
+        MediaKind.IMAGE -> MdBlock.Image(raw, alt, url)
+    }
 
 /** Matches any `![alt](url)` anywhere in a line. Non-greedy to handle multiple per line. */
 private val inlineMediaRegex = Regex("""!\[([^\]\n]*)]\(([^)\s]+)\)""")
@@ -135,24 +173,16 @@ private fun splitParagraphOnInlineMedia(text: String): List<MdBlock> {
 
     // Pre-check: only split when at least one match is a media (video/audio)
     // that we can render as a card. Plain image-extension matches stay inline.
-    val hasMediaExt = matches.any { m ->
-        val url = m.groupValues[2]
-        val lastSeg = url.substringAfterLast('/')
-        val decoded = decodeUriPath(lastSeg)
-        val ext = decoded.substringAfterLast('.', "").lowercase()
-        ext in nativeVideoExts || ext in nativeAudioExts
-    }
+    // [dv22/B-06] Classification goes through mediaKindOfUrl so the query /
+    // fragment / percent-decoding rules are the same ones the card renderers use.
+    val hasMediaExt = matches.any { m -> mediaKindOfUrl(m.groupValues[2]) != MediaKind.IMAGE }
     if (!hasMediaExt) return listOf(MdBlock.Paragraph(text))
 
     val result = mutableListOf<MdBlock>()
     var cursor = 0
     for (m in matches) {
         val url = m.groupValues[2]
-        val lastSeg = url.substringAfterLast('/')
-        val decoded = decodeUriPath(lastSeg)
-        val ext = decoded.substringAfterLast('.', "").lowercase()
-        val isMedia = ext in nativeVideoExts || ext in nativeAudioExts
-        if (!isMedia) continue
+        if (mediaKindOfUrl(url) == MediaKind.IMAGE) continue
 
         val preceding = text.substring(cursor, m.range.first).trim('\n', ' ', '\t')
         if (preceding.isNotBlank()) result.add(MdBlock.Paragraph(preceding))

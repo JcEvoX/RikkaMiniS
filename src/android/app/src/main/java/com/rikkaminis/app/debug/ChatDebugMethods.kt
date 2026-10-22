@@ -247,7 +247,11 @@ internal object ChatDebugMethods {
             if (entry.providerInstanceId !in enabledIds) continue
             if (!includeHidden && entry.isHidden) continue
             val inst = cfg.instances.find { it.id == entry.providerInstanceId } ?: continue
-            val effective = entry.model
+            // [dv22-A4] Effective = enriched + overrides via the shared
+            // resolver (same one as minis-model-use): the raw `entry.model`
+            // skipped models.dev, so every built-in reported null windows
+            // and no vision/audio/pdf capability here.
+            val effective = com.rikkaminis.app.provider.ModelsDevApi.effectiveModel(entry)
             val inputs = effective.inputModalities ?: emptyList()
             entriesArr.put(JSONObject().apply {
                 put("id", entry.id)

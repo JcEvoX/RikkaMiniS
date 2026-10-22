@@ -548,7 +548,10 @@ internal object ProviderMutationMethods {
     }
 
     private fun entryToJson(entry: ModelEntry): JSONObject {
-        val effective = entry.model
+        // [dv22-A4] Enriched effective model — every modelsAdd/modelsUpdate
+        // response (and this helper's read-back) goes through the shared
+        // resolver, so the mutation faces answer like the read faces.
+        val effective = com.rikkaminis.app.provider.ModelsDevApi.effectiveModel(entry)
         return JSONObject().apply {
             put("id", entry.id)
             put("modelId", effective.id)

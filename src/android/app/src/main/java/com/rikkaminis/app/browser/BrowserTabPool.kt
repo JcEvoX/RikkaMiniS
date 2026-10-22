@@ -1278,6 +1278,10 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
 
         destroyTab(currentTabs, currentTabs[idx])
         _tabs.value = currentTabs
+        // [dv22-B2] Membership move with no inUse write: the list emission
+        // alone cannot reach a busy collector, so re-derive here or agentBusy
+        // freezes at its pre-destroy value when the last in-use tab closes.
+        publishAgentBusy()
 
         // Select next tab
         if (currentTabs.isNotEmpty() && _selectedTabId.value == id) {
@@ -1348,6 +1352,9 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
             val closedId = currentTabs[idx].id
             destroyTab(currentTabs, currentTabs[idx])
             _tabs.value = currentTabs
+            // [dv22-B2] Same defect family as closeTab: JS-initiated window
+            // close must re-derive the busy flag after the list write.
+            publishAgentBusy()
             if (_selectedTabId.value == closedId && currentTabs.isNotEmpty()) {
                 _selectedTabId.value = currentTabs.first().id
             }
@@ -1390,6 +1397,9 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
         if (idx < 0) return@withContext
         destroyTab(currentTabs, currentTabs[idx])
         _tabs.value = currentTabs
+        // [dv22-B2] UI close path mirrors closeTab: re-derive the busy flag
+        // after the list write or the sheet stays stuck on "agent working".
+        publishAgentBusy()
         if (_selectedTabId.value == tabId && currentTabs.isNotEmpty()) {
             _selectedTabId.value = currentTabs.first().id
         }
@@ -1546,6 +1556,10 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
                 Log.i(TAG, "dispose(): destroyed tab ${tab.id}")
             }
             _tabs.value = emptyList()
+            // [dv22-B2] dispose() empties the pool after destroying every
+            // tab; without a re-derivation the collector keeps the last
+            // published value for the pool instance's whole lifetime.
+            publishAgentBusy()
         }
     }
 
@@ -1612,6 +1626,10 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
             Log.i(TAG, "Trimmed tab ${tab.id} (level $level)")
         }
         _tabs.value = currentTabs
+        // [dv22-B2] Trim eviction drops tabs outside any inUse write (victims
+        // are filtered to !inUse, but the busy flag must still settle on the
+        // surviving set — e.g. a destroy-then-release race).
+        publishAgentBusy()
         if (currentTabs.isNotEmpty() && currentTabs.none { it.id == _selectedTabId.value }) {
             _selectedTabId.value = currentTabs.first().id
         }
@@ -1640,6 +1658,9 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
         }
         if (toRemove.isNotEmpty()) {
             _tabs.value = currentTabs
+            // [dv22-B2] Idle eviction is a destroy path too — re-derive the
+            // busy flag on the surviving set after the list write.
+            publishAgentBusy()
             if (currentTabs.isNotEmpty() && currentTabs.none { it.id == _selectedTabId.value }) {
                 _selectedTabId.value = currentTabs.first().id
             }

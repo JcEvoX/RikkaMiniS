@@ -64,6 +64,7 @@ import androidx.compose.ui.res.stringResource
 import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.model.ProviderInstance
 import com.rikkaminis.app.data.model.ProviderType
+import com.rikkaminis.app.data.model.normalizeModalities
 import com.rikkaminis.app.data.repository.ProviderRepository
 import android.widget.Toast
 import com.rikkaminis.app.logging.AppLogger
@@ -81,6 +82,7 @@ import com.rikkaminis.app.ui.components.MinisSmallTextButton
 import com.rikkaminis.app.ui.components.MinisTextButton
 import com.rikkaminis.app.ui.components.SectionTextField
 import com.rikkaminis.app.ui.theme.ChatColors
+import com.rikkaminis.app.provider.ModelsDevApi
 
 private const val TAG = "ProviderDetail"
 
@@ -730,8 +732,14 @@ private fun ProviderModelRow(
         // Surface both directions — input badges are muted,
         // output badges use a tinted "generate"-style glyph so
         // they read distinctly. Mirrors iOS #669.
-        val inputModalities = entry.model.inputModalities.orEmpty()
-        val outputModalities = entry.model.outputModalities.orEmpty()
+        // [dv22/B-03] Capability source is the effective model (models.dev
+        // enrichment under the user's overrides) — the raw entry declares no
+        // modalities for any built-in model. normalizeModalities strips the
+        // `_input`/`_output` suffix and lowercases, so the icon-key match is no
+        // longer suffix- and case-sensitive (`IMAGE_INPUT` used to match nothing).
+        val capabilityModel = ModelsDevApi.effectiveModel(entry)
+        val inputModalities = capabilityModel.inputModalities.normalizeModalities().orEmpty()
+        val outputModalities = capabilityModel.outputModalities.normalizeModalities().orEmpty()
         val hasBadge = inputModalities.any { it in modalityIconKeys } ||
             outputModalities.any { it in modalityOutputIconKeys }
         SettingsRow(
