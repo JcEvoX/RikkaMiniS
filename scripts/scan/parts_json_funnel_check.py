@@ -64,6 +64,7 @@ RANGE_RE = re.compile(r"dao\.loadMessagesPageInRange\(")
 # [da1032-B] read-side surface (debug RPC view of the same parts_json rows).
 DEBUG_REL = "src/android/app/src/main/java/com/rikkaminis/app/debug/ChatDebugMethods.kt"
 MUTATION_DEBUG_REL = "src/android/app/src/main/java/com/rikkaminis/app/debug/ChatMutationMethods.kt"
+DAO_REL = "src/android/app/src/main/java/com/rikkaminis/app/data/db/ChatDao.kt"
 
 # The @SerialName set of data/model/ContentPart.kt — the only three keys that
 # a real persisted parts_json row can carry besides "text".
@@ -234,6 +235,112 @@ def region_between(text, start_sig, end_sig_regex):
     return text[start:]
 
 
+DEBUG_BLOB_PARTY_RELS = (
+    DEBUG_REL,
+    MUTATION_DEBUG_REL,
+    "src/android/app/src/main/java/com/rikkaminis/app/debug/HeadlessChatRunner.kt",
+)
+
+
+class ColumnScanner:
+    """Resolves what a DAO @Query's `SELECT *` actually expands to.
+
+    Star projections are not self-describing: `SELECT * FROM messages` reads
+    parts_json while `SELECT * FROM sessions` does not, and the difference is
+    the row type each query is bound to. A capture anchored on the literal
+    `parts_json` token therefore sees only some of the real read surface — so
+    [R10] asks this scanner instead.
+
+    """
+
+    # Row types whose projection is exposed to the parts_json read risk.
+    ROWS = {
+        "MessageEntity": True,
+        "ChatSessionEntity": False,
+        "SessionTailRow": True,
+    }
+    TABLE_ROW_TYPES = {
+        "messages": "MessageEntity",
+        "compact_markers": "CompactMarkerEntity",
+        "sessions": "ChatSessionEntity",
+    }
+
+    _STAR_FROM_RE = re.compile(r"(?is)\bSELECT\s+\*\s+.*?\bFROM\s+(?P<table>\w+)")
+    _DIRECT_HIT_RE = re.compile(r"(?i)\bparts_json\b")
+
+    @classmethod
+    def for_dao_tables(cls):
+        return dict(cls.TABLE_ROW_TYPES)
+
+    @classmethod
+    def may_read(cls, table_map, body):
+        """True when this query can materialise parts_json into Kotlin memory.
+
+        Two shapes qualify, and nothing else:
+          * the column is named in the projection (`SELECT parts_json …`, or a
+            multi-column list that includes `m.parts_json`);
+          * the projection is a STAR over a table whose row type carries the
+            column (`SELECT * FROM messages`).
+
+        A COUNT/aggregate over the same table is deliberately NOT a reader: it
+        never materialises the blob, which is precisely why COUNT is the shape
+        [fix/dv23-a5] moved the emptiness probe onto.
+        """
+        if cls._DIRECT_HIT_RE.search(body):
+            return True
+        star = cls._STAR_FROM_RE.search(body)
+        if star is None:
+            return False
+        row_type = table_map.get(star.group("table"))
+        return cls.ROWS.get(row_type, False)
+
+
+def derive_parts_readers(dao_source):
+    """Every ChatDao @Query that READS parts_json, by function name.
+
+    Derived from the real DAO rather than hand-listed, so a blob-reading query
+    added tomorrow falls under [R10] the same day — the gate cannot go blind by
+    omission.
+
+    The @Query argument is extracted by paren balancing, not by a single regex:
+    several declarations build their SQL with `"…" + "…"` concatenation across
+    lines, and a lazy `.*?` capture happily runs past the closing paren into the
+    NEXT declaration (that misfire attributed `loadUserMessagesSince`'s SQL to
+    `nextSortOrder` while developing this arm).
+    """
+    code = strip_kotlin_comments(dao_source)
+    readers = {}
+    for m in re.finditer(r"@Query\s*\(", code):
+        body = _balanced_arg(code, m.end() - 1)
+        if body is None:
+            continue
+        # `body` ends just before its closing paren; step past it and expect
+        # the annotated member to be the very next declaration.
+        after = code[m.end() + len(body) + 1:]
+        fn = re.match(r"\s*\n\s*(?:suspend\s+)?fun\s+(\w+)\s*\(", after)
+        if fn is None:
+            continue
+        if not re.match(r"(?is)\s*['\"]{0,3}\s*(SELECT|WITH)\b", body):
+            continue
+        if ColumnScanner.may_read(ColumnScanner.for_dao_tables(), body):
+            readers[fn.group(1)] = body
+    return readers
+
+
+def _balanced_arg(text, open_idx):
+    """Text between the paren at `open_idx` and its match ("" if unbalanced)."""
+    depth = 0
+    for i in range(open_idx, len(text)):
+        c = text[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx + 1:i]
+    return None
+
+
 def check_debug_surface(root):
     """[R7]-[R9] — the read-side debug RPC view of the same persisted rows.
 
@@ -318,7 +425,48 @@ def check_debug_surface(root):
         else:
             findings.append(
                 f"[R9] PASS single resolver reached from {dbg_calls + mut_calls} call sites")
+    # [R10] [fix/dv23-a5] The debug RPCs must answer "is this session empty?"
+    # WITHOUT reading parts_json. Every chat DAO query that pulls the column is
+    # derived from ChatDao.kt's own @Query bodies (not hand-listed, so a new
+    # blob-reading query is covered the day it lands). Anything in debug/
+    # calling one directly walks straight past the 2 MB CursorWindow ceiling
+    # that ChatRepository.loadPageTolerant exists to hold: one >2 MB
+    # historical row aborts the whole RPC with SQLiteBlobTooBigException.
+    dao_path = os.path.join(root, DAO_REL)
+    parts_readers = {}
+    if not os.path.exists(dao_path):
+        findings.append("[R10] FAIL missing ChatDao.kt - cannot derive the parts_json read surface")
+    else:
+        parts_readers = derive_parts_readers(read(dao_path))
+        if not parts_readers:
+            findings.append(
+                "[R10] FAIL no parts_json-reading query derived from ChatDao.kt "
+                "(fail-closed: the read surface could not be established)")
+    if parts_readers:
+        hits = []
+        for path in DEBUG_BLOB_PARTY_RELS:
+            p10 = os.path.join(root, path)
+            if not os.path.exists(p10):
+                continue
+            code = strip_kotlin_comments(read(p10))
+            for name in parts_readers:
+                # DAO-level access only. `repo.loadMessages(...)` is the funnel
+                # and must stay green; `.dao.loadMessages(...)` is the raw read
+                # that skips it — the exact shape [fix/dv23-a5] removed.
+                for m in re.finditer(r"\.dao\s*\.\s*" + re.escape(name) + r"\s*\(", code):
+                    hits.append(
+                        f"{path.rsplit('/', 1)[-1]}:{code[:m.start()].count(chr(10)) + 1} {name}(")
+        if hits:
+            findings.append(
+                "[R10] FAIL debug/ reads parts_json outside its tolerant funnel: "
+                + ", ".join(sorted(set(hits)))
+                + " - one >2 MB historical row aborts the whole RPC with SQLiteBlobTooBigException")
+        else:
+            findings.append(
+                f"[R10] PASS debug/ never calls {len(parts_readers)} parts_json DAO reads directly "
+                f"({', '.join(sorted(parts_readers))})")
     return findings
+
 
 
 def find_production_files(root):
@@ -496,20 +644,59 @@ PREFIX_IMPORT = """internal suspend fun importChatSections(
 """
 
 
-def build_debug_fixture(root, debug_body, mutation_body):
-    """Lay out the two debug RPC files [R7]-[R9] read."""
+def build_debug_fixture(root, debug_body, mutation_body, dao_body=None):
+    """Lay out the two debug RPC files [R7]-[R9] read, plus the DAO [R10] derives from."""
     debug_dir = os.path.join(root, "src/android/app/src/main/java/com/rikkaminis/app/debug")
     os.makedirs(debug_dir, exist_ok=True)
     with open(os.path.join(debug_dir, "ChatDebugMethods.kt"), "w", encoding="utf-8") as f:
         f.write(debug_body)
     with open(os.path.join(debug_dir, "ChatMutationMethods.kt"), "w", encoding="utf-8") as f:
         f.write(mutation_body)
+    dao_path = os.path.join(root, DAO_REL)
+    os.makedirs(os.path.dirname(dao_path), exist_ok=True)
+    with open(dao_path, "w", encoding="utf-8") as f:
+        f.write(DAO_GREEN if dao_body is None else dao_body)
     return root
 
 
 # --- [R7]-[R9] fixtures ------------------------------------------------------
 # All three judgments read the same two shipped files; the fixtures below are
 # minimally-shaped stand-ins whose only job is to make one arm flip.
+
+# [R10] the DAO the derivation walks. Shaped like ChatDao: a blob-naming read,
+# a star-over-messages read, a star-over-sessions read (NOT a blob read — this
+# is the control that keeps the star rule from swallowing every query), and an
+# aggregate that never materialises the column.
+DAO_GREEN = """package com.rikkaminis.app.data.db
+
+interface ChatDao {
+    @Query("SELECT * FROM sessions ORDER BY updated_at DESC")
+    suspend fun listSessions(): List<ChatSessionEntity>
+
+    @Query(\"\"\"
+        SELECT parts_json FROM messages
+        WHERE session_id = :sessionId
+        ORDER BY sort_order DESC LIMIT 1
+    \"\"\")
+    suspend fun lastMessageParts(sessionId: String): String?
+
+    @Query("SELECT * FROM messages WHERE session_id = :sessionId")
+    suspend fun loadMessages(sessionId: String): List<MessageEntity>
+
+    @Query("SELECT COUNT(*) FROM messages WHERE session_id = :sessionId")
+    suspend fun messageCountForSession(sessionId: String): Int
+}
+"""
+
+# [R10] a DAO that gained a brand-new blob read the gate has never been told
+# about — the derivation must pick it up on its own (no hand-list to update).
+DAO_NEW_BLOB_READ = DAO_GREEN.replace(
+    '    @Query("SELECT COUNT(*) FROM messages WHERE session_id = :sessionId")',
+    '    @Query("SELECT * FROM messages WHERE session_id = :sessionId AND role = :role")\n'
+    '    suspend fun messagesByRole(sessionId: String, role: String): List<MessageEntity>\n'
+    '\n'
+    '    @Query("SELECT COUNT(*) FROM messages WHERE session_id = :sessionId")',
+)
 
 DEBUG_GREEN = """package com.rikkaminis.app.debug
 
@@ -521,8 +708,11 @@ internal object ChatDebugMethods {
      * the [R7] judgment must ignore it (comments are stripped).
      */
     suspend fun sessionsList(context: Context, params: JSONObject): JSONObject {
+        val includeEmpty = params.optBoolean("includeEmpty", false)
         val provRepo = provider(context)
         for (session in all) {
+            // [fix/dv23-a5] the emptiness probe is a COUNT, never a blob read
+            if (!includeEmpty && repo.messageCount(session.id) == 0) continue
             arr.put(sessionCoreJson(session, provRepo))
         }
         return JSONObject().apply { put("count", emitted) }
@@ -668,6 +858,40 @@ DEBUG_MAPPER_DROPS_FIELD = DEBUG_GREEN.replace(
 DEBUG_BARE_PREDICATE = DEBUG_GREEN.replace(
     'it.baseModel.id == modelId || it.id == modelId', 'it.baseModel.id == modelId')
 
+# [R10] the pre-fix shape: the emptiness probe is a raw blob read per session.
+DEBUG_PRE_FIX_PROBE = DEBUG_GREEN.replace(
+    """            // [fix/dv23-a5] the emptiness probe is a COUNT, never a blob read
+            if (!includeEmpty && repo.messageCount(session.id) == 0) continue""",
+    """            val lastParts = repo.dao.lastMessageParts(session.id)
+            if (!includeEmpty && lastParts == null) continue""",
+)
+
+# [R10] the same bypass through a different DAO door: load the whole message
+# list (a `SELECT *` over messages) to answer a yes/no question.
+DEBUG_RAW_LOADMESSAGES = DEBUG_GREEN.replace(
+    """            // [fix/dv23-a5] the emptiness probe is a COUNT, never a blob read
+            if (!includeEmpty && repo.messageCount(session.id) == 0) continue""",
+    """            if (!includeEmpty && repo.dao.loadMessages(session.id).isEmpty()) continue""",
+)
+
+# [R10] a raw read of a DAO query that only exists in DAO_NEW_BLOB_READ.
+DEBUG_NEW_BLOB_READ_CALL = DEBUG_GREEN.replace(
+    """            // [fix/dv23-a5] the emptiness probe is a COUNT, never a blob read
+            if (!includeEmpty && repo.messageCount(session.id) == 0) continue""",
+    """            if (!includeEmpty && repo.dao.messagesByRole(session.id, "user").isEmpty()) continue""",
+)
+
+# [R10] negative control for over-capture: neither of these can read the blob,
+# so a green verdict here proves the gate is not just banning `.dao.` wholesale.
+DEBUG_NON_BLOB_CALLS = DEBUG_GREEN.replace(
+    """            // [fix/dv23-a5] the emptiness probe is a COUNT, never a blob read
+            if (!includeEmpty && repo.messageCount(session.id) == 0) continue""",
+    """            val n = repo.dao.messageCountForSession(session.id)
+            if (!includeEmpty && n == 0) continue
+            val sessions = repo.dao.listSessions()""",
+)
+
+
 
 def selftest():
     import tempfile
@@ -698,12 +922,12 @@ def selftest():
         shutil.rmtree(tmp, ignore_errors=True)
 
     # --- [R7]-[R9]: the debug RPC read surface -------------------------------
-    def debug_arm(name, debug_body, mutation_body, tag, want):
-        """Grade ONE of the three read-side arms on an isolated fixture tree."""
+    def debug_arm(name, debug_body, mutation_body, tag, want, dao_body=None):
+        """Grade ONE read-side arm on an isolated fixture tree."""
         nonlocal bad
         tmp = tempfile.mkdtemp(prefix="debug-arm-")
         try:
-            build_debug_fixture(tmp, debug_body, mutation_body)
+            build_debug_fixture(tmp, debug_body, mutation_body, dao_body)
             hits = [f for f in check_debug_surface(tmp) if f.startswith(tag)]
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -734,6 +958,33 @@ def selftest():
     debug_arm("r9-single-resolver", DEBUG_GREEN, MUTATION_GREEN, "[R9]", "PASS")
     debug_arm("r9-mutation-local-predicate", DEBUG_GREEN, MUTATION_LOCAL_PREDICATE, "[R9]", "FAIL")
     debug_arm("r9-composite-arm-dropped", DEBUG_BARE_PREDICATE, MUTATION_GREEN, "[R9]", "FAIL")
+
+    # [R10] [fix/dv23-a5] the debug RPCs must never read parts_json through a
+    # raw DAO path — the COUNT probe is the shape, the blob read is the bug.
+    debug_arm("r10-count-probe", DEBUG_GREEN, MUTATION_GREEN, "[R10]", "PASS")
+    debug_arm("r10-raw-lastMessageParts", DEBUG_PRE_FIX_PROBE, MUTATION_GREEN, "[R10]", "FAIL")
+    debug_arm("r10-raw-loadMessages", DEBUG_RAW_LOADMESSAGES, MUTATION_GREEN, "[R10]", "FAIL")
+    # teeth are not hardcoded to the two known names: a DAO that grows a new
+    # blob read is covered the day it lands.
+    debug_arm("r10-new-dao-blob-read-used", DEBUG_NEW_BLOB_READ_CALL,
+              MUTATION_GREEN, "[R10]", "FAIL", dao_body=DAO_NEW_BLOB_READ)
+    # ... and the derivation must not over-reach: a star over sessions and a
+    # COUNT over messages are NOT blob reads, so calling them stays green.
+    debug_arm("r10-non-blob-queries-allowed", DEBUG_NON_BLOB_CALLS,
+              MUTATION_GREEN, "[R10]", "PASS", dao_body=DAO_GREEN)
+    # fail-closed: no DAO to derive from is RED, not silently green.
+    _tmp = tempfile.mkdtemp(prefix="r10-nodao-")
+    try:
+        build_debug_fixture(_tmp, DEBUG_GREEN, MUTATION_GREEN)
+        os.remove(os.path.join(_tmp, DAO_REL))
+        _hits = [f for f in check_debug_surface(_tmp) if f.startswith("[R10]")]
+        if not _hits or "FAIL" not in _hits[0]:
+            print("  SELFTEST r10-missing-dao: FAIL (gate went blind without ChatDao.kt)")
+            bad += 1
+        else:
+            print("  SELFTEST r10-missing-dao: OK (fails closed)")
+    finally:
+        shutil.rmtree(_tmp, ignore_errors=True)
 
     # the whole gate must still flip RED on the pre-fix read surface
     tmp = tempfile.mkdtemp(prefix="funnel-read-neg-")
