@@ -46,6 +46,92 @@ internal fun rootfsFailureState(
     installProgress = null,
 )
 
+/**
+ * [deep-audit-1042 B-05] Is the frame a collector has just received the
+ * StateFlow's REPLAY of an already-known terminal, or a live event?
+ *
+ * `RootfsManager.installState` is a StateFlow, so a new collector's very first
+ * frame is always the flow's current value. And the manager never leaves a
+ * terminal: all eight of its write sites publish `Installed` / `Failed` and
+ * none of them resets to `Idle`, so "current value" at the moment a new
+ * operation starts is the PREVIOUS operation's verdict. Applying that replay
+ * was two defects at once:
+ *
+ *  - the stale `Installed` arm cleared the `installProgress = 0f` the caller had
+ *    just published, so the bar vanished for the whole apk-repair phase
+ *    (Stages 1/2/2.5/2.6 publish nothing — only the Stage-3 `reset()` does);
+ *  - the stale `Failed` arm set `isProcessing = false`, which is exactly the
+ *    flag the screen disables Repair/Reset on (`enabled = !state.isProcessing`),
+ *    so the in-flight guard inverted and a second VM migration could be
+ *    started on top of the first, with the old failure text rendered over the
+ *    new operation's eventual success.
+ *
+ * Gated on the FIRST frame and on instance identity (`===`) on purpose:
+ * `RootfsManager` constructs a fresh `Failed(...)` for every verdict it
+ * publishes, so a live failure is never the same instance as the stale one
+ * even when the texts match, and a live re-publication of the `Installed`
+ * singleton is still applied once [firstFrame] has been consumed.
+ *
+ * The alternative spelling — `installState.dropWhile { it === prior }` — was
+ * rejected: `dropWhile` keeps dropping *leading* frames while its predicate
+ * holds, so it swallows more than the replay (a legitimate re-issued terminal
+ * of the same identity, and with an equality-based predicate any later `Idle`),
+ * and the special case never ends. One frame, decided once, is the whole
+ * contract.
+ *
+ * Only terminals are treated as replays: a non-terminal current value means an
+ * operation really is in flight, and its progress must be mirrored.
+ */
+internal fun isStaleInstallReplay(
+    firstFrame: Boolean,
+    state: RootfsInstallState,
+    priorTerminal: RootfsInstallState,
+): Boolean = firstFrame &&
+    state === priorTerminal &&
+    (state is RootfsInstallState.Installed || state is RootfsInstallState.Failed)
+
+/**
+ * [deep-audit-1042 B-05] The settlement of [RootfsManagementViewModel.repairRootfs]:
+ * the verdict the manager published outranks the boolean `autoRepair()` returned.
+ *
+ * `autoRepair()`'s last stage is a full `reset()`, and `installIfNeeded()`
+ * reports its disk-space gate by publishing `Failed(rootfs_insufficient_space)`
+ * and RETURNING — it never throws. The old settlement branched on `repaired`
+ * alone and wrote `rootfs_msg_repair_missing` unconditionally, so a refusal for
+ * lack of storage was announced as "repair failed — still missing: …", i.e.
+ * the sandbox was reported as corrupt when the real reason was free space.
+ * `install` / `resetRootfs` already settle through the published terminal
+ * (see [RootfsManagementViewModel.settleRootfsOperation]); repair must consult
+ * the same source.
+ *
+ * Kept pure (like [rootfsFailureState]) so the three-way decision runs on a
+ * JVM without an Android runtime. The refused arm reuses [rootfsFailureState]
+ * rather than re-listing the fields — the same transition was already written
+ * out twice in this file, and a third copy is exactly how the two got out of
+ * step in the first place.
+ */
+internal fun rootfsRepairState(
+    current: RootfsManagementUiState,
+    terminal: RootfsInstallState,
+    repaired: Boolean,
+    repairedMessage: String,
+    stillMissingMessage: String,
+): RootfsManagementUiState = when {
+    terminal is RootfsInstallState.Failed -> rootfsFailureState(current, terminal.error)
+    repaired -> current.copy(
+        isProcessing = false,
+        lastOperationSuccess = true,
+        resultMessage = repairedMessage,
+        installProgress = null,
+    )
+    else -> current.copy(
+        isProcessing = false,
+        lastOperationSuccess = false,
+        resultMessage = stillMissingMessage,
+        installProgress = null,
+    )
+}
+
 class RootfsManagementViewModel : ViewModel() {
 
     private val _uiState = MutableStateFlow(RootfsManagementUiState())
@@ -55,13 +141,27 @@ class RootfsManagementViewModel : ViewModel() {
 
     /**
      * Subscribe to the manager's installState and mirror progress + status
-     * text into [_uiState]. Cancelled on completion so we don't leak a job
-     * across multiple install() calls.
+     * text into [_uiState]. The job is cancelled by whoever settles the
+     * operation ([settleRootfsOperation] / [settleRootfsFailure] / the repair
+     * terminal), and any still-running one is cancelled here before a new
+     * subscription starts, so two operations can never share a collector.
      */
     private fun observeInstallProgress(manager: RootfsManager, ctx: android.content.Context) {
         progressJob?.cancel()
         progressJob = viewModelScope.launch {
+            // [deep-audit-1042 B-05] The value the flow already holds when the
+            // subscription starts. The first frame a StateFlow collector gets is
+            // exactly this value, and `RootfsManager` never resets to `Idle`, so
+            // it is the PREVIOUS operation's terminal — a replay, not an event.
+            // Skipping it is what keeps the progress bar the caller just asked
+            // for on screen and keeps `isProcessing` from being cleared by a
+            // failure that already happened (see [isStaleInstallReplay]).
+            val priorTerminal = manager.installState.value
+            var firstFrame = true
             manager.installState.collect { state ->
+                val replay = isStaleInstallReplay(firstFrame, state, priorTerminal)
+                firstFrame = false
+                if (replay) return@collect
                 when (state) {
                     is RootfsInstallState.Idle -> Unit
                     is RootfsInstallState.Preparing ->
@@ -85,10 +185,9 @@ class RootfsManagementViewModel : ViewModel() {
                         // collector from inside `collect {}` is self-cancellation:
                         // it made "who re-subscribes on the next install()"
                         // depend on how far this emission got before the
-                        // cancellation landed. The terminal state is reached
-                        // exactly once per install, so the job simply ends on
-                        // its own — and `observeInstallProgress` cancels any
-                        // previous job before starting a new one.
+                        // cancellation landed. The cancellation belongs to the
+                        // code that KNOWS the operation is over — the settlement
+                        // terminals, which run outside this collector.
                         _uiState.value = _uiState.value.copy(installProgress = null)
                     }
                     is RootfsInstallState.Failed -> {
@@ -161,6 +260,12 @@ class RootfsManagementViewModel : ViewModel() {
         successMessage: String,
         failureFallback: String,
     ) {
+        // [deep-audit-1042 B-05] The operation is over, so the collector that
+        // mirrored its progress has nothing left to mirror. `StateFlow.collect`
+        // never returns on its own — before this, the job stayed subscribed
+        // until the next `observeInstallProgress()` or until the ViewModel was
+        // cleared, mirroring installState changes this screen did not start.
+        progressJob?.cancel()
         when (val terminal = manager.installState.value) {
             is RootfsInstallState.Installed ->
                 _uiState.value = _uiState.value.copy(
@@ -170,14 +275,13 @@ class RootfsManagementViewModel : ViewModel() {
                     installProgress = null,
                 )
             is RootfsInstallState.Failed ->
-                _uiState.value = _uiState.value.copy(
-                    isProcessing = false,
-                    lastOperationSuccess = false,
-                    // The manager's own message (e.g. the existing
-                    // `rootfs_insufficient_space` resource) passes through.
-                    resultMessage = terminal.error,
-                    installProgress = null,
-                )
+                // The manager's own message (e.g. the existing
+                // `rootfs_insufficient_space` resource) passes through.
+                // [deep-audit-1042 B-05] Same transition the `catch` arms use
+                // (rootfsFailureState) — it was written out twice in this file,
+                // and a third copy in `repairRootfs` would have been how it
+                // drifted next.
+                _uiState.value = rootfsFailureState(_uiState.value, terminal.error)
             else ->
                 _uiState.value = _uiState.value.copy(
                     isProcessing = false,
@@ -204,6 +308,10 @@ class RootfsManagementViewModel : ViewModel() {
      * it is never rendered as the user-facing result line.
      */
     private fun settleRootfsFailure(ctx: Context, tag: String, messageRes: Int, e: Exception) {
+        // [deep-audit-1042 B-05] The operation that this failure terminal ends is
+        // over — its progress collector must not survive it (see
+        // [settleRootfsOperation]; StateFlow.collect never ends on its own).
+        progressJob?.cancel()
         AppLogger.error("RootfsManagement", "$tag failed: ${e.message}")
         _uiState.value = rootfsFailureState(_uiState.value, ctx.getString(messageRes))
         refresh(ctx)
@@ -310,15 +418,22 @@ class RootfsManagementViewModel : ViewModel() {
                 val after = withContext(Dispatchers.IO) {
                     manager.verifyIntegrity()
                 }
-                _uiState.value = _uiState.value.copy(
-                    isProcessing = false,
-                    lastOperationSuccess = repaired,
-                    resultMessage = if (repaired) {
-                        ctx.getString(R.string.rootfs_msg_repaired)
-                    } else {
-                        ctx.getString(R.string.rootfs_msg_repair_missing, after.missing.joinToString(", "))
-                    },
-                    installProgress = null,
+                // [deep-audit-1042 B-05] Settle through the manager's PUBLISHED
+                // verdict, the same source `install` / `resetRootfs` read in
+                // [settleRootfsOperation]: `autoRepair()`'s Stage 3 is a full
+                // `reset()`, and `installIfNeeded()` reports its disk-space gate
+                // by publishing `Failed(rootfs_insufficient_space)` and returning
+                // normally — so `repaired == false` alone cannot tell "still
+                // corrupt" from "refused". The old branch wrote the
+                // `rootfs_msg_repair_missing` text unconditionally, which
+                // announced a storage refusal as rootfs corruption.
+                progressJob?.cancel()
+                _uiState.value = rootfsRepairState(
+                    _uiState.value,
+                    manager.installState.value,
+                    repaired,
+                    ctx.getString(R.string.rootfs_msg_repaired),
+                    ctx.getString(R.string.rootfs_msg_repair_missing, after.missing.joinToString(", ")),
                 )
                 refresh(ctx)
             } catch (e: Exception) {
