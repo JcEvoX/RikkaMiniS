@@ -78,6 +78,11 @@ REL_ACTIVITY = "src/android/app/src/main/java/com/rikkaminis/app/MainActivity.kt
 # [deep-audit-1039 A-06] criterion 13 — optional, same stance as criterion 9:
 # the mini-tree fixtures that predate it write only the four files above.
 REL_RUNNER = "src/android/app/src/main/java/com/rikkaminis/app/debug/HeadlessChatRunner.kt"
+# [deep-audit-1043 A-05] criterion 14 derives its entry set from EVERY file in
+# the `debug` package, not just the runner: `ChatMutationMethods.uiPrompt`
+# obtains the screen-owned ViewModel and dispatches into it too.
+REL_DEBUG_DIR = "src/android/app/src/main/java/com/rikkaminis/app/debug"
+REL_MUTATION_FILE = REL_DEBUG_DIR + "/ChatMutationMethods.kt"
 
 # (start token, end token) pairs isolating a call block; the block must
 # contain `required` and must NOT contain `forbidden`.
@@ -382,16 +387,57 @@ def _fn_body_after(code: str, decl_re) -> "str | None":
 # function bodies for the mutation calls, so a new entry is covered the moment
 # it is written and a renamed one does not silently escape (gate criterion 11
 # of §8.7: never hardcode the member count).
-RE_RUNNER_MEMBER_FUN = re.compile(r"(?m)^    (?:private |internal )?(?:suspend )?fun (\w+)\s*\(")
+#
+# [deep-audit-1043 A-05] Two blind spots closed here, both of the same shape
+# ("the derived set was spelled, not derived"):
+#   (a) the mutator list was hardcoded as `vm.<method>(` — `selectEntry` was
+#       missing, so `HeadlessChatRunner.selectModel` (the 6th `viewModel(…)`
+#       call site) was never derived at all;
+#   (b) the scan was pinned to ONE file — `debug/ChatMutationMethods.uiPrompt`
+#       obtains the SAME ViewModel from the store and calls `sendMessage`, but
+#       it was never read, and its call is written `it.sendMessage(text)`
+#       (a `.also { … }` receiver), which the `vm.` prefix could not see either.
+# The criterion now walks every `debug/*.kt`, derives the ChatViewModel
+# receivers per member function, and polices every state-mutating call made on
+# one of them. Receivers it cannot prove are a ChatViewModel are RED
+# (fail-closed) unless they belong to a transport that delegates to another
+# entry in this same package — those are policed on the callee's body, which
+# this criterion also scans.
+RE_MEMBER_FUN = re.compile(r"(?m)^    (?:private |internal )?(?:suspend )?fun (\w+)\s*\(")
 RUNNER_STATE_MUTATORS = (
-    "vm.sendMessage(",
-    "vm.retryFromMessage(",
-    "vm.rerunFromToolBlock(",
-    "vm.compactBefore(",
-    "vm.revertCompact(",
-    "vm.runCompactNow(",
+    "sendMessage",
+    "retryFromMessage",
+    "rerunFromToolBlock",
+    "compactBefore",
+    "revertCompact",
+    "runCompactNow",
+    "selectEntry",
 )
+RE_STATE_MUTATOR_CALL = re.compile(
+    r"(?<![\w.])([A-Za-z_]\w*)\.(%s)\(" % "|".join(RUNNER_STATE_MUTATORS)
+)
+# ChatViewModel bindings, derived from the acquisition expression itself:
+#   `val vm = viewModel(context, sessionId)`      (the runner's factory helper)
+#   `val vm = viewModelForCancel(…)`              (the cancel resolver)
+#   `val vm = … [ChatViewModel::class.java]`      (the store/ViewModelProvider shape)
+#   `… [ChatViewModel::class.java].also { it.… }` (the pre-1043 uiPrompt shape)
+RE_VM_FACTORY_BIND = re.compile(
+    r"\bval\s+(\w+)\s*=\s*(?:[\w.]+\.)?(?:viewModel|viewModelForCancel)\s*\("
+)
+VM_TYPE_MARK = "ChatViewModel::class.java"
+RE_LET_BIND = re.compile(r"\.(?:also|let)\s*\{\s*(\w+)\s*\.")
+# Transports: their calls land on an object of THIS package, and the callee's
+# own body is scanned by this criterion (and is where the barrier belongs).
+# `ChatViewModel` is a type reference (companion / factory), not an instance.
+DELEGATING_RECEIVERS = ("HeadlessChatRunner", "ChatMutationMethods", "ChatViewModel")
 RUNNER_BARRIER_WAIT = "sessionLoaded.first"
+# Bind the decision (an off-Main hop), not one spelling: the `debug` package
+# mixes imported and fully-qualified dispatcher names, and a legal
+# `kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default)`
+# must not read as "waits on Main".
+RE_OFFMAIN_HOP = re.compile(
+    r"withContext\s*\(\s*(?:[A-Za-z_]\w*\.)*Dispatchers\s*\.\s*Default\s*\)"
+)
 RUNNER_OFFMAIN_HOP = "withContext(Dispatchers.Default)"
 RUNNER_BOUND_WAIT = "withTimeoutOrNull("
 
@@ -433,27 +479,66 @@ def _body_span_after(code: str, paren_hint: int) -> "tuple[int, int] | None":
     return None if end is None else (open_idx, end + 1)
 
 
-def _runner_member_spans(code: str) -> "list[tuple[str, int, int]]":
-    """(name, body_start, body_end) for every member function in [code]."""
+def _member_spans(code: str) -> "list[tuple[str, int, int]]":
+    """(name, span_start, span_end) for every member function in [code].
+
+    Spans are delimited by the NEXT member declaration, not by the first brace
+    after the parameter list: an expression-bodied member that does not end in
+    a trailing lambda (`private fun app(context: Context): MinisApp = …`) has
+    no body brace at all, and a brace-hunting walk would hand that member the
+    following function's body — attributing its mutator calls to the wrong
+    entry and skipping the real owner.
+    """
+    decls = list(RE_MEMBER_FUN.finditer(code))
     spans = []
-    for m in RE_RUNNER_MEMBER_FUN.finditer(code):
-        span = _body_span_after(code, m.end() - 1)
-        if span is None:
-            continue
-        spans.append((m.group(1), span[0], span[1]))
+    for i, m in enumerate(decls):
+        end = decls[i + 1].start() if i + 1 < len(decls) else len(code)
+        spans.append((m.group(1), m.start(), end))
     return spans
 
 
+def _derived_vm_receivers(body: str) -> "set[str]":
+    """Names bound to a ChatViewModel in [body] (per function, not per file).
+
+    Derived from the acquisition expression so a rename is still covered: the
+    factory helpers by name, the store/`ViewModelProvider` shape by the
+    `[ChatViewModel::class.java]` projection it terminates in, and the
+    `.also { it… }` / `.let { it… }` lambda parameter. The projection arm binds
+    the NEAREST preceding `val x =` only when nothing re-binds in between
+    (`return` / another `val`), which is what keeps an unrelated
+    `[ChatViewModel::class.java]` inside `runCatching { … }` from minting a
+    bogus receiver name.
+    """
+    names = {m.group(1) for m in RE_VM_FACTORY_BIND.finditer(body)}
+    idx = 0
+    while True:
+        i = body.find(VM_TYPE_MARK, idx)
+        if i == -1:
+            break
+        idx = i + 1
+        binds = list(re.finditer(r"\bval\s+(\w+)\s*=", body[:i]))
+        if not binds:
+            continue
+        tail = body[binds[-1].end() : i]
+        if "return" in tail or "val " in tail:
+            continue
+        names.add(binds[-1].group(1))
+    for m in RE_LET_BIND.finditer(body):
+        names.add(m.group(1))
+    return names
+
+
 def _offmain_bounded_blocks(prefix: str) -> "list[tuple[int, int]]":
-    """Spans of every `withContext(Dispatchers.Default) { … }` inside [prefix]."""
+    """Spans of every off-Main `withContext(Dispatchers.Default) { … }` in [prefix]."""
     blocks = []
     pos = 0
     while True:
-        d = prefix.find(RUNNER_OFFMAIN_HOP, pos)
-        if d == -1:
+        m = RE_OFFMAIN_HOP.search(prefix, pos)
+        if m is None:
             break
-        pos = d + 1
-        brace = prefix.find("{", d)
+        d = m.start()
+        pos = m.end()
+        brace = prefix.find("{", m.end())
         if brace == -1:
             continue
         end = _match_brace(prefix, brace)
@@ -463,55 +548,93 @@ def _offmain_bounded_blocks(prefix: str) -> "list[tuple[int, int]]":
     return blocks
 
 
-def _session_barrier_violations(code: str) -> "list[str]":
+def _session_barrier_violations(rel: str, code: str) -> "list[str]":
     out: "list[str]" = []
-    spans = _runner_member_spans(code)
-    for token in RUNNER_STATE_MUTATORS:
-        idx = 0
-        while True:
-            j = code.find(token, idx)
-            if j == -1:
+    spans = _member_spans(code)
+    for m in RE_STATE_MUTATOR_CALL.finditer(code):
+        j = m.start()
+        receiver = m.group(1)
+        token = m.group(2) + "("
+        owner = None
+        for name, s, e in spans:
+            if s <= j < e:
+                owner = (name, s, e)
                 break
-            idx = j + 1
-            owner = None
-            for name, s, e in spans:
-                if s <= j < e:
-                    owner = (name, s)
-                    break
-            if owner is None:
-                out.append(
-                    "HeadlessChatRunner.kt: `%s` no longer sits inside a member "
-                    "function body — criterion 14 cannot prove the caller awaits "
-                    "`sessionLoaded` before it (re-anchor, do not drop it)" % token[:-1]
-                )
-                continue
-            name, body_start = owner
-            prefix = code[body_start:j]
-            if RUNNER_BARRIER_WAIT not in prefix:
-                out.append(
-                    "HeadlessChatRunner.kt: `%s` mutates the ViewModel's in-memory "
-                    "turn state at `%s` without awaiting the `sessionLoaded` latch "
-                    "first — `_activeEntryId` flips at load step 1 and the latch only "
-                    "at step 2's finally, so in that window the id resolves to "
-                    "nothing, the mutation drops silently, and the settle branch "
-                    "reports Completed for a run that never began"
-                    % (name, token[:-1])
-                )
-                continue
-            k = prefix.rfind(RUNNER_BARRIER_WAIT)
-            covered = any(
-                b < k < e and RUNNER_BOUND_WAIT in prefix[b:e]
-                for b, e in _offmain_bounded_blocks(prefix)
+        if owner is None:
+            out.append(
+                "%s: `%s.%s` no longer sits inside a member function body — "
+                "criterion 14 cannot prove the caller awaits `sessionLoaded` "
+                "before it (re-anchor, do not drop it)"
+                % (rel, receiver, m.group(2))
             )
-            if not covered:
-                out.append(
-                    "HeadlessChatRunner.kt: the `sessionLoaded` wait in `%s` is not "
-                    "a BOUNDED OFF-MAIN hop — it must sit inside "
-                    "`withContext(Dispatchers.Default) { withTimeoutOrNull(…) { … } }`. "
-                    "Waiting on Main deadlocks the load that flips the latch; waiting "
-                    "without a timeout pins the RPC connection forever when the load "
-                    "never completes" % name
-                )
+            continue
+        name, body_start, body_end = owner
+        if receiver in DELEGATING_RECEIVERS:
+            # A transport handing the call to another entry of this package:
+            # that entry's own body is scanned here too, and the barrier
+            # belongs to it (waiting in the transport would wait for the VM the
+            # callee resolves, not this one).
+            continue
+        if receiver not in _derived_vm_receivers(code[body_start:body_end]):
+            out.append(
+                "%s: cannot prove `%s` in `%s` is a ChatViewModel — criterion 14 "
+                "only polices calls made on a receiver derived from a "
+                "ChatViewModel acquisition (`val x = viewModel(…)` / "
+                "`val x = …[ChatViewModel::class.java]` / `.also { it… }`). "
+                "Either acquire it that way or add the delegating owner to "
+                "DELEGATING_RECEIVERS — do not let the entry escape unproven"
+                % (rel, receiver, name)
+            )
+            continue
+        prefix = code[body_start:j]
+        if RUNNER_BARRIER_WAIT not in prefix:
+            out.append(
+                "%s: `%s` mutates the ViewModel's in-memory turn state at `%s` "
+                "without awaiting the `sessionLoaded` latch first — "
+                "`_activeEntryId` flips at load step 1 and the latch only at "
+                "step 2's finally, so in that window the id/message list/model "
+                "is still the constructor default: the mutation drops (or is "
+                "rolled back by the late apply) and the settle branch reports "
+                "the pre-load value as if it were live"
+                % (rel, name, token[:-1])
+            )
+            continue
+        k = prefix.rfind(RUNNER_BARRIER_WAIT)
+        covered = any(
+            b < k < e and RUNNER_BOUND_WAIT in prefix[b:e]
+            for b, e in _offmain_bounded_blocks(prefix)
+        )
+        if not covered:
+            out.append(
+                "%s: the `sessionLoaded` wait in `%s` is not a BOUNDED OFF-MAIN "
+                "hop — it must sit inside "
+                "`withContext(Dispatchers.Default) { withTimeoutOrNull(…) { … } }`. "
+                "Waiting on Main deadlocks the load that flips the latch; waiting "
+                "without a timeout pins the RPC connection forever when the load "
+                "never completes" % (rel, name)
+            )
+    return out
+
+
+def _session_barrier_violations_in(root: Path) -> "list[str]":
+    """Criterion 14 over the whole `debug` package (derived file set)."""
+    debug_dir = root / REL_DEBUG_DIR
+    files = sorted(debug_dir.glob("*.kt")) if debug_dir.is_dir() else []
+    if not files:
+        # Backward compat: the four-file mini-tree fixtures predate the runner.
+        # A fixture that carries it as a single file keeps working; a tree with
+        # neither is vacuously green (criterion 13 in the same stance).
+        single = root / REL_RUNNER
+        files = [single] if single.is_file() else []
+    out: "list[str]" = []
+    for p in files:
+        try:
+            rel = str(p.relative_to(root))
+        except ValueError:
+            rel = p.name
+        out.extend(
+            _session_barrier_violations(rel, strip_comments(p.read_text(encoding="utf-8")))
+        )
     return out
 
 
@@ -943,11 +1066,13 @@ def check(root: Path) -> int:
                     "cancel"
                 )
 
-        # --- 14. [deep-audit-1042 A-05] every headless entry that mutates the
-        #     ViewModel's in-memory turn state awaits the `sessionLoaded`
-        #     latch BEFORE the mutation. Entry set is derived from the call
-        #     sites, so a new entry is covered without editing this gate. ---
-        errors.extend(_session_barrier_violations(runner))
+    # --- 14. [deep-audit-1042 A-05 / 1043 A-05] every entry that mutates the
+    #     ViewModel's in-memory turn state awaits the `sessionLoaded` latch
+    #     BEFORE the mutation. Files, entries and receivers are all derived
+    #     (every `debug/*.kt`, every state-mutating call on a
+    #     ChatViewModel-typed receiver), so a new entry — or a new file — is
+    #     covered without editing this gate. ---
+    errors.extend(_session_barrier_violations_in(root))
 
     if errors:
         for e in errors:
@@ -1208,6 +1333,109 @@ _RUNNER_BARRIER_MUTATIONS = (
     ),
 )
 
+# --- criterion 14 [deep-audit-1043 A-05]: the SECOND file ---------------------
+# `debug/ChatMutationMethods.uiPrompt` obtains the SAME screen-owned ViewModel
+# from the store and dispatches into it — an entry the pre-1043 criterion could
+# not see (it read one file and matched a `vm.` prefix, while this call is
+# written `it.sendMessage(text)`). The fixture is faithful to the post-fix
+# production shape: fully-qualified coroutine calls, a projection-only
+# acquisition, and an expression-bodied `app(…)` helper with NO body brace
+# (a brace-hunting member walk would hand its body to the next function).
+FIXTURE_MUTATION = '''package com.rikkaminis.app.debug
+
+internal object ChatMutationMethods {
+    private fun app(context: Context): MinisApp =
+        context.applicationContext as? MinisApp ?: throw RPCException(-32000, "no app")
+
+    suspend fun uiPrompt(context: Context, text: String): JSONObject {
+        val app = app(context)
+        val vm = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+            androidx.lifecycle.ViewModelProvider(
+                ChatViewModelStore.ownerFor(sessionId),
+                ChatViewModel.factory(sessionId = sessionId),
+            )[com.rikkaminis.app.ui.chat.ChatViewModel::class.java]
+        }
+        val sessionReady = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
+            kotlinx.coroutines.withTimeoutOrNull(5000L) { vm.sessionLoaded.first { it } }
+        }
+        if (sessionReady == null) {
+            throw RPCException(-32000, "session_not_loaded_in_5s")
+        }
+        val started = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+            vm.sendMessage(text)
+            vm.isStreaming.value
+        }
+        return JSONObject()
+    }
+}
+'''
+
+_R_MUT_BARRIER_BLOCK = (
+    "        val sessionReady = kotlinx.coroutines.withContext("
+    "kotlinx.coroutines.Dispatchers.Default) {\n"
+    "            kotlinx.coroutines.withTimeoutOrNull(5000L) "
+    "{ vm.sessionLoaded.first { it } }\n"
+    "        }\n"
+    "        if (sessionReady == null) {\n"
+    "            throw RPCException(-32000, \"session_not_loaded_in_5s\")\n"
+    "        }\n"
+)
+
+_R_MUT_DISPATCH_BLOCK = (
+    "        val started = kotlinx.coroutines.withContext("
+    "kotlinx.coroutines.Dispatchers.Main) {\n"
+    "            vm.sendMessage(text)\n"
+    "            vm.isStreaming.value\n"
+    "        }\n"
+)
+
+_R_MUT_ACQUISITION = (
+    "        val vm = kotlinx.coroutines.withContext("
+    "kotlinx.coroutines.Dispatchers.Main) {\n"
+    "            androidx.lifecycle.ViewModelProvider(\n"
+    "                ChatViewModelStore.ownerFor(sessionId),\n"
+    "                ChatViewModel.factory(sessionId = sessionId),\n"
+    "            )[com.rikkaminis.app.ui.chat.ChatViewModel::class.java]\n"
+    "        }\n"
+)
+
+assert _R_MUT_BARRIER_BLOCK in FIXTURE_MUTATION, "mutation fixture: barrier block moved"
+assert _R_MUT_DISPATCH_BLOCK in FIXTURE_MUTATION, "mutation fixture: dispatch block moved"
+assert _R_MUT_ACQUISITION in FIXTURE_MUTATION, "mutation fixture: acquisition moved"
+
+# (name, mutation-file fixture, anchor that must have been replaced)
+_MUTATION_FILE_MUTATIONS = (
+    (
+        "the second file's uiPrompt drops the barrier (MUT-B6)",
+        FIXTURE_MUTATION.replace(_R_MUT_BARRIER_BLOCK, ""),
+        _R_MUT_BARRIER_BLOCK,
+    ),
+    (
+        "the pre-1043 uiPrompt shape (`.also { it.sendMessage }`, no barrier) "
+        "is caught even though the receiver is not `vm` (MUT-B7)",
+        FIXTURE_MUTATION.replace(_R_MUT_DISPATCH_BLOCK, "        vm.also { it.sendMessage(text) }\n")
+        .replace(_R_MUT_BARRIER_BLOCK, ""),
+        _R_MUT_DISPATCH_BLOCK,
+    ),
+    (
+        "the ViewModel acquisition no longer derives a receiver — fail-closed, "
+        "not silently skipped (MUT-B9)",
+        FIXTURE_MUTATION.replace(_R_MUT_ACQUISITION, "        val vm = buildUiViewModel()\n"),
+        _R_MUT_ACQUISITION,
+    ),
+)
+
+# `selectEntry` was missing from the mutator list, so the 6th `viewModel(…)`
+# call site (selectModel) was outside the derived set entirely.
+_RUNNER_SELECT_MODEL_ENTRY = (
+    "\n    suspend fun selectModel(context: Context, sessionId: String): Pair<String, String> "
+    "= withContext(Dispatchers.Main) {\n"
+    "        val vm = viewModel(context, sessionId)\n"
+    "        vm.selectEntry(entryId)\n"
+    "        vm.modelName.value to vm.thinkingLevel.value.name\n"
+    "    }\n"
+)
+
 # Each mutation is (name, fixture-mutator) applied to the GREEN fixture set.
 # The mutated tree MUST go red for the gate to have teeth.
 MUTATIONS = [
@@ -1376,7 +1604,8 @@ def selftest() -> int:
 
     def run_tree(screen: str, nav: str, move: str, store: str,
                  activity: "str | None" = None,
-                 runner: "str | None" = None) -> "tuple[int, list[str]]":
+                 runner: "str | None" = None,
+                 mutation: "str | None" = None) -> "tuple[int, list[str]]":
         with tempfile.TemporaryDirectory() as td:
             tdp = Path(td)
             for rel in (REL_SCREEN, REL_NAV, REL_MOVE, REL_STORE):
@@ -1394,6 +1623,10 @@ def selftest() -> int:
                 f = tdp / REL_RUNNER
                 f.parent.mkdir(parents=True, exist_ok=True)
                 f.write_text(runner, encoding="utf-8")
+            if mutation is not None:
+                f = tdp / REL_MUTATION_FILE
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text(mutation, encoding="utf-8")
             rc = check(tdp)
             return rc, list(errors)
 
@@ -1582,6 +1815,49 @@ def selftest() -> int:
             failures.append(f"criterion 14 {name}: gate stayed GREEN (no teeth)")
         else:
             print(f"selftest: criterion 14 {name} -> RED ({len(errs)} violation(s)) OK")
+
+    # --- criterion 14 [deep-audit-1043 A-05]: the derived set spans the whole
+    #     `debug` package and the receiver is derived, not spelled `vm.` ------
+    rc, errs = run_tree(
+        screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY,
+        FIXTURE_RUNNER_BARRIER, FIXTURE_MUTATION)
+    if rc != 0:
+        failures.append(
+            f"criterion 14 second-file (ChatMutationMethods) GREEN fixture unexpectedly red: {errs}")
+    else:
+        print("selftest: criterion 14 second-file (ChatMutationMethods) GREEN fixture passes")
+
+    for name, mut_fixture, anchor in _MUTATION_FILE_MUTATIONS:
+        if mut_fixture == FIXTURE_MUTATION:
+            failures.append(f"criterion 14 {name}: mutation is a no-op (anchor not found)")
+            continue
+        rc, errs = run_tree(
+            screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY,
+            FIXTURE_RUNNER_BARRIER, mut_fixture)
+        if rc == 0:
+            failures.append(f"criterion 14 {name}: gate stayed GREEN (no teeth)")
+        else:
+            print(f"selftest: criterion 14 {name} -> RED ({len(errs)} violation(s)) OK")
+
+    # selectEntry is the mutator the pre-1043 list was missing: an entry that
+    # switches the session's model without the latch wait must be RED.
+    select_model_fixture = (
+        FIXTURE_RUNNER_BARRIER[: FIXTURE_RUNNER_BARRIER.rfind("}\n")]
+        + _RUNNER_SELECT_MODEL_ENTRY + "}\n"
+    )
+    if select_model_fixture == FIXTURE_RUNNER_BARRIER:
+        failures.append("criterion 14 selectEntry arm: mutation is a no-op (anchor not found)")
+    else:
+        rc, errs = run_tree(
+            screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY, select_model_fixture)
+        if rc == 0:
+            failures.append(
+                "criterion 14 a selectModel entry without the barrier (MUT-B8, "
+                "selectEntry): gate stayed GREEN (no teeth)")
+        else:
+            print(
+                "selftest: criterion 14 a selectModel entry without the barrier "
+                f"(MUT-B8, selectEntry) -> RED ({len(errs)} violation(s)) OK")
 
     if failures:
         print("\nselftest FAILURES:")
