@@ -347,6 +347,181 @@ def scan_queue_drain(root):
             )
     return findings
 
+# ─────────────────────────────────────────────────────────────────────────
+# [§1042-A-07 deep-audit-1042] staged-bytes ledger section
+#
+# A-07: `ShareReceiverActivity.debitStagedBytes` clamped a DISCARDED copy —
+# `totalStagedBytes.addAndGet(-bytes).coerceAtLeast(0L)` written as a
+# statement. The counter went negative on a double debit and the cumulative
+# 500 MB cap under-counted.
+#
+# Why NOT a generic WATCHLIST entry for coerce*: measured on the real tree
+# (2026-10-22, `probe/inject_watchlist.py`), the three names hit 15 sites and
+# ALL 15 are legitimate — parameter-list continuation lines, single-expression
+# function tails (`= x.coerceIn(...)`), assignment continuations, `.let` tails.
+# Worse, the generic statement-position regex cannot even SEE the defect's own
+# shape (the receiver is an infix call result, not a simple identifier), so it
+# would have been 15 false positives and zero teeth. The specialized criteria
+# below anchor the DECISION POINTS instead:
+#
+#   S1  debitStagedBytes must write the clamped balance back THROUGH the
+#       ledger (updateAndGet/set on a receiver named `stagedBytes`), never
+#       `.coerce*` on a discarded copy;
+#   S2  the AttachText branch must guard the write through the pure
+#       admission core (`admitAttachText`) AND credit the ledger after it —
+#       a bare `writeText` with no guard is the pre-fix shape;
+#   S3  every reference to the counter goes through the ledger — a bare
+#       `AtomicLong` named totalStagedBytes in this file means someone
+#       re-inlined the raw counter (fail-closed).
+# ─────────────────────────────────────────────────────────────────────────
+
+SHARE_FILE = "share/ShareReceiverActivity.kt"
+LEDGER_FILE = "share/StagedBytesLedger.kt"
+
+def scan_staged_bytes(root):
+    findings = []
+    base = os.path.join(root, SRC_SUBDIR, "com", "rikkaminis", "app")
+    share_path = os.path.join(base, *SHARE_FILE.split("/"))
+    ledger_path = os.path.join(base, *LEDGER_FILE.split("/"))
+    if not os.path.isfile(share_path):
+        if os.path.isdir(os.path.dirname(share_path)):
+            findings.append("%s:?  [A-07 S1] ShareReceiverActivity.kt missing while share/ exists — the staged-bytes criteria lost their anchor (fail-closed)" % SHARE_FILE)
+        return findings
+    code = code_only(open(share_path, encoding="utf-8", errors="replace").read())
+    lines = code.split("\n")
+
+    def body(sig_re):
+        i0, i1 = extract_block(lines, sig_re)
+        if i0 < 0:
+            return None
+        return i0, i1, "\n".join(lines[i0:i1 + 1])
+
+    # S1: the debit must write the clamp back through the ledger.
+    debit = body(re.compile(r"fun\s+debitStagedBytes\s*\("))
+    if debit is None:
+        findings.append("%s:?  [A-07 S1] debitStagedBytes body NOT FOUND (fail-closed)" % SHARE_FILE)
+    else:
+        i0, i1, dbody = debit
+        if re.search(r"\.coerce(?:AtLeast|AtMost|In)\s*\(", dbody):
+            findings.append(
+                "%s:%d  [A-07 S1] debitStagedBytes applies a clamp inside its body — the "
+                "2026 defect clamped a DISCARDED copy (`addAndGet(-b).coerceAtLeast(0)` as a "
+                "statement); the clamped write-back must live in StagedBytesLedger.debit" % (SHARE_FILE, i0 + 1)
+            )
+        if not re.search(r"stagedBytes\.debit\s*\(", dbody):
+            findings.append(
+                "%s:%d  [A-07 S1] debitStagedBytes does not route through the ledger "
+                "(`stagedBytes.debit(…)`) — a raw AtomicLong update here can re-ship the "
+                "discarded-clamp defect" % (SHARE_FILE, i0 + 1)
+            )
+
+    # S3: the raw counter must not be re-inlined in this file.
+    if re.search(r"\btotalStagedBytes\b", code):
+        for i, ln in enumerate(lines):
+            if re.search(r"\btotalStagedBytes\b", ln):
+                findings.append(
+                    "%s:%d  [A-07 S3] bare `totalStagedBytes` AtomicLong re-inlined — every "
+                    "access must go through StagedBytesLedger (fail-closed)" % (SHARE_FILE, i + 1)
+                )
+                break
+
+    # S2: AttachText — guard + credit around the writeText.
+    send = body(re.compile(r"fun\s+handleSingleSend\s*\("))
+    if send is None:
+        findings.append("%s:?  [A-07 S2] handleSingleSend body NOT FOUND (fail-closed)" % SHARE_FILE)
+    else:
+        i0, i1, sbody = send
+        m = re.search(r"is\s+SingleSendDecision\.AttachText\s*->\s*\{", sbody)
+        if not m:
+            findings.append(
+                "%s:%d  [A-07 S2] handleSingleSend lost the AttachText branch — the text-"
+                "staging path moved; re-anchor this criterion" % (SHARE_FILE, i0 + 1)
+            )
+        else:
+            # Brace-match from the branch's own `{` — `code_only` blanked the
+            # strings/comments, so braces here are real. Slicing on the next
+            # `is … ->` line would break the moment that arm is reordered.
+            brace = m.end() - 1
+            depth = 0
+            end = len(sbody) - 1
+            for j in range(brace, len(sbody)):
+                if sbody[j] == "{":
+                    depth += 1
+                elif sbody[j] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = j
+                        break
+            branch = sbody[brace:end + 1]
+            write = re.search(r"writeText\s*\(", branch)
+            admit = re.search(r"admitAttachText\s*\(", branch)
+            credit = re.search(r"stagedBytes\.credit\s*\(", branch)
+            if not write:
+                findings.append(
+                    "%s:%d  [A-07 S2] the AttachText branch no longer writes the text itself "
+                    "(no `writeText`) — the staging path moved; re-anchor this criterion"
+                    % (SHARE_FILE, i0 + 1)
+                )
+            else:
+                if not admit:
+                    findings.append(
+                        "%s:%d  [A-07 S2] the AttachText branch writes text with NO budget guard — "
+                        "long EXTRA_TEXT shares bypassed MAX_FILE_BYTES / MAX_TOTAL_BYTES and the "
+                        "500 MB cap (the pre-fix shape)" % (SHARE_FILE, i0 + 1)
+                    )
+                if not re.search(r"attachTextByteCount\s*\(", branch):
+                    findings.append(
+                        "%s:%d  [A-07 S2] the AttachText branch does not measure the text through "
+                        "attachTextByteCount() — the budget counts UTF-8 BYTES, and an inline char "
+                        "count under-charges every non-ASCII share" % (SHARE_FILE, i0 + 1)
+                    )
+                elif admit.start() > write.start():
+                    findings.append(
+                        "%s:%d  [A-07 S2] the AttachText budget guard runs AFTER the write — a "
+                        "post-mortem check cannot keep the forbidden bytes off disk"
+                        % (SHARE_FILE, i0 + 1)
+                    )
+                if not credit:
+                    findings.append(
+                        "%s:%d  [A-07 S2] the AttachText branch writes text but never credits the "
+                        "staged-bytes ledger — the budget under-counts and admits past the cap"
+                        % (SHARE_FILE, i0 + 1)
+                    )
+                elif credit.start() < write.start():
+                    findings.append(
+                        "%s:%d  [A-07 S2] the AttachText branch credits the ledger BEFORE the "
+                        "write — a failed write would leave phantom bytes counted against the cap"
+                        % (SHARE_FILE, i0 + 1)
+                    )
+
+    # S2b: the admission core itself must exist with the strict > shape.
+    if not os.path.isfile(ledger_path):
+        findings.append("%s:?  [A-07 S2] StagedBytesLedger.kt missing while the share file "
+                        "routes through it (fail-closed)" % LEDGER_FILE)
+    else:
+        lcode = code_only(open(ledger_path, encoding="utf-8", errors="replace").read())
+        if not re.search(r"textBytes\s*>\s*maxFileBytes", lcode) or \
+           not re.search(r"currentTotalBytes\s*\+\s*textBytes\s*>\s*maxTotalBytes", lcode):
+            findings.append(
+                "%s:?  [A-07 S2] admitAttachText lost the strict-`>` guard shape — the "
+                "per-file / cumulative caps no longer bound text attachments" % LEDGER_FILE
+            )
+        # Two accepted write-back idioms — the DECISION is "the clamped balance is
+        # written back", not one spelling (same idiom as the fastio NOFOLLOW
+        # criterion, which accepts both explicit and flag-based guards):
+        #   A: updateAndGet { (it - bytes).coerceAtLeast(0L) }   (atomic lambda)
+        #   B: set(total.addAndGet(-bytes).coerceAtLeast(0L))     (one-line set)
+        idiom_a = re.search(r"updateAndGet\s*\{[^{}]*coerceAtLeast\s*\(\s*0", lcode)
+        idiom_b = re.search(r"\.set\s*\([^()]*addAndGet\s*\(\s*-[^()]*\)[^()]*coerceAtLeast\s*\(\s*0", lcode)
+        if not (idiom_a or idiom_b):
+            findings.append(
+                "%s:?  [A-07 S1] StagedBytesLedger.debit lost the clamp-inside-the-write "
+                "(accepted: `updateAndGet { … coerceAtLeast(0L) }` or "
+                "`set(total.addAndGet(-bytes).coerceAtLeast(0L))`) — the negative-balance "
+                "hole is back" % LEDGER_FILE
+            )
+    return findings
+
 FIXTURE = "src/android/app/src/main/java/com/rikkaminis/app/network/Trace.kt"
 _Q = "com.rikkaminis.app.diagnostics.ProviderHealthTracker"
 FIXTURE_LINES = [
@@ -540,6 +715,276 @@ def drain_self_test():
     )
     return 0
 
+# ─────────────────────────────────────────────────────────────────────────
+# [§1042-A-07] staged-bytes self-test — one breaker per criterion, expected
+# literal findings hand-written from the rule table (never derived from a run).
+# ─────────────────────────────────────────────────────────────────────────
+
+STAGED_LEDGER_CLEAN = """package com.rikkaminis.app.share
+
+import java.util.concurrent.atomic.AtomicLong
+
+internal class StagedBytesLedger(initial: Long = 0L) {
+    private val total = AtomicLong(initial)
+
+    fun current(): Long = total.get()
+
+    fun credit(bytes: Long) {
+        if (bytes > 0L) total.addAndGet(bytes)
+    }
+
+    fun debit(bytes: Long) {
+        total.updateAndGet { (it - bytes).coerceAtLeast(0L) }
+    }
+
+    fun reset() {
+        total.set(0L)
+    }
+}
+
+internal fun attachTextByteCount(text: String): Long =
+    text.toByteArray(Charsets.UTF_8).size.toLong()
+
+internal sealed class AttachTextAdmission {
+    object RejectedPerFile : AttachTextAdmission()
+    object RejectedCumulative : AttachTextAdmission()
+    object Admitted : AttachTextAdmission()
+}
+
+internal fun admitAttachText(
+    textBytes: Long,
+    currentTotalBytes: Long,
+    maxFileBytes: Long,
+    maxTotalBytes: Long,
+): AttachTextAdmission = when {
+    textBytes > maxFileBytes -> AttachTextAdmission.RejectedPerFile
+    currentTotalBytes + textBytes > maxTotalBytes -> AttachTextAdmission.RejectedCumulative
+    else -> AttachTextAdmission.Admitted
+}
+"""
+
+def _staged_activity(branch, debit_body=None, extra=""):
+    """Minimal ShareReceiverActivity slice exercising the A-07 criteria."""
+    db = debit_body or "            stagedBytes.debit(bytes)\n"
+    return (
+        "package com.rikkaminis.app.share\n"
+        "\n"
+        "class ShareReceiverActivity {\n"
+        "    companion object {\n"
+        "        private val stagedBytes = StagedBytesLedger()\n"
+        "\n"
+        "        fun resetStagedBytes() {\n"
+        "            stagedBytes.reset()\n"
+        "        }\n"
+        "\n"
+        "        fun debitStagedBytes(bytes: Long) {\n"
+        + db +
+        "        }\n"
+        "    }\n"
+        "\n"
+        "    private fun handleSingleSend(intent: Intent, out: MutableList<Item>) {\n"
+        "        when (val d = decide()) {\n"
+        "            is SingleSendDecision.InlineText -> out += Item(d.text)\n"
+        + branch +
+        "            is SingleSendDecision.Stream -> copy()\n"
+        "            SingleSendDecision.Drop -> Unit\n"
+        "        }\n"
+        "    }\n"
+        "\n"
+        "    private fun discardStagedAttachments(items: List<Item>) {\n"
+        "        for (item in items) {\n"
+        "            debitStagedBytes(item.len())\n"
+        "        }\n"
+        "    }\n"
+        + extra +
+        "}\n"
+    )
+
+STAGED_ATTACH_CLEAN = """            is SingleSendDecision.AttachText -> {
+                val textBytes = attachTextByteCount(d.text)
+                val admission = admitAttachText(
+                    textBytes,
+                    stagedBytes.current(),
+                    MAX_FILE_BYTES,
+                    MAX_TOTAL_BYTES,
+                )
+                when (admission) {
+                    AttachTextAdmission.RejectedPerFile -> log(textBytes)
+                    AttachTextAdmission.RejectedCumulative -> log(textBytes)
+                    AttachTextAdmission.Admitted -> {
+                        File(dir(), name()).writeText(d.text, Charsets.UTF_8)
+                        stagedBytes.credit(textBytes)
+                        out += Item(name())
+                    }
+                }
+            }
+"""
+
+def staged_self_test():
+    import tempfile
+    import shutil
+
+    rel_a = "share/ShareReceiverActivity.kt"
+    rel_l = "share/StagedBytesLedger.kt"
+
+    def run(files):
+        tmp = tempfile.mkdtemp(prefix="stagedguard-")
+        try:
+            for r, text in files.items():
+                p = os.path.join(
+                    tmp, "src/android/app/src/main/java/com/rikkaminis/app", r
+                )
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "w", encoding="utf-8") as fh:
+                    fh.write(text)
+            return scan_staged_bytes(tmp)
+        finally:
+            shutil.rmtree(tmp)
+
+    def clean_tree(activity=None, ledger=None):
+        return {
+            rel_a: activity if activity is not None else _staged_activity(STAGED_ATTACH_CLEAN),
+            rel_l: ledger if ledger is not None else STAGED_LEDGER_CLEAN,
+        }
+
+    results = []
+
+    # 0: clean fixture → no findings.
+    got = run(clean_tree())
+    results.append(("clean fixture exits clean", got == [], got))
+
+    # S1a: the pre-fix shape — debitStagedBytes clamps a discarded copy.
+    n1 = clean_tree(activity=_staged_activity(
+        STAGED_ATTACH_CLEAN,
+        debit_body="            totalStagedBytes.addAndGet(-bytes).coerceAtLeast(0L)\n",
+        extra="        private val totalStagedBytes = java.util.concurrent.atomic.AtomicLong(0)\n",
+    ))
+    got = run(n1)
+    ok = (len(got) == 3 and
+          sum(1 for f in got if "[A-07 S1]" in f and "DISCARDED copy" in f) == 1 and
+          sum(1 for f in got if "[A-07 S1]" in f and "route through the ledger" in f) == 1 and
+          sum(1 for f in got if "[A-07 S3]" in f) == 1)
+    results.append(("S1a: discarded-clamp shape reds S1 (clamp + funnel) and S3", ok, got))
+
+    # S1b: routes to a raw AtomicLong instead of the ledger (no clamp in body).
+    n2 = clean_tree(activity=_staged_activity(
+        STAGED_ATTACH_CLEAN,
+        debit_body="            totalStagedBytes.addAndGet(-bytes)\n",
+        extra="        private val totalStagedBytes = java.util.concurrent.atomic.AtomicLong(0)\n",
+    ))
+    got = run(n2)
+    ok = (len(got) == 2 and
+          sum(1 for f in got if "[A-07 S1]" in f and "route through the ledger" in f) == 1 and
+          sum(1 for f in got if "[A-07 S3]" in f) == 1)
+    results.append(("S1b: raw-counter funnel reds S1 funnel + S3", ok, got))
+
+    # S1c: the ledger's write-back replaced by a bare statement clamp.
+    bad_ledger = STAGED_LEDGER_CLEAN.replace(
+        "        total.updateAndGet { (it - bytes).coerceAtLeast(0L) }\n",
+        "        total.addAndGet(-bytes).coerceAtLeast(0L)\n",
+    )
+    got = run(clean_tree(ledger=bad_ledger))
+    ok = (len(got) == 1 and "[A-07 S1]" in got[0] and "clamp-inside-the-write" in got[0])
+    results.append(("S1c: ledger statement-clamp reds S1 write-back only", ok, got))
+
+    # S2a: the pre-fix AttachText branch — bare write, no guard, no credit.
+    n3 = clean_tree(activity=_staged_activity(
+        """            is SingleSendDecision.AttachText -> {
+                val name = name()
+                File(dir(), name).writeText(d.text, Charsets.UTF_8)
+                out += Item(name)
+            }
+""",
+    ))
+    got = run(n3)
+    ok = (len(got) == 3 and
+          sum(1 for f in got if "[A-07 S2]" in f and "NO budget guard" in f) == 1 and
+          sum(1 for f in got if "[A-07 S2]" in f and "never credits" in f) == 1 and
+          sum(1 for f in got if "[A-07 S2]" in f and "attachTextByteCount()" in f) == 1)
+    results.append(("S2a: unguarded AttachText reds the S2 family only (guard/credit/bytes)", ok, got))
+
+    # S2b: guard runs AFTER the write (post-mortem) — reds the order finding.
+    n4 = clean_tree(activity=_staged_activity(
+        """            is SingleSendDecision.AttachText -> {
+                val textBytes = attachTextByteCount(d.text)
+                File(dir(), name()).writeText(d.text, Charsets.UTF_8)
+                val admission = admitAttachText(textBytes, stagedBytes.current(), MAX_FILE_BYTES, MAX_TOTAL_BYTES)
+                stagedBytes.credit(textBytes)
+                out += Item(name())
+            }
+""",
+    ))
+    got = run(n4)
+    ok = (len(got) == 1 and "[A-07 S2]" in got[0] and "AFTER the write" in got[0])
+    results.append(("S2b: guard after the write reds the order finding only", ok, got))
+
+    # S2e: char count instead of the UTF-8 byte funnel — reds byteCount only.
+    n7 = clean_tree(activity=_staged_activity(
+        STAGED_ATTACH_CLEAN.replace(
+            "val textBytes = attachTextByteCount(d.text)",
+            "val textBytes = d.text.length.toLong()",
+        ),
+    ))
+    got = run(n7)
+    ok = (len(got) == 1 and "[A-07 S2]" in got[0] and "attachTextByteCount()" in got[0])
+    results.append(("S2e: char-count drift reds the byte-funnel finding only", ok, got))
+
+    # S2c: credit BEFORE the write — reds the phantom-bytes finding only.
+    n5 = clean_tree(activity=_staged_activity(
+        STAGED_ATTACH_CLEAN.replace(
+            "                        File(dir(), name()).writeText(d.text, Charsets.UTF_8)\n"
+            "                        stagedBytes.credit(textBytes)\n",
+            "                        stagedBytes.credit(textBytes)\n"
+            "                        File(dir(), name()).writeText(d.text, Charsets.UTF_8)\n",
+        ),
+    ))
+    got = run(n5)
+    ok = (len(got) == 1 and "[A-07 S2]" in got[0] and "BEFORE the write" in got[0])
+    results.append(("S2c: credit before the write reds the phantom-bytes finding only", ok, got))
+
+    # S2d: the admission core lost the strict > shape (>= boundary drift).
+    bad_ledger2 = STAGED_LEDGER_CLEAN.replace(
+        "    textBytes > maxFileBytes -> AttachTextAdmission.RejectedPerFile",
+        "    textBytes >= maxFileBytes -> AttachTextAdmission.RejectedPerFile",
+    )
+    got = run(clean_tree(ledger=bad_ledger2))
+    ok = (len(got) == 1 and "[A-07 S2]" in got[0] and "strict-`>` guard" in got[0])
+    results.append(("S2d: >= boundary drift reds the admission-shape finding only", ok, got))
+
+    # ROT: the ledger file vanished while the activity routes through it.
+    got = run({rel_a: _staged_activity(STAGED_ATTACH_CLEAN)})
+    ok = (len(got) == 1 and "[A-07 S2]" in got[0] and "missing while the share file" in got[0])
+    results.append(("ROT: missing ledger file is a fail-closed finding", ok, got))
+
+    # ROT: the AttachText branch disappeared from handleSingleSend.
+    n6 = clean_tree(activity=_staged_activity(
+        """            is SingleSendDecision.AttachText -> {
+                out += Item(stageText(d.text))
+            }
+""",
+    ))
+    got = run(n6)
+    ok = (len(got) == 1 and "[A-07 S2]" in got[0] and "no longer writes the text itself" in got[0])
+    results.append(("ROT: delegated-away writeText is a re-anchor finding", ok, got))
+
+    failed = [name for name, ok, got in results if not ok]
+    if failed:
+        print("STAGED-BYTES SELF-TEST FAILED (%d breaker(s))" % len(failed))
+        for name, ok, got in results:
+            if not ok:
+                print("  ✗ " + name)
+                for f in got:
+                    print("      " + f)
+        return 1
+    print(
+        "✅ staged-bytes self-test has teeth: S1 (discarded clamp / raw-counter "
+        "funnel / ledger write-back), S2 (unguarded write / guard-after-write / "
+        "credit-before-write / boundary drift), S3 (re-inlined counter) and the "
+        "ROT arms each flip red on exactly their own breaker; clean fixture green"
+    )
+    return 0
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -548,13 +993,17 @@ def main():
     if args[0] == "--self-test":
         rc = self_test()
         rc2 = drain_self_test()
-        return 1 if (rc or rc2) else 0
+        rc3 = staged_self_test()
+        return 1 if (rc or rc2 or rc3) else 0
     violations = scan(args[0])
     # [B-04 deep-audit-1037] queue-drain persistence section. Its findings are
     # pre-formatted `file:line  [criterion] reason` strings, so they are
     # reported in their own block — the watchlist tuple format above is left
     # exactly as it was.
     drain_violations = scan_queue_drain(args[0])
+    # [§1042-A-07 deep-audit-1042] staged-bytes ledger section. Same pre-formatted
+    # file:line [criterion] reason contract as the drain section above.
+    staged_violations = scan_staged_bytes(args[0])
     if violations:
         print("❌ 丢弃了必须消费的返回值（看似接线，实则没生效）：")
         for rel, line, snippet, fn, why in violations:
@@ -570,13 +1019,20 @@ def main():
             print("  %s" % msg)
         print("")
         print("  共 %d 处。" % len(drain_violations))
-    if violations or drain_violations:
+    if staged_violations:
+        print("❌ 分享暂存字节账本段：计数器钳制/守卫不变量被打破（A-07）：")
+        for msg in staged_violations:
+            print("  %s" % msg)
+        print("")
+        print("  共 %d 处。" % len(staged_violations))
+    if violations or drain_violations or staged_violations:
         return 1
     print(
         "✅ discarded-return guard: no watchlisted return value is dropped "
         "(%d watched function(s))" % len(WATCHLIST)
     )
     print("✅ discarded-return guard: queue-drain persistence section green")
+    print("✅ discarded-return guard: share staged-bytes accounting section green")
     return 0
 
 
