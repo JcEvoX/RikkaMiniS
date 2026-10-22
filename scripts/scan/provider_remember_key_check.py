@@ -181,6 +181,31 @@ Criteria (each fail-closed: missing anchor = RED, never silent skip):
       kept feeding "Run again" the config the row had at tap time, and a deleted
       model left the sheet open against a row that no longer exists.
 
+  C30 ProviderListScreen [deep-audit-1041 B-01] — the credential LIVE SOURCE, the
+      read half the C26..C29 family left open. The API key is NOT a
+      `ProviderInstance` field (EncryptedSharedPreferences), so no config field
+      carries it and no plain field key observes an external write; the signal is
+      `config.revision`. C30a = no `remember` initializer may call `loadApiKey()`
+      (blocking keystore I/O on the composition thread — the pre-fix shape). C30b
+      = a producer effect keyed on the instance list AND a revision token, reading
+      through an IO hop, whose result the rows derive from. Fail-closed when the
+      credential read is gone from the file.
+
+  C31 ProviderConnectionScreen [deep-audit-1041 B-01] — the same decision C29
+      grades on ProviderDetailScreen, on the screen the earlier fix missed. A
+      stale snapshot here rolls the credential BACK: pressing Edit seeds the
+      editor from `storedKey`, so the next Save writes the old key over the one an
+      external writer just landed. Fail-closed when the read is gone.
+
+  C32 the model picker's section collapse [deep-audit-1041 B-04] — graded on BOTH
+      the chat sheet and the shared `ModelEntryPicker`, so the private copy that
+      drifted cannot stay silently different. `collapsedInstanceIds` seeds to
+      every instance, so a section that ignores the query renders one summary row
+      and hides the rest of the hits behind a chevron. Two accepted spellings: the
+      conjunctive gate (`<searchBox>.isEmpty() && …contains(id)` — polarity
+      graded: `… && isNotEmpty()` is a red) and a derived set yielding `emptySet()`
+      while searching. Fail-closed when the render decision is gone.
+
 Usage:
   python3 provider_remember_key_check.py <repo_root>   # real-tree mode
   python3 provider_remember_key_check.py --selftest    # fixture mode
@@ -220,6 +245,7 @@ REL_BACKUP_SCREEN = "src/android/app/src/main/java/com/rikkaminis/app/ui/setting
 REL_ADD_MODELS = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/AddModelsToGroupScreen.kt"
 REL_AGENT_LOOP_SHEETS = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/AgentLoopAddSheets.kt"
 REL_MODEL_ENTRY_PICKER = "src/android/app/src/main/java/com/rikkaminis/app/ui/components/ModelEntryPicker.kt"
+REL_MODEL_PICKER_SHEET = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatModelPickerSheet.kt"
 # da1039-B3 (B-03 / B-04 / B-08): the settings screens that read a config object
 # once and then write through it.
 REL_ADD_CUSTOM_MODEL = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/AddCustomModelScreen.kt"
@@ -314,6 +340,54 @@ PD_DELETE_DISMISS_RE = re.compile(
 PD_STORED_KEY = "storedKey"
 PD_REVISION_TOKEN_RE = re.compile(r"\brevision\b")
 PD_LIVE_LIST_RE = re.compile(r"\b(?:allEntries|entries|modelEntries)\b")
+
+# ---- [deep-audit-1041 B-01] C30 / C31: the credential LIVE SOURCE ----------
+# The stored API key is not a `ProviderInstance` field — it lives in
+# EncryptedSharedPreferences — so no part of the config object carries it and no
+# plain field key can observe an external credential write. The available
+# signal is the config revision (bumped by instancesUpdate RPC / provider import
+# / backup restore), paired with the instance list.
+#
+# C30 — ProviderListScreen: the per-row credential snapshot must be produced by
+# an effect keyed on (instance list, revision) that reads through an IO hop, and
+# must NOT be read from a composition-phase `remember` initializer (the pre-fix
+# shape ran blocking keystore I/O on the main thread once per key change).
+# C31 — ProviderConnectionScreen: the masked-key state must be re-read by an
+# effect keyed on (instance id, revision) — the same decision C29 grades on
+# ProviderDetailScreen.
+API_KEY_READ_RE = re.compile(r"\bloadApiKey\s*\(")
+IO_HOP_RE = re.compile(
+    r"withContext\s*\([^)]*Dispatchers\s*\.\s*(?:IO|Default)\b")
+EFFECT_CALLS = ("LaunchedEffect", "produceState")
+
+# ---- [deep-audit-1041 B-04] C32: the collapse read must consult the search --
+# `collapsedInstanceIds` seeds to "all collapsed", so a picker that renders the
+# collapse decision without consulting the search box hides every hit beyond the
+# first one behind a chevron (and, on the sheet, the collapsed summary row is
+# further biased towards the already-selected entry). Two accepted spellings:
+# the conjunctive gate (`searchText.isEmpty() && …contains(id)`) — polarity
+# graded — and the derived-set branch that yields `emptySet()` while searching
+# (the shared ModelEntryPicker's spelling).
+IS_COLLAPSED_DECL_RE = re.compile(r"\bval\s+isCollapsed\s*=\s*")
+IDENT_NAME_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+SEARCH_EMPTY_CALL_RE = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\.\s*(?:isEmpty|isBlank)\s*\(\s*\)")
+
+def _is_search_name(name):
+    """A binding that holds the picker's query (`searchText`, `searchQuery`,
+    `isSearching`, `query`) — matched on the name's meaning, not its spelling,
+    so renaming the box does not silently open the criterion."""
+    low = name.lower()
+    return "search" in low or "query" in low
+
+def search_empty_tests(text):
+    """The `nothing typed yet` predicates in [text]
+    (`<searchBox>.isEmpty()` / `.isBlank()`)."""
+    return [m.group(1) for m in SEARCH_EMPTY_CALL_RE.finditer(text)
+            if _is_search_name(m.group(1))]
+
+def mentions_search(text):
+    return any(_is_search_name(n) for n in IDENT_NAME_RE.findall(text))
 
 
 # C6c — value families a remember initializer can derive from in
@@ -1660,6 +1734,157 @@ def check_provider_detail_live_state(code):
     return results
 
 
+def check_credential_live_source_list(code):
+    """C30 [deep-audit-1041 B-01] — ProviderListScreen's credential snapshot.
+
+    The rows carry an `apiKey` / `isConfigured` pair read from
+    EncryptedSharedPreferences, i.e. from outside the config object, so the
+    pre-fix `remember(instances, config.modelEntries) { … loadApiKey(id) … }`
+    both (a) ran blocking keystore I/O on the composition thread and (b) never
+    re-derived when an external write changed a key (neither `instances` nor
+    `modelEntries` moves). Graded on the two decisions, not the spelling:
+
+    - the read happens OFF the composition thread: no `remember` initializer may
+      contain the credential read;
+    - a producer effect exists whose KEYS resolve back to the instance list and
+      carry a revision token, and whose body performs the read through an IO hop.
+
+    Fail-closed when the credential read is gone from the file entirely (the
+    screen was reworked — re-derive this criterion)."""
+    results = []
+    if not API_KEY_READ_RE.search(code):
+        results.append(("C30", False,
+                        "no `loadApiKey(` read in this file (fail-closed: the row credential "
+                        "snapshot is gone — re-derive this criterion)"))
+        return results
+
+    composition = []
+    for line_no, _keys, _span, init in iter_remember_calls(code, "remember"):
+        if API_KEY_READ_RE.search(init):
+            composition.append(line_no)
+    results.append(("C30a", not composition,
+                    "0 composition-phase credential reads (every loadApiKey sits in a "
+                    "producer effect)" if not composition else
+                    "loadApiKey() runs in a `remember` initializer at line(s) %s — blocking "
+                    "keystore I/O on the composition thread"
+                    % ", ".join(str(x) for x in composition)))
+
+    decls = value_sources(code)
+    producers = []
+    for effect in EFFECT_CALLS:
+        for line_no, keys, _span, init in iter_remember_calls(code, effect):
+            if not API_KEY_READ_RE.search(init):
+                continue
+            flat = keys or ""
+            if not PD_REVISION_TOKEN_RE.search(flat):
+                continue
+            if not derives_from_instances(flat, decls):
+                continue
+            if not IO_HOP_RE.search(init):
+                continue
+            producers.append(line_no)
+    results.append(("C30b", bool(producers),
+                    "the credential snapshot is produced by an effect keyed on the instance "
+                    "list + config revision, reading through an IO hop (L%s)"
+                    % ",".join(str(x) for x in producers) if producers else
+                    "no producer effect keyed on (instance list, <x>.revision) that reads the "
+                    "credentials through an IO hop — an external key write changes neither "
+                    "`instances` nor `modelEntries`, so the row badges stay stale"))
+    return results
+
+def check_credential_live_source_connection(code):
+    """C31 [deep-audit-1041 B-01] — ProviderConnectionScreen must re-read the
+    stored key when the config revision moves (the same decision C29 grades on
+    ProviderDetailScreen, whose fix this screen was missed by).
+
+    On this screen a stale snapshot is worse than a stale badge: pressing Edit
+    seeds the editor from `storedKey`, so the next Save writes the OLD key back
+    over the credential an external writer had just landed. Fail-closed when the
+    credential read is gone from the file entirely."""
+    results = []
+    if not API_KEY_READ_RE.search(code):
+        results.append(("C31", False,
+                        "no `loadApiKey(` read in this file (fail-closed: the stored-key "
+                        "snapshot is gone — re-derive this criterion)"))
+        return results
+    subs = []
+    for line_no, keys, _span, init in iter_remember_calls(code, "LaunchedEffect"):
+        if PD_STORED_KEY not in init or not API_KEY_READ_RE.search(init):
+            continue
+        flat = keys or ""
+        if "instanceId" in flat and PD_REVISION_TOKEN_RE.search(flat):
+            subs.append(line_no)
+    results.append(("C31", bool(subs),
+                    "the stored key is re-read by a LaunchedEffect keyed on the instance id AND "
+                    "the config revision (L%s)" % ",".join(str(x) for x in subs) if subs else
+                    "no `LaunchedEffect(instanceId, <x>.revision)` assigning `%s` — an external "
+                    "key write leaves the previous key on screen and Edit → Save writes it back "
+                    "over the newer one" % PD_STORED_KEY))
+    return results
+
+def _resolve_expr(expr, decls, depth=0, seen=None):
+    """[expr] joined with the file-local declaration tails of the names it uses,
+    so a decision expressed through a local reads as one expression."""
+    if not expr or depth >= 2:
+        return expr or ""
+    seen = seen or set()
+    out = [expr]
+    for name in set(IDENT_RE.findall(expr)):
+        if name in seen:
+            continue
+        sub = decls.get(name)
+        if sub is None:
+            continue
+        out.append(_resolve_expr(sub, decls, depth + 1, seen | {name}))
+    return " ".join(out)
+
+def check_picker_search_gating(code):
+    """C32 [deep-audit-1041 B-04] — a provider section must not render collapsed
+    while the picker's search box holds a query.
+
+    `collapsedInstanceIds` seeds to the full instance set, so a section that
+    matches the query renders its single collapsed summary row and hides every
+    other hit behind a chevron. Two accepted spellings of the decision:
+
+    - conjunctive gate: the collapse read is conjoined (`&&`) with a NO-QUERY
+      test (`<searchBox>.isEmpty()` / `.isBlank()`). Polarity is graded: a
+      `… && <searchBox>.isNotEmpty()` reads the query but inverts the guard and
+      is a red.
+    - derived set: the expression yields `emptySet()` for the searching branch
+      (the shared ModelEntryPicker's spelling), which requires the query to
+      appear in the resolved expression.
+
+    Fail-closed when the render decision is gone (the picker was reworked —
+    re-derive this criterion)."""
+    results = []
+    m = IS_COLLAPSED_DECL_RE.search(code)
+    if not m:
+        results.append(("C32", False,
+                        "no `val isCollapsed = …` section decision (fail-closed: the picker "
+                        "render loop was reworked — re-derive this criterion)"))
+        return results
+    expr = statement_tail(code, m.end())
+    if not expr.strip():
+        results.append(("C32", False,
+                        "`val isCollapsed = ` carries no expression (fail-closed)"))
+        return results
+    if search_empty_tests(expr) and "&&" in expr:
+        results.append(("C32", True,
+                        "the collapse read is gated on the empty-query test: `%s`"
+                        % " ".join(expr.split())[:110]))
+        return results
+    resolved = _resolve_expr(expr, value_sources(code))
+    if "emptySet()" in resolved and mentions_search(resolved):
+        results.append(("C32", True,
+                        "the collapse decision branches on the query and yields emptySet() while "
+                        "searching: `%s`" % " ".join(resolved.split())[:110]))
+        return results
+    results.append(("C32", False,
+                    "the collapse read `%s` never consults the search box — sections stay "
+                    "collapsed while searching, so every hit past the first one is hidden"
+                    % " ".join(expr.split())[:110]))
+    return results
+
 CHECKERS = (
     (REL_PROVIDER_LIST, check_provider_list),
     (REL_SHEET, check_sheet),
@@ -1686,6 +1911,11 @@ CHECKERS = (
     (REL_CONNECTION, check_connection_write_path),
     (REL_ADD_MODELS, check_quick_test_target),
     (REL_AGENT_LOOP_SHEETS, check_quick_test_target),
+    # deep-audit-1041 B-01 (credential live source) / B-04 (search gating)
+    (REL_PROVIDER_LIST, check_credential_live_source_list),
+    (REL_CONNECTION, check_credential_live_source_connection),
+    (REL_MODEL_PICKER_SHEET, check_picker_search_gating),
+    (REL_MODEL_ENTRY_PICKER, check_picker_search_gating),
 )
 
 
@@ -1711,7 +1941,14 @@ def run_tree(root):
 
 FIX_PROVIDER_LIST_CLEAN = """package com.rikkaminis.app.ui.settings
 
-val providerRows: List<ProviderRowData> = remember(instances, config.modelEntries) {
+val instances = config.instances
+var apiKeyByInstanceId by remember { mutableStateOf<Map<String, String?>>(emptyMap()) }
+LaunchedEffect(instances, config.revision) {
+    apiKeyByInstanceId = withContext(Dispatchers.IO) {
+        instances.associate { it.id to providerRepository.loadApiKey(it.id) }
+    }
+}
+val providerRows: List<ProviderRowData> = remember(instances, config.modelEntries, apiKeyByInstanceId) {
     instances.map { it }
 }
 val reorderableRows = remember(providerRows) { providerRows.distinctBy { it.instance.id } }
@@ -1724,7 +1961,49 @@ onTogglePinned = remember(row.instance.id, row.instance.pinned) {
 """
 
 FIX_PROVIDER_LIST_NO_MODEL_ENTRIES = FIX_PROVIDER_LIST_CLEAN.replace(
-    "remember(instances, config.modelEntries)", "remember(instances)")
+    "remember(instances, config.modelEntries, apiKeyByInstanceId)",
+    "remember(instances, apiKeyByInstanceId)")
+
+# --- [deep-audit-1041 B-01] C30 variants: the credential live source --------
+
+# the pre-fix read: the credential is fetched inside the providerRows remember
+# (composition phase) even though the producer effect is still there. Teethed on
+# the composition-phase arm alone — C30b stays green, so this fixture pins C30a.
+FIX_PROVIDER_LIST_SYNC_READ = FIX_PROVIDER_LIST_CLEAN.replace(
+    """    instances.map { it }""",
+    """    instances.map { providerRepository.loadApiKey(it.id) }""")
+
+# the baseline shape: the row snapshot is read inside the providerRows remember
+# (composition thread, keyed on neither the credential nor the revision) and no
+# producer effect exists at all — both arms red.
+FIX_PROVIDER_LIST_PRE_BASELINE = FIX_PROVIDER_LIST_CLEAN.replace(
+    """LaunchedEffect(instances, config.revision) {
+    apiKeyByInstanceId = withContext(Dispatchers.IO) {
+        instances.associate { it.id to providerRepository.loadApiKey(it.id) }
+    }
+}
+""", "").replace(
+    "remember(instances, config.modelEntries, apiKeyByInstanceId)",
+    "remember(instances, config.modelEntries)").replace(
+    "    instances.map { it }",
+    "    instances.map { providerRepository.loadApiKey(it.id) }")
+
+# the effect still exists but is keyed on the instance list only: an external
+# credential write moves `revision`, not `instances`.
+FIX_PROVIDER_LIST_NO_REVISION_KEY = FIX_PROVIDER_LIST_CLEAN.replace(
+    "LaunchedEffect(instances, config.revision)", "LaunchedEffect(instances)")
+
+# the read is back on whatever thread the effect runs on.
+FIX_PROVIDER_LIST_NO_IO_HOP = FIX_PROVIDER_LIST_CLEAN.replace(
+    """    apiKeyByInstanceId = withContext(Dispatchers.IO) {
+        instances.associate { it.id to providerRepository.loadApiKey(it.id) }
+    }""",
+    """    apiKeyByInstanceId = instances.associate { it.id to providerRepository.loadApiKey(it.id) }""")
+
+# fail-closed arm: no credential read left in the file at all.
+FIX_PROVIDER_LIST_NO_READ = FIX_PROVIDER_LIST_CLEAN.replace(
+    """        instances.associate { it.id to providerRepository.loadApiKey(it.id) }""",
+    """        instances.associate { it.id to null }""")
 
 FIX_PROVIDER_LIST_NO_PROVIDER_ROWS_KEY = FIX_PROVIDER_LIST_CLEAN.replace(
     "remember(providerRows) { providerRows.distinctBy { it.instance.id } }",
@@ -1901,6 +2180,10 @@ fun pendingConnectionFieldWrite(edited: String, stored: String?): String? {
 }
 
 fun ProviderConnectionScreen(instanceId: String, instance: ProviderInstance) {
+    var storedKey by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(instanceId, config.revision) {
+        storedKey = withContext(Dispatchers.IO) { providerRepository.loadApiKey(instanceId) }
+    }
     var customBaseURL by rememberSaveable(instance.id, instance.customBaseURL) { mutableStateOf(instance.customBaseURL ?: "") }
     var customUserAgent by rememberSaveable(instance.id, instance.customUserAgent) { mutableStateOf(instance.customUserAgent ?: "") }
 
@@ -1937,6 +2220,22 @@ FIX_CONNECTION_MISSING_ANCHOR = """package com.rikkaminis.app.ui.settings
 
 fun unrelated() {}
 """
+
+# --- [deep-audit-1041 B-01] C31 variants: the connection screen's key re-read
+
+# the pre-fix key set: the credential is read once per instance id, so an
+# external write (RPC / import / restore) leaves the old key on screen — and the
+# next Edit → Save writes it back over the newer one.
+FIX_CONNECTION_KEY_NO_REVISION = FIX_CONNECTION_CLEAN.replace(
+    "LaunchedEffect(instanceId, config.revision)", "LaunchedEffect(instanceId)")
+
+# fail-closed arm: no stored-key read left in the file at all.
+FIX_CONNECTION_NO_KEY_READ = FIX_CONNECTION_CLEAN.replace(
+    """    var storedKey by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(instanceId, config.revision) {
+        storedKey = withContext(Dispatchers.IO) { providerRepository.loadApiKey(instanceId) }
+    }
+""", "")
 
 # --- da1039-B3 B-04 variants: the write-path criteria (C22 / C23) ---------
 
@@ -2619,7 +2918,64 @@ fun rememberCollapsedInstanceIds(
         mutableStateOf(collapsedInstanceIdsSeed(instanceIds, defaultExpanded))
     }
 }
+
+@Composable
+fun ModelEntryPickerInstanceSections(searchQuery: String, instanceIds: List<String>) {
+    val isSearching = searchQuery.isNotBlank()
+    val collapsedInstanceIds = rememberCollapsedInstanceIds(config)
+    val effectiveCollapsed = if (isSearching) emptySet() else collapsedInstanceIds.value
+    instanceIds.forEach { instanceId ->
+        val isCollapsed = instanceId in effectiveCollapsed
+        if (isCollapsed) renderCollapsedSummary(instanceId)
+    }
+}
 """
+
+# --- [deep-audit-1041 B-04] C32: the search-gated collapse read ------------
+
+FIX_MODEL_PICKER_SHEET_CLEAN = """package com.rikkaminis.app.ui.chat
+
+internal fun ModelPickerSheetProviderSections(allInstanceIds: Set<String>) {
+    var searchText by remember { mutableStateOf("") }
+    var collapsedInstanceIds by remember(allInstanceIds) {
+        mutableStateOf(allInstanceIds)
+    }
+    orderedProviderSections.forEachIndexed { sectionIndex, (instance, entries) ->
+        val isCollapsed = searchText.isEmpty() && collapsedInstanceIds.contains(instance.id)
+        if (isCollapsed) {
+            renderCollapsedSummary(instance, entries)
+        }
+    }
+}
+"""
+
+# the pre-fix read: the collapse set decides on its own, so a matching section
+# stays folded and shows only the (selected-biased) summary row.
+FIX_MODEL_PICKER_SHEET_PRE = FIX_MODEL_PICKER_SHEET_CLEAN.replace(
+    "val isCollapsed = searchText.isEmpty() && collapsedInstanceIds.contains(instance.id)",
+    "val isCollapsed = collapsedInstanceIds.contains(instance.id)")
+
+# polarity inverted: the query is consulted, but the guard reads backwards —
+# every section FOLDS while searching. Must be a red.
+FIX_MODEL_PICKER_SHEET_INVERTED = FIX_MODEL_PICKER_SHEET_CLEAN.replace(
+    "searchText.isEmpty() &&", "searchText.isNotEmpty() &&")
+
+# the shared component's spelling (derived set + emptySet()): accepted.
+FIX_MODEL_PICKER_SHEET_DERIVED = FIX_MODEL_PICKER_SHEET_CLEAN.replace(
+    "        val isCollapsed = searchText.isEmpty() && collapsedInstanceIds.contains(instance.id)",
+    """        val effectiveCollapsed =
+            if (searchText.isEmpty()) collapsedInstanceIds else emptySet()
+        val isCollapsed = instance.id in effectiveCollapsed""")
+
+FIX_MODEL_PICKER_SHEET_MISSING_ANCHOR = """package com.rikkaminis.app.ui.chat
+
+fun unrelated() {}
+"""
+
+# the shared picker's own render decision, ungated (same defect, other file).
+FIX_PICKER_RENDER_UNGATED = FIX_MODEL_ENTRY_PICKER_CLEAN.replace(
+    "val isCollapsed = instanceId in effectiveCollapsed",
+    "val isCollapsed = instanceId in collapsedInstanceIds.value")
 
 # C18 — a screen that kept its own copy keyed on the whole config object.
 FIX_ADD_MODELS_BARE_CONFIG_KEY = FIX_ADD_MODELS_CLEAN.replace(
@@ -2781,6 +3137,7 @@ CLEAN_TREE = {
     REL_ADD_MODELS: FIX_ADD_MODELS_CLEAN,
     REL_AGENT_LOOP_SHEETS: FIX_AGENT_LOOP_SHEETS_CLEAN,
     REL_MODEL_ENTRY_PICKER: FIX_MODEL_ENTRY_PICKER_CLEAN,
+    REL_MODEL_PICKER_SHEET: FIX_MODEL_PICKER_SHEET_CLEAN,
     REL_ADD_CUSTOM_MODEL: FIX_ADD_CUSTOM_MODEL_CLEAN,
 }
 
@@ -2858,7 +3215,7 @@ def run_selftest():
     # fail-closed: missing anchors must be red, never silently green
     run_case("failclosed-missing-provider-anchors", 1,
              variant(REL_PROVIDER_LIST, FIX_PROVIDER_LIST_MISSING_ANCHOR), failures,
-             ("C1", "C2", "C4"))
+             ("C1", "C2", "C4", "C30"))
     run_case("failclosed-missing-sheet-anchor", 1,
              variant(REL_SHEET, FIX_SHEET_MISSING_ANCHOR), failures, ("C3",))
     # comment must not satisfy criteria (KDoc quoting an anchor is not the anchor)
@@ -2873,7 +3230,7 @@ def run_selftest():
              variant(REL_CONNECTION, FIX_CONNECTION_NO_UA_KEY), failures, ("C5", "C5a"))
     run_case("failclosed-missing-conn-anchor", 1,
              variant(REL_CONNECTION, FIX_CONNECTION_MISSING_ANCHOR), failures,
-             ("C5", "C5a", "C22", "C23"))
+             ("C5", "C5a", "C22", "C23", "C31"))
     # --- da1039-B3: C20 / C21 (AddCustomModelScreen parent-instance read) --
     run_case("c20-custom-model-snapshot-read", 1,
              variant(REL_ADD_CUSTOM_MODEL, FIX_ADD_CUSTOM_MODEL_SNAPSHOT), failures, ("C20",))
@@ -3045,7 +3402,7 @@ def run_selftest():
     run_case("c19-picker-size-only-key", 1,
              variant(REL_MODEL_ENTRY_PICKER, FIX_PICKER_SIZE_ONLY_KEY), failures, ("C19",))
     run_case("failclosed-missing-picker-helper", 1,
-             variant(REL_MODEL_ENTRY_PICKER, FIX_PICKER_MISSING_HELPER), failures, ("C19",))
+             variant(REL_MODEL_ENTRY_PICKER, FIX_PICKER_MISSING_HELPER), failures, ("C19", "C32"))
     run_case("failclosed-missing-picker-file", 1,
              missing(REL_MODEL_ENTRY_PICKER), failures, ("FILE",))
     # --- da1040-B1: C26..C29 (ProviderDetailScreen live resolution) --------
@@ -3066,6 +3423,34 @@ def run_selftest():
              ("C28",))
     run_case("c29-detail-key-without-revision", 1,
              variant(REL_PROVIDER_DETAIL, FIX_PROVIDER_DETAIL_KEY_NO_REVISION), failures, ("C29",))
+    # --- da1041-B1: C30 / C31 (the credential live source) -----------------
+    run_case("c30-list-sync-read", 1,
+             variant(REL_PROVIDER_LIST, FIX_PROVIDER_LIST_SYNC_READ), failures, ("C30a",))
+    run_case("c30-list-pre-baseline", 1,
+             variant(REL_PROVIDER_LIST, FIX_PROVIDER_LIST_PRE_BASELINE), failures,
+             ("C30a", "C30b"))
+    run_case("c30-list-no-revision-key", 1,
+             variant(REL_PROVIDER_LIST, FIX_PROVIDER_LIST_NO_REVISION_KEY), failures, ("C30b",))
+    run_case("c30-list-no-io-hop", 1,
+             variant(REL_PROVIDER_LIST, FIX_PROVIDER_LIST_NO_IO_HOP), failures, ("C30b",))
+    run_case("failclosed-list-no-read", 1,
+             variant(REL_PROVIDER_LIST, FIX_PROVIDER_LIST_NO_READ), failures, ("C30",))
+    run_case("c31-conn-key-no-revision", 1,
+             variant(REL_CONNECTION, FIX_CONNECTION_KEY_NO_REVISION), failures, ("C31",))
+    run_case("failclosed-conn-no-key-read", 1,
+             variant(REL_CONNECTION, FIX_CONNECTION_NO_KEY_READ), failures, ("C31",))
+    # --- da1041-B4: C32 (the collapse read must consult the search) --------
+    run_case("c32-sheet-ungated", 1,
+             variant(REL_MODEL_PICKER_SHEET, FIX_MODEL_PICKER_SHEET_PRE), failures, ("C32",))
+    run_case("c32-sheet-inverted-polarity", 1,
+             variant(REL_MODEL_PICKER_SHEET, FIX_MODEL_PICKER_SHEET_INVERTED), failures, ("C32",))
+    run_case("c32-sheet-derived-set", 0,
+             variant(REL_MODEL_PICKER_SHEET, FIX_MODEL_PICKER_SHEET_DERIVED), failures)
+    run_case("failclosed-sheet-missing-anchor", 1,
+             variant(REL_MODEL_PICKER_SHEET, FIX_MODEL_PICKER_SHEET_MISSING_ANCHOR), failures,
+             ("C32",))
+    run_case("c32-picker-render-ungated", 1,
+             variant(REL_MODEL_ENTRY_PICKER, FIX_PICKER_RENDER_UNGATED), failures, ("C32",))
     if failures:
         print("SELFTEST FAILURES:")
         for f in failures:

@@ -899,9 +899,19 @@ internal fun ModelPickerSheet(
                     }
                     // Pinned providers first, then everything else — each group
                     // keeps its original relative order.
+                    // [deep-audit-1041 B-04] Force every provider section open
+                    // while a search is running: the collapse set seeds to "all
+                    // collapsed", so a section that matches the query rendered
+                    // its single collapsed summary row and hid the rest of the
+                    // hits behind a chevron the user had to find and tap. The
+                    // gate is derived at the read site (never written back into
+                    // `collapsedInstanceIds`), so clearing the query restores the
+                    // user's own expand/collapse choices untouched — same
+                    // decision as the shared ModelEntryPicker, which the
+                    // model-group and agent-loop pickers already route through.
                     val orderedProviderSections = pinnedInstancesWithEntries + otherInstancesWithEntries
                     orderedProviderSections.forEachIndexed { sectionIndex, (instance, entries) ->
-                        val isCollapsed = collapsedInstanceIds.contains(instance.id)
+                        val isCollapsed = searchText.isEmpty() && collapsedInstanceIds.contains(instance.id)
                         // When both Favorites and the rest are present, mark the
                         // boundary with an "All Providers" section label.
                         if (sectionIndex == pinnedInstancesWithEntries.size &&
