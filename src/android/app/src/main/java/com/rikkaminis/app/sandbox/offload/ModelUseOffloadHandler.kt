@@ -396,9 +396,21 @@ class ModelUseOffloadHandler(
                 maxTokens = maxTokens,
                 warnings = ptWarnings,
             )
+            // [dv23-A03] The serialized model must be the SAME enriched model the
+            // guards above judged: `entry.model` is only `baseModel + overrides`,
+            // so every capability field models.dev supplies (output-/inputModalities,
+            // maxOutputTokens, contextWindow, reasoning effort tiers) was dropped at
+            // the process boundary — :modelservice rebuilt an LLMModel with them
+            // null and e.g. never sent `responseModalities: ["TEXT","IMAGE"]`, so a
+            // --output out.png run that passed the gate here came back text-only.
+            // ponytail: 复用 :190 已算好的 `effectiveModel`，不在此处重新解析 —— 这正是
+            // `ModelsDevApi.effectiveModel(` 字面计数保持恰为 2（:190 与 :1007）的原因，
+            // ModelUseModalityParityTest 钉住了这个计数。 | 天花板: 某个 buildRequestJson
+            // 调用点若移出 cmdRun（拿不到该局部变量）就必须自解析，届时该测试计数断言要同步改。
+            // | 升级触发: 出现第 3 个 buildRequestJson 调用点，或 cmdRun 被拆分。
             val ptRequestJson = ModelExecutionDispatcher.buildRequestJson(
                 instance = instance,
-                model = entry.model,
+                model = effectiveModel,
                 messages = messages,
                 systemPrompt = systemPrompt,
                 maxTokens = maxTokens,
@@ -473,9 +485,12 @@ class ModelUseOffloadHandler(
         // (logs showed Post-recycle GC freed 0MB). On any dispatch failure or
         // unparseable result the call falls back to the in-process path below
         // (behaviour unchanged, leak containment degraded).
+        // [dv23-A03] Same as the passthrough branch above: the model that crosses
+        // into :modelservice must be the enriched `effectiveModel`, not the raw
+        // `entry.model` (see the note there).
         val remoteRequestJson = ModelExecutionDispatcher.buildRequestJson(
             instance = instance,
-            model = entry.model,
+            model = effectiveModel,
             messages = messages,
             systemPrompt = systemPrompt,
             maxTokens = maxTokens,
