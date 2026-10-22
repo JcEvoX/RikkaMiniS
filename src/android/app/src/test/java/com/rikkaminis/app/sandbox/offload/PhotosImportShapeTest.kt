@@ -1,5 +1,6 @@
 package com.rikkaminis.app.sandbox.offload
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -80,7 +81,11 @@ class PhotosImportShapeTest {
 
     @Test
     fun `parsed intent URIs are stripped of grants, clipData and same-package targets`() {
-        val body = declarationSlice(readRepoFile(open), "Intent.parseUri(url, Intent.URI_INTENT_SCHEME)")
+        // [deep-audit-1041 FIX-A6] Re-anchored on `tryOpen` itself: the old
+        // marker was `Intent.parseUri(url, …)`, which the scheme normalisation
+        // rewrote to `Intent.parseUri(lowercaseIntentScheme(url), …)`. Bind the
+        // declaration that OWNS the decision, not the call spelling.
+        val body = declarationSlice(readRepoFile(open), "private fun tryOpen(")
         for (flag in listOf(
             "FLAG_GRANT_READ_URI_PERMISSION",
             "FLAG_GRANT_WRITE_URI_PERMISSION",
@@ -92,6 +97,13 @@ class PhotosImportShapeTest {
         assertTrue(body.contains("removeFlags("))
         assertTrue(body.contains("clipData = null"))
         assertTrue(body.contains("component?.packageName == context.packageName) component = null"))
+        // [deep-audit-1041 FIX-A6] `Intent.parseUri` writes `package=` into
+        // `getPackage()`, so the component check above never saw it — a
+        // same-package package target pins resolution to this app too.
+        assertTrue(
+            "same-package `package=` target not stripped",
+            body.contains("getPackage() == context.packageName) setPackage(null)"),
+        )
         // No regression of the historical behaviour:
         assertTrue(body.contains("FLAG_ACTIVITY_NEW_TASK"))
         assertTrue(body.contains("selector = null"))
@@ -100,9 +112,44 @@ class PhotosImportShapeTest {
     @Test
     fun `plain ACTION_VIEW path is untouched and intent URIs keep their semantics`() {
         val src = readRepoFile(open)
-        val body = declarationSlice(src, "Intent.parseUri(url, Intent.URI_INTENT_SCHEME)")
+        val body = declarationSlice(src, "private fun tryOpen(")
         assertTrue(body.contains("Intent(Intent.ACTION_VIEW, Uri.parse(url))"))
-        assertTrue(src.contains("url.startsWith(\"intent:\")"))
+        // [deep-audit-1041 FIX-A6] RFC 3986 schemes are case-insensitive, so
+        // the prefix is matched with ignoreCase AND the parser is handed a
+        // scheme-normalised copy (Intent.parseUri matches `intent:` itself
+        // case-sensitively and would degrade `INTENT://…` to ACTION_VIEW).
+        assertTrue(body.contains("url.startsWith(\"intent:\", ignoreCase = true)"))
+        assertTrue(body.contains("url.startsWith(\"android-app:\", ignoreCase = true)"))
+        assertTrue(body.contains("Intent.parseUri(lowercaseIntentScheme(url), Intent.URI_INTENT_SCHEME)"))
+    }
+
+    // ── B2: scheme normalisation — pure logic, no Android runtime ──────────
+    // [deep-audit-1041 FIX-A6] The helpers' behavioural half: only the SCHEME
+    // may be lower-cased; everything from the first ':' on (path, query, and
+    // the `#Intent;…;end` fragment whose keys and values are case-sensitive)
+    // must come back byte-identical.
+
+    @Test
+    fun `intent scheme prefixes are normalised case-insensitively`() {
+        assertEquals(
+            "intent://x#Intent;action=android.intent.action.SET_ALARM;end",
+            lowercaseIntentScheme("INTENT://x#Intent;action=android.intent.action.SET_ALARM;end"),
+        )
+        assertEquals(
+            "intent://x#Intent;action=A;end",
+            lowercaseIntentScheme("Intent://x#Intent;action=A;end"),
+        )
+        assertEquals("android-app://com.example/Path", lowercaseIntentScheme("ANDROID-APP://com.example/Path"))
+        // payload case preserved (payload = everything from the first ':')
+        assertEquals(
+            "intent://x#Intent;S.content=Hello;end",
+            lowercaseIntentScheme("INTENT://x#Intent;S.content=Hello;end"),
+        )
+        assertEquals("mailto:Foo@Bar.example", lowercaseIntentScheme("mailto:Foo@Bar.example"))
+        assertEquals("https://Example.com/A", lowercaseIntentScheme("HTTPS://Example.com/A"))
+        // no scheme at all → unchanged, never a crash
+        assertEquals("just-a-string", lowercaseIntentScheme("just-a-string"))
+        assertEquals(":odd", lowercaseIntentScheme(":odd"))
     }
 
     // ── C: date-range wiring ──────────────────────────────────────────────
