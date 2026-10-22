@@ -33,9 +33,15 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
@@ -44,6 +50,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.res.stringResource
 import com.rikkaminis.app.data.repository.EnvVarRepository
 import com.rikkaminis.app.deeplink.DeepLinkCoordinator
+
+/**
+ * What a row paints before its value has been read out of the Keystore-backed
+ * store, and the only thing a hidden row ever paints ([deep-audit-1041 B-03]).
+ */
+private const val MASKED_ENV_VAR_VALUE = "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"
 
 /**
  * Environment Variables \u2014 adopts the SettingsScaffold/SettingsSection
@@ -68,6 +80,14 @@ fun EnvironmentVariablesScreen(
     var prefill by remember { mutableStateOf<DeepLinkCoordinator.EnvVarCreate?>(null) }
     val visibleKeys = remember { mutableStateOf(setOf<String>()) }
     val clipboardManager = LocalClipboardManager.current
+    // [deep-audit-1041 B-03] `envVarRepository.getValue/add/update/delete` are
+    // the only blocking entry points of this screen: values live in
+    // Keystore-backed EncryptedSharedPreferences and every write also rewrites
+    // env-vars.json. None of them may run on the Main dispatcher, so the click
+    // callbacks below hand the repository call to this screen-scoped coroutine
+    // (same shape as the Skills / MCP / Session-sheet settings screens) while the
+    // Compose-owned state keeps updating on Main.
+    val scope = rememberCoroutineScope()
 
     // [da1028-C] Reactively observe the pending create request instead of a
     // one-shot `LaunchedEffect(Unit)` + `.value` read. The old shape only ran
@@ -161,24 +181,37 @@ fun EnvironmentVariablesScreen(
                 if (group.isNotEmpty()) {
                     SettingsSection(header = group) {
                         groupEntries.forEachIndexed { index, entry ->
-                            EnvVarListRow(
-                                entry = entry,
-                                envVarRepository = envVarRepository,
-                                visible = entry.key in visibleKeys.value,
-                                showDivider = index < groupEntries.size - 1,
-                                onToggleVisible = {
-                                    visibleKeys.value = if (visibleKeys.value.contains(entry.key))
-                                        visibleKeys.value - entry.key
-                                    else
-                                        visibleKeys.value + entry.key
-                                },
-                                onCopy = {
-                                    val v = envVarRepository.getValue(entry.key) ?: ""
-                                    clipboardManager.setText(AnnotatedString("${entry.key}=$v"))
-                                },
-                                onEdit = { editEntryId = entry.id },
-                                onDelete = { deleteEntryId = entry.id },
-                            )
+                            // `key(entry.id)`: a row holds its revealed value in a
+                            // remembered state (see EnvVarListRow), so a slot reused by
+                            // the next entry must not paint the previous entry's secret
+                            // for a frame after a delete/restore reorders the list.
+                            key(entry.id) {
+                                EnvVarListRow(
+                                    entry = entry,
+                                    envVarRepository = envVarRepository,
+                                    visible = entry.key in visibleKeys.value,
+                                    showDivider = index < groupEntries.size - 1,
+                                    onToggleVisible = {
+                                        visibleKeys.value =
+                                            if (visibleKeys.value.contains(entry.key))
+                                                visibleKeys.value - entry.key
+                                            else
+                                                visibleKeys.value + entry.key
+                                    },
+                                    onCopy = {
+                                        // The decrypt is Keystore I/O; the clipboard write
+                                        // itself stays on Main (Compose-owned handle).
+                                        scope.launch {
+                                            val v = withContext(Dispatchers.IO) {
+                                                envVarRepository.getValue(entry.key) ?: ""
+                                            }
+                                            clipboardManager.setText(AnnotatedString("${entry.key}=$v"))
+                                        }
+                                    },
+                                    onEdit = { editEntryId = entry.id },
+                                    onDelete = { deleteEntryId = entry.id },
+                                )
+                            }
                         }
                     }
                 }
@@ -190,24 +223,31 @@ fun EnvironmentVariablesScreen(
                     footer = stringResource(R.string.env_var_section_footer),
                 ) {
                     uncategorized.forEachIndexed { index, entry ->
-                        EnvVarListRow(
-                            entry = entry,
-                            envVarRepository = envVarRepository,
-                            visible = entry.key in visibleKeys.value,
-                            showDivider = index < uncategorized.size - 1,
-                            onToggleVisible = {
-                                visibleKeys.value = if (visibleKeys.value.contains(entry.key))
-                                    visibleKeys.value - entry.key
-                                else
-                                    visibleKeys.value + entry.key
-                            },
-                            onCopy = {
-                                val v = envVarRepository.getValue(entry.key) ?: ""
-                                clipboardManager.setText(AnnotatedString("${entry.key}=$v"))
-                            },
-                            onEdit = { editEntryId = entry.id },
-                            onDelete = { deleteEntryId = entry.id },
-                        )
+                        key(entry.id) {
+                            EnvVarListRow(
+                                entry = entry,
+                                envVarRepository = envVarRepository,
+                                visible = entry.key in visibleKeys.value,
+                                showDivider = index < uncategorized.size - 1,
+                                onToggleVisible = {
+                                    visibleKeys.value =
+                                        if (visibleKeys.value.contains(entry.key))
+                                            visibleKeys.value - entry.key
+                                        else
+                                            visibleKeys.value + entry.key
+                                },
+                                onCopy = {
+                                    scope.launch {
+                                        val v = withContext(Dispatchers.IO) {
+                                            envVarRepository.getValue(entry.key) ?: ""
+                                        }
+                                        clipboardManager.setText(AnnotatedString("${entry.key}=$v"))
+                                    }
+                                },
+                                onEdit = { editEntryId = entry.id },
+                                onDelete = { deleteEntryId = entry.id },
+                            )
+                        }
                     }
                 }
             }
@@ -256,8 +296,17 @@ fun EnvironmentVariablesScreen(
             text = { Text(stringResource(R.string.env_var_delete_confirm_text)) },
             confirmButton = {
                 MinisTextButton(onClick = {
-                    deleteEntryId?.let { envVarRepository.delete(it) }
+                    // [deep-audit-1041 B-03] The dialog closes on Main first (so it
+                    // cannot flicker or absorb a second tap while the write is in
+                    // flight), then the Keystore row + env-vars.json rewrite follows on
+                    // IO — same shape as the MCP screen's delete confirm.
+                    val id = deleteEntryId
                     deleteEntryId = null
+                    if (id != null) {
+                        scope.launch {
+                            withContext(Dispatchers.IO) { envVarRepository.delete(id) }
+                        }
+                    }
                 }) {
                     Text(stringResource(R.string.common_delete), color = MaterialTheme.colorScheme.error)
                 }
@@ -305,11 +354,31 @@ private fun EnvVarListRow(
     onEdit: () -> Unit,
     onDelete: () -> Unit,
 ) {
-    val displayValue = if (visible) {
-        envVarRepository.getValue(entry.key) ?: ""
-    } else {
-        "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"
+    // [deep-audit-1041 B-03] This read decrypts through Keystore-backed
+    // EncryptedSharedPreferences. Inline (the old shape) it ran on the
+    // composition thread — on Main and inside the frame — on every
+    // recomposition of the row. It now runs in a produceState effect on
+    // Dispatchers.IO, keyed on the entry and the visibility toggle; the mask
+    // is what the first frame paints, so a row can never show another entry's
+    // value while a read is in flight.
+    val revealedValue by produceState(
+        initialValue = MASKED_ENV_VAR_VALUE,
+        entry.key,
+        visible,
+    ) {
+        // Read only while the row is revealed: a hidden row must never decrypt,
+        // and the pre-read placeholder is the mask either way.
+        value = if (visible) {
+            withContext(Dispatchers.IO) { envVarRepository.getValue(entry.key) ?: "" }
+        } else {
+            MASKED_ENV_VAR_VALUE
+        }
     }
+    // The gate is applied to the PAINTED value, not inside the effect: the
+    // effect is asynchronous, so hiding a row would otherwise paint the secret
+    // for one more frame (the producer's new value lands after the recomposition
+    // that flipped `visible`).
+    val displayValue = if (visible) revealedValue else MASKED_ENV_VAR_VALUE
     // iOS parity (EnvironmentVariablesView.swift:139-151): show
     // value on one line and the optional note on a second.
     // SettingsRow only has one subtitle slot, so concatenate
@@ -368,6 +437,9 @@ private fun EnvVarFormSheet(
     // and the user must drag it up to reach the value/note fields and the
     // save button. Open fully instead — the form is a single screenful.
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    // [deep-audit-1041 B-03] The save button's repository call is Keystore +
+    // disk I/O; it is launched from this sheet-scoped coroutine.
+    val scope = rememberCoroutineScope()
     // [da1028-C] Every field is keyed on the entry it was seeded from (plus the
     // deep-link prefill): a keyless `remember` kept the FIRST entry's text after
     // `editEntry` switched identity (another entry updated / backup restore /
@@ -375,12 +447,29 @@ private fun EnvVarFormSheet(
     // external write. Same family as 1027-E's group/mount editors.
     //
     // `valueText` keys on the LIVE secret (`currentSecretValue`) rather than a
-    // snapshot, which is what makes an external write visible at all. Trade-off
-    // (recorded, accepted): while the user is typing, an external write to the
-    // same key re-seeds the box with the new value. The alternative — keying on
-    // `editEntry` alone — cannot see a value-only change, since the entry object
-    // is not rebuilt when only the secret moves.
-    val currentSecretValue = editEntry?.let { envVarRepository.getValue(it.key) } ?: prefillValue
+    // snapshot, which is what makes an external write visible at all. As of
+    // [deep-audit-1041 B-03] that live secret is produced by an IO effect keyed
+    // on (entry id, entry key, prefill): re-read per entry identity rather than
+    // on every recomposition, so the box no longer re-seeds itself under the
+    // user's fingers whenever an unrelated recomposition lands (the trade-off
+    // that used to be recorded here). The alternative — keying on `editEntry`
+    // alone — cannot see a value-only change at all, since the entry object is
+    // not rebuilt when only the secret moves.
+    // [deep-audit-1041 B-03] The live secret is a Keystore decrypt; it used to run
+    // inline, on the composition thread, on every composition of the sheet. Same
+    // value and the same `valueText` key as before — only the dispatcher moves:
+    // a produceState effect reads it on Dispatchers.IO, keyed on the entry it
+    // belongs to plus the deep-link prefill.
+    val currentSecretValue by produceState(
+        initialValue = prefillValue,
+        editEntry?.id,
+        editEntry?.key,
+        prefillValue,
+    ) {
+        value = withContext(Dispatchers.IO) {
+            editEntry?.let { envVarRepository.getValue(it.key) } ?: prefillValue
+        }
+    }
     var keyText by remember(editEntry?.id, editEntry?.key, prefillKey) {
         mutableStateOf(editEntry?.key ?: prefillKey)
     }
@@ -504,12 +593,25 @@ private fun EnvVarFormSheet(
                 }
                 MinisTextButton(
                     onClick = {
-                        val success = if (isEditing) {
-                            envVarRepository.update(editEntry!!.id, keyText, valueText, noteText, groupText)
-                        } else {
-                            envVarRepository.add(keyText, valueText, noteText, groupText)
+                        // [deep-audit-1041 B-03] The write touches Keystore and
+                        // rewrites env-vars.json. Capture the Compose-owned values on
+                        // Main, run the repository call on IO, and dismiss only on
+                        // success (the dismiss itself stays on Main).
+                        val editingId = editEntry?.id
+                        val saveKey = keyText
+                        val saveValue = valueText
+                        val saveNote = noteText
+                        val saveGroup = groupText
+                        scope.launch {
+                            val success = withContext(Dispatchers.IO) {
+                                if (editingId != null) {
+                                    envVarRepository.update(editingId, saveKey, saveValue, saveNote, saveGroup)
+                                } else {
+                                    envVarRepository.add(saveKey, saveValue, saveNote, saveGroup)
+                                }
+                            }
+                            if (success) onDismiss()
                         }
-                        if (success) onDismiss()
                     },
                     enabled = canSave,
                 ) {
