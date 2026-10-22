@@ -11,7 +11,10 @@ import com.rikkaminis.app.config.fields.ReadOnlyField
 import com.rikkaminis.app.data.model.LLMModel
 import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.model.ModelOverrides
+import com.rikkaminis.app.data.model.directionalModalities
+import com.rikkaminis.app.data.model.expandDirectionalModalities
 import com.rikkaminis.app.data.repository.ProviderRepository
+import com.rikkaminis.app.provider.ModelsDevApi
 
 /**
  * Exposes ModelEntry overrides under `models.<entryUUID>.…`. Mirrors
@@ -242,61 +245,22 @@ class ModelsCollection(
     // -- Capability fields (modalities / contextWindow / derived) --
 
     /**
-     * Canonical names matching `minis-model-use list` so the two tools
-     * agree on terminology. Order is meaningful for [encodeModalities]'
-     * stable output. Mirrors iOS `modalityNamesInOrder`.
+     * Build the *effective* modality list of [e] — the canonical
+     * direction-suffixed names both `minis-model-use list` and this collection
+     * emit.
+     *
+     * [dv21-A05] It goes through the SAME resolver as the offload side
+     * (`ModelsDevApi.effectiveModel` → `LLMModel.directionalModalities`), so the
+     * two surfaces cannot answer differently:
+     *   - the base model is enriched from models.dev first and the user's
+     *     overrides applied on top (this surface used to skip enrichment
+     *     entirely, so every built-in model — all 39 declare null modality
+     *     fields by construction — reported `[]`);
+     *   - an absent list means text on that side, evaluated PER DIRECTION
+     *     (a pure image generator keeps `supportsTools = false`).
      */
-    private val modalityNamesInOrder = listOf(
-        "text_input", "text_output",
-        "image_input", "pdf_input", "audio_input", "video_input",
-        "image_output", "audio_output", "video_output",
-    )
-    private val allowedModalities = modalityNamesInOrder.toSet()
-
-    /**
-     * Build the *effective* modality list: union of override (if any)
-     * with baseModel input/output lists, intersected with the allowed
-     * names so we never emit junk like "image" without a direction.
-     */
-    private fun effectiveModalities(e: ModelEntry): List<String> {
-        val ovInputs = e.overrides.inputModalities
-        val ovOutputs = e.overrides.outputModalities
-        val baseInputs = e.baseModel.inputModalities ?: emptyList()
-        val baseOutputs = e.baseModel.outputModalities ?: emptyList()
-        val inputs = ovInputs ?: baseInputs
-        val outputs = ovOutputs ?: baseOutputs
-
-        // Translate models.dev short tokens (e.g. "text", "image") into
-        // direction-suffixed names that match `minis-model-use list`.
-        val out = LinkedHashSet<String>()
-        for (m in inputs) appendDirectional(out, m, "input")
-        for (m in outputs) appendDirectional(out, m, "output")
-
-        // Stable order — matches modalityNamesInOrder.
-        return modalityNamesInOrder.filter { it in out }
-    }
-
-    private fun appendDirectional(out: MutableSet<String>, raw: String, direction: String) {
-        val short = raw.lowercase()
-        // Canonical "text" → "text_input"/"text_output".
-        if (short == "text") {
-            out.add("text_$direction"); return
-        }
-        if (short == "image") {
-            out.add("image_$direction"); return
-        }
-        if (short == "pdf") {
-            out.add("pdf_$direction"); return
-        }
-        if (short == "audio") {
-            out.add("audio_$direction"); return
-        }
-        if (short == "video") {
-            out.add("video_$direction"); return
-        }
-        // Already directional? Use as-is when it's in our allowed set.
-        if (short in allowedModalities) out.add(short)
-    }
+    private fun effectiveModalities(e: ModelEntry): List<String> =
+        ModelsDevApi.effectiveModel(e).directionalModalities
 
     /** Split the user-supplied flat list into input/output components. */
     private fun decodeModalitiesOverride(names: List<String>): Pair<List<String>, List<String>> {
@@ -343,10 +307,15 @@ class ModelsCollection(
                 if (ov.inputModalities == null && ov.outputModalities == null) {
                     return@ClosureField ConfigValue.Arr(emptyList())
                 }
-                val out = LinkedHashSet<String>()
-                for (m in (ov.inputModalities ?: emptyList())) appendDirectional(out, m, "input")
-                for (m in (ov.outputModalities ?: emptyList())) appendDirectional(out, m, "output")
-                ConfigValue.Arr(modalityNamesInOrder.filter { it in out }.map { ConfigValue.Str(it) })
+                // Raw override reader — reports exactly what the user wrote.
+                // expandDirectionalModalities() (no text fallback) keeps that
+                // promise: the derived "absent means text" default must never
+                // be persisted-looking output here, or a partial override would
+                // read back as a different one.
+                ConfigValue.Arr(
+                    expandDirectionalModalities(ov.inputModalities, ov.outputModalities)
+                        .map { ConfigValue.Str(it) },
+                )
             },
             writer = { v ->
                 val arr = (v as? ConfigValue.Arr)?.value ?: throw ConfigError.TypeMismatch("array")

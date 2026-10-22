@@ -341,3 +341,63 @@ fun String.normalizeModalityName(): String =
 
 fun List<String>?.normalizeModalities(): List<String>? =
     this?.map { it.normalizeModalityName() }?.distinct()?.takeIf { it.isNotEmpty() }
+
+/**
+ * Canonical direction-suffixed modality names, in emission order. This is the
+ * vocabulary `minis-model-use list` and `minis-config get models.<id>.modalities`
+ * both speak — ONE list, so the two surfaces cannot disagree on terminology
+ * (the config collection used to carry a private copy of it).
+ */
+val modalityNamesInOrder: List<String> = listOf(
+    "text_input", "text_output",
+    "image_input", "pdf_input", "audio_input", "video_input",
+    "image_output", "audio_output", "video_output",
+)
+
+/**
+ * Expand a bare input/output modality pair (e.g. `["text","image"]` /
+ * `["text"]`) into [modalityNamesInOrder]. Each side is normalized first, so a
+ * suffixed provider value ("image_input") and a models.dev value ("image") land
+ * on the same name.
+ *
+ * No text fallback here — this is the mechanical expansion. The "an absent
+ * modality list means text in / text out" convention belongs to
+ * [directionalModalities] (it must not leak into the raw-override reader, which
+ * has to keep reporting exactly what the user wrote).
+ */
+fun expandDirectionalModalities(inputs: List<String>?, outputs: List<String>?): List<String> {
+    val set = LinkedHashSet<String>()
+    for (m in inputs.orEmpty()) {
+        when (m.normalizeModalityName()) {
+            "text" -> set.add("text_input")
+            "image" -> set.add("image_input")
+            "pdf" -> set.add("pdf_input")
+            "audio" -> set.add("audio_input")
+            "video" -> set.add("video_input")
+        }
+    }
+    for (m in outputs.orEmpty()) {
+        when (m.normalizeModalityName()) {
+            "text" -> set.add("text_output")
+            "image" -> set.add("image_output")
+            "audio" -> set.add("audio_output")
+            "video" -> set.add("video_output")
+        }
+    }
+    return modalityNamesInOrder.filter { it in set }
+}
+
+/**
+ * Canonical directional modalities of this model, with the per-direction
+ * "text" fallback: a null/empty list on either side means text on that side
+ * (the convention documented on [LLMModel.isTextOutput]).
+ *
+ * The fallback is evaluated **per direction on purpose** — a pure image
+ * generator (`outputModalities = ["image"]`) must NOT gain a `text_output`,
+ * or it would be offered as a new-chat model and advertised as tool-capable.
+ */
+val LLMModel.directionalModalities: List<String>
+    get() = expandDirectionalModalities(
+        (inputModalities.normalizeModalities() ?: emptyList()).ifEmpty { listOf("text") },
+        (outputModalities.normalizeModalities() ?: emptyList()).ifEmpty { listOf("text") },
+    )

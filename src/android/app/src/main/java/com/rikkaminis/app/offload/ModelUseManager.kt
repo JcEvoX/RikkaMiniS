@@ -59,28 +59,18 @@ object ModelUseManager {
         // Enrich at read time — entries persisted before the modalities field
         // existed won't have inputModalities/outputModalities populated, so
         // look them up from the bundled models.dev registry on the fly.
-        val enrichedModel = com.rikkaminis.app.provider.ModelsDevApi.enrichModel(entry.model)
+        //
+        // [dv21-A05] …but the registry is a DEFAULT source, not a user input.
+        // `effectiveModel` enriches the BASE model first and applies the user's
+        // overrides second; enriching the merged model instead re-imposed the
+        // registry's modalities / context window on top of an explicit override.
+        val effectiveModel = com.rikkaminis.app.provider.ModelsDevApi.effectiveModel(entry)
         val modalities = JSONArray()
-        val inputs = enrichedModel.inputModalities.orEmpty()
-        val outputs = enrichedModel.outputModalities.orEmpty()
-        // Fallback when neither models.dev nor pattern inference populated them —
-        // every LLM supports text in/out.
-        // [audit-0917] Evaluate the two sides independently. The joint
-        // `inputs.isEmpty() && outputs.isEmpty()` condition meant a model with
-        // outputModalities=["text"] but no input modalities kept inputSet empty
-        // — the entry then advertised no *_input modality at all, so the UI
-        // treated a normal text model as unusable for input.
-        val inputSet = inputs.ifEmpty { listOf("text") }
-        val outputSet = outputs.ifEmpty { listOf("text") }
-        if ("text" in inputSet) modalities.put("text_input")
-        if ("text" in outputSet) modalities.put("text_output")
-        if ("image" in inputSet) modalities.put("image_input")
-        if ("image" in outputSet) modalities.put("image_output")
-        if ("audio" in inputSet) modalities.put("audio_input")
-        if ("audio" in outputSet) modalities.put("audio_output")
-        if ("video" in inputSet) modalities.put("video_input")
-        if ("video" in outputSet) modalities.put("video_output")
-        if ("pdf" in inputSet) modalities.put("pdf_input")
+        // One canonical expansion, shared with the offload modality filter and
+        // the config collection (LLMModel.directionalModalities) — the fallback
+        // for an absent list is per direction, so a model with
+        // outputModalities=["image"] never gains a "text_output".
+        for (m in effectiveModel.directionalModalities) modalities.put(m)
 
         return JSONObject().apply {
             put("entry_id", entry.id)
@@ -90,7 +80,7 @@ object ModelUseManager {
             put("instance_label", instance?.label ?: "unknown")
             put("provider_type", instance?.providerType?.displayName ?: "unknown")
             put("modalities", modalities)
-            enrichedModel.contextWindow?.let { put("context_window", it) }
+            effectiveModel.contextWindow?.let { put("context_window", it) }
         }
     }
 }

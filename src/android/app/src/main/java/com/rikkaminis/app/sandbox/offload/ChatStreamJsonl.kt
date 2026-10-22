@@ -133,7 +133,9 @@ object ChatStreamJsonl {
                             .firstOrNull { it.value == obj.optString("type", "") }
                             ?: LLMMediaAttachment.MediaType.IMAGE,
                         mimeType = obj.optString("mime", "application/octet-stream"),
-                        data = if (b64.isNotEmpty()) java.util.Base64.getDecoder().decode(b64) else ByteArray(0),
+                        // [dv21-A06] One decode entry for the whole wire; the strict
+                        // RFC 4648 decoder here threw uncaught out of the chunk reader.
+                        data = OffloadWireBase64.decode(b64) ?: ByteArray(0),
                     )
                 )
             }

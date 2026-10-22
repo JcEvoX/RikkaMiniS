@@ -406,19 +406,47 @@ data class ModelEntry(
 
     /** Effective model as seen by the rest of the app: baseModel with overrides applied. */
     val model: LLMModel
-        get() = if (overrides.isEmpty) baseModel else baseModel.copy(
-            displayName = overrides.displayName ?: baseModel.displayName,
-            maxOutputTokens = overrides.maxOutputTokens ?: baseModel.maxOutputTokens,
-            contextWindow = overrides.contextWindow ?: baseModel.contextWindow,
-            supportsReasoning = overrides.supportsReasoning ?: baseModel.supportsReasoning,
-            inputModalities = overrides.inputModalities ?: baseModel.inputModalities,
-            outputModalities = overrides.outputModalities ?: baseModel.outputModalities,
-        )
+        get() = baseModel.withOverrides(overrides)
 
     /** True when this entry carries user intent beyond API-reported defaults. */
     val isUserModified: Boolean
         get() = isCustom || isHidden || !overrides.isEmpty
 }
+
+/**
+ * [this] with [overrides] applied — a null override field inherits the base
+ * value. ONE definition: [ModelEntry.model] and the enriched path in
+ * [effectiveEntryModel] both merge through here, so "which side wins" cannot
+ * drift between the two callers (it did: see [effectiveEntryModel]).
+ */
+fun LLMModel.withOverrides(overrides: ModelOverrides): LLMModel =
+    if (overrides.isEmpty) this else copy(
+        displayName = overrides.displayName ?: displayName,
+        maxOutputTokens = overrides.maxOutputTokens ?: maxOutputTokens,
+        contextWindow = overrides.contextWindow ?: contextWindow,
+        supportsReasoning = overrides.supportsReasoning ?: supportsReasoning,
+        inputModalities = overrides.inputModalities ?: inputModalities,
+        outputModalities = overrides.outputModalities ?: outputModalities,
+    )
+
+/**
+ * The model [entry] actually resolves to: **enrich the BASE model first, apply
+ * the user's overrides second**.
+ *
+ * The order is the whole contract. `models.dev` is a *default* registry, not a
+ * user input: every field of an enriched row is filled unconditionally
+ * (`devModel.x ?: model.x` in `ModelsDevApi.applyDevData`), so enrichment after
+ * a merge silently restores the registry value on top of an explicit user
+ * override. `ModelUseManager.entryDict` did exactly that, and the same missing
+ * step in the offload filter / config surface produced three different answers
+ * for one entry.
+ *
+ * [enrich] is a parameter (not a direct `ModelsDevApi` call) so the ordering
+ * stays a pure function the JVM unit tests can exercise without the Android
+ * registry — production callers go through `ModelsDevApi.effectiveModel`.
+ */
+fun effectiveEntryModel(entry: ModelEntry, enrich: (LLMModel) -> LLMModel): LLMModel =
+    enrich(entry.baseModel).withOverrides(entry.overrides)
 
 @Serializable
 @Stable
