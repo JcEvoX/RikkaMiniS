@@ -17,10 +17,16 @@ every other gate:
   R2  UNHARDENED intent: URI LAUNCH
       `Intent.parseUri(url, URI_INTENT_SCHEME)` on model-supplied input must be
       stripped before startActivity: grant flags (a crafted URI could hand a
-      launched activity a read/write/persistable URI grant), clipData, and a
-      same-package `component` target (explicit same-uid intents bypass
-      `exported=false`).
-      Fixed in OpenOffloadHandler ([deep-audit-1016c FIX-B B]).
+      launched activity a read/write/persistable URI grant), clipData, a
+      same-package `component` target, a same-package `package` target
+      (explicit same-uid intents AND `package=`-pinned intents both bypass
+      `exported=false` and the system chooser), and the injected `selector`.
+      Fixed in OpenOffloadHandler ([deep-audit-1016c FIX-B B] grants /
+      clipData / component / selector; [deep-audit-1041 FIX-A6] the
+      same-package `package=` target — and the R2 CRITERIA THEMSELVES: the
+      body below had claimed "component stripping" in this docstring since
+      1016c while never reading component/selector, so deleting those two
+      lines from the handler left the gate GREEN).
 
 Usage:
   python3 scripts/scan/offload_host_path_check.py <repo_root>
@@ -42,6 +48,30 @@ GRANT_FLAGS = (
     "FLAG_GRANT_WRITE_URI_PERMISSION",
     "FLAG_GRANT_PERSISTABLE_URI_PERMISSION",
     "FLAG_GRANT_PREFIX_URI_PERMISSION",
+)
+
+# ── [deep-audit-1041 FIX-A6] R2: what the hardening block must clear ────────
+# (label used in the problem message, regex that must match inside the
+# `Intent.parseUri(...)` statement window).
+#
+# Regexes, not plain substrings, because two of these criteria ARE decisions:
+# the clear must be guarded by "this target is OUR package". An unconditional
+# `setPackage(null)` / `component = null` satisfies a bare existence check but
+# is a REGRESSION — it would destroy a legitimate third-party (`package=` /
+# `component=`) target, the thing the fix must not break. Accepted spellings
+# are listed per entry; anything else fails CLOSED (a red gate that a human
+# re-anchors) rather than silently passing.
+R2_STRIPS = (
+    ("clipData = null",
+     r"\bclipData\s*=\s*null\b|\bsetClipData\(\s*null\s*\)"),
+    ("same-package component strip",
+     r"if\s*\([^\n]*packageName\s*==\s*context\.packageName[^\n]*\)[^\n]*"
+     r"(?:\bcomponent\s*=\s*null\b|\bsetComponent\(\s*null\s*\))"),
+    ("same-package package strip",
+     r"if\s*\([^\n]*(?:getPackage\(\)|`package`)\s*==\s*context\.packageName[^\n]*\)[^\n]*"
+     r"(?:\bsetPackage\(\s*null\s*\)|`package`\s*=\s*null\b)"),
+    ("selector = null",
+     r"\bselector\s*=\s*null\b|\bsetSelector\(\s*null\s*\)"),
 )
 
 # `val <ident> = ...get("path"|"file"|"source")` (any receiver spelling).
@@ -552,7 +582,9 @@ def _statement_window(text, start_idx):
 
 
 def scan_parse_uri(rel, text):
-    """R2: Intent.parseUri must be followed by grant/clipData/component stripping."""
+    """R2: Intent.parseUri must be followed by grant / clipData / component /
+    package / selector stripping — each strip checked as the guarded DECISION
+    it is (see R2_STRIPS)."""
     problems = []
     for m in re.finditer(r"Intent\.parseUri\(", text):
         line_no = text.count("\n", 0, m.start()) + 1
@@ -566,8 +598,9 @@ def scan_parse_uri(rel, text):
         for flag in GRANT_FLAGS:
             if flag not in window:
                 missing.append(flag)
-        if "clipData = null" not in window:
-            missing.append("clipData = null")
+        for label, pattern in R2_STRIPS:
+            if not re.search(pattern, window):
+                missing.append(label)
         if missing:
             problems.append(
                 "%s:%d: Intent.parseUri without hardening — missing %s"
@@ -766,11 +799,22 @@ class CleanIntentHandler {
             )
             clipData = null
             if (component?.packageName == context.packageName) component = null
+            if (getPackage() == context.packageName) setPackage(null)
             selector = null
         }
         context.startActivity(intent)
     }
 }
+"""
+
+# [deep-audit-1041 FIX-A6] Fail-closed arm for R2: a truncated/renamed call the
+# statement-window walk cannot balance must be REPORTED, never silently skipped.
+INTENT_UNDELIMITED = """package com.rikkaminis.app.sandbox.offload
+
+class BrokenIntentHandler {
+    private fun handleOpen(url: String) {
+        val intent = Intent.parseUri(url, Intent.URI_INTENT_SCHEME).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 """
 
 
@@ -846,6 +890,55 @@ def selftest():
         print("❌ selftest failed: %s" % ", ".join(a08_failures))
         return 1
     print("A08_R1_BLINDSPOT_SELFTEST=PASS (4 fixtures: 3 violations caught, 1 clean tree green)")
+
+    # ── [deep-audit-1041 FIX-A6] R2 blind-spot fixtures ────────────────────
+    # R2 used to read grants/clipData only, while this module's docstring had
+    # claimed component stripping since 1016c: deleting the component /
+    # selector lines from the real handler left the gate GREEN (probe/
+    # blindspot.py records that on the real tree, both strips removed at once
+    # included). Each arm below drops exactly ONE strip from the shipped block
+    # and must be red on that strip's own label: the expected count is a
+    # literal AND the message must name the strip.
+    def _intent_without(line):
+        if line not in CLEAN_INTENT:
+            raise AssertionError("A07 fixture anchor missing: %r" % line)
+        return CLEAN_INTENT.replace(line, "", 1)
+
+    component_strip = "            if (component?.packageName == context.packageName) component = null\n"
+    package_strip = "            if (getPackage() == context.packageName) setPackage(null)\n"
+    a07_arms = [
+        ("A07 dirty: same-package component strip removed",
+         _intent_without(component_strip), 1, "same-package component strip"),
+        ("A07 dirty: same-package package strip removed",
+         _intent_without(package_strip), 1, "same-package package strip"),
+        ("A07 dirty: selector strip removed",
+         _intent_without("            selector = null\n"), 1, "selector = null"),
+        ("A07 dirty: UNGUARDED setPackage(null) — third-party targets broken",
+         CLEAN_INTENT.replace(package_strip, "            setPackage(null)\n"), 1,
+         "same-package package strip"),
+        ("A07 clean: the shipped hardening block", CLEAN_INTENT, 0, None),
+        ("A07 fail-closed: parseUri statement cannot be delimited",
+         INTENT_UNDELIMITED, 1, "could not be delimited"),
+    ]
+    a07_failures = []
+    for label, src, expected, needle in a07_arms:
+        root = _fixture_root({"AOffloadHandler.kt": src})
+        try:
+            _, problems = check_tree(root, verbose=False)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+        ok = len(problems) == expected
+        if ok and needle is not None:
+            ok = any(needle in p for p in problems)
+        print("  [%s] %s%s" % ("PASS" if ok else "FAIL", label,
+                               "" if ok else "  → problems=%s" % problems))
+        if not ok:
+            a07_failures.append(label)
+    if a07_failures:
+        print("❌ selftest failed: %s" % ", ".join(a07_failures))
+        return 1
+    print("A07_R2_STRIP_SELFTEST=PASS (6 fixtures: 4 violations + 1 fail-closed "
+          "arm red, 1 clean tree green)")
 
     # ── [da1025-A] R3: player session-path fixtures ────────────────────────
     # Each dirty fixture breaks exactly one criterion: NO_SESSION keeps the
