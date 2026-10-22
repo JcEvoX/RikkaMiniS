@@ -649,6 +649,290 @@ def check_busy_source(pool_src: str, sheet_src: str) -> list:
         errs.append("C9: BrowserSheet still reads the non-reactive busy getter")
     return errs
 
+# --- [dv22-B2] C10: every destroy path re-derives the busy flag ---
+# Membership is DERIVED FROM THE TREE, never a hardcoded caller list: every
+# function whose body calls destroyTab( is a destroy path and must settle its
+# published list (`_tabs.value = …`) and then re-derive the busy flag
+# (publishAgentBusy(), or routed through updateTabs()) AFTER that last write.
+# A future 7th destroy caller is therefore checked by construction and fails
+# closed if it forgets — the gate cannot go stale by omitting a member
+# (deep-audit-1041 §8.7 rule 11: a written-out member list is the blindness).
+# destroyTab itself stays a pure teardown: it receives the caller's LOCAL list
+# (not yet written back), so a publish inside it would derive from the stale
+# `_tabs.value`; dispose() also writes its list after the destroy loop, out of
+# destroyTab's reach. That division of labour is pinned here too.
+
+C10_PUBLISH_SPELLINGS = ("publishAgentBusy()", "updateTabs(")
+
+
+def _c10_slice_fun(code: str, header: str) -> str:
+    """Body of a `fun` whose body starts with `{` — expression-bodied functions
+    (`fun onConfigurationChanged(...): T = Unit`) are SKIPPED, because a
+    brace-matching slice would run past them and swallow the rest of the
+    class, attributing another function's destroyTab( call to them."""
+    idx = code.find(header)
+    if idx < 0:
+        return ""
+    i = idx + len(header)
+    # The header ends with an unclosed "(" — skip to its matching ")".
+    depth_paren = 1
+    while i < len(code) and depth_paren > 0:
+        c = code[i]
+        if c == "(":
+            depth_paren += 1
+        elif c == ")":
+            depth_paren -= 1
+        i += 1
+    # Skip a return type / generic tail up to the body brace; an expression
+    # body (": T = Unit") has no brace on this line -> not a block body.
+    while i < len(code):
+        c = code[i]
+        if c == "{":
+            break
+        if c == "\n":
+            return ""
+        i += 1
+    if i >= len(code) or code[i] != "{":
+        return ""
+    depth = 0
+    j = i
+    while j < len(code):
+        c = code[j]
+        if c == '"':
+            j += 1
+            while j < len(code):
+                if code[j] == "\\":
+                    j += 2
+                    continue
+                if code[j] == '"':
+                    break
+                j += 1
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return code[i:j + 1]
+        j += 1
+    return ""
+
+
+def _c10_destroy_callers(code: str) -> list:
+    """Every `fun name(` whose body calls destroyTab( — definition excluded."""
+    out = []
+    for m in re.finditer(r"fun\s+([A-Za-z_]\w*)\s*\(", code):
+        name = m.group(1)
+        if name == "destroyTab":
+            continue  # the teardown itself, not a caller
+        body = _c10_slice_fun(code, m.group(0))
+        if body and "destroyTab(" in body:
+            out.append((name, body))
+    return out
+
+
+def check_destroy_busy_source(pool_src: str) -> list:
+    """[dv22-B2] C10 — destroy paths re-derive agentBusy. Fail-closed."""
+    code = strip_comments(pool_src)
+    errs = []
+
+    callers = _c10_destroy_callers(code)
+    if not callers:
+        errs.append(
+            "C10: no function body calling destroyTab( was found — the destroy "
+            "funnel vanished or the bodies stopped being extractable "
+            "(fail-closed; update this gate)")
+        return errs
+
+    # Coverage cross-check: every destroyTab( call site outside the definition
+    # must sit inside one of the caller bodies above. A call in a property
+    # initializer or a top-level lambda would otherwise go unchecked while the
+    # gate still reports green for the paths it did find.
+    total_calls = len(re.findall(r"destroyTab\(", code)) - 1  # minus the definition
+    owned_calls = sum(b.count("destroyTab(") for _, b in callers)
+    if total_calls != owned_calls:
+        errs.append(
+            f"C10: {total_calls} destroyTab( call site(s) in the pool but only "
+            f"{owned_calls} attributed to a caller body — an unchecked destroy "
+            "path exists (fail-closed; keep teardown calls inside a named fun "
+            "so this gate can see them)")
+
+    for name, body in callers:
+        writes = [m.start() for m in re.finditer(r"_tabs\.value\s*=(?!=)", body)]
+        if not writes:
+            errs.append(
+                f"C10: {name} destroys a tab but never settles the published list "
+                "(no `_tabs.value =` write) — the destroyed tab stays in the "
+                "flow (fail-closed; update this gate if the list write moved)")
+            continue
+        last_write = max(writes)
+        pubs = [body.find(sp) for sp in C10_PUBLISH_SPELLINGS]
+        pubs = [p for p in pubs if p >= 0]
+        if not pubs:
+            errs.append(
+                f"C10: {name} destroys a tab but never re-derives the busy flag "
+                "(no publishAgentBusy()/updateTabs() in its body) — agentBusy "
+                "freezes at its pre-destroy value, so closing the last in-use "
+                "tab leaves the sheet stuck on \"agent working\"")
+        elif not any(p > last_write for p in pubs):
+            errs.append(
+                f"C10: {name} re-derives the busy flag before its last "
+                "_tabs.value write — the derivation has to see the post-destroy "
+                "list or it publishes a stale value")
+
+    dt = slice_body(code, "fun destroyTab")
+    if not dt:
+        errs.append("C10: destroyTab body not extractable (fail-closed)")
+    elif any(sp in dt for sp in C10_PUBLISH_SPELLINGS):
+        errs.append(
+            "C10: destroyTab publishes the busy flag itself — it holds the "
+            "caller's local list, not _tabs.value, so the derivation is stale "
+            "by construction (and dispose() writes its list after the destroy "
+            "loop, out of its reach); publish at the caller's list write")
+    return errs
+
+
+# --- [dv22-B2] C10 fixtures: the shipped destroy paths at the decision points
+# only (destroy → settle list → re-derive). Breakers are GENERATED from this
+# fixture's own derived caller set, so "one arm per destroy path" holds even if
+# the fixture grows; each breaker removes exactly one re-derivation.
+DESTROY_COMPLIANT = """package com.rikkaminis.app.browser
+
+class BrowserTabPool {
+    private val _tabs = MutableStateFlow<List<Tab>>(emptyList())
+    private val _agentBusy = MutableStateFlow(false)
+
+    private fun publishAgentBusy() {
+        _agentBusy.value = _tabs.value.any { it.inUse }
+    }
+
+    private fun updateTabs() {
+        _tabs.value = _tabs.value.toList()
+        publishAgentBusy()
+    }
+
+    private fun destroyTab(tabs: MutableList<Tab>, tab: Tab) {
+        tabs.remove(tab)
+        tab.manager.destroy()
+    }
+
+    private suspend fun closeTab(tabId: Int) {
+        val currentTabs = _tabs.value.toMutableList()
+        destroyTab(currentTabs, currentTabs[0])
+        _tabs.value = currentTabs
+        publishAgentBusy()
+    }
+
+    suspend fun closeTabFromUI(tabId: Int) {
+        val currentTabs = _tabs.value.toMutableList()
+        destroyTab(currentTabs, currentTabs[0])
+        _tabs.value = currentTabs
+        publishAgentBusy()
+    }
+
+    private fun handleCloseWindow(manager: Manager) {
+        val currentTabs = _tabs.value.toMutableList()
+        destroyTab(currentTabs, currentTabs[0])
+        _tabs.value = currentTabs
+        publishAgentBusy()
+    }
+
+    fun dispose() {
+        val current = _tabs.value
+        if (current.isNotEmpty()) {
+            val mutable = current.toMutableList()
+            for (tab in current) {
+                destroyTab(mutable, tab)
+            }
+            _tabs.value = emptyList()
+            publishAgentBusy()
+        }
+    }
+
+    override fun onTrimMemory(level: Int) {
+        val currentTabs = _tabs.value.toMutableList()
+        for (tab in currentTabs.toList()) {
+            destroyTab(currentTabs, tab)
+        }
+        _tabs.value = currentTabs
+        publishAgentBusy()
+    }
+
+    fun evictIdleTabs() {
+        val currentTabs = _tabs.value.toMutableList()
+        for (tab in currentTabs.toList()) {
+            destroyTab(currentTabs, tab)
+        }
+        if (currentTabs.size != _tabs.value.size) {
+            _tabs.value = currentTabs
+            publishAgentBusy()
+        }
+    }
+}
+"""
+
+
+def _c10_body_span(src: str, name: str):
+    m = re.search(r"fun\s+%s\s*\(" % re.escape(name), src)
+    if not m:
+        raise AssertionError(f"C10 fixture lost `fun {name}(`")
+    body = slice_body(src[m.start():], f"fun {name}(")
+    if not body:
+        raise AssertionError(f"C10 fixture body unextractable: {name}")
+    start = src.index(body, m.start())
+    return start, start + len(body)
+
+
+def _c10_strip_publish(src: str, name: str) -> str:
+    """Delete the last re-derivation statement inside `name`'s body."""
+    start, end = _c10_body_span(src, name)
+    body = src[start:end]
+    at = body.rfind("publishAgentBusy()")
+    if at < 0:
+        raise AssertionError(f"C10 fixture has no publish in {name}")
+    line_start = body.rfind("\n", 0, at)
+    new_body = body[:line_start] + body[at + len("publishAgentBusy()"):]
+    if new_body == body:
+        raise AssertionError(f"C10 breaker for {name} did not change the source")
+    return src[:start] + new_body + src[end:]
+
+
+def _c10_publish_before_write(src: str, name: str) -> str:
+    """Move the re-derivation above the list write (stale-value shape)."""
+    start, end = _c10_body_span(src, name)
+    body = src[start:end]
+    at = body.rfind("publishAgentBusy()")
+    line_start = body.rfind("\n", 0, at)
+    line_end = body.find("\n", at)
+    if line_end < 0:
+        line_end = len(body)
+    stmt = body[line_start:line_end]
+    rest = body[:line_start] + body[line_end:]
+    write_at = rest.rfind("_tabs.value =")
+    write_line_start = rest.rfind("\n", 0, write_at) + 1
+    new_body = rest[:write_line_start] + stmt.lstrip("\n") + "\n" + rest[write_line_start:]
+    if new_body == body:
+        raise AssertionError(f"C10 order breaker for {name} did not change the source")
+    return src[:start] + new_body + src[end:]
+
+
+# 7th destroy caller added to the fixture without a publish: the derived set
+# must catch it although the gate never names it (blindness-by-list regression).
+DESTROY_V_NEW_CALLER_BLIND = DESTROY_COMPLIANT.replace(
+    "    fun evictIdleTabs() {",
+    "    fun closeTabFromTray(tabId: Int) {\n"
+    "        val currentTabs = _tabs.value.toMutableList()\n"
+    "        destroyTab(currentTabs, currentTabs[0])\n"
+    "        _tabs.value = currentTabs\n"
+    "    }\n\n    fun evictIdleTabs() {",
+)
+# A destroy call the gate cannot attribute to any body (property initializer):
+# the coverage cross-check must go red instead of quietly checking six paths.
+DESTROY_V_UNATTRIBUTED_CALL = DESTROY_COMPLIANT.replace(
+    "    private suspend fun closeTab(tabId: Int) {",
+    "    private val eagerKill: Unit = destroyTab(_tabs.value.toMutableList(), tab0)\n\n"
+    "    private suspend fun closeTab(tabId: Int) {",
+)
+
 BUSY_COMPLIANT = """package com.rikkaminis.app.browser
 
 class BrowserTabPool(context: Context) {
@@ -961,6 +1245,43 @@ class SessionFileStore internal constructor(
             failures += 1
         else:
             print(f"  OK {name}: {errs if errs else 'green'}")
+    # --- [dv22-B2] C10 arms: destroy paths re-derive the busy flag ---
+    # Arms are generated from the fixture's OWN derived caller set, so the
+    # "one breaker per destroy path" coverage cannot silently shrink.
+    destroy_names = [n for n, _ in _c10_destroy_callers(strip_comments(DESTROY_COMPLIANT))]
+    destroy_arms = [("C10 compliant destroy paths", DESTROY_COMPLIANT, [])]
+    for nm in destroy_names:
+        destroy_arms.append((f"C10 {nm} stops re-deriving", _c10_strip_publish(DESTROY_COMPLIANT, nm), ["C10"]))
+    destroy_arms.append(("C10 re-derivation moved above the list write",
+                         _c10_publish_before_write(DESTROY_COMPLIANT, destroy_names[0]), ["C10"]))
+    destroy_arms.append(("C10 destroyTab publishes from the stale local list",
+                         DESTROY_COMPLIANT.replace(
+                             "    private fun destroyTab(tabs: MutableList<Tab>, tab: Tab) {\n"
+                             "        tabs.remove(tab)\n",
+                             "    private fun destroyTab(tabs: MutableList<Tab>, tab: Tab) {\n"
+                             "        tabs.remove(tab)\n        publishAgentBusy()\n"),
+                         ["C10"]))
+    destroy_arms.append(("C10 a 7th destroy caller the gate never names",
+                         DESTROY_V_NEW_CALLER_BLIND, ["C10"]))
+    destroy_arms.append(("C10 destroy call outside any function body",
+                         DESTROY_V_UNATTRIBUTED_CALL, ["C10"]))
+    if len(destroy_names) != 6:
+        print(f"  FAIL C10 fixture caller set is {len(destroy_names)} names, "
+              "expected the six shipped destroy paths (fixture drift)")
+        failures += 1
+    for name, sample, expect in destroy_arms:
+        errs = check_destroy_busy_source(sample)
+        if expect == [] and errs:
+            print(f"  FAIL {name}: expected green, got {errs}")
+            failures += 1
+        elif expect != [] and not errs:
+            print(f"  FAIL {name}: expected red, got green")
+            failures += 1
+        elif expect != [] and not any(err.startswith(c) for c in expect for err in errs):
+            print(f"  FAIL {name}: expected {expect}, got {errs}")
+            failures += 1
+        else:
+            print(f"  OK {name}: {errs if errs else 'green'}")
     # --- [da1040-B2] C9 arms: busy-signal observability (own fixtures) ---
     for name, p, sh, expect in busy_arms:
         errs = check_busy_source(p, sh)
@@ -1027,12 +1348,15 @@ def main() -> int:
     else:
         if pool_src is not None:
             errs += check_busy_source(pool_src, sheet_src)
+        # [dv22-B2] C10 — destroy paths re-derive agentBusy (pool file only).
+        if pool_src is not None:
+            errs += check_destroy_busy_source(pool_src)
     if errs:
         print("browser_tabs_lifecycle_check RED:")
         for e in errs:
             print(f"  - {e}")
         return 1
-    print("browser_tabs_lifecycle_check OK (criteria: C1-C3 store lifecycle + C4/C4d pool teardown + window.open/close persistence + C5 risk notice reaches the agent text + C6 setSession re-points downloads atomically + C7 the session-shape predicate alone carries the draft alias + C8 every orphan entry folds the composer's active draft in + C9 the pool's busy signal is funnelled and observable)")
+    print("browser_tabs_lifecycle_check OK (criteria: C1-C3 store lifecycle + C4/C4d pool teardown + window.open/close persistence + C5 risk notice reaches the agent text + C6 setSession re-points downloads atomically + C7 the session-shape predicate alone carries the draft alias + C8 every orphan entry folds the composer's active draft in + C9 the pool's busy signal is funnelled and observable + C10 every destroyTab caller re-derives it after settling the list)")
     return 0
 
 
