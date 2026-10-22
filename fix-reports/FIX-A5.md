@@ -192,9 +192,26 @@ session_sheet_id_binding_check      rc=0  OK (4 session-scoped call blocks ...)
 - dispatch：`gh-actions-dispatch --workflow build-apk.yml --ref fix/dv22-a5-headless-session-ready` → `204; run created at 2026-10-22T10:26:13Z`
 - run：`https://github.com/logicflow-GYW/RikkaMinis/actions/runs/39763081224`
 
-**结论：见 §5.1（判读结果以本节末尾的最终读数为准）**
+**结论：attempt 1 success，8/8 判据 ALL GREEN。**
 
-<!-- CI-RESULT -->
+| 项 | 读数 |
+|---|---|
+| run / job | `39763322068` / `119772879607`（26 步） |
+| conclusion | `success`（`at 2026-10-22T10:47:01Z`） |
+| **head_sha 三方** | 本地 `877d48701c0da11b9d4e3e4e4301fc2e437b0f1f` == `git ls-remote` == CI job `head_sha` = **三者逐字符一致** |
+| 步骤 | `not_ok_steps=[]` · 唯一 `skipped_steps=['Publish to Releases']`（main 门控 ✓，分支不该发版） |
+| 门头 | `[1/109] … [109/109]`，序号连续、**109 个互异门名** |
+| 门汇总 | `║  Summary: 109 passed, 0 failed`（全部 9 条 `Summary:` 行里 **无任何非零 failed**） |
+| 夹具 | `✅ ALL 336 CASES PASS`（1 处） |
+| 本门 | `chat_session_id_binding_check: all criteria satisfied`（真树）· `✅ chat_session_id_binding_check selftest has teeth (CHAT_SESSION_ID_BINDING_SELFTEST=PASS)` · `✅ chat_session_id_binding_check real tree green` |
+| 新测试 | `HeadlessChatRunnerSessionReadyBarrierTest` **10/10 逐条 PASSED**（含 7 条负控） |
+| 编译错 | `Z e: ` **0** |
+| 游离 FAILED | **0**（含 FAILED 但不含 PASSED 的行 = 0） |
+| 日志 | `probe/ci/job-119772879607.log`，1,364,711 B / 16,309 行 |
+
+**判读装置两处踩坑（登记在 R8）**：
+1. `Summary:` 行的权威形态是 `║  Summary: 109 passed, 0 failed`（带框线前缀），首版用 `strip().startswith("Summary:")` 导致 `Summary lines=0` 的假阴性 —— 改为「收集全部含 `Summary:` 的行，断言其中一条为 109/0 且无任何非零 failed」。
+2. `.env` 里没有 `GITHUB_TOKEN` 的话取数会 401；本支按 skill `github-ops` 的既有路径复用同一个 `python3` 取数装置（不走裸 curl，避免本机代理把 HTTPS 降级成明文导致 rc=0 空输出）。
 
 ---
 
@@ -222,6 +239,8 @@ session_sheet_id_binding_check      rc=0  OK (4 session-scoped call blocks ...)
 - **R5 `prompt` 的屏障仍是 warn-only（P3，刻意）**：`send` 的语义是「可以把消息交给 VM」，修前行为是地板（`fix/send-dispatch-race` 的既有决定）。触发条件 = 出现「dispatch 后 agent 没看到任务」的第 4 次报告（前三记在 backlog §76）；触发后方案 = 把 `prompt` 的 `sessionReady == null` 也升为结构化错误。
 - **R6 门判据不覆盖 `SessionSheet` / UI 侧同族（P3）**：UI 侧入口（`ChatScreen` 的按钮）本来就在屏上、用户只有在列表已渲染后才能点，窗口不成立。触发条件 = 出现 UI 侧误点即静默失败的复现；触发后再评估。
 - **R7 `seedMemberCount` 类「成员数写死」在别的门里仍存在（P3）**：本支只把 criterion 14 做成派生；全仓其它 108 道门是否还有写死成员数未普查。触发条件 = 下一次「新增成员静默不红」的实例；触发后方案 = 用 `scan_debt.py code` 扫一遍。
+- **R8 CI 判读脚本的汇总行形态（P3）**：首版用 `strip().startswith("Summary:")` 匹配，实际权威形态是带框线前缀的 `║  Summary: 109 passed, 0 failed`，导致 `Summary lines=0` 假阴性（其余判据当场标出真读数，未误判为绿）。触发条件 = 下次把这段判读装置复用到别的批次时；触发后方案 = 统一改为「全量收集含 `Summary:` 的行 + 断言其中一条满足 ran/0 + 无非零 failed」，并抽成共享 `judge_ci.py`。
+- **R9 本支未能拿到 `gate_run --full` 的单份 summary（P2，只影响证据形态）**：两次尝试分别遇到 ENOSYS（test_scan 步骤被打断）与并发会话 a3 持锁（`gate_run.sh --status` 显示 `pid=4967 mode=full repo=…/a3`），未抢锁。证据以「108 道门逐门 PASS 的进度行 + 单独跑 `test_scan.py` 的 `ALL 336 CASES PASS` + 分支 CI 的 `109 passed, 0 failed`」三条独立读数替代。触发条件 = 下次收口期抢到空闲窗口；触发后方案 = 补跑一次完整 `--full` 留 summary.tsv。
 
 ---
 
