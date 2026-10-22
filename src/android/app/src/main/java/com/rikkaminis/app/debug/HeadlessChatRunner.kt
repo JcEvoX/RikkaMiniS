@@ -366,11 +366,65 @@ internal object HeadlessChatRunner {
                 retriedMessageId = targetMsgId,
             )
         }
-        vm.retryFromMessage(targetMsgId)
-        if (!wait) {
+        // [deep-audit-1042 A-05] loadSession is TWO steps: `_activeEntryId`
+        // flips at step 1 (ChatSessionLifecycle:423), the message list is read
+        // at step 2 (:477) and `_sessionLoaded` only in its `finally` (:786).
+        // The readiness wait above is therefore satisfied while `_messages` is
+        // still empty — and `retryFromMessage` resolves its target with
+        // `_messages.value.indexOfFirst { it.id == messageId }`, returning
+        // silently on a miss (ChatViewModel:3199). Invoked inside that window
+        // it truncated nothing and started nothing, while the `wait` branch
+        // below read "not streaming" and settled `Completed` with the previous
+        // assistant text: a fake success for a retry that never ran.
+        // Await the latch first — the same shape as prompt()'s dispatch
+        // barrier: OFF Main (the load resumes on Main.immediate, so waiting on
+        // Main would deadlock it) and bounded (a timeout is not thrown; the
+        // branch below turns it into a structured error instead of guessing).
+        val sessionReady = withContext(Dispatchers.Default) {
+            withTimeoutOrNull(5000L) { vm.sessionLoaded.first { it } }
+        }
+        if (sessionReady == null) {
             return@withContext PromptResult(
-                status = "Retrying",
-                responseText = null,
+                status = "Error",
+                responseText = "session_not_loaded_in_5s",
+                timedOut = false,
+                deletedMessageCount = deletedCount,
+                retriedMessageId = targetMsgId,
+            )
+        }
+        vm.retryFromMessage(targetMsgId)
+        // `retryFromMessage` claims `_isStreaming` SYNCHRONOUSLY (T145) after
+        // every drop gate (already streaming / not a retryable user message /
+        // no provider / target missing from `_messages`), so reading the flag
+        // here — same Main dispatcher, straight after the call — answers "did
+        // a retry actually start?". A dropped retry used to fall through to
+        // the wait branch, which saw `isStreaming == false` and reported
+        // `Completed` + the stale assistant text. Same envelope family as
+        // prompt()'s "send_dropped_before_stream".
+        val started = vm.isStreaming.value
+        if (!wait) {
+            return@withContext if (started) {
+                PromptResult(
+                    status = "Retrying",
+                    responseText = null,
+                    timedOut = false,
+                    deletedMessageCount = deletedCount,
+                    retriedMessageId = targetMsgId,
+                )
+            } else {
+                PromptResult(
+                    status = "Error",
+                    responseText = "retry_dropped_before_stream",
+                    timedOut = false,
+                    deletedMessageCount = deletedCount,
+                    retriedMessageId = targetMsgId,
+                )
+            }
+        }
+        if (!started) {
+            return@withContext PromptResult(
+                status = "Error",
+                responseText = "retry_dropped_before_stream",
                 timedOut = false,
                 deletedMessageCount = deletedCount,
                 retriedMessageId = targetMsgId,
@@ -426,6 +480,26 @@ internal object HeadlessChatRunner {
             )
         }
         val before = app.chatRepository.messageCount(sessionId)
+        // [deep-audit-1042 A-05] The same two-step load window as retry():
+        // `rerunFromToolBlock` resolves the assistant bubble and its tool block
+        // from `_messages.value` and returns false on a miss — but its
+        // degenerate branch (no preceding content in the turn) delegates to
+        // `retryFromMessage` and returns TRUE without claiming `_isStreaming`.
+        // Both are the wrong answer before the message list is loaded: the
+        // caller then waited on a stream that never started. Await the latch
+        // off Main / bounded, exactly like prompt() and retry().
+        val sessionReady = withContext(Dispatchers.Default) {
+            withTimeoutOrNull(5000L) { vm.sessionLoaded.first { it } }
+        }
+        if (sessionReady == null) {
+            return@withContext PromptResult(
+                status = "Error",
+                responseText = "session_not_loaded_in_5s",
+                timedOut = false,
+                deletedMessageCount = 0,
+                retriedMessageId = assistantMessageId,
+            )
+        }
         // The in-memory assistant bubble id is a volatile `assistant_<ts>`
         // runtime id, not the DB row id a harness reads from chat.messages.list.
         // Resolve the live bubble that owns this tool block; fall back to the
@@ -442,10 +516,36 @@ internal object HeadlessChatRunner {
                 retriedMessageId = assistantMessageId,
             )
         }
+        // `accepted == true` is not the same as "a stream started": the
+        // degenerate branch inside `rerunFromToolBlock` delegates to
+        // `retryFromMessage`, which can still drop silently (its own gates),
+        // while the non-degenerate path claims `_isStreaming` synchronously.
+        // Read the flag on the same Main dispatcher so the settle branches
+        // below can never report `Completed` for a run that never began.
+        val started = vm.isStreaming.value
         if (!wait) {
+            return@withContext if (started) {
+                PromptResult(
+                    status = "Rerunning",
+                    responseText = null,
+                    timedOut = false,
+                    deletedMessageCount = 0,
+                    retriedMessageId = assistantMessageId,
+                )
+            } else {
+                PromptResult(
+                    status = "Error",
+                    responseText = "rerun_dropped_before_stream",
+                    timedOut = false,
+                    deletedMessageCount = 0,
+                    retriedMessageId = assistantMessageId,
+                )
+            }
+        }
+        if (!started) {
             return@withContext PromptResult(
-                status = "Rerunning",
-                responseText = null,
+                status = "Error",
+                responseText = "rerun_dropped_before_stream",
                 timedOut = false,
                 deletedMessageCount = 0,
                 retriedMessageId = assistantMessageId,
@@ -500,6 +600,24 @@ internal object HeadlessChatRunner {
                 summary = null,
                 timedOut = false,
                 error = "no_provider_resolved_in_5s",
+            )
+        }
+        // [deep-audit-1042 A-05] Same two-step load window as retry(): before
+        // `_sessionLoaded` flips, the in-memory history the compactor walks is
+        // empty, so a cold-session compact read as "nothing to compact" —
+        // structurally a fake no-op `done` for a session that DID have
+        // history. Await the latch off Main / bounded (the readiness wait for
+        // `_activeEntryId` alone cannot close this window: it flips at load
+        // step 1, the latch only at step 2's finally).
+        val sessionReady = withContext(Dispatchers.Default) {
+            withTimeoutOrNull(5000L) { vm.sessionLoaded.first { it } }
+        }
+        if (sessionReady == null) {
+            return@withContext CompactResult(
+                status = "Error",
+                summary = null,
+                timedOut = false,
+                error = "session_not_loaded_in_5s",
             )
         }
         if (vm.isStreaming.value) {
@@ -585,6 +703,22 @@ internal object HeadlessChatRunner {
             }
         }
         if (ready == null) throw RPCException(-32000, "Session VM did not resolve a provider within 5s")
+        // [deep-audit-1042 A-05] `revertCompact` deletes the LATEST compact
+        // marker via `_cachedLatestMarker`, which is only populated by the
+        // message load ("before the first load completes it is null, so
+        // callers treat null as no boundary"). Before the latch flips the
+        // in-VM revert is a silent no-op that still appends "nothing to
+        // revert" system info, and the RPC layer (ChatMutationMethods.
+        // compactRevert) then polls for a marker-drop that never happens and
+        // answers `afterMarkerCount == beforeMarkerCount` after a 5 s hang —
+        // a structured failure here is the honest answer instead. Await the
+        // latch off Main / bounded, same shape as the other entries.
+        val sessionReady = withContext(Dispatchers.Default) {
+            withTimeoutOrNull(5000L) { vm.sessionLoaded.first { it } }
+        }
+        if (sessionReady == null) {
+            throw RPCException(-32000, "session_not_loaded_in_5s: $sessionId")
+        }
         vm.revertCompact()
     }
 
