@@ -29,12 +29,22 @@ Fix contract asserted here (code anchors, comments stripped before matching):
         the parsed block to update() as well — same contract as arm4/arm8's
         file path; without it the on-disk block shadowed the incoming one
         (deep-audit-1030 ISSUE-02)
+  arm10 [dv22-B6 §1042-B-07] the skills-BROWSER import path judges duplication
+        BEFORE the full-fat import: it resolves the update target
+        (resolveUpdateTargetId) first, hands that id to importFromGitHub as
+        preferredId (else importFromContent's landing id is slugify(name), so
+        a renamed / custom-id skill is duplicated instead of refreshed), and
+        picks the HUD string on the dedup result — pre-fix importFromGitHub
+        always returned non-null (its replace branch), so `if (skill != null)`
+        was always true, every refresh claimed "imported", and the resolved-id
+        refresh was unreachable dead code
 
 Usage: python3 scripts/scan/skill_frontmatter_roundtrip_check.py [repo_root]
        python3 scripts/scan/skill_frontmatter_roundtrip_check.py --selftest
 Exit:  0 = clean, 1 = violation(s), 2 = usage
 """
 import os
+import re
 import sys
 
 REPO_REL = "src/android/app/src/main/java/com/rikkaminis/app"
@@ -64,6 +74,18 @@ DETAIL_PASSES = "frontmatter = parsed.frontmatter.ifBlank { null }"
 # [da1030-A ISSUE-02] the browser refresh call site
 SB_UPDATE_CALL = "skillRepository.update("
 SB_UPDATE_DISCRIMINATOR = "id = targetId"
+# [dv22-B6 §1042-B-07] the browser pre-import dedup chain. Decision points,
+# not whole-line spellings: the resolution must happen before the full-fat
+# import, the import call must carry the resolved id, and the success HUD must
+# branch on the dedup result. The dedup VARIABLE NAME is derived from the
+# `val x = resolveUpdateTargetId(` statement, so renaming it cannot silently
+# satisfy (or break) the criteria — only removing the decision can.
+SB_RESOLVE_STMT_RE = re.compile(
+    r"val\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*resolveUpdateTargetId\(")
+SB_IMPORT_CALL = "skillRepository.importFromGitHub("
+SB_NULL_GUARD = "if (skill != null)"
+SB_MSG_UPDATED = "R.string.skills_browser_success_updated"
+SB_MSG_IMPORTED = "R.string.skills_browser_success_imported"
 
 
 def strip_comments(text):
@@ -275,6 +297,54 @@ def run_checks_text(sr_text, sm_text, sb_text=None):
               "passed, so the incoming subagent / max_turns / allowed_tools are "
               "shadowed by the disk copy")
 
+    # arm10 [dv22-B6 §1042-B-07]: the browser import judges duplication BEFORE
+    # the full-fat import. The dedup variable name is derived from the
+    # `val x = resolveUpdateTargetId(` statement so a rename cannot satisfy
+    # the criteria — only the decision chain can.
+    import_at = sb_nc.find(SB_IMPORT_CALL)
+    if import_at < 0:
+        check("arm10 browser import call site found", False,
+              "'%s' not found in MinisSkillsBrowserScreen.kt (ROT — update this gate)"
+              % SB_IMPORT_CALL)
+    else:
+        m = SB_RESOLVE_STMT_RE.search(sb_nc)
+        check("arm10 browser resolves the update target before importing",
+              m is not None and m.start() < import_at,
+              "expected a `val <x> = resolveUpdateTargetId(` statement before "
+              "the importFromGitHub call — without it the import always "
+              "duplicated a renamed / custom-id skill and always claimed "
+              "'imported' (ROT — update this gate)")
+        if m is None:
+            check("arm10 browser import carries the resolved id", False,
+                  "no resolveUpdateTargetId statement to carry (ROT — update this gate)")
+            check("arm10 HUD message branches on the dedup result", False,
+                  "no resolveUpdateTargetId statement to branch on (ROT — update this gate)")
+        else:
+            dedup_var = m.group(1)
+            import_block = call_arg_block(sb_nc, import_at)
+            check("arm10 browser import carries the resolved id",
+                  import_block is not None and
+                  ("preferredId = %s" % dedup_var) in import_block,
+                  "expected 'preferredId = %s' in the importFromGitHub "
+                  "arguments — without the passthrough importFromContent lands "
+                  "under slugify(name) and a local record under a different id "
+                  "is duplicated instead of refreshed (ROT — update this gate)"
+                  % dedup_var)
+            # scope the message check to the success branch: from the import
+            # call to the next resolveUpdateTargetId( (the fallback re-resolve)
+            # — the fallback's own 'updated' string must not satisfy this.
+            dedup2 = sb_nc.find("resolveUpdateTargetId(", import_at)
+            seg_end = min(dedup2 if dedup2 >= 0 else len(sb_nc), import_at + 3000)
+            msg_seg = sb_nc[import_at:seg_end]
+            guard_at = msg_seg.find(SB_NULL_GUARD)
+            check("arm10 HUD message branches on the dedup result",
+                  SB_NULL_GUARD in msg_seg and
+                  SB_MSG_UPDATED in msg_seg and SB_MSG_IMPORTED in msg_seg and
+                  ("%s != null" % dedup_var) in msg_seg,
+                  "expected the success HUD to pick %s / %s on '%s != null' "
+                  "inside the if (skill != null) branch (ROT — update this gate)"
+                  % (SB_MSG_UPDATED, SB_MSG_IMPORTED, dedup_var))
+
     return failures
 
 
@@ -469,11 +539,22 @@ DIRTY_SM_SPLICE = GOOD_SM.replace(
         }""")
 
 # [da1030-A ISSUE-02] browser-refresh fixture: the call site the gate scopes to
-# is the resolved-id one (`id = targetId`).
+# is the resolved-id one (`id = targetId`). [dv22-B6] extended with the
+# pre-import dedup chain arm10 pins: resolve before import, carry the id, and
+# branch the HUD string on the dedup result.
 GOOD_SB = '''package com.rikkaminis.app.ui.settings
 
 internal suspend fun refreshFromCatalogue(skillRepository: SkillRepository) {
     val parsed = skillRepository.parseSkillMdPublic(content)
+    val matchedId = resolveUpdateTargetId(rows, slug = slugify(parsed.name), incomingName = parsed.name)
+    val skill = skillRepository.importFromGitHub(url, preferredId = matchedId)
+    if (skill != null) {
+        val messageRes =
+            if (matchedId != null) R.string.skills_browser_success_updated
+            else R.string.skills_browser_success_imported
+        onStateChange(HudState.SUCCESS, context.getString(messageRes, skill.name))
+        return
+    }
     val targetId = resolveUpdateTargetId(rows, slugify(parsed.name), parsed.name) ?: slugify(parsed.name)
     val updated = withContext(Dispatchers.IO) {
         skillRepository.update(
@@ -502,6 +583,33 @@ DIRTY_SB_BLOCK_ELSEWHERE = DIRTY_SB_DROP.replace(
     "    skillRepository.update(id = otherId, frontmatter = parsed.frontmatter.ifBlank { null })\n"
     "    val updated = withContext(Dispatchers.IO) {\n")
 
+# [dv22-B6 §1042-B-07] dirty variants — each flips exactly the arm10 decision
+# it names, keeping arm9 green (the update() call site is untouched).
+
+# The pre-fix shape: import before resolve (no dedup at all).
+DIRTY_SB_NO_DEDUP = GOOD_SB.replace(
+    """    val matchedId = resolveUpdateTargetId(rows, slug = slugify(parsed.name), incomingName = parsed.name)
+    val skill = skillRepository.importFromGitHub(url, preferredId = matchedId)
+""",
+    """    val skill = skillRepository.importFromGitHub(url)
+""")
+
+# Resolve happens but the id never reaches the import call — the landing id
+# falls back to slugify(name) and a custom-id record is duplicated.
+DIRTY_SB_NO_PASSTHROUGH = GOOD_SB.replace(
+    "skillRepository.importFromGitHub(url, preferredId = matchedId)",
+    "skillRepository.importFromGitHub(url)")
+
+# The id is carried but the HUD always claims "imported" — the message lies
+# about the in-place refresh (the original symptom).
+DIRTY_SB_ALWAYS_IMPORTED = GOOD_SB.replace(
+    """        val messageRes =
+            if (matchedId != null) R.string.skills_browser_success_updated
+            else R.string.skills_browser_success_imported
+""",
+    """        val messageRes = R.string.skills_browser_success_imported
+""")
+
 
 def selftest():
     # tempfile.mkdtemp resolves through the guest-tmp translation (host-side
@@ -524,6 +632,9 @@ def selftest():
         ("viewer hand-splice returns", GOOD_SR, DIRTY_SM_SPLICE, GOOD_SB),
         ("browser refresh drops the block", GOOD_SR, GOOD_SM, DIRTY_SB_DROP),
         ("browser block on the wrong call", GOOD_SR, GOOD_SM, DIRTY_SB_BLOCK_ELSEWHERE),
+        ("browser import without dedup", GOOD_SR, GOOD_SM, DIRTY_SB_NO_DEDUP),
+        ("browser dedup id not carried", GOOD_SR, GOOD_SM, DIRTY_SB_NO_PASSTHROUGH),
+        ("browser HUD always says imported", GOOD_SR, GOOD_SM, DIRTY_SB_ALWAYS_IMPORTED),
     ]:
         f = run(sr_t, sm_t, sb_t)
         red = len(f) > 0
@@ -544,7 +655,7 @@ def main():
         for f in failures:
             print("  - %s" % f)
         sys.exit(1)
-    print("OK %s + %s + %s (%d arms)" % (SR_REL, SM_REL, SB_REL, 14))
+    print("OK %s + %s + %s (17 arms)" % (SR_REL, SM_REL, SB_REL))
     sys.exit(0)
 
 
