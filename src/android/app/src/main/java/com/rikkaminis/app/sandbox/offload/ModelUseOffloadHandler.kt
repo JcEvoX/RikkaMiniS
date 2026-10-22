@@ -404,8 +404,9 @@ class ModelUseOffloadHandler(
             // null and e.g. never sent `responseModalities: ["TEXT","IMAGE"]`, so a
             // --output out.png run that passed the gate here came back text-only.
             // ponytail: 复用 :190 已算好的 `effectiveModel`，不在此处重新解析 —— 这正是
-            // `ModelsDevApi.effectiveModel(` 字面计数保持恰为 2（:190 与 :1007）的原因，
-            // ModelUseModalityParityTest 钉住了这个计数。 | 天花板: 某个 buildRequestJson
+            // 共享 resolver 的字面调用计数保持恰为 2（:190 与 :1007）的原因，
+            // ModelUseModalityParityTest 钉住了这个计数（该断言按原文计数，
+            // 因此本注释刻意不复述那个字面调用形式）。 | 天花板: 某个 buildRequestJson
             // 调用点若移出 cmdRun（拿不到该局部变量）就必须自解析，届时该测试计数断言要同步改。
             // | 升级触发: 出现第 3 个 buildRequestJson 调用点，或 cmdRun 被拆分。
             val ptRequestJson = ModelExecutionDispatcher.buildRequestJson(

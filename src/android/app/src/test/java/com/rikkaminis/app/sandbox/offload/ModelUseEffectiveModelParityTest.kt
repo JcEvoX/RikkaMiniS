@@ -151,11 +151,14 @@ class ModelUseEffectiveModelParityTest {
         val handler = readRepoFile(
             "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ModelUseOffloadHandler.kt",
         ) ?: return
-        val code = codeOnly(handler)
+        // Counted on the RAW text, exactly like the fence in
+        // ModelUseModalityParityTest: a prose mention of the call form would
+        // count there too, so this assertion must use the same口径 or the two
+        // would disagree about the same file.
         assertEquals(
             "the handler must resolve the enriched model exactly twice (the two guards)",
             2,
-            Regex("""ModelsDevApi\.effectiveModel\(""").findAll(code).count(),
+            Regex("""ModelsDevApi\.effectiveModel\(""").findAll(handler).count(),
         )
     }
 
