@@ -54,8 +54,17 @@ class OpenOffloadHandler(private val context: Context) : NativeOffloadHandler {
             // the no_handler error branch. Use Intent.parseUri to honor the
             // full URI semantics; ACTION_VIEW path stays for plain http/tel
             // /mailto/geo/market URLs.
-            val intent: Intent = if (url.startsWith("intent:") || url.startsWith("android-app:")) {
-                Intent.parseUri(url, Intent.URI_INTENT_SCHEME).apply {
+            // [deep-audit-1041 FIX-A6] RFC 3986 makes URI schemes
+            // case-insensitive, but `Intent.parseUri` matches `intent:` /
+            // `android-app:` case-SENSITIVELY internally and silently degrades
+            // `INTENT://…` to a plain ACTION_VIEW over the raw string (which
+            // then fails as `no_handler`). Match case-insensitively here AND
+            // hand the parser a scheme-normalised copy, so a mixed-case scheme
+            // keeps the full URI_INTENT_SCHEME semantics.
+            val isIntentUri = url.startsWith("intent:", ignoreCase = true) ||
+                url.startsWith("android-app:", ignoreCase = true)
+            val intent: Intent = if (isIntentUri) {
+                Intent.parseUri(lowercaseIntentScheme(url), Intent.URI_INTENT_SCHEME).apply {
                     addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                     // [deep-audit-1016c FIX-B B] A model-supplied intent URI is
                     // untrusted input: strip everything it could use to reach
@@ -69,7 +78,13 @@ class OpenOffloadHandler(private val context: Context) : NativeOffloadHandler {
                     //   • a same-package `component` target would launch an
                     //     internal activity that `exported=false` never
                     //     protects against same-uid explicit intents — the
-                    //     system chooser must stay the arbiter.
+                    //     system chooser must stay the arbiter;
+                    //   • [deep-audit-1041 FIX-A6] a same-package `package=`
+                    //     target pins resolution to THIS app exactly like a
+                    //     component does — `Intent.parseUri` writes it to
+                    //     `getPackage()`, so the component check above never
+                    //     saw it. Dropped under the same rule; a third-party
+                    //     package target is left intact.
                     removeFlags(
                         Intent.FLAG_GRANT_READ_URI_PERMISSION or
                             Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
@@ -78,6 +93,10 @@ class OpenOffloadHandler(private val context: Context) : NativeOffloadHandler {
                     )
                     clipData = null
                     if (component?.packageName == context.packageName) component = null
+                    // [deep-audit-1041 FIX-A6] Same rule for the `package=`
+                    // target (see the bullet above): only OUR package is
+                    // stripped; a third-party package survives verbatim.
+                    if (getPackage() == context.packageName) setPackage(null)
                     // Browsers inject a selector to bind the URI to a
                     // specific package; we already trust the model-supplied
                     // intent, so let the system-wide chooser apply.
@@ -170,4 +189,23 @@ market:// URLs automatically fall back to AppGallery.
 Errors are returned as JSON: {"error":"no_handler","message":"...","url":"..."}.
 """
     }
+}
+
+/**
+ * [deep-audit-1041 FIX-A6] Lower-case the URI SCHEME PREFIX only.
+ *
+ * `Intent.parseUri` matches `intent:` / `android-app:` case-sensitively
+ * inside `parseUriInternal`, so a mixed-case scheme is silently degraded to a
+ * plain ACTION_VIEW over the raw string. RFC 3986 declares schemes
+ * case-insensitive, so normalising just the prefix is lossless: everything
+ * from the first ':' onward — path, query and the `#Intent;…;end` fragment,
+ * whose keys and values ARE case-sensitive — comes back byte-identical.
+ *
+ * `internal` (not private) so the JVM unit tests can pin the normalisation
+ * without an Android runtime.
+ */
+internal fun lowercaseIntentScheme(url: String): String {
+    val sep = url.indexOf(':')
+    if (sep <= 0) return url
+    return url.substring(0, sep).lowercase() + url.substring(sep)
 }
