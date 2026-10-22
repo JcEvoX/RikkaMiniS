@@ -1105,6 +1105,31 @@ class ChatViewModel(
     internal val _forceScrollToBottom = MutableSharedFlow<Unit>(extraBufferCapacity = 4)
     val forceScrollToBottom: SharedFlow<Unit> = _forceScrollToBottom.asSharedFlow()
 
+    /**
+     * [fix/dv23-b3] Composer intents. The composer's single writer is
+     * `ChatInputArea`: it alone owns the live field state
+     * (`inputFieldValue.text`) and the 150 ms IME-burst job. ChatScreen used to
+     * reach into the composer directly for the slash-menu toggle/dismiss and
+     * the clear-chat wipe, resolving them against [_inputText] — the value that
+     * LAGS the field by the debounce window — so a fresh dictation/paste was
+     * rolled back to a stale snapshot (and, when the computed text equalled the
+     * current value, the write was dropped by the StateFlow anyway). Those
+     * intents now travel here and are executed by the composer with its own
+     * live text.
+     *
+     * Fire-and-forget by design: with no composer on screen there is nothing to
+     * command, and replaying a queued intent after re-entry would wipe a draft
+     * the user typed in the meantime (hence no replay / no buffering across
+     * an absent collector).
+     */
+    internal val _composerCommand = MutableSharedFlow<ComposerCommand>(extraBufferCapacity = 4)
+    val composerCommand: SharedFlow<ComposerCommand> = _composerCommand.asSharedFlow()
+
+    /** Route a composer intent to the composer (see [_composerCommand]). */
+    fun requestComposerCommand(command: ComposerCommand) {
+        _composerCommand.tryEmit(command)
+    }
+
     internal val _availableGroups = MutableStateFlow<List<ModelGroup>>(emptyList())
     val availableGroups: StateFlow<List<ModelGroup>> = _availableGroups.asStateFlow()
 
@@ -4526,4 +4551,35 @@ internal fun pruneExpiredShareInboundFiles(
         }
     }
     return deleted
+}
+
+/**
+ * [fix/dv23-b3] Composer intents raised OUTSIDE the composer.
+ *
+ * The composer has exactly one writer: `ChatInputArea`. It owns the live field
+ * state and the 150 ms IME-burst debounce, so any intent that touches the
+ * composer must be resolved there, against the field's live text — never here
+ * against [ChatViewModel.inputText], which lags by the debounce window.
+ *
+ * Intentionally tiny: an enum-like command set, not a general bus. Adding a
+ * member is only justified when a caller cannot reach the composer state at all
+ * (it lives in the child composable's `remember`).
+ */
+sealed interface ComposerCommand {
+    /**
+     * Toolbar `/` button: open the slash menu over the current text, or close
+     * it when already open. Never clobbers existing composer content (see
+     * `showSlashMenuOverInput`).
+     */
+    data object ToggleSlashMenu : ComposerCommand
+
+    /** Tap outside / system back: close the slash menu, keep the body text. */
+    data object DismissSlashMenu : ComposerCommand
+
+    /**
+     * Clear-chat confirmation: wipe the composer through the three-write funnel
+     * (`clearComposerInput`) — a bare `setInputText("")` is dropped by the
+     * StateFlow when the value already equals "".
+     */
+    data object Clear : ComposerCommand
 }
