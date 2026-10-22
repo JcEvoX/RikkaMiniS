@@ -7,6 +7,7 @@ import org.junit.Before
 import org.junit.Test
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * [fix/da1019-rssprobe-lock-scope] deep-audit-1019 ISSUE-09 (P2) — lock-scope rig
@@ -174,11 +175,16 @@ class BrowserRssProbeLockScopeTest {
     fun `summary stays self consistent while records run concurrently`() {
         val stop = java.util.concurrent.atomic.AtomicBoolean(false)
         val errors = ConcurrentLinkedQueue<Throwable>()
+        // [VERIFY-2476] Wait for the first record before reading a summary: the
+        // invariant below divides by `count`, so a recorder that has not started
+        // yet makes the loop throw ArithmeticException instead of testing it.
+        val firstRecord = CountDownLatch(1)
         val recorders = (1..6).map {
             Thread {
                 try {
                     while (!stop.get()) {
                         BrowserRssProbe.record("mix", 0L, 131_072L) // +128MB/call
+                        firstRecord.countDown()
                         Thread.yield()
                     }
                 } catch (t: Throwable) {
@@ -186,25 +192,40 @@ class BrowserRssProbeLockScopeTest {
                 }
             }.apply { start() }
         }
+        assertTrue(
+            "no recorder landed a record within 10s",
+            firstRecord.await(10, TimeUnit.SECONDS),
+        )
         var seen = 0
         var lastCount = 0L
-        repeat(200) {
-            val s = BrowserRssProbe.summary()
-            val cum = fieldOf(s, "mix", "cum")
-            val count = fieldOf(s, "mix", "count")
-            val avg = fieldOf(s, "mix", "avg")
-            // Snapshot must be internally consistent: avg comes from the same
-            // critical section as cum and count (pre-fix they were three racy reads).
-            assertEquals(cum / count, avg)
-            // count only grows (this probe never resets the cumulative value).
-            assertTrue("count went backwards: $lastCount → $count", count >= lastCount)
-            lastCount = count
-            seen += 1
+        // [VERIFY-2476] The failure path must terminate the recorders too: they
+        // loop forever, so an assertion thrown in this body would leave six live
+        // threads writing into the probe after the test returns — the next test
+        // that re-points the global hook then sees their increments, which is
+        // exactly how the CI failure cascaded.
+        try {
+            repeat(200) {
+                val s = BrowserRssProbe.summary()
+                val cum = fieldOf(s, "mix", "cum")
+                val count = fieldOf(s, "mix", "count")
+                val avg = fieldOf(s, "mix", "avg")
+                // Snapshot must be internally consistent: avg comes from the same
+                // critical section as cum and count (pre-fix they were three racy reads).
+                assertEquals(cum / count, avg)
+                // count only grows (this probe never resets the cumulative value).
+                assertTrue("count went backwards: $lastCount → $count", count >= lastCount)
+                lastCount = count
+                seen += 1
+            }
+            assertTrue(lastCount > 0L)
+        } finally {
+            stop.set(true)
+            recorders.forEach {
+                it.join(5_000)
+                assertFalse("recorder thread did not terminate: ${it.state}", it.isAlive)
+            }
         }
-        stop.set(true)
-        recorders.forEach { it.join() }
         assertTrue("worker errors: $errors", errors.isEmpty())
         assertEquals(200, seen)
-        assertTrue(lastCount > 0L)
     }
 }
