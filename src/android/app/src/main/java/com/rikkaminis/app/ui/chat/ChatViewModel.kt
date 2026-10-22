@@ -41,6 +41,7 @@ import com.rikkaminis.app.data.model.AgentContentPart
 import com.rikkaminis.app.data.model.AgentToolDefinition
 import com.rikkaminis.app.data.model.LLMMessage
 import com.rikkaminis.app.data.model.LLMModel
+import com.rikkaminis.app.data.model.normalizeModalities
 import com.rikkaminis.app.data.model.LLMStreamChunk
 import com.rikkaminis.app.data.model.LLMUsage
 import com.rikkaminis.app.data.model.ModelGroup
@@ -53,6 +54,7 @@ import com.rikkaminis.app.data.repository.MemoryRepository
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.provider.ImageBudget
 import com.rikkaminis.app.provider.LLMProvider
+import com.rikkaminis.app.provider.ModelsDevApi
 import com.rikkaminis.app.provider.ProviderFactory
 import com.rikkaminis.app.provider.catalogMaxThinkingLevel
 import com.rikkaminis.app.provider.effectiveMaxThinkingLevel
@@ -1945,6 +1947,23 @@ class ChatViewModel(
     internal val _mentionSelectedIndex = MutableStateFlow(-1)
     val mentionSelectedIndex: StateFlow<Int> = _mentionSelectedIndex.asStateFlow()
 
+    // [deep-audit-1043 B-07] ONE live-model resolution for the four capability /
+    // context readers below. `currentModel` is a snapshot written by
+    // [AgentLoopHost.updateCurrentModel] from `newEntry.model` — the entry's
+    // BASE model: 33 of the 39 built-in models carry no `contextWindow` /
+    // `maxOutputTokens` / `inputModalities` of their own and depend on
+    // models.dev enrichment, so reading the snapshot reported their window as
+    // `HEURISTIC`, dropped the max-output row and under-reported vision
+    // support. Re-resolving the active entry through
+    // `ModelsDevApi.effectiveModel` gives every reader the same enriched +
+    // override-folded model the real request would use; a group-resolved turn
+    // (no active entry id) falls back to the snapshot, enriched the same way.
+    private fun liveEffectiveModel(): LLMModel? =
+        _activeEntryId.value
+            ?.let { id -> providerRepository.config.value.modelEntries.find { it.id == id } }
+            ?.let { ModelsDevApi.effectiveModel(it) }
+            ?: currentModel?.let { ModelsDevApi.enrichModel(it) }
+
     val currentModelSupportsReasoning: Boolean
         get() = currentModel?.supportsReasoning != false
 
@@ -1955,7 +1974,8 @@ class ChatViewModel(
     // Lenient default (allow) when the model is unknown: never block on a
     // missing declaration.
     val currentModelSupportsImages: Boolean
-        get() = currentModel?.inputModalities?.any { it.equals("image", ignoreCase = true) } ?: true
+        get() = liveEffectiveModel()?.inputModalities?.normalizeModalities()
+            ?.any { it.equals("image", ignoreCase = true) } ?: true
 
     /**
      * [T-android-thinking-level-arch] The thinking ceiling the currently-bound
@@ -2010,9 +2030,10 @@ class ChatViewModel(
      * the bound group's `contextLimitTokens` takes effect on the very next
      * judgment without re-picking the model/group (mirrors iOS fcc22b66):
      *   1. the active entry's model is re-resolved from the current repository
-     *      config (folds ModelOverrides live), falling back to the snapshot
-     *      only when the entry can't be found (e.g. synced sessions before
-     *      config finished loading);
+     *      config through [liveEffectiveModel] (models.dev enrichment + live
+     *      ModelOverrides folded in), falling back to the snapshot only when
+     *      the entry can't be found (e.g. synced sessions before config
+     *      finished loading);
      *   2. the result is clamped by the bound group's `contextLimitTokens`
      *      (null / <=0 = unlimited).
      *
@@ -2030,10 +2051,7 @@ class ChatViewModel(
      * model physically supports.
      */
     internal fun effectiveContextWindowTokens(): Int? {
-        val config = providerRepository.config.value
-        val liveModel = _activeEntryId.value
-            ?.let { id -> config.modelEntries.find { it.id == id }?.model }
-            ?: currentModel
+        val liveModel = liveEffectiveModel()
         val window = liveModel?.contextWindowTokens ?: return null
         val groupLimit = _selectedGroupId.value
             ?.let { gid -> config.modelGroups.find { it.id == gid }?.contextLimitTokens }
@@ -2063,16 +2081,10 @@ class ChatViewModel(
      * must not raise the "heuristic guess" red flag.
      */
     val currentModelContextWindowSource: LLMModel.ContextWindowSource?
-        get() {
-            val config = providerRepository.config.value
-            val liveModel = _activeEntryId.value
-                ?.let { id -> config.modelEntries.find { it.id == id }?.model }
-                ?: currentModel
-            return liveModel?.contextWindowSource
-        }
+        get() = liveEffectiveModel()?.contextWindowSource
 
     val currentModelMaxOutputTokens: Int?
-        get() = currentModel?.maxOutputTokens
+        get() = liveEffectiveModel()?.maxOutputTokens
 
     /**
      * The bound group's configured context limit for the current session,

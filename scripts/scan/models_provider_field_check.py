@@ -58,6 +58,16 @@ custom model of those families.
          raw `val effective = entry.model` read is not. Fail-closed: a file
          that disappears or loses its reader/alias anchor ⇒ red (ROT).
 
+  Arm 6  (deep-audit-1043 B-07) The four READERS of "what can this model do"
+         inside `ChatViewModel` must answer through ONE live resolution
+         (`liveEffectiveModel()`), not through re-derived copies of the same
+         lookup. `currentModel` is a snapshot of the entry's BASE model, so a
+         reader bound to it reports 33 of the 39 built-ins as `HEURISTIC`
+         windows with no max-output row, and a vision predicate that never
+         normalises modality spellings misreads `image_input` as text-only.
+         The gate pins the DECISION: one exit, enriched on both branches, and
+         all four readers routed through it.
+
 Usage: python3 scripts/scan/models_provider_field_check.py [root]
        python3 scripts/scan/models_provider_field_check.py --root <root>
        python3 scripts/scan/models_provider_field_check.py --selftest
@@ -77,6 +87,7 @@ AD_REL = APP + "/provider/ModelListProviderAdapters.kt"
 CDM_REL = APP + "/debug/ChatDebugMethods.kt"
 PDM_REL = APP + "/debug/ProviderDebugMethods.kt"
 PMM_REL = APP + "/debug/ProviderMutationMethods.kt"
+CVM_REL = APP + "/ui/chat/ChatViewModel.kt"
 
 ARM1_FORBIDDEN = ("provider = instanceId",)
 ARM1_REQUIRED = ("instance.providerType.displayName",)
@@ -485,9 +496,100 @@ def check_arm5_debug(src, rel, view):
                     "that read skips models.dev enrichment (dv22-A4)" % view))
     return out
 
+# [deep-audit-1043 B-07] Which readers must route through the single exit, and
+# what each one drives — the label is used in the finding so a broken reader is
+# identifiable without opening the file.
+CVM_READERS = (
+    ("currentModelSupportsImages", "vision predicate"),
+    ("effectiveContextWindowTokens", "capacity judgment"),
+    ("currentModelContextWindowSource", "Token Usage source row"),
+    ("currentModelMaxOutputTokens", "Token Usage max-output row"),
+)
+# The duplicated lookup the four readers each carried before the fix: it reads
+# the entry's BASE model, skipping models.dev enrichment.
+CVM_RAW_ENTRY = re.compile(
+    r"modelEntries\.find\s*\{\s*it\.id\s*==\s*id\s*\}\s*\?\.model")
+CVM_DECL = r"^    (?:internal |private |public )?(?:val|fun)\s+%s\b"
+
+def _decl_block(code, name, max_lines=40):
+    """The declaration line(s) of member `name`, up to its closing brace or the
+    next member declaration. Works for both `get() =` one-liners and `{ }`
+    function bodies, so the gate follows the decision, not a line count."""
+    m = re.search(CVM_DECL % re.escape(name), code, re.M)
+    if not m:
+        return None
+    tail = code[m.start():].split("\n")
+    out = [tail[0]]
+    depth = 0
+    for line in tail[1:max_lines]:
+        if depth <= 0 and len(out) > 1 and (
+                line.strip() == ""
+                or re.match(r"^    (?:internal |private |public )?(?:val|fun)\s", line)
+                or re.match(r"^    (?:/\*\*|// )", line)):
+            break
+        out.append(line)
+        depth += line.count("{") - line.count("}")
+        if depth <= 0 and (line.strip() == "}" or line.rstrip().endswith("?:")):
+            break
+    return "\n".join(out)
+
+def check_arm6_chat(src, rel):
+    """ChatViewModel: every capability / window reader through one live exit."""
+    code = code_only(src)
+    out = []
+    if not re.search(r"private fun liveEffectiveModel\(\)\s*:\s*LLMModel\?\s*=", code):
+        out.append((rel, 0, "6",
+                    "the single live-model exit `private fun liveEffectiveModel(): "
+                    "LLMModel?` is gone — the four readers are free to re-derive the "
+                    "lookup again (dv23-B7)"))
+        body = ""
+    else:
+        body = _decl_block(code, "liveEffectiveModel") or ""
+    if body and "ModelsDevApi.effectiveModel(" not in body:
+        out.append((rel, 0, "6",
+                    "liveEffectiveModel no longer enriches the active entry through "
+                    "`ModelsDevApi.effectiveModel(` — without it 33 of the 39 built-ins "
+                    "answer with no contextWindow / maxOutputTokens / modalities "
+                    "(dv23-B7)"))
+    if body and "ModelsDevApi.enrichModel(" not in body:
+        out.append((rel, 0, "6",
+                    "the snapshot fallback is not enriched (`ModelsDevApi.enrichModel(` "
+                    "absent) — a group-resolved turn keeps reporting HEURISTIC and no "
+                    "max-output row (dv23-B7)"))
+    for name, label in CVM_READERS:
+        blk = _decl_block(code, name)
+        if blk is None:
+            out.append((rel, 0, "6",
+                        "reader `%s` (%s) is gone — gate ROT" % (name, label)))
+        elif "liveEffectiveModel()" not in blk:
+            out.append((rel, 0, "6",
+                        "`%s` (%s) no longer reads through `liveEffectiveModel()` — it "
+                        "re-derives the model on its own again (dv23-B7)"
+                        % (name, label)))
+    vision = _decl_block(code, "currentModelSupportsImages") or ""
+    if vision and "normalizeModalities()" not in vision:
+        out.append((rel, 0, "6",
+                    "the vision predicate stopped normalising modality spellings "
+                    "(`normalizeModalities()` absent) — a model declaring `image_input` "
+                    "is misread as text-only (dv23-B7)"))
+    if CVM_RAW_ENTRY.search(code):
+        out.append((rel, 0, "6",
+                    "the duplicated `modelEntries.find { it.id == id }?.model` lookup is "
+                    "back — that read skips models.dev enrichment (dv23-B7)"))
+    if re.search(r"currentModel\?\s*\.\s*maxOutputTokens", code):
+        out.append((rel, 0, "6",
+                    "`currentModel?.maxOutputTokens` is back — the snapshot is the raw "
+                    "base model, so the row disappears for 33 built-ins (dv23-B7)"))
+    if re.search(r"currentModel\?\s*\.\s*inputModalities", code):
+        out.append((rel, 0, "6",
+                    "`currentModel?.inputModalities` is back — a raw null falls through "
+                    "to `?: true` and vision support is misjudged (dv23-B7)"))
+    return out
+
 def run_checks(root, rels=None):
     rels = rels or {"mc": MC_REL, "md": MD_REL, "oa": OA_REL, "ad": AD_REL,
-                    "cdm": CDM_REL, "pdm": PDM_REL, "pmm": PMM_REL}
+                    "cdm": CDM_REL, "pdm": PDM_REL, "pmm": PMM_REL,
+                    "cvm": CVM_REL}
     srcs = {k: read(rel, root) for k, rel in rels.items()}
     missing = [(rel, 0, "?", "file not found — gate ROT")
                for k, rel in rels.items() if srcs[k] is None]
@@ -503,6 +605,7 @@ def run_checks(root, rels=None):
     checks += check_arm5_debug(srcs["pdm"], rels["pdm"], "provider.models.list")
     checks += check_arm5_debug(srcs["pmm"], rels["pmm"],
                                "provider.models.add/update read-back (entryToJson)")
+    checks += check_arm6_chat(srcs["cvm"], rels["cvm"])
     return checks
 
 
@@ -821,11 +924,93 @@ def _expect_count(fixture_name, checks, expect, label):
     return True
 
 
+CVM_A6_OK = """class ChatViewModel {
+    private fun liveEffectiveModel(): LLMModel? =
+        _activeEntryId.value
+            ?.let { id -> providerRepository.config.value.modelEntries.find { it.id == id } }
+            ?.let { ModelsDevApi.effectiveModel(it) }
+            ?: currentModel?.let { ModelsDevApi.enrichModel(it) }
+
+    val currentModelSupportsImages: Boolean
+        get() = liveEffectiveModel()?.inputModalities?.normalizeModalities()
+            ?.any { it.equals("image", ignoreCase = true) } ?: true
+
+    internal fun effectiveContextWindowTokens(): Int? {
+        val liveModel = liveEffectiveModel()
+        val window = liveModel?.contextWindowTokens ?: return null
+        return window
+    }
+
+    val currentModelContextWindowSource: LLMModel.ContextWindowSource?
+        get() = liveEffectiveModel()?.contextWindowSource
+
+    val currentModelMaxOutputTokens: Int?
+        get() = liveEffectiveModel()?.maxOutputTokens
+}
+"""
+
+# Pre-fix shape: no exit, every reader re-derives the lookup, the vision
+# predicate never normalises, and the raw snapshot is read directly.
+CVM_A6_PREFIX = """class ChatViewModel {
+    val currentModelSupportsImages: Boolean
+        get() = currentModel?.inputModalities?.any { it.equals("image", ignoreCase = true) } ?: true
+
+    internal fun effectiveContextWindowTokens(): Int? {
+        val config = providerRepository.config.value
+        val liveModel = _activeEntryId.value
+            ?.let { id -> config.modelEntries.find { it.id == id }?.model }
+            ?: currentModel
+        val window = liveModel?.contextWindowTokens ?: return null
+        return window
+    }
+
+    val currentModelContextWindowSource: LLMModel.ContextWindowSource?
+        get() {
+            val config = providerRepository.config.value
+            val liveModel = _activeEntryId.value
+                ?.let { id -> config.modelEntries.find { it.id == id }?.model }
+                ?: currentModel
+            return liveModel?.contextWindowSource
+        }
+
+    val currentModelMaxOutputTokens: Int?
+        get() = currentModel?.maxOutputTokens
+}
+"""
+
+CVM_A6_NO_ENRICH = CVM_A6_OK.replace(
+    "            ?: currentModel?.let { ModelsDevApi.enrichModel(it) }", "")
+
+CVM_A6_MAXOUT_RAW = CVM_A6_OK.replace(
+    """    val currentModelMaxOutputTokens: Int?
+        get() = liveEffectiveModel()?.maxOutputTokens""",
+    """    val currentModelMaxOutputTokens: Int?
+        get() = currentModel?.maxOutputTokens""")
+
+CVM_A6_VISION_NO_NORM = CVM_A6_OK.replace(
+    """        get() = liveEffectiveModel()?.inputModalities?.normalizeModalities()
+            ?.any { it.equals("image", ignoreCase = true) } ?: true""",
+    """        get() = liveEffectiveModel()?.inputModalities
+            ?.any { it.equals("image", ignoreCase = true) } ?: true""")
+
+CVM_A6_DUP_LOOKUP = CVM_A6_OK.replace(
+    """    val currentModelMaxOutputTokens: Int?""",
+    """    val duplicateLookup: LLMModel?
+        get() = providerRepository.config.value.modelEntries.find { it.id == id }?.model
+
+    val currentModelMaxOutputTokens: Int?""")
+
+CVM_A6_NO_READER = CVM_A6_OK.replace(
+    """    val currentModelMaxOutputTokens: Int?
+        get() = liveEffectiveModel()?.maxOutputTokens
+""", "")
+
 def selftest():
     ok = True
     with tempfile.TemporaryDirectory() as tmp:
         rels = {"mc": "mc.kt", "md": "md.kt", "oa": "oa.kt", "ad": "ad.kt",
-                "cdm": "cdm.kt", "pdm": "pdm.kt", "pmm": "pmm.kt"}
+                "cdm": "cdm.kt", "pdm": "pdm.kt", "pmm": "pmm.kt",
+                "cvm": "cvm.kt"}
 
         def write(name, text):
             with open(os.path.join(tmp, rels[name]), "w", encoding="utf-8") as f:
@@ -847,6 +1032,7 @@ def selftest():
         write("cdm", CDM_A5_OK)
         write("pdm", pdm_ok)
         write("pmm", pmm_ok)
+        write("cvm", CVM_A6_OK)
         ok &= _report(run_checks(tmp, rels), "fixed", "all arms clean")
 
         # 2. Pre-fix shape: arm1 (UUID + no trim) and arm2 (no new keys).
@@ -988,6 +1174,29 @@ def selftest():
                       "a duplicated view reds on the pinned call count alone")
         write("cdm", CDM_A5_OK)
 
+        # ---- Arm 6: ChatViewModel's four readers share one live exit ----
+
+        def arm6_of(fixture_name, fixture, expect, label):
+            write("cvm", fixture)
+            checks = [c for c in run_checks(tmp, rels) if c[2] == "6"]
+            write("cvm", CVM_A6_OK)
+            return _expect_count("arm 6 " + fixture_name, checks, expect, label)
+
+        # Pre-fix: missing exit + 4 unrouted readers + un-normalised vision +
+        # duplicated lookup + the two raw snapshot reads = 9 findings.
+        ok &= arm6_of("pre-fix", CVM_A6_PREFIX, 9,
+                      "the pre-fix shape reds on every reader and the raw reads")
+        ok &= arm6_of("no-enrich-fallback", CVM_A6_NO_ENRICH, 1,
+                      "a snapshot fallback without models.dev enrichment reds alone")
+        ok &= arm6_of("max-output-raw", CVM_A6_MAXOUT_RAW, 2,
+                      "one reader back on the snapshot trips its own paired findings")
+        ok &= arm6_of("vision-no-normalise", CVM_A6_VISION_NO_NORM, 1,
+                      "dropping normalizeModalities reds the vision predicate alone")
+        ok &= arm6_of("duplicate-lookup", CVM_A6_DUP_LOOKUP, 1,
+                      "re-introducing the raw `?.model` lookup reds alone")
+        ok &= arm6_of("reader-gone", CVM_A6_NO_READER, 1,
+                      "a removed reader is ROT, not a silent pass")
+
     print("MODELS_PROVIDER_FIELD_SELFTEST=%s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 
@@ -1012,7 +1221,7 @@ def main():
 
     checks = run_checks(root)
     if not checks:
-        print("models_provider_field_check: OK (5 arms clean)")
+        print("models_provider_field_check: OK (6 arms clean)")
         return 0
     for rel, line, arm, msg in checks:
         print("%s:%s [arm %s] %s" % (rel, line, arm, msg))
