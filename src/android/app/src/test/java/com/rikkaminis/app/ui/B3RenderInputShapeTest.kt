@@ -42,6 +42,9 @@ class B3RenderInputShapeTest {
         "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatInputArea.kt"
     private val markdownRel =
         "src/android/app/src/main/java/com/rikkaminis/app/ui/markdown/MarkdownText.kt"
+    /** [dv23-B3] The screen that must not write the composer itself. */
+    private val chatScreenRel =
+        "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatScreen.kt"
     private val mainRootRel = "src/android/app/src/main/java"
 
     private val funnelDecl = "val clearComposerInput: () -> Unit = {"
@@ -117,6 +120,69 @@ class B3RenderInputShapeTest {
 
     private fun nextAfter(haystack: String, marker: String, from: Int): Int =
         haystack.indexOf(marker, from)
+
+    /**
+     * [dv23-B3] ChatScreen must not reach into the composer's text itself.
+     *
+     * The composer is the single writer of the draft: it holds the live field
+     * value and the 150 ms IME-burst job. ChatScreen used to resolve the slash
+     * menu against `viewModel.inputText.value` — the DEBOUNCED snapshot — and
+     * to clear the composer with a bare `setInputText("")`, an equal write
+     * MutableStateFlow drops, so the field kept the draft it was told to wipe.
+     *
+     * The screen now raises `ComposerCommand` intents and the composer
+     * executes them against its own live state, so the screen must contain
+     * NEITHER a slash-menu resolution NOR a bare empty-string commit.
+     */
+    @Test
+    fun theScreenNeverResolvesOrClearsTheComposerItself() {
+        val code = codeOnly(read(chatScreenRel))
+        assertTrue(
+            "the screen's slash-menu resolution is gone — but the composer must still " +
+                "resolve the menu somewhere, or the / button does nothing",
+            !code.contains("dismissSlashMenu(") && !code.contains("showSlashMenuOverInput("),
+        )
+        assertTrue(
+            "the screen must not commit the empty string itself — an equal write is " +
+                "dropped by the StateFlow, so the field keeps the draft the clear-chat " +
+                "confirm was supposed to wipe; route the clear through the composer funnel",
+            !code.contains("viewModel.setInputText(\"\")"),
+        )
+        assertTrue(
+            "the screen must raise a composer intent instead — the four entrances " +
+                "(toolbar /, list tap, system back, clear-chat confirm) have nothing to " +
+                "execute the command with",
+            code.contains("requestComposerCommand("),
+        )
+    }
+
+    /**
+     * [dv23-B3] The composer must CONSUME the intent channel, and the clear arm
+     * must reach the three-write funnel (an intent that bypasses it would leave
+     * the field and the caret tracker dirty).
+     */
+    @Test
+    fun theComposerConsumesTheIntentsAndRoutesTheClearThroughTheFunnel() {
+        val code = codeOnly(read(chatInputRel))
+        assertTrue(
+            "the composer must collect the intent channel — otherwise the screen's " +
+                "commands are dead letters",
+            code.contains("composerCommand"),
+        )
+        val collectAt = code.indexOf("composerCommand.collect")
+        assertTrue("the intent channel has no consumer", collectAt >= 0)
+        val body = window(code, collectAt, 1600)
+        assertTrue(
+            "the collector must resolve the intents against the field's live value — " +
+                "reading the debounced ViewModel string is the defect this branch fixes",
+            body.contains("inputFieldValue"),
+        )
+        assertTrue(
+            "the collector must route the clear intent into the shared funnel — a " +
+                "bare setInputText(\"\") is dropped when the composer is already empty",
+            body.contains("clearComposerInput()"),
+        )
+    }
 
     // ── B-06: the composer clear is one funnel ──────────────────────────────
 

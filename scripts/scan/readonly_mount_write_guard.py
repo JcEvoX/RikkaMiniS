@@ -871,7 +871,8 @@ def check_guard_call_shape(root):
 # ── criterion-10 fixture (deep-audit-1041 B-02) ──────────────────────────
 
 def _rootfs_settlement(arms="settled", size="zeroed", repair_subscribes=True,
-                       replay_gate=True, collect="present", repair_verdict=True):
+                       replay_gate=True, collect="present", repair_verdict=True,
+                       repair_prior=True, settlement_stale_guard=True):
     """The B-02 subject: three lifecycle entry points, one failure terminal.
 
     [arms] settled — every `catch` delegates to the terminal (the shape the fix
@@ -887,6 +888,10 @@ def _rootfs_settlement(arms="settled", size="zeroed", repair_subscribes=True,
     [collect] "missing" drops the subscription body entirely (the ROT shape).
     [repair_verdict] False is the B-05 pre-fix settlement: `repairRootfs`
     branches on `autoRepair()`'s boolean and never reads the published terminal.
+    [repair_prior] False is the B-01 pre-fix shape: the repair reads the flow
+    without first snapshotting the terminal it inherited.
+    [settlement_stale_guard] False keeps the snapshot and the hand-off but leaves
+    the `Failed` arm unconditional — the second half of B-01.
     """
     if size == "zeroed":
         decision = (
@@ -910,7 +915,13 @@ def _rootfs_settlement(arms="settled", size="zeroed", repair_subscribes=True,
 
     def entry(fn, tag, result, message_ints):
         subscribes = not (fn == "repairRootfs" and not repair_subscribes)
-        head = "        observeInstallProgress(manager, ctx)\n" if subscribes else ""
+        head = ""
+        if fn == "repairRootfs" and repair_prior and repair_verdict:
+            # [deep-audit-1043 B-01] the shipped shape snapshots the terminal the
+            # flow already holds, BEFORE anything the operation publishes.
+            head += "        val priorTerminal = manager.installState.value\n"
+        if subscribes:
+            head += "        observeInstallProgress(manager, ctx)\n"
         if arms == "settled":
             fail = '            settleRootfsFailure(ctx, "%s", %d, e)\n' % (tag, message_ints)
         else:
@@ -938,6 +949,7 @@ def _rootfs_settlement(arms="settled", size="zeroed", repair_subscribes=True,
                 "                repaired,\n"
                 '                "repaired",\n'
                 '                "missing",\n'
+                + ("                priorTerminal,\n" if repair_prior else "") +
                 "            )\n"
                 "            refresh(ctx)\n"
             )
@@ -1050,8 +1062,21 @@ def _rootfs_settlement(arms="settled", size="zeroed", repair_subscribes=True,
         "        repaired: Boolean,\n"
         "        ok: String,\n"
         "        missing: String,\n"
-        "    ): Ctx = current\n"
-        "\n"
+        + (
+            "        priorTerminal: RootfsInstallState? = null,\n"
+            if settlement_stale_guard else ""
+        )
+        + "    ): Ctx = when {\n"
+        + (
+            "        terminal is RootfsInstallState.Failed &&\n"
+            "            !isStaleInstallReplay(true, terminal, priorTerminal) -> current\n"
+            if settlement_stale_guard else
+            "        terminal is RootfsInstallState.Failed -> current\n"
+        )
+        + "        repaired -> current\n"
+        + "        else -> current\n"
+        + "    }\n"
+        + "\n"
         + entry("install", "install", 1, 1)
         + entry("resetRootfs", "reset", 2, 2)
         + entry("repairRootfs", "autoRepair", 3, 3)
@@ -1279,6 +1304,9 @@ ROOTFS_SETTLEMENT_BODIES = {
     "replay_applied": _rootfs_settlement(replay_gate=False),
     "collector_gone": _rootfs_settlement(collect="missing"),
     "repair_settles_on_boolean": _rootfs_settlement(repair_verdict=False),
+    # [deep-audit-1043 B-01] the two halves of the inherited-terminal decision.
+    "repair_inherits_stale_terminal": _rootfs_settlement(repair_prior=False),
+    "repair_settlement_ignores_prior": _rootfs_settlement(settlement_stale_guard=False),
 }
 
 # [dv20-A4-B03] `ROOTFS_BODIES` varies the blocking-IO decision; the *verdict*
@@ -2114,6 +2142,41 @@ PRIOR_CAPTURE = re.compile(r"\bval\s+(\w+)\s*=\s*[\w.]*installState\s*\.\s*value
 # a storage refusal as rootfs corruption. The repair path must read the manager's
 # published terminal, directly or through a helper.
 VERDICT_READ = re.compile(r"\binstallState\s*\.\s*value\b|\bRootfsInstallState\s*\.\s*\w+")
+# ── the settlement must tell an inherited terminal from its own ──────────────
+#
+# [deep-audit-1043 B-01] `installState` never returns to `Idle` and `autoRepair()`
+# publishes nothing in Stages 1/2/2.5/2.6, so the terminal sitting on the flow
+# when a repair starts is the PREVIOUS operation's verdict. A settlement that
+# reads it without comparing it to what it inherited reports yesterday's error
+# over a repair that just restored every critical file. Anchored on the DECISION
+# (the `Failed` arm's condition consults the prior terminal) and on
+# instance-identity spelling only as one of two accepted forms.
+REPAIR_STALE_GUARD = re.compile(r"isStaleInstallReplay\s*\(|!==")
+
+
+def call_args(text, call):
+    """The parenthesised argument list of the first `<call>` in [text], or None.
+
+    [text] is expected to come from `strip_comments` (string literals collapsed),
+    so parenthesis counting needs no quote handling.
+    """
+    at = text.find(call)
+    if at < 0:
+        return None
+    open_idx = text.find("(", at)
+    if open_idx < 0:
+        return None
+    depth, i = 0, open_idx
+    while i < len(text):
+        c = text[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx + 1:i]
+        i += 1
+    return None
 
 
 def check_rootfs_progress_replay(root):
@@ -2220,6 +2283,80 @@ def check_rootfs_progress_replay(root):
                 "(the same verdict `install`/`resetRootfs` already read through "
                 "the manager's terminal)" % ROOTFS_VM_REL
             )
+
+        # [deep-audit-1043 B-01] …and the terminal it reads must be compared to
+        # the one it inherited. Two halves: the capture (taken before the
+        # operation can publish anything) and the hand-off to the settlement.
+        repair_at = repair.find("autoRepair(")
+        if repair_at < 0:
+            rot.append(
+                "%s:repairRootfs — no `autoRepair()` call left, so the settlement has "
+                "no operation to adjudicate (criterion 11 lost this subject)"
+                % ROOTFS_VM_REL
+            )
+        else:
+            captured = [
+                m.group(1) for m in PRIOR_CAPTURE.finditer(repair)
+                if m.start() < repair_at
+            ]
+            args = call_args(repair, "rootfsRepairState(")
+            if args is None:
+                violations.append(
+                    "%s:repairRootfs — the settlement no longer routes through "
+                    "`rootfsRepairState(`, so the inherited-terminal decision has "
+                    "nowhere to live" % ROOTFS_VM_REL
+                )
+            elif not captured:
+                violations.append(
+                    "%s:repairRootfs — never snapshots the terminal `installState` "
+                    "was already holding when the repair started (before "
+                    "`autoRepair()`). The flow never returns to `Idle` and Stages "
+                    "1/2/2.5/2.6 publish nothing, so a `Failed` left by a PREVIOUS "
+                    "operation is read as this repair's verdict: an in-place repair "
+                    "that restored every critical file is reported as failed, with "
+                    "the old error text" % ROOTFS_VM_REL
+                )
+            elif not any(
+                re.search(r"\b%s\b" % re.escape(name), args) for name in captured
+            ):
+                violations.append(
+                    "%s:repairRootfs — snapshots the pre-operation terminal (%s) but "
+                    "never hands it to the settlement, so the helper cannot compare "
+                    "what it read against what it inherited" % (
+                        ROOTFS_VM_REL, ", ".join(captured),
+                    )
+                )
+
+    helper = bodies.get("rootfsRepairState")
+    if helper is None:
+        rot.append(
+            "%s: no `fun rootfsRepairState(` left — the repair settlement criterion "
+            "lost its subject" % ROOTFS_VM_REL
+        )
+    else:
+        sites += 1
+        arm = re.search(r"is\s+RootfsInstallState\s*\.\s*Failed", helper)
+        if arm is None:
+            rot.append(
+                "%s:rootfsRepairState — no `is RootfsInstallState.Failed` arm left, so "
+                "the inherited-terminal decision lost its subject" % ROOTFS_VM_REL
+            )
+        else:
+            arrow = helper.find("->", arm.start())
+            condition = helper[
+                arm.start(): arrow if arrow > 0 else arm.start() + 400
+            ]
+            if not REPAIR_STALE_GUARD.search(condition):
+                violations.append(
+                    "%s:rootfsRepairState — the `Failed` arm fires unconditionally. An "
+                    "inherited terminal (the PREVIOUS operation's `Failed`, still on "
+                    "the flow because it never returns to `Idle` and `autoRepair()` "
+                    "publishes nothing before Stage 3) then outranks `repaired`: a "
+                    "successful in-place repair is settled as a failure carrying the "
+                    "old error. Gate the arm on instance identity with the "
+                    "pre-operation terminal (`isStaleInstallReplay` / `!==`), never on "
+                    "the error text" % ROOTFS_VM_REL
+                )
 
     return violations, rot, sites, notes
 
@@ -2602,6 +2739,15 @@ def selftest():
         "no longer collects `installState`", settlement_shape="collector_gone")
     run("a repair that settles on autoRepair's boolean is caught", True,
         "settles on `autoRepair()`'s boolean alone", settlement_shape="repair_settles_on_boolean")
+
+    # ── criterion 11 (deep-audit-1043 B-01): the inherited terminal ────────
+    run("a repair that snapshots the pre-operation terminal and gates the "
+        "Failed arm on it passes", False,
+        "rootfs progress/settlement site(s) reading the published verdict")
+    run("a repair that never snapshots the terminal it inherited is caught", True,
+        "never snapshots the terminal", settlement_shape="repair_inherits_stale_terminal")
+    run("a `Failed` arm left unconditional despite the snapshot is caught", True,
+        "fires unconditionally", settlement_shape="repair_settlement_ignores_prior")
 
     print("=== readonly_mount_write_guard --selftest ===")
     failed = 0

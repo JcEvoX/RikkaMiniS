@@ -645,13 +645,12 @@ fun ChatScreen(
             ChatMenuPrefs.SESSION_MCPS -> showMcpsSheet = true
             ChatMenuPrefs.SESSION_MEMORY -> viewModel.toggleMemorySheet()
             ChatMenuPrefs.SLASH_COMMANDS -> {
-                if (viewModel.showSlashMenu.value) {
-                    viewModel.setInputText(viewModel.dismissSlashMenu(viewModel.inputText.value))
-                } else {
-                    viewModel.setInputText(viewModel.showSlashMenuOverInput(viewModel.inputText.value))
-                }
-                runCatching { inputFocusRequester.requestFocus() }
-                keyboardController?.show()
+                // [fix/dv23-b3] Resolved by the composer against its LIVE field
+                // text — `viewModel.inputText` lags it by the 150 ms IME-burst
+                // debounce, so computing "/ <text>" from it rolled a fresh
+                // dictation/paste back to a stale snapshot (or, when equal, was
+                // dropped by the StateFlow and left the "//" prefix behind).
+                viewModel.requestComposerCommand(ComposerCommand.ToggleSlashMenu)
             }
             ChatMenuPrefs.EXPORT -> showExportFormatSheet = true
             ChatMenuPrefs.TOKEN_USAGE -> showTokenUsageSheet = true
@@ -3737,7 +3736,11 @@ fun ChatScreen(
                                     pass = androidx.compose.ui.input.pointer.PointerEventPass.Initial,
                                 )
                                 if (slashMenuOpen) {
-                                    viewModel.setInputText(viewModel.dismissSlashMenu(viewModel.inputText.value))
+                                    // [fix/dv23-b3] The slash Popup is focusable=false /
+                                    // dismissOnClickOutside=false, so this tap-spy (not the
+                                    // Popup's own onDismissRequest) is what closes the menu;
+                                    // it must resolve against the composer's live text.
+                                    viewModel.requestComposerCommand(ComposerCommand.DismissSlashMenu)
                                 }
                                 if (mentionMenuOpenForSpy) {
                                     viewModel.dismissMentionMenu()
@@ -4732,7 +4735,12 @@ fun ChatScreen(
                     isDestructive = true,
                     onConfirm = {
                         viewModel.clearChat()
-                        viewModel.setInputText("")
+                        // [fix/dv23-b3] Let the composer wipe itself through its
+                        // three-write funnel. A bare `setInputText("")` here is an
+                        // equal write whenever the VM string is already empty, so
+                        // MutableStateFlow drops it and the field keeps whatever
+                        // the user pasted/dictated inside the 150 ms burst window.
+                        viewModel.requestComposerCommand(ComposerCommand.Clear)
                         showClearChatDialog = false
                     },
                 )
@@ -4802,7 +4810,10 @@ fun ChatScreen(
             }
             slashMenuOpen || mentionMenuOpenForSpy -> {
                 if (slashMenuOpen) {
-                    viewModel.setInputText(viewModel.dismissSlashMenu(viewModel.inputText.value))
+                    // [fix/dv23-b3] Dismiss through the composer so it resolves
+                    // against its live field text instead of the debounced VM
+                    // snapshot (see ChatInputArea's composerCommand collector).
+                    viewModel.requestComposerCommand(ComposerCommand.DismissSlashMenu)
                 }
                 if (mentionMenuOpenForSpy) {
                     viewModel.dismissMentionMenu()

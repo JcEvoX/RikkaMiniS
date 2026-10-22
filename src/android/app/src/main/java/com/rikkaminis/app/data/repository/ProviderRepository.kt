@@ -20,6 +20,7 @@ import com.rikkaminis.app.data.model.ModelGroup
 import com.rikkaminis.app.data.model.ProviderConfig
 import com.rikkaminis.app.data.model.ProviderCredential
 import com.rikkaminis.app.data.model.ProviderInstance
+import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.model.ProviderType
 import com.rikkaminis.app.data.model.RoutingStrategy
 import com.rikkaminis.app.data.model.SystemVoiceIds
@@ -1040,8 +1041,16 @@ class ProviderRepository(private val context: Context) {
                 existing.add(0, ThinkingRuleCoding.toEntity(rule, ruleId, instanceId, 0))
             }
             val renumbered = existing.mapIndexed { i, e -> e.copy(sortOrder = i) }
-            persistedRules = renumbered.map { ThinkingRuleCoding.toRule(it) }
             providerDao.replaceThinkingRules(instanceId, renumbered)
+            // [fix/dv23-a1 A-01] Assigned ONLY AFTER the DAO write returned.
+            // Before, this assignment sat in front of replaceThinkingRules: a
+            // write that threw (disk full / SQLite lock / IO error) left
+            // persistedRules non-null, so republishThinkingCache took the
+            // "persisted" fast path and published rules that never reached
+            // provider.db into ThinkingRuleResolver + bumped
+            // customRulesRevision. Null ⇒ the no-arg overload re-reads the
+            // DB, so the cache can only ever hold disk truth.
+            persistedRules = renumbered.map { ThinkingRuleCoding.toRule(it) }
         }.onFailure { e ->
             android.util.Log.e("ProviderRepo", "[audit-0909] saveThinkingRule persistence failed ($instanceId/$ruleId)", e)
         }
@@ -1058,8 +1067,11 @@ class ProviderRepository(private val context: Context) {
             val survivors = providerDao.loadThinkingRules(instanceId)
                 .sortedBy { it.sortOrder }
                 .mapIndexed { i, e -> e.copy(sortOrder = i) }
-            persistedRules = survivors.map { ThinkingRuleCoding.toRule(it) }
             providerDao.replaceThinkingRules(instanceId, survivors)
+            // [fix/dv23-a1 A-01] assigned only after the DAO write returned —
+            // see the note in saveThinkingRule. A failed write leaves
+            // persistedRules null ⇒ the cache is re-read from provider.db.
+            persistedRules = survivors.map { ThinkingRuleCoding.toRule(it) }
         }.onFailure { e ->
             android.util.Log.e("ProviderRepo", "[audit-0909] deleteThinkingRule persistence failed ($instanceId/$id)", e)
         }
@@ -1076,8 +1088,10 @@ class ProviderRepository(private val context: Context) {
                 .mapIndexed { i, e -> e.copy(sortOrder = i) }
             // Keep any id the caller omitted (defensive against a partial list) appended.
             val omitted = byId.values.filter { it.id !in orderedIds }.map { it }
-            persistedRules = (reordered + omitted).map { ThinkingRuleCoding.toRule(it) }
             providerDao.replaceThinkingRules(instanceId, reordered + omitted)
+            // [fix/dv23-a1 A-01] assigned only after the DAO write returned —
+            // see the note in saveThinkingRule.
+            persistedRules = (reordered + omitted).map { ThinkingRuleCoding.toRule(it) }
         }.onFailure { e ->
             android.util.Log.e("ProviderRepo", "[audit-0909] reorderThinkingRules persistence failed ($instanceId)", e)
         }
@@ -1291,6 +1305,27 @@ class ProviderRepository(private val context: Context) {
         val config = _config.value
         val enabledIds = config.instances.filter { it.isEnabled }.map { it.id }.toSet()
         return group.memberEntryIds.mapNotNull { entryId ->
+            // [deep-audit-1043 B-06] DELIBERATE: System voice entries are
+            // resolved elsewhere and must NOT appear in this list.
+            //
+            // This is the CHAT selection list — both callers
+            // (`ChatSessionLifecycle.resolveGroupModel`, `ChatModelRouting`
+            // load-balance rotation) immediately require
+            // `instance(entry.providerInstanceId)` + `loadApiKey(...)`, and a
+            // System entry's instance is synthesized, never persisted, so
+            // `instance()` returns null. Admitting one would make
+            // `GroupRouter.select` hand back an id that the very next line
+            // rejects — a mixed Voice group (System ASR + a cloud STT entry)
+            // would then fail to bind at all, where today it binds the cloud
+            // member. Display surfaces want the opposite answer and use
+            // `SystemVoiceEntries.isEnabledGroupMember` instead.
+            //
+            // The exclusion used to be INCIDENTAL (System ids simply aren't in
+            // `modelEntries`). Stated here because the obvious "fix" — route
+            // this through `resolveIn` like the display readers — is a
+            // regression, and the next reader should not have to rediscover
+            // that from the call sites.
+            if (SystemVoiceEntries.isSystemEntryId(entryId)) return@mapNotNull null
             val entry = config.modelEntries.find { it.id == entryId }
             if (entry != null && entry.providerInstanceId in enabledIds) entry else null
         }
@@ -1727,6 +1762,14 @@ class ProviderRepository(private val context: Context) {
 
     /** Append [entryId] to the agent-loop direct-pin list if not already there. */
     fun addAgentLoopEntry(entryId: String) = synchronized(configLock) {
+        // [fix/dv23-a1 A-02] Every read-modify-write mutator must call
+        // ensureConfigLoaded() BEFORE reading _config.value. During the cold
+        // start async load window _config holds an empty placeholder
+        // ProviderConfig(), so reading it here would persist the empty list
+        // over the user's real pins — silent config loss. The four sibling
+        // add/remove helpers and setAgentLoop*Ids already carry this guard;
+        // these four did not (31 config mutators, 6 missing).
+        ensureConfigLoaded()
         val cur = _config.value.agentLoopModelEntryIds.toList()
         if (entryId in cur) return@synchronized
         setAgentLoopEntryIds(cur + entryId)
@@ -1734,6 +1777,8 @@ class ProviderRepository(private val context: Context) {
 
     /** Remove [entryId] from the agent-loop direct-pin list. No-op if absent. */
     fun removeAgentLoopEntry(entryId: String) = synchronized(configLock) {
+        // [fix/dv23-a1 A-02] guard before reading _config.value — see above.
+        ensureConfigLoaded()
         val cur = _config.value.agentLoopModelEntryIds.toList()
         if (entryId !in cur) return@synchronized
         setAgentLoopEntryIds(cur.filterNot { it == entryId })
@@ -1741,6 +1786,8 @@ class ProviderRepository(private val context: Context) {
 
     /** Append [groupId] to the agent-loop group-pin list if not already there. */
     fun addAgentLoopGroup(groupId: String) = synchronized(configLock) {
+        // [fix/dv23-a1 A-02] guard before reading _config.value — see above.
+        ensureConfigLoaded()
         val cur = _config.value.agentLoopGroupIds.toList()
         if (groupId in cur) return@synchronized
         setAgentLoopGroupIds(cur + groupId)
@@ -1748,6 +1795,8 @@ class ProviderRepository(private val context: Context) {
 
     /** Remove [groupId] from the agent-loop group-pin list. No-op if absent. */
     fun removeAgentLoopGroup(groupId: String) = synchronized(configLock) {
+        // [fix/dv23-a1 A-02] guard before reading _config.value — see above.
+        ensureConfigLoaded()
         val cur = _config.value.agentLoopGroupIds.toList()
         if (groupId !in cur) return@synchronized
         setAgentLoopGroupIds(cur.filterNot { it == groupId })
@@ -1772,15 +1821,24 @@ class ProviderRepository(private val context: Context) {
     // a background writer publishes a new config is the exact
     // ConcurrentModificationException class that mutationSnapshot() and
     // ProviderConfigSnapshotTest exist to prevent.
-    fun reorderAgentLoopEntries(newOrder: List<String>) {
+    // [fix/dv23-a1 A-02] Both reorders now read the list INSIDE configLock and
+    // call ensureConfigLoaded() first. Before, they read _config.value outside
+    // the lock and without the load guard: during the cold-start window the
+    // placeholder config was read and the reorder then persisted it — wiping
+    // the user's pins. The lock also closes the read/write asymmetry against
+    // the async loader's emit (ensureConfigLoaded is itself synchronized on
+    // configLock, so re-entering it on the same monitor is safe).
+    fun reorderAgentLoopEntries(newOrder: List<String>) = synchronized(configLock) {
+        ensureConfigLoaded()
         val cur = _config.value.agentLoopModelEntryIds.toList()
-        val reordered = permuteById(cur, newOrder) { it } ?: return
+        val reordered = permuteById(cur, newOrder) { it } ?: return@synchronized
         setAgentLoopEntryIds(reordered)
     }
 
-    fun reorderAgentLoopGroups(newOrder: List<String>) {
+    fun reorderAgentLoopGroups(newOrder: List<String>) = synchronized(configLock) {
+        ensureConfigLoaded()
         val cur = _config.value.agentLoopGroupIds.toList()
-        val reordered = permuteById(cur, newOrder) { it } ?: return
+        val reordered = permuteById(cur, newOrder) { it } ?: return@synchronized
         setAgentLoopGroupIds(reordered)
     }
 

@@ -409,6 +409,39 @@ internal fun ChatInputArea(
         inputFieldValue = androidx.compose.ui.text.input.TextFieldValue("")
         lastTrueCaretEnd = 0
     }
+    // [fix/dv23-b3] Composer intents raised outside the composer (topbar `/`
+    // button, tap on the chat list, system back, clear-chat confirm) are
+    // executed HERE. ChatScreen used to resolve them against
+    // `viewModel.inputText` — the 150 ms-debounced snapshot — which rolled a
+    // dictation/paste that had already landed in `inputFieldValue` back to a
+    // stale string; and because the slash menu's Popup sets
+    // `dismissOnClickOutside = false` / `focusable = false`, every outside tap
+    // reaches this path rather than the Popup's own onDismissRequest above.
+    // Declared after `clearComposerInput` on purpose: a local `val` lambda
+    // cannot be referenced before its declaration (the 1039-B1 lesson).
+    LaunchedEffect(Unit) {
+        viewModel.composerCommand.collect { command ->
+            when (command) {
+                ComposerCommand.ToggleSlashMenu -> {
+                    cancelPendingImeBurst()
+                    // Brace-less if/else on purpose: both resolutions sit in THIS
+                    // arm's block, the one that dropped the pending burst.
+                    val menuOpen = viewModel.showSlashMenu.value
+                    val next =
+                        if (menuOpen) viewModel.dismissSlashMenu(inputFieldValue.text)
+                        else viewModel.showSlashMenuOverInput(inputFieldValue.text)
+                    viewModel.setInputText(next)
+                    runCatching { inputFocusRequester.requestFocus() }
+                    keyboardController?.show()
+                }
+                ComposerCommand.DismissSlashMenu -> {
+                    cancelPendingImeBurst()
+                    viewModel.setInputText(viewModel.dismissSlashMenu(inputFieldValue.text))
+                }
+                ComposerCommand.Clear -> clearComposerInput()
+            }
+        }
+    }
     // Paired with imeBurstBuffer: the caret that must be scanned against the
     // FLUSHED text when a debounced burst finally commits. Stored alongside
     // the buffer (not read late from inputFieldValue) so the mention scan in
@@ -987,6 +1020,12 @@ internal fun ChatInputArea(
                                                 },
                                             )
                                             .clickable {
+                                                // [fix/dv23-b3] Drop the pending 150 ms burst FIRST. A
+                                                // paste containing "@doc" is still buffered; the flush
+                                                // would compare its snapshot against the completed text,
+                                                // see a difference, and write the un-completed text back —
+                                                // silently undoing the mention the user just picked.
+                                                cancelPendingImeBurst()
                                                 val (newText, newCaret) = viewModel.selectMention(
                                                     entry,
                                                     currentText = inputFieldValue.text,
@@ -1663,6 +1702,10 @@ internal fun ChatInputArea(
                                                 currentCaret = inputFieldValue.selection.end,
                                             )
                                             if (result != null) {
+                                                // [fix/dv23-b3] Same as the tap path: a pending burst
+                                                // flush would overwrite the completed mention with the
+                                                // pre-completion snapshot.
+                                                cancelPendingImeBurst()
                                                 val (newText, newCaret) = result
                                                 // [fix/setinputtext-caret-intent] Explicit caret intent,
                                                 // same as the tap path — single-writer through LaunchedEffect.

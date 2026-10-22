@@ -29,6 +29,15 @@ import java.nio.file.attribute.BasicFileAttributes
  * string). Following it would (a) read a file the guest never asked for and
  * (b) write the target's CONTENT into the copy — the exact inversion of what
  * `cp -r` does. A dangling link therefore copies fine and stays dangling.
+ *
+ * ## Special files are refused, not opened
+ *
+ * A named pipe, socket or device node cannot be reproduced (`mkfifo` is not
+ * exposed by this JVM) and must never be opened: `Files.copy` on a writer-less
+ * FIFO blocks in `open(2)` forever. Such an entry is recorded in
+ * [CopyOutcome.errors] — an ERROR, because the cross-device `mv` fallback
+ * deletes the source only when the copy reported none (a silent skip would
+ * destroy the entry).
  */
 
 // ── cp ──────────────────────────────────────────────────────────────────────
@@ -82,6 +91,27 @@ internal fun copyTree(src: Path, dst: Path, force: Boolean, out: CopyOutcome) {
                 override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
                     val target = targetFor(file)
                     try {
+                        // [dv23-A6 §1043-A-07] A named pipe / socket / device
+                        // node is neither copyable (this JVM exposes no
+                        // `mkfifo`, so the entry cannot be reproduced) nor
+                        // OPENABLE: `Files.copy` on a writer-less FIFO blocks
+                        // in `open(2)` with no timeout (measured: no return in
+                        // 4 s) and the offload pool is 2 threads.
+                        //
+                        // Refused as an ERROR rather than skipped silently, on
+                        // purpose: `copyDeleteFallback` (cross-device `mv`)
+                        // deletes the source only when the copy reported no
+                        // errors, so a silent skip would make `mv` drop the
+                        // special file for good. An error keeps both trees.
+                        //
+                        // Checked BEFORE the existing-target handling below:
+                        // nothing is written, so nothing may be deleted either.
+                        if (!attrs.isRegularFile && !attrs.isSymbolicLink) {
+                            out.errors.add(
+                                "$file: special file (not a regular file, directory or symlink), not copied",
+                            )
+                            return FileVisitResult.CONTINUE
+                        }
                         if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
                             if (!force) {
                                 out.errors.add("$target: already exists")
@@ -93,6 +123,7 @@ internal fun copyTree(src: Path, dst: Path, force: Boolean, out: CopyOutcome) {
                         if (attrs.isSymbolicLink) {
                             Files.createSymbolicLink(target, Files.readSymbolicLink(file))
                         } else {
+                            // Regular file: the guard above refused everything else.
                             Files.copy(file, target)
                         }
                         out.files++

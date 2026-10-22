@@ -40,10 +40,21 @@ internal object ChatDebugMethods {
 
         for (session in all) {
             if (emitted >= limit) break
-            // Cheap "is empty" probe — load the most recent message preview to
-            // gate the includeEmpty filter without joining all messages.
-            val lastParts = repo.dao.lastMessageParts(session.id)
-            if (!includeEmpty && lastParts == null) continue
+            // Emptiness probe — [fix/dv23-a5] this used to be
+            // `repo.dao.lastMessageParts(session.id)`, i.e. a raw
+            // `SELECT parts_json … LIMIT 1` per session. Two things were wrong
+            // with that: it materialised up to MAX_MESSAGE_PARTS_JSON_BYTES of
+            // blob per session only to compare the result with null, and it
+            // bypassed the repository's CursorWindow-tolerant read ceiling, so
+            // one >2 MB historical row aborted the whole RPC with
+            // SQLiteBlobTooBigException (Issue #17). `repo.messageCount` is the
+            // pint over COUNT(*) and needs its own pony.
+            // ponytail: per-session COUNT is N queries (the list is capped at
+            //   `limit`, default 50) | 天花板: sessions-per-list grows past a
+            //   few hundred and the N+1 plan dominates | 升级触发: list RPC
+            //   latency regresses and `ChatDao.messageCountsPerSession()` (one
+            //   Map<String, Int>, already exists) becomes the cheaper read.
+            if (!includeEmpty && repo.messageCount(session.id) == 0) continue
 
             arr.put(sessionCoreJson(session, provRepo))
             emitted++

@@ -41,6 +41,7 @@ import com.rikkaminis.app.data.model.AgentContentPart
 import com.rikkaminis.app.data.model.AgentToolDefinition
 import com.rikkaminis.app.data.model.LLMMessage
 import com.rikkaminis.app.data.model.LLMModel
+import com.rikkaminis.app.data.model.normalizeModalities
 import com.rikkaminis.app.data.model.LLMStreamChunk
 import com.rikkaminis.app.data.model.LLMUsage
 import com.rikkaminis.app.data.model.ModelGroup
@@ -53,6 +54,7 @@ import com.rikkaminis.app.data.repository.MemoryRepository
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.provider.ImageBudget
 import com.rikkaminis.app.provider.LLMProvider
+import com.rikkaminis.app.provider.ModelsDevApi
 import com.rikkaminis.app.provider.ProviderFactory
 import com.rikkaminis.app.provider.catalogMaxThinkingLevel
 import com.rikkaminis.app.provider.effectiveMaxThinkingLevel
@@ -1105,6 +1107,31 @@ class ChatViewModel(
     internal val _forceScrollToBottom = MutableSharedFlow<Unit>(extraBufferCapacity = 4)
     val forceScrollToBottom: SharedFlow<Unit> = _forceScrollToBottom.asSharedFlow()
 
+    /**
+     * [fix/dv23-b3] Composer intents. The composer's single writer is
+     * `ChatInputArea`: it alone owns the live field state
+     * (`inputFieldValue.text`) and the 150 ms IME-burst job. ChatScreen used to
+     * reach into the composer directly for the slash-menu toggle/dismiss and
+     * the clear-chat wipe, resolving them against [_inputText] — the value that
+     * LAGS the field by the debounce window — so a fresh dictation/paste was
+     * rolled back to a stale snapshot (and, when the computed text equalled the
+     * current value, the write was dropped by the StateFlow anyway). Those
+     * intents now travel here and are executed by the composer with its own
+     * live text.
+     *
+     * Fire-and-forget by design: with no composer on screen there is nothing to
+     * command, and replaying a queued intent after re-entry would wipe a draft
+     * the user typed in the meantime (hence no replay / no buffering across
+     * an absent collector).
+     */
+    internal val _composerCommand = MutableSharedFlow<ComposerCommand>(extraBufferCapacity = 4)
+    val composerCommand: SharedFlow<ComposerCommand> = _composerCommand.asSharedFlow()
+
+    /** Route a composer intent to the composer (see [_composerCommand]). */
+    fun requestComposerCommand(command: ComposerCommand) {
+        _composerCommand.tryEmit(command)
+    }
+
     internal val _availableGroups = MutableStateFlow<List<ModelGroup>>(emptyList())
     val availableGroups: StateFlow<List<ModelGroup>> = _availableGroups.asStateFlow()
 
@@ -1945,6 +1972,23 @@ class ChatViewModel(
     internal val _mentionSelectedIndex = MutableStateFlow(-1)
     val mentionSelectedIndex: StateFlow<Int> = _mentionSelectedIndex.asStateFlow()
 
+    // [deep-audit-1043 B-07] ONE live-model resolution for the four capability /
+    // context readers below. `currentModel` is a snapshot written by
+    // [AgentLoopHost.updateCurrentModel] from `newEntry.model` — the entry's
+    // BASE model: 33 of the 39 built-in models carry no `contextWindow` /
+    // `maxOutputTokens` / `inputModalities` of their own and depend on
+    // models.dev enrichment, so reading the snapshot reported their window as
+    // `HEURISTIC`, dropped the max-output row and under-reported vision
+    // support. Re-resolving the active entry through
+    // `ModelsDevApi.effectiveModel` gives every reader the same enriched +
+    // override-folded model the real request would use; a group-resolved turn
+    // (no active entry id) falls back to the snapshot, enriched the same way.
+    private fun liveEffectiveModel(): LLMModel? =
+        _activeEntryId.value
+            ?.let { id -> providerRepository.config.value.modelEntries.find { it.id == id } }
+            ?.let { ModelsDevApi.effectiveModel(it) }
+            ?: currentModel?.let { ModelsDevApi.enrichModel(it) }
+
     val currentModelSupportsReasoning: Boolean
         get() = currentModel?.supportsReasoning != false
 
@@ -1955,7 +1999,8 @@ class ChatViewModel(
     // Lenient default (allow) when the model is unknown: never block on a
     // missing declaration.
     val currentModelSupportsImages: Boolean
-        get() = currentModel?.inputModalities?.any { it.equals("image", ignoreCase = true) } ?: true
+        get() = liveEffectiveModel()?.inputModalities?.normalizeModalities()
+            ?.any { it.equals("image", ignoreCase = true) } ?: true
 
     /**
      * [T-android-thinking-level-arch] The thinking ceiling the currently-bound
@@ -2010,9 +2055,10 @@ class ChatViewModel(
      * the bound group's `contextLimitTokens` takes effect on the very next
      * judgment without re-picking the model/group (mirrors iOS fcc22b66):
      *   1. the active entry's model is re-resolved from the current repository
-     *      config (folds ModelOverrides live), falling back to the snapshot
-     *      only when the entry can't be found (e.g. synced sessions before
-     *      config finished loading);
+     *      config through [liveEffectiveModel] (models.dev enrichment + live
+     *      ModelOverrides folded in), falling back to the snapshot only when
+     *      the entry can't be found (e.g. synced sessions before config
+     *      finished loading);
      *   2. the result is clamped by the bound group's `contextLimitTokens`
      *      (null / <=0 = unlimited).
      *
@@ -2030,11 +2076,9 @@ class ChatViewModel(
      * model physically supports.
      */
     internal fun effectiveContextWindowTokens(): Int? {
-        val config = providerRepository.config.value
-        val liveModel = _activeEntryId.value
-            ?.let { id -> config.modelEntries.find { it.id == id }?.model }
-            ?: currentModel
+        val liveModel = liveEffectiveModel()
         val window = liveModel?.contextWindowTokens ?: return null
+        val config = providerRepository.config.value
         val groupLimit = _selectedGroupId.value
             ?.let { gid -> config.modelGroups.find { it.id == gid }?.contextLimitTokens }
             ?.takeIf { it > 0 }
@@ -2063,16 +2107,10 @@ class ChatViewModel(
      * must not raise the "heuristic guess" red flag.
      */
     val currentModelContextWindowSource: LLMModel.ContextWindowSource?
-        get() {
-            val config = providerRepository.config.value
-            val liveModel = _activeEntryId.value
-                ?.let { id -> config.modelEntries.find { it.id == id }?.model }
-                ?: currentModel
-            return liveModel?.contextWindowSource
-        }
+        get() = liveEffectiveModel()?.contextWindowSource
 
     val currentModelMaxOutputTokens: Int?
-        get() = currentModel?.maxOutputTokens
+        get() = liveEffectiveModel()?.maxOutputTokens
 
     /**
      * The bound group's configured context limit for the current session,
@@ -4526,4 +4564,35 @@ internal fun pruneExpiredShareInboundFiles(
         }
     }
     return deleted
+}
+
+/**
+ * [fix/dv23-b3] Composer intents raised OUTSIDE the composer.
+ *
+ * The composer has exactly one writer: `ChatInputArea`. It owns the live field
+ * state and the 150 ms IME-burst debounce, so any intent that touches the
+ * composer must be resolved there, against the field's live text — never here
+ * against [ChatViewModel.inputText], which lags by the debounce window.
+ *
+ * Intentionally tiny: an enum-like command set, not a general bus. Adding a
+ * member is only justified when a caller cannot reach the composer state at all
+ * (it lives in the child composable's `remember`).
+ */
+sealed interface ComposerCommand {
+    /**
+     * Toolbar `/` button: open the slash menu over the current text, or close
+     * it when already open. Never clobbers existing composer content (see
+     * `showSlashMenuOverInput`).
+     */
+    data object ToggleSlashMenu : ComposerCommand
+
+    /** Tap outside / system back: close the slash menu, keep the body text. */
+    data object DismissSlashMenu : ComposerCommand
+
+    /**
+     * Clear-chat confirmation: wipe the composer through the three-write funnel
+     * (`clearComposerInput`) — a bare `setInputText("")` is dropped by the
+     * StateFlow when the value already equals "".
+     */
+    data object Clear : ComposerCommand
 }

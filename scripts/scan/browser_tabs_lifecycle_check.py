@@ -1032,6 +1032,87 @@ busy_arms = [
     ("C9f sheet reads the getter", BUSY_COMPLIANT, BUSY_SHEET_V_GETTER, ["C9"]),
 ]
 
+# --- [dv23-B4 B-04] C11: a context-only bind must not persist ---------------
+# The defect: the process-wide shared pool borrowed the requesting session's id
+# through bindSessionContextOnly (so minis:// resolves and downloads land in
+# that session) and every saveState() then wrote the driver's cross-session tab
+# list into that session's filesDir/browser_tabs/<sid>.json — resurrecting
+# deleted sessions and overwriting the chat session's own tabs.
+
+CTX_COMPLIANT = """package com.rikkaminis.app.browser
+
+class BrowserTabPool(private val context: Context) {
+    private var isContextOnlySession: Boolean = false
+
+    fun setSession(sessionId: String) {
+        isContextOnlySession = false
+        val dir = File(context.filesDir, "browser_tabs")
+        saveState()
+    }
+
+    fun bindSessionContextOnly(sessionId: String) {
+        this.sessionId = sessionId
+        isContextOnlySession = true
+    }
+
+    private fun saveState() {
+        if (isContextOnlySession) return
+        val dir = File(context.filesDir, "browser_tabs")
+    }
+}
+"""
+
+# C11 breaker: the guard is gone, so a borrowing pool persists again.
+CTX_V_PERSIST = CTX_COMPLIANT.replace(
+    "        if (isContextOnlySession) return\n", "",
+)
+
+# C11 breaker: a full bind never takes ownership back.
+CTX_V_NO_CLEAR = CTX_COMPLIANT.replace(
+    "        isContextOnlySession = false\n", "",
+)
+
+
+def check_context_only_persist(pool_src: str) -> list:
+    """[dv23-B4 B-04] C11 — the borrow latch is set on the context-only bind,
+    cleared by a full bind, and consulted before saveState touches the file.
+    Anchored on the DECISION (return before the write), not on spelling of the
+    surrounding code; fail-closed everywhere."""
+    code = strip_comments(pool_src)
+    if "isContextOnlySession" not in code:
+        return ["C11: the borrow latch is gone — context-only binds persist again"]
+    errs = []
+    ctx = slice_body(code, "fun bindSessionContextOnly")
+    if not ctx:
+        errs.append("C11: fun bindSessionContextOnly body not extractable (fail-closed)")
+    elif "isContextOnlySession = true" not in ctx:
+        errs.append("C11: bindSessionContextOnly no longer latches the borrow")
+    full = slice_body(code, "fun setSession(")
+    if not full:
+        errs.append("C11: fun setSession( body not extractable (fail-closed)")
+    else:
+        if "isContextOnlySession = false" not in full:
+            errs.append("C11: a full session bind does not take ownership back (stale latch)")
+        if "isContextOnlySession = true" in full:
+            errs.append("C11: a full session bind latches the borrow (it owns the session)")
+    save = slice_body(code, "private fun saveState")
+    if not save:
+        errs.append("C11: fun saveState body not extractable (fail-closed)")
+    else:
+        guard = save.find("if (isContextOnlySession) return")
+        if guard < 0:
+            errs.append("C11: saveState writes regardless of the borrow latch")
+        else:
+            touches = [
+                i for i in (save.find("browser_tabs"), save.find("getSharedPreferences"))
+                if i >= 0
+            ]
+            first = min(touches) if touches else -1
+            if first < 0 or guard > first:
+                errs.append("C11: the borrow guard sits after the tab file is touched")
+    return errs
+
+
 def selftest() -> int:
     compliant = """package com.rikkaminis.app.data.storage
 
@@ -1245,6 +1326,26 @@ class SessionFileStore internal constructor(
             failures += 1
         else:
             print(f"  OK {name}: {errs if errs else 'green'}")
+
+    # --- [dv23-B4 B-04] C11 arms: the borrow latch and its write guard ---
+    ctx_arms = [
+        ("C11 compliant borrow latch", CTX_COMPLIANT, []),
+        ("C11 saveState persists anyway", CTX_V_PERSIST, ["C11"]),
+        ("C11 full bind never clears the latch", CTX_V_NO_CLEAR, ["C11"]),
+    ]
+    for name, sample, expect in ctx_arms:
+        errs = check_context_only_persist(sample)
+        if expect == [] and errs:
+            print(f"  FAIL {name}: expected green, got {errs}")
+            failures += 1
+        elif expect != [] and not errs:
+            print(f"  FAIL {name}: expected red, got green")
+            failures += 1
+        elif expect != [] and not any(err.startswith(c) for c in expect for err in errs):
+            print(f"  FAIL {name}: expected {expect}, got {errs}")
+            failures += 1
+        else:
+            print(f"  OK {name}: {errs if errs else 'green'}")
     # --- [dv22-B2] C10 arms: destroy paths re-derive the busy flag ---
     # Arms are generated from the fixture's OWN derived caller set, so the
     # "one breaker per destroy path" coverage cannot silently shrink.
@@ -1351,6 +1452,9 @@ def main() -> int:
         # [dv22-B2] C10 — destroy paths re-derive agentBusy (pool file only).
         if pool_src is not None:
             errs += check_destroy_busy_source(pool_src)
+    # [dv23-B4 B-04] C11 — a borrowing pool must not persist (fail-closed).
+    if pool_src is not None:
+        errs += check_context_only_persist(pool_src)
     if errs:
         print("browser_tabs_lifecycle_check RED:")
         for e in errs:

@@ -38,6 +38,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.rikkaminis.app.R
 import com.rikkaminis.app.data.model.ProviderConfig
+import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.ui.components.MinisOutlinedButton
 import com.rikkaminis.app.ui.components.SectionDesign
@@ -212,8 +213,10 @@ private fun LazyListScope.agentLoopModelsSectionItems(
                 state = reorderState,
                 key = "agent_group:${group.id}",
             ) { _ ->
+                // [deep-audit-1043 B-06] Resolve through the System single
+                // source, or a group of system voice entries reports "0 models".
                 val resolvedCount = group.memberEntryIds.count { mid ->
-                    config.modelEntries.any { it.id == mid }
+                    SystemVoiceEntries.resolveIn(config.modelEntries, mid) != null
                 }
                 val subtitle = if (resolvedCount == 1) {
                     stringResource(R.string.agent_loop_models_model_count_singular)

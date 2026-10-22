@@ -235,6 +235,11 @@ fun BrowserSettingsSheet(
                     onValueChange = {
                         customUA = it
                         prefs.edit().putString("custom_user_agent", it).apply()
+                        // [dv23-B4 B-05] Keep the pool's copy in step without
+                        // reloading every open tab on each keystroke: Apply (or a
+                        // preset tap) stays the moment live tabs change, but the
+                        // stored copy must not lag behind the field.
+                        tabPool.stageCustomUserAgent(it)
                     },
                     label = { Text(stringResource(R.string.browser_settings_custom_ua_label)) },
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
