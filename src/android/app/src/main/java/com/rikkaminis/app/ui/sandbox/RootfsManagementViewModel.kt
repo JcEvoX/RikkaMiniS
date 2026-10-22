@@ -27,6 +27,25 @@ data class RootfsManagementUiState(
     val installProgress: Float? = null,
 )
 
+/**
+ * [deep-audit-1041 B-02] The failure terminal shared by the three lifecycle
+ * entry points (`install` / `resetRootfs` / `repairRootfs`). Kept pure so the
+ * contract is testable without an Android runtime.
+ *
+ * All three used to inline this same `copy(...)` inside their own `catch`,
+ * which is exactly why all three could miss the step that has to follow it —
+ * see [RootfsManagementViewModel.settleRootfsFailure].
+ */
+internal fun rootfsFailureState(
+    current: RootfsManagementUiState,
+    message: String,
+): RootfsManagementUiState = current.copy(
+    isProcessing = false,
+    lastOperationSuccess = false,
+    resultMessage = message,
+    installProgress = null,
+)
+
 class RootfsManagementViewModel : ViewModel() {
 
     private val _uiState = MutableStateFlow(RootfsManagementUiState())
@@ -102,6 +121,15 @@ class RootfsManagementViewModel : ViewModel() {
         _uiState.value = _uiState.value.copy(
             isInstalled = manager.isInstalled,
             rootfsPath = manager.rootfsDir.absolutePath,
+            // [deep-audit-1041 B-02] The size read below only runs for an
+            // INSTALLED rootfs, so the previous value used to survive a wipe: a
+            // reset that had already deleted the directory (or a repair that
+            // emptied it before failing) left the screen announcing "Not
+            // installed" next to the old ~200 MB disk-usage figure. Zero it on
+            // the way out instead — deliberately NOT by clearing it first and
+            // refilling it asynchronously, which would flash 0 on every refresh
+            // of a healthy rootfs.
+            rootfsSize = if (manager.isInstalled) _uiState.value.rootfsSize else 0L,
         )
 
         if (manager.isInstalled) {
@@ -160,6 +188,27 @@ class RootfsManagementViewModel : ViewModel() {
         }
     }
 
+    /**
+     * [deep-audit-1041 B-02] The single failure terminal for the three
+     * lifecycle entry points. `catch` arms used to stop at the `copy(...)`
+     * below, which is only enough when the failing operation left the rootfs
+     * untouched — and none of the three is that operation: `reset()` deletes
+     * the directory BEFORE re-installing, and `autoRepair()` falls back to
+     * exactly that reset in its last stage. So a throw mid-extract left the
+     * screen rendering a rootfs that no longer exists: green "Installed", the
+     * "Install" button hidden because `!isInstalled` was false, and (before the
+     * size fix in [refresh]) the old disk figure beside it. Re-read the manager
+     * here rather than keep trusting the pre-operation snapshot.
+     *
+     * [fix/render-ui F-277] The raw exception message goes to the log only —
+     * it is never rendered as the user-facing result line.
+     */
+    private fun settleRootfsFailure(ctx: Context, tag: String, messageRes: Int, e: Exception) {
+        AppLogger.error("RootfsManagement", "$tag failed: ${e.message}")
+        _uiState.value = rootfsFailureState(_uiState.value, ctx.getString(messageRes))
+        refresh(ctx)
+    }
+
     fun install(ctx: Context) {
         _uiState.value = _uiState.value.copy(
             isProcessing = true,
@@ -182,15 +231,7 @@ class RootfsManagementViewModel : ViewModel() {
                 )
                 refresh(ctx)
             } catch (e: Exception) {
-                // [fix/render-ui F-277] The raw exception used to be rendered as
-                // the user-facing result line. It now goes to the log only.
-                AppLogger.error("RootfsManagement", "install failed: ${e.message}")
-                _uiState.value = _uiState.value.copy(
-                    isProcessing = false,
-                    lastOperationSuccess = false,
-                    resultMessage = ctx.getString(R.string.rootfs_msg_install_failed),
-                    installProgress = null,
-                )
+                settleRootfsFailure(ctx, "install", R.string.rootfs_msg_install_failed, e)
             }
         }
     }
@@ -218,13 +259,7 @@ class RootfsManagementViewModel : ViewModel() {
                 )
                 refresh(ctx)
             } catch (e: Exception) {
-                AppLogger.error("RootfsManagement", "reset failed: ${e.message}")
-                _uiState.value = _uiState.value.copy(
-                    isProcessing = false,
-                    lastOperationSuccess = false,
-                    resultMessage = ctx.getString(R.string.rootfs_msg_reset_failed),
-                    installProgress = null,
-                )
+                settleRootfsFailure(ctx, "reset", R.string.rootfs_msg_reset_failed, e)
             }
         }
     }
@@ -263,6 +298,13 @@ class RootfsManagementViewModel : ViewModel() {
                 resultMessage = null,
                 installProgress = 0f,
             )
+            // [deep-audit-1041 B-02] Stage 3 of `autoRepair()` is a full
+            // `reset()`, i.e. the same re-extraction `install`/`resetRootfs`
+            // subscribe to. Without the subscription the determinate progress
+            // bar this method just asked for sat frozen at 0% for the whole
+            // (minutes-long) wipe + extract, because nobody was collecting
+            // `manager.installState`.
+            observeInstallProgress(manager, ctx)
             try {
                 val repaired = manager.autoRepair()
                 val after = withContext(Dispatchers.IO) {
@@ -280,13 +322,7 @@ class RootfsManagementViewModel : ViewModel() {
                 )
                 refresh(ctx)
             } catch (e: Exception) {
-                AppLogger.error("RootfsManagement", "repair failed: ${e.message}")
-                _uiState.value = _uiState.value.copy(
-                    isProcessing = false,
-                    lastOperationSuccess = false,
-                    resultMessage = ctx.getString(R.string.rootfs_msg_repair_failed),
-                    installProgress = null,
-                )
+                settleRootfsFailure(ctx, "repair", R.string.rootfs_msg_repair_failed, e)
             }
         }
     }
