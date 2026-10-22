@@ -2053,6 +2053,7 @@ class ChatViewModel(
     internal fun effectiveContextWindowTokens(): Int? {
         val liveModel = liveEffectiveModel()
         val window = liveModel?.contextWindowTokens ?: return null
+        val config = providerRepository.config.value
         val groupLimit = _selectedGroupId.value
             ?.let { gid -> config.modelGroups.find { it.id == gid }?.contextLimitTokens }
             ?.takeIf { it > 0 }
