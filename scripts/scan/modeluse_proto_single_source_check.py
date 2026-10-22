@@ -35,6 +35,16 @@ sync by discipline, so:
   6. the silent `optJSONObject("extra_body")` read must not come back in a
      caller — a present-but-not-an-object `extra_body` has to be reported.
 
+  7. [dv23-A03] the `model =` argument at EVERY `buildRequestJson(` call site in
+     ModelUseOffloadHandler.kt is the ENRICHED model (the value bound from
+     `…effectiveModel(`, or that call itself) — never the raw `entry.model`.
+     `cmdRun` judged `--output`/input modalities on `effectiveModel` but handed
+     `entry.model` to :modelservice, so every models.dev capability field was
+     dropped at the process boundary (no `responseModalities` → a `--output`
+     run that passed the gate here came back text-only; `maxOutputTokens` fell
+     back to the provider default). Derived per call site + counted, so a
+     THIRD dispatch point cannot reintroduce the raw hand-off.
+
 Scope note: every check below is limited to ModelUseProtocol.kt and
 CALLER_RELS; the gate never judges a file outside them.
 
@@ -158,6 +168,134 @@ def check_provider(root):
                 "%s: cmdSearch has no provider filter decision point (%s) — the "
                 "read flag would be dropped" % (name, PROVIDER_FILTER_GUARD)
             )
+    return v
+
+
+# ── [dv23-A03] the model that crosses into :modelservice must be ENRICHED ──
+# `cmdRun` resolves `effectiveModel` (models.dev base + overrides) and judges the
+# --output / input modality guards on it, but handed the RAW `entry.model` to
+# buildRequestJson. The worker rebuilds LLMModel from that JSON and never calls
+# ModelsDevApi (init happens in the app process only), so every capability field
+# models.dev supplied died at the boundary.
+DISPATCH_REL = CALLER_RELS[1]
+DISPATCH_CALL = "buildRequestJson("
+# An enrichment outlet: a call into the shared resolver. Matches both
+# `ModelsDevApi.effectiveModel(` and a local alias of it.
+ENRICH_CALL_RE = re.compile(r"\beffective(?:Entry)?Model\s*\(")
+# `val <name> [ : <type> ] = … effectiveModel(` — the binding the fix reuses.
+ALIAS_RE = re.compile(
+    r"\bval\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::\s*[^=\n]+)?=\s*[^=\n]*\beffective(?:Entry)?Model\s*\(",
+)
+# The raw hand-off shape the fix removed (`entry.model`, `x.model`, …).
+RAW_MODEL_ARG_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*\.model$")
+
+
+def _call_args(src, open_idx):
+    """Argument text between the '(' at [open_idx] and its matching ')'.
+
+    None when unbalanced (renamed / moved call) — fail-closed at the caller.
+    """
+    depth = 0
+    i = open_idx
+    while i < len(src):
+        c = src[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return src[open_idx + 1:i]
+        i += 1
+    return None
+
+
+def _named_arg(args, name):
+    """Value text of the top-level named argument `name = …`, or None."""
+    parts, depth, cur = [], 0, []
+    for c in args:
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        if c == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+            continue
+        cur.append(c)
+    if "".join(cur).strip():
+        parts.append("".join(cur))
+    for part in parts:
+        m = re.match(r"\s*%s\s*=\s*(.+?)\s*$" % re.escape(name), part, re.S)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def check_enriched_dispatch(root):
+    """[dv23-A03] Every `buildRequestJson(` hand-off resolves the enriched model.
+
+    Derived per call site and counted: the number of compliant `model =`
+    arguments must equal the number of call sites, so a THIRD dispatch point
+    cannot quietly pass the raw entry again.
+    """
+    v = []
+    path = os.path.join(root, DISPATCH_REL)
+    name = os.path.basename(DISPATCH_REL)
+    if not os.path.exists(path):
+        return ["%s: NOT FOUND at %s — cannot verify the dispatched model" % (name, path)]
+    src = code_only(open(path, encoding="utf-8").read())
+
+    aliases = set(m.group(1) for m in ALIAS_RE.finditer(src))
+    if not aliases:
+        v.append(
+            "%s: no `val … = …effectiveModel(` binding — the enriched model is never "
+            "resolved, so nothing can be handed over (fail-closed)" % name
+        )
+
+    sites = [i for i in range(len(src)) if src.startswith(DISPATCH_CALL, i)]
+    if not sites:
+        v.append(
+            "%s: no '%s' call site — fail-closed (dispatch renamed or moved out of "
+            "this file?)" % (name, DISPATCH_CALL)
+        )
+
+    compliant = 0
+    for idx in sites:
+        line = src.count("\n", 0, idx) + 1
+        args = _call_args(src, idx + len(DISPATCH_CALL) - 1)
+        if args is None:
+            v.append(
+                "%s:%d: '%s' could not be delimited — fail-closed" % (name, line, DISPATCH_CALL)
+            )
+            continue
+        value = _named_arg(args, "model")
+        if value is None:
+            v.append(
+                "%s:%d: '%s' carries no `model =` argument — the worker would be handed "
+                "no model at all" % (name, line, DISPATCH_CALL)
+            )
+            continue
+        if RAW_MODEL_ARG_RE.match(value):
+            v.append(
+                "%s:%d: `model = %s` hands the RAW entry to :modelservice — every "
+                "models.dev capability field (output_modalities, max_output_tokens, "
+                "reasoning_effort_values, …) is dropped at the process boundary; pass "
+                "the enriched model the guards above read" % (name, line, value)
+            )
+            continue
+        if value in aliases or ENRICH_CALL_RE.search(value):
+            compliant += 1
+            continue
+        v.append(
+            "%s:%d: `model = %s` is not an enrichment outlet — the argument must be the "
+            "value bound from `effectiveModel(...)` (or that call itself)"
+            % (name, line, value)
+        )
+    if sites and compliant != len(sites):
+        v.append(
+            "%s: %d of %d '%s' call sites hand over the enriched model — every site must"
+            % (name, compliant, len(sites), DISPATCH_CALL)
+        )
     return v
 
 
@@ -326,6 +464,22 @@ class C {
 
     private fun applyImagePassthrough(inputJson: String): Map<String, Any?> =
         ModelUseProtocol.parseImagePassthrough(inputJson).body
+
+    // [dv23-A03] the enriched model is what crosses into :modelservice
+    private fun cmdRun(args: OffloadArgs): NativeOffloadResult {
+        val effectiveModel = com.rikkaminis.app.provider.ModelsDevApi.effectiveModel(entry)
+        val ptRequestJson = ModelExecutionDispatcher.buildRequestJson(
+            instance = instance,
+            model = effectiveModel,
+            messages = messages,
+        )
+        val remoteRequestJson = ModelExecutionDispatcher.buildRequestJson(
+            instance = instance,
+            model = effectiveModel,
+            messages = messages,
+        )
+        return NativeOffloadResult(0, "")
+    }
 }
 
 internal fun providerMatches(query: String, label: String, id: String, typeName: String): Boolean {
@@ -419,6 +573,42 @@ GOOD_CALLER_SEARCH_NO_FLAG = GOOD_CALLER.replace(
     "",
 )
 
+# [dv23-A03] the pre-fix shape: BOTH dispatch points hand the raw entry over.
+GOOD_CALLER_RAW_HANDOFF = GOOD_CALLER.replace(
+    "model = effectiveModel,",
+    "model = entry.model,",
+)
+
+# Only the standard path regressed — the passthrough branch stays enriched.
+# The gate counts call sites, so a single raw site must already be red.
+GOOD_CALLER_ONE_RAW = GOOD_CALLER.replace(
+    "            model = effectiveModel,",
+    "            model = entry.model,",
+)
+
+# A `model =` argument that is neither the alias nor the shared resolver: the
+# hand-off bypasses enrichment without looking like `entry.model`.
+GOOD_CALLER_FOREIGN_ARG = GOOD_CALLER.replace(
+    "            model = effectiveModel,",
+    "            model = resolvedElsewhere,",
+)
+
+# The enriched model is bound from something other than the shared resolver, so
+# there is no alias to hand over (a local re-derivation would be the same bug).
+GOOD_CALLER_NO_ALIAS = GOOD_CALLER.replace(
+    "        val effectiveModel = com.rikkaminis.app.provider.ModelsDevApi.effectiveModel(entry)",
+    "        val effectiveModel = entry.baseModel",
+)
+
+# No dispatch call site at all — fail-closed, not silently clean.
+GOOD_CALLER_NO_DISPATCH = GOOD_CALLER.replace(
+    "    private fun cmdRun(args: OffloadArgs): NativeOffloadResult {",
+    "    private fun notRun(args: OffloadArgs): NativeOffloadResult {",
+).replace(
+    "ModelExecutionDispatcher.buildRequestJson(",
+    "ModelExecutionDispatcher.buildBodyJson(",
+)
+
 GOOD_CALLER_TWO_MATCHERS = GOOD_CALLER.replace(
     "class C {",
     "class C {\n"
@@ -439,7 +629,7 @@ def selftest():
     ok = True
 
     def run(root):
-        violations = check(root) + check_provider(root)
+        violations = check(root) + check_provider(root) + check_enriched_dispatch(root)
         return violations
 
     # fixture 1: good tree → exit 0
@@ -562,6 +752,44 @@ class C {
             ok = False
             print("SELFTEST-FAIL a missing handler file must not pass silently:", bad)
 
+    # [dv23-A03] fixtures 12-15: the dispatched model must be the enriched one
+    def dispatch_arm(label, caller, needle):
+        nonlocal ok
+        with tempfile.TemporaryDirectory() as root:
+            write(root, PROTO_REL, GOOD_PROTO)
+            write(root, CALLER_RELS[0], GOOD_CALLER)
+            write(root, CALLER_RELS[1], caller)
+            bad = run(root)
+            if not any(needle in b for b in bad):
+                ok = False
+                print("SELFTEST-FAIL %s must be caught:" % label, bad)
+
+    dispatch_arm(
+        "a raw `model = entry.model` hand-off (the pre-fix shape)",
+        GOOD_CALLER_RAW_HANDOFF,
+        "hands the RAW entry to :modelservice",
+    )
+    dispatch_arm(
+        "one enriched site beside one raw site (second dispatch point re-added)",
+        GOOD_CALLER_ONE_RAW,
+        "hands the RAW entry to :modelservice",
+    )
+    dispatch_arm(
+        "a `model =` argument that is neither the alias nor the shared resolver",
+        GOOD_CALLER_FOREIGN_ARG,
+        "is not an enrichment outlet",
+    )
+    dispatch_arm(
+        "the enriched model never resolved (no alias binding)",
+        GOOD_CALLER_NO_ALIAS,
+        "no `val … = …effectiveModel(` binding",
+    )
+    dispatch_arm(
+        "the dispatch call site removed (fail-closed)",
+        GOOD_CALLER_NO_DISPATCH,
+        "no 'buildRequestJson(' call site",
+    )
+
     if ok:
         print("MODELUSE_PROTO_SELFTEST=PASS")
         print("MODELUSE_PROVIDER_MATCHER_SELFTEST=PASS (4 fixtures: 3 violations caught, 1 fail-closed)")
@@ -577,7 +805,7 @@ def main():
         print(__doc__)
         sys.exit(2)
     root = args[0] if args else os.getcwd()
-    violations = check(root) + check_provider(root)
+    violations = check(root) + check_provider(root) + check_enriched_dispatch(root)
     if violations:
         print("modeluse_proto_single_source_check: %d violation(s)" % len(violations))
         for v in violations:
