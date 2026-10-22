@@ -54,6 +54,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
@@ -321,8 +322,17 @@ fun AddToHomeSheet(
                                 // thread — a 12 Mpx webpage icon is ~48 MB of
                                 // ARGB_8888 for a thumbnail, and a 4K one blew
                                 // past the canvas draw ceiling.
-                                val bmp = remember(path) {
-                                    ImageDecoding.decodeFileBounded(path, ICON_MAX_EDGE_PX)?.bitmap
+                                // [fix/dv21-b4-B08] …and the bounded decode was
+                                // still running ON that thread, inside a
+                                // `remember {}`: composition blocked until the
+                                // file was read and sampled. `produceState`
+                                // keeps the same call and moves it to
+                                // Dispatchers.IO; the tile shows the
+                                // placeholder icon until it lands.
+                                val bmp by produceState<Bitmap?>(initialValue = null, path) {
+                                    value = withContext(Dispatchers.IO) {
+                                        ImageDecoding.decodeFileBounded(path, ICON_MAX_EDGE_PX)?.bitmap
+                                    }
                                 }
                                 if (bmp != null) {
                                     androidx.compose.foundation.Image(
@@ -365,7 +375,17 @@ fun AddToHomeSheet(
                         contentDescription = stringResource(R.string.webapp_sheet_icon_pick),
                     ) {
                         if (galleryUri != null) {
-                            val bmp = remember(galleryUri) { loadBitmapFromUri(context, galleryUri) }
+                            // [fix/dv21-b4-B08] `loadBitmapFromUri` reads the
+                            // WHOLE picked image into memory (`readBytes()`) and
+                            // then decodes it — in a `remember {}` that ran on
+                            // the composition thread, so choosing a multi-MB
+                            // gallery photo stalled the sheet's next frame for
+                            // as long as the read + decode took.
+                            val bmp by produceState<Bitmap?>(initialValue = null, galleryUri) {
+                                value = withContext(Dispatchers.IO) {
+                                    loadBitmapFromUri(context, galleryUri)
+                                }
+                            }
                             if (bmp != null) {
                                 androidx.compose.foundation.Image(
                                     bitmap = bmp.asImageBitmap(),

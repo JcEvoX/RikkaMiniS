@@ -50,11 +50,56 @@ object ShortcutPinner {
             .setIntent(launchIntent)
             .build()
 
-        return runCatching {
-            ShortcutManagerCompat.requestPinShortcut(context, info, null)
-        }.getOrElse {
+        // [fix/dv21-b4-B08] The failure toast used to live in `getOrElse`, i.e.
+        // it only ran when the call THREW. A launcher that advertises support
+        // and then answers `false` — the usual answer on MIUI / HyperOS /
+        // ColorOS when the "create shortcut" permission was never granted —
+        // fell straight through: `AddToHomeSheet` rolled its DB row back and
+        // closed the sheet, and the user got a vanishing panel with no icon and
+        // no reason. `false` and a throw are the same answer to the user.
+        val outcome = pinOutcome(
+            runCatching { ShortcutManagerCompat.requestPinShortcut(context, info, null) },
+        )
+        if (outcome != ShortcutPinOutcome.REQUESTED) {
             Toast.makeText(context, R.string.webapp_pin_failed, Toast.LENGTH_LONG).show()
-            false
         }
+        return outcome == ShortcutPinOutcome.REQUESTED
     }
+}
+
+/**
+ * [fix/dv21-b4-B08] The verdict of one `requestPinShortcut` attempt, shared by
+ * the two carriers that pin a shortcut — this file and
+ * [com.rikkaminis.app.ui.preview.WebPreviewShortcut].
+ *
+ * Why one shared verdict instead of two hand-written `try/catch` blocks: the
+ * carriers drifted. This one toasted only in its `getOrElse` (thrown
+ * exceptions), the preview one had neither a failure toast nor a `runCatching`
+ * at all — so a throwing OEM launcher took the process down, and a declining
+ * one produced no feedback anywhere. Both are the same question ("did the pin
+ * actually get requested?"), so they get one answer.
+ *
+ * `false` is NOT success: the launcher has already told us it will not pin.
+ * Only [ShortcutPinOutcome.REQUESTED] may report success to the user.
+ *
+ * `isRequestPinShortcutSupported` is deliberately NOT folded in: the two call
+ * sites carry different "this launcher has no such feature" strings, and each
+ * already toasts on that path.
+ */
+internal enum class ShortcutPinOutcome {
+    /** The launcher accepted the request (it may still ask the user to confirm). */
+    REQUESTED,
+
+    /** `requestPinShortcut` returned `false` — advertised support, then declined. */
+    REJECTED,
+
+    /** `requestPinShortcut` threw (SecurityException / IllegalStateException on
+     *  launchers that gate shortcut creation behind an OEM permission). */
+    THREW,
+}
+
+internal fun pinOutcome(request: Result<Boolean>): ShortcutPinOutcome = when {
+    request.isFailure -> ShortcutPinOutcome.THREW
+    request.getOrNull() == true -> ShortcutPinOutcome.REQUESTED
+    else -> ShortcutPinOutcome.REJECTED
 }

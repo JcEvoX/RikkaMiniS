@@ -139,4 +139,162 @@ class WebAppPathGuardTest {
         assertNull(webAppTitleBackfill(null, userEditedTitle = false))
         assertNull(webAppTitleBackfill("   ", userEditedTitle = false))
     }
+
+    // ── [dv21-b4-B08] pin verdict surfaced ×2, decode off the composition ──
+
+    private val pinnerRel =
+        "src/android/app/src/main/java/com/rikkaminis/app/webapp/ShortcutPinner.kt"
+    private val previewShortcutRel =
+        "src/android/app/src/main/java/com/rikkaminis/app/ui/preview/WebPreviewShortcut.kt"
+    private val sheetRel =
+        "src/android/app/src/main/java/com/rikkaminis/app/webapp/AddToHomeSheet.kt"
+    private val decodeCalls = listOf("decodeFileBounded(", "loadBitmapFromUri(")
+
+    private fun readRepoFile(relative: String): String {
+        var dir: java.io.File? = java.io.File(System.getProperty("user.dir"))
+        while (dir != null) {
+            val f = java.io.File(dir, relative)
+            if (f.exists()) return f.readText()
+            dir = dir.parentFile
+        }
+        throw java.io.FileNotFoundException(
+            "$relative not found from user.dir=${System.getProperty("user.dir")}",
+        )
+    }
+
+    /** Drops `//`, `/* */` and KDoc so a comment that NAMES a shape cannot satisfy a check. */
+    private fun stripKotlinComments(src: String): String =
+        src.replace(Regex("/\\*[\\s\\S]*?\\*/"), "")
+            .lines()
+            .joinToString("\n") { line ->
+                val i = line.indexOf("//")
+                if (i >= 0 && line.substring(0, i).count { it == '"' } % 2 == 0) {
+                    line.substring(0, i)
+                } else {
+                    line
+                }
+            }
+
+    private fun parenEnd(code: String, open: Int): Int {
+        var depth = 0
+        for (j in open until code.length) {
+            when (code[j]) {
+                '(' -> depth++
+                ')' -> {
+                    depth--
+                    if (depth == 0) return j + 1
+                }
+            }
+        }
+        return code.length
+    }
+
+    private fun braceEnd(code: String, open: Int): Int {
+        var depth = 0
+        for (j in open until code.length) {
+            when (code[j]) {
+                '{' -> depth++
+                '}' -> {
+                    depth--
+                    if (depth == 0) return j + 1
+                }
+            }
+        }
+        return code.length
+    }
+
+    /** [start, end) of every `<header>(…) { … }` body in the file. */
+    private fun lambdaBodies(code: String, header: Regex): List<IntRange> {
+        val out = mutableListOf<IntRange>()
+        for (m in header.findAll(code)) {
+            val ob = code.indexOf('(', m.range.first)
+            if (ob < 0) continue
+            val br = code.indexOf('{', parenEnd(code, ob))
+            if (br < 0) continue
+            out.add((br + 1) until braceEnd(code, br))
+        }
+        return out
+    }
+
+    /** [start, end) of every `<header> { … }` body (header without a paren list). */
+    private fun braceBodies(code: String, header: Regex): List<IntRange> {
+        val out = mutableListOf<IntRange>()
+        for (m in header.findAll(code)) {
+            val br = code.indexOf('{', m.range.first)
+            if (br < 0) continue
+            out.add((br + 1) until braceEnd(code, br))
+        }
+        return out
+    }
+
+    @Test
+    fun `both pin carriers classify the answer through the shared verdict`() {
+        for (rel in listOf(pinnerRel, previewShortcutRel)) {
+            val src = stripKotlinComments(readRepoFile(rel))
+            assertTrue("$rel must classify via the shared pinOutcome(", "pinOutcome(" in src)
+            assertTrue(
+                "$rel must compare the verdict against REQUESTED",
+                "ShortcutPinOutcome.REQUESTED" in src,
+            )
+            assertTrue(
+                "$rel must surface a declined pin (false and a throw are the same answer)",
+                "webapp_pin_failed" in src,
+            )
+        }
+    }
+
+    @Test
+    fun `a throwing launcher cannot escape either pin call`() {
+        for (rel in listOf(pinnerRel, previewShortcutRel)) {
+            val src = stripKotlinComments(readRepoFile(rel))
+            val captured = braceBodies(src, Regex("\\brunCatching\\s*\\{"))
+            val calls = Regex("\\brequestPinShortcut\\s*\\(").findAll(src).map { it.range.first }
+            val sites = calls.toList()
+            assertTrue("$rel is expected to call requestPinShortcut", sites.isNotEmpty())
+            for (site in sites) {
+                assertTrue(
+                    "$rel: requestPinShortcut at offset $site escapes its runCatching block " +
+                        "(a throwing OEM launcher takes the process down)",
+                    captured.any { site in it },
+                )
+            }
+        }
+    }
+
+    @Test
+    fun `the sheet never decodes inside a remember block`() {
+        val src = stripKotlinComments(readRepoFile(sheetRel))
+        val sites = decodeCalls.flatMap { call ->
+            Regex(Regex.escape(call)).findAll(src).map { it.range.first }.toList()
+        }
+        assertTrue("the sheet is expected to carry a bounded decode", sites.isNotEmpty())
+        val rememberBodies = lambdaBodies(src, Regex("\\bremember\\s*\\("))
+        for (site in sites) {
+            assertTrue(
+                "decode at offset $site runs inside `remember { }`, i.e. on the composition " +
+                    "thread — a 12 Mpx icon blocks the sheet's next frame",
+                rememberBodies.none { site in it },
+            )
+        }
+    }
+
+    @Test
+    fun `a produceState decode hops off the composition thread`() {
+        val src = stripKotlinComments(readRepoFile(sheetRel))
+        val sites = decodeCalls.flatMap { call ->
+            Regex(Regex.escape(call)).findAll(src).map { it.range.first }.toList()
+        }
+        val produceBodies = lambdaBodies(src, Regex("\\bproduceState\\s*(?:<[^>{]*>)?\\s*\\("))
+        var checked = 0
+        for (body in produceBodies) {
+            if (sites.none { it in body }) continue
+            checked++
+            assertTrue(
+                "a produceState body that decodes must hop (Dispatchers.IO / withContext) — " +
+                    "produceState otherwise runs on the composition dispatcher",
+                "Dispatchers.IO" in src.substring(body.first, body.last + 1),
+            )
+        }
+        assertTrue("expected at least one decoding produceState body", checked >= 1)
+    }
 }
