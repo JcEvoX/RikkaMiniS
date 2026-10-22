@@ -30,7 +30,15 @@ import java.nio.file.attribute.BasicFileAttributes
 
 // ── find ────────────────────────────────────────────────────────────────────
 
-/** One emitted hit: guest path, entry type (`f` file / `d` dir / `l` symlink), apparent size. */
+/**
+ * One emitted hit: guest path, entry type, apparent size.
+ *
+ * `d` directory · `f` REGULAR file · `l` symlink · `o` other — a named pipe,
+ * socket or device node. `o` exists because those were previously labelled `f`
+ * ("anything that is not a link"), which made `find -type f` return entries the
+ * help text says it never returns, and made the four fastio engines disagree
+ * about what a special file is ([dv23-A6 §1043-A-07]).
+ */
 internal data class FindMatch(val guestPath: String, val type: Char, val size: Long)
 
 internal class FindOutcome : EntryBudget {
@@ -84,7 +92,23 @@ internal fun findTree(
                 override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
                     if (charge(out, maxEntries)) return FileVisitResult.TERMINATE
                     out.files++
-                    consider(file, if (attrs.isSymbolicLink) 'l' else 'f', attrs.size())
+                    // [dv23-A6 §1043-A-07] `f` means REGULAR file — the meaning
+                    // the help text gives `--type f|d|l` ("only regular files /
+                    // directories / symlinks"). `else 'f'` filed a FIFO or a
+                    // socket under `f` too, so `-type f` listed entries no guest
+                    // can open. Only the LABEL is fixed here: the entry counts
+                    // stay filter-independent (a pipe is still a file entry for
+                    // `files`, exactly as a symlink already was), which keeps
+                    // `find` consistent with `du`'s counting.
+                    consider(
+                        file,
+                        when {
+                            attrs.isSymbolicLink -> 'l'
+                            attrs.isRegularFile -> 'f'
+                            else -> 'o'
+                        },
+                        attrs.size(),
+                    )
                     return FileVisitResult.CONTINUE
                 }
 
@@ -125,6 +149,15 @@ internal class GrepOutcome : EntryBudget {
     var filesSkippedBinary = 0L
     var filesSkippedLarge = 0L
     var filesSkippedLink = 0L
+
+    /**
+     * Named pipes, sockets and device nodes: never opened.
+     *
+     * [dv23-A6 §1043-A-07] Reported like the other skips so an empty result
+     * over a tree full of pipes is diagnosable instead of looking like "no
+     * match".
+     */
+    var filesSkippedSpecial = 0L
     var bytesScanned = 0L
 
     override var visited = 0L
@@ -137,8 +170,9 @@ internal class GrepOutcome : EntryBudget {
 }
 
 /**
- * Scan every regular file under [root] (symlinks skipped, never followed) for
- * lines matching [regex], collecting at most [limit] hits.
+ * Scan every regular file under [root] (symlinks and special files skipped,
+ * never followed or opened) for lines matching [regex], collecting at most
+ * [limit] hits.
  *
  * [regex] is a caller-built `java.util.regex` pattern — the handler owns that
  * choice and states it in its help text; this engine stays dialect-agnostic.
@@ -191,6 +225,18 @@ internal fun grepTree(
                     if (out.matchesCapped) return FileVisitResult.TERMINATE
                     if (attrs.isSymbolicLink) {
                         out.filesSkippedLink++
+                        return FileVisitResult.CONTINUE
+                    }
+                    // [dv23-A6 §1043-A-07] Neither a regular file nor a link ⇒
+                    // a named pipe / socket / device node. NEVER opened:
+                    // `Files.newInputStream` on a writer-less FIFO blocks in
+                    // `open(2)` with no timeout (measured: no return in 4 s on
+                    // this JVM; a socket raises ENXIO instead), and the offload
+                    // pool is 2 threads — two such entries stall every other
+                    // tool call. Same guard as FastioTar's create walk
+                    // ([dv22-A2 §1042-A-02]).
+                    if (!attrs.isRegularFile) {
+                        out.filesSkippedSpecial++
                         return FileVisitResult.CONTINUE
                     }
                     if (attrs.size() > MAX_GREP_FILE_BYTES) {

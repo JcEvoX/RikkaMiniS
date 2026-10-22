@@ -427,6 +427,7 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
         var totalBinary = 0L
         var totalLarge = 0L
         var totalLinks = 0L
+        var totalSpecial = 0L
         var totalBytes = 0L
         var truncated = false
         var capped = false
@@ -462,6 +463,7 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
                             .put("files_skipped_binary", outcome.filesSkippedBinary)
                             .put("files_skipped_large", outcome.filesSkippedLarge)
                             .put("files_skipped_link", outcome.filesSkippedLink)
+                            .put("files_skipped_special", outcome.filesSkippedSpecial)
                             .put("bytes_scanned", outcome.bytesScanned)
                         if (outcome.truncated) entry.put("truncated", true)
                         if (outcome.matchesCapped) entry.put("matches_capped", true)
@@ -474,6 +476,7 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
                         totalBinary += outcome.filesSkippedBinary
                         totalLarge += outcome.filesSkippedLarge
                         totalLinks += outcome.filesSkippedLink
+                        totalSpecial += outcome.filesSkippedSpecial
                         totalBytes += outcome.bytesScanned
                         truncated = truncated || outcome.truncated
                         capped = capped || outcome.matchesCapped
@@ -494,6 +497,7 @@ class FastioOffloadHandler(private val context: Context) : NativeOffloadHandler 
                     .put("files_skipped_binary", totalBinary)
                     .put("files_skipped_large", totalLarge)
                     .put("files_skipped_link", totalLinks)
+                    .put("files_skipped_special", totalSpecial)
                     .put("bytes_scanned", totalBytes),
             )
             .put("engine", "java.util.regex")
@@ -1273,6 +1277,8 @@ Options:
                      refused with "already_exists" — an accidental overwrite has no undo.
   --name GLOB        (find) match the entry NAME (shell-style glob, e.g. '*.log'). `-name` works.
   --type f|d|l       (find) only regular files / directories / symlinks. `-type` works.
+                     A hit's `type` is f (regular file) / d / l / o — `o` is anything else
+                     (named pipe, socket, device), reported but never opened.
   -i, --ignore-case  (grep) case-insensitive match.
   -c, -x             (tar) create / extract. -f <archive> then names the archive; -C <dir> sets the
                      extraction directory. Clustered forms work: -cf, -czf, -xf, -xzf.
@@ -1293,8 +1299,9 @@ Notes:
   - `find`/`grep` emit COMPACT json (the hit list is the payload); `du`/`rm`/`cp`/`mv` emit indented
     json. "truncated": true means the output is incomplete — either the hit budget was reached
     ("matches_capped": true, the scan/list stops there) or the traversal budget ran out.
-  - `grep` skips symlinks, binary files (NUL in the first 8 KiB) and files larger than 8 MiB; the
-    per-file skip counts are reported so an empty result is diagnosable.
+  - `grep` skips symlinks, binary files (NUL in the first 8 KiB), files larger than 8 MiB and
+    special files (named pipe / socket / device — never opened: a writer-less FIFO blocks in
+    open(2)); the per-file skip counts are reported so an empty result is diagnosable.
   - `cp`/`mv` copy a symlink as a LINK (never followed), refuse to overwrite without --force,
     refuse a target inside its own source, and treat an existing directory `dst` as "copy into it"
     (`cp -r a dir` → `dir/a`), like the shell.
