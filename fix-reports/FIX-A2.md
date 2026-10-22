@@ -201,11 +201,11 @@ FastioTarTest           post rc=0 :: OK (31 tests)      ← 冻结套件 31 条�
 
 | 项 | 值 |
 |---|---|
-| run | `39765536676`（`https://github.com/logicflow-GYW/RikkaMinis/actions/runs/39765536676`） |
-| job | `119779933705`（build）· **conclusion = success** · 日志 1,359,935 B（`probe/ci/job-119779933705.log`） |
-| dispatch | 手动 dispatch（`gh_sync.sh gh-actions-dispatch --workflow build-apk.yml --ref fix/dv22-a2-fastio-tar-toplevel`），2026-10-22T10:45:54Z；10:45:59 起 → 11:04:08 完 |
+| run | **`39768460593`**（`https://github.com/logicflow-GYW/RikkaMinis/actions/runs/39768460593`）· 前一轮 `39765536676`（head_sha `9535d2fc`，**代码内容完全相同**，只少一个 `.md` 报告提交） |
+| job | `119789714737`（build）· **conclusion = success** · 日志 1,359,620 B（`probe/ci/job-119789714737.log`） |
+| dispatch | 手动 dispatch（`gh_sync.sh gh-actions-dispatch --workflow build-apk.yml --ref fix/dv22-a2-fastio-tar-toplevel`），2026-10-22T11:09:27Z；11:09:32 起 → 11:27:08 完 |
 | 分支 | `fix/dv22-a2-fastio-tar-toplevel` |
-| head_sha | `9535d2fc663a5860d994bd3b5adb90d440835c14` |
+| head_sha | `f8b1590d3d0f96f2a6fe8ade13a311be3e79f28e`（= 分支 HEAD，含报告提交） |
 | 三方一致 | 本地 HEAD == `git ls-remote` == CI `head_sha`（逐字符） |
 
 **判读 14/14 GREEN**（装置 `probe/ci/judge_ci.py`，判据只取两源：门真树 OK 行 + `test_scan` 的 `✅ <gate> selftest has teeth` 行）：
@@ -245,7 +245,9 @@ FastioTarTopLevelTest > top-level files stop at the budget without double counti
 
 **判读装置的一处自伤（已修，记录在案）**：首版判据把 Summary 行写成「以 `Summary:` **行首**开头」、门头写成「以 `[` 开头」，实际日志形态是「`时间戳 ║  Summary: …`」与「`时间戳 ━━━ [N/109] 门名 ━━━`」⇒ 3 条判据假红（`0/0 条 Summary 合规` / `门头 0 个`）。修法 = 按真样本重取形态（正则 `[N/109]` / 含 `Summary:` 子串 + 非零 failed 计数扫描），**不照抄臆想句式**（同族第 N 次，见 1039 A-4）。修后 14/14。
 
-**三源取二**：CI 绿（run `39765536676` success，14/14 判读）+ 本地独立实跑（L1 全量 109 门 GREEN + 336 夹具 + L3 pre/post/变异三臂真编译真跑）——两条独立证据成立。
+**三源取二**：CI 绿（run `39768460593` success，14/14 判读）+ 本地独立实跑（L1 全量 109 门 GREEN + 336 夹具 + L3 pre/post/变异三臂真编译真跑）——两条独立证据成立。
+
+**停止节点达成（分支 CI 绿）**，**未合并 main**（含 `.kt` 验证面，合并起手权在用户）。
 
 ---
 
