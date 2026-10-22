@@ -272,6 +272,82 @@ class RootfsManagementViewModelTest {
         assertFalse(settled.lastOperationSuccess)
     }
 
+    // ── 4b. the inherited terminal ([deep-audit-1043 B-01]) ────────────────
+
+    @Test
+    fun `an inherited Failed does not fail a repair that restored the rootfs`() {
+        // RootfsManager never resets installState to Idle and autoRepair()
+        // publishes nothing in Stages 1/2/2.5/2.6, so yesterday's Failed is
+        // still sitting on the flow when a repair fixes everything in place.
+        // The unconditional first arm reported that stale error — and
+        // lastOperationSuccess = false — over a repair that had just restored
+        // every critical file.
+        val stale = RootfsInstallState.Failed("Not enough space: need about 900 MB")
+        val after = rootfsRepairState(
+            repairFixtureState(),
+            stale,
+            repaired = true,
+            repairedMessage = "REPAIRED-TEXT",
+            stillMissingMessage = "STILL-MISSING-TEXT",
+            priorTerminal = stale,
+        )
+
+        assertEquals("the repair's own outcome decides", "REPAIRED-TEXT", after.resultMessage)
+        assertTrue("restoring every critical file is a success", after.lastOperationSuccess)
+        assertFalse("the operation is over", after.isProcessing)
+        assertEquals("the progress bar must be cleared", null, after.installProgress)
+    }
+
+    @Test
+    fun `a fresh Failed repeating the stale text is still this repair's verdict`() {
+        // The discriminator is instance identity, NOT text: RootfsManager
+        // constructs a fresh Failed for every verdict it publishes, so a real
+        // failure during THIS repair must win even when the message repeats —
+        // filtering by `error` equality would swallow it.
+        val stale = RootfsInstallState.Failed("Not enough space: need about 900 MB")
+        val live = RootfsInstallState.Failed("Not enough space: need about 900 MB")
+        assertEquals("fixture premise: identical text, different verdict", stale.error, live.error)
+        assertFalse(
+            "fixture premise: the two are not the same instance",
+            isStaleInstallReplay(firstFrame = true, state = live, priorTerminal = stale),
+        )
+
+        val after = rootfsRepairState(
+            repairFixtureState(),
+            live,
+            repaired = false,
+            repairedMessage = "REPAIRED-TEXT",
+            stillMissingMessage = "STILL-MISSING-TEXT",
+            priorTerminal = stale,
+        )
+
+        assertEquals(
+            "the disk-space verdict this repair published must surface",
+            "Not enough space: need about 900 MB", after.resultMessage,
+        )
+        assertFalse("a refused repair is not a success", after.lastOperationSuccess)
+    }
+
+    @Test
+    fun `an inherited Failed over a still-broken rootfs reports the current missing list`() {
+        // Stage 1/2 finished but files are still missing: the honest message is
+        // the re-verified list, not yesterday's unrelated error text.
+        val stale = RootfsInstallState.Failed("previous run: disk space")
+        val after = rootfsRepairState(
+            repairFixtureState(),
+            stale,
+            repaired = false,
+            repairedMessage = "REPAIRED-TEXT",
+            stillMissingMessage = "STILL-MISSING-TEXT",
+            priorTerminal = stale,
+        )
+
+        assertEquals("STILL-MISSING-TEXT", after.resultMessage)
+        assertFalse(after.lastOperationSuccess)
+        assertFalse(after.isProcessing)
+        assertEquals(null, after.installProgress)
+    }
+
     // ── 5. source shape: the replay gate and the settlement wiring ────────
 
     @Test
@@ -338,6 +414,32 @@ class RootfsManagementViewModelTest {
         )
     }
 
+    @Test
+    fun `repairRootfs snapshots the pre-operation terminal before it repairs`() {
+        val code = stripComments(readRepoFile(VIEW_MODEL))
+        val body = bodyOf(code, "fun repairRootfs(")
+        val capture = Regex("""val\s+(\w+)\s*=\s*manager\.installState\.value""").find(body)
+        assertTrue(
+            "repairRootfs must snapshot the terminal the flow was holding before the repair " +
+                "publishes anything — without it the settlement cannot tell an inherited " +
+                "Failed from one of its own",
+            capture != null,
+        )
+        val captured = capture!!.groupValues[1]
+        val repairAt = body.indexOf("manager.autoRepair()")
+        assertTrue("autoRepair() must stay in repairRootfs", repairAt > 0)
+        assertTrue(
+            "the snapshot must be taken BEFORE autoRepair() — Stage 3 republishes the terminal, " +
+                "so a later capture would record this operation's own verdict as the prior one",
+            capture.range.first < repairAt,
+        )
+        val args = callArgs(body, "rootfsRepairState(")
+        assertTrue(
+            "the settlement must hand the snapshot to the helper (got: ${args.take(220)})",
+            Regex("\\b" + captured + "\\b").containsMatchIn(args),
+        )
+    }
+
 
 
     // ── source helpers (same idiom as the other shape tests) ─────────────
@@ -360,6 +462,34 @@ class RootfsManagementViewModelTest {
         assertTrue("declaration not found: $decl", at >= 0)
         val open = src.indexOf("{", at)
         return braceBlockAt(src, open)
+    }
+
+    /** The argument list of the first `<call>` — paren-balanced, quoted spans excluded. */
+    private fun callArgs(src: String, call: String): String {
+        val at = src.indexOf(call)
+        assertTrue("call not found: $call", at >= 0)
+        var i = src.indexOf("(", at)
+        val start = i + 1
+        var depth = 0
+        while (i < src.length) {
+            val c = src[i]
+            if (c == '"' || c == '\'') {
+                val quote = c
+                i++
+                while (i < src.length && src[i] != quote) {
+                    i += if (src[i] == '\\') 2 else 1
+                }
+                i++
+                continue
+            }
+            if (c == '(') depth++
+            if (c == ')') {
+                depth--
+                if (depth == 0) return src.substring(start, i)
+            }
+            i++
+        }
+        throw AssertionError("unbalanced call arguments for $call")
     }
 
     /** The `{ … }` block whose opening brace is at [open]. */
