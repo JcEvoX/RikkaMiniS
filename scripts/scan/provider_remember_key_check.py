@@ -249,6 +249,9 @@ REL_MODEL_PICKER_SHEET = "src/android/app/src/main/java/com/rikkaminis/app/ui/ch
 # [dv22/B-03] the remaining capability-reading surfaces
 REL_QUICK_TEST = "src/android/app/src/main/java/com/rikkaminis/app/ui/components/QuickTestSheet.kt"
 REL_CHAT_SCREEN = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatScreen.kt"
+# [deep-audit-1043 B-06] the group surfaces that resolve memberEntryIds for DISPLAY
+REL_MODEL_GROUPS = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/ModelGroupsScreen.kt"
+REL_AGENT_LOOP_MODELS = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/AgentLoopModelsScreen.kt"
 # da1039-B3 (B-03 / B-04 / B-08): the settings screens that read a config object
 # once and then write through it.
 REL_ADD_CUSTOM_MODEL = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/AddCustomModelScreen.kt"
@@ -544,6 +547,22 @@ def iter_remember_calls(code, call="remember"):
         init = code[brace:end] if brace >= 0 else ""
         out.append((code.count("\n", 0, start) + 1, keys, code[start:end], init))
     return out
+
+
+def derived_state_calls(code):
+    """Every keyed derived-state carrier: `remember(keys) { … }` plus the two
+    producer effects (`LaunchedEffect` / `produceState`).
+
+    [deep-audit-1043 B-02] A criterion about "which sources this value is
+    re-derived from" must not depend on WHICH carrier holds the derivation —
+    the same decision moved from `remember` to a producer effect when the read
+    became blocking I/O, and a gate anchored on the carrier would have to be
+    rewritten (or would red the fix) every time. Callers get the union, tagged
+    only by line number, and grade the key list exactly as before."""
+    out = list(iter_remember_calls(code, "remember"))
+    for effect in EFFECT_CALLS:
+        out.extend(iter_remember_calls(code, effect))
+    return sorted(out, key=lambda c: c[0])
 
 
 def call_args(code, pos):
@@ -913,53 +932,87 @@ def check_thinking_rules(code):
     mentioning a field is exactly what is under test, so grading the whole
     statement would be tautological. Keyless counts as a miss whenever the
     initializer is derived. Fail-closed: no remember whose initializer calls
-    the anchor callee means the section was reworked → RED."""
+    the anchor callee means the section was reworked → RED.
+
+    [deep-audit-1043 B-02] The two built-in/preview derivations moved out of the
+    composition (they are Room / config-load reads), so the keyed derivation now
+    lives on a PRODUCER EFFECT (LaunchedEffect / produceState) rather than on a
+    `remember` initializer. The DECISION under test is unchanged — "this value is
+    re-derived whenever its sources move" — so the criterion accepts either
+    carrier and grades the key list of whichever one performs the read. Anchoring
+    on `remember` alone here would be a spelling test that reds the fix."""
     results = []
     targets = (
         ("C11a", "builtInThinkingRulesForDisplay(",
          ("customBaseURL", "appendV1Suffix", "modelEntries"), "built-in rule list"),
         ("C11b", "firstModelId(", ("modelEntries",), "resolution-preview model id"),
     )
-    calls = iter_remember_calls(code, "remember")
+    calls = derived_state_calls(code)
     for cid, callee, required, label in targets:
         hits = [c for c in calls if callee in c[3]]
         if not hits:
             results.append((cid, False,
-                            "no `remember(...)` whose initializer calls %s (fail-closed: the %s "
-                            "call was reworked — re-derive this criterion)" % (callee, label)))
+                            "no `remember(...)`/producer effect whose initializer calls %s "
+                            "(fail-closed: the %s call was reworked — re-derive this criterion)"
+                            % (callee, label)))
             continue
         bad = []
         for line_no, keys, _span, _init in hits:
             if keys is None:
-                bad.append("L%d: keyless remember derives from %s" % (line_no, callee))
+                bad.append("L%d: keyless derivation reads %s" % (line_no, callee))
                 continue
             missing = [tok for tok in required if tok not in keys]
             if missing:
                 bad.append("L%d: keys=[%s] missing %s"
                            % (line_no, " ".join(keys.split()), ",".join(missing)))
         results.append((cid, not bad,
-                        "all %d %s remember call(s) key on %s"
+                        "all %d %s derivation(s) key on %s"
                         % (len(hits), label, " + ".join(required))
                         if not bad else "; ".join(bad)))
     # C12 [da1030-C ISSUE-05] — the loader must observe EXTERNAL rule writes.
+    # [deep-audit-1043 B-02] Same move as C11 (the loader is a Room read too), so
+    # the arm now has THREE parts instead of two:
+    #   (a) the section subscribes to `customRulesRevision` — without it a rule
+    #       written outside this screen is invisible;
+    #   (b) the custom-rule loader is keyed on (instance.id, reloadKey, revision);
+    #   (c) the loader runs OFF the composition thread — an IO hop inside a
+    #       producer effect, not a `remember` initializer. `thinkingRulesWithIds`
+    #       is `= runBlocking { dao.load… }`, so (c) is what keeps a SQLite round
+    #       trip out of the frame budget.
+    # Arm (c) is the new one; (a)/(b) are the original contract, deliberately
+    # preserved across the carrier change rather than re-derived.
     bad = []
     if not REVISION_SUB_RE.search(code):
         bad.append("no `customRulesRevision` → `collectAsState()` subscription (fail-closed: "
                    "the section cannot observe rules written outside this screen)")
     loader_hits = [c for c in calls if THINKING_LOADER_CALLEE in c[3]]
     if not loader_hits:
-        bad.append("no `remember(...)` whose initializer calls %s (fail-closed: the loader "
-                   "was reworked — re-derive this criterion)" % THINKING_LOADER_CALLEE)
-    for line_no, keys, _span, _init in loader_hits:
+        bad.append("no `remember(...)`/producer effect whose initializer calls %s "
+                   "(fail-closed: the loader was reworked — re-derive this criterion)"
+                   % THINKING_LOADER_CALLEE)
+    producers = []
+    for line_no, keys, _span, init in loader_hits:
         if keys is None:
-            bad.append("L%d: keyless remember loads the custom rules" % line_no)
+            bad.append("L%d: keyless derivation loads the custom rules" % line_no)
             continue
         if not any(tok in keys for tok in REVISION_KEY_TOKENS):
             bad.append("L%d: keys=[%s] missing the rules-revision key (%s)"
                        % (line_no, " ".join(keys.split()), " / ".join(REVISION_KEY_TOKENS)))
+        if IO_HOP_RE.search(init):
+            producers.append(line_no)
+    composition = [c[0] for c in iter_remember_calls(code, "remember")
+                   if THINKING_LOADER_CALLEE in c[3]]
+    if composition:
+        bad.append("the Room loader still runs in a `remember` initializer at line(s) %s — "
+                   "blocking SQLite I/O on the composition thread"
+                   % ", ".join(str(x) for x in composition))
+    if loader_hits and not producers:
+        bad.append("the loader is keyed correctly but never hops to an IO dispatcher — "
+                   "the Room read would still run on the composition thread")
     results.append(("C12", not bad,
-                    "section subscribes to customRulesRevision and keys the loader on it"
-                    if not bad else "; ".join(bad)))
+                    "section subscribes to customRulesRevision, keys the loader on it and "
+                    "loads it off the composition thread (L%s)"
+                    % ",".join(str(x) for x in producers) if not bad else "; ".join(bad)))
     return results
 
 def check_thinking_resolver(code):
@@ -1908,6 +1961,157 @@ CAP_READ_RE = re.compile(r"\b(?:inputModalities|outputModalities|modalityBadges|
 SINGLE_SOURCE_RE = re.compile(r"\b(?:effectiveModel|enrichModel)\s*\(")
 
 
+def _member_block(code, start):
+    """The statement that resolves the member id mentioned at `start`.
+
+    Statements here come in two shapes and BOTH must be captured whole:
+        for (x in group.memberEntryIds) { … }
+        val names = group.memberEntryIds           <- fluent chain, the lambda
+            .mapNotNull { x -> … }                    opens on the NEXT line
+    so "walk to the next `{`" is not enough (a newline intervenes) and "stop at
+    the first newline" is not either (it cuts the chain in half, and the whole
+    point is to see whether the body resolves through the System source).
+
+    Rule: from the mention, scan to the first line that is BOTH at bracket depth
+    0 AND indented no deeper than the mention's own line. That ends the
+    statement for a chain, a loop body, a `remember { … }` wrapper, or an
+    assignment, while keeping nested lambdas and `withContext` blocks inside."""
+    line_start = code.rfind("\n", 0, start) + 1
+    indent = 0
+    while line_start + indent < len(code) and code[line_start + indent] == " ":
+        indent += 1
+
+    depth = 0
+    i = start
+    while i < len(code):
+        ch = code[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth < 0:                 # the enclosing block already closed
+                return code[start:i]
+        elif ch == "\n" and depth == 0:
+            nxt = code[i + 1:]
+            nxt_indent = len(nxt) - len(nxt.lstrip(" "))
+            if not nxt.strip():
+                i += 1
+                continue
+            if nxt_indent <= indent:      # a sibling statement starts here
+                return code[start:i]
+        i += 1
+    return code[start:]
+
+
+# Positive evidence that this site is about the MEMBER ITSELF (its identity,
+# its name, its capability, whether it is usable) rather than one of its
+# scalar attributes. Only the former can be wrong about a System voice entry:
+# such an entry is a real member with a name and a modality, but it has no
+# thinking level / context window, so a roll-up over those MUST skip it.
+_MEMBER_DISPLAY_SIGNALS = (
+    "SystemVoiceEntries.",      # already routed through the single source
+    "displayName",
+    "modalities",
+    "Modality",
+    "isEnabledGroupMember",
+    "isKnownGroupMemberId",
+    "INSTANCE_ID",
+    ".count {",
+    ".any {",
+)
+# A numeric roll-up over a per-member scalar (max thinking level, token window …)
+# is a different question and is out of scope by design.
+_AGGREGATE_REDUCERS = (
+    ".minByOrNull", ".maxByOrNull", ".minOf", ".maxOf", ".sumOf", ".average",
+)
+# A block that only copies / collects ids performs no resolution; nothing to grade.
+_COLLECT_ONLY = re.compile(
+    r"^\s*(?:for\s*\(\s*\w+\s+in\s+[\w.]*memberEntryIds\s*\)\s*\{\s*\}\s*"
+    r"|[\w.]*memberEntryIds\s*\.\s*(?:toMutableList|toList|toSet|size|isEmpty|isNotEmpty|indices|forEachIndexed)\b)")
+
+
+def _is_member_resolution_site(block):
+    """Does this `memberEntryIds` block turn an id into something ABOUT the member?
+
+    The criterion grades 「resolved through one source」, so it only applies where a
+    resolution actually happens. A block that merely copies the id list
+    (`memberEntryIds.toMutableList()`) or counts its length has no resolution to
+    be wrong about, and grading it would force a meaningless SystemVoiceEntries
+    import into files that never look a member up.
+
+    Positive evidence only — a projection (`.model`), a lookup
+    (`find`/`firstOrNull`/`any`/`count`), a null-test on one, or an existing
+    single-source call. That keeps the criterion honest on the surfaces it is
+    registered for, all of which resolve members for DISPLAY."""
+    if _COLLECT_ONLY.match(block):
+        return False
+    display = any(tok in block for tok in _MEMBER_DISPLAY_SIGNALS)
+    if display:
+        return True
+    # Not about the member itself: a scalar roll-up, or a lookup that only
+    # feeds one. Grading it would force a SystemVoiceEntries import into
+    # arithmetic that must legitimately ignore System entries.
+    return False if any(tok in block for tok in _AGGREGATE_REDUCERS) else False
+
+
+def check_group_member_resolution(code):
+    """C34 [deep-audit-1043 B-06] — a group's member ids are resolved through
+    ONE source, so a System voice member is never silently dropped.
+
+    The bug: every reader of `ModelGroup.memberEntryIds` re-derived
+    "persisted entry, else the synthesized System entry". The readers that
+    remembered the fallback worked; the ones that did not resolved a System
+    member to null. A DEFAULT Voice Input/Output group contains ONLY System
+    sentinels (that is what makes it work with zero configuration), so those
+    readers rendered it as 「No usable models」 in red, with no modality badges,
+    an empty member preview and a 「0 models」 count. Five such readers existed
+    at once — the same decision re-derived five times, one of them wrong.
+
+    Graded as the DECISION — "every member-resolution site consults the System
+    source" — per site, not per file. Both accepted spellings qualify:
+      - `SystemVoiceEntries.resolveIn(entries, id)`  (what the fix uses), and
+      - `entries.find { it.id == id } ?: SystemVoiceEntries.resolve(id)`
+        (what the already-correct readers do).
+    A `memberEntryIds` block with no SystemVoiceEntries reference at all is the
+    defect, whichever spelling the rest of the file uses.
+
+    Fail-closed: a surface that no longer reads `memberEntryIds` means the
+    structure was reworked — RED, re-derive the criterion."""
+    if "memberEntryIds" not in code:
+        return [("C34", False,
+                 "this surface no longer reads `memberEntryIds` — fail-closed, "
+                 "re-derive this criterion instead of letting it pass vacuously")]
+    bad = []
+    sites = 0
+    skipped = 0
+    pos = code.find("memberEntryIds")
+    while pos >= 0:
+        site_pos = pos
+        block = _member_block(code, site_pos)
+        pos = code.find("memberEntryIds", site_pos + 1)
+        if not _is_member_resolution_site(block):
+            skipped += 1
+            continue
+        sites += 1
+        if "SystemVoiceEntries." not in block:
+            bad.append(code.count("\n", 0, site_pos) + 1)
+    if not sites:
+        # Reads member ids, but only feeds a per-member scalar roll-up (a max
+        # thinking level, a token window …). System voice entries are real
+        # members but have no such attribute, so skipping them there is the
+        # correct behaviour, not a dropped member.
+        return [("C34", True,
+                 "reads `memberEntryIds` but performs no member resolution "
+                 "(%d aggregate-only site(s)) — nothing to grade" % skipped)]
+    return [("C34", not bad,
+             "%d member-resolution site(s), all consult the System single source "
+             "(%d aggregate-only site(s) out of scope)"
+             % (sites, skipped) if not bad else
+             "member-resolution without the System fallback at line(s) %s — a System "
+             "voice member resolves to null there, so a default Voice group renders "
+             "empty / 「No usable models」" % ", ".join(str(x) for x in bad))]
+
+
 def check_capability_single_source(code):
     """C33 [dv22/B-03] — capability is read from the effective model, one exit.
 
@@ -1987,6 +2191,12 @@ CHECKERS = (
     (REL_ENTRY_DETAIL, check_capability_single_source),
     (REL_QUICK_TEST, check_capability_single_source),
     (REL_CHAT_SCREEN, check_capability_single_source),
+    # dv23-B6 — the group surfaces render member modalities/names too
+    (REL_MODEL_GROUPS, check_capability_single_source),
+    # dv23-B6 (C34) — group members resolve through ONE source
+    (REL_MODEL_GROUPS, check_group_member_resolution),
+    (REL_AGENT_LOOP_MODELS, check_group_member_resolution),
+    (REL_AGENT_LOOP_SHEETS, check_group_member_resolution),
 )
 
 
@@ -2537,6 +2747,22 @@ fun UsageStatsScreen(chatDao: ChatDao, providerConfig: ProviderConfig? = null) {
 }
 """
 
+def _replace_exactly(src, old, new, count=1):
+    """`src.replace` that REFUSES to no-op.
+
+    A fixture built by mutating a clean sample is only a test while the mutation
+    lands: when the sample is reworked the `old` string disappears, `.replace`
+    returns the clean text unchanged, and the fixture quietly becomes "the clean
+    sample must be green" — an arm that has stopped testing anything yet can
+    never fail. Same class of self-injury as the probe that mutates a file path
+    no longer present. Callers get an exception at import time instead."""
+    if src.count(old) != count:
+        raise AssertionError(
+            "fixture drift: expected %d occurrence(s) of %r, found %d — the clean "
+            "sample was reworked, re-derive this fixture" % (count, old, src.count(old)))
+    return src.replace(old, new)
+
+
 # --- da1028-C fixtures: ThinkingRulesSection derived keys ------------------
 
 FIX_THINKING_CLEAN = """package com.rikkaminis.app.ui.settings
@@ -2550,14 +2776,25 @@ fun ThinkingRulesSection(
     var reloadKey by remember { mutableStateOf(0) }
     var defaultsExpanded by remember { mutableStateOf(false) }
     val rulesRevision by ThinkingRuleResolver.customRulesRevision.collectAsState()
-    val customRulesAndIds = remember(instance.id, reloadKey, rulesRevision) {
-        providerRepository.thinkingRulesWithIds(instance.id)
+    var customRulesAndIds by remember { mutableStateOf(emptyList<ThinkingRule>() to emptyList<String>()) }
+    var rulesLoaded by remember(instance.id) { mutableStateOf(false) }
+    LaunchedEffect(instance.id, reloadKey, rulesRevision) {
+        customRulesAndIds = withContext(Dispatchers.IO) {
+            providerRepository.thinkingRulesWithIds(instance.id)
+        }
+        rulesLoaded = true
     }
-    val builtIns = remember(instance.id, instance.customBaseURL, instance.appendV1Suffix, modelEntries, reloadKey) {
-        providerRepository.builtInThinkingRulesForDisplay(instance.id)
+    var builtIns by remember { mutableStateOf(emptyList<ThinkingRule>()) }
+    LaunchedEffect(instance.id, instance.customBaseURL, instance.appendV1Suffix, modelEntries, reloadKey) {
+        builtIns = withContext(Dispatchers.IO) {
+            providerRepository.builtInThinkingRulesForDisplay(instance.id)
+        }
     }
-    val sampleModelId = remember(instance.id, modelEntries, reloadKey) {
-        providerRepository.firstModelId(instance.id)
+    var sampleModelId by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(instance.id, modelEntries, reloadKey) {
+        sampleModelId = withContext(Dispatchers.IO) {
+            providerRepository.firstModelId(instance.id)
+        }
     }
     // da1033-I07: the dialog edits the LIVE rule, not the tapped snapshot.
     val editorLiveIndex = editorRequest?.existingId?.let { customIds.indexOf(it) } ?: -1
@@ -2592,21 +2829,33 @@ fun ThinkingRulesSection(
 }
 """
 
-FIX_THINKING_NO_BASEURL_KEY = FIX_THINKING_CLEAN.replace(
-    "remember(instance.id, instance.customBaseURL, instance.appendV1Suffix, modelEntries, reloadKey)",
-    "remember(instance.id, instance.appendV1Suffix, modelEntries, reloadKey)")
+# The built-in / preview derivations moved onto producer effects with B-02, so
+# these four fixtures mutate the EFFECT key list now. All four go through
+# `_replace_exactly`: a silent no-op here would turn each arm into "the clean
+# sample is green" and would never fail again (the C11a/C11b variant of it bit
+# this very edit — selftest caught all four at once).
+FIX_THINKING_NO_BASEURL_KEY = _replace_exactly(
+    FIX_THINKING_CLEAN,
+    "LaunchedEffect(instance.id, instance.customBaseURL, instance.appendV1Suffix, modelEntries, reloadKey) {",
+    "LaunchedEffect(instance.id, instance.appendV1Suffix, modelEntries, reloadKey) {")
 
-FIX_THINKING_BUILTINS_NO_MODEL_ENTRIES = FIX_THINKING_CLEAN.replace(
-    "remember(instance.id, instance.customBaseURL, instance.appendV1Suffix, modelEntries, reloadKey)",
-    "remember(instance.id, instance.customBaseURL, instance.appendV1Suffix, reloadKey)")
+FIX_THINKING_BUILTINS_NO_MODEL_ENTRIES = _replace_exactly(
+    FIX_THINKING_CLEAN,
+    "LaunchedEffect(instance.id, instance.customBaseURL, instance.appendV1Suffix, modelEntries, reloadKey) {",
+    "LaunchedEffect(instance.id, instance.customBaseURL, instance.appendV1Suffix, reloadKey) {")
 
-FIX_THINKING_SAMPLE_NO_MODEL_ENTRIES = FIX_THINKING_CLEAN.replace(
-    "remember(instance.id, modelEntries, reloadKey) {\n        providerRepository.firstModelId(instance.id)",
-    "remember(instance.id, reloadKey) {\n        providerRepository.firstModelId(instance.id)")
+FIX_THINKING_SAMPLE_NO_MODEL_ENTRIES = _replace_exactly(
+    FIX_THINKING_CLEAN,
+    "LaunchedEffect(instance.id, modelEntries, reloadKey) {",
+    "LaunchedEffect(instance.id, reloadKey) {")
 
-FIX_THINKING_SAMPLE_KEYLESS = FIX_THINKING_CLEAN.replace(
-    "remember(instance.id, modelEntries, reloadKey) {\n        providerRepository.firstModelId(instance.id)",
-    "remember {\n        providerRepository.firstModelId(instance.id)")
+# Keyless is not reachable on a LaunchedEffect (its key list is the whole
+# argument), so the "cannot tell its sources apart" arm is now the SAME key list
+# with the source dropped — the effect still runs, but only once.
+FIX_THINKING_SAMPLE_KEYLESS = _replace_exactly(
+    FIX_THINKING_CLEAN,
+    "LaunchedEffect(instance.id, modelEntries, reloadKey) {",
+    "LaunchedEffect(Unit) {")
 
 FIX_THINKING_MISSING_ANCHOR = """package com.rikkaminis.app.ui.settings
 
@@ -2672,12 +2921,45 @@ FIX_THINKING_PRECISION_UNRELATED = FIX_THINKING_CLEAN.replace(
 
 # --- da1030-C ISSUE-05 fixtures: C12 / C13 --------------------------------
 
-FIX_THINKING_NO_REVISION_KEY = FIX_THINKING_CLEAN.replace(
-    "remember(instance.id, reloadKey, rulesRevision)",
-    "remember(instance.id, reloadKey)")
+# --- deep-audit-1043 B-02: the two new arms of C12 --------------------------
+# Arm (b) moved to the producer effect, so its negative fixture must move too —
+# a `.replace` aimed at the old `remember(instance.id, reloadKey, rulesRevision)`
+# would silently no-op (the string is gone) and the "missing revision key" arm
+# would be green without testing anything. The assert below is what catches
+# that class of drift.
+FIX_THINKING_NO_REVISION_KEY = _replace_exactly(
+    FIX_THINKING_CLEAN,
+    "LaunchedEffect(instance.id, reloadKey, rulesRevision) {",
+    "LaunchedEffect(instance.id, reloadKey) {")
 
 FIX_THINKING_NO_SUBSCRIPTION = FIX_THINKING_CLEAN.replace(
     "    val rulesRevision by ThinkingRuleResolver.customRulesRevision.collectAsState()\n", "")
+
+# Arm (c): back to the pre-fix carrier — keyed correctly, still blocking. Only
+# C12 may move; C11a/C11b stay green because the other two effects are intact.
+FIX_THINKING_SYNC_LOADER = _replace_exactly(
+    FIX_THINKING_CLEAN,
+    """    var customRulesAndIds by remember { mutableStateOf(emptyList<ThinkingRule>() to emptyList<String>()) }
+    var rulesLoaded by remember(instance.id) { mutableStateOf(false) }
+    LaunchedEffect(instance.id, reloadKey, rulesRevision) {
+        customRulesAndIds = withContext(Dispatchers.IO) {
+            providerRepository.thinkingRulesWithIds(instance.id)
+        }
+        rulesLoaded = true
+    }""",
+    """    val customRulesAndIds = remember(instance.id, reloadKey, rulesRevision) {
+        providerRepository.thinkingRulesWithIds(instance.id)
+    }
+    val rulesLoaded = true""")
+
+# Arm (c), second spelling: the effect exists and is keyed, but the read is
+# inline. Catches "someone moved the call into the effect and forgot the hop".
+FIX_THINKING_NO_IO_HOP = _replace_exactly(
+    FIX_THINKING_CLEAN,
+    """        customRulesAndIds = withContext(Dispatchers.IO) {
+            providerRepository.thinkingRulesWithIds(instance.id)
+        }""",
+    "        customRulesAndIds = providerRepository.thinkingRulesWithIds(instance.id)")
 
 FIX_THINKING_RESOLVER_CLEAN = """package com.rikkaminis.app.provider.thinking
 
@@ -2954,6 +3236,13 @@ fun AddModelsToGroupScreen(modalityFilter: PickerModalityFilter? = null) {
 
 FIX_AGENT_LOOP_SHEETS_CLEAN = """package com.rikkaminis.app.ui.settings
 
+private fun memberNames(config: ProviderConfig): List<String> =
+    config.groups.flatMap { group ->
+        group.memberEntryIds.mapNotNull { id ->
+            SystemVoiceEntries.resolveIn(config.modelEntries, id)?.model?.displayName
+        }
+    }
+
 @Composable
 fun AgentLoopGroupsSheet(config: ProviderConfig) {
     val collapsedInstanceIds = rememberCollapsedInstanceIds(config)
@@ -2968,6 +3257,61 @@ fun AgentLoopGroupsSheet(config: ProviderConfig) {
     quickTestEntry?.let { entry ->
         QuickTestSheet(entry = entry, onDismiss = { quickTestEntryId = null })
     }
+}
+"""
+
+FIX_MODEL_GROUPS_CLEAN = """package com.rikkaminis.app.ui.settings
+
+@Composable
+fun ModelGroupsScreen(config: ProviderConfig) {
+    config.groups.forEach { group ->
+        GroupRow(
+            names = memberNames(config, group),
+            badges = modalityBadges(ModelsDevApi.effectiveModel(config.modelEntries.first())),
+        )
+    }
+}
+
+private fun memberNames(config: ProviderConfig, group: ModelGroup): List<String> =
+    group.memberEntryIds.mapNotNull { id ->
+        SystemVoiceEntries.resolveIn(config.modelEntries, id)?.model?.displayName
+    }
+"""
+
+# C34 teeth: the defect spelling — resolution that never consults the System source
+FIX_MODEL_GROUPS_UNRESOLVED = FIX_MODEL_GROUPS_CLEAN.replace(
+    "SystemVoiceEntries.resolveIn(config.modelEntries, id)?.model?.displayName",
+    "config.modelEntries.find { it.id == id }?.model?.displayName")
+
+# C34 fail-closed: the group surface no longer reads member ids at all
+FIX_MODEL_GROUPS_NO_MEMBER_READ = """package com.rikkaminis.app.ui.settings
+
+@Composable
+fun ModelGroupsScreen(config: ProviderConfig) {
+    config.groups.forEach { group -> GroupRow(name = group.name) }
+}
+"""
+
+# C34 must NOT grade a pure numeric aggregate: System entries have no thinking
+# level, so excluding them from a max-thinking roll-up is CORRECT behaviour.
+FIX_MODEL_GROUPS_AGGREGATE_ONLY = """package com.rikkaminis.app.ui.settings
+
+internal fun groupMaxThinkingLevel(group: ModelGroup, entries: List<ModelEntry>): ThinkingLevel? =
+    group.memberEntryIds
+        .mapNotNull { id -> entries.find { it.id == id }?.effectiveMaxThinkingLevel }
+        .minByOrNull { it.level }
+"""
+
+FIX_AGENT_LOOP_MODELS_CLEAN = """package com.rikkaminis.app.ui.settings
+
+@Composable
+fun AgentLoopModelsScreen(config: ProviderConfig) {
+    val resolvedCount = remember(config) {
+        config.groups.sumOf { group ->
+            group.memberEntryIds.count { SystemVoiceEntries.isEnabledGroupMember(config.modelEntries, it) }
+        }
+    }
+    Text("$resolvedCount models")
 }
 """
 
@@ -3245,6 +3589,8 @@ CLEAN_TREE = {
     REL_BACKUP_SCREEN: FIX_BACKUP_CLEAN,
     REL_ADD_MODELS: FIX_ADD_MODELS_CLEAN,
     REL_AGENT_LOOP_SHEETS: FIX_AGENT_LOOP_SHEETS_CLEAN,
+    REL_AGENT_LOOP_MODELS: FIX_AGENT_LOOP_MODELS_CLEAN,
+    REL_MODEL_GROUPS: FIX_MODEL_GROUPS_CLEAN,
     REL_MODEL_ENTRY_PICKER: FIX_MODEL_ENTRY_PICKER_CLEAN,
     REL_MODEL_PICKER_SHEET: FIX_MODEL_PICKER_SHEET_CLEAN,
     REL_ADD_CUSTOM_MODEL: FIX_ADD_CUSTOM_MODEL_CLEAN,
@@ -3343,6 +3689,13 @@ def run_selftest():
              variant(REL_QUICK_TEST, FIX_QUICK_TEST_NO_SOURCE), failures, ("C33",))
     run_case("c33-nontext-label-raw", 1,
              variant(REL_CHAT_SCREEN, FIX_CHAT_SCREEN_RAW_LABEL), failures, ("C33",))
+    # --- dv23-B6: C34 (group members resolve through ONE source) ----------
+    run_case("c34-member-unresolved", 1,
+             variant(REL_MODEL_GROUPS, FIX_MODEL_GROUPS_UNRESOLVED), failures, ("C34",))
+    run_case("c34-member-resolution-site-gone", 1,
+             variant(REL_MODEL_GROUPS, FIX_MODEL_GROUPS_NO_MEMBER_READ), failures, ("C34",))
+    run_case("c34-aggregate-only-out-of-scope", 0,
+             variant(REL_MODEL_GROUPS, FIX_MODEL_GROUPS_AGGREGATE_ONLY), failures)
 
     # --- da1026-C: C5 (connection screen) ---------------------------------
     run_case("c5-conn-no-baseurl-key", 1,
@@ -3427,6 +3780,11 @@ def run_selftest():
     # --- da1030-C: C12 (external rule writes must re-key the loader) -------
     run_case("c12-loader-no-revision-key", 1,
              variant(REL_THINKING_SECTION, FIX_THINKING_NO_REVISION_KEY), failures, ("C12",))
+    # deep-audit-1043 B-02 — arm (c): the loader must leave the composition thread.
+    run_case("c12-sync-loader-in-remember", 1,
+             variant(REL_THINKING_SECTION, FIX_THINKING_SYNC_LOADER), failures, ("C12",))
+    run_case("c12-loader-without-io-hop", 1,
+             variant(REL_THINKING_SECTION, FIX_THINKING_NO_IO_HOP), failures, ("C12",))
     run_case("c12-no-revision-subscription", 1,
              variant(REL_THINKING_SECTION, FIX_THINKING_NO_SUBSCRIPTION), failures, ("C12",))
     # --- da1030-C: C13 (every mutator bumps the revision) ------------------
