@@ -77,6 +77,10 @@ internal class TarCreateOutcome : EntryBudget {
  * symlink is counted in [TarCreateOutcome.skippedSpecial] with up to
  * [MAX_REPORTED_SKIPS] names, so an archive that quietly lacks a device node
  * says so.
+ *
+ * The entry budget covers the top-level roots too: once [TarCreateOutcome.visited]
+ * reaches [maxEntries] no further root is written and
+ * [TarCreateOutcome.truncated] is set — a root list is a walk like any other.
  */
 internal fun tarCreate(
     sink: OutputStream,
@@ -86,6 +90,17 @@ internal fun tarCreate(
 ) {
     for ((path, memberPrefix) in roots) {
         val name = tarMemberName(memberPrefix)
+        // [dv22-A2 §1042-A-02] Budget gate, checked before anything this
+        // iteration can write. writeRegular / writeLink / writeTree all do
+        // their own `out.visited++` (writeTree via charge()), so the gate only
+        // COMPARES — charging here as well would count one entry twice and
+        // stop the walk at half the budget. Without the gate, roots after an
+        // exhausted one kept writing past maxEntries with `truncated` never
+        // set, so the handler reported a complete archive.
+        if (out.visited >= maxEntries) {
+            out.truncated = true
+            break
+        }
         if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
             out.errors.add("$memberPrefix: not found")
             continue
@@ -95,11 +110,22 @@ internal fun tarCreate(
             continue
         }
         if (!Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS)) {
+            // [dv22-A2 §1042-A-02] A top-level FIFO/socket/device is counted,
+            // never read: writeRegular would open it with newInputStream, and a
+            // FIFO with no writer blocks the worker thread forever. Mirrors the
+            // writeTree child branch and the KDoc promise above.
+            if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
+                out.skippedSpecial++
+                if (out.skippedNames.size < MAX_REPORTED_SKIPS) out.skippedNames.add(name)
+                continue
+            }
             writeRegular(sink, name, path, out)
             continue
         }
         try {
-            writeTree(sink, path, name, path, maxEntries, out)
+            // [dv22-A2 §1042-A-02] writeTree returns false when the budget ran
+            // out mid-tree — the WHOLE traversal must stop, not just that tree.
+            if (!writeTree(sink, path, name, path, maxEntries, out)) break
         } catch (e: Exception) {
             out.errors.add("$memberPrefix: ${e.message}")
         }
