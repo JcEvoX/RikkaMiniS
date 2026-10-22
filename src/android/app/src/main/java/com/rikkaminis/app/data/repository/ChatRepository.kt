@@ -29,7 +29,8 @@ class ChatRepository(
     internal val dao: ChatDao,
     private val sessionFiles: SessionFileStore? = null,
     // [fix/da1021-A] Cross-db session cleanup hook. Invoked after the session
-    // row (and messages) are gone from both delete entry points, so
+    // row (and messages) are gone from EVERY delete entry point — user delete,
+    // row-only delete and (since dv21-a2) the startup empty-session sweep — so
     // session-scoped tables in OTHER repositories (skill / mcp
     // session_skill_overrides / mcp_session_overrides) are reaped with the
     // session. Those clearSessionOverrides functions existed with zero
@@ -316,7 +317,34 @@ class ChatRepository(
     ): Int {
         val guarded = guardActiveIds(activeIds)
         val staleBefore = System.currentTimeMillis() - graceMillis
-        return dao.deleteEmptySessions(guarded, staleBefore)
+        // [dv21-a2] Third delete entry point, same contract. This sweep drops
+        // `sessions` rows, so each removed id owes the cross-db cleanup that
+        // deleteSession / deleteSessionRowOnly already run — it used to be the
+        // one entry point that skipped `onSessionDeleted`, which left the
+        // skills.db / mcp.db session overrides, the session-list badge and the
+        // session-scoped offload grants behind for whatever session later
+        // reused the id (and the hook KDoc in MinisApp already claimed the
+        // sweep was covered).
+        //
+        // Order: snapshot the candidate ids (same guards) → DELETE (its guards
+        // still apply inside the statement, so no row that acquired a message
+        // is removed) → notify only the candidates that are really gone. A
+        // candidate that survived means a first message landed in the window:
+        // notifying it would reap a live session's overrides.
+        val candidates = dao.selectEmptySessionIds(guarded, staleBefore)
+        val deleted = dao.deleteEmptySessions(guarded, staleBefore)
+        if (candidates.isEmpty()) return deleted
+        val survivors = dao.existingSessionIds(candidates).toSet()
+        for (id in candidates) {
+            if (id in survivors) continue
+            runCatching { onSessionDeleted?.invoke(id) }.onFailure {
+                AppLogger.warning(
+                    "ChatRepository",
+                    "onSessionDeleted($id) cleanup failed (empty sweep): ${it.message}",
+                )
+            }
+        }
+        return deleted
     }
 
     suspend fun searchSessions(query: String): List<ChatSessionEntity> =
