@@ -36,6 +36,17 @@ BLOCKING_IO_CALLS for the table and `check_blocking_io` for what "inside" means.
 `onClick` — once inline, once inside a `viewModelScope.launch` whose
 `Main.immediate` body ran it on the click thread anyway.
 
+Criterion 10 (deep-audit-1041 B-02): the three rootfs lifecycle entry points
+(`install` / `resetRootfs` / `repairRootfs`) must each settle their failure arms
+through the shared terminal that re-reads the manager (`refresh`) — `reset()`
+deletes the rootfs directory BEFORE re-installing and `autoRepair()`'s last
+stage is that same reset, so a throw mid-extract left `isInstalled` at its
+pre-operation `true` and the screen kept offering a rootfs that no longer
+existed. `refresh` itself must zero the size of a rootfs that is gone, and
+`repairRootfs` must subscribe to install progress like its two siblings (it
+published `installProgress = 0f` and then left the bar frozen for a full
+Stage-3 re-extract).
+
 Usage: python3 scripts/scan/readonly_mount_write_guard.py [repo_root]
        python3 scripts/scan/readonly_mount_write_guard.py --selftest
 Exit:  0 = every site guarded (or exempt with evidence), 1 = unguarded site
@@ -857,6 +868,95 @@ def check_guard_call_shape(root):
 
 
 # ── selftest ────────────────────────────────────────────────────────────────
+# ── criterion-10 fixture (deep-audit-1041 B-02) ──────────────────────────
+
+def _rootfs_settlement(arms="settled", size="zeroed", repair_subscribes=True):
+    """The B-02 subject: three lifecycle entry points, one failure terminal.
+
+    [arms] settled — every `catch` delegates to the terminal (the shape the fix
+    ships); direct — each `catch` re-inlines the state copy and stops there,
+    which is the pre-fix shape the criterion exists to catch.
+    [size] zeroed — `refresh` decides the size on the manager's verdict;
+    missing — no decision at all; inside_branch — the zeroing is placed in the
+    installed-only branch (the "must not introduce" shape).
+    [repair_subscribes] False drops `repairRootfs`'s subscription, the third leg
+    of the same defect (the bar froze at 0% for a full Stage-3 re-extract).
+    """
+    if size == "zeroed":
+        decision = (
+            "            rootfsSize = if (manager.isInstalled) _uiState.value.rootfsSize "
+            "else 0L,\n"
+        )
+        # The installed arm is the async size read that used to be the only way
+        # the field ever changed.
+        inner = (
+            "            viewModelScope.launch {\n"
+            "                _uiState.value = _uiState.value.copy("
+            "rootfsSize = manager.getRootfsSize())\n"
+            "            }\n"
+        )
+    elif size == "inside_branch":
+        decision = ""
+        inner = "            _uiState.value = _uiState.value.copy(rootfsSize = 0L)\n"
+    else:  # missing
+        decision = ""
+        inner = ""
+
+    def entry(fn, tag, result, message_ints):
+        subscribes = not (fn == "repairRootfs" and not repair_subscribes)
+        head = "        observeInstallProgress(manager, ctx)\n" if subscribes else ""
+        if arms == "settled":
+            fail = '            settleRootfsFailure(ctx, "%s", %d, e)\n' % (tag, message_ints)
+        else:
+            fail = (
+                '            logging.log("%s failed")\n'
+                "            _uiState.value = _uiState.value.copy(\n"
+                "                isProcessing = false,\n"
+                "                lastOperationSuccess = false,\n"
+                '                resultMessage = "failed",\n'
+                "                installProgress = null,\n"
+                "            )\n"
+            ) % tag
+        return (
+            "    fun %s(ctx: Ctx) {\n" % fn
+            + head
+            + "        try {\n"
+            + "            manager.%s()\n" % tag
+            + "            refresh(ctx)\n"
+            + "        } catch (e: Exception) {\n"
+            + fail
+            + "        }\n"
+            + "    }\n"
+            + "\n"
+        )
+
+    return (
+        "    fun refresh(ctx: Ctx) {\n"
+        "        _uiState.value = _uiState.value.copy(\n"
+        "            isInstalled = manager.isInstalled,\n"
+        + decision +
+        "        )\n"
+        "        if (manager.isInstalled) {\n"
+        + inner +
+        "        }\n"
+        "    }\n"
+        "\n"
+        "    private fun observeInstallProgress(manager: RootfsManager, ctx: Ctx) {\n"
+        "        progressJob?.cancel()\n"
+        "    }\n"
+        "\n"
+        "    private fun settleRootfsFailure(ctx: Ctx, tag: String, res: Int, e: Exception) {\n"
+        "        logging.log(tag)\n"
+        "        _uiState.value = rootfsFailureState(_uiState.value, ctx.getString(res))\n"
+        "        refresh(ctx)\n"
+        "    }\n"
+        "\n"
+        + entry("install", "install", 1, 1)
+        + entry("resetRootfs", "reset", 2, 2)
+        + entry("repairRootfs", "autoRepair", 3, 3)
+    )
+
+
 
 FILLER_GUARD = "isLinuxPathUnderReadOnlyMount("
 
@@ -1005,7 +1105,7 @@ def _app_logger():
 ROOTFS_BODIES = {
     # the shape FIX-D ships: both reads inside `withContext(Dispatchers.IO) { … }`
     "io": (
-        "    fun repairRootfs(ctx: Ctx) {\n"
+        "    fun verifyRootfsOnCall(ctx: Ctx) {\n"
         "        val manager = RootfsManager.getInstance(ctx)\n"
         "        viewModelScope.launch {\n"
         "            val initial = withContext(Dispatchers.IO) {\n"
@@ -1019,7 +1119,7 @@ ROOTFS_BODIES = {
     ),
     # pre-fix shape (live until deep-audit-1027): the first read on the click thread
     "direct": (
-        "    fun repairRootfs(ctx: Ctx) {\n"
+        "    fun verifyRootfsOnCall(ctx: Ctx) {\n"
         "        val manager = RootfsManager.getInstance(ctx)\n"
         "        val initial = manager.verifyIntegrity()\n"
         "        if (initial.healthy) return\n"
@@ -1031,7 +1131,7 @@ ROOTFS_BODIES = {
     # the second read left inside `viewModelScope.launch`: Main.immediate is not an
     # IO hop, so the read still runs on the click thread
     "launch_only": (
-        "    fun repairRootfs(ctx: Ctx) {\n"
+        "    fun verifyRootfsOnCall(ctx: Ctx) {\n"
         "        val manager = RootfsManager.getInstance(ctx)\n"
         "        withContext(Dispatchers.IO) { manager.verifyIntegrity() }\n"
         "        viewModelScope.launch {\n"
@@ -1041,7 +1141,7 @@ ROOTFS_BODIES = {
     ),
     # correct at runtime, wrong shape (`withContext(IO) expr`) — fail-closed
     "inline_io": (
-        "    fun repairRootfs(ctx: Ctx) {\n"
+        "    fun verifyRootfsOnCall(ctx: Ctx) {\n"
         "        val manager = RootfsManager.getInstance(ctx)\n"
         "        val initial = withContext(Dispatchers.IO) manager.verifyIntegrity()\n"
         "    }\n"
@@ -1049,7 +1149,7 @@ ROOTFS_BODIES = {
 }
 
 
-def _rootfs_vm(shape="io", verdict_shape="derived"):
+def _rootfs_vm(shape="io", verdict_shape="derived", settlement_shape="settled"):
     return (
         "package com.rikkaminis.app.ui.sandbox\n"
         "\n"
@@ -1058,9 +1158,22 @@ def _rootfs_vm(shape="io", verdict_shape="derived"):
         "import kotlinx.coroutines.withContext\n"
         "\n"
         "class RootfsManagementViewModel {\n"
-        + ROOTFS_BODIES[shape] + VERDICT_BODIES[verdict_shape] +
+        + ROOTFS_BODIES[shape] + VERDICT_BODIES[verdict_shape]
+        + ROOTFS_SETTLEMENT_BODIES[settlement_shape] +
         "}\n"
     )
+
+# [deep-audit-1041 B-02] Third axis on the same file. `_rootfs_settlement`
+# declares the three lifecycle entry points, so criterion 2's subject had to
+# stop calling itself `repairRootfs` (one definition per name in a fixture that
+# is read as source).
+ROOTFS_SETTLEMENT_BODIES = {
+    "settled": _rootfs_settlement(),
+    "catch_without_refresh": _rootfs_settlement(arms="direct"),
+    "size_not_zeroed": _rootfs_settlement(size="missing"),
+    "size_zeroed_inside_branch": _rootfs_settlement(size="inside_branch"),
+    "no_repair_subscription": _rootfs_settlement(repair_subscribes=False),
+}
 
 # [dv20-A4-B03] `ROOTFS_BODIES` varies the blocking-IO decision; the *verdict*
 # decision is a second, orthogonal axis. Every shape carries the derived verdict
@@ -1840,6 +1953,162 @@ def check_rootfs_verdict(root):
         )
     return violations, rot, sites, notes
 
+# ── criterion 10 (deep-audit-1041 B-02): the rootfs failure terminal ────────
+#
+# `install` / `resetRootfs` / `repairRootfs` all end their SUCCESS path with
+# `refresh(ctx)`; the `catch` arms used to stop at the state copy. That is only
+# enough when the failed operation left the rootfs alone — and none of them is:
+# `RootfsManager.reset()` deletes the directory BEFORE re-installing and
+# `autoRepair()`'s Stage 3 is that same reset, so a throw mid-extract left the
+# screen rendering a rootfs that no longer existed (green "Installed", the
+# "Install" button hidden behind `if (!isInstalled)`).
+#
+# The subject is the DECISION ("what must the failure arm re-read"), not the
+# spelling: a `catch` passes when it reaches `refresh()`, directly or through a
+# helper declared in the same file that reaches it — so a delegation is fine
+# and a rename is not a silent pass. Anchoring instead on "refresh() appears
+# somewhere in the function" would be satisfied by the success path, which is
+# exactly the shape that shipped the defect.
+ROOTFS_LIFECYCLE = ("install", "resetRootfs", "repairRootfs")
+REFRESH_DEF = re.compile(r"\bfun\s+refresh\s*\(")
+OBSERVE_PROGRESS_DEF = re.compile(r"\bfun\s+observeInstallProgress\s*\(")
+CATCH_HEAD = re.compile(r"\bcatch\s*\([^)]*\)\s*\{")
+# refresh decides the size from the manager's own verdict: either the decision
+# is taken inline (`if (…isInstalled…) old else 0L`) or the not-installed arm is
+# handled outright (`rootfsSize = 0L`).
+SIZE_ZEROING = re.compile(
+    r"rootfsSize\s*=\s*if\s*\([^)]*isInstalled[^)]*\)[^,\n]*\belse\s+0L?\b"
+    r"|rootfsSize\s*=\s*0L?\b"
+)
+INSTALLED_BRANCH = re.compile(r"if\s*\([^)]*isInstalled[^)]*\)\s*\{")
+
+
+def check_rootfs_failure_settlement(root):
+    """(violations, rot, sites, notes) — criterion 10 (B-02)."""
+    violations, rot, notes = [], [], []
+    path = os.path.join(root, APP_REL, *ROOTFS_VM_REL.split("/"))
+    pkg = os.path.dirname(path)
+    if not os.path.isfile(path):
+        if os.path.isdir(pkg) and os.listdir(pkg):
+            rot.append(
+                "%s lost its anchor (the ui/sandbox package is there, the file is not)"
+                % ROOTFS_VM_REL
+            )
+        else:
+            notes.append(
+                "[PARTIAL] the rootfs failure-terminal anchor — this tree never shipped %s"
+                % ROOTFS_VM_REL
+            )
+        return violations, rot, 0, notes
+
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        text = strip_comments(fh.read())
+
+    if not REFRESH_DEF.search(text):
+        rot.append(
+            "%s: no `fun refresh(` left — the failure terminal has nothing to converge on"
+            % ROOTFS_VM_REL
+        )
+        return violations, rot, 0, notes
+    if not OBSERVE_PROGRESS_DEF.search(text):
+        rot.append(
+            "%s: no `fun observeInstallProgress(` left — the progress-subscription "
+            "contract lost its subject" % ROOTFS_VM_REL
+        )
+        return violations, rot, 0, notes
+
+    bodies = {}
+    for name, _params, body in functions(text):
+        bodies.setdefault(name, body)
+
+    # Names whose body reaches refresh(), closed transitively: an arm may
+    # delegate, but the delegation has to land somewhere.
+    reaches = {name for name, body in bodies.items() if "refresh(" in body}
+    growing = True
+    while growing:
+        growing = False
+        for name, body in bodies.items():
+            if name in reaches:
+                continue
+            if any(re.search(r"\b%s\s*\(" % re.escape(n), body) for n in reaches):
+                reaches.add(name)
+                growing = True
+
+    sites = 0
+    for fn in ROOTFS_LIFECYCLE:
+        body = bodies.get(fn)
+        if body is None:
+            rot.append(
+                "%s: no `fun %s(` — the lifecycle entry points moved" % (ROOTFS_VM_REL, fn)
+            )
+            continue
+        arms = []
+        broken = False
+        for m in CATCH_HEAD.finditer(body):
+            open_idx = body.find("{", m.start(), m.end())
+            end = balanced_block(body, open_idx) if open_idx >= 0 else -1
+            if end < 0:
+                rot.append("%s:%s — unbalanced failure arm" % (ROOTFS_VM_REL, fn))
+                broken = True
+                break
+            arms.append(body[open_idx:end])
+        if broken:
+            continue
+        if not arms:
+            rot.append(
+                "%s:%s — no failure arm to check (the criterion would pass by looking "
+                "at nothing)" % (ROOTFS_VM_REL, fn)
+            )
+            continue
+        for arm in arms:
+            sites += 1
+            if "refresh(" in arm:
+                continue
+            if any(re.search(r"\b%s\s*\(" % re.escape(n), arm) for n in reaches):
+                continue
+            violations.append(
+                "%s:%s — the failure arm updates the UI state but never re-reads the "
+                "manager (no reachable refresh()): after a reset/repair that already "
+                "deleted the rootfs the screen keeps rendering 'Installed' with the "
+                "Install button hidden" % (ROOTFS_VM_REL, fn)
+            )
+
+    refresh_body = bodies.get("refresh", "")
+    sites += 1
+    zeroings = list(SIZE_ZEROING.finditer(refresh_body))
+    if not zeroings:
+        violations.append(
+            "%s:refresh — the size of a rootfs that is gone is never zeroed (the read "
+            "below it is guarded by isInstalled), so the previous figure outlives a "
+            "wipe and renders beside 'Not installed'" % ROOTFS_VM_REL
+        )
+    else:
+        guarded = []
+        for m in INSTALLED_BRANCH.finditer(refresh_body):
+            open_idx = refresh_body.find("{", m.start(), m.end())
+            end = balanced_block(refresh_body, open_idx) if open_idx >= 0 else -1
+            if end > 0:
+                guarded.append((open_idx, end))
+        for m in zeroings:
+            if any(s <= m.start() < e for s, e in guarded):
+                violations.append(
+                    "%s:refresh — the size is zeroed INSIDE the installed-only branch; an "
+                    "installed rootfs then flashes 0 before the async read refills it"
+                    % ROOTFS_VM_REL
+                )
+                break
+
+    repair = bodies.get("repairRootfs")
+    if repair is not None and "observeInstallProgress(" not in repair:
+        sites += 1
+        violations.append(
+            "%s:repairRootfs — sets installProgress = 0f without subscribing to "
+            "manager.installState, so the determinate bar freezes at 0%% for the whole "
+            "Stage-3 re-extract" % ROOTFS_VM_REL
+        )
+    return violations, rot, sites, notes
+
+
 
 def write_io_fixture(root, store_shape="io", log_shape="io", store_fn="probeWritable",
                      drop_store=False, drop_log=False, data_pkg=True, ui_pkg=True,
@@ -1849,7 +2118,8 @@ def write_io_fixture(root, store_shape="io", log_shape="io", store_fn="probeWrit
                      drop_guard_anchors=False,
                      onboarding_shape="io", add_model_shape="io", backup_shape="io",
                      provider_shape="clean", volume_shape="single",
-                     volume_mirror=False, verdict_shape="derived"):
+                     volume_mirror=False, verdict_shape="derived",
+                     settlement_shape="settled"):
     """A `com/rikkaminis/app` tree carrying both criterion-2 targets.
 
     [keep_pkgs_when_dropped] leaves an unrelated file in the package whose anchor
@@ -1882,7 +2152,7 @@ def write_io_fixture(root, store_shape="io", log_shape="io", store_fn="probeWrit
         files["share/ShareHost.kt"] = "package com.rikkaminis.app.share\n\nclass ShareHost\n"
     if not drop_rootfs:
         files["sandbox/RootfsManager.kt"] = _rootfs_manager()
-        files["ui/sandbox/RootfsManagementViewModel.kt"] = _rootfs_vm(rootfs_shape, verdict_shape)
+        files["ui/sandbox/RootfsManagementViewModel.kt"] = _rootfs_vm(rootfs_shape, verdict_shape, settlement_shape)
     elif keep_pkgs_when_dropped:
         files["ui/sandbox/OtherScreen.kt"] = (
             "package com.rikkaminis.app.ui.sandbox\n\nclass OtherScreen\n"
@@ -2069,6 +2339,18 @@ def selftest():
         "[PARTIAL]", provider_shape="never_shipped")
     run("the clean provider tree passes", False)
 
+    # ── criterion 10 (deep-audit-1041 B-02): the rootfs failure terminal ──
+    run("the three rootfs failure arms settling through refresh pass", False,
+        "rootfs failure arm(s) re-reading the manager on exit")
+    run("a failure arm that stops at the state copy is caught", True,
+        "never re-reads the manager", settlement_shape="catch_without_refresh")
+    run("refresh leaving the size of a wiped rootfs behind is caught", True,
+        "never zeroed", settlement_shape="size_not_zeroed")
+    run("zeroing the size inside the installed-only branch is caught", True,
+        "INSIDE the installed-only branch", settlement_shape="size_zeroed_inside_branch")
+    run("repairRootfs without the progress subscription is caught", True,
+        "without subscribing to manager.installState", settlement_shape="no_repair_subscription")
+
     print("=== readonly_mount_write_guard --selftest ===")
     failed = 0
     for name, ok, note in results:
@@ -2095,6 +2377,7 @@ def main():
     funnel_violations, funnel_rot, funnel_sites, funnel_notes = check_documents_provider_funnel(root)
     vol_violations, vol_rot, vol_sites, vol_notes = check_volume_root_single_source(root)
     verdict_violations, verdict_rot, verdict_sites, verdict_notes = check_rootfs_verdict(root)
+    set_violations, set_rot, set_sites, set_notes = check_rootfs_failure_settlement(root)
 
     rot = []
     if files < 20:
@@ -2108,13 +2391,14 @@ def main():
     rot += funnel_rot
     rot += vol_rot
     rot += verdict_rot
+    rot += set_rot
     if rot:
         print("ROT — the guard can no longer see what it is supposed to check:")
         for r in rot:
             print(f"  ✗ {r}")
         return 1
     for n in (io_notes + hop_notes + shape_notes + doc_notes
-              + funnel_notes + vol_notes + verdict_notes):
+              + funnel_notes + vol_notes + verdict_notes + set_notes):
         print(f"  {n}")
     if violations or io_violations:
         print("Unguarded host-file writes:")
@@ -2144,13 +2428,18 @@ def main():
         print("Rootfs outcomes claimed without consulting the manager's verdict:")
         for v in verdict_violations:
             print(f"  ✗ {v}")
+    if set_violations:
+        print("Rootfs failure arms that stop short of re-reading the manager:")
+        for v in set_violations:
+            print(f"  ✗ {v}")
     if (violations or io_violations or hop_violations or shape_violations or doc_violations
-            or funnel_violations or vol_violations or verdict_violations):
+            or funnel_violations or vol_violations or verdict_violations or set_violations):
         return 1
     print(f"OK: {checked} path-parameter write site(s) guarded ({files} files scanned)")
     print(f"    {io_sites} blocking-IO call site(s) inside Dispatchers.IO")
     print(f"    {vol_sites} volume-root definition(s), single source in {VOLUME_ROOT_STORE_REL}")
     print(f"    {verdict_sites} success claim(s) backed by the manager's verdict")
+    print(f"    {set_sites} rootfs failure arm(s) re-reading the manager on exit")
     print(f"    {funnel_sites} id->File funnel(s) judging the exposed top level")
     if hop_sites:
         print(f"    {hop_sites} share UI hand-off verified on a Looper thread")
