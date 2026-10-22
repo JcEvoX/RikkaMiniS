@@ -6,6 +6,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.os.Build
 import android.util.Log
+import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.sandbox.NativeOffloadHandler
 import com.rikkaminis.app.sandbox.NativeOffloadRequest
 import com.rikkaminis.app.sandbox.NativeOffloadResult
@@ -75,7 +76,7 @@ class ClipboardOffloadHandler(private val context: Context) : NativeOffloadHandl
             when (val sub = args.positional.firstOrNull() ?: "get") {
                 "get" -> doGet(cm, args)
                 "set" -> doSet(cm, args)
-                "clear" -> doClear(cm, args)
+                "clear" -> doClear(cm, args, request)
                 "status" -> doStatus(cm, args)
                 else -> NativeOffloadResult(2, "android-clipboard: unknown subcommand '$sub'\n$HELP")
             }
@@ -137,12 +138,17 @@ class ClipboardOffloadHandler(private val context: Context) : NativeOffloadHandl
         return NativeOffloadResult(0, OffloadOutput.formatBody(data.toString(2), args) + "\n")
     }
 
-    private fun doClear(cm: ClipboardManager, args: OffloadArgs): NativeOffloadResult {
+    private fun doClear(cm: ClipboardManager, args: OffloadArgs, request: NativeOffloadRequest): NativeOffloadResult {
         // [dv22-A6 A-06] the guard get/set/status use, verbatim: Android 10+
         // is the first release that restricts clipboard access from the
         // background, so a pre-Q background clear that used to work must not
         // be refused (the old bare `!isAppForeground()` did exactly that).
         if (!isAppForeground() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // The refusal is now the SAME refusal get/set/status give, and it
+            // is logged: a background clear used to "succeed" silently (the
+            // empty-string write was refused by the platform but the payload
+            // still said cleared = true), so the log is the only trace.
+            AppLogger.warning(TAG, "clear refused: background clipboard access on API ${Build.VERSION.SDK_INT} (pid ${request.pid})")
             return backgroundError(args)
         }
         when (clearAction(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)) {
