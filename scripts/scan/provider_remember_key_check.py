@@ -546,6 +546,22 @@ def iter_remember_calls(code, call="remember"):
     return out
 
 
+def derived_state_calls(code):
+    """Every keyed derived-state carrier: `remember(keys) { … }` plus the two
+    producer effects (`LaunchedEffect` / `produceState`).
+
+    [deep-audit-1043 B-02] A criterion about "which sources this value is
+    re-derived from" must not depend on WHICH carrier holds the derivation —
+    the same decision moved from `remember` to a producer effect when the read
+    became blocking I/O, and a gate anchored on the carrier would have to be
+    rewritten (or would red the fix) every time. Callers get the union, tagged
+    only by line number, and grade the key list exactly as before."""
+    out = list(iter_remember_calls(code, "remember"))
+    for effect in EFFECT_CALLS:
+        out.extend(iter_remember_calls(code, effect))
+    return sorted(out, key=lambda c: c[0])
+
+
 def call_args(code, pos):
     """Text between the parentheses of the call whose `(` is the first one at
     or after `pos`, or None if there is no balanced paren pair."""
@@ -913,53 +929,87 @@ def check_thinking_rules(code):
     mentioning a field is exactly what is under test, so grading the whole
     statement would be tautological. Keyless counts as a miss whenever the
     initializer is derived. Fail-closed: no remember whose initializer calls
-    the anchor callee means the section was reworked → RED."""
+    the anchor callee means the section was reworked → RED.
+
+    [deep-audit-1043 B-02] The two built-in/preview derivations moved out of the
+    composition (they are Room / config-load reads), so the keyed derivation now
+    lives on a PRODUCER EFFECT (LaunchedEffect / produceState) rather than on a
+    `remember` initializer. The DECISION under test is unchanged — "this value is
+    re-derived whenever its sources move" — so the criterion accepts either
+    carrier and grades the key list of whichever one performs the read. Anchoring
+    on `remember` alone here would be a spelling test that reds the fix."""
     results = []
     targets = (
         ("C11a", "builtInThinkingRulesForDisplay(",
          ("customBaseURL", "appendV1Suffix", "modelEntries"), "built-in rule list"),
         ("C11b", "firstModelId(", ("modelEntries",), "resolution-preview model id"),
     )
-    calls = iter_remember_calls(code, "remember")
+    calls = derived_state_calls(code)
     for cid, callee, required, label in targets:
         hits = [c for c in calls if callee in c[3]]
         if not hits:
             results.append((cid, False,
-                            "no `remember(...)` whose initializer calls %s (fail-closed: the %s "
-                            "call was reworked — re-derive this criterion)" % (callee, label)))
+                            "no `remember(...)`/producer effect whose initializer calls %s "
+                            "(fail-closed: the %s call was reworked — re-derive this criterion)"
+                            % (callee, label)))
             continue
         bad = []
         for line_no, keys, _span, _init in hits:
             if keys is None:
-                bad.append("L%d: keyless remember derives from %s" % (line_no, callee))
+                bad.append("L%d: keyless derivation reads %s" % (line_no, callee))
                 continue
             missing = [tok for tok in required if tok not in keys]
             if missing:
                 bad.append("L%d: keys=[%s] missing %s"
                            % (line_no, " ".join(keys.split()), ",".join(missing)))
         results.append((cid, not bad,
-                        "all %d %s remember call(s) key on %s"
+                        "all %d %s derivation(s) key on %s"
                         % (len(hits), label, " + ".join(required))
                         if not bad else "; ".join(bad)))
     # C12 [da1030-C ISSUE-05] — the loader must observe EXTERNAL rule writes.
+    # [deep-audit-1043 B-02] Same move as C11 (the loader is a Room read too), so
+    # the arm now has THREE parts instead of two:
+    #   (a) the section subscribes to `customRulesRevision` — without it a rule
+    #       written outside this screen is invisible;
+    #   (b) the custom-rule loader is keyed on (instance.id, reloadKey, revision);
+    #   (c) the loader runs OFF the composition thread — an IO hop inside a
+    #       producer effect, not a `remember` initializer. `thinkingRulesWithIds`
+    #       is `= runBlocking { dao.load… }`, so (c) is what keeps a SQLite round
+    #       trip out of the frame budget.
+    # Arm (c) is the new one; (a)/(b) are the original contract, deliberately
+    # preserved across the carrier change rather than re-derived.
     bad = []
     if not REVISION_SUB_RE.search(code):
         bad.append("no `customRulesRevision` → `collectAsState()` subscription (fail-closed: "
                    "the section cannot observe rules written outside this screen)")
     loader_hits = [c for c in calls if THINKING_LOADER_CALLEE in c[3]]
     if not loader_hits:
-        bad.append("no `remember(...)` whose initializer calls %s (fail-closed: the loader "
-                   "was reworked — re-derive this criterion)" % THINKING_LOADER_CALLEE)
-    for line_no, keys, _span, _init in loader_hits:
+        bad.append("no `remember(...)`/producer effect whose initializer calls %s "
+                   "(fail-closed: the loader was reworked — re-derive this criterion)"
+                   % THINKING_LOADER_CALLEE)
+    producers = []
+    for line_no, keys, _span, init in loader_hits:
         if keys is None:
-            bad.append("L%d: keyless remember loads the custom rules" % line_no)
+            bad.append("L%d: keyless derivation loads the custom rules" % line_no)
             continue
         if not any(tok in keys for tok in REVISION_KEY_TOKENS):
             bad.append("L%d: keys=[%s] missing the rules-revision key (%s)"
                        % (line_no, " ".join(keys.split()), " / ".join(REVISION_KEY_TOKENS)))
+        if IO_HOP_RE.search(init):
+            producers.append(line_no)
+    composition = [c[0] for c in iter_remember_calls(code, "remember")
+                   if THINKING_LOADER_CALLEE in c[3]]
+    if composition:
+        bad.append("the Room loader still runs in a `remember` initializer at line(s) %s — "
+                   "blocking SQLite I/O on the composition thread"
+                   % ", ".join(str(x) for x in composition))
+    if loader_hits and not producers:
+        bad.append("the loader is keyed correctly but never hops to an IO dispatcher — "
+                   "the Room read would still run on the composition thread")
     results.append(("C12", not bad,
-                    "section subscribes to customRulesRevision and keys the loader on it"
-                    if not bad else "; ".join(bad)))
+                    "section subscribes to customRulesRevision, keys the loader on it and "
+                    "loads it off the composition thread (L%s)"
+                    % ",".join(str(x) for x in producers) if not bad else "; ".join(bad)))
     return results
 
 def check_thinking_resolver(code):
@@ -2537,6 +2587,22 @@ fun UsageStatsScreen(chatDao: ChatDao, providerConfig: ProviderConfig? = null) {
 }
 """
 
+def _replace_exactly(src, old, new, count=1):
+    """`src.replace` that REFUSES to no-op.
+
+    A fixture built by mutating a clean sample is only a test while the mutation
+    lands: when the sample is reworked the `old` string disappears, `.replace`
+    returns the clean text unchanged, and the fixture quietly becomes "the clean
+    sample must be green" — an arm that has stopped testing anything yet can
+    never fail. Same class of self-injury as the probe that mutates a file path
+    no longer present. Callers get an exception at import time instead."""
+    if src.count(old) != count:
+        raise AssertionError(
+            "fixture drift: expected %d occurrence(s) of %r, found %d — the clean "
+            "sample was reworked, re-derive this fixture" % (count, old, src.count(old)))
+    return src.replace(old, new)
+
+
 # --- da1028-C fixtures: ThinkingRulesSection derived keys ------------------
 
 FIX_THINKING_CLEAN = """package com.rikkaminis.app.ui.settings
@@ -2550,14 +2616,25 @@ fun ThinkingRulesSection(
     var reloadKey by remember { mutableStateOf(0) }
     var defaultsExpanded by remember { mutableStateOf(false) }
     val rulesRevision by ThinkingRuleResolver.customRulesRevision.collectAsState()
-    val customRulesAndIds = remember(instance.id, reloadKey, rulesRevision) {
-        providerRepository.thinkingRulesWithIds(instance.id)
+    var customRulesAndIds by remember { mutableStateOf(emptyList<ThinkingRule>() to emptyList<String>()) }
+    var rulesLoaded by remember(instance.id) { mutableStateOf(false) }
+    LaunchedEffect(instance.id, reloadKey, rulesRevision) {
+        customRulesAndIds = withContext(Dispatchers.IO) {
+            providerRepository.thinkingRulesWithIds(instance.id)
+        }
+        rulesLoaded = true
     }
-    val builtIns = remember(instance.id, instance.customBaseURL, instance.appendV1Suffix, modelEntries, reloadKey) {
-        providerRepository.builtInThinkingRulesForDisplay(instance.id)
+    var builtIns by remember { mutableStateOf(emptyList<ThinkingRule>()) }
+    LaunchedEffect(instance.id, instance.customBaseURL, instance.appendV1Suffix, modelEntries, reloadKey) {
+        builtIns = withContext(Dispatchers.IO) {
+            providerRepository.builtInThinkingRulesForDisplay(instance.id)
+        }
     }
-    val sampleModelId = remember(instance.id, modelEntries, reloadKey) {
-        providerRepository.firstModelId(instance.id)
+    var sampleModelId by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(instance.id, modelEntries, reloadKey) {
+        sampleModelId = withContext(Dispatchers.IO) {
+            providerRepository.firstModelId(instance.id)
+        }
     }
     // da1033-I07: the dialog edits the LIVE rule, not the tapped snapshot.
     val editorLiveIndex = editorRequest?.existingId?.let { customIds.indexOf(it) } ?: -1
@@ -2592,21 +2669,33 @@ fun ThinkingRulesSection(
 }
 """
 
-FIX_THINKING_NO_BASEURL_KEY = FIX_THINKING_CLEAN.replace(
-    "remember(instance.id, instance.customBaseURL, instance.appendV1Suffix, modelEntries, reloadKey)",
-    "remember(instance.id, instance.appendV1Suffix, modelEntries, reloadKey)")
+# The built-in / preview derivations moved onto producer effects with B-02, so
+# these four fixtures mutate the EFFECT key list now. All four go through
+# `_replace_exactly`: a silent no-op here would turn each arm into "the clean
+# sample is green" and would never fail again (the C11a/C11b variant of it bit
+# this very edit — selftest caught all four at once).
+FIX_THINKING_NO_BASEURL_KEY = _replace_exactly(
+    FIX_THINKING_CLEAN,
+    "LaunchedEffect(instance.id, instance.customBaseURL, instance.appendV1Suffix, modelEntries, reloadKey) {",
+    "LaunchedEffect(instance.id, instance.appendV1Suffix, modelEntries, reloadKey) {")
 
-FIX_THINKING_BUILTINS_NO_MODEL_ENTRIES = FIX_THINKING_CLEAN.replace(
-    "remember(instance.id, instance.customBaseURL, instance.appendV1Suffix, modelEntries, reloadKey)",
-    "remember(instance.id, instance.customBaseURL, instance.appendV1Suffix, reloadKey)")
+FIX_THINKING_BUILTINS_NO_MODEL_ENTRIES = _replace_exactly(
+    FIX_THINKING_CLEAN,
+    "LaunchedEffect(instance.id, instance.customBaseURL, instance.appendV1Suffix, modelEntries, reloadKey) {",
+    "LaunchedEffect(instance.id, instance.customBaseURL, instance.appendV1Suffix, reloadKey) {")
 
-FIX_THINKING_SAMPLE_NO_MODEL_ENTRIES = FIX_THINKING_CLEAN.replace(
-    "remember(instance.id, modelEntries, reloadKey) {\n        providerRepository.firstModelId(instance.id)",
-    "remember(instance.id, reloadKey) {\n        providerRepository.firstModelId(instance.id)")
+FIX_THINKING_SAMPLE_NO_MODEL_ENTRIES = _replace_exactly(
+    FIX_THINKING_CLEAN,
+    "LaunchedEffect(instance.id, modelEntries, reloadKey) {",
+    "LaunchedEffect(instance.id, reloadKey) {")
 
-FIX_THINKING_SAMPLE_KEYLESS = FIX_THINKING_CLEAN.replace(
-    "remember(instance.id, modelEntries, reloadKey) {\n        providerRepository.firstModelId(instance.id)",
-    "remember {\n        providerRepository.firstModelId(instance.id)")
+# Keyless is not reachable on a LaunchedEffect (its key list is the whole
+# argument), so the "cannot tell its sources apart" arm is now the SAME key list
+# with the source dropped — the effect still runs, but only once.
+FIX_THINKING_SAMPLE_KEYLESS = _replace_exactly(
+    FIX_THINKING_CLEAN,
+    "LaunchedEffect(instance.id, modelEntries, reloadKey) {",
+    "LaunchedEffect(Unit) {")
 
 FIX_THINKING_MISSING_ANCHOR = """package com.rikkaminis.app.ui.settings
 
@@ -2672,12 +2761,45 @@ FIX_THINKING_PRECISION_UNRELATED = FIX_THINKING_CLEAN.replace(
 
 # --- da1030-C ISSUE-05 fixtures: C12 / C13 --------------------------------
 
-FIX_THINKING_NO_REVISION_KEY = FIX_THINKING_CLEAN.replace(
-    "remember(instance.id, reloadKey, rulesRevision)",
-    "remember(instance.id, reloadKey)")
+# --- deep-audit-1043 B-02: the two new arms of C12 --------------------------
+# Arm (b) moved to the producer effect, so its negative fixture must move too —
+# a `.replace` aimed at the old `remember(instance.id, reloadKey, rulesRevision)`
+# would silently no-op (the string is gone) and the "missing revision key" arm
+# would be green without testing anything. The assert below is what catches
+# that class of drift.
+FIX_THINKING_NO_REVISION_KEY = _replace_exactly(
+    FIX_THINKING_CLEAN,
+    "LaunchedEffect(instance.id, reloadKey, rulesRevision) {",
+    "LaunchedEffect(instance.id, reloadKey) {")
 
 FIX_THINKING_NO_SUBSCRIPTION = FIX_THINKING_CLEAN.replace(
     "    val rulesRevision by ThinkingRuleResolver.customRulesRevision.collectAsState()\n", "")
+
+# Arm (c): back to the pre-fix carrier — keyed correctly, still blocking. Only
+# C12 may move; C11a/C11b stay green because the other two effects are intact.
+FIX_THINKING_SYNC_LOADER = _replace_exactly(
+    FIX_THINKING_CLEAN,
+    """    var customRulesAndIds by remember { mutableStateOf(emptyList<ThinkingRule>() to emptyList<String>()) }
+    var rulesLoaded by remember(instance.id) { mutableStateOf(false) }
+    LaunchedEffect(instance.id, reloadKey, rulesRevision) {
+        customRulesAndIds = withContext(Dispatchers.IO) {
+            providerRepository.thinkingRulesWithIds(instance.id)
+        }
+        rulesLoaded = true
+    }""",
+    """    val customRulesAndIds = remember(instance.id, reloadKey, rulesRevision) {
+        providerRepository.thinkingRulesWithIds(instance.id)
+    }
+    val rulesLoaded = true""")
+
+# Arm (c), second spelling: the effect exists and is keyed, but the read is
+# inline. Catches "someone moved the call into the effect and forgot the hop".
+FIX_THINKING_NO_IO_HOP = _replace_exactly(
+    FIX_THINKING_CLEAN,
+    """        customRulesAndIds = withContext(Dispatchers.IO) {
+            providerRepository.thinkingRulesWithIds(instance.id)
+        }""",
+    "        customRulesAndIds = providerRepository.thinkingRulesWithIds(instance.id)")
 
 FIX_THINKING_RESOLVER_CLEAN = """package com.rikkaminis.app.provider.thinking
 
@@ -3427,6 +3549,11 @@ def run_selftest():
     # --- da1030-C: C12 (external rule writes must re-key the loader) -------
     run_case("c12-loader-no-revision-key", 1,
              variant(REL_THINKING_SECTION, FIX_THINKING_NO_REVISION_KEY), failures, ("C12",))
+    # deep-audit-1043 B-02 — arm (c): the loader must leave the composition thread.
+    run_case("c12-sync-loader-in-remember", 1,
+             variant(REL_THINKING_SECTION, FIX_THINKING_SYNC_LOADER), failures, ("C12",))
+    run_case("c12-loader-without-io-hop", 1,
+             variant(REL_THINKING_SECTION, FIX_THINKING_NO_IO_HOP), failures, ("C12",))
     run_case("c12-no-revision-subscription", 1,
              variant(REL_THINKING_SECTION, FIX_THINKING_NO_SUBSCRIPTION), failures, ("C12",))
     # --- da1030-C: C13 (every mutator bumps the revision) ------------------
