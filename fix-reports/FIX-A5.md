@@ -194,24 +194,28 @@ session_sheet_id_binding_check      rc=0  OK (4 session-scoped call blocks ...)
 
 **结论：attempt 1 success，8/8 判据 ALL GREEN。**
 
+**最终 run（对应分支末尾 HEAD）**
+
 | 项 | 读数 |
 |---|---|
-| run / job | `39763322068` / `119772879607`（26 步） |
-| conclusion | `success`（`at 2026-10-22T10:47:01Z`） |
-| **head_sha 三方** | 本地 `877d48701c0da11b9d4e3e4e4301fc2e437b0f1f` == `git ls-remote` == CI job `head_sha` = **三者逐字符一致** |
+| run / job | `39766531437` / `119783259705`（26 步） |
+| conclusion | `success`（`at 2026-10-22T11:07:35Z`） |
+| **head_sha 三方** | 本地 `b85beef123845685f6d7a24d18f8c177178080d4` == `git ls-remote` == CI job `head_sha` = **三者逐字符一致** |
 | 步骤 | `not_ok_steps=[]` · 唯一 `skipped_steps=['Publish to Releases']`（main 门控 ✓，分支不该发版） |
 | 门头 | `[1/109] … [109/109]`，序号连续、**109 个互异门名** |
-| 门汇总 | `║  Summary: 109 passed, 0 failed`（全部 9 条 `Summary:` 行里 **无任何非零 failed**） |
-| 夹具 | `✅ ALL 336 CASES PASS`（1 处） |
-| 本门 | `chat_session_id_binding_check: all criteria satisfied`（真树）· `✅ chat_session_id_binding_check selftest has teeth (CHAT_SESSION_ID_BINDING_SELFTEST=PASS)` · `✅ chat_session_id_binding_check real tree green` |
+| 门汇总 | `║  Summary: 109 passed, 0 failed`（line 896；全部 8 条 `Summary:` 行里 **无任何非零 failed**） |
+| 夹具 | `✅ ALL 336 CASES PASS`（line 单处） |
+| 本门 | `chat_session_id_binding_check: all criteria satisfied`（真树，line 784）· `✅ chat_session_id_binding_check selftest has teeth (CHAT_SESSION_ID_BINDING_SELFTEST=PASS)` · `✅ chat_session_id_binding_check real tree green` |
 | 新测试 | `HeadlessChatRunnerSessionReadyBarrierTest` **10/10 逐条 PASSED**（含 7 条负控） |
 | 编译错 | `Z e: ` **0** |
 | 游离 FAILED | **0**（含 FAILED 但不含 PASSED 的行 = 0） |
-| 日志 | `probe/ci/job-119772879607.log`，1,364,711 B / 16,309 行 |
+| 日志 | `probe/ci/job-final.log`，1,364,732 B / 16,310 行 |
+
+**前一轮 run（同一套代码，报告未回填时的 commit）**：`39763322068` / job `119772879607`，`head_sha=877d4870…`，同样 `success` + `109 passed, 0 failed` + `336 CASES PASS` + 10/10 新用例 PASSED（日志 `probe/ci/job-119772879607.log`）。`877d4870…b85beef1` 之间的差异经 `git diff --name-only … ':(exclude)fix-reports'` 核实为 **空** —— 即两次 CI 验的是同一棵源码树，第二轮只是补上「报告回填后 HEAD 也要有绿的 run」。
 
 **判读装置两处踩坑（登记在 R8）**：
-1. `Summary:` 行的权威形态是 `║  Summary: 109 passed, 0 failed`（带框线前缀），首版用 `strip().startswith("Summary:")` 导致 `Summary lines=0` 的假阴性 —— 改为「收集全部含 `Summary:` 的行，断言其中一条为 109/0 且无任何非零 failed」。
-2. `.env` 里没有 `GITHUB_TOKEN` 的话取数会 401；本支按 skill `github-ops` 的既有路径复用同一个 `python3` 取数装置（不走裸 curl，避免本机代理把 HTTPS 降级成明文导致 rc=0 空输出）。
+1. `Summary:` 行的权威形态是 `║  Summary: 109 passed, 0 failed`（带框线前缀），首版用 `strip().startswith("Summary:")` 导致 `Summary lines=0` 的假阴性 —— 改为「收集全部含 `Summary:` 的行，断言其中一条为 109/0 且无任何非零 failed」（二次核验：`grep -oE 'Summary: [0-9]+ passed, [0-9]+ failed' | sort | uniq -c` 无任何非零 failed）。
+2. 取数用 `python3` + 两跳（job 日志 302 到 objects 主机，二跳**不带 token**），不走裸 curl —— 本机代理偶发把 HTTPS 降级成明文导致 rc=0 空输出。
 
 ---
 
