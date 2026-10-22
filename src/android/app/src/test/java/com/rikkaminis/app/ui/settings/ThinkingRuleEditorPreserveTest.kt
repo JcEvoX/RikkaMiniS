@@ -394,7 +394,7 @@ class ThinkingRuleEditorPreserveTest {
             "val liveSeed = if (req.existingId != null && !req.isNew && editorLiveIndex >= 0) {",
             "customRules[editorLiveIndex]",
             "request = req.copy(seed = liveSeed),",
-            "if (req?.existingId != null && editorLiveIndex < 0) editorRequest = null",
+            "if (rulesLoaded && req?.existingId != null && editorLiveIndex < 0) editorRequest = null",
         )) {
             assertTrue("call-site anchor missing: $anchor", code.contains(anchor))
         }
