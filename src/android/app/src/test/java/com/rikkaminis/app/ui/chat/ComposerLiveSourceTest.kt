@@ -159,6 +159,38 @@ class ComposerLiveSourceTest {
         }
     }
 
+    /**
+     * 4. [dv23-B3] The two `@`-mention completion sites must drop the pending
+     * IME burst before they commit the completed text. A paste containing
+     * "@doc" is still buffered for 150 ms; the flush compares its snapshot
+     * against the completed text, sees a difference and commits the
+     * UN-completed text back — silently undoing the mention the user just
+     * picked.
+     */
+    private fun assertMentionSitesDropPendingBurst(input: String) {
+        val skel = skeleton(input)
+        val helper = Regex("""val (\w+): \(\) -> Unit = \{""").findAll(skel)
+            .firstOrNull { braceSlice(skel, it.range.last).contains("imeBurstJob?.cancel()") }
+            ?.groupValues?.get(1)
+        val sites = listOf(
+            "selectMention(" to Regex("""selectMention\("""),
+            "executeSelectedMention(" to Regex("""executeSelectedMention\("""),
+        )
+        for ((label, re) in sites) {
+            val m = re.find(skel)
+            assertTrue("$label site must exist (a missing site = the decision moved)", m != null)
+            val block = enclosingBlock(skel, m!!.range.last)
+            val ok = (helper != null && block.contains("$helper()")) ||
+                block.contains("imeBurstJob?.cancel()")
+            assertTrue(
+                "$label must drop the pending IME-burst flush before it commits the " +
+                    "completed mention — otherwise the 150 ms snapshot overwrites the " +
+                    "completion and the picked @file silently reverts",
+                ok,
+            )
+        }
+    }
+
     // ── tests ────────────────────────────────────────────────────────────────
 
     @Test
@@ -174,6 +206,35 @@ class ComposerLiveSourceTest {
     @Test
     fun `every leaving site drops the pending burst flush first`() {
         assertBurstFlushDroppedAtLeavingSites(source(inputFile))
+    }
+
+    /** [dv23-B3] The two @-mention completion sites drop the pending burst too. */
+    @Test
+    fun `the mention completion sites drop the pending burst flush first`() {
+        assertMentionSitesDropPendingBurst(source(inputFile))
+    }
+
+    /** [dv23-B3] Negative control: a mention site that keeps the pending job. */
+    @Test
+    fun `negative control - a mention site that keeps the pending burst fails the probe`() {
+        val src = source(inputFile)
+        val mutated = src.replace(
+            "                                                cancelPendingImeBurst()\n" +
+                "                                                val (newText, newCaret) = viewModel.selectMention(",
+            "                                                val (newText, newCaret) = viewModel.selectMention(",
+        )
+        Assume.assumeTrue("the mention site must exist to be rewritten", mutated != src)
+        var failed = false
+        try {
+            assertMentionSitesDropPendingBurst(mutated)
+        } catch (_: AssertionError) {
+            failed = true
+        }
+        assertTrue(
+            "the probe must fail once a mention site keeps the pending 150 ms job — the " +
+                "flush would overwrite the just-completed @file",
+            failed,
+        )
     }
 
     /** The executable premise: a burst really does leave the committed string behind. */
