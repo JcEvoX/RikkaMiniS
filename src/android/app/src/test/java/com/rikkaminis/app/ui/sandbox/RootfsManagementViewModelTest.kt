@@ -1,5 +1,6 @@
 package com.rikkaminis.app.ui.sandbox
 
+import com.rikkaminis.app.sandbox.RootfsInstallState
 import java.io.File
 import java.io.FileNotFoundException
 import org.junit.Assert.assertEquals
@@ -123,6 +124,221 @@ class RootfsManagementViewModelTest {
             match!!.range.first < guardedReadAt,
         )
     }
+
+    // ── 3. the StateFlow replay gate ([deep-audit-1042 B-05]) ─────────────
+
+    @Test
+    fun `the replay gate skips a prior terminal on the first frame only`() {
+        val prior = RootfsInstallState.Installed
+
+        assertTrue(
+            "first frame holding the same Installed instance is a replay and must be skipped",
+            isStaleInstallReplay(firstFrame = true, state = prior, priorTerminal = prior),
+        )
+        assertFalse(
+            "the same terminal on a later frame is a live event (first frame was consumed)",
+            isStaleInstallReplay(firstFrame = false, state = prior, priorTerminal = prior),
+        )
+    }
+
+    @Test
+    fun `a live Failed is never the stale instance the collector started on`() {
+        val prior = RootfsInstallState.Failed("old disk-space verdict")
+        val live = RootfsInstallState.Failed("old disk-space verdict")
+
+        assertEquals(
+            "fixture premise: RootfsManager constructs a fresh Failed for every verdict, " +
+                "so the texts match but the instances do not",
+            prior.error, live.error,
+        )
+        assertFalse(
+            "a live failure of identical text must NOT be dropped as a replay",
+            isStaleInstallReplay(firstFrame = true, state = live, priorTerminal = prior),
+        )
+        // and the shape that must be dropped: the literal previous instance
+        assertTrue(
+            "the previous operation's Failed instance itself IS the replay",
+            isStaleInstallReplay(firstFrame = true, state = prior, priorTerminal = prior),
+        )
+    }
+
+    @Test
+    fun `non-terminal frames are never dropped`() {
+        // A non-terminal current value means an operation is in flight; its
+        // progress must be mirrored even on the very first frame — including
+        // when the flow happens to be holding that same phase again.
+        for (active in listOf(
+            RootfsInstallState.Idle,
+            RootfsInstallState.Preparing,
+            RootfsInstallState.Extracting(0.25f),
+            RootfsInstallState.Finalizing,
+        )) {
+            assertFalse(
+                "${active.javaClass.simpleName} against a different prior must be mirrored",
+                isStaleInstallReplay(
+                    firstFrame = true, state = active, priorTerminal = RootfsInstallState.Installed,
+                ),
+            )
+            assertFalse(
+                "${active.javaClass.simpleName} against itself is still an in-flight phase, " +
+                    "not a terminal replay",
+                isStaleInstallReplay(firstFrame = true, state = active, priorTerminal = active),
+            )
+        }
+    }
+
+    // ── 4. the repair settlement ([deep-audit-1042 B-05]) ─────────────────
+
+    private fun repairFixtureState() = RootfsManagementUiState(
+        isInstalled = true,
+        isProcessing = true,
+        statusMessage = "Repairing…",
+        resultMessage = null,
+        installProgress = 0.4f,
+    )
+
+    @Test
+    fun `a published Failed outranks autoRepair returning false`() {
+        // Stage 3 of autoRepair() is a full reset(); installIfNeeded() reports
+        // its disk-space gate by publishing Failed and RETURNING. The old
+        // settlement branched on `repaired` alone and announced the refusal as
+        // "repair failed — still missing: …" (rootfs corruption).
+        val after = rootfsRepairState(
+            repairFixtureState(),
+            RootfsInstallState.Failed("Not enough space: need about 900 MB"),
+            repaired = false,
+            repairedMessage = "REPAIRED-TEXT",
+            stillMissingMessage = "STILL-MISSING-TEXT",
+        )
+
+        assertEquals(
+            "the disk-space verdict must surface, not the corruption text",
+            "Not enough space: need about 900 MB", after.resultMessage,
+        )
+        assertFalse("a refused repair is not a success", after.lastOperationSuccess)
+        assertFalse("the operation is over", after.isProcessing)
+        assertEquals("the progress bar must be cleared", null, after.installProgress)
+    }
+
+    @Test
+    fun `repaired with no Failed verdict keeps the repaired contract`() {
+        val after = rootfsRepairState(
+            repairFixtureState(),
+            RootfsInstallState.Installed,
+            repaired = true,
+            repairedMessage = "REPAIRED-TEXT",
+            stillMissingMessage = "STILL-MISSING-TEXT",
+        )
+
+        assertEquals("REPAIRED-TEXT", after.resultMessage)
+        assertTrue(after.lastOperationSuccess)
+        assertFalse(after.isProcessing)
+        assertEquals(null, after.installProgress)
+    }
+
+    @Test
+    fun `autoRepair false without a Failed verdict keeps repair_missing`() {
+        // The existing contract from B-02: a repair that genuinely finished but
+        // left files missing still reports rootfs_msg_repair_missing with the
+        // re-verified list, and is an error.
+        val after = rootfsRepairState(
+            repairFixtureState(),
+            RootfsInstallState.Installed,
+            repaired = false,
+            repairedMessage = "REPAIRED-TEXT",
+            stillMissingMessage = "STILL-MISSING-TEXT",
+        )
+
+        assertEquals("STILL-MISSING-TEXT", after.resultMessage)
+        assertFalse(after.lastOperationSuccess)
+        assertFalse(after.isProcessing)
+    }
+
+    @Test
+    fun `a live Failed replayed as the first frame keeps the guard in force`() {
+        // The two halves of the defect on the real functions: the replay gate
+        // drops the STALE Failed, and the settlement still surfaces a LIVE one.
+        val stale = RootfsInstallState.Failed("previous run: disk space")
+        val live = RootfsInstallState.Failed("Not enough space: need about 900 MB")
+        assertTrue(
+            "the stale verdict the subscription started on is dropped",
+            isStaleInstallReplay(true, stale, stale),
+        )
+        val settled = rootfsRepairState(
+            repairFixtureState(), live, repaired = false,
+            repairedMessage = "R", stillMissingMessage = "M",
+        )
+        assertEquals("Not enough space: need about 900 MB", settled.resultMessage)
+        assertFalse(settled.lastOperationSuccess)
+    }
+
+    // ── 5. source shape: the replay gate and the settlement wiring ────────
+
+    @Test
+    fun `the collector skips the replayed first frame and only that frame`() {
+        val code = stripComments(readRepoFile(VIEW_MODEL))
+        val body = bodyOf(code, "fun observeInstallProgress(")
+        assertTrue(
+            "the collector must capture the flow's current value BEFORE subscribing",
+            body.indexOf("manager.installState.value") <
+                body.indexOf("manager.installState.collect"),
+        )
+        assertTrue(
+            "the first-frame replay must be decided by the shared pure gate",
+            body.contains("isStaleInstallReplay("),
+        )
+        val decide = body.indexOf("isStaleInstallReplay(")
+        val consume = body.indexOf("firstFrame = false")
+        val skipped = body.indexOf("if (replay) return@collect")
+        assertTrue("the replay must be decided", decide > 0)
+        assertTrue("the first-frame flag must be consumed", consume > 0)
+        assertTrue("a replayed frame must be skipped", skipped > 0)
+        assertTrue(
+            "the decision must precede the skip",
+            decide < skipped,
+        )
+        assertTrue(
+            "the first-frame flag must be consumed right after the decision so only " +
+                "frame 1 can be skipped",
+            consume - decide < 120,
+        )
+    }
+
+    @Test
+    fun `every settle site cancels the progress collector`() {
+        // StateFlow.collect never returns on its own; before B-05 the job
+        // survived the operation that started it.
+        val code = stripComments(readRepoFile(VIEW_MODEL))
+        for (anchor in listOf(
+            "fun settleRootfsOperation(",
+            "fun settleRootfsFailure(",
+        )) {
+            assertTrue(
+                "$anchor must cancel progressJob — StateFlow.collect never ends itself",
+                bodyOf(code, anchor).contains("progressJob?.cancel()"),
+            )
+        }
+        assertTrue(
+            "the repair settlement must cancel progressJob too",
+            bodyOf(code, "fun repairRootfs(").contains("progressJob?.cancel()"),
+        )
+    }
+
+    @Test
+    fun `repair settles through the published verdict`() {
+        val code = stripComments(readRepoFile(VIEW_MODEL))
+        val body = bodyOf(code, "fun repairRootfs(")
+        assertTrue(
+            "repairRootfs must route the settlement through the shared pure helper",
+            body.contains("rootfsRepairState("),
+        )
+        assertTrue(
+            "the verdict passed must be the manager's CURRENT terminal state",
+            body.contains("manager.installState.value"),
+        )
+    }
+
+
 
     // ── source helpers (same idiom as the other shape tests) ─────────────
 
