@@ -37,6 +37,19 @@ import org.json.JSONObject
  *   android-clipboard clear
  *   android-clipboard status
  */
+// [dv22-A6 A-06] one classification owns "how do I clear on this platform":
+// Q+ gets the real `clearPrimaryClip()` (primaryClip becomes null, itemCount
+// 0); API 26–28 keep the empty-string write — pre-Q `clearPrimaryClip()` is
+// not reliable on all vendor builds, and an empty clip is what those platform
+// versions can actually deliver.
+internal sealed class ClipboardClearAction {
+    /** Q+: `ClipboardManager.clearPrimaryClip()` — a real clear. */
+    object PlatformClear : ClipboardClearAction()
+
+    /** API 26–28: `newPlainText("", "")` — the only reliable shape pre-Q. */
+    object EmptyStringFallback : ClipboardClearAction()
+}
+
 class ClipboardOffloadHandler(private val context: Context) : NativeOffloadHandler {
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
         val args = OffloadArgs(request.argv.drop(1))
@@ -125,8 +138,17 @@ class ClipboardOffloadHandler(private val context: Context) : NativeOffloadHandl
     }
 
     private fun doClear(cm: ClipboardManager, args: OffloadArgs): NativeOffloadResult {
-        if (!isAppForeground()) return backgroundError(args)
-        cm.setPrimaryClip(ClipData.newPlainText("", ""))
+        // [dv22-A6 A-06] the guard get/set/status use, verbatim: Android 10+
+        // is the first release that restricts clipboard access from the
+        // background, so a pre-Q background clear that used to work must not
+        // be refused (the old bare `!isAppForeground()` did exactly that).
+        if (!isAppForeground() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            return backgroundError(args)
+        }
+        when (clearAction(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)) {
+            ClipboardClearAction.PlatformClear -> cm.clearPrimaryClip()
+            ClipboardClearAction.EmptyStringFallback -> cm.setPrimaryClip(ClipData.newPlainText("", ""))
+        }
         // [da1034-A4] ISSUE-08: JSON payload, not `Clipboard cleared.`
         val data = JSONObject().put("cleared", true)
         return NativeOffloadResult(0, OffloadOutput.formatBody(data.toString(2), args) + "\n")
@@ -212,6 +234,17 @@ class ClipboardOffloadHandler(private val context: Context) : NativeOffloadHandl
     )
 
     companion object {
+        /**
+         * [dv22-A6 A-06] the single decision behind `clear`'s two write arms,
+         * pure so a JVM test can pin it. `atLeastQ` is the caller's
+         * `Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q`, kept at the call
+         * site because `android.os.Build` is not readable from a plain JVM
+         * unit test.
+         */
+        internal fun clearAction(atLeastQ: Boolean): ClipboardClearAction =
+            if (atLeastQ) ClipboardClearAction.PlatformClear
+            else ClipboardClearAction.EmptyStringFallback
+
         private const val TAG = "ClipboardOffload"
         // Local copies of android.content.ClipDescription constants so the
         // status switch reads cleanly without an extra import.
