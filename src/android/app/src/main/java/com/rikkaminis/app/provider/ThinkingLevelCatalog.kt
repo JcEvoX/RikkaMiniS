@@ -113,11 +113,38 @@ val LLMModel.selectableThinkingLevels: List<ThinkingLevel>
 /**
  * [T-android-thinking-level-arch] The four-level resolution the rest of the app
  * consults: the user's manual override on the entry (highest priority) wins over
- * the catalog/default. `entry.model` already folds ModelOverrides into the base
- * model, so read the ceiling off the resolved model there.
+ * the catalog/default.
+ *
+ * [dv23-A04] The ceiling is read off [ModelsDevApi.effectiveModel], NOT off
+ * `entry.model`. `entry.model` is only `baseModel.withOverrides(overrides)` —
+ * it never touches the models.dev registry, so every field this ceiling depends
+ * on (`reasoningEffortValues`, `supportsReasoning`, `declaresNoEffortTiers`)
+ * stayed at its raw built-in value (null for all 39 catalog rows). The
+ * data-driven tier-2 path in [catalogMaxThinkingLevel] was therefore dead for
+ * exactly the models it was written for: a model whose catalog row declares
+ * `["high","max"]` showed a ceiling of XHIGH (MAX unreachable), and one whose
+ * row declares `["low","medium"]` showed XHIGH too (tiers its backend rejects).
+ * Every other surface that answers "what can this model do" (the badges, the
+ * debug RPCs, `minis-model-use`) already goes through `effectiveModel`; this
+ * was the last bypass — and it feeds the picker ceiling and the group ceiling.
+ *
+ * Ordering contract unchanged: `ModelsDevApi.effectiveModel` enriches the BASE
+ * model first and applies [ModelOverrides] second ([effectiveEntryModel]), so
+ * an explicit `overrides.maxThinkingLevel` still wins, and
+ * `overrides.supportsReasoning = false` still forces the ceiling to OFF instead
+ * of being overwritten by the registry's `reasoning = true`.
  */
 val ModelEntry.effectiveMaxThinkingLevel: ThinkingLevel
-    get() = overrides.maxThinkingLevel ?: model.catalogMaxThinkingLevel
+    get() = overrides.maxThinkingLevel
+        ?: ModelsDevApi.effectiveModel(this).catalogMaxThinkingLevel
+// ponytail: overloads.supportsReasoning == false is enforced by withOverrides AFTER
+// enrichment, so it still wins over the registry's `reasoning = true`; the registry
+// is only consulted for fields the base row leaves null. | 天花板: a model whose
+// catalog row DECLARES supportsReasoning = false while overrides leave it null now
+// reports OFF where it used to report XHIGH — that is the corrected direction (the
+// catalog is data, the old null-fallback was a guess). | 升级触发: a user report of
+// "this model used to offer XHIGH and now shows Off" AND its models.dev row carries
+// reasoning:false → reconcile the row, not this resolution order.
 
 /**
  * [T-thinking-effective-level] The level that will ACTUALLY be sent for the

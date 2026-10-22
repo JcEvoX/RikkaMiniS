@@ -77,6 +77,9 @@ AD_REL = APP + "/provider/ModelListProviderAdapters.kt"
 CDM_REL = APP + "/debug/ChatDebugMethods.kt"
 PDM_REL = APP + "/debug/ProviderDebugMethods.kt"
 PMM_REL = APP + "/debug/ProviderMutationMethods.kt"
+# [dv23-A04] The thinking-level ceiling resolver. It must read the ENRICHED
+# model (models.dev), not the raw `entry.model`.
+TLC_REL = APP + "/provider/ThinkingLevelCatalog.kt"
 
 ARM1_FORBIDDEN = ("provider = instanceId",)
 ARM1_REQUIRED = ("instance.providerType.displayName",)
@@ -485,9 +488,52 @@ def check_arm5_debug(src, rel, view):
                     "that read skips models.dev enrichment (dv22-A4)" % view))
     return out
 
+def check_arm5_tlc(src, rel):
+    """[dv23-A04] The thinking-level ceiling must resolve off the ENRICHED model.
+
+    `ModelEntry.effectiveMaxThinkingLevel` used to read
+    `model.catalogMaxThinkingLevel`, where `model` is only
+    `baseModel.withOverrides(overrides)` — a chain that never touches the
+    models.dev registry. Every built-in row therefore kept
+    `reasoningEffortValues == null` and `supportsReasoning == null`, so the
+    data-driven tier of `catalogMaxThinkingLevel` was dead code for them and
+    a custom model whose registry row says `reasoning = true` resolved to
+    OFF. The ceiling has to come from `ModelsDevApi.effectiveModel(this)`.
+
+    The criterion pins the DECISION (the ceiling reads the enriched model),
+    not the spelling: any shape that resolves the ceiling through the shared
+    resolver passes, while a raw `model.catalogMaxThinkingLevel` read reds.
+    """
+    code = code_only(src)
+    out = []
+    n = _resolver_calls(code)
+    if n == 0:
+        out.append((rel, 0, "5",
+                    "the thinking-level ceiling no longer resolves through "
+                    "`ModelsDevApi.effectiveModel(` — it reads the raw "
+                    "`entry.model` again, so models.dev-declared effort tiers "
+                    "and reasoning flags are invisible to the picker (dv23-A04)"))
+    elif n > 1:
+        out.append((rel, 0, "5",
+                    "the thinking-level ceiling carries %d literal "
+                    "`ModelsDevApi.effectiveModel(` calls — exactly one reader "
+                    "is expected (the ceiling); route extras through a local "
+                    "val (dv23-A04)" % n))
+    # The ceiling read itself must not go through the raw `model` chain.
+    if re.search(r"\?\s*:\s*model\.catalogMaxThinkingLevel", code):
+        out.append((rel, 0, "5",
+                    "the ceiling still reads the raw `model.catalogMaxThinkingLevel` "
+                    "— that model is only `baseModel.withOverrides(overrides)` and "
+                    "skips models.dev entirely (dv23-A04)"))
+    if re.search(r"catalogMaxThinkingLevel", code) and n == 0:
+        pass  # already reported by the resolver-count finding
+    return out
+
+
 def run_checks(root, rels=None):
     rels = rels or {"mc": MC_REL, "md": MD_REL, "oa": OA_REL, "ad": AD_REL,
-                    "cdm": CDM_REL, "pdm": PDM_REL, "pmm": PMM_REL}
+                    "cdm": CDM_REL, "pdm": PDM_REL, "pmm": PMM_REL,
+                    "tlc": TLC_REL}
     srcs = {k: read(rel, root) for k, rel in rels.items()}
     missing = [(rel, 0, "?", "file not found — gate ROT")
                for k, rel in rels.items() if srcs[k] is None]
@@ -503,6 +549,7 @@ def run_checks(root, rels=None):
     checks += check_arm5_debug(srcs["pdm"], rels["pdm"], "provider.models.list")
     checks += check_arm5_debug(srcs["pmm"], rels["pmm"],
                                "provider.models.add/update read-back (entryToJson)")
+    checks += check_arm5_tlc(srcs["tlc"], rels["tlc"])
     return checks
 
 
@@ -801,6 +848,32 @@ CDM_A5_PREFIX = _debug_view("val effective = entry.model")
 CDM_A5_EQUIV_RAW = _debug_view(
     "val effective = entry.baseModel.withOverrides(entry.overrides)")
 
+# [dv23-A04] Thinking-level ceiling fixtures.
+TLC_A5_OK = """val ModelEntry.effectiveMaxThinkingLevel: ThinkingLevel
+    get() = overrides.maxThinkingLevel
+        ?: ModelsDevApi.effectiveModel(this).catalogMaxThinkingLevel
+"""
+
+TLC_A5_PREFIX = """val ModelEntry.effectiveMaxThinkingLevel: ThinkingLevel
+    get() = overrides.maxThinkingLevel ?: model.catalogMaxThinkingLevel
+"""
+
+# Same intent, wrong outlet: enrichModel(this.model) skips the overrides
+# ordering (effectiveEntryModel enriches the BASE model first) — the shape
+# the work order explicitly forbids.
+TLC_A5_ENRICH_BASE = """val ModelEntry.effectiveMaxThinkingLevel: ThinkingLevel
+    get() = overrides.maxThinkingLevel
+        ?: ModelsDevApi.enrichModel(model).catalogMaxThinkingLevel
+"""
+
+TLC_A5_DOUBLE = """val ModelEntry.effectiveMaxThinkingLevel: ThinkingLevel
+    get() = overrides.maxThinkingLevel
+        ?: ModelsDevApi.effectiveModel(this).catalogMaxThinkingLevel
+
+val other: ThinkingLevel
+    get() = ModelsDevApi.effectiveModel(this).catalogMaxThinkingLevel
+"""
+
 
 def _report(checks, fixture_name, label):
     if not checks:
@@ -825,7 +898,8 @@ def selftest():
     ok = True
     with tempfile.TemporaryDirectory() as tmp:
         rels = {"mc": "mc.kt", "md": "md.kt", "oa": "oa.kt", "ad": "ad.kt",
-                "cdm": "cdm.kt", "pdm": "pdm.kt", "pmm": "pmm.kt"}
+                "cdm": "cdm.kt", "pdm": "pdm.kt", "pmm": "pmm.kt",
+                "tlc": "tlc.kt"}
 
         def write(name, text):
             with open(os.path.join(tmp, rels[name]), "w", encoding="utf-8") as f:
@@ -847,6 +921,7 @@ def selftest():
         write("cdm", CDM_A5_OK)
         write("pdm", pdm_ok)
         write("pmm", pmm_ok)
+        write("tlc", TLC_A5_OK)
         ok &= _report(run_checks(tmp, rels), "fixed", "all arms clean")
 
         # 2. Pre-fix shape: arm1 (UUID + no trim) and arm2 (no new keys).
@@ -987,6 +1062,27 @@ def selftest():
         ok &= arm5_of("cdm-double", checks, 1,
                       "a duplicated view reds on the pinned call count alone")
         write("cdm", CDM_A5_OK)
+
+        # (d) [dv23-A04] the thinking-level ceiling must read the enriched model.
+        def tlc_of(fixture_name, fixture, expect, label):
+            write("tlc", fixture)
+            checks = [c for c in run_checks(tmp, rels)
+                      if c[2] == "5" and c[0].endswith("tlc.kt")]
+            write("tlc", TLC_A5_OK)
+            return _expect_count("arm 5 " + fixture_name, checks, expect, label)
+
+        ok &= tlc_of("tlc-ok", TLC_A5_OK, 0,
+                     "the enriched ceiling shape is accepted")
+        ok &= tlc_of("tlc-pre-fix", TLC_A5_PREFIX, 2,
+                     "the raw `model.catalogMaxThinkingLevel` read reds twice "
+                     "(no enriched outlet + the raw chain itself)")
+        # enrichModel(model) instead of effectiveModel(this): the raw-chain
+        # regex does not match it, but the resolver count is 0 -> the
+        # "no enriched outlet" finding fires. Exactly one finding.
+        ok &= tlc_of("tlc-enrich-base", TLC_A5_ENRICH_BASE, 1,
+                     "enriching the already-overridden model reds (wrong outlet)")
+        ok &= tlc_of("tlc-double", TLC_A5_DOUBLE, 1,
+                     "a duplicated ceiling resolver reds on the pinned count")
 
     print("MODELS_PROVIDER_FIELD_SELFTEST=%s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
