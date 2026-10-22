@@ -58,6 +58,26 @@ import java.util.zip.ZipOutputStream
 internal fun shouldDeleteSessionSkillOverride(globalEnabled: Boolean?, requestedEnabled: Boolean): Boolean =
     globalEnabled != null && requestedEnabled == globalEnabled
 
+/**
+ * [dv22-B4] Pure merge core of [SkillRepository.sessionEnablementMap] — the
+ * batched read that replaced one [SkillRepository.isEnabledForSession]
+ * rawQuery PER SKILL in the slash menu (N queries per keystroke → one per
+ * list). Precedence is IDENTICAL to [SkillRepository.isEnabledForSession]:
+ * session override row → global `isEnabled` → absent (false).
+ *
+ * Top-level (not a member) so the precedence is JVM-testable with zero
+ * Android deps, and so a counting fake can prove the merge itself issues no
+ * queries: [overrideRows] is the result of ONE batched SELECT, [globalEnabled]
+ * reads the in-memory `_skills` list.
+ */
+internal fun mergeSessionSkillEnablement(
+    ids: List<String>,
+    overrideRows: Map<String, Boolean>,
+    globalEnabled: (id: String) -> Boolean?,
+): Map<String, Boolean> = ids.associateWith { id ->
+    overrideRows[id] ?: globalEnabled(id) ?: false
+}
+
 class SkillRepository(private val context: Context) {
 
     companion object {
@@ -71,6 +91,12 @@ class SkillRepository(private val context: Context) {
         // keyword prefilter -> embedding retrieval (see backlog §38-A).
         private const val MAX_SKILLS_IN_PROMPT = 40
         private const val MAX_SKILL_DESC_LENGTH = 200
+        /** [dv22-B4] Ids per batched `IN (…)` SELECT in
+         *  [sessionEnablementMap]. SQLITE_MAX_VARIABLE_NUMBER is 999 on older
+         *  SQLite builds; 400 leaves rom for the session id and keeps the
+         *  query count constant (a skill list this long is already an
+         *  anomaly, not a path to optimise). */
+        private const val SESSION_OVERRIDE_QUERY_CHUNK = 400
         private const val RECENT_WINDOW_MS = 7L * 24 * 3600 * 1000
         private const val RECENT_SLOTS = 10
         private const val NORMALIZE_THRESHOLD = 1000.0
@@ -301,6 +327,19 @@ class SkillRepository(private val context: Context) {
     private val _skills = MutableStateFlow<List<Skill>>(emptyList())
     val skills: StateFlow<List<Skill>> = _skills.asStateFlow()
 
+    /**
+     * [dv22-B4] Bumped by every write to `session_skill_overrides`
+     * ([setSessionOverride] / [clearSessionOverrides] /
+     * [renameSessionOverrides]). The overrides table is the only part of the
+     * session-scoped enablement that does NOT flow through [_skills], so
+     * before this counter the two had no shared invalidation channel: the
+     * slash menu memo keyed on `.skills` and never re-ran after a toggle
+     * inside the SAME session (B-04). Collectors re-read the table when this
+     * moves — it is a pure revision number, never an enablement value.
+     */
+    private val _sessionOverridesRevision = MutableStateFlow(0L)
+    val sessionOverridesRevision: StateFlow<Long> = _sessionOverridesRevision.asStateFlow()
+
     /** Lock serializing the check-then-act sequence in [add] so concurrent
      *  calls with the same id don't create duplicate DB rows / SKILL.md
      *  files or lose updates to the _skills StateFlow. */
@@ -475,6 +514,35 @@ class SkillRepository(private val context: Context) {
     }
 
     /**
+     * [dv22-B4] Batched twin of [isEnabledForSession]: ONE `IN (…)` SELECT for
+     * the whole id list (chunked at [SESSION_OVERRIDE_QUERY_CHUNK] to stay
+     * under SQLITE_MAX_VARIABLE_NUMBER) instead of one rawQuery per skill —
+     * the slash menu walks the full list on every keystroke, so the per-item
+     * shape cost N synchronous queries per producer run (B-04). Precedence
+     * identical: session override row → global `isEnabled` → absent (false),
+     * via the pure [mergeSessionSkillEnablement] core.
+     */
+    fun sessionEnablementMap(sessionId: String, ids: List<String>): Map<String, Boolean> {
+        if (ids.isEmpty()) return emptyMap()
+        val overrideRows = mutableMapOf<String, Boolean>()
+        ids.chunked(SESSION_OVERRIDE_QUERY_CHUNK).forEach { chunk ->
+            val placeholders = chunk.joinToString(",") { "?" }
+            val cursor = db.rawQuery(
+                "SELECT skill_id, is_enabled FROM session_skill_overrides WHERE session_id=? AND skill_id IN ($placeholders)",
+                arrayOf(sessionId) + chunk.toTypedArray(),
+            )
+            if (cursor.moveToFirst()) {
+                do {
+                    overrideRows[cursor.getString(0)] = cursor.getInt(1) == 1
+                } while (cursor.moveToNext())
+            }
+            cursor.close()
+        }
+        val globals = _skills.value.associate { it.id to it.isEnabled }
+        return mergeSessionSkillEnablement(ids, overrideRows) { id -> globals[id] }
+    }
+
+    /**
      * [dv16-A05] Sparse-clear, mirroring [MCPRepository.setSessionOverride]:
      * when [enabled] equals the skill's CURRENT global enabled, DELETE the
      * override row instead of pinning it — so a later flip of the global
@@ -499,10 +567,14 @@ class SkillRepository(private val context: Context) {
                 arrayOf<Any>(sessionId, skillId, if (enabled) 1 else 0)
             )
         }
+        // [dv22-B4] The table moved — publish the revision so async consumers
+        // (the slash menu's producer) re-query without polling.
+        _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L
     }
 
     fun clearSessionOverrides(sessionId: String) {
         db.execSQL("DELETE FROM session_skill_overrides WHERE session_id=?", arrayOf(sessionId))
+        _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L
     }
 
     /**
@@ -521,6 +593,7 @@ class SkillRepository(private val context: Context) {
             "UPDATE OR REPLACE session_skill_overrides SET session_id=? WHERE session_id=?",
             arrayOf<Any>(toReal, fromDraft),
         )
+        _sessionOverridesRevision.value = _sessionOverridesRevision.value + 1L
     }
 
     // -- Prompt Fragment --
