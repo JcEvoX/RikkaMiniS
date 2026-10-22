@@ -556,6 +556,121 @@ def check_merge_preserves_entry_timestamp(src, rel=PR_REL):
     return out
 
 # ----------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Arms 10/11 — [fix/dv22-a1 §1042-A-01] a DAO write must not be able to
+# destroy the store that survives it (bare DAO call before the mirror write;
+# bare DAO call in the one function whose nine siblings all wrap).
+# ----------------------------------------------------------------------
+PERSIST_DECL = "fun persistToDbAndMirror("
+DAO_SYNC_CALL = "providerDao.syncAllIncremental("
+MIRROR_WRITE_CALL = 'prefs.edit().putString("config", mirrorStr).commit()'
+RESTORE_DECL = "fun restoreThinkingRules("
+DAO_RESTORE_CALL = "providerDao.replaceThinkingRules("
+FAILURE_HANDLERS = (".onFailure", ".getOrElse", ".getOrDefault", ".fold")
+
+
+def _envelope_containing(code, idx):
+    """(open_idx, end_idx, kind) of the INNERMOST runCatching{}/try{} region
+    containing [idx], or None. Brace-matched on comment-stripped code."""
+    best = None
+    for m in re.finditer(r"\b(runCatching|try)\s*\{", code):
+        open_idx = code.index("{", m.start())
+        end = _balanced(code, open_idx, "{", "}")
+        if end < 0:
+            continue
+        if open_idx < idx < end and (best is None or open_idx > best[0]):
+            best = (open_idx, end, m.group(1))
+    return best
+
+
+def check_persist_dao_wrapped(src, rel=PR_REL):
+    """[fix/dv22-a1 §1042-A-01] persistToDbAndMirror: the DB write must not be
+    able to skip the mirror write.
+
+    The DAO row-set sync runs BEFORE the prefs mirror write. Unwrapped, a
+    provider.db that failed to open (migration abort — ProviderDatabase has no
+    fallbackToDestructiveMigration) throws straight out of the function, the
+    mirror write never runs, and the user loses the change entirely — with the
+    DB down, prefs is the only surviving store (the caller logs "DB+mirror
+    stale" while the mirror was never attempted).
+
+    Two decision points, both fail-closed:
+      A. the syncAllIncremental call sits inside a runCatching/try envelope;
+      B. the mirror write sits OUTSIDE that envelope — inside it a DAO throw
+         skips the mirror, i.e. the same defect wearing a wrapper.
+    """
+    out = []
+    body = function_text(src, PERSIST_DECL)
+    if body is None:
+        return [(rel, 0, "10", "persistToDbAndMirror( not found — gate ROT")]
+    dec_at = src.find(PERSIST_DECL)
+    code = code_only(body)
+    dao_rel = code.find(DAO_SYNC_CALL)
+    if dao_rel < 0:
+        return [(rel, line_of(src, dec_at), "10",
+                 "persistToDbAndMirror no longer calls %s — gate ROT "
+                 "(DB write face renamed or removed)" % DAO_SYNC_CALL)]
+    env = _envelope_containing(code, dao_rel)
+    if env is None:
+        out.append((rel, line_of(src, dec_at + body.find("providerDao")), "10",
+                    "the %s call is BARE — a provider.db that failed to open throws out "
+                    "of persistToDbAndMirror before the mirror write, destroying the only "
+                    "store that survives the DB being down" % DAO_SYNC_CALL))
+    mirror_rel = code.find(MIRROR_WRITE_CALL)
+    if mirror_rel < 0:
+        out.append((rel, line_of(src, dec_at), "10",
+                    "the prefs mirror write is gone from persistToDbAndMirror — gate ROT "
+                    "(mirror face renamed or removed)"))
+        return out
+    if env is not None and mirror_rel < env[1]:
+        out.append((rel, line_of(src, dec_at + mirror_rel), "10",
+                    "the prefs mirror write sits INSIDE the DAO write's %s envelope — a DAO "
+                    "throw still skips it (the wrapper must not swallow the mirror too)"
+                    % env[2]))
+    return out
+
+
+def check_restore_dao_wrapped(src, rel=PR_REL):
+    """[fix/dv22-a1 §1042-A-01] restoreThinkingRules: the DAO call must be
+    wrapped AND the failure must not be silently discarded.
+
+    Nine sibling functions in the same file wrap their DAO call
+    (runCatching + a loud log — the [audit-0909 T4-H1] hunks); this one did
+    not, so a provider.db that failed to open threw straight into the backup
+    importer. A wrapper that throws away the failure is the silent-swallow
+    form of the same defect, so the envelope must carry a failure handler.
+    """
+    out = []
+    body = function_text(src, RESTORE_DECL)
+    if body is None:
+        return [(rel, 0, "11", "restoreThinkingRules( not found — gate ROT")]
+    dec_at = src.find(RESTORE_DECL)
+    code = code_only(body)
+    call_rel = code.find(DAO_RESTORE_CALL)
+    if call_rel < 0:
+        return [(rel, line_of(src, dec_at), "11",
+                 "restoreThinkingRules no longer calls %s — gate ROT "
+                 "(restore write face renamed or removed)" % DAO_RESTORE_CALL)]
+    env = _envelope_containing(code, call_rel)
+    if env is None:
+        return [(rel, line_of(src, dec_at + body.find("providerDao")), "11",
+                 "the %s call is BARE — unlike the nine sibling functions in this "
+                 "file, a provider.db that failed to open throws into the caller"
+                 % DAO_RESTORE_CALL)]
+    tail = code[env[1]:].lstrip()
+    if env[2] == "runCatching":
+        if not tail.startswith(FAILURE_HANDLERS):
+            out.append((rel, line_of(src, dec_at + env[1]), "11",
+                        "the runCatching envelope around %s carries no failure handler "
+                        "(%s) — the failure is discarded silently"
+                        % (DAO_RESTORE_CALL, " / ".join(FAILURE_HANDLERS))))
+    elif not tail.startswith("catch"):
+        out.append((rel, line_of(src, dec_at + env[1]), "11",
+                    "the try envelope around %s has no catch clause at its close — "
+                    "the failure escapes" % DAO_RESTORE_CALL))
+    return out
+
+
 def run_checks(root):
     pr = read(PR_REL, root)
     bm = read(BM_REL, root)
@@ -575,6 +690,8 @@ def run_checks(root):
     checks += check_merge_restores_entry_fields(pr)
     checks += check_save_persists_published(pr)
     checks += check_merge_preserves_entry_timestamp(pr)
+    checks += check_persist_dao_wrapped(pr)
+    checks += check_restore_dao_wrapped(pr)
     return checks
 
 
@@ -773,6 +890,160 @@ fun saveConfig(config: ProviderConfig) {
             runBlocking { persistToDbAndMirror(config) }
         }
     }
+}
+"""
+
+# [fix/dv22-a1 §1042-A-01] Arm 10 fixtures: persistToDbAndMirror must not be
+# able to skip the prefs mirror write when the DB write throws. Appended to
+# every fixture tree so the arm is exercisable in both directions.
+FIX_PERSIST_OK = """
+private suspend fun persistToDbAndMirror(config: ProviderConfig): ProviderConfig {
+    val mirrorStr = json.encodeToString(ProviderConfig.serializer(), config)
+    val snapshot = config.toSnapshot(json, jsonSyncHash = hashJsonMirror(mirrorStr))
+    val dbWrite = runCatching {
+        providerDao.syncAllIncremental(
+            instances = snapshot.instances,
+            entries = snapshot.entries,
+            meta = snapshot.meta,
+        )
+    }
+    dbWrite.onFailure { e ->
+        android.util.Log.e("ProviderRepo", "DB incremental sync failed: ${'$'}{e.message}", e)
+    }
+    val mirrorWritten = prefs.edit().putString("config", mirrorStr).commit()
+    if (!mirrorWritten) {
+        android.util.Log.w("ProviderRepo", "mirror commit() returned false")
+    }
+    return snapshot.toProviderConfig(json)
+}
+"""
+
+# Breaker: the baseline shape — the DAO call is BARE before the mirror write,
+# so a provider.db that failed to open throws out and the mirror never lands.
+FIX_PERSIST_BARE_BAD = """
+private suspend fun persistToDbAndMirror(config: ProviderConfig): ProviderConfig {
+    val mirrorStr = json.encodeToString(ProviderConfig.serializer(), config)
+    val snapshot = config.toSnapshot(json, jsonSyncHash = hashJsonMirror(mirrorStr))
+    providerDao.syncAllIncremental(
+        instances = snapshot.instances,
+        entries = snapshot.entries,
+        meta = snapshot.meta,
+    )
+    val mirrorWritten = prefs.edit().putString("config", mirrorStr).commit()
+    return snapshot.toProviderConfig(json)
+}
+"""
+
+# Breaker: wrapped, but the mirror write is INSIDE the envelope — a DAO throw
+# still skips it (the same defect wearing a wrapper).
+FIX_PERSIST_MIRROR_INSIDE_BAD = """
+private suspend fun persistToDbAndMirror(config: ProviderConfig): ProviderConfig {
+    val mirrorStr = json.encodeToString(ProviderConfig.serializer(), config)
+    val snapshot = config.toSnapshot(json, jsonSyncHash = hashJsonMirror(mirrorStr))
+    runCatching {
+        providerDao.syncAllIncremental(
+            instances = snapshot.instances,
+            entries = snapshot.entries,
+            meta = snapshot.meta,
+        )
+        val mirrorWritten = prefs.edit().putString("config", mirrorStr).commit()
+    }.onFailure { e ->
+        android.util.Log.e("ProviderRepo", "DB incremental sync failed: ${'$'}{e.message}", e)
+    }
+    return snapshot.toProviderConfig(json)
+}
+"""
+
+# fail-closed: the mirror write face is gone -> ROT, not a silent pass.
+FIX_PERSIST_NOMIRROR_BAD = """
+private suspend fun persistToDbAndMirror(config: ProviderConfig): ProviderConfig {
+    val mirrorStr = json.encodeToString(ProviderConfig.serializer(), config)
+    val snapshot = config.toSnapshot(json, jsonSyncHash = hashJsonMirror(mirrorStr))
+    val dbWrite = runCatching {
+        providerDao.syncAllIncremental(instances = snapshot.instances)
+    }
+    dbWrite.onFailure { e -> android.util.Log.e("ProviderRepo", "failed", e) }
+    return snapshot.toProviderConfig(json)
+}
+"""
+
+# [fix/dv22-a1 §1042-A-01] Arm 11 fixtures: restoreThinkingRules must wrap its
+# DAO call (like its nine siblings) and must not silently discard the failure.
+FIX_RESTORE_OK = """
+private suspend fun restoreThinkingRules(instanceId: String, rows: JSONArray): Int = runBlocking {
+    val entities = ArrayList<ProviderThinkingRuleEntity>()
+    for (i in 0 until rows.length()) {
+        val o = rows.optJSONObject(i) ?: continue
+        val id = o.optString("id", "")
+        if (id.isEmpty()) continue
+        entities.add(
+            ProviderThinkingRuleEntity(
+                id = id,
+                providerInstanceId = instanceId,
+                label = o.optString("label", ""),
+                sortOrder = o.optInt("sortOrder", i),
+            ),
+        )
+    }
+    if (entities.isEmpty()) return@runBlocking 0
+    val persisted = runCatching {
+        providerDao.replaceThinkingRules(instanceId, entities)
+    }.onFailure { e ->
+        android.util.Log.e("ProviderRepo", "restoreThinkingRules failed: ${'$'}{e.message}", e)
+    }.isSuccess
+    if (!persisted) return@runBlocking 0
+    republishThinkingCache(instanceId)
+    entities.size
+}
+"""
+
+# Breaker: the baseline shape — bare DAO call, the exception escapes into the
+# backup importer while the nine siblings all wrap.
+FIX_RESTORE_BARE_BAD = """
+private suspend fun restoreThinkingRules(instanceId: String, rows: JSONArray): Int = runBlocking {
+    val entities = ArrayList<ProviderThinkingRuleEntity>()
+    if (entities.isEmpty()) return@runBlocking 0
+    providerDao.replaceThinkingRules(instanceId, entities)
+    republishThinkingCache(instanceId)
+    entities.size
+}
+"""
+
+# Breaker: wrapped but the failure is discarded silently (no handler) — the
+# silent-swallow form of the same defect.
+FIX_RESTORE_SILENT_BAD = """
+private suspend fun restoreThinkingRules(instanceId: String, rows: JSONArray): Int = runBlocking {
+    val entities = ArrayList<ProviderThinkingRuleEntity>()
+    if (entities.isEmpty()) return@runBlocking 0
+    val persisted = runCatching {
+        providerDao.replaceThinkingRules(instanceId, entities)
+    }.isSuccess
+    if (!persisted) return@runBlocking 0
+    republishThinkingCache(instanceId)
+    entities.size
+}
+"""
+
+# Breaker: a try envelope with no catch — the failure escapes anyway.
+FIX_RESTORE_NOCATCH_BAD = """
+private suspend fun restoreThinkingRules(instanceId: String, rows: JSONArray): Int = runBlocking {
+    val entities = ArrayList<ProviderThinkingRuleEntity>()
+    if (entities.isEmpty()) return@runBlocking 0
+    try {
+        providerDao.replaceThinkingRules(instanceId, entities)
+    }
+    republishThinkingCache(instanceId)
+    entities.size
+}
+"""
+
+# fail-closed: the restore write face is gone -> ROT.
+FIX_RESTORE_MISSING_BAD = """
+private suspend fun restoreThinkingRules(instanceId: String, rows: JSONArray): Int = runBlocking {
+    val entities = ArrayList<ProviderThinkingRuleEntity>()
+    if (entities.isEmpty()) return@runBlocking 0
+    republishThinkingCache(instanceId)
+    entities.size
 }
 """
 
@@ -1082,7 +1353,7 @@ FIX_CONVERT_BAD = """private fun convertThinkingRules(
 
 
 def build_fixture_tree(tmp, merge_src, export_src, parse_src, convert_src,
-                       update_entry_src=None):
+                       update_entry_src=None, persist_src=None, restore_src=None):
     os.makedirs(os.path.join(tmp, APP + "/data/repository"), exist_ok=True)
     os.makedirs(os.path.join(tmp, APP + "/backup"), exist_ok=True)
     os.makedirs(os.path.join(tmp, APP + "/data/model"), exist_ok=True)
@@ -1090,7 +1361,9 @@ def build_fixture_tree(tmp, merge_src, export_src, parse_src, convert_src,
         f.write(merge_src + "\n" + export_src + "\n" + parse_src + "\n" + FIX_HELPERS
                 + "\n" + FIX_IMPORT_OK + "\n" + FIX_MERGE_FIELDS_HELPER + "\n"
                 + (FIX_UPDATE_ENTRY_OK if update_entry_src is None else update_entry_src)
-                + "\n" + FIX_SAVE_CANONICAL)
+                + "\n" + FIX_SAVE_CANONICAL
+                + "\n" + (FIX_PERSIST_OK if persist_src is None else persist_src)
+                + "\n" + (FIX_RESTORE_OK if restore_src is None else restore_src))
     with open(os.path.join(tmp, BM_REL), "w") as f:
         f.write(convert_src)
     with open(os.path.join(tmp, LM_REL), "w") as f:
@@ -1153,7 +1426,12 @@ def selftest():
         with open(os.path.join(tmp, PR_REL), "w") as f:
             f.write(FIX_MERGE_FIELDS_OK + "\n" + FIX_EXPORT_OK + "\n" + FIX_PARSE_OK + "\n"
                     + FIX_HELPERS + "\n" + FIX_IMPORT_OK + "\n" + FIX_MERGE_FIELDS_HELPER
-                    + "\n" + FIX_UPDATE_ENTRY_OK + "\n" + FIX_SAVE_RAW_BAD)
+                    + "\n" + FIX_UPDATE_ENTRY_OK + "\n" + FIX_SAVE_RAW_BAD
+                    # [fix/dv22-a1 §1042-A-01] this fixture hand-builds its tree
+                    # instead of calling build_fixture_tree, so the compliant
+                    # arm-10/11 bodies must be carried explicitly — otherwise
+                    # arms 10/11 ROT and the fixture stops isolating arm 8.
+                    + "\n" + FIX_PERSIST_OK + "\n" + FIX_RESTORE_OK)
         with open(os.path.join(tmp, BM_REL), "w") as f:
             f.write(FIX_CONVERT_OK)
         with open(os.path.join(tmp, LM_REL), "w") as f:
@@ -1191,6 +1469,59 @@ def selftest():
             failures.append("update-missing fixture arms=%r (want ['9'])" % (got,))
         elif not any("gate ROT" in x[3] for x in v):
             failures.append("update-missing fixture did not report ROT: %r" % (v,))
+    # [fix/dv22-a1 §1042-A-01] Arms 10/11: the DB write must not be able to
+    # skip the mirror write (10), and the one function whose nine siblings all
+    # wrap their DAO call must wrap it too — with a handler, not a silent
+    # swallow (11). Each fixture reds only its own arm; both ROT cases are
+    # fail-closed (a renamed/removed write face is a violation, not a pass).
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_OK, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK,
+                           persist_src=FIX_PERSIST_BARE_BAD)
+        got = _arm_set(tmp)
+        if got != ["10"]:
+            failures.append("persist-bare-dao fixture arms=%r (want ['10'])" % (got,))
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_OK, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK,
+                           persist_src=FIX_PERSIST_MIRROR_INSIDE_BAD)
+        got = _arm_set(tmp)
+        if got != ["10"]:
+            failures.append("persist-mirror-inside fixture arms=%r (want ['10'])" % (got,))
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_OK, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK,
+                           persist_src=FIX_PERSIST_NOMIRROR_BAD)
+        v = run_checks(tmp)
+        got = sorted({x[2] for x in v})
+        if got != ["10"]:
+            failures.append("persist-no-mirror fixture arms=%r (want ['10'])" % (got,))
+        elif not any("gate ROT" in x[3] for x in v):
+            failures.append("persist-no-mirror fixture did not report ROT: %r" % (v,))
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_OK, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK,
+                           restore_src=FIX_RESTORE_BARE_BAD)
+        got = _arm_set(tmp)
+        if got != ["11"]:
+            failures.append("restore-bare-dao fixture arms=%r (want ['11'])" % (got,))
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_OK, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK,
+                           restore_src=FIX_RESTORE_SILENT_BAD)
+        got = _arm_set(tmp)
+        if got != ["11"]:
+            failures.append("restore-silent-swallow fixture arms=%r (want ['11'])" % (got,))
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_OK, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK,
+                           restore_src=FIX_RESTORE_NOCATCH_BAD)
+        got = _arm_set(tmp)
+        if got != ["11"]:
+            failures.append("restore-no-catch fixture arms=%r (want ['11'])" % (got,))
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_OK, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK,
+                           restore_src=FIX_RESTORE_MISSING_BAD)
+        v = run_checks(tmp)
+        got = sorted({x[2] for x in v})
+        if got != ["11"]:
+            failures.append("restore-missing fixture arms=%r (want ['11'])" % (got,))
+        elif not any("gate ROT" in x[3] for x in v):
+            failures.append("restore-missing fixture did not report ROT: %r" % (v,))
     if failures:
         for f in failures:
             print("SELFTEST-FAIL: " + f)
@@ -1198,7 +1529,9 @@ def selftest():
         return 1
     print("selftest: compliant green / violating red arms 1-6 / read-dropped red arms 3+5"
           " / merge-noapply red arm 6 / merge-id-only+whitelist red arm 7 / save-raw red arm 8"
-          " / merge-restamp+update-restamp+update-no-switch+update-missing red arm 9")
+          " / merge-restamp+update-restamp+update-no-switch+update-missing red arm 9"
+          " / persist-bare+persist-mirror-inside+persist-no-mirror red arm 10"
+          " / restore-bare+restore-silent+restore-no-catch+restore-missing red arm 11")
     print("PROVIDER_IMPORT_ID_ROUNDTRIP_SELFTEST=PASS")
     return 0
 
@@ -1218,7 +1551,7 @@ def main():
         for rel, line, arm, msg in violations:
             print("  [arm %s] %s:%s — %s" % (arm, rel, line, msg))
         sys.exit(1)
-    print("PROVIDER_IMPORT_ID_ROUNDTRIP: clean (9 arms)")
+    print("PROVIDER_IMPORT_ID_ROUNDTRIP: clean (11 arms)")
     sys.exit(0)
 
 
