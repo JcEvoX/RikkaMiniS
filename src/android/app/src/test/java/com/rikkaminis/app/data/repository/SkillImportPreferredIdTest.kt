@@ -102,6 +102,35 @@ class SkillImportPreferredIdTest {
         )
     }
 
+    // -- [dv22-B6 §1042-B-07] the URL import must carry the caller's resolved
+    //    id: the browser resolves the update target BEFORE importing, and a
+    //    repository that drops the value on the floor re-creates the
+    //    duplicate-under-slug defect the dedup was meant to close --
+
+    @Test
+    fun importFromGitHub_signature_hasPreferredIdParameter() {
+        val src = readRepoFile("app/src/main/java/com/rikkaminis/app/data/repository/SkillRepository.kt")
+        val sig = src.substringAfter("suspend fun importFromGitHub(").substringBefore("): Skill? =")
+        assertTrue(
+            "importFromGitHub must accept preferredId: String? = null as the last parameter",
+            sig.contains("preferredId: String? = null"),
+        )
+    }
+
+    @Test
+    fun importFromGitHub_passesPreferredIdToImportFromContent() {
+        val fn = readRepoFile("app/src/main/java/com/rikkaminis/app/data/repository/SkillRepository.kt")
+            .substringAfter("suspend fun importFromGitHub(")
+            .substringBefore("/** Outcome of [updateFromURL]")
+        val call = fn.substringAfter("importFromContent(").substringBefore("\n")
+        assertTrue(
+            "importFromGitHub's importFromContent call must pass preferredId = preferredId " +
+                "(without it the landing id is always slugify(name) and a renamed / " +
+                "custom-id local record is duplicated instead of refreshed)",
+            call.contains("preferredId = preferredId"),
+        )
+    }
+
     // -- ISSUE-10 wiring: cross-db session cleanup closure --
 
     @Test
