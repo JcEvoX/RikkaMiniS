@@ -976,11 +976,22 @@ class SkillRepository(private val context: Context) {
     /**
      * Download SKILL.md from a GitHub URL and recursively download sibling files
      * from the same directory. Mirrors iOS SkillStore.importFromGitHub.
+     *
+     * [dv22-B6 §1042-B-07] `preferredId` routes the import to the
+     * replace-in-place branch of [importFromContent] under an EXISTING local
+     * id. Without it the landing id was always `slugify(name)`: importing a
+     * catalogue entry whose local record sits under a different id (renamed
+     * skill, custom id) silently created a duplicate record instead of
+     * refreshing the installed one, and the re-import of an already-installed
+     * skill reported "imported" although the repository had replaced it.
+     * The replace branch refreshes name / description / version / body /
+     * frontmatter / importSource / sourceURL in place, so the sibling
+     * recursion below lands in the existing skill's directory.
      */
-    suspend fun importFromGitHub(urlString: String): Skill? = withContext(Dispatchers.IO) {
+    suspend fun importFromGitHub(urlString: String, preferredId: String? = null): Skill? = withContext(Dispatchers.IO) {
         val rawURL = githubToRawURL(urlString) ?: return@withContext null
         val content = httpGetString(rawURL) ?: return@withContext null
-        val skill = importFromContent(content, ImportSource.URL, sourceURL = urlString) ?: return@withContext null
+        val skill = importFromContent(content, ImportSource.URL, sourceURL = urlString, preferredId = preferredId) ?: return@withContext null
 
         val ghInfo = parseGitHubURL(urlString) ?: return@withContext skill
         val skillDir = File(skillsDir, skill.id)

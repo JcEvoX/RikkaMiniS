@@ -220,7 +220,19 @@ fun MinisSkillsBrowserScreen(
 
                         webChromeClient = WebChromeClient()
 
-                        loadUrl("https://github.com/OpenMinis/MinisSkills")
+                        // [dv22-B6 §1042-B-07] Restore the page the user was
+                        // looking at instead of the repository root. This
+                        // factory re-runs whenever `key(rendererEpoch)` bumps
+                        // (renderer killed by the system / crash recovery),
+                        // and the hardcoded root URL used to throw the user
+                        // back to OpenMinis/MinisSkills mid-browse — losing
+                        // the very skill directory they were reading and,
+                        // with it, the URL the Import button acts on.
+                        // `currentUrl` tracks every navigation
+                        // (onPageStarted + doUpdateVisitedHistory); the
+                        // ifBlank fallback keeps the first-ever open pointed
+                        // at the catalogue.
+                        loadUrl(currentUrl.ifBlank { "https://github.com/OpenMinis/MinisSkills" })
                     }.also { webViewRef = it }
                 },
                 onRelease = { wv ->
@@ -304,24 +316,19 @@ private suspend fun importSkillFromCurrentUrl(
     onStateChange(HudState.IMPORTING, "")
 
     try {
-        // Hand the GitHub directory URL to the repository's full-fat
-        // importer. importFromGitHub fetches SKILL.md, imports it, then
-        // recurses through the GitHub Contents API to pull every sibling
-        // file (scripts/, references/, sub-directories) into the skill's
-        // local directory. The previous flow only fetched SKILL.md via
-        // toRawGitHubUrl + importFromContent, which left bundled
-        // scripts on the server and the skill non-runnable on first use.
-        val skill = skillRepository.importFromGitHub(url)
-        if (skill != null) {
-            onStateChange(HudState.SUCCESS, context.getString(R.string.skills_browser_success_imported, skill.name))
-            delay(3000)
-            onStateChange(HudState.HIDDEN, "")
-            return
-        }
-
-        // importFromGitHub returned null — the SKILL.md was either
-        // missing or duplicate. Fall back to the prior "fetch + try
-        // updating existing" path so users can refresh in place.
+        // [dv22-B6 §1042-B-07] Pre-dedup: fetch the raw SKILL.md once to learn
+        // the incoming skill's name, then resolve the local record this
+        // catalogue page updates (by name slug, else by display name) BEFORE
+        // importing. Passing that id into importFromGitHub routes the import
+        // to importFromContent's replace-in-place branch, so:
+        //   * an already-installed skill is refreshed under its EXISTING id —
+        //     a local record under a different id (renamed / custom id) is no
+        //     longer duplicated under slugify(name), and
+        //   * the HUD tells the truth: "updated" vs "imported". Before this,
+        //     importFromGitHub's replace branch always returned non-null, so
+        //     `if (skill != null)` was always true and the in-place refresh
+        //     below was unreachable for every skill whose id equals its name
+        //     slug (the screen always claimed "imported").
         val rawUrl = toRawGitHubUrl(url)
         val content = withContext(Dispatchers.IO) {
             val conn = URL(rawUrl).openConnection() as HttpURLConnection
@@ -346,57 +353,82 @@ private suspend fun importSkillFromCurrentUrl(
         }
 
         val parsed = skillRepository.parseSkillMdPublic(content)
-        if (parsed != null) {
-            // [FIX-R22 B32b] The old call used `slugify(parsed)` as the id and
-            // passed body only: skills whose local id differs from the name
-            // slug (renamed or imported with a custom id) never matched, and
-            // description/version were dropped. Resolve the real record id by
-            // name OR slug (pure helper below, JVM-covered), pass the full
-            // ParsedSkill, and run the repository write on IO — db.execSQL +
-            // writeSkillMd are disk IO and used to run on the Main
-            // dispatcher. [da1030-A ISSUE-02] The landing document's frontmatter
-            // block travels with the managed fields: update() re-seeds its copy
-            // from the on-disk SKILL.md when no block is passed, so omitting it
-            // shadowed `subagent` / `max_turns` / `allowed_tools` with whatever
-            // the disk already said (a catalogue edit under a refactor never
-            // landed, silently). Same contract as updateFromURL /
-            // "update from file".
-            val targetId = resolveUpdateTargetId(
-                skillRepository.skills.value.map { it.id to it.name },
-                slug = slugify(parsed.name),
-                incomingName = parsed.name,
-            ) ?: slugify(parsed.name)
-            val updated = withContext(Dispatchers.IO) {
-                skillRepository.update(
-                    id = targetId,
-                    name = parsed.name,
-                    description = parsed.description,
-                    // [rv1014-E3] The other in-place update paths (refreshFromDisk,
-                    // importFromContent, importFromArchive) all refresh version
-                    // too — keep the browser refresh consistent. parseSkillMd
-                    // defaults a missing frontmatter version to "1.0.0", so a
-                    // SKILL.md without one resets the stored version to that
-                    // default (accepted: same exposure as refreshFromDisk).
-                    version = parsed.version,
-                    body = parsed.body,
-                    // [da1030-A ISSUE-02] Hand the parsed document's block over
-                    // too — without it update() re-seeds from the on-disk
-                    // SKILL.md, so the incoming `subagent` / `max_turns` /
-                    // `allowed_tools` were shadowed by whatever the disk said.
-                    frontmatter = parsed.frontmatter.ifBlank { null },
-                )
-            }
-            if (updated) {
-                onStateChange(HudState.SUCCESS, context.getString(R.string.skills_browser_success_updated, parsed.name))
-                delay(3000)
-                onStateChange(HudState.HIDDEN, "")
-            } else {
-                onStateChange(HudState.ERROR, context.getString(R.string.skills_browser_error_invalid))
-                delay(4000)
-                onStateChange(HudState.HIDDEN, "")
-            }
-        } else {
+        if (parsed == null) {
             onStateChange(HudState.ERROR, context.getString(R.string.skills_browser_error_format))
+            delay(4000)
+            onStateChange(HudState.HIDDEN, "")
+            return
+        }
+
+        val matchedId = resolveUpdateTargetId(
+            skillRepository.skills.value.map { it.id to it.name },
+            slug = slugify(parsed.name),
+            incomingName = parsed.name,
+        )
+
+        // Hand the GitHub directory URL to the repository's full-fat
+        // importer: importFromGitHub re-fetches SKILL.md, imports it under
+        // matchedId (replace-in-place when a local record matched), then
+        // recurses through the GitHub Contents API to pull every sibling
+        // file (scripts/, references/, sub-directories) into the skill's
+        // local directory — on the update path too, which the pre-fix
+        // fallback's update() alone never did.
+        val skill = skillRepository.importFromGitHub(url, preferredId = matchedId)
+        if (skill != null) {
+            val messageRes =
+                if (matchedId != null) R.string.skills_browser_success_updated
+                else R.string.skills_browser_success_imported
+            onStateChange(HudState.SUCCESS, context.getString(messageRes, skill.name))
+            delay(3000)
+            onStateChange(HudState.HIDDEN, "")
+            return
+        }
+
+        // importFromGitHub returned null — the parsed name yields no
+        // adoptable id (blank slug, e.g. a pure-CJK name) and nothing matched
+        // at dedup time. Last-resort in-place refresh: re-resolve against a
+        // FRESH snapshot (a concurrent import may have landed the skill
+        // between the pre-dedup read and here) and write the parsed document,
+        // so a manual-id record still gets refreshed instead of erroring out.
+        // [FIX-R22 B32b] Resolve the real record id by name OR slug (pure
+        // helper below, JVM-covered) — skills whose local id differs from the
+        // name slug (renamed or imported with a custom id) never matched
+        // when the old call used `slugify(parsed)` as the id — and pass the
+        // full ParsedSkill, running the repository write on IO (db.execSQL +
+        // writeSkillMd are disk IO).
+        // [da1030-A ISSUE-02] The landing document's frontmatter block
+        // travels with the managed fields: update() re-seeds its copy from
+        // the on-disk SKILL.md when no block is passed, so omitting it would
+        // shadow `subagent` / `max_turns` / `allowed_tools` with whatever the
+        // disk already said. Same contract as updateFromURL /
+        // "update from file".
+        val targetId = resolveUpdateTargetId(
+            skillRepository.skills.value.map { it.id to it.name },
+            slug = slugify(parsed.name),
+            incomingName = parsed.name,
+        ) ?: slugify(parsed.name)
+        val updated = withContext(Dispatchers.IO) {
+            skillRepository.update(
+                id = targetId,
+                name = parsed.name,
+                description = parsed.description,
+                // [rv1014-E3] The other in-place update paths (refreshFromDisk,
+                // importFromContent, importFromArchive) all refresh version
+                // too — keep the browser refresh consistent. parseSkillMd
+                // defaults a missing frontmatter version to "1.0.0", so a
+                // SKILL.md without one resets the stored version to that
+                // default (accepted: same exposure as refreshFromDisk).
+                version = parsed.version,
+                body = parsed.body,
+                frontmatter = parsed.frontmatter.ifBlank { null },
+            )
+        }
+        if (updated) {
+            onStateChange(HudState.SUCCESS, context.getString(R.string.skills_browser_success_updated, parsed.name))
+            delay(3000)
+            onStateChange(HudState.HIDDEN, "")
+        } else {
+            onStateChange(HudState.ERROR, context.getString(R.string.skills_browser_error_invalid))
             delay(4000)
             onStateChange(HudState.HIDDEN, "")
         }
