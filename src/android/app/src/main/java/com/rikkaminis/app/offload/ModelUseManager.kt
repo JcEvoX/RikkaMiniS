@@ -2,6 +2,7 @@ package com.rikkaminis.app.offload
 
 import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.model.ProviderInstance
+import com.rikkaminis.app.data.model.directionalModalities
 import org.json.JSONArray
 import org.json.JSONObject
 

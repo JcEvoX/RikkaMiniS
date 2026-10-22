@@ -13,6 +13,7 @@ import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.model.ModelOverrides
 import com.rikkaminis.app.data.model.directionalModalities
 import com.rikkaminis.app.data.model.expandDirectionalModalities
+import com.rikkaminis.app.data.model.modalityNamesInOrder
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.provider.ModelsDevApi
 
@@ -268,7 +269,7 @@ class ModelsCollection(
         val outputs = ArrayList<String>()
         for (n in names) {
             val low = n.lowercase()
-            if (low !in allowedModalities) {
+            if (low !in modalityNamesInOrder) {
                 throw ConfigError.InvalidValue(
                     "Unknown modality '$n'. Allowed: ${modalityNamesInOrder.joinToString(", ")}"
                 )
