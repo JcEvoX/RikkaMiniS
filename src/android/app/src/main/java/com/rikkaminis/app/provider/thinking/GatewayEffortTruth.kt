@@ -116,10 +116,31 @@ object GatewayEffortTruth {
         "deepseek-v4.1-flash" to listOf("none", "low", "high", "xhigh", "max"),
     )
 
+    /**
+     * [T-senseaudio-effort-enum] Last resort for a model THIS gateway serves that we
+     * have not probed. [SENSENOVA_FALLBACK_TIERS] cannot stand in: it carries
+     * `medium`, and this relay 400s `medium` outright. One last-resort set per
+     * gateway family, never one table for both — the same rule [SENSEAUDIO_TIERS]
+     * already follows against [SENSENOVA_TIERS].
+     *
+     * `minimal` is omitted for the same reason it is omitted below (no client-side
+     * [ThinkingLevel] maps to it). `max` is KEPT, unlike the sensenova fallback: the
+     * gateway's own 400 text names it as legal ("must be low, high, xhigh, max, or
+     * an integer within [1, 100]") and the probe accepted it, whereas six of the
+     * seven measured sensenova models reject it. That text describes the gateway,
+     * not one model, so it is the strongest evidence available for models we have
+     * not probed here.
+     */
+    val SENSEAUDIO_FALLBACK_TIERS = listOf("none", "low", "high", "xhigh", "max")
+
     fun isSensenovaHost(host: String): Boolean = host in SENSENOVA_HOSTS
 
-    /** True when [host] has a measured truth table — the caller may replace the
-     *  models.dev declared tiers with it ([ModelsDevApi.applyGatewayEffortTruth]). */
+    /** True when [host] has a measured truth table. Two consumers, one question:
+     *  the model-sync path replaces the models.dev declared tiers with it
+     *  ([ModelsDevApi.applyGatewayEffortTruth]) and the request path routes the host
+     *  through [resolveTier] instead of a hand-written `when (host)` arm
+     *  (`OpenAIProvider.injectThinkingParams`) — a table that only one of them
+     *  consults is a table the wire never sees. */
     fun isMeasuredHost(host: String): Boolean =
         isSensenovaHost(host) || host in SENSEAUDIO_HOSTS
 
@@ -134,6 +155,17 @@ object GatewayEffortTruth {
     }
 
     /**
+     * The last-resort set for [host] — chosen by gateway FAMILY, never one global
+     * constant: the two measured gateways disagree about `medium` on the same model
+     * id, so a single shared fallback would hand one of them a value it 400s.
+     *
+     * Only reachable for hosts this object describes (its production caller sits
+     * behind [isMeasuredHost]); anything else keeps the original sensenova set.
+     */
+    private fun fallbackTiersFor(host: String): List<String> =
+        if (host in SENSEAUDIO_HOSTS) SENSEAUDIO_FALLBACK_TIERS else SENSENOVA_FALLBACK_TIERS
+
+    /**
      * The wire value for an ENABLED [level] on a gateway whose strict enum this object
      * describes. Precedence:
      *
@@ -141,7 +173,8 @@ object GatewayEffortTruth {
      *     One-hand truth, freshest, and the only source that ever updates itself.
      *  2. [tiersFor] — the static measurement table (what we probed by hand).
      *  3. [declaredTiers] — the catalog's opinion, possibly under-declared.
-     *  4. [SENSENOVA_FALLBACK_TIERS] — never a value the gateway is known to reject.
+     *  4. [fallbackTiersFor] — the conservative set for THIS gateway, never a value
+     *     it is known to reject.
      *
      * Extracted from the provider's host-table branch so the decision is testable: the
      * branch runs behind a base-URL host match, which a MockWebServer-backed test cannot
@@ -159,7 +192,7 @@ object GatewayEffortTruth {
         val tiers = EffortTierLearner.learned(host, modelId)
             ?: tiersFor(host, modelId)
             ?: declaredTiers?.takeIf { it.isNotEmpty() }
-            ?: SENSENOVA_FALLBACK_TIERS
+            ?: fallbackTiersFor(host)
         return ThinkingEffortLadder.clampEffort(ThinkingEffortLadder.wireEffort(level), tiers)
     }
 }

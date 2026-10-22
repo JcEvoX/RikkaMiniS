@@ -2500,8 +2500,9 @@ class OpenAIProvider constructor(
         // [T5-M4] AUTO means "let the vendor decide" — omit ALL thinking
         // control fields. The relay dialects below key off level.isEnabled, and
         // AUTO.isEnabled == true, so picking Auto silently forced thinking ON on
-        // every listed host. The sensenova branch already returns early for
-        // AUTO; these six predate AUTO and never followed the semantics.
+        // every listed host. The measured-gateway branch and the relay dialects
+        // below predate AUTO and never followed the semantics; AUTO is handled
+        // once, above both, by the single `level == AUTO` return.
         // [T-deepseek-v4-thinking-echo] Resolve the ctx (and the echo requirement the
         // rules declare for this model) BEFORE the relay-host table: the host branches
         // return early, and the vendor's echo demand is a property of the MODEL, not of
@@ -2532,6 +2533,51 @@ class OpenAIProvider constructor(
         val echo = ThinkingRuleResolver.echoPolicyFor(ctx)
 
         if (level == ThinkingLevel.AUTO) return echo
+
+        // [T-measured-gateway-effort] Every gateway whose `reasoning_effort` enum we
+        // measured by hand is dispatched HERE, off [GatewayEffortTruth.isMeasuredHost]
+        // — the truth table, not a second copy of the host list. Two gateways are
+        // measured today (sensenova: token.sensenova.cn / api.sensenova.cn;
+        // senseaudio: api.senseaudio.cn), and the enums differ PER MODEL *and* per
+        // gateway: `glm-5.2` takes `max` while `sensenova-6.8-flash-lite` rejects it,
+        // and `deepseek-v4.1-flash` takes `medium` on sensenova but is 400'd for it on
+        // senseaudio. Adding a third host is therefore a table edit, not an edit here.
+        //
+        // This branch used to be a `when (host)` arm listing sensenova's two hosts by
+        // hand, which meant senseaudio — measured, tabled, and reachable from the
+        // picker — silently fell through to the rule engine below: `medium` went out
+        // unclamped (HTTP 400, "reasoning_effort must be low, high, xhigh, max, or an
+        // integer within [1, 100]") and `xhigh`/`max` were clamped away by whatever
+        // stale tier set the catalog had declared. A table nobody consults is not a
+        // truth table.
+        //
+        // The clamp is applied PER TIER. Collapsing every enabled tier onto one value
+        // (the behaviour that preceded it: unconditional "xhigh") avoided the 400 but
+        // silently made LOW/MEDIUM/HIGH indistinguishable — the picker drew three
+        // options that produced one request, which is the bug users reported.
+        // clampEffort walks down then up, so a tier the model's enum lacks degrades to
+        // the strongest tier below it instead of failing the request.
+        if (GatewayEffortTruth.isMeasuredHost(host)) {
+            if (model.supportsReasoning == false) return echo
+            if (!level.isEnabled) {
+                // Measured live: `reasoning_effort:"none"` is accepted and really
+                // stops the reasoning stream; enable_thinking is honoured but does
+                // NOT suppress reasoning_content on deepseek-v4-flash.
+                body.put("reasoning_effort", "none")
+                return echo
+            }
+            // ON: emit the tier the user asked for, clamped onto the gateway's
+            // measured enum (see GatewayEffortTruth.resolveTier — measurement first,
+            // then whatever the catalog declared, then that gateway's own fallback).
+            body.put(
+                "reasoning_effort",
+                GatewayEffortTruth.resolveTier(host, model.id, level, model.reasoningEffortValues),
+            )
+            return echo
+        }
+
+        // Every host below is an UNMEASURED relay dialect: its wire shape comes from
+        // live observation of one model, not from a probed effort enum.
         when (host) {
             "api.siliconflow.cn" -> {
                 // SiliconFlow: enable_thinking is honored only by an allowlist.
@@ -2575,44 +2621,6 @@ class OpenAIProvider constructor(
                 return echo
             }
 
-            // [T-sensenova-effort-enum] Sensenova's OpenAI-compat gateway
-            // (token.sensenova.cn / api.sensenova.cn) validates reasoning_effort against
-            // a STRICT per-model enum and 400s anything outside it:
-            //   400 field ReasoningEffort invalid, should be one of: low, medium, high, xhigh, none
-            // The enum is per MODEL, not per host — measured live 2026-09-23, glm-5.2
-            // accepts `max` while sensenova-6.8-flash-lite rejects it. See
-            // GatewayEffortTruth for the measured table and the probe that produced it.
-            //
-            // Re-measured 2026-09-23: an earlier note here claimed "non-streaming
-            // accepted max, streaming 400'd it". Both paths reject it now, so the only
-            // reason for a clamp is that the gateway's enum is strict — not a per-path
-            // difference. deepseek-v4-flash was the original observed victim.
-            //
-            // The clamp is applied PER TIER. Collapsing every enabled tier onto one
-            // value (the previous behaviour: unconditional "xhigh") avoided the 400 but
-            // silently made LOW/MEDIUM/HIGH indistinguishable — the picker drew three
-            // options that produced one request, which is the bug users reported.
-            // clampEffort walks down then up, so a tier the model's enum lacks degrades
-            // to the strongest tier below it instead of failing.
-            "token.sensenova.cn", "api.sensenova.cn" -> {
-                if (level == ThinkingLevel.AUTO) return echo
-                if (model.supportsReasoning == false) return echo
-                if (!level.isEnabled) {
-                    // Measured live: `reasoning_effort:"none"` is accepted and really
-                    // stops the reasoning stream; enable_thinking is honoured but does
-                    // NOT suppress reasoning_content on deepseek-v4-flash.
-                    body.put("reasoning_effort", "none")
-                    return echo
-                }
-                // ON: emit the tier the user asked for, clamped onto the gateway's
-                // measured enum (see GatewayEffortTruth.resolveTier — measurement first,
-                // then whatever the catalog declared, then the conservative fallback).
-                body.put(
-                    "reasoning_effort",
-                    GatewayEffortTruth.resolveTier(host, model.id, level, model.reasoningEffortValues),
-                )
-                return echo
-            }
         }
 
         // [T-android-thinking-rules-phase2] Everything below the host table is now
