@@ -3,7 +3,9 @@ package com.rikkaminis.app.provider
 import android.content.Context
 import android.util.Log
 import com.rikkaminis.app.data.model.LLMModel
+import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.model.ProviderType
+import com.rikkaminis.app.data.model.effectiveEntryModel
 import com.rikkaminis.app.data.model.legacyProviderNames
 import com.rikkaminis.app.data.model.modelsDevProviderIds
 import com.rikkaminis.app.provider.thinking.GatewayEffortTruth
@@ -179,6 +181,25 @@ object ModelsDevApi {
             model
         }
     }
+
+    // MARK: - Public: Effective model of a ModelEntry
+
+    /**
+     * The model a [ModelEntry] really resolves to — **enrich the base model
+     * first, then apply the user's overrides** ([effectiveEntryModel] holds the
+     * ordering contract).
+     *
+     * This is the single entry point for every surface that answers "what can
+     * this model do" (the `minis-model-use` filter/guards, the config
+     * collection's `modalities` / `supportsTools`, and the agent-facing
+     * `minis-model-use list` payload). Each of them used to re-derive it, and
+     * they disagreed: the list enriched AFTER applying overrides (so the
+     * registry overwrote explicit user choices) while the other two skipped
+     * enrichment entirely (so all 39 built-in models, whose modality fields are
+     * null by construction, reported no modalities at all).
+     */
+    fun effectiveModel(entry: ModelEntry): LLMModel =
+        effectiveEntryModel(entry, ::enrichModel)
 
     /**
      * [T-sensenova-effort-enum] Replace the declared effort tiers with the gateway's

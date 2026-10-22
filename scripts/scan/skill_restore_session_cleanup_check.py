@@ -18,10 +18,14 @@ ISSUE-10 (ChatRepository.kt + MinisApp.kt)
   SkillRepository.clearSessionOverrides / MCPRepository.clearSessionOverrides
   existed with ZERO production callers — a deleted session's "Allow in this
   session" skill/mcp toggles leaked into every later session that reused the
-  id. The rule: ChatRepository exposes an onSessionDeleted hook invoked AFTER
-  the session row is gone from BOTH delete entry points, and MinisApp injects
-  a callback that reaps both repositories (with skill/mcp constructed BEFORE
-  chatRepository so the callback references the real instances).
+  id. The rule: ChatRepository exposes an onSessionDeleted hook that EVERY
+  function removing `sessions` rows reaches AFTER the row is gone (user delete,
+  row-only delete and — since dv21-a2, deep-audit-1041 A-02 — the startup
+  empty-session sweep `deleteEmptySessions`), and MinisApp injects a callback
+  that reaps both repositories (with skill/mcp constructed BEFORE
+  chatRepository so the callback references the real instances). The entry
+  point set is DERIVED from the tree: the sweep was the entry point that a
+  hard-coded two-entry list made invisible.
 
 Checks assert PRESENCE of the routing rather than the absence of a spelling,
 so a refactor that keeps the contract is a deliberate edit to this gate rather
@@ -78,7 +82,15 @@ SHARED_DECISION = "shouldDeleteSessionSkillOverride("
 GLOBAL_READ = "_skills.value.find { it.id == skillId }?.isEnabled"
 DELETE_SESSION = "suspend fun deleteSession(id: String): SessionFileStore.DeleteResult? {"
 DELETE_ROW_ONLY = "suspend fun deleteSessionRowOnly(id: String) {"
+# [dv21-a2] Third entry point: the startup empty-session sweep.
+DELETE_EMPTY = "suspend fun deleteEmptySessions("
 INVOKE_HOOK = "onSessionDeleted?.invoke("
+# [dv21-a2] A function whose body drops `sessions` rows IS a delete entry point.
+# The gate derives the set from the tree instead of trusting this list, so a
+# fourth entry point that skips the cleanup goes red.
+SESSION_ROW_DELETES = ("dao.deleteSession(", "dao.deleteEmptySessions(")
+FN_DECL_RE = re.compile(r"\bfun\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+CALL_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 CHATREPO_NEW = "chatRepository = ChatRepository("
 SKILL_NEW = "skillRepository = SkillRepository("
 MCP_NEW = "mcpRepository = MCPRepository("
@@ -309,17 +321,116 @@ def check_skill_repo(src):
     return v
 
 
+def balanced_index(text, open_idx, opener, closer):
+    """Index of the delimiter matching [opener] at `open_idx`, or -1."""
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == opener:
+            depth += 1
+        elif text[i] == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def block_body(code, decl_idx):
+    """The `{...}` body of a block-bodied declaration at `decl_idx`, or None.
+
+    Bounded on purpose: the opening brace must sit on the SAME LINE as the
+    parameter list's closing paren (this codebase's style). That keeps an
+    expression-bodied sibling (`fun foo(): Int = 0`) from swallowing the next
+    declaration's brace.
+    """
+    op = code.find("(", decl_idx)
+    if op < 0:
+        return None
+    cp = balanced_index(code, op, "(", ")")
+    if cp < 0:
+        return None
+    ob = code.find("{", cp)
+    if ob < 0 or "\n" in code[cp + 1:ob]:
+        return None
+    oe = brace_block_end(code, ob)
+    if oe < 0:
+        return None
+    return code[ob:oe + 1]
+
+
+def block_functions(code):
+    """[(name, body)] for every block-bodied declaration in the file."""
+    out = []
+    for m in FN_DECL_RE.finditer(code):
+        body = block_body(code, m.start())
+        if body is not None:
+            out.append((m.group(1), body))
+    return out
+
+
 def check_chat_repo(src):
+    """Arms 1–3 [fix/da1021-A, widened by dv21-a2]: EVERY `sessions`-row delete
+    entry point runs the cross-db cleanup.
+
+    The hook was originally wired into two of the three entry points; the
+    startup empty-session sweep (`deleteEmptySessions`) skipped it, so a session
+    the user opened, flipped a session-scoped toggle on and then abandoned kept
+    its skills.db / mcp.db override rows, its badge and its offload grants for
+    whatever session later reused the id. Criterion: every function that removes
+    `sessions` rows must reach `onSessionDeleted` — inline, or through a helper
+    it calls — and the entry-point SET is derived from the tree, so a fourth
+    entry point that skips the cleanup goes red instead of passing a gate whose
+    list nobody updated.
+    """
     v = []
-    for decl, label in ((DELETE_SESSION, "deleteSession"), (DELETE_ROW_ONLY, "deleteSessionRowOnly")):
-        s = slice_between(src, decl, "}", label, v)  # first '}' ends the decl's opening block marker only in fixtures
-        if s is None:
+    code = strip_literals(src)
+    if code is None:
+        v.append("ChatRepository.kt: unterminated string/comment (ROT — update this gate)")
+        return v
+    funcs = block_functions(code)
+    bodies = {}
+    for name, body in funcs:
+        bodies.setdefault(name, body)
+    # The decision this gate is about: which functions drop `sessions` rows.
+    row_deleters = sorted({name for name, body in funcs
+                           if any(call in body for call in SESSION_ROW_DELETES)})
+    registered = []
+    for decl, label in ((DELETE_SESSION, "deleteSession"),
+                        (DELETE_ROW_ONLY, "deleteSessionRowOnly"),
+                        (DELETE_EMPTY, "deleteEmptySessions")):
+        m = re.search(r"\bfun\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", decl)
+        registered.append((decl, label, m.group(1) if m else label))
+    names = {name for _, _, name in registered}
+    # Arm 1: the registered declarations are still there (a rename is ROT, not
+    # a silent pass).
+    entry_bodies = {}
+    for decl, label, name in registered:
+        off = code.find(decl)
+        if off < 0:
+            v.append("ChatRepository.kt: '%s' not found (ROT — update this gate)" % decl)
             continue
-        if INVOKE_HOOK not in s:
+        entry_bodies[label] = block_body(code, off)
+    # Arm 2: nothing removes `sessions` rows outside the registered set.
+    for name in row_deleters:
+        if name not in names:
             v.append(
-                "ChatRepository.kt: %s does not invoke '%s' — cross-db "
-                "session cleanup is unwired" % (label, INVOKE_HOOK)
+                "ChatRepository.kt: %s removes `sessions` rows but is not a registered "
+                "delete entry point — it must reach '%s' too (ROT — update this gate)"
+                % (name, INVOKE_HOOK)
             )
+    # Arm 3: every entry point reaches the hook (directly or via a helper whose
+    # own body holds it), judged on the body, not on a whole-line spelling.
+    for _, label, _ in registered:
+        body = entry_bodies.get(label)
+        if body is None:
+            continue
+        if INVOKE_HOOK in body:
+            continue
+        if any(INVOKE_HOOK in bodies.get(c, "") for c in CALL_RE.findall(body)):
+            continue
+        v.append(
+            "ChatRepository.kt: %s does not invoke '%s' — cross-db "
+            "session cleanup is unwired" % (label, INVOKE_HOOK)
+        )
     if INVOKE_HOOK not in src:
         v.append("ChatRepository.kt: onSessionDeleted hook declaration missing")
     return v
@@ -760,16 +871,75 @@ class ChatRepository(
         dao.deleteSession(id)
         runCatching { onSessionDeleted?.invoke(id) }.onFailure { warn(it) }
     }
+
+    suspend fun deleteEmptySessions(
+        activeIds: List<String> = emptyList(),
+        graceMillis: Long = 60_000L,
+    ): Int {
+        val guarded = guardActiveIds(activeIds)
+        val staleBefore = System.currentTimeMillis() - graceMillis
+        val candidates = dao.selectEmptySessionIds(guarded, staleBefore)
+        val deleted = dao.deleteEmptySessions(guarded, staleBefore)
+        if (candidates.isEmpty()) return deleted
+        val survivors = dao.existingSessionIds(candidates).toSet()
+        for (id in candidates) {
+            if (id in survivors) continue
+            runCatching { onSessionDeleted?.invoke(id) }.onFailure { warn(it) }
+        }
+        return deleted
+    }
 }
 """
 
-BAD_CHAT_NO_HOOK = GOOD_CHAT.replace(
-    "runCatching { onSessionDeleted?.invoke(id) }.onFailure { warn(it) }\n        return sessionFiles",
-    "return sessionFiles",
-).replace(
-    "runCatching { onSessionDeleted?.invoke(id) }.onFailure { warn(it) }\n    }\n}",
+# One line of the hook, exactly as the wired fixture spells it. Removing every
+# occurrence models "the cleanup was never wired anywhere".
+HOOK_LINE = "runCatching { onSessionDeleted?.invoke(id) }.onFailure { warn(it) }\n"
+# The sweep's copy sits one indent deeper (inside the per-id loop), so this key
+# removes ONLY the sweep's notification.
+SWEEP_HOOK_LINE = "            " + HOOK_LINE
+
+BAD_CHAT_NO_HOOK = GOOD_CHAT.replace(HOOK_LINE, "")
+
+# The dv21-a2 regression itself: a two-entry-point gate was blind to the sweep.
+BAD_CHAT_SWEEP_NO_HOOK = GOOD_CHAT.replace(SWEEP_HOOK_LINE, "")
+
+# A FOURTH entry point that drops `sessions` rows without the cleanup: the gate
+# must derive the entry set from the tree, not from a list someone forgot.
+BAD_CHAT_UNREGISTERED_ENTRY = GOOD_CHAT.replace(
+    "        return deleted\n    }\n}",
+    "        return deleted\n    }\n\n"
+    "    suspend fun deleteExpiredSessions(ids: List<String>) {\n"
+    "        dao.deleteSession(ids.first())\n"
     "    }\n}",
 )
+
+# Delegation is legal: the entry points call one helper that owns the hook.
+GOOD_CHAT_DELEGATED = GOOD_CHAT.replace(
+    "            " + HOOK_LINE, "            notifySessionDeleted(id)\n",
+).replace(
+    "        " + HOOK_LINE, "        notifySessionDeleted(id)\n",
+).replace(
+    "    }\n}",
+    "    }\n\n    private fun notifySessionDeleted(id: String) {\n"
+    "        runCatching { onSessionDeleted?.invoke(id) }.onFailure { warn(it) }\n"
+    "    }\n}",
+)
+
+
+def _drop_helper_hook(src):
+    """Keep the delegated shape but empty the helper — the delegation branch
+    must not launder an unhooked helper."""
+    return src.replace(
+        "    private fun notifySessionDeleted(id: String) {\n"
+        "        runCatching { onSessionDeleted?.invoke(id) }.onFailure { warn(it) }\n"
+        "    }\n",
+        "    private fun notifySessionDeleted(id: String) {\n"
+        "        log(id)\n"
+        "    }\n",
+    )
+
+
+BAD_CHAT_HELPER_NO_HOOK = _drop_helper_hook(GOOD_CHAT_DELEGATED)
 
 GOOD_APP = """
 class MinisApp : Application() {
@@ -911,6 +1081,34 @@ def selftest():
     bad_chat = check_chat_repo(BAD_CHAT_NO_HOOK)
     expect_trip("unwired-hook fixture (ISSUE-10)", bad_chat, "unwired", failures)
 
+    # [dv21-a2 / deep-audit-1041 A-02] the startup sweep as a THIRD entry point.
+    # Precision control first: the wired fixture (now carrying the sweep) must be
+    # clean, or "everything is red" would masquerade as teeth.
+    if good_chat:
+        failures.append("compliant chat fixture is not clean: %r" % good_chat)
+    bad_sweep = check_chat_repo(BAD_CHAT_SWEEP_NO_HOOK)
+    expect_trip("unhooked-sweep fixture (dv21-a2)", bad_sweep, "deleteEmptySessions", failures)
+    expect_trip("unhooked-sweep fixture (dv21-a2)", bad_sweep, "unwired", failures)
+    # The sweep fixture must fire ONLY the sweep arm — the other two entries are
+    # still wired, so any extra violation means the gate is matching the wrong
+    # body (e.g. back to the first-`}` slice).
+    if len(bad_sweep) != 1:
+        failures.append("unhooked-sweep fixture tripped %d arms, expected exactly 1: %r"
+                        % (len(bad_sweep), bad_sweep))
+
+    # A fourth `sessions`-row delete entry point that nobody registered.
+    bad_unregistered = check_chat_repo(BAD_CHAT_UNREGISTERED_ENTRY)
+    expect_trip("unregistered-entry fixture (dv21-a2)", bad_unregistered, "not a registered",
+                failures)
+
+    # Delegation to one shared helper is a legitimate shape and must stay clean;
+    # an EMPTY helper must not launder the missing cleanup.
+    good_delegated = check_chat_repo(GOOD_CHAT_DELEGATED)
+    if good_delegated:
+        failures.append("delegating chat fixture is not clean: %r" % good_delegated)
+    bad_helper = check_chat_repo(BAD_CHAT_HELPER_NO_HOOK)
+    expect_trip("empty-helper fixture (dv21-a2)", bad_helper, "unwired", failures)
+
     good_app = check_minis_app(GOOD_APP)
     bad_app = check_minis_app(BAD_APP_ORDER)
     expect_trip("late-wiring fixture (ISSUE-10)", bad_app, "AFTER chatRepository", failures)
@@ -969,6 +1167,10 @@ def selftest():
     print("selftest pinned override         -> %d violation(s)" % len(bad_pin))
     print("selftest compliant chat repo     -> %d violation(s)" % len(good_chat))
     print("selftest unwired-hook chat repo  -> %d violation(s)" % len(bad_chat))
+    print("selftest unhooked sweep          -> %d violation(s)" % len(bad_sweep))
+    print("selftest unregistered entry      -> %d violation(s)" % len(bad_unregistered))
+    print("selftest delegating chat repo    -> %d violation(s)" % len(good_delegated))
+    print("selftest empty helper            -> %d violation(s)" % len(bad_helper))
     print("selftest compliant MinisApp      -> %d violation(s)" % len(good_app))
     print("selftest late-wiring MinisApp    -> %d violation(s)" % len(bad_app))
     print("selftest MinisApp badge kept     -> %d violation(s)" % len(bad_badge))

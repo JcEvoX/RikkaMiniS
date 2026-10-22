@@ -472,4 +472,29 @@ interface ChatDao {
           AND updated_at < :staleBefore
     """)
     suspend fun deleteEmptySessions(activeIds: List<String>, staleBefore: Long): Int
+
+    /**
+     * [dv21-a2] The same selection as [deleteEmptySessions] as a read, so the
+     * caller can run the cross-db session cleanup for exactly the rows the
+     * DELETE is about to remove. The DELETE above carries its guards inside the
+     * statement (atomic); this SELECT is only the *candidate* snapshot, which
+     * is why the caller re-checks the survivors before notifying — a row that
+     * gained its first message in between must keep its overrides.
+     */
+    @Query("""
+        SELECT id FROM sessions
+        WHERE id NOT IN (SELECT DISTINCT session_id FROM messages)
+          AND id NOT IN (:activeIds)
+          AND updated_at < :staleBefore
+    """)
+    suspend fun selectEmptySessionIds(activeIds: List<String>, staleBefore: Long): List<String>
+
+    /**
+     * [dv21-a2] Which of [ids] still have a `sessions` row. Used right after
+     * the empty-session sweep so a candidate that survived the DELETE (its
+     * first message landed in the snapshot→delete window) is not reported as
+     * deleted and does not lose its session-scoped overrides.
+     */
+    @Query("SELECT id FROM sessions WHERE id IN (:ids)")
+    suspend fun existingSessionIds(ids: List<String>): List<String>
 }

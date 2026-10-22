@@ -30,9 +30,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.core.graphics.drawable.toBitmap
+import coil.Coil
 import coil.ImageLoader
 import coil.request.ImageRequest
 import coil.request.SuccessResult
+import com.rikkaminis.app.ui.DisplayBitmapLimits.limitDisplaySize
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -99,6 +101,15 @@ internal fun ImageActionButton(
 // [audit-0917] One loader for the process: a per-call ImageLoader(context)
 // spun up its own executor and was never shut down - it leaked threads on
 // every Copy/Share/Save. Coil's ImageLoader is meant to be a singleton.
+//
+// [fix/dv21-b4-B06] …and it has to be THE APP'S singleton, not a freshly
+// built one: `ImageLoader(context.applicationContext)` registers none of the
+// components `MinisApp.newImageLoader()` installs, so `minis://` models had no
+// fetcher (Copy / Share / Save failed with a decode error for every attachment
+// that reaches the viewer as a URI) and an in-place rewritten file had no
+// mtime keyer (the stale bitmap came back out of the cache). `Coil.imageLoader`
+// resolves the very singleton Coil's own AsyncImage path uses, so both paths
+// also share one memory cache instead of two.
 @Volatile
 private var sharedImageLoader: ImageLoader? = null
 
@@ -106,8 +117,18 @@ internal suspend fun loadBitmap(context: Context, model: Any): Bitmap? =
     withContext(Dispatchers.IO) {
         try {
             val loader = sharedImageLoader
-                ?: ImageLoader(context.applicationContext).also { sharedImageLoader = it }
-            val req = ImageRequest.Builder(context).data(model).allowHardware(false).build()
+                ?: Coil.imageLoader(context.applicationContext).also { sharedImageLoader = it }
+            // [fix/dv21-b4-B06] `allowHardware(false)` bounds nothing: with no
+            // target size Coil decodes at the image's INTRINSIC size, and this
+            // is the path Copy / Share / Save take — a 3000x17920 screenshot
+            // allocated ~215 MB of ARGB_8888 right here (`DisplayBitmapLimits`
+            // documents the crash that follows). Same ceiling the markdown
+            // renderers apply.
+            val req = ImageRequest.Builder(context)
+                .data(model)
+                .allowHardware(false)
+                .limitDisplaySize()
+                .build()
             val result = loader.execute(req)
             (result as? SuccessResult)?.drawable?.toBitmap()
         } catch (e: Exception) {

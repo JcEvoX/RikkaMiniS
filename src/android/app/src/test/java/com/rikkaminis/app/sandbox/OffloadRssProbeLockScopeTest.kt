@@ -7,6 +7,7 @@ import org.junit.Before
 import org.junit.Test
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -229,11 +230,21 @@ class OffloadRssProbeLockScopeTest {
     fun `summary stays self consistent while records run concurrently`() {
         val stop = AtomicBoolean(false)
         val errors = ConcurrentLinkedQueue<Throwable>()
+        // [dv21-rss-fix] The 6 recorder threads race the FIRST summary() read:
+        // under CI load none may have run yet → `summary: (no data)` → the
+        // assertion throws BEFORE `stop.set(true)` and the threads leak for the
+        // rest of the JVM (they kept firing the SHARED governanceHook and broke
+        // the conservation arm that ran after: expected:<64> but was:<11403>).
+        // Fix = await the first record (fail-closed on timeout), and release
+        // the recorders in `finally` so no failure path leaves them running.
+        val firstRecord = CountDownLatch(1)
+        var seen = 0
         val recorders = (1..6).map {
             Thread {
                 try {
                     while (!stop.get()) {
                         OffloadRssProbe.record("mix", 0L, 131_072L)
+                        firstRecord.countDown()
                         Thread.yield()
                     }
                 } catch (t: Throwable) {
@@ -241,25 +252,37 @@ class OffloadRssProbeLockScopeTest {
                 }
             }.apply { start() }
         }
-        var seen = 0
-        var lastCount = 0L
-        repeat(300) {
-            val s = OffloadRssProbe.summary()
-            val cum = fieldOf(s, "mix", "cum")
-            val count = fieldOf(s, "mix", "count")
-            val avg = fieldOf(s, "mix", "avg")
-            // Snapshot must be internally consistent: avg comes from the same
-            // critical section as cum and count (pre-fix they were three racy reads).
-            assertEquals(cum / count, avg)
-            // count only grows (recorders never reset it).
-            assertTrue("count went backwards: $lastCount → $count", count >= lastCount)
-            lastCount = count
-            seen += 1
+        try {
+            // A recorder thread must actually land its first record before any
+            // observation; 10s is generous (the loop is one method call), and
+            // timing out fails the test instead of observing an empty summary.
+            assertTrue(
+                "no recorder landed a record within 10s",
+                firstRecord.await(10, TimeUnit.SECONDS),
+            )
+            var lastCount = 0L
+            repeat(300) {
+                val s = OffloadRssProbe.summary()
+                val cum = fieldOf(s, "mix", "cum")
+                val count = fieldOf(s, "mix", "count")
+                val avg = fieldOf(s, "mix", "avg")
+                // Snapshot must be internally consistent: avg comes from the same
+                // critical section as cum and count (pre-fix they were three racy reads).
+                assertEquals(cum / count, avg)
+                // count only grows (recorders never reset it).
+                assertTrue("count went backwards: $lastCount → $count", count >= lastCount)
+                lastCount = count
+                seen += 1
+            }
+            assertTrue(lastCount > 0L)
+        } finally {
+            stop.set(true)
+            recorders.forEach {
+                it.join(5_000)
+                assertFalse("recorder thread did not terminate: ${it.state}", it.isAlive)
+            }
         }
-        stop.set(true)
-        recorders.forEach { it.join() }
         assertTrue("worker errors: $errors", errors.isEmpty())
         assertEquals(300, seen)
-        assertTrue(lastCount > 0L)
     }
 }

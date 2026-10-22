@@ -212,4 +212,59 @@ class GatewayEffortTruthTest {
             ),
         )
     }
+
+    @Test
+    fun `an unmeasured model on senseaudio never inherits the sensenova last resort`() {
+        // The live shape (device log, api.senseaudio.cn): the model in use is NOT in
+        // SENSEAUDIO_TIERS and the entry declares no tier set at all
+        // (`declared=null`), so resolveTier reaches its last resort. Sharing
+        // sensenova's set would put `medium` on the wire — the single value this
+        // gateway 400s — so each gateway family carries its own last resort.
+        val id = "glm-5.3-flash"
+        assertNull(GatewayEffortTruth.tiersFor(saHost, id))
+        assertEquals("low", GatewayEffortTruth.resolveTier(saHost, id, ThinkingLevel.MEDIUM, null))
+        assertEquals("low", GatewayEffortTruth.resolveTier(saHost, id, ThinkingLevel.LOW, null))
+        assertEquals("high", GatewayEffortTruth.resolveTier(saHost, id, ThinkingLevel.HIGH, null))
+        assertEquals("xhigh", GatewayEffortTruth.resolveTier(saHost, id, ThinkingLevel.XHIGH, null))
+        assertEquals("max", GatewayEffortTruth.resolveTier(saHost, id, ThinkingLevel.MAX, null))
+    }
+
+    @Test
+    fun `the senseaudio last resort keeps the tiers the gateway serves`() {
+        // Contents of the new table, pinned directly. (Dropped from the PRE arm: the
+        // symbol does not exist there — that is the point of the split.)
+        assertFalse(GatewayEffortTruth.SENSEAUDIO_FALLBACK_TIERS.contains("medium"))
+        assertTrue(GatewayEffortTruth.SENSEAUDIO_FALLBACK_TIERS.contains("none"))
+        assertTrue(GatewayEffortTruth.SENSEAUDIO_FALLBACK_TIERS.contains("max"))
+    }
+
+    @Test
+    fun `a declared set still outranks the senseaudio last resort`() {
+        // Priority #3 survives the split: an unmeasured model whose catalog row exists
+        // keeps that row's opinion. The last resort is a last resort, not an override.
+        assertEquals(
+            "high",
+            GatewayEffortTruth.resolveTier(saHost, "senseaudio-s2", ThinkingLevel.HIGH, listOf("high", "max")),
+        )
+    }
+
+    @Test
+    fun `sensenova keeps medium in its last resort`() {
+        // Regression on the pre-existing gateway: `medium` is legal on every measured
+        // sensenova model, so the host-keyed split must not take it away from the
+        // unmeasured ones either (the fallback was host-global before).
+        assertTrue(GatewayEffortTruth.SENSENOVA_FALLBACK_TIERS.contains("medium"))
+        assertEquals("medium", GatewayEffortTruth.resolveTier(host, "brand-new-model", ThinkingLevel.MEDIUM, null))
+        assertEquals("xhigh", GatewayEffortTruth.resolveTier(host, "brand-new-model", ThinkingLevel.MAX, null))
+    }
+
+    @Test
+    fun `a host with no measurement keeps the last resort it had before the split`() {
+        // resolveTier is only reachable behind isMeasuredHost; a host outside the table
+        // keeps the historical set rather than silently inheriting senseaudio's.
+        assertFalse(GatewayEffortTruth.isMeasuredHost("api.openai.com"))
+        assertFalse(GatewayEffortTruth.isMeasuredHost("api.senseaudio.cn.evil.test"))
+        assertEquals("medium", GatewayEffortTruth.resolveTier("api.openai.com", "any-model", ThinkingLevel.MEDIUM, null))
+        assertEquals("medium", GatewayEffortTruth.resolveTier("api.senseaudio.cn.evil.test", "any-model", ThinkingLevel.MEDIUM, null))
+    }
 }

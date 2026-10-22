@@ -39,18 +39,80 @@ it reads the call site as TEXT and checks the argument's origin.
    silently collapsed back into a single value.
 3. Inside the picker body, the clamp predicate must take `requested`, and the
    tap rule must key off `requested` (not the highlight `isHighlighted`).
+4. Measured-gateway effort truth (2026-10-22, deep-audit-1041 A-04) — see below.
 
-Escape hatch: `thinking-wiring-ok: <reason>` on the same or the previous line.
+Escape hatch: `thinking-wiring-ok: <reason>` (picker family) /
+`thinking-effort-ok: <reason>` (effort family) on the line, the line above, or
+anywhere inside the annotated span/file.
+
+## Second family: the measured-gateway effort truth table
+
+`GatewayEffortTruth` exists because the `reasoning_effort` enum is per MODEL and
+per GATEWAY, and models.dev under-declares it. It was written, measured, tabled
+and unit-tested — and then the one place that builds the request still listed the
+gateway hosts BY HAND:
+
+    // OpenAIProvider.injectThinkingParams, before the fix
+    when (host) {
+        ...
+        "token.sensenova.cn", "api.sensenova.cn" -> { ... resolveTier(...) ... }
+    }
+
+The second measured gateway (`api.senseaudio.cn`, whose enum is coarser but has
+higher tiers and which 400s `medium`) therefore never reached the table: it fell
+through to the rule engine, `medium` went out unclamped, and the tiers the
+gateway does serve were clamped away by whatever stale set the catalog declared.
+Every unit test passed — they exercise the table, not the dispatch. A table one
+consumer consults and another re-implements by hand is not a single source of
+truth; the tests cannot tell the difference, so this gate does.
+
+Criteria (all derived from the table, never from a written-down host list):
+
+4. No `*_HOSTS` host literal may appear in the provider's code: the measured-host
+   set is owned by `GatewayEffortTruth`, and the provider must dispatch on
+   `isMeasuredHost(host)`. This rejects both the original defect and the tempting
+   one-line "fix" that adds a third literal to the same `when`.
+5. The provider must consult `GatewayEffortTruth.` at all (a table nobody reads
+   cannot be enforced on the wire).
+6. `resolveTier`'s LAST-RESORT set must be chosen by `host`: one global fallback
+   now serves two gateways that disagree about `medium` on the same model id.
+7. Every `*_HOSTS` family must have its own `*_FALLBACK_TIERS` symbol, so adding
+   a measured gateway to the table cannot silently inherit the wrong last resort.
+
+Fail-closed: if the host set or `resolveTier` cannot be read, or one of the two
+files exists while the other does not, the family reports a violation instead of
+checking nothing. Minimal trees that contain neither file (see test_scan fixtures)
+skip it by design.
 
 Usage: python3 scripts/scan/thinking_wiring_guard.py <repo_root>
+       python3 scripts/scan/thinking_wiring_guard.py --selftest [repo_root]
 Exit:  0 = clean, 1 = violation(s) found
 """
 import os
 import re
+import shutil
 import sys
+import tempfile
 
 LINE_COMMENT_RE = re.compile(r"//.*$")
 ESCAPE_RE = re.compile(r"thinking-wiring-ok\s*:")
+EFFORT_ESCAPE_RE = re.compile(r"thinking-effort-ok\s*:")
+
+# ── measured-gateway effort truth table (deep-audit-1041 A-04) ───────────────
+TRUTH_REL = "src/android/app/src/main/java/com/rikkaminis/app/provider/thinking/GatewayEffortTruth.kt"
+PROVIDER_REL = "src/android/app/src/main/java/com/rikkaminis/app/provider/openai/OpenAIProvider.kt"
+TRUTH_OBJECT = "GatewayEffortTruth."
+HOSTS_DECL_RE = re.compile(
+    r"\b(?:private\s+)?val\s+(\w+_HOSTS)\b(?::[^=\n]+)?\s*=\s*setOf\(([^)]*)\)"
+)
+FALLBACK_DECL_RE = re.compile(r"\b(?:private\s+)?val\s+(\w+_FALLBACK_TIERS)\b")
+HOSTS_SUFFIX = "_HOSTS"
+FALLBACK_SUFFIX = "_FALLBACK_TIERS"
+STR_LITERAL_RE = re.compile(r'"([^"\n]+)"')
+RESOLVE_SIG = "fun resolveTier("
+# How far past the final `?:` the host test must appear: the operand itself, not
+# an unrelated later statement.
+FALLBACK_WINDOW = 240
 
 # Expressions that denote the EFFECTIVE level (capability + ceiling folded in).
 EFFECTIVE_EXPR_RE = re.compile(
@@ -186,11 +248,274 @@ def find_function_body(src: str, signature: str):
     return None, None
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("usage: thinking_wiring_guard.py <repo_root>")
-        return 2
-    root = sys.argv[1]
+def check_measured_gateway_effort(root: str, violations: list) -> int:
+    """Criteria 4-7 — the measured-gateway effort truth table. Returns family count.
+
+    Everything is DERIVED: the host set comes from the table's own `*_HOSTS`
+    declarations, so a third measured gateway extends the prohibition with no
+    edit here (and a table that cannot be read is a violation, not a silent pass).
+    """
+    truth_path = os.path.join(root, TRUTH_REL)
+    prov_path = os.path.join(root, PROVIDER_REL)
+    has_truth = os.path.isfile(truth_path)
+    has_prov = os.path.isfile(prov_path)
+    if not has_truth and not has_prov:
+        return 0   # minimal fixture tree: the family is not installed here
+    if not has_truth or not has_prov:
+        missing = TRUTH_REL if not has_truth else PROVIDER_REL
+        violations.append(
+            f"{missing}: missing while its counterpart exists — the measured-gateway "
+            "effort checks cannot run, so a now-broken dispatch would read as clean"
+        )
+        return 0
+
+    with open(truth_path, encoding="utf-8") as f:
+        truth_raw = f.read()
+    with open(prov_path, encoding="utf-8") as f:
+        prov_raw = f.read()
+    truth = strip_comments(truth_raw)
+    prov = strip_comments(prov_raw)
+
+    families = HOSTS_DECL_RE.findall(truth)          # [(symbol, setOf body)]
+    hosts = []
+    for name, body in families:
+        family_hosts = STR_LITERAL_RE.findall(body)
+        if not family_hosts:
+            violations.append(
+                f"{TRUTH_REL}: {name} declares no host literal — a measured gateway "
+                "that silently stops being measured is a regression the wire absorbs "
+                "without a trace (its enum then goes unenforced)"
+            )
+        hosts.extend(family_hosts)
+    if not families or not hosts:
+        violations.append(
+            f"{TRUTH_REL}: no `*_HOSTS = setOf(\"...\")` declaration could be read — "
+            "the gate would be comparing the provider against an empty host set, which "
+            "passes for every shape (fail-closed)"
+        )
+        return 0
+
+    # ── 4 & 5: the provider delegates, it does not restate ───────────────
+    if not EFFORT_ESCAPE_RE.search(prov):
+        found = sorted({h for h in hosts if f'"{h}"' in prov})
+        for h in found:
+            violations.append(
+                f"{PROVIDER_REL}: host literal {h!r} is written into the provider — the "
+                "measured-host set is owned by GatewayEffortTruth. Dispatch on "
+                "GatewayEffortTruth.isMeasuredHost(host); a second copy of the list is "
+                "how api.senseaudio.cn stayed unenforced on the wire. "
+                "(thinking-effort-ok: <reason> to override.)"
+            )
+        if TRUTH_OBJECT not in prov:
+            violations.append(
+                f"{PROVIDER_REL}: never consults {TRUTH_OBJECT} — a measured gateway's "
+                "reasoning_effort enum is then unenforced where the request is built"
+            )
+
+    # ── 6: the last resort is chosen by host ─────────────────────────────
+    body, _ = find_function_body(truth, RESOLVE_SIG)
+    if body is None:
+        violations.append(
+            f"{TRUTH_REL}: `{RESOLVE_SIG}` not found — the last-resort check cannot run "
+            "(fail-closed)"
+        )
+    elif not EFFORT_ESCAPE_RE.search(truth):
+        cut = body.rfind("?:")
+        if cut < 0:
+            violations.append(
+                f"{TRUTH_REL}: resolveTier has no `?:` fallback chain to inspect "
+                "(fail-closed)"
+            )
+        else:
+            tail = body[cut + 2:cut + 2 + FALLBACK_WINDOW]
+            if "host" not in tail:
+                violations.append(
+                    f"{TRUTH_REL}: resolveTier's last resort does not depend on `host` "
+                    f"— one shared fallback then serves gateways whose enums disagree "
+                    f"(seen: {tail.strip().splitlines()[0][:70]!r}). Choose it per "
+                    "gateway family. (thinking-effort-ok: <reason> to override.)"
+                )
+
+    # ── 7: every host family owns a fallback ─────────────────────────────
+    declared = set(FALLBACK_DECL_RE.findall(truth))
+    for name, _ in families:
+        want = name[: -len(HOSTS_SUFFIX)] + FALLBACK_SUFFIX
+        if want not in declared:
+            violations.append(
+                f"{TRUTH_REL}: {name} has no `{want}` — a measured gateway added "
+                "without its own last resort silently inherits the previous "
+                "gateway's enum (the two disagree on `medium`)."
+            )
+    return len(families)
+
+
+def _selftest_wiring_fixture():
+    """Minimal picker-call tree, mirroring the shape test_scan.py builds."""
+    pkg = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/"
+    caller = (
+        "package com.rikkaminis.app.ui.chat\n"
+        "class ChatInputArea {\n"
+        "    fun row(viewModel: ChatViewModel) {\n"
+        "        val requestedThinkingLevelState by viewModel.requestedThinkingLevel.collectAsState()\n"
+        "        ThinkingLevelPicker(\n"
+        "            current = viewModel.effectiveThinkingLevel,\n"
+        "            requested = requestedThinkingLevelState,\n"
+        "            availableLevels = viewModel.availableThinkingLevels,\n"
+        "            onSelect = { },\n"
+        "        )\n"
+        "    }\n"
+        "}\n"
+    )
+    body = (
+        "package com.rikkaminis.app.ui.chat\n"
+        "internal fun ThinkingLevelPicker(\n"
+        "    current: ThinkingLevel,\n"
+        "    requested: ThinkingLevel,\n"
+        "    availableLevels: List<ThinkingLevel>,\n"
+        "    onSelect: (ThinkingLevel) -> Unit,\n"
+        ") {\n"
+        "    val maxAvailable = availableLevels.lastOrNull { it != ThinkingLevel.OFF }\n"
+        "    val isClamped = maxAvailable != null && isCappedBy(requested, maxAvailable)\n"
+        "    availableLevels.forEach { level ->\n"
+        "        onSelect(thinkingTapTarget(level, requested))\n"
+        "    }\n"
+        "}\n"
+    )
+    return {pkg + "ChatInputArea.kt": caller, pkg + "ChatComposerWidgets.kt": body}
+
+
+EFFORT_TRUTH_CLEAN = """package com.rikkaminis.app.provider.thinking
+
+object GatewayEffortTruth {
+    private val SENSENOVA_HOSTS = setOf("token.sensenova.cn", "api.sensenova.cn")
+    private val SENSEAUDIO_HOSTS = setOf("api.senseaudio.cn")
+    val SENSENOVA_FALLBACK_TIERS = listOf("none", "low", "medium", "high", "xhigh")
+    val SENSEAUDIO_FALLBACK_TIERS = listOf("none", "low", "high", "xhigh", "max")
+
+    fun isMeasuredHost(host: String): Boolean = true
+
+    private fun fallbackTiersFor(host: String): List<String> =
+        if (host in SENSEAUDIO_HOSTS) SENSEAUDIO_FALLBACK_TIERS else SENSENOVA_FALLBACK_TIERS
+
+    fun resolveTier(host: String, modelId: String, declaredTiers: List<String>?): String {
+        val tiers = tiersFor(host, modelId)
+            ?: declaredTiers?.takeIf { it.isNotEmpty() }
+            ?: fallbackTiersFor(host)
+        return ThinkingEffortLadder.clampEffort(tiers.first())
+    }
+}
+"""
+
+EFFORT_PROVIDER_CLEAN = """package com.rikkaminis.app.provider.openai
+
+class OpenAIProvider {
+    fun inject(host: String, body: MutableMap<String, String>) {
+        if (GatewayEffortTruth.isMeasuredHost(host)) {
+            body["reasoning_effort"] = GatewayEffortTruth.resolveTier(host, "m", null)
+        }
+    }
+}
+"""
+
+
+def _effort_tree(provider=EFFORT_PROVIDER_CLEAN, truth=EFFORT_TRUTH_CLEAN, drop=()):
+    tree = dict(_selftest_wiring_fixture())
+    if "provider" not in drop:
+        tree[PROVIDER_REL] = provider
+    if "truth" not in drop:
+        tree[TRUTH_REL] = truth
+    return tree
+
+
+def selftest(root: str | None = None) -> int:
+    """Negative arms for the effort family; each must red on ITS criterion only."""
+    cases = [
+        ("clean text-book dispatch",
+         _effort_tree(), 0, None),
+        ("provider hardcodes the first gateway's hosts (the original defect)",
+         _effort_tree(provider=EFFORT_PROVIDER_CLEAN.replace(
+             "if (GatewayEffortTruth.isMeasuredHost(host)) {",
+             'if (host == "token.sensenova.cn") {')),
+         1, "host literal 'token.sensenova.cn'"),
+        ("provider gains a third literal arm (the tempting one-line fix)",
+         _effort_tree(provider=EFFORT_PROVIDER_CLEAN.replace(
+             "if (GatewayEffortTruth.isMeasuredHost(host)) {",
+             'if (host == "api.senseaudio.cn") {')),
+         1, "host literal 'api.senseaudio.cn'"),
+        ("provider stops consulting the table at all",
+         _effort_tree(provider=EFFORT_PROVIDER_CLEAN
+                      .replace("GatewayEffortTruth.isMeasuredHost(host)", "true")
+                      .replace("GatewayEffortTruth.resolveTier(host, \"m\", null)", '"low"')),
+         1, "never consults GatewayEffortTruth."),
+        ("resolveTier falls back to one global set",
+         _effort_tree(truth=EFFORT_TRUTH_CLEAN.replace(
+             "?: fallbackTiersFor(host)", "?: SENSENOVA_FALLBACK_TIERS")),
+         1, "last resort does not depend on `host`"),
+        ("a third measured gateway arrives without its own fallback",
+         _effort_tree(truth=EFFORT_TRUTH_CLEAN.replace(
+             'private val SENSEAUDIO_HOSTS = setOf("api.senseaudio.cn")',
+             'private val SENSEAUDIO_HOSTS = setOf("api.senseaudio.cn")\n'
+             '    private val THIRDGATEWAY_HOSTS = setOf("api.third.example")')),
+         1, "has no `THIRDGATEWAY_FALLBACK_TIERS`"),
+        ("host set cannot be derived (fail-closed)",
+         _effort_tree(truth=EFFORT_TRUTH_CLEAN
+                      .replace('private val SENSENOVA_HOSTS = setOf("token.sensenova.cn", "api.sensenova.cn")',
+                               "private val SENSENOVA_HOSTS = HOSTS_FROM_CONFIG")
+                      .replace('private val SENSEAUDIO_HOSTS = setOf("api.senseaudio.cn")',
+                               "private val SENSEAUDIO_HOSTS = HOSTS_FROM_CONFIG")),
+         1, "no `*_HOSTS = setOf"),
+        ("host set declared but empty (fail-closed)",
+         _effort_tree(truth=EFFORT_TRUTH_CLEAN.replace(
+             'setOf("api.senseaudio.cn")', "setOf()")),
+         1, "declares no host literal"),
+        ("provider present, table deleted (fail-closed)",
+         _effort_tree(drop=("truth",)), 1, "missing while its counterpart exists"),
+        ("table present, provider deleted (fail-closed)",
+         _effort_tree(drop=("provider",)), 1, "missing while its counterpart exists"),
+        ("picker-only minimal tree skips the family",
+         dict(_selftest_wiring_fixture()), 0, None),
+    ]
+    failures = []
+    for label, tree, want_rc, want_text in cases:
+        d = tempfile.mkdtemp(prefix="twg-selftest-")
+        try:
+            for rel, text in tree.items():
+                p = os.path.join(d, rel)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "w", encoding="utf-8") as f:
+                    f.write(text)
+            rc, out = _run_scan(d)
+            ok = rc == want_rc and (want_text is None or want_text in out)
+            if not ok:
+                failures.append(f"{label}: rc={rc} want={want_rc}\n{out}")
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    if root:
+        rc, out = _run_scan(root)
+        if rc != 0:
+            failures.append(f"real tree ({root}): rc={rc}\n{out}")
+
+    if failures:
+        print("❌ thinking_wiring_guard selftest:")
+        for f in failures:
+            print(f"   • {f}")
+        return 1
+    print(f"THINKING_EFFORT_SELFTEST=PASS ({len(cases)} fixtures"
+          f"{' + real tree' if root else ''})")
+    return 0
+
+
+def _run_scan(root: str):
+    """(exit_code, output) for `root` — used by the selftest arms."""
+    try:
+        return scan(root)
+    except Exception as e:      # a crash must read as red, never as an empty pass
+        return 1, f"❌ thinking_wiring_guard raised: {type(e).__name__}: {e}"
+
+
+def scan(root: str):
+    """Run every criterion over `root`. Returns (exit_code, output_text)."""
     kt_root = os.path.join(root, "src/android/app/src/main/java")
     violations = []
     checked_calls = 0
@@ -302,18 +627,37 @@ def main():
                             "turns thinking OFF instead of selecting it."
                         )
 
+    # ── 4..7: measured-gateway effort truth table (see module docstring) ──
+    families = check_measured_gateway_effort(root, violations)
+
     if checked_calls == 0:
-        print("⚠️  no ThinkingLevelPicker call sites found — is the picker still there?")
-        print("    (gate would silently pass; failing instead so it can't rot)")
-        return 1
+        lines = [
+            "⚠️  no ThinkingLevelPicker call sites found — is the picker still there?",
+            "    (gate would silently pass; failing instead so it can't rot)",
+        ]
+        return 1, "\n".join(lines)
 
     if violations:
-        print(f"❌ thinking-level wiring: {len(violations)} violation(s)")
-        for v in violations:
-            print(f"   • {v}")
-        return 1
-    print(f"✅ thinking-level wiring OK ({checked_calls} call site(s) checked)")
-    return 0
+        lines = [f"❌ thinking-level wiring: {len(violations)} violation(s)"]
+        lines += [f"   • {v}" for v in violations]
+        return 1, "\n".join(lines)
+
+    return 0, (
+        f"✅ thinking-level wiring OK ({checked_calls} call site(s) checked; "
+        f"{families} measured-gateway effort family/families pinned)"
+    )
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("usage: thinking_wiring_guard.py <repo_root>")
+        print("       thinking_wiring_guard.py --selftest [repo_root]")
+        return 2
+    if sys.argv[1] == "--selftest":
+        return selftest(sys.argv[2] if len(sys.argv) > 2 else None)
+    rc, out = _run_scan(sys.argv[1])
+    print(out)
+    return rc
 
 
 if __name__ == "__main__":

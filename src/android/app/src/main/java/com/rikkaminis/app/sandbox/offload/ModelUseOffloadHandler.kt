@@ -5,6 +5,8 @@ import android.util.Base64
 import android.util.Log
 import com.rikkaminis.app.data.model.LLMMessage
 import com.rikkaminis.app.data.model.ModelEntry
+import com.rikkaminis.app.data.model.directionalModalities
+import com.rikkaminis.app.data.model.modalityNamesInOrder
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.debug.LLMRequestLog
 import com.rikkaminis.app.provider.safeOptString
@@ -180,24 +182,22 @@ class ModelUseOffloadHandler(
             )
         }
         val outputExt = outputPath?.substringAfterLast('.', "")?.lowercase().orEmpty()
-        val outputs = entry.model.outputModalities.orEmpty()
+        // [dv21-A05] Effective modalities of this entry: models.dev-enriched BASE
+        // model + the user's overrides, canonicalized once through the shared
+        // resolver. Reading `entry.model.*` raw skipped enrichment entirely, and
+        // all 39 built-in models declare null modality fields by construction —
+        // so every image/TTS-capable built-in was refused here as incapable.
+        val effectiveModel = com.rikkaminis.app.provider.ModelsDevApi.effectiveModel(entry)
+        val modalities = effectiveModel.directionalModalities.toSet()
         val requiredModality = when {
-            isImageExt(outputExt) -> "image_output".takeIf { "image" !in outputs }
-            isAudioExt(outputExt) -> "audio_output".takeIf { "audio" !in outputs }
-            isVideoExt(outputExt) -> "video_output".takeIf { "video" !in outputs }
+            isImageExt(outputExt) -> "image_output".takeIf { "image_output" !in modalities }
+            isAudioExt(outputExt) -> "audio_output".takeIf { "audio_output" !in modalities }
+            isVideoExt(outputExt) -> "video_output".takeIf { "video_output" !in modalities }
             else -> null
         }
         if (requiredModality != null) {
-            val supported = buildList {
-                if ("text" in entry.model.inputModalities.orEmpty()) add("text_input")
-                if ("text" in outputs) add("text_output")
-                if ("image" in entry.model.inputModalities.orEmpty()) add("image_input")
-                if ("image" in outputs) add("image_output")
-                if ("audio" in entry.model.inputModalities.orEmpty()) add("audio_input")
-                if ("audio" in outputs) add("audio_output")
-                if ("video" in entry.model.inputModalities.orEmpty()) add("video_input")
-                if ("video" in outputs) add("video_output")
-            }
+            // Same canonical vocabulary (and order) as `minis-model-use list`.
+            val supported = modalityNamesInOrder.filter { it in modalities }
             return NativeOffloadResult(
                 2,
                 JSONObject().put("error", "modality_not_supported")
@@ -277,7 +277,7 @@ class ModelUseOffloadHandler(
         // modality — explicit error instead of the historical silent drop.
         // Mirrors iOS ModelUseOffloadBridge's hasAudioInput gate.
         if (nonSystem.any { it.audios.isNotEmpty() } &&
-            "audio" !in entry.model.inputModalities.orEmpty()
+            "audio_input" !in modalities
         ) {
             return NativeOffloadResult(
                 2,
@@ -518,7 +518,13 @@ class ModelUseOffloadHandler(
                                 .firstOrNull { it.value == m.optString("type", "") }
                                 ?: com.rikkaminis.app.data.model.LLMMediaAttachment.MediaType.IMAGE,
                             mimeType = m.optString("mime_type", "application/octet-stream"),
-                            data = Base64.decode(b64, Base64.DEFAULT),
+                            // [dv21-A06] Tolerant + non-throwing, via the ONE decode
+                            // entry for the offload wire. The bare
+                            // `Base64.decode(b64, Base64.DEFAULT)` here threw an
+                            // IllegalArgumentException on a single malformed
+                            // attachment, which escaped `mapNotNull` and discarded the
+                            // already-generated text reply plus every later attachment.
+                            data = OffloadWireBase64.decode(b64) ?: return@mapNotNull null,
                         )
                     }
                 }
@@ -988,22 +994,30 @@ class ModelUseOffloadHandler(
      * Modality filter: matches iOS behavior. Terms are comma-separated and
      * checked against input/output modality lists. All requested terms must
      * be satisfied for an entry to pass.
+     *
+     * [dv21-A05] The modality lists come from the SAME effective-model resolver
+     * as the payload `list` emits and as the config collection — models.dev
+     * enrichment first, user overrides on top, canonical direction suffixes.
+     * This used to read `entry.model` raw, so `list` advertised `image_input`
+     * for a built-in model (its own path enriched) while
+     * `list --modality image_input` filtered that same model out (this path did
+     * not) — the two halves of one command disagreeing about one entry.
      */
     private fun matchesModality(entry: ModelEntry, filter: String): Boolean {
-        val inputs = entry.model.inputModalities.orEmpty()
-        val outputs = entry.model.outputModalities.orEmpty()
+        val modalities = com.rikkaminis.app.provider.ModelsDevApi.effectiveModel(entry)
+            .directionalModalities.toSet()
         val required = filter.split(",").map { it.trim().lowercase() }.filter { it.isNotEmpty() }
         for (term in required) {
             val ok = when (term) {
-                "text", "text_input" -> "text" in inputs || inputs.isEmpty()
-                "text_output" -> "text" in outputs || outputs.isEmpty()
-                "image", "image_input" -> "image" in inputs
-                "image_output" -> "image" in outputs
-                "audio", "audio_input" -> "audio" in inputs
-                "audio_output" -> "audio" in outputs
-                "video", "video_input" -> "video" in inputs
-                "video_output" -> "video" in outputs
-                "pdf", "pdf_input" -> "pdf" in inputs
+                "text", "text_input" -> "text_input" in modalities
+                "text_output" -> "text_output" in modalities
+                "image", "image_input" -> "image_input" in modalities
+                "image_output" -> "image_output" in modalities
+                "audio", "audio_input" -> "audio_input" in modalities
+                "audio_output" -> "audio_output" in modalities
+                "video", "video_input" -> "video_input" in modalities
+                "video_output" -> "video_output" in modalities
+                "pdf", "pdf_input" -> "pdf_input" in modalities
                 else -> true
             }
             if (!ok) return false

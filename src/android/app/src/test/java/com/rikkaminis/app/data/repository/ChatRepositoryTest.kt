@@ -121,8 +121,13 @@ class ChatRepositoryTest {
  */
 class ChatRepositoryCreateSessionTest {
 
-    /** Records just the calls we care about; every other DAO method is inert. */
-    private class RecordingDao : ChatDao {
+    /**
+     * Records just the calls we care about; every other DAO method is inert.
+     *
+     * `internal` (not private) so the empty-sweep regression class in this file
+     * can share the one ChatDao fake instead of copying ~55 inert overrides.
+     */
+    internal class RecordingDao : ChatDao {
         var insertedSession: ChatSessionEntity? = null
         val updateThinkingOverrideCalls = mutableListOf<Pair<String, String?>>()
 
@@ -209,7 +214,29 @@ class ChatRepositoryCreateSessionTest {
             endMs: Long?,
         ): Int = error("messageCountForSessionInRange is not stubbed in this test")
         override fun messageCountsPerSession(): Flow<Map<String, Int>> = flowOf(emptyMap())
-        override suspend fun deleteEmptySessions(activeIds: List<String>, staleBefore: Long): Int = 0
+
+        // -- [dv21-a2] the startup empty-session sweep ----------------------
+        /** What `selectEmptySessionIds` reports as sweepable. */
+        var emptySweepCandidates: List<String> = emptyList()
+        /** What the bulk DELETE reports as removed. */
+        var emptySweepDeleted: Int = 0
+        /** Of the candidates, which still have a row (raced-in first message). */
+        var emptySweepSurvivors: List<String> = emptyList()
+        val emptySweepArgs = mutableListOf<Pair<List<String>, Long>>()
+
+        override suspend fun selectEmptySessionIds(
+            activeIds: List<String>,
+            staleBefore: Long,
+        ): List<String> {
+            emptySweepArgs.add(activeIds to staleBefore)
+            return emptySweepCandidates
+        }
+
+        override suspend fun deleteEmptySessions(activeIds: List<String>, staleBefore: Long): Int =
+            emptySweepDeleted
+
+        override suspend fun existingSessionIds(ids: List<String>): List<String> =
+            emptySweepSurvivors
     }
 
     @Test
@@ -252,4 +279,121 @@ class ChatRepositoryCreateSessionTest {
         // insertedSession is the LAST insert (the `off` session).
         assertEquals(0, dao.insertedSession?.memoryEnabled)
     }
+}
+
+/**
+ * Regression tests for the startup empty-session sweep's cross-db cleanup
+ * (deep-audit-1041 A-02).
+ *
+ * `deleteEmptySessions` was the third function that removes `sessions` rows but
+ * the only one that never ran `onSessionDeleted`, so a session that was opened,
+ * given a session-scoped toggle and then abandoned kept its
+ * skill / mcp override rows, its badge and its offload grants for whatever
+ * session later reused the id. These tests pin the contract: exactly the ids
+ * that really disappeared are reported, once each, and nothing is reported when
+ * nothing was swept.
+ */
+class ChatRepositoryEmptySweepCleanupTest {
+
+    private fun repo(
+        dao: ChatRepositoryCreateSessionTest.RecordingDao,
+        deleted: MutableList<String>,
+    ) = ChatRepository(dao, sessionFiles = null, onSessionDeleted = { deleted.add(it) })
+
+    @Test
+    fun `deleteEmptySessions reports every swept id exactly once`() =
+        kotlinx.coroutines.runBlocking {
+            val dao = ChatRepositoryCreateSessionTest.RecordingDao()
+            dao.emptySweepCandidates = listOf("a", "b")
+            dao.emptySweepDeleted = 2
+            val reported = mutableListOf<String>()
+
+            val swept = repo(dao, reported).deleteEmptySessions()
+
+            assertEquals(2, swept)
+            assertEquals(listOf("a", "b"), reported)
+        }
+
+    @Test
+    fun `deleteEmptySessions reports nothing when nothing was swept`() =
+        kotlinx.coroutines.runBlocking {
+            val dao = ChatRepositoryCreateSessionTest.RecordingDao()
+            dao.emptySweepCandidates = emptyList()
+            dao.emptySweepDeleted = 0
+            val reported = mutableListOf<String>()
+
+            val swept = repo(dao, reported).deleteEmptySessions()
+
+            assertEquals(0, swept)
+            assertEquals(emptyList<String>(), reported)
+        }
+
+    @Test
+    fun `deleteEmptySessions skips a candidate that survived the delete`() =
+        kotlinx.coroutines.runBlocking {
+            // The window between the candidate SELECT and the DELETE is where a
+            // first message can land: that row is still live and must keep its
+            // session-scoped overrides.
+            val dao = ChatRepositoryCreateSessionTest.RecordingDao()
+            dao.emptySweepCandidates = listOf("a", "b")
+            dao.emptySweepDeleted = 1
+            dao.emptySweepSurvivors = listOf("b")
+            val reported = mutableListOf<String>()
+
+            repo(dao, reported).deleteEmptySessions()
+
+            assertEquals(listOf("a"), reported)
+        }
+
+    @Test
+    fun `deleteEmptySessions keeps the live-session sentinel for an empty active set`() =
+        kotlinx.coroutines.runBlocking {
+            val dao = ChatRepositoryCreateSessionTest.RecordingDao()
+            val reported = mutableListOf<String>()
+
+            repo(dao, reported).deleteEmptySessions(activeIds = emptyList(), graceMillis = 1234L)
+
+            // guardActiveIds: an empty exclusion list becomes [""] so the
+            // `NOT IN (:activeIds)` clause can never match nothing and wipe
+            // every message-less row.
+            assertEquals(1, dao.emptySweepArgs.size)
+            assertEquals(listOf(""), dao.emptySweepArgs[0].first)
+            assertEquals(true, dao.emptySweepArgs[0].second <= System.currentTimeMillis() - 1234L + 1)
+        }
+
+    @Test
+    fun `one failing hook does not stop the remaining ids`() =
+        kotlinx.coroutines.runBlocking {
+            // A throwing cleanup (e.g. skills.db locked) must not abort the
+            // sweep: the rows are already gone, and the other ids still owe
+            // their cleanup.
+            val dao = ChatRepositoryCreateSessionTest.RecordingDao()
+            dao.emptySweepCandidates = listOf("a", "b", "c")
+            dao.emptySweepDeleted = 3
+            val reported = mutableListOf<String>()
+            val repository = ChatRepository(dao, sessionFiles = null, onSessionDeleted = { id ->
+                if (id == "a") error("clearSessionOverrides exploded")
+                reported.add(id)
+            })
+
+            val swept = repository.deleteEmptySessions()
+
+            assertEquals(3, swept)
+            assertEquals(listOf("b", "c"), reported)
+        }
+
+    @Test
+    fun `deleteSession and deleteSessionRowOnly notify once each`() =
+        kotlinx.coroutines.runBlocking {
+            val dao = ChatRepositoryCreateSessionTest.RecordingDao()
+            val reported = mutableListOf<String>()
+            val repository = repo(dao, reported)
+
+            repository.deleteSession("s1")
+            repository.deleteSessionRowOnly("s2")
+
+            // No double-send: the sweep's loop must not have leaked into the
+            // two existing entry points.
+            assertEquals(listOf("s1", "s2"), reported)
+        }
 }

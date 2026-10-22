@@ -36,17 +36,14 @@ class ConfigRegistry private constructor() {
     /**
      * Look up a field by path. Handles both flat fields and collection
      * children (`<base>.<id>.<sub>`). Returns null for unknown paths.
+     *
+     * The grammar itself lives in [resolveRegistryField] — a pure function
+     * (maps in, field out), so the path rules are JVM-testable without an
+     * Android context and there is exactly one place that decides where a
+     * child id ends.
      */
-    fun resolveField(path: String): ConfigField? {
-        fields[path]?.let { return it }
-        // Collection child lookup: split into [base, id, leaf]. The leaf
-        // may itself contain dots (e.g. `models.<uuid>.modality.video`),
-        // so cap maxSplits at 2.
-        val segments = path.split('.', limit = 3)
-        if (segments.size != 3) return null
-        val coll = collections[segments[0]] ?: return null
-        return coll.fields(forId = segments[1]).firstOrNull { it.path == path }
-    }
+    fun resolveField(path: String): ConfigField? =
+        resolveRegistryField(path, fields, collections)
 
     fun collection(basePath: String): ConfigCollection? = collections[basePath]
 
@@ -125,4 +122,40 @@ class ConfigRegistry private constructor() {
             }
         }
     }
+}
+
+/**
+ * Pure core of [ConfigRegistry.resolveField] — resolve [path] against the
+ * flat [fields] map and the [collections] table. Returns null for unknown
+ * paths.
+ *
+ * A collection child path (`<base>.<id>.<sub>`) cannot be split by counting
+ * dots: the child id itself carries dots and so may the leaf. A previous
+ * implementation did exactly that and silently truncated every dotted id —
+ * `models.<instanceId>/gpt-5.5.isHidden` was cut into
+ * `fields(forId = "<instanceId>/gpt-5")`, so `minis-config get/set` answered
+ * `unknown_path` for every child of a dotted id (16 of the 39 built-in
+ * models have a dot in their id, and user-added model ids like
+ * `deepseek-v4.1-flash` are just as common; env-var keys may carry dots too).
+ *
+ * The collection's own id table is the only authority for where the id
+ * ends: take the LONGEST registered id that prefixes the remainder, then
+ * confirm the collection exposes a field whose full path equals the request
+ * (a near match is a miss — refuse instead of guessing).
+ */
+internal fun resolveRegistryField(
+    path: String,
+    fields: Map<String, ConfigField>,
+    collections: Map<String, ConfigCollection>,
+): ConfigField? {
+    fields[path]?.let { return it }
+    val coll = collections[path.substringBefore('.', missingDelimiterValue = "")] ?: return null
+    val prefix = coll.basePath + "."
+    if (!path.startsWith(prefix)) return null
+    val rest = path.substring(prefix.length)
+    val childId = coll.childIds()
+        .filter { rest.startsWith("$it.") }
+        .maxByOrNull { it.length }
+        ?: return null
+    return coll.fields(forId = childId).firstOrNull { it.path == path }
 }

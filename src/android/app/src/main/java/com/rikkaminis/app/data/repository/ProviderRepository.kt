@@ -1465,7 +1465,20 @@ class ProviderRepository(private val context: Context) {
         }?.id ?: compositeEntryKey(entry.providerInstanceId, entry.baseModel.id)
     }
 
-    fun updateEntry(entry: ModelEntry): String? = synchronized(configLock) {
+    // [fix/dv21-a3 A-03] `stampUserModified` selects which meaning of "update"
+    // this write carries, and the default (true) keeps every editor / agent
+    // caller on the historical behavior:
+    //   - true  = a user edit landed → this entry IS newly modified, stamp now.
+    //   - false = a restore wrote the backup's values onto the entry → the
+    //             backup's own userModifiedAt must survive (see
+    //             [mergeImportedEntryOntoLocal]'s restore-is-restore contract).
+    // Stamping a restore with "now" quietly broke two things: the merge's no-op
+    // short-circuit (`restored == local` can never hold once the local carries
+    // t_import while the backup carries null/t_backup, so every re-import
+    // rewrote every hit), and [shadowVoiceProviders]' arbitration (restoring
+    // instance A pushed its mostRecentModified past instance B's genuine edit,
+    // stealing the voice-provider slot).
+    fun updateEntry(entry: ModelEntry, stampUserModified: Boolean = true): String? = synchronized(configLock) {
         ensureConfigLoaded()
         val config = mutationSnapshot(_config.value)
         val idx = config.modelEntries.indexOfFirst { it.id == entry.id }
@@ -1494,7 +1507,10 @@ class ProviderRepository(private val context: Context) {
             }
             val renamed = decision.newKey != null
             val newUuid = decision.newKey ?: existing.id
-            config.modelEntries[idx] = entry.copy(uuid = newUuid, userModifiedAt = System.currentTimeMillis())
+            config.modelEntries[idx] = entry.copy(
+                uuid = newUuid,
+                userModifiedAt = if (stampUserModified) System.currentTimeMillis() else entry.userModifiedAt,
+            )
             if (renamed) {
                 val oldKey = decision.oldKey
                 // Canonicalize this entry's uuid to the new composite key and
@@ -2822,8 +2838,17 @@ class ProviderRepository(private val context: Context) {
                 // write was rejected and the untouched existing id is still
                 // the correct mapping target. A no-op merge (imported values
                 // already identical) skips the write entirely.
+                // [fix/dv21-a3 A-03] …and the write is a RESTORE, not an edit:
+                // stampUserModified = false carries the backup's own
+                // userModifiedAt instead of "now". The baseline shape stamped
+                // it, which defeated the no-op short-circuit above on the
+                // second import (the local entry carried t_import while the
+                // backup carried null/t_backup, so `restored == local` could
+                // never hold again) and let a restore of one instance jump
+                // shadowVoiceProviders' mostRecentModified arbitration over a
+                // genuinely edited sibling.
                 val updated = mergeImportedEntryOntoLocal(hit, entry)
-                if (updated == null) hit.id else (updateEntry(updated) ?: hit.id)
+                if (updated == null) hit.id else (updateEntry(updated, stampUserModified = false) ?: hit.id)
             } else {
                 addEntry(entry)
                 // [T-fix-import-id-roundtrip] addEntry 落盘后 _config.value 已被
@@ -2994,8 +3019,14 @@ internal fun applyImportInstanceFields(base: ProviderInstance, f: ImportInstance
  *    entryIdMap / model-group members / agentLoop ids referencing it stay
  *    valid. (providerInstanceId is equal by construction — the caller's hit
  *    predicate matches on it.)
- *  - [ModelEntry.userModifiedAt] is stamped by the writer, not copied from the
- *    backup (the same rule the UI editor path follows through [updateEntry]).
+ *  - [ModelEntry.userModifiedAt] rides the backup like every other field
+ *    ([fix/dv21-a3 A-03]) — it is NOT restamped with "now" by the writer. The
+ *    restored value is what makes a second import of the same backup a true
+ *    no-op (`restored == local` above), and a fresh stamp would push this
+ *    instance's [shadowVoiceProviders] arbitration past a sibling the user
+ *    really edited. The write face honors it through [updateEntry]'s
+ *    `stampUserModified = false` mode; the UI editor path keeps the default
+ *    (true).
  *  - A no-op merge returns null: nothing to write, the caller keeps the
  *    existing id. That is the unchanged "identical restore does not touch the
  *    entry" behavior.

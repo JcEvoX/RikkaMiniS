@@ -210,6 +210,46 @@ class ProviderEntryKeyAndPinTest {
     }
 
     @Test
+    fun `updateEntry stamps the entry only in its default edit mode`() {
+        // [fix/dv21-a3 A-03] The write face carries two modes: the default
+        // (true) stamps "now" for every editor / agent caller, `false` is the
+        // merge restore's mode and must carry the entry's own timestamp. A
+        // bare `userModifiedAt = System.currentTimeMillis()` (the baseline
+        // shape) re-dates every restore, which kills the merge's no-op
+        // short-circuit and steals shadowVoiceProviders' arbitration.
+        val src = repositorySource()
+        val decl = src.indexOf("fun updateEntry(")
+        require(decl >= 0) { "fun updateEntry( not found" }
+        val header = src.substring(decl, src.indexOf("{", decl))
+        assertTrue(
+            "the write face needs a switch to tell a restore from an edit: $header",
+            header.contains("stampUserModified: Boolean = true"),
+        )
+        val body = bodyOf(src, "fun updateEntry(")
+        val writeIdx = body.indexOf("userModifiedAt =")
+        require(writeIdx >= 0) { "no userModifiedAt write in updateEntry" }
+        val write = body.substring(writeIdx, minOf(body.length, writeIdx + 200))
+        assertTrue("the stamp must be guarded: $write", write.contains("if (stampUserModified)"))
+        assertTrue("the restore mode keeps the entry's value: $write", write.contains("entry.userModifiedAt"))
+    }
+
+    @Test
+    fun `merge hit branch writes the restored entry in the restore mode`() {
+        // [fix/dv21-a3 A-03] Judge the CALL SITE, not the helper: the restore
+        // must reach the write face with the non-stamping mode selected. A
+        // bare `updateEntry(updated)` is the baseline defect.
+        val body = bodyOf(repositorySource(), "fun mergeImportInstanceJSON(")
+        assertTrue(
+            "merge must route the restored entry through updateEntry: $body",
+            body.contains("updateEntry("),
+        )
+        assertTrue(
+            "the restored entry must be written with stampUserModified = false",
+            body.contains("updateEntry(updated, stampUserModified = false)"),
+        )
+    }
+
+    @Test
     fun `removeEntry clears the compact pin it just orphaned`() {
         val body = bodyOf(repositorySource(), "fun removeEntry(")
         assertTrue(body.contains("decideCompactPinCleanup("))
