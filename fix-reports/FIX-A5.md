@@ -194,27 +194,34 @@ session_sheet_id_binding_check      rc=0  OK (4 session-scoped call blocks ...)
 
 **结论：attempt 1 success，8/8 判据 ALL GREEN。**
 
-**最终 run（对应分支末尾 HEAD）**
+**最终 run（对应分支尖端 HEAD，即交付 SHA）**
 
 | 项 | 读数 |
 |---|---|
-| run / job | `39769224007` / `119792252375`（26 步） |
-| conclusion | `success`（`at 2026-10-22T11:28:11Z`） |
-| **head_sha 三方** | 本地 `7f27d08042633efbbfb53b56e7b74a5f7b388fbe` == `git ls-remote` == CI job `head_sha` = **三者逐字符一致** |
+| run / job | `39771233041` / `119799011771`（26 步） |
+| conclusion | `success`（`at 2026-10-22T11:49:53Z`） |
+| **head_sha 三方** | 本地 `b71265e74bb98ffc6dba46d4f6927b7c2657e738` == `git ls-remote` == CI job `head_sha` = **三者逐字符一致** |
 | 步骤 | `not_ok_steps=[]` · 唯一 `skipped_steps=['Publish to Releases']`（main 门控 ✓，分支不该发版） |
 | 门头 | `[1/109] … [109/109]`，序号连续、**109 个互异门名** |
 | 门汇总 | `Summary: 109 passed, 0 failed`（`grep -oE 'Summary: [0-9]+ passed, [0-9]+ failed' \| sort \| uniq -c` 共 8 条，**无任何非零 failed**） |
 | 夹具 | `✅ ALL 336 CASES PASS` |
-| 本门 | `✅ chat_session_id_binding_check selftest has teeth (CHAT_SESSION_ID_BINDING_SELFTEST=PASS)` · `✅ chat_session_id_binding_check real tree green`（+ 单独 `all criteria satisfied`） |
+| 本门 | `✅ chat_session_id_binding_check selftest has teeth (CHAT_SESSION_ID_BINDING_SELFTEST=PASS)` · `✅ chat_session_id_binding_check real tree green`（另有单独 `all criteria satisfied` 一处） |
 | 新测试 | `HeadlessChatRunnerSessionReadyBarrierTest` **10/10 逐条 PASSED**（含 7 条负控） |
 | 编译错 | `Z e: ` **0** |
 | 游离 FAILED | **0**（含 FAILED 但不含 PASSED 的行 = 0） |
-| 日志 | `probe/ci/job-final2.log`，1,364,970 B / 16,313 行 |
+| 日志 | `probe/ci/job-tip.log`，1,364,537 B / 16,307 行 |
 
-**同一套源码的前两轮 run**（都 `success`，用于证明本轮红绿与「报告回填」无关）：
-`39763322068` / job `119772879607`（`head_sha=877d4870…`，日志 `probe/ci/job-119772879607.log`）；
-`39766531437` / job `119783259705`（`head_sha=b85beef1…`，日志 `probe/ci/job-final.log`）。
-`877d4870…7f27d080` 之间的源码差异经 `git diff --name-only … ':(exclude)fix-reports'` 核实为 **空** —— 即三轮 CI 验的是同一棵源码树，只是每轮补上「报告回填后 HEAD 也要有绿的 run」。
+**同一套源码的前三轮 run**（都 `success`，用于证明红绿与「报告回填」这一非代码动作无关，且判读可复现）：
+`39763322068` / job `119772879607`（`head_sha=877d4870…`，`probe/ci/job-119772879607.log`）；
+`39766531437` / job `119783259705`（`head_sha=b85beef1…`，`probe/ci/job-final.log`）；
+`39769224007` / job `119792252375`（`head_sha=7f27d080…`，`probe/ci/job-final2.log`）。
+`877d4870 → b71265e7` 的全部差异经 `git diff --name-only … ':(exclude)fix-reports'` 核实为 **空** —— 四轮 CI 验的是同一棵源码树（`HeadlessChatRunner.kt` / 测试 / 门三文件逐字节相同），后三轮只是把「报告回填后的新 HEAD 也要有绿的 run」补齐。
+
+**交付源码树 = CI 在 `b71265e7` 验的那棵树的逐字节副本。** 本报告在 `b71265e7` 之后的提交只改动 `fix-reports/FIX-A5.md`，可用一条命令复核：
+
+```sh
+git diff --name-only b71265e7 HEAD -- . ':(exclude)fix-reports'   # 输出为空
+```
 
 **判读装置两处踩坑（登记在 R8）**：
 1. `Summary:` 行的权威形态是 `║  Summary: 109 passed, 0 failed`（带框线前缀），首版用 `strip().startswith("Summary:")` 导致 `Summary lines=0` 的假阴性 —— 改为「收集全部含 `Summary:` 的行，断言其中一条为 109/0 且无任何非零 failed」。
