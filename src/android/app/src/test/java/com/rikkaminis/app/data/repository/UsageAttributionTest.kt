@@ -120,6 +120,12 @@ class UsageAttributionTest {
         ): Int = error("messageCountForSessionInRange is not stubbed in this test")
         override fun messageCountsPerSession(): Flow<Map<String, Int>> = flowOf(emptyMap())
         override suspend fun deleteEmptySessions(activeIds: List<String>, staleBefore: Long): Int = 0
+        // [dv21-a2] inert: this test never runs the empty-session sweep.
+        override suspend fun selectEmptySessionIds(
+            activeIds: List<String>,
+            staleBefore: Long,
+        ): List<String> = emptyList()
+        override suspend fun existingSessionIds(ids: List<String>): List<String> = emptyList()
     }
 
     @Test
