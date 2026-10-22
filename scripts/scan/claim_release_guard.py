@@ -40,6 +40,34 @@ two mechanical shapes every instance has exhibited CAN be:
      the flip. (41f024e7's root cause; the pre-fix tree violates this at all 7
      claim sites, the post-fix tree at none — used as ground truth.)
 
+  C. [1042-A-03, 2026-10-22] SELF-BOUND GATES & UNGUARDED SETTLEMENT — two
+     blind spots the pre-1042 gate had, both found by deep-audit-1042 A-03 in
+     sandbox/TerminalSession.kt:
+
+     C2. SELF-BOUND OWNERSHIP GUARD — `X?.let { s -> … if (X === s) … }`.
+         The let-parameter IS the receiver, so the identity check is a
+         tautology: it always passes and the "guarded" release behind it is
+         effectively ungated. The pre-fix start() failure handler self-bound
+         exactly this way (`termuxSession?.let { s -> if (termuxSession === s)
+         termuxSession = null }`) and unconditionally killed a newer attempt's
+         PTY, unregistered its liveSessions entry and flipped STOPPED over it.
+         Such a condition now never counts as a gate (Check A sees the write
+         as ungated) and is reported on its own with an explicit message.
+
+     C1. TERMINAL SETTLEMENT OWNERSHIP — inside every `fun onSessionFinished`
+         body, the settlement decision points (the *Generation bump, the
+         termuxSession slot clear, the _state.value publish, the
+         liveSessions removal) must sit inside the brace block of an
+         ownership guard (`if (termuxSession === changedSession) { … }`).
+         The pre-fix callback bumped the generation, published STOPPED and
+         unregistered liveSessions OUTSIDE the guard, so a stale callback
+         landing after a newer start() aborted the fresh boot, rendered the
+         live session dead on the screen and cut it off from broadcasts.
+         The criterion anchors the DECISIONS, not their spellings (backlog
+         §1036-A1 R3: criteria bound to literal call shapes rotted 4×); if
+         the decisions themselves disappear the gate ROTs loudly instead of
+         disarming silently.
+
 ## What counts as an ownership gate
 
 The nearest enclosing `if` of a release write, if its condition compares
@@ -69,6 +97,7 @@ Check B at all 7 claim sites; the current tree passes strict clean, and the
 self-test asserts both.
 
 Usage: python3 scripts/scan/claim_release_guard.py <repo_root> [--report]
+       python3 scripts/scan/claim_release_guard.py --selftest
 Exit:  0 = clean (or report mode), 1 = finding(s) in strict mode
 """
 import os
@@ -112,6 +141,32 @@ GUARD_WINDOW_CHARS = 220
 MINT_CLAIM_SEARCH = 60
 FUNC_SEARCH_BACK = 60
 FWD_REPORT_WINDOW = 60
+
+# [1042-A-03] Self-bound fake gate: `X?.let { s -> … }` / `X?.let { … }`.
+# Receiver must be a plain identifier chain (a call result has no name to
+# self-compare against). The explicit-param form captures `s`, the implicit
+# form means `it`.
+SELF_LET_RE = re.compile(
+    r"([A-Za-z_]\w*(?:\s*\.\s*[A-Za-z_]\w*)*)\?\.\s*let\s*\{"
+    r"(?:\s*([A-Za-z_]\w*)\s*->)?"
+)
+SELF_LET_SCAN_LINES = 15
+
+# [1042-A-03] C1 anchors: the settlement decisions of the terminal family.
+ON_SESSION_FINISHED_RE = re.compile(r"\bfun\s+onSessionFinished\s*\(")
+SETTLE_DECISIONS = (
+    ("*Generation counter bump",
+     re.compile(r"\b[A-Za-z_]\w*[Gg]eneration\s*(?:\.\s*(?:increment|add|"
+                r"update|set)\w*\s*\(|=(?!=))")),
+    ("termuxSession slot clear",
+     re.compile(r"\btermuxSession\s*=(?!=)")),
+    ("_state.value publish",
+     re.compile(r"\b_state\s*\.\s*value\s*=(?!=)")),
+    ("liveSessions removal",
+     re.compile(r"\bliveSessions\s*\.\s*(?:remove\w*|clear)\b")),
+)
+TERM_SETTLE_KEYS = ("termuxSession", "startGeneration", "_state",
+                    "liveSessions")
 
 # Audited (file, key) pairs where the ungated release is demonstrably safe in
 # the current architecture. Every entry states WHY — re-audit when the file's
@@ -199,8 +254,169 @@ def is_ownership_cond(cond):
     return False
 
 
-def enclosing_gate(clean_lines, idx, col):
-    """First ownership condition enclosing the write, or None."""
+def match_brace(text, open_idx):
+    """Index of the `}` matching the `{` at [open_idx], or None (quote-aware)."""
+    depth = 0
+    i = open_idx
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"' or ch == "'":
+            j = i + 1
+            while j < n and text[j] != ch and text[j] != "\n":
+                if text[j] == "\\":
+                    j += 1
+                j += 1
+            i = j + 1
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return None
+
+
+def norm_cond(cond):
+    return " ".join(cond.split())
+
+
+def scan_fake_gates(clean_lines):
+    """[1042-A-03 C2] Self-bound ownership guards in this file.
+
+    `X?.let { s -> … if (X === s) … }`: the let-parameter binds to the
+    receiver itself, so the identity comparison is a tautology — it always
+    passes and the "guarded" write behind it is effectively ungated. Returns
+    ({(line, norm_cond): (recv, param, op)}, [(line, recv, param, op, cond)]).
+    """
+    fakes = {}
+    reports = []
+    n = len(clean_lines)
+    for i, line in enumerate(clean_lines):
+        for m in SELF_LET_RE.finditer(line):
+            recv = norm_cond(m.group(1))
+            param = m.group(2) or "it"
+            brace_off = m.start() + m.group(0).rfind("{")
+            # Walk the lambda body (brace depth from the `let {`) to bound the scan.
+            depth = 0
+            j = i
+            while j < n and j < i + SELF_LET_SCAN_LINES:
+                text = clean_lines[j]
+                seg_from = brace_off if j == i else 0
+                closed = False
+                for k in range(seg_from, len(text)):
+                    if text[k] == "{":
+                        depth += 1
+                    elif text[k] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            closed = True
+                            break
+                if closed:
+                    break
+                j += 1
+            for jj in range(i, min(j + 1, n)):
+                for fm in re.finditer(r"\bif\s*\(", clean_lines[jj]):
+                    cond = extract_condition(clean_lines[jj], fm.end() - 1)
+                    if cond is None:
+                        continue
+                    for op, left, right in compare_operands(cond):
+                        if op not in ("===", "!=="):
+                            continue
+                        if (norm_cond(left) == recv and norm_cond(right) == param) or \
+                           (norm_cond(right) == recv and norm_cond(left) == param):
+                            key = (jj, norm_cond(cond))
+                            if key not in fakes:
+                                fakes[key] = (recv, param, op)
+                                reports.append((jj, recv, param, op, cond))
+    return fakes, reports
+
+
+def terminal_settlement_findings(rel, clean_lines, fake_gates):
+    """[1042-A-03 C1] onSessionFinished settlement must be ownership-gated.
+
+    Every settlement decision in the callback body — *Generation bump,
+    termuxSession slot clear, _state.value publish, liveSessions removal —
+    must sit inside the brace block (or the single brace-less statement) of
+    an ownership guard. Anchors the DECISIONS, not their spellings; a body
+    with no decisions at all ROTs loudly (audit-0917 requires the natural-exit
+    path to mirror stop()'s bookkeeping).
+    """
+    joined = "\n".join(clean_lines)
+    out = []
+    for m in ON_SESSION_FINISHED_RE.finditer(joined):
+        open_brace = joined.find("{", m.end())
+        if open_brace < 0:
+            continue
+        close = match_brace(joined, open_brace)
+        if close is None:
+            close = len(joined) - 1
+        body = joined[open_brace:close + 1]
+        base_line = joined[:open_brace].count("\n")  # 0-based line of `{`
+        decisions = []
+        for label, rx in SETTLE_DECISIONS:
+            for dm in rx.finditer(body):
+                line = base_line + body[:dm.start()].count("\n") + 1
+                decisions.append((dm.start(), label, line))
+        if not decisions:
+            mentions = [k for k in TERM_SETTLE_KEYS if k in body]
+            if not mentions:
+                out.append(("C1-ROT", rel, m.start() and
+                            (joined[:m.start()].count("\n") + 1),
+                            "onSessionFinished found but no settlement decisions "
+                            "and no terminal-family keys — audit-0917's "
+                            "bookkeeping is gone or the keys were renamed. "
+                            "ROT — update this gate."))
+            else:
+                out.append(("C1-ROT", rel,
+                            joined[:m.start()].count("\n") + 1,
+                            "onSessionFinished found, family keys present "
+                            f"({', '.join(mentions)}) but no decision points "
+                            "matched — the gate's decision anchors drifted. "
+                            "ROT — update this gate."))
+            continue
+        spans = []
+        for fm in re.finditer(r"\bif\s*\(", body):
+            p = fm.end() - 1
+            cond = extract_condition(body, p)
+            if cond is None:
+                continue
+            line = base_line + body[:fm.start()].count("\n")
+            if (line, norm_cond(cond)) in fake_gates:
+                continue  # self-bound tautology — not a gate (C2 reports it)
+            if not is_ownership_cond(cond):
+                continue
+            after = p + len(cond) + 2
+            k = after
+            while k < len(body) and body[k] in " \t":
+                k += 1
+            if k < len(body) and body[k] == "{":
+                c = match_brace(body, k)
+                if c is not None:
+                    spans.append((k, c))
+            else:
+                nl = body.find("\n", after)
+                spans.append((after, nl if nl >= 0 else len(body)))
+        for d, label, line in decisions:
+            if any(s < d <= e for s, e in spans):
+                continue
+            out.append(("C1", rel, line,
+                        f"onSessionFinished: {label} sits OUTSIDE the "
+                        "ownership guard — a stale callback landing after a "
+                        "newer start() would settle a live session's state. "
+                        "Wrap the whole settlement in "
+                        "`if (termuxSession === changedSession) { … }`."))
+    return out
+
+
+def enclosing_gate(clean_lines, idx, col, fake_gates=()):
+    """First ownership condition enclosing the write, or None.
+
+    fake_gates: {(line_idx, norm_cond)} of self-bound tautologies — such a
+    condition never counts as a gate ([1042-A-03 C2]).
+    """
     lo = max(0, idx - GATE_WINDOW)
     window = "\n".join(clean_lines[lo:idx + 1])
     my_pos = sum(len(clean_lines[j]) + 1 for j in range(lo, idx)) + col
@@ -211,6 +427,8 @@ def enclosing_gate(clean_lines, idx, col):
         cond = extract_condition(window, p)
         if cond is None:
             continue
+        if (lo + window[:m.start()].count("\n"), norm_cond(cond)) in fake_gates:
+            continue  # self-bound tautology — see scan_fake_gates
         after = p + len(cond) + 2
         k = after
         while k < len(window) and window[k] in " \t":
@@ -234,10 +452,14 @@ def enclosing_gate(clean_lines, idx, col):
         if enclosed and is_ownership_cond(cond):
             return cond
     # early-return guard style: `if (ownership) return` just above the write
-    tail = window[max(0, my_pos - GUARD_WINDOW_CHARS):my_pos]
+    tail_start = max(0, my_pos - GUARD_WINDOW_CHARS)
+    tail = window[tail_start:my_pos]
     for m in re.finditer(r"\bif\s*\(", tail):
         cond = extract_condition(tail, m.end() - 1)
         if cond is None:
+            continue
+        if (lo + window[:tail_start + m.start()].count("\n"),
+                norm_cond(cond)) in fake_gates:
             continue
         after = tail[m.end() + len(cond) + 1:]
         if re.match(r"\s*(return|continue)\b", after) and is_ownership_cond(cond):
@@ -347,12 +569,287 @@ def family_scope(site, decls):
     return site["file"]
 
 
+def selftest():
+    """[1042-A-03] Selftest: every new criterion has a breaker, and the
+    pre-existing ground truths (2026-10-12 Check A/B) still bite."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    base = "com/rikkaminis/app/sandbox/"
+    chat = "com/rikkaminis/app/ui/chat/"
+    prefix = "src/android/app/src/main/java/"
+
+    post = prefix + base + "Post.kt"
+    pre_onfin = prefix + base + "PreOnFin.kt"
+    selfbound = prefix + base + "SelfBound.kt"
+    pre_catch = prefix + base + "PreCatch.kt"
+    rot = prefix + base + "Rot.kt"
+    b_good = prefix + chat + "BG.kt"
+    b_bad = prefix + chat + "BB.kt"
+    sib_bad = prefix + chat + "Sib.kt"
+    handoff = prefix + chat + "Hand.kt"
+
+    POST = ("""package com.rikkaminis.app.sandbox
+class Post {
+    var termuxSession: Any? = null
+    var startGeneration = 0
+    val _state = St()
+    val liveSessions = mutableListOf<Any>()
+    inner class St { var value: Any? = null }
+    fun start() {
+        var createdSession: Any? = null
+        try {
+            val session = Any()
+            createdSession = session
+            termuxSession = session
+        } catch (t: Throwable) {
+            createdSession?.let { s ->
+                runCatching { kill(s) }
+            }
+            if (termuxSession === createdSession) {
+                termuxSession = null
+                liveSessions.removeAll { it === this@Post }
+                _state.value = null
+            }
+        }
+    }
+    inner class C {
+        fun onSessionFinished(changedSession: Any) {
+            if (termuxSession === changedSession) {
+                startGeneration = startGeneration + 1
+                termuxSession = null
+                if (_state.value != null) _state.value = null
+                liveSessions.removeAll { it === this@Post }
+            } else {
+                Log.i("stale callback ignored")
+            }
+        }
+    }
+    fun kill(s: Any?) {}
+    object Log { fun i(m: String) {} }
+}
+""")
+
+    # Pre-fix onSessionFinished (1042-A-03 shape): generation bump, state
+    # publish and liveSessions removal OUTSIDE the ownership guard. The slot
+    # clear itself was (brace-lessly) guarded — C1 must NOT flag it.
+    PRE_ONFIN = ("""package com.rikkaminis.app.sandbox
+class PreOnFin {
+    var termuxSession: Any? = null
+    var startGeneration = 0
+    val _state = St()
+    val liveSessions = mutableListOf<Any>()
+    inner class St { var value: Any? = null }
+    inner class C {
+        fun onSessionFinished(changedSession: Any) {
+            startGeneration.incrementAndGet()
+            if (termuxSession === changedSession) termuxSession = null
+            if (_state.value != STOPPED) _state.value = STOPPED
+            liveSessions.removeAll { it === this@PreOnFin }
+        }
+    }
+    object STOPPED
+}
+""")
+
+    # Settlement "guarded" by a self-bound let: the guard is a tautology, so
+    # C2 must report it AND C1 must see the decisions as unguarded.
+    SELFBOUND = ("""package com.rikkaminis.app.sandbox
+class SelfBound {
+    var termuxSession: Any? = null
+    var startGeneration = 0
+    val _state = St()
+    val liveSessions = mutableListOf<Any>()
+    inner class St { var value: Any? = null }
+    inner class C {
+        fun onSessionFinished(changedSession: Any) {
+            termuxSession?.let { s ->
+                if (termuxSession === s) {
+                    startGeneration.incrementAndGet()
+                    termuxSession = null
+                    _state.value = STOPPED
+                    liveSessions.removeAll { it === this@SelfBound }
+                }
+            }
+        }
+    }
+    object STOPPED
+}
+""")
+
+    # Pre-fix start() catch handler (1042-A-03 shape): self-bound guard only.
+    PRE_CATCH = ("""package com.rikkaminis.app.sandbox
+class PreCatch {
+    var termuxSession: Any? = null
+    val _state = St()
+    inner class St { var value: Any? = null }
+    fun start() {
+        try {
+            termuxSession = Any()
+        } catch (t: Throwable) {
+            termuxSession?.let { s ->
+                if (termuxSession === s) termuxSession = null
+                runCatching { kill(s) }
+            }
+            _state.value = false
+        }
+    }
+    fun kill(s: Any?) {}
+}
+""")
+
+    ROT_SRC = ("""package com.rikkaminis.app.sandbox
+class Rot {
+    inner class C {
+        fun onSessionFinished(changedSession: Any) {
+            Log.i("finished")
+        }
+    }
+    object Log { fun i(m: String) {} }
+}
+""")
+
+    B_GOOD = ("""package com.rikkaminis.app.ui.chat
+class BG {
+    var streamingClaimToken: Any = Any()
+    var streamJob: Job? = null
+    fun send() {
+        streamingClaimToken = Any()
+        _isStreaming.value = true
+        val claimToken = streamingClaimToken
+        streamJob = launch {
+            try { loop() } finally {
+                if (claimToken === streamingClaimToken) { _isStreaming.value = false }
+            }
+        }
+    }
+    fun sendSecond() {
+        streamingClaimToken = Any()
+        _isStreaming.value = true
+    }
+}
+""")
+
+    B_BAD = ("""package com.rikkaminis.app.ui.chat
+class BB {
+    var streamingClaimToken: Any = Any()
+    fun send() {
+        _isStreaming.value = true
+        streamingClaimToken = Any()
+        val claimToken = streamingClaimToken
+        launch {}
+        if (claimToken === streamingClaimToken) { _isStreaming.value = false }
+    }
+}
+""")
+
+    SIB_BAD = ("""package com.rikkaminis.app.ui.chat
+class Sib {
+    var streamEpoch = 0
+    var curEpoch = 0
+    fun a() { if (streamEpoch === curEpoch) { _isStreaming.value = false } }
+    fun b() { _isStreaming.value = false }
+}
+""")
+
+    HANDOFF = ("""package com.rikkaminis.app.ui.chat
+class Hand {
+    var pendingContinuation: Any? = null
+    var gateEpoch = 0
+    var curGate = 0
+    fun respond() {
+        val cont = pendingContinuation ?: return
+        pendingContinuation = null
+        _pendingRequest.value = null
+    }
+    fun timedOut() { if (gateEpoch === curGate) { pendingContinuation = null } }
+}
+""")
+
+    def mk_tree(files):
+        root = tempfile.mkdtemp(prefix="claim-release-selftest-")
+        for rel, text in files.items():
+            path = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        return root
+
+    def run_gate(root):
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), root],
+            capture_output=True, text=True, timeout=180)
+        return proc.returncode, proc.stdout + proc.stderr
+
+    print("── selftest: compliant fixture green, every breaker red, "
+          "ground truths intact ──")
+    arms = [
+        ("post-fix terminal settlement is green (exit 0)", {post: POST}, 0, []),
+        ("pre-fix onSessionFinished settlement caught (C1)",
+         {pre_onfin: PRE_ONFIN}, 1,
+         ["[C1] ", "*Generation counter bump", "_state.value publish",
+          "liveSessions removal"]),
+        ("pre-fix onSessionFinished: guarded slot clear NOT flagged (precision)",
+         {pre_onfin: PRE_ONFIN}, 1, ["NOT termuxSession slot clear"]),
+        ("self-bound settlement guard is a tautology (C2 + C1)",
+         {selfbound: SELFBOUND}, 1, ["[C2] ", "[C1] "]),
+        ("pre-fix self-bound catch handler caught (C2)",
+         {pre_catch: PRE_CATCH}, 1, ["[C2] ", "tautology"]),
+        ("onSessionFinished with no settlement ROTs",
+         {rot: ROT_SRC}, 1, ["C1-ROT"]),
+        ("ground truth: claim after mint passes", {b_good: B_GOOD}, 0, []),
+        ("ground truth: pre-flip claim caught",
+         {b_bad: B_BAD}, 1, ["AFTER the claim"]),
+        ("ground truth: ungated sibling caught",
+         {sib_bad: SIB_BAD}, 1, ["[A]"]),
+        ("ground truth: atomic hand-off passes", {handoff: HANDOFF}, 0, []),
+    ]
+    failures = []
+    for name, files, want_rc, needles in arms:
+        root = mk_tree(files)
+        try:
+            rc, out = run_gate(root)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+        problems = []
+        if rc != want_rc:
+            problems.append(f"exit={rc} want={want_rc}")
+        for needle in needles:
+            if needle == "NOT termuxSession slot clear":
+                if "termuxSession slot clear" in out:
+                    problems.append("flagged the guarded slot clear")
+            elif needle not in out:
+                problems.append(f"missing {needle!r}")
+        if problems:
+            failures.append(f"{name}: {'; '.join(problems)}\n--- output ---\n{out}")
+            print(f"  [FAIL] {name}: {'; '.join(problems)}")
+        else:
+            print(f"  [OK] {name}")
+    if failures:
+        print(f"SELFTEST FAIL ({len(failures)} arm(s))")
+        return 1
+    print(f"SELFTEST=PASS ({len(arms)} fixtures: {sum(1 for a in arms if a[2] == 1)} "
+          "breakers red, compliant/good arms green)")
+    return 0
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     report_only = "--report" in sys.argv
+    if "--selftest" in sys.argv:
+        return selftest()
     root = os.path.abspath(args[0] if args else ".")
 
     claims, releases, mints, decls, clean, rawD = collect(root)
+
+    # [1042-A-03 C2] self-bound fake gates, per file.
+    fake_gates, c2_reports = {}, []
+    for rel, lines in clean.items():
+        fk, rep = scan_fake_gates(lines)
+        fake_gates[rel] = fk
+        c2_reports.extend((rel, ln, recv, param, op, cond)
+                          for ln, recv, param, op, cond in rep)
 
     # ── Check A: sibling-gate inconsistency within one flag's family ──
     families = {}
@@ -364,7 +861,8 @@ def main():
     for (key, _scope), sites in sorted(families.items()):
         gated, ungated = [], []
         for s in sites:
-            cond = enclosing_gate(clean[s["file"]], s["idx"], s["col"])
+            cond = enclosing_gate(clean[s["file"]], s["idx"], s["col"],
+                                  fake_gates.get(s["file"], ()))
             if cond:
                 s["gate_cond"] = cond
                 gated.append(s)
@@ -387,6 +885,14 @@ def main():
 
     # Only names that are actually re-minted somewhere count as markers: a
     # generation stamp compared by the gate AND reassigned as `X = <fresh>`.
+
+    # ── Check C1: onSessionFinished settlement ownership ([1042-A-03]) ──
+    findings_c1 = []
+    for rel in sorted(clean):
+        findings_c1.extend(
+            terminal_settlement_findings(rel, clean[rel],
+                                         fake_gates.get(rel, ())))
+
     minted_names = {m["var"] for m in mints}
 
     # ── Check B: claim flips before publishing any gate-compared marker ──
@@ -410,9 +916,11 @@ def main():
         nearest = min(fwd, key=lambda m: m["idx"]) if fwd else None
         findings_b.append((c, sorted(markers), nearest))
 
-    total = len(findings_a) + len(findings_b)
+    total = (len(findings_a) + len(findings_b) + len(findings_c1)
+             + len(c2_reports))
     if not total:
-        print("✅ Claim/release guard: no ungated release or unminted claim found")
+        print("✅ Claim/release guard: no ungated release, self-bound gate, "
+              "unguarded settlement or unminted claim found")
         return 0
 
     tag = "⚠️  REPORT-ONLY" if report_only else "❌"
@@ -430,6 +938,22 @@ def main():
             g = items[0][1]
             print(f"     {f}  `{key}` — {len(items)} ungated: {lines}"
                   f"   | gated sibling :{g['line']} (`{g['gate_cond'][:56]}`)")
+    if c2_reports:
+        print("   [C2] Self-bound ownership guard — the let-parameter IS the")
+        print("       receiver, so `if (X === s)` is a tautology that always")
+        print("       passes. The write behind it is effectively ungated")
+        print("       (1042-A-03). Compare the slot against a value captured")
+        print("       elsewhere, e.g. the local this-attempt created reference.")
+        for rel, ln, recv, param, op, cond in c2_reports:
+            print(f"     {rel}:{ln + 1}  `{recv}?.let {{ {param} -> … "
+                  f"{recv} {op} {param} … }}` — `{cond.strip()[:60]}`")
+    if findings_c1:
+        print("   [C1] Terminal onSessionFinished settlement outside the")
+        print("       ownership guard (1042-A-03). A stale callback landing")
+        print("       after a newer start() would bump the generation, publish")
+        print("       STOPPED and unregister liveSessions over the live session.")
+        for kind, rel, ln, msg in findings_c1:
+            print(f"     [{kind}] {rel}:{ln}  {msg}")
     if findings_b:
         print("   [B] Claim flips the flag before publishing the release gate's marker.")
         print("       Publish (`X = Any()` / `X = epoch`) BEFORE the flip, or justify")
