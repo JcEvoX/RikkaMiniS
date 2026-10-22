@@ -60,6 +60,9 @@ import androidx.compose.ui.res.stringResource
 import com.rikkaminis.app.data.model.DEFAULT_GROUP_CONTEXT_LIMIT_TOKENS
 import com.rikkaminis.app.data.model.ModelGroup
 import com.rikkaminis.app.data.model.RoutingStrategy
+import com.rikkaminis.app.data.model.SystemVoiceEntries
+import com.rikkaminis.app.data.model.normalizeModalities
+import com.rikkaminis.app.provider.ModelsDevApi
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.data.AgentRuntimeLimitsPrefs
 import com.rikkaminis.app.R
@@ -518,10 +521,19 @@ private fun groupTopModalities(
     val inputs = mutableSetOf<String>()
     val outputs = mutableSetOf<String>()
     for (entryId in group.memberEntryIds) {
-        val model = config.modelEntries.find { it.id == entryId }?.model ?: continue
-        model.inputModalities.orEmpty().forEach { inputs.add(it.lowercase()) }
-        val out = model.outputModalities.orEmpty()
-        if (out.isEmpty()) outputs.add("text") else out.forEach { outputs.add(it.lowercase()) }
+        // [deep-audit-1043 B-06] Two halves of the same 母题:
+        //  - resolve through the System single source, or the default Voice
+        //    groups contribute no marker at all;
+        //  - read capability off `ModelsDevApi.effectiveModel`, or every built-in
+        //    registry model reports no modalities (its `baseModel` fields are
+        //    null by construction and only the registry fills them). Raw
+        //    `.lowercase()` also kept the provider-side `_input` / `_output`
+        //    suffixes, so "image_input" never matched the "image" marker.
+        val entry = SystemVoiceEntries.resolveIn(config.modelEntries, entryId) ?: continue
+        val model = ModelsDevApi.effectiveModel(entry)
+        model.inputModalities.normalizeModalities().orEmpty().forEach { inputs.add(it) }
+        val out = model.outputModalities.normalizeModalities().orEmpty()
+        if (out.isEmpty()) outputs.add("text") else out.forEach { outputs.add(it) }
     }
     return GROUP_MODALITY_PRIORITY.filter { marker ->
         if (marker.isOutput) marker.kind in outputs else marker.kind in inputs
@@ -570,8 +582,11 @@ private fun GroupRow(
      *  inert handle — fine for previews/non-reorderable hosts. */
     dragHandleModifier: Modifier = Modifier,
 ) {
+    // [deep-audit-1043 B-06] System voice members are virtual — resolving only
+    // through `config.modelEntries` left the default Voice groups with an empty
+    // member preview even though their detail screen lists two entries.
     val memberNames = group.memberEntryIds.mapNotNull { entryId ->
-        config.modelEntries.find { it.id == entryId }?.model?.displayName
+        SystemVoiceEntries.resolveIn(config.modelEntries, entryId)?.model?.displayName
     }
     val preview = if (memberNames.size <= 3) {
         memberNames.joinToString(", ")
@@ -591,8 +606,12 @@ private fun GroupRow(
     // appears empty in chat.
     val enabledInstanceIds = config.instances.filter { it.isEnabled }.map { it.id }.toSet()
     val totalMembers = group.memberEntryIds.size
+    // [deep-audit-1043 B-06] Same single predicate the runtime member list uses
+    // (`ProviderRepository.enabledMemberEntries`): System entries are usable
+    // without a Provider instance, so judging them by `enabledInstanceIds` marked
+    // every default Voice group 「No usable models」 in red.
     val enabledMembers = group.memberEntryIds.count { entryId ->
-        config.modelEntries.find { it.id == entryId }?.providerInstanceId in enabledInstanceIds
+        SystemVoiceEntries.isEnabledGroupMember(config.modelEntries, enabledInstanceIds, entryId)
     }
     val allDisabled = totalMembers > 0 && enabledMembers == 0
 

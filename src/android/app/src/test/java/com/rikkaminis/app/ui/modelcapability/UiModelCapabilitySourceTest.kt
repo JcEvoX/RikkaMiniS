@@ -53,6 +53,11 @@ class UiModelCapabilitySourceTest {
         "the chat screen non-text label" to "com/rikkaminis/app/ui/chat/ChatScreen.kt",
         "the model entry editor" to "com/rikkaminis/app/ui/settings/ModelEntryDetailScreen.kt",
         "the provider detail rows" to "com/rikkaminis/app/ui/settings/ProviderDetailScreen.kt",
+        // [deep-audit-1043 B-06] `groupTopModalities` was the seventh reader of
+        // the raw `entry.model` and the one C33's original six-file table
+        // missed — so a group card lost every modality badge while its own
+        // detail screen showed them.
+        "the model groups screen" to "com/rikkaminis/app/ui/settings/ModelGroupsScreen.kt",
     )
 
     /** One reason string per way a surface can go back to the raw model. */

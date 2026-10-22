@@ -249,6 +249,9 @@ REL_MODEL_PICKER_SHEET = "src/android/app/src/main/java/com/rikkaminis/app/ui/ch
 # [dv22/B-03] the remaining capability-reading surfaces
 REL_QUICK_TEST = "src/android/app/src/main/java/com/rikkaminis/app/ui/components/QuickTestSheet.kt"
 REL_CHAT_SCREEN = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatScreen.kt"
+# [deep-audit-1043 B-06] the group surfaces that resolve memberEntryIds for DISPLAY
+REL_MODEL_GROUPS = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/ModelGroupsScreen.kt"
+REL_AGENT_LOOP_MODELS = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/AgentLoopModelsScreen.kt"
 # da1039-B3 (B-03 / B-04 / B-08): the settings screens that read a config object
 # once and then write through it.
 REL_ADD_CUSTOM_MODEL = "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/AddCustomModelScreen.kt"
@@ -1958,6 +1961,157 @@ CAP_READ_RE = re.compile(r"\b(?:inputModalities|outputModalities|modalityBadges|
 SINGLE_SOURCE_RE = re.compile(r"\b(?:effectiveModel|enrichModel)\s*\(")
 
 
+def _member_block(code, start):
+    """The statement that resolves the member id mentioned at `start`.
+
+    Statements here come in two shapes and BOTH must be captured whole:
+        for (x in group.memberEntryIds) { … }
+        val names = group.memberEntryIds           <- fluent chain, the lambda
+            .mapNotNull { x -> … }                    opens on the NEXT line
+    so "walk to the next `{`" is not enough (a newline intervenes) and "stop at
+    the first newline" is not either (it cuts the chain in half, and the whole
+    point is to see whether the body resolves through the System source).
+
+    Rule: from the mention, scan to the first line that is BOTH at bracket depth
+    0 AND indented no deeper than the mention's own line. That ends the
+    statement for a chain, a loop body, a `remember { … }` wrapper, or an
+    assignment, while keeping nested lambdas and `withContext` blocks inside."""
+    line_start = code.rfind("\n", 0, start) + 1
+    indent = 0
+    while line_start + indent < len(code) and code[line_start + indent] == " ":
+        indent += 1
+
+    depth = 0
+    i = start
+    while i < len(code):
+        ch = code[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+            if depth < 0:                 # the enclosing block already closed
+                return code[start:i]
+        elif ch == "\n" and depth == 0:
+            nxt = code[i + 1:]
+            nxt_indent = len(nxt) - len(nxt.lstrip(" "))
+            if not nxt.strip():
+                i += 1
+                continue
+            if nxt_indent <= indent:      # a sibling statement starts here
+                return code[start:i]
+        i += 1
+    return code[start:]
+
+
+# Positive evidence that this site is about the MEMBER ITSELF (its identity,
+# its name, its capability, whether it is usable) rather than one of its
+# scalar attributes. Only the former can be wrong about a System voice entry:
+# such an entry is a real member with a name and a modality, but it has no
+# thinking level / context window, so a roll-up over those MUST skip it.
+_MEMBER_DISPLAY_SIGNALS = (
+    "SystemVoiceEntries.",      # already routed through the single source
+    "displayName",
+    "modalities",
+    "Modality",
+    "isEnabledGroupMember",
+    "isKnownGroupMemberId",
+    "INSTANCE_ID",
+    ".count {",
+    ".any {",
+)
+# A numeric roll-up over a per-member scalar (max thinking level, token window …)
+# is a different question and is out of scope by design.
+_AGGREGATE_REDUCERS = (
+    ".minByOrNull", ".maxByOrNull", ".minOf", ".maxOf", ".sumOf", ".average",
+)
+# A block that only copies / collects ids performs no resolution; nothing to grade.
+_COLLECT_ONLY = re.compile(
+    r"^\s*(?:for\s*\(\s*\w+\s+in\s+[\w.]*memberEntryIds\s*\)\s*\{\s*\}\s*"
+    r"|[\w.]*memberEntryIds\s*\.\s*(?:toMutableList|toList|toSet|size|isEmpty|isNotEmpty|indices|forEachIndexed)\b)")
+
+
+def _is_member_resolution_site(block):
+    """Does this `memberEntryIds` block turn an id into something ABOUT the member?
+
+    The criterion grades 「resolved through one source」, so it only applies where a
+    resolution actually happens. A block that merely copies the id list
+    (`memberEntryIds.toMutableList()`) or counts its length has no resolution to
+    be wrong about, and grading it would force a meaningless SystemVoiceEntries
+    import into files that never look a member up.
+
+    Positive evidence only — a projection (`.model`), a lookup
+    (`find`/`firstOrNull`/`any`/`count`), a null-test on one, or an existing
+    single-source call. That keeps the criterion honest on the surfaces it is
+    registered for, all of which resolve members for DISPLAY."""
+    if _COLLECT_ONLY.match(block):
+        return False
+    display = any(tok in block for tok in _MEMBER_DISPLAY_SIGNALS)
+    if display:
+        return True
+    # Not about the member itself: a scalar roll-up, or a lookup that only
+    # feeds one. Grading it would force a SystemVoiceEntries import into
+    # arithmetic that must legitimately ignore System entries.
+    return False if any(tok in block for tok in _AGGREGATE_REDUCERS) else False
+
+
+def check_group_member_resolution(code):
+    """C34 [deep-audit-1043 B-06] — a group's member ids are resolved through
+    ONE source, so a System voice member is never silently dropped.
+
+    The bug: every reader of `ModelGroup.memberEntryIds` re-derived
+    "persisted entry, else the synthesized System entry". The readers that
+    remembered the fallback worked; the ones that did not resolved a System
+    member to null. A DEFAULT Voice Input/Output group contains ONLY System
+    sentinels (that is what makes it work with zero configuration), so those
+    readers rendered it as 「No usable models」 in red, with no modality badges,
+    an empty member preview and a 「0 models」 count. Five such readers existed
+    at once — the same decision re-derived five times, one of them wrong.
+
+    Graded as the DECISION — "every member-resolution site consults the System
+    source" — per site, not per file. Both accepted spellings qualify:
+      - `SystemVoiceEntries.resolveIn(entries, id)`  (what the fix uses), and
+      - `entries.find { it.id == id } ?: SystemVoiceEntries.resolve(id)`
+        (what the already-correct readers do).
+    A `memberEntryIds` block with no SystemVoiceEntries reference at all is the
+    defect, whichever spelling the rest of the file uses.
+
+    Fail-closed: a surface that no longer reads `memberEntryIds` means the
+    structure was reworked — RED, re-derive the criterion."""
+    if "memberEntryIds" not in code:
+        return [("C34", False,
+                 "this surface no longer reads `memberEntryIds` — fail-closed, "
+                 "re-derive this criterion instead of letting it pass vacuously")]
+    bad = []
+    sites = 0
+    skipped = 0
+    pos = code.find("memberEntryIds")
+    while pos >= 0:
+        site_pos = pos
+        block = _member_block(code, site_pos)
+        pos = code.find("memberEntryIds", site_pos + 1)
+        if not _is_member_resolution_site(block):
+            skipped += 1
+            continue
+        sites += 1
+        if "SystemVoiceEntries." not in block:
+            bad.append(code.count("\n", 0, site_pos) + 1)
+    if not sites:
+        # Reads member ids, but only feeds a per-member scalar roll-up (a max
+        # thinking level, a token window …). System voice entries are real
+        # members but have no such attribute, so skipping them there is the
+        # correct behaviour, not a dropped member.
+        return [("C34", True,
+                 "reads `memberEntryIds` but performs no member resolution "
+                 "(%d aggregate-only site(s)) — nothing to grade" % skipped)]
+    return [("C34", not bad,
+             "%d member-resolution site(s), all consult the System single source "
+             "(%d aggregate-only site(s) out of scope)"
+             % (sites, skipped) if not bad else
+             "member-resolution without the System fallback at line(s) %s — a System "
+             "voice member resolves to null there, so a default Voice group renders "
+             "empty / 「No usable models」" % ", ".join(str(x) for x in bad))]
+
+
 def check_capability_single_source(code):
     """C33 [dv22/B-03] — capability is read from the effective model, one exit.
 
@@ -2037,6 +2191,12 @@ CHECKERS = (
     (REL_ENTRY_DETAIL, check_capability_single_source),
     (REL_QUICK_TEST, check_capability_single_source),
     (REL_CHAT_SCREEN, check_capability_single_source),
+    # dv23-B6 — the group surfaces render member modalities/names too
+    (REL_MODEL_GROUPS, check_capability_single_source),
+    # dv23-B6 (C34) — group members resolve through ONE source
+    (REL_MODEL_GROUPS, check_group_member_resolution),
+    (REL_AGENT_LOOP_MODELS, check_group_member_resolution),
+    (REL_AGENT_LOOP_SHEETS, check_group_member_resolution),
 )
 
 
@@ -3076,6 +3236,13 @@ fun AddModelsToGroupScreen(modalityFilter: PickerModalityFilter? = null) {
 
 FIX_AGENT_LOOP_SHEETS_CLEAN = """package com.rikkaminis.app.ui.settings
 
+private fun memberNames(config: ProviderConfig): List<String> =
+    config.groups.flatMap { group ->
+        group.memberEntryIds.mapNotNull { id ->
+            SystemVoiceEntries.resolveIn(config.modelEntries, id)?.model?.displayName
+        }
+    }
+
 @Composable
 fun AgentLoopGroupsSheet(config: ProviderConfig) {
     val collapsedInstanceIds = rememberCollapsedInstanceIds(config)
@@ -3090,6 +3257,61 @@ fun AgentLoopGroupsSheet(config: ProviderConfig) {
     quickTestEntry?.let { entry ->
         QuickTestSheet(entry = entry, onDismiss = { quickTestEntryId = null })
     }
+}
+"""
+
+FIX_MODEL_GROUPS_CLEAN = """package com.rikkaminis.app.ui.settings
+
+@Composable
+fun ModelGroupsScreen(config: ProviderConfig) {
+    config.groups.forEach { group ->
+        GroupRow(
+            names = memberNames(config, group),
+            badges = modalityBadges(ModelsDevApi.effectiveModel(config.modelEntries.first())),
+        )
+    }
+}
+
+private fun memberNames(config: ProviderConfig, group: ModelGroup): List<String> =
+    group.memberEntryIds.mapNotNull { id ->
+        SystemVoiceEntries.resolveIn(config.modelEntries, id)?.model?.displayName
+    }
+"""
+
+# C34 teeth: the defect spelling — resolution that never consults the System source
+FIX_MODEL_GROUPS_UNRESOLVED = FIX_MODEL_GROUPS_CLEAN.replace(
+    "SystemVoiceEntries.resolveIn(config.modelEntries, id)?.model?.displayName",
+    "config.modelEntries.find { it.id == id }?.model?.displayName")
+
+# C34 fail-closed: the group surface no longer reads member ids at all
+FIX_MODEL_GROUPS_NO_MEMBER_READ = """package com.rikkaminis.app.ui.settings
+
+@Composable
+fun ModelGroupsScreen(config: ProviderConfig) {
+    config.groups.forEach { group -> GroupRow(name = group.name) }
+}
+"""
+
+# C34 must NOT grade a pure numeric aggregate: System entries have no thinking
+# level, so excluding them from a max-thinking roll-up is CORRECT behaviour.
+FIX_MODEL_GROUPS_AGGREGATE_ONLY = """package com.rikkaminis.app.ui.settings
+
+internal fun groupMaxThinkingLevel(group: ModelGroup, entries: List<ModelEntry>): ThinkingLevel? =
+    group.memberEntryIds
+        .mapNotNull { id -> entries.find { it.id == id }?.effectiveMaxThinkingLevel }
+        .minByOrNull { it.level }
+"""
+
+FIX_AGENT_LOOP_MODELS_CLEAN = """package com.rikkaminis.app.ui.settings
+
+@Composable
+fun AgentLoopModelsScreen(config: ProviderConfig) {
+    val resolvedCount = remember(config) {
+        config.groups.sumOf { group ->
+            group.memberEntryIds.count { SystemVoiceEntries.isEnabledGroupMember(config.modelEntries, it) }
+        }
+    }
+    Text("$resolvedCount models")
 }
 """
 
@@ -3367,6 +3589,8 @@ CLEAN_TREE = {
     REL_BACKUP_SCREEN: FIX_BACKUP_CLEAN,
     REL_ADD_MODELS: FIX_ADD_MODELS_CLEAN,
     REL_AGENT_LOOP_SHEETS: FIX_AGENT_LOOP_SHEETS_CLEAN,
+    REL_AGENT_LOOP_MODELS: FIX_AGENT_LOOP_MODELS_CLEAN,
+    REL_MODEL_GROUPS: FIX_MODEL_GROUPS_CLEAN,
     REL_MODEL_ENTRY_PICKER: FIX_MODEL_ENTRY_PICKER_CLEAN,
     REL_MODEL_PICKER_SHEET: FIX_MODEL_PICKER_SHEET_CLEAN,
     REL_ADD_CUSTOM_MODEL: FIX_ADD_CUSTOM_MODEL_CLEAN,
@@ -3465,6 +3689,13 @@ def run_selftest():
              variant(REL_QUICK_TEST, FIX_QUICK_TEST_NO_SOURCE), failures, ("C33",))
     run_case("c33-nontext-label-raw", 1,
              variant(REL_CHAT_SCREEN, FIX_CHAT_SCREEN_RAW_LABEL), failures, ("C33",))
+    # --- dv23-B6: C34 (group members resolve through ONE source) ----------
+    run_case("c34-member-unresolved", 1,
+             variant(REL_MODEL_GROUPS, FIX_MODEL_GROUPS_UNRESOLVED), failures, ("C34",))
+    run_case("c34-member-resolution-site-gone", 1,
+             variant(REL_MODEL_GROUPS, FIX_MODEL_GROUPS_NO_MEMBER_READ), failures, ("C34",))
+    run_case("c34-aggregate-only-out-of-scope", 0,
+             variant(REL_MODEL_GROUPS, FIX_MODEL_GROUPS_AGGREGATE_ONLY), failures)
 
     # --- da1026-C: C5 (connection screen) ---------------------------------
     run_case("c5-conn-no-baseurl-key", 1,

@@ -1291,6 +1291,27 @@ class ProviderRepository(private val context: Context) {
         val config = _config.value
         val enabledIds = config.instances.filter { it.isEnabled }.map { it.id }.toSet()
         return group.memberEntryIds.mapNotNull { entryId ->
+            // [deep-audit-1043 B-06] DELIBERATE: System voice entries are
+            // resolved elsewhere and must NOT appear in this list.
+            //
+            // This is the CHAT selection list — both callers
+            // (`ChatSessionLifecycle.resolveGroupModel`, `ChatModelRouting`
+            // load-balance rotation) immediately require
+            // `instance(entry.providerInstanceId)` + `loadApiKey(...)`, and a
+            // System entry's instance is synthesized, never persisted, so
+            // `instance()` returns null. Admitting one would make
+            // `GroupRouter.select` hand back an id that the very next line
+            // rejects — a mixed Voice group (System ASR + a cloud STT entry)
+            // would then fail to bind at all, where today it binds the cloud
+            // member. Display surfaces want the opposite answer and use
+            // `SystemVoiceEntries.isEnabledGroupMember` instead.
+            //
+            // The exclusion used to be INCIDENTAL (System ids simply aren't in
+            // `modelEntries`). Stated here because the obvious "fix" — route
+            // this through `resolveIn` like the display readers — is a
+            // regression, and the next reader should not have to rediscover
+            // that from the call sites.
+            if (SystemVoiceEntries.isSystemEntryId(entryId)) return@mapNotNull null
             val entry = config.modelEntries.find { it.id == entryId }
             if (entry != null && entry.providerInstanceId in enabledIds) entry else null
         }

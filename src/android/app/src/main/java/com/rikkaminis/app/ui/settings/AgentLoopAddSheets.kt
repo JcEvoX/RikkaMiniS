@@ -286,9 +286,12 @@ fun AddAgentLoopGroupsScreen(
                             // user remembers what the group contains
                             // without tapping into detail. Mirrors iOS
                             // AddAgentLoopGroupsSheet preview row.
+                            // [deep-audit-1043 B-06] System voice members are
+                            // virtual — resolving only through `config.modelEntries`
+                            // rendered an empty preview for them.
                             val memberNames = group.memberEntryIds
                                 .mapNotNull { mid ->
-                                    config.modelEntries.find { it.id == mid }?.model?.displayName
+                                    SystemVoiceEntries.resolveIn(config.modelEntries, mid)?.model?.displayName
                                 }
                             val preview = when {
                                 memberNames.isEmpty() ->
