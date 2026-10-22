@@ -135,6 +135,8 @@ ARGS = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/Offload
 # [dv19-A1 A-03] the grep/find walk engine lives beside the handler; the
 # per-root match budget is enforced there, so the gate has to read it.
 FASTIO_SEARCH = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/FastioSearch.kt"
+# [dv22-A6 A-06] clipboard clear — see check_clipboard_clear.
+CLIPBOARD = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ClipboardOffloadHandler.kt"
 
 # [da1034-A4] ISSUE-08: every handler that ships a `formatBody` payload. Kept
 # explicit rather than a glob over the offload dir: a glob would also drag in
@@ -146,7 +148,7 @@ PAYLOAD_FILES = [
     "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/CalendarOffloadHandler.kt",
     "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/LocationOffloadHandler.kt",
     "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/NotificationOffloadHandler.kt",
-    "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ClipboardOffloadHandler.kt",
+    CLIPBOARD,
     "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/OpenOffloadHandler.kt",
     FASTIO,
 ]
@@ -1013,6 +1015,64 @@ def check_photos_album(photos_src: str) -> list:
         findings.append(("P4", "missing", "handleAlbums (the no-arg listing) is gone"))
     return findings
 
+# ── [dv22-A6 A-06] android-clipboard clear: an empty string is not a clear ──
+#
+# `doClear` used to write `setPrimaryClip(newPlainText("", ""))` and call it
+# done: the clipboard still holds an item (itemCount 1, text/plain
+# description), so `status` kept answering has_content = true for a clipboard
+# `clear` had just reported as cleared = true. Its background guard was also
+# the only one of the four (get/set/clear/status) missing `&& SDK_INT >= Q`,
+# refusing pre-Q background clears that Android 8–9 actually permit.
+# Four judgements, all derived from the tree:
+#   L1  doClear keeps its owner body (a renamed / deleted owner is a red
+#       gate, not a silently narrower rule set)
+#   L2  the platform clear `clearPrimaryClip(` is reached from doClear
+#   L3  every `!isAppForeground()` site keeps the `&& SDK_INT >= Q` half —
+#       per-site derived, so a fifth subcommand is covered the day it lands
+#       (no hand-written member list to go stale)
+#   L4  doClear keeps BOTH write arms and they sit in different branches:
+#       the empty-string arm is what keeps API 26–28 working (clearPrimaryClip
+#       is not reliable there), and an unconditional clear-then-set would put
+#       the empty item right back even on Q+
+FOREGROUND_Q_RE = r"!isAppForeground\(\)\s*&&\s*Build\.VERSION\.SDK_INT\s*>=\s*Build\.VERSION_CODES\.Q"
+BARE_FOREGROUND_RE = r"!isAppForeground\(\)(?!\s*&&\s*Build\.VERSION\.SDK_INT\s*>=\s*Build\.VERSION_CODES\.Q)"
+
+def check_clipboard_clear(clipboard_src: str) -> list:
+    """[dv22-A6 A-06] the L1–L4 rules above."""
+    code = code_only(clipboard_src)
+    findings = []
+    body = _payload_helper_bodies(code, "doClear")
+    if body is None:
+        findings.append(("L1", "missing",
+                         "doClear lost its owner body (renamed / inlined / deleted?)"))
+        return findings
+    if "clearPrimaryClip(" not in body:
+        findings.append(("L2", "missing",
+                         "clear must reach the platform clearPrimaryClip() — an empty "
+                         "string write leaves itemCount = 1 and status answers has_content = true"))
+    if re.search(BARE_FOREGROUND_RE, code):
+        findings.append(("L3", "regressed",
+                         "an isAppForeground() guard dropped its `&& SDK_INT >= Q` half "
+                         "(pre-Q background clipboard access is legal; refusing it breaks clear)"))
+    if not re.search(FOREGROUND_Q_RE, body):
+        findings.append(("L3", "missing",
+                         "doClear's background guard must be the exact get/set/status shape"))
+    if 'setPrimaryClip(ClipData.newPlainText("", ""))' not in body:
+        findings.append(("L4", "missing",
+                         "the API 26–28 empty-string fallback is gone — clearPrimaryClip() "
+                         "is not reliable there"))
+    else:
+        platform_at = body.find("clearPrimaryClip(")
+        if platform_at >= 0:
+            fallback_at = body.find('ClipData.newPlainText("", "")')
+            between = body[platform_at:fallback_at] if fallback_at > platform_at \
+                else body[fallback_at:platform_at]
+            if "else" not in between and "->" not in between:
+                findings.append(("L4", "unbranched",
+                                 "the two clear writes must sit in different branches — "
+                                 "unconditional clear-then-set puts the empty item back on Q+"))
+    return findings
+
 
 # ── selftest: every rule must have a tooth, and the green arm must pass ──────
 
@@ -1690,6 +1750,41 @@ internal fun resolveAlbumSelector(rawId: String?, rawName: String?): AlbumSelect
 
 internal fun albumSelectorRefusal(selector: AlbumSelector.Unreadable): String =
     "android-photos album: " + selector.flag + " '" + selector.raw + "' is not usable\\n"
+"""
+
+# [dv22-A6 A-06] the fixed clipboard clear shape, all four subcommand guards
+# and both write arms. The red arms below are mutations of THIS text, so the
+# expectations are hand-written from the L-table and never from a run.
+GREEN_CLIPBOARD_CLEAR = """
+    private fun doGet(cm: ClipboardManager, args: OffloadArgs): NativeOffloadResult {
+        if (!isAppForeground() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            return backgroundError(args)
+        }
+    }
+
+    private fun doSet(cm: ClipboardManager, args: OffloadArgs): NativeOffloadResult {
+        if (!isAppForeground() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            return backgroundError(args)
+        }
+    }
+
+    private fun doClear(cm: ClipboardManager, args: OffloadArgs): NativeOffloadResult {
+        if (!isAppForeground() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            return backgroundError(args)
+        }
+        when (clearAction(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)) {
+            ClipboardClearAction.PlatformClear -> cm.clearPrimaryClip()
+            ClipboardClearAction.EmptyStringFallback -> cm.setPrimaryClip(ClipData.newPlainText("", ""))
+        }
+        val data = JSONObject().put("cleared", true)
+        return NativeOffloadResult(0, OffloadOutput.formatBody(data.toString(2), args) + "\\n")
+    }
+
+    private fun doStatus(cm: ClipboardManager, args: OffloadArgs): NativeOffloadResult {
+        if (!isAppForeground() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            return backgroundError(args)
+        }
+    }
 """
 
 def selftest() -> int:
@@ -2376,6 +2471,58 @@ def selftest() -> int:
         if got != want:
             print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
             failures += 1
+    # [dv22-A6 A-06] the clipboard clear arms. Expectations hand-written from
+    # the L-table: one arm per way the fix can be undone, plus the baseline
+    # (pre-fix) shape and the fail-closed arm for a lost owner function.
+    CLEAR_WHEN_BLOCK = (
+        "        when (clearAction(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)) {\n"
+        "            ClipboardClearAction.PlatformClear -> cm.clearPrimaryClip()\n"
+        "            ClipboardClearAction.EmptyStringFallback -> cm.setPrimaryClip(ClipData.newPlainText(\"\", \"\"))\n"
+        "        }\n"
+    )
+    DO_CLEAR_GUARD = (
+        "    private fun doClear(cm: ClipboardManager, args: OffloadArgs): NativeOffloadResult {\n"
+        "        if (!isAppForeground() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {\n"
+    )
+    red_cases_clipboard = [
+        ("clipboard: clear reverts to the empty-string write (baseline defect)",
+         GREEN_CLIPBOARD_CLEAR.replace(CLEAR_WHEN_BLOCK,
+                                       '        cm.setPrimaryClip(ClipData.newPlainText("", ""))\n'),
+         {"L2"}),
+        ("clipboard: doClear's guard drops the `&& SDK_INT >= Q` half (baseline defect)",
+         GREEN_CLIPBOARD_CLEAR.replace(DO_CLEAR_GUARD,
+                                       "    private fun doClear(cm: ClipboardManager, args: OffloadArgs): NativeOffloadResult {\n"
+                                       "        if (!isAppForeground()) {\n"),
+         {"L3"}),
+        ("clipboard: always clearPrimaryClip — the pre-Q fallback is deleted",
+         GREEN_CLIPBOARD_CLEAR.replace(CLEAR_WHEN_BLOCK, "        cm.clearPrimaryClip()\n"),
+         {"L4"}),
+        ("clipboard: both writes run unconditionally (clear-then-set puts the item back)",
+         GREEN_CLIPBOARD_CLEAR.replace(
+             CLEAR_WHEN_BLOCK,
+             '        cm.clearPrimaryClip()\n'
+             '        cm.setPrimaryClip(ClipData.newPlainText("", ""))\n'),
+         {"L4"}),
+        ("clipboard: the whole pre-fix shape",
+         GREEN_CLIPBOARD_CLEAR
+         .replace(CLEAR_WHEN_BLOCK, '        cm.setPrimaryClip(ClipData.newPlainText("", ""))\n')
+         .replace(DO_CLEAR_GUARD,
+                  "    private fun doClear(cm: ClipboardManager, args: OffloadArgs): NativeOffloadResult {\n"
+                  "        if (!isAppForeground()) {\n"),
+         {"L2", "L3"}),
+        ("fail-closed: doClear lost its owner body",
+         GREEN_CLIPBOARD_CLEAR.replace("private fun doClear(", "private fun unusedClear("),
+         {"L1"}),
+    ]
+    for label, clipboard_src, want in red_cases_clipboard:
+        if clipboard_src == GREEN_CLIPBOARD_CLEAR:
+            print(f"SELFTEST-FAIL: {label}: mutation did not apply to any arm")
+            failures += 1
+            continue
+        got = {rid for rid, _, _ in check_clipboard_clear(clipboard_src)}
+        if got != want:
+            print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
+            failures += 1
     # [dv19-A1 A-03] the grep budget teeth. Expectations hand-written from
     # check_fastio_search's S-table: one arm per moment a walk can spend the
     # caller's single cross-root budget, plus a fail-closed arm proving the rules
@@ -2423,6 +2570,7 @@ def selftest() -> int:
     clean_sessions = check_sessions(GREEN_SESSIONS)
     clean_args = check_args(GREEN_ARGS)
     clean_album = check_photos_album(GREEN_ALBUM_PHOTOS)
+    clean_clipboard = check_clipboard_clear(GREEN_CLIPBOARD_CLEAR)
     clean_bindings = check_offload_cli_bindings(
         GREEN_CONTACTS, GREEN_NOTIFICATION_HANDLE, GREEN_FASTIO)
     clean_search = check_fastio_search(GREEN_FASTIO_SEARCH)
@@ -2437,9 +2585,10 @@ def selftest() -> int:
         ("FastioOffloadHandler.kt", GREEN_PAYLOAD_FASTIO_USAGE),
     )
     if clean or clean_flags or clean_debug or clean_sessions or clean_bindings \
-            or clean_payload or clean_album or clean_search:
+            or clean_payload or clean_album or clean_search or clean_clipboard:
         green_findings = (clean + clean_flags + clean_debug + clean_sessions
-                          + clean_bindings + clean_payload + clean_album + clean_search)
+                          + clean_bindings + clean_payload + clean_album + clean_search
+                          + clean_clipboard)
         print(f"SELFTEST-FAIL: green fixtures must produce no findings, "
               f"got {describe(green_findings)}")
         failures += 1
@@ -2504,6 +2653,7 @@ def main(argv):
                                           notification_path.read_text(encoding="utf-8"),
                                           fastio_path.read_text(encoding="utf-8"))
     findings += check_offload_json(*payload_files)
+    findings += check_clipboard_clear((root / CLIPBOARD).read_text(encoding="utf-8"))
     findings += check_fastio_search(search_path.read_text(encoding="utf-8"))
     if findings:
         print("offload_cli_args_check: FAIL")
@@ -2520,7 +2670,8 @@ def main(argv):
           "and consumes -C, photos --album decision classified (non-numeric --id refuses), "
           "contacts subcommand probe reads the rewritten alias list, sessions declares "
           "async/wait/help/h and documents --wait, grep budget stops a spent root before "
-          "any file is opened)")
+          "any file is opened, clipboard clear reaches clearPrimaryClip behind the shared "
+          "four-guard shape and keeps the pre-Q empty-string fallback)")
     return 0
 
 
