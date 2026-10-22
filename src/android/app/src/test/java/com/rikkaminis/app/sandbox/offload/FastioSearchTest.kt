@@ -3,11 +3,16 @@ package com.rikkaminis.app.sandbox.offload
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assume
 import org.junit.Test
 import java.io.RandomAccessFile
 import java.nio.file.FileSystems
 import java.nio.file.Files
+import java.nio.file.LinkOption
 import java.nio.file.Path
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 /**
  * `minis-fastio find` / `grep` walk engines ([T-minis-fastio] phase 2).
@@ -283,5 +288,93 @@ class FastioSearchTest {
         assertEquals(0L, out.visited)
         assertEquals(0L, out.filesScanned)
         assertFalse(out.truncated)
+    }
+
+    // ── [dv23-A6] §1043-A-07: special files are never opened ────────────────
+    //
+    // `visitFile` fires for EVERY non-directory entry, so a named pipe reaches
+    // the engines like any other file. `Files.newInputStream` on a pipe with no
+    // writer blocks in open(2) with no timeout (measured on this JVM: no return
+    // in 4 s), and the offload pool is 2 threads — two such entries stall every
+    // other tool call. `find` opens nothing, but it used to label the pipe `f`,
+    // which the help text defines as "regular file".
+
+    /**
+     * Create a named pipe and return it, or null where `mkfifo` is not
+     * available (a POSIX binary; the JVM has no FIFO API). Callers `Assume` on
+     * it, so a platform without mkfifo skips instead of failing.
+     */
+    private fun mkfifo(dir: Path, name: String): Path? {
+        val fifo = dir.resolve(name)
+        return try {
+            val ok = ProcessBuilder("mkfifo", fifo.toString())
+                .redirectErrorStream(true)
+                .start()
+                .waitFor() == 0
+            if (ok && Files.exists(fifo, LinkOption.NOFOLLOW_LINKS)) fifo else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Run [block] on a daemon thread and fail if it has not returned within
+     * [seconds]. A slow walk is allowed; blocking in `open(2)` is not — and a
+     * plain call would hang the test JVM instead of failing the case.
+     */
+    private fun <T> completesWithin(seconds: Long, block: () -> T): T {
+        val pool = Executors.newSingleThreadExecutor { r -> Thread(r).also { it.isDaemon = true } }
+        try {
+            return pool.submit(block).get(seconds, TimeUnit.SECONDS)
+        } catch (e: TimeoutException) {
+            throw AssertionError("the engine did not return within ${seconds}s — a special file was opened")
+        } finally {
+            pool.shutdownNow()
+        }
+    }
+
+    @Test
+    fun `find types a named pipe as o and never lists it under type f`() {
+        val root = findFixture()
+        val fifo = mkfifo(root, "pipe")
+        Assume.assumeTrue("mkfifo is not available on this platform", fifo != null)
+
+        val all = FindOutcome()
+        findTree(root, "/ws", null, null, limit = 100, maxEntries = 1_000, out = all)
+
+        val pipeHit = all.matches.single { it.guestPath == "/ws/pipe" }
+        assertEquals("a pipe is not a regular file: 'o' is the type find must report", 'o', pipeHit.type)
+        assertEquals("counts stay filter-independent: the pipe is still a file entry", 5L, all.files)
+        assertEquals(0L, pipeHit.size)
+
+        val regularOnly = FindOutcome()
+        findTree(root, "/ws", null, typeFilter = 'f', limit = 100, maxEntries = 1_000, out = regularOnly)
+
+        assertEquals(
+            "`-type f` means REGULAR files (the help text's own words): the pipe must not appear",
+            listOf("/ws/a.txt", "/ws/b.log", "/ws/sub/c.log", "/ws/sub/d.txt"),
+            regularOnly.matches.map { it.guestPath }.sorted(),
+        )
+    }
+
+    @Test
+    fun `grep skips a named pipe instead of blocking on it`() {
+        val root = Files.createTempDirectory("fastio-grep-fifo")
+        Files.write(root.resolve("a.txt"), "needle\n".toByteArray())
+        val fifo = mkfifo(root, "pipe")
+        Assume.assumeTrue("mkfifo is not available on this platform", fifo != null)
+        val out = GrepOutcome()
+
+        completesWithin(30) {
+            grepTree(root, "/ws", Regex("needle"), limit = 100, maxEntries = 1_000, out = out)
+        }
+
+        assertEquals(listOf("/ws/a.txt"), out.matches.map { it.guestPath })
+        assertEquals(1L, out.filesSkippedSpecial)
+        assertEquals(1L, out.filesScanned)      // only the regular file
+        assertEquals(7L, out.bytesScanned)      // "needle\n"
+        assertEquals(0L, out.filesSkippedLink)
+        assertFalse(out.matchesCapped)
+        assertTrue("a skipped pipe is not an error, it is reported", out.errors.isEmpty())
     }
 }
