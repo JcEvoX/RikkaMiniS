@@ -381,6 +381,181 @@ def check_save_persists_published(src, rel=PR_REL):
     return out
 
 # ----------------------------------------------------------------------
+# Arm 9 — [fix/dv21-a3 A-03] a restore must not restamp userModifiedAt
+# ----------------------------------------------------------------------
+ENTRY_UPDATE_DECL = "fun updateEntry("
+ENTRY_WRITE_TARGET = "config.modelEntries[idx]"
+
+def _params_of(fn_text):
+    """Declared parameter names of the `fun …(...)` header [fn_text] starts
+    with (`Map<String, String>` stays one parameter)."""
+    open_paren = fn_text.find("(")
+    if open_paren < 0:
+        return None
+    end = _balanced(fn_text, open_paren)
+    if end < 0:
+        return None
+    names = _split_top_level(fn_text[open_paren + 1:end - 1])
+    return [m.group(1) for m in (re.match(r"\s*(\w+)\s*:", p) for p in names) if m]
+
+def _assignment_statement(code, target):
+    """The whole statement `target = …`, balanced from the `=` (multi-line for
+    a brace/bracket-bodied right-hand side). None when the anchor drifted.
+
+    Anchored on `target <ws> =` — NOT on the first `=` after the first
+    occurrence, which would land on a later call's named argument when the
+    target is itself the right-hand side of a declaration
+    (`val existing = config.modelEntries[idx]`)."""
+    m = re.search(re.escape(target) + r"\s*=(?!=)", code)
+    if m is None:
+        return None
+    i, eq = m.start(), m.end() - 1
+    depth = 0
+    for j in range(eq, len(code)):
+        c = code[j]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                nl = code.find("\n", j)
+                return code[i:(nl if nl >= 0 else len(code))]
+    return None
+
+def _assignment_count(code, target):
+    return len(re.findall(re.escape(target) + r"\s*=(?!=)", code))
+
+def _split_top_level(text):
+    """Split on commas at depth 0 (so `hit.copy(a = 1), flag = false` splits
+    into two arguments while `Map<String, String>` stays one)."""
+    parts, cur, depth = [], "", 0
+    for ch in text:
+        if ch in "([{<":
+            depth += 1
+        elif ch in ")]}>":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    parts.append(cur)
+    return [p.strip() for p in parts]
+
+def _call_args(code, name):
+    """Argument lists of every `name( … )` call in [code] (None = unbalanced)."""
+    out = []
+    for m in re.finditer(r"(?<![.\w])" + re.escape(name) + r"\s*\(", code):
+        open_idx = code.index("(", m.start())
+        end = _balanced(code, open_idx)
+        out.append(None if end < 0 else code[open_idx + 1:end - 1])
+    return out
+
+def check_merge_preserves_entry_timestamp(src, rel=PR_REL):
+    """A restore writes the backup's values — INCLUDING its userModifiedAt.
+
+    Two coupled decision points, both fail-closed:
+
+      a) the merge hit branch DECLARES the restore at the call site: the write
+         face is called with a second argument selecting "do not stamp". The
+         bare `updateEntry(updated)` shape (baseline) stamps
+         `userModifiedAt = now`, which (i) makes `restored == local` — the
+         no-op short-circuit in the same block — unreachable from the second
+         import on, so every re-import rewrites every hit, and (ii) pushes this
+         instance's shadowVoiceProviders mostRecentModified past a sibling the
+         user really edited.
+      b) the write face HONORS it: the statement writing the entry must consult
+         the declared parameter, guard the stamp with a positive test on it,
+         and carry `entry.userModifiedAt` on the other side of the branch. A
+         decorative parameter (accepted, ignored) compiles and still stamps;
+         an inverted test stamps the restore and preserves the editor.
+      c) fail-closed: an absent declaration / unreadable write target is a ROT
+         error, never a silent pass.
+    """
+    out = []
+    merge_body = function_text(src, "fun mergeImportInstanceJSON(")
+    if merge_body is None:
+        return [(rel, 0, "9", "mergeImportInstanceJSON( not found — gate ROT")]
+    code = code_only(merge_body)
+    if MERGE_FIELDS_HELPER in code:
+        calls = _call_args(code, "updateEntry")
+        if len(calls) > 1:
+            out.append((rel, line_of(src, src.find("fun mergeImportInstanceJSON(")), "9",
+                        "merge hit branch writes the restored entry %d times — the "
+                        "restore must go through the write face exactly once"
+                        % len(calls)))
+        elif len(calls) == 1:
+            if calls[0] is None:
+                out.append((rel, line_of(src, src.find("fun mergeImportInstanceJSON(")), "9",
+                            "merge hit branch's updateEntry call has no readable argument "
+                            "list — gate ROT"))
+            else:
+                args, parts = calls[0].strip(), _split_top_level(calls[0])
+                if len(parts) < 2:
+                    out.append((rel, line_of(src, src.find("fun mergeImportInstanceJSON(")), "9",
+                                "merge hit branch writes the restored entry through the default "
+                                "(editor) mode — `updateEntry(%s)` stamps userModifiedAt = now, "
+                                "so the backup's timestamp never lands and the restored == local "
+                                "short-circuit dies on the second import" % args))
+                elif "false" not in parts[1]:
+                    out.append((rel, line_of(src, src.find("fun mergeImportInstanceJSON(")), "9",
+                                "merge hit branch does not select the restore mode at the call "
+                                "site (second argument %r) — a restore must not stamp "
+                                "userModifiedAt with now" % parts[1]))
+        # 0 calls = the write face is gone entirely; arm 7 owns that regression.
+
+    decl = src.find(ENTRY_UPDATE_DECL)
+    if decl < 0:
+        out.append((rel, 0, "9", ENTRY_UPDATE_DECL + " not found — gate ROT"))
+        return out
+    fn = function_text(src, ENTRY_UPDATE_DECL)
+    if fn is None:
+        out.append((rel, line_of(src, decl), "9", ENTRY_UPDATE_DECL + " has no body — gate ROT"))
+        return out
+    fn_code = code_only(fn)
+    params = _params_of(fn_code)
+    if params is None:
+        out.append((rel, line_of(src, decl), "9",
+                    "updateEntry's parameter list is unreadable — gate ROT"))
+        return out
+    if len(params) < 2:
+        out.append((rel, line_of(src, decl), "9",
+                    "updateEntry declares %d parameter(s) (%s) — the write face has no way "
+                    "to tell a restore from an edit, so every restore stamps "
+                    "userModifiedAt = now" % (len(params), params)))
+        return out
+    stamp_param = params[1]
+    n_writes = _assignment_count(fn_code, ENTRY_WRITE_TARGET)
+    if n_writes != 1:
+        out.append((rel, line_of(src, decl), "9",
+                    "updateEntry assigns %s %d times — the entry write must stay "
+                    "single-shot for the stamp decision to be readable"
+                    % (ENTRY_WRITE_TARGET, n_writes)))
+        if n_writes == 0:
+            return out
+    stmt = _assignment_statement(fn_code, ENTRY_WRITE_TARGET)
+    if stmt is None:
+        out.append((rel, line_of(src, decl), "9",
+                    "updateEntry no longer writes %s through a readable statement — "
+                    "gate ROT" % ENTRY_WRITE_TARGET))
+        return out
+    if stamp_param not in stmt:
+        out.append((rel, line_of(src, decl), "9",
+                    "updateEntry ignores %r when writing the entry — the switch is "
+                    "decorative and a restored timestamp is stamped with now anyway"
+                    % stamp_param))
+    elif not re.search(r"if\s*\(\s*%s\s*\)" % re.escape(stamp_param), stmt):
+        out.append((rel, line_of(src, decl), "9",
+                    "updateEntry's stamp is not guarded by a positive test on %r — an "
+                    "absent or negated test flips the two modes (stamp on restore, "
+                    "preserve on edit) while still reading the parameter" % stamp_param))
+    elif "entry.userModifiedAt" not in stmt:
+        out.append((rel, line_of(src, decl), "9",
+                    "updateEntry's non-stamping branch does not carry "
+                    "entry.userModifiedAt — the restore mode has nothing to preserve"))
+    return out
+
+# ----------------------------------------------------------------------
 def run_checks(root):
     pr = read(PR_REL, root)
     bm = read(BM_REL, root)
@@ -399,6 +574,7 @@ def run_checks(root):
     checks += check_merge_shares_instance_fields(pr)
     checks += check_merge_restores_entry_fields(pr)
     checks += check_save_persists_published(pr)
+    checks += check_merge_preserves_entry_timestamp(pr)
     return checks
 
 
@@ -644,7 +820,7 @@ FIX_MERGE_WHITELIST_BAD = """fun mergeImportInstanceJSON(
             it.providerInstanceId == existing.id && it.baseModel.id == entry.baseModel.id
         }
         val resolvedEntryId = if (hit != null) {
-            updateEntry(hit.copy(overrides = entry.overrides, isHidden = entry.isHidden))
+            updateEntry(hit.copy(overrides = entry.overrides, isHidden = entry.isHidden), stampUserModified = false)
             hit.id
         } else {
             addEntry(entry)
@@ -737,7 +913,7 @@ FIX_MERGE_OK = """fun mergeImportInstanceJSON(
         }
         val resolvedEntryId = if (hit != null) {
             val restored = mergeImportedEntryOntoLocal(hit, entry)
-            if (restored == null) hit.id else (updateEntry(restored) ?: hit.id)
+            if (restored == null) hit.id else (updateEntry(restored, stampUserModified = false) ?: hit.id)
         } else {
             addEntry(entry)
             _config.value.modelEntries.firstOrNull {
@@ -771,7 +947,7 @@ FIX_MERGE_BAD = """fun mergeImportInstanceJSON(
         }
         val resolvedEntryId = if (hit != null) {
             val restored = mergeImportedEntryOntoLocal(hit, entry)
-            if (restored == null) hit.id else (updateEntry(restored) ?: hit.id)
+            if (restored == null) hit.id else (updateEntry(restored, stampUserModified = false) ?: hit.id)
         } else {
             addEntry(entry)
             entry.id
@@ -784,6 +960,47 @@ FIX_MERGE_BAD = """fun mergeImportInstanceJSON(
     return existing.id to entryMap
 }
 """
+
+# [fix/dv21-a3 A-03] The entry write face's timestamp decision. Compliant:
+# the restore mode (stampUserModified = false) keeps the backup's own
+# userModifiedAt; the default (true) stamps now for the editor paths.
+FIX_UPDATE_ENTRY_OK = """
+fun updateEntry(entry: ModelEntry, stampUserModified: Boolean = true): String? {
+    val existing = config.modelEntries.first { it.id == entry.id }
+    val newUuid = existing.id
+    config.modelEntries[idx] = entry.copy(
+        uuid = newUuid,
+        userModifiedAt = if (stampUserModified) System.currentTimeMillis() else entry.userModifiedAt,
+    )
+    return newUuid
+}
+"""
+
+# Breaker: the switch exists but the stamp is unconditional — the baseline
+# write face (dv20-a2 A-08), where a restore silently re-dates the entry.
+FIX_UPDATE_ENTRY_STAMP_BAD = """
+fun updateEntry(entry: ModelEntry, stampUserModified: Boolean = true): String? {
+    val existing = config.modelEntries.first { it.id == entry.id }
+    val newUuid = existing.id
+    config.modelEntries[idx] = entry.copy(uuid = newUuid, userModifiedAt = System.currentTimeMillis())
+    return newUuid
+}
+"""
+
+# Breaker: no switch at all (the pre-fix signature) — the fail-closed arm.
+FIX_UPDATE_ENTRY_ONEPARAM_BAD = """
+fun updateEntry(entry: ModelEntry): String? {
+    val existing = config.modelEntries.first { it.id == entry.id }
+    val newUuid = existing.id
+    config.modelEntries[idx] = entry.copy(uuid = newUuid, userModifiedAt = System.currentTimeMillis())
+    return newUuid
+}
+"""
+
+# Breaker: the hit branch keeps the write face but drops the restore flag —
+# the exact call-site regression arm 9a exists for.
+FIX_MERGE_STAMP_BAD = FIX_MERGE_OK.replace(
+    "updateEntry(restored, stampUserModified = false)", "updateEntry(restored)")
 
 # [fix/dv20-a2 A-08] Compliant hit branch, used as the arm-8 fixture's carriage.
 FIX_MERGE_FIELDS_OK = FIX_MERGE_OK
@@ -805,7 +1022,7 @@ FIX_MERGE_NOAPPLY_BAD = """fun mergeImportInstanceJSON(
         }
         val resolvedEntryId = if (hit != null) {
             val restored = mergeImportedEntryOntoLocal(hit, entry)
-            if (restored == null) hit.id else (updateEntry(restored) ?: hit.id)
+            if (restored == null) hit.id else (updateEntry(restored, stampUserModified = false) ?: hit.id)
         } else {
             addEntry(entry)
             _config.value.modelEntries.firstOrNull {
@@ -864,14 +1081,16 @@ FIX_CONVERT_BAD = """private fun convertThinkingRules(
 """
 
 
-def build_fixture_tree(tmp, merge_src, export_src, parse_src, convert_src):
+def build_fixture_tree(tmp, merge_src, export_src, parse_src, convert_src,
+                       update_entry_src=None):
     os.makedirs(os.path.join(tmp, APP + "/data/repository"), exist_ok=True)
     os.makedirs(os.path.join(tmp, APP + "/backup"), exist_ok=True)
     os.makedirs(os.path.join(tmp, APP + "/data/model"), exist_ok=True)
     with open(os.path.join(tmp, PR_REL), "w") as f:
         f.write(merge_src + "\n" + export_src + "\n" + parse_src + "\n" + FIX_HELPERS
                 + "\n" + FIX_IMPORT_OK + "\n" + FIX_MERGE_FIELDS_HELPER + "\n"
-                + FIX_SAVE_CANONICAL)
+                + (FIX_UPDATE_ENTRY_OK if update_entry_src is None else update_entry_src)
+                + "\n" + FIX_SAVE_CANONICAL)
     with open(os.path.join(tmp, BM_REL), "w") as f:
         f.write(convert_src)
     with open(os.path.join(tmp, LM_REL), "w") as f:
@@ -934,7 +1153,7 @@ def selftest():
         with open(os.path.join(tmp, PR_REL), "w") as f:
             f.write(FIX_MERGE_FIELDS_OK + "\n" + FIX_EXPORT_OK + "\n" + FIX_PARSE_OK + "\n"
                     + FIX_HELPERS + "\n" + FIX_IMPORT_OK + "\n" + FIX_MERGE_FIELDS_HELPER
-                    + "\n" + FIX_SAVE_RAW_BAD)
+                    + "\n" + FIX_UPDATE_ENTRY_OK + "\n" + FIX_SAVE_RAW_BAD)
         with open(os.path.join(tmp, BM_REL), "w") as f:
             f.write(FIX_CONVERT_OK)
         with open(os.path.join(tmp, LM_REL), "w") as f:
@@ -942,13 +1161,44 @@ def selftest():
         got = _arm_set(tmp)
         if got != ["8"]:
             failures.append("save-raw fixture arms=%r (want ['8'])" % (got,))
+    # [fix/dv21-a3 A-03] Arm 9: a restore must not restamp userModifiedAt —
+    # broken at the call site, inside the write face (decorative switch), by
+    # dropping the switch entirely, and by removing the write face (ROT).
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_STAMP_BAD, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK)
+        got = _arm_set(tmp)
+        if got != ["9"]:
+            failures.append("merge-restamp fixture arms=%r (want ['9'])" % (got,))
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_OK, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK,
+                           update_entry_src=FIX_UPDATE_ENTRY_STAMP_BAD)
+        got = _arm_set(tmp)
+        if got != ["9"]:
+            failures.append("update-unconditional-stamp fixture arms=%r (want ['9'])" % (got,))
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_OK, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK,
+                           update_entry_src=FIX_UPDATE_ENTRY_ONEPARAM_BAD)
+        got = _arm_set(tmp)
+        if got != ["9"]:
+            failures.append("update-no-switch fixture arms=%r (want ['9'])" % (got,))
+    with tempfile.TemporaryDirectory() as tmp:
+        # fail-closed: the write face is gone -> ROT message, not a silent pass.
+        build_fixture_tree(tmp, FIX_MERGE_OK, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK,
+                           update_entry_src="")
+        v = run_checks(tmp)
+        got = sorted({x[2] for x in v})
+        if got != ["9"]:
+            failures.append("update-missing fixture arms=%r (want ['9'])" % (got,))
+        elif not any("gate ROT" in x[3] for x in v):
+            failures.append("update-missing fixture did not report ROT: %r" % (v,))
     if failures:
         for f in failures:
             print("SELFTEST-FAIL: " + f)
         print("PROVIDER_IMPORT_ID_ROUNDTRIP_SELFTEST=FAIL")
         return 1
     print("selftest: compliant green / violating red arms 1-6 / read-dropped red arms 3+5"
-          " / merge-noapply red arm 6 / merge-id-only+whitelist red arm 7 / save-raw red arm 8")
+          " / merge-noapply red arm 6 / merge-id-only+whitelist red arm 7 / save-raw red arm 8"
+          " / merge-restamp+update-restamp+update-no-switch+update-missing red arm 9")
     print("PROVIDER_IMPORT_ID_ROUNDTRIP_SELFTEST=PASS")
     return 0
 
@@ -968,7 +1218,7 @@ def main():
         for rel, line, arm, msg in violations:
             print("  [arm %s] %s:%s — %s" % (arm, rel, line, msg))
         sys.exit(1)
-    print("PROVIDER_IMPORT_ID_ROUNDTRIP: clean (8 arms)")
+    print("PROVIDER_IMPORT_ID_ROUNDTRIP: clean (9 arms)")
     sys.exit(0)
 
 

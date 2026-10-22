@@ -393,4 +393,114 @@ class ProviderImportRoundTripTest {
         assertEquals(1_000_000, restored.baseModel.contextWindow)
         assertEquals("inst-1/gpt-5.5", restored.uuid)
     }
+
+    // ------------------------------------------------------------------
+    // [fix/dv21-a3 A-03] A restore is a restore for the TIMESTAMP too.
+    //
+    // Faithful replica of the two production decision points: the merge hit
+    // branch (`if (updated == null) hit.id else (updateEntry(updated,
+    // stampUserModified = false) ?: hit.id)`) and [updateEntry]'s write face
+    // (`userModifiedAt = if (stampUserModified) System.currentTimeMillis()
+    // else entry.userModifiedAt`). [mergeImportedEntryOntoLocal] is called
+    // directly — it is the real production function.
+    // ------------------------------------------------------------------
+    private val editorStamp = 4_102_444_800_000L // synthetic "now" (2100-01-01)
+
+    private fun updateEntryReplica(
+        entry: ModelEntry,
+        newUuid: String = entry.uuid,
+        stampUserModified: Boolean = true,
+    ): ModelEntry = entry.copy(
+        uuid = newUuid,
+        userModifiedAt = if (stampUserModified) editorStamp else entry.userModifiedAt,
+    )
+
+    /** The merge hit branch: restore through the shared decision point, then
+     *  write back through the write face in the restore mode. An untouched
+     *  (no-op) merge returns the existing entry — nothing written. */
+    private fun mergeHit(hit: ModelEntry, imported: ModelEntry): ModelEntry {
+        val updated = mergeImportedEntryOntoLocal(hit, imported) ?: return hit
+        return updateEntryReplica(updated, stampUserModified = false)
+    }
+
+    /** Faithful replica of shadowVoiceProviders' arbitration key. */
+    private fun mostRecentModified(instanceId: String, entries: List<ModelEntry>): Long =
+        entries.filter { it.providerInstanceId == instanceId }
+            .mapNotNull { it.userModifiedAt }
+            .maxOrNull() ?: Long.MIN_VALUE
+
+    @Test
+    fun restoreKeepsTheBackupTimestampInsteadOfStampingNow() {
+        val backupStamp = 1_600_000_000_000L
+        val restored = mergeHit(
+            entry(uuid = "inst-1/gpt-5.5", displayName = "local", userModifiedAt = 1_700_000_000_000L),
+            entry(uuid = "temp", displayName = "backup", userModifiedAt = backupStamp),
+        )
+        // The backup's own stamp rides the restore; "now" would be 4_102_444_800_000.
+        assertEquals(backupStamp, restored.userModifiedAt)
+    }
+
+    @Test
+    fun restoreOfANeverEditedBackupEntryLeavesTheStampAbsent() {
+        val restored = mergeHit(
+            entry(uuid = "inst-1/gpt-5.5", displayName = "local", userModifiedAt = 1_700_000_000_000L),
+            entry(uuid = "temp", displayName = "backup"),
+        )
+        // `null` is the backup's value (never user-edited), not "keep the local
+        // one": restoring a false freshness is still a false freshness.
+        assertNull(restored.userModifiedAt)
+    }
+
+    @Test
+    fun reimportingTheSameBackupIsANoOpAfterTheRestore() {
+        val imported = entry(uuid = "temp", displayName = "backup", isHidden = true)
+        val once = mergeHit(entry(uuid = "inst-1/gpt-5.5", displayName = "local"), imported)
+        // Restored == local must hold on the second pass — the restored entry
+        // carries the backup's timestamp, not t_import.
+        assertNull(mergeImportedEntryOntoLocal(once, imported))
+    }
+
+    @Test
+    fun restoreDoesNotHijackVoiceProviderArbitration() {
+        val genuinelyEdited = 1_700_000_000_000L
+        val restored = mergeHit(
+            entry(uuid = "inst-1/gpt-5.5", displayName = "local", userModifiedAt = genuinelyEdited),
+            entry(uuid = "temp", displayName = "backup", userModifiedAt = 1_600_000_000_000L),
+        )
+        val other = entry(uuid = "inst-2/gpt-5.5", userModifiedAt = genuinelyEdited)
+            .copy(providerInstanceId = "inst-2")
+        assertTrue(
+            mostRecentModified("inst-1", listOf(restored)) < mostRecentModified("inst-2", listOf(other)),
+        )
+    }
+
+    @Test
+    fun restoreStillPinsTheLocalIdentity() {
+        val restored = mergeHit(
+            entry(uuid = "inst-1/gpt-5.5", displayName = "local"),
+            entry(uuid = "totally-different-uuid", displayName = "backup"),
+        )
+        assertEquals("inst-1/gpt-5.5", restored.uuid)
+        assertEquals("inst-1/gpt-5.5", restored.id)
+    }
+
+    @Test
+    fun editorPathStillStampsNow() {
+        // The default mode is unchanged: every editor / agent caller keeps
+        // marking the entry as freshly modified.
+        val edited = updateEntryReplica(entry(uuid = "inst-1/gpt-5.5", displayName = "edited"))
+        assertEquals(4_102_444_800_000L, edited.userModifiedAt)
+    }
+
+    @Test
+    fun firstImportIntoAnEmptyInstanceKeepsTheBackupTimestamp() {
+        // The append path (addEntry / importInstanceJSON's addAll) never touched
+        // userModifiedAt — it stays verbatim from the backup. Pinned so the
+        // restore-side fix cannot "harmonize" the two paths by making the append
+        // path start stamping.
+        val backupStamp = 1_600_000_000_000L
+        val appended = entry(uuid = "temp", displayName = "backup", userModifiedAt = backupStamp)
+        assertEquals(backupStamp, appended.userModifiedAt)
+        assertNull(entry(uuid = "temp", displayName = "backup").userModifiedAt)
+    }
 }
