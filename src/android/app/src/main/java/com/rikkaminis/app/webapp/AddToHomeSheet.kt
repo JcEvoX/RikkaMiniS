@@ -334,9 +334,10 @@ fun AddToHomeSheet(
                                         ImageDecoding.decodeFileBounded(path, ICON_MAX_EDGE_PX)?.bitmap
                                     }
                                 }
-                                if (bmp != null) {
+                                val bmpNow = bmp
+                                if (bmpNow != null) {
                                     androidx.compose.foundation.Image(
-                                        bitmap = bmp.asImageBitmap(),
+                                        bitmap = bmpNow.asImageBitmap(),
                                         contentDescription = null,
                                         modifier = Modifier.size(36.dp),
                                     )
@@ -386,9 +387,10 @@ fun AddToHomeSheet(
                                     loadBitmapFromUri(context, galleryUri)
                                 }
                             }
-                            if (bmp != null) {
+                            val bmpNow = bmp
+                            if (bmpNow != null) {
                                 androidx.compose.foundation.Image(
-                                    bitmap = bmp.asImageBitmap(),
+                                    bitmap = bmpNow.asImageBitmap(),
                                     contentDescription = null,
                                     modifier = Modifier.size(36.dp),
                                 )
