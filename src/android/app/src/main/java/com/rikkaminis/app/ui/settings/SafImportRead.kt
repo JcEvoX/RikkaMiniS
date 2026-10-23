@@ -33,12 +33,10 @@ import java.io.InputStream
  *  2. the stream read itself stops one byte past the cap ([readAtMost]), which
  *     is the authority. A lying provider still cannot get past it.
  *
- * ponytail: the archive path still materialises the picked bundle once (now
- * capped at 32 MiB) instead of streaming the zip entries through the extractor
- * | 天花板: a legitimately larger bundle (or a future format that needs >32 MiB
- * raw) would be refused outright | 升级触发: a user report of a real skill
- * bundle above the cap, or `readZipEntries` raising its own expanded limit.
  */
+
+// ponytail: the archive path still materialises the picked bundle once (now capped at 32 MiB) instead of streaming the zip entries through the extractor | 天花板: a legitimately larger bundle (or a format that needs >32 MiB raw) is refused outright | 升级触发: a user report of a real bundle above the cap, or `readZipEntries` raising its own expanded limit.
+
 private const val TAG = "SafBoundedRead"
 
 /**
