@@ -341,11 +341,16 @@ class GeminiProvider(
             // signal truncated so the turnTruncated retry path owns it. A fully
             // empty EOF (contentChars == 0) is left to failOnSilentEmptyCompletion
             // and is not flagged here.
-            if (shouldFlagEofTruncated(lastFinishReason, contentChars, toolChars)) {
-                send(LLMStreamChunk.Finished(null, truncated = true))
-            } else {
-                send(LLMStreamChunk.Finished(lastFinishReason ?: "end_turn"))
-            }
+            //
+            // [deep-audit-1045 A-02] "Left to failOnSilentEmptyCompletion" only
+            // holds if we stop INVENTING a stop reason on the way out: that
+            // operator decides by `Finished.stopReason != null` (LLMProvider.kt
+            // :239), so the old `?: "end_turn"` on a fully empty EOF made it
+            // read as a clean finish and no TransientError was ever raised.
+            // The terminal decision now lives in [geminiEofTerminal], which
+            // passes an absent finishReason through as null.
+            val terminal = geminiEofTerminal(lastFinishReason, contentChars, toolChars)
+            send(LLMStreamChunk.Finished(terminal.stopReason, truncated = terminal.truncated))
         } catch (e: Exception) {
             // [F-177] same defect as OpenAIProvider: a cause-less
             // CancellationException here means the consumer asked us to stop
@@ -775,3 +780,50 @@ internal fun shouldFlagEofTruncated(
     contentChars: Int,
     toolChars: Int,
 ): Boolean = lastFinishReason == null && (contentChars > 0 || toolChars > 0)
+
+/**
+ * [deep-audit-1045 A-02] The terminal chunk Gemini's SSE loop emits once the
+ * stream reaches EOF, as a pure decision over the same three inputs as
+ * [shouldFlagEofTruncated].
+ *
+ * Why this exists: the loop's `else` arm used to send
+ * `Finished(lastFinishReason ?: "end_turn")`. On a FULLY EMPTY EOF
+ * (contentChars == 0 && toolChars == 0) `lastFinishReason` is null, so the
+ * arm synthesized a stop reason — and `failOnSilentEmptyCompletion`
+ * (LLMProvider.kt:239) treats `Finished` with a non-null stopReason as
+ * "the server finished cleanly". A relay that drops the SSE body therefore
+ * produced an empty assistant turn that looked like a legitimate end_turn:
+ * the KDoc above `shouldFlagEofTruncated` promises that case is "left to
+ * failOnSilentEmptyCompletion", and the fabricated stop reason is exactly
+ * what made that promise unenforceable.
+ *
+ * Table (hand-pinned in GeminiEofTerminalDecisionTest):
+ *  - no finishReason + any stream activity → truncated, no stop reason (the
+ *    turnTruncated retry path owns it — same shape as before);
+ *  - no finishReason + no activity       → NOT truncated, NO stop reason, so
+ *    failOnSilentEmptyCompletion raises TransientError (retryable) instead of
+ *    a silent empty success;
+ *  - a real finishReason                 → pass it through verbatim, never
+ *    truncated (even when tool calls were delivered).
+ *
+ * Deliberately NOT expressed as a change to [shouldFlagEofTruncated]: that
+ * verdict has other consumers (the media-only / tool-only truncation rules)
+ * and widening it would reclassify a fully empty EOF as "truncated" as well,
+ * which would double-handle the case with a retry the empty-stream operator
+ * already owns.
+ */
+internal data class GeminiEofTerminal(
+    val stopReason: String?,
+    val truncated: Boolean,
+)
+
+internal fun geminiEofTerminal(
+    lastFinishReason: String?,
+    contentChars: Int,
+    toolChars: Int,
+): GeminiEofTerminal =
+    if (shouldFlagEofTruncated(lastFinishReason, contentChars, toolChars)) {
+        GeminiEofTerminal(stopReason = null, truncated = true)
+    } else {
+        GeminiEofTerminal(stopReason = lastFinishReason, truncated = false)
+    }

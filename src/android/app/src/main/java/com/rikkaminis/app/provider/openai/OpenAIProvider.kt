@@ -22,6 +22,7 @@ import com.rikkaminis.app.provider.applyUserAgentOverride
 import com.rikkaminis.app.provider.extractHttpErrorMessage
 import com.rikkaminis.app.provider.safeOptString
 import com.rikkaminis.app.provider.sanitizeToolPairing
+import com.rikkaminis.app.provider.hasWirePayload
 import com.rikkaminis.app.provider.clampOutboundMaxTokens
 import com.rikkaminis.app.provider.clampOutboundTemperature
 import com.rikkaminis.app.provider.StreamTimeouts
@@ -1859,9 +1860,18 @@ class OpenAIProvider constructor(
         // OpenAI rejects an unanswered `tool_calls` entry (no following
         // role:"tool" message) and a role:"tool" message with an unknown
         // tool_call_id — both deterministic 400s.
-        val sanitizedMessages = sanitizeToolPairing(messages) { detail ->
+        val sanitizedRaw = sanitizeToolPairing(messages) { detail ->
             android.util.Log.i("OpenAIProvider", detail)
         }
+        // [deep-audit-1045 A-03] The request-level `imageParts` argument is
+        // attached to the LAST user turn (attachTopLevelImages below), and the
+        // `minis-model-use` CLI path builds that turn from text + media only —
+        // its `content` is empty whenever the CLI call carries a bare image or
+        // audio block. Keyed on the PRE-filter list on purpose: the filter's
+        // whole job is to drop entries, so an index taken afterwards is -1 in
+        // exactly the case this guard exists for.
+        val rawLastUserIndex = sanitizedRaw.indexOfLast { it.role == LLMMessage.Role.USER }
+        val sanitizedMessages = sanitizedRaw
             // [FIX-1 / F-211] Drop messages the sanitizer emptied (only orphan
             // tool parts get stripped). An empty `content` is a shape OpenAI
             // rejects, so without this filter the sanitizer manufactures the
@@ -1875,7 +1885,18 @@ class OpenAIProvider constructor(
             // empty-dropping is provider policy, not pairing policy. Gemini's
             // serializer turns "" into " " (a valid empty turn) and
             // RequestSanitizersTest pins that the sanitizer itself keeps them.
-            .filter { m -> m.contentParts.isNotEmpty() || m.content.isNotEmpty() }
+            //
+            // [deep-audit-1045 A-03] "Empty" means no TEXT, not no payload: a
+            // media-only turn (audioParts / imageParts, or the last user turn
+            // whose bytes ride the top-level `imageParts` argument) still has
+            // something to put on the wire, and dropping it deleted the user's
+            // image / audio from the request entirely.
+            .filterIndexed { index, m ->
+                m.hasWirePayload(
+                    isLastUserTurn = index == rawLastUserIndex,
+                    turnImageCount = imageParts.size,
+                )
+            }
         val body = JSONObject()
         body.put("model", model.id)
         // Defense-in-depth clamp (see AnthropicProvider): upstream
@@ -2240,7 +2261,14 @@ class OpenAIProvider constructor(
                     // Preserve the pre-GH#67 image-path behavior (text part
                     // always present); for audio-only messages skip an empty
                     // text block some servers reject.
-                    if (attachTopLevelImages || msg.content.isNotEmpty()) {
+                    // [deep-audit-1045 A-03] The `|| attachTopLevelImages` arm
+                    // used to be reachable only for turns that had text (the
+                    // empty filter dropped the rest), so it never emitted an
+                    // empty text part. Now that a media-only last user turn
+                    // survives the filter, the text part must be skipped when
+                    // there is no text — a server that rejects an empty text
+                    // block would 400 on a legitimate image-only request.
+                    if (msg.content.isNotEmpty()) {
                         contentArray.put(JSONObject().apply {
                             put("type", "text")
                             put("text", msg.content)
@@ -2797,12 +2825,23 @@ class OpenAIProvider constructor(
         // API rejects an unanswered function_call and a function_call_output
         // with an unknown call_id). Sanitize BEFORE deriving the prompt cache
         // key so the key reflects the payload that actually goes on the wire.
-        val sanitizedMessages = sanitizeToolPairing(messages) { detail ->
+        val sanitizedRaw = sanitizeToolPairing(messages) { detail ->
             android.util.Log.i("OpenAIProvider", detail)
         }
+        // [deep-audit-1045 A-03] Same pre-filter index as the Chat-Completions
+        // builder — see the note there; this file must not fork the decision.
+        val rawLastUserIndex = sanitizedRaw.indexOfLast { it.role == LLMMessage.Role.USER }
+        val sanitizedMessages = sanitizedRaw
             // [FIX-1 / F-211] Same filter as the legacy serializer path above —
             // see the note there for why this lives at the call site.
-            .filter { m -> m.contentParts.isNotEmpty() || m.content.isNotEmpty() }
+            // [deep-audit-1045 A-03] and for why "empty" excludes media-only
+            // turns (audioParts / imageParts / top-level turn images).
+            .filterIndexed { index, m ->
+                m.hasWirePayload(
+                    isLastUserTurn = index == rawLastUserIndex,
+                    turnImageCount = imageParts.size,
+                )
+            }
         val body = JSONObject()
         body.put("model", model.id)
         body.put("stream", stream)
