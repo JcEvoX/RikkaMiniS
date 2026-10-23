@@ -4,6 +4,9 @@ import android.content.Context
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.tools.AtomicFileWrite
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -30,6 +33,25 @@ object ScheduledTasksStore {
     private const val TAG = "scheduled-run"
 
     private val lock = Mutex()
+
+    private val _revision = MutableStateFlow(0L)
+
+    /**
+     * [deep-audit-1046 S-11] Bumped exactly once per SUCCESSFUL atomic write.
+     *
+     * Every read in this store is a one-shot `load`, so a screen that rendered
+     * once rendered that document forever: the list kept showing a task as
+     * "never ran" after a background run settled, and never showed the fuse
+     * trip (the Resume button only appeared after leaving and re-entering the
+     * screen). Screens now key their reloads on this value.
+     *
+     * It is a change TICKER, not a document version: the value means nothing
+     * beyond "different from before". The bump lives in [writeLocked] — the one
+     * funnel every write already goes through — so a future write helper cannot
+     * forget it (the alternative, one bump per write method, silently misses
+     * the seventh one).
+     */
+    val revision: StateFlow<Long> = _revision.asStateFlow()
 
     fun fileFor(context: Context): File = File(File(context.filesDir, DIR_NAME), FILE_NAME)
 
@@ -94,8 +116,14 @@ object ScheduledTasksStore {
      * that settled while the editor was open (up to the full prompt budget) —
      * see the merge function for the shape.
      */
-    suspend fun upsertTask(context: Context, task: ScheduledTask): ScheduledTasksFile =
-        mutate(context) { file -> ScheduledTaskTransitions.mergeUpsertTask(file, task) }
+    suspend fun upsertTask(
+        context: Context,
+        task: ScheduledTask,
+        allowInsert: Boolean = true,
+    ): ScheduledTasksFile =
+        mutate(context) { file ->
+            ScheduledTaskTransitions.mergeUpsertTask(file, task, allowInsert)
+        }
 
     suspend fun deleteTask(context: Context, taskId: String): ScheduledTasksFile {
         val next = mutate(context) { file ->
@@ -189,10 +217,18 @@ object ScheduledTasksStore {
     }
 
     private fun writeLocked(context: Context, file: ScheduledTasksFile) {
-        try {
+        val wrote = try {
             AtomicFileWrite.write(fileFor(context), ScheduledTasksCodec.encode(file))
+            true
         } catch (t: Throwable) {
             AppLogger.warning(TAG, "tasks.json write failed: ${t.javaClass.simpleName}")
+            false
         }
+        // [deep-audit-1046 S-11] The single bump point — AFTER the write landed.
+        // Reading the file back instead would need a second parse and could
+        // still race; a failed write says so directly, and a would-be bump for
+        // a document that never changed makes every open screen re-render stale
+        // data for nothing.
+        _revision.value = ScheduledTaskRevisionPolicy.nextRevision(_revision.value, wrote)
     }
 }

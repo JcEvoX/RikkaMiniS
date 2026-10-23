@@ -423,6 +423,537 @@ def read_optional(root, rel):
         return f.read()
 
 
+# ── deep-audit-1046 S-11 ────────────────────────────────────────────────────
+# `ScheduledTasksStore` is read-once by design (every accessor is a one-shot
+# `load`), so a screen that rendered once rendered that document until it was
+# left and re-entered. Two silent windows follow:
+#
+#   * the list never saw a background run settle (`lastRunDate` / `lastResult` /
+#     `failStreak`) and never saw the fuse trip — a suspended task's Resume
+#     button only appeared after an ON_RESUME round-trip;
+#   * the editor never saw its own target disappear, and Save then appended the
+#     vanished record straight back (`mergeUpsertTask`: `idx < 0 → append`) with
+#     the run state the form had snapshotted — a deleted task resurrected.
+#
+# The fix is one change ticker (bumped after each landed write), two
+# subscriptions, and an explicit allow-insert parameter for the save. Each of the
+# four is silent when dropped, so each gets a criterion. Everything below is
+# derived: the ticker's NAME comes from the store, the collected variable comes
+# from the screen, the parameters come from the signature — no member lists.
+# ────────────────────────────────────────────────────────────────────────────
+
+LIST_SCREEN_REL = (
+    "src/android/app/src/main/java/com/rikkaminis/app/ui/settings/ScheduledTasksScreen.kt"
+)
+APPEND_RE = re.compile(r"\.tasks *\+ *task\b")
+WRITE_CALL_RE = re.compile(r"AtomicFileWrite\.write *\(")
+BUMP_TAIL_RE = re.compile(r"\. *value *=|\. *update *\{")
+
+
+def _paren_args(scan, open_idx):
+    """Text between the parenthesis at [open_idx] and its match, or None."""
+    depth = 0
+    for k in range(open_idx, len(scan)):
+        if scan[k] == "(":
+            depth += 1
+        elif scan[k] == ")":
+            depth -= 1
+            if depth == 0:
+                return scan[open_idx + 1:k]
+    return None
+
+
+def _call_args(scan, head_re):
+    """(args, start_index_of_head) of the first [head_re] call, or (None, None)."""
+    m = re.search(head_re, scan)
+    if m is None:
+        return None, None
+    return _paren_args(scan, m.end() - 1), m.start()
+
+
+def _brace_body(scan, idx):
+    """Body of the `{ … }` that starts at/after [idx], brace-matched."""
+    j = idx
+    while j < len(scan) and scan[j] != "{":
+        if not scan[j].isspace() and scan[j] != ")":
+            break
+        j += 1
+    if j >= len(scan) or scan[j] != "{":
+        return None
+    depth = 0
+    for k in range(j, len(scan)):
+        if scan[k] == "{":
+            depth += 1
+        elif scan[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return scan[j + 1:k]
+    return None
+
+
+def _state_flow_name(store_raw):
+    """(backing_field_name, exposed_property_name) of the store's change ticker."""
+    scan = strip_code(store_raw)
+    backing = re.search(r"private +val +_(\w+) *= *MutableStateFlow *[<(]", scan)
+    if backing is None:
+        return None, None
+    exposed = re.search(r"(?<![.\w])val +(\w+) *: *StateFlow *<[^>]*> *= *_(\w+)", scan)
+    if exposed is None:
+        return backing.group(1), None
+    # A `private val x: StateFlow<…>` is not an exposure — no screen can collect
+    # it. The modifier sits on the same line, before the keyword.
+    line_head = scan[scan.rfind("\n", 0, exposed.start()) + 1:exposed.start()]
+    if re.search(r"\bprivate\b", line_head):
+        return backing.group(1), None
+    return backing.group(1), exposed.group(1)
+
+
+def scan_revision_stream(store_raw):
+    """C1 — the store publishes a change ticker, and it moves ONLY when a write
+    actually landed.
+
+    Two shapes are silent: no ticker at all (every screen reads once), and a
+    ticker bumped before the write (a write that throws leaves the screens told
+    to re-read a document that never changed — and a retry loop re-renders for
+    nothing). Order is therefore part of the criterion, not a style note."""
+    scan = strip_code(store_raw)
+    writes = [m.start() for m in WRITE_CALL_RE.finditer(scan)]
+    if not writes:
+        # A store-shaped fixture that never writes (the removal-path fixtures in
+        # test_scan are exactly this) has no write to report on — SKIP rather
+        # than red, so the criterion stays about ordering/coverage and not about
+        # the fixture's completeness.
+        return [
+            "SKIP: no `AtomicFileWrite.write(` in %s — the change-ticker criterion does "
+            "not apply to a store that never writes" % STORE_REL
+        ]
+    backing, exposed = _state_flow_name(store_raw)
+    if backing is None:
+        return [
+            "%s: no `private val _x = MutableStateFlow(` backing field — the store has no "
+            "change stream, so every screen keeps rendering the document it read once: a "
+            "background run settling and a fuse trip stay invisible until the screen is "
+            "left and re-entered, and the editor never learns its target is gone"
+            % STORE_REL
+        ]
+    if exposed is None or exposed != backing:
+        return [
+            "%s: the change ticker is not exposed as a StateFlow over its own backing field "
+            "(`val <name>: StateFlow<…> = _%s`) — a private ticker no screen can collect is "
+            "the same bug with more code" % (STORE_REL, backing)
+        ]
+
+    bump_res = (
+        re.compile(r"(?<![.\w])_%s *\. *value *=" % backing),
+        re.compile(r"(?<![.\w])_%s *\. *update *\{" % backing),
+    )
+    bumps = sorted({m.start() for r in bump_res for m in r.finditer(scan)})
+    if not bumps:
+        return [
+            "%s: the change ticker (`_%s`) is never bumped — screens that key on it never "
+            "reload, which is indistinguishable from having no ticker at all"
+            % (STORE_REL, backing)
+        ]
+
+    bad = []
+    spans = function_spans(scan)
+
+    def enclosing(idx):
+        for name, start, end, line in spans:
+            if start <= idx < end:
+                return name, start, end, line
+        return None
+
+    # (1) order: the bump must come after the write it reports on.
+    for bump in bumps:
+        span = enclosing(bump)
+        if span is None:
+            bad.append(
+                "%s:%d: the ticker is bumped outside any store function — the bump cannot be "
+                "tied to the write it is supposed to report"
+                % (STORE_REL, line_of(scan, bump))
+            )
+            continue
+        name, start, end, line = span
+        inner_writes = [w for w in writes if start <= w < end]
+        if not inner_writes:
+            bad.append(
+                "%s:%d: [%s] bumps the ticker but performs no write — a bump without a landed "
+                "write tells every screen to re-read a document that cannot have changed"
+                % (STORE_REL, line_of(scan, bump), name)
+            )
+            continue
+        for w in inner_writes:
+            if w > bump:
+                bad.append(
+                    "%s:%d: [%s] bumps the ticker BEFORE the write (write at line %d) — a "
+                    "failed write then still tells every screen the document changed"
+                    % (STORE_REL, line_of(scan, bump), name, line_of(scan, w))
+                )
+
+    # (2) coverage: no write may escape the funnel (one bump per write path).
+    for w in writes:
+        span = enclosing(w)
+        if span is None:
+            continue
+        name, start, end, line = span
+        if not any(start <= b < end for b in bumps):
+            bad.append(
+                "%s:%d: [%s] writes the document without bumping the ticker — that write is "
+                "invisible to every screen (bump in the write funnel, or per write method, "
+                "but never nowhere)" % (STORE_REL, line_of(scan, w), name)
+            )
+    return bad
+
+
+def _collect_var(scan, flow_name):
+    """The variable a screen binds `…<flow>.collectAsState()` to, or None."""
+    m = re.search(
+        r"val +(\w+) +by +(?:[\w.]+\.)*%s *\. *collectAsState *\(" % re.escape(flow_name),
+        scan,
+    )
+    return m.group(1) if m else None
+
+
+def scan_list_screen_keys(store_raw, list_raw):
+    """C2 — the list must reload when the store changes, without losing the
+    ON_RESUME re-read that covers a returning screen."""
+    _backing, flow = _state_flow_name(store_raw)
+    if flow is None:
+        return [
+            "%s: the store exposes no StateFlow change ticker to key on" % STORE_REL
+        ]
+    scan = strip_code(list_raw)
+    var = _collect_var(scan, flow)
+    if var is None:
+        return [
+            "%s: does not collect `%s.%s` — the list keeps rendering the document it read "
+            "first: a run settling (lastRunDate / lastResult / failStreak) and a fuse trip "
+            "(suspendedByFuse → the Resume button) stay invisible while the screen is open"
+            % (LIST_SCREEN_REL, "ScheduledTasksStore", flow)
+        ]
+    args, _ = _call_args(scan, r"produceState *<[^>]*> *\(")
+    if args is None:
+        return [
+            "%s: no `produceState<…>(…)` load — the list's document source changed shape "
+            "(update this gate's detection)" % LIST_SCREEN_REL
+        ]
+    keys = [a.strip() for a in args.split(",")]
+    if var not in keys[1:]:
+        return [
+            "%s: `produceState` does not key on `%s` (keys: %s) — collecting the ticker and "
+            "not keying on it reloads nothing"
+            % (LIST_SCREEN_REL, var, ", ".join(k for k in keys[1:] if k) or "none")
+        ]
+    # The double safety: the ON_RESUME re-read must survive (returning from the
+    # editor / the app switcher re-reads even if no write happened meanwhile).
+    if "ON_RESUME" not in scan or not re.search(r"\breloadKey *\+\+", scan):
+        return [
+            "%s: the ON_RESUME re-read (`reloadKey++`) is gone — the ticker only fires on "
+            "writes, and a screen returning from the editor or the app switcher must still "
+            "re-read; the two are deliberate belts, keep both" % LIST_SCREEN_REL
+        ]
+    return []
+
+
+FORM_TEXT_FIELDS = ("title", "prompt", "windowStart", "windowEnd")
+
+
+def scan_edit_screen_revision(store_raw, edit_raw):
+    """C3 — the editor follows the ticker: a vanished target becomes the
+    not-found state, and a change never rewrites what the user is typing."""
+    _backing, flow = _state_flow_name(store_raw)
+    if flow is None:
+        return ["%s: the store exposes no StateFlow change ticker to follow" % STORE_REL]
+    scan = strip_code(edit_raw)
+    var = _collect_var(scan, flow)
+    if var is None:
+        return [
+            "%s: does not collect `ScheduledTasksStore.%s` — the form read its record once, "
+            "so a task deleted (or replaced away by a backup restore) while the editor is "
+            "open stays editable, and Save appends it back" % (EDIT_SCREEN_REL, flow)
+        ]
+    watched = None
+    for m in re.finditer(r"LaunchedEffect *\(", scan):
+        open_idx = m.end() - 1
+        args = _paren_args(scan, open_idx)
+        if args is None:
+            continue
+        if var not in [a.strip() for a in args.split(",")]:
+            continue
+        body = _brace_body(scan, open_idx + len(args) + 1)
+        if body is not None:
+            watched = body
+            break
+    if watched is None:
+        return [
+            "%s: no `LaunchedEffect(… %s …)` — collecting the ticker without an effect keyed "
+            "on it re-runs nothing" % (EDIT_SCREEN_REL, var)
+        ]
+    normalized = re.sub(r"\s+", "", watched)
+    if "recordMissing=true" not in normalized:
+        return [
+            "%s: the change handler never raises `recordMissing` — the gone-target decision "
+            "exists but no refresh path reaches it" % EDIT_SCREEN_REL
+        ]
+    if not (
+        re.search(r"none *\{ *it\.id *==|firstOrNull *\{ *it\.id *==|shouldMarkMissing *\(", watched)
+    ):
+        return [
+            "%s: the change handler never asks whether the target still exists (no "
+            "`none { it.id ==` / `firstOrNull { it.id ==` / shouldMarkMissing) — it cannot "
+            "tell a run settling from a deletion" % EDIT_SCREEN_REL
+        ]
+    for field in FORM_TEXT_FIELDS:
+        if re.search(r"(?<![.\w])%s *= *(?!=)" % field, watched):
+            return [
+                "%s: the change handler assigns `%s` — a background run settling while the "
+                "form is open would rewrite what the user is typing; only the RUN half of "
+                "the snapshot may be refreshed" % (EDIT_SCREEN_REL, field)
+            ]
+    return []
+
+
+def scan_merge_insert_guard(policy_raw):
+    """C4 — appending an unknown id must be an explicit, opt-in decision.
+
+    "Unknown id" has two meanings (a brand-new task vs an edit whose target was
+    deleted) and only the caller can tell them apart, so the insert branch has to
+    sit behind a parameter. Unconditional append is what resurrected deleted
+    records together with the form's stale run state."""
+    scan = strip_code(policy_raw)
+    for name, start, end, line in function_spans(scan):
+        body = scan[start:end]
+        if not APPEND_RE.search(body):
+            continue
+        head_start = scan.rfind("fun ", 0, start)
+        sig = scan[head_start:start]
+        params = _paren_args(sig, sig.find("(")) if sig.find("(") >= 0 else None
+        if params is None:
+            return [
+                "%s:%d: [%s] the insert branch's signature could not be parsed (update this "
+                "gate's detection)" % (POLICY_REL, line, name)
+            ]
+        boolean_params = [
+            p.split(":")[0].strip()
+            for p in params.split(",")
+            if re.search(r": *Boolean\b", p) and p.split(":")[0].strip()
+        ]
+        if not boolean_params:
+            return [
+                "%s:%d: [%s] appends an unknown id with no allow-insert parameter — an editor "
+                "save for a task that was deleted meanwhile resurrects it, carrying the run "
+                "state the form snapshotted (`enabled`, `lastRunDate`, a cleared fuse)"
+                % (POLICY_REL, line, name)
+            ]
+        block = None
+        for im in re.finditer(r"if *\( *idx *< *0 *\)", body):
+            block = _brace_body(body, im.end()) or body[im.end():im.end() + 400]
+            if block is not None:
+                break
+        if block is None:
+            return [
+                "%s:%d: [%s] the `idx < 0` branch is unreadable — the insert decision cannot "
+                "be checked (update this gate's detection)" % (POLICY_REL, line, name)
+            ]
+        allowed = [p for p in boolean_params if re.search(r"(?<![.\w])%s\b" % re.escape(p), block)]
+        if not allowed:
+            return [
+                "%s:%d: [%s] inserts an unknown id without consulting its allow-insert "
+                "parameter (%s) — the parameter exists but guards nothing"
+                % (POLICY_REL, line, name, ", ".join(boolean_params))
+            ]
+        if not re.search(r"return +file\b(?! *\.)", block):
+            return [
+                "%s:%d: [%s] the `idx < 0` branch has no `return file` path — a refused insert "
+                "must leave the document untouched (the same instance), or the store writes "
+                "and bumps for nothing" % (POLICY_REL, line, name)
+            ]
+        return []
+    return [
+        "%s: no function appends `file.tasks + task` — the merge/insert site moved "
+        "(update this gate's detection)" % POLICY_REL
+    ]
+
+
+def selftest_revision():
+    """Negative controls for the deep-audit-1046 S-11 criteria."""
+    clean_store = (
+        "object ScheduledTasksStore {\n"
+        "    private val _revision = MutableStateFlow(0L)\n"
+        "    val revision: StateFlow<Long> = _revision.asStateFlow()\n"
+        "    private fun writeLocked(ctx: Any, file: Any) {\n"
+        "        val wrote = try {\n"
+        "            AtomicFileWrite.write(fileFor(ctx), encode(file))\n"
+        "            true\n"
+        "        } catch (t: Throwable) {\n"
+        "            false\n"
+        "        }\n"
+        "        _revision.value = ScheduledTaskRevisionPolicy.nextRevision(_revision.value, wrote)\n"
+        "    }\n"
+        "}\n"
+    )
+    clean_list = (
+        "fun ScheduledTasksScreen() {\n"
+        "    var reloadKey by remember { mutableIntStateOf(0) }\n"
+        "    val storeRevision by ScheduledTasksStore.revision.collectAsState()\n"
+        "    val file by produceState<ScheduledTasksFile?>(null, context, reloadKey, storeRevision) {\n"
+        "        value = ScheduledTasksStore.load(context)\n"
+        "    }\n"
+        "    DisposableEffect(lifecycleOwner) {\n"
+        "        val observer = LifecycleEventObserver { _, event ->\n"
+        "            if (event == Lifecycle.Event.ON_RESUME) reloadKey++\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+    )
+    clean_edit = (
+        "fun ScheduledTaskEditScreen(taskId: String?, onDone: () -> Unit) {\n"
+        "    var title by remember { mutableStateOf(\"\") }\n"
+        "    var recordMissing by remember { mutableStateOf(false) }\n"
+        "    val storeRevision by ScheduledTasksStore.revision.collectAsState()\n"
+        "    LaunchedEffect(taskId) {\n"
+        "        title = loaded.title\n"
+        "    }\n"
+        "    LaunchedEffect(taskId, storeRevision) {\n"
+        "        val fresh = ScheduledTasksStore.load(context).tasks.firstOrNull { it.id == taskId }\n"
+        "        if (shouldMarkMissing(loadedOnce, stillExists = fresh != null)) {\n"
+        "            recordMissing = true\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+    )
+    clean_policy = (
+        "object ScheduledTaskTransitions {\n"
+        "    fun mergeUpsertTask(file: Any, task: Any, allowInsert: Boolean = true): Any {\n"
+        "        val idx = file.tasks.indexOfFirst { it.id == task.id }\n"
+        "        if (idx < 0) {\n"
+        "            if (!allowInsert) return file\n"
+        "            return file.copy(tasks = file.tasks + task)\n"
+        "        }\n"
+        "        return file\n"
+        "    }\n"
+        "}\n"
+    )
+    cases = [
+        # [name, args, scanner, expected_violation_count]
+        ["revision/clean", [clean_store], scan_revision_stream, 0],
+        ["revision/no ticker at all", [
+            clean_store.replace(
+                "    private val _revision = MutableStateFlow(0L)\n"
+                "    val revision: StateFlow<Long> = _revision.asStateFlow()\n", ""),
+        ], scan_revision_stream, 1],
+        ["revision/ticker never exposed", [
+            clean_store.replace(
+                "val revision: StateFlow<Long> = _revision.asStateFlow()",
+                "private val revision: StateFlow<Long> = _revision.asStateFlow()"),
+        ], scan_revision_stream, 1],
+        ["revision/bumped before the write", [
+            clean_store.replace(
+                "        val wrote = try {\n",
+                "        _revision.value = _revision.value + 1\n"
+                "        val wrote = try {\n").replace(
+                "        _revision.value = ScheduledTaskRevisionPolicy.nextRevision("
+                "_revision.value, wrote)\n", ""),
+        ], scan_revision_stream, 1],
+        ["revision/write escapes the funnel", [
+            clean_store.replace(
+                "\n}\n",
+                "\n    private fun otherWrite(ctx: Any, file: Any) {\n"
+                "        AtomicFileWrite.write(fileFor(ctx), encode(file))\n"
+                "    }\n}\n"),
+        ], scan_revision_stream, 1],
+        ["list/clean", [clean_store, clean_list], scan_list_screen_keys, 0],
+        ["list/does not collect", [
+            clean_store,
+            clean_list.replace(
+                "    val storeRevision by ScheduledTasksStore.revision.collectAsState()\n", ""),
+        ], scan_list_screen_keys, 1],
+        ["list/revision not a produceState key", [
+            clean_store,
+            clean_list.replace(
+                "null, context, reloadKey, storeRevision", "null, context, reloadKey"),
+        ], scan_list_screen_keys, 1],
+        ["list/ON_RESUME re-read dropped", [
+            clean_store,
+            clean_list.replace(
+                "if (event == Lifecycle.Event.ON_RESUME) reloadKey++",
+                "if (event == null) Unit"),
+        ], scan_list_screen_keys, 1],
+        ["edit/clean", [clean_store, clean_edit], scan_edit_screen_revision, 0],
+        ["edit/does not collect", [
+            clean_store,
+            clean_edit.replace(
+                "    val storeRevision by ScheduledTasksStore.revision.collectAsState()\n", ""),
+        ], scan_edit_screen_revision, 1],
+        ["edit/no change handler", [
+            clean_store,
+            clean_edit.replace(
+                "    LaunchedEffect(taskId, storeRevision) {\n"
+                "        val fresh = ScheduledTasksStore.load(context)"
+                ".tasks.firstOrNull { it.id == taskId }\n"
+                "        if (shouldMarkMissing(loadedOnce, stillExists = fresh != null)) {\n"
+                "            recordMissing = true\n"
+                "        }\n"
+                "    }\n", ""),
+        ], scan_edit_screen_revision, 1],
+        ["edit/handler never marks missing", [
+            clean_store,
+            clean_edit.replace(
+                "            recordMissing = true\n        }\n    }\n}\n",
+                "        }\n    }\n}\n"),
+        ], scan_edit_screen_revision, 1],
+        ["edit/handler does not ask whether the target exists", [
+            clean_store,
+            clean_edit.replace(
+                "        val fresh = ScheduledTasksStore.load(context).tasks.firstOrNull"
+                " { it.id == taskId }\n"
+                "        if (shouldMarkMissing(loadedOnce, stillExists = fresh != null)) {\n"
+                "            recordMissing = true\n"
+                "        }\n",
+                "        recordMissing = true\n"),
+        ], scan_edit_screen_revision, 1],
+        ["edit/handler rewrites the user's text", [
+            clean_store,
+            clean_edit.replace(
+                "            recordMissing = true\n",
+                "            recordMissing = true\n            title = fresh?.title ?: \"\"\n", 1),
+        ], scan_edit_screen_revision, 1],
+        ["merge/clean", [clean_policy], scan_merge_insert_guard, 0],
+        ["merge/unconditional append", [
+            clean_policy.replace(
+                "        if (idx < 0) {\n"
+                "            if (!allowInsert) return file\n"
+                "            return file.copy(tasks = file.tasks + task)\n"
+                "        }\n",
+                "        if (idx < 0) return file.copy(tasks = file.tasks + task)\n"),
+        ], scan_merge_insert_guard, 1],
+        ["merge/no allow-insert parameter", [
+            clean_policy.replace(
+                "task: Any, allowInsert: Boolean = true", "task: Any"),
+        ], scan_merge_insert_guard, 1],
+        ["merge/parameter guards nothing", [
+            clean_policy.replace("            if (!allowInsert) return file\n", ""),
+        ], scan_merge_insert_guard, 1],
+        ["merge/refused insert still writes", [
+            clean_policy.replace(
+                "            if (!allowInsert) return file\n",
+                "            if (!allowInsert) return file.copy(tasks = file.tasks)\n"),
+        ], scan_merge_insert_guard, 1],
+    ]
+    print("  ── deep-audit-1046 S-11 (store change ticker) ──")
+    failures = 0
+    for name, args, scanner, expected in cases:
+        bad = scanner(*args)
+        ok = len(bad) == expected
+        print(f"  {'✅' if ok else '❌'} {name} → {len(bad)} violation(s), expected {expected}"
+              + ("" if ok else ": " + "; ".join(bad)[:150]))
+        if not ok:
+            failures += 1
+    print(f"SCHEDULED_REVISION_SELFTEST={'PASS' if failures == 0 else 'FAIL'}")
+    return failures
+
+
 def selftest():
     """Negative controls for the deep-audit-1030 criteria: each must reject its
     own mutated fixture and accept the clean one."""
@@ -604,7 +1135,8 @@ def selftest():
     print(f"SCHEDULED_MERGE_SELFTEST={'PASS' if merge_failures == 0 else 'FAIL'}")
     print(f"SCHEDULED_CANSAVE_SELFTEST={'PASS' if cansave_failures == 0 else 'FAIL'}")
     print(f"SCHEDULED_EDITGUARD_SELFTEST={'PASS' if editguard_failures == 0 else 'FAIL'}")
-    return 1 if failures else 0
+    revision_failures = selftest_revision()
+    return 1 if (failures or revision_failures) else 0
 
 
 def strip_code(src):
@@ -806,6 +1338,49 @@ def main():
         print("  The gate fails loudly instead of passing vacuously. If the store was")
         print("  refactored, update the detection in this script.")
         return 1
+
+    # deep-audit-1046 S-11: the store's change ticker and the two screens that
+    # must follow it, plus the explicit allow-insert guard on the merge.
+    c1 = scan_revision_stream(src)
+    list_raw = read_optional(root, LIST_SCREEN_REL)
+    if list_raw is None:
+        print("SKIP: %s not in this tree — the list-screen criteria do not apply here"
+              % LIST_SCREEN_REL)
+        c2 = ["SKIP: list screen missing"]
+    else:
+        c2 = scan_list_screen_keys(src, list_raw)
+    edit_raw = read_optional(root, EDIT_SCREEN_REL)
+    if edit_raw is None:
+        print("SKIP: %s not in this tree — the edit-screen criteria do not apply here"
+              % EDIT_SCREEN_REL)
+        c3 = ["SKIP: edit screen missing"]
+    else:
+        c3 = scan_edit_screen_revision(src, edit_raw)
+    merge_rel, merge_raw = find_merge_source(root)
+    if merge_raw is None:
+        print("SKIP: no `mergeUpsertTask(` anywhere — the insert-guard criteria do not apply")
+        c4 = ["SKIP: merge source missing"]
+    else:
+        c4 = scan_merge_insert_guard(merge_raw)
+    for name, bad, ok_msg in (
+        ("C1 change ticker", c1,
+         "the store exposes a StateFlow change ticker, bumped only after a landed write"),
+        ("C2 list keys on it", c2,
+         "the list collects the ticker, keys its produceState on it and keeps the "
+         "ON_RESUME re-read"),
+        ("C3 editor follows it", c3,
+         "the editor follows the ticker: a vanished target raises recordMissing and a "
+         "change never rewrites the form's text"),
+        ("C4 insert is opt-in", c4,
+         "mergeUpsertTask's unknown-id branch is guarded by its allow-insert parameter and "
+         "a refusal leaves the document untouched"),
+    ):
+        if bad:
+            for f in bad:
+                if not f.startswith("SKIP"):
+                    findings.append("[%s] %s" % (name, f))
+        else:
+            print("OK (%s): %s" % (name, ok_msg))
 
     if findings:
         for f in findings:

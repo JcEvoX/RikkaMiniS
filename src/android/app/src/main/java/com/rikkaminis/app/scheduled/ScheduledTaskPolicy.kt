@@ -204,10 +204,29 @@ object ScheduledTaskTransitions {
      *
      * An unknown id is appended as-is: a brand-new task has no run state to
      * preserve, and the editor already seeds new tasks disabled (brief §5.4).
+     *
+     * [deep-audit-1046 S-11] `allowInsert` exists because "unknown id" has TWO
+     * meanings and a save must tell them apart. A new task really is unknown
+     * (the editor minted the id a moment ago) — that one appends. An EDIT whose
+     * target vanished is also unknown, and appending it resurrects a record the
+     * user (or a backup restore) has deleted, carrying whatever run state the
+     * form snapshot held (`enabled = prior.enabled`, the last `lastRunDate`, the
+     * previously tripped fuse). So the editing surface passes
+     * `allowInsert = false`: an unknown id then leaves the document untouched
+     * (the very same instance, so `ScheduledTasksStore.mutate` skips the write
+     * and the revision does not bump) and the caller reports the target as
+     * missing instead of pretending the save succeeded.
      */
-    fun mergeUpsertTask(file: ScheduledTasksFile, task: ScheduledTask): ScheduledTasksFile {
+    fun mergeUpsertTask(
+        file: ScheduledTasksFile,
+        task: ScheduledTask,
+        allowInsert: Boolean = true,
+    ): ScheduledTasksFile {
         val idx = file.tasks.indexOfFirst { it.id == task.id }
-        if (idx < 0) return file.copy(tasks = file.tasks + task)
+        if (idx < 0) {
+            if (!allowInsert) return file
+            return file.copy(tasks = file.tasks + task)
+        }
         val existing = file.tasks[idx]
         val merged = existing.copy(
             title = task.title,
@@ -223,4 +242,55 @@ object ScheduledTaskTransitions {
 
     private fun clearMarker(file: ScheduledTasksFile, taskId: String): ScheduledTasksFile =
         if (file.running?.taskId == taskId) file.copy(running = null) else file
+
+    /**
+     * [deep-audit-1046 S-11] Refresh the RUN half of an editor's snapshot.
+     *
+     * The editor keeps `original` as "the record the save is an edit OF": its
+     * spec fields feed nothing (the form's own text state does) but its run
+     * state is what the save carries. When the store publishes a change while
+     * the form is open, only that run half may move — the spec fields the user
+     * is typing must come from the form, never from a refresh, or a background
+     * run settling mid-typing would overwrite the title being edited.
+     */
+    fun refreshRunState(original: ScheduledTask, fresh: ScheduledTask): ScheduledTask =
+        original.copy(
+            enabled = fresh.enabled,
+            lastRunDate = fresh.lastRunDate,
+            lastResult = fresh.lastResult,
+            failStreak = fresh.failStreak,
+            suspendedByFuse = fresh.suspendedByFuse,
+        )
+}
+
+/**
+ * [deep-audit-1046 S-11] Decisions behind [ScheduledTasksStore]'s revision
+ * stream — android-free so JVM tests can pin them with fixed inputs.
+ *
+ * Why a stream at all: every store read is a one-shot `load`, so a screen that
+ * rendered once kept rendering that document forever. The list therefore never
+ * saw a background run settle (`lastRunDate` / `lastResult` / `failStreak`) and
+ * never saw the fuse trip — a suspended task's Resume button only appeared
+ * after an ON_RESUME round-trip through the editor — and the editor never saw
+ * its own target disappear.
+ */
+object ScheduledTaskRevisionPolicy {
+
+    /**
+     * The next revision value. A failed atomic write leaves the file exactly as
+     * it was, so it must NOT bump: a bump would tell every open screen to
+     * re-read a document that cannot have changed (and a retry loop would spin
+     * the whole UI for nothing). Only a write that landed is a change.
+     */
+    fun nextRevision(current: Long, writeSucceeded: Boolean): Long =
+        if (writeSucceeded) current + 1L else current
+
+    /**
+     * "My target is gone" — but only once the form actually loaded something.
+     * On the very first frame the load effect owns the not-found decision; a
+     * refresh that fires before it (e.g. a revision that moved while this screen
+     * was still composing) must not pre-empt it with an empty form.
+     */
+    fun shouldMarkMissing(loadedOnce: Boolean, stillExists: Boolean): Boolean =
+        loadedOnce && !stillExists
 }
