@@ -177,13 +177,27 @@
 | 父提交 | `f7aba218` ✔（`git log --oneline -1` 确认） |
 | 分支 | `fix/dv26-a2-oauth-bridge-refresh` |
 | 提交（代码+门） | `d95f41c3` |
-| CI run | `39949090022`（run #2562） |
-| CI job | `120398876541` |
+| CI run | `39949090022`（run #2562，event=workflow_dispatch） |
+| CI job | `120398876541`（attempt 1，**`conclusion=success`**） |
 | head_sha | `d95f41c37c8f991e5773b70080dea6727a757cac` |
-| 三方 sha 一致 | 本地 HEAD == `git ls-remote` == `run.head_sha` ✔ |
+| 三方 sha 一致 | 本地 HEAD（`d95f41c3`）== `git ls-remote` == `run.head_sha` ✔ |
 | attempt | 1 |
+| 报告提交 | `e35408cb`（源码树与 CI 绿树等价：`git diff --name-only d95f41c3 HEAD -- . ':(exclude)fix-reports'` = **0 文件**） |
 
-（CI 判绿三条：run.head_sha == 本地 HEAD == ls-remote 逐字符；26 步无 failure，唯一 skipped 只允许 `Publish to Releases`；日志 `109 passed, 0 failed` 恰一条 + `ALL 336 CASES PASS` + 编译错 `Z e: ` 0 + 游离 FAILED 0 —— 判读结果见主会话回报。）
+### L4 CI 判读（8/8 全绿，日志 1,430,496 B）
+
+| 判据 | 结果 |
+|---|---|
+| 26 个步骤非 success | **0**（`not_ok_steps=[]`） |
+| 唯一 skipped | `23 Publish to Releases`（main 门控）✔ |
+| `Summary: 109 passed, 0 failed` | 恰 **1** 条（其余 Summary 均为 `0 failed`） |
+| `ALL 336 CASES PASS` | 恰 1 条 |
+| 门头 `[1/109]..[109/109]` | 109 条，序号连续，门名互异 109 |
+| 编译错 `Z e: ` | **0** |
+| 游离 FAILED | **0**（所有含 `FAILED` 的行都是 `PASSED` 用例名子串） |
+| 本门真树 OK 行 | 在册（日志 :846，含新增的 "a token the in-guest CLI refreshed is read back, promoted and persisted …"） |
+| 本门 selftest 牙线 | 在册（:1264 `MCP_OAUTH_LIFECYCLE_SELFTEST=PASS` + :1265 real tree green） |
+| 新增 11 用例 | **11/11 逐条 PASSED** |
 
 ---
 
