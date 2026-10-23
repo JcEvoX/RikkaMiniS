@@ -191,11 +191,32 @@ fun ChatViewModel.promoteDraftIfNeeded(): Boolean {
             promoteInFlight = false
             if (!persisted) {
                 // The durable write did not land: hand the text back to the draft
-                // slot so the next New Chat / process start still finds it. Safe by
-                // the store's own stale-id rule — `saveText` is a no-op when the slot
-                // has been claimed by a DIFFERENT draft in the meantime, so this can
-                // never overwrite text the user typed after the promotion failed.
-                com.rikkaminis.app.data.ComposerDraftStore.saveText(context, draftId, text)
+                // slot so the next New Chat / process start still finds it.
+                //
+                // Two cases, and they need different targets:
+                //
+                //  - the slot is still OURS (the promotion failed before the
+                //    navigation minted a new draft): writing back under [draftId]
+                //    restores the text exactly where it was.
+                //  - the slot has already been re-claimed by the NEW draft the
+                //    navigation opened (the slot doubles as the id allocator, see
+                //    the clearDraft comment above): writing under [draftId] would
+                //    be dropped by the store's stale-id rule, and the text would
+                //    be lost with the abandoned ViewModel. In that case the text
+                //    goes to the CURRENT owner — but only if that owner is still
+                //    empty, so a draft the user has already typed into is never
+                //    overwritten.
+                val currentOwner = com.rikkaminis.app.data.ComposerDraftStore
+                    .activeDraftIds(context)
+                    .firstOrNull()
+                val restoreTarget = currentOwner
+                    ?.takeIf {
+                        com.rikkaminis.app.data.ComposerDraftStore
+                            .restoreText(context, it)
+                            .isEmpty()
+                    }
+                    ?: draftId
+                com.rikkaminis.app.data.ComposerDraftStore.saveText(context, restoreTarget, text)
             }
         }
     }
