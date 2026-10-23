@@ -675,18 +675,37 @@ private suspend fun performTest(
  * synthesizeToFile already writes a WAV container. Returns null on any
  * engine/init failure (caller reports a friendly message). 15 s guard so a
  * stuck engine can't hang the test card forever.
+ *
+ * [dv26/G10] "Nothing may be written after cancellation" is one explicit latch.
+ * Before it, a cancelled call (15 s timeout, or the sheet dismissed while the
+ * engine was still initialising) ran `invokeOnCancellation` + the `finally`
+ * delete, and THEN the late `TextToSpeech(context) { … }` init callback reached
+ * `synthesizeToFile(...)` — writing `quicktest-clip-<ts>.wav` back into cacheDir
+ * with nobody left to delete it. Every side effect below is gated through
+ * [SynthClipPolicy]; the three delete sites cover the three ways a clip can
+ * outlive the caller (exit path, cancel path, callback that lands after cancel).
  */
 private suspend fun synthesizeTestClip(context: android.content.Context, text: String): ByteArray? {
     val file = java.io.File(context.cacheDir, "quicktest-clip-${System.currentTimeMillis()}.wav")
+    // Flipped only by the cancellation path below; read by the init callback,
+    // the synth dispatch and the progress callbacks (all main-looper callbacks).
+    val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
     return try {
         kotlinx.coroutines.withTimeoutOrNull(15_000) {
             kotlinx.coroutines.suspendCancellableCoroutine { cont ->
                 var tts: android.speech.tts.TextToSpeech? = null
                 fun finish(ok: Boolean) {
                     runCatching { tts?.shutdown() }
+                    // A callback landing after cancellation is a late write: the
+                    // clip is on disk and no caller will ever read it.
+                    if (SynthClipPolicy.mustDropOnCallback(cancelled.get())) runCatching { file.delete() }
                     if (cont.isActive) cont.resumeWith(Result.success(ok))
                 }
                 tts = android.speech.tts.TextToSpeech(context) { status ->
+                    if (!SynthClipPolicy.mayTouchEngine(cancelled.get())) {
+                        runCatching { tts?.shutdown() }
+                        return@TextToSpeech
+                    }
                     if (status != android.speech.tts.TextToSpeech.SUCCESS) {
                         finish(false)
                         return@TextToSpeech
@@ -701,10 +720,23 @@ private suspend fun synthesizeTestClip(context: android.content.Context, text: S
                             override fun onError(utteranceId: String?, errorCode: Int) = finish(false)
                         },
                     )
+                    // The request can be cancelled between the init callback and
+                    // this line — re-check right before the write.
+                    if (!SynthClipPolicy.maySynthesize(cancelled.get())) {
+                        runCatching { tts?.shutdown() }
+                        return@TextToSpeech
+                    }
                     val result = tts?.synthesizeToFile(text, android.os.Bundle(), file, "quicktest-clip")
                     if (result != android.speech.tts.TextToSpeech.SUCCESS) finish(false)
                 }
-                cont.invokeOnCancellation { runCatching { tts?.shutdown() } }
+                cont.invokeOnCancellation {
+                    cancelled.set(true)
+                    runCatching { tts?.shutdown() }
+                    // The engine can have finished the write between the dispatch
+                    // and this cancellation, and the `finally` below may run
+                    // before that write lands — drop the clip again here.
+                    runCatching { file.delete() }
+                }
             }
         }?.takeIf { it }?.let { file.readBytes() }
     } catch (e: Exception) {
