@@ -165,7 +165,11 @@ val page by produceState<Bitmap?>(
 
 ### L4 CI
 
-见 §6。
+- **run `39993443358`**（job `120550780583`）@ `6825f9fd` —— attempt 1 **success**，26 步 `not_ok=[]`，唯一 skipped = `Publish to Releases`（main 门控），`Summary: 111 passed, 0 failed` 恰一条、门头 `[1/111]..[111/111]` 连续 111、`ALL 340 CASES PASS` 恰一条、` e: ` **0**、游离 FAILED **0**。
+  **但本支新增的两个测试文件有 2 条 `w:` 可空性警告**（`FilePreviewPdfKeyAndSaveTest.kt:218:47` / `AddToHomeSafBoundedReadTest.kt:123:47`，`System.getProperty("user.dir")` 返回可空）⇒ **CI 绿 ≠ 没有警告**，单独提交 `548354d4` 修掉并重跑。
+- **run `39995646395`**（job `120558355500`）@ `548354d4` —— attempt 1 **success**，同样 26 步 `not_ok=[]`、唯一 skipped = Publish、`Summary: 111 passed, 0 failed` 恰一条、门头 111 连续、`ALL 340 CASES PASS`、` e: ` **0**、**本支文件警告 0**、游离 FAILED 0。
+- **三方 sha 逐字符一致**：本地 HEAD = `git ls-remote` = `run.head_sha` = `548354d4912e5fb0e1f91931da2608c0cbb4b4de`。
+- **新增用例逐条 PASSED 13/13**（`SaveOutcomeTest` 5 + `FilePreviewPdfKeyAndSaveTest` 5 + `AddToHomeSafBoundedReadTest` 3）。
 
 ---
 
