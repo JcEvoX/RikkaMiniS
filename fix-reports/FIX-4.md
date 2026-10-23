@@ -276,11 +276,31 @@ Agent 跑 `minis-config set session.thinkingLevel high` / `session.primaryModel 
 |---|---|
 | 基线 main | `f94413f52fa5403c903902f6b1d2ae10cb9bc906` |
 | 分支 | `fix/dv24-a4-config-session-writethrough` |
-| 提交 | `b7979890` 生产 · `0f5897e7` 测试 · `2451a671` 门 · 报告（本文件） |
-| 本地 HEAD | 见回报（报告提交后） |
-| `git ls-remote origin <branch>` | 见回报 |
-| CI `run.head_sha` | 见回报 |
-| CI run / conclusion | 见回报 |
+| 提交 | `b7979890` 生产 · `0f5897e7` 测试 · `2451a671` 门 · `9a002abf` 报告 |
+| 本地 `git rev-parse HEAD` | `9a002abfdfc5826b703f08004bef95ecb14ea119` |
+| `git ls-remote origin <branch>` | `9a002abfdfc5826b703f08004bef95ecb14ea119` |
+| CI `run.head_sha` | `9a002abfdfc5826b703f08004bef95ecb14ea119` |
+| **三方逐字符一致** | **是** |
+| CI run / job | `39895387909` / job `120224504654`（attempt 1） |
+| 结论 | **success**；26 步、唯一 `skipped` = 步骤 23 `Publish to Releases`（main 门控，符合预期）、非 success 步 **0** |
+| 日志 | 1,390,811 B |
+
+### CI 日志判读（逐条取证，不看结论就信）
+
+| 判据 | 实测 |
+|---|---|
+| 门头 | `[1/109]`..`[109/109]` **109 条、序号连续、显示名 109 个互异** |
+| 门总表 | **恰好一条** `Summary: 109 passed, 0 failed`；其余 7 条为门内子集汇总，`failed` 全 0 |
+| 门夹具 | `✅ ALL 336 CASES PASS` |
+| 本门在册 | `━━━ [105/109] provider_rpc_symmetry_check ━━━`，绿行含「C18 session config write-through to the resident view model」；`✅ provider_rpc_symmetry_check selftest has teeth (PROVIDER_RPC_SELFTEST=PASS)`；`✅ provider_rpc_symmetry_check real tree green` |
+| 编译 | 含 `Z e: ` 的 Kotlin 错误行 **0** |
+| 新用例 | `SessionConfigTargetTest` **8 条 PASSED**、`SessionConfigWriteThroughTest` **6 条 PASSED** |
+| 游离 FAILED | 日志含 `FAILED` 的 6 行**逐条确认全是以 PASSED 结尾的既有用例名子串**（`RealAgentAdapterSkeletonTest` / `ChatAgentTraceObserverSchemaTest` ×4 / `TerminalErrorSurfacedTest`），无一条真失败 |
+
+**报告回填后的源码树等价**：本文件在 CI 绿（`9a002abf`）之后又追加了本节，
+故当前 HEAD 与「CI 验过的 sha」不同。证据 = `git diff --name-only 9a002abf HEAD -- . ':(exclude)fix-reports'`
+输出为空（唯一差异 `fix-reports/FIX-4.md`，不在 workflow `paths` 内、不参与构建）；
+`git diff --name-only 9a002abf HEAD` 只有 `fix-reports/FIX-4.md` 一行。⇒ CI 结论对当前源码树成立，无需重跑。
 
 **判读口径**（COMMON §4）：`conclusion == success` **且** 三方 `head_sha` 逐字符一致；
 `Summary:` 行带框线前缀；skip 与否看 steps API 不在日志文本里 grep。
