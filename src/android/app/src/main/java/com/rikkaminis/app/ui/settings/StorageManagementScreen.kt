@@ -118,6 +118,29 @@ private object StorageSnapshotCache {
     var snapshot: StorageSnapshot? = null
 }
 
+/**
+ * [deep-audit-1045 B-03] The ONLY way to drop the cached scan.
+ *
+ * Everything that changes what this page measures has to come through here, and
+ * one family of them did not: installing / repairing / resetting the rootfs
+ * rewrites the entire shell tree, but nothing told the Storage screen. Inside
+ * the freshness window the re-entry rendered the stale snapshot and returned
+ * without scanning; past it, the rescan STILL reused it (the old rootfs gate was
+ * `StorageSnapshotCache.snapshot != null`), copying the cached `shellSize` into
+ * the new snapshot by reading it back out of Compose state — so the "Terminal
+ * Shell" row was pinned for the life of the process. Install a 200 MB rootfs
+ * over an empty one and it kept reading "0 B".
+ *
+ * `internal` rather than `private` on purpose: `RootfsManagementViewModel` lives
+ * in `ui.sandbox` and must reach it, while the cache object itself stays private
+ * to this file. Keeping this the single clearing site is the point — a second
+ * `StorageSnapshotCache.snapshot = null` somewhere is how the next mutation path
+ * would come to miss it.
+ */
+internal fun invalidateStorageSnapshot() {
+    StorageSnapshotCache.snapshot = null
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun StorageManagementScreen(
@@ -173,12 +196,6 @@ fun StorageManagementScreen(
                 orphanInfo = cached.orphanInfo
                 isSizingSessions = false
                 isScanningOrphans = false
-                if (System.currentTimeMillis() - cached.scannedAt < SNAPSHOT_STALE_MS) {
-                    return@launch // fresh enough — not worth the rescan storm
-                }
-                // Stale: wait out the nav transition before the background
-                // rescan so it never overlaps the animation frames.
-                delay(RESCAN_DELAY_MS)
             } else {
                 // Reset state so a first entry / forced scan shows a skeleton.
                 isSizingSessions = true
@@ -186,7 +203,33 @@ fun StorageManagementScreen(
                 isScanningOrphans = true
                 orphanInfo = null
             }
-            withContext(Dispatchers.IO) {
+            // [deep-audit-1045 B-03] The freshness gate moved into
+            // [decideScan] (pure, JVM-testable) — the 3-minute contract and the
+            // "stale re-entry waits out the transition" timing are its arms.
+            when (decideScan(
+                cachedAt = cached?.scannedAt,
+                force = force,
+                now = System.currentTimeMillis(),
+                staleMs = SNAPSHOT_STALE_MS,
+            )) {
+                StorageScanDecision.Reuse -> return@launch // fresh enough — not worth the rescan storm
+                // Stale: wait out the nav transition before the background
+                // rescan so it never overlaps the animation frames.
+                StorageScanDecision.RescanDeferred -> delay(RESCAN_DELAY_MS)
+                StorageScanDecision.RescanNow -> Unit
+            }
+            // [deep-audit-1045 B-03] The IO block now only COMPUTES the next
+            // snapshot and returns it as a value; every Compose state write is
+            // below it, on this coroutine's own dispatcher (the composition
+            // Main dispatcher, via rememberCoroutineScope). The defect was
+            // exactly the opposite: six `mutableState*` variables were assigned
+            // from inside `withContext(Dispatchers.IO)`. Compose state has no
+            // cross-thread happens-before with the frame that renders it, and
+            // two overlapping reloads could interleave their assignments, so
+            // the rows, the totals and the cached snapshot could each belong to
+            // a different scan. House shape: LogManagementScreen /
+            // UsageStatsScreen ("IO computes, Main publishes").
+            val scanned = withContext(Dispatchers.IO) {
                 // [rootfs-usage-v1] Real on-disk footprint (lstat + st_blocks,
                 // no symlink following, hardlink dedupe). The old recursive
                 // walkTopDown()+length() double-counted versioned .so symlinks
@@ -196,22 +239,32 @@ fun StorageManagementScreen(
                 // this process has no cached rootfs values; a refresh reuses
                 // them (installed packages / scaffolding change slowest on the
                 // page). ROOTFS_MANAGEMENT shows its own live scan.
-                if (StorageSnapshotCache.snapshot == null) {
-                    val report = com.rikkaminis.app.sandbox.RootfsUsageScanner.scan(
-                        File(context.filesDir, "alpine-rootfs"),
-                        com.rikkaminis.app.sandbox.RootfsUsageScanner.androidStat(),
-                    )
-                    shellSize = report.totalBytes
-                    // Only surface buckets that can actually explain a large
-                    // footprint. A rootfs has ~15 top-level dirs and most are
-                    // filesystem scaffolding (/bin, /etc, /run, /srv … a few KB
-                    // to 1 MB); listing them all buries the two that matter
-                    // (/tmp scratch files and /usr installed packages).
-                    shellBreakdown = report.entries
-                        .filter { it.bytes >= 8L * 1024 * 1024 }
-                        .take(8)
-                }
-                dbSize = databaseSize(context)
+                // Carried from the CACHE and never from the state published
+                // above: that state is still 0 until this screen instance has
+                // published once, so reading it here is what zeroed the shell
+                // row when a forced refresh arrived with a warm cache.
+                // Re-read the cache instead of reusing the `cached` captured
+                // before the delay: a rootfs install / repair / reset that
+                // invalidated it during RESCAN_DELAY_MS must win, or the stale
+                // total would be carried into the snapshot this scan is about
+                // to publish. A read of the @Volatile holder — no state write.
+                val shell: Pair<Long, List<com.rikkaminis.app.sandbox.RootfsUsageScanner.Entry>> =
+                    StorageSnapshotCache.snapshot?.let { it.shellSize to it.shellBreakdown }
+                        ?: com.rikkaminis.app.sandbox.RootfsUsageScanner.scan(
+                            File(context.filesDir, "alpine-rootfs"),
+                            com.rikkaminis.app.sandbox.RootfsUsageScanner.androidStat(),
+                        ).let { report ->
+                            // Only surface buckets that can actually explain a
+                            // large footprint. A rootfs has ~15 top-level dirs
+                            // and most are filesystem scaffolding (/bin, /etc,
+                            // /run, /srv … a few KB to 1 MB); listing them all
+                            // buries the two that matter (/tmp scratch files and
+                            // /usr installed packages).
+                            report.totalBytes to report.entries
+                                .filter { it.bytes >= 8L * 1024 * 1024 }
+                                .take(8)
+                        }
+                val dbBytes = databaseSize(context)
 
                 val allSessions = chatRepository.dao.listSessions()
                 val liveIds = allSessions.map { it.id }.toSet()
@@ -220,14 +273,13 @@ fun StorageManagementScreen(
                 // walked the whole media tree twice per entry.
                 val mediaScan = sessionFiles.scanMediaOnce(liveIds)
                 val mediaSizes = mediaScan.liveSizes
-                sessionCount = allSessions.size
 
                 // [B] Scan for leftover dirs whose session no longer exists
                 // (measure only — nothing is deleted until the user confirms).
                 // Session-root part here; the media part came from the walk
                 // above.
                 val orphanSessionPart = sessionFiles.scanOrphanSessionDirs(liveIds)
-                orphanInfo = SessionFileStore.ReclaimReport(
+                val orphans = SessionFileStore.ReclaimReport(
                     sessionIds = orphanSessionPart.sessionIds,
                     sessionDirs = orphanSessionPart.sessionDirs,
                     sessionBytes = orphanSessionPart.sessionBytes,
@@ -242,7 +294,7 @@ fun StorageManagementScreen(
                 // equal number of concurrent recursive walks (one per IO thread
                 // up to the dispatcher pool), causing a sizing IO storm on
                 // entry. Capping at 8 keeps the list fast without saturating IO.
-                sessions = coroutineScope {
+                val sized = coroutineScope {
                     val gate = Semaphore(8)
                     allSessions.map { session ->
                         async {
@@ -261,17 +313,25 @@ fun StorageManagementScreen(
                     }.awaitAll()
                 }.sortedByDescending { it.totalSize }
 
-                // Cache the fresh scan so the next re-entry renders instantly.
-                StorageSnapshotCache.snapshot = StorageSnapshot(
-                    shellSize = shellSize,
-                    shellBreakdown = shellBreakdown,
-                    dbSize = dbSize,
-                    sessionCount = sessionCount,
-                    sessions = sessions,
-                    orphanInfo = orphanInfo,
+                StorageSnapshot(
+                    shellSize = shell.first,
+                    shellBreakdown = shell.second,
+                    dbSize = dbBytes,
+                    sessionCount = allSessions.size,
+                    sessions = sized,
+                    orphanInfo = orphans,
                     scannedAt = System.currentTimeMillis(),
                 )
             }
+            // Cache the fresh scan so the next re-entry renders instantly, then
+            // publish it. Both on Main, in one place, from ONE scan.
+            StorageSnapshotCache.snapshot = scanned
+            shellSize = scanned.shellSize
+            shellBreakdown = scanned.shellBreakdown
+            dbSize = scanned.dbSize
+            sessionCount = scanned.sessionCount
+            sessions = scanned.sessions
+            orphanInfo = scanned.orphanInfo
             isScanningOrphans = false
             isSizingSessions = false
         }
@@ -488,7 +548,7 @@ fun StorageManagementScreen(
                         // snapshot: the pre-reclaim scan must not be re-rendered
                         // by the freshness gate (it still lists the just-reclaimed
                         // orphans), and the rescan must not be skipped.
-                        StorageSnapshotCache.snapshot = null
+                        invalidateStorageSnapshot()
                         reload(force = true)
                     }
                 }) {
@@ -524,11 +584,19 @@ fun SessionStorageDetailScreen(
 
     fun reload() {
         scope.launch {
-            withContext(Dispatchers.IO) {
-                session = chatDao.getSession(sessionId)
-                minisSize = sessionFiles.sizeOf(sessionFiles.sessionDir(sessionId))
-                mediaSize = sessionFiles.mediaSize(sessionId)
+            // [deep-audit-1045 B-03] IO computes, Main publishes — same shape as
+            // the list screen's scan above. All three of these are Compose
+            // state, and all three used to be assigned from the IO dispatcher.
+            val (loaded, minisBytes, mediaBytes) = withContext(Dispatchers.IO) {
+                Triple(
+                    chatDao.getSession(sessionId),
+                    sessionFiles.sizeOf(sessionFiles.sessionDir(sessionId)),
+                    sessionFiles.mediaSize(sessionId),
+                )
             }
+            session = loaded
+            minisSize = minisBytes
+            mediaSize = mediaBytes
         }
     }
 
@@ -632,11 +700,13 @@ fun SessionStorageDetailScreen(
                         // blindly zeroing — if a file was held open (or a mount
                         // read-only) and deleteRecursively() partially failed,
                         // the sizes stay truthful rather than showing a fake 0 B.
-                        withContext(Dispatchers.IO) {
+                        val (minisBytes, mediaBytes) = withContext(Dispatchers.IO) {
                             sessionFiles.deleteSessionFiles(sessionId)
-                            minisSize = sessionFiles.sizeOf(sessionFiles.sessionDir(sessionId))
-                            mediaSize = sessionFiles.mediaSize(sessionId)
+                            sessionFiles.sizeOf(sessionFiles.sessionDir(sessionId)) to
+                                sessionFiles.mediaSize(sessionId)
                         }
+                        minisSize = minisBytes
+                        mediaSize = mediaBytes
                         // [storage-rescan-jank] Same invalidation the orphan
                         // reclaim flow does above, for the same reason: the list
                         // screen's freshness gate renders the cached snapshot for
@@ -645,7 +715,7 @@ fun SessionStorageDetailScreen(
                         // (user report: cleared a 70 MB session, list still said
                         // 70 MB). Only on the success path — a failed delete leaves
                         // the snapshot alone, since it is still accurate.
-                        StorageSnapshotCache.snapshot = null
+                        invalidateStorageSnapshot()
                         isClearing = false
                     }
                 }) {

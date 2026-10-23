@@ -7,6 +7,7 @@ import com.rikkaminis.app.R
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.sandbox.RootfsInstallState
 import com.rikkaminis.app.sandbox.RootfsManager
+import com.rikkaminis.app.ui.settings.invalidateStorageSnapshot
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -357,6 +358,15 @@ class RootfsManagementViewModel : ViewModel() {
         )
 
         val manager = RootfsManager.getInstance(ctx)
+        // [deep-audit-1045 B-03] An install rewrites the shell tree, so the
+        // Storage page's process-lifetime scan is stale from this moment on and
+        // nothing used to say so: the list screen kept serving the cached
+        // `shellSize` for the life of the process (see
+        // [invalidateStorageSnapshot]). Dropped BEFORE the mutation starts, not
+        // on the success path — a failed or interrupted install can already have
+        // written files, and a crash between the mutation and the drop would
+        // leave the old total pinned.
+        invalidateStorageSnapshot()
         observeInstallProgress(manager, ctx)
         viewModelScope.launch {
             try {
@@ -384,6 +394,10 @@ class RootfsManagementViewModel : ViewModel() {
         )
 
         val manager = RootfsManager.getInstance(ctx)
+        // [deep-audit-1045 B-03] Same as install(): `reset()` deletes the whole
+        // rootfs directory before it re-extracts, so the cached shell total is
+        // stale even if the operation fails halfway.
+        invalidateStorageSnapshot()
         observeInstallProgress(manager, ctx)
         viewModelScope.launch {
             try {
@@ -453,6 +467,13 @@ class RootfsManagementViewModel : ViewModel() {
             // its own, unrelated job: gating frames, not adjudicating a
             // verdict) and before `autoRepair()`, i.e. before anything this
             // operation does can publish.
+            // [deep-audit-1045 B-03] Same reason as install(), and deliberately
+            // AFTER the `healthy` early-return above: `autoRepair()` can reach
+            // Stage 3's full reset, so the cached shell total is stale from here
+            // on — but a repair that found nothing to do changes nothing, and
+            // must not cost the Storage page its cache (that cache is the whole
+            // reason the ~125k-entry rootfs walk stays off the nav transition).
+            invalidateStorageSnapshot()
             val priorTerminal = manager.installState.value
             observeInstallProgress(manager, ctx)
             try {
