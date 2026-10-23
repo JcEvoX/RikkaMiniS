@@ -64,6 +64,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.res.stringResource
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
@@ -198,6 +199,11 @@ object MirrorSpeedTestViewModel {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     @Volatile private var currentJob: Job? = null
+    // [dv25-B1] First-boot auto-detection settles long after the run it reuses
+    // has finished, so it needs a job slot of its own: a user-initiated test
+    // cancels this (runAllTests / runTest) and the settlement re-checks that it
+    // is still the owner before touching the selection maps.
+    @Volatile private var autoDetectJob: Job? = null
 
     // Observable state — Compose observes these Snapshot-backed maps.
     val results: SnapshotStateMap<MirrorCategory, List<MirrorTestResult>> = mutableStateMapOf()
@@ -253,8 +259,27 @@ object MirrorSpeedTestViewModel {
     // -- Speed Test --
 
     fun runAllTests(context: Context) {
+        // [dv25-B1] A user-initiated run invalidates an in-flight first-boot
+        // auto-detection: its settlement writes the same maps, prefs and rootfs
+        // config, so a stale detector would overwrite the mirror this run is
+        // about to pick. autoDetectOnceIfNeeded calls startAllTests directly —
+        // cancelling here would cancel the job it is running in.
+        autoDetectJob?.cancel()
+        startAllTests(context)
+    }
+
+    /**
+     * Shared body of [runAllTests] and [autoDetectOnceIfNeeded] (the boot path
+     * reuses the normal test flow). Separate from the public entry point because
+     * only a user tap may preempt auto-detection.
+     */
+    private fun startAllTests(context: Context) {
         currentJob?.cancel()
-        currentJob = scope.launch {
+        // [dv25-B1] LAZY + explicit start publishes `currentJob` *before* the
+        // body can read it — the settlement/finally ownership checks compare
+        // against this field, and a plain `scope.launch` dispatches the body
+        // before the assignment lands.
+        val job = scope.launch(start = CoroutineStart.LAZY) {
             // T10-L8: capture this job so the finally block can tell whether a
             // newer run already replaced it. A cancelled predecessor's reset
             // could otherwise land *after* the successor set isTesting = true,
@@ -293,6 +318,12 @@ object MirrorSpeedTestViewModel {
                 val sorted = perCategory.mapValues { (_, list) -> list.sortedWith(latencyComparator) }
                 val autoApplied = mutableListOf<MirrorCategory>()
                 withContext(Dispatchers.Main) {
+                    // [dv25-B1] A superseded run must not settle: its results
+                    // belong to a cancelled attempt and would replace the
+                    // successor's map plus its auto-selection. Cancellation
+                    // normally stops this dispatch; the identity check covers
+                    // the case where the job was replaced without cancelling.
+                    if (currentJob !== self) return@withContext
                     results.clear()
                     results.putAll(sorted)
 
@@ -325,11 +356,16 @@ object MirrorSpeedTestViewModel {
                 }
             }
         }
+        currentJob = job
+        job.start()
     }
 
     fun runTest(context: Context, category: MirrorCategory) {
+        // [dv25-B1] Same preemption as runAllTests: a single-category test is a
+        // user-initiated run too, and must invalidate a pending auto-detection.
+        autoDetectJob?.cancel()
         currentJob?.cancel()
-        currentJob = scope.launch {
+        val job = scope.launch(start = CoroutineStart.LAZY) {
             // T10-L8: same identity guard as runAllTests.
             val self = coroutineContext[Job]
             withContext(Dispatchers.Main) {
@@ -367,6 +403,9 @@ object MirrorSpeedTestViewModel {
                 // made the truncation invisible.
                 val autoApplied = mutableListOf<MirrorCategory>()
                 withContext(Dispatchers.Main) {
+                    // [dv25-B1] Same ownership gate as runAllTests: a run that a
+                    // newer one replaced must not write its older results.
+                    if (currentJob !== self) return@withContext
                     this@MirrorSpeedTestViewModel.results[category] = sorted
                     for ((cat, fastest) in autoSelectFastest(mapOf(category to sorted)) { selectedMirrorId[it] != null }) {
                         selectedMirrorId[cat] = fastest.mirror.id
@@ -391,6 +430,8 @@ object MirrorSpeedTestViewModel {
                 }
             }
         }
+        currentJob = job
+        job.start()
     }
 
     private val latencyComparator = Comparator<MirrorTestResult> { a, b ->
@@ -475,15 +516,38 @@ object MirrorSpeedTestViewModel {
         p.edit().remove("rootfs.freshInstall").apply()
         Log.i(TAG, "Fresh rootfs detected — running auto mirror detection")
 
-        scope.launch {
-            // Reuse the normal test flow, then await its completion via currentJob.
-            runAllTests(context)
+        // [dv25-B1] The detector owns its own job. Before this the coroutine was
+        // a bare `scope.launch`, so the only cancellation target was the inner
+        // runAllTests job: a user tap cancelled that inner job, `join()` returned
+        // immediately on it, and this coroutine settled anyway — overwriting the
+        // mirror the user had just picked by hand (selectMirror writes the same
+        // maps, prefs and rootfs config).
+        autoDetectJob?.cancel()
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            val self = coroutineContext[Job]
+            // A run the user started wins over first-boot convenience: detection
+            // only fills a gap, so it must never cancel work already in flight.
+            if (currentJob?.isActive == true) {
+                Log.i(TAG, "Auto mirror detection skipped: a speed test is already in flight")
+                return@launch
+            }
+            // Reuse the normal test flow — startAllTests, not runAllTests: the
+            // public entry point cancels auto-detection first, which here would
+            // be the job this very coroutine is running in.
+            startAllTests(context)
             currentJob?.join()
             val toApply = mutableListOf<MirrorCategory>()
             withContext(Dispatchers.Main) {
-                for (cat in MirrorCategory.entries) {
-                    val fastest = results[cat]?.firstOrNull { it.isSuccess } ?: continue
-                    if (fastest.mirror.isOfficial) continue
+                // Ownership gate: a detector superseded by a user tap must not
+                // settle. It sits inside the main-thread block so it cannot
+                // interleave with the user's own selectMirror writes below.
+                if (autoDetectJob !== self) return@withContext
+                // First-boot detection is a convenience, not a decision: a
+                // category the user already picked keeps its mirror — the same
+                // "prior selection wins" predicate the user-initiated path hands
+                // to autoSelectFastest.
+                val alreadySelected = selectedMirrorId.keys.toSet()
+                for ((cat, fastest) in decideAutoApply(results.toMap(), alreadySelected)) {
                     selectedMirrorId[cat] = fastest.mirror.id
                     useCustomMirror[cat] = true
                     persist(context, cat)
@@ -497,6 +561,8 @@ object MirrorSpeedTestViewModel {
             for (cat in toApply) applyMirror(context, cat)
             Log.i(TAG, "Auto mirror detection applied")
         }
+        autoDetectJob = job
+        job.start()
     }
 
     /**
@@ -652,6 +718,30 @@ internal fun autoSelectFastest(
         if (hasPriorSelection(cat)) return@mapNotNull null
         sorted[cat]?.firstOrNull { it.isSuccess }?.let { cat to it }
     }
+
+/**
+ * [dv25-B1] Pure decision for first-boot auto-detection: which categories the
+ * detector may apply, and with which mirror.
+ *
+ * Two properties, both load-bearing:
+ *  - a category in [alreadySelected] is skipped. Detection runs on the boot
+ *    path, so the user may already have picked a mirror by hand — and
+ *    `selectMirror` writes the same maps, prefs and rootfs config, so an
+ *    unguarded detector silently overwrote that choice. The predicate is the
+ *    one the user-initiated path already hands [autoSelectFastest];
+ *  - the official CDN is never chosen: on first boot it is what the config
+ *    already points at, not a discovery result.
+ *
+ * Dependency-free like [autoSelectFastest], so the JVM test source set can
+ * exercise it without Compose. The caller performs the state writes,
+ * persistence and the applyMirror disk IO.
+ */
+internal fun decideAutoApply(
+    results: Map<MirrorCategory, List<MirrorTestResult>>,
+    alreadySelected: Set<MirrorCategory>,
+): List<Pair<MirrorCategory, MirrorTestResult>> =
+    autoSelectFastest(results) { it in alreadySelected }
+        .filterNot { (_, fastest) -> fastest.mirror.isOfficial }
 
 /**
  * Body-only rows (no section header) for embedding inside an outer
