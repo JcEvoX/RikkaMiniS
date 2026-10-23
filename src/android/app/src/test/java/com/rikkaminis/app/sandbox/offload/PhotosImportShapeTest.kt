@@ -3,6 +3,7 @@ package com.rikkaminis.app.sandbox.offload
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import com.rikkaminis.app.util.lowercaseIntentScheme
 import org.junit.Test
 import java.io.File
 import java.io.FileNotFoundException
@@ -23,6 +24,7 @@ class PhotosImportShapeTest {
 
     private val photos = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/PhotosOffloadHandler.kt"
     private val open = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/OpenOffloadHandler.kt"
+    private val sanitizer = "src/android/app/src/main/java/com/rikkaminis/app/util/IntentSanitizer.kt"
 
     // ── A: import path resolution ─────────────────────────────────────────
 
@@ -85,28 +87,49 @@ class PhotosImportShapeTest {
         // marker was `Intent.parseUri(url, …)`, which the scheme normalisation
         // rewrote to `Intent.parseUri(lowercaseIntentScheme(url), …)`. Bind the
         // declaration that OWNS the decision, not the call spelling.
+        //
+        // [deep-audit-1046 FIX-F9] The strip sequence moved OUT of this file
+        // into the shared `IntentSanitizer` (the browser handler had a second,
+        // much weaker copy: `selector = null` only). So the pin splits in two,
+        // and it got STRONGER: `tryOpen` must delegate, and the shared body —
+        // the only implementation left — must carry every guard.
         val body = declarationSlice(readRepoFile(open), "private fun tryOpen(")
+        assertTrue(
+            "tryOpen must route the parsed intent through the shared sanitizer",
+            body.contains("IntentSanitizer.sanitize(this, context)"),
+        )
+        assertFalse(
+            "a second copy of the strip sequence came back in tryOpen",
+            body.contains("removeFlags("),
+        )
+        assertTrue(body.contains("FLAG_ACTIVITY_NEW_TASK"))
+
+        val shared = declarationSlice(readRepoFile(sanitizer), "fun sanitize(")
         for (flag in listOf(
             "FLAG_GRANT_READ_URI_PERMISSION",
             "FLAG_GRANT_WRITE_URI_PERMISSION",
             "FLAG_GRANT_PERSISTABLE_URI_PERMISSION",
             "FLAG_GRANT_PREFIX_URI_PERMISSION",
         )) {
-            assertTrue("grant flag not stripped: $flag", body.contains(flag))
+            assertTrue("grant flag not stripped: $flag", shared.contains(flag))
         }
-        assertTrue(body.contains("removeFlags("))
-        assertTrue(body.contains("clipData = null"))
-        assertTrue(body.contains("component?.packageName == context.packageName) component = null"))
+        assertTrue(shared.contains("removeFlags("))
+        assertTrue(shared.contains("clipData = null"))
+        assertTrue(
+            "same-package `component=` target not stripped",
+            shared.contains("isSelfTarget(componentPackage, context.packageName)) intent.component = null"),
+        )
         // [deep-audit-1041 FIX-A6] `Intent.parseUri` writes `package=` into
         // `getPackage()`, so the component check above never saw it — a
         // same-package package target pins resolution to this app too.
         assertTrue(
             "same-package `package=` target not stripped",
-            body.contains("getPackage() == context.packageName) setPackage(null)"),
+            shared.contains("isSelfTarget(pinnedPackage, context.packageName)) intent.setPackage(null)"),
         )
         // No regression of the historical behaviour:
-        assertTrue(body.contains("FLAG_ACTIVITY_NEW_TASK"))
-        assertTrue(body.contains("selector = null"))
+        assertTrue(shared.contains("selector = null"))
+        // ...and the third-party target must survive: both strips stay guarded
+        // by the `isSelfTarget(...)` checks asserted above.
     }
 
     @Test
