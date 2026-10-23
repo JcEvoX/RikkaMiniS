@@ -523,9 +523,18 @@ fun BackupSettingsScreen(
         // [audit-0909] SAF pick callback runs on the Main thread; the file
         // read below can be tens of MB (auto-backup files embed the artifact
         // zip), so hop the read to IO — same fix shape as the snapshot-restore
-        // dialog (568d87a). The query for byte size is a cheap metadata call
-        // and stays inline; errorMessage is Compose state, so it is written
+        // dialog (568d87a). errorMessage is Compose state, so it is written
         // back on this Main-dispatcher scope.
+        //
+        // [deep-audit-1047 B-02] Two holes were left by that hop:
+        //  * the `OpenableColumns.SIZE` query (a cross-process IPC) stayed
+        //    inline on Main — it is now inside the same IO block as the read;
+        //  * the declared size was the ONLY bound. A provider that reports no
+        //    size (or lies about it) fell through to `readBytes()` and pulled
+        //    the whole file into the heap, and a lying `SIZE` under the cap did
+        //    the same. The read now goes through [readSafBytes], which keeps
+        //    the declared-size precheck as a cheap early reject AND caps the
+        //    stream itself one byte past MAX_PAYLOAD_BYTES.
         scope.launch {
             try {
                 // [T-backup-import-memory] Reject oversized files BEFORE pulling
@@ -536,22 +545,28 @@ fun BackupSettingsScreen(
                 // for large backups. Byte size is a conservative bound (chars ≤
                 // bytes for UTF-8), so a file that passes here still gets the
                 // exact char check during import.
-                val sizeBytes = context.contentResolver.query(
-                    uri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null,
-                )?.use { c ->
-                    if (c.moveToFirst()) {
-                        val idx = c.getColumnIndex(android.provider.OpenableColumns.SIZE)
-                        if (idx >= 0 && !c.isNull(idx)) c.getLong(idx) else null
-                    } else null
-                }
-                if (sizeBytes != null &&
-                    sizeBytes > com.rikkaminis.app.backup.ConfigBackup.MAX_PAYLOAD_BYTES
-                ) {
-                    val mb = sizeBytes / (1024 * 1024)
-                    val maxMb = com.rikkaminis.app.backup.ConfigBackup.MAX_PAYLOAD_BYTES / (1024 * 1024)
-                    throw IllegalStateException(
-                        context.getString(R.string.backup_import_too_large, mb, maxMb),
-                    )
+                val bytes = withContext(Dispatchers.IO) {
+                    when (val read = readSafBytes(
+                        context.contentResolver,
+                        uri,
+                        ConfigBackup.MAX_PAYLOAD_BYTES.toLong(),
+                    )) {
+                        is SafRead.Ok -> read.bytes
+                        SafRead.TooLarge -> {
+                            // The verdict is already made on the STREAM; the
+                            // declared size is re-read only for the wording, and
+                            // falls back to the cap when the provider reported
+                            // nothing (that is exactly the case a declared-only
+                            // check used to let through).
+                            val declared = querySafSize(context.contentResolver, uri)
+                            val mb = (declared ?: ConfigBackup.MAX_PAYLOAD_BYTES.toLong()) / (1024 * 1024)
+                            val maxMb = ConfigBackup.MAX_PAYLOAD_BYTES / (1024 * 1024)
+                            throw IllegalStateException(
+                                context.getString(R.string.backup_import_too_large, mb, maxMb),
+                            )
+                        }
+                        SafRead.Failed -> throw IllegalStateException(errRead)
+                    }
                 }
                 // [fix-minisbak-import] 读**字节**，不是文本。
                 //
@@ -563,11 +578,8 @@ fun BackupSettingsScreen(
                 // 兼容层之前根本没被任何地方调用，属于死代码。
                 //
                 // 字节不能先 String 化：UTF-8 解码 ZIP 会丢信息。
-                val bytes = withContext(Dispatchers.IO) {
-                    context.contentResolver.openInputStream(uri)
-                        ?.use { it.readBytes() }
-                        ?: throw IllegalStateException(errRead)
-                }
+                // [deep-audit-1047 B-02] 上面的 readSafBytes 就是这次读取——
+                // 字节已按 MAX_PAYLOAD_BYTES 封顶，这里不再有第二个读点。
                 when {
                     OpenMinisBackupCompat.looksLikeMinisBak(bytes) ->
                         // [fix-minisbak-import] 嗅探/转换/恢复交接统一走

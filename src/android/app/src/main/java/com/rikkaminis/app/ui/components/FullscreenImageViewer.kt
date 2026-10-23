@@ -35,11 +35,12 @@ import coil.ImageLoader
 import coil.request.ImageRequest
 import coil.request.SuccessResult
 import com.rikkaminis.app.ui.DisplayBitmapLimits.limitDisplaySize
+import com.rikkaminis.app.util.saveOutcome
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.OutputStream
+import java.io.IOException
 
 // [fix/render-ui F-272] The `FullscreenImageViewer` composable was deleted here.
 //
@@ -172,7 +173,14 @@ internal fun copyBitmapToClipboard(
             val shareDir = File(context.cacheDir, "share").apply { mkdirs() }
             pruneShareDir(shareDir)
             val file = File(shareDir, "clipboard_img_${System.currentTimeMillis()}.png")
-            file.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            // [deep-audit-1047 B-01] `compress` returns false when the encoder
+            // wrote nothing — the old statement-position call dropped that and
+            // pasted a content:// URI pointing at a 0-byte file.
+            val encoded = file.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            if (!saveOutcome(streamOpened = true, compressed = encoded)) {
+                file.delete()
+                error("png encode failed")
+            }
             val uri = androidx.core.content.FileProvider.getUriForFile(
                 context,
                 "${context.packageName}.fileprovider",
@@ -216,7 +224,13 @@ internal suspend fun shareImage(context: Context, model: Any) {
             val shareDir = File(context.cacheDir, "share").apply { mkdirs() }
             pruneShareDir(shareDir)
             val file = File(shareDir, "share_img_${System.currentTimeMillis()}.png")
-            file.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            // [deep-audit-1047 B-01] a dropped `compress` result shared a 0-byte
+            // file: the chooser opened on an unreadable image.
+            val encoded = file.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            if (!saveOutcome(streamOpened = true, compressed = encoded)) {
+                file.delete()
+                error("png encode failed")
+            }
             val uri = androidx.core.content.FileProvider.getUriForFile(
                 context,
                 "${context.packageName}.fileprovider",
@@ -246,7 +260,6 @@ internal suspend fun saveToGallery(context: Context, bitmap: Bitmap): Boolean =
     withContext(Dispatchers.IO) {
         try {
             val filename = "minis_${System.currentTimeMillis()}.png"
-            val stream: OutputStream?
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val values = ContentValues().apply {
                     put(MediaStore.Images.Media.DISPLAY_NAME, filename)
@@ -257,14 +270,28 @@ internal suspend fun saveToGallery(context: Context, bitmap: Bitmap): Boolean =
                 val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
                     ?: return@withContext false
                 try {
-                    stream = context.contentResolver.openOutputStream(uri)
-                    stream?.use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                    // [deep-audit-1047 B-01] Two failure channels never reached
+                    // this catch, so a failed write was PUBLISHED: the row was
+                    // flipped to IS_PENDING=0 and `saveToGallery` returned true,
+                    // and the caller toasts "saved to album" over a 0-byte
+                    // entry. 1) `openOutputStream` returns null (dead/refusing
+                    // provider) — `stream?.use` skipped the write; 2) `compress`
+                    // returns false — its result was dropped. Both now throw
+                    // into this catch, which deletes the pending row
+                    // ([audit-0917]) and therefore never publishes it.
+                    val out = context.contentResolver.openOutputStream(uri)
+                        ?: throw IOException("openOutputStream returned null")
+                    val encoded = out.use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                    if (!saveOutcome(streamOpened = true, compressed = encoded)) {
+                        throw IOException("png encode failed")
+                    }
                     values.clear()
                     values.put(MediaStore.Images.Media.IS_PENDING, 0)
                     context.contentResolver.update(uri, values, null, null)
                 } catch (e: Exception) {
                     // [audit-0917] Delete the orphaned IS_PENDING=1 row: the old
                     // catch returned false and left a pending entry in the gallery.
+                    // (A failed encode is deleted here too — never published.)
                     context.contentResolver.delete(uri, null, null)
                     throw e
                 }
@@ -273,8 +300,15 @@ internal suspend fun saveToGallery(context: Context, bitmap: Bitmap): Boolean =
                 val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
                 val minisDir = File(dir, "Minis").also { it.mkdirs() }
                 val file = File(minisDir, filename)
-                stream = file.outputStream()
-                stream.use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                // [deep-audit-1047 B-01] pre-Q has no row to delete, so the
+                // symmetry is a file delete: a dropped `compress` result used to
+                // leave a 0-byte png in Pictures/Minis that the gallery shows as
+                // a broken thumbnail.
+                val encoded = file.outputStream().use { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                if (!saveOutcome(streamOpened = true, compressed = encoded)) {
+                    file.delete()
+                    throw IOException("png encode failed")
+                }
             }
             true
         } catch (e: Exception) {

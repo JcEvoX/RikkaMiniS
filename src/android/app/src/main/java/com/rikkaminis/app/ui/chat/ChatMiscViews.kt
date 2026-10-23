@@ -485,8 +485,20 @@ private fun BorderedMarkdownTable(
                                 // TTL), so run it before adding another one.
                                 com.rikkaminis.app.ui.components.pruneShareDir(shareDir)
                                 val outFile = java.io.File(shareDir, "table_${System.currentTimeMillis()}.png")
-                                outFile.outputStream().use {
+                                // [deep-audit-1047 B-01] `compress` returns false
+                                // when the encoder wrote nothing; the dropped
+                                // result used to put a 0-byte png (and a
+                                // success toast) on the clipboard.
+                                val encoded = outFile.outputStream().use {
                                     androidBitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)
+                                }
+                                if (!com.rikkaminis.app.util.saveOutcome(
+                                        streamOpened = true,
+                                        compressed = encoded,
+                                    )
+                                ) {
+                                    outFile.delete()
+                                    throw java.io.IOException("png encode failed")
                                 }
                                 val uri = androidx.core.content.FileProvider.getUriForFile(
                                     context,

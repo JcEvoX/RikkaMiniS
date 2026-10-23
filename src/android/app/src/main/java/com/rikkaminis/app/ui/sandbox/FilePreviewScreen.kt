@@ -141,9 +141,14 @@ fun FilePreviewScreen(
         if (uri == null) return@rememberLauncherForActivityResult
         scope.launch(Dispatchers.IO) {
             val ok = try {
+                // [deep-audit-1047 B-01] `openOutputStream` returns null (never
+                // throws) when the document provider refuses or died; `?.use`
+                // then skipped the copy and the old code returned `true` anyway
+                // — a "saved" toast over an empty document. Null now lands in
+                // the same failure branch as an I/O exception.
                 context.contentResolver.openOutputStream(uri)?.use { out ->
                     item.file.inputStream().use { it.copyTo(out) }
-                }
+                } ?: throw java.io.IOException("openOutputStream returned null")
                 true
             } catch (e: Exception) {
                 AppLogger.warning("FilePreview", "Save-As failed: ${e.message}")
@@ -628,7 +633,23 @@ private fun PdfPreview(item: FileItem) {
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 items(count) { idx ->
-                    val page by produceState<Bitmap?>(initialValue = renderer.cached(idx), key1 = idx) {
+                    // [deep-audit-1047 B-03] `idx` alone is not a data-source
+                    // key: the preview composable is reused for the next file,
+                    // so the page slot keeps the SAME `idx` and the old bitmap
+                    // survives the switch (and the `if (value == null)` guard
+                    // then skips the render, leaving the previous document's
+                    // page on screen). `item.file` is the source the page comes
+                    // from; the top-level `error`/`pageCount`/`renderer` are all
+                    // keyed on it for exactly this reason.
+                    //
+                    // `initialValue = renderer.cached(idx)` must stay FIRST: a
+                    // re-key still reuses the new renderer's LRU before paying
+                    // for a re-render when the page is already warm.
+                    val page by produceState<Bitmap?>(
+                        initialValue = renderer.cached(idx),
+                        key1 = idx,
+                        key2 = item.file,
+                    ) {
                         if (value == null) {
                             value = withContext(Dispatchers.IO) { renderer.render(idx) }
                         }
