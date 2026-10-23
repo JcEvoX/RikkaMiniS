@@ -176,7 +176,33 @@ provider 把线上值 floor 到 1（`clampOutboundMaxTokens`），所以线上 `
 
 ### L4 CI 层
 
-见 §7。
+**绿 run = `39997759383`**（job `120565626959`，attempt 1，head_sha `1d7ef15e`）。
+
+- 三方 sha 逐字符一致：本地 HEAD == `git ls-remote` == `run.head_sha` = `1d7ef15e2dd4247320e10b8da2ea1e55eb106551`。
+- 26 步：唯一非 success = 步骤 23 `Publish to Releases` = **skipped**（main 门控，非 main 分支必须如此）。
+- 日志判读：`Summary: 111 passed, 0 failed` **恰一条**（另 6 条 Summary 是各门自己的计数，
+  `10/13/22/25/33/5 passed, 0 failed`，无非零 failed）；`✅ ALL 340 CASES PASS` 恰一条；
+  门头 `[1/111]..[111/111]` **111 个序号连续且门名互异**；编译错 `Z e: ` **0**；
+  游离 FAILED **0**（6 条含 `FAILED` 的行逐条确认全是**用例名子串** + `PASSED`）。
+- 本支文件编译警告 **0**（含本支改过的 `OpenAIToolResultImagesTest.kt`——见下）。
+- 新测试逐条 PASSED：`LegacyMediaPlanTest` 4 条、`ThinkingBudgetPairTest` 4 条。
+
+**两次红的真相（都是真错，不是 flake）**：
+
+1. **run `39992888827`（job `120548867960`）失败** — 步骤 15 `Run unit tests (full suite)` 红，
+   唯一失败用例 `OpenAIToolResultImagesTest > responses serializer wires both
+   tool-result images and top-level imageParts FAILED`。
+   **根因**：那是一条**源形状测试**，它钉的是旧拼写 `entries = imageParts.map`；
+   合并后的分支喂的是派生列表 `legacyImages`（请求级 + 消息级）⇒ 断言失配。
+   **修法**：断言改钉**派生列表**，并额外钉住该列表由两个载体构成
+   （`(if (attachTopLevelImages) imageParts else emptyList()) + msg.imageParts`）——
+   **源形状测试应当钉「形状」而不是「拼写」**，这次是我们自己打破了这条规矩（1046 波记过同族）。
+2. **run `39994858886`（job `120555634432`）绿但不干净** — 日志里本支改过的文件带 **1 条既有警告**
+   `OpenAIToolResultImagesTest.kt:266:47 Java type mismatch: inferred type is
+   'kotlin.String?', but 'kotlin.String' was expected`（`System.getProperty("user.dir")` 可空）。
+   该警告**在本支之前就存在**（上一次 run 的同一行也有），但既然本支动了这个文件，
+   就地修掉（`?: "."`）并重跑——**CI 绿 ≠ CI 干净**（1042-A6 / 1045-FIX-8 同族）。
+   最终绿 run `39997759383` 的**本支文件警告 = 0**。
 
 ## 6. 残留与负决策
 
@@ -202,10 +228,15 @@ provider 把线上值 floor 到 1（`clampOutboundMaxTokens`），所以线上 `
 ## 7. 身份链
 
 - 基线：`88ef9b2774cf14a0c983d5cb138db0e052ea7a83`
-- 提交：`eeff57707903ef57fa559362d50d2e94f3a77096`
+- 提交链（3 个）：
+  1. `eeff57707903ef57fa559362d50d2e94f3a77096` — 生产 + 门 + 测试（CI run `39992888827` **红**：源形状测试）
+  2. `2878a229ec838ea03ba984840782cf991e08430e` — 修源形状测试 + 报告（CI run `39994858886` **绿但不干净**：1 条既有警告）
+  3. `1d7ef15e2dd4247320e10b8da2ea1e55eb106551` — 清警告（CI run `39997759383` **绿且干净**）
 - 分支：`fix/dv27-a1-provider-wire-parity`
-- CI：run `39992888827`（本地 HEAD == `ls-remote` == `run.head_sha` 三方逐字符一致）
+- CI：run `39997759383` / job `120565626959` / attempt 1 / head_sha `1d7ef15e`
+  （本地 HEAD == `ls-remote` == `run.head_sha` 三方逐字符一致）
 - 门数：111（0 新建，2 扩既有）· 夹具：340（不变）· 冻结面 `scan.sh`/`test_scan.py`：零触碰
+- 报告：`fix-reports/dv27-FIX-A1.md`（本文件，随分支提交）
 
 ## 8. 自证成本与不确定项
 
