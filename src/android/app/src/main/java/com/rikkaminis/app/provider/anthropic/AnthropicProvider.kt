@@ -570,7 +570,17 @@ class AnthropicProvider(
         // Defense-in-depth clamp: upstream dynamicMaxTokens() is already in
         // range; this guards out-of-band callers (sub-agent budgets, synthesized
         // requests) from a deterministic 400 on over-range max_tokens.
-        body.put("max_tokens", clampOutboundMaxTokens(maxTokens, effectiveMaxOutputTokens(model)))
+        //
+        // [deep-audit-1046 S-03] ONE value, TWO readers. `budget_tokens` is
+        // defined *relative to* `max_tokens` (Anthropic 400s with
+        // "thinking.budget_tokens must be less than max_tokens"), so the budget
+        // must be derived from the number actually put on the wire. It used to
+        // read the RAW request value while this field wrote the clamped one —
+        // any out-of-band caller above the model ceiling (sub-agent budget,
+        // synthesized request) emitted e.g. max_tokens=8192 with
+        // budget_tokens=65536 and got a deterministic 400.
+        val cappedMaxTokens = clampOutboundMaxTokens(maxTokens, effectiveMaxOutputTokens(model))
+        body.put("max_tokens", cappedMaxTokens)
         body.put("stream", stream)
 
         if (temperature != null && !thinkingLevel.isEnabled && !modelRejectsTemperature(model.id)) {
@@ -618,8 +628,15 @@ class AnthropicProvider(
                     put("effort", thinkingEffort(thinkingLevel))
                 })
             } else {
-                val budgetTokens = thinkingBudget(maxTokens, thinkingLevel)
-                if (budgetTokens > 0) {
+                // [deep-audit-1046 S-03] Budget off the WIRE value, and only
+                // emit the field when the pair is actually legal: a budget that
+                // is 0 or >= max_tokens is a deterministic 400 (maxTokens==1
+                // leaves no room for any budget at all), and a thinking block
+                // with no usable budget is worse than no thinking block — the
+                // legacy path's default is "no thinking", so omitting it is the
+                // honest degradation.
+                val budgetTokens = thinkingBudget(cappedMaxTokens, thinkingLevel)
+                if (budgetTokens > 0 && budgetTokens < cappedMaxTokens) {
                     body.put("thinking", JSONObject().apply {
                         put("type", "enabled")
                         put("budget_tokens", budgetTokens)
@@ -1094,7 +1111,15 @@ class AnthropicProvider(
             return major > 4 || major == 4 || (major == 3 && minor >= 7)
         }
 
-        /** Calculate thinking budget tokens based on level (legacy <=4.5 protocol). */
+        /**
+         * Calculate thinking budget tokens based on level (legacy <=4.5 protocol).
+         *
+         * [deep-audit-1046 S-03] `maxTokens` MUST be the value actually written
+         * to the request's `max_tokens` (the clamped one), never the raw
+         * caller-supplied figure: budget_tokens is defined relative to
+         * max_tokens on the wire, so deriving it from a different number
+         * produces the illegal pair the API rejects outright.
+         */
         fun thinkingBudget(maxTokens: Int, level: ThinkingLevel): Int {
             val cap = when (level) {
                 ThinkingLevel.OFF -> 0
@@ -1170,12 +1195,22 @@ class AnthropicProvider(
         // claude-code-20250219 there because those signal Claude-Code-only
         // surface and get rejected on plain API-key auth.
         val betaFlags = mutableListOf<String>()
+        // [deep-audit-1046 S-03] Three-way, not two-way. The body carries three
+        // distinct thinking types and each has its own beta story:
+        //   adaptive → effort-2025-11-24 (4.6+ effort knob)
+        //   enabled  → interleaved-thinking-2025-05-14 (legacy budget_tokens)
+        //   disabled → NONE. `disabled` is the explicit "do not think" switch we
+        //              send on adaptive models (their default is to think); the
+        //              beta header advertises the very capability the body just
+        //              asked to switch off. Harmless noise at api.anthropic.com,
+        //              a 400 on relays that validate the pairing.
         if (body.has("thinking")) {
-            val isAdaptive = body.optJSONObject("thinking")?.optString("type") == "adaptive"
-            if (isAdaptive) {
-                betaFlags.add("effort-2025-11-24")
-            } else {
-                betaFlags.add("interleaved-thinking-2025-05-14")
+            when (body.optJSONObject("thinking")?.optString("type")) {
+                "adaptive" -> betaFlags.add("effort-2025-11-24")
+                "enabled" -> betaFlags.add("interleaved-thinking-2025-05-14")
+                // Explicit off-switch — and, by the same fail-closed shape, any
+                // type this gate does not know yet: announce nothing.
+                "disabled" -> Unit
             }
         }
         // [T-android-enhanced-cache] The 1-hour cache TTL requires this flag.
