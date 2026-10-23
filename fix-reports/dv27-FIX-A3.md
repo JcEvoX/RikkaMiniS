@@ -248,8 +248,27 @@ L3 ALL ARMS MATCH
 |---|---|
 | 基线 main | `88ef9b2774cf14a0c983d5cb138db0e052ea7a83` |
 | 分支 | `fix/dv27-a3-mcp-secret-handoff` |
-| 提交 | 见下（提交后回填） |
-| CI run / job | 见下（提交后回填） |
+| 提交（代码 + 门） | `eca1598a` —— 生产/门 3 文件 +420/−11（`MCPOAuthStore.kt` +29/−2、`mcp_oauth_lifecycle_check.py` +220、`skill_import_offmain_check.py` +182） |
+| 提交（报告） | `6f7efb08` —— 本报告首版 |
+| 报告回填提交 | 本文件 §7 回填（只动 `fix-reports/`，不改 `src/`/`scripts/`） |
+| 三方 sha | 本地 `git rev-parse HEAD` == `api/branches/fix/dv27-a3-mcp-secret-handoff.sha` == `run.head_sha` = `6f7efb083404f90c4d0a2a68bb5cf30a2f912bec`（逐字符一致；CI 验的就是这棵树） |
+| CI run / job | run **`40019485653`** / job **`120640023138`**，`event=workflow_dispatch`，**attempt 1**，`conclusion=success`，日志 1,446,900 B |
+| 步骤面 | 26 步，`not_ok=[]`，唯一 skipped = `Publish to Releases`（main 门控，符合预期） |
+
+**CI 日志判读（`probe/l4/job-120640023138.log`，逐条取真样本）**
+
+| 判据 | 实测 |
+|---|---|
+| 门头 | `━━━ [N/111] … ━━━` 计数 **111**，门名去重后仍 **111**（无重号/无同名） |
+| 汇总行 | `║  Summary: 111 passed, 0 failed` @ 行 974（带框线前缀，全日志恰一条 111 形态；其余 `Summary:` 均为门内 selftest 子摘要，failed 全为 0） |
+| 夹具集 | `✅ ALL 340 CASES PASS` @ 行 1364 |
+| 编译错 | ` e: ` **0** 条 |
+| 游离 FAILED | **0**（无含 `FAILED` 而不含 `PASSED` 的行） |
+| 本支两门在册 | `✅ skill_import_offmain_check selftest has teeth (SKILL_IMPORT_OFFMAIN_SELFTEST=PASS)` @ 1288 + `real tree green`；`✅ mcp_oauth_lifecycle_check selftest has teeth (MCP_OAUTH_LIFECYCLE_SELFTEST=PASS)` @ 1299 + `real tree green` |
+| 本支文件警告 | `MCPOAuthStore.kt` 的 `w:` **0** 条（全日志 378 条 ` w: ` 均为既有代码，非本支引入） |
+| 既有用例 | `MCPOAuthLifecycleTest` 全部 `PASSED`（含 `convergence entry point keeps its signature` / `configured but not yet authorized keeps the pending client secret` / `no credential write is aimed at an id that left the listing`，即本支收敛后未破坏既有契约） |
+
+**源码树等价性**：报告回填提交后需重验 —— `git diff --name-only 6f7efb08 HEAD -- . ':(exclude)fix-reports'` 必须为空（CI 验的是 `6f7efb08`，回填只动 `fix-reports/`，不在 workflow paths 内、不参与构建）。
 
 ---
 
