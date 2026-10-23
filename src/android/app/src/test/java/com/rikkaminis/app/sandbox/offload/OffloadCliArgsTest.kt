@@ -827,6 +827,84 @@ class OffloadCliArgsTest {
         assertProbeFails { assertContactsFailureBranches(mutated) }
     }
 
+    // ── [dv27-A5 A-07] the help / bare-invocation exit code ──────────────────
+    //
+    // `OffloadArgs` folds `--help` / `-h` into flags, so `tool --help` leaves
+    // `positional` EMPTY — the same state a bare `tool` is in. The five
+    // handlers that guarded both invocations with one condition and then
+    // decided the exit code on positional emptiness therefore answered 2 for
+    // `--help`: `set -e` / `cmd --help && …` probes broke. The first test pins
+    // the root cause in behaviour (nothing separates the two calls except the
+    // flag), the second and third pin the decision in the real sources, with a
+    // negative control built by mutating a copy of each file back to the old
+    // shape.
+
+    private val helpExitFiles = listOf(
+        "src/main/java/com/rikkaminis/app/sandbox/offload/ModelUseOffloadHandler.kt",
+        "src/main/java/com/rikkaminis/app/sandbox/offload/AlarmOffloadHandler.kt",
+        "src/main/java/com/rikkaminis/app/sandbox/offload/PhotosOffloadHandler.kt",
+        "src/main/java/com/rikkaminis/app/sandbox/offload/SpeechOffloadHandler.kt",
+        "src/main/java/com/rikkaminis/app/sandbox/offload/AccessibilityOffloadHandler.kt",
+    )
+
+    @Test
+    fun `help leaves positional empty so the old exit code could not tell it from a bare call`() {
+        val longHelp = OffloadArgs(listOf("--help"))
+        assertTrue(longHelp.hasFlag("h", "help"))
+        assertTrue("this is why the old else-0 arm was dead for --help", longHelp.positional.isEmpty())
+
+        val shortHelp = OffloadArgs(listOf("-h"))
+        assertTrue(shortHelp.hasFlag("h", "help"))
+        assertTrue(shortHelp.positional.isEmpty())
+
+        val bare = OffloadArgs(emptyList())
+        assertFalse("only the flag separates --help from a bare call", bare.hasFlag("h", "help"))
+        assertTrue(bare.positional.isEmpty())
+
+        assertEquals(listOf("list"), OffloadArgs(listOf("list")).positional)
+        // a global flag still helps when a subcommand follows, and the
+        // subcommand is not eaten as the flag's value
+        assertTrue(OffloadArgs(listOf("--help", "list")).hasFlag("h", "help"))
+        assertEquals(listOf("list"), OffloadArgs(listOf("--help", "list")).positional)
+    }
+
+    @Test
+    fun `every help-guarded early exit decides the exit code on the flag`() {
+        for (rel in helpExitFiles) {
+            val src = source(rel)
+            assertTrue("$rel must answer 0 for --help", helpExitDecidesOnFlag(src))
+            assertFalse(
+                "$rel must not decide the exit code on positional emptiness",
+                codeOnly(src).contains("if (args.positional.isEmpty()) 2 else 0"),
+            )
+        }
+    }
+
+    @Test
+    fun `negative control - the positional-emptiness decision fails the probe`() {
+        for (rel in helpExitFiles) {
+            val original = source(rel)
+            val mutated = original.replace(
+                "if (args.hasFlag(\"h\", \"help\")) 0 else 2",
+                "if (args.positional.isEmpty()) 2 else 0",
+            )
+            assertTrue("$rel: the flag decision must exist to be mutated", mutated != original)
+            assertFalse("$rel: the old shape must fail the probe", helpExitDecidesOnFlag(mutated))
+        }
+    }
+
+    /**
+     * The early exit answers 0 for the help flag and only for it: the decision
+     * reads the flag, and the dead positional-emptiness arm is gone.
+     */
+    private fun helpExitDecidesOnFlag(src: String): Boolean {
+        val code = codeOnly(src)
+        val onFlag = Regex("""if \(args\.hasFlag\("h", "help"\)\) 0 else 2""").containsMatchIn(code)
+        val onPositional =
+            Regex("""if \(args\.positional\.isEmpty\(\)\) 2 else 0""").containsMatchIn(code)
+        return onFlag && !onPositional
+    }
+
     // ── source location (same technique as DatabaseVersionGuardTest) ─────────
 
     /** Strip line + block comments so a comment quoting a bad pattern cannot trip a probe. */
