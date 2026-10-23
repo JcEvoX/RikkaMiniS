@@ -117,7 +117,30 @@ backup surface — the artifact archive is NOT gated by `includeSecrets`:
       overwrite this device's LIVE token bridge — fixing the exporter cannot
       protect archives that already exist.
 
-Both are fail-closed: sources that cannot be read are a violation.
+[dv25-A1] The PARSE side of the same credential invariant (deep-audit-1045
+A-01). The in-guest CLI writes camelCase oauth keys (`clientId`,
+`authorizationEndpoint`, `tokenEndpoint`, `redirectURI` — main.py), this app
+writes snake_case. Reading snake_case only left every field blank for a
+CLI-written entry ⇒ `isConfigured` false ⇒ `MCPRepository.save()` — which runs
+on the load of any entry without `createdAt`, and the CLI writes none — dropped
+the `oauth` block outright, so the config evaporated from servers.json on the
+next reload from disk or backup import (both go through the same `fromJson`).
+The CLI's key set is DERIVED from main.py, so a new guest-side key turns this
+gate red instead of silently evaporating.
+
+  C1  every key the guest CLI writes is readable here: either spelled the same
+      way, or mentioned by a key table (`listOf(<snake_case>, <camelCase>)`).
+  C2  key tables are ordered primary-then-alias — snake_case first. A table
+      whose only entry is the camelCase spelling (alias promoted to primary)
+      makes the value this app wrote unreadable.
+  C3  an aliased table must be consulted by `fromJson` — a fallback nobody
+      reads is a fallback on paper.
+  C4  `toJson` writes only snake_case keys: the disk/backup format must not
+      fork just because the read side learned a second spelling.
+  C5  `fromJson` keeps its "no endpoints = noise" null path (every property
+      `isConfigured` requires is blank-checked).
+
+All are fail-closed: sources that cannot be read are a violation.
 
 Usage: python3 scripts/scan/mcp_oauth_lifecycle_check.py [repo_root]
        python3 scripts/scan/mcp_oauth_lifecycle_check.py --selftest
@@ -159,6 +182,26 @@ MCP_SECRET_STRIP = "stripExportedMcpSecrets"
 DENIED_SET_RE = re.compile(
     r'val\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*setOf\(\s*"' + OAUTH_DENY_LITERAL + r'"\s*\)'
 )
+
+# [dv25-A1] The PARSE side of the same credential invariant. The in-guest CLI
+# (`minis-mcp-cli add --oauth-*`) writes camelCase keys while this app writes
+# snake_case. Reading snake_case only made every field blank for a CLI-written
+# entry ⇒ isConfigured false ⇒ MCPRepository.save() (it runs on the load of any
+# entry without `createdAt`, and the CLI writes none) dropped the whole `oauth`
+# object. Both entry points are the same parse: CLI add → reloadFromDisk, and
+# backup import → importJSON.
+#
+# The CLI's key set is DERIVED from main.py rather than listed here, so a new
+# key on the guest side turns this gate red instead of silently evaporating.
+CONFIG_REL = "src/android/app/src/main/java/com/rikkaminis/app/mcp/oauth/MCPOAuthConfig.kt"
+CLI_REL = "src/android/app/src/main/assets/default_mount/usr/local/lib/minis-mcp-cli/main.py"
+KEY_TABLE_RE = re.compile(r"\bval\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*listOf\(([^)]*)\)")
+KEY_LITERAL_RE = re.compile(r'"([^"]*)"')
+CLI_OAUTH_DICT_RE = re.compile(r"\boauth\s*=\s*\{")
+CLI_OAUTH_ITEM_RE = re.compile(r'"([A-Za-z_][A-Za-z0-9_]*)"\s*:')
+CLI_OAUTH_ITEM_SET_RE = re.compile(r'\boauth\[\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*\]')
+TOJSON_WRITE_RE = re.compile(r'\bput\(\s*"([A-Za-z_][A-Za-z0-9_]*)"')
+CONFIGURED_PROP_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\.isNotBlank\(\)")
 
 CONVERGE_DECL = "reconcileForServer("
 DECIDE_DECL = "decideReconcileAction("
@@ -428,6 +471,175 @@ def check_repo(code):
         )
     return v
 
+
+def camel_to_snake(name):
+    """`clientId` → `client_id`, `redirectURI` → `redirect_uri`.
+
+    Used to DERIVE which spelling pairs with which: the alias the guest CLI
+    writes and the snake_case primary this app writes are two spellings of the
+    same field, so neither has to be listed in this gate.
+    """
+    s = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
+    s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", s)
+    return s.lower()
+
+def brace_block(code, open_idx):
+    """The `{...}` block starting at [open_idx] (index of the `{`), or None."""
+    depth = 0
+    j = open_idx
+    while j < len(code):
+        c = code[j]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return code[open_idx:j + 1]
+        j += 1
+    return None
+
+def cli_oauth_keys(cli):
+    """Keys the in-guest CLI writes into a server's `oauth` object, in order."""
+    keys = []
+    for m in CLI_OAUTH_DICT_RE.finditer(cli):
+        block = brace_block(cli, m.end() - 1)
+        if block is None:
+            continue
+        for item in CLI_OAUTH_ITEM_RE.finditer(block):
+            if item.group(1) not in keys:
+                keys.append(item.group(1))
+    for m in CLI_OAUTH_ITEM_SET_RE.finditer(cli):
+        if m.group(1) not in keys:
+            keys.append(m.group(1))
+    return keys
+
+def check_config(code, cli):
+    """[dv25-A1] The parse/write key contract of MCPOAuthConfig.
+
+    C1  every key the guest CLI writes is readable here — either spelled the
+        same way, or present as an alias whose snake_case primary is a key
+        `toJson` writes (so the two ends describe the same field).
+    C2  every key table is ordered primary-then-alias (snake_case first).
+    C3  every aliased table is actually consumed by `fromJson` (a table the
+        parser ignores is a fallback that exists only on paper).
+    C4  `toJson` writes only snake_case keys — the on-disk / backup format must
+        not fork because the read side learned a second spelling.
+    C5  `fromJson` keeps its "no endpoints = noise" null path (every property
+        `isConfigured` requires must be blank-checked before returning null).
+    """
+    v = []
+    fromjson = body_of(code, "fromJson")
+    tojson = body_of(code, "toJson")
+    if fromjson is None:
+        return ["MCPOAuthConfig.kt: no `fun fromJson(` with a body — the parse "
+                "side of the oauth key contract is gone (ROT: update this gate)"]
+    if tojson is None:
+        return ["MCPOAuthConfig.kt: no `fun toJson(` with a body — the write "
+                "side of the oauth key contract is gone (ROT: update this gate)"]
+
+    written = []
+    for m in TOJSON_WRITE_RE.finditer(tojson):
+        if m.group(1) not in written:
+            written.append(m.group(1))
+    if not written:
+        return ["MCPOAuthConfig.kt: `toJson` writes no keys — the write side of "
+                "the oauth key contract cannot be checked (ROT: update this gate)"]
+
+    cli_keys = cli_oauth_keys(cli)
+    if not cli_keys:
+        return ["cannot derive the in-guest CLI's oauth keys from %s — the alias "
+                "contract has no source of truth (ROT: update this gate)" % CLI_REL]
+
+    tables = []
+    for m in KEY_TABLE_RE.finditer(code):
+        tables.append((m.group(1), KEY_LITERAL_RE.findall(m.group(2))))
+
+    # C2: direction. Runs before C1's coverage test so an alias promoted to
+    # primary is reported as a direction defect (C2 owns it), not as an
+    # unreadable key — one arm, one criterion.
+    tabled = set()
+    for name, keys in tables:
+        tabled.update(keys)
+        if len(keys) >= 2:
+            if camel_to_snake(keys[1]) != keys[0]:
+                v.append(
+                    "MCPOAuthConfig.kt:%d: key table `%s` is not ordered "
+                    "primary-then-alias ('%s' should be the snake_case primary of "
+                    "'%s') — with the alias first, a CLI-written block wins over "
+                    "the value this app saved"
+                    % (line_of(code, code.find(name)), name, keys[0], keys[1])
+                )
+        elif keys and keys[0] != camel_to_snake(keys[0]) and camel_to_snake(keys[0]) in written:
+            v.append(
+                "MCPOAuthConfig.kt:%d: key table `%s` reads only '%s', the "
+                "CLI's camelCase spelling, with no snake_case primary — the "
+                "value this app wrote to disk would be ignored"
+                % (line_of(code, code.find(name)), name, keys[0])
+            )
+
+    # C1: coverage. A CLI spelling with no home parses blank and takes the
+    # whole oauth block down with it.
+    for key in cli_keys:
+        if key in written or key in tabled:
+            continue
+        v.append(
+            "MCPOAuthConfig.kt: `fromJson` does not read '%s', the key the "
+            "in-guest CLI writes for this field (%s) — the whole oauth block "
+            "parses blank, isConfigured turns false and MCPRepository.save() "
+            "drops it on the next reload" % (key, CLI_REL)
+        )
+
+    # C3: wiring. Derive the table names from the file, not from a list here.
+    for name, keys in tables:
+        if len(keys) < 2 or camel_to_snake(keys[1]) != keys[0]:
+            continue
+        if re.search(r"\b" + re.escape(name) + r"\b", fromjson) is None:
+            v.append(
+                "MCPOAuthConfig.kt:%d: key table `%s` is declared but `fromJson` "
+                "never consults it — the alias exists only on paper"
+                % (line_of(code, code.find(name)), name)
+            )
+
+    # C4: the write side stays snake_case (old configs and backups unchanged).
+    for key in written:
+        if key != key.lower():
+            v.append(
+                "MCPOAuthConfig.kt:%d: `toJson` writes the camelCase key '%s' — "
+                "the disk/backup format must stay snake_case; only the read side "
+                "accepts the CLI's spelling" % (line_of(code, tojson.find('"%s"' % key)), key)
+            )
+
+    # C5: the null path. Derive the required properties from `isConfigured`'s
+    # own getter — scanning the whole file would also catch `it.isNotBlank()`
+    # in `toJson`'s takeIf and invent a property named `it`.
+    cfg_at = code.find("isConfigured")
+    required = []
+    if cfg_at >= 0:
+        stop = code.find("\n\n", cfg_at)
+        scope = code[cfg_at:min(stop, cfg_at + 400) if stop > 0 else cfg_at + 400]
+        for m in CONFIGURED_PROP_RE.finditer(scope):
+            if m.group(1) not in required:
+                required.append(m.group(1))
+    if not required:
+        v.append(
+            "MCPOAuthConfig.kt: cannot derive the required oauth properties from "
+            "`isConfigured` — the null path below has nothing to be checked "
+            "against (ROT: update this gate)"
+        )
+        return v
+    for prop in required:
+        if (prop + ".isBlank()") not in fromjson:
+            v.append(
+                "MCPOAuthConfig.kt: `fromJson` no longer treats a blank `%s` as "
+                "unconfigured — an oauth block with no endpoints would be parsed "
+                "as configuration" % prop
+            )
+    if required and "null" not in fromjson:
+        v.append(
+            "MCPOAuthConfig.kt: `fromJson` has no null path — an absent/empty "
+            "oauth block must still parse as null"
+        )
+    return v
 
 def balanced(code, start, open_ch, close_ch):
     """Index of the char closing the group opened at [start], or -1."""
@@ -879,6 +1091,19 @@ def run(root):
         print("mcp_oauth_lifecycle_check: cannot read sources: %s" % exc)
         return 2
     violations = check_store(store) + check_repo(repo)
+    # [dv25-A1] parse/write key contract (fail-closed: unreadable = violation).
+    # Comments are masked, string literals are NOT — the criteria are anchored
+    # on the key spellings themselves.
+    try:
+        config_raw = read(root, CONFIG_REL)
+        cli_raw = read(root, CLI_REL)
+    except OSError as exc:
+        violations.append(
+            "[dv25-A1] cannot read the oauth key-contract sources (%s) — a "
+            "CLI-written oauth block can evaporate again" % exc
+        )
+    else:
+        violations += check_config(mask_comments(config_raw), cli_raw)
     # [da1034-A1] artifact-backup surface (fail-closed: unreadable = violation).
     try:
         scope_raw = read(root, SCOPE_REL)
@@ -916,7 +1141,8 @@ def run(root):
         "PASS mcp_oauth_lifecycle_check (one reconcile point; add/update/import "
         "all wired; no secret-only cleanup path; edit sheet edits the live entry; "
         "oauth bridge never archived and never restored; mcp servers.json redacted "
-        "on a credentials-free export%s)"
+        "on a credentials-free export; every CLI-written oauth key readable by "
+        "fromJson with snake_case primary first and the disk format unchanged%s)"
         % note
     )
     return 0
@@ -1368,6 +1594,172 @@ BAD_ARCHIVER_NO_TRANSFORM = GOOD_ARCHIVER.replace(
 BAD_ARCHIVER_NO_FUN = GOOD_ARCHIVER.replace("fun writeEntries(", "fun writeEntriesX(")
 
 
+# [dv25-A1] fixtures for check_config: MCPOAuthConfig's parse/write key
+# contract. GOOD mirrors the shipped shape; each BAD trips exactly one
+# criterion group.
+GOOD_CLI = '''
+        oauth = {
+            "mode": "static",
+            "clientId": oauth_client_id,
+            "authorizationEndpoint": oauth_auth_endpoint,
+            "tokenEndpoint": oauth_token_endpoint,
+        }
+        if oauth_scopes:
+            oauth["scopes"] = oauth_scopes
+        if oauth_redirect:
+            oauth["redirectURI"] = oauth_redirect
+'''
+
+CLI_WITH_EXTRA_KEY = GOOD_CLI + '''
+        if oauth_device_code:
+            oauth["deviceAuthorizationEndpoint"] = oauth_device_code
+'''
+
+GOOD_CONFIG = """
+data class MCPOAuthConfig(
+    val mode: String = "static",
+    val clientId: String = "",
+    val authorizationEndpoint: String = "",
+    val tokenEndpoint: String = "",
+    val scopes: String? = null,
+    val redirectUri: String? = null,
+) {
+    val isConfigured: Boolean
+        get() = clientId.isNotBlank() &&
+            authorizationEndpoint.isNotBlank() &&
+            tokenEndpoint.isNotBlank()
+
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("mode", mode)
+        put("client_id", clientId)
+        put("authorization_endpoint", authorizationEndpoint)
+        put("token_endpoint", tokenEndpoint)
+        scopes?.takeIf { it.isNotBlank() }?.let { put("scopes", it) }
+        redirectUri?.takeIf { it.isNotBlank() }?.let { put("redirect_uri", it) }
+    }
+
+    companion object {
+        private val CLIENT_ID_KEYS = listOf("client_id", "clientId")
+        private val AUTH_ENDPOINT_KEYS = listOf("authorization_endpoint", "authorizationEndpoint")
+        private val TOKEN_ENDPOINT_KEYS = listOf("token_endpoint", "tokenEndpoint")
+        private val REDIRECT_URI_KEYS = listOf("redirect_uri", "redirectURI")
+
+        private fun JSONObject.firstNonBlank(keys: List<String>): String =
+            keys.firstNotNullOfOrNull { key -> optString(key, "").ifBlank { null } } ?: ""
+
+        fun fromJson(obj: JSONObject?): MCPOAuthConfig? {
+            if (obj == null) return null
+            val config = MCPOAuthConfig(
+                mode = obj.optString("mode", "static").ifBlank { "static" },
+                clientId = obj.firstNonBlank(CLIENT_ID_KEYS),
+                authorizationEndpoint = obj.firstNonBlank(AUTH_ENDPOINT_KEYS),
+                tokenEndpoint = obj.firstNonBlank(TOKEN_ENDPOINT_KEYS),
+                scopes = obj.optString("scopes", "").ifBlank { null },
+                redirectUri = obj.firstNonBlank(REDIRECT_URI_KEYS).ifBlank { null },
+            )
+            return if (config.clientId.isBlank() &&
+                config.authorizationEndpoint.isBlank() &&
+                config.tokenEndpoint.isBlank()
+            ) {
+                null
+            } else {
+                config
+            }
+        }
+    }
+}
+"""
+
+# C1 — the alias reads are gone (the shipped-but-blank state).
+BAD_CONFIG_NO_ALIAS = GOOD_CONFIG.replace(
+    'listOf("client_id", "clientId")', 'listOf("client_id")').replace(
+    'listOf("authorization_endpoint", "authorizationEndpoint")', 'listOf("authorization_endpoint")').replace(
+    'listOf("token_endpoint", "tokenEndpoint")', 'listOf("token_endpoint")').replace(
+    'listOf("redirect_uri", "redirectURI")', 'listOf("redirect_uri")')
+
+# C1 — the pre-fix file, verbatim in shape: no tables at all, snake_case
+# literals only (the four CLI-written fields parse blank).
+BAD_CONFIG_BASELINE = """
+data class MCPOAuthConfig(
+    val mode: String = "static",
+    val clientId: String = "",
+    val authorizationEndpoint: String = "",
+    val tokenEndpoint: String = "",
+    val scopes: String? = null,
+    val redirectUri: String? = null,
+) {
+    val isConfigured: Boolean
+        get() = clientId.isNotBlank() &&
+            authorizationEndpoint.isNotBlank() &&
+            tokenEndpoint.isNotBlank()
+
+    fun toJson(): JSONObject = JSONObject().apply {
+        put("mode", mode)
+        put("client_id", clientId)
+        put("authorization_endpoint", authorizationEndpoint)
+        put("token_endpoint", tokenEndpoint)
+        scopes?.takeIf { it.isNotBlank() }?.let { put("scopes", it) }
+        redirectUri?.takeIf { it.isNotBlank() }?.let { put("redirect_uri", it) }
+    }
+
+    companion object {
+        fun fromJson(obj: JSONObject?): MCPOAuthConfig? {
+            if (obj == null) return null
+            val config = MCPOAuthConfig(
+                mode = obj.optString("mode", "static").ifBlank { "static" },
+                clientId = obj.optString("client_id", ""),
+                authorizationEndpoint = obj.optString("authorization_endpoint", ""),
+                tokenEndpoint = obj.optString("token_endpoint", ""),
+                scopes = obj.optString("scopes", "").ifBlank { null },
+                redirectUri = obj.optString("redirect_uri", "").ifBlank { null },
+            )
+            return if (config.clientId.isBlank() &&
+                config.authorizationEndpoint.isBlank() &&
+                config.tokenEndpoint.isBlank()
+            ) null else config
+        }
+    }
+}
+"""
+
+# C1 — a mention of the CLI spelling inside a COMMENT cannot satisfy the check.
+BAD_CONFIG_COMMENT_ONLY = BAD_CONFIG_BASELINE.replace(
+    "    companion object {",
+    "    // The in-guest CLI spells these clientId / authorizationEndpoint /\n"
+    "    // tokenEndpoint — honoured the same way as parseStartupTimeout does.\n"
+    "    companion object {")
+
+# C2 — alias promoted to primary (camelCase only, no snake_case fallback).
+BAD_CONFIG_ALIAS_FIRST = GOOD_CONFIG.replace(
+    'listOf("client_id", "clientId")', 'listOf("clientId")').replace(
+    'listOf("authorization_endpoint", "authorizationEndpoint")', 'listOf("authorizationEndpoint")').replace(
+    'listOf("token_endpoint", "tokenEndpoint")', 'listOf("tokenEndpoint")').replace(
+    'listOf("redirect_uri", "redirectURI")', 'listOf("redirectURI")')
+
+# C2 — table reversed: camelCase first, snake_case as the fallback.
+BAD_CONFIG_TABLE_REVERSED = GOOD_CONFIG.replace(
+    'listOf("client_id", "clientId")', 'listOf("clientId", "client_id")')
+
+# C3 — the tables exist but fromJson reads literals: a fallback on paper only.
+BAD_CONFIG_TABLE_UNWIRED = GOOD_CONFIG.replace(
+    "clientId = obj.firstNonBlank(CLIENT_ID_KEYS)", 'clientId = obj.optString("client_id", "")')
+
+# C4 — the read side learned a second spelling and the write side followed.
+BAD_CONFIG_TOJSON_CAMEL = GOOD_CONFIG.replace(
+    'put("client_id", clientId)', 'put("clientId", clientId)')
+
+# C5 — the "no endpoints is noise" null path removed.
+BAD_CONFIG_NO_NULL_GUARD = GOOD_CONFIG.replace(
+    """            return if (config.clientId.isBlank() &&
+                config.authorizationEndpoint.isBlank() &&
+                config.tokenEndpoint.isBlank()
+            ) {
+                null
+            } else {
+                config
+            }""",
+    "            return config")
+
 def selftest():
     failures = []
 
@@ -1566,6 +1958,51 @@ def selftest():
              len(art(archiver=BAD_ARCHIVER_NO_SINK)[2]),
              len(art(archiver=BAD_ARCHIVER_NO_TRANSFORM)[2]),
              len(art(archiver=BAD_ARCHIVER_NO_FUN)[2])))
+
+
+
+    # [dv25-A1] parse/write key-contract arms: each fixture must trip exactly
+    # one criterion group, so a green run proves the five checks all have teeth.
+    N1 = "does not read"
+    N2A = "not ordered primary-then-alias"
+    N2B = "reads only"
+    N3 = "never consults it"
+    N4 = "camelCase key"
+    N5 = "no longer treats a blank"
+
+    def cfg_arm(label, code, needle, cli=GOOD_CLI):
+        res = check_config(mask_comments(code), cli)
+        expect_trip(label, res, needle)
+        for item in res:
+            if needle not in item:
+                failures.append("%s tripped an unexpected criterion: %s" % (label, item))
+        return len(res)
+
+    cfg_clean = check_config(mask_comments(GOOD_CONFIG), GOOD_CLI)
+    expect_clean("compliant MCPOAuthConfig fixture", cfg_clean)
+    if cfg_clean:
+        failures.append("compliant config fixture tripped: %s" % cfg_clean)
+
+    a1 = cfg_arm("alias-reads-removed fixture", BAD_CONFIG_NO_ALIAS, N1)
+    a2 = cfg_arm("baseline-snake-only fixture", BAD_CONFIG_BASELINE, N1)
+    a3 = cfg_arm("comment-only-alias fixture", BAD_CONFIG_COMMENT_ONLY, N1)
+    a4 = cfg_arm("alias-promoted-to-primary fixture", BAD_CONFIG_ALIAS_FIRST, N2B)
+    a5 = cfg_arm("table-reversed fixture", BAD_CONFIG_TABLE_REVERSED, N2A)
+    a6 = cfg_arm("table-declared-but-unused fixture", BAD_CONFIG_TABLE_UNWIRED, N3)
+    a7 = cfg_arm("toJson-writes-camelCase fixture", BAD_CONFIG_TOJSON_CAMEL, N4)
+    a8 = cfg_arm("null-path-removed fixture", BAD_CONFIG_NO_NULL_GUARD, N5)
+    a9 = cfg_arm("new-CLI-key fixture", GOOD_CONFIG, N1, cli=CLI_WITH_EXTRA_KEY)
+
+    # fail-closed: an unreadable CLI (no derived key set) must not pass silently.
+    no_cli = check_config(mask_comments(GOOD_CONFIG), "")
+    expect_trip("empty CLI source", no_cli, "cannot derive the in-guest CLI")
+    no_from = check_config(mask_comments("class X { fun toJson(): JSONObject = JSONObject() }"), GOOD_CLI)
+    expect_trip("fromJson gone", no_from, "no `fun fromJson(`")
+
+    print("selftest dv25-A1 config arms (no-alias/baseline/comment-only/alias-first/"
+          "reversed/unwired/tojson-camel/no-null/new-cli-key/no-cli/no-fun) -> "
+          "%d/%d/%d/%d/%d/%d/%d/%d/%d/%d/%d violation(s)"
+          % (a1, a2, a3, a4, a5, a6, a7, a8, a9, len(no_cli), len(no_from)))
 
 
     if failures:
