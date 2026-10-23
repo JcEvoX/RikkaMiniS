@@ -87,6 +87,23 @@ Usage:
   python3 scripts/scan/offload_cli_args_check.py <repo_root>   # check the tree
   python3 scripts/scan/offload_cli_args_check.py <repo_root> --selftest
 Exit 0 = pass, 1 = violation (or selftest failure).
+[dv27-A5 A-07] addition (the exit code of a help-guarded early exit):
+
+ 13. Five handlers (`android-model-use`, `android-alarm`, `android-photos`,
+     `android-speech`, `android-a11y`) guarded `--help` AND a bare call with
+     one condition (`hasFlag("h", "help") || positional.isEmpty()`) and then
+     decided the exit code on POSITIONAL emptiness. `OffloadArgs` folds
+     `--help` / `-h` into flags, so `tool --help` leaves positional empty
+     exactly like a bare `tool`: the `else 0` arm was dead, every `tool --help`
+     exited 2 and `set -e` / `cmd --help && …` probe chains broke (the agent
+     reads a help request as a failure). H1 pins that a help probe reaches
+     exit 0 (a positional test cannot separate the two invocations); H2 keeps
+     the bare-invocation contract at 2 wherever the exit code varies; H3 is
+     fail-closed on the derivation itself (>= 15 sites, one decidable early
+     exit per help-probing file). The accepted spellings are derived, not
+     listed: a literal 0, a `const val … = 0` name, and `if (<token count>)
+     2 else 0` (DebugOffloadHandler's shape) all pass.
+
 Success marker on selftest: OFFLOAD_CLI_ARGS_SELFTEST=PASS
 
 [dv19-A1] additions (the same defect family one layer up: a decision read from
@@ -2367,6 +2384,341 @@ object WeatherManager {
 }
 """
 
+# ── [dv27-A5 A-07] a help-guarded early exit must answer 0 for `--help` ──────
+#
+# `OffloadArgs` folds `--help` / `-h` into `flags` (both are in
+# `OffloadOutput.OUTPUT_FLAGS`), so `tool --help` leaves `positional` EMPTY —
+# byte-for-byte the state a bare `tool` is in. A guard that merges the two
+# invocations (`hasFlag("h", "help") || positional.isEmpty()`) and then decides
+# the exit code on *positional emptiness* therefore answers 2 for `--help` as
+# well: its `else 0` arm is dead code. Five handlers shipped that shape, so
+# every `tool --help` exited 2 and `set -e` / `cmd --help && …` probe chains
+# broke (the agent reads `--help` as a failure).
+#
+# Rules, derived from the decision point (never from a spelling or a file list):
+#   H1 — a help probe must be able to reach exit 0. For every `if (<guard>)`
+#        whose condition probes the help flag, the guarded early exit's code
+#        expression must evaluate to 0 while the flag is present:
+#          • a literal 0 (or a `const val … = 0` name)                     → ok
+#          • `if (C) A else B` where C probes the help flag: A (the help
+#            side) must be 0;
+#          • `if (C) A else B` where C does NOT probe it: C must then be a
+#            TOKEN-COUNT separator (`argv.size` / `rawArgs.isEmpty`). A
+#            POSITIONAL test cannot separate the two invocations — `--help` is
+#            a flag, so positional stays empty — which is exactly the defect.
+#        Anything else is fail-closed red (an exit code nobody can decide is
+#        not evidence that `--help` works).
+#   H2 — the bare-invocation contract stays 2 wherever it is expressible: when
+#        the exit code varies and the guard can also be reached without help,
+#        the branch serving the bare call must be 2 (the pinned contract).
+#        A merged guard answering a literal 0 is left alone: `android-contacts`
+#        / `android-browser-use` deliberately print help at exit 0 for a bare
+#        call, and because their separator is a token count the help case is
+#        still reachable — they are not this family.
+#   H3 — fail-closed on the derivation itself: the family must still be found
+#        (>= 15 sites) and a file that probes help must yield a decidable early
+#        exit, so a rename or an extracted helper cannot narrow the rule to
+#        nothing and turn the gate into a false green.
+#
+# Judged on comment-stripped text, so a KDoc quoting the old shape cannot trip
+# the rule (1046-F9) and a comment cannot satisfy it either.
+_HELP_PROBE_RE = re.compile(r'hasFlag\(([^)]*)\)')
+_HELP_NAME_RE = re.compile(r'"([^"]*)"')
+_NUM_LIT_RE = re.compile(r'^\d+$')
+_BARE_SEPARATOR_RE = re.compile(
+    r'\b(?:argv|rawArgs)\s*\.\s*(?:size|isEmpty|count|length|isNotEmpty)\b')
+_POSITIONAL_TEST_RE = re.compile(
+    r'\bpositional\s*\.\s*(?:isEmpty|isNotEmpty|count|size)\b')
+_CONST_INT_RE = re.compile(r'\bconst\s+val\s+([A-Za-z_][A-Za-z_0-9]*)\s*=\s*(\d+)\b')
+
+
+def _statement_ifs(code: str):
+    r"""Indices of the `(` of every `if (` in STATEMENT position.
+
+    A naive `\bif\s*\(` scan also matches the `if (…) 0 else 2` nested INSIDE
+    a call argument (`NativeOffloadResult(if (help) 0 else 2, HELP)`), whose
+    "guarded region" is then the tail of that same expression — the gate would
+    judge the fix as if it were the guard. Only an `if` whose enclosing bracket
+    is a block (or nothing) can guard a statement, so the scan tracks the
+    bracket stack and skips string literals.
+    """
+    stack = []
+    i, n = 0, len(code)
+    while i < n:
+        c = code[i]
+        if c == '"':
+            j = i + 1
+            while j < n:
+                if code[j] == "\\":
+                    j += 2
+                    continue
+                if code[j] == '"':
+                    break
+                j += 1
+            i = j + 1
+            continue
+        if c in "([{":
+            stack.append(c)
+            i += 1
+            continue
+        if c in ")]}":
+            if stack:
+                stack.pop()
+            i += 1
+            continue
+        if code.startswith("if", i) and (i == 0 or not (code[i - 1].isalnum() or code[i - 1] in "_.")):
+            if not stack or stack[-1] == "{":
+                j = i + 2
+                while j < n and code[j].isspace():
+                    j += 1
+                if j < n and code[j] == "(":
+                    yield j
+            i += 2
+            continue
+        i += 1
+
+
+def _help_probe_span(cond: str):
+    """(start, end) of the first `hasFlag(...)` call naming the help flag."""
+    for m in _HELP_PROBE_RE.finditer(cond):
+        if "help" in _HELP_NAME_RE.findall(m.group(1)):
+            return (m.start(), m.end())
+    return None
+
+
+def _exit_code_value(expr: str, consts: dict):
+    """Int value of a numeric literal or a `const val … = <int>` name, else None."""
+    e = expr.strip()
+    if _NUM_LIT_RE.match(e):
+        return int(e)
+    return consts.get(e)
+
+
+def _guarded_region(text: str, j: int) -> str:
+    """The statement / block guarded by an `if (…)` whose `)` ends at [j]."""
+    n = len(text)
+    k = j
+    while k < n and text[k].isspace():
+        k += 1
+    if k >= n:
+        return ""
+    if text[k] == "{":
+        end = _pcs_match(text, k, "{", "}")
+        return text[k:end + 1] if end >= 0 else text[k:]
+    # single-statement form (`if (…) return NativeOffloadResult(…)`) — the call
+    # may sit on the next line, so walk to the first complete call.
+    idx = text.find("NativeOffloadResult(", k, min(n, k + 1200))
+    if idx < 0:
+        return ""
+    close = _pcs_match(text, idx + len("NativeOffloadResult"), "(", ")")
+    if close < 0:
+        return ""
+    eol = text.find("\n", close)
+    return text[k:(eol if eol >= 0 else n)]
+
+
+def _first_call_arg(text: str, paren_at: int):
+    """Text of the first top-level argument of the call whose `(` is [paren_at]."""
+    depth = 0
+    j = paren_at
+    while j < len(text):
+        c = text[j]
+        if c == '"':                      # a literal's brackets and commas do not count
+            j += 1
+            while j < len(text):
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    break
+                j += 1
+            j += 1
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                return text[paren_at + 1:j]
+        elif c == "," and depth == 1:
+            return text[paren_at + 1:j]
+        j += 1
+    return ""
+
+
+def _split_top_level_else(rest: str):
+    """Split `A else B` at its top-level `else`; (A, B) or (None, None)."""
+    depth = 0
+    i = 0
+    while i < len(rest):
+        c = rest[i]
+        if c == '"':
+            j = i + 1
+            while j < len(rest):
+                if rest[j] == "\\":
+                    j += 2
+                    continue
+                if rest[j] == '"':
+                    break
+                j += 1
+            i = j + 1
+            continue
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif depth == 0 and rest.startswith("else", i) \
+                and (i == 0 or rest[i - 1].isspace()) \
+                and (i + 4 >= len(rest) or rest[i + 4].isspace()):
+            return rest[:i].strip(), rest[i + 4:].strip()
+        i += 1
+    return None, None
+
+
+def _squash(text: str, limit: int = 90) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[:limit] + "…"
+
+
+def _help_exit_findings(file: str, guard: str, expr: str, consts: dict) -> list:
+    """H1/H2 verdict for one help-guarded early exit."""
+    findings = []
+    e = expr.strip()
+    value = _exit_code_value(e, consts)
+    if value is not None:
+        if value != 0:
+            findings.append(("H1", f"{file}: --help exits {value}",
+                             _squash(e)))
+        return findings
+    if not e.startswith("if") or "(" not in e:
+        findings.append(("H1", f"{file}: exit code is not decidable (fail-closed)",
+                         _squash(e)))
+        return findings
+    op = e.index("(")
+    cl = _pcs_match(e, op, "(", ")")
+    cond = e[op + 1:cl]
+    if_side, else_side = _split_top_level_else(e[cl + 1:])
+    if if_side is None:
+        findings.append(("H1", f"{file}: exit-code conditional has no else arm",
+                         _squash(e)))
+        return findings
+    probe = _help_probe_span(cond)
+    if probe is not None:
+        # `!hasFlag(…)` flips which arm serves the help call.
+        negated = cond.strip().startswith("!")
+        help_side, bare_side = (else_side, if_side) if negated else (if_side, else_side)
+    elif _BARE_SEPARATOR_RE.search(cond) and not _POSITIONAL_TEST_RE.search(cond):
+        # A token count separates a bare call (true) from a help call (false).
+        help_side, bare_side = else_side, if_side
+    else:
+        findings.append((
+            "H1",
+            f"{file}: exit code decided on positional emptiness — `--help` is a flag, "
+            f"so positional is empty for it too and the other arm is dead",
+            _squash(cond)))
+        return findings
+    help_value = _exit_code_value(help_side, consts)
+    if help_value != 0:
+        findings.append(("H1", f"{file}: the help arm of the exit code must be 0",
+                         _squash(help_side)))
+    outer_probe = _help_probe_span(guard)
+    guard_rest = (guard[:outer_probe[0]] + guard[outer_probe[1]:]) if outer_probe else ""
+    if "||" in guard_rest:
+        if _exit_code_value(bare_side, consts) != 2:
+            findings.append(("H2", f"{file}: a bare invocation must still exit 2",
+                             _squash(bare_side)))
+    return findings
+
+
+HELP_EXIT_MIN_SITES = 15
+
+
+def check_help_exit(sources: dict, min_sites: int = HELP_EXIT_MIN_SITES) -> list:
+    """[dv27-A5 A-07] H1–H3 above, over every offload source file.
+
+    [min_sites] is a parameter so the selftest can exercise the shape arms on a
+    hand-written fixture (which naturally has fewer sites) while the tree run
+    keeps the fail-closed floor.
+    """
+    findings = []
+    consts = {}
+    for src in sources.values():
+        for m in _CONST_INT_RE.finditer(code_only(src)):
+            consts[m.group(1)] = int(m.group(2))
+    sites = 0
+    for name in sorted(sources):
+        code = code_only(sources[name])
+        for op in _statement_ifs(code):
+            cl = _pcs_match(code, op, "(", ")")
+            cond = code[op + 1:cl]
+            if _help_probe_span(cond) is None:
+                continue
+            region = _guarded_region(code, cl + 1)
+            call = region.find("NativeOffloadResult(")
+            if call < 0:
+                findings.append((
+                    "H3", f"{name}: help guard with no exit-code site (fail-closed)",
+                    _squash(cond)))
+                continue
+            arg = _first_call_arg(region, region.index("(", call))
+            sites += 1
+            findings += _help_exit_findings(name, cond, arg, consts)
+    if sites < min_sites:
+        findings.append((
+            "H3", f"the help/bare derivation found only {sites} early exits "
+                  f"(< {min_sites}, fail-closed)",
+            "the handlers were renamed or the guard shape changed — re-derive, "
+            "do not delete the rule"))
+    return findings
+
+
+# [dv27-A5 A-07] Every ACCEPTED spelling of the help / bare-invocation exit
+# code, one class each — the mutation arms above are diffs against this text.
+GREEN_HELP_SHAPES = """
+class ConditionalHelp {
+    fun handle(request: NativeOffloadRequest): NativeOffloadResult {
+        val args = OffloadArgs(request.argv.drop(1))
+        // `--help` is a flag, so positional is empty for it too.
+        if (args.hasFlag("h", "help") || args.positional.isEmpty()) {
+            return NativeOffloadResult(if (args.hasFlag("h", "help")) 0 else 2, HELP)
+        }
+        return NativeOffloadResult(0, args.positional[0])
+    }
+}
+
+class TokenSeparatorHelp {
+    fun handle(request: NativeOffloadRequest): NativeOffloadResult {
+        val args = OffloadArgs(request.argv.drop(1))
+        if (request.argv.size <= 1 || args.hasFlag("h", "help") && args.positional.isEmpty()) {
+            return NativeOffloadResult(if (request.argv.size <= 1) 2 else 0, HELP)
+        }
+        return NativeOffloadResult(0, "list")
+    }
+}
+
+class ConstantHelp {
+    fun handle(request: NativeOffloadRequest): NativeOffloadResult {
+        val args = OffloadArgs(request.argv.drop(1))
+        if (args.hasFlag("h", "help")) return NativeOffloadResult(EXIT_OK, HELP)
+        return NativeOffloadResult(EXIT_FAILURE, "nope")
+    }
+}
+
+class LiteralHelp {
+    fun handle(request: NativeOffloadRequest): NativeOffloadResult {
+        val args = OffloadArgs(request.argv.drop(1))
+        if (rawArgs.isEmpty() || args.hasFlag("h", "help")) {
+            return NativeOffloadResult(0, HELP)
+        }
+        return NativeOffloadResult(1, "nope")
+    }
+}
+
+private const val EXIT_OK = 0
+private const val EXIT_FAILURE = 1
+"""
+
+
 def selftest() -> int:
     # Each case mutates ONE arm and names the rules it must trip. The expected
     # sets are written by hand from the rule table (never derived from a run:
@@ -3269,9 +3621,56 @@ def selftest() -> int:
             print(f"SELFTEST-FAIL: {label}: got {sorted(_got)}, want {sorted(_want)}")
             failures += 1
 
+    # [dv27-A5 A-07] help / bare-invocation exit-code arms. Expected rule-id
+    # sets are written by hand from the H1/H2/H3 table, never derived from a
+    # run; the fixture carries every accepted spelling at once (conditional on
+    # the flag, literal 0, a `const val` name, and the token-count separator).
+    def _help_ids(src, min_sites=1):
+        return {rid for rid, _, _ in check_help_exit({"H.kt": src}, min_sites=min_sites)}
+
+    for label, mutate, want in [
+        ("help exit: the accepted spellings are clean", None, set()),
+        ("help exit: decided on positional emptiness again (the defect)",
+         lambda x: x.replace('if (args.hasFlag("h", "help")) 0 else 2',
+                             'if (args.positional.isEmpty()) 2 else 0'), {"H1"}),
+        ("help exit: the help arm answers a non-zero literal",
+         lambda x: x.replace("NativeOffloadResult(0, HELP)",
+                             "NativeOffloadResult(2, HELP)"), {"H1"}),
+        ("help exit: the bare arm degraded to 0",
+         lambda x: x.replace("0 else 2", "0 else 0"), {"H2"}),
+        ("help exit: the bare arm degraded to 1",
+         lambda x: x.replace("0 else 2", "0 else 1"), {"H2"}),
+        ("help exit: the exit constant behind the help arm stops being 0",
+         lambda x: x.replace("const val EXIT_OK = 0", "const val EXIT_OK = 2"), {"H1"}),
+        ("help exit: an exit code nobody can decide (fail-closed)",
+         lambda x: x.replace('if (args.hasFlag("h", "help")) 0 else 2',
+                             "helpExitFor(args)"), {"H1"}),
+        ("help exit: a help guard with no exit site",
+         lambda x: x.replace('return NativeOffloadResult(0, HELP)',
+                             "println(HELP)"), {"H3"}),
+        ("help exit: the derivation finds fewer sites than the floor",
+         None, {"H3"}),
+    ]:
+        if label.endswith("floor"):
+            got = _help_ids(GREEN_HELP_SHAPES, min_sites=HELP_EXIT_MIN_SITES)
+        else:
+            mutated = GREEN_HELP_SHAPES if mutate is None else mutate(GREEN_HELP_SHAPES)
+            if mutate is not None and mutated == GREEN_HELP_SHAPES:
+                print(f"SELFTEST-FAIL: {label}: mutation did not apply to any arm")
+                failures += 1
+                continue
+            got = _help_ids(mutated)
+        if got != want:
+            print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
+            failures += 1
+    if clean_help := check_help_exit({"H.kt": GREEN_HELP_SHAPES}, min_sites=1):
+        print(f"SELFTEST-FAIL: help-exit green fixture is not clean: "
+              f"{describe(clean_help)}")
+        failures += 1
+
     if clean or clean_flags or clean_debug or clean_sessions or clean_bindings \
             or clean_payload or clean_album or clean_search or clean_clipboard \
-            or clean_send_status or clean_provenance:
+            or clean_send_status or clean_provenance or clean_help:
         green_findings = (clean + clean_flags + clean_debug + clean_sessions
                           + clean_bindings + clean_payload + clean_album + clean_search
                           + clean_clipboard + clean_send_status)
@@ -3352,6 +3751,8 @@ def main(argv):
         for _f in sorted(_p.glob("*.kt")):
             sources[_f.name] = _f.read_text(encoding="utf-8")
     findings += check_payload_delegates(sources, PAYLOAD_FILES)
+    # [dv27-A5 A-07] the help / bare-invocation exit code, derived over the family
+    findings += check_help_exit(sources)
     if findings:
         print("offload_cli_args_check: FAIL")
         print(describe(findings))
@@ -3370,7 +3771,10 @@ def main(argv):
           "contacts subcommand probe reads the rewritten alias list, sessions declares "
           "async/wait/help/h and documents --wait, grep budget stops a spent root before "
           "any file is opened, clipboard clear reaches clearPrimaryClip behind the shared "
-          "four-guard shape and keeps the pre-Q empty-string fallback)")
+          "four-guard shape and keeps the pre-Q empty-string fallback, "
+          "every help-guarded early exit answers 0 for --help while a bare invocation "
+          "still answers 2 (H1/H2 derived over the family, H3 fail-closed on the "
+          "derivation)")
     return 0
 
 
