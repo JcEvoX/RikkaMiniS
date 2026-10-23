@@ -60,6 +60,16 @@ stays private — `katex_ready_race_check.py` hard-pins its source form.
    Both criteria are fail-closed on a missing/renamed anchor and are scoped to
    the block they name — a legitimate bare `getString("sessionId")` route-arg
    read elsewhere in the file must not trip them.
+
+  debug/HeadlessChatRunner.kt (deep-audit-1045 A-05) — criterion 16 below
+   16. `applyModelOverride` must consult the session's PERSISTED binding before
+       applying the new-session default group (a caller cannot tell a session
+       created by the previous RPC call from one the user pinned last week, so
+       "no model passed" is not "rebind to the default"), must feed that row
+       value to the delegated decision (`resolveBindingTarget`), and must write
+       through to the resident view model through the non-creating lookup —
+       otherwise the live chat keeps the previous model while the row says the
+       new one.
 """
 import argparse
 import re
@@ -471,6 +481,141 @@ def _prompt_drop_violations(code: str) -> "list[str]":
             "HeadlessChatRunner.kt: prompt()'s `if (!started) { … }` block is "
             "EMPTY — falling through to the drain reports the last assistant "
             "turn as this request's answer"
+        )
+    return errs
+
+# [dv25-A05] criterion 16 — an RPC model override must not rebind a pinned session.
+#
+# `chat.prompt` / `chat.retry` pass `modelEntryId = modelGroupId = null` whenever
+# the caller did not ask for a model, and `applyModelOverride` read that as "no
+# model picked yet → apply the new-session default group". On a session the user
+# had pinned to a non-default model that is a silent REBIND: the second prompt
+# moved the session back to the default group, and (with the refresh half
+# missing) the screen kept showing the old model while the row said otherwise.
+#
+# Three decisions are pinned, all behaviour rather than spelling:
+#   1. the session's PERSISTED binding is consulted — the row, not a caller flag,
+#      because a caller cannot tell "session created by the previous RPC call"
+#      from "session the user pinned last week";
+#   2. that value is what the delegated decision is FED (`resolveBindingTarget`'s
+#      six outcomes are pinned by a pure JVM test, so the gate only has to prove
+#      the runner routes through it and does not read-and-ignore);
+#   3. the write reaches BOTH surfaces — the Room row and the resident VM through
+#      the non-creating peek (two helper hops are followed).
+RE_APPLY_OVERRIDE_DECL = re.compile(r"suspend\s+fun\s+applyModelOverride\s*\(")
+APPLY_OVERRIDE_ROW_TOKEN = "modelBinding"
+APPLY_OVERRIDE_DECISION_TOKEN = "resolveBindingTarget("
+APPLY_OVERRIDE_DEFAULT_TOKEN = "defaultPrimaryGroupId"
+APPLY_OVERRIDE_ROW_WRITE = "updateSessionBinding("
+APPLY_OVERRIDE_VM_PEEK = "peekViewModel("
+APPLY_OVERRIDE_VM_REFRESH = (
+    "restoreFromBinding(",
+    "applyDefaultModelFallback(",
+    "selectEntry(",
+    "selectGroup(",
+    "applyNewChatDefaultModel(",
+)
+
+
+def _matched_paren(code: str, open_idx: int) -> "str | None":
+    """`( … )` slice starting at [open_idx] (string-literal aware)."""
+    depth = 0
+    i = open_idx
+    n = len(code)
+    while i < n:
+        c = code[i]
+        if c == '"' or c == "'":
+            i = _skip_string_literal(code, i)
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return code[open_idx : i + 1]
+        i += 1
+    return None
+
+
+def _reaches(code: str, block: str, token: str, depth: int = 2, seen=None) -> bool:
+    """Is [token] reachable from [block] through at most [depth] same-file hops?
+
+    The refresh half legitimately lives two helpers away
+    (`applyModelOverride` → `persistBinding` → `applyBindingToResident`), so the
+    criterion follows the delegation instead of pinning helper names.
+    """
+    if token in block:
+        return True
+    if depth <= 0:
+        return False
+    if seen is None:
+        seen = set()
+    callee = token.rstrip("(")
+    for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", block):
+        name = m.group(1)
+        if name == callee or name in seen:
+            continue
+        seen.add(name)
+        body = _fn_body_after(code, re.compile(r"\bfun\s+" + re.escape(name) + r"\s*\("))
+        if body is not None and _reaches(code, body, token, depth - 1, seen):
+            return True
+    return False
+
+
+def _apply_override_violations(code: str) -> "list[str]":
+    """Criterion 16 for one `debug/HeadlessChatRunner.kt` (comments stripped)."""
+    body = _fn_body_after(code, RE_APPLY_OVERRIDE_DECL)
+    if body is None:
+        return [
+            "HeadlessChatRunner.kt: `suspend fun applyModelOverride(` block not found "
+            "(renamed or moved? re-anchor criterion 16, do not drop it)"
+        ]
+    errs = []
+    if APPLY_OVERRIDE_ROW_TOKEN not in body:
+        errs.append(
+            "HeadlessChatRunner.kt: applyModelOverride never reads the session's "
+            "persisted binding (`modelBinding`) — with no model passed it applies the "
+            "NEW-SESSION default group to an already bound session, silently rebinding "
+            "a pin the user made"
+        )
+    elif APPLY_OVERRIDE_DECISION_TOKEN not in body:
+        errs.append(
+            "HeadlessChatRunner.kt: applyModelOverride no longer routes the "
+            "new-session-vs-pinned decision through `resolveBindingTarget(…)` — the "
+            "decision is pinned by a pure JVM test, so re-deriving it here leaves one "
+            "of the two copies to drift"
+        )
+    else:
+        at = body.find(APPLY_OVERRIDE_DECISION_TOKEN)
+        args = _matched_paren(body, at + len(APPLY_OVERRIDE_DECISION_TOKEN) - 1)
+        if args is None or APPLY_OVERRIDE_ROW_TOKEN not in args:
+            errs.append(
+                "HeadlessChatRunner.kt: the row value is not what the decision is fed "
+                "— reading `modelBinding` and passing null/false is the same defect "
+                "with extra steps (args: %s)" % (args or "<unbalanced>")
+            )
+    if APPLY_OVERRIDE_DEFAULT_TOKEN not in body:
+        errs.append(
+            "HeadlessChatRunner.kt: applyModelOverride dropped the default primary "
+            "group — a session with no binding of its own would keep whatever "
+            "ensureSession seeded instead of the user's default group"
+        )
+    if not _reaches(code, body, APPLY_OVERRIDE_ROW_WRITE):
+        errs.append(
+            "HeadlessChatRunner.kt: the override never reaches the Room write "
+            "(`updateSessionBinding(`) — the row is the only cross-restart store"
+        )
+    if not _reaches(code, body, APPLY_OVERRIDE_VM_PEEK):
+        errs.append(
+            "HeadlessChatRunner.kt: the override never reaches the resident "
+            "ChatViewModel through the non-creating lookup (`peekViewModel(`) — the "
+            "live chat keeps the OLD model while the row says the new one"
+        )
+    elif not any(_reaches(code, body, tok) for tok in APPLY_OVERRIDE_VM_REFRESH):
+        errs.append(
+            "HeadlessChatRunner.kt: the resident VM is peeked but never applied "
+            "(none of %s) — the screen keeps the previous binding"
+            % "/".join(APPLY_OVERRIDE_VM_REFRESH)
         )
     return errs
 
@@ -1179,6 +1324,10 @@ def check(root: Path) -> int:
         #     previous turn replayed as a "Completed". ---
         errors.extend(_prompt_drop_violations(runner))
 
+        # --- 16. [dv25-A05] the RPC model override must not rebind a pinned
+        #     session, and its write must reach the live chat. ---
+        errors.extend(_apply_override_violations(runner))
+
     # --- 14. [deep-audit-1042 A-05 / 1043 A-05] every entry that mutates the
     #     ViewModel's in-memory turn state awaits the `sessionLoaded` latch
     #     BEFORE the mutation. Files, entries and receivers are all derived
@@ -1401,6 +1550,54 @@ assert FIXTURE_RUNNER.endswith(_R_RUNNER_TAIL), "runner fixture tail moved"
 FIXTURE_RUNNER = (
     FIXTURE_RUNNER[: -len(_R_RUNNER_TAIL)] + _prompt_entry(_R_PROMPT_GUARD_INLINE) + _R_RUNNER_TAIL
 )
+
+# --- criterion 16 [dv25-A05]: the RPC model override ------------------------
+# Every runner fixture carries `applyModelOverride`, for the same fail-closed
+# reason as `prompt()` above: a fixture without it would red criterion 16 and
+# make the 13/14/15 arms look like they have teeth they do not have. Faithful to
+# the production shape (row read inlined into the decision call, two helper hops
+# to the refresh), never compiled.
+_R_OVERRIDE_ROW_READ = (
+    "        val target = resolveBindingTarget(\n"
+    "            requestedEntryId = modelEntryId,\n"
+    "            requestedGroupId = modelGroupId,\n"
+    "            existingBinding = app.chatRepository.dao.getSession(sessionId)?"
+    ".modelBinding,\n"
+    "            defaultGroupId = cfg.defaultPrimaryGroupId?.takeIf { gid ->\n"
+    "                cfg.modelGroups.any { it.id == gid }\n"
+    "            },\n"
+    "        )\n"
+)
+_R_OVERRIDE_REFRESH_CALL = "        if (vm != null) applyBindingToResident(vm, sessionId)\n"
+_R_OVERRIDE_ENTRY = (
+    "\n"
+    "    suspend fun applyModelOverride(\n"
+    "        context: Context,\n"
+    "        sessionId: String,\n"
+    "        modelEntryId: String?,\n"
+    "        modelGroupId: String?,\n"
+    "    ): String? = withContext(Dispatchers.IO) {\n"
+    "        val app = app(context)\n"
+    "        val cfg = app.providerRepository.config.value\n"
+    + _R_OVERRIDE_ROW_READ
+    + "        persistBinding(app, sessionId, target)\n"
+    "        null\n"
+    "    }\n"
+    "\n"
+    "    private fun persistBinding(app: MinisApp, sessionId: String, target: Any) {\n"
+    "        val vm = ChatViewModelStore.peekViewModel(sessionId)\n"
+    "        app.chatRepository.updateSessionBinding(sessionId, \"\", \"\")\n"
+    + _R_OVERRIDE_REFRESH_CALL
+    + "    }\n"
+    "\n"
+    "    private fun applyBindingToResident(vm: ChatViewModel, sessionId: String) {\n"
+    "        if (!vm.restoreFromBinding(\"\")) vm.applyDefaultModelFallback()\n"
+    "    }\n"
+)
+assert FIXTURE_RUNNER.endswith(_R_RUNNER_TAIL), "runner fixture tail moved"
+FIXTURE_RUNNER = (
+    FIXTURE_RUNNER[: -len(_R_RUNNER_TAIL)] + _R_OVERRIDE_ENTRY + _R_RUNNER_TAIL
+)
 # Green arm, delegated spelling: the envelope literals live in a helper one hop
 # away, which the criterion must accept (it binds the decision, not the spelling).
 FIXTURE_RUNNER_DROP_DELEGATED = (
@@ -1472,6 +1669,64 @@ _RUNNER_MUTATIONS = (
      FIXTURE_RUNNER_RAW_KEY, _R_RESOLVED_ARG),
     ("resolver drops the cache fast path (MUT-R4)", FIXTURE_RUNNER_NO_FASTPATH, _R_CACHE_BLOCK),
     ("a renamed cancel anchor (MUT-R5)", FIXTURE_RUNNER_RENAMED, "suspend fun cancel("),
+)
+
+# --- criterion 16 [dv25-A05]: one dirty variant per decision point ----------
+_OVERRIDE_ARG_LINE = (
+    "            existingBinding = app.chatRepository.dao.getSession(sessionId)?"
+    ".modelBinding,\n"
+)
+FIXTURE_RUNNER_ROW_IGNORED = FIXTURE_RUNNER.replace(
+    _R_OVERRIDE_ROW_READ,
+    "        val row = app.chatRepository.dao.getSession(sessionId)?.modelBinding\n"
+    "        val target = resolveBindingTarget(\n"
+    "            requestedEntryId = modelEntryId,\n"
+    "            requestedGroupId = modelGroupId,\n"
+    "            existingBinding = null,\n"
+    "            defaultGroupId = cfg.defaultPrimaryGroupId?.takeIf { gid ->\n"
+    "                cfg.modelGroups.any { it.id == gid }\n"
+    "            },\n"
+    "        )\n",
+)
+FIXTURE_RUNNER_NO_DECISION = FIXTURE_RUNNER.replace(
+    _R_OVERRIDE_ROW_READ,
+    "        val existing = app.chatRepository.dao.getSession(sessionId)?.modelBinding\n"
+    "        val target: Any = if (existing.isNullOrBlank()) "
+    "cfg.defaultPrimaryGroupId else existing\n",
+)
+FIXTURE_RUNNER_NO_REFRESH = FIXTURE_RUNNER.replace(_R_OVERRIDE_REFRESH_CALL, "")
+FIXTURE_RUNNER_ROW_ONLY_WRITE = FIXTURE_RUNNER.replace(
+    "        val vm = ChatViewModelStore.peekViewModel(sessionId)\n", "")
+FIXTURE_RUNNER_NO_DEFAULT_GROUP = FIXTURE_RUNNER.replace(
+    "            defaultGroupId = cfg.defaultPrimaryGroupId?.takeIf { gid ->\n"
+    "                cfg.modelGroups.any { it.id == gid }\n"
+    "            },\n",
+    "            defaultGroupId = null,\n",
+)
+_R_OVERRIDE_PREFIX = (
+    "        val resolvedGroupId = modelGroupId ?: run {\n"
+    "            if (modelEntryId != null) return@run null\n"
+    "            cfg.defaultPrimaryGroupId?.takeIf { gid -> cfg.modelGroups.any { "
+    "it.id == gid } }\n"
+    "        }\n"
+    "        app.chatRepository.updateSessionBinding(sessionId, \"\", \"\")\n"
+)
+FIXTURE_RUNNER_BASELINE_OVERRIDE = FIXTURE_RUNNER.replace(
+    _R_OVERRIDE_ROW_READ, _R_OVERRIDE_PREFIX)
+
+_OVERRIDE_MUTATIONS = (
+    ("the row value is read and ignored (MUT-O1)",
+     FIXTURE_RUNNER_ROW_IGNORED, "not what the decision is fed"),
+    ("the decision is re-derived inline (MUT-O2)",
+     FIXTURE_RUNNER_NO_DECISION, "no longer routes"),
+    ("the resident VM is peeked but never applied (MUT-O3)",
+     FIXTURE_RUNNER_NO_REFRESH, "peeked but never applied"),
+    ("the write stops at the Room row (MUT-O4)",
+     FIXTURE_RUNNER_ROW_ONLY_WRITE, "never reaches the resident"),
+    ("the new-session default group is dropped (MUT-O5)",
+     FIXTURE_RUNNER_NO_DEFAULT_GROUP, "dropped the default primary group"),
+    ("the pre-fix unconditional default group (MUT-O6)",
+     FIXTURE_RUNNER_BASELINE_OVERRIDE, "never reads the session's persisted binding"),
 )
 
 # --- criterion 14 [deep-audit-1042 A-05]: the session-ready barrier ----------
@@ -2046,6 +2301,23 @@ def selftest() -> int:
                 f"criterion 15 {name}: expected a `{expect}` violation, got {errs}")
         else:
             print(f"selftest: criterion 15 {name} -> RED ({len(errs)} violation(s)) OK")
+
+    # --- criterion 16 [dv25-A05]: the RPC model override ---
+    rc, errs = run_tree(screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY, FIXTURE_RUNNER)
+    if rc != 0:
+        failures.append(f"criterion 16 GREEN fixture unexpectedly red: {errs}")
+    else:
+        print("selftest: criterion 16 GREEN fixture passes")
+    for name, run_fixture, expect in _OVERRIDE_MUTATIONS:
+        if run_fixture == FIXTURE_RUNNER:
+            failures.append(f"criterion 16 {name}: mutation is a no-op (anchor not found)")
+            continue
+        rc, errs = run_tree(screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY, run_fixture)
+        if rc == 0 or not [e for e in errs if expect in e]:
+            failures.append(
+                f"criterion 16 {name}: expected a `{expect}` violation, got {errs}")
+        else:
+            print(f"selftest: criterion 16 {name} -> RED ({len(errs)} violation(s)) OK")
 
     # --- criterion 14 [deep-audit-1042 A-05]: the session-ready barrier ---
     # Backward compat: the fixture above (no mutator calls) proves the

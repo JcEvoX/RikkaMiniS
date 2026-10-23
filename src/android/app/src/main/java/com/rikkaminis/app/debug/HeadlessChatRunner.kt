@@ -3,15 +3,22 @@ package com.rikkaminis.app.debug
 import android.content.Context
 import androidx.lifecycle.ViewModelProvider
 import com.rikkaminis.app.MinisApp
+import com.rikkaminis.app.config.BindingTarget
+import com.rikkaminis.app.config.SessionConfigWriteThrough
+import com.rikkaminis.app.config.resolveBindingTarget
 import com.rikkaminis.app.data.model.ThinkingLevel
+import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.ui.chat.ChatViewModel
 import com.rikkaminis.app.ui.chat.ChatViewModelStore
 import com.rikkaminis.app.ui.chat.InputAttachment
 import com.rikkaminis.app.ui.chat.addAttachment
+import com.rikkaminis.app.ui.chat.applyDefaultModelFallback
+import com.rikkaminis.app.ui.chat.restoreFromBinding
 import com.rikkaminis.app.ui.chat.selectEntry
 import com.rikkaminis.app.ui.chat.setThinkingLevel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 
@@ -31,6 +38,8 @@ import kotlinx.coroutines.withTimeoutOrNull
  * on the same session can collect the same `isStreaming` Flow.
  */
 internal object HeadlessChatRunner {
+
+    private const val TAG = "HeadlessChatRunner"
 
     /**
      * sessionId → ViewModelProvider that owns its single ChatViewModel.
@@ -114,6 +123,8 @@ internal object HeadlessChatRunner {
      * - `modelEntryId`: bind to a specific entry (`binding=entry`).
      * - `modelGroupId`: bind to a group (`binding=group`); the picker uses
      *   the group's routing strategy at chat time.
+     * - neither: leave an ALREADY bound session alone; only a session with no
+     *   binding of its own falls back to the default primary group.
      * Returns the human-friendly `modelName` for the response.
      */
     suspend fun applyModelOverride(
@@ -127,44 +138,127 @@ internal object HeadlessChatRunner {
         }
         val app = app(context)
         val cfg = app.providerRepository.config.value
-        // No explicit model → bind to the user's default primary group (the
-        // `isDefault: true` group in provider.groups.list), matching the in-app
-        // "new chat, no model picked" path (ChatViewModel priority-3 fallback on
-        // providerRepository.defaultPrimaryGroupId). Without this the session
-        // kept whatever model ensureSession seeded — the first visible provider
-        // entry (e.g. OpenRouter's aion-labs/aion-3.0-mini) — not the default group.
-        val resolvedGroupId = modelGroupId ?: run {
-            if (modelEntryId != null) return@run null
-            cfg.defaultPrimaryGroupId?.takeIf { gid -> cfg.modelGroups.any { it.id == gid } }
+        // [dv25-A05] The default primary group is a NEW-SESSION default, not an
+        // override. It used to be applied unconditionally when both parameters
+        // were null — which is exactly what `chat.prompt` / `chat.retry` pass
+        // when the caller did not ask for a model — so every follow-up prompt on
+        // a session the user had pinned to a non-default model silently rebound
+        // it to the default group (and, with the refresh half missing, left the
+        // screen showing the old model while the row said otherwise).
+        //
+        // The answer has to come from the row, not from a caller flag: a caller
+        // cannot tell "session created by the previous RPC call" from "session
+        // the user pinned last week". `resolveBindingTarget` is the same pure
+        // decision the tests pin, and the row read is its argument — inlined on
+        // purpose, so the value that is consulted is visibly the one that is
+        // used (no local that can be dropped later).
+        val target = resolveBindingTarget(
+            requestedEntryId = modelEntryId,
+            requestedGroupId = modelGroupId,
+            existingBinding = app.chatRepository.dao.getSession(sessionId)?.modelBinding,
+            defaultGroupId = cfg.defaultPrimaryGroupId?.takeIf { gid ->
+                cfg.modelGroups.any { it.id == gid }
+            },
+        )
+        when (target) {
+            // Nothing to write: keep the session's own binding (or, with no
+            // request and no default group configured, keep whatever
+            // `ensureSession` seeded).
+            BindingTarget.Preserve, BindingTarget.None -> return@withContext null
+            is BindingTarget.Entry -> {
+                val entry = cfg.modelEntries.firstOrNull { it.id == target.entryId }
+                    ?: throw RPCException(-32602, "Entry not found: ${target.entryId}")
+                val instance = cfg.instances.firstOrNull { it.id == entry.providerInstanceId }
+                    ?: throw RPCException(-32602, "Provider instance for entry not found")
+                if (!instance.isEnabled) throw RPCException(-32602, "Provider instance is disabled")
+                // The binding column stores a JSON object the VM parses in
+                // restoreFromBinding (ChatViewModel: {"type":"entry","entryId":…}).
+                // Writing the bare literal "entry" left restoreFromBinding unable to
+                // resolve the entry, so activeEntryId never flipped non-null, the
+                // headless provider-resolve wait timed out, and sendMessage
+                // early-returned with no LLM request — RPC-driven sessions produced
+                // a lone user message and no assistant turn.
+                val binding = """{"type":"entry","entryId":"${entry.id}"}"""
+                persistBinding(app, sessionId, binding, entry.baseModel.id)
+                return@withContext entry.model.displayName
+            }
+            is BindingTarget.Group -> {
+                val group = cfg.modelGroups.firstOrNull { it.id == target.groupId }
+                    ?: throw RPCException(-32602, "Group not found: ${target.groupId}")
+                val firstMemberId = group.memberEntryIds.firstOrNull()
+                val firstMember = firstMemberId?.let { mid -> cfg.modelEntries.firstOrNull { it.id == mid } }
+                val resolvedModelId = firstMember?.baseModel?.id ?: ""
+                // Same JSON-object shape the VM expects for a group binding.
+                val groupBinding = """{"type":"group","groupId":"${group.id}"}"""
+                persistBinding(app, sessionId, groupBinding, resolvedModelId)
+                return@withContext group.name
+            }
         }
-        if (modelEntryId == null && resolvedGroupId == null) return@withContext null
-        if (modelEntryId != null) {
-            val entry = cfg.modelEntries.firstOrNull { it.id == modelEntryId }
-                ?: throw RPCException(-32602, "Entry not found: $modelEntryId")
-            val instance = cfg.instances.firstOrNull { it.id == entry.providerInstanceId }
-                ?: throw RPCException(-32602, "Provider instance for entry not found")
-            if (!instance.isEnabled) throw RPCException(-32602, "Provider instance is disabled")
-            // The binding column stores a JSON object the VM parses in
-            // restoreFromBinding (ChatViewModel: {"type":"entry","entryId":…}).
-            // Writing the bare literal "entry" left restoreFromBinding unable to
-            // resolve the entry, so activeEntryId never flipped non-null, the
-            // headless provider-resolve wait timed out, and sendMessage
-            // early-returned with no LLM request — RPC-driven sessions produced
-            // a lone user message and no assistant turn.
-            val binding = """{"type":"entry","entryId":"${entry.id}"}"""
-            app.chatRepository.updateSessionBinding(sessionId, binding, entry.baseModel.id)
-            return@withContext entry.model.displayName
+    }
+
+    /**
+     * [dv25-A05] Write a session binding to BOTH surfaces, in the order 1044-A05
+     * established for `minis-config session.primaryModel`: the Room row first
+     * (the only cross-restart store, and the write must have landed before it
+     * reports success), then the resident ViewModel.
+     *
+     * The refresh goes through [ChatViewModel.restoreFromBinding] — the SAME
+     * entry `loadSession` uses — so honours the provider-enabled / credential
+     * gates, with the same `applyDefaultModelFallback` second priority. Without
+     * it the row said one model while the live chat kept the previous one, and
+     * the headless `activeEntryId` wait could return on the OLD binding.
+     */
+    private fun persistBinding(
+        app: MinisApp,
+        sessionId: String,
+        bindingJson: String,
+        modelId: String,
+    ) {
+        // `peekViewModel` walks the ViewModelStore, so it is main-thread-only and
+        // must not create a VM for a chat that is not on screen.
+        val vm = runBlocking { withContext(Dispatchers.Main) { ChatViewModelStore.peekViewModel(sessionId) } }
+        SessionConfigWriteThrough.deliver(
+            vm = vm,
+            persist = { app.chatRepository.updateSessionBinding(sessionId, bindingJson, modelId) },
+            hasPersistedRow = { app.chatRepository.dao.getSession(sessionId) != null },
+            refresh = { resident -> applyBindingToResident(resident, bindingJson, sessionId) },
+            onDraftWithoutRow = {
+                AppLogger.warning(
+                    TAG,
+                    "applyModelOverride: session '$sessionId' has no persisted row and no " +
+                        "resident view model — the binding write matched 0 rows",
+                )
+            },
+        )
+    }
+
+    /**
+     * [dv25-A05] Push [bindingJson] into the resident view model.
+     *
+     * The VM-side entry points are main-thread-only; [SessionConfigWriteThrough
+     * .deliver] is synchronous (called from the RPC's IO dispatcher), hence the
+     * blocking hop. A throw here must not turn a landed row write into an RPC
+     * failure — the row is authoritative and the UI is one load behind — so it
+     * is logged, not rethrown.
+     */
+    private fun applyBindingToResident(
+        vm: ChatViewModel,
+        bindingJson: String,
+        sessionId: String,
+    ) {
+        runBlocking {
+            withContext(Dispatchers.Main) {
+                runCatching {
+                    if (!vm.restoreFromBinding(bindingJson)) vm.applyDefaultModelFallback()
+                }.onFailure {
+                    AppLogger.warning(
+                        TAG,
+                        "applyModelOverride: resident view model refresh failed for " +
+                            "'$sessionId': ${it.message}",
+                    )
+                }
+            }
         }
-        // modelGroupId (explicit) or the default primary group (implicit fallback)
-        val group = cfg.modelGroups.firstOrNull { it.id == resolvedGroupId }
-            ?: throw RPCException(-32602, "Group not found: $resolvedGroupId")
-        val firstMemberId = group.memberEntryIds.firstOrNull()
-        val firstMember = firstMemberId?.let { mid -> cfg.modelEntries.firstOrNull { it.id == mid } }
-        val resolvedModelId = firstMember?.baseModel?.id ?: ""
-        // Same JSON-object shape the VM expects for a group binding.
-        val groupBinding = """{"type":"group","groupId":"${group.id}"}"""
-        app.chatRepository.updateSessionBinding(sessionId, groupBinding, resolvedModelId)
-        return@withContext group.name
     }
 
     /**
