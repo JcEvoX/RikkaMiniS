@@ -1000,6 +1000,77 @@ def composer_intent_parity_findings(vm_c, inp_c, screen_c):
     return problems
 
 
+# ── H (dv25-B05): the Fast Mode toggle has ONE source ──────────────────────
+#
+# The flag is APP-LEVEL and persisted (FastModePrefs). The provider layer reads
+# it per request through `FastModePrefs.isEnabled()`, but the chat screen read
+# a ViewModel-LOCAL copy seeded once at construction
+# (`MutableStateFlow(FastModePrefs.isEnabled())`). ViewModels live in
+# ChatViewModelStore, so an already-open conversation kept rendering the flag
+# as it was when that chat was first opened: the menu row and the nav ⚡ badge
+# disagreed with the wire. The defect is the SECOND copy, not a missing sync.
+#
+# The criterion is DERIVED, not spelled: the process-level flow is whatever
+# public `StateFlow<Boolean>` FastModePrefs exposes, and the ViewModel must
+# source its own flow from THAT property. A rename on either side stays green;
+# a second, locally-seeded copy goes red.
+FASTMODE_REL = ("src/android/app/src/main/java/com/rikkaminis/app/"
+                "data/FastModePrefs.kt")
+FASTMODE_FLOW_RE = re.compile(
+    r"^[ \t]*val\s+(\w+)\s*:\s*StateFlow<Boolean>", re.MULTILINE)
+FASTMODE_SNAPSHOT_RE = re.compile(
+    r"MutableStateFlow\s*\([^)]*FastModePrefs\s*\.\s*isEnabled\s*\(\)")
+
+
+def fast_mode_single_source_findings(vm_c, fm_c):
+    """H1-H3 (dv25-B05 / deep-audit-1045 B-05)."""
+    problems = []
+    if vm_c is None:
+        return problems
+    if fm_c is None:
+        problems.append(("H2",
+                         "FastModePrefs.kt cannot be read — fail-closed (the global "
+                         "source of the Fast Mode flag is unknown)"))
+        return problems
+
+    flows = sorted(set(FASTMODE_FLOW_RE.findall(fm_c)))
+    if not flows:
+        problems.append(("H2",
+                         "FastModePrefs exposes NO public `StateFlow<Boolean>` — the "
+                         "chat screen has nothing global to read, so it will keep a "
+                         "local copy that drifts"))
+        return problems
+
+    # H1 — no locally seeded snapshot of the global flag.
+    if FASTMODE_SNAPSHOT_RE.search(vm_c):
+        problems.append(("H1",
+                         "ChatViewModel seeds a local MutableStateFlow from "
+                         "`FastModePrefs.isEnabled()` — a CONSTRUCTION-TIME snapshot. "
+                         "ViewModels live in ChatViewModelStore, so an already-open "
+                         "conversation keeps rendering the flag as of the moment it was "
+                         "first opened, while every request builder already uses the "
+                         "new value: the screen and the wire disagree"))
+
+    # H2 — the ViewModel's flow must be sourced from the global one.
+    decl = re.search(
+        r"val\s+fastModeEnabled\s*:\s*StateFlow<Boolean>\s*=\s*([^\n]+)",
+        vm_c)
+    if decl is None:
+        problems.append(("H2",
+                         "`val fastModeEnabled: StateFlow<Boolean>` not found in "
+                         "ChatViewModel — fail-closed (the toggle must stay observable)"))
+        return problems
+    init = decl.group(1)
+    if not any(re.search(r"FastModePrefs\s*\.\s*%s\b" % re.escape(f), init)
+               for f in flows):
+        problems.append(("H2",
+                         "`fastModeEnabled` is not sourced from FastModePrefs' global "
+                         "flow (%s) — it must be the SAME flow the provider layer and "
+                         "every other screen read, not a second copy"
+                         % " / ".join(flows)))
+    return problems
+
+
 # ── the gate ─────────────────────────────────────────────────────────────────
 
 def check_tree(root):
@@ -1247,6 +1318,14 @@ def check_tree(root):
         strip_comments(vm) if vm is not None else None,
         inp_c,
         strip_strings(strip_comments(screen)) if screen is not None else None))
+
+    # ── H1-H3: the Fast Mode toggle has one source (dv25-B05) ──────────────
+    # ChatViewModel.kt is read comment-stripped only (see the note above: the
+    # shared string stripper mis-tracks its CHAR literals).
+    fastmode = read(root, FASTMODE_REL)
+    problems.extend(fast_mode_single_source_findings(
+        strip_comments(vm) if vm is not None else None,
+        strip_comments(fastmode) if fastmode is not None else None))
 
     return INPUT_REL, problems
 
@@ -2095,6 +2174,9 @@ private fun ComposerIntentHost(viewModel: ChatViewModel) {
 VM_F = """package com.rikkaminis.app.ui.chat
 
 class ChatViewModel {
+    // [dv25-B05] the compliant shape: the flow IS the global one.
+    val fastModeEnabled: StateFlow<Boolean> = com.rikkaminis.app.data.FastModePrefs.enabled
+
     fun appendToInputText(snippet: String) {
         val cleaned = snippet.trim()
         if (cleaned.isEmpty()) return
@@ -2143,6 +2225,25 @@ INPUT_H = INPUT_G.replace(
                     commitComposerBody(next, next.length)
                 }""")
 
+# [dv25-B05] the global source of the Fast Mode flag.
+FASTMODE_F = """package com.rikkaminis.app.data
+
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+object FastModePrefs {
+    private val _enabled = MutableStateFlow(false)
+    val enabled: StateFlow<Boolean> = _enabled.asStateFlow()
+
+    fun isEnabled(): Boolean = _enabled.value
+
+    fun setEnabled(context: Context, enabled: Boolean) {
+        _enabled.value = enabled
+    }
+}
+"""
+
 def fixtures(**overrides):
     files = {
         MODELS_REL: MODELS_F,
@@ -2158,6 +2259,8 @@ def fixtures(**overrides):
         SLASH_EXT_REL: SLASHEXT_F,
         SKILL_REPO_REL: SKILLREPO_F,
         MCP_REPO_REL: MCPREPO_F,
+        # [dv25-B05] the global Fast Mode source.
+        FASTMODE_REL: FASTMODE_F,
     }
     files.update(overrides)
     # An override of None removes the file from the tree entirely — the
@@ -2217,6 +2320,31 @@ def selftest():
 
     # clean fixture → exit 0
     expect("clean", fixtures(), None)
+    # ── H1-H3 (dv25-B05): the Fast Mode toggle has ONE source ──────────────
+    # The H family reads ChatViewModel.kt, so these arms ship the ViewModel
+    # fixture too (and the composer fixture that satisfies the G6/G7 criteria
+    # it shares the tree with — otherwise the arm would trip an unrelated
+    # criterion and the "only this one turns red" proof would be worthless).
+    h_base = {VM_REL: VM_F, INPUT_REL: INPUT_H}
+    # H1: the pre-fix construction-time snapshot of the global flag.
+    expect("H1 local fast-mode snapshot", fixtures(**dict(h_base, **{
+        VM_REL: VM_F.replace(
+            "    val fastModeEnabled: StateFlow<Boolean> = com.rikkaminis.app.data.FastModePrefs.enabled\n",
+            "    private val _fastModeEnabled = MutableStateFlow(com.rikkaminis.app.data.FastModePrefs.isEnabled())\n"
+            "    val fastModeEnabled: StateFlow<Boolean> = _fastModeEnabled.asStateFlow()\n"),
+    })), ["H1"])
+    # H2: a second, locally-owned copy of the same value.
+    expect("H2 fast-mode not sourced from the global flow", fixtures(**dict(h_base, **{
+        VM_REL: VM_F.replace(
+            "    val fastModeEnabled: StateFlow<Boolean> = com.rikkaminis.app.data.FastModePrefs.enabled\n",
+            "    private val _fastModeEnabled = MutableStateFlow(false)\n"
+            "    val fastModeEnabled: StateFlow<Boolean> = _fastModeEnabled.asStateFlow()\n"),
+    })), ["H2"])
+    # H2 fail-closed: the global object exposes no observable flow at all.
+    expect("H2 no global fast-mode flow", fixtures(**dict(h_base, **{
+        FASTMODE_REL: FASTMODE_F.replace(
+            "    val enabled: StateFlow<Boolean> = _enabled.asStateFlow()\n", ""),
+    })), ["H2"])
     # A1: a written-but-never-read boolean flips red (the B-01 class, generalized)
     expect("A1 unread boolean", fixtures(**{
         MODELS_REL: MODELS_F.replace(

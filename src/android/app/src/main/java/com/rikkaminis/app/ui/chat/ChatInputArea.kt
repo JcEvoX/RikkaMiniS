@@ -389,6 +389,10 @@ internal fun ChatInputArea(
         imeBurstJob?.cancel()
         imeBurstJob = null
         imeBurstBuffer = null
+        // [dv25-B08] The buffer is gone, so the ViewModel's pending copy must go
+        // with it — every caller of this funnel commits the field's live text
+        // itself, which is newer than the snapshot.
+        viewModel.publishPendingComposerText(null)
     }
     // [dv20-B03] Single funnel for "clear the composer from outside
     // onValueChange". Every clear entrance used to spell
@@ -1659,6 +1663,13 @@ internal fun ChatInputArea(
                                 if (shouldDebounceImeBurst(inputText, tfv.text)) {
                                     imeBurstBuffer = tfv.text
                                     imeBurstCaret = tfv.selection.end
+                                    // [dv25-B08] Publish the pending snapshot to the
+                                    // ViewModel: the field's live text is the newest
+                                    // copy of what the user typed, and for 150 ms it
+                                    // exists ONLY here. `promoteDraftIfNeeded` (the
+                                    // "New Chat" path) reads it so a dictated tail is
+                                    // not promoted as the pre-burst string.
+                                    viewModel.publishPendingComposerText(tfv.text)
                                     imeBurstJob?.cancel()
                                     imeBurstJob = coroutineScope.launch {
                                         delay(150)
@@ -1676,6 +1687,12 @@ internal fun ChatInputArea(
                                         // snapshot would overwrite them.
                                         imeBurstJob = null
                                         imeBurstBuffer = null
+                                        // [dv25-B08] The pending snapshot is spent:
+                                        // whatever the field commits next is the
+                                        // authoritative text, so the ViewModel's
+                                        // pending copy must not outlive its flush
+                                        // (the `fix/ttfb-thinktag-composer` lesson).
+                                        viewModel.publishPendingComposerText(null)
                                         if (flushed != null &&
                                             shouldCommitImeBurst(flushed, inputText, inputFieldValue.text)
                                         ) {
@@ -1698,6 +1715,9 @@ internal fun ChatInputArea(
                                     }
                                 } else {
                                     viewModel.setInputText(tfv.text)
+                                    // [dv25-B08] No burst pending any more — the
+                                    // committed string IS the newest copy.
+                                    viewModel.publishPendingComposerText(null)
                                     viewModel.updateSlashMenuState(tfv.text)
                                     viewModel.updateMentionMenuState(
                                         text = tfv.text,

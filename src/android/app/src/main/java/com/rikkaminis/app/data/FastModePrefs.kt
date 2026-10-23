@@ -2,6 +2,9 @@ package com.rikkaminis.app.data
 
 import android.content.Context
 import android.content.SharedPreferences
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * [T-codex-fast-mode] App-level persisted Fast Mode toggle (mirrors iOS
@@ -55,12 +58,42 @@ object FastModePrefs {
      *
      * Guard: `scripts/scan/prefs_listener_holder_guard.py`.
      */
+    /**
+     * [dv25-B05 / deep-audit-1045 B-05] Process-level observable for the SAME
+     * value [isEnabled] serves. The chat screen used to keep its own copy
+     * (`MutableStateFlow(FastModePrefs.isEnabled())` seeded at ViewModel
+     * construction), so a cached conversation kept drawing the flag as of the
+     * moment it was first opened while every request builder already used the
+     * new one. Exposing it here makes the toggle one value with one write path:
+     * [setEnabled], [prime] and [selfSyncListener] all publish through
+     * [publish], and no caller holds a second copy to drift.
+     */
+    private val _enabled = MutableStateFlow(false)
+    val enabled: StateFlow<Boolean> = _enabled.asStateFlow()
+
+    /**
+     * The only writer of the two mirror representations ([cachedEnabled] stays
+     * because the context-free readers and the prefs guard anchor on it; the flow
+     * is what screens collect). Both are updated together, so they cannot
+     * disagree.
+     */
+    private fun publish(value: Boolean) {
+        cachedEnabled = value
+        // `MutableStateFlow` drops equal writes itself, so no guard is needed;
+        // the value here is always the same one `cachedEnabled` just took.
+        _enabled.value = value
+    }
+
     @Volatile
     private var listenerRegistered = false
 
     private val selfSyncListener =
         SharedPreferences.OnSharedPreferenceChangeListener { changed, _ ->
+            // The snapshot is reloaded in the listener body itself (that is the
+            // [ARCH-02] S3 contract the prefs guard anchors on), then published
+            // to the observable so screens move with it.
             cachedEnabled = changed.getBoolean(KEY_ENABLED, false)
+            publish(cachedEnabled)
         }
 
     private fun prefs(context: Context): SharedPreferences =
@@ -77,7 +110,7 @@ object FastModePrefs {
                 }
             }
         }
-        cachedEnabled = p.getBoolean(KEY_ENABLED, false)
+        publish(p.getBoolean(KEY_ENABLED, false))
     }
 
     /**
@@ -90,7 +123,7 @@ object FastModePrefs {
     }
 
     fun setEnabled(context: Context, enabled: Boolean) {
-        cachedEnabled = enabled
+        publish(enabled)
         prefs(context).edit().putBoolean(KEY_ENABLED, enabled).apply()
     }
 }
