@@ -216,4 +216,23 @@ python3 scripts/scan/test_scan.py                             → ✅ ALL 336 CA
 
 ## §8 身份链
 
-（CI 结论回填在本节，报告提交后源码树等价性一并记录）
+| 环节 | 值 |
+|---|---|
+| 基线 | main `1d44ec905b8f5d21a215694e9a13910c74e1f645` |
+| 分支 | `fix/dv25-b3-storage-io-offmain` |
+| 源码树提交（CI 验证对象） | **`d4d6886c114f55263eb487060cf782000c480a30`** |
+| 远端同点 | `git ls-remote origin` = `d4d6886c…`（逐字符一致） |
+| CI run | **#2541 / run `39916839435` / job `120292573919` / attempt 1 / success** |
+| run `head_sha` | `d4d6886c…`（与本地逐字符一致） |
+| 步骤 | 26 步，`non-success = [(23, "Publish to Releases", "skipped")]` —— 唯一 skip 是 main 门控，**Publish 未执行 = 分支不产资产** |
+| 日志 | 1,413,757 B（`probe/l3/job-120292573919.log`） |
+
+**CI 判读 14/14 ALL GREEN**（`probe/l3/judge_ci.py`，判据全部先取真样本再写：`Summary: 109 passed, 0 failed` 恰一条且无非零；门头 `[n/109]` 共 109 条且互异；`ALL 336 CASES PASS`；`Z e: ` = 0；`sysinfo_state_thread_check selftest has teeth (SYSINFO-STATE SELFTEST=PASS)` 在册；`sysinfo_state_thread_check real tree green` 在册（= 判据 F/G 在 CI 真树上跑绿）；新用例 **15/15 PASSED**、0 FAILED；行尾 ` FAILED` 结果标记 0 条）。
+
+**两次判读自伤（已修，留档）**：①teeth 见证行真形态是 `sysinfo_state_thread_check selftest has teeth (…)`（**无 `.py`**），按任务习惯写 `….py` 直接假红；②「游离 FAILED」不能按词匹配 —— 日志里有用例名叫 `phase FAILED maps to Failed`，行尾结果是 `PASSED`。判据改为「行尾最后一个词是 `FAILED`」。这是「写判据前先 grep 一条真样本」的又一次自证。
+
+**报告回填后的源码树等价性**：报告提交只加 `fix-reports/FIX-7.md`（不在 `build-apk.yml` 的 paths 内，不参与构建）。
+`git diff --name-only d4d6886c HEAD -- . ':(exclude)fix-reports'` 输出为空 ⇒ 当前 HEAD 的源码树与 CI 验证过的树**逐字节一致**，CI 结论对当前代码成立。
+
+**未合并 main**（含 `.kt` 验证面，合并起手权在用户）。真机行为级欠账见 §7-R1，统一进 `§1045-VERIFY`。
+
