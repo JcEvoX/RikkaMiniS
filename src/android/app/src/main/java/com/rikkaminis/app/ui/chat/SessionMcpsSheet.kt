@@ -80,15 +80,32 @@ fun SessionMcpsSheet(
         // per-session read is a SQLite query per server, so it moves to IO.
         // Which ids are missing is decided on Main (that reads the snapshot
         // map); the writes into it stay on Main too.
-        val missing = servers.map { it.id }.filter { it !in overrides }
+        //
+        // [deep-audit-1045 B-06] The seeding write now goes through the SAME
+        // helper SessionSkillsSheet uses instead of an inline loop of its own.
+        // The inline loop decided `missing` on Main, awaited one SQLite read per
+        // missing id on IO, and then wrote every result back UNCONDITIONALLY —
+        // so a toggle the user flipped inside that window was overwritten with
+        // the pre-toggle stored value: the switch snapped back and the choice
+        // was lost until the user noticed. `missing` is a snapshot; the map is
+        // live. [mergeSessionOverrides] re-decides on Main after the await
+        // (`if (id !in overrides)`), which is the contract both sheets' comments
+        // already claimed to share — the drift was that only one of them
+        // actually called it. `?: false` keeps the lookup total: `seeds` covers
+        // exactly the ids the merge asks about, so the fallback is unreachable.
+        val liveIds = servers.map { it.id }
         val seeds = withContext(Dispatchers.IO) {
-            missing.associateWith { mcpRepository.isEnabledForSession(it, sessionId) }
+            liveIds.filter { it !in overrides }
+                .associateWith { mcpRepository.isEnabledForSession(it, sessionId) }
         }
-        for (id in missing) overrides[id] = seeds[id] ?: false
-        // Drop entries for servers that no longer exist so a later re-add
-        // doesn't resurrect a stale toggle.
-        val live = servers.mapTo(HashSet()) { it.id }
-        overrides.keys.retainAll(live)
+        mergeSessionOverrides(
+            liveIds = liveIds,
+            overrides = overrides,
+            lookup = { seeds[it] ?: false },
+        )
+        // ids that vanished from the live list are dropped inside the helper, so
+        // a later re-add re-seeds from storage instead of resurrecting a stale
+        // toggle.
     }
 
     // [deep-audit-1040 B-04] Same shape as SessionSkillsSheet's row toggle:
