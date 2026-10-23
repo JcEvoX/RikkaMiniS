@@ -276,7 +276,7 @@
 | CI head_sha | `a8f34b116654c83b1a9ce6ce6d23f79b04e7cb37` —— 与本地 HEAD、`git ls-remote` **逐字符一致** |
 | CI 步骤 | 26 步，non-success = `[('Publish to Releases', 'skipped')]`（main 门控，分支构建不发版）✓ |
 | CI 判读 | `Summary: 109 passed, 0 failed` 恰一条（另有 5 类子 Summary 全 `0 failed`）；`ALL 336 CASES PASS` 1 条；门头 `[n/109]` **109 个互异**；`Z e: ` 编译错 **0**；含 `FAILED` 的 6 行逐条确认**全是 PASSED 用例名子串**（`slot denied produces FAILED…` / `…maps to persistence_failed` / `phase FAILED maps to Failed` / `terminal FAILED maps to Failed` / `reason EXECUTION_FAILED…` / `legal FAILED terminal`）；本支新类 `PromoteDraftPolicyTest` **9 条逐条 PASSED**；两门真树 OK 行（log :703 / :920）与两门 teeth 行（:1181 / :1275）双双在册 |
-| 提交序列 | `b1d00555` 生产(B-08) → `dfe6e9e3` 生产(B-05) → `c930e94a` 测试 → `ad8e33de` 门 → `a8f34b11` 失败恢复路径收紧（**CI 绿于此**）→ `94cf953e` 报告回填 |
+| 提交序列 | `b1d00555` 生产(B-08) → `dfe6e9e3` 生产(B-05) → `c930e94a` 测试 → `ad8e33de` 门 → `a8f34b11` 失败恢复路径收紧（**CI 绿于此**）→ 其后**仅** `fix-reports/FIX-9.md` 回填提交（不动源码，故不再重跑 CI；等价性由上行机械证明） |
 | 门 / 夹具 | **109 / 336**（不变） |
 | 改动规模 | 8 文件 **+883 / −37**（生产 5 文件 +274/−27、测试 1 文件 +138、门 2 文件 +424/−1） |
 | 合并状态 | **未合并 main**（停止节点 = 分支 CI 绿；合并起手权在用户） |
