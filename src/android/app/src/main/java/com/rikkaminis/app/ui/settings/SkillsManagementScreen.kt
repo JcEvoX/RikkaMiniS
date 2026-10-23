@@ -4,7 +4,6 @@ import com.rikkaminis.app.R
 import com.rikkaminis.app.ui.components.MinisButton
 import com.rikkaminis.app.ui.components.MinisTextButton
 
-import android.content.ContentResolver
 import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -441,16 +440,12 @@ internal fun isZipArchiveBytes(bytes: ByteArray): Boolean =
         bytes[0] == 0x50.toByte() && bytes[1] == 0x4B.toByte() &&
         (bytes[2] == 0x03.toByte() || bytes[2] == 0x05.toByte() || bytes[2] == 0x07.toByte())
 
-/**
- * [FIX-R22 B32a] Read the picked file's raw bytes so callers can branch on
- * file magic; null on stream/IO failure (callers own the user-facing error).
- */
-internal fun readUriBytes(resolver: ContentResolver, uri: Uri): ByteArray? =
-    try {
-        resolver.openInputStream(uri)?.use { it.readBytes() }
-    } catch (_: Exception) {
-        null
-    }
+// [deep-audit-1045 B-07] `readUriBytes` lived here and ran a bare
+// `use { it.readBytes() }` — the picked bundle went into the heap whole before
+// `isZipArchiveBytes` could sniff it, so the 32 MiB expanded-size guard in
+// `SkillRepository.readZipEntries` never got a chance to matter. The bounded
+// replacement is `readSafBytes` in SafImportRead.kt (one cap, queried SIZE as a
+// cheap early reject, and a hard stop one byte past the cap).
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -485,9 +480,18 @@ private fun SkillImportSheet(
                     // (readUriBytes / isZipArchiveBytes) so the detail-page
                     // update launcher below reuses the same recognition
                     // instead of a diverging copy.
-                    val bytes = readUriBytes(context.contentResolver, uri)
+                    //
+                    // [deep-audit-1045 B-07] …and the read is bounded: the
+                    // picked bundle used to go into the heap whole. A refused
+                    // pick is reported as "too large", not as a read failure.
+                    val read = readSafBytes(context.contentResolver, uri, MAX_SKILL_IMPORT_BYTES)
+                    val bytes = (read as? SafRead.Ok)?.bytes
                     if (bytes == null) {
-                        failure = "Failed to read file"
+                        failure = if (read is SafRead.TooLarge) {
+                            safTooLargeText(MAX_SKILL_IMPORT_BYTES)
+                        } else {
+                            "Failed to read file"
+                        }
                         false
                     } else if (isZipArchiveBytes(bytes)) {
                         val result = skillRepository.importFromArchive(
@@ -719,10 +723,17 @@ fun SkillDetailScreen(
             var failureMsg: String? = null
             val ok = withContext(Dispatchers.IO) {
                 try {
-                    val bytes = readUriBytes(context.contentResolver, uri)
+                    val read = readSafBytes(context.contentResolver, uri, MAX_SKILL_IMPORT_BYTES)
+                    val bytes = (read as? SafRead.Ok)?.bytes
                     when {
                         bytes == null -> {
-                            failureMsg = "Failed to read file"
+                            // [deep-audit-1045 B-07] Bounded now; an oversized
+                            // bundle gets its own wording.
+                            failureMsg = if (read is SafRead.TooLarge) {
+                                safTooLargeText(MAX_SKILL_IMPORT_BYTES)
+                            } else {
+                                "Failed to read file"
+                            }
                             false
                         }
                         // [FIX-R22 B32a] A .zip/.skill bundle used to be piped

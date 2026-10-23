@@ -230,13 +230,23 @@ fun ProviderListScreen(
                         // the old `if (jsonStr != null)` fell through it with no
                         // toast at all — the user picked a file and nothing
                         // happened. Report it like any other read error.
-                        val jsonStr = context.contentResolver.openInputStream(uri)
-                            ?.bufferedReader()?.use { it.readText() }
-                        if (jsonStr == null) {
-                            val msg = context.getString(R.string.provider_import_read_error)
+                        //
+                        // [deep-audit-1045 B-07] Bounded read. This branch used
+                        // to stream the whole document into one String with no
+                        // upper limit, while the `.zip` branch beside it was
+                        // capped by ProviderImportZip — so a user-pickable 2 GB
+                        // .json hit OutOfMemoryError before validation.
+                        val read = readSafBytes(context.contentResolver, uri, MAX_PROVIDER_JSON_BYTES)
+                        if (read !is SafRead.Ok) {
+                            val msg = if (read is SafRead.TooLarge) {
+                                safTooLargeText(MAX_PROVIDER_JSON_BYTES)
+                            } else {
+                                context.getString(R.string.provider_import_read_error)
+                            }
                             importToastHandler.post { Toast.makeText(context, msg, Toast.LENGTH_SHORT).show() }
                             return@withContext
                         }
+                        val jsonStr = String(read.bytes, Charsets.UTF_8)
                         val label = providerRepository.importInstanceJSON(jsonStr)
                         if (label != null) {
                             val toastMsg = context.getString(R.string.provider_import_success, label)
