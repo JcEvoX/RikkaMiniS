@@ -121,10 +121,24 @@ fun ChatHistoryDrawer(
     // findable even while its title is still pending (or after title
     // generation failed), and message-less draft rows (the current unsent
     // chat, ghost rows from /memory or /thinking toggles) stay hidden.
+    //
+    // [dv24-b3] …nor may it depend on the row having `messages` rows yet. A
+    // session whose body is known only through `last_message` (a promoted
+    // draft — see `promoteDraftIfNeeded` — or a turn whose first assistant row
+    // is not durable yet, [T-android-session-last-message-live-tool-call]) has
+    // content the user typed and must be reachable. The ghost-row guard stays
+    // exact: those rows are created by a settings toggle, carry no preview and
+    // no message, so they fail all three terms.
     val messageCounts by chatRepository.observeMessageCountsPerSession()
         .collectAsState(initial = emptyMap())
     val visibleSessions = remember(sessions, messageCounts) {
-        sessions.filter { it.pinnedAt != null || (messageCounts[it.id] ?: 0) > 0 }
+        sessions.filter { session ->
+            isDrawerRowVisible(
+                pinnedAt = session.pinnedAt,
+                messageCount = messageCounts[session.id] ?: 0,
+                lastMessage = session.lastMessage,
+            )
+        }
     }
     val grouped = remember(visibleSessions) { groupSessionsByDate(visibleSessions) }
 
@@ -597,3 +611,31 @@ private fun DrawerSessionRow(
         }
     }
 }
+
+/**
+ * [dv24-b3] Which `sessions` rows the history drawer renders.
+ *
+ * Three independent reasons a row has content worth showing, in the order the
+ * user would recognise them:
+ *  - pinned: an explicit "keep this at hand" from the user;
+ *  - has messages: the ordinary case;
+ *  - has a preview: the body exists even though no `messages` row does yet
+ *    (a promoted draft — see `promoteDraftIfNeeded` — or a turn whose first
+ *    assistant row is not durable, `T-android-session-last-message-live-tool-call`).
+ *
+ * A row with none of the three is a ghost: the empty chat the user abandoned,
+ * or one materialised by a `/memory` / `/thinking` toggle. Those stay hidden —
+ * that is the `P0-1-drawer-title-visibility` contract, and it is why the
+ * preview term tests BLANKNESS rather than merely "the column is non-null": a
+ * whitespace-only preview carries no content either, and `isNullOrBlank` keeps
+ * such a legacy row in the ghost bucket.
+ *
+ * Pure on purpose: the drawer is a @Composable (not JVM-testable), so the
+ * decision lives here where `PromoteDraftVisibilityTest` can pin all four
+ * cases — including the two ghost-row regressions.
+ */
+internal fun isDrawerRowVisible(
+    pinnedAt: Long?,
+    messageCount: Int,
+    lastMessage: String?,
+): Boolean = pinnedAt != null || messageCount > 0 || !lastMessage.isNullOrBlank()
