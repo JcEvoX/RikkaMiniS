@@ -42,7 +42,7 @@ class BoundedDecodeCallSitesTest {
         )
         assertProbeRejects(
             src.replace(
-                "?.let { ImageDecoding.decodeBytesBounded(it, maxEdge)?.bitmap }",
+                "ImageDecoding.decodeBytesBounded(bytes, maxEdge)?.bitmap",
                 "",
             ),
             ::assertSheetShape,
@@ -98,7 +98,7 @@ class BoundedDecodeCallSitesTest {
         )
         assertTrue(
             "loadBitmapFromUri must decode the picked image through ImageDecoding",
-            src.contains("?.let { ImageDecoding.decodeBytesBounded(it, maxEdge)?.bitmap }"),
+            src.contains("ImageDecoding.decodeBytesBounded(bytes, maxEdge)?.bitmap"),
         )
         assertTrue(
             "renderIconBitmap must decode through ImageDecoding for the webpage branch",

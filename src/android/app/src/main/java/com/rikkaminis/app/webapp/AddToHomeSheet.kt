@@ -73,6 +73,9 @@ import com.rikkaminis.app.ui.components.sanitizeSingleLineInput
 import com.rikkaminis.app.data.repository.WebAppShortcutRepository
 import com.rikkaminis.app.data.storage.SessionFileStore
 import com.rikkaminis.app.util.ImageDecoding
+// [deep-audit-1047 B-02] The picked icon's bytes go through the repo's single
+// bounded SAF/stream reader instead of a bare `readBytes()`.
+import com.rikkaminis.app.ui.settings.readAtMost
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -682,21 +685,50 @@ private fun parseHtmlTitle(file: File): String? {
 private const val ICON_MAX_EDGE_PX = 192
 
 /**
- * Bounded decode of a picked image. Reads the encoded bytes once and hands them
- * to [ImageDecoding.decodeBytesBounded], which probes the header
- * (`inJustDecodeBounds`), samples the decode, and shrinks to the exact bound —
- * so a 50 Mpx gallery photo never allocates its ~200 MB full-resolution
- * bitmap just to fill a 36.dp tile. The encoded bytes (a few MB at worst) are
- * strictly smaller than the pixels they replace and are released right after
- * the decode.
+ * [deep-audit-1047 B-02] Cap on the picked image's ENCODED bytes.
+ *
+ * The decode itself is already bounded ([ImageDecoding.decodeBytesBounded]
+ * samples down to [ICON_MAX_EDGE_PX]), but the byte array it is handed was not:
+ * `readBytes()` reads whatever the user picked, so a several-hundred-MB image
+ * allocated its full size in the heap before the bound applied — the bound was
+ * on pixels, the OOM is on bytes.
+ *
+ * The number is the repo's existing "largest raw user-picked file we still
+ * accept" figure (32 MiB, same as `FileReadTool.MAX_INPUT_BYTES` /
+ * `MAX_SKILL_IMPORT_BYTES`) rather than a value invented for this screen: an
+ * encoded image that cannot carry a 192px icon within that budget is not a
+ * usable icon source, and nothing here is a document import that would justify
+ * a larger ceiling.
+ */
+internal const val MAX_ICON_SOURCE_BYTES = 32L * 1024 * 1024
+
+/**
+ * Bounded decode of a picked image. Reads the encoded bytes once — with a
+ * STREAM-level cap, not a declared-size precheck (a provider may report
+ * nothing, or lie) — and hands them to [ImageDecoding.decodeBytesBounded],
+ * which probes the header (`inJustDecodeBounds`), samples the decode, and
+ * shrinks to the exact bound, so a 50 Mpx gallery photo never allocates its
+ * ~200 MB full-resolution bitmap just to fill a 36.dp tile.
+ *
+ * [deep-audit-1047 B-02] The read used to be a bare `readBytes()`: the
+ * pixel bound could not help bytes that were already in the heap, so picking a
+ * multi-hundred-MB image OOM'd before any decode ran. [readAtMost] stops one
+ * byte past [MAX_ICON_SOURCE_BYTES] and reports the overflow as null, which
+ * this function already maps to "no icon" (the caller falls back to the
+ * preset/title glyph).
+ *
+ * Callers must stay off the main thread: both call sites wrap this in
+ * `withContext(Dispatchers.IO)`.
  */
 private fun loadBitmapFromUri(
     context: Context,
     uri: Uri,
     maxEdge: Int = ICON_MAX_EDGE_PX,
 ): Bitmap? = runCatching {
-    context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
-        ?.let { ImageDecoding.decodeBytesBounded(it, maxEdge)?.bitmap }
+    val bytes = context.contentResolver.openInputStream(uri)?.use { input ->
+        readAtMost(input, MAX_ICON_SOURCE_BYTES)
+    } ?: return@runCatching null
+    ImageDecoding.decodeBytesBounded(bytes, maxEdge)?.bitmap
 }.getOrNull()
 
 /**
