@@ -15,6 +15,7 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -61,7 +62,15 @@ fun ScheduledTasksScreen(
     val scope = rememberCoroutineScope()
 
     var reloadKey by remember { mutableIntStateOf(0) }
-    val file by produceState<ScheduledTasksFile?>(null, context, reloadKey) {
+    // [deep-audit-1046 S-11] The store publishes a change ticker on every
+    // successful atomic write. Without it this list was frozen at whatever
+    // document it loaded first: a background run settling (lastRunDate /
+    // lastResult / failStreak) and a fuse trip (suspendedByFuse → the Resume
+    // button) both stayed invisible until the screen was left and re-entered.
+    // reloadKey stays: it forces a re-read for this screen's OWN actions, whose
+    // revision bump lands one frame later than the click's feedback.
+    val storeRevision by ScheduledTasksStore.revision.collectAsState()
+    val file by produceState<ScheduledTasksFile?>(null, context, reloadKey, storeRevision) {
         value = ScheduledTasksStore.load(context)
     }
     // Re-read on resume: mirrors MountedFoldersScreen — returning from the
