@@ -365,6 +365,115 @@ def _fn_body_after(code: str, decl_re) -> "str | None":
     return None if end is None else code[open_idx : end + 1]
 
 
+# [deep-audit-1044 A-03] criterion 15 — a dropped headless send is an ERROR.
+# `ChatViewModel.sendMessage` claims `_isStreaming` SYNCHRONOUSLY, and only
+# after every pre-flight gate (Safe Mode / `currentProvider == null` /
+# `_isCompacting` / context exhausted / blank input). `prompt()` reads the flag
+# right after the call, so `started == false` means "this send was dropped and
+# nothing will ever stream" — the `wait=true` path used to fall through an empty
+# `if (!started) { }` block instead, and because nothing streams the wait
+# returned at once (`withTimeoutOrNull` sees `isStreaming == false`, skips the
+# `first { !it }` branch) and the drain read the PREVIOUS assistant turn out of
+# the DB and reported it as `Completed`. The caller (chat.prompt RPC /
+# `minis-sessions send`) then accepted a stale reply as this request's answer.
+#
+# The criterion binds the DECISION (an `!started` early return carrying a
+# structured error, before the drain), not one spelling: the envelope may be
+# written inline or delegated to a helper, and the status literal may live in
+# that helper — one hop is followed, which is what `droppedSendResult()` uses.
+# It also pins the pre-fix shape itself: an EMPTY `!started` block is red on its
+# own, because "fall through to drain" is exactly the defect.
+RE_RUNNER_PROMPT_DECL = re.compile(r"\bsuspend\s+fun\s+prompt\s*\(")
+RE_IF_NOT_STARTED = re.compile(r"if\s*\(\s*!\s*started\s*\)")
+
+def _decl_region(code: str, name: str, span: int = 600) -> "str | None":
+    """`fun <name>(` plus the first [span] characters of its declaration.
+
+    Used to follow ONE delegation hop for the dropped-send envelope. A text
+    window rather than a parsed body on purpose: the helper is a single
+    expression (`… : PromptResult = PromptResult(status = "Error", …)`) with no
+    brace block of its own, so a brace-hunting walk would read the NEXT
+    function's body and either pass or fail for the wrong reason.
+    """
+    m = re.search(r"\bfun\s+" + re.escape(name) + r"\s*\(", code)
+    if m is None:
+        return None
+    return code[m.start(): m.start() + span]
+
+def _yields_dropped_error(code: str, block: str) -> "bool":
+    """Does this `if (!started) { … }` block RETURN the dropped-send envelope?
+
+    Accepts both spellings of the same decision: the literal inline
+    (`status = "Error"`, `responseText = "send_dropped_before_stream"`) and a
+    call to a helper whose own declaration carries them. Both literals must be
+    present, because together they ARE the contract the CLI reads (status
+    decides the exit code, responseText is the machine reason).
+    """
+    text = strip_comments(block)
+    if "return" not in text:
+        return False
+    hop = [text]
+    for name in sorted(set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", text))):
+        region = _decl_region(code, name)
+        if region is not None:
+            hop.append(region)
+    blob = "\n".join(hop)
+    return '"Error"' in blob and "send_dropped_before_stream" in blob
+
+def _prompt_drop_violations(code: str) -> "list[str]":
+    """Criterion 15 for one `debug/HeadlessChatRunner.kt` (comments stripped)."""
+    body = _fn_body_after(code, RE_RUNNER_PROMPT_DECL)
+    if body is None:
+        return [
+            "HeadlessChatRunner.kt: `suspend fun prompt(` block not found "
+            "(renamed or moved? re-anchor criterion 15, do not drop it)"
+        ]
+    if "withTimeoutOrNull(" not in body or "loadMessages(" not in body:
+        return [
+            "HeadlessChatRunner.kt: prompt() lost its wait->drain arm "
+            "(`withTimeoutOrNull(` around the `isStreaming` wait, then "
+            "`loadMessages(` for the final text) — re-anchor criterion 15 "
+            "instead of dropping it"
+        ]
+    drain = body.find("loadMessages(")
+    guards = []
+    for m in RE_IF_NOT_STARTED.finditer(body):
+        open_idx = body.find("{", m.end())
+        if open_idx == -1:
+            continue
+        end = _match_brace(body, open_idx)
+        if end is None:
+            continue
+        guards.append((m.start(), body[open_idx:end + 1]))
+    errs = []
+    if not guards:
+        errs.append(
+            "HeadlessChatRunner.kt: prompt() no longer guards on `!started` — a "
+            "send dropped by a pre-flight gate settles `Completed` with the "
+            "PREVIOUS assistant text (nothing ever streams, so the wait returns "
+            "at once and the drain reads the last turn)"
+        )
+        return errs
+    if not [b for at, b in guards if at < drain]:
+        errs.append(
+            "HeadlessChatRunner.kt: prompt()'s `!started` guard sits AFTER the "
+            "drain — it must decide before `loadMessages(` is reached"
+        )
+    elif not [b for at, b in guards if at < drain and _yields_dropped_error(code, b)]:
+        errs.append(
+            "HeadlessChatRunner.kt: prompt()'s `!started` guard does not return "
+            "a structured error before the drain — it must settle "
+            '`status = "Error"` with `responseText = "send_dropped_before_stream"` '
+            '(inline or through the shared envelope helper), never a pseudo-success'
+        )
+    if [b for _, b in guards if not strip_comments(b[1:-1]).strip()]:
+        errs.append(
+            "HeadlessChatRunner.kt: prompt()'s `if (!started) { … }` block is "
+            "EMPTY — falling through to the drain reports the last assistant "
+            "turn as this request's answer"
+        )
+    return errs
+
 # [deep-audit-1042 A-05] criterion 14 — the headless session-ready barrier.
 # `ChatSessionLifecycle.loadSession` is a TWO-STEP publish: step 1 flips
 # `_activeEntryId` (ChatSessionLifecycle:423) and the RPC layer's existing
@@ -1066,6 +1175,10 @@ def check(root: Path) -> int:
                     "cancel"
                 )
 
+        # --- 15. [deep-audit-1044 A-03] a dropped send is an ERROR, never the
+        #     previous turn replayed as a "Completed". ---
+        errors.extend(_prompt_drop_violations(runner))
+
     # --- 14. [deep-audit-1042 A-05 / 1043 A-05] every entry that mutates the
     #     ViewModel's in-memory turn state awaits the `sessionLoaded` latch
     #     BEFORE the mutation. Files, entries and receivers are all derived
@@ -1212,6 +1325,123 @@ class HeadlessChatRunner {
     }
 }
 '''
+
+# --- criterion 15 [deep-audit-1044 A-03]: the headless send path -------------
+# Every runner fixture carries `prompt()`, because the criterion is fail-closed:
+# a fixture without the function would red criterion 15 and make the 13/14 arms
+# look like they have more teeth (or fewer) than they do.
+_R_PROMPT_GUARD_INLINE = (
+    "        if (!started) {\n"
+    "            return@withContext PromptResult(\n"
+    "                status = \"Error\",\n"
+    "                responseText = \"send_dropped_before_stream\",\n"
+    "                timedOut = false,\n"
+    "            )\n"
+    "        }\n"
+)
+_R_PROMPT_GUARD_DELEGATED = (
+    "        if (!started) {\n"
+    "            return@withContext droppedSendResult()\n"
+    "        }\n"
+)
+# Top level, AFTER the class — exactly where the production helper lives, so the
+# one-hop delegation path in `_yields_dropped_error` is exercised for real.
+_R_PROMPT_HELPER_DECL = (
+    "\n"
+    "internal fun droppedSendResult(): PromptResult =\n"
+    "    PromptResult(\n"
+    "        status = \"Error\",\n"
+    "        responseText = \"send_dropped_before_stream\",\n"
+    "        timedOut = false,\n"
+    "    )\n"
+)
+_R_PROMPT_DRAIN = (
+    "        val finished = withTimeoutOrNull(timeoutMs) {\n"
+    "            if (vm.isStreaming.value) {\n"
+    "                vm.isStreaming.first { !it }\n"
+    "            }\n"
+    "            true\n"
+    "        } ?: false\n"
+    "        val msgs = app.chatRepository.loadMessages(sessionId)\n"
+    "        val lastAssistant = msgs.lastOrNull { it.role == \"assistant\" }\n"
+    "        PromptResult(\n"
+    "            status = if (finished) \"Completed\" else \"Timeout\",\n"
+    "            responseText = lastAssistant?.id,\n"
+    "            timedOut = !finished,\n"
+    "        )\n"
+    "    }\n"
+)
+
+def _prompt_entry(guard: str) -> str:
+    return (
+        "\n"
+        "    suspend fun prompt(\n"
+        "        context: Context,\n"
+        "        sessionId: String,\n"
+        "        text: String,\n"
+        "        wait: Boolean,\n"
+        "        timeoutMs: Long,\n"
+        "    ): PromptResult = withContext(Dispatchers.Main) {\n"
+        "        val vm = viewModel(context, sessionId)\n"
+        "        val started = vm.isStreaming.value\n"
+        "        if (!wait) {\n"
+        "            return@withContext if (started) {\n"
+        "                PromptResult(status = \"Running\", responseText = null, timedOut = false)\n"
+        "            } else {\n"
+        "                PromptResult(status = \"Error\", "
+        "responseText = \"send_dropped_before_stream\", timedOut = false)\n"
+        "            }\n"
+        "        }\n"
+        + guard
+        + _R_PROMPT_DRAIN
+    )
+
+_R_RUNNER_TAIL = "}\n"
+assert FIXTURE_RUNNER.endswith(_R_RUNNER_TAIL), "runner fixture tail moved"
+FIXTURE_RUNNER = (
+    FIXTURE_RUNNER[: -len(_R_RUNNER_TAIL)] + _prompt_entry(_R_PROMPT_GUARD_INLINE) + _R_RUNNER_TAIL
+)
+# Green arm, delegated spelling: the envelope literals live in a helper one hop
+# away, which the criterion must accept (it binds the decision, not the spelling).
+FIXTURE_RUNNER_DROP_DELEGATED = (
+    FIXTURE_RUNNER.replace(_R_PROMPT_GUARD_INLINE, _R_PROMPT_GUARD_DELEGATED)
+    + _R_PROMPT_HELPER_DECL
+)
+# Dirty arms, one per decision point.
+_R_PROMPT_GUARD_EMPTY = (
+    "        if (!started) {\n"
+    "            // dropped before the stream was claimed — fall through to drain\n"
+    "        }\n"
+)
+_R_PROMPT_GUARD_COMPLETED = (
+    "        if (!started) {\n"
+    "            return@withContext PromptResult(\n"
+    "                status = \"Completed\",\n"
+    "                responseText = null,\n"
+    "                timedOut = false,\n"
+    "            )\n"
+    "        }\n"
+)
+_R_PROMPT_DRAIN_CLOSE = "    }\n"
+assert _R_PROMPT_DRAIN.endswith(_R_PROMPT_DRAIN_CLOSE), "prompt drain tail moved"
+FIXTURE_RUNNER_DROP_EMPTY = FIXTURE_RUNNER.replace(_R_PROMPT_GUARD_INLINE, _R_PROMPT_GUARD_EMPTY)
+FIXTURE_RUNNER_DROP_NONE = FIXTURE_RUNNER.replace(_R_PROMPT_GUARD_INLINE, "")
+FIXTURE_RUNNER_DROP_COMPLETED = FIXTURE_RUNNER.replace(
+    _R_PROMPT_GUARD_INLINE, _R_PROMPT_GUARD_COMPLETED)
+FIXTURE_RUNNER_DROP_AFTER = FIXTURE_RUNNER.replace(_R_PROMPT_GUARD_INLINE, "").replace(
+    _R_PROMPT_DRAIN,
+    _R_PROMPT_DRAIN[: -len(_R_PROMPT_DRAIN_CLOSE)]
+    + _R_PROMPT_GUARD_INLINE
+    + _R_PROMPT_DRAIN_CLOSE,
+)
+
+_RUNNER_DROP_MUTATIONS = (
+    ("an empty !started block (MUT-P1)", FIXTURE_RUNNER_DROP_EMPTY, "is EMPTY"),
+    ("the guard deleted (MUT-P2)", FIXTURE_RUNNER_DROP_NONE, "no longer guards on `!started`"),
+    ("the guard returns a Completed pseudo-success (MUT-P3)",
+     FIXTURE_RUNNER_DROP_COMPLETED, "does not return a structured error"),
+    ("the guard moved below the drain (MUT-P4)", FIXTURE_RUNNER_DROP_AFTER, "sits AFTER the drain"),
+)
 
 _R_CANCEL_CALL = ("        val vm = viewModelForCancel(context, sessionId) "
                   "?: return@withContext false")
@@ -1794,6 +2024,28 @@ def selftest() -> int:
             failures.append(f"criterion 13 {name}: gate stayed GREEN (no teeth)")
         else:
             print(f"selftest: criterion 13 {name} -> RED ({len(errs)} violation(s)) OK")
+
+    # --- criterion 15 [deep-audit-1044 A-03]: a dropped send is an ERROR -----
+    # The green arm above (FIXTURE_RUNNER, inline spelling) already proves the
+    # happy path, because every runner fixture carries `prompt()`. This arm adds
+    # the DELEGATED spelling — the envelope literals one hop away in a helper.
+    rc, errs = run_tree(screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY,
+                        FIXTURE_RUNNER_DROP_DELEGATED)
+    if rc != 0:
+        failures.append(f"criterion 15 delegated-envelope fixture unexpectedly red: {errs}")
+    else:
+        print("selftest: criterion 15 delegated envelope (helper carries the literals) passes")
+
+    for name, run_fixture, expect in _RUNNER_DROP_MUTATIONS:
+        if run_fixture == FIXTURE_RUNNER:
+            failures.append(f"criterion 15 {name}: mutation is a no-op (anchor not found)")
+            continue
+        rc, errs = run_tree(screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY, run_fixture)
+        if rc == 0 or not [e for e in errs if expect in e]:
+            failures.append(
+                f"criterion 15 {name}: expected a `{expect}` violation, got {errs}")
+        else:
+            print(f"selftest: criterion 15 {name} -> RED ({len(errs)} violation(s)) OK")
 
     # --- criterion 14 [deep-audit-1042 A-05]: the session-ready barrier ---
     # Backward compat: the fixture above (no mutator calls) proves the

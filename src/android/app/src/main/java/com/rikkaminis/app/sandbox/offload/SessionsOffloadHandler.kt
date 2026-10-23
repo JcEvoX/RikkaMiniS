@@ -308,15 +308,51 @@ class SessionsOffloadHandler(
             val result = runBlocking {
                 com.rikkaminis.app.debug.ChatMutationMethods.prompt(context, params)
             }
+            // [deep-audit-1044 A-04] `ChatMutationMethods.prompt` does NOT throw
+            // for a dropped send — it answers with a structured `status`
+            // ("Error" + the reason in `responseText`), and for a timed-out wait
+            // with `"Timeout"`. The old shape only caught exceptions and then
+            // emitted unconditionally, so every one of those settled `ok: true`
+            // with exit code 0 while the machine reason was printed in the
+            // place an assistant reply belongs — a caller (`minis-sessions
+            // send` from a shell, or a scheduler) could not tell a delivered
+            // prompt from one that never left the device. Route them through
+            // the same `errorEnvelope` funnel the catch branch and every other
+            // subcommand use, and keep the whole payload as `detail` so the
+            // session id / timeout flag stay available for diagnosis.
+            val status = result.optString("status")
             val data = JSONObject()
                 .put("session_id", result.optString("sessionId"))
                 .put("is_new_session", result.optBoolean("isNewSession"))
-                .put("status", result.optString("status"))
+                .put("status", status)
                 .put("model", result.opt("modelName"))
-                if (result.has("responseText") && !result.isNull("responseText")) {
-                    data.put("response_text", result.optString("responseText"))
-                }
-                if (result.has("timedOut")) data.put("timed_out", result.optBoolean("timedOut"))
+            if (result.has("responseText") && !result.isNull("responseText")) {
+                data.put("response_text", result.optString("responseText"))
+            }
+            if (result.has("timedOut")) data.put("timed_out", result.optBoolean("timedOut"))
+            if (!sendSucceeded(status)) {
+                // The reason leaves the envelope as the machine code in
+                // `message` — NOT as `response_text`, which is the field a
+                // caller reads as "the assistant's answer". The diagnostic
+                // fields that are genuinely diagnostic (session id / status /
+                // timeout flag / model) stay, under `detail`.
+                val detail = JSONObject()
+                    .put("session_id", data.optString("session_id"))
+                    .put("is_new_session", data.optBoolean("is_new_session"))
+                    .put("status", status)
+                if (data.has("model")) detail.put("model", data.opt("model"))
+                if (data.has("timed_out")) detail.put("timed_out", data.optBoolean("timed_out"))
+                val err = errorEnvelope(
+                    "send",
+                    sendErrorCode(status),
+                    sendErrorReason(status, data.optString("response_text")),
+                    detail,
+                )
+                return NativeOffloadResult(
+                    sendExitFor(status),
+                    OffloadOutput.formatBody(err.toString(2), args) + "\n",
+                )
+            }
             emit("send", data, args)
         } catch (t: Throwable) {
             val err = errorEnvelope(
@@ -404,12 +440,19 @@ class SessionsOffloadHandler(
         )
     }
 
-    private fun errorEnvelope(action: String, code: String, msg: String): JSONObject {
+    private fun errorEnvelope(
+        action: String,
+        code: String,
+        msg: String,
+        detail: JSONObject? = null,
+    ): JSONObject {
+        val data = JSONObject().put("error", code).put("message", msg)
+        if (detail != null) data.put("detail", detail)
         return JSONObject()
             .put("ok", false)
             .put("tool", TOOL_NAME)
             .put("action", action)
-            .put("data", JSONObject().put("error", code).put("message", msg))
+            .put("data", data)
     }
 
     companion object {
@@ -417,6 +460,45 @@ class SessionsOffloadHandler(
         private const val TOOL_NAME = "minis-sessions-cli"
         private const val DEFAULT_LIMIT = 50
         private const val MAX_LIMIT = 100
+        private const val EXIT_FAILURE = 1
+
+        /**
+         * [deep-audit-1044 A-04] The `prompt` statuses that mean the send (or
+         * its async dispatch) really happened: `"Completed"` for `--wait`,
+         * `"Running"` for `--async`. Everything else is a refusal — `"Error"`
+         * carries a machine reason in `responseText` (`send_dropped_before_stream`
+         * / `no_provider_resolved_in_5s` / `session_not_loaded_in_5s`), and
+         * `"Timeout"` means the wait elapsed. Unknown/empty statuses are
+         * refusals too: the old code read "no status" as success, which is how
+         * the dropped-send defect stayed invisible.
+         */
+        internal fun sendSucceeded(status: String): Boolean =
+            status == "Completed" || status == "Running"
+
+        /**
+         * Exit code for a `send` that did not succeed. Split from
+         * [sendErrorCode] so the CLI contract (nonzero = the prompt was not
+         * delivered) is one decision, and stays testable off-device.
+         */
+        internal fun sendExitFor(status: String): Int =
+            if (sendSucceeded(status)) 0 else EXIT_FAILURE
+
+        /** Envelope `error` code, per the file's other subcommands' vocabulary. */
+        internal fun sendErrorCode(status: String): String =
+            if (status == "Timeout") "SEND_TIMEOUT" else "SEND_FAILED"
+
+        /**
+         * The envelope `message`: the machine reason from `responseText` when
+         * there is one (`send_dropped_before_stream` / `no_provider_resolved_in_5s`
+         * / `session_not_loaded_in_5s` — the same strings the RPC surface uses),
+         * else `"timeout"` for an elapsed wait, else the lowercased status so an
+         * unknown refusal still names itself.
+         */
+        internal fun sendErrorReason(status: String, responseText: String?): String {
+            val reason = responseText?.trim()
+            if (!reason.isNullOrEmpty()) return reason
+            return if (status == "Timeout") "timeout" else status.lowercase()
+        }
 
         // iOS NOFF_EXIT_INVALID_ARGS — the shell convention is exit 2
         // for invalid CLI args, distinct from exit 1 for runtime errors.

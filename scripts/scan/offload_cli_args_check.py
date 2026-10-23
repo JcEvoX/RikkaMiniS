@@ -1074,6 +1074,260 @@ def check_clipboard_clear(clipboard_src: str) -> list:
     return findings
 
 
+# ── [deep-audit-1044 A-04] the `send` subcommand's status → exit-code contract ──
+#
+# `ChatMutationMethods.prompt` does NOT throw when the send is dropped — it
+# answers with a structured `status` ("Error" + the reason in `responseText`),
+# and with "Timeout" when the wait elapsed. `cmdSend` used to catch exceptions
+# only and then `emit(...)` unconditionally, and `emit()` hard-codes `ok: true`
+# with exit code 0 — so every refusal (no provider, compacting in flight,
+# context exhausted, wait timeout) left the CLI as a SUCCESS whose
+# `response_text` carried a machine reason in the place an assistant reply
+# belongs. A shell caller could not tell a delivered prompt from one that
+# never left the device.
+#
+# The rule binds the DECISION POINTS, not one spelling:
+#   S1 — the status must be READ from the RPC result (`optString("status")`).
+#   S2 — the success set must be consulted (`sendSucceeded(`): only
+#        "Completed" / "Running" are successes; every other status (including
+#        an unknown or empty one) is a refusal.
+#   S3 — a refusal must go through the file's existing `errorEnvelope` funnel
+#        (no second envelope shape).
+#   S4 — a refusal must pick its exit code through `sendExitFor(` (nonzero).
+#   S5 — the refusal branch must be REACHED BEFORE `emit("send"…)`: the success
+#        payload may only be emitted on the success path.
+#   S6 — the success set must be exactly {"Completed", "Running"} (two
+#        comparisons against the status) — a set that also accepts "" or an
+#        unknown status re-opens the defect.
+#   S7 — the exit code must be the file's failure code (1), not 0.
+#
+# Judged on comment-stripped text, so a status literal quoted in a comment
+# cannot satisfy OR trip the rule.
+_SEND_STATUS_RE = re.compile(r'optString\(\s*"status"\s*\)')
+
+
+def _send_helper_body(code: str, name: str):
+    """Body of `fun <name>(…)` in [code], or None (expression body / absent)."""
+    m = re.search(r"\bfun\s+" + re.escape(name) + r"\s*\(", code)
+    if not m:
+        return None
+    i, depth = m.end() - 1, 0
+    while i < len(code):
+        if code[i] == "(":
+            depth += 1
+        elif code[i] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    j = code.find("{", i)
+    if j < 0:
+        return None
+    eq = code.find("=", i)
+    if 0 <= eq < j:
+        return None
+    depth, k = 0, j
+    while k < len(code):
+        if code[k] == "{":
+            depth += 1
+        elif code[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return code[j:k + 1]
+        k += 1
+    return None
+
+
+GREEN_SESSIONS_SEND = """
+class SessionsOffloadHandler {
+    private fun cmdSend(args: OffloadArgs): NativeOffloadResult {
+        val result = runBlocking {
+            com.rikkaminis.app.debug.ChatMutationMethods.prompt(context, params)
+        }
+        val status = result.optString("status")
+        val data = JSONObject()
+            .put("session_id", result.optString("sessionId"))
+            .put("status", status)
+        if (result.has("responseText")) data.put("response_text", result.optString("responseText"))
+        if (!sendSucceeded(status)) {
+            val detail = JSONObject()
+                .put("session_id", data.optString("session_id"))
+                .put("status", status)
+            val err = errorEnvelope(
+                "send",
+                sendErrorCode(status),
+                sendErrorReason(status, data.optString("response_text")),
+                detail,
+            )
+            return NativeOffloadResult(
+                sendExitFor(status),
+                OffloadOutput.formatBody(err.toString(2), args) + "\\n",
+            )
+        }
+        emit("send", data, args)
+    }
+
+    private fun errorEnvelope(
+        action: String,
+        code: String,
+        msg: String,
+        detail: JSONObject? = null,
+    ): JSONObject {
+        val data = JSONObject().put("error", code).put("message", msg)
+        if (detail != null) data.put("detail", detail)
+        return JSONObject().put("ok", false).put("action", action).put("data", data)
+    }
+
+    private fun emit(action: String, data: JSONObject, args: OffloadArgs): NativeOffloadResult {
+        val envelope = JSONObject().put("ok", true).put("action", action).put("data", data)
+        return NativeOffloadResult(0, OffloadOutput.formatBody(envelope.toString(2), args) + "\\n")
+    }
+
+    companion object {
+        private const val EXIT_FAILURE = 1
+
+        internal fun sendSucceeded(status: String): Boolean =
+            status == "Completed" || status == "Running"
+
+        internal fun sendExitFor(status: String): Int =
+            if (sendSucceeded(status)) 0 else EXIT_FAILURE
+
+        internal fun sendErrorCode(status: String): String =
+            if (status == "Timeout") "SEND_TIMEOUT" else "SEND_FAILED"
+
+        internal fun sendErrorReason(status: String, responseText: String?): String {
+            val reason = responseText?.trim()
+            if (!reason.isNullOrEmpty()) return reason
+            return if (status == "Timeout") "timeout" else status.lowercase()
+        }
+    }
+}
+"""
+
+
+def _cut_at_next_decl(region: str) -> str:
+    """Trim a declaration window at the NEXT `fun`/`class`/`companion` keyword.
+
+    A text window that runs past the helper's own declaration would swallow the
+    NEXT helper's comparisons — `sendSucceeded` would then look like it
+    compares three statuses. Cut at the next declaration so each window
+    describes exactly one decision.
+    """
+    m = re.search(r"\b(fun|class|companion\s+object)\b", region[1:])
+    return region[: m.start() + 1] if m else region
+
+
+def _send_helper_region(code: str, name: str, span: int = 400) -> "str | None":
+    """The declaration of `fun <name>(…)` plus [span] characters after it.
+
+    A text window rather than a brace body on purpose: the decision helpers are
+    EXPRESSION-bodied (`… : Boolean = status == "Completed" || …`) and have no
+    braces of their own — a brace-hunting walk would read the NEXT function's
+    body and pass or fail for the wrong reason.
+    """
+    m = re.search(r"\bfun\s+" + re.escape(name) + r"\s*\(", code)
+    if m is None:
+        return None
+    return code[m.start(): m.start() + span]
+
+
+def check_sessions_send_status(sessions_src: str) -> list:
+    """[deep-audit-1044 A-04] — the `send` status → exit-code contract."""
+    code = code_only(sessions_src)
+    findings = []
+    body = _send_helper_body(code, "cmdSend")
+    if body is None:
+        findings.append(("S1", "missing",
+                         "cmdSend lost its owner body (renamed / inlined / deleted?)"))
+        return findings
+    if not _SEND_STATUS_RE.search(body):
+        findings.append(("S1", "missing",
+                         "cmdSend must read the RPC status (`optString(\"status\")`) — "
+                         "a dropped send is reported in the payload, not by an exception"))
+    if "sendSucceeded(" not in body:
+        findings.append(("S2", "missing",
+                         "cmdSend must consult the success set (`sendSucceeded(…)`) — "
+                         "only Completed/Running are deliveries"))
+    if "errorEnvelope(" not in body:
+        findings.append(("S3", "missing",
+                         "a refusal must go through the existing `errorEnvelope(` funnel — "
+                         "the file's single error shape"))
+    else:
+        # The FIRST `errorEnvelope(` in cmdSend belongs to the earlier ARGUMENT
+        # guards (SUBAGENT_DISABLED / INVALID_ARGS) — the refusal's own call is
+        # the one AFTER the success-set consultation. Requiring that one keeps
+        # the rule from being satisfied by an unrelated guard.
+        gate_at = body.find("sendSucceeded(")
+        if gate_at >= 0 and "errorEnvelope(" not in body[gate_at:]:
+            findings.append(("S3", "missing",
+                             "the refusal branch must call `errorEnvelope(` AFTER the "
+                             "success-set consultation — the earlier argument guards "
+                             "do not count"))
+    if "sendExitFor(" not in body:
+        findings.append(("S4", "missing",
+                         "a refusal must pick its exit code through `sendExitFor(…)` — "
+                         "the CLI contract (nonzero = not delivered)"))
+    emit_at = body.find('emit("send"')
+    if emit_at < 0:
+        findings.append(("S5", "missing",
+                         "cmdSend no longer emits its success payload (`emit(\"send\"…`)"))
+    else:
+        # Ordering, anchored on the success-set consultation rather than on the
+        # envelope helper's name: whatever the refusal is spelled, it has to be
+        # decided before the payload leaves.
+        gate_at = body.find("sendSucceeded(")
+        if gate_at < 0 or gate_at > emit_at:
+            findings.append(("S5", "present",
+                             "the success decision must be reached BEFORE `emit(\"send\"…)` — "
+                             "the success payload may only be emitted on the success path"))
+    succ = _send_helper_region(code, "sendSucceeded")
+    if succ is None:
+        findings.append(("S6", "missing",
+                         "the success set helper `sendSucceeded(…)` is gone — the "
+                         "status → success decision must live in ONE place"))
+    else:
+        succ = _cut_at_next_decl(succ)
+        if '"Completed"' not in succ or '"Running"' not in succ:
+            findings.append(("S6", "missing",
+                             "the success set must contain Completed and Running"))
+        compares = len(re.findall(r"status\s*==", succ))
+        if compares != 2:
+            findings.append(("S6", f"count {compares} != 2",
+                             "the success set must compare the status against exactly "
+                             "two values — an extra accepted status re-opens the defect"))
+    exit_helper = _send_helper_region(code, "sendExitFor")
+    if exit_helper is None:
+        findings.append(("S7", "missing",
+                         "the exit-code helper `sendExitFor(…)` is gone"))
+    else:
+        exit_helper = _cut_at_next_decl(exit_helper)
+        if "EXIT_FAILURE" not in exit_helper:
+            findings.append(("S7", "missing",
+                             "the exit code must come from the file's failure constant"))
+    if not re.search(r"EXIT_FAILURE\s*=\s*1\b", code):
+        findings.append(("S7", "missing",
+                         "the failure exit code must be 1 (the file's other error "
+                         "branches use 1)"))
+    # S8 — the reason must NOT ride along in the failure payload under the
+    # `response_text` key: that key is where an assistant's answer belongs, and
+    # a caller reading it would still see a machine code in the answer slot.
+    # The reason belongs in the envelope's `message`; the diagnostic fields
+    # (session id / status / timeout flag) may stay in `detail`.
+    detail_at = body.find("val detail")
+    # The FIRST `errorEnvelope(` in cmdSend belongs to the earlier argument
+    # guards (SUBAGENT_DISABLED / INVALID_ARGS) — the refusal's own call is the
+    # one AFTER the detail payload is built.
+    err_at = body.find("errorEnvelope(", detail_at) if detail_at >= 0 else -1
+    if detail_at >= 0 and err_at > detail_at:
+        detail_region = body[detail_at:err_at]
+        if "response_text" in detail_region:
+            findings.append(("S8", "present",
+                             "the failure payload must not carry the reason under "
+                             "`response_text` — that key is the assistant's answer "
+                             "slot; use the envelope `message` instead"))
+    return findings
+
+
 # ── selftest: every rule must have a tooth, and the green arm must pass ──────
 
 GREEN_CONTACTS = """
@@ -2141,7 +2395,74 @@ def selftest() -> int:
         if got != want:
             print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
             failures += 1
-    # [dv15-A1 A-01/A-02] ARGS teeth — every value-binding rule has one arm.
+    # [deep-audit-1044 A-04] S1–S7 teeth — the send status → exit-code contract.
+    # Expectations are written by hand from the S rule table, never derived from
+    # a run. The pre-fix shape is the first arm: `cmdSend` catches exceptions and
+    # then emits, so the status is never consulted (S2) and nothing returns early
+    # with a nonzero code (S4); S1/S3 stay green because the payload builder does
+    # read the status and the catch branch does call `errorEnvelope`.
+    for label, send_src, want in [
+        ("the status read is dropped",
+         GREEN_SESSIONS_SEND.replace('val status = result.optString("status")',
+                                    'val status = ""'),
+         {"S1"}),
+        # Consulting the set and placing it BEFORE the payload are one decision:
+        # an `if (false)` stub keeps the payload unconditional, so both rules fire.
+        ("the success set is never consulted",
+         GREEN_SESSIONS_SEND.replace("if (!sendSucceeded(status)) {", "if (false) {"),
+         {"S2", "S5"}),
+        ("the refusal skips the shared error funnel",
+         GREEN_SESSIONS_SEND.replace('val err = errorEnvelope(', 'val err = errorShape('),
+         {"S3"}),
+        ("the refusal still exits 0",
+         GREEN_SESSIONS_SEND.replace("sendExitFor(status),", "0,"),
+         {"S4"}),
+        ("emit runs before the refusal branch",
+         GREEN_SESSIONS_SEND.replace("        if (!sendSucceeded(status)) {",
+                                     '        emit("send", data, args)\n'
+                                     "        if (!sendSucceeded(status)) {"),
+         {"S5"}),
+        ("an unknown status counts as a delivery",
+         GREEN_SESSIONS_SEND.replace(
+             'status == "Completed" || status == "Running"',
+             'status == "Completed" || status == "Running" || status == ""'),
+         {"S6"}),
+        ("Completed is no longer a delivery",
+         GREEN_SESSIONS_SEND.replace(
+             'status == "Completed" || status == "Running"', 'status == "Running"'),
+         {"S6"}),
+        ("the refusal hard-codes its exit code",
+         GREEN_SESSIONS_SEND.replace("sendExitFor(status),", "1,"),
+         {"S4"}),
+        ("the exit helper is deleted",
+         GREEN_SESSIONS_SEND.replace(
+             "        internal fun sendExitFor(status: String): Int =\n"
+             "            if (sendSucceeded(status)) 0 else EXIT_FAILURE\n", ""),
+         {"S7"}),
+        ("the reason rides along under response_text",
+         GREEN_SESSIONS_SEND.replace(
+             '            val detail = JSONObject()\n'
+             '                .put("session_id", data.optString("session_id"))\n'
+             '                .put("status", status)\n',
+             '            val detail = JSONObject()\n'
+             '                .put("session_id", data.optString("session_id"))\n'
+             '                .put("response_text", data.optString("response_text"))\n'
+             '                .put("status", status)\n'),
+         {"S8"}),
+        ("the failure exit code becomes 0",
+         GREEN_SESSIONS_SEND.replace("private const val EXIT_FAILURE = 1",
+                                     "private const val EXIT_FAILURE = 0"),
+         {"S7"}),
+    ]:
+        if send_src == GREEN_SESSIONS_SEND:
+            print(f"SELFTEST-FAIL: {label}: mutation did not apply to any arm")
+            failures += 1
+            continue
+        got = {rid for rid, _, _ in check_sessions_send_status(send_src)}
+        if got != want:
+            print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
+            failures += 1
+
     # Expectations are written by hand from ARGS_RULES, never derived from a run.
     for label, args_src, want in [
         ("value token helper gone",
@@ -2568,6 +2889,7 @@ def selftest() -> int:
     clean_flags = check_flag_set(GREEN_OUTPUT, GREEN_SPEAK)
     clean_debug = check_debug(GREEN_DEBUG)
     clean_sessions = check_sessions(GREEN_SESSIONS)
+    clean_send_status = check_sessions_send_status(GREEN_SESSIONS_SEND)
     clean_args = check_args(GREEN_ARGS)
     clean_album = check_photos_album(GREEN_ALBUM_PHOTOS)
     clean_clipboard = check_clipboard_clear(GREEN_CLIPBOARD_CLEAR)
@@ -2585,10 +2907,11 @@ def selftest() -> int:
         ("FastioOffloadHandler.kt", GREEN_PAYLOAD_FASTIO_USAGE),
     )
     if clean or clean_flags or clean_debug or clean_sessions or clean_bindings \
-            or clean_payload or clean_album or clean_search or clean_clipboard:
+            or clean_payload or clean_album or clean_search or clean_clipboard \
+            or clean_send_status:
         green_findings = (clean + clean_flags + clean_debug + clean_sessions
                           + clean_bindings + clean_payload + clean_album + clean_search
-                          + clean_clipboard)
+                          + clean_clipboard + clean_send_status)
         print(f"SELFTEST-FAIL: green fixtures must produce no findings, "
               f"got {describe(green_findings)}")
         failures += 1
@@ -2647,6 +2970,7 @@ def main(argv):
                                speak_path.read_text(encoding="utf-8"))
     findings += check_debug(debug_path.read_text(encoding="utf-8"))
     findings += check_sessions(sessions_path.read_text(encoding="utf-8"))
+    findings += check_sessions_send_status(sessions_path.read_text(encoding="utf-8"))
     findings += check_args(args_path.read_text(encoding="utf-8"))
     findings += check_photos_album((root / PHOTOS).read_text(encoding="utf-8"))
     findings += check_offload_cli_bindings(contacts_path.read_text(encoding="utf-8"),
