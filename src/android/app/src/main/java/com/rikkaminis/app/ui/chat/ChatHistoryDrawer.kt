@@ -421,14 +421,36 @@ private const val TAG = "ChatHistoryDrawer"
 
 private fun deleteSessionAndCleanup(chatRepository: ChatRepository, id: String) {
     drawerIoScope.launch {
-        // [fix/audit-0917-b9] release()/clear() used to run only AFTER
-        // deleteSession returned; an exception there (IO error, row already
-        // gone) skipped them, leaking the ChatViewModel and a stale badge for
-        // a session that no longer exists. finally keeps the cleanup
-        // unconditional. ChatViewModelStore.release touches Compose state and
-        // must run on Main — hop back like ChatViewModel.deleteSession does.
+        // [dv27-B4 / deep-audit-1047 B-06] The sequence lives in
+        // `sessionDeletePlan()` (release → delete → clear) and is executed, not
+        // re-stated here. Releasing FIRST kills the producer before the tree it
+        // produces into is removed: the resident ChatViewModel's streamJob and
+        // its BrowserTabPool otherwise keep writing `minis-sessions/<id>/…` /
+        // `browser_tabs/<id>.json` back into the just-deleted directory, and
+        // the cancelled stream's own `finally` re-publishes an overlay excerpt
+        // / badge AFTER the clear below — a deleted session that lights up
+        // again. ChatMutationMethods.delete (headless entry) cancels first for
+        // the exact same reason.
+        //
+        // [fix/audit-0917-b9] The cleanup stays UNCONDITIONAL: any throw from a
+        // step (IO error, row already gone) is logged and the finally replays
+        // the two idempotent steps, so the VM and the badge are still cleared
+        // for a session that no longer exists. ChatViewModelStore.release
+        // touches Compose state and must run on Main — hop back like
+        // ChatViewModel.deleteSession does.
         try {
-            chatRepository.deleteSession(id)
+            for (step in sessionDeletePlan()) {
+                when (step) {
+                    SessionDeleteStep.RELEASE_VIEW_MODEL ->
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
+                            ChatViewModelStore.release(id)
+                        }
+                    SessionDeleteStep.DELETE_ROW ->
+                        chatRepository.deleteSession(id)
+                    SessionDeleteStep.CLEAR_BADGE ->
+                        com.rikkaminis.app.service.SessionBadgeStore.clear(id)
+                }
+            }
         } catch (t: Throwable) {
             android.util.Log.w(TAG, "deleteSession($id) failed — releasing resources anyway", t)
         } finally {

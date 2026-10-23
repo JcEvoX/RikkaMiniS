@@ -1073,6 +1073,140 @@ def fast_mode_single_source_findings(vm_c, fm_c):
 
 # ── the gate ─────────────────────────────────────────────────────────────────
 
+# ---------------------------------------------------------------------------
+# C-CLIP-1 (dv27 B-07): the borrowed clipboard is ALWAYS handed back
+# ---------------------------------------------------------------------------
+# `MinisMarkdownTextToolbar.withSelection` borrows the system clipboard to
+# resolve a text selection (Compose exposes no "give me the selection" API).
+# Its `finally` used to restore the snapshot only when there WAS one
+# (`if (original != null)`), so a user whose clipboard was empty (or unreadable)
+# kept the borrowed selection in the clipboard — visible to every other app and
+# to the next paste.
+#
+# The criterion is behavioural, not spelling-based: the restore block must
+# contain BOTH a "put the original clip back" action AND a "make the clipboard
+# empty again" action, and the two must live in MUTUALLY EXCLUSIVE branches —
+# otherwise the "clipboard was empty" case is still skipped, which is exactly
+# the defect shape this criterion exists to catch.
+
+CLIP_RESTORE_RE = re.compile(r"\.setPrimaryClip\s*\(")
+CLIP_CLEAR_RE = re.compile(r"\.clearPrimaryClip\s*\(|newPlainText\s*\(")
+
+
+def _matching_brace_end(text, open_idx):
+    depth = 0
+    i = open_idx
+    while i < len(text):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _mutually_exclusive_regions(block):
+    """Groups of mutually-exclusive branch spans found inside [block].
+
+    A group is a list of (start, end) spans whose bodies cannot both run.
+    Recognised shapes: `when (x) { A -> ... B -> ... }` arms, and
+    `if (c) { ... } else { ... }`.
+    """
+    regions = []
+    for m in re.finditer(r"\bwhen\s*\(", block):
+        ob = block.find("{", m.end())
+        if ob < 0:
+            continue
+        end = _matching_brace_end(block, ob)
+        if end < 0:
+            continue
+        body = block[ob + 1:end]
+        headers = [(h.start(), h.end()) for h in re.finditer(
+            r"(?m)^[ \t]*(?:else\s*)?(?:[A-Za-z_][\w.]*[ \t]*)?->", body)]
+        if len(headers) < 2:
+            continue
+        spans = []
+        for i, (hs, _he) in enumerate(headers):
+            nxt = headers[i + 1][0] if i + 1 < len(headers) else len(body)
+            spans.append((ob + 1 + hs, ob + 1 + nxt))
+        regions.append(spans)
+    for m in re.finditer(r"\bif\s*\(", block):
+        j = block.find("(", m.end())
+        if j < 0:
+            continue
+        depth = 0
+        k = j
+        while k < len(block):
+            if block[k] == "(":
+                depth += 1
+            elif block[k] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        ob = block.find("{", k)
+        if ob < 0:
+            continue
+        end = _matching_brace_end(block, ob)
+        if end < 0:
+            continue
+        tail = block[end + 1:]
+        stripped = tail.lstrip()
+        if not stripped.startswith("else"):
+            continue
+        e_ob = end + 1 + (len(tail) - len(stripped))
+        e_ob = block.find("{", e_ob)
+        if e_ob < 0:
+            continue
+        e_end = _matching_brace_end(block, e_ob)
+        if e_end < 0:
+            continue
+        regions.append([(ob + 1, end), (e_ob + 1, e_end)])
+    return regions
+
+
+def clipboard_restore_findings(mdtoolbar_c):
+    """C-CLIP-1 — the borrowed clipboard is always handed back."""
+    if "withSelection" not in mdtoolbar_c:
+        return []  # ROT: this toolbar shape does not borrow the clipboard at all
+    problems = []
+    fi = mdtoolbar_c.find("finally")
+    if fi < 0:
+        return [("C-CLIP-1", "withSelection has no `finally` — the borrowed "
+                 "clipboard is not handed back when the copy/read throws")]
+    ob = mdtoolbar_c.find("{", fi)
+    block = _brace_block(mdtoolbar_c, ob) if ob >= 0 else None
+    if block is None:
+        return [("C-CLIP-1", "cannot read the `finally` block of withSelection")]
+    restore = CLIP_RESTORE_RE.search(block)
+    clear = CLIP_CLEAR_RE.search(block)
+    if not restore:
+        problems.append(("C-CLIP-1", "the `finally` block never puts the original "
+                         "clip back (no setPrimaryClip) — the borrowed selection "
+                         "permanently replaces the user's clipboard"))
+    if not clear:
+        problems.append(("C-CLIP-1", "the `finally` block has no 'make it empty "
+                         "again' action (clearPrimaryClip / empty-string write) — a "
+                         "user whose clipboard was empty keeps our borrowed text"))
+    if restore and clear:
+        rp, cp = restore.start(), clear.start()
+        separated = False
+        for spans in _mutually_exclusive_regions(block):
+            in_r = [i for i, (s, e) in enumerate(spans) if s <= rp < e]
+            in_c = [i for i, (s, e) in enumerate(spans) if s <= cp < e]
+            if in_r and in_c and in_r[0] != in_c[0]:
+                separated = True
+                break
+        if not separated:
+            problems.append(("C-CLIP-1", "the restore and the clear are not in "
+                             "mutually exclusive branches — the 'clipboard was "
+                             "empty' case is still skipped (the old "
+                             "`if (original != null)` shape)"))
+    return problems
+
 def check_tree(root):
     """Returns (None, [problems]) when a target file is missing, else
     (path-of-first-problem, problems)."""
@@ -1104,6 +1238,10 @@ def check_tree(root):
     selection_c = strip_strings(strip_comments(selection))
     stream_c = strip_strings(strip_comments(stream))
     mdtoolbar_c = strip_strings(strip_comments(mdtoolbar))
+
+    # ── C-CLIP-1: the borrowed clipboard is always handed back ────────────
+    for cid, msg in clipboard_restore_findings(mdtoolbar_c):
+        problems.append((cid, msg))
 
     # ── A1: every SlashCommand boolean field has >= 1 read point ────────────
     # SlashCommand is a primary-constructor-only data class (no body braces),
@@ -1700,6 +1838,34 @@ fun MinisMarkdownTextToolbarHost(toolbar: Toolbar) {
         val tableActions = toolbar.selectionController?.selectionTableActions()
         if (tableActions != null) {
             ToolbarButton(label = "Copy Table") { tableActions.copyTableMarkdown() }
+        }
+    }
+}
+
+internal fun withSelection(sink: (String) -> Unit) {
+    val cm = clipboard()
+    val original = runCatching { cm.primaryClip }.getOrNull()
+    try {
+        onCopyRequested.invoke()
+        val selection = runCatching {
+            cm.primaryClip?.getItemAt(0)?.coerceToText(context)?.toString()
+        }.getOrNull()?.trim().orEmpty()
+        if (selection.isNotEmpty()) sink(selection)
+    } finally {
+        val snapshot = original
+        runCatching {
+            when (clipboardRestoreAction(
+                hadOriginal = snapshot != null,
+                atLeastQ = true,
+            )) {
+                ClipboardRestoreAction.RESTORE_ORIGINAL ->
+                    snapshot?.let { cm.setPrimaryClip(it) }
+                ClipboardRestoreAction.CLEAR_PLATFORM ->
+                    cm.clearPrimaryClip()
+                ClipboardRestoreAction.CLEAR_EMPTY_STRING ->
+                    cm.setPrimaryClip(ClipData.newPlainText("", ""))
+                ClipboardRestoreAction.NOOP -> Unit
+            }
         }
     }
 }
@@ -2366,6 +2532,80 @@ def selftest():
             "            MinisToolbarButton(label = \"Copy Table Image\") { tableActions.copyTableImage() }\n"
             "        }\n", ""),
     }), ["B1"])
+    # ── C-CLIP-1 (dv27 B-07) ────────────────────────────────────────────
+    # The borrowed clipboard must ALWAYS be handed back, including the case
+    # where there was nothing to hand back. Each breaker below mutates exactly
+    # one property of the restore block and must flip exactly C-CLIP-1.
+    CLIP_GOOD = (
+        "    } finally {\n"
+        "        val snapshot = original\n"
+        "        runCatching {\n"
+        "            when (clipboardRestoreAction(\n"
+        "                hadOriginal = snapshot != null,\n"
+        "                atLeastQ = true,\n"
+        "            )) {\n"
+        "                ClipboardRestoreAction.RESTORE_ORIGINAL ->\n"
+        "                    snapshot?.let { cm.setPrimaryClip(it) }\n"
+        "                ClipboardRestoreAction.CLEAR_PLATFORM ->\n"
+        "                    cm.clearPrimaryClip()\n"
+        "                ClipboardRestoreAction.CLEAR_EMPTY_STRING ->\n"
+        "                    cm.setPrimaryClip(ClipData.newPlainText(\"\", \"\"))\n"
+        "                ClipboardRestoreAction.NOOP -> Unit\n"
+        "            }\n"
+        "        }\n"
+        "    }\n"
+    )
+    # breaker 1: the old `if (original != null)` shape — the empty-clipboard
+    # case is skipped again (restore + clear present but NOT exclusive).
+    expect_exact("C-CLIP-1 old if(original != null) shape", fixtures(**{
+        MDTOOLBAR_REL: MDTOOLBAR_F.replace(CLIP_GOOD,
+            "    } finally {\n"
+            "        if (original != null) runCatching { cm.setPrimaryClip(original) }\n"
+            "    }\n"),
+    }), ["C-CLIP-1"])
+    # breaker 2: no clear action at all — the borrowed text stays in the
+    # clipboard for a user who had an empty one.
+    expect_exact("C-CLIP-1 clear action removed", fixtures(**{
+        MDTOOLBAR_REL: MDTOOLBAR_F.replace(CLIP_GOOD,
+            "    } finally {\n"
+            "        val snapshot = original\n"
+            "        runCatching {\n"
+            "            when (clipboardRestoreAction(\n"
+            "                hadOriginal = snapshot != null,\n"
+            "                atLeastQ = true,\n"
+            "            )) {\n"
+            "                ClipboardRestoreAction.RESTORE_ORIGINAL ->\n"
+            "                    snapshot?.let { cm.setPrimaryClip(it) }\n"
+            "                ClipboardRestoreAction.CLEAR_PLATFORM -> Unit\n"
+            "                ClipboardRestoreAction.CLEAR_EMPTY_STRING -> Unit\n"
+            "                ClipboardRestoreAction.NOOP -> Unit\n"
+            "            }\n"
+            "        }\n"
+            "    }\n"),
+    }), ["C-CLIP-1"])
+    # breaker 3: no restore action at all — the user's own clip is lost.
+    expect_exact("C-CLIP-1 restore action removed", fixtures(**{
+        MDTOOLBAR_REL: MDTOOLBAR_F.replace(CLIP_GOOD,
+            "    } finally {\n"
+            "        runCatching {\n"
+            "            when (clipboardRestoreAction(\n"
+            "                hadOriginal = snapshot != null,\n"
+            "                atLeastQ = true,\n"
+            "            )) {\n"
+            "                ClipboardRestoreAction.RESTORE_ORIGINAL -> Unit\n"
+            "                ClipboardRestoreAction.CLEAR_PLATFORM ->\n"
+            "                    cm.clearPrimaryClip()\n"
+            "                ClipboardRestoreAction.CLEAR_EMPTY_STRING -> Unit\n"
+            "                ClipboardRestoreAction.NOOP -> Unit\n"
+            "            }\n"
+            "        }\n"
+            "    }\n"),
+    }), ["C-CLIP-1"])
+    # breaker 4: the whole finally is gone — the borrow is never returned.
+    expect_exact("C-CLIP-1 finally removed", fixtures(**{
+        MDTOOLBAR_REL: MDTOOLBAR_F.replace(CLIP_GOOD, "    }\n"),
+    }), ["C-CLIP-1"])
+
     # B2: deleting the markdown-toolbar consumer flips red
     expect("B2 mdtoolbar consumer dropped", fixtures(**{
         MDTOOLBAR_REL: MDTOOLBAR_F.replace(
