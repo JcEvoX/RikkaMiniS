@@ -338,6 +338,15 @@ class WebViewHolder(
      * `BrowserUseManager.applyShrinkToFit`.
      */
     fun toggleDesktopMode() {
+        // [deep-audit-1045 B-02] Same latch the pool's setUserAgent entries
+        // carry: the holder is destroyed by a Compose DisposableEffect and by
+        // the dismiss callback, and a desktop/mobile toggle from a still-visible
+        // toolbar can land after either. Pre-fix this wrote UA + clearCache +
+        // reload() on a destroyed WebView.
+        if (destroyed.get()) {
+            AppLogger.warning(TAG, "toggleDesktopMode dropped: WebView already destroyed")
+            return
+        }
         desktopMode = !desktopMode
         if (desktopMode) {
             webView.settings.userAgentString = DESKTOP_UA
@@ -417,6 +426,15 @@ class WebViewHolder(
         try {
             detach()
             webView.stopLoading()
+            // [deep-audit-1045 B-02] Same three-call teardown KaTeXView.kt
+            // (T10-M1) and FilePreviewScreen.kt (F-274) already use: stop →
+            // drop this view's queued callbacks → destroy. The queue that
+            // matters here is `onPageFinished`'s `view.postDelayed({ resize })`
+            // (:249): a late attach would flush it into a destroyed renderer.
+            // Safe by ordering — detach() above already cleared attachInfo, so
+            // this only drains THIS view's run queue, never the shared window
+            // handler's null-token messages.
+            webView.removeCallbacks(null)
             webView.loadUrl("about:blank")
             webView.destroy()
             AppLogger.info(TAG, "destroyed")

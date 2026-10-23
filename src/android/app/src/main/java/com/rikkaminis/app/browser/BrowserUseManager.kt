@@ -562,6 +562,13 @@ class BrowserUseManager(
      * from THIS reader.
      */
     private fun fetchBlobDownload(blobUrl: String, contentDisposition: String?, mimeType: String?) {
+        // [deep-audit-1045 B-02] Check the latch BEFORE arming the credential:
+        // a dispatch that [runJsOnMain] will refuse must not leave a one-shot
+        // bridge token armed for a request that can never come back.
+        if (destroyed) {
+            Log.w(TAG, "blob download dropped: the WebView was already destroyed")
+            return
+        }
         val guessedName = android.webkit.URLUtil.guessFileName(blobUrl, contentDisposition, mimeType)
         // [audit2-A2] Arm the one-shot bridge credential for THIS fetch: the
         // token interpolated below is the only value the bridge will accept
@@ -586,7 +593,50 @@ class BrowserUseManager(
                     .catch(function(e) { __minis__.blobDownloadError(String(e)); });
             })();
         """.trimIndent()
-        webView.post { webView.evaluateJavascript(js, null) }
+        // [deep-audit-1045 B-02] NOT `webView.post { … }`: that is a View-queue
+        // write. On a DETACHED WebView — which every headless pool tab is until
+        // something attaches it to a window — the runnable parks in View's
+        // HandlerActionQueue and is only flushed on a later attach. For a tab
+        // that never attaches, the injected FileReader therefore never runs:
+        // the download silently never lands and the one-shot bridge token armed
+        // above is never consumed. `evaluateJavascript` needs the main THREAD,
+        // not a window (the pool drives detached tabs this way everywhere
+        // else), so the injection goes through the same main-thread chokepoint
+        // [setUserAgent] uses — one that always drains.
+        runJsOnMain("blob-download") { webView.evaluateJavascript(js, null) }
+    }
+
+    /**
+     * [deep-audit-1045 B-02] Main-thread chokepoint for one-shot JS injections
+     * requested from a non-suspending caller (download listener, WebView
+     * client callbacks).
+     *
+     * Two things it owns that a bare `View.post` does not:
+     *  1. **the queue** — a main-`Looper` hop always drains; a detached View's
+     *     `post` queue waits for an attach that a headless pool tab never gets
+     *     ([jsDispatchFor] carries the whole decision).
+     *  2. **the latch** — the hop can land *after* [destroy], so the destroyed
+     *     flag is re-checked at execution time, and a WebView throwing
+     *     "… on a destroyed WebView" is logged instead of crashing the app.
+     */
+    private fun runJsOnMain(what: String, block: () -> Unit) {
+        when (jsDispatchFor(destroyed, Looper.myLooper() == Looper.getMainLooper())) {
+            JsDispatch.REJECT_DESTROYED ->
+                Log.w(TAG, "JS dispatch dropped ($what): the WebView was already destroyed")
+            JsDispatch.INLINE -> runJsNow(what, block)
+            JsDispatch.HOP_TO_MAIN -> Handler(Looper.getMainLooper()).post { runJsNow(what, block) }
+        }
+    }
+
+    /** Run [block] if the tab is still alive; a destroy race stays a log line. */
+    private fun runJsNow(what: String, block: () -> Unit) {
+        if (destroyed) {
+            Log.w(TAG, "JS dispatch dropped ($what): the WebView was destroyed before it ran")
+            return
+        }
+        runCatching(block).onFailure {
+            Log.w(TAG, "JS dispatch failed ($what): ${it.message}")
+        }
     }
 
     /**
@@ -1821,6 +1871,16 @@ class BrowserUseManager(
 
     /** Set user agent from UI settings (public, non-result). */
     fun setUserAgent(profile: UserAgentProfile, customUA: String? = null) {
+        // [deep-audit-1045 B-02] The latch must be the FIRST statement: the
+        // thread hop below re-enters this same function, so one check here
+        // covers both the direct call and a hop that lands after destroy().
+        // Without it the body wrote `settings.userAgentString` and called
+        // reload() on a destroyed WebView — "Attempt to perform WebView method
+        // on a destroyed WebView" for any UI path that outlived its tab.
+        if (destroyed) {
+            Log.w(TAG, "setUserAgent dropped: the WebView was already destroyed")
+            return
+        }
         // [audit-0917] WebView.settings / reload() are main-thread-only, and
         // this is a public entry point. Every current caller happens to be on
         // the main thread, but the failure mode (CalledFromWrongThreadException)
@@ -1892,27 +1952,50 @@ class BrowserUseManager(
     }
 
     private suspend fun setUserAgent(profile: UserAgentProfile?): BrowserActionResult {
+        // [deep-audit-1045 B-02] Same latch as the public overload, but this is
+        // the AGENT-facing entry (BrowserAction.SET_USER_AGENT → the answer
+        // slot). Silently returning would report "Switched to …" for a tab that
+        // no longer exists, so the refusal goes into the result.
+        if (destroyed) return destroyedTabResult()
         val newProfile = profile ?: UserAgentProfile.MOBILE_CHROME
-        currentProfile = newProfile
         val ua = newProfile.userAgentString
         // Every WebView method must be called on the main thread, but the
         // offload handler's `runBlocking { ... execute(...) }` dispatches on
         // a worker. `applyViewport(...)` measures/layouts the detached
         // WebView; settings / reload likewise. Hop to main so we don't
         // crash with "A WebView method was called on thread 'worker-N'".
-        withContext(Dispatchers.Main) {
-            if (ua != null) {
-                webView.settings.userAgentString = ua
-            }
-            applyViewport()
-            val oldUrl = _currentURL.value
-            if (oldUrl.isNotEmpty()) {
-                webView.reload()
+        val applied = withContext(Dispatchers.Main) {
+            // Re-checked after the hop: the tab can be evicted while we are
+            // waiting for the main thread.
+            if (destroyed) {
+                false
+            } else {
+                currentProfile = newProfile
+                if (ua != null) {
+                    webView.settings.userAgentString = ua
+                }
+                applyViewport()
+                val oldUrl = _currentURL.value
+                if (oldUrl.isNotEmpty()) {
+                    webView.reload()
+                }
+                true
             }
         }
+        if (!applied) return destroyedTabResult()
         val vp = newProfile.viewportSize
         return BrowserActionResult(text = "Switched to ${newProfile.value} (${vp.first}x${vp.second})")
     }
+
+    /**
+     * [deep-audit-1045 B-02] The answer-slot form of "this tab is gone".
+     * Every entry that can outlive its tab returns this instead of a fabricated
+     * success or a silent no-op.
+     */
+    private fun destroyedTabResult(): BrowserActionResult = BrowserActionResult.error(
+        "This tab's WebView was already destroyed (the tab was closed or evicted) — " +
+            "the user agent was not applied; open a new tab and retry",
+    )
 
     // -- User Navigation --
 
@@ -2755,6 +2838,18 @@ class BrowserUseManager(
             // crash the app (ConnectionTerminated / missing renderer).
             (webView.parent as? android.view.ViewGroup)?.removeView(webView)
             webView.stopLoading()
+            // [deep-audit-1045 B-02] Drop everything queued on this view before
+            // it dies: `onPageFinished` posts a synthetic `resize` via
+            // `view.postDelayed(…, 80)` and a late attach would flush that
+            // runnable straight into a destroyed renderer (KaTeXView.kt and
+            // FilePreviewScreen.kt carry the same three-call teardown: stop →
+            // drop callbacks → destroy).
+            //
+            // Order matters twice over: this MUST sit after the removeView()
+            // above, because `View.removeCallbacks(null)` on an ATTACHED view
+            // also drains the shared window handler's null-token messages,
+            // while on a detached one it only drops this view's run queue.
+            webView.removeCallbacks(null)
             webView.loadUrl("about:blank")
             webView.removeAllViews()
             webView.settings.javaScriptEnabled = false
@@ -2926,3 +3021,47 @@ internal fun decodeDataUrlPayload(
 /** [deep-audit-1019 ISSUE-08] Production Base64 half of [decodeDataUrlPayload]. */
 private fun decodeDataUrlBase64(payload: String): ByteArray =
     Base64.decode(payload, Base64.DEFAULT)
+
+/**
+ * [deep-audit-1045 B-02] Where a one-shot JS injection must land.
+ *
+ * Lifted to the top level next to [MinisMainDocGate] / [decodeDataUrlPayload]
+ * for the same reason they were: an Android-owned instance member cannot be
+ * exercised without a WebView, and "the download goes into a queue nothing
+ * ever drains" is exactly the kind of silent loss a pinned unit test should
+ * hold still.
+ *
+ * The axis is deliberately **not** "is the view attached". A headless pool tab
+ * is never attached and must still run JS — `evaluateJavascript` needs the main
+ * *thread*, not a window (every other entry in this file drives detached tabs
+ * that way). The axis is *which queue receives the block*:
+ *
+ *  * `View.post` on a detached view parks the runnable into
+ *    `HandlerActionQueue` and replays it only when attachInfo arrives — never,
+ *    for a tab that never attaches. The pre-fix blob: download path used it,
+ *    so the injected FileReader never ran: no file, no error, and the armed
+ *    one-shot bridge token left dangling.
+ *  * a `Looper.getMainLooper()` hop always drains, and is what the sibling
+ *    entries ([setUserAgent]'s thread hop, `navigate()`'s timeout runnable) use.
+ */
+internal enum class JsDispatch {
+    /** Already on the main thread: run the block directly. */
+    INLINE,
+
+    /** Posted to the main Looper — always runs (unlike a detached View queue). */
+    HOP_TO_MAIN,
+
+    /** The WebView is destroyed: nothing may touch it, on any thread. */
+    REJECT_DESTROYED,
+}
+
+/**
+ * [deep-audit-1045 B-02] Three-state decision. `destroyed` outranks the thread:
+ * a destroyed WebView must not be touched even from the main thread (every
+ * method throws "Attempt to perform WebView method on a destroyed WebView").
+ */
+internal fun jsDispatchFor(destroyed: Boolean, onMainThread: Boolean): JsDispatch = when {
+    destroyed -> JsDispatch.REJECT_DESTROYED
+    onMainThread -> JsDispatch.INLINE
+    else -> JsDispatch.HOP_TO_MAIN
+}
