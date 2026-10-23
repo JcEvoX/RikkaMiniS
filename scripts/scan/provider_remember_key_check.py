@@ -2390,6 +2390,188 @@ def check_quick_test_execution(code):
     return [("C33", True,
              "performTest executes the effective model (0 raw entry.model arguments)")]
 
+# ------------------- [dv27/B-03] System voice member presentation --------
+# A System voice entry is a VIRTUAL member: it lives in
+# `SystemVoiceIds.BUILTIN_PROVIDER_ID`, is never written to
+# `config.modelEntries`, and has no ProviderInstance (the device IS its
+# provider). A default Voice Input/Output group is made ENTIRELY of them, so
+# every 「member that has no cloud provider behind it」 accident shows up on
+# 100% of that screen's rows:
+#   • a subtitle that degrades to "" (`instance?.label ?: ""`),
+#   • a cost-tier menu whose write `updateEntry` silently drops,
+#   • a remove dialog that falls back to the generic 「this model」 copy.
+_WRITE_ENTRY_RE = re.compile(r"\bupdateEntr(?:y|ies)\s*\(")
+_INSTANCE_LABEL_RE = re.compile(r"\?\s*\.\s*label\b")
+_EMPTY_FALLBACK_RE = re.compile(r'\?\:\s*""')
+# Any spelling of 「this member is (not) a System voice entry」. The prefix test,
+# a decision helper that wraps it, and membership in the persisted list are the
+# same decision answered three ways.
+_SYSTEM_EXCLUSION_RE = re.compile(
+    r"isSystemEntryId|canEditCostTier|\bisSystemEntry\b|"
+    r"\b\w+\s+(?:in|!in)\s+[\w.]*modelEntries\b")
+# The single sources a member label may come from: the System entry resolver /
+# the presentation decisions that wrap it.
+_SYSTEM_LABEL_SOURCE_RE = re.compile(
+    r"SystemVoiceEntries\s*\.|SystemVoiceMemberPresentation\s*\.")
+_FUN_DECL_RE = re.compile(
+    r"(?m)^[ \t]*(?:@\w+(?:\([^)\n]*\))?[ \t]*\n[ \t]*)*"
+    r"(?:private |internal |public |protected )?(?:suspend )?fun[ \t]+\w+")
+
+
+def _brace_blocks(code):
+    """[(open_idx, close_idx)] for every `{ … }` block. Lone `{`s are ignored."""
+    blocks, stack = [], []
+    for i, ch in enumerate(code):
+        if ch == "{":
+            stack.append(i)
+        elif ch == "}" and stack:
+            blocks.append((stack.pop(), i))
+    return blocks
+
+
+def _block_header(code, open_idx, limit=700, max_lines=8):
+    """The text that INTRODUCES the block at [open_idx] — `if (…)`, `forEach { t ->` …
+
+    Cut at the previous block / statement boundary, then keep only the last few
+    non-blank lines: enough to see a condition written across several lines, and
+    short enough that a guard three statements up cannot stand in for this one."""
+    seg = code[max(0, open_idx - limit):open_idx]
+    cut = max(seg.rfind("}"), seg.rfind("{"), seg.rfind(";"))
+    if cut >= 0:
+        seg = seg[cut + 1:]
+    lines = [ln for ln in seg.split("\n") if ln.strip()]
+    return "\n".join(lines[-max_lines:])
+
+
+def _enclosing_headers(code, pos, blocks):
+    """Headers of every block that CONTAINS [pos], innermost last."""
+    return [_block_header(code, o) for (o, c) in blocks if o < pos < c]
+
+
+def _enclosing_function(code, pos):
+    """Source segment of the function declaration that contains [pos].
+
+    Used to scope a criterion to 「surfaces that talk to provider instances」:
+    `?.label` is also the spelling of a slider step's label (ContextLimitSlider),
+    which has nothing to do with a ProviderInstance and must not be graded."""
+    decls = [m.start() for m in _FUN_DECL_RE.finditer(code)]
+    before = [s for s in decls if s < pos]
+    if not before:
+        return ""
+    after = [s for s in decls if s > pos]
+    return code[before[-1]:after[0] if after else len(code)]
+
+
+def check_system_voice_cost_tier_write(code):
+    """C-SV1 [dv27/B-03] — a member write is guarded against virtual members.
+
+    `ProviderRepository.updateEntry(entry.copy(…))` resolves the entry by id
+    inside `config.modelEntries` (`indexOfFirst == -1` → return). For a System
+    voice entry that is a SILENT no-op: the menu closes, the tick does not move,
+    nothing is reported. The cost-tier rows therefore may only be offered for a
+    PERSISTED member — and the guard has to be a real enclosing condition, not a
+    comment: the write sits 4 blocks deep (menu lambda → forEach → onClick →
+    `if (currentTier != …)`), so a guard that is merely NEAR it does nothing.
+
+    Graded as the decision, per write site: the call must sit inside an
+    enclosing block whose header tests System identity — any spelling of the
+    single source (`isSystemEntryId`, a decision helper, or `entry in
+    …modelEntries`). A local flag used as that test must itself derive from
+    `SystemVoiceEntries.isSystemEntryId` in this file: a name is not a derivation.
+
+    Fail-closed: a cost-tier menu with no write left is a rework, not a pass."""
+    sites = [m.start() for m in _WRITE_ENTRY_RE.finditer(code)]
+    if not sites:
+        if "CostTier.entries" in code:
+            return [("C-SV1", False,
+                     "the cost-tier menu is still rendered but no entry write "
+                     "remains — fail-closed, re-derive this criterion")]
+        return [("C-SV1", True, "no entry write on this surface — nothing to guard")]
+    blocks = _brace_blocks(code)
+    bad = []
+    guarded_by_flag = False
+    for pos in sites:
+        headers = _enclosing_headers(code, pos, blocks)
+        if any(_SYSTEM_EXCLUSION_RE.search(h) for h in headers):
+            guarded_by_flag = guarded_by_flag or any(
+                re.search(r"\bisSystemEntry\b", h) for h in headers)
+        else:
+            bad.append(code.count("\n", 0, pos) + 1)
+    if bad:
+        return [("C-SV1", False,
+                 "entry write(s) at line(s) %s run unguarded for a System voice "
+                 "member — `updateEntry` resolves the id inside "
+                 "`config.modelEntries`, where a virtual entry is absent, so the "
+                 "tap closes the menu and changes nothing"
+                 % ", ".join(str(x) for x in bad))]
+    if guarded_by_flag and not re.search(
+            r"\bisSystemEntry\s*=\s*[^\n]*isSystemEntryId\s*\(", code):
+        return [("C-SV1", False,
+                 "the write is guarded by a bare `isSystemEntry` flag that this file "
+                 "never derives from `SystemVoiceEntries.isSystemEntryId(…)` — the "
+                 "guard's name is not the decision")]
+    return [("C-SV1", True,
+             "%d entry write(s), each inside a block guarded on System identity"
+             % len(sites))]
+
+
+def check_system_voice_member_label(code):
+    """C-SV2 [dv27/B-03] — a member's provider label never degrades, and a
+    surface that can show a System member labels it through the single source.
+
+    Two assertions, both derived:
+
+    (a) no `?: ""` ANYWHERE on the screen. A user-visible label that falls back
+        to the empty string is the defect itself (`Text(instanceLabel ?: "")` left
+        every row of a default Voice group with a blank secondary line) and has no
+        correct use.
+
+    (b) every provider-label read (`….?.label`) on a surface that lists group
+        members must be in a statement that consults the System single source.
+        The `instance` lookup is answerable only for a PERSISTED entry; for a
+        System member there is no instance at all, so an elvis onto a constant is
+        guaranteed to fire on 100% of a default Voice group's rows. Statement
+        scope, not spelling: `SystemVoiceEntries.resolveIn`-derived labels and a
+        presentation helper that wraps them both qualify."""
+    results = []
+    empties = [code.count("\n", 0, m.start()) + 1
+               for m in _EMPTY_FALLBACK_RE.finditer(code)]
+    results.append(("C-SV2a", not empties,
+                    "no label falls back to the empty string" if not empties else
+                    "label falls back to `\"\"` at line(s) %s — on a System voice "
+                    "member that is EVERY row of a default Voice group"
+                    % ", ".join(str(x) for x in empties)))
+    if "memberEntryIds" not in code:
+        results.append(("C-SV2b", True,
+                        "no group member list on this surface — nothing to grade"))
+        return results
+    sites, bad = 0, []
+    for m in _INSTANCE_LABEL_RE.finditer(code):
+        if ".instances" not in _enclosing_function(code, m.start()):
+            # Not a provider-instance surface (e.g. a slider step's `?.label`).
+            continue
+        start, _end = _statement_around(code, m.start())
+        stmt = code[start:_end]
+        sites += 1
+        if not _SYSTEM_LABEL_SOURCE_RE.search(stmt):
+            bad.append(code.count("\n", 0, start) + 1)
+    if bad:
+        results.append(("C-SV2b", False,
+                        "provider-label read at line(s) %s never consults the System "
+                        "single source — a System voice member has no provider "
+                        "instance, so that label is null on every default Voice row"
+                        % ", ".join(str(x) for x in bad)))
+    elif not sites:
+        results.append(("C-SV2b", False,
+                        "the file lists group members but performs no provider-label "
+                        "read — fail-closed, re-derive this criterion"))
+    else:
+        results.append(("C-SV2b", True,
+                        "%d provider-label read(s), all through the System single "
+                        "source" % sites))
+    return results
+
+
 CHECKERS = (
     (REL_PROVIDER_LIST, check_provider_list),
     (REL_SHEET, check_sheet),
@@ -2448,6 +2630,14 @@ CHECKERS = (
     (REL_MODEL_PICKER_SHEET, check_active_entry_single_source),
     (REL_MODEL_PICKER_SHEET, check_elvis_after_else_null),
     (REL_CHAT_SCREEN, check_group_member_resolution),
+    # dv27-B3 — the group detail screen resolves the same members the pickers
+    # do, and C35/C36 were only ever mounted on the PICKER surface. 「The
+    # criterion exists but was never wired to this file」 is exactly how three
+    # System-voice faults survived on the screen the user actually opens.
+    (REL_GROUP_DETAIL, check_active_entry_single_source),
+    (REL_GROUP_DETAIL, check_elvis_after_else_null),
+    (REL_GROUP_DETAIL, check_system_voice_cost_tier_write),
+    (REL_GROUP_DETAIL, check_system_voice_member_label),
 )
 
 
@@ -2899,7 +3089,28 @@ fun ModelGroupDetailScreen(groupId: String) {
     var memberIds by remember(group.memberEntryIds) { mutableStateOf(group.memberEntryIds.toList()) }
     var entryToRemove by remember { mutableStateOf<String?>(null) }
     val groupMaxThinkingLevel = remember(group.memberEntryIds, config.modelEntries) {
-        group.memberEntryIds.mapNotNull { entryId -> config.modelEntries.find { it.id == entryId } }
+        group.memberEntryIds
+            .filterNot { SystemVoiceEntries.isSystemEntryId(it) }
+            .mapNotNull { entryId -> SystemVoiceEntries.resolveIn(config.modelEntries, entryId) }
+    }
+    val entry = SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
+    val instance = config.instances.find { it.id == entry.providerInstanceId }
+    val instanceLabel = SystemVoiceMemberPresentation.memberSubtitle(
+        instanceLabel = instance?.label,
+        isSystemEntry = SystemVoiceEntries.isSystemEntryId(entry.id),
+        systemLabel = systemLabel,
+    )
+    val removingEntry = SystemVoiceEntries.resolveIn(config.modelEntries, removingId)
+    val removingName = SystemVoiceMemberPresentation.removalDisplayName(
+        entryName = removingEntry?.model?.displayName,
+        fallback = removingFallback,
+    )
+    if (
+        SystemVoiceMemberPresentation.canEditCostTier(
+            isSystemEntry = SystemVoiceEntries.isSystemEntryId(entry.id),
+        )
+    ) {
+        providerRepository.updateEntry(entry.copy(costTier = tier.value))
     }
 }
 """
@@ -2909,6 +3120,42 @@ fun ModelGroupDetailScreen(groupId: String) {
 FIX_GROUP_DETAIL_NO_NAME_KEY = FIX_GROUP_DETAIL_CLEAN.replace(
     "remember(group.id, group.name) { mutableStateOf(group.name) }",
     "remember(group.id) { mutableStateOf(group.name) }")
+
+# [dv27/B-03] the three faults this wave fixed, one fixture per criterion:
+#   C35  — the remove dialog resolved the member id in `config.modelEntries` only
+#   C-SV1 — the cost-tier write ran unguarded for a virtual System member
+#   C-SV2a — a member label fell back to the empty string
+#   C-SV2b — the subtitle read `instance?.label` with no System source at all
+#   C-SV1 — a guard that tests a local flag nobody derives from the prefix test
+_SUBTITLE_CALL = """    val instanceLabel = SystemVoiceMemberPresentation.memberSubtitle(
+        instanceLabel = instance?.label,
+        isSystemEntry = SystemVoiceEntries.isSystemEntryId(entry.id),
+        systemLabel = systemLabel,
+    )"""
+_COST_TIER_GUARD = """    if (
+        SystemVoiceMemberPresentation.canEditCostTier(
+            isSystemEntry = SystemVoiceEntries.isSystemEntryId(entry.id),
+        )
+    ) {"""
+
+FIX_GROUP_DETAIL_REMOVE_PERSISTED_ONLY = FIX_GROUP_DETAIL_CLEAN.replace(
+    "    val removingEntry = SystemVoiceEntries.resolveIn(config.modelEntries, removingId)",
+    "    val removingEntry = config.modelEntries.find { it.id == removingId }")
+
+FIX_GROUP_DETAIL_COST_TIER_UNGUARDED = FIX_GROUP_DETAIL_CLEAN.replace(
+    _COST_TIER_GUARD, "    if (tierSelectable) {")
+
+FIX_GROUP_DETAIL_SUBTITLE_EMPTY = FIX_GROUP_DETAIL_CLEAN.replace(
+    "    val removingName",
+    '    val extraEmpty = otherLabel ?: ""\n    val removingName')
+
+FIX_GROUP_DETAIL_SUBTITLE_NO_SYSTEM = FIX_GROUP_DETAIL_CLEAN.replace(
+    _SUBTITLE_CALL,
+    "    val instanceLabel = instance?.label ?: systemLabel")
+
+FIX_GROUP_DETAIL_FLAG_NOT_DERIVED = FIX_GROUP_DETAIL_CLEAN.replace(
+    "isSystemEntry = SystemVoiceEntries.isSystemEntryId(entry.id),",
+    "isSystemEntry = systemMember,")
 
 FIX_GROUP_DETAIL_MISSING_ANCHOR = """package com.rikkaminis.app.ui.settings
 
@@ -4127,7 +4374,24 @@ def run_selftest():
     run_case("c8-group-no-name-key", 1,
              variant(REL_GROUP_DETAIL, FIX_GROUP_DETAIL_NO_NAME_KEY), failures, ("C8",))
     run_case("failclosed-missing-group-anchor", 1,
-             variant(REL_GROUP_DETAIL, FIX_GROUP_DETAIL_MISSING_ANCHOR), failures, ("C8",))
+             variant(REL_GROUP_DETAIL, FIX_GROUP_DETAIL_MISSING_ANCHOR), failures,
+             ("C8", "C35"))
+    # --- dv27-B3: C35 mounted on the group detail screen + C-SV1 / C-SV2 ----
+    run_case("c35-group-remove-persisted-only", 1,
+             variant(REL_GROUP_DETAIL, FIX_GROUP_DETAIL_REMOVE_PERSISTED_ONLY),
+             failures, ("C35",))
+    run_case("csv1-cost-tier-unguarded", 1,
+             variant(REL_GROUP_DETAIL, FIX_GROUP_DETAIL_COST_TIER_UNGUARDED),
+             failures, ("C-SV1",))
+    run_case("csv1-guard-flag-not-derived", 1,
+             variant(REL_GROUP_DETAIL, FIX_GROUP_DETAIL_FLAG_NOT_DERIVED),
+             failures, ("C-SV1",))
+    run_case("csv2-subtitle-empty-fallback", 1,
+             variant(REL_GROUP_DETAIL, FIX_GROUP_DETAIL_SUBTITLE_EMPTY),
+             failures, ("C-SV2a",))
+    run_case("csv2-subtitle-no-system-source", 1,
+             variant(REL_GROUP_DETAIL, FIX_GROUP_DETAIL_SUBTITLE_NO_SYSTEM),
+             failures, ("C-SV2b",))
     run_case("c9-mount-no-write-key", 1,
              variant(REL_MOUNT_DETAIL, FIX_MOUNT_DETAIL_NO_WRITE_KEY), failures, ("C9",))
     run_case("failclosed-missing-mount-anchor", 1,
