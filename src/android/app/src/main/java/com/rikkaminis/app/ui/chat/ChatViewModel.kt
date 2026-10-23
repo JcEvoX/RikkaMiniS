@@ -1896,13 +1896,20 @@ class ChatViewModel(
      * chat reads the same flag. The provider reads FastModePrefs directly at
      * request-build time, so this flow only drives the menu row + nav badge.
      */
-    internal val _fastModeEnabled =
-        MutableStateFlow(com.rikkaminis.app.data.FastModePrefs.isEnabled())
-    val fastModeEnabled: StateFlow<Boolean> = _fastModeEnabled.asStateFlow()
+    // [dv25-B05 / deep-audit-1045 B-05] Single source: the process-level flow
+    // owned by FastModePrefs. This used to be a VM-local MutableStateFlow seeded
+    // ONCE at construction, so an already-cached conversation (ViewModels live in
+    // ChatViewModelStore) kept rendering the flag as it was when that chat was
+    // first opened: toggle Fast Mode in chat A, go back to chat B, and the menu
+    // row / nav ⚡ badge still showed the old value while every request builder
+    // (FastModePrefs.isEnabled(), read per request) already used the new one. The
+    // screen and the wire disagreeing about the same flag is the defect; one flow
+    // read by both removes the second copy rather than re-syncing it.
+    val fastModeEnabled: StateFlow<Boolean> = com.rikkaminis.app.data.FastModePrefs.enabled
 
     fun setFastModeEnabled(enabled: Boolean) {
+        // FastModePrefs publishes to that same flow — no local mirror to update.
         com.rikkaminis.app.data.FastModePrefs.setEnabled(context, enabled)
-        _fastModeEnabled.value = enabled
     }
 
     /**
