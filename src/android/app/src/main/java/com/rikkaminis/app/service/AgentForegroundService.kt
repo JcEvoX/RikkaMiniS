@@ -436,9 +436,13 @@ class AgentForegroundService : Service() {
             hasCompletionPending = true
         }
         wasBusy = isBusy
-        val shouldShow = state.enabled && hasPerm && !state.isForeground &&
-            !state.cameraSuppress &&
-            (isBusy || hasCompletionPending)
+        val shouldShow = state.enabled && resolveOverlayIntent(
+            wantShown = isBusy,
+            permission = hasPerm,
+            foreground = state.isForeground,
+            camera = state.cameraSuppress,
+            hasPending = hasCompletionPending,
+        )
         Log.d(
             TAG,
             "applyOverlayState fg=${state.isForeground} enabled=${state.enabled} " +
@@ -473,7 +477,12 @@ class AgentForegroundService : Service() {
             if (state.isForeground) hasCompletionPending = false
             lingerJob?.cancel()
             lingerJob = null
-            if (controller.isShown) controller.hide()
+            // [T-android-overlay-intent-latch] Unconditional. Gating on
+            // `isShown` dropped every flip that landed while show()'s
+            // attach was still queued, and that attach then painted the
+            // capsule over the chat / camera with no later frame to clear
+            // it. hide() is idempotent and cheap when nothing is attached.
+            controller.hide()
             return
         }
 
@@ -529,7 +538,10 @@ class AgentForegroundService : Service() {
         // the user already dismissed the completion (or none was pending,
         // e.g. the turn ended in foreground), so the old "task finished →
         // proactively hide" semantics still hold for those cases.
-        if (controller.isShown) controller.hide()
+        // [T-android-overlay-intent-latch] Unconditional for the same
+        // reason as the early-return branch above: the queued attach has
+        // to be cancelled by intent, not by the not-yet-true `isShown`.
+        controller.hide()
     }
 
     private fun acquireWakeLock() {
