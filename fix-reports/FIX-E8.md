@@ -149,16 +149,20 @@ private fun resolveMount(context: Context, htmlPath: String): File? {
 
 ### L2 邻门层
 
-按概念（不是任务书点名的文件名）`grep -rln 'WebAppActivity\|WebAppPathResolver\|applyMountedFoldersSnapshot\|MountedFolders' scripts/scan/` 命中 4 道真实邻门，逐个 rc=0：
+按**概念**（不是任务书点名的文件名）两轮 `grep -rln`：`WebAppActivity|WebAppPathResolver|applyMountedFoldersSnapshot|MountedFolders` 命中 4 道；再按 `withContext|Dispatchers.IO`（主线程 IO 面）与 `SCOPE_|ShortcutEntity|webapp`（作用域/快捷方式面）补齐 6 道。**10/10 rc=0**：
 
 | 门 | rc | 与本次改动的关系 |
 |---|---|---|
-| `readonly_mount_write_guard.py` | 0 | 主线程 IO / 只读挂载写守卫；本次新增的 `applyMountedFoldersSnapshot` 调用在 IO 上下文内 |
-| `claim_release_guard.py` | 0 | 引用 `PRootKernel` 的 claim/release 生命周期 |
+| `readonly_mount_write_guard.py` | 0 | 主线程 IO / 只读挂载写守卫（新增的 `applyMountedFoldersSnapshot` 调用在 IO 上下文内） |
+| `claim_release_guard.py` | 0 | 引用 `PRootKernel` 的生命周期 |
 | `share_dir_prune_check.py` | 0 | 引用 `applyMountedFoldersSnapshot` 的目录清理面 |
 | `offload_host_path_check.py` | 0 | 宿主路径判据（同批 F 支另改，本支不触碰） |
-
-（另有 `webapp_asset_url_cleanup_check.py` 本身 = 本门。）
+| `chat_session_id_binding_check.py` | 0 | 会话 id 绑定（WebApp 快捷方式带 `sourceSessionId`） |
+| `file_provider_paths_coverage_check.py` | 0 | SAF 路径覆盖面（挂载走 `DocumentsProvider`） |
+| `four_way_sync_check.py` | 0 | 数据类字段四处同步（`WebAppShortcutEntity` 的 `pathScope`/`scopeContext`/`htmlPath`） |
+| `log_url_redaction_guard.py` | 0 | 日志脱敏（`renderSourceMissing` 会写 `htmlPath`） |
+| `discarded_return_guard.py` | 0 | 丢弃返回值守卫（新增 `runCatching { refresh() }` 的返回值显式忽略） |
+| `browser_tabs_lifecycle_check.py` | 0 | WebView 生命周期（同文件族，Activity 侧） |
 
 ### L3 装置层（真 kotlinc + JUnitCore）
 
