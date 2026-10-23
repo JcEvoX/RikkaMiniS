@@ -44,6 +44,7 @@ import com.rikkaminis.app.data.model.LLMModel
 import com.rikkaminis.app.data.model.normalizeModalities
 import com.rikkaminis.app.data.model.LLMStreamChunk
 import com.rikkaminis.app.data.model.LLMUsage
+import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.model.ModelGroup
 import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.sandbox.offload.ModelStreamErrorException
@@ -1983,14 +1984,37 @@ class ChatViewModel(
     // `ModelsDevApi.effectiveModel` gives every reader the same enriched +
     // override-folded model the real request would use; a group-resolved turn
     // (no active entry id) falls back to the snapshot, enriched the same way.
-    private fun liveEffectiveModel(): LLMModel? =
+    internal fun liveEffectiveModel(): LLMModel? =
         _activeEntryId.value
             ?.let { id -> providerRepository.config.value.modelEntries.find { it.id == id } }
             ?.let { ModelsDevApi.effectiveModel(it) }
             ?: currentModel?.let { ModelsDevApi.enrichModel(it) }
 
+    /**
+     * [deep-audit-1044 B-03] THE model a provider-construction site must hand
+     * to `ProviderFactory.create` — and, at the same time, to `currentModel`,
+     * which is the snapshot every later reader (and the wire) trusts.
+     *
+     * `entry.model` is `baseModel.withOverrides(overrides)` and never touches
+     * models.dev, so 33 of the 39 built-ins answer with no `inputModalities` /
+     * `catalogMaxThinkingLevel` / `declaresNoEffortTiers` / `maxOutputTokens`.
+     * The provider then re-decides those same capabilities FROM that object
+     * (`"image" in model.inputModalities`, `clampThinkingLevel`,
+     * `injectThinkingParams`) inside `:modelservice` — a process that never
+     * initialises [ModelsDevApi] and only ever sees the serialised
+     * `LLMModel` — so an un-enriched model silently downgrades an attachment
+     * to `[attached image: …]` and clamps a `MAX` thinking pick back to XHIGH.
+     *
+     * Order matters: enrich the BASE first, fold the user's overrides SECOND
+     * ([ModelsDevApi.effectiveModel]). The reverse — enriching the already
+     * override-folded model — lets a registry `reasoning = true` overwrite an
+     * explicit user `supportsReasoning = false` (dv23-A04).
+     */
+    internal fun providerModelFor(entry: ModelEntry): LLMModel =
+        ModelsDevApi.effectiveModel(entry)
+
     val currentModelSupportsReasoning: Boolean
-        get() = currentModel?.supportsReasoning != false
+        get() = liveEffectiveModel()?.supportsReasoning != false
 
     // §27a: does the currently-bound model actually consume images on the
     // wire? The providers gate the same predicate ("image" in
@@ -2017,7 +2041,15 @@ class ChatViewModel(
             if (entry != null) {
                 return entry.effectiveMaxThinkingLevel
             }
-            val model = currentModel ?: return ThinkingLevel.XHIGH
+            // [deep-audit-1044 B-04] The no-entry fallback is reached by a
+            // group-resolved turn and by any snapshot written before the
+            // active entry was known. Reading `currentModel` raw skipped
+            // models.dev, so a model whose effort tiers live in the registry
+            // reported its catalogue default (or no ceiling at all) and the
+            // picker offered tiers the wire would clamp. Route the fallback
+            // through the same live exit as the other readers — it enriches
+            // the snapshot exactly like the entry branch does.
+            val model = liveEffectiveModel() ?: return ThinkingLevel.XHIGH
             return model.catalogMaxThinkingLevel
         }
 
@@ -2702,7 +2734,14 @@ class ChatViewModel(
                             currentProvider = ProviderFactory.create(
                                 freshInstance,
                                 freshKey,
-                                cachedProvider.model,
+                                // [deep-audit-1044 B-03] Rebuild IN PLACE for the
+                                // same entry, so the model must stay the one the
+                                // cached provider was created with — but resolved
+                                // through the live exit (a provider built by a
+                                // path that predates this fix still carries the
+                                // raw, un-enriched base model).
+                                liveEffectiveModel()?.takeIf { it.id == cachedProvider.model.id }
+                                    ?: cachedProvider.model,
                                 context,
                             )
                             AppLogger.info(

@@ -41,7 +41,10 @@ data class ThinkingInfo(
 
 /** Read-only view of the current thinking configuration for the model. */
 fun ChatViewModel.thinkingInfo(): ThinkingInfo? {
-    val model = currentModel ?: return null
+    // [deep-audit-1044 B-04] Same live exit as the other capability readers —
+    // a raw snapshot reports `supportsReasoning == null` for the 33 built-ins
+    // whose registry row is the only place that flag exists.
+    val model = liveEffectiveModel() ?: return null
     val supported = model.supportsReasoning != false
     // [T-thinking-effective-level] Report what is actually in force, not the
     // raw stored choice — otherwise the Token Usage sheet shows "High" for a

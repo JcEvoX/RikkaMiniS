@@ -2112,5 +2112,8 @@ internal fun ChatViewModel.resolveTitleProvider(): LLMProvider? {
     val instance = providerRepository.instance(entry.providerInstanceId) ?: return null
     val apiKey = providerRepository.loadApiKey(instance.id) ?: return null
 
-    return ProviderFactory.create(instance, apiKey, entry.model, context)
+    // [deep-audit-1044 B-03] Title generation sizes its token budget from
+    // `provider.model.supportsReasoning` and its provider must answer the same
+    // capability questions as the primary — pass the enriched model.
+    return ProviderFactory.create(instance, apiKey, providerModelFor(entry), context)
 }
