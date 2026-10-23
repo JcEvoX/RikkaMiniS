@@ -28,7 +28,10 @@ Usage: python3 tool_title_error_branch_check.py <repo_root>
 Exit 0 = pass, 1 = violation, 2 = usage error.
 """
 import os
+import re
+import shutil
 import sys
+import tempfile
 
 TOOL_DIR = "src/android/app/src/main/java/com/rikkaminis/app/tools"
 UI_CHAT_DIR = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat"
@@ -108,6 +111,308 @@ def check_file(source: str, fname: str) -> list:
     return errs
 
 
+# ══════════════════════════════════════════════════════════════════════
+# [deep-audit-1047 / A-08] write-shaped tool guards
+#
+# Two judgments, both DERIVED from the tree (never a hand-listed line):
+#
+#   C-EDIT-ENC   every disk-write call of a write-shaped tool must be
+#                preceded by a UTF-8 validity guard that rejects unpaired
+#                surrogates. The guard may live in the tool or in a helper
+#                (resolved through the tools package), so a shared helper
+#                counts — but the guard must be applied to the SAME content
+#                that is written.
+#   C-EDIT-BYTES the byte count a write tool reports must come from the
+#                written FILE's length, not from a String length/count
+#                (UTF-16 code units under-report CJK by up to 3x).
+# ══════════════════════════════════════════════════════════════════════
+
+WRITE_TOOLS = ("FileWriteTool.kt", "FileEditTool.kt")
+
+# Disk-write call shapes: (target file, content expression).
+WRITE_CALL_RES = (
+    re.compile(r"AtomicFileWrite\s*\.\s*write\s*\(\s*([^,\n]+),([^)\n]+)\)"),
+    re.compile(r"\b([A-Za-z_]\w*)\s*\.\s*(?:writeText|appendText|writeBytes)\s*\(\s*([^)\n]+)\)"),
+)
+
+
+def strip_kotlin_comments(src: str) -> str:
+    """Blank out line AND block comments, preserving line structure.
+
+    Block comments matter here: a KDoc that merely MENTIONS
+    `CodingErrorAction.REPORT` or `file.length()` would otherwise satisfy
+    the judgment. Line structure is preserved so line-based function
+    splitting still works.
+    """
+    out = []
+    i = 0
+    n = len(src)
+    in_block = False
+    while i < n:
+        c = src[i]
+        if in_block:
+            if c == "*" and i + 1 < n and src[i + 1] == "/":
+                in_block = False
+                out.append("  ")
+                i += 2
+                continue
+            out.append("\n" if c == "\n" else " ")
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "*":
+            in_block = True
+            out.append("  ")
+            i += 2
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            while i < n and src[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+FUN_DECL_RE = re.compile(
+    r"^\s{0,8}(?:@\w+\s+)*(?:private\s+|internal\s+|public\s+|protected\s+|open\s+|"
+    r"override\s+|suspend\s+|inline\s+|final\s+|abstract\s+)*fun\s+([A-Za-z_]\w*)")
+
+
+def split_functions(src: str):
+    """[(name, body)] for every function declaration in `src`.
+
+    Line based rather than brace matched: an expression-bodied function
+    (`= try { ... }`) has no opening brace on its signature line, and a
+    brace matcher would truncate it at the wrong `}`.
+    """
+    lines = src.split("\n")
+    starts = [i for i, line in enumerate(lines) if FUN_DECL_RE.match(line)]
+    out = []
+    for si in starts:
+        nxt = [s for s in starts if s > si]
+        end = nxt[0] if nxt else len(lines)
+        name = FUN_DECL_RE.match(lines[si]).group(1)
+        out.append((name, "\n".join(lines[si:end])))
+    return out
+
+
+def build_function_table(sources):
+    """{name: [(path, body)]} for every function declaration in `sources`.
+
+    `sources` is a list of (path, code) pairs. The encoding guard may
+    legitimately live in a shared helper file next to the tool
+    (UnencodableContentGuard.kt), so the helper table spans the whole
+    package rather than one file.
+    """
+    table = {}
+    for path, code in sources:
+        for name, body in split_functions(strip_kotlin_comments(code)):
+            table.setdefault(name, []).append((path, body))
+    return table
+
+
+def collect_repo_sources(root: str):
+    """[(path, code)] for every .kt under the tools package."""
+    out = []
+    tools_dir = os.path.join(root, TOOL_DIR)
+    for dirpath, dirnames, filenames in os.walk(tools_dir):
+        for fn in filenames:
+            if not fn.endswith(".kt"):
+                continue
+            path = os.path.join(dirpath, fn)
+            try:
+                out.append((path, open(path).read()))
+            except OSError:
+                continue
+    return out
+
+
+# An unpaired surrogate is a MALFORMED input, not an unmappable character:
+# the encoder must be told to REPORT on malformed input. Merely finding the
+# token `CodingErrorAction.REPORT` anywhere in the body is too loose — a body
+# that REPORTS only on unmappable characters while REPLACING malformed ones
+# still substitutes '?' for the very surrogates this guard exists to reject,
+# and the string check would happily accept it.
+MALFORMED_REPORT_RE = re.compile(
+    r"onMalformedInput\s*\(\s*CodingErrorAction\s*\.\s*REPORT\s*\)")
+
+def encoding_guard_names(table):
+    """Names whose body REJECTS unpaired surrogates.
+
+    Derived from the encoder configuration (`CodingErrorAction.REPORT`), not
+    from the name — a helper called `checkText` that actually does the check
+    counts, and a helper that merely mentions surrogates in a comment does
+    not (comments are stripped). One hop of delegation is followed, so a
+    guard that delegates to another helper is still found.
+    """
+    out = {n for n, entries in table.items()
+           if any(MALFORMED_REPORT_RE.search(body) for _p, body in entries)}
+    for _ in range(2):
+        for n, entries in table.items():
+            if n in out:
+                continue
+            for _p, body in entries:
+                if any(re.search(r"(?<![\w.])" + re.escape(g) + r"\s*\(", body)
+                       for g in out):
+                    out.add(n)
+                    break
+    return out
+
+
+def _write_calls(body: str):
+    """[(target, content, char_index)] for every disk-write call in `body`."""
+    out = []
+    for rx in WRITE_CALL_RES:
+        for m in rx.finditer(body):
+            target, content = m.group(1).strip(), m.group(2).strip()
+            out.append((target, content, m.start()))
+    return out
+
+
+def _string_literals_with(body: str, needle: str):
+    """Every double-quoted literal in `body` that contains `needle`."""
+    out = []
+    for m in re.finditer(r'"((?:[^"\\]|\\.)*)"', body):
+        if needle in m.group(1):
+            out.append(m.group(1))
+    return out
+
+
+def _reported_size_exprs(body: str, targets):
+    """[(expr, receiver)] for every size expression the body REPORTS.
+
+    Only expressions that actually reach a user-visible message count: a
+    message literal mentioning `bytes` is the anchor, and the identifiers it
+    interpolates are resolved back to their `val` definitions. Size
+    expressions that are computed but never reported (a post-write
+    consistency probe, for instance) are not the judgment's business.
+    """
+    val_defs = {}
+    for m in re.finditer(
+            r"val\s+([A-Za-z_]\w*)\s*(?::[^=]+)?=\s*([A-Za-z_]\w*)\s*\.\s*(length|count)\(\)",
+            body):
+        val_defs[m.group(1)] = (m.group(2), m.group(3))
+
+    exprs = []
+    for lit in _string_literals_with(body, "bytes"):
+        # ${...} form
+        for m in re.finditer(r"\$\{([^{}]*)\}", lit):
+            frag = m.group(1).strip()
+            direct = re.match(r"^([A-Za-z_]\w*)\s*\.\s*(length|count)\(\)$", frag)
+            if direct:
+                exprs.append((frag, direct.group(1), direct.group(2)))
+                continue
+            vm = re.match(r"^([A-Za-z_]\w*)$", frag)
+            if vm and vm.group(1) in val_defs:
+                recv, kind = val_defs[vm.group(1)]
+                exprs.append((f"{vm.group(1)} = {recv}.{kind}()", recv, kind))
+        # $name form
+        for m in re.finditer(r"\$([A-Za-z_]\w*)", lit):
+            nm = m.group(1)
+            if nm in val_defs:
+                recv, kind = val_defs[nm]
+                exprs.append((f"{nm} = {recv}.{kind}()", recv, kind))
+    return exprs
+
+
+def check_write_guard_source(src: str, fname: str, guard_names) -> list:
+    """C-EDIT-ENC — every disk write must be guarded, and guarded correctly."""
+    errs = []
+    code = strip_kotlin_comments(src)
+    total = 0
+    for fname_fun, body in split_functions(code):
+        writes = _write_calls(body)
+        if not writes:
+            continue
+        total += len(writes)
+        for target, content, idx in writes:
+            guard_ok = False
+            for g in sorted(guard_names):
+                if g == fname_fun:
+                    continue  # a function is not its own guard
+                for m in re.finditer(r"(?<![\w.])" + re.escape(g) + r"\s*\(([^)]*)\)", body):
+                    if m.start() > idx:
+                        break
+                    if content and content in m.group(1):
+                        guard_ok = True
+                        break
+                if guard_ok:
+                    break
+            if not guard_ok:
+                errs.append(
+                    f"{fname}: [C-EDIT-ENC] the write of `{content}` is not preceded "
+                    "by a UTF-8 validity guard (CodingErrorAction.REPORT) applied to "
+                    "that same content — unpaired surrogates are silently "
+                    "substituted with '?' by the encoder and the file lands corrupted")
+    if total == 0:
+        # fail closed: a write-shaped tool with no recognizable write call
+        # means the derivation broke, not that the tool is safe
+        errs.append(
+            f"{fname}: [C-EDIT-ENC] no disk-write call derived from the tree "
+            "(cannot verify the encoding guard)")
+    # de-duplicate (the same write shape can match two call forms)
+    seen, uniq = set(), []
+    for e in errs:
+        if e in seen:
+            continue
+        seen.add(e)
+        uniq.append(e)
+    return uniq
+
+
+def check_byte_unit_source(src: str, fname: str) -> list:
+    """C-EDIT-BYTES — the reported byte count must be the FILE's length."""
+    errs = []
+    code = strip_kotlin_comments(src)
+    for _fname_fun, body in split_functions(code):
+        writes = _write_calls(body)
+        if not writes:
+            continue
+        targets = {t for t, _c, _i in writes}
+        exprs = _reported_size_exprs(body, targets)
+        if not exprs:
+            # the tool reports no size at all — not this judgment's business
+            continue
+        for expr, recv, kind in exprs:
+            if kind == "count":
+                errs.append(
+                    f"{fname}: [C-EDIT-BYTES] the reported size uses `{expr}` — "
+                    "`.count()` is a character count, never a byte count")
+                continue
+            if recv not in targets:
+                errs.append(
+                    f"{fname}: [C-EDIT-BYTES] the reported size comes from "
+                    f"`{expr}` — it must be the length of the written file "
+                    f"({', '.join(sorted(targets))}), not a String length "
+                    "(UTF-16 code units under-report CJK by up to 3x)")
+    seen, uniq = set(), []
+    for e in errs:
+        if e in seen:
+            continue
+        seen.add(e)
+        uniq.append(e)
+    return uniq
+
+
+def check_write_guards(root: str) -> list:
+    """C-EDIT-ENC + C-EDIT-BYTES over the write-shaped tools."""
+    errs = []
+    sources = collect_repo_sources(root)
+    table = build_function_table(sources)
+    guard_names = encoding_guard_names(table)
+    for fname in WRITE_TOOLS:
+        path = os.path.join(root, TOOL_DIR, fname)
+        try:
+            src = open(path).read()
+        except OSError as e:
+            errs.append(f"cannot read {fname}: {e}")
+            continue
+        errs.extend(check_write_guard_source(src, fname, guard_names))
+        errs.extend(check_byte_unit_source(src, fname))
+    return errs
+
+
 def check(root: str) -> list:
     errs = []
     for fname, (fdir, _, _) in SPEC.items():
@@ -119,6 +424,8 @@ def check(root: str) -> list:
             continue
         for e in check_file(src, fname):
             errs.append(f"{fname}: {e}")
+    # [deep-audit-1047 / A-08] write-shaped tool guards (encoding + byte unit)
+    errs.extend(check_write_guards(root))
     # MemoryTools: both functions must resolve the title
     path = os.path.join(root, TOOL_DIR, "MemoryTools.kt")
     try:
@@ -278,6 +585,193 @@ def selftest() -> int:
         "            .getOrDefault(NAME)",
     )
 
+
+    # ── [deep-audit-1047 / A-08] write-tool guard fixtures ────────────────
+    # The judged surface is DERIVED from the tool sources: the disk-write
+    # calls, the guard applied to them, and the size expression the tool
+    # REPORTS. The fixtures below are minimally-shaped stand-ins whose only
+    # job is to make one arm flip.
+
+    GOOD_EDIT = """
+package com.rikkaminis.app.tools
+
+import java.io.File
+
+class FileEditTool {
+    fun execute(argsJson: String, path: String, content: String): ToolExecutionResult {
+        val file = File(path)
+        val newContent = content.replace("a", "b")
+        if (isUnpairedSurrogateFailure(newContent)) {
+            return ToolExecutionResult(UNENCODABLE_CONTENT_MESSAGE, false, toolTitle = toolTitle)
+        }
+        AtomicFileWrite.write(file, newContent)
+        val bytes = file.length()
+        return ToolExecutionResult("Edited $path ($bytes bytes)", true, toolTitle = toolTitle)
+    }
+}
+"""
+
+    # The guard is gone — the pre-fix file_edit shape.
+    NO_ENC_EDIT = GOOD_EDIT.replace(
+        """        if (isUnpairedSurrogateFailure(newContent)) {
+            return ToolExecutionResult(UNENCODABLE_CONTENT_MESSAGE, false, toolTitle = toolTitle)
+        }
+""", "")
+
+    # The guard survives but is applied to a DIFFERENT string than the one
+    # written — the content that reaches disk is still unguarded.
+    WRONG_CONTENT_EDIT = GOOD_EDIT.replace(
+        "isUnpairedSurrogateFailure(newContent)", "isUnpairedSurrogateFailure(content)")
+
+    # The reported size comes from the string, not the file.
+    STRING_LENGTH_EDIT = GOOD_EDIT.replace(
+        "val bytes = file.length()", "val bytes = newContent.length()")
+
+    # A character count is never a byte count.
+    CHAR_COUNT_EDIT = GOOD_EDIT.replace(
+        "val bytes = file.length()", "val bytes = newContent.count()")
+
+    # The guard is delegated to a helper the file calls — must stay GREEN.
+    HELPER_EDIT = """
+package com.rikkaminis.app.tools
+
+import java.io.File
+
+class FileEditTool {
+    fun execute(argsJson: String, path: String, content: String): ToolExecutionResult {
+        val file = File(path)
+        val newContent = content.replace("a", "b")
+        if (!isEncodableUtf8(newContent)) {
+            return ToolExecutionResult("Error: unencodable", false, toolTitle = toolTitle)
+        }
+        AtomicFileWrite.write(file, newContent)
+        val bytes = file.length()
+        return ToolExecutionResult("Edited $path ($bytes bytes)", true, toolTitle = toolTitle)
+    }
+}
+"""
+
+    # A KDoc that merely NAMES the encoder configuration must not satisfy the
+    # judgment (comments are stripped before judging).
+    COMMENT_ONLY_EDIT = GOOD_EDIT.replace(
+        "        if (isUnpairedSurrogateFailure(newContent)) {",
+        "        // see CodingErrorAction.REPORT below\n"
+        "        if (false) {")
+
+    def write_arms():
+        """Grade the [A-08] arms on an isolated fixture tree.
+
+        Returns the number of failed arms — this selftest counts failures in
+        `failures`, not `bad` (that is the parts_json gate's variable), so the
+        arm runner must not assume a `nonlocal` binding that does not exist.
+        """
+        failed = 0
+
+        def arm(name, edit_body, helper_body, want_enc, want_bytes):
+            tmp = tempfile.mkdtemp(prefix="enc-arm-")
+            try:
+                tdir = os.path.join(tmp, TOOL_DIR)
+                os.makedirs(tdir, exist_ok=True)
+                with open(os.path.join(tdir, "FileEditTool.kt"), "w") as f:
+                    f.write(edit_body)
+                # The sibling write tool must call the SAME guard the helper
+                # provides — otherwise this arm would fail for a reason that
+                # has nothing to do with the judgment under test.
+                gname = ("isEncodableUtf8" if helper_body is not None
+                         and "isEncodableUtf8" in helper_body
+                         else "isUnpairedSurrogateFailure")
+                with open(os.path.join(tdir, "FileWriteTool.kt"), "w") as f:
+                    f.write("""
+package com.rikkaminis.app.tools
+
+import java.io.File
+
+class FileWriteTool {
+    fun execute(argsJson: String, path: String, content: String): ToolExecutionResult {
+        val file = File(path)
+        if (GUARDNAME(content)) {
+            return ToolExecutionResult(UNENCODABLE_CONTENT_MESSAGE, false, toolTitle = toolTitle)
+        }
+        AtomicFileWrite.write(file, content)
+        val bytes = file.length()
+        return ToolExecutionResult("Wrote to $path ($bytes bytes)", true, toolTitle = toolTitle)
+    }
+}
+""".replace("GUARDNAME", gname))
+                if helper_body is not None:
+                    with open(os.path.join(tdir, "UnencodableContentGuard.kt"), "w") as f:
+                        f.write(helper_body)
+                errs = check_write_guards(tmp)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+            enc = [e for e in errs if "C-EDIT-ENC" in e]
+            byt = [e for e in errs if "C-EDIT-BYTES" in e]
+            ok = True
+            if want_enc == "FAIL" and not enc:
+                print(f"  SELFTEST {name}: FAIL (expected C-EDIT-ENC to fire, got none)")
+                ok = False
+            if want_enc == "PASS" and enc:
+                print(f"  SELFTEST {name}: FAIL (expected C-EDIT-ENC green, got {enc[0][:120]})")
+                ok = False
+            if want_bytes == "FAIL" and not byt:
+                print(f"  SELFTEST {name}: FAIL (expected C-EDIT-BYTES to fire, got none)")
+                ok = False
+            if want_bytes == "PASS" and byt:
+                print(f"  SELFTEST {name}: FAIL (expected C-EDIT-BYTES green, got {byt[0][:120]})")
+                ok = False
+            if ok:
+                print(f"  SELFTEST {name}: OK (enc={'red' if enc else 'green'}, bytes={'red' if byt else 'green'})")
+            else:
+                failed += 1
+
+        # --- the arms themselves (hand-written expectations, never derived
+        # from the run's own output) ---
+        # A compliant tree: both judgments green.
+        arm("a08-compliant", GOOD_EDIT, GUARD_HELPER, "PASS", "PASS")
+        # Teeth 1: the encoding guard is deleted -> only C-EDIT-ENC fires.
+        arm("a08-guard-removed", NO_ENC_EDIT, GUARD_HELPER, "FAIL", "PASS")
+        # Teeth 2: the guard survives but guards a DIFFERENT string than the
+        # one written -> C-EDIT-ENC must still fire.
+        arm("a08-guard-wrong-content", WRONG_CONTENT_EDIT, GUARD_HELPER, "FAIL", "PASS")
+        # Teeth 3: the reported size comes from the String -> only
+        # C-EDIT-BYTES fires.
+        arm("a08-string-length", STRING_LENGTH_EDIT, GUARD_HELPER, "PASS", "FAIL")
+        # Teeth 4: a character count is never a byte count.
+        arm("a08-char-count", CHAR_COUNT_EDIT, GUARD_HELPER, "PASS", "FAIL")
+        # Precision: the guard delegated to a differently-NAMED helper that
+        # still configures the encoder -> stays green (the criterion keys on
+        # the encoder configuration, not on a memorized function name).
+        arm("a08-helper-delegation", HELPER_EDIT, GUARD_HELPER_ALT, "PASS", "PASS")
+        # Precision: a KDoc that merely NAMES the encoder configuration must
+        # not satisfy the judgment (comments are stripped before judging).
+        arm("a08-comment-only", COMMENT_ONLY_EDIT, GUARD_HELPER, "FAIL", "PASS")
+        return failed
+
+    GUARD_HELPER = """
+package com.rikkaminis.app.tools
+
+import java.nio.CharBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
+
+internal fun isUnpairedSurrogateFailure(content: String): Boolean =
+    try {
+        Charsets.UTF_8.newEncoder()
+            .onMalformedInput(CodingErrorAction.REPORT)
+            .onUnmappableCharacter(CodingErrorAction.REPORT)
+            .encode(CharBuffer.wrap(content))
+        false
+    } catch (e: CharacterCodingException) {
+        true
+    }
+
+internal const val UNENCODABLE_CONTENT_MESSAGE = "Error: unpaired surrogates"
+"""
+
+    # A second helper name that also does the check — the criterion must key on
+    # the encoder configuration, not on a memorized function name.
+    GUARD_HELPER_ALT = GUARD_HELPER.replace("isUnpairedSurrogateFailure", "isEncodableUtf8")
+
     arms = [
         ("compliant exec", "FileReadTool.kt", good_exec, 0),
         ("V1 catch hardcode NAME", "FileReadTool.kt", bad_hardcode, 2),
@@ -296,7 +790,8 @@ def selftest() -> int:
         ("compliant file_write (helper)", "FileWriteTool.kt", good_filewrite, 0),
         ("V11 file_write inline copy (non-single-source)", "FileWriteTool.kt", bad_filewrite_inline, 2),
     ]
-    failures = 0
+    failures = write_arms()
+
     for name, fname, sample, expect in arms:
         errs = [f"{fname}: {e}" for e in check_file(sample, fname)]
         if expect == 0 and errs:
