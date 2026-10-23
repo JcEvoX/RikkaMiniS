@@ -81,6 +81,34 @@ object ChatViewModelStore {
     }
 
     /**
+     * [dv24-A05] NON-CREATING lookup of a session's resident [ChatViewModel].
+     *
+     * [ownerFor] cannot be used for this: it `getOrPut`s a fresh
+     * [ViewModelStore], so calling it for a session that is not on screen
+     * allocates an owner that never receives a VM (leak) — or, once a caller
+     * resolves the VM through `ViewModelProvider`, materialises a whole
+     * ChatViewModel (agent-loop scope, repositories, provider) for a chat the
+     * user closed. Callers that merely want to *refresh* whatever is already
+     * resident must not have that side effect, and this is the only such entry
+     * point: it walks the existing stores and answers null otherwise.
+     *
+     * Used by `minis-config`'s `session.thinkingLevel` / `session.primaryModel`
+     * writers, which persist to Room and then have to push the same value into
+     * the live UI (see `ConfigBuiltins.writeSessionConfig`).
+     *
+     * @return the resident VM, or null when this session has no live VM.
+     */
+    @Synchronized
+    fun peekViewModel(sessionId: String): ChatViewModel? {
+        val store = stores[resolveKey(sessionId)] ?: return null
+        for (key in store.keys()) {
+            val vm = store.get(key)
+            if (vm is ChatViewModel) return vm
+        }
+        return null
+    }
+
+    /**
      * Drop the cached VM for this session (cancels `viewModelScope`, triggers
      * `ChatViewModel.onCleared`). Call when the session is deleted. Also
      * clears any draft alias pointing at this canonical id.
