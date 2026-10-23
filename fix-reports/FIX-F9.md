@@ -200,4 +200,9 @@ com.rikkaminis.app.sandbox.offload.PhotosImportShapeTest` → **`OK (18 tests)`*
   本轮补上本地运行器后 3 个类 **`OK (18 tests)`**（policy 5 + browser shape 4 + photos shape 9）。
   **规则**：凡本支新增/改动的**源形状测试**，收工前必须本地 `kotlinc` + `JUnitCore -Dprobe.repo=$PWD` 跑一遍，
   不能当作「只能 CI 跑」。
+- **自伤 7（CI 绿但有警告，同族第 N 次）**：第三轮 run 已 `success`，但日志里两条
+  `w: …BrowserExternalSchemeShapeTest.kt:96:31 / PhotosImportShapeTest.kt:205:31 Java type mismatch: inferred type is 'kotlin.String?', but 'kotlin.String' was expected`
+  —— `File(System.getProperty("user.dir"))` 的可空性。**CI 绿 ≠ 干净**（1042-A6 / 1045-FIX-8 同一形态）。
+  两处同 helper，一次 `?: "."` 修掉（`PhotosImportShapeTest` 那处是既有代码，本支已在该文件上施工、
+  顺路成本≈0，故一并收）。修完本地三测试类复跑 **`OK (18 tests)`**。
 - **不确定项**：`PhotosImportShapeTest` 是既有源形状测试，本支把它的断言从「tryOpen 里有内联 strip」改成「tryOpen 委派 + 共享体有全量 strip」。这不是放宽而是**加强**（覆盖了唯一实现），但属于对既有测试的语义修改，已在报告显式登记，供主会话复核。
