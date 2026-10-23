@@ -3,7 +3,7 @@
 - **支**：`fix/dv27-b4-session-delete-clipboard`
 - **基线**：main `88ef9b27`（docs(dev-history): refresh entry count 2182 -> 2192）
 - **尖端**：`56f16a61`（`fix(dv27-b4): release the view model before deleting a session; always restore the borrowed clipboard`）
-- **改���**：8 文件 +798/−12（生产 2 改 + 2 新 / 门 2 扩 / 测试 2 新）
+- **改动**：8 文件 +798/−12（生产 2 改 + 2 新 / 门 2 扩 / 测试 2 新）
 - **门数**：111（不变，0 新建门）；**夹具**：340（不变）
 - **CI**：run `39996499456` / job `120561280684` attempt 1 **success**
 - **停点**：分支 CI 绿 = 本轮确定性停止节点。**未合并 main**（含 `.kt` 验证面，合并起手权在用户）
