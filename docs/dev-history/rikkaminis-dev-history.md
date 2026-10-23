@@ -1,11 +1,11 @@
-# RikkaMinis 开发日志合并导出（2026-08-03 ～ 2026-10-23）
+# RikkaMinis 开发日志合并导出（2026-08-03 ～ 2026-10-24）
 
 > 📌 **注意**：本文件是 raw dump（归档快照，按时间正序排列）。
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
-- 合并范围：2026-08-03 ～ 2026-10-23，共 82 天
-- 条目总数：2192（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：3315371 / 总行数：39873
+- 合并范围：2026-08-03 ～ 2026-10-24，共 83 天
+- 条目总数：2203（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：3340913 / 总行数：40103
 
 ---
 
@@ -39866,6 +39866,236 @@ FIX-1 `de1757d6` / FIX-2 `b5844632` / FIX-3 `131bd094` / FIX-4 `4acf26a2` / FIX-
 2. **注册脚本模板**：scan.sh 块 = `# --- N. 注释 ---` + `echo "━━━ [N/总] 门名 ━━━"` + `if python3 ... "$ROOT"`；test_scan.py = `DA####_GATES` 列表（(script, selftest 标记, (REPO_ROOT,))）+ test 函数 + main 里调用一次；格式串 `%` 参数顺序与占位符数必须逐一核对（本批 2 次自伤全当场闭环）。
 3. **报告提取陷阱**：`ls fix-reports/*.md | head -1` 会命中 main 里继承的旧报告（f7aba218 已含 27 份）——按支号映射取本支自己的文件名。
 4. **基线漂移吃掉 3/11**（S-01/S-04/S-05 已被 1045 修）——派发前重锚 main + 回真树逐条 verify 是第二道门的固定动作，报告比 main 旧的反向漂移和 main 比报告新同样会误判。
+
+<!-- 2026-10-23 21:46:09 -->
+## 审计背景包 v28 构建完成（为下一波双路审计准备）—— 2026-10-23 夜
+
+
+**触发**：用户「最新的报告消化完了，为下一批做准备吧，两份，在挂载文件夹的笔记的子文件夹」＝重建背景包 + **双路**（A/B）提示词，落 `/var/minis/mounts/笔记/RikkaMinis审计背景包/`。上一版 v27 / prompt v24-A/B(+S) 基线 `1d44ec90`。
+
+**基线核实（实测非沿用）**：main = **`42af0ae6`**（dv26 并集 `bea3525b` 已并入 + docs `5d5b688f`；`src/`+`scripts/` 与并集逐字节一致）；主代码 **625** .kt / 229,315 行；全仓 1255 .kt（617 JVM 测试 + 13 androidTest）；@Test **6,960**；门 **111** / 夹具 **340**。
+
+**产物**（挂载目录，sha256 前 16 已填 BUILD-LOG）：`audit-context.md` v28 239,451 B / 923 行 / `36907c84…` · `audit-prompt-v25-A.md` 37,917 B / `8e60e6df…` · `audit-prompt-v25-B.md` 35,544 B / `be6358b5…` · `task-A.md` 277,722 B · `task-B.md` 275,349 B · `README.md` 6,307 B · `RikkaMinis-42af0ae6.zip` 18,617,096 B（1833 条目 / 1255 .kt）。archive 65 件（v24 prompt ×3 + 旧 zip 已归档）。
+
+**增量九项**：①形状 37→**39**（+38「同一次调用的两个参数各读自己的副本」1046-B03 / +39「清理/移除调用形似生效」1046-D7；形状 36 记第三形态「取消后才投递的回调」1046-G10）②§5 记 1046 的 **10 门 +4101/−161**（2 新建 anthropic_thinking_budget / overlay_show_hide_latch + 8 扩展）③§8.3 失真 **0.55**（6/11，全基线/行号/符号/门名类，0 机制臆造）+ 新规律 ④§8.7 第 15 条（作用域从发布树派生）/ 第 16 条（清理类判据锚身份）⑤§9 第 14 条（**报告必须自带基线 sha**）⑥负决策 191→**197** ⑦§7.1 划掉 8 面 / §7.2 真空区重排（**mcp 八轮零工单首破**；provider 收窄到 openai/gemini/openrouter）⑧§7.4/§7.5 刷新 ⑨**双路恢复**（v24-S 单路是额度临时措施）。
+
+**★ 本版新增的两条可复用判据（写进背景包 §8.3/§9）**：
+1. **失真率 = 报告基线到真树的距离**：1046 波 6/11 = 0.55「历史最高但性质最轻」—— 3 条就是报告基线落后 main 一轮（1045 已修），报告自己无法察觉。对策 = 审计方报告头写基线 sha + 核实方第一步重锚（先取远端 main sha，逐条回真树 verify），第二步才谈判级。
+2. **配对类缺陷单点单测天然测不出**：一次调用里成对字段各读自己的副本（`max_tokens` 已钳制 / `budget_tokens` 读裸值）⇒ 两数各自合法、配对才非法 ⇒ 装置必须「两读者一起看」。清理类同理：判据锚**被清理对象的身份**，不锚「清理调用存在」（`removeCallbacks(null)` 是 AOSP no-op）。
+
+**★ 本轮自伤三条（已闭环，形态可复用）**：
+1. **长段落插入要锚「段落结束」不锚「句子结束」**：§8.3 的 1046 段插在 1044 段中间 ⇒ 出现「…机制失真仍为 0）。：点名的…」断句。修法 = stage5 整段迁到 §8.3 末尾。
+2. **幂等脚本的归档清单不能含本脚本的输出**：assemble 第二次运行把刚落盘的 task-A/B 移进 archive（并覆盖旧版）。修法 = 归档只列真正退役的一次性旧物（v24 prompt + 旧 zip）；合订本不入档（可由 context+prompt 重生）。
+3. **selfcheck 断言要区分「当前状态」与「历史引用」**：禁 `1d44ec90` / 禁 `109 passed` 会误杀合法的历史段落（§7.6/§8.3/§8.7 实例）⇒ 改成只禁「当前基线的旧写法」（`main = **`<old>`**`）。同理编号重号统计要限定章节区间（否则 §8.3 的 1..16 列表被当成重号）。
+
+**复现**：`shared/work/audit-pack-v28/{stage1..5,prompts25,assemble_v28,selfcheck}.py` + BUILD-LOG.md；zip 用 `git archive --prefix=RikkaMinis-42af0ae6/` 从 `shared/work/deep-audit-1046/golden` 切。
+
+<!-- 2026-10-23 21:53:12 -->
+## deep-audit-1046 全批闭环：main `42af0ae6`（+ docs `88ef9b27`）+ main CI #39961698711 success（skipped=[]，Publish 真执行，v1.0.0+2567）→ 分支/worktree 清零
+
+
+**收口链**：8/8 分支 CI 绿（attempt 1，唯一 skipped=Publish）→ 并集 `integration/dv26` @ `bea3525b`（8 次 `--no-ff` 零冲突，49 文件 +8501/−522）→ 门注册（109→111 门 / 336→340 夹具）→ 本地 111/0 + ALL 340 → 并集 CI `39957962219` 全绿 → **用户「合并」放行** → 合并前三项核查 → 文档先行 → main `42af0ae6` → main CI `39961698711`（job `120441030772`，26 步 **skipped=[]**，`Summary: 111 passed, 0 failed` 带框线、ALL 340、`Z e:` 0、游离 FAILED 0）→ 发布 **v1.0.0+2567**（APK 14,472,069 B，asset updated 13:49Z）→ 清理 11 远端分支（远端只剩 main）+ 9 worktree + 11 本地分支 → docs `88ef9b27`（README 计数 2182→2192，docs-only push **不触发 CI**：build-apk.yml paths 只认 `src/android/**`、`src/shared/**`、`deps/**`、workflow 自身）。
+
+**★ 本波最值钱的三条（可复用）**：
+1. **报告文件名会撞既往波次**：`fix-reports/FIX-A2.md` 在 main 里已存在（dv22-a2 fastio tar 报告）⇒ 本波 A2 报告 `git diff` 显示为「M」而非「A」= **覆盖了历史报告**。判据：合并前必须 `for f in 本波报告; do git cat-file -e main:fix-reports/$f; done` 逐名检查；命中即改 `dv26-FIX-*` 前缀并把原报告 `git show main:... >` 还原（校验 `git diff main..HEAD -- 该文件 | wc -l` == 0）。**dz25 波同族已发生过一次**（FIX-1..11 撞 1044）⇒ 规则级：**新波次报告一律带波次前缀入库**，不用裸 FIX-<支名>。
+2. **`git mv` + 覆盖写入的顺序陷阱**：先 `git show main:X > X`（覆盖成老内容）再 `git mv X Y` ⇒ 把**老内容搬去新名、新内容丢失**，且随后 `git add X` pathspec 报错中断链条。正确顺序 = **先 `git mv` 把本波报告挪走 → 再 `git show main:X > X` 还原老报告 → `git add`**。回滚路径：`git reset && git checkout -- <dir>` 恢复索引内容（本波靠它救回）。
+3. **docs 分支必须从 main 切，不能从并集分支切**：本波首个 docs 分支从 `integration/dv26` 切出，`git merge --no-ff docs/...` 进 main 时**把整条并集链带进 main**（merge message 写成「docs」但实际合了代码）。发现靠 `git log`/`--stat` 立刻可见；处置 = `git reset --hard <原 main>` 重来，改从 main 切。**判据：docs 分支上 `git diff --name-only main..HEAD | wc -l` 必须 == 文件数（3）**。
+
+**合并后核对（四项全过）**：合并树 vs 并集树 `src`+`scripts`+`fix-reports` 逐字节一致（0 diff 行）· 合并树与并集树差异仅 `docs/dev-history/` 3 文件 · 门头 111 · 新门真树 GREEN · 档案 blob sha256 三份与挂载源逐一相等（c13adb5a / 005251e1 / c22d3c53）。
+
+**档案**：2192 条（2182→2192）/ 82 天 / SAGAS 24 主题（orphans 198、multi4 159）/ 脱敏 NONE ×2 轮 / anchors=2192=声明、乱序 0、NUL 0、fences 60。README 计数已同步。
+
+**残留欠账**：`§1046-VERIFY` 真机行为级（8 支各 R1：A2 CLI 刷新 token 后宿主拿到新 token / B3 自定义保守 max_tokens 时 budget 不超发 / C6 快速连点 show-hide 不漏窗 / D7 乱序渲染后公式不空白 / E8 冷启动 mount webapp 不死屏 / F9 intent:// 消毒后功能仍可用 / G10 连续合成-取消不留孤儿 WAV / H11 删任务后编辑屏不复活），等下次真机窗口一次开齐。
+
+<!-- 2026-10-23 22:48:57 -->
+## TierFlow 三账号复查（2026-10-23 22:48）：额度 7 小时内被大量消耗，账号 3 套餐将 ~100 分钟耗尽
+
+
+**关键事实**：15:50 生成的台账快照 → 22:48 复查（间隔约 7 小时），三家账号额度大量流失：
+- *****PHONE*****：套餐已用 0 → **13,034,062**（+¥26.07），请求 79 → 892 次；剩 **1,915,938（¥3.83）**；余额 ¥0.04
+- *****PHONE*****：余额 ¥5.00 → **¥0.18**（−¥4.82，礼金耗尽），请求 363 → 515
+- *****PHONE*****：余额 ¥5.00 → **¥0.13**（−¥4.87，礼金耗尽），请求 677 → 882
+
+**实时速率**：账号 3 套餐 269 秒消耗 85,818 额度（¥0.17）= **19,141 额度/分**，同期仅 +1 次请求 ⇒ **单次大上下文请求**（不是高频小请求）。剩余额度按此速率 **≈100 分钟耗尽**。三把 Key 验真均 200（额度耗尽前仍可用）。
+
+**结论**：这批号已不算「额度不低」，继续跑量需新号/充值。已更新精选台账（顶部加「最新复查」章节，标注 15:50 为旧快照）+ 新增 `recheck-2026-10-23.{csv,json}`。
+
+**★ 可复用教训（时钟对齐）**：沙箱 `date` = CST（LCL），与服务器 GMT 差 8 小时，但**我误把两次相隔 7 小时的查询当成「10 分钟前」**——因为会话中途用户离开，我按对话轮次直觉推时间。**教训：跨轮次的时间差必须用 `date` 实测或数据里的时间戳算，不能凭「上一条消息刚说完」推断**。这也解释了「额度莫名消失」其实是被正常使用（Rate 测量证实）。
+
+**★ 另一个踩坑（cookie 串号）**：同一个 `http.cookiejar` 实例跨账号连续 login，后续 `/api/user/self` 返回 `data=None`（session cookie 冲突）⇒ 出现「余额 None」的假数据。修法 = **每账号一个独立 Client/opener**。这条对后续所有多账号 API 脚本通用。
+
+<!-- 2026-10-23 22:57:05 -->
+## TierFlow 第二批 5 账号勘察（2026-10-23 22:5x）—— 全部全新满额，5/5 入选
+
+
+**对象**：新一批 5 账号（***PHONE*** / ***PHONE*** / ***PHONE*** / ***PHONE*** / ***PHONE***），共用密码 `8QzTDRMH`，与昨日批完全不同的号（创建 2026-10-06 23:07-23:08）。
+
+**结果（好消息）**：**5 家全部处女号**——余额各 ¥5.00（礼金至 2027-01-04）、套餐各 14,950,000 额度**一分未用**、请求次数 **0**、10 把 Key（5 按量 + 5 轻享）全部验真 200 且打码归属一一对应。合计 ≈ **87,250,000 额度（¥149.50 套餐 + ¥25.00 余额）**。全部 2026-11-05 到期。
+
+**对比昨晚批**：那批 7 小时内一家烧掉 14.95M（19,141 额度/分的单次大上下文请求）。给这批的建议 = **5 家轮换使用，别集中压一家**。
+
+**产物**：`/var/minis/shared/tierflow-1023/batch2-keys-2026-10-23.{md,csv}` + `batch2-probe.json`（原始数据）。全程只读，0 写操作。
+
+**★ 自伤（第 N 次同族）**：台账 md 手写段落里的 **uid 是我凭印象编的**（5 个全错，token 号却是对的）——靠查 JSON 核对当场抓到。**规则：台账/报告里的任何标识符（uid/token_no/sub_no）必须从 API 原始响应里程序化带出，不许手打**。这和 evidence-discipline 的「报告行号要回真树核实」同族：写进去的数字 = 声称的事实，要可核对。
+
+**★ 通用教训（复用）**：服务器打码 Key 有两种形态——按量 token 的 mask **不带** `sk-` 前缀（`OVkv**********ueWQ`），套餐 token 的 mask **带** `sk-`（`sk-psgg**********iJRB`）。比对函数必须同时尝试 `full.startswith(head)` 和 `full.startswith('sk-'+head)`，否则按量归属全报「无匹配」假阴性。
+
+<!-- 2026-10-23 23:45:40 -->
+## deep-audit-1047（v25-A/B 波）启动：第二道门 15/15 成立，判级修正 3 处，9 支派发完成（回读 9/9 送达）
+
+
+**基线** main `88ef9b27`（报告写 `42af0ae6` = 父提交，`src/`+`scripts/` 逐字节一致）。工作区 `shared/work/deep-audit-1047/`（REPORT-A/B、TRIAGE、COMMON、DISPATCH、fix-tasks、a1..b4 worktree）。
+
+**输入**：A 面 8 条（A-01..A-08，97,715 B）+ B 面 7 条（B-01..B-07，82,692 B）。**第二道门逐条回真树取证 15/15 成立、0 驳回**（脚本 `verify/run_all.sh`、`verify/run_b1.sh`，含 A-06 的 python 复现：`method_io_state(store,"clientSecret")` = `('pure',…)`）。
+
+**★ 判级修正三条（本波最值钱的判断）**：
+1. **「未消费」≠「无生产者」**：A-03 报告说 4 个 provider 构造器都不序列化 `msg.imageParts`（真），但**生产代码根本没有任何 `LLMMessage(imageParts=…)` 生产者**（`grep "imageParts = "` 全是函数参数）⇒ 该半条是 latent，按修复门应为 **P2 登记不修**，真 P1 只有「Responses API 图片+音频 `else if` 互斥导致丢音频」。**规则**：报告说某字段「写了不读」时，必须再查「谁写」，无写者 = latent。
+2. **门钉住一条不可达载体 = 声明与实现不一致**：`MessagePayloadFilter.hasWirePayload` 放行消息级 `imageParts` 且门钉死，但无人消费 ⇒ 修法二选一（补消费者 / 缩声明），本波选「零行为变更的镜像分支」（分支永不进入，`msg.imageParts` 恒空）+ 门改成「声明放行 ⇒ 必须有消费者」。
+3. **A-08 的 bytes 口径已是 backlog DESIGN-06 登记的 P2** ⇒ 只修编码守卫，bytes 因同函数同一行允许捎带（读边契约生效：先查 backlog 再判）。
+
+**9 支（0 新建门 ⇒ 门 111 / 夹具 340 应不变）**：A1=A-01+A-03（provider 走线）· A2=A-02（modelsvc thinking_level）· A3=A-05+A-06（MCP `.secret` 移交 + 门表达式体截断）· A4=A-04+A-08 · A5=A-07（5 handler `--help` 退 2）· B1=B-01+B-02+B-03（**必须同支**：共享 `FilePreviewScreen.kt` + `filepreview_print_bounded_check.py`）· B2=B-04 · B3=B-05 · B4=B-06+B-07。
+
+**★ 报告批次表的坑**：B 面报告把「B-01 的 `FilePreviewScreen.kt:144`」塞进 Batch-B2，而 B-01 的其余站点在 Batch-B1 ⇒ 同一文件两支各改一次。**批次划分必须按生产文件集求交集，不能按报告点名的缺陷位置**（1043 波同族已记）。
+
+**★ 自伤（同族第 N 次）**：`mkdir -p a/{fix-tasks,verify,logs}` 在 ash 下**不做花括号展开** ⇒ 建出字面名目录，后续 `logs/send-*.json` 全部 "nonexistent directory"，8 次 send 的 stdout 丢了（会话仍创建成功，靠 `list` 反查 id）。**规则：ash 里建多目录就写多条 mkdir，别用 `{a,b}`；且写文件前先 `ls` 确认目录真的要存在。**
+
+**派发**：`minis-sessions-cli send --prompt "读这个文件并立刻执行：<任务书>" --async` 9 次，回读 `messages --id` 逐支核对任务书代号 **9/9 匹配**。派发后 27 分钟，9 会话全部活跃（last_active 差 ≤4 分钟），a1/a3/a5/b1 已开始改文件。
+
+## 2026-10-24
+
+<!-- 2026-10-24 00:58:06 -->
+## FIX-A5 收口（deep-audit-1047 / A-07 P1）：5 个 offload handler 的 `--help` 恒 exit 2
+
+
+**身份链**：基线 main `88ef9b27` → `5ec73d8f`（生产 5 文件 +15/−5）→ `77248c41`（测试 +78）→ `dba13f46`（门 +406/−2，CI 绿于此）→ `f57111ce` + `4199a526`（报告）。HEAD `4199a526` == 远端；`git diff --name-only dba13f46..HEAD -- . ':(exclude)fix-reports'` = **0 行**（源码树等价）。**门 111 / 夹具 340 不变**（0 新建门，扩 `offload_cli_args_check.py` H1/H2/H3）。**未合并 main**（含 .kt，起手权在用户）。
+
+**缺陷根因（一句话）**：`OffloadArgs` 把 `--help`/`-h` 折进 flags（`OffloadOutput.OUTPUT_FLAGS`），所以 `tool --help` 的 `positional` **同样为空** —— 与裸跑不可区分。五处守卫把「有 help」与「positional 空」并列，退出码却只在 positional 空上分叉 ⇒ `else 0` 是死分支 ⇒ `--help` 恒 2、`tool --help sub` 却是 0（同一族两种 help 调用不同退出码），`set -e` / `cmd --help && …` 全断。
+
+**修法**：阶梯第 6 级（每处一行：`if (args.hasFlag("h","help")) 0 else 2`）。不抽生产 helper（新增 API 面换不到可测性）、不动 `OffloadArgs` flag 语义（21 handler 共用）、`Contacts`/`BrowserUse` 的「裸调也退 0」是另一套刻意契约（令牌计数分隔符，半径外）。
+
+**门判据 H1/H2/H3（派生，不锚拼写）**：H1 help 必须能到达 0 —— 字面 0 / `const val …=0` 名字 / `if (探 help) A else B` 的 A 侧为 0 / C 是**令牌计数**分隔符（`argv.size`、`rawArgs.isEmpty`）；**positional 空不是分隔符**（正是缺陷）。H2 退出码随条件变化且守卫还能无 help 进入时，裸调侧必须 2。H3 派生 fail-closed（站点地板 15，现树 21；探 help 的文件必有可判站点）。**9 臂 selftest**（期望集手写）+ 绿夹具同时是精度臂（Debug 令牌计数写法、Contacts 合并+字面 0 写法各占一类，必须绿）。
+
+**★ 本轮最值钱的两条（可复用）**：
+1. **「扫描某关键字所在语句块」的门必须只认语句位置**：朴素 `\bif\s*\(` 会命中 `NativeOffloadResult(if (help) 0 else 2, HELP)` 里那个**表达式级 `if`** ⇒ **修复本身被判成缺陷**（实测 2 条假红 + 1 条「无退出码站点」）。修法 = 括号栈 + 只接受栈顶为 `{` 或空的 `if`，字符串字面量整体跳过；并让绿夹具**同时含修好的写法**，这样首跑就暴露。同族第 N 次「判据锚拼写不锚位置」。
+2. **「本支文件 0 警告」不能按文件名判**：本支改的 5 个文件在 CI 日志里有 4 条 `w:`（`isChecked` deprecated :336/:390/:1157、`getLatLong` :1213），全是基线既有。判据必须**锚行号区间**（本支改动 106–113 / 135–142），否则要么假红要么把既有噪声算成新债。
+
+**CI 日志取法（新形态，值得记）**：`api.github.com/repos/.../jobs/<id>/logs` 用 `GITHUB_TOKEN` 返回 **403 `Must have admin rights to Repository`**（不是 401 token 失效）。健康路径 = **一跳拿 302 的 `Location`（blob.core.windows.net），二跳对该地址不带 token 裸取**（1.44 MB 纯文本）。另：门头真形态 `━━━ [N/111] Four-way sync check ━━━` 门名含空格，正则要用非贪婪到 `━`。
+
+**验证四层**：L1 真树 PASS + `OFFLOAD_CLI_ARGS_SELFTEST=PASS`（9 新臂）+ PRE 树恰 5 条 H1 + `sh scripts/scan/scan.sh` **111/0**（注意是 `sh` 不是 `python3`！`python3 scan.sh` 直接 SyntaxError）+ `test_scan` **ALL 340** + 真树变异 2 臂（单处回退⇒恰 1 H1；裸调侧改 0⇒恰 1 H2）· L2 任务书点名 8 道邻门 8/8 rc=0（`calendar_events_nullable_predicate_check` 只吃 `--root`）· L3 真 kotlinc+JUnit **20 用例**：POST 0 红 / PRE 恰 10 红（五工具 × `--help`/`-h`）/ m1 2 红 / m2 1 红 / m3 1 红 = `ALL L3 ARMS MATCH`；另加「in-repo 测试逐字抽出独立编译」臂（compile clean 0 警告 + `OK (3 tests)`）—— 让 CI 不是第一次看见测试代码（1046-F9 教训）· L4 run `39985782209` / job `120524473110` attempt 1 success，判读器 **17/17 GREEN**（26 步、唯一 skipped=Publish、`Summary: 111 passed, 0 failed` 恰 1 条、`ALL 340`、` e: ` 0、门头 1..111 连续互异、3 条新用例逐条 PASSED、日志 1,443,855 B）。
+
+**登记**：报告 `fix-reports/dv27-FIX-A5.md`（九节）；backlog **§1047-A5**（机械门 386 段 / no-触发条件 4 既有 / 豁免 11，本段 OK @ backlog.md:7660）。残留 R1 真机五工具 `--help;echo $?`=0 + 裸跑=2 / R2 shizuku `service --help` 实弹执行（半径外，交叉引用）/ R3 Debug 两段式不动 / R4 H2 刻意不收窄到字面 0 形态 / R5 15 站点地板是经验值 / R6 门只覆盖 `hasFlag("help")` 探针形态 / R7「守卫锚位置还是锚拼写」形态进规则库。
+
+<!-- 2026-10-24 01:23:00 -->
+## FIX-B3 收口（deep-audit-1047 / B-05 P1）：模型组详情屏系统语音三处断层 — `fix/dv27-b3-model-group-system-voice` @ `8feb5466`（CI 绿于 `77ba33fc`），停在分支
+
+
+**缺陷（真树 4 处，报告报 3 处）**：`ModelGroupDetailScreen.kt` 对 `SystemVoiceEntries`（默认 Voice Input/Output 组的**全部**成员，虚拟、无 instance、不在 `config.modelEntries`）处理不一致 —— ①移除弹窗 `modelEntries.find` 丢模型名 ②成员行副标题 `instance?.label ?: ""` 空串 ③CostTier 菜单可点但 `updateEntry` 静默丢写 ④**报告漏报**：思维上限 roll-up `:492-495` 同样只查持久列表。
+
+**修法（停在第 2 级）**：全部收编到既有的 `SystemVoiceEntries.resolveIn`（dv25/1043-B06 立的单一来源）；思维 roll-up 加 `.filterNot { isSystemEntryId(it) }` 保持结果字节等价；三处纯决策抽 `SystemVoiceMemberPresentation.kt`（String/Boolean only，L3 可测）。零新增语言键（`i18n_check` 全绿）。
+
+**★ 本波最值钱的判据形态（写进报告 §1.3/§4）**：
+1. **「判据存在但没挂上」= 本次缺陷的成因本身**。C35 `check_active_entry_single_source` 的判据文本就是「id-keyed lookup 必须咨询 System 单一来源」，但它只挂 `REL_MODEL_PICKER_SHEET`，`REL_GROUP_DETAIL` 只挂了 C8。**修复的一半是挂载**：挂 C35+C36 后新判据 C-SV1（写点必须落在 System 守卫**块内**，按包围块 header 派生）/ C-SV2a（禁 `?: ""`）/ C-SV2b（成员屏 provider label 读必须过单一来源）才有意义。
+2. **挂载后的 C35 在本文件上 `sites=0`**（`resolveIn(modelEntries, id)` 是参数传入，`_PERSISTED_LOOKUP_RE` 看不见）⇒ 它是**防回归锁**，不是当前缺陷的证词。证词必须来自 PRE 臂（基线文件跑红 4 条）。**别把「修复后 PASS」当「判据有效」**。
+3. **任务书点名的资源键必须回 res grep**：`R.string.model_picker_system_provider` 真树 0 命中，真身是 `R.string.voice_provider_system`（7 locale）；`ModelEntryPicker.kt` 在 `ui/components/` 不在 `ui/settings/`。派发前第二道门要把「报告里的资源键/路径」一起 verify。
+4. **范围判据要按函数体收窄，不按行**：C-SV2b 首版扫全文件 `?.label`，被 `ContextLimitSlider` 的 `steps.firstOrNull{…}?.label`（滑杆档位标签）当场误报 ⇒ 收窄成「包含该读的函数体读 `.instances`」。
+5. **「守卫在附近」≠「守卫包住写点」**：源形状测试 S3 首版用「写点前 600 字符窗口含 `canEditCostTier(`」，真树红（守卫在 900+ 字符前）⇒ 改成结构判定：从守卫自己的 `{` 起做字符串/`${}` 感知的括号配对，再问写点是否在区间内。
+
+**验证**：L1 真树 5 判据 PASS + selftest `PROVIDER_REMEMBER_SELFTEST=PASS`（夹具 121→126，5 新臂各恰红一条）+ PRE 红 4 + `scan.sh` 111/0 + `test_scan` ALL 340 · L2 概念邻门 10/10 rc=0（`i18n` 证零语言键）· L3 真 kotlinc+JUnit 10 臂（POST 12/12、PRE-dec 红 3、PRE-src 红 5、m1/m2/m3 各恰红 1、树臂 m4/m5/m6 门+JVM 双层各恰红）· L4 run `39992098984` / job `120546147641` attempt 1 success，26 步 not_ok=[]、唯一 skipped=Publish，日志判读 **19/19 GREEN**（含「本支文件警告 0」「12 新用例逐条 PASSED」）。
+
+**登记**：报告 `fix-reports/dv27-FIX-B3.md`（八节）；backlog `§1047-B3`（R1 真机欠账 / R2 C35 sites=0 / R3 C32 不挂 / R4 C34 空跑 / R5 非 System 缺 provider 副标题空 / R6 硬编码英文 / R7 报告失真 3 条 / R8 strip_comments 吃换行致行号偏移），机械门 387 段 / no-触发条件 4 既有 / 豁免 11，本段 OK @ backlog.md:7711。
+
+<!-- 2026-10-24 01:51:27 -->
+## deep-audit-1047 B1 收口（dv27 波 B-01+B-02+B-03 P1）：`fix/dv27-b1-preview-export-guards` @ `5bd22bfa`，CI #2574 success，停在分支
+
+
+**身份链**：基线 main `88ef9b27` → 5 提交（`24d9026e` 生产 / `4ee6166c` 测试 / `62b5212d` 门 / `6825f9fd` 报告 / `548354d4` 警告修复 / `5bd22bfa` L4 判读）。9 文件改 + 4 新（生产 6 改 + 1 新 / 门 2 / 测试 3 新 + 1 改）；**门数不变 111**，`scan.sh`/`test_scan.py` 零触碰。**未合并 main**（含 .kt 验证面，起手权在用户）。
+
+**三缺陷**：①**平台第二种失败通道**：`openOutputStream` 返回 null（`?.use` 整段跳过）+ `Bitmap.compress` 返回 false（语句位置把判决丢给 `use` 的返回值）—— 两条都不抛异常 ⇒ 相册保存把 `IS_PENDING=1` 孤儿行**正式发布**成 0 字节条目并弹「已保存到相册」、SAF 另存为假成功 Toast、4 处 compress 把 0 字节 png 塞进剪贴板/分享面板；②**SAF 读取只有声明大小预检无流级上限**（`readBytes()` 整文件进堆，而 `ImageDecoding` 的上限是**像素**上限；`BackupSettingsScreen` 的 `query` 还在主线程）；③**`PdfPreview` 页级 `produceState` 只以 `idx` 为键**（顶层状态都 `remember(item.file)`）⇒ 同槽位换 PDF 旧位图残留。
+
+**修法**：新增 Android 无关 `saveOutcome(streamOpened, compressed)` 纯函数当唯一判决；6 个站点全部路由过去。`AddToHomeSheet` 走 `readAtMost`（**32 MiB** = 仓库既有 `MAX_INPUT_BYTES` 口径，**不凭空造 16MB**）；`BackupSettingsScreen` 的 query 下沉同一 IO 块 + `readSafBytes` 并**删掉第二个读点**；`produceState` 加 `key2 = item.file`（LRU `initialValue = renderer.cached(idx)` 不动）。
+
+**门（扩，0 新建）**：`discarded_return_guard` 新增二进制写入判定段（B1 判决须经 `saveOutcome` 路由 + B2 `openOutputStream` 须 elvis 退出）；`filepreview_print_bounded` 新增 C-SAF-1 域派生 / C-SAF-2 仅声明预检即红 / C-PDF-KEY 键集派生。
+
+**验证四层**：L1 两门真树 rc=0 + 两个 selftest PASS + **PRE 臂红 6 处** + `scan.sh` **111/0** + `test_scan` **ALL 340**（首次撞沙箱 S28 `OSError: [Errno 38]`，静置重跑取干净读数）· L2 邻门 **9/9 rc=0** · L3 真 kotlinc 2.0.21：SaveOutcomeTest **OK (5)** + 锚点 **OK (13 + 3)**；**真树变异 5 臂各恰红 1 条**（源文件字节不动，变异在副本上）· L4 run `39993443358`@`6825f9fd` success（26 步唯一 skipped=Publish、111/0、ALL 340、`e:` 0、游离 FAILED 0）→ **但本支两个新测试文件有 2 条 `w:` 可空性警告** ⇒ 单独提交 `548354d4` 修掉 → run `39995646395`@`548354d4` success（**本支文件警告 0**）；三方 sha 逐字符一致；新增用例 13/13 PASSED。
+
+**★ 可复用四条**：
+1. **「失败判定被丢弃」要用「目的地」判，不用「调用点清单」**：压进内存 `ByteArrayOutputStream`（模型图像预算/截图环/debug dump）**不是**缺陷（不发布、调用方自己的长度检查看得见空数组）；只有压进 FileProvider/MediaStore/SAF 的才发布给外部。判据写成「所在函数触及出站 token ⇒ 判决必须路由」后新增站点自动纳入。
+2. **门把「声明大小预检」判成 bounded 是分类错误**：`OpenableColumns.SIZE` 是 provider 说的（常 null、可虚报），是**早拒**不是**上限**。降级它后同族「预检+无上限读」立刻变红；预检本身作为廉价早拒**保留**。
+3. **扫描域必须派生且可证伪**：硬编码 `…/app/ui` 的门对 `webapp/` 的同类洞完全失明且自己报 PASS。要钉的是「**带站点的文件必须在域内**」（候选集 − 扫描集 ≠ ∅），不是「域里没站点」——后者抓不住域缩小。
+4. **表达式体函数会让归属体解析跳步**：`discarded_return_guard._function_bodies` 在 `= expr` 函数后 `i = j + 1` 会把**下一个**声明整条跳过 ⇒ 它后面的函数没有归属体 ⇒ 判据落到「整个文件」粗粒度 ⇒ 内存目的地的压缩被误判成出站写入。修法 `i = j`。
+
+**工具坑**：`kotlinc` 不在默认 PATH（`/opt/kotlinc/bin`）；`curl` 直连 api.github.com 拿 run 会 404（`gh_sync.sh gh-actions-runs` 只显示 UI 序号 #2571，真实 run id 要用 `actions/runs?branch=` 列表接口取）。
+
+**登记**：报告 `fix-reports/dv27-FIX-B1.md`（八节）；backlog **§1047-B1**（机械门 388 段 / no-触发条件 4 既有 / 豁免 11，本段 OK @ backlog.md:7757）。R1 真机五连（相册失败不产 0 字节条目 / 剪贴板不贴 0 字节 png / 500MB 图不 OOM / SIZE=null 的备份导入报「过大」/ 两 PDF 切换不串页）· R2 文案复用既有键（未新增语言键）· R3 `SAF_EXEMPTIONS` 剩余豁免复核 · R4 pre-Q 只删文件不删行（刻意）· R5 声明预检未单列判据 · R6 `_function_bodies` 同类跳步可能还在别的门 · R7 `blank_literals` raw string 处理不精确。
+
+<!-- 2026-10-24 02:08:33 -->
+## deep-audit-1047 A1 收口（dv27 A-01+A-03）：`fix/dv27-a1-provider-wire-parity`，CI 绿，停在分支
+
+
+**身份链**：基线 `88ef9b27` → 4 提交（`eeff5770` 生产+门+测试 / `2878a229` 修源形状测试+报告 / `1d7ef15e` 清编译警告 / `67066ce3` 报告补证据）→ 绿 run **`39997759383`** / job `120565626959` attempt 1 success（head_sha `1d7ef15e` 三方逐字符一致；26 步唯一 skipped=Publish=main 门控；`Summary: 111 passed, 0 failed` 恰一条；门头 1..111 互异；ALL 340；`Z e:` 0；游离 FAILED 0；**本支文件警告 0**）。11 文件 +1364/−54（生产 5 改 + 1 新 / 门 2 扩 / 测试 3 新 + 1 改 / 报告 1）；**门 111 / 夹具 340 不变**，冻结面零触碰。
+
+**缺陷**（两条「契约存在、实现没跟上」同族）：
+- **A-01**：`OpenAIProvider.buildRequestBody` 写**钳制后**的 `max_tokens`（`safeMaxTokens`）却把**原始** `maxTokens` 交给 `injectThinkingParams` ⇒ `thinking_budget` 相对 `max_tokens` 的数对非法（400），而两个数各自合法故单测任一 helper 都看不见；同族第二半：`ThinkingRuleResolver` 的 `maxTokens < 2 → budget=0` guard **嵌在 `budget>0 && maxTokens>0`** 里，而 provider 把线上值 floor 到 1 ⇒ 外层条件恒真、guard 形同虚设，`maxTokens<=0` 时整个 clamp 被跳过、原始 budget 出网。**与 1046-B3 的 Anthropic 侧同根**（那次只修了一家）。
+- **A-03**：`hasWirePayload` 把 `imageParts.isNotEmpty()` 列为「保住这个 turn」，但**整个 provider 包无一处读 `msg.imageParts`**（grep 命中全是请求级形参）；且 OpenAI **Responses** 把请求级图片与消息级音频分处**互斥 `else if` 两臂** ⇒ 同时带两者的 turn 静默丢音频（Chat flavour 一直是合并分支 ⇒ 同 provider 两 flavour 形态不一致）。
+
+**修法**（阶梯第 2 级）：注入器改喂 `safeMaxTokens`；guard 提到 `budget>0` 的兄弟位置（可达公式逐字未动）；新增 Android 无关纯顶层 `provider/LegacyMediaPlan.kt`（`imageCount` + `hasMedia`）作三家共享答案，Responses 两臂并为一臂（图片→音频→文本）。
+
+**门（2 扩 0 新建）**：`anthropic_thinking_budget_check` 加 **C-OAI-1**（写 `max_tokens` 的值必须**就是**同函数 `injectThinkingParams` 第 3 实参；从 `put` 实参 token 派生 ⇒ 改名不红、改回原参即红）+ **C-OAI-2**（`<2` guard 不得嵌在 `maxTokens>0` 内，按花括号深度）；`tool_result_image_branch_check` 加 **C-IMG-1**（从 predicate **函数体**派生载体表 ⇒ 写媒体 wire part 的文件须读 `.carrier`；**字节量估算读取不算消费**——那正是老门失明处）+ **C-IMG-2**（**锚两个写点**：`input_audio` 写点与「写图片部件」互为 `else`/`else if` 兄弟 ⇒ 红；改名不失明且覆盖新载体）。
+
+**★ 四条可复用**：
+1. **「声明了却没人消费」要判消费方，且消费方不能是字节量估算**——老门只查 predicate 自己列没列媒体 arm ⇒ 声明得越齐漏得越深。
+2. **互斥分支判据锚「两个写点」而非载体名**——改名/换载体不失明，顺带覆盖新载体。
+3. **源形状测试必须钉「形状」不是「拼写」**——本波自己踩：`OpenAIToolResultImagesTest` 钉 `entries = imageParts.map`，合并成派生列表 `legacyImages` 后失配、**CI 首跑红**；改钉派生列表 + 额外钉「由两个载体构成」。
+4. **`ceiling` 的 `< max` 一半是冗余的** ⇒ mut3 三臂全绿：**不是每条变异都该红**，无牙变异如实登记（别反过来怀疑装置）。
+
+**两次红的真相（都真错）**：① run `39992888827` 红 = 源形状测试钉拼写（见上）；② run `39994858886` 绿但**不干净** = 本支改过的文件带 1 条**既有**警告（`System.getProperty("user.dir")` 可空，同一行上上次 run 也有）⇒ 就地修掉重跑 ⇒ 第三次绿且警告 0。**CI 绿 ≠ CI 干净**（1042-A6 / 1045-FIX-8 同族）。
+
+**L3 装置**（`probe/l3/`）：切片 = `provider/thinking/*.kt` **真树逐字节副本** + `ThinkingLevel` 从 `ProviderConfig.kt` **机械抽取**（`make_slice.py` 按花括号切片）+ Room entity/logger 打桩（唯一不可信面）；POST `PairWiringTest` OK(1) / PRE(喂原始值) RED(7 个越界，`wire=8192 budget=28672`) / 基线树 resolver 臂 `PairNonPositiveTest` RED / mut1 mut2 mut4 各 RED / `PairGuardNestingTest` OK(3) / `MergeDistributionTest` OK(4)。**provider 侧编不出完整包**（OkHttp/Base64/Room ⇒ 1565 unresolved），故序列化器本体由「门 + 真树变异」覆盖。
+
+**登记**：报告 `fix-reports/dv27-FIX-A1.md`（八节）；backlog **§1047-A1**（机械门 389 段 / no-触发条件 4 段**既有未新增** / 豁免 11，本段 OK @ backlog.md:7783）。残留 R1 真机欠账 / R2 `maxTokens==2 → budget==1` 登记不修 / **R3 重要：`msg.imageParts` 无生产者 ⇒ 活路径逐字节不变**（本次修的是契约缺口不是线上丢图）/ R4 文本块位置 / R5 门只看 provider 包 / R6 else 链启发式不认 `when` / R7 C-OAI-2 是刻意形状锁 / R8 三家顺序各自写死。
+
+**★ 自伤（一次，已闭环）**：`file_write` 写 backlog.md 时**覆盖**了 1.5MB 全文（工具是写文件不是追加）⇒ 从 `backlog.md.bak-20261023-174018`（当日最新备份）恢复后改用 `cat >>` 追加。**规则：跨会话共享的大文件（backlog）只追加，绝不用 file_write；且先看 `ls -la` 确认文件大小再动手**。
+
+<!-- 2026-10-24 02:49:27 -->
+## FIX-A2 收口（deep-audit-1047 / A-02 P1）：`fix/dv27-a2-modelsvc-thinking-level` @ `2fc80db6`，CI #2578 success，停在分支
+
+
+**缺陷**：`ModelExecutionDispatcher.buildRequestJson` 对非 OFF 档位无条件 `put("thinking_level", level.name)`，但 worker 只有流式路径解析；非流式 `executeRun` 全函数 0 次读该键、`provider.sendMessage(...)` 也不带 `thinkingLevel =` ⇒ 取 `LLMProvider.sendMessage` 默认 `ThinkingLevel.OFF`。任何非流式 offload 请求在 DeepSeek/Qwen3/Claude 3.7+ 上**显式关掉推理**。
+
+**修法（阶梯第 6 级）**：新增 Android 无关 `sandbox/offload/ThinkingLevelWire.kt`（`thinkingLevelFromWire(raw)`：空串⇒OFF 因 dispatcher 刻意省略 OFF 键；未知⇒仍抛 `UnknownEnumValueException`），两条路径都只写这一行；`UnknownEnumValueException` 从 6000 行的 service 挪到独立文件（内容不变）以便纯 JVM 真编译真跑。生图分支/`restoreThinkingRules`/dispatcher 省略条件一律不动。
+
+**门（扩 `modeluse_proto_single_source_check.py`，0 新建门，+353/−2）**：C1 派生 dispatcher 请求级键（最外层 `JSONObject().apply{}` 内 `put("…")`，排除嵌套 builder ⇒ 真树 **35 键**）并要求 service 全文有读点；C2a 两条 provider 调用都带 `thinkingLevel =`；C2b 该值必须可追溯到同函数体的 `thinking_level` 读取（一跳 helper 允许，常量过不了）；C2c 两条调用具名实参**集合**必须相等（覆盖本波 + 历史 `tools`/`imageParts` 单侧丢参与族）。4 个带牙臂各断言**恰好一条**违规 + 1 合规夹具。
+
+**★ 最值钱的偏离判断**：任务书 C1 字面要求「派生键在两条函数体内**各自**都有消费」在**干净树**上必红——`input_json`/`passthrough_request`/`output_ext` 是非流式专属路由，`streaming` 在两条 body 之前（`:402`）就决定路由。**在正确代码上必红的判据无法被信任** ⇒ C1 取 service 级「无孤儿键」，逐路径对称交给 C2c 在调用点判（丢参无歧义）。规则：判据落地前先在干净树验证不误红。
+
+**验证四层**：L1 门真树 0 + selftest PASS（4 脏臂各恰红其一）+ **PRE 臂红**（`probe/pre/` 基线 service + 真树 dispatcher ⇒ 2 条精确违规）+ `scan.sh` **111 passed / 0 failed**（门头 111 互异）+ `test_scan` **ALL 340**（FAIL/ERROR 计数 0）· L2 邻门 **6/6 rc=0** · L3 真 kotlinc 2.0.21 + JUnitCore（生产 `ThinkingLevelWire.kt` + 真测试 5 用例）：**POST OK**，m1 删空串守卫⇒恰红 1、m2 未知静默回落⇒恰红 2、m3 恒 OFF⇒恰红 2，`ALL ARMS MATCH` · L4 **run 40002574114 / job 120582199256 / #2578 attempt 1 success @6fe519f8**：26 步坏步 0、唯一 skipped=Publish、8 条 Summary 全 0 failed、111 门头互异、ALL 340、编译错 0、**本支 4 文件诊断 0 条**、5 条新用例逐条 PASSED、三方 sha 逐字符一致。
+
+**★ 自伤三条（形态可复用）**：①**kotlinc 编译通过 ≠ 运行时能加载**：JVM 臂 `java -cp` 只给 junit/hamcrest，漏 `kotlin-stdlib.jar` ⇒ 5 用例全 `NoClassDefFoundError: kotlin/jvm/internal/Intrinsics`（假红）；编译期/运行期 classpath 要分开对齐。②派生键提取两次返回 0：先 `\.put(` 漏了 `apply` 内不带点的 `put(`，再「排除嵌套 builder」把最外层也排掉 ⇒ 解析器要先用真文件跑出预期基数再嵌进判据。③L3 枚举切片从 `ProviderConfig.kt:84` 逐字提取、仅去 `@Serializable`（只影响序列化，不影响 `valueOf`），报告里明写为唯一合成件。
+
+**残留**：R1 真机（`minis-model-use run --thinking high` 不带 `--stream` 时上游带思考参数，等真机窗口）· R2 C1 是 service 级非逐路径级 · R3 生图分支刻意不收档位 · R4 C2 只认首个 provider 调用 · R5 C2c 假定两方法签名一致。backlog **§1047-A2** 已落（段数 380→381）。**停止节点达成：分支 CI 绿，未合并 main（起手权在用户）。**
+
+<!-- 2026-10-24 05:39:14 -->
+## FIX-A3 收口（deep-audit-1047 / A-05+A-06）：`fix/dv27-a3-mcp-secret-handoff` @ `45b14121`，CI #40019485653 success，停在分支
+
+
+**缺陷（A-05）**：客侧 CLI 写不了加密存储，只能把 MCP 客户端密钥落 `<server>.secret` 等宿主导入；全仓只有编辑弹窗一处调 `importPendingClientSecret` ⇒ 另两个读者（`reconcileForServer` / `exchangeCode`）读到旧值或 null：前者把**旧密钥回写进桥接文件**，后者换票漏 `client_secret`（机密客户端 401）；`signOut` 先 `deleteBridgeFile`，把那份**不可再推导**的密钥连文件删掉（凭据损失）。
+
+**修法**：`clientSecret` 收敛为唯一出口（先导入，有值即返回，否则回落 prefs）⇒ 三处调用点一行未改即继承语义；`signOut` 在删文件前导入；`purge` **刻意不导入**（删服务器不许复活孤儿凭据）。保住原三契约（幂等/非法名拒绝拼路径/导入成功才删）。
+
+**缺陷（A-06，门）**：`_fun_body_nc` 用 `split("\n",1)[0]` 取表达式体 ⇒ 跨行写法被截成 `"="`，`method_io_state` 判 `pure`，主线程裸调 `clientSecret`/`isAuthorized` 报 0 违规。修法 = 新增 `_expr_body_nc`（跳过换行 → 花括号头走 `_match_brace` → 否则括号深度 + 续行符/`catch`/`finally`/`else`，**遇声明边界即停**，永不吞下一函数）。
+
+**门**：`mcp_oauth_lifecycle_check` 增 C5a（`clientSecret` 或其跳委派必含导入）/ C5b（`signOut` 导入位置**早于** `deleteBridgeFile`，按语句顺序派生）/ C6（`purge` 闭包内不得导入），带牙 4 臂；`skill_import_offmain_check` 增 3 条 B-04 臂 + 5 条解析器臂。**门 111 / 夹具 340 不变**，`scan.sh`/`test_scan.py` 零触碰。
+
+**验证四层**：L1 111/0 + ALL 340 + 两门真树 rc=0 + selftest PASS · PRE 臂三个组合（旧脚本/基线源 / 新脚本/基线源 / 新脚本/修复源）证明「红→绿确由解析器修复带来，非源改动巧合」 · L2 13 邻门 rc=0 · L3 3 个真树字节变异臂各恰红其判据、sha256 前后一致（`a80d0f6b…`） · L4 run `40019485653` / job `120640023138` attempt 1 success、26 步 not_ok=[]、唯一 skipped=Publish、`║  Summary: 111 passed, 0 failed` @974、`ALL 340 CASES PASS` @1364、门头 111 且门名去重仍 111、` e: ` 0、游离 FAILED 0、两门 teeth 行在册（1288/1299）、`MCPOAuthStore.kt` 警告 0。
+
+**★ 三条可复用（已入 backlog 段）**：
+1. **`.replace()` 型夹具的源串是隐式契约**：生产代码一改，replace 静默不匹配 ⇒ 夹具不再脏 ⇒ 该臂变**假绿**（不报错，最难发现）。改生产形态必须同步所有 `replace` 源串。
+2. **树内 probe 副本会被「按文件名遍历」的门当成真源码**：`probe/base-tree`（PRE 臂基线 worktree）让 `parts_json_funnel_check` 报 1 条自造假红（110/1）。**PRE 臂 worktree 用完立刻 `git worktree remove`**。
+3. **同类文件靠「同目录 + 同 `readText(`」无法区分**：`.secret` 交接文件与令牌桥 `.json` 都在同目录、都用 `readText(` ⇒ 门判到错误文件上（让「从不读桥」夹具假红）。修法 = 用字符串后缀 `.secret` 剥离出 `_secret_handoff_readers`，**判据锚文件身份而非 API 形态**。
+
+**残留**：R1 真机（CLI 种 `.secret` → 授权换票带 `client_secret`；`signOut` 后 prefs 仍有密钥、文件已删）· R2 `.secret` 权限未复核（P2）· R3 `_expr_body_nc` 仍不认无续行符的跨行 `if/else` 表达式（P2 latent，真树 0 例）· R4 `clientSecret` 变 IO 后新调用点在 Main 时 arm7 报的是「磁盘 IO 在 Main」而非「移交语义丢失」（P2）· R5 `_secret_handoff_readers` 锚定 `.secret` 字面量（P3）。全部带触发条件。
+
+**backlog**：§1047-A3 已落（382 段；机械门 393 段 / no-触发条件 4 / 豁免 11，本段 OK @ backlog.md:7888）。
 
 ---
 
