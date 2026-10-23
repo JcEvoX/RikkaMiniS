@@ -68,6 +68,7 @@ MINIS_APP_REL = "src/android/app/src/main/java/com/rikkaminis/app/MinisApp.kt"
 CHAT_ENTRY_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatSessionEntryExt.kt"
 DRAWER_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatHistoryDrawer.kt"
 CHAT_VM_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatViewModel.kt"
+SESSION_DELETE_PLAN_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/SessionDeletePlan.kt"
 
 # [dv24-b3 / deep-audit-1044 B-06] Draft promotion must persist the BODY, not
 # just a 50-char title prefix, and the drawer must treat a preview as content.
@@ -1009,6 +1010,164 @@ class MinisApp : Application() {
 }
 """
 
+
+# ── session-deletion step order (dv27-B4 / deep-audit-1047 B-06) ────────────
+#
+# C-DEL-1 (order): the FIRST `ChatViewModelStore.release(` in the delete path
+#   must precede `deleteSession(`. The order may be delegated to one pure plan
+#   function (that is the fix's whole point — a JVM test can pin it), so the
+#   criterion resolves the plan the body iterates and reads ITS return order,
+#   then maps each step to its effect through the `when (step)` branches. Both
+#   the step names and the plan function's name are therefore free to change;
+#   only the relation "release before delete" is asserted.
+#
+#   Deleting before releasing is not a style question: the resident
+#   ChatViewModel's streamJob / BrowserTabPool keep writing
+#   `minis-sessions/<id>/…` back into the directory that was just removed
+#   (ghost directory), and the cancelled stream's own `finally` re-publishes a
+#   badge AFTER SessionBadgeStore.clear(id) (deleted session lights up again).
+DELETE_FN_DECL = "fun deleteSessionAndCleanup("
+PLAN_FN_LOOP_RE = re.compile(
+    r"for\s*\(\s*\w+\s+in\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*\)")
+# Step constants may be written bare or qualified (`SessionDeleteStep.RELEASE_VM`);
+# both shapes must resolve, else renaming the enum makes the gate blind.
+ENUM_CONST_RE = re.compile(r"(?:[A-Za-z_]\w*\.)?([A-Z][A-Z0-9_]{2,})(?![.\w])")
+WHEN_BRANCH_RE = re.compile(r"(?:[A-Za-z_]\w*\.)?([A-Z][A-Z0-9_]{2,})\s*->")
+RELEASE_CALL_RE = re.compile(r"ChatViewModelStore\s*\.\s*release\s*\(")
+DELETE_CALL_RE = re.compile(r"\.\s*deleteSession\s*\(")
+BADGE_CLEAR_RE = re.compile(r"SessionBadgeStore\s*\.\s*clear\s*\(")
+
+
+def _plan_constant_order(src, plan_name):
+    """The ordered constants a plan function RETURNS, or None.
+
+    Resolution is two-hop on purpose: the name comes from the `for (step in
+    <plan>())` loop in the drawer, so renaming the function (or any step) moves
+    the gate with it.
+    """
+    if not src:
+        return None
+    masked = mask_keep_offsets(src)
+    if masked is None:
+        return None
+    body = decl_slice(masked, "fun %s(" % plan_name)
+    if body is None:
+        return None
+    open_call = body.find("listOf(")
+    if open_call < 0:
+        return None
+    close = balanced_index(body, open_call + len("listOf"), "(", ")")
+    if close < 0:
+        return None
+    return [m.group(1) for m in ENUM_CONST_RE.finditer(body[open_call:close])]
+
+
+def _branch_effects(fn_body):
+    """{step constant: set of effects} derived from the `when (step)` branches.
+
+    Effects are the three calls the plan is allowed to dispatch to. A branch
+    that carries none of them is simply absent from the map (and the order
+    criterion then reports the plan as unresolvable rather than guessing).
+    """
+    marks = list(WHEN_BRANCH_RE.finditer(fn_body))
+    out = {}
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(fn_body)
+        branch = fn_body[m.end():end]
+        effects = set()
+        if RELEASE_CALL_RE.search(branch):
+            effects.add("release")
+        if DELETE_CALL_RE.search(branch):
+            effects.add("delete")
+        if BADGE_CLEAR_RE.search(branch):
+            effects.add("clear")
+        if effects:
+            out.setdefault(m.group(1), set()).update(effects)
+    return out
+
+
+def check_drawer_delete_order(drawer_src, plan_src=None):
+    """C-DEL-1 + C-DEL-2 [dv27-B4 B-06].
+
+    C-DEL-1  release strictly before delete (through the plan when one exists).
+    C-DEL-2  the `finally` still replays release + badge clear, i.e. the fix did
+             not trade the [fix/audit-0917-b9] "cleanup even on failure"
+             contract for the new ordering.
+    """
+    v = []
+    masked = mask_keep_offsets(drawer_src)
+    if masked is None:
+        v.append("ChatHistoryDrawer.kt: unterminated string/comment literal — cannot inspect "
+                 "the session-deletion order (ROT — update this gate)")
+        return v
+    fn_body = decl_slice(masked, DELETE_FN_DECL)
+    if fn_body is None:
+        v.append("ChatHistoryDrawer.kt: '%s' not found (ROT — update this gate)"
+                 % DELETE_FN_DECL)
+        return v
+
+    release_idx = delete_idx = None
+    loop = PLAN_FN_LOOP_RE.search(fn_body)
+    if loop:
+        plan_name = loop.group(1)
+        order = _plan_constant_order(plan_src, plan_name) or \
+            _plan_constant_order(drawer_src, plan_name)
+        if not order:
+            v.append("ChatHistoryDrawer.kt: the delete path iterates '%s()' but no plan "
+                     "function of that name returning an ordered list was found in the drawer "
+                     "or in its sibling plan file (ROT — update this gate)" % plan_name)
+            return v
+        effects = _branch_effects(fn_body)
+        for i, const in enumerate(order):
+            eff = effects.get(const, set())
+            if "release" in eff and release_idx is None:
+                release_idx = i
+            if "delete" in eff and delete_idx is None:
+                delete_idx = i
+        if release_idx is None or delete_idx is None:
+            v.append("ChatHistoryDrawer.kt: the delete plan (%s) has no step that reaches "
+                     "ChatViewModelStore.release( and no step that reaches a deleteSession( "
+                     "call — the ordering contract cannot be verified (C-DEL-1)"
+                     % " -> ".join(order))
+            return v
+    else:
+        # Inline shape (no plan hop): fall back to statement order.
+        rel = RELEASE_CALL_RE.search(fn_body)
+        dele = DELETE_CALL_RE.search(fn_body)
+        if rel is None or dele is None:
+            v.append("ChatHistoryDrawer.kt: the delete path no longer calls both "
+                     "ChatViewModelStore.release( and deleteSession( — ordering unverifiable "
+                     "(C-DEL-1)")
+            return v
+        release_idx, delete_idx = rel.start(), dele.start()
+
+    if release_idx > delete_idx:
+        v.append("ChatHistoryDrawer.kt: the session is deleted BEFORE its ChatViewModel is "
+                 "released (C-DEL-1) — the live streamJob / BrowserTabPool recreates "
+                 "minis-sessions/<id>/… in the tree that was just removed, and the cancelled "
+                 "stream's finally re-publishes the badge after the clear. Release first.")
+
+    # C-DEL-2: the unconditional cleanup tail must survive the reordering.
+    fin_at = fn_body.find("finally")
+    if fin_at < 0:
+        v.append("ChatHistoryDrawer.kt: the delete path has no 'finally' — a throw from any "
+                 "step now leaves the ChatViewModel and the badge behind "
+                 "([fix/audit-0917-b9] contract, C-DEL-2)")
+    else:
+        open_at = fn_body.find("{", fin_at)
+        close_at = brace_block_end(fn_body, open_at) if open_at >= 0 else -1
+        tail = fn_body[open_at:close_at + 1] if close_at > open_at else ""
+        missing = []
+        if not RELEASE_CALL_RE.search(tail):
+            missing.append("ChatViewModelStore.release(")
+        if not BADGE_CLEAR_RE.search(tail):
+            missing.append("SessionBadgeStore.clear(")
+        if missing:
+            v.append("ChatHistoryDrawer.kt: the 'finally' cleanup dropped %s — the "
+                     "unconditional cleanup contract ([fix/audit-0917-b9]) is gone (C-DEL-2)"
+                     % " / ".join(missing))
+    return v
+
 BAD_APP_SWEEP_UNWIRED = GOOD_APP_SWEEP.replace(
     "chatRepository.deleteEmptySessions(", "chatRepository.countEmptySessions(")
 
@@ -1036,6 +1195,10 @@ def run(root):
         app = read(root, MINIS_APP_REL)
         entry = read(root, CHAT_ENTRY_REL)
         drawer = read(root, DRAWER_REL)
+        try:
+            delete_plan = read(root, SESSION_DELETE_PLAN_REL)
+        except OSError:
+            delete_plan = None
         vm = read(root, CHAT_VM_REL)
     except OSError as exc:
         print("skill_restore_session_cleanup_check: cannot read sources: %s" % exc)
@@ -1044,7 +1207,8 @@ def run(root):
                   + check_chat_entry(entry) + check_minis_app_badge(app)
                   + check_minis_app_sweep(app)
                   + check_promote_draft(entry) + check_drawer_visibility(drawer)
-                  + check_promote_ownership(vm, entry))
+                  + check_promote_ownership(vm, entry)
+                  + check_drawer_delete_order(drawer, delete_plan))
     if violations:
         print("FAIL skill_restore_session_cleanup_check")
         for v in violations:

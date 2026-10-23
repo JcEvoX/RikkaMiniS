@@ -105,8 +105,10 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
                 "contains",
             ),
         )
+        // `--help` is a flag, so `positional` is empty for it too: the exit
+        // code has to be decided on the flag, or `--help` answers 2.
         if (args.hasFlag("h", "help") || args.positional.isEmpty()) {
-            return NativeOffloadResult(if (args.positional.isEmpty()) 2 else 0, TOP_HELP)
+            return NativeOffloadResult(if (args.hasFlag("h", "help")) 0 else 2, TOP_HELP)
         }
         val sub = args.positional[0]
         // T330: tri-state agent gate via OffloadPermissionManager. `service`

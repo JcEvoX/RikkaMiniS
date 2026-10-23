@@ -1,7 +1,9 @@
 package com.rikkaminis.app.ui.chat
 
+import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.os.Build
 import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -146,10 +148,32 @@ internal class MinisMarkdownTextToolbar(
             }.getOrNull()?.trim().orEmpty()
             if (selection.isNotEmpty()) sink(selection)
         } finally {
-            // Restore the user's prior clipboard so the action stays
-            // additive — only the chat input / speech changes, the clipboard
-            // is exactly as the user left it.
-            if (original != null) runCatching { cm.setPrimaryClip(original) }
+            // [dv27-B4 / deep-audit-1047 B-07] Hand the clipboard back exactly
+            // as we found it — INCLUDING the case where we found nothing. The
+            // old arm restored only when a snapshot existed (`if (original !=
+            // null)`), so a user whose clipboard was empty (or unreadable — the
+            // read is `runCatching { cm.primaryClip }`) kept our borrowed
+            // selection in the system clipboard after tapping "add to input":
+            // every other app and the next paste saw it. Putting "nothing" back
+            // means emptying it again, and HOW an empty clipboard is produced is
+            // not re-decided here — the offload handler already owns that split
+            // (dv22-A6 A-06: Q+ `clearPrimaryClip()`, API 26–28 the empty-string
+            // write). One decision, two callers.
+            val snapshot = original
+            runCatching {
+                when (clipboardRestoreAction(
+                    hadOriginal = snapshot != null,
+                    atLeastQ = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q,
+                )) {
+                    ClipboardRestoreAction.RESTORE_ORIGINAL ->
+                        snapshot?.let { cm.setPrimaryClip(it) }
+                    ClipboardRestoreAction.CLEAR_PLATFORM ->
+                        cm.clearPrimaryClip()
+                    ClipboardRestoreAction.CLEAR_EMPTY_STRING ->
+                        cm.setPrimaryClip(ClipData.newPlainText("", ""))
+                    ClipboardRestoreAction.NOOP -> Unit
+                }
+            }
         }
     }
 

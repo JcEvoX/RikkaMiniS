@@ -297,6 +297,8 @@ def run(root):
     violations = check_source(texts[LIFECYCLE_REL])
     factory_v, sites = check_factory_models(texts)
     violations += factory_v
+    # [deep-audit-1047 B-04] group selection / member resolution sync
+    violations += check_group_selection(texts)
     if violations:
         for x in violations:
             print("session_provider_enabled_check: %s" % x)
@@ -307,6 +309,349 @@ def run(root):
     print("GATE=GREEN session_provider_enabled")
     return 0
 
+
+# ── [deep-audit-1047 B-04] group selection / member resolution sync ────────
+#
+# Three disconnects, all in the two files that own "which member serves this
+# session":
+#  C-SEL-1  selectGroup / selectGroupEntry published the display state
+#           (_selectedGroupId / _selectedGroupName) BEFORE asking whether the
+#           group could serve, so a group resolving to nothing still flipped
+#           the top bar and the picker highlight while provider / binding
+#           stayed on the old one.
+#  C-SEL-2  the same call wrote the RAW requested entry id into
+#           pendingEntryOverride / the persisted `lastEntryId` while a comment
+#           two lines below declared "_activeEntryId is the truth" — after a
+#           fallback the session was bound to a member that had been skipped.
+#  C-SEL-3  selectEntry re-derived "instance + key" inline (no disable gate),
+#           and both group consumers filtered members by `isEnabled` only, so
+#           a key-less member at the head of a group sank the whole group.
+#
+# Every name below is DERIVED from the tree, not hard-coded: the acceptable
+# "usability filter" wrappers come from the signatures that take a
+# List<ModelEntry> and consult the funnel, and the names that count as "the
+# answer of a resolution" come from the assignments whose right-hand side
+# calls one of the resolution entry points. Renaming a helper keeps the gate
+# green; deleting it turns every consumer red.
+
+
+CSEL_GROUP_WRITE = "_selectedGroup"
+FUNNEL_CALL = "decideSessionModelResolution("
+FUNNEL_USE = "SessionModelResolution.Use"
+RESOLVE_CALL = "resolveProviderFromGroup("
+ACTIVE_ENTRY = "_activeEntryId"
+MEMBERS_CALL = "enabledMemberEntries("
+
+# The three ways a "can this group/member serve?" answer is produced. A local
+# name assigned from any of them is accepted as the guard of a group write.
+_RESOLVE_SOURCES = (RESOLVE_CALL, "planGroupSelect(", FUNNEL_CALL)
+
+_EMPTY_VALUES = ("null", '""')
+_WRITE_RE = re.compile(r"_(?:selectedGroupId|selectedGroupName)\.value\s*=\s*(.*)$", re.M)
+_LAST_ENTRY_RE = re.compile(r'lastEntryId\\{0,2}":\\{0,2}"\$([A-Za-z_][A-Za-z0-9_]*)')
+_DECL_RE = re.compile(r"^[ \t]*(?:internal |private |public |override |suspend )*fun\s", re.M)
+_ASSIGN_RE = re.compile(
+    r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*((?:[^\n=]|\([^\n)]*\)){0,400})")
+
+
+def _fun_span(text, pos):
+    """(start, end) of the top-level `fun` declaration containing `pos`."""
+    starts = [m.start() for m in _DECL_RE.finditer(text)]
+    prev = None
+    nxt = None
+    for s in starts:
+        if s <= pos:
+            prev = s
+        elif nxt is None:
+            nxt = s
+    if prev is None:
+        return None
+    return (prev, nxt if nxt is not None else len(text))
+
+
+def _resolution_names(code):
+    """Local names that carry the answer of a resolution.
+
+    Derived, not enumerated: anything whose right-hand side calls
+    resolveProviderFromGroup / planGroupSelect / decideSessionModelResolution.
+    `resolved`, `plan`, `decision` all fall out of this; renaming them keeps
+    the gate green, and inlining the resolution into the `if` keeps it green
+    too (the guard is then the call itself).
+    """
+    names = set()
+    for m in _ASSIGN_RE.finditer(code):
+        rhs = m.group(2)
+        if any(src in rhs for src in _RESOLVE_SOURCES):
+            names.add(m.group(1))
+    return names
+
+
+def _logical_header(lines, i):
+    """The statement that opened the block on line `i` — a condition may be
+    wrapped, so walk back until the parentheses balance."""
+    seg = lines[i]
+    opens = seg.count("(")
+    closes = seg.count(")")
+    j = i - 1
+    while closes > opens and j >= 0 and i - j <= 6:
+        seg = lines[j] + "\n" + seg
+        opens += lines[j].count("(")
+        closes += lines[j].count(")")
+        j -= 1
+    return seg
+
+
+def _guarded_by_resolution(code, write_pos, fun_start, names):
+    """True when the write may only run after a resolution said yes.
+
+    Indentation-based rather than brace-matched on purpose: these files carry
+    `\"\"\"{\"type\":\"group\",...}\"\"\"` literals whose braces would corrupt a
+    depth count, while the formatter's indentation is reliable.
+    """
+    lines = code.split("\n")
+    line_no = code.count("\n", 0, write_pos)
+    line_start = code.rfind("\n", 0, write_pos) + 1
+    own_line = code[line_start:write_pos]
+    candidates = [own_line]
+    indent = len(lines[line_no]) - len(lines[line_no].lstrip())
+    i = line_no - 1
+    while i >= 0 and code[:line_start].count("\n") >= 0:
+        ln = lines[i]
+        if ln.strip():
+            ind = len(ln) - len(ln.lstrip())
+            if ind < indent and ln.rstrip().endswith("{"):
+                candidates.append(_logical_header(lines, i))
+                indent = ind
+        i -= 1
+        if indent <= 0:
+            break
+    for cand in candidates:
+        if "if" not in cand:
+            continue
+        if FUNNEL_USE in cand:
+            return True
+        for name in names:
+            if re.search(r"\b%s\b" % re.escape(name), cand):
+                return True
+    return False
+
+
+def _traces_to_active(code, name, hops=3):
+    """Does `name` carry the entry id that actually got resolved?"""
+    seen = set()
+
+    def rec(n, h):
+        if h <= 0 or n in seen:
+            return False
+        seen.add(n)
+        m = re.search(r"\bval\s+%s\b[^=\n]*=" % re.escape(n), code)
+        if not m:
+            return False
+        stmt = code[m.end():m.end() + 400].split("\n\n")[0]
+        if ACTIVE_ENTRY in stmt:
+            return True
+        for cand in set(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\b", stmt)):
+            if cand in ("val", "let", "null", "true", "false", "return", "it", "is"):
+                continue
+            if rec(cand, h - 1):
+                return True
+        return False
+
+    return rec(name, hops)
+
+
+def _usable_filters(texts):
+    """Names of the functions that narrow a List<ModelEntry> through the funnel."""
+    names = set()
+    for text in texts.values():
+        for m in re.finditer(r"\bfun\s+[^\n(]*?([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)", text):
+            if "List<ModelEntry>" not in m.group(2):
+                continue
+            body = text[m.end():m.end() + 1500]
+            if FUNNEL_CALL in body:
+                names.add(m.group(1))
+    return names
+
+
+def _is_resolver(header):
+    """True when the enclosing function IS the resolution.
+
+    `resolveProviderFromGroup` publishes the group name on its own success
+    path — by the time that line runs it has already established that a member
+    can serve, so requiring it to be guarded by a resolution would be
+    circular. Same for the funnel itself.
+    """
+    return RESOLVE_CALL.rstrip("(") in header or FUNNEL_CALL.rstrip("(") in header
+
+
+def check_group_selection(texts):
+    """C-SEL-1/2/3 across the chat layer. Returns a list of violations."""
+    v = []
+    filters = _usable_filters(texts)
+    # the filter names live in whichever file declares them, so resolve them
+    # against the whole layer, not per file
+    all_code = {rel: _strip_line_comments(t) for rel, t in texts.items()}
+    names = set()
+    for code in all_code.values():
+        names |= _resolution_names(code)
+
+    for rel, code in sorted(all_code.items()):
+        # ── C-SEL-1: a group id may only be published once it resolved ─────
+        for m in _WRITE_RE.finditer(code):
+            rhs = m.group(1).strip()
+            if rhs.startswith(_EMPTY_VALUES):
+                # clearing the selection is the inverse operation — no gate.
+                continue
+            span = _fun_span(code, m.start())
+            if span is None:
+                v.append("%s group write outside any function (ROT?)" % rel)
+                continue
+            fun_start, _fun_end = span
+            header = code[fun_start:code.find("\n", fun_start)]
+            if _is_resolver(header):
+                continue
+            if not _guarded_by_resolution(code, m.start(), fun_start, names):
+                v.append(
+                    "%s: `%s` publishes a group that nothing established as "
+                    "servable — it must sit inside the branch that a "
+                    "resolution opened (C-SEL-1)" % (rel, m.group(0).strip()))
+
+        # ── C-SEL-2: one id per call — the persisted id is the resolved one ─
+        for m in _LAST_ENTRY_RE.finditer(code):
+            name = m.group(1)
+            span = _fun_span(code, m.start())
+            if span is None:
+                continue
+            fun_start, fun_end = span
+            body = code[fun_start:fun_end]
+            if ACTIVE_ENTRY not in body or name.startswith(ACTIVE_ENTRY):
+                continue
+            if not _traces_to_active(code, name):
+                v.append(
+                    "%s: persisted `lastEntryId` uses `%s`, which does not come "
+                    "from %s — the same call must write one id (C-SEL-2)"
+                    % (rel, name, ACTIVE_ENTRY))
+
+        # ── C-SEL-3: single decision point ─────────────────────────────────
+        if rel.endswith("ChatModelRouting.kt"):
+            sm = re.search(r"\bfun\s+ChatViewModel\.selectEntry\s*\(", code)
+            if sm is None:
+                v.append("%s: selectEntry not found (anchors drifted)" % rel)
+            else:
+                span = _fun_span(code, sm.start())
+                body = code[span[0]:span[1]]
+                if FUNNEL_CALL not in body:
+                    v.append(
+                        "%s: selectEntry does not route through %s — a "
+                        "DISABLED instance carrying a key is activated anyway "
+                        "(C-SEL-3)" % (rel, FUNNEL_CALL.rstrip("(")))
+
+        for m in re.finditer(re.escape(MEMBERS_CALL), code):
+            pre = code[max(0, m.start() - 80):m.start()]
+            if not any((f + "(") in pre for f in filters):
+                v.append(
+                    "%s: `%s` hands the router members that were never checked "
+                    "for a credential — a key-less head member sinks the whole "
+                    "group (C-SEL-3)" % (rel, MEMBERS_CALL.rstrip("(")))
+    return v
+
+
+# ── selftest fixtures ────────────────────────────────────────────────────────
+
+CSEL_ROUTING_GOOD = '''fun ChatViewModel.selectGroup(groupId: String) {
+    groupRouter.clearHealth()
+    val resolved = resolveProviderFromGroup(groupId)
+    if (resolved) {
+        _selectedGroupId.value = groupId
+        _selectedGroupName.value = providerRepository.group(groupId)?.name
+        pendingEntryOverride = null
+    }
+}
+
+fun ChatViewModel.selectGroupEntry(groupId: String, entryId: String) {
+    groupRouter.clearHealth()
+    val resolved = resolveProviderFromGroup(groupId, entryId)
+    val plan = planGroupSelect(resolved = resolved, resolvedId = _activeEntryId.value, requestedId = entryId)
+    if (plan.applyUi) {
+        val resolvedEntryId = plan.effectiveEntryId ?: return
+        _selectedGroupId.value = groupId
+        _selectedGroupName.value = providerRepository.group(groupId)?.name
+        persistBinding(""{"type":"group","groupId":"$groupId","lastEntryId":"$resolvedEntryId"}"")
+        providerRepository.lastUsedEntryId = resolvedEntryId
+    }
+}
+
+fun ChatViewModel.selectEntry(entryId: String) {
+    val entry = config.modelEntries.find { it.id == entryId } ?: return
+    val instance = providerRepository.instance(entry.providerInstanceId)
+    val apiKey = instance?.let { providerRepository.loadApiKey(it.id) }
+    val decision = decideSessionModelResolution(entry, instance, apiKey)
+    if (decision !is SessionModelResolution.Use) return
+    _selectedGroupId.value = null
+    _selectedGroupName.value = ""
+}
+
+internal fun ChatViewModel.rotateForNewTurn(label: String) {
+    val group = providerRepository.group(gid) ?: return
+    val members = usableGroupMembers(providerRepository.enabledMemberEntries(group))
+    val targetId = groupRouter.nextLoadBalanceMember(members)
+}
+'''
+
+# ① the pre-fix shape: display state first, resolution afterwards.
+CSEL_ROUTING_PRE = '''fun ChatViewModel.selectGroup(groupId: String) {
+    _selectedGroupId.value = groupId
+    groupRouter.clearHealth()
+    val resolved = resolveProviderFromGroup(groupId)
+    if (resolved) {
+        pendingEntryOverride = null
+    }
+}
+
+fun ChatViewModel.selectGroupEntry(groupId: String, entryId: String) {
+    _selectedGroupId.value = groupId
+    _selectedGroupName.value = providerRepository.group(groupId)?.name ?: ""
+    groupRouter.clearHealth()
+    val resolved = resolveProviderFromGroup(groupId, entryId)
+    if (resolved) {
+        persistBinding(""{"type":"group","groupId":"$groupId","lastEntryId":"$entryId"}"")
+        _activeEntryId.value?.let { providerRepository.lastUsedEntryId = it }
+    }
+}
+
+fun ChatViewModel.selectEntry(entryId: String) {
+    val entry = config.modelEntries.find { it.id == entryId } ?: return
+    val instance = providerRepository.instance(entry.providerInstanceId) ?: return
+    val apiKey = providerRepository.loadApiKey(instance.id) ?: return
+    _selectedGroupId.value = null
+}
+
+internal fun ChatViewModel.rotateForNewTurn(label: String) {
+    val group = providerRepository.group(gid) ?: return
+    val members = providerRepository.enabledMemberEntries(group)
+    val targetId = groupRouter.nextLoadBalanceMember(members)
+}
+'''
+
+CSEL_LIFECYCLE_GOOD = '''internal fun ChatViewModel.usableGroupMembers(members: List<ModelEntry>): List<ModelEntry> =
+    members.filter { member ->
+        val instance = providerRepository.instance(member.providerInstanceId)
+        decideSessionModelResolution(member, instance, null) is SessionModelResolution.Use
+    }
+
+internal fun ChatViewModel.resolveProviderFromGroup(groupId: String): Boolean {
+    val group = providerRepository.group(groupId) ?: return false
+    val enabledMembers = usableGroupMembers(providerRepository.enabledMemberEntries(group))
+    if (enabledMembers.isEmpty()) return false
+    return true
+}
+
+internal fun ChatViewModel.restoreFromBinding(bindingJson: String?): Boolean {
+    val resolved = resolveProviderFromGroup(groupId, lastEntryId)
+    if (resolved) _selectedGroupId.value = groupId
+    return resolved
+}
+'''
 
 # ── selftest fixtures ────────────────────────────────────────────────────────
 
@@ -530,6 +875,20 @@ def selftest():
     print("selftest apply w/o currentModel-> %d violation(s)" % len(no_current))
     print("selftest factory raw model    -> %d violation(s)"
           % len(check_factory_models(FACTORY_RAW)[0]))
+
+    good_sel = check_group_selection(
+        {ROUTING_REL: CSEL_ROUTING_GOOD, LIFECYCLE_REL: CSEL_LIFECYCLE_GOOD})
+    expect(len(good_sel) == 0, "compliant group-selection fixture reported %r" % (good_sel,))
+
+    pre_sel = check_group_selection(
+        {ROUTING_REL: CSEL_ROUTING_PRE, LIFECYCLE_REL: CSEL_LIFECYCLE_GOOD})
+    for crit in ("C-SEL-1", "C-SEL-2", "C-SEL-3"):
+        expect(
+            any(crit in x for x in pre_sel),
+            "pre-fix group-selection fixture produced no %s violation" % crit,
+        )
+    print("selftest group selection     -> good=%d violation(s), pre=%d"
+          % (len(good_sel), len(pre_sel)))
 
     if failures or not all(factory_results):
         for f in failures:

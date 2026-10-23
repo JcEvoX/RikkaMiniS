@@ -49,6 +49,17 @@ pin that surface (each judged on the DECISION POINT, not on a call shape):
        (incl. the mutation side), and no other copy of the bare predicate is
        re-derived in the debug package.
 
+  [R11 / C-EXP] Every reader that DISPATCHES ON THE PART NAME of a persisted
+       parts_json row must handle `"mediaRef"` — the @SerialName a real row
+       carries for media today. `ChatExporter.countAttachments` only knew the
+       pre-mediaRef names (`"image"` / `"video"`), which every row written
+       since the migration stopped using, so those counters were structural
+       zeros: summed per batch, published in Summary, written into
+       session.json, and never incremented once. The READER SET IS DERIVED (a
+       function body that both parses a persisted parts payload and switches
+       on `type`), so a new face added tomorrow is judged the same day — a
+       hand-listed file list would go blind.
+
   --selftest  proves the gate would fail on the pre-fix shapes (negative
   fixtures inline), so an emptied or stubbed tree cannot masquerade as green.
 """
@@ -469,6 +480,118 @@ def check_debug_surface(root):
 
 
 
+def derive_all_functions(root):
+    """{name: [(rel, line, body)]} for every production function declaration.
+
+    Needed because a face can delegate its dispatch: after the A-04 fix,
+    `countAttachments` only PARSES the row and hands the array to a pure
+    counter whose body carries every recognized name. A criterion scoped to a
+    single function body would go blind on exactly that refactor, so the
+    judged surface is each face plus what it delegates to.
+    """
+    table = {}
+    for path in find_production_files(root):
+        code = strip_kotlin_comments(read(path))
+        lines = code.split("\n")
+        starts = [i for i, line in enumerate(lines) if any(r.match(line) for r in DECL_RES)]
+        for si in starts:
+            nxt = [s for s in starts if s > si]
+            end = nxt[0] if nxt else len(lines)
+            n = re.search(r"fun\s+(\w+)", lines[si])
+            if n is None:
+                continue
+            table.setdefault(n.group(1), []).append(
+                (os.path.relpath(path, root), si + 1, "\n".join(lines[si:end])))
+    return table
+
+
+CALLEE_RE = re.compile(r"(?<![\w.])([A-Za-z_]\w*)\s*\(")
+
+
+def functions_in_source(code):
+    """{name: body} for the function declarations inside one file's source."""
+    lines = code.split("\n")
+    starts = [i for i, line in enumerate(lines) if any(r.match(line) for r in DECL_RES)]
+    out = {}
+    for si in starts:
+        nxt = [s for s in starts if s > si]
+        end = nxt[0] if nxt else len(lines)
+        n = re.search(r"fun\s+(\w+)", lines[si])
+        if n is not None:
+            out.setdefault(n.group(1), "\n".join(lines[si:end]))
+    return out
+
+
+def expand_same_file(body, local):
+    """`body` plus (one hop) the bodies of functions it calls IN THE SAME FILE.
+
+    One hop, same file, because that is where a delegated discriminator
+    actually lives: a face that spells out `"image"`/`"video"` arms and hands
+    the modern names to a sibling helper in the same file is not the defect.
+    Cross-file delegation needs no expansion — the discriminating body itself
+    is judged where it is declared (after the A-04 fix the names live in the
+    pure counter, and THAT body is the one carrying mediaRef).
+    """
+    out = [body]
+    for name in set(CALLEE_RE.findall(body)):
+        callee = local.get(name)
+        if callee is not None and callee not in out:
+            out.append(callee)
+    return "\n".join(out)
+
+
+
+def count_type_dispatchers(root):
+    """How many production functions dispatch a payload's `type` at all.
+
+    Used to tell "the derivation went blind" (RED) apart from "the tree has
+    no offending face" (GREEN).
+    """
+    n = 0
+    for path in find_production_files(root):
+        code = strip_kotlin_comments(read(path))
+        for _name, body in functions_in_source(code).items():
+            if any(r.search(body) for r in TYPE_DISPATCH_RES):
+                n += 1
+    return n
+
+
+def iter_image_video_faces(root):
+    """[(where, body)] for every production function that discriminates IMAGE
+    from VIDEO by legacy part name.
+
+    That discrimination is the invariant, not "touches partsJson": a body
+    that answers "is this an image or a video?" is making a claim about
+    persisted rows, and every row written since the mediaRef migration carries
+    the current serial name instead of the pre-migration one. Seeding on
+    partsJson would also have missed the fixed shape (the entry point now only
+    parses, the names live in the pure counter) and would have to depend on
+    call-graph expansion to see the delegated body.
+
+    A face that treats image and video IDENTICALLY (`sanitizeChatParts` drops
+    both, `extractText` only reads `"text"`) is out of family on purpose: it
+    asserts nothing per-kind, so demanding mediaRef there would be noise.
+    """
+    for path in find_production_files(root):
+        code = strip_kotlin_comments(read(path))
+        # Comments are stripped first, so an explanatory KDoc that merely
+        # NAMES serial names cannot satisfy the judgment.
+        local = functions_in_source(code)
+        for name, body in local.items():
+            # Must actually dispatch a payload's `type` — otherwise this is a
+            # modality badge/prompt helper that merely mentions `"image"` and
+            # `"video"` as capability strings (17 such faces measured).
+            if not any(r.search(body) for r in TYPE_DISPATCH_RES):
+                continue
+            body_lines = body.split("\n")
+            img = {i for i, l in enumerate(body_lines) if any(s in l for s in LEGACY_IMAGE_NAMES)}
+            vid = {i for i, l in enumerate(body_lines) if any(s in l for s in LEGACY_VIDEO_NAMES)}
+            if not (img and vid and img != vid):
+                continue
+            line_no = body.count("\n")
+            yield f"{os.path.relpath(path, root)} {name}()", body
+
+
 def find_production_files(root):
     out = []
     for dirpath, dirnames, filenames in os.walk(root):
@@ -480,6 +603,210 @@ def find_production_files(root):
             if fn.endswith(".kt"):
                 out.append(os.path.join(dirpath, fn))
     return out
+
+# ── [R11 / C-EXP] every parts_json name-dispatch must handle "mediaRef" ────
+# The persisted vocabulary is the @SerialName set of ContentPart.kt; a reader
+# that dispatches on the part name and omits "mediaRef" silently counts /
+# renders / exports nothing for every row written today.
+MEDIA_REF_NAME = '"mediaRef"'
+# The legacy pre-migration names a row may still carry; a face that keeps them
+# alongside the current serial name is correct, one that knows ONLY them
+# quantifies rows that no longer exist.
+LEGACY_IMAGE_NAMES = ('"image"', '"image_url"')
+LEGACY_VIDEO_NAMES = ('"video"', '"video_url"')
+# Marks that a payload really is a persisted parts row rather than some other
+# JSON array (an alarm list, a GitHub tree, an OpenAI content block...). The
+# COLUMN itself, plus how every real reader reaches it.
+PARTS_PAYLOAD_MARKS = ("partsJson", "parts_json", "m.partsJson", "row.partsJson")
+TYPE_DISPATCH_RES = (
+    re.compile(r'\boptString\(\s*"type"\s*\)'),
+    re.compile(r'\bgetString\(\s*"type"\s*\)'),
+    re.compile(r'\bopt\(\s*"type"\s*\)'),
+)
+DECL_RES = (
+    re.compile(r"^\s{0,8}(?:@\w+\s+)*(?:private\s+|internal\s+|public\s+|protected\s+|open\s+|override\s+|suspend\s+|inline\s+|final\s+|abstract\s+)*fun\s"),
+)
+
+
+def derive_parts_name_readers(source):
+    """[(line_no, name, body)] for every function in `source` that touches a
+    persisted parts payload.
+
+    Derived bottom-up rather than hand-listed: after the mediaRef migration
+    most faces handled the new name and one did not, so a list written against
+    today's tree would simply omit tomorrow's face. Body-splitting is line
+    based (not brace matching) to keep expression-bodied functions
+    (`= try { ... }`) whole; nested declarations count as part of the body —
+    the conservative direction, since a nested dispatcher is still inside this
+    face.
+    """
+    lines = source.split("\n")
+    starts = [i for i, line in enumerate(lines) if any(r.match(line) for r in DECL_RES)]
+    out = []
+    for si in starts:
+        nxt = [s for s in starts if s > si]
+        end = nxt[0] if nxt else len(lines)
+        body = "\n".join(lines[si:end])
+        payload = any(m in body for m in PARTS_PAYLOAD_MARKS)
+        dispatch = any(r.search(body) for r in TYPE_DISPATCH_RES)
+        if not (payload and dispatch):
+            continue
+        name = lines[si].strip()
+        n = re.search(r"fun\s+(\w+)", name)
+        out.append((si + 1, n.group(1) if n else name[:40], body))
+    return out
+
+
+# A face "recognizes" the modern serial name only if the name appears on a
+# line that DISPATCHES on it. Merely mentioning it anywhere in the body is
+# not enough: a `toolResult` arm that reads `value.optJSONObject("mediaRef")`
+# mentions the name without ever classifying a mediaRef ROW — so a face whose
+# only mention is such a lookup would satisfy a naive substring check while
+# still counting every mediaRef row as nothing (the very defect R11 grades).
+# Dispatch arms in this codebase take two shapes, and both must count:
+#   - a `when` arm:   "mediaRef" -> { ... }
+#   - an equality test: type == "mediaRef"
+def has_media_ref_dispatch_arm(body):
+    """Does [body] dispatch on the modern serial name itself?"""
+    for line in body.split("\n"):
+        if MEDIA_REF_NAME not in line:
+            continue
+        if "->" in line or "==" in line:
+            return True
+    return False
+
+def check_tool_result_media_ref(root):
+    """[R12 / C-EXP-NESTED] a face that quantifies media must also count the
+    media a TOOL produced.
+
+    A tool result is persisted as a `"toolResult"` part whose `value` carries
+    an optional `mediaRef` (see `ToolResult.mediaRef`). A media-counting face
+    that dispatches on `"toolResult"` but never looks inside it for a
+    `mediaRef` counts every tool-produced image/video as nothing — the same
+    structural zero R11 grades, reached through a different door. R11 only
+    sees the TOP-LEVEL dispatch arm, so without this criterion a face can
+    satisfy R11 and still drop every screenshot a tool returned.
+
+    The judgment is derived, not hand-listed: a face is in the family when
+    it dispatches on the `"toolResult"` part name AND attaches quantification
+    (splits image from video by part name). The nested lookup must be inside
+    the toolResult arm — a `mediaRef` lookup in a different arm does not
+    classify a tool result's media.
+    """
+    tool_rows, missing_rows = [], []
+    dispatchers = count_type_dispatchers(root)
+    if dispatchers == 0:
+        return ["[R12] FAIL no `type` dispatcher derived from the tree "
+                "(fail-closed: the reader set could not be established)"]
+    for where, surface in iter_image_video_faces(root):
+        if '"toolResult"' not in surface:
+            continue
+        tool_rows.append(where)
+        if tool_result_arm_reads_media_ref(surface):
+            continue
+        missing_rows.append(where)
+    if not tool_rows:
+        return [
+            f"[R12] PASS no media-quantifying parts_json face dispatches on "
+            f"{chr(34)}toolResult{chr(34)} ({dispatchers} type dispatchers derived) "
+            "— nothing to count there"
+        ]
+    if missing_rows:
+        return [
+            f"[R12] FAIL {len(missing_rows)}/{len(tool_rows)} media-quantifying "
+            f"parts_json faces dispatch on {chr(34)}toolResult{chr(34)} without "
+            f"reading its nested mediaRef — {', '.join(missing_rows)}. A tool that "
+            "returns media (a screenshot, a clip) persists it as "
+            "toolResult.value.mediaRef, so such a face counts every tool-produced "
+            "image/video as nothing — the same structural zero R11 grades, "
+            "reached through a different door."
+        ]
+    return [
+        f"[R12] PASS all {len(tool_rows)} media-quantifying parts_json faces read "
+        f"the nested mediaRef of their toolResult arm ({', '.join(tool_rows)})"
+    ]
+
+def tool_result_arm_reads_media_ref(body):
+    """Does the toolResult arm of [body] read a nested mediaRef?
+
+    Line-based arm extraction: the arm runs from the line that dispatches on
+    `"toolResult"` to the next line that dispatches on another part name (or
+    to the end of the body). A `mediaRef` lookup inside that span counts; one
+    in a sibling arm does not.
+    """
+    lines = body.split("\n")
+    start = None
+    for i, line in enumerate(lines):
+        if '"toolResult"' in line and ("->" in line or "==" in line):
+            start = i
+            break
+    if start is None:
+        return False
+    end = len(lines)
+    for j in range(start + 1, len(lines)):
+        line = lines[j]
+        if MEDIA_REF_NAME in line and ("->" in line or "==" in line):
+            end = j
+            break
+    arm = "\n".join(lines[start:end])
+    return MEDIA_REF_NAME in arm
+
+def check_media_ref_dispatch(root):
+    """[R11 / C-EXP] every parts_json face that ATTACHES quantization has to
+    recognize the mediaRef names.
+
+    Derivation: a counter/reporter that distinguishes image from video by
+    part name is asserting a claim about persisted rows, and only the
+    mediaRef names describe the rows being written today (the legacy names
+    describe pre-migration rows). A face that splits image/video and doesn't
+    recognize mediaRef reports structural zeros. The Family Is Identified By
+    The DISCRIMINATION, not by the function name — `extractText` only appends
+    `type == "text"`, `isInterruptedTail` only maps kinds, `sanitizeChatParts`
+    drops both image and video identically. Those three don't quantify media,
+    so demanding mediaRef handling there would only add noise; the property
+    that matters is "image vs video, distinguished by part name".
+    """
+    legacy_rows, both_rows, absent_rows = [], [], []
+    dispatchers = 0
+    for where, surface in iter_image_video_faces(root):
+        body_lines = surface.split("\n")
+        img = {i for i, l in enumerate(body_lines) if any(s in l for s in LEGACY_IMAGE_NAMES)}
+        vid = {i for i, l in enumerate(body_lines) if any(s in l for s in LEGACY_VIDEO_NAMES)}
+        if not (img and vid and img != vid):
+            continue  # does not discriminate image vs video by part name
+        if has_media_ref_dispatch_arm(surface):
+            both_rows.append(where)
+        else:
+            legacy_rows.append(where)
+        absent_rows.append(where)
+    dispatchers = count_type_dispatchers(root)
+    if dispatchers == 0:
+        # Fail-closed means "the DERIVATION went blind", not "the tree happens
+        # to have no offending face". A tree with no `type` dispatcher at all
+        # cannot be judged by this criterion, so it is RED. A tree that HAS
+        # dispatchers but none in the family is GREEN (nothing violates) —
+        # conflating the two would make the precision arm ungradeable.
+        return ["[R11] FAIL no `type` dispatcher derived from the tree "
+                "(fail-closed: the reader set could not be established)"]
+    if not absent_rows:
+        return [
+            f"[R11] PASS no image/video-discriminating parts_json face in the tree "
+            f"({dispatchers} type dispatchers derived, none discriminates image vs "
+            "video by part name) — nothing to classify"]
+
+    if legacy_rows:
+        return [
+            f"[R11] FAIL {len(legacy_rows)}/{len(absent_rows)} image/video parts_json "
+            f"faces split on the LEGACY part names only — {', '.join(legacy_rows)}. "
+            f"Rows persisted today carry {MEDIA_REF_NAME} "
+            f"(`{(MEDIA_REF_NAME,)}` plus nested toolResult variants), so this face "
+            "quantifies nothing that exists: the export counters were summed per "
+            "batch, written into session.json, and never incremented once."
+        ]
+    return [
+        f"[R11] PASS all {len(both_rows)} image/video parts_json faces classify "
+        f"{MEDIA_REF_NAME} alongside the legacy names ({', '.join(both_rows)})"
+    ]
 
 
 def check(root):
@@ -586,6 +913,10 @@ def check(root):
 
     # [da1032-B] read-side debug RPC view of the very same rows
     findings.extend(check_debug_surface(root))
+
+    # [da1047-A4 / C-EXP] every parts_json name dispatcher handles "mediaRef"
+    findings.extend(check_media_ref_dispatch(root))
+    findings.extend(check_tool_result_media_ref(root))
 
     if any(f.startswith(("FAIL", "[R")) and " FAIL " in f for f in findings):
         return FAIL, findings
@@ -893,6 +1224,177 @@ DEBUG_NON_BLOB_CALLS = DEBUG_GREEN.replace(
 
 
 
+# --- [R11 / C-EXP] mediaRef fixtures ---------------------------------------
+# The judged surface is DERIVED: a production function that dispatches a
+# payload's `type` AND discriminates image from video by part name. The
+# fixtures below are minimally-shaped stand-ins whose only job is to make one
+# arm flip.
+
+MEDIA_FACE_REL = "src/android/app/src/main/java/com/rikkaminis/app/share/ChatPartsAttachmentCount.kt"
+
+MEDIA_GREEN = """package com.rikkaminis.app.share
+
+import org.json.JSONArray
+
+internal fun countPartsAttachments(arr: JSONArray): Pair<Int, Int> {
+    var img = 0
+    var vid = 0
+    for (i in 0 until arr.length()) {
+        val obj = arr.optJSONObject(i) ?: continue
+        val value = obj.optJSONObject("value")
+        when (obj.optString("type")) {
+            "mediaRef" -> {
+                if (isVideoMediaRef(value)) vid += 1 else img += 1
+            }
+            "toolResult" -> {
+                val media = value?.optJSONObject("mediaRef")
+                if (media != null) {
+                    if (isVideoMediaRef(media)) vid += 1 else img += 1
+                }
+            }
+            "image", "image_url" -> img += 1
+            "video", "video_url" -> vid += 1
+        }
+    }
+    return img to vid
+}
+
+internal fun isVideoMediaRef(media: JSONObject?): Boolean {
+    if (media == null) return false
+    val mime = media.optString("mimeType")
+    return mime.startsWith("video/", ignoreCase = true)
+}
+"""
+
+# The pre-fix shape: the modern serial name is not recognized at all, so every
+# row written today quantifies as nothing.
+MEDIA_PREFIX = """package com.rikkaminis.app.share
+
+import org.json.JSONArray
+
+internal fun countPartsAttachments(arr: JSONArray): Pair<Int, Int> {
+    var img = 0
+    var vid = 0
+    for (i in 0 until arr.length()) {
+        val obj = arr.optJSONObject(i) ?: continue
+        when (obj.optString("type")) {
+            "image", "image_url" -> img += 1
+            "video", "video_url" -> vid += 1
+        }
+    }
+    return img to vid
+}
+"""
+
+# A second, independent face that ALSO drops the modern name — proves the
+# derivation covers more than the one function it was written against.
+MEDIA_SECOND_FACE = """
+internal fun countVideoParts(arr: JSONArray): Pair<Int, Int> {
+    var img = 0
+    var vid = 0
+    for (i in 0 until arr.length()) {
+        val obj = arr.optJSONObject(i) ?: continue
+        when (obj.optString("type")) {
+            "image", "image_url" -> img += 1
+            "video", "video_url" -> vid += 1
+        }
+    }
+    return img to vid
+}
+"""
+
+# Precision: a JSON reader that dispatches on `type` but treats image and
+# video IDENTICALLY asserts nothing per-kind, and a non-parts JSON reader
+# that merely mentions "image"/"video" is not a parts face at all. Neither may
+# be flagged.
+MEDIA_PRECISION = """package com.rikkaminis.app.share
+
+internal fun dropMedia(arr: JSONArray): Int {
+    var dropped = 0
+    for (i in 0 until arr.length()) {
+        val obj = arr.optJSONObject(i) ?: continue
+        when (obj.optString("type")) {
+            "mediaRef", "image", "image_url", "video", "video_url" -> dropped += 1
+        }
+    }
+    return dropped
+}
+
+internal fun modalityBadge(kind: String): String {
+    return if (kind == "image") "vision" else if (kind == "video") "motion" else "text"
+}
+"""
+
+
+# --- [R12 / C-EXP-NESTED] toolResult nested-media fixtures -------------------
+# The toolResult arm must READ the nested mediaRef; a face that dispatches on
+# "toolResult" but never looks inside drops every tool-produced image/video.
+
+MEDIA_TOOLRESULT_DROPPED = """package com.rikkaminis.app.share
+
+import org.json.JSONArray
+
+internal fun countPartsAttachments(arr: JSONArray): Pair<Int, Int> {
+    var img = 0
+    var vid = 0
+    for (i in 0 until arr.length()) {
+        val obj = arr.optJSONObject(i) ?: continue
+        val value = obj.optJSONObject("value")
+        when (obj.optString("type")) {
+            "mediaRef" -> {
+                if (isVideoMediaRef(value)) vid += 1 else img += 1
+            }
+            "toolResult" -> {
+                Unit
+            }
+            "image", "image_url" -> img += 1
+            "video", "video_url" -> vid += 1
+        }
+    }
+    return img to vid
+}
+"""
+
+# A face that reads the nested mediaRef — but OUTSIDE the toolResult arm
+# (in the mediaRef arm instead). That must NOT satisfy R12: a tool result's
+# media would still be uncounted.
+MEDIA_TOOLRESULT_OUTSIDE_ARM = """package com.rikkaminis.app.share
+
+import org.json.JSONArray
+
+internal fun countPartsAttachments(arr: JSONArray): Pair<Int, Int> {
+    var img = 0
+    var vid = 0
+    for (i in 0 until arr.length()) {
+        val obj = arr.optJSONObject(i) ?: continue
+        val value = obj.optJSONObject("value")
+        val media = value?.optJSONObject("mediaRef")
+        when (obj.optString("type")) {
+            "mediaRef" -> {
+                if (media != null) {
+                    if (isVideoMediaRef(media)) vid += 1 else img += 1
+                }
+            }
+            "toolResult" -> {
+                Unit
+            }
+            "image", "image_url" -> img += 1
+            "video", "video_url" -> vid += 1
+        }
+    }
+    return img to vid
+}
+"""
+
+def build_media_fixture(root, body, extra=None):
+    """Lay out the media-counting face(s) [R11] derives from."""
+    path = os.path.join(root, MEDIA_FACE_REL)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(body if extra is None else body + extra)
+    return root
+
+
 def selftest():
     import tempfile
     import shutil
@@ -1003,6 +1505,98 @@ def selftest():
             bad += 1
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+    # --- [R11 / C-EXP]: the mediaRef dispatch judgment ------------------------
+    def media_arm(name, body, extra, want, tag="[R11]"):
+        """Grade ONE [R11] arm on an isolated fixture tree."""
+        nonlocal bad
+        tmp = tempfile.mkdtemp(prefix="media-arm-")
+        try:
+            build_media_fixture(tmp, body, extra)
+            hits = [f for f in check_media_ref_dispatch(tmp) if f.startswith(tag)]
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        if not hits:
+            print(f"  SELFTEST {name}: FAIL ({tag} produced no finding — arm is empty)")
+            bad += 1
+            return
+        if want == "PASS":
+            if "PASS" not in hits[0]:
+                print(f"  SELFTEST {name}: FAIL (expected PASS, got {hits[0][:120]})")
+                bad += 1
+            else:
+                print(f"  SELFTEST {name}: OK ({hits[0].split(']')[1].strip()[:60]})")
+            return
+        if "FAIL" not in hits[0]:
+            print(f"  SELFTEST {name}: FAIL (expected FAIL, got {hits[0][:120]})")
+            bad += 1
+            return
+        # the failing face must be NAMED — a criterion that cannot say WHICH
+        # function is wrong is not actionable
+        # The FAIL message names the OFFENDING faces only (the ones that
+        # split on the legacy names). The compliant face must NOT be named —
+        # naming it would be a false accusation.
+        if want == "FAIL-NAMED":
+            if "countVideoParts" not in hits[0]:
+                print(f"  SELFTEST {name}: FAIL (offending face not named: {hits[0][:200]})")
+                bad += 1
+            elif "countPartsAttachments" in hits[0]:
+                print(f"  SELFTEST {name}: FAIL (compliant face wrongly accused)")
+                bad += 1
+            else:
+                print(f"  SELFTEST {name}: OK (offending face named, compliant face spared)")
+            return
+        if want == "FAIL" and ("countPartsAttachments" in hits[0] or "countVideoParts" in hits[0]):
+            print(f"  SELFTEST {name}: OK (gate RED: {hits[0].split(']')[0] + ']'})")
+            return
+        print(f"  SELFTEST {name}: FAIL (expected {want}, got {hits[0][:160]})")
+        bad += 1
+
+    media_arm("r11-modern-name-handled", MEDIA_GREEN, None, "PASS")
+    # --- [R12] the nested toolResult media arm ---
+    def r12_arm(name, body, want):
+        nonlocal bad
+        tmp = tempfile.mkdtemp(prefix="r12-arm-")
+        try:
+            build_media_fixture(tmp, body)
+            hits = [f for f in check_tool_result_media_ref(tmp) if f.startswith("[R12]")]
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        if not hits:
+            print(f"  SELFTEST {name}: FAIL ([R12] produced no finding — arm is empty)")
+            bad += 1
+            return
+        if want == "PASS" and "PASS" in hits[0]:
+            print(f"  SELFTEST {name}: OK (nested toolResult media counted)")
+            return
+        if want == "FAIL" and "FAIL" in hits[0]:
+            print(f"  SELFTEST {name}: OK (gate RED: {hits[0].split(']')[0] + ']'})")
+            return
+        print(f"  SELFTEST {name}: FAIL (expected {want}, got {hits[0][:160]})")
+        bad += 1
+
+    r12_arm("r12-compliant-nested-media", MEDIA_GREEN, "PASS")
+    r12_arm("r12-toolresult-arm-drops-media", MEDIA_TOOLRESULT_DROPPED, "FAIL")
+    r12_arm("r12-media-ref-read-outside-arm", MEDIA_TOOLRESULT_OUTSIDE_ARM, "FAIL")
+    media_arm("r11-pre-fix-shape", MEDIA_PREFIX, None, "FAIL")
+    # teeth are not hardcoded to one function: a SECOND face that drops the
+    # modern name is caught and NAMED.
+    media_arm("r11-second-face-dropped", MEDIA_GREEN, MEDIA_SECOND_FACE, "FAIL-NAMED")
+    # precision: image and video treated identically asserts nothing per-kind;
+    # a modality-badge helper mentions the words but is not a parts face.
+    media_arm("r11-precision-no-false-positive", MEDIA_PRECISION, None, "PASS")
+    # fail-closed: a tree with no derivable face is RED, not silently green.
+    _tmp = tempfile.mkdtemp(prefix="r11-noface-")
+    try:
+        os.makedirs(os.path.join(_tmp, "src/android/app/src/main/java/com/rikkaminis/app"), exist_ok=True)
+        _hits = [f for f in check_media_ref_dispatch(_tmp) if f.startswith("[R11]")]
+        if not _hits or "FAIL" not in _hits[0]:
+            print("  SELFTEST r11-no-face: FAIL (gate went blind with no derivable face)")
+            bad += 1
+        else:
+            print("  SELFTEST r11-no-face: OK (fails closed)")
+    finally:
+        shutil.rmtree(_tmp, ignore_errors=True)
 
     # the gate must be able to fail: an empty tree has no ChatRepository at all
     verdict, _ = check("/nonexistent-root-xyz")

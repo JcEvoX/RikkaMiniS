@@ -188,6 +188,9 @@ def check(src):
         if KEYED_REMEMBER not in fbody:
             v.append("%s must key its preview state on item.file "
                      "(no 'by remember(item.file) {{' found)" % sig)
+    # [deep-audit-1047 B-03] C-PDF-KEY — derived preview set, derived key set.
+    kv, ksites = check_preview_keys(src)
+    v.extend(kv)
     for needle, why in (
         ("private fun readCapped(file: File, maxBytes: Int): ByteArray {",
          "the readCapped helper must stay defined"),
@@ -384,9 +387,29 @@ def check_log_share(root):
 # exemption that no longer matches a real site is a rot failure — a stale
 # whitelist is exactly how the previous generation of these holes stayed green.
 
-SAF_UI_DIR = os.path.join(
-    "src", "android", "app", "src", "main", "java", "com", "rikkaminis", "app", "ui"
+APP_PKG_DIR = os.path.join(
+    "src", "android", "app", "src", "main", "java", "com", "rikkaminis", "app"
 )
+SAF_UI_DIR = os.path.join(APP_PKG_DIR, "ui")
+
+# [deep-audit-1047 B-02] The sweep used to walk `…/app/ui` ONLY — a hardcoded
+# single directory, so `webapp/AddToHomeSheet.kt` (which reads a user-picked
+# image with `readBytes()`) was never even looked at: the gate reported "the
+# picked document is bounded" while a second, identical hole sat one package
+# over. The domain is now every UI tree under the app package, derived rather
+# than listed, and C-SAF-1 asserts the sweep actually COVERED every file that
+# carries a site — shrinking the domain back to `ui/` is a red, not a pass.
+SAF_SCAN_DIRS = (
+    SAF_UI_DIR,
+    os.path.join(APP_PKG_DIR, "webapp"),
+)
+
+# The SUBJECT set is fixed (every UI tree that reads a user-picked document),
+# while SAF_SCAN_DIRS above is what the sweep actually walks. Keeping them
+# separate is the whole point of C-SAF-1: a domain that silently shrinks back to
+# one directory must be reported (candidates − scanned), which is impossible if
+# the candidate set is derived from the same variable being shrunk.
+SAF_SUBJECT_DIRS = SAF_SCAN_DIRS
 SAF_HELPER_REL = os.path.join(SAF_UI_DIR, "settings", "SafImportRead.kt")
 SAF_CONSUMERS = (
     os.path.join(SAF_UI_DIR, "settings", "ProviderListScreen.kt"),
@@ -464,13 +487,232 @@ def _saf_classify(text, idx, blocks):
     for open_idx, close_idx in enclosing:
         block = text[open_idx:close_idx]
         before = text[open_idx:idx]
-        if SAF_DECLARED_SIZE_RE.search(before) and SAF_CAP_CMP_RE.search(before):
-            return True, "declared-size precheck", snippet
+        # [deep-audit-1047 B-02] REMOVED: `declared-size precheck` used to be a
+        # "bounded" verdict. It cannot be one: `OpenableColumns.SIZE` is whatever
+        # the provider says (frequently null, occasionally a lie), and the site
+        # that relied on it then called `readBytes()` — nothing stopped the
+        # stream. `BackupSettingsScreen` is exactly that shape: a provider
+        # reporting "no size" sailed past the precheck and into the heap. The
+        # precheck is still a useful early reject, but the verdict must come from
+        # the stream, so only the cap-carrying forms below count.
         if SAF_CAPPED_COPY_RE.search(block) and SAF_CAP_CONST_RE.search(block):
             return True, "capped extractor", snippet
         if any(call in block for call in SAF_HELPER_CALLS):
             return True, "bounded helper", snippet
     return False, "", snippet
+
+
+# ── [deep-audit-1047 B-03] preview state must be keyed on its DATA SOURCE ──
+#
+# Same family as the two `REMEMBER_ANCHORS` above (a preview composable is
+# reused by slot, so unkeyed state survives a file switch), one generation on:
+# `PdfPreview`'s page state was keyed on `idx` ALONE while everything else in
+# the same composable (`error` / `pageCount` / `renderer`) was keyed on
+# `item.file`. Switching documents in the same preview slot therefore kept the
+# previous document's rendered page: the slot's `idx` is unchanged, so the
+# producer was not re-run AND its `if (value == null)` guard considered the
+# stale bitmap "loaded".
+#
+# The subject set is derived, not listed:
+#   * every `private fun <X>Preview(item: FileItem)` in the screen is a subject
+#     (a new preview surface is covered the day it lands);
+#   * every `produceState(` inside one is judged on its NAMED key arguments
+#     (`key1 = …` / `key2 = …` / positional) — at least one must name the data
+#     source the produced value derives from.
+# Deriving the anchors also retires the hardcoded pair above: a preview renamed
+# or added can no longer quietly drop out of the `remember` criterion either.
+
+PREVIEW_SIG_RE = re.compile(r"^\s*private fun ([A-Za-z0-9_]+)Preview\(item: FileItem\)\s*\{")
+PDF_KEY_SOURCES = ("item.file", "renderer", "item")
+PRODUCE_STATE_RE = re.compile(r"produceState\b")
+
+
+def _call_paren(text, idx):
+    """Index of the argument-list `(` for a call starting at [idx].
+
+    Generic type arguments may nest (`produceState<Pair<List<X>, Int>?>(`), so a
+    `[^>]*` pattern stops at the FIRST `>` and misses the call entirely. Walk
+    forward instead and only accept a `(` once every `<` is closed.
+    """
+    depth = 0
+    i = idx
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "<":
+            depth += 1
+        elif c == ">":
+            if depth:
+                depth -= 1
+        elif c == "(" and depth <= 0:
+            return i
+        elif c == ")":
+            return -1
+        elif c == "\n" and depth <= 0:
+            return -1
+        i += 1
+    return -1
+
+
+def _brace_blocks(text):
+    """[(open, close)] for every balanced `{…}`."""
+    pairs, stack = [], []
+    for i, c in enumerate(text):
+        if c == "{":
+            stack.append(i)
+        elif c == "}" and stack:
+            pairs.append((stack.pop(), i))
+    return pairs
+
+
+def derived_preview_anchors(code):
+    """[(signature, (start, end))] for every `private fun *Preview(item: …)`."""
+    out = []
+    for line_no, line in enumerate(code.split("\n")):
+        m = PREVIEW_SIG_RE.match(line)
+        if m:
+            out.append(("private fun %sPreview(item: FileItem) {" % m.group(1), line_no))
+    return out
+
+
+def _produce_keys(text, idx):
+    """The produceState call's own key arguments (named + positional)."""
+    start = _call_paren(text, idx)
+    if start < 0:
+        return []
+    n = len(text)
+    j, depth = start, 0
+    while j < n:
+        c = text[j]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    call = text[start + 1:j]
+    # Split on TOP-LEVEL commas only: `initialValue = renderer.cached(idx)`
+    # carries a comma-free call, but a nested lambda or `Pair(a, b)` would not.
+    parts, depth, cur = [], 0, ""
+    for ch in call:
+        if ch in "([{<":
+            depth += 1
+        elif ch in ")]}>":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        parts.append(cur)
+    keys = []
+    for part in parts:
+        arg = part.strip()
+        if not arg:
+            continue
+        # `initialValue = …` names the starting value, not a key.
+        if re.match(r"initialValue\s*=", arg):
+            continue
+        if re.match(r"[A-Za-z_][A-Za-z0-9_]*\s*=", arg):
+            arg = arg.split("=", 1)[1].strip()
+        if arg:
+            keys.append(arg)
+    return keys
+
+
+def blank_literals(text):
+    """Same text with the CONTENTS of string / char literals blanked.
+
+    `strip_comments` deliberately keeps literal contents (KDoc history notes
+    quote the old call shapes), but a Kotlin CHAR literal is written `'{'` —
+    exactly the brace a body-extractor counts. `JsonPreview`'s
+    `when (raw.firstOrNull()) { '{' -> … '[' -> … }` therefore unbalanced the
+    brace walk and made its own anchor look duplicated/missing (the criterion
+    reported "JsonPreview must exist exactly once" on a file where it does).
+    Newlines are preserved so line numbers stay meaningful.
+    """
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == '"':
+            if text[i:i + 3] == '"""':
+                j = text.find('"""', i + 3)
+                j = n if j < 0 else j + 3
+            else:
+                j = i + 1
+                while j < n:
+                    if text[j] == "\\":
+                        j += 2
+                        continue
+                    if text[j] in ('"', "\n"):
+                        j += 1
+                        break
+                    j += 1
+            seg = text[i:j]
+            out.append("".join(c if c == "\n" else " " for c in seg))
+            i = j
+            continue
+        if ch == "'":
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] in ("'", "\n"):
+                    j += 1
+                    break
+                j += 1
+            seg = text[i:j]
+            out.append("".join(c if c == "\n" else " " for c in seg))
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def check_preview_keys(src):
+    """(violations, sites) — C-PDF-KEY."""
+    violations = []
+    sites = 0
+    code = blank_literals(strip_comments(src))
+    for sig, line_no in derived_preview_anchors(code):
+        body = grab_body(code, sig)
+        if body is None:
+            violations.append(
+                "%s must exist exactly once (anchor missing or duplicated)" % sig
+            )
+            continue
+        sites += 1
+        offset = code.find(body)
+        start = offset if offset >= 0 else 0
+        pos = 0
+        while True:
+            m = PRODUCE_STATE_RE.search(body, pos)
+            if not m:
+                break
+            pos = m.end()
+            if _call_paren(body, m.end()) < 0:
+                continue          # a type reference (`produceState<…>`), not a call
+            keys = _produce_keys(body, m.end())
+            hit = ", ".join(keys) if keys else "(no key argument at all)"
+            if not any(src_name in k for k in keys for src_name in PDF_KEY_SOURCES):
+                violations.append(
+                    "%s holds a produceState whose key set misses its data source "
+                    "(key set = %s) — the slot is reused across files, so the "
+                    "produced value must be keyed on item.file / renderer / item"
+                    % (sig, hit)
+                )
+            _ = start
+    if sites == 0:
+        violations.append(
+            "no `private fun *Preview(item: FileItem)` found in FilePreviewScreen.kt — "
+            "the preview-key criterion lost its subject"
+        )
+    return violations, sites
 
 
 def _saf_short(rel):
@@ -580,20 +822,42 @@ def check_saf_imports(root):
                 "%s: the import cap must be passed explicitly (no MAX_*_BYTES token)" % short
             )
 
-    ui_root = os.path.join(root, SAF_UI_DIR)
-    if not os.path.isdir(ui_root):
-        rot.append("the ui/** tree is gone — the SAF sweep has nothing to look at")
-        return violations, rot, sites, notes
+    # [deep-audit-1047 B-02] C-SAF-1 — the domain is derived: every UI tree
+    # under the app package, and every file in it that carries a site must
+    # actually be scanned (a domain that shrank back to `ui/` alone is caught
+    # here, which is the blindspot this criterion exists for).
+    candidates = set()
+    for scan_dir in SAF_SUBJECT_DIRS:
+        abs_dir = os.path.join(root, scan_dir)
+        if not os.path.isdir(abs_dir):
+            rot.append("%s/ is gone — the SAF sweep lost part of its subject" % _saf_short(scan_dir))
+            continue
+        for base, _dirs, files in os.walk(abs_dir):
+            for name in sorted(files):
+                if not name.endswith(".kt"):
+                    continue
+                full = os.path.join(base, name)
+                with open(full, encoding="utf-8", errors="replace") as fh:
+                    if SAF_SITE in strip_comments(fh.read()):
+                        candidates.add(os.path.relpath(full, root))
+    if not candidates:
+        rot.append("no openInputStream( site found anywhere in the derived SAF domain — the sweep lost its subject")
 
     resolved = set()
     present_files = set()
-    for base, _dirs, files in os.walk(ui_root):
+    scanned_files = set()
+    for scan_dir in SAF_SCAN_DIRS:
+      ui_root = os.path.join(root, scan_dir)
+      if not os.path.isdir(ui_root):
+          continue
+      for base, _dirs, files in os.walk(ui_root):
         for name in sorted(files):
             if not name.endswith(".kt"):
                 continue
             full = os.path.join(base, name)
             rel = os.path.relpath(full, root)
             present_files.add(rel)
+            scanned_files.add(rel)
             with open(full, encoding="utf-8", errors="replace") as fh:
                 code = strip_comments(fh.read())
             blocks = None
@@ -624,6 +888,13 @@ def check_saf_imports(root):
                     "%s:%d openInputStream( reading the whole document with no bound — cap it "
                     "or register an exemption with a reason" % (_saf_short(rel), line)
                 )
+
+    for rel in sorted(candidates - scanned_files):
+        violations.append(
+            "%s carries an openInputStream( site but is outside the sweep domain — "
+            "derive the domain from the tree instead of listing directories"
+            % _saf_short(rel)
+        )
 
     for rel, needle in SAF_EXEMPTIONS:
         if (rel, needle) in resolved:
@@ -773,6 +1044,28 @@ _SAF_CHAT_EXTRA = _SAF_CHAT_BOTH + (
 )
 
 
+# [deep-audit-1047 B-02] A webapp screen (the half of the domain the old
+# hardcoded `…/app/ui` sweep never walked) and its pre-fix shape: a bounded
+# icon read and a copy-to-app-storage streaming site.
+_SAF_WEBAPP_BOUNDED = (
+    "package com.rikkaminis.app.webapp\n"
+    "\n"
+    "fun loadIcon(resolver: ContentResolver, uri: Uri): ByteArray? {\n"
+    "    return resolver.openInputStream(uri)?.use { input -> readAtMost(input, MAX_ICON_SOURCE_BYTES) }\n"
+    "}\n"
+    "\n"
+    "fun copyHtml(resolver: ContentResolver, uri: Uri, target: File) {\n"
+    "    resolver.openInputStream(uri)?.use { input ->\n"
+    "        target.outputStream().use { out -> input.copyTo(out) }\n"
+    "    }\n"
+    "}\n"
+)
+
+_SAF_WEBAPP_UNBOUNDED = _SAF_WEBAPP_BOUNDED.replace(
+    "    return resolver.openInputStream(uri)?.use { input -> readAtMost(input, MAX_ICON_SOURCE_BYTES) }\n",
+    "    return resolver.openInputStream(uri)?.use { it.readBytes() }\n",
+)
+
 def _saf_fixture(shape="fixed"):
     """A minimal ui/** tree carrying one shape per B-07 criterion."""
     root = tempfile.mkdtemp(prefix="safimport_")
@@ -781,8 +1074,11 @@ def _saf_fixture(shape="fixed"):
     provider = _SAF_PROVIDER_FIXED
     skills = _SAF_SKILLS_FIXED
     chat_src = _SAF_CHAT_BOTH
+    webapp_src = _SAF_WEBAPP_BOUNDED
 
-    if shape == "no_helper":
+    if shape == "webapp_unbounded":
+        webapp_src = _SAF_WEBAPP_UNBOUNDED
+    elif shape == "no_helper":
         helper = None
     elif shape == "helper_nocap":
         helper = _SAF_HELPER_NOCAP
@@ -804,6 +1100,10 @@ def _saf_fixture(shape="fixed"):
     _write(root, SAF_CONSUMERS[0], provider)
     _write(root, SAF_CONSUMERS[1], skills)
     _write(root, os.path.join(SAF_UI_DIR, "chat", "ChatPromptAndTools.kt"), chat_src)
+    # [deep-audit-1047 B-02] the second half of the derived domain: a webapp
+    # screen that reads a user-picked document. The pre-fix shape (a bare
+    # readBytes()) is its own arm below.
+    _write(root, os.path.join(APP_PKG_DIR, "webapp", "AddToHomeSheet.kt"), webapp_src)
     return root
 
 
@@ -835,6 +1135,17 @@ def selftest_saf_imports():
     arm("over-cap verdict swallowed", "must stay visible", shape="too_large_swallowed")
     arm("unregistered unbounded site", "with no bound", shape="sweep_extra_unregistered")
     arm("stale exemption", "no longer matches any site", shape="sweep_stale_exemption")
+    # [deep-audit-1047 B-02] C-SAF-2: the tree the old hardcoded domain never
+    # walked, in its pre-fix (unbounded) shape.
+    arm("webapp unbounded read", "with no bound", shape="webapp_unbounded")
+    # [deep-audit-1047 B-02] C-SAF-1: shrink the domain back to `ui/` and the
+    # webapp site must be reported as UNCOVERED, not silently skipped.
+    saved = globals()["SAF_SCAN_DIRS"]
+    try:
+        globals()["SAF_SCAN_DIRS"] = (SAF_UI_DIR,)
+        arm("domain shrunk back to ui/ only", "outside the sweep domain")
+    finally:
+        globals()["SAF_SCAN_DIRS"] = saved
     return failures
 
 
@@ -1031,6 +1342,21 @@ private fun MarkdownPreview(item: FileItem) {
     var content by remember(item.file) { mutableStateOf<String?>(null) }
     var error by remember(item.file) { mutableStateOf<String?>(null) }
 }
+
+@Composable
+private fun PdfPreview(item: FileItem) {
+    val renderer = remember(item.file) { Any() }
+    val page by produceState<Bitmap?>(initialValue = null, key1 = idx, key2 = item.file) {
+        value = null
+    }
+}
+
+@Composable
+private fun GalleryPreview(item: FileItem) {
+    val gallery by produceState<Bitmap?>(initialValue = null, item.file.absolutePath) {
+        value = null
+    }
+}
 """
 
 BAD_UNBOUNDED = GOOD_SRC.replace(
@@ -1115,6 +1441,19 @@ BAD_TEXT_KEYS_GONE = GOOD_SRC.replace(
 )
 
 
+
+# [deep-audit-1047 B-03] The shipped shape: the page producer keys on `idx`
+# alone, so the slot survives a file switch with the previous document's bitmap.
+BAD_PDF_KEY_ONLY_IDX = GOOD_SRC.replace(
+    "initialValue = null, key1 = idx, key2 = item.file) {",
+    "initialValue = null, key1 = idx) {",
+)
+assert BAD_PDF_KEY_ONLY_IDX != GOOD_SRC
+
+# [deep-audit-1047 B-03] The whole preview set vanished (renamed / removed) —
+# the derived criterion must fail closed instead of passing on zero subjects.
+BAD_NO_PREVIEW_ANCHORS = GOOD_SRC.replace("Preview(item: FileItem) {", "Pane(item: FileItem) {")
+assert BAD_NO_PREVIEW_ANCHORS != GOOD_SRC
 def selftest():
     failures = []
 
@@ -1163,6 +1502,13 @@ def selftest():
     bad_keys_gone = check(BAD_TEXT_KEYS_GONE)
     expect_trip("text keys-gone fixture", bad_keys_gone, "key its preview state on item.file")
 
+    # [deep-audit-1047 B-03] C-PDF-KEY arms.
+    expect_clean("compliant preview key set", check_preview_keys(GOOD_SRC)[0])
+    bad_pdf_idx = check(BAD_PDF_KEY_ONLY_IDX)
+    expect_trip("pdf produceState keyed on idx only", bad_pdf_idx, "misses its data source")
+    bad_no_preview = check(BAD_NO_PREVIEW_ANCHORS)
+    expect_trip("preview set gone (fail-closed)", bad_no_preview, "lost its subject")
+
     # [da1026-F] fail-closed: a body that lost its anchor must be red, not skipped.
     missing_anchor = check(GOOD_SRC.replace(REMEMBER_ANCHORS[0], "private fun TextPreviewX(item: FileItem) {"))
     expect_trip("missing TextPreview anchor (fail-closed)", missing_anchor, "anchor missing or duplicated")
@@ -1185,6 +1531,8 @@ def selftest():
     print("selftest markdown-unkeyed     -> %d violation(s)" % len(bad_md_unkeyed))
     print("selftest text-keys-gone       -> %d violation(s)" % len(bad_keys_gone))
     print("selftest anchors-fail-closed  -> 3 arms exercised")
+    print("selftest pdf-key-only-idx     -> %d violation(s)" % len(bad_pdf_idx))
+    print("selftest preview-set-gone     -> %d violation(s)" % len(bad_no_preview))
 
     # [deep-audit-1041 B-07] the second target's arms.
     failures.append("B-07 arms misbehaved" if selftest_log_share() else None)

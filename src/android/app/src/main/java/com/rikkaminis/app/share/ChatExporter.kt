@@ -298,19 +298,14 @@ object ChatExporter {
         partsJson
     }
 
-    /** Best-effort `(images, videos)` count by walking parts_json. */
+    /**
+     * Best-effort `(images, videos)` count by walking parts_json.
+     *
+     * The counting itself lives in [countPartsAttachments] — Android-free, so
+     * a plain JVM test can pin the classification.
+     */
     private fun countAttachments(partsJson: String): Pair<Int, Int> = try {
-        val arr = JSONArray(partsJson)
-        var img = 0
-        var vid = 0
-        for (i in 0 until arr.length()) {
-            val obj = arr.optJSONObject(i) ?: continue
-            when (obj.optString("type")) {
-                "image", "image_url" -> img += 1
-                "video", "video_url" -> vid += 1
-            }
-        }
-        img to vid
+        countPartsAttachments(JSONArray(partsJson))
     } catch (_: Throwable) {
         0 to 0
     }

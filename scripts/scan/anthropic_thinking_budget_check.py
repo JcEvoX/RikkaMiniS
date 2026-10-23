@@ -45,6 +45,22 @@ that validate the pairing.
       whitelist that simply omits it is NOT accepted: the exclusion must be
       visible where the header is built.
 
+[deep-audit-1047 A-01] The SAME pair contract, one provider over. OpenAI's
+builder wrote the CLAMPED value into the body but handed the RAW request value
+to the thinking injector, so the two readers disagree exactly when the clamp
+fires:
+
+  C-OAI-1  In OpenAIProvider.kt the value written as `max_tokens` /
+           `max_completion_tokens` must BE the 3rd argument of
+           `injectThinkingParams(...)` in the same function. Derived from the
+           write tokens: renaming the local changes nothing, reverting it to the
+           raw parameter is red.
+  C-OAI-2  In ThinkingRuleResolver.kt the `maxTokens < 2 → budget = 0` guard
+           must not sit inside a `maxTokens > 0` block. The provider floors the
+           wire value at 1 (`clampOutboundMaxTokens`), so a non-positive request
+           value means "no room", not "skip the clamp" — the old nesting let the
+           raw budget through against a wire max_tokens of 1.
+
 Deliberate strictness (fail-closed): C2 requires the guard to be a
 brace-bodied `if` in the same function as the write, and it requires the guard
 to be VISIBLE AT THE WRITE SITE rather than trusting `thinkingBudget()`'s
@@ -370,6 +386,113 @@ def check_source(src):
     return results
 
 
+# ── [deep-audit-1047 A-01] The OpenAI pair contract ─────────────────────────
+# Same defect class as C1 above, one provider over: `max_tokens` and
+# `thinking_budget` are defined RELATIVE to each other, and OpenAI's builder
+# wrote the CLAMPED value into the body while handing the RAW request value to
+# the thinking injector. Neither number is wrong alone; only the pair is illegal
+# — derivable only by looking at both readers, which is why no test of either
+# helper ever saw it.
+#
+# C-OAI-1 (same source): in OpenAIProvider.kt, the value written as
+#     `max_tokens` / `max_completion_tokens` must BE the 3rd argument of
+#     `injectThinkingParams(...)`. Derived from the write tokens, never from the
+#     local's name — renaming `safeMaxTokens` changes nothing, reverting it to
+#     the raw parameter is red.
+# C-OAI-2 (guard externalized): the `maxTokens < 2 → budget = 0` guard in
+#     ThinkingRuleResolver.kt must NOT sit inside a `maxTokens > 0` block. The
+#     provider floors the wire value at 1 (clampOutboundMaxTokens), so a
+#     non-positive request value means "no room", not "skip the clamp".
+REL_OAI = os.path.join(
+    "src", "android", "app", "src", "main", "java", "com", "rikkaminis", "app",
+    "provider", "openai", "OpenAIProvider.kt")
+REL_RESOLVER = os.path.join(
+    "src", "android", "app", "src", "main", "java", "com", "rikkaminis", "app",
+    "provider", "thinking", "ThinkingRuleResolver.kt")
+OAI_ROT_MARK = "class OpenAIProvider"
+RESOLVER_ROT_MARK = "object ThinkingRuleResolver"
+
+PUT_ANY_MAX_TOKENS = re.compile(r"\bput\(\s*\"(?:max_tokens|max_completion_tokens)\"")
+INJECT_CALL = re.compile(r"(?<![\w.])injectThinkingParams\s*\(")
+MAX_TOKENS_GT_ZERO = re.compile(r"\bmaxTokens\s*>\s*0\b")
+ZERO_ASSIGN = re.compile(r"(?<![=!<>])[A-Za-z_]\w*\s*=\s*0\b")
+LT_TWO = re.compile(r"<\s*2\b")
+
+
+def check_openai_pair(src):
+    """C-OAI-1 — every max_tokens writer must feed the thinking injector.
+
+    Derived: the write VALUE tokens come from the `put(...)` calls themselves,
+    the 3rd argument from the `injectThinkingParams(...)` call in the SAME
+    function. No member name, no line number."""
+    stripped = strip_comments(src)
+    violations = []
+    writes = 0
+    for name, _start, body in iter_functions(stripped):
+        wcalls = find_calls(body, PUT_ANY_MAX_TOKENS)
+        if not wcalls:
+            continue
+        writes += len(wcalls)
+        injects = find_calls(body, INJECT_CALL)
+        if not injects:
+            violations.append(
+                "%s writes max_tokens but never calls injectThinkingParams — the thinking "
+                "budget cannot be derived from the value that goes on the wire" % name)
+            continue
+        for _pos, wargs in wcalls:
+            wrote = wargs[-1].strip() if len(wargs) > 1 else ""
+            for _ipos, iargs in injects:
+                third = iargs[2].strip() if len(iargs) > 2 else ""
+                if not third:
+                    violations.append(
+                        "%s: injectThinkingParams has no max-tokens argument — the budget "
+                        "is computed without knowing the wire value" % name)
+                elif norm(third) != norm(wrote):
+                    violations.append(
+                        "%s: thinking budget derives from `%s` but max_tokens writes `%s` — "
+                        "two readers of two different numbers (a budget above the wire "
+                        "max_tokens is a deterministic 400)" % (name, third, wrote))
+    if writes == 0:
+        violations.append(
+            "no max_tokens write site found in OpenAIProvider.kt — refusing to report green "
+            "(the serialization shape moved; update this criterion deliberately)")
+    # One message per distinct (writer, wire value vs budget source) pair: the two
+    # `put` spellings usually share one injector call.
+    return list(dict.fromkeys(violations))
+
+
+def check_resolver_guard(src):
+    """C-OAI-2 — the `maxTokens < 2` guard must not nest inside `maxTokens > 0`.
+
+    Derived by brace depth: for every `if` whose condition tests `< 2` and whose
+    body zeroes a variable, no ENCLOSING `if` may test `maxTokens > 0`."""
+    stripped = strip_comments(src)
+    violations = []
+    guards = 0
+    for m in IF_RE.finditer(stripped):
+        paren_at = stripped.find("(", m.end() - 1)
+        cond, after = paren_body(stripped, paren_at)
+        brace_at = stripped.find("{", after - 1)
+        if brace_at < 0:
+            continue
+        body, _end = brace_body(stripped, brace_at)
+        if not LT_TWO.search(cond) or not ZERO_ASSIGN.search(body):
+            continue
+        guards += 1
+        line = stripped[:m.start()].count("\n") + 1
+        for outer in enclosing_ifs(stripped, m.start()):
+            if MAX_TOKENS_GT_ZERO.search(outer):
+                violations.append(
+                    "ThinkingRuleResolver.kt:%d `maxTokens < 2` guard nests inside "
+                    "`%s` — a non-positive request value then skips the clamp entirely "
+                    "while the provider floors the wire value at 1, so the raw budget "
+                    "reaches the wire above max_tokens" % (line, re.sub(r"\s+", " ", outer).strip()))
+    if guards == 0:
+        violations.append(
+            "ThinkingRuleResolver.kt: no `< 2 → 0` budget guard found — refusing to report "
+            "green (the clamp moved; update this criterion deliberately)")
+    return violations
+
 # ── selftest: one arm per criterion, each red exactly once ──────────────────
 
 GREEN_BODY = '''
@@ -537,6 +660,115 @@ def selftest():
     ):
         if mutated == base:
             fails.append("arm '%s' did not apply (string replace missed)" % label)
+    fails.extend(_selftest_oai())
+    return fails
+
+
+# ── C-OAI-1 / C-OAI-2 arms ──────────────────────────────────────────────────
+OAI_GREEN = '''
+class OpenAIProvider {
+    private fun buildRequestBody(messages: List<Int>, maxTokens: Int): JSONObject {
+        val body = JSONObject()
+        val safeMaxTokens = clampOutboundMaxTokens(maxTokens, effectiveMaxOutputTokens(model))
+        if (usesMaxCompletionTokens) {
+            body.put("max_completion_tokens", safeMaxTokens)
+        } else {
+            body.put("max_tokens", safeMaxTokens)
+        }
+        var echoPolicy: ReasoningEchoPolicy? = null
+        if (!isMistral) {
+            echoPolicy = injectThinkingParams(body, thinkingLevel, safeMaxTokens)
+        }
+        return body
+    }
+}
+'''
+
+# PRE shape (88ef9b27): the injector gets the RAW request value.
+OAI_PRE = OAI_GREEN.replace(
+    "injectThinkingParams(body, thinkingLevel, safeMaxTokens)",
+    "injectThinkingParams(body, thinkingLevel, maxTokens)",
+)
+
+# No injector call at all in the writing function.
+OAI_NO_INJECT = OAI_GREEN.replace(
+    "            echoPolicy = injectThinkingParams(body, thinkingLevel, safeMaxTokens)\n",
+    "",
+)
+
+# Only one of the two writes is wired to the clamped value.
+OAI_HALF = OAI_GREEN.replace(
+    'body.put("max_completion_tokens", safeMaxTokens)',
+    'body.put("max_completion_tokens", maxTokens)',
+)
+
+RESOLVER_GREEN = '''
+object ThinkingRuleResolver {
+    private fun emit(body: JSONObject, ctx: ThinkingResolveContext) {
+        val enabled = true
+        var budget = 32768
+        if (budget > 0) {
+            if (ctx.maxTokens < 2) {
+                budget = 0
+            } else {
+                val margin = maxOf(2048, ctx.maxTokens / 8)
+                val ceiling = maxOf(1, minOf(ctx.maxTokens - margin, ctx.maxTokens - 1))
+                if (budget >= ceiling) budget = ceiling
+            }
+        }
+        body.put("enable_thinking", enabled)
+        if (budget > 0) body.put("thinking_budget", budget)
+    }
+}
+'''
+
+# PRE shape: guard nested inside a `maxTokens > 0` block.
+RESOLVER_PRE = RESOLVER_GREEN.replace(
+    "if (budget > 0) {",
+    "if (budget > 0 && ctx.maxTokens > 0) {",
+)
+
+# The guard is gone: nothing zeroes the budget for a non-positive maxTokens.
+RESOLVER_NO_GUARD = RESOLVER_GREEN.replace(
+    '''            if (ctx.maxTokens < 2) {
+                budget = 0
+            } else {''',
+    '''            if (false) {
+                budget = 0
+            } else {''',
+)
+
+
+def _selftest_oai():
+    fails = []
+    # (label, criterion, source, expected-to-be-red) — each fixture is shaped for
+    # ONE criterion, so the arms stay independent (an OpenAI fixture is not a
+    # resolver and must not be graded by C-OAI-2).
+    oai_arms = [
+        ("openai pair wired to the clamped value", check_openai_pair, OAI_GREEN, False),
+        ("baseline shape: injector gets the raw value", check_openai_pair, OAI_PRE, True),
+        ("no injector call in the max_tokens writer", check_openai_pair, OAI_NO_INJECT, True),
+        ("only one of two max_tokens writes is wired", check_openai_pair, OAI_HALF, True),
+        ("resolver guard outside `maxTokens > 0`", check_resolver_guard, RESOLVER_GREEN, False),
+        ("resolver guard nested inside `maxTokens > 0`", check_resolver_guard, RESOLVER_PRE, True),
+        ("resolver guard removed entirely", check_resolver_guard, RESOLVER_NO_GUARD, True),
+    ]
+    for label, fn, src, expect_red in oai_arms:
+        got = bool(fn(src))
+        if got != expect_red:
+            fails.append("arm '%s': expected %s, got %s" % (
+                label,
+                "RED" if expect_red else "GREEN",
+                "RED" if got else "GREEN"))
+    for label, mutated, base in (
+        ("OAI_PRE", OAI_PRE, OAI_GREEN),
+        ("OAI_NO_INJECT", OAI_NO_INJECT, OAI_GREEN),
+        ("OAI_HALF", OAI_HALF, OAI_GREEN),
+        ("RESOLVER_PRE", RESOLVER_PRE, RESOLVER_GREEN),
+        ("RESOLVER_NO_GUARD", RESOLVER_NO_GUARD, RESOLVER_GREEN),
+    ):
+        if mutated == base:
+            fails.append("arm '%s' did not apply (string replace missed)" % label)
     return fails
 
 
@@ -563,6 +795,30 @@ def main():
         return 2
 
     results = check_source(src)
+    # [deep-audit-1047 A-01] Two more readers of the same pair contract, in the
+    # files the Anthropic-shaped criteria above cannot see. Fail-closed on a
+    # missing file: a moved path must read as ROT, never as green.
+    for rel, mark in ((REL_OAI, OAI_ROT_MARK), (REL_RESOLVER, RESOLVER_ROT_MARK)):
+        extra_path = os.path.join(root, rel)
+        if not os.path.isfile(extra_path):
+            print("FAIL %s not found under root %s" % (rel, root))
+            return 2
+        extra = open(extra_path, encoding="utf-8").read()
+        if mark not in extra:
+            print("FAIL %s does not look like the expected source (no '%s')" % (rel, mark))
+            return 2
+        if rel == REL_OAI:
+            oai_v = check_openai_pair(extra)
+            results.append((
+                "C-OAI-1 max_tokens and the thinking budget read the same value",
+                not oai_v, " / ".join(oai_v),
+            ))
+        else:
+            res_v = check_resolver_guard(extra)
+            results.append((
+                "C-OAI-2 the `maxTokens < 2` guard is not inside a `> 0` block",
+                not res_v, " / ".join(res_v),
+            ))
     failed = [(c, d) for c, ok, d in results if not ok]
     for crit, ok, detail in results:
         if ok:

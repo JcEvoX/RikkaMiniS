@@ -23,6 +23,7 @@ import com.rikkaminis.app.provider.extractHttpErrorMessage
 import com.rikkaminis.app.provider.safeOptString
 import com.rikkaminis.app.provider.sanitizeToolPairing
 import com.rikkaminis.app.provider.hasWirePayload
+import com.rikkaminis.app.provider.LegacyMediaPlan
 import com.rikkaminis.app.provider.clampOutboundMaxTokens
 import com.rikkaminis.app.provider.clampOutboundTemperature
 import com.rikkaminis.app.provider.StreamTimeouts
@@ -1964,7 +1965,16 @@ class OpenAIProvider constructor(
         // filled in by injectThinkingParams below and consumed by the message loop.
         var echoPolicy: ReasoningEchoPolicy? = null
         if (!isMistral) {
-            echoPolicy = injectThinkingParams(body, thinkingLevel, maxTokens)
+            // [deep-audit-1047 A-01] Feed the CLAMPED value, not the raw request
+            // value. `thinking_budget` is defined relative to `max_tokens`
+            // (`budget < max_tokens`, a deterministic 400), and the field two
+            // lines above writes `safeMaxTokens`. The resolver derived its
+            // ceiling from the raw number instead, so an out-of-band caller
+            // above the model ceiling (sub-agent budget, synthesized request —
+            // exactly the callers the clamp defends) emitted e.g.
+            // max_tokens=8192 with thinking_budget=32768. Same pair contract as
+            // AnthropicProvider's `cappedMaxTokens`, which was fixed in 1046.
+            echoPolicy = injectThinkingParams(body, thinkingLevel, safeMaxTokens)
         }
 
         // Tools
@@ -2222,29 +2232,42 @@ class OpenAIProvider constructor(
 
                 val attachTopLevelImages =
                     index == lastUserIndex && msg.role == LLMMessage.Role.USER && imageParts.isNotEmpty()
-                if (attachTopLevelImages || msg.audioParts.isNotEmpty()) {
+                // [deep-audit-1047 A-03] Per-message images ride the SAME branch as
+                // the request-level list and the message's own audio. The payload
+                // predicate (`hasWirePayload`) already declares
+                // `imageParts.isNotEmpty()` a reason to keep a turn — but until now
+                // no serializer ever read `msg.imageParts`, so a text-less turn that
+                // only the predicate let through went out as `content: ""` with the
+                // bytes dropped. Mirrors the audio arm, which has always been read
+                // from the message. Order (images → audio → text) is the order the
+                // wire sees for the top-level arm.
+                val legacyImages = (if (attachTopLevelImages) imageParts else emptyList()) + msg.imageParts
+                val legacyImageCount = LegacyMediaPlan.imageCount(
+                    attachRequestImages = attachTopLevelImages,
+                    requestImageCount = imageParts.size,
+                    messageImageCount = msg.imageParts.size,
+                )
+                if (legacyImageCount > 0 || LegacyMediaPlan.hasMedia(0, msg.audioParts.size)) {
                     val contentArray = JSONArray()
-                    if (attachTopLevelImages) {
-                        for (part in imageParts) {
-                            if (supportsImages) {
-                                // T-imgsize: provider-boundary backstop.
-                                val safeBytes = com.rikkaminis.app.provider.ImageBudget.compressUnderBudget(part.data)
-                                val safeMime = if (safeBytes === part.data) part.mimeType else "image/jpeg"
-                                val b64 = Base64.encodeToString(safeBytes, Base64.NO_WRAP)
-                                val imageUrl = JSONObject()
-                                imageUrl.put("url", "data:$safeMime;base64,$b64")
-                                contentArray.put(JSONObject().apply {
-                                    put("type", "image_url")
-                                    put("image_url", imageUrl)
-                                })
-                            } else {
-                                // T264: target model has no vision modality —
-                                // emit text placeholder (iOS-parity literal).
-                                contentArray.put(JSONObject().apply {
-                                    put("type", "text")
-                                    put("text", VISION_UNSUPPORTED_PLACEHOLDER)
-                                })
-                            }
+                    for (part in legacyImages) {
+                        if (supportsImages) {
+                            // T-imgsize: provider-boundary backstop.
+                            val safeBytes = com.rikkaminis.app.provider.ImageBudget.compressUnderBudget(part.data)
+                            val safeMime = if (safeBytes === part.data) part.mimeType else "image/jpeg"
+                            val b64 = Base64.encodeToString(safeBytes, Base64.NO_WRAP)
+                            val imageUrl = JSONObject()
+                            imageUrl.put("url", "data:$safeMime;base64,$b64")
+                            contentArray.put(JSONObject().apply {
+                                put("type", "image_url")
+                                put("image_url", imageUrl)
+                            })
+                        } else {
+                            // T264: target model has no vision modality —
+                            // emit text placeholder (iOS-parity literal).
+                            contentArray.put(JSONObject().apply {
+                                put("type", "text")
+                                put("text", VISION_UNSUPPORTED_PLACEHOLDER)
+                            })
                         }
                     }
                     // [GH#67] Official Chat Completions audio-input shape,
@@ -3008,6 +3031,14 @@ class OpenAIProvider constructor(
         // the last user message in the list.
         val lastUserIndex = sanitizedMessages.indexOfLast { it.role == LLMMessage.Role.USER }
         for ((index, msg) in sanitizedMessages.withIndex()) {
+            // [deep-audit-1047 A-03] One flag for the whole legacy media path: the
+            // request-level images (last user turn only — unchanged contract), the
+            // message's own image parts, and its audio all share ONE branch. The
+            // last two used to be mutually exclusive `else if` arms.
+            val attachTopLevelImages =
+                index == lastUserIndex && msg.role == LLMMessage.Role.USER && imageParts.isNotEmpty()
+            val legacyMediaAttached =
+                attachTopLevelImages || msg.imageParts.isNotEmpty() || msg.audioParts.isNotEmpty()
             if (msg.contentParts.isNotEmpty()) {
                 when (msg.role) {
                     LLMMessage.Role.ASSISTANT -> {
@@ -3152,7 +3183,7 @@ class OpenAIProvider constructor(
                         })
                     }
                 }
-            } else if (imageParts.isNotEmpty() && msg.role == LLMMessage.Role.USER && index == lastUserIndex) {
+            } else if (legacyMediaAttached) {
                 // [da1017-01 / ISSUE-01] Legacy (non-contentParts) message whose
                 // images arrive in the top-level `imageParts` argument — the
                 // `minis-model-use` CLI path, and the analogue of the
@@ -3163,31 +3194,40 @@ class OpenAIProvider constructor(
                 // Mirrors the Chat flavour: images first, then the message text
                 // as an input_text part (an empty one is skipped, per GH#67's
                 // note about servers that reject it).
-                val contentArray = OpenAIToolResultImages.responsesUserContent(
-                    entries = imageParts.map {
-                        OpenAIToolResultImages.Entry(caption = "", bytes = it.data, mimeType = it.mimeType)
-                    },
-                    supportsImages = supportsImages,
-                    compress = { com.rikkaminis.app.provider.ImageBudget.compressUnderBudget(it) },
-                    encodeBase64 = { Base64.encodeToString(it, Base64.NO_WRAP) },
-                )
-                if (msg.content.isNotEmpty()) {
-                    contentArray.put(JSONObject().apply {
-                        put("type", "input_text")
-                        put("text", msg.content)
-                    })
-                }
-                input.put(JSONObject().apply {
-                    put("role", "user")
-                    put("content", contentArray)
-                })
-            } else if (msg.audioParts.isNotEmpty()) {
-                // [GH#67] Legacy (non-contentParts) message carrying audio —
-                // the minis-model-use path. The Responses API keeps the SAME
-                // nested input_audio shape as Chat Completions ({data,
-                // format}), unlike input_image which flattens image_url to a
-                // string. Text rides along as input_text.
+                //
+                // [GH#67] The SAME branch carries `msg.audioParts` — the
+                // Responses API keeps the nested input_audio shape as Chat
+                // Completions ({data, format}), unlike input_image which
+                // flattens image_url to a string.
+                //
+                // [deep-audit-1047 A-03] These used to be two MUTUALLY EXCLUSIVE
+                // `else if` branches: a turn carrying both request-level images
+                // and message-level audio hit the image arm and every audio part
+                // was dropped silently. Chat Completions has always treated the
+                // two carriers as one list
+                // (`if (attachTopLevelImages || msg.audioParts.isNotEmpty())`);
+                // this is that shape — order images → audio → text included. The
+                // image arm also reads `msg.imageParts` for the same reason the
+                // Chat builder does (see hasWirePayload).
+                val legacyImages =
+                    (if (attachTopLevelImages) imageParts else emptyList()) + msg.imageParts
                 val contentArray = JSONArray()
+                val legacyImageCount = LegacyMediaPlan.imageCount(
+                    attachRequestImages = attachTopLevelImages,
+                    requestImageCount = imageParts.size,
+                    messageImageCount = msg.imageParts.size,
+                )
+                if (legacyImageCount > 0 || LegacyMediaPlan.hasMedia(0, msg.audioParts.size)) {
+                    val imageArray = OpenAIToolResultImages.responsesUserContent(
+                        entries = legacyImages.map {
+                            OpenAIToolResultImages.Entry(caption = "", bytes = it.data, mimeType = it.mimeType)
+                        },
+                        supportsImages = supportsImages,
+                        compress = { com.rikkaminis.app.provider.ImageBudget.compressUnderBudget(it) },
+                        encodeBase64 = { Base64.encodeToString(it, Base64.NO_WRAP) },
+                    )
+                    for (i in 0 until imageArray.length()) contentArray.put(imageArray.get(i))
+                }
                 for (audio in msg.audioParts) {
                     contentArray.put(JSONObject().apply {
                         put("type", "input_audio")

@@ -728,11 +728,18 @@ object ThinkingRuleResolver {
                     // top of apply(); kept for exhaustiveness.
                     ThinkingLevel.AUTO -> 0
                 }
-                if (budget > 0 && ctx.maxTokens > 0) {
+                if (budget > 0) {
                     // [T-android-qwen3-thinking-budget-max-tokens-constraint] absorbed
                     // upstream (a5a0de20): maxTokens<2 leaves no room for any positive
                     // budget strictly below max, so DROP the field rather than emit an
                     // invalid value.
+                    // [deep-audit-1047 A-01] The `< 2` guard used to sit inside a
+                    // `ctx.maxTokens > 0` condition, so `maxTokens <= 0` skipped the
+                    // whole clamp and the RAW budget reached the wire. The provider
+                    // writes `clampOutboundMaxTokens(maxTokens, …)`, which floors at 1
+                    // — i.e. the wire always carries a positive `max_tokens`, and a
+                    // non-positive request value now means "no room", not "no clamp".
+                    // Guards are ordered so the reachable formula below is untouched.
                     if (ctx.maxTokens < 2) {
                         budget = 0
                     } else {

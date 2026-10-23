@@ -299,6 +299,244 @@ def check_enriched_dispatch(root):
     return v
 
 
+# ── [dv27-A02] the request body must reach the provider WHOLE on both paths ──
+# `buildRequestJson` wrote `thinking_level` for every non-OFF turn and the
+# STREAMING path parsed it, but `executeRun` — the non-streaming path — never
+# read the key at all. The worker then fell back to `LLMProvider.sendMessage`'s
+# default (`ThinkingLevel.OFF`), so every non-streamed offloaded request asked
+# the vendor NOT to reason: silently, and on exactly the families where the
+# level decides whether the model reasons at all (DeepSeek / Qwen3 / Claude 3.7+).
+#
+# Two criteria, both DERIVED from the tree, never from a hand-written field list:
+#   C1 — no orphan request key. Every request-level key derived from
+#        `buildRequestJson`'s write points must be read SOMEWHERE in the worker
+#        service. A third field added to the dispatcher and consumed by nobody
+#        fails here.
+#   C2 — the level reaches the provider call, and both paths hand over the same
+#        argument surface. At `executeRun`'s `provider.sendMessage(` and
+#        `executeStreamingRun`'s `provider.streamMessage(` the named-argument
+#        SETS must be equal, and the `thinkingLevel =` value must trace to a
+#        read of `thinking_level` in the same function body (one helper hop
+#        allowed). A constant (`thinkingLevel = ThinkingLevel.OFF`) has no such
+#        trace and fails; so does a path that drops an argument its sibling
+#        passes.
+#
+# Scope note: C1 is a *service-wide* read check on purpose. Three derived keys
+# are legitimately single-path — `input_json` / `passthrough_request` /
+# `output_ext` exist only for the non-streaming image & raw-passthrough routes,
+# and `streaming` decides the route before either body runs — so a literal
+# "consumed in BOTH bodies" rule would be red on a clean tree, i.e. a gate that
+# cannot be trusted. The per-path half of the contract is enforced by C2 at the
+# call sites, where a drop is unambiguous.
+SERVICE_REL = CALLER_RELS[0]
+EXEC_DISPATCH_REL = SRC + "/ModelExecutionDispatcher.kt"
+# (entry point, provider method) — the pair that must agree.
+EXEC_PATHS = (("executeRun", "sendMessage"), ("executeStreamingRun", "streamMessage"))
+LEVEL_KEY = "thinking_level"
+LEVEL_ARG = "thinkingLevel"
+READ_CALLS = (
+    "optString", "optInt", "optBoolean", "optLong", "optDouble",
+    "optJSONObject", "optJSONArray", "opt",
+    "has", "getString", "getInt", "getBoolean", "getLong", "getDouble",
+    "getJSONObject", "getJSONArray",
+)
+KEY_READ_RE = re.compile(
+    r'\b(?:%s)\(\s*"([A-Za-z_][A-Za-z0-9_]*)"' % "|".join(READ_CALLS)
+)
+LEVEL_READ_RE = re.compile(r'\b(?:%s)\(\s*"%s"' % ("|".join(READ_CALLS), LEVEL_KEY))
+NESTED_BUILDER_RE = re.compile(r"JSON(?:Object|Array)\(\)\s*\.apply\s*\{")
+IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+def _brace_end(text, open_idx):
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+def _dispatch_request_keys(src):
+    """Request-level keys written by `buildRequestJson`, or None (fail-closed).
+
+    A key counts as request-level when its `put("…"` sits inside the function's
+    body but NOT inside a nested `JSONObject()/JSONArray().apply { }` builder —
+    the nested ones are message / content-part / tool-schema fields, not values
+    the worker reads off the request.
+    """
+    body = fun_body(src, "buildRequestJson")
+    if body is None:
+        return None
+    regions = []
+    for m in NESTED_BUILDER_RE.finditer(body):
+        b = m.end() - 1
+        e = _brace_end(body, b)
+        if e > b:
+            regions.append((b, e))
+    outer = None
+    for b, e in regions:
+        if all(b <= b2 and e2 <= e for b2, e2 in regions):
+            if outer is None or (b <= outer[0] and e >= outer[1]):
+                outer = (b, e)
+    nested = [r for r in regions if r != outer]
+    keys = []
+    for m in re.finditer(r'\bput\(\s*"([A-Za-z_][A-Za-z0-9_]*)"', body):
+        pos = m.start()
+        if any(b < pos < e for b, e in nested):
+            continue
+        if m.group(1) not in keys:
+            keys.append(m.group(1))
+    return keys
+
+def _named_args(args):
+    """Top-level `name = value` pairs of a call's argument text."""
+    out = {}
+    parts, depth, cur = [], 0, []
+    for c in args:
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        if c == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+            continue
+        cur.append(c)
+    if "".join(cur).strip():
+        parts.append("".join(cur))
+    for part in parts:
+        m = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*(.+?)\s*$", part, re.S)
+        if m:
+            out[m.group(1)] = m.group(2).strip()
+    return out
+
+def _traces_to_level(value, body, svc):
+    """True when [value] is, or is bound in [body] to, a read of `thinking_level`."""
+    if LEVEL_READ_RE.search(value):
+        return True
+    ident = value.strip()
+    if not IDENT_RE.match(ident):
+        return False
+    m = re.search(r"\bval\s+%s\b[^=\n]*=\s*([^\n]+)" % re.escape(ident), body)
+    if not m:
+        return False
+    rhs = m.group(1)
+    if LEVEL_READ_RE.search(rhs):
+        return True
+    # one helper hop: `val x = helper(…)` where helper() reads the key
+    for hm in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", rhs):
+        helper = fun_body(svc, hm.group(1))
+        if helper and LEVEL_READ_RE.search(helper):
+            return True
+    return False
+
+def check_service_wiring(root):
+    """[dv27-A02] C1 (no orphan key) + C2 (level reaches both provider calls)."""
+    v = []
+    svc_path = os.path.join(root, SERVICE_REL)
+    svc_name = os.path.basename(SERVICE_REL)
+    if not os.path.exists(svc_path):
+        return ["%s: NOT FOUND at %s" % (svc_name, svc_path)]
+    svc = code_only(open(svc_path, encoding="utf-8").read())
+    disp_path = os.path.join(root, EXEC_DISPATCH_REL)
+    if not os.path.exists(disp_path):
+        # The dialect fixtures model only the protocol files; a tree that ships
+        # the real service but no dispatcher is a different (bigger) breakage.
+        if "fun executeRun(" in svc:
+            return [
+                "%s: NOT FOUND at %s — the request body cannot be derived, so the "
+                "worker's coverage of it cannot be judged (fail-closed)"
+                % (os.path.basename(EXEC_DISPATCH_REL), disp_path)
+            ]
+        return v
+    disp = code_only(open(disp_path, encoding="utf-8").read())
+    keys = _dispatch_request_keys(disp)
+    if keys is None:
+        return [
+            "%s: `fun buildRequestJson(` could not be delimited — fail-closed"
+            % os.path.basename(EXEC_DISPATCH_REL)
+        ]
+    if not keys:
+        return [
+            "%s: no request-level `put(\"…\"` could be derived — fail-closed "
+            "(the writer was renamed or its body changed shape)"
+            % os.path.basename(EXEC_DISPATCH_REL)
+        ]
+
+    # ── C1: every key the dispatcher writes is read by the worker ──
+    read_keys = set(KEY_READ_RE.findall(svc))
+    for k in keys:
+        if k not in read_keys:
+            v.append(
+                "%s: the dispatcher writes '%s' but no worker site reads it — the "
+                "field dies at the process boundary" % (svc_name, k)
+            )
+
+    # ── C2: the level reaches BOTH provider calls, bound to its read ──
+    surfaces = {}
+    for entry, callee in EXEC_PATHS:
+        body = fun_body(svc, entry)
+        if body is None:
+            v.append(
+                "%s: `fun %s(` could not be delimited — fail-closed (entry renamed "
+                "or moved?)" % (svc_name, entry)
+            )
+            continue
+        token = "provider.%s(" % callee
+        idx = body.find(token)
+        if idx < 0:
+            v.append(
+                "%s: `%s` makes no '%s' call — fail-closed"
+                % (svc_name, entry, token)
+            )
+            continue
+        args = _call_args(body, idx + len(token) - 1)
+        if args is None:
+            v.append(
+                "%s: the '%s' call in `%s` could not be delimited — fail-closed"
+                % (svc_name, token, entry)
+            )
+            continue
+        named = _named_args(args)
+        surfaces[entry] = (set(named), token)
+        if LEVEL_ARG not in named:
+            v.append(
+                "%s: `%s` calls %s without `%s =` — the level the dispatcher "
+                "serialized is dropped and the provider falls back to its OFF "
+                "default (reasoning silently disabled)"
+                % (svc_name, entry, token.rstrip("("), LEVEL_ARG)
+            )
+            continue
+        if not _traces_to_level(named[LEVEL_ARG], body, svc):
+            v.append(
+                "%s: `%s` passes `%s = %s` — that value is not derived from reading "
+                "'%s' in this function body (constant or re-typed literal)"
+                % (svc_name, entry, LEVEL_ARG, named[LEVEL_ARG], LEVEL_KEY)
+            )
+
+    # ── C2b: the two paths hand the provider the same argument surface ──
+    if len(surfaces) == 2:
+        (a_name, (a_args, a_tok)) , (b_name, (b_args, b_tok)) = list(surfaces.items())
+        only_a = sorted(a_args - b_args)
+        only_b = sorted(b_args - a_args)
+        if only_a:
+            v.append(
+                "%s: `%s` passes %s to %s but `%s` does not — one path drops an "
+                "argument the other hands over"
+                % (svc_name, a_name, ", ".join("`%s =`" % x for x in only_a),
+                   a_tok.rstrip("("), b_name)
+            )
+        if only_b:
+            v.append(
+                "%s: `%s` passes %s to %s but `%s` does not — one path drops an "
+                "argument the other hands over"
+                % (svc_name, b_name, ", ".join("`%s =`" % x for x in only_b),
+                   b_tok.rstrip("("), a_name)
+            )
+    return v
+
 def code_only(text):
     """Text with comments removed — presence checks must not be satisfiable
     from prose. Block comments (KDoc) first, then line comments, keeping line
@@ -616,6 +854,67 @@ GOOD_CALLER_TWO_MATCHERS = GOOD_CALLER.replace(
 )
 
 
+# ── [dv27-A02] fixtures: the request body must reach the provider whole ──
+# The delegate block keeps these fixtures legal for the dialect checks above, so
+# a wiring arm isolates check_service_wiring() instead of tripping four gates.
+WIRING_DELEGATES = """\
+    private fun parseExtraHeaders(inputJson: String, warnings: MutableList<String>): Map<String, String> =
+        ModelUseProtocol.parseExtraHeaders(inputJson, warnings)
+
+    private fun parseCustomEndpointPath(inputJson: String): String? =
+        ModelUseProtocol.parseCustomEndpointPath(inputJson)
+
+    private fun applyImagePassthrough(inputJson: String): Map<String, Any?> =
+        ModelUseProtocol.parseImagePassthrough(inputJson).body
+"""
+
+def wiring_service(parse_line=("        val thinkingLevel = "
+                               "thinkingLevelFromWire(req.optString(\"thinking_level\", \"\"))\n"),
+                   run_level="thinkingLevel",
+                   run_drop_max_tokens=False):
+    """A worker service whose two execution paths mirror the shipped shape."""
+    run_mt = "" if run_drop_max_tokens else "            maxTokens = maxTokens,\n"
+    return (
+        "package p\nclass ModelExecutionService {\n"
+        + WIRING_DELEGATES
+        + "\n    private fun executeRun(req: JSONObject): String {\n"
+        + "        val messages = req.optJSONArray(\"messages\")\n"
+        + "        val maxTokens = req.optInt(\"max_tokens\", 4096)\n"
+        + parse_line
+        + "        provider.sendMessage(\n"
+        + "            messages = messages,\n"
+        + run_mt
+        + "            thinkingLevel = %s,\n" % run_level
+        + "        )\n        return \"\"\n    }\n"
+        + "\n    private fun executeStreamingRun(req: JSONObject): String {\n"
+        + "        val messages = req.optJSONArray(\"messages\")\n"
+        + "        val maxTokens = req.optInt(\"max_tokens\", 4096)\n"
+        + "        val thinkingLevel = "
+        + "thinkingLevelFromWire(req.optString(\"thinking_level\", \"\"))\n"
+        + "        provider.streamMessage(\n"
+        + "            messages = messages,\n"
+        + "            maxTokens = maxTokens,\n"
+        + "            thinkingLevel = thinkingLevel,\n"
+        + "        )\n        return \"\"\n    }\n}\n"
+    )
+
+def wiring_dispatch(extra_key=None):
+    """The dispatcher writer: request-level puts at the top level of one
+    builder, plus a nested builder whose keys must NOT be derived."""
+    extra = '            put("%s", 1)\n' % extra_key if extra_key else ""
+    return (
+        "package p\nobject ModelExecutionDispatcher {\n"
+        "    fun buildRequestJson(thinkingLevel: ThinkingLevel): String {\n"
+        "        return JSONObject().apply {\n"
+        "            put(\"messages\", JSONArray().apply { put(JSONObject().apply { "
+        "put(\"role\", \"user\") }) })\n"
+        "            put(\"max_tokens\", 4096)\n"
+        + extra
+        + "            if (thinkingLevel != ThinkingLevel.OFF) "
+        "put(\"thinking_level\", thinkingLevel.name)\n"
+        "        }\n    }\n}\n"
+    )
+
 def write(root, rel, text):
     p = os.path.join(root, rel)
     os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -629,7 +928,7 @@ def selftest():
     ok = True
 
     def run(root):
-        violations = check(root) + check_provider(root) + check_enriched_dispatch(root)
+        violations = check(root) + check_provider(root) + check_enriched_dispatch(root) + check_service_wiring(root)
         return violations
 
     # fixture 1: good tree → exit 0
@@ -790,6 +1089,58 @@ class C {
         "no 'buildRequestJson(' call site",
     )
 
+    # [dv27-A02] fixtures 16-20: thinking_level must reach BOTH provider calls,
+    # and every key the dispatcher writes must have a reader.
+    def wiring_arm(label, service, dispatch, needle):
+        nonlocal ok
+        with tempfile.TemporaryDirectory() as root:
+            write(root, PROTO_REL, GOOD_PROTO)
+            write(root, CALLER_RELS[0], service)
+            write(root, CALLER_RELS[1], GOOD_CALLER)
+            write(root, EXEC_DISPATCH_REL, dispatch)
+            bad = check_service_wiring(root)
+            if not any(needle in b for b in bad):
+                ok = False
+                print("SELFTEST-FAIL %s must be caught:" % label, bad)
+            elif len(bad) != 1:
+                ok = False
+                print("SELFTEST-FAIL %s must be the ONLY violation:" % label, bad)
+
+    with tempfile.TemporaryDirectory() as root:
+        write(root, PROTO_REL, GOOD_PROTO)
+        write(root, CALLER_RELS[0], wiring_service())
+        write(root, CALLER_RELS[1], GOOD_CALLER)
+        write(root, EXEC_DISPATCH_REL, wiring_dispatch())
+        bad = check_service_wiring(root)
+        if bad:
+            ok = False
+            print("SELFTEST-FAIL the wiring-compliant fixture must be clean:", *bad, sep="\n  ")
+
+    wiring_arm(
+        "the non-streaming path parses nothing (pre-fix shape: value undefined)",
+        wiring_service(parse_line=""),
+        wiring_dispatch(),
+        "is not derived from reading 'thinking_level'",
+    )
+    wiring_arm(
+        "the non-streaming path passes a constant level",
+        wiring_service(run_level="ThinkingLevel.OFF"),
+        wiring_dispatch(),
+        "is not derived from reading 'thinking_level'",
+    )
+    wiring_arm(
+        "the dispatcher writes a key no worker site reads",
+        wiring_service(),
+        wiring_dispatch(extra_key="nobody_reads_me"),
+        "but no worker site reads it",
+    )
+    wiring_arm(
+        "one path drops an argument its sibling hands over",
+        wiring_service(run_drop_max_tokens=True),
+        wiring_dispatch(),
+        "one path drops an argument the other hands over",
+    )
+
     if ok:
         print("MODELUSE_PROTO_SELFTEST=PASS")
         print("MODELUSE_PROVIDER_MATCHER_SELFTEST=PASS (4 fixtures: 3 violations caught, 1 fail-closed)")
@@ -805,7 +1156,7 @@ def main():
         print(__doc__)
         sys.exit(2)
     root = args[0] if args else os.getcwd()
-    violations = check(root) + check_provider(root) + check_enriched_dispatch(root)
+    violations = check(root) + check_provider(root) + check_enriched_dispatch(root) + check_service_wiring(root)
     if violations:
         print("modeluse_proto_single_source_check: %d violation(s)" % len(violations))
         for v in violations:

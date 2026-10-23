@@ -471,6 +471,75 @@ def _prefs_fields(text_nc):
     return names
 
 
+def _next_nonspace(masked, i):
+    """(char, index) of the next non-whitespace character at or after `i`."""
+    n = len(masked)
+    while i < n and masked[i] in " \t\r\n":
+        i += 1
+    if i >= n:
+        return "", n
+    return masked[i], i
+
+
+# A line that starts with one of these continues the expression above it.
+EXPR_CONTINUATION_CHARS = ".&|?:+*%<>=!-"
+# ... and so do these keywords (`= try { } catch (e) { }` and friends).
+EXPR_CONTINUATION_WORDS = ("catch", "finally", "else")
+
+
+def _expr_body_nc(text_nc, masked, k):
+    """Full text of the expression body that follows the `=` at index `k`.
+
+    The old implementation kept only the remainder of the FIRST LINE, so an
+    expression body whose value starts on the next line was reduced to `"="`.
+    The function then looked marker-free and was classified pure — which is
+    exactly how `MCPOAuthStore.isAuthorized` (value
+    `tokens(context, server)?.accessToken?.isNotEmpty() == true` on the
+    following line) escaped the off-main arm.
+
+    Extraction rules:
+      * a brace-headed form (`withContext(...) { }`, `try { }`, `when { }`,
+        `runCatching { }`, ...) is taken as a balanced block, so the whole
+        block is visible to the callers;
+      * otherwise the expression continues while the next non-blank line
+        starts with a continuation operator or keyword, and stops at a
+        declaration boundary — so an expression body never swallows the
+        function that follows it.
+    """
+    n = len(masked)
+    j = k + 1
+    while j < n and masked[j] in " \t\r\n":
+        j += 1
+    end = j
+    i = j
+    depth = 0
+    while i < n:
+        c = masked[i]
+        if c in "([":
+            depth += 1
+        elif c in ")]":
+            depth -= 1
+        elif c == "{" and depth == 0:
+            i = _match_brace(masked, i)
+            end = i
+            continue
+        elif c == ";" and depth == 0:
+            break
+        elif c == "\n" and depth == 0:
+            nxt, ni = _next_nonspace(masked, i + 1)
+            if not nxt:
+                break
+            wm = re.match(r"[A-Za-z_]\w*", masked[ni:])
+            word = wm.group(0) if wm else ""
+            if word in EXPR_CONTINUATION_WORDS or nxt in EXPR_CONTINUATION_CHARS:
+                i = ni
+                continue
+            break
+        i += 1
+        end = i
+    return text_nc[j:end]
+
+
 def _fun_body_nc(text_nc, masked, name):
     """(body text, 'block'|'expr') for `fun <name>(...)`; (None, reason) if the
     declaration is absent or its body form is not recognised."""
@@ -485,19 +554,27 @@ def _fun_body_nc(text_nc, masked, name):
         elif masked[i] == ")":
             depth -= 1
         i += 1
-    body_open = masked.find("{", i)
-    stop = body_open if body_open >= 0 else len(masked)
+    # `i` is now just past the closing paren; from here the body FORM
+    # decides the shape: `{ ... }` (block) or `= <expr>` (expression).
+    n = len(masked)
     k = i
-    while k < stop:
-        if masked[k] == "=" and masked[k - 1:k] not in ("=", "!", "<", ">") \
+    while k < n:
+        c = masked[k]
+        if c == "=" and masked[k - 1:k] not in ("=", "!", "<", ">") \
                 and masked[k + 1:k + 2] != "=":
-            return text_nc[k:].split("\n", 1)[0], "expr"
-        if masked[k] == "\n":
+            return _expr_body_nc(text_nc, masked, k), "expr"
+        if c == "{":
+            return text_nc[k:_match_brace(masked, k)], "block"
+        if c == "\n":
+            # The declaration may continue on the next line (a return type,
+            # the `=` of an expression body, or the opening brace).
+            nxt, ni = _next_nonspace(masked, k + 1)
+            if nxt in (":", "=", "{", "where"):
+                k = ni
+                continue
             break
         k += 1
-    if body_open < 0:
-        return None, "`%s`: body form not recognised" % name
-    return text_nc[body_open:_match_brace(masked, body_open)], "block"
+    return None, "`%s`: body form not recognised" % name
 
 
 def method_io_state(text, name, hops=2, _seen=None):
@@ -994,6 +1071,20 @@ fun clientSecret(context: Context, server: String): String? =
 fun setClientSecret(context: Context, server: String, secret: String?) {
     prefs(context).edit().putString(secretKey(server), secret).apply()
 }
+
+private fun tokens(context: Context, server: String): String? =
+    prefs(context).getString(tokensKey(server), null)
+
+// [dv27-A3] A MULTI-LINE expression body: the value starts on the NEXT line.
+// The old parser kept only the remainder of the first line ("="), so this
+// function looked marker-free and was classified pure — which is how a bare
+// `isAuthorized` on Main escaped the off-main arm.
+fun isAuthorized(context: Context, server: String): Boolean =
+    tokens(context, server)?.isNotEmpty() == true
+
+// A genuinely PURE single-line expression body: it must stay legal on Main.
+fun validateServerName(server: String): Boolean =
+    server.isNotBlank() && !server.contains('/')
 '''
 
 
@@ -1467,7 +1558,72 @@ B04_FIXTURES = [
          "var oauthClientSecret by remember(editServer) {",
          "var oauthClientSecret by remember {")),
      True, "carries no remember key"),
+    # ── [dv27-A3] A-06 arms: the expression-body parser must see the whole
+    # expression, not just the remainder of the first line. The old parser
+    # reduced `fun isAuthorized(...): Boolean =` + a next-line value to "=",
+    # so the function looked marker-free (pure) and a bare Main-thread call
+    # escaped the off-main arm.
+    ("dv27-A06 bare MCPOAuthStore.isAuthorized on Main",
+     _files(mcp=_mcp_text(extra='    MCPOAuthStore.isAuthorized(context, id)\n')),
+     True, "runs on Main while its callee performs"),
+    ("dv27-A06 bare MCPOAuthStore.clientSecret on Main",
+     _files(mcp=_mcp_text(extra='    val s2 = MCPOAuthStore.clientSecret(context, id)\n')),
+     True, "runs on Main while its callee performs"),
+    ("dv27-A06 precision: a pure expression body stays legal on Main",
+     _files(mcp=_mcp_text(extra='    val ok = MCPOAuthStore.validateServerName(id)\n')),
+     False, None),
 ]
+
+# ── [dv27-A3] A-06 parser arms ───────────────────────────────────────────
+# The expression-body extractor must take the WHOLE expression (not just the
+# remainder of the first line) and must stop at the next declaration. These
+# are python-level arms: the expected strings are literals, never derived
+# from the code under test.
+EXPR_PARSER_ARMS = [
+    ("single-line expression body",
+     "fun a(): Int = foo(1)",
+     "foo(1)",
+     None),
+    ("multi-line expression body",
+     "fun b(): Int =\n    foo(2)",
+     "foo(2)",
+     None),
+    ("chained continuation line",
+     "fun c(): Int =\n    foo(3)\n        .bar()",
+     ".bar()",
+     None),
+    ("expression body does not swallow the next function",
+     "fun d(): Int = foo(4)\nfun e() {\n    sideEffect()\n}",
+     "foo(4)",
+     "fun e"),
+    ("block-bodied function is a block",
+     "fun f() {\n    sideEffect()\n}",
+     "sideEffect()",
+     None),
+]
+
+
+def _expr_parser_arms():
+    """(ok, detail) for every A-06 parser arm."""
+    out = []
+    for label, src, must_contain, must_not_contain in EXPR_PARSER_ARMS:
+        nc = strip_comments(src)
+        masked = mask_strings(nc)
+        m = re.search(r"\bfun\s+([A-Za-z_]\w*)\s*\(", nc)
+        name = m.group(1)
+        body, kind = _fun_body_nc(nc, masked, name)
+        if body is None:
+            out.append((label, False, "body not recognised"))
+            continue
+        if must_contain is not None and must_contain not in body:
+            out.append((label, False, "body %r lacks %r" % (body, must_contain)))
+            continue
+        if must_not_contain is not None and must_not_contain in body:
+            out.append((label, False, "body %r wrongly contains %r"
+                        % (body, must_not_contain)))
+            continue
+        out.append((label, True, ""))
+    return out
 
 
 def selftest():
@@ -1535,6 +1691,14 @@ def selftest():
         print("selftest 1041-B03 %-46s: %s%s" % (
             label, "RED" if red else "CLEAN",
             "" if good else "  UNEXPECTED %s" % f[:2]))
+        ok &= good
+
+    # [dv27-A3] A-06 parser arms: the expression-body extractor must take the
+    # whole expression and must stop at the next declaration.
+    for label, good, detail in _expr_parser_arms():
+        print("selftest dv27-A06 %-46s: %s%s" % (
+            label, "PASS" if good else "FAIL",
+            "" if good else "  %s" % detail))
         ok &= good
 
     print(SELFTEST_MARK if ok else "SKILL_IMPORT_OFFMAIN_SELFTEST=FAIL")

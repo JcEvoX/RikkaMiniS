@@ -3175,6 +3175,32 @@ def test_da1046_gates():
         check(f"{script} real tree green", rc == 0, out[-280:])
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# deep-audit-1047 gate registration (union wrap-up): discarded_return_guard was
+# extended with the B-01 binary-write criteria (compress/openOutputStream
+# verdicts) but had never been registered here, so its --self-test arms were
+# never witnessed in CI. Registered at the union so a stubbed criterion cannot
+# pass silently; note the hyphenated flag (this gate spells it --self-test).
+# (script without .py, selftest flag, closing marker, real-tree argv)
+# ─────────────────────────────────────────────────────────────────────────────
+
+DV27_GATES = [
+    ("discarded_return_guard", "--self-test", "binary-write self-test has teeth", (REPO_ROOT,)),
+]
+
+def test_dv27_gates():
+    print("━━━ deep-audit-1047 gates (selftest teeth + real tree) ━━━")
+    for script, selftest_flag, marker, real_args in DV27_GATES:
+        proc = subprocess.run(
+            [sys.executable, os.path.join(SCRIPT_DIR, script + ".py"), selftest_flag],
+            capture_output=True, text=True,
+        )
+        out = (proc.stdout or "") + (proc.stderr or "")
+        check(f"{script} selftest has teeth ({marker})", proc.returncode == 0 and marker in out,
+              out[-280:])
+        rc, out = run_scanner(script + ".py", *real_args)
+        check(f"{script} real tree green", rc == 0, out[-280:])
+
 def main():
     print("╔══════════════════════════════════════════════════╗")
     print("║  Scan Self-Test (fixture ground truth)          ║")
@@ -3209,6 +3235,7 @@ def main():
     test_da1017_gates()
     test_da1016_gates()
     test_da1046_gates()
+    test_dv27_gates()
     test_da1018_gates()
     test_da1019_gates()
     test_da1020_gates()
