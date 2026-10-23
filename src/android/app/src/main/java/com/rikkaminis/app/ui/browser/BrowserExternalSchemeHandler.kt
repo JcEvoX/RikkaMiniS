@@ -8,6 +8,9 @@ import android.widget.Toast
 import androidx.core.net.toUri
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.R
+import com.rikkaminis.app.util.IntentSanitizePolicy
+import com.rikkaminis.app.util.IntentSanitizer
+import com.rikkaminis.app.util.lowercaseIntentScheme
 
 /**
  * Centralized router for non-http(s) URL schemes that show up inside our
@@ -19,10 +22,19 @@ import com.rikkaminis.app.R
  *
  *   * `intent://...` — parsed via `Intent.parseUri(_, URI_INTENT_SCHEME)`
  *     so `action`, `category`, and extras encoded after `#Intent;` get
- *     restored. We strip `FLAG_ACTIVITY_NEW_DOCUMENT` and the package
- *     selector (set when the spec restricts to one app) before fanning
- *     out via `startActivity`. If no app handles the intent, the spec's
- *     `browser_fallback_url` extra is honoured; absent that, a Toast.
+ *     restored. The URL is scheme-normalised first (`Intent.parseUri` matches
+ *     `intent:` case-sensitively) and the parsed intent then goes through
+ *     [IntentSanitizer], the same hardening `android-open` uses: URI-grant
+ *     flags, `clipData`, a same-package `component`/`package` target and the
+ *     injected `selector` are dropped before `startActivity`. A THIRD-PARTY
+ *     package target survives — that is how `intent://` links reach
+ *     WeChat/Alipay/Play Store. If no app handles the intent, the spec's
+ *     `browser_fallback_url` extra is honoured **only when it is an ordinary
+ *     http(s) URL**; otherwise (or when absent) a Toast.
+ *     ([deep-audit-1046 FIX-F9]: this KDoc used to advertise a `NEW_DOCUMENT`
+ *     task-reuse strip, which no line in the file ever performed — the
+ *     implementation stripped the selector only, and left grant flags,
+ *     `clipData`, a same-package target and the page's raw casing intact.)
  *   * Other "open in app" schemes — fired as a plain `ACTION_VIEW`
  *     against the URI. ActivityNotFoundException → Toast.
  *   * `http`, `https`, `about`, `file` — return `false` so the WebView
@@ -109,21 +121,36 @@ object BrowserExternalSchemeHandler {
     }
 
     private fun handleIntentScheme(context: Context, url: String): Boolean {
+        // [deep-audit-1046 FIX-F9] Two things this side never did:
+        //   1. `Intent.parseUri` matches `intent:` / `android-app:`
+        //      case-SENSITIVELY, so `INTENT://…` (RFC 3986 says schemes are
+        //      case-insensitive) was silently degraded to a plain ACTION_VIEW
+        //      over the raw string. Hand it a scheme-normalised copy.
+        //   2. The hardening below used to be `selector = null` only, while a
+        //      page-supplied intent can carry grant flags, clipData and
+        //      same-package targets — i.e. hand a launched activity a read
+        //      grant on our FileProvider roots, or start a non-exported
+        //      activity of ours. Both call sites now share IntentSanitizer.
         val intent = runCatching {
-            Intent.parseUri(url, Intent.URI_INTENT_SCHEME)
+            Intent.parseUri(lowercaseIntentScheme(url), Intent.URI_INTENT_SCHEME).apply {
+                addCategory(Intent.CATEGORY_BROWSABLE)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                IntentSanitizer.sanitize(this, context)
+            }
         }.getOrElse {
             AppLogger.warning(TAG, "parseUri failed for $url: ${it.message}")
             return true
         }
 
-        // Drop selector + browser-only flags so the system resolves the
-        // intent against any matching Activity, not just the package the
-        // page suggested (which is often unavailable).
-        intent.selector = null
-        intent.addCategory(Intent.CATEGORY_BROWSABLE)
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-
-        val fallback = intent.getStringExtra("browser_fallback_url")
+        // Page-supplied and therefore untrusted: only an ordinary web URL may
+        // become the second startActivity. Anything else is dropped with a log
+        // so a crafted `intent://…;S.browser_fallback_url=intent://…` chain
+        // cannot rebuild the very escape the sanitizer just removed.
+        val rawFallback = intent.getStringExtra("browser_fallback_url")
+        val fallback = IntentSanitizePolicy.allowedFallbackUrl(rawFallback)
+        if (rawFallback != null && fallback == null) {
+            AppLogger.info(TAG, "dropped non-http browser_fallback_url: $rawFallback")
+        }
 
         try {
             context.startActivity(intent)

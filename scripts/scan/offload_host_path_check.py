@@ -27,6 +27,18 @@ every other gate:
       body below had claimed "component stripping" in this docstring since
       1016c while never reading component/selector, so deleting those two
       lines from the handler left the gate GREEN).
+      [deep-audit-1046 FIX-F9] THE SCOPE WAS THE BLIND SPOT: R2 only ever read
+      `sandbox/offload/*OffloadHandler.kt`, so ui/browser's
+      BrowserExternalSchemeHandler — the one fed by arbitrary WEB PAGES —
+      shipped with `selector = null` as its entire hardening and was invisible
+      here. The scope is now DERIVED from the shipped source tree: every
+      `Intent.parseUri(` call site, every file that dispatches an
+      `intent:`/`android-app:` link and calls startActivity, and every read of
+      the page-supplied `browser_fallback_url` (which must be scheme-gated to
+      http(s)). A shared sanitizer is accepted by body (a function whose own
+      body clears every strip) instead of by name, so extracting the sequence
+      into one helper cannot silence the gate — and gutting that helper turns
+      every call site red again.
 
 Usage:
   python3 scripts/scan/offload_host_path_check.py <repo_root>
@@ -61,17 +73,56 @@ GRANT_FLAGS = (
 # `component=`) target, the thing the fix must not break. Accepted spellings
 # are listed per entry; anything else fails CLOSED (a red gate that a human
 # re-anchors) rather than silently passing.
+# The two package strips must stay GUARDED by "this target is OUR package".
+# [deep-audit-1046 FIX-F9] the accepted guard spellings grew to cover the shared
+# sanitizer, which receives the package as a parameter and asks a derived pure
+# predicate (`isSelfTarget(pkg, selfPackage)`) instead of inlining
+# `context.packageName`. Everything else still fails CLOSED.
+PACKAGE_GUARD = (
+    r"(?:\.packageName|selfPackage|selfPkg|ownPackage|isSelfTarget\(|shouldStripSelfTarget\()"
+)
 R2_STRIPS = (
     ("clipData = null",
      r"\bclipData\s*=\s*null\b|\bsetClipData\(\s*null\s*\)"),
     ("same-package component strip",
-     r"if\s*\([^\n]*packageName\s*==\s*context\.packageName[^\n]*\)[^\n]*"
+     r"if\s*\([^\n]*" + PACKAGE_GUARD + r"[^\n]*\)[^\n]*"
      r"(?:\bcomponent\s*=\s*null\b|\bsetComponent\(\s*null\s*\))"),
     ("same-package package strip",
-     r"if\s*\([^\n]*(?:getPackage\(\)|`package`)\s*==\s*context\.packageName[^\n]*\)[^\n]*"
+     r"if\s*\([^\n]*(?:" + PACKAGE_GUARD + r"|getPackage\(\)|`package`)[^\n]*\)[^\n]*"
      r"(?:\bsetPackage\(\s*null\s*\)|`package`\s*=\s*null\b)"),
     ("selector = null",
      r"\bselector\s*=\s*null\b|\bsetSelector\(\s*null\s*\)"),
+)
+
+# ── [deep-audit-1046 FIX-F9] R2 SCOPE: every intent:// path in the app ──────
+# R2 used to read only `sandbox/offload/*OffloadHandler.kt`, so the app's SECOND
+# `Intent.parseUri` caller — ui/browser/BrowserExternalSchemeHandler, the one fed
+# by arbitrary WEB PAGES — was invisible to this gate while stripping the
+# selector only. The blind spot was never "that file"; it was the hand-written
+# scope. The scope is derived from the shipped source tree below, so a third
+# caller is covered the day it lands.
+MAIN_SRC_REL = os.path.join("src", "android", "app", "src", "main", "java")
+
+FUN_DECL_RE = re.compile(r"\bfun\s+(?:<[^>]+>\s+)?([A-Za-z_]\w*)\s*\(")
+# Any spelling that normalises the scheme before parsing (`lowercaseIntentScheme(u)`,
+# `u.lowercase()`). `Intent.parseUri` matches `intent:` case-SENSITIVELY, so a
+# mixed-case scheme silently degrades to ACTION_VIEW over the raw string.
+SCHEME_NORMALISE_RE = re.compile(r"[Ll]owercase")
+START_ACTIVITY_RE = re.compile(r"\bstartActivity\s*\(")
+# strip_comments() cuts a line at `//`, so `"intent://x"` arrives as `"intent:` —
+# accept the scheme prefix with or without its closing quote.
+INTENT_SCHEME_LITERAL_RE = re.compile(r'"(?:android-app|intent)(?::|")')
+FALLBACK_READ_RE = re.compile(r'getStringExtra\(\s*"browser_fallback_url"\s*\)')
+FALLBACK_ASSIGN_RE = re.compile(
+    r'val\s+([A-Za-z_]\w*)\s*(?::\s*[A-Za-z_]\w*\s*)?=\s*[^\n]*'
+    r'getStringExtra\(\s*"browser_fallback_url"\s*\)'
+)
+FALLBACK_GATE_RE = re.compile(
+    r"[Aa]llowedFallback|startsWith\(\s*\"https?\"|scheme\s*==\s*\"https?\""
+)
+GATED_IDENT_TMPL = (
+    r"(?:[Aa]llowedFallback\w*|[Ss]afeFallback\w*)\s*\(\s*%s\b"
+    r"|%s\s*\.\s*startsWith\(\s*\"https?\""
 )
 
 # `val <ident> = ...get("path"|"file"|"source")` (any receiver spelling).
@@ -581,10 +632,90 @@ def _statement_window(text, start_idx):
     return None
 
 
-def scan_parse_uri(rel, text):
-    """R2: Intent.parseUri must be followed by grant / clipData / component /
-    package / selector stripping — each strip checked as the guarded DECISION
-    it is (see R2_STRIPS)."""
+def _main_src_files(root):
+    """(path, repo-relative path) for every .kt in the shipped main source set."""
+    base = os.path.join(root, MAIN_SRC_REL)
+    files = []
+    if not os.path.isdir(base):
+        return files
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames.sort()
+        for name in sorted(filenames):
+            if not name.endswith(".kt"):
+                continue
+            path = os.path.join(dirpath, name)
+            files.append((path, os.path.relpath(path, root)))
+    return files
+
+
+def _brace_body(text, idx):
+    """Brace-balanced body of the declaration whose header ends at idx."""
+    start = text.find("{", idx)
+    if start < 0:
+        return None
+    depth = 0
+    for n in range(start, len(text)):
+        c = text[n]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:n + 1]
+    return None
+
+
+def has_full_hardening(body):
+    """True when `body` clears every R2 strip — i.e. it IS a sanitizer."""
+    if "removeFlags(" not in body:
+        return False
+    if any(flag not in body for flag in GRANT_FLAGS):
+        return False
+    return all(re.search(pattern, body) for _label, pattern in R2_STRIPS)
+
+
+def derive_sanitizer_names(root):
+    """Names of tree functions whose body performs the FULL hardening.
+
+    Derived from the body, never from a hardcoded name: a shared sanitizer is
+    accepted by [scan_parse_uri] because its own body carries the guards, and
+    the day somebody guts that body the name leaves this set and every call site
+    goes red again (arm "sanitizer gutted" pins that transitivity).
+    """
+    names = set()
+    for path, _rel in _main_src_files(root):
+        code = _read_code(path)
+        for m in FUN_DECL_RE.finditer(code):
+            body = _brace_body(code, m.end())
+            if body and has_full_hardening(body):
+                names.add(m.group(1))
+    return names
+
+
+def _parse_uri_hardening_missing(window, sanitizer_names):
+    """Criteria one `Intent.parseUri(...)` statement must satisfy."""
+    missing = []
+    if not SCHEME_NORMALISE_RE.search(window):
+        missing.append("scheme normalisation (`Intent.parseUri` matches `intent:` case-sensitively)")
+    for name in sorted(sanitizer_names):
+        if re.search(r"\b%s\s*\(" % re.escape(name), window):
+            return missing
+    if "removeFlags(" not in window:
+        missing.append("removeFlags(...)")
+    for flag in GRANT_FLAGS:
+        if flag not in window:
+            missing.append(flag)
+    for label, pattern in R2_STRIPS:
+        if not re.search(pattern, window):
+            missing.append(label)
+    return missing
+
+
+def scan_parse_uri(rel, text, sanitizer_names=()):
+    """R2: Intent.parseUri must be paired with grant / clipData / component /
+    package / selector stripping plus scheme normalisation — inline in the same
+    statement, or by calling a shared sanitizer whose own body carries them
+    ([deep-audit-1046 FIX-F9] added the sanitizer shape and the normalisation)."""
     problems = []
     for m in re.finditer(r"Intent\.parseUri\(", text):
         line_no = text.count("\n", 0, m.start()) + 1
@@ -592,21 +723,79 @@ def scan_parse_uri(rel, text):
         if window is None:
             problems.append("%s:%d: Intent.parseUri statement could not be delimited" % (rel, line_no))
             continue
-        missing = []
-        if "removeFlags(" not in window:
-            missing.append("removeFlags(...)")
-        for flag in GRANT_FLAGS:
-            if flag not in window:
-                missing.append(flag)
-        for label, pattern in R2_STRIPS:
-            if not re.search(pattern, window):
-                missing.append(label)
+        missing = _parse_uri_hardening_missing(window, sanitizer_names)
         if missing:
             problems.append(
                 "%s:%d: Intent.parseUri without hardening — missing %s"
                 % (rel, line_no, ", ".join(missing))
             )
     return problems
+
+
+def _fallback_is_gated(code, match):
+    """Is the page-supplied `browser_fallback_url` value scheme-gated?"""
+    window = _statement_window(code, match.start()) or ""
+    if FALLBACK_GATE_RE.search(window):
+        return True
+    am = FALLBACK_ASSIGN_RE.search(code)
+    if not am:
+        return False
+    ident = re.escape(am.group(1))
+    return re.search(GATED_IDENT_TMPL % (ident, ident), code) is not None
+
+
+def scan_intent_uri_scope(root, sanitizer_names=None, skip_rels=()):
+    """R2 scope ([dv26-F9]): every `Intent.parseUri` site in the shipped tree,
+    every `intent://` dispatcher, and the page-supplied `browser_fallback_url`.
+
+    Returns (problems, stats). `skip_rels` keeps the caller's own offload-dir
+    pass from being reported twice.
+    """
+    if sanitizer_names is None:
+        sanitizer_names = derive_sanitizer_names(root)
+    problems = []
+    stats = {"sites": 0, "consumers": 0, "fallbacks": 0}
+    skip = set(skip_rels)
+    for path, rel in _main_src_files(root):
+        code = _read_code(path)
+        site_problems = []
+        if "Intent.parseUri(" in code:
+            stats["sites"] += code.count("Intent.parseUri(")
+            # The caller's own offload-dir pass already ran R2 over these files.
+            if rel not in skip:
+                site_problems = scan_parse_uri(rel, code, sanitizer_names)
+                problems.extend(site_problems)
+        calls_sanitizer = any(
+            re.search(r"\b%s\s*\(" % re.escape(n), code) for n in sanitizer_names
+        )
+        if START_ACTIVITY_RE.search(code) and INTENT_SCHEME_LITERAL_RE.search(code):
+            stats["consumers"] += 1
+            hardened_inline = any(
+                not _parse_uri_hardening_missing(_statement_window(code, m.start()) or "", ())
+                for m in re.finditer(r"Intent\.parseUri\(", code)
+            )
+            # One message per file: a dispatcher whose own parseUri site was
+            # already reported above is the same defect, not a second one.
+            if not calls_sanitizer and not hardened_inline and not site_problems:
+                problems.append(
+                    "%s: dispatches intent:// links and calls startActivity but never routes the "
+                    "parsed intent through a shared sanitizer (derived in tree: %s) — a "
+                    "page-supplied intent keeps its URI grants / clipData / same-package target"
+                    % (rel, ", ".join(sorted(sanitizer_names)) or "<none>")
+                )
+        for m in FALLBACK_READ_RE.finditer(code):
+            stats["fallbacks"] += 1
+            if _fallback_is_gated(code, m):
+                continue
+            problems.append(
+                "%s:%d: page-supplied `browser_fallback_url` is dispatched without an http(s) "
+                "scheme gate — an intent:// (or file://) fallback re-opens the escape"
+                % (rel, code.count("\n", 0, m.start()) + 1)
+            )
+    return problems, stats
+
+
+INTENT_SCOPE_STATS = {"sites": 0, "consumers": 0, "fallbacks": 0}
 
 
 def check_tree(root, verbose=True):
@@ -616,16 +805,23 @@ def check_tree(root, verbose=True):
     if not os.path.isdir(offload_dir):
         print("❌ offload dir not found: %s" % offload_dir)
         return 1, ["missing dir"]
+    # [deep-audit-1046 FIX-F9] the shared `intent://` sanitizers, derived from
+    # their bodies (empty set on a tree without one — arms stay meaningful).
+    sanitizers = derive_sanitizer_names(root)
+    covered = set()
     for name in sorted(os.listdir(offload_dir)):
         if not name.endswith("OffloadHandler.kt"):
             continue
         path = os.path.join(offload_dir, name)
         rel = os.path.join(OFFLOAD_REL, name)
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            code = strip_comments(fh.read())
+        code = _read_code(path)
         scanned += 1
+        covered.add(rel)
         problems.extend(scan_bare_file(rel, code))
-        problems.extend(scan_parse_uri(rel, code))
+        problems.extend(scan_parse_uri(rel, code, sanitizers))
+    scope_problems, scope_stats = scan_intent_uri_scope(root, sanitizers, skip_rels=covered)
+    INTENT_SCOPE_STATS.update(scope_stats)
+    problems.extend(scope_problems)
     if verbose:
         for p in problems:
             print("❌ %s" % p)
@@ -789,7 +985,7 @@ CLEAN_INTENT = """package com.rikkaminis.app.sandbox.offload
 
 class CleanIntentHandler {
     private fun handleOpen(url: String) {
-        val intent = Intent.parseUri(url, Intent.URI_INTENT_SCHEME).apply {
+        val intent = Intent.parseUri(lowercaseIntentScheme(url), Intent.URI_INTENT_SCHEME).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             removeFlags(
                 Intent.FLAG_GRANT_READ_URI_PERMISSION or
@@ -1415,6 +1611,236 @@ internal fun execScopeParams(sub: String, sessionId: String?, cwd: String?): Map
     _exec_total = len(exec_arms) + 2
     print("DEBUG_EXEC_SCOPE_SELFTEST=PASS (%d fixtures: %d dirty/fail-closed arms red as expected, "
           "1 clean tree green)" % (_exec_total, _exec_total - 1))
+
+    # ── [deep-audit-1046 FIX-F9] R2 SCOPE: every parseUri site + every
+    # dispatcher + the page-supplied fallback ───────────────────────────────
+    # The blind spot this pins is the SCOPE, not a strip: R2 only ever read
+    # `sandbox/offload/*OffloadHandler.kt`, so ui/browser (fed by arbitrary web
+    # pages) had a naked `Intent.parseUri` with `selector = null` as its entire
+    # hardening. Arms 2-4 are the browser-side regressions; arm 5 is a brand-new
+    # third caller (the derivation must not need a human to remember); arm 6 is
+    # the `browser_fallback_url` second-launch; arm 7 proves the sanitizer
+    # derivation is TRANSITIVE (gut the helper and its callers go red too).
+    MAIN = MAIN_SRC_REL
+    F9_UTIL = os.path.join(MAIN, "com", "rikkaminis", "app", "util")
+    F9_OFFLOAD = os.path.join(MAIN, "com", "rikkaminis", "app", "sandbox", "offload")
+    F9_BROWSER = os.path.join(MAIN, "com", "rikkaminis", "app", "ui", "browser")
+
+    F9_SANITIZER = """package com.rikkaminis.app.util
+
+internal object F9IntentSanitizer {
+    fun sanitize(intent: Intent, context: Context): Intent {
+        intent.removeFlags(
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
+        )
+        intent.clipData = null
+        if (isSelfTarget(intent.component?.packageName, context.packageName)) intent.component = null
+        if (isSelfTarget(intent.getPackage(), context.packageName)) intent.setPackage(null)
+        intent.selector = null
+        return intent
+    }
+}
+"""
+
+    F9_SANITIZER_GUTTED = F9_SANITIZER.replace(
+        "            Intent.FLAG_GRANT_READ_URI_PERMISSION or\n", "", 1
+    )
+
+    F9_OFFLOAD_CONSUMER = """package com.rikkaminis.app.sandbox.offload
+
+class F9OpenHandler(private val context: Context) {
+    private fun tryOpen(url: String): Intent {
+        val isIntentUri = url.startsWith("android-app:", ignoreCase = true)
+        return Intent.parseUri(lowercaseIntentScheme(url), Intent.URI_INTENT_SCHEME).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            F9IntentSanitizer.sanitize(this, context)
+        }
+    }
+
+    private fun dispatch(intent: Intent) = context.startActivity(intent)
+}
+"""
+
+    F9_BROWSER_CONSUMER = """package com.rikkaminis.app.ui.browser
+
+object F9BrowserHandler {
+    private val ANDROID_APP_SCHEME = "android-app"
+
+    fun handleIntentScheme(context: Context, url: String): Boolean {
+        val intent = Intent.parseUri(lowercaseIntentScheme(url), Intent.URI_INTENT_SCHEME).apply {
+            addCategory(Intent.CATEGORY_BROWSABLE)
+            F9IntentSanitizer.sanitize(this, context)
+        }
+        val rawFallback = intent.getStringExtra("browser_fallback_url")
+        val fallback = allowedFallbackUrl(rawFallback)
+        context.startActivity(intent)
+        return fallback != null
+    }
+}
+"""
+
+    # Arm 2: the shipped-before shape — parse, strip the selector, launch.
+    F9_BROWSER_DEGRADED = """package com.rikkaminis.app.ui.browser
+
+object F9BrowserHandler {
+    private val ANDROID_APP_SCHEME = "android-app"
+
+    fun handleIntentScheme(context: Context, url: String): Boolean {
+        val intent = Intent.parseUri(lowercaseIntentScheme(url), Intent.URI_INTENT_SCHEME).apply {
+            selector = null
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+        return true
+    }
+}
+"""
+
+    # Arm 3: full hardening, but the page's raw casing reaches parseUri.
+    F9_BROWSER_NO_LOWERCASE = F9_BROWSER_CONSUMER.replace(
+        "Intent.parseUri(lowercaseIntentScheme(url)", "Intent.parseUri(url", 1
+    )
+
+    # Arm 5: dispatches intent:// and never parses / never sanitises.
+    F9_DISPATCHER_ONLY = """package com.rikkaminis.app.ui.browser
+
+object F9RawDispatcher {
+    fun handle(context: Context, url: String): Boolean {
+        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        return true
+    }
+
+    private val INTENT_SCHEME = "intent:"
+}
+"""
+
+    # Arm 6: the fallback is launched verbatim, whatever scheme it names.
+    F9_BROWSER_RAW_FALLBACK = """package com.rikkaminis.app.ui.browser
+
+object F9BrowserHandler {
+    private val ANDROID_APP_SCHEME = "android-app"
+
+    fun handleIntentScheme(context: Context, url: String): Boolean {
+        val intent = Intent.parseUri(lowercaseIntentScheme(url), Intent.URI_INTENT_SCHEME).apply {
+            F9IntentSanitizer.sanitize(this, context)
+        }
+        val fallback = intent.getStringExtra("browser_fallback_url")
+        if (fallback != null) {
+            context.startActivity(Intent(Intent.ACTION_VIEW, fallback.toUri()))
+        }
+        return true
+    }
+}
+"""
+
+    # Arm 8: no shared helper at all — inline hardening is still accepted.
+    F9_INLINE_CONSUMER = """package com.rikkaminis.app.sandbox.offload
+
+class F9InlineHandler(private val context: Context) {
+    private fun tryOpen(url: String): Intent {
+        val isIntentUri = url.startsWith("android-app:", ignoreCase = true)
+        return Intent.parseUri(lowercaseIntentScheme(url), Intent.URI_INTENT_SCHEME).apply {
+            removeFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PREFIX_URI_PERMISSION,
+            )
+            clipData = null
+            if (component?.packageName == context.packageName) component = null
+            if (getPackage() == context.packageName) setPackage(null)
+            selector = null
+        }
+    }
+
+    private fun dispatch(intent: Intent) = context.startActivity(intent)
+}
+"""
+
+    # Arm 4: a THIRD caller nobody remembered to wire up.
+    F9_THIRD_BARE = """package com.rikkaminis.app.ui.settings
+
+object F9NewConsumer {
+    fun launch(url: String): Intent =
+        Intent.parseUri(lowercaseIntentScheme(url), Intent.URI_INTENT_SCHEME)
+}
+"""
+
+    def f9_root(files):
+        root = tempfile.mkdtemp(prefix="offload-gate-selftest-f9-")
+        os.makedirs(os.path.join(root, OFFLOAD_REL), exist_ok=True)
+        for rel, content in files.items():
+            path = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+        return root
+
+    F9_SANITIZER_REL = os.path.join(F9_UTIL, "F9IntentSanitizer.kt")
+    F9_OFFLOAD_REL = os.path.join(F9_OFFLOAD, "F9OpenHandler.kt")
+    F9_BROWSER_REL = os.path.join(F9_BROWSER, "F9BrowserHandler.kt")
+
+    f9_arms = [
+        ("F9 clean: shared sanitizer + both consumers",
+         {F9_SANITIZER_REL: F9_SANITIZER,
+          F9_OFFLOAD_REL: F9_OFFLOAD_CONSUMER,
+          F9_BROWSER_REL: F9_BROWSER_CONSUMER}, 0, None),
+        ("F9 dirty: browser side degrades to `selector = null` only",
+         {F9_SANITIZER_REL: F9_SANITIZER,
+          F9_OFFLOAD_REL: F9_OFFLOAD_CONSUMER,
+          F9_BROWSER_REL: F9_BROWSER_DEGRADED}, 1, "Intent.parseUri without hardening"),
+        ("F9 dirty: page casing handed to parseUri (no scheme normalisation)",
+         {F9_SANITIZER_REL: F9_SANITIZER,
+          F9_OFFLOAD_REL: F9_OFFLOAD_CONSUMER,
+          F9_BROWSER_REL: F9_BROWSER_NO_LOWERCASE}, 1, "scheme normalisation"),
+        ("F9 dirty: a THIRD bare Intent.parseUri caller",
+         {F9_SANITIZER_REL: F9_SANITIZER,
+          F9_OFFLOAD_REL: F9_OFFLOAD_CONSUMER,
+          F9_BROWSER_REL: F9_BROWSER_CONSUMER,
+          os.path.join(MAIN, "com", "rikkaminis", "app", "ui", "settings", "F9NewConsumer.kt"):
+              F9_THIRD_BARE}, 1, "F9NewConsumer.kt"),
+        ("F9 dirty: an intent:// dispatcher that never sanitises",
+         {F9_SANITIZER_REL: F9_SANITIZER,
+          F9_OFFLOAD_REL: F9_OFFLOAD_CONSUMER,
+          F9_BROWSER_REL: F9_BROWSER_CONSUMER,
+          os.path.join(F9_BROWSER, "F9RawDispatcher.kt"): F9_DISPATCHER_ONLY},
+         1, "never routes the parsed intent through a shared sanitizer"),
+        ("F9 dirty: browser_fallback_url launched without a scheme gate",
+         {F9_SANITIZER_REL: F9_SANITIZER,
+          F9_OFFLOAD_REL: F9_OFFLOAD_CONSUMER,
+          F9_BROWSER_REL: F9_BROWSER_RAW_FALLBACK}, 1, "browser_fallback_url"),
+        ("F9 dirty: sanitizer gutted → both call sites lose the guards (transitive)",
+         {F9_SANITIZER_REL: F9_SANITIZER_GUTTED,
+          F9_OFFLOAD_REL: F9_OFFLOAD_CONSUMER,
+          F9_BROWSER_REL: F9_BROWSER_CONSUMER}, 2, "FLAG_GRANT_READ_URI_PERMISSION"),
+        ("F9 clean: inline hardening at the call site (no shared helper)",
+         {F9_OFFLOAD_REL: F9_INLINE_CONSUMER}, 0, None),
+    ]
+    f9_failures = []
+    for label, files, expected, needle in f9_arms:
+        root = f9_root(files)
+        try:
+            _, problems = check_tree(root, verbose=False)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+        ok = len(problems) == expected
+        if ok and needle is not None:
+            ok = any(needle in p for p in problems)
+        print("  [%s] %s%s" % ("PASS" if ok else "FAIL", label,
+                               "" if ok else "  → problems=%s" % problems))
+        if not ok:
+            f9_failures.append(label)
+    if f9_failures:
+        print("❌ selftest failed: %s" % ", ".join(f9_failures))
+        return 1
+    print("F9_INTENT_SCOPE_SELFTEST=PASS (%d fixtures: %d dirty arms red on their own "
+          "criterion, %d clean trees green)"
+          % (len(f9_arms),
+             sum(1 for a in f9_arms if a[2] > 0),
+             sum(1 for a in f9_arms if a[2] == 0)))
     return 0
 
 
@@ -1436,8 +1862,11 @@ def main():
     if problems:
         print("offload_host_path_check: %d handler file(s) scanned, %d violation(s)" % (scanned, len(problems)))
         return 1
-    print("offload_host_path_check: %d handler file(s) scanned, 0 violations — "
-          "OFFLOAD-HOST-PATH GATE OK" % scanned)
+    print("offload_host_path_check: %d handler file(s) + %d intent dispatcher(s) scanned, "
+          "0 violations — OFFLOAD-HOST-PATH GATE OK (%d Intent.parseUri site(s), "
+          "%d browser_fallback_url read(s))"
+          % (scanned, INTENT_SCOPE_STATS["consumers"], INTENT_SCOPE_STATS["sites"],
+             INTENT_SCOPE_STATS["fallbacks"]))
     return 0
 
 
