@@ -15,6 +15,7 @@ import android.print.PrintManager
 import android.util.LruCache
 import android.webkit.MimeTypeMap
 import android.webkit.WebView
+import android.view.ViewGroup
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -88,6 +89,9 @@ import com.rikkaminis.app.ui.components.rememberIosBounceOverscrollEffect
 import com.rikkaminis.app.ui.markdown.MarkdownText
 import com.rikkaminis.app.ui.media.InlineAudioPlayer
 import com.rikkaminis.app.ui.media.InlineVideoPlayer
+import com.rikkaminis.app.ui.preview.ReleaseStep
+import com.rikkaminis.app.ui.preview.WebViewReleaseLatch
+import com.rikkaminis.app.ui.preview.releasePlan
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -452,6 +456,9 @@ private fun HtmlPreview(item: FileItem) {
     // `key(rendererEpoch)` never changes (0→0) and the factory does not
     // re-run — the screen kept showing the *previous* file's HTML.
     key(item.file, rendererEpoch) {
+    // [deep-audit-1046 S-07] One latch per WebView instance; `key(...)` recreates
+    // this block (and this `remember`) whenever the renderer is replaced.
+    val releaseLatch = remember { WebViewReleaseLatch() }
     AndroidView(
         modifier = Modifier.fillMaxSize(),
         factory = { ctx ->
@@ -480,17 +487,43 @@ private fun HtmlPreview(item: FileItem) {
                     }
                 }
                 val targetUrl = fileUrlFor(item.file)
-                post { loadUrl(targetUrl) }
+                // [deep-audit-1046 S-07] `post` parks the load in this view's run
+                // queue until the first layout — and on a view that never gets
+                // attached it stays parked. If the preview is closed first, the
+                // load must not be replayed onto the destroyed WebView; named so
+                // `onRelease` can remove it by identity (`removeCallbacks(null)`
+                // is a no-op: AOSP guards it on `action != null`).
+                val initialLoad = Runnable {
+                    if (!releaseLatch.canRunDeferred()) return@Runnable
+                    loadUrl(targetUrl)
+                }
+                releaseLatch.track(initialLoad)
+                post(initialLoad)
             }
         },
         // [fix/render-ui F-274] This WebView had no release path: every preview
         // of an HTML file left a live renderer process handle behind, and the
         // queued `post { loadUrl }` could still fire after the composable left.
-        // Same three-call teardown as KaTeXView.kt's T10-M1 fix.
+        // [deep-audit-1046 S-07] That queued load was never actually cancelled:
+        // `removeCallbacks(null)` removes nothing (AOSP: `if (action != null) {
+        // … } return false;`), so a preview closed before its first layout still
+        // loaded the file into a destroyed WebView. The load is now registered
+        // with the latch and removed by identity, and the latch is flipped first
+        // so a re-post during teardown stands down too.
+        // Order (releasePlan, shared with KaTeXView.kt): latch → detach → drop
+        // tracked work → stopLoading → destroy.
         onRelease = { wv ->
-            wv.removeCallbacks(null)
-            wv.stopLoading()
-            wv.destroy()
+            val outstanding = releaseLatch.release()
+            for (step in releasePlan(attached = wv.parent != null)) {
+                when (step) {
+                    ReleaseStep.DETACH -> (wv.parent as? ViewGroup)?.removeView(wv)
+                    ReleaseStep.DROP_DEFERRED -> {
+                        for (task in outstanding) wv.removeCallbacks(task)
+                    }
+                    ReleaseStep.STOP_LOADING -> wv.stopLoading()
+                    ReleaseStep.DESTROY -> wv.destroy()
+                }
+            }
         },
     )
     }

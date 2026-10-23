@@ -29,6 +29,17 @@ This gate pins, on the comment-stripped source:
     allowlist: the two pre-existing call sites already comply, so any new
     bare call site is a regression by construction).
 
+[deep-audit-1046 S-07] — the offscreen AndroidView hosts (`ui/markdown/KaTeXView.kt`,
+`ui/sandbox/FilePreviewScreen.kt`) and the shared teardown policy
+(`ui/preview/WebViewReleaseLatch.kt`). Their `onRelease` used
+`removeCallbacks(null)` — a documented no-op (AOSP guards on `action != null`) —
+with no latch, so a `postDelayed` capture could draw on a destroyed WebView and
+cache an EMPTY bitmap under a formula's key (blank for the process lifetime).
+Criteria, all derived from code shape: the release path latches the view before
+it touches it; it consumes the shared `releasePlan(…)` order; it removes the
+tracked runnables by identity; `stopLoading` still precedes `destroy`; every
+deferred block opens with the latch guard; every named runnable is registered.
+
 Usage: python3 browser_destroy_wakeup_check.py [ROOT]   (ROOT = repo root, default ".")
        python3 browser_destroy_wakeup_check.py --selftest
 Exit:  0 = gate green, 1 = violations found (or selftest failures).
@@ -40,6 +51,10 @@ import sys
 MANAGER = "src/android/app/src/main/java/com/rikkaminis/app/browser/BrowserUseManager.kt"
 HOLDER = "src/android/app/src/main/java/com/rikkaminis/app/ui/preview/WebViewHolder.kt"
 SLOT = "src/android/app/src/main/java/com/rikkaminis/app/browser/AsyncJsSlot.kt"
+# [deep-audit-1046 S-07] the two offscreen AndroidView hosts + the shared policy
+KATEX_VIEW = "src/android/app/src/main/java/com/rikkaminis/app/ui/markdown/KaTeXView.kt"
+FILE_PREVIEW = "src/android/app/src/main/java/com/rikkaminis/app/ui/sandbox/FilePreviewScreen.kt"
+RELEASE_POLICY = "src/android/app/src/main/java/com/rikkaminis/app/ui/preview/WebViewReleaseLatch.kt"
 SRC_ROOT = "src/android/app/src/main/java"
 
 DESTROY_MUST = (
@@ -327,6 +342,197 @@ def analyse_lifecycle(manager_src, holder_src):
     return out
 
 
+# ── [deep-audit-1046 S-07] offscreen WebView release contract ────────────────
+# Two `AndroidView` hosts (KaTeXView.kt / FilePreviewScreen.kt) schedule work on
+# a WebView through its View queue and destroy it in `onRelease`. Their teardown
+# called `removeCallbacks(null)` — a documented no-op (AOSP guards the method on
+# `action != null`) — and their deferred bodies had no latch, so a capture block
+# could draw on a destroyed WebView and cache an EMPTY bitmap under that
+# formula's key. The criteria below are derived: the latch call, the removal of
+# the tracked runnables, the teardown plan and the guard positions are all read
+# from the code, never from a member list.
+ONRELEASE_RE = re.compile(r"\bonRelease\s*=\s*\{")
+DEFERRED_RE = re.compile(r"(?<![\w.])(?:post|postDelayed)\s*(?:\(\s*)?\{")
+NAMED_RUNNABLE_RE = re.compile(r"\bval\s+([A-Za-z_]\w*)\s*=\s*Runnable\s*\{")
+NAMED_REMOVE_RE = re.compile(r"removeCallbacks\(\s*(?!null\b)([^)\s])")
+NULL_CLEAR = "removeCallbacks(null)"
+DETACH_TOKENS_ANY = ("removeView(", "detach(")
+POLICY_LISTS_RE = re.compile(r"listOf\(([^)]*)\)")
+STEP_RE = re.compile(r"ReleaseStep\.([A-Z_]+)")
+
+def lambda_body(text, brace_at):
+    """`{...}` body at `brace_at` (the index of a '{'), or None."""
+    if brace_at < 0 or brace_at >= len(text) or text[brace_at] != "{":
+        j = text.find("{", max(brace_at, 0))
+        if j < 0:
+            return None
+        brace_at = j
+    body, _end = brace_body(text, brace_at)
+    return body
+
+def deferred_body_guarded(body):
+    """True iff the body's FIRST statement is `if (<latch>…) return…`.
+
+    Fail-closed by construction: the guard has to open the block. A guard placed
+    after the work it was meant to stop is exactly the pre-fix shape with extra
+    text.
+    """
+    inner = body[1:]
+    i = 0
+    while i < len(inner) and inner[i] in " \t\r\n":
+        i += 1
+    if not inner.startswith("if", i):
+        return False
+    j = inner.find("(", i)
+    if j < 0:
+        return False
+    depth = 0
+    k = j
+    while k < len(inner):
+        c = inner[k]
+        if c == '"' or c == "'":
+            k = skip_string(inner, k)
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        k += 1
+    cond = inner[j:k + 1]
+    if "canRunDeferred(" not in cond and "isReleased" not in cond:
+        return False
+    return re.match(r"\s*return\b", inner[k + 1:k + 120]) is not None
+
+def analyse_release_latch(sources):
+    """-> [(criterion, ok, detail)] for the offscreen WebView release contract.
+
+    `sources` = [(label, source)] — one entry per AndroidView host.
+    """
+    out = []
+    for label, src in sources:
+        doc = strip_comments(src)
+        bodies = []
+        for m in ONRELEASE_RE.finditer(doc):
+            body = lambda_body(doc, m.end() - 1)
+            if body:
+                bodies.append(body)
+        if not bodies:
+            out.append((
+                "%s has no AndroidView onRelease teardown (the renderer leaks)" % label,
+                False,
+                label,
+            ))
+            continue
+        for body in bodies:
+            latch = body.find(".release()")
+            plan = body.find("releasePlan(")
+            drop = body.find("removeCallbacks(")
+            stop = body.find("stopLoading()")
+            destroy = body.find("destroy()")
+            touches = [i for i in (plan, drop, stop, destroy) if i >= 0]
+            out.append((
+                "%s release path touches the WebView before latching it" % label,
+                latch >= 0 and touches and latch < min(touches),
+                "%s onRelease latch=%d first-touch=%s"
+                % (label, latch, min(touches) if touches else "none"),
+            ))
+            out.append((
+                "%s release path does not use the derived teardown plan" % label,
+                plan >= 0,
+                "%s onRelease" % label,
+            ))
+            out.append((
+                "%s release path does not remove the deferred work by identity" % label,
+                NAMED_REMOVE_RE.search(body) is not None,
+                "%s onRelease" % label,
+            ))
+            out.append((
+                "%s release path no longer stops and destroys the WebView" % label,
+                stop >= 0 and destroy >= 0 and stop < destroy,
+                "%s onRelease stop=%d destroy=%d" % (label, stop, destroy),
+            ))
+            # Defensive: a bulk null-clear may only run once the view is detached
+            # (that is the only ordering under which it even has a local meaning;
+            # as written it removes nothing at all, which is why it is gone).
+            null_clear = body.find(NULL_CLEAR)
+            if null_clear >= 0:
+                detach = min([i for i in (body.find(t) for t in DETACH_TOKENS_ANY) if i >= 0] or [-1])
+                out.append((
+                    "%s release path clears view callbacks with removeCallbacks(null) "
+                    "before detaching" % label,
+                    detach >= 0 and detach < null_clear,
+                    "%s onRelease detach=%d null-clear=%d" % (label, detach, null_clear),
+                ))
+
+        # Every deferred block — inline `post { … }` and named
+        # `val x = Runnable { … }` alike — must open with the latch guard.
+        blocks = [(m.start(), lambda_body(doc, m.end() - 1)) for m in DEFERRED_RE.finditer(doc)]
+        blocks += [(m.start(), lambda_body(doc, m.end() - 1)) for m in NAMED_RUNNABLE_RE.finditer(doc)]
+        if not blocks:
+            out.append((
+                "%s schedules no deferred work on its WebView at all (capture/load path gone?)"
+                % label,
+                False,
+                label,
+            ))
+        for pos, body in blocks:
+            if body is None:
+                continue
+            line = doc[:pos].count("\n") + 1
+            out.append((
+                "%s deferred block at line %d does not stand down on release" % (label, line),
+                deferred_body_guarded(body),
+                "%s:%d" % (label, line),
+            ))
+
+        # A named runnable that is never registered can never be removed by the
+        # teardown — the registration is half of the contract.
+        for m in NAMED_RUNNABLE_RE.finditer(doc):
+            name = m.group(1)
+            line = doc[:m.start()].count("\n") + 1
+            out.append((
+                "%s deferred runnable %s (line %d) is never registered with the release latch"
+                % (label, name, line),
+                re.search(r"\.track\(\s*" + re.escape(name) + r"\s*\)", doc) is not None,
+                "%s:%d" % (label, line),
+            ))
+    return out
+
+def analyse_release_policy(src):
+    """-> [(criterion, ok, detail)] for WebViewReleaseLatch.kt: the plan ORDER
+    is the contract, and the two hosts cannot re-derive it locally."""
+    doc = strip_comments(src)
+    plans = []
+    for m in POLICY_LISTS_RE.finditer(doc):
+        steps = STEP_RE.findall(m.group(1))
+        if steps:
+            plans.append(steps)
+    out = []
+    out.append((
+        "the release plan is not expressed as two driven step lists (attached / already detached)",
+        len(plans) == 2,
+        "WebViewReleaseLatch.kt plans=%d" % len(plans),
+    ))
+    if len(plans) == 2:
+        out.append((
+            "the attached-view plan does not detach first and destroy last",
+            plans[0] == ["DETACH", "DROP_DEFERRED", "STOP_LOADING", "DESTROY"],
+            "attached=%s" % plans[0],
+        ))
+        out.append((
+            "the already-detached plan does not drop the detach step (or reorders the rest)",
+            plans[1] == ["DROP_DEFERRED", "STOP_LOADING", "DESTROY"],
+            "detached=%s" % plans[1],
+        ))
+    out.append((
+        "WebViewReleaseLatch no longer exposes the deferred-work guard the hosts call",
+        "fun canRunDeferred(" in doc and "fun release(" in doc and "fun track(" in doc,
+        "WebViewReleaseLatch.kt",
+    ))
+    return out
+
 def analyse_manager(manager_src):
     """-> [(criterion, ok, detail)] for the two teardown bodies."""
     doc = strip_comments(manager_src)
@@ -453,6 +659,120 @@ GOOD_LIFECYCLE_HOLDER = """
     }
 """
 
+
+# --- [deep-audit-1046 S-07] release-latch fixtures ---------------------------
+# Shapes mirror the real files: a latch per WebView, both deferred bodies guarded,
+# a named capture runnable registered and removed by identity, teardown driven by
+# the shared plan.
+GOOD_KATEX = """
+        key(cacheKey, rendererEpoch) {
+            val releaseLatch = remember { WebViewReleaseLatch() }
+            AndroidView(
+                factory = { ctx ->
+                    WebView(ctx).apply {
+                        addJavascriptInterface(object {
+                            fun onRendered(width: Int, height: Int, error: String, token: Long) {
+                                if (!releaseLatch.canRunDeferred()) return
+                                post {
+                                    if (!releaseLatch.canRunDeferred()) return@post
+                                    layoutParams = ViewGroup.LayoutParams(bitmapW, bitmapH)
+                                    val capture = Runnable {
+                                        if (!releaseLatch.canRunDeferred()) return@Runnable
+                                        renderedBitmap = bitmap
+                                    }
+                                    releaseLatch.track(capture)
+                                    postDelayed(capture, 100)
+                                }
+                            }
+                        }, "AndroidBridge")
+                    }
+                },
+                onRelease = { wv ->
+                    val outstanding = releaseLatch.release()
+                    for (step in releasePlan(attached = wv.parent != null)) {
+                        when (step) {
+                            ReleaseStep.DETACH -> (wv.parent as? ViewGroup)?.removeView(wv)
+                            ReleaseStep.DROP_DEFERRED -> for (task in outstanding) wv.removeCallbacks(task)
+                            ReleaseStep.STOP_LOADING -> wv.stopLoading()
+                            ReleaseStep.DESTROY -> wv.destroy()
+                        }
+                    }
+                },
+            )
+        }
+"""
+
+GOOD_PREVIEW = """
+    key(item.file, rendererEpoch) {
+    val releaseLatch = remember { WebViewReleaseLatch() }
+    AndroidView(
+        factory = { ctx ->
+            WebView(ctx).apply {
+                val initialLoad = Runnable {
+                    if (!releaseLatch.canRunDeferred()) return@Runnable
+                    loadUrl(targetUrl)
+                }
+                releaseLatch.track(initialLoad)
+                post(initialLoad)
+            }
+        },
+        onRelease = { wv ->
+            val outstanding = releaseLatch.release()
+            for (step in releasePlan(attached = wv.parent != null)) {
+                when (step) {
+                    ReleaseStep.DETACH -> (wv.parent as? ViewGroup)?.removeView(wv)
+                    ReleaseStep.DROP_DEFERRED -> for (task in outstanding) wv.removeCallbacks(task)
+                    ReleaseStep.STOP_LOADING -> wv.stopLoading()
+                    ReleaseStep.DESTROY -> wv.destroy()
+                }
+            }
+        },
+    )
+"""
+
+GOOD_POLICY = """
+internal fun releasePlan(attached: Boolean): List<ReleaseStep> =
+    if (attached) {
+        listOf(ReleaseStep.DETACH, ReleaseStep.DROP_DEFERRED, ReleaseStep.STOP_LOADING, ReleaseStep.DESTROY)
+    } else {
+        listOf(ReleaseStep.DROP_DEFERRED, ReleaseStep.STOP_LOADING, ReleaseStep.DESTROY)
+    }
+
+internal class WebViewReleaseLatch {
+    fun canRunDeferred(): Boolean = !released.get()
+    fun track(task: Runnable) { }
+    fun release(): List<Runnable> = emptyList()
+}
+"""
+
+# The pre-fix shape, verbatim in structure: unguarded nested `post { postDelayed }`,
+# a null-clear teardown, no latch.
+BASE_KATEX = """
+        key(cacheKey, rendererEpoch) {
+            AndroidView(
+                factory = { ctx ->
+                    WebView(ctx).apply {
+                        addJavascriptInterface(object {
+                            fun onRendered(width: Int, height: Int, error: String, token: Long) {
+                                post {
+                                    layoutParams = ViewGroup.LayoutParams(bitmapW, bitmapH)
+                                    postDelayed({
+                                        draw(canvas)
+                                        KaTeXRendererCache.cache.put(cacheKey, entry)
+                                    }, 100)
+                                }
+                            }
+                        }, "AndroidBridge")
+                    }
+                },
+                onRelease = { wv ->
+                    wv.removeCallbacks(null)
+                    wv.stopLoading()
+                    wv.destroy()
+                },
+            )
+        }
+"""
 
 def selftest():
     fails = []
@@ -688,6 +1008,201 @@ def selftest():
         ],
     )
 
+    # ── [deep-audit-1046 S-07] offscreen release latch ───────────────────────
+    # Same discipline as `expect_red`: the EXPECTED red set is written out by
+    # hand from the criterion table, never derived from a run.
+    def expect_latch(label, katex, preview, policy, want, n=None):
+        res = analyse_release_latch([
+            ("KaTeXView.kt", katex),
+            ("FilePreviewScreen.kt", preview),
+        ])
+        res += analyse_release_policy(policy)
+        got = [c for c, ok, _ in res if not ok]
+        missing = [w for w in want if not any(w in c for c in got)]
+        unexpected = [c for c in got if not any(w in c for w in want)]
+        bad = bool(missing or unexpected) or (n is not None and len(got) != n)
+        if bad:
+            fails.append(label)
+            print(
+                "  [FAIL] %s -> red set %d (want %s), missing=%r unexpected=%r"
+                % (label, len(got), n if n is not None else len(want), missing, unexpected)
+            )
+        else:
+            print("  [OK] %s -> red set %d" % (label, len(got)))
+
+    expect_latch("clean fixture: release latch contract", GOOD_KATEX, GOOD_PREVIEW, GOOD_POLICY, [], 0)
+
+    # PRE arm — the pre-fix shape: no latch, no plan, null-clear teardown, both
+    # deferred blocks unguarded.
+    expect_latch(
+        "baseline shape: every release-latch criterion red",
+        BASE_KATEX,
+        GOOD_PREVIEW,
+        GOOD_POLICY,
+        [
+            "touches the WebView before latching it",
+            "does not use the derived teardown plan",
+            "does not remove the deferred work by identity",
+            "clears view callbacks with removeCallbacks(null) before detaching",
+            "KaTeXView.kt deferred block",
+        ],
+        # 4 teardown criteria + 2 unguarded blocks (`post {` + `postDelayed({`)
+        6,
+    )
+
+    # one arm per criterion, each reddening exactly one
+    no_capture_guard = GOOD_KATEX.replace(
+        "                                        if (!releaseLatch.canRunDeferred()) return@Runnable\n",
+        "",
+    )
+    expect_latch(
+        "breaker: the capture block drops its latch guard",
+        no_capture_guard,
+        GOOD_PREVIEW,
+        GOOD_POLICY,
+        ["KaTeXView.kt deferred block"],
+        1,
+    )
+
+    late_capture_guard = GOOD_KATEX.replace(
+        "                                        if (!releaseLatch.canRunDeferred()) return@Runnable\n"
+        "                                        renderedBitmap = bitmap\n",
+        "                                        renderedBitmap = bitmap\n"
+        "                                        if (!releaseLatch.canRunDeferred()) return@Runnable\n",
+    )
+    expect_latch(
+        "breaker: the capture guard sits after the work it was meant to stop",
+        late_capture_guard,
+        GOOD_PREVIEW,
+        GOOD_POLICY,
+        ["KaTeXView.kt deferred block"],
+        1,
+    )
+
+    commented_capture_guard = GOOD_KATEX.replace(
+        "                                        if (!releaseLatch.canRunDeferred()) return@Runnable\n",
+        "                                        // if (!releaseLatch.canRunDeferred()) return@Runnable\n",
+    )
+    expect_latch(
+        "precision: a commented-out guard is not a guard",
+        commented_capture_guard,
+        GOOD_PREVIEW,
+        GOOD_POLICY,
+        ["KaTeXView.kt deferred block"],
+        1,
+    )
+
+    untracked = GOOD_KATEX.replace("                                    releaseLatch.track(capture)\n", "")
+    expect_latch(
+        "breaker: the capture runnable is never registered for removal",
+        untracked,
+        GOOD_PREVIEW,
+        GOOD_POLICY,
+        ["is never registered with the release latch"],
+        1,
+    )
+
+    unlatched = GOOD_KATEX.replace("                    val outstanding = releaseLatch.release()\n", "")
+    expect_latch(
+        "breaker: the release path never latches the view",
+        unlatched,
+        GOOD_PREVIEW,
+        GOOD_POLICY,
+        ["touches the WebView before latching it"],
+        1,
+    )
+
+    inlined_plan = GOOD_KATEX.replace(
+        "                    for (step in releasePlan(attached = wv.parent != null)) {\n"
+        "                        when (step) {\n"
+        "                            ReleaseStep.DETACH -> (wv.parent as? ViewGroup)?.removeView(wv)\n"
+        "                            ReleaseStep.DROP_DEFERRED -> for (task in outstanding) wv.removeCallbacks(task)\n"
+        "                            ReleaseStep.STOP_LOADING -> wv.stopLoading()\n"
+        "                            ReleaseStep.DESTROY -> wv.destroy()\n"
+        "                        }\n"
+        "                    }\n",
+        "                    (wv.parent as? ViewGroup)?.removeView(wv)\n"
+        "                    for (task in outstanding) wv.removeCallbacks(task)\n"
+        "                    wv.stopLoading()\n"
+        "                    wv.destroy()\n",
+    )
+    expect_latch(
+        "breaker: the release path hand-sequences the teardown instead of using the plan",
+        inlined_plan,
+        GOOD_PREVIEW,
+        GOOD_POLICY,
+        ["does not use the derived teardown plan"],
+        1,
+    )
+
+    null_instead_of_named = GOOD_KATEX.replace(
+        "ReleaseStep.DROP_DEFERRED -> for (task in outstanding) wv.removeCallbacks(task)",
+        "ReleaseStep.DROP_DEFERRED -> for (task in outstanding) wv.removeCallbacks(null)",
+    )
+    expect_latch(
+        "breaker: the tracked runnables are dropped with the null no-op again",
+        null_instead_of_named,
+        GOOD_PREVIEW,
+        GOOD_POLICY,
+        ["does not remove the deferred work by identity"],
+        1,
+    )
+
+    no_destroy = GOOD_KATEX.replace("ReleaseStep.DESTROY -> wv.destroy()", "")
+    expect_latch(
+        "breaker: the release path no longer destroys the WebView",
+        no_destroy,
+        GOOD_PREVIEW,
+        GOOD_POLICY,
+        ["no longer stops and destroys the WebView"],
+        1,
+    )
+
+    # the second host is covered by the same criteria, not by a copy of them
+    preview_unguarded = GOOD_PREVIEW.replace(
+        "                    if (!releaseLatch.canRunDeferred()) return@Runnable\n",
+        "",
+    )
+    expect_latch(
+        "breaker: the preview load drops its latch guard",
+        GOOD_KATEX,
+        preview_unguarded,
+        GOOD_POLICY,
+        ["FilePreviewScreen.kt deferred block"],
+        1,
+    )
+
+    # policy arms — the plan order is the contract both hosts inherit
+    plan_no_detach = GOOD_POLICY.replace(
+        "listOf(ReleaseStep.DETACH, ReleaseStep.DROP_DEFERRED, ReleaseStep.STOP_LOADING, ReleaseStep.DESTROY)",
+        "listOf(ReleaseStep.DROP_DEFERRED, ReleaseStep.STOP_LOADING, ReleaseStep.DESTROY)",
+    )
+    expect_latch(
+        "breaker: the attached-view plan stops detaching first",
+        GOOD_KATEX,
+        GOOD_PREVIEW,
+        plan_no_detach,
+        ["the attached-view plan does not detach first"],
+        1,
+    )
+
+    plan_single = GOOD_POLICY.replace(
+        "    } else {\n"
+        "        listOf(ReleaseStep.DROP_DEFERRED, ReleaseStep.STOP_LOADING, ReleaseStep.DESTROY)\n"
+        "    }\n",
+        "    } else {\n"
+        "        ReleaseStep.DESTROY.let { java.util.Collections.singletonList(it) }\n"
+        "    }\n",
+    )
+    expect_latch(
+        "breaker: the two plans collapse into one (the detached branch lost its steps)",
+        GOOD_KATEX,
+        GOOD_PREVIEW,
+        plan_single,
+        ["not expressed as two driven step lists"],
+        1,
+    )
+
     return fails
 
 
@@ -705,7 +1220,10 @@ def main():
     manager_path = os.path.join(root, MANAGER)
     holder_path = os.path.join(root, HOLDER)
     slot_path = os.path.join(root, SLOT)
-    for p in (manager_path, holder_path, slot_path):
+    katex_path = os.path.join(root, KATEX_VIEW)
+    preview_path = os.path.join(root, FILE_PREVIEW)
+    policy_path = os.path.join(root, RELEASE_POLICY)
+    for p in (manager_path, holder_path, slot_path, katex_path, preview_path, policy_path):
         if not os.path.isfile(p):
             print("FAIL %s not found under root %s" % (p, root))
             return 1
@@ -715,6 +1233,11 @@ def main():
     results = list(analyse_manager(manager_src))
     results += list(analyse_lifecycle(manager_src, holder_src))
     results += list(analyse_slot(open(slot_path, encoding="utf-8").read()))
+    results += list(analyse_release_latch([
+        ("KaTeXView.kt", open(katex_path, encoding="utf-8").read()),
+        ("FilePreviewScreen.kt", open(preview_path, encoding="utf-8").read()),
+    ]))
+    results += list(analyse_release_policy(open(policy_path, encoding="utf-8").read()))
 
     violations = url_decode_violations(root)
     results.append((

@@ -2,6 +2,9 @@ package com.rikkaminis.app.ui.markdown
 
 import com.rikkaminis.app.R
 import com.rikkaminis.app.browser.SafeWebViewClient
+import com.rikkaminis.app.ui.preview.ReleaseStep
+import com.rikkaminis.app.ui.preview.WebViewReleaseLatch
+import com.rikkaminis.app.ui.preview.releasePlan
 import com.rikkaminis.app.ui.theme.ChatColors
 import androidx.compose.ui.res.stringResource
 import android.annotation.SuppressLint
@@ -219,6 +222,11 @@ fun KaTeXRenderView(
         // therefore fell into the "placeholder while rendering" branch and
         // stayed blank for the new formula, instead of rendering it.
         key(cacheKey, rendererEpoch) {
+            // [deep-audit-1046 S-07] One latch per WebView instance. `key(...)`
+            // discards this block — and therefore this `remember` — whenever the
+            // renderer is replaced, so a released latch is never handed to the
+            // next WebView.
+            val releaseLatch = remember { WebViewReleaseLatch() }
             AndroidView(
                 factory = { ctx ->
                     WebView(ctx).apply {
@@ -276,6 +284,12 @@ fun KaTeXRenderView(
                              */
                             @JavascriptInterface
                             fun onRendered(width: Int, height: Int, error: String, token: Long) {
+                                // [deep-audit-1046 S-07] The page can deliver this
+                                // while the row is being torn down (the first
+                                // successful render already replaced this
+                                // AndroidView with an Image). Nothing past this
+                                // point is meaningful on a released renderer.
+                                if (!releaseLatch.canRunDeferred()) return
                                 if (error.isNotEmpty()) {
                                     AppLogger.warning(TAG, "KaTeX render failed: $error · latex=${latex.take(80)}")
                                     renderError = error
@@ -308,11 +322,30 @@ fun KaTeXRenderView(
                                     )
                                 }
 
-                                // Resize WebView to content size, then capture
+                                // Resize WebView to content size, then capture.
+                                // [deep-audit-1046 S-07] BOTH hops are latch-
+                                // guarded. This callback arrives on the JS bridge
+                                // thread, and by the time either hop runs the row
+                                // may already be gone (the first successful render
+                                // replaces this AndroidView with an Image). Pre-fix
+                                // the 100 ms block ran on the destroyed WebView:
+                                // `draw()` produced an EMPTY bitmap and
+                                // `KaTeXRendererCache.cache.put()` stored it under
+                                // this formula's key — which is a cache HIT
+                                // forever after, so the formula rendered blank for
+                                // the life of the process. `onRelease`'s
+                                // `removeCallbacks(null)` never stopped it: AOSP
+                                // guards that method on `action != null`, i.e. the
+                                // null form removes nothing at all.
                                 post {
+                                    if (!releaseLatch.canRunDeferred()) return@post
                                     layoutParams = ViewGroup.LayoutParams(bitmapW, bitmapH)
                                     requestLayout()
-                                    postDelayed({
+                                    // Named so `onRelease` can remove it by
+                                    // identity — the only cancellation form that
+                                    // actually works.
+                                    val capture = Runnable {
+                                        if (!releaseLatch.canRunDeferred()) return@Runnable
                                         val bitmap = Bitmap.createBitmap(fit.width, fit.height, Bitmap.Config.ARGB_8888)
                                         val canvas = android.graphics.Canvas(bitmap)
                                         if (fit.scale < 1f) canvas.scale(fit.scale, fit.scale)
@@ -330,7 +363,9 @@ fun KaTeXRenderView(
                                         renderedCssWidth = width
                                         renderedCssHeight = height
                                         renderedBitmap = bitmap
-                                    }, 100)
+                                    }
+                                    releaseLatch.track(capture)
+                                    postDelayed(capture, 100)
                                 }
                             }
                         }, "AndroidBridge")
@@ -382,17 +417,34 @@ fun KaTeXRenderView(
                 // a live WebView + renderer process handle behind (no destroy()
                 // anywhere in this file), accumulating for the life of the app.
                 onRelease = { wv ->
-                    // [audit-0917] Cancel the pending capture callback BEFORE
-                    // destroying. The capture runs 100ms after the resize post, and
-                    // it calls draw(canvas) on this WebView — if the view left the
-                    // composition in that window (renderedBitmap already replaced
-                    // it, or the row scrolled away), destroy() had run and the
-                    // callback drew into a destroyed WebView. removeCallbacks(null)
-                    // drops everything queued on this view, which is safe here:
-                    // nothing else schedules work on it.
-                    wv.removeCallbacks(null)
-                    wv.stopLoading()
-                    wv.destroy()
+                    // [audit-0917 / deep-audit-1046 S-07] Cancel the pending
+                    // capture BEFORE destroying. The capture runs 100 ms after the
+                    // resize post and calls draw(canvas) on this WebView — if the
+                    // view left the composition in that window (renderedBitmap
+                    // already replaced it, or the row scrolled away), destroy()
+                    // had run and the callback drew into a destroyed WebView,
+                    // caching an empty bitmap for that formula.
+                    //
+                    // `removeCallbacks(null)` — what this used to call, and what
+                    // the comment above it claimed "drops everything queued on
+                    // this view" — removes NOTHING: AOSP is
+                    // `if (action != null) { … } return false;`. The runnables are
+                    // now registered with the latch and removed by identity, and
+                    // every deferred body carries its own latch guard.
+                    //
+                    // Order (releasePlan, derived so both hosts cannot drift):
+                    // latch → detach → drop tracked work → stopLoading → destroy.
+                    val outstanding = releaseLatch.release()
+                    for (step in releasePlan(attached = wv.parent != null)) {
+                        when (step) {
+                            ReleaseStep.DETACH -> (wv.parent as? ViewGroup)?.removeView(wv)
+                            ReleaseStep.DROP_DEFERRED -> {
+                                for (task in outstanding) wv.removeCallbacks(task)
+                            }
+                            ReleaseStep.STOP_LOADING -> wv.stopLoading()
+                            ReleaseStep.DESTROY -> wv.destroy()
+                        }
+                    }
                 },
             )
         }
