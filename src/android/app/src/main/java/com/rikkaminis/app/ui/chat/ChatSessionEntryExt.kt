@@ -59,6 +59,33 @@ fun ChatViewModel.regenerateSessionTitle() {
  * draft; the DB row + title write happens asynchronously in viewModelScope
  * (local DB, ~50ms — no need to block the UI).
  *
+ * [dv24-b3] The body is a per-session durable artifact, not a 50-char title
+ * prefix. Promotion used to write ONLY `sessions.title = text.take(50)` and
+ * then drop both in-memory copies — and a promoted row has no `messages`
+ * rows, so `ChatHistoryDrawer`'s `pinnedAt / messageCounts` filter hid it,
+ * `ChatViewModel.cleanupIfEmptyOnExit` deleted it the moment the user opened
+ * and left it, and `ChatRepository.deleteEmptySessions` swept it at the next
+ * cold start. Net effect of tapping "New Chat" with a long draft: the text
+ * was destroyed, 100% of the time. The fix persists the captured text as the
+ * promoted session's first `user` row (`appendMessage`, the same single
+ * source `send()` uses — it also writes `last_message` + `updated_at`), so
+ * the row carries a message count (never swept), is visible in the drawer and
+ * re-opens with the full text in the transcript.
+ *
+ * The composer copy is cleared only AFTER that durable write lands, and it is
+ * deliberate: keeping it (as an earlier revision of this fix did) made the
+ * returned-to session show the same text twice (transcript bubble + composer)
+ * and invited a double send. Ordering is the safety net — a cancellation or a
+ * DB failure in between leaves the text in the composer, so the two copies are
+ * never both destroyed.
+ *
+ * The row is intentionally an *unanswered user turn*: that is what
+ * `InterruptedTailDetector` Case D calls it, so the session surfaces the
+ * Resume affordance (send it for real) instead of a phantom "No messages yet"
+ * chat. `_messages` is updated in place because the VM is cached in
+ * `ChatViewModelStore` and would otherwise keep rendering the pre-promotion
+ * (empty) transcript until the next process start.
+ *
  * Returns true when promotion was triggered — the caller should let
  * onNewChat proceed (the slot is already freed either way).
  */
@@ -67,19 +94,33 @@ fun ChatViewModel.promoteDraftIfNeeded(): Boolean {
     val text = _inputText.value
     if (text.isBlank()) return false
 
-    // Free the draft slot synchronously — the text is captured in `text`,
-    // and nextDraftId must return a fresh ID before the navigation fires.
-    _inputText.value = ""
+    // Free the draft slot synchronously — the text is captured in `text` and
+    // still sits in the composer, so nextDraftId may mint a fresh ID before
+    // the navigation fires without anything being destroyed.
     com.rikkaminis.app.data.ComposerDraftStore.clearDraft(context, sessionId)
 
-    // Create a real session row + set its title asynchronously.
+    // Create a real session row, a title, and the durable body copy.
     viewModelScope.launch {
         val sid = ensureSession()
-        if (sid.isNotEmpty()) {
-            val title = text.take(50).trim()
-            chatRepository.updateSessionTitleAndCategory(sid, title, null)
-            _sessionTitle.value = title
-        }
+        if (sid.isEmpty()) return@launch
+        val title = text.take(50).trim()
+        chatRepository.updateSessionTitleAndCategory(sid, title, null)
+        _sessionTitle.value = title
+        // The transcript row is the durable home for the body: `appendMessage`
+        // also refreshes `last_message` + `updated_at`, which is what makes the
+        // row visible (and un-sweepable) without a second write.
+        val promoted = chatRepository.appendMessage(
+            sid,
+            "user",
+            buildUserPartsJson(text, emptyList()),
+        )
+        _messages.value = _messages.value + ChatMessage(
+            id = promoted.id,
+            role = "user",
+            content = text,
+        )
+        // Only now is the composer copy redundant. See the KDoc above.
+        _inputText.value = ""
     }
     return true
 }
