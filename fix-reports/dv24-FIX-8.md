@@ -301,8 +301,9 @@ SUT（`providerModelFor` 的函数体）由 `extract.py` **从真树按字节切
 2. `ba3611ef` — **测试**：`ChatProviderModelSourceTest.kt`
 3. `3d3bf5c1` — **门**：`models_provider_field_check.py` + `session_provider_enabled_check.py`
    → **CI 绿于此提交**（run `39894373704`）
-4. `5c32285c` — **报告**：`fix-reports/dv24-FIX-8.md`（**不叫 `FIX-8.md`**：main 已跟踪
-   `fix-reports/FIX-8.md` = dv23/1043 波的同号报告，覆盖会抹掉那一波的记录）
+4. `5c32285c` + `ef7d9d7e` — **报告**（两笔，均在 `fix-reports/` 下）：
+   `fix-reports/dv24-FIX-8.md`（**不叫 `FIX-8.md`**：main 已跟踪 `fix-reports/FIX-8.md`
+   = dv23/1043 波的同号报告，覆盖会抹掉那一波的记录）
 
 **报告回填后源码树等价**（1042/1043 判据）：
 `git diff --name-only 3d3bf5c1 HEAD -- . ':(exclude)fix-reports'` → **空**；
