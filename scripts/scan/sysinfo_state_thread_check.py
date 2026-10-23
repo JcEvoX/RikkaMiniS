@@ -33,6 +33,19 @@ the convergence*, not the presence of a comment:
   E. CONVERGENCE POINT — `appendSystemInfo` must route through the coalescer and
      must not touch `pendingSysInfo*` again.
 
+[deep-audit-1045 B-03] Two more shapes, in the Storage page:
+
+  F. OFF-MAIN PUBLISH — no `var … by remember` Compose state may be assigned
+     inside a `withContext(Dispatchers.IO)` / `(Dispatchers.Default)` block.
+     Call arguments are not assignments. The state set is derived from the
+     file's own declarations, so renames do not evade the gate.
+  G. SINGLE INVALIDATION — the process-lifetime scan cache must have exactly one
+     non-private clearing entry, and every ViewModel entry that drives a
+     mutating `RootfsManager` operation (mutating = touches disk / publishes
+     install state, transitively through member calls) must call it BEFORE the
+     mutation. Otherwise a rootfs install / repair / reset leaves the cached
+     `shellSize` in place for the life of the process.
+
 A probe that cannot find its subject FAILS (exit 1) instead of reporting success:
 a missing class means the convergence point was deleted, not that the tree is
 clean.
@@ -361,6 +374,8 @@ def run(repo_root):
     problems += rule_single_home(repo_root, class_file, class_span)
     problems += rule_guarded_access(class_text, class_span, blank_comments(class_text))
     problems += rule_convergence(repo_root, class_file)
+    problems += rule_storage_state_off_io(repo_root)
+    problems += rule_storage_cache_invalidation(repo_root)
 
     if problems:
         print("")
@@ -374,7 +389,282 @@ def run(repo_root):
         print("appendSystemInfo through it.")
         return 1
     print("== sysinfo coalesce window has a single guarded home ==")
+    print("== storage page: background dispatchers publish nothing; rootfs "
+          "operations invalidate the cached scan ==")
     return 0
+
+
+
+# ─── [deep-audit-1045 B-03] storage page: off-Main state + cache invalidation ─
+#
+# The Storage page recomputes a process-lifetime snapshot (rootfs lstat walk,
+# DB size, per-session recursive sizing, orphan scan) and keeps it in
+# `StorageSnapshotCache` so a re-entry does not repeat the storm. Two shapes
+# went wrong and neither is visible to a single-threaded test:
+#
+#   F. OFF-MAIN PUBLISH — the composable holds its rows in `var … by remember`
+#      state, and six of those variables (plus three in the per-session detail
+#      screen) were assigned INSIDE `withContext(Dispatchers.IO)`. Compose state
+#      has no cross-thread happens-before with the frame rendering it, and two
+#      overlapping reloads can interleave assignments, so rows / totals / cache
+#      can each come from a different scan. The criterion derives the state set
+#      from the file's own `var … by remember` declarations (renames do not
+#      evade it) and flags any ASSIGNMENT to one of them inside a
+#      `Dispatchers.IO/Default` block. Call arguments (`name = value` inside a
+#      call's parentheses) are not assignments and are skipped.
+#
+#   G. SINGLE INVALIDATION — the cache must have one non-private clearing entry,
+#      and every ViewModel entry that drives a mutating `RootfsManager`
+#      operation must call it BEFORE the mutation. Without it the cached
+#      `shellSize` outlives the operation that rewrote the tree (the rescan path
+#      reuses the cached totals, it does not re-walk the rootfs), i.e. the shell
+#      row is pinned for the life of the process. The mutating member set is
+#      derived from `RootfsManager` itself (a disk/state mutation, or a call to
+#      one), so a renamed or newly added lifecycle operation is covered on the
+#      day it lands.
+
+STORAGE_SCREEN = PKG + "/ui/settings/StorageManagementScreen.kt"
+ROOTFS_VM = PKG + "/ui/sandbox/RootfsManagementViewModel.kt"
+ROOTFS_MANAGER = PKG + "/sandbox/RootfsManager.kt"
+
+OFF_MAIN_CALL = re.compile(r"withContext\(\s*Dispatchers\.(?:IO|Default)\s*\)\s*\{")
+REMEMBER_VAR = re.compile(r"^\s*var\s+(\w+)\s*(?::\s*[^=\n]+)?\s+by\s+remember\b", re.M)
+CACHE_CLEAR = "StorageSnapshotCache.snapshot = null"
+
+# Signals that a RootfsManager member mutates the rootfs or its published state.
+MUTATE_SIGNS = (
+    r"installState\.value\s*=",
+    r"deleteRecursively",
+    r"\.delete\(",
+    r"mkdirs\(",
+    r"copyTo\(",
+    r"writeText\(",
+    r"\.renameTo\(",
+)
+
+
+def brace_span(code, brace_idx):
+    """(first line, last line) 1-based of the `{`-block at [brace_idx]."""
+    depth = 0
+    for j in range(brace_idx, len(code)):
+        ch = code[j]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return (code.count("\n", 0, brace_idx) + 1, code.count("\n", 0, j) + 1)
+    return None
+
+
+def fun_body_span(code, after_params_idx):
+    """Span of a member's `{`-body, or None for an expression / abstract body.
+
+    Scanning from just after the parameter list's `(`: the first `=` at paren
+    depth 0 means `fun f(): T = expr`, which has no body to inspect. Assuming
+    the next `{` is the body instead would make such a member swallow the NEXT
+    member's body — and a read-only member that swallowed a mutating one would
+    be classified as mutating.
+    """
+    depth, i = 1, after_params_idx
+    while i < len(code):
+        ch = code[i]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                j = i + 1
+                while j < len(code) and code[j] not in "={":
+                    j += 1
+                if j >= len(code):
+                    return None
+                if code[j] == "{":
+                    return brace_span(code, j)
+                # `= expr`. The house shape for a suspend member is
+                # `= withContext(Dispatchers.IO) { … }`, so the mutation lives in
+                # that trailing lambda — take its span. A genuinely bodiless
+                # expression (`= true`) gets just its own line, and a member that
+                # starts before any `{` ends the search (otherwise this would
+                # swallow the NEXT member's body, which is how a read-only
+                # member would be mistaken for a mutating one).
+                k = code.find("{", j)
+                eq_line = code.count("\n", 0, j)
+                if k < 0:
+                    return (eq_line + 1, eq_line + 1)
+                seg = code[j:k]
+                if re.search(r"\n\s{0,4}(?:(?:private|internal|public|override|suspend|inline)\s+)*"
+                             r"(?:fun|val|var|class|object)\s+\w+", seg):
+                    return (eq_line + 1, eq_line + 1)
+                return brace_span(code, k)
+        i += 1
+    return None
+
+
+def paren_depths(lines):
+    """Paren depth at the START of each line (0 = statement position)."""
+    out, depth = [], 0
+    for ln in lines:
+        out.append(depth)
+        depth += ln.count("(") - ln.count(")")
+        if depth < 0:
+            depth = 0
+    return out
+
+
+def off_main_blocks(code):
+    out = []
+    for m in OFF_MAIN_CALL.finditer(code):
+        span = brace_span(code, m.end() - 1)
+        if span:
+            out.append(span)
+    return out
+
+
+def rule_storage_state_off_io(repo_root):
+    """F: no Compose state is assigned from a background dispatcher."""
+    text = read(os.path.join(repo_root, STORAGE_SCREEN))
+    if text is None:
+        return ["%s [F storage-off-main] file missing — the subject of this "
+                "criterion was moved or deleted" % STORAGE_SCREEN]
+    code = blank_comments(text)
+    names = sorted(set(REMEMBER_VAR.findall(code)))
+    if not names:
+        return ["%s [F storage-off-main] no `var ... by remember` state found — "
+                "the subject of this criterion was deleted" % STORAGE_SCREEN]
+    blocks = off_main_blocks(code)
+    if not blocks:
+        return ["%s [F storage-off-main] no withContext(Dispatchers.IO|Default) "
+                "block found — the scans moved, not the writes" % STORAGE_SCREEN]
+    lines = code.split("\n")
+    depths = paren_depths(lines)
+    problems = []
+    for lo, hi in blocks:
+        shadowed = set()
+        for ln in range(lo, hi + 1):
+            stripped = lines[ln - 1].strip()
+            decl = re.match(r"(?:val|var)\s+(\w+)\b", stripped)
+            if decl:
+                shadowed.add(decl.group(1))  # a local of the same name wins
+                continue
+            if depths[ln - 1] > 0:
+                continue  # inside a call's parentheses: `name = value` is an argument
+            for name in names:
+                if name in shadowed:
+                    continue
+                if re.match(r"%s\s*(?:\+=|-=|=)(?!=)" % re.escape(name), stripped):
+                    problems.append("[F storage-off-main] %s:%d assigns Compose state "
+                                    "`%s` on a background dispatcher: %s"
+                                    % (STORAGE_SCREEN, ln, name, stripped))
+    return problems
+
+
+def invalidation_entry(text):
+    """(name, span) of the file-level non-private cache-clearing entry."""
+    code = blank_comments(text)
+    for m in re.finditer(r"^(?:internal |public )?fun\s+(\w+)\s*\(\s*\)\s*\{", code, re.M):
+        span = brace_span(code, m.end() - 1)
+        if not span:
+            continue
+        body = "\n".join(code.split("\n")[span[0] - 1: span[1]])
+        if CACHE_CLEAR in body:
+            return m.group(1), span
+    return None
+
+
+def mutating_manager_members(manager_text):
+    """RootfsManager's non-private members that mutate disk / published state.
+
+    Transitive: a member that only calls a mutating one (e.g. `autoRepair` →
+    `reset`) is mutating too, so a new lifecycle op cannot slip past the gate
+    by delegating.
+    """
+    code = blank_comments(manager_text)
+    bodies = {}
+    for m in re.finditer(r"^    (?!private )(?:internal |public )?(?:suspend )?fun\s+(\w+)\s*\(",
+                         code, re.M):
+        span = fun_body_span(code, m.end())
+        if not span:
+            continue
+        bodies[m.group(1)] = "\n".join(code.split("\n")[span[0] - 1: span[1]])
+    mut = {n for n, b in bodies.items() if any(re.search(s, b) for s in MUTATE_SIGNS)}
+    changed = True
+    while changed:
+        changed = False
+        for name, body in bodies.items():
+            if name in mut:
+                continue
+            if any(re.search(r"\b%s\s*\(" % re.escape(m), body) for m in mut):
+                mut.add(name)
+                changed = True
+    return mut
+
+
+def lifecycle_invalidation_problems(vm_text, entry_name, mutators):
+    code = blank_comments(vm_text)
+    lines = code.split("\n")
+    problems, seen = [], []
+    for m in re.finditer(r"^    (?:private |internal |public |override )?fun\s+(\w+)\s*\(",
+                         code, re.M):
+        span = fun_body_span(code, m.end())
+        if not span:
+            continue
+        name = m.group(1)
+        body = lines[span[0] - 1: span[1]]
+        calls = [(idx, c.group(1)) for idx, ln in enumerate(body)
+                 for c in re.finditer(r"\bmanager\.(\w+)\s*\(", ln)]
+        mut = [(idx, c) for idx, c in calls if c in mutators]
+        if not mut:
+            continue
+        seen.append(name)
+        inval = [idx for idx, ln in enumerate(body)
+                 if re.search(r"\b%s\s*\(" % re.escape(entry_name), ln)]
+        if not inval:
+            problems.append("[G cache-invalidation] %s:%d (%s) mutates the rootfs but never "
+                            "invalidates the cached storage scan"
+                            % (ROOTFS_VM, span[0], name))
+        elif inval[0] > mut[0][0]:
+            problems.append("[G cache-invalidation] %s:%d (%s) invalidates the cached storage "
+                            "scan only AFTER %s() — an interruption between the two would leave "
+                            "the stale total pinned" % (ROOTFS_VM, span[0], name, mut[0][1]))
+    if not seen:
+        problems.append("[G cache-invalidation] no ViewModel entry drives a mutating "
+                        "RootfsManager call — the lifecycle moved, so this criterion saw "
+                        "nothing to check")
+    return problems
+
+
+def rule_storage_cache_invalidation(repo_root):
+    """G: one clearing entry, called before every rootfs mutation."""
+    screen = read(os.path.join(repo_root, STORAGE_SCREEN))
+    if screen is None:
+        return ["%s [G cache-invalidation] file missing — the subject of this "
+                "criterion was moved or deleted" % STORAGE_SCREEN]
+    entry = invalidation_entry(screen)
+    if entry is None:
+        return ["%s [G cache-invalidation] no non-private entry clears the cached "
+                "scan — nothing outside this file can invalidate it" % STORAGE_SCREEN]
+    entry_name = entry[0]
+    problems = []
+    sites = [i + 1 for i, ln in enumerate(screen.split("\n"))
+             if ln.strip().startswith(CACHE_CLEAR)]
+    if len(sites) != 1:
+        problems.append("[G cache-invalidation] %s:%s clears the cache from %d places "
+                        "(single writer expected: only inside %s())"
+                        % (STORAGE_SCREEN, ",".join(str(s) for s in sites), len(sites),
+                           entry_name))
+    vm = read(os.path.join(repo_root, ROOTFS_VM))
+    mgr = read(os.path.join(repo_root, ROOTFS_MANAGER))
+    if vm is None or mgr is None:
+        problems.append("[G cache-invalidation] %s or %s missing — cannot verify who "
+                        "invalidates the storage snapshot" % (ROOTFS_VM, ROOTFS_MANAGER))
+        return problems
+    mutators = mutating_manager_members(mgr)
+    if not mutators:
+        problems.append("[G cache-invalidation] no mutating RootfsManager member found — "
+                        "the operations moved, not the invalidation")
+        return problems
+    return problems + lifecycle_invalidation_problems(vm, entry_name, mutators)
 
 
 # ─── fixtures / selftest ─────────────────────────────────────────────────────
@@ -444,6 +734,93 @@ class ChatViewModel {
 """
 
 
+GOOD_STORAGE = """package com.rikkaminis.app.ui.settings
+
+private object StorageSnapshotCache {
+    @Volatile
+    var snapshot: Snapshot? = null
+}
+
+internal fun invalidateStorageSnapshot() {
+    StorageSnapshotCache.snapshot = null
+}
+
+@Composable
+fun StorageManagementScreen() {
+    var shellSize by remember { mutableLongStateOf(0L) }
+    var orphanInfo by remember {
+        mutableStateOf<Report?>(null)
+    }
+
+    fun reload(force: Boolean = false) {
+        scope.launch {
+            val cached = StorageSnapshotCache.snapshot
+            if (cached != null) {
+                shellSize = cached.shellSize
+                orphanInfo = cached.orphanInfo
+            }
+            val scanned = withContext(Dispatchers.IO) {
+                val report = scan()
+                Snapshot(
+                    shellSize = report.totalBytes,
+                    orphanInfo = report.orphans,
+                )
+            }
+            StorageSnapshotCache.snapshot = scanned
+            shellSize = scanned.shellSize
+            orphanInfo = scanned.orphanInfo
+        }
+    }
+}
+"""
+
+GOOD_VM_ROOTFS = """package com.rikkaminis.app.ui.sandbox
+
+class RootfsManagementViewModel {
+    fun install(ctx: Context) {
+        val manager = RootfsManager.getInstance(ctx)
+        invalidateStorageSnapshot()
+        viewModelScope.launch {
+            manager.installIfNeeded()
+        }
+    }
+
+    fun repairRootfs(ctx: Context) {
+        val manager = RootfsManager.getInstance(ctx)
+        viewModelScope.launch {
+            val initial = withContext(Dispatchers.IO) {
+                manager.verifyIntegrity()
+            }
+            if (initial.healthy) return@launch
+            invalidateStorageSnapshot()
+            val repaired = manager.autoRepair()
+        }
+    }
+}
+"""
+
+GOOD_MANAGER = """package com.rikkaminis.app.ui.sandbox
+
+class RootfsManager {
+    fun verifyIntegrity(): Boolean = true
+
+    suspend fun installIfNeeded() {
+        _installState.value = RootfsInstallState.Preparing
+    }
+
+    suspend fun reset() {
+        rootfsDir.deleteRecursively()
+        installIfNeeded()
+    }
+
+    suspend fun autoRepair(): Boolean {
+        reset()
+        return true
+    }
+}
+"""
+
+
 def make_tree(files):
     root = tempfile.mkdtemp(prefix="sysinfo-state-selftest-")
     for rel, content in files.items():
@@ -456,7 +833,12 @@ def make_tree(files):
 
 def selftest():
     arms = []
-    good = {CHAT + "/ChatViewModel.kt": GOOD_VM + "\n" + GOOD_COALESCER}
+    good = {
+        CHAT + "/ChatViewModel.kt": GOOD_VM + "\n" + GOOD_COALESCER,
+        STORAGE_SCREEN: GOOD_STORAGE,
+        ROOTFS_VM: GOOD_VM_ROOTFS,
+        ROOTFS_MANAGER: GOOD_MANAGER,
+    }
     root = make_tree(good)
     arms.append(("compliant fixture is green", run(root) == 0))
     _rm(root)
@@ -503,6 +885,69 @@ def selftest():
 
     root = make_tree({CHAT + "/ChatViewModel.kt": "package x\nclass A\n"})
     arms.append(("missing coalescer class fails loudly", run(root) == 1))
+    _rm(root)
+
+    # ── [deep-audit-1045 B-03] storage page ────────────────────────────────
+
+    bad = dict(good)
+    bad[STORAGE_SCREEN] = GOOD_STORAGE.replace(
+        "                val report = scan()\n",
+        "                shellSize = 1L\n                val report = scan()\n")
+    root = make_tree(bad)
+    arms.append(("state written on the IO dispatcher is red", run(root) == 1))
+    _rm(root)
+
+    named = dict(good)
+    named[STORAGE_SCREEN] = GOOD_STORAGE.replace(
+        "                val report = scan()\n",
+        "                val report = scan()\n"
+        "                val ignored = Snapshot(\n"
+        "                    shellSize = report.totalBytes,\n"
+        "                )\n")
+    root = make_tree(named)
+    arms.append(("a call argument inside IO is not a state write", run(root) == 0))
+    _rm(root)
+
+    bad = dict(good)
+    bad[STORAGE_SCREEN] = GOOD_STORAGE.replace(
+        "internal fun invalidateStorageSnapshot", "private fun invalidateStorageSnapshot")
+    root = make_tree(bad)
+    arms.append(("a private cache-clearing entry is red", run(root) == 1))
+    _rm(root)
+
+    bad = dict(good)
+    bad[STORAGE_SCREEN] = GOOD_STORAGE + (
+        "\ninternal fun clearAgain() {\n"
+        "    StorageSnapshotCache.snapshot = null\n"
+        "}\n")
+    root = make_tree(bad)
+    arms.append(("a second cache-clearing site is red", run(root) == 1))
+    _rm(root)
+
+    bad = dict(good)
+    bad[ROOTFS_VM] = GOOD_VM_ROOTFS.replace("        invalidateStorageSnapshot()\n", "")
+    root = make_tree(bad)
+    arms.append(("a rootfs mutation that never invalidates is red", run(root) == 1))
+    _rm(root)
+
+    bad = dict(good)
+    bad[ROOTFS_VM] = GOOD_VM_ROOTFS.replace(
+        "        invalidateStorageSnapshot()\n"
+        "        viewModelScope.launch {\n"
+        "            manager.installIfNeeded()\n"
+        "        }",
+        "        viewModelScope.launch {\n"
+        "            manager.installIfNeeded()\n"
+        "        }\n"
+        "        invalidateStorageSnapshot()")
+    root = make_tree(bad)
+    arms.append(("invalidating only after the mutation is red", run(root) == 1))
+    _rm(root)
+
+    bad = dict(good)
+    bad.pop(STORAGE_SCREEN, None)
+    root = make_tree(bad)
+    arms.append(("deleting the storage screen fails loudly", run(root) == 1))
     _rm(root)
 
     print("")
