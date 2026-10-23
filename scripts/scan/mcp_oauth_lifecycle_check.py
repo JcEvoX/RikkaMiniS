@@ -238,6 +238,12 @@ SECRET_REMOVE = "remove(secretKey("
 TOKENS_REMOVE = "remove(tokensKey("
 BRIDGE_DELETE = "deleteBridgeFile("
 SECRET_ONLY_VERB = "setClientSecret("
+# [dv27-A3] the `.secret` handoff: the in-guest CLI cannot write the encrypted
+# store, so it drops `<server>.secret` next to the token bridge and expects the
+# HOST to import it. Before this, only the edit sheet ever imported it, so
+# every other reader saw the stale stored value — and `signOut` DELETED the
+# file, destroying the only copy of a client secret that cannot be re-derived.
+SECRET_IMPORT_CALL = "importPendingClientSecret("
 REPO_FULL_CALL = "MCPOAuthStore.reconcileForServer("
 REPO_HELPER_CALL = "reconcileOAuth("
 REPO_HELPER_DECL = "reconcileOAuth"
@@ -425,6 +431,113 @@ def functions(code):
 PLAY = "the convergence point"
 
 
+def _first_pos(body, needle):
+    """Index of [needle] in [body], or -1."""
+    i = body.find(needle)
+    return i
+
+
+def _imports_pending_secret(code, name, hops=1):
+    """True when `fun <name>` (or a callee ONE hop down) calls the handoff
+    import. Derived from the call graph, not from the spelling of the body:
+    the import may sit in a helper the function delegates to."""
+    bodies = {n: b for n, b, _l in functions(code) if b is not None}
+    body = bodies.get(name)
+    if body is None:
+        return False
+    if SECRET_IMPORT_CALL in body:
+        return True
+    if hops <= 0:
+        return False
+    for m in CALL_RE.finditer(body):
+        callee = m.group(1)
+        if callee == name:
+            continue
+        cb = bodies.get(callee)
+        if cb is not None and SECRET_IMPORT_CALL in cb:
+            return True
+    return False
+
+
+def check_secret_handoff(code):
+    """[dv27-A3] C5/C6 — the `.secret` handoff must have exactly one importer
+    and must never be lost.
+
+    The in-guest CLI cannot write the encrypted store, so it drops
+    `<server>.secret` next to the token bridge and expects the HOST to import
+    it. Two defects shared that file:
+
+      * only the edit sheet ever imported it, so `reconcileForServer` wrote
+        the STALE stored secret back into the bridge file and the token
+        exchange omitted `client_secret` (a confidential client answers 401);
+      * `signOut` deleted the bridge file — and with it the only copy of a
+        client secret that had never been imported and cannot be re-derived.
+
+    C5 pins the import into the single exit point (`clientSecret`) and
+    requires `signOut` to import BEFORE it deletes the bridge file.
+    C6 pins the opposite for `purge`: deleting a server must NOT write the
+    secret back into the encrypted store (that would resurrect an orphan
+    credential for a server the user just removed).
+    """
+    v = []
+    bodies = {n: b for n, b, _l in functions(code) if b is not None}
+
+    # --- C5a: the single exit point imports the pending handoff -------------
+    if "clientSecret" not in bodies:
+        v.append(
+            "MCPOAuthStore.kt: no `fun clientSecret(` — the single exit point "
+            "for a server's client secret is gone; every reader would fall "
+            "back to the stored value and ignore the CLI's `.secret` handoff "
+            "(ROT: update this gate if it was renamed)"
+        )
+    elif not _imports_pending_secret(code, "clientSecret"):
+        v.append(
+            "MCPOAuthStore.kt: `clientSecret` does not import the pending "
+            "`.secret` handoff — the in-guest CLI seeds a client secret into "
+            "`<server>.secret` because it cannot write the encrypted store, "
+            "and only the host can move it in. A reader that skips the import "
+            "sees the STALE stored value (or none), so the token exchange "
+            "omits `client_secret` and a confidential client answers 401"
+        )
+
+    # --- C5b: signOut imports before it deletes the bridge file -------------
+    signout = bodies.get("signOut")
+    if signout is None:
+        v.append(
+            "MCPOAuthStore.kt: no `fun signOut(` — the sign-out path is gone "
+            "(ROT: update this gate if it was renamed)"
+        )
+    else:
+        imp = _first_pos(signout, SECRET_IMPORT_CALL)
+        dele = _first_pos(signout, BRIDGE_DELETE)
+        if imp < 0:
+            v.append(
+                "MCPOAuthStore.kt: `signOut` does not import the pending "
+                "`.secret` handoff — it deletes the bridge file, and with it "
+                "the only copy of a client secret that was never imported and "
+                "cannot be re-derived. `signOut` promises to KEEP the client "
+                "secret; a credential loss is not a cleanup gap"
+            )
+        elif dele >= 0 and imp > dele:
+            v.append(
+                "MCPOAuthStore.kt: `signOut` deletes the bridge file BEFORE it "
+                "imports the pending `.secret` handoff — the handoff file is "
+                "gone by the time the import runs, so the client secret is "
+                "lost (the import must happen first)"
+            )
+
+    # --- C6: purge must not resurrect the secret ---------------------------
+    if "purge" in bodies:
+        if _imports_pending_secret(code, "purge"):
+            v.append(
+                "MCPOAuthStore.kt: `purge` imports the pending `.secret` "
+                "handoff — deleting a server must REMOVE its credentials, not "
+                "write them into the encrypted store. The import would leave "
+                "an orphan secret for a server the user just removed"
+            )
+    return v
+
+
 def check_store(code):
     v = []
     converge = body_of(code, "reconcileForServer")
@@ -521,6 +634,25 @@ def call_closure(code, starts):
                 stack.append(callee)
     return seen
 
+def _secret_handoff_readers(code_scoped):
+    """Names of functions that read the `.secret` HANDOFF file.
+
+    The `.secret` file carries the client secret the in-guest CLI could not
+    put into the encrypted store; the token bridge is the sibling `<id>.json`.
+    Both live under the bridge dir and both are read with `readText(`, so the
+    structural view cannot tell them apart — the string-preserving view can.
+    Without this separation the handoff reader looks like a token-bridge
+    reader, and the promotion criteria (C1-C3) would judge the WRONG file.
+    """
+    out = set()
+    for name, body, _line in functions(code_scoped):
+        if body is None:
+            continue
+        if ".secret" in body:
+            out.add(name)
+    return out
+
+
 def check_bridge_promotion(store, store_scoped, merge):
     """[dv26-A2] C1-C3 — the guest's refreshed token must survive a config save.
 
@@ -571,6 +703,15 @@ def check_bridge_promotion(store, store_scoped, merge):
     # constructor arguments they feed) are the cross-language contract, and the
     # masked view blanks exactly those literals.
     readers_scoped = bridge_readers(store_scoped)
+    # [dv27-A3] The `.secret` HANDOFF file lives under the same bridge dir and
+    # is read with the same `readText(`, so the structural walk sees it as a
+    # token-bridge reader. It is not one: it carries the client secret, not the
+    # token triple. Judging it under C1-C3 would read the wrong file (and made
+    # the "no bridge reader" fixture report a spurious C2), so the handoff
+    # reader is removed from the token-bridge set.
+    handoff = _secret_handoff_readers(store_scoped)
+    readers = {n: b for n, b in readers.items() if n not in handoff}
+    readers_scoped = {n: b for n, b in readers_scoped.items() if n not in handoff}
     if not readers:
         red("C1", "no function reads the bridge file (`%s` under the bridge dir) "
                   "— the in-guest CLI's refreshed token can be overwritten by the "
@@ -1379,6 +1520,9 @@ def run(root):
         print("mcp_oauth_lifecycle_check: cannot read sources: %s" % exc)
         return 2
     violations = check_store(store) + check_repo(repo)
+    # [dv27-A3] the `.secret` handoff (client secret the in-guest CLI could
+    # not put into the encrypted store).
+    violations += check_secret_handoff(store)
     # [dv26-A2] the guest -> host half of the token bridge (fail-closed: an
     # unreadable policy file is a violation, not a skipped check).
     try:
@@ -1468,7 +1612,23 @@ object MCPOAuthStore {
         }
     }
 
+    fun clientSecret(context: Context, server: String): String? {
+        importPendingClientSecret(context, server)?.let { return it }
+        return prefs(context).getString(secretKey(server), null)?.takeIf { it.isNotEmpty() }
+    }
+
+    fun importPendingClientSecret(context: Context, server: String): String? {
+        val file = File(bridgeDir(context), "$server.secret")
+        if (!file.exists()) return null
+        val secret = runCatching { file.readText().trim() }.getOrNull()
+        if (secret.isNullOrEmpty()) return null
+        setClientSecret(context, server, secret)
+        runCatching { file.delete() }
+        return secret
+    }
+
     fun signOut(context: Context, server: String) {
+        importPendingClientSecret(context, server)
         prefs(context).edit().remove(tokensKey(server)).apply()
         deleteBridgeFile(context, server)
     }
@@ -1602,11 +1762,55 @@ BAD_STORE_NO_PURGE = GOOD_STORE.replace(
 # tokens forgotten, bridge file left in the guest
 BAD_STORE_NO_BRIDGE_DELETE = GOOD_STORE.replace(
     """    fun signOut(context: Context, server: String) {
+        importPendingClientSecret(context, server)
+        prefs(context).edit().remove(tokensKey(server)).apply()
+        deleteBridgeFile(context, server)
+    }""",
+    """    fun signOut(context: Context, server: String) {
+        importPendingClientSecret(context, server)
+        prefs(context).edit().remove(tokensKey(server)).apply()
+    }""",
+)
+
+# ── [dv27-A3] `.secret` handoff arms ──────────────────────────────────────
+# C5a: the single exit point no longer imports the pending handoff — the
+# reader falls back to the stale stored value and the token exchange omits
+# `client_secret` (a confidential client answers 401).
+BAD_STORE_NO_SECRET_IMPORT = GOOD_STORE.replace(
+    """    fun clientSecret(context: Context, server: String): String? {
+        importPendingClientSecret(context, server)?.let { return it }
+        return prefs(context).getString(secretKey(server), null)?.takeIf { it.isNotEmpty() }
+    }""",
+    """    fun clientSecret(context: Context, server: String): String? =
+        prefs(context).getString(secretKey(server), null)?.takeIf { it.isNotEmpty() }""",
+)
+
+# C5b: signOut deletes the bridge file BEFORE importing — the handoff file is
+# gone by the time the import runs, so the client secret is lost.
+BAD_STORE_SIGNOUT_ORDER = GOOD_STORE.replace(
+    """    fun signOut(context: Context, server: String) {
+        importPendingClientSecret(context, server)
         prefs(context).edit().remove(tokensKey(server)).apply()
         deleteBridgeFile(context, server)
     }""",
     """    fun signOut(context: Context, server: String) {
         prefs(context).edit().remove(tokensKey(server)).apply()
+        deleteBridgeFile(context, server)
+        importPendingClientSecret(context, server)
+    }""",
+)
+
+# C6: purge imports the handoff — deleting a server would write its secret
+# back into the encrypted store, resurrecting an orphan credential.
+BAD_STORE_PURGE_IMPORTS = GOOD_STORE.replace(
+    """    fun purge(context: Context, server: String) {
+        prefs(context).edit().remove(tokensKey(server)).remove(secretKey(server)).apply()
+        deleteBridgeFile(context, server)
+    }""",
+    """    fun purge(context: Context, server: String) {
+        importPendingClientSecret(context, server)
+        prefs(context).edit().remove(tokensKey(server)).remove(secretKey(server)).apply()
+        deleteBridgeFile(context, server)
     }""",
 )
 
@@ -2213,6 +2417,22 @@ def selftest():
 
     s_mat = check_store(mask(BAD_STORE_NO_MATERIALIZE))
     expect_trip("purge-only reconcile fixture", s_mat, "does not call `materializeBridgeFile(")
+
+    # [dv27-A3] the `.secret` handoff arms (C5/C6).
+    expect_clean("compliant secret-handoff fixture",
+                 check_secret_handoff(mask(GOOD_STORE)))
+
+    h_noimport = check_secret_handoff(mask(BAD_STORE_NO_SECRET_IMPORT))
+    expect_trip("clientSecret without the handoff import", h_noimport,
+                "does not import the pending")
+
+    h_order = check_secret_handoff(mask(BAD_STORE_SIGNOUT_ORDER))
+    expect_trip("signOut importing after the bridge delete", h_order,
+                "BEFORE it imports")
+
+    h_purge = check_secret_handoff(mask(BAD_STORE_PURGE_IMPORTS))
+    expect_trip("purge importing the handoff", h_purge,
+                "imports the pending `.secret` handoff")
 
     r_add = check_repo(mask(BAD_REPO_ADD_UNWIRED))
     expect_trip("unwired add fixture", r_add, "`add` does not reach")

@@ -71,8 +71,25 @@ object MCPOAuthStore {
         }
     }
 
-    fun clientSecret(context: Context, server: String): String? =
-        prefs(context).getString(secretKey(server), null)?.takeIf { it.isNotEmpty() }
+    /**
+     * [dv27-A3] The single exit point for a server's client secret: a pending
+     * `.secret` handoff file wins over the stored value, and the encrypted
+     * store is the fallback.
+     *
+     * Converging the import here — rather than at each call site — is the whole
+     * point. The handoff file is written by the in-guest CLI
+     * (`minis-mcp-cli add --oauth-client-secret`), which cannot reach the
+     * encrypted store; before this, only the edit sheet ever imported it, so
+     * every other reader saw the stale stored value (or none at all):
+     * [reconcileForServer] wrote the OLD secret back into the bridge file, and
+     * [MCPOAuthController]'s token exchange omitted `client_secret`, which a
+     * confidential client answers with 401. Both now inherit the handoff for
+     * free because they read through here.
+     */
+    fun clientSecret(context: Context, server: String): String? {
+        importPendingClientSecret(context, server)?.let { return it }
+        return prefs(context).getString(secretKey(server), null)?.takeIf { it.isNotEmpty() }
+    }
 
     /**
      * [T-mcp-secret-handoff-import] The in-guest CLI seeds a client secret via
@@ -133,6 +150,14 @@ object MCPOAuthStore {
 
     /** Forget issued tokens but keep the client secret (sign out, re-auth later). */
     fun signOut(context: Context, server: String) {
+        // [dv27-A3] Delete the bridge file only AFTER any pending handoff has
+        // landed in the encrypted store. `deleteBridgeFile` unconditionally
+        // removes `<server>.secret`, and the CLI's only copy of a never-imported
+        // client secret is that file — signing out before the sheet ever opened
+        // the form destroyed a credential that cannot be re-derived (the user
+        // would have to fetch it from the provider again). Credential loss, not
+        // a cleanup gap: `signOut` promises "keep the client secret".
+        importPendingClientSecret(context, server)
         prefs(context).edit().remove(tokensKey(server)).apply()
         deleteBridgeFile(context, server)
     }
