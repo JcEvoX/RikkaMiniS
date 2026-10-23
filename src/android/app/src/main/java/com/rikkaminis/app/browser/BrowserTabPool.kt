@@ -11,6 +11,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -324,6 +325,19 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
     // @Volatile for cross-thread visibility.
     @Volatile
     private var nextTabId = 0
+
+    /**
+     * [dv24-B4 B-07] Disposal latch. Written once by [dispose] (which may run
+     * on any thread — ChatViewModel.onCleared) and read by the pool's async
+     * continuations, so it is @Volatile: a stale read is exactly the bug.
+     *
+     * Cancelling the scopes below stops work that has not started; this latch
+     * covers the work already dispatched to Main
+     * (`evictionScope.launch { withContext(Dispatchers.Main) { restoreSavedTabs() } }`),
+     * which cancellation can no longer retract.
+     */
+    @Volatile
+    private var isDisposed = false
 
     private val evictionScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var evictionJob: Job? = null
@@ -1599,8 +1613,37 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
      * deleteSessionFiles) — an unconditional saveState() here resurrected
      * the deleted session's browser_tabs/<sid>.json (plaintext URLs) on
      * disk.
+     *
+     * [dv24-B4 B-07] Disposal owns every async face of the pool, not just the
+     * eviction ticker. The two [CoroutineScope]s were instance-owned and never
+     * cancelled, so after disposal:
+     *  - a `restoreSavedTabs()` already dispatched to Main by [loadSavedState]
+     *    ran to completion — rebuilding WebViews on a destroyed pool (never
+     *    destroyed again: main thread + a leaked Context) and then persisting
+     *    the tab list, re-creating the very `<sid>.json` the session deletion
+     *    had just removed (breaking the dv14-B2 invariant above);
+     *  - in-flight downloads kept writing into
+     *    `filesDir/minis-sessions/<sid>/workspace/downloads/` and kept posting
+     *    progress through [onDownloadEvent] into the cleared ViewModel.
+     * Idempotent: the release half runs exactly once per instance.
      */
     fun dispose() {
+        if (isDisposed) return
+        isDisposed = true
+        // Scope-level cancel first: it stops anything not yet started AND
+        // detaches the children, so the per-job sweep below is belt-and-braces
+        // for jobs registered through `downloadJobs` (the map is the pool's own
+        // index of them, not a promise that every one was launched here).
+        evictionScope.cancel()
+        downloadScope.cancel()
+        for (job in downloadJobs.values) {
+            job.cancel()
+        }
+        downloadJobs.clear()
+        // Drop the pending-restore table and the chat-callback: both point at
+        // the session/ViewModel that is going away.
+        savedURLs.clear()
+        onDownloadEvent = null
         evictionJob?.cancel()
         evictionJob = null
         runCatching { context.applicationContext.unregisterComponentCallbacks(this) }
@@ -1869,6 +1912,12 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
     // -- Disk Persistence --
 
     private fun saveState() {
+        // [dv24-B4 B-07] A disposed pool must never write its tab list back:
+        // the owning session may have been deleted a moment ago, and a
+        // late-landing restore (already queued on Main when dispose ran) used
+        // to re-create that session's <sid>.json. Fail-closed on the latch,
+        // before any disk touch.
+        if (isDisposed) return
         // [dv23-B4 B-04] A pool that only BORROWS a session's context (the
         // process-wide shared pool, bound through bindSessionContextOnly) must
         // never persist its tab list into that session's
@@ -1996,6 +2045,12 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
      * the restored ones.
      */
     private fun restoreSavedTabs() {
+        // [dv24-B4 B-07] Cancelling evictionScope stops a *pending* launch, but
+        // a restore already dispatched to Main survives it — and rebuilding
+        // tabs on a disposed pool creates WebViews nobody will ever destroy
+        // (up to 50-100 MB each, plus the Context they hold). Bail before the
+        // first createTab.
+        if (isDisposed) return
         val currentTabs = _tabs.value.toMutableList()
         val plan = planTabRestore(savedURLs.keys.toList(), currentTabs.map { it.id }, _selectedTabId.value)
         var restored = 0
