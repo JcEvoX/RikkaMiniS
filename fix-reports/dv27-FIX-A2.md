@@ -118,7 +118,8 @@ rc=1
 
 `L3 RESULT: ALL ARMS MATCH`。附加证据：首个 POST 轮次全红是因为装置漏了 `kotlin-stdlib` 在**运行时** classpath（`NoClassDefFoundError: kotlin/jvm/internal/Intrinsics`），不是被测代码问题；补 `/opt/kotlinc/lib/kotlin-stdlib.jar` 后转绿（记录在 §8）。
 
-**L4（CI）**：见 §7（提交后回填）。
+**L4（CI）**：**run `40002574114` / job `120582199256` / run #2578 / attempt 1 / event `workflow_dispatch` / conclusion `success` @ `6fe519f8`**（三方 sha 逐字符一致：本地 == `run.head_sha` == `ls-remote`）。26 步，**坏步 0**，唯一 `skipped` = `Publish to Releases`（main 门控，符合预期）。日志 1,444,024 B 判读：`Summary:` 行 8 条**全部 0 failed**（含 `║  Summary: 111 passed, 0 failed`）· 门头 **111 个互异**（`[1/111]..[111/111]`）· `✅ ALL 340 CASES PASS` · 编译错 `e:` **0** · **本支 4 个文件的诊断（`e:`/`w:`）0 条** · 5 条新用例逐条 `PASSED`（`absentKeyDecodesAsOff` / `everyKnownLevelRoundTrips` / `appendedAutoCaseRoundTrips` / `unknownValueThrowsInsteadOfSilentlyDegrading` / `lowercaseIsNotSilentlyAccepted`）。
+判读纪律：run/job/step 结论取自 **API JSON**（`run.conclusion` / `steps[].conclusion`），日志只用于确认形状（`Summary:` / 门头 / `ALL 340`），不从日志文本猜步骤是否 skipped —— 1042-B5 的同族教训。
 
 ---
 
@@ -134,7 +135,11 @@ rc=1
 
 ## 7. 身份链
 
-基线 `88ef9b27` → 本文档提交后回填（生产/测试/门 → 报告 → CI run / job / head_sha）。
+基线 `88ef9b27` → 生产+测试 `9768b220` → 门 `0c64bdf1` → 报告 `6fe519f8`（CI 绿于此）→ 报告回填（本条提交）。
+
+- **CI 验过的代码树 = `6fe519f8`**：run `40002574114` / job `120582199256` / #2578 / attempt 1 / `conclusion=success`。
+- **报告回填提交只改 `fix-reports/`**（不在 `build-apk.yml` 的 `paths` 内、不参与构建），因此 `git diff --name-only 6fe519f8 HEAD -- . ':(exclude)fix-reports'` 必须为**空** —— 即 CI 结论对当前代码树成立（1042-A5 确立的「源码树等价」判据，避免为回填反复重跑 CI）。
+- 三方 sha 逐字符一致（本地 HEAD `6fe519f8` == `run.head_sha` == `ls-remote origin fix/dv27-a2-modelsvc-thinking-level`）。
 
 ---
 
