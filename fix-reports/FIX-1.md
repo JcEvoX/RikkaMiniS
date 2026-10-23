@@ -128,7 +128,8 @@
 **为什么 layer 2 用源码探针而不是实例化 `ProviderRepository`**：`ProviderRepository(private val context: Context)` 需要真 Android Context（Room + SharedPreferences + EncryptedSharedPreferences），沙箱/单测都构造不出来（同一理由见 `ProviderThinkingRulePublishOrderTest` 的 KDoc）。按 COMMON §4「抽不出来就写清不可 JVM 化 + 用门带牙替代，不要硬造装置」，这里把行为面压到 `effectiveEntryModel` + 真谓词（真跑），把接线圈到源码探针 + 门（带牙）。
 
 ### L4 分支 CI
-见 §8。
+**run `39891898960` / job `120213372981` attempt 1 `success`**（`workflow_dispatch`），`head_sha` 与本地/远端逐字符一致 —— 详见 §8。
+本支在 CI 上的在册证据：`model_entry_override_parity_check: OK (7 arms, 0 violations)` · `✅ … selftest has teeth (MODEL_ENTRY_OVERRIDE_SELFTEST=PASS)` · `✅ … real tree green` · **新增 12 条用例逐条 PASSED** · `SystemVoiceMemberResolutionTest` **10/10 PASSED**（任务书要求「v22 波新增用例保持全绿」，实测在册）。
 
 ---
 
