@@ -129,6 +129,33 @@ class StorageScanPolicyTest {
     }
 
     @Test
+    fun aWriteInsideALambdaArgumentIsStillFlagged() {
+        // The clear-confirm callback is a lambda inside `AlertDialog(…)`, i.e.
+        // nested in an argument list AND in statement position. Paren depth
+        // alone reads those writes as named arguments and goes blind on them —
+        // the first version of the detector did exactly that, on two real sites.
+        val nested = """
+            fun StorageManagementScreen() {
+                var minisSize by remember { mutableLongStateOf(0L) }
+                AlertDialog(
+                    confirmButton = {
+                        scope.launch {
+                            withContext(Dispatchers.IO) {
+                                minisSize = sizeOf(dir)
+                            }
+                        }
+                    },
+                )
+            }
+        """.trimIndent()
+        assertEquals(
+            "a block nested in an argument list is still statement position",
+            listOf("7:minisSize"),
+            stateWritesInsideBackgroundBlocks(nested),
+        )
+    }
+
+    @Test
     fun theScanResultIsPublishedAfterTheBackgroundBlock() {
         val code = codeOnly(screen)
         val block = code.indexOf("val scanned = withContext(Dispatchers.IO) {")
@@ -222,13 +249,7 @@ class StorageScanPolicyTest {
             RegexOption.MULTILINE,
         ).findAll(code).map { it.groupValues[1] }.toSet()
         val lines = code.lines()
-        val depths = IntArray(lines.size)
-        var depth = 0
-        for (i in lines.indices) {
-            depths[i] = depth
-            depth += lines[i].count { it == '(' } - lines[i].count { it == ')' }
-            if (depth < 0) depth = 0
-        }
+        val brackets = innermostBrackets(code)
         val out = mutableListOf<String>()
         for (block in backgroundBlockSpans(code)) {
             val shadowed = mutableSetOf<String>()
@@ -239,7 +260,9 @@ class StorageScanPolicyTest {
                     shadowed.add(decl.groupValues[1])
                     continue
                 }
-                if (depths[ln - 1] > 0) continue // `name = value` inside a call's parens
+                // `(` = in a call's argument list, so `name = value` is a named
+                // argument; `{` = inside a block (body / lambda), i.e. statements.
+                if (brackets[ln - 1] == "(") continue
                 for (name in stateNames) {
                     if (name in shadowed) continue
                     if (Regex("""^${Regex.escape(name)}\s*(?:\+=|-=|=)(?!=)""").containsMatchIn(text)) {
@@ -255,6 +278,22 @@ class StorageScanPolicyTest {
         Regex("""withContext\(\s*Dispatchers\.(?:IO|Default)\s*\)\s*\{""").findAll(code)
             .mapNotNull { m -> braceSpan(code, m.range.last) }
             .toList()
+
+    /** Innermost still-open bracket at the start of each line ("", "(", "{" …). */
+    private fun innermostBrackets(code: String): List<String> {
+        val out = mutableListOf<String>()
+        val stack = ArrayDeque<Char>()
+        for (line in code.lines()) {
+            out.add(if (stack.isEmpty()) "" else stack.last().toString())
+            for (ch in line) {
+                when (ch) {
+                    '(', '{', '[' -> stack.addLast(ch)
+                    ')', '}', ']' -> if (stack.isNotEmpty()) stack.removeLast()
+                }
+            }
+        }
+        return out
+    }
 
     /** 1-based (first, last) line of the `{`-block opening at [openIdx]. */
     private fun braceSpan(code: String, openIdx: Int): Pair<Int, Int>? {

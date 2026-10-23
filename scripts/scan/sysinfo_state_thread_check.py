@@ -501,14 +501,27 @@ def fun_body_span(code, after_params_idx):
     return None
 
 
-def paren_depths(lines):
-    """Paren depth at the START of each line (0 = statement position)."""
-    out, depth = [], 0
-    for ln in lines:
-        out.append(depth)
-        depth += ln.count("(") - ln.count(")")
-        if depth < 0:
-            depth = 0
+def innermost_brackets(code):
+    """For each line, the innermost bracket still open at its start.
+
+    `(` means the line sits directly in a call's ARGUMENT list, so `name = value`
+    there is a named argument. `{` means it sits in a block (function body,
+    `if`, or a lambda passed as an argument) — statements, where `name = value`
+    IS an assignment. Paren depth alone cannot tell those apart, and Compose code
+    nests both: the clear-confirm callback in the Storage screen is a lambda
+    inside `AlertDialog(confirmButton = { … })`, i.e. two parens deep and still
+    statement position. The first version of this gate used paren depth and went
+    blind on exactly those two writes.
+    """
+    out, stack = [], []
+    for line in code.split("\n"):
+        out.append(stack[-1] if stack else "")
+        for ch in line:
+            if ch in "({[":
+                stack.append(ch)
+            elif ch in ")}]":
+                if stack:
+                    stack.pop()
     return out
 
 
@@ -537,7 +550,7 @@ def rule_storage_state_off_io(repo_root):
         return ["%s [F storage-off-main] no withContext(Dispatchers.IO|Default) "
                 "block found — the scans moved, not the writes" % STORAGE_SCREEN]
     lines = code.split("\n")
-    depths = paren_depths(lines)
+    brackets = innermost_brackets(code)
     problems = []
     for lo, hi in blocks:
         shadowed = set()
@@ -547,8 +560,8 @@ def rule_storage_state_off_io(repo_root):
             if decl:
                 shadowed.add(decl.group(1))  # a local of the same name wins
                 continue
-            if depths[ln - 1] > 0:
-                continue  # inside a call's parentheses: `name = value` is an argument
+            if brackets[ln - 1] == "(":
+                continue  # in a call's argument list: `name = value` is an argument
             for name in names:
                 if name in shadowed:
                     continue
@@ -895,6 +908,19 @@ def selftest():
         "                shellSize = 1L\n                val report = scan()\n")
     root = make_tree(bad)
     arms.append(("state written on the IO dispatcher is red", run(root) == 1))
+    _rm(root)
+
+    bad = dict(good)
+    bad[STORAGE_SCREEN] = GOOD_STORAGE.replace(
+        "            val scanned = withContext(Dispatchers.IO) {",
+        "            val scanned = AlertDialog(confirmButton = {\n"
+        "                withContext(Dispatchers.IO) {\n"
+        "                    shellSize = 1L\n"
+        "                }\n"
+        "            })\n"
+        "            val ignored = withContext(Dispatchers.IO) {")
+    root = make_tree(bad)
+    arms.append(("a write inside a lambda argument is red", run(root) == 1))
     _rm(root)
 
     named = dict(good)
