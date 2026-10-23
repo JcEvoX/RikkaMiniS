@@ -1129,6 +1129,13 @@ class ModelExecutionService : Service() {
         }
 
         // 2) Standard sendMessage path
+        // [dv27-A02] Read the thinking level the same way the streaming path
+        // does — through the ONE shared parser. This path never read
+        // `thinking_level` at all, so every non-streamed offloaded request
+        // fell back to the `LLMProvider.sendMessage` default (OFF): the
+        // dispatcher serialized the level, the worker dropped it, and the
+        // model ran with reasoning explicitly disabled.
+        val thinkingLevel = thinkingLevelFromWire(req.optString("thinking_level", ""))
         val response = try {
             runBlocking {
                 provider.sendMessage(
@@ -1143,6 +1150,7 @@ class ModelExecutionService : Service() {
                     // them, so non-streaming function-calling turns ran with
                     // an empty tool surface.
                     tools = parseToolsJson(req.optJSONArray("tools")),
+                    thinkingLevel = thinkingLevel,
                 )
             }
         } catch (e: Throwable) {
@@ -1332,10 +1340,7 @@ class ModelExecutionService : Service() {
             // the default parameter expresses. A present-but-unparseable value
             // (newer enum case from a main-process-only build) still throws —
             // that strict contract is unchanged.
-            val thinkingLevel = req.optString("thinking_level", "").let {
-                if (it.isEmpty()) com.rikkaminis.app.data.model.ThinkingLevel.OFF
-                else safeEnum(it, com.rikkaminis.app.data.model.ThinkingLevel.OFF)
-            }
+            val thinkingLevel = thinkingLevelFromWire(req.optString("thinking_level", ""))
 
             // ── API key: read from EncryptedSharedPreferences (same uid) ──
             // [T-stale-apikey-worker-cache] Same guard as executeRun: if the
@@ -2012,21 +2017,10 @@ private class LivenessHeartbeat(
 }
 
 /**
- * [T-model-exec-strict-enum] Thrown when the worker receives an enum value
- * it doesn't recognize — typically because the main process serialized a
- * NEWER enum case that this (older) worker build doesn't know about. The
- * outer catch in executeRun / executeStreamingRun writes an error result /
- * stream error line; the main process's dispatch() retry then spawns a
- * fresh worker that reads the correct enum on its first-ever prefs load.
- *
- * Replaces the old silent-fallback-to-default behavior which could route
- * an Anthropic request through the OpenAI protocol (or vice versa) and
- * produce a confusing 400 / parse failure that looked like a provider bug.
+ * [T-model-exec-strict-enum] [UnknownEnumValueException] now lives in its own
+ * file (UnknownEnumValueException.kt) so the wire-level enum parsers can be
+ * compiled and unit-tested on a plain JVM.
  */
-internal class UnknownEnumValueException(
-    val enumClass: String,
-    val unknownValue: String,
-) : RuntimeException("unknown $enumClass value: $unknownValue")
 
 /**
  * [ISSUE-12a] One run's request body, read from disk and parsed exactly once.
