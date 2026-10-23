@@ -251,7 +251,20 @@ value 回调根本没被调用；同时 `:566` 已经武装的一次性桥凭据
 
 ### L4 CI
 
-见 §8。
+**#2550**（run `39920342153` / job `120303791910` / attempt 1，event=workflow_dispatch）：
+
+| 判据 | 结果 |
+|---|---|
+| run 身份 | `head_sha=42686631113afe15f08923780c326ad5407bd022` == 本地 HEAD == `ls-remote`（三方逐字符一致） |
+| 步骤 | 26 步，`not_ok=[]`，唯一 skipped = `Publish to Releases`（main 门控，符合分支预期） |
+| 通用判读 | `judge_generic.py` → **ALL GENERIC CRITERIA GREEN**：9 条 Summary 中恰一条 `109 passed, 0 failed`、无非零；`ALL 336 CASES PASS` 恰一条；门头 `[n/109]` 序号 1..109 连续且 109 个门名互异；编译错 `Z e: ` **0**；含 `FAILED` 的 6 行逐条确认全是 PASSED 用例名子串（游离 FAILED 0） |
+| 本门 | `Summary: 16 passed, 0 failed` + `GATE=GREEN browser_destroy_wakeup`（log:654/655）；`✅ browser_destroy_wakeup_check selftest has teeth (BROWSER_DESTROY_WAKEUP_SELFTEST=PASS)`（:1174）；`✅ browser_destroy_wakeup_check real tree green`（:1175） |
+| 新测试 | `JsDispatchDecisionTest` **7 条逐条 PASSED、FAILED 0**（log:4382+） |
+| 编译警告 | 新测试 0 条（`JsDispatchDecisionTest.kt:` 命中 0）——#2548 首次暴露的 `Java type mismatch: String? vs String` 已在 `42686631` 修掉，#2550 复验 |
+
+**#2547 / #2548 说明**：#2547 是拆分提交前的 dispatch，被强推作废（cancelled）；
+#2548 绿于 `0635d5a2`，但暴露了新测试的一处编译警告（CI 绿 ≠ 无警告，1042-A6 同族教训）⇒
+修掉后重跑得 #2550。**两次 dispatch 的日志判读都基于 steps API（`conclusion`），不是日志文本**。
 
 ---
 
@@ -290,9 +303,9 @@ value 回调根本没被调用；同时 `:566` 已经武装的一次性桥凭据
 | 项 | 值 |
 |---|---|
 | 基线 main | `1d44ec905b8f5d21a215694e9a13910c74e1f645` |
-| 本地 HEAD | `0635d5a25241dcc909244fd50916be67e0ff07b8` |
+| 本地 HEAD | `42686631113afe15f08923780c326ad5407bd022`（= `ls-remote` = CI `head_sha`，三方逐字符一致）|
 | 远端分支 | `fix/dv25-b2-webview-lifecycle` @ `0635d5a2`（`git ls-remote` 自核一致） |
-| 提交链 | `34aa5aba` 生产 → `dd70f0ca` 测试 → `0635d5a2` 门 |
-| CI run | `build-apk.yml` #2547（首次 dispatch，HEAD 为拆分前的 `1eb22801`，已作废）→ 重新 dispatch 于拆分后 `0635d5a2` |
+| 提交链 | `34aa5aba` 生产 → `dd70f0ca` 测试 → `0635d5a2` 门 → `9d6f1dca` 报告 → `42686631` 修新测试编译警告 |
+| CI run | **`build-apk.yml` #2550**（run id `39920342153` / job `120303791910` / attempt 1，event=workflow_dispatch，head_sha `42686631113afe15f08923780c326ad5407bd022`）|
 | 门 / 夹具 | 109 / 336（不变，0 新建门，冻结面 `scan.sh` / `test_scan.py` 0 触碰） |
-| 停止节点 | 分支 CI 绿（判定：run `conclusion == success` 且 `head_sha` == `0635d5a2` 逐字符一致） |
+| 停止节点 | **已达成**：#2550 `conclusion=success`，26 步 `not_ok=[]`，唯一 skipped = `Publish to Releases`（main 门控），`head_sha` 与本地 HEAD 逐字符一致 |
