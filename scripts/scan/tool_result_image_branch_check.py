@@ -15,7 +15,19 @@ the defect is invisible in review because the file looks complete, and it is
 invisible at runtime because the request still succeeds (the model simply never
 sees the bytes).
 
-Criterion (structural — behaviour is pinned by `OpenAIToolResultImagesTest`):
+[deep-audit-1045 A-03] Sibling criterion, same family ("bytes that exist but
+never reach the wire"): the three provider serializers each drop messages the
+orphan-tool-pairing sanitizer emptied, using
+`contentParts.isNotEmpty() || content.isNotEmpty()` — i.e. "is there TEXT?".
+A `minis-model-use` turn carrying only an image or only an audio block has no
+text, so the filter deleted the whole user turn and the payload never left the
+device (the request stayed valid and semantically empty). The predicate now
+lives once, in `MessagePayloadFilter.kt:hasWirePayload(...)`, and every
+empty-message filter site must route through it. Criteria 5/6 below pin the
+decision (does a media-only turn survive?) and the single source.
+
+Criterion (structural — behaviour is pinned by `OpenAIToolResultImagesTest` and
+`MessagePayloadFilterTest`):
   1. Every `*.kt` under the provider package that handles tool-result parts —
      either a `when` branch (`is AgentContentPart.ToolResult ->`) or a filter
      (`filterIsInstance<AgentContentPart.ToolResult>()`) — must reference
@@ -48,6 +60,21 @@ PROVIDER_REL = os.path.join(
 WHEN_BRANCH = "is AgentContentPart.ToolResult ->"
 FILTER_CALL = "filterIsInstance<AgentContentPart.ToolResult>()"
 IMAGE_FIELD = "imageData"
+
+# [deep-audit-1045 A-03] The empty-message filter (derived from the tree: any
+# `.filter {` / `.filterIndexed {` whose body asks `contentParts.isNotEmpty()`)
+# must route through the shared payload predicate, and that predicate must weigh
+# every media payload the providers can serialize.
+# A site is either the delegated form (predicate call) or the legacy inline form
+# (the marker the pre-fix tree used) — both are derived, so a reverted site is
+# caught by the same criterion that a new site is covered by.
+EMPTY_FILTER_SITE_MARKS = ("hasWirePayload(", "contentParts.isNotEmpty()")
+PAYLOAD_PREDICATE_FILE = "MessagePayloadFilter.kt"
+PAYLOAD_PREDICATE_DECL = "fun LLMMessage.hasWirePayload("
+PAYLOAD_PREDICATE_CALL = "hasWirePayload("
+PAYLOAD_MEDIA_ARMS = ("audioParts.isNotEmpty()", "imageParts.isNotEmpty()")
+PAYLOAD_TURN_IMAGE_ARM = "turnImageCount > 0"
+MIN_EMPTY_FILTER_SITES = 3
 
 # file (provider-relative) -> {"reason": ..., "symbol": ...}
 EXEMPTIONS = {
@@ -125,6 +152,104 @@ def branch_block(text, start):
     return text[start:end]
 
 
+def enclosing_block(text, target):
+    """Return (start, block) of the innermost brace block containing [target],
+    or (None, None). Braces inside comments/strings are ignored."""
+    code = strip_comments_and_strings(text)
+    stack = []
+    for idx, ch in code:
+        if idx >= target:
+            break
+        if ch == "{":
+            stack.append(idx)
+        elif ch == "}" and stack:
+            stack.pop()
+    if not stack:
+        return (None, None)
+    start = stack[-1]
+    depth = 0
+    opened = False
+    for idx, ch in code:
+        if idx < start:
+            continue
+        if ch == "{":
+            depth += 1
+            opened = True
+        elif ch == "}":
+            depth -= 1
+            if opened and depth == 0:
+                return (start, text[start:idx + 1])
+    return (None, None)
+
+
+def payload_filter_sites(text):
+    """Derive the empty-message filter sites in one file: every brace block that
+    opens a `.filter` / `.filterIndexed` lambda and either delegates to the
+    shared predicate or still carries the legacy inline marker. No line numbers
+    and no file list, so a new provider call site is covered the day it lands,
+    and a site reverted to the inline predicate is caught by the same pass."""
+    sites = []
+    seen = set()
+    for mark in EMPTY_FILTER_SITE_MARKS:
+        for m in re.finditer(re.escape(mark), text):
+            start, block = enclosing_block(text, m.start())
+            if start is None or start in seen:
+                continue
+            head = text[max(0, start - 40):start]
+            if not re.search(r"\.filter(Indexed)?\s*$", head):
+                continue
+            seen.add(start)
+            sites.append((text[:start].count("\n") + 1, block))
+    return sites
+
+
+def check_payload_filters(root, provider_dir, texts):
+    """[deep-audit-1045 A-03] Empty-message filters must keep media-only turns,
+    through the one shared predicate."""
+    violations = []
+    total = 0
+    for rel, text in texts.items():
+        for line, block in payload_filter_sites(text):
+            total += 1
+            if PAYLOAD_PREDICATE_CALL in block:
+                continue
+            missing = [arm for arm in PAYLOAD_MEDIA_ARMS if arm not in block]
+            violations.append(
+                "%s:%d empty-message filter drops media-only turns (no %s, no shared "
+                "%s) — a minis-model-use turn carrying only an image or an audio block "
+                "is deleted and the bytes never reach the model"
+                % (rel, line, " / ".join(missing) or "<media arm>", PAYLOAD_PREDICATE_CALL)
+            )
+    if total < MIN_EMPTY_FILTER_SITES:
+        violations.append(
+            "only %d empty-message filter site(s) found under the provider package "
+            "(expected >= %d) — the filter was removed or renamed, which either loses the "
+            "sanitizer defense or hides the media arm from this gate"
+            % (total, MIN_EMPTY_FILTER_SITES)
+        )
+    predicate = texts.get(PAYLOAD_PREDICATE_FILE)
+    if predicate is None:
+        violations.append(
+            "%s: the shared payload predicate file is gone — the three serializers are "
+            "free to drift apart again" % PAYLOAD_PREDICATE_FILE
+        )
+        return violations, total
+    if PAYLOAD_PREDICATE_DECL not in predicate:
+        violations.append(
+            "%s: '%s' declaration not found (the predicate was inlined or renamed)"
+            % (PAYLOAD_PREDICATE_FILE, PAYLOAD_PREDICATE_DECL)
+        )
+        return violations, total
+    alive = [arm for arm in PAYLOAD_MEDIA_ARMS + (PAYLOAD_TURN_IMAGE_ARM,) if arm not in predicate]
+    if alive:
+        violations.append(
+            "%s: the payload predicate no longer weighs %s — that payload can only come "
+            "from a media-only turn, so dropping the arm re-drops the user's turn"
+            % (PAYLOAD_PREDICATE_FILE, ", ".join(alive))
+        )
+    return violations, total
+
+
 def scan_root(root, exemptions=None):
     """Return (violations, scanned_files, per_file_report)."""
     exemptions = EXEMPTIONS if exemptions is None else exemptions
@@ -132,6 +257,7 @@ def scan_root(root, exemptions=None):
     violations = []
     report = []
     scanned = 0
+    texts = {}
     if not os.path.isdir(provider_dir):
         return (["provider package not found at %s" % provider_dir], 0, [])
 
@@ -143,6 +269,7 @@ def scan_root(root, exemptions=None):
             rel = os.path.relpath(path, provider_dir)
             with open(path, encoding="utf-8") as fh:
                 text = fh.read()
+            texts[rel] = text
             when_hits = [m.start() for m in re.finditer(re.escape(WHEN_BRANCH), text)]
             has_filter = FILTER_CALL in text
             if not when_hits and not has_filter:
@@ -195,6 +322,9 @@ def scan_root(root, exemptions=None):
                 "%s: exemption is stale — file no longer handles tool-result parts "
                 "(%s)" % (rel, exempt["reason"][:60])
             )
+
+    payload_violations, _sites = check_payload_filters(root, provider_dir, texts)
+    violations.extend(payload_violations)
     return (violations, scanned, report)
 
 
@@ -314,6 +444,110 @@ def selftest():
             "exemption with a renamed symbol is reported as rot",
             any("stale exemption" in v for v in v_dead),
         )
+
+        # [deep-audit-1045 A-03] media-only turns survive the empty-message filter
+        def payload_tree():
+            t = tempfile.mkdtemp(prefix="trimg-payload-")
+            pkg = os.path.join(t, PROVIDER_REL)
+            os.makedirs(pkg, exist_ok=True)
+
+            def w(rel, body):
+                path = os.path.join(pkg, rel)
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(body)
+
+            w(PAYLOAD_PREDICATE_FILE,
+              "internal fun LLMMessage.hasWirePayload(\n"
+              "    isLastUserTurn: Boolean,\n"
+              "    turnImageCount: Int,\n"
+              "): Boolean =\n"
+              "    contentParts.isNotEmpty() ||\n"
+              "        content.isNotEmpty() ||\n"
+              "        audioParts.isNotEmpty() ||\n"
+              "        imageParts.isNotEmpty() ||\n"
+              "        (isLastUserTurn && turnImageCount > 0)\n")
+            for rel, var in (("openai/A.kt", "a"), ("openai/B.kt", "b"),
+                             ("anthropic/C.kt", "c")):
+                w(rel,
+                  "class %s {\n"
+                  "    fun f(raw: List<LLMMessage>, images: List<Any>) {\n"
+                  "        val sites = raw\n"
+                  "            .filterIndexed { index, m ->\n"
+                  "                m.hasWirePayload(\n"
+                  "                    isLastUserTurn = index == 0,\n"
+                  "                    turnImageCount = images.size,\n"
+                  "                )\n"
+                  "            }\n"
+                  "    }\n"
+                  "}\n" % ("P" + var.upper()))
+            return t, pkg
+
+        p_root, p_pkg = payload_tree()
+        try:
+            v_clean, _sc, _rp = scan_root(p_root)
+            check("media-aware filter sites are green",
+                  not any("empty-message filter" in v or "payload predicate" in v
+                          for v in v_clean),
+                  str(v_clean[:2]))
+
+            def mutate(rel, old, new_text):
+                path = os.path.join(p_pkg, rel)
+                with open(path, encoding="utf-8") as fh:
+                    body = fh.read()
+                assert old in body, "fixture mutation anchor missing in %s" % rel
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(body.replace(old, new_text, 1))
+
+            # (1) predicate loses the audio arm
+            mutate(PAYLOAD_PREDICATE_FILE, "        audioParts.isNotEmpty() ||\n", "")
+            v_audio, _, _ = scan_root(p_root)
+            check("dropping the audio arm is red",
+                  any(PAYLOAD_PREDICATE_FILE in v and "audioParts" in v for v in v_audio),
+                  str(v_audio[:2]))
+            mutate(PAYLOAD_PREDICATE_FILE, "        content.isNotEmpty() ||\n",
+                   "        content.isNotEmpty() ||\n        audioParts.isNotEmpty() ||\n")
+
+            # (2) predicate loses the request-level turn-image arm
+            mutate(PAYLOAD_PREDICATE_FILE,
+                   "        imageParts.isNotEmpty() ||\n"
+                   "        (isLastUserTurn && turnImageCount > 0)\n",
+                   "        imageParts.isNotEmpty()\n")
+            v_turn, _, _ = scan_root(p_root)
+            check("dropping the turn-image arm is red",
+                  any(PAYLOAD_PREDICATE_FILE in v and "turnImageCount" in v for v in v_turn),
+                  str(v_turn[:2]))
+            mutate(PAYLOAD_PREDICATE_FILE,
+                   "        imageParts.isNotEmpty()\n",
+                   "        imageParts.isNotEmpty() ||\n"
+                   "        (isLastUserTurn && turnImageCount > 0)\n")
+
+            # (3) one site reverts to the legacy inline predicate
+            mutate("openai/B.kt",
+                   "                m.hasWirePayload(\n"
+                   "                    isLastUserTurn = index == 0,\n"
+                   "                    turnImageCount = images.size,\n"
+                   "                )\n",
+                   "                m.contentParts.isNotEmpty() || m.content.isNotEmpty()\n")
+            v_site, _, _ = scan_root(p_root)
+            check("a site reverted to the inline text-only predicate is red",
+                  any("openai/B.kt" in v and "empty-message filter" in v for v in v_site),
+                  str(v_site[:2]))
+            mutate("openai/B.kt",
+                   "                m.contentParts.isNotEmpty() || m.content.isNotEmpty()\n",
+                   "                m.hasWirePayload(\n"
+                   "                    isLastUserTurn = index == 0,\n"
+                   "                    turnImageCount = images.size,\n"
+                   "                )\n")
+
+            # (4) the shared predicate file disappears
+            os.remove(os.path.join(p_pkg, PAYLOAD_PREDICATE_FILE))
+            v_gone, _, _ = scan_root(p_root)
+            check("a missing payload predicate file is red",
+                  any("payload predicate file is gone" in v for v in v_gone),
+                  str(v_gone[:2]))
+        finally:
+            shutil.rmtree(p_root, ignore_errors=True)
 
         missing_dir, scanned_missing, _ = scan_root(os.path.join(tmp, "does-not-exist"))
         check(
