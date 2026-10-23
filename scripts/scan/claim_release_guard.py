@@ -19,13 +19,16 @@ That was the third generation of the same family:
     not (the "fixed one side, missed the other" step);
   - 2026-10-12 14:40: the gate existed everywhere, but the marker it compares
     was published a few statements AFTER `_isStreaming = true` — the window
-    the gate was supposed to cover was open from the flip.
+    the gate was supposed to cover was open from the flip;
+  - 2026-10-23 (deep-audit-1044 A-02): TerminalSession.start()'s preemption
+    bail-outs settled the `_state` / `termuxSession` slot of the attempt that
+    superseded them — and the gate certified them, because it counted a counter
+    INEQUALITY as an ownership gate. See C3 below (and the direction rule).
 
 The class is "stale release of a shared run-state flag": a flag with multiple
 claimants (send / retry / resume / switch-model) whose teardown paths must
 prove ownership before releasing it. Timing cannot be seen statically, but the
 two mechanical shapes every instance has exhibited CAN be:
-
   A. SIBLING-GATE INCONSISTENCY — within one flag's release-site family, some
      releases are guarded by an ownership comparison (epoch / token / job
      identity) and others are not. Ungated siblings are either a miss or a
@@ -68,12 +71,42 @@ two mechanical shapes every instance has exhibited CAN be:
          the decisions themselves disappear the gate ROTs loudly instead of
          disarming silently.
 
+     C3. [1044-A02, 2026-10-23] START PREEMPTION SETTLEMENT — inside every
+         `fun start` body, a preemption bail-out (a branch whose condition
+         proves "I am NOT the current owner" while containing a `return`)
+         must not settle shared state it no longer owns:
+
+           · it must not publish `_state.value` at all — the generation bump
+             that invalidated the attempt was made by the party that now owns
+             the state (`stop()` publishes STOPPED, a newer `start()` publishes
+             BOOTING), so publishing here overwrites a newer attempt's state and
+             pins the terminal to STOPPED while its PTY boots;
+           · a `termuxSession = …` clear / `liveSessions.remove…` must sit
+             behind an identity guard against the value captured at creation
+             (`if (termuxSession === session) { … }`). Unguarded, a superseded
+             attempt clears the PTY a newer `start()` just installed — an
+             orphaned bash tree the UI can neither write to nor resize — and
+             strands its liveSessions entry.
+
+         Same doctrine as C1: anchors the decisions, and ROTs when a file
+         declares a generation counter next to the terminal slot but no
+         `fun start` (so a rename cannot disarm it silently).
+
 ## What counts as an ownership gate
 
-The nearest enclosing `if` of a release write, if its condition compares
-identity (`===` / `!==` between two non-literal operands), or compares
-epoch/token/claim/job-named operands with `==` / `!=`. Plain business checks
-(`result != null`, `code == 200`) do NOT count — they release on a condition,
+The nearest enclosing `if` of a release write, if its condition, READ IN THE
+POLARITY IT IS USED — direction matters ([1044-A02]; the pre-1044 gate ignored
+it, which is how the defect below stayed invisible):
+
+  · taken branch  (`if (c) { …write… }`)      → ownership when `c` is
+    `==` / `===` between two non-literal operands;
+  · skipped branch (`if (c) return` above the write) → ownership when `c` is
+    `!=` / `!==` between two non-literal operands.
+
+A counter inequality in a taken branch (`if (myGeneration !=
+startGeneration.get()) { … }`) therefore means "I am stale" and is NOT a gate,
+while `if (termuxSession === session) { … }` is. Plain business checks
+(`result != null`, `code == 200`) never count — they release on a condition,
 not on ownership.
 
 ## Family scoping (false-family suppression)
@@ -134,6 +167,7 @@ DECL_RE = re.compile(r"\b(?:val|var)\s+([A-Za-z_]\w*)\b")
 OWNERSHIP_LONG = re.compile(r"(?i)(epoch|token|claim|generation|serial|owner|job)")
 OWNERSHIP_SHORT = re.compile(r"(?i)\b(gen|seq|active|isactive)\b")
 LITERAL_RE = re.compile(r"^(null|true|false|-?\d[\w.]*|\"[^\"]*\"|'[^']*')$")
+CMP_OP_RE = re.compile(r"!==|===|!=|==")
 SINGLE_IDENT_RE = re.compile(r"^[A-Za-z_]\w*$")
 
 GATE_WINDOW = 8
@@ -167,6 +201,14 @@ SETTLE_DECISIONS = (
 )
 TERM_SETTLE_KEYS = ("termuxSession", "startGeneration", "_state",
                     "liveSessions")
+
+# [1044-A02] C3 anchors: `fun start` preemption bail-outs. Named aliases of the
+# same decision shapes C1 uses, so a renamed decision ROTs in both criteria.
+START_FUN_RE = re.compile(r"\bfun\s+start\s*\(")
+RETURN_RE = re.compile(r"\breturn\b")
+STATE_PUBLISH_RE = re.compile(r"\b_state\s*\.\s*value\s*=(?!=)")
+SLOT_CLEAR_RE = re.compile(r"\btermuxSession\s*=(?!=)")
+LIVE_REMOVE_RE = re.compile(r"\bliveSessions\s*\.\s*(?:remove\w*|clear)\b")
 
 # Audited (file, key) pairs where the ungated release is demonstrably safe in
 # the current architecture. Every entry states WHY — re-audit when the file's
@@ -228,17 +270,46 @@ def extract_condition(text, open_paren):
 
 
 def compare_operands(cond):
-    """Yield (left, right) operand strings for ==/!=/===/!== in a condition."""
+    """Yield (op, left, right) for each comparison in a condition, left to right.
+
+    [1044-A02] Scanned with ONE alternation instead of one `finditer` per
+    operator: `"!=="` contains `"!="`, and `"!="` contains `"="`, so the
+    per-operator loop also reported a phantom `==` inside `!==` (left operand
+    `myToken !`) and turned a staleness test into an ownership gate.
+    """
     c = " ".join(cond.split())
-    for op in ("!==", "===", "!=", "=="):
-        for m in re.finditer(re.escape(op), c):
-            left = re.split(r"[&|();{]", c[:m.start()])[-1].strip()
-            right = re.split(r"[&|();{]", c[m.end():])[0].strip()
-            if left and right:
-                yield op, left, right
+    for m in CMP_OP_RE.finditer(c):
+        left = re.split(r"[&|();{]", c[:m.start()])[-1].strip()
+        right = re.split(r"[&|();{]", c[m.end():])[0].strip()
+        if left and right:
+            yield m.group(0), left, right
 
 
-def is_ownership_cond(cond):
+def is_ownership_cond(cond, taken=True):
+    """Does the branch this condition selects mean "I am the current owner"?
+
+    [1044-A02] DIRECTION MATTERS, and the pre-1044 gate ignored it. A release
+    write is safe when the branch PROVES ownership; it is the defect when the
+    branch proves the opposite and settles anyway. Both polarities of both
+    operator families exist in the tree:
+
+        if (termuxSession === session) { …settle… }    # taken  → I own it
+        if (genAtStart != generation) { …settle… }     # taken  → I am STALE
+        if (claimToken !== streamingClaimToken) return # not-taken → I own it
+
+    So ownership = `==`/`===` when the branch IS taken, and `!=`/`!==` when the
+    branch is SKIPPED (the early-return guard form). Treating every comparison
+    as a gate — what the pre-1044 gate did — is exactly how 1044-A02 hid: the
+    preemption branch in `TerminalSession.start()` read
+    `myGeneration != startGeneration.get()`, matched the `generation` stem of
+    the ownership vocabulary, and the gate therefore certified the two
+    unguarded settlements behind it (unconditional slot clear + STOPPED publish
+    over a newer attempt) as "gated".
+
+    taken=True  → the caller is the `if` body (or a span enclosed by it).
+    taken=False → the caller is the early-return form `if (cond) return`, i.e.
+                  execution continues past the guard only when cond is false.
+    """
     if not cond:
         return False
     for op, left, right in compare_operands(cond):
@@ -246,12 +317,28 @@ def is_ownership_cond(cond):
             continue
         if not re.search(r"[A-Za-z_]", left) or not re.search(r"[A-Za-z_]", right):
             continue
+        same = op in ("==", "===")
+        if same != taken:
+            continue  # this comparison, read in this branch, says "not mine"
         if op in ("===", "!=="):
             return True  # identity compare of two non-literals = TOCTOU guard
         if (OWNERSHIP_LONG.search(left) or OWNERSHIP_LONG.search(right)
                 or OWNERSHIP_SHORT.search(left) or OWNERSHIP_SHORT.search(right)):
             return True
     return False
+
+
+def is_staleness_cond(cond):
+    """[1044-A02] TRUE when `cond` proves "I am NOT the current owner".
+
+    Exactly the inverse of an ownership gate, and the shape the pre-1044 gate
+    certified as a gate: `if (myGeneration != startGeneration.get()) { …settle… }`.
+    Settling shared state inside such a branch means a superseded attempt
+    overwrites the state/slot of the attempt that superseded it.
+    """
+    return (bool(cond)
+            and not is_ownership_cond(cond, taken=True)
+            and is_ownership_cond(cond, taken=False))
 
 
 def match_brace(text, open_idx):
@@ -377,28 +464,7 @@ def terminal_settlement_findings(rel, clean_lines, fake_gates):
                             "matched — the gate's decision anchors drifted. "
                             "ROT — update this gate."))
             continue
-        spans = []
-        for fm in re.finditer(r"\bif\s*\(", body):
-            p = fm.end() - 1
-            cond = extract_condition(body, p)
-            if cond is None:
-                continue
-            line = base_line + body[:fm.start()].count("\n")
-            if (line, norm_cond(cond)) in fake_gates:
-                continue  # self-bound tautology — not a gate (C2 reports it)
-            if not is_ownership_cond(cond):
-                continue
-            after = p + len(cond) + 2
-            k = after
-            while k < len(body) and body[k] in " \t":
-                k += 1
-            if k < len(body) and body[k] == "{":
-                c = match_brace(body, k)
-                if c is not None:
-                    spans.append((k, c))
-            else:
-                nl = body.find("\n", after)
-                spans.append((after, nl if nl >= 0 else len(body)))
+        spans = ownership_spans(body, fake_gates, base_line)
         for d, label, line in decisions:
             if any(s < d <= e for s, e in spans):
                 continue
@@ -408,6 +474,135 @@ def terminal_settlement_findings(rel, clean_lines, fake_gates):
                         "newer start() would settle a live session's state. "
                         "Wrap the whole settlement in "
                         "`if (termuxSession === changedSession) { … }`."))
+    return out
+
+
+def ownership_spans(text, fake_gates=(), line_base=0):
+    """Offsets of the blocks/spans whose `if` PROVES ownership when taken.
+
+    Shared by C1 (onSessionFinished settlement) and C3 (start preemption) so
+    both anchor the same decision shape. `line_base` is the 0-based file line
+    of `text`'s first line, needed because `fake_gates` is keyed by file line.
+    """
+    spans = []
+    for fm in re.finditer(r"\bif\s*\(", text):
+        p = fm.end() - 1
+        cond = extract_condition(text, p)
+        if cond is None:
+            continue
+        line = line_base + text[:fm.start()].count("\n")
+        if (line, norm_cond(cond)) in fake_gates:
+            continue  # self-bound tautology — not a gate (C2 reports it)
+        if not is_ownership_cond(cond, taken=True):
+            continue
+        after = p + len(cond) + 2
+        k = after
+        while k < len(text) and text[k] in " \t":
+            k += 1
+        if k < len(text) and text[k] == "{":
+            c = match_brace(text, k)
+            if c is not None:
+                spans.append((k, c))
+        else:
+            nl = text.find("\n", after)
+            spans.append((after, nl if nl >= 0 else len(text)))
+    return spans
+
+
+def start_preemption_findings(rel, clean_lines, fake_gates):
+    """[1044-A02] C3: `fun start` preemption bail-outs must not settle state
+    they no longer own.
+
+    Shape under test (TerminalSession.start): the boot coroutine compares the
+    generation it captured against the live one and, having lost the race,
+    reaps its PTY and returns. Two settlements behind such a bail-out are
+    wrong, and both were unguarded in the pre-1044 tree:
+
+      · `_state.value = …` — the bump that invalidated this attempt was made by
+        the party that now owns the state (stop() publishes STOPPED, a newer
+        start() publishes BOOTING), so publishing here overwrites a newer
+        attempt's state: the terminal is pinned to STOPPED while a fresh PTY
+        boots.
+      · `termuxSession = …` / `liveSessions.remove…` — the slot is SHARED, so
+        clearing it unconditionally drops whatever a newer attempt has already
+        installed (orphaning a live PTY the UI can neither write to nor resize)
+        and strands its registry entry. The clear must sit behind an identity
+        guard against the value captured at creation
+        (`if (termuxSession === session) { … }`).
+
+    Anchors decisions, not spellings: a bail-out is recognised by the POLARITY
+    of its condition (proves "not mine" when taken) plus a `return`, never by
+    `generation`-named text — so the pre-1044 `myGeneration !=
+    startGeneration.get()` and a token-compared spelling are both covered. A
+    file that declares a generation counter next to the terminal slot but has
+    no `fun start` ROTs instead of passing silently.
+    """
+    joined = "\n".join(clean_lines)
+    out = []
+    starts = list(START_FUN_RE.finditer(joined))
+    if not starts:
+        if (re.search(r"\b(?:val|var)\s+[A-Za-z_]*[Gg]eneration[A-Za-z_]*",
+                      joined) and "termuxSession" in joined):
+            out.append(("C3-ROT", rel, 1,
+                        "terminal-family generation counter declared but no "
+                        "`fun start(` found — the preemption checkpoints were "
+                        "renamed or moved. ROT — update this gate."))
+        return out
+    for sm in starts:
+        open_brace = joined.find("{", sm.end())
+        if open_brace < 0:
+            continue
+        close = match_brace(joined, open_brace)
+        if close is None:
+            close = len(joined) - 1
+        body = joined[open_brace:close + 1]
+        base_line = joined[:open_brace].count("\n")
+        for fm in re.finditer(r"\bif\s*\(", body):
+            p = fm.end() - 1
+            cond = extract_condition(body, p)
+            if not is_staleness_cond(cond):
+                continue
+            after = p + len(cond) + 2
+            k = after
+            while k < len(body) and body[k] in " \t":
+                k += 1
+            if k < len(body) and body[k] == "{":
+                end = match_brace(body, k)
+                if end is None:
+                    continue
+                block_off, block = k, body[k:end + 1]
+            else:
+                nl = body.find("\n", after)
+                end = nl if nl >= 0 else len(body)
+                block_off, block = after, body[after:end]
+            if not RETURN_RE.search(block):
+                continue  # an inner staleness test, not a bail-out
+            block_line_base = base_line + body[:block_off].count("\n")
+
+            def line_at(off, _b=block, _o=block_off, _l=block_line_base):
+                return _l + _b[:off].count("\n") + 1
+
+            for dm in STATE_PUBLISH_RE.finditer(block):
+                out.append(("C3", rel, line_at(dm.start()),
+                            "start(): `_state.value` publish inside a "
+                            "preemption bail-out — the bump that invalidated "
+                            "this attempt was made by the party that now owns "
+                            "the state (stop() → STOPPED, a newer start() → "
+                            "BOOTING), so this write overwrites a newer "
+                            "attempt's state. Write nothing here."))
+            guards = ownership_spans(block, fake_gates, block_line_base)
+            for label, rx in (("termuxSession slot clear", SLOT_CLEAR_RE),
+                              ("liveSessions removal", LIVE_REMOVE_RE)):
+                for dm in rx.finditer(block):
+                    if any(s < dm.start() <= e for s, e in guards):
+                        continue
+                    out.append(("C3", rel, line_at(dm.start()),
+                                f"start(): {label} inside a preemption "
+                                "bail-out without an ownership guard — a "
+                                "superseded attempt would clear the newer "
+                                "attempt's PTY/registry entry. Guard it with "
+                                "the value captured at creation: "
+                                "`if (termuxSession === session) { … }`."))
     return out
 
 
@@ -462,7 +657,8 @@ def enclosing_gate(clean_lines, idx, col, fake_gates=()):
                 norm_cond(cond)) in fake_gates:
             continue
         after = tail[m.end() + len(cond) + 1:]
-        if re.match(r"\s*(return|continue)\b", after) and is_ownership_cond(cond):
+        if re.match(r"\s*(return|continue)\b", after) and is_ownership_cond(
+                cond, taken=False):
             return cond
     return None
 
@@ -585,6 +781,10 @@ def selftest():
     selfbound = prefix + base + "SelfBound.kt"
     pre_catch = prefix + base + "PreCatch.kt"
     rot = prefix + base + "Rot.kt"
+    pre_start = prefix + base + "PreStart.kt"
+    post_start = prefix + base + "PostStart.kt"
+    rot_start = prefix + base + "RotStart.kt"
+    polarity = prefix + chat + "Pol.kt"
     b_good = prefix + chat + "BG.kt"
     b_bad = prefix + chat + "BB.kt"
     sib_bad = prefix + chat + "Sib.kt"
@@ -710,6 +910,113 @@ class Rot {
 }
 """)
 
+    # [1044-A02] Pre-fix `fun start` preemption bail-outs: the superseded
+    # attempt publishes STOPPED and clears the shared slot unguarded. C3 must
+    # catch both, and Check A must see the unguarded slot clear too.
+    PRE_START = ("""package com.rikkaminis.app.sandbox
+class PreStart {
+    var termuxSession: Any? = null
+    var startGeneration = 0
+    var claimToken: Any? = null
+    val _state = St()
+    val liveSessions = mutableListOf<Any>()
+    inner class St { var value: Any? = null }
+    fun start() {
+        val myGeneration = startGeneration.incrementAndGet()
+        val session = Any()
+        if (myGeneration != startGeneration.get()) {
+            kill(session)
+            _state.value = STOPPED
+            return
+        }
+        termuxSession = session
+        if (myGeneration != startGeneration.get()) {
+            kill(session)
+            termuxSession = null
+            _state.value = STOPPED
+            return
+        }
+        val myToken = claimToken
+        if (myToken !== claimToken) {
+            kill(session)
+            liveSessions.removeAll { it === this@PreStart }
+            termuxSession = null
+            return
+        }
+        _state.value = RUNNING
+    }
+    fun attach() {
+        try {
+            termuxSession = Any()
+        } catch (t: Throwable) {
+            if (termuxSession === null) {
+                termuxSession = null
+                liveSessions.removeAll { it === this@PreStart }
+            }
+        }
+    }
+    fun kill(s: Any?) {}
+    object STOPPED
+    object RUNNING
+}
+""")
+
+    # Post-fix shape: the bail-out reaps the PTY and nothing else; the shared
+    # slot/registry release sits behind an identity guard against the value
+    # captured at creation.
+    POST_START = ("""package com.rikkaminis.app.sandbox
+class PostStart {
+    var termuxSession: Any? = null
+    var startGeneration = 0
+    val _state = St()
+    val liveSessions = mutableListOf<Any>()
+    inner class St { var value: Any? = null }
+    fun start() {
+        val myGeneration = startGeneration.incrementAndGet()
+        val session = Any()
+        if (myGeneration != startGeneration.get()) {
+            kill(session)
+            return
+        }
+        termuxSession = session
+        if (myGeneration != startGeneration.get()) {
+            kill(session)
+            if (termuxSession === session) {
+                termuxSession = null
+                liveSessions.removeAll { it === this@PostStart }
+            }
+            return
+        }
+        _state.value = RUNNING
+    }
+    fun kill(s: Any?) {}
+    object RUNNING
+    object STOPPED
+}
+""")
+
+    # ROT: the bail-out was renamed away — the criterion must ROT loudly rather
+    # than pass silently on a tree that no longer has the checkpoints.
+    ROT_START = ("""package com.rikkaminis.app.sandbox
+class RotStart {
+    var termuxSession: Any? = null
+    var startGeneration = 0
+    val _state = St()
+    inner class St { var value: Any? = null }
+    fun begin() {
+        val myGeneration = startGeneration.incrementAndGet()
+        val session = Any()
+        if (myGeneration != startGeneration.get()) {
+            kill(session)
+            _state.value = STOPPED
+            return
+        }
+    }
+    fun kill(s: Any?) {}
+    object STOPPED
+}
+""")
+
     B_GOOD = ("""package com.rikkaminis.app.ui.chat
 class BG {
     var streamingClaimToken: Any = Any()
@@ -767,6 +1074,51 @@ class Hand {
 }
 """)
 
+    # [1044-A02] Direction proof for Check A: `a` releases behind an identity
+    # guard (owner), `b` releases inside a counter INEQUALITY — "I am not the
+    # current owner". The pre-1044 gate read `streamGeneration` as ownership
+    # vocabulary and certified `b` as gated; the direction-aware gate must
+    # report it. This is the mutation arm for the polarity rule itself.
+    POLARITY = ("""package com.rikkaminis.app.ui.chat
+class Pol {
+    var streamJob: Any? = null
+    var claimJob: Any? = null
+    var streamGeneration = 0
+    var myGeneration = 0
+    fun a() { if (streamJob === claimJob) { _isStreaming.value = false } }
+    fun b() { if (myGeneration != streamGeneration) { _isStreaming.value = false } }
+}
+""")
+
+    def mutate(src, old, new):
+        assert src.count(old) == 1, "selftest fixture mutation anchor not unique"
+        return src.replace(old, new)
+
+    # 1044-A02 mutations: each new C3 sub-criterion must flip on its own.
+    MUT_NOGUARD = mutate(
+        POST_START,
+        """            if (termuxSession === session) {
+                termuxSession = null
+                liveSessions.removeAll { it === this@PostStart }
+            }""",
+        """            termuxSession = null
+            liveSessions.removeAll { it === this@PostStart }""")
+    MUT_PUBLISH = mutate(
+        POST_START,
+        """            kill(session)
+            if (termuxSession === session) {""",
+        """            kill(session)
+            _state.value = STOPPED
+            if (termuxSession === session) {""")
+    # Guard on the wrong predicate: "the slot is empty" instead of "the slot is
+    # still mine". Behaviourally indistinguishable in the JVM device when the
+    # slot is occupied (both clear nothing), so the SHAPE criterion is the only
+    # device that can see it — see the 1044-A02 arm below and report §4.
+    MUT_WRONG_PREDICATE = mutate(
+        POST_START,
+        "if (termuxSession === session) {",
+        "if (termuxSession == null) {")
+
     def mk_tree(files):
         root = tempfile.mkdtemp(prefix="claim-release-selftest-")
         for rel, text in files.items():
@@ -804,6 +1156,34 @@ class Hand {
         ("ground truth: ungated sibling caught",
          {sib_bad: SIB_BAD}, 1, ["[A]"]),
         ("ground truth: atomic hand-off passes", {handoff: HANDOFF}, 0, []),
+        # ── [1044-A02] start() preemption ownership ──
+        ("1044-A02 pre-fix start() preemption settles unowned state (C3)",
+         {pre_start: PRE_START}, 1,
+         ["[C3] ", "`_state.value` publish inside a preemption bail-out",
+          "termuxSession slot clear inside a preemption bail-out without an "
+          "ownership guard"]),
+        ("1044-A02 pre-fix token-compared bail-out ALSO caught (not "
+         "generation-bound)", {pre_start: PRE_START}, 1,
+         ["liveSessions removal inside a preemption bail-out"]),
+        ("1044-A02 post-fix start() bail-out is green (precision)",
+         {post_start: POST_START}, 0, ["NOT C3"]),
+        ("1044-A02 start() preemption ROTs when the checkpoints vanish",
+         {rot_start: ROT_START}, 1, ["C3-ROT"]),
+        ("1044-A02 mutation: slot clear loses its identity guard",
+         {post_start: MUT_NOGUARD}, 1,
+         ["termuxSession slot clear inside a preemption bail-out",
+          "NOT `_state.value` publish"]),
+        ("1044-A02 mutation: bail-out publishes state again",
+         {post_start: MUT_PUBLISH}, 1,
+         ["`_state.value` publish inside a preemption bail-out",
+          "NOT termuxSession slot clear"]),
+        ("1044-A02 direction: counter INEQUALITY is not an ownership gate (A)",
+         {polarity: POLARITY}, 1,
+         ["[A] ", "`_isStreaming` — 1 ungated"]),
+        ("1044-A02 mutation: guard on `== null` instead of identity is caught",
+         {post_start: MUT_WRONG_PREDICATE}, 1,
+         ["termuxSession slot clear inside a preemption bail-out without an "
+          "ownership guard", "NOT `_state.value` publish"]),
     ]
     failures = []
     for name, files, want_rc, needles in arms:
@@ -816,9 +1196,9 @@ class Hand {
         if rc != want_rc:
             problems.append(f"exit={rc} want={want_rc}")
         for needle in needles:
-            if needle == "NOT termuxSession slot clear":
-                if "termuxSession slot clear" in out:
-                    problems.append("flagged the guarded slot clear")
+            if needle.startswith("NOT "):
+                if needle[4:] in out:
+                    problems.append(f"unexpected {needle[4:]!r}")
             elif needle not in out:
                 problems.append(f"missing {needle!r}")
         if problems:
@@ -893,6 +1273,13 @@ def main():
             terminal_settlement_findings(rel, clean[rel],
                                          fake_gates.get(rel, ())))
 
+    # ── Check C3: start() preemption settlement ownership ([1044-A02]) ──
+    findings_c3 = []
+    for rel in sorted(clean):
+        findings_c3.extend(
+            start_preemption_findings(rel, clean[rel],
+                                      fake_gates.get(rel, ())))
+
     minted_names = {m["var"] for m in mints}
 
     # ── Check B: claim flips before publishing any gate-compared marker ──
@@ -917,7 +1304,7 @@ def main():
         findings_b.append((c, sorted(markers), nearest))
 
     total = (len(findings_a) + len(findings_b) + len(findings_c1)
-             + len(c2_reports))
+             + len(findings_c3) + len(c2_reports))
     if not total:
         print("✅ Claim/release guard: no ungated release, self-bound gate, "
               "unguarded settlement or unminted claim found")
@@ -953,6 +1340,14 @@ def main():
         print("       after a newer start() would bump the generation, publish")
         print("       STOPPED and unregister liveSessions over the live session.")
         for kind, rel, ln, msg in findings_c1:
+            print(f"     [{kind}] {rel}:{ln}  {msg}")
+    if findings_c3:
+        print("   [C3] start() preemption bail-out settles state it no longer")
+        print("       owns (1044-A02). A superseded attempt must reap its PTY")
+        print("       and nothing else: publishing _state pins the terminal to")
+        print("       STOPPED over a newer start(), clearing termuxSession")
+        print("       orphans the newer attempt's live PTY.")
+        for kind, rel, ln, msg in findings_c3:
             print(f"     [{kind}] {rel}:{ln}  {msg}")
     if findings_b:
         print("   [B] Claim flips the flag before publishing the release gate's marker.")

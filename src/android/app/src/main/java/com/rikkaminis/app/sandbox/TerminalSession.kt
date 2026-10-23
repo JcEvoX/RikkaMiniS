@@ -180,10 +180,18 @@ class TerminalSession(private val context: Context) {
                 createdSession = session
                 session.updateSize(cols, rows)
 
+                // [1044-A02] Superseded before attach: reap the PTY and NOTHING
+                // else. The bump that just invalidated this attempt was made by
+                // the party that now owns `_state` — stop() publishes STOPPED,
+                // a newer start() publishes BOOTING — so any write here lands on
+                // top of the newer attempt's state and pins the screen to
+                // STOPPED while a fresh PTY is booting (the reported symptom).
+                // There is nothing else to settle at this checkpoint either: the
+                // slot is not assigned yet (below) and liveSessions holds no
+                // entry for this attempt.
                 if (myGeneration != startGeneration.get()) {
                     Log.i(TAG, "start() superseded before attach — killing PTY")
                     killTermuxProcessTree(session)
-                    _state.value = State.STOPPED
                     return@launch
                 }
 
@@ -225,11 +233,28 @@ class TerminalSession(private val context: Context) {
                 // two earlier guards: stop() cannot cancel this coroutine, so a
                 // teardown (or a newer start()) during the 300 ms delay above
                 // must not resurrect an already-killed PTY as RUNNING.
+                // [1044-A02] Same rule, plus one: the shared slot and the
+                // registry are released ONLY while they still point at the PTY
+                // THIS attempt created. An unguarded `termuxSession = null` here
+                // clears whatever a newer start() has already installed — that
+                // newer attempt writes the slot before this checkpoint can run
+                // again — which orphans a live bash tree the UI can neither
+                // write to nor resize, and strands its liveSessions entry. Same
+                // ownership rule as the catch handler below and
+                // onSessionFinished (compare against a value captured at
+                // creation, never against the slot itself).
+                //
+                // No `_state` write for the reason spelled out at the checkpoint
+                // above: the generation bumper published the state.
                 if (myGeneration != startGeneration.get()) {
                     Log.i(TAG, "start() superseded before RUNNING — killing PTY")
                     killTermuxProcessTree(session)
-                    termuxSession = null
-                    _state.value = State.STOPPED
+                    if (termuxSession === session) {
+                        termuxSession = null
+                        liveSessions.removeAll {
+                            it.get() === this@TerminalSession || it.get() == null
+                        }
+                    }
                     return@launch
                 }
                 _state.value = State.RUNNING

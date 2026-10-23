@@ -385,7 +385,11 @@ class SystemSpeechRecognitionEngine(private val appContext: Context) : SpeechRec
     companion object {
         private const val TAG = "SystemSTT"
 
-        private fun mapError(code: Int): RecognitionError = when (code) {
+        // [deep-audit-1044 A-06] `internal` (was `private`) so the table can be
+        // exercised from JVM unit tests: the mapping is pure integer logic, and
+        // the defect it guards (a shifted code table) is invisible to any
+        // source-shape probe that only looks for the names.
+        internal fun mapError(code: Int): RecognitionError = when (code) {
             SpeechRecognizer.ERROR_NO_MATCH,
             SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> RecognitionError.NO_MATCH
             SpeechRecognizer.ERROR_NETWORK,
@@ -395,13 +399,28 @@ class SystemSpeechRecognitionEngine(private val appContext: Context) : SpeechRec
             SpeechRecognizer.ERROR_AUDIO -> RecognitionError.AUDIO_ERROR
             SpeechRecognizer.ERROR_CLIENT -> RecognitionError.OEM_NO_SERVICE
             SpeechRecognizer.ERROR_SERVER -> RecognitionError.NETWORK
-            // Codes added in API 33; referenced by literal for compatibility.
-            11 /* ERROR_LANGUAGE_NOT_SUPPORTED */,
-            12 /* ERROR_LANGUAGE_UNAVAILABLE   */ -> RecognitionError.LANGUAGE_UNSUPPORTED
+            // [deep-audit-1044 A-06] Literal ints: these constants need API 31
+            // (10/11) and API 33 (12/13). The table used to be shifted by one —
+            // it labelled 11/12 as the language pair, so 11
+            // (ERROR_SERVER_DISCONNECTED) surfaced as "language not supported"
+            // and 13 (ERROR_LANGUAGE_UNAVAILABLE) fell through to UNKNOWN. The
+            // latter broke the on-device→cloud retry in onError, which gates on
+            // LANGUAGE_UNSUPPORTED: a device with no offline pack for the
+            // locale never got its cloud second chance.
+            // 10 = ERROR_TOO_MANY_REQUESTS (API 31)
+            10 -> RecognitionError.RECOGNIZER_BUSY
+            // 11 = ERROR_SERVER_DISCONNECTED (API 31)
+            11 -> RecognitionError.NETWORK
+            // 12 = ERROR_LANGUAGE_NOT_SUPPORTED (API 33)
+            12 -> RecognitionError.LANGUAGE_UNSUPPORTED
+            // 13 = ERROR_LANGUAGE_UNAVAILABLE (API 33)
+            13 -> RecognitionError.LANGUAGE_UNSUPPORTED
             else -> RecognitionError.UNKNOWN
         }
 
-        private fun errorMessage(code: Int): String = when (code) {
+        // [deep-audit-1044 A-06] `internal` for the same reason as [mapError]:
+        // the user-visible string is part of the same decision table.
+        internal fun errorMessage(code: Int): String = when (code) {
             SpeechRecognizer.ERROR_AUDIO -> "Audio recording error"
             SpeechRecognizer.ERROR_CLIENT -> "Client error (no recognition service?)"
             SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "RECORD_AUDIO required"
@@ -411,15 +430,19 @@ class SystemSpeechRecognitionEngine(private val appContext: Context) : SpeechRec
             SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "Recognizer busy"
             SpeechRecognizer.ERROR_SERVER -> "Server error"
             SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "Speech timeout"
-            // [T-android-asr-script-subtag] mapError already classifies 11/12 as
-            // LANGUAGE_UNSUPPORTED, but this function built the user-visible
-            // string and had no case for them — so a language-pack problem
-            // surfaced as the useless "Unknown error (12)". Name the actual
-            // cause, and point at the fix the user can act on.
-            11 /* ERROR_LANGUAGE_NOT_SUPPORTED */ ->
-                "Language not supported by the recognizer"
-            12 /* ERROR_LANGUAGE_UNAVAILABLE */ ->
-                "Language pack unavailable — download it in the system speech settings"
+            // [T-android-asr-script-subtag] This function builds the string the
+            // user actually sees, so a code mapError classifies needs its own
+            // case here too — otherwise the cause surfaces as the useless
+            // "Unknown error (13)" and nothing the user can act on.
+            // [deep-audit-1044 A-06] 10/11 are API 31 codes, 12/13 are API 33.
+            // 10 = ERROR_TOO_MANY_REQUESTS
+            10 -> "Too many requests — try again in a moment"
+            // 11 = ERROR_SERVER_DISCONNECTED
+            11 -> "Recognition service disconnected"
+            // 12 = ERROR_LANGUAGE_NOT_SUPPORTED
+            12 -> "Language not supported by the recognizer"
+            // 13 = ERROR_LANGUAGE_UNAVAILABLE
+            13 -> "Language pack unavailable — download it in the system speech settings"
             else -> "Unknown error ($code)"
         }
     }

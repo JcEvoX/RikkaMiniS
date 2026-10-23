@@ -44,6 +44,31 @@ browser_tabs/<sid>.json on session reload, and selectedTabId could point at
 a destroyed tab. Both bodies must carry `saveState(` (fail-closed: an
 unextractable body = red, never a silent skip).
 
+[dv24-B4 B-07] C4e/C4f — disposal owns the pool's ASYNC faces, not just the
+eviction ticker. `dispose()` used to cancel only `evictionJob` while the two
+instance-owned CoroutineScopes (`evictionScope`, `downloadScope`) and the
+pending-restore table lived on:
+  C4e every `CoroutineScope(` field declared in the pool must be cancelled
+      from `dispose()` — directly or through a helper body in the same file
+      (a transitive call closure, so a `destroyScopes()` refactor is
+      accepted; the set of scopes is DERIVED from the file, so a future third
+      scope is covered by construction). Reason: a restore already dispatched
+      to Main rebuilt WebViews on a destroyed pool (never destroyed again:
+      main thread + leaked Context) and re-persisted the tab list, recreating
+      the `<sid>.json` the session deletion had just removed; in-flight
+      downloads kept writing into the deleted session's workspace and posting
+      through the cleared ViewModel's callback.
+  C4f a disposal latch must exist (@Volatile — dispose may run off-main while
+      the Main-dispatched restore reads it), `dispose()` must set it and
+      short-circuit on it BEFORE it starts releasing (idempotent release
+      half), and BOTH async continuations that can outlive the pool —
+      `saveState` (before it touches browser_tabs) and `restoreSavedTabs`
+      (before the first createTab) — must return on it. Cancelling a scope
+      cannot retract a block already dispatched to Main; that is exactly the
+      window this latch covers.
+  Fail-closed throughout: an unextractable body or a missing latch is red,
+  never a silent skip.
+
 [fix/dv17-1 B-01/B-06] C5/C6 — the same pool file, two "written but never
 consumed / never re-pointed" defects (also read from BrowserTabPool.kt):
   C5  a detected risk challenge must actually REACH the agent. The four
@@ -255,6 +280,60 @@ def check_source(source: str) -> list:
 # --- [fix/dv14-B2] C4: pool teardown ordering (separate function — the
 # C1-C3 criteria read SessionFileStore.kt; C4 reads BrowserTabPool.kt only).
 
+# [dv24-B4 B-07] C4e/C4f helpers. Both judge the DECISION, never a spelling of
+# the cleanup: the scope set is derived from the file's own field declarations
+# and cancellation is traced through helper bodies (so `destroyScopes()` /
+# `releaseAsyncFaces()` refactors stay green, while a third scope nobody
+# cancels goes red by construction).
+
+def _c4_scope_fields(code: str) -> list:
+    """Every `val name [ : CoroutineScope ] = CoroutineScope(` in the pool."""
+    return re.findall(
+        r"\bval\s+([A-Za-z_]\w*)\s*(?::\s*CoroutineScope\s*)?=\s*CoroutineScope\s*\(",
+        code,
+    )
+
+
+def _c4_cancel_closure(code: str, entry_body: str) -> set:
+    """Names receiving `.cancel()` reachable from entry_body, following calls
+    into other block-bodied functions declared in the same file.
+
+    (_c10_slice_fun is defined in the C10 section below; resolved at call
+    time. It deliberately skips expression-bodied functions, which cannot own
+    a multi-statement cancel block anyway.)"""
+    bodies = {}
+    for m in re.finditer(r"fun\s+([A-Za-z_]\w*)\s*\(", code):
+        body = _c10_slice_fun(code, m.group(0))
+        if body:
+            bodies.setdefault(m.group(1), body)
+    cancelled = set()
+    seen = set()
+    stack = [entry_body]
+    while stack:
+        body = stack.pop()
+        if body in seen:
+            continue
+        seen.add(body)
+        for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\.\s*cancel\s*\(", body):
+            cancelled.add(m.group(1))
+        for m in re.finditer(r"\b([A-Za-z_]\w*)\s*\(", body):
+            name = m.group(1)
+            if name in bodies and bodies[name] not in seen:
+                stack.append(bodies[name])
+    return cancelled
+
+
+def _c4_guard_pos(body: str, latch: str) -> int:
+    """Position of an early `if (<latch>) return` guard in body, or -1."""
+    m = re.search(rf"\bif\s*\(\s*{re.escape(latch)}\s*\)\s*return\b", body)
+    if m:
+        return m.start()
+    m = re.search(rf"\bif\s*\(\s*{re.escape(latch)}\s*\)\s*\{{", body)
+    if m and re.search(r"\breturn\b", body[m.end():m.end() + 160]):
+        return m.start()
+    return -1
+
+
 def check_pool_source(pool_src: str) -> list:
     """[fix/dv14-B2] C4 — dispose() must not re-persist; the evicted tab's
     URL must be stored AFTER destroyTab. Fail-closed throughout."""
@@ -296,6 +375,84 @@ def check_pool_source(pool_src: str) -> list:
                 f"C4d: {label} changes tab state but never calls saveState( — "
                 "window.open/close tabs resurrect from the stale state file "
                 "(and selectedTabId can point at a destroyed tab)")
+
+    # --- [dv24-B4 B-07] C4e: dispose() must cancel every pool-owned scope ---
+    scopes = _c4_scope_fields(code)
+    if disp and not scopes:
+        errs.append(
+            "C4e: no `CoroutineScope(` field found in the pool (fail-closed — this "
+            "criterion exists to keep disposal owning the pool's async faces)")
+    elif disp:
+        cancelled = _c4_cancel_closure(code, disp)
+        for scope in scopes:
+            if scope not in cancelled:
+                errs.append(
+                    f"C4e: dispose() never cancels `{scope}` — work already queued on it "
+                    "keeps running against a destroyed pool (a Main-dispatched restore "
+                    "rebuilt WebViews nobody will destroy and re-persisted a just-deleted "
+                    "session's tab file)")
+
+    # --- [dv24-B4 B-07] C4f: the disposal latch and its two async guards ---
+    latch = ""
+    if disp:
+        for candidate in re.findall(r"\b([A-Za-z_]\w*)\s*=\s*true\b", disp):
+            if _c4_guard_pos(disp, candidate) >= 0:
+                latch = candidate
+                break
+        if not latch:
+            errs.append(
+                "C4f: dispose() never latches a disposal flag and short-circuits on it — "
+                "the release half is not idempotent, and no async continuation can ask "
+                "whether the pool is gone")
+        else:
+            if not re.search(
+                rf"@Volatile\b[\s\S]{{0,160}}?\bvar\s+{re.escape(latch)}\b", code
+            ):
+                errs.append(
+                    f"C4f: the disposal latch `{latch}` is not @Volatile — dispose() runs "
+                    "on the ViewModel-clearing thread while the Main-dispatched restore "
+                    "reads it; a stale read is the bug this latch exists for")
+            effects = [
+                p for p in (
+                    disp.find("cancel("),
+                    disp.find("unregisterComponentCallbacks"),
+                    disp.find("destroyTab("),
+                ) if p >= 0
+            ]
+            if effects and _c4_guard_pos(disp, latch) > min(effects):
+                errs.append(
+                    f"C4f: dispose() sets `{latch}` only after it starts releasing — a "
+                    "second dispose must be a no-op before any scope is cancelled")
+            save = slice_body(code, "private fun saveState") or slice_body(code, "fun saveState")
+            if not save:
+                errs.append("C4f: fun saveState body not extractable (fail-closed)")
+            else:
+                pos = _c4_guard_pos(save, latch)
+                touch = save.find("browser_tabs")
+                if pos < 0:
+                    errs.append(
+                        f"C4f: saveState does not short-circuit on `{latch}` — a restore "
+                        "that already landed on Main writes the tab list back after "
+                        "disposal and re-creates the deleted session's browser_tabs file")
+                elif touch >= 0 and pos > touch:
+                    errs.append(
+                        f"C4f: saveState consults `{latch}` only after touching the tab "
+                        "file — the write has already happened")
+            restore = slice_body(code, "fun restoreSavedTabs")
+            if not restore:
+                errs.append("C4f: fun restoreSavedTabs body not extractable (fail-closed)")
+            else:
+                pos = _c4_guard_pos(restore, latch)
+                first = restore.find("createTab(")
+                if pos < 0:
+                    errs.append(
+                        f"C4f: restoreSavedTabs does not short-circuit on `{latch}` — a "
+                        "restore queued before disposal rebuilds WebViews on a destroyed "
+                        "pool (50-100 MB each, plus the Context they hold)")
+                elif first >= 0 and pos > first:
+                    errs.append(
+                        f"C4f: restoreSavedTabs consults `{latch}` only after createTab( — "
+                        "the WebViews are already rebuilt")
 
     # --- [fix/dv17-1 B-01] C5: a detected risk challenge must reach the agent.
     # Bound to the call shape (+ the text merge AFTER it), never a bare name:
@@ -362,6 +519,14 @@ class BrowserTabPool(context: Context) {
     private val savedURLs = mutableMapOf<Int, String>()
     private val _tabs = MutableStateFlow<List<Tab>>(emptyList())
 
+    // [dv24-B4 B-07] C4e/C4f: the pool's async faces and the latch that
+    // disposal owns (mirrors the production shapes at the decision points).
+    @Volatile
+    private var isDisposed = false
+
+    private val evictionScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val downloadScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
     private fun destroyTab(tabs: MutableList<Tab>, tab: Tab) {
         tabs.remove(tab)
         // destroyTab removes the entry — storing before this call loses it.
@@ -370,6 +535,10 @@ class BrowserTabPool(context: Context) {
     }
 
     fun dispose() {
+        if (isDisposed) return
+        isDisposed = true
+        evictionScope.cancel()
+        downloadScope.cancel()
         evictionJob?.cancel()
         evictionJob = null
         val current = _tabs.value
@@ -379,6 +548,24 @@ class BrowserTabPool(context: Context) {
                 destroyTab(mutable, tab)
             }
             _tabs.value = emptyList()
+        }
+    }
+
+    private fun saveState() {
+        if (isDisposed) return
+        val file = File(context.filesDir, "browser_tabs/$sessionId.json")
+        file.writeText("{}")
+    }
+
+    private fun restoreSavedTabs() {
+        if (isDisposed) return
+        val currentTabs = _tabs.value.toMutableList()
+        for (id in plan.restoreIds) {
+            val url = savedURLs[id] ?: continue
+            createTab(currentTabs, url, explicitId = id) ?: break
+        }
+        if (restored > 0) {
+            saveState()
         }
     }
 
@@ -529,8 +716,8 @@ POOL_V_SESSION_PLAIN_ASSIGN = POOL_COMPLIANT.replace(
 
 # C4a: the pre-fix dispose re-persisted the (possibly just-deleted) session.
 POOL_V_DISPOSE_SAVE = POOL_COMPLIANT.replace(
-    "            _tabs.value = emptyList()\n        }\n    }\n\n    override fun onTrimMemory",
-    "            _tabs.value = emptyList()\n        }\n        saveState()\n    }\n\n    override fun onTrimMemory",
+    "            _tabs.value = emptyList()\n        }\n    }\n\n    private fun saveState() {",
+    "            _tabs.value = emptyList()\n        }\n        saveState()\n    }\n\n    private fun saveState() {",
 )
 
 # C4c: URL stored BEFORE destroyTab — silently wiped by its remove().
@@ -578,6 +765,61 @@ POOL_V_CLOSEWIN_NOSAVE = POOL_COMPLIANT.replace(
     "            if (_selectedTabId.value == closedId && currentTabs.isNotEmpty()) {\n"
     "                _selectedTabId.value = currentTabs.first().id\n"
     "            }\n",
+)
+
+# --- [dv24-B4 B-07] C4e/C4f: disposal owns the pool's async faces ----------
+# The defect was a scope that outlived its pool: disposing cancelled only the
+# eviction ticker, so a restore already dispatched to Main rebuilt WebViews on
+# a destroyed pool and re-persisted a just-deleted session's tab file, and
+# in-flight downloads kept writing into the deleted session's workspace.
+
+# C4e: the eviction scope survives disposal (restore queue keeps draining).
+POOL_V_DISPOSE_NO_EVICTION_CANCEL = POOL_COMPLIANT.replace(
+    "        evictionScope.cancel()\n", "",
+)
+
+# C4e: the download scope survives disposal (writes + callbacks keep running).
+POOL_V_DISPOSE_NO_DOWNLOAD_CANCEL = POOL_COMPLIANT.replace(
+    "        downloadScope.cancel()\n", "",
+)
+
+# C4e negative control: cancelling through a helper must stay GREEN — the
+# criterion is anchored on which scopes end up cancelled, not on the spelling.
+POOL_HELPER_CANCEL = POOL_COMPLIANT.replace(
+    "        evictionScope.cancel()\n        downloadScope.cancel()\n",
+    "        destroyScopes()\n",
+).replace(
+    "    fun dispose() {\n        if (isDisposed) return\n",
+    "    private fun destroyScopes() {\n"
+    "        evictionScope.cancel()\n"
+    "        downloadScope.cancel()\n"
+    "    }\n\n"
+    "    fun dispose() {\n        if (isDisposed) return\n",
+)
+
+# C4f: the restore keeps rebuilding on a disposed pool (guard dropped).
+POOL_V_RESTORE_NO_GUARD = POOL_COMPLIANT.replace(
+    "    private fun restoreSavedTabs() {\n        if (isDisposed) return\n",
+    "    private fun restoreSavedTabs() {\n",
+)
+
+# C4f: only restore is guarded — the late saveState still resurrects the file.
+POOL_V_SAVE_NO_GUARD = POOL_COMPLIANT.replace(
+    "    private fun saveState() {\n        if (isDisposed) return\n",
+    "    private fun saveState() {\n",
+)
+
+# C4f: the latch is not @Volatile — the Main-dispatched restore may read stale.
+POOL_V_LATCH_NOT_VOLATILE = POOL_COMPLIANT.replace(
+    "    @Volatile\n    private var isDisposed = false\n",
+    "    private var isDisposed = false\n",
+)
+
+# C4f: no latch at all — dispose re-runs its release half on a second call.
+POOL_V_NO_LATCH = POOL_COMPLIANT.replace(
+    "    @Volatile\n    private var isDisposed = false\n\n", "",
+).replace(
+    "        if (isDisposed) return\n        isDisposed = true\n", "",
 )
 
 
@@ -1308,6 +1550,13 @@ class SessionFileStore internal constructor(
         ("C4b dispose no longer destroys tabs", POOL_V_DISPOSE_NO_DESTROY, ["C4"]),
         ("C4d window.open forgets saveState", POOL_V_NEWWIN_NOSAVE, ["C4d"]),
         ("C4d window.close forgets saveState", POOL_V_CLOSEWIN_NOSAVE, ["C4d"]),
+        ("C4e dispose stops cancelling the eviction scope", POOL_V_DISPOSE_NO_EVICTION_CANCEL, ["C4e"]),
+        ("C4e dispose stops cancelling the download scope", POOL_V_DISPOSE_NO_DOWNLOAD_CANCEL, ["C4e"]),
+        ("C4e cancellation through a helper stays green", POOL_HELPER_CANCEL, []),
+        ("C4f restoreSavedTabs drops its disposal guard", POOL_V_RESTORE_NO_GUARD, ["C4f"]),
+        ("C4f saveState drops its disposal guard", POOL_V_SAVE_NO_GUARD, ["C4f"]),
+        ("C4f disposal latch is not volatile", POOL_V_LATCH_NOT_VOLATILE, ["C4f"]),
+        ("C4f dispose never latches", POOL_V_NO_LATCH, ["C4f"]),
         ("C5 risk notice rendered but dropped", POOL_V_RISK_NOT_MERGED, ["C5"]),
         ("C5 risk notice never rendered", POOL_V_RISK_NO_CALL, ["C5"]),
         ("C6 setSession forgets to re-point downloads", POOL_V_SESSION_NO_REMAP, ["C6"]),
@@ -1460,7 +1709,7 @@ def main() -> int:
         for e in errs:
             print(f"  - {e}")
         return 1
-    print("browser_tabs_lifecycle_check OK (criteria: C1-C3 store lifecycle + C4/C4d pool teardown + window.open/close persistence + C5 risk notice reaches the agent text + C6 setSession re-points downloads atomically + C7 the session-shape predicate alone carries the draft alias + C8 every orphan entry folds the composer's active draft in + C9 the pool's busy signal is funnelled and observable + C10 every destroyTab caller re-derives it after settling the list)")
+    print("browser_tabs_lifecycle_check OK (criteria: C1-C3 store lifecycle + C4/C4d pool teardown + window.open/close persistence + C4e disposal cancels every pool-owned scope + C4f the disposal latch guards saveState/restoreSavedTabs + C5 risk notice reaches the agent text + C6 setSession re-points downloads atomically + C7 the session-shape predicate alone carries the draft alias + C8 every orphan entry folds the composer's active draft in + C9 the pool's busy signal is funnelled and observable + C10 every destroyTab caller re-derives it after settling the list)")
     return 0
 
 

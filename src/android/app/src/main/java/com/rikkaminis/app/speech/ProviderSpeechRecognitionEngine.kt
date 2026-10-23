@@ -7,6 +7,7 @@ import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.util.Log
 import com.rikkaminis.app.MinisApp
+import com.rikkaminis.app.provider.ModelsDevApi
 import com.rikkaminis.app.provider.voice.VoiceInputRequest
 import com.rikkaminis.app.provider.voice.VoiceProvider
 import com.rikkaminis.app.provider.voice.VoiceProviderException
@@ -229,7 +230,15 @@ class ProviderSpeechRecognitionEngine(private val appContext: Context) : SpeechR
                                 audioData = wav,
                                 model = entry.baseModel.id,
                                 language = locale.toLanguageTag(),
-                                resolvedModel = entry.model,
+                                // [deep-audit-1044 A-01] The vendor adapters read
+                                // modalities / display / capability off this model, and
+                                // `entry.model` is base+overrides with NO models.dev
+                                // enrichment — a built-in whose local row declares no
+                                // modality answered "not audio" to the very provider
+                                // that was chosen because the registry says it is.
+                                // Same single source as the candidate gate in
+                                // ProviderRepository.resolveVoiceInputCandidates.
+                                resolvedModel = ModelsDevApi.effectiveModel(entry),
                             ),
                         )
                         if (cancelled.get()) return@launch

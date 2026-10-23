@@ -57,9 +57,19 @@ WATCHLIST = {
         "returns a COPY carrying the TTFB; the tracker is immutable-by-copy, so a "
         "statement-position call records nothing (2026-09-26 TTFB wire-up defect)"
     ),
+    "copySharedStream": (
+        "returns the staging OUTCOME (Staged / Failed); a statement-position call "
+        "drops the only signal that a file was written, so the caller goes back to "
+        "handing the composer a filename for a file that was never created "
+        "(§1044-A08 ghost attachment)"
+    ),
 }
 
 EXEMPT = "record-ok:"
+# Watchlist names that are legitimately called as bare top-level functions
+# (no receiver) — for those the optional-receiver pattern must still match a
+# statement-position call.
+BARE_OK = {"copySharedStream"}
 _CALL = re.compile(
     r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)*[A-Za-z_][A-Za-z0-9_]*\??\.?\s*%s\s*\("
 )
@@ -74,6 +84,13 @@ _CONSUMING_LAMBDA = re.compile(
 
 
 def _pattern(name):
+    if name in BARE_OK:
+        # The receiver is optional for this name: the extracted core is called
+        # as a top-level function, and a statement-position call of a
+        # top-level function is exactly the shape that must be caught.
+        return re.compile(
+            r"^\s*(?:[A-Za-z_][A-Za-z0-9_]*\.)*%s\s*\(" % re.escape(name)
+        )
     return re.compile(_CALL.pattern % re.escape(name))
 
 
@@ -521,6 +538,327 @@ def scan_staged_bytes(root):
                 "hole is back" % LEDGER_FILE
             )
     return findings
+
+# ─────────────────────────────────────────────────────────────────────────
+# A-08 — the share inbound stream copy (deep-audit-1044)
+#
+# Neither the watchlist nor the staged-bytes criteria above could see this one:
+# the call site was syntactically fine and the value WAS consumed — the helper
+# simply returned a staged filename for a file it never created.
+#
+# `ContentResolver.openInputStream(Uri)` is allowed to return null WITHOUT
+# throwing (a remote provider refuses the read, or its process was reaped). The
+# pre-fix copy read
+#
+#     contentResolver.openInputStream(uri)?.use { input ->
+#         dest.outputStream().use { output -> … }
+#     }
+#     name                        ← returned unconditionally
+#
+# so a null stream skipped the whole `use` block, the destination file was never
+# created, and the caller still built a `PendingShare.Item` for it: a ghost
+# attachment that reached the composer and never took the "Could not read shared
+# file" branch.
+#
+# The decision pinned here is the ORDER, not the spelling: inside whichever
+# function performs the copy, the stream must be null-checked and abandoned
+# BEFORE the destination file is created/truncated. Accepted early exits:
+#   `?: return …` / `?: throw …`           (elvis — PhotosOffloadHandler shape)
+#   `if (x == null) { …; return … }`       (guard clause)
+# Delegating the copy to a helper (the §1044 ship shape: copySharedStream) is
+# equally fine — every function that BOTH acquires a stream and creates the
+# destination must obey the rule, so an inlined regression is caught as well.
+# ─────────────────────────────────────────────────────────────────────────
+
+_STREAM_SIG = re.compile(
+    r"^\s*(?:@\w+(?:\([^)]*\))?\s+)*"
+    r"(?:public |private |internal |protected |override |suspend |inline "
+    r"|operator |abstract |open )*fun\s+(?:<[^>]*>\s*)?"
+    r"(?:[A-Za-z_][A-Za-z0-9_]*\.)*([A-Za-z_][A-Za-z0-9_]*)\s*\("
+)
+_STREAM_SRC = re.compile(r"openInputStream\s*\(")
+_STREAM_PROVIDER_CALL = re.compile(r"(?<![A-Za-z0-9_])openStream\s*\(\s*\)")
+# The destination is opened either directly (`dest.outputStream()`) or through
+# the injected factory the pure core takes (`openDest()`).
+_DEST_CREATE = re.compile(r"outputStream\s*\(|\bopenDest\s*\(\s*\)")
+_STREAM_TOKEN = r"(?:openInputStream|openStream|input|source|stream)"
+# Elvis early-exit, attached to a stream-ish expression within one short span.
+_GUARD_ELVIS = re.compile(_STREAM_TOKEN + r"[\s\S]{0,120}?\?\:\s*(?:return|throw)\b")
+# Guard clause: `if (… == null …) { … return … }` where the condition mentions a
+# stream-ish name (so an unrelated `if (uri == null)` above it cannot satisfy
+# this criterion from a distance).
+_GUARD_IF_NULL = re.compile(
+    r"if\s*\([^\n]*" + _STREAM_TOKEN + r"[^\n]*==\s*null[^\n]*\)[\s\S]{0,300}?\breturn\b"
+)
+
+
+def _function_bodies(lines):
+    """(name, start, end, body) for every brace-bodied `fun` in [lines].
+
+    Expression-bodied functions (`… = expr`) are skipped: they cannot carry the
+    create-then-copy shape this criterion judges. Nested declarations are not
+    descended into — the enclosing body already contains them textually.
+    """
+    bodies = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        m = _STREAM_SIG.match(lines[i])
+        if not m:
+            i += 1
+            continue
+        paren = 0
+        j = i
+        body_start = -1
+        while j < n:
+            if j > i and _STREAM_SIG.match(lines[j]):
+                break
+            found = False
+            for ch in lines[j]:
+                if ch == "(":
+                    paren += 1
+                elif ch == ")":
+                    paren -= 1
+                elif ch == "{" and paren <= 0:
+                    found = True
+                    break
+            if found:
+                body_start = j
+                break
+            j += 1
+        if body_start < 0:
+            i = j + 1
+            continue
+        depth = 0
+        end = n - 1
+        for j2 in range(body_start, n):
+            depth += lines[j2].count("{") - lines[j2].count("}")
+            if depth <= 0:
+                end = j2
+                break
+        bodies.append((m.group(1), i, end, "\n".join(lines[i:end + 1])))
+        i = end + 1
+    return bodies
+
+
+def _own_acquisition(body):
+    """Position of the stream ACQUISITION inside [body], or None.
+
+    An acquisition is an `openInputStream(` / `openStream()` call that is not
+    merely passed as a lambda to somebody else. The distinction matters: the
+    §1044 ship shape has the Activity hand `openStream = { resolver
+    .openInputStream(uri) }` to the core — the Activity does not acquire the
+    stream, the core does, and the core is where the null guard must live.
+
+    A lambda is recognised by an `=` whose right-hand side opens a brace
+    (`x = { … }`); a plain `val x = call()` is NOT a lambda. Brace depth is
+    tracked with a stack so a call inside a lambda body is attributed to the
+    lambda, not to the enclosing function.
+    """
+    stack = []          # one entry per open brace: True = lambda body
+    i = 0
+    n = len(body)
+    while i < n:
+        ch = body[i]
+        if ch == "=":
+            j = i + 1
+            while j < n and body[j] in " \t\n":
+                j += 1
+            if j < n and body[j] == "{":
+                stack.append(True)
+                i = j + 1
+                continue
+        elif ch == "{":
+            stack.append(False)
+        elif ch == "}":
+            if stack:
+                stack.pop()
+        elif ch == "o":
+            m = _ACQUIRE_RE.match(body, i)
+            if m:
+                if not any(stack):     # not inside any lambda body
+                    return m.start()
+                i = m.end()
+                continue
+        i += 1
+    return None
+
+
+_ACQUIRE_RE = re.compile(
+    r"openInputStream\s*\(|(?<![A-Za-z0-9_])openStream\s*\(\s*\)"
+)
+
+
+def _guard_before(body, acquisition, dest):
+    """Position of the null early-exit that follows [acquisition], or None.
+
+    Two accepted spellings, both anchored AFTER the acquisition and BEFORE the
+    destination is opened:
+      * elvis      — `val input = openStream() ?: return null`
+      * guard      — `if (input == null) { … return null }`
+    """
+    window = body[acquisition:dest.start()] if dest.start() > acquisition else ""
+    if dest.start() <= acquisition:
+        # The destination is opened BEFORE the stream is even acquired — the
+        # 0-byte-ghost order. Report it as an ORDER violation, not as a
+        # missing guard (the guard may well exist, just too late).
+        return dest.start() + 1
+    cands = []
+    m = re.search(r"\?\:\s*(?:return|throw)\b", window)
+    if m:
+        cands.append(acquisition + m.end())
+    m = re.search(
+        r"if\s*\([^\n]*(?:==\s*null|is\s+null)[^\n]*\)\s*\{?[\s\S]{0,300}?\breturn\b",
+        window,
+    )
+    if m:
+        cands.append(acquisition + m.end())
+    if not cands:
+        return None
+    return min(cands)
+
+
+def scan_share_stream_guard(root):
+    findings = []
+    base = os.path.join(root, SRC_SUBDIR, "com", "rikkaminis", "app")
+    share_dir = os.path.join(base, "share")
+    share_path = os.path.join(base, *SHARE_FILE.split("/"))
+    if not os.path.isdir(share_dir):
+        return findings
+    if not os.path.isfile(share_path):
+        findings.append(
+            "%s:?  [A-08 G1] ShareReceiverActivity.kt missing while share/ exists — "
+            "the null-stream criteria lost their anchor (fail-closed)" % SHARE_FILE
+        )
+        return findings
+
+    # The copy may be inlined in the Activity or delegated to a helper in the
+    # same package (§1044 ship shape: SharedStreamCopy.kt) — judge every file.
+    files = []
+    for name in sorted(os.listdir(share_dir)):
+        if not name.endswith(".kt"):
+            continue
+        path = os.path.join(share_dir, name)
+        rel = os.path.relpath(path, root)
+        text = code_only(open(path, encoding="utf-8", errors="replace").read())
+        files.append((rel, text, text.split("\n")))
+
+    package_code = "\n".join(text for _rel, text, _lines in files)
+
+    # G2 — the inbound staging path must still acquire a ContentResolver stream.
+    # Without this anchor a "fix" that quietly deletes the staging path would
+    # satisfy G1 vacuously.
+    if not _STREAM_SRC.search(package_code):
+        findings.append(
+            "%s:?  [A-08 G2] no `openInputStream(` left in the share package — the inbound "
+            "stream-staging path moved or was removed; re-anchor this criterion "
+            "(fail-closed)" % SHARE_FILE
+        )
+        return findings
+
+    # G3 — the copy outcome must be consumed. A statement-position call drops the
+    # only signal that a file was written, which is the ghost-attachment shape
+    # again; the generic watchlist cannot see a bare top-level call on its own.
+    if "fun copySharedStream(" in package_code:
+        bound = False
+        for _rel, _text, lines in files:
+            for ln in lines:
+                m = re.search(r"copySharedStream\s*\(", ln)
+                if not m:
+                    continue
+                if re.search(r"\bval\s+[A-Za-z_][A-Za-z0-9_]*\s*=\s*", ln[:m.start()]):
+                    bound = True
+        if not bound:
+            findings.append(
+                "%s:?  [A-08 G3] the copySharedStream outcome is never bound — a "
+                "statement-position call throws away the only signal that a file was "
+                "written, and the caller is back to handing out a filename for a file "
+                "that may not exist" % SHARE_FILE
+            )
+
+    # G1 — guard before the destination file is created.
+    #
+    # The two shapes that must both satisfy the rule:
+    #   (a) a function that OPENS the stream itself (`openInputStream(` in its
+    #       own body) and also opens the destination;
+    #   (b) the pure core `copySharedStream`, which receives the stream through
+    #       the `openStream` factory and opens the destination through
+    #       `openDest`.
+    # A function that merely INJECTS the stream (e.g. `openStream = {
+    # contentResolver.openInputStream(uri) }`) is neither: it does not acquire
+    # the stream, it hands the acquisition to the core — which is where the
+    # guard now lives. Judging it as if it acquired the stream would flag the
+    # §1044 ship shape itself, so the criterion tracks WHERE the acquisition
+    # happens instead of counting occurrences.
+    saw_dest = False
+    for rel, _text, lines in files:
+        for name, start, _end, body in _function_bodies(lines):
+            dest = _DEST_CREATE.search(body)
+            if not dest:
+                continue
+            saw_dest = True
+            # The acquisition must be in THIS function's own body, not inside a
+            # lambda the function passes to somebody else.
+            acquires = _own_acquisition(body)
+            if acquires is None:
+                continue          # only injects the stream — the core guards it
+            guard = _guard_before(body, acquires, dest)
+            if guard is None:
+                findings.append(
+                    "%s:%d  [A-08 G1] %s() creates the destination file from a stream with NO "
+                    "null early-exit — `openInputStream` returns null without throwing when a "
+                    "remote provider refuses, so the copy stages nothing and the caller still "
+                    "gets a filename (ghost attachment)" % (rel, start + 1, name)
+                )
+                continue
+            if guard > dest.start():
+                findings.append(
+                    "%s:%d  [A-08 G1] %s() null-checks the stream AFTER creating the destination "
+                    "file — the file is created/truncated before the guard can bail out, which is "
+                    "the 0-byte-ghost shape; check first, create second"
+                    % (rel, start + 1, name)
+                )
+    if not saw_dest:
+        findings.append(
+            "%s:?  [A-08 G1] no `outputStream(` in the share package — the staging write path "
+            "moved; re-anchor this criterion (fail-closed)" % SHARE_FILE
+        )
+
+    # G4 — the copy must have a SUCCESS GATE: the caller may only report a
+    # staged file when the core says it staged one. This is the criterion that
+    # catches the ghost attachment even if somebody re-inlines the copy in a
+    # shape G1 cannot see: a function that returns a filename without ever
+    # asking whether the copy succeeded.
+    # G4 — the copy must have a SUCCESS GATE. A function that RETURNS A
+    # FILENAME (not an outcome) and acquires the stream itself must either
+    # gate on the copy result or return null when the stream was absent. The
+    # pure core is exempt: it RETURNS the outcome, which IS the gate.
+    for rel, _text, lines in files:
+        for name, start, _end, body in _function_bodies(lines):
+            if _own_acquisition(body) is None:
+                continue          # only injects the stream — the core gates it
+            if _returns_outcome(body):
+                continue          # the outcome IS the success gate
+            gated = (
+                re.search(r"when\s*\(", body)
+                or re.search(r"\bis\s+[A-Za-z_][A-Za-z0-9_.]*\s*->", body)
+                or re.search(r"if\s*\([^\n]*==\s*null[^\n]*\)\s*\{?[^\n]*return\s+null", body)
+            )
+            if not gated:
+                findings.append(
+                    "%s:%d  [A-08 G4] %s() opens a content stream and returns a filename with NO "
+                    "success gate — when the provider hands back no stream the copy stages "
+                    "nothing, yet the caller still gets a name for a file that was never created "
+                    "(ghost attachment)" % (rel, start + 1, name)
+                )
+    return findings
+
+
+def _returns_outcome(body):
+    """True when the function RETURNS the copy outcome (its type is a sealed
+    outcome, not a filename). Such a function IS the success gate."""
+    return bool(re.search(r"Copy\b|SharedStreamCopy|Outcome\b", body))
+
 
 FIXTURE = "src/android/app/src/main/java/com/rikkaminis/app/network/Trace.kt"
 _Q = "com.rikkaminis.app.diagnostics.ProviderHealthTracker"
@@ -985,6 +1323,252 @@ def staged_self_test():
     return 0
 
 
+def _share_stream_activity(core):
+    """Minimal ShareReceiverActivity slice exercising the A-08 criteria."""
+    return (
+        "package com.rikkaminis.app.share\n"
+        "\n"
+        "internal sealed class Copy {\n"
+        "    object Staged : Copy()\n"
+        "    object Failed : Copy()\n"
+        "}\n"
+        "\n"
+        "class ShareReceiverActivity {\n"
+        "    private fun copyUriToStaging(uri: Uri): String? {\n"
+        "        val dest = File(name())\n"
+        "        return when (val outcome = copySharedStream({ resolver.openInputStream(uri) }, dest)) {\n"
+        "            is Copy.Staged -> name()\n"
+        "            is Copy.Failed -> null\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+        "\n"
+        "internal fun copySharedStream(openStream: () -> InputStream?, openDest: () -> OutputStream): Copy {\n"
+        "    return try {\n"
+        + core +
+        "    } catch (e: Exception) {\n"
+        "        Copy.Failed\n"
+        "    }\n"
+        "}\n"
+    )
+
+
+# The §1044 ship shape: guard, then create the destination, then copy.
+STREAM_CORE_CLEAN = (
+    "        val input = openStream()\n"
+    "            ?: return Copy.Failed\n"
+    "        input.use { source ->\n"
+    "            openDest().use { output -> source.copyTo(output) }\n"
+    "        }\n"
+    "        Copy.Staged\n"
+)
+
+
+def share_stream_self_test():
+    import shutil
+    import tempfile
+
+    rel = os.path.join("share", "ShareReceiverActivity.kt")
+
+    def run(text, extra=None):
+        tmp = tempfile.mkdtemp(prefix="sharestream-")
+        try:
+            pkg = os.path.join(tmp, SRC_SUBDIR, "com", "rikkaminis", "app", "share")
+            os.makedirs(pkg, exist_ok=True)
+            with open(os.path.join(pkg, "ShareReceiverActivity.kt"), "w", encoding="utf-8") as fh:
+                fh.write(text)
+            for fname, body in (extra or {}).items():
+                with open(os.path.join(pkg, fname), "w", encoding="utf-8") as fh:
+                    fh.write(body)
+            return scan_share_stream_guard(tmp)
+        finally:
+            shutil.rmtree(tmp)
+
+    results = []
+
+    # A08-0: the shipped shape (guard → create → copy) is clean.
+    got = run(_share_stream_activity(STREAM_CORE_CLEAN))
+    results.append(("A08-0: guard-before-create fixture exits clean", got == [], got))
+
+    # A08-1: the pre-fix shape — no null check at all, `use` on the nullable.
+    got = run(_share_stream_activity(
+        STREAM_CORE_CLEAN.replace("            ?: return Copy.Failed\n", "")
+    ))
+    ok = (len(got) == 1 and "[A-08 G1]" in got[0] and "NO null early-exit" in got[0]
+          and "copySharedStream()" in got[0])
+    results.append(("A08-1: missing null guard reds G1 (no early exit)", ok, got))
+
+    # A08-2: guard present but AFTER the destination is created — the 0-byte ghost.
+    got = run(_share_stream_activity(
+        "        val output = openDest()\n"
+        "        val input = openStream()\n"
+        "            ?: return Copy.Failed\n"
+        "        output.use { sink -> input.use { src -> src.copyTo(sink) } }\n"
+        "        Copy.Staged\n"
+    ))
+    ok = (len(got) == 1 and "[A-08 G1]" in got[0] and "AFTER creating the destination" in got[0])
+    results.append(("A08-2: guard after create reds G1 (order)", ok, got))
+
+    # A08-3: the other accepted spelling — a guard clause instead of elvis.
+    #        Must stay green: the criterion anchors the decision, not the idiom.
+    got = run(_share_stream_activity(
+        "        val input = openStream()\n"
+        "        if (input == null) {\n"
+        "            AppLogger.warning(TAG, \"openInputStream returned null\")\n"
+        "            return Copy.Failed\n"
+        "        }\n"
+        "        input.use { source ->\n"
+        "            openDest().use { output -> source.copyTo(output) }\n"
+        "        }\n"
+        "        Copy.Staged\n"
+    ))
+    results.append(("A08-3: guard-clause spelling stays green", got == [], got))
+
+    # A08-4: the destination creation disappeared — fail closed, re-anchor.
+    got = run(_share_stream_activity(
+        STREAM_CORE_CLEAN.replace(
+            "            openDest().use { output -> source.copyTo(output) }\n",
+            "            source.copyTo(sink)\n",
+        )
+    ))
+    ok = (len(got) == 1 and "[A-08 G1]" in got[0] and "no `outputStream(`" in got[0])
+    results.append(("A08-4: vanished write path is a fail-closed finding", ok, got))
+
+    # A08-5: the resolver stream disappeared — the G2 anchor is gone.
+    got = run(_share_stream_activity(STREAM_CORE_CLEAN).replace(
+        "resolver.openInputStream(uri)", "resolver.stream(uri)"
+    ))
+    ok = (len(got) == 1 and "[A-08 G2]" in got[0] and "no `openInputStream(`" in got[0])
+    results.append(("A08-5: vanished resolver stream is a fail-closed finding", ok, got))
+
+    # A08-6: the extracted outcome must be consumed — a statement-position call
+    #        drops the only signal that a file was written.
+    tmp = tempfile.mkdtemp(prefix="sharestream-wl-")
+    try:
+        p = os.path.join(tmp, SRC_SUBDIR, "com", "rikkaminis", "app", rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(
+                "class ShareReceiverActivity {\n"
+                "    fun stage() {\n"
+                "        copySharedStream(openStream = { null }, dest = f)\n"
+                "    }\n"
+                "}\n"
+            )
+        got = scan(tmp)
+        ok = len(got) == 1 and got[0][3] == "copySharedStream"
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write(
+                "class ShareReceiverActivity {\n"
+                "    fun stage() {\n"
+                "        val outcome = copySharedStream(openStream = { null }, dest = f)\n"
+                "    }\n"
+                "}\n"
+            )
+        control = scan(tmp)
+        ok = ok and control == []
+    finally:
+        shutil.rmtree(tmp)
+    results.append(("A08-6: discarded copySharedStream outcome is watchlisted (control green)", ok, got))
+
+    # A08-7: same regression seen by the section itself — the outcome is never
+    #        bound, so nothing distinguishes "staged" from "staged nothing".
+    #        The Activity acquires the stream ITSELF here (the inlined-regression
+    #        shape), so the success gate (G4) is what must catch it.
+    got = run(
+        "package com.rikkaminis.app.share\n"
+        "\n"
+        "class ShareReceiverActivity {\n"
+        "    private fun copyUriToStaging(uri: Uri): String? {\n"
+        "        val dest = File(name())\n"
+        "        copySharedStream({ resolver.openInputStream(uri) }, dest)\n"
+        "        return name()\n"
+        "    }\n"
+        "}\n"
+        "\n"
+        "internal fun copySharedStream(openStream: () -> InputStream?, openDest: () -> OutputStream): Copy {\n"
+        + STREAM_CORE_CLEAN +
+        "}\n"
+    )
+    ok = (len(got) == 2 and
+          sum(1 for f in got if "[A-08 G3]" in f and "never bound" in f) == 1 and
+          sum(1 for f in got if "[A-08 G4]" in f) == 1)
+    results.append(("A08-7: unbound copy outcome reds G3 (+G4: no success gate)", ok, got))
+
+    # A08-10: the inlined regression — the function acquires the stream itself
+    #         and returns a filename with no success gate (G4).
+    got = run(
+        "package com.rikkaminis.app.share\n"
+        "\n"
+        "class ShareReceiverActivity {\n"
+        "    private fun copyUriToStaging(uri: Uri): String? {\n"
+        "        val dest = File(name())\n"
+        "        val input = resolver.openInputStream(uri)\n"
+        "        input?.use { source ->\n"
+        "            openDest().use { output -> source.copyTo(output) }\n"
+        "        }\n"
+        "        return name()\n"
+        "    }\n"
+        "}\n"
+    )
+    ok = (len(got) == 2 and
+          sum(1 for f in got if "[A-08 G4]" in f and "NO success gate" in f) == 1 and
+          sum(1 for f in got if "[A-08 G1]" in f) == 1)
+    results.append(("A08-10: self-acquiring copy with no success gate reds G4 (+G1)", ok, got))
+
+    # A08-8/A08-9: the shipped layout — the core lives in its own file. The
+    # criterion must follow the copy across files (it judges the function that
+    # both opens the stream and creates the file, wherever that function sits).
+    thin = (
+        "package com.rikkaminis.app.share\n"
+        "\n"
+        "class ShareReceiverActivity {\n"
+        "    private fun copyUriToStaging(uri: Uri): String? {\n"
+        "        val dest = File(name())\n"
+        "        return when (val outcome = copySharedStream({ resolver.openInputStream(uri) }, dest)) {\n"
+        "            is Copy.Staged -> name()\n"
+        "            is Copy.Failed -> null\n"
+        "        }\n"
+        "    }\n"
+        "}\n"
+    )
+    core_file = (
+        "package com.rikkaminis.app.share\n"
+        "\n"
+        "internal fun copySharedStream(openStream: () -> InputStream?, openDest: () -> OutputStream): Copy {\n"
+        "    return try {\n"
+        + STREAM_CORE_CLEAN +
+        "    } catch (e: Exception) {\n"
+        "        Copy.Failed\n"
+        "    }\n"
+        "}\n"
+    )
+    got = run(thin, extra={"SharedStreamCopy.kt": core_file})
+    results.append(("A08-8: split-file shipped layout exits clean", got == [], got))
+
+    got = run(thin, extra={"SharedStreamCopy.kt": core_file.replace("            ?: return Copy.Failed\n", "")})
+    ok = (len(got) == 1 and "[A-08 G1]" in got[0] and "SharedStreamCopy.kt" in got[0]
+          and "NO null early-exit" in got[0])
+    results.append(("A08-9: unguarded core in a separate file reds G1 on that file", ok, got))
+
+    failed = [name for name, ok, _got in results if not ok]
+    if failed:
+        print("SHARE-STREAM SELF-TEST FAILED (%d breaker(s))" % len(failed))
+        for name, ok, got in results:
+            if not ok:
+                print("  ✗ " + name)
+                for f in got:
+                    print("      " + f)
+        return 1
+    print(
+        "✅ share-stream self-test has teeth: A-08 G1 (missing null guard / guard after "
+        "create / vanished write path) and G2 (vanished resolver stream) each flip red on "
+        "exactly their own breaker, the guard-clause spelling stays green, and a discarded "
+        "copySharedStream outcome is caught by the watchlist"
+    )
+    return 0
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -994,7 +1578,8 @@ def main():
         rc = self_test()
         rc2 = drain_self_test()
         rc3 = staged_self_test()
-        return 1 if (rc or rc2 or rc3) else 0
+        rc4 = share_stream_self_test()
+        return 1 if (rc or rc2 or rc3 or rc4) else 0
     violations = scan(args[0])
     # [B-04 deep-audit-1037] queue-drain persistence section. Its findings are
     # pre-formatted `file:line  [criterion] reason` strings, so they are
@@ -1004,6 +1589,10 @@ def main():
     # [§1042-A-07 deep-audit-1042] staged-bytes ledger section. Same pre-formatted
     # file:line [criterion] reason contract as the drain section above.
     staged_violations = scan_staged_bytes(args[0])
+    # [§1044-A08 deep-audit-1044] share inbound stream section: null stream must
+    # not reach the composer as a ghost attachment. Same pre-formatted
+    # `file:line [criterion] reason` contract as the sections above.
+    stream_violations = scan_share_stream_guard(args[0])
     if violations:
         print("❌ 丢弃了必须消费的返回值（看似接线，实则没生效）：")
         for rel, line, snippet, fn, why in violations:
@@ -1025,7 +1614,13 @@ def main():
             print("  %s" % msg)
         print("")
         print("  共 %d 处。" % len(staged_violations))
-    if violations or drain_violations or staged_violations:
+    if stream_violations:
+        print("❌ 分享入站流段：null 流会被当成已暂存文件（A-08）：")
+        for msg in stream_violations:
+            print("  %s" % msg)
+        print("")
+        print("  共 %d 处。" % len(stream_violations))
+    if violations or drain_violations or staged_violations or stream_violations:
         return 1
     print(
         "✅ discarded-return guard: no watchlisted return value is dropped "
@@ -1033,6 +1628,7 @@ def main():
     )
     print("✅ discarded-return guard: queue-drain persistence section green")
     print("✅ discarded-return guard: share staged-bytes accounting section green")
+    print("✅ discarded-return guard: share inbound stream section green (null stream never staged)")
     return 0
 
 

@@ -409,6 +409,28 @@ internal fun ChatInputArea(
         inputFieldValue = androidx.compose.ui.text.input.TextFieldValue("")
         lastTrueCaretEnd = 0
     }
+    // [dv24/B-05] Single funnel for "replace / append the composer body from
+    // outside onValueChange" — the twin of `clearComposerInput` for the two text
+    // intents. It writes BOTH copies on purpose: the ViewModel string feeds the
+    // inputText→field mirror, and the direct field write is what makes a write
+    // land when the new text already EQUALS the ViewModel string (the StateFlow
+    // drops the equal emission, and the mirror's `!=` guard then skips too — the
+    // message-edit prefill used to lose its caret that way, and the still-live
+    // 150 ms IME burst then flushed its pre-edit snapshot straight over the
+    // edit). Declared before its consumers for the same reason as the funnel
+    // above (1039-B1: a local `val` lambda cannot be referenced before its
+    // declaration).
+    val commitComposerBody: (String, Int) -> Unit = { text, caret ->
+        cancelPendingImeBurst()
+        val at = caret.coerceIn(0, text.length)
+        viewModel.setInputText(text)
+        inputFieldValue = androidx.compose.ui.text.input.TextFieldValue(
+            text = text,
+            selection = androidx.compose.ui.text.TextRange(at),
+            composition = null,
+        )
+        lastTrueCaretEnd = at
+    }
     // [fix/dv23-b3] Composer intents raised outside the composer (topbar `/`
     // button, tap on the chat list, system back, clear-chat confirm) are
     // executed HERE. ChatScreen used to resolve them against
@@ -439,6 +461,24 @@ internal fun ChatInputArea(
                     viewModel.setInputText(viewModel.dismissSlashMenu(inputFieldValue.text))
                 }
                 ComposerCommand.Clear -> clearComposerInput()
+                // [dv24/B-05] The two text intents: resolved HERE against the
+                // field's live text, then committed through the funnel above.
+                is ComposerCommand.ReplaceText -> commitComposerBody(
+                    command.text,
+                    composerCaretFor(command.text, command.caretOverride),
+                )
+                is ComposerCommand.AppendText -> {
+                    // `inputFieldValue.text` inline on purpose: it is the
+                    // composer's own live value (E-family criteria anchor).
+                    val next = composeAppend(
+                        live = inputFieldValue.text,
+                        text = command.text,
+                        separator = command.separator,
+                        trimExistingEnd = command.trimExistingEnd,
+                        trailingSpace = command.trailingSpace,
+                    )
+                    commitComposerBody(next, next.length)
+                }
             }
         }
     }

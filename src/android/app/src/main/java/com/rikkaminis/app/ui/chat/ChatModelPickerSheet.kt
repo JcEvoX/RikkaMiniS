@@ -265,6 +265,7 @@ import com.rikkaminis.app.data.model.ModelEntry
 import com.rikkaminis.app.data.model.ModelGroup
 import com.rikkaminis.app.data.model.ProviderConfig
 import com.rikkaminis.app.data.model.ProviderType
+import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.model.RoutingStrategy
 import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.data.repository.ChatRepository
@@ -625,11 +626,19 @@ internal fun ModelPickerSheet(
                                 val resolvedEntry = if (isSelected && activeEntryId != null) {
                                     config.modelEntries.find { it.id == activeEntryId }
                                 } else null ?: group.memberEntryIds.firstNotNullOfOrNull { entryId ->
-                                    config.modelEntries.find { it.id == entryId }
+                                    // [dv24/B-02] persisted entry first, synthesized
+                                    // System voice entry second — one source
+                                    // (SystemVoiceEntries.resolveIn). The System
+                                    // sentinels are never persisted, so a lookup
+                                    // against `config.modelEntries` alone resolved
+                                    // a default Voice Input/Output group to nothing.
+                                    SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
                                 }
                                 // Count of resolved members for display
                                 val resolvedCount = group.memberEntryIds.count { entryId ->
-                                    config.modelEntries.any { it.id == entryId }
+                                    // [dv24/B-02] same single source — a System voice
+                                    // member IS a usable member of the group
+                                    SystemVoiceEntries.resolveIn(config.modelEntries, entryId) != null
                                 }
 
                                 // Header sits above the first row, so the
@@ -768,7 +777,8 @@ internal fun ModelPickerSheet(
                                 if (isExpanded) {
                                     // Resolve actual entries from memberEntryIds
                                     val resolvedMembers = group.memberEntryIds.mapNotNull { entryId ->
-                                        config.modelEntries.find { it.id == entryId }
+                                        // [dv24/B-02] single source (see above)
+                                        SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
                                     }
                                     // Fallback: show active entry ONLY if this group is selected
                                     val displayMembers = resolvedMembers.ifEmpty {

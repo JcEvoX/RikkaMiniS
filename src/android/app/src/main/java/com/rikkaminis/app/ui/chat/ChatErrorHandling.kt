@@ -91,7 +91,13 @@ internal fun ChatViewModel.reportAgentLoopError(e: Exception) {
  * @param lastContextTokens API-reported input token count from the last call (0 = first call).
  */
 internal fun ChatViewModel.dynamicMaxTokens(provider: LLMProvider, lastContextTokens: Int = 0): Int {
-    val model = currentModel ?: return minOf(ChatViewModel.GLOBAL_MAX_TOKENS_CEILING, provider.defaultMaxOutputTokens)
+    // [deep-audit-1044 B-04] Route through the single live exit, like the other
+    // four capability readers. `currentModel` is the entry's BASE model for any
+    // snapshot written before B-03 landed, so a 33-of-39 built-in reported no
+    // `maxOutputTokens` and the output was silently capped at the provider
+    // default while the Token Usage sheet showed the real 64K/128K.
+    val model = liveEffectiveModel()
+        ?: return minOf(ChatViewModel.GLOBAL_MAX_TOKENS_CEILING, provider.defaultMaxOutputTokens)
     // Ceiling: min(global cap, model.maxOutputTokens-or-provider-default).
     // The global cap means we never send more than 128K regardless of
     // what the model claims it can output.

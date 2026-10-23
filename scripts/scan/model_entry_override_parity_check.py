@@ -38,6 +38,36 @@ wiring in BOTH files:
           list, and the screen's toggle init must keep deriving from the
           normalized override-or-base lists.
 
+  Arm 4 — [deep-audit-1044 A-01] ProviderRepository: every capability /
+          modality decision must be taken on the EFFECTIVE model
+          (ModelsDevApi.effectiveModel = enrich the base first, then apply the
+          user's overrides), never on `ModelEntry.model` (base + overrides,
+          no registry). All 39 built-in models declare null modality lists by
+          construction, so the raw read says "no audio / yes text" for
+          everything: a multimodal model the registry declares audio-capable
+          was dropped from the Voice Input candidates (recording then failed
+          with "No provider voice-input model configured"), the Voice Services
+          shadow list reported "0 models", and pure image generators were
+          offered as the new-chat default. The arm also pins the funnel's
+          definition (it must route through ModelsDevApi.effectiveModel, not a
+          re-derivation) and a ledger of the six decision functions, so
+          deleting a capability gate trips instead of passing silently.
+
+  Arm 5 — ProviderSpeechRecognitionEngine: the `resolvedModel` handed to
+          VoiceProvider.transcribe must be the effective model too (the
+          adapters read modalities / capability off it).
+
+  Arm 6 — the ONE sanctioned raw read: voice-TEMPLATE seeds
+          (`voiceTemplate?.mockModels`) are plain LLMModel values with no
+          ModelEntry behind them, so they cannot be enriched. Exactly one
+          function may carry the seed anchor, it must keep its modality read,
+          and it must NOT be routed through the funnel.
+
+  Arm 7 — drift: every `val LLMModel.<name>: Boolean` in VoiceModality.kt
+          whose body is about audio must be in MODALITY_PREDICATES (or in the
+          declared non-selection list), so a new audio predicate cannot escape
+          the funnel by not being listed here.
+
 Usage: python3 scripts/scan/model_entry_override_parity_check.py [root]
        python3 scripts/scan/model_entry_override_parity_check.py --root <root>
        python3 scripts/scan/model_entry_override_parity_check.py --selftest
@@ -45,6 +75,7 @@ Exit:  0 = clean, 1 = violation(s), 2 = usage/ROT
 """
 import argparse
 import os
+import re
 import sys
 import tempfile
 
@@ -83,6 +114,54 @@ ARM3_ANCHORS = (
 # strictly between the Save MinisButton onClick start and the entry.copy(
 # that follows, so the Reset button's sanctioned `overrides = ModelOverrides()`
 # (outside the save block, further down the file) is not flagged.
+# ── Arms 4-7: [deep-audit-1044 A-01] the effective-model funnel ─────────────
+PR_REL = APP + "/data/repository/ProviderRepository.kt"
+ASR_REL = APP + "/speech/ProviderSpeechRecognitionEngine.kt"
+VM_REL = APP + "/data/model/VoiceModality.kt"
+
+# Capability predicates a SELECTION decision may read. Off an un-enriched
+# `ModelEntry.model` every one of them answers "no" for a built-in model (all
+# 39 declare null modality lists by construction). Arm 7 derives coverage from
+# VoiceModality.kt, so a NEW audio predicate cannot escape by omission.
+MODALITY_PREDICATES = (
+    "hasAudioInput",
+    "hasAudioOutput",
+    "hasVoiceModality",
+    "isTextOutput",
+)
+
+# Not a selection decision: the single-flag voice-TEMPLATE-SEED shape
+# discriminator (launch cleanup over raw LLMModel seeds).
+NON_SELECTION_PREDICATES = ("isVoiceTemplateSeedShape",)
+
+# The one sanctioned raw read. Voice-template seeds are LLMModel values with no
+# ModelEntry behind them — they cannot be enriched, so their filter must stay
+# raw. Exactly one function may own this anchor (arm 6).
+SEED_ANCHOR = "?.mockModels"
+
+# Arm 4 ledger: function -> the capability predicate(s) it must read. Naming a
+# function here means "if this disappears or loses its gate, say so" — a rename
+# trips loudly instead of silently shrinking the gate's reach.
+PR_DECISION_LEDGER = {
+    "newestProviderNewestTextEntry": ("isTextOutput",),
+    "resolveVoiceInputChoice": ("hasAudioInput",),
+    "resolveVoiceInputCandidates": ("hasAudioInput",),
+    "resolveVoiceOutputChoice": ("hasAudioOutput",),
+    "hasVoiceModels": ("hasVoiceModality",),
+    "shadowVoiceProviders": ("hasAudioInput", "hasAudioOutput"),
+}
+
+FUN_RE = re.compile(
+    r"(?m)^[ \t]*(?:@\w+(?:\([^)]*\))?\s+)*"
+    r"(?:(?:private|internal|public|protected|override|suspend|inline|operator|open|abstract|tailrec)\s+)*"
+    r"fun\s+([A-Za-z_]\w*)\s*\(",
+)
+
+# The funnel is named by convention (`effective*`) and its DEFINITION is pinned
+# separately (arm 4b) — so the judgement anchors the decision (read the
+# effective model), not one particular spelling of the call site.
+SANCTIONED_RE = re.compile(r"^(?:[A-Za-z_][\w.]*\.)?(effective\w*)$")
+
 SAVE_BLOCK_START = "onClick = {"
 SAVE_BLOCK_END = "val updated = if (entry.isCustom) {"
 FORBIDDEN_SAVE_SNIPPETS = (
@@ -153,8 +232,279 @@ def save_block(src):
     return src[i:end + len(SAVE_BLOCK_END)]
 
 
+def strip_kotlin_comments(text):
+    """Comments blanked out (preserving newlines / offsets), string literals and
+    raw strings kept intact. Prose — including a KDoc that mentions the very
+    predicate under test — must neither satisfy nor trip a criterion; a `//`
+    inside a URL string must not eat the rest of the line."""
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith('"""', i):
+            out.append('"""')
+            i += 3
+            while i < n and not text.startswith('"""', i):
+                out.append(text[i])
+                i += 1
+            if i < n:
+                out.append('"""')
+                i += 3
+            continue
+        c = text[i]
+        if c in '"\'':
+            quote = c
+            out.append(c)
+            i += 1
+            while i < n:
+                ch = text[i]
+                out.append(ch)
+                if ch == '\\' and i + 1 < n:
+                    out.append(text[i + 1])
+                    i += 2
+                    continue
+                i += 1
+                if ch == quote:
+                    break
+            continue
+        if text.startswith("//", i):
+            while i < n and text[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        if text.startswith("/*", i):
+            out.append("  ")
+            i += 2
+            while i < n and not text.startswith("*/", i):
+                out.append("\n" if text[i] == "\n" else " ")
+                i += 1
+            if i < n:
+                out.append("  ")
+                i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _balanced(src, k, open_ch, close_ch):
+    depth = 0
+    i, n = k, len(src)
+    while i < n:
+        if src[i] == open_ch:
+            depth += 1
+        elif src[i] == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return n - 1
+
+
+def fun_bodies(src):
+    """[(name, body_start, body_end)] for every `fun`, braced OR expression
+    body. An expression body ends where the next declaration starts (slicing it
+    on braces would swallow the following function — the shape that made a
+    previous wave's装置 attribute a defect to the wrong function)."""
+    matches = [m.start() for m in FUN_RE.finditer(src)]
+    out = []
+    for idx, start in enumerate(matches):
+        m = FUN_RE.match(src, start)
+        if m is None:
+            continue
+        open_paren = src.find("(", m.end() - 1)
+        if open_paren < 0:
+            continue
+        close_paren = _balanced(src, open_paren, "(", ")")
+        limit = matches[idx + 1] if idx + 1 < len(matches) else len(src)
+        k = close_paren + 1
+        body_start = None
+        while k < limit:
+            if src[k] in "{=":
+                body_start = k
+                break
+            k += 1
+        if body_start is None:
+            continue  # abstract / interface declaration — no body
+        if src[body_start] == "{":
+            body_end = _balanced(src, body_start, "{", "}")
+        else:
+            body_end = limit
+        out.append((m.group(1), body_start, body_end))
+    return out
+
+
+def receiver_before(src, dot_index):
+    """(chain-without-arguments, is_call) of the receiver of the `.` at
+    [dot_index]. `entry.model` -> ("entry.model", False);
+    `effectiveEntryModel(it)` -> ("effectiveEntryModel", True)."""
+    j = dot_index - 1
+    while j >= 0 and src[j] in " \t\n":
+        j -= 1
+    if j >= 0 and src[j] == ")":
+        depth = 0
+        while j >= 0:
+            if src[j] == ")":
+                depth += 1
+            elif src[j] == "(":
+                depth -= 1
+                if depth == 0:
+                    break
+            j -= 1
+        if j < 0:
+            return (None, False)
+        open_paren = j
+        j -= 1
+        while j >= 0 and (src[j].isalnum() or src[j] in "_."):
+            j -= 1
+        return (src[j + 1:open_paren].strip(), True)
+    while j >= 0 and (src[j].isalnum() or src[j] in "_?."):
+        j -= 1
+    return (src[j + 1:dot_index].strip(), False)
+
+
+def is_sanctioned(receiver):
+    chain, is_call = receiver
+    return bool(is_call and chain and SANCTIONED_RE.match(chain))
+
+
+def modality_occurrences(code):
+    """[(line, owner_function_or_None, predicate, receiver)] for every
+    capability read in comment-stripped [code]. Import lines are skipped: the
+    import of `hasAudioInput` is not a decision."""
+    bodies = fun_bodies(code)
+    lines = code.split("\n")
+    out = []
+    for pred in MODALITY_PREDICATES:
+        for m in re.finditer(r"\.%s\b" % pred, code):
+            line = code.count("\n", 0, m.start()) + 1
+            if lines[line - 1].lstrip().startswith("import "):
+                continue
+            owner = None
+            for name, start, end in bodies:
+                if start <= m.start() <= end:
+                    owner = name
+                    break
+            out.append((line, owner, pred, receiver_before(code, m.start())))
+    return bodies, out
+
+
+def check_effective_model_funnel(root, rels):
+    """Arms 4-7 — the effective-model funnel (deep-audit-1044 A-01)."""
+    out = []
+    srcs = {k: read(rel, root) for k, rel in rels.items()}
+    for key, arm in (("pr", "4"), ("asr", "5"), ("vm", "7")):
+        if srcs.get(key) is None:
+            out.append((rels[key], 0, arm, "file not found — gate ROT"))
+    if out:
+        return out
+
+    pr_code = strip_kotlin_comments(srcs["pr"])
+    pr_bodies, pr_occ = modality_occurrences(pr_code)
+    by_name = {}
+    for name, start, end in pr_bodies:
+        by_name.setdefault(name, []).append(pr_code[start:end])
+
+    seed_fns = [name for name, start, end in pr_bodies if SEED_ANCHOR in pr_code[start:end]]
+    exempt = set(seed_fns)
+
+    # Arm 4a — no capability decision on an un-enriched model.
+    for line, owner, pred, receiver in pr_occ:
+        if owner in exempt:
+            continue
+        if is_sanctioned(receiver):
+            continue
+        out.append((rels["pr"], line, "4",
+                    "`%s` is read off `%s` — an un-enriched model (base + overrides, "
+                    "no models.dev). A modality decision must go through the effective-model "
+                    "funnel; for a built-in model the raw lists are null, so this answers "
+                    "\"not capable\" for every multimodal model"
+                    % (pred, receiver[0] or "<unknown>")))
+
+    # Arm 4b — the funnel exists and is the real single source.
+    funnel = by_name.get("effectiveEntryModel")
+    if not funnel:
+        out.append((rels["pr"], 0, "4",
+                    "`effectiveEntryModel(` funnel is gone — every capability decision in "
+                    "this file has to route through ModelsDevApi.effectiveModel"))
+    elif "ModelsDevApi.effectiveModel(" not in funnel[0]:
+        out.append((rels["pr"], 0, "4",
+                    "the effectiveEntryModel( funnel does not route through "
+                    "ModelsDevApi.effectiveModel( — a re-derivation (e.g. "
+                    "enrichModel(entry.model)) applies the registry ON TOP of the user's "
+                    "overrides and silently reverses an explicit choice"))
+
+    # Arm 4c — decision ledger: a dropped/renamed capability gate must not pass.
+    for fn, preds in PR_DECISION_LEDGER.items():
+        if fn not in by_name:
+            out.append((rels["pr"], 0, "4",
+                        "decision function `%s` not found — gate ROT (renamed or removed? "
+                        "update PR_DECISION_LEDGER in this gate if the rename is intended)" % fn))
+            continue
+        for pred in preds:
+            if "." + pred not in by_name[fn][0]:
+                out.append((rels["pr"], 0, "4",
+                            "`%s` no longer reads `%s` — the capability gate that keeps "
+                            "non-conforming models out was dropped" % (fn, pred)))
+
+    # Arm 6 — the one sanctioned raw read (voice-template seeds).
+    if len(seed_fns) > 1:
+        out.append((rels["pr"], 0, "6",
+                    "the seed carve-out is claimed by %d functions (%s) — exactly ONE may "
+                    "own `%s`, otherwise the exemption silently widens"
+                    % (len(seed_fns), ", ".join(sorted(seed_fns)), SEED_ANCHOR)))
+    elif seed_fns:
+        body = by_name[seed_fns[0]][0]
+        if not any("." + p in body for p in MODALITY_PREDICATES):
+            out.append((rels["pr"], 0, "6",
+                        "the voice-template seed filter in `%s` lost its modality read — seeds "
+                        "would be kept/dropped by accident" % seed_fns[0]))
+        if "effectiveEntryModel(" in body or "effectiveModel(" in body:
+            out.append((rels["pr"], 0, "6",
+                        "`%s` routes the template seeds through the effective-model funnel — "
+                        "seeds are plain LLMModel values with no ModelEntry, so there is nothing "
+                        "to enrich; this read must stay raw" % seed_fns[0]))
+
+    # Arm 5 — the ASR request carries the effective model.
+    asr_code = strip_kotlin_comments(srcs["asr"])
+    _, asr_occ = modality_occurrences(asr_code)
+    for line, owner, pred, receiver in asr_occ:
+        if is_sanctioned(receiver):
+            continue
+        out.append((rels["asr"], line, "5",
+                    "`%s` is read off `%s` in the transcription engine — the vendor adapters "
+                    "must see the effective model" % (pred, receiver[0] or "<unknown>")))
+    resolved = re.search(r"resolvedModel\s*=\s*([^\n,]*)", asr_code)
+    if resolved is None:
+        out.append((rels["asr"], 0, "5",
+                    "`resolvedModel =` not found in the VoiceInputRequest construction — "
+                    "gate ROT (renamed field?)"))
+    elif not re.match(r"^(?:[A-Za-z_][\w.]*\.)?effective\w*\s*\(", resolved.group(1).strip()):
+        out.append((rels["asr"], 0, "5",
+                    "the transcription request hands over `%s` — that is base + overrides with "
+                    "no models.dev row"
+                    % resolved.group(1).strip()))
+
+    # Arm 7 — coverage drift: a new audio predicate must be listed above.
+    vm_code = strip_kotlin_comments(srcs["vm"])
+    declared = [m.group(1) for m in re.finditer(r"val\s+LLMModel\.(\w+)\s*:\s*Boolean", vm_code)]
+    for idx, name in enumerate(declared):
+        if name in MODALITY_PREDICATES or name in NON_SELECTION_PREDICATES:
+            continue
+        start = vm_code.find("val LLMModel." + name)
+        next_start = vm_code.find("val LLMModel.", start + 1)
+        body = vm_code[start:next_start if next_start > 0 else len(vm_code)].lower()
+        if "audio" not in body:
+            continue
+        out.append((rels["vm"], vm_code.count("\n", 0, start) + 1, "7",
+                    "new audio predicate `%s` is not covered by this gate — add it to "
+                    "MODALITY_PREDICATES (a selection decision) or NON_SELECTION_PREDICATES "
+                    "(not a selection decision)" % name))
+
+    return out
+
+
 def run_checks(root, rels=None):
-    rels = rels or {"me": ME_REL, "ob": OB_REL}
+    rels = rels or {"me": ME_REL, "ob": OB_REL, "pr": PR_REL, "asr": ASR_REL, "vm": VM_REL}
     srcs = {k: read(rel, root) for k, rel in rels.items()}
     missing = [(rel, 0, "?", "file not found — gate ROT")
                for k, rel in rels.items() if srcs[k] is None]
@@ -198,6 +548,9 @@ def run_checks(root, rels=None):
     else:
         checks += check_anchors(srcs["ob"], OB_REL, fn3, "3",
                                 ARM3_ANCHORS, "deriveModalityList")
+
+    # Arms 4-7 — the effective-model funnel.
+    checks += check_effective_model_funnel(root, rels)
 
     return checks
 
@@ -430,26 +783,223 @@ internal fun deriveModalityList(
 }
 """
 
-# (name, {rel-key: fixture}, expected-arm)
+# ── arms 4-7 fixtures ────────────────────────────────────────────────────────
+# A plausible ProviderRepository: the funnel, the six ledger decisions, and the
+# one sanctioned raw seed read. The `hasAudioInput` IMPORT is deliberate — an
+# import line is not a decision and must not trip arm 4.
+FIX_PR_OK = """import com.rikkaminis.app.data.model.LLMModel
+import com.rikkaminis.app.data.model.ModelEntry
+import com.rikkaminis.app.data.model.hasAudioInput
+import com.rikkaminis.app.data.model.hasVoiceModality
+import com.rikkaminis.app.provider.ModelsDevApi
+
+class ProviderRepository {
+    private fun effectiveEntryModel(entry: ModelEntry): LLMModel =
+        ModelsDevApi.effectiveModel(entry)
+
+    fun newestProviderNewestTextEntry(): ModelEntry? {
+        val textEntry = config.modelEntries
+            .filter { effectiveEntryModel(it).isTextOutput }
+            .lastOrNull()
+        return textEntry
+    }
+
+    fun resolveVoiceInputChoice(): Any? {
+        fun providerEntry(memberId: String): Any? {
+            val entry = config.modelEntries.find { it.id == memberId } ?: return null
+            if (!inst.isEnabled || !effectiveEntryModel(entry).hasAudioInput) return null
+            return inst to entry
+        }
+        return providerEntry("x")
+    }
+
+    fun resolveVoiceInputCandidates(): List<Any> {
+        fun providerEntry(memberId: String): Any? {
+            val entry = config.modelEntries.find { it.id == memberId } ?: return null
+            if (!inst.isEnabled || !effectiveEntryModel(entry).hasAudioInput) return null
+            return inst to entry
+        }
+        return listOfNotNull(providerEntry("x"))
+    }
+
+    fun resolveVoiceOutputChoice(): Any? {
+        fun providerEntry(memberId: String): Any? {
+            val entry = config.modelEntries.find { it.id == memberId } ?: return null
+            if (!inst.isEnabled || !effectiveEntryModel(entry).hasAudioOutput) return null
+            return inst to entry
+        }
+        return providerEntry("x")
+    }
+
+    fun hasVoiceModels(instanceId: String): Boolean =
+        config.modelEntries.any {
+            it.providerInstanceId == instanceId && effectiveEntryModel(it).hasVoiceModality
+        }
+
+    fun shadowVoiceProviders(): List<Any> {
+        val entries = config.modelEntries
+        return listOf(
+            entries.filter { effectiveEntryModel(it).hasAudioInput },
+            entries.filter { effectiveEntryModel(it).hasAudioOutput },
+        )
+    }
+
+    fun replaceEntries(instanceId: String, models: List<LLMModel>) {
+        // Seeds are authored single-flag on purpose; they have no ModelEntry.
+        val voiceTemplate = VoiceProviderTemplate.template(instanceBaseURL)
+        val templateVoiceModelById = voiceTemplate?.mockModels
+            ?.filter { it.hasVoiceModality }
+            ?.associateBy { it.id }
+            ?: emptyMap()
+        models.size
+    }
+}
+"""
+
+# The pre-fix shape: same functions, same gates, read off the raw entry model.
+FIX_PR_BAD_BARE = (FIX_PR_OK
+                   .replace("effectiveEntryModel(it).isTextOutput", "it.model.isTextOutput")
+                   .replace("!effectiveEntryModel(entry).hasAudioInput", "!entry.model.hasAudioInput")
+                   .replace("!effectiveEntryModel(entry).hasAudioOutput", "!entry.model.hasAudioOutput")
+                   .replace("effectiveEntryModel(it).hasVoiceModality", "it.model.hasVoiceModality")
+                   .replace("effectiveEntryModel(it).hasAudioInput", "it.model.hasAudioInput")
+                   .replace("effectiveEntryModel(it).hasAudioOutput", "it.model.hasAudioOutput"))
+
+# The funnel exists but re-derives the raw model — the shape that hands the
+# registry value back over an explicit user override.
+FIX_PR_BAD_NO_FUNNEL = FIX_PR_OK.replace(
+    "ModelsDevApi.effectiveModel(entry)",
+    "entry.model",
+)
+
+# A capability gate quietly removed (a model would be offered even when the
+# registry says it cannot produce audio).
+FIX_PR_BAD_DROPPED_GATE = FIX_PR_OK.replace(
+    "            if (!inst.isEnabled || !effectiveEntryModel(entry).hasAudioOutput) return null\n",
+    "",
+)
+
+# The seed read routed through the funnel (nothing to enrich — a seed has no
+# ModelEntry).
+FIX_PR_BAD_SEED_ENRICHED = FIX_PR_OK.replace(
+    "?.filter { it.hasVoiceModality }",
+    "?.filter { effectiveEntryModel(seedEntry).hasVoiceModality }",
+)
+
+# A second function claiming the exempt anchor would widen the carve-out.
+FIX_PR_BAD_TWO_SEEDS = FIX_PR_OK + """
+fun templateSeedCount(instanceBaseURL: String?): Int {
+    val seeds = VoiceProviderTemplate.template(instanceBaseURL)?.mockModels
+    return seeds?.size ?: 0
+}
+"""
+
+FIX_ASR_OK = """import com.rikkaminis.app.provider.ModelsDevApi
+
+class ProviderSpeechRecognitionEngine {
+    private fun transcribeOnce() {
+        val response = provider.transcribe(
+            VoiceInputRequest(
+                audioData = wav,
+                model = entry.baseModel.id,
+                language = locale.toLanguageTag(),
+                resolvedModel = ModelsDevApi.effectiveModel(entry),
+            ),
+        )
+        response.text
+    }
+}
+"""
+
+FIX_ASR_BAD = """class ProviderSpeechRecognitionEngine {
+    private fun transcribeOnce() {
+        val response = provider.transcribe(
+            VoiceInputRequest(
+                audioData = wav,
+                model = entry.baseModel.id,
+                language = locale.toLanguageTag(),
+                resolvedModel = entry.model,
+            ),
+        )
+        response.text
+    }
+}
+"""
+
+FIX_ASR_ROT = """class ProviderSpeechRecognitionEngine {
+    private fun transcribeOnce() {
+        val response = provider.transcribe(VoiceInputRequest(audioData = wav))
+        response.text
+    }
+}
+"""
+
+FIX_VM = """package com.rikkaminis.app.data.model
+
+val LLMModel.hasAudioInput: Boolean
+    get() = normalizedInputs?.contains("audio") == true
+
+val LLMModel.hasAudioOutput: Boolean
+    get() = normalizedOutputs?.contains("audio") == true
+
+val LLMModel.hasVoiceModality: Boolean
+    get() = hasAudioInput || hasAudioOutput
+
+val LLMModel.isVoiceTemplateSeedShape: Boolean
+    get() = normalizedInputs == listOf("audio")
+"""
+
+FIX_VM_DRIFT = FIX_VM + """
+val LLMModel.hasAudioStream: Boolean
+    get() = normalizedInputs?.contains("audio") == true
+"""
+
+BASE_FIXTURES = {
+    "me": FIX_ME_OK,
+    "ob": FIX_OB_OK,
+    "pr": FIX_PR_OK,
+    "asr": FIX_ASR_OK,
+    "vm": FIX_VM,
+}
+
+# (name, {rel-key: fixture override}, expected-arm)
 SELFTEST_CASES = [
-    ("all-ok", {"me": FIX_ME_OK, "ob": FIX_OB_OK}, None),
-    ("me-inline-lists", {"me": FIX_ME_BAD_INLINE_LISTS, "ob": FIX_OB_OK}, "1"),
-    ("me-bare-ctor", {"me": FIX_ME_BAD_BARE_CTOR, "ob": FIX_OB_OK}, "1"),
-    ("ob-positional-ctor", {"me": FIX_ME_OK, "ob": FIX_OB_BAD_POSITIONAL}, "2"),
-    ("ob-raw-compare", {"me": FIX_ME_OK, "ob": FIX_OB_BAD_RAW_COMPARE}, "2"),
-    ("ob-no-passthrough", {"me": FIX_ME_OK, "ob": FIX_OB_BAD_NO_PASSTHROUGH}, "3"),
-    ("ob-no-toggle-loop", {"me": FIX_ME_OK, "ob": FIX_OB_BAD_NO_TOGGLE_LOOP}, "3"),
+    ("all-ok", {}, None),
+    ("me-inline-lists", {"me": FIX_ME_BAD_INLINE_LISTS}, "1"),
+    ("me-bare-ctor", {"me": FIX_ME_BAD_BARE_CTOR}, "1"),
+    ("ob-positional-ctor", {"ob": FIX_OB_BAD_POSITIONAL}, "2"),
+    ("ob-raw-compare", {"ob": FIX_OB_BAD_RAW_COMPARE}, "2"),
+    ("ob-no-passthrough", {"ob": FIX_OB_BAD_NO_PASSTHROUGH}, "3"),
+    ("ob-no-toggle-loop", {"ob": FIX_OB_BAD_NO_TOGGLE_LOOP}, "3"),
+    ("pr-bare-modality-read", {"pr": FIX_PR_BAD_BARE}, "4"),
+    ("pr-funnel-is-raw", {"pr": FIX_PR_BAD_NO_FUNNEL}, "4"),
+    ("pr-gate-dropped", {"pr": FIX_PR_BAD_DROPPED_GATE}, "4"),
+    ("pr-seed-enriched", {"pr": FIX_PR_BAD_SEED_ENRICHED}, "6"),
+    ("pr-two-seed-owners", {"pr": FIX_PR_BAD_TWO_SEEDS}, "6"),
+    ("asr-raw-resolved-model", {"asr": FIX_ASR_BAD}, "5"),
+    ("asr-no-resolved-model", {"asr": FIX_ASR_ROT}, "5"),
+    ("vm-new-audio-predicate", {"vm": FIX_VM_DRIFT}, "7"),
 ]
 
 
 def selftest():
-    rels = {"me": "ModelEntryDetailScreen.kt", "ob": "ModelEntryOverrideBuilder.kt"}
+    rels = {
+        "me": "ModelEntryDetailScreen.kt",
+        "ob": "ModelEntryOverrideBuilder.kt",
+        "pr": "ProviderRepository.kt",
+        "asr": "ProviderSpeechRecognitionEngine.kt",
+        "vm": "VoiceModality.kt",
+    }
     ok = True
-    for name, fixtures, expect_arm in SELFTEST_CASES:
+    for name, overrides, expect_arm in SELFTEST_CASES:
+        fixtures = dict(BASE_FIXTURES)
+        fixtures.update(overrides)
         with tempfile.TemporaryDirectory() as tmp:
             for k, rel in rels.items():
                 path = os.path.join(tmp, rel)
-                os.makedirs(os.path.dirname(path), exist_ok=True)
+                parent = os.path.dirname(path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
                 with open(path, "w", encoding="utf-8") as f:
                     f.write(fixtures[k])
             violations = run_checks(tmp, rels=rels)
@@ -495,7 +1045,7 @@ def main():
         for rel, line, arm, msg in violations:
             print("  [%s] %s:%d %s" % (arm, rel, line, msg))
         return 1
-    print("model_entry_override_parity_check: OK (3 arms, 0 violations)")
+    print("model_entry_override_parity_check: OK (7 arms, 0 violations)")
     return 0
 
 

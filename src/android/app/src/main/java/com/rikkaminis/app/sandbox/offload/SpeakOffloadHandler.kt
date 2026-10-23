@@ -117,9 +117,22 @@ class SpeakOffloadHandler(private val context: Context) : NativeOffloadHandler {
         // meant every tag was silently overwritten by the zh/en guess.
         val voiceTag = args.get("voice")
 
-        args.getDouble("rate")?.let { tts.speechRate = it.toFloat() }
-        args.getDouble("pitch")?.let { tts.speechPitch = it.toFloat() }
-        args.getDouble("volume")?.let { tts.speechVolume = it.toFloat() }
+        // [deep-audit-1044 A-07] Apply the tuning UNCONDITIONALLY, with the
+        // defaults the CLI contract above documents. `tts` is a process-wide
+        // singleton (registered once in MinisApp), so the old
+        // `args.getDouble("x")?.let { tts.speechX = it }` form *skipped* the
+        // assignment when the flag was absent and every later call inherited
+        // the previous call's value — one `--volume 0` silenced the rest of
+        // the process. Resolution lives in [TtsSpeakTuning] so the
+        // absent-flag→default decision is testable without an engine.
+        val tuning = TtsSpeakTuning.from(
+            rate = args.getDouble("rate"),
+            pitch = args.getDouble("pitch"),
+            volume = args.getDouble("volume"),
+        )
+        tts.speechRate = tuning.rate
+        tts.speechPitch = tuning.pitch
+        tts.speechVolume = tuning.volume
 
         val spoke = tts.speak(text, explicitLanguage = voiceTag)
         if (!spoke) {
@@ -309,5 +322,37 @@ NOTES:
 Returns structured JSON on errors:
   {"error":"tts_unavailable","message":"...","available_engines":[...]}
 """
+    }
+}
+
+/**
+ * [deep-audit-1044 A-07] Per-call TTS tuning: the values one `android-speak`
+ * invocation asks for, with the documented defaults filled in for absent flags.
+ *
+ * The TTS manager behind `android-speak` is a process-wide singleton whose
+ * `speechRate` / `speechPitch` / `speechVolume` keep their last value, so "the
+ * flag was absent" must resolve to the documented default rather than to
+ * "leave whatever the previous call left behind" — one `--volume 0` used to
+ * silence every later call in the process.
+ *
+ * Android-free by construction (three nullable doubles in, three floats out) so
+ * the absent-flag decision is unit-testable; the manager still owns the
+ * `coerceIn` clamps, which this type deliberately does not duplicate.
+ */
+internal data class TtsSpeakTuning(
+    val rate: Float,
+    val pitch: Float,
+    val volume: Float,
+) {
+    companion object {
+        /** Documented CLI defaults for `--rate` / `--pitch` / `--volume`. */
+        const val DEFAULT = 1.0
+
+        fun from(rate: Double?, pitch: Double?, volume: Double?): TtsSpeakTuning =
+            TtsSpeakTuning(
+                rate = (rate ?: DEFAULT).toFloat(),
+                pitch = (pitch ?: DEFAULT).toFloat(),
+                volume = (volume ?: DEFAULT).toFloat(),
+            )
     }
 }

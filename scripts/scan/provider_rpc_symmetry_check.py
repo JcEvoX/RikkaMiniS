@@ -65,6 +65,26 @@ Selftest：≥4 夹具，每条判据至少一个「恰好被它打破」的形�
       在 ProviderFactory 的 openRouter 臂上同样生效，藏在 base-URL 门控里 = 用户
       改不到一个真被发送的字段。守卫块整体消失同样 fail-closed 红（须重新推导）。
 
+[dv24-A05] 第五组：config 面的 `session.*` 写入必须**写穿**到驻留 VM。
+
+  C18 `ConfigBuiltins` 的 `session.thinkingLevel` / `session.primaryModel`
+      writer 必须同时具备两半（合取，缺一即红）：
+        - Room 写（`updateThinkingOverride(` / `updateSessionBinding(`）——
+          行是唯一跨重启的存储；
+        - 驻留 `ChatViewModel` 的刷新——经**非创建型**查找
+          （`peekViewModel(`，允许一层同文件委托）拿到 VM，再走 VM 自己的入口
+          （`setThinkingLevel` / `restoreFromBinding` / `applyNewChatDefaultModel`
+          / `select*` 家族）。
+      `session.primaryModel` 的清空/设置两支**分别**判定（`return@ClosureField`
+      切界）——只补一支 = 另一支仍然静默。两个 writer 都必须保留
+      `No active session` 拒绝契约。
+      `ChatViewModelStore.peekViewModel` 的**函数体**不得含任何分配路径
+      （`getOrPut(` / `ViewModelProvider` / `.put(`）：刷新一个不在屏上的会话
+      必须是无操作，不能凭空 materialise 一个 ChatViewModel。
+      原因：`ChatViewModel` 只在 `loadSession()` 读一次这两个字段，且 store
+      全进程缓存实例 ⇒ 只写行 = 界面永远看不到配置写入，用户随后点选模型
+      还会把内存旧值写回覆盖行。
+
 用法：
   python3 provider_rpc_symmetry_check.py <repo_root>   # 真树模式（位置参数）
   python3 provider_rpc_symmetry_check.py --selftest    # 夹具模式
@@ -116,6 +136,34 @@ FUN_DECL_PAT = re.compile(r"\bfun\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
 
 # ---- [da1030-C ISSUE-04] instance-field face symmetry (C6-C9) ----
 CONFIG_BUILTINS_FILE = "ConfigBuiltins.kt"
+
+# ---- [dv24-A05] session config write-through (C18) ----
+# (label, `path = "…"` marker in ConfigBuiltins, the DAO write token that field
+#  must keep). Both rows of this table are judged independently.
+SESSION_FIELDS = (
+    ("thinkingLevel", 'path = "session.thinkingLevel"', "updateThinkingOverride("),
+    ("primaryModel", 'path = "session.primaryModel"', "updateSessionBinding("),
+)
+# The VM-side entries that legitimately apply session config to the live chat:
+# the thinking picker's own entry, both priorities of loadSession's model chain,
+# and the explicit model pickers. Anchored on the FAMILY — a rename inside it
+# must not turn this criterion into a spelling test.
+VM_REFRESH_TOKENS = (
+    "setThinkingLevel(",
+    "restoreFromBinding(",
+    "applyDefaultModelFallback(",
+    "applyNewChatDefaultModel(",
+    "selectEntry(",
+    "selectGroup(",
+    "selectGroupEntry(",
+)
+VM_PEEK_TOKENS = ("peekViewModel(",)
+VM_STORE_FILE = "ChatViewModelStore.kt"
+# A peek that can CREATE is not a peek: these are the allocation paths a
+# read-only resident lookup must never carry.
+VM_STORE_CREATION_TOKENS = ("getOrPut(", "ViewModelProvider", ".put(")
+SESSION_NO_ACTIVE_GUARD = "No active session"
+SESSION_BRANCH_SPLIT = "return@ClosureField"
 CONNECTION_SCREEN_FILE = "ProviderConnectionScreen.kt"
 AZURE_MODE_TOKEN = "azureMode"
 AZURE_MODE_PUT = 'put("azureMode"'
@@ -467,11 +515,119 @@ def check_group_member_faces(mut_code, debug_code, groups_code):
     return v16, v17, vfc
 
 
+def session_writer_block(code, path_marker):
+    """The `writer = { … }` block of the field whose `path = "…"` is
+    [path_marker] (comment-stripped code). None when not locatable."""
+    at = code.find(path_marker)
+    if at < 0:
+        return None
+    w = code.find("writer = {", at)
+    if w < 0:
+        return None
+    return brace_block_after(code, w)
+
+def check_session_write_through(cfg_code, store_code):
+    """[dv24-A05] C18 — every `session.*` config write reaches BOTH surfaces.
+
+    `minis-config set session.thinkingLevel|primaryModel` used to write the Room
+    row and nothing else. ChatViewModel reads both fields exactly once (inside
+    `loadSession()`) and ChatViewModelStore caches that instance for the whole
+    process, so (a) the open chat kept the old model/level, and (b) the next
+    in-app picker tap wrote that stale memory back over the row.
+
+    Both halves are required, hence a conjunction per branch:
+      - the Room row (only cross-restart store), and
+      - a resident-VM refresh reached through the NON-CREATING lookup.
+
+    Returns (c18 violations, fail-closed violations).
+    """
+    v18, vfc = [], []
+    peek_cache = {}
+
+    def reaches_peek(block):
+        """True when [block] peeks, directly or through one same-file helper."""
+        if any(t in block for t in VM_PEEK_TOKENS):
+            return True
+        for m in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", block):
+            name = m.group(1)
+            if name == "peekViewModel":
+                continue
+            if name not in peek_cache:
+                body = extract_function(cfg_code, name)
+                peek_cache[name] = bool(
+                    body and any(t in body for t in VM_PEEK_TOKENS))
+            if peek_cache[name]:
+                return True
+        return False
+
+    for label, path_marker, dao_token in SESSION_FIELDS:
+        block = session_writer_block(cfg_code, path_marker)
+        if block is None:
+            vfc.append(
+                "%s: the %s writer block is not extractable (fail-closed) — the "
+                "criterion must be re-derived, not deleted"
+                % (CONFIG_BUILTINS_FILE, label))
+            continue
+        if SESSION_NO_ACTIVE_GUARD not in block:
+            v18.append(
+                "%s: %s writer no longer refuses with '%s' — the no-foreground "
+                "contract must survive the write-through rewrite"
+                % (CONFIG_BUILTINS_FILE, label, SESSION_NO_ACTIVE_GUARD))
+        branches = [block]
+        if label == "primaryModel":
+            branches = block.split(SESSION_BRANCH_SPLIT)
+            if len(branches) != 2:
+                v18.append(
+                    "%s: %s writer lost its clear/echo split (expected exactly one "
+                    "%s) — both branches are judged separately, so a collapsed "
+                    "writer hides whichever half stops refreshing"
+                    % (CONFIG_BUILTINS_FILE, label, SESSION_BRANCH_SPLIT))
+        for idx, branch in enumerate(branches):
+            if label == "primaryModel":
+                where = "%s[%s]" % (label, "clear" if idx == 0 else "set")
+            else:
+                where = label
+            if dao_token not in branch:
+                v18.append(
+                    "%s: %s writer dropped its Room write (%s) — the row is the only "
+                    "cross-restart store, so a VM-only refresh evaporates on the next "
+                    "load" % (CONFIG_BUILTINS_FILE, where, dao_token))
+            if not reaches_peek(branch):
+                v18.append(
+                    "%s: %s writer never reaches the resident ChatViewModel through the "
+                    "non-creating lookup — the open chat keeps the OLD value and the next "
+                    "in-app pick writes it back over the row"
+                    % (CONFIG_BUILTINS_FILE, where))
+            elif not any(t in branch for t in VM_REFRESH_TOKENS):
+                v18.append(
+                    "%s: %s writer peeks but never applies the value to the live chat "
+                    "(none of %s)"
+                    % (CONFIG_BUILTINS_FILE, where, "/".join(VM_REFRESH_TOKENS)))
+
+    peek = extract_function(store_code, "peekViewModel")
+    if peek is None:
+        vfc.append(
+            "%s: peekViewModel not found (fail-closed) — the non-creating resident "
+            "lookup is the whole point of the refresh half" % VM_STORE_FILE)
+    else:
+        for tok in VM_STORE_CREATION_TOKENS:
+            if tok in peek:
+                v18.append(
+                    "%s: peekViewModel can allocate (%s) — refreshing a session that is "
+                    "not on screen must not materialise a ChatViewModel"
+                    % (VM_STORE_FILE, tok))
+        if "stores[" not in peek:
+            v18.append(
+                "%s: peekViewModel no longer reads the existing store map — a lookup "
+                "that cannot find an existing VM is not a peek" % VM_STORE_FILE)
+    return v18, vfc
+
 def check_tree(root):
     """Returns (rc, detail dict). rc=0 all green."""
     detail = {"c1": [], "c2": [], "c3": [], "c4": [], "c5": [], "c6": [], "c7": [],
               "c8": [], "c9": [], "c10": [], "c11": [], "c12": [], "c13": [],
-              "c14": [], "c15": [], "c16": [], "c17": [], "fail_closed": []}
+              "c14": [], "c15": [], "c16": [], "c17": [], "c18": [],
+              "fail_closed": []}
 
     debug_paths = find_files(root, DEBUG_FILE)
     mut_paths = find_files(root, MUTATION_FILE)
@@ -991,9 +1147,28 @@ def check_tree(root):
                 % PROVIDERS_COLLECTION_FILE
             )
 
+    # ---- C18 ---- [dv24-A05] the config face's `session.*` writes must reach
+    # the resident ChatViewModel, not just the Room row.
+    store_paths = find_files(root, VM_STORE_FILE)
+    cfg18_paths = find_files(root, CONFIG_BUILTINS_FILE)
+    if len(store_paths) != 1:
+        detail["fail_closed"].append(
+            "expected exactly one %s, found %d" % (VM_STORE_FILE, len(store_paths)))
+    elif len(cfg18_paths) != 1:
+        # C8 already reported a missing/duplicated ConfigBuiltins.
+        pass
+    else:
+        with open(cfg18_paths[0], encoding="utf-8") as f:
+            cfg18 = strip_comments(f.read())
+        with open(store_paths[0], encoding="utf-8") as f:
+            store18 = strip_comments(f.read())
+        v18, vfc18 = check_session_write_through(cfg18, store18)
+        detail["c18"].extend(v18)
+        detail["fail_closed"].extend(vfc18)
+
     rc = 0
     for k in ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11",
-              "c12", "c13", "c14", "c15", "c16", "c17", "fail_closed"):
+              "c12", "c13", "c14", "c15", "c16", "c17", "c18", "fail_closed"):
         if detail[k]:
             rc = 1
     return rc, detail
@@ -1313,6 +1488,24 @@ internal class ProvidersCollection {
             },
         )
 }
+
+'''
+
+# [dv24-A05] C18's resident lookup: reads the store map, allocates nothing.
+GOOD_VM_STORE = '''package com.rikkaminis.app.ui.chat
+
+object ChatViewModelStore {
+    private val stores = mutableMapOf<String, ViewModelStore>()
+
+    fun peekViewModel(sessionId: String): ChatViewModel? {
+        val store = stores[sessionId] ?: return null
+        for (key in store.keys()) {
+            val vm = store.get(key)
+            if (vm is ChatViewModel) return vm
+        }
+        return null
+    }
+}
 '''
 
 # Minimal stand-ins so the fixture compiles conceptually (never compiled here);
@@ -1371,7 +1564,61 @@ internal object ConfigBuiltins {
             )
         )
     }
+    }
+
+    // [dv24-A05] the two `session.*` writers C18 judges. Both halves present:
+    // the Room write (cross-restart store) + a refresh through the
+    // non-creating resident lookup.
+    private fun registerSession(r: ConfigRegistry, chatRepo: ChatRepository) {
+        r.register(
+            ClosureField(
+                path = "session.thinkingLevel",
+                writer = { v ->
+                    val sid = sessionIdProvider()
+                        ?: throw ConfigError.InvalidValue("No active session — open a chat first")
+                    writeSessionConfig(
+                        sessionId = sid,
+                        persist = { chatRepo.dao.updateThinkingOverride(sid, v) },
+                        refresh = { vm -> vm.setThinkingLevel(v) },
+                    )
+                },
+            )
+        )
+        r.register(
+            ClosureField(
+                path = "session.primaryModel",
+                writer = { v ->
+                    val sid = sessionIdProvider()
+                        ?: throw ConfigError.InvalidValue("No active session — open a chat first")
+                    if (v == "") {
+                        writeSessionConfig(
+                            sessionId = sid,
+                            persist = { chatRepo.dao.updateSessionBinding(sid, "", "") },
+                            refresh = { vm -> vm.applyNewChatDefaultModel() },
+                        )
+                        return@ClosureField
+                    }
+                    writeSessionConfig(
+                        sessionId = sid,
+                        persist = { chatRepo.dao.updateSessionBinding(sid, v, v) },
+                        refresh = { vm -> vm.restoreFromBinding(v) },
+                    )
+                },
+            )
+        )
+    }
+
+    private fun writeSessionConfig(
+        sessionId: String,
+        persist: () -> Unit,
+        refresh: (ChatViewModel) -> Unit,
+    ) {
+        persist()
+        val vm = ChatViewModelStore.peekViewModel(sessionId)
+        if (vm != null) refresh(vm)
+    }
 }
+
 '''
 
 # ---------------------------------------------------------------------------
@@ -1488,7 +1735,8 @@ object ProviderDebugMethods {
 
 def write_fixture(debug_text, mutation_text, collection_text=None,
                   config_text=None, connection_text=None,
-                  auth_text=None, omit_auth=False, groups_text=None, rules_text=None):
+                  auth_text=None, omit_auth=False, groups_text=None, rules_text=None,
+                  store_text=None):
     root = tempfile.mkdtemp(prefix="rpcsym-")
     os.makedirs(os.path.join(root, "src", "debug"))
     os.makedirs(os.path.join(root, "src", "collections"))
@@ -1518,6 +1766,9 @@ def write_fixture(debug_text, mutation_text, collection_text=None,
     connection_text = GOOD_CONNECTION if connection_text is None else connection_text
     with open(os.path.join(root, "src", "ui", CONNECTION_SCREEN_FILE), "w", encoding="utf-8") as f:
         f.write(connection_text)
+    # [dv24-A05] the resident-VM store that C18's refresh half must go through.
+    with open(os.path.join(root, "src", "ui", VM_STORE_FILE), "w", encoding="utf-8") as f:
+        f.write(GOOD_VM_STORE if store_text is None else store_text)
     return root
 
 
@@ -2115,6 +2366,89 @@ def run_selftest():
         GOOD_MEMBER_FACES_MUT, GOOD_MEMBER_FACES_DBG,
         "package fake\n\nclass GroupsCollection {\n}\n")
 
+    # --- [dv24-A05] C18: the config face's `session.*` writers must reach the
+    # resident ChatViewModel (non-creating lookup), not just the Room row.
+    def session_arm(label, cfg_text, store_text, want_key):
+        v18, vfc = check_session_write_through(cfg_text, store_text)
+        got = {"c18": v18, "fail_closed": vfc}
+        if want_key is None:
+            clean = not any(got.values())
+            results.append((label, clean, {} if clean else got))
+            return
+        ok = bool(got[want_key]) and not any(got[k] for k in got if k != want_key)
+        results.append((label, ok, got))
+
+    THINK_REFRESH = """                        refresh = { vm -> vm.setThinkingLevel(v) },
+"""
+    CLEAR_REFRESH = """                            refresh = { vm -> vm.applyNewChatDefaultModel() },
+"""
+    SET_REFRESH = """                        refresh = { vm -> vm.restoreFromBinding(v) },
+"""
+    THINK_PERSIST = """                        persist = { chatRepo.dao.updateThinkingOverride(sid, v) },
+"""
+    THINK_CALL = """                    writeSessionConfig(
+                        sessionId = sid,
+                        persist = { chatRepo.dao.updateThinkingOverride(sid, v) },
+                        refresh = { vm -> vm.setThinkingLevel(v) },
+                    )"""
+    CLEAR_CALL = """                        writeSessionConfig(
+                            sessionId = sid,
+                            persist = { chatRepo.dao.updateSessionBinding(sid, "", "") },
+                            refresh = { vm -> vm.applyNewChatDefaultModel() },
+                        )"""
+    SET_CALL = """                    writeSessionConfig(
+                        sessionId = sid,
+                        persist = { chatRepo.dao.updateSessionBinding(sid, v, v) },
+                        refresh = { vm -> vm.restoreFromBinding(v) },
+                    )"""
+    GUARD = """                        ?: throw ConfigError.InvalidValue("No active session — open a chat first")
+"""
+
+    session_arm("F46-session-write-through-green", GOOD_CONFIG_BUILTINS, GOOD_VM_STORE, None)
+    for label, needle in (("thinking", THINK_REFRESH), ("clear", CLEAR_REFRESH),
+                          ("set", SET_REFRESH)):
+        assert GOOD_CONFIG_BUILTINS.count(needle) == 1, "F47/F48/F49 anchor missing: " + label
+        session_arm(
+            "F47-session-%s-refresh-dropped-C18" % label,
+            GOOD_CONFIG_BUILTINS.replace(needle, ""), GOOD_VM_STORE, "c18")
+    assert GOOD_CONFIG_BUILTINS.count(THINK_PERSIST) == 1, "F50 anchor missing"
+    session_arm(
+        "F50-session-think-refresh-only-no-row-C18",
+        GOOD_CONFIG_BUILTINS.replace(THINK_PERSIST, ""), GOOD_VM_STORE, "c18")
+    baseline = GOOD_CONFIG_BUILTINS.replace(
+        THINK_CALL, "                    chatRepo.dao.updateThinkingOverride(sid, v)")
+    baseline = baseline.replace(
+        CLEAR_CALL, '                        chatRepo.dao.updateSessionBinding(sid, "", "")')
+    baseline = baseline.replace(
+        SET_CALL, "                    chatRepo.dao.updateSessionBinding(sid, v, v)")
+    assert baseline.count("writeSessionConfig(") == 1, "F51 anchor missing"
+    v18, vfc = check_session_write_through(baseline, GOOD_VM_STORE)
+    results.append(("F51-session-baseline-dao-only-C18",
+                    bool(v18) and not vfc and len(v18) >= 3,
+                    {"c18": v18, "fail_closed": vfc}))
+    session_arm(
+        "F52-peek-allocates-C18",
+        GOOD_CONFIG_BUILTINS,
+        GOOD_VM_STORE.replace(
+            "stores[sessionId]", "stores.getOrPut(sessionId) { ViewModelStore() }"),
+        "c18")
+    session_arm(
+        "F53-peek-missing-fail-closed",
+        GOOD_CONFIG_BUILTINS,
+        GOOD_VM_STORE.replace("fun peekViewModel", "fun peekViewModelRenamed"),
+        "fail_closed")
+    assert GOOD_CONFIG_BUILTINS.count(GUARD) == 2, "F54 anchor missing"
+    session_arm(
+        "F54-session-no-active-guard-dropped-C18",
+        GOOD_CONFIG_BUILTINS.replace(GUARD, "", 1), GOOD_VM_STORE, "c18")
+    # Tree-level wiring: the baseline shape written to disk (proves the locate +
+    # read path, not just the checker function).
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, config_text=baseline)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c18"] and only(detail, "c18")
+    results.append(("F55-session-baseline-tree-wiring-C18", ok, detail))
+    shutil.rmtree(root)
+
     all_ok = True
     for name, ok, detail in results:
         print("%s %s" % ("PASS" if ok else "FAIL", name))
@@ -2146,10 +2480,11 @@ def main():
               "C10 auth single source, C11 group field faces, "
               "C12 context-limit canonical face, C13 entry-id check single-source, "
               "C14 instance key parity, C15 collection image keys, "
-              "C16 group member predicate single-source, C17 no sentinel literal)")
+              "C16 group member predicate single-source, C17 no sentinel literal, "
+              "C18 session config write-through to the resident view model)")
         return 0
     for k in ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11",
-              "c12", "c13", "c14", "c15", "c16", "c17", "fail_closed"):
+              "c12", "c13", "c14", "c15", "c16", "c17", "c18", "fail_closed"):
         for line in detail[k]:
             print("[%s] %s" % (k.upper(), line))
     return 1
