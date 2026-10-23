@@ -135,9 +135,38 @@ class ToolOverlayController(private val context: Context) {
      */
     var onDismissByUser: (() -> Unit)? = null
 
+    /**
+     * [T-android-overlay-intent-latch] *Real* attach state — true only
+     * while a view is genuinely attached to the WindowManager. Flipped by
+     * [attach] (which runs inside a posted Runnable) and cleared by
+     * [hide].
+     *
+     * Do NOT gate [hide] on this value: it lags the user-visible intent by
+     * a whole main-thread queue hop. See [desiredShown].
+     */
     @Volatile
     var isShown: Boolean = false
         private set
+
+    /**
+     * [T-android-overlay-intent-latch] The *intent*: "the capsule should be
+     * on screen". [show] sets it, [hide] clears it — both synchronously on
+     * the calling thread, so the two intents can never interleave inside
+     * the main-thread queue.
+     *
+     * Why a second field. `show()` attaches the view from a posted
+     * Runnable, so [isShown] stays false for at least one queue hop. Every
+     * state flip landing inside that window ("app returned to foreground",
+     * "camera suppress", "user toggled the overlay off", "task finished")
+     * used to be dropped by the `if (isShown) hide()` guards at all three
+     * call sites — the still-queued attach then painted the capsule over
+     * the chat or over the camera preview, with no further state frame
+     * left to clear it. The posted show block now re-reads this latch
+     * before touching the WindowManager, and every hide site calls [hide]
+     * unconditionally.
+     */
+    @Volatile
+    private var desiredShown: Boolean = false
 
     fun hasOverlayPermission(): Boolean =
         Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(context)
@@ -175,10 +204,18 @@ class ToolOverlayController(private val context: Context) {
                 "session=$targetSessionId perm=${hasOverlayPermission()}",
         )
         if (!hasOverlayPermission()) {
-            if (isShown) hide()
+            // [T-android-overlay-intent-latch] Unconditional: `isShown`
+            // is still false while an attach is queued, so guarding on it
+            // left the posted attach alive with the permission now gone.
+            hide()
             return
         }
+        // [T-android-overlay-intent-latch] Publish the intent *now*, on the
+        // calling thread, before the Runnable is queued: a hide that
+        // arrives while this attach is in flight must win.
+        desiredShown = true
         mainHandler.post {
+            if (!shouldRunShowPost(desiredShown)) return@post
             try {
                 pendingSessionId = targetSessionId
                 if (view == null) {
@@ -193,6 +230,13 @@ class ToolOverlayController(private val context: Context) {
     }
 
     fun hide() {
+        // [T-android-overlay-intent-latch] Clear the intent unconditionally
+        // on the calling thread, *before* posting: a show whose attach is
+        // still queued behind us re-reads this latch and bails. There is
+        // deliberately no `isShown` pre-check — that flag is false during
+        // the race this closes, and the posted body below is already
+        // idempotent (`view == null` → return).
+        desiredShown = false
         mainHandler.post {
             val v = view ?: return@post
             try {
@@ -265,6 +309,9 @@ class ToolOverlayController(private val context: Context) {
         attachTouchListener(container, params)
         windowManager.addView(container, params)
         view = container
+        // [T-android-overlay-intent-latch] Reached only from show()'s posted
+        // block, which sampled [desiredShown] first — so `isShown` here
+        // always reflects a view that the caller still wants on screen.
         isShown = true
     }
 
