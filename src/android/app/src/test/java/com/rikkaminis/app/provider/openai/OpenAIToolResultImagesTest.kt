@@ -216,8 +216,18 @@ class OpenAIToolResultImagesTest {
         assertEquals(2, countOf(providerSource, call))
         val firstWindow = providerSource.substringAfter(call).take(400)
         assertTrue(firstWindow, firstWindow.contains("entries = toolResultImages"))
+        // [deep-audit-1047 A-03] The legacy-media branch now feeds the serializer
+        // ONE list that carries the request-level images AND the message's own
+        // image parts (the two used to be exclusive branches, and the per-message
+        // carrier was dropped entirely). The assertions below name the DERIVED
+        // list, not the old spelling: the entries come from `legacyImages`, and
+        // that list is built from the request-level list plus `msg.imageParts`.
         val secondWindow = providerSource.substringAfterLast(call).take(400)
-        assertTrue(secondWindow, secondWindow.contains("entries = imageParts.map"))
+        assertTrue(secondWindow, secondWindow.contains("entries = legacyImages.map"))
+        assertTrue(
+            providerSource,
+            providerSource.contains("(if (attachTopLevelImages) imageParts else emptyList()) + msg.imageParts"),
+        )
     }
 
     @Test
