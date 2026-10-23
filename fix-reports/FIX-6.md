@@ -206,7 +206,7 @@ core + `StagedBytesLedger.kt` + `SharedStreamCopyTest.kt` 三文件真编译真�
 
 ### L4 CI
 
-run **39894730889** / job **120222409741** attempt 1 **success**；26 步 `failed=[]`，唯一
+run **39896463281** / job **120227969257** attempt 1 **success**（前一次 run 39894730889 / job 120222409741 亦 success，源码树等价）；26 步 `failed=[]`，唯一
 skipped = `Publish to Releases`（main 门控）；`Summary: 109 passed, 0 failed` 恰一条；
 门头 1..109 连续且门名互异；`ALL 336 CASES PASS`；编译错 `Z e: ` 0；游离 FAILED 0；
 `SharedStreamCopyTest` **12/12 逐条 PASSED**。详见 §8。
@@ -310,10 +310,10 @@ skipped = `Publish to Releases`（main 门控）；`Summary: 109 passed, 0 faile
 
 | 项 | 值 |
 |---|---|
-| run id | **39894730889**（`Build RikkaMinis Android APK`；`gh_sync.sh` 打印的 `#2528` 是其内部序号） |
+| run id | **39896463281**（`Build RikkaMinis Android APK`；`gh_sync.sh` 打印的 `#2528` 是其内部序号）。前一次 run **39894730889** @ `efc21523` 亦 success（同一源码树，报告提交后重跑一次使 `head_sha` 与本地 HEAD 逐字符一致） |
 | dispatch | `gh-actions-dispatch --workflow build-apk.yml --ref fix/dv24-a6-share-null-stream`（2026-10-23T03:23:10Z，204） |
-| job id | **120222409741**（`build`，attempt 1） |
+| job id | **120227969257**（`build`，attempt 1；前一次 run 的 job = `120222409741`，亦 success） |
 | conclusion | **success** |
-| head_sha 三方 | `efc21523f200047e00c38adfeda5e330015cb68f` == 本地 `git rev-parse HEAD` == `git ls-remote origin fix/dv24-a6-share-null-stream` == `run.head_sha`（逐字符一致） |
+| head_sha 三方 | `8a86cfc95f5d9ea71e34b432106b999608a61321` == 本地 `git rev-parse HEAD` == `git ls-remote origin fix/dv24-a6-share-null-stream` == `run.head_sha`（逐字符一致）。两次 run 的源码树等价：`git diff --name-only efc21523 HEAD` = **仅 `fix-reports/FIX-6.md`**（不在 workflow paths 内） |
 | steps | **26 步全 success**，`failed=[]`，唯一 skipped = `Publish to Releases`（main 门控） |
-| 日志判读 | `Summary: 109 passed, 0 failed` 恰一条（其余 6 条 Summary 为其他分组的 5/10/13/22/25 passed, 0 failed，无非零）· 门头 `[1/109]..[109/109]` **序号连续 109、门名互异 109** · `ALL 336 CASES PASS` 1 条 · 编译错 `Z e: ` **0** · 游离 FAILED **0** · `share inbound stream section green` 在册 · `SharedStreamCopyTest` **12/12 逐条 PASSED** · 日志 1,394,357 B |
+| 日志判读 | `Summary: 109 passed, 0 failed` 恰一条（其余 6 条 Summary 为其他分组的 5/10/13/22/25 passed, 0 failed，无非零）· 门头 `[1/109]..[109/109]` **序号连续 109、门名互异 109** · `ALL 336 CASES PASS` 1 条 · 编译错 `Z e: ` **0** · 游离 FAILED **0** · `share inbound stream section green` 在册 · `SharedStreamCopyTest` **12/12 逐条 PASSED** · 日志 1,394,553 B |
