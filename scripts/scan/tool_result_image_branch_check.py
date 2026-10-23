@@ -250,6 +250,328 @@ def check_payload_filters(root, provider_dir, texts):
     return violations, total
 
 
+# ── [deep-audit-1047 A-03] Declared carriers must have a wire consumer ──────
+# `hasWirePayload` is the ONE place that decides "this turn still has payload".
+# Every arm it weighs is therefore a promise to some serializer: the turn is
+# kept, so the serializer had better know what to do with those bytes. Until
+# 1047 nothing on the wire side read `msg.imageParts` at all — the promise was
+# unbacked, and the empty filter happily let a text-less image turn through to
+# an empty `content: ""`.
+#
+# C-IMG-1 (declaration implies consumption): derive the carrier list from the
+#     predicate BODY (`<carrier>.isNotEmpty()` arms) and require `.<carrier>`
+#     reads in the files that actually write media wire parts. Byte-estimate
+#     readers (`LLMProvider.approxInputBytes`) do NOT count — that is exactly
+#     the read that made the old gate blind.
+# C-IMG-2 (images and audio must not be mutually exclusive): inside a file that
+#     writes both, the `input_audio` write may not sit in a sibling branch of
+#     the chain that serializes `imageParts` — a turn carrying both would lose
+#     one of them silently.
+#
+# Both derive from the tree: no carrier list, no file list, no line numbers.
+
+CARRIER_ARM_RE = re.compile(r"([A-Za-z_]\w*)\.isNotEmpty\(\)")
+MEDIA_WIRE_MARKS = (
+    re.compile(r'put\(\s*"type"\s*,\s*"image_url"'),
+    re.compile(r'put\(\s*"type"\s*,\s*"input_image"'),
+    re.compile(r'put\(\s*"type"\s*,\s*"image"'),
+    re.compile(r'put\(\s*"inlineData"'),
+    # The shared image encoders (OpenAIToolResultImages.chat/responsesUserContent)
+    # build the parts themselves, so a serialization site may hand them the bytes
+    # without ever spelling an image marker inline.
+    re.compile(r"\b[A-Za-z_]*UserContent\s*\("),
+)
+AUDIO_WRITE_RE = re.compile(r'put\(\s*"type"\s*,\s*"input_audio"')
+MIN_MEDIA_SERIALIZER_FILES = 2
+IF_KW = re.compile(r"\bif\s*\(")
+
+
+def blank_comments(text):
+    """Same length as `text`: comment bodies become spaces (newlines kept),
+    literals INTACT — the media markers are string literals."""
+    out = list(text)
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '"' or c == "'":
+            q = text[i:i + 3] if text.startswith('"""', i) else c
+            i += len(q)
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text.startswith(q, i) if len(q) == 3 else text[i] == q:
+                    i += len(q)
+                    break
+                i += 1
+            continue
+        if text.startswith("//", i):
+            while i < n and text[i] != "\n":
+                out[i] = " "
+                i += 1
+            continue
+        if text.startswith("/*", i):
+            while i < n and not text.startswith("*/", i):
+                if text[i] != "\n":
+                    out[i] = " "
+                i += 1
+            if i < n:
+                out[i] = " "
+                out[i + 1] = " "
+                i += 2
+            continue
+        i += 1
+    return "".join(out)
+
+
+def blank_comments_and_strings(text):
+    """Same length as `text`: comments AND literal contents become spaces,
+    newlines kept — so brace/paren matching can never be fooled by a literal,
+    and every index still lines up with the original."""
+    out = list(text)
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if text.startswith('"""', i):
+            for k in range(i, min(i + 3, n)):
+                out[k] = " "
+            i += 3
+            while i < n and not text.startswith('"""', i):
+                if text[i] != "\n":
+                    out[i] = " "
+                i += 1
+            for k in range(i, min(i + 3, n)):
+                out[k] = " "
+            i += 3
+            continue
+        if text.startswith("//", i):
+            while i < n and text[i] != "\n":
+                out[i] = " "
+                i += 1
+            continue
+        if text.startswith("/*", i):
+            while i < n and not text.startswith("*/", i):
+                if text[i] != "\n":
+                    out[i] = " "
+                i += 1
+            if i < n:
+                out[i] = " "
+                out[i + 1] = " "
+                i += 2
+            continue
+        if c == '"' or c == "'":
+            q = c
+            out[i] = " "
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    out[i] = " "
+                    if i + 1 < n and text[i + 1] != "\n":
+                        out[i + 1] = " "
+                    i += 2
+                    continue
+                if text[i] == q:
+                    out[i] = " "
+                    i += 1
+                    break
+                if text[i] != "\n":
+                    out[i] = " "
+                i += 1
+            continue
+        i += 1
+    return "".join(out)
+
+
+def matching(text, i):
+    """Index of the delimiter closing the one at `i` (`(`/`{`), or -1."""
+    opener = text[i]
+    closer = ")" if opener == "(" else "}"
+    depth = 0
+    k = i
+    while k < len(text):
+        if text[k] == opener:
+            depth += 1
+        elif text[k] == closer:
+            depth -= 1
+            if depth == 0:
+                return k
+        k += 1
+    return -1
+
+
+def if_blocks(structure):
+    """-> [(if_start, cond, body_start, body_end)] for every brace-bodied `if`
+    in a comment/string-blanked text."""
+    out = []
+    for m in IF_KW.finditer(structure):
+        paren_at = structure.find("(", m.start())
+        if paren_at < 0:
+            continue
+        paren_end = matching(structure, paren_at)
+        if paren_end < 0:
+            continue
+        brace_at = structure.find("{", paren_end)
+        if brace_at < 0:
+            continue
+        brace_end = matching(structure, brace_at)
+        if brace_end < 0:
+            continue
+        out.append((m.start(), structure[paren_at + 1:paren_end], brace_at, brace_end))
+    return out
+
+
+def innermost_if(blocks, index):
+    """The smallest `if` body containing `index`, or None."""
+    best = None
+    for blk in blocks:
+        if blk[2] <= index < blk[3]:
+            if best is None or (blk[3] - blk[2]) < (best[3] - best[2]):
+                best = blk
+    return best
+
+
+def is_else_chained(structure, if_start):
+    """True when the `if` at `if_start` opens an `else` / `else if` branch."""
+    i = if_start - 1
+    while i >= 0 and structure[i] in " \t\r\n":
+        i -= 1
+    return structure[max(0, i - 3):i + 1].endswith("else")
+
+
+def preceding_sibling(structure, if_start):
+    """(start, end) of the sibling block that the `else` at `if_start` continues,
+    or None."""
+    i = if_start - 1
+    while i >= 0 and structure[i] in " \t\r\n":
+        i -= 1
+    if not structure[max(0, i - 3):i + 1].endswith("else"):
+        return None
+    k = i - 4
+    while k >= 0 and structure[k] in " \t\r\n":
+        k -= 1
+    if k < 0 or structure[k] != "}":
+        return None
+    depth = 0
+    while k >= 0:
+        if structure[k] == "}":
+            depth += 1
+        elif structure[k] == "{":
+            depth -= 1
+            if depth == 0:
+                return (k, i)
+        k -= 1
+    return None
+
+
+def predicate_carrier_arms(predicate_text):
+    """-> set of carrier names the shared payload predicate weighs, or None."""
+    blanked = blank_comments(predicate_text)
+    idx = blanked.find(PAYLOAD_PREDICATE_DECL)
+    if idx < 0:
+        return None
+    end = blanked.find("\n\n", idx)
+    if end < 0:
+        end = len(blanked)
+    span = blanked[idx:end]
+    return {m.group(1) for m in CARRIER_ARM_RE.finditer(span)}
+
+
+def check_carrier_consumption(texts):
+    """C-IMG-1."""
+    violations = []
+    predicate = texts.get(PAYLOAD_PREDICATE_FILE)
+    arms = predicate_carrier_arms(predicate) if predicate is not None else None
+    if not arms:
+        violations.append(
+            "%s: no `<carrier>.isNotEmpty()` arm could be derived from the payload "
+            "predicate — refusing to report green" % PAYLOAD_PREDICATE_FILE)
+        return violations
+    serializers = {}
+    for rel, text in texts.items():
+        flat = blank_comments(text)
+        if any(mark.search(flat) for mark in MEDIA_WIRE_MARKS):
+            serializers[rel] = flat
+    if len(serializers) < MIN_MEDIA_SERIALIZER_FILES:
+        violations.append(
+            "only %d file(s) under the provider package write a media wire part "
+            "(expected >= %d) — the serializers moved or the markers changed, so "
+            "carrier consumption cannot be judged"
+            % (len(serializers), MIN_MEDIA_SERIALIZER_FILES))
+        return violations
+    for carrier in sorted(arms):
+        read = re.compile(r"\.%s\b" % re.escape(carrier))
+        if not any(read.search(body) for body in serializers.values()):
+            violations.append(
+                "%s: the payload predicate keeps a turn alive for `%s.isNotEmpty()`, but "
+                "no media serializer under the provider package ever reads `.%s` — those "
+                "bytes are dropped and a text-less turn goes out as `content: \"\"`"
+                % (PAYLOAD_PREDICATE_FILE, carrier, carrier))
+    return violations
+
+
+def has_media_image_mark(text):
+    return any(mark.search(text) for mark in MEDIA_WIRE_MARKS)
+
+
+def check_image_audio_not_exclusive(texts):
+    """C-IMG-2.
+
+    Anchored on the two WRITES, not on a carrier name: whatever feeds the image
+    parts, an `input_audio` write that lives in an `else`/`else if` branch of the
+    same chain as an image write is unreachable whenever images are attached —
+    and vice versa. The merged shape (both writes reachable in one block) is the
+    only compliant one."""
+    violations = []
+    audio_sites = 0
+    for rel in sorted(texts):
+        text = texts[rel]
+        structure = blank_comments_and_strings(text)
+        flat = blank_comments(text)
+        audio_positions = [m.start() for m in AUDIO_WRITE_RE.finditer(flat)]
+        if not audio_positions:
+            continue
+        blocks = if_blocks(structure)
+        image_blocks = [blk for blk in blocks if has_media_image_mark(flat[blk[2]:blk[3]])]
+        for apos in audio_positions:
+            audio_sites += 1
+            line = flat[:apos].count("\n") + 1
+            ablk = innermost_if(blocks, apos)
+            if ablk is None:
+                continue
+            if has_media_image_mark(flat[ablk[2]:ablk[3]]):
+                continue  # both carriers reachable from one block — the fix shape
+            sibling = preceding_sibling(structure, ablk[0]) if is_else_chained(structure, ablk[0]) else None
+            if sibling is not None and has_media_image_mark(flat[sibling[0]:sibling[1]]):
+                violations.append(
+                    "%s:%d writes `input_audio` in an `else` branch whose sibling writes "
+                    "an image part — a turn carrying both loses its audio silently (the "
+                    "two carriers must share one branch)" % (rel, line))
+                continue
+            flagged = False
+            for iblk in image_blocks:
+                if not is_else_chained(structure, iblk[0]):
+                    continue
+                sib = preceding_sibling(structure, iblk[0])
+                if sib is None:
+                    continue
+                if any(sib[0] <= p < sib[1] for p in audio_positions):
+                    violations.append(
+                        "%s:%d writes an image part in an `else` branch whose sibling "
+                        "writes `input_audio` — same exclusive chain, the audio is dropped "
+                        "whenever images are attached" % (rel, line))
+                    flagged = True
+                    break
+            if flagged:
+                continue
+    if audio_sites == 0:
+        violations.append(
+            "no `input_audio` write site found under the provider package — refusing to "
+            "report green (the audio serialization moved)")
+    return violations
+
+
 def scan_root(root, exemptions=None):
     """Return (violations, scanned_files, per_file_report)."""
     exemptions = EXEMPTIONS if exemptions is None else exemptions
@@ -325,6 +647,11 @@ def scan_root(root, exemptions=None):
 
     payload_violations, _sites = check_payload_filters(root, provider_dir, texts)
     violations.extend(payload_violations)
+    # [deep-audit-1047 A-03] The two criteria that make "declared" mean
+    # "consumed", and that keep the image / audio carriers out of mutually
+    # exclusive branches.
+    violations.extend(check_carrier_consumption(texts))
+    violations.extend(check_image_audio_not_exclusive(texts))
     return (violations, scanned, report)
 
 
@@ -549,6 +876,43 @@ def selftest():
         finally:
             shutil.rmtree(p_root, ignore_errors=True)
 
+        # [deep-audit-1047 A-03] Carrier arms must have a wire consumer, and the
+        # image / audio carriers must not sit in mutually exclusive branches.
+        # Fixtures live at module level (MEDIA_*) so they can be inspected and
+        # mutated without the payload-filter scaffolding around them.
+        m_root, m_pkg, m_snapshot = build_media_tree(MEDIA_MERGED)
+        try:
+            v_ok, _sc, _rp = scan_root(m_root)
+            check("merged image/audio branch and full carrier reads are green",
+                  not media_crit_codes(v_ok), str(v_ok[:2]))
+
+            # (1) no serializer reads a carrier the predicate weighs -> C-IMG-1 only
+            for rel in m_snapshot:
+                write_fixture(os.path.join(m_pkg, rel), m_snapshot[rel]
+                              .replace("msg.imageParts", "msg.contentParts"))
+            v_unread, _, _ = scan_root(m_root)
+            check("a carrier arm with no serializer reader is C-IMG-1 red",
+                  media_crit_codes(v_unread) == {"C-IMG-1"},
+                  str(sorted(media_crit_codes(v_unread))))
+            for rel in m_snapshot:
+                write_fixture(os.path.join(m_pkg, rel), m_snapshot[rel])
+
+            # (2) split the merged branch back into exclusive `else if` arms
+            write_fixture(os.path.join(m_pkg, "openai/A.kt"),
+                          m_snapshot["openai/A.kt"].replace(MEDIA_MERGED, MEDIA_EXCLUSIVE))
+            v_split, _, _ = scan_root(m_root)
+            check("image and audio in exclusive else-if branches is C-IMG-2 red",
+                  media_crit_codes(v_split) == {"C-IMG-2"},
+                  str(sorted(media_crit_codes(v_split))))
+            write_fixture(os.path.join(m_pkg, "openai/A.kt"), m_snapshot["openai/A.kt"])
+            v_back, _, _ = scan_root(m_root)
+            check("restoring the merged branch clears the C-IMG-2 arm",
+                  not media_crit_codes(v_back), str(sorted(media_crit_codes(v_back))))
+            if "openai/A.kt" not in m_snapshot or MEDIA_MERGED not in m_snapshot["openai/A.kt"]:
+                check("media fixture carries the merged branch it mutates", False)
+        finally:
+            shutil.rmtree(m_root, ignore_errors=True)
+
         missing_dir, scanned_missing, _ = scan_root(os.path.join(tmp, "does-not-exist"))
         check(
             "missing provider package is a hard failure, not a green skip",
@@ -557,6 +921,129 @@ def selftest():
         return 0 if ok else 1
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+
+# ── [deep-audit-1047 A-03] selftest fixtures for C-IMG-1 / C-IMG-2 ──────────
+PREDICATE_BODY = (
+    "internal fun LLMMessage.hasWirePayload(\n"
+    "    isLastUserTurn: Boolean,\n"
+    "    turnImageCount: Int,\n"
+    "): Boolean =\n"
+    "    contentParts.isNotEmpty() ||\n"
+    "        content.isNotEmpty() ||\n"
+    "        audioParts.isNotEmpty() ||\n"
+    "        imageParts.isNotEmpty() ||\n"
+    "        (isLastUserTurn && turnImageCount > 0)\n"
+)
+FILTER_SITE = (
+    "        val sites = raw\n"
+    "            .filterIndexed { index, m ->\n"
+    "                m.hasWirePayload(\n"
+    "                    isLastUserTurn = index == 0,\n"
+    "                    turnImageCount = images.size,\n"
+    "                )\n"
+    "            }\n"
+)
+# Compliant shape: images (request-level + per-message) and audio share ONE branch,
+# text last.
+MEDIA_MERGED = (
+    "        for ((index, msg) in sites.withIndex()) {\n"
+    "            val legacy = (if (index == 0) images else emptyList()) + msg.imageParts\n"
+    "            if (legacy.isNotEmpty() || msg.audioParts.isNotEmpty()) {\n"
+    "                val contentArray = JSONArray()\n"
+    "                for (part in legacy) {\n"
+    '                    contentArray.put(JSONObject().put("type", "image_url"))\n'
+    "                }\n"
+    "                for (audio in msg.audioParts) {\n"
+    '                    contentArray.put(JSONObject().put("type", "input_audio"))\n'
+    "                }\n"
+    "                if (msg.content.isNotEmpty()) {\n"
+    '                    contentArray.put(JSONObject().put("type", "text"))\n'
+    "                }\n"
+    "            }\n"
+    "        }\n"
+)
+# Defect shape (88ef9b27): images and audio are exclusive `else if` siblings.
+MEDIA_EXCLUSIVE = (
+    "        for ((index, msg) in sites.withIndex()) {\n"
+    "            if (index == 0 && images.isNotEmpty()) {\n"
+    "                val contentArray = JSONArray()\n"
+    "                for (part in images) {\n"
+    '                    contentArray.put(JSONObject().put("type", "image_url"))\n'
+    "                }\n"
+    "                val alt = msg.imageParts\n"
+    "            } else if (msg.audioParts.isNotEmpty()) {\n"
+    "                val contentArray = JSONArray()\n"
+    "                for (audio in msg.audioParts) {\n"
+    '                    contentArray.put(JSONObject().put("type", "input_audio"))\n'
+    "                }\n"
+    "            }\n"
+    "        }\n"
+)
+
+
+def write_fixture(path, body):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(body)
+
+
+def build_media_tree(media_body):
+    """-> (root, provider_dir, {rel: text}) for the C-IMG fixtures.
+
+    A carries both carriers; B and C serialize images only (Anthropic and Gemini
+    have no audio-input shape, so the carrier criterion is tree-wide by design).
+    """
+    root = tempfile.mkdtemp(prefix="trimg-media-")
+    pkg = os.path.join(root, PROVIDER_REL)
+    os.makedirs(pkg, exist_ok=True)
+    files = {
+        PAYLOAD_PREDICATE_FILE: PREDICATE_BODY,
+        # RequestSanitizers is exempt in the real tree; a fixture tree without it
+        # would report that exemption as stale and mask the arms under test.
+        "RequestSanitizers.kt": "fun sanitizeToolPairing() {}\n",
+        "openai/A.kt": (
+            "class A {\n"
+            "    fun f(raw: List<LLMMessage>, images: List<Any>) {\n"
+            + FILTER_SITE
+            + "        val parts = sites.map { it.contentParts.size + it.content.length }\n"
+            + media_body
+            + "    }\n"
+            "}\n"),
+        "anthropic/B.kt": (
+            "class B {\n"
+            "    fun f(raw: List<LLMMessage>, images: List<Any>) {\n"
+            + FILTER_SITE
+            + '        put("type", "image")\n'
+            "        val n = sites.map { it.contentParts.size + it.content.length }\n"
+            "    }\n"
+            "    fun g(msg: LLMMessage) = msg.imageParts.size\n"
+            "}\n"),
+        "gemini/C.kt": (
+            "class C {\n"
+            "    fun f(raw: List<LLMMessage>, images: List<Any>) {\n"
+            + FILTER_SITE
+            + '        put("inlineData", images)\n'
+            "        val n = sites.map { it.contentParts.size + it.content.length }\n"
+            "    }\n"
+            "    fun g(msg: LLMMessage) = msg.imageParts.size\n"
+            "}\n"),
+    }
+    for rel, body in files.items():
+        write_fixture(os.path.join(pkg, rel), body)
+    return root, pkg, dict(files)
+
+
+def media_crit_codes(violations):
+    """-> the C-IMG criteria a violation list actually fails."""
+    codes = set()
+    for v in violations:
+        if "no media serializer under the provider package ever reads" in v:
+            codes.add("C-IMG-1")
+        if "input_audio" in v:
+            codes.add("C-IMG-2")
+    return codes
 
 
 def main():
