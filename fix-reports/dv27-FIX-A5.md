@@ -292,6 +292,39 @@ help/裸调提前返回块的结束）按语句位置切出来，接**真实的 
 
 ---
 
-## CI 结论
+## ⑨ CI 结论（回填）
 
-（本节在 CI 出结论后回填：run / job / head_sha / 26 步 / 唯一 skipped / Summary / ALL 340 / 编译错 / 警告 / 新用例逐条）
+| 项 | 值 |
+|---|---|
+| run | **`39985782209`** |
+| job | **`120524473110`** |
+| conclusion / attempt | `success` / attempt 1 |
+| `run.head_sha` | `dba13f46c1cbc59e5926febc9c177b81f88e5be2`（= 门提交，是本支**代码树**尖端；其后的 `f57111ce` 只动 `fix-reports/`） |
+| 本地 HEAD | `f57111ceb01b84357e0b294f7e132f4aa9afbce3` == `git ls-remote` 远端 |
+| 源码树等价声明 | `git diff --name-only dba13f46..HEAD -- . ':(exclude)fix-reports'` 输出 **0 行** ⇒ CI 结论对当前代码树成立（COMMON §3.6，无需再跑一轮） |
+| 步骤 | 26 步，无 failure / cancellation；唯一 skipped = `Publish to Releases`（main 门控） |
+| Summary | `Summary: 111 passed, 0 failed` 恰 1 条；日志里另有 10/13/22/25/33/5 等**单类测试套件**的 Summary，全部 `0 failed` |
+| 夹具 | `ALL 340 CASES PASS` 恰 1 条 |
+| 门头 | `[1/111] … [111/111]` 序号连续、门名互异 111 |
+| 编译错 | ` e: ` **0** |
+| 本支文件警告 | **0**。改动的 5 个 handler 在 CI 日志里的 `w:` 只有既有的 `AccessibilityOffloadHandler.kt:336/390/1157`（`isChecked` deprecated）与 `PhotosOffloadHandler.kt:1213`（`getLatLong` deprecated），**行号均不在本支改动的 106–113 / 135–142 区间** |
+| 新用例 | 3 条逐条 `PASSED`：`help leaves positional empty …` / `every help-guarded early exit decides the exit code on the flag` / `negative control - the positional-emptiness decision fails the probe` |
+| 门在册 | 日志 line 680：`offload_cli_args_check: PASS … every help-guarded early exit answers 0 for --help while a bare invocation still answers 2 (H1/H2 derived over the family, H3 fail-closed on the derivation)` |
+| 日志 | 1,443,855 B，`probe/ci/job.log` |
+
+判读器 `probe/ci/judge.py`：**17/17 GREEN**。身份与步骤结论全部走 GitHub API JSON
+（`run` / `jobs` / `steps`），日志仅用于确认形态（1042-B5 教训）；
+日志下载走「一跳拿 302、二跳裸取」两跳法（直连 API 取 logs 返回 403 Must have admin rights）。
+
+### 三个判据踩坑（本轮，当场闭环，形态可复用）
+
+1. **取日志的接口是 403 不是 401**：`api.github.com/repos/.../jobs/<id>/logs` 对 `GITHUB_TOKEN`
+   返回 `{"message":"Must have admin rights to Repository."}`（不是 token 失效）。健康路径 = 一跳拿
+   `Location` 的 blob 地址、二跳对该地址**不带 token** 裸取（1.44 MB 纯文本）。
+2. **门名的正则要吃空格**：门头真形态 `━━━ [N/111] Four-way sync check ━━━`，门名含空格，
+   `([A-Za-z0-9_.]+)` 抓不到 ⇒ 改成非贪婪到下一个 `━`。
+3. **「本支文件 0 警告」不能按文件名判**：本支改的 5 个文件在 CI 里有 4 条 `w:`，
+   但都在基线就存在的 deprecated API 上（`:336/:390/:1157/:1213`）。判据必须**锚行号区间**
+   （本支改动落在 106–113 / 135–142），否则「0 警告」是假红，或反过来把既有噪声算成新债。
+
+**停止节点达成**（分支 CI 绿）。**未合并 main**（含 .kt 验证面，起手权在用户）。
