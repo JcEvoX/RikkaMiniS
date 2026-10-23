@@ -145,9 +145,30 @@ com.rikkaminis.app.sandbox.offload.PhotosImportShapeTest` → **`OK (18 tests)`*
 另外用 `android.jar` + `core-ktx` 桩独立编译 `IntentSanitizer.kt` + `IntentSanitizePolicy.kt` +
 `BrowserExternalSchemeHandler.kt` → **rc=0，0 error**（`probe/l3/ktcompile2.log`）。
 
-### L4 CI 层
+### L4 CI 层 ✅（第四轮，@ `1843c1ca`）
 
-见 §7（run / job / head_sha）。
+run **`39953818482`** / job **`120414575871`** / attempt **1** / event `workflow_dispatch` / **success**，
+`head_sha` = `1843c1ca40745f8693c3e693af4887628a940625`，与本地 HEAD 的报告前提交、
+远端分支（API `branches` 端点）**三方逐字符一致**。
+
+| 判据 | 读数 |
+|---|---|
+| 步骤 | 26 步，唯一非 success = **#23 `Publish to Releases` skipped**（main 门控 ✓） |
+| 门总数 | `║  Summary: 109 passed, 0 failed` 恰 1 条（9 条 Summary 中其余是各门自己的分块小结，全部 `0 failed`） |
+| 门头 | `[N/109]` **109 条，序号唯一、门名唯一** |
+| 夹具 | `✅ ALL 336 CASES PASS` 恰 1 条 |
+| 编译错 | ` e: file:` **0** |
+| 编译警告 | **本支 6 个文件 0 条**（第三轮还有 2 条 `user.dir` 可空性，已修并重跑） |
+| 游离 FAILED | 含 `FAILED` 的 6 行逐条确认**全是 PASSED 用例名子串**，非 PASSED 的 FAILED 行 **0** |
+| 本门在册 | `offload_host_path_check: 22 handler file(s) + 2 intent dispatcher(s) scanned, 0 violations — OFFLOAD-HOST-PATH GATE OK (2 Intent.parseUri site(s), 1 browser_fallback_url read(s))` + `✅ offload_host_path_check selftest has teeth` |
+| 新用例 | `IntentSanitizePolicyTest` **5/5 PASSED**、`BrowserExternalSchemeShapeTest` **4/4 PASSED**、`PhotosImportShapeTest > parsed intent URIs are stripped of grants, clipData and same-package targets` **PASSED** |
+
+日志 1,430,486 B 存 `probe/l3/ci-job-120414575871.log`。
+
+**三轮红的真相（没有一次是 flake，全是真错）**：
+`39946782398` = backticked 测试名含 `.`（JVM 非法）→ `d552a8c0`；
+`39948387027` = 我在 KDoc 里写了被测试禁掉的 `FLAG_ACTIVITY_NEW_DOCUMENT` 字面量 → `0e74c57f`；
+`39950926463` = **success 但有 2 条可空性警告**（CI 绿 ≠ 干净）→ `1843c1ca`。
 
 ---
 
@@ -171,9 +192,11 @@ com.rikkaminis.app.sandbox.offload.PhotosImportShapeTest` → **`OK (18 tests)`*
 | 项 | 值 |
 |---|---|
 | 基线 main | `f7aba218`（`d91fb8bc2e9c49af19a07356c9c74b4f`，`ls-remote` 与本地一致） |
-| 生产/测试/门提交 | `57203319` |
-| 报告提交 | 见分支尖端（源码树与 CI 绿 sha 等价，`git diff --name-only <绿sha> HEAD -- . ':(exclude)fix-reports'` 为空） |
-| CI run | 见下（dispatch 于 2026-10-23T11:32:23Z） |
+| 提交链 | `57203319`（生产 4 + 门 + 测试 3，8 文件 +847/−95）→ `d552a8c0`（测试名去点）→ `0e74c57f`（KDoc 措辞）→ `1843c1ca`（可空性警告）**← CI 绿于此** → `19f98a26`（本报告） |
+| 源码树等价 | `git diff --name-only 1843c1ca HEAD -- . ':(exclude)fix-reports'` = **0 行** ⇒ 报告提交未动任何源码/门/测试，CI 结论对分支尖端成立 |
+| 远端 | `origin/fix/dv26-f9-intent-scheme-sanitize` = `19f98a26`；CI 验的树 = `1843c1ca` |
+| CI run | `39953818482`（job `120414575871`，attempt 1，success，12:30:24Z 起、12:48:31Z 结束） |
+| 停止节点 | **分支 CI 绿 = 本支开发结束**；合并 main 起手权在用户，本支含 `.kt` 验证面，**非纯文本例外** |
 
 ---
 
