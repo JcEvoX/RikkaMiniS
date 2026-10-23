@@ -77,7 +77,7 @@ object MediaPlayerManager {
         filePath: String,
         chatSessionId: String? = null,
         context: Context? = null,
-    ): String {
+    ): PlayerOutcome {
         // [da1022-C] Releasing the previous player for this id happens UNDER
         // the lock the terminalize callbacks take: unlocked, the
         // onCompletion/onError handler could be mid-releaseSession() on the
@@ -106,10 +106,16 @@ object MediaPlayerManager {
             resolvedPath = filePath,
             resolveSession = sessionResolver,
             resolveGlobal = { PRootKernel.resolveHostPath(it) },
-        ) ?: return "Error: cannot resolve path '$filePath' (session=${chatSessionId ?: "none"})"
+        ) ?: return PlayerOutcome.failure(
+            "path_unresolved",
+            "cannot resolve path '$filePath' (session=${chatSessionId ?: "none"})",
+        )
 
         if (!hostFile.exists()) {
-            return "Error: file not found at '$filePath' (resolved: ${hostFile.absolutePath})"
+            return PlayerOutcome.failure(
+                "file_not_found",
+                "file not found at '$filePath' (resolved: ${hostFile.absolutePath})",
+            )
         }
 
         val ext = hostFile.extension.lowercase()
@@ -120,8 +126,11 @@ object MediaPlayerManager {
         }
 
         if (mediaType == "video") {
-            return "Error: video playback requires a SurfaceView and is not supported in headless mode. " +
-                "Only audio files can be played."
+            return PlayerOutcome.failure(
+                "video_unsupported",
+                "video playback requires a SurfaceView and is not supported in headless mode. " +
+                    "Only audio files can be played.",
+            )
         }
 
         // [audit-0909 T3-M3] Construct the player OUTSIDE the try so the
@@ -174,113 +183,156 @@ object MediaPlayerManager {
             replaced?.let { releaseSession(it) }
 
             val durationMs = player.duration
-            val durationStr = formatDuration(durationMs)
-            "Playing '$filePath' (session=$sessionId, type=$mediaType, duration=$durationStr)"
+            PlayerOutcome.ok(
+                session = sessionId,
+                state = PlayerState.PLAYING.name,
+                file = filePath,
+                mediaType = mediaType,
+                durationMs = durationMs,
+            )
         } catch (e: Exception) {
             Log.e(TAG, "Failed to play $filePath", e)
             // [audit-0909 T3-M3] release the native codec on the failure path
             runCatching { player.release() }
-            "Error: failed to play '$filePath': ${e.message}"
+            PlayerOutcome.failure("play_failed", "failed to play '$filePath': ${e.message}")
         }
     }
 
-    fun pause(sessionId: String): String {
+    /**
+     * [dv25-A4 A-07] Every command answers a [PlayerOutcome] instead of an
+     * English sentence: the CLI's payload has to be JSON (see
+     * playerEnvelope()), and a `startsWith("Error")` sniff was the only
+     * error signal the prose form offered. Refusals carry a machine code plus
+     * the human detail the old sentence held; positions/durations are raw
+     * milliseconds (a `m:ss` string cannot be summed by a caller).
+     */
+    fun pause(sessionId: String): PlayerOutcome {
         val session = sessions[sessionId]
-            ?: return "Error: no session '$sessionId'"
+            ?: return PlayerOutcome.failure("no_session", "no session '$sessionId'")
 
         if (session.state != PlayerState.PLAYING) {
-            return "Error: session '$sessionId' is not playing (state=${session.state})"
+            return PlayerOutcome.failure(
+                "not_playing",
+                "session '$sessionId' is not playing (state=${session.state})",
+            )
         }
 
         return try {
             session.player.pause()
             session.state = PlayerState.PAUSED
-            val pos = formatDuration(session.player.currentPosition)
-            "Paused session '$sessionId' at $pos"
+            PlayerOutcome.ok(
+                session = sessionId,
+                state = PlayerState.PAUSED.name,
+                positionMs = session.player.currentPosition,
+            )
         } catch (e: Exception) {
-            "Error: ${e.message}"
+            PlayerOutcome.failure(PlayerOutcome.ERROR_PLAYER_FAILED, e.message ?: "unknown")
         }
     }
 
-    fun resume(sessionId: String): String {
+    fun resume(sessionId: String): PlayerOutcome {
         val session = sessions[sessionId]
-            ?: return "Error: no session '$sessionId'"
+            ?: return PlayerOutcome.failure("no_session", "no session '$sessionId'")
 
         if (session.state != PlayerState.PAUSED) {
-            return "Error: session '$sessionId' is not paused (state=${session.state})"
+            return PlayerOutcome.failure(
+                "not_paused",
+                "session '$sessionId' is not paused (state=${session.state})",
+            )
         }
 
         return try {
             session.player.start()
             session.state = PlayerState.PLAYING
-            val pos = formatDuration(session.player.currentPosition)
-            "Resumed session '$sessionId' from $pos"
+            PlayerOutcome.ok(
+                session = sessionId,
+                state = PlayerState.PLAYING.name,
+                positionMs = session.player.currentPosition,
+            )
         } catch (e: Exception) {
-            "Error: ${e.message}"
+            PlayerOutcome.failure(PlayerOutcome.ERROR_PLAYER_FAILED, e.message ?: "unknown")
         }
     }
 
-    fun seek(sessionId: String, positionMs: Int): String {
+    fun seek(sessionId: String, positionMs: Int): PlayerOutcome {
         val session = sessions[sessionId]
-            ?: return "Error: no session '$sessionId'"
+            ?: return PlayerOutcome.failure("no_session", "no session '$sessionId'")
 
         if (session.state == PlayerState.STOPPED || session.state == PlayerState.IDLE) {
-            return "Error: session '$sessionId' is ${session.state} – cannot seek"
+            return PlayerOutcome.failure(
+                "cannot_seek",
+                "session '$sessionId' is ${session.state} – cannot seek",
+            )
         }
 
         return try {
             session.player.seekTo(positionMs)
-            val pos = formatDuration(positionMs)
-            "Seeked session '$sessionId' to $pos"
+            PlayerOutcome.ok(
+                session = sessionId,
+                state = session.state.name,
+                positionMs = positionMs,
+            )
         } catch (e: Exception) {
-            "Error: ${e.message}"
+            PlayerOutcome.failure(PlayerOutcome.ERROR_PLAYER_FAILED, e.message ?: "unknown")
         }
     }
 
-    fun stop(sessionId: String): String {
+    fun stop(sessionId: String): PlayerOutcome {
         // [da1022-C] remove() must be atomic with the release: unlocked
         // "release then remove" races a concurrent play() that re-registers
         // this id — the remove() would then drop the fresh session from the
         // map while its player is still live and unreferenced (leak + the
         // caller sees "no session" for a player that is still playing).
         val removed = synchronized(lock) { sessions.remove(sessionId) }
-            ?: return "Error: no session '$sessionId'"
+            ?: return PlayerOutcome.failure("no_session", "no session '$sessionId'")
 
         releaseSession(removed)
-        return "Stopped and released session '$sessionId'"
+        return PlayerOutcome.ok(session = sessionId, state = PlayerState.STOPPED.name)
     }
 
-    fun status(sessionId: String): String {
+    fun status(sessionId: String): PlayerOutcome {
         val session = sessions[sessionId]
-            ?: return "Error: no session '$sessionId'"
+            ?: return PlayerOutcome.failure("no_session", "no session '$sessionId'")
 
+        // A terminal session has no readable position/duration (the native
+        // player is already released); the fields are omitted rather than
+        // reported as 0, which would read as "at the start".
+        val live = session.state != PlayerState.STOPPED && session.state != PlayerState.IDLE
         return try {
-            val pos = if (session.state == PlayerState.STOPPED || session.state == PlayerState.IDLE) {
-                "N/A"
-            } else {
-                formatDuration(session.player.currentPosition)
-            }
-            val dur = if (session.state == PlayerState.STOPPED || session.state == PlayerState.IDLE) {
-                "N/A"
-            } else {
-                formatDuration(session.player.duration)
-            }
-            "Session '$sessionId': state=${session.state}, file=${session.filePath}, " +
-                "type=${session.mediaType}, position=$pos, duration=$dur"
+            PlayerOutcome.ok(
+                session = sessionId,
+                state = session.state.name,
+                file = session.filePath,
+                mediaType = session.mediaType,
+                positionMs = if (live) session.player.currentPosition else null,
+                durationMs = if (live) session.player.duration else null,
+            )
         } catch (e: Exception) {
-            "Session '$sessionId': state=${session.state}, file=${session.filePath} (player error: ${e.message})"
+            PlayerOutcome.ok(
+                session = sessionId,
+                state = session.state.name,
+                file = session.filePath,
+                mediaType = session.mediaType,
+                playerError = e.message ?: "unknown",
+            )
         }
     }
 
-    fun listSessions(): String {
-        if (sessions.isEmpty()) return "No active media sessions."
-
-        val sb = StringBuilder("Active media sessions (${sessions.size}):\n")
-        for ((id, session) in sessions) {
-            sb.append("  - $id: state=${session.state}, file=${session.filePath}, type=${session.mediaType}\n")
-        }
-        return sb.toString().trimEnd()
-    }
+    /**
+     * Sorted by session id: `ConcurrentHashMap` iteration order is
+     * unspecified, so the pre-fix prose listed sessions in a different order
+     * on every call — a caller diffing two `list` answers saw phantom churn.
+     */
+    fun listSessions(): PlayerOutcome = PlayerOutcome.ok(
+        sessions = sessions.map { (id, session) ->
+            PlayerSessionSnapshot(
+                session = id,
+                state = session.state.name,
+                file = session.filePath,
+                mediaType = session.mediaType,
+            )
+        }.sortedBy { it.session },
+    )
 
     // ── Internal ────────────────────────────────────────────────────────
 
@@ -327,12 +379,5 @@ object MediaPlayerManager {
         } catch (e: Exception) {
             Log.w(TAG, "Error releasing player: ${e.message}")
         }
-    }
-
-    private fun formatDuration(ms: Int): String {
-        val totalSec = ms / 1000
-        val min = totalSec / 60
-        val sec = totalSec % 60
-        return "%d:%02d".format(min, sec)
     }
 }
