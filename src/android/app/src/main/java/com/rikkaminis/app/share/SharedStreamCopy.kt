@@ -1,7 +1,7 @@
 package com.rikkaminis.app.share
 
-import java.io.File
 import java.io.InputStream
+import java.io.OutputStream
 
 /** Bytes per read in [copySharedStream]. 8 KiB matches the pre-§1044-A08 inline
  *  copy and the rest of the repo's stream loops; large enough that a multi-MB
@@ -28,7 +28,7 @@ internal sealed class SharedStreamCopy {
     /** [bytes] were written to the destination and credited to the ledger. */
     data class Staged(val bytes: Long) : SharedStreamCopy()
 
-    /** Nothing usable was staged; any destination file was removed. */
+    /** Nothing usable was staged; the destination was removed if it existed. */
     data class Failed(
         val reason: SharedStreamFailure,
         val detail: String? = null,
@@ -49,24 +49,36 @@ internal sealed class SharedStreamCopy {
  * reached the composer, skipped the "Could not read shared file" toast, and only
  * surfaced later as a silently dropped attachment.
  *
+ * The ORDER is the whole point: the source is null-checked BEFORE [openDest] is
+ * ever called, so a null stream cannot leave a 0-byte file behind.
+ *
+ * The destination is injected as a FACTORY, not as a path: the caller owns the
+ * file (and therefore where it lives); this core only decides when to open it
+ * and when to remove it. That keeps the write target exactly where it was
+ * before the extraction — the app-private staging directory — and keeps this
+ * function free of any caller-supplied path.
+ *
  * Guards that MUST survive any refactor here (all preserved from the inline
  * version, and each one pinned by a test):
- *  * the source is null-checked BEFORE `dest.outputStream()` — creating the
+ *  * the source is null-checked BEFORE the destination is opened — opening the
  *    destination first is what turned "no stream" into a 0-byte ghost file;
- *  * [ioTimeoutMs] aborts a stalled provider and deletes the partial file;
- *  * [maxFileBytes] / [maxTotalBytes] reject oversized shares and delete the
+ *  * [ioTimeoutMs] aborts a stalled provider and removes the partial file;
+ *  * [maxFileBytes] / [maxTotalBytes] reject oversized shares and remove the
  *    partial file they already wrote;
  *  * the ledger is credited ONLY after the copy finished ([credit] with the
  *    exact byte count), so a rejected share never counts against the cap;
- *  * any exception deletes the partial file and reports [SharedStreamFailure.ReadFailed].
+ *  * any exception removes the partial file and reports
+ *    [SharedStreamFailure.ReadFailed].
  *
- * All effects are injected ([openStream] / [stagedBytesNow] / [credit] / [now])
- * so the caller keeps ownership of the ContentResolver and the process-lifetime
- * ledger; this function touches no Android API.
+ * All effects are injected ([openStream] / [openDest] / [deleteDest] /
+ * [stagedBytesNow] / [credit] / [now]) so the caller keeps ownership of the
+ * ContentResolver and the process-lifetime ledger; this function touches no
+ * Android API.
  */
 internal fun copySharedStream(
     openStream: () -> InputStream?,
-    dest: File,
+    openDest: () -> OutputStream,
+    deleteDest: () -> Unit,
     stagedBytesNow: () -> Long,
     credit: (Long) -> Unit,
     maxFileBytes: Long,
@@ -78,14 +90,14 @@ internal fun copySharedStream(
     fun abort(reason: SharedStreamFailure, detail: String? = null): SharedStreamCopy {
         // The destination may already exist (partial write, or a name reuse) —
         // every failure path leaves the staging dir exactly as it found it.
-        runCatching { dest.delete() }
+        runCatching { deleteDest() }
         return SharedStreamCopy.Failed(reason, detail)
     }
     return try {
         val input = openStream()
             ?: return abort(SharedStreamFailure.OpenStreamNull)
         input.use { source ->
-            dest.outputStream().use { output ->
+            openDest().use { output ->
                 val buf = ByteArray(COPY_BUFFER_BYTES)
                 val deadline = now() + ioTimeoutMs
                 while (true) {

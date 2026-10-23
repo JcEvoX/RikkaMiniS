@@ -392,7 +392,8 @@ class ShareReceiverActivity : ComponentActivity() {
         return when (
             val outcome = copySharedStream(
                 openStream = { contentResolver.openInputStream(uri) },
-                dest = dest,
+                openDest = { dest.outputStream() },
+                deleteDest = { dest.delete() },
                 stagedBytesNow = { stagedBytes.current() },
                 credit = { stagedBytes.credit(it) },
                 maxFileBytes = MAX_FILE_BYTES,

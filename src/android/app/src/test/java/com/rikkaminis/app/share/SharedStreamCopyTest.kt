@@ -7,9 +7,11 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.io.InputStream
+import java.io.OutputStream
 import java.util.UUID
 
 /**
@@ -28,13 +30,12 @@ import java.util.UUID
  * inline version got wrong or could lose, with HAND-WRITTEN literal
  * expectations (never derived from the code under test — a constant changed
  * together with its expectation would hide the mutation behind a PASS):
- *  * a null stream stages NOTHING (the defect itself);
- *  * a null stream leaves no 0-byte file in the staging directory;
+ *  * a null stream stages NOTHING and opens NO destination (the defect);
  *  * bytes are written and credited exactly once, with the exact count;
- *  * the per-file / cumulative caps reject, delete the partial file and credit
+ *  * the per-file / cumulative caps reject, remove the partial file and credit
  *    nothing, and admit a share that exactly fills either cap;
- *  * the IO deadline aborts a stalled provider and deletes the partial file;
- *  * a read failure deletes the partial file and reports the exception.
+ *  * the IO deadline aborts a stalled provider and removes the partial file;
+ *  * a read failure removes the partial file and reports the exception.
  */
 class SharedStreamCopyTest {
 
@@ -54,7 +55,21 @@ class SharedStreamCopyTest {
         return dir
     }
 
-    private fun destIn(dir: File): File = File(dir, "shared-image-abcd1234.png")
+    /**
+     * The destination is a real file on disk, opened through the same factory
+     * the Activity injects — so "the destination was opened" is observable as
+     * "the file exists", exactly the ghost-file shape the defect produced.
+     */
+    private class Dest(val file: File) {
+        var opens = 0
+        fun open(): OutputStream {
+            opens++
+            return file.outputStream()
+        }
+        fun delete() {
+            file.delete()
+        }
+    }
 
     private fun runCopy(
         dir: File,
@@ -64,9 +79,11 @@ class SharedStreamCopyTest {
         maxTotalBytes: Long = 1000L,
         ioTimeoutMs: Long = 30_000L,
         now: () -> Long = { 0L },
+        dest: Dest = Dest(File(dir, "shared-image-abcd1234.png")),
     ): SharedStreamCopy = copySharedStream(
         openStream = { source },
-        dest = destIn(dir),
+        openDest = { dest.open() },
+        deleteDest = { dest.delete() },
         stagedBytesNow = { ledger.current() },
         credit = { ledger.credit(it) },
         maxFileBytes = maxFileBytes,
@@ -74,8 +91,6 @@ class SharedStreamCopyTest {
         ioTimeoutMs = ioTimeoutMs,
         now = now,
     )
-
-    private fun stagedEntries(dir: File): Int = dir.listFiles()?.size ?: 0
 
     // ── the defect ──────────────────────────────────────────────────────────
 
@@ -92,15 +107,26 @@ class SharedStreamCopyTest {
     }
 
     @Test
-    fun `a null stream leaves no ghost file in the staging directory`() {
+    fun `a null stream opens no destination and leaves no ghost file`() {
+        val dir = tempDir()
+        val ledger = StagedBytesLedger()
+        val dest = Dest(File(dir, "shared-image-abcd1234.png"))
+
+        val outcome = runCopy(dir, source = null, ledger = ledger, dest = dest)
+
+        assertTrue(outcome is SharedStreamCopy.Failed)
+        assertEquals("the destination must never be opened", 0, dest.opens)
+        assertFalse("no destination file may be created: ${dest.file}", dest.file.exists())
+    }
+
+    @Test
+    fun `a null stream leaves the staging directory empty`() {
         val dir = tempDir()
         val ledger = StagedBytesLedger()
 
-        val outcome = runCopy(dir, source = null, ledger = ledger)
+        runCopy(dir, source = null, ledger = ledger)
 
-        assertTrue(outcome is SharedStreamCopy.Failed)
-        assertFalse("no destination file may be created: ${destIn(dir)}", destIn(dir).exists())
-        assertEquals("the staging dir must stay empty", 0, stagedEntries(dir))
+        assertEquals("the staging dir must stay empty", 0, dir.listFiles()?.size ?: 0)
     }
 
     // ── happy path ──────────────────────────────────────────────────────────
@@ -109,13 +135,15 @@ class SharedStreamCopyTest {
     fun `bytes are written and credited once with the exact count`() {
         val dir = tempDir()
         val ledger = StagedBytesLedger()
+        val dest = Dest(File(dir, "shared-image-abcd1234.png"))
 
-        val outcome = runCopy(dir, source = ByteArrayInputStream("hello".toByteArray()), ledger = ledger)
+        val outcome = runCopy(dir, source = ByteArrayInputStream("hello".toByteArray()), ledger = ledger, dest = dest)
 
         assertTrue(outcome is SharedStreamCopy.Staged)
         assertEquals(5L, (outcome as SharedStreamCopy.Staged).bytes)
-        assertEquals("hello", destIn(dir).readText())
+        assertEquals("hello", dest.file.readText())
         assertEquals(5L, ledger.current())
+        assertEquals(1, dest.opens)
     }
 
     @Test
@@ -137,14 +165,16 @@ class SharedStreamCopyTest {
     fun `the per file cap rejects and deletes the partial file`() {
         val dir = tempDir()
         val ledger = StagedBytesLedger()
+        val dest = Dest(File(dir, "shared-image-abcd1234.png"))
 
         val outcome = runCopy(
-            dir, source = ByteArrayInputStream("abcdef".toByteArray()), ledger = ledger, maxFileBytes = 5L,
+            dir, source = ByteArrayInputStream("abcdef".toByteArray()), ledger = ledger,
+            maxFileBytes = 5L, dest = dest,
         )
 
         assertTrue(outcome is SharedStreamCopy.Failed)
         assertEquals(SharedStreamFailure.ExceededPerFile, (outcome as SharedStreamCopy.Failed).reason)
-        assertFalse("the partial file must be removed", destIn(dir).exists())
+        assertFalse("the partial file must be removed", dest.file.exists())
         assertEquals(0L, ledger.current())
     }
 
@@ -167,14 +197,16 @@ class SharedStreamCopyTest {
         val dir = tempDir()
         val ledger = StagedBytesLedger()
         ledger.credit(96L)
+        val dest = Dest(File(dir, "shared-image-abcd1234.png"))
 
         val outcome = runCopy(
-            dir, source = ByteArrayInputStream("abcde".toByteArray()), ledger = ledger, maxTotalBytes = 100L,
+            dir, source = ByteArrayInputStream("abcde".toByteArray()), ledger = ledger,
+            maxTotalBytes = 100L, dest = dest,
         )
 
         assertTrue(outcome is SharedStreamCopy.Failed)
         assertEquals(SharedStreamFailure.ExceededCumulative, (outcome as SharedStreamCopy.Failed).reason)
-        assertFalse("the partial file must be removed", destIn(dir).exists())
+        assertFalse("the partial file must be removed", dest.file.exists())
         assertEquals("a rejected share must not be credited", 96L, ledger.current())
     }
 
@@ -199,6 +231,7 @@ class SharedStreamCopyTest {
         val dir = tempDir()
         val ledger = StagedBytesLedger()
         var clock = 0L
+        val dest = Dest(File(dir, "shared-image-abcd1234.png"))
 
         // Six 1-byte reads available, but the clock advances 500 ms per call and
         // the deadline is 1000 ms — the copy must give up after two bytes.
@@ -208,11 +241,12 @@ class SharedStreamCopyTest {
             ledger = ledger,
             ioTimeoutMs = 1000L,
             now = { clock.also { clock += 500L } },
+            dest = dest,
         )
 
         assertTrue(outcome is SharedStreamCopy.Failed)
         assertEquals(SharedStreamFailure.TimedOut, (outcome as SharedStreamCopy.Failed).reason)
-        assertFalse("the partial file must be removed", destIn(dir).exists())
+        assertFalse("the partial file must be removed", dest.file.exists())
         assertEquals(0L, ledger.current())
     }
 
@@ -220,15 +254,39 @@ class SharedStreamCopyTest {
     fun `a read failure deletes the partial file and reports the exception`() {
         val dir = tempDir()
         val ledger = StagedBytesLedger()
+        val dest = Dest(File(dir, "shared-image-abcd1234.png"))
 
-        val outcome = runCopy(dir, source = FailingStream(), ledger = ledger)
+        val outcome = runCopy(dir, source = FailingStream(), ledger = ledger, dest = dest)
 
         assertTrue(outcome is SharedStreamCopy.Failed)
         val failed = outcome as SharedStreamCopy.Failed
         assertEquals(SharedStreamFailure.ReadFailed, failed.reason)
         assertEquals("boom", failed.detail)
-        assertFalse("the partial file must be removed", destIn(dir).exists())
+        assertFalse("the partial file must be removed", dest.file.exists())
         assertEquals(0L, ledger.current())
+    }
+
+    // ── credit sink ─────────────────────────────────────────────────────────
+
+    @Test
+    fun `credit is never called for a failed copy`() {
+        val dir = tempDir()
+        var credited: Long? = null
+
+        val outcome = copySharedStream(
+            openStream = { null },
+            openDest = { ByteArrayOutputStream() },
+            deleteDest = { },
+            stagedBytesNow = { 0L },
+            credit = { credited = it },
+            maxFileBytes = 100L,
+            maxTotalBytes = 1000L,
+            ioTimeoutMs = 30_000L,
+            now = { 0L },
+        )
+
+        assertTrue(outcome is SharedStreamCopy.Failed)
+        assertNull("no credit may be issued for an aborted copy", credited)
     }
 
     // ── fixtures ────────────────────────────────────────────────────────────
@@ -249,26 +307,5 @@ class SharedStreamCopyTest {
 
     private class FailingStream : InputStream() {
         override fun read(): Int = throw IOException("boom")
-    }
-
-    /** Documents that the ledger is the only credit sink the core talks to. */
-    @Test
-    fun `credit is never called for a failed copy`() {
-        val dir = tempDir()
-        var credited: Long? = null
-
-        val outcome = copySharedStream(
-            openStream = { null },
-            dest = destIn(dir),
-            stagedBytesNow = { 0L },
-            credit = { credited = it },
-            maxFileBytes = 100L,
-            maxTotalBytes = 1000L,
-            ioTimeoutMs = 30_000L,
-            now = { 0L },
-        )
-
-        assertTrue(outcome is SharedStreamCopy.Failed)
-        assertNull("no credit may be issued for an aborted copy", credited)
     }
 }
