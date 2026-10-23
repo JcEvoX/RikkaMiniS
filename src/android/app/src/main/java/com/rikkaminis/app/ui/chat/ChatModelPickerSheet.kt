@@ -623,9 +623,19 @@ internal fun ModelPickerSheet(
                                 // rotation, or fallback recovery). Fall back to the first member
                                 // only when the group is NOT selected (preview), or when the active
                                 // entry cannot be resolved.
-                                val resolvedEntry = if (isSelected && activeEntryId != null) {
-                                    config.modelEntries.find { it.id == activeEntryId }
-                                } else null ?: group.memberEntryIds.firstNotNullOfOrNull { entryId ->
+                                // [dv25/B-04] The decision (including the fallback above)
+                                // lives in `pickerHeaderEntry` — see its KDoc for the two
+                                // spellings this replaced on this very line: a persisted-only
+                                // `modelEntries.find { it.id == activeEntryId }` (a System
+                                // sentinel active entry resolved to null), and an
+                                // `… } else null ?: group.memberEntryIds…` whose elvis bound to
+                                // the else branch alone, so the SELECTED group — the branch that
+                                // matters — had no fallback at all.
+                                val resolvedEntry = pickerHeaderEntry(
+                                    isSelected = isSelected,
+                                    activeEntryId = activeEntryId,
+                                    memberEntryIds = group.memberEntryIds,
+                                ) { entryId ->
                                     // [dv24/B-02] persisted entry first, synthesized
                                     // System voice entry second — one source
                                     // (SystemVoiceEntries.resolveIn). The System
@@ -781,10 +791,16 @@ internal fun ModelPickerSheet(
                                         SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
                                     }
                                     // Fallback: show active entry ONLY if this group is selected
-                                    val displayMembers = resolvedMembers.ifEmpty {
-                                        if (isSelected && activeEntryId != null)
-                                            listOfNotNull(config.modelEntries.find { it.id == activeEntryId })
-                                        else emptyList()
+                                    // [dv25/B-04] the fallback lookup is the same single source
+                                    // as `resolvedMembers` above — the pre-fix `modelEntries`-only
+                                    // spelling dropped a System sentinel active entry and the rows
+                                    // rendered 「No linked models」.
+                                    val displayMembers = pickerDisplayMembers(
+                                        resolvedMembers = resolvedMembers,
+                                        isSelected = isSelected,
+                                        activeEntryId = activeEntryId,
+                                    ) { entryId ->
+                                        SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
                                     }
                                     if (displayMembers.isEmpty()) {
                                         Text(
