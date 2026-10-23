@@ -292,20 +292,31 @@ internal object HeadlessChatRunner {
                 // the string through verbatim. Reuse the existing "Error"
                 // value — plus a reason in responseText, the same shape as
                 // "no_provider_resolved_in_5s" — instead of minting a new word.
-                PromptResult(
-                    status = "Error",
-                    responseText = "send_dropped_before_stream",
-                    timedOut = false,
-                )
+                // [deep-audit-1044 A-03] ONE envelope for every dropped send:
+                // this branch and the `wait=true` guard below both return it.
+                droppedSendResult()
             }
         }
 
-        // Wait for isStreaming to be false. `started` was read above; when it is
-        // false the message was dropped (or completed before we returned to the
-        // suspension point) — fall through to drain.
+        // [deep-audit-1044 A-03] `started == false` here means the send was
+        // dropped by one of the pre-flight gates (Safe Mode / no provider /
+        // compacting / context exhausted / blank input): `sendMessage` claims
+        // `_isStreaming` synchronously, AFTER them, so nothing will ever
+        // stream. Falling through used to "settle" immediately (`isStreaming`
+        // is already false, so `withTimeoutOrNull` returns at once) and the
+        // drain below then read the PREVIOUS assistant turn out of the DB and
+        // reported it as `Completed` — the caller (chat.prompt RPC /
+        // `minis-sessions send`) accepted a stale reply as this request's
+        // answer. A run that starts and finishes before we read the flag
+        // cannot happen: the streaming Job is created by an IO coroutine that
+        // only runs after we return to the suspension point.
+        //
+        // Same envelope as the `!wait` branch above and as retry() /
+        // rerunFromToolBlock() — status strings are a contract
+        // (ScheduledTaskRunner settles any status != "Running" as RESULT_ERROR,
+        // the offload/CLI layer passes responseText through as the reason).
         if (!started) {
-            // Either dropped (e.g. compacting in flight) or completed before we
-            // returned to the suspension point — fall through to drain.
+            return@withContext droppedSendResult()
         }
         val finished = withTimeoutOrNull(timeoutMs) {
             // Skip the initial false (if we were called before sendMessage flipped true)
@@ -861,3 +872,30 @@ internal object HeadlessChatRunner {
         val error: String?,
     )
 }
+
+/**
+ * [deep-audit-1044 A-03] The one envelope for "the send was dropped before any
+ * stream was ever claimed".
+ *
+ * `ChatViewModel.sendMessage` claims `_isStreaming` synchronously, and only
+ * after every pre-flight gate (Safe Mode / `currentProvider == null` /
+ * `_isCompacting` / context exhausted / blank input). A send that returns
+ * before that line will never stream, so the headless wrapper must not pretend
+ * a turn happened: it reports `"Error"` with the reason in `responseText`,
+ * the same shape as `"no_provider_resolved_in_5s"` / `"session_not_loaded_in_5s"`.
+ *
+ * Both call sites use it — the `wait=false` branch and the `wait=true` guard —
+ * so the two can never drift into different statuses for the same event. The
+ * literals are a contract: `ScheduledTaskRunner` settles any status !=
+ * "Running" as RESULT_ERROR, and the offload/CLI layer prints `responseText`
+ * as the machine-readable reason.
+ *
+ * Top level (not a member) so a plain JVM test can assert the literals without
+ * constructing the Android-bound runner.
+ */
+internal fun droppedSendResult(): HeadlessChatRunner.PromptResult =
+    HeadlessChatRunner.PromptResult(
+        status = "Error",
+        responseText = "send_dropped_before_stream",
+        timedOut = false,
+    )
