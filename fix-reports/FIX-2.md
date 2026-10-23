@@ -234,7 +234,35 @@ loop_counter_reset_guard     rc=0
 
 ### L4 CI
 
-见 §8（run id / job id / 判读表）。
+| 项 | 值 |
+|---|---|
+| run | **39893791520**（`workflow_dispatch`, attempt 1, **conclusion=success**） |
+| job | **120219397542**（success，日志 1,392,514 B） |
+| `run.head_sha` | `0819d5ece5d64a9a0c31b23e1aeecbdfe0b282cb` = 本地 HEAD = `ls-remote` **逐字符一致** |
+| 步骤 | 26 步，非 success 且非 skipped 的：**0**；唯一 skipped = 第 23 步 `Publish to Releases`（main 门控，分支应跳过） |
+| 构建产物 | `RikkaMinis-apk.zip`（12,941,629 B，`MINIS_VERSION_NAME_SUFFIX=+2525`，`compileReleaseKotlin` 全绿 ⇒ 生产改动真实编译通过） |
+
+日志判读（`judge_generic.py`，逐条取真样本后写判据）：
+
+```
+Summary lines: 9, non-zero: 0, 109/0: 1
+ALL 336 CASES PASS lines: 1
+gate headers: 109, distinct nums: 109, distinct names: 109
+compile errors (`Z e: `): 0
+FAILED lines: 6, stray (no PASSED on same line): 0
+ALL GENERIC CRITERIA GREEN
+```
+
+逐项在册：
+
+- `:379` `✅ Claim/release guard: no ungated release, self-bound gate, unguarded settlement or unminted claim found` ← 门在 CI 真树上绿（`scan.sh` 第 21 门）
+- `:1017-` `━━━ claim_release_guard ━━━` + 7 条夹具断言（`strict mode (exit 0)` / `… is caught (exit 1)` / `--report … but exits 0`）全 ✅
+- `:1296` `✅ claim_release_guard.py on real repo exits 0`（`test_real_repo`）
+- 门头 `[1/109]..[109/109]` 连续、109 个显示名互异
+- 含 `FAILED` 的 6 行逐条确认是 **PASSED 用例名的子串**（既有 `…GuardTest` 用例），stray = 0
+- 编译错误 `Z e: ` = 0；`TerminalSession.kt` 无 error/warning
+
+> **门 `--selftest` 的原始 stdout 不进 CI 日志**（`scan.sh` 只跑真树；`test_scan.py` 对本门只跑真树 + 独立夹具，不注册 selftest 标记）⇒ 本报告 §4 的 18 臂证据是**本地留档**（`probe/l3/` + 本节命令），不作为 CI 判据 —— 与 1043 波的同一结论（判据只取两源：门真树行 + `test_scan` 夹具行）。
 
 ---
 
@@ -268,9 +296,10 @@ loop_counter_reset_guard     rc=0
 | 项 | 值 |
 |---|---|
 | 基线 main | `f94413f52fa5403c903902f6b1d2ae10cb9bc906` |
-| 本地 HEAD | 见下方"收口回报"（本报告随最后一个提交入库，源码面此后不再变） |
-| `git ls-remote origin <branch>` | 与本地 HEAD 逐字符一致（推送后核对） |
-| CI `run.head_sha` | 与上两者逐字符一致（dispatch 后核对） |
-| CI run / job | run id / job id 见收口回报 |
+| 提交 | 2 个：`4ae5bf10` 生产 + 门（2 文件 +464/−44）· `0819d5ec` 报告 |
+| 本地 HEAD（CI 绿的那棵树） | `0819d5ece5d64a9a0c31b23e1aeecbdfe0b282cb` |
+| `git ls-remote origin fix/dv24-a2-terminal-ownership` | `0819d5ece5d64a9a0c31b23e1aeecbdfe0b282cb` — **逐字符一致** |
+| CI `run.head_sha` | `0819d5ece5d64a9a0c31b23e1aeecbdfe0b282cb` — **逐字符一致** |
+| CI run / job | run **39893791520** / job **120219397542**（attempt 1，conclusion=success） |
 
-**源码树等价声明**：若本报告有回填提交，则以 `git diff --name-only <CI 绿 sha> HEAD -- . ':(exclude)fix-reports'` 输出为空作为"CI 结论对当前代码树成立"的证据（`fix-reports/` 不在 workflow paths 内，不参与构建）。
+**源码树等价声明**：本报告在本提交之后又有一次"回填 CI 结果"的提交。判据 = `git diff --name-only 0819d5ec HEAD -- . ':(exclude)fix-reports'` **输出为空** ⇒ CI 结论对当前代码树成立（`fix-reports/` 不在 `build-apk.yml` 的 paths 内、不参与构建）。**停止节点已达成，未合并 main**（起手权在主会话/用户）。
