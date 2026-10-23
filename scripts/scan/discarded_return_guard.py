@@ -46,6 +46,7 @@ Usage:
 
 import os
 import re
+import shutil
 import sys
 import tempfile
 
@@ -627,7 +628,10 @@ def _function_bodies(lines):
                 break
             j += 1
         if body_start < 0:
-            i = j + 1
+            # [deep-audit-1047 B-01] `j` is the NEXT declaration (expression-bodied
+            # functions have no body brace): skipping it used to drop the function
+            # right after an `= expr` one, so its body was never attributed.
+            i = j
             continue
         depth = 0
         end = n - 1
@@ -1569,6 +1573,205 @@ def share_stream_self_test():
     return 0
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# B-01 — the binary-write verdict (deep-audit-1047)
+#
+# One family, two channels, and BOTH of them fail WITHOUT throwing:
+#
+#  * `ContentResolver.openOutputStream(uri)` returns NULL when the provider
+#    refuses the write or its process died. `stream?.use { … }` then skips the
+#    write entirely and execution falls through to "publish the row" /
+#    "hand the URI to another app" / "start the share chooser".
+#  * `Bitmap.compress(...)` returns FALSE when the encoder wrote nothing. In
+#    statement position (`file.outputStream().use { bmp.compress(…) }`) that
+#    verdict is dropped by construction: `use` returns it and nobody reads it.
+#
+# Measured on the shipped tree (deep-audit-1047 B-01): a failed gallery save
+# published an `IS_PENDING=0` MediaStore row for a 0-byte file and toasted
+# "saved to album", and the clipboard / share / table-image paths pasted a
+# FileProvider URI pointing at a 0-byte png.
+#
+# The criteria are derived from the DESTINATION, not from a site list:
+#
+#   B1  when the compressed bytes LEAVE the app or get PUBLISHED (the enclosing
+#       function reaches `FileProvider.getUriForFile(` / `MediaStore.` /
+#       `contentResolver.openOutputStream(`), the write must route its verdict
+#       through `saveOutcome(` — the Android-free decision JVM tests pin.
+#       Compression into an in-memory `ByteArrayOutputStream` (model image
+#       budget, screenshot ring, debug dumps) is deliberately OUT of scope:
+#       nothing is published and the caller's own length check sees the empty
+#       array.
+#   B2  every `openOutputStream(` site must exit on null (`?: throw|return|
+#       error`, or a `requireNotNull` on the value) instead of swallowing it
+#       with `?.use`. This one is tree-wide: the sites already shipping the
+#       elvis form are green, so the criterion is cheap to keep honest.
+# ─────────────────────────────────────────────────────────────────────────
+
+_BIN_COMPRESS = re.compile(r"\.compress\s*\(")
+# Tokens that mean "these bytes are handed to somebody outside this process".
+_BIN_OUTBOUND = (
+    "FileProvider.getUriForFile(",
+    "MediaStore.",
+    "contentResolver.openOutputStream(",
+)
+_BIN_OPEN_OUT = re.compile(r"openOutputStream\s*\(")
+_BIN_ELVIS_EXIT = re.compile(r"\?\:\s*(?:throw|return|error|require)\b")
+_BIN_REQUIRE_NON_NULL = re.compile(r"requireNotNull\s*\(")
+_BIN_ROUTING = "saveOutcome("
+
+def _innermost_body(bodies, line_no):
+    """Innermost `fun` body whose [start, end] covers [line_no] (or None)."""
+    best = None
+    for name, start, end, body in bodies:
+        if start <= line_no <= end and (best is None or start > best[1]):
+            best = (name, start, end, body)
+    return best
+
+def scan_binary_write_verdict(root):
+    """(violations, sites) — B-01 criteria. Findings are pre-formatted
+    `file:line  [Bx] reason` strings, same contract as the sections above."""
+    violations = []
+    sites = 0
+    base = os.path.join(root, SRC_SUBDIR)
+    for dirpath, _dirnames, filenames in os.walk(base):
+        for name in sorted(filenames):
+            if not name.endswith(".kt"):
+                continue
+            path = os.path.join(dirpath, name)
+            rel = os.path.relpath(path, root)
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                lines = fh.read().split("\n")
+            bodies = _function_bodies(lines)
+            for i, line in enumerate(lines):
+                if _COMMENT.match(line):
+                    continue
+                for _m in _BIN_COMPRESS.finditer(line):
+                    holder = _innermost_body(bodies, i)
+                    # No body found (e.g. a call inside an object literal the
+                    # declaration scan does not descend into): judge the LOCAL
+                    # window, never the whole file — a file that mentions
+                    # MediaStore somewhere must not make an unrelated in-memory
+                    # encode look like an outbound write.
+                    body = holder[3] if holder else "\n".join(lines[max(0, i - 20):i + 20])
+                    if not any(tok in body for tok in _BIN_OUTBOUND):
+                        continue
+                    sites += 1
+                    if _BIN_ROUTING in body:
+                        continue
+                    where = ("%s()" % holder[0]) if holder else "the file top level"
+                    violations.append(
+                        "%s:%d  [B1] %s compresses bytes that leave the app (FileProvider / "
+                        "MediaStore / SAF) but never reads the verdict — `compress` returns "
+                        "false without throwing, so route it through saveOutcome(…)"
+                        % (rel, i + 1, where)
+                    )
+                found = _BIN_OPEN_OUT.search(line)
+                if not found:
+                    continue
+                if "//" in line[:found.start()]:
+                    continue
+                sites += 1
+                window = "\n".join(lines[i:i + 40])
+                if _BIN_ELVIS_EXIT.search(window) or _BIN_REQUIRE_NON_NULL.search(window):
+                    continue
+                if "?." in line[found.start():]:
+                    violations.append(
+                        "%s:%d  [B2] openOutputStream(…) is chained with `?.` and the null "
+                        "stream is swallowed — the write is skipped and the caller still "
+                        "reports success" % (rel, i + 1)
+                    )
+    return violations, sites
+
+# ── B-01 self-test: one breaker per criterion, plus the destination predicate ──
+
+_BIN_FIXED = (
+    "package probe\n"
+    "\n"
+    "internal fun copyPng(ctx: Context, bmp: Bitmap, cacheDir: File) {\n"
+    "    val file = File(cacheDir, \"x.png\")\n"
+    "    val encoded = file.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }\n"
+    "    if (!saveOutcome(streamOpened = true, compressed = encoded)) {\n"
+    "        file.delete()\n"
+    "        return\n"
+    "    }\n"
+    "    val uri = FileProvider.getUriForFile(ctx, \"a.b\", file)\n"
+    "    val out = ctx.contentResolver.openOutputStream(uri) ?: throw IOException(\"null\")\n"
+    "}\n"
+)
+
+_BIN_PRE = (
+    "package probe\n"
+    "\n"
+    "internal fun copyPng(ctx: Context, bmp: Bitmap, cacheDir: File) {\n"
+    "    val file = File(cacheDir, \"x.png\")\n"
+    "    file.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }\n"
+    "    val uri = FileProvider.getUriForFile(ctx, \"a.b\", file)\n"
+    "    ctx.contentResolver.openOutputStream(uri)?.use { out -> out.write(1) }\n"
+    "}\n"
+)
+
+_BIN_IN_MEMORY = (
+    "package probe\n"
+    "\n"
+    "internal fun encodeForModel(bmp: Bitmap): ByteArray {\n"
+    "    val baos = ByteArrayOutputStream()\n"
+    "    bmp.compress(Bitmap.CompressFormat.JPEG, 85, baos)\n"
+    "    return baos.toByteArray()\n"
+    "}\n"
+)
+
+_BIN_OPEN_ONLY = _BIN_FIXED.replace(
+    "    val out = ctx.contentResolver.openOutputStream(uri) ?: throw IOException(\"null\")\n",
+    "    ctx.contentResolver.openOutputStream(uri)?.use { out -> out.write(1) }\n",
+)
+
+def _bin_fixture(src):
+    root = tempfile.mkdtemp(prefix="binwrite_")
+    rel = os.path.join(SRC_SUBDIR, "probe", "PngWrite.kt")
+    full = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "w", encoding="utf-8") as fh:
+        fh.write(src)
+    return root
+
+def binary_write_self_test():
+    """Each arm must flip exactly the criterion built for it."""
+    failures = []
+
+    def run(src):
+        root = _bin_fixture(src)
+        try:
+            return scan_binary_write_verdict(root)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def arm(name, src, expect, forbid=()):
+        v, _sites = run(src)
+        blob = " ".join(v)
+        ok = all(tok in blob for tok in expect) and not any(tok in blob for tok in forbid)
+        if not ok:
+            failures.append("B-01 %s: want %s / forbid %s, got %s"
+                            % (name, list(expect), list(forbid), v))
+        else:
+            print("[ok] B-01 %s" % name)
+
+    arm("the routed, null-checked write passes", _BIN_FIXED, ())
+    arm("the statement-position verdict and the swallowed null stream are both caught",
+        _BIN_PRE, ("[B1]", "[B2]"))
+    arm("an in-memory ByteArrayOutputStream destination is out of scope",
+        _BIN_IN_MEMORY, (), ("[B1]", "[B2]"))
+    arm("a routed verdict with a swallowed null stream trips only [B2]",
+        _BIN_OPEN_ONLY, ("[B2]",), ("[B1]",))
+
+    if failures:
+        for f in failures:
+            print("SELFTEST FAIL " + f)
+        return 1
+    print("✅ binary-write self-test has teeth: B1 (verdict not routed through saveOutcome) "
+          "and B2 (null openOutputStream swallowed) each flip red on exactly their own "
+          "breaker, and the in-memory destination class stays green")
+    return 0
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -1579,7 +1782,8 @@ def main():
         rc2 = drain_self_test()
         rc3 = staged_self_test()
         rc4 = share_stream_self_test()
-        return 1 if (rc or rc2 or rc3 or rc4) else 0
+        rc5 = binary_write_self_test()
+        return 1 if (rc or rc2 or rc3 or rc4 or rc5) else 0
     violations = scan(args[0])
     # [B-04 deep-audit-1037] queue-drain persistence section. Its findings are
     # pre-formatted `file:line  [criterion] reason` strings, so they are
@@ -1593,6 +1797,10 @@ def main():
     # not reach the composer as a ghost attachment. Same pre-formatted
     # `file:line [criterion] reason` contract as the sections above.
     stream_violations = scan_share_stream_guard(args[0])
+    # [deep-audit-1047 B-01] binary-write verdict section (compress /
+    # openOutputStream). Same pre-formatted `file:line [criterion] reason`
+    # contract as the sections above.
+    binary_violations, _binary_sites = scan_binary_write_verdict(args[0])
     if violations:
         print("❌ 丢弃了必须消费的返回值（看似接线，实则没生效）：")
         for rel, line, snippet, fn, why in violations:
@@ -1620,7 +1828,13 @@ def main():
             print("  %s" % msg)
         print("")
         print("  共 %d 处。" % len(stream_violations))
-    if violations or drain_violations or staged_violations or stream_violations:
+    if binary_violations:
+        print("❌ 二进制写入判定段：compress/openOutputStream 的失败结果被丢弃（B-01）：")
+        for msg in binary_violations:
+            print("  %s" % msg)
+        print("")
+        print("  共 %d 处。" % len(binary_violations))
+    if violations or drain_violations or staged_violations or stream_violations or binary_violations:
         return 1
     print(
         "✅ discarded-return guard: no watchlisted return value is dropped "
@@ -1629,6 +1843,8 @@ def main():
     print("✅ discarded-return guard: queue-drain persistence section green")
     print("✅ discarded-return guard: share staged-bytes accounting section green")
     print("✅ discarded-return guard: share inbound stream section green (null stream never staged)")
+    print("✅ discarded-return guard: binary-write verdict section green (compress verdict routed, "
+          "no swallowed openOutputStream)")
     return 0
 
 
