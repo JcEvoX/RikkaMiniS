@@ -148,10 +148,14 @@ fun ChatViewModel.selectEntry(entryId: String) {
     // left the model fields already flipped while currentProvider was still the
     // previous one - a UI/provider split state. Doing the throwing call first
     // means a failure leaves the whole selection untouched.
-    val newProvider = ProviderFactory.create(instance, apiKey, entry.model, context)
-    currentModel = entry.model
-    _modelName.value = entry.model.displayName
-    _providerName.value = instance.label.ifEmpty { entry.model.provider }
+    // [deep-audit-1044 B-03] Resolved through the single enriched exit, so the
+    // provider and the `currentModel` snapshot agree AND carry models.dev
+    // capabilities (`entry.model` is the raw base + overrides only).
+    val effectiveModel = providerModelFor(entry)
+    val newProvider = ProviderFactory.create(instance, apiKey, effectiveModel, context)
+    currentModel = effectiveModel
+    _modelName.value = effectiveModel.displayName
+    _providerName.value = instance.label.ifEmpty { effectiveModel.provider }
     _selectedGroupId.value = null
     _selectedGroupName.value = ""
     _activeEntryId.value = entry.id
@@ -396,7 +400,10 @@ internal fun ChatViewModel.buildFallbackProviders(primaryProvider: LLMProvider):
         if (!instance.isEnabled) continue
         val apiKey = providerRepository.loadApiKey(instance.id) ?: continue
         val p = try {
-            ProviderFactory.create(instance, apiKey, entry.model, context)
+            // [deep-audit-1044 B-03] Fallback providers answer the same
+            // capability questions as the primary, so they get the enriched
+            // model too (raw `entry.model` lost vision + effort tiers here).
+            ProviderFactory.create(instance, apiKey, providerModelFor(entry), context)
         } catch (_: Exception) { continue }
         result.add(FallbackCandidate(p, entryId))
     }
@@ -456,12 +463,15 @@ internal fun ChatViewModel.rotateForNewTurn(label: String) {
     val targetEntry = members.firstOrNull { it.id == targetId } ?: return
     val instance = providerRepository.instance(targetEntry.providerInstanceId) ?: return
     val apiKey = providerRepository.loadApiKey(instance.id) ?: return
-    currentModel = targetEntry.model
-    _modelName.value = targetEntry.model.displayName
-    _providerName.value = instance.label.ifEmpty { targetEntry.model.provider }
+    // [deep-audit-1044 B-03] Rotated-in member takes the same enriched path as
+    // an explicit pick (raw base model = no modalities / effort tiers on the wire).
+    val effectiveModel = providerModelFor(targetEntry)
+    currentModel = effectiveModel
+    _modelName.value = effectiveModel.displayName
+    _providerName.value = instance.label.ifEmpty { effectiveModel.provider }
     _activeEntryId.value = targetEntry.id
     // [T-provider-key-roulette] Rotation happens inside ProviderFactory.create.
-    currentProvider = ProviderFactory.create(instance, apiKey, targetEntry.model, context)
+    currentProvider = ProviderFactory.create(instance, apiKey, effectiveModel, context)
     persistBinding("""{"type":"group","groupId":"$groupId","lastEntryId":"$targetId"}""")
     AppLogger.info(
         "ChatVMRouting",

@@ -418,12 +418,20 @@ internal fun ChatViewModel.loadSession() {
                 val apiKey = instance?.let { providerRepository.loadApiKey(it.id) }
                 val decision = decideSessionModelResolution(entry, instance, apiKey)
                 if (decision is SessionModelResolution.Use) {
-                    currentModel = entry.model
-                    _modelName.value = entry.model.displayName
+                    // [deep-audit-1044 B-03] The provider — and the `currentModel`
+                    // snapshot the whole session reads — must carry the ENRICHED
+                    // model: `entry.model` is `baseModel.withOverrides(…)`, which
+                    // never touches models.dev, so 33 of the 39 built-ins lost
+                    // their modalities / effort tiers / output cap the moment the
+                    // request crossed into `:modelservice` (a process that never
+                    // initialises ModelsDevApi).
+                    val effectiveModel = providerModelFor(entry)
+                    currentModel = effectiveModel
+                    _modelName.value = effectiveModel.displayName
                     _activeEntryId.value = entry.id
                     currentProvider =
-                        ProviderFactory.create(decision.instance, decision.apiKey, entry.model, context)
-                    _providerName.value = decision.instance.label.ifEmpty { entry.model.provider }
+                        ProviderFactory.create(decision.instance, decision.apiKey, effectiveModel, context)
+                    _providerName.value = decision.instance.label.ifEmpty { effectiveModel.provider }
                     resolved = true
                     // No binding row (e.g. a synced session that only
                     // carried model_id). If the entry belongs to the
@@ -1138,13 +1146,17 @@ internal fun ChatViewModel.restoreFromBinding(bindingJson: String?): Boolean {
                     }
                     return false
                 }
-                currentModel = entry.model
-                _modelName.value = entry.model.displayName
-                _providerName.value = decision.instance.label.ifEmpty { entry.model.provider }
+                // [deep-audit-1044 B-03] Enriched model, same single source as
+                // every other provider-construction site (see
+                // `ChatViewModel.providerModelFor`).
+                val effectiveModel = providerModelFor(entry)
+                currentModel = effectiveModel
+                _modelName.value = effectiveModel.displayName
+                _providerName.value = decision.instance.label.ifEmpty { effectiveModel.provider }
                 _selectedGroupId.value = null
                 _selectedGroupName.value = ""
                 _activeEntryId.value = entry.id
-                currentProvider = ProviderFactory.create(decision.instance, decision.apiKey, entry.model, context)
+                currentProvider = ProviderFactory.create(decision.instance, decision.apiKey, effectiveModel, context)
                 true
             }
             else -> false
@@ -1192,12 +1204,16 @@ internal fun ChatViewModel.resolveProviderFromGroup(
     val instance = providerRepository.instance(targetEntry.providerInstanceId) ?: return false
     val apiKey = providerRepository.loadApiKey(instance.id) ?: return false
 
-    currentModel = targetEntry.model
-    _modelName.value = targetEntry.model.displayName
-    _providerName.value = instance.label.ifEmpty { targetEntry.model.provider }
+    // [deep-audit-1044 B-03] Group-resolved turns take the same enriched path as
+    // an explicit pick — the member entry's base model alone has no capability
+    // metadata (models.dev is not reachable from `:modelservice`).
+    val effectiveModel = providerModelFor(targetEntry)
+    currentModel = effectiveModel
+    _modelName.value = effectiveModel.displayName
+    _providerName.value = instance.label.ifEmpty { effectiveModel.provider }
     _selectedGroupName.value = group.name
     _activeEntryId.value = targetEntry.id
-    currentProvider = ProviderFactory.create(instance, apiKey, targetEntry.model, context)
+    currentProvider = ProviderFactory.create(instance, apiKey, effectiveModel, context)
     return true
 }
 
@@ -1281,9 +1297,19 @@ internal fun ChatViewModel.applyNewChatDefaultModel(): Boolean {
         }
         return false
     }
-    _modelName.value = entry.model.displayName
+    // [deep-audit-1044 B-03/B-04] Same enriched model as every other
+    // construction site, and — [B-04] — publish it to `currentModel` too. The
+    // KDoc above promised "Sets currentModel / currentProvider / the name +
+    // activeEntry state flows" but the body never wrote `currentModel`, so a
+    // new chat with no default group left it null: `ensureSession()` then
+    // persisted `model_id = "unknown"`, `thinkingInfo()` returned null (the
+    // Token Usage "Thinking" block vanished) and `dynamicMaxTokens()` skipped
+    // the remaining-context clamp entirely.
+    val effectiveModel = providerModelFor(entry)
+    currentModel = effectiveModel
+    _modelName.value = effectiveModel.displayName
     _activeEntryId.value = entry.id
-    _providerName.value = decision.instance.label.ifEmpty { entry.model.provider }
-    currentProvider = ProviderFactory.create(decision.instance, decision.apiKey, entry.model, context)
+    _providerName.value = decision.instance.label.ifEmpty { effectiveModel.provider }
+    currentProvider = ProviderFactory.create(decision.instance, decision.apiKey, effectiveModel, context)
     return true
 }

@@ -91,6 +91,12 @@ PMM_REL = APP + "/debug/ProviderMutationMethods.kt"
 # model (models.dev), not the raw `entry.model`.
 TLC_REL = APP + "/provider/ThinkingLevelCatalog.kt"
 CVM_REL = APP + "/ui/chat/ChatViewModel.kt"
+# [deep-audit-1044 B-04] The two capability readers that live OUTSIDE
+# ChatViewModel.kt — the FE-5 extractions moved them into extension files and
+# dv23-B07 only fixed the four members that stayed inside the class, so these
+# two kept answering from the raw `currentModel` snapshot.
+CEH_REL = APP + "/ui/chat/ChatErrorHandling.kt"
+CST_REL = APP + "/ui/chat/ChatSlashTokenExt.kt"
 
 ARM1_FORBIDDEN = ("provider = instanceId",)
 ARM1_REQUIRED = ("instance.providerType.displayName",)
@@ -549,6 +555,12 @@ CVM_READERS = (
     ("effectiveContextWindowTokens", "capacity judgment"),
     ("currentModelContextWindowSource", "Token Usage source row"),
     ("currentModelMaxOutputTokens", "Token Usage max-output row"),
+    # [deep-audit-1044 B-04] The two remaining in-class capabilities: the
+    # thinking toggle and the thinking ceiling. Both read the raw snapshot, so
+    # a model whose `supportsReasoning` / effort tiers exist only in the
+    # models.dev row reported "no thinking" and a ceiling the wire would clamp.
+    ("currentModelSupportsReasoning", "thinking toggle"),
+    ("currentModelMaxThinkingLevel", "thinking ceiling"),
 )
 # The duplicated lookup the four readers each carried before the fix: it reads
 # the entry's BASE model, skipping models.dev enrichment.
@@ -582,9 +594,9 @@ def check_arm6_chat(src, rel):
     """ChatViewModel: every capability / window reader through one live exit."""
     code = code_only(src)
     out = []
-    if not re.search(r"private fun liveEffectiveModel\(\)\s*:\s*LLMModel\?\s*=", code):
+    if not re.search(r"(?:private|internal) fun liveEffectiveModel\(\)\s*:\s*LLMModel\?\s*=", code):
         out.append((rel, 0, "6",
-                    "the single live-model exit `private fun liveEffectiveModel(): "
+                    "the single live-model exit `private|internal fun liveEffectiveModel(): "
                     "LLMModel?` is gone — the four readers are free to re-derive the "
                     "lookup again (dv23-B7)"))
         body = ""
@@ -631,10 +643,48 @@ def check_arm6_chat(src, rel):
                     "to `?: true` and vision support is misjudged (dv23-B7)"))
     return out
 
+# [deep-audit-1044 B-04] The two capability readers that were extracted OUT of
+# ChatViewModel (FE-5 batches 7/8) — one per file — and therefore escaped
+# dv23-B07's four-reader sweep: they still opened with
+# `val model = currentModel ?: return …`. Keyed by rels key.
+EXT_READERS = {
+    "ceh": ("dynamicMaxTokens", "output sizing (remaining-context clamp)"),
+    "cst": ("thinkingInfo", "Token Usage Thinking row"),
+}
+
+def _block_comment_free(text):
+    """[deep-audit-1044] KDoc is prose: it may neither satisfy nor trip a
+    judgement. `code_only` only drops `//` lines, so strip `/* … */` too."""
+    return re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+
+def _ext_fn(code, name):
+    """Body of a top-level `fun ChatViewModel.<name>(…)` extension function."""
+    return function_text(code, "fun ChatViewModel.%s(" % name)
+
+def check_arm7_ext_readers(src, rel, key):
+    """The out-of-class capability reader of THIS file answers through the live
+    exit. Fail-closed per file: the reader disappearing is ROT."""
+    name, label = EXT_READERS[key]
+    code = _block_comment_free(code_only(src))
+    out = []
+    blk = _ext_fn(code, name)
+    if blk is None:
+        out.append((rel, 0, "7",
+                    "reader `%s` (%s) is gone — gate ROT" % (name, label)))
+    elif "liveEffectiveModel()" not in blk:
+        out.append((rel, 0, "7",
+                    "`%s` (%s) still opens on the raw `currentModel` snapshot — "
+                    "for 33 of the 39 built-ins that snapshot carries no "
+                    "models.dev capability data, so the remaining-context clamp "
+                    "and the Thinking row silently fall back to the provider "
+                    "default (dv24-B04)" % (name, label)))
+    return out
+
 def run_checks(root, rels=None):
     rels = rels or {"mc": MC_REL, "md": MD_REL, "oa": OA_REL, "ad": AD_REL,
                     "cdm": CDM_REL, "pdm": PDM_REL, "pmm": PMM_REL,
-                    "cvm": CVM_REL, "tlc": TLC_REL}
+                    "cvm": CVM_REL, "tlc": TLC_REL,
+                    "ceh": CEH_REL, "cst": CST_REL}
     srcs = {k: read(rel, root) for k, rel in rels.items()}
     missing = [(rel, 0, "?", "file not found — gate ROT")
                for k, rel in rels.items() if srcs[k] is None]
@@ -652,6 +702,8 @@ def run_checks(root, rels=None):
                                "provider.models.add/update read-back (entryToJson)")
     checks += check_arm5_tlc(srcs["tlc"], rels["tlc"])
     checks += check_arm6_chat(srcs["cvm"], rels["cvm"])
+    checks += check_arm7_ext_readers(srcs["ceh"], rels["ceh"], "ceh")
+    checks += check_arm7_ext_readers(srcs["cst"], rels["cst"], "cst")
     return checks
 
 
@@ -1018,6 +1070,21 @@ CVM_A6_OK = """class ChatViewModel {
 
     val currentModelMaxOutputTokens: Int?
         get() = liveEffectiveModel()?.maxOutputTokens
+
+    val currentModelSupportsReasoning: Boolean
+        get() = liveEffectiveModel()?.supportsReasoning != false
+
+    internal val currentModelMaxThinkingLevel: ThinkingLevel
+        get() {
+            val entry = _activeEntryId.value?.let { id ->
+                providerRepository.config.value.modelEntries.find { it.id == id }
+            }
+            if (entry != null) {
+                return entry.effectiveMaxThinkingLevel
+            }
+            val model = liveEffectiveModel() ?: return ThinkingLevel.XHIGH
+            return model.catalogMaxThinkingLevel
+        }
 }
 """
 
@@ -1047,6 +1114,21 @@ CVM_A6_PREFIX = """class ChatViewModel {
 
     val currentModelMaxOutputTokens: Int?
         get() = currentModel?.maxOutputTokens
+
+    val currentModelSupportsReasoning: Boolean
+        get() = currentModel?.supportsReasoning != false
+
+    internal val currentModelMaxThinkingLevel: ThinkingLevel
+        get() {
+            val entry = _activeEntryId.value?.let { id ->
+                providerRepository.config.value.modelEntries.find { it.id == id }
+            }
+            if (entry != null) {
+                return entry.effectiveMaxThinkingLevel
+            }
+            val model = currentModel ?: return ThinkingLevel.XHIGH
+            return model.catalogMaxThinkingLevel
+        }
 }
 """
 
@@ -1077,13 +1159,50 @@ CVM_A6_NO_READER = CVM_A6_OK.replace(
         get() = liveEffectiveModel()?.maxOutputTokens
 """, "")
 
+# [deep-audit-1044 B-04] The two out-of-class readers (extension files).
+CEH_A7_OK = """internal fun ChatViewModel.dynamicMaxTokens(provider: LLMProvider, lastContextTokens: Int = 0): Int {
+    val model = liveEffectiveModel()
+        ?: return minOf(ChatViewModel.GLOBAL_MAX_TOKENS_CEILING, provider.defaultMaxOutputTokens)
+    val maxOutputCeiling = minOf(ChatViewModel.GLOBAL_MAX_TOKENS_CEILING, provider.effectiveMaxOutputTokens(model))
+    return maxOutputCeiling
+}
+"""
+
+CST_A7_OK = """fun ChatViewModel.thinkingInfo(): ThinkingInfo? {
+    val model = liveEffectiveModel() ?: return null
+    val supported = model.supportsReasoning != false
+    return ThinkingInfo(supported, true, "--")
+}
+"""
+
+# Pre-fix shapes: both opened on the raw snapshot.
+CEH_A7_RAW = CEH_A7_OK.replace(
+    """    val model = liveEffectiveModel()
+        ?: return minOf""",
+    """    val model = currentModel
+        ?: return minOf""")
+
+CST_A7_RAW = CST_A7_OK.replace(
+    "val model = liveEffectiveModel() ?: return null",
+    "val model = currentModel ?: return null")
+
+# A KDoc that merely MENTIONS the exit must not satisfy the judgement.
+CST_A7_KDOC_ONLY = """/**
+ * Reads [liveEffectiveModel] -- this prose is not a call.
+ */
+fun ChatViewModel.thinkingInfo(): ThinkingInfo? {
+    val model = currentModel ?: return null
+    return ThinkingInfo(model.supportsReasoning != false, true, "--")
+}
+"""
+
 def selftest():
     ok = True
     with tempfile.TemporaryDirectory() as tmp:
         rels = {"mc": "mc.kt", "md": "md.kt", "oa": "oa.kt", "ad": "ad.kt",
                 "cdm": "cdm.kt", "pdm": "pdm.kt", "pmm": "pmm.kt",
                 "tlc": "tlc.kt",
-                "cvm": "cvm.kt"}
+                "cvm": "cvm.kt", "ceh": "ceh.kt", "cst": "cst.kt"}
 
         def write(name, text):
             with open(os.path.join(tmp, rels[name]), "w", encoding="utf-8") as f:
@@ -1107,6 +1226,8 @@ def selftest():
         write("pmm", pmm_ok)
         write("tlc", TLC_A5_OK)
         write("cvm", CVM_A6_OK)
+        write("ceh", CEH_A7_OK)
+        write("cst", CST_A7_OK)
         ok &= _report(run_checks(tmp, rels), "fixed", "all arms clean")
 
         # 2. Pre-fix shape: arm1 (UUID + no trim) and arm2 (no new keys).
@@ -1278,7 +1399,10 @@ def selftest():
 
         # Pre-fix: missing exit + 4 unrouted readers + un-normalised vision +
         # duplicated lookup + the two raw snapshot reads = 9 findings.
-        ok &= arm6_of("pre-fix", CVM_A6_PREFIX, 9,
+        # 9 findings before dv24-B04; the two readers added to CVM_READERS
+        # (`currentModelSupportsReasoning` / `currentModelMaxThinkingLevel`) add
+        # one each when they are present in the pre-fix shape ⇒ 11.
+        ok &= arm6_of("pre-fix", CVM_A6_PREFIX, 11,
                       "the pre-fix shape reds on every reader and the raw reads")
         ok &= arm6_of("no-enrich-fallback", CVM_A6_NO_ENRICH, 1,
                       "a snapshot fallback without models.dev enrichment reds alone")
@@ -1290,6 +1414,23 @@ def selftest():
                       "re-introducing the raw `?.model` lookup reds alone")
         ok &= arm6_of("reader-gone", CVM_A6_NO_READER, 1,
                       "a removed reader is ROT, not a silent pass")
+
+        # ---- Arm 7: the two capability readers extracted OUT of the class ----
+
+        def arm7_of(fixture_name, name, fixture, expect, label):
+            write(name, fixture)
+            checks = [c for c in run_checks(tmp, rels) if c[2] == "7"]
+            write(name, CEH_A7_OK if name == "ceh" else CST_A7_OK)
+            return _expect_count("arm 7 " + fixture_name, checks, expect, label)
+
+        ok &= arm7_of("dynamic-max-tokens-raw", "ceh", CEH_A7_RAW, 1,
+                      "`dynamicMaxTokens` back on the snapshot reds its own reader")
+        ok &= arm7_of("thinking-info-raw", "cst", CST_A7_RAW, 1,
+                      "`thinkingInfo` back on the snapshot reds its own reader")
+        ok &= arm7_of("kdoc-only-mention", "cst", CST_A7_KDOC_ONLY, 1,
+                      "a KDoc that merely names the exit cannot satisfy the arm")
+        ok &= arm7_of("reader-gone", "cst", "", 1,
+                      "a removed out-of-class reader is ROT")
 
     print("MODELS_PROVIDER_FIELD_SELFTEST=%s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1

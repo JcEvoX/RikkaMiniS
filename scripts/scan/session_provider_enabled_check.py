@@ -45,6 +45,22 @@ import sys
 LIFECYCLE_REL = (
     "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatSessionLifecycle.kt"
 )
+APP_DIR = "src/android/app/src/main/java/com/rikkaminis/app"
+ROUTING_REL = APP_DIR + "/ui/chat/ChatModelRouting.kt"
+PROMPT_TOOLS_REL = APP_DIR + "/ui/chat/ChatPromptAndTools.kt"
+
+# [deep-audit-1044 B-03] Every `ProviderFactory.create(...)` in the chat layer
+# must hand over the ENRICHED model. The raw arguments below are each the
+# entry's `baseModel.withOverrides(overrides)` — that never touches models.dev,
+# and `:modelservice` (which decides vision / effort tiers / output cap FROM
+# that object) never initialises ModelsDevApi either.
+RAW_MODEL_ARGS = ("entry.model", "targetEntry.model", "cachedProvider.model")
+# The single sources that ARE allowed to answer "which model": the shared
+# resolver on the view model, and models.dev itself.
+ENRICH_CALLS = ("providerModelFor(", "ModelsDevApi.effectiveModel(")
+FACTORY_CALL = "ProviderFactory.create("
+# Fail-closed: the three files carried 8 call sites when dv24-B03 was written.
+MIN_FACTORY_CALLS = 8
 
 FUNNEL_DEF = "internal fun decideSessionModelResolution("
 FUNNEL_ENABLED = "!instance.isEnabled"
@@ -65,6 +81,98 @@ BINDING_SIG = "internal fun ChatViewModel.restoreFromBinding("
 ENTRY_BRANCH_START = '"entry" -> {'
 ENTRY_BRANCH_END = "else -> false"
 APPLY_SIG = "internal fun ChatViewModel.applyNewChatDefaultModel()"
+
+# ── B-03: the `ProviderFactory.create` model argument ─────────────────────────
+# Every create site in the chat layer must hand over the ENRICHED model.
+_DECL_HEAD = re.compile(
+    r"^[ \t]*(?:internal |private |public |override |suspend )*fun\s", re.M)
+
+
+def _strip_line_comments(text):
+    """`//` comments out — a judgement must be satisfiable only by code."""
+    return "\n".join(line.split("//")[0] for line in text.split("\n"))
+
+
+def _call_args(text, open_idx):
+    """Split the argument list whose `(` sits at `open_idx` (None if unbalanced)."""
+    depth = 0
+    args, cur = [], []
+    for i in range(open_idx, len(text)):
+        c = text[i]
+        if c in "([{":
+            depth += 1
+            if depth == 1:
+                continue
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                args.append("".join(cur))
+                return args
+        elif c == "," and depth == 1:
+            args.append("".join(cur))
+            cur = []
+            continue
+        cur.append(c)
+    return None
+
+
+def _enclosing_source(text, pos):
+    """From the nearest preceding declaration to `pos` — the window in which a
+    `val effectiveModel = providerModelFor(entry)` may have been resolved."""
+    last = None
+    for m in _DECL_HEAD.finditer(text, 0, pos):
+        last = m
+    return text[last.start():pos] if last else text[:pos]
+
+
+def _assigned_from(window, name):
+    """Is `name` assigned from one of ENRICH_CALLS inside `window`?"""
+    pat = re.compile(r"\b(?:val|var)\s+%s\b[^=\n]*=" % re.escape(name))
+    for m in pat.finditer(window):
+        rest = window[m.end():]
+        # include the continuation line so a wrapped `=\n providerModelFor(` counts
+        head = rest.split("\n", 2)
+        rhs = head[0] + ("\n" + head[1] if len(head) > 1 else "")
+        if any(tok in rhs for tok in ENRICH_CALLS):
+            return True
+    return False
+
+
+def check_factory_models(texts, min_calls=None):
+    """[deep-audit-1044 B-03] Every `ProviderFactory.create(` in the chat layer
+    passes an enriched model. Returns (violations, resolved_call_sites)."""
+    min_calls = MIN_FACTORY_CALLS if min_calls is None else min_calls
+    v, sites = [], 0
+    for rel in sorted(texts):
+        code = _strip_line_comments(texts[rel])
+        for m in re.finditer(re.escape(FACTORY_CALL), code):
+            sites += 1
+            args = _call_args(code, m.end() - 1)
+            if args is None or len(args) < 3:
+                v.append("%s: unparseable %s call (fail-closed)" % (rel, FACTORY_CALL))
+                continue
+            model_arg = args[2].strip()
+            if model_arg in RAW_MODEL_ARGS:
+                v.append(
+                    "%s: %s passes the raw `%s` — that is the entry's "
+                    "baseModel+overrides, which carries no models.dev capabilities, "
+                    "and `:modelservice` never initialises ModelsDevApi to fill them "
+                    "in (dv24-B03)" % (rel, FACTORY_CALL, model_arg))
+                continue
+            if any(tok in model_arg for tok in ENRICH_CALLS):
+                continue
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", model_arg) and \
+                    _assigned_from(_enclosing_source(code, m.start()), model_arg):
+                continue
+            v.append(
+                "%s: %s model argument `%s` is not resolved through %s — only the "
+                "enriched model answers vision / effort tiers / output cap (dv24-B03)"
+                % (rel, FACTORY_CALL, model_arg, " or ".join(ENRICH_CALLS)))
+    if sites < min_calls:
+        v.append("only %d %s call site(s) across %d file(s) — expected >= %d "
+                 "(detection lost = ROT)"
+                 % (sites, FACTORY_CALL, len(texts), min_calls))
+    return v, sites
 
 
 def _segment(text, start_needle, end_needle, where):
@@ -153,22 +261,49 @@ def check_source(text):
                     % (site, token)
                 )
                 break
+
+    # ── D. [deep-audit-1044 B-04] applyNewChatDefaultModel must publish the
+    # model it just resolved. Its KDoc has always promised
+    # "Sets currentModel / currentProvider / the name + activeEntry state
+    # flows"; the body never wrote `currentModel`, so a new chat with no
+    # default group left it null and three readers degraded silently
+    # (ensureSession() persisted model_id = "unknown", thinkingInfo() returned
+    # null, dynamicMaxTokens() skipped the remaining-context clamp).
+    apply_seg = site_segments.get("applyNewChatDefaultModel")
+    if apply_seg is not None and "currentModel =" not in apply_seg:
+        v.append(
+            "applyNewChatDefaultModel: never writes `currentModel =` — the KDoc "
+            "promises it and every reader (session model_id / thinkingInfo / "
+            "dynamicMaxTokens) falls back to null without it (dv24-B04)")
     return v
 
 
-def run(root):
-    path = os.path.join(root, LIFECYCLE_REL)
+def _read(root, rel):
+    path = os.path.join(root, rel)
     if not os.path.isfile(path):
-        print("session_provider_enabled_check: missing target %s" % path)
-        return 2
+        return None
     with open(path, "r", encoding="utf-8") as f:
-        text = f.read()
-    violations = check_source(text)
+        return f.read()
+
+
+def run(root):
+    texts = {}
+    for rel in (LIFECYCLE_REL, ROUTING_REL, PROMPT_TOOLS_REL):
+        text = _read(root, rel)
+        if text is None:
+            print("session_provider_enabled_check: missing target %s" % rel)
+            return 2
+        texts[rel] = text
+    violations = check_source(texts[LIFECYCLE_REL])
+    factory_v, sites = check_factory_models(texts)
+    violations += factory_v
     if violations:
         for x in violations:
-            print("session_provider_enabled_check: %s: %s" % (LIFECYCLE_REL, x))
+            print("session_provider_enabled_check: %s" % x)
         print("GATE=RED session_provider_enabled (%d violation(s))" % len(violations))
         return 1
+    print("session_provider_enabled_check: %d ProviderFactory.create site(s) resolved "
+          "through the enriched model" % sites)
     print("GATE=GREEN session_provider_enabled")
     return 0
 
@@ -282,6 +417,45 @@ BAD_FUNNEL_NO_ENABLED = """internal fun decideSessionModelResolution(
 }
 """
 
+# [deep-audit-1044 B-04] The apply site resolved a model but never published it.
+BAD_APPLY_NO_CURRENT_MODEL = GOOD_APPLY.replace(
+    "    currentModel = entry.model\n", "")
+
+# [deep-audit-1044 B-03] `ProviderFactory.create` model arguments. Eight sites
+# across the three chat files when B-03 was written.
+FACTORY_OK = {
+    "lc": """internal fun ChatViewModel.a() {
+    val effectiveModel = providerModelFor(entry)
+    currentProvider = ProviderFactory.create(instance, apiKey, effectiveModel, context)
+    currentProvider = ProviderFactory.create(instance, apiKey, providerModelFor(targetEntry), context)
+    currentProvider = ProviderFactory.create(instance, apiKey, ModelsDevApi.effectiveModel(entry), context)
+}
+""",
+    "rt": """internal fun ChatViewModel.b() {
+    val effectiveModel = providerModelFor(targetEntry)
+    currentProvider = ProviderFactory.create(instance, apiKey, effectiveModel, context)
+    currentProvider = ProviderFactory.create(instance, apiKey, providerModelFor(entry), context)
+    currentProvider = ProviderFactory.create(instance, apiKey, providerModelFor(entry), context)
+}
+""",
+    "pt": """internal fun ChatViewModel.c(): LLMProvider {
+    return ProviderFactory.create(instance, apiKey, providerModelFor(entry), context)
+}
+
+internal fun ChatViewModel.d(): LLMProvider {
+    return ProviderFactory.create(instance, apiKey, providerModelFor(entry), context)
+}
+""",
+}
+
+FACTORY_RAW = dict(FACTORY_OK)
+FACTORY_RAW["lc"] = FACTORY_OK["lc"].replace(
+    "apiKey, effectiveModel, context", "apiKey, entry.model, context", 1)
+
+FACTORY_UNENRICHED = dict(FACTORY_OK)
+FACTORY_UNENRICHED["lc"] = FACTORY_OK["lc"].replace(
+    "apiKey, effectiveModel, context", "apiKey, entry.baseModel, context", 1)
+
 
 def _fixture(funnel, p2, entry, apply):
     return funnel + "\n" + p2 + "\n" + entry + "\n" + apply + "\n"
@@ -321,13 +495,43 @@ def selftest():
         "empty-source fixture did not fail closed",
     )
 
+    no_current = check_source(
+        _fixture(GOOD_FUNNEL, GOOD_P2, GOOD_ENTRY, BAD_APPLY_NO_CURRENT_MODEL))
+    expect(
+        any("applyNewChatDefaultModel" in x and "currentModel =" in x for x in no_current),
+        "apply-without-currentModel fixture produced no B-04 violation",
+    )
+
+    def factory_of(name, texts, want, label, min_calls=None):
+        v, _sites = check_factory_models(texts, min_calls)
+        if len(v) != want:
+            print("  [FAIL] factory %s: expected %d finding(s), got %d — %s"
+                  % (name, want, len(v), v))
+            return False
+        print("  [OK]   factory %s (%s)" % (name, label))
+        return True
+
+    factory_results = [
+        factory_of("enriched", FACTORY_OK, 0,
+                   "every create site resolves through the single source"),
+        factory_of("raw-entry", FACTORY_RAW, 1,
+                   "one raw `entry.model` reds exactly that site"),
+        factory_of("unenriched-ident", FACTORY_UNENRICHED, 1,
+                   "an identifier not resolved from the source reds"),
+        factory_of("rot", {"lc": FACTORY_OK["lc"]}, 1,
+                   "too few call sites is ROT, not a silent pass"),
+    ]
+
     print("selftest compliant tree      -> %d violation(s)" % len(good))
     print("selftest state-before-decision-> %d violation(s)" % len(bad_order))
     print("selftest bypassed entry branch-> %d violation(s)" % len(bad_bypass))
     print("selftest funnel w/o isEnabled-> %d violation(s)" % len(bad_gate))
     print("selftest funnel missing      -> %d violation(s)" % len(bad_missing))
+    print("selftest apply w/o currentModel-> %d violation(s)" % len(no_current))
+    print("selftest factory raw model    -> %d violation(s)"
+          % len(check_factory_models(FACTORY_RAW)[0]))
 
-    if failures:
+    if failures or not all(factory_results):
         for f in failures:
             print("SELFTEST FAIL " + f)
         return 1
