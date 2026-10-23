@@ -140,6 +140,32 @@ gate red instead of silently evaporating.
   C5  `fromJson` keeps its "no endpoints = noise" null path (every property
       `isConfigured` requires is blank-checked).
 
+[dv26-A2] The BRIDGE side of the same credential invariant, in the direction
+nobody implemented (deep-audit-1046 S-02). `MCPOAuthStore` and
+`/var/minis/mcp-servers/oauth/<server>.json` are two copies of one credential:
+the host writes the bridge, and the in-guest CLI rewrites it on every refresh
+(`transport/http.py::_oauth_refresh → _save_oauth_tokens`) with a new
+access_token / expires_at and — under refresh-token rotation — a new
+refresh_token. Nothing read it back, so `REFRESH_BRIDGE` (every save of any
+other field of that server) re-materialized the PRE-refresh snapshot; the guest
+then presented a rotated-away refresh_token and got `invalid_grant`.
+
+  C1  the function that materializes the bridge must, through its call
+      closure, READ the bridge file (a helper, not a comment) and PERSIST what
+      it read (`setTokens(`) — reading without persisting just moves the
+      regression one save later.
+  C2  the promotion must ORDER the bridge expiry against the stored copy (an
+      older bridge is the shape of "the app authorized after the guest's last
+      refresh" — promoting it is a rollback) and compare the tokens themselves
+      (a same-second refresh has an identical expiry). The `>=` vs `>` boundary
+      is behaviour and lives in `MCPOAuthBridgeMergeTest`, not here.
+  C3  the bridge is a token carrier, not a configuration source: the reader must
+      not read `client_id` / `token_endpoint` / `client_secret` / `resource`
+      (derived as "what materializeBridgeFile writes, minus the token triple").
+
+  A damaged / older / blank bridge promotes NOTHING — clearing valid host
+  tokens on a corrupt guest file would be the inverse bug, and a worse one.
+
 All are fail-closed: sources that cannot be read are a violation.
 
 Usage: python3 scripts/scan/mcp_oauth_lifecycle_check.py [repo_root]
@@ -224,6 +250,26 @@ HALF_CLEANUP_EXEMPT = {
 }
 
 FUN_DECL_RE = re.compile(r"\bfun\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+# [dv26-A2] deep-audit-1046 S-02 — the guest -> host half of the token bridge.
+# The store and `/var/minis/mcp-servers/oauth/<server>.json` are two copies of
+# one credential; the in-guest CLI rewrites its copy on every refresh and
+# nothing read it back, so a config save materialized the pre-refresh snapshot
+# over it (with a rotated-away refresh_token, i.e. invalid_grant).
+MERGE_REL = ("src/android/app/src/main/java/com/rikkaminis/app/mcp/oauth/"
+             "MCPOAuthBridgeMerge.kt")
+BRIDGE_READ_CALL = "readText("
+BRIDGE_WRITE_CALL = "writeText("
+BRIDGE_PATH_MARKERS = ("bridgeFile(", "bridgeDir(")
+BRIDGE_TOKEN_KEYS = ("access_token", "refresh_token", "expires_at")
+PREFS_TOKEN_READER = "tokens"
+PUT_KEY_RE = re.compile(r'\bput\(\s*"([A-Za-z_][A-Za-z0-9_]*)"')
+DATA_CLASS_RE = re.compile(r"\bdata\s+class\s+([A-Za-z_]\w*)\s*\(")
+CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+COMPARISON_RE = re.compile(r"([A-Za-z_][\w.]*)\s*(>=|<=|!=|==|>|<)\s*([A-Za-z_][\w.]*)")
+LOCAL_VAL_RE = re.compile(r"\bval\s+([A-Za-z_]\w*)\s*=\s*([^\n]*)")
+ORDERING_OPS = (">=", "<=", ">", "<")
+INEQUALITY_OPS = ("!=", "==")
 
 
 def mask(src):
@@ -435,6 +481,248 @@ def check_store(code):
             )
     return v
 
+
+def bridge_readers(code):
+    """{name: body} of every function that reads a FILE under the bridge dir.
+
+    Derived, not listed: a body that calls `readText(` on something the bridge
+    path helpers built. The prefs reader (`tokens(`) pulls a string out of
+    EncryptedSharedPreferences and therefore never qualifies — which is what
+    keeps the closure in C1 from being trivially satisfied.
+    """
+    out = {}
+    for name, body, _line in functions(code):
+        if body is None or name == PREFS_TOKEN_READER:
+            continue
+        # A WRITER is not a reader: `materializeBridgeFile` contains
+        # `readText(tmp)` in its rename fallback (it copies the half-written
+        # temp file), and counting that as "the bridge is read back" would make
+        # this gate pass on the pre-fix tree — the exact shape it exists to
+        # catch.
+        if BRIDGE_WRITE_CALL in body:
+            continue
+        if BRIDGE_READ_CALL in body and any(m in body for m in BRIDGE_PATH_MARKERS):
+            out[name] = body
+    return out
+
+def call_closure(code, starts):
+    """Names reachable from [starts] through calls to functions declared here."""
+    bodies = {n: b for n, b, _l in functions(code) if b is not None}
+    seen = set()
+    stack = [n for n in starts if n in bodies]
+    while stack:
+        name = stack.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        for m in CALL_RE.finditer(bodies[name]):
+            callee = m.group(1)
+            if callee in bodies and callee not in seen:
+                stack.append(callee)
+    return seen
+
+def check_bridge_promotion(store, store_scoped, merge):
+    """[dv26-A2] C1-C3 — the guest's refreshed token must survive a config save.
+
+    [store] is comment/string-masked (structure only); [store_scoped] keeps
+    string literal CONTENTS (the bridge key names are the cross-language
+    contract, so they are anchored); [merge] is the Android-free policy file
+    that holds the decision.
+
+    C1  the path that materializes the bridge must READ it first and PERSIST
+        what it read. Two thresholds, both needed: reading without persisting
+        only moves the regression one save later (the next save reads the
+        superseded triple back), and persisting without reading is a no-op.
+        Derived through the call graph, so a helper that hides the read still
+        counts, and a read that is only mentioned in a comment does not.
+    C2  the promotion must ORDER the bridge against the stored copy (an older
+        bridge must never win: that is the shape of "the app authorized after
+        the guest's last refresh") AND compare the tokens themselves (a
+        same-second refresh has an identical expiry, so ordering alone drops
+        it). This is not a ritual: each guard is one of the two ways the
+        promotion silently stops working.
+    C3  the bridge is a token carrier, not a configuration source: the reader
+        must not touch `client_id` / `token_endpoint` / `client_secret` /
+        `resource` (derived from what `materializeBridgeFile` writes, minus the
+        token triple). A stale or hand-edited bridge able to redirect a refresh
+        to another endpoint is a worse bug than the one this fixes.
+
+    Deliberately NOT pinned here: whether the ordering comparison is `>=` or
+    `>` at the boundary. That is behaviour, and `MCPOAuthBridgeMergeTest`
+    drives the same-second case with literals.
+
+    All are fail-closed: when the sources cannot be read, or the anchors moved,
+    that is a violation rather than a silent pass.
+    """
+    v = []
+
+    def red(criterion, message):
+        v.append("[dv26-A2] %s %s" % (criterion, message))
+
+    materializers = [(n, ln) for n, b, ln in functions(store)
+                     if b is not None and MATERIALIZE_CALL in b]
+    if not materializers:
+        red("C1", "no function calls `%s` — the bridge is never written, so this "
+                  "criterion has lost its subject (ROT: re-point this gate)"
+            % MATERIALIZE_CALL)
+        return v
+    readers = bridge_readers(store)
+    # Same walk on the string-preserving view: the bridge KEY NAMES (and the
+    # constructor arguments they feed) are the cross-language contract, and the
+    # masked view blanks exactly those literals.
+    readers_scoped = bridge_readers(store_scoped)
+    if not readers:
+        red("C1", "no function reads the bridge file (`%s` under the bridge dir) "
+                  "— the in-guest CLI's refreshed token can be overwritten by the "
+                  "host's pre-refresh copy again, and a rotated refresh_token "
+                  "comes back as invalid_grant" % BRIDGE_READ_CALL)
+        return v
+
+    bodies = {n: b for n, b, _l in functions(store) if b is not None}
+    for name, line in materializers:
+        reach = call_closure(store, [name])
+        hit = reach & set(readers)
+        if not hit:
+            red("C1", "`%s` (line %d) materializes the bridge without reading it "
+                      "through any helper — the guest's refreshed token is "
+                      "overwritten by the stored snapshot on every config save"
+                % (name, line))
+            continue
+        persisted = [f for f in reach
+                     if "setTokens(" in bodies.get(f, "")
+                     and (f in readers or call_closure(store, [f]) & set(readers))]
+        if not persisted:
+            red("C1", "`%s` (line %d) reads the bridge but never persists the "
+                      "promotion (`setTokens(`) — the promotion is lost on the "
+                      "next save, which reads the superseded triple back" % (name, line))
+
+    # -- C3: the reader must not lift configuration out of the guest file ----
+    payload_body = body_of(store_scoped, MATERIALIZE_CALL.rstrip("("))
+    if payload_body is None:
+        red("C3", "`%s` has no body in the store — the bridge payload contract "
+                  "cannot be derived, so 'tokens travel guest -> host, endpoints "
+                  "do not' cannot be checked (ROT: re-point this gate)"
+            % MATERIALIZE_CALL.rstrip("("))
+    else:
+        keys = []
+        for m in PUT_KEY_RE.finditer(payload_body):
+            if m.group(1) not in keys:
+                keys.append(m.group(1))
+        missing = [k for k in BRIDGE_TOKEN_KEYS if k not in keys]
+        auth_keys = [k for k in keys if k not in BRIDGE_TOKEN_KEYS]
+        if missing:
+            red("C3", "the bridge payload no longer carries %s — the token triple "
+                      "is the only thing this contract moves in either direction "
+                      "(ROT: update this gate)" % ", ".join(missing))
+        if not auth_keys:
+            red("C3", "the bridge payload carries no authorization field — the "
+                      "host-authoritative half of the contract is gone (ROT)")
+        for name, body in readers_scoped.items():
+            for key in auth_keys:
+                if '"%s"' % key in body:
+                    red("C3", "`%s` reads '%s' from the bridge file — %s stay "
+                              "authoritative on the host side (the saved config + "
+                              "the encrypted secret); a stale or hand-edited bridge "
+                              "must not be able to redirect a refresh"
+                        % (name, key, "/".join(auth_keys)))
+
+    # -- C2: the guards that make the promotion survive the boundary cases --
+    merge_classes = set(DATA_CLASS_RE.findall(merge))
+    bridge_types = set()
+    for body in readers_scoped.values():
+        for cls in merge_classes:
+            if re.search(r"\b" + re.escape(cls) + r"\s*\(", body):
+                bridge_types.add(cls)
+    if not bridge_types:
+        red("C2", "the bridge reader builds no snapshot type declared in %s — the "
+                  "decision has no input type to check (ROT: re-point this gate)"
+            % MERGE_REL)
+        return v
+    decision = None
+    for m in re.finditer(r"\bfun\s+([A-Za-z_]\w*)\s*\(([^)]*)\)", merge):
+        for cls in bridge_types:
+            pm = re.search(r"([A-Za-z_]\w*)\s*:\s*" + re.escape(cls) + r"\b", m.group(2))
+            if pm:
+                body = body_at(merge, m.start())
+                if body:
+                    decision = (m.group(1), pm.group(1), body)
+                    break
+        if decision:
+            break
+    if decision is None:
+        red("C2", "no function in %s decides on a bridge snapshot — the promotion "
+                  "rule and its guards are gone (ROT: re-point this gate)" % MERGE_REL)
+        return v
+    fname, param, body = decision
+    # Field names are DERIVED from the reader (which key of the guest file maps
+    # to which constructor argument), never spelled by this gate. Then a local
+    # assigned from one of those fields is resolved back to its bridge field, so
+    # `val a = bridge.accessToken.trim()` followed by `a != stored.accessToken`
+    # still counts as "the access token is compared".
+    derived = {}
+    for key, pat in (
+        ("access_token", re.compile(r"([A-Za-z_]\w*)\s*=\s*\w+\.optString\(\s*\"access_token\"")),
+        ("refresh_token", re.compile(r"([A-Za-z_]\w*)\s*=\s*\w+\.optString\(\s*\"refresh_token\"")),
+        ("expires_at", re.compile(r"([A-Za-z_]\w*)\s*=\s*\w+\.optLong\(\s*\"expires_at\"")),
+    ):
+        for rbody in readers_scoped.values():
+            m = pat.search(rbody)
+            if m:
+                derived[key] = m.group(1)
+                break
+    if len(derived) != 3:
+        red("C2", "cannot derive the token / expiry field names from the bridge "
+                  "reader — the comparisons below have nothing to be checked "
+                  "against (ROT: re-point this gate)")
+        return v
+
+    alias_fields = {}
+    for nm, rhs in LOCAL_VAL_RE.findall(body):
+        for key, field in derived.items():
+            if re.search(r"\b" + re.escape(param) + r"\." + re.escape(field) + r"\b", rhs):
+                alias_fields[nm] = key
+
+    def bridge_field(expr):
+        """The bridge field name this expression came from, or None."""
+        head = expr.split(".")[0]
+        if head == param:
+            rest = expr.split(".")[1] if "." in expr else ""
+            for key, field in derived.items():
+                if rest == field:
+                    return key
+            return None
+        return alias_fields.get(head)
+
+    def other_side_is_not_bridge(expr):
+        head = expr.split(".")[0]
+        return head != param and head not in alias_fields
+
+    ordering = False
+    compared = set()
+    for m in COMPARISON_RE.finditer(body):
+        left, op, right = m.group(1), m.group(2), m.group(3)
+        for a, b in ((left, right), (right, left)):
+            field = bridge_field(a)
+            if field is None or not other_side_is_not_bridge(b):
+                continue
+            if op in ORDERING_OPS:
+                ordering = True
+            elif op in INEQUALITY_OPS:
+                compared.add(field)
+    if not ordering:
+        red("C2", "`%s` never orders the bridge expiry against the stored copy — a "
+                  "bridge left over from BEFORE the host authorized would promote "
+                  "the token it already replaced (a rollback, not a refresh)"
+            % fname)
+    if "access_token" not in compared:
+        red("C2", "`%s` never compares the bridge access token against the stored "
+                  "one — a same-second refresh has an identical expiry, so ordering "
+                  "alone silently stops promoting it" % fname)
+    if "refresh_token" not in compared:
+        red("C2", "`%s` never compares the bridge refresh token against the stored "
+                  "one — under refresh-token rotation the superseded token stays in "
+                  "the store and the guest's next refresh is invalid_grant" % fname)
+    return v
 
 def check_repo(code):
     v = []
@@ -1091,6 +1379,18 @@ def run(root):
         print("mcp_oauth_lifecycle_check: cannot read sources: %s" % exc)
         return 2
     violations = check_store(store) + check_repo(repo)
+    # [dv26-A2] the guest -> host half of the token bridge (fail-closed: an
+    # unreadable policy file is a violation, not a skipped check).
+    try:
+        store_scoped = mask_comments(read(root, STORE_REL))
+        merge = mask(read(root, MERGE_REL))
+    except OSError as exc:
+        violations.append(
+            "[dv26-A2] cannot read the bridge-merge sources (%s) — a token the "
+            "in-guest CLI refreshed can be overwritten by the host's pre-refresh "
+            "copy again" % exc)
+    else:
+        violations += check_bridge_promotion(store, store_scoped, merge)
     # [dv25-A1] parse/write key contract (fail-closed: unreadable = violation).
     # Comments are masked, string literals are NOT — the criteria are anchored
     # on the key spellings themselves.
@@ -1142,7 +1442,9 @@ def run(root):
         "all wired; no secret-only cleanup path; edit sheet edits the live entry; "
         "oauth bridge never archived and never restored; mcp servers.json redacted "
         "on a credentials-free export; every CLI-written oauth key readable by "
-        "fromJson with snake_case primary first and the disk format unchanged%s)"
+        "fromJson with snake_case primary first and the disk format unchanged; "
+        "a token the in-guest CLI refreshed is read back, promoted and persisted "
+        "before the bridge is re-materialized%s)"
         % note
     )
     return 0
@@ -1195,12 +1497,45 @@ object MCPOAuthStore {
             ReconcileAction.KEEP -> Unit
             ReconcileAction.REFRESH_BRIDGE -> {
                 val cfg = requireNotNull(oauth)
-                materializeBridgeFile(context, server, BridgePayload(accessToken = stored!!.accessToken, tokenEndpoint = cfg.tokenEndpoint))
+                val t = promoteFromBridge(context, server, requireNotNull(stored))
+                materializeBridgeFile(context, server, BridgePayload(accessToken = t.accessToken, tokenEndpoint = cfg.tokenEndpoint))
             }
         }
     }
 
-    fun materializeBridgeFile(context: Context, server: String, payload: BridgePayload) {}
+    private fun readBridgeTokenSnapshot(context: Context, server: String): BridgeTokenSnapshot? {
+        return runCatching {
+            val file = bridgeFile(context, server)
+            if (!file.exists()) return@runCatching null
+            val o = JSONObject(file.readText())
+            BridgeTokenSnapshot(
+                accessToken = o.optString("access_token", ""),
+                refreshToken = o.optString("refresh_token", "").ifBlank { null },
+                expiresAtSeconds = o.optLong("expires_at", 0L),
+            )
+        }.getOrNull()
+    }
+
+    private fun promoteFromBridge(context: Context, server: String, stored: StoredTokens): StoredTokens {
+        val bridge = readBridgeTokenSnapshot(context, server) ?: return stored
+        val promoted = promoteTokensFromBridge(
+            StoredTokenSnapshot(stored.accessToken, stored.refreshToken, stored.expiresAtMs), bridge,
+        ) ?: return stored
+        val tokens = StoredTokens(promoted.accessToken, promoted.refreshToken, promoted.expiresAtMs)
+        setTokens(context, server, tokens)
+        return tokens
+    }
+
+    fun materializeBridgeFile(context: Context, server: String, payload: BridgePayload) {
+        val json = JSONObject().apply {
+            put("access_token", payload.accessToken)
+            payload.refreshToken?.let { put("refresh_token", it) }
+            put("expires_at", payload.expiresAtSeconds)
+            put("token_endpoint", payload.tokenEndpoint)
+            put("client_id", payload.clientId)
+            payload.clientSecret?.let { put("client_secret", it) }
+        }
+    }
 
     fun deleteBridgeFile(context: Context, server: String) {
         runCatching { bridgeFile(context, server).delete() }
@@ -1277,8 +1612,99 @@ BAD_STORE_NO_BRIDGE_DELETE = GOOD_STORE.replace(
 
 # reconcile degenerated into purge-only (crack 2 re-opens)
 BAD_STORE_NO_MATERIALIZE = GOOD_STORE.replace(
-    "                materializeBridgeFile(context, server, BridgePayload(accessToken = stored!!.accessToken, tokenEndpoint = cfg.tokenEndpoint))\n",
+    "                materializeBridgeFile(context, server, BridgePayload(accessToken = t.accessToken, tokenEndpoint = cfg.tokenEndpoint))\n",
     "",
+)
+
+# ── [dv26-A2] guest → host token promotion fixtures ───────────────────────
+# The merge decision (Android-free policy file). Two guards carry the rule: an
+# expiry ORDERING against the stored copy, and a token INEQUALITY (a same-second
+# refresh has an identical expiry), plus the refresh-token rotation half.
+GOOD_MERGE = """
+internal data class BridgeTokenSnapshot(
+    val accessToken: String,
+    val refreshToken: String?,
+    val expiresAtSeconds: Long,
+)
+
+internal data class StoredTokenSnapshot(
+    val accessToken: String,
+    val refreshToken: String?,
+    val expiresAtMs: Long,
+)
+
+internal data class TokenPromotion(
+    val accessToken: String,
+    val refreshToken: String?,
+    val expiresAtMs: Long,
+)
+
+internal fun promoteTokensFromBridge(
+    stored: StoredTokenSnapshot,
+    bridge: BridgeTokenSnapshot?,
+): TokenPromotion? {
+    if (bridge == null) return null
+    val bridgeAccess = bridge.accessToken.trim()
+    if (bridgeAccess.isEmpty()) return null
+    val bridgeRefresh = bridge.refreshToken?.trim()?.takeIf { it.isNotBlank() }
+    val bridgeSeconds = if (bridge.expiresAtSeconds > 0) bridge.expiresAtSeconds else 0L
+    val storedSeconds = if (stored.expiresAtMs > 0) stored.expiresAtMs / 1000 else 0L
+    if (bridgeSeconds < storedSeconds) return null
+    val replaced = bridgeAccess != stored.accessToken
+    val rotated = bridgeRefresh != null && bridgeRefresh != stored.refreshToken
+    if (!replaced && !rotated) return null
+    return TokenPromotion(
+        accessToken = bridgeAccess,
+        refreshToken = bridgeRefresh ?: stored.refreshToken,
+        expiresAtMs = bridgeSeconds * 1000,
+    )
+}
+"""
+
+# the pre-fix shape: the promotion is there but never orders against the host
+# copy — an OLDER bridge would overwrite the token the app just authorized with
+BAD_MERGE_NO_ORDERING = GOOD_MERGE.replace(
+    "    if (bridgeSeconds < storedSeconds) return null\n",
+    "",
+)
+
+# the same-second refresh: the ordering guard stays, the refresh comparison goes
+BAD_MERGE_NO_REFRESH_CMP = GOOD_MERGE.replace(
+    "    val rotated = bridgeRefresh != null && bridgeRefresh != stored.refreshToken\n",
+    "    val rotated = false\n",
+)
+
+# ... and the same for the access-token comparison
+BAD_MERGE_NO_ACCESS_CMP = GOOD_MERGE.replace(
+    "    val replaced = bridgeAccess != stored.accessToken\n",
+    "    val replaced = false\n",
+)
+
+# the baseline shape: reconcile materializes the prefs copy straight away
+BAD_STORE_NO_PROMOTION = GOOD_STORE.replace(
+    "                val t = promoteFromBridge(context, server, requireNotNull(stored))\n"
+    "                materializeBridgeFile(context, server, BridgePayload(accessToken = t.accessToken, tokenEndpoint = cfg.tokenEndpoint))",
+    "                materializeBridgeFile(context, server, BridgePayload(accessToken = stored!!.accessToken, tokenEndpoint = cfg.tokenEndpoint))",
+)
+
+# read but never persisted: the next save reads the superseded triple back and
+# loses the promotion, so the bridge keeps flapping
+BAD_STORE_UNPERSISTED = GOOD_STORE.replace(
+    "        setTokens(context, server, tokens)\n        return tokens",
+    "        return tokens",
+)
+
+# the authority leak: the reader parses an endpoint out of the guest file
+BAD_STORE_READS_ENDPOINT = GOOD_STORE.replace(
+    '                expiresAtSeconds = o.optLong("expires_at", 0L),',
+    '                expiresAtSeconds = o.optLong("expires_at", 0L),\n'
+    '                tokenEndpoint = o.optString("token_endpoint", ""),',
+)
+
+# not one function reads the file: the bridge is write-only again
+BAD_STORE_NO_FILE_READ = GOOD_STORE.replace(
+    "            val o = JSONObject(file.readText())",
+    "            val o = JSONObject()",
 )
 
 BAD_REPO_ADD_UNWIRED = GOOD_REPO.replace("        reconcileOAuth(server)\n        return true\n    }\n\n    fun update(",
@@ -2003,6 +2429,58 @@ def selftest():
           "reversed/unwired/tojson-camel/no-null/new-cli-key/no-cli/no-fun) -> "
           "%d/%d/%d/%d/%d/%d/%d/%d/%d/%d/%d violation(s)"
           % (a1, a2, a3, a4, a5, a6, a7, a8, a9, len(no_cli), len(no_from)))
+
+    # [dv26-A2] bridge-promotion arms. Each fixture must trip EXACTLY one
+    # criterion, so a green run proves all three have teeth and none of them is
+    # a restatement of another (the C1 pair are its two thresholds: never
+    # reading, and reading without persisting).
+    def promo(store=GOOD_STORE, merge=GOOD_MERGE):
+        # check_bridge_promotion wants the structural view AND the
+        # string-literal-preserving view of the SAME source (the bridge key names
+        # are the cross-language contract), so both come from mask_comments(store).
+        return check_bridge_promotion(mask_comments(store), mask_comments(store), mask(merge))
+
+    def expect_only_tag(name, res, tag):
+        if not any(tag in item for item in res):
+            failures.append("%s must trip %s (got %s)" % (name, tag, res))
+            return
+        for item in res:
+            if tag not in item:
+                failures.append("%s tripped an unexpected criterion: %s" % (name, item))
+
+    good_promo = promo()
+    expect_clean("compliant bridge-promotion fixture", good_promo)
+
+    p_noread = promo(store=BAD_STORE_NO_PROMOTION)
+    expect_only_tag("baseline materialize-without-read fixture", p_noread, "C1")
+
+    p_nofile = promo(store=BAD_STORE_NO_FILE_READ)
+    expect_only_tag("store that never reads the bridge file", p_nofile, "C1")
+
+    p_nopersist = promo(store=BAD_STORE_UNPERSISTED)
+    expect_only_tag("read-but-not-persisted fixture", p_nopersist, "C1")
+
+    p_endpoint = promo(store=BAD_STORE_READS_ENDPOINT)
+    expect_only_tag("reader lifting an endpoint fixture", p_endpoint, "C3")
+
+    p_noorder = promo(merge=BAD_MERGE_NO_ORDERING)
+    expect_only_tag("promotion without an ordering guard fixture", p_noorder, "C2")
+
+    p_noacc = promo(merge=BAD_MERGE_NO_ACCESS_CMP)
+    expect_only_tag("promotion without an access-token comparison fixture", p_noacc, "C2")
+
+    p_norefresh = promo(merge=BAD_MERGE_NO_REFRESH_CMP)
+    expect_only_tag("promotion without a refresh-token comparison fixture", p_norefresh, "C2")
+
+    p_nomerge = promo(merge="")
+    expect_only_tag("missing bridge-merge policy fixture", p_nomerge, "C2")
+
+    print("selftest dv26-A2 bridge-promotion arms (no-read/no-file-read/"
+          "not-persisted/reader-endpoint/no-ordering/no-access-cmp/"
+          "no-refresh-cmp/no-policy) -> "
+          "%d/%d/%d/%d/%d/%d/%d/%d violation(s)"
+          % (len(p_noread), len(p_nofile), len(p_nopersist), len(p_endpoint),
+             len(p_noorder), len(p_noacc), len(p_norefresh), len(p_nomerge)))
 
 
     if failures:
