@@ -1,6 +1,6 @@
 # rikkaminis-dev-history 按天索引
 
-快速跳转到每日开发日志。共 2203 条记录，83 天。
+快速跳转到每日开发日志。共 2192 条记录，83 天。
 
 ## 2026-08-03（11 条）
 
@@ -3057,7 +3057,7 @@
 - `20:53` **签名：每次安装都要先卸载的根因（09-29 晚，已修，main f6196b8）**
   - **根因（两处独立证据）**：`build-debug.yaml` 的 `Signing properties` 步骤是三条 workflow 里**唯一被注释…
 
-## 2026-09-30（31 条）
+## 2026-09-30（30 条）
 
 - `06:39` **两个遗留全部处理完（09-30，main = f7053bc）**
   - **① 合并 PR #1**（`chore/rename-build-workflow` @ 58043a5）：`git merge --no-commit` …
@@ -3065,8 +3065,6 @@
   - **触发**：用户给两张 GitHub Actions annotation 截图（预发布 3 错误 / Build APK 1 警告）说「解决一下」。
 - `07:29` **CI annotation 全清 + 合并 main = 34aca49（09-30，含 tag 步骤线上首跑验证）**
   - **承接**：上一段修了 tag/缓存/噪音三处（分支 9565782），用户追加「把 ubuntu-latest 迁移 notice 也处理了，处理完就合并」…
-- `11:46` **CF 三套账号密钥核验（09-30）**
-  - - 三套 token 全部有效，且各自与配置的 ACCOUNT_ID 精确匹配（32 hex 逐字符 equal，非猜测）：`CF_API_TOKEN`(尾 0…
 - `12:10` **★ 部署事故：wrangler 覆盖式部署丢掉了 KV 绑定（09-30，自查发现）**
   - **用户质疑「之前那些不是自动继承下来吗」是对的**。***WORKER*** 三账号原本就是**完整配置好的**（ADMIN 密码、UUID、KV 绑定），我第一轮…
 - `12:31` **★ 沙箱怪癖：shell_execute 输出管道会吞掉「裸 null 行」（09-30 实证）**
@@ -3668,7 +3666,7 @@
 - `23:19` **§97 收口：fix/skill-asset-hash-gate 合并 main 15a1f1336（用户令「没有问题就**
   - # §97 收口：fix/skill-asset-hash-gate 合并 main 15a1f1336（用户令「没有问题就合并」+「合并触发之后就不用等了」）
 
-## 2026-10-15（44 条）
+## 2026-10-15（42 条）
 
 - `00:11` **§97 内容哈希门控在真机未生效——根因定性：DB 行来源不是 bundled（原本就有，非本次改出）**
   - **验证对象**：设备包 `1.0.0+2095`（lastUpdate 23:21:46）= CI run **#2095** = `fix/skill-as…
@@ -3708,10 +3706,6 @@
   - **本地**：挂载 `笔记/RikkaMinis开发档案/` 三件套已刷新（1747 条 / 74 天，重建→脱敏→SAGAS→复核 NONE→结构校验：行首围…
 - `15:03` **verify-1015 修复批次收口：P0/P1 全部 8 条，分支 CI #2112 绿（2026-10-15）**
   - **任务**：核实报告（shared/work/verify-audit-1015/VERIFY-REPORT.md）P0/P1 8 条 → 分支 `fix/a…
-- `15:18` **TierFlow 批量密钥提取（2026-10-15，用户交付 10 个账号）**
-  - **任务**：用户给 10 个 tierflow.cn 账号（手机号+密码，均已实名），要求批量提取两类 API Key（按量 Key 扣余额 / 套餐 Key…
-- `15:28` **tierflow-key-harvest 技能固化 + 挂载交付（2026-10-15）**
-  - **用户令**：「把这个操作变成一个技能，处理好的就到挂载文件夹那里」。
 - `15:54` **第二道门核实：全仓审计报告（附件 25 项）→ VERIFY-REPORT.md（2026-10-15）**
   - **用户令**：「按照老流程来」+ 附件 `rikkaminis_full_repository_audit_report.md`（64.5KB，BUG×10 …
 - `15:59` **audit2 修复批次派发（2026-10-15，用户令「按你的建议来吧」）**
@@ -3759,7 +3753,7 @@
 - `23:33` **deep-audit-1015 第二道门核实 + 5 支派发（用户令「走流程吧」，附新审计报告 14 项）**
   - **输入**：用户附件 `rikkaminis_deep_audit_report.md`（1388 行，BUG-01..09 + ARCH-01..03 + …
 
-## 2026-10-16（54 条）
+## 2026-10-16（52 条）
 
 - `00:01` **FIX-A 收口：deep-audit ARCH-01（T3 副作用安全重试接线，P0）+ BUG-09（二次截断）（2026-10-15）**
   - **任务**：读 `shared/work/deep-audit-1015/fix-tasks/FIX-A.md` 立刻执行（基线 main `e10fb2aa…
@@ -3823,10 +3817,6 @@
   - **身份链**：设备包 `1.0.0+2174` base.apk sha256 `6bc3c3bb…7e98`（14,353,469 B）== CI run …
 - `14:53` **A 支（P0 OpenAI tool-result 图）vision 路径真机端到端通过（用户切 vision 模型后补验）**
   - **语义半边（最强证据）**：用户切 vision 模型（glm-5.3-flash @ api.senseaudio.cn，OpenAI 兼容 → OpenA…
-- `16:19` **8.148.217.237:8892 卡密兑换系统侦查（tierflow 注册农场 master）**
-  - **触发**：朋友发 `http://8.148.217.237:8892/redeem` 让用户输入卡密+填自己的邀请码，用户问这是什么东西为什么起作用。
-- `16:23` **稀缺资源分析：tierflow 注册农场的关键不是身份证本身（用户问"身份池怎么来的"）**
-  - **用户问题**：这套系统里的稀缺资源是什么？直觉答"身份证/身份池"，追问这些东西怎么来的。
 - `16:38` **deep-audit-1016c 启动：第二道门核实 + 8 支派发（用户令「按流程吧」，附新审计报告 12 项）**
   - **输入**：附件 `shared-8c9ee41c.md`（170KB / 2645 行，ISSUE-01..12）。基线 main `e3ef74545bc…
 - `17:44` **deep-audit-1016c FIX-B 收口：offload 路径/intent/日期（`fix/da1016-offload-path-intent` @ `17d1860`，CI #2177 绿，停在分支）**
@@ -3870,7 +3860,7 @@
 - `23:36` **FIX-B 交付收口：deep-audit-1018 ISSUE-04/06/03（分支 CI #2196 绿，停在分支）**
   - **身份链**：分支 `fix/da1018-offload-wiring`，基线 main `c38cbba`，HEAD **`afee1fa37e08cb6…
 
-## 2026-10-17（85 条）
+## 2026-10-17（84 条）
 
 - `00:05` **deep-audit-1018 收口完成：8 支全绿 + 并集树 CI #2197 绿（停在并集分支，未合并 main）**
   - **输入**：用户附件 `shared-d48335c9.md`（2566 行 / 12 工单）。基线 main `c38cbba752c2`。
@@ -3930,8 +3920,6 @@
   - **任务**：读 `shared/work/deep-audit-1020/fix-tasks/FIX-G.md`（先读 COMMON/TRIAGE，基线 ma…
 - `10:50` **FIX-C 收口：deep-audit-1020（BrowserUse/Fastio 相对路径 + tar 前缀）—— fix/da1020-offload-relpath-tar @ be8def62，CI #2219 绿，停在分支**
   - **任务**：读 `shared/work/deep-audit-1020/fix-tasks/FIX-C.md`（先读 COMMON/TRIAGE）。**报告…
-- `11:14` **TierFlow 密钥提取批次 2026-10-17（5 账号 / 10 把 Key 全新建并复验）**
-  - **任务**：用户报「兑换完成，成功 5/5 个账号」但首条消息只贴了 4 个（手机号----密码，均标已实名）。处置 = 先对 4 个走 probe→harv…
 - `11:21` **deep-audit-1020 收口完成：8 支全绿 → 试合树 `integration/da1020` @ `bdc6d68`，CI #38997214449 **success**（停在分支，未合并 main）+ 文档三件套同步**
   - **输入**：用户附件 `shared-c9689fbd.md`（8 工单）。基线 main `942b0111d`（60 门）。用户「按流程来吧」→ 第一道门…
 - `11:25` **deep-audit-1020 合并 main（用户放行「合并」，2026-10-17）**
@@ -4163,7 +4151,7 @@
 - `23:47` **deep-audit-1028 启动：第二道门核实 + 判级 + 8→3 合支派发（用户令「走流程吧，小的合并少开会话」）**
   - - **输入**：REPORT-1028（8 工单/12 裂口，基线声明 889d645 = main 一致）。工作区 `shared/work/deep-au…
 
-## 2026-10-19（46 条）
+## 2026-10-19（45 条）
 
 - `00:56` **FIX-C 收口：deep-audit-1028 ISSUE-02 + ISSUE-05 + ISSUE-06（UI 状态失步 / filesDir 清理接线 / 深链响应式）—— `fix/da1028-c-ui-state-wiring` @ `aaa4cc1`，CI #39145801329 绿，停在分支**
   - **身份链**：基线 main `889d645`（tree `f12ca356`）→ 单提交 **`aaa4cc1b6267a40e7683c2e4795a5…
@@ -4219,8 +4207,6 @@
   - **位置**：`mounts/笔记/RikkaMinis审计背景包/`。三件全升：**context v12→v13（146→159 KB / 546 行）· …
 - `14:01` **deep-audit-1030 装机后独立复核（用户令「应用已含这波修改，开始验证」）2026-10-19**
   - **身份链（装机 = 这波代码，三环闭合）**：设备 `versionName=1.0.0+2328` / `lastUpdate 13:37:22 SGT` …
-- `14:54` **tierflow 密钥提取（5 账号，2026-10-19）**
-  - **输入**：用户提供 5 个 tierflow 账号（***PHONE*** / ***PHONE*** / ***PHONE*** / 1937949967…
 - `15:06` **deep-audit-1031 启动：第二道门（8/8 成立）+ 8→4 支合并派发（用户令「走流程」+「不要忘了把小的任务合并」）**
   - **输入**：附件 `shared-8c2edc89.md`（1551 行 / 107,816 B，ISSUE-01..08）。**基线** main `2bc…
 - `16:25` **FIX-A 收口（deep-audit-1031 ISSUE-01 + ISSUE-03 合支）：`fix/da1031-a-refs-and-config` @ `86e6979`，CI #2330 绿，停在分支**
@@ -4352,7 +4338,7 @@
 - `23:35` **deep-audit-1037（v16 波）启动：第二道门 16/16 成立 + 17 项（含 §1036-FLAKE 兑现）→ 6 支派发完成**
   - **输入**：`attachments/uploads/Audit_Report_V16_A.md`（82,870 B）+ `Rikkaminis_Audit_…
 
-## 2026-10-21（41 条）
+## 2026-10-21（40 条）
 
 - `00:45` **FIX-3 收口（deep-audit-1037 / dv16 波 A-06+A-07+A-08）：`fix/dv16-a-provider-config` @ `97e2655c`，CI #2406 绿，停在分支**
   - **身份链三方逐字符**：基线 main `7c38a79d` → 单提交 `97e2655c069a30da6032924736b36b252278e0ef`…
@@ -4415,8 +4401,6 @@
   - **身份链三方逐字符**：基线 main `6bbbded2` → 3 提交（`e0b84e84` 生产 / `b9c531b9` 测试 / `e8bfb52b…
 - `19:31` **FIX-B3 收口（deep-audit-1039 / 面 B：B-03 + B-04 + B-08）—— `fix/dv19-b3-settings-live-subscribe` @ `63b25132`，CI run 39586968122 success，停在分支**
   - **身份链三方逐字符**：基线 main `6bbbded2` → 3 提交（`22230a93` 生产 / `fa727dac` 测试 / `63b25132…
-- `19:44` **tierflow 密钥提取（2026-10-21 批次，5 账号）**
-  - **输入**：兑换交付的 5 个已实名账号（***PHONE*** / ***PHONE*** / ***PHONE*** / ***PHONE*** / 17…
 - `20:07` **FIX-A2 收口（deep-audit-1039 / v19 波面 A / A-04）：customBaseURL 归一化单源 —— `fix/dv19-a2-custom-base-url-trim` @ `05acae4f`，CI #2437 success，停在分支**
   - **身份链三方逐字符**：基线 main `6bbbded2` → 3 提交（`a92ed9ba` 生产 / `dc346cef` 测试 / `05acae4f…
 - `20:12` **FIX-A3 收口（deep-audit-1039 / dv19 波 A-05+A-06）：`fix/dv19-a3-voice-url-and-cancel` @ `0b699b18`，CI #2438 success，停在分支**
@@ -4513,7 +4497,7 @@
 - `20:50` **deep-audit-1042（dv22 波）全批闭环：14 支并集 → main `79ef6d59` + main CI #39778517080 success（Publish 真执行）→ 发布 v1.0.0+2500**
   - **① 并入范围（用户提醒补上的第 14 支）**：13 支 `fix/dv22-*`（A-01..A-07 / B-01..B-07）+ 遗留支 **`fix…
 
-## 2026-10-23（53 条）
+## 2026-10-23（49 条）
 
 - `00:30` **FIX-A6 收口（deep-audit-1043 / A-07 P1）：`fix/dv23-a6-fastio-special-files` @ `2bd96269`，CI #39811912340 success，停在分支**
   - **身份链**：基线 main `79ef6d59` → 3 提交（生产 `3efb8f7d` / 测试 `a8abc3f1` / 门 `2bd96269`）→…
@@ -4584,10 +4568,6 @@
   - **缺陷**：`autoDetectOnceIfNeeded`（首启 `rootfs.freshInstall` 自动测速）是裸 `scope.launch`（…
 - `15:48` **FIX-9 收口（deep-audit-1045 / dv25 波 B-08 P0 + B-05 P1）：`fix/dv25-b5-fastmode-promote-draft` @ `97642c3f`，CI #2544 (run 39917029875 / job 120293005852) success，停在分支**
   - **身份链**：基线 main `1d44ec90` → 6 提交（`b1d00555` B-08 生产 / `dfe6e9e3` B-05 生产 / `c93…
-- `15:50` **TierFlow 5 账号额度勘察（2026-10-23）—— 关键结论：套餐额度已普遍用超，账号 3 的套餐 Key 失效**
-  - **对象**：5 个 tierflow.cn 账号（***PHONE*** / ***PHONE*** / ***PHONE*** / ***PHONE*** …
-- `15:54` **TierFlow 精选台账 + 账号 3 rotate 换发（2026-10-23 15:53）**
-  - **rotate 已执行**（用户明确要求）：账号 `***PHONE***` 套餐 `SB1261006464823` → `POST /api/subscr…
 - `16:08` **deep-audit-1045 / FIX-6 支（B-02 P1）收口：分支 `fix/dv25-b2-webview-lifecycle` CI #2550 绿，停在分支（未合并 main）**
   - **身份链**：基线 main `1d44ec90` → 6 提交（`34aa5aba` 生产 / `dd70f0ca` 测试 / `0635d5a2` 门 /…
 - `17:33` **v27 追加：单任务版 v24-S（用户令「本波额度只有一份」）**
@@ -4614,14 +4594,10 @@
   - **触发**：用户「最新的报告消化完了，为下一批做准备吧，两份，在挂载文件夹的笔记的子文件夹」＝重建背景包 + **双路**（A/B）提示词，落 `/var/m…
 - `21:53` **deep-audit-1046 全批闭环：main `42af0ae6`（+ docs `88ef9b27`）+ main CI #39961698711 success（skipped=[]，Publish 真执行，v1.0.0+2567）→ 分支/worktree 清零**
   - **收口链**：8/8 分支 CI 绿（attempt 1，唯一 skipped=Publish）→ 并集 `integration/dv26` @ `bea3…
-- `22:48` **TierFlow 三账号复查（2026-10-23 22:48）：额度 7 小时内被大量消耗，账号 3 套餐将 ~100 分钟耗尽**
-  - **关键事实**：15:50 生成的台账快照 → 22:48 复查（间隔约 7 小时），三家账号额度大量流失：
-- `22:57` **TierFlow 第二批 5 账号勘察（2026-10-23 22:5x）—— 全部全新满额，5/5 入选**
-  - **对象**：新一批 5 账号（***PHONE*** / ***PHONE*** / ***PHONE*** / ***PHONE*** / 17068219…
 - `23:45` **deep-audit-1047（v25-A/B 波）启动：第二道门 15/15 成立，判级修正 3 处，9 支派发完成（回读 9/9 送达）**
   - **基线** main `88ef9b27`（报告写 `42af0ae6` = 父提交，`src/`+`scripts/` 逐字节一致）。工作区 `shared…
 
-## 2026-10-24（6 条）
+## 2026-10-24（7 条）
 
 - `00:58` **FIX-A5 收口（deep-audit-1047 / A-07 P1）：5 个 offload handler 的 `--help` 恒 exit 2**
   - **身份链**：基线 main `88ef9b27` → `5ec73d8f`（生产 5 文件 +15/−5）→ `77248c41`（测试 +78）→ `db…
@@ -4635,3 +4611,5 @@
   - **缺陷**：`ModelExecutionDispatcher.buildRequestJson` 对非 OFF 档位无条件 `put("thinking_l…
 - `05:39` **FIX-A3 收口（deep-audit-1047 / A-05+A-06）：`fix/dv27-a3-mcp-secret-handoff` @ `45b14121`，CI #40019485653 success，停在分支**
   - **缺陷（A-05）**：客侧 CLI 写不了加密存储，只能把 MCP 客户端密钥落 `<server>.secret` 等宿主导入；全仓只有编辑弹窗一处调 `…
+- `06:38` **deep-audit-1047 收口：9 支全绿 → 并集 `integration/dv27` @ `e4ac1240` 并集 CI 全绿（111 门 / 342 夹具）→ docs 已合 main `7263dbee`，代码并集待用户放行**
+  - **9 支回报核对**：本地 HEAD == 远端 sha == 绿 run `head_sha` 9/9 逐字符；`<绿sha>..HEAD` 差异仅 `fi…
