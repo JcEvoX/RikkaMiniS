@@ -263,7 +263,9 @@ class OpenAIToolResultImagesTest {
     }
 
     private fun readRepoFile(relative: String): String {
-        var dir: java.io.File? = java.io.File(System.getProperty("user.dir"))
+        // `user.dir` is nullable on the JVM — the `?: "."` keeps the compiler
+        // warning-free (CI reads "本支文件编译警告 0" as a gate).
+        var dir: java.io.File? = java.io.File(System.getProperty("user.dir") ?: ".")
         while (dir != null) {
             val f = java.io.File(dir, relative)
             if (f.exists()) return f.readText()
