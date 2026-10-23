@@ -43,7 +43,7 @@ class BrowserExternalSchemeShapeTest {
     }
 
     @Test
-    fun `the page's raw casing never reaches Intent.parseUri`() {
+    fun `the page's raw casing never reaches the parser`() {
         val body = declarationSlice(readRepoFile(handler), "private fun handleIntentScheme(")
         // `Intent.parseUri` matches `intent:` / `android-app:` case-SENSITIVELY;
         // a page writing `INTENT://…` used to degrade into ACTION_VIEW over the
