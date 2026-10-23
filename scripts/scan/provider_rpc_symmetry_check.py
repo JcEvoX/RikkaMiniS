@@ -622,11 +622,111 @@ def check_session_write_through(cfg_code, store_code):
                 "that cannot find an existing VM is not a peek" % VM_STORE_FILE)
     return v18, vfc
 
+# ---- [dv25-A06] session config READ-through (C19) ----
+# The reader-side mirror of SESSION_FIELDS. A `session.*` write lands on two
+# surfaces (C18), so a reader that only consults the Room row answers a
+# different value than the write just reported as accepted — and for a draft
+# session (no row) it answered the empty default while the resident VM held the
+# real level / binding. Every reader must therefore:
+#   - reach the resident VM through the NON-CREATING lookup (the peek),
+#   - keep the row as its no-live-chat fallback,
+#   - produce a value FROM the VM in its resident arm — peeking and then
+#     answering a constant is the same defect with extra steps.
+SESSION_READ_FIELDS = (
+    ("thinkingLevel", 'path = "session.thinkingLevel"'),
+    ("primaryModel", 'path = "session.primaryModel"'),
+)
+SESSION_ROW_READ_TOKEN = "getSession("
+SESSION_READ_ARM_MARKER = "ResidentViewModel ->"
+SESSION_READ_ARM_PREFIX = "SessionConfigReadSource."
+
+
+def session_reader_block(code, path_marker):
+    """The `reader = { … }` block of the field whose `path = "…"` is
+    [path_marker] (comment-stripped code). None when not locatable."""
+    at = code.find(path_marker)
+    if at < 0:
+        return None
+    r = code.find("reader = {", at)
+    if r < 0:
+        return None
+    return brace_block_after(code, r + len("reader = "))
+
+
+def _reaches_token(code, block, tokens):
+    """True when one of [tokens] is reachable from [block] — directly, or through
+    one same-file helper (the readers delegate the peek to `residentViewModel`,
+    so the criterion follows the delegation instead of pinning helper names)."""
+    if any(t in block for t in tokens):
+        return True
+    for m in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", block):
+        name = m.group(1)
+        body = extract_function(code, name)
+        if body and any(t in body for t in tokens):
+            return True
+    return False
+
+
+def _resident_arm(block):
+    """The text of the `… ResidentViewModel -> …` arm of a reader's `when`
+    (up to the next arm), or None when the reader has no such arm."""
+    at = block.find(SESSION_READ_ARM_MARKER)
+    if at < 0:
+        return None
+    rest = block[at + len(SESSION_READ_ARM_MARKER):]
+    nxt = rest.find(SESSION_READ_ARM_PREFIX)
+    return rest if nxt < 0 else rest[:nxt]
+
+
+def check_session_read_through(cfg_code):
+    """[dv25-A06] C19 — every `session.*` config READ answers from the live value.
+
+    `minis-config get session.thinkingLevel|primaryModel` used to read the Room
+    row only, while the writers (C18) push into the resident ChatViewModel. For
+    an open chat the two surfaces disagree until the next `loadSession()`, and
+    for a draft (no row at all) the read reported the empty default while the VM
+    held the value the write had just accepted.
+
+    Returns (c19 violations, fail-closed violations).
+    """
+    v19, vfc = [], []
+    for label, path_marker in SESSION_READ_FIELDS:
+        block = session_reader_block(cfg_code, path_marker)
+        if block is None:
+            vfc.append(
+                "%s: the %s reader block is not extractable (fail-closed) — the "
+                "criterion must be re-derived, not deleted"
+                % (CONFIG_BUILTINS_FILE, label))
+            continue
+        if not _reaches_token(cfg_code, block, VM_PEEK_TOKENS):
+            v19.append(
+                "%s: the %s reader never reaches the resident ChatViewModel through "
+                "the non-creating lookup — it reports the row value while the open "
+                "chat (and a draft's only copy) lives in the VM, so a read disagrees "
+                "with the write that just succeeded" % (CONFIG_BUILTINS_FILE, label))
+        if not _reaches_token(cfg_code, block, (SESSION_ROW_READ_TOKEN,)):
+            v19.append(
+                "%s: the %s reader dropped the row fallback — a session with no live "
+                "chat has only the row, so the read would answer the default instead "
+                "of the persisted value" % (CONFIG_BUILTINS_FILE, label))
+        arm = _resident_arm(block)
+        if arm is None:
+            v19.append(
+                "%s: the %s reader has no resident-VM arm (no `%s`) — without an "
+                "explicit precedence the VM half is either unreachable or applied "
+                "unconditionally" % (CONFIG_BUILTINS_FILE, label, SESSION_READ_ARM_MARKER))
+        elif not (".value" in arm or "!!." in arm or "(" in arm):
+            v19.append(
+                "%s: the %s reader's resident arm answers a CONSTANT ('%s') — peeking "
+                "and then ignoring the value is the row-only defect with extra steps"
+                % (CONFIG_BUILTINS_FILE, label, arm.strip()))
+    return v19, vfc
+
 def check_tree(root):
     """Returns (rc, detail dict). rc=0 all green."""
     detail = {"c1": [], "c2": [], "c3": [], "c4": [], "c5": [], "c6": [], "c7": [],
               "c8": [], "c9": [], "c10": [], "c11": [], "c12": [], "c13": [],
-              "c14": [], "c15": [], "c16": [], "c17": [], "c18": [],
+              "c14": [], "c15": [], "c16": [], "c17": [], "c18": [], "c19": [],
               "fail_closed": []}
 
     debug_paths = find_files(root, DEBUG_FILE)
@@ -1165,10 +1265,14 @@ def check_tree(root):
         v18, vfc18 = check_session_write_through(cfg18, store18)
         detail["c18"].extend(v18)
         detail["fail_closed"].extend(vfc18)
+        # ---- C19 ---- [dv25-A06] the same two fields on the READ side.
+        v19, vfc19 = check_session_read_through(cfg18)
+        detail["c19"].extend(v19)
+        detail["fail_closed"].extend(vfc19)
 
     rc = 0
     for k in ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11",
-              "c12", "c13", "c14", "c15", "c16", "c17", "c18", "fail_closed"):
+              "c12", "c13", "c14", "c15", "c16", "c17", "c18", "c19", "fail_closed"):
         if detail[k]:
             rc = 1
     return rc, detail
@@ -1573,6 +1677,27 @@ internal object ConfigBuiltins {
         r.register(
             ClosureField(
                 path = "session.thinkingLevel",
+                reader = {
+                    val sid = sessionIdProvider()
+                    if (sid == null) {
+                        "off"
+                    } else {
+                        val vm = residentViewModel(sid)
+                        val session = runBlocking { chatRepo.dao.getSession(sid) }
+                        when (
+                            thinkingLevelReadSource(
+                                hasLiveViewModel = vm != null,
+                                vmAdoptedRow = vm?.sessionLoaded?.value == true,
+                                hasPersistedRow = session != null,
+                            )
+                        ) {
+                            SessionConfigReadSource.ResidentViewModel ->
+                                vm!!.requestedThinkingLevel.value
+                            SessionConfigReadSource.PersistedRow -> session?.thinkingOverride ?: "off"
+                            SessionConfigReadSource.Absent -> "off"
+                        }
+                    }
+                },
                 writer = { v ->
                     val sid = sessionIdProvider()
                         ?: throw ConfigError.InvalidValue("No active session — open a chat first")
@@ -1587,6 +1712,26 @@ internal object ConfigBuiltins {
         r.register(
             ClosureField(
                 path = "session.primaryModel",
+                reader = {
+                    val sid = sessionIdProvider()
+                    if (sid == null) {
+                        ""
+                    } else {
+                        val vm = residentViewModel(sid)
+                        val session = runBlocking { chatRepo.dao.getSession(sid) }
+                        when (
+                            modelBindingReadSource(
+                                hasLiveViewModel = vm != null,
+                                hasPersistedRow = session != null,
+                            )
+                        ) {
+                            SessionConfigReadSource.ResidentViewModel ->
+                                residentBindingToken(vm!!)
+                            SessionConfigReadSource.PersistedRow -> formatBinding(session?.modelBinding)
+                            SessionConfigReadSource.Absent -> ""
+                        }
+                    }
+                },
                 writer = { v ->
                     val sid = sessionIdProvider()
                         ?: throw ConfigError.InvalidValue("No active session — open a chat first")
@@ -1606,6 +1751,16 @@ internal object ConfigBuiltins {
                 },
             )
         )
+    }
+
+    private fun residentViewModel(sid: String): ChatViewModel? {
+        return runBlocking { ChatViewModelStore.peekViewModel(sid) }
+    }
+
+    private fun residentBindingToken(vm: ChatViewModel): String {
+        val groupId = vm.selectedGroupId.value
+        if (!groupId.isNullOrEmpty()) return "group:$groupId"
+        return vm.activeEntryId.value?.let { "entry:$it" } ?: ""
     }
 
     private fun writeSessionConfig(
@@ -2449,6 +2604,59 @@ def run_selftest():
     results.append(("F55-session-baseline-tree-wiring-C18", ok, detail))
     shutil.rmtree(root)
 
+    # --- [dv25-A06] C19: the READ side of the same two fields -------------
+    def read_arm(label, cfg_text, want_key):
+        v19, vfc = check_session_read_through(cfg_text)
+        got = {"c19": v19, "fail_closed": vfc}
+        if want_key is None:
+            clean = not any(got.values())
+            results.append((label, clean, {} if clean else got))
+            return
+        ok = bool(got[want_key]) and not any(got[k] for k in got if k != want_key)
+        results.append((label, ok, got))
+
+    read_arm("F56-session-read-through-green-C19", GOOD_CONFIG_BUILTINS, None)
+
+    THINK_VM_DECOMP = """                        val vm = residentViewModel(sid)
+                        val session = runBlocking { chatRepo.dao.getSession(sid) }
+                        when (
+                            thinkingLevelReadSource("""
+    THINK_VM_NULL = """                        val vm: ChatViewModel? = null
+                        val session = runBlocking { chatRepo.dao.getSession(sid) }
+                        when (
+                            thinkingLevelReadSource("""
+    assert GOOD_CONFIG_BUILTINS.count(THINK_VM_DECOMP) == 1, "F57 anchor missing"
+    read_arm(
+        "F57-session-think-reader-row-only-C19",
+        GOOD_CONFIG_BUILTINS.replace(THINK_VM_DECOMP, THINK_VM_NULL), "c19")
+
+    THINK_ROW_READ = """                        val session = runBlocking { chatRepo.dao.getSession(sid) }
+                        when (
+                            thinkingLevelReadSource("""
+    THINK_NO_ROW = """                        val session: SessionRow? = null
+                        when (
+                            thinkingLevelReadSource("""
+    assert GOOD_CONFIG_BUILTINS.count(THINK_ROW_READ) == 1, "F58 anchor missing"
+    read_arm(
+        "F58-session-think-reader-no-row-fallback-C19",
+        GOOD_CONFIG_BUILTINS.replace(THINK_ROW_READ, THINK_NO_ROW), "c19")
+
+    BIND_ARM = """                            SessionConfigReadSource.ResidentViewModel ->
+                                residentBindingToken(vm!!)"""
+    BIND_ARM_CONST = '                            SessionConfigReadSource.ResidentViewModel -> ""'
+    assert GOOD_CONFIG_BUILTINS.count(BIND_ARM) == 1, "F59 anchor missing"
+    read_arm(
+        "F59-session-binding-reader-constant-arm-C19",
+        GOOD_CONFIG_BUILTINS.replace(BIND_ARM, BIND_ARM_CONST), "c19")
+
+    baseline_readers = (
+        GOOD_CONFIG_BUILTINS.replace(THINK_VM_DECOMP, THINK_VM_NULL)
+        .replace(BIND_ARM, BIND_ARM_CONST)
+    )
+    read_arm("F60-session-baseline-room-only-readers-C19", baseline_readers, "c19")
+
+    shutil.rmtree(root) if os.path.isdir(root) else None
+
     all_ok = True
     for name, ok, detail in results:
         print("%s %s" % ("PASS" if ok else "FAIL", name))
@@ -2481,10 +2689,11 @@ def main():
               "C12 context-limit canonical face, C13 entry-id check single-source, "
               "C14 instance key parity, C15 collection image keys, "
               "C16 group member predicate single-source, C17 no sentinel literal, "
-              "C18 session config write-through to the resident view model)")
+              "C18 session config write-through to the resident view model, "
+              "C19 session config read-through from the resident view model)")
         return 0
     for k in ("c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10", "c11",
-              "c12", "c13", "c14", "c15", "c16", "c17", "c18", "fail_closed"):
+              "c12", "c13", "c14", "c15", "c16", "c17", "c18", "c19", "fail_closed"):
         for line in detail[k]:
             print("[%s] %s" % (k.upper(), line))
     return 1
