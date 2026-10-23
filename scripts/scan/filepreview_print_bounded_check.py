@@ -30,6 +30,17 @@ spelling, so a refactor that keeps the contract is a deliberate edit to this
 gate rather than a silent pass. Bodies are located by brace-balanced anchor
 and FAIL CLOSED when the anchor is missing or duplicated.
 
+[deep-audit-1045 B-07] extended a third time — the same property on the two
+settings screens that import a USER-PICKED document. `ProviderListScreen`'s
+non-zip branch read the whole document into one String with no bound, and
+`SkillsManagementScreen.readUriBytes` did the same with `readBytes()`; the
+32 MiB guard further downstream (`SkillRepository.readZipEntries`) only bounds
+EXPANDED zip entries, so it could never help the raw array. Both now route
+through `readSafBytes` (SafImportRead.kt). The gate DERIVES its subject set
+from every `openInputStream(` under ui/** — a site is bounded when it streams,
+caps, or pre-checks the declared size, and everything else needs a registered
+exemption with a reason. A stale exemption is a rot failure, not a pass.
+
 Usage: python3 scripts/scan/filepreview_print_bounded_check.py [repo_root]
        python3 scripts/scan/filepreview_print_bounded_check.py --selftest
 Exit:  0 = clean, 1 = violation(s), 2 = usage
@@ -346,6 +357,485 @@ def check_log_share(root):
                 "started on the Main thread" % LOG_SCREEN_REL
             )
     return violations, rot, sites, notes
+
+
+# ── [deep-audit-1045 B-07] user-picked SAF documents ────────────────────────
+#
+# Third subject in the same family, one layer up from the file paths above: the
+# two settings screens read the picked document straight into the heap before
+# anything validated it.
+#
+#  * `ProviderListScreen`'s non-zip branch ran
+#    `openInputStream(uri)?.bufferedReader()?.use { it.readText() }` — no upper
+#    bound at all, while the `.zip` branch right beside it is capped by
+#    ProviderImportZip.
+#  * `SkillsManagementScreen.readUriBytes` ran a bare `use { it.readBytes() }`,
+#    and the only bound downstream (`SkillRepository.readZipEntries`,
+#    maxExpanded = 32 MiB) applies to EXPANDED entries — it cannot help the raw
+#    array that was already materialised upstream.
+#
+# A user-pickable multi-GB .json/.zip therefore reached OutOfMemoryError. Both
+# now route through `readSafBytes` (SafImportRead.kt): one cap per import kind,
+# a queried SIZE as a cheap early reject, and a hard stop one byte past the cap.
+#
+# The subject set is DERIVED, never listed: every `openInputStream(` under ui/**
+# is classified as bounded (streaming copy / cap helper / declared-size
+# precheck / capped extractor) or it needs an exemption WITH a reason, and an
+# exemption that no longer matches a real site is a rot failure — a stale
+# whitelist is exactly how the previous generation of these holes stayed green.
+
+SAF_UI_DIR = os.path.join(
+    "src", "android", "app", "src", "main", "java", "com", "rikkaminis", "app", "ui"
+)
+SAF_HELPER_REL = os.path.join(SAF_UI_DIR, "settings", "SafImportRead.kt")
+SAF_CONSUMERS = (
+    os.path.join(SAF_UI_DIR, "settings", "ProviderListScreen.kt"),
+    os.path.join(SAF_UI_DIR, "settings", "SkillsManagementScreen.kt"),
+)
+SAF_SITE = "openInputStream("
+SAF_HELPER_CALLS = ("readSafBytes(", "readAtMost(")
+SAF_READER_ANCHOR = "internal fun readAtMost(input: InputStream, cap: Long): ByteArray? {"
+SAF_ENTRY_ANCHOR = "internal fun readSafBytes(resolver: ContentResolver, uri: Uri, cap: Long): SafRead {"
+SAF_OVERFLOW_RE = re.compile(r">\s*cap\b")
+SAF_CAPPED_COPY_RE = re.compile(r"\w*Capped\s*\(")
+SAF_CAP_CONST_RE = re.compile(r"MAX_[A-Z0-9_]*BYTES")
+SAF_CAP_CMP_RE = re.compile(r">\s*[\w.]*MAX_[A-Z0-9_]*BYTES")
+SAF_DECLARED_SIZE_RE = re.compile(r"\.SIZE\b|OpenableColumns")
+SAF_WHOLE_READS = (".readBytes()", ".readText()", "bufferedReader(", ".readLines()")
+
+# Sites this batch deliberately does not touch (radius: FIX-11 owns the two
+# import screens). Key = (relative path, needle the site's own chain must
+# contain); an entry whose file ships but whose needle no longer matches is ROT.
+SAF_EXEMPTIONS = {
+    (os.path.join(SAF_UI_DIR, "chat", "ChatPromptAndTools.kt"),
+     "openInputStream(attachment.uri)?.use { it.readBytes()"):
+        "chat image attachment read with no cap — registered, not fixed (FIX-11 radius; "
+        "trigger = an OOM report on a multi-hundred-MB image share)",
+}
+
+
+def _saf_brace_blocks(text):
+    """[(open, close)] for every balanced `{…}` (comment-stripped text only)."""
+    pairs, stack = [], []
+    for i, c in enumerate(text):
+        if c == "{":
+            stack.append(i)
+        elif c == "}" and stack:
+            pairs.append((stack.pop(), i))
+    return pairs
+
+
+def _saf_snippet(text, idx):
+    """The site's own call chain: up to the end of its statement."""
+    depth, i, n = 0, idx, len(text)
+    while i < n:
+        c = text[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif c == "\n" and depth == 0:
+            break
+        i += 1
+    return text[idx:i]
+
+
+def _saf_classify(text, idx, blocks):
+    """(bounded?, reason, snippet) for one `openInputStream(` site.
+
+    Granularity is the site's own chain first, then the INNERMOST enclosing
+    block — an outer block is never consulted, because a helper called three
+    functions up has nothing to do with this read.
+    """
+    snippet = _saf_snippet(text, idx)
+    if "copyTo(" in snippet:
+        return True, "streaming copy", snippet
+    if any(call in snippet for call in SAF_HELPER_CALLS):
+        return True, "bounded helper", snippet
+    # Enclosing blocks, innermost first. The precheck may sit in an OUTER block
+    # (a `try { size check … }` around a `withContext(Dispatchers.IO) { read }`),
+    # so every level is consulted, not just the innermost one.
+    enclosing = sorted(
+        ((open_idx, close_idx) for open_idx, close_idx in blocks if open_idx < idx < close_idx),
+        key=lambda pair: -pair[0],
+    )
+    for open_idx, close_idx in enclosing:
+        block = text[open_idx:close_idx]
+        before = text[open_idx:idx]
+        if SAF_DECLARED_SIZE_RE.search(before) and SAF_CAP_CMP_RE.search(before):
+            return True, "declared-size precheck", snippet
+        if SAF_CAPPED_COPY_RE.search(block) and SAF_CAP_CONST_RE.search(block):
+            return True, "capped extractor", snippet
+        if any(call in block for call in SAF_HELPER_CALLS):
+            return True, "bounded helper", snippet
+    return False, "", snippet
+
+
+def _saf_short(rel):
+    return rel.split(os.sep + "rikkaminis" + os.sep)[-1]
+
+
+def check_saf_imports(root):
+    """(violations, rot, sites, notes) — criterion B-07."""
+    violations, rot, notes = [], [], []
+    sites = 0
+
+    helper = os.path.join(root, SAF_HELPER_REL)
+    if not os.path.isfile(helper):
+        # NOT an early return: the sweep below must still run, so the baseline
+        # tree reports the DEFECT (an unbounded read) and not only the missing
+        # helper. A gate that stops at the first missing file reports the
+        # symptom and hides the disease.
+        rot.append(
+            "%s is gone — the bounded SAF read has no implementation left"
+            % _saf_short(SAF_HELPER_REL)
+        )
+        helper_code = ""
+    else:
+        with open(helper, encoding="utf-8", errors="replace") as fh:
+            helper_code = strip_comments(fh.read())
+
+    reader = grab_body(helper_code, SAF_READER_ANCHOR)
+    sites += 1
+    if reader is None:
+        violations.append(
+            "%s: readAtMost(input, cap) must exist exactly once — it is the only thing "
+            "between a picked file and the heap" % _saf_short(SAF_HELPER_REL)
+        )
+    else:
+        if not SAF_OVERFLOW_RE.search(reader):
+            violations.append(
+                "%s: readAtMost never compares the byte count against its cap — an unbounded "
+                "read wearing a cap parameter" % _saf_short(SAF_HELPER_REL)
+            )
+        if "return null" not in reader:
+            violations.append(
+                "%s: readAtMost must report an overflow as null, not as a truncated array "
+                "(half a document would import silently)" % _saf_short(SAF_HELPER_REL)
+            )
+    entry = grab_body(helper_code, SAF_ENTRY_ANCHOR)
+    sites += 1
+    if entry is None:
+        violations.append(
+            "%s: readSafBytes(resolver, uri, cap) must exist exactly once — the two import "
+            "screens have to share ONE bounded entry point" % _saf_short(SAF_HELPER_REL)
+        )
+    else:
+        if "TooLarge" not in entry:
+            violations.append(
+                "%s: readSafBytes must map an over-cap pick to a TooLarge verdict — a read "
+                "failure and an over-cap pick are different user stories" % _saf_short(SAF_HELPER_REL)
+            )
+        if "readAtMost(" not in entry:
+            violations.append(
+                "%s: readSafBytes must read through readAtMost — the cap has to be enforced "
+                "on the stream, not on a provider-reported size" % _saf_short(SAF_HELPER_REL)
+            )
+    if not SAF_CAP_CONST_RE.search(helper_code):
+        violations.append(
+            "%s: the SAF caps must stay named MAX_*_BYTES constants (the reason has to "
+            "travel with the number)" % _saf_short(SAF_HELPER_REL)
+        )
+    if not SAF_DECLARED_SIZE_RE.search(helper_code):
+        violations.append(
+            "%s: the SAF read must query the provider's declared size — it is a cheap early "
+            "reject before the bytes are pulled" % _saf_short(SAF_HELPER_REL)
+        )
+
+    for rel in SAF_CONSUMERS:
+        path = os.path.join(root, rel)
+        short = _saf_short(rel)
+        if not os.path.isfile(path):
+            rot.append("%s is gone — the bounded-import criterion lost half its subject" % short)
+            continue
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            code = strip_comments(fh.read())
+        sites += 1
+        for needle in SAF_WHOLE_READS:
+            n = code.count(needle)
+            if n:
+                violations.append(
+                    "%s: %d whole-file read(s) (%s) — the picked document must go through "
+                    "readSafBytes, not into one array/String" % (short, n, needle)
+                )
+        n = code.count(SAF_SITE)
+        if n:
+            violations.append(
+                "%s: %d direct openInputStream( site(s) — the SAF read must route through "
+                "readSafBytes so there is one cap to audit" % (short, n)
+            )
+        if "readSafBytes(" not in code:
+            violations.append(
+                "%s: no readSafBytes( call — the bounded helper is not wired in" % short
+            )
+        if "TooLarge" not in code:
+            violations.append(
+                "%s: an over-cap pick must stay visible (no TooLarge verdict found) — reading "
+                "it as a read failure sends the user hunting for a corrupt file" % short
+            )
+        if not SAF_CAP_CONST_RE.search(code):
+            violations.append(
+                "%s: the import cap must be passed explicitly (no MAX_*_BYTES token)" % short
+            )
+
+    ui_root = os.path.join(root, SAF_UI_DIR)
+    if not os.path.isdir(ui_root):
+        rot.append("the ui/** tree is gone — the SAF sweep has nothing to look at")
+        return violations, rot, sites, notes
+
+    resolved = set()
+    present_files = set()
+    for base, _dirs, files in os.walk(ui_root):
+        for name in sorted(files):
+            if not name.endswith(".kt"):
+                continue
+            full = os.path.join(base, name)
+            rel = os.path.relpath(full, root)
+            present_files.add(rel)
+            with open(full, encoding="utf-8", errors="replace") as fh:
+                code = strip_comments(fh.read())
+            blocks = None
+            start = 0
+            while True:
+                idx = code.find(SAF_SITE, start)
+                if idx < 0:
+                    break
+                start = idx + 1
+                if blocks is None:
+                    blocks = _saf_brace_blocks(code)
+                sites += 1
+                bounded, reason, snippet = _saf_classify(code, idx, blocks)
+                if bounded:
+                    notes.append("[B-07 bounded] %s — %s" % (_saf_short(rel), reason))
+                    continue
+                hit = None
+                for key in SAF_EXEMPTIONS:
+                    if key[0] == rel and key[1] in snippet:
+                        hit = key
+                        break
+                if hit is not None:
+                    resolved.add(hit)
+                    notes.append("[B-07 exempt] %s — %s" % (_saf_short(rel), SAF_EXEMPTIONS[hit]))
+                    continue
+                line = code.count("\n", 0, idx) + 1
+                violations.append(
+                    "%s:%d openInputStream( reading the whole document with no bound — cap it "
+                    "or register an exemption with a reason" % (_saf_short(rel), line)
+                )
+
+    for rel, needle in SAF_EXEMPTIONS:
+        if (rel, needle) in resolved:
+            continue
+        if rel not in present_files:
+            notes.append(
+                "[B-07 skip] exemption for %s — this tree does not ship that file"
+                % _saf_short(rel)
+            )
+            continue
+        rot.append(
+            "%s: exemption %r no longer matches any site — a stale whitelist would silently "
+            "cover the next hole" % (_saf_short(rel), needle)
+        )
+    if sites == 0:
+        rot.append("no openInputStream( site found anywhere under ui/** — the sweep lost its subject")
+    return violations, rot, sites, notes
+
+
+# ── [deep-audit-1045 B-07] fixture: the SAF import decision, written out ────
+
+_SAF_HELPER = (
+    "package com.rikkaminis.app.ui.settings\n"
+    "\n"
+    "import android.content.ContentResolver\n"
+    "import android.net.Uri\n"
+    "import android.provider.OpenableColumns\n"
+    "import java.io.InputStream\n"
+    "\n"
+    "internal const val MAX_SKILL_IMPORT_BYTES = 32L * 1024 * 1024\n"
+    "internal const val MAX_PROVIDER_JSON_BYTES = 16L * 1024 * 1024\n"
+    "\n"
+    "internal sealed class SafRead {\n"
+    "    class Ok(val bytes: ByteArray) : SafRead()\n"
+    "    object TooLarge : SafRead()\n"
+    "    object Failed : SafRead()\n"
+    "}\n"
+    "\n"
+    "internal fun readAtMost(input: InputStream, cap: Long): ByteArray? {\n"
+    "    var total = 0L\n"
+    "    while (total <= cap) {\n"
+    "        val room = cap - total + 1L\n"
+    "        if (room <= 0L) return null\n"
+    "        val n = input.read(ByteArray(8 * 1024))\n"
+    "        if (n <= 0) return ByteArray(0)\n"
+    "        total += n.toLong()\n"
+    "        if (total > cap) return null\n"
+    "    }\n"
+    "    return null\n"
+    "}\n"
+    "\n"
+    "internal fun readSafBytes(resolver: ContentResolver, uri: Uri, cap: Long): SafRead {\n"
+    "    val declared = resolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)\n"
+    "    val stream = resolver.openInputStream(uri)\n"
+    "    return stream.use { input ->\n"
+    "        val bytes = readAtMost(input, cap)\n"
+    "        if (bytes == null) SafRead.TooLarge else SafRead.Ok(bytes)\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "internal fun safTooLargeText(capBytes: Long): String = \"too large: $capBytes\"\n"
+)
+
+_SAF_HELPER_NOCAP = _SAF_HELPER.replace("        if (total > cap) return null\n", "")
+
+_SAF_PROVIDER_FIXED = (
+    "package com.rikkaminis.app.ui.settings\n"
+    "\n"
+    "fun importProviderJson(resolver: ContentResolver, uri: Uri) {\n"
+    "    val read = readSafBytes(resolver, uri, MAX_PROVIDER_JSON_BYTES)\n"
+    "    if (read !is SafRead.Ok) {\n"
+    "        val msg = if (read is SafRead.TooLarge) safTooLargeText(MAX_PROVIDER_JSON_BYTES) else \"r\"\n"
+    "        return\n"
+    "    }\n"
+    "    val jsonStr = String(read.bytes, Charsets.UTF_8)\n"
+    "}\n"
+)
+
+_SAF_PROVIDER_READTEXT = _SAF_PROVIDER_FIXED.replace(
+    "    val read = readSafBytes(resolver, uri, MAX_PROVIDER_JSON_BYTES)\n"
+    "    if (read !is SafRead.Ok) {\n"
+    "        val msg = if (read is SafRead.TooLarge) safTooLargeText(MAX_PROVIDER_JSON_BYTES) else \"r\"\n"
+    "        return\n"
+    "    }\n",
+    "    val jsonStr = resolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }\n",
+)
+
+_SAF_PROVIDER_SWALLOWED = _SAF_PROVIDER_FIXED.replace(
+    "        val msg = if (read is SafRead.TooLarge) safTooLargeText(MAX_PROVIDER_JSON_BYTES) else \"r\"\n",
+    "        val msg = \"r\"\n",
+)
+
+_SAF_SKILLS_FIXED = (
+    "package com.rikkaminis.app.ui.settings\n"
+    "\n"
+    "fun importSkillFile(resolver: ContentResolver, uri: Uri) {\n"
+    "    val read = readSafBytes(resolver, uri, MAX_SKILL_IMPORT_BYTES)\n"
+    "    val bytes = (read as? SafRead.Ok)?.bytes\n"
+    "    if (bytes == null) {\n"
+    "        val msg = if (read is SafRead.TooLarge) safTooLargeText(MAX_SKILL_IMPORT_BYTES) else \"f\"\n"
+    "    }\n"
+    "}\n"
+)
+
+_SAF_SKILLS_BASELINE = (
+    "package com.rikkaminis.app.ui.settings\n"
+    "\n"
+    "fun importSkillFile(resolver: ContentResolver, uri: Uri) {\n"
+    "    val bytes = resolver.openInputStream(uri)?.use { it.readBytes() }\n"
+    "}\n"
+)
+
+# The chat file carries BOTH a bounded streaming site and the one registered
+# exemption, so the compliant fixture exercises the exemption path too.
+_SAF_CHAT_BOTH = (
+    "package com.rikkaminis.app.ui.chat\n"
+    "\n"
+    "fun upload(resolver: ContentResolver, uri: Uri, dest: File) {\n"
+    "    resolver.openInputStream(uri)?.use { input ->\n"
+    "        dest.outputStream().use { output -> input.copyTo(output) }\n"
+    "    }\n"
+    "}\n"
+    "\n"
+    "fun preview(resolver: ContentResolver, uri: Uri) {\n"
+    "    val all = resolver.openInputStream(attachment.uri)?.use { it.readBytes() }\n"
+    "}\n"
+)
+
+# The exemption's site is gone — the whitelist now covers nothing and must be
+# reported instead of silently rotting.
+_SAF_CHAT_NO_EXEMPT = (
+    "package com.rikkaminis.app.ui.chat\n"
+    "\n"
+    "fun upload(resolver: ContentResolver, uri: Uri, dest: File) {\n"
+    "    resolver.openInputStream(uri)?.use { input ->\n"
+    "        dest.outputStream().use { output -> input.copyTo(output) }\n"
+    "    }\n"
+    "}\n"
+)
+
+# A NEW unbounded site in a file nobody registered — the sweep must catch it.
+_SAF_CHAT_EXTRA = _SAF_CHAT_BOTH + (
+    "\n"
+    "fun sneaky(resolver: ContentResolver, uri: Uri) {\n"
+    "    val all = resolver.openInputStream(uri)?.use { it.readBytes() }\n"
+    "}\n"
+)
+
+
+def _saf_fixture(shape="fixed"):
+    """A minimal ui/** tree carrying one shape per B-07 criterion."""
+    root = tempfile.mkdtemp(prefix="safimport_")
+
+    helper = _SAF_HELPER
+    provider = _SAF_PROVIDER_FIXED
+    skills = _SAF_SKILLS_FIXED
+    chat_src = _SAF_CHAT_BOTH
+
+    if shape == "no_helper":
+        helper = None
+    elif shape == "helper_nocap":
+        helper = _SAF_HELPER_NOCAP
+    elif shape == "readtext":
+        provider = _SAF_PROVIDER_READTEXT
+    elif shape == "skills_baseline":
+        skills = _SAF_SKILLS_BASELINE
+    elif shape == "too_large_swallowed":
+        provider = _SAF_PROVIDER_SWALLOWED
+    elif shape == "sweep_extra_unregistered":
+        chat_src = _SAF_CHAT_EXTRA
+    elif shape == "sweep_stale_exemption":
+        chat_src = _SAF_CHAT_NO_EXEMPT
+    elif shape != "fixed":
+        raise SystemExit("unknown SAF fixture shape %r" % shape)
+
+    if helper is not None:
+        _write(root, SAF_HELPER_REL, helper)
+    _write(root, SAF_CONSUMERS[0], provider)
+    _write(root, SAF_CONSUMERS[1], skills)
+    _write(root, os.path.join(SAF_UI_DIR, "chat", "ChatPromptAndTools.kt"), chat_src)
+    return root
+
+
+def selftest_saf_imports():
+    """One dirty arm per B-07 criterion; each must turn the criterion red."""
+    failures = []
+
+    def arm(name, expect, shape="fixed"):
+        root = _saf_fixture(shape)
+        v, r, sites, _notes = check_saf_imports(root)
+        blob = v + r
+        if expect is None:
+            if blob:
+                failures.append("SAF %s must be clean, got %s" % (name, blob))
+            else:
+                print("[ok] SAF %s -> clean (%d site(s))" % (name, sites))
+        elif not any(expect in item for item in blob):
+            failures.append("SAF %s did not trip %r (got %s)" % (name, expect, blob))
+        else:
+            print("[ok] SAF %s is caught -> %s" % (name, expect))
+        shutil.rmtree(root, ignore_errors=True)
+
+    arm("compliant tree", None)
+    arm("baseline readText restored", "whole-file read", shape="readtext")
+    arm("baseline bare reader", "no readSafBytes( call", shape="skills_baseline")
+    arm("helper without a cap", "never compares the byte count against its cap",
+        shape="helper_nocap")
+    arm("helper gone (fail-closed)", "no implementation left", shape="no_helper")
+    arm("over-cap verdict swallowed", "must stay visible", shape="too_large_swallowed")
+    arm("unregistered unbounded site", "with no bound", shape="sweep_extra_unregistered")
+    arm("stale exemption", "no longer matches any site", shape="sweep_stale_exemption")
+    return failures
 
 
 # ── [deep-audit-1041 B-07] fixture: the log-share decision, written out ─────
@@ -698,6 +1188,8 @@ def selftest():
 
     # [deep-audit-1041 B-07] the second target's arms.
     failures.append("B-07 arms misbehaved" if selftest_log_share() else None)
+    # [deep-audit-1045 B-07] the third target's arms (user-picked SAF documents).
+    failures.extend(selftest_saf_imports())
     failures = [f for f in failures if f]
 
     if failures:
@@ -738,6 +1230,21 @@ def run(root):
     if not (lv or lrot):
         print("PASS %s: log share bounded and prepared off the caller's thread (%d decision(s) checked)"
               % (LOG_SCREEN_REL, lsites))
+    # [deep-audit-1045 B-07] third target, same family: the picked SAF document.
+    sv, srot, ssites, snotes = check_saf_imports(root)
+    for n in snotes:
+        print("  %s" % n)
+    if srot:
+        for r in srot:
+            print("ROT %s" % r)
+        rc = 1
+    if sv:
+        for item in sv:
+            print("FAIL %s" % item)
+        rc = 1
+    if not (sv or srot):
+        print("PASS %s: picked SAF documents are read through the bounded helper (%d decision(s) checked)"
+              % (_saf_short(SAF_HELPER_REL), ssites))
     return rc
 
 
