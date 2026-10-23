@@ -53,6 +53,26 @@ SYSTEM_SPEECH_REL = os.path.join(
     MAIN_ROOT, "com", "rikkaminis", "app", "speech", "SystemSpeechRecognitionEngine.kt"
 )
 
+# [dv26/G10] Quick Test clip synthesis (deep-audit-1046 S-10). The TTS card's
+# `synthesizeTestClip` is the third engine user in this subsystem; it had the
+# cancellation hole the other two don't (a late engine-init callback wrote the
+# clip back after the coroutine had already been cancelled and the file deleted).
+QUICK_TEST_REL = os.path.join(
+    MAIN_ROOT, "com", "rikkaminis", "app", "ui", "components", "QuickTestSheet.kt"
+)
+CLIP_SIG = "fun synthesizeTestClip("
+CLIP_FALLBACK_RE = re.compile(
+    r"val\s+(\w+)\s*=\s*(?:java\.io\.)?File\(\s*\w+\.cacheDir"
+)
+# Statements that touch the engine. WRITE ones put bytes on disk; SETUP ones
+# configure the engine and therefore open a window in which a cancellation can
+# arrive before the write.
+TOUCH_SETUP_RE = re.compile(r"\?\s*\.\s*language\s*=|\?\s*\.\s*setOn\w+\s*\(")
+TOUCH_WRITE_RE = re.compile(
+    r"\.\s*(?:synthesizeToFile|writeText|writeBytes|appendText|createNewFile|copyTo|renameTo)\s*\("
+)
+CANCEL_READ_RE = re.compile(r"([A-Za-z_]\w*)\s*(?:\?\.|\.)\s*(?:is[A-Z]\w*|get)\b")
+
 # Explicit exemption marker for rule B (rare callers that must voice raw text).
 SANITIZER_EXEMPT_RE = re.compile(r"tts-sanitizer-exempt:\s*\S.*")
 
@@ -126,6 +146,306 @@ def strip_comments(src):
             out.append(src[i])
             i += 1
     return "".join(out)
+
+
+# ── [dv26/G10] Quick Test clip: cancellation latch ─────────────────────────
+def mask_strings(src):
+    """Blank string/char literal bodies, preserving offsets and newlines.
+
+    Brace matching must not read `"quicktest-clip-${System.currentTimeMillis()}.wav"`
+    as structure; template bodies are blanked too (their braces are what would
+    otherwise shift the depth).
+    """
+    out = list(src)
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == '"':
+            triple = src.startswith('"""', i)
+            quote = '"""' if triple else '"'
+            i += len(quote)
+            while i < n:
+                if not triple and src[i] == "\\":
+                    out[i] = " "
+                    if i + 1 < n:
+                        out[i + 1] = " "
+                    i += 2
+                    continue
+                if src.startswith(quote, i):
+                    i += len(quote)
+                    break
+                if src[i] != "\n":
+                    out[i] = " "
+                i += 1
+        elif c == "'":
+            j = i + 1
+            closed = False
+            while j < n and j < i + 6:
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == "'":
+                    closed = True
+                    break
+                j += 1
+            if not closed:
+                i += 1
+                continue
+            for k in range(i + 1, j):
+                out[k] = " "
+            i = j + 1
+        else:
+            i += 1
+    return "".join(out)
+
+
+def brace_map(src):
+    """open index -> close index for balanced braces (strings already masked)."""
+    pairs, stack = {}, []
+    for i, ch in enumerate(src):
+        if ch == "{":
+            stack.append(i)
+        elif ch == "}" and stack:
+            pairs[stack.pop()] = i
+    return pairs
+
+
+def enclosing_blocks(pairs, pos):
+    """Blocks containing `pos`, innermost first."""
+    spans = [(o, c) for o, c in pairs.items() if o < pos < c]
+    spans.sort(key=lambda s: s[1] - s[0])
+    return spans
+
+
+def matching_paren(src, open_idx):
+    depth = 0
+    for i in range(open_idx, len(src)):
+        if src[i] == "(":
+            depth += 1
+        elif src[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def statement_end(src, pos, pairs):
+    """End index of the statement starting at `pos` (brace/ paren aware)."""
+    i = pos
+    n = len(src)
+    while i < n:
+        ch = src[i]
+        if ch == "(":
+            j = matching_paren(src, i)
+            if j < 0:
+                return n
+            i = j + 1
+            continue
+        if ch == "{":
+            j = pairs.get(i)
+            if j is None:
+                return n
+            i = j + 1
+            continue
+        if ch == "\n" or ch == ";":
+            return i
+        i += 1
+    return n
+
+
+def guard_before(code, pairs, pos, cancel_idents, scope):
+    """Nearest cancellation guard that dominates `pos`, or None.
+
+    A guard = `if (<reads a cancellation flag>) { … return … }` (or the
+    single-statement form) *inside a block that also contains `pos`* — a guard
+    parked inside a sibling callback (e.g. the utterance listener's `onStart`)
+    does not dominate the call it looks like it guards.
+    The flag read is derived, not spelled: the receiver must be an identifier the
+    cancellation path itself mentions, or the coroutine's own `cont`.
+    """
+    for b_open, b_close in enclosing_blocks(pairs, pos):
+        if b_open < scope[0] or b_close > scope[1]:
+            continue
+        best = None
+        for m in re.finditer(r"\bif\s*\(", code):
+            if m.start() <= b_open or m.start() >= pos:
+                continue
+            p_open = m.end() - 1
+            p_close = matching_paren(code, p_open)
+            if p_close < 0 or p_close >= pos:
+                continue
+            cond = code[p_open + 1 : p_close]
+            if not is_cancel_read(cond, cancel_idents):
+                continue
+            body_end = statement_end(code, p_close + 1, pairs)
+            if body_end > pos:
+                continue
+            body = code[p_close + 1 : body_end]
+            if not re.search(r"\breturn\b", body):
+                continue
+            # the guard's own innermost block must also contain pos
+            guards_blocks = enclosing_blocks(pairs, m.start())
+            if guards_blocks and guards_blocks[0][1] < pos:
+                continue
+            best = (m.start(), body_end)
+        if best is not None:
+            return best
+    return None
+
+
+def is_cancel_read(cond, cancel_idents):
+    for m in CANCEL_READ_RE.finditer(cond):
+        if m.group(1) in cancel_idents or m.group(1) == "cont":
+            return True
+    return False
+
+
+def check_quick_test_clip(src):
+    """[dv26/G10] The Quick Test clip must not outlive its caller.
+
+    C1 (*guard*) — inside the `suspendCancellableCoroutine` block, every engine
+    SETUP statement (`language =`, `setOn…Listener(`) needs a cancellation guard
+    before it, and every WRITE (`synthesizeToFile(`, file writes) needs a guard
+    that is *after the last setup statement* — the init callback and the write are
+    separated by the setup work, and that window was the defect: a cancellation
+    landing in it reached the write unharmed.
+    C2 (*cancel*) — `invokeOnCancellation` must exist inside the block, shut the
+    engine down, and re-delete the clip (the engine can have finished the write
+    between dispatch and cancellation).
+    C3 (*cleanup*) — the `finally` must still delete the clip, and the block that
+    hands the result back (`resumeWith`) must drop the file when it ran after a
+    cancellation (that is the late-write path: no caller will ever read it).
+    """
+    failures = []
+    code = mask_strings(strip_comments(src))
+    body = function_body(code, CLIP_SIG)
+    if body is None:
+        return [
+            "%s: [tts-clip-guard] %s not found — re-derive this criterion instead "
+            "of deleting it (the clip's cancellation latch is what keeps a late "
+            "engine callback from writing an orphan WAV into cacheDir)"
+            % (QUICK_TEST_REL, CLIP_SIG.strip())
+        ]
+
+    m = CLIP_FALLBACK_RE.search(body)
+    clip_var = m.group(1) if m else None
+
+    coro = re.search(r"suspendCancellableCoroutine\s*\{\s*(\w+)\s*->", code)
+    span = None
+    if coro is not None:
+        pairs_all = brace_map(code)
+        open_curly = code.find("{", coro.start())
+        close_curly = pairs_all.get(open_curly)
+        if close_curly is not None:
+            span = (open_curly, close_curly)
+    if span is None:
+        return [
+            "%s: [tts-clip-guard] no `suspendCancellableCoroutine { cont -> … }` "
+            "block in synthesizeTestClip — re-derive" % QUICK_TEST_REL
+        ]
+
+    block = code[span[0] : span[1] + 1]
+    pairs = brace_map(block)
+
+    # identifiers the cancellation path itself mentions ⇒ candidate flags
+    cancel_body = ""
+    cancel_span = None
+    inv = re.search(r"invokeOnCancellation\s*\{", block)
+    if inv is not None:
+        o = block.find("{", inv.start())
+        c = pairs.get(o)
+        if c is not None:
+            cancel_span = (o, c)
+            cancel_body = block[o : c + 1]
+    cancel_idents = set(re.findall(r"[A-Za-z_]\w*", cancel_body)) if cancel_body else set()
+
+    def fail(tag, msg):
+        failures.append("%s: [%s] %s" % (QUICK_TEST_REL, tag, msg))
+
+    # ── C1: guard dominates every engine statement ──
+    touches = []
+    for rex, kind in ((TOUCH_SETUP_RE, "setup"), (TOUCH_WRITE_RE, "write")):
+        for t in rex.finditer(block):
+            touches.append((t.start(), kind, t.group(0).strip()))
+    touches.sort()
+    for pos, kind, what in touches:
+        g = guard_before(block, pairs, pos, cancel_idents, (0, len(block) - 1))
+        if g is None:
+            fail(
+                "tts-clip-guard",
+                "`%s` runs without a cancellation guard before it — a callback "
+                "that lands after the 15 s timeout / sheet dismissal must return "
+                "before touching the engine" % what,
+            )
+            continue
+        if kind == "write":
+            between = block[g[1] : pos]
+            setup = TOUCH_SETUP_RE.search(between)
+            if setup is not None:
+                fail(
+                    "tts-clip-guard",
+                    "`%s` is guarded only across the engine setup "
+                    "(`%s`) — the window between the init callback and the write "
+                    "must be re-checked, else a cancellation landing in it still "
+                    "writes the clip" % (what, setup.group(0).strip()),
+                )
+
+    # ── C2: the cancel path shuts the engine down AND re-deletes the clip ──
+    if cancel_span is None:
+        fail(
+            "tts-clip-cancel",
+            "no `invokeOnCancellation { … }` in the coroutine block — the engine "
+            "leaks and the clip survives cancellation",
+        )
+    else:
+        if "shutdown" not in cancel_body:
+            fail("tts-clip-cancel", "`invokeOnCancellation` must shut the engine down")
+        if clip_var is None or ("%s.delete()" % clip_var) not in cancel_body.replace(" ", ""):
+            fail(
+                "tts-clip-cancel",
+                "`invokeOnCancellation` must re-delete the clip: the engine can "
+                "have finished the write between the dispatch and this cancellation",
+            )
+
+    # ── C3: exit-path cleanup + late-callback cleanup ──
+    fin = re.search(r"\bfinally\s*\{", body)
+    fib = None
+    if fin is not None:
+        fib = function_body(body[fin.start() :], "finally {")
+    if fib is None or clip_var is None or ("%s.delete()" % clip_var) not in fib.replace(" ", ""):
+        fail(
+            "tts-clip-cleanup",
+            "the `finally` block must still delete the clip variable — the "
+            "success path reads it and nothing else cleans cacheDir",
+        )
+    resume = block.find("resumeWith(")
+    if resume < 0:
+        fail("tts-clip-cleanup", "no `resumeWith(` in the coroutine block — re-derive")
+    else:
+        host = enclosing_blocks(pairs, resume)
+        host_span = host[0] if host else (0, len(block) - 1)
+        guarded_delete = False
+        for m2 in re.finditer(r"\bif\s*\(", block[host_span[0] : host_span[1] + 1]):
+            base = host_span[0]
+            p_open = base + m2.end() - 1
+            p_close = matching_paren(block, p_open)
+            if p_close < 0:
+                continue
+            if not is_cancel_read(block[p_open + 1 : p_close], cancel_idents):
+                continue
+            tail = block[p_close + 1 : p_close + 200].replace(" ", "")
+            if clip_var is not None and ("%s.delete()" % clip_var) in tail:
+                guarded_delete = True
+                break
+        if not guarded_delete:
+            fail(
+                "tts-clip-cleanup",
+                "the block that hands the result back must drop the clip when it "
+                "ran after a cancellation — a late onDone/onError leaves the "
+                "orphan WAV in cacheDir",
+            )
+
+    return failures
 
 
 def split_top_level(text, sep):
@@ -491,11 +811,154 @@ def run(root, verbose=True):
     else:
         failures.extend(check_error_table(system_speech))
 
+    # ── [dv26/G10] the Quick Test clip's cancellation latch ──
+    quick_test = read(root, QUICK_TEST_REL)
+    if quick_test is None:
+        failures.append(
+            "%s: [tts-files] QuickTestSheet.kt not found" % QUICK_TEST_REL
+        )
+    else:
+        failures.extend(check_quick_test_clip(quick_test))
+
     if verbose:
         for line in failures:
             print(line)
     return failures
 
+
+
+# ── [dv26/G10] Quick Test clip fixtures ─────────────────────────────────────
+COMPLIANT_QUICK = '''
+private suspend fun synthesizeTestClip(context: Context, text: String): ByteArray? {
+    val file = java.io.File(context.cacheDir, "quicktest-clip-${System.currentTimeMillis()}.wav")
+    val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+    return try {
+        kotlinx.coroutines.withTimeoutOrNull(15_000) {
+            kotlinx.coroutines.suspendCancellableCoroutine { cont ->
+                var tts: TextToSpeech? = null
+                fun finish(ok: Boolean) {
+                    runCatching { tts?.shutdown() }
+                    if (SynthClipPolicy.mustDropOnCallback(cancelled.get())) runCatching { file.delete() }
+                    if (cont.isActive) cont.resumeWith(Result.success(ok))
+                }
+                tts = TextToSpeech(context) { status ->
+                    if (!SynthClipPolicy.mayTouchEngine(cancelled.get())) {
+                        runCatching { tts?.shutdown() }
+                        return@TextToSpeech
+                    }
+                    if (status != TextToSpeech.SUCCESS) {
+                        finish(false)
+                        return@TextToSpeech
+                    }
+                    tts?.language = java.util.Locale.US
+                    tts?.setOnUtteranceProgressListener(listener)
+                    if (!SynthClipPolicy.maySynthesize(cancelled.get())) {
+                        runCatching { tts?.shutdown() }
+                        return@TextToSpeech
+                    }
+                    val result = tts?.synthesizeToFile(text, android.os.Bundle(), file, "quicktest-clip")
+                    if (result != TextToSpeech.SUCCESS) finish(false)
+                }
+                cont.invokeOnCancellation {
+                    cancelled.set(true)
+                    runCatching { tts?.shutdown() }
+                    runCatching { file.delete() }
+                }
+            }
+        }?.takeIf { it }?.let { file.readBytes() }
+    } catch (e: Exception) {
+        null
+    } finally {
+        runCatching { file.delete() }
+    }
+}
+'''
+
+# The defect: no cancellation latch at all — the late init callback wrote the
+# clip after `finally` had already deleted it.
+PRE_FIX_QUICK = '''
+private suspend fun synthesizeTestClip(context: Context, text: String): ByteArray? {
+    val file = java.io.File(context.cacheDir, "quicktest-clip-${System.currentTimeMillis()}.wav")
+    return try {
+        kotlinx.coroutines.withTimeoutOrNull(15_000) {
+            kotlinx.coroutines.suspendCancellableCoroutine { cont ->
+                var tts: TextToSpeech? = null
+                fun finish(ok: Boolean) {
+                    runCatching { tts?.shutdown() }
+                    if (cont.isActive) cont.resumeWith(Result.success(ok))
+                }
+                tts = TextToSpeech(context) { status ->
+                    if (status != TextToSpeech.SUCCESS) {
+                        finish(false)
+                        return@TextToSpeech
+                    }
+                    tts?.language = java.util.Locale.US
+                    tts?.setOnUtteranceProgressListener(listener)
+                    val result = tts?.synthesizeToFile(text, android.os.Bundle(), file, "quicktest-clip")
+                    if (result != TextToSpeech.SUCCESS) finish(false)
+                }
+                cont.invokeOnCancellation { runCatching { tts?.shutdown() } }
+            }
+        }?.takeIf { it }?.let { file.readBytes() }
+    } catch (e: Exception) {
+        null
+    } finally {
+        runCatching { file.delete() }
+    }
+}
+'''
+
+INIT_GUARD = """                    if (!SynthClipPolicy.mayTouchEngine(cancelled.get())) {
+                        runCatching { tts?.shutdown() }
+                        return@TextToSpeech
+                    }
+"""
+
+SYNTH_GUARD = """                    if (!SynthClipPolicy.maySynthesize(cancelled.get())) {
+                        runCatching { tts?.shutdown() }
+                        return@TextToSpeech
+                    }
+"""
+
+LATE_DROP = "                    if (SynthClipPolicy.mustDropOnCallback(cancelled.get())) runCatching { file.delete() }\n"
+
+CANCEL_DROP = """                    runCatching { file.delete() }
+                }
+"""
+
+
+def _mut(rel, old, new, count=1):
+    got = rel.count(old)
+    if got != count:
+        raise AssertionError("fixture anchor hit %d times, expected %d: %r" % (got, count, old[:60]))
+    return rel.replace(old, new, count)
+
+
+# m1: the init callback lost its entry guard (late callback touches the engine)
+MUT_NO_INIT_GUARD_QUICK = _mut(COMPLIANT_QUICK, INIT_GUARD, "")
+# m2: only the init guard left — the window between setup and the write is open
+MUT_NO_SYNTH_GUARD_QUICK = _mut(COMPLIANT_QUICK, SYNTH_GUARD, "")
+# m3: the guard moved AFTER synthesizeToFile (looks guarded, guards nothing)
+MUT_GUARD_AFTER_SYNTH_QUICK = _mut(
+    _mut(COMPLIANT_QUICK, INIT_GUARD, ""),
+    '                    val result = tts?.synthesizeToFile(text, android.os.Bundle(), file, "quicktest-clip")\n',
+    '                    val result = tts?.synthesizeToFile(text, android.os.Bundle(), file, "quicktest-clip")\n'
+    + INIT_GUARD,
+)
+# m4: cancel path keeps shutdown but dropped the re-delete
+MUT_CANCEL_NO_DROP_QUICK = _mut(COMPLIANT_QUICK, CANCEL_DROP, "                }\n")
+# m5: the late callback no longer drops the clip it just wrote
+MUT_NO_LATE_DROP_QUICK = _mut(COMPLIANT_QUICK, LATE_DROP, "")
+# m6: exit-path cleanup removed (success path leaves the clip behind)
+MUT_NO_FINALLY_DROP_QUICK = _mut(
+    COMPLIANT_QUICK,
+    """    } finally {
+        runCatching { file.delete() }
+    }
+""",
+    """    }
+""",
+)
 
 # ── selftest ────────────────────────────────────────────────────────────────
 
@@ -844,18 +1307,87 @@ def selftest():
             COMPLIANT_SYSTEM,
             {"tts-defaults"},
         ),
+        # ── S-10 / G10: the Quick Test clip's cancellation latch (one arm per
+        #    decision point, plus the pre-fix shape as the PRE arm) ──
+        (
+            "clip: pre-fix shape (no latch — late init callback writes an orphan WAV)",
+            COMPLIANT_MANAGER,
+            COMPLIANT_HANDLER,
+            COMPLIANT_SYSTEM,
+            {"tts-clip-guard", "tts-clip-cancel", "tts-clip-cleanup"},
+            PRE_FIX_QUICK,
+        ),
+        (
+            "clip: compliant latch",
+            COMPLIANT_MANAGER,
+            COMPLIANT_HANDLER,
+            COMPLIANT_SYSTEM,
+            set(),
+            COMPLIANT_QUICK,
+        ),
+        (
+            "clip: init callback lost its entry guard",
+            COMPLIANT_MANAGER,
+            COMPLIANT_HANDLER,
+            COMPLIANT_SYSTEM,
+            {"tts-clip-guard"},
+            MUT_NO_INIT_GUARD_QUICK,
+        ),
+        (
+            "clip: setup→write window no longer re-checked",
+            COMPLIANT_MANAGER,
+            COMPLIANT_HANDLER,
+            COMPLIANT_SYSTEM,
+            {"tts-clip-guard"},
+            MUT_NO_SYNTH_GUARD_QUICK,
+        ),
+        (
+            "clip: guard parked after synthesizeToFile",
+            COMPLIANT_MANAGER,
+            COMPLIANT_HANDLER,
+            COMPLIANT_SYSTEM,
+            {"tts-clip-guard"},
+            MUT_GUARD_AFTER_SYNTH_QUICK,
+        ),
+        (
+            "clip: cancel path dropped the re-delete",
+            COMPLIANT_MANAGER,
+            COMPLIANT_HANDLER,
+            COMPLIANT_SYSTEM,
+            {"tts-clip-cancel"},
+            MUT_CANCEL_NO_DROP_QUICK,
+        ),
+        (
+            "clip: late callback no longer drops the clip",
+            COMPLIANT_MANAGER,
+            COMPLIANT_HANDLER,
+            COMPLIANT_SYSTEM,
+            {"tts-clip-cleanup"},
+            MUT_NO_LATE_DROP_QUICK,
+        ),
+        (
+            "clip: exit-path cleanup removed",
+            COMPLIANT_MANAGER,
+            COMPLIANT_HANDLER,
+            COMPLIANT_SYSTEM,
+            {"tts-clip-cleanup"},
+            MUT_NO_FINALLY_DROP_QUICK,
+        ),
     ]
     ok = True
-    for label, manager, handler, system, expected in cases:
+    for case in cases:
+        label, manager, handler, system, expected = case[:5]
+        quick = case[5] if len(case) > 5 else COMPLIANT_QUICK
         root = tempfile.mkdtemp(prefix="ttsgate-")
         try:
             write_fixture(root, MANAGER_REL, manager)
             write_fixture(root, HANDLER_REL, handler)
             write_fixture(root, SYSTEM_SPEECH_REL, system)
+            write_fixture(root, QUICK_TEST_REL, quick)
             failures = run(root, verbose=False)
             got = set()
             for f in failures:
-                m = re.search(r"\[(tts-[a-z]+)\]", f)
+                m = re.search(r"\[(tts-[a-z-]+)\]", f)
                 if m:
                     got.add(m.group(1))
             else:
