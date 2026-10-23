@@ -8,10 +8,10 @@
 > 由 `skills/dev-history-sync/scripts/build_sagas.py` 从档案自动生成，可重复执行。
 
 - 覆盖范围：2026-08-03 ～ 2026-10-23，共 82 天
-- 条目总数：2182（源文件：rikkaminis-dev-history.md）
+- 条目总数：2192（源文件：rikkaminis-dev-history.md）
 - 主题数：24
-- 未归入任何主题：196 条（8%，列在文末）
-- 归入 ≥4 个主题（说明规则偏松）：157 条
+- 未归入任何主题：198 条（9%，列在文末）
+- 归入 ≥4 个主题（说明规则偏松）：159 条
 - 标 `↳` 的条目是**推断归属**：标题里没有主题词（「X 完成 / X 收尾」这类收尾条目，主题词在**上一条**里），由「12 小时内最近一条有主题的条目」继承而来，共 140 条。
 
 ### 怎么读
@@ -32,24 +32,24 @@
 | 3 | native 内存 / OOM / 崩溃 | 160 | 08-03 ～ 10-23 | 持续跟踪 |
 | 4 | 沙箱 / rootfs / PRoot / 终端 | 145 | 08-03 ～ 10-23 | 稳定 |
 | 5 | fastio offload / syscall 税 | 37 | 08-20 ～ 10-23 | 已合并 main |
-| 6 | 流式回答中断 / 恢复 / 取消 | 170 | 08-03 ～ 10-23 | 已闭环 |
-| 7 | 思考 / 推理泄漏 | 94 | 08-08 ～ 10-23 | 已闭环 |
+| 6 | 流式回答中断 / 恢复 / 取消 | 173 | 08-03 ～ 10-23 | 已闭环 |
+| 7 | 思考 / 推理泄漏 | 95 | 08-08 ～ 10-23 | 已闭环 |
 | 8 | 上下文压缩 / 记忆 / 预算 | 202 | 08-06 ～ 10-23 | 稳定 |
 | 9 | Provider / 模型组 / 负载均衡 | 147 | 08-04 ～ 10-23 | 已闭环 |
 | 10 | 备份 / 多端同步 | 169 | 08-03 ～ 10-22 | 收敛 |
 | 11 | 渲染性能 / Markdown / 长会话卡顿 | 132 | 08-05 ～ 10-23 | 已闭环 + 持续加固 |
-| 12 | 审计 / 整改（多轮） | 355 | 08-03 ～ 10-23 | 常态机制 |
-| 13 | 多会话并行协作 / 派发 / 交接 | 577 | 08-04 ～ 10-23 | 成熟 |
-| 14 | CI / 构建 / 发布流水线 | 606 | 08-03 ～ 10-23 | 稳定 |
+| 12 | 审计 / 整改（多轮） | 356 | 08-03 ～ 10-23 | 常态机制 |
+| 13 | 多会话并行协作 / 派发 / 交接 | 585 | 08-04 ～ 10-23 | 成熟 |
+| 14 | CI / 构建 / 发布流水线 | 613 | 08-03 ～ 10-23 | 稳定 |
 | 15 | 开发档案 / 记忆 / 工具链 | 185 | 08-03 ～ 10-23 | 常态维护 |
-| 16 | 会话 / 导航 / 抽屉交互 | 157 | 08-03 ～ 10-23 | 已闭环 |
+| 16 | 会话 / 导航 / 抽屉交互 | 158 | 08-03 ～ 10-23 | 已闭环 |
 | 17 | 平台适配 / 通知 / 图标 / 权限 | 99 | 08-03 ～ 10-21 | 部分放弃 |
 | 18 | 国际化 / 文案 / 本地化 | 32 | 08-04 ～ 10-23 | 已闭环 |
 | 19 | 上游 / 生态吸收 / 开源 | 101 | 08-03 ～ 10-20 | 常态 |
 | 20 | UI 组件 / 设置页 / 交互微调 | 120 | 08-04 ～ 10-23 | 持续 |
 | 21 | Token 用量 / 成本统计 | 84 | 08-05 ～ 10-23 | 已闭环 |
 | 22 | 人格 / Soul / 提示词 / 技能体系 | 157 | 08-04 ～ 10-23 | 稳定 |
-| 23 | 语音 / 多模态输入 | 47 | 08-03 ～ 10-23 | 低优先级维护 |
+| 23 | 语音 / 多模态输入 | 48 | 08-03 ～ 10-23 | 低优先级维护 |
 | 24 | 被否掉的方向（决策记录） | 51 | 08-04 ～ 10-18 | 持续累积 |
 
 ---
@@ -555,7 +555,7 @@
 
 ## 6. 流式回答中断 / 恢复 / 取消
 
-**跨度** 2026-08-03 ～ 2026-10-23 · **170 条** · **状态** 已闭环（09-07 收口，含停止按钮竞态 + 多会话真并发真机验证）
+**跨度** 2026-08-03 ～ 2026-10-23 · **173 条** · **状态** 已闭环（09-07 收口，含停止按钮竞态 + 多会话真并发真机验证）
 
 **叙事**：08-18 「回答频繁断掉」诊断链（provider 层铁证健康）→ 08-24 首块超时 30000ms + retry 分类不对称 → 09-06 一天内连收四种形态：EOF 静默停、stream error 手动重试、content_filter→fallback、finish_reason=network_error 伪正常结束 → 09-07 预算墙第 4 形态 + provider-exec-concurrency。**「同一个用户现象 = 五种不同根因」的教科书案例**，每条都靠日志实证拆开。
 
@@ -731,10 +731,13 @@
 | 10-23 11:37 | FIX-3 收口（deep-audit-1044 / dv24 波 A-03+A-04 P1×2）：`fix/dv24-a3-headless-send-contract` @ `8a4a38a5`，CI #2527 success，停在分支 | 身份链三方逐字符：基线 main f94413f5 → 5 提交（8f8da7f7 A-03 生产 / 4008328e A-04 生产 / f7fc1a70 测试 / 469bb7cf 门 criterion 15 /… |
 | 10-23 11:51 | FIX-7 收口（deep-audit-1044 / dv24 波 B-01+B-02+B-05，P1×3）：`fix/dv24-b1-picker-quicktest-composer` @ `71dc0225f1`，CI #2529 (run `39894855850` / job `120222802096`) success，停在分支 | 身份链三方逐字符：基线 main f94413f5 → 5 提交（f49a541d B-01 生产 / 5ef21819 B-02 生产 / 1529ecae B-05 生产 / 5edf7021 测试 / 71dc02… |
 | 10-23 14:20 | deep-audit-1045（v24 波）启动：第二道门 15/15 成立 0 驳回 + P0×1 + 失真 2 → 11 支派发完成（回读 11/11 在跑） | 输入：Rikkaminis_Audit_Report_V24_A.md（78,946 B，A-01..A-07）+ V24_B.md（102,201 B，B-01..B-08）。基线 main 1d44ec90（ls-r… |
+| 10-23 17:43 | deep-audit-1045（v24 波）全批闭环：main `381d1026` + main CI #2553 success（Publish 真执行，v1.0.0+2553）→ 清理 14/14 分支 + 14/14 worktree | 用户在收口中两次干预：①「怎么分支又一次跑了，不是应该并入吗？」——点破我为 2 条测试文件编译警告（user.dir 可空性，P2）不必要地重跑了一轮并集 CI（装置比例失当；正确做法是登记不修，或合并后由 main … |
+| 10-23 20:10 | FIX-G10 收口（deep-audit-1046 / S-10 P1）：`fix/dv26-g10-tts-cancel-guard` @ `eb7b9edd`，CI #39947618231 success，停在分支 | 身份链：基线 main f7aba218 → 73215401 生产+测试 / 188858b6 门（CI 绿于此）/ eb7b9edd 报告。git diff --name-only 188858b6 HEAD -- … |
+| 10-23 20:33 | FIX-D7 收口（deep-audit-1046 / S-07 P1）：`fix/dv26-d7-webview-release-latch`，CI 两次绿，停在分支 | 缺陷：KaTeXView.kt:390-393 与 FilePreviewScreen.kt:490-494 的 AndroidView.onRelease 都调 wv.removeCallbacks(null)——AO… |
 
 ## 7. 思考 / 推理泄漏
 
-**跨度** 2026-08-08 ～ 2026-10-23 · **94 条** · **状态** 已闭环（09-12 打包合并；同类新方言需重新进表）
+**跨度** 2026-08-08 ～ 2026-10-23 · **95 条** · **状态** 已闭环（09-12 打包合并；同类新方言需重新进表）
 
 **叙事**：08-14 思考折叠框缺失（模型组中转站场景）→ 08-18 「思考跑进正文」+ 断流诊断 → 08-20 thinking 级别无效 → 09-04 thinking-rules-port + 思考字段决策键 → 09-05 thinking-gap-close（审计出 2 HIGH）→ 09-11/12 **think 泄漏实锤：中转站 `<think>` 标签不在解析表**。核心难点：泄漏来自**上游 provider 的方言差异**，不是我们自己的解析 bug。
 
@@ -834,6 +837,7 @@
 | 10-22 03:22 | 上下文极限自动停 — 压缩链超时取证（2026-10-22） | 现象：当日 8 次 finish=length ×3 empty output — giving up（run 自动停止）；Compact failed 32 次 / folded nothing 119 次 / sum… |
 | 10-23 00:56 | FIX-2 收口（deep-audit-1043 / A-03 P1）：`minis-model-use run` 交给 `:modelservice` 的模型未富化 — `fix/dv23-a2-modeluse-effective-model` @ `fe3f9a7c`，CI #39815679884 success，停在分支 | 身份链：基线 main 79ef6d59 → 4 提交（210912f3 生产 / a6f7eb1f 测试 / 258fff8a 门 / fe3f9a7c 首跑红修复）→ 本地 == ls-remote == CI he… |
 | 10-23 01:02 | FIX-3 收口（deep-audit-1043 / v22 波 A-04 P1）：`fix/dv23-a3-thinking-ceiling-enrich` @ `6b708e44`，CI run 39815917331 / job 119954364519 success，停在分支 | 身份链三方逐字符：基线 main 79ef6d59 → 3 提交（生产 d80a812f / 测试 0364107e / 门 6b708e44）→ 本地 == ls-remote == CI head_sha = 6b7… |
+| 10-23 20:12 | FIX-B3 收口（deep-audit-1046 / dv26 波 S-03 P1）：`fix/dv26-b3-anthropic-thinking-budget` @ `db3de4da`，CI #2559 success，停在分支 | 身份链：基线 main f7aba218 → 4 提交（8e3d361d 生产 / 22cb622a 测试 / c2c86207 门 = CI 验过的树 / db3de4da 报告）。git diff --name-on… |
 
 ## 8. 上下文压缩 / 记忆 / 预算
 
@@ -1523,7 +1527,7 @@
 
 ## 12. 审计 / 整改（多轮）
 
-**跨度** 2026-08-03 ～ 2026-10-23 · **355 条** · **状态** 常态机制（已固化为 security-audit-checklist / four-way-sync-check 等 skill）
+**跨度** 2026-08-03 ～ 2026-10-23 · **356 条** · **状态** 常态机制（已固化为 security-audit-checklist / four-way-sync-check 等 skill）
 
 **叙事**：08-05 首次全量代码审查 → 08-16 系统性审计 → 08-18 RC1–RC17 两轮整改（多会话并行）→ 08-26/27 模块审计批 → 09-02 bug-hunt 四会话 → 09-04 diff 驱动定向审计 → 09-09 全局第二轮 T1–T12 → 09-13 完善度横向扫描 → 09-14 度量存活度 → 09-15 七轴 sweep。**审计是本项目最稳定的工程节奏**：每次改动后必有一次独立审计，且审计本身产出纪律（skill）。
 
@@ -1884,10 +1888,11 @@
 | 10-23 06:52 | deep-audit-1043（v22 波）全批闭环：文档先行 → main `f94413f5` + main CI #39865696671 success（Publish 真执行，v1.0.0+2517）→ 清理 13/13 | ① 文档先行（用户令「先处理文档，再合并」）：先 memory_write 1043 收口（档案从日志生成，不先落盘条目会缺）→ rebuild 2153 条 / 82 天（2142→2153，08-03～10-23）/… |
 | 10-23 12:45 | 审计背景包 v27 / 提示词 v24-A,B 构建完成（为 deep-audit-1045 / v24 波准备）—— 2026-10-23 午后 | 触发：用户「好了，现在已经合并进去了」（dv24 十支已并入 main）。基线核实：main 1d44ec90（= dv24 并集 f842dd13 + docs-1044；两树 src/+scripts/ 逐字节一致，… |
 | 10-23 12:59 | deep-audit-1044（v23 波）全批闭环：main `1d44ec90` + main CI #2534 success（Publish 真执行，v1.0.0+2534）→ 清理 12/12 分支 + 10/10 worktree | 用户令「按流程走」= 放行合并（承接上一轮已完成的收口证据）。 |
+| 10-23 17:43 | deep-audit-1045（v24 波）全批闭环：main `381d1026` + main CI #2553 success（Publish 真执行，v1.0.0+2553）→ 清理 14/14 分支 + 14/14 worktree | 用户在收口中两次干预：①「怎么分支又一次跑了，不是应该并入吗？」——点破我为 2 条测试文件编译警告（user.dir 可空性，P2）不必要地重跑了一轮并集 CI（装置比例失当；正确做法是登记不修，或合并后由 main … |
 
 ## 13. 多会话并行协作 / 派发 / 交接
 
-**跨度** 2026-08-04 ～ 2026-10-23 · **577 条** · **状态** 成熟（skill: task-dispatch / git-parallel-collaboration / rikkaminis-dev-methodology）
+**跨度** 2026-08-04 ～ 2026-10-23 · **585 条** · **状态** 成熟（skill: task-dispatch / git-parallel-collaboration / rikkaminis-dev-methodology）
 
 **叙事**：08-07 多对话框并发操作同一 worktree 翻车（native OOM 修复）→ 08-12 多任务并行推进模式确立 → 08-15 T1–T10 十会话派发（平衡点施工）→ 08-18 RC 整改凭编号领取 → 08-22 小号 TF-A..TF-J → 08-23 bug-hunt 五会话 → 09-13 两条纪律固化：**每会话独立 clone 绝不共享 .git** + **两分支同基各一 commit 时第二个必须 rebase**。
 
@@ -2470,10 +2475,18 @@
 | 10-23 15:47 | FIX-5 收口（deep-audit-1045 / v24 波 B-01 P1）：`fix/dv25-b1-mirror-autodetect-ownership` @ `665e9b21`，CI #2540 success（head_sha `6e929cd3` 三方一致），停在分支 | 缺陷：autoDetectOnceIfNeeded（首启 rootfs.freshInstall 自动测速）是裸 scope.launch（基线 :478），Job 从未进字段 ⇒ runTest/runAllTests… |
 | 10-23 15:48 | FIX-9 收口（deep-audit-1045 / dv25 波 B-08 P0 + B-05 P1）：`fix/dv25-b5-fastmode-promote-draft` @ `97642c3f`，CI #2544 (run 39917029875 / job 120293005852) success，停在分支 | 身份链：基线 main 1d44ec90 → 6 提交（b1d00555 B-08 生产 / dfe6e9e3 B-05 生产 / c930e94a 测试 / ad8e33de 门 / a8f34b11 失败恢复收紧 =… |
 | 10-23 16:08 | deep-audit-1045 / FIX-6 支（B-02 P1）收口：分支 `fix/dv25-b2-webview-lifecycle` CI #2550 绿，停在分支（未合并 main） | 身份链：基线 main 1d44ec90 → 6 提交（34aa5aba 生产 / dd70f0ca 测试 / 0635d5a2 门 / 9d6f1dca 报告 / 42686631 修新测试编译警告 / ffd7cc0… |
+| 10-23 17:43 | deep-audit-1045（v24 波）全批闭环：main `381d1026` + main CI #2553 success（Publish 真执行，v1.0.0+2553）→ 清理 14/14 分支 + 14/14 worktree | 用户在收口中两次干预：①「怎么分支又一次跑了，不是应该并入吗？」——点破我为 2 条测试文件编译警告（user.dir 可空性，P2）不必要地重跑了一轮并集 CI（装置比例失当；正确做法是登记不修，或合并后由 main … |
+| 10-23 18:48 | deep-audit-1046 启动（v24-S 单路报告，8 支派发完成） | 输入：Rikkaminis_Audit_Report_V24_S.md（127,225 B / 849 行，S-01..S-11）。报告自报基线 main 1d44ec90。 |
+| 10-23 20:10 | FIX-G10 收口（deep-audit-1046 / S-10 P1）：`fix/dv26-g10-tts-cancel-guard` @ `eb7b9edd`，CI #39947618231 success，停在分支 | 身份链：基线 main f7aba218 → 73215401 生产+测试 / 188858b6 门（CI 绿于此）/ eb7b9edd 报告。git diff --name-only 188858b6 HEAD -- … |
+| 10-23 20:12 | FIX-B3 收口（deep-audit-1046 / dv26 波 S-03 P1）：`fix/dv26-b3-anthropic-thinking-budget` @ `db3de4da`，CI #2559 success，停在分支 | 身份链：基线 main f7aba218 → 4 提交（8e3d361d 生产 / 22cb622a 测试 / c2c86207 门 = CI 验过的树 / db3de4da 报告）。git diff --name-on… |
+| 10-23 20:17 | FIX-A2 收口（deep-audit-1046 / S-02 P1）：`fix/dv26-a2-oauth-bridge-refresh` @ `8eb3a837`，CI #2562 success，停在分支 | 身份链：基线 main f7aba218 → 3 提交（d95f41c3 生产+测试+门 / e35408cb 报告 / 8eb3a837 补 L4）。CI 绿于 d95f41c3，报告提交后源码树等价（git diff… |
+| 10-23 20:33 | FIX-D7 收口（deep-audit-1046 / S-07 P1）：`fix/dv26-d7-webview-release-latch`，CI 两次绿，停在分支 | 缺陷：KaTeXView.kt:390-393 与 FilePreviewScreen.kt:490-494 的 AndroidView.onRelease 都调 wv.removeCallbacks(null)——AO… |
+| 10-23 20:51 | FIX-F9 收口（deep-audit-1046 / S-09 P1）：`fix/dv26-f9-intent-scheme-sanitize` @ `e97f77f9`，CI #39953818482 success，停在分支 | 身份链：基线 main f7aba218 → 5 提交（57203319 生产+门+测试 8 文件 +847/−95 / d552a8c0 测试名去点 / 0e74c57f KDoc 措辞 / 1843c1ca 可空性警… |
+| 10-23 21:24 | deep-audit-1046 全批收口：8 支 CI 绿 → 并集 `integration/dv26` @ `bea3525b`，并集 CI #39957962219 全绿（111 门 + 340 夹具），未合并 main（起手权在用户） | 8 支 CI 绿（全 attempt 1，唯一 skipped=Publish，SRC_EQ_GREEN=True）：A2 39949090022 / B3 39947709325 / C6 39945776622 / … |
 
 ## 14. CI / 构建 / 发布流水线
 
-**跨度** 2026-08-03 ～ 2026-10-23 · **606 条** · **状态** 稳定（Publish 步骤已加 `if: refs/heads/main` 门控）
+**跨度** 2026-08-03 ～ 2026-10-23 · **613 条** · **状态** 稳定（Publish 步骤已加 `if: refs/heads/main` 门控）
 
 **叙事**：08-04 main 编译被 WebDAV 提交弄坏（连红 4 个 run）→ 08-05 android-latest 被分支构建污染 → workflow 门控修复 → 08-17 **CI 缓存恢复旧 native .so**（Tier 0 真 bug）→ 08-24 gh_ci_wait.sh 工具化 + 重复构建幂等守卫 → 09-10 语法门 grep 大小写坑 → 09-14 workflow_dispatch 并发竞态。**「CI 绿 ≠ 逻辑对」这条纪律就是从这条 saga 长出来的。**
 
@@ -3085,6 +3098,13 @@
 | 10-23 15:47 | FIX-5 收口（deep-audit-1045 / v24 波 B-01 P1）：`fix/dv25-b1-mirror-autodetect-ownership` @ `665e9b21`，CI #2540 success（head_sha `6e929cd3` 三方一致），停在分支 | 缺陷：autoDetectOnceIfNeeded（首启 rootfs.freshInstall 自动测速）是裸 scope.launch（基线 :478），Job 从未进字段 ⇒ runTest/runAllTests… |
 | 10-23 15:48 | FIX-9 收口（deep-audit-1045 / dv25 波 B-08 P0 + B-05 P1）：`fix/dv25-b5-fastmode-promote-draft` @ `97642c3f`，CI #2544 (run 39917029875 / job 120293005852) success，停在分支 | 身份链：基线 main 1d44ec90 → 6 提交（b1d00555 B-08 生产 / dfe6e9e3 B-05 生产 / c930e94a 测试 / ad8e33de 门 / a8f34b11 失败恢复收紧 =… |
 | 10-23 16:08 | deep-audit-1045 / FIX-6 支（B-02 P1）收口：分支 `fix/dv25-b2-webview-lifecycle` CI #2550 绿，停在分支（未合并 main） | 身份链：基线 main 1d44ec90 → 6 提交（34aa5aba 生产 / dd70f0ca 测试 / 0635d5a2 门 / 9d6f1dca 报告 / 42686631 修新测试编译警告 / ffd7cc0… |
+| 10-23 17:43 | deep-audit-1045（v24 波）全批闭环：main `381d1026` + main CI #2553 success（Publish 真执行，v1.0.0+2553）→ 清理 14/14 分支 + 14/14 worktree | 用户在收口中两次干预：①「怎么分支又一次跑了，不是应该并入吗？」——点破我为 2 条测试文件编译警告（user.dir 可空性，P2）不必要地重跑了一轮并集 CI（装置比例失当；正确做法是登记不修，或合并后由 main … |
+| 10-23 20:10 | FIX-G10 收口（deep-audit-1046 / S-10 P1）：`fix/dv26-g10-tts-cancel-guard` @ `eb7b9edd`，CI #39947618231 success，停在分支 | 身份链：基线 main f7aba218 → 73215401 生产+测试 / 188858b6 门（CI 绿于此）/ eb7b9edd 报告。git diff --name-only 188858b6 HEAD -- … |
+| 10-23 20:12 | FIX-B3 收口（deep-audit-1046 / dv26 波 S-03 P1）：`fix/dv26-b3-anthropic-thinking-budget` @ `db3de4da`，CI #2559 success，停在分支 | 身份链：基线 main f7aba218 → 4 提交（8e3d361d 生产 / 22cb622a 测试 / c2c86207 门 = CI 验过的树 / db3de4da 报告）。git diff --name-on… |
+| 10-23 20:17 | FIX-A2 收口（deep-audit-1046 / S-02 P1）：`fix/dv26-a2-oauth-bridge-refresh` @ `8eb3a837`，CI #2562 success，停在分支 | 身份链：基线 main f7aba218 → 3 提交（d95f41c3 生产+测试+门 / e35408cb 报告 / 8eb3a837 补 L4）。CI 绿于 d95f41c3，报告提交后源码树等价（git diff… |
+| 10-23 20:33 | FIX-D7 收口（deep-audit-1046 / S-07 P1）：`fix/dv26-d7-webview-release-latch`，CI 两次绿，停在分支 | 缺陷：KaTeXView.kt:390-393 与 FilePreviewScreen.kt:490-494 的 AndroidView.onRelease 都调 wv.removeCallbacks(null)——AO… |
+| 10-23 20:51 | FIX-F9 收口（deep-audit-1046 / S-09 P1）：`fix/dv26-f9-intent-scheme-sanitize` @ `e97f77f9`，CI #39953818482 success，停在分支 | 身份链：基线 main f7aba218 → 5 提交（57203319 生产+门+测试 8 文件 +847/−95 / d552a8c0 测试名去点 / 0e74c57f KDoc 措辞 / 1843c1ca 可空性警… |
+| 10-23 21:24 | deep-audit-1046 全批收口：8 支 CI 绿 → 并集 `integration/dv26` @ `bea3525b`，并集 CI #39957962219 全绿（111 门 + 340 夹具），未合并 main（起手权在用户） | 8 支 CI 绿（全 attempt 1，唯一 skipped=Publish，SRC_EQ_GREEN=True）：A2 39949090022 / B3 39947709325 / C6 39945776622 / … |
 
 ## 15. 开发档案 / 记忆 / 工具链
 
@@ -3282,7 +3302,7 @@
 
 ## 16. 会话 / 导航 / 抽屉交互
 
-**跨度** 2026-08-03 ～ 2026-10-23 · **157 条** · **状态** 已闭环（09-01 后未再复现）
+**跨度** 2026-08-03 ～ 2026-10-23 · **158 条** · **状态** 已闭环（09-01 后未再复现）
 
 **叙事**：08-03 空对话残留 → 08-04 左滑历史抽屉 + 新建对话弹窗 → 08-06 系统返回不进 SESSION_LIST + 双击返回 → 08-07 重启后进列表页而非新会话 → 08-18 RC10 深链路径穿越 → 09-01 launch-resume 导航修复 → 09-13 冷打开空白。**「打开应用后我在哪」这个问题被修了 6 次**，每次都是不同的入口（返回键 / 重启 / 深链 / 冷启）。
 
@@ -3445,6 +3465,7 @@
 | 10-23 11:17 | FIX-9 收口（deep-audit-1044 / B-06 **本波唯一 P0**）：`fix/dv24-b3-promote-draft-persist` @ `ed90a7f3`，CI run 39892254078 / job 120214646640 success，停在分支 | 身份链：基线 main f94413f5 → 3 提交（3df76c6f 生产 / 3dc0cf8a 测试 / ed90a7f3 门）→ 本地 == ls-remote == CI head_sha = ed90a7f3… |
 | 10-23 14:20 | deep-audit-1045（v24 波）启动：第二道门 15/15 成立 0 驳回 + P0×1 + 失真 2 → 11 支派发完成（回读 11/11 在跑） | 输入：Rikkaminis_Audit_Report_V24_A.md（78,946 B，A-01..A-07）+ V24_B.md（102,201 B，B-01..B-08）。基线 main 1d44ec90（ls-r… |
 | 10-23 15:47 | FIX-5 收口（deep-audit-1045 / v24 波 B-01 P1）：`fix/dv25-b1-mirror-autodetect-ownership` @ `665e9b21`，CI #2540 success（head_sha `6e929cd3` 三方一致），停在分支 | 缺陷：autoDetectOnceIfNeeded（首启 rootfs.freshInstall 自动测速）是裸 scope.launch（基线 :478），Job 从未进字段 ⇒ runTest/runAllTests… |
+| 10-23 18:48 | deep-audit-1046 启动（v24-S 单路报告，8 支派发完成） | 输入：Rikkaminis_Audit_Report_V24_S.md（127,225 B / 849 行，S-01..S-11）。报告自报基线 main 1d44ec90。 |
 
 ## 17. 平台适配 / 通知 / 图标 / 权限
 
@@ -4095,7 +4116,7 @@
 
 ## 23. 语音 / 多模态输入
 
-**跨度** 2026-08-03 ～ 2026-10-23 · **47 条** · **状态** 低优先级维护（语音输入可用，未再重点投入）
+**跨度** 2026-08-03 ～ 2026-10-23 · **48 条** · **状态** 低优先级维护（语音输入可用，未再重点投入）
 
 **叙事**：08-04 语音 UI 移除 → 08-06 语音功能清理（合并 main）→ 08-27 语音输入顺滑度修复 + voice-ime 合并 → 09-12 senseaudio「系统繁忙」实测 + TTFB 30s 通用缺口。**两次「移除」后又两次「修回来」**——语音这条线反复横跳，最终落在「保留但降低优先级」。
 
@@ -4148,6 +4169,7 @@
 | 10-23 11:15 | FIX-1 收口（deep-audit-1044 / A-01 P1）：`fix/dv24-a1-voice-effective-model` @ `8c27fd25`（CI 绿于 `fe6ab36e`），run 39891898960 / job 120213372981 success，停在分支 | 身份链四方逐字符：基线 main f94413f5 → 3 提交（生产 4bce8f71 / 测试 67ed74b8 / 门 fe6ab36e）+ 2 个 docs 提交（af98f5a3/8c27fd25，只动 fix… |
 | 10-23 12:30 | deep-audit-1044（v23 波）10 支全绿闭环：并集 `integration/dv24` @ `f842dd13`，并集 CI #2533 success，**待用户放行合并 main** | 输入：Rikkaminis_Audit_Report_V23_A.md（68,767 B，A-01..A-08）+ V23_B.md（88,135 B，B-01..B-07）= 15 单。基线 main f94413f5… |
 | 10-23 12:59 | deep-audit-1044（v23 波）全批闭环：main `1d44ec90` + main CI #2534 success（Publish 真执行，v1.0.0+2534）→ 清理 12/12 分支 + 10/10 worktree | 用户令「按流程走」= 放行合并（承接上一轮已完成的收口证据）。 |
+| 10-23 20:10 | FIX-G10 收口（deep-audit-1046 / S-10 P1）：`fix/dv26-g10-tts-cancel-guard` @ `eb7b9edd`，CI #39947618231 success，停在分支 | 身份链：基线 main f7aba218 → 73215401 生产+测试 / 188858b6 门（CI 绿于此）/ eb7b9edd 报告。git diff --name-only 188858b6 HEAD -- … |
 
 ## 24. 被否掉的方向（决策记录）
 
@@ -4414,3 +4436,5 @@
 | 10-23 15:33 | 2026-10-23 15:33:45 |
 | 10-23 15:50 | TierFlow 5 账号额度勘察（2026-10-23）—— 关键结论：套餐额度已普遍用超，账号 3 的套餐 Key 失效 |
 | 10-23 15:54 | TierFlow 精选台账 + 账号 3 rotate 换发（2026-10-23 15:53） |
+| 10-23 17:33 | v27 追加：单任务版 v24-S（用户令「本波额度只有一份」） |
+| 10-23 19:32 | FIX-F9（deep-audit-1046 / S-09，P1）施工中：`intent://` 消毒共享 + R2 scope 派生 |

@@ -4,8 +4,8 @@
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
 - 合并范围：2026-08-03 ～ 2026-10-23，共 82 天
-- 条目总数：2182（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：3294556 / 总行数：39687
+- 条目总数：2192（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：3315371 / 总行数：39873
 
 ---
 
@@ -39680,6 +39680,192 @@ FIX-1 `de1757d6` / FIX-2 `b5844632` / FIX-3 `131bd094` / FIX-4 `4acf26a2` / FIX-
 **★ 两条流程教训**：①**CI 绿 ≠ 没有编译警告**（1042-A6 同族复发）——#2548 绿但暴露新测试 `Java type mismatch: String? vs String`（`user.dir` 可空），修掉后重跑 #2550 才干净。②**backlog.md 是多会话并发写的**：本支 append 后，别支（FIX-4）的 append 把**我的段尾 L4 CI 证据整段覆盖**成它自己的 CI 描述（症状：我的段里出现 `PlayerOutcomeJsonTest` / `OFFLOAD_CLI_ARGS_SELFTEST`）。**规则级：写完 backlog 段必须回读该段自己的行做归属核对**（`python3` 按 `## §` 切段打印），不能只信 `scan_debt.py` 的 OK——机械门只查「段有触发条件」，查不出「证据被换成了别人的」。
 
 **残留**：`§1045-B02`（R1/R2/R3 真机行为级：blob 下载真落地、切 UA 后立刻销毁不崩、池回收无残留回调；R4 注入失败只记日志；R5 公共 setUserAgent 静默 return 无信号；R6 门 L1 依赖字面形态；R7 desktopMode 不再翻转；R8 报告不入库）全部带触发条件，机械门 **376 段 / no-触发条件 4 / 豁免 11**，本段 OK。
+
+<!-- 2026-10-23 17:33:31 -->
+## v27 追加：单任务版 v24-S（用户令「本波额度只有一份」）
+
+
+**触发**：用户「这一批的吸收完了，为下一批做准备吧，但是这一批只准备一份，这是一个任务，因为额度有5小时限制，原本够两份的现如今只够一份，等到下一次刷新，再准备两份」。⇒ 本波（deep-audit-1045 / v24 波）**只发一个审计任务**，下一波恢复 A/B 双路。
+
+**做法**：`make_single.py` 以 v24-A 为骨架切片合成，不重写 —— 先 diff 证 §1.1–2.12 / §3.9 / §4 / §5 两份逐字节相同，只换四处：①头（单路全覆盖 + 交付 **10–16 条、两族各 ≥3**）②§1.0 管辖面（族一内核 380 .kt + 族二 UI 231 .kt 合并 + 跨族工单两边 `文件:行` 同单）③§3.0 火力 11 条合并（真空区硬要求 / 迁移链抽样复核 / 形状 36·37 双面 / 35 / 30 / 31·32·34 / 22 换问法 / 生命周期 / 主线程 IO / 判据盲区 / 对照物三查）④§5.1 两族自检 8 条。6 处措辞替换各断言 count==1（关键：**「深度优先于广度」→「覆盖与深度并重」** —— 单路不能只押一个面；「另一份报告的管辖面」→「整族完全没扫」）。
+
+**产物**：`audit-prompt-v24-S.md` 31,089 B（`0a737528`）· **`task-S.md` 254,380 B（`0950d1d2`）= 本波唯一任务**（背景包全文 + S 模板）· README 11,259 B（`11e6e1e7`，表格加 S 两行 + 用法分「本波单路 / 下一波双路」）。`task-A/B` 字节与 sha 与改前**完全一致**（`d4858c98` / `4647724c`）= 双路留档无损，下一波直接复用。
+
+**★ 可复用判据**：**改造模板时先 diff 找共用段，只替换差异块** —— 两份 35/33 KB 模板合成一份，净新增仅 6 处替换 + 4 个新块（30,998 B 首版），比重新写一遍节省且不可能漂移；验证手段 = 未涉及的产物 sha 必须逐字节不变。
+
+<!-- 2026-10-23 17:43:04 -->
+## deep-audit-1045（v24 波）全批闭环：main `381d1026` + main CI #2553 success（Publish 真执行，v1.0.0+2553）→ 清理 14/14 分支 + 14/14 worktree
+
+
+**用户在收口中两次干预**：①「怎么分支又一次跑了，不是应该并入吗？」——点破我为 2 条测试文件编译警告（`user.dir` 可空性，P2）不必要地重跑了一轮并集 CI（装置比例失当；正确做法是登记不修，或合并后由 main CI 一并覆盖）。②「跑完了」+ 前句 = 放行合并。
+
+**收口链**：11/11 回报 CI 绿 → 独立核对（11 支 EXACT 或 SRC-EQ）→ 并集 `integration/dv25`（11 次 --no-ff 零冲突，64 文件零共享）→ 本地 109/0 + 336 → 并集 CI #2548（`39923965228`@ce368528 ALL GREEN）→（自伤：+1 轮 CI）→ 文档先行（档案 **2182 条 / 82 天**，脱敏 NONE，SAGAS 24 主题，SHA 一致）→ docs 自合 `ac0cfa68` → **代码合并 main `381d1026`**（合并树 vs 并集树 src+scripts 逐字节一致）→ main CI run `39929484879` **26 步全 success、skipped=[]（Publish 真执行）、发布 v1.0.0+2553**、三方 sha EXACT → 报告入库 → 清理（worktree 14 → 本地分支 14 → 远端 14，只剩 main）。
+
+**★ 收口新教训（3 条）**：
+1. **收口主会话必须自己重验台账里的 CI 身份**：§1045-A07 的 L4 段是**从 §1045-B04 复制粘贴**的（run 39915172412/95d84870/PickerGroupResolutionTest 都属 FIX-8），§1044-A05 同病（写成 dv25-B04 的 run）。已就地更正两处并加勘误注。**规则：写「验证 L4」段时 run id/sha 必须从 API 现取，不许从别的段落抄**——同批 11 支极易抄串。
+2. **本波报告编号 FIX-1..11 与 1044 波重号** → 统一 `dv25-FIX-*` 前缀入库（1044 原报告保全）；支 1/2/4/8/11 会话未落盘报告文件，由主会话按 backlog 台账+提交+CI 判读**重建**（8 节），报告头部注明重建来源。
+3. **minis-sessions-cli messages 输出可能被 native_offload 截断**（单条只回 31 字）→ 用 `--offset`/`--limit`/`--full` 分页取尾部；长会话最终报告在尾部 8-25 条里。
+
+**本波完整战绩**：15 单（P0×1 B-08 promoteDraft×cleanupIfEmpty 竞态删行 + P1×14）→ 11 支（11/11 分支 CI 绿，首跑红 0）→ 并集 64 文件 +11108/−390（零冲突）→ 文档先行 2182 条 → main `381d1026`（main CI 绿 + 发布 v1.0.0+2553）→ 11 份 dv25-FIX-* 报告入库 → 分支/worktree 清零。
+
+**残留欠账**：`§1045-VERIFY` 真机行为级（11 支各 R1：A-01 OAuth 不蒸发 / A-02 真空 EOF 重试 / A-03 纯媒体轮可见 / A-04 限流可重试 / A-07 player JSON / B-01 autoDetect 归属 / B-02 WebView 生命周期 / B-03 存储 IO / B-04 picker 哨兵头 / B-05+B-08 P0 草稿提升+附件 / B-06 MCP toggle / B-07 SAF 超限提示），等下次真机窗口一次开齐。
+
+<!-- 2026-10-23 18:48:32 -->
+## deep-audit-1046 启动（v24-S 单路报告，8 支派发完成）
+
+
+**输入**：`Rikkaminis_Audit_Report_V24_S.md`（127,225 B / 849 行，S-01..S-11）。报告自报基线 main `1d44ec90`。
+
+**★ 第二道门的最大发现：基线漂移吃掉 3/11**。真树 main 已到 **`f7aba218`**（1045 波 15 条全并入 + docs 合并），其中：
+- **S-01（报告判 P0）已修**：`MCPOAuthConfig.kt` 现用 `CLIENT_ID_KEYS/AUTH_ENDPOINT_KEYS/…` 双拼写 alias + `firstNonBlank()`（dv25-A1 `6bb83a20`），KDoc 逐字点名该蒸发缺陷 ⇒ 不再从 `servers.json` 抹除 oauth。残留仅 `main.py cmd_add` 仍写 camelCase（靠 alias 兜）→ **P2 登记不修**。
+- **S-04 已修**：`HeadlessChatRunner.applyModelOverride` 已用 `resolveBindingTarget(...)` + `persistBinding(...)` 写两处（dv25-A05/A06）。
+- **S-05 已修**：`PlayerOffloadHandler.kt` 散文版被 dv25-a4 重写为 120 行 JSON 版（KDoc 直写 `jq / json.loads broke on success`）。
+⇒ **实际派发面 8 条，全部 P1，0 条 P0**。教训：**下一波必须在报告到手后、派发前重锚 main 并回真树逐条 verify**（v22 背景包重锚是同族，这次是"报告比 main 旧"的反向漂移）。
+
+**报告失真 6 条**（全为基线/行号类，无机制臆造）：基线过期（1 条最重）；`RE_MATERIALIZE`→`REFRESH_BRIDGE` 改名；`AgentForegroundService:540`→`:532`；门名 `katex_ready_race_guard.py`→真名 `katex_ready_race_check.py`；`QuickTestSheet:679`→`:678`；`S-11` 行号成立。
+
+**8 支（生产文件集/门集两两互斥，预期零冲突）**：A2 S-02 桥接刷新 · B3 S-03 Anthropic thinking 预算 · C6 S-06 悬浮窗意图闩锁 · D7 S-07 WebView release 闩锁 · E8 S-08 SCOPE_MOUNT 冷启动 · F9 S-09 intent parseUri 消毒 · G10 S-10 TTS 取消守卫 · H11 S-11 ScheduledTasksStore revision。worktree 由主会话统一建在 `deep-audit-1046/{a2,b3,c6,d7,e8,f9,g10,h11}/`（golden + worktree，8×0 空间）。
+
+**门策略（本批新规）**：`scan.sh` / `test_scan.py` 两文件**冻结**——新增门只允许落 `scripts/scan/<name>_check.py` + 自带 `--selftest` 带牙臂，注册与重编号由主会话在并集阶段统一做（防止多支同改冻结面撞车）。
+
+**派发**：`minis-sessions-cli send --async` 8/8 送达（逐会话回读首条消息匹配任务书代号）。**踩坑**：首批发 4 支时用 `| tail -3` 取输出，session_id 被截掉 ⇒ 只能事后用 `minis-sessions-cli list` + `messages --id --limit 2 | grep FIX-` 反查映射。**下次一律 `-q` 重定向到文件再解析 id**。
+
+<!-- 2026-10-23 19:32:48 -->
+## FIX-F9（deep-audit-1046 / S-09，P1）施工中：`intent://` 消毒共享 + R2 scope 派生
+
+
+**基线 f7aba218**，分支 `fix/dv26-f9-intent-scheme-sanitize` @ `57203319`。8 文件 +847/−95。
+
+**修法（阶梯第 2 级「代码库里已有」）**：把 `OpenOffloadHandler.tryOpen` 里内联的消毒序列抽成唯一实现：`util/IntentSanitizer.kt`（Android 薄翻译）+ `util/IntentSanitizePolicy.kt`（Android 无关决策：`isSelfTarget` / `allowedFallbackUrl` / `lowercaseIntentScheme` 从 offload 包迁来）。Browser 侧从「只 `selector = null`」改为走共享消毒 + scheme 归一 + fallback 只放行 http(s)。
+
+**门**：`offload_host_path_check.py` R2 的盲区不是文件而是**手写清单**——原来只扫 `sandbox/offload/*OffloadHandler.kt`。改成从发布树派生：①每个 `Intent.parseUri(` 调用点 ②每个「有 `"intent:"/"android-app"` 字面量 + 调 startActivity」的 dispatcher ③每处 `getStringExtra("browser_fallback_url")` 读点必须被 http(s) 网关住。共享消毒器**按函数体派生**（body 含全部 strip 才算 sanitizer），所以抽成 helper 不会让门失明，而掏空 helper 会让所有调用点重新变红（这是本轮最值钱的一条：`has_full_hardening(body)` 派生 > 写死函数名）。
+
+**装置**：selftest 8 臂（6 dirty 各红恰好一条 + 2 clean）；L3 真 kotlinc+JUnit 七臂（POST OK(5) / PRE 恰 3 红 / m1..m5 各恰 1 红）；PRE 树 = `scratch-f9/base-tree` worktree，门在基线上 red 且错误精确指向 browser `:113` 与 `:126`。
+
+**踩坑**：①`scan.sh` 是 shell 脚本，不能 `python3 scan.sh`；②基线 worktree 建在仓库内会让 `parts_json_funnel_check` 把基线源码当违规（红门），**基线树必须建在 worktree 之外**；③Kotlin `internal` 在独立 kotlinc 编译（非 Gradle friend module）下测试看不到——策略文件与测试必须同一次 kotlinc 调用编译；④JUnit 运行要显式带 `kotlin-stdlib.jar`，否则 NoClassDefFoundError `kotlin/jvm/internal/Intrinsics`。
+
+<!-- 2026-10-23 20:10:30 -->
+## FIX-G10 收口（deep-audit-1046 / S-10 P1）：`fix/dv26-g10-tts-cancel-guard` @ `eb7b9edd`，CI #39947618231 success，停在分支
+
+
+**身份链**：基线 main `f7aba218` → `73215401` 生产+测试 / `188858b6` 门（**CI 绿于此**）/ `eb7b9edd` 报告。`git diff --name-only 188858b6 HEAD -- . ':(exclude)fix-reports'` = **0**。三方 sha（本地/`ls-remote`/`run.head_sha`）= `188858b69684…`。5 文件 **+971/−3**（生产 2 / 测试 1 / 门 1 / 报告 1）；**门 109 不变**（0 新建门，扩 `tts_voice_and_sanitizer_check.py`，零触碰 `scan.sh`/`test_scan.py`）。**未合并 main**。
+
+**缺陷**：`QuickTestSheet.synthesizeTestClip` 的 `TextToSpeech(context) { … }` 初始化回调体无任何取消读取 ⇒ 15 s 超时/sheet 关闭后 `invokeOnCancellation` 只 shutdown、`finally` 删片文件，**随后才投递**的 init 回调照常 `synthesizeToFile` 把 `quicktest-clip-<ts>.wav` 写回 cacheDir ⇒ 孤儿（无人再删）。基线行：`:682` 超时 / `:687` 只守 resume / `:689` 回调体 / `:704` 写盘 / `:707` 取消只 shutdown / `:714` finally；调用点仅 `:546`。
+
+**修法（阶梯 7 级）**：`AtomicBoolean` 闩锁 + 三处 guard（init 首行 `mayTouchEngine`、写盘点前 `maySynthesize` **重查**）+ 三处 delete（`finally` / 取消路径再删 / 迟到回调丢弃刚写出的片文件）。决策抽 Android 无关纯 object `SynthClipPolicy`（3 个纯函数）。否决：用 `cont.isActive` 当闩锁（取消后才翻转、成功 resume 后也变假）/ 延后 `finally` / 重写 TTS 封装。
+
+**★ 可复用三条**：
+1. **判据轴 =「守卫读的布尔接收者必须出现在取消路径里」**，不锚字段名 ⇒ 灯光/改名不失明；且守卫必须与调用同/外层块（嵌在兄弟回调 `onStart{}` 里的守卫支配不到那个调用，必须排除）。
+2. **`resumeWith(` 是「把结果交回调用方」的结构锚点** ⇒ 迟到写入的丢弃判据挂在它所在的块上（交回处同时负责丢弃无人接收的文件），比按函数名找 `finish` 稳。
+3. **模板字符串必须先 mask 再配花括号**：`"quicktest-clip-${System.currentTimeMillis()}.wav"` 里的 `${…}` 会打乱块配对；`strip_comments` 保留换行 + `mask_strings`（逐字符抹空格保偏移）后行号才可用。
+
+**自伤四条（当场闭环）**：①协程块起点写成 `find("{", coro.end()-1)`（锚点在 `->`，取到 `fun finish{` 的花括号）⇒ C1 空转 + C2/C3 误报，改 `coro.start()`；②测试断言写在事件顺序反面（`writeLands` 之后断言「取消已删」）⇒ POST 臂红，改成「迟到写入确实落地 → 回调丢弃」；③harness 无条件调 `synthLine()` 使 m2 红 2 条 ⇒ 改 `initCallback(): Boolean`（返回是否继续），m2 回恰 1 红；④直接断言策略函数的真值表测试让任何变异连带红 ⇒ 删除（覆盖已被 4 个生命周期场景占满）。
+
+**验证四层**：L1 真树 PASS + selftest **22 臂**（新增 7 臂，每个变异恰红一条）+ PRE 真基线文件红 5 条 + **逐门 108/108** + `ALL 336`（PRoot S28 风暴打断两次 → 写可续跑 `probe/l1/run_gates.sh`（每门 done 标记），75→108）· L2 邻门 **6/6 rc=0**（含扫同文件的 `provider_remember_key_check`）· L3 真 kotlinc+JUnitCore 五臂（POST OK(4) / PRE 3 红 / m1..m3 各恰 1 红，PRE 臂用「基线语义复刻」因基线无该策略文件，已明写）· L4 run `39947618231` / job `120394031065` / attempt 1：26 步 `not_ok=[]`、唯一 skipped=Publish、`109 passed 0 failed`（9 条 Summary 无非零）、门头 1..109 互异、`ALL 336`、`Z e:` 0、游离 FAILED 0、新增 4 用例逐条 PASSED、日志 1,433,207 B。
+
+**登记**：报告 `fix-reports/FIX-G10.md`（八节）；backlog **§1046-G10** @ backlog.md:7526（机械门 **381 段 / no-触发条件 4（既有）/ 豁免 11**）。残留 R1 既存孤儿片文件不清理 · R2 shutdown 后完成写盘且永不回调 · R3 15 s 字面量 · R4 门只认「守卫+早退」形态 · R5 纯 object 无状态 · R6 L3 不建模线程可见性 · R7 SETUP 集合覆盖面 · R8 真机行为级未验（全部带触发条件）。
+
+<!-- 2026-10-23 20:12:33 -->
+## FIX-B3 收口（deep-audit-1046 / dv26 波 S-03 P1）：`fix/dv26-b3-anthropic-thinking-budget` @ `db3de4da`，CI #2559 success，停在分支
+
+
+**身份链**：基线 main `f7aba218` → 4 提交（`8e3d361d` 生产 / `22cb622a` 测试 / `c2c86207` 门 = **CI 验过的树** / `db3de4da` 报告）。`git diff --name-only c2c86207 HEAD -- . ':(exclude)fix-reports'` = **0 文件**；本地 == 远端 == `db3de4da`。4 文件 **+1146/−9**；**门 109 / 夹具 336 不变**（新门未注册，冻结面零触碰）。未合并 main。
+
+**缺陷**：`budget_tokens` 相对 `max_tokens` 定义（越界 = 确定性 400），但 `buildRequestBody` 两个读者读两个基数——`put("max_tokens", clampOutboundMaxTokens(...))` 写钳制值，`thinkingBudget(maxTokens, level)` 读裸值且从不参考模型上限。`LLMProvider.sendMessage/streamMessage` **不钳 maxTokens** ⇒ 带外 caller 越上限时发出 `max_tokens=8192` 配 `budget_tokens=65536`。次生：`thinking.type=="disabled"` 落进 beta 头 else ⇒ body 要求关掉、头却宣告该能力。
+
+**修法（第 6 级）**：`val cappedMaxTokens` 两读者共用；守卫 `> 0 && < cappedMaxTokens`（`maxTokens==1` 无合法预算 ⇒ 不写 thinking 字段）；beta 头两路 → `when(adaptive/enabled/"disabled"→Unit)` 三路。`thinkingBudget()` 算法一行未改。**否决**任务书建议的「抽 AnthropicThinkingPlan 纯对象」（那是把接线对齐升级成重构分派）。
+
+**验证**：L1 `scan.sh` **109 passed/0 failed** + `test_scan` **ALL 336** + `gate_run --full` **110/110/0 envretry=0** + 本门 selftest 7 臂 + PRE 基线树 C1/C2/C3 各红一次 · L2 概念反查邻门 **12/12 rc=0** · L3 真 kotlinc+JUnit **5 臂**（POST 绿 / PRE 红 4 / m1 红 1 / m2 红 2 / m3 红 1）· L4 run `39947709325` #2559 / job `120394331754` attempt 1 success，`not_ok_steps=[]`、唯一 skipped=Publish、`Summary: 109 passed, 0 failed` 恰一条、ALL 336、门头 1..109 互异、编译错 0、`w:` 379 条中 **0 条指向本支文件**、7 个新用例逐条 PASSED。
+
+**★ 四条可复用**：
+1. **配对类缺陷（两个数各自合法、只有配对非法）测不出来于单点单测** —— 必须有「把两个读者一起看」的装置；L3 PRE 臂实证：同函数同断言、只换基数就红。
+2. **函数的"内部收紧"不能当外部守卫的替代**：`thinkingBudget` 的 `>= maxTokens → maxTokens-1` 只在 `maxTokens > 1` 生效，`== 1` 正是漏的那格。
+3. **切片器必须区分字符字面量与散文撇号**：`HIGH's min(...)` 的 `'` 被当 char literal ⇒ 吞掉函数收尾 `}` ⇒ 切片 22 行变 195 行越界到文件尾。（与 1045-B02 的 raw string 同族：词法器盲区会伪装成"判据抓到了别的函数"。）
+4. **「不同变异给出完全相同的红集」= 驱动坏了的信号**：`prep.py` 元组错位解包让三个变异臂全退化成 PRE 臂；先看见"三臂同时红"才反查出来。
+
+**登记**：报告 `fix-reports/FIX-B3.md`（八节）；backlog **§1046-B3**（383 段 / no-触发条件 4 既有 / 豁免 11，本段 OK @ backlog.md:7560）；R1–R8 全带触发条件（R1 真机行为级 / R2 C2 形状 fail-closed / R5 门待注册 / R6 disabled 无 beta 的中转未知面）。装置 `probe/`（`l3/` slice.py+prep.py+run.sh+arms / `base/` 基线树 / `ci/job-120394331754.log` 1.43 MB / `l1-*.log`）。
+
+<!-- 2026-10-23 20:17:29 -->
+## FIX-A2 收口（deep-audit-1046 / S-02 P1）：`fix/dv26-a2-oauth-bridge-refresh` @ `8eb3a837`，CI #2562 success，停在分支
+
+
+**身份链**：基线 main `f7aba218` → 3 提交（`d95f41c3` 生产+测试+门 / `e35408cb` 报告 / `8eb3a837` 补 L4）。**CI 绿于 `d95f41c3`**，报告提交后源码树等价（`git diff --name-only d95f41c3 HEAD -- . ':(exclude)fix-reports'` = 0）。run `39949090022` / job `120398876541` attempt 1 success，26 步 not_ok=0、唯一 skipped=Publish（main 门控）、`109 passed, 0 failed` 恰一条、`ALL 336`、门头 109 互异连续、`Z e:` 0、游离 FAILED 0、新增 11 用例逐条 PASSED。4 文件（生产 2 / 测试 1 新增 11 例 / 门 1 扩 ~430 行），**门 109 / 夹具 336 不变**（0 新建门）。未合并 main。
+
+**缺陷**：`MCPOAuthStore` 与桥接文件 `mcp-servers/oauth/<server>.json` 是同一凭据两副本，只实现了 host→guest：沙箱 CLI `_oauth_refresh → _save_oauth_tokens` 刷新后写回的新 token 永不回宿主；保存该 server 任意其它字段 → `REFRESH_BRIDGE` → 用刷新前快照覆盖桥接 ⇒ 轮换场景下次刷新 `invalid_grant`（授权永久失效）。
+
+**修法（阶梯 6 级）**：新增 Android 无关 `MCPOAuthBridgeMerge.kt`：`promoteTokensFromBridge(stored, bridge)` 三守卫——①到期排序：桥接秒 < 宿主秒 ⇒ **整条不晋升**（含轮换半边；到期 0 视为最旧）②access_token 不等（同秒刷新靠它）③refresh_token 不等（轮换半边）。桥接缺失/空白/损坏 ⇒ 不晋升且绝不清宿主 token。store 侧 `readBridgeTokenSnapshot()`（runCatching，日志只带 server 名）+ `promoteFromBridge()`（**先 setTokens 持久化再 materialize**），接线点 = `REFRESH_BRIDGE` 写桥接之前。授权字段（client_id/token_endpoint/client_secret/resource）读回方**连解析都不做**。
+
+**★ 三条可复用（判据设计）**：
+1. **「写流程里的读」会让判据假绿**：门 C1 首版把 `materializeBridgeFile` 当读者——它 rename 回退里有 `tmp.readText()` ⇒ 基线树也绿。修法：含 `writeText(` 的函数排除出读者集。**通用规则：以「读过某文件」为判据的门，必须先排除写流程内部的读。**
+2. **结构判据与字面量派生要两套掩码视图**：`mask()` 剥字符串防日志文本满足判据，但桥接 key 名本身就是字面量 ⇒ 派生字段名时假红。修法：结构走 `mask()`、字面量派生走 `mask_comments()`，两视图并存（1045-B02「词法器是判据的一部分」同族）。
+3. **「到期未知」语义一次定死**：CLI 的 `_save_oauth_tokens` 无 `expires_in` 时**保留原值** ⇒「桥接无到期」= CLI 从未刷新 = 桥接更旧 ⇒ 整条拒绝。初版写成「双方都有到期才比较」被 L3 m1 臂当场抓住。
+
+**验证四层**：L1 本门真树 rc=0 + selftest PASS（8 新臂各恰 1 红）+ **PRE 双臂红**（`probe/base` 无策略文件 fail-closed；`probe/base2` 基线 store + 新策略 → C1 精确指名 `reconcileForServer` 不读桥接）+ 全量 109/0 + ALL 336（首跑撞 ENOSYS 风暴 42/67 假红，静置重跑全绿）· L2 概念反查 **7/7** 邻门 rc=0（mcp_oauth / skill_import_offmain / chat_ui_interaction / ime_inset / session_sheet_id / share_dir_prune / skill_restore_session_cleanup）+ offload_cli_args · L3 真 kotlinc+JUnit 5 臂：POST `OK (11 tests)` / PRE 6 红 / m1（`<`→`<=`）3 红 / m2（删 refresh 不等）1 红 / m3（删排序守卫）2 红 · L4 见上。
+
+**登记**：报告 `fix-reports/FIX-A2.md`（八节）；backlog **§1046-A2**（R1 只在保存路径晋升 / R2 到期时基 / R3 KEEP 不读 / R4 C1 依赖闭包 / R5 C2 派生 / R6 桥接信任边界 / R7 无到期清理 / **R8 真机行为级欠账**，全带触发条件）。机械门 **379 段 / no-触发条件 4（既有）/ 豁免 11**，本段 OK @ backlog.md:7470。装置 `probe/`（`pre/build_pre.py` 基线双臂 · `l3/gen.py` 5 臂字节变异 · `ci-job.log` 1,430,496 B），`.gitignore:141` 覆盖 probe/。
+
+<!-- 2026-10-23 20:33:52 -->
+## FIX-D7 收口（deep-audit-1046 / S-07 P1）：`fix/dv26-d7-webview-release-latch`，CI 两次绿，停在分支
+
+
+**缺陷**：`KaTeXView.kt:390-393` 与 `FilePreviewScreen.kt:490-494` 的 `AndroidView.onRelease` 都调 `wv.removeCallbacks(null)`——AOSP `View.removeCallbacks` 是 `if (action != null) {…} return false;`，**传 null 一个都不删**（基线注释还把它当「drops everything queued」）；延迟块无销毁守卫 ⇒ 100 ms 捕获块在已销毁 WebView 上 `draw()` 出**空白位图**并 `KaTeXRendererCache.cache.put(cacheKey, …)` 写入进程级缓存 ⇒ 该公式在此后整个进程生命期内**永久空白**。预览屏同族：排队 `post { loadUrl }` 无处取消。
+
+**修法**：新增 Android 无关 `ui/preview/WebViewReleaseLatch.kt`（CAS 幂等闩锁 + 具名 runnable 登记表 + `canRunDeferred()` + `pendingCount` + `releasePlan(attached)` 唯一顺序源：DETACH→DROP_DEFERRED→STOP_LOADING→DESTROY）；两 host 各自 `for (step in releasePlan(…)) when(step)` 执行；闩锁建在 `key(cacheKey, rendererEpoch)` **内部**；`onRendered`（JS 桥线程入口）读闩锁早退；捕获块改具名 `Runnable` + `track()`；**删掉 `removeCallbacks(null)`**（无正确 bulk 替身，改按身份移除）。
+
+**身份链**：基线 `f7aba218` → 生产/测试/门 `cd4ce3bb` → 报告 `7ea49f1a`（`git diff --name-only 121e255e HEAD -- . ':(exclude)fix-reports'` = **0 文件**）。CI **run 39947373561/job 120393218837 @cd4ce3bb** 与 **run 39951345298/job 120406293477 @121e255e** 均 attempt 1 success；26 步唯一 skipped=Publish；109 门序号连续互异；`Summary: 109 passed, 0 failed` 恰一条 + 本门 `33 passed, 0 failed`；`ALL 336 CASES PASS`；`Z e:` 0；游离 FAILED 0；新测试类 9 条逐条 PASSED。5 文件 **+898/−20**；门 109/夹具 336 不变（0 新建门，`scan.sh`/`test_scan.py` 零触碰）。
+
+**★ 三条可复用（已写入 backlog 段）**：
+1. **「清理调用存在」≠「清理生效」——判据锚在被删对象的可达性上**：`removeCallbacks(null)` 在文本上完全像一次清理，注释也这么写；只有「具名 runnable 是否被按身份移除」能判死它。门因此派生 `val x = Runnable {` 的名字并要求 `track(x)` + `removeCallbacks(<非 null>)` 同框。
+2. **同族 ≥2 处 ⇒ 顺序语义收敛成一份纯函数**：`releasePlan(attached)` 把顺序变成可 JVM 测的一个返回值，两 host 只执行不判断——这正是顺序能被真 kotlinc+JUnit 测出、而 UI 文件只能被门扫的原因。
+3. **任务书点名的门先 grep 验证它到底扫什么**：任务书称 `katex_ready_race_check.py` 已扫 `KaTeXView.kt`——真树里该门只扫 `KatexWebViewPool.kt`/`ChatViewModelStore.kt`。正确落点 = 语义最近的 `browser_destroy_wakeup_check.py`（C4 段本就是 teardown 清队列契约）。
+
+**验证四层**：L1 本门真树 33/0 + selftest **40 臂**（原 27 + 新 13，期望红集手写）+ **PRE 臂**（`git show f7aba218:` 五文件）11 条红 + 全量 **108 门/0**（`probe/l1/run_gates.py` 抗 ENOSYS；2 门只吃 `--root` 形态）+ `test_scan` **ALL 336**；L2 概念反查邻门 **11/11 rc=0**；L3 真 kotlinc+JUnit **9 用例绿** / PRE 3 红 / m1–m5 各恰红其判据 / **真树变异 4 臂各恰 1 红**、源树 sha256 前后一致；L4 见上。
+
+**环境坑**：本轮 `scan.sh` 整链撞 PRoot S28，`Summary: 25 passed, 84 failed` 是**假红**（逐行 `python3: Function not implemented`）——健康路径 = 逐门直跑 + `test_scan` 重试驱动（脚本见 `probe/l1/`）。另：amend 已推送的提交后必须 `gh_sync.sh push --force`（gh_sync 支持 `--force`）。
+
+**残留**：`§1046-D7`（R1 真机：公式滚出滚回不空白 / 预览首帧前返回不崩 / 连续进出 20 次正常）· R1 P2 `WebViewHolder:437`+`BUM:2852` 仍 no-op（门与 `JsDispatchDecisionTest` 都要求它存在，半径外）· R5 负决策：不造 bulk clear helper。
+
+<!-- 2026-10-23 20:51:13 -->
+## FIX-F9 收口（deep-audit-1046 / S-09 P1）：`fix/dv26-f9-intent-scheme-sanitize` @ `e97f77f9`，CI #39953818482 success，停在分支
+
+
+**身份链**：基线 main `f7aba218` → 5 提交（`57203319` 生产+门+测试 8 文件 +847/−95 / `d552a8c0` 测试名去点 / `0e74c57f` KDoc 措辞 / `1843c1ca` 可空性警告 **← CI 绿于此** / `19f98a26`+`e97f77f9` 报告）。`git diff --name-only 1843c1ca HEAD -- . ':(exclude)fix-reports'` = **0 行**（源码树等价）。三方 sha（本地 / API `branches` / `run.head_sha`）逐字符一致。**门 109 / 夹具 336 不变**（0 新建门，扩 `offload_host_path_check.py` R2）。
+
+**缺陷**：`BrowserExternalSchemeHandler` 对**网页给的** `intent://` 只做 `selector = null` —— 授权 flags / clipData / 同包 component·package / 页面混写大小写四项全缺，`browser_fallback_url` 不经 scheme 门直接把刚剥掉的逃逸重建回来；KDoc 另宣称剥 NEW_DOCUMENT（全文件 0 处）。根因层 = **两份实现只有一份被加固**（offload 侧 1016c/1041-A6 加固过）+ **门作用域是手写目录清单**（`grep -rln BrowserExternalSchemeHandler scripts/scan/` = 0）。同族：1045-B06。
+
+**修法（阶梯第 2 级）**：`util/IntentSanitizer.kt`（唯一序列）+ `util/IntentSanitizePolicy.kt`（Android 无关三决策：`isSelfTarget`/`allowedFallbackUrl`/`lowercaseIntentScheme`），两侧共享；第三方包名**刻意保留**（拉微信/支付宝）。门改成从发布树**派生作用域**（每个 `Intent.parseUri` 站点 / 每个 dispatcher / 每个 fallback 读点），共享消毒器按**函数体**认定 —— **掏空 helper 会让所有调用点重新变红**（这是本轮最值钱的判据形态：按 body 派生 > 写死函数名）。
+
+**★ 三轮红的真相（全真错，无一次 flake，全部值得记）**：
+1. `compileReleaseUnitTestKotlin: Name contains illegal characters: .` —— **backticked 测试名不能含 `.`**（我在测试名里写了 `Intent.parseUri`）。
+2. `BrowserExternalSchemeShapeTest` FAILED —— 我改写 KDoc 时**把被测试禁掉的字面量写进「说明它为什么是假的」那句话里**。规则：禁字面量的源形状测试，解释性文字也不能引用该字面量。
+3. **CI 绿 ≠ 干净**（1042-A6 / 1045-FIX-8 同族第 N 次）：第三轮 success 但日志 2 条 `user.dir` 可空性警告 → `?: "."` 修掉重跑。
+4. **源形状测试是纯 JVM，不该留给 CI**：本地 `kotlinc` + `java -Dprobe.repo=$PWD org.junit.runner.JUnitCore …` 可跑（本轮 3 类 `OK (18 tests)`），这是上面 1、2 两条本可在本地就抓到的缺口。
+
+**验证四层**：L1 本门真树 GREEN + 8 臂 selftest（6 dirty 各红恰好一条 + 2 clean）+ PRE 基线树 rc=1 且两条错误精确指向 `:113`/`:126` + 全量 `109 passed / 0 failed` + `ALL 336`；L2 邻门 8/8 rc=0（`log_url_redaction_guard` / `offload_cli_args` / `deeplink_settings_routes` / `file_provider_paths_coverage` / `file_uri_parse_guard` / `share_dir_prune` / `browser_tabs_lifecycle` / `browser_destroy_wakeup`）；L3 真 kotlinc+JUnit 七臂（POST OK(5) / PRE 恰 3 红 / m1–m5 各恰 1 红，其中 m2 = 第三方被误清 = 功能面回归）+ android.jar 编译生产三文件 rc=0；L4 run `39953818482` / job `120414575871` attempt 1 success，26 步唯一 skipped = Publish（main 门控）、`109 passed, 0 failed` 恰一条、门头 1..109 互异、`ALL 336` 恰一条、` e: ` 0、**本支文件警告 0**、游离 FAILED 0、新用例 10/10 PASSED。
+
+**登记**：报告 `fix-reports/FIX-F9.md`（八节）；backlog **§1046-F9**（R1 真机四连点 / R2 fallback 只判 scheme / R3 门拼写白名单误红 / R4 lowercase 锚词不锚数据流 / R5 只扫 main source set / R6 兄弟包 / R7 顺序未重排 / R8 既有测试语义改动待复核 / R9 三轮红形态）。机械门 **384 段 / no-触发条件 4（既有）/ 豁免 11**，本段 OK @ backlog.md:7590。
+
+**环境坑**：`git ls-remote` / `gh_sync.sh push` 多次 `TLS connect error: unexpected eof`（代理抖动）——`push` 报错但**实际已推成功**，判据要用 `api.github.com/repos/.../branches/<name>` 取 sha 核对，不要信 push 的 rc。另 `/tmp` 写入偶发 ENOSYS，落盘改到 worktree 内 `probe/`。
+
+<!-- 2026-10-23 21:24:44 -->
+## deep-audit-1046 全批收口：8 支 CI 绿 → 并集 `integration/dv26` @ `bea3525b`，并集 CI #39957962219 全绿（111 门 + 340 夹具），未合并 main（起手权在用户）
+
+
+**8 支 CI 绿（全 attempt 1，唯一 skipped=Publish，SRC_EQ_GREEN=True）**：A2 `39949090022` / B3 `39947709325` / C6 `39945776622` / D7 `39947373561` / E8 `39946138565` / F9 `39950926463`→`39953818482`（首跑红后两跑）/ G10 `39947618231` / H11 `39948641772`。
+
+**并集**：`integration/dv26` @ **`bea3525b3ed23f90b389b11c74868232655194b5`**，8 次 `--no-ff` **零冲突**（文件集两两互斥是施工前设计出来的），49 文件 +8501/−522；门注册提交 `bea3525b`（**109→111 门 / 336→340 夹具**：新增 `anthropic_thinking_budget_check.py`、`overlay_show_hide_latch_check.py` 两门，由主会话在并集阶段统一注册——本批新规：`scan.sh`/`test_scan.py` 施工期冻结，新门只落门文件 + 自带 selftest，注册/重编号收口时统一做，防止多支撞冻结面）。本地并集 scan 111/0 + test_scan ALL 340。
+
+**并集 CI #39957962219 / job `120428441123`**：attempt 1 success，head_sha 三方逐字符一致，26 步 not_ok=[]、`Summary: 111 passed, 0 failed` 带框线恰一条、ALL 340、`Z e:` 0、游离 FAILED 0（judge_ci.py 判读 2.89MB 日志）。
+
+**报告/台账**：8 份 FIX-{A2,B3,C6,D7,E8,F9,G10,H11}.md（18.5–21.5 KB 八节）随分支提交且与并集逐字节一致；backlog §1046-A2..H11 8/8 落段（机械门 384 段 / no-触发条件 4 既有）。
+
+**待用户**：并集→main 合并放行；合并后清 8+1 分支 + worktree。
+
+**★ 可复用判据（本批新增）**：
+1. **冻结面策略终版**：新门 = 门文件 + `--selftest` 带牙臂由支线自建，`scan.sh`/`test_scan.py` 注册与 `[N/109]→[N/111]` 重编号由主会话并集阶段统一做——比让支线各改冻结面（1039 撞车）便宜且零冲突。
+2. **注册脚本模板**：scan.sh 块 = `# --- N. 注释 ---` + `echo "━━━ [N/总] 门名 ━━━"` + `if python3 ... "$ROOT"`；test_scan.py = `DA####_GATES` 列表（(script, selftest 标记, (REPO_ROOT,))）+ test 函数 + main 里调用一次；格式串 `%` 参数顺序与占位符数必须逐一核对（本批 2 次自伤全当场闭环）。
+3. **报告提取陷阱**：`ls fix-reports/*.md | head -1` 会命中 main 里继承的旧报告（f7aba218 已含 27 份）——按支号映射取本支自己的文件名。
+4. **基线漂移吃掉 3/11**（S-01/S-04/S-05 已被 1045 修）——派发前重锚 main + 回真树逐条 verify 是第二道门的固定动作，报告比 main 旧的反向漂移和 main 比报告新同样会误判。
 
 ---
 
