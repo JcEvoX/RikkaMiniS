@@ -39,6 +39,31 @@ Judged by CODE anchors (comments stripped first — never anchor on comments):
     * `LaunchedEffect(servers, sessionId)` present (seeding effect re-runs on
       id change)
 
+  [da1045-B6] BOTH sheets — the seeding write must re-check membership at the
+  write, not earlier. `deep-audit-1045` B-06: SessionMcpsSheet computed
+  `missing` on Main, awaited one `isEnabledForSession` SQLite read per missing
+  id on IO, then wrote every result back with a bare `for (id in missing)
+  overrides[id] = …`. `missing` is a snapshot taken BEFORE the await while
+  `overrides` is a live map, so a toggle the user flipped inside that window
+  was overwritten with the pre-toggle stored value. SessionSkillsSheet
+  delegates to `mergeSessionOverrides`, whose first line IS the guard
+  (`if (id !in overrides)`) — the two files carried the same contract in their
+  comments and only one of them in its code.
+
+  Judged per `LaunchedEffect(<keys with sessionId>)` body of the map derived
+  from `… = remember(sessionId)`:
+    * a write `<map>[…] =` must be attached to an `if ( … )` whose condition
+      re-tests membership in THAT map — any of `x !in map`,
+      `!map.containsKey(…)`, `map[…] == null` (spelling-tolerant, the decision
+      point is "is it still missing when the write runs");
+    * OR the body calls a `merge*Overrides(…)` family helper that receives that
+      map (family matched, not a pinned name — renaming the helper keeps the
+      guard alive, deleting the call flips red);
+    * neither writes nor helper in the body is red too (fail closed: the
+      seeding statement was not moved, it was removed).
+  `if (id in missing)` — guarding on the pre-await snapshot — does NOT count:
+  it is the defect, rephrased.
+
   [da1032-A] ISSUE-02 — `SessionEditSheet` is host-agnostic: its Regenerate
   button and its live row are both defaulted parameters, so a host that omits
   them still compiles and the button silently no-ops. Two more blocks:
@@ -198,6 +223,155 @@ def extract_block_fun_body(code, signature_fragment):
 
 
 # ---------------------------------------------------------------------------
+# [da1045-B6] Seeding-guard machinery
+
+# The merge helper family. Matched by shape, never by a pinned name, so
+# `mergeSessionOverrides` → `mergeMcpOverrides` → `applySeeds` (kept in the
+# family) all stay judged; a helper that stops being a merge is what should
+# flip the gate red.
+MERGE_FAMILY_RE = r"\bmerge[A-Za-z0-9_]*Overrides?\s*\("
+
+# `<map>[<key>] =` — an assignment into the live map. `=(?!=)` skips `==`,
+# the lookbehind skips `foo.map[…]` and `smap[…]` receivers of another object.
+SEED_WRITE_TMPL = r"(?<![\w.]){}\s*\[[^\]]*\]\s*=(?!=)"
+
+# The three spellings of "this id is still missing". What is pinned is the
+# DECISION (membership re-tested against THAT map at the write), not the words.
+GUARD_TMPLS = [
+    r"!\s*in\s+{}\b",
+    r"!\s*{}\s*\.\s*containsKey\s*\(",
+    r"\b{}\s*\[[^\]]*\]\s*==\s*null",
+]
+
+def _enclosing_brace(code, idx):
+    """Index of the `{` opening the block that contains `idx`, or None."""
+    depth = 0
+    for j in range(idx - 1, -1, -1):
+        c = code[j]
+        if c == "}":
+            depth += 1
+        elif c == "{":
+            if depth == 0:
+                return j
+            depth -= 1
+    return None
+
+def _attached_if_condition(text):
+    """Condition text of an `if ( … )` whose `)` is the last token of `text`.
+
+    Backward paren matching (not `[^)]*`) so nested calls inside the condition
+    — `if (!map.containsKey(s.id))` — do not truncate it. Returns None when the
+    text before the statement is not an `if` / `else if` header.
+    """
+    tail = text.rstrip()
+    if not tail.endswith(")"):
+        return None
+    depth = 0
+    for j in range(len(tail) - 1, -1, -1):
+        c = tail[j]
+        if c == ")":
+            depth += 1
+        elif c == "(":
+            depth -= 1
+            if depth == 0:
+                if not re.search(r"\bif\s*$", tail[:j]):
+                    return None
+                return tail[j + 1: len(tail) - 1]
+    return None
+
+def _seeding_effect_bodies(code):
+    """[(offset, body)] of every `LaunchedEffect(<keys with sessionId>) { … }`.
+
+    Scoping to the effect body is what keeps the row toggle — which legitimately
+    writes `overrides[server.id] = enabled` unguarded inside `onCheckedChange` —
+    out of the judgement.
+    """
+    out = []
+    for m in re.finditer(r"\bLaunchedEffect\s*\(", code):
+        open_paren = m.end() - 1
+        close_paren = _match_forward(code, open_paren, "(", ")")
+        if close_paren < 0:
+            continue
+        if not re.search(r"\bsessionId\b", code[open_paren:close_paren]):
+            continue
+        open_brace = code.find("{", close_paren)
+        if open_brace < 0:
+            continue
+        close_brace = _match_forward(code, open_brace, "{", "}")
+        if close_brace < 0:
+            continue
+        out.append((open_brace, code[open_brace:close_brace + 1]))
+    return out
+
+def _write_is_guarded(code, idx, map_var):
+    """True when the write starting at `idx` re-tests membership in `map_var`."""
+    guards = [re.compile(t.format(re.escape(map_var))) for t in GUARD_TMPLS]
+    window = code[max(0, idx - 500):idx]
+    # (a) brace-less: `if (id !in overrides) overrides[id] = …`
+    cond = _attached_if_condition(window)
+    if cond is not None and any(g.search(cond) for g in guards):
+        return True
+    # (b) braced: the write is the first statement of a block whose opening
+    #     brace is attached to an `if ( … )` header
+    blk = _enclosing_brace(code, idx)
+    if blk is not None and not code[blk + 1:idx].strip():
+        cond2 = _attached_if_condition(code[max(0, blk - 500):blk])
+        if cond2 is not None and any(g.search(cond2) for g in guards):
+            return True
+    return False
+
+def check_seeding_guard(code, label, findings):
+    """[da1045-B6] Shared by BOTH sheets: seed writes must survive a re-check.
+
+    Skipped (not failed) when no sessionId-keyed map / effect exists — those
+    absences are already reported by the sibling criteria above, and re-reporting
+    them would inflate their precision counts.
+    """
+    code = strip_comments(code)
+    map_vars = re.findall(
+        r"\b([A-Za-z_][A-Za-z0-9_]*)\s*=\s*remember\s*\(\s*sessionId\s*\)", code)
+    if not map_vars:
+        return
+    bodies = _seeding_effect_bodies(code)
+    if not bodies:
+        return
+    for map_var in map_vars:
+        write_re = re.compile(SEED_WRITE_TMPL.format(re.escape(map_var)))
+        for offset, body in bodies:
+            writes = list(write_re.finditer(body))
+            helper = re.search(MERGE_FAMILY_RE, body)
+            helper_ok = False
+            if helper:
+                # the family call must hand ITSELF the map it is seeding
+                call_open = offset + helper.end() - 1
+                call_close = _match_forward(code, call_open, "(", ")")
+                helper_ok = (
+                    call_close > call_open
+                    and bool(re.search(r"\b" + re.escape(map_var) + r"\b",
+                                       code[call_open:call_close + 1]))
+                )
+            if not writes and not helper_ok:
+                findings.append(
+                    f"{label}: the seeding effect no longer writes `{map_var}` and does "
+                    f"not call a merge*Overrides(…) helper that receives it — the per-session "
+                    f"seed either vanished or moved somewhere this guard cannot see"
+                )
+                continue
+            for w in writes:
+                idx = offset + w.start()
+                if _write_is_guarded(code, idx, map_var):
+                    continue
+                line = code.count("\n", 0, idx) + 1
+                findings.append(
+                    f"{label}:{line}: unguarded seeding write `{map_var}[…] =` inside the "
+                    f"LaunchedEffect — the missing-id set is a snapshot taken before the IO "
+                    f"await, so this overwrites an in-flight toggle. Guard it with "
+                    f"`if (id !in {map_var})` at the write, or seed through a "
+                    f"merge*Overrides(…) helper that receives {map_var}"
+                )
+    return findings
+
+# ---------------------------------------------------------------------------
 # Anchor specs
 
 # (call_name, required_pattern, forbidden_pattern, label)
@@ -350,6 +524,9 @@ def check_skills_sheet(code, findings):
             "(expected `LaunchedEffect(skills, sessionId)`) — otherwise a promoted draft keeps "
             "the __new__ seeds and never re-derives from the real id"
         )
+    # [da1045-B6] the same membership-guard criterion the Mcps sheet is now held
+    # to — the two files claim one contract, so one gate judges both.
+    check_seeding_guard(code, "SessionSkillsSheet.kt", findings)
     return findings
 
 
@@ -368,6 +545,10 @@ def check_mcps_sheet(code, findings):
             "SessionMcpsSheet.kt: seeding effect must re-run on sessionId change "
             "(expected `LaunchedEffect(servers, sessionId)`)"
         )
+    # [da1045-B6] B-06: `missing` was captured before the IO await and written
+    # back unguarded, so an in-flight toggle was overwritten by its own
+    # pre-toggle stored value.
+    check_seeding_guard(code, "SessionMcpsSheet.kt", findings)
     return findings
 
 
@@ -576,6 +757,151 @@ fun SessionMcpsSheet(sessionId: String, mcpRepository: MCPRepository) {
 """
 
 
+# [da1045-B6] the pre-fix shape: `missing` is a snapshot taken before the IO
+# await, then written back with no membership re-check — an in-flight toggle is
+# overwritten by its own pre-toggle stored value. Note the file DOES contain
+# `it !in overrides` (inside the `missing` filter), which is exactly why the
+# criterion has to judge the write site rather than the file.
+FIX_MCPS_NOGUARD = """\
+fun SessionMcpsSheet(sessionId: String, mcpRepository: MCPRepository) {
+    val servers by mcpRepository.servers.collectAsState()
+    val overrides = remember(sessionId) {
+        mutableStateMapOf<String, Boolean>()
+    }
+    LaunchedEffect(servers, sessionId) {
+        val missing = servers.map { it.id }.filter { it !in overrides }
+        val seeds = withContext(Dispatchers.IO) {
+            missing.associateWith { mcpRepository.isEnabledForSession(it, sessionId) }
+        }
+        for (id in missing) overrides[id] = seeds[id] ?: false
+        val live = servers.mapTo(HashSet()) { it.id }
+        overrides.keys.retainAll(live)
+    }
+}
+"""
+
+# [da1045-B6] the shipped shape — the same helper SessionSkillsSheet uses.
+FIX_MCPS_MERGE = """\
+fun SessionMcpsSheet(sessionId: String, mcpRepository: MCPRepository) {
+    val servers by mcpRepository.servers.collectAsState()
+    val overrides = remember(sessionId) {
+        mutableStateMapOf<String, Boolean>()
+    }
+    LaunchedEffect(servers, sessionId) {
+        val liveIds = servers.map { it.id }
+        val seeds = withContext(Dispatchers.IO) {
+            liveIds.filter { it !in overrides }
+                .associateWith { mcpRepository.isEnabledForSession(it, sessionId) }
+        }
+        mergeSessionOverrides(
+            liveIds = liveIds,
+            overrides = overrides,
+            lookup = { seeds[it] ?: false },
+        )
+    }
+}
+"""
+
+# [da1045-B6] same decision, three tolerated spellings.
+FIX_MCPS_BRACELESS = """\
+fun SessionMcpsSheet(sessionId: String, mcpRepository: MCPRepository) {
+    val overrides = remember(sessionId) {
+        mutableStateMapOf<String, Boolean>()
+    }
+    LaunchedEffect(servers, sessionId) {
+        val ids = servers.map { it.id }
+        for (id in ids) {
+            if (id !in overrides)
+                overrides[id] = mcpRepository.isEnabledForSession(id, sessionId)
+        }
+    }
+}
+"""
+
+FIX_MCPS_NULLREAD = """\
+fun SessionMcpsSheet(sessionId: String, mcpRepository: MCPRepository) {
+    val overrides = remember(sessionId) {
+        mutableStateMapOf<String, Boolean>()
+    }
+    LaunchedEffect(servers, sessionId) {
+        val ids = servers.map { it.id }
+        withContext(Dispatchers.IO) {
+            ids.filter { overrides[it] == null }
+        }
+        for (id in ids) {
+            if (overrides[id] == null) overrides[id] = mcpRepository.isEnabledForSession(id, sessionId)
+        }
+    }
+}
+"""
+
+FIX_MCPS_CONTAINSKEY = """\
+fun SessionMcpsSheet(sessionId: String, mcpRepository: MCPRepository) {
+    val overrides = remember(sessionId) {
+        mutableStateMapOf<String, Boolean>()
+    }
+    LaunchedEffect(servers, sessionId) {
+        val ids = servers.map { it.id }
+        for (id in ids) {
+            if (!overrides.containsKey(id)) {
+                overrides[id] = mcpRepository.isEnabledForSession(id, sessionId)
+            }
+        }
+    }
+}
+"""
+
+# [da1045-B6] the guard must name the map it writes: `!in seeds` decides
+# nothing about `overrides` (seeds is the just-read snapshot).
+FIX_MCPS_WRONG_MAP = """\
+fun SessionMcpsSheet(sessionId: String, mcpRepository: MCPRepository) {
+    val overrides = remember(sessionId) {
+        mutableStateMapOf<String, Boolean>()
+    }
+    LaunchedEffect(servers, sessionId) {
+        val seeds = withContext(Dispatchers.IO) {
+            servers.associate { it.id to mcpRepository.isEnabledForSession(it.id, sessionId) }
+        }
+        for (id in servers.map { it.id }) {
+            if (id !in seeds) overrides[id] = seeds[id] ?: false
+        }
+    }
+}
+"""
+
+# [da1045-B6] fail closed: a helper call that never receives the map seeds
+# nothing this gate can see, and the inline writes are gone.
+FIX_MCPS_HELPER_BLIND = """\
+fun SessionMcpsSheet(sessionId: String, mcpRepository: MCPRepository) {
+    val overrides = remember(sessionId) {
+        mutableStateMapOf<String, Boolean>()
+    }
+    LaunchedEffect(servers, sessionId) {
+        val seeds = withContext(Dispatchers.IO) {
+            servers.associate { it.id to mcpRepository.isEnabledForSession(it.id, sessionId) }
+        }
+        mergeSessionOverrides(liveIds = servers.map { it.id }, lookup = { seeds[it] ?: false })
+    }
+}
+"""
+
+# [da1045-B6] the SAME defect on the twin sheet — one criterion, both files.
+FIX_SKILLS_NOGUARD = """\
+fun SessionSkillsSheet(sessionId: String, repo: SkillRepository) {
+    val skills by repo.skills.collectAsState()
+    val overrides = remember(sessionId) {
+        mutableStateMapOf<String, Boolean>()
+    }
+    LaunchedEffect(skills, sessionId) {
+        val missing = skills.map { it.id }.filter { it !in overrides }
+        val seeds = withContext(Dispatchers.IO) {
+            missing.associateWith { repo.isEnabledForSession(it, sessionId) }
+        }
+        for (id in missing) overrides[id] = seeds[id] ?: false
+    }
+}
+"""
+
 def write_fixture(root, rel, content):
     p = os.path.join(root, rel)
     os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -676,6 +1002,59 @@ def selftest():
                 print(f"[selftest FAIL] {name}: expected {'clean' if expect_clean else 'findings'}, got: {findings}")
             else:
                 print(f"[selftest ok] {name}: {'clean' if clean else f'{len(findings)} finding(s)'}")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    # [da1045-B6] seeding-guard arms: the defect shape flips red, every spelling
+    # of the same decision stays clean, and one criterion judges both sheets.
+    for name, mp, sk, expect_clean in (
+        ("mcps baseline: snapshot-unguarded seed loop", FIX_MCPS_NOGUARD, FIX_SKILLS_OK, False),
+        ("mcps shipped: seeds through the merge helper", FIX_MCPS_MERGE, FIX_SKILLS_OK, True),
+        ("mcps direct guard, brace-less", FIX_MCPS_BRACELESS, FIX_SKILLS_OK, True),
+        ("mcps guard spelled `overrides[id] == null`", FIX_MCPS_NULLREAD, FIX_SKILLS_OK, True),
+        ("mcps guard spelled `!overrides.containsKey(id)`", FIX_MCPS_CONTAINSKEY, FIX_SKILLS_OK, True),
+        ("mcps guard on the wrong map (`!in seeds`)", FIX_MCPS_WRONG_MAP, FIX_SKILLS_OK, False),
+        ("mcps helper called without the map", FIX_MCPS_HELPER_BLIND, FIX_SKILLS_OK, False),
+        ("skills sheet, same unguarded loop", FIX_MCPS_MERGE, FIX_SKILLS_NOGUARD, False),
+    ):
+        root = make_tree(FIX_CHATSCEEN_OK, sk, mp)
+        try:
+            findings = check(root)
+            clean = not findings
+            if clean != expect_clean:
+                ok = False
+                print(f"[selftest FAIL] {name}: expected {'clean' if expect_clean else 'findings'}, got: {findings}")
+            else:
+                print(f"[selftest ok] {name}: {'clean' if clean else f'{len(findings)} finding(s)'}")
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    # precision: each seed arm must produce EXACTLY its own finding and name its
+    # own anchor — a second finding means the arm is not isolating the
+    # criterion, zero means the criterion went blind.
+    for name, mp, sk, must_mention, want_count in (
+        ("mcps unguarded seed loop", FIX_MCPS_NOGUARD, FIX_SKILLS_OK,
+         ["SessionMcpsSheet.kt", "unguarded seeding write", "in-flight toggle"], 1),
+        ("mcps guard on the wrong map", FIX_MCPS_WRONG_MAP, FIX_SKILLS_OK,
+         ["SessionMcpsSheet.kt", "unguarded seeding write"], 1),
+        ("mcps helper without the map arg", FIX_MCPS_HELPER_BLIND, FIX_SKILLS_OK,
+         ["SessionMcpsSheet.kt", "merge*Overrides"], 1),
+        ("skills unguarded seed loop", FIX_MCPS_MERGE, FIX_SKILLS_NOGUARD,
+         ["SessionSkillsSheet.kt", "unguarded seeding write"], 1),
+    ):
+        root = make_tree(FIX_CHATSCEEN_OK, sk, mp)
+        try:
+            findings = check(root)
+            joined = " | ".join(findings)
+            for hit in must_mention:
+                if hit not in joined:
+                    ok = False
+                    print(f"[selftest FAIL] precision {name}: missing `{hit}` in findings")
+            if len(findings) != want_count:
+                ok = False
+                print(f"[selftest FAIL] precision {name}: expected {want_count} finding(s), got {len(findings)}: {findings}")
+            else:
+                print(f"[selftest ok] precision {name}: exactly {want_count} finding(s), anchors named")
         finally:
             shutil.rmtree(root, ignore_errors=True)
 
@@ -812,7 +1191,7 @@ def main():
         return 1
     print("session_sheet_id_binding_check: OK (4 session-scoped call blocks + LocalMarkdownSessionId "
           "active-bound, SessionEditSheet call args wired, both sheets id-keyed with incremental "
-          "seeding, edit-sheet keys id-keyed)")
+          "seeding through membership-guarded writes, edit-sheet keys id-keyed)")
     return 0
 
 
