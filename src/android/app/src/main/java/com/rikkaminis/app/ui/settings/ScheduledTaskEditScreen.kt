@@ -16,6 +16,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -29,6 +30,8 @@ import androidx.compose.ui.unit.dp
 import com.rikkaminis.app.R
 import com.rikkaminis.app.scheduled.ScheduledTask
 import com.rikkaminis.app.scheduled.ScheduledTaskPolicy
+import com.rikkaminis.app.scheduled.ScheduledTaskRevisionPolicy
+import com.rikkaminis.app.scheduled.ScheduledTaskTransitions
 import com.rikkaminis.app.scheduled.ScheduledTasksCodec
 import com.rikkaminis.app.scheduled.ScheduledTasksStore
 import com.rikkaminis.app.ui.components.MinisButton
@@ -76,6 +79,13 @@ fun ScheduledTaskEditScreen(
     // with Save locked for good (`original == null`) while Delete stayed live
     // on an id that no longer exists.
     var recordMissing by remember { mutableStateOf(false) }
+    // [deep-audit-1046 S-11] "This screen has finished its initial read." The
+    // change watcher below must not speak before it: a refresh that fires while
+    // the load effect is still in flight would judge the form against a document
+    // it has not loaded from yet.
+    var loadedOnce by remember { mutableStateOf(false) }
+    // The store's change ticker (bumped after every successful write).
+    val storeRevision by ScheduledTasksStore.revision.collectAsState()
 
     if (!isNew) {
         LaunchedEffect(taskId) {
@@ -94,6 +104,28 @@ fun ScheduledTaskEditScreen(
                 deadlineSec = loaded.deadlineSec.toString()
                 maxEstimatedTokens = loaded.maxEstimatedTokens.toString()
                 original = loaded
+                recordMissing = false
+            }
+            loadedOnce = true
+        }
+
+        // [deep-audit-1046 S-11] Second half of the load: follow the store.
+        // The screen used to read once, so a task deleted (or replaced away by a
+        // backup restore) while the form was open stayed editable, and Save
+        // appended it straight back — a deleted record resurrected together with
+        // the stale run state the form had snapshotted.
+        //
+        // Deliberately NOT a form refresh: when the target still exists only its
+        // run half may move (`original`). The spec fields belong to the text
+        // state above — a background run settling mid-typing must never rewrite
+        // the title under the user's cursor.
+        LaunchedEffect(taskId, storeRevision) {
+            if (!loadedOnce) return@LaunchedEffect
+            val fresh = ScheduledTasksStore.load(context).tasks.firstOrNull { it.id == taskId }
+            if (ScheduledTaskRevisionPolicy.shouldMarkMissing(loadedOnce, stillExists = fresh != null)) {
+                recordMissing = true
+            } else if (fresh != null) {
+                original = original?.let { ScheduledTaskTransitions.refreshRunState(it, fresh) }
                 recordMissing = false
             }
         }
@@ -282,7 +314,7 @@ fun ScheduledTaskEditScreen(
                 val prior = original
                 val effectiveId = taskId ?: ScheduledTasksCodec.newTaskId()
                 scope.launch {
-                    ScheduledTasksStore.upsertTask(
+                    val saved = ScheduledTasksStore.upsertTask(
                         context,
                         ScheduledTask(
                             id = effectiveId,
@@ -302,8 +334,24 @@ fun ScheduledTaskEditScreen(
                             failStreak = prior?.failStreak ?: 0,
                             suspendedByFuse = prior?.suspendedByFuse ?: false,
                         ),
+                        // [deep-audit-1046 S-11] Only a brand-new task may insert.
+                        // An edit whose target vanished must not append it back:
+                        // that resurrected a deleted record carrying the form's
+                        // stale run state (`enabled`, `lastRunDate`, a cleared
+                        // fuse). The store refuses, writes nothing, and the
+                        // screen says the record is gone.
+                        allowInsert = isNew,
                     )
-                    onDone()
+                    if (
+                        ScheduledTaskRevisionPolicy.shouldMarkMissing(
+                            loadedOnce,
+                            stillExists = saved.tasks.any { it.id == effectiveId },
+                        )
+                    ) {
+                        recordMissing = true
+                    } else {
+                        onDone()
+                    }
                 }
             },
             enabled = canSave,

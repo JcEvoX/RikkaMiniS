@@ -3147,6 +3147,34 @@ def test_dv16_chat_ui_interaction():
 
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# deep-audit-1046 gates (S-03 / S-06, registered at union wrap-up)
+# Same pattern as DA1016: every gate ships its own --selftest with negative
+# arms; asserted through its unique closing marker so a stubbed gate cannot
+# pass silently, plus the real-tree run pinned the way CI invokes it.
+# ─────────────────────────────────────────────────────────────────────────────
+
+DA1046_GATES = [
+    # (script without .py, selftest closing marker, real-tree argv)
+    ("anthropic_thinking_budget_check", "ANTHROPIC_THINKING_BUDGET_SELFTEST=PASS", (REPO_ROOT,)),
+    ("overlay_show_hide_latch_check", "OVERLAY_SHOW_HIDE_LATCH_SELFTEST=PASS", (REPO_ROOT,)),
+]
+
+
+def test_da1046_gates():
+    print("━━━ deep-audit-1046 gates (selftest teeth + real tree) ━━━")
+    for script, marker, real_args in DA1046_GATES:
+        proc = subprocess.run(
+            [sys.executable, os.path.join(SCRIPT_DIR, script + ".py"), "--selftest"],
+            capture_output=True, text=True,
+        )
+        out = (proc.stdout or "") + (proc.stderr or "")
+        check(f"{script} selftest has teeth ({marker})", proc.returncode == 0 and marker in out,
+              out[-280:])
+        rc, out = run_scanner(script + ".py", *real_args)
+        check(f"{script} real tree green", rc == 0, out[-280:])
+
+
 def main():
     print("╔══════════════════════════════════════════════════╗")
     print("║  Scan Self-Test (fixture ground truth)          ║")
@@ -3180,6 +3208,7 @@ def main():
     test_scheduled_store_release()
     test_da1017_gates()
     test_da1016_gates()
+    test_da1046_gates()
     test_da1018_gates()
     test_da1019_gates()
     test_da1020_gates()
