@@ -2125,6 +2125,144 @@ def check_group_member_resolution(code):
              "empty / 「No usable models」" % ", ".join(str(x) for x in bad))]
 
 
+# --- [dv25/B-04] C35 / C36: the ACTIVE entry, and the elvis that ate the if ---
+
+# A lookup INTO the persisted list. Deliberately keyed on `modelEntries` only: a
+# group member id may also be looked up in a local `entries` list already
+# filtered for a provider section, and that shape is not this decision.
+_PERSISTED_LOOKUP_RE = re.compile(
+    r"\bmodelEntries\s*\.\s*"
+    r"(?:find|findLast|first|firstOrNull|lastOrNull|filter|filterNotNull|singleOrNull|any|none)\b")
+# …and the lookup is ID-KEYED (not, say, a per-provider filter).
+_ID_KEY_RE = re.compile(r"\bit\.(?:id|uuid)\s*[!=]=")
+_ELVIS_SWALLOW_RE = re.compile(r"\belse\s+null\s*\?:")
+
+# Trailing tokens that make the next line part of this logical statement.
+_CONT_TAIL = ("(", "{", ",", "=", "->", "?.", ".", "&&", "||", "?:", "+", "|", ":")
+# Leading tokens that continue the previous line.
+_CONT_HEAD = ("?:", ".", "?.", "->", "&&", "||", ")", "}", ",")
+
+
+def _statement_around(code, pos):
+    """Offsets (start, end) of the LOGICAL statement containing `pos`.
+
+    [_member_block] walks FORWARD from a mention, which is enough when the
+    mention opens the statement — and wrong for every shape where the token sits
+    in the middle of a call:
+    `pickerHeaderEntry(activeEntryId = activeEntryId, …) { … }` starts one line
+    up, and a forward walk from the mention cuts the statement in half (the
+    mention's own indent is deeper than the call's, so the very next line looks
+    like a sibling) and hides the single-source call on the line below. So: walk
+    BACK over continuation lines, then forward.
+
+    A line continues the previous one when it starts with an operator / `.` /
+    `)`, or the previous line ends with one, or the previous line leaves a
+    bracket open. Comments are already stripped by [strip_comments]."""
+    lines = code.split("\n")
+    idx = code.count("\n", 0, pos)
+    lo = idx
+    while lo > 0:
+        prev = lines[lo - 1].rstrip()
+        cur = lines[lo].lstrip()
+        if not prev.strip():
+            break
+        if (prev.endswith(_CONT_TAIL) or cur.startswith(_CONT_HEAD)
+                or prev.count("(") + prev.count("[") + prev.count("{")
+                > prev.count(")") + prev.count("]") + prev.count("}")):
+            lo -= 1
+            continue
+        break
+    hi = idx
+    depth = 0
+    while hi < len(lines):
+        line = lines[hi]
+        depth += (line.count("(") + line.count("[") + line.count("{")) \
+            - (line.count(")") + line.count("]") + line.count("}"))
+        if hi + 1 < len(lines):
+            nxt = lines[hi + 1].lstrip()
+            if depth > 0 or line.rstrip().endswith(_CONT_TAIL) or nxt.startswith(_CONT_HEAD):
+                hi += 1
+                continue
+        break
+    start = len("\n".join(lines[:lo])) + (1 if lo else 0)
+    end = start + len("\n".join(lines[lo:hi + 1]))
+    return start, end
+
+
+def check_active_entry_single_source(code):
+    """C35 [dv25/B-04] — the SELECTED group's active entry resolves through the
+    same single source as one of its members.
+
+    The bug: the picker header looked the active entry up in
+    `config.modelEntries` alone, two lines above a `SystemVoiceEntries.resolveIn`
+    for the very next member. A default Voice Input/Output group is built from
+    System sentinels ONLY, so selecting one resolved its own active entry to
+    null — the header fell back to 「N models」 / 「No linked models」 while the
+    member rows below it, which did consult the System source, listed the very
+    same entry.
+
+    Graded as the DECISION 「an id-keyed lookup into the persisted list consults
+    the System source」, per site, not per spelling: `resolveIn(…)` and
+    `find { it.id == … } ?: SystemVoiceEntries.resolve(…)` both qualify, and a
+    lookup handed to a helper as a lambda counts by the lambda's own body. Sites
+    are DERIVED (every id-keyed persisted lookup on the surface), never listed.
+
+    Fail-closed: a surface with neither a persisted lookup nor any
+    SystemVoiceEntries reference was reworked and must be re-derived instead of
+    passing vacuously."""
+    if "SystemVoiceEntries." not in code and not _PERSISTED_LOOKUP_RE.search(code):
+        return [("C35", False,
+                 "no persisted entry lookup AND no System single source on this "
+                 "surface — fail-closed, re-derive this criterion instead of "
+                 "letting it pass vacuously")]
+    bad = []
+    sites = 0
+    m = _PERSISTED_LOOKUP_RE.search(code)
+    while m:
+        start, end = _statement_around(code, m.start())
+        stmt = code[start:end]
+        m = _PERSISTED_LOOKUP_RE.search(code, end)
+        if not _ID_KEY_RE.search(stmt):
+            continue
+        sites += 1
+        if "SystemVoiceEntries." not in stmt:
+            bad.append(code.count("\n", 0, start) + 1)
+    if not sites:
+        return [("C35", True,
+                 "no persisted-only id lookup remains — every entry resolution on "
+                 "this surface routes through the System single source")]
+    return [("C35", not bad,
+             "%d id-keyed persisted lookup(s), all consult the System single source"
+             % sites if not bad else
+             "id-keyed lookup into `modelEntries` without the System source at "
+             "line(s) %s — a System voice entry (a default Voice group's ONLY "
+             "member) resolves to null there" % ", ".join(str(x) for x in bad))]
+
+
+def check_elvis_after_else_null(code):
+    """C36 [dv25/B-04] — `… else null ?: fallback` binds the fallback to the else
+    branch, not to the `if`.
+
+    In Kotlin `?:` binds tighter than the branches of an `if` expression, so
+    `if (c) { active } else null ?: firstMember` means
+    `if (c) { active } else (null ?: firstMember)`. The `if` branch — the
+    SELECTED case, the one whose fallback matters — gets nothing, and the
+    fallback is dead code that only runs when `c` is already false (where it is
+    exactly what `else null` would have produced anyway).
+
+    Graded as the decision point, not a spelling: the guard is 「a bare `null`
+    left operand of an elvis, in an else branch」, which has no correct use. A
+    parenthesised `else (null ?: x)` still reds — same precedence surprise, more
+    typing."""
+    bad = [code.count("\n", 0, m.start()) + 1 for m in _ELVIS_SWALLOW_RE.finditer(code)]
+    return [("C36", not bad,
+             "no `else null ?:` precedence swallow" if not bad else
+             "`else null ?:` at line(s) %s — the elvis attaches to the else branch "
+             "alone, so the if branch has no fallback at all and the fallback "
+             "below only ever runs when the if already failed"
+             % ", ".join(str(x) for x in bad))]
+
+
 def check_capability_single_source(code):
     """C33 [dv22/B-03] — capability is read from the effective model, one exit.
 
@@ -2304,6 +2442,11 @@ CHECKERS = (
     # sentinels, so both rendered/counted nothing and skipped the non-text
     # confirmation).
     (REL_MODEL_PICKER_SHEET, check_group_member_resolution),
+    # dv25-B4 (C35/C36) — this surface also resolves the SELECTED group's
+    # ACTIVE entry (the header), and that lookup had drifted off the single
+    # source; its `else null ?:` bound the fallback to the else branch alone.
+    (REL_MODEL_PICKER_SHEET, check_active_entry_single_source),
+    (REL_MODEL_PICKER_SHEET, check_elvis_after_else_null),
     (REL_CHAT_SCREEN, check_group_member_resolution),
 )
 
@@ -3466,6 +3609,30 @@ internal fun pickerGroupMembers(config: ProviderConfig, group: ModelGroup): List
         SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
     }
 
+// [dv25/B-04] C35 / C36 are registered on this surface too: the group HEADER
+// resolves the selected group's ACTIVE entry, and the member fallback must hang
+// off the `if`, not off its else branch.
+internal fun pickerHeaderEntry(
+    isSelected: Boolean,
+    activeEntryId: String?,
+    memberEntryIds: List<String>,
+    resolve: (String) -> ModelEntry?,
+): ModelEntry? {
+    val fromActive = if (isSelected && activeEntryId != null) resolve(activeEntryId) else null
+    return fromActive ?: memberEntryIds.firstNotNullOfOrNull { entryId ->
+        SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
+    }
+}
+
+internal fun pickerDisplayMembers(
+    resolvedMembers: List<ModelEntry>,
+    isSelected: Boolean,
+    activeEntryId: String?,
+    resolve: (String) -> ModelEntry?,
+): List<ModelEntry> = resolvedMembers.ifEmpty {
+    if (isSelected && activeEntryId != null) listOfNotNull(resolve(activeEntryId)) else emptyList()
+}
+
 internal fun ModelPickerSheetProviderSections(allInstanceIds: Set<String>) {
     var searchText by remember { mutableStateOf("") }
     var collapsedInstanceIds by remember(allInstanceIds) {
@@ -3502,6 +3669,37 @@ FIX_MODEL_PICKER_SHEET_MISSING_ANCHOR = """package com.rikkaminis.app.ui.chat
 
 fun unrelated() {}
 """
+
+# --- [dv25/B-04] C35: the ACTIVE entry must share the single source ----------
+
+# the header looks the active entry up in the persisted list alone, so a System
+# sentinel active entry (a default Voice group's only inhabitant) resolves null.
+FIX_MODEL_PICKER_SHEET_ACTIVE_BARE = FIX_MODEL_PICKER_SHEET_CLEAN.replace(
+    "val fromActive = if (isSelected && activeEntryId != null) resolve(activeEntryId) else null",
+    "val fromActive = if (isSelected && activeEntryId != null) "
+    "config.modelEntries.find { it.id == activeEntryId } else null")
+
+# the members resolve correctly but the ACTIVE fallback row does not — this is
+# the `:786` shape verbatim: its own statement, so C34 (which grades the
+# `memberEntryIds` blocks) is blind to it and C35 is the only witness.
+FIX_MODEL_PICKER_SHEET_MEMBER_BARE = FIX_MODEL_PICKER_SHEET_CLEAN.replace(
+    "listOfNotNull(resolve(activeEntryId)) else emptyList()",
+    "listOfNotNull(config.modelEntries.find { it.id == activeEntryId }) else emptyList()")
+
+# --- [dv25/B-04] C36: the precedence swallow, verbatim -----------------------
+
+# Both lookups correctly route through the System source, so ONLY the elvis
+# placement is wrong — that is what makes this arm pin C36 by itself.
+FIX_MODEL_PICKER_SHEET_ELVIS_SWALLOW = FIX_MODEL_PICKER_SHEET_CLEAN.replace(
+    """    val fromActive = if (isSelected && activeEntryId != null) resolve(activeEntryId) else null
+    return fromActive ?: memberEntryIds.firstNotNullOfOrNull { entryId ->
+        SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
+    }""",
+    """    return if (isSelected && activeEntryId != null) {
+        SystemVoiceEntries.resolveIn(config.modelEntries, activeEntryId)
+    } else null ?: memberEntryIds.firstNotNullOfOrNull { entryId ->
+        SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
+    }""")
 
 # the shared picker's own render decision, ungated (same defect, other file).
 FIX_PICKER_RENDER_UNGATED = FIX_MODEL_ENTRY_PICKER_CLEAN.replace(
@@ -3867,7 +4065,7 @@ def run_selftest():
     # --- dv24-B2: the two surfaces whose resolution spelling was unrecognised --
     run_case("c34-picker-no-system-fallback", 1,
              variant(REL_MODEL_PICKER_SHEET, FIX_MODEL_PICKER_SHEET_NO_SYSTEM_FALLBACK),
-             failures, ("C34",))
+             failures, ("C34", "C35"))
     run_case("c34-screen-no-system-fallback", 1,
              variant(REL_CHAT_SCREEN, FIX_CHAT_SCREEN_NO_SYSTEM_FALLBACK), failures, ("C34",))
     run_case("c34-screen-entrybyid-indirection", 1,
@@ -4111,7 +4309,17 @@ def run_selftest():
     # criteria closed — that is the intended shape, not an extra red.
     run_case("failclosed-sheet-missing-anchor", 1,
              variant(REL_MODEL_PICKER_SHEET, FIX_MODEL_PICKER_SHEET_MISSING_ANCHOR), failures,
-             ("C32", "C34"))
+             ("C32", "C34", "C35"))
+    # --- dv25-B4: C35 (active entry shares the single source) / C36 (elvis) ---
+    run_case("c35-picker-active-bare-find", 1,
+             variant(REL_MODEL_PICKER_SHEET, FIX_MODEL_PICKER_SHEET_ACTIVE_BARE),
+             failures, ("C35",))
+    run_case("c35-picker-active-fallback-bare-find", 1,
+             variant(REL_MODEL_PICKER_SHEET, FIX_MODEL_PICKER_SHEET_MEMBER_BARE),
+             failures, ("C35",))
+    run_case("c36-picker-elvis-eats-the-if", 1,
+             variant(REL_MODEL_PICKER_SHEET, FIX_MODEL_PICKER_SHEET_ELVIS_SWALLOW),
+             failures, ("C36",))
     run_case("c32-picker-render-ungated", 1,
              variant(REL_MODEL_ENTRY_PICKER, FIX_PICKER_RENDER_UNGATED), failures, ("C32",))
     if failures:
