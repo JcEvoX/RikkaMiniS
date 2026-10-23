@@ -96,14 +96,11 @@ object FileWriteTool {
             // was unreachable and gave a false sense that the write was
             // validated. Use an encoder configured to REPORT malformed input,
             // which does reject unpaired surrogates.
-            try {
-                Charsets.UTF_8.newEncoder()
-                    .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
-                    .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
-                    .encode(java.nio.CharBuffer.wrap(effectiveContent))
-            } catch (e: java.nio.charset.CharacterCodingException) {
+            // [deep-audit-1047 A-08] file_edit now takes the same check
+            // (UnencodableContentGuard) instead of a third inline copy.
+            if (isUnpairedSurrogateFailure(effectiveContent)) {
                 return ToolExecutionResult(
-                    "Error: Content contains unpaired surrogates and cannot be encoded as UTF-8",
+                    UNENCODABLE_CONTENT_MESSAGE,
                     false,
                     toolTitle = toolTitle,
                 )
