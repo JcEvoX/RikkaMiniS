@@ -86,41 +86,118 @@ fun ChatViewModel.regenerateSessionTitle() {
  * `ChatViewModelStore` and would otherwise keep rendering the pre-promotion
  * (empty) transcript until the next process start.
  *
+ * [dv25-B08] Two more things promotion has to own, both on the same "the user's
+ * input must survive" line:
+ *
+ *  - **Attachments** ride along. The pre-dv25 body was persisted as
+ *    `buildUserPartsJson(text, emptyList())`, so a draft that carried images /
+ *    files promoted a text-only row and the user's staged uploads evaporated when
+ *    the composer was cleared. The promotion now takes the SAME single source
+ *    `send()` takes (`prepareUserAttachments` → mediaRef parts + attached-files
+ *    inventory), and the in-memory attachment list is cleared with the text.
+ *  - **The newest text**, not the last committed one. `_inputText` is committed per
+ *    keystroke for ordinary typing, but a >8-char IME burst is buffered in the
+ *    composer for 150 ms; reading only the ViewModel string promoted the body as it
+ *    was BEFORE the burst. `composerTextForPromotion` prefers the pending snapshot.
+ *
  * Returns true when promotion was triggered — the caller should let
  * onNewChat proceed (the slot is already freed either way).
  */
 fun ChatViewModel.promoteDraftIfNeeded(): Boolean {
     if (!isDraft || realSessionId.isNotEmpty()) return false
-    val text = _inputText.value
+    // [dv25-B08] A second tap while the first promotion is still running must not
+    // capture the same draft again: it would append a SECOND user row for the same
+    // body. Both New-Chat entrances ignore the return value, so returning false
+    // here only says "no new promotion was triggered" — the caller still navigates.
+    if (promoteInFlight) return false
+    // [dv25-B08] `_inputText` commits ordinary typing per keystroke but buffers a
+    // large IME burst (voice dictation / pinyin) for 150 ms; the pending snapshot
+    // IS the field's live text, so it is the newest copy of what the user typed.
+    val text = composerTextForPromotion(_pendingComposerText.value, _inputText.value)
     if (text.isBlank()) return false
+    val stagedAttachments = _attachments.value
+    // Captured before `ensureSession()`: that call renames the ViewModel onto the
+    // real id and the draft slot is released right below.
+    val draftId = sessionId
 
-    // Free the draft slot synchronously — the text is captured in `text` and
-    // still sits in the composer, so nextDraftId may mint a fresh ID before
-    // the navigation fires without anything being destroyed.
-    com.rikkaminis.app.data.ComposerDraftStore.clearDraft(context, sessionId)
+    // [dv25-B08] Claim the session BEFORE anything is destroyed. `ChatScreen`'s
+    // onDispose fires `cleanupIfEmptyOnExit()` on the very next frame (the top-bar
+    // New Chat navigates immediately, the drawer path after its 200 ms settle), and
+    // in the window between `ensureSession()` — which inserts the row but no
+    // message — and the `appendMessage()` below, that sweep read
+    // `messageCount(sid) == 0`, deleted the brand-new row and called
+    // `ChatViewModelStore.release(sid)`, which cancels THIS coroutine after the
+    // composer copy is already gone. The bit is a session-ownership claim, not a
+    // grace period: it is cleared in `finally`, so a failed promotion releases it.
+    promoteInFlight = true
 
-    // Create a real session row, a title, and the durable body copy.
-    viewModelScope.launch {
-        val sid = ensureSession()
-        if (sid.isEmpty()) return@launch
-        val title = text.take(50).trim()
-        chatRepository.updateSessionTitleAndCategory(sid, title, null)
-        _sessionTitle.value = title
-        // The transcript row is the durable home for the body: `appendMessage`
-        // also refreshes `last_message` + `updated_at`, which is what makes the
-        // row visible (and un-sweepable) without a second write.
-        val promoted = chatRepository.appendMessage(
-            sid,
-            "user",
-            buildUserPartsJson(text, emptyList()),
-        )
-        _messages.value = _messages.value + ChatMessage(
-            id = promoted.id,
-            role = "user",
-            content = text,
-        )
-        // Only now is the composer copy redundant. See the KDoc above.
-        _inputText.value = ""
+    // Free the draft slot synchronously — the text is captured in `text` and still
+    // sits in the composer, so nextDraftId may mint a fresh ID before the
+    // navigation fires without anything being destroyed.
+    //
+    // [dv25-B08] This ordering is deliberate and NOT the "clear after the durable
+    // write" shape used for the in-memory copies below: the slot doubles as the id
+    // allocator for the next New Chat (`ComposerDraftStore.nextDraftId` hands back an
+    // existing slot), so a deferred clear would make the next draft reuse this
+    // draft's id — and the deferred clear would then wipe ITS text. Durability
+    // against cancellation is provided by `promoteInFlight` + the restore below,
+    // not by holding the slot hostage.
+    com.rikkaminis.app.data.ComposerDraftStore.clearDraft(context, draftId)
+
+    viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+        var persisted = false
+        try {
+            val sid = ensureSession()
+            if (sid.isEmpty()) return@launch
+            val title = promoteTitle(text)
+            chatRepository.updateSessionTitleAndCategory(sid, title, null)
+            _sessionTitle.value = title
+            // [dv25-B08] Attachments take the SAME single-source path `send()` uses:
+            // copied into the promoted session's media dir, with their mediaRef parts
+            // riding the transcript row (so the bubble re-renders after a reload
+            // instead of collapsing to a bodyless text bubble).
+            val prepared = prepareUserAttachments(stagedAttachments, sid)
+            // The transcript row is the durable home for the body: `appendMessage`
+            // also refreshes `last_message` + `updated_at`, which is what makes the
+            // row visible (and un-sweepable) without a second write.
+            val promoted = chatRepository.appendMessage(
+                sid,
+                "user",
+                buildUserPartsJson(text, prepared.mediaRefPartsJson, prepared.attachedFilesXml),
+            )
+            _messages.value = _messages.value + ChatMessage(
+                id = promoted.id,
+                role = "user",
+                content = text,
+                imageUris = prepared.imageUris,
+                attachmentNames = prepared.attachmentNames,
+                attachmentUris = prepared.nonImageUris,
+            )
+            persisted = true
+            // Only now are the composer copies redundant. See the KDoc above.
+            _inputText.value = ""
+            _attachments.value = emptyList()
+            publishPendingComposerText(null)
+        } catch (c: kotlinx.coroutines.CancellationException) {
+            // Termination path: a cancelled scope must stay cancelled (the restore
+            // below still runs in `finally`).
+            throw c
+        } catch (t: Throwable) {
+            com.rikkaminis.app.logging.AppLogger.warning(
+                "ChatViewModel",
+                "promoteDraftIfNeeded failed for $draftId: ${t.message}",
+            )
+        } finally {
+            promoteInFlight = false
+            if (!persisted) {
+                // The durable write did not land: hand the text back to the draft
+                // slot so the next New Chat / process start still finds it. Safe by
+                // the store's own stale-id rule — `saveText` is a no-op when the slot
+                // has been claimed by a DIFFERENT draft in the meantime, so this can
+                // never overwrite text the user typed after the promotion failed.
+                com.rikkaminis.app.data.ComposerDraftStore.saveText(context, draftId, text)
+            }
+        }
     }
     return true
 }

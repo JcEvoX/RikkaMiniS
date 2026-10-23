@@ -814,6 +814,46 @@ class ChatViewModel(
     internal val _inputText = MutableStateFlow("")
     val inputText: StateFlow<String> = _inputText.asStateFlow()
 
+    /**
+     * [dv25-B08 / deep-audit-1045 B-08] The composer's pending 150 ms IME burst
+     * snapshot, published by `ChatInputArea` (the only place that can see the
+     * field's live `TextFieldValue`).
+     *
+     * `_inputText` is committed per keystroke for ordinary typing but a large
+     * burst (voice dictation / pinyin, see `shouldDebounceImeBurst`) is buffered
+     * locally and flushed 150 ms later. Anything that must act on "what the user
+     * has typed" outside the composer — today only `promoteDraftIfNeeded` — would
+     * otherwise read the PRE-burst string and silently drop the tail. The field
+     * publishes the snapshot here while it is pending and nulls it the moment the
+     * field commits past it, so this value is always the newest one and never
+     * outlives its own flush (the `fix/ttfb-thinktag-composer` lesson).
+     */
+    internal val _pendingComposerText = MutableStateFlow<String?>(null)
+
+    /** [dv25-B08] See [_pendingComposerText]. Null = the field and [_inputText] agree. */
+    fun publishPendingComposerText(text: String?) {
+        if (_pendingComposerText.value != text) _pendingComposerText.value = text
+    }
+
+    /**
+     * [dv25-B08 / deep-audit-1045 B-08] Session ownership bit for a draft
+     * promotion in flight.
+     *
+     * `promoteDraftIfNeeded` inserts the session row (`ensureSession`) and writes
+     * the first message several suspends later. In that window the row exists but
+     * has `messageCount == 0`, which is exactly what `cleanupIfEmptyOnExit` (fired
+     * from `ChatScreen`'s onDispose when the user taps the top-bar New Chat) reads
+     * before deleting the row and releasing this ViewModel — cancelling the
+     * promotion coroutine after the composer copy was already dropped.
+     *
+     * `@Volatile`: written on the main thread by the promotion, read by
+     * `cleanupIfEmptyOnExit` from wherever the caller happens to run it. The bit
+     * is the guard; it is not a time window, so it needs no timer and no grace
+     * period.
+     */
+    @Volatile
+    internal var promoteInFlight: Boolean = false
+
     // [T-context-exhausted-dialog] iOS-parity prompt for send-at-capacity. When
     // the context reaches EXHAUSTED the send is NOT silently dropped (Android
     // pre-fix behaviour) nor hard-blocked behind an inline message — instead
@@ -4317,6 +4357,9 @@ class ChatViewModel(
      * Called from ChatScreen's onDispose. Gates:
      *   - realSessionId must be non-empty (a row was actually inserted)
      *   - not currently streaming (background agent work would be lost)
+     *   - no attachments staged (the user handed us files with no message yet)
+     *   - no draft promotion in flight ([promoteInFlight] — the row belongs to
+     *     the promotion; its first message row has not landed yet)
      *   - persisted message count == 0 (authoritative DB check — `_messages`
      *     also contains ephemeral system-info bubbles that aren't persisted,
      *     so a state-only check would over-count).
@@ -4327,13 +4370,38 @@ class ChatViewModel(
      */
     fun cleanupIfEmptyOnExit() {
         val sid = realSessionId
-        if (sid.isEmpty()) return
-        if (_isStreaming.value) return
-        if (_attachments.value.isNotEmpty()) return
+        // [dv25-B08 / deep-audit-1045 B-08] The four reasons a departure must NOT
+        // reap the row live in one pure predicate (PromoteDraftPolicy) so the
+        // decision is JVM-pinnable. `promoteInFlight` is a session-ownership bit,
+        // not a grace period: between `ensureSession()` and the promotion's first
+        // `messages` row the count IS legitimately zero, and deleting there also
+        // releases this ViewModel — cancelling the very coroutine that was about
+        // to fill the row, after the composer copy had already been dropped.
+        if (shouldSkipCleanup(
+                hasRealId = sid.isNotEmpty(),
+                streaming = _isStreaming.value,
+                hasAttachments = _attachments.value.isNotEmpty(),
+                promoteInFlight = promoteInFlight,
+            )
+        ) {
+            return
+        }
         viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
             try {
                 val count = chatRepository.messageCount(sid)
                 if (count > 0) return@launch
+                // [dv25-B08] Re-read the ownership bit AFTER the IO hop: a
+                // promotion that started while this coroutine was in flight owns
+                // the row now, and the count is legitimately zero until its first
+                // message lands. Deleting here would also release the ViewModel
+                // and cancel the promotion itself.
+                if (promoteInFlight) {
+                    AppLogger.info(
+                        TAG,
+                        "cleanupIfEmptyOnExit: skipping $sid — a draft promotion owns it",
+                    )
+                    return@launch
+                }
                 AppLogger.info(
                     TAG,
                     "cleanupIfEmptyOnExit: deleting empty session $sid (no persisted messages)",
