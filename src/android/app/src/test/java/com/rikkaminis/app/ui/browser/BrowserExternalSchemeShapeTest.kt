@@ -93,7 +93,7 @@ class BrowserExternalSchemeShapeTest {
 
     private fun repoRoot(): File {
         System.getProperty("probe.repo")?.let { return File(it) }
-        var dir: File? = File(System.getProperty("user.dir"))
+        var dir: File? = File(System.getProperty("user.dir") ?: ".")
         while (dir != null) {
             if (File(dir, handler).exists()) return dir
             dir = dir.parentFile

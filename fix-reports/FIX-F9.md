@@ -138,6 +138,10 @@ clipData / component / package / selector / 大小写各一次），而 browser 
 | m4 整串 lowercase（payload 被改写） | 恰 1 红 |
 | m5 完全不归一 | 恰 1 红 |
 
+**源形状测试本地化**（自伤 6 的补救）：`java -Dprobe.repo=$PWD -cp … org.junit.runner.JUnitCore
+com.rikkaminis.app.util.IntentSanitizePolicyTest com.rikkaminis.app.ui.browser.BrowserExternalSchemeShapeTest
+com.rikkaminis.app.sandbox.offload.PhotosImportShapeTest` → **`OK (18 tests)`**（`probe/l3/shape-run.log`）。
+
 另外用 `android.jar` + `core-ktx` 桩独立编译 `IntentSanitizer.kt` + `IntentSanitizePolicy.kt` +
 `BrowserExternalSchemeHandler.kt` → **rc=0，0 error**（`probe/l3/ktcompile2.log`）。
 
@@ -188,4 +192,12 @@ clipData / component / package / selector / 大小写各一次），而 browser 
   里写了 `Intent.parseUri`，而 JVM 方法名不允许 `.`（Kotlin 只放行空格等少量字符）。改名为
   `the page's raw casing never reaches the parser`。**本地 kotlinc 编译新测试类已能提前抓到**
   （本轮补跑了 `probe/l3/testcompile.log` rc=0 才推），教训：新增/改名 backticked 测试必须本地编译过一次。
+- **自伤 6（CI 第二轮红，真错）**：`BrowserExternalSchemeShapeTest > the KDoc no longer claims a strip the code never performed` FAILED
+  —— 我在改写 KDoc 时**把被禁的 flag 字面量写进了「说明它曾是假的」那句话里**，而这条测试断言的是
+  「文件里不出现 `FLAG_ACTIVITY_NEW_DOCUMENT`」。（`BrowserExternalSchemeShapeTest.kt:78`）
+  **根因不是措辞，是验证缺口**：这些源形状测试是**纯 JVM**（只依赖 `java.io` + JUnit，`readRepoFile`
+  用 `-Dprobe.repo` 或从 `user.dir` 上溯），我却只在 L3 里跑了 `IntentSanitizePolicyTest`，把它们留给 CI。
+  本轮补上本地运行器后 3 个类 **`OK (18 tests)`**（policy 5 + browser shape 4 + photos shape 9）。
+  **规则**：凡本支新增/改动的**源形状测试**，收工前必须本地 `kotlinc` + `JUnitCore -Dprobe.repo=$PWD` 跑一遍，
+  不能当作「只能 CI 跑」。
 - **不确定项**：`PhotosImportShapeTest` 是既有源形状测试，本支把它的断言从「tryOpen 里有内联 strip」改成「tryOpen 委派 + 共享体有全量 strip」。这不是放宽而是**加强**（覆盖了唯一实现），但属于对既有测试的语义修改，已在报告显式登记，供主会话复核。
