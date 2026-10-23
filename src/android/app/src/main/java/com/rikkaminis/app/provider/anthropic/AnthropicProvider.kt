@@ -8,6 +8,7 @@ import com.rikkaminis.app.data.model.LLMError
 import com.rikkaminis.app.data.model.parseRetryAfterMs
 import com.rikkaminis.app.data.model.LLMMessage
 import com.rikkaminis.app.data.model.LLMModel
+import com.rikkaminis.app.provider.LegacyMediaPlan
 import com.rikkaminis.app.provider.clampOutboundMaxTokens
 import com.rikkaminis.app.provider.clampOutboundTemperature
 import com.rikkaminis.app.provider.sanitizeToolPairing
@@ -887,9 +888,21 @@ class AnthropicProvider(
             } else {
                 val isLastUser = msg.role == LLMMessage.Role.USER &&
                     index == messages.indexOfLast { it.role == LLMMessage.Role.USER }
-                if (isLastUser && imageParts.isNotEmpty()) {
+                // [deep-audit-1047 A-03] `msg.imageParts` is a per-message carrier the
+                // payload predicate already weighs (`hasWirePayload`), so it needs a
+                // serializer here too. The request-level list keeps its contract
+                // (last user turn only); the message's own parts stay on its own turn.
+                // No producer feeds this in production today, so every live path is
+                // byte-identical to before.
+                val legacyImages = (if (isLastUser) imageParts else emptyList()) + msg.imageParts
+                val legacyImageCount = LegacyMediaPlan.imageCount(
+                    attachRequestImages = isLastUser,
+                    requestImageCount = imageParts.size,
+                    messageImageCount = msg.imageParts.size,
+                )
+                if (legacyImageCount > 0) {
                     val contentArray = JSONArray()
-                    for (part in imageParts) {
+                    for (part in legacyImages) {
                         val visionText = visionPlaceholder(supportsImages, VISION_UNSUPPORTED_PLACEHOLDER)
                         if (visionText != null) {
                             // [§27a] Non-vision model — placeholder, mirrors the
