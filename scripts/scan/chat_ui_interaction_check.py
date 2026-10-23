@@ -137,6 +137,10 @@ INPUT_REL = CHAT + "/ChatInputArea.kt"
 # [dv23-B3] ChatScreen is an OPTIONAL read: the minimal fixture trees in
 # test_scan.py never ship it, exactly like the D5/D6 sibling sources.
 SCREEN_REL = CHAT + "/ChatScreen.kt"
+# [dv24/B-05] the ViewModel half of the composer handoff: the two entrances that
+# used to resolve the composer text themselves. OPTIONAL read for the same
+# reason as ChatScreen.kt.
+VM_REL = CHAT + "/ChatViewModel.kt"
 GESTURE_REL = CHAT + "/MinisTextKitGesture.kt"
 SELECTION_REL = CHAT + "/MinisTextKitSelection.kt"
 STREAM_REL = CHAT + "/StreamingMarkdownText.kt"
@@ -771,6 +775,29 @@ def composer_screen_handoff_findings(screen_c, inp_c):
     if screen_c is None:
         return problems
 
+    # ── G5: the screen never reads or writes the debounced composer string ──
+    # [dv24/B-05] G2 banned only the empty-string write; every other write and
+    # every read of `viewModel.inputText` used the 150 ms-debounced snapshot.
+    # Five entrances were still doing it: the two share/transfer appends (built
+    # the new text from the snapshot and wrote it back), the message-edit
+    # prefill (an equal write, dropped by the StateFlow, then overwritten by the
+    # live burst) and the 'Context Full' restore. A screen has no business
+    # owning the composer body at all — it raises intents.
+    for m in SET_INPUT_RE.finditer(screen_c):
+        stmt = _statement_at(screen_c, m.start())
+        if CLEAR_WRITE_RE.search(stmt):
+            continue        # G2 owns the empty-string clear (dedicated criterion)
+        problems.append(("G5a", "ChatScreen writes the composer body itself (%s) — raise a "
+                         "ComposerCommand instead: the write lands on the debounced copy "
+                         "(or is dropped outright when it equals it), and the composer's "
+                         "live field then keeps the stale text"
+                         % stmt.strip()[:90]))
+    for m in DEBOUNCED_READ_RE.finditer(screen_c):
+        problems.append(("G5b", "ChatScreen reads `viewModel.inputText` (%s) — that is the "
+                         "150 ms-debounced snapshot, not what the user sees; a dictation or "
+                         "paste inside the window is overwritten by the string read here"
+                         % _statement_at(screen_c, m.start()).strip()[:90]))
+
     # ── G1: the screen never resolves slash-menu text itself ────────────────
     for label, rx in (("dismissSlashMenu", DISMISS_RE),
                       ("showSlashMenuOverInput", SHOW_SLASH_RE)):
@@ -847,6 +874,129 @@ def composer_screen_handoff_findings(screen_c, inp_c):
         problems.append(("G4", "the collector never reaches the clear funnel `%s` — the "
                          "Clear intent would bypass the three-write reset (empty string + "
                          "field + caret) and leave the draft on screen" % funnel))
+    return problems
+
+# ── G5-G7: every composer write is an intent (dv24-B05) ─────────────────────
+
+SET_INPUT_RE = re.compile(r"\bsetInputText\s*\(")
+DEBOUNCED_READ_RE = re.compile(r"\bviewModel\s*\.\s*inputText\b")
+DISPATCH_CALL_RE = re.compile(r"\brequestComposerCommand\s*\(")
+CMD_DECL_OBJECT_RE = re.compile(r"data\s+object\s+(\w+)\s*:\s*ComposerCommand")
+CMD_DECL_CLASS_RE = re.compile(r"data\s+class\s+(\w+)\s*\(")
+CMD_ARM_RE = re.compile(r"(?:is\s+)?ComposerCommand\s*\.\s*(\w+)\s*->")
+
+def _brace_block(text, open_idx):
+    """Text between the braces at/after [open_idx] (brace-matched)."""
+    ob = text.find("{", open_idx)
+    if ob < 0:
+        return None
+    depth = 0
+    i = ob
+    while i < len(text):
+        ch = text[i]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[ob + 1:i]
+        i += 1
+    return None
+
+def _fun_body(code, marker):
+    """Body of `fun <marker>(…)` — paren-matched signature, then the braces."""
+    i = code.find(marker)
+    if i < 0:
+        return None
+    j = code.find("(", i)
+    if j < 0:
+        return None
+    depth = 0
+    while j < len(code):
+        ch = code[j]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    return _brace_block(code, j)
+
+def composer_intent_parity_findings(vm_c, inp_c, screen_c):
+    """[dv24/B-05] The composer has ONE writer, and the intent set is closed.
+
+    G6 — the two ViewModel-side entrances (`appendToInputText`,
+    `dismissContextExhaustedDialog(restoreInput = true)`) must raise an intent
+    instead of writing `setInputText` against the 150 ms-debounced copy. The
+    append one read `_inputText.value` and appended onto a snapshot a dictation
+    burst had already outdated; the restore one wrote a value that
+    `MutableStateFlow` dropped whenever the composer already held it.
+    G7 — every `ComposerCommand` subtype the ViewModel declares has exactly one
+    arm in the composer's collector, and vice versa. Without this a new intent
+    added on the ViewModel side (or an arm added for a deleted subtype) is
+    invisible: the sealed interface makes the KOTLIN compiler demand the arm,
+    but nothing makes a fixture/test tree stay in step, and a command that is
+    raised and never collected is silently dropped (`tryEmit` reports nothing).
+    """
+    problems = []
+    if vm_c is None:
+        return problems
+
+    # ── G6: the ViewModel-side entrances dispatch through the channel ───────
+    for name in ("appendToInputText", "dismissContextExhaustedDialog"):
+        body = _fun_body(vm_c, "fun %s(" % name)
+        if body is None:
+            problems.append(("G6", "`fun %s(` not found in ChatViewModel — fail-closed "
+                             "(this entry point must stay visible to the gate)" % name))
+            continue
+        if not DISPATCH_CALL_RE.search(body):
+            problems.append(("G6", "%s resolves/writes the composer text itself — it must "
+                             "raise a ComposerCommand: the ViewModel copy lags the field by "
+                             "the 150 ms IME debounce, and an equal write is dropped by "
+                             "MutableStateFlow entirely" % name))
+        elif SET_INPUT_RE.search(body):
+            problems.append(("G6", "%s raises a ComposerCommand AND writes setInputText — "
+                             "two writers for one text; the direct write is what the intent "
+                             "was introduced to remove" % name))
+
+    # ── G7: declared intents ↔ composer arms ────────────────────────────────
+    decl_idx = vm_c.find("sealed interface ComposerCommand")
+    if decl_idx < 0:
+        problems.append(("G7", "no `sealed interface ComposerCommand` in ChatViewModel — "
+                         "fail-closed (re-derive this criterion)"))
+        return problems
+    decls = _brace_block(vm_c, decl_idx)
+    if decls is None:
+        problems.append(("G7", "the ComposerCommand declaration has no body — fail-closed"))
+        return problems
+    declared = set(CMD_DECL_OBJECT_RE.findall(decls))
+    # a data CLASS declaration only counts inside the sealed interface
+    for m in CMD_DECL_CLASS_RE.finditer(decls):
+        declared.add(m.group(1))
+    if not declared:
+        problems.append(("G7", "ComposerCommand declares no subtypes — fail-closed"))
+        return problems
+
+    collect_m = re.search(r"\bcomposerCommand\s*\.\s*collect\b", inp_c)
+    if collect_m is None:
+        problems.append(("G7", "ChatInputArea never collects `composerCommand` — every "
+                         "declared intent (%s) would be dropped on emit"
+                         % ", ".join(sorted(declared))))
+        return problems
+    arms_block = _brace_block(inp_c, collect_m.end())
+    if arms_block is None:
+        problems.append(("G7", "the composerCommand collector has no block — fail-closed"))
+        return problems
+    arms = set(CMD_ARM_RE.findall(arms_block))
+
+    for name in sorted(declared - arms):
+        problems.append(("G7", "`ComposerCommand.%s` is declared but the composer has no "
+                         "arm for it — the intent is dead (raised by the screen, dropped "
+                         "by the collector)" % name))
+    for name in sorted(arms - declared):
+        problems.append(("G7", "the composer has an arm for `ComposerCommand.%s`, which no "
+                         "longer exists — the collector outran the declaration" % name))
     return problems
 
 
@@ -1085,6 +1235,18 @@ def check_tree(root):
     screen = read(root, SCREEN_REL)
     problems.extend(composer_screen_handoff_findings(
         strip_strings(strip_comments(screen)) if screen is not None else None, inp_c))
+    # ── G5-G7: every composer write is an intent (dv24-B05) ────────────────
+    # OPTIONAL read for the same reason as ChatScreen.kt.
+    # NOTE: comment-stripped only (no strip_strings). ChatViewModel.kt contains
+    # Kotlin CHAR literals that the shared string stripper mis-tracks ('"' inside
+    # '...'), which blanks a long legitimate span — the marker below then reads
+    # as "missing". A comment can still not satisfy any of these criteria, so
+    # leaving string literals intact keeps the criteria honest here.
+    vm = read(root, VM_REL)
+    problems.extend(composer_intent_parity_findings(
+        strip_comments(vm) if vm is not None else None,
+        inp_c,
+        strip_strings(strip_comments(screen)) if screen is not None else None))
 
     return INPUT_REL, problems
 
@@ -1928,6 +2090,59 @@ private fun ComposerIntentHost(viewModel: ChatViewModel) {
 """
 
 
+# [dv24/B-05] The ViewModel half of the handoff: the intent set and the two
+# entrances that used to resolve the composer text themselves.
+VM_F = """package com.rikkaminis.app.ui.chat
+
+class ChatViewModel {
+    fun appendToInputText(snippet: String) {
+        val cleaned = snippet.trim()
+        if (cleaned.isEmpty()) return
+        requestComposerCommand(
+            ComposerCommand.AppendText(text = cleaned, separator = " "),
+        )
+    }
+
+    fun dismissContextExhaustedDialog(restoreInput: Boolean) {
+        _showContextExhaustedDialog.value = false
+        if (restoreInput) {
+            requestComposerCommand(ComposerCommand.ReplaceText(text = pendingExhaustedText))
+        }
+    }
+
+    fun requestComposerCommand(command: ComposerCommand) {
+        _composerCommand.tryEmit(command)
+    }
+}
+
+sealed interface ComposerCommand {
+    data object ToggleSlashMenu : ComposerCommand
+    data object DismissSlashMenu : ComposerCommand
+    data object Clear : ComposerCommand
+    data class ReplaceText(val text: String, val caretOverride: Int? = null) : ComposerCommand
+    data class AppendText(
+        val text: String,
+        val separator: String = " ",
+        val trimExistingEnd: Boolean = true,
+        val trailingSpace: Boolean = true,
+    ) : ComposerCommand
+}
+"""
+
+# the composer-side arms for exactly those five intents (INPUT_G grew the two
+# text arms with the same commit that declared them).
+INPUT_H = INPUT_G.replace(
+    """                ComposerCommand.Clear -> clearComposerInput()""",
+    """                ComposerCommand.Clear -> clearComposerInput()
+                is ComposerCommand.ReplaceText -> {
+                    cancelPendingImeBurst()
+                    commitComposerBody(command.text, composerCaretFor(command.text, command.caretOverride))
+                }
+                is ComposerCommand.AppendText -> {
+                    val next = composeAppend(inputFieldValue.text, command.text)
+                    commitComposerBody(next, next.length)
+                }""")
+
 def fixtures(**overrides):
     files = {
         MODELS_REL: MODELS_F,
@@ -1952,8 +2167,12 @@ def fixtures(**overrides):
 
 def selftest():
     failures = []
+    # counted rather than hard-coded: the number drifted silently every time a
+    # family grew (the message said 47 while the file ran more).
+    arms = [0]
 
     def expect(name, files, want_violation_ids):
+        arms[0] += 1
         root = tempfile.mkdtemp(prefix="chat-ui-gate-selftest-")
         try:
             for rel, content in files.items():
@@ -1979,6 +2198,7 @@ def selftest():
         """Stricter than expect(): the violation-id SET must match exactly, so a
         fixture cannot pass by tripping an unrelated criterion (the "only this
         one turns red" proof each new criterion owes)."""
+        arms[0] += 1
         root = tempfile.mkdtemp(prefix="chat-ui-gate-selftest-")
         try:
             for rel, content in files.items():
@@ -2376,13 +2596,17 @@ def selftest():
            fixtures(**{SCREEN_REL: SCREEN_F, INPUT_REL: INPUT_G}), None)
     # G1: the pre-fix shape — ChatScreen resolves the menu text from the
     #     DEBOUNCED ViewModel string.
+    # The pre-fix fixture resolves the text AND writes/reads the debounced
+    # string, so it reds G1 + G5a + G5b — exactly the three spellings the defect
+    # had, not an unrelated criterion (G2 stays out: the write is not the
+    # empty-string clear).
     expect_exact("G1 screen resolves the menu text", fixtures(**{
         SCREEN_REL: SCREEN_F.replace(
             "    MenuAction(",
             "    viewModel.setInputText(viewModel.dismissSlashMenu(viewModel.inputText.value))\n"
             "    MenuAction("),
         INPUT_REL: INPUT_G,
-    }), ["G1"])
+    }), ["G1", "G5a", "G5b"])
     # G2: the clear-chat confirm writes the empty string behind the funnel.
     expect_exact("G2 screen clears the composer itself", fixtures(**{
         SCREEN_REL: SCREEN_F.replace(
@@ -2403,13 +2627,58 @@ def selftest():
         INPUT_REL: INPUT_G.replace(
             "                ComposerCommand.Clear -> clearComposerInput()\n", ""),
     }), ["G4"])
+    # ── G5-G7 (dv24-B05): every composer write is an intent ────────────────
+    # G clean with the full intent set declared and consumed.
+    expect("G5-G7 clean: intents declared, consumed and dispatched",
+           fixtures(**{SCREEN_REL: SCREEN_F, INPUT_REL: INPUT_H, VM_REL: VM_F}), None)
+    # G5a: the screen writes a non-empty body behind the composer's back (the
+    #      message-edit / share / transfer shape).
+    expect_exact("G5a screen writes the composer body", fixtures(**{
+        SCREEN_REL: SCREEN_F.replace(
+            "    MenuAction(",
+            "    viewModel.setInputText(prefill, caretOverride = prefill.length)\n"
+            "    MenuAction("),
+        INPUT_REL: INPUT_H,
+    }), ["G5a"])
+    # G5b: the screen READS the debounced string (the append shape).
+    expect_exact("G5b screen reads the debounced string", fixtures(**{
+        SCREEN_REL: SCREEN_F.replace(
+            "    MenuAction(",
+            "    val merged = viewModel.inputText.value + sep + item.value\n"
+            "    MenuAction("),
+        INPUT_REL: INPUT_H,
+    }), ["G5b"])
+    # G6: the ViewModel entrance resolves the text itself again.
+    expect_exact("G6 viewmodel writes the text itself", fixtures(**{
+        SCREEN_REL: SCREEN_F,
+        INPUT_REL: INPUT_H,
+        VM_REL: VM_F.replace(
+            """        requestComposerCommand(
+            ComposerCommand.AppendText(text = cleaned, separator = " "),
+        )""",
+            """        setInputText(_inputText.value + " " + cleaned)"""),
+    }), ["G6"])
+    # G7a: an intent is declared but the composer has no arm for it.
+    expect_exact("G7a declared intent has no composer arm", fixtures(**{
+        SCREEN_REL: SCREEN_F,
+        INPUT_REL: INPUT_G,
+        VM_REL: VM_F,
+    }), ["G7"])
+    # G7b: the composer keeps an arm for a subtype that no longer exists.
+    expect_exact("G7b composer arm outran the declaration", fixtures(**{
+        SCREEN_REL: SCREEN_F,
+        INPUT_REL: INPUT_H,
+        VM_REL: VM_F.replace(
+            "    data object Clear : ComposerCommand\n", ""),
+    }), ["G7"])
 
     if failures:
         print("❌ selftest failed:")
         for f in failures:
             print("   " + f)
         return 1
-    print("CHAT_UI_INTERACTION_SELFTEST=PASS (47 fixtures: clean + 46 violation/precision)")
+    print("CHAT_UI_INTERACTION_SELFTEST=PASS (%d fixtures: clean + %d violation/precision)"
+          % (arms[0], arms[0] - 1))
     return 0
 
 
