@@ -31,6 +31,7 @@ import com.rikkaminis.app.data.model.hasAudioOutput
 import com.rikkaminis.app.data.model.hasVoiceModality
 import com.rikkaminis.app.data.model.isVoiceTemplateSeedShape
 import com.rikkaminis.app.data.model.withInferredVoiceModality
+import com.rikkaminis.app.provider.ModelsDevApi
 import com.rikkaminis.app.provider.registerModelListProviders
 import com.rikkaminis.app.provider.thinking.ThinkingRule
 import com.rikkaminis.app.provider.thinking.ThinkingRuleCoding
@@ -1261,6 +1262,36 @@ class ProviderRepository(private val context: Context) {
     }
 
     /**
+     * [deep-audit-1044 A-01] A [ModelEntry]'s model **as the registry knows it**
+     * — the only legitimate source for a capability / modality decision in this
+     * file.
+     *
+     * [ModelEntry.model] is nothing but `baseModel.withOverrides(overrides)`: it
+     * never consults models.dev. All 39 built-in models declare null modality
+     * lists by construction (see [LLMModel.isTextOutput]'s KDoc, and the
+     * "absent modality list means text in / text out" convention), so the raw
+     * property answered "no audio / yes text" for models the registry declares
+     * multimodal. Consequences on the voice side were user-visible: a
+     * multimodal model with audio input was dropped from the Voice Input
+     * candidates → recording failed with "No provider voice-input model
+     * configured"; the same read in [hasVoiceModels] painted every Voice
+     * Services row as "0 models"; and [newestProviderNewestTextEntry] offered a
+     * pure image generator as the new-chat default.
+     *
+     * [ModelsDevApi.effectiveModel] is the repo-wide single entry point (the
+     * `minis-model-use` surface, the config collection, the Debug RPCs,
+     * `ThinkingLevelCatalog` and `ModelEntryPicker` all ride on it): it enriches
+     * [ModelEntry.baseModel] FIRST and applies the user's overrides SECOND, so
+     * an explicit `overrides.inputModalities` / `outputModalities` still wins
+     * over the registry row. Do **not** re-derive it as `enrichModel(entry.model)`
+     * — that order hands the registry value back over the user's choice.
+     *
+     * Read-only: the enriched model must never be written back into
+     * `baseModelJson` / `overridesJson` (see [toSnapshot]).
+     */
+    private fun effectiveEntryModel(entry: ModelEntry): LLMModel = ModelsDevApi.effectiveModel(entry)
+
+    /**
      * [T-newchat-default-model-fallback-android] Final-tier default for a new
      * chat: the newest text-output model from the newest-added enabled
      * provider. "Newest provider" = max [ProviderInstance.createdAt]; "newest
@@ -1280,7 +1311,7 @@ class ProviderRepository(private val context: Context) {
             .sortedByDescending { it.createdAt }
         for (instance in enabledProviders) {
             val textEntry = config.modelEntries
-                .filter { it.providerInstanceId == instance.id && !it.isHidden && it.model.isTextOutput }
+                .filter { it.providerInstanceId == instance.id && !it.isHidden && effectiveEntryModel(it).isTextOutput }
                 .lastOrNull()
             if (textEntry != null) return textEntry
         }
@@ -2067,7 +2098,7 @@ class ProviderRepository(private val context: Context) {
         fun providerEntry(memberId: String): Pair<ProviderInstance, ModelEntry>? {
             val entry = config.modelEntries.find { it.id == memberId } ?: return null
             val inst = config.instances.find { it.id == entry.providerInstanceId } ?: return null
-            if (!inst.isEnabled || !entry.model.hasAudioInput) return null
+            if (!inst.isEnabled || !effectiveEntryModel(entry).hasAudioInput) return null
             return inst to entry
         }
 
@@ -2121,7 +2152,7 @@ class ProviderRepository(private val context: Context) {
         fun providerEntry(memberId: String): Pair<ProviderInstance, ModelEntry>? {
             val entry = config.modelEntries.find { it.id == memberId } ?: return null
             val inst = config.instances.find { it.id == entry.providerInstanceId } ?: return null
-            if (!inst.isEnabled || !entry.model.hasAudioInput) return null
+            if (!inst.isEnabled || !effectiveEntryModel(entry).hasAudioInput) return null
             return inst to entry
         }
 
@@ -2205,7 +2236,7 @@ class ProviderRepository(private val context: Context) {
         fun providerEntry(memberId: String): Pair<ProviderInstance, ModelEntry>? {
             val entry = config.modelEntries.find { it.id == memberId } ?: return null
             val inst = config.instances.find { it.id == entry.providerInstanceId } ?: return null
-            if (!inst.isEnabled || !entry.model.hasAudioOutput) return null
+            if (!inst.isEnabled || !effectiveEntryModel(entry).hasAudioOutput) return null
             return inst to entry
         }
 
@@ -2253,7 +2284,7 @@ class ProviderRepository(private val context: Context) {
     /** True if [instanceId] has ANY model entry with an audio modality. */
     fun hasVoiceModels(instanceId: String): Boolean =
         _config.value.modelEntries.any {
-            it.providerInstanceId == instanceId && it.model.hasVoiceModality
+            it.providerInstanceId == instanceId && effectiveEntryModel(it).hasVoiceModality
         }
 
     /**
@@ -2323,8 +2354,8 @@ class ProviderRepository(private val context: Context) {
             ShadowVoiceProvider(
                 instanceId = rep.id,
                 displayName = rep.label,
-                inputModels = entries.filter { it.model.hasAudioInput },
-                outputModels = entries.filter { it.model.hasAudioOutput },
+                inputModels = entries.filter { effectiveEntryModel(it).hasAudioInput },
+                outputModels = entries.filter { effectiveEntryModel(it).hasAudioOutput },
             )
         }.sortedWith(compareBy({ it.displayName }, { it.instanceId }))
     }
