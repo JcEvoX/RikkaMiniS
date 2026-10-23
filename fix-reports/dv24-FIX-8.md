@@ -295,8 +295,15 @@ SUT（`providerModelFor` 的函数体）由 `extract.py` **从真树按字节切
 | CI run id | `39894373704`（job `120221268875`，attempt 1，success；26 步 not-ok=[]，唯一 skipped = Publish to Releases = main 门控） |
 | 日志 | `shared/work/deep-audit-1044/w8-logs/job-39894373704.log`（1,393,758 B）；判读 `probe/ci/judge_generic.py` = ALL GENERIC CRITERIA GREEN |
 
-### 提交链（3 提交，分行写清）
+### 提交链（4 提交，分行写清）
 
 1. `0e335456` — **生产**：6 个生产文件
 2. `ba3611ef` — **测试**：`ChatProviderModelSourceTest.kt`
 3. `3d3bf5c1` — **门**：`models_provider_field_check.py` + `session_provider_enabled_check.py`
+   → **CI 绿于此提交**（run `39894373704`）
+4. `5c32285c` — **报告**：`fix-reports/dv24-FIX-8.md`（**不叫 `FIX-8.md`**：main 已跟踪
+   `fix-reports/FIX-8.md` = dv23/1043 波的同号报告，覆盖会抹掉那一波的记录）
+
+**报告回填后源码树等价**（1042/1043 判据）：
+`git diff --name-only 3d3bf5c1 HEAD -- . ':(exclude)fix-reports'` → **空**；
+`fix-reports/` 不在 `build-apk.yml` 的 paths 内、不参与构建 ⇒ CI 结论对当前树成立，不必重跑。
