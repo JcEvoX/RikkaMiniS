@@ -11,6 +11,7 @@ import com.rikkaminis.app.data.model.LLMModel
 import com.rikkaminis.app.provider.clampOutboundMaxTokens
 import com.rikkaminis.app.provider.clampOutboundTemperature
 import com.rikkaminis.app.provider.sanitizeToolPairing
+import com.rikkaminis.app.provider.hasWirePayload
 import com.rikkaminis.app.provider.anthropicUsageAccounting
 import com.rikkaminis.app.data.model.LLMResponse
 import com.rikkaminis.app.data.model.LLMStreamChunk
@@ -453,7 +454,7 @@ class AnthropicProvider(
                             "Stream error event: ${event.toString().take(500)}",
                         )
                         throw mapHttpError(
-                            if (errType == "overloaded_error") 529 else 400,
+                            anthropicStreamErrorStatus(errType),
                             event.toString(),
                         )
                     }
@@ -720,15 +721,31 @@ class AnthropicProvider(
         // tool_results) to also drop orphan tool_use — an assistant tool_use
         // with no matching tool_result in the immediately following user
         // message is an equally deterministic 400.
-        val messages = sanitizeToolPairing(rawMessages) { detail ->
+        val sanitizedRaw = sanitizeToolPairing(rawMessages) { detail ->
             android.util.Log.i("AnthropicProvider", detail)
         }
+        // [deep-audit-1045 A-03] Same pre-filter index as the two OpenAI
+        // builders: the request-level `imageParts` attach to the LAST user turn
+        // (the `isLastUser` arm below), so a media-only turning point must not
+        // be filtered out before that arm can see it.
+        val rawLastUserIndex = sanitizedRaw.indexOfLast { it.role == LLMMessage.Role.USER }
+        val messages = sanitizedRaw
             // Drop messages that became empty (orphan-only removed). An empty
             // content array is itself a 400 on Anthropic. Pristine empty
             // messages (e.g. empty USER text) are handled by the serializer
             // below — they reach here only if a call site sent them, and this
             // filter is the last defense against empty content arrays.
-            .filter { m -> m.contentParts.isNotEmpty() || m.content.isNotEmpty() }
+            //
+            // [deep-audit-1045 A-03] "Empty" must mean no TEXT, not no
+            // payload — see OpenAIProvider's twin filter. Without the media
+            // arms a `minis-model-use` turn carrying only an image or audio
+            // block was deleted here and the model never saw the bytes.
+            .filterIndexed { index, m ->
+                m.hasWirePayload(
+                    isLastUserTurn = index == rawLastUserIndex,
+                    turnImageCount = imageParts.size,
+                )
+            }
         // [T-android-anthropic-thinking-echo] (issue #70) Compute once — the
         // gate depends only on the model + endpoint, not the message.
         val echoThinking = shouldEchoInterleavedThinking()
@@ -882,10 +899,16 @@ class AnthropicProvider(
                             })
                         }
                     }
-                    contentArray.put(JSONObject().apply {
-                        put("type", "text")
-                        put("text", msg.content)
-                    })
+                    // [deep-audit-1045 A-03] A media-only last user turn now
+                    // survives the empty filter, so the text part must be
+                    // skipped when the turn carries no text — Anthropic
+                    // rejects an empty text block.
+                    if (msg.content.isNotEmpty()) {
+                        contentArray.put(JSONObject().apply {
+                            put("type", "text")
+                            put("text", msg.content)
+                        })
+                    }
                     obj.put("content", contentArray)
                 } else if (echoThinking && msg.role == LLMMessage.Role.ASSISTANT) {
                     // [T-android-anthropic-thinking-echo] (issue #70) Assistant
@@ -1256,4 +1279,42 @@ class AnthropicProvider(
         if (error is java.io.IOException) return LLMError.NetworkError(error)
         return LLMError.Unknown(error)
     }
+}
+
+/**
+ * [deep-audit-1045 A-04] HTTP status for an Anthropic mid-stream `error` event,
+ * derived from the event's `error.type`.
+ *
+ * Why this exists: the stream branch used to send everything except
+ * `overloaded_error` as 400. Anthropic's Messages protocol reports a rate limit
+ * as `type: "rate_limit_error"`, and 400 lands in `mapHttpError`'s fallthrough
+ * (ProviderError — NOT retryable), while the same condition reported over HTTP
+ * as 429 lands in RateLimited (retryable with backoff). The mid-stream form
+ * therefore turned a retryable upstream condition into a hard failure.
+ *
+ * The table mirrors Anthropic's documented error types:
+ *  - `overloaded_error`  → 529 (kept verbatim: 529 is in `mapHttpError`'s
+ *    transient set, so it stays a retryable TransientError);
+ *  - `api_error`         → 500 (also transient);
+ *  - `rate_limit_error`  → 429 (RateLimited);
+ *  - `authentication_error` → 401, `permission_error` → 403 (both
+ *    InvalidApiKey in `mapHttpError`);
+ *  - `not_found_error`   → 404, `request_too_large` → 413;
+ *  - `invalid_request_error` → 400;
+ *  - anything else (including a blank type) → 400, i.e. the previous
+ *    behaviour for unknown types.
+ *
+ * Pure + top-level so the mapping is directly unit-testable
+ * (AnthropicStreamErrorStatusTest) instead of being buried in the SSE loop.
+ */
+internal fun anthropicStreamErrorStatus(errType: String?): Int = when (errType) {
+    "overloaded_error" -> 529
+    "api_error" -> 500
+    "rate_limit_error" -> 429
+    "authentication_error" -> 401
+    "permission_error" -> 403
+    "not_found_error" -> 404
+    "request_too_large" -> 413
+    "invalid_request_error" -> 400
+    else -> 400
 }

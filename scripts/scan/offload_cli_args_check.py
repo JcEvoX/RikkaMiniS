@@ -137,6 +137,11 @@ ARGS = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/Offload
 FASTIO_SEARCH = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/FastioSearch.kt"
 # [dv22-A6 A-06] clipboard clear — see check_clipboard_clear.
 CLIPBOARD = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/ClipboardOffloadHandler.kt"
+# [dv25-A4 A-07] the player CLI: its payload used to be the manager's English
+# sentence, so N1 accepted a variable and N2 (same-file helpers) could not see
+# the cross-file call. Registered here so both rules judge it, and Z1-Z4 below
+# police the provenance itself.
+PLAYER = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/PlayerOffloadHandler.kt"
 
 # [da1034-A4] ISSUE-08: every handler that ships a `formatBody` payload. Kept
 # explicit rather than a glob over the offload dir: a glob would also drag in
@@ -151,6 +156,7 @@ PAYLOAD_FILES = [
     CLIPBOARD,
     "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/OpenOffloadHandler.kt",
     FASTIO,
+    PLAYER,
 ]
 
 # (id, kind, needle) — kind: "req" exact substring / "forbid" exact substring /
@@ -2041,6 +2047,326 @@ GREEN_CLIPBOARD_CLEAR = """
     }
 """
 
+OFFLOAD_HANDLER_DIR = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload"
+OFFLOAD_SOURCE_DIRS = (
+    OFFLOAD_HANDLER_DIR,
+    "src/android/app/src/main/java/com/rikkaminis/app/offload",
+)
+
+# Handler basename → why it still ships a prose payload from another file.
+PAYLOAD_DELEGATE_EXEMPT = {
+    "WeatherOffloadHandler.kt": (
+        "registered P2 (backlog 1045-A07): WeatherManager.fetchWeather() renders a "
+        "human weather report; the structured sibling fetchWeatherJson() already "
+        "exists, so this is a straightforward follow-up — deliberately not fixed in "
+        "the android-player branch."
+    ),
+}
+
+_PCS_FUN_RE = re.compile(r"\bfun\s+(?:<[^>]*>\s*)?(?:[\w.]+\.)?(\w+)\s*\(")
+_PCS_STR_RE = re.compile(r'"(?:[^"\\\n]|\\.)*"')
+
+
+def _pcs_strip(src: str) -> str:
+    """Comments out, string literals kept verbatim."""
+    out = []
+    i, n = 0, len(src)
+    while i < n:
+        two = src[i:i + 2]
+        if two == "//":
+            while i < n and src[i] != "\n":
+                i += 1
+        elif two == "/*":
+            i += 2
+            while i + 1 < n and not (src[i] == "*" and src[i + 1] == "/"):
+                i += 1
+            i = min(i + 2, n)
+        elif src[i] == '"':
+            j = i + 1
+            while j < n:
+                if src[j] == "\\":
+                    j += 2
+                    continue
+                if src[j] == '"':
+                    break
+                j += 1
+            out.append(src[i:j + 1])
+            i = j + 1
+        else:
+            out.append(src[i])
+            i += 1
+    return "".join(out)
+
+
+def _pcs_match(code: str, i: int, opener: str, closer: str) -> int:
+    depth = 0
+    while i < len(code):
+        c = code[i]
+        if c == opener:
+            depth += 1
+        elif c == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+        elif c == '"':
+            j = i + 1
+            while j < len(code):
+                if code[j] == "\\":
+                    j += 2
+                    continue
+                if code[j] == '"':
+                    break
+                j += 1
+            i = j
+        i += 1
+    return len(code) - 1
+
+
+def _pcs_decl_table(sources: dict) -> dict:
+    """callee name → {(basename, declared return type)}."""
+    table = {}
+    for base, src in sources.items():
+        code = _pcs_strip(src)
+        for m in _PCS_FUN_RE.finditer(code):
+            end = _pcs_match(code, m.end() - 1, "(", ")")
+            tail = code[end + 1:end + 1 + 240]
+            mm = re.match(r"\s*:\s*([A-Za-z_][\w.<>?, ]*)", tail)
+            rt = mm.group(1).strip() if mm else ""
+            table.setdefault(m.group(1), set()).add((base, rt))
+    return table
+
+
+def _pcs_first_arg(code: str, open_idx: int) -> str:
+    i, depth, start = open_idx + 1, 0, open_idx + 1
+    while i < len(code):
+        c = code[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                return code[start:i]
+            depth -= 1
+        elif c == "," and depth == 0:
+            return code[start:i]
+        elif c == '"':
+            j = i + 1
+            while j < len(code):
+                if code[j] == "\\":
+                    j += 2
+                    continue
+                if code[j] == '"':
+                    break
+                j += 1
+            i = j
+        i += 1
+    return code[start:]
+
+
+def _pcs_init(code: str, after_eq: int) -> str:
+    """Initializer text: balanced to the end of the statement."""
+    i, depth = after_eq, 0
+    while i < len(code):
+        c = code[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                return code[after_eq:i]
+            depth -= 1
+        elif c == '"':
+            j = i + 1
+            while j < len(code):
+                if code[j] == "\\":
+                    j += 2
+                    continue
+                if code[j] == '"':
+                    break
+                j += 1
+            i = j
+        elif c == "\n" and depth == 0:
+            return code[after_eq:i]
+        i += 1
+    return code[after_eq:]
+
+
+def _pcs_bindings(code: str) -> dict:
+    out = {}
+    for m in re.finditer(r"\b(?:val|var)\s+(\w+)\s*(?::[^=\n]+)?=", code):
+        out.setdefault(m.group(1), _pcs_init(code, m.end()))
+    return out
+
+
+def _pcs_calls(text: str) -> set:
+    # raw strings first (prose in a `"""…"""` HELP block spells words like
+    # "text [" and would otherwise read as calls), then ordinary literals
+    stripped = re.sub(r'"""(?:[^"]|"(?!""))*"""', '""', text)
+    stripped = _PCS_STR_RE.sub('""', stripped)
+    return set(re.findall(r"\b(\w+)\s*\(", stripped))
+
+
+def _pcs_value_text(text: str) -> str:
+    """Value positions only: a nested `val x = …` initializer is an
+    intermediate (its result is not the payload), and a `catch`/`finally` block
+    is the failure path — neither may be attributed to the payload. Without
+    this, `val result = try { … } catch { … }` charged every call in the catch
+    branch (including `formatBody` itself) to the payload."""
+    out = []
+    i = 0
+    while i < len(text):
+        m = re.compile(r"\b(?:val|var)\s+\w+\s*(?::[^=\n]+)?=").search(text, i)
+        k = re.compile(r"\b(?:catch|finally)\b").search(text, i)
+        nxt = min([x.start() for x in (m, k) if x] or [len(text)])
+        out.append(text[i:nxt])
+        if nxt >= len(text):
+            break
+        head = text[nxt:]
+        if m and m.start() == nxt:
+            init = _pcs_init(text, m.end())
+            i = m.end() + len(init)
+        else:
+            brace = text.find("{", nxt)
+            i = len(text) if brace < 0 else _pcs_match(text, brace, "{", "}") + 1
+    return "".join(out)
+
+
+def _pcs_delegates(base: str, code: str, table: dict) -> list:
+    """[(callee, return_type, declaring_file)] for the payload of every
+    `formatBody(` call in this file, resolved one binding level down."""
+    bind = _pcs_bindings(code)
+    hits = []
+    for m in re.finditer(r"formatBody\(", code):
+        expr = _pcs_first_arg(code, m.end() - 1).strip()
+        # the payload is <ident> or <ident>.<method>(…) — follow the receiver
+        src_text = expr
+        mm = re.fullmatch(r"([A-Za-z_]\w*)(?:\s*\.\s*\w+\s*\([^()]*\))?", expr)
+        if mm and mm.group(1) in bind:
+            src_text = bind[mm.group(1)]
+        for callee in _pcs_calls(_pcs_value_text(src_text)):
+            decls = table.get(callee, ())
+            if not decls:
+                continue
+            if any(d == base for (d, _) in decls):
+                continue  # a same-file declaration of that name wins
+            for (d, rt) in decls:
+                hits.append((callee, rt, d))
+    return sorted(set(hits))
+
+
+def check_payload_delegates(sources: dict, payload_files, exemptions=None) -> list:
+    """Z1–Z4. `sources` maps basename → file text (both offload dirs)."""
+    exemptions = PAYLOAD_DELEGATE_EXEMPT if exemptions is None else exemptions
+    table = _pcs_decl_table(sources)
+    derived = {}
+    for base, src in sources.items():
+        code = _pcs_strip(src)
+        if "formatBody(" not in code:
+            continue
+        hits = _pcs_delegates(base, code, table)
+        if hits:
+            derived[base] = hits
+    findings = []
+    registered = {Path(p).name for p in payload_files}
+    # Z4 (first: an empty derivation would make Z1/Z2 vacuous)
+    if not derived:
+        findings.append(("Z4", "payload delegates: the derivation found no file", "derived set is empty"))
+    # Z1 — unregistered delegating handler
+    for base in sorted(derived):
+        if base in registered or base in exemptions:
+            continue
+        why = ", ".join("%s()→%s in %s" % h for h in derived[base])
+        findings.append(("Z1", "formatBody payload delegated across files", "%s: %s" % (base, why)))
+    # Z2 — a registered payload file must not take a String from another file
+    for base in sorted(derived):
+        if base not in registered:
+            continue
+        for (callee, rt, d) in derived[base]:
+            if rt == "String":
+                findings.append((
+                    "Z2",
+                    "payload file takes its payload from a String delegate",
+                    "%s: %s()→String in %s (a sentence from another file)" % (base, callee, d),
+                ))
+    # Z3 — exemptions must still be needed
+    for base, reason in exemptions.items():
+        if not str(reason).strip():
+            findings.append(("Z3", "exemption without a reason", base))
+        if base not in sources:
+            findings.append(("Z3", "exemption names a missing file", base))
+        elif base not in derived:
+            findings.append(("Z3", "exemption no longer needed", base))
+    return findings
+
+# [dv25-A4 A-07] payload provenance: a handler that assembles its body from a
+# structured envelope (green) vs one that hands over another file's sentence.
+GREEN_PLAYER_HANDLER = r"""
+class PlayerOffloadHandler {
+    fun handle(sub: String, args: OffloadArgs): NativeOffloadResult {
+        val outcome = try {
+            when (sub) {
+                "play" -> MediaPlayerManager.play(args.positional[1])
+                else -> PlayerOutcome.failure("unknown_subcommand", sub)
+            }
+        } catch (e: Throwable) {
+            PlayerOutcome.failure(PlayerOutcome.ERROR_PLAYER_FAILED, e.message ?: "unknown")
+        }
+        val envelope = playerEnvelope(sub, outcome)
+        return NativeOffloadResult(
+            if (outcome.ok) 0 else 1,
+            OffloadOutput.formatBody(envelope.toString(2), args) + "\n",
+        )
+    }
+}
+"""
+
+PROSE_PLAYER_HANDLER = r"""
+class PlayerOffloadHandler {
+    fun handle(sub: String, args: OffloadArgs): NativeOffloadResult {
+        val result = try {
+            when (sub) {
+                "play" -> MediaPlayerManager.play(args.positional[1])
+                else -> "Error: unknown subcommand"
+            }
+        } catch (e: Throwable) {
+            "Error: ${e.message}"
+        }
+        return NativeOffloadResult(0, OffloadOutput.formatBody(result.trimEnd('\n'), args) + "\n")
+    }
+}
+"""
+
+GREEN_PLAYER_MANAGER = r"""
+object MediaPlayerManager {
+    fun play(id: String): PlayerOutcome = PlayerOutcome.ok(session = id)
+}
+"""
+
+PROSE_PLAYER_MANAGER = r"""
+object MediaPlayerManager {
+    fun play(id: String): String = "Playing '$id'"
+}
+"""
+
+GREEN_PLAYER_OUTCOME = r"""
+internal fun playerEnvelope(action: String, outcome: PlayerOutcome): JSONObject {
+    return JSONObject().put("ok", outcome.ok).put("action", action)
+}
+"""
+
+GREEN_WEATHER_HANDLER = r"""
+class WeatherOffloadHandler {
+    fun handle(args: OffloadArgs): NativeOffloadResult {
+        val text = WeatherManager.fetchWeather(1.0, 2.0)
+        return NativeOffloadResult(0, OffloadOutput.formatBody(text.trimEnd('\n'), args) + "\n")
+    }
+}
+"""
+
+GREEN_WEATHER_MANAGER = r"""
+object WeatherManager {
+    fun fetchWeather(latitude: Double, longitude: Double): String = "weather"
+}
+"""
+
 def selftest() -> int:
     # Each case mutates ONE arm and names the rules it must trip. The expected
     # sets are written by hand from the rule table (never derived from a run:
@@ -2906,9 +3232,46 @@ def selftest() -> int:
         ("OpenOffloadHandler.kt", GREEN_PAYLOAD_SIDE_EFFECTS),
         ("FastioOffloadHandler.kt", GREEN_PAYLOAD_FASTIO_USAGE),
     )
+    # [dv25-A4 A-07] payload provenance across files (Z1-Z4). Expected sets are
+    # written by hand from the rule table, never derived from the run.
+    _prov_sources = {
+        "PlayerOffloadHandler.kt": GREEN_PLAYER_HANDLER,
+        "MediaPlayerManager.kt": GREEN_PLAYER_MANAGER,
+        "PlayerOutcome.kt": GREEN_PLAYER_OUTCOME,
+        "WeatherOffloadHandler.kt": GREEN_WEATHER_HANDLER,
+        "WeatherManager.kt": GREEN_WEATHER_MANAGER,
+    }
+    _prov_prose = dict(_prov_sources)
+    _prov_prose["PlayerOffloadHandler.kt"] = PROSE_PLAYER_HANDLER
+    _prov_prose["MediaPlayerManager.kt"] = PROSE_PLAYER_MANAGER
+    _prov_exempt = {"WeatherOffloadHandler.kt": "P2 registered, out of this branch"}
+    clean_provenance = check_payload_delegates(_prov_sources, [PLAYER], _prov_exempt)
+    if clean_provenance:
+        print(f"SELFTEST-FAIL: provenance green arm is not clean: {describe(clean_provenance)}")
+        failures += 1
+    for label, _src, _payload, _exempt, _want in [
+        ("provenance: a payload file keeps the manager's sentence",
+         _prov_prose, [PLAYER], _prov_exempt, {"Z2"}),
+        ("provenance: a delegating handler is missing from the whitelist",
+         _prov_sources, [], _prov_exempt, {"Z1"}),
+        ("provenance: the exemption list lost an entry",
+         _prov_sources, [PLAYER], {}, {"Z1"}),
+        ("provenance: an exemption outlived its defect",
+         _prov_sources, [PLAYER],
+         dict(_prov_exempt, **{"PhotosOffloadHandler.kt": "stale"}), {"Z3"}),
+        ("provenance: an exemption carries no reason",
+         _prov_sources, [PLAYER], {"WeatherOffloadHandler.kt": "   "}, {"Z3"}),
+        ("provenance: the derivation lost the tree",
+         {"Other.kt": "class Other { fun f(): Int = 1 }"}, [PLAYER], {}, {"Z4"}),
+    ]:
+        _got = {rid for rid, _, _ in check_payload_delegates(_src, _payload, _exempt)}
+        if _got != _want:
+            print(f"SELFTEST-FAIL: {label}: got {sorted(_got)}, want {sorted(_want)}")
+            failures += 1
+
     if clean or clean_flags or clean_debug or clean_sessions or clean_bindings \
             or clean_payload or clean_album or clean_search or clean_clipboard \
-            or clean_send_status:
+            or clean_send_status or clean_provenance:
         green_findings = (clean + clean_flags + clean_debug + clean_sessions
                           + clean_bindings + clean_payload + clean_album + clean_search
                           + clean_clipboard + clean_send_status)
@@ -2979,6 +3342,16 @@ def main(argv):
     findings += check_offload_json(*payload_files)
     findings += check_clipboard_clear((root / CLIPBOARD).read_text(encoding="utf-8"))
     findings += check_fastio_search(search_path.read_text(encoding="utf-8"))
+    # [dv25-A4 A-07] payload provenance ACROSS files (see check_payload_delegates)
+    sources = {}
+    for _dir in OFFLOAD_SOURCE_DIRS:
+        _p = root / _dir
+        if not _p.is_dir():
+            print(f"GATE-FAIL: offload source dir not found: {_dir} under {root}")
+            return 1
+        for _f in sorted(_p.glob("*.kt")):
+            sources[_f.name] = _f.read_text(encoding="utf-8")
+    findings += check_payload_delegates(sources, PAYLOAD_FILES)
     if findings:
         print("offload_cli_args_check: FAIL")
         print(describe(findings))
@@ -2988,7 +3361,9 @@ def main(argv):
           "OUTPUT_FLAGS covers help/h, speak declares stop/status, "
           "sessions date bounds funneled + refuse invalid, "
           "debug pass-through argv verbatim + global-only output shaping, "
-          "8/8 payload files hand formatBody JSON (N1 whole-file, N2 payload helpers), "
+          "9/9 payload files hand formatBody JSON (N1 whole-file, N2 payload helpers), "
+          "cross-file payload delegates registered (Z1 derived members, Z2 no String "
+          "delegate in a payload file, Z3 exemptions still needed, Z4 derivation alive), "
           "contacts search -n bound to --max through the one resolver, notification --after "
           "refuses an unreadable value, fastio subcommand scan knows its boolean flags "
           "and consumes -C, photos --album decision classified (non-numeric --id refuses), "

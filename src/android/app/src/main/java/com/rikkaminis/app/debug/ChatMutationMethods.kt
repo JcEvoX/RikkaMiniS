@@ -102,6 +102,8 @@ internal object ChatMutationMethods {
         val sessionId = existingId ?: HeadlessChatRunner.ensureSession(context)
 
         // Resolve model override (mutually exclusive with sessionId binding).
+        // [dv25-A05] Only an explicit request changes the binding; passing null
+        // for both leaves an already bound session alone.
         val modelEntryId = if (params.has("modelEntryId") && !params.isNull("modelEntryId")) params.optString("modelEntryId").ifEmpty { null } else null
         val modelGroupId = if (params.has("modelGroupId") && !params.isNull("modelGroupId")) params.optString("modelGroupId").ifEmpty { null } else null
         val overrideName = HeadlessChatRunner.applyModelOverride(context, sessionId, modelEntryId, modelGroupId)
@@ -149,10 +151,10 @@ internal object ChatMutationMethods {
             ?: throw RPCException(-32602, "Session not found")
         val messageId = if (params.has("messageId") && !params.isNull("messageId")) params.optString("messageId").ifEmpty { null } else null
 
-        // Apply model override (per-call only; iOS docs say session binding is
-        // untouched — but the existing ChatViewModel doesn't expose a per-call
-        // override, so we update + restore around the call. Acceptable for
-        // automation harnesses.)
+        // Apply a model override only when the caller asked for one
+        // ([dv25-A05] `applyModelOverride` no longer treats "no model passed" as
+        // "apply the new-session default group" — a retry of a session the user
+        // pinned keeps that pin; the runner reads the row's binding itself).
         val modelEntryId = if (params.has("modelEntryId") && !params.isNull("modelEntryId")) params.optString("modelEntryId").ifEmpty { null } else null
         val modelGroupId = if (params.has("modelGroupId") && !params.isNull("modelGroupId")) params.optString("modelGroupId").ifEmpty { null } else null
         val overrideName = HeadlessChatRunner.applyModelOverride(context, sessionId, modelEntryId, modelGroupId)

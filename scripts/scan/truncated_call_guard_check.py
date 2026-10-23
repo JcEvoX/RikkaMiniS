@@ -28,9 +28,17 @@ mechanical check would have noticed any one of them regressing:
      guard as its EOF-stub sibling through the shared
      [EofStubReminderStackGuard] — an inline second predicate would drift.
 
+[deep-audit-1045 A-02] The sibling failure of the same family: the Gemini SSE
+loop's EOF `else` arm used to send `Finished(lastFinishReason ?: "end_turn")`,
+i.e. it INVENTED a stop reason on a fully empty EOF. `failOnSilentEmptyCompletion`
+decides by `Finished.stopReason != null`, so the fabricated value made an empty
+relay response read as a clean finish and no TransientError was ever raised.
+The terminal decision now lives in the pure `geminiEofTerminal(...)`, which
+passes an absent finishReason through as null (criterion 6/7 below).
+
 Behaviour is covered by unit tests (TruncatedCallGuardTest /
-EofStubStackingGuardTest); this gate pins the WIRING, because none of the four
-sites can execute without the Android runtime.
+EofStubStackingGuardTest / GeminiEofTerminalDecisionTest); this gate pins the
+WIRING, because none of these sites can execute without the Android runtime.
 
 ## Escape hatch
 
@@ -49,6 +57,7 @@ ENGINE = MAIN + "/ui/chat/AgentLoopEngine.kt"
 OPENAI = MAIN + "/provider/openai/OpenAIProvider.kt"
 ANTHROPIC = MAIN + "/provider/anthropic/AnthropicProvider.kt"
 TOOL_EXECUTORS = MAIN + "/ui/chat/ChatToolExecutors.kt"
+GEMINI = MAIN + "/provider/gemini/GeminiProvider.kt"
 
 C1_SIGNATURE = ("fun rejectionReason(toolName: String, finishReason: String?, "
                 "turnTruncated: Boolean = false): String?")
@@ -72,8 +81,42 @@ C5_SHARED_GUARD = "EofStubReminderStackGuard.isStaleEofStubReminder("
 C5_GUARD_CALLS = 2
 C5_OLD_INLINE = "val tailIsEofStubReminder ="
 
+# [deep-audit-1045 A-02] Gemini's EOF terminal decision must be the pure
+# function, and it must never fabricate a stop reason for an absent one.
+C6_GEMINI_TERMINAL_CALL = "geminiEofTerminal(lastFinishReason, contentChars, toolChars)"
+C6_GEMINI_SEND = "send(LLMStreamChunk.Finished(terminal.stopReason, truncated = terminal.truncated))"
+C6_GEMINI_PURE_DECL = "internal fun geminiEofTerminal("
+C6_GEMINI_PURE_ELSE = "GeminiEofTerminal(stopReason = lastFinishReason, truncated = false)"
+C7_FABRICATED = "lastFinishReason ?:"
+
 ESCAPE = "truncated-guard-ok:"
 SELFTEST_MARK = "TRUNCATED_CALL_GUARD_SELFTEST=PASS"
+
+
+def strip_kotlin_comments(text):
+    """Blank out // and /* */ comments (newlines preserved, so line numbers
+    stay valid). Prose must never satisfy a pinned-expression criterion — the
+    KDoc of the fix itself quotes the defect's old line."""
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                out.append(" ")
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            while i < n and not (text[i] == "*" and i + 1 < n and text[i + 1] == "/"):
+                out.append("\n" if text[i] == "\n" else " ")
+                i += 1
+            out.append("  ")
+            i += 2
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
 
 
 def line_of(text, needle):
@@ -82,7 +125,7 @@ def line_of(text, needle):
 
 
 def load(root):
-    paths = [POLICY, ENGINE, OPENAI, ANTHROPIC, TOOL_EXECUTORS]
+    paths = [POLICY, ENGINE, OPENAI, ANTHROPIC, TOOL_EXECUTORS, GEMINI]
     texts = []
     for rel in paths:
         path = os.path.join(root, rel)
@@ -107,7 +150,7 @@ def escaped_segment(text, needle):
     return False
 
 
-def check(policy, engine, openai, anthropic, tool_executors):
+def check(policy, engine, openai, anthropic, tool_executors, gemini):
     """Return [(criterion, file, line, message)] — empty list means wired."""
     problems = []
 
@@ -185,6 +228,39 @@ def check(policy, engine, openai, anthropic, tool_executors):
                          line_of(engine, C5_OLD_INLINE),
                          "the EOF-stub family's second inline predicate is back — use the shared object"))
 
+    # C6/C7 — Gemini's EOF terminal decision. Comments are stripped first: the
+    # fix's own KDoc quotes the defect's old line, and prose must never satisfy
+    # a pinned-expression criterion.
+    code = strip_kotlin_comments(gemini)
+    wired = (
+        code.count(C6_GEMINI_TERMINAL_CALL) == 1
+        and C6_GEMINI_SEND in code
+        and C6_GEMINI_PURE_DECL in code
+    )
+    if not wired:
+        problems.append(("gemini-eof-terminal-pure", GEMINI,
+                         line_of(code, C6_GEMINI_PURE_DECL),
+                         "the SSE EOF path must decide through the pure %s and emit %s "
+                         "(found %d verdict call(s))"
+                         % (C6_GEMINI_PURE_DECL, C6_GEMINI_SEND,
+                            code.count(C6_GEMINI_TERMINAL_CALL))))
+    if C6_GEMINI_PURE_DECL in code and (
+            C6_GEMINI_PURE_ELSE not in code or C7_FABRICATED in code):
+        # An absent finishReason must be passed through, never substituted:
+        # failOnSilentEmptyCompletion decides by `Finished.stopReason != null`,
+        # so a fabricated "end_turn" turns an empty relay response into a clean
+        # finish. File-scope on purpose (the defect lived at the call site and
+        # moves with it), anchored on the two variables involved — the
+        # non-streaming `finishReason ?: "end_turn"` path uses a different
+        # variable and is a separate (registered) decision.
+        problems.append(("gemini-eof-passthrough", GEMINI,
+                         line_of(code, C7_FABRICATED) if C7_FABRICATED in code
+                         else line_of(code, C6_GEMINI_PURE_DECL),
+                         "a fabricated stop reason for an absent finishReason is back "
+                         "(%s) — it makes failOnSilentEmptyCompletion read an empty EOF as "
+                         "a clean finish; the else arm must stay '%s'"
+                         % (C7_FABRICATED, C6_GEMINI_PURE_ELSE)))
+
     return problems
 
 
@@ -192,22 +268,25 @@ def selftest(root):
     files = load(root)
     if files is None:
         return 1
-    policy, engine, openai, anthropic, tool_executors = files
+    policy, engine, openai, anthropic, tool_executors, gemini = files
 
     def on_policy(fn):
-        return lambda p, e, o, a, t: (fn(p), e, o, a, t)
+        return lambda p, e, o, a, t, g: (fn(p), e, o, a, t, g)
 
     def on_engine(fn):
-        return lambda p, e, o, a, t: (p, fn(e), o, a, t)
+        return lambda p, e, o, a, t, g: (p, fn(e), o, a, t, g)
 
     def on_openai(fn):
-        return lambda p, e, o, a, t: (p, e, fn(o), a, t)
+        return lambda p, e, o, a, t, g: (p, e, fn(o), a, t, g)
 
     def on_anthropic(fn):
-        return lambda p, e, o, a, t: (p, e, o, fn(a), t)
+        return lambda p, e, o, a, t, g: (p, e, o, fn(a), t, g)
 
     def on_tool_executors(fn):
-        return lambda p, e, o, a, t: (p, e, o, a, fn(t))
+        return lambda p, e, o, a, t, g: (p, e, o, a, fn(t), g)
+
+    def on_gemini(fn):
+        return lambda p, e, o, a, t, g: (p, e, o, a, t, fn(g))
 
     def strip_guard_from_error_branch(s):
         # delete the FIRST guard call (the error-shaped site) → count drops to 1
@@ -250,6 +329,14 @@ def selftest(root):
                                                "content = truncatedRefusal, isError = false", 1))),
         ("error-shaped branch loses the stacking guard", "stack-guard-shared",
          on_engine(strip_guard_from_error_branch)),
+        ("gemini EOF reverts to the fabricated end_turn",
+         "gemini-eof-terminal-pure+gemini-eof-passthrough",
+         on_gemini(lambda s: s.replace(C6_GEMINI_SEND,
+                                       'send(LLMStreamChunk.Finished(lastFinishReason ?: "end_turn"))', 1))),
+        ("gemini pure verdict invents a stop reason", "gemini-eof-passthrough",
+         on_gemini(lambda s: s.replace(
+             C6_GEMINI_PURE_ELSE,
+             'GeminiEofTerminal(stopReason = lastFinishReason ?: "end_turn", truncated = false)', 1))),
         ("eof-stub branch back to an inline predicate", "stack-guard-no-inline-twin",
          on_engine(lambda s: s.replace(
              "                        if (EofStubReminderStackGuard.isStaleEofStubReminder(prevTail)) {",
@@ -262,8 +349,9 @@ def selftest(root):
         mutated = mutate(*files)
         found = check(*mutated)
         fired = sorted(set(c for c, _f, _l, _m in found))
-        if fired != [criterion]:
-            failed.append("%s: expected [%s] got %s" % (name, criterion, fired))
+        expected = sorted(criterion.split("+"))
+        if fired != expected:
+            failed.append("%s: expected %s got %s" % (name, expected, fired))
     # clean tree must be fully green
     if check(*files):
         failed.append("clean tree unexpectedly flagged: %s" % (check(*files)[:2],))
@@ -292,8 +380,9 @@ def main():
             print("   - [%s] %s:%d — %s" % (criterion, rel, line, msg))
         return 1
     print("✅ truncated-call gate: policy reads both truncation sources, the engine and the "
-          "sub-agent loop feed it, OpenAI's EOF guard counts tool-call events, and both "
-          "stub-reminder injection sites share one stacking guard")
+          "sub-agent loop feed it, OpenAI's EOF guard counts tool-call events, both "
+          "stub-reminder injection sites share one stacking guard, and Gemini's EOF "
+          "terminal decision goes through the pure verdict without inventing a stop reason")
     return 0
 
 

@@ -21,7 +21,10 @@ import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.ui.chat.ChatViewModel
 import com.rikkaminis.app.ui.chat.ChatViewModelStore
+import com.rikkaminis.app.ui.chat.SessionModelResolution
+import com.rikkaminis.app.ui.chat.UnusableModelReason
 import com.rikkaminis.app.ui.chat.applyDefaultModelFallback
+import com.rikkaminis.app.ui.chat.decideSessionModelResolution
 import com.rikkaminis.app.ui.chat.restoreFromBinding
 import com.rikkaminis.app.ui.chat.setThinkingLevel
 import kotlinx.coroutines.Dispatchers
@@ -576,12 +579,32 @@ internal object ConfigBuiltins {
                     val sid = sessionIdProvider()
                     if (sid == null) ConfigValue.Null
                     else {
+                        // [dv25-A06] Read the LIVE value, not just the row: the
+                        // writer above pushes into the resident view model, so a
+                        // row-only read reported a different value than the one
+                        // the write had just accepted (and for a draft it
+                        // reported the empty default while the VM held the real
+                        // level). Precedence lives in
+                        // `SessionConfigWriteThrough.thinkingLevelReadSource`.
+                        val vm = residentViewModel(sid)
                         val session = runBlocking { chatRepo.dao.getSession(sid) }
-                        val raw = session?.thinkingOverride
-                        val token = if (raw == null) "off" else thinkingLevelToToken(
-                            runCatching { ThinkingLevel.valueOf(raw) }.getOrDefault(ThinkingLevel.OFF)
-                        )
-                        ConfigValue.Str(token)
+                        val level = when (
+                            thinkingLevelReadSource(
+                                hasLiveViewModel = vm != null,
+                                vmAdoptedRow = vm?.sessionLoaded?.value == true,
+                                hasPersistedRow = session != null,
+                            )
+                        ) {
+                            SessionConfigReadSource.ResidentViewModel ->
+                                vm!!.requestedThinkingLevel.value
+                            SessionConfigReadSource.PersistedRow -> {
+                                val raw = session?.thinkingOverride
+                                if (raw == null) ThinkingLevel.OFF
+                                else runCatching { ThinkingLevel.valueOf(raw) }.getOrDefault(ThinkingLevel.OFF)
+                            }
+                            SessionConfigReadSource.Absent -> ThinkingLevel.OFF
+                        }
+                        ConfigValue.Str(thinkingLevelToToken(level))
                     }
                 },
                 writer = { v ->
@@ -615,8 +638,28 @@ internal object ConfigBuiltins {
                     val sid = sessionIdProvider()
                     if (sid == null) ConfigValue.Str("")
                     else {
+                        // [dv25-A06] Same asymmetry as `session.thinkingLevel`, but
+                        // the precedence is ROW-first: the row holds the explicit
+                        // pin, the VM holds the model in use (also non-empty when
+                        // the pin is empty and loadSession's fallback chain picked
+                        // one). Reading the VM would invent a pin the user never
+                        // made. See `SessionConfigWriteThrough.modelBindingReadSource`.
+                        val vm = residentViewModel(sid)
                         val session = runBlocking { chatRepo.dao.getSession(sid) }
-                        ConfigValue.Str(formatBinding(session?.modelBinding))
+                        ConfigValue.Str(
+                            when (
+                                modelBindingReadSource(
+                                    hasLiveViewModel = vm != null,
+                                    hasPersistedRow = session != null,
+                                )
+                            ) {
+                                SessionConfigReadSource.ResidentViewModel ->
+                                    residentBindingToken(vm!!)
+                                SessionConfigReadSource.PersistedRow ->
+                                    formatBinding(session?.modelBinding)
+                                SessionConfigReadSource.Absent -> ""
+                            }
+                        )
                     }
                 },
                 writer = { v ->
@@ -648,6 +691,13 @@ internal object ConfigBuiltins {
                             }
                             val entry = cfg.modelEntries.find { it.id == uuid }
                                 ?: throw ConfigError.InvalidValue("Unknown model entry uuid: $uuid")
+                            // [dv25-A06] Existence is not usability: writing a
+                            // binding to a disabled instance / a keyless instance
+                            // produces a row that `restoreFromBinding` then REFUSES
+                            // (see decideSessionModelResolution), so the write
+                            // reported success and the chat fell back to another
+                            // model. Same decision source as the runtime gate.
+                            requireUsableEntry(providerRepo, entry, "entry:$uuid")
                             """{"type":"entry","entryId":"$uuid"}""" to entry.baseModel.id
                         }
                         s.startsWith("group:") -> {
@@ -657,10 +707,14 @@ internal object ConfigBuiltins {
                             }
                             val group = cfg.modelGroups.find { it.id == gid }
                                 ?: throw ConfigError.InvalidValue("Unknown group id: $gid")
-                            val firstEntryId = group.memberEntryIds.firstOrNull()
-                                ?: throw ConfigError.InvalidValue("Group $gid has no member entries")
-                            val firstEntry = cfg.modelEntries.find { it.id == firstEntryId }
-                                ?: throw ConfigError.InvalidValue("Group $gid references missing entry $firstEntryId")
+                            // [dv25-A06] A group binding is usable only when at
+                            // least one member is: `resolveProviderFromGroup`
+                            // returns false when every member is disabled /
+                            // keyless, so binding such a group wrote a row the
+                            // runtime then discarded. Pick the first USABLE member
+                            // for `model_id` (it used to be the first member,
+                            // which could itself be the unusable one).
+                            val firstEntry = firstUsableGroupMember(providerRepo, group)
                             """{"type":"group","groupId":"$gid"}""" to firstEntry.baseModel.id
                         }
                         else -> throw ConfigError.InvalidValue(
@@ -775,6 +829,102 @@ internal object ConfigBuiltins {
      * sentence has to see the new level. The fast path exists because hopping to
      * a looper we are already running on would deadlock `runBlocking`.
      */
+    /**
+     * [dv25-A06] The resident ViewModel for [sessionId], or null.
+     *
+     * `peekViewModel` is main-thread-only (it walks the ViewModelStore) and
+     * non-creating (a read for a chat that is not on screen must not
+     * materialise one) — both properties are load-bearing here, which is why
+     * the read path uses the same lookup as the write path.
+     */
+    private fun residentViewModel(sessionId: String): ChatViewModel? =
+        runOnMainThread { ChatViewModelStore.peekViewModel(sessionId) }
+
+    /**
+     * [dv25-A06] The binding token the resident VM is currently on, in the same
+     * `entry:<uuid>` / `group:<id>` syntax [formatBinding] renders from the row
+     * (empty = no explicit pin).
+     *
+     * Only consulted when the session has NO row (see
+     * `modelBindingReadSource`): a draft's write lands in the VM, so the VM is
+     * the only place that can answer. `selectedGroupId` first — a group-bound
+     * VM also carries a concrete `activeEntryId` (the rotated member), and
+     * reporting that member as an `entry:` pin would be a different fact.
+     */
+    private fun residentBindingToken(vm: ChatViewModel): String {
+        val groupId = vm.selectedGroupId.value
+        if (!groupId.isNullOrEmpty()) return "group:$groupId"
+        val entryId = vm.activeEntryId.value
+        if (!entryId.isNullOrEmpty()) return "entry:$entryId"
+        return ""
+    }
+
+    /**
+     * [dv25-A06] Fail-closed availability gate for `session.primaryModel`
+     * (entry branch). Same decision as the runtime gate
+     * ([decideSessionModelResolution]) — a binding the chat would refuse to
+     * restore must not be reported as written.
+     */
+    private fun requireUsableEntry(
+        providerRepo: ProviderRepository,
+        entry: com.rikkaminis.app.data.model.ModelEntry,
+        what: String,
+    ) {
+        val instance = providerRepo.instance(entry.providerInstanceId)
+        val apiKey = instance?.let { providerRepo.loadApiKey(it.id) }
+        val decision = decideSessionModelResolution(entry, instance, apiKey)
+        if (decision is SessionModelResolution.Unusable) {
+            throw ConfigError.InvalidValue("$what is not usable — ${unusableReasonMessage(decision.reason)}")
+        }
+    }
+
+    /**
+     * [dv25-A06] The first member of [group] that the runtime would actually
+     * use, or [ConfigError.InvalidValue] when there is none.
+     *
+     * Mirrors `ProviderRepository.enabledMemberEntries` +
+     * `resolveProviderFromGroup`'s credential check in ONE place, so the
+     * validation and the later restore cannot disagree.
+     */
+    private fun firstUsableGroupMember(
+        providerRepo: ProviderRepository,
+        group: com.rikkaminis.app.data.model.ModelGroup,
+    ): com.rikkaminis.app.data.model.ModelEntry {
+        if (group.memberEntryIds.isEmpty()) {
+            throw ConfigError.InvalidValue("Group ${group.id} has no member entries")
+        }
+        val cfg = providerRepo.config.value
+        val members = group.memberEntryIds.mapNotNull { id -> cfg.modelEntries.find { it.id == id } }
+        if (members.isEmpty()) {
+            throw ConfigError.InvalidValue(
+                "Group ${group.id} references no existing model entry — " +
+                    "every member id in ${group.memberEntryIds} is gone"
+            )
+        }
+        members.firstOrNull { member ->
+            val instance = providerRepo.instance(member.providerInstanceId)
+            decideSessionModelResolution(
+                member,
+                instance,
+                instance?.let { providerRepo.loadApiKey(it.id) },
+            ) is SessionModelResolution.Use
+        }?.let { return it }
+        throw ConfigError.InvalidValue(
+            "Group ${group.id} has no usable member — every member's provider " +
+                "instance is disabled or has no API key"
+        )
+    }
+
+    /** [dv25-A06] Human-readable cause for a rejected `session.primaryModel`. */
+    private fun unusableReasonMessage(reason: UnusableModelReason): String = when (reason) {
+        UnusableModelReason.MISSING_INSTANCE ->
+            "its provider instance no longer exists"
+        UnusableModelReason.PROVIDER_DISABLED ->
+            "its provider instance is disabled (enable it in Settings → Providers)"
+        UnusableModelReason.MISSING_API_KEY ->
+            "its provider instance has no API key"
+    }
+
     private fun <T> runOnMainThread(block: () -> T): T {
         if (Looper.myLooper() == Looper.getMainLooper()) return block()
         return runBlocking { withContext(Dispatchers.Main) { block() } }

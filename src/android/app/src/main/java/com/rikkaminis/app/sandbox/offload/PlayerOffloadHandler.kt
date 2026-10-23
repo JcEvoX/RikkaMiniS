@@ -2,6 +2,8 @@ package com.rikkaminis.app.sandbox.offload
 
 import android.content.Context
 import com.rikkaminis.app.offload.MediaPlayerManager
+import com.rikkaminis.app.offload.PlayerOutcome
+import com.rikkaminis.app.offload.playerEnvelope
 import com.rikkaminis.app.sandbox.NativeOffloadHandler
 import com.rikkaminis.app.sandbox.NativeOffloadRequest
 import com.rikkaminis.app.sandbox.NativeOffloadResult
@@ -17,6 +19,22 @@ import com.rikkaminis.app.sandbox.NativeOffloadResult
  *   android-player stop <session>
  *   android-player status <session>
  *   android-player list
+ *
+ * [dv25-A4 A-07] The payload is JSON on EVERY path, success and refusal
+ * alike. Before, the only `formatBody` input was the manager's English
+ * sentence (`"Playing '…'"`, `"Error: no session '…'"`, `"No active media
+ * sessions."`), and `OffloadOutput.formatBody` is a pass-through for prose —
+ * so `-c` / `-q` were no-ops and `jq` / `json.loads` broke on success while
+ * the uncaught-exception branch answered `{"error":"player_failed"}`: one
+ * command, two formats. [MediaPlayerManager] now returns fields
+ * ([PlayerOutcome]) and [playerEnvelope] — the sibling handlers' `{ok, tool,
+ * action, data}` shape — assembles the body; no prose is parsed and no
+ * `startsWith("Error")` sniff decides the exit code.
+ *
+ * Exit codes are unchanged: 0 = command ran (a live session that cannot
+ * report a position still exits 0 and carries `player_error`), 1 = refusal,
+ * 2 = bad arguments. `--help` and the exit-2 usage strings deliberately
+ * never reach `formatBody`: they are human text, not a payload.
  */
 class PlayerOffloadHandler(private val context: Context) : NativeOffloadHandler {
     override fun handle(request: NativeOffloadRequest): NativeOffloadResult {
@@ -30,7 +48,7 @@ class PlayerOffloadHandler(private val context: Context) : NativeOffloadHandler 
 
         val sub = args.positional.firstOrNull() ?: "list"
         val id = args.positional.getOrNull(1)
-        val result = try {
+        val outcome = try {
             when (sub) {
                 "play" -> {
                     val path = args.positional.getOrNull(2)
@@ -73,13 +91,16 @@ class PlayerOffloadHandler(private val context: Context) : NativeOffloadHandler 
                 else -> return NativeOffloadResult(2, "android-player: unknown subcommand '$sub'\n$HELP")
             }
         } catch (e: Throwable) {
-            val body = org.json.JSONObject().put("error", "player_failed")
-                .put("message", e.message ?: "unknown").toString()
-            return NativeOffloadResult(1, OffloadOutput.formatBody(body, args) + "\n")
+            // Same code the pre-fix catch branch emitted, now carried through
+            // the one envelope so an uncaught failure and a refusal share a
+            // shape.
+            PlayerOutcome.failure(PlayerOutcome.ERROR_PLAYER_FAILED, e.message ?: "unknown")
         }
-        val err = result.startsWith("Error")
-        val formatted = OffloadOutput.formatBody(result.trimEnd('\n'), args)
-        return NativeOffloadResult(if (err) 1 else 0, "$formatted\n")
+        val envelope = playerEnvelope(sub, outcome)
+        return NativeOffloadResult(
+            if (outcome.ok) 0 else 1,
+            OffloadOutput.formatBody(envelope.toString(2), args) + "\n",
+        )
     }
 
     companion object {

@@ -67,6 +67,7 @@ CHAT_REPO_REL = "src/android/app/src/main/java/com/rikkaminis/app/data/repositor
 MINIS_APP_REL = "src/android/app/src/main/java/com/rikkaminis/app/MinisApp.kt"
 CHAT_ENTRY_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatSessionEntryExt.kt"
 DRAWER_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatHistoryDrawer.kt"
+CHAT_VM_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatViewModel.kt"
 
 # [dv24-b3 / deep-audit-1044 B-06] Draft promotion must persist the BODY, not
 # just a 50-char title prefix, and the drawer must treat a preview as content.
@@ -80,6 +81,28 @@ DURABLE_WRITES = ("appendMessage(", "updateSessionPreview(")
 # copy"; a variable (`= text`) keeps it. Anchored on that decision, not on the
 # spelling of the blank.
 COMPOSER_LITERAL_RE = re.compile(r"_inputText\.value\s*=\s*[\"']")
+# [dv25-B08 / deep-audit-1045 B-08] The promotion owns the session it creates.
+# The exit sweep must respect that ownership, and the promotion must keep the
+# draft slot recoverable when its durable write did not land.
+CLEANUP_DECL = "fun cleanupIfEmptyOnExit()"
+PROMOTE_OWNER_BIT = "promoteInFlight"
+# A READ of the bit: an occurrence that is not an assignment target. The
+# sweep must READ the bit (its value decides), so `promoteInFlight = false`
+# is not a read — and a hard-coded false is exactly the pre-fix shape.
+PROMOTE_OWNER_READ_RE = re.compile(r"(?<![.\w])promoteInFlight(?!\s*=)")
+# The promotion must both CLAIM the bit and RELEASE it (a claim that is never
+# released would freeze the sweep off for the rest of the session).
+PROMOTE_OWNER_CLAIM_RE = re.compile(r"(?<![.\w])promoteInFlight\s*=\s*true")
+PROMOTE_OWNER_RELEASE_RE = re.compile(r"(?<![.\w])promoteInFlight\s*=\s*false")
+# The sweep's decision is routed through the shared pure predicate, so the
+# four inputs (real id / streaming / attachments / promotion) are visible in
+# one place instead of four hand-written early returns.
+CLEANUP_PREDICATE = "shouldSkipCleanup("
+# The slot must be released only AFTER the durable write landed, or restored
+# when it did not. Either way the text must be recoverable.
+DRAFT_SAVE = "ComposerDraftStore.saveText("
+DRAFT_CLEAR = "ComposerDraftStore.clearDraft("
+
 DRAWER_VISIBLE_DECL = "fun isDrawerRowVisible("
 DRAWER_VISIBLE_CALL = "isDrawerRowVisible("
 DRAWER_FILTER_RE = re.compile(r"sessions\s*\.\s*filter\s*\{[^}]*isDrawerRowVisible\(")
@@ -830,6 +853,95 @@ def check_promote_draft(src):
     return v
 
 
+def check_promote_ownership(vm_src, entry_src):
+    """Arm 11 [dv25-B08 / deep-audit-1045 B-08]: the promotion OWNS the session
+    it creates, and the exit sweep must not reap it.
+
+    The pre-fix sequence: `promoteDraftIfNeeded` freed the draft slot
+    synchronously and then promoted asynchronously; `ensureSession()` inserted
+    the row (so `realSessionId` became non-empty) while the first `messages` row
+    was still several suspends away. Leaving the chat screen in that window
+    fired `cleanupIfEmptyOnExit()`, whose IO coroutine read
+    `messageCount(sid) == 0`, deleted the brand-new row and called
+    `ChatViewModelStore.release(sid)` — which cancels the promotion's own
+    `viewModelScope`. The composer copy was already dropped, so the user's typed
+    body (and its attachments) were gone 100% of the time.
+
+    Three criteria, each anchored on the DECISION rather than on a spelling:
+
+      C3 — `cleanupIfEmptyOnExit` must consult the promotion's ownership bit.
+           A session-ownership bit, NOT a grace period: the window has no
+           bounded length (the write can be delayed by IO), and a timer would
+           also skip rows the user really did leave empty.
+      C4 — the sweep's decision must be routed through the shared pure
+           predicate, so the four inputs live in ONE place. Four hand-written
+           early returns are how the fourth input silently went missing once
+           already (the pre-fix shape had exactly three).
+      C5 — the promotion must keep the draft slot recoverable: the text is
+           either durably persisted or written back to the draft slot. A
+           promotion that drops the only copy without landing the write is the
+           pre-fix shape.
+    """
+    v = []
+    masked_vm = mask_keep_offsets(vm_src)
+    masked_entry = mask_keep_offsets(entry_src)
+    if masked_vm is None or masked_entry is None:
+        v.append("ChatViewModel.kt / ChatSessionEntryExt.kt: unterminated string/comment literal "
+                 "— cannot mask offsets for the promotion-ownership check (ROT — update this gate)")
+        return v
+
+    cleanup_at = masked_vm.find(CLEANUP_DECL)
+    if cleanup_at < 0:
+        v.append("ChatViewModel.kt: '%s' not found (ROT — update this gate)" % CLEANUP_DECL)
+        return v
+    open_brace = masked_vm.find("{", cleanup_at)
+    end = brace_block_end(masked_vm, open_brace) if open_brace >= 0 else -1
+    if end < 0:
+        v.append("ChatViewModel.kt: cleanupIfEmptyOnExit body braces do not balance "
+                 "(ROT — update this gate)")
+        return v
+    cleanup_body = masked_vm[open_brace:end + 1]
+
+    if CLEANUP_PREDICATE not in cleanup_body:
+        v.append("ChatViewModel.kt: cleanupIfEmptyOnExit does not route its decision through "
+                 "'%s' — the four reasons to spare a row (real id / streaming / attachments / a "
+                 "promotion in flight) are four hand-written early returns, and the fourth one "
+                 "went missing this way: the exit sweep then deletes the row a draft promotion "
+                 "just created, before that promotion's first message lands" % CLEANUP_PREDICATE)
+    if not PROMOTE_OWNER_READ_RE.search(cleanup_body):
+        v.append("ChatViewModel.kt: cleanupIfEmptyOnExit never consults '%s' — a draft promotion "
+                 "in flight owns the row it created, and deleting it here also releases the "
+                 "ViewModel, cancelling the promotion that was about to fill it" % PROMOTE_OWNER_BIT)
+
+    start = masked_entry.find(PROMOTE_DECL)
+    if start < 0:
+        v.append("ChatSessionEntryExt.kt: '%s' not found (ROT — update this gate)" % PROMOTE_DECL)
+        return v
+    p_open = masked_entry.find("{", start)
+    p_end = brace_block_end(masked_entry, p_open) if p_open >= 0 else -1
+    if p_end < 0:
+        v.append("ChatSessionEntryExt.kt: promoteDraftIfNeeded body braces do not balance "
+                 "(ROT — update this gate)")
+        return v
+    promote_body = masked_entry[p_open:p_end + 1]
+
+    if not PROMOTE_OWNER_CLAIM_RE.search(promote_body):
+        v.append("ChatSessionEntryExt.kt: promoteDraftIfNeeded never claims the session with "
+                 "'%s' — without the ownership bit the exit sweep cannot tell a promotion-owned "
+                 "row from an abandoned empty one, and the user's typed body is destroyed"
+                 % PROMOTE_OWNER_BIT)
+    if not PROMOTE_OWNER_RELEASE_RE.search(promote_body):
+        v.append("ChatSessionEntryExt.kt: promoteDraftIfNeeded never releases '%s' — a claim that "
+                 "is never handed back freezes the exit sweep off for the rest of the session, "
+                 "and a genuinely empty row the user left would survive forever"
+                 % PROMOTE_OWNER_BIT)
+    if DRAFT_SAVE not in promote_body:
+        v.append("ChatSessionEntryExt.kt: promoteDraftIfNeeded does not write the text back to "
+                 "the draft slot ('%s') — a promotion whose durable write failed (or was "
+                 "cancelled) leaves NO copy of the user's text anywhere" % DRAFT_SAVE)
+    return v
+
+
 def check_drawer_visibility(src):
     """Arm 10 [dv24-b3 / deep-audit-1044 B-06]: the drawer's visibility
     decision must treat a preview as content, without resurrecting ghost rows.
@@ -924,13 +1036,15 @@ def run(root):
         app = read(root, MINIS_APP_REL)
         entry = read(root, CHAT_ENTRY_REL)
         drawer = read(root, DRAWER_REL)
+        vm = read(root, CHAT_VM_REL)
     except OSError as exc:
         print("skill_restore_session_cleanup_check: cannot read sources: %s" % exc)
         return 2
     violations = (check_skill_repo(skill) + check_chat_repo(chat) + check_minis_app(app)
                   + check_chat_entry(entry) + check_minis_app_badge(app)
                   + check_minis_app_sweep(app)
-                  + check_promote_draft(entry) + check_drawer_visibility(drawer))
+                  + check_promote_draft(entry) + check_drawer_visibility(drawer)
+                  + check_promote_ownership(vm, entry))
     if violations:
         print("FAIL skill_restore_session_cleanup_check")
         for v in violations:
@@ -1302,6 +1416,137 @@ BAD_PROMOTE_PERSIST_BEFORE_ENSURE = GOOD_PROMOTE.replace(
     "        val sid = ensureSession()").replace(
     PERSIST_TWO_LINES, "")
 
+# [dv25-B08 / deep-audit-1045 B-08] promotion-ownership fixtures.
+GOOD_VM = """
+class ChatViewModel {
+    @Volatile
+    internal var promoteInFlight: Boolean = false
+
+    fun cleanupIfEmptyOnExit() {
+        val sid = realSessionId
+        if (shouldSkipCleanup(
+                hasRealId = sid.isNotEmpty(),
+                streaming = _isStreaming.value,
+                hasAttachments = _attachments.value.isNotEmpty(),
+                promoteInFlight = promoteInFlight,
+            )
+        ) {
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val count = chatRepository.messageCount(sid)
+            if (count > 0) return@launch
+            if (promoteInFlight) return@launch
+            chatRepository.deleteSessionRowOnly(sid)
+        }
+    }
+}
+"""
+
+# The pre-fix shape: three hand-written early returns, no ownership bit.
+BAD_VM_NO_OWNER = GOOD_VM.replace(
+    """        if (shouldSkipCleanup(
+                hasRealId = sid.isNotEmpty(),
+                streaming = _isStreaming.value,
+                hasAttachments = _attachments.value.isNotEmpty(),
+                promoteInFlight = promoteInFlight,
+            )
+        ) {
+            return
+        }
+""",
+    """        if (shouldSkipCleanup(
+                hasRealId = sid.isNotEmpty(),
+                streaming = _isStreaming.value,
+                hasAttachments = _attachments.value.isNotEmpty(),
+                promoteInFlight = false,
+            )
+        ) {
+            return
+        }
+""").replace(
+    "            if (promoteInFlight) return@launch\n", "")
+
+# The ownership bit is consulted, but the decision is spread over hand-written
+# early returns — the shape that lost the fourth input once already.
+BAD_VM_NO_PREDICATE = GOOD_VM.replace(
+    """        if (shouldSkipCleanup(
+                hasRealId = sid.isNotEmpty(),
+                streaming = _isStreaming.value,
+                hasAttachments = _attachments.value.isNotEmpty(),
+                promoteInFlight = promoteInFlight,
+            )
+        ) {
+            return
+        }
+""",
+    """        if (sid.isEmpty()) return
+        if (_isStreaming.value) return
+        if (_attachments.value.isNotEmpty()) return
+        if (promoteInFlight) return
+""")
+
+# Both criteria gone: the hand-written returns AND no ownership bit.
+BAD_VM_NO_OWNER_AT_ALL = GOOD_VM.replace(
+    """        if (shouldSkipCleanup(
+                hasRealId = sid.isNotEmpty(),
+                streaming = _isStreaming.value,
+                hasAttachments = _attachments.value.isNotEmpty(),
+                promoteInFlight = promoteInFlight,
+            )
+        ) {
+            return
+        }
+""",
+    """        if (sid.isEmpty()) return
+        if (_isStreaming.value) return
+        if (_attachments.value.isNotEmpty()) return
+""").replace(
+    "            if (promoteInFlight) return@launch\n", "")
+
+GOOD_PROMOTE_OWNED = """
+fun ChatViewModel.promoteDraftIfNeeded(): Boolean {
+    if (!isDraft || realSessionId.isNotEmpty()) return false
+    if (promoteInFlight) return false
+    val text = composerTextForPromotion(_pendingComposerText.value, _inputText.value)
+    if (text.isBlank()) return false
+    promoteInFlight = true
+    com.rikkaminis.app.data.ComposerDraftStore.clearDraft(context, draftId)
+    viewModelScope.launch(Dispatchers.IO) {
+        var persisted = false
+        try {
+            val sid = ensureSession()
+            if (sid.isEmpty()) return@launch
+            val promoted = chatRepository.appendMessage(sid, "user", buildUserPartsJson(text, prepared.mediaRefPartsJson))
+            persisted = true
+            _inputText.value = ""
+        } finally {
+            promoteInFlight = false
+            if (!persisted) {
+                com.rikkaminis.app.data.ComposerDraftStore.saveText(context, draftId, text)
+            }
+        }
+    }
+    return true
+}
+"""
+
+# The promotion never claims the session.
+BAD_PROMOTE_NO_OWNER = GOOD_PROMOTE_OWNED.replace(
+    "    promoteInFlight = true\n", "")
+
+# The claim is made but never released: the sweep would stay off for the rest
+# of the session.
+BAD_PROMOTE_NO_RELEASE = GOOD_PROMOTE_OWNED.replace(
+    "            promoteInFlight = false\n", "")
+
+# The promotion drops the only copy when its write did not land.
+BAD_PROMOTE_NO_RESTORE = GOOD_PROMOTE_OWNED.replace(
+    """            if (!persisted) {
+                com.rikkaminis.app.data.ComposerDraftStore.saveText(context, draftId, text)
+            }
+""", "")
+
 GOOD_DRAWER = '''
 @Composable
 fun ChatHistoryDrawer(chatRepository: ChatRepository) {
@@ -1534,6 +1779,56 @@ def selftest():
     bad_persist_early = check_promote_draft(BAD_PROMOTE_PERSIST_BEFORE_ENSURE)
     expect_trip("persist-before-ensure promotion (B-06)", bad_persist_early, "BEFORE 'ensureSession('",
                 failures)
+
+    # [dv25-B08 / deep-audit-1045 B-08] the promotion owns its session.
+    good_own = check_promote_ownership(GOOD_VM, GOOD_PROMOTE_OWNED)
+    if good_own:
+        failures.append("compliant promotion-ownership fixture is not clean: %r" % good_own)
+    bad_no_owner = check_promote_ownership(BAD_VM_NO_OWNER, GOOD_PROMOTE_OWNED)
+    expect_trip("sweep without the promotion ownership bit (B-08)", bad_no_owner,
+                "never consults", failures)
+    # Precision: the ownership arm must fire ONLY its own criterion, so a
+    # regression in the predicate arm cannot hide behind it.
+    if len(bad_no_owner) != 1:
+        failures.append("no-ownership-bit fixture tripped %d arms, expected exactly 1: %r"
+                        % (len(bad_no_owner), bad_no_owner))
+    bad_no_predicate = check_promote_ownership(BAD_VM_NO_PREDICATE, GOOD_PROMOTE_OWNED)
+    expect_trip("sweep without the shared predicate (B-08)", bad_no_predicate,
+                "does not route its decision", failures)
+    if len(bad_no_predicate) != 1:
+        failures.append("no-predicate fixture tripped %d arms, expected exactly 1: %r"
+                        % (len(bad_no_predicate), bad_no_predicate))
+    bad_no_owner_at_all = check_promote_ownership(BAD_VM_NO_OWNER_AT_ALL, GOOD_PROMOTE_OWNED)
+    expect_trip("sweep without any ownership guard (B-08)", bad_no_owner_at_all,
+                "does not route its decision", failures)
+    expect_trip("sweep without any ownership guard (B-08)", bad_no_owner_at_all,
+                "never consults", failures)
+    bad_promote_no_owner = check_promote_ownership(GOOD_VM, BAD_PROMOTE_NO_OWNER)
+    expect_trip("promotion that never claims the session (B-08)", bad_promote_no_owner,
+                "never claims the session", failures)
+    bad_promote_no_release = check_promote_ownership(GOOD_VM, BAD_PROMOTE_NO_RELEASE)
+    expect_trip("promotion that never releases the claim (B-08)", bad_promote_no_release,
+                "never releases", failures)
+    if len(bad_promote_no_release) != 1:
+        failures.append("no-release promotion fixture tripped %d arms, expected exactly 1: %r"
+                        % (len(bad_promote_no_release), bad_promote_no_release))
+    bad_promote_no_restore = check_promote_ownership(GOOD_VM, BAD_PROMOTE_NO_RESTORE)
+    expect_trip("promotion that drops the only copy (B-08)", bad_promote_no_restore,
+                "does not write the text back", failures)
+    # Precision: the "no owner bit" arm must fire ONLY its own criterion — the
+    # predicate is still routed, so a mask that trips both would hide a
+    # regression in either one.
+    if len(bad_promote_no_owner) != 1:
+        failures.append("no-claim promotion fixture tripped %d arms, expected exactly 1: %r"
+                        % (len(bad_promote_no_owner), bad_promote_no_owner))
+
+    print("selftest compliant promotion ownership -> %d violation(s)" % len(good_own))
+    print("selftest sweep without ownership bit   -> %d violation(s)" % len(bad_no_owner))
+    print("selftest sweep without shared predicate -> %d violation(s)" % len(bad_no_predicate))
+    print("selftest sweep without any guard       -> %d violation(s)" % len(bad_no_owner_at_all))
+    print("selftest promotion without claim        -> %d violation(s)" % len(bad_promote_no_owner))
+    print("selftest promotion without release      -> %d violation(s)" % len(bad_promote_no_release))
+    print("selftest promotion without restore      -> %d violation(s)" % len(bad_promote_no_restore))
 
     # [dv24-b3] drawer visibility treats a preview as content.
     good_drawer = check_drawer_visibility(GOOD_DRAWER)
