@@ -66,6 +66,26 @@ SKILL_REPO_REL = "src/android/app/src/main/java/com/rikkaminis/app/data/reposito
 CHAT_REPO_REL = "src/android/app/src/main/java/com/rikkaminis/app/data/repository/ChatRepository.kt"
 MINIS_APP_REL = "src/android/app/src/main/java/com/rikkaminis/app/MinisApp.kt"
 CHAT_ENTRY_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatSessionEntryExt.kt"
+DRAWER_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatHistoryDrawer.kt"
+
+# [dv24-b3 / deep-audit-1044 B-06] Draft promotion must persist the BODY, not
+# just a 50-char title prefix, and the drawer must treat a preview as content.
+PROMOTE_DECL = "fun ChatViewModel.promoteDraftIfNeeded("
+ENSURE_CALL = "ensureSession("
+# The two single-source writers that associate text with a session durably.
+# Both live in ChatRepository and both refresh `last_message` + `updated_at`.
+DURABLE_WRITES = ("appendMessage(", "updateSessionPreview(")
+# `_inputText.value = "<literal>` — assigning a CONSTANT to the composer. In
+# this function the only such constant is the blank, i.e. "destroy the in-memory
+# copy"; a variable (`= text`) keeps it. Anchored on that decision, not on the
+# spelling of the blank.
+COMPOSER_LITERAL_RE = re.compile(r"_inputText\.value\s*=\s*[\"']")
+DRAWER_VISIBLE_DECL = "fun isDrawerRowVisible("
+DRAWER_VISIBLE_CALL = "isDrawerRowVisible("
+DRAWER_FILTER_RE = re.compile(r"sessions\s*\.\s*filter\s*\{[^}]*isDrawerRowVisible\(")
+# Blankness test on the preview column (any of these is the "no content" arm).
+PREVIEW_BLANK_CHECKS = ("isNullOrBlank", "isNotBlank", "isNullOrEmpty", "isNotEmpty")
+TOP_LEVEL_BOUNDS = ("\nfun ", "\ninternal fun ", "\nprivate fun ", "\n@Composable")
 
 ADD_DECL = "fun add("
 ADD_SIG_END = "): Skill? {"
@@ -649,6 +669,220 @@ def check_minis_app_sweep(src):
     return v
 
 
+def mask_keep_offsets(src):
+    """Mask string/comment BODIES with spaces, keeping every offset intact.
+
+    The sibling `strip_literals` collapses bodies (offsets shift) and
+    `code_only` drops whole comment lines — neither can be used when the
+    criterion is *ordering* ("the composer blanking must come after the durable
+    write"). Quotes are kept so `= ""` stays visible as an assignment of a
+    literal; only the bodies are blanked, newlines preserved.
+
+    Returns None when a literal/comment never terminates (caller treats that as
+    ROT rather than matching shifted garbage).
+    """
+    out = list(src)
+    i, n = 0, len(src)
+    while i < n:
+        if src.startswith('"""', i):
+            end = src.find('"""', i + 3)
+            if end < 0:
+                return None
+            for k in range(i + 3, end):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = end + 3
+            continue
+        c = src[i]
+        if c == '"' or c == "'":
+            i += 1
+            while i < n and src[i] != c:
+                if src[i] == "\\":
+                    if out[i] != "\n":
+                        out[i] = " "
+                    i += 1
+                    if i < n and out[i] != "\n":
+                        out[i] = " "
+                    i += 1
+                    continue
+                if out[i] != "\n":
+                    out[i] = " "
+                i += 1
+            if i >= n:
+                return None
+            i += 1
+            continue
+        if src.startswith("//", i):
+            j = src.find("\n", i)
+            j = n if j < 0 else j
+            for k in range(i, j):
+                out[k] = " "
+            i = j
+            continue
+        if src.startswith("/*", i):
+            j = src.find("*/", i + 2)
+            if j < 0:
+                return None
+            for k in range(i, j + 2):
+                if out[k] != "\n":
+                    out[k] = " "
+            i = j + 2
+            continue
+        i += 1
+    return "".join(out)
+
+
+def decl_slice(masked, decl):
+    """`masked[decl:next-top-level-declaration]` — for BOTH body shapes.
+
+    `block_body` only understands block bodies and returns None for an
+    expression-bodied declaration (`): Boolean = ...`), which is the shape the
+    drawer helper is written in. Slicing to the next top-level declaration keeps
+    the anchor honest without dictating the shape.
+    """
+    start = masked.find(decl)
+    if start < 0:
+        return None
+    end = len(masked)
+    for pat in TOP_LEVEL_BOUNDS:
+        k = masked.find(pat, start + len(decl))
+        if k >= 0:
+            end = min(end, k)
+    return masked[start:end]
+
+
+def check_promote_draft(src):
+    """Arm 9 [dv24-b3 / deep-audit-1044 B-06]: promoting a draft on "New Chat"
+    must hand the typed body to a DURABLE home owned by the new session.
+
+    The pre-fix function wrote `sessions.title = text.take(50).trim()` and
+    nothing else, then blanked both in-memory copies. Consequences, in the order
+    they bite: the list row has no `messages`, so `ChatHistoryDrawer`'s
+    `pinnedAt / messageCounts` filter hides it; `cleanupIfEmptyOnExit` deletes it
+    (and releases the VM) the moment the user opens and leaves that session;
+    the startup sweep deletes it after 60 s. The text is gone 100% of the time.
+
+    Two decisions, both anchored on the outcome rather than on a spelling:
+      C1 — the captured text reaches `appendMessage(` / `updateSessionPreview(`
+           AFTER `ensureSession()` (persisting under a sid that does not exist
+           yet is a no-op);
+      C2 — IF the composer copy is blanked, that happens AFTER the durable write.
+           Ordering is the cancellation safety net: clearing first destroys the
+           only copy if the coroutine never resumes.
+    """
+    v = []
+    masked = mask_keep_offsets(src)
+    if masked is None:
+        v.append("ChatSessionEntryExt.kt: unterminated string/comment literal — cannot mask "
+                 "offsets for the promotion ordering check (ROT — update this gate)")
+        return v
+    start = masked.find(PROMOTE_DECL)
+    if start < 0:
+        v.append("ChatSessionEntryExt.kt: '%s' not found (ROT — update this gate)"
+                 % PROMOTE_DECL)
+        return v
+    open_brace = masked.find("{", start)
+    end = brace_block_end(masked, open_brace) if open_brace >= 0 else -1
+    if end < 0:
+        v.append("ChatSessionEntryExt.kt: promoteDraftIfNeeded body braces do not balance "
+                 "(ROT — update this gate)")
+        return v
+    body = masked[open_brace:end + 1]
+
+    ensure_at = body.find(ENSURE_CALL)
+    wired = []
+    for token in DURABLE_WRITES:
+        k = body.find(token)
+        while k >= 0:
+            paren = body.find("(", k + len(token) - 1)
+            close = balanced_index(body, paren, "(", ")") if paren >= 0 else -1
+            args = body[paren:close + 1] if close > paren else ""
+            # The persisted payload must carry the captured text. `sid`-only
+            # writes (a title, a binding) are exactly the pre-fix shape.
+            if "text" in args:
+                wired.append(k)
+            k = body.find(token, k + 1)
+    if not wired:
+        v.append(
+            "ChatSessionEntryExt.kt: promoteDraftIfNeeded never persists the captured draft text "
+            "into the promoted session (no 'appendMessage(' / 'updateSessionPreview(' carrying "
+            "`text`) — only a 50-char title would land, and a message-less row is hidden by the "
+            "drawer, deleted by cleanupIfEmptyOnExit and swept at the next cold start"
+        )
+    elif ensure_at < 0:
+        v.append("ChatSessionEntryExt.kt: promoteDraftIfNeeded does not call '%s' — the promoted "
+                 "id it persists against cannot exist" % ENSURE_CALL)
+    elif not any(k > ensure_at for k in wired):
+        v.append("ChatSessionEntryExt.kt: promoteDraftIfNeeded persists the body BEFORE '%s' — "
+                 "the write lands against a session id that does not exist yet and is "
+                 "silently dropped" % ENSURE_CALL)
+
+    blanks = [m.start() for m in COMPOSER_LITERAL_RE.finditer(body)]
+    if blanks and wired:
+        first_durable = min(wired)
+        for b in blanks:
+            if b < first_durable:
+                v.append(
+                    "ChatSessionEntryExt.kt: promoteDraftIfNeeded blanks the composer "
+                    "(_inputText.value = \"\") BEFORE the durable body write — a cancellation "
+                    "or DB failure in between leaves NO copy of the draft text"
+                )
+    return v
+
+
+def check_drawer_visibility(src):
+    """Arm 10 [dv24-b3 / deep-audit-1044 B-06]: the drawer's visibility
+    decision must treat a preview as content, without resurrecting ghost rows.
+
+    A promoted draft's body lives in `last_message` while `messages` stays empty,
+    so the old `pinnedAt != null || messageCounts > 0` filter hid exactly the
+    sessions this fix rescues. The inverse hazard is the `P0-1-drawer-title-
+    visibility` contract: `/memory` and `/thinking` toggle rows are message-less
+    AND preview-less, so they must stay hidden.
+
+    Criterion shape: the composable must ROUTE the filter through the extracted
+    pure predicate (so the four cases are JVM-pinnable, see
+    PromoteDraftVisibilityTest), and that predicate must consult all three
+    inputs — dropping any one of them is a different bug (drop the pin term and
+    pinned empties vanish; drop the count term and ordinary chats vanish; drop
+    the preview term and this fix evaporates).
+    """
+    v = []
+    masked = mask_keep_offsets(src)
+    if masked is None:
+        v.append("ChatHistoryDrawer.kt: unterminated string/comment literal — cannot inspect the "
+                 "visibility filter (ROT — update this gate)")
+        return v
+    if not DRAWER_FILTER_RE.search(masked):
+        v.append("ChatHistoryDrawer.kt: the session list filter does not route through '%s' — the "
+                 "visibility decision is inline again (a promoted draft with a preview but no "
+                 "messages row stays invisible)" % DRAWER_VISIBLE_CALL)
+    helper = decl_slice(masked, DRAWER_VISIBLE_DECL)
+    if helper is None:
+        v.append("ChatHistoryDrawer.kt: '%s' not found (ROT — update this gate)"
+                 % DRAWER_VISIBLE_DECL)
+        return v
+    # Look at the DECISION, not the parameter list: the parameters are named
+    # after the three inputs, so a term dropped from the predicate body would
+    # otherwise still be "mentioned" by its own parameter.
+    paren = helper.find("(")
+    close = balanced_index(helper, paren, "(", ")") if paren >= 0 else -1
+    decision = helper[close + 1:] if close > paren else helper
+    for term, label in (("pinnedAt", "the pinned reason"),
+                        ("messageCount", "the has-messages reason"),
+                        ("lastMessage", "the has-a-preview reason")):
+        if term not in decision:
+            v.append("ChatHistoryDrawer.kt: isDrawerRowVisible does not consult '%s' (%s) — "
+                     "that row class silently disappears from the drawer" % (term, label))
+    if not any(token in decision for token in PREVIEW_BLANK_CHECKS):
+        v.append("ChatHistoryDrawer.kt: isDrawerRowVisible accepts any non-null preview — a "
+                 "blank `last_message` would resurrect the ghost rows "
+                 "(P0-1-drawer-title-visibility): test blankness (%s)"
+                 % " / ".join(PREVIEW_BLANK_CHECKS))
+    return v
+
+
+
 GOOD_APP_SWEEP = """
 class MinisApp : Application() {
     override fun onCreate() {
@@ -689,12 +923,14 @@ def run(root):
         chat = read(root, CHAT_REPO_REL)
         app = read(root, MINIS_APP_REL)
         entry = read(root, CHAT_ENTRY_REL)
+        drawer = read(root, DRAWER_REL)
     except OSError as exc:
         print("skill_restore_session_cleanup_check: cannot read sources: %s" % exc)
         return 2
     violations = (check_skill_repo(skill) + check_chat_repo(chat) + check_minis_app(app)
                   + check_chat_entry(entry) + check_minis_app_badge(app)
-                  + check_minis_app_sweep(app))
+                  + check_minis_app_sweep(app)
+                  + check_promote_draft(entry) + check_drawer_visibility(drawer))
     if violations:
         print("FAIL skill_restore_session_cleanup_check")
         for v in violations:
@@ -1019,6 +1255,100 @@ BAD_ENTRY_OUTSIDE_DRAFT = GOOD_ENTRY.replace(
     "    webAppShortcutRepository?.renameSessionShortcuts(sessionId, session.id)\n"
     "    return realSessionId\n}")
 
+# [dv24-b3 / deep-audit-1044 B-06] draft-promotion fixtures. The compliant
+# shape persists the body AFTER ensureSession and blanks the composer only
+# after that write landed.
+GOOD_PROMOTE = '''
+fun ChatViewModel.promoteDraftIfNeeded(): Boolean {
+    if (!isDraft || realSessionId.isNotEmpty()) return false
+    val text = _inputText.value
+    if (text.isBlank()) return false
+    com.rikkaminis.app.data.ComposerDraftStore.clearDraft(context, sessionId)
+    viewModelScope.launch {
+        val sid = ensureSession()
+        if (sid.isEmpty()) return@launch
+        val title = text.take(50).trim()
+        chatRepository.updateSessionTitleAndCategory(sid, title, null)
+        _sessionTitle.value = title
+        val promoted = chatRepository.appendMessage(sid, "user", buildUserPartsJson(text, emptyList()))
+        _messages.value = _messages.value + ChatMessage(id = promoted.id, role = "user", content = text)
+        _inputText.value = ""
+    }
+    return true
+}
+'''
+
+PERSIST_TWO_LINES = (
+    "        val promoted = chatRepository.appendMessage(sid, \"user\", buildUserPartsJson(text, emptyList()))\n"
+    "        _messages.value = _messages.value + ChatMessage(id = promoted.id, role = \"user\", content = text)\n"
+)
+
+# The pre-fix shape: a 50-char title and nothing else.
+BAD_PROMOTE_TITLE_ONLY = GOOD_PROMOTE.replace(PERSIST_TWO_LINES, "")
+
+# Ordering hazard: the composer is blanked BEFORE the durable write, so a
+# cancellation in between destroys the only copy.
+BAD_PROMOTE_BLANK_FIRST = GOOD_PROMOTE.replace(
+    "        _inputText.value = \"\"\n", "").replace(
+    "    com.rikkaminis.app.data.ComposerDraftStore.clearDraft(context, sessionId)\n",
+    "    com.rikkaminis.app.data.ComposerDraftStore.clearDraft(context, sessionId)\n"
+    "    _inputText.value = \"\"\n")
+
+# Persisting before the id exists is a no-op against an empty sid.
+BAD_PROMOTE_PERSIST_BEFORE_ENSURE = GOOD_PROMOTE.replace(
+    "    viewModelScope.launch {\n        val sid = ensureSession()",
+    "    viewModelScope.launch {\n"
+    "        chatRepository.appendMessage(realSessionId, \"user\", buildUserPartsJson(text, emptyList()))\n"
+    "        val sid = ensureSession()").replace(
+    PERSIST_TWO_LINES, "")
+
+GOOD_DRAWER = '''
+@Composable
+fun ChatHistoryDrawer(chatRepository: ChatRepository) {
+    val messageCounts by chatRepository.observeMessageCountsPerSession()
+        .collectAsState(initial = emptyMap())
+    val visibleSessions = remember(sessions, messageCounts) {
+        sessions.filter { session ->
+            isDrawerRowVisible(
+                pinnedAt = session.pinnedAt,
+                messageCount = messageCounts[session.id] ?: 0,
+                lastMessage = session.lastMessage,
+            )
+        }
+    }
+}
+
+internal fun isDrawerRowVisible(
+    pinnedAt: Long?,
+    messageCount: Int,
+    lastMessage: String?,
+): Boolean = pinnedAt != null || messageCount > 0 || !lastMessage.isNullOrBlank()
+'''
+
+# The pre-fix inline filter: no preview term at all, and no shared predicate.
+BAD_DRAWER_INLINE_FILTER = GOOD_DRAWER.replace(
+    """        sessions.filter { session ->
+            isDrawerRowVisible(
+                pinnedAt = session.pinnedAt,
+                messageCount = messageCounts[session.id] ?: 0,
+                lastMessage = session.lastMessage,
+            )
+        }""",
+    "        sessions.filter { it.pinnedAt != null || (messageCounts[it.id] ?: 0) > 0 }",
+)
+
+# Dropping the has-messages term makes every ordinary chat vanish.
+BAD_DRAWER_NO_COUNT = GOOD_DRAWER.replace(
+    "): Boolean = pinnedAt != null || messageCount > 0 || !lastMessage.isNullOrBlank()",
+    "): Boolean = pinnedAt != null || !lastMessage.isNullOrBlank()",
+)
+
+# Accepting any non-null preview resurrects the ghost rows.
+BAD_DRAWER_ANY_NON_NULL = GOOD_DRAWER.replace(
+    "!lastMessage.isNullOrBlank()",
+    "lastMessage != null",
+)
+
 BAD_APP_ORDER = """
 class MinisApp : Application() {
     lateinit var chatRepository: ChatRepository
@@ -1182,6 +1512,56 @@ def selftest():
     print("selftest unwired startup sweep     -> %d violation(s)" % len(bad_sweep_unwired))
     print("selftest sweep without live set    -> %d violation(s)" % len(bad_sweep_no_live))
     print("selftest sweep off the IO region   -> %d violation(s)" % len(bad_sweep_on_main))
+
+    # [dv24-b3 / deep-audit-1044 B-06] draft promotion persists the BODY.
+    good_promote = check_promote_draft(GOOD_PROMOTE)
+    if good_promote:
+        failures.append("compliant promoteDraftIfNeeded fixture is not clean: %r" % good_promote)
+    bad_title_only = check_promote_draft(BAD_PROMOTE_TITLE_ONLY)
+    expect_trip("title-only promotion (B-06)", bad_title_only, "never persists the captured draft text",
+                failures)
+    # The pre-fix shape must fire ONLY C1: with no durable write there is no
+    # ordering to judge, so C2 stays quiet and the arms stay attributable.
+    if len(bad_title_only) != 1:
+        failures.append("title-only promotion fixture tripped %d arms, expected exactly 1: %r"
+                        % (len(bad_title_only), bad_title_only))
+    bad_blank_first = check_promote_draft(BAD_PROMOTE_BLANK_FIRST)
+    expect_trip("blank-before-persist promotion (B-06)", bad_blank_first, "BEFORE the durable body write",
+                failures)
+    if len(bad_blank_first) != 1:
+        failures.append("blank-before-persist fixture tripped %d arms, expected exactly 1: %r"
+                        % (len(bad_blank_first), bad_blank_first))
+    bad_persist_early = check_promote_draft(BAD_PROMOTE_PERSIST_BEFORE_ENSURE)
+    expect_trip("persist-before-ensure promotion (B-06)", bad_persist_early, "BEFORE 'ensureSession('",
+                failures)
+
+    # [dv24-b3] drawer visibility treats a preview as content.
+    good_drawer = check_drawer_visibility(GOOD_DRAWER)
+    if good_drawer:
+        failures.append("compliant drawer visibility fixture is not clean: %r" % good_drawer)
+    bad_inline = check_drawer_visibility(BAD_DRAWER_INLINE_FILTER)
+    expect_trip("inline drawer filter (B-06)", bad_inline, "does not route through", failures)
+    bad_no_count = check_drawer_visibility(BAD_DRAWER_NO_COUNT)
+    expect_trip("drawer predicate without messageCount (B-06)", bad_no_count, "does not consult 'messageCount'",
+                failures)
+    if len(bad_no_count) != 1:
+        failures.append("no-count drawer fixture tripped %d arms, expected exactly 1: %r"
+                        % (len(bad_no_count), bad_no_count))
+    bad_any_non_null = check_drawer_visibility(BAD_DRAWER_ANY_NON_NULL)
+    expect_trip("drawer predicate accepting any non-null preview (B-06)", bad_any_non_null,
+                "accepts any non-null preview", failures)
+    if len(bad_any_non_null) != 1:
+        failures.append("any-non-null drawer fixture tripped %d arms, expected exactly 1: %r"
+                        % (len(bad_any_non_null), bad_any_non_null))
+
+    print("selftest compliant promote draft  -> %d violation(s)" % len(good_promote))
+    print("selftest title-only promotion     -> %d violation(s)" % len(bad_title_only))
+    print("selftest blank-before-persist     -> %d violation(s)" % len(bad_blank_first))
+    print("selftest persist-before-ensure    -> %d violation(s)" % len(bad_persist_early))
+    print("selftest compliant drawer filter  -> %d violation(s)" % len(good_drawer))
+    print("selftest inline drawer filter      -> %d violation(s)" % len(bad_inline))
+    print("selftest drawer without count      -> %d violation(s)" % len(bad_no_count))
+    print("selftest drawer any-non-null       -> %d violation(s)" % len(bad_any_non_null))
 
     if failures:
         for f in failures:
