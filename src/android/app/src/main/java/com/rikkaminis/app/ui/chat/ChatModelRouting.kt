@@ -79,17 +79,30 @@ internal fun prependCompactionPin(
 }
 
 fun ChatViewModel.selectGroup(groupId: String) {
-    _selectedGroupId.value = groupId
-    _selectedGroupName.value = providerRepository.group(groupId)?.name ?: ""
     // [T-recovery] Explicit user selection clears all health state —
     // choosing a group is an explicit "I want to work with this group"
     // signal (also how a re-authed member becomes usable again).
+    //
+    // [deep-audit-1047 B-04] KEPT AHEAD of the resolution on purpose: clearing
+    // health is what makes a cooling / circuit-open member usable again, so it
+    // has to happen BEFORE the router is asked to pick one — moving it into the
+    // success branch would make a fully-demoted group unrecoverable by
+    // re-selection. (Health is routing state, not the display state this fix is
+    // about.)
     groupRouter.clearHealth()
-    // [T-per-message-load-balance] A group (re-)selection supersedes any
-    // pending member pick from a previous selection.
-    pendingEntryOverride = null
+    // [deep-audit-1047 B-04] Everything below is display + execution state and
+    // is written only once the group actually resolved. When it does not (every
+    // member disabled or credential-less, or a group holding nothing but System
+    // voice sentinels), the previous selection is left exactly as it was:
+    // writing the group id/name first used to leave the top bar showing group B
+    // while the session kept running on group A's provider + binding.
     val resolved = resolveProviderFromGroup(groupId)
     if (resolved) {
+        _selectedGroupId.value = groupId
+        _selectedGroupName.value = providerRepository.group(groupId)?.name ?: ""
+        // [T-per-message-load-balance] A group (re-)selection supersedes any
+        // pending member pick from a previous selection.
+        pendingEntryOverride = null
         // [T-per-message-load-balance] resolveProviderFromGroup already
         // advanced the rotation to the member now shown in the top bar —
         // pin it so THIS member serves the next new user turn (otherwise
@@ -108,26 +121,40 @@ fun ChatViewModel.selectGroup(groupId: String) {
 
 /** Select a specific entry within a group (keeps group selected). */
 fun ChatViewModel.selectGroupEntry(groupId: String, entryId: String) {
-    _selectedGroupId.value = groupId
-    _selectedGroupName.value = providerRepository.group(groupId)?.name ?: ""
     // [T-recovery] Explicit user pick overrides any recovery/cooldown
-    // policy — the user asked for THIS member, deliver it.
+    // policy — the user asked for THIS member, deliver it. (Ahead of the
+    // resolution for the same reason as in [selectGroup]: demoted members
+    // become usable again only because the health map was just cleared.)
     groupRouter.clearHealth()
     val resolved = resolveProviderFromGroup(groupId, entryId)
-    if (resolved) {
+    // [deep-audit-1047 B-04] ONE id for every consumer of this pick.
+    // `resolveProviderFromGroup` falls back off a member it cannot use
+    // (disabled instance / no credential), so the entry the user asked for is
+    // NOT necessarily the entry that is now serving: `_activeEntryId` is the
+    // truth. Persisting the raw `entryId` used to bind the session — and the
+    // next `rotateForNewTurn` with it — to a member that was just skipped.
+    val plan = planGroupSelect(
+        resolved = resolved,
+        resolvedId = _activeEntryId.value,
+        requestedId = entryId,
+    )
+    if (plan.applyUi) {
+        val resolvedEntryId = plan.effectiveEntryId ?: return
+        _selectedGroupId.value = groupId
+        _selectedGroupName.value = providerRepository.group(groupId)?.name ?: ""
         // [T-per-message-load-balance] The user hand-picked THIS member. When
         // idle, it serves the NEXT new user turn (one-shot pick consumed by
         // rotateForNewTurn), then rotation resumes from it. When streaming,
         // switchModelAndRerun below already re-serves the current turn on the
         // pick — setting a pending override here would make it serve the next
         // message too (two turns in a row), so only arm it while idle.
-        if (!_isStreaming.value) pendingEntryOverride = entryId
-        persistBinding("""{"type":"group","groupId":"$groupId","lastEntryId":"$entryId"}""")
+        if (!_isStreaming.value) pendingEntryOverride = resolvedEntryId
+        persistBinding("""{"type":"group","groupId":"$groupId","lastEntryId":"$resolvedEntryId"}""")
         applyGroupSessionDefaults(groupId)
         // [T-newchat-default-model-fallback-android] Record the actually-
         // resolved active entry as last-used (resolveProviderFromGroup may
         // fall back off a disabled member, so _activeEntryId is the truth).
-        _activeEntryId.value?.let { providerRepository.lastUsedEntryId = it }
+        providerRepository.lastUsedEntryId = resolvedEntryId
         // [switchModelAndRerun] Model-switch-during-streaming (Plan A).
         if (_isStreaming.value) switchModelAndRerun("switchModel-groupEntry")
     }
@@ -137,8 +164,21 @@ fun ChatViewModel.selectGroupEntry(groupId: String, entryId: String) {
 fun ChatViewModel.selectEntry(entryId: String) {
     val config = providerRepository.config.value
     val entry = config.modelEntries.find { it.id == entryId } ?: return
-    val instance = providerRepository.instance(entry.providerInstanceId) ?: return
-    val apiKey = providerRepository.loadApiKey(instance.id) ?: return
+    // [deep-audit-1047 B-04] The direct-pick path used to re-derive
+    // "instance exists and has a key" inline and stopped there, so an entry
+    // whose provider instance was DISABLED but still carried a key was
+    // activated anyway — the disable switch was bypassable from the picker and
+    // from `HeadlessChatRunner.selectModel`. It now goes through the same
+    // single decision point the restore / load paths already use.
+    val instance = providerRepository.instance(entry.providerInstanceId)
+    val apiKey = instance?.let { providerRepository.loadApiKey(it.id) }
+    val decision = decideSessionModelResolution(entry, instance, apiKey)
+    if (decision !is SessionModelResolution.Use) {
+        if (decision is SessionModelResolution.Unusable) {
+            logSessionModelUnusable("selectEntry", entry.id, decision.reason)
+        }
+        return
+    }
 
     // Apply the new model's state + persisted binding. This runs in BOTH
     // the idle and the streaming cases (the streaming case additionally
@@ -152,10 +192,10 @@ fun ChatViewModel.selectEntry(entryId: String) {
     // provider and the `currentModel` snapshot agree AND carry models.dev
     // capabilities (`entry.model` is the raw base + overrides only).
     val effectiveModel = providerModelFor(entry)
-    val newProvider = ProviderFactory.create(instance, apiKey, effectiveModel, context)
+    val newProvider = ProviderFactory.create(decision.instance, decision.apiKey, effectiveModel, context)
     currentModel = effectiveModel
     _modelName.value = effectiveModel.displayName
-    _providerName.value = instance.label.ifEmpty { effectiveModel.provider }
+    _providerName.value = decision.instance.label.ifEmpty { effectiveModel.provider }
     _selectedGroupId.value = null
     _selectedGroupName.value = ""
     _activeEntryId.value = entry.id
@@ -452,7 +492,12 @@ internal fun ChatViewModel.rotateForNewTurn(label: String) {
     // assistant row already in the message list belongs to a PRIOR
     // completed turn. (Draft sessions start with an empty list.)
     if (_messages.value.none { it.role == "assistant" }) return
-    val members = providerRepository.enabledMemberEntries(group)
+    // [deep-audit-1047 B-04] Same credential filter as
+    // [resolveProviderFromGroup]: a member with no API key must not be picked
+    // by the rotation only to abort the whole rotation at
+    // `loadApiKey(...) ?: return` below (which silently froze the group on the
+    // member it happened to land on, skipping usable members behind it).
+    val members = usableGroupMembers(providerRepository.enabledMemberEntries(group))
     val targetId = groupRouter.nextLoadBalanceMember(
         group = group,
         currentEntryId = currentEntryId,
