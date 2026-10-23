@@ -64,6 +64,36 @@ point (never on the call spelling):
         block hops off it (`Dispatchers.IO` in the same block). Fail-closed
         when the sheet carries no decode call at all (anchor moved).
 
+[dv26-E8] S-08 — the `mount`-scoped WebApp cold start. `WebAppPathResolver`
+resolved `SCOPE_MOUNT` exactly once, while `applyMountedFoldersSnapshot` is
+fired from `MinisApp.onCreate` on `applicationScope` + IO ([dv20-A4-A06] moved
+it off the first frame on purpose). A home-screen shortcut starts
+`WebAppActivity` directly — nothing awaits the snapshot first — so losing that
+race sent `resolveHostPath` to the rootfs *placeholder directory* and the
+Activity painted "WebApp source missing" over a healthy file. Three arms, each
+on the decision point:
+
+  arm10 (WebAppPathResolver.kt): the `SCOPE_MOUNT` arm of `resolve()` must
+        reach — transitively, over calls BETWEEN FUNCTIONS OF THIS FILE — both
+        `resolveHostPath(` (the retry re-probes; re-reading the old `File`
+        object would re-read the placeholder) and `applyMountedFoldersSnapshot(`
+        (the retry is "refresh the snapshot, then resolve again"). Seeded from
+        the arm's own callee, so a refresh sitting in a function `resolve()`
+        never calls does not count, and neither does one in `MinisApp.onCreate`.
+  arm11 (WebAppActivity.kt): the resolved value is bound to a `val`, and the
+        `renderSourceMissing(` exit must sit INSIDE the `if (<that val> ==
+        null)` block — the guard cannot be moved to an "early exit before the
+        retry" shape, and no source-missing call may appear between the
+        resolve call and its guard.
+  arm12 (WebAppActivity.kt): the resolve call stays inside
+        `withContext(Dispatchers.IO)`, and no `applyMountedFoldersSnapshot(`
+        appears in the Activity outside such a block — the snapshot does
+        blocking host I/O and must not run on Main.
+
+Deliberately NOT flagged: `SCOPE_SHARED` keeps its direct `resolveHostPath`
+(global binds are registered synchronously in `MinisApp.onCreate`, so there is
+no window to lose), and the `session_attachment` arm keeps its own guard.
+
 Usage:
   python3 webapp_asset_url_cleanup_check.py <repo_root>   # real tree
   python3 webapp_asset_url_cleanup_check.py --selftest    # fixtures
@@ -83,6 +113,7 @@ PINNER_REL = "src/android/app/src/main/java/com/rikkaminis/app/webapp/ShortcutPi
 PREVIEW_SHORTCUT_REL = (
     "src/android/app/src/main/java/com/rikkaminis/app/ui/preview/WebPreviewShortcut.kt"
 )
+RESOLVER_REL = "src/android/app/src/main/java/com/rikkaminis/app/webapp/WebAppPathResolver.kt"
 
 # --- compliant / violation fixture snippets (code-level, not comments) ---
 
@@ -140,6 +171,19 @@ class WebAppActivity {
         onToggleFullscreen: () -> Unit,
     ) {
         val icon = if (fullscreen) FullscreenExit else Fullscreen
+    }
+
+    private fun loadShortcut() {
+        lifecycleScope.launch {
+            val file = withContext(Dispatchers.IO) {
+                WebAppPathResolver.resolve(this@WebAppActivity, shortcut)
+            }
+            if (file == null) {
+                renderSourceMissing(sourceSessionId = null)
+                return@launch
+            }
+            loadHtml(webViewRef, file)
+        }
     }
 
     private fun loadHtml(webView: WebView, file: File) {
@@ -342,6 +386,88 @@ VIOLATION_ARM9_NO_IO = SHEET_DECODE_TILE.replace(
     """        value = ImageDecoding.decodeFileBounded(path, ICON_MAX_EDGE_PX)?.bitmap""",
 )
 
+
+# [dv26-E8] S-08 fixtures — the mount-scope resolver and its violations.
+
+COMPLIANT_RESOLVER = """package com.rikkaminis.app.webapp
+
+import java.io.File
+
+object WebAppPathResolver {
+
+    fun resolve(context: Context, shortcut: WebAppShortcutEntity): File? {
+        val file = when (shortcut.pathScope) {
+            WebAppShortcutRepository.SCOPE_SESSION_ATTACHMENT -> resolveSession(context, shortcut)
+            WebAppShortcutRepository.SCOPE_SHARED -> PRootKernel.resolveHostPath(shortcut.htmlPath)
+            WebAppShortcutRepository.SCOPE_MOUNT -> resolveMount(context, shortcut.htmlPath)
+            else -> null
+        }
+        return file?.takeIf { it.exists() && it.isFile }
+    }
+
+    private fun resolveMount(context: Context, htmlPath: String): File? {
+        val hostPath = resolveMountWithRetry(
+            htmlPath = htmlPath,
+            mountKnown = { root -> PRootKernel.bindMounts[root] != null },
+            probe = { path -> PRootKernel.resolveHostPath(path)?.absolutePath },
+            usable = { path -> File(path).let { it.exists() && it.isFile } },
+            refresh = { PRootKernel.applyMountedFoldersSnapshot(context) },
+        )
+        return hostPath?.let { File(it) }
+    }
+
+    private fun resolveSession(context: Context, shortcut: WebAppShortcutEntity): File? = null
+}
+"""
+
+# The pre-fix shape, verbatim: one shot, no snapshot refresh, no retry.
+VIOLATION_ARM10_NO_RETRY = COMPLIANT_RESOLVER.replace(
+    "WebAppShortcutRepository.SCOPE_MOUNT -> resolveMount(context, shortcut.htmlPath)",
+    "WebAppShortcutRepository.SCOPE_MOUNT -> PRootKernel.resolveHostPath(shortcut.htmlPath)",
+)
+
+# The subtle shape: the refresh exists in the file but `resolve()` cannot reach
+# it — a file-level grep would call this green, the closure walk must not.
+VIOLATION_ARM10_ORPHAN_REFRESH = COMPLIANT_RESOLVER.replace(
+    "            refresh = { PRootKernel.applyMountedFoldersSnapshot(context) },",
+    "            refresh = { },",
+).replace(
+    "    private fun resolveSession(context: Context, shortcut: WebAppShortcutEntity): File? = null",
+    "    private fun unusedRefresh(context: Context) {\n"
+    "        PRootKernel.applyMountedFoldersSnapshot(context)\n"
+    "    }\n",
+)
+
+# The source-missing exit without its null guard — "early exit before the
+# retry", the shape that would make a failed first probe terminal again.
+VIOLATION_ARM11_UNGUARDED_MISSING = COMPLIANT_ACTIVITY.replace(
+    """            if (file == null) {
+                renderSourceMissing(sourceSessionId = null)
+                return@launch
+            }
+""",
+    """            renderSourceMissing(sourceSessionId = null)
+            return@launch
+""",
+)
+
+# Resolve the shortcut on the main thread (the resolver does blocking host I/O).
+VIOLATION_ARM12_MAIN_THREAD_RESOLVE = COMPLIANT_ACTIVITY.replace(
+    """            val file = withContext(Dispatchers.IO) {
+                WebAppPathResolver.resolve(this@WebAppActivity, shortcut)
+            }""",
+    """            val file = WebAppPathResolver.resolve(this@WebAppActivity, shortcut)""",
+)
+
+# Apply the mount snapshot from the Activity's main thread.
+VIOLATION_ARM12_MAIN_THREAD_SNAPSHOT = COMPLIANT_ACTIVITY.replace(
+    """    private fun loadShortcut() {""",
+    """    private fun refreshMounts() {
+        PRootKernel.applyMountedFoldersSnapshot(this)
+    }
+
+    private fun loadShortcut() {""",
+)
 
 def strip_comments(src: str) -> str:
     """Remove //-comments, /* */ comments and KDoc, keeping line structure.
@@ -655,26 +781,147 @@ def check_sheet_arm9(src: str) -> bool:
     return True
 
 
-def run_on_tree(root: str) -> int:
-    failures = []
-    act_path = os.path.join(root, ACTIVITY_REL)
-    sheet_path = os.path.join(root, SHEET_REL)
-    pinner_path = os.path.join(root, PINNER_REL)
-    preview_path = os.path.join(root, PREVIEW_SHORTCUT_REL)
-    for label, path in (
-        ("WebAppActivity.kt", act_path),
-        ("AddToHomeSheet.kt", sheet_path),
-        ("ShortcutPinner.kt", pinner_path),
-        ("WebPreviewShortcut.kt", preview_path),
-    ):
-        if not os.path.exists(path):
-            print(f"[webapp-asset-url] FAIL missing file: {label}")
-            return 1
-    act = open(act_path, encoding="utf-8").read()
-    sheet = open(sheet_path, encoding="utf-8").read()
-    pinner = open(pinner_path, encoding="utf-8").read()
-    preview = open(preview_path, encoding="utf-8").read()
+# --- [dv26-E8] S-08 mount-scope cold start --------------------------------
 
+FUN_DECL_RE = re.compile(r"\bfun\s+(?:<[^>]*>\s*)?([A-Za-z_]\w*)\s*\(")
+SCOPE_MOUNT_ARM_RE = re.compile(r"\bSCOPE_MOUNT\s*->\s*([^\n}]*)")
+IDENT_CALL_RE = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
+RESOLVE_CALL = "WebAppPathResolver.resolve("
+
+
+def fun_spans(code: str):
+    """{name: body} for every `fun` in [code] (comments already stripped).
+
+    Block bodies become brace blocks; expression bodies run to the next
+    declaration. A body that cannot be delimited is skipped — for arm10 that
+    fails CLOSED (a missing edge only removes a reachable function).
+    """
+    spans = {}
+    for m in FUN_DECL_RE.finditer(code):
+        name = m.group(1)
+        open_paren = code.find("(", m.end() - 1)
+        if open_paren < 0:
+            continue
+        paren = _paren_block(code, open_paren)
+        j = open_paren + len(paren)
+        brace = code.find("{", j)
+        eq = code.find("=", j)
+        if brace < 0:
+            continue
+        if 0 <= eq < brace and code[eq + 1:eq + 2] != "=":
+            nxt = code.find("\n    private fun ", eq)
+            spans[name] = code[eq:len(code) if nxt < 0 else nxt]
+        else:
+            spans[name] = _brace_block(code, brace)
+    return spans
+
+
+def reachable_bodies(bodies, seeds):
+    """Body text of every function reachable from [seeds] by call name."""
+    seen = set()
+    stack = [x for x in seeds if x in bodies]
+    while stack:
+        name = stack.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        for m in IDENT_CALL_RE.finditer(bodies[name]):
+            callee = m.group(1)
+            if callee in bodies and callee not in seen:
+                stack.append(callee)
+    return "\n".join(bodies[n] for n in seen)
+
+
+def check_mount_arm_snapshot_retry(src: str) -> bool:
+    """arm10 — `SCOPE_MOUNT` reaches "refresh the snapshot, then resolve again"."""
+    code = strip_comments(src)
+    bodies = fun_spans(code)
+    resolve_body = bodies.get("resolve")
+    if not resolve_body:
+        return False
+    arm = None
+    for m in SCOPE_MOUNT_ARM_RE.finditer(resolve_body):
+        arm = m.group(1)
+    if not arm:
+        return False
+    seeds = [m.group(1) for m in IDENT_CALL_RE.finditer(arm) if m.group(1) in bodies]
+    if not seeds:
+        return False
+    closure = reachable_bodies(bodies, seeds)
+    return "resolveHostPath(" in closure and "applyMountedFoldersSnapshot(" in closure
+
+
+def enclosing_io_block(code: str, idx: int) -> bool:
+    """Is [idx] inside a `withContext(Dispatchers.IO) { … }` block?"""
+    for m in re.finditer(r"\bwithContext\s*\(", code):
+        open_paren = code.find("(", m.end() - 1)
+        paren = _paren_block(code, open_paren)
+        if "Dispatcher" not in paren or not re.search(r"\bIO\b", paren):
+            continue
+        brace = code.find("{", open_paren + len(paren))
+        if brace < 0:
+            continue
+        block = _brace_block(code, brace)
+        if brace < idx < brace + len(block):
+            return True
+    return False
+
+
+def check_activity_failure_guard(src: str) -> bool:
+    """arm11 — `renderSourceMissing(` is the guarded failure of the resolve."""
+    code = strip_comments(src)
+    at = code.find(RESOLVE_CALL)
+    if at < 0:
+        return False
+    assigned = None
+    for m in re.finditer(r"\bval\s+([A-Za-z_]\w*)\s*=", code[:at]):
+        assigned = m.group(1)
+    if not assigned:
+        return False
+    guard = code.find("if (%s == null)" % assigned, at)
+    if guard < 0:
+        return False
+    if "renderSourceMissing(" in code[at:guard]:
+        return False
+    brace = code.find("{", guard)
+    if brace < 0:
+        return False
+    return "renderSourceMissing(" in _brace_block(code, brace)
+
+
+def check_activity_resolve_offmain(src: str) -> bool:
+    """arm12 — resolve (and any snapshot refresh) never runs on Main."""
+    code = strip_comments(src)
+    at = code.find(RESOLVE_CALL)
+    if at < 0:
+        return False
+    if not enclosing_io_block(code, at):
+        return False
+    for m in re.finditer(r"\bapplyMountedFoldersSnapshot\s*\(", code):
+        if not enclosing_io_block(code, m.start()):
+            return False
+    return True
+
+
+def evaluate_tree(root: str):
+    """-> list of failing arm ids (empty = green)."""
+    paths = (
+        ("WebAppActivity.kt", os.path.join(root, ACTIVITY_REL)),
+        ("AddToHomeSheet.kt", os.path.join(root, SHEET_REL)),
+        ("ShortcutPinner.kt", os.path.join(root, PINNER_REL)),
+        ("WebPreviewShortcut.kt", os.path.join(root, PREVIEW_SHORTCUT_REL)),
+        ("WebAppPathResolver.kt", os.path.join(root, RESOLVER_REL)),
+    )
+    for label, path in paths:
+        if not os.path.exists(path):
+            return ["missing:" + label]
+    act = open(os.path.join(root, ACTIVITY_REL), encoding="utf-8").read()
+    sheet = open(os.path.join(root, SHEET_REL), encoding="utf-8").read()
+    pinner = open(os.path.join(root, PINNER_REL), encoding="utf-8").read()
+    preview = open(os.path.join(root, PREVIEW_SHORTCUT_REL), encoding="utf-8").read()
+    resolver = open(os.path.join(root, RESOLVER_REL), encoding="utf-8").read()
+
+    failures = []
     if not check_activity_arm1(act):
         failures.append("arm1")
     if not check_activity_arm2(act):
@@ -695,16 +942,25 @@ def run_on_tree(root: str) -> int:
         failures.append("arm8b")
     if not check_sheet_arm9(sheet):
         failures.append("arm9")
+    if not check_mount_arm_snapshot_retry(resolver):
+        failures.append("arm10")
+    if not check_activity_failure_guard(act):
+        failures.append("arm11")
+    if not check_activity_resolve_offmain(act):
+        failures.append("arm12")
+    return failures
 
+
+def run_on_tree(root: str) -> int:
+    failures = evaluate_tree(root)
     if failures:
         print(f"[webapp-asset-url] FAIL arms={','.join(failures)}")
         return 1
-    print("[webapp-asset-url] PASS all 10 arms "
+    print("[webapp-asset-url] PASS all 13 arms "
           "(asset-url single source ×2, sheet cleanup ×2, fullscreen single source ×2, "
           "title seed + user-edit guard ×1, pin verdict ×2, decode off the "
-          "composition thread ×1)")
+          "composition thread ×1, mount cold-start snapshot retry ×3)")
     return 0
-
 
 def selftest() -> int:
     tmp = tempfile.mkdtemp(prefix="webapp-gate-")
@@ -731,15 +987,16 @@ def selftest() -> int:
             ("arm7-violation empty seed (pre-fix race)",
              COMPLIANT_ACTIVITY, VIOLATION_ARM7_EMPTY_SEED, False),
         ]
-        def write_tree(name, act, sheet, pinner, preview):
+        def write_tree(name, act, sheet, pinner, preview, resolver=COMPLIANT_RESOLVER):
             tree = os.path.join(tmp, name.replace(" ", "_").replace("(", "").replace(")", ""))
-            for rel in (ACTIVITY_REL, SHEET_REL, PINNER_REL, PREVIEW_SHORTCUT_REL):
+            for rel in (ACTIVITY_REL, SHEET_REL, PINNER_REL, PREVIEW_SHORTCUT_REL, RESOLVER_REL):
                 os.makedirs(os.path.join(tree, os.path.dirname(rel)), exist_ok=True)
             open(os.path.join(tree, ACTIVITY_REL), "w", encoding="utf-8").write(act)
             open(os.path.join(tree, SHEET_REL), "w", encoding="utf-8").write(
                 sheet + SHEET_DECODE_TILE)
             open(os.path.join(tree, PINNER_REL), "w", encoding="utf-8").write(pinner)
             open(os.path.join(tree, PREVIEW_SHORTCUT_REL), "w", encoding="utf-8").write(preview)
+            open(os.path.join(tree, RESOLVER_REL), "w", encoding="utf-8").write(resolver)
             return tree
 
         for name, act, sheet, expected_pass in cases:
@@ -820,6 +1077,31 @@ def selftest() -> int:
             else:
                 print(f"[webapp-asset-url] SELFTEST FAIL precision {name}: "
                       f"arm7 red={bad7}, arm3/arm4 green={others}")
+                ok = False
+        # [dv26-E8] S-08 — mount-scope cold start. One arm per criterion, plus
+        # a compliant tree (all green) and two violation shapes that a
+        # file-level grep would call clean (orphan refresh, snapshot on Main).
+        for name, resolver, activity, want in (
+            ("e8-compliant", COMPLIANT_RESOLVER, COMPLIANT_ACTIVITY, []),
+            ("e8-no-retry pre-fix resolver",
+             VIOLATION_ARM10_NO_RETRY, COMPLIANT_ACTIVITY, ["arm10"]),
+            ("e8-orphan-refresh", VIOLATION_ARM10_ORPHAN_REFRESH, COMPLIANT_ACTIVITY, ["arm10"]),
+            ("e8-unguarded-missing",
+             COMPLIANT_RESOLVER, VIOLATION_ARM11_UNGUARDED_MISSING, ["arm11"]),
+            ("e8-main-thread-resolve",
+             COMPLIANT_RESOLVER, VIOLATION_ARM12_MAIN_THREAD_RESOLVE, ["arm12"]),
+            ("e8-main-thread-snapshot",
+             COMPLIANT_RESOLVER, VIOLATION_ARM12_MAIN_THREAD_SNAPSHOT, ["arm12"]),
+        ):
+            tree = write_tree(name, activity, COMPLIANT_SHEET, COMPLIANT_PINNER,
+                              COMPLIANT_PREVIEW_SHORTCUT, resolver=resolver)
+            got = evaluate_tree(tree)
+            if sorted(got) == sorted(want):
+                print(f"[webapp-asset-url] selftest ok {name}: "
+                      f"red={','.join(got) if got else 'none'}")
+            else:
+                print(f"[webapp-asset-url] SELFTEST FAIL {name}: "
+                      f"got={got} want={want}")
                 ok = False
         if ok:
             print("WEBAPP_ASSET_URL_CLEANUP_SELFTEST=PASS")
