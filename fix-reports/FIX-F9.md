@@ -183,4 +183,9 @@ clipData / component / package / selector / 大小写各一次），而 browser 
   Gradle 里 test source set 是 main 的 friend module，独立 kotlinc 没有这层关系 ⇒ 改为「策略 + 测试同一次编译」，
   不把 `internal` 降级成 `public` 去迁就装置。
 - **自伤 4**：JUnit 运行漏 `kotlin-stdlib.jar` ⇒ 所有臂 `NoClassDefFoundError: kotlin/jvm/internal/Intrinsics`（5/5 全红 = 装置坏而非缺陷红，靠「POST 也全红」当场识别）。
+- **自伤 5（CI 首跑红，真错）**：`compileReleaseUnitTestKotlin` 报
+  `BrowserExternalSchemeShapeTest.kt:46:9 Name contains illegal characters: ..` —— backticked 测试名
+  里写了 `Intent.parseUri`，而 JVM 方法名不允许 `.`（Kotlin 只放行空格等少量字符）。改名为
+  `the page's raw casing never reaches the parser`。**本地 kotlinc 编译新测试类已能提前抓到**
+  （本轮补跑了 `probe/l3/testcompile.log` rc=0 才推），教训：新增/改名 backticked 测试必须本地编译过一次。
 - **不确定项**：`PhotosImportShapeTest` 是既有源形状测试，本支把它的断言从「tryOpen 里有内联 strip」改成「tryOpen 委派 + 共享体有全量 strip」。这不是放宽而是**加强**（覆盖了唯一实现），但属于对既有测试的语义修改，已在报告显式登记，供主会话复核。

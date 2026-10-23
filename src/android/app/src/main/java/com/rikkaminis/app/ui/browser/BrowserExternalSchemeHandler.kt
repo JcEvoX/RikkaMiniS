@@ -31,9 +31,10 @@ import com.rikkaminis.app.util.lowercaseIntentScheme
  *     WeChat/Alipay/Play Store. If no app handles the intent, the spec's
  *     `browser_fallback_url` extra is honoured **only when it is an ordinary
  *     http(s) URL**; otherwise (or when absent) a Toast.
- *     ([deep-audit-1046 FIX-F9]: this KDoc used to claim we strip
- *     `FLAG_ACTIVITY_NEW_DOCUMENT`, which no line in the file ever did, and the
- *     implementation stripped the selector only.)
+ *     ([deep-audit-1046 FIX-F9]: this KDoc used to advertise a `NEW_DOCUMENT`
+ *     task-reuse strip, which no line in the file ever performed — the
+ *     implementation stripped the selector only, and left grant flags,
+ *     `clipData`, a same-package target and the page's raw casing intact.)
  *   * Other "open in app" schemes — fired as a plain `ACTION_VIEW`
  *     against the URI. ActivityNotFoundException → Toast.
  *   * `http`, `https`, `about`, `file` — return `false` so the WebView
