@@ -1102,7 +1102,7 @@ internal fun decideSessionModelResolution(
  * is the only hook for 「禁用后重开会话到底走了哪条 fallback」.
  * Ids are truncated; nothing credential-shaped is ever logged.
  */
-private fun ChatViewModel.logSessionModelUnusable(
+internal fun ChatViewModel.logSessionModelUnusable(
     site: String,
     entryId: String,
     reason: UnusableModelReason,
@@ -1166,6 +1166,34 @@ internal fun ChatViewModel.restoreFromBinding(bindingJson: String?): Boolean {
     }
 }
 
+/**
+ * [deep-audit-1047 B-04] The members of a group that can actually serve a
+ * turn — [enabledMemberEntries] narrowed by the same single decision point
+ * every other resolution site uses ([decideSessionModelResolution]).
+ *
+ * `enabledMemberEntries` only answers "the provider instance is enabled". It
+ * does not answer "there is a credential", so a group whose FIRST member sat
+ * behind a key-less (or disabled) instance used to resolve to that member and
+ * then bail out at `loadApiKey(...) ?: return false` — the whole group looked
+ * unusable while perfectly good members sat behind it. Both group consumers
+ * ([resolveProviderFromGroup] and `ChatModelRouting.rotateForNewTurn`) now
+ * hand the router this list instead.
+ *
+ * The credential read is the same synchronous `encryptedPrefs` lookup
+ * `buildFallbackProviders` and `ConfigBuiltins.firstUsableGroupMember` already
+ * perform inside their candidate loops — this just moves it ahead of the
+ * choice instead of after it.
+ */
+internal fun ChatViewModel.usableGroupMembers(members: List<ModelEntry>): List<ModelEntry> =
+    members.filter { member ->
+        val instance = providerRepository.instance(member.providerInstanceId)
+        decideSessionModelResolution(
+            member,
+            instance,
+            instance?.let { providerRepository.loadApiKey(it.id) },
+        ) is SessionModelResolution.Use
+    }
+
 internal fun ChatViewModel.resolveProviderFromGroup(
     groupId: String,
     preferredEntryId: String? = null,
@@ -1182,7 +1210,12 @@ internal fun ChatViewModel.resolveProviderFromGroup(
     // this entry inside the group last time"). Honor it only if the
     // entry is still enabled; otherwise fall back to the first enabled
     // member so the session can still proceed on a now-degraded group.
-    val enabledMembers = providerRepository.enabledMemberEntries(group)
+    //
+    // [deep-audit-1047 B-04] …and [usableGroupMembers] additionally drops
+    // members with no credential, so a key-less member at the head of the
+    // group can no longer sink the whole resolution (the `?: return false`
+    // two lines below now only fires when EVERY member is unusable).
+    val enabledMembers = usableGroupMembers(providerRepository.enabledMemberEntries(group))
     if (enabledMembers.isEmpty()) return false
     // Selection decision delegated to GroupRouter (pure JVM, testable) —
     // identical semantics: preferred binding first, then loadBalance
