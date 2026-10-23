@@ -241,7 +241,17 @@ object MCPOAuthStore {
                 // (and land in the caller's runCatching) rather than silently
                 // materializing a bridge file with blank metadata.
                 val cfg = requireNotNull(oauth) { "REFRESH_BRIDGE requires an oauth config" }
-                val t = requireNotNull(stored) { "REFRESH_BRIDGE requires stored tokens" }
+                // [dv26-A2] The guest CLI refreshes tokens on its own schedule
+                // and writes the result to the bridge file only. Promote that
+                // copy back BEFORE materializing, or this branch (which exists
+                // to refresh the bridge from the saved config) hands the guest
+                // its own pre-refresh snapshot back — with a rotated
+                // refresh_token that is already dead on the provider side.
+                val t = promoteFromBridge(
+                    context,
+                    server,
+                    requireNotNull(stored) { "REFRESH_BRIDGE requires stored tokens" },
+                )
                 materializeBridgeFile(
                     context, server,
                     BridgePayload(
@@ -263,6 +273,83 @@ object MCPOAuthStore {
                 )
             }
         }
+    }
+
+    // -- Guest → host promotion of a refreshed token ([dv26-A2]) --------------
+    //
+    // deep-audit-1046 S-02. The bridge file is a SECOND copy of the same
+    // credential and only the host → guest direction was implemented: the
+    // in-guest `minis-mcp-cli` refreshes (`transport/http.py::_oauth_refresh →
+    // _save_oauth_tokens`) and rewrites access_token / expires_at / — under
+    // refresh-token rotation — refresh_token, and nothing ever read it back.
+    // The next save of any other field of that server then materialized the
+    // PRE-refresh snapshot over it, so the guest's next refresh presented a
+    // rotated-away refresh token and died with `invalid_grant` (authorization
+    // permanently lost). The promotion below runs before every materialize
+    // driven by [reconcileForServer], so both trigger paths (a config save and
+    // the reconciliation that follows it) see the guest's copy first.
+    //
+    // Scope is deliberately the token triple only (see [promoteTokensFromBridge]):
+    // endpoints / client credentials stay authoritative on the host side, a
+    // damaged or older bridge promotes nothing, and every failure is silent by
+    // design — this runs inside a save and must not abort it.
+
+    /**
+     * Read the token triple the in-guest CLI left in the bridge file, or null
+     * when the file is absent or unreadable. Best-effort: a corrupt bridge must
+     * never throw here (the caller is inside a save), and never clears the
+     * host's tokens.
+     */
+    private fun readBridgeTokenSnapshot(context: Context, server: String): BridgeTokenSnapshot? {
+        val safe = validateServerName(server) ?: return null
+        return runCatching {
+            val file = bridgeFile(context, safe)
+            if (!file.exists()) return@runCatching null
+            val o = JSONObject(file.readText())
+            BridgeTokenSnapshot(
+                accessToken = o.optString("access_token", ""),
+                refreshToken = o.optString("refresh_token", "").ifBlank { null },
+                expiresAtSeconds = o.optLong("expires_at", 0L),
+            )
+        }.onFailure {
+            AppLogger.warning(TAG, "unreadable OAuth bridge for '$server': ${it.message}")
+        }.getOrNull()
+    }
+
+    /**
+     * Promote a guest-refreshed token into the store and hand back the tokens
+     * the caller must materialize. Returns [stored] unchanged when the bridge
+     * has nothing newer — that is the common case (the host is the fresher
+     * side), so it costs one file read and no writes.
+     */
+    private fun promoteFromBridge(
+        context: Context,
+        server: String,
+        stored: StoredTokens,
+    ): StoredTokens {
+        val bridge = readBridgeTokenSnapshot(context, server) ?: return stored
+        val promoted = promoteTokensFromBridge(
+            StoredTokenSnapshot(
+                accessToken = stored.accessToken,
+                refreshToken = stored.refreshToken,
+                expiresAtMs = stored.expiresAtMs,
+            ),
+            bridge,
+        ) ?: return stored
+        val tokens = StoredTokens(
+            accessToken = promoted.accessToken,
+            refreshToken = promoted.refreshToken,
+            expiresAtMs = promoted.expiresAtMs,
+        )
+        // Persist first: the bridge is materialized from the returned value by
+        // the caller, but the encrypted store must not keep the superseded
+        // triple — the next save would read it back and lose the promotion.
+        setTokens(context, server, tokens)
+        AppLogger.info(
+            TAG,
+            "reconcile '$server': promoted the in-guest refreshed token into the store",
+        )
+        return tokens
     }
 
     // -- In-guest token bridge (materialized for minis-mcp-cli) ---------------
