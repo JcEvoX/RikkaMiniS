@@ -487,6 +487,21 @@ private suspend fun performTest(
 ): QuickTestState = withContext(Dispatchers.IO) {
     fun failure(msg: String) = QuickTestState.Failure(msg)
 
+    // [dv24/B-01] The capability source is the EFFECTIVE model, exactly as
+    // `applicableKinds` above already decides which cards to show. Every
+    // execution call below used to pass the raw `entry.model`, which for a
+    // built-in carries no modality declaration at all: the card appeared
+    // (because the enrichment happened for the *list*) and then the request
+    // that left this process described a text-only model. Across the
+    // `:modelservice` boundary `ModelRequestJson.encodeModel` OMITS a null
+    // `outputModalities`, and that process never calls `ModelsDevApi.init`, so
+    // the worker could not enrich it back — Gemini image routing then skipped
+    // `responseModalities: ["TEXT","IMAGE"]` ("No image returned") and the
+    // OpenAI-compatible providers were routed down `ChatPath`
+    // (`/v1/chat/completions`) instead of `/v1/images/generations` (400/404).
+    // Resolved ONCE here: the three call sites are one decision.
+    val effectiveModel = ModelsDevApi.effectiveModel(entry)
+
     val instance = providerRepository.instance(entry.providerInstanceId)
         ?: return@withContext failure("Provider instance not found.")
     val apiKey = providerRepository.loadApiKey(instance.id)
@@ -536,7 +551,8 @@ private suspend fun performTest(
                                 audioData = clip,
                                 model = entry.baseModel.id,
                                 language = "en",
-                                resolvedModel = entry.model,
+                                // [dv24/B-01] enriched model, not the raw entry
+                                resolvedModel = effectiveModel,
                             ),
                         )
                         val heard = resp.text.trim().ifEmpty { "(empty transcription)" }
@@ -559,7 +575,8 @@ private suspend fun performTest(
                 when (val r = com.rikkaminis.app.sandbox.offload.ProviderExecutionGateway.send(
                     context = context,
                     instance = instance,
-                    model = entry.model,
+                    // [dv24/B-01] enriched model, not the raw entry
+                    model = effectiveModel,
                     messages = listOf(
                         LLMMessage(
                             role = LLMMessage.Role.USER,
@@ -604,7 +621,9 @@ private suspend fun performTest(
                 when (val r = com.rikkaminis.app.sandbox.offload.ProviderExecutionGateway.generateImage(
                     context = context,
                     instance = instance,
-                    model = entry.model,
+                    // [dv24/B-01] enriched model, not the raw entry — the
+                    // worker's ARG modality / route decision reads it
+                    model = effectiveModel,
                     prompt = "A friendly cute mascot logo for an app called RikkaMinis, minimalist, centered, soft colors",
                     n = 1,
                     size = "1024x1024",

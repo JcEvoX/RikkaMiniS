@@ -929,13 +929,20 @@ class ChatViewModel(
     fun appendToInputText(snippet: String) {
         val cleaned = snippet.trim()
         if (cleaned.isEmpty()) return
-        val current = _inputText.value
-        val joined = if (current.isBlank()) {
-            "$cleaned "
-        } else {
-            current.trimEnd() + " " + cleaned + " "
-        }
-        setInputText(joined, caretOverride = joined.length)
+        // [dv24/B-05] The append target is the composer's LIVE text, not
+        // [inputText] — that copy lags a dictation / paste burst by the 150 ms
+        // IME debounce, so appending here pasted the snippet onto a stale
+        // string and the burst's own flush then overwrote the result. The
+        // composer resolves it (minimal `appendToInputText` semantics kept:
+        // separator " ", trimmed tail, one trailing space).
+        requestComposerCommand(
+            ComposerCommand.AppendText(
+                text = cleaned,
+                separator = " ",
+                trimExistingEnd = true,
+                trailingSpace = true,
+            ),
+        )
     }
 
     internal val _isStreaming = MutableStateFlow(false)
@@ -1124,7 +1131,7 @@ class ChatViewModel(
      * the user typed in the meantime (hence no replay / no buffering across
      * an absent collector).
      */
-    internal val _composerCommand = MutableSharedFlow<ComposerCommand>(extraBufferCapacity = 4)
+    internal val _composerCommand = MutableSharedFlow<ComposerCommand>(extraBufferCapacity = 16)
     val composerCommand: SharedFlow<ComposerCommand> = _composerCommand.asSharedFlow()
 
     /** Route a composer intent to the composer (see [_composerCommand]). */
@@ -2792,7 +2799,12 @@ class ChatViewModel(
     fun dismissContextExhaustedDialog(restoreInput: Boolean) {
         _showContextExhaustedDialog.value = false
         if (restoreInput) {
-            setInputText(pendingExhaustedText)
+            // [dv24/B-05] Restore through the composer, which writes BOTH the
+            // ViewModel string and the field. The old single write was dropped
+            // whenever the composer's live text already equalled the stash
+            // (equal StateFlow write) — and it never cancelled the pending IME
+            // burst, so the burst's snapshot landed over the restored message.
+            requestComposerCommand(ComposerCommand.ReplaceText(text = pendingExhaustedText))
         }
         pendingExhaustedText = ""
         pendingExhaustedHasAttachments = false
@@ -4595,4 +4607,37 @@ sealed interface ComposerCommand {
      * StateFlow when the value already equals "".
      */
     data object Clear : ComposerCommand
+
+    /**
+     * [dv24/B-05] Replace the whole composer body with [text] — the message
+     * edit prefill and the 'Context Full' restore.
+     *
+     * Resolved by the composer against its live text so the write reaches BOTH
+     * copies (ViewModel string + field). Writing only the ViewModel string is
+     * an equal write when the draft already reads [text], and `MutableStateFlow`
+     * drops it: the field keeps its old selection and, worse, the still-live
+     * 150 ms IME burst flushes its pre-edit snapshot over the edit.
+     */
+    data class ReplaceText(
+        val text: String,
+        /** null = caret to the end of [text]. */
+        val caretOverride: Int? = null,
+    ) : ComposerCommand
+
+    /**
+     * [dv24/B-05] Append [text] to whatever the composer holds right now —
+     * the system share injection, the cross-session Move-to transfer and the
+     * selection "add to input" action.
+     *
+     * The separator is a parameter because the three callers disagree on
+     * purpose (a shared paragraph starts on its own line; a text snippet is
+     * inline), and [trimExistingEnd] / [trailingSpace] encode the two tail
+     * conventions that were previously spelled out at each caller.
+     */
+    data class AppendText(
+        val text: String,
+        val separator: String = " ",
+        val trimExistingEnd: Boolean = true,
+        val trailingSpace: Boolean = true,
+    ) : ComposerCommand
 }

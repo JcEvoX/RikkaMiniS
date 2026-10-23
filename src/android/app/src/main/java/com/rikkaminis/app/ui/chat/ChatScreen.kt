@@ -293,6 +293,7 @@ import com.rikkaminis.app.data.model.normalizeModalities
 import com.rikkaminis.app.data.model.ModelGroup
 import com.rikkaminis.app.data.model.ProviderConfig
 import com.rikkaminis.app.data.model.ProviderType
+import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.model.RoutingStrategy
 import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.data.repository.ChatRepository
@@ -436,14 +437,14 @@ fun ChatScreen(
         for (item in pending.items) {
             when (item.kind) {
                 com.rikkaminis.app.share.PendingShare.Item.Kind.INLINE_TEXT -> {
-                    val sep = if (viewModel.inputText.value.isNotEmpty()) "\n" else ""
                     val needsTrailingSpace = item.value.startsWith("http://") ||
                         item.value.startsWith("https://")
-                    val newText = viewModel.inputText.value + sep + item.value +
-                        if (needsTrailingSpace) " " else ""
-                    // [fix/setinputtext-caret-intent] Explicit caret to the end of
-                    // the appended text (caret lands after the just-injected text).
-                    viewModel.setInputText(newText, caretOverride = newText.length)
+                    // [dv24/B-05] Route the append as an intent: the composer owns
+                    // its live text. Resolving it here read `viewModel.inputText` —
+                    // the 150 ms-debounced snapshot — so text dictated or pasted
+                    // inside that window was overwritten by the stale string, and
+                    // an equal write was dropped by the StateFlow altogether.
+                    viewModel.requestComposerCommand(ComposerCommand.AppendText(item.value, separator = "\n", trimExistingEnd = false, trailingSpace = needsTrailingSpace))
                 }
                 com.rikkaminis.app.share.PendingShare.Item.Kind.ATTACHMENT -> {
                     // Suspend: copies the staged bytes on IO, adds the attachment on Main.
@@ -546,11 +547,9 @@ fun ChatScreen(
         // injecting (mirrors iOS injectPendingTransferIfNeeded).
         viewModel.clearAttachments()
         if (transfer.inputText.isNotEmpty()) {
-            val sep = if (viewModel.inputText.value.isNotEmpty()) "\n" else ""
-            val appended = viewModel.inputText.value + sep + transfer.inputText
-            // [fix/setinputtext-caret-intent] Explicit caret to end of injected
-            // transfer text so the composer shows the tail after injection.
-            viewModel.setInputText(appended, caretOverride = appended.length)
+            // [dv24/B-05] Same intent as the share injection: the text being
+            // appended to is the composer's live one, never this VM snapshot.
+            viewModel.requestComposerCommand(ComposerCommand.AppendText(transfer.inputText, separator = "\n", trimExistingEnd = false, trailingSpace = false))
         }
         for (a in transfer.attachments) viewModel.addAttachment(a)
         viewModel.markShareInjected()
@@ -4001,9 +4000,13 @@ fun ChatScreen(
                                 onEdit = if (isStreaming || item.message.isQueued) null else ({
                                     val prefill = viewModel.editMessage(item.message.id)
                                     if (prefill != null) {
-                                        // [fix/setinputtext-caret-intent] Editing a full message:
-                                        // place the caret at the end so the user sees the tail.
-                                        viewModel.setInputText(prefill, caretOverride = prefill.length)
+                                        // [dv24/B-05] Caret at the end (user sees the tail),
+                                        // routed as an intent so the write reaches the FIELD.
+                                        // The old single write was silently swallowed whenever
+                                        // the draft already equalled the prefilled text (equal
+                                        // StateFlow write), and the live 150 ms IME burst then
+                                        // committed its older snapshot straight over the edit.
+                                        viewModel.requestComposerCommand(ComposerCommand.ReplaceText(prefill, caretOverride = prefill.length))
                                         coroutineScope.launch {
                                             tracedScrollToItem("EDIT-MSG", (listState.layoutInfo.totalItemsCount - 1).coerceAtLeast(0), 0)
                                         }
@@ -4956,15 +4959,29 @@ fun ChatScreen(
             // `image_output`, so a vision model could be bound to an Agent loop
             // with no "non-text model" warning at all.
             val mods = model.outputModalities.normalizeModalities() ?: emptyList()
+            // [dv24/B-02] A System ASR sentinel declares an AUDIO INPUT and no
+            // output modality at all (SystemVoiceEntries.asrOnline/asrOffline),
+            // so the three output checks below all missed it and a Voice Input
+            // group was bound straight away — no "non-text model" confirmation.
+            // An audio-in / no-declared-output model cannot drive an Agent loop
+            // for the same reason a TTS one cannot, so it earns the same label.
+            val ins = model.inputModalities.normalizeModalities() ?: emptyList()
             return when {
                 "image" in mods -> resolveImageLabel
                 "audio" in mods -> resolveAudioLabel
                 "video" in mods -> resolveVideoLabel
+                mods.isEmpty() && "audio" in ins -> resolveAudioLabel
                 else -> null
             }
         }
         fun entryById(entryId: String): ModelEntry? =
-            config.modelEntries.firstOrNull { it.id == entryId }
+            // [dv24/B-02] persisted entry first, synthesized System voice entry
+            // second — the same single source the group screens use. A default
+            // Voice Input/Output group holds ONLY System sentinels, so the old
+            // `config.modelEntries`-only lookup returned null here: `firstEntry`
+            // and `label` both nulled out and `selectGroup` ran with NO
+            // non-text-model confirmation for a group that cannot drive a loop.
+            SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
 
         ModelPickerSheet(
             groups = availableGroups,
@@ -4975,7 +4992,12 @@ fun ChatScreen(
             providerRepository = providerRepository,
             onSelectGroup = { groupId ->
                 val group = availableGroups.firstOrNull { it.id == groupId }
-                val firstEntry = group?.memberEntryIds?.firstNotNullOfOrNull(::entryById)
+                // [dv24/B-02] same single source (see entryById) — a System
+                // voice member must resolve here too, or the confirmation is
+                // skipped for exactly the groups made of them
+                val firstEntry = group?.memberEntryIds?.firstNotNullOfOrNull { entryId ->
+                    SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
+                }
                 val label = firstEntry?.let { nonTextLabelFor(ModelsDevApi.effectiveModel(it)) }
                 if (label != null) {
                     pendingNonTextSelection = PendingNonTextSelection.Group(

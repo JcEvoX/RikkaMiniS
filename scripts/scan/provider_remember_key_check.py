@@ -2018,6 +2018,18 @@ _MEMBER_DISPLAY_SIGNALS = (
     "INSTANCE_ID",
     ".count {",
     ".any {",
+    # [dv24/B-02] the rest of the lookup spellings. The criterion's own docstring
+    # already promised these ("a lookup (`find`/`firstOrNull`/`any`/`count`)"),
+    # but only `any`/`count` were actually listed — so a site that resolved
+    # through `find { }`, `firstOrNull { }`, `firstNotNullOfOrNull`,
+    # `mapNotNull { }` or the `::entryById` method reference was graded as
+    # "no resolution here" and skipped. The chat model picker was skipped on
+    # exactly those spellings while resolving three ways to null.
+    ".find {",
+    ".firstOrNull {",
+    ".firstNotNullOfOrNull",
+    ".mapNotNull {",
+    "::entryById",
 )
 # A numeric roll-up over a per-member scalar (max thinking level, token window …)
 # is a different question and is out of scope by design.
@@ -2045,13 +2057,14 @@ def _is_member_resolution_site(block):
     registered for, all of which resolve members for DISPLAY."""
     if _COLLECT_ONLY.match(block):
         return False
-    display = any(tok in block for tok in _MEMBER_DISPLAY_SIGNALS)
-    if display:
-        return True
-    # Not about the member itself: a scalar roll-up, or a lookup that only
-    # feeds one. Grading it would force a SystemVoiceEntries import into
-    # arithmetic that must legitimately ignore System entries.
-    return False if any(tok in block for tok in _AGGREGATE_REDUCERS) else False
+    # A numeric roll-up is out of scope EVEN when it is spelled with a lookup:
+    # the reducers are checked FIRST, because `memberEntryIds.mapNotNull { … }
+    # .minByOrNull { … }` now matches the `.mapNotNull {` display signal while
+    # remaining, correctly, an aggregate that must skip System entries (they
+    # have no thinking level / context window).
+    if any(tok in block for tok in _AGGREGATE_REDUCERS):
+        return False
+    return any(tok in block for tok in _MEMBER_DISPLAY_SIGNALS)
 
 
 def check_group_member_resolution(code):
@@ -2153,6 +2166,92 @@ def check_capability_single_source(code):
     return results
 
 
+# ---------------------------------- [dv24/B-01] quick test EXECUTION model --
+# An argument that hands the RAW entry to the worker. `entry.model.id` and
+# `entry.baseModel.id` are string IDS (the voice adapters take them as model /
+# voice names) and must keep working — hence the `(?!\s*\.)` lookahead that
+# rejects only the model CARRIER, never its `.id`.
+_QUICK_TEST_RAW_ARG_RE = re.compile(
+    r"\b(?:resolvedModel|model)\s*=\s*entry\s*\.\s*(?:baseModel|model)\b(?!\s*\.)")
+
+def _function_body(code, marker):
+    """Body of the function introduced by [marker] — paren-matched signature,
+    then a brace-matched body. `fun performTest(...): T = withContext(…) { … }`
+    is an expression body, so the first `{` after the signature IS the body and
+    its matching `}` is the end of the function."""
+    i = code.find(marker)
+    if i < 0:
+        return None
+    j = code.find("(", i)
+    if j < 0:
+        return None
+    depth = 0
+    while j < len(code):
+        ch = code[j]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    ob = code.find("{", j)
+    if ob < 0:
+        return None
+    depth = 0
+    k = ob
+    while k < len(code):
+        ch = code[k]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return code[ob + 1:k]
+        k += 1
+    return None
+
+def check_quick_test_execution(code):
+    """C33 [dv24/B-01] — the quick test EXECUTES the model it advertised.
+
+    `applicableKinds` already resolves through `ModelsDevApi.effectiveModel` (it
+    has to: that is how the image / speech / transcription cards appear at all),
+    and the three execution calls then handed the worker `entry.model` — the
+    stored, un-enriched entry. Across the `:modelservice` boundary
+    `ModelRequestJson.encodeModel` OMITS a null `outputModalities` and that
+    process never calls `ModelsDevApi.init`, so the worker cannot enrich it
+    back: Gemini image generation skipped `responseModalities: ["TEXT","IMAGE"]`
+    ("No image returned") and the OpenAI-compatible providers were routed to
+    `/v1/chat/completions` instead of `/v1/images/generations` (400/404).
+
+    Graded on the DECISION (does `performTest` execute the effective model?),
+    not on any single spelling: the raw carrier argument is banned and the
+    enrichment must be visible in the same function. String-id arguments
+    (`entry.model.id`, `entry.baseModel.id`) stay legal on purpose.
+
+    Fail-closed: a file with no `performTest` means the structure was reworked —
+    RED, re-derive the criterion."""
+    body = _function_body(code, "fun performTest(")
+    if body is None:
+        return [("C33", False,
+                 "no `fun performTest(` in this surface — fail-closed, re-derive the "
+                 "quick-test execution criterion instead of letting it pass vacuously")]
+    bad = [code.count("\n", 0, code.find(body)) + body.count("\n", 0, m.start()) + 1
+           for m in _QUICK_TEST_RAW_ARG_RE.finditer(body)]
+    if bad:
+        return [("C33", False,
+                 "the quick test executes the RAW `entry.model` at line(s) %s — the "
+                 "capability it advertised came from the effective model, and the "
+                 ":modelservice worker cannot re-derive it (no ModelsDevApi.init "
+                 "there), so image routing falls back to a chat request"
+                 % ", ".join(str(x) for x in bad))]
+    if not re.search(r"ModelsDevApi\s*\.\s*effectiveModel\s*\(\s*entry\s*\)", body):
+        return [("C33", False,
+                 "`performTest` never resolves `ModelsDevApi.effectiveModel(entry)` — "
+                 "whatever it hands the worker is the un-enriched entry")]
+    return [("C33", True,
+             "performTest executes the effective model (0 raw entry.model arguments)")]
+
 CHECKERS = (
     (REL_PROVIDER_LIST, check_provider_list),
     (REL_SHEET, check_sheet),
@@ -2190,6 +2289,8 @@ CHECKERS = (
     (REL_PROVIDER_DETAIL, check_capability_single_source),
     (REL_ENTRY_DETAIL, check_capability_single_source),
     (REL_QUICK_TEST, check_capability_single_source),
+    # dv24-B1 (C33) — the quick test must EXECUTE what it advertised
+    (REL_QUICK_TEST, check_quick_test_execution),
     (REL_CHAT_SCREEN, check_capability_single_source),
     # dv23-B6 — the group surfaces render member modalities/names too
     (REL_MODEL_GROUPS, check_capability_single_source),
@@ -2197,6 +2298,13 @@ CHECKERS = (
     (REL_MODEL_GROUPS, check_group_member_resolution),
     (REL_AGENT_LOOP_MODELS, check_group_member_resolution),
     (REL_AGENT_LOOP_SHEETS, check_group_member_resolution),
+    # dv24-B2 — the chat model picker + the screen's confirm-dialog resolver
+    # were the two surfaces whose resolution spelling the old signal table did
+    # not recognise (a default Voice Input/Output group is made ONLY of System
+    # sentinels, so both rendered/counted nothing and skipped the non-text
+    # confirmation).
+    (REL_MODEL_PICKER_SHEET, check_group_member_resolution),
+    (REL_CHAT_SCREEN, check_group_member_resolution),
 )
 
 
@@ -3350,6 +3458,14 @@ fun ModelEntryPickerInstanceSections(searchQuery: String, instanceIds: List<Stri
 
 FIX_MODEL_PICKER_SHEET_CLEAN = """package com.rikkaminis.app.ui.chat
 
+// [dv24/B-02] C34 is registered on this surface: the picker renders a group's
+// members (count, preview, expanded rows), so every resolution must consult the
+// System source.
+internal fun pickerGroupMembers(config: ProviderConfig, group: ModelGroup): List<ModelEntry> =
+    group.memberEntryIds.mapNotNull { entryId ->
+        SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
+    }
+
 internal fun ModelPickerSheetProviderSections(allInstanceIds: Set<String>) {
     var searchText by remember { mutableStateOf("") }
     var collapsedInstanceIds by remember(allInstanceIds) {
@@ -3542,6 +3658,16 @@ fun applicableKinds(entry: ModelEntry): List<String> {
     val outputs = (model.outputModalities ?: emptyList()).map { it.normalizeModalityName() }
     return outputs
 }
+
+private suspend fun performTest(entry: ModelEntry): String = withContext(Dispatchers.IO) {
+    val effectiveModel = ModelsDevApi.effectiveModel(entry)
+    val a = VoiceInputRequest(model = entry.baseModel.id, language = "en", resolvedModel = effectiveModel)
+    // string-ids stay legal: the voice adapter takes the entry as its VOICE
+    val b = VoiceOutputRequest(model = entry.model.id, voice = entry.model.id)
+    val c = ProviderExecutionGateway.send(model = effectiveModel)
+    val d = ProviderExecutionGateway.generateImage(model = effectiveModel)
+    a + b + c + d
+}
 """
 
 FIX_QUICK_TEST_RAW_LOCAL = FIX_QUICK_TEST_CLEAN.replace(
@@ -3552,11 +3678,35 @@ FIX_QUICK_TEST_RAW_CHAIN = FIX_QUICK_TEST_CLEAN.replace(
     "val outputs = (model.outputModalities ?: emptyList()).map { it.normalizeModalityName() }",
     "val outputs = (entry.model.outputModalities ?: emptyList()).map { it.normalizeModalityName() }")
 
+# BOTH enrichment sites gone: the capability list AND the execution (the
+# fixture used to strip only the list, which the execution resolution kept
+# "single source present" — the arm had lost its teeth).
 FIX_QUICK_TEST_NO_SOURCE = FIX_QUICK_TEST_CLEAN.replace(
-    "val model = ModelsDevApi.effectiveModel(entry)",
-    "val model = entry.baseModel")
+    "ModelsDevApi.effectiveModel(entry)",
+    "entry.baseModel")
+
+# [dv24/B-01] the pre-fix execution spelling: one of the three calls hands the
+# worker the raw entry again (the other two stay fixed — ONE bad site is enough
+# to lose the image capability on that test kind).
+FIX_QUICK_TEST_RAW_PERFORM_MODEL = FIX_QUICK_TEST_CLEAN.replace(
+    "ProviderExecutionGateway.generateImage(model = effectiveModel)",
+    "ProviderExecutionGateway.generateImage(model = entry.model)")
+
+# [dv24/B-01] the resolution is gone but the arguments look right — the calls
+# now reference an identifier nothing enriched.
+FIX_QUICK_TEST_NO_PERFORM_ENRICH = FIX_QUICK_TEST_CLEAN.replace(
+    """    val effectiveModel = ModelsDevApi.effectiveModel(entry)
+    val a = """,
+    """    val a = """)
 
 FIX_CHAT_SCREEN_CLEAN = """package com.rikkaminis.app.ui.chat
+
+// [dv24/B-02] C34 is registered on this surface too: the group tap resolves
+// its first member to decide whether a non-text confirmation is owed.
+internal fun firstGroupEntry(config: ProviderConfig, group: ModelGroup?): ModelEntry? =
+    group?.memberEntryIds?.firstNotNullOfOrNull { entryId ->
+        SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
+    }
 
 fun nonTextLabelFor(model: LLMModel): String? {
     val mods = model.outputModalities.normalizeModalities() ?: emptyList()
@@ -3570,6 +3720,24 @@ fun usage(entry: ModelEntry?): String? =
 FIX_CHAT_SCREEN_RAW_LABEL = FIX_CHAT_SCREEN_CLEAN.replace(
     "entry?.let { nonTextLabelFor(ModelsDevApi.effectiveModel(it)) }",
     "entry?.model?.let(::nonTextLabelFor)")
+# [dv24/B-02] both new C34 surfaces, pre-fix spelling (persisted-only lookup)
+FIX_MODEL_PICKER_SHEET_NO_SYSTEM_FALLBACK = FIX_MODEL_PICKER_SHEET_CLEAN.replace(
+    "SystemVoiceEntries.resolveIn(config.modelEntries, entryId)",
+    "config.modelEntries.find { it.id == entryId }")
+
+FIX_CHAT_SCREEN_NO_SYSTEM_FALLBACK = FIX_CHAT_SCREEN_CLEAN.replace(
+    "SystemVoiceEntries.resolveIn(config.modelEntries, entryId)",
+    "config.modelEntries.find { it.id == entryId }")
+
+# [dv24/B-02] the method-reference indirection: `::entryById` is a member
+# resolution site even though the single source lives in another function, so
+# the screen must not resolve the member id inline behind it.
+FIX_CHAT_SCREEN_ENTRY_BY_ID_INDIRECTION = FIX_CHAT_SCREEN_CLEAN.replace(
+    """    group?.memberEntryIds?.firstNotNullOfOrNull { entryId ->
+        SystemVoiceEntries.resolveIn(config.modelEntries, entryId)
+    }""",
+    """    group?.memberEntryIds?.firstNotNullOfOrNull(::entryById)""")
+
 
 
 CLEAN_TREE = {
@@ -3696,6 +3864,20 @@ def run_selftest():
              variant(REL_MODEL_GROUPS, FIX_MODEL_GROUPS_NO_MEMBER_READ), failures, ("C34",))
     run_case("c34-aggregate-only-out-of-scope", 0,
              variant(REL_MODEL_GROUPS, FIX_MODEL_GROUPS_AGGREGATE_ONLY), failures)
+    # --- dv24-B2: the two surfaces whose resolution spelling was unrecognised --
+    run_case("c34-picker-no-system-fallback", 1,
+             variant(REL_MODEL_PICKER_SHEET, FIX_MODEL_PICKER_SHEET_NO_SYSTEM_FALLBACK),
+             failures, ("C34",))
+    run_case("c34-screen-no-system-fallback", 1,
+             variant(REL_CHAT_SCREEN, FIX_CHAT_SCREEN_NO_SYSTEM_FALLBACK), failures, ("C34",))
+    run_case("c34-screen-entrybyid-indirection", 1,
+             variant(REL_CHAT_SCREEN, FIX_CHAT_SCREEN_ENTRY_BY_ID_INDIRECTION),
+             failures, ("C34",))
+    # --- dv24-B1: the quick test must EXECUTE the effective model -------------
+    run_case("c33-quick-test-raw-perform-model", 1,
+             variant(REL_QUICK_TEST, FIX_QUICK_TEST_RAW_PERFORM_MODEL), failures, ("C33",))
+    run_case("c33-quick-test-no-perform-enrich", 1,
+             variant(REL_QUICK_TEST, FIX_QUICK_TEST_NO_PERFORM_ENRICH), failures, ("C33",))
 
     # --- da1026-C: C5 (connection screen) ---------------------------------
     run_case("c5-conn-no-baseurl-key", 1,
@@ -3925,9 +4107,11 @@ def run_selftest():
              variant(REL_MODEL_PICKER_SHEET, FIX_MODEL_PICKER_SHEET_INVERTED), failures, ("C32",))
     run_case("c32-sheet-derived-set", 0,
              variant(REL_MODEL_PICKER_SHEET, FIX_MODEL_PICKER_SHEET_DERIVED), failures)
+    # C34 is registered on the same surface, so a reworked file fails BOTH
+    # criteria closed — that is the intended shape, not an extra red.
     run_case("failclosed-sheet-missing-anchor", 1,
              variant(REL_MODEL_PICKER_SHEET, FIX_MODEL_PICKER_SHEET_MISSING_ANCHOR), failures,
-             ("C32",))
+             ("C32", "C34"))
     run_case("c32-picker-render-ungated", 1,
              variant(REL_MODEL_ENTRY_PICKER, FIX_PICKER_RENDER_UNGATED), failures, ("C32",))
     if failures:
