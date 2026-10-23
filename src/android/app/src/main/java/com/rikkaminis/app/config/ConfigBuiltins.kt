@@ -2,6 +2,7 @@ package com.rikkaminis.app.config
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.Looper
 import com.rikkaminis.app.config.collections.EnvVarsCollection
 import com.rikkaminis.app.config.collections.GroupsCollection
 import com.rikkaminis.app.config.collections.ModelsCollection
@@ -17,7 +18,15 @@ import com.rikkaminis.app.data.repository.EnvVarRepository
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.data.model.SystemVoiceEntries
 import com.rikkaminis.app.data.model.ThinkingLevel
+import com.rikkaminis.app.logging.AppLogger
+import com.rikkaminis.app.ui.chat.ChatViewModel
+import com.rikkaminis.app.ui.chat.ChatViewModelStore
+import com.rikkaminis.app.ui.chat.applyDefaultModelFallback
+import com.rikkaminis.app.ui.chat.restoreFromBinding
+import com.rikkaminis.app.ui.chat.setThinkingLevel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -582,7 +591,15 @@ internal object ConfigBuiltins {
                         ?: throw ConfigError.InvalidValue("Unknown thinking level: $token")
                     val sid = sessionIdProvider()
                         ?: throw ConfigError.InvalidValue("No active session — open a chat first")
-                    runBlocking { chatRepo.dao.updateThinkingOverride(sid, level.name) }
+                    // [dv24-A05] Persist AND push into the resident VM: the row is
+                    // the only cross-restart store, the VM is what the user sees.
+                    writeSessionConfig(
+                        sessionId = sid,
+                        path = "session.thinkingLevel",
+                        chatRepo = chatRepo,
+                        persist = { chatRepo.dao.updateThinkingOverride(sid, level.name) },
+                        refresh = { vm -> vm.setThinkingLevel(level) },
+                    )
                 },
             )
         )
@@ -609,7 +626,17 @@ internal object ConfigBuiltins {
                         ?: throw ConfigError.InvalidValue("No active session — open a chat first")
                     if (s.isEmpty()) {
                         // Clear the binding — fall back to default group/entry on next load.
-                        runBlocking { chatRepo.dao.updateSessionBinding(sid, "", "") }
+                        // [dv24-A05] The live VM must run the SAME fallback the next
+                        // `loadSession()` would (priority 3: default group → new-chat
+                        // default), otherwise the chat keeps showing the cleared pin
+                        // while the row already says "no binding".
+                        writeSessionConfig(
+                            sessionId = sid,
+                            path = "session.primaryModel",
+                            chatRepo = chatRepo,
+                            persist = { chatRepo.dao.updateSessionBinding(sid, "", "") },
+                            refresh = { vm -> vm.applyDefaultModelFallback() },
+                        )
                         return@ClosureField
                     }
                     val cfg = providerRepo.config.value
@@ -640,9 +667,19 @@ internal object ConfigBuiltins {
                             "Expected `entry:<uuid>` or `group:<id>`, got '$s'"
                         )
                     }
-                    runBlocking {
-                        chatRepo.dao.updateSessionBinding(sid, bindingJson, modelId)
-                    }
+                    writeSessionConfig(
+                        sessionId = sid,
+                        path = "session.primaryModel",
+                        chatRepo = chatRepo,
+                        persist = { chatRepo.dao.updateSessionBinding(sid, bindingJson, modelId) },
+                        refresh = { vm ->
+                            // Same three priorities `loadSession` uses: the persisted
+                            // binding first (this also honours the provider-enabled /
+                            // credential gates), then the default group → new-chat
+                            // default when that binding is unusable.
+                            if (!vm.restoreFromBinding(bindingJson)) vm.applyDefaultModelFallback()
+                        },
+                    )
                 },
             )
         )
@@ -651,6 +688,96 @@ internal object ConfigBuiltins {
         // `subModelSource` field in `model_binding` JSON, no agent-loop
         // fallback path). Reported up at the spec level rather than
         // adding a no-op key that silently throws on every write.
+    }
+
+    private const val TAG = "ConfigBuiltins"
+
+    /**
+     * [dv24-A05] A `session.*` write lands on **every** surface that can hold
+     * the value, in one call.
+     *
+     * Before this, `minis-config set session.thinkingLevel high` /
+     * `session.primaryModel entry:<uuid>` ran a single
+     * `runBlocking { dao.update… }`. `ChatViewModel` reads both fields exactly
+     * once, inside `loadSession()`, and `ChatViewModelStore` keeps that instance
+     * alive for the whole process — so the agent's write returned success while
+     * the chat kept using the OLD model / level. Worse, the next in-app picker
+     * tap wrote that stale in-memory state back over the row, silently undoing
+     * the config write.
+     *
+     * Both halves are load-bearing, which is why they live in one function
+     * rather than at each call site:
+     *   - `persist` — the Room row is the only cross-restart store;
+     *   - `refresh` — the resident VM is the only live surface, and it is the
+     *     one that would otherwise clobber the row.
+     * The refresh goes through the VM's own entry points (`setThinkingLevel`,
+     * `restoreFromBinding` / `applyDefaultModelFallback`), i.e. the same
+     * decisions the UI and `loadSession()` take — no second state path.
+     *
+     * Row first, VM second: if the VM-side entry throws, the value is already
+     * persisted (the write succeeded) and the UI is one load behind — the
+     * opposite order would report failure for a write that did land.
+     *
+     * Draft sessions (`__new__…`, no row yet): the UPDATE matches 0 rows, so
+     * the resident VM is the only place the value can live — it holds it and
+     * `ensureSession()` folds it into the row at insert time. With no VM either
+     * there is nothing to hold it; that case is logged rather than silently
+     * accepted (it used to be indistinguishable from success).
+     */
+    private fun writeSessionConfig(
+        sessionId: String,
+        path: String,
+        chatRepo: ChatRepository,
+        persist: suspend () -> Unit,
+        refresh: (ChatViewModel) -> Unit,
+    ) {
+        // The resident VM is looked up BEFORE the write and refreshed after it
+        // (see SessionConfigWriteThrough.deliver): the row is the only
+        // cross-restart store, the VM is the only live surface, and the VM is
+        // the one that would otherwise clobber the row with stale memory.
+        //
+        // `peekViewModel` is main-thread-only (it walks ViewModelStore), hence
+        // the hop — and the refresh must run on Main too, exactly like the
+        // in-app picker does.
+        val vm = runOnMainThread { ChatViewModelStore.peekViewModel(sessionId) }
+        SessionConfigWriteThrough.deliver(
+            vm = vm,
+            persist = persist,
+            hasPersistedRow = { chatRepo.dao.getSession(sessionId) != null },
+            refresh = { resident ->
+                runOnMainThread {
+                    runCatching { refresh(resident) }.onFailure {
+                        AppLogger.warning(
+                            TAG,
+                            "$path: resident view model refresh failed for " +
+                                "'$sessionId': ${it.message}",
+                        )
+                    }
+                }
+            },
+            onDraftWithoutRow = {
+                AppLogger.warning(
+                    TAG,
+                    "$path: session '$sessionId' has no persisted row and no resident " +
+                        "view model — the UPDATE matched 0 rows, so the value is not retained",
+                )
+            },
+        )
+    }
+
+    /**
+     * Run [block] on the Android main thread and wait for it.
+     *
+     * `minis-config` is served from the offload worker thread, while every
+     * `ChatViewModel` `MutableStateFlow` write and every `ProviderFactory.create`
+     * call behind the VM's entry points is main-thread-only. Waiting (rather
+     * than `launch`) is what makes the write-through real: the agent's next
+     * sentence has to see the new level. The fast path exists because hopping to
+     * a looper we are already running on would deadlock `runBlocking`.
+     */
+    private fun <T> runOnMainThread(block: () -> T): T {
+        if (Looper.myLooper() == Looper.getMainLooper()) return block()
+        return runBlocking { withContext(Dispatchers.Main) { block() } }
     }
 
     /** iOS uses lowercase tokens (`off`/`low`/…); Android `ThinkingLevel.name`

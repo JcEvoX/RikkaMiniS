@@ -176,6 +176,36 @@ fun ChatViewModel.selectEntry(entryId: String) {
 }
 
 /**
+ * [dv24-A05] The fallback a session uses when it has NO usable model binding.
+ *
+ * `loadSession()` resolves a session's model in three priorities: (1) the
+ * persisted `model_binding`, (2) the persisted `model_id`, (3) the default
+ * group and then the new-chat default. Clearing the binding therefore means
+ * "run priority 3 now", not "pick one arbitrary entry".
+ *
+ * The config surface (`minis-config set session.primaryModel ""`) has to run
+ * the same fallback on the RESIDENT view model, otherwise the chat keeps
+ * showing the pin that was just cleared while the row already says "no
+ * binding" — the two disagree and the next picker tap writes the stale pin
+ * back.
+ *
+ * `applyNewChatDefaultModel` alone is not the same fallback: it skips the
+ * default GROUP (priority 3's first half). This is the shared entry both
+ * sides use.
+ */
+internal fun ChatViewModel.applyDefaultModelFallback(): Boolean {
+    val defaultGroupId = providerRepository.defaultPrimaryGroupId
+    if (defaultGroupId != null) {
+        val resolved = resolveProviderFromGroup(defaultGroupId)
+        if (resolved) {
+            _selectedGroupId.value = defaultGroupId
+            return true
+        }
+    }
+    return applyNewChatDefaultModel()
+}
+
+/**
  * [switchModelAndRerun] Model-switch-during-streaming (Plan A: cancel +
  * restart). Called by [selectEntry] / [selectGroup] / [selectGroupEntry]
  * AFTER the caller has already applied the new model's fields
