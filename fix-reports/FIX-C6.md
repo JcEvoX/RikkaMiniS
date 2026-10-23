@@ -107,6 +107,7 @@ fi
 - 真树：`python3 scripts/scan/overlay_show_hide_latch_check.py` → `rc=0`，`OK: 4 criteria clean — … [intent field = desiredShown] / [guard on desiredShown precedes attach()] / [no hide() gated on isShown] / [intent=desiredShown / real=isShown]`
 - selftest：`10/10`，`OVERLAY_SHOW_HIDE_LATCH_SELFTEST=PASS`
 - PRE 臂：`rc=1`，4 条 violation（C3 恰 3 条，见 ④）
+- **真树变异（造违规 → 红 → 字节级还原）**：把 `show()` 的 post 守卫整行删掉 → 门 `rc=1` 且只报 C2（"the posted show Runnable never checks desiredShown"）；写回原字节后 `sha256` 前后一致（`b781dba0…`），门恢复 `rc=0`。
 - 全量（**沙箱侧为 S28 假红，不采信**）：持锁 `gate_run --exec 'sh scripts/scan/scan.sh; python3 scripts/scan/test_scan.py'` 落到 `probe/full2.log` —— `Summary: 25 passed, 84 failed` + `TS_RC=127`。按 registry S28 的判据逐行核对：日志里 `Function not implemented` 行 **85 条**（84 个门的 `python3` exec 各一条 + `sh: python3` 一条），**84 个 failed 与 ENOSYS 行一一对应，没有任何一条失败不带该字样** ⇒ 全是沙箱症状，不是代码红。16 支并发施工把并发窗口拉满，`gate_run --full` 两次在后段被沙箱回收（进度停在 16/48 门）。
 - 全量（**权威读数 = 分支 CI job 日志**）：`Summary: 109 passed, 0 failed` 恰一条、`✅ ALL 336 CASES PASS` 恰一条、门头 `[1/109]…[109/109]` 序号连续且 109 个门名互异、编译错 `Z e:` 0、游离 `FAILED` 0 —— 见 L4。这与 COMMON §5.1「施工期本地只跑本门 + 邻门，全量交给 CI」一致；新门未注册（本批冻结 `scan.sh`/`test_scan.py`），所以 CI 的 109 门不含本门，本门的证据在 L1 前三条与 L2/L3。
 
