@@ -369,7 +369,17 @@ class ShareReceiverActivity : ComponentActivity() {
      *  IO dispatcher (the caller is [extractItems]). Returns the staged
      *  filename (relative to sharedFileDirectory) or null on failure.
      *  Enforces per-file and cumulative size limits and cleans up partial
-     *  files on any failure. */
+     *  files on any failure.
+     *
+     *  [§1044-A08] The byte-copying itself lives in the JVM-pinned
+     *  [copySharedStream] core, which null-guards the resolver stream BEFORE
+     *  the destination file is created. `ContentResolver.openInputStream`
+     *  returns null (without throwing) when a remote provider refuses or its
+     *  process died; the old inline shape `openInputStream(uri)?.use { … }`
+     *  then skipped its whole block and still returned `name`, so the caller
+     *  built a `PendingShare.Item` for a file that never existed — a ghost
+     *  attachment that reached the composer with no "could not read" error.
+     *  Nothing is staged unless the core reports [SharedStreamCopy.Staged]. */
     private fun copyUriToStaging(uri: Uri, mimeType: String): String? {
         val ext = guessExtension(mimeType, uri)
         val prefix = when {
@@ -379,44 +389,35 @@ class ShareReceiverActivity : ComponentActivity() {
         }
         val name = "$prefix-${shortId()}${if (ext.isNotEmpty()) ".$ext" else ""}"
         val dest = File(SharedShareStore.sharedFileDirectory(this), name)
-        return try {
-            contentResolver.openInputStream(uri)?.use { input ->
-                dest.outputStream().use { output ->
-                    val buf = ByteArray(8192)
-                    var total = 0L
-                    val deadline = System.currentTimeMillis() + IO_TIMEOUT_MS
-                    while (true) {
-                        if (System.currentTimeMillis() > deadline) {
-                            AppLogger.warning(TAG, "copyUriToStaging($uri) timed out after ${IO_TIMEOUT_MS}ms")
-                            // Remove the partial file left behind by the timeout.
-                            runCatching { dest.delete() }
-                            return null
-                        }
-                        val n = input.read(buf)
-                        if (n < 0) break
-                        total += n
-                        if (total > MAX_FILE_BYTES) {
-                            AppLogger.warning(TAG, "copyUriToStaging($uri) exceeded ${MAX_FILE_BYTES} bytes")
-                            runCatching { dest.delete() }
-                            return null
-                        }
-                        if (stagedBytes.current() + total > MAX_TOTAL_BYTES) {
-                            AppLogger.warning(TAG, "copyUriToStaging($uri) would exceed cumulative ${MAX_TOTAL_BYTES} bytes")
-                            runCatching { dest.delete() }
-                            return null
-                        }
-                        output.write(buf, 0, n)
-                    }
-                    stagedBytes.credit(total)
-                }
+        return when (
+            val outcome = copySharedStream(
+                openStream = { contentResolver.openInputStream(uri) },
+                openDest = { dest.outputStream() },
+                deleteDest = { dest.delete() },
+                stagedBytesNow = { stagedBytes.current() },
+                credit = { stagedBytes.credit(it) },
+                maxFileBytes = MAX_FILE_BYTES,
+                maxTotalBytes = MAX_TOTAL_BYTES,
+                ioTimeoutMs = IO_TIMEOUT_MS,
+                now = { System.currentTimeMillis() },
+            )
+        ) {
+            is SharedStreamCopy.Staged -> name
+            is SharedStreamCopy.Failed -> {
+                AppLogger.warning(TAG, "copyUriToStaging($uri): ${outcome.describe()}")
+                null
             }
-            name
-        } catch (e: Exception) {
-            AppLogger.warning(TAG, "copyUriToStaging($uri): ${e.message}")
-            // Clean up partial file, if any
-            try { dest.delete() } catch (_: Exception) {}
-            null
         }
+    }
+
+    /** Human-readable reason for a failed staging copy. Keeps the log lines the
+     *  pre-§1044-A08 inline copy emitted (same wording, same numbers). */
+    private fun SharedStreamCopy.Failed.describe(): String = when (reason) {
+        SharedStreamFailure.OpenStreamNull -> "openInputStream returned null — nothing to stage"
+        SharedStreamFailure.TimedOut -> "timed out after ${IO_TIMEOUT_MS}ms"
+        SharedStreamFailure.ExceededPerFile -> "exceeded $MAX_FILE_BYTES bytes"
+        SharedStreamFailure.ExceededCumulative -> "would exceed cumulative $MAX_TOTAL_BYTES bytes"
+        SharedStreamFailure.ReadFailed -> detail ?: "read failed"
     }
 
     private fun guessExtension(mimeType: String, uri: Uri): String {
