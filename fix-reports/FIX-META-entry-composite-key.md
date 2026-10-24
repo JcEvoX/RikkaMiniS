@@ -73,8 +73,13 @@
 
 ## 6. CI
 
-- run：`（回填见下一条提交）`
-- 判读项：`head_sha` 逐字符一致 · `Summary: 112 passed, 0 failed` 恰一条 · `ALL 344 CASES PASS` 恰一条 · `skipped` 仅 Publish。
+- run：**#2624**（`run_id 40102323086`，`job 120896842322`），attempt 1，**success**
+- `head_sha` = `f915282a9c98f3e09b070dbb2a44ba751895f8af`，与本地 HEAD 逐字符一致
+- 26 个步骤，`NOT_OK = []`，唯一 `skipped` = **第 23 步 Publish to Releases**（main 门控）
+- 门：`Summary: 112 passed, 0 failed` **恰一条**；门头 `━━━ [N/112] ━━━` 112 条、编号 1..112 **互异无重号**
+- 夹具：`ALL 344 CASES PASS` **恰一条**；本门的 `ENTRY_COMPOSITE_KEY_SELFTEST=PASS` 标记断言在册（1 条），真树分支 `entry_composite_key_guard_check: OK (9 arms clean)` 同时出现在 CI 日志里
+- 编译错 `e: ` **0 条**；含 `FAILED` 的行逐条确认全是用例名/断言文本子串，无游离失败
+- 日志体积 1,478,843 B
 
 ## 7. 残留登记（本支不动手）
 

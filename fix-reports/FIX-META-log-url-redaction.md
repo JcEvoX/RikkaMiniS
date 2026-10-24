@@ -72,8 +72,15 @@
 
 ## 6. CI
 
-- run：`（回填见下一条提交）`
-- 判读项：`head_sha` 与本地 HEAD 逐字符一致 · `Summary: 112 passed, 0 failed` 恰一条 · `ALL 344 CASES PASS` 恰一条 · `skipped` 仅 Publish（main 门控）。
+- run：**#2624**（`run_id 40102323086`，`job 120896842322`），attempt 1，**success**
+- `head_sha` = `f915282a9c98f3e09b070dbb2a44ba751895f8af`，与本地 HEAD 逐字符一致
+- 26 个步骤，`NOT_OK = []`，唯一 `skipped` = **第 23 步 Publish to Releases**（main 门控，分支构建不发布）
+- 门：`Summary: 112 passed, 0 failed` **恰一条**；门头 `━━━ [N/112] ━━━` 共 112 条、编号 1..112 **互异无重号**
+- 夹具：`ALL 344 CASES PASS` **恰一条**；`ENTRY_COMPOSITE_KEY_SELFTEST=PASS` 在册
+- 本门新判据在 CI 日志里确实生效：`no whole url value reaches a log — judged across all evaluation forms (interpolation / concatenation / brace-nested)`
+- 编译错 `e: ` **0 条**；含 `FAILED` 的 6 行逐条确认全是**用例名/断言文本**子串（如 `... produces FAILED without calling provid…`、`phase FAILED maps to Failed PASSED`），无游离失败
+- 日志体积 1,478,843 B
+- 本门的 17 条 selftest 臂未进 CI（见 §7 R4，`test_scan.py` 是冻结面）
 
 ## 7. 残留登记（本支不动手）
 
