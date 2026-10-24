@@ -91,6 +91,15 @@ API_KEY_DECISION_FORMS = (API_KEY_LITERAL, '"api-key" to')
 
 CTOR_RE = re.compile(r"\b(AnthropicProvider|GeminiProvider|OpenAIProvider)\s*\(")
 UA_ARG = "customUserAgent ="
+# [wide-1024] `customUserAgent =` proves the parameter is spelled, not that the
+# instance's value reaches it: `customUserAgent = null` keeps the name and drops
+# the override. The criterion follows the VALUE instead (one hop of local alias
+# or same-file helper is legitimate; a literal is not).
+UA_FLOW_RE = re.compile(r"customUserAgent\s*=\s*([^,\n]*)")
+UA_SOURCE_TOKEN = ".customUserAgent"
+# [wide-1024] the EOF verdict must be fed the ACCUMULATOR, not a literal — the
+# counter is derived from `X += toolCallActivityChars(`, never from its name.
+TOOL_ACCUM_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\+=\s*toolCallActivityChars\s*\(")
 NULL_OVERRIDE = ".applyUserAgentOverride(null)"
 OVERRIDE_PASSED = ".applyUserAgentOverride(customUserAgent)"
 CTOR_PARAM = "private val customUserAgent: String? = null"
@@ -217,6 +226,47 @@ def constructor_slices(code):
     return slices
 
 
+def decl_text(code, name):
+    """Text of the [name] declaration: its `{ … }` body when present, else the
+    expression body (`fun f() = …`) up to the next top-level declaration."""
+    body = decl_body(code, "fun " + name + "(")
+    if body is not None:
+        return body
+    m = re.search(r"\bfun\s+(?:[A-Za-z_][\w.]*\.)?" + re.escape(name) + r"\s*\(", code)
+    if not m:
+        return None
+    rest = code[m.end():]
+    end = len(rest)
+    for stop in ("\ninternal ", "\nprivate ", "\npublic ", "\nfun ",
+                 "\nobject ", "\nclass ", "\n@"):
+        idx = rest.find(stop)
+        if 0 <= idx < end:
+            end = idx
+    return rest[:end]
+
+
+def ua_value_flows(code, expr):
+    """[wide-1024] True when [expr] carries the instance's customUserAgent.
+
+    Existence of the argument name is not use of the value: `customUserAgent =
+    null` spells the parameter and drops the override. Follow the value — the
+    field itself, a local alias of it, or a one-hop helper that reads it."""
+    if expr is None:
+        return False
+    if UA_SOURCE_TOKEN in expr:
+        return True
+    for ident in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", expr):
+        for m in re.finditer(
+                r"\b(?:val|var)\s+" + re.escape(ident) +
+                r"\s*(?::\s*[A-Za-z0-9_.<>?, ]+)?=\s*([^\n]*)", code):
+            if UA_SOURCE_TOKEN in m.group(1):
+                return True
+        helper = decl_text(code, ident)
+        if helper is not None and UA_SOURCE_TOKEN in helper:
+            return True
+    return False
+
+
 def check_factory(src):
     v = []
     code = blank_strings(strip_comments(src))
@@ -232,6 +282,17 @@ def check_factory(src):
                 "'%s instance.customUserAgent' (ISSUE-04a: the override is "
                 "settable on every apiKey provider, null is harmless)"
                 % (lineno, ctype, UA_ARG)
+            )
+            continue
+        # [wide-1024] the parameter being spelled is not the value arriving
+        m = UA_FLOW_RE.search(text)
+        expr = None if m is None else m.group(1)
+        if not ua_value_flows(code, expr):
+            v.append(
+                "ProviderFactory.kt:%d: %s(...) passes '%s' to customUserAgent — "
+                "the instance override never arrives (ISSUE-04a: a literal or "
+                "null silently falls back to MinisUserAgent.DEFAULT)"
+                % (lineno, ctype, (expr or "").strip())
             )
     return v
 
@@ -312,6 +373,31 @@ def check_gemini(src):
             "(ISSUE-04c: without it the verdict's tool counter stays 0 and the "
             "condition is dead)" % TOOL_ACCUM
         )
+    else:
+        # [wide-1024] the accumulator must arrive at the EOF call site. The old
+        # criterion only proved `toolChars` appears somewhere in the file (the
+        # helper's own parameter list), so `geminiEofTerminal(…, 0)` — the tool
+        # payload hard-coded away at the one place it is consumed — stayed green.
+        accumulators = set(m.group(1) for m in TOOL_ACCUM_RE.finditer(code))
+        terminal_sites = [
+            m for m in re.finditer(r"\bgeminiEofTerminal\s*\(", code)
+            if not re.search(r"fun\s+$", code[max(0, m.start() - 8):m.start()])
+        ]
+        for m in terminal_sites:
+            args = balanced_slice(code, m.end() - 1)
+            lineno = code.count("\n", 0, m.start()) + 1
+            if args is None:
+                v.append(
+                    "GeminiProvider.kt:%d: geminiEofTerminal(...) call is "
+                    "unbalanced (fail-closed: the criterion cannot tell whether "
+                    "the tool counter arrives)" % lineno)
+            elif not any(re.search(r"\b%s\b" % re.escape(a), args) for a in accumulators):
+                v.append(
+                    "GeminiProvider.kt:%d: geminiEofTerminal(...) call does not "
+                    "pass the tool counter ('%s') — the accumulator is computed "
+                    "and then dropped at the only place the verdict consumes it "
+                    "(ISSUE-04c: tool-only EOF reads as a clean end_turn)"
+                    % (lineno, "', '".join(sorted(accumulators))))
     return v
 
 
@@ -529,6 +615,28 @@ def check_voice(provider_src, vendors_src, factory_src):
             "post-construction injection must cover every build() arm; per-arm "
             "forwarding is the deep-audit-1019 ISSUE-04 shape that drops new arms)"
         )
+    else:
+        # [wide-1024] the injection must be the LAST word. Existence of the
+        # assignment regex says nothing about a later assignment overwriting it:
+        # `.also { it?.customUserAgent = instance.customUserAgent;
+        #          it?.customUserAgent = null }` matched and still shipped the
+        # default UA. Judge the post-condition — every assignment in make()
+        # has to carry the instance value.
+        clobbers = []
+        for m in re.finditer(
+                r"(?<!val )(?<!var )([\w?.]*customUserAgent)\s*=(?!=)\s*([^;\n}]*)",
+                body):
+            rhs = m.group(2).strip()
+            if not ua_value_flows(code_f, rhs):
+                clobbers.append((m.group(1), rhs))
+        if clobbers:
+            v.append(
+                "VoiceProviderFactory.kt: make() assigns '%s' to a value that is "
+                "not the instance override ('%s') — assign-then-clobber leaves "
+                "every voice request on the default UA (da1029 ISSUE-05 V3: one "
+                "injection, and it must survive)"
+                % (clobbers[0][0], clobbers[0][1])
+            )
     return v
 
 
@@ -917,6 +1025,51 @@ BAD_GEMINI_NO_CALLSITE = GOOD_GEMINI.replace(
     "if (lastFinishReason == null && contentChars > 0) {",
 )
 
+# [wide-1024] the helper shape the real GeminiProvider uses: the SSE flow calls
+# `geminiEofTerminal(...)` and THAT feeds the pure verdict. The old criterion
+# saw `toolChars` inside the helper's parameter list and stopped there.
+GOOD_GEMINI_TERMINAL = GOOD_GEMINI.replace(
+    """        if (shouldFlagEofTruncated(lastFinishReason, contentChars, toolChars)) {""",
+    """        val terminal = geminiEofTerminal(lastFinishReason, contentChars, toolChars)
+        if (terminal) {""",
+).replace(
+    """internal fun shouldFlagEofTruncated(""",
+    """internal fun geminiEofTerminal(
+    lastFinishReason: String?,
+    contentChars: Int,
+    toolChars: Int,
+): Boolean =
+    shouldFlagEofTruncated(lastFinishReason, contentChars, toolChars)
+
+internal fun shouldFlagEofTruncated(""",
+)
+
+BAD_GEMINI_TERMINAL_ZERO = GOOD_GEMINI_TERMINAL.replace(
+    "geminiEofTerminal(lastFinishReason, contentChars, toolChars)",
+    "geminiEofTerminal(lastFinishReason, contentChars, 0)",
+)
+
+BAD_GEMINI_TERMINAL_UNBALANCED = GOOD_GEMINI_TERMINAL.replace(
+    "geminiEofTerminal(lastFinishReason, contentChars, toolChars)",
+    "geminiEofTerminal(lastFinishReason, contentChars, toolChars",
+)
+
+BAD_FACTORY_UA_NULL = GOOD_FACTORY.replace(
+    """                    basePath = "https://openrouter.ai/api/v1",
+                    customUserAgent = instance.customUserAgent,""",
+    """                    basePath = "https://openrouter.ai/api/v1",
+                    customUserAgent = null,""",
+)
+
+GOOD_FACTORY_UA_ALIAS = GOOD_FACTORY.replace(
+    """        val effectiveKey = apiKey""",
+    """        val effectiveKey = apiKey
+        val ua = instance.customUserAgent""",
+).replace(
+    "customUserAgent = instance.customUserAgent",
+    "customUserAgent = ua",
+)
+
 BAD_GEMINI_NO_VERDICT_FN = BAD_GEMINI_NO_CALLSITE.replace(
     """
 internal fun shouldFlagEofTruncated(
@@ -1090,6 +1243,11 @@ object VoiceProviderFactory {
 BAD_VOICE_FACTORY_DROP = GOOD_VOICE_FACTORY.replace(
     "        build(instance, rawApiKey).also { it?.customUserAgent = instance.customUserAgent }",
     "        build(instance, rawApiKey)",
+)
+
+BAD_VOICE_FACTORY_CLOBBER = GOOD_VOICE_FACTORY.replace(
+    "build(instance, rawApiKey).also { it?.customUserAgent = instance.customUserAgent }",
+    "build(instance, rawApiKey).also { it?.customUserAgent = instance.customUserAgent; it?.customUserAgent = null }",
 )
 
 BAD_VOICE_FACTORY_NULL = GOOD_VOICE_FACTORY.replace(
@@ -1342,6 +1500,13 @@ def selftest():
     expect_trip("dropped-openRouter fixture (ISSUE-04a)", bad_drop, "drops")
     expect_trip("dropped-openRouter fixture (ISSUE-04a)", bad_drop, "OpenAIProvider")
 
+    # [wide-1024] the argument name is not the value
+    bad_null = check_factory(BAD_FACTORY_UA_NULL)
+    expect_trip("null-UA-in-openRouter-arm fixture (ISSUE-04a)", bad_null,
+                "the instance override never arrives")
+    good_alias = check_factory(GOOD_FACTORY_UA_ALIAS)
+    expect_clean("local-alias-UA fixture (ISSUE-04a)", good_alias)
+
     bad_null = check_gemini(BAD_GEMINI_NULL)
     expect_trip("hard-coded-null fixture (ISSUE-04b)", bad_null, "applyUserAgentOverride(null)")
 
@@ -1357,6 +1522,16 @@ def selftest():
 
     bad_callsite = check_gemini(BAD_GEMINI_NO_CALLSITE)
     expect_trip("inline-verdict fixture (ISSUE-04c)", bad_callsite, "never called")
+
+    # [wide-1024] the accumulator must arrive at the terminal call site
+    good_term = check_gemini(GOOD_GEMINI_TERMINAL)
+    expect_clean("gemini terminal-helper fixture", good_term)
+    bad_term_zero = check_gemini(BAD_GEMINI_TERMINAL_ZERO)
+    expect_trip("tool-counter-hardcoded-at-terminal fixture (ISSUE-04c)",
+                bad_term_zero, "does not pass the tool counter")
+    bad_term_unbal = check_gemini(BAD_GEMINI_TERMINAL_UNBALANCED)
+    expect_trip("terminal-call-unbalanced fixture (fail-closed)", bad_term_unbal,
+                "unbalanced (fail-closed")
 
     bad_nofn = check_gemini(BAD_GEMINI_NO_VERDICT_FN)
     expect_trip("verdict-fn-deleted fixture (ISSUE-04c)", bad_nofn, "no longer routed")
@@ -1399,6 +1574,12 @@ def selftest():
     expect_trip("voice factory injection-drop fixture (ISSUE-05 V3)", bad_vf_drop,
                 "does not inject")
 
+    # [wide-1024] assign-then-clobber: the injection exists and is overwritten
+    bad_vf_clobber = check_voice(GOOD_VOICE_PROVIDER, GOOD_VOICE_VENDORS,
+                                 BAD_VOICE_FACTORY_CLOBBER)
+    expect_trip("voice factory clobber fixture (ISSUE-05 V3)", bad_vf_clobber,
+                "assign-then-clobber")
+
     bad_vf_null = check_voice(GOOD_VOICE_PROVIDER, GOOD_VOICE_VENDORS, BAD_VOICE_FACTORY_NULL)
     expect_trip("voice factory fake-null wiring fixture (ISSUE-05 V3)", bad_vf_null,
                 "does not inject")
@@ -1410,6 +1591,9 @@ def selftest():
     print("selftest xunfei WS-anchor-moved   -> %d violation(s)" % len(bad_vv_moved))
     print("selftest voice factory drop       -> %d violation(s)" % len(bad_vf_drop))
     print("selftest voice factory null       -> %d violation(s)" % len(bad_vf_null))
+    print("selftest voice factory clobber    -> %d violation(s)" % len(bad_vf_clobber))
+    print("selftest gemini terminal-zero     -> %d violation(s)" % len(bad_term_zero))
+    print("selftest factory UA null          -> %d violation(s)" % len(bad_null))
 
     # -- [da1030 ISSUE-06] OpenAI outbound arms ----------------------------
     def oai(provider=GOOD_OPENAI_PROVIDER, models=GOOD_OPENAI_MODELS,

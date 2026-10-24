@@ -458,6 +458,132 @@ def base_url_write_offsets(code):
     return sorted(offs)
 
 
+# ---- [wide-1024] C4: a guard is only a guard when it decides the branch ----
+def _strip_parens(expr):
+    """[expr] with redundant wrapping parentheses removed (`(false)` → `false`)."""
+    expr = expr.strip()
+    while len(expr) >= 2 and expr[0] == "(" and expr[-1] == ")":
+        depth, closes_last = 0, True
+        for i, ch in enumerate(expr):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i != len(expr) - 1:
+                    closes_last = False
+                    break
+        if not closes_last:
+            break
+        expr = expr[1:-1].strip()
+    return expr
+
+
+def _split_top(expr, op):
+    """Split [expr] at depth-0 occurrences of the boolean operator [op].
+    String literals are opaque so a `"a && b"` argument never splits."""
+    parts, depth, cur, i, quote = [], 0, [], 0, ""
+    while i < len(expr):
+        ch = expr[i]
+        if quote:
+            cur.append(ch)
+            if ch == "\\" and i + 1 < len(expr):
+                cur.append(expr[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            cur.append(ch)
+            i += 1
+            continue
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if depth == 0 and expr.startswith(op, i):
+            parts.append("".join(cur))
+            cur = []
+            i += len(op)
+            continue
+        cur.append(ch)
+        i += 1
+    parts.append("".join(cur))
+    return parts
+
+
+def _constant_condition(cond):
+    """'false' / 'true' when the literal decides [cond] at depth 0 — the shape
+    `false && <guard>` (dead) or `<guard> || true` (always taken). A guard that
+    only appears inside such an expression does not gate anything. '' otherwise."""
+    cond = _strip_parens(cond)
+    disjuncts = _split_top(cond, "||")
+    if any(_strip_parens(d) == "true" for d in disjuncts):
+        return "true"
+    if all(any(_strip_parens(c) == "false" for c in _split_top(d, "&&"))
+           for d in disjuncts):
+        return "false"
+    return ""
+
+
+def _decl_text(code, name):
+    """Text of the [name] declaration — block body when present, else the
+    expression body (`fun f() = …`) up to the next top-level declaration.
+    `extract_function` only understands `{ … }` bodies, so an expression-bodied
+    helper would come back as None and its dataflow would look absent."""
+    body = extract_function(code, name)
+    if body is not None:
+        return body
+    m = re.search(r"\bfun\s+(?:[A-Za-z_][\w.]*\.)?" + re.escape(name) + r"\s*\(", code)
+    if not m:
+        return None
+    rest = code[m.end():]
+    end = len(rest)
+    for stop in ("\ninternal ", "\nprivate ", "\npublic ", "\nfun ",
+                 "\nobject ", "\nclass ", "\n@"):
+        idx = rest.find(stop)
+        if 0 <= idx < end:
+            end = idx
+    return rest[:end]
+
+
+def _bound_initialisers(code, body):
+    """identifier → list of right-hand sides for every `val|var id[: T] = …` in
+    [body]. Used to follow one hop of local delegation without pinning names."""
+    out = {}
+    for m in re.finditer(
+            r"\b(?:val|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*"
+            r"(?::\s*[A-Za-z0-9_.<>?, ]+)?=\s*([^\n]*)", body):
+        out.setdefault(m.group(1), []).append(m.group(2))
+    return out
+
+
+def _guard_branches(body, aliases):
+    """[(condition, if-body)] for every `if (…)` whose condition bears a guard
+    token — directly or through one local alias (the `val ok = isAllowed(…)`
+    delegation is a legitimate refactor, judging it red would punish it)."""
+    out = []
+    for m in re.finditer(r"\bif\s*\(", body):
+        cond = paren_block_after(body, m.end() - 1)
+        if cond is None:
+            continue  # unbalanced — the caller reports fail-closed
+        bears = any(tok in cond for tok in BASE_URL_GUARD_TOKENS) or any(
+            re.search(r"\b%s\b" % re.escape(a), cond) for a in aliases)
+        if not bears:
+            continue
+        tail = body[m.end() + len(cond):]
+        dm = re.match(r"\s*\{", tail)
+        if dm:
+            blk = brace_block_after(tail, dm.end() - 1)
+            if_body = "" if blk is None else blk
+        else:
+            if_body = tail.split("\n", 1)[0]
+        out.append((cond, if_body))
+    return out
+
+
 def check_group_member_faces(mut_code, debug_code, groups_code):
     """[dv20-a1 A-02] Two decisions on the group member faces.
 
@@ -678,6 +804,38 @@ def _resident_arm(block):
     return rest if nxt < 0 else rest[:nxt]
 
 
+def _vm_handles(code, block):
+    """Identifiers bound to the resident VM inside [block]: `val vm = <peek>(…)`,
+    where the callee is the non-creating lookup itself or a same-file helper that
+    reaches it. Derived, not spelled — renaming `vm` or the helper keeps working."""
+    names = set()
+    for m in re.finditer(
+            r"\b(?:val|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*"
+            r"(?::\s*[A-Za-z0-9_.<>?, ]+)?=\s*([A-Za-z_][A-Za-z0-9_]*)\s*\(", block):
+        callee = m.group(2)
+        if callee == "peekViewModel":
+            names.add(m.group(1))
+            continue
+        helper = _decl_text(code, callee)
+        if helper is not None and any(t in helper for t in VM_PEEK_TOKENS):
+            names.add(m.group(1))
+    return names
+
+
+def _arm_derives_from_vm(code, block, arm):
+    """[wide-1024] C19 — the resident arm's value must be READ from the VM.
+
+    `"(" in arm` used to stand in for "this is a call, so it is a read": it also
+    accepted `(ThinkingLevel.OFF)`, i.e. a parenthesised constant, which is the
+    row-only defect wearing a call's clothes. Require the arm to consume the
+    identifier bound to the peek; when the peek is inlined (`peekViewModel(…)?.let
+    { … }`) accept the peek itself."""
+    handles = _vm_handles(code, block)
+    if handles:
+        return any(re.search(r"\b%s\b" % re.escape(h), arm) for h in handles)
+    return any(t in arm for t in VM_PEEK_TOKENS)
+
+
 def check_session_read_through(cfg_code):
     """[dv25-A06] C19 — every `session.*` config READ answers from the live value.
 
@@ -715,12 +873,43 @@ def check_session_read_through(cfg_code):
                 "%s: the %s reader has no resident-VM arm (no `%s`) — without an "
                 "explicit precedence the VM half is either unreachable or applied "
                 "unconditionally" % (CONFIG_BUILTINS_FILE, label, SESSION_READ_ARM_MARKER))
-        elif not (".value" in arm or "!!." in arm or "(" in arm):
+        elif not _arm_derives_from_vm(cfg_code, block, arm):
             v19.append(
-                "%s: the %s reader's resident arm answers a CONSTANT ('%s') — peeking "
-                "and then ignoring the value is the row-only defect with extra steps"
+                "%s: the %s reader's resident arm answers a CONSTANT ('%s') instead "
+                "of reading the resident ChatViewModel — peeking, then ignoring the "
+                "value, is the row-only defect with extra steps"
                 % (CONFIG_BUILTINS_FILE, label, arm.strip()))
     return v19, vfc
+
+def _azure_value_flows(code, body):
+    """[wide-1024] C6 — the `azureMode` the function stores must BE the parse.
+
+    The old criterion asked only that `optBoolean("azureMode"` appears somewhere
+    in the function body, so parking the parse in an unused local and writing
+    `azureMode = false` stayed green. Follow the value instead: the initialiser
+    of the stored `azureMode` — through local aliases and one same-file helper —
+    has to reach the parse.
+    """
+    binds = _bound_initialisers(code, body)
+    roots = binds.get("azureMode")
+    if not roots:
+        return False
+    seen, stack = set(), list(roots)
+    while stack:
+        expr = stack.pop()
+        if AZURE_MODE_PARSE.search(expr):
+            return True
+        for ident in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", expr):
+            if ident in seen:
+                continue
+            seen.add(ident)
+            stack.extend(binds.get(ident, []))
+        for callee in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", expr):
+            helper = _decl_text(code, callee)
+            if helper is not None and AZURE_MODE_PARSE.search(helper):
+                return True
+    return False
+
 
 def check_tree(root):
     """Returns (rc, detail dict). rc=0 all green."""
@@ -877,7 +1066,44 @@ def check_tree(root):
                 continue
             fn_start = coll_code.rfind("fun %s(" % fn, 0, off)
             body = coll_code[fn_start:off] if fn_start >= 0 else ""
-            if not any(tok in body for tok in BASE_URL_GUARD_TOKENS):
+            # [wide-1024] the guard must DECIDE the write, not merely exist:
+            #   (a) a live `if` guard — its condition is not short-circuited by
+            #       a literal, and the branch terminates (throw/return);
+            #   (b) or the value written is the guard's own result
+            #       (`val x = resolveAddCustomBaseURL(raw)` → `x` written).
+            inits = _bound_initialisers(coll_code, body)
+            aliases = set(
+                name for name, rhs in inits.items()
+                if any(tok in r for r in rhs for tok in BASE_URL_GUARD_TOKENS))
+            branches = _guard_branches(body, aliases)
+            live = [c for c, b in branches
+                    if not _constant_condition(c) and re.search(r"\b(?:throw|return)\b", b)]
+            if live:
+                continue
+            stmt_end = coll_code.find("\n", off)
+            stmt = coll_code[off:stmt_end if stmt_end > 0 else off + 240]
+            derived = any(
+                any(tok in r for r in inits.get(ident, [])
+                    for tok in BASE_URL_GUARD_TOKENS)
+                for ident in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", stmt))
+            if derived:
+                continue
+            if branches:
+                dead = [_constant_condition(c) for c, _ in branches if _constant_condition(c)]
+                if dead:
+                    detail["c4"].append(
+                        "%s: customBaseURL write site in fun %s is guarded by a "
+                        "condition the literal '%s' decides ('%s') — the guard call "
+                        "is dead code and the write is ungated"
+                        % (PROVIDERS_COLLECTION_FILE, fn, dead[0],
+                           next(c for c, _ in branches if _constant_condition(c)).strip()))
+                else:
+                    detail["c4"].append(
+                        "%s: customBaseURL write site in fun %s has a guard that "
+                        "does not terminate (no throw/return in the guarded branch) — "
+                        "the write runs either way"
+                        % (PROVIDERS_COLLECTION_FILE, fn))
+            else:
                 detail["c4"].append(
                     "%s: customBaseURL write site in fun %s has no supportsCustomBaseURL guard"
                     % (PROVIDERS_COLLECTION_FILE, fn)
@@ -913,12 +1139,24 @@ def check_tree(root):
             "%s: instancesCreate does not parse/store azureMode (write face 1/2)"
             % MUTATION_FILE
         )
+    elif not _azure_value_flows(mut_code, create_body):
+        detail["c6"].append(
+            "%s: instancesCreate stores an azureMode that is NOT the parsed value "
+            "— the parse is parked in an unused local and the instance gets a "
+            "constant (write face 1/2)" % MUTATION_FILE
+        )
     if update_body is None:
         detail["c6"].append("instancesUpdate body not extractable (fail-closed)")
     elif AZURE_MODE_TOKEN not in update_body or not AZURE_MODE_PARSE.search(update_body):
         detail["c6"].append(
             "%s: instancesUpdate does not parse/store azureMode (write face 2/2)"
             % MUTATION_FILE
+        )
+    elif not _azure_value_flows(mut_code, update_body):
+        detail["c6"].append(
+            "%s: instancesUpdate stores an azureMode that is NOT the parsed value "
+            "— the parse is parked in an unused local and the instance gets a "
+            "constant (write face 2/2)" % MUTATION_FILE
         )
 
     # ---- C7 ---- [da1030-C ISSUE-04] probe auth-header fork
@@ -2654,6 +2892,81 @@ def run_selftest():
         .replace(BIND_ARM, BIND_ARM_CONST)
     )
     read_arm("F60-session-baseline-room-only-readers-C19", baseline_readers, "c19")
+
+    # --- [wide-1024] witnesses handed over by the wide-sweep audit ---------
+    # F61 — C4: `false && <guard>` keeps every token the old criterion looked
+    # for (`isCustomBaseURLWriteAllowed` + `throw ConfigError`) and writes
+    # anyway. Blind before this batch (rc=0 on exactly this patch).
+    witness_coll = new_coll.replace(
+        "if (!isCustomBaseURLWriteAllowed(inst.providerType, newBase)) {",
+        "if (false && !isCustomBaseURLWriteAllowed(inst.providerType, newBase)) {")
+    assert witness_coll != new_coll, "F61 anchor missing"
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, witness_coll)
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c4"] and only(detail, "c4")
+    results.append(("F61-collection-guard-short-circuited-by-false-C4", ok, detail))
+    shutil.rmtree(root)
+
+    # F62 — C4: the same guard laundered through a local alias (`val ok = …`)
+    # is a legitimate refactor and must stay GREEN (acceptance, not teeth).
+    alias_coll = new_coll.replace(
+        "if (!isCustomBaseURLWriteAllowed(inst.providerType, newBase)) {",
+        "val ok = isCustomBaseURLWriteAllowed(inst.providerType, newBase)\n"
+        "                if (!ok) {")
+    assert alias_coll != new_coll, "F62 anchor missing"
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION, alias_coll)
+    rc, detail = check_tree(root)
+    results.append(("F62-collection-guard-via-local-alias-green", rc == 0, detail))
+    shutil.rmtree(root)
+
+    # F63 — C19: a parenthesised constant satisfies `"(" in arm`; the old
+    # criterion read that as "this arm calls something, so it reads the VM".
+    THINK_ARM = """                            SessionConfigReadSource.ResidentViewModel ->
+                                vm!!.requestedThinkingLevel.value"""
+    THINK_ARM_PAREN = """                            SessionConfigReadSource.ResidentViewModel ->
+                                (ThinkingLevel.OFF)"""
+    assert GOOD_CONFIG_BUILTINS.count(THINK_ARM) == 1, "F63 anchor missing"
+    read_arm(
+        "F63-session-think-reader-parenthesised-constant-C19",
+        GOOD_CONFIG_BUILTINS.replace(THINK_ARM, THINK_ARM_PAREN), "c19")
+
+    # F64/F65 — C6: the parse parked in an unused local while the stored value
+    # is a literal. Both faces.
+    AZ_CREATE = "        val azureMode = params.optBoolean(\"azureMode\", false)\n"
+    AZ_CREATE_PARKED = (
+        "        val _parsedAzure = params.optBoolean(\"azureMode\", false)\n"
+        "        val azureMode = false\n")
+    assert GOOD_MUTATION.count(AZ_CREATE) == 1, "F64 anchor missing"
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION.replace(AZ_CREATE, AZ_CREATE_PARKED))
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c6"] and only(detail, "c6")
+    results.append(("F64-create-parks-parse-then-constant-C6", ok, detail))
+    shutil.rmtree(root)
+
+    AZ_UPDATE = ('        val azureMode = if (params.has("azureMode")) '
+                 'params.optBoolean("azureMode", current.azureMode) else current.azureMode\n')
+    AZ_UPDATE_PARKED = (
+        '        val _parsedAzure = params.optBoolean("azureMode", current.azureMode)\n'
+        "        val azureMode = current.azureMode\n")
+    assert GOOD_MUTATION.count(AZ_UPDATE) == 1, "F65 anchor missing"
+    root = write_fixture(GOOD_DEBUG, GOOD_MUTATION.replace(AZ_UPDATE, AZ_UPDATE_PARKED))
+    rc, detail = check_tree(root)
+    ok = rc == 1 and detail["c6"] and only(detail, "c6")
+    results.append(("F65-update-parks-parse-then-constant-C6", ok, detail))
+    shutil.rmtree(root)
+
+    # F66 — C6: reading the parse through one local alias is legitimate
+    # (acceptance arm: the dataflow criterion must follow the value, not the
+    # spelling. Delegating the parse to a helper is NOT accepted — C6/C14 pin
+    # the key literal on each write face by design).
+    assisted = GOOD_MUTATION.replace(
+        AZ_CREATE,
+        "        val rawAzure = params.optBoolean(\"azureMode\", false)\n"
+        "        val azureMode = rawAzure\n")
+    root = write_fixture(GOOD_DEBUG, assisted)
+    rc, detail = check_tree(root)
+    results.append(("F66-create-azureMode-via-local-alias-green", rc == 0, detail))
+    shutil.rmtree(root)
 
     shutil.rmtree(root) if os.path.isdir(root) else None
 
