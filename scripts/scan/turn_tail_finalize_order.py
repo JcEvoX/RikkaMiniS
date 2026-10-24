@@ -226,7 +226,7 @@ def check_source(src: str, label: str) -> list:
         if cm is not None:
             bad.append("%s:%d: a `continue` branch can bypass the turn-tail finalize "
                        "(the finalized row then rejects the continued turn's deltas)"
-                       % (label, line_of(src, at + cm.start())))
+                       % (label, line_of(src, cm.start())))
 
     if PER_TURN_CALL not in code:
         bad.append("%s:1: the tail does not use TurnVisibleContent.hasVisibleContent(…) — the "
