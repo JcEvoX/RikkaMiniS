@@ -143,6 +143,93 @@ def bool_fields(class_body: str) -> list[str]:
     return re.findall(r"\bvar\s+(\w+)\s*:\s*Boolean\b", class_body)
 
 
+def literal_decides(cond: str) -> bool:
+    """True when a literal operand decides [cond]'s value.
+
+    [wide-1024 C2] `if (!shouldRunShowPost(latch) && false) return@post` still
+    *mentions* the latch and still *contains* an early return, so every
+    substring criterion the old arm used stays satisfied while the guard is
+    dead. A conjunction that contains a bare `false` (or a disjunction with a
+    bare `true`) is decided by that literal, not by the latch."""
+    for part in re.split(r"&&|\|\|", cond):
+        t = part.strip().strip("()").strip()
+        if t in ("true", "false", "!true", "!false"):
+            return True
+    return False
+
+
+def paren_cond_at(text: str, close_idx: int) -> tuple[str | None, int]:
+    """Condition text of the `(…)` group whose ')' sits at [close_idx]."""
+    depth = 0
+    i = close_idx
+    while i >= 0:
+        if text[i] == ")":
+            depth += 1
+        elif text[i] == "(":
+            depth -= 1
+            if depth == 0:
+                return text[i + 1:close_idx], i
+        i -= 1
+    return None, -1
+
+
+def enclosing_conds(text: str, pos: int) -> list[str]:
+    """Header conditions of every brace block that textually encloses [pos].
+
+    [wide-1024 C3] The old scan only looked at the hide() call's own line and
+    the line above, so the canonical Kotlin block form
+
+        if (controller.isShown) {
+            controller.hide()
+        }
+
+    was invisible: the brace-brace form failed `prev.rstrip().endswith(")")`.
+    Conditions are read from the block HEADERS (if / while / when), brace
+    matched backwards, so the spelling of the body does not matter."""
+    out: list[str] = []
+    depth = 0
+    i = pos - 1
+    while i >= 0:
+        c = text[i]
+        if c == "}":
+            depth += 1
+        elif c == "{":
+            if depth == 0:
+                j = i - 1
+                while j >= 0 and text[j] in " \t\n":
+                    j -= 1
+                if j >= 0 and text[j] == ")":
+                    cond, open_at = paren_cond_at(text, j)
+                    if cond is not None:
+                        head = text[max(0, open_at - 12):open_at]
+                        if re.search(r"\b(if|while|when)\s*$", head):
+                            out.append(cond)
+            else:
+                depth -= 1
+        i -= 1
+    return out
+
+
+def hide_gates(src: str) -> list[tuple[int, list[str]]]:
+    """(line, governing conditions) for every hide() CALL site."""
+    out: list[tuple[int, list[str]]] = []
+    for m in re.finditer(r"\bhide\s*\(\s*\)", src):
+        pre = src[max(0, m.start() - 30):m.start()]
+        if re.search(r"\bfun\s*$", pre):
+            continue  # the declaration itself
+        line_start = src.rfind("\n", 0, m.start()) + 1
+        prefix = src[line_start:m.start()]
+        conds: list[str] = []
+        for im in re.finditer(r"\bif\s*\(", prefix):
+            c, _ = paren_cond(prefix, im.end() - 1)
+            conds.append(c)
+        if re.search(r"takeIf|takeUnless", prefix):
+            conds.append(prefix)
+        conds.extend(enclosing_conds(src, m.start()))
+        out.append((line_of(src, m.start()), conds))
+    return out
+
+
 # --------------------------------------------------------------------------
 # analysis
 # --------------------------------------------------------------------------
@@ -190,6 +277,20 @@ def analyse(ctrl: str, svc: str) -> list[tuple[str, bool, str]]:
             post = re.search(r"\.post\s*[({]", body)
             if post and pos > post.start():
                 bad.append(f"{label} writes {intent} only AFTER queueing the post")
+        # [wide-1024 C1] The entry must PUBLISH the intent and keep it: a
+        # second write of the opposite value (hide() re-latching `= true`, or
+        # show() re-latching `= false`) silently undoes the publication while
+        # every position/substring criterion above stays satisfied.
+        if assign_positions(show_f[0], intent, "false"):
+            bad.append(
+                f"show() re-latches {intent} = false after publishing it — the intent "
+                "is dropped again before the post runs"
+            )
+        if assign_positions(hide_f[0], intent, "true"):
+            bad.append(
+                f"hide() re-latches {intent} = true after publishing it — the hide "
+                "intent is overwritten and a queued attach survives"
+            )
         if bad:
             out.append((CRIT_C1, False, "; ".join(bad)))
         else:
@@ -208,16 +309,25 @@ def analyse(ctrl: str, svc: str) -> list[tuple[str, bool, str]]:
         else:
             runnable = block_at(body, post.end() - 1)
             guard = -1
+            guard_cond, guard_lit = "", False
             for m in re.finditer(r"\bif\s*\(", runnable):
                 cond, close = paren_cond(runnable, m.end() - 1)
                 if not re.search(r"(?<![\w])" + re.escape(intent) + r"(?!\w)", cond):
                     continue
                 tail = runnable[close + 1: close + 120].lstrip()
                 if tail.startswith("{") or tail.startswith("return"):
-                    guard = m.start()
+                    guard, guard_cond = m.start(), cond
+                    guard_lit = literal_decides(cond)
                     break
             attach_at = runnable.find("attach(")
-            if guard < 0:
+            if guard >= 0 and guard_lit:
+                out.append((
+                    CRIT_C2, False,
+                    f"the posted show Runnable's {intent} guard is decided by a literal "
+                    f"(`{guard_cond.strip()}`) — the early return can never fire, so a "
+                    "hide inside the queue hop cannot cancel the attach",
+                ))
+            elif guard < 0:
                 out.append((
                     CRIT_C2, False,
                     f"the posted show Runnable never checks {intent} — a hide inside "
@@ -238,33 +348,15 @@ def analyse(ctrl: str, svc: str) -> list[tuple[str, bool, str]]:
         viol.append("could not derive the real attach-state field (no `= true` inside attach())")
     else:
         for path, src in ((CONTROLLER, ctrl), (SERVICE, svc)):
-            for m in re.finditer(r"\bhide\s*\(\s*\)", src):
-                pre = src[max(0, m.start() - 20):m.start()]
-                if re.search(r"\bfun\s*$", pre):
-                    continue  # the declaration itself
-                line_start = src.rfind("\n", 0, m.start()) + 1
-                prefix = src[line_start:m.start()]
-                cond = None
-                cond_line = None
-                if re.search(r"\bif\s*\(", prefix):
-                    for im in re.finditer(r"\bif\s*\(", prefix):
-                        c, _ = paren_cond(prefix, im.end() - 1)
-                        cond, cond_line = c, line_of(src, line_start + im.start())
-                else:
-                    # `if (cond)\n    hide()` — single-statement body form
-                    prev_end = line_start - 1
-                    prev_start = src.rfind("\n", 0, prev_end) + 1
-                    prev = src[prev_start:prev_end]
-                    if re.search(r"\bif\s*\(", prev) and prev.rstrip().endswith(")"):
-                        im = re.search(r"\bif\s*\(", prev)
-                        c, _ = paren_cond(prev, im.end() - 1)
-                        cond, cond_line = c, line_of(src, prev_start + im.start())
-                if cond is None:
-                    continue
-                if re.search(r"(?<![\w])" + re.escape(real) + r"(?!\w)", cond):
+            for line_no, conds in hide_gates(src):
+                hits = [
+                    c for c in conds
+                    if re.search(r"(?<![\w])" + re.escape(real) + r"(?!\w)", c)
+                ]
+                if hits:
                     viol.append(
-                        f"{path.rsplit('/', 1)[-1]}:{line_of(src, m.start())} "
-                        f"hide() gated on `{cond.strip()}` — `{real}` lags the intent "
+                        f"{path.rsplit('/', 1)[-1]}:{line_no} "
+                        f"hide() gated on `{hits[0].strip()}` — `{real}` lags the intent "
                         "by a queue hop, so this drops the hide"
                     )
         if viol:
@@ -424,6 +516,29 @@ def selftest() -> int:
     merged = _mutate(ctrl, "    @Volatile\n    private var desiredShown: Boolean = false\n", "", "c8")
     merged = merged.replace("desiredShown", "isShown")
     good &= arm("c4-merged-fields", merged, svc, ["C4"])
+
+    # ── wide-1024 witness arms (each was green before this branch) ──────────
+    # arm 10: hide() publishes `false` then immediately re-latches `true` —
+    #         position/substring criteria stay satisfied, the intent is gone.
+    good &= arm("c1-hide-relatch-true", _mutate(
+        ctrl, HIDE_HEAD, "        desiredShown = false\n        desiredShown = true\n", "c9"),
+        svc, ["C1"])
+
+    # arm 11: the posted guard mentions the latch and still returns early, but
+    #         a literal `&& false` decides it.
+    good &= arm("c2-guard-literal-false", _mutate(
+        ctrl,
+        "            if (!shouldRunShowPost(desiredShown)) return@post\n",
+        "            if (!shouldRunShowPost(desiredShown) && false) return@post\n", "c10"),
+        svc, ["C2"])
+
+    # arm 12: the canonical Kotlin BLOCK form of the gated hide — the old
+    #         line-prefix scan could not see `) {` + a body line.
+    good &= arm("c3-service-braced-gate", ctrl, _mutate(
+        svc, SVC_GATE1,
+        "            if (controller.isShown) {\n"
+        "                controller.hide()\n"
+        "            }\n            return\n", "c11"), ["C3"])
 
     # arm 9: missing file must be red, never silently green
     d = tmp / "missing"

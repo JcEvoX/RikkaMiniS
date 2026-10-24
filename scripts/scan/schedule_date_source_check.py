@@ -134,6 +134,89 @@ def strip_calls(text, marker):
         i = k
 
 
+def brace_body_after(src, start):
+    """Body of a function whose declaration starts at [start]: braced body or,
+    for `= expr` bodies, the expression up to the end of the statement."""
+    i = src.find("(", start)
+    if i < 0:
+        return None
+    depth = 0
+    close = -1
+    for k in range(i, len(src)):
+        if src[k] == "(":
+            depth += 1
+        elif src[k] == ")":
+            depth -= 1
+            if depth == 0:
+                close = k
+                break
+    if close < 0:
+        return None
+    j = close + 1
+    while j < len(src) and src[j] in " \t\n":
+        j += 1
+    # skip a return type annotation up to the body marker
+    while j < len(src) and src[j] not in "{=":
+        if src[j] == "(":  # e.g. `: () -> Unit`
+            d = 0
+            for k in range(j, len(src)):
+                if src[k] == "(":
+                    d += 1
+                elif src[k] == ")":
+                    d -= 1
+                    if d == 0:
+                        j = k
+                        break
+        j += 1
+    if j >= len(src):
+        return None
+    if src[j] == "{":
+        depth = 0
+        for k in range(j, len(src)):
+            if src[k] == "{":
+                depth += 1
+            elif src[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    return src[j:k + 1]
+        return None
+    end = src.find("\n", j)
+    return src[j:len(src) if end < 0 else end]
+
+
+def param_names(src, start):
+    """Top-level parameter names of the declaration at [start]."""
+    i = src.find("(", start)
+    depth = 0
+    close = -1
+    for k in range(i, len(src)):
+        if src[k] == "(":
+            depth += 1
+        elif src[k] == ")":
+            depth -= 1
+            if depth == 0:
+                close = k
+                break
+    if close < 0:
+        return []
+    names = []
+    for part in top_level_args(src[i + 1:close]):
+        m = re.match(r"\s*(?:vararg\s+)?([A-Za-z_]\w*)\s*:", part)
+        if m:
+            names.append(m.group(1))
+    return names
+
+
+def returned_expressions(body):
+    """Every expression the body hands back (returns + `= expr` tail)."""
+    outs = [m.group(1).strip() for m in re.finditer(r"\breturn\s+([^\n;]+)", body)]
+    if not outs:
+        m = re.search(r"=\s*([^\n{}]+)$", body.strip())
+        if m:
+            outs.append(m.group(1).strip())
+    return outs
+
+
 def top_level_args(argtext):
     """Split a call's argument text on top-level commas."""
     parts, depth, cur = [], 0, []
@@ -190,6 +273,77 @@ def violations_scheduler(src, label):
     if "internal object ScheduledRunDating {" not in src:
         bad.append("%s:1: ScheduledRunDating is gone — the dating decision is no longer a "
                    "pure, harness-covered unit" % label)
+    else:
+        # [wide-1024 dataflow] Routing the funnel through `gateDateOnSettle` only
+        # proves a call happened. The DECISION is which day the helper returns:
+        # `= settleDate` (one identifier) re-opens ISSUE-09A in full while every
+        # criterion above stays satisfied.
+        at = src.find("fun gateDateOnSettle")
+        body = brace_body_after(src, at) if at >= 0 else None
+        if body is None:
+            bad.append("%s:1: gateDateOnSettle cannot be read (fail-closed) — the dating "
+                       "decision is no longer a readable unit" % label)
+        else:
+            params = param_names(src, at)
+            sched = params[0] if params else "scheduledDate"
+            settle = params[1] if len(params) > 1 else "settleDate"
+            outs = returned_expressions(body)
+            if not outs:
+                bad.append("%s:1: gateDateOnSettle returns nothing readable (fail-closed)"
+                           % label)
+            for expr in outs:
+                if re.search(r"\b%s\b" % re.escape(settle), expr):
+                    bad.append(
+                        "%s:1: gateDateOnSettle returns the SETTLE day (`%s`) — a run fired "
+                        "23:55 that settles 00:06 pins tomorrow into lastRunDate and the "
+                        "whole next day degrades to ALREADY_RAN (ISSUE-09A re-opened)"
+                        % (label, expr[:60]))
+                elif re.search(r"now\(|currentTimeMillis|LocalDate\.now", expr):
+                    bad.append(
+                        "%s:1: gateDateOnSettle reads the wall clock (`%s`) — the date must "
+                        "be the run's SCHEDULED day, not a re-read of the clock at settle time"
+                        % (label, expr[:60]))
+                elif not re.search(r"\b%s\b" % re.escape(sched), expr):
+                    bad.append(
+                        "%s:1: gateDateOnSettle returns `%s`, which is not the scheduled day "
+                        "`%s` — the run is credited to the wrong calendar day"
+                        % (label, expr[:60], sched))
+    return bad
+
+
+def align_call_gaps(scope_body, label, where):
+    """Every alignBareDateEnd() call must align THE CALLER'S date string.
+
+    [wide-1024 dataflow] `alignBareDateEnd(it, "", zone)` keeps the call, keeps
+    the order and keeps the helper — and turns the inclusive end-of-day into a
+    no-op, so `--start D --end D` is a zero-width window again. The argument is
+    therefore judged by where it comes from: it must be an identifier that the
+    same scope parsed as a date."""
+    bad = []
+    for _at, argtext in call_args(scope_body, "alignBareDateEnd("):
+        args = top_level_args(argtext)
+        if len(args) < 3:
+            bad.append("%s:1: alignBareDateEnd in %s no longer takes (epochMs, raw, zone) — "
+                       "the alignment rule moved; re-anchor this gate" % (label, where))
+            continue
+        raw = args[1].strip()
+        # A string literal (or the empty string) can never be the caller's date:
+        # `""` fails DATE_ONLY, so the alignment silently becomes a no-op.
+        idents = [
+            t for t in re.findall(r"[A-Za-z_]\w*", raw)
+            if t not in ("null", "true", "false")
+        ]
+        if raw.startswith('"') or not idents:
+            bad.append("%s:1: alignBareDateEnd in %s receives `%s` as the raw date — the "
+                       "bare-date decision needs the CALLER'S string; a literal (or empty "
+                       "string) never matches YYYY-MM-DD and the inclusive end-of-day is "
+                       "silently skipped" % (label, where, raw[:40]))
+            continue
+        candidate = idents[-1]
+        if not re.search(r"\b\w*[Pp]arse\w*\s*\(\s*%s\b" % re.escape(candidate), scope_body):
+            bad.append("%s:1: alignBareDateEnd in %s aligns `%s`, which this scope never "
+                       "parsed — the value aligned is not the caller's date string"
+                       % (label, where, candidate))
     return bad
 
 
@@ -225,6 +379,7 @@ def violations_calendar(src, label):
             if needed not in pure:
                 bad.append("%s:1: resolveRangePure lost %s — --today/--days must walk local "
                            "calendar days, not fixed offsets" % (label, needed))
+        bad.extend(align_call_gaps(pure, label, "resolveRangePure"))
 
     if "internal fun alignBareDateEnd(" not in src:
         bad.append("%s:1: alignBareDateEnd helper is gone" % label)
@@ -246,6 +401,7 @@ def violations_calendar(src, label):
                        "date must go through alignBareDateEnd" % label)
         if ALIGN_CALL not in fb:
             bad.append("%s:1: freebusy --end must route through %s" % (label, ALIGN_CALL))
+        bad.extend(align_call_gaps(fb, label, "freebusy"))
 
     crt = member_slice(src, "private fun doCreate(")
     if crt is None:
@@ -434,6 +590,25 @@ def violations_strict_date_parser(src, label, marker, what):
         bad.append("%s:1: %s parses %s in the DEFAULT LENIENT mode — an out-of-range field is "
                    "rolled over (2026-02-30 → March 2) and the command answers for a DIFFERENT "
                    "day instead of refusing" % (label, marker.strip(), what))
+        return bad
+    # [wide-1024 order] Presence is not the decision: a later
+    # `isLenient = true` (or `setLenient(true)`) overrides the strict
+    # assignment, so the parser rolls `2026-02-30` into March exactly as
+    # before while the criterion above stays satisfied.
+    modes = [
+        (m.start(), m.group(1))
+        for m in re.finditer(r"(?:\bisLenient\s*=\s*|\bsetLenient\s*\(\s*)(true|false)", body)
+    ]
+    relaxed = [at for at, val in modes if val == "true"]
+    if relaxed:
+        bad.append("%s:1: %s re-enables LENIENT mode (`isLenient = true` / `setLenient(true)`) "
+                   "after the strict assignment — the later write wins, so %s again rolls an "
+                   "out-of-range field over instead of refusing it"
+                   % (label, marker.strip(), what))
+    elif modes and modes[-1][1] != "false":
+        bad.append("%s:1: the LAST leniency write in %s is not `false` — the effective mode is "
+                   "decided by the final assignment, not by the presence of one"
+                   % (label, marker.strip()))
     return bad
 
 
@@ -760,6 +935,27 @@ BAD_PARSER_REWRITTEN = GOOD_STRICT_PARSER.replace("SimpleDateFormat", "MyFormats
 
 BAD_PARSER_RENAMED = GOOD_STRICT_PARSER.replace("private fun parseDate(", "private fun parseDay(")
 
+# ── [wide-1024] witness arms: each of these was GREEN before this branch ───
+# dataflow: the dating funnel is still routed through the helper, but the
+# helper credits the SETTLE day (one identifier) — ISSUE-09A in full.
+BAD_RUNNER_SETTLE_DAY = GOOD_RUNNER.replace(
+    "fun gateDateOnSettle(scheduledDate: String, settleDate: String, outcome: String): String = scheduledDate",
+    "fun gateDateOnSettle(scheduledDate: String, settleDate: String, outcome: String): String = settleDate",
+)
+
+# dataflow: the alignment call is still there, still after the parse — but it
+# aligns an empty string, so `--start D --end D` is a zero-width window again.
+BAD_CALENDAR_ALIGN_EMPTY = GOOD_CALENDAR.replace(
+    "alignBareDateEnd(it, endStr, TimeZone.getDefault())",
+    'alignBareDateEnd(it, "", TimeZone.getDefault())',
+)
+
+# order: the strict assignment survives, a later lenient one overrides it.
+BAD_PARSER_LENIENT_REENABLED = GOOD_STRICT_PARSER.replace(
+    "                    isLenient = false\n",
+    "                    isLenient = false\n                    isLenient = true\n",
+)
+
 STRICT_PARSERS_MARK = "STRICT_DATE_PARSERS_SELFTEST=PASS (4 parsers x 4 arms)"
 
 
@@ -789,6 +985,11 @@ def run_selftest():
             BAD_PARSER_REWRITTEN, "fixture", "private fun parseDate(", "--start/--end"), ">0"),
         ("parsers/renamed", violations_strict_date_parser(
             BAD_PARSER_RENAMED, "fixture", "private fun parseDate(", "--start/--end"), ">0"),
+        # ── wide-1024 witness arms ──
+        ("runner/settle-day-returned", violations_scheduler(BAD_RUNNER_SETTLE_DAY, "fixture"), ">0"),
+        ("calendar/aligns-empty-raw", violations_calendar(BAD_CALENDAR_ALIGN_EMPTY, "fixture"), ">0"),
+        ("parsers/lenient-reenabled", violations_strict_date_parser(
+            BAD_PARSER_LENIENT_REENABLED, "fixture", "private fun parseDate(", "--start/--end"), ">0"),
     ]
     problems = []
     for name, bad, expected in cases:
@@ -803,6 +1004,17 @@ def run_selftest():
         problems.append("runner/settle-clock: the routing rule did not fire")
     if not any("zero-width" in b for b in violations_calendar(BAD_CALENDAR_RAW_PARSE, "fixture")):
         problems.append("calendar/raw-parse: the raw-parse rule did not fire")
+    # [wide-1024] each witness arm must be red for ITS OWN rule, not by accident
+    if not any("returns the SETTLE day" in b
+               for b in violations_scheduler(BAD_RUNNER_SETTLE_DAY, "fixture")):
+        problems.append("runner/settle-day-returned: the returned-day rule did not fire")
+    if not any("as the raw date" in b
+               for b in violations_calendar(BAD_CALENDAR_ALIGN_EMPTY, "fixture")):
+        problems.append("calendar/aligns-empty-raw: the raw-date-origin rule did not fire")
+    if not any("re-enables LENIENT mode" in b
+               for b in violations_strict_date_parser(
+                   BAD_PARSER_LENIENT_REENABLED, "fixture", "private fun parseDate(", "--start/--end")):
+        problems.append("parsers/lenient-reenabled: the effective-mode rule did not fire")
     if not any("24h constant" in b for b in violations_calendar(BAD_CALENDAR_RAW_PARSE, "fixture")):
         problems.append("calendar/raw-parse: the DST-constant rule did not fire")
     if not any("alignBareDateEnd" in b for b in violations_calendar(BAD_CALENDAR_RAW_PARSE, "fixture")):
