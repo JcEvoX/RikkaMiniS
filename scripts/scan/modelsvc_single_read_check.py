@@ -56,18 +56,37 @@ ACCEPT_LOOP = "private fun runAcceptLoop("
 NEXT_MEMBER = "private fun handleClient("
 
 
+# [wide-1024 12-misc-b] Every way this file can pull the body off disk. The old
+# count matched ONE spelling (`requestFile.readText()`), so
+# `requestFile.inputStream().bufferedReader().use { it.readText() }` — a second
+# full read plus a second parse of a multi-MB body — was invisible. The rule is
+# "the body is read once", so the criterion counts READS, not spellings.
+READ_API = (r"(?:readText|readLines|readBytes|inputStream|bufferedReader|"
+            r"useLines|readChannel|copyTo|lines\s*\()")
+READ_SITE_RE = re.compile(r"requestFile\s*\.\s*" + READ_API)
+# `thread { … }` needs no parentheses (all params defaulted, trailing lambda) —
+# the old detector only looked for the literal "thread(".
+THREAD_SPAWN_RE = re.compile(r"(?<!\w)thread\s*[({]|\bThread\s*\(|\bExecutors\b")
+
+
+def read_sites(src):
+    """1-based line of EVERY read site (two reads on one line = two sites)."""
+    return [src[: m.start()].count("\n") + 1 for m in READ_SITE_RE.finditer(src)]
+
+
 def lines_of(src, needle):
     return [i + 1 for i, line in enumerate(src.split("\n")) if needle in line]
 
 
 def check_service(src):
     v = []
-    reads = lines_of(src, READ_CALL)
+    reads = read_sites(src)
     if len(reads) != 1:
         where = ", ".join(str(n) for n in reads) or "-"
         v.append(
-            "ModelExecutionService.kt:%s: %d x '%s' (exactly 1 expected — the "
-            "body must be read once per run)" % (where, len(reads), READ_CALL)
+            "ModelExecutionService.kt:%s: %d x read of requestFile (exactly 1 "
+            "expected — the body must be read once per run, whatever the spelling)"
+            % (where, len(reads))
         )
     if CAPTURE_CALL not in src:
         v.append(
@@ -81,6 +100,12 @@ def check_service(src):
                 "ModelExecutionService.kt:%d: leftover per-site local "
                 "'requestText' (re-read path is back)" % n
             )
+    if re.search(r"JSONObject\s*\(\s*requestFile", src):
+        v.append(
+            "ModelExecutionService.kt:%d: a second parse is built straight from "
+            "requestFile — the captured body (CapturedRequestBody) must be the only "
+            "reader" % (read_sites(src) or [0])[0]
+        )
     if SITE_PARSE in src:
         v.append(
             "ModelExecutionService.kt:%d: per-site parse '%s' is back"
@@ -109,11 +134,12 @@ def check_offload(src):
     if loop is None:
         v.append("NativeOffload.kt: 'runAcceptLoop' not found (ROT — update this gate)")
         return v
-    for n in lines_of(loop, "thread("):
-        v.append(
-            "NativeOffload.kt: runAcceptLoop (line %d of the member) spawns a "
-            "thread — accept must delegate to the bounded pool" % n
-        )
+    for n, line in enumerate(loop.split("\n"), 1):
+        if THREAD_SPAWN_RE.search(line):
+            v.append(
+                "NativeOffload.kt: runAcceptLoop (line %d of the member) spawns a "
+                "thread — accept must delegate to the bounded pool" % n
+            )
     if POOL_SUBMIT not in loop:
         v.append(
             "NativeOffload.kt: runAcceptLoop does not hand clients to the "
@@ -126,6 +152,22 @@ def check_offload(src):
         )
     if POOL_DECL not in src:
         v.append("NativeOffload.kt: '%s' missing" % POOL_DECL)
+    # [wide-1024 12-misc-b] `permits.tryAcquire() || true` keeps the call and makes
+    # the bound a constant: every submit spawns a worker, above the cap.
+    for m in re.finditer(r"permits\s*\.\s*tryAcquire\s*\(\s*\)", src):
+        tail = src[m.end(): m.end() + 8].lstrip()
+        if tail.startswith(("||", "&&", "?:", ".")):
+            v.append(
+                "NativeOffload.kt:%d: the 'tryAcquire' verdict is combined with "
+                "another expression (%r) — the spawn bound becomes constant and "
+                "every submit starts a worker" % (src[: m.start()].count("\n") + 1, tail[:6])
+            )
+            break
+    if not re.search(r"if\s*\(\s*spawn\s*\)", src):
+        v.append(
+            "NativeOffload.kt: the tryAcquire verdict no longer gates the spawn "
+            "(`if (spawn)` missing) — the permit bound is decoration"
+        )
     if TRY_ACQUIRE not in src:
         v.append(
             "NativeOffload.kt: 'tryAcquire' bound missing — a submit could "
@@ -310,6 +352,26 @@ BAD_OFFLOAD_NO_BOUND = GOOD_OFFLOAD.replace(
 )
 
 
+# ── [wide-1024 12-misc-b] witness fixtures: the call stays, the effect goes ──
+# a second read through a different receiver spelling (ISSUE-12a)
+BAD_SERVICE_REPOINT_READ = GOOD_SERVICE.replace(
+    "            val req = requestBody.jsonOrThrow()",
+    "            val req = JSONObject(requestFile.inputStream().bufferedReader()"
+    ".use { it.readText() })",
+)
+# the permit verdict short-circuited to constant true (ISSUE-12b)
+BAD_OFFLOAD_SHORT_CIRCUIT = GOOD_OFFLOAD.replace(
+    "            permits.tryAcquire()\n",
+    "            permits.tryAcquire() || true\n",
+)
+# a thread spawned next to the pool submit, with no parentheses
+BAD_OFFLOAD_BARE_THREAD = GOOD_OFFLOAD.replace(
+    "            pool.submit(client)\n",
+    "            pool.submit(client)\n"
+    "            kotlin.concurrent.thread { handleClient(client, 0L) }\n",
+)
+
+
 def selftest():
     failures = []
 
@@ -344,6 +406,19 @@ def selftest():
     expect_trip("unbounded-submit fixture", bad_nobound, "tryAcquire")
     expect_trip("unbounded-submit fixture", bad_nobound, "never released")
 
+    repoint = check_service(BAD_SERVICE_REPOINT_READ)
+    expect_trip("re-pointed second read", repoint, "exactly 1 expected")
+    expect_trip("re-pointed second read", repoint, "straight from requestFile")
+
+    short = check_offload(BAD_OFFLOAD_SHORT_CIRCUIT)
+    expect_trip("short-circuited permit", short, "combined with another expression")
+
+    bare = check_offload(BAD_OFFLOAD_BARE_THREAD)
+    expect_trip("bare-lambda thread", bare, "spawns a thread")
+
+    print("selftest re-pointed second read -> %d violation(s)" % len(repoint))
+    print("selftest short-circuited permit -> %d violation(s)" % len(short))
+    print("selftest bare-lambda thread     -> %d violation(s)" % len(bare))
     print("selftest compliant service      -> %d violation(s)" % len(good_service))
     print("selftest compliant offload      -> %d violation(s)" % len(good_offload))
     print("selftest three-read service     -> %d violation(s)" % len(bad_reads))

@@ -52,6 +52,22 @@ def strip_strings(src):
     return re.sub(r'"(?:[^"\\\n]|\\.)*"', '""', src)
 
 
+def rhs_is_exact(text, field, value):
+    """True when some `<field> = <value>` has NOTHING appended to `value`.
+
+    [wide-1024 12-misc-b] A substring test ("outcomeKnown = result.outcomeKnown"
+    in text) is satisfied by its own prefix, so `= result.outcomeKnown || true`
+    passes — the field is then hardcoded `true` while every token the criterion
+    looks for is still present. The value has to END at the assignment: only a
+    `,` / `)` / newline may follow.
+    """
+    for m in re.finditer(r"\b%s\s*=\s*%s" % (re.escape(field), re.escape(value)), text):
+        tail = text[m.end(): m.end() + 8].lstrip()
+        if not tail or tail[0] in ",)":
+            return True
+    return False
+
+
 def find_wrap(text, anchor):
     """Index of the `CommandResult(` call whose tail contains `anchor`."""
     for m in re.finditer(r"CommandResult\s*\(", text):
@@ -73,7 +89,7 @@ def analyse(text):
     if wrap is None:
         out.append((CRIT_L1, False, "no execute() re-wrap with truncated = outputTruncated found", -1))
     else:
-        ok = "outcomeKnown = result.outcomeKnown" in wrap
+        ok = rhs_is_exact(wrap, "outcomeKnown", "result.outcomeKnown")
         out.append((CRIT_L1, ok, "" if ok else "outcomeKnown dropped in the re-wrap: %r" % wrap[-160:], line))
 
     shell = strip_strings(text[SHELL])
@@ -102,11 +118,33 @@ def analyse(text):
         )
     )
 
-    mapped = "outcomeKnown = outcomeKnown," in shell
-    out.append((CRIT_MAP, mapped, "" if mapped else "toToolExecutionResult() does not pass outcomeKnown", -1))
+    # [wide-1024 12-misc-b] Judged on the MAPPING function only, and the value
+    # has to survive it: `<ctor>(… outcomeKnown = outcomeKnown …).copy(outcomeKnown = true)`
+    # passes the substring test and hardcodes `true` one hop later.
+    m = re.search(
+        r"fun ToolResultShell\.toToolExecutionResult\(\)[\s\S]*?(?=\n\n|\Z)", shell)
+    fn = m.group(0) if m else ""
+    mapped = bool(fn) and rhs_is_exact(fn, "outcomeKnown", "outcomeKnown")
+    overwritten = bool(re.search(r"\.(?:copy|also|let|apply|run)\s*[(\{][\s\S]*?outcomeKnown", fn))
+    out.append((
+        CRIT_MAP,
+        mapped and not overwritten,
+        "" if (mapped and not overwritten) else
+        "toToolExecutionResult() does not pass outcomeKnown (extracted=%s overwritten=%s)"
+        % (bool(fn), overwritten),
+        -1,
+    ))
 
     prompt = strip_strings(text[PROMPT])
-    good = re.search(r"AgentRunEvent\.ToolFinished\([^)]*resultKnown = result\.outcomeKnown", prompt) is not None
+    # [wide-1024 12-misc-b] `resultKnown = result.outcomeKnown || !result.outcomeKnown`
+    # matches the positive regex and dodges the `= true` ban while evaluating to
+    # `true`. Read the argument and require the value to END there.
+    m4 = re.search(r"AgentRunEvent\.ToolFinished\(", prompt)
+    args4 = ""
+    if m4:
+        close = prompt.find(")", m4.end())
+        args4 = prompt[m4.end(): close] if close > 0 else ""
+    good = rhs_is_exact(args4, "resultKnown", "result.outcomeKnown")
     bad = re.search(r'AgentRunEvent\.ToolFinished\([^)]*resultKnown = true', prompt) is not None
     out.append(
         (
@@ -189,6 +227,26 @@ COMPLIANT = {
 }
 
 BREAKERS = {}
+# ── [wide-1024 12-misc-b] witness breakers: every token the old criterion
+# matched is still present; the VALUE is hardcoded one expression later.
+# B6: the re-wrap keeps the assignment and ORs it to constant true.
+BREAKERS[6] = (
+    [(COORD, "                outcomeKnown = result.outcomeKnown,\n",
+      "                outcomeKnown = result.outcomeKnown || true,\n")],
+    CRIT_L1,
+)
+# B7: the mapping passes outcomeKnown and then .copy()s it to true.
+BREAKERS[7] = (
+    [(SHELL, "                outcomeKnown = outcomeKnown,\n            )\n",
+      "                outcomeKnown = outcomeKnown,\n            ).copy(outcomeKnown = true)\n")],
+    CRIT_MAP,
+)
+# B8: the excluded middle — `x || !x` is `true` without the literal.
+BREAKERS[8] = (
+    [(PROMPT, "resultKnown = result.outcomeKnown",
+      "resultKnown = result.outcomeKnown || !result.outcomeKnown")],
+    CRIT_L4,
+)
 # B1: the pre-fix shape — re-wrap drops outcomeKnown
 BREAKERS[1] = (
     [(COORD, "                outcomeKnown = result.outcomeKnown,\n", "")],
