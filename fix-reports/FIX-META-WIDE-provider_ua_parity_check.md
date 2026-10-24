@@ -57,11 +57,19 @@ selftest 逐行输出新增四行计数（`voice factory clobber` / `gemini term
 - **L1 本门（真树）**：`python3 scripts/scan/provider_ua_parity_check.py .` → `PASS provider_ua_parity_check (...)` rc=0；`--selftest` → 全臂符合预期 + `PROVIDER_UA_PARITY_SELFTEST=PASS`。
 - **L2 见证反攻**：上表 3/3 `old_rc=0 → new_rc=1`，restore=True；D2b 守卫形状仍 rc=1。
 - **L3 邻门**：`provider_rpc_symmetry_check` rc=0、`provider_boundary_guard` rc=0。
-- **L4 全量**：`scan.sh` → `Summary: 112 passed, 0 failed`；`test_scan.py` 全量见最终回报（门数 / 夹具数不变；两门 `test_da1019_gates` / `test_da1025_gates` 单组复跑全 ✅）。
+- **L4 全量**：`scan.sh` → `Summary: 112 passed, 0 failed`；分支 CI **ALL 344 CASES PASS**（见 §6）；本机 `test_da1019_gates` / `test_da1025_gates` / `test_da1026_gates` 单组复跑全 ✅。门数 / 夹具数不变：112 / 344。
 
 ## 6. CI run
 
-见提交推送后的补充（HEAD sha 与 run 读数在最终回报里给出）。
+- 分支 CI（手动 dispatch，`on: push` 只认 main）：**run `40136767900` / #2640 / job `120999811778`**，`conclusion=success`，attempt 1。
+- 三方 sha 逐字符一致：本地 HEAD = 远端分支 ref = `run.head_sha` = `02aad4c5326eae83afab27ad477edab71039e044`。
+- 26 步 `not_ok=[]`，唯一 `skipped` = **Publish to Releases**（`if: github.ref == 'refs/heads/main'` 门控，分支预期）。
+- 日志判读（1,484,497 B）：
+  - `Summary: 112 passed, 0 failed` 恰 **1** 条（该后缀无其它命中）；
+  - `ALL 344 CASES PASS` 恰 **1** 条；
+  - ` e: ` 行 **0** 条（无编译错误回显）；
+  - `PROVIDER_RPC_SELFTEST=PASS` / `PROVIDER_UA_PARITY_SELFTEST=PASS` 各 1 条（`✅ … selftest has teeth`），即新增臂在 CI 里被 `test_scan.py` 断言见证（门 selftest 逐臂 stdout 不进 CI 日志，标记行是权威见证）；
+  - 含 `FAILED` 的行 6 条，逐条确认**全是 PASSED 用例名**（如 `slot denied produces FAILED without calling provider PASSED`），游离失败 0。
 
 ## 7. 残留（均带三件）
 
