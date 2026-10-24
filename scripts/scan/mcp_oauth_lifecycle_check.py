@@ -681,6 +681,60 @@ def _secret_handoff_readers(code_scoped):
     return out
 
 
+def _if_guard_around(body, pos):
+    """(condition, consequent) of the innermost `if (...)` containing [pos]."""
+    best = None
+    for m in re.finditer(r"\bif\s*\(", body):
+        if m.start() > pos:
+            break
+        close = _paren_end(body, m.end() - 1)
+        if close < 0 or close < pos:
+            continue
+        best = (m.end() - 1, close)
+    if best is None:
+        return None, None
+    open_idx, close = best
+    k = close + 1
+    while k < len(body) and body[k] in " \t\r\n":
+        k += 1
+    if k < len(body) and body[k] == "{":
+        block = brace_block(body, k)
+        consequent = block if block else body[k:]
+    else:
+        eol = body.find("\n", k)
+        consequent = body[k:eol if eol >= 0 else len(body)]
+    return body[open_idx + 1:close], consequent
+
+
+def _ordering_direction(cond, consequent, bridge_left, op):
+    """(ok, why) — the expiry guard must stop the OLDER copy, never the newer.
+
+    [wide-1024 C2] The criterion only required that SOME ordering operator
+    appears between a bridge field and the stored copy. Flipping the shipped
+    `if (bridgeSeconds < storedSeconds) return null` into `>=` keeps a
+    comparison in the body while the promotion now returns early for every
+    bridge the guest just refreshed: the host keeps its superseded token and
+    the guest's next refresh is `invalid_grant`. So the DIRECTION is judged
+    against the guard's shape: an early exit must be taken on the older side, a
+    positive guard must admit the newer side. Anything else (no `if`, or an
+    ordering that matches neither shape) is fail-closed red.
+    """
+    if cond is None:
+        return False, ("the expiry ordering is not inside an `if` guard — its "
+                       "direction cannot be read (fail-closed)")
+    newer = op in (">", ">=") if bridge_left else op in ("<", "<=")
+    older = op in ("<", "<=") if bridge_left else op in (">", ">=")
+    early_exit = re.search(r"^\s*(?:\{\s*)?return\b", consequent or "") is not None
+    if early_exit and not older:
+        return False, ("the ordering guard exits early on the NEWER side — every "
+                       "bridge the in-guest CLI just refreshed is discarded and the "
+                       "host refreshes the superseded token (invalid_grant)")
+    if not early_exit and not newer:
+        return False, ("the ordering guard admits the OLDER bridge — a copy left "
+                       "over from before the host authorized rolls the token back")
+    return True, ""
+
+
 def check_bridge_promotion(store, store_scoped, merge):
     """[dv26-A2] C1-C3 — the guest's refreshed token must survive a config save.
 
@@ -867,6 +921,7 @@ def check_bridge_promotion(store, store_scoped, merge):
         return head != param and head not in alias_fields
 
     ordering = False
+    direction_bad = ""
     compared = set()
     for m in COMPARISON_RE.finditer(body):
         left, op, right = m.group(1), m.group(2), m.group(3)
@@ -876,6 +931,12 @@ def check_bridge_promotion(store, store_scoped, merge):
                 continue
             if op in ORDERING_OPS:
                 ordering = True
+                if field == "expires_at" and not direction_bad:
+                    cond, consequent = _if_guard_around(body, m.start())
+                    ok_dir, why = _ordering_direction(
+                        cond, consequent, a == left, op)
+                    if not ok_dir:
+                        direction_bad = why
             elif op in INEQUALITY_OPS:
                 compared.add(field)
     if not ordering:
@@ -883,6 +944,8 @@ def check_bridge_promotion(store, store_scoped, merge):
                   "bridge left over from BEFORE the host authorized would promote "
                   "the token it already replaced (a rollback, not a refresh)"
             % fname)
+    elif direction_bad:
+        red("C2", "`%s` %s" % (fname, direction_bad))
     if "access_token" not in compared:
         red("C2", "`%s` never compares the bridge access token against the stored "
                   "one — a same-second refresh has an identical expiry, so ordering "
@@ -892,6 +955,120 @@ def check_bridge_promotion(store, store_scoped, merge):
                   "one — under refresh-token rotation the superseded token stays in "
                   "the store and the guest's next refresh is invalid_grant" % fname)
     return v
+
+def _paren_end(text, open_idx):
+    """Index of the ')' closing the '(' at [open_idx], or -1."""
+    depth = 0
+    i = open_idx
+    while i < len(text):
+        c = text[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _paren_args(text, open_idx):
+    """Argument text between the '(' at [open_idx] and its matching ')'."""
+    close = _paren_end(text, open_idx)
+    return None if close < 0 else text[open_idx + 1:close]
+
+
+def _top_level_parts(args):
+    """Split an argument list on top-level commas."""
+    parts, depth, cur = [], 0, []
+    for c in args:
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        if c == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+            continue
+        cur.append(c)
+    if "".join(cur).strip():
+        parts.append("".join(cur))
+    return parts
+
+
+def _named_value(args, name):
+    """Value text of the top-level named argument `name = …`, or None."""
+    for part in _top_level_parts(args):
+        m = re.match(r"\s*%s\s*=(?!=)\s*(.+?)\s*$" % re.escape(name), part, re.S)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _expression_body(code, name):
+    """Expression body of `fun <name>(…) = …` (None for block bodies)."""
+    m = re.search(r"\bfun\s+%s\s*\(" % re.escape(name), code)
+    if not m:
+        return None
+    close = _paren_end(code, m.end() - 1)
+    if close < 0:
+        return None
+    k = close + 1
+    while k < len(code) and code[k] in " \t\r\n":
+        k += 1
+    if k < len(code) and code[k] == ":":
+        while k < len(code) and code[k] not in "={":
+            k += 1
+    if k >= len(code) or code[k] != "=":
+        return None
+    stops = []
+    blank = code.find("\n\n", k)
+    if blank >= 0:
+        stops.append(blank)
+    nxt = re.search(r"\n\s*(?:@\w+\s*)*(?:private |internal |public |override )?fun\s", code[k:])
+    if nxt:
+        stops.append(k + nxt.start())
+    end = min(stops) if stops else len(code)
+    return code[k + 1:end]
+
+
+# ── [wide-1024 R4] the transport decision must be the shared predicate ────
+TRANSPORT_ARG = "urlTransport"
+_BOOL_LITERAL_RE = re.compile(r"^(?:true|false|Boolean\.(?:TRUE|FALSE))$")
+
+
+def _transport_decision(code, value):
+    """(ok, note): the `urlTransport =` argument must be DERIVED, never a literal.
+
+    [wide-1024 R4] The gate only proved the write paths reach
+    `MCPOAuthStore.reconcileForServer(` and that the helper body names it. What
+    the helper PASSES was never read, so `urlTransport = true` — the shipped
+    pre-fix shape — kept the gate green: a server switched from HTTP/SSE to
+    STDIO is reported as a URL transport, `reconcileForServer` skips its PURGE
+    branch, and `/var/minis/mcp-servers/oauth/<id>.json` keeps a plaintext
+    bearer token forever. The argument must be decided by a predicate whose body
+    reads BOTH facts the persisted transport depends on (`isStdio` and `url`).
+    """
+    if value is None:
+        return False, "no `%s =` argument at the call site" % TRANSPORT_ARG
+    v = value.strip()
+    if _BOOL_LITERAL_RE.match(v):
+        return False, ("a literal (`%s`) — the transport decision is hard-coded, so a "
+                       "server that became STDIO keeps its live token" % v)
+    if re.match(r"^[A-Za-z_]\w*$", v):
+        m = re.search(r"\bval\s+%s\b[^=\n]*=\s*([^\n]+)" % re.escape(v), code)
+        if m is None:
+            return False, "`%s` is not bound in this file (fail-closed)" % v
+        v = m.group(1)
+    for cm in CALL_RE.finditer(v):
+        callee = cm.group(1)
+        body = _expression_body(code, callee) or body_of(code, callee)
+        if body and "isStdio" in body and ".url" in body:
+            return True, "decided by `%s`" % callee
+    return False, ("no predicate reading both `isStdio` and `url` decides `%s` — "
+                   "the transport must be derived from the server, not restated here"
+                   % v.strip()[:60])
+
 
 def check_repo(code):
     v = []
@@ -919,6 +1096,24 @@ def check_repo(code):
                 "MCPRepository.kt: the `%s` indirection does not call `%s` — "
                 "the write paths look wired but nothing reconciles"
                 % (REPO_HELPER_DECL, REPO_FULL_CALL)
+            )
+    for idx in range(len(code)):
+        if not code.startswith(REPO_FULL_CALL, idx):
+            continue
+        args = _paren_args(code, idx + len(REPO_FULL_CALL) - 1)
+        if args is None:
+            v.append(
+                "MCPRepository.kt:%d: `%s` could not be delimited — fail-closed"
+                % (line_of(code, idx), REPO_FULL_CALL)
+            )
+            continue
+        ok, note = _transport_decision(code, _named_value(args, TRANSPORT_ARG))
+        if not ok:
+            v.append(
+                "MCPRepository.kt:%d: `%s%s` — %s. A STDIO/blank-transport server "
+                "must be reconciled as NOT a URL transport, or its token bridge "
+                "survives the switch (crack 1)"
+                % (line_of(code, idx), REPO_FULL_CALL, TRANSPORT_ARG, note)
             )
     if SECRET_ONLY_VERB in code:
         v.append(
@@ -1244,12 +1439,16 @@ def check_ui(code):
     # deleted id. A body-level check is not enough — one handler's guard would
     # satisfy the other's removal (m2 caught that). Fail-closed the other way:
     # no call sites = nothing to orphan.
-    guard_pat = re.escape(UI_LIST_HOLDER) + r"\.value\.none \{"
+    guard_pat = re.escape(UI_LIST_HOLDER) + r"\.value\.none\s*\{"
     for occ in re.finditer(re.escape(SECRET_ONLY_VERB), body):
         span_start = body.rfind("onClick", 0, occ.start())
         if span_start < 0:
             span_start = 0
-        if not re.search(guard_pat, body[span_start:occ.start()]):
+        window = body[span_start:occ.start()]
+        found = None
+        for gm in re.finditer(guard_pat, window):
+            found = gm
+        if found is None:
             v.append(
                 "MCPIntegrationsScreen.kt:%d: the form stores credentials via "
                 "`%s` but the click handler never checks the listing still "
@@ -1263,7 +1462,59 @@ def check_ui(code):
                 )
             )
             break
+        predicate = brace_block(window, found.end() - 1) if window[found.end() - 1] == "{" \
+            else None
+        id_expr = _secret_id_argument(body, occ.start())
+        if not _guard_compares_captured_id(
+                predicate[1:-1] if predicate else None, id_expr):
+            v.append(
+                "MCPIntegrationsScreen.kt:%d: the presence guard does not compare "
+                "`it.id` with the id this handler writes under (`%s`) — a predicate "
+                "that always (or never) matches either blocks every edit or lets a "
+                "deleted id receive the credentials, silently"
+                % (line_of(code, body_off + occ.start()), id_expr or "unknown")
+            )
+            break
     return v, enforced
+
+
+def _secret_id_argument(body, verb_pos):
+    """The id expression handed to the credential setter, or None."""
+    paren = body.find("(", verb_pos)
+    if paren < 0:
+        return None
+    args = _paren_args(body, paren)
+    if args is None:
+        return None
+    parts = _top_level_parts(args)
+    return parts[1].strip() if len(parts) > 1 else None
+
+
+def _guard_compares_captured_id(predicate, id_expr):
+    """True when the `none { … }` predicate compares the element id against
+    [id_expr] — the id the handler is about to write credentials under.
+
+    [wide-1024 U3] The criterion pinned the PREFIX `servers.value.none {` only,
+    so any predicate satisfied it: `none { it.id == "" }` refuses every normal
+    edit (the listing has no blank id), and `none { it.id != it.id }` is always
+    false and lets the save through — a server deleted while the sheet was open
+    gets its OAuth credentials written back under a dead id. The predicate must
+    compare the element's id with the SAME expression the setter is keyed by.
+    """
+    if predicate is None or id_expr is None:
+        return False
+    m = re.match(r"\s*([A-Za-z_]\w*)\s*->", predicate)
+    param = m.group(1) if m else "it"
+    want = re.sub(r"\s+", "", id_expr)
+    if not want or want == param or want.startswith(param + "."):
+        return False
+    norm = re.sub(r"\s+", "", predicate)
+    return bool(
+        ("%s.id==%s" % (param, want)) in norm
+        or ("%s.id!=%s" % (param, want)) in norm
+        or ("%s==%s.id" % (want, param)) in norm
+        or ("%s!=%s.id" % (want, param)) in norm
+    )
 
 
 def check_backup_scope(code):
@@ -1983,6 +2234,13 @@ class MCPRepository(private val context: Context) {
         return parsed
     }
 
+    companion object {
+        // [wide-1024 R4] the shared transport predicate — the reconcile call
+        // must PASS this, not a literal (the real file has it in a companion).
+        internal fun persistsAsUrlTransport(server: MCPServerConfig): Boolean =
+            !server.isStdio && !server.url.isNullOrBlank()
+    }
+
     private fun reconcileOAuth(server: MCPServerConfig) {
         runCatching {
             com.rikkaminis.app.mcp.oauth.MCPOAuthStore.reconcileForServer(
@@ -2138,6 +2396,13 @@ BAD_MERGE_NO_ACCESS_CMP = GOOD_MERGE.replace(
     "    val replaced = false\n",
 )
 
+# [wide-1024 C2] witness 2: the comparison survives, its DIRECTION is flipped —
+# every bridge the guest just refreshed takes the early exit.
+BAD_MERGE_FLIPPED_ORDERING = GOOD_MERGE.replace(
+    "if (bridgeSeconds < storedSeconds) return null",
+    "if (bridgeSeconds >= storedSeconds) return null",
+)
+
 # the baseline shape: reconcile materializes the prefs copy straight away
 BAD_STORE_NO_PROMOTION = GOOD_STORE.replace(
     "                val t = promoteFromBridge(context, server, requireNotNull(stored))\n"
@@ -2273,6 +2538,13 @@ BAD_UI_NO_REFUSE = GOOD_UI.replace(
     "",
 )
 
+# [wide-1024 U3] witness 3: the presence guard is there, the predicate is not
+# about the captured id (refuses every edit, or lets a dead id through).
+BAD_UI_HOLLOW_PREDICATE = GOOD_UI.replace(
+    "servers.value.none { it.id == server.id }",
+    'servers.value.none { it.id == "" }',
+)
+
 # the form is gone entirely (anchor drift)
 BAD_UI_NO_FORM = GOOD_UI.replace("private fun MCPFormTab(", "private fun MCPFormBody(")
 
@@ -2288,6 +2560,14 @@ LYING_UI = BAD_UI_UNKEYED.replace(
 private fun MCPFormTab(""",
 )
 
+
+# [wide-1024 R4] witness 1: the convergence call is made, but the transport is
+# hard-coded — a server switched to STDIO is still reported as a URL transport
+# and its plaintext token bridge survives the switch.
+BAD_REPO_TRANSPORT_LITERAL = GOOD_REPO.replace(
+    "urlTransport = persistsAsUrlTransport(server),",
+    "urlTransport = true,",
+)
 
 # -- [da1034-A1] artifact-backup fixtures ------------------------------------
 
@@ -2744,6 +3024,13 @@ def selftest():
     s_bridge = check_store(mask(BAD_STORE_NO_BRIDGE_DELETE))
     expect_trip("tokens-without-bridge-delete fixture", s_bridge, "leaves the bridge file")
 
+    # [wide-1024 R4] the argument the convergence call passes
+    r_transport = check_repo(mask(BAD_REPO_TRANSPORT_LITERAL))
+    expect_trip("hard-coded transport fixture", r_transport, "a literal")
+    for item in r_transport:
+        if "a literal" not in item:
+            failures.append("hard-coded transport fixture tripped something else: %s" % item)
+
     s_mat = check_store(mask(BAD_STORE_NO_MATERIALIZE))
     expect_trip("purge-only reconcile fixture", s_mat, "does not call `materializeBridgeFile(")
 
@@ -2871,6 +3158,10 @@ def selftest():
     u_orphan_noelvis, _ = check_ui(mask(BAD_UI_NO_FALLBACK))
     expect_trip("no-fallback fixture (no elvis, no close effect)", u_orphan_noelvis,
                 "has no `?: ` fallback")
+
+    # [wide-1024 U3] the guard exists, its predicate is not about the id
+    u_hollow, _ = check_ui(mask(BAD_UI_HOLLOW_PREDICATE))
+    expect_trip("hollow presence-predicate fixture", u_hollow, "does not compare")
 
     # [dv14-B3] U3 arms
     u_norefuse, _ = check_ui(mask(BAD_UI_NO_REFUSE))
@@ -3057,6 +3348,11 @@ def selftest():
 
     p_norefresh = promo(merge=BAD_MERGE_NO_REFRESH_CMP)
     expect_only_tag("promotion without a refresh-token comparison fixture", p_norefresh, "C2")
+
+    # [wide-1024 C2] the flipped ordering: comparison present, direction wrong
+    p_flipped = promo(merge=BAD_MERGE_FLIPPED_ORDERING)
+    expect_only_tag("flipped ordering guard fixture", p_flipped, "C2")
+    expect_trip("flipped ordering guard fixture", p_flipped, "exits early on the NEWER side")
 
     p_nomerge = promo(merge="")
     expect_only_tag("missing bridge-merge policy fixture", p_nomerge, "C2")
