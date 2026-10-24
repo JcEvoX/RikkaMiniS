@@ -74,8 +74,15 @@ Boolean 直接被丢弃，`CLICKED`/`UNCHANGED` 的区分随之消失。
 
 ## 6. CI
 
-- 本地全量：`gate_run.sh --full`（flock + ENOSYS 重试），本节末回填。
-- 分支 CI：dispatch 后回填 run id / conclusion / head_sha。
+- 本地全量：`gate_run.sh --full`（全局 flock + ENOSYS 重试）111 道 python 门 **PASS=111 / FAIL=0**；
+  首轮 `test_scan.py` 撞并发窗口 ENOSYS（`browser_tab_exec_serial_check` 一条 case 误红，单独重跑该门 `--selftest` 即 PASS），
+  锁内重跑 → **`ALL 344 CASES PASS`**（0 条 ❌）。裸跑 `scan.sh` 会撞 S28（多会话并发 → PRoot 返回 ENOSYS），故一律走持锁运行器。
+- 分支 CI：**run #2639 / id `40136718049` / job `120999670424`**，`conclusion=success`，attempt 1，
+  `head_sha=d6911e894b086d7ebbac18e42692b757f40cfe4a`（与本地 `git rev-parse HEAD` 逐字符一致）。
+  26 步里唯一非 success = `Publish to Releases`（skipped，main 门控，符合预期）。
+  日志逐条核（1,484,200 B）：`Summary: 112 passed, 0 failed` **恰 1 条**；子套件 5/10/14/22/28/36 passed 各 1 条（非主 Summary）；
+  `ALL 344 CASES PASS` 恰 1 条；编译错误 ` e: ` **0 条**；6 条含 `FAILED` 的行逐条确认全是 **PASSED 用例名子串**；
+  本门的分节/收尾标记在册。
 
 ## 7. 残留
 
