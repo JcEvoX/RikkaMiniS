@@ -65,7 +65,7 @@ import org.junit.Test
  * exception never escapes and the failure is never mistaken for the replayable
  * race.
  */
-class MessageInsertConstraintTest {
+class MessageInsertRetryGateTest {
 
     // ── 1. appendMessage: the FK failure is classified, not raw ─────────────
 
@@ -228,7 +228,7 @@ internal open class InertChatDao : ChatDao {
     override suspend fun loadUserMessagesSince(since: Long, limit: Int): List<MessageEntity> =
         emptyList()
     override suspend fun deleteMessages(sessionId: String) {}
-    override suspend fun deleteMessagesAfter(sessionId: String, keepCount: Int) {}
+    override suspend fun deleteMessagesAfter(sessionId: String, fromSortOrder: Int) {}
     override suspend fun totalMessageCount(): Int = 0
     override suspend fun tokenUsages(sessionId: String): List<String> = emptyList()
     override suspend fun allUsageRecords(): List<UsageRecord> = emptyList()
