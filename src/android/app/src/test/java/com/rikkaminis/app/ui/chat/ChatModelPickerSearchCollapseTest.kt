@@ -128,7 +128,11 @@ class ChatModelPickerSearchCollapseTest {
 
     @Test
     fun `without a query the sections still start collapsed`() {
-        val code = sheet()
+        // Grade CODE, not prose: the branch's own KDoc quotes the forbidden
+        // projection while explaining why it was wrong (a comment cannot fold a
+        // section, and a criterion that reads one is a criterion that will be
+        // "fixed" by deleting the explanation).
+        val code = codeOf(sheet())
         assertTrue(
             "the default must stay `all sections collapsed` — the seed now delegates to the " +
                 "shared single source, whose `defaultExpanded = false` seeds every instance id " +
@@ -137,12 +141,26 @@ class ChatModelPickerSearchCollapseTest {
                 collapseSeed(code),
             code.contains("var collapsedInstanceIds by rememberCollapsedInstanceIds(config)"),
         )
+        // Scoped to the seed's own derivation area (six comment-stripped code
+        // lines before the seed statement, plus the statement itself): this file
+        // legitimately contains OTHER `instances.filter { … }` sites — the
+        // visible-section builder (`allInstancesWithEntries`) filters on
+        // `isEnabled` to decide which sections EXIST, which is correct — and a
+        // whole-file criterion would forbid those. The derivation-chain
+        // enforcement lives in the gate (C18 + DISPLAY_FLAG_FILTER_RE); this pin
+        // is for this file's seed only.
+        val lines = code.lines()
+        val seedIdx = lines.indexOfFirst { "collapsedInstanceIds" in it && " by " in it }
+        val window =
+            if (seedIdx < 0) "<no delegated seed>"
+            else lines.drop(maxOf(0, seedIdx - 6)).take(7).joinToString("\n")
         assertTrue(
             "the seed must NOT be derived from a filtered instance projection — the collapse " +
                 "set answers provider IDENTITY, and a filter on a user-mutable flag makes the " +
-                "key move under the user: $code",
-            !Regex("""instances\s*\.\s*filter\s*\{[^}]*\b(?:isEnabled|isHidden|pinned)\b""")
-                .containsMatchIn(code),
+                "key move under the user (window: $window)",
+            seedIdx >= 0 &&
+                !Regex("""instances\s*\.\s*filter\s*\{[^}]*\b(?:isEnabled|isHidden|pinned)\b""")
+                    .containsMatchIn(window),
         )
         assertTrue(
             "the gate must read the query's EMPTINESS; inverting it folds every section while " +
@@ -150,6 +168,12 @@ class ChatModelPickerSearchCollapseTest {
             !collapseDecision(code).contains("searchText.isNotEmpty()"),
         )
     }
+
+    /** The source with comments blanked out, so prose cannot satisfy nor trip a code check. */
+    private fun codeOf(source: String): String =
+        source
+            .replace(Regex("""/\*[\s\S]*?\*/"""), " ")
+            .replace(Regex("""(?m)//.*$"""), " ")
 
     /** The declaration that seeds the collapse state (for assertion messages). */
     private fun collapseSeed(code: String): String {
