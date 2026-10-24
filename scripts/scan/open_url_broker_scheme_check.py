@@ -65,6 +65,25 @@ which live in a third and fourth file:
 
 Both are skipped when their file is absent (mini-tree fixtures).
 
+meta-audit-1024 FIX-M1 (external witness, axis=dataflow) added the *effect*
+half of the U1/U3 pair, which U1+U3 alone could not see:
+
+  U8  the `isSupportedScheme(` guard inside `offer(uri: Uri)` must TERMINATE
+      control flow, not merely be mentioned. Two accepted shapes:
+        (a) negative early exit — an `if (!isSupportedScheme(…))` /
+            `isSupportedScheme(…).not()` / `… == false` arm whose body ends
+            the function (a `return`, a labelled `return@offer`, or a
+            `throw`); negation may also come from a `!` wrapping parentheses.
+        (b) positive wrapping — the `_pendingUrl.value = uri` publish sits
+            inside the body of an `if (isSupportedScheme(…)) { … }`.
+      A negative arm whose consequence is `Unit` / an empty block / any
+      non-terminating statement is RED even though `idx_gate < idx_write`
+      (U3) and `"isSupportedScheme(" in body` (U1) both still hold — that
+      exact patch was externally witnessed keeping this gate green while
+      republishing `file://` / `javascript:` / `content://` Uris.
+      Fail-closed: unparseable braces/parens or a guard with no `if` at all
+      is a violation, never a skip.
+
 Usage: python3 open_url_broker_scheme_check.py [ROOT]   (ROOT = repo root)
        python3 open_url_broker_scheme_check.py --selftest
 Exit:  0 = gate green, 1 = violations found (or selftest failures).
@@ -227,7 +246,182 @@ def analyse(code_raw):
     ok4 = ok_lower and ok_null and ok_list
     results.append(("U4 whitelist not weakened (lowercase + null fail-close + 4 schemes)", ok4,
                     "lowercase=%s null-close=%s schemes=%s" % (ok_lower, ok_null, ok_list)))
+
+    # --- U8: the guard must terminate control flow, not merely be mentioned ---
+    results.extend(analyse_guard_termination(body_uri, RE_WRITE.search(body_uri)))
     return results
+
+
+RE_IF = re.compile(r"\bif\s*\(")
+# A terminator: `return`, a labelled `return@x`, or `throw` — as the head of a
+# statement. Deliberately not a bare `Unit` / assignment / other call.
+RE_TERMINATOR = re.compile(r"\b(?:return(?:@[A-Za-z_][A-Za-z0-9_]*)?|throw)\b")
+# Negation spellings accepted on the guard call: `!…`, `!(…)`, `….not()`,
+# `… == false` (the common Kotlin equivalents; keep the list narrow — the
+# point is to accept real code, not to enumerate every exotic form).
+RE_NOT_SUFFIX = re.compile(r"\.not\s*\(")
+RE_FALSE_SUFFIX = re.compile(r"==\s*false|!=\s*true")
+
+
+def _skip_ws(text, i):
+    n = len(text)
+    while i < n and text[i] in " \t\r\n":
+        i += 1
+    return i
+
+
+def _preceded_by_not(cond, call_start):
+    """True when the call at call_start is negated (`!…`, `!(…)`, `….not()`,
+    `… == false`, `… != true`)."""
+    j = call_start - 1
+    while j >= 0 and cond[j] in " \t\r\n(":
+        j -= 1
+    if j >= 0 and cond[j] == "!":
+        return True
+    close = -1
+    op = call_start + len("isSupportedScheme")
+    while op < len(cond) and cond[op] in " \t\r\n":
+        op += 1
+    if op < len(cond) and cond[op] == "(":
+        close = match_delim(cond, op, "(", ")")
+    if close < 0:
+        return False
+    tail = cond[close + 1:]
+    if RE_NOT_SUFFIX.match(tail.lstrip()):
+        return True
+    if RE_FALSE_SUFFIX.match(tail.lstrip()):
+        return True
+    return False
+
+
+def _body_terminates(text):
+    """True when the branch text contains a top-level `return` / `return@x` /
+    `throw` (a guard arm that ends the function). String-aware, depth-aware:
+    a `return` nested inside a lambda of the arm does not count."""
+    depth = 0
+    quote = None
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if quote is not None:
+            if c == "\\":
+                i += 2
+                continue
+            if c == quote:
+                quote = None
+            i += 1
+            continue
+        if c in ('"', "'"):
+            quote = c
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+        elif depth == 0:
+            prev = text[i - 1] if i > 0 else ""
+            if (c == "r" and text.startswith("return", i)
+                    and not (prev.isalnum() or prev == "_")):
+                return True
+            if (c == "t" and text.startswith("throw", i)
+                    and not (prev.isalnum() or prev == "_")):
+                return True
+        i += 1
+    return False
+
+
+def _consequent_span(body, close_idx):
+    """Span (start, end_exclusive) of the `if` consequence after the closing
+    paren at close_idx — a braced block or a single statement. Returns
+    (start, end) or None when there is no consequence (fail-closed at the
+    caller)."""
+    k = _skip_ws(body, close_idx + 1)
+    if k >= len(body):
+        return None
+    if body[k] == "{":
+        e = match_brace(body, k)
+        if e < 0:
+            return None
+        return (k, e + 1)
+    e = k
+    while e < len(body) and body[e] not in "\n;":
+        e += 1
+    return (k, e)
+
+
+def _arm_inner(consequent):
+    """The statements of a guard arm: the braced block's interior, or the bare
+    single-statement arm as-is."""
+    text = consequent.strip()
+    if text.startswith("{") and text.endswith("}"):
+        return text[1:-1]
+    return text
+
+
+def analyse_guard_termination(body, m_write):
+    """U8 — the isSupportedScheme guard must terminate control flow.
+
+    Green iff at least one guard `if` exists and it either
+      (a) negates the call and its consequence terminates (`return`/`throw`),
+          with the publish NOT inside that (dead) consequence, or
+      (b) keeps the call positive and the publish sits inside its block.
+    Anything else (Unit / empty block / call not under any `if` / unbalanced
+    braces) is a violation — fail-closed.
+    """
+    label = "U8 isSupportedScheme guard terminates control flow (no Unit/no-op arm)"
+    sites = list(re.finditer(r"isSupportedScheme\s*\(", body))
+    if not sites:
+        # No guard call at all: U1 already owns that shape; keep the criterion
+        # list stable so fail-closed fixtures cannot double-count it.
+        return []
+    idx_write = m_write.start() if m_write else -1
+    problems = []
+    protected = False
+    for m in RE_IF.finditer(body):
+        open_idx = m.end() - 1
+        close_idx = match_delim(body, open_idx, "(", ")")
+        if close_idx < 0:
+            problems.append("unbalanced guard condition at offset %d — fail-closed" % open_idx)
+            continue
+        cond = body[open_idx:close_idx + 1]
+        cm = re.search(r"isSupportedScheme\s*\(", cond)
+        if not cm:
+            continue
+        negated = _preceded_by_not(cond, cm.start())
+        span = _consequent_span(body, close_idx)
+        if span is None:
+            problems.append("guard at offset %d has no parsable consequence — fail-closed"
+                            % open_idx)
+            continue
+        bs, be = span
+        consequent = body[bs:be]
+        if negated:
+            # The dead arm must end the function; a publish inside it would be
+            # reachable exactly when the scheme is NOT supported.
+            inner = _arm_inner(consequent)
+            terminates = _body_terminates(inner)
+            publish_inside = idx_write >= 0 and bs <= idx_write < be
+            if terminates and not publish_inside:
+                protected = True
+            elif publish_inside:
+                problems.append("negated guard arm (offset %d) PUBLISHES instead of "
+                                "rejecting — inverted guard" % open_idx)
+            else:
+                problems.append("negated guard arm (offset %d) does not terminate control "
+                                "flow (Unit/no-op/other statement)" % open_idx)
+        else:
+            wraps = idx_write >= 0 and bs <= idx_write < be
+            if wraps:
+                protected = True
+            else:
+                problems.append("positive guard arm (offset %d) neither wraps the publish "
+                                "nor terminates — publish reachable without the gate"
+                                % open_idx)
+    if not problems and not protected:
+        problems.append("no isSupportedScheme guard terminates control flow or wraps the "
+                        "publish — fail-closed")
+    return [(label, not problems, "; ".join(problems) if problems
+             else "guard arm terminates / wraps the publish")]
 
 # ------------------------------------------------------- TerminalScreen (U5) ---
 RE_LAUNCHED_PENDING = re.compile(r"LaunchedEffect\(\s*pendingUrl\s*\)\s*\{")
@@ -494,6 +688,145 @@ class B {
 """
 
 
+# ---- meta-audit-1024 FIX-M1 witness arms (U8: guard must terminate) ----------
+# The exact external witness: `return` -> `Unit` keeps U1 (substring), U2b (one
+# publish point), U3 (gate before publish) and U4 all green, yet the guard is a
+# no-op and every scheme lands in _pendingUrl.
+BAD_GUARD_UNIT = """package probe
+class B {
+    private val _pendingUrl = MutableStateFlow<Uri?>(null)
+    fun offer(uri: Uri) {
+        if (!isSupportedScheme(uri.scheme)) Unit
+        _pendingUrl.value = uri
+    }
+    fun offer(uriString: String) {
+        val parsed = runCatching { Uri.parse(uriString) }.getOrNull() ?: return
+        offer(parsed)
+    }
+    fun isSupportedScheme(scheme: String?): Boolean {
+        val s = scheme?.lowercase() ?: return false
+        return s == "http" || s == "https" || s == "about" || s == "minis"
+    }
+}
+"""
+
+BAD_GUARD_EMPTY_BLOCK = """package probe
+class B {
+    private val _pendingUrl = MutableStateFlow<Uri?>(null)
+    fun offer(uri: Uri) {
+        if (!isSupportedScheme(uri.scheme)) { }
+        _pendingUrl.value = uri
+    }
+    fun offer(uriString: String) {
+        val parsed = runCatching { Uri.parse(uriString) }.getOrNull() ?: return
+        offer(parsed)
+    }
+    fun isSupportedScheme(scheme: String?): Boolean {
+        val s = scheme?.lowercase() ?: return false
+        return s == "http" || s == "https" || s == "about" || s == "minis"
+    }
+}
+"""
+
+# Inverted guard: the rejected branch does the publishing.
+BAD_GUARD_INVERTED = """package probe
+class B {
+    private val _pendingUrl = MutableStateFlow<Uri?>(null)
+    fun offer(uri: Uri) {
+        if (!isSupportedScheme(uri.scheme)) { _pendingUrl.value = uri }
+    }
+    fun offer(uriString: String) {
+        val parsed = runCatching { Uri.parse(uriString) }.getOrNull() ?: return
+        offer(parsed)
+    }
+    fun isSupportedScheme(scheme: String?): Boolean {
+        val s = scheme?.lowercase() ?: return false
+        return s == "http" || s == "https" || s == "about" || s == "minis"
+    }
+}
+"""
+
+# Precision: a multi-statement guard arm that still ends the function is fine.
+GOOD_GUARD_BLOCK_MULTI = """package probe
+class B {
+    private val _pendingUrl = MutableStateFlow<Uri?>(null)
+    fun offer(uri: Uri) {
+        if (!isSupportedScheme(uri.scheme)) {
+            Log.w(TAG, "unsupported scheme: %s", uri.scheme)
+            return
+        }
+        _pendingUrl.value = uri
+    }
+    fun offer(uriString: String) {
+        val parsed = runCatching { Uri.parse(uriString) }.getOrNull() ?: return
+        offer(parsed)
+    }
+    fun isSupportedScheme(scheme: String?): Boolean {
+        val s = scheme?.lowercase() ?: return false
+        return s == "http" || s == "https" || s == "about" || s == "minis"
+    }
+}
+"""
+
+GOOD_GUARD_THROW = """package probe
+class B {
+    private val _pendingUrl = MutableStateFlow<Uri?>(null)
+    fun offer(uri: Uri) {
+        if (!isSupportedScheme(uri.scheme)) throw IllegalArgumentException("scheme")
+        _pendingUrl.value = uri
+    }
+    fun offer(uriString: String) {
+        val parsed = runCatching { Uri.parse(uriString) }.getOrNull() ?: return
+        offer(parsed)
+    }
+    fun isSupportedScheme(scheme: String?): Boolean {
+        val s = scheme?.lowercase() ?: return false
+        return s == "http" || s == "https" || s == "about" || s == "minis"
+    }
+}
+"""
+
+# Precision: the accepted positive-wrapping shape (same decision point, other
+# legal spelling).
+GOOD_GUARD_POSITIVE_WRAP = """package probe
+class B {
+    private val _pendingUrl = MutableStateFlow<Uri?>(null)
+    fun offer(uri: Uri) {
+        if (isSupportedScheme(uri.scheme)) {
+            _pendingUrl.value = uri
+        }
+    }
+    fun offer(uriString: String) {
+        val parsed = runCatching { Uri.parse(uriString) }.getOrNull() ?: return
+        offer(parsed)
+    }
+    fun isSupportedScheme(scheme: String?): Boolean {
+        val s = scheme?.lowercase() ?: return false
+        return s == "http" || s == "https" || s == "about" || s == "minis"
+    }
+}
+"""
+
+# Precision: `….not()` / `== false` negations are also real guards.
+GOOD_GUARD_NOT_CALL = """package probe
+class B {
+    private val _pendingUrl = MutableStateFlow<Uri?>(null)
+    fun offer(uri: Uri) {
+        if (isSupportedScheme(uri.scheme).not()) return
+        _pendingUrl.value = uri
+    }
+    fun offer(uriString: String) {
+        val parsed = runCatching { Uri.parse(uriString) }.getOrNull() ?: return
+        offer(parsed)
+    }
+    fun isSupportedScheme(scheme: String?): Boolean {
+        val s = scheme?.lowercase() ?: return false
+        return s == "http" || s == "https" || s == "about" || s == "minis"
+    }
+}
+"""
+
+
 GOOD_TERMINAL = """package probe
 @Composable
 fun TerminalScreen(pendingUrl: Uri?) {
@@ -673,7 +1006,7 @@ def selftest():
 
     # good fixture: everything green
     good = as_dict(analyse(GOOD))
-    expect(len(good) == 5, "good fixture should produce 5 criteria, got %d" % len(good))
+    expect(len(good) == 6, "good fixture should produce 6 criteria, got %d" % len(good))
     for c, ok in good.items():
         expect(ok, "good fixture must pass %s" % c)
 
@@ -703,6 +1036,47 @@ def selftest():
     d = as_dict(analyse("class B { }"))
     expect(len(d) == 1 and not d["U1 offer(uri: Uri) present and unambiguous"],
            "garbage input must fail-closed on U1")
+
+    # ---- U8 (guard must TERMINATE control flow) — the external witness ----
+    U8 = "U8 isSupportedScheme guard terminates control flow (no Unit/no-op arm)"
+
+    d = as_dict(analyse(BAD_GUARD_UNIT))
+    expect(not d[U8], "BAD_GUARD_UNIT U8 must be RED (return mutated to Unit: the "
+                      "guard is a no-op, every scheme reaches _pendingUrl)")
+    # ...and the OLD criteria must stay green — that is precisely why the old
+    # gate was blind to this patch.
+    for c, ok in d.items():
+        if c == U8:
+            continue
+        expect(ok, "BAD_GUARD_UNIT %s must stay OK (old criteria cannot see it)" % c)
+
+    d = as_dict(analyse(BAD_GUARD_EMPTY_BLOCK))
+    expect(not d[U8], "BAD_GUARD_EMPTY_BLOCK U8 must be RED (empty guard arm)")
+    expect(d["U3 scheme check precedes the _pendingUrl publish"],
+           "BAD_GUARD_EMPTY_BLOCK U3 must stay OK (order is unchanged)")
+
+    d = as_dict(analyse(BAD_GUARD_INVERTED))
+    expect(not d[U8], "BAD_GUARD_INVERTED U8 must be RED (rejected arm publishes)")
+
+    g = as_dict(analyse(GOOD_GUARD_BLOCK_MULTI))
+    expect(len(g) == 6 and all(g.values()),
+           "GOOD_GUARD_BLOCK_MULTI must be fully green (log + return arm): %s"
+           % [c for c, ok in g.items() if not ok])
+
+    g = as_dict(analyse(GOOD_GUARD_THROW))
+    expect(len(g) == 6 and all(g.values()),
+           "GOOD_GUARD_THROW must be fully green (throw arm): %s"
+           % [c for c, ok in g.items() if not ok])
+
+    g = as_dict(analyse(GOOD_GUARD_POSITIVE_WRAP))
+    expect(len(g) == 6 and all(g.values()),
+           "GOOD_GUARD_POSITIVE_WRAP must be fully green (publish inside the gate): %s"
+           % [c for c, ok in g.items() if not ok])
+
+    g = as_dict(analyse(GOOD_GUARD_NOT_CALL))
+    expect(len(g) == 6 and all(g.values()),
+           "GOOD_GUARD_NOT_CALL must be fully green (.not() negation): %s"
+           % [c for c, ok in g.items() if not ok])
 
     # ---- U5 (TerminalScreen consumer placement) ----
     tgood = as_dict(analyse_terminal(GOOD_TERMINAL))
