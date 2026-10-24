@@ -70,6 +70,15 @@ the panel shows the viewport the pool actually resolves:
       size — so a session/global custom viewport was clobbered and the other
       tabs kept the old profile.
 
+  V9  [dv29-B4 B-04] dropping the session viewport must reach the tabs: a
+      clear that only zeroes `_sessionViewportWidth/Height` leaves every
+      surviving tab's `lastAppliedViewport` on the previous session's size,
+      which `navigate` / `minis://` injection / full-page capture replay
+      forever. Criteria: replay after the last write, ONE non-suspend
+      collection point that both zeroes and replays, every session re-point
+      reaching it, and no writer gated on `hasOverride` (the 0 × 0 direction
+      is the leak).
+
 Families 1-4 are judged by [check] (cookie); B1–B2 by [check_domain_refresh],
 V1–V6 by [check_viewport] and V7 by [check_pool_ua] — the latter is the first
 criterion here that reads a second file (`BrowserTabPool.kt`). Each family
@@ -201,6 +210,18 @@ GLOBAL_WRITE = "setGlobalViewport("
 FROZEN_FILTER = "cookieFilterText"
 UA_POOL_FLOW = "currentUserAgentProfile"
 REPLAY_CALL = "applyViewportToAllTabs()"
+
+# ── [dv29-B4 B-04] V9: dropping the session viewport must reach the tabs ─────
+REPLAY_APPLY = "applyViewportToAllTabs("
+# A `fun` header at class-member indentation (4 spaces); visibility and
+# `suspend` prefixes, generic parameter lists and extension receivers allowed.
+FUN_HEADER = re.compile(
+    r"^ {4}(?:(?:private|internal|public|protected)\s+)?(?:suspend\s+)?"
+    r"fun\s+(?:<[^>]*>\s*)?(?:[A-Za-z_][\w.]*\.)?([A-Za-z_]\w*)\s*\("
+)
+VALUE_WRITE = re.compile(r"_sessionViewport(?:Width|Height)\s*\.\s*value\s*=")
+ZERO_WRITE = re.compile(r"_sessionViewport(?:Width|Height)\s*\.\s*value\s*=\s*0\b")
+REPOINT = re.compile(r"this\.sessionId\s*=\s*sessionId")
 
 
 def _statement_window(code, ident):
@@ -344,6 +365,179 @@ def check_viewport(source: str) -> list:
                 "(V6)" % (keys, UA_POOL_FLOW)
             )
 
+    return errs
+
+
+def _pool_members(code: str):
+    """Members of the pool class, derived from the file.
+
+    A member is a `fun` header line at class-member indentation (4 spaces) and
+    everything up to the next such header. Line-based on purpose: brace pairing
+    breaks on expression bodies and on lambdas, and the pool has both (COMMON
+    §4). `code` must already be masked, so comments cannot create or hide a
+    member.
+    """
+    lines = code.split("\n")
+    starts = [i for i, l in enumerate(lines) if FUN_HEADER.match(l)]
+    members = []
+    for idx, st in enumerate(starts):
+        end = starts[idx + 1] if idx + 1 < len(starts) else len(lines)
+        header = lines[st]
+        members.append({
+            "header": header,
+            "name": FUN_HEADER.match(header).group(1),
+            "body": "\n".join(lines[st:end]),
+            "suspend": "suspend fun " in header,
+        })
+    return members
+
+
+def _calls(body: str, name: str) -> bool:
+    return re.search(r"\b" + re.escape(name) + r"\s*\(", body) is not None
+
+
+def _replay_bearing(members):
+    """Names of members that re-apply the resolved viewport: the direct ones,
+    plus the one hop that only delegates to one of them."""
+    direct = {m["name"] for m in members if REPLAY_APPLY in m["body"]}
+    indirect = {
+        m["name"] for m in members
+        if m["name"] not in direct and any(_calls(m["body"], n) for n in direct)
+    }
+    return direct | indirect
+
+
+def _replay_positions(body: str, replaying) -> list:
+    return [
+        m.start()
+        for n in replaying
+        for m in re.finditer(r"\b" + re.escape(n) + r"\s*\(", body)
+    ]
+
+
+def _reaches(body_start, members, targets, max_depth):
+    """Breadth-first walk over the pool's own call graph, depth-bounded."""
+    by_name = {m["name"]: m for m in members}
+    frontier = {body_start}
+    seen = {body_start}
+    for _ in range(max_depth):
+        nxt = set()
+        for n in frontier:
+            body = by_name[n]["body"] if n in by_name else ""
+            if any(t != n and _calls(body, t) for t in targets):
+                return True
+            for m in members:
+                if m["name"] not in seen and _calls(body, m["name"]):
+                    nxt.add(m["name"])
+        seen |= nxt
+        if not nxt:
+            return False
+        frontier = nxt
+    return False
+
+
+def check_pool_viewport_reset(pool_src: str) -> list:
+    """[dv29-B4 B-04] V9 — dropping the session viewport must reach the tabs.
+
+    `_sessionViewportWidth/Height` are the pool's *intent*; each tab's effective
+    size lives in `BrowserUseManager.lastAppliedViewport`, which every later
+    `navigate`, `minis://` injection and full-page capture replays. The pre-fix
+    code wrote 0 into the flows on three paths (session hand-off, restore with no
+    state file, restore of a session without an override) and never called
+    `applyViewportToAllTabs()`, so the previous session's size stayed applied to
+    the surviving WebViews.
+
+    Criteria, all derived from the tree (no member-name list):
+
+      R1  every member that writes a session viewport flow must replay AFTER its
+          last write (in its own body, or by calling a member that does);
+      R2  exactly one NON-suspend member may zero the flows — that is the
+          collection point, and it must be private and replay (a plain function
+          cannot await the replay, so a fourth path that zeroes on its own is
+          the defect this pins);
+      R3  every member that re-points the pool (`this.sessionId = sessionId`)
+          must reach the clearing member through its own call graph;
+      R4  no writer may condition on `hasOverride`: the 0 × 0 direction is the
+          leak.
+    """
+    code = mask_code(pool_src)
+    errs = []
+    members = _pool_members(code)
+    if not members:
+        return [
+            "no class members found in %s — the derivation anchor drifted "
+            "(ROT: update this gate)" % POOL_TARGET
+        ]
+    replaying = _replay_bearing(members)
+    if not replaying:
+        return [
+            "no member calls `%s` — the viewport replay this criterion anchors on "
+            "is gone (ROT: update this gate)" % REPLAY_APPLY
+        ]
+
+    writers = [m for m in members if VALUE_WRITE.search(m["body"])]
+    if not writers:
+        errs.append(
+            "no member writes `_sessionViewportWidth/Height.value` — this criterion "
+            "lost its subject (ROT: re-point it)"
+        )
+    for m in writers:
+        last_write = max(v.start() for v in VALUE_WRITE.finditer(m["body"]))
+        last_replay = max(_replay_positions(m["body"], replaying) or [-1])
+        if last_replay < last_write:
+            errs.append(
+                "`%s` writes a session viewport but never replays it afterwards — the "
+                "surviving tabs keep the previous size in `lastAppliedViewport`"
+                % m["header"].strip()
+            )
+        if "hasOverride" in m["body"]:
+            errs.append(
+                "`%s` conditions the session viewport on `hasOverride` — the 0 × 0 "
+                "(no override) direction is exactly the leak (R4)" % m["name"]
+            )
+
+    clearers = [m for m in members if ZERO_WRITE.search(m["body"]) and not m["suspend"]]
+    if len(clearers) != 1:
+        errs.append(
+            "expected exactly one non-suspend member to zero the session viewport, "
+            "found %d (%s) — the clear must stay a single collection point so a fourth "
+            "path cannot drop the flows without replaying (R2)"
+            % (len(clearers), ", ".join(m["name"] for m in clearers) or "none")
+        )
+    else:
+        point = clearers[0]
+        if "private fun " not in point["header"]:
+            errs.append(
+                "the collection point `%s` is not private — it is the pool's own "
+                "invariant" % point["name"]
+            )
+        for flow in ("_sessionViewportWidth.value = 0", "_sessionViewportHeight.value = 0"):
+            if flow not in point["body"]:
+                errs.append(
+                    "the collection point `%s` does not `%s` — both flows must drop "
+                    "together" % (point["name"], flow)
+                )
+        if not _replay_positions(point["body"], replaying):
+            errs.append(
+                "the collection point `%s` zeroes the flows without replaying — that is "
+                "the pre-fix shape with a new name" % point["name"]
+            )
+
+    targets = {m["name"] for m in clearers}
+    repointers = [m for m in members if REPOINT.search(m["body"])]
+    if not repointers:
+        errs.append(
+            "no member re-points the pool (`this.sessionId = sessionId`) — this "
+            "criterion lost its subject (ROT: re-point it)"
+        )
+    elif targets:
+        for m in repointers:
+            if not _reaches(m["name"], members, targets, 3):
+                errs.append(
+                    "`%s` re-points the pool without reaching the viewport clear — the "
+                    "incoming session inherits the previous session's size (R3)"
+                    % m["name"]
+                )
     return errs
 
 
@@ -805,6 +999,106 @@ def selftest() -> int:
          ["does not subscribe to `currentUserAgentProfile`"]),
     ]
 
+    # ── [dv29-B4 B-04] V9 fixtures: dropping the session viewport must reach
+    #    the tabs. The compliant slice is the POST-fix shape; each dirty arm
+    #    changes exactly one decision, so a breaker cannot be satisfied by
+    #    another criterion. ──
+    good_reset = """
+    fun setSession(sessionId: String) {
+        this.sessionId = sessionId
+        loadSavedState()
+    }
+
+    fun bindSessionContextOnly(sessionId: String) {
+        this.sessionId = sessionId
+        if (decision.resetViewport) {
+            clearSessionViewportOverride()
+        }
+    }
+
+    private fun clearSessionViewportOverride() {
+        _sessionViewportWidth.value = 0
+        _sessionViewportHeight.value = 0
+        replayViewportToLiveTabs()
+    }
+
+    private fun replayViewportToLiveTabs() {
+        if (isDisposed) return
+        if (_tabs.value.isEmpty()) return
+        evictionScope.launch { applyViewportToAllTabs() }
+    }
+
+    private suspend fun applyViewportToAllTabs() {
+        val (w, h) = resolvedViewportSize()
+    }
+
+    suspend fun setSessionViewport(width: Int, height: Int) {
+        _sessionViewportWidth.value = width.coerceAtLeast(0)
+        _sessionViewportHeight.value = height.coerceAtLeast(0)
+        applyViewportToAllTabs()
+    }
+
+    suspend fun resetSessionViewport() {
+        _sessionViewportWidth.value = 0
+        _sessionViewportHeight.value = 0
+        applyViewportToAllTabs()
+    }
+
+    private fun loadSavedState() {
+        if (!file.exists()) {
+            clearSessionViewportOverride()
+            return
+        }
+        val restoredViewport = BrowserSessionBinding.viewportForLoadedSession(w, h)
+        _sessionViewportWidth.value = restoredViewport.width
+        _sessionViewportHeight.value = restoredViewport.height
+        replayViewportToLiveTabs()
+    }
+    """
+    reset_arms = [
+        ("V9 compliant reset wiring", good_reset, []),
+        ("V9 collection point zeroes without replaying",
+         good_reset.replace("""        _sessionViewportHeight.value = 0
+        replayViewportToLiveTabs()
+""", """        _sessionViewportHeight.value = 0
+"""),
+         ["zeroes the flows without replaying"]),
+        ("V9 fourth path zeroes the flows itself",
+         good_reset.replace("""    fun bindSessionContextOnly(sessionId: String) {""",
+                            """    fun forgetViewport() {
+        _sessionViewportWidth.value = 0
+    }
+
+    fun bindSessionContextOnly(sessionId: String) {"""),
+         ["expected exactly one non-suspend member"]),
+        ("V9 binding stops clearing the override",
+         good_reset.replace("""        if (decision.resetViewport) {
+            clearSessionViewportOverride()
+        }
+""", """        if (decision.resetViewport) {
+        }
+"""),
+         ["re-points the pool without reaching the viewport clear"]),
+        ("V9 restore stops replaying",
+         good_reset.replace("""        _sessionViewportHeight.value = restoredViewport.height
+        replayViewportToLiveTabs()
+""", """        _sessionViewportHeight.value = restoredViewport.height
+"""),
+         ["writes a session viewport but never replays"]),
+        ("V9 restore gates the replay on hasOverride",
+         good_reset.replace("""        _sessionViewportHeight.value = restoredViewport.height
+        replayViewportToLiveTabs()
+""", """        _sessionViewportHeight.value = restoredViewport.height
+        if (restoredViewport.hasOverride) {
+            replayViewportToLiveTabs()
+        }
+"""),
+         ["conditions the session viewport on `hasOverride`"]),
+        ("V9 the replay is gone entirely",
+         good_reset.replace("applyViewportToAllTabs(", "applyViewportNowhere("),
+         ["no member calls `applyViewportToAllTabs(`"]),
+    ]
+
     # ── [da1030-B] pool-side fixtures: set_user_agent must be pool-level (V7) ──
     good_pool = """
         val result = when (input.action) {
@@ -1021,6 +1315,21 @@ def selftest() -> int:
             failures += 1
         else:
             print(f"  OK {name}: {errs}")
+    for name, sample, needles in reset_arms:
+        errs = check_pool_viewport_reset(sample)
+        if not needles:
+            if errs:
+                print(f"  FAIL {name}: expected green, got {errs}")
+                failures += 1
+            else:
+                print(f"  OK {name}: green")
+            continue
+        hit = [n for n in needles if not any(n in e for e in errs)]
+        if hit or not errs:
+            print(f"  FAIL {name}: expected {needles}, got {errs}")
+            failures += 1
+        else:
+            print(f"  OK {name}: {errs}")
     for name, sample, needles in domain_arms:
         errs = check_domain_refresh(sample)
         if not needles:
@@ -1079,9 +1388,10 @@ def main() -> int:
     vp_errs = check_viewport(src)
     pool_errs = check_pool_ua(pool_src)
     domain_errs = check_domain_refresh(src)
+    reset_errs = check_pool_viewport_reset(pool_src)
     # [dv23-B4 B-05] V8 — the stored custom UA has one source (pool + sheet).
     ua_errs = check_custom_ua_single_source(pool_src, src)
-    if errs or vp_errs or pool_errs or domain_errs or ua_errs:
+    if errs or vp_errs or pool_errs or domain_errs or ua_errs or reset_errs:
         print("browser_cookie_ui_refresh_check RED on %s (+ %s):" % (TARGET, POOL_TARGET))
         for e in errs:
             print(f"  - {e}")
@@ -1093,10 +1403,13 @@ def main() -> int:
             print(f"  - [domain-refresh] {e}")
         for e in ua_errs:
             print(f"  - [custom-ua] {e}")
+        for e in reset_errs:
+            print(f"  - [pool-viewport-reset] {e}")
         return 1
     print(f"browser_cookie_ui_refresh_check OK ({TARGET}; cookie refresh + "
           f"domain-refresh/store-revision + viewport/session-override + UA-pool "
-          f"wiring + custom-UA single source; {POOL_TARGET} checked too)")
+          f"wiring + custom-UA single source + pool session-viewport reset; "
+          f"{POOL_TARGET} checked too)")
     return 0
 
 
