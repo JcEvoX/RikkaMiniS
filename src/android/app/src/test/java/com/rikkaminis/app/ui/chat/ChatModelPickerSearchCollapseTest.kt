@@ -40,7 +40,7 @@ class ChatModelPickerSearchCollapseTest {
      * established).
      */
     private fun repoFile(rel: String): File {
-        var dir: File? = File(System.getProperty("user.dir"))
+        var dir: File? = File(System.getProperty("user.dir") ?: ".")
         while (dir != null) {
             val f = File(dir, rel)
             if (f.exists()) return f
