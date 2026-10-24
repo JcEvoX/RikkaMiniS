@@ -102,15 +102,21 @@ fun SoulSettingsScreen(onBack: () -> Unit) {
     // already seeded on first run, but loading from a freshly cleared app
     // shouldn't crash.
     LaunchedEffect(writeVersion) {
-        withContext(Dispatchers.IO) {
+        // [deep-audit-1048 B-01] IO computes, Main publishes: parsing SOUL.md is
+        // disk read + decode and stays on Dispatchers.IO, but the editor state
+        // is now written AFTER `withContext` returns (on the composition's
+        // dispatcher) instead of from inside the IO block. Compose state has no
+        // cross-thread happens-before, so the old shape could publish a
+        // half-updated editor to the next frame.
+        val parsed = withContext(Dispatchers.IO) {
             SoulStore.ensureExists(context)
-            val parsed = SoulStore.load(context) ?: SoulMDParser.parse(SoulStore.DEFAULT_CONTENT)
-            name = parsed.metadata.name
-            preservedEmoji = parsed.metadata.emoji
-            style = parsed.metadata.style
-            lang = parsed.metadata.lang
-            body = parsed.body
+            SoulStore.load(context) ?: SoulMDParser.parse(SoulStore.DEFAULT_CONTENT)
         }
+        name = parsed.metadata.name
+        preservedEmoji = parsed.metadata.emoji
+        style = parsed.metadata.style
+        lang = parsed.metadata.lang
+        body = parsed.body
         loaded = true
     }
 

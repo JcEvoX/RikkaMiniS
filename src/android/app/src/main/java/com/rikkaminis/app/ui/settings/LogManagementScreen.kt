@@ -6,6 +6,7 @@ import com.rikkaminis.app.ui.components.MinisTextButton
 import android.content.Context
 import android.content.Intent
 import android.text.format.Formatter
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -476,24 +477,31 @@ fun LogDetailScreen(
         // the way out and the handle never reaches lazyLog — so its file
         // descriptor leaked. Hold it locally and close it on cancellation.
         var opened: LazyLogFile? = null
-        try {
+        // [deep-audit-1048 B-01] IO computes, Main publishes: the stat + open
+        // stay on Dispatchers.IO, and the two Compose states are written after
+        // `withContext` returns (on the composition's dispatcher) instead of
+        // from inside the IO block, which had no happens-before with the frame.
+        val outcome = try {
             withContext(Dispatchers.IO) {
                 try {
                     val file = File(File(context.filesDir, "logs"), fileName)
                     if (!file.exists()) {
-                        loadError = context.getString(R.string.log_not_found)
+                        LogOpenResult(null, context.getString(R.string.log_not_found))
                     } else {
-                        opened = LazyLogFile.open(file)
+                        val handle = LazyLogFile.open(file)
+                        opened = handle
+                        LogOpenResult(handle, null)
                     }
                 } catch (e: Exception) {
-                    loadError = context.getString(R.string.log_error_reading, e.message ?: "")
+                    LogOpenResult(null, context.getString(R.string.log_error_reading, e.message ?: ""))
                 }
             }
         } catch (e: kotlinx.coroutines.CancellationException) {
             opened?.close()
             throw e
         }
-        lazyLog = opened
+        loadError = outcome.error
+        lazyLog = outcome.file
         loading = false
     }
 
@@ -516,7 +524,19 @@ fun LogDetailScreen(
                         // prep are disk-bound; `shareLogFile` takes them to
                         // Dispatchers.IO and starts the chooser back here.
                         val file = File(File(context.filesDir, "logs"), fileName)
-                        scope.launch { shareLogFile(context, file) }
+                        scope.launch {
+                            // [deep-audit-1048 B-04] A failed share used to be
+                            // silent; report it on the same toast channel the
+                            // other export paths use.
+                            val launched = shareLogFile(context, file)
+                            if (!launched) {
+                                Toast.makeText(
+                                    context,
+                                    context.getString(R.string.file_share_failed_toast, fileName),
+                                    Toast.LENGTH_SHORT,
+                                ).show()
+                            }
+                        }
                     }) {
                         Icon(Icons.Default.Share, contentDescription = stringResource(R.string.common_share))
                     }
@@ -593,6 +613,13 @@ fun LogDetailScreen(
 internal const val LOG_SHARE_MAX_CHARS = 100_000
 
 /**
+ * [deep-audit-1048 B-01] Outcome of the off-main open in [LogDetailScreen]:
+ * either a handle or the message to show. Produced on Dispatchers.IO, consumed
+ * (into Compose state) after `withContext` returns.
+ */
+private data class LogOpenResult(val file: LazyLogFile?, val error: String?)
+
+/**
  * Read at most [maxChars] characters of [file] for the EXTRA_TEXT fallback —
  * streamed, so the peak allocation is the cap and not the file size.
  *
@@ -652,6 +679,12 @@ private suspend fun buildLogShareChooser(context: Context, file: File): Intent? 
             // receiver hits SecurityException reading the content://
             // FileProvider URI.
             chooser.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            // [deep-audit-1048 B-04] …and NEW_TASK, like the sibling share
+            // paths (provider export / MCP export / markdown): `context` is
+            // whatever LocalContext hands the screen, and starting an activity
+            // from a non-Activity context without this flag throws
+            // AndroidRuntimeException — an uncatchable crash on the share tap.
+            chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             chooser
         } catch (e: Exception) {
             // Log the FileProvider failure — earlier this catch silently dropped
@@ -670,12 +703,25 @@ private suspend fun buildLogShareChooser(context: Context, file: File): Intent? 
                 type = "text/plain"
                 putExtra(Intent.EXTRA_TEXT, text)
             }
-            Intent.createChooser(intent, context.getString(R.string.log_share_chooser))
+            // [deep-audit-1048 B-04] Same NEW_TASK requirement as the
+            // FileProvider branch above.
+            Intent.createChooser(intent, context.getString(R.string.log_share_chooser)).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
         }
     }
 
-private suspend fun shareLogFile(context: Context, file: File) {
+/**
+ * [deep-audit-1048 B-04] Returns whether the chooser was actually started.
+ * Every failure exit used to be a bare `return` — a log file that had been
+ * rotated away, a FileProvider misconfiguration and a device with no share
+ * target all produced the same nothing-on-screen, indistinguishable from a
+ * successful share.
+ */
+private suspend fun shareLogFile(context: Context, file: File): Boolean {
     // Prep runs on Dispatchers.IO inside the builder; the launch stays on Main.
-    val chooser = buildLogShareChooser(context, file) ?: return
-    context.startActivity(chooser)
+    val chooser = buildLogShareChooser(context, file) ?: return false
+    // No handler installed throws ActivityNotFoundException; it used to escape
+    // the caller's coroutine scope and take the process down.
+    return runCatching { context.startActivity(chooser) }.isSuccess
 }

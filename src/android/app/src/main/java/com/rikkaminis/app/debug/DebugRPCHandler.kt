@@ -238,6 +238,12 @@ class DebugRPCHandler(private val context: Context) {
         }
 
         val baos = ByteArrayOutputStream()
+        // record-ok: deep-audit-1048 A-02 radius — this DEBUG RPC screenshot
+        // channel is outside the 5 production files in scope. A failed encode
+        // still answers a `size: 0` payload (latent, debug-only, no file is
+        // published). Deferred as §1048-A2 R5 with a trigger condition; fix it
+        // through saveOutcome(streamOpened = true, compressed = …) like the
+        // 1048 sites when that surface is next touched.
         bitmap.compress(Bitmap.CompressFormat.PNG, 100, baos)
         bitmap.recycle()
         val pngBytes = baos.toByteArray()

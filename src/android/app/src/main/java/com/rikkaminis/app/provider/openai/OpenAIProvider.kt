@@ -985,7 +985,6 @@ class OpenAIProvider constructor(
                         }
                         contentLen += cLen
                         reasoningLen += rcLen + rLen
-                        if (tcLen > 0) toolCallEventCount += tcLen
                     } else if (type.isNotEmpty()) {
                         // Responses API event-typed diagnostics
                         val dLen = ev.optString("delta", "").length
@@ -1003,6 +1002,18 @@ class OpenAIProvider constructor(
                 if (isResponsesAPI) {
                     // Responses API SSE parsing
                     val type = event.optString("type", "")
+                    // [dv28 A-01] Second feed site of the SAME counter the EOF
+                    // guard reads. Before this, only the Chat Completions
+                    // `delta.tool_calls` shape fed it, so a tool-call-only
+                    // Responses turn cut by EOF looked like an EMPTY turn
+                    // (contentLen == reasoningLen == toolCallEventCount == 0),
+                    // emitted no Finished(truncated = true), and let a
+                    // half-streamed argument object reach the executor.
+                    toolCallEventCount += responsesToolCallEventWeight(
+                        eventType = type,
+                        itemType = event.optJSONObject("item")?.optString("type"),
+                        argsDeltaLen = event.optString("delta", "").length,
+                    )
                     when {
                         // Reasoning text deltas — both event variants the API emits.
                         // For Codex OAuth the actual content is encrypted (echoed via
@@ -1106,12 +1117,18 @@ class OpenAIProvider constructor(
                                 "OpenAIProvider",
                                 "Responses API response.failed — code=$code message=$message"
                             )
-                            if (code == "server_error" || code == "rate_limit_exceeded") {
-                                // Transient family: retry on the same model
-                                // rather than falling back through the group.
-                                throw LLMError.TransientError("[$code] $message")
-                            }
-                            throw LLMError.ProviderError("[$code] $message")
+                            // [dv28 A-08] Same single-source mapping as the Chat
+                            // Completions inline-error arm: the symbolic code is turned
+                            // into HTTP semantics first, so `rate_limit_exceeded` becomes
+                            // RateLimited (back off / fall back to another route) instead
+                            // of the TransientError it used to share with server_error
+                            // (retry on the SAME model). Response body handed over is the
+                            // error object itself, whose `message` field is what
+                            // extractHttpErrorMessage reads.
+                            throw mapHttpError(
+                                openAiStreamErrorStatus(code, err?.optString("type", "") ?: ""),
+                                err?.toString() ?: event.toString(),
+                            )
                         }
                         type == "response.incomplete" -> {
                             // [T-responses-terminal-events] The server ended the
@@ -1184,13 +1201,22 @@ class OpenAIProvider constructor(
                     // Check for inline error (OpenRouter sends error inside SSE with empty choices)
                     val inlineError = event.optJSONObject("error")
                     if (inlineError != null) {
-                        val code = inlineError.optInt("code", 0)
-                        val msg = inlineError.optString("message", "Unknown SSE error")
+                        // [dv28 A-08] The code token is read as a STRING and mapped to
+                        // HTTP semantics before it reaches mapHttpError: relays spell
+                        // it `{"code":"rate_limit_exceeded"}` or carry `type` only, and
+                        // the old `optInt("code", 0)` coerced every such payload to 0 —
+                        // which mapHttpError turns into a non-retryable ProviderError.
                         // [T-android-effort-self-learn] Same hook as the HTTP-400 path:
                         // some relays report the identical error inside a 200 stream, so
                         // the enum lands in the event instead of the status body.
                         EffortTierLearner.record(request.url.host, bodyStr, event.toString())
-                        val err = mapHttpError(code, event.toString())
+                        val err = mapHttpError(
+                            openAiStreamErrorStatus(
+                                inlineError.optString("code", ""),
+                                inlineError.optString("type", ""),
+                            ),
+                            event.toString(),
+                        )
                         throw err
                     }
                     val choices = event.optJSONArray("choices")
@@ -1260,6 +1286,13 @@ class OpenAIProvider constructor(
                         // Tool calls (parallel: keyed by index)
                         val toolCalls = delta?.optJSONArray("tool_calls")
                         if (toolCalls != null) {
+                            // [dv28 A-01] Feed the EOF guard's turn counter from the
+                            // Chat Completions flavour. The weight derivation lives in
+                            // OpenAiStreamSignals.kt (single source, shared with the
+                            // Responses arm) — a turn whose ONLY progress is a tool call
+                            // must still be readable as non-empty when the stream dies
+                            // without [DONE], or the truncated-tool-call guard never fires.
+                            toolCallEventCount += chatCompletionsToolCallEventWeight(toolCalls.length())
                             for (i in 0 until toolCalls.length()) {
                                 val tc = toolCalls.getJSONObject(i)
                                 val idx = tc.optInt("index", 0)

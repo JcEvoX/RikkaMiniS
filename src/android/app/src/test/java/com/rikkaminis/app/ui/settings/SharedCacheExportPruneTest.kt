@@ -80,7 +80,16 @@ class SharedCacheExportPruneTest {
             io.indexOf("pruneShareDir(") < io.indexOf(".writeText("),
         )
         assertTrue("exportProviderInstance must stay a suspend fun", provider.contains("private suspend fun exportProviderInstance("))
-        assertTrue("it must be launched, not called inline", provider.contains("scope.launch { exportProviderInstance("))
+        // [deep-audit-1048 B-04] Shape, not spelling: the call now also CONSUMES
+        // its verdict (`val launched = exportProviderInstance(…)`) so a failed
+        // share can be reported, which broke the old
+        // `scope.launch { exportProviderInstance(` literal. The intent — started
+        // from a launch block, never inline on the click callback — is what this
+        // asserts.
+        assertTrue(
+            "it must be launched, not called inline",
+            insideLaunchBlock(provider, "exportProviderInstance("),
+        )
     }
 
     @Test
@@ -109,7 +118,12 @@ class SharedCacheExportPruneTest {
             io.indexOf("pruneShareDir(") < io.indexOf(".writeText("),
         )
         assertTrue("shareMcpServerJson must stay a suspend fun", mcp.contains("private suspend fun shareMcpServerJson("))
-        assertTrue("it must be launched, not called inline", mcp.contains("oauthScope.launch { shareMcpServerJson("))
+        // [deep-audit-1048 B-04] Same shape-not-spelling fix as the provider
+        // export above: the verdict is consumed before the toast.
+        assertTrue(
+            "it must be launched, not called inline",
+            insideLaunchBlock(mcp, "shareMcpServerJson("),
+        )
         val ioEnd = mcpFn.indexOf("withContext(Dispatchers.IO)") + io.length
         assertTrue("FileProvider URI construction must happen after the IO block", mcpFn.indexOf("FileProvider.getUriForFile(") > ioEnd)
         assertTrue("the chooser must exist", mcpFn.indexOf("startActivity(") > ioEnd)
@@ -167,6 +181,18 @@ class SharedCacheExportPruneTest {
         throw java.io.FileNotFoundException(
             "$relative not found from user.dir=${System.getProperty("user.dir")}",
         )
+    }
+
+    /** True when [callMarker] sits inside SOME `launch { … }` block of [src]. */
+    private fun insideLaunchBlock(src: String, callMarker: String): Boolean {
+        var from = 0
+        while (true) {
+            val at = src.indexOf("launch {", from)
+            if (at < 0) return false
+            val block = bracedBlock(src.substring(at), "launch {")
+            if (block.contains(callMarker)) return true
+            from = at + "launch {".length
+        }
     }
 
     /** Substring from [marker] through the brace that closes the first block

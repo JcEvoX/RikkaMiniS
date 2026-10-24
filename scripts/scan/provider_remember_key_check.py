@@ -1292,8 +1292,17 @@ def check_webdav_dialog(code):
 # landing its result, a DTO → StateFlow re-emit), so an unrelated field change
 # wiped the user's expand/collapse choice. C18 grades the two call sites, C19
 # the shared single source that replaced them.
-COLLAPSED_DECL_RE = re.compile(r"\bval\s+collapsedInstanceIds\s*(?::[^=\n]*)?(?:by|=)\s*")
+COLLAPSED_DECL_RE = re.compile(r"\b(?:val|var)\s+collapsedInstanceIds\s*(?::[^=\n]*)?(?:by|=)\s*")
 COLLAPSED_SINGLE_SOURCE = "rememberCollapsedInstanceIds"
+# [dv28/B-07] A collapse seed built from a FILTERED instance projection. The
+# collapse set answers 「is this provider's section folded」 — a question about
+# instance IDENTITY — so seeding it from a subset that excludes instances on a
+# mutable display flag makes the state's remember key change when the user
+# toggles that flag, folding/unfolding every section they had arranged. The
+# picker's `config.instances.filter { it.isEnabled }` was exactly this: flipping
+# any provider's enable switch re-seeded the whole set.
+DISPLAY_FLAG_FILTER_RE = re.compile(
+    r"\.\s*filter(?:Not)?\s*(?:\([^()\n]*\))?\s*\{[^{}]*\b(?:isEnabled|isHidden|pinned)\b[^{}]*\}")
 # Derivation from the instance LIST. `.instances.size` / `.instances.count` are
 # deliberately NOT identity — that is the same mistake as a size-only refresh
 # key — while anything else rooted at `<x>.instances` (`.map`, `.filter`,
@@ -1401,13 +1410,34 @@ def derives_from_instances(expr, decls, depth=0, seen=None):
     return False
 
 
+def derivation_sources(expr, decls, depth=0, seen=None):
+    """[expr] plus the body of every file-local declaration it names, transitively
+    — the whole chain a key resolves through. Used to ask a question about the
+    SHAPE of the derivation («does anything in this chain discard instances?»)
+    rather than about one spelling."""
+    out = [expr]
+    if depth >= 4:
+        return out
+    seen = seen or set()
+    for name in set(IDENT_RE.findall(expr)):
+        if name in seen:
+            continue
+        sub = decls.get(name)
+        if sub is None:
+            continue
+        out.extend(derivation_sources(sub, decls, depth + 1, seen | {name}))
+    return out
+
 def check_collapsed_screen(code):
     """C18 [da1034-B4] — the picker collapse state survives a non-identity config write.
 
     Graded on the DECISION (does this state re-seed only when the instance set
     changes), not the spelling: delegating to the shared single source counts,
     an inline `remember(config.instances.map { … }.toSet())` counts, and so does
-    any local the key list names that resolves back to `<x>.instances`.
+    any local the key list names that resolves back to `<x>.instances`. A
+    derivation that FILTERS the instance list on a per-instance display flag
+    (`isEnabled` / `isHidden` / `pinned`) does not count — it resolves back to
+    `.instances` while still re-seeding on a runtime toggle (dv28/B-07).
     Fail-closed when the declaration is gone (screen reworked)."""
     results = []
     m = COLLAPSED_DECL_RE.search(code)
@@ -1435,17 +1465,37 @@ def check_collapsed_screen(code):
                         "a provider instance being added or removed"))
         return results
     flat = " ".join(keys.split())
-    if derives_from_instances(keys, value_sources(code)):
-        results.append(("C18", True,
-                        "keys=[%s] resolve back to the instance list, so a config re-emit "
-                        "that changes no instance while the user is picking no longer "
-                        "resets every open section" % flat))
-    else:
+    decls = value_sources(code)
+    if not derives_from_instances(keys, decls):
         results.append(("C18", False,
                         "keys=[%s] derive from neither the instance list nor anything "
                         "derived from it — an unrelated config write (Quick Test "
                         "persisting imageEndpointResolved, refreshModels landing, a DTO → "
                         "StateFlow emit) resets every open section" % flat))
+        return results
+    # [dv28/B-07] …and the derivation must not THROW INSTANCES AWAY. A key built
+    # from `.instances.filter { it.isEnabled }` derives from the instance list
+    # (so the check above passes it) while being wrong for the same reason as a
+    # whole-config key: the filtered flag is user-mutable at runtime, so toggling
+    # it changes the key and re-seeds the collapse state. Graded on the shape of
+    # the chain, not on a flag-name whitelist at one call site: the offender is a
+    # `.filter`/`.filterNot` whose predicate reads a per-instance DISPLAY flag.
+    offenders = [t for t in derivation_sources(keys, decls)
+                 if INSTANCES_DERIVATION_RE.search(t) and DISPLAY_FLAG_FILTER_RE.search(t)]
+    if offenders:
+        results.append(("C18", False,
+                        "keys=[%s] resolve through a FILTERED instance projection (`%s`) — "
+                        "the key therefore changes whenever that per-instance display flag "
+                        "is toggled, so flipping one provider's switch re-seeds the set and "
+                        "folds (or unfolds) every section the user had arranged. The collapse "
+                        "set is a question about instance IDENTITY: seed it from the whole id "
+                        "set (the shared single source does exactly that)"
+                        % (flat, " ".join(offenders[0].split())[:160])))
+        return results
+    results.append(("C18", True,
+                    "keys=[%s] resolve back to the instance list, so a config re-emit "
+                    "that changes no instance while the user is picking no longer "
+                    "resets every open section" % flat))
     return results
 
 
@@ -2563,8 +2613,13 @@ def check_system_voice_member_label(code):
                         % ", ".join(str(x) for x in bad)))
     elif not sites:
         results.append(("C-SV2b", False,
-                        "the file lists group members but performs no provider-label "
-                        "read — fail-closed, re-derive this criterion"))
+                        "the file lists group members but never reads a provider label "
+                        "through the System single source (no `….?.label` statement consulting "
+                        "SystemVoiceEntries / SystemVoiceMemberPresentation). Either the member "
+                        "rows lost their provider label entirely, or the label is read behind an "
+                        "`if (instance != null)` guard — which is exactly the shape that leaves "
+                        "a System voice member (no instance: the device is its provider) with a "
+                        "bare model id while the group detail screen shows 「System · <model>」"))
     else:
         results.append(("C-SV2b", True,
                         "%d provider-label read(s), all through the System single "
@@ -2592,6 +2647,13 @@ CHECKERS = (
     (REL_BACKUP_SCREEN, check_webdav_dialog),
     (REL_ADD_MODELS, check_collapsed_screen),
     (REL_AGENT_LOOP_SHEETS, check_collapsed_screen),
+    # [dv28/B-07] both criteria already existed and were mounted only on the
+    # two screens that were FIXED by dv15/dv27 — the chat model picker, which
+    # renders the same list in the same shape, was never wired. This is the
+    # mirror of dv27-B3's lesson: 「判据存在 ≠ 判据挂上」. The picker's own
+    # collapse seed was filtered on `isEnabled` and its System members lost the
+    # provider label, so both criteria go red on the baseline file.
+    (REL_MODEL_PICKER_SHEET, check_collapsed_screen),
     (REL_MODEL_ENTRY_PICKER, check_collapsed_helper),
     # da1039-B3 (B-03 / B-04 / B-08)
     (REL_ADD_CUSTOM_MODEL, check_add_custom_model),
@@ -2638,6 +2700,11 @@ CHECKERS = (
     (REL_GROUP_DETAIL, check_elvis_after_else_null),
     (REL_GROUP_DETAIL, check_system_voice_cost_tier_write),
     (REL_GROUP_DETAIL, check_system_voice_member_label),
+    # [dv28/B-07] the picker renders the very same member rows (its expanded
+    # group section) and answered 「what is this member's provider」 with
+    # `if (instance != null)` — never consulting the System source. Mounting the
+    # criterion here is half the fix; the other half is RED on the baseline file.
+    (REL_MODEL_PICKER_SHEET, check_system_voice_member_label),
 )
 
 
@@ -3880,17 +3947,31 @@ internal fun pickerDisplayMembers(
     if (isSelected && activeEntryId != null) listOfNotNull(resolve(activeEntryId)) else emptyList()
 }
 
-internal fun ModelPickerSheetProviderSections(allInstanceIds: Set<String>) {
+internal fun ModelPickerSheetProviderSections(config: ProviderConfig) {
     var searchText by remember { mutableStateOf("") }
-    var collapsedInstanceIds by remember(allInstanceIds) {
-        mutableStateOf(allInstanceIds)
-    }
+    // [dv28/B-07] the pre-fix copy was `remember(allInstanceIds)` with
+    // allInstanceIds = config.instances.filter { it.isEnabled } — a key that
+    // moves when the user toggles a provider's enable switch.
+    var collapsedInstanceIds by rememberCollapsedInstanceIds(config)
     orderedProviderSections.forEachIndexed { sectionIndex, (instance, entries) ->
         val isCollapsed = searchText.isEmpty() && collapsedInstanceIds.contains(instance.id)
         if (isCollapsed) {
             renderCollapsedSummary(instance, entries)
         }
     }
+}
+
+// [dv28/B-07] the expanded group's member rows answer 「which provider serves
+// this member」 through the shared presentation decision — a System voice member
+// has no instance behind it, so `if (instance != null)` dropped the label.
+internal fun pickerMemberSubtitle(entry: ModelEntry, config: ProviderConfig): String {
+    val instance = config.instances.find { it.id == entry.providerInstanceId }
+    return SystemVoiceMemberPresentation.memberSubtitle(
+        instanceLabel = instance?.label?.takeUnless { it.isEmpty() }
+            ?: instance?.providerType?.displayName,
+        isSystemEntry = SystemVoiceEntries.isSystemEntryId(entry.id),
+        systemLabel = "System",
+    )
 }
 """
 
@@ -4184,6 +4265,45 @@ FIX_CHAT_SCREEN_ENTRY_BY_ID_INDIRECTION = FIX_CHAT_SCREEN_CLEAN.replace(
     """    group?.memberEntryIds?.firstNotNullOfOrNull(::entryById)""")
 
 
+
+# --- [dv28/B-07] C18 + C-SV2b mounted on the chat model picker --------------
+
+# The picker's private collapse copy: it DOES derive from the instance list, so
+# the pre-dv28 C18 (「keys resolve back to instances」) let it through — the key
+# was filtered on `isEnabled`, which is user-mutable, so the criterion had to be
+# tightened to grade the SHAPE of the derivation. Only C18 may fire here.
+FIX_MODEL_PICKER_SHEET_INLINE_FILTERED_KEY = FIX_MODEL_PICKER_SHEET_CLEAN.replace(
+    "    var collapsedInstanceIds by rememberCollapsedInstanceIds(config)",
+    """    val allInstanceIds = remember(config) {
+        config.instances.filter { it.isEnabled }.map { it.id }.toSet()
+    }
+    var collapsedInstanceIds by remember(allInstanceIds) {
+        mutableStateOf(allInstanceIds)
+    }""")
+
+# The pre-fix member row: the label only exists when a persisted instance does,
+# so a System voice member (the device IS its provider) shows a bare model id.
+FIX_MODEL_PICKER_SHEET_MEMBER_LABEL_GUARDED = FIX_MODEL_PICKER_SHEET_CLEAN.replace(
+    """    val instance = config.instances.find { it.id == entry.providerInstanceId }
+    return SystemVoiceMemberPresentation.memberSubtitle(
+        instanceLabel = instance?.label?.takeUnless { it.isEmpty() }
+            ?: instance?.providerType?.displayName,
+        isSystemEntry = SystemVoiceEntries.isSystemEntryId(entry.id),
+        systemLabel = "System",
+    )""",
+    """    val instance = config.instances.find { it.id == entry.providerInstanceId }
+    return if (instance != null) instance.label.ifEmpty { instance.providerType.displayName } else \"\"""")
+
+# A site that DOES read `?.label` but never consults the System source: the
+# criterion must catch this too (site present, decision absent).
+FIX_MODEL_PICKER_SHEET_MEMBER_LABEL_BARE = FIX_MODEL_PICKER_SHEET_CLEAN.replace(
+    """    return SystemVoiceMemberPresentation.memberSubtitle(
+        instanceLabel = instance?.label?.takeUnless { it.isEmpty() }
+            ?: instance?.providerType?.displayName,
+        isSystemEntry = SystemVoiceEntries.isSystemEntryId(entry.id),
+        systemLabel = "System",
+    )""",
+    """    return instance?.label.orEmpty()""")
 
 CLEAN_TREE = {
     REL_PROVIDER_LIST: FIX_PROVIDER_LIST_CLEAN,
@@ -4506,6 +4626,20 @@ def run_selftest():
              variant(REL_ADD_MODELS, FIX_ADD_MODELS_UNRELATED_REMEMBER), failures)
     run_case("failclosed-missing-add-models-anchor", 1,
              variant(REL_ADD_MODELS, FIX_ADD_MODELS_MISSING_ANCHOR), failures, ("C18", "C24", "C25"))
+    # --- dv28/B-07: C18 + C-SV2b mounted on the chat model picker -----------
+    # the picker's private copy derives from `.instances` but FILTERS it on a
+    # user-mutable flag — the pre-dv28 criterion accepted exactly this shape.
+    run_case("c18-picker-inline-filtered-key", 1,
+             variant(REL_MODEL_PICKER_SHEET, FIX_MODEL_PICKER_SHEET_INLINE_FILTERED_KEY),
+             failures, ("C18",))
+    # the member label exists only when a persisted instance does (PRE shape)
+    run_case("csv2-picker-member-label-guarded", 1,
+             variant(REL_MODEL_PICKER_SHEET, FIX_MODEL_PICKER_SHEET_MEMBER_LABEL_GUARDED),
+             failures, ("C-SV2b",))
+    # a `?.label` read that never consults the System source
+    run_case("csv2-picker-member-label-bare", 1,
+             variant(REL_MODEL_PICKER_SHEET, FIX_MODEL_PICKER_SHEET_MEMBER_LABEL_BARE),
+             failures, ("C-SV2b",))
     # --- da1039-B3: C24 / C25 (Quick Test target) ---------------------------
     run_case("c24-c25-add-models-snapshot-target", 1,
              variant(REL_ADD_MODELS, FIX_ADD_MODELS_SNAPSHOT_TARGET), failures, ("C24", "C25"))
@@ -4571,9 +4705,11 @@ def run_selftest():
              variant(REL_MODEL_PICKER_SHEET, FIX_MODEL_PICKER_SHEET_DERIVED), failures)
     # C34 is registered on the same surface, so a reworked file fails BOTH
     # criteria closed — that is the intended shape, not an extra red.
+    # dv28/B-07: C18 is mounted on this surface too, so a reworked file reds it
+    # fail-closed as well (C-SV2b stays green — no member list, nothing to grade).
     run_case("failclosed-sheet-missing-anchor", 1,
              variant(REL_MODEL_PICKER_SHEET, FIX_MODEL_PICKER_SHEET_MISSING_ANCHOR), failures,
-             ("C32", "C34", "C35"))
+             ("C18", "C32", "C34", "C35"))
     # --- dv25-B4: C35 (active entry shares the single source) / C36 (elvis) ---
     run_case("c35-picker-active-bare-find", 1,
              variant(REL_MODEL_PICKER_SHEET, FIX_MODEL_PICKER_SHEET_ACTIVE_BARE),

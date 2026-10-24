@@ -7,6 +7,7 @@ import com.rikkaminis.app.data.model.AgentToolParam
 import com.rikkaminis.app.sandbox.PRootKernel
 import com.rikkaminis.app.ui.chat.decodeUriPath
 import com.rikkaminis.app.util.ImageDecoding
+import com.rikkaminis.app.util.saveOutcome
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 
@@ -94,16 +95,23 @@ object ReadImageTool {
             // bitmap"). Recycle the one bitmap the decoder handed us.
             val width = decoded.sourceWidth
             val height = decoded.sourceHeight
+            val encoded: Boolean
             val imageBytes: ByteArray
             try {
                 val out = ByteArrayOutputStream()
-                decoded.bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
+                // [deep-audit-1048 A-02] `compress` returns false (no throw) when
+                // the encoder wrote nothing; dropped, this tool handed the model a
+                // 0-byte "image/jpeg" and reported success.
+                encoded = decoded.bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
                 imageBytes = out.toByteArray()
             } finally {
                 // [audit-0917] Recycle on the error path too: a throw between the
                 // decode and the old explicit recycles used to leak the bitmap
                 // until GC (native memory). recycle() is idempotent.
                 decoded.bitmap.recycle()
+            }
+            if (!saveOutcome(streamOpened = true, compressed = encoded)) {
+                return ToolExecutionResult("Error: Cannot encode image: $path", false, toolTitle = toolTitle)
             }
             val metadata = "[$path | ${width}x${height} | ${file.length()} bytes]"
             ToolExecutionResult(

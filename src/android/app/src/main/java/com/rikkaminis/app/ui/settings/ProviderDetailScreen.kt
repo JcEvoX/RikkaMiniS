@@ -473,7 +473,22 @@ fun ProviderDetailScreen(
                 showExportDialog = false
                 val live = currentInstance()
                 AppLogger.info(TAG, "Export instance ${live.id} (${live.label})")
-                scope.launch { exportProviderInstance(exportContext, providerRepository, live) }
+                scope.launch {
+                    // [deep-audit-1048 B-04] The export reports whether the
+                    // chooser really started; a failed staging write / provider
+                    // URI / handler used to be indistinguishable from success.
+                    val launched = exportProviderInstance(exportContext, providerRepository, live)
+                    if (!launched) {
+                        Toast.makeText(
+                            exportContext,
+                            exportContext.getString(
+                                R.string.file_share_failed_toast,
+                                "${live.label}.json",
+                            ),
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                }
             },
         )
     }
@@ -643,19 +658,24 @@ private fun connectionSummary(
  * Export the provider instance as JSON and hand it to the system share sheet
  * via FileProvider. Mirrors iOS `ProviderShareSheet` — writes a <label>.json
  * file to app-scoped cache and emits ACTION_SEND with a content:// URI.
+ *
+ * [deep-audit-1048 B-04] Returns whether the chooser was actually started.
+ * Every failure exit used to be a bare `return`, so a failed staging write, a
+ * FileProvider misconfiguration or a missing handler all looked exactly like a
+ * successful export (nothing on screen), and the caller had no way to tell.
  */
 private suspend fun exportProviderInstance(
     context: android.content.Context,
     providerRepository: ProviderRepository,
     instance: com.rikkaminis.app.data.model.ProviderInstance,
-) {
+): Boolean {
     val safeLabel = instance.label.ifBlank { "provider" }
         .replace(Regex("[^A-Za-z0-9._-]"), "_")
     // [da1024-G] exportInstanceJSON reads EncryptedSharedPreferences and
     // serializes the whole instance (hundreds of entries for a large catalog),
     // and the staging write is disk I/O — both used to run on the UI thread
-    // from the dialog's onConfirm. Returns null when the export or the write
-    // fails, preserving the previous "silently skip the share sheet".
+    // from the dialog's onConfirm. Returns false when the export or the write
+    // fails; the caller surfaces it instead of silently skipping the sheet.
     val file = withContext(Dispatchers.IO) {
         val json = providerRepository.exportInstanceJSON(instance.id) ?: return@withContext null
         val dir = java.io.File(context.cacheDir, "shared").apply { mkdirs() }
@@ -665,7 +685,7 @@ private suspend fun exportProviderInstance(
         com.rikkaminis.app.ui.components.pruneShareDir(dir)
         val f = java.io.File(dir, "$safeLabel.json")
         runCatching { f.writeText(json) }.map { f }.getOrNull()
-    } ?: return
+    } ?: return false
 
     val uri = try {
         androidx.core.content.FileProvider.getUriForFile(
@@ -674,7 +694,7 @@ private suspend fun exportProviderInstance(
             file,
         )
     } catch (_: Throwable) {
-        return
+        return false
     }
 
     val sendIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
@@ -684,9 +704,15 @@ private suspend fun exportProviderInstance(
         addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
     val chooser = android.content.Intent.createChooser(sendIntent, "Export provider").apply {
+        // [deep-audit-1048 B-04] The chooser carries the flag itself, like the
+        // markdown share path and the log share: `exportContext` is whatever
+        // LocalContext hands us, and starting an activity from a non-Activity
+        // context without NEW_TASK throws AndroidRuntimeException.
         addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
     }
-    context.startActivity(chooser)
+    // A device with no share target throws ActivityNotFoundException here — it
+    // used to escape the coroutine scope and take the process with it.
+    return runCatching { context.startActivity(chooser) }.isSuccess
 }
 
 /** Input modalities that get a (muted) capability badge in the model list. */

@@ -144,6 +144,8 @@ import com.rikkaminis.app.ui.components.sanitizeSingleLineInput
 import com.rikkaminis.app.ui.components.MinisMenu
 import com.rikkaminis.app.ui.components.MinisMenuDivider
 import com.rikkaminis.app.ui.components.providerDotColor
+import com.rikkaminis.app.ui.components.rememberCollapsedInstanceIds
+import com.rikkaminis.app.ui.settings.SystemVoiceMemberPresentation
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -410,12 +412,16 @@ internal fun ModelPickerSheet(
     // Note: the non-text-output "may not work as an Agent" confirmation lives
     // in ChatScreen's callback wrappers (ee828dba), NOT here — the sheet stays
     // a dumb list and the caller owns selection policy.
-    val allInstanceIds = remember(config) {
-        config.instances.filter { it.isEnabled }.map { it.id }.toSet()
-    }
-    var collapsedInstanceIds by remember(allInstanceIds) {
-        mutableStateOf(allInstanceIds)
-    }
+    // [dv28/B-07] Single source. This sheet kept a private copy of the collapse
+    // state and seeded it from `config.instances.filter { it.isEnabled }`, i.e.
+    // a key derived from a MUTABLE per-instance display flag: flipping any
+    // provider's enable switch changed the key, re-seeded the set and folded
+    // every section the user had just arranged. `rememberCollapsedInstanceIds`
+    // keys on the instance-ID set (identity, immune to an unrelated config
+    // write) and is what the other two surfaces that render the same list use.
+    // A disabled instance merely sits in the seed unused — `allInstancesWithEntries`
+    // below filters those out, so the collapse set never gets read for them.
+    var collapsedInstanceIds by rememberCollapsedInstanceIds(config)
 
     // Filtered groups — [S3-model-picker-rank] ranked, not just filtered.
     val filteredGroups = remember(groups, searchText) {
@@ -813,6 +819,24 @@ internal fun ModelPickerSheet(
                                     displayMembers.forEach { entry ->
                                             val isActive = activeEntryId == entry.id
                                             val instance = config.instances.find { it.id == entry.providerInstanceId }
+                                            // [dv28/B-07] Single source. A System voice
+                                            // member has NO provider instance (the device is
+                                            // its provider), so the old `if (instance != null)`
+                                            // branch dropped the provider name entirely and
+                                            // every row of a default Voice group showed a bare
+                                            // model id — while the group detail screen, which
+                                            // asks the same question through
+                                            // SystemVoiceMemberPresentation, showed
+                                            // 「System · <model>」. The DECISION (what the
+                                            // secondary line says, and when it is empty) lives
+                                            // in the shared presentation helper; only the
+                                            // rendering stays here.
+                                            val memberSubtitle = SystemVoiceMemberPresentation.memberSubtitle(
+                                                instanceLabel = instance?.label?.takeUnless { it.isEmpty() }
+                                                    ?: instance?.providerType?.displayName,
+                                                isSystemEntry = SystemVoiceEntries.isSystemEntryId(entry.id),
+                                                systemLabel = stringResource(R.string.voice_provider_system),
+                                            )
                                             Row(
                                                 modifier = Modifier
                                                     .fillMaxWidth()
@@ -837,9 +861,9 @@ internal fun ModelPickerSheet(
                                                 Column(modifier = Modifier.weight(1f)) {
                                                     Text(entry.model.displayName, style = MaterialTheme.typography.bodyMedium)
                                                     Row {
-                                                        if (instance != null) {
+                                                        if (memberSubtitle.isNotEmpty()) {
                                                             Text(
-                                                                instance.label.ifEmpty { instance.providerType.displayName },
+                                                                memberSubtitle,
                                                                 style = MaterialTheme.typography.labelSmall,
                                                                 fontWeight = FontWeight.Medium,
                                                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),

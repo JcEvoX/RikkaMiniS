@@ -51,13 +51,34 @@ Pins the cache/share housekeeping contract:
   postdates the fresh copy written after the prune, so the prune can never
   delete the file the current call is about to stage.
 
+  arm6: [deep-audit-1048 B-04] the share-sheet hand-off itself. The three
+        writers above all end in `startActivity(chooser)`, and none of the
+        failure exits was visible:
+
+        C-NT     every `Intent.createChooser(` is given
+                 FLAG_ACTIVITY_NEW_TASK — on the chooser statement itself or
+                 through `chooser.addFlags(…)` in the same function. A chooser
+                 started from a non-Activity context without it throws
+                 AndroidRuntimeException (the two sibling paths already did
+                 this; the log share did not).
+        C-SILENT the function that starts the sheet must return a VERDICT
+                 (non-Unit, no bare `return` / `return null`), and every call
+                 site must consume it and sit in a block that reports failure
+                 (Toast / snackbar / AppLogger). `?: return` on a missing file
+                 and a `return` on a FileProvider failure were both
+                 indistinguishable from "shared".
+
+        Both criteria are derived from the call graph (which functions call
+        `startActivity`), not from names.
+
 Usage:
   python3 share_dir_prune_check.py <repo_root>   # real tree
   python3 share_dir_prune_check.py --selftest    # fixtures
 
 Selftest marker: SHARE_DIR_PRUNE_SELFTEST=PASS (+ CRASH_SHARE_SELFTEST=PASS
 for the [da1025-B] arm4 fixture block, ARM5_FILESDIR_PRUNE_SELFTEST=PASS for
-the [da1028-C] arm5 fixture block)
+the [da1028-C] arm5 fixture block),
+SHARE_HANDOFF_SELFTEST=PASS for the [deep-audit-1048 B-04] arm6 block
 """
 
 import os
@@ -78,6 +99,12 @@ CAMERA_REL = "src/android/app/src/main/java/com/rikkaminis/app/ui/chat/ChatScree
 PHOTOS_REL = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/PhotosOffloadHandler.kt"
 A11Y_REL = "src/android/app/src/main/java/com/rikkaminis/app/sandbox/offload/AccessibilityOffloadHandler.kt"
 MUTATION_REL = "src/android/app/src/main/java/com/rikkaminis/app/debug/ChatMutationMethods.kt"
+LOG_SCREEN = SETTINGS_DIR + "/LogManagementScreen.kt"
+SHARE_FILES = (PROVIDER_REL, MCP_REL, LOG_SCREEN)
+
+CHOOSER_CALL = re.compile(r"Intent\s*\.\s*createChooser\s*\(")
+START_CALL = re.compile(r"\bstartActivity\s*\(")
+FEEDBACK_TOKENS = ("Toast.makeText(", "snackbarHostState", "SnackbarHost(", "AppLogger.")
 
 # Covers cacheDir/share (plural writers) and cacheDir/shared, for ANY receiver
 # (`context.cacheDir` / `ctx.cacheDir` / ...). The literal run is bounded by the
@@ -491,6 +518,202 @@ class WebAppActivity {
 """
 
 
+# ─── [deep-audit-1048 B-04] share hand-off: flags + verdict + feedback ──────
+
+def _brace_end(text, open_idx):
+    depth = 0
+    for j in range(open_idx, len(text)):
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return j
+    return None
+
+
+def _innermost_block(text, idx):
+    """(start, end) of the innermost `{ … }` containing [idx]."""
+    stack = []
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "{":
+            stack.append(i)
+        elif ch == "}" and stack:
+            start = stack.pop()
+            if start < idx < i:
+                return start, i
+        i += 1
+    return None
+
+
+def _enclosing_fun(code, idx):
+    """(name, body_start, body_end) of the `fun` whose body contains [idx]."""
+    best = None
+    for m in re.finditer(r"\bfun\s+(\w+)\s*\(", code):
+        if m.start() > idx:
+            break
+        brace = code.find("{", m.end())
+        if brace < 0:
+            continue
+        depth, j = 0, brace
+        while j < len(code):
+            if code[j] == "{":
+                depth += 1
+            elif code[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if brace < idx < j:
+            best = (m.group(1), brace, j)
+    return best
+
+
+def _statement(text, idx):
+    """The expression statement around [idx]: from its line start until the
+    bracket depth returns to zero and the call chain stops."""
+    start = text.rfind("\n", 0, idx) + 1
+    depth, i = 0, idx
+    while i < len(text):
+        ch = text[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif ch == "\n" and depth == 0:
+            nxt = text[i:].lstrip("\n ")
+            if not nxt.startswith((".", "?", ":")):
+                break
+        i += 1
+    return text[start:i]
+
+
+def _declared_return_type(sig):
+    """Return type text of a `fun …` signature up to its body, or ''."""
+    depth = 0
+    for j, ch in enumerate(sig):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == ":" and depth == 0:
+            return sig[j + 1:].split("{")[0].split("=")[0].strip()
+    return ""
+
+
+def _sig_text(code, fun_match):
+    """The signature text of the `fun` at [fun_match] (up to body / `=`)."""
+    if fun_match is None:
+        return ""
+    i, depth = fun_match.end(), 1
+    while i < len(code):
+        if code[i] == "(":
+            depth += 1
+        elif code[i] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    end = i
+    while end < len(code) and code[end] not in "{=":
+        end += 1
+    return code[fun_match.start():end]
+
+
+def check_handoff_src(rel, text):
+    """[deep-audit-1048 B-04] C-NT + C-SILENT for one share-bearing source.
+
+    C-NT: every `Intent.createChooser(` carries FLAG_ACTIVITY_NEW_TASK (on the
+    chooser statement, or through `<chooser>.addFlags(…)` in the same function).
+    C-SILENT: the function that calls `startActivity` declares a non-Unit
+    verdict, no failure exit is a bare `return`, the launch is contained in
+    runCatching/try, and every call site assigns the verdict inside a block that
+    reports failure.
+    """
+    code = strip_comments(text)
+    problems = []
+    chooser_sites = 0
+    for m in CHOOSER_CALL.finditer(code):
+        chooser_sites += 1
+        stmt = _statement(code, m.start())
+        if "FLAG_ACTIVITY_NEW_TASK" in stmt:
+            continue
+        var = re.match(r"\s*val\s+(\w+)\s*=", stmt)
+        fn = _enclosing_fun(code, m.start())
+        body = code[fn[1]: fn[2]] if fn else ""
+        if var and re.search(r"\b%s\s*\.\s*addFlags\s*\([^)]*FLAG_ACTIVITY_NEW_TASK"
+                             % re.escape(var.group(1)), body):
+            continue
+        problems.append("[C-NT] %s: a chooser is started without "
+                        "FLAG_ACTIVITY_NEW_TASK (offset %d)" % (rel, m.start()))
+
+    starters = 0
+    for m in START_CALL.finditer(code):
+        starters += 1
+        fn = _enclosing_fun(code, m.start())
+        if fn is None:
+            problems.append("[C-SILENT] %s: startActivity outside any function" % rel)
+            continue
+        name, body_start, body_end = fn
+        body = code[body_start: body_end]
+        rtype = _declared_return_type(
+            _sig_text(code, re.search(r"\bfun\s+%s\s*\(" % re.escape(name), code)))
+        if rtype in ("", "Unit"):
+            problems.append("[C-SILENT] %s: %s() starts the sheet but returns no verdict "
+                            "(%s) — a failed share is indistinguishable from success"
+                            % (rel, name, rtype or "no return type"))
+        for r in re.finditer(r"\breturn\b(?!\s*@)", body):
+            same_line = body[r.end(): r.end() + 40].split("\n")[0]
+            if same_line.strip() in ("", "}", "null", "Unit"):
+                if not any(tok in same_line for tok in FEEDBACK_TOKENS):
+                    problems.append("[C-SILENT] %s: bare `return` in %s() — that exit "
+                                    "reports nothing" % (rel, name))
+        contained = []
+        for b in re.finditer(r"(?:runCatching|try)\s*\{", body):
+            end = _brace_end(body, b.end() - 1)
+            if end is not None:
+                contained.append((b.start(), end))
+        for s in START_CALL.finditer(body):
+            if not any(lo < s.start() < hi for lo, hi in contained):
+                problems.append("[C-SILENT] %s: startActivity in %s() is not wrapped in "
+                                "runCatching/try — a missing handler crashes the caller"
+                                % (rel, name))
+        for c in re.finditer(r"\b%s\s*\(" % re.escape(name), code):
+            if re.search(r"fun\s+$", code[max(0, c.start() - 6): c.start()]):
+                continue  # the declaration itself
+            stmt = _statement(code, c.start())
+            if not re.search(r"=\s*%s\s*\(" % re.escape(name), stmt):
+                problems.append("[C-SILENT] %s: call to %s() discards its verdict: %s"
+                                % (rel, name, stmt.strip()[:80]))
+                continue
+            block = _innermost_block(code, c.start())
+            region = code[block[0]: block[1]] if block else ""
+            if not any(tok in region for tok in FEEDBACK_TOKENS):
+                problems.append("[C-SILENT] %s: call to %s() has no visible failure path "
+                                "in its block" % (rel, name))
+    if chooser_sites == 0 and starters == 0:
+        problems.append("[C-NT/C-SILENT] %s: no chooser / startActivity found — the share "
+                        "path moved, so this criterion saw nothing to check" % rel)
+    return problems
+
+
+def check_handoff(root):
+    problems = []
+    for rel in SHARE_FILES:
+        try:
+            with open(os.path.join(root, rel), encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError:
+            problems.append("[C-NT] %s: file missing (was it renamed/moved?)" % rel)
+            continue
+        problems.extend(check_handoff_src(rel, text))
+    return problems
+
+
 def run_fixture(name, content, expect_ok):
     with tempfile.TemporaryDirectory() as tmp:
         os.makedirs(os.path.join(tmp, ACTIVITY_REL.rsplit("/", 1)[0]))
@@ -879,6 +1102,78 @@ def selftest():
     )
     ok &= ok5
     print("ARM5_FILESDIR_PRUNE_SELFTEST=" + ("PASS" if ok5 else "FAIL"))
+    # ── [deep-audit-1048 B-04] arm6: share hand-off ───────────────────────
+    good_handoff = "\n".join([
+        'private suspend fun shareThing(context: Context, file: File): Boolean {',
+        '    val file2 = withContext(Dispatchers.IO) {',
+        '        val dir = File(context.cacheDir, "shared").apply { mkdirs() }',
+        '        pruneShareDir(dir)',
+        '        val f = File(dir, "x.json")',
+        '        runCatching { f.writeText("{}") }.map { f }.getOrNull()',
+        '    } ?: return false',
+        '    val uri = try {',
+        '        FileProvider.getUriForFile(context, "p", file2)',
+        '    } catch (_: Throwable) {',
+        '        return false',
+        '    }',
+        '    val chooser = Intent.createChooser(Intent(Intent.ACTION_SEND), "t").apply {',
+        '        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)',
+        '    }',
+        '    return runCatching { context.startActivity(chooser) }.isSuccess',
+        '}',
+        '',
+        'private fun Caller() {',
+        '    scope.launch {',
+        '        val launched = shareThing(context, file)',
+        '        if (!launched) {',
+        '            Toast.makeText(context, "Share failed", Toast.LENGTH_SHORT).show()',
+        '        }',
+        '    }',
+        '}',
+        '    ',
+    ])
+    # V1: the pre-fix shape — Unit return + bare exits on every failure path.
+    bad_handoff_unit = (good_handoff
+                        .replace("file: File): Boolean {", "file: File) {")
+                        .replace("    } ?: return false", "    } ?: return")
+                        .replace("        return false\n", "        return\n")
+                        .replace("    return runCatching { context.startActivity(chooser) }.isSuccess",
+                                 "    context.startActivity(chooser)"))
+    # V2: verdict kept, chooser loses the flag.
+    bad_handoff_flag = good_handoff.replace(
+        "        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)\n", "")
+    # V3: startActivity escapes containment.
+    bad_handoff_crash = good_handoff.replace(
+        "    return runCatching { context.startActivity(chooser) }.isSuccess",
+        "    context.startActivity(chooser)\n    return true")
+    # V4: the verdict is dropped at the call site.
+    bad_handoff_ignored = good_handoff.replace(
+        "        val launched = shareThing(context, file)\n"
+        "        if (!launched) {\n"
+        "            Toast.makeText(context, \"Share failed\", Toast.LENGTH_SHORT).show()\n"
+        "        }\n",
+        "        shareThing(context, file)\n")
+    # V5: verdict consumed but nothing is shown.
+    bad_handoff_silent = good_handoff.replace(
+        "            Toast.makeText(context, \"Share failed\", Toast.LENGTH_SHORT).show()\n",
+        "            println(\"failed\")\n")
+
+    for arm_name, sample in (
+        ("b04-compliant", good_handoff),
+        ("b04-unit-return + bare exits", bad_handoff_unit),
+        ("b04-chooser without NEW_TASK", bad_handoff_flag),
+        ("b04-startActivity not contained", bad_handoff_crash),
+        ("b04-verdict discarded at the call site", bad_handoff_ignored),
+        ("b04-failure never shown", bad_handoff_silent),
+    ):
+        got = check_handoff_src("Fixture.kt", sample)
+        if (arm_name == "b04-compliant") == (not got):
+            print(f"  SELFTEST {arm_name}: OK ({got[0][:100] if got else 'green'})")
+        else:
+            print(f"  SELFTEST {arm_name}: FAIL (got {got})")
+            ok = False
+    print("SHARE_HANDOFF_SELFTEST=" + ("PASS" if ok else "FAIL"))
+
     print("SHARE_DIR_PRUNE_SELFTEST=" + ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 
@@ -900,6 +1195,9 @@ def main():
     a3 = check_arm3(root)
     if a3:
         failures.append(f"arm3 (cacheDir/shared writers must be suspend + IO + prune): {a3}")
+    a6 = check_handoff(root)
+    if a6:
+        failures.append(f"arm6 (share hand-off: flags + verdict + feedback): {a6}")
     a4 = check_arm4(root)
     if a4:
         failures.append(f"arm4 ([da1025-B] CrashFrequencyDetector.packageZip suspend + IO + prune): {a4}")
@@ -910,7 +1208,7 @@ def main():
         for f in failures:
             print("FAIL:", f)
         sys.exit(1)
-    print("share_dir_prune_check: OK (arm1 + arm2 + arm3 + arm4 + arm5 green)")
+    print("share_dir_prune_check: OK (arm1 + arm2 + arm3 + arm4 + arm5 + arm6 green)")
 
 
 if __name__ == "__main__":

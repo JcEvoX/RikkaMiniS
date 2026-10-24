@@ -841,7 +841,21 @@ private fun MCPFormTab(
                 // exportServerJSON is pure in-memory JSON building; only the
                 // staging write needs a coroutine (see shareMcpServerJson).
                 val json = mcpRepository.exportServerJSON(server)
-                oauthScope.launch { shareMcpServerJson(context, server.id, json) }
+                oauthScope.launch {
+                    // [deep-audit-1048 B-04] Surface a failed share instead of
+                    // leaving the tap with no effect at all.
+                    val launched = shareMcpServerJson(context, server.id, json)
+                    if (!launched) {
+                        android.widget.Toast.makeText(
+                            context,
+                            context.getString(
+                                R.string.file_share_failed_toast,
+                                "${server.id}-mcp.json",
+                            ),
+                            android.widget.Toast.LENGTH_SHORT,
+                        ).show()
+                    }
+                }
             }) { Text(stringResource(R.string.mcp_export_share)) }
         }
 
@@ -1112,13 +1126,21 @@ private fun FieldLabel(text: String) {
  * write to cacheDir/shared/<safeName>-mcp.json, expose via FileProvider
  * (${packageName}.fileprovider, configured for cache-path "shared/"), and
  * launch a chooser with type application/json.
+ *
+ * [deep-audit-1048 B-04] Returns whether the chooser was actually started —
+ * every failure exit used to be a bare `return`, so a failed write or a missing
+ * handler looked exactly like a successful share.
  */
-private suspend fun shareMcpServerJson(context: android.content.Context, serverId: String, json: String) {
+private suspend fun shareMcpServerJson(
+    context: android.content.Context,
+    serverId: String,
+    json: String,
+): Boolean {
     val safeName = serverId.ifBlank { "mcp-server" }
         .replace(Regex("[^A-Za-z0-9._-]"), "_")
     // [da1024-G] mkdirs / prune / writeText are disk work — keep them off the
-    // main thread. Returns null when the write fails, preserving the previous
-    // "silently skip the share sheet" behaviour.
+    // main thread. Returns false when the write fails, which the caller now
+    // surfaces instead of silently skipping the share sheet.
     val file = withContext(Dispatchers.IO) {
         val dir = java.io.File(context.cacheDir, "shared").apply { mkdirs() }
         // Same 24h-TTL pruner the cache/share/ writers use: nothing else ever
@@ -1127,13 +1149,13 @@ private suspend fun shareMcpServerJson(context: android.content.Context, serverI
         com.rikkaminis.app.ui.components.pruneShareDir(dir)
         val f = java.io.File(dir, "$safeName-mcp.json")
         runCatching { f.writeText(json) }.map { f }.getOrNull()
-    } ?: return
+    } ?: return false
     val uri = try {
         androidx.core.content.FileProvider.getUriForFile(
             context, "${context.packageName}.fileprovider", file,
         )
     } catch (_: Throwable) {
-        return
+        return false
     }
     val sendIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
         type = "application/json"
@@ -1142,9 +1164,13 @@ private suspend fun shareMcpServerJson(context: android.content.Context, serverI
         addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
     val chooser = android.content.Intent.createChooser(sendIntent, "Export MCP server").apply {
+        // [deep-audit-1048 B-04] `context` here is the sheet's LocalContext; a
+        // non-Activity context needs NEW_TASK or startActivity throws
+        // AndroidRuntimeException (the sibling provider export already did this).
         addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
     }
-    context.startActivity(chooser)
+    // No share target installed: ActivityNotFoundException must not escape.
+    return runCatching { context.startActivity(chooser) }.isSuccess
 }
 
 private fun mapToLines(map: Map<String, String>?, joiner: String): String {

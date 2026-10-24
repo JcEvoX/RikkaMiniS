@@ -62,6 +62,11 @@ object DebugScreenshotRing {
         // PNG) and the throw skipped the recycle — every failed capture leaked
         // the full-size bitmap until GC.
         try {
+            // record-ok: deep-audit-1048 A-02 radius — the debug screenshot ring
+            // is outside this ticket's 5 files. A failed encode adds an entry
+            // with empty pngBytes (latent: debug-only, nothing published).
+            // Deferred as §1048-A2 R5; route through
+            // saveOutcome(streamOpened = true, compressed = …) when touched.
             bitmap.compress(Bitmap.CompressFormat.PNG, 100, baos)
         } finally {
             bitmap.recycle()

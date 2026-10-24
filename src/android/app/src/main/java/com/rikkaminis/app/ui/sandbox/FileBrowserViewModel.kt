@@ -9,6 +9,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import com.rikkaminis.app.ui.settings.SharedFolderRegistry
+import com.rikkaminis.app.ui.settings.invalidateStorageSnapshot
 import java.io.File
 import java.nio.file.Files
 import java.text.SimpleDateFormat
@@ -453,6 +454,17 @@ class FileBrowserViewModel(
                     )
                     return@launch
                 }
+                // [deep-audit-1048 B-05] The Storage page keeps a
+                // process-lifetime snapshot (`StorageSnapshotCache`: rootfs
+                // lstat walk + per-session recursive sizing, ~minutes of work)
+                // and its re-entry path reuses the cached totals instead of
+                // re-walking. Deleting a file / a whole session directory here
+                // therefore left the Storage screen showing the pre-delete
+                // sizes for the rest of the process. Invalidate on the SUCCESS
+                // path only — the failure branch above (and the read-only
+                // guards) leave the tree untouched, so dropping the cache there
+                // would only cost a rescan.
+                invalidateStorageSnapshot()
                 loadItems()
             } catch (e: Exception) {
                 _uiState.value = _uiState.value.copy(errorMessage = e.message)

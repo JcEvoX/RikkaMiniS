@@ -146,6 +146,18 @@ fun AddToHomeSheet(
     // we just point [copiedFile] at it.
     var copiedFile by remember { mutableStateOf<File?>(null) }
     var pinned by remember { mutableStateOf(false) }
+    // [deep-audit-1048 B-06] In-flight flag for the primary action. `create(…)`
+    // inserts a DB row and `ShortcutPinner.pin(…)` is an IPC round trip to the
+    // launcher, so the button stayed enabled for the whole trip and a second
+    // tap raced a second row + a second pin against the first attempt's
+    // cleanup. Decision lives in [pinActionEnabled] / [pinShouldCommit].
+    var isPinning by remember { mutableStateOf(false) }
+    // [deep-audit-1048 B-06] "The sheet is gone" latch. Every teardown hook
+    // (Cancel, `onDismissRequest`, `onDispose` — the sheet can also be removed
+    // externally via `webAppSheetTarget = null`, which only `onDispose` sees)
+    // sets it, and the pin coroutine checks it after the IO staging step: a pin
+    // the user already cancelled must not insert a row or add an icon.
+    var sheetClosed by remember { mutableStateOf(false) }
 
     // [sweep1014-b7a] If the sheet closes without a successful pin, delete
     // the ChatAttachment copy so it doesn't outlive the sheet as an orphan.
@@ -169,14 +181,24 @@ fun AddToHomeSheet(
     // successful pin intact, so stacking it with the explicit
     // `onDismissRequest` call is safe.
     DisposableEffect(Unit) {
-        onDispose { cleanupCopiedAttachment() }
+        onDispose {
+            sheetClosed = true
+            cleanupCopiedAttachment()
+        }
     }
     var copyFailed by remember { mutableStateOf(false) }
     var parsedTitle by remember { mutableStateOf<String?>(null) }
     var webpageIconPath by remember { mutableStateOf<String?>(null) }
 
+    // [deep-audit-1048 B-01] IO computes, Main publishes. The copy, the title
+    // parse and the icon extraction all run on Dispatchers.IO (unchanged); only
+    // the RESULT crosses back, and the Compose state is assigned after
+    // `withContext` returns — i.e. on the composition's own dispatcher. Writing
+    // those states from inside the IO block gave the frame no happens-before
+    // with them, and two overlapping opens could publish a file from one copy
+    // with a title parsed from another.
     LaunchedEffect(source, shortcutId) {
-        withContext(Dispatchers.IO) {
+        val staged = withContext(Dispatchers.IO) {
             when (source) {
                 is WebAppSource.ChatAttachment -> {
                     // [sweep1014-b7a] Use SessionFileStore's same root
@@ -198,25 +220,33 @@ fun AddToHomeSheet(
                         context.contentResolver.openInputStream(source.uri)?.use { input ->
                             target.outputStream().use { out -> input.copyTo(out) }
                         } ?: error("openInputStream returned null")
-                    }.onSuccess {
-                        copiedFile = target
-                        parsedTitle = parseHtmlTitle(target)
-                        webpageIconPath = WebAppIconExtractor.extractFromHtml(target.absolutePath)?.localPath
-                    }.onFailure {
-                        copyFailed = true
-                    }
+                    }.map {
+                        StagedCopy(
+                            file = target,
+                            title = parseHtmlTitle(target),
+                            iconPath = WebAppIconExtractor.extractFromHtml(target.absolutePath)?.localPath,
+                            failed = false,
+                        )
+                    }.getOrElse { StagedCopy(file = null, title = null, iconPath = null, failed = true) }
                 }
                 is WebAppSource.HostFile -> {
                     if (!source.file.exists() || !source.file.isFile) {
-                        copyFailed = true
+                        StagedCopy(file = null, title = null, iconPath = null, failed = true)
                     } else {
-                        copiedFile = source.file
-                        parsedTitle = parseHtmlTitle(source.file)
-                        webpageIconPath = WebAppIconExtractor.extractFromHtml(source.file.absolutePath)?.localPath
+                        StagedCopy(
+                            file = source.file,
+                            title = parseHtmlTitle(source.file),
+                            iconPath = WebAppIconExtractor.extractFromHtml(source.file.absolutePath)?.localPath,
+                            failed = false,
+                        )
                     }
                 }
             }
         }
+        copiedFile = staged.file
+        parsedTitle = staged.title
+        webpageIconPath = staged.iconPath
+        copyFailed = staged.failed
     }
 
     // [dv14-B2] The field is seeded from the de-suffixed file name up front;
@@ -249,6 +279,7 @@ fun AddToHomeSheet(
 
     ModalBottomSheet(
         onDismissRequest = {
+            sheetClosed = true
             cleanupCopiedAttachment()
             onDismiss()
         },
@@ -425,80 +456,119 @@ fun AddToHomeSheet(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 OutlinedButton(
-                    onClick = onDismiss,
+                    onClick = {
+                        // [deep-audit-1048 B-06] Cancel is a teardown hook: latch
+                        // first, then clean up. A pin already in flight then stops
+                        // at its post-staging guard instead of inserting a row for
+                        // a shortcut the user has cancelled.
+                        sheetClosed = true
+                        cleanupCopiedAttachment()
+                        onDismiss()
+                    },
                     modifier = Modifier.weight(1f),
                 ) {
                     Text(stringResource(android.R.string.cancel))
                 }
                 Button(
-                    enabled = copiedFile != null && titleText.isNotBlank(),
+                    // [deep-audit-1048 B-06] `isPinning` closes the double-tap
+                    // window; `sheetClosed` keeps the last frame inert.
+                    enabled = pinActionEnabled(
+                        hasTarget = copiedFile != null,
+                        hasTitle = titleText.isNotBlank(),
+                        inFlight = isPinning,
+                        closed = sheetClosed,
+                    ),
                     modifier = Modifier.weight(1f),
                     onClick = {
+                        // Read-then-set in the same frame: Compose re-composes
+                        // asynchronously, so `enabled` alone cannot stop a
+                        // second tap that lands before the next frame.
+                        if (isPinning) return@Button
                         val target = copiedFile ?: return@Button
+                        isPinning = true
                         val finalTitle = titleText.trim().ifBlank {
                             fileName.removeSuffix(".html").removeSuffix(".htm")
                         }
                         scope.launch {
-                            val iconBitmap = withContext(Dispatchers.IO) {
-                                renderIconBitmap(context, selectedIcon, finalTitle)
-                            }
-                            val iconRef = when (val c = selectedIcon) {
-                                is IconChoice.Webpage -> "html"
-                                is IconChoice.Gallery -> "file:${c.uri}"
-                                is IconChoice.Preset -> "preset:${c.preset.name.lowercase()}"
-                            }
-                            val app = context.applicationContext as MinisApp
-                            val entity = when (source) {
-                                is WebAppSource.ChatAttachment -> {
-                                    // htmlPath stays relative under the
-                                    // session attachments dir — WebAppPathResolver's
-                                    // "relative path" branch resolves it back to
-                                    // <filesDir>/minis-sessions/<sid>/attachments/<htmlPath>.
-                                    val htmlPath = "$shortcutId/${target.name}"
-                                    app.webAppShortcutRepository.create(
-                                        htmlPath = htmlPath,
-                                        pathScope = WebAppShortcutRepository.SCOPE_SESSION_ATTACHMENT,
-                                        scopeContext = source.sessionId,
-                                        title = finalTitle,
-                                        iconRef = iconRef,
-                                        iconCachePath = null,
-                                        sourceSessionId = source.sessionId,
-                                    )
+                            // [deep-audit-1048 B-06] `finally` releases the
+                            // in-flight flag on every exit (success, pin failure,
+                            // or the post-staging abort below), so a future edit that
+                            // moves `onDismiss()` cannot leave the button dead.
+                            try {
+                                val iconBitmap = withContext(Dispatchers.IO) {
+                                    renderIconBitmap(context, selectedIcon, finalTitle)
                                 }
-                                is WebAppSource.HostFile -> {
-                                    // T-pwa-3: link in place — htmlPath is the
-                                    // /var/minis/... linux path; WebAppPathResolver
-                                    // routes through PRootKernel.resolveHostPath.
-                                    app.webAppShortcutRepository.create(
-                                        htmlPath = source.linuxPath,
-                                        pathScope = source.pathScope,
-                                        scopeContext = source.scopeContext,
-                                        title = finalTitle,
-                                        iconRef = iconRef,
-                                        iconCachePath = null,
-                                        sourceSessionId = null,
-                                    )
+
+                                // [deep-audit-1048 B-06] The sheet may have been
+                                // torn down while `renderIconBitmap` ran (Cancel,
+                                // drag-to-dismiss, or an external removal of the
+                                // sheet target). Committing now would insert a
+                                // shortcut row and add a launcher icon for a pin the
+                                // user already cancelled.
+                                if (!pinShouldCommit(closed = sheetClosed, inFlight = isPinning)) {
+                                    cleanupCopiedAttachment()
+                                    return@launch
                                 }
+                                val iconRef = when (val c = selectedIcon) {
+                                    is IconChoice.Webpage -> "html"
+                                    is IconChoice.Gallery -> "file:${c.uri}"
+                                    is IconChoice.Preset -> "preset:${c.preset.name.lowercase()}"
+                                }
+                                val app = context.applicationContext as MinisApp
+                                val entity = when (source) {
+                                    is WebAppSource.ChatAttachment -> {
+                                        // htmlPath stays relative under the
+                                        // session attachments dir — WebAppPathResolver's
+                                        // "relative path" branch resolves it back to
+                                        // <filesDir>/minis-sessions/<sid>/attachments/<htmlPath>.
+                                        val htmlPath = "$shortcutId/${target.name}"
+                                        app.webAppShortcutRepository.create(
+                                            htmlPath = htmlPath,
+                                            pathScope = WebAppShortcutRepository.SCOPE_SESSION_ATTACHMENT,
+                                            scopeContext = source.sessionId,
+                                            title = finalTitle,
+                                            iconRef = iconRef,
+                                            iconCachePath = null,
+                                            sourceSessionId = source.sessionId,
+                                        )
+                                    }
+                                    is WebAppSource.HostFile -> {
+                                        // T-pwa-3: link in place — htmlPath is the
+                                        // /var/minis/... linux path; WebAppPathResolver
+                                        // routes through PRootKernel.resolveHostPath.
+                                        app.webAppShortcutRepository.create(
+                                            htmlPath = source.linuxPath,
+                                            pathScope = source.pathScope,
+                                            scopeContext = source.scopeContext,
+                                            title = finalTitle,
+                                            iconRef = iconRef,
+                                            iconCachePath = null,
+                                            sourceSessionId = null,
+                                        )
+                                    }
+                                }
+                                val ok = ShortcutPinner.pin(context, entity, iconBitmap)
+                                if (ok) {
+                                    pinned = true
+                                    Toast.makeText(
+                                        context,
+                                        R.string.webapp_pin_success,
+                                        Toast.LENGTH_SHORT,
+                                    ).show()
+                                } else {
+                                    // [da1021-F] Pin failed: the DB row was already
+                                    // inserted by `create(...)` above — delete it too,
+                                    // or `webapp_shortcuts` keeps an orphan record
+                                    // pointing at a copy this sheet just cleaned up.
+                                    // `delete` is suspend; this runs inside the
+                                    // coroutine scope the pin block already launched.
+                                    runCatching { app.webAppShortcutRepository.delete(entity.id) }
+                                    cleanupCopiedAttachment()
+                                }
+                                onDismiss()
+                            } finally {
+                                isPinning = false
                             }
-                            val ok = ShortcutPinner.pin(context, entity, iconBitmap)
-                            if (ok) {
-                                pinned = true
-                                Toast.makeText(
-                                    context,
-                                    R.string.webapp_pin_success,
-                                    Toast.LENGTH_SHORT,
-                                ).show()
-                            } else {
-                                // [da1021-F] Pin failed: the DB row was already
-                                // inserted by `create(...)` above — delete it too,
-                                // or `webapp_shortcuts` keeps an orphan record
-                                // pointing at a copy this sheet just cleaned up.
-                                // `delete` is suspend; this runs inside the
-                                // coroutine scope the pin block already launched.
-                                runCatching { app.webAppShortcutRepository.delete(entity.id) }
-                                cleanupCopiedAttachment()
-                            }
-                            onDismiss()
                         }
                     },
                 ) {
@@ -510,6 +580,19 @@ fun AddToHomeSheet(
         }
     }
 }
+
+/**
+ * [deep-audit-1048 B-01] Result of the off-main staging step: the copied (or
+ * in-place) file plus everything parsed from it. Produced on Dispatchers.IO,
+ * consumed on the composition's dispatcher — the state writes happen only after
+ * `withContext` returns.
+ */
+private data class StagedCopy(
+    val file: File?,
+    val title: String?,
+    val iconPath: String?,
+    val failed: Boolean,
+)
 
 @Composable
 private fun IconOption(

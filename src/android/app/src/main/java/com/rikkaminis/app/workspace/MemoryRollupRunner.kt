@@ -77,9 +77,14 @@ class MemoryRollupRunner(
 
             val logText = logFile.readText()
             val entries = MemoryRollupEngine.extractEntries(logText)
-            val stableEntries = entries.filter {
-                MemoryRollupEngine.classify(it) != MemoryRollupEngine.RollupClass.TRANSIENT
-            }
+            // [dv28-A3] Candidacy owns the content dimension now, so the picker
+            // can only select a log that holds a distillable entry. This branch
+            // therefore only fires on an EXPLICIT date (which bypasses the
+            // picker) or through the picker's last-resort "no eligible log"
+            // branch below — both are intentional: the Outcome contract stays,
+            // and a targeted `memory_rollup 2026-08-11` on a transient-only log
+            // still answers "nothing to distill" instead of silently no-op'ing.
+            val stableEntries = MemoryRollupEngine.distillableEntries(entries)
             if (stableEntries.isEmpty()) {
                 Log.i(TAG, "$resolvedDate.md had no distillable rules (${entries.size} entries, all transient)")
                 return Outcome.NOTHING_TO_DISTILL
@@ -133,12 +138,16 @@ class MemoryRollupRunner(
                 // .dailyLogSizes). Both sides used to spell the date shape and
                 // the "already distilled" cutoff themselves, and the hint's copy
                 // had lost them.
-                if (!MemoryRollupEngine.isRollupCandidate(f.name, f.length(), todayStr, rollupContent)) {
-                    return@mapNotNull null
-                }
-                val text = runCatching { f.readText() }.getOrNull() ?: return@mapNotNull null
-                val entries = MemoryRollupEngine.extractEntries(text)
-                if (entries.none { MemoryRollupEngine.classify(it) != MemoryRollupEngine.RollupClass.TRANSIENT }) {
+                // [dv28-A3] The content dimension is part of that predicate too,
+                // so this picker no longer extracts/classifies: one decision,
+                // both sides.
+                if (!MemoryRollupEngine.isRollupCandidate(
+                        f.name,
+                        f.length(),
+                        todayStr,
+                        rollupContent,
+                    ) { runCatching { f.readText() }.getOrNull() }
+                ) {
                     return@mapNotNull null
                 }
                 f to f.name.removeSuffix(".md")
