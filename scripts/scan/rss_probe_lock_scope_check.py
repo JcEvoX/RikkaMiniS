@@ -117,6 +117,70 @@ def line_of(src, needle):
     return src.count("\n", 0, i) + 1 if i >= 0 else 0
 
 
+# [meta-audit-1024 / M5] ORDER axis. The criteria above judge the record body
+# by counting text: `synchronized(` appears exactly once, the reset/leak
+# needles appear nowhere in it. Both are satisfied by a DECOY critical section
+# — `synchronized(st) {}` in front of an unlocked
+# `applyAndDecideLocked(st, deltaKb)` passes every one of them while the read-
+# modify-write, the LEAK-SUSPECT winner flag and the governance decision all
+# run outside the lock again (two offload workers interleave, exactly the
+# ISSUE-11 defect). Counting tokens cannot tell "inside the braces" from
+# "next to the braces", so the criterion has to be positional: parse the
+# block body of the synchronized expression and require every call to the
+# locked decision helper to fall inside it.
+DECISION_LOCKED_CRIT = "record calls %s inside its synchronized block" % DECISION
+
+
+def synchronized_blocks(body):
+    """[(lock_expr, block_start, block_end)] for every `synchronized(…) { … }`
+    inside [body]. Offsets index into [body]; the block spans exclude the
+    surrounding braces. Unparseable expressions/blocks are dropped, and the
+    caller treats "no block parsed" as a violation (fail-closed)."""
+    out = []
+    n = len(body)
+    for m in re.finditer(r"\bsynchronized\s*\(", body):
+        i = m.end() - 1
+        depth = 0
+        while i < n:
+            c = body[i]
+            if c == '"':
+                i += 1
+                while i < n and body[i] != '"':
+                    i += 2 if body[i] == "\\" else 1
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        if depth != 0 or i >= n:
+            continue
+        lock_expr = body[m.end():i].strip()
+        j = body.find("{", i + 1)
+        if j < 0 or j - i > 200:
+            continue
+        depth = 0
+        k = j
+        while k < n:
+            c = body[k]
+            if c == '"':
+                k += 1
+                while k < n and body[k] != '"':
+                    k += 2 if body[k] == "\\" else 1
+            elif c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        if depth != 0:
+            continue
+        out.append((lock_expr, j + 1, k))
+    return out
+
+
 def analyse(src, require_govern_reset=True):
     """Returns list of (criterion, ok, detail, line). ok=True means contract held."""
     res = []
@@ -139,6 +203,40 @@ def analyse(src, require_govern_reset=True):
             "found %d" % sync_n,
             line_of(src, "synchronized("),
         ))
+        # [meta-audit-1024 / M5] positional counterpart: the decision helper
+        # must be CALLED inside the block body, not merely next to it.
+        blocks = synchronized_blocks(rec)
+        calls = [c.start() for c in re.finditer(r"\b" + re.escape(DECISION) + r"\s*\(", rec)]
+        if not blocks:
+            res.append((
+                DECISION_LOCKED_CRIT,
+                False,
+                "no `synchronized(…) { … }` block body could be parsed "
+                "(fail-closed: cannot confirm the decision runs under the lock)",
+                0,
+            ))
+        elif not calls:
+            res.append((
+                DECISION_LOCKED_CRIT,
+                False,
+                "record never calls %s( — the locked decision was inlined or "
+                "removed (fail-closed)" % DECISION,
+                0,
+            ))
+        else:
+            outside = [o for o in calls
+                       if not any(a <= o <= b for (_, a, b) in blocks)]
+            in_block = len(calls) - len(outside)
+            res.append((
+                DECISION_LOCKED_CRIT,
+                not outside,
+                ("all %d call site(s) inside a synchronized block" % len(calls))
+                if not outside
+                else "%d/%d call site(s) OUTSIDE every synchronized block body "
+                     "(the lock is a decoy — the increments run unlocked)"
+                     % (len(outside), len(calls)),
+                line_of(src, DECISION + "("),
+            ))
     dec = function_body(src, DECISION)
     if dec is None:
         res.append(("locked decision function %s found" % DECISION, False, "missing", 0))
@@ -230,6 +328,25 @@ BREAKERS[4] = (
     "summary takes a snapshot under the lock",
 )
 
+# [meta-audit-1024 / M5] WITNESS ARMS — adversarial shapes taken from an
+# external verifier, not from any known pre-fix tree. Kept in a separate dict
+# because the frozen test_scan marker pins the fixture count of BREAKERS.
+WITNESS_ARMS = {}
+# decoy critical section: the lock still appears exactly once and no forbidden
+# needle enters the body, but the decision call sits AFTER the (empty) block.
+WITNESS_ARMS["decoy-empty-block"] = (
+    [("val d = synchronized(st) { applyAndDecideLocked(st, deltaKb) }",
+      "synchronized(st) {}\n        val d = applyAndDecideLocked(st, deltaKb)")],
+    DECISION_LOCKED_CRIT,
+)
+# decision inlined into the block, call removed entirely: the helper contract
+# ("only ever called under the lock") is unverifiable, so fail closed.
+WITNESS_ARMS["decision-call-removed"] = (
+    [("val d = synchronized(st) { applyAndDecideLocked(st, deltaKb) }",
+      "val d = synchronized(st) { st.count += 1; st.totalDeltaKb += deltaKb; st.totalDeltaKb }")],
+    DECISION_LOCKED_CRIT,
+)
+
 
 def selftest():
     print("── selftest: compliant fixture must be green, each breaker must go red ──")
@@ -242,32 +359,42 @@ def selftest():
     else:
         print("  [OK] compliant fixture green on all %d criteria" % len(base))
 
-    for idx, (pairs, target) in BREAKERS.items():
+    def run_arm(label, pairs, target):
         mutated = COMPLIANT
         missing = [old for old, _ in pairs if old not in mutated]
         if missing:
-            failures.append("breaker %d cannot apply (fixture text moved): %s" % (idx, missing))
-            print("  [FAIL] breaker %d: anchor not found in fixture" % idx)
-            continue
+            failures.append("%s cannot apply (fixture text moved): %s" % (label, missing))
+            print("  [FAIL] %s: anchor not found in fixture" % label)
+            return
         for old, new in pairs:
             mutated = mutated.replace(old, new, 1)
         res = analyse(strip_comments(mutated))
         red = [c for c, ok, _, _ in res if not ok]
         if target not in red:
-            failures.append("breaker %d did not turn %r red (red=%s)" % (idx, target, red))
-            print("  [FAIL] breaker %d -> %r stayed green (red=%s)" % (idx, target, red))
+            failures.append("%s did not turn %r red (red=%s)" % (label, target, red))
+            print("  [FAIL] %s -> %r stayed green (red=%s)" % (label, target, red))
         else:
-            print("  [OK] breaker %d -> red on %r%s" % (idx, target, "" if len(red) == 1 else " (+%d side)" % (len(red) - 1)))
-    return failures
+            print("  [OK] %s -> red on %r%s" % (label, target, "" if len(red) == 1 else " (+%d side)" % (len(red) - 1)))
+
+    for idx, (pairs, target) in BREAKERS.items():
+        run_arm("breaker %d" % idx, pairs, target)
+
+    n_witness_bad = len(failures)
+    for name, (pairs, target) in WITNESS_ARMS.items():
+        run_arm("witness %s" % name, pairs, target)
+    witness_bad = len(failures) > n_witness_bad
+    return failures, witness_bad
 
 
 def main():
     if "--selftest" in sys.argv:
-        fails = selftest()
+        fails, witness_bad = selftest()
         if fails:
             print("SELFTEST FAIL (%d)" % len(fails))
             return 1
         print("SELFTEST=PASS (%d fixtures)" % (1 + len(BREAKERS)))
+        print("WITNESS_ARM_ORDER=%s (%d arm(s): decoy lock + inlined decision)"
+              % ("PASS" if not witness_bad else "FAIL", len(WITNESS_ARMS)))
         return 0
 
     root = None

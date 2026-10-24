@@ -86,6 +86,130 @@ SHARE_TTL_EXPECTED = "internal const val SHARE_INBOUND_TTL_MS = 24L * 60L * 60L 
 
 IO_OPEN_RE = re.compile(r'withContext\(\s*Dispatchers\.IO\s*\)\s*\{')
 
+# [fix/meta-audit-m2-binding] C10/C11 — the falsifying witness added a SECOND
+# filesDir dir literal (`media-unregistered`) to MediaStore.kt and pointed the
+# live property at it, leaving a dead one on the declared `media`. The old C1/C2
+# only asked whether SOME site in the file still matched the registry regex, so
+# "a dead property wears the legal dir while the live one points elsewhere" read
+# as covered. These two criteria derive the dir set from the tree instead of
+# trusting the registry, and then bind it to a property that is actually used.
+#
+# Base dir → the FileProvider tag that must declare it.
+FILE_CTOR_RE = re.compile(
+    r'(?:java\.io\.)?File\s*\(\s*context\.(?:applicationContext\.)?(filesDir|cacheDir)\s*,')
+BASE_TAG = {"filesDir": "files-path", "cacheDir": "cache-path"}
+ASSIGN_RE_TAIL = re.compile(r'(?:val|var)\s+([A-Za-z_]\w*)\s*(?::\s*[\w.]+(?:\s*<[^>]*>)?)?\s*=\s*$')
+RETURN_RE_TAIL = re.compile(
+    r'(?:fun\s+[A-Za-z_]\w*\s*\([^)]*\)\s*(?::\s*[\w.]+(?:\s*<[^>]*>)?)?\s*=|return)\s*$')
+MKDIRS_RE_HEAD = re.compile(r'\s*(?:\.(?:apply|also|let|run)\s*\{[^}]*mkdirs\s*\(\s*\)|\.mkdirs\s*\(\s*\))')
+
+
+def _close_paren(code: str, open_idx: int):
+    """Index just past the `)` matching the `(` at open_idx (string-aware)."""
+    depth = 0
+    i = open_idx
+    n = len(code)
+    while i < n:
+        c = code[i]
+        if c == '"':
+            i += 1
+            while i < n and code[i] != '"':
+                i += 2 if code[i] == "\\" else 1
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return -1
+
+
+def fold_dir_literal(code: str, pos: int):
+    """Fold the second argument of File(base, ARG) into a literal string.
+
+    Handles `"a" + "b"` (constant folding — the witness-shaped evasion).
+    Returns (literal, resolved) — resolved=False when the argument is not a
+    constant we can read (template, identifier, call …).
+    """
+    i = pos
+    n = len(code)
+    parts = []
+    while i < n:
+        if code[i] in " \t\r\n":
+            i += 1
+            continue
+        if code[i] == '"':
+            j = i + 1
+            buf = []
+            while j < n and code[j] != '"':
+                if code[j] == "\\":
+                    buf.append(code[j:j + 2])
+                    j += 2
+                    continue
+                buf.append(code[j])
+                j += 1
+            seg = "".join(buf)
+            if "$" in seg:          # template — value unknown at scan time
+                return ("", False)
+            parts.append(seg)
+            i = j + 1
+            while i < n and code[i] in " \t":
+                i += 1
+            if i < n and code[i] == "+":
+                i += 1
+                continue
+            break
+        return ("", False)
+    if not parts:
+        return ("", False)
+    return ("".join(parts), True)
+
+
+def dir_root_sites(code: str):
+    """Every `File(context.filesDir|cacheDir, …)` that establishes a DIRECTORY.
+
+    Returns [(base, tag, literal, resolved, name_or_None)] — a site qualifies as
+    a directory root when it is bound to a val/var/property or is immediately
+    mkdirs()'d. A bare `File(context.filesDir, "browser_tabs/$sid.json").delete()`
+    is a FILE path and is deliberately not a provider root.
+    """
+    out = []
+    for m in FILE_CTOR_RE.finditer(code):
+        base = m.group(1)
+        arg_at = m.end()
+        lit, resolved = fold_dir_literal(code, arg_at)
+        open_idx = code.rfind("(", m.start(), m.end())
+        end = _close_paren(code, open_idx) if open_idx >= 0 else -1
+        before = code[max(0, m.start() - 200):m.start()]
+        am = ASSIGN_RE_TAIL.search(before)
+        name = am.group(1) if am else None
+        after = code[end:end + 80] if end > 0 else ""
+        rm = None if am else RETURN_RE_TAIL.search(before)
+        if not (am or MKDIRS_RE_HEAD.match(after) or rm):
+            continue
+        if rm and not am:
+            # A returned File is only a directory ROOT when the literal looks
+            # like a bare dir name (`"photos-scratch"`); `"config.json"` is a
+            # file under filesDir and must not be dragged into the declaration
+            # contract. Unresolvable literals stay in and fail closed.
+            if resolved and ("." in lit.split("/")[-1] or lit.endswith("/")):
+                continue
+            if not resolved:
+                continue
+        out.append((base, BASE_TAG[base], lit, resolved, name))
+    return out
+
+
+def declared_covers(decls, tag: str, seg: str) -> bool:
+    for t, _n, p in decls:
+        if t != tag:
+            continue
+        q = p.rstrip("/")
+        if q == seg or q.startswith(seg + "/"):
+            return True
+    return False
+
 DECL_RE = re.compile(
     r'<\s*(files-path|cache-path|external-path|external-files-path|external-cache-path|root-path)'
     r'\s+name\s*=\s*"([^"]*)"\s+path\s*=\s*"([^"]*)"\s*/?>',
@@ -250,6 +374,66 @@ def check(root: Path) -> list:
                 f"C1 [{rid}] dir `{path}` is written ({rel}) but not declared as "
                 f"<{tag} path=\"{path}\"> in {XML_REL} — getUriForFile throws "
                 "IllegalArgumentException for every file under it")
+
+    # ── C10 / C11 [fix/meta-audit-m2-binding]: derive the dir set from the tree
+    #   ─────────────────────────────────────────────────────────────────────
+    #     C10: EVERY directory root created under filesDir/cacheDir in a guarded
+    #          writer must be covered by a declared <files-path>/<cache-path>.
+    #          C1 below is registry-shaped — it asks whether the registry regex
+    #          still matches *somewhere* in the file, so a second, undeclared
+    #          dir literal slips past it entirely.
+    #     C11: binding — the dir a registry entry claims must actually be bound
+    #          to a LIVE property/val. A dead alias parked on the legal literal
+    #          while the live one points elsewhere is the witness's shape:
+    #          `_legacyMediaDir` (never read) held `media`, `mediaBaseDir` (read
+    #          by every saveMedia call) held `media-unregistered`.
+    #     Fail-closed: an unresolvable dir literal is a violation, not a skip.
+    guarded_files = [KT_REL, MEDIASTORE_REL, PHOTOS_REL, CHATVM_REL, SCREEN_REL]
+    dir_sites = []       # (rel, base, tag, literal, name, live)
+    for rel in guarded_files:
+        gpath = root / rel
+        if not gpath.exists():
+            violations.append(f"C10 guarded writer MISSING: {rel}")
+            continue
+        gcode = strip_comments(gpath.read_text())
+        for base, tag, lit, resolved, name in dir_root_sites(gcode):
+            if not resolved:
+                violations.append(
+                    f"C10 [{rel}] `File(context.{base}, …)` directory root built from a "
+                    "non-literal expression — the gate cannot tell which provider root it "
+                    "lands under, so it must not pass silently")
+                continue
+            seg = lit.split("/")[0]
+            if not seg:
+                violations.append(f"C10 [{rel}] empty directory literal under context.{base}")
+                continue
+            if not declared_covers(decls, tag, seg):
+                violations.append(
+                    f"C10 [{rel}] directory `{base}/{seg}` is created ({name or 'inline'} = "
+                    f"File(context.{base}, \"{lit}\")) but no <{tag}> root declares it in "
+                    f"{XML_REL} — getUriForFile throws IllegalArgumentException for everything "
+                    "under it, and the registry never noticed because it only checked whether "
+                    "its own literal still appears somewhere in the file")
+            live = True if name is None else (
+                len(re.findall(r'\b%s\b' % re.escape(name), gcode)) >= 2)
+            dir_sites.append((rel, base, tag, lit, name, live))
+
+    for rid, rel, _writer_re, tag, path in WRITER_DIRS:
+        want = path.rstrip("/").split("/")[0]
+        bound = [s for s in dir_sites
+                 if s[0] == rel and s[2] == tag and s[3].split("/")[0] == want]
+        if not bound:
+            violations.append(
+                f"C11 [{rid}] no directory root bound to `{tag}/{want}` in {rel} — the registry "
+                "entry stopped corresponding to a real binding")
+            continue
+        if not any(s[5] for s in bound):
+            names = sorted({s[4] or "<inline>" for s in bound})
+            violations.append(
+                f"C11 [{rid}] the only bindings of `{tag}/{want}` in {rel} are dead "
+                f"({names}: declared but never read) — the live code writes elsewhere, which is "
+                "exactly how a re-pointed dir keeps the registry green while the provider has no "
+                "root for the real location")
 
     # ── C3: export must leave the main thread ───────────────────────────────
     if not re.search(r'private\s+suspend\s+fun\s+exportLargeContentToFile\s*\(', code):
@@ -438,9 +622,19 @@ CLEAN_MEDIASTORE = '''package com.rikkaminis.app.data.storage
 
 import android.content.Context
 import java.io.File
+import java.util.UUID
 
 class MediaStore(private val context: Context) {
     val mediaBaseDir: File = File(context.filesDir, "media")
+
+    fun saveMedia(data: ByteArray, relativePath: String): File {
+        val file = File(mediaBaseDir, relativePath)
+        file.parentFile?.mkdirs()
+        file.writeBytes(data)
+        return file
+    }
+
+    fun newId(): String = UUID.randomUUID().toString()
 }
 '''
 
@@ -733,6 +927,58 @@ def selftest() -> int:
         expect_red=True,
         screen=CLEAN_SCREEN.replace("viewModel.addAttachmentFromStagedShare(File(sharedDir, item.value))",
                                     "Unit"),
+    )
+
+    # ── [fix/meta-audit-m2-binding] the falsifying witness, verbatim: a dead
+    #    alias keeps the registry's literal (`media`) in the file while the
+    #    property every write goes through is re-pointed at an undeclared dir.
+    #    Old C1/C2 stayed green ("the literal still appears, and media/ is
+    #    declared"); C10 catches the undeclared root, C11 catches the dead alias.
+    WITNESS_MEDIASTORE = CLEAN_MEDIASTORE.replace(
+        '    val mediaBaseDir: File = File(context.filesDir, "media")',
+        '    private val _legacyMediaDir: File = File(context.filesDir, "media")\n'
+        '    val mediaBaseDir: File = File(context.filesDir, "media-unregistered")')
+    run("WITNESS dead alias + re-pointed live dir", expect_red=True, media=WITNESS_MEDIASTORE)
+
+    # Same defect with the XML widened to cover the new dir: C10 goes quiet, so
+    # only the binding rule (C11) can still notice that the live write path
+    # moved off the registry's dir.
+    run(
+        "WITNESS variant: new dir declared, only C11 can see it",
+        expect_red=True,
+        media=WITNESS_MEDIASTORE,
+        xml=CLEAN_XML.replace(
+            '    <files-path name="photos-export" path="photos-export/" />',
+            '    <files-path name="media-unregistered" path="media-unregistered/" />\n'
+            '    <files-path name="photos-export" path="photos-export/" />'),
+    )
+
+    # Constant folding: the literal is assembled so a naive `File(dir, "x")`
+    # scanner reads nothing.
+    run(
+        "dir literal assembled by concatenation",
+        expect_red=True,
+        media=CLEAN_MEDIASTORE.replace(
+            '    val mediaBaseDir: File = File(context.filesDir, "media")',
+            '    val mediaBaseDir: File = File(context.filesDir, "media" + "-unregistered")'),
+    )
+
+    # A brand-new dir root that the registry never knew about.
+    run(
+        "extra undeclared dir root added",
+        expect_red=True,
+        photos=CLEAN_PHOTOS.replace(
+            '    fun outDir(): File = File(context.filesDir, "photos-export").also { it.mkdirs() }',
+            '    fun outDir(): File = File(context.filesDir, "photos-export").also { it.mkdirs() }\n'
+            '    fun scratch(): File = File(context.filesDir, "photos-scratch")'),
+    )
+
+    # Non-literal dir root: fail-closed, not silently skipped.
+    run(
+        "dir root built from a variable",
+        expect_red=True,
+        media=CLEAN_MEDIASTORE.replace(
+            'File(context.filesDir, "media")', 'File(context.filesDir, dirName)'),
     )
 
     print("=== file_provider_paths_coverage --selftest ===")

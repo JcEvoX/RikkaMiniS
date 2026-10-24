@@ -44,10 +44,72 @@ REL = "src/android/app/src/main/java/com/rikkaminis/app/browser/BrowserTabPool.k
 
 EXEC_CALL = "tab.manager.execute("
 IMPLICIT_COND = "if (implicitTab)"
+LOCK_FN = "lockForTab"
 
 
 def line_of(src: str, idx: int) -> int:
     return src.count("\n", 0, idx) + 1
+
+
+def withlock_receivers(src: str):
+    """Every `.withLock` in [src] reduced to its receiver.
+
+    Returns (kind, name, expr) triples:
+      ("call", callee, full_call)  — `lockForTab(tabId).withLock` / `Mutex().withLock`
+      ("ident", name, "")          — `mutex.withLock`
+      ("unknown", "", "")          — receiver could not be resolved (fail-closed)
+
+    [fix/meta-audit-m2-binding] the falsifying witness kept `lockForTab(tabId)`
+    in the function (bound to a dead `val mutex`) and locked on a freshly
+    constructed `Mutex()` instead — the old "both substrings present" test read
+    that as serialized. The receiver of `withLock` is the contract; not the
+    co-occurrence of two words somewhere in the body.
+    """
+    out = []
+    for m in re.finditer(r"\.withLock", src):
+        i = m.start() - 1
+        while i >= 0 and src[i] in " \t\r\n":
+            i -= 1
+        if i < 0:
+            out.append(("unknown", "", ""))
+            continue
+        if src[i] == ")":
+            depth = 0
+            j = i
+            while j >= 0:
+                if src[j] == ")":
+                    depth += 1
+                elif src[j] == "(":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j -= 1
+            if j < 0:
+                out.append(("unknown", "", ""))
+                continue
+            k = j - 1
+            while k >= 0 and (src[k].isalnum() or src[k] in "_."):
+                k -= 1
+            out.append(("call", src[k + 1:j], src[j:i + 1]))
+            continue
+        if src[i].isalnum() or src[i] == "_":
+            k = i
+            while k >= 0 and (src[k].isalnum() or src[k] in "_."):
+                k -= 1
+            out.append(("ident", src[k + 1:i + 1], ""))
+            continue
+        out.append(("unknown", "", ""))
+    return out
+
+
+def receiver_is_per_tab(kind: str, name: str, scope: str) -> bool:
+    """True only when the receiver provably comes from lockForTab(…)."""
+    if kind == "call":
+        return name == LOCK_FN or name.endswith("." + LOCK_FN)
+    if kind == "ident":
+        return bool(re.search(
+            r"\b%s\s*(?::\s*[^=]+)?=\s*%s\s*\(" % (re.escape(name), LOCK_FN), scope))
+    return False
 
 
 def balanced_block(src: str, open_idx: int):
@@ -118,11 +180,30 @@ def check_source(src: str, label: str) -> list:
         else:
             c_start, c_end = balanced_block(body_src, brace)
             arm = body_src[c_start:c_end]
-            if "lockForTab(" not in arm or "withLock" not in arm:
-                bad.append("%s:%d: the implicit arm must take the acquired "
-                           "tab's per-tab mutex (lockForTab(…).withLock { … })"
+            arm_recv = withlock_receivers(arm)
+            if not arm_recv:
+                bad.append("%s:%d: the implicit arm takes no lock — it must "
+                           "acquire the acquired tab's per-tab mutex "
+                           "(lockForTab(tab.id).withLock { … })"
                            % (label, cond_line))
             else:
+                for kind, name, expr in arm_recv:
+                    if receiver_is_per_tab(kind, name, arm):
+                        continue
+                    if kind == "unknown":
+                        bad.append("%s:%d: the implicit arm locks on a "
+                                   "receiver this gate cannot resolve — "
+                                   "re-pin the gate rather than assume it is "
+                                   "the per-tab mutex" % (label, cond_line))
+                    elif kind == "call":
+                        bad.append("%s:%d: the implicit arm locks on "
+                                   "`%s.withLock` — not lockForTab(tab.id), so "
+                                   "the fan-out still drives the WebView "
+                                   "unserialized" % (label, cond_line, name))
+                    else:
+                        bad.append("%s:%d: the implicit arm locks on "
+                                   "`%s.withLock` but `%s` is not bound to "
+                                   "lockForTab(…) there" % (label, cond_line, name, name))
                 wl = arm.rfind("withLock")
                 wb = arm.find("{", wl)
                 if wb >= 0:
@@ -155,16 +236,49 @@ def check_source(src: str, label: str) -> list:
             "already holds the mutex)" % (label, line)
         )
 
-    # The serial entry must still exist and still take its mutex.
+    # The serial entry must still exist and still take its mutex — on the
+    # per-tab mutex ITSELF, not merely in its neighbourhood.
+    #
+    # [fix/meta-audit-m2-binding] dataflow axis: the falsifying witness left
+    # `val mutex = lockForTab(tabId)` in place (now a dead local) and locked on
+    # `Mutex()` — every `executeSerialized` call then serialized against a
+    # throwaway instance while the tab's real mutex was never acquired, and the
+    # old "lockForTab( and withLock both appear" test stayed green.
     ser = extract_fun(src, "fun executeSerialized(")
     if ser is None:
         bad.append("%s:1: executeSerialized(…) not found — the serial entry "
                    "moved? re-pin this gate" % label)
     else:
         s_src = src[ser[0]:ser[1]]
-        if "lockForTab(" not in s_src or "withLock" not in s_src:
-            bad.append("%s:%d: executeSerialized must still acquire "
-                       "lockForTab(tabId).withLock" % (label, line_of(src, ser[0])))
+        # Scope for resolving `val x = lockForTab(...)`: the function body plus
+        # any enclosing-class locals are out of reach here, so bindings must be
+        # visible inside the function itself — that is where the witness lives.
+        recv = withlock_receivers(s_src)
+        if not recv:
+            bad.append("%s:%d: executeSerialized takes no lock at all — it "
+                       "must acquire lockForTab(tabId).withLock"
+                       % (label, line_of(src, ser[0])))
+        else:
+            for kind, name, expr in recv:
+                if receiver_is_per_tab(kind, name, s_src):
+                    continue
+                if kind == "unknown":
+                    bad.append("%s:%d: executeSerialized locks on a receiver "
+                               "this gate cannot resolve — re-pin the gate "
+                               "rather than assume it is the per-tab mutex"
+                               % (label, line_of(src, ser[0])))
+                elif kind == "call":
+                    bad.append("%s:%d: executeSerialized locks on `%s.withLock` "
+                               "— a `%s(...)` result is not the per-tab mutex, "
+                               "so two concurrent actions still drive the same "
+                               "WebView (ISSUE-03A overlap window)"
+                               % (label, line_of(src, ser[0]), name, name))
+                else:
+                    bad.append("%s:%d: executeSerialized locks on `%s.withLock` "
+                               "but `%s` is not bound to lockForTab(…) inside "
+                               "the function — the per-tab mutex is never "
+                               "acquired (ISSUE-03A overlap window)"
+                               % (label, line_of(src, ser[0]), name, name))
     return bad
 
 
@@ -272,6 +386,35 @@ BAD_WRONG_SPAN = '''    private suspend fun runAcquiredAction(
 '''
 
 
+# [fix/meta-audit-m2-binding] the falsifying witness, verbatim: `lockForTab(tabId)`
+# stays in the function (bound to a now-dead `val mutex`) while `withLock` moves
+# onto a throwaway `Mutex()`. Both magic substrings remain, so the old
+# co-occurrence test stayed green — this arm pins the RECEIVER identity.
+BAD_MUTEX_RECEIVER = GOOD.replace(
+    "        val result = withTimeoutOrNull(TAB_SERIAL_WAIT_TIMEOUT_MS) {\n"
+    "            mutex.withLock {",
+    "        val result = withTimeoutOrNull(TAB_SERIAL_WAIT_TIMEOUT_MS) {\n"
+    "            Mutex().withLock {")
+
+# Same class of defect on the implicit arm: the lock is taken on a fresh
+# instance instead of the acquired tab's mutex.
+BAD_IMPLICIT_RECEIVER = GOOD.replace(
+    "                    lockForTab(tab.id).withLock { tab.manager.execute(input) }",
+    "                    Mutex().withLock { tab.manager.execute(input) }")
+
+# Direct-chain form (no local binding) must stay accepted: `lockForTab(id).withLock`.
+GOOD_DIRECT_CHAIN = GOOD.replace(
+    "        val mutex = lockForTab(tabId)\n"
+    "        val result = withTimeoutOrNull(TAB_SERIAL_WAIT_TIMEOUT_MS) {\n"
+    "            mutex.withLock {",
+    "        val result = withTimeoutOrNull(TAB_SERIAL_WAIT_TIMEOUT_MS) {\n"
+    "            lockForTab(tabId).withLock {")
+
+# Lock taken on a non-per-tab factory — same shape as `Mutex()`, different name.
+BAD_OTHER_FACTORY = GOOD.replace("            mutex.withLock {",
+                                 "            newMutex().withLock {")
+
+
 def selftest() -> int:
     failures = []
     good = check_source(GOOD, "good.kt")
@@ -294,11 +437,41 @@ def selftest() -> int:
     stripped = GOOD.replace("val mutex = lockForTab(tabId)", "val mutex = kotlinx.coroutines.sync.Mutex()")
     if not check_source(stripped, "x.kt"):
         failures.append("stripped executeSerialized not detected")
+
+    # ── [fix/meta-audit-m2-binding] receiver-identity arms ─────────────────
+    arms = [
+        # (name, source, expect_red, must_mention)
+        ("witness: Mutex().withLock receiver", BAD_MUTEX_RECEIVER, True,
+         "`Mutex.withLock`"),
+        ("witness: implicit arm on Mutex()", BAD_IMPLICIT_RECEIVER, True,
+         "`Mutex.withLock`"),
+        ("direct chain lockForTab(id).withLock", GOOD_DIRECT_CHAIN, False, ""),
+        ("non-per-tab factory receiver", BAD_OTHER_FACTORY, True,
+         "`newMutex.withLock`"),
+    ]
+    for name, src, expect_red, needle in arms:
+        v = check_source(src, name.replace(" ", "-") + ".kt")
+        if expect_red:
+            if not v:
+                failures.append("%s must red" % name)
+            elif needle and not any(needle in b for b in v):
+                failures.append("%s red but not on the receiver rule: %s" % (name, v))
+        else:
+            if v:
+                failures.append("%s must stay clean, got %s" % (name, v))
+        print("selftest %-38s -> %d violation(s)" % (name, len(v)))
+        for b in v:
+            print("   " + b)
+
     if failures:
         for f in failures:
             print("SELFTEST FAIL " + f)
         return 1
+    # The closing marker is pinned verbatim in the frozen scripts/scan/test_scan.py
+    # (DA1016_GATES); growing the arm count must not break that contract, so the
+    # arm total is reported on its own line.
     print("SELFTEST=PASS (browser_tab_exec_serial: 3 fixtures)")
+    print("SELFTEST_ARMS=PASS (browser_tab_exec_serial: +4 receiver-identity arms)")
     return 0
 
 
