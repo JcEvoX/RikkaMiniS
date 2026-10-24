@@ -47,6 +47,20 @@ the convergence*, not the presence of a comment:
      the delegated `var x by remember`. The names are still derived from each
      file's own declarations, so renames do not evade the gate. Deleting one of
      the files that anchors the scope is a failure, not a silent narrowing.
+     [deep-audit-1049 B-02] The BLOCK SET is derived too, not just the file set.
+     Two launch-shaped regions were invisible: `launch(Dispatchers.Default) { … }`
+     (explicit dispatcher wins over the receiver) and `<scope>.launch { … }` (the
+     thread comes from the scope). Which scopes carry IO/Default is derived from
+     their `CoroutineScope(…)` construction — today `MinisApp.applicationScope`,
+     plus per-file aliases of it — never from a member list. Main-implicit scopes
+     are excluded twice over, by the factory that creates them
+     (`rememberCoroutineScope()`, `viewModelScope`, `lifecycleScope`,
+     `MainScope()`) and by an explicit `Dispatchers.Main` argument; without that
+     exclusion every `scope.launch` in every screen would be red. Nesting is
+     resolved innermost-first, so a write inside `withContext(Dispatchers.Main)
+     { … }` nested in an off-main launch is safe and is not reported — which is
+     exactly the shape of the fix. A deliberate off-main write is escaped with a
+     `// offmain-state-ok: <reason>` marker on the offending line.
   G. SINGLE INVALIDATION — the process-lifetime scan cache must have exactly one
      non-private clearing entry, and every ViewModel entry that drives a
      mutating `RootfsManager` operation (mutating = touches disk / publishes
@@ -464,7 +478,6 @@ STORAGE_SCREEN = PKG + "/ui/settings/StorageManagementScreen.kt"
 ROOTFS_VM = PKG + "/ui/sandbox/RootfsManagementViewModel.kt"
 ROOTFS_MANAGER = PKG + "/sandbox/RootfsManager.kt"
 
-OFF_MAIN_CALL = re.compile(r"withContext\(\s*Dispatchers\.(?:IO|Default)\s*\)\s*\{")
 REMEMBER_VAR = re.compile(r"^\s*var\s+(\w+)\s*(?::\s*[^=\n]+)?\s+by\s+remember\b", re.M)
 # `val x = remember { mutableStateOf(…) }` — the holder form, written `x.value =`.
 REMEMBER_HOLDER = re.compile(
@@ -488,6 +501,13 @@ EXPECTED_OFF_MAIN_SCOPE = (
     PKG + "/ui/settings/SoulSettingsScreen.kt",
     PKG + "/ui/settings/StorageManagementScreen.kt",
     PKG + "/webapp/AddToHomeSheet.kt",
+    # [deep-audit-1049 B-02] the three sites the launch-shaped blocks uncovered:
+    # the gallery's share/save resets, the backup screen's WebDAV error, the cold
+    # prewarm timing. Anchored so a refactor that drops the launch (and with it
+    # the only reason this criterion looks at the file) fails loudly.
+    PKG + "/ui/components/ImageGalleryViewer.kt",
+    PKG + "/ui/settings/BackupSettingsScreen.kt",
+    PKG + "/ui/chat/ChatScreen.kt",
 )
 
 # Signals that a RootfsManager member mutates the rootfs or its published state.
@@ -584,38 +604,212 @@ def innermost_brackets(code):
     return out
 
 
-def off_main_blocks(code):
+# ── F: off-main blocks, derived ─────────────────────────────────────────────
+#
+# [deep-audit-1049 B-02] The original block set was `withContext(Dispatchers.IO|
+# Default)` alone. Two more shapes write Compose state on a background thread
+# and were therefore invisible to the gate:
+#
+#   * `launch(Dispatchers.Default) { … }` — the explicit dispatcher wins over
+#     whatever context the receiver carried;
+#   * `<scope>.launch { … }` — no dispatcher argument, so the thread comes from
+#     the scope. WHICH scopes are off-main is derived from the tree: any name
+#     declared as `CoroutineScope(…)` carrying Dispatchers.IO/Default (today
+#     `MinisApp.applicationScope`), plus per-file aliases of it. No member list,
+#     so a new app-wide scope is covered the day it is declared.
+#
+# Main-implicit scopes stay OUT, on two independent grounds: the API that
+# creates them (`rememberCoroutineScope()`, `viewModelScope`, `lifecycleScope`,
+# `MainScope()`) and an explicit `Dispatchers.Main` in the dispatcher argument.
+# Without that exclusion every `scope.launch` in every screen would be red.
+#
+# Nesting resolves innermost-first: a write inside
+# `withContext(Dispatchers.Main) { … }` that itself sits inside an off-main
+# launch lands on Main and must not be reported. That is also why the fix for
+# the three sites below is a Main hop rather than a restructure.
+SCOPE_DECL = re.compile(
+    r"^[ \t]*(?:(?:private|internal|public|protected)[ \t]+)?(?:val|var)[ \t]+(\w+)[ \t]*"
+    r"(?::[ \t]*CoroutineScope[ \t]*)?(?:by[ \t]+lazy[ \t]*\{|=)([^\n]*)$", re.M)
+# `val scope = rememberCoroutineScope()` / `val viewModelScope = …` — Main.implicit.
+MAIN_SCOPE_FACTORY = re.compile(r"rememberCoroutineScope[ \t]*\(|\bMainScope[ \t]*\(")
+MAIN_SCOPE_API = re.compile(r"\b(?:viewModelScope|lifecycleScope)\b")
+OFF_DISPATCH = re.compile(r"Dispatchers\.(?:IO|Default)\b")
+MAIN_DISPATCH = re.compile(r"Dispatchers\.Main\b")
+SCOPE_CTOR = re.compile(r"CoroutineScope[ \t]*\(")
+WITH_CTX = re.compile(r"\bwithContext[ \t]*\(")
+LAUNCH = re.compile(r"\blaunch\b")
+# The escape hatch for a deliberate off-main write is a
+# `// offmain-state-ok: <reason>` marker on the offending line.
+STATE_ESCAPE = "offmain-state-ok:"
+
+def _scope_decls(code):
+    """[(name, rhs)] for `val/var <name>[: CoroutineScope] = <rhs>`."""
+    return [(m.group(1), m.group(2)) for m in SCOPE_DECL.finditer(code)]
+
+def _word(name):
+    return re.compile(r"\b%s\b" % re.escape(name))
+
+def off_main_scope_roots(sources):
+    """Scope names the tree gives an IO/Default dispatcher.
+
+    Deliberately narrow: only a `CoroutineScope(…)` construction that carries
+    Dispatchers.IO/Default counts. A looser test ("the RHS mentions
+    Dispatchers.IO") also matches `val x = withContext(Dispatchers.IO) { … }`,
+    and those names then alias-propagate through every file that mentions them
+    — that version of this function took minutes instead of seconds.
+    """
+    roots = set()
+    for _raw, code in sources.values():
+        for name, rhs in _scope_decls(code):
+            if (SCOPE_CTOR.search(rhs) and OFF_DISPATCH.search(rhs)
+                    and not MAIN_DISPATCH.search(rhs)):
+                roots.add(name)
+    return roots
+
+def file_scope_names(code, roots):
+    """(off-main names, Main-implicit names) as seen inside one file.
+
+    A file-local Main declaration shadows a tree-wide off-main name: the
+    Storage screen's `val scope = rememberCoroutineScope()` and the gallery's
+    `val scope = …applicationScope` are the same identifier with opposite
+    threads, and only the file can tell them apart.
+    """
+    local_off, local_main = set(), set()
+    decls = _scope_decls(code)
+    for name, rhs in decls:
+        if MAIN_SCOPE_FACTORY.search(rhs):
+            local_main.add(name)
+        elif SCOPE_CTOR.search(rhs) and OFF_DISPATCH.search(rhs) and not MAIN_DISPATCH.search(rhs):
+            local_off.add(name)
+    known = (roots | local_off) - local_main
+    # `val child = app.applicationScope` — two passes cover `val a = b; val c = a`.
+    for _ in range(2):
+        for name, rhs in decls:
+            if name in local_off or name in local_main:
+                continue
+            if any(_word(o).search(rhs) for o in known):
+                local_off.add(name)
+                known.add(name)
+    return (roots | local_off) - local_main, local_main
+
+def _paren_end(code, open_paren):
+    depth = 0
+    for j in range(open_paren, len(code)):
+        if code[j] == "(":
+            depth += 1
+        elif code[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return j
+    return len(code) - 1
+
+def _arg_text(code, open_paren):
+    return code[open_paren + 1:_paren_end(code, open_paren)]
+
+def _inline_scope_kind(code, launch_idx):
+    """`CoroutineScope(…Dispatchers.IO…).launch` — classify the receiver expr."""
+    window = code[max(0, launch_idx - 240):launch_idx]
+    last = None
+    for m in SCOPE_CTOR.finditer(window):
+        last = m
+    if last is None:
+        return None
+    seg = window[last.start():]
+    if not seg.rstrip().endswith(")"):
+        return None
+    if OFF_DISPATCH.search(seg) and not MAIN_DISPATCH.search(seg):
+        return "off"
+    if MAIN_DISPATCH.search(seg):
+        return "main"
+    return None
+
+def dispatcher_blocks(code, off_names, main_names):
+    """[(first_line, last_line, 'off'|'main')] for every thread-changing block."""
     out = []
-    for m in OFF_MAIN_CALL.finditer(code):
-        span = brace_span(code, m.end() - 1)
-        if span:
-            out.append(span)
+    for m in WITH_CTX.finditer(code):
+        args = _arg_text(code, m.end() - 1)
+        brace = code.find("{", m.end())
+        span = brace_span(code, brace) if brace >= 0 else None
+        if not span:
+            continue
+        if MAIN_DISPATCH.search(args):
+            out.append((span[0], span[1], "main"))
+        elif OFF_DISPATCH.search(args):
+            out.append((span[0], span[1], "off"))
+    for m in LAUNCH.finditer(code):
+        j = m.end()
+        while j < len(code) and code[j] in " \t":
+            j += 1
+        args = ""
+        if j < len(code) and code[j] == "(":
+            args = _arg_text(code, j)
+            j = _paren_end(code, j) + 1
+        while j < len(code) and code[j] in " \t\n":
+            j += 1
+        if j >= len(code) or code[j] != "{":
+            continue  # `launch(…)` with no trailing block: no region, nothing to classify
+        span = brace_span(code, j)
+        if not span:
+            continue
+        if MAIN_DISPATCH.search(args):
+            out.append((span[0], span[1], "main"))
+            continue
+        if OFF_DISPATCH.search(args):
+            out.append((span[0], span[1], "off"))
+            continue
+        tail = code[max(0, m.start() - 120):m.start()]
+        rm = re.search(r"([A-Za-z_][\w.]*)[ \t]*\.[ \t]*$", tail)
+        if rm:
+            head = rm.group(1).split(".")[-1]
+            if head in main_names or MAIN_SCOPE_API.search(head):
+                out.append((span[0], span[1], "main"))
+            elif head in off_names:
+                out.append((span[0], span[1], "off"))
+            continue
+        kind = _inline_scope_kind(code, m.start())
+        if kind:
+            out.append((span[0], span[1], kind))
     return out
 
+def _innermost_block(blocks, ln):
+    best = None
+    for lo, hi, kind in blocks:
+        if lo <= ln <= hi:
+            if best is None or (hi - lo) < (best[1] - best[0]):
+                best = (lo, hi, kind)
+    return best
 
-def off_main_state_files(repo_root):
-    """Every production file that declares `remember` state AND runs an
-    off-main block — the derived scope of criterion F."""
-    out = []
+def prod_sources(repo_root):
+    """{rel: (raw text, comment/string-blanked code)} for every production .kt."""
+    out = {}
     for path in iter_prod_kt(repo_root):
         text = read(path)
         if text is None:
             continue
-        code = blank_comments(text)
+        out[os.path.relpath(path, repo_root)] = (text, blank_comments(text))
+    return out
+
+def off_main_state_files(sources, roots):
+    """Every production file that declares `remember` state AND runs an
+    off-main block — the derived scope of criterion F."""
+    out = []
+    for rel, (_raw, code) in sources.items():
         if not (REMEMBER_VAR.search(code) or REMEMBER_HOLDER.search(code)):
             continue
-        if not OFF_MAIN_CALL.search(code):
+        off_names, main_names = file_scope_names(code, roots)
+        if not dispatcher_blocks(code, off_names, main_names):
             continue
-        out.append(os.path.relpath(path, repo_root))
+        out.append(rel)
     return sorted(out)
 
 def rule_storage_state_off_io(repo_root):
     """F: no Compose state is assigned from a background dispatcher."""
-    files = off_main_state_files(repo_root)
+    sources = prod_sources(repo_root)
+    roots = off_main_scope_roots(sources)
+    files = off_main_state_files(sources, roots)
     if not files:
-        return ["[F off-main-state] no production file pairs `remember` state with a "
-                "withContext(Dispatchers.IO|Default) block — the subject of this "
-                "criterion was moved or deleted"]
+        return ["[F off-main-state] no production file pairs `remember` state with an "
+                "off-main block — the subject of this criterion was moved or deleted"]
     problems = []
     for rel in EXPECTED_OFF_MAIN_SCOPE:
         if rel not in files:
@@ -624,49 +818,46 @@ def rule_storage_state_off_io(repo_root):
                             "EXPECTED_OFF_MAIN_SCOPE; if it is a refactor, the states moved "
                             "somewhere this criterion no longer sees" % rel)
     for rel in files:
-        text = read(os.path.join(repo_root, rel))
-        if text is None:
-            continue
-        problems += off_main_writes(rel, blank_comments(text))
+        raw, code = sources[rel]
+        problems += off_main_writes(rel, raw, code, roots)
     return problems
 
-def off_main_writes(rel, code):
-    """State assignments whose VALUE comes from inside an off-main block."""
+def off_main_writes(rel, raw, code, roots):
+    """State assignments that land on a background thread."""
     delegated = set(REMEMBER_VAR.findall(code))
     holders = set(REMEMBER_HOLDER.findall(code))
     if not delegated and not holders:
         return []
-    blocks = off_main_blocks(code)
+    off_names, main_names = file_scope_names(code, roots)
+    blocks = dispatcher_blocks(code, off_names, main_names)
     if not blocks:
         return []
     lines = code.split("\n")
+    raw_lines = raw.split("\n")
     brackets = innermost_brackets(code)
     problems = []
-    for lo, hi in blocks:
-        shadowed = set()
-        for ln in range(lo, hi + 1):
-            stripped = lines[ln - 1].strip()
-            decl = re.match(r"(?:val|var)\s+(\w+)\b", stripped)
-            if decl:
-                shadowed.add(decl.group(1))  # a local of the same name wins
+    for ln in range(1, len(lines) + 1):
+        inner = _innermost_block(blocks, ln)
+        if not inner or inner[2] != "off":
+            continue
+        stripped = lines[ln - 1].strip()
+        if brackets[ln - 1] == "(":
+            continue  # in a call's argument list: `name = value` is an argument
+        m = STATE_ASSIGN.match(stripped)
+        if not m:
+            continue
+        name, on_value, rhs = m.group(1), bool(m.group(2)), m.group(3)
+        if on_value:
+            if name not in holders:
                 continue
-            if brackets[ln - 1] == "(":
-                continue  # in a call's argument list: `name = value` is an argument
-            m = STATE_ASSIGN.match(stripped)
-            if not m:
-                continue
-            name, on_value, rhs = m.group(1), bool(m.group(2)), m.group(3)
-            if on_value:
-                if name not in holders:
-                    continue
-            elif name not in delegated:
-                continue
-            if name in shadowed:
-                continue
-            if rhs.startswith("withContext("):
-                continue  # the write itself happens on the caller's thread
-            problems.append("[F off-main-state] %s:%d assigns Compose state `%s` on a "
-                            "background dispatcher: %s" % (rel, ln, name, stripped))
+        elif name not in delegated:
+            continue
+        if rhs.startswith("withContext(") or rhs.startswith("kotlinx.coroutines.withContext("):
+            continue  # the value IS the call: the write lands on the caller's thread
+        if STATE_ESCAPE in (raw_lines[ln - 1] if ln - 1 < len(raw_lines) else ""):
+            continue
+        problems.append("[F off-main-state] %s:%d assigns Compose state `%s` on a "
+                        "background dispatcher: %s" % (rel, ln, name, stripped))
     return problems
 
 def member_bodies(code):
@@ -1120,6 +1311,105 @@ private fun deleteSessionAndCleanup(chatRepository: ChatRepository, id: String) 
 }
 """
 
+GOOD_APP = """package com.rikkaminis.app
+
+class MinisApp : Application() {
+    val applicationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+}
+"""
+
+GOOD_GALLERY = """package com.rikkaminis.app.ui.components
+
+@Composable
+fun ImageGalleryViewer() {
+    val context = LocalContext.current
+    val scope = (context.applicationContext as? MinisApp)?.applicationScope
+        ?: rememberCoroutineScope()
+    var sharing by remember { mutableStateOf(false) }
+    var saving by remember { mutableStateOf(false) }
+    ImageActionButton(onClick = {
+        sharing = true
+        scope.launch {
+            try {
+                shareImage(context)
+            } finally {
+                withContext(Dispatchers.Main.immediate) {
+                    sharing = false
+                }
+            }
+        }
+    })
+    ImageActionButton(onClick = {
+        saving = true
+        scope.launch {
+            try {
+                saveToGallery(context)
+            } finally {
+                withContext(Dispatchers.Main.immediate) {
+                    saving = false
+                }
+            }
+        }
+    })
+}
+"""
+
+GOOD_BACKUP_SCREEN = """package com.rikkaminis.app.ui.settings
+
+@Composable
+fun BackupSettingsScreen(application: MinisApp) {
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+    var operationBusy by remember { mutableStateOf(false) }
+    val upload: () -> Unit = upload@{
+        application.applicationScope.launch {
+            try {
+                val cfg = withContext(Dispatchers.Main) {
+                    val current = webDavConfig
+                    if (current == null) {
+                        errorMessage = context.getString(R.string.webdav_server_not_configured)
+                    }
+                    current
+                }
+                if (cfg == null) {
+                    notifier.notifyWorkCompleted(tag = "webdav-upload")
+                }
+            } finally {
+                withContext(Dispatchers.Main) { operationBusy = false }
+            }
+        }
+    }
+}
+"""
+
+GOOD_CHAT_SCREEN_OFFMAIN = """package com.rikkaminis.app.ui.chat
+
+@Composable
+fun ChatScreen() {
+    var lastColdPrewarmMs by remember { mutableStateOf(-1L) }
+    LaunchedEffect(Unit) {
+        launch(Dispatchers.Default) {
+            val prewarmMs = 12L
+            withContext(Dispatchers.Main.immediate) {
+                lastColdPrewarmMs = prewarmMs
+            }
+        }
+    }
+}
+"""
+
+GOOD_VM_SCOPE_SCREEN = """package com.rikkaminis.app.ui.settings
+
+@Composable
+fun MemoryManagementScreen() {
+    var count by remember { mutableStateOf(0) }
+    LaunchedEffect(Unit) {
+        viewModelScope.launch {
+            count = 1
+        }
+    }
+}
+"""
+
 def make_tree(files):
     root = tempfile.mkdtemp(prefix="sysinfo-state-selftest-")
     for rel, content in files.items():
@@ -1143,6 +1433,11 @@ def selftest():
         PKG + "/webapp/AddToHomeSheet.kt": GOOD_SHEET_FILE,
         FILE_BROWSER_VM: GOOD_FILE_BROWSER,
         HISTORY_DRAWER: GOOD_DRAWER,
+        PKG + "/MinisApp.kt": GOOD_APP,
+        PKG + "/ui/components/ImageGalleryViewer.kt": GOOD_GALLERY,
+        PKG + "/ui/settings/BackupSettingsScreen.kt": GOOD_BACKUP_SCREEN,
+        PKG + "/ui/chat/ChatScreen.kt": GOOD_CHAT_SCREEN_OFFMAIN,
+        PKG + "/ui/settings/MemoryManagementScreen.kt": GOOD_VM_SCOPE_SCREEN,
     }
     root = make_tree(good)
     arms.append(("compliant fixture is green", run(root) == 0))
@@ -1328,6 +1623,122 @@ def selftest():
         "        com.rikkaminis.app.ui.settings.invalidateStorageSnapshot()\n", "")
     root = make_tree(bad)
     arms.append(("a session delete without invalidating is red", run(root) == 1))
+    _rm(root)
+
+    # ── [deep-audit-1049 B-02] launch-shaped off-main blocks ───────────────
+
+    def f_problems(root):
+        """Only the write findings — the anchor-loss messages are separate."""
+        return [p for p in rule_storage_state_off_io(root) if " assigns Compose state " in p]
+
+    arms.append(("the three launch-shaped screens are green as written",
+                 f_problems(root) == []))
+
+    SHARE_HOP = ("                withContext(Dispatchers.Main.immediate) {\n"
+                 "                    sharing = false\n"
+                 "                }\n")
+    SAVE_HOP = ("                withContext(Dispatchers.Main.immediate) {\n"
+                "                    saving = false\n"
+                "                }\n")
+    BACKUP_HOP = ("                val cfg = withContext(Dispatchers.Main) {\n"
+                  "                    val current = webDavConfig\n"
+                  "                    if (current == null) {\n"
+                  "                        errorMessage = context.getString("
+                  "R.string.webdav_server_not_configured)\n"
+                  "                    }\n"
+                  "                    current\n"
+                  "                }\n")
+    BACKUP_RAW = ("                val cfg = webDavConfig\n"
+                  "                if (cfg == null) {\n"
+                  "                    errorMessage = context.getString("
+                  "R.string.webdav_server_not_configured)\n"
+                  "                }\n")
+    PREWARM_HOP = ("            withContext(Dispatchers.Main.immediate) {\n"
+                   "                lastColdPrewarmMs = prewarmMs\n"
+                   "            }\n")
+    PREWARM_RAW = "            lastColdPrewarmMs = prewarmMs\n"
+
+    bad = dict(good)
+    bad[PKG + "/ui/components/ImageGalleryViewer.kt"] = GOOD_GALLERY.replace(
+        SHARE_HOP, "                sharing = false\n")
+    root = make_tree(bad)
+    probs = f_problems(root)
+    arms.append(("a state reset in an app-scope finally is red (one point only)",
+                 len(probs) == 1 and "`sharing`" in probs[0]))
+    _rm(root)
+
+    bad = dict(good)
+    bad[PKG + "/ui/components/ImageGalleryViewer.kt"] = GOOD_GALLERY.replace(
+        SAVE_HOP, "                saving = false\n")
+    root = make_tree(bad)
+    probs = f_problems(root)
+    arms.append(("the save-album reset is red on its own point only",
+                 len(probs) == 1 and "`saving`" in probs[0]))
+    _rm(root)
+
+    bad = dict(good)
+    bad[PKG + "/ui/settings/BackupSettingsScreen.kt"] = GOOD_BACKUP_SCREEN.replace(
+        BACKUP_HOP, BACKUP_RAW)
+    root = make_tree(bad)
+    probs = f_problems(root)
+    arms.append(("errorMessage written from an app-scope launch is red",
+                 len(probs) == 1 and "`errorMessage`" in probs[0]))
+    _rm(root)
+
+    bad = dict(good)
+    bad[PKG + "/ui/chat/ChatScreen.kt"] = GOOD_CHAT_SCREEN_OFFMAIN.replace(
+        PREWARM_HOP, PREWARM_RAW)
+    root = make_tree(bad)
+    probs = f_problems(root)
+    arms.append(("launch(Dispatchers.Default) writing remember state is red",
+                 len(probs) == 1 and "`lastColdPrewarmMs`" in probs[0]))
+    _rm(root)
+
+    bad = dict(good)
+    bad[PKG + "/ui/components/ImageGalleryViewer.kt"] = GOOD_GALLERY.replace(
+        SHARE_HOP, "                sharing = false\n").replace(
+        SAVE_HOP, "                saving = false\n")
+    bad[PKG + "/ui/settings/BackupSettingsScreen.kt"] = GOOD_BACKUP_SCREEN.replace(
+        BACKUP_HOP, BACKUP_RAW)
+    bad[PKG + "/ui/chat/ChatScreen.kt"] = GOOD_CHAT_SCREEN_OFFMAIN.replace(
+        PREWARM_HOP, PREWARM_RAW)
+    root = make_tree(bad)
+    probs = f_problems(root)
+    names = sorted(re.findall(r"assigns Compose state `(\w+)`", " ".join(probs)))
+    arms.append(("reverting all four sites reddens exactly those four",
+                 names == ["errorMessage", "lastColdPrewarmMs", "saving", "sharing"]))
+    _rm(root)
+
+    named = dict(good)
+    named[PKG + "/ui/components/ImageGalleryViewer.kt"] = GOOD_GALLERY.replace(
+        SHARE_HOP, "                sharing = false // offmain-state-ok: fixture\n")
+    root = make_tree(named)
+    arms.append(("the offmain-state-ok escape hatch silences one site",
+                 f_problems(root) == []))
+    _rm(root)
+
+    named = dict(good)
+    named[PKG + "/ui/chat/ChatScreen.kt"] = GOOD_CHAT_SCREEN_OFFMAIN.replace(
+        "launch(Dispatchers.Default) {\n            val prewarmMs = 12L",
+        "launch(Dispatchers.Main.immediate) {\n            val prewarmMs = 12L").replace(
+        PREWARM_HOP, PREWARM_RAW)
+    root = make_tree(named)
+    arms.append(("an explicit Main dispatcher is not off-main",
+                 f_problems(root) == []))
+    _rm(root)
+
+    named = dict(good)
+    named[PKG + "/MinisApp.kt"] = GOOD_APP.replace(
+        "Dispatchers.IO", "Dispatchers.Main.immediate")
+    root = make_tree(named)
+    arms.append(("a Main-backed application scope is not off-main",
+                 f_problems(root) == []))
+    _rm(root)
+
+    bad = dict(good)
+    bad.pop(PKG + "/ui/components/ImageGalleryViewer.kt", None)
+    root = make_tree(bad)
+    arms.append(("deleting a launch-shaped anchor file is red", run(root) == 1))
     _rm(root)
 
     print("")

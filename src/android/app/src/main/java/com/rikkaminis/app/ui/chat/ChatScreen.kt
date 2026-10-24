@@ -3427,7 +3427,13 @@ fun ChatScreen(
                                             val tPrewarmNs = System.nanoTime()
                                             prewarmMarkdown(prewarmSources)
                                             val prewarmMs = (System.nanoTime() - tPrewarmNs) / 1_000_000
-                                            lastColdPrewarmMs = prewarmMs
+                                            // [deep-audit-1049 B-02] `lastColdPrewarmMs` is
+                                            // Compose state. The warming stays on Default; only
+                                            // the publish hops to Main — a state write from a
+                                            // background dispatcher races recomposition.
+                                            withContext(Dispatchers.Main.immediate) {
+                                                lastColdPrewarmMs = prewarmMs
+                                            }
                                             com.rikkaminis.app.diagnostics.PerfLongCtx.step(
                                                 sessionId,
                                                 "coldPrewarm.done",

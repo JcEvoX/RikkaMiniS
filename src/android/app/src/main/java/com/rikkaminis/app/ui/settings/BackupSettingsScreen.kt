@@ -911,11 +911,22 @@ fun BackupSettingsScreen(
                                     }
                                 }
                             }
-                            // Resolve config on Main (it reads SharedPreferences and
-                            // Compose state); bail with an inline error if unset.
-                            val cfg = webDavConfig
+                            // [deep-audit-1049 B-02] Resolve config ON Main: the
+                            // comment that used to sit here always claimed Main,
+                            // but the read sat on the applicationScope dispatcher
+                            // (Dispatchers.IO) and so did the `errorMessage` write
+                            // in the bail arm — both are Compose state. One hop
+                            // covers the read and the "not configured" report.
+                            val cfg = withContext(Dispatchers.Main) {
+                                val current = webDavConfig
+                                if (current == null) {
+                                    errorMessage = context.getString(
+                                        R.string.webdav_server_not_configured,
+                                    )
+                                }
+                                current
+                            }
                             if (cfg == null) {
-                                errorMessage = context.getString(R.string.webdav_server_not_configured)
                                 notifier.notifyWorkCompleted(
                                     tag = "webdav-upload",
                                     title = context.getString(R.string.webdav_notify_title_failed),
