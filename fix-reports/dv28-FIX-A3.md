@@ -171,8 +171,13 @@ m1/m3 是同一件事的两种写法（删掉 vs 退化），都**恰好红**在
 ## 7. 身份链
 
 - 基线：`eea9f407f9e0e79f4902eeef1f84e1550ee5c29c`（`git log --oneline -2` 确认父链）。
-- 提交：见回报消息（生产 → 测试 → 门 → 报告；报告提交只含 `fix-reports/*.md`，按 COMMON §3.6 用 `git diff --name-only <绿sha>..HEAD -- . ':(exclude)fix-reports'` 为空声明源码树等价）。
-- CI：`run <id>` / `job <id>` / `attempt 1` / `head_sha` 三方逐字符一致（见回报消息）。
+- 提交（4 个，生产 → 测试 → 门 → 报告 → 本段回填）：
+  - `b4bd0b66` fix(memory): rollup candidacy owns the content dimension
+  - `73b84261` test(gate): extend backup_remap_rollup_check with content-dimension criteria
+  - `81d86f8d` docs(report): dv28-A3 report ← **CI 绿于这棵树**
+  - 本段回填提交只含 `fix-reports/*.md`，按 COMMON §3.6 用 `git diff --name-only 81d86f8d..HEAD -- . ':(exclude)fix-reports'` 为空声明源码树等价。
+- CI：`run 40050931869` / `job 120743217009` / `attempt 1` / `conclusion success` / `head_sha 81d86f8d938dc44c5f9211389d14af341a83f5a1`（本地 HEAD == `git ls-remote` == `run.head_sha` 三方逐字符一致）。
+- CI 判读（1,460,807 B 日志，逐项）：26 步唯一 skipped = `Publish to Releases`（main 门控，真分支构建不发布）· `Summary: 111 passed, 0 failed` 恰一条且带框线 · `✅ ALL 342 CASES PASS` · 门头 `[1/111]..[111/111]` 共 111 条且去重仍 111 · 编译错 ` e: ` **0** · 含 `FAILED` 的行 6 条**全部是 PASSED 用例名子串**（`RealAgentAdapterSkeletonTest` / `ChatAgentTraceObserverSchemaTest` ×4 / `TerminalErrorSurfacedTest`）· 本门见证两行在册（`selftest has teeth (BACKUP_REMAP_ROLLUP_SELFTEST=PASS)` + `real tree green`）· 本支 6 个文件警告 **0 条** · 两条新用例逐条 `PASSED`。
 
 ---
 
