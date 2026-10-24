@@ -248,7 +248,6 @@ fun AddToHomeSheet(
         webpageIconPath = staged.iconPath
         copyFailed = staged.failed
     }
-    }
 
     // [dv14-B2] The field is seeded from the de-suffixed file name up front;
     // the async parsed <title> backfills it only while the user hasn't typed
