@@ -46,6 +46,11 @@ internal object ChatMutationMethods {
         val sessionId = params.optString("sessionId", "").ifEmpty { null }
             ?: store.activeSessionId
             ?: throw RPCException(-32000, "No chat is on screen (activeSessionId is null) and no sessionId was given")
+        // [dv29-A2] Same existence gate as the headless entries: this drives the
+        // SCREEN-owned VM, and `activeSessionId` can outlive the row it names (delete
+        // while the screen is open) — the send would then append into a missing FK
+        // parent. A draft (`__new__…`) passes through the resident-VM half.
+        HeadlessChatRunner.requireSendableSession(app, sessionId)
         val vm = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
             androidx.lifecycle.ViewModelProvider(
                 store.ownerFor(sessionId),

@@ -609,13 +609,55 @@ class ChatRepository(
             // [RC15] Unique (session_id, sort_order) constraint violated —
             // another concurrent append raced to the same sort_order. Retry
             // with a fresh sort_order from the DB.
+            //
+            // [dv29-A2] …but ONLY that one. This catch used to assume every
+            // SQLiteConstraintException was the sort_order race. A FOREIGN KEY
+            // failure (`messages.session_id → chat_sessions.id`, code 787) is
+            // not: re-reading `nextSortOrder` for a session with no row returns
+            // 0, the replay repeats the identical insert against the identical
+            // missing parent, and the second throw escaped the catch — as an
+            // uncaught coroutine exception it killed the process (ACRA,
+            // 2026-10-24 12:57 ×2 via `minis-sessions-cli send --session
+            // <missing id>`). Decide from the message, retry only the race, and
+            // re-throw everything else as a CLASSIFIED failure so callers can
+            // report it instead of dying.
+            val conflict = classifyMessageInsertConstraint(e.message)
+            if (conflict != MessageInsertConflict.SORT_ORDER &&
+                conflict != MessageInsertConflict.UNKNOWN
+            ) {
+                AppLogger.warning(
+                    "ChatRepository",
+                    "appendMessage: insert rejected ($conflict) — not retried " +
+                        "(session=$sessionId id=${message.id})",
+                )
+                throw MessageInsertRejectedException(conflict, sessionId, e)
+            }
             val retrySortOrder = dao.nextSortOrder(sessionId)
             AppLogger.info("ChatRepository", "appendMessage: constraint-retry re-order=$retrySortOrder (original=$sortOrder)")
             // NB: keep `.also { }` as this block's last expression — it's the
             // MessageEntity the `persisted` val is initialized from. Logging
             // AFTER it would make the block's inferred type `Any` (AppLogger.info → Unit).
             message.copy(sortOrder = retrySortOrder).also {
-                dao.insertMessage(it)
+                try {
+                    dao.insertMessage(it)
+                } catch (retry: SQLiteConstraintException) {
+                    // [dv29-A2] The replay is allowed exactly once, and a
+                    // SECOND failure never leaves this function as a raw
+                    // constraint exception: whatever it was, it is now a
+                    // classified `MessageInsertRejectedException` (the ACRA
+                    // process kill started here, on the un-caught second throw).
+                    val retryConflict = classifyMessageInsertConstraint(retry.message)
+                    AppLogger.warning(
+                        "ChatRepository",
+                        "appendMessage: retry also rejected ($retryConflict) — " +
+                            "giving up (session=$sessionId id=${message.id})",
+                    )
+                    throw MessageInsertRejectedException(
+                        if (retryConflict == MessageInsertConflict.UNKNOWN) conflict else retryConflict,
+                        sessionId,
+                        retry,
+                    )
+                }
                 AppLogger.info("ChatRepository", "appendMessage: insertMessage(retry) done (${System.currentTimeMillis() - t0}ms)")
             }
         }
@@ -1307,4 +1349,71 @@ data class MessagePageItem(
     // [T-android-sessions-cli-full] True when the stored text exceeded the
     // requested cap and [text] is a prefix. Surfaced as "truncated": true.
     val truncated: Boolean = false,
+)
+
+/**
+ * [dv29-A2] Which constraint did a `messages` INSERT trip?
+ *
+ * Classified from the SQLite message because that is the only thing Room hands
+ * back (`SQLiteConstraintException.message`), and it is the only discriminator
+ * available before deciding whether the insert may be replayed.
+ */
+internal enum class MessageInsertConflict {
+    /** `unique(session_id, sort_order)` — two appends raced; replay with a fresh order. */
+    SORT_ORDER,
+
+    /** `messages.session_id → chat_sessions.id` (code 787) — the session row is gone. */
+    SESSION_ROW_MISSING,
+
+    /** Anything else the message names (another unique index, NOT NULL, …) — never replayable. */
+    OTHER,
+
+    /**
+     * No usable message (null/blank). Cannot happen with a real SQLite, but a
+     * constraint failure whose identity is unknowable is the one case where a
+     * single bounded replay is still worth trying — and its second failure is
+     * classified rather than thrown raw, so the unknowable case cannot crash.
+     */
+    UNKNOWN,
+}
+
+/**
+ * [dv29-A2] Pure classifier for [ChatRepository.appendMessage]'s retry gate.
+ *
+ * `sort_order` is part of the SORT_ORDER test on purpose: `messages` also has a
+ * unique PRIMARY KEY, and "UNIQUE constraint failed: messages.id" must NOT be
+ * treated as a sort-order race (the retry would re-send the same colliding id).
+ */
+internal fun classifyMessageInsertConstraint(message: String?): MessageInsertConflict {
+    val text = message?.trim().orEmpty()
+    if (text.isEmpty()) return MessageInsertConflict.UNKNOWN
+    if (text.contains("FOREIGN KEY constraint failed", ignoreCase = true)) {
+        return MessageInsertConflict.SESSION_ROW_MISSING
+    }
+    if (text.contains("UNIQUE constraint failed", ignoreCase = true) &&
+        text.contains("sort_order", ignoreCase = true)
+    ) {
+        return MessageInsertConflict.SORT_ORDER
+    }
+    return MessageInsertConflict.OTHER
+}
+
+/**
+ * [dv29-A2] A `messages` INSERT that must not be replayed failed.
+ *
+ * Thrown instead of letting the raw `SQLiteConstraintException` escape: it
+ * carries the [conflict] classification, so a caller (RPC entry, recovery
+ * sweep, fork) can report `session_not_found` / `insert_rejected` rather than
+ * crash, and the probe of "did we retry?" is answerable from the type alone.
+ * `appendMessage`'s caller-visible contract is unchanged for the one case the
+ * retry exists for (the sort_order race is still retried and still returns a
+ * persisted row).
+ */
+internal class MessageInsertRejectedException(
+    val conflict: MessageInsertConflict,
+    val sessionId: String,
+    cause: Throwable,
+) : RuntimeException(
+    "messages insert rejected ($conflict) for session=$sessionId",
+    cause,
 )
