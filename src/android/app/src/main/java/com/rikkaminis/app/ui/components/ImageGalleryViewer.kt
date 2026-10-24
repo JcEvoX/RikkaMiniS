@@ -60,6 +60,7 @@ import coil.compose.AsyncImage
 import coil.request.ImageRequest
 import com.rikkaminis.app.ui.DisplayBitmapLimits.limitDisplaySize
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -321,7 +322,18 @@ fun ImageGalleryViewer(
                                         try {
                                             shareImage(context, currentItem.model)
                                         } finally {
-                                            sharing = false
+                                            // [deep-audit-1049 B-02] `sharing` is Compose
+                                            // state and `scope` is MinisApp.applicationScope
+                                            // = SupervisorJob + Dispatchers.IO (no Looper), so
+                                            // the reset has to land on Main — writing it from
+                                            // IO races recomposition and can throw
+                                            // "Reading a state that was created after the
+                                            // snapshot was taken". NonCancellable keeps the
+                                            // reset running if the job is cancelled between
+                                            // the share and this line.
+                                            withContext(NonCancellable + Dispatchers.Main.immediate) {
+                                                sharing = false
+                                            }
                                         }
                                     }
                                 },
@@ -357,7 +369,12 @@ fun ImageGalleryViewer(
                                                 Toast.makeText(context, msg, Toast.LENGTH_SHORT).show()
                                             }
                                         } finally {
-                                            saving = false
+                                            // [deep-audit-1049 B-02] Same off-main write as
+                                            // the Share button's finally: `saving` is Compose
+                                            // state, `scope` runs on Dispatchers.IO.
+                                            withContext(NonCancellable + Dispatchers.Main.immediate) {
+                                                saving = false
+                                            }
                                         }
                                     }
                                 },
