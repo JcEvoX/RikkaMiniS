@@ -532,14 +532,19 @@ class WebAppActivity : ComponentActivity() {
                 putExtra(Intent.EXTRA_STREAM, uri)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            val chooser = Intent.createChooser(
+            // [deep-audit-1049 B-03] Shared launcher: NEW_TASK stays on the
+            // chooser (the intent actually started) and a device with no share
+            // target now says so instead of only writing a log line.
+            com.rikkaminis.app.util.ExternalIntent.share(
+                context,
                 send,
                 context.getString(R.string.webapp_share_chooser_title),
-            ).apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
-            try {
-                context.startActivity(chooser)
-            } catch (e: ActivityNotFoundException) {
-                AppLogger.warning(logTag, "Share chooser failed: ${e.message}")
+            ) { t ->
+                Toast.makeText(
+                    context,
+                    context.getString(R.string.file_share_failed_toast, t.message ?: ""),
+                    Toast.LENGTH_SHORT,
+                ).show()
             }
         }
     }

@@ -293,6 +293,7 @@ import com.rikkaminis.app.data.repository.MemoryRepository
 import com.rikkaminis.app.data.repository.ProviderRepository
 import com.rikkaminis.app.ui.browser.BrowserSheet
 import com.rikkaminis.app.ui.theme.ChatColors
+import com.rikkaminis.app.util.ExternalIntent
 import com.rikkaminis.app.ui.components.MinisTextButton
 
 // [refactor/split-chatscreen] Batch 1: the composer/input area composable,
@@ -424,9 +425,20 @@ internal fun ChatInputArea(
     // edit). Declared before its consumers for the same reason as the funnel
     // above (1039-B1: a local `val` lambda cannot be referenced before its
     // declaration).
-    val commitComposerBody: (String, Int) -> Unit = { text, caret ->
+    //
+    // [deep-audit-1049 B-06] `caret` is nullable: the slash/`@` outlets below
+    // that carry no caret intent pass `null` and keep the user's true caret
+    // (`lastTrueCaretEnd`), which is exactly what the inputText mirror does for
+    // them. They used to call `viewModel.setInputText(...)` on their own, and
+    // that path is the one that can lose: while a >8-char IME burst is still
+    // buffered, `inputFieldValue` is AHEAD of `viewModel.inputText`, so
+    // `setInputText(newText)` where newText == the VM string is an equal write —
+    // the StateFlow suppresses it, the mirror never re-runs, and the field keeps
+    // the old slash prefix. `_pendingCaret` was also left dangling for the next
+    // input.
+    val commitComposerBody: (String, Int?) -> Unit = { text, caret ->
         cancelPendingImeBurst()
-        val at = caret.coerceIn(0, text.length)
+        val at = composerCommitCaret(caret, lastTrueCaretEnd, text.length)
         viewModel.setInputText(text)
         inputFieldValue = androidx.compose.ui.text.input.TextFieldValue(
             text = text,
@@ -456,13 +468,18 @@ internal fun ChatInputArea(
                     val next =
                         if (menuOpen) viewModel.dismissSlashMenu(inputFieldValue.text)
                         else viewModel.showSlashMenuOverInput(inputFieldValue.text)
-                    viewModel.setInputText(next)
+                    // [deep-audit-1049 B-06] Through the funnel: a bare
+                    // setInputText equal to the (burst-lagged) VM string is
+                    // suppressed, and the field keeps the pre-toggle text.
+                    commitComposerBody(next, null)
                     runCatching { inputFocusRequester.requestFocus() }
                     keyboardController?.show()
                 }
                 ComposerCommand.DismissSlashMenu -> {
-                    cancelPendingImeBurst()
-                    viewModel.setInputText(viewModel.dismissSlashMenu(inputFieldValue.text))
+                    commitComposerBody(
+                        viewModel.dismissSlashMenu(inputFieldValue.text),
+                        null,
+                    )
                 }
                 ComposerCommand.Clear -> clearComposerInput()
                 // [dv24/B-05] The two text intents: resolved HERE against the
@@ -748,8 +765,10 @@ internal fun ChatInputArea(
                         // back as the composer's value — clearing the dictation or
                         // paste the user just made. Drop the pending flush first so
                         // the stale snapshot cannot restore itself afterwards.
-                        cancelPendingImeBurst()
-                        viewModel.setInputText(viewModel.dismissSlashMenu(inputFieldValue.text))
+                        commitComposerBody(
+                            viewModel.dismissSlashMenu(inputFieldValue.text),
+                            null,
+                        )
                     },
                     properties = androidx.compose.ui.window.PopupProperties(
                         focusable = false,
@@ -848,7 +867,10 @@ internal fun ChatInputArea(
                                                 // flush is dropped so it cannot re-commit a
                                                 // snapshot over the post-command value.
                                                 cancelPendingImeBurst()
-                                                viewModel.setInputText(viewModel.executeSlashCommand(cmd, inputFieldValue.text))
+                                                commitComposerBody(
+                                                    viewModel.executeSlashCommand(cmd, inputFieldValue.text),
+                                                    null,
+                                                )
                                                 // For the typing-aid rows
                                                 // (skill + MCP), "/<name> "
                                                 // is a typing aid — the user
@@ -1075,11 +1097,12 @@ internal fun ChatInputArea(
                                                     currentText = inputFieldValue.text,
                                                     currentCaret = inputFieldValue.selection.end,
                                                 )
-                                                // [fix/setinputtext-caret-intent] Pass the explicit caret
-                                                // intent so the consuming LaunchedEffect places the cursor
-                                                // exactly here — replaces the old manual TextFieldValue
-                                                // double-write that raced the effect's pendingCaret read.
-                                                viewModel.setInputText(newText, caretOverride = newCaret)
+                                                // [fix/setinputtext-caret-intent] Explicit caret intent:
+                                                // the funnel places the field's selection exactly here, so
+                                                // the consuming LaunchedEffect does not have to race it.
+                                                // [deep-audit-1049 B-06] …and it goes through the funnel so
+                                                // an equal-to-VM write still lands on the field.
+                                                commitComposerBody(newText, newCaret)
                                             }
                                             .padding(horizontal = 12.dp, vertical = 8.dp),
                                         verticalAlignment = Alignment.CenterVertically,
@@ -1465,12 +1488,15 @@ internal fun ChatInputArea(
                                                     android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION,
                                                 )
                                             }
-                                            try {
-                                                context.startActivity(intent)
-                                            } catch (_: android.content.ActivityNotFoundException) {
+                                            // [deep-audit-1049 B-03] Shared launcher instead of a
+                                            // bare startActivity: the intent carries no
+                                            // NEW_TASK (a chooser would not have inherited one
+                                            // either), and the failure toast used to be a
+                                            // hard-coded English sentence.
+                                            ExternalIntent.start(context, intent) {
                                                 android.widget.Toast.makeText(
                                                     context,
-                                                    "No app available to open this attachment.",
+                                                    context.getString(R.string.filepreview_no_app),
                                                     android.widget.Toast.LENGTH_SHORT,
                                                 ).show()
                                             }
@@ -1768,8 +1794,9 @@ internal fun ChatInputArea(
                                                 cancelPendingImeBurst()
                                                 val (newText, newCaret) = result
                                                 // [fix/setinputtext-caret-intent] Explicit caret intent,
-                                                // same as the tap path — single-writer through LaunchedEffect.
-                                                viewModel.setInputText(newText, caretOverride = newCaret)
+                                                // same as the tap path — single writer is the funnel
+                                                // ([deep-audit-1049 B-06]).
+                                                commitComposerBody(newText, newCaret)
                                                 return@onKeyEvent true
                                             }
                                             // Menu open but no candidates → fall
@@ -2205,3 +2232,21 @@ private fun SlashMenuLoadingPanel() {
     }
 }
 
+/**
+ * [deep-audit-1049 B-06] Where the caret lands after a funnel rewrite.
+ *
+ * `null` means "this outlet has no caret intent" — the slash and `@` sites that
+ * just replace the body keep the user's true caret (`lastTrueCaretEnd`, the
+ * authoritative value maintained by `onValueChange`, NOT the possibly-lagging
+ * `TextFieldValue.selection`). Both shapes are clamped to the new text, because
+ * a shift-delete during the 150 ms burst can leave the remembered caret past the
+ * end of the replacement and `TextRange` would throw.
+ *
+ * Pure and top-level so the arithmetic is pinned on the JVM; the funnel itself
+ * needs a composition (`BasicTextField` + a ViewModel).
+ */
+internal fun composerCommitCaret(caret: Int?, lastTrueCaretEnd: Int, length: Int): Int {
+    val wanted = caret ?: lastTrueCaretEnd
+    if (length <= 0) return 0
+    return wanted.coerceIn(0, length)
+}

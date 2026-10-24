@@ -898,8 +898,15 @@ private fun shareMediaFile(context: android.content.Context, file: File, mime: S
         putExtra(Intent.EXTRA_STREAM, uri)
         addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
     }
-    val chooser = Intent.createChooser(intent, file.name).apply {
-        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    // [deep-audit-1049 B-03] Shared launcher. The hand-rolled version had the
+    // flag right but an EMPTY catch — a device with no share target and a
+    // successful share were indistinguishable on screen (the same defect the
+    // FileProvider exit above documents).
+    com.rikkaminis.app.util.ExternalIntent.share(context, intent, file.name) { t ->
+        Toast.makeText(
+            context,
+            context.getString(R.string.file_share_failed_toast, t.message ?: ""),
+            Toast.LENGTH_SHORT,
+        ).show()
     }
-    try { context.startActivity(chooser) } catch (_: Throwable) {}
 }

@@ -45,6 +45,7 @@ import androidx.core.content.FileProvider
 import com.rikkaminis.app.R
 import com.rikkaminis.app.browser.BrowserTabPool
 import com.rikkaminis.app.ui.theme.ChatColors
+import com.rikkaminis.app.util.ExternalIntent
 
 /**
  * [T-android-browser-download-ux] Downloads panel — Android port of iOS
@@ -252,11 +253,25 @@ private fun openDownloadedFile(context: Context, entry: BrowserTabPool.DownloadE
         val intent = Intent(Intent.ACTION_VIEW).apply {
             setDataAndType(uri, mime)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         }
-        context.startActivity(Intent.createChooser(intent, null))
+        // [deep-audit-1049 B-03] Shared launcher: NEW_TASK moves onto the
+        // chooser (the intent that is actually started — a chooser does not
+        // inherit the inner intent's flags), and the failure is no longer a
+        // logcat line the user cannot see.
+        ExternalIntent.share(context, intent, null) {
+            android.widget.Toast.makeText(
+                context,
+                context.getString(R.string.filepreview_no_app),
+                android.widget.Toast.LENGTH_SHORT,
+            ).show()
+        }
     } catch (e: Exception) {
         android.util.Log.w("BrowserDownloads", "open failed: ${e.message}")
+        android.widget.Toast.makeText(
+            context,
+            context.getString(R.string.filepreview_no_app),
+            android.widget.Toast.LENGTH_SHORT,
+        ).show()
     }
 }
 

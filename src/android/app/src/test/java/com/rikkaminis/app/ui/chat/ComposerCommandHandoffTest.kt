@@ -207,6 +207,57 @@ class ComposerCommandHandoffTest {
         }
     }
 
+    // ── [deep-audit-1049 B-06] the body funnel's caret rule ────────────────
+
+    @Test
+    fun `a funnel rewrite without a caret keeps the true caret`() {
+        // The slash and `@` outlets carry no caret intent: they replace the
+        // body and the user's caret stays where the field says it is.
+        assertEquals(7, composerCommitCaret(null, lastTrueCaretEnd = 7, length = 20))
+    }
+
+    @Test
+    fun `a funnel rewrite with a caret uses the caller's caret`() {
+        assertEquals(3, composerCommitCaret(3, lastTrueCaretEnd = 7, length = 20))
+    }
+
+    @Test
+    fun `the caret is clamped into the replacement`() {
+        // A shift-delete during the 150 ms burst can leave the remembered caret
+        // beyond the replacement; TextRange would throw on an out-of-range index.
+        assertEquals(5, composerCommitCaret(9, lastTrueCaretEnd = 7, length = 5))
+        assertEquals(0, composerCommitCaret(-4, lastTrueCaretEnd = 7, length = 5))
+        assertEquals(0, composerCommitCaret(4, lastTrueCaretEnd = 7, length = 0))
+    }
+
+    @Test
+    fun `every slash outlet rewrites through the body funnel`() {
+        val code = codeOnly(read(inputAreaRel))
+        for (call in listOf("dismissSlashMenu(", "executeSlashCommand(", "showSlashMenuOverInput(")) {
+            var at = code.indexOf(call)
+            assertTrue("$call is no longer called from the composer", at >= 0)
+            var checked = 0
+            while (at >= 0) {
+                // The outlet's own arm: the call may be resolved a line above the
+                // funnel call (`val next = if (…) … else …`), so the window is the
+                // surrounding arm rather than the call expression itself.
+                val window = code.substring(maxOf(0, at - 320), minOf(code.length, at + 320))
+                assertTrue(
+                    "$call must resolve its rewrite through commitComposerBody (a bare " +
+                        "setInputText is dropped when the text equals the debounced copy)",
+                    window.contains("commitComposerBody("),
+                )
+                assertTrue(
+                    "$call must not write setInputText itself",
+                    !window.contains("setInputText("),
+                )
+                checked++
+                at = code.indexOf(call, at + call.length)
+            }
+            assertTrue("$call call sites found: 0", checked > 0)
+        }
+    }
+
     @Test
     fun `the composer executes both text intents against its live field`() {
         val code = codeOnly(read(inputAreaRel))
