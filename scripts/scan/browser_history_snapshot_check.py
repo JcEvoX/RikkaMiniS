@@ -420,6 +420,189 @@ def sync_entries_spans(body: str):
     return spans
 
 
+def blank_spans(text: str, spans) -> str:
+    """Same-length copy with every [start, end) span blanked (newlines kept so
+    offsets/line numbers stay meaningful)."""
+    out = list(text)
+    for s, e in spans:
+        for k in range(s, min(e, len(out))):
+            if out[k] != "\n":
+                out[k] = " "
+    return "".join(out)
+
+
+# ── wide-1024 A1 ──────────────────────────────────────────────────────────
+# The old A1 arm asked a spelling question: "is there a `for (x in entries)` /
+# `entries.forEach` / `entries.map {` outside the monitor?" — and the defect
+# family's answer was to change the *spelling of the read*, not the read:
+#
+#     for (entry in entries.iterator())        # ConcurrentModificationException
+#     for (entry in entries.subList(0, size))  # unlocked view of the live list
+#
+# A1 now grades the dataflow instead: inside save(), the identifier `entries`
+# may only be *touched* under `synchronized(entries)`. Every other reference —
+# whatever call hangs off it — is a read of the live list the writers mutate.
+LIVE_SYMBOL = "entries"
+
+
+def live_entries_reads(save_body: str):
+    """Offsets of every reference to the live `entries` list that is NOT inside
+    a `synchronized(entries)` block (the lock's own argument is exempt)."""
+    spans = sync_entries_spans(save_body)
+    masked = blank_spans(save_body, spans)
+    # the monitor expression itself: synchronized(entries) { … }
+    masked = re.sub(r"synchronized\s*\(\s*entries\s*\)", lambda m: " " * len(m.group(0)), masked)
+    return [m.start() for m in re.finditer(r"\b" + LIVE_SYMBOL + r"\b", masked)]
+
+
+# ── wide-1024 B1 (producer side) ──────────────────────────────────────────
+# The sheet arm proves the panel KEYS on store-owned state. It cannot see
+# whether that state ever changes: a producer written `.update { it }` maps the
+# old value onto itself, and StateFlow suppresses equal values — the observable
+# exists, is wired, and never fires. So the producer is judged on the same
+# axis: the value published must DIFFER from the one it replaced.
+IDENTITY_LAMBDA_RE = re.compile(
+    r"^\{?\s*(?:([A-Za-z_]\w*)\s*->\s*)?([A-Za-z_]\w*)\s*\}?$")
+FLOW_WRITE_RE = re.compile(r"\.\s*(update|emit|tryEmit|compareAndSet|value\s*=)\s*")
+
+
+def producer_value_text(text: str, pos: int) -> str:
+    """Text of the value handed to a flow write starting at [pos]."""
+    m = re.match(r"\s*", text[pos:])
+    pos += m.end() if m else 0
+    if text[pos:pos + 1] == "{":
+        s, e = brace_span(text, pos)
+        return text[s:e]
+    depth = 0
+    i = pos
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c in "([":
+            depth += 1
+        elif c in ")]":
+            if depth == 0:
+                break
+            depth -= 1
+        elif c in ",\n" and depth == 0:
+            break
+        i += 1
+    return text[pos:i]
+
+
+def revision_holder_names(store: str):
+    """Names that can carry the observable revision flow: the declared member
+    plus every identifier named in its initializer/getter (the `_x` /
+    placeholder indirection)."""
+    holders = set()
+    for m in OBSERVABLE_STATE_RE.finditer(store):
+        name = m.group(1)
+        holders.add(name)
+        line_end = store.find("\n", m.end())
+        tail = store[m.end():line_end if line_end > 0 else len(store)]
+        holders |= set(re.findall(r"\b([A-Za-z_]\w*)\b", tail)) - {"get", "StateFlow",
+                                                                  "MutableStateFlow", "State"}
+    return {h for h in holders
+            if h not in ("Int", "Long", "Boolean", "String", "Byte", "Short", "Unit", "value")}
+
+
+def check_revision_producer(store: str):
+    """The observable mutation counter must be advanced by a producer that
+    publishes a DIFFERENT value."""
+    problems = []
+    holders = revision_holder_names(store)
+    sites = []
+    for m in FLOW_WRITE_RE.finditer(store):
+        recv = store[:m.start()].rstrip()
+        if holders and not any(re.search(r"\b" + re.escape(h) + r"\b", recv[-120:]) for h in holders):
+            continue
+        sites.append((m.group(1), producer_value_text(store, m.end())))
+    if not sites:
+        problems.append(
+            "B1p: the observable revision flow is declared but never written -- a key on it "
+            "can never change (fail-closed)")
+        return problems
+    for kind, value in sites:
+        norm = " ".join(value.split())
+        ident = IDENTITY_LAMBDA_RE.match(norm)
+        is_identity = bool(ident) and (
+            ident.group(1) is None or ident.group(1) == ident.group(2))
+        if "value =" in kind and norm in ("value", "revision.value"):
+            is_identity = True
+        if is_identity:
+            problems.append(
+                "B1p: the revision producer writes the value it read (%r) -- StateFlow "
+                "suppresses equal values, so `revision` never emits and every panel keyed "
+                "on it stays frozen" % norm[:60])
+            break
+    return problems
+
+
+def string_resource_bindings(sheet: str):
+    """`val <local> = stringResource(R.string.<key>)` -> {local: key}."""
+    out = {}
+    for m in re.finditer(
+            r"\b(?:val|var)\s+([A-Za-z_]\w*)\s*(?::[^=\n]*)?(?:by|=)\s*"
+            r"stringResource\s*\(\s*R\.string\.([A-Za-z0-9_]+)", sheet):
+        out[m.group(1)] = m.group(2)
+    return out
+
+
+def split_args(arg_text: str):
+    """Top-level comma split of a call's argument list."""
+    out, depth, cur = [], 0, []
+    for c in arg_text:
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        if c == "," and depth == 0:
+            out.append("".join(cur).strip())
+            cur = []
+            continue
+        cur.append(c)
+    if "".join(cur).strip():
+        out.append("".join(cur).strip())
+    return out
+
+
+def check_bucket_label_args(sheet: str):
+    """B2's dataflow half: the two labels handed to `groupedByDay` must be the
+    localised resources, not a literal (or a literal disguised by `"To" + "day"`)."""
+    problems = []
+    bindings = string_resource_bindings(sheet)
+    calls = list(re.finditer(r"\bgroupedByDay\s*\(", sheet))
+    if not calls:
+        problems.append("B2: no `groupedByDay(` call in the sheet -- re-point this arm "
+                        "(the day buckets are no longer built there)")
+        return problems
+    wanted = ("browser_history_today", "browser_history_yesterday")
+    for m in calls:
+        s, e = paren_span(sheet, m.end() - 1)
+        args = split_args(sheet[s + 1:e - 1])
+        for idx, want in enumerate(wanted):
+            if idx >= len(args):
+                problems.append("B2: `groupedByDay` is called with fewer than two labels -- "
+                                "the day buckets would fall back to whatever the store defaults to")
+                break
+            arg = args[idx]
+            if not re.fullmatch(r"[A-Za-z_]\w*", arg):
+                problems.append(
+                    "B2: `groupedByDay` label #%d is the expression `%s`, not a "
+                    "stringResource-bound local -- a literal (also a split one like "
+                    "`\"To\" + \"day\"`) renders English in all 7 locales" % (idx + 1, arg[:60]))
+            elif arg not in bindings:
+                problems.append(
+                    "B2: `groupedByDay` label #%d is `%s`, which is not bound to a "
+                    "browser_history_* string resource" % (idx + 1, arg))
+            elif bindings[arg] != want:
+                problems.append(
+                    "B2: `groupedByDay` label #%d is `%s` = R.string.%s, expected R.string.%s "
+                    "(the buckets would be swapped)" % (idx + 1, arg, bindings[arg], want))
+    return problems
+
+
+
 def check_arms(clean: str):
     """A1/A2 — the save() snapshot contract (code view)."""
     problems = []
@@ -428,17 +611,18 @@ def check_arms(clean: str):
         return ["A0: could not locate `private fun save(...)` in " + STORE_REL
                 + " -- the function may have been renamed; re-point this guard"]
 
-    # arm A1: no iteration over the live `entries` outside the monitor
-    spans = sync_entries_spans(save_body)
-    for m in LIVE_ITER_RE.finditer(save_body):
-        if not any(s < m.start() < e for s, e in spans):
-            problems.append(
-                "A1: save() iterates the live `entries` list at offset "
-                + str(m.start())
-                + " outside synchronized(entries) -- record()/clear() mutate the "
-                  "same list under the monitor, so this is a CME/torn-persist "
-                  "(save() runs unlocked right after both record() and clear())")
-            break
+    # arm A1: no read of the live `entries` list outside the monitor. Graded
+    # on the identifier, not on the iterating call: `.iterator()`,
+    # `.subList(...)`, `entries[0]` and a plain `for (x in entries)` are the
+    # same unlocked read [wide-1024 A1].
+    leaks = live_entries_reads(save_body)
+    if leaks:
+        problems.append(
+            "A1: save() reads the live `entries` list at offset "
+            + str(leaks[0])
+            + " outside synchronized(entries) -- record()/clear() mutate the "
+              "same list under the monitor, so an unlocked read is a CME / torn "
+              "persist (save() runs unlocked right after both of them)")
 
     # arm A2: locked shallow-copy snapshot present
     if not SNAPSHOT_RE.search(save_body):
@@ -554,8 +738,12 @@ class BrowserHistoryStore {
     private val entries = mutableListOf<Entry>()
     // [dv15-B3 fixture] the observable mutation counter the sheet keys on
     val revision: StateFlow<Int> = MutableStateFlow(0)
+    private fun bumpRevision() {
+        revision.update { it + 1 }
+    }
     fun record(url: String, title: String) {
         synchronized(entries) { entries.add(Entry(url = url, title = title)) }
+        bumpRevision()
         save()
     }
     fun groupedByDay(todayLabel: String, yesterdayLabel: String): Map<String, List<Entry>> {
@@ -668,7 +856,7 @@ def _selftest_store_arms():
         ("A4 unlocked snapshot",
          STORE_COMPLIANT.replace(
              "val snapshot = synchronized(entries) { entries.toList() }",
-             "val snapshot = entries.toList()"), ["A2"]),
+             "val snapshot = entries.toList()"), ["A1", "A2"]),
         ("A5 compliant variant toMutableList",
          STORE_COMPLIANT.replace(
              "val snapshot = synchronized(entries) { entries.toList() }",
@@ -828,12 +1016,83 @@ def _selftest_locale_keys():
     return ok
 
 
+def _selftest_wide_1024():
+    """wide-1024 witnesses: the three shapes that used to slip through."""
+    ok = True
+
+    def report(name, problems, want_prefix):
+        nonlocal ok
+        tags = sorted({p.split(":")[0] for p in problems})
+        good = tags == [want_prefix]
+        if not good:
+            ok = False
+        print("  selftest %-52s red=%-14s expect=%-14s %s"
+              % (name, tags or "[]", [want_prefix], "ok" if good else "FAIL"))
+        for p in problems:
+            print("      - " + p)
+
+    # W-A1 (wide-1024, axis spelling): same unlocked read, different spelling.
+    store_w = STORE_COMPLIANT.replace("for (entry in snapshot) {",
+                                      "for (entry in entries.iterator()) {")
+    report("W-A1 loop over entries.iterator()",
+           check_arms(strip_comments_and_strings(store_w)), "A1")
+
+    # W-B1p (wide-1024, axis dataflow): the producer maps the old value onto
+    # itself, so the observable never emits and every keyed panel freezes.
+    store_b = STORE_COMPLIANT.replace("revision.update { it + 1 }",
+                                      "revision.update { it }")
+    report("W-B1p producer writes the value it read",
+           check_revision_producer(strip_comments_and_strings(store_b)), "B1p")
+
+    # fail-closed: an observable declared with no producer at all.
+    store_np = STORE_COMPLIANT.replace(
+        "    private fun bumpRevision() {\n        revision.update { it + 1 }\n    }\n", "")
+    report("W-B1p observable without a producer",
+           check_revision_producer(strip_comments_and_strings(store_np)), "B1p")
+
+    # W-B2 (wide-1024, axis spelling): the literal is split so the "Today"
+    # literal arm cannot see it, and the caller drops the localised labels.
+    sheet_w = SHEET_COMPLIANT.replace(
+        "historyStore.groupedByDay(todayLabel, yesterdayLabel)",
+        'historyStore.groupedByDay("To" + "day", "Yester" + "day")')
+    report("W-B2 split literal labels",
+           check_bucket_label_args(strip_comments_and_strings(sheet_w)), "B2")
+
+    # accepted spelling: a differently-named local bound to the resource.
+    sheet_alt = SHEET_COMPLIANT.replace(
+        "historyStore.groupedByDay(todayLabel, yesterdayLabel)",
+        "historyStore.groupedByDay(selfToday, selfYesterday)").replace(
+        'val todayLabel = stringResource(R.string.browser_history_today)',
+        'val selfToday = stringResource(R.string.browser_history_today)').replace(
+        'val yesterdayLabel = stringResource(R.string.browser_history_yesterday)',
+        'val selfYesterday = stringResource(R.string.browser_history_yesterday)')
+    alt = check_bucket_label_args(strip_comments_and_strings(sheet_alt))
+    if alt:
+        ok = False
+        print("  selftest W-B2 (localised labels under other names) must stay GREEN: %s" % alt)
+    else:
+        print("  selftest %-52s red=%-14s expect=%-14s ok" % ("W-B2 (labels under other names)", "[]", "[]"))
+
+    # swapped labels are still a defect: the buckets would be mislabelled.
+    sheet_swap = SHEET_COMPLIANT.replace(
+        "historyStore.groupedByDay(todayLabel, yesterdayLabel)",
+        "historyStore.groupedByDay(yesterdayLabel, todayLabel)")
+    report("W-B2 swapped bucket labels",
+           check_bucket_label_args(strip_comments_and_strings(sheet_swap)), "B2")
+
+    # fail-closed: the day-bucket call disappeared from the sheet.
+    report("W-B2 day-bucket call gone",
+           check_bucket_label_args(strip_comments_and_strings("fun other() {}")), "B2")
+    return ok
+
+
 def run_selftest() -> bool:
     ok = True
     ok = _selftest_store_arms() and ok
     ok = _selftest_sheet_arms() and ok
     ok = _selftest_literals() and ok
     ok = _selftest_locale_keys() and ok
+    ok = _selftest_wide_1024() and ok
     return ok
 
 
@@ -862,7 +1121,9 @@ def main() -> int:
     sheet_code = strip_comments_and_strings(sheet_raw)
 
     problems += check_arms(store_code)
+    problems += check_revision_producer(store_code)
     problems += check_sheet_arms(sheet_code, function_bodies(store_code + sheet_code), store_code)
+    problems += check_bucket_label_args(sheet_code)
     problems += check_bucket_literals(strip_comments_only(sheet_raw), strip_comments_only(store_raw))
     problems += check_locale_keys(ROOT)
 
