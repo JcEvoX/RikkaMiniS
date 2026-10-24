@@ -35,16 +35,34 @@ the convergence*, not the presence of a comment:
 
 [deep-audit-1045 B-03] Two more shapes, in the Storage page:
 
-  F. OFF-MAIN PUBLISH — no `var … by remember` Compose state may be assigned
-     inside a `withContext(Dispatchers.IO)` / `(Dispatchers.Default)` block.
-     Call arguments are not assignments. The state set is derived from the
-     file's own declarations, so renames do not evade the gate.
+  F. OFF-MAIN PUBLISH — no Compose state may be assigned inside a
+     `withContext(Dispatchers.IO)` / `(Dispatchers.Default)` block. Call
+     arguments are not assignments, and an assignment whose VALUE IS the
+     `withContext` call (`x = withContext(Dispatcher.IO) { … }`) is fine — that
+     write happens on the caller's thread once the block returns.
+     [deep-audit-1048 B-01] The FILE SET is now derived (any production file
+     that declares `remember` state AND contains an off-main block) instead of
+     being the Storage screen alone, and two more state forms are covered —
+     `val x = remember { mutableStateOf(…) }` (written as `x.value = …`) next to
+     the delegated `var x by remember`. The names are still derived from each
+     file's own declarations, so renames do not evade the gate. Deleting one of
+     the files that anchors the scope is a failure, not a silent narrowing.
   G. SINGLE INVALIDATION — the process-lifetime scan cache must have exactly one
      non-private clearing entry, and every ViewModel entry that drives a
      mutating `RootfsManager` operation (mutating = touches disk / publishes
      install state, transitively through member calls) must call it BEFORE the
      mutation. Otherwise a rootfs install / repair / reset leaves the cached
      `shellSize` in place for the life of the process.
+
+  C-INV. [deep-audit-1048 B-05] the same cache also outlives *deletions*. Two
+     entries change what the page measures without touching the rootfs —
+     `FileBrowserViewModel`'s delete (a file, or a whole session directory) and
+     the drawer's session delete (which reclaims `minis-sessions/<id>`, sized by
+     the page) — and neither invalidated it. The criterion derives both entries
+     from their behaviour (a file deletion that re-lists; a session delete) and,
+     where the entry has a `deleted` verdict, requires the invalidation to sit
+     on the SUCCESS side of it: dropping the cache in the failure branch costs a
+     pointless rescan and would let a refactor move it out of the success path.
 
 A probe that cannot find its subject FAILS (exit 1) instead of reporting success:
 a missing class means the convergence point was deleted, not that the tree is
@@ -67,11 +85,17 @@ SELFTEST_MARKER = "SYSINFO-STATE SELFTEST=PASS"
 
 # Words that mark a line as a comment rather than code (KDoc/line/block).
 def blank_comments(text):
-    """Replace comment and string-literal *contents* with spaces, keeping every
-    newline and every code character in place (line numbers stay valid)."""
+    """Replace comment, string- and char-literal *contents* with spaces, keeping
+    every newline and every code character in place (line numbers stay valid).
+
+    Char literals matter for brace counting: a `'{'` in a `when` arm was counted
+    as an opening brace, so the enclosing `withContext(…) { … }` block never
+    closed and every statement after it — including the `fold` that publishes to
+    Compose state — was reported as living on the IO thread.
+    """
     out = []
     i, n = 0, len(text)
-    in_line, in_block, in_str = False, False, False
+    in_line, in_block, in_str, in_chr = False, False, False, False
     while i < n:
         ch = text[i]
         nxt = text[i + 1] if i + 1 < n else ""
@@ -97,6 +121,15 @@ def blank_comments(text):
                 out.append(ch)
             else:
                 out.append("\n" if ch == "\n" else " ")
+        elif in_chr:
+            if ch == "\\":
+                out.append("  ")
+                i += 1
+            elif ch == "'":
+                in_chr = False
+                out.append(ch)
+            else:
+                out.append("\n" if ch == "\n" else " ")
         else:
             if ch == "/" and nxt == "/":
                 in_line = True
@@ -108,6 +141,9 @@ def blank_comments(text):
                 i += 1
             elif ch == '"':
                 in_str = True
+                out.append(ch)
+            elif ch == "'":
+                in_chr = True
                 out.append(ch)
             else:
                 out.append(ch)
@@ -376,6 +412,7 @@ def run(repo_root):
     problems += rule_convergence(repo_root, class_file)
     problems += rule_storage_state_off_io(repo_root)
     problems += rule_storage_cache_invalidation(repo_root)
+    problems += rule_delete_invalidation(repo_root)
 
     if problems:
         print("")
@@ -390,7 +427,7 @@ def run(repo_root):
         return 1
     print("== sysinfo coalesce window has a single guarded home ==")
     print("== storage page: background dispatchers publish nothing; rootfs "
-          "operations invalidate the cached scan ==")
+          "operations and file/session deletions invalidate the cached scan ==")
     return 0
 
 
@@ -429,7 +466,29 @@ ROOTFS_MANAGER = PKG + "/sandbox/RootfsManager.kt"
 
 OFF_MAIN_CALL = re.compile(r"withContext\(\s*Dispatchers\.(?:IO|Default)\s*\)\s*\{")
 REMEMBER_VAR = re.compile(r"^\s*var\s+(\w+)\s*(?::\s*[^=\n]+)?\s+by\s+remember\b", re.M)
+# `val x = remember { mutableStateOf(…) }` — the holder form, written `x.value =`.
+REMEMBER_HOLDER = re.compile(
+    r"^\s*val\s+(\w+)\s*(?::\s*[^=\n]+)?\s*=\s*remember\s*\{[^}]*mutableStateOf\b", re.M)
+# `x = value` where the value came out of the IO block, but NOT `x = withContext(…)`.
+STATE_ASSIGN = re.compile(r"^(\w+)(\.value)?\s*(?:\+=|-=|=)(?!=)\s*(.*)$")
 CACHE_CLEAR = "StorageSnapshotCache.snapshot = null"
+
+FILE_BROWSER_VM = PKG + "/ui/sandbox/FileBrowserViewModel.kt"
+HISTORY_DRAWER = PKG + "/ui/chat/ChatHistoryDrawer.kt"
+INVAL_CALL = "invalidateStorageSnapshot("
+DELETE_SIGNS = (r"\.deleteRecursively\(\)", r"\.delete\(\)")
+
+# Files that pair `remember` state with an off-main block TODAY. The criterion's
+# scope is derived (so a new screen is covered the day it lands); this anchor
+# only detects LOSS — renaming or deleting one of them must fail loudly instead
+# of quietly shrinking the surface the gate still watches.
+EXPECTED_OFF_MAIN_SCOPE = (
+    PKG + "/ui/sandbox/FilePreviewScreen.kt",
+    PKG + "/ui/settings/LogManagementScreen.kt",
+    PKG + "/ui/settings/SoulSettingsScreen.kt",
+    PKG + "/ui/settings/StorageManagementScreen.kt",
+    PKG + "/webapp/AddToHomeSheet.kt",
+)
 
 # Signals that a RootfsManager member mutates the rootfs or its published state.
 MUTATE_SIGNS = (
@@ -534,21 +593,52 @@ def off_main_blocks(code):
     return out
 
 
+def off_main_state_files(repo_root):
+    """Every production file that declares `remember` state AND runs an
+    off-main block — the derived scope of criterion F."""
+    out = []
+    for path in iter_prod_kt(repo_root):
+        text = read(path)
+        if text is None:
+            continue
+        code = blank_comments(text)
+        if not (REMEMBER_VAR.search(code) or REMEMBER_HOLDER.search(code)):
+            continue
+        if not OFF_MAIN_CALL.search(code):
+            continue
+        out.append(os.path.relpath(path, repo_root))
+    return sorted(out)
+
 def rule_storage_state_off_io(repo_root):
     """F: no Compose state is assigned from a background dispatcher."""
-    text = read(os.path.join(repo_root, STORAGE_SCREEN))
-    if text is None:
-        return ["%s [F storage-off-main] file missing — the subject of this "
-                "criterion was moved or deleted" % STORAGE_SCREEN]
-    code = blank_comments(text)
-    names = sorted(set(REMEMBER_VAR.findall(code)))
-    if not names:
-        return ["%s [F storage-off-main] no `var ... by remember` state found — "
-                "the subject of this criterion was deleted" % STORAGE_SCREEN]
+    files = off_main_state_files(repo_root)
+    if not files:
+        return ["[F off-main-state] no production file pairs `remember` state with a "
+                "withContext(Dispatchers.IO|Default) block — the subject of this "
+                "criterion was moved or deleted"]
+    problems = []
+    for rel in EXPECTED_OFF_MAIN_SCOPE:
+        if rel not in files:
+            problems.append("[F off-main-state] %s no longer pairs Compose state with an "
+                            "off-main block — if that is a rename/removal, update "
+                            "EXPECTED_OFF_MAIN_SCOPE; if it is a refactor, the states moved "
+                            "somewhere this criterion no longer sees" % rel)
+    for rel in files:
+        text = read(os.path.join(repo_root, rel))
+        if text is None:
+            continue
+        problems += off_main_writes(rel, blank_comments(text))
+    return problems
+
+def off_main_writes(rel, code):
+    """State assignments whose VALUE comes from inside an off-main block."""
+    delegated = set(REMEMBER_VAR.findall(code))
+    holders = set(REMEMBER_HOLDER.findall(code))
+    if not delegated and not holders:
+        return []
     blocks = off_main_blocks(code)
     if not blocks:
-        return ["%s [F storage-off-main] no withContext(Dispatchers.IO|Default) "
-                "block found — the scans moved, not the writes" % STORAGE_SCREEN]
+        return []
     lines = code.split("\n")
     brackets = innermost_brackets(code)
     problems = []
@@ -562,15 +652,106 @@ def rule_storage_state_off_io(repo_root):
                 continue
             if brackets[ln - 1] == "(":
                 continue  # in a call's argument list: `name = value` is an argument
-            for name in names:
-                if name in shadowed:
+            m = STATE_ASSIGN.match(stripped)
+            if not m:
+                continue
+            name, on_value, rhs = m.group(1), bool(m.group(2)), m.group(3)
+            if on_value:
+                if name not in holders:
                     continue
-                if re.match(r"%s\s*(?:\+=|-=|=)(?!=)" % re.escape(name), stripped):
-                    problems.append("[F storage-off-main] %s:%d assigns Compose state "
-                                    "`%s` on a background dispatcher: %s"
-                                    % (STORAGE_SCREEN, ln, name, stripped))
+            elif name not in delegated:
+                continue
+            if name in shadowed:
+                continue
+            if rhs.startswith("withContext("):
+                continue  # the write itself happens on the caller's thread
+            problems.append("[F off-main-state] %s:%d assigns Compose state `%s` on a "
+                            "background dispatcher: %s" % (rel, ln, name, stripped))
     return problems
 
+def member_bodies(code):
+    """{name: (first_line, body)} for every `fun name(` in [code]."""
+    out = {}
+    for m in re.finditer(r"^\s*(?:(?:private|internal|public|override|open|inline|suspend)\s+)*"
+                         r"fun\s+(\w+)\s*\(", code, re.M):
+        span = fun_body_span(code, m.end())
+        if not span:
+            continue
+        out[m.group(1)] = (span, "\n".join(code.split("\n")[span[0] - 1: span[1]]))
+    return out
+
+def _block_end(code, open_idx):
+    """Character index just past the `{`-block at [open_idx]."""
+    depth = 0
+    for j in range(open_idx, len(code)):
+        if code[j] == "{":
+            depth += 1
+        elif code[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return j
+    return None
+
+def rule_delete_invalidation(repo_root):
+    """C-INV: an entry that removes files must drop the cached storage scan."""
+    problems, checked = [], 0
+
+    text = read(os.path.join(repo_root, FILE_BROWSER_VM))
+    if text is None:
+        problems.append("[C-INV] %s missing — the subject of this criterion was "
+                        "moved or deleted" % FILE_BROWSER_VM)
+    else:
+        code = blank_comments(text)
+        for name, (span, body) in member_bodies(code).items():
+            if not any(re.search(s, body) for s in DELETE_SIGNS):
+                continue
+            if "loadItems(" not in body:
+                continue  # only the entries that re-list what they just removed
+            checked += 1
+            inval = body.find(INVAL_CALL)
+            if inval < 0:
+                problems.append("[C-INV] %s:%d (%s) deletes a file/dir and then re-lists, "
+                                "but never invalidates the cached storage scan"
+                                % (FILE_BROWSER_VM, span[0], name))
+                continue
+            guard = re.search(r"if\s*\(\s*!\s*deleted\s*\)\s*\{", body)
+            if guard:
+                end = _block_end(body, guard.end() - 1)
+                if end is not None and inval < end:
+                    problems.append("[C-INV] %s:%d (%s) invalidates the cached scan on the "
+                                    "FAILED-delete path — the tree is untouched there, so the "
+                                    "drop buys a rescan and leaves the success path unpinned"
+                                    % (FILE_BROWSER_VM, span[0], name))
+            catch = re.search(r"catch\s*\([^)]*\)\s*\{", body)
+            if catch:
+                end = _block_end(body, catch.end() - 1)
+                if end is not None and catch.start() < inval < end:
+                    problems.append("[C-INV] %s:%d (%s) invalidates from the catch arm — the "
+                                    "drop happens while the delete is still in doubt"
+                                    % (FILE_BROWSER_VM, span[0], name))
+    if checked == 0:
+        problems.append("[C-INV] no FileBrowserViewModel member both deletes and re-lists — "
+                        "the delete entry moved, so this criterion saw nothing to check")
+
+    text = read(os.path.join(repo_root, HISTORY_DRAWER))
+    if text is None:
+        problems.append("[C-INV] %s missing — the subject of this criterion was "
+                        "moved or deleted" % HISTORY_DRAWER)
+    else:
+        code = blank_comments(text)
+        found = 0
+        for name, (span, body) in member_bodies(code).items():
+            if not re.search(r"\bdeleteSession\s*\(", body):
+                continue
+            found += 1
+            if INVAL_CALL not in body:
+                problems.append("[C-INV] %s:%d (%s) deletes a session (and its on-disk tree, "
+                                "which the Storage page sizes) without invalidating the cached "
+                                "scan" % (HISTORY_DRAWER, span[0], name))
+        if found == 0:
+            problems.append("[C-INV] no %s entry calls deleteSession — the delete path moved, "
+                            "so this criterion saw nothing to check" % HISTORY_DRAWER)
+    return problems
 
 def invalidation_entry(text):
     """(name, span) of the file-level non-private cache-clearing entry."""
@@ -834,6 +1015,111 @@ class RootfsManager {
 """
 
 
+GOOD_PREVIEW = """package com.rikkaminis.app.ui.sandbox
+
+@Composable
+private fun TextPreview(item: FileItem) {
+    var content by remember(item.file) { mutableStateOf<String?>(null) }
+    var truncated by remember(item.file) { mutableStateOf(false) }
+
+    LaunchedEffect(item.file) {
+        val capped = withContext(Dispatchers.IO) { readCapped(item.file) }
+        content = decodeUtf8Capped(capped)
+        truncated = capped.size > MAX_BYTES
+    }
+}
+"""
+
+GOOD_LOG_SCREEN = """package com.rikkaminis.app.ui.settings
+
+@Composable
+private fun LogDetailScreen(file: File) {
+    var text by remember(file) { mutableStateOf<String?>(null) }
+    var loadError by remember(file) { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(file) {
+        val loaded = withContext(Dispatchers.IO) {
+            runCatching { readLogText(file) }.getOrNull()
+        }
+        text = loaded
+        if (loaded == null) loadError = "cannot read"
+    }
+}
+"""
+
+GOOD_SHEET_FILE = """package com.rikkaminis.app.webapp
+
+@Composable
+fun AddToHomeSheet(source: WebAppSource, onDismiss: () -> Unit) {
+    var copiedFile by remember { mutableStateOf<File?>(null) }
+    var parsedTitle by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(source) {
+        val staged = withContext(Dispatchers.IO) {
+            stage(source)
+        }
+        copiedFile = staged
+        parsedTitle = parseHtmlTitle(staged)
+    }
+}
+"""
+
+GOOD_SOUL = """package com.rikkaminis.app.ui.settings
+
+@Composable
+fun SoulSettingsScreen() {
+    var name by remember { mutableStateOf("") }
+    val parsed = remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(Unit) {
+        val loaded = withContext(Dispatchers.IO) {
+            SoulStore.load(context)
+        }
+        name = loaded.name
+        parsed.value = loaded.body
+    }
+}
+"""
+
+GOOD_FILE_BROWSER = """package com.rikkaminis.app.ui.sandbox
+
+import com.rikkaminis.app.ui.settings.invalidateStorageSnapshot
+
+class FileBrowserViewModel {
+    fun deleteItem(item: FileItem) {
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val deleted = if (item.isDirectory) item.file.deleteRecursively() else item.file.delete()
+                if (!deleted) {
+                    _uiState.value = _uiState.value.copy(errorMessage = "Delete failed")
+                    return@launch
+                }
+                invalidateStorageSnapshot()
+                loadItems()
+            } catch (e: Exception) {
+                _uiState.value = _uiState.value.copy(errorMessage = e.message)
+            }
+        }
+    }
+}
+"""
+
+GOOD_DRAWER = """package com.rikkaminis.app.ui.chat
+
+private fun deleteSessionAndCleanup(chatRepository: ChatRepository, id: String) {
+    drawerIoScope.launch {
+        try {
+            chatRepository.deleteSession(id)
+        } catch (t: Throwable) {
+            android.util.Log.w(TAG, "deleteSession failed", t)
+        } finally {
+            ChatViewModelStore.release(id)
+        }
+        com.rikkaminis.app.ui.settings.invalidateStorageSnapshot()
+    }
+}
+"""
+
 def make_tree(files):
     root = tempfile.mkdtemp(prefix="sysinfo-state-selftest-")
     for rel, content in files.items():
@@ -851,6 +1137,12 @@ def selftest():
         STORAGE_SCREEN: GOOD_STORAGE,
         ROOTFS_VM: GOOD_VM_ROOTFS,
         ROOTFS_MANAGER: GOOD_MANAGER,
+        PKG + "/ui/settings/SoulSettingsScreen.kt": GOOD_SOUL,
+        PKG + "/ui/sandbox/FilePreviewScreen.kt": GOOD_PREVIEW,
+        PKG + "/ui/settings/LogManagementScreen.kt": GOOD_LOG_SCREEN,
+        PKG + "/webapp/AddToHomeSheet.kt": GOOD_SHEET_FILE,
+        FILE_BROWSER_VM: GOOD_FILE_BROWSER,
+        HISTORY_DRAWER: GOOD_DRAWER,
     }
     root = make_tree(good)
     arms.append(("compliant fixture is green", run(root) == 0))
@@ -974,6 +1266,68 @@ def selftest():
     bad.pop(STORAGE_SCREEN, None)
     root = make_tree(bad)
     arms.append(("deleting the storage screen fails loudly", run(root) == 1))
+    _rm(root)
+
+    # ── [deep-audit-1048 B-01] derived scope + holder form ─────────────────
+
+    bad = dict(good)
+    bad[PKG + "/ui/settings/SoulSettingsScreen.kt"] = GOOD_SOUL.replace(
+        "        name = loaded.name\n", "").replace(
+        "        parsed.value = loaded.body\n", "")
+    root = make_tree(bad)
+    arms.append(("a compliant off-main screen is green", run(root) == 0))
+    _rm(root)
+
+    bad = dict(good)
+    bad[PKG + "/ui/settings/SoulSettingsScreen.kt"] = GOOD_SOUL.replace(
+        "            SoulStore.load(context)\n",
+        "            val early = SoulStore.load(context)\n"
+        "            name = early.name\n")
+    root = make_tree(bad)
+    arms.append(("a delegated state written from IO is red", run(root) == 1))
+    _rm(root)
+
+    bad = dict(good)
+    bad[PKG + "/ui/settings/SoulSettingsScreen.kt"] = GOOD_SOUL.replace(
+        "            SoulStore.load(context)\n",
+        "            val early = SoulStore.load(context)\n"
+        "            parsed.value = early.body\n")
+    root = make_tree(bad)
+    arms.append(("a remember-holder written from IO is red", run(root) == 1))
+    _rm(root)
+
+    bad = dict(good)
+    bad.pop(PKG + "/ui/settings/SoulSettingsScreen.kt", None)
+    root = make_tree(bad)
+    arms.append(("deleting a file that anchors the derived scope is red", run(root) == 1))
+    _rm(root)
+
+    # ── [deep-audit-1048 B-05] deletions invalidate the cached scan ────────
+
+    bad = dict(good)
+    bad[FILE_BROWSER_VM] = GOOD_FILE_BROWSER.replace(
+        "                invalidateStorageSnapshot()\n", "")
+    root = make_tree(bad)
+    arms.append(("a delete that re-lists without invalidating is red", run(root) == 1))
+    _rm(root)
+
+    bad = dict(good)
+    bad[FILE_BROWSER_VM] = GOOD_FILE_BROWSER.replace(
+        "                    return@launch\n"
+        "                }\n"
+        "                invalidateStorageSnapshot()\n",
+        "                    invalidateStorageSnapshot()\n"
+        "                    return@launch\n"
+        "                }\n")
+    root = make_tree(bad)
+    arms.append(("invalidating on the failed-delete path is red", run(root) == 1))
+    _rm(root)
+
+    bad = dict(good)
+    bad[HISTORY_DRAWER] = GOOD_DRAWER.replace(
+        "        com.rikkaminis.app.ui.settings.invalidateStorageSnapshot()\n", "")
+    root = make_tree(bad)
+    arms.append(("a session delete without invalidating is red", run(root) == 1))
     _rm(root)
 
     print("")

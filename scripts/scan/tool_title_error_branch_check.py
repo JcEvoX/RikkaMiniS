@@ -22,6 +22,13 @@ Code anchors only — comments are stripped before judgment. Anchor matching
 is "contains" (not startswith) so `?: return ToolExecutionResult("Error: …")`
 early-return lines are checked too.
 
+[deep-audit-1048 B-03] the artifact-persistence contract of the browser_use
+executor. `artifactWriter` returns the HOST path it staged the bytes at, or
+null when the write failed. Two call sites (screenshot + fetch) must consume
+that verdict: a call whose result is not assigned, or whose `minis_url` line
+is appended outside the `!= null` guard, ships a URL for a file that does not
+exist — the agent then fails at the NEXT read, pointing at the wrong layer.
+
 Usage: python3 tool_title_error_branch_check.py <repo_root>
        python3 tool_title_error_branch_check.py --root <repo_root>
        python3 tool_title_error_branch_check.py --selftest
@@ -413,6 +420,66 @@ def check_write_guards(root: str) -> list:
     return errs
 
 
+ARTIFACT_CALL_RE = re.compile(r"\bartifactWriter\s*\(")
+ARTIFACT_ASSIGN_RE = re.compile(r"^\s*val\s+(\w+)\s*=\s*artifactWriter\s*\(")
+
+def _brace_end(text, open_idx):
+    depth = 0
+    for j in range(open_idx, len(text)):
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return j
+    return None
+
+def check_artifact_writer_src(src: str) -> list:
+    """[deep-audit-1048 B-03] every artifactWriter verdict must be consumed.
+
+    Decision points, not spellings: the call must be assigned to a local, that
+    local must be tested against null, and the `minis_url` append for the same
+    artifact must live INSIDE that guard (so a failed write cannot advertise a
+    URL). Fail-closed when the executor has no such call at all — the subject
+    moved."""
+    code = strip_kotlin_comments(src)
+    problems = []
+    sites = 0
+    for m in ARTIFACT_CALL_RE.finditer(code):
+        sites += 1
+        line_start = code.rfind("\n", 0, m.start()) + 1
+        line_end = code.find("\n", m.end())
+        line = code[line_start: line_end if line_end >= 0 else len(code)]
+        assign = ARTIFACT_ASSIGN_RE.match(line)
+        if not assign:
+            problems.append("artifactWriter() result discarded — a failed write still "
+                            "reports success to the agent: %s" % line.strip())
+            continue
+        name = assign.group(1)
+        rest = code[m.end():]
+        guard = re.search(r"if\s*\(\s*%s\s*!=\s*null\s*\)\s*\{" % re.escape(name), rest)
+        if not guard:
+            problems.append("artifactWriter() verdict `%s` is never tested against null, so "
+                            "the minis_url line is emitted unconditionally" % name)
+            continue
+        end = _brace_end(rest, guard.end() - 1)
+        block = rest[guard.start(): end if end is not None else len(rest)]
+        if "minis_url" not in block and "linuxPathToMinisURL" not in block:
+            problems.append("artifactWriter() `%s`: the minis_url append sits OUTSIDE the "
+                            "`%s != null` guard" % (name, name))
+    if sites == 0:
+        problems.append("ChatToolExecutors.kt: no artifactWriter( call found — the artifact "
+                        "persistence moved, so this criterion saw nothing to check")
+    return problems
+
+def check_artifact_writer(root: str) -> list:
+    path = os.path.join(root, UI_CHAT_DIR, "ChatToolExecutors.kt")
+    try:
+        src = open(path).read()
+    except OSError as e:
+        return ["ChatToolExecutors.kt: cannot read (%s)" % e]
+    return ["ChatToolExecutors.kt: " + p for p in check_artifact_writer_src(src)]
+
 def check(root: str) -> list:
     errs = []
     for fname, (fdir, _, _) in SPEC.items():
@@ -426,6 +493,8 @@ def check(root: str) -> list:
             errs.append(f"{fname}: {e}")
     # [deep-audit-1047 / A-08] write-shaped tool guards (encoding + byte unit)
     errs.extend(check_write_guards(root))
+    # [deep-audit-1048 / B-03] artifact persistence verdict must be consumed
+    errs.extend(check_artifact_writer(root))
     # MemoryTools: both functions must resolve the title
     path = os.path.join(root, TOOL_DIR, "MemoryTools.kt")
     try:
@@ -790,6 +859,75 @@ internal const val UNENCODABLE_CONTENT_MESSAGE = "Error: unpaired surrogates"
         ("compliant file_write (helper)", "FileWriteTool.kt", good_filewrite, 0),
         ("V11 file_write inline copy (non-single-source)", "FileWriteTool.kt", bad_filewrite_inline, 2),
     ]
+    # ── [deep-audit-1048 B-03] artifactWriter verdict ─────────────────────
+    GOOD_ARTIFACT = "\n".join([
+        '        if (base64 != null) {',
+        '            val filename = "screenshot_1.jpg"',
+        '            val persistPath = artifactWriter(filename, raw)',
+        '            if (persistPath != null) {',
+        '                linuxPathToMinisURL("/var/minis/browser/$filename")?.let {',
+        '                    output = "$output\\nminis_url: $it"',
+        '                }',
+        '            }',
+        '        }',
+        '        if (fetchData != null && fetchName != null) {',
+        '            val fetchPersistPath = artifactWriter(fetchName, fetchData)',
+        '            if (fetchPersistPath != null) {',
+        '                linuxPathToMinisURL("/var/minis/browser/$fetchName")?.let {',
+        '                    output = "$output\\nminis_url: $it"',
+        '                }',
+        '            } else {',
+        '                output = "$output\\n(fetched file not persisted: $fetchName)"',
+        '            }',
+        '        }',
+        '    ',
+    ])
+    # B-03-V1: the pre-fix fetch arm — result discarded, URL still appended.
+    ARTIFACT_DISCARDED = GOOD_ARTIFACT.replace(
+        '            val fetchPersistPath = artifactWriter(fetchName, fetchData)\n'
+        '            if (fetchPersistPath != null) {\n'
+        '                linuxPathToMinisURL("/var/minis/browser/$fetchName")?.let {\n'
+        '                    output = "$output\\nminis_url: $it"\n'
+        '                }\n'
+        '            } else {\n'
+        '                output = "$output\\n(fetched file not persisted: $fetchName)"\n'
+        '            }\n',
+        '            artifactWriter(fetchName, fetchData)\n'
+        '            linuxPathToMinisURL("/var/minis/browser/$fetchName")?.let {\n'
+        '                output = "$output\\nminis_url: $it"\n'
+        '            }\n')
+    # B-03-V2: assigned + guarded, but the URL line escaped the guard.
+    ARTIFACT_URL_OUTSIDE = GOOD_ARTIFACT.replace(
+        '            if (fetchPersistPath != null) {\n'
+        '                linuxPathToMinisURL("/var/minis/browser/$fetchName")?.let {\n'
+        '                    output = "$output\\nminis_url: $it"\n'
+        '                }\n'
+        '            } else {\n',
+        '            if (fetchPersistPath != null) {\n'
+        '                output = "$output\\n(persisted)"\n'
+        '            }\n'
+        '            linuxPathToMinisURL("/var/minis/browser/$fetchName")?.let {\n'
+        '                output = "$output\\nminis_url: $it"\n'
+        '            }\n'
+        '            if (false) {\n')
+    # B-03-V3: the verdict is never tested at all.
+    ARTIFACT_UNTESTED = GOOD_ARTIFACT.replace(
+        '            if (fetchPersistPath != null) {\n',
+        '            if (true) {\n')
+
+    for arm_name, sample, want in (
+        ("b03-compliant", GOOD_ARTIFACT, 0),
+        ("b03-discarded verdict", ARTIFACT_DISCARDED, 1),
+        ("b03-url outside the guard", ARTIFACT_URL_OUTSIDE, 1),
+        ("b03-verdict never tested", ARTIFACT_UNTESTED, 1),
+    ):
+        got = check_artifact_writer_src(sample)
+        if len(got) == want:
+            print(f"  OK {arm_name}: {got if got else 'green'}")
+        else:
+            print(f"  FAIL {arm_name}: want {want} problem(s), got {len(got)}: {got}")
+            failures += 1
+
     failures = write_arms()
 
     for name, fname, sample, expect in arms:
