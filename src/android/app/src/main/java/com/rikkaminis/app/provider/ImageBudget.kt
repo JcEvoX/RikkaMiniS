@@ -107,6 +107,12 @@ object ImageBudget {
                 )
             } else decoded
             val baos = ByteArrayOutputStream()
+            // record-ok: deep-audit-1048 A-02 — OUT OF SCOPE BY TICKET ORDER
+            // ("ImageBudget.kt 属另一族，不在本条半径内不许动"). Verified on the
+            // shipped tree: the verdict is NOT read, so a failed encode makes
+            // compressBytes return an EMPTY ByteArray while its KDoc above
+            // promises "the original bytes on decode/encode failure". Deferred as
+            // §1048-A2 R2 (trigger: the next change to the compression chain).
             out.compress(Bitmap.CompressFormat.JPEG, q.coerceIn(1, 100), baos)
             if (out !== decoded) out.recycle()
             decoded.recycle()

@@ -1772,6 +1772,361 @@ def binary_write_self_test():
           "breaker, and the in-memory destination class stays green")
     return 0
 
+# ─────────────────────────────────────────────────────────────────────────
+# B-02 — the encode verdict family (deep-audit-1048 A-02 / B-02)
+#
+# `Bitmap.compress(...)` answers FALSE when the encoder could not write the
+# pixels, and it does NOT throw. 1047-B01 pinned the subset whose destination
+# leaves the app (see `_BIN_OUTBOUND`: FileProvider / MediaStore / SAF
+# openOutputStream). The rest of the family stayed invisible, because B1 asks
+# "is the destination outbound?" and these destinations are a temp file, a
+# `ByteArrayOutputStream`, or a helper that writes a file and returns its PATH:
+#
+#   * offload tool output (`photos export`, `ui screenshot`) answering success
+#     with `size_bytes: 0` / an empty base64 image;
+#   * `read_image` handing the model a 0-byte "image/jpeg";
+#   * `resizeJpeg` / `resizeImageBytes` returning an EMPTY ByteArray instead of
+#     the `null` their own KDoc promises;
+#   * browser screenshots publishing a path to a 0-byte file.
+#
+# The criteria are derived from the call's POSITION and the helper's SIGNATURE,
+# not from a site list:
+#
+#   C-B2  every `.compress(` call must have its verdict consumed — the call has
+#         to sit in expression position (assigned / returned / gated by `if`,
+#         `!`, `&&`, `?:` / passed as an argument), or be the tail of a
+#         value-returning lambda (`let`/`run`/`with`/`map…`/`sumOf`/`use`) whose
+#         OWN value is consumed. `also`/`apply`/`forEach` deliberately do not
+#         count: they hand back the receiver, so a value dropped inside them is
+#         still dropped.
+#   C-B3  a non-Unit helper that compresses must be able to REPORT a failed
+#         encode to its caller: nullable return with a null exit, a `throw`, or
+#         one of the repo's failure results (`saveOutcome(`, `return err(`,
+#         `error(`, `success = false`). Derived from the signature + the body.
+#
+# Escape hatch: `record-ok: <reason>` on the call line (or the line above),
+# same convention as the watchlist section. A deferred defect is a REASON too —
+# write down what it is and which backlog entry owns it.
+# ─────────────────────────────────────────────────────────────────────────
+
+_ENC_COMPRESS = re.compile(r"\.compress\s*\(")
+# Receiver chain immediately before the call (`bmp`, `this.bitmap`, `a.b?.c`).
+_ENC_RECEIVER = re.compile(
+    r"(?:[A-Za-z_][A-Za-z0-9_]*\s*(?:\?\.|\.)\s*)*[A-Za-z_][A-Za-z0-9_]*\s*$"
+)
+# `let|run|with|map…|sumOf|use {` — value-returning scopes (`use` returns the
+# lambda's value, so a verdict assigned through it IS consumed).
+_ENC_LAMBDA_OPEN = re.compile(
+    r"\b(?:let|run|with|map|mapNotNull|flatMap|fold|sumOf|use)\s*\{"
+)
+# Failure channels a helper may use to tell its caller "the encode failed".
+_ENC_FAILURE_PATTERNS = (
+    re.compile(r"\bthrow\s"),
+    re.compile(r"\breturn\s+null\b"),
+    re.compile(r"\b(?:else|\?:)\s*null\b"),
+    re.compile(r"(?<![.\w])saveOutcome\s*\("),
+    re.compile(r"\breturn\s+err\s*\("),
+    # Kotlin's own `error(…)` is a throw; `AppLogger.error(` is not (the `(?<![.\w])`
+    # keeps a logging call from satisfying the criterion).
+    re.compile(r"(?<![.\w])error\s*\("),
+    re.compile(r"\bsuccess\s*=\s*false\b"),
+)
+_ENC_SCAN_LINES = 40  # a multi-line argument list longer than this is skipped
+
+
+def _enc_call_span(code_lines, i, col):
+    """(end_line, close_col) of the `(` that starts at `col` on line `i`.
+
+    `col` points at the `(`. Returns None when the call does not close inside
+    [_ENC_SCAN_LINES] lines — a failure of the parser, not of the code.
+    """
+    depth = 0
+    for j in range(i, min(len(code_lines), i + _ENC_SCAN_LINES)):
+        line = code_lines[j]
+        k = col if j == i else 0
+        while k < len(line):
+            ch = line[k]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return j, k
+            k += 1
+    return None
+
+
+def _enc_enclosing_open(code_lines, i):
+    """Nearest block opener above [i] — `… {` or a lambda arrow `… ->`.
+
+    The `->` form matters: `val encoded = file.outputStream().use { out ->` opens
+    a value-returning scope on the same line as the arrow, and the old
+    `{`-suffix-only walk treated the call under it as a bare statement.
+    """
+    for j in range(i - 1, -1, -1):
+        s = code_lines[j].strip()
+        if not s:
+            continue
+        if s.endswith("{") or s.endswith("->"):
+            return code_lines[j]
+        return ""
+    return ""
+
+
+def _enc_exempt(raw_lines, i, lookback=6):
+    """`record-ok:` on this line, or in the contiguous comment block above it."""
+    if EXEMPT in raw_lines[i]:
+        return True
+    for j in range(i - 1, max(-1, i - 1 - lookback), -1):
+        s = raw_lines[j].strip()
+        if not s:
+            continue
+        if not s.startswith(("//", "/*", "*")):
+            return False
+        if EXEMPT in raw_lines[j]:
+            return True
+    return False
+
+
+def _enc_head_consumes(head):
+    """True when the text before the receiver chain reads the call's value."""
+    h = head.rstrip()
+    if not h:
+        return False
+    if h.endswith("=") and not h.endswith(("==", "!=", ">=", "<=")):
+        return True
+    if h.endswith(("(", ",", "!", "&&", "||", "?:")):
+        return True
+    if re.search(r"\b(?:return|throw)\s*$", h):
+        return True
+    return False
+
+
+def _enc_lambda_consumes(open_line):
+    """True when a value-returning scope's own value is used on [open_line]."""
+    if not _ENC_LAMBDA_OPEN.search(open_line):
+        return False
+    head = open_line.split("{")[0]
+    if "=" in head and not head.rstrip().endswith(("==", "!=", ">=", "<=")):
+        return True
+    if re.search(r"\breturn\s", head):
+        return True
+    # argument position: `foo(bar.use { … })`
+    return head.count("(") > head.count(")")
+
+
+def _enc_dropped(code_lines, i, m):
+    """True when the `.compress(` call at [i]:[m.start()] drops its verdict."""
+    span = _enc_call_span(code_lines, i, m.end() - 1)
+    if span is None:
+        return False  # parser limit, not a verdict drop
+    end_i, close_col = span
+    post = code_lines[end_i][close_col + 1:].strip()
+    if post and not post.startswith("}"):
+        # `) ?: x`, `) && y`, `).also { … }` — something downstream reads it.
+        return False
+    head = _ENC_RECEIVER.sub("", code_lines[i][:m.start()])
+    if _enc_head_consumes(head):
+        return False
+    if "{" in head:
+        return not _enc_lambda_consumes(head)
+    open_line = _enc_enclosing_open(code_lines, i)
+    if open_line and _enc_lambda_consumes(open_line):
+        return False
+    return True
+
+
+def _enc_return_type(body):
+    """Declared return type of the function whose text is [body], or None."""
+    depth = 0
+    sig = []
+    for ch in body:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "{" and depth <= 0:
+            break
+        sig.append(ch)
+    flat = " ".join("".join(sig).split())
+    m = re.search(r"\)\s*:\s*(.+)$", flat)
+    if not m:
+        return None
+    return m.group(1).strip()
+
+
+def scan_encode_verdict(root):
+    """(violations, sites) — B-02 criteria (C-B2 position / C-B3 reportability).
+
+    Findings use the same pre-formatted `file:line  [Bx] reason` contract as the
+    sections above.
+    """
+    violations = []
+    sites = 0
+    base = os.path.join(root, SRC_SUBDIR)
+    for dirpath, _dirnames, filenames in os.walk(base):
+        for name in sorted(filenames):
+            if not name.endswith(".kt"):
+                continue
+            path = os.path.join(dirpath, name)
+            rel = os.path.relpath(path, root)
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                raw = fh.read().split("\n")
+            code = code_only("\n".join(raw)).split("\n")
+            bodies = _function_bodies(code)
+
+            def exempt(li):
+                return _enc_exempt(raw, li)
+
+            for i, line in enumerate(code):
+                for m in _ENC_COMPRESS.finditer(line):
+                    sites += 1
+                    if exempt(i):
+                        continue
+                    if not _enc_dropped(code, i, m):
+                        continue
+                    holder = _innermost_body(bodies, i)
+                    where = ("%s()" % holder[0]) if holder else "the file top level"
+                    violations.append(
+                        "%s:%d  [B2] %s drops the `compress` verdict — the encoder answers "
+                        "false WITHOUT throwing, so this path keeps reporting success (a "
+                        "0-byte file / an empty image payload). Bind it and route the "
+                        "decision through saveOutcome(streamOpened = true, compressed = …), "
+                        "or add `record-ok: <reason>`" % (rel, i + 1, where)
+                    )
+
+            for fname, start, end, body in bodies:
+                if ".compress" not in body:
+                    continue
+                rtype = _enc_return_type(body)
+                if rtype is None or rtype == "Unit":
+                    continue
+                if not any(
+                    _ENC_COMPRESS.search(code[li])
+                    and not exempt(li)
+                    for li in range(start, end + 1)
+                ):
+                    continue
+                if any(p.search(body) for p in _ENC_FAILURE_PATTERNS):
+                    continue
+                violations.append(
+                    "%s:%d  [B3] %s() compresses and returns %s, but nothing in the body "
+                    "can report a failed encode (no null exit / throw / failure result) — "
+                    "the caller cannot tell a real image from an encoder that wrote "
+                    "nothing" % (rel, start + 1, fname, rtype)
+                )
+    return violations, sites
+
+# ── B-02 self-test: every arm flips exactly its own criterion ─────────────
+
+_ENC_PROBE_PKG = "package probe\n\n"
+
+
+def _enc_fixture(src):
+    root = tempfile.mkdtemp(prefix="encoverdict_")
+    rel = os.path.join(SRC_SUBDIR, "probe", "Encode.kt")
+    full = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "w", encoding="utf-8") as fh:
+        fh.write(src)
+    return root
+
+# The 1047-B01 shipped shape: verdict bound through `use`, decision routed.
+_ENC_COMPLIANT = (
+    _ENC_PROBE_PKG +
+    "internal fun savePng(bmp: Bitmap, file: File): Boolean {\n"
+    "    val encoded = file.outputStream().use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }\n"
+    "    return saveOutcome(streamOpened = true, compressed = encoded)\n"
+    "}\n"
+)
+
+# Unit helper, statement position, nothing reads the verdict.
+_ENC_DROPPED = (
+    _ENC_PROBE_PKG +
+    "internal fun upload(bmp: Bitmap, out: OutputStream) {\n"
+    "    bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)\n"
+    "}\n"
+)
+
+# Verdict bound but the helper still cannot say "failed".
+_ENC_BOUND_ONLY = (
+    _ENC_PROBE_PKG +
+    "internal fun encode(bmp: Bitmap): ByteArray {\n"
+    "    val out = ByteArrayOutputStream()\n"
+    "    val encoded = bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)\n"
+    "    return out.toByteArray()\n"
+    "}\n"
+)
+
+# Nullable + conditional null: both criteria satisfied.
+_ENC_NULLABLE = (
+    _ENC_PROBE_PKG +
+    "internal fun encodeOrNull(bmp: Bitmap): ByteArray? {\n"
+    "    val out = ByteArrayOutputStream()\n"
+    "    val encoded = bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)\n"
+    "    return if (encoded) out.toByteArray() else null\n"
+    "}\n"
+)
+
+# Throw on the verdict (the offload-handler shape).
+_ENC_THROWING = (
+    _ENC_PROBE_PKG +
+    "internal fun writeOrThrow(bmp: Bitmap, out: OutputStream): Long {\n"
+    "    val encoded = bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)\n"
+    "    if (!encoded) throw IOException(\"encoder wrote no bytes\")\n"
+    "    return 1L\n"
+    "}\n"
+)
+
+# Deferred site: the escape hatch must keep it green.
+_ENC_RECORD_OK = (
+    _ENC_PROBE_PKG +
+    "internal fun debugDump(bmp: Bitmap, out: OutputStream) {\n"
+    "    // record-ok: probe fixture — deferred, see the backlog entry\n"
+    "    bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)\n"
+    "}\n"
+)
+
+
+def encode_verdict_self_test():
+    failures = []
+
+    def run(src):
+        root = _enc_fixture(src)
+        try:
+            return scan_encode_verdict(root)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def arm(name, src, expect, forbid=()):
+        v, _sites = run(src)
+        blob = " ".join(v)
+        ok = all(tok in blob for tok in expect) and not any(tok in blob for tok in forbid)
+        if not ok:
+            failures.append("B-02 %s: want %s / forbid %s, got %s"
+                            % (name, list(expect), list(forbid), v))
+        else:
+            print("[ok] B-02 %s" % name)
+
+    arm("the routed, `use`-bound verdict passes", _ENC_COMPLIANT, ())
+    arm("a statement-position verdict trips only [B2]", _ENC_DROPPED,
+        ("[B2]",), ("[B3]",))
+    arm("a bound-but-unreportable helper trips only [B3]", _ENC_BOUND_ONLY,
+        ("[B3]",), ("[B2]",))
+    arm("nullable + `else null` passes", _ENC_NULLABLE, ())
+    arm("throwing on the verdict passes", _ENC_THROWING, ())
+    arm("`record-ok:` keeps a deferred site green", _ENC_RECORD_OK, ())
+
+    if failures:
+        for f in failures:
+            print("SELFTEST FAIL " + f)
+        return 1
+    print("✅ encode-verdict self-test has teeth: C-B2 (statement-position compress) and "
+          "C-B3 (non-Unit helper that cannot report a failed encode) each flip red on "
+          "exactly their own breaker; the `use`-bound, nullable, throwing and "
+          "`record-ok:` shapes stay green")
+    return 0
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -1783,7 +2138,8 @@ def main():
         rc3 = staged_self_test()
         rc4 = share_stream_self_test()
         rc5 = binary_write_self_test()
-        return 1 if (rc or rc2 or rc3 or rc4 or rc5) else 0
+        rc6 = encode_verdict_self_test()
+        return 1 if (rc or rc2 or rc3 or rc4 or rc5 or rc6) else 0
     violations = scan(args[0])
     # [B-04 deep-audit-1037] queue-drain persistence section. Its findings are
     # pre-formatted `file:line  [criterion] reason` strings, so they are
@@ -1801,6 +2157,10 @@ def main():
     # openOutputStream). Same pre-formatted `file:line [criterion] reason`
     # contract as the sections above.
     binary_violations, _binary_sites = scan_binary_write_verdict(args[0])
+    # [deep-audit-1048 A-02 / B-02] encode-verdict section (compress outside the
+    # outbound destinations). Same pre-formatted `file:line [criterion] reason`
+    # contract as the sections above.
+    encode_violations, _encode_sites = scan_encode_verdict(args[0])
     if violations:
         print("❌ 丢弃了必须消费的返回值（看似接线，实则没生效）：")
         for rel, line, snippet, fn, why in violations:
@@ -1834,7 +2194,14 @@ def main():
             print("  %s" % msg)
         print("")
         print("  共 %d 处。" % len(binary_violations))
-    if violations or drain_violations or staged_violations or stream_violations or binary_violations:
+    if encode_violations:
+        print("❌ 编码判定段：compress 的 false 结果没有到达任何失败出口（B-02）：")
+        for msg in encode_violations:
+            print("  %s" % msg)
+        print("")
+        print("  共 %d 处。" % len(encode_violations))
+    if (violations or drain_violations or staged_violations or stream_violations
+            or binary_violations or encode_violations):
         return 1
     print(
         "✅ discarded-return guard: no watchlisted return value is dropped "
@@ -1845,6 +2212,8 @@ def main():
     print("✅ discarded-return guard: share inbound stream section green (null stream never staged)")
     print("✅ discarded-return guard: binary-write verdict section green (compress verdict routed, "
           "no swallowed openOutputStream)")
+    print("✅ discarded-return guard: encode verdict section green (every compress verdict reaches "
+          "a failure exit)")
     return 0
 
 

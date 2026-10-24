@@ -29,6 +29,7 @@ import com.rikkaminis.app.tools.UnknownToolMessage
 import com.rikkaminis.app.util.ImageDecodeSizing
 import com.rikkaminis.app.util.ImageDecoding
 import com.rikkaminis.app.util.Utf16Sanitizer
+import com.rikkaminis.app.util.saveOutcome
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -751,8 +752,12 @@ internal fun ChatViewModel.resizeJpegToMaxEdge(data: ByteArray, maxEdge: Int): B
     val decoded = ImageDecoding.decodeBytesBounded(data, maxEdge, source) ?: return null
     return try {
         val out = java.io.ByteArrayOutputStream()
-        decoded.bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
-        out.toByteArray()
+        // [deep-audit-1048 A-02] `compress` returns false when the encoder wrote
+        // nothing; a dropped verdict uploaded an EMPTY image to the model. The
+        // documented contract above is "null on any decode/compress failure" —
+        // null is exactly the caller's "use the original bytes" path.
+        val encoded = decoded.bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
+        if (saveOutcome(streamOpened = true, compressed = encoded)) out.toByteArray() else null
     } finally {
         decoded.bitmap.recycle()
     }
@@ -1533,8 +1538,10 @@ internal fun ChatViewModel.resizeImageBytes(
             val out = ByteArrayOutputStream()
             val format = if (mimeType.contains("png")) Bitmap.CompressFormat.PNG
             else Bitmap.CompressFormat.JPEG
-            decoded.bitmap.compress(format, 85, out)
-            out.toByteArray()
+            // [deep-audit-1048 A-02] ditto: the KDoc promises null on encode
+            // failure, the dropped verdict promised nothing and shipped ''.
+            val encoded = decoded.bitmap.compress(format, 85, out)
+            if (saveOutcome(streamOpened = true, compressed = encoded)) out.toByteArray() else null
         } finally {
             decoded.bitmap.recycle()
         }

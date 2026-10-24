@@ -737,8 +737,17 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
                 android.graphics.Bitmap.createScaledBitmap(bmp, (bmp.width * scale).toInt(), (bmp.height * scale).toInt(), true)
             } else bmp
             try {
-                dst.outputStream().use { os ->
+                // [deep-audit-1048 A-02] `Bitmap.compress(...)` returns FALSE when
+                // the JPEG encoder could not write the pixels — it does not throw.
+                // Dropped, `export` answered `size_bytes: 0` with success and left
+                // a 0-byte file in the export dir. This helper already reports
+                // failure by throwing (see copyStream's IOException): the export
+                // caller catches it and answers `export_failed`.
+                val encoded = dst.outputStream().use { os ->
                     out.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, os)
+                }
+                if (!com.rikkaminis.app.util.saveOutcome(streamOpened = true, compressed = encoded)) {
+                    throw java.io.IOException("JPEG encoder wrote no bytes (compress returned false)")
                 }
             } finally {
                 // [sweep1014-P8] Recycle the intermediate scaled bitmap.
