@@ -151,6 +151,62 @@ RESOLVER_CALL_RE = re.compile(
     r"|sessionAwareHostFile|GuestPathMapper\.resolve)\("
 )
 
+# ── [meta-audit-1024 M6] R1b: `File(<expression>)`, not only `File(<ident>)` ──
+# The three R1 spellings above match the SHAPE of one argument: a bare
+# identifier, `it`, or an inline `get("path")`. A derived expression slips
+# through all three — the adversarial witness for this gate is exactly
+# `val src = File(rawPath.trim())`, where the value is still the raw guest path
+# but the argument is no longer one of those three shapes. The obligation R1
+# states is a DATAFLOW one ("the value reaching File() went through a guest→host
+# resolver"), so the argument is now read as an expression and every
+# args-tainted identifier inside it is checked.
+FILE_CALL_RE = re.compile(r"\bFile\s*\(")
+FILE_ARG_IDENT_ONLY_RE = re.compile(r"^[A-Za-z_]\w*$")
+
+
+def _file_call_args(line):
+    """(offset, argument text) for every `File(...)` opened on a single line."""
+    out = []
+    for m in FILE_CALL_RE.finditer(line):
+        depth = 1
+        i = m.end()
+        while i < len(line) and depth:
+            c = line[i]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        if depth == 0:
+            out.append((m.start(), line[m.end():i]))
+    return out
+
+
+# ── [meta-audit-1024 M6] R7: `android-photos import` — sanitisation must HAPPEN ─
+# R1's spellings are about the shape of ONE `File(...)` argument; they say nothing
+# about whether the guest→host conversion happened at all. The witness for this
+# gate replaces `val src = PRootKernel.resolvePathForSession(...)` with
+# `val src = File(rawPath.trim())` — the handler still compiles, still imports,
+# and R1's argument-shape criteria alone must carry the whole load. The
+# obligation is DATAFLOW, and it lives on the import path:
+#   S1 the entry must resolve session-scoped (a session-scoped resolver call in
+#      the body — sanitisation must happen, not merely exist elsewhere);
+#   S2 the RESOLVED value must be what gets opened / streamed;
+#   S3 fail-closed: the entry cannot be derived, or its resolver result cannot
+#      be traced to an open point ⇒ violation, never a silent skip.
+PHOTOS_HANDLER_REL = os.path.join(OFFLOAD_REL, "PhotosOffloadHandler.kt")
+# The import sink: the guest file is copied OUT of the sandbox into MediaStore.
+IMPORT_SINK_RE = re.compile(
+    r"contentResolver\s*\.\s*insert\s*\(|MediaStore\s*\.\s*(?:Images|Video)\.Media\."
+)
+# Anything that turns a path value into bytes / a stream.
+HOST_OPEN_TOKEN_RE = re.compile(
+    r"\b(?:File|FileInputStream|FileOutputStream|RandomAccessFile)\s*\(|\bFiles\s*\.\s*\w+\s*\("
+    r"|\.\s*(?:inputStream|outputStream|readBytes|readText|bufferedReader|useLines|source)\s*\("
+)
+
 # ── [da1025-A] R3: player session-path wiring ───────────────────────────────
 # android-player play <session> <path> must join relative paths against the
 # session cwd and resolve the file session-scoped, fail-closed. Pre-fix, the
@@ -500,35 +556,37 @@ def scan_debug_exec_scope(root):
     return problems
 
 
+_CODE_TOKEN_RE = re.compile(
+    r'"""(?:\\.|[^\\])*?"""'          # triple-quoted string (may span lines)
+    r'|"(?:\\.|[^"\\\n])*"'           # single-line string
+    r"|'(?:\\.|[^'\\\n])*'"           # char literal
+    r"|//[^\n]*"                      # line comment
+    r"|/\*.*?\*/"                     # block comment, terminated
+    r"|/\*.*",                        # unterminated block comment (to EOF)
+    re.S,
+)
+
+
 def strip_comments(text):
-    """Blank out // and /* */ comment content, keeping line structure."""
-    out = []
-    in_block = False
-    for line in text.splitlines():
-        s = line
-        if in_block:
-            end = s.find("*/")
-            if end < 0:
-                out.append("")
-                continue
-            s = s[end + 2:]
-            in_block = False
-        while True:
-            d = s.find("//")
-            b = s.find("/*")
-            if b >= 0 and (d < 0 or b < d):
-                end = s.find("*/", b + 2)
-                if end < 0:
-                    s = s[:b]
-                    in_block = True
-                    break
-                s = s[:b] + s[end + 2:]
-                continue
-            if d >= 0:
-                s = s[:d]
-            break
-        out.append(s)
-    return "\n".join(out)
+    """Blank out // and /* */ comment content, keeping line structure.
+
+    [meta-audit-1024 M6] Literals are tokenised first. The line-oriented version
+    this replaces opened a BLOCK comment on the `/*` inside a string: the import
+    handler's `"video/*"` / `"image/*"` MIME lookup blanked the following 67
+    lines — values, contentResolver.insert, openOutputStream and the
+    `FileInputStream(src)` read itself — so every criterion reading this file
+    (R1 included) was judging a handler with half its body missing. The
+    replacement keeps every newline, so line numbers are unchanged.
+    """
+    def repl(m):
+        s = m.group(0)
+        if s.startswith("//"):
+            return ""
+        if s.startswith("/*"):
+            return "\n" * s.count("\n")
+        return s
+
+    return _CODE_TOKEN_RE.sub(repl, text)
 
 
 def tainted_from_args(text):
@@ -615,6 +673,28 @@ def scan_bare_file(rel, text):
                         "%s:%d: `File(%s)` derives from the guest path argument without passing "
                         "through a guest→host resolver — no raw host File" % (rel, i, ident)
                     )
+            # [meta-audit-1024 M6] the same obligation, read as an EXPRESSION:
+            # `File(rawPath.trim())`, `File(Paths.get(rawPath).toString())`,
+            # `File("" + rawPath)`. Shapes already covered above are skipped so a
+            # single construction still reports exactly one violation.
+            for _pos, arg in _file_call_args(line):
+                arg_s = arg.strip()
+                if not arg_s or arg_s == "it" or FILE_ARG_IDENT_ONLY_RE.match(arg_s):
+                    continue  # covered by the identifier / ?.let criteria above
+                if re.search(r'get\(\s*"(?:%s)"' % ARG_NAMES, arg_s):
+                    continue  # covered by FILE_DIRECT_RE
+                if RESOLVER_CALL_RE.search(arg_s):
+                    continue  # sanitised inline: File(resolvePathForSession(...))
+                hits = sorted(
+                    t for t, state in snapshot.items()
+                    if state == "raw" and re.search(r"\b%s\b" % re.escape(t), arg_s)
+                )
+                if hits:
+                    problems.append(
+                        "%s:%d: `File(%s)` derives from the guest path argument (%s) without "
+                        "passing through a guest→host resolver — no raw host File"
+                        % (rel, i, arg_s, ", ".join(hits))
+                    )
     return problems
 
 def _statement_window(text, start_idx):
@@ -663,6 +743,112 @@ def _brace_body(text, idx):
             if depth == 0:
                 return text[start:n + 1]
     return None
+
+
+def _body_opener(text, idx):
+    """Index of the `{` that opens a function body, or None.
+
+    Expression bodies (`fun f(x: Int) = ...`) and abstract declarations have no
+    brace body. `_brace_body` alone cannot tell them apart — it would find the
+    NEXT function's `{` and swallow every function in between, which is how a
+    whole run of declarations disappears from an enumeration like this one.
+    """
+    depth = 1                                  # idx sits just inside `(`
+    i = idx
+    while i < len(text):
+        c = text[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif depth == 0 and c == "=":
+            return None                      # `fun f() = <expression>`
+        elif depth == 0 and c == "{":
+            return i
+        elif depth == 0 and c == "\n":
+            if not text[i + 1:].lstrip().startswith("{"):
+                return None                  # header ended without a body
+        i += 1
+    return None
+
+
+def _fun_declarations(text):
+    """(name, body) for every function with a brace body in text, outermost only."""
+    out = []
+    covered = -1
+    for m in FUN_DECL_RE.finditer(text):
+        if m.start() < covered:
+            continue
+        open_idx = _body_opener(text, m.end())
+        if open_idx is None:
+            continue
+        body = _brace_body(text, open_idx)
+        if body is None:
+            continue
+        out.append((m.group(1), body))
+        covered = open_idx + len(body)
+    return out
+
+
+def scan_photos_import_sanitisation(root):
+    """R7 [meta-audit-1024 M6]: `android-photos import` must resolve the guest
+    path session-scoped AND open the RESOLVED file.
+
+    Scope is derived, never a hardcoded function name: an import entry is any
+    function in PhotosOffloadHandler.kt whose body reads a path operand from args
+    AND writes into MediaStore (a copy OUT of the sandbox). A second import entry
+    — or the rename of this one — is covered without touching the gate, and an
+    entry that can no longer be derived at all is reported instead of skipped.
+
+    This is the axis R1 cannot see: R1 asks "is this File() argument shaped like
+    a raw path"; R7 asks "did the conversion happen, and is its RESULT the thing
+    that gets read". An import that keeps a resolver call somewhere but opens a
+    different expression satisfies R1 and fails R7.
+    """
+    rel = PHOTOS_HANDLER_REL
+    path = os.path.join(root, rel)
+    if not os.path.isfile(path):
+        return ["%s: missing — cannot verify that the import path sanitises the guest "
+                "path before reading it as a host file (fail-closed)" % rel]
+    code = _read_code(path)
+    entries = [
+        (name, body)
+        for name, body in _fun_declarations(code)
+        if ARG_ASSIGN_RE.search(body) and IMPORT_SINK_RE.search(body)
+    ]
+    if not entries:
+        return ["%s: no import entry could be derived (no function reads a path operand "
+                "from args and writes into MediaStore) — fail-closed: the entry was renamed "
+                "or moved, so the sanitiser criteria would silently check nothing" % rel]
+    problems = []
+    for name, body in entries:
+        if not RESOLVER_CALL_RE.search(body):
+            problems.append(
+                "%s: `%s` never resolves the guest path through a session-scoped guest→host "
+                "resolver — the file that gets imported is a raw host path (sanitisation must "
+                "happen in the entry, not merely exist elsewhere in the file)" % (rel, name)
+            )
+            continue
+        bound = re.search(
+            r"\b(?:val|var)\s+([A-Za-z_]\w*)\s*(?::[^=\n]*)?=\s*[^\n]*"
+            + RESOLVER_CALL_RE.pattern, body)
+        if bound:
+            ident = re.escape(bound.group(1))
+            used = any(
+                re.search(r"\b%s\b" % ident, line) and HOST_OPEN_TOKEN_RE.search(line)
+                for line in body.splitlines()
+            )
+        else:
+            # `File(PRootKernel.resolvePathForSession(...))` — inline is a flow too.
+            used = re.search(
+                HOST_OPEN_TOKEN_RE.pattern + r"[^\n]*" + RESOLVER_CALL_RE.pattern, body
+            ) is not None
+        if not used:
+            problems.append(
+                "%s: `%s` resolves the guest path but its result never reaches a host open "
+                "point — the value that gets opened is not the resolved one" % (rel, name)
+            )
+    return problems
 
 
 def has_full_hardening(body):
@@ -1841,6 +2027,194 @@ object F9NewConsumer {
           % (len(f9_arms),
              sum(1 for a in f9_arms if a[2] > 0),
              sum(1 for a in f9_arms if a[2] == 0)))
+
+    # ── [meta-audit-1024 M6] R1b + R7: sanitisation must HAPPEN ────────────
+    # Two axes, one obligation: the value that reaches a host file must be the
+    # one a session-scoped resolver produced. R1's three spellings read the SHAPE
+    # of one argument; these arms pin the two shapes that walk straight past it:
+    # an EXPRESSION argument (`File(rawPath.trim())`) and an entry that keeps a
+    # resolver somewhere but opens something else. Expected counts are literals
+    # so "red on exactly its own criterion" is mechanical, not eyeballed.
+    M6_FILE_EXPR_TAINTED = """package com.rikkaminis.app.sandbox.offload
+
+import java.io.File
+import java.io.FileInputStream
+
+class M6ExprHandler {
+    private fun handleExport(args: OffloadArgs): NativeOffloadResult {
+        val rawPath = args.get("path") ?: return NativeOffloadResult(2, "required")
+        val src = File(rawPath.trim())
+        return NativeOffloadResult(0, FileInputStream(src).use { it.readBytes().size.toString() })
+    }
+}
+"""
+
+    M6_FILE_EXPR_PATHS_GET = """package com.rikkaminis.app.sandbox.offload
+
+import java.io.File
+import java.nio.file.Paths
+
+class M6PathsGetHandler {
+    private fun handleExport(args: OffloadArgs): NativeOffloadResult {
+        val rawPath = args.get("path") ?: return NativeOffloadResult(2, "required")
+        val src = File(Paths.get(rawPath).toString())
+        return NativeOffloadResult(0, src.name)
+    }
+}
+"""
+
+    M6_FILE_EXPR_RESOLVED = """package com.rikkaminis.app.sandbox.offload
+
+import java.io.File
+
+class M6ResolvedExprHandler {
+    private fun handleExport(args: OffloadArgs, request: NativeOffloadRequest): NativeOffloadResult {
+        val rawPath = args.get("path") ?: return NativeOffloadResult(2, "required")
+        val host = PRootKernel.resolvePathForSession(request.sessionId, rawPath, context)
+            ?: return NativeOffloadResult(1, "no_file")
+        val src = File(host.absolutePath)
+        return NativeOffloadResult(0, src.name)
+    }
+}
+"""
+
+    # The MIME lookup that made the old comment stripper blank the rest of the
+    # file: `"video/*"` opened a BLOCK comment. Everything below it — including
+    # the raw File(...) this arm plants — used to be invisible.
+    M6_STRIP_STRING_COMMENT = """package com.rikkaminis.app.sandbox.offload
+
+import java.io.File
+
+class M6StripHandler {
+    private fun mime(ext: String): String = when (ext) {
+        "mp4" -> "video/*"
+        "jpg" -> "image/*"
+        else -> "application/octet-stream"
+    }
+
+    private fun handleImport(args: OffloadArgs): NativeOffloadResult {
+        val rawPath = args.get("path") ?: return NativeOffloadResult(2, "required")
+        val src = File(rawPath.trim())
+        return NativeOffloadResult(0, src.name)
+    }
+}
+"""
+
+    M6_PHOTOS_IMPORT_OK = """package com.rikkaminis.app.sandbox.offload
+
+import java.io.FileInputStream
+
+class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler {
+    private fun handleImport(args: OffloadArgs, request: NativeOffloadRequest): NativeOffloadResult {
+        val rawPath = args.get("path") ?: return NativeOffloadResult(2, "required")
+        val guestPath = GuestPathMapper.absoluteGuestPath(request.cwd, rawPath)
+            ?: return NativeOffloadResult(1, "path_outside_sandbox")
+        val src = PRootKernel.resolvePathForSession(request.sessionId, guestPath, context)
+            ?: return NativeOffloadResult(1, "no_file")
+        val values = ContentValues()
+        val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
+            ?: return NativeOffloadResult(1, "insert_failed")
+        context.contentResolver.openOutputStream(uri)?.use { os ->
+            FileInputStream(src).use { input -> os.write(input.readBytes()) }
+        }
+        return NativeOffloadResult(0, src.name)
+    }
+}
+"""
+
+    # The gate's adversarial witness, verbatim: the resolver is replaced by a raw
+    # host File whose argument is an expression, so none of R1's three spellings
+    # match and the handler still compiles and still imports.
+    M6_PHOTOS_IMPORT_NO_RESOLVER = M6_PHOTOS_IMPORT_OK.replace(
+        """        val src = PRootKernel.resolvePathForSession(request.sessionId, guestPath, context)
+            ?: return NativeOffloadResult(1, "no_file")""",
+        "        val src = File(rawPath.trim())",
+    )
+
+    # A resolver that is present but whose RESULT never reaches the read: this is
+    # what "keep the sanitiser so the gate is happy, open something else" looks
+    # like — R1 sees nothing (the File() argument is an expression).
+    M6_PHOTOS_IMPORT_RESULT_DROPPED = M6_PHOTOS_IMPORT_OK.replace(
+        """        val src = PRootKernel.resolvePathForSession(request.sessionId, guestPath, context)
+            ?: return NativeOffloadResult(1, "no_file")""",
+        """        val resolved = PRootKernel.resolvePathForSession(request.sessionId, guestPath, context)
+            ?: return NativeOffloadResult(1, "no_file")
+        val src = File(rawPath.trim())""",
+    )
+
+    M6_PHOTOS_NO_ENTRY = """package com.rikkaminis.app.sandbox.offload
+
+class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler {
+    private fun handleImport(args: OffloadArgs, request: NativeOffloadRequest): NativeOffloadResult {
+        val rawPath = args.get("path") ?: return NativeOffloadResult(2, "required")
+        return NativeOffloadResult(0, rawPath)
+    }
+}
+"""
+
+    def photos_fixture_root(src):
+        root = tempfile.mkdtemp(prefix="offload-gate-selftest-photos-")
+        path = os.path.join(root, PHOTOS_HANDLER_REL)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(src)
+        return root
+
+    m6_arms = [
+        ("M6 dirty: `File(rawPath.trim())` — an expression, not the three R1 spellings",
+         "tree", M6_FILE_EXPR_TAINTED, 1, "derives from the guest path argument (rawPath)"),
+        ("M6 dirty: `File(Paths.get(rawPath).toString())` — value rebuilt, never resolved",
+         "tree", M6_FILE_EXPR_PATHS_GET, 1, "derives from the guest path argument"),
+        ("M6 dirty: a `\"video/*\"` literal must not blank the rest of the handler",
+         "tree", M6_STRIP_STRING_COMMENT, 1, "derives from the guest path argument"),
+        ("M6 clean: `File(<resolved>.absolutePath)` after the session resolver",
+         "tree", M6_FILE_EXPR_RESOLVED, 0, None),
+        ("M6 clean: photos import resolves, then opens the RESOLVED file",
+         "photos", M6_PHOTOS_IMPORT_OK, 0, None),
+        ("M6 dirty (witness): sanitisation replaced by `File(rawPath.trim())`",
+         "photos", M6_PHOTOS_IMPORT_NO_RESOLVER, 1, "never resolves the guest path"),
+        ("M6 dirty: resolver present but its result never reaches the read",
+         "photos", M6_PHOTOS_IMPORT_RESULT_DROPPED, 1, "never reaches a host open point"),
+        ("M6 fail-closed: no import entry can be derived (renamed or moved)",
+         "photos", M6_PHOTOS_NO_ENTRY, 1, "no import entry could be derived"),
+        ("M6 fail-closed: PhotosOffloadHandler.kt missing",
+         "photos_missing", None, 1, "missing — cannot verify"),
+    ]
+    m6_failures = []
+    for label, kind, src, expected, needle in m6_arms:
+        if kind == "photos":
+            root = photos_fixture_root(src)
+            try:
+                problems = scan_photos_import_sanitisation(root)
+            finally:
+                shutil.rmtree(root, ignore_errors=True)
+        elif kind == "photos_missing":
+            root = tempfile.mkdtemp(prefix="offload-gate-selftest-nophotos-")
+            try:
+                problems = scan_photos_import_sanitisation(root)
+            finally:
+                shutil.rmtree(root, ignore_errors=True)
+        else:
+            root = _fixture_root({"AOffloadHandler.kt": src})
+            try:
+                _, problems = check_tree(root, verbose=False)
+            finally:
+                shutil.rmtree(root, ignore_errors=True)
+        ok = len(problems) == expected
+        if ok and needle is not None:
+            ok = any(needle in p for p in problems)
+        print("  [%s] %s%s" % ("PASS" if ok else "FAIL", label,
+                               "" if ok else "  → problems=%s" % problems))
+        if not ok:
+            m6_failures.append(label)
+    if m6_failures:
+        print("❌ selftest failed: %s" % ", ".join(m6_failures))
+        return 1
+    print("M6_TAINT_SELFTEST=PASS (%d fixtures: %d dirty/fail-closed arms red on their own "
+          "criterion, %d clean trees green)"
+          % (len(m6_arms),
+             sum(1 for a in m6_arms if a[3] > 0),
+             sum(1 for a in m6_arms if a[3] == 0)))
     return 0
 
 
@@ -1855,10 +2229,18 @@ def main():
         print("unknown option(s): %s" % " ".join(unknown))
         return 2
     scanned, problems = check_tree(root)
-    problems.extend(scan_player_session_path(root))
-    problems.extend(scan_shizuku_paths(root))
-    problems.extend(scan_debug_session_path(root))
-    problems.extend(scan_debug_exec_scope(root))
+    extra = []
+    extra.extend(scan_player_session_path(root))
+    extra.extend(scan_shizuku_paths(root))
+    extra.extend(scan_debug_session_path(root))
+    extra.extend(scan_debug_exec_scope(root))
+    extra.extend(scan_photos_import_sanitisation(root))
+    # [meta-audit-1024 M6] a red gate has to say WHAT is red: the extension
+    # criteria used to contribute only to the count, so a witness like
+    # `File(rawPath.trim())` reported "2 violation(s)" with one line of text.
+    for p in extra:
+        print("❌ %s" % p)
+    problems.extend(extra)
     if problems:
         print("offload_host_path_check: %d handler file(s) scanned, %d violation(s)" % (scanned, len(problems)))
         return 1
