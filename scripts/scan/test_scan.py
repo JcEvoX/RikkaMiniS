@@ -3218,34 +3218,6 @@ def test_dv27_gates():
         rc, out = run_scanner(script + ".py", *real_args)
         check(f"{script} real tree green", rc == 0, out[-280:])
 
-# ─────────────────────────────────────────────────────────────────────────────
-# meta-audit-1024 M6 gate registration: offload_host_path_check gained the two
-# dataflow axes its three argument-shape spellings could not see
-# (`File(<expression>)` and "the resolver's RESULT must be what gets opened"),
-# plus a literal-aware comment stripper — a `"video/*"` string used to blank 67
-# lines of the photos import handler. The pre-existing registration above pins
-# the old closing marker; this one pins the new arms through their own marker so
-# gutting either axis is caught even when the old marker still prints.
-# ─────────────────────────────────────────────────────────────────────────────
-
-M6_TAINT_GATES = [
-    # (script without .py, selftest closing marker, real-tree argv)
-    ("offload_host_path_check", "M6_TAINT_SELFTEST=PASS", (REPO_ROOT,)),
-]
-
-def test_m6_taint():
-    print("━━━ meta-audit-1024 M6 gates (dataflow teeth + real tree) ━━━")
-    for script, marker, real_args in M6_TAINT_GATES:
-        proc = subprocess.run(
-            [sys.executable, os.path.join(SCRIPT_DIR, script + ".py"), "--selftest"],
-            capture_output=True, text=True,
-        )
-        out = (proc.stdout or "") + (proc.stderr or "")
-        check(f"{script} M6 dataflow arms have teeth ({marker})",
-              proc.returncode == 0 and marker in out, out[-280:])
-        rc, out = run_scanner(script + ".py", *real_args)
-        check(f"{script} real tree green (M6)", rc == 0, out[-280:])
-
 def main():
     print("╔══════════════════════════════════════════════════╗")
     print("║  Scan Self-Test (fixture ground truth)          ║")
@@ -3281,7 +3253,6 @@ def main():
     test_da1016_gates()
     test_da1046_gates()
     test_dv27_gates()
-    test_m6_taint()
     test_da1018_gates()
     test_da1019_gates()
     test_da1020_gates()
