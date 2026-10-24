@@ -84,6 +84,8 @@
 
 **PRE 臂**（`probe/base/` = 基线 `ChatViewModel.kt` 单文件树）：`rc=1`，**恰 2 条 finding** —— `[C-B8] :4227`、`[C-B8b] :4221`，其余判据 0 条（基线树本就过 Check A/B/C1/C3）。真实行号与审计报告一致。
 
+**⚠ 见证缺口（收口必做，1047-A3 同族）**：`claim_release_guard` 的 `--selftest` **不在** `test_scan.py` 任何 `DA####_GATES` 列表里（`grep -n claim_release_guard test_scan.py` 只有 `test_claim_release()` 的 7 个 Check A/B/C 夹具），因此 CI 日志里能看到 `✅ claim_release_guard.py on real repo exits 0`，但**看不到本波 9 条新臂**。`test_scan.py` 属冻结面（COMMON §4），本支不改；**收口时由主会话在 dv28 的见证列表里注册**：`("claim_release_guard", "SELFTEST=PASS (27 fixtures", (REPO_ROOT,))`（flag 是单数 `--selftest`）。登记 `backlog §1048-B3` R8。
+
 ---
 
 ## 5. 验证四层
@@ -109,7 +111,16 @@
 
 **唯一不可信面**：`ChatViewModel.resume()` 的**运行期**行为（真机双流/诈尸）在本环境不可执行 —— 见 R1。
 
-**L4（CI 层）** 见 §7。
+**L4（CI 层）**
+- run **`40050946272`** / job **`120743264182`** / **attempt 1** / `conclusion=success`；
+- **三方 sha 逐字符一致**：本地 `git rev-parse HEAD` = 远端 `branches/…` = `run.head_sha` = `167526ef425dc66b7f160f43f9e3a557de392a5b`；
+- 26 步 `not_ok_steps=[]`，**唯一 skipped = `Publish to Releases`**（main 门控）；
+- `━━━ [N/111]` **111 条、去重 111、min/max = 1/111**（门头连续互异）；
+- `Summary: <n> passed, 0 failed` **8 条，全部 failed=0**，其中 `Summary: 111 passed, 0 failed` **恰 1 条**；
+- `✅ ALL 342 CASES PASS` **恰 1 条**；
+- ` e: `（Kotlin 编译错）= **0**；游离 `FAILED`（不含 PASSED 子串）行 = **0**；
+- 本支改动的三个文件（`ChatViewModel.kt` / `SessionActivityStreamErrorTest.kt` / `claim_release_guard.py`）**警告 0 条**（CI 绿 ≠ CI 干净，单独查过）；
+- 门见证：`✅ claim_release_guard.py on real repo exits 0`（CI 日志 `:1370`）；日志 1,460,647 B（`probe/ci/job-40050946272.log`）。
 
 ---
 
@@ -127,6 +138,8 @@
 - **R4**：`cancelStream()` 是否也该等待 shell 收尾（本波不改）。**触发条件**：出现「取消后仍有一次系统提示词构建」的性能/耗电报告。
 - **R5（同族，本波刻意不修）**：`ChatRetryOps.retryLast:51` 的 setup shell 同样未持有（bare `viewModelScope.launch`，`streamJob` 在 `:97` 才建）；`ChatRetryOps.retryFromMessage` / `ChatViewModel.rerunFromToolBlock` 的 shell 也未持有（setup 期只做 DB 读，无 prompt 构建）。C-B8b 的作用域被限定在 `ChatViewModel.kt`（本波独占生产面），故这三处不进判据。**触发条件**：出现「retry 期间点 Stop 仍会发一次请求」的真机报告，或下一波触碰 `ChatRetryOps.kt`。登记 backlog。
 - **R6**：C-B8b 的「字段被读」判据只认「文件内出现该标识符且非声明/非赋值」，不区分读点是否在取消路径上。**触发条件**：`sendShellJob` 被挪到非取消路径读取（守卫会退化）。登记 backlog。
+- **R7**：`SessionActivityStreamErrorTest` 的 `cancel-is-not-error` 变异臂按固定缩进定位（见 §3 第三行），本波已同步成 28 空格，但后续再加缩进层会**再次静默失配**。**触发条件**：下一次给 resume 体加缩进层。登记 backlog（建议改成结构无关定位）。
+- **R8（收口必做）**：`claim_release_guard --selftest` 未在 `test_scan.py` 的见证列表里 ⇒ 本波 9 条新臂在 CI 中**隐形**（同 1047-A3 的 `discarded_return_guard`）。`test_scan.py` 是冻结面，本支不改。**触发条件** = 收口合并阶段。**触发后方案** = 主会话在 dv28 见证列表加一条 `("claim_release_guard", "SELFTEST=PASS (27 fixtures", (REPO_ROOT,))`，夹具计数相应 +1。登记 backlog。
 
 ---
 
@@ -134,7 +147,9 @@
 
 - 基线：`eea9f407f9e0e79f4902eeef1f84e1550ee5c29c`（main，`git log --oneline -2` 父提交链上确认）
 - 分支：`fix/dv28-b3-resume-claim-timing`
-- 提交 / CI：见 `git log` 与本支回报（`run id` / `job id` / `head_sha` 三方逐字符一致）
+- 提交：`c5566502`（生产 + 夹具同步）→ `c2dccbbe`（门）→ `167526ef`（报告，**CI 绿的正是这棵**）
+- CI：run **`40050946272`** / job **`120743264182`** / attempt **1** / `head_sha` **`167526ef425dc66b7f160f43f9e3a557de392a5b`**（本地 == `branches` API == `run.head_sha`，逐字符一致）
+- 本报告后续的措辞订正（§4 见证缺口 / §5 L4 / R7 R8）只改 `fix-reports/*.md`，源码树等价性用 `git diff --name-only 167526ef..HEAD -- . ':(exclude)fix-reports'` 输出为空来声明。
 
 ---
 
