@@ -161,8 +161,26 @@ merged file, so every server this device has and the backup does not is erased �
 
 还原纪律：变异只施加在 `probe/l3/arms/*` 的切片副本上，生产文件全程未进入变异态（`git status` 只有 3 个预期文件），故无需「还原 + sha256 对拍」；`arms/post/ConfigBackupSlice.kt` 由 `extract.py` 从工作树重生，内容 sha256 稳定。
 
-### L4 CI 层
-见 §⑦（CI 绿后回填）。
+### L4 CI 层（run `40051341292` / job `120744487664` / attempt 1 / success）
+
+判读脚本 `probe/judge_ci.py`（日志 1,456,822 B，经「302 → 预签名 blob，第二跳不带 Authorization」取回）：
+
+```
+summary lines 8 values [('10','0'),('111','0'),('13','0'),('22','0'),('25','0'),('33','0'),('5','0')]
+111/0 exactly one: True          ALL 342: True
+gate headers 111  unique 111  contiguous True
+compile error lines 0            FAILED lines 6  stray 0
+warning lines total 377  in touched files 0
+test serverListEntryNamePinsOnlyTheOneFileUnderTheMcpRoot            all PASSED
+test stage9SkipsTheServerListOnlyWhenStage7MergedIt                  all PASSED
+PASS mcp_oauth_lifecycle_check (… the server list Stage 7 merged is never re-copied …)
+✅ mcp_oauth_lifecycle_check selftest has teeth (MCP_OAUTH_LIFECYCLE_SELFTEST=PASS)
+✅ mcp_oauth_lifecycle_check real tree green
+```
+
+- 26 步，`not_ok_steps = []`，唯一 skipped = 步骤 23 `Publish to Releases`（main 门控）
+- 三方 sha 逐字符一致：本地 HEAD = `git ls-remote` = `run.head_sha` = `f7093bbb6a3ec102a65dc4d5240ebd40c646dc7e`
+- **本支改过的三个文件编译警告 0**（CI 绿 ≠ CI 干净，单独查过）
 
 ---
 
@@ -186,7 +204,11 @@ merged file, so every server this device has and the backup does not is erased �
 
 - 基线：`eea9f407f9e0e79f4902eeef1f84e1550ee5c29c`
 - 分支：`fix/dv28-a5-mcp-restore-stage9`
-- 提交：见文件末尾「提交序列」（CI 绿后回填 run/job/head_sha 三方一致）
+- 提交序列：
+  1. `f7093bbb6a3ec102a65dc4d5240ebd40c646dc7e` — 生产 + 门 + 测试 + 本报告初稿（CI 绿的确切树）
+  2. 报告回填提交（仅 `fix-reports/dv28-FIX-A5.md`）— **源码树与本 CI 绿 sha 等价**，见下
+- CI：**run `40051341292` / job `120744487664` / attempt 1 / success**，`head_sha` 三方一致 `f7093bbb…dc7e`
+- 源码树等价声明：`git diff --name-only f7093bbb..HEAD -- . ':(exclude)fix-reports'` 输出为空
 
 ---
 
