@@ -4,8 +4,8 @@
 > 按天索引见 **rikkaminis-dev-history-INDEX.md**，精炼时间线见 **RikkaMinis-开发时间线全记录.md**。
 
 - 合并范围：2026-08-03 ～ 2026-10-24，共 83 天
-- 条目总数：2221（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
-- 总字符数：3393407 / 总行数：40490
+- 条目总数：2226（按时间戳正序排序，已剔除与 RikkaMinis 应用开发无关的条目）
+- 总字符数：3402384 / 总行数：40595
 
 ---
 
@@ -40483,6 +40483,111 @@ A1=A-01（Anthropic toolChars）· A2=V-1+A-02+A-03+A-04（headless 绑定 + FK 
 - **停在分支，未合 main**（起手权在用户）。
 
 **边界**：`integration/dv29` 并集仍归另一会话（8 支全绿）。我只在自己的 `repo` 工作树开分支，未碰 integration。
+
+<!-- 2026-10-24 15:57:30 -->
+## deep-audit-1049（v27-A/B 波 + 真机 P1 合并）收口前状态：8 支 CI 绿 → 并集 `integration/dv29` @ `3a051b46` 并集 CI 全绿，文档已自合 main `6c7c4636`，**代码并集待用户放行**
+
+
+**输入**：v27-A（A-01..A-07）+ v27-B（B-01..B-06）+ 真机验证抓到的两条 P1（§2597-VERIFY-2 R4 prefs 写盘不生效 / §2597-VERIFY-3 不存在会话崩进程）。基线 main `b82aa8dc`。
+
+**分诊（15 条 → 8 支）**：A-03/A-04/A-06 **判级修正 P1→P2**（唯一入口在 DebugServer 背后，release 实测 5321/8321 端口不通 = debug-only），其中 **A-06 登记不修**；A-07 P2 顺路；V-1 真机崩溃升 **P0**（两处同改：catch 收窄到 UNIQUE + runner 早退）。8 支 = A1 截断守卫 / A2 崩溃+headless 假成功 / A3 分页静默回退 / A4 prefs 写后送达 / B1 认领壳撤销守卫 / B2 后台写 Compose 状态 / B3 分享打印+输入漏斗 / B4 视口重放。
+
+**8/8 支 CI 绿**（attempt 1，唯一 skipped=Publish），三方 sha 逐字符一致，源码树等价（`<绿sha>..HEAD` 排除 fix-reports = 0 行），跨支文件交集 0，门 111 / 夹具 342 不变（0 新建门）。
+
+**并集** `integration/dv29` @ **`3a051b46`**：8 次 `--no-ff` 零冲突，66 文件 **+9255/−617**；本地 111 门 GREEN + ALL 342。并集 CI run `40074388511` / job `120814535090` **success**：26 步无失败、`Summary: 111 passed, 0 failed` 权威行恰一条（其余 7 条步骤级 Summary 全 0 failed）、ALL 342 恰一条、门头 1..111 唯一、` e: ` 0、游离 FAILED 0；**警告按 (文件,文本) 对齐基线 = 新增 0 / 消失 0（两侧 376 条 / 190 唯一）**。
+
+**文档先行（纯文本例外自合，已完成）**：档案 **2201 → 2221 条 / 83 天**，脱敏 NONE ×3，结构自检（solo 锚 2221=头声明、乱序 0、NUL 0、围栏 60 偶）；README 计数同步；`docs/dev-history-1049` @ `c097de4f` → main **`6c7c4636`**（仅 docs 4 文件），远端三件套 sha256 与挂载源逐一一致（1b1bc8f5 / 9a42bd47 / 96c07c23）。docs-only push 不触发 CI。
+
+**backlog 落段**：新增 §1049-A1/A2/B1/B2/B3/B4 + §1049-A06（P2 登记不修，触发条件=debug RPC 变常用路径或真实触发证据），§1049-A3/A4 已在册；机械门 **427 段 / no-触发条件 4（既有）/ 豁免 11**，新增段全 OK。
+
+**★ 本波可复用判据**：
+1. **判级的可达性三查**再证一次：报告 P1 的三条（A-03/A-04/A-06）唯一入口都在 DebugServer（仅 DEBUG 启动，release 实测端口不通）⇒ 降 P2；「文件独立 + 装置成本」不等于「必须修」。
+2. **真机 P1 的因果是软的、观测是硬的**：V-2 root cause 六候选逐条排查后仍存在「callback 未触发 vs 两实例」二选一，修法对两种子因不变（PrefsWriteBus 把**写入方句柄**交给 sink）⇒ 不去证死子因也能正确修。
+3. **警告对比必须按 (basename, 文本) 对齐**（本波 376/190 vs 376/190 完全一致，NEW 0 / GONE 0），按行号比对会把行号漂移误判成新增。
+4. **judge 装置读 API JSON 判身份/步骤**（run.head_sha + steps[].conclusion），日志文本只判内容形态；`skipped` 步骤在日志里零输出。
+
+**待用户**：`integration/dv29` @ `3a051b46` → main 合并放行（含 .kt 验证面，起手权在用户）。放行后：`--no-ff` 合 main → push 自动触发 main CI → 绿后清理 8 支 + integration + docs 分支与 10 个 worktree。残留 R1 真机行为级 8 支各一条（backlog 各段在册）。
+
+<!-- 2026-10-24 16:18:04 -->
+## dv29 批次已闭环：main `6576c7fa` + main CI `40076239617` success（skipped=[]，Publish 真执行）→ 发布 v1.0.0+2612 → 分支/worktree 清理 100%
+
+
+**合并链**：用户「合并」放行 → docs 工作树 main `6c7c4636` `--no-ff` 合 `integration/dv29` @ `3a051b46` → **main `6576c7fa`**（合并树 vs 并集树 `src`+`scripts`+`fix-reports` diff 0 行、docs 0、冲突 0；相对 main 66 文件 +9255/−617）。
+
+**main CI 判读**（run `40076239617` / job `120820076440` / head_sha `6576c7fa` / event=push / attempt 1）：26 步 **skipped=[]** ⇒ Publish 真执行；8 条 Summary 中权威 `111 passed, 0 failed` 恰一条且无任何非零 failed；`ALL 342 CASES PASS` 恰一条；门头 111 唯一连续；编译错 0；游离 FAILED 0；**警告 376/190 与基线（run 40057945965）逐条一致，新增 0 / 消失 0**。发布 **v1.0.0+2612**（versionCode 220002612，APK 14,485,357 B，asset updated 08:14:27Z）。
+
+**清理**：远端 10 支 API DELETE 全 204（8 fix + integration/dv29 + docs/dev-history-1049）；10 worktree 回收；9 本地分支删除；`ls-remote --heads` 只剩 `main`（+ 会话既有 `fix/skill-desc-prompt-cap`，非本批，未动）。
+
+**★ 可复用两条**：①`gh_sync.sh delete-branches` **只删本地分支**（且对 worktree 占用中的分支 FAIL），**远端必须走 `DELETE /git/refs/heads/<b>` API（预期 204）**；②合并前判「已并入」用 `git merge-base --is-ancestor <branch_sha> origin/main`，clone 的 fetch refspec 只认 main 时 `origin/<feature>` 不存在，会误报 NOT-MERGED。
+
+**残留**：8 支各 1 条真机行为级（backlog §1049-A1/A2/B1/B2/B3/B4 + A3/A4 段在册）；A-06 登记不修（debug-only）。backlog 427 段机械门 OK；档案 2221 条 / 83 天已在 main。
+
+<!-- 2026-10-24 17:09:37 -->
+## 真机验证窗口 1（2026-10-24 17:0x）—— 设备 1.0.0+2615 = main `fa59c008`，四验通过 + 抓到一个同族漏修
+
+
+**前置核实**：设备 `versionName=1.0.0+2615` / `versionCode=220002615` / `lastUpdateTime=17:03:55`，与 main `fa59c008` 同树 ⇒ dv29 八支全部解锁（407 条欠账里「装包含本支的包」的闸门解除）。崩溃基线：当日 `silent_kill|FATAL` 13（含装包重启 ×2），进程 pid `16904`。
+
+**agent 自验四条（不需要用户在场）**：
+1. **§2597-VERIFY-3 / A2（P0 崩溃）✓** — `minis-sessions-cli send --session 00000000-… --prompt …` → `{"ok":false,"error":"SEND_FAILED","message":"session_not_found: 00000000-…"}`，`native_offload exit=1`，**pid 前后不变、launch-beacon 无新条目**。修前崩进程、修后结构化拒绝。
+2. **§1049-A3 分页守卫 ✓ 四条全过** — `messages --limit -5/0/1000/abc` 各 `exit=2` + 精确文案。修前钳到 1/100/50。
+3. **§1049-A4 prefs 写后送达 ✓ 双向** — `set background.overlay true` 请求收于 `17:08:04.474`，同进程的 `applyOverlayState enabled=true` 现于 `17:08:06.153`（**1.7s**，且该日志「逐次变化都打」⇒ 这是上界非管线延迟）；反向 2s 内跟随。修前实证 = 同 pid 写盘后持续 `enabled=false`。
+4. **§1049-B2 R1③ ✓** — `Perf[LongCtx] coldPrewarm.done` **240/240 带 `prewarmMs=`**。
+
+**不可验**：§1049-A1（需可注入断流的本地中继，真机构造不出）。
+
+**★ 抓到 A3 的同族漏修（P2 登记）**：`SessionsOffloadHandler.kt:213` 仍是 `args.getInt("offset") ?: 0).coerceAtLeast(0)` —— 正是 `OffloadPageSize` KDoc 第 9 行点名要消灭的形态。实测 `--offset -5` / `--offset abc` 都 **exit 0 静默返回第一页**（应 exit 2）；`--offset 99999` 返回 count 0（合理）。`--limit` 修了、`--offset` 没接进共享层。**同族第 2 次**，按纪律下次动 sessions CLI 分页面必须连带修；登记在 backlog §VERIFY-1024-DV29。
+
+**★ 方法教训（本轮 3 次自伤）**：
+- **假阳性三连**：① `minis-sessions-cli list` 的字段是 `session_id` 不是 `id`，我按 `id` 取到空值 ⇒ 四条「非法分页」全被 `--id required` 触发 exit 2，**看似全过实则一个没验到**；② R1 原文写的是 `--limit -5/0/1000/abc`，我读成 `--offset -5` 先测了错参数；③ 门审计里 shell `while read` 的假阴性要靠 python 重算才暴露。**判据必须先打印「实际被触发的错误消息」再判 exit code，否则验的是另一条分支。**
+- 对账口径：真实退出码取 `proot info: native_offload … exit=N`，不是 shell 的 `$?`。
+
+**待用户动作**（窗口 1 剩余）：B2①②（分享/保存连点 3 次、未配 WebDAV 点立即上传看内联错误）· B3 四条（无 share 目标 Toast / 连点两次打印单弹窗 / IME 划掉斜杠前缀不残留 / 退出预览后 WebView 不驻留）· B4（多会话交替首次 navigate 尺寸）· B1 R3（`send shell aborted before stream` 语义确认）。
+
+台账：backlog **428 段 / no-触发条件 4（既有）/ 豁免 11**，新段 OK @ :8605。销账脚本 `shared/work/backlog-audit-1024/settle_v1.py`（就地加标记，原文保留）。
+
+<!-- 2026-10-24 17:32:57 -->
+## 真机验证窗口 2（浏览器/WebView，2026-10-24 17:23–17:31）—— 四条通过 + 三条新 P2
+
+
+**取证基建**：为 blob / `intent://` 临时部署 CF Worker `blob-test.***USER***.workers.dev`（PUT `workers/scripts/<name>` 用 `-F 'worker.js=@/tmp/worker.js;type=application/javascript+module'` + `metadata` part；**新建 script 必须再 POST `/subdomain {"enabled":true}` 否则 workers.dev 返 404/1042**），用完已 DELETE。证据全部来自 LOGCAT 行 + 沙箱可见落地文件。
+
+**通过**：
+1. **§1045-B02 R2（切 UA 后立刻销毁 tab 不崩）✓** — 四个 tab 全走 `Created`→`destroyed`；2 次销毁后 **9ms** 出现 `W/cr_AwContents: Application attempted to call on a destroyed WebView`（17:23:38/55）。**无 FATAL、无重启** ⇒ 判据「不崩」成立；WARN = R5 已登记的已知形态，不升级。
+2. **§1045-B02 R1（blob 下载落地）✓ 最强证据** — 链路 `onDownloadStart: blob:…` → `blob download decoded: <uuid>.txt (2048 bytes)` → `BrowserTabPool: download finished → …/minis-sessions/554171a5-…/workspace/`；三个文件各 **2048 B**、内容与 JS `blob.size` 一致，**就落在我这个沙箱的 `/var/minis/workspace`，直接 `ls` 可见**。
+3. **§1046-F9 R1⑤（file:// 伪装 fallback 被丢弃）✓** — `dropped non-http browser_fallback_url: file:///data/data/…/browser_tabs/x.json`，失败形态是「无反应」不是吐内部 JSON。
+4. **§1036-B3 ① 核心判据（scheme 不被当搜索）✓** — about:/data: 成功加载，17:2x 窗口搜索引擎 URL 命中 0。
+
+**部分**：R3（开关 20 次）实做 5–6 次，销毁路径完整但泄漏判据要 20 次带前后快照。
+
+**★ 三条新 P2（已登记 §VERIFY-1024-W2，各带触发条件）**：
+- **N1 预览屏下载静默**：`setDownloadListener` 只接在 `BrowserUseManager`，`WebViewHolder`/`FilePreviewScreen` 零接线 ⇒ 预览屏点下载**完全无反应无提示**。
+- **N2 blob 文件名被 UUID 化**：页面 `a.download='blob-tab-a.txt'` 被忽略，落地 `<uuid>.txt`。
+- **N3 地址栏 mailto 未转系统**：`E/BrowserUseManager: Navigation error: net::ERR_UNKNOWN_URL_SCHEME`，既不加载也不拉起邮件。
+
+**★ 方法教训**：
+- **`minis://` 链接点开走的是「文件预览屏」，不是浏览器 tab** ⇒ 凡要测浏览器行为（下载监听/UA/tab 池）必须让用户在**浏览器地址栏**输入 http URL，或部署外部页面。我第一次让用户点 minis:// 链接测 blob，结果测了个没有下载监听的容器，白跑一轮。
+- **自造测试页必须先在本地跑通语义**：`intent://VIEW#Intent;scheme=http;package=com.tencent.mm` 的 host=VIEW 让 intent 变成无效 `http://VIEW`，日志 `No app handles` 是页面 bug 不是 app bug —— 差点当成缺陷报。
+
+台账 **429 段 / no-触发条件 4（既有）/ 豁免 11**，新段 OK @ :8660。
+
+<!-- 2026-10-24 17:41:34 -->
+## 真机验证窗口 3（agent 自测批次）—— 2 条通过，1 条未取到样本，同一个假阳性踩了两次
+
+
+**通过**：
+- **`minis-contacts` 参数校验 ✓**：`list --max abc` / `list --max 0` / `search -n Alice` 三组**全 `exit=2`** + 精确文案（`--max expects an integer between 1 and …`）；正常 `list --max 20` → exit 0 + `[]`。
+- **`android-player` 全生命周期 ✓**：`play/status/pause/resume/seek/stop/list` 七条全 exit 0 + `{"ok":true}`；**`seek` 的参数名是 `position_ms`（整数）**，传 `0.5` → exit 2 报 `need <session> <position_ms>`（校验正确非缺陷）；`stop` 后 `list` 回 `count:0`。
+
+**未取到样本**：§COMPACT-BUDGET-1022（P0）。今天主日志 **`[Compact] summary` 一次都没出现**；会话虽反复触压缩线（`[CompactDiag] eAH v2 slice … agentHistory.size=388` 连续 10+ 次）但走的是 trim/eAH 路径不是 LLM summary。要验必须专项制造「大量 tool result 超 summary 阈值」的一次压缩。
+
+**★★ 同一个假阳性踩了两次（已升为规则，进 self-improving-agent）**：
+1. 第一次把 `giving up` 当压缩放弃 —— 实际是 `runAgentLoop` 空输出放弃 + 我自己命令回显。
+2. 第二次把 `24 summary SUCCESS / 8 summary TIMEOUT` 当压缩统计 —— **全部是我自己那条 `grep … | sort | uniq -c` 的输出被回显**。
+**根因**：`ToolChain` 把每条 `shell_execute` 的 `args`（命令全文）与 `stdout` 写进**同一个主日志**，于是「我 grep 的词」必然出现在日志里 = 自证循环。
+**规则**：对 app 主日志做关键词取证，**必须先剔除含 `ToolChain` / `ToolCallComplete` / `args={"command"` 的行**，或改用 tag 白名单正向过滤（`[Compact]` / `BrowserTabPool` / `BrowserUseManager` / `[ChatVMStream]`）。判据：命中行里出现命令全文或 `tool_title` ⇒ 是我自己的痕迹。
+
+**全窗口合计**（窗口 1+2+3）：P0/P1 欠账 55 条，**已清 15 条**（窗口1 7 + 窗口2 4 + 窗口3 2 + 两条 P0 部分）；新登记 P2 5 条（N1/N2/N3 + FIX-B 文案待核 + 压缩专项）。台账 429 段（W3 用 `###` 标题未被计入段数，内容仍完整）。
 
 ---
 
