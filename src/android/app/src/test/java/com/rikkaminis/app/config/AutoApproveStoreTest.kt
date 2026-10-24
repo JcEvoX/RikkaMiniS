@@ -4,7 +4,6 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
-import org.junit.BeforeClass
 import org.junit.Test
 
 /**
@@ -23,14 +22,10 @@ class AutoApproveStoreTest {
         private val prefs = FakeSharedPreferences()
 
         init {
+            // install() is idempotent and the store is a process singleton, so
+            // the fake is wired exactly once for the whole class.
             AutoApproveStore.install(prefs)
         }
-    }
-
-    @BeforeClass
-    @JvmStatic
-    fun primeDefaults() {
-        AutoApproveStore.disableAll()
     }
 
     @Before
