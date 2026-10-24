@@ -183,6 +183,64 @@ ON_DISPOSE_RE = re.compile(r"\bonDispose\s*\{")
 ON_PAGE_FINISHED = "override fun onPageFinished(view: WebView, url: String) {"
 PRINT_CALL_RE = re.compile(r"\bprintManager\s*\.\s*print\s*\(")
 SLOT_IDENTITY_RE = re.compile(r"\bprintWebView\s*!==\s*view\b")
+# [wide-1024] The guard may be spelled through the helper the file already has;
+# its body is then checked for a real `===` comparison (anchor rule: a helper is
+# only worth accepting when its own body does the work).
+SLOT_IDENTITY_HELPER_RE = re.compile(r"\bisCurrentPrintView\s*\(")
+SLOT_IDENTITY_HELPER_DECL = "internal fun isCurrentPrintView(owner: Any?, candidate: Any?): Boolean ="
+# A literal in front of the comparison makes the guard dead code — the whole
+# family of `false && guard` / `true || guard` rewrites.
+DEAD_GUARD_RE = re.compile(r"\bfalse\s*&&|\btrue\s*\|\|")
+CONTROL_FLOW_END_RE = re.compile(r"\b(return|throw)\b")
+
+
+def _if_statements(text):
+    """[(condition, branch_text)] for every `if (…)` in `text`.
+
+    Brace form yields the `{…}` block; a braceless branch yields the single
+    statement up to the end of the line. Unbalanced parentheses are skipped —
+    the caller treats "no usable guard" as a violation (fail-closed).
+    """
+    out = []
+    for m in re.finditer(r"\bif\s*\(", text):
+        p = text.find("(", m.start())
+        depth, j = 0, p
+        while j < len(text):
+            if text[j] == "(":
+                depth += 1
+            elif text[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        else:
+            continue
+        cond = text[p + 1: j]
+        k = j + 1
+        while k < len(text) and text[k] in " \t\r\n":
+            k += 1
+        if k < len(text) and text[k] == "{":
+            block = _block_at(text, k)
+            if block is None:
+                continue
+        else:
+            nl = text.find("\n", k)
+            block = text[k: nl if nl >= 0 else len(text)]
+        out.append((cond, block))
+    return out
+
+
+def _decl_text(code, decl):
+    """Body of a declaration: `{…}` for block form, the logical line(s) for `= …`."""
+    if code.count(decl) != 1:
+        return None
+    i = code.index(decl)
+    nl = code.find("\n", i)
+    head = code[i: nl if nl >= 0 else len(code)]
+    if "{" in head:
+        return grab_body(code, decl)
+    end = code.find("\n\n", i)
+    return code[i: end if end >= 0 else len(code)]
 
 
 def _block_at(text, open_idx):
@@ -258,7 +316,10 @@ def check_print_slot(src):
         if not released:
             problems.append("every `onDispose` in the preview must release the print slot "
                             "(call the releaser) — the slot is module state, not Compose state")
-    # (4) a superseded view must not start a print job
+    # (4) a superseded view must not start a print job — and the guard that
+    #     decides it must actually END the branch (wide-1024: comparing is not
+    #     skipping; `if (false && printWebView !== view)` and a guard body
+    #     without `return` both let a superseded view fall through to print).
     page = grab_body(code, ON_PAGE_FINISHED)
     if page is None:
         problems.append("`%s` must exist exactly once (anchor missing or duplicated)"
@@ -268,10 +329,38 @@ def check_print_slot(src):
         if first_print is None:
             problems.append("onPageFinished no longer starts a print job — the print path "
                             "moved, re-point this criterion")
-        elif not SLOT_IDENTITY_RE.search(page[: first_print.start()]):
-            problems.append("onPageFinished starts a print job without first checking that "
-                            "`view` is still the slot owner — a superseded view whose page "
-                            "finishes late starts a duplicate print dialog")
+        else:
+            head = page[: first_print.start()]
+            guards = [(cond, block) for cond, block in _if_statements(head)
+                      if SLOT_IDENTITY_RE.search(cond) or SLOT_IDENTITY_HELPER_RE.search(cond)]
+            if not guards:
+                problems.append("onPageFinished starts a print job without first checking that "
+                                "`view` is still the slot owner — a superseded view whose page "
+                                "finishes late starts a duplicate print dialog")
+            live = []
+            for cond, block in guards:
+                if DEAD_GUARD_RE.search(cond):
+                    problems.append(
+                        "onPageFinished's superseded-view guard is short-circuited (%r) — the "
+                        "comparison never runs, so the dead branch is what the slot gets"
+                        % cond.strip()[:60]
+                    )
+                    continue
+                if SLOT_IDENTITY_HELPER_RE.search(cond):
+                    helper = _decl_text(code, SLOT_IDENTITY_HELPER_DECL)
+                    if helper is None or "===" not in helper:
+                        problems.append(
+                            "onPageFinished delegates the identity guard to a helper that does "
+                            "not compare identity (`===`) — the guard has to be a real check"
+                        )
+                        continue
+                live.append((cond, block))
+            if guards and not any(CONTROL_FLOW_END_RE.search(block) for _c, block in live):
+                problems.append(
+                    "onPageFinished's superseded-view guard does not end control flow — the "
+                    "branch must `return` (or `throw`) so a superseded view cannot fall through "
+                    "into `printManager.print(...)`"
+                )
     return problems
 
 
@@ -551,6 +640,41 @@ SAF_CAPPED_COPY_RE = re.compile(r"\w*Capped\s*\(")
 SAF_CAP_CONST_RE = re.compile(r"MAX_[A-Z0-9_]*BYTES")
 SAF_CAP_CMP_RE = re.compile(r">\s*[\w.]*MAX_[A-Z0-9_]*BYTES")
 SAF_DECLARED_SIZE_RE = re.compile(r"\.SIZE\b|OpenableColumns")
+
+
+def _args_of(text, open_idx):
+    """Top-level comma-separated arguments of the call whose `(` is at open_idx.
+
+    None when the parentheses are unbalanced: the caller reports that as a
+    fail-closed violation instead of guessing the arguments.
+    """
+    depth, j = 0, open_idx
+    while j < len(text):
+        c = text[j]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    else:
+        return None
+    inner = text[open_idx + 1: j]
+    parts, depth, cur = [], 0, ""
+    for ch in inner:
+        if ch in "([{<":
+            depth += 1
+        elif ch in ")]}>":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        parts.append(cur)
+    return [p.strip() for p in parts]
 SAF_WHOLE_READS = (".readBytes()", ".readText()", "bufferedReader(", ".readLines()")
 
 # Sites this batch deliberately does not touch (radius: FIX-11 owns the two
@@ -652,6 +776,10 @@ def _saf_classify(text, idx, blocks):
 PREVIEW_SIG_RE = re.compile(r"^\s*private fun ([A-Za-z0-9_]+)Preview\(item: FileItem\)\s*\{")
 PDF_KEY_SOURCES = ("item.file", "renderer", "item")
 PRODUCE_STATE_RE = re.compile(r"produceState\b")
+# A key argument must BE a reference chain (`item.file`, `idx`, `renderer.epoch`).
+# Anything else — a lambda chain, an arithmetic expression, a literal — is judged
+# fail-closed: the criterion cannot prove the runtime key tracks the file.
+KEY_REF_RE = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*(?:\(\))?)*")
 
 
 def _call_paren(text, idx):
@@ -826,7 +954,19 @@ def check_preview_keys(src):
                 continue          # a type reference (`produceState<…>`), not a call
             keys = _produce_keys(body, m.end())
             hit = ", ".join(keys) if keys else "(no key argument at all)"
-            if not any(src_name in k for k in keys for src_name in PDF_KEY_SOURCES):
+            # [wide-1024] Compose compares the key VALUE, not its spelling. A key
+            # written `item.file.let { 0 }` still contains "item.file" and still
+            # compiles, but the runtime key is the constant 0 — the slot then
+            # survives every file switch. Accept only a plain reference chain.
+            opaque = [k for k in keys if not KEY_REF_RE.fullmatch(k)]
+            if opaque:
+                violations.append(
+                    "%s holds a produceState key that is not a plain data-source reference "
+                    "(%s) — the key's VALUE decides whether the producer restarts, so a chain "
+                    "call returning a constant freezes the slot across file switches"
+                    % (sig, ", ".join(opaque))
+                )
+            if not any(k == src or k.startswith(src + ".") for k in keys for src in PDF_KEY_SOURCES):
                 violations.append(
                     "%s holds a produceState whose key set misses its data source "
                     "(key set = %s) — the slot is reused across files, so the "
@@ -902,6 +1042,28 @@ def check_saf_imports(root):
                 "%s: readSafBytes must read through readAtMost — the cap has to be enforced "
                 "on the stream, not on a provider-reported size" % _saf_short(SAF_HELPER_REL)
             )
+        # [wide-1024] …and it has to be THE cap. A call with the right callee and
+        # an unbounded second argument (`Long.MAX_VALUE - 1L`) reads like a bounded
+        # read while materialising the whole provider document.
+        for m in re.finditer(r"\breadAtMost\s*\(", entry):
+            args = _args_of(entry, m.end() - 1)
+            if args is None or len(args) < 2:
+                violations.append(
+                    "%s: cannot read the readAtMost(...) arguments (fail-closed) — the cap "
+                    "argument is the whole bound and must stay readable"
+                    % _saf_short(SAF_HELPER_REL)
+                )
+                continue
+            cap_arg = args[1]
+            if not re.fullmatch(r"cap", cap_arg) and not re.fullmatch(
+                r"minOf\(\s*cap\b[^)]*\)", cap_arg
+            ):
+                violations.append(
+                    "%s: readSafBytes calls readAtMost(%s, %s) — the stream bound must be the "
+                    "caller's cap (`cap`, or `minOf(cap, …)`), not an unbounded value; a "
+                    "correct call with a wrong cap is still an unbounded read"
+                    % (_saf_short(SAF_HELPER_REL), args[0], cap_arg)
+                )
     if not SAF_CAP_CONST_RE.search(helper_code):
         violations.append(
             "%s: the SAF caps must stay named MAX_*_BYTES constants (the reason has to "
@@ -1087,6 +1249,15 @@ _SAF_HELPER = (
 
 _SAF_HELPER_NOCAP = _SAF_HELPER.replace("        if (total > cap) return null\n", "")
 
+# [wide-1024] The call is right, the cap is not: `readAtMost(input, Long.MAX_VALUE
+# - 1L)` still contains a `readAtMost(` token while materialising the whole
+# provider document before the heap dies.
+_SAF_HELPER_UNBOUNDED_CAP = _SAF_HELPER.replace(
+    "        val bytes = readAtMost(input, cap)\n",
+    "        val bytes = readAtMost(input, Long.MAX_VALUE - 1L)\n",
+)
+assert _SAF_HELPER_UNBOUNDED_CAP != _SAF_HELPER
+
 _SAF_PROVIDER_FIXED = (
     "package com.rikkaminis.app.ui.settings\n"
     "\n"
@@ -1209,6 +1380,8 @@ def _saf_fixture(shape="fixed"):
         helper = None
     elif shape == "helper_nocap":
         helper = _SAF_HELPER_NOCAP
+    elif shape == "helper_unbounded_cap":
+        helper = _SAF_HELPER_UNBOUNDED_CAP
     elif shape == "readtext":
         provider = _SAF_PROVIDER_READTEXT
     elif shape == "skills_baseline":
@@ -1258,6 +1431,9 @@ def selftest_saf_imports():
     arm("baseline bare reader", "no readSafBytes( call", shape="skills_baseline")
     arm("helper without a cap", "never compares the byte count against its cap",
         shape="helper_nocap")
+    # [wide-1024] a bounded-looking call with an unbounded cap argument.
+    arm("helper called with an unbounded cap", "must be the caller's cap",
+        shape="helper_unbounded_cap")
     arm("helper gone (fail-closed)", "no implementation left", shape="no_helper")
     arm("over-cap verdict swallowed", "must stay visible", shape="too_large_swallowed")
     arm("unregistered unbounded site", "with no bound", shape="sweep_extra_unregistered")
@@ -1581,6 +1757,15 @@ assert BAD_PDF_KEY_ONLY_IDX != GOOD_SRC
 # the derived criterion must fail closed instead of passing on zero subjects.
 BAD_NO_PREVIEW_ANCHORS = GOOD_SRC.replace("Preview(item: FileItem) {", "Pane(item: FileItem) {")
 assert BAD_NO_PREVIEW_ANCHORS != GOOD_SRC
+
+# [wide-1024] The key still SPELLS `item.file` while the runtime key is the
+# constant 0 — the old substring criterion passed this and the slot froze across
+# file switches (b.pdf showing a.pdf's cached page).
+BAD_PDF_KEY_OPAQUE = GOOD_SRC.replace(
+    "initialValue = null, key1 = idx, key2 = item.file) {",
+    "initialValue = null, key1 = idx, key2 = item.file.let { 0 }) {",
+)
+assert BAD_PDF_KEY_OPAQUE != GOOD_SRC
 def selftest():
     failures = []
 
@@ -1635,6 +1820,10 @@ def selftest():
     expect_trip("pdf produceState keyed on idx only", bad_pdf_idx, "misses its data source")
     bad_no_preview = check(BAD_NO_PREVIEW_ANCHORS)
     expect_trip("preview set gone (fail-closed)", bad_no_preview, "lost its subject")
+    # [wide-1024] key value, not key spelling.
+    bad_pdf_opaque = check(BAD_PDF_KEY_OPAQUE)
+    expect_trip("pdf produceState key rewritten to a constant", bad_pdf_opaque,
+                "not a plain data-source reference")
 
     # [da1026-F] fail-closed: a body that lost its anchor must be red, not skipped.
     missing_anchor = check(GOOD_SRC.replace(REMEMBER_ANCHORS[0], "private fun TextPreviewX(item: FileItem) {"))
@@ -1660,6 +1849,7 @@ def selftest():
     print("selftest anchors-fail-closed  -> 3 arms exercised")
     print("selftest pdf-key-only-idx     -> %d violation(s)" % len(bad_pdf_idx))
     print("selftest preview-set-gone     -> %d violation(s)" % len(bad_no_preview))
+    print("selftest pdf-key-opaque       -> %d violation(s)" % len(bad_pdf_opaque))
 
     # [deep-audit-1041 B-07] the second target's arms.
     failures.append("B-07 arms misbehaved" if selftest_log_share() else None)
@@ -1721,6 +1911,18 @@ def selftest():
         "}",
         "",
     ])
+    slot_helper = slot_clean.replace(
+        "            if (printWebView !== view) {",
+        "            if (!isCurrentPrintView(printWebView, view)) {",
+    ).replace(
+        "private fun releasePrintWebView() {",
+        "internal fun isCurrentPrintView(owner: Any?, candidate: Any?): Boolean =\n"
+        "    owner != null && owner === candidate\n"
+        "\n"
+        "private fun releasePrintWebView() {",
+    )
+    slot_helper_loose = slot_helper.replace("owner === candidate", "owner == candidate")
+
     slot_arms = (
         ("b05-clean", slot_clean, ()),
         ("b05-overwrite without release", slot_clean.replace(
@@ -1738,6 +1940,20 @@ def selftest():
             "                destroyPrintWebView(view)\n"
             "                return\n"
             "            }\n", ""), ("without first checking",)),
+        # [wide-1024] comparing is not skipping: the guard must survive
+        # short-circuiting AND must end the branch.
+        ("b05-guard short-circuited", slot_clean.replace(
+            "            if (printWebView !== view) {",
+            "            if (false && printWebView !== view) {"),
+         ("short-circuited",)),
+        ("b05-guard without return", slot_clean.replace(
+            "                destroyPrintWebView(view)\n"
+            "                return\n",
+            "                destroyPrintWebView(view)\n"),
+         ("does not end control flow",)),
+        ("b05-helper guard (clean)", slot_helper, ()),
+        ("b05-helper guard compares equality", slot_helper_loose,
+         ("does not compare identity",)),
         ("b05-slot declaration gone", slot_clean.replace(
             "private var printWebView: WebView? = null\n", ""),
          ("declared exactly once",)),
@@ -1750,7 +1966,12 @@ def selftest():
             print("  SELFTEST %s: OK (%d problem(s))" % (arm_name, len(got)))
         else:
             print("  SELFTEST %s: FAIL (want %r, got %r)" % (arm_name, want, got))
-            ok = False
+            failures.append(arm_name)
+    if failures:
+        for f in failures:
+            print("SELFTEST FAIL " + f)
+        print("FILEPREVIEW_PRINT_BOUNDED_SELFTEST=FAIL")
+        return 1
     print("FILEPREVIEW_PRINT_BOUNDED_SELFTEST=PASS")
     return 0
 
