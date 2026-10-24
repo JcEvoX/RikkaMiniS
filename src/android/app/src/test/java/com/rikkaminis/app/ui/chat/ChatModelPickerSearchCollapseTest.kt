@@ -130,14 +130,30 @@ class ChatModelPickerSearchCollapseTest {
     fun `without a query the sections still start collapsed`() {
         val code = sheet()
         assertTrue(
-            "the default must stay `all sections collapsed` — the seed has to keep deriving " +
-                "from the enabled instance set",
-            code.contains("var collapsedInstanceIds by remember(allInstanceIds)"),
+            "the default must stay `all sections collapsed` — the seed now delegates to the " +
+                "shared single source, whose `defaultExpanded = false` seeds every instance id " +
+                "(dv28/B-07: the private copy keyed on `instances.filter { it.isEnabled }`, so " +
+                "toggling any provider's enable switch re-seeded the whole set): " +
+                collapseSeed(code),
+            code.contains("var collapsedInstanceIds by rememberCollapsedInstanceIds(config)"),
+        )
+        assertTrue(
+            "the seed must NOT be derived from a filtered instance projection — the collapse " +
+                "set answers provider IDENTITY, and a filter on a user-mutable flag makes the " +
+                "key move under the user: $code",
+            !Regex("""instances\s*\.\s*filter\s*\{[^}]*\b(?:isEnabled|isHidden|pinned)\b""")
+                .containsMatchIn(code),
         )
         assertTrue(
             "the gate must read the query's EMPTINESS; inverting it folds every section while " +
                 "searching: ${collapseDecision(code)}",
             !collapseDecision(code).contains("searchText.isNotEmpty()"),
         )
+    }
+
+    /** The declaration that seeds the collapse state (for assertion messages). */
+    private fun collapseSeed(code: String): String {
+        val at = code.indexOf("collapsedInstanceIds by")
+        return if (at < 0) "<no delegated seed>" else code.substring(at - 4, at + 80)
     }
 }
