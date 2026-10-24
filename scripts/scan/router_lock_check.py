@@ -140,6 +140,52 @@ def _line(code, off):
     return code.count("\n", 0, off) + 1
 
 
+# [meta-audit-1024 / M5] SPELLING axis: WHERE the monitor object comes from.
+# `\bval\s+healthLock\b` only proves the NAME exists. A custom accessor —
+# `private val healthLock get() = Any()` — satisfies it while handing every
+# `synchronized(healthLock)` a BRAND-NEW monitor: two callers lock two
+# different objects, nothing is serialized, and every access is still "inside
+# a synchronized(healthLock) span" because the textual span check cannot see
+# the identity. That is the ISSUE-10/1018 defect restored with the gate green.
+# The criterion therefore pins the property SHAPE: a backing-field initializer,
+# evaluated once, one instance locked thereafter. A `by` delegate is rejected
+# too — fail-closed, identity is not statically confirmable.
+HEALTHLOCK_IDENTITY_CRIT = (
+    "healthLock is a stable monitor (backing-field initializer, not a per-access getter)"
+)
+
+
+def healthlock_identity(code):
+    """(ok, detail, offset) — is `healthLock` one stable object?
+
+    A custom getter is written either inline (`val healthLock get() = …`) or on
+    the following line (`val healthLock: Any\\n    get() = …`), so both lines are
+    inspected. No initializer at all is a violation (fail-closed).
+    """
+    m = re.search(r"\bval\s+healthLock\b", code)
+    if not m:
+        return (False, "no `val healthLock` declaration", 0)
+    window = code[m.end(): m.end() + 240]
+    nl = window.find("\n")
+    first = window if nl < 0 else window[:nl]
+    tail = "" if nl < 0 else window[nl + 1:]
+    nxt = tail.lstrip().split("\n")[0] if tail.strip() else ""
+    joined = first + ("\n" + nxt if re.match(r"\s*(get|set|by)\b", nxt) else "")
+    if re.search(r"\bget\s*\(", joined):
+        return (False,
+                "custom getter (`get() = …`) — every read builds a NEW monitor, so "
+                "`synchronized(healthLock)` serializes nothing", m.start())
+    if re.search(r"\bby\b", joined):
+        return (False,
+                "delegated property (`by …`) — monitor identity is not statically "
+                "confirmable (fail-closed)", m.start())
+    if "=" not in joined:
+        return (False,
+                "declaration carries no initializer — cannot confirm a stable "
+                "backing field (fail-closed)", m.start())
+    return (True, "backing field, one instance for the object's lifetime", m.start())
+
+
 def analyse_router(code):
     res = []
     declared = re.search(r"\bval\s+healthLock\b", code)
@@ -148,6 +194,13 @@ def analyse_router(code):
         declared is not None,
         "private val healthLock = Any()" if declared else "no `val healthLock` in code view",
         _line(code, declared.start()) if declared else 0,
+    ))
+    ok_id, detail_id, off_id = healthlock_identity(code)
+    res.append((
+        HEALTHLOCK_IDENTITY_CRIT,
+        ok_id,
+        detail_id,
+        _line(code, off_id) if off_id else 0,
     ))
     spans = synchronized_spans(code)
     health_spans = [(a, b) for (expr, a, b) in spans if "healthLock" in expr]
@@ -407,6 +460,17 @@ ROUTER_BREAKERS = {
         [("fun clearHealth() = synchronized(healthLock) { health.clear() }",
           "fun clearHealth() = synchronized(healthLock) { health.clear() }\n    fun snapshot(): Map<String, Int> = health")],
         "every health reference inside a synchronized(healthLock) span",
+    ),
+    # [meta-audit-1024 / M5] the name survives, the identity does not: every
+    # read mints a fresh monitor, so all four call sites lock different objects.
+    5: (
+        [("private val healthLock = Any()", "private val healthLock get() = Any()")],
+        HEALTHLOCK_IDENTITY_CRIT,
+    ),
+    # delegated property: identity is not statically confirmable (fail-closed)
+    6: (
+        [("private val healthLock = Any()", "private val healthLock by lazy { Any() }")],
+        HEALTHLOCK_IDENTITY_CRIT,
     ),
 }
 

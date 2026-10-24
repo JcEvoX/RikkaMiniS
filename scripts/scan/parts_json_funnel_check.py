@@ -589,7 +589,7 @@ def iter_image_video_faces(root):
             if not (img and vid and img != vid):
                 continue
             line_no = body.count("\n")
-            yield f"{os.path.relpath(path, root)} {name}()", body
+            yield f"{os.path.relpath(path, root)} {name}()", body, local
 
 
 def find_production_files(root):
@@ -666,14 +666,115 @@ def derive_parts_name_readers(source):
 # Dispatch arms in this codebase take two shapes, and both must count:
 #   - a `when` arm:   "mediaRef" -> { ... }
 #   - an equality test: type == "mediaRef"
-def has_media_ref_dispatch_arm(body):
-    """Does [body] dispatch on the modern serial name itself?"""
-    for line in body.split("\n"):
-        if MEDIA_REF_NAME not in line:
+#
+# [meta-audit-1024 / M5] DATAFLOW axis. Naming the arm is not counting the
+# row. Two adversarial shapes satisfy every spelling criterion above while
+# throwing the value away:
+#
+#     "mediaRef" -> Unit
+#     "toolResult" -> {
+#         value?.optJSONObject("mediaRef")
+#     }
+#
+# The first dispatches on the modern name and accumulates nothing; the second
+# performs the nested read as a bare statement and discards its result. Every
+# mediaRef row and every tool-produced image/video is still counted as zero —
+# the structural zero this gate exists to remove is back, gate green. So the
+# judgment has to be the FLOW: the arm must BIND (or pass on) what it read,
+# and it must MOVE a counter.
+ACCUM_RES = (
+    re.compile(r"\b\w+\s*\+=\s*[^=]"),          # vid += 1
+    re.compile(r"\b\w+\s*=\s*\w+\s*\+\s*\d"),   # vid = vid + 1
+    re.compile(r"\b\w+\s*\+\+"),                # vid++
+    re.compile(r"\+\+\s*\w+"),
+)
+NESTED_READ_RE = re.compile(r"(?:opt|get)(?:JSONObject)?\(\s*\"mediaRef\"\s*\)")
+
+
+def brace_balanced_arm(lines, start):
+    """Text of the arm (or `if` block) opening on line [start].
+
+    Brace-aware: a block arm ends where its own braces balance, so a nested
+    `if (...) { … }` cannot be mistaken for the end of the arm. An arm with no
+    block (`"mediaRef" -> img += 1`, `"mediaRef" -> Unit`) is its own line.
+    """
+    head = lines[start]
+    depth = head.count("{") - head.count("}")
+    out = [head]
+    if depth <= 0:
+        return head
+    for j in range(start + 1, len(lines)):
+        out.append(lines[j])
+        depth += lines[j].count("{") - lines[j].count("}")
+        if depth <= 0:
+            break
+    return "\n".join(out)
+
+
+def dispatch_arm(body, part_name):
+    """Text of the arm that dispatches on [part_name], or None.
+
+    Line-based, brace-balanced: the arm starts on the line that carries the
+    serial name next to an arrow/equality and ends where its braces close.
+    """
+    lines = body.split("\n")
+    for i, line in enumerate(lines):
+        if part_name in line and ("->" in line or "==" in line):
+            return brace_balanced_arm(lines, i)
+    return None
+
+
+def arm_accumulates(arm, local=None):
+    """Does [arm] MOVE a counter — directly, or through a same-file helper?
+
+    Derived, not spelling-bound: any `+=` / `++` / `x = x + n` counts, and so
+    does a call to a sibling function whose body does one (one hop, same file,
+    mirroring [expand_same_file]).
+    """
+    if not arm:
+        return False
+    if any(r.search(arm) for r in ACCUM_RES):
+        return True
+    if local:
+        for name in set(CALLEE_RE.findall(arm)):
+            callee = local.get(name)
+            if callee and callee != arm and any(r.search(callee) for r in ACCUM_RES):
+                return True
+    return False
+
+
+def nested_read_consumed(arm):
+    """Is the nested mediaRef read BOUND or PASSED ON, rather than discarded?
+
+    Three consuming shapes, all of them live in this codebase:
+      - bound and used:  `val media = value?.optJSONObject("mediaRef")` …
+                         later `isVideoMediaRef(media)`
+      - passed inline:   `isVideoMediaRef(value?.optJSONObject("mediaRef"))`
+      - chained:         `… .optJSONObject("mediaRef")?.let { … }`
+    A bare statement (`value?.optJSONObject("mediaRef")`) is none of them: the
+    read happens, the value is thrown away, nothing is counted.
+    """
+    for m in NESTED_READ_RE.finditer(arm):
+        line_start = arm.rfind("\n", 0, m.start()) + 1
+        nl = arm.find("\n", m.end())
+        line_end = len(arm) if nl < 0 else nl
+        before = arm[line_start:m.start()]
+        after = arm[m.end():line_end]
+        bm = re.search(r"\b(?:val|var)\s+(\w+)\s*=\s*[^=\n]*$", before)
+        if bm:
+            if re.search(r"\b" + re.escape(bm.group(1)) + r"\b", arm[m.end():]):
+                return True
             continue
-        if "->" in line or "==" in line:
+        if before.count("(") > before.count(")"):
+            return True          # the read sits inside another call's argument list
+        if re.match(r"\s*\?\.\s*(?:let|also|run|takeIf)\b", after):
             return True
     return False
+
+
+def tool_result_arm(body):
+    """Arm text for the `"toolResult"` dispatch, or None."""
+    return dispatch_arm(body, '"toolResult"')
 
 def check_tool_result_media_ref(root):
     """[R12 / C-EXP-NESTED] a face that quantifies media must also count the
@@ -693,26 +794,29 @@ def check_tool_result_media_ref(root):
     the toolResult arm — a `mediaRef` lookup in a different arm does not
     classify a tool result's media.
     """
-    tool_rows, missing_rows = [], []
+    tool_rows, missing_rows, silent_rows = [], [], []
     dispatchers = count_type_dispatchers(root)
     if dispatchers == 0:
         return ["[R12] FAIL no `type` dispatcher derived from the tree "
                 "(fail-closed: the reader set could not be established)"]
-    for where, surface in iter_image_video_faces(root):
+    for where, surface, local in iter_image_video_faces(root):
         if '"toolResult"' not in surface:
             continue
         tool_rows.append(where)
-        if tool_result_arm_reads_media_ref(surface):
-            continue
-        missing_rows.append(where)
+        if not tool_result_arm_reads_media_ref(surface):
+            missing_rows.append(where)
+        elif not tool_result_arm_counts(surface, local):
+            # reads the nested mediaRef but throws the value away
+            silent_rows.append(where)
     if not tool_rows:
         return [
             f"[R12] PASS no media-quantifying parts_json face dispatches on "
             f"{chr(34)}toolResult{chr(34)} ({dispatchers} type dispatchers derived) "
             "— nothing to count there"
         ]
+    findings = []
     if missing_rows:
-        return [
+        findings.append(
             f"[R12] FAIL {len(missing_rows)}/{len(tool_rows)} media-quantifying "
             f"parts_json faces dispatch on {chr(34)}toolResult{chr(34)} without "
             f"reading its nested mediaRef — {', '.join(missing_rows)}. A tool that "
@@ -720,36 +824,49 @@ def check_tool_result_media_ref(root):
             "toolResult.value.mediaRef, so such a face counts every tool-produced "
             "image/video as nothing — the same structural zero R11 grades, "
             "reached through a different door."
-        ]
+        )
+    if silent_rows:
+        findings.append(
+            f"[R12] FAIL {len(silent_rows)} media-quantifying parts_json faces read "
+            f"the nested mediaRef of their toolResult arm and DISCARD it — "
+            f"{', '.join(silent_rows)}. The lookup runs, its result reaches no "
+            "counter (a bare `value?.optJSONObject(\"mediaRef\")` statement, or a "
+            "binding nothing uses), so tool-produced images/videos still count as "
+            "zero while the arm looks correct."
+        )
+    if findings:
+        return findings
     return [
-        f"[R12] PASS all {len(tool_rows)} media-quantifying parts_json faces read "
-        f"the nested mediaRef of their toolResult arm ({', '.join(tool_rows)})"
+        f"[R12] PASS all {len(tool_rows)} media-quantifying parts_json faces bind "
+        f"and count the nested mediaRef of their toolResult arm "
+        f"({', '.join(tool_rows)})"
     ]
 
 def tool_result_arm_reads_media_ref(body):
     """Does the toolResult arm of [body] read a nested mediaRef?
 
-    Line-based arm extraction: the arm runs from the line that dispatches on
-    `"toolResult"` to the next line that dispatches on another part name (or
-    to the end of the body). A `mediaRef` lookup inside that span counts; one
-    in a sibling arm does not.
+    Arm-scoped (brace-balanced): a `mediaRef` lookup inside the toolResult arm
+    counts; one in a sibling arm does not.
     """
-    lines = body.split("\n")
-    start = None
-    for i, line in enumerate(lines):
-        if '"toolResult"' in line and ("->" in line or "==" in line):
-            start = i
-            break
-    if start is None:
+    arm = tool_result_arm(body)
+    return bool(arm) and MEDIA_REF_NAME in arm
+
+
+def tool_result_arm_counts(body, local=None):
+    """Does the toolResult arm CONSUME the nested read and MOVE a counter?
+
+    [meta-audit-1024 / M5] The spelling criterion above is satisfied by a bare
+    `value?.optJSONObject("mediaRef")` statement — the read happens, the value
+    is discarded, nothing is counted, and every tool-produced image/video is
+    still structurally zero. Consuming the read (bound/used, passed inline, or
+    chained) AND moving a counter are the two halves of "this face actually
+    quantifies tool media"; either one missing means the value never reaches a
+    counter.
+    """
+    arm = tool_result_arm(body)
+    if not arm:
         return False
-    end = len(lines)
-    for j in range(start + 1, len(lines)):
-        line = lines[j]
-        if MEDIA_REF_NAME in line and ("->" in line or "==" in line):
-            end = j
-            break
-    arm = "\n".join(lines[start:end])
-    return MEDIA_REF_NAME in arm
+    return nested_read_consumed(arm) and arm_accumulates(arm, local)
 
 def check_media_ref_dispatch(root):
     """[R11 / C-EXP] every parts_json face that ATTACHES quantization has to
@@ -766,18 +883,23 @@ def check_media_ref_dispatch(root):
     so demanding mediaRef handling there would only add noise; the property
     that matters is "image vs video, distinguished by part name".
     """
-    legacy_rows, both_rows, absent_rows = [], [], []
+    legacy_rows, both_rows, absent_rows, silent_rows = [], [], [], []
     dispatchers = 0
-    for where, surface in iter_image_video_faces(root):
+    for where, surface, local in iter_image_video_faces(root):
         body_lines = surface.split("\n")
         img = {i for i, l in enumerate(body_lines) if any(s in l for s in LEGACY_IMAGE_NAMES)}
         vid = {i for i, l in enumerate(body_lines) if any(s in l for s in LEGACY_VIDEO_NAMES)}
         if not (img and vid and img != vid):
             continue  # does not discriminate image vs video by part name
-        if has_media_ref_dispatch_arm(surface):
-            both_rows.append(where)
-        else:
+        arm = dispatch_arm(surface, MEDIA_REF_NAME)
+        if arm is None:
             legacy_rows.append(where)
+        elif not arm_accumulates(arm, local):
+            # dispatches on the modern name but the arm moves no counter:
+            # `"mediaRef" -> Unit` and friends — the row is still counted as 0
+            silent_rows.append(where)
+        else:
+            both_rows.append(where)
         absent_rows.append(where)
     dispatchers = count_type_dispatchers(root)
     if dispatchers == 0:
@@ -794,18 +916,32 @@ def check_media_ref_dispatch(root):
             f"({dispatchers} type dispatchers derived, none discriminates image vs "
             "video by part name) — nothing to classify"]
 
+    findings = []
     if legacy_rows:
-        return [
+        findings.append(
             f"[R11] FAIL {len(legacy_rows)}/{len(absent_rows)} image/video parts_json "
             f"faces split on the LEGACY part names only — {', '.join(legacy_rows)}. "
             f"Rows persisted today carry {MEDIA_REF_NAME} "
             f"(`{(MEDIA_REF_NAME,)}` plus nested toolResult variants), so this face "
             "quantifies nothing that exists: the export counters were summed per "
             "batch, written into session.json, and never incremented once."
-        ]
+        )
+    if silent_rows:
+        findings.append(
+            f"[R11] FAIL {len(silent_rows)} image/video parts_json faces dispatch on "
+            f"{MEDIA_REF_NAME} and MOVE NO COUNTER — {', '.join(silent_rows)}. The "
+            "arm names the modern part (so a name-matching check passes) but its "
+            "body never increments an accumulator: `\"mediaRef\" -> Unit`, or a "
+            "branch that only reads. Every mediaRef row is still counted as zero — "
+            "the structural zero this criterion grades, reached without dropping "
+            "the name."
+        )
+    if findings:
+        return findings
     return [
         f"[R11] PASS all {len(both_rows)} image/video parts_json faces classify "
-        f"{MEDIA_REF_NAME} alongside the legacy names ({', '.join(both_rows)})"
+        f"{MEDIA_REF_NAME} alongside the legacy names and move their counters "
+        f"({', '.join(both_rows)})"
     ]
 
 
@@ -1395,6 +1531,76 @@ def build_media_fixture(root, body, extra=None):
     return root
 
 
+# --- [meta-audit-1024 / M5] DATAFLOW witnesses ------------------------------
+# Adversarial shapes supplied by an external verifier. Both arms still NAME
+# the modern part and the toolResult arm still performs the nested lookup, so
+# every spelling criterion is satisfied — and nothing is counted.
+MEDIA_WITNESS_R11_ARM = (
+    '            "mediaRef" -> {\n'
+    '                if (isVideoMediaRef(value)) vid += 1 else img += 1\n'
+    '            }',
+    '            "mediaRef" -> Unit',
+)
+MEDIA_WITNESS_R12_ARM = (
+    '            "toolResult" -> {\n'
+    '                val media = value?.optJSONObject("mediaRef")\n'
+    '                if (media != null) {\n'
+    '                    if (isVideoMediaRef(media)) vid += 1 else img += 1\n'
+    '                }\n'
+    '            }',
+    '            "toolResult" -> {\n'
+    '                value?.optJSONObject("mediaRef")\n'
+    '            }',
+)
+
+
+def witness_shape(green):
+    """[green] with both counting arms replaced by their silent twins."""
+    out = green
+    for old, new in (MEDIA_WITNESS_R11_ARM, MEDIA_WITNESS_R12_ARM):
+        out = out.replace(old, new, 1)
+    return out
+
+
+MEDIA_WITNESS = witness_shape(MEDIA_GREEN)
+
+# Precision: counting DELEGATED to a same-file helper. The arm itself carries
+# no `+=`; the helper it calls does. A criterion that only accepts inline
+# increments would accuse a legitimate refactor — the same-file hop exists so
+# that moving the counters into a helper is not punished.
+MEDIA_DELEGATED = """package com.rikkaminis.app.share
+
+import org.json.JSONArray
+
+internal class Counters(var img: Int = 0, var vid: Int = 0)
+
+internal fun countPartsAttachments(arr: JSONArray): Pair<Int, Int> {
+    val c = Counters()
+    for (i in 0 until arr.length()) {
+        val obj = arr.optJSONObject(i) ?: continue
+        when (obj.optString("type")) {
+            "mediaRef" -> countInto(obj.optJSONObject("value"), c)
+            "toolResult" -> countInto(obj.optJSONObject("value")?.optJSONObject("mediaRef"), c)
+            "image", "image_url" -> c.img += 1
+            "video", "video_url" -> c.vid += 1
+        }
+    }
+    return c.img to c.vid
+}
+
+internal fun countInto(media: JSONObject?, c: Counters) {
+    if (media == null) return
+    if (isVideoMediaRef(media)) c.vid += 1 else c.img += 1
+}
+
+internal fun isVideoMediaRef(media: JSONObject?): Boolean {
+    if (media == null) return false
+    val mime = media.optString("mimeType")
+    return mime.startsWith("video/", ignoreCase = true)
+}
+"""
+
+
 def selftest():
     import tempfile
     import shutil
@@ -1585,6 +1791,23 @@ def selftest():
     # precision: image and video treated identically asserts nothing per-kind;
     # a modality-badge helper mentions the words but is not a parts face.
     media_arm("r11-precision-no-false-positive", MEDIA_PRECISION, None, "PASS")
+
+    # --- [meta-audit-1024 / M5] DATAFLOW arms -------------------------------
+    # The witness fixture must really be the mutated shape; if the anchor drifts
+    # the arms below would silently grade MEDIA_GREEN and "pass" while blind.
+    if MEDIA_WITNESS == MEDIA_GREEN:
+        print("  SELFTEST media-witness-binding: FAIL (arm replacement missed — "
+              "the witness fixture is the compliant one)")
+        bad += 1
+    else:
+        print("  SELFTEST media-witness-binding: OK (both counting arms replaced)")
+    # name matches, counter does not move: `"mediaRef" -> Unit`
+    media_arm("r11-witness-arm-without-count", MEDIA_WITNESS, None, "FAIL")
+    # read happens, result discarded: `value?.optJSONObject("mediaRef")`
+    r12_arm("r12-witness-arm-discards-read", MEDIA_WITNESS, "FAIL")
+    # delegated counting stays green (no false accusation on refactors)
+    media_arm("r11-delegated-count-stays-green", MEDIA_DELEGATED, None, "PASS")
+    r12_arm("r12-delegated-count-stays-green", MEDIA_DELEGATED, "PASS")
     # fail-closed: a tree with no derivable face is RED, not silently green.
     _tmp = tempfile.mkdtemp(prefix="r11-noface-")
     try:
