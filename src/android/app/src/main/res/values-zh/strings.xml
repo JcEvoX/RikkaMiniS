@@ -1682,4 +1682,23 @@
     <!-- Text-to-speech: spoken link phrases (VoiceTextSanitizer). -->
     <string name="tts_spoken_link_to_host">链接到%1$s</string>
     <string name="tts_spoken_bare_link">链接</string>
+
+    <!-- Auto-approve mode (config write skip + tool level lift + runtime batch grant) -->
+    <string name="perm_section_auto_approve">免确认模式</string>
+    <string name="perm_auto_approve_title">免确认模式</string>
+    <string name="perm_auto_approve_desc">常规设置变更直接生效，不再询问。敏感与破坏性变更仍可保留确认。</string>
+    <string name="perm_auto_approve_sensitive">包含敏感配置</string>
+    <string name="perm_auto_approve_sensitive_desc">敏感配置（服务商 API 密钥、接口地址）也直接生效，不再询问。智能体可能静默改动它们。</string>
+    <string name="perm_auto_approve_privileged">允许特权工具</string>
+    <string name="perm_auto_approve_privileged_desc">允许智能体使用无障碍与 Shizuku 命令行（它们能驱动其他应用、读取屏幕内容）。</string>
+    <string name="perm_auto_approve_footer">默认关闭。开启后，常规写入不再弹出确认框，工具调用不再弹权限询问。所有变更仍会记录在 日志 → 配置变更。</string>
+    <string name="perm_auto_approve_confirm_title">开启免确认模式？</string>
+    <string name="perm_auto_approve_confirm_text">常规设置变更将直接生效，不再弹确认框；工具调用也不再弹权限询问。敏感配置（服务商 API 密钥）与破坏性变更仍会确认。随时可以关掉。</string>
+    <string name="perm_auto_approve_confirm_on">开启</string>
+    <string name="perm_section_runtime_batch">系统权限</string>
+    <string name="perm_runtime_batch_desc">Android 会在你使用对应功能时逐个询问这些权限。现在一次性全部授予，之后就不会反复打断。</string>
+    <string name="perm_runtime_batch_title">一次授予全部系统权限</string>
+    <string name="perm_runtime_batch_sub">日历、联系人、位置、照片、麦克风、相机、通知</string>
+    <string name="perm_runtime_batch_all_granted">全部系统权限均已授予。</string>
+    <string name="perm_runtime_batch_partial">仍有 %1$d 项权限未授予 —— Android 拒绝或你跳过了。</string>
 </resources>

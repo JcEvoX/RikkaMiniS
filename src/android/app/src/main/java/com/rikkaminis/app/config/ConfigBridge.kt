@@ -1,5 +1,6 @@
 package com.rikkaminis.app.config
 
+import com.rikkaminis.app.config.confirm.ConfigAutoApprovePolicy
 import com.rikkaminis.app.config.confirm.ConfigConfirmationGate
 import com.rikkaminis.app.config.confirm.ConfirmOutcome
 import com.rikkaminis.app.config.confirm.PendingConfigChange
@@ -516,11 +517,37 @@ object ConfigBridge {
         // 2. Enqueue confirmation. Suspends until user acts or timeout —
         //    or skipped when the caller already collected user consent
         //    (see [skipConfirmation] doc).
-        val outcome: ConfirmOutcome = if (skipConfirmation) {
-            ConfirmOutcome.Approved(resolvedItems)
-        } else {
-            val pending = PendingConfigChange(items = resolvedItems, caption = caption)
-            ConfigConfirmationGate.requestConfirmation(pending)
+        //
+        //    [auto-approve] The user's opt-in "免确认模式" skips the dialog for
+        //    batches that pass [ConfigAutoApprovePolicy] (all-NORMAL rows by
+        //    default; SENSITIVE rows only behind their sub-flag; DESTRUCTIVE
+        //    rows never). Every skipped dialog is logged so the change remains
+        //    traceable in Logs → Config Changes.
+        //
+        //    A Resolved without a ConfigField (collection verbs like
+        //    `envvars.<key>`) carries no declared risk level — it maps to
+        //    SENSITIVE, i.e. confirmation is KEPT by default. Unscoped writes
+        //    touch env-var credentials too often to assume they are routine.
+        val resolvedRisks = resolved.map { it.field?.risk ?: ConfigRisk.SENSITIVE }
+        val autoSkip = !skipConfirmation &&
+            ConfigAutoApprovePolicy.shouldSkip(
+                risks = resolvedRisks,
+                autoApproveEnabled = AutoApproveStore.isEnabled,
+                sensitiveAutoApproveEnabled = AutoApproveStore.isSensitiveEnabled,
+            )
+        if (autoSkip) {
+            AppLogger.info(
+                TAG,
+                "auto-approve: dialog skipped for ${resolved.size} item(s) " +
+                    "(risk=${resolvedRisks.joinToString { it.name }} actor=$actorRaw)",
+            )
+        }
+        val outcome: ConfirmOutcome = when {
+            skipConfirmation || autoSkip -> ConfirmOutcome.Approved(resolvedItems)
+            else -> {
+                val pending = PendingConfigChange(items = resolvedItems, caption = caption)
+                ConfigConfirmationGate.requestConfirmation(pending)
+            }
         }
 
         // 3. Map outcome → confirmation status/user_message.

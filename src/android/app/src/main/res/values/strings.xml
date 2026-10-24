@@ -1757,4 +1757,23 @@
     <!-- Text-to-speech: spoken link phrases (VoiceTextSanitizer). -->
     Spoken when rewriting a bare URL before text-to-speech synthesis (device locale for the host name inserted).<string name="tts_spoken_link_to_host">link to %1$s</string>
     <string name="tts_spoken_bare_link">link</string>
+
+    <!-- Auto-approve mode (config write skip + tool level lift + runtime batch grant) -->
+    <string name="perm_section_auto_approve">Auto-approve</string>
+    <string name="perm_auto_approve_title">Auto-approve mode</string>
+    <string name="perm_auto_approve_desc">Apply routine settings changes without asking. Sensitive and destructive changes can still require confirmation.</string>
+    <string name="perm_auto_approve_sensitive">Include sensitive settings</string>
+    <string name="perm_auto_approve_sensitive_desc">Also apply provider credentials (API keys, base URLs) without asking. The agent could silently repoint them.</string>
+    <string name="perm_auto_approve_privileged">Allow privileged tools</string>
+    <string name="perm_auto_approve_privileged_desc">Let the agent use the accessibility and Shizuku command lines (they drive other apps and read the screen).</string>
+    <string name="perm_auto_approve_footer">Off by default. Turning this on stops the confirmation dialog for routine writes and stops permission prompts for agent tools. Every change is still logged under Logs → Config Changes.</string>
+    <string name="perm_auto_approve_confirm_title">Turn on auto-approve?</string>
+    <string name="perm_auto_approve_confirm_text">Routine settings changes will be applied without asking, and agent tools will run without permission prompts. Sensitive settings (provider API keys) and destructive changes still ask. You can turn this off any time.</string>
+    <string name="perm_auto_approve_confirm_on">Turn on</string>
+    <string name="perm_section_runtime_batch">System permissions</string>
+    <string name="perm_runtime_batch_desc">Android asks for these one at a time while you use each capability. Grant them all now in one sitting so they stop interrupting later.</string>
+    <string name="perm_runtime_batch_title">Grant all system permissions</string>
+    <string name="perm_runtime_batch_sub">Calendar, contacts, location, photos, microphone, camera, notifications</string>
+    <string name="perm_runtime_batch_all_granted">All system permissions already granted.</string>
+    <string name="perm_runtime_batch_partial">%1$d permission(s) still not granted — Android declined or you skipped them.</string>
 </resources>

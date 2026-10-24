@@ -2,6 +2,7 @@ package com.rikkaminis.app.offload
 
 import android.content.Context
 import android.content.SharedPreferences
+import com.rikkaminis.app.config.AutoApproveStore
 import com.rikkaminis.app.logging.AppLogger
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -546,12 +547,18 @@ object OffloadPermissionManager {
         val info = toolRegistry.find { it.toolName == toolName }
             ?: return PermissionLevel.BYPASS // Unknown tools are bypassed
 
-        val stored = prefs.getString("level_$toolName", null)
-        return if (stored != null) {
-            try { PermissionLevel.valueOf(stored) } catch (_: Exception) { info.defaultLevel }
-        } else {
-            info.defaultLevel
+        // A stored value is the user's explicit choice for this row. It wins
+        // over the auto-approve overlays (see OffloadPermissionLevelPolicy).
+        val stored = prefs.getString("level_$toolName", null)?.let {
+            try { PermissionLevel.valueOf(it) } catch (_: Exception) { null }
         }
+        return OffloadPermissionLevelPolicy.resolve(
+            storedLevel = stored,
+            defaultLevel = info.defaultLevel,
+            isPrivilegedTool = info.category == PermissionCategory.INTEGRATIONS,
+            autoApproveEnabled = AutoApproveStore.isEnabled,
+            privilegedToolsEnabled = AutoApproveStore.isPrivilegedToolsEnabled,
+        )
     }
 
     fun setLevel(toolName: String, level: PermissionLevel) {
