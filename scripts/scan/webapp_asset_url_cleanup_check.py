@@ -47,6 +47,22 @@ the private `FloatingToolbar` composable, and `fullscreen` locals in other
 files — the arms are keyed on "a fullscreen-named snapshot state", not on the
 word `fullscreen` itself.
 
+[deep-audit-1048 B-06] the primary action had no in-flight guard and the sheet
+had no "I am gone" latch. Two arms, both derived from the sheet's own
+`remember` states (renames do not evade them):
+
+  arm13 (C-PIN): the CTA's `enabled` expression must reference a `remember`
+        state that the CTA's own click entry checks BEFORE setting it true
+        (read-then-set in one frame — `enabled` alone cannot stop a second tap
+        that lands before the next recomposition).
+  arm14 (C-CLOSE): a `remember` boolean set true by a teardown hook
+        (`onDismissRequest` / `onDispose` / a click that calls `onDismiss()`,
+        the last one being the only hook an external `webAppSheetTarget = null`
+        removal runs) must be consumed as a guard AFTER the staging
+        `withContext(Dispatchers.IO)` and BEFORE both
+        `webAppShortcutRepository.create(` and `ShortcutPinner.pin(`. Order is
+        judged: a guard placed after `create(` does not stop the row insert.
+
 [dv21-B04 B-08] the pin verdict was silent on two carriers and the tile
 decode ran on the composition thread. Three anchors, all on the decision
 point (never on the call spelling):
@@ -245,8 +261,13 @@ fun AddToHomeSheet(source: WebAppSource, onDismiss: () -> Unit) {
         if (!pinned) f.delete()
         Unit
     }
+    var isPinning by remember { mutableStateOf(false) }
+    var sheetClosed by remember { mutableStateOf(false) }
     DisposableEffect(Unit) {
-        onDispose { cleanupCopiedAttachment() }
+        onDispose {
+            sheetClosed = true
+            cleanupCopiedAttachment()
+        }
     }
     var parsedTitle by remember { mutableStateOf<String?>(null) }
     var titleText by remember(fileName) { mutableStateOf(webAppTitleFallback(fileName)) }
@@ -261,16 +282,41 @@ fun AddToHomeSheet(source: WebAppSource, onDismiss: () -> Unit) {
             titleText = sanitizeSingleLineInput(it)
         },
     )
-    OutlinedButton(onClick = onDismiss) { Text(stringResource(R.string.cancel)) }
-    scope.launch {
-        if (ok) {
-            pinned = true
-        } else {
-            runCatching { app.webAppShortcutRepository.delete(entity.id) }
-            cleanupCopiedAttachment()
-        }
+    ModalBottomSheet(onDismissRequest = {
+        sheetClosed = true
         onDismiss()
-    }
+    })
+    OutlinedButton(onClick = {
+        sheetClosed = true
+        onDismiss()
+    }) { Text(stringResource(R.string.cancel)) }
+    Button(
+        enabled = pinActionEnabled(copiedFile != null, titleText.isNotBlank(), isPinning, sheetClosed),
+        onClick = {
+            if (isPinning) return@Button
+            isPinning = true
+            scope.launch {
+                try {
+                    val iconBitmap = withContext(Dispatchers.IO) { renderIconBitmap() }
+                    if (!pinShouldCommit(closed = sheetClosed, inFlight = isPinning)) {
+                        cleanupCopiedAttachment()
+                        return@launch
+                    }
+                    val entity = app.webAppShortcutRepository.create(htmlPath = "x")
+                    val ok = ShortcutPinner.pin(context, entity, iconBitmap)
+                    if (ok) {
+                        pinned = true
+                    } else {
+                        runCatching { app.webAppShortcutRepository.delete(entity.id) }
+                        cleanupCopiedAttachment()
+                    }
+                    onDismiss()
+                } finally {
+                    isPinning = false
+                }
+            }
+        },
+    ) { Text(stringResource(R.string.webapp_sheet_cta)) }
 }
 """
 
@@ -628,14 +674,22 @@ def check_activity_arm6(src: str) -> bool:
 
 
 def check_sheet_arm3(src: str) -> bool:
-    """The universal hook must funnel cleanup: a DisposableEffect onDispose
-    referencing cleanupCopiedAttachment is the accepted shape; a file
-    without any DisposableEffect must clean up in the Cancel callback."""
+    """The universal hook must funnel cleanup: a DisposableEffect whose
+    `onDispose` block reaches `cleanupCopiedAttachment()`; a file without any
+    DisposableEffect must clean up in the Cancel callback.
+
+    [deep-audit-1048 B-06] The check used to require the single line
+    `onDispose { cleanupCopiedAttachment() }`. B-06 needs a second statement in
+    that block (the sheet-closed latch), so the anchor is now derived from the
+    block itself — same intent (the hook that every disappearance path funnels
+    through must clean up), no longer a spelling lock.
+    """
     code = strip_comments(src)
     if "cleanupCopiedAttachment()" not in code:
         return False
-    if "onDispose { cleanupCopiedAttachment() }" in code:
-        return True
+    for m in re.finditer(r"onDispose\s*\{", code):
+        if "cleanupCopiedAttachment()" in _brace_block(code, m.end() - 1):
+            return True
     return "DisposableEffect(" not in code and "onClick = { cleanupCopiedAttachment()" in code
 
 
@@ -690,6 +744,119 @@ def check_sheet_arm7(src: str) -> bool:
     brace = code.find("{", eff.end())
     body = _brace_block(code, brace) if brace >= 0 else ""
     return "userEditedTitle" in body
+
+
+DELEGATED_STATE_RE = re.compile(r"\bvar\s+(\w+)\s*(?::[^=\n]+)?\s+by\s+remember\b")
+BUTTON_CALL_RE = re.compile(r"(?<![\w.])Button\s*\(")
+
+
+def _delegated_states(code: str):
+    """Names declared as `var X [by] remember` — the sheet's own state."""
+    return set(DELEGATED_STATE_RE.findall(code))
+
+
+def _top_level_expr_after(block: str, key: str) -> str:
+    """Text after `key =` inside `block`, up to the first depth-0 comma."""
+    m = re.search(r"\b%s\s*=" % re.escape(key), block)
+    if not m:
+        return ""
+    depth = 0
+    out = []
+    for ch in block[m.end():]:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif ch == "," and depth == 0:
+            break
+        out.append(ch)
+    return "".join(out)
+
+
+def check_sheet_arm13(src: str) -> bool:
+    """[deep-audit-1048 B-06] C-PIN: the CTA carries an in-flight state.
+
+    Decision point (not the call spelling): the CTA's `enabled` expression
+    mentions a `remember` state, and the CTA's own `onClick` body tests that
+    state BEFORE assigning it true. Fail-closed when the sheet has no
+    `Button(enabled = ...)` at all — the anchor moved."""
+    code = strip_comments(src)
+    states = _delegated_states(code)
+    if not states:
+        return False
+    for m in BUTTON_CALL_RE.finditer(code):
+        block = _paren_block(code, m.end() - 1)
+        enabled_expr = _top_level_expr_after(block, "enabled")
+        if not enabled_expr:
+            continue
+        named = {w for w in re.findall(r"\b[A-Za-z_]\w*\b", enabled_expr)} & states
+        if not named:
+            continue
+        click_at = block.find("onClick")
+        if click_at < 0:
+            continue
+        brace = block.find("{", click_at)
+        click = _brace_block(block, brace) if brace >= 0 else ""
+        for name in named:
+            set_at = re.search(r"\b%s\s*=\s*true\b" % re.escape(name), click)
+            if not set_at:
+                continue
+            head = click[:set_at.start()]
+            for cond in re.finditer(r"if\s*\(", head):
+                if re.search(r"\b%s\b" % re.escape(name), _paren_block(head, cond.end() - 1)):
+                    return True
+    return False
+
+
+def check_sheet_arm14(src: str) -> bool:
+    """[deep-audit-1048 B-06] C-CLOSE: a cancelled sheet must not commit.
+
+    A `remember` boolean latched true by a teardown hook must be consumed, in
+    the coroutine that calls `ShortcutPinner.pin(`, after the staging
+    `withContext(Dispatchers.IO)` and before both the row insert and the pin.
+    Fail-closed when there is no pin call or no teardown hook."""
+    code = strip_comments(src)
+    states = _delegated_states(code)
+    if not states:
+        return False
+    hooks = []
+    for m in re.finditer(r"onDismissRequest\s*=\s*\{", code):
+        hooks.append(_brace_block(code, m.end() - 1))
+    for m in re.finditer(r"onDispose\s*\{", code):
+        hooks.append(_brace_block(code, m.end() - 1))
+    for m in re.finditer(r"onClick\s*=\s*\{", code):
+        block = _brace_block(code, m.end() - 1)
+        # A CTA that runs the pin also ends with `onDismiss()`, but it is not a
+        # teardown hook — its `isPinning = true` would otherwise masquerade as a
+        # close latch (and make this arm green with the latch deleted).
+        if "onDismiss()" in block and ".launch" not in block:
+            hooks.append(block)
+    latched = set()
+    for hook in hooks:
+        latched |= {w for w in re.findall(r"\b(\w+)\s*=\s*true\b", hook)}
+    latched &= states
+    if not latched:
+        return False
+    for m in re.finditer(r"\.launch\s*\{", code):
+        body = _brace_block(code, m.end() - 1)
+        pin_at = body.find("ShortcutPinner.pin(")
+        if pin_at < 0:
+            continue
+        create_at = body.find("webAppShortcutRepository.create(")
+        if create_at < 0:
+            return False
+        io_at = body.find("withContext(Dispatchers.IO)")
+        if io_at < 0:
+            return False
+        for cond in re.finditer(r"if\s*\(", body[:create_at]):
+            if cond.start() < io_at:
+                continue  # a guard about the target, not about the closed sheet
+            cond_text = _paren_block(body, cond.end() - 1)
+            if any(re.search(r"\b%s\b" % re.escape(n), cond_text) for n in latched):
+                return cond.start() < pin_at
+    return False
 
 
 DECODE_CALLS = ("decodeFileBounded", "loadBitmapFromUri")
@@ -942,6 +1109,10 @@ def evaluate_tree(root: str):
         failures.append("arm8b")
     if not check_sheet_arm9(sheet):
         failures.append("arm9")
+    if not check_sheet_arm13(sheet):
+        failures.append("arm13")
+    if not check_sheet_arm14(sheet):
+        failures.append("arm14")
     if not check_mount_arm_snapshot_retry(resolver):
         failures.append("arm10")
     if not check_activity_failure_guard(act):
@@ -956,10 +1127,11 @@ def run_on_tree(root: str) -> int:
     if failures:
         print(f"[webapp-asset-url] FAIL arms={','.join(failures)}")
         return 1
-    print("[webapp-asset-url] PASS all 13 arms "
+    print("[webapp-asset-url] PASS all 15 arms "
           "(asset-url single source ×2, sheet cleanup ×2, fullscreen single source ×2, "
           "title seed + user-edit guard ×1, pin verdict ×2, decode off the "
-          "composition thread ×1, mount cold-start snapshot retry ×3)")
+          "composition thread ×1, sheet in-flight guard ×1, sheet close latch ×1, "
+          "mount cold-start snapshot retry ×3)")
     return 0
 
 def selftest() -> int:
@@ -971,7 +1143,9 @@ def selftest() -> int:
             ("arm1-violation", VIOLATION_ARM1, COMPLIANT_SHEET, False),
             ("arm2-violation", VIOLATION_ARM2, COMPLIANT_SHEET, False),
             ("arm3-violation", COMPLIANT_ACTIVITY, COMPLIANT_SHEET.replace(
-                "onDispose { cleanupCopiedAttachment() }", "onDispose { onDismiss() }"), False),
+                "        onDispose {\n            sheetClosed = true\n"
+                "            cleanupCopiedAttachment()\n        }",
+                "        onDispose {\n            onDismiss()\n        }"), False),
             ("arm4-violation", COMPLIANT_ACTIVITY, COMPLIANT_SHEET.replace(
                 "runCatching { app.webAppShortcutRepository.delete(entity.id) }", "cleanupOnly()"), False),
             ("arm5-violation double source (plain field + keyed copy)",
@@ -1102,6 +1276,48 @@ def selftest() -> int:
             else:
                 print(f"[webapp-asset-url] SELFTEST FAIL {name}: "
                       f"got={got} want={want}")
+                ok = False
+        # [deep-audit-1048 B-06] arm13/arm14: each targeted violation trips its
+        # OWN arm (the other stays green), and the compliant sheet is green —
+        # the arms key on the sheet's own state names, so a rename must not
+        # matter (checked by the "renamed state" case below).
+        for name, sheet, want in (
+            ("b06-no-inflight", COMPLIANT_SHEET.replace(
+                "enabled = pinActionEnabled(copiedFile != null, titleText.isNotBlank(), "
+                "isPinning, sheetClosed)",
+                "enabled = copiedFile != null && titleText.isNotBlank()"), (True, False)),
+            ("b06-no-click-guard", COMPLIANT_SHEET.replace(
+                "            if (isPinning) return@Button\n", ""), (True, False)),
+            ("b06-no-close-latch",
+             re.sub(r"^\s*sheetClosed = true\n", "", COMPLIANT_SHEET, flags=re.M),
+             (False, True)),
+            ("b06-guard-after-create", COMPLIANT_SHEET.replace(
+                "                    if (!pinShouldCommit(closed = sheetClosed, "
+                "inFlight = isPinning)) {\n"
+                "                        cleanupCopiedAttachment()\n"
+                "                        return@launch\n"
+                "                    }\n"
+                "                    val entity = app.webAppShortcutRepository.create("
+                "htmlPath = \"x\")\n",
+                "                    val entity = app.webAppShortcutRepository.create("
+                "htmlPath = \"x\")\n"
+                "                    if (!pinShouldCommit(closed = sheetClosed, "
+                "inFlight = isPinning)) {\n"
+                "                        cleanupCopiedAttachment()\n"
+                "                        return@launch\n"
+                "                    }\n"), (False, True)),
+            ("b06-renamed-states stay green",
+             COMPLIANT_SHEET.replace("isPinning", "busy").replace("sheetClosed", "gone"),
+             (False, False)),
+        ):
+            bad13 = not check_sheet_arm13(sheet)
+            bad14 = not check_sheet_arm14(sheet)
+            if (bad13, bad14) == want:
+                print(f"[webapp-asset-url] selftest ok {name}: "
+                      f"arm13 red={bad13}, arm14 red={bad14}")
+            else:
+                print(f"[webapp-asset-url] SELFTEST FAIL {name}: "
+                      f"arm13 red={bad13}, arm14 red={bad14} (want {want})")
                 ok = False
         if ok:
             print("WEBAPP_ASSET_URL_CLEANUP_SELFTEST=PASS")

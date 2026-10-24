@@ -166,9 +166,22 @@ internal suspend fun executeBrowserUseTool(
         val fetchData = result.fetchedFileData
         val fetchName = result.fetchedFileName
         if (fetchData != null && fetchName != null) {
-            artifactWriter(fetchName, fetchData)
-            linuxPathToMinisURL("/var/minis/browser/$fetchName")?.let {
-                output = "$output\nminis_url: $it"
+            // [deep-audit-1048 B-03] Same contract as the screenshot arm above:
+            // the writer returns the HOST path and null when the write failed.
+            // This arm discarded the return value, so a failed write still
+            // appended `minis_url: /var/minis/browser/<name>` — handing the
+            // agent a URL for a file that does not exist, with no signal that
+            // the fetched bytes were lost (the next read_image / file read then
+            // fails for a reason that points at the wrong layer).
+            val fetchPersistPath = artifactWriter(fetchName, fetchData)
+            if (fetchPersistPath != null) {
+                linuxPathToMinisURL("/var/minis/browser/$fetchName")?.let {
+                    output = "$output\nminis_url: $it"
+                }
+            } else {
+                output = "$output\n(fetched file not persisted: $fetchName — " +
+                    "the bytes could not be written to /var/minis/browser/, " +
+                    "do not reference it)"
             }
         }
 

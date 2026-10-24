@@ -459,6 +459,14 @@ private fun deleteSessionAndCleanup(chatRepository: ChatRepository, id: String) 
             }
             com.rikkaminis.app.service.SessionBadgeStore.clear(id)
         }
+        // [deep-audit-1048 B-05] `deleteSession` reclaims the session's on-disk
+        // tree (minis-sessions/<id>: workspace / attachments / offloads /
+        // browser) and the Storage page caches a process-lifetime snapshot that
+        // sizes exactly those directories — so without this the deleted
+        // session's bytes stayed in the totals for the life of the process.
+        // Unconditional on purpose: the reclamation can be partial (read-only
+        // mount, IO error) and the cached numbers are stale either way.
+        com.rikkaminis.app.ui.settings.invalidateStorageSnapshot()
     }
 }
 
