@@ -24,7 +24,7 @@ import java.io.File
  *     has carried the cwd since da1015. Every relative `--file` failed.
  *
  * The pure halves live in the two handlers' companion objects
- * (`parseContactsCommand` / `listMax` / `resolveMaybeRelative`) so the
+ * (`parseContactsCommand` / `resolvePageSize` / `resolveMaybeRelative`) so the
  * behaviour is pinned off-device; the wiring half (dispatch really goes
  * through the parsed args, all three `--file` call sites really pass the cwd)
  * is asserted against the compiled sources, the `FastioWiringTest` shape.
@@ -119,39 +119,97 @@ class OffloadCliArgsTest {
         assertTrue(parse("-h").args.hasFlag("h", "help"))
     }
 
-    // ── A'. `list --max` resolution (was the raw-argv scan `parseMax`) ────────
+    // ── A'. the `--max` / `-n` page-size contract (dv28-A6, A-06) ────────────
+    //
+    // Three ways a SPELLED page size used to be treated as "nothing spelled":
+    // `--max abc` fell back to the default (50 list / 20 search) at exit 0;
+    // `--max 0` / `-n 0` / a negative value handed 0 to `collectContactPage`,
+    // whose `rows.size < max` loop exits at once — an empty page `[]` at exit 0,
+    // indistinguishable from "no contacts"; and `search -n abc Alice` left
+    // "abc" in the query slot (the alias binds only a numeric value) and
+    // searched for it, dropping "Alice".
+    // [ContactsOffloadHandler.resolvePageSize] now answers a sealed outcome
+    // instead of collapsing all three onto an Int.
 
-    private fun maxOf(vararg argv: String) =
-        ContactsOffloadHandler.listMax(OffloadArgs(argv.toList(), booleanFlags = setOf("help", "h")))
+    private fun okValue(size: ContactsOffloadHandler.PageSize): Int = when (size) {
+        is ContactsOffloadHandler.PageSize.Ok -> size.value
+        is ContactsOffloadHandler.PageSize.Invalid ->
+            throw AssertionError("expected a usable page size, got a refusal: ${size.message}")
+    }
+
+    private fun refusal(size: ContactsOffloadHandler.PageSize): String = when (size) {
+        is ContactsOffloadHandler.PageSize.Ok ->
+            throw AssertionError("expected a refusal, got the page size ${size.value}")
+        is ContactsOffloadHandler.PageSize.Invalid -> size.message
+    }
+
+    /** The real CLI path: the alias is bound first, then the shared parser. */
+    private fun cliPageSize(vararg argv: String): ContactsOffloadHandler.PageSize =
+        ContactsOffloadHandler.resolvePageSize(parse(*argv).args)
 
     @Test
     fun `max defaults to 50 when absent`() {
-        assertEquals(50, maxOf("list"))
+        assertEquals(50, okValue(cliPageSize("list")))
     }
 
     @Test
     fun `max reads the named value after the subcommand`() {
-        assertEquals(10, maxOf("list", "--max", "10"))
+        assertEquals(10, okValue(cliPageSize("list", "--max", "10")))
     }
 
     /** The `=` spelling was invisible to the old raw-argv scan. */
     @Test
     fun `max reads the equals spelling`() {
-        assertEquals(10, maxOf("list", "--max=10"))
+        assertEquals(10, okValue(cliPageSize("list", "--max=10")))
     }
 
     /** The legacy undocumented `-n N` form must not regress. */
     @Test
     fun `max keeps the legacy short form`() {
-        assertEquals(10, maxOf("list", "-n", "10"))
+        assertEquals(10, okValue(cliPageSize("list", "-n", "10")))
     }
 
+    /** The default answers an ABSENT option only — never an unreadable one. */
     @Test
-    fun `unparseable or absent values fall back to the default`() {
-        assertEquals(50, maxOf("list", "--max", "abc"))
-        assertEquals(50, maxOf("list", "-n", "abc"))
-        assertEquals(50, maxOf("list", "-n"))
-        assertEquals(50, maxOf("list", "10"))
+    fun `a non-numeric page size is refused, not replaced by the default`() {
+        assertEquals(
+            "--max expects an integer between 1 and 500, got 'abc'",
+            refusal(cliPageSize("list", "--max", "abc")),
+        )
+        // search's documented default (20) must not swallow it either.
+        assertEquals(
+            "--max expects an integer between 1 and 500, got 'abc'",
+            refusal(cliPageSize("search", "--max", "abc", "Alice")),
+        )
+    }
+
+    /** `--max` with no follower binds no value at all (it becomes a flag). */
+    @Test
+    fun `a bare --max is refused`() {
+        assertTrue(refusal(cliPageSize("list", "--max")).contains("--max expects"))
+        assertTrue(refusal(cliPageSize("list", "--max=")).contains("--max expects"))
+    }
+
+    /** 0 and negatives produced an empty page at exit 0 before this. */
+    @Test
+    fun `zero and negative page sizes are refused`() {
+        assertTrue(refusal(cliPageSize("list", "--max", "0")).contains("got 0"))
+        assertTrue(refusal(cliPageSize("list", "--max", "-5")).contains("got -5"))
+        assertTrue(refusal(cliPageSize("search", "-n", "0", "Alice")).contains("got 0"))
+    }
+
+    /** The bound is a named constant: 500 passes, 501 is refused. */
+    @Test
+    fun `the upper bound is inclusive at 500`() {
+        assertEquals(500, okValue(cliPageSize("list", "--max", "500")))
+        assertTrue(refusal(cliPageSize("list", "--max", "501")).contains("got 501"))
+        assertEquals(500, ContactsOffloadHandler.MAX_PAGE_SIZE)
+    }
+
+    /** A positional number is not a page size — the default still answers. */
+    @Test
+    fun `an unrelated positional token is not read as the page size`() {
+        assertEquals(50, okValue(cliPageSize("list", "10")))
     }
 
     // ── A''. the legacy `-n` alias really binds a value (dv14-A1, ISSUE-01) ──
@@ -162,8 +220,9 @@ class OffloadCliArgsTest {
     // "Alice". [ContactsOffloadHandler.bindLegacyShortMax] rewrites the alias to
     // `--max` before the parse, for the two subcommands that have a page size.
 
-    private fun searchMaxOf(vararg argv: String): Int =
-        ContactsOffloadHandler.listMax(parse(*argv).args, 20)
+    private fun searchMaxOf(vararg argv: String): Int = okValue(
+        ContactsOffloadHandler.resolvePageSize(parse(*argv).args, 20),
+    )
 
     @Test
     fun `legacy -n before the query binds the page size and keeps the query`() {
@@ -182,14 +241,22 @@ class OffloadCliArgsTest {
 
     @Test
     fun `legacy -n reaches the list resolver through the parse`() {
-        assertEquals(10, ContactsOffloadHandler.listMax(parse("list", "-n", "10").args))
+        assertEquals(10, okValue(ContactsOffloadHandler.resolvePageSize(parse("list", "-n", "10").args)))
     }
 
+    /**
+     * The alias still only REWRITES a numeric value — but a surviving `-n` is
+     * now a usage error instead of a stray flag: its token would otherwise sit
+     * in the query slot (`search -n abc Alice` searched for "abc" and dropped
+     * "Alice"). Fail-closed on purpose: `-n` is documented as a page size.
+     */
     @Test
-    fun `the alias only rewrites a numeric value`() {
-        val c = parse("search", "-n", "Alice")
-        assertEquals("Alice", c.args.positional.getOrNull(1))
-        assertEquals(20, searchMaxOf("search", "-n", "Alice"))
+    fun `a surviving -n is refused instead of taking the query slot`() {
+        val c = parse("search", "-n", "abc", "Alice")
+        assertEquals("abc", c.args.positional.getOrNull(1))
+        assertTrue(
+            refusal(ContactsOffloadHandler.resolvePageSize(c.args, 20)).contains("-n expects"),
+        )
         assertEquals(
             listOf("search", "-n", "Alice"),
             ContactsOffloadHandler.bindLegacyShortMax(listOf("search", "-n", "Alice")),
@@ -228,7 +295,7 @@ class OffloadCliArgsTest {
         val c = parse("-n", "10", "list")
         assertEquals("list", c.sub)
         assertNull(c.id)
-        assertEquals(10, ContactsOffloadHandler.listMax(c.args))
+        assertEquals(10, okValue(ContactsOffloadHandler.resolvePageSize(c.args)))
     }
 
     @Test
@@ -236,7 +303,7 @@ class OffloadCliArgsTest {
         val c = parse("--compact", "-n", "10", "list")
         assertEquals("list", c.sub)
         assertTrue(c.args.hasFlag("compact"))
-        assertEquals(10, ContactsOffloadHandler.listMax(c.args))
+        assertEquals(10, okValue(ContactsOffloadHandler.resolvePageSize(c.args)))
     }
 
     @Test
@@ -244,7 +311,7 @@ class OffloadCliArgsTest {
         val c = parse("-n", "10", "search", "Alice")
         assertEquals("search", c.sub)
         assertEquals("Alice", c.args.positional.getOrNull(1))
-        assertEquals(10, ContactsOffloadHandler.listMax(c.args, 20))
+        assertEquals(10, okValue(ContactsOffloadHandler.resolvePageSize(c.args, 20)))
     }
 
     @Test
@@ -359,8 +426,12 @@ class OffloadCliArgsTest {
         // `-n` alias must be bound before the parse or its value takes the
         // query slot.
         assertTrue(
-            "doSearch must resolve the page size through listMax (search's documented default)",
-            code.contains("val max = listMax(parsedArgs, 20)"),
+            "doSearch must resolve the page size through resolvePageSize (search's default 20)",
+            code.contains("val max = when (val size = resolvePageSize(parsedArgs, 20))"),
+        )
+        assertTrue(
+            "an unusable page size must be answered as a usage error, not as a page",
+            code.contains("is PageSize.Invalid -> return pageSizeRefusal(\"search\", size.message)"),
         )
         assertTrue(
             "the legacy -n alias must be bound before the parse",
@@ -449,7 +520,7 @@ class OffloadCliArgsTest {
     fun `negative control - the dead -n alias read comes back and the probe fails`() {
         val original = source(contactsFile)
         val mutated = original.replace(
-            "val max = listMax(parsedArgs, 20)",
+            "val max = when (val size = resolvePageSize(parsedArgs, 20))",
             "val max = parsedArgs.getInt(\"max\", \"n\") ?: 20",
         )
         assertTrue("the resolver call must exist to be removable", mutated != original)

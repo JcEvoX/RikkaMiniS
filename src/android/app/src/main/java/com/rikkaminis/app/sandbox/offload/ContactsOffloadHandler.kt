@@ -179,7 +179,14 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
         JSONObject().put("error", "query_failed").put("message", message).toString()
 
     private fun doList(parsedArgs: OffloadArgs): NativeOffloadResult {
-        val max = listMax(parsedArgs)
+        // [dv28-A6 A-06] A bad page size is a usage error, never a silent
+        // default and never an empty page: `--max 0` used to hand 0 to
+        // collectContactPage, whose `rows.size < max` loop answered `[]` at
+        // exit 0 (and `--max abc` fell back to the default at exit 0).
+        val max = when (val size = resolvePageSize(parsedArgs)) {
+            is PageSize.Ok -> size.value
+            is PageSize.Invalid -> return pageSizeRefusal("list", size.message)
+        }
         val projection = arrayOf(
             ContactsContract.Contacts._ID,
             ContactsContract.Contacts.DISPLAY_NAME_PRIMARY,
@@ -205,23 +212,25 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
     }
 
     private fun doSearch(parsedArgs: OffloadArgs): NativeOffloadResult {
-        // [sweep1014-B34] The old `args.firstOrNull { !it.startsWith("-") }`
-        // scanned the RAW args, so `search --max 10 Alice` picked "10" as the
-        // query and dropped "Alice". parsedArgs has already consumed the named
-        // value, so positional[1] is the query (positional[0] is the
-        // subcommand itself — same convention as the other offload handlers).
-        val query = searchQueryOf(parsedArgs.positional)
-            ?: return NativeOffloadResult(2, "android-contacts search: missing <query>\n")
         // [dv14-A1 ISSUE-01] The `-n` short form is bound to `--max` by
         // [bindLegacyShortMax] before the parse, so `getInt("max", "n")` — the
         // old spelling here — could never have read it: OffloadArgs puts a
         // single-dash token in the flag set and NEVER in `values`, so the "n"
         // alias was dead and the value landed in the positional list, where
         // `search -n 10 Alice` searched for the name "10" and dropped "Alice".
-        // `listMax` is the ONE resolver (same as doList); 20 is search's
-        // documented default (HELP_TEXT: "default 20" — list's is 50).
-        val max = listMax(parsedArgs, 20)
-
+        // [resolvePageSize] is the ONE resolver (same as doList); 20 is
+        // search's documented default (HELP_TEXT: "default 20" — list's is 50).
+        //
+        // [dv28-A6 A-06] Resolved BEFORE the query on purpose: a page size the
+        // caller spelled but the handler cannot honour is a usage error even in
+        // the invocation whose query slot is ambiguous (`search -n abc Alice`
+        // put "abc" there and dropped "Alice").
+        val max = when (val size = resolvePageSize(parsedArgs, 20)) {
+            is PageSize.Ok -> size.value
+            is PageSize.Invalid -> return pageSizeRefusal("search", size.message)
+        }
+        val query = searchQueryOf(parsedArgs.positional)
+            ?: return NativeOffloadResult(2, "android-contacts search: missing <query>\n")
         val projection = arrayOf(
             ContactsContract.Contacts._ID,
             ContactsContract.Contacts.DISPLAY_NAME_PRIMARY,
@@ -442,6 +451,23 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
         return aggregateValues(pairs)
     }
 
+    /**
+     * [dv28-A6 A-06] Outcome of resolving one page-size spelling.
+     *
+     * A plain `Int` cannot express the difference the three defects
+     * depended on: `--max abc` and "no `--max` at all" both arrive as
+     * `null` out of `getInt`, and a non-positive value was handed straight
+     * to [collectContactPage], whose `rows.size < max` loop then answered
+     * an empty page with exit 0.
+     */
+    internal sealed class PageSize {
+        /** A usable page size, always within 1..[MAX_PAGE_SIZE]. */
+        data class Ok(val value: Int) : PageSize()
+
+        /** The caller spelled a page size that cannot be honoured. */
+        data class Invalid(val message: String) : PageSize()
+    }
+
     companion object {
         private const val TAG = "ContactsOffload"
         // [sweep1014-P10] SQLite's default host-parameter ceiling is 999;
@@ -456,6 +482,17 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
 
         /** Default page size for `list` when no `--max` is given. */
         private const val DEFAULT_LIST_MAX = 50
+
+        /**
+         * [dv28-A6 A-06] Upper bound for `--max` / `-n`. A page size is a
+         * provider + Binder cost, not a preference: every page is two batch
+         * queries per data kind (see [BATCH_CHUNK]), and an agent that wants
+         * more rows can loop. Out of range is a usage error (exit 2) rather
+         * than a clamp — [OffloadArgs.getBool] documents the same
+         * refuse-instead-of-guess posture, and a clamped page would report
+         * success for a request the handler silently did not honour.
+         */
+        internal const val MAX_PAGE_SIZE = 500
 
         /**
          * [da1019-J] The parsed shape of one `android-contacts` invocation
@@ -493,7 +530,7 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
 
         /**
          * [dv14-A1] ISSUE-01: `-n <N>` is the legacy shorthand for `--max <N>`
-         * that [listMax] used to recover from the positional list — the shared
+         * that the handler used to recover from the positional list — the shared
          * parser binds no value to a single-dash token (`-n` becomes a bare
          * flag and `10` lands in the positional list), so `search -n 10 Alice`
          * took the `10` as the QUERY slot and dropped "Alice".
@@ -502,7 +539,9 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
          * [OffloadArgs] (shared by every offload handler) untouched and makes
          * the alias mean the same thing in every position (`-n 10` before or
          * after the query). Only a numeric value is rewritten, so `search -n
-         * Alice` (a stray flag + a real query) is untouched; only the two
+         * Alice` binds no page size at all — [resolvePageSize] then refuses the
+         * stray `-n` as a usage error instead of letting "Alice" survive in the
+         * query slot as if the alias had been honoured; only the two
          * subcommands that HAVE a page size are rewritten, so `get` / `delete`
          * keep their id slots bit-for-bit (`get -n 10` still read id 10).
          *
@@ -544,22 +583,64 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
         }
 
         /**
-         * [da1019-J] `--max N` (and `--max=N`) is a named value that
-         * [OffloadArgs] consumes, so it is read through [OffloadArgs.getInt].
-         * The legacy `-n N` short form binds no value in the parser (a short
-         * option becomes a bare flag and its value lands in
-         * [OffloadArgs.positional]), so that form is read as the positional
-         * right after the subcommand. This replaces the old raw-argv scan
-         * (`parseMax`) — the last site in this file that still walked the
-         * unparsed argument list. Pure so both arms stay testable off-device.
+         * [dv28-A6 A-06] The ONE page-size resolver — `list` takes the default
+         * 50, `search` passes its documented 20. Three outcomes, one per
+         * spelling:
+         *
+         *  - `--max N` / `--max=N`: the named value [OffloadArgs] consumed,
+         *    read as the RAW string. `getInt("max")` is what collapsed
+         *    "spelled but unreadable" into "not spelled": `--max abc` came out
+         *    `null` and the handler answered the default at exit 0;
+         *  - `-n N`: rewritten to `--max N` by [bindLegacyShortMax] BEFORE the
+         *    parse, so a `-n` that survives the rewrite carries no number at
+         *    all (it trails the argv, or the token after it is not numeric).
+         *    That token used to stay in [OffloadArgs.positional] and take the
+         *    QUERY slot — `search -n abc Alice` searched for "abc" and dropped
+         *    "Alice". Refused here instead;
+         *  - nothing spelled: [default], the only path that may answer a
+         *    default.
+         *
+         * Zero / negative / over-[MAX_PAGE_SIZE] is refused, not clamped: the
+         * empty page a zero produced was indistinguishable from "no contacts".
+         * Pure — no Context, no I/O — so every arm stays testable off-device.
          */
-        internal fun listMax(parsedArgs: OffloadArgs, default: Int = DEFAULT_LIST_MAX): Int {
-            parsedArgs.getInt("max")?.let { return it }
-            if (parsedArgs.hasFlag("n")) {
-                parsedArgs.positional.getOrNull(1)?.toIntOrNull()?.let { return it }
+        internal fun resolvePageSize(parsedArgs: OffloadArgs, default: Int = DEFAULT_LIST_MAX): PageSize {
+            parsedArgs.get("max")?.let { raw -> return pageSizeOf(raw, "--max") }
+            if (parsedArgs.hasFlag("max")) {
+                // `--max` with no follower: OffloadArgs files the key as a
+                // boolean flag, so "spelled" is still visible here.
+                return PageSize.Invalid("--max expects an integer between 1 and $MAX_PAGE_SIZE")
             }
-            return default
+            if (parsedArgs.hasFlag("n")) {
+                return PageSize.Invalid(
+                    "-n expects an integer between 1 and $MAX_PAGE_SIZE (short form of --max)",
+                )
+            }
+            return PageSize.Ok(default)
         }
+
+        /** Parse + range-check one spelled page size. Pure. */
+        private fun pageSizeOf(raw: String, spelled: String): PageSize {
+            val value = raw.toIntOrNull()
+                ?: return PageSize.Invalid(
+                    "$spelled expects an integer between 1 and $MAX_PAGE_SIZE, got '$raw'",
+                )
+            if (value < 1 || value > MAX_PAGE_SIZE) {
+                return PageSize.Invalid(
+                    "$spelled expects an integer between 1 and $MAX_PAGE_SIZE, got $value",
+                )
+            }
+            return PageSize.Ok(value)
+        }
+
+        /**
+         * [dv28-A6 A-06] Usage-error result (exit 2, the code the other
+         * offload handlers use for a bad invocation) carrying the accepted
+         * range and the usage block, so an agent reads "I spelled it wrong"
+         * instead of an empty page.
+         */
+        private fun pageSizeRefusal(sub: String, message: String): NativeOffloadResult =
+            NativeOffloadResult(2, "android-contacts $sub: $message\n$HELP_TEXT")
 
         /** "?,?,…" placeholder list for an IN (…) selection. Pure. */
         private fun inPlaceholders(count: Int): String = List(count) { "?" }.joinToString(",")
@@ -578,11 +659,15 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
         private const val HELP_TEXT = """android-contacts — read + delete device contacts (requires READ_CONTACTS, plus WRITE_CONTACTS for delete)
 
 Usage:
-  android-contacts list [--max N]         List contacts (default 50)
-  android-contacts search <query> [--max N]  Search by name (default 20)
-  android-contacts get <id>               Get a single contact by id
-  android-contacts delete <id>            Delete a contact by id (PERMANENT — cascades all raw rows)
-  android-contacts --help                 Show this help
+  android-contacts list [--max N]             List contacts (default 50, range 1..500)
+  android-contacts search <query> [--max N]   Search by name (default 20, range 1..500)
+  android-contacts get <id>                   Get a single contact by id
+  android-contacts delete <id>                Delete a contact by id (PERMANENT — cascades all raw rows)
+  android-contacts --help                     Show this help
+
+`-n N` is the legacy short form of `--max N`. A page size that is not an integer,
+or that is outside 1..500, is a usage error (exit 2): it is never replaced by the
+default and never answered as an empty page.
 
 Output is JSON. Each contact has: id, name, phones[], emails[].
 """
