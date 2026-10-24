@@ -115,7 +115,8 @@ python3 /var/minis/skills/meta-audit-witness/scripts/verify_witness.py \
 → `auto_approve_bypass_check.py`：`gate rc=1 → ❌ 门抓住了（见证无效）  restore=True`，
 输出尾部为 `C5: getLevel discards the OffloadPermissionLevelPolicy.resolve() result
 (call at offset 297, statement head 'OffloadPermissionLevelPolicy.resolve(')`，即
-**GATE_CAUGHT_WITNESS**。
+**GATE_CAUGHT_WITNESS**（**在最终树 HEAD 上重跑**，非中间树：`rc=1 → 门抓住了` +
+`restore=True` + `sha256` 还原校验通过）。
 
 **L3 全量回归（冻结面未动）**
 
