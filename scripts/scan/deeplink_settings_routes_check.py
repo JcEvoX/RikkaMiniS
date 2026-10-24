@@ -144,6 +144,199 @@ def code_only(src: str) -> str:
 def fail(path, msg):
     VIOLATIONS.append(f"{path}: {msg}")
 
+# [wide-1024 12-misc-b] Form-aware helpers. The criteria below used to ask
+# "does the file contain this substring / does the block mention seg() once";
+# every one of the four witnesses in this branch keeps the substring and drops
+# the EFFECT (a raw sibling id, a constant LaunchedEffect key, a constant
+# remember key, a constructed-but-never-launched Intent). Judging a spelling
+# needs a shape-equivalence class; judging an effect needs the AST-level
+# neighbours, so these helpers read the expression rather than the text.
+KEYWORDS = {
+    "true", "false", "null", "this", "it", "super", "return", "if", "else",
+    "val", "var", "by", "fun", "object", "class", "when", "for", "while",
+    "in", "is", "as", "try", "catch", "throw", "Unit", "String", "Boolean",
+    "Int", "Long", "Float", "Double", "Any", "Nothing",
+}
+
+def string_literals(text):
+    """[(start, end)] of every "…" literal; comments are skipped.
+
+    Template strings count as literals — criterion 2 reads their `$…` holes, so
+    the spans are needed both to blank and to inspect them.
+    """
+    spans = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        if c != '"':
+            i += 1
+            continue
+        j = i + 1
+        while j < n:
+            if text[j] == "\\":
+                j += 2
+                continue
+            if text[j] == '"' or text[j] == "\n":
+                j += 1
+                break
+            j += 1
+        spans.append((i, j))
+        i = j
+    return spans
+
+def mask_literals(text):
+    """Same length with literals blanked: indices stay valid for brace matching
+    (a `{` inside a string must not unbalance the walk)."""
+    chars = list(text)
+    for a, b in string_literals(text):
+        for k in range(a, min(b, len(chars))):
+            if chars[k] != "\n":
+                chars[k] = " "
+    return "".join(chars)
+
+def ident_roots(expr):
+    """Root identifiers an expression READS (`editEntry?.key` -> editEntry)."""
+    blank = mask_literals(expr)
+    out = set()
+    for m in re.finditer(r"[A-Za-z_]\w*", blank):
+        name = m.group(0)
+        if blank[: m.start()].rstrip().endswith("."):
+            continue                      # member access, not a root
+        if blank[m.end():].lstrip().startswith("("):
+            continue                      # call target
+        if name in KEYWORDS:
+            continue
+        out.add(name)
+    return out
+
+def paren_text(text, open_idx):
+    """Text inside the balanced (…) starting at open_idx, or None."""
+    depth = 0
+    i = open_idx
+    while i < len(text):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx + 1: i]
+        i += 1
+    return None
+
+def brace_text(text, open_idx):
+    """Text inside the balanced {…} at open_idx, or None (callers fail-closed).
+    Pass a mask_literals() copy so braces inside strings cannot unbalance it."""
+    depth = 0
+    i = open_idx
+    while i < len(text):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx + 1: i]
+        i += 1
+    return None
+
+def path_interpolations(lit):
+    """The `$…` holes of a template literal, PATH part only (before the first
+    `?` — query args are not path segments and have their own encoders)."""
+    body = lit[1:-1] if lit.endswith('"') else lit[1:]
+    q = body.find("?")
+    if q >= 0:
+        body = body[:q]
+    out = []
+    i = 0
+    while i < len(body):
+        if body[i] != "$":
+            i += 1
+            continue
+        if i + 1 < len(body) and body[i + 1] == "{":
+            depth, j = 0, i + 2
+            while j < len(body):
+                if body[j] == "{":
+                    depth += 1
+                elif body[j] == "}":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                j += 1
+            out.append(body[i + 2: j])
+            i = j + 1
+            continue
+        m = re.match(r"[A-Za-z_]\w*", body[i + 1:])
+        if m:
+            out.append(m.group(0))
+            i += 1 + len(m.group(0))
+            continue
+        i += 1
+    return out
+
+def string_params(sig):
+    """Builder parameters declared with type String / String? — exactly the
+    values that carry an id and must therefore be encoded."""
+    return {m.group(1) for m in re.finditer(r"(\w+)\s*:\s*String\b", sig)}
+
+def launched_effects(code):
+    """[(lineno, key_expr, block_body)] for every `LaunchedEffect(<key>) { … }`.
+
+    The criterion pins the KEY, so the key is returned verbatim: `Unit`, `true`
+    and `0` are the same defect in three spellings — what matters is whether
+    the key READS the state the effect consumes.
+    """
+    masked = mask_literals(code)
+    out = []
+    for m in re.finditer(r"LaunchedEffect\s*\(", masked):
+        arg = paren_text(masked, m.end() - 1)
+        if arg is None:
+            continue                      # unbalanced -> caller fail-closed
+        close = m.end() + len(arg) + 1
+        brace = masked.find("{", close)
+        if brace < 0:
+            continue
+        body = brace_text(masked, brace)
+        if body is None:
+            continue
+        out.append((masked[: m.start()].count("\n") + 1, arg, body))
+    return out
+
+def remember_decl(env, field):
+    """(keys, initializer) of `var <field> by remember(<keys>) { … }`, else None."""
+    masked = mask_literals(env)
+    m = re.search(rf"var\s+{field}\s+by\s+remember\s*\(", masked)
+    if not m:
+        return None
+    keys = paren_text(masked, m.end() - 1)
+    if keys is None:
+        return None
+    brace = masked.find("{", m.end() + len(keys) + 1)
+    if brace < 0:
+        return None
+    init = brace_text(masked, brace)
+    if init is None:
+        return None
+    return keys, init
+
+def case_block(text, case_re):
+    """Body of the `is … -> { … }` branch matching case_re, or None."""
+    masked = mask_literals(text)
+    m = re.search(case_re, masked)
+    if not m:
+        return None
+    brace = masked.find("{", m.end())
+    if brace < 0:
+        return None
+    body = brace_text(masked, brace)
+    return None if body is None else body
+
 # [da1024-E] A second decode of a route argument. Builder-side Uri.encode is
 # NOT covered (the nav graph must keep encoding when it builds a route).
 DECODE_RE = re.compile(r"(?:android\.net\.|java\.net\.)?(?:Uri|URLDecoder)\.decode\s*\(")
@@ -280,6 +473,13 @@ def check(root: Path) -> None:
         print(f"SKIP: emitter cross-check — {REL_HTTP_PY} not found (hardcoded list still enforced)")
 
     # --- 2. segment builders encode through the single helper ---
+    # [wide-1024 12-misc-b] The old test was `count("seg(") == 0`: a builder
+    # with TWO ids passed as long as ONE of them was encoded, so
+    # `"model_entry/${seg(instanceId)}/$entryId"` — the composite entryId that
+    # is the whole reason this criterion exists — sailed through. Judge the
+    # interpolation, not the presence of the helper: every `$…` hole in a path
+    # segment must be carried by seg(), unless its root identifier is not a
+    # String parameter (a Boolean flag / a pre-encoded local / a `?` query arg).
     for name in SEG_BUILDERS:
         m = re.search(rf"fun {name}\(", nav)
         if not m:
@@ -288,8 +488,26 @@ def check(root: Path) -> None:
         # definition body = from `fun name(` up to the next member boundary
         nxt = re.search(r"\n    fun |\n\}", nav[m.end():])
         body_end = m.end() + nxt.start() if nxt else len(nav)
-        if nav[m.start():body_end].count("seg(") == 0:
+        defn = nav[m.start():body_end]
+        if defn.count("seg(") == 0:
             fail(REL_NAV, f"Routes.{name} does not encode through seg() (raw id -> malformed route)")
+            continue
+        eq = defn.find("=")
+        params = string_params(defn[:eq] if eq > 0 else defn)
+        raw = []
+        for start, end in string_literals(defn):
+            for expr in path_interpolations(nav[m.start() + start: m.start() + end]):
+                hole = expr.strip()
+                if hole.startswith("seg(") and hole.endswith(")"):
+                    continue
+                base = re.split(r"[?.\s]", hole)[0]
+                if base in params:
+                    raw.append(hole)
+        if raw:
+            fail(REL_NAV,
+                 f"Routes.{name} interpolates raw id(s) {sorted(set(raw))} into a path "
+                 "segment — every id hole must ride seg(...); one encoded sibling no "
+                 "longer satisfies the criterion")
 
     # --- 3. fallback still present (deliberate design) ---
     if "else -> SettingsDeepLink.Route(Routes.SETTINGS)" not in dlh:
@@ -357,12 +575,34 @@ def check(root: Path) -> None:
                  "pins the one-shot-vs-reactive shape, re-derive it if the consume path "
                  "was renamed)")
         else:
-            for lineno, blk in launch_effect_blocks(env, "Unit"):
-                if "consumePendingEnvVarCreate(" in blk:
-                    fail(REL_ENV_SCREEN,
-                         f"LaunchedEffect(Unit) at line {lineno} still consumes the pending "
-                         "create request — a one-shot effect never re-runs, so a warm-start "
-                         "deep link into this screen is dropped")
+            # [wide-1024 12-misc-b] Judge the KEY, not the spelling. The old
+            # check only rejected `LaunchedEffect(Unit)` — `LaunchedEffect(true)`
+            # / `(0)` are the same defect (a constant key never re-runs, so a
+            # request that lands after the first composition is dropped) and
+            # passed. What matters is whether the key READS the observed state.
+            collected = re.findall(
+                r"(\w+)\s+by\s+[\w.]*pendingEnvVarCreate\s*\.\s*collectAsState\s*\(", env)
+            reactive = 0
+            consumers = 0
+            for lineno, key, blk in launched_effects(env):
+                if "consumePendingEnvVarCreate(" not in blk:
+                    continue
+                consumers += 1
+                if any(re.search(rf"\b{re.escape(v)}\b", key) for v in collected):
+                    reactive += 1
+                    continue
+                fail(REL_ENV_SCREEN,
+                     f"LaunchedEffect({key.strip()}) at line {lineno} still consumes the "
+                     "pending create request — a one-shot effect never re-runs, so a "
+                     "warm-start deep link into this screen is dropped"
+                     + ("" if collected else
+                        " (and no `by …pendingEnvVarCreate.collectAsState()` state exists "
+                        "to key it on)"))
+            if consumers == 0:
+                fail(REL_ENV_SCREEN,
+                     "no LaunchedEffect keyed on the observed pending-create state consumes "
+                     "consumePendingEnvVarCreate() — the reactive binding is gone "
+                     "(fail-closed: re-derive this criterion, never drop it)")
         # 10. the form's four shadow copies must be keyed on their source
         if "fun EnvVarFormSheet(" not in env:
             fail(REL_ENV_SCREEN,
@@ -370,16 +610,33 @@ def check(root: Path) -> None:
                  "seeding)")
         else:
             for field in ENV_FORM_FIELDS:
-                m = re.search(rf"var\s+{field}\s+by\s+remember\s*\(([^)]*)\)", env)
-                if not m:
+                decl = remember_decl(env, field)
+                if decl is None:
                     fail(REL_ENV_SCREEN,
                          f"`var {field} by remember(...)` not found — the field is keyless "
                          "or renamed (fail-closed: it must be keyed on what it seeds from)")
-                elif not m.group(1).strip():
+                    continue
+                keys, init = decl
+                if not keys.strip():
                     fail(REL_ENV_SCREEN,
                          f"`var {field} by remember()` carries no keys — it keeps the first "
                          "entry's text after editEntry switches identity, and Save writes "
                          "that stale text back over an external write")
+                    continue
+                # [wide-1024 12-misc-b] "Non-empty key list" is not the contract:
+                # `remember(Unit)` / `remember(true)` / `remember(0)` are just as
+                # constant, and a list that drops ONE seed source keeps that half
+                # stale. Derive what the initializer READS and require every root
+                # of it to appear in the key list (editEntry?.key ?: prefillKey
+                # needs both; editEntry?.group ?: "" needs only editEntry).
+                seeds = ident_roots(init)
+                missing = sorted(seeds - ident_roots(keys))
+                if missing:
+                    fail(REL_ENV_SCREEN,
+                         f"`var {field} by remember({keys.strip()})` is not keyed on "
+                         f"{', '.join(missing)} — the initializer seeds from it, so the "
+                         "field keeps the previous entry's/prefill's value instead of "
+                         "re-seeding when it changes")
 
     # --- 9. [da1028-C] ChatScreen observes its pending quick action ---------
     chat = code_only(read(root, REL_CHAT_SCREEN))
@@ -439,15 +696,38 @@ def check(root: Path) -> None:
                  "(`DeepLinkAction?`) and the catch-all `else` is gone — the `when` "
                  "must name the `null` case explicitly (otherwise the compiler "
                  "rejects it: \"'when' expression must be exhaustive\")")
-        if not re.search(
-            r"is\s+DeepLinkAction\.OpenAlarmList\s*->\s*\{[^}]*"
-            r"AlarmClock\.ACTION_SHOW_ALARMS",
-            dispatch, re.S,
-        ):
+        # [wide-1024 12-misc-b] "The branch mentions ACTION_SHOW_ALARMS" only
+        # proves the Intent was CONSTRUCTED. `showAlarms.action` (read the
+        # property, launch nothing) kept the gate green while the card tap did
+        # nothing — judge the side effect: the derived Intent must reach
+        # startActivity() in the same branch.
+        alarm = case_block(dispatch, r"is\s+DeepLinkAction\.OpenAlarmList\s*->")
+        if alarm is None:
             fail(REL_NAV,
                  "cold-start dispatch: `is DeepLinkAction.OpenAlarmList` branch must launch "
                  "AlarmClock.ACTION_SHOW_ALARMS (minis://views/alarm was a cold-start "
                  "no-op; parity with MainActivity's warm-start handler)")
+        elif "AlarmClock.ACTION_SHOW_ALARMS" not in alarm:
+            fail(REL_NAV,
+                 "cold-start dispatch: `is DeepLinkAction.OpenAlarmList` branch must launch "
+                 "AlarmClock.ACTION_SHOW_ALARMS (minis://views/alarm was a cold-start "
+                 "no-op; parity with MainActivity's warm-start handler)")
+        else:
+            built = re.search(r"val\s+(\w+)\s*=\s*[\w.]*Intent\s*\(", alarm)
+            launched = False
+            if built:
+                launched = re.search(
+                    rf"startActivity\s*\(\s*{re.escape(built.group(1))}\s*\)", alarm) is not None
+            else:
+                launched = re.search(
+                    r"startActivity\s*\([^)]*Action|startActivity\s*\([^)]*ACTION_SHOW_ALARMS",
+                    alarm) is not None
+            if not launched:
+                fail(REL_NAV,
+                     "cold-start dispatch: the OpenAlarmList branch builds the "
+                     "AlarmClock.ACTION_SHOW_ALARMS Intent but never hands it to "
+                     "startActivity() — the tap is a silent no-op (fail-closed: derive the "
+                     "Intent variable from `val x = …Intent(…)` and require startActivity(x))")
 
 
 # ---------------- selftest fixtures (minimal synthetic repo) ----------------
@@ -1030,6 +1310,63 @@ def selftest() -> None:
             print("SELFTEST U (non-nullable subject) leaked the nullable criterion")
         else:
             print("SELFTEST U (non-nullable subject needs no null branch) GREEN as expected")
+
+        # --- [wide-1024 12-misc-b] witness arms: the four shapes the report
+        # proved blind. Each one keeps every substring the old criteria looked
+        # for and drops the EFFECT, so each arm asserts the new criterion speaks
+        # AND nothing else does.
+        def witness_arm(label, needle, nav=FIXTURE_NAV, env=FIXTURE_ENV_SCREEN):
+            nonlocal ok
+            write_fixture(root, FIXTURE_DLH, nav, FIXTURE_MAIN, env=env)
+            VIOLATIONS.clear()
+            check(root)
+            hits = [v for v in VIOLATIONS if needle in v]
+            noise = [v for v in VIOLATIONS if needle not in v]
+            if not hits or noise or len(hits) != 1:
+                ok = False
+                print(f"SELFTEST {label} wrong verdict: {VIOLATIONS}")
+            else:
+                print(f"SELFTEST {label} RED as expected")
+
+        # V: one encoded sibling + one raw composite id (entryId carries '/').
+        witness_arm(
+            "V (raw sibling id in a 2-arg route builder)",
+            "Routes.modelEntryDetail interpolates raw id",
+            nav=FIXTURE_NAV.replace(
+                '"model_entry/${seg(instanceId)}/${seg(entryId)}"',
+                '"model_entry/${seg(instanceId)}/$entryId"',
+            ),
+        )
+        # W: constant LaunchedEffect key — same defect as Unit, different spelling.
+        witness_arm(
+            "W (LaunchedEffect(true) keeps the consume)",
+            "still consumes the pending create request",
+            env=FIXTURE_ENV_SCREEN.replace(
+                "LaunchedEffect(pendingCreate) {", "LaunchedEffect(true) {"),
+        )
+        # X: constant remember key.
+        witness_arm(
+            "X (remember(Unit) field shadow)",
+            "`var keyText by remember(Unit)` is not keyed on",
+            env=FIXTURE_ENV_SCREEN.replace(
+                "var keyText by remember(editEntry?.id, editEntry?.key, prefillKey) {",
+                "var keyText by remember(Unit) {"),
+        )
+        # X2: half a key list — the prefill half goes stale.
+        witness_arm(
+            "X2 (key list drops the prefill half)",
+            "is not keyed on prefillKey",
+            env=FIXTURE_ENV_SCREEN.replace(
+                "var keyText by remember(editEntry?.id, editEntry?.key, prefillKey) {",
+                "var keyText by remember(editEntry?.id, editEntry?.key) {"),
+        )
+        # Y: the Intent is built and then only read — never launched.
+        witness_arm(
+            "Y (alarm Intent built, never launched)",
+            "never hands it to startActivity()",
+            nav=FIXTURE_NAV.replace(
+                "context.startActivity(showAlarms)", "showAlarms.action"),
+        )
 
     if not ok:
         sys.exit("DEEPLINK_SETTINGS_ROUTES_SELFTEST=FAIL")

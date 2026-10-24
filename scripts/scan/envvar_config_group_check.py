@@ -215,9 +215,48 @@ def check_fields_registration(envvars_src: str) -> str | None:
     return None
 
 
+def enclosing_braces(text: str, pos: int) -> str:
+    """The nearest balanced { … } spanning pos (the predicate/expression the
+    site sits in). Returns the tail from the opener when it never closes."""
+    depth = 0
+    start = 0
+    i = pos
+    while i >= 0:
+        if text[i] == "}":
+            depth += 1
+        elif text[i] == "{":
+            if depth == 0:
+                start = i
+                break
+            depth -= 1
+        i -= 1
+    depth = 0
+    j = start
+    while j < len(text):
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:j + 1]
+        j += 1
+    return text[start:]
+
+# [wide-1024 12-misc-b] A boolean expression that is constant no matter what
+# the input is: `x || !x`, `false && …`, `… && false`, `true || …`. Such a
+# predicate keeps every anchor token the criteria look for and decides nothing.
+DEAD_PREDICATE_RE = re.compile(
+    r"(?:\bfalse\s*&&|&&\s*false\b|\btrue\s*\|\||\|\|\s*true\b|\bif\s*\(\s*false\s*\))"
+)
+# `x || !x` — the excluded middle reads as "always true" without spelling the
+# literal `true`, so a check that only forbids the literal stays blind to it.
+DEAD_TAUTOLOGY_RE = re.compile(
+    r"([A-Za-z_][\w.]*(?:\([^()]*\))?)\s*\|\|\s*!\s*\1"
+)
+
 def check_group_path(envvars_src: str) -> str | None:
     """Criterion 2: a groupField member registers path "envvars.$key.group"
-    (or the forId variant)."""
+    (or the forId variant) AND its reader returns the stored group."""
     text = strip_comments(envvars_src)
     win = func_window(
         text,
@@ -226,9 +265,29 @@ def check_group_path(envvars_src: str) -> str | None:
     )
     if win is None:
         return "C2 EXTRACT_FAIL: groupField member not found (fail-closed)"
-    if re.search(r'path\s*=\s*"envvars\.\$(key|forId)\.group"', win):
-        return None
-    return 'C2 RED: groupField does not register path "envvars.$key.group" (or forId variant)'
+    if not re.search(r'path\s*=\s*"envvars\.\$(key|forId)\.group"', win):
+        return 'C2 RED: groupField does not register path "envvars.$key.group" (or forId variant)'
+    # [wide-1024 12-misc-b] The path makes the field ADDRESSABLE; the reader is
+    # what makes it ANSWER. `reader = { ConfigValue.Null }` keeps the path, the
+    # writer and the UI, and turns the single-path read into a constant.
+    body = extract_braced(win, r"reader\s*=")
+    if body is None:
+        return (
+            "C2 EXTRACT_FAIL: groupField's `reader = { … }` lambda not found "
+            "(fail-closed: the criterion pins what the reader yields)"
+        )
+    if not re.search(r"ConfigValue\.Str\(\s*[\w.]+\.group\s*\)", body):
+        return (
+            "C2 RED: groupField's reader never yields ConfigValue.Str(<entry>.group) — "
+            "the group set through the writer (UI / `set`) is invisible on the "
+            "single-path read `minis-config get envvars.<key>.group`"
+        )
+    if "repo." not in body:
+        return (
+            "C2 RED: groupField's reader does not read the repository — the group must "
+            "come from the entry (single source), not from a literal"
+        )
+    return None
 
 
 def check_summary_group(builtins_src: str) -> str | None:
@@ -281,6 +340,29 @@ def check_add_calls_context_limit_helper(groups_src: str) -> str | None:
             "C4 RED: GroupsCollection.add never calls applyContextLimitWrite — "
             "a CLI-created group loses its limit on the first clearing write"
         )
+    # [wide-1024 12-misc-b] Calling the helper is half the contract; the ARG is
+    # the value. `applyContextLimitWrite(g, 0)` keeps the call, the helper and
+    # the field, and drops the limit the caller passed (lastContextLimitTokens
+    # stays 0 = "no limit"), so `minis-config add groups {contextLimitTokens:…}`
+    # silently loses the parameter.
+    parsed = re.search(
+        r'val\s+(\w+)\s*=\s*\(obj\["context_limit_tokens"\]\s*as\?\s*ConfigValue\.Int\)', body)
+    if parsed is None:
+        return (
+            'C4 EXTRACT_FAIL: add() no longer derives the limit from '
+            'obj["context_limit_tokens"] (fail-closed: re-derive this criterion, '
+            "never drop it)"
+        )
+    for m in re.finditer(r"applyContextLimitWrite\s*\(", body):
+        args = extract_paren_block(body, m.end() - 1)
+        if args is None:
+            return "C4 EXTRACT_FAIL: applyContextLimitWrite( never balances (fail-closed)"
+        if parsed.group(1) not in args:
+            return (
+                "C4 RED: applyContextLimitWrite is called with a limit that is not the "
+                "parsed context_limit_tokens value — a CLI-created group silently loses "
+                "the limit it was created with"
+            )
     return None
 
 
@@ -423,13 +505,28 @@ def check_sentinel_remap(backup_src: str) -> str | None:
             "(`else droppedMembers++`) not found (fail-closed)"
         )
     for pos in drops:
-        if "SystemVoiceEntries.isSystemEntryId" not in text[max(0, pos - 400):pos]:
+        window = text[max(0, pos - 400):pos]
+        if "SystemVoiceEntries.isSystemEntryId" not in window:
             return (
                 "C12 RED: the member remap drops a member whenever the entry map has "
                 "no mapping — the virtual System voice ids are never in that map, so "
                 "every voice-group member counts as a dropped member; the remap must "
                 "consult SystemVoiceEntries.isSystemEntryId (single source)"
             )
+        # [wide-1024 12-misc-b] …and the predicate must DECIDE. `takeIf { false &&
+        # SystemVoiceEntries.isSystemEntryId(it) }` keeps the call, answers false
+        # for every id, and every virtual member is dropped — the exact defect
+        # this criterion exists to stop, wearing the anchor as a decoration.
+        for call in re.finditer(r"SystemVoiceEntries\.isSystemEntryId\s*\(", window):
+            pred = enclosing_braces(window, call.start())
+            if DEAD_PREDICATE_RE.search(pred) or DEAD_TAUTOLOGY_RE.search(pred):
+                return (
+                    "C12 RED: the remap's isSystemEntryId predicate is constant "
+                    "(`false && …` / `… || true`) or a tautology (`x || !x`) — it keeps "
+                    "the call and "
+                    "decides nothing, so every virtual System voice member is still "
+                    "counted as dropped"
+                )
     if "__builtin_system_speech__" in backup_src:
         return (
             "C12 RED: ConfigBackup spells the System sentinel id literal instead of "
@@ -446,6 +543,34 @@ def check_group_member_resolution(builtins_src: str) -> str | None:
             "C13 RED: the `groups` config summary never calls "
             "SystemVoiceEntries.resolve — a virtual System voice member is rendered "
             "as a missing model row even though chat resolves it fine"
+        )
+    # [wide-1024 12-misc-b] Calling it is not resolving the member: the VALUE has
+    # to be consumed. `entriesById[id].also { SystemVoiceEntries.resolve(id) }`
+    # keeps the anchor token, throws the resolved entry away (the receiver is
+    # what flows on) and still renders the member as missing. Two legitimate
+    # shapes exist and both are accepted — an Elvis fallback (`a[id] ?: resolve(id)`)
+    # and a chain on the result (`ConfigValue.Str(resolve(id)?.id ?: id)`).
+    discarded = []
+    for call in re.finditer(r"SystemVoiceEntries\.resolve\s*\(", text):
+        head = text[: call.start()].rstrip()
+        close = extract_paren_block(text, call.end() - 1)
+        if close is None:
+            return (
+                "C13 EXTRACT_FAIL: SystemVoiceEntries.resolve( never balances "
+                "(fail-closed)"
+            )
+        tail = text[call.end() - 1 + len(close):].lstrip()
+        consumed_in = head.endswith(("=", "?:", "(", ",", "return", "->"))
+        consumed_out = tail[:1] in {"?", "!", ".", ",", ")"} or tail[:2] == "!!"
+        if not (consumed_in or consumed_out):
+            line = text[: call.start()].count("\n") + 1
+            discarded.append(line)
+    if discarded:
+        return (
+            "C13 RED: SystemVoiceEntries.resolve is called as a discarded statement "
+            "(ConfigBuiltins.kt:%s) — the resolved virtual entry never reaches the "
+            "member row, so a System voice member is still rendered as a missing model"
+            % ", ".join(str(n) for n in discarded)
         )
     if "__builtin_system_speech__" in builtins_src:
         return (
@@ -568,7 +693,10 @@ class EnvVarsCollection(private val repo: Repo) : ConfigCollection {
         path = "envvars.$key.group",
         displayName = "Group",
         valueSchema = ConfigSchema.Str(maxLength = 200),
-        reader = { ConfigValue.Null },
+        reader = {
+            val e = repo.entries.value.firstOrNull { it.key == key }
+            if (e == null) ConfigValue.Null else ConfigValue.Str(e.group)
+        },
         writer = { v ->
             val e = repo.entries.value.firstOrNull { it.key == key }
                 ?: throw ConfigError.UnknownPath("envvars.$key")
@@ -585,7 +713,8 @@ class GroupsCollection(private val repo: Repo) : ConfigCollection {
     override fun add(payload: ConfigValue): String {
         val obj = (payload as? ConfigValue.Obj)?.value
             ?: throw ConfigError.InvalidValue("Expected JSON object")
-        val contextLimit = 32000
+        val contextLimit = (obj["context_limit_tokens"] as? ConfigValue.Int)?.value
+            ?.takeIf { it > 0 }
         val g = ModelGroup(name = "g", contextLimitTokens = contextLimit)
         applyContextLimitWrite(g, contextLimit ?: 0)
         repo.addGroup(g)
@@ -1138,6 +1267,69 @@ object ConfigBuiltins {
             "        val entryIds = listOf(\"a\")",
             "        val pinned = \"__builtin_system_speech__\"\n"
             "        val entryIds = listOf(\"a\")"),
+        check_group_member_resolution, "C13 RED:")
+
+    # ── [wide-1024 12-misc-b] witness arms ────────────────────────────────
+    # Each one keeps every token the old criterion matched and drops the EFFECT.
+    # FIX-25: the reader answers a constant (the path + writer stay intact).
+    d25 = fixture_dir()
+    p25 = os.path.join(d25, "fake", "config", "collections", "EnvVarsCollection.kt")
+    src25 = open(p25, encoding="utf-8").read().replace(
+        "        reader = {\n"
+        "            val e = repo.entries.value.firstOrNull { it.key == key }\n"
+        "            if (e == null) ConfigValue.Null else ConfigValue.Str(e.group)\n"
+        "        },\n",
+        "        reader = { ConfigValue.Null },\n",
+    )
+    open(p25, "w", encoding="utf-8").write(src25)
+    ok &= expect(
+        "FIX-25 groupField reader answers a constant",
+        check(
+            p25,
+            os.path.join(d25, "fake", "config", "ConfigBuiltins.kt"),
+            groups_path(d25),
+        ),
+        "C2 RED:",
+    )
+
+    # FIX-26: the helper is called, with a constant instead of the parsed value.
+    d26 = fixture_dir()
+    p26 = groups_path(d26)
+    src26 = open(p26, encoding="utf-8").read().replace(
+        "applyContextLimitWrite(g, contextLimit ?: 0)", "applyContextLimitWrite(g, 0)")
+    open(p26, "w", encoding="utf-8").write(src26)
+    ok &= expect(
+        "FIX-26 context-limit helper fed a constant",
+        check(
+            os.path.join(d26, "fake", "config", "collections", "EnvVarsCollection.kt"),
+            os.path.join(d26, "fake", "config", "ConfigBuiltins.kt"),
+            p26,
+        ),
+        "C4 RED:",
+    )
+
+    # FIX-27: isSystemEntryId present but short-circuited to false.
+    ok &= sentinel_arm(
+        "FIX-27 sentinel predicate dead-guarded",
+        SENTINEL_BACKUP_OK.replace(
+            "old.takeIf { SystemVoiceEntries.isSystemEntryId(it) }",
+            "old.takeIf { false && SystemVoiceEntries.isSystemEntryId(it) }"),
+        check_sentinel_remap, "C12 RED:")
+    # FIX-27b: the tautology spelling of the same dead predicate.
+    ok &= sentinel_arm(
+        "FIX-27b sentinel predicate exhausted middle",
+        SENTINEL_BACKUP_OK.replace(
+            "old.takeIf { SystemVoiceEntries.isSystemEntryId(it) }",
+            "old.takeIf { SystemVoiceEntries.isSystemEntryId(it) || "
+            "!SystemVoiceEntries.isSystemEntryId(it) }"),
+        check_sentinel_remap, "C12 RED:")
+
+    # FIX-28: resolve() called inside .also — the value is thrown away.
+    ok &= sentinel_arm(
+        "FIX-28 resolve result discarded",
+        SENTINEL_BUILTINS_OK.replace(
+            " ?: SystemVoiceEntries.resolve(entryId)",
+            ".also { SystemVoiceEntries.resolve(entryId) }"),
         check_group_member_resolution, "C13 RED:")
 
     for dd in fds:
