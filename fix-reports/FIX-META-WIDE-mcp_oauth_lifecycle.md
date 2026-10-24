@@ -37,7 +37,10 @@
 
 ## 6. CI run
 
-分支 `fix/meta-wide-07-mcp-tools`，dispatch 后回填：run `<id>` / head_sha 与本地一致（见最终回报）。
+分支 `fix/meta-wide-07-mcp-tools` @ `d1a9093124ea485ab90b80c167d8dbcf5fdc1ccd`（`head_sha` 与本地 HEAD 逐字符一致，attempt 1）。
+run `40135996652`（#2637）→ **conclusion = success**，job `120997514627`，26 步唯一 skipped = `Publish to Releases`（main 门控）。
+日志判读：`Summary: 112 passed, 0 failed` 恰 1 条 · `ALL 344 CASES PASS` 恰 1 条 · ` e: ` 0 · 含 `FAILED` 的 6 行逐条确认全为 PASSED 用例名子串。
+本门自证在 CI 内被见证：`✅ mcp_oauth_lifecycle_check selftest has teeth (MCP_OAUTH_LIFECYCLE_SELFTEST=PASS)`（日志 1334 行）
 
 ## 7. 残留
 

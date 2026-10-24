@@ -37,7 +37,10 @@
 
 ## 6. CI run
 
-分支 `fix/meta-wide-07-mcp-tools`：run `<id>`（回填见最终回报），head_sha 与本地逐一核对。
+分支 `fix/meta-wide-07-mcp-tools` @ `d1a9093124ea485ab90b80c167d8dbcf5fdc1ccd`（`head_sha` 与本地 HEAD 逐字符一致，attempt 1）。
+run `40135996652`（#2637）→ **conclusion = success**，job `120997514627`，26 步唯一 skipped = `Publish to Releases`（main 门控）。
+日志判读：`Summary: 112 passed, 0 failed` 恰 1 条 · `ALL 344 CASES PASS` 恰 1 条 · ` e: ` 0 · 含 `FAILED` 的 6 行逐条确认全为 PASSED 用例名子串。
+本门自证在 CI 内被见证：`✅ shizuku_args_check selftest has teeth (gate flips red on every criterion)`（日志 1190 行；本门收尾标记带计数，CI 只回显断言短语，标记本体不出现在日志里——selftest 仍逐臂执行为红）
 
 ## 7. 残留
 
