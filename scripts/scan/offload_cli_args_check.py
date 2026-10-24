@@ -187,7 +187,7 @@ CONTACTS_RULES = [
     ("C6", "req", "sub = args.positional.getOrNull(0)"),
     ("C7", "req", "id = args.positional.getOrNull(1)?.toLongOrNull()"),
     ("C8", "req", 'booleanFlags = setOf("help", "h")'),
-    ("C9", "req", "internal fun listMax(parsedArgs: OffloadArgs, default: Int = DEFAULT_LIST_MAX): Int"),
+    ("C9", "req", "internal fun resolvePageSize(parsedArgs: OffloadArgs, default: Int = DEFAULT_LIST_MAX)"),
     ("C10", "forbid", "rawArgs[0]"),
     ("C11", "forbid", "rawArgs.drop(1)"),
     ("C12", "forbid", "args.firstOrNull()?.toLongOrNull()"),
@@ -829,8 +829,8 @@ def check_offload_cli_bindings(contacts_src: str, notification_src: str,
     do_search = _payload_helper_bodies(contacts, "doSearch")
     if do_search is None:
         findings.append(("V1b", "missing", "private fun doSearch(parsedArgs: OffloadArgs)"))
-    elif "listMax(" not in do_search:
-        findings.append(("V1b", "missing", "doSearch must resolve its page size through listMax("))
+    elif "resolvePageSize(" not in do_search:
+        findings.append(("V1b", "missing", "doSearch must resolve its page size through resolvePageSize("))
     parse_contacts = _payload_helper_bodies(contacts, "parseContactsCommand")
     if parse_contacts is None:
         findings.append(("V1c", "missing", "internal fun parseContactsCommand(argv: List<String>)"))
@@ -1351,6 +1351,249 @@ def check_sessions_send_status(sessions_src: str) -> list:
     return findings
 
 
+# ── [dv28-A6 A-06] the android-contacts page-size contract ──────────────────
+#
+# One contract (`--max N` / its legacy `-n N` alias) had three gaps, all of the
+# same shape: a spelled-but-unusable value was treated as "spelled nothing".
+#
+#   CN1  `--max abc` was read through `getInt`, which maps "unreadable" onto
+#        "absent" — the handler answered the default (50 list / 20 search) at
+#        exit 0, so the caller believed the requested page size took effect.
+#   CN2  `-n` is bound to `--max` only for a NUMERIC value, so a surviving `-n`
+#        flag means "the token after it is not a number" — and that token sat in
+#        the positional list, where `searchQueryOf` reads positional[1]: the
+#        invocation `search -n abc Alice` searched for "abc" and dropped
+#        "Alice". Reading the alias value back out of the positional list (the
+#        pre-dv14 spelling) is exactly what made that silent.
+#   CN3  0 / negative reached `collectContactPage`, whose `rows.size < max` loop
+#        exits at once: the handler answered an empty page `[]` at exit 0, which
+#        is indistinguishable from "no contacts".
+#
+# Every anchor below is derived: the resolver is the function that takes a
+# `default` parameter and reads the `max` CLI key (the key IS the contract); the
+# outcome type, its variants, the upper-bound constant and the exit-2 producers
+# all come from their declarations — so renaming one keeps the rules pointing at
+# the same decision, and deleting one lands as a finding instead of a silently
+# narrower rule set (fail-closed).
+def _match_brace(code: str, open_idx: int):
+    """`{…}` text from `open_idx` (which must be a brace), or None."""
+    if open_idx >= len(code) or code[open_idx] != "{":
+        return None
+    depth = 0
+    k = open_idx
+    while k < len(code):
+        if code[k] == "{":
+            depth += 1
+        elif code[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return code[open_idx:k + 1]
+        k += 1
+    return None
+
+
+def _expr_body(code: str, eq_idx: int) -> str:
+    """Text of a single expression body, from the token after `=` up to the
+    newline that closes it (bracket depth 0). The expression may start on the
+    NEXT line, which is the house style for a long signature."""
+    k = eq_idx + 1
+    while k < len(code) and code[k] in " \t\r\n":
+        k += 1
+    start = k
+    depth = 0
+    while k < len(code):
+        c = code[k]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth < 0:
+                break
+        elif c == "\n" and depth <= 0:
+            break
+        k += 1
+    return code[start:k]
+
+
+def _fn_bodies_with_sigs(code: str):
+    """[(name, params, return_type, body)] for every `fun` in `code`.
+
+    The body is the braced block, or the expression after `=` — an
+    expression-bodied helper (`fun f(): T = NativeOffloadResult(2, …)`) still
+    answers a usage error, so it must be readable like its braced twin.
+    """
+    out = []
+    for m in re.finditer(r"\bfun\s+(?:<[^>]*>\s*)?(?:[\w.]+\.)?(\w+)\s*\(", code):
+        name = m.group(1)
+        i, depth = m.end() - 1, 0
+        while i < len(code):
+            if code[i] == "(":
+                depth += 1
+            elif code[i] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            i += 1
+        params = code[m.end():i]
+        k = i + 1
+        rm = re.match(r"\s*:\s*([\w.<>?]+)", code[k:])
+        ret = rm.group(1) if rm else ""
+        if rm:
+            k += rm.end()
+        body = ""
+        while k < len(code) and code[k] not in "{=":
+            k += 1
+        if k < len(code):
+            body = (_match_brace(code, k) or "") if code[k] == "{" else _expr_body(code, k)
+        out.append((name, params, ret, body))
+    return out
+
+
+def _contacts_page_resolver(code: str):
+    """The ONE page-size resolver: takes a `default`, reads the `max` CLI key."""
+    return [
+        (name, params, ret, body)
+        for name, params, ret, body in _fn_bodies_with_sigs(code)
+        if body and "default" in params and '"max"' in body
+    ]
+
+
+def _exit2_producers(code: str) -> set:
+    """Names of helpers that answer the shared usage-error exit code."""
+    return {
+        name for name, _p, _r, body in _fn_bodies_with_sigs(code)
+        if "NativeOffloadResult(2" in body
+    }
+
+
+def check_contacts_page_size(contacts_src: str) -> list:
+    """[dv28-A6 A-06] CN1-CN4 — see the block comment above."""
+    findings = []
+    code = code_only(contacts_src)
+    resolvers = _contacts_page_resolver(code)
+    if len(resolvers) != 1:
+        findings.append(
+            ("CN0", f"{len(resolvers)} page-size resolver(s)",
+             "exactly one function (a `default` parameter + the `max` CLI key) "
+             "must resolve the page size"))
+        return findings
+    name, _params, ret, body = resolvers[0]
+
+    sealed = bool(ret) and re.search(r"sealed class\s+" + re.escape(ret) + r"\b", code) is not None
+    variants = re.findall(
+        r"(?:data\s+)?(?:class|object)\s+(\w+)\s*(?:\([^)]*\))?\s*:\s*"
+        + re.escape(ret) + r"\(",
+        code,
+    ) if ret else []
+    refused = []
+    default_variant = None
+    if not sealed or len(variants) < 2:
+        findings.append(
+            ("CN1", "no two-outcome type",
+             f"the resolver's outcome type ({ret or 'none'}) must be a sealed type "
+             "with at least an ok and a refused variant"))
+    else:
+        defaults = list(re.finditer(r"return\s+([\w.]+)\s*\(\s*default\s*\)", body))
+        if len(defaults) != 1:
+            findings.append(
+                ("CN1", f"{len(defaults)} default answers",
+                 "exactly one return may answer the default (the last one, reached "
+                 "only when no page size was spelled)"))
+        else:
+            default_variant = defaults[0].group(1)
+        refused = [v for v in variants if v != default_variant]
+
+    # CN1 — the default may only answer an ABSENT option.
+    if re.search(r"\bgetInt\s*\(", body):
+        findings.append(
+            ("CN1", "lossy integer read",
+             "the page size is read with getInt(...), which maps 'spelled but "
+             "unreadable' onto 'absent' — read the raw value and validate it"))
+    if re.search(r"hasFlag\([^)]*\"max\"", body) is None:
+        findings.append(
+            ("CN1", "a bare --max is not refused",
+             "`--max` with no value binds no value at all (OffloadArgs files the "
+             "key as a flag), so the option's own presence must be checked or the "
+             "invocation silently answers the default"))
+    if default_variant is not None:
+        defaults = list(re.finditer(r"return\s+([\w.]+)\s*\(\s*default\s*\)", body))
+        constructed = [
+            (v, m.start())
+            for v in refused
+            for m in re.finditer(r"\b" + re.escape(v) + r"\s*\(", body)
+        ]
+        if not constructed:
+            findings.append(
+                ("CN1", "no refusal path",
+                 f"the resolver never constructs a refusal variant (of {refused}) — "
+                 "a spelled-but-unusable value would fall through to the default"))
+        elif defaults and min(i for _v, i in constructed) > defaults[0].start():
+            findings.append(
+                ("CN1", "default answered first",
+                 "the refusal path must be reached BEFORE the default answer"))
+
+    # CN2 — a surviving `-n` means "the value after it is not a number".
+    flag_at = re.search(r"hasFlag\([^)]*\"n\"", body)
+    if flag_at is None:
+        findings.append(
+            ("CN2", "the -n flag is never consulted",
+             "a `-n` that survived the alias rewrite carries no number — it must "
+             "be refused here, or its token reaches the query slot"))
+    else:
+        tail = body[flag_at.end():]
+        if not any(re.search(r"\b" + re.escape(v) + r"\s*\(", tail) for v in refused):
+            findings.append(
+                ("CN2", "the -n branch does not refuse",
+                 "the `-n` branch must construct a refusal (that token is not a "
+                 "page size, and it must not be searched for)"))
+    if re.search(r"positional\.getOrNull\(\s*1\s*\)\s*\)?\s*\?\.\s*toInt", body):
+        findings.append(
+            ("CN2", "alias value recovered from the positional list",
+             "reading the -n value back out of positional[] is what let `-n abc` "
+             "leave \"abc\" in the query slot"))
+
+    # CN3 — the resolved size must be positive and bounded; both numbers are
+    # derived from their declarations in the same file.
+    closure = body + "".join(
+        b for _n, _p, _r, b in _fn_bodies_with_sigs(code)
+        if b and re.search(r"\b" + re.escape(_n) + r"\s*\(", body)
+    )
+    if not re.search(r"<\s*1\b|<=\s*0\b|!\s*in\s+1\s*\.\.", closure):
+        findings.append(
+            ("CN3", "no positive lower bound",
+             "a zero/negative page size must be refused before it reaches "
+             "collectContactPage (an empty page reads as 'no contacts')"))
+    bounds = re.findall(r"const val\s+(\w*MAX\w*)\s*=\s*(\d+)", code)
+    if not bounds:
+        findings.append(
+            ("CN3", "no declared upper bound",
+             "the page size must be bounded by a named constant"))
+    elif not any(nm in closure and ">" in closure for nm, _v in bounds):
+        findings.append(
+            ("CN3", "the upper bound is never compared",
+             f"the declared bound(s) {[nm for nm, _v in bounds]} must be compared "
+             "against the resolved size"))
+
+    # CN4 — every subcommand that collects a page must go through the resolver
+    # and answer a refusal as a usage error (exit 2), not as an empty page.
+    producers = _exit2_producers(code)
+    exit2 = "|".join([r"NativeOffloadResult\(2"] + [re.escape(p) + r"\s*\(" for p in sorted(producers)])
+    for fn, _p, _r, fbody in _fn_bodies_with_sigs(code):
+        if not fbody or fn == name or "collectContactPage(" not in fbody:
+            continue
+        if not re.search(r"\b" + re.escape(name) + r"\s*\(", fbody):
+            findings.append(
+                ("CN4", f"collectContactPage caller `{fn}` skips the resolver",
+                 f"`{fn}` must resolve the page size through `{name}`"))
+            continue
+        if not re.search(r"return\s+(?:" + exit2 + r")", fbody):
+            findings.append(
+                ("CN4", f"collectContactPage caller `{fn}` cannot refuse",
+                 "a resolution the handler cannot honour must be answered as a "
+                 "usage error (exit 2), never as a default page size"))
+    return findings
+
+
 # ── selftest: every rule must have a tooth, and the green arm must pass ──────
 
 GREEN_CONTACTS = """
@@ -1383,13 +1626,71 @@ GREEN_CONTACTS = """
             return rewritten
         }
         internal fun doSearch(parsedArgs: OffloadArgs): NativeOffloadResult {
+            val max = resolvePageSize(parsedArgs, 20)
             val query = searchQueryOf(parsedArgs.positional)
                 ?: return NativeOffloadResult(2, "android-contacts search: missing <query>\n")
-            val max = listMax(parsedArgs, 20)
             return NativeOffloadResult(0, OffloadOutput.formatBody(arr.toString(2), parsedArgs) + "\n")
         }
-        internal fun listMax(parsedArgs: OffloadArgs, default: Int = DEFAULT_LIST_MAX): Int {
-            parsedArgs.getInt("max")?.let { return it }
+        internal fun resolvePageSize(parsedArgs: OffloadArgs, default: Int = DEFAULT_LIST_MAX): PageSize {
+            parsedArgs.get("max")?.let { raw -> return pageSizeOf(raw, "--max") }
+            if (parsedArgs.hasFlag("max")) {
+                return PageSize.Invalid("--max expects an integer between 1 and $MAX_PAGE_SIZE")
+            }
+            if (parsedArgs.hasFlag("n")) {
+                return PageSize.Invalid("-n expects an integer between 1 and $MAX_PAGE_SIZE")
+            }
+            return PageSize.Ok(default)
+        }
+    }
+"""
+
+# [dv28-A6 A-06] green fixture for the page-size contract (CN1-CN4). It states
+# the wanted shape: one resolver whose default is answered only when nothing was
+# spelled, two refusals (a collapsed `--max` and a surviving `-n`), a validated
+# range, and both page collectors turning a refusal into exit 2.
+GREEN_CONTACTS_PAGE = """
+    private fun doList(parsedArgs: OffloadArgs): NativeOffloadResult {
+        val max = when (val size = resolvePageSize(parsedArgs)) {
+            is PageSize.Ok -> size.value
+            is PageSize.Invalid -> return pageSizeRefusal("list", size.message)
+        }
+        val rows = collectContactPage(cursor, max)
+        return NativeOffloadResult(0, "[]\\n")
+    }
+    private fun doSearch(parsedArgs: OffloadArgs): NativeOffloadResult {
+        val max = when (val size = resolvePageSize(parsedArgs, 20)) {
+            is PageSize.Ok -> size.value
+            is PageSize.Invalid -> return pageSizeRefusal("search", size.message)
+        }
+        val rows = collectContactPage(cursor, max)
+        return NativeOffloadResult(0, "[]\\n")
+    }
+    companion object {
+        internal const val MAX_PAGE_SIZE = 500
+        private const val DEFAULT_LIST_MAX = 50
+        internal sealed class PageSize {
+            data class Ok(val value: Int) : PageSize()
+            data class Invalid(val message: String) : PageSize()
+        }
+        internal fun resolvePageSize(parsedArgs: OffloadArgs, default: Int = DEFAULT_LIST_MAX): PageSize {
+            parsedArgs.get("max")?.let { raw -> return pageSizeOf(raw, "--max") }
+            if (parsedArgs.hasFlag("max")) {
+                return PageSize.Invalid("--max expects an integer between 1 and $MAX_PAGE_SIZE")
+            }
+            if (parsedArgs.hasFlag("n")) {
+                return PageSize.Invalid("-n expects an integer between 1 and $MAX_PAGE_SIZE")
+            }
+            return PageSize.Ok(default)
+        }
+        private fun pageSizeOf(raw: String, spelled: String): PageSize {
+            val value = raw.toIntOrNull() ?: return PageSize.Invalid("$spelled: '$raw'")
+            if (value < 1 || value > MAX_PAGE_SIZE) {
+                return PageSize.Invalid("$spelled: $value")
+            }
+            return PageSize.Ok(value)
+        }
+        private fun pageSizeRefusal(sub: String, message: String): NativeOffloadResult {
+            return NativeOffloadResult(2, "android-contacts $sub: $message")
         }
     }
 """
@@ -2744,8 +3045,8 @@ def selftest() -> int:
          GREEN_CONFIG, {"C8"}),
         ("max resolver loses the parsed shape",
          GREEN_CONTACTS.replace(
-             "internal fun listMax(parsedArgs: OffloadArgs, default: Int = DEFAULT_LIST_MAX): Int {",
-             "internal fun listMax(args: List<String>): Int {"),
+             "internal fun resolvePageSize(parsedArgs: OffloadArgs, default: Int = DEFAULT_LIST_MAX)",
+             "internal fun resolvePageSize(args: List<String>)"),
          GREEN_CONFIG, {"C9"}),
         ("sub off the raw list",
          GREEN_CONTACTS.replace("sub = args.positional.getOrNull(0)", "sub = rawArgs[0]"),
@@ -3335,11 +3636,11 @@ def selftest() -> int:
     # scan knowing too small a boolean set (both halves of it).
     red_cases_bindings = [
         ("contacts: doSearch reverts to the dead alias read",
-         GREEN_CONTACTS.replace("val max = listMax(parsedArgs, 20)",
+         GREEN_CONTACTS.replace("val max = resolvePageSize(parsedArgs, 20)",
                                 'val max = parsedArgs.getInt("max", "n") ?: 20'),
          GREEN_NOTIFICATION_HANDLE, GREEN_FASTIO, {"V1a", "V1b"}),
         ("contacts: doSearch stops reusing the resolver",
-         GREEN_CONTACTS.replace("val max = listMax(parsedArgs, 20)", "val max = 20"),
+         GREEN_CONTACTS.replace("val max = resolvePageSize(parsedArgs, 20)", "val max = 20"),
          GREEN_NOTIFICATION_HANDLE, GREEN_FASTIO, {"V1b"}),
         ("contacts: the -n alias stops being bound before the parse",
          GREEN_CONTACTS.replace("OffloadArgs(bindLegacyShortMax(argv), booleanFlags",
@@ -3432,6 +3733,63 @@ def selftest() -> int:
          GREEN_CONTACTS.replace("            return rewritten\n", "            return argv\n"),
          GREEN_NOTIFICATION_HANDLE, GREEN_FASTIO, {"V1g"}),
     ]
+    # [dv28-A6 A-06] the page-size contract teeth. Expected id sets are written
+    # by hand from the CN table (never derived from a run): one arm per way the
+    # three gaps can come back, plus the fail-closed arm for a lost resolver.
+    red_cases_page = [
+        ("page size: the value is read through a lossy getInt (gap 1)",
+         GREEN_CONTACTS_PAGE.replace(
+             'parsedArgs.get("max")?.let { raw -> return pageSizeOf(raw, "--max") }',
+             'parsedArgs.getInt("max")?.let { raw -> return pageSizeOf(raw.toString(), "--max") }'),
+         {"CN1"}),
+        ("page size: a bare --max falls through to the default",
+         GREEN_CONTACTS_PAGE.replace(
+             'if (parsedArgs.hasFlag("max")) {\n'
+             '                return PageSize.Invalid("--max expects an integer between 1 and $MAX_PAGE_SIZE")\n'
+             '            }\n', ''),
+         {"CN1"}),
+        ("page size: a surviving -n is ignored (gap 2)",
+         GREEN_CONTACTS_PAGE.replace(
+             'if (parsedArgs.hasFlag("n")) {\n'
+             '                return PageSize.Invalid("-n expects an integer between 1 and $MAX_PAGE_SIZE")\n'
+             '            }\n', ''),
+         {"CN2"}),
+        ("page size: the positive lower bound is dropped (gap 3)",
+         GREEN_CONTACTS_PAGE.replace(
+             "if (value < 1 || value > MAX_PAGE_SIZE) {",
+             "if (value > MAX_PAGE_SIZE) {"),
+         {"CN3"}),
+        ("page size: a collector answers a refusal as a default page",
+         GREEN_CONTACTS_PAGE.replace(
+             'is PageSize.Invalid -> return pageSizeRefusal("list", size.message)',
+             'is PageSize.Invalid -> 50'),
+         {"CN4"}),
+        ("page size: the collector calls a resolver that is not the one defined",
+         GREEN_CONTACTS_PAGE.replace(
+             "internal fun resolvePageSize(parsedArgs: OffloadArgs, default: Int = DEFAULT_LIST_MAX)",
+             "internal fun unusedPageSize(parsedArgs: OffloadArgs, default: Int = DEFAULT_LIST_MAX)"),
+         {"CN4"}),
+        ("fail-closed: the resolver loses its shape (no default parameter)",
+         GREEN_CONTACTS_PAGE.replace(
+             "internal fun resolvePageSize(parsedArgs: OffloadArgs, default: Int = DEFAULT_LIST_MAX)",
+             "internal fun resolvePageSize(parsedArgs: OffloadArgs)").replace(
+             "return PageSize.Ok(default)", "return PageSize.Ok(DEFAULT_LIST_MAX)"),
+         {"CN0"}),
+    ]
+    for label, src, want in red_cases_page:
+        if src == GREEN_CONTACTS_PAGE:
+            print(f"SELFTEST-FAIL: {label}: mutation did not apply to any arm")
+            failures += 1
+            continue
+        got = {rid for rid, _, _ in check_contacts_page_size(src)}
+        if got != want:
+            print(f"SELFTEST-FAIL: {label}: got {sorted(got)}, want {sorted(want)}")
+            failures += 1
+    # green control for the page-size contract
+    if _page_clean := check_contacts_page_size(GREEN_CONTACTS_PAGE):
+        print(f"SELFTEST-FAIL: page-size green fixture is not clean: {describe(_page_clean)}")
+        failures += 1
+
     for label, contacts_src, notif_src, fastio_src, want in red_cases_bindings:
         if contacts_src == GREEN_CONTACTS and notif_src == GREEN_NOTIFICATION_HANDLE \
                 and fastio_src == GREEN_FASTIO:
@@ -3738,6 +4096,8 @@ def main(argv):
     findings += check_offload_cli_bindings(contacts_path.read_text(encoding="utf-8"),
                                           notification_path.read_text(encoding="utf-8"),
                                           fastio_path.read_text(encoding="utf-8"))
+    # [dv28-A6 A-06] the android-contacts page-size contract (CN1-CN4)
+    findings += check_contacts_page_size(contacts_path.read_text(encoding="utf-8"))
     findings += check_offload_json(*payload_files)
     findings += check_clipboard_clear((root / CLIPBOARD).read_text(encoding="utf-8"))
     findings += check_fastio_search(search_path.read_text(encoding="utf-8"))
@@ -3765,7 +4125,9 @@ def main(argv):
           "9/9 payload files hand formatBody JSON (N1 whole-file, N2 payload helpers), "
           "cross-file payload delegates registered (Z1 derived members, Z2 no String "
           "delegate in a payload file, Z3 exemptions still needed, Z4 derivation alive), "
-          "contacts search -n bound to --max through the one resolver, notification --after "
+          "contacts page size validated (refuse non-numeric / <=0 / >bound, -n alias "
+          "survives only as a refusal, both collectors answer exit 2), "
+          "notification --after "
           "refuses an unreadable value, fastio subcommand scan knows its boolean flags "
           "and consumes -C, photos --album decision classified (non-numeric --id refuses), "
           "contacts subcommand probe reads the rewritten alias list, sessions declares "
