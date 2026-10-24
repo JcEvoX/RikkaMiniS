@@ -94,6 +94,152 @@ def _strip_line_comments(text):
     return "\n".join(line.split("//")[0] for line in text.split("\n"))
 
 
+# [wide-1024] Value-flow helpers. Two rules run through this gate:
+#  * a scope call that keeps its RECEIVER (`.also` / `.apply` / `.onEach` /
+#    `.forEach`) cannot make an expression "come from" something the lambda
+#    merely mentions — whatever it references is discarded;
+#  * a decision only counts as taken if the code that depends on it is
+#    REACHABLE on the answered side, not merely textually after the call.
+_DISCARD_SCOPE_RE = re.compile(r"\.\s*(?:also|apply|onEach|forEach)\s*\{")
+DEAD_GUARD_RE = re.compile(r"\b(?:if|while)\s*\(\s*!?\s*(?:true|false)\b")
+NEG_USE_RE = re.compile(r"if\s*\([^)]*!\s*is\s+" + re.escape("SessionModelResolution.Use"))
+_CONTINUATION = ".?:+-*/%&|=<>!"
+
+
+def _brace_end(text, open_idx):
+    """Index one past the matching `}`, or -1 (fail-closed)."""
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == "{":
+            depth += 1
+        elif text[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return -1
+
+
+def _match(text, idx, opener, closer):
+    """Index one past the matching [closer] for the [opener] at [idx], or -1."""
+    depth = 0
+    for i in range(idx, len(text)):
+        if text[i] == opener:
+            depth += 1
+        elif text[i] == closer:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return -1
+
+
+CONST_COND_PREFIX_RE = re.compile(r"^\s*!?\s*(?:true|false)\s*(?:\)|&&|\|\|)")
+
+
+def _dead_use_guards(body):
+    """Every `if (false && … Use …)` / `if (true || …)` around the Use test.
+
+    [wide-1024] The guard can keep the funnel name, the `!is` polarity and the
+    `throw` and still be skipped: a constant first operand short-circuits the
+    whole condition, so the rejection never runs while every token the gate
+    looked for is present.
+    """
+    out = []
+    for m in re.finditer(re.escape(FUNNEL_USE), body):
+        i = body.rfind("if", 0, m.start())
+        if i < 0:
+            continue
+        paren = body.find("(", i)
+        if paren < 0 or paren > m.start():
+            continue
+        close = _match(body, paren, "(", ")")
+        if close < 0:
+            continue
+        cond = body[paren + 1:close - 1]
+        if CONST_COND_PREFIX_RE.match(cond):
+            out.append(cond.strip()[:90])
+    return out
+
+
+def _peel_discarding(expr, rounds=4):
+    """Drop `.also/.apply/.onEach/.forEach { … }` scopes, keeping the receiver:
+    the value of the whole expression is the receiver's value."""
+    for _ in range(rounds):
+        m = _DISCARD_SCOPE_RE.search(expr)
+        if not m:
+            break
+        brace = m.end() - 1
+        end = _brace_end(expr, brace)
+        if end < 0:
+            break
+        expr = expr[:m.start()] + expr[end:]
+    return expr
+
+
+def _value_end(text, start):
+    """End of the expression starting at [start]: the first newline at bracket
+    depth 0 that is not a continuation (`.`, `?:`, an operator)."""
+    depth = 0
+    i, n = start, len(text)
+    while i < n:
+        c = text[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                return i
+            depth -= 1
+        elif c == "\n" and depth == 0:
+            j = i + 1
+            while j < n and text[j] in " \t":
+                j += 1
+            if j >= n or text[j] not in _CONTINUATION:
+                return i
+        i += 1
+    return n
+
+
+def _use_branch_encloses(seg, pos):
+    """Is [pos] nested inside a block whose header tests the decision for Use?"""
+    lines = seg.split("\n")
+    line_no = seg.count("\n", 0, pos)
+    indent = len(lines[line_no]) - len(lines[line_no].lstrip())
+    i = line_no - 1
+    while i >= 0:
+        ln = lines[i]
+        if ln.strip():
+            ind = len(ln) - len(ln.lstrip())
+            if ind < indent:
+                header = _logical_header(lines, i)
+                if "if" in header and "{" in header and FUNNEL_USE in header:
+                    return True
+                indent = ind
+        i -= 1
+    return False
+
+
+def _terminating_negative_guard(seg, call_at, pos):
+    """Does a `if (decision !is …Use) { … return/throw … }` sit between the
+    decision and the write? Then everything after it is the usable side."""
+    region = seg[call_at:pos]
+    for m in NEG_USE_RE.finditer(region):
+        tail = region[m.end():]
+        brace = tail.find("{")
+        line_end = tail.find("\n")
+        if line_end < 0:
+            line_end = len(tail)
+        if brace < 0 or brace > line_end:
+            # braceless form: `if (decision !is …Use) return false`
+            if re.search(r"\b(?:return|throw)\b", tail[:line_end]):
+                return True
+            continue
+        end = _brace_end(tail, brace)
+        if end < 0:
+            continue
+        if re.search(r"\b(?:return|throw)\b", tail[brace:end]):
+            return True
+    return False
+
+
 def _call_args(text, open_idx):
     """Split the argument list whose `(` sits at `open_idx` (None if unbalanced)."""
     depth = 0
@@ -127,14 +273,20 @@ def _enclosing_source(text, pos):
 
 
 def _assigned_from(window, name):
-    """Is `name` assigned from one of ENRICH_CALLS inside `window`?"""
+    """Is `name` assigned FROM one of ENRICH_CALLS inside `window`?
+
+    [wide-1024] "the call appears in the right-hand side" is not the question:
+    `val effectiveModel = entry.model.also { providerModelFor(entry) }` keeps
+    the call in the text and hands `entry.model` — the raw, un-enriched model —
+    to every `ProviderFactory.create` below, because `.also {}` returns its
+    receiver. Judge the peeled value instead (see [_peel_discarding]).
+    """
     pat = re.compile(r"\b(?:val|var)\s+%s\b[^=\n]*=" % re.escape(name))
     for m in pat.finditer(window):
         rest = window[m.end():]
-        # include the continuation line so a wrapped `=\n providerModelFor(` counts
-        head = rest.split("\n", 2)
-        rhs = head[0] + ("\n" + head[1] if len(head) > 1 else "")
-        if any(tok in rhs for tok in ENRICH_CALLS):
+        rhs = rest[:_value_end(rest, 0)]
+        value = _peel_discarding(rhs)
+        if any(tok in value for tok in ENRICH_CALLS):
             return True
     return False
 
@@ -262,6 +414,32 @@ def check_source(text):
                     % (site, token)
                 )
                 break
+        # [wide-1024] `decide … then write` is only half the property: the
+        # write must happen where the decision SAID YES. One stray line above
+        # the `if (decision is …Use)` branch keeps the order (call first) and
+        # publishes a disabled provider / a key-less instance as "model ready"
+        # — da1019-FIX-E verbatim.
+        if DEAD_GUARD_RE.search(seg):
+            v.append(
+                "%s: the decision is guarded behind a constant condition (`%s`) "
+                "— the funnel's answer is computed and then ignored"
+                % (site, DEAD_GUARD_RE.search(seg).group(0)))
+        for wm in re.finditer(
+                r"\b(?:currentModel|_modelName\.value|_activeEntryId\.value|"
+                r"_providerName\.value|currentProvider)\s*=", seg):
+            wp = wm.start()
+            if wp < call_at:
+                continue
+            if _use_branch_encloses(seg, wp) or \
+                    _terminating_negative_guard(seg, call_at, wp):
+                continue
+            v.append(
+                "%s: state write `%s` runs after the decision but OUTSIDE its "
+                "Use branch (no terminating `!is …Use` guard before it, not "
+                "nested in the `is …Use` branch) — a disabled provider or a "
+                "key-less instance is published as ready (da1019-FIX-E)"
+                % (site, wm.group(0).strip()))
+            break
 
     # ── D. [deep-audit-1044 B-04] applyNewChatDefaultModel must publish the
     # model it just resolved. Its KDoc has always promised
@@ -463,7 +641,12 @@ def _traces_to_active(code, name, hops=3):
         m = re.search(r"\bval\s+%s\b[^=\n]*=" % re.escape(n), code)
         if not m:
             return False
-        stmt = code[m.end():m.end() + 400].split("\n\n")[0]
+        rest = code[m.end():]
+        # [wide-1024] The traced name must CARRY the resolved id. `.also {}` /
+        # `.apply {}` keep their receiver, so `entryId.also { plan
+        # .effectiveEntryId }` mentions the resolution, evaluates to `entryId`,
+        # and used to be accepted because the token `plan` was in the window.
+        stmt = _peel_discarding(rest[:_value_end(rest, 0)])
         if ACTIVE_ENTRY in stmt:
             return True
         for cand in set(re.findall(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\b", stmt)):
@@ -742,6 +925,16 @@ def check_binding_writes(texts):
             "be judged (fail-closed)" % BINDING_WRITE_CALL.rstrip("(")
         ]
     v = []
+    # [wide-1024] Scope matters: the Use guard is a DECISION site, not only a
+    # write-entry one — `selectModel` holds a guard and writes nothing, so an
+    # entries-only sweep left it unjudged. Scan every function.
+    for rel, code in sorted(code_by_rel.items()):
+        for name, body in _all_funs(code):
+            for cond in _dead_use_guards(body):
+                v.append(
+                    "%s: `%s` short-circuits the Use test with a constant "
+                    "(`if (%s…`) — the funnel is called and its answer is "
+                    "ignored (C-SEL-4)" % (rel, name, cond))
     entries = 0
     for rel, code in sorted(code_by_rel.items()):
         for name, body in _all_funs(code):
@@ -995,6 +1188,40 @@ def _fixture(funnel, p2, entry, apply):
     return funnel + "\n" + p2 + "\n" + entry + "\n" + apply + "\n"
 
 
+# ── [wide-1024] witnesses: the knives that used to walk through this gate ──
+# W1 (order): the decision is taken first, and a state write still happens
+# BEFORE (a sibling of) the branch that would license it.
+W_P2_WRITE_BEFORE_BRANCH = GOOD_P2.replace(
+    "                val decision = decideSessionModelResolution(entry, instance, apiKey)\n",
+    "                val decision = decideSessionModelResolution(entry, instance, apiKey)\n"
+    "                _activeEntryId.value = entry.id\n")
+
+# W2 (dataflow): the enriched call is present and its result is discarded.
+W_APPLY_DISCARDED_ENRICH = """internal fun ChatViewModel.applyNewChatDefaultModel(): Boolean {
+    val entry = providerRepository.lastUsedVisibleEntry() ?: return false
+    val instance = providerRepository.instance(entry.providerInstanceId)
+    val apiKey = instance?.let { providerRepository.loadApiKey(it.id) }
+    val decision = decideSessionModelResolution(entry, instance, apiKey)
+    if (decision !is SessionModelResolution.Use) return false
+    val effectiveModel = entry.model.also { providerModelFor(entry) }
+    currentModel = effectiveModel
+    currentProvider = ProviderFactory.create(decision.instance, decision.apiKey, effectiveModel, context)
+    return true
+}
+"""
+
+# W3 (dataflow): the resolved id is mentioned inside a discarded `.also` and
+# the value stays the requested id.
+W_CSEL2_DISCARDED_PLAN = CSEL_ROUTING_GOOD.replace(
+    "        val resolvedEntryId = plan.effectiveEntryId ?: return",
+    "        val resolvedEntryId = entryId.also { plan.effectiveEntryId }")
+
+# W4 (order): the funnel guard keeps its name and loses its teeth.
+W_CSEL4_DEAD_GUARD = BW_RUNNER_GOOD.replace(
+    "                if (decision !is SessionModelResolution.Use) return null",
+    "                if (false && decision !is SessionModelResolution.Use) return null")
+
+
 def selftest():
     failures = []
 
@@ -1109,6 +1336,28 @@ def selftest():
 
     print("selftest C-SEL-4 binding write -> good=%d pre=%d nofunnel=%d nowriter=%d"
           % (len(bw_good), len(bw_pre), len(bw_no_funnel), len(bw_no_writer)))
+
+    # ── [wide-1024] witness knives ────────────────────────────────────────
+    w1 = check_source(_fixture(GOOD_FUNNEL, W_P2_WRITE_BEFORE_BRANCH, GOOD_ENTRY, GOOD_APPLY))
+    expect(any("loadSession-priority2" in x and "OUTSIDE its Use branch" in x for x in w1),
+           "W1: a state write before the Use branch produced no violation (%r)" % (w1,))
+
+    w2, _sites = check_factory_models({"lc": W_APPLY_DISCARDED_ENRICH}, min_calls=1)
+    expect(any("not resolved through" in x for x in w2),
+           "W2: `entry.model.also { providerModelFor(entry) }` produced no violation (%r)" % (w2,))
+
+    w3 = check_group_selection(
+        {ROUTING_REL: W_CSEL2_DISCARDED_PLAN, LIFECYCLE_REL: CSEL_LIFECYCLE_GOOD})
+    expect(any("C-SEL-2" in x for x in w3),
+           "W3: `entryId.also { plan.effectiveEntryId }` produced no C-SEL-2 violation (%r)" % (w3,))
+
+    w4 = check_binding_writes(
+        {DEBUG_DIR_REL + "/HeadlessChatRunner.kt": W_CSEL4_DEAD_GUARD})
+    expect(any("short-circuits the Use test with a constant" in x for x in w4),
+           "W4: `if (false && … !is …Use)` produced no C-SEL-4 violation (%r)" % (w4,))
+
+    print("selftest witness W1..W4      -> %d/%d/%d/%d violation(s)"
+          % (len(w1), len(w2), len(w3), len(w4)))
 
     if failures or not all(factory_results):
         for f in failures:

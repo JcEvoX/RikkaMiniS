@@ -123,6 +123,55 @@ def _balanced(src, open_idx, opener="(", closer=")"):
     return -1
 
 
+# ── [wide-1024] value-flow helpers ─────────────────────────────────────────
+# Two spellings of the same defect must not need two arms: what matters is
+# WHICH EXPRESSION PRODUCES THE VALUE, not whether a token appears somewhere
+# nearby. `.also { … }` / `.apply { … }` / `.onEach { … }` / `.forEach { … }`
+# keep the RECEIVER's value (whatever the lambda references is discarded),
+# while `.let { … }` / `.run { … }` take the lambda's LAST expression.
+_DISCARD_SCOPE_RE = re.compile(r"\.\s*(?:also|apply|onEach|forEach)\s*\{")
+_VALUE_SCOPE_RE = re.compile(r"\.\s*(?:let|run)\s*\{")
+DEAD_GUARD_RE = re.compile(r"\b(?:if|while)\s*\(\s*!?\s*(?:true|false)\b")
+INSTANCE_ID_RE = re.compile(r"\binstance\s*\.\s*id\b|\binstanceId\b")
+
+
+def _scope_body(expr, pattern):
+    """Body of the first `<pattern> { … }` block in [expr], or None."""
+    m = pattern.search(expr)
+    if not m:
+        return None
+    brace = m.end() - 1
+    end = _balanced(expr, brace, "{", "}")
+    return None if end < 0 else expr[brace + 1:end - 1]
+
+
+def _peel_discarding(expr, rounds=4):
+    """Remove value-discarding scope calls, keeping their receiver."""
+    for _ in range(rounds):
+        m = _DISCARD_SCOPE_RE.search(expr)
+        if not m:
+            break
+        brace = m.end() - 1
+        end = _balanced(expr, brace, "{", "}")
+        if end < 0:
+            break
+        expr = expr[:m.start()] + expr[end:]
+    return expr
+
+
+def value_expression(expr):
+    """The expression that actually determines the value of [expr].
+
+    Discarding scopes are peeled; a value-defining scope (`let`/`run`) is
+    replaced by its body, which is where the value really comes from.
+    """
+    core = _peel_discarding(expr.strip())
+    body = _scope_body(core, _VALUE_SCOPE_RE)
+    if body is not None:
+        return body.strip()
+    return core
+
+
 def function_text(src, header):
     i = src.find(header)
     if i < 0:
@@ -214,6 +263,32 @@ def check_arm1(src, rel):
             out.append((rel, 0, "1",
                         "ModelsCollection.add missing required code anchor `%s`"
                         % anchor))
+    # ── [wide-1024] judge the assigned VALUE, not its spelling ────────────
+    # `provider = instance.providerType.displayName.let { instance.id }`
+    # satisfies "the anchor is present" and "`provider = instanceId` is absent"
+    # while persisting the raw UUID — the `.let` body IS the value.
+    m = re.search(r"\bprovider\s*=\s*([^\n]+)", code)
+    if m is None:
+        out.append((rel, 0, "1",
+                    "ModelsCollection.add never assigns `provider =` — gate ROT"))
+    else:
+        raw = m.group(1).strip().rstrip(",")
+        val = value_expression(raw)
+        if INSTANCE_ID_RE.search(val):
+            if ("provider = " + raw) not in ARM1_FORBIDDEN:   # plain spelling already reported
+                out.append((rel, 0, "1",
+                            "ModelsCollection.add assigns `provider = %s`, whose VALUE "
+                            "is the instance id (`%s`) — the raw UUID the fix exists to "
+                            "keep out of LLMModel.provider (minis-model-use renders it "
+                            "and ModelsDevApi.enrichModel can never resolve it)"
+                            % (raw, val)))
+        elif "displayName" not in val:
+            out.append((rel, 0, "1",
+                        "ModelsCollection.add assigns `provider = %s`, whose VALUE "
+                        "does not name the provider family (`…providerType."
+                        "displayName` absent from the value expression) — a "
+                        "same-looking call that yields something else is the "
+                        "defect with a new spelling" % raw))
     # model_id gate must trim before validating. Anchor the declaration line
     # (plus the continuation line, Kotlin breaks after `?.value`) and demand
     # `.trim()` inside that statement. Fail-closed: no declaration ⇒ red.
@@ -291,6 +366,33 @@ def openai_call_sites(block):
     return out
 
 
+def _names_family(expr, block):
+    """Does [expr] evaluate to a provider FAMILY label?
+
+    Accepted: `…displayName` / `…name` of a ProviderType constant, a string
+    literal, or a local bound from one of those. Rejected: anything that
+    evaluates to the instance identity (`instance.id` / `instanceId` /
+    `instance.label`) — that is the UUID the whole 1026-ISSUE-04 fix exists to
+    keep out of `LLMModel.provider`, and it satisfies "non-null identifier"
+    just as well as the real label does.
+    """
+    val = value_expression(expr)
+    if INSTANCE_ID_RE.search(val) or re.search(r"\binstance\s*\.\s*label\b", val):
+        return "the value is the instance identity (`%s`), not a family label" % val.strip()
+    if re.search(r"\bdisplayName\b", val) or re.search(r"\.\s*name\b", val):
+        return None
+    if re.fullmatch(r'"[^"]*"', val.strip()):
+        return None
+    if block and re.fullmatch(r"[A-Za-z_]\w*", val.strip()):
+        decl = re.search(r"\b(?:val|var)\s+%s\s*=\s*([^\n]+)"
+                         % re.escape(val.strip()), block)
+        if decl is not None:
+            return _names_family(decl.group(1), "")
+    return ("the value `%s` is not a provider family label "
+            "(`ProviderType.<x>.displayName` / `.name` / a literal)"
+            % val.strip())
+
+
 def adapter_delivers_name(block, call):
     """Does this call site say which family the rows belong to?
 
@@ -298,27 +400,31 @@ def adapter_delivers_name(block, call):
     (same spirit as dv15-A2 accepting both `isSymbolicLink` and a NOFOLLOW
     open):
 
-      a) a `providerName = <expr>` argument whose value is not the literal
-         `null` (the fetcher takes it), or
+      a) a `providerName = <expr>` argument that EVALUATES to a family label
+         (see [_names_family]) — not merely to a non-null identifier, or
       b) a post-fetch relabel — the call chained into a `.map { }` /
          `.mapNotNull { }` that assigns `provider = …` — which is
          behaviourally equivalent and must not be forced into shape (a).
+
+    Returns None when the name is delivered, else the reason it is not.
     """
     _start, end, args = call
-    m = re.search(r"\bproviderName\s*=\s*([A-Za-z_][\w.]*)", args)
+    m = re.search(r"\bproviderName\s*=\s*([^\n,]+)", args)
     # `providerName = null` is the defect spelled politely — it re-declares
     # the default and hides it from the reader. The value must name something.
-    if m and m.group(1) != "null":
-        return True
+    if m:
+        return _names_family(m.group(1).strip(), block)
     tail = block[end:]
     m = re.match(r"\s*\.(map|mapIndexed|mapNotNull)\s*\{", tail)
     if not m:
-        return False
+        return "neither a `providerName = …` argument nor a post-fetch relabel"
     brace = end + m.end() - 1
     b_end = _balanced(block, brace, "{", "}")
     if b_end < 0:
-        return False
-    return re.search(r"\bprovider\s*=", block[brace:b_end]) is not None
+        return "the post-fetch relabel block is unbalanced (fail-closed)"
+    if re.search(r"\bprovider\s*=", block[brace:b_end]) is None:
+        return "the chained `.map { }` never assigns `provider =`"
+    return None
 
 
 def check_arm3(src, rel):
@@ -356,15 +462,15 @@ def check_arm3(src, rel):
             continue
         vendor_sites += len(calls)
         for start, _end, _args in calls:
-            if adapter_delivers_name(body, (start, _end, _args)):
+            reason = adapter_delivers_name(body, (start, _end, _args))
+            if reason is None:
                 continue
             out.append((rel, line_of(src, off + start), "3",
                         "%s delegates to OpenAIModelsApi.fetchModels for its own "
-                        "vendor base URL but supplies no provider name — neither "
-                        "a `providerName = <expr>` argument nor a post-fetch "
-                        "`.map { … provider = … }` relabel. Every returned row is "
-                        "stamped \"Custom\", so ModelsDevApi enrichment can never "
-                        "hit providerKeyMap for it (dv18-A-08)" % name))
+                        "vendor base URL but supplies no family name — %s. Every "
+                        "returned row is stamped \"Custom\", so ModelsDevApi "
+                        "enrichment can never hit providerKeyMap for it "
+                        "(dv18-A-08 / 1026-ISSUE-04)" % (name, reason)))
     if vendor_sites == 0 and not out:
         out.append((rel, 0, "3",
                     "no non-openAI adapter delegating to OpenAIModelsApi detected "
@@ -602,6 +708,22 @@ def check_arm6_chat(src, rel):
         body = ""
     else:
         body = _decl_block(code, "liveEffectiveModel") or ""
+    # [wide-1024] Reachability: the chain can be spelled perfectly and still be
+    # dead behind a constant condition — `= if (true) currentModel else <the
+    # whole enrichment chain>` keeps every token this arm looks for and returns
+    # the raw snapshot to all four readers.
+    if body and DEAD_GUARD_RE.search(body):
+        out.append((rel, 0, "6",
+                    "liveEffectiveModel short-circuits on a constant condition "
+                    "(`if (true)` / `if (false)`) — the enrichment chain is "
+                    "unreachable and every reader gets the raw snapshot "
+                    "(dv23-B7)"))
+    elif body and "_activeEntryId.value" not in body:
+        out.append((rel, 0, "6",
+                    "liveEffectiveModel no longer consults `_activeEntryId.value` "
+                    "— it answers from the raw snapshot only, so the pinned / "
+                    "group-resolved entry's overrides and models.dev data are "
+                    "ignored (dv23-B7)"))
     if body and "ModelsDevApi.effectiveModel(" not in body:
         out.append((rel, 0, "6",
                     "liveEffectiveModel no longer enriches the active entry through "
@@ -1029,6 +1151,26 @@ val other: ThinkingLevel
 """
 
 
+# ----------------------------------------------------------------------
+# [wide-1024] Witness fixtures — the exact knives that walked through,
+# reproduced verbatim so they stay caught (or the gate changes loudly).
+# ----------------------------------------------------------------------
+# W1 (Arm 1, dataflow): the assignment still SPELLS displayName, and its
+# `.let` body is what actually gets persisted.
+FIX_MC_VALUE_SWAP = FIX_MC_OK.replace(
+    "provider = instance.providerType.displayName,",
+    "provider = instance.providerType.displayName.let { instance.id },")
+
+# W2 (Arm 3, dataflow): the adapter passes a non-null identifier that is the
+# instance UUID instead of the family label.
+AD_W_INSTANCE_ID = AD_FIX_OK.replace(
+    "providerName = ProviderType.kimiCode.displayName,",
+    "providerName = instance.id,")
+
+# W3 (Arm 6, dataflow): every enrichment token survives; a constant condition
+# makes the chain unreachable. (Defined next to CVM_A6_OK below.)
+
+
 def _report(checks, fixture_name, label):
     if not checks:
         print("  [OK]   %s (%s)" % (fixture_name, label))
@@ -1087,6 +1229,14 @@ CVM_A6_OK = """class ChatViewModel {
         }
 }
 """
+
+# [wide-1024] W3 (Arm 6, dataflow): every enrichment token survives; a constant
+# condition makes the chain unreachable and the raw snapshot wins.
+CVM_A6_DEAD_CHAIN = CVM_A6_OK.replace(
+    """    private fun liveEffectiveModel(): LLMModel? =
+        _activeEntryId.value""",
+    """    private fun liveEffectiveModel(): LLMModel? =
+        if (true) currentModel else _activeEntryId.value""")
 
 # Pre-fix shape: no exit, every reader re-derives the lookup, the vision
 # predicate never normalises, and the raw snapshot is read directly.
@@ -1431,6 +1581,34 @@ def selftest():
                       "a KDoc that merely names the exit cannot satisfy the arm")
         ok &= arm7_of("reader-gone", "cst", "", 1,
                       "a removed out-of-class reader is ROT")
+
+        # ---- wide-1024 witness arms: the knives that used to pass ----------
+        # W1: `provider = …displayName.let { instance.id }` — the value is the
+        # UUID even though the spelling survived ⇒ arm 1, exactly one finding.
+        write("mc", FIX_MC_VALUE_SWAP)
+        w1 = [c for c in run_checks(tmp, rels) if c[2] == "1"]
+        write("mc", FIX_MC_OK)
+        if len(w1) != 1 or "VALUE" not in w1[0][3]:
+            print("  [FAIL] witness arm1 value-swap: expected 1 value finding, got %s"
+                  % [c[3][:60] for c in w1])
+            ok = False
+        else:
+            print("  [OK]   witness arm1 value-swap (displayName.let { instance.id }) reds")
+
+        # W2: `providerName = instance.id` ⇒ arm 3 alone.
+        write("ad", AD_W_INSTANCE_ID)
+        w2 = [c for c in run_checks(tmp, rels) if c[2] == "3"]
+        write("ad", AD_FIX_OK)
+        if len(w2) != 1 or "instance" not in w2[0][3]:
+            print("  [FAIL] witness arm3 instance-id: expected 1 finding about the "
+                  "instance identity, got %s" % [c[3][:60] for c in w2])
+            ok = False
+        else:
+            print("  [OK]   witness arm3 instance-id (`providerName = instance.id`) reds")
+
+        # W3: `if (true) currentModel else <chain>` ⇒ arm 6 alone.
+        ok &= arm6_of("dead-chain", CVM_A6_DEAD_CHAIN, 1,
+                      "a constant-condition shortcut reds the live exit")
 
     print("MODELS_PROVIDER_FIELD_SELFTEST=%s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1

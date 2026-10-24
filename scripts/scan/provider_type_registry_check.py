@@ -71,6 +71,23 @@ MD_IMPORTS = (
 # gate does not become a style cop.
 MERGE_TOKENS = ("flatMap", "modelsDevProviderIds", "legacyProviderNames", ".toMap()")
 ENUM_ITER_RE = re.compile(r"ProviderType\s*\.\s*(?:values\(\)|entries)")
+# [wide-1024] A branch whose body is a statically EMPTY list disarms the
+# mapping just as effectively as a missing branch: `ProviderType.xAI ->
+# emptyList()` keeps the `when` exhaustive (the compiler is happy) while the
+# family silently falls back to the order-dependent all-providers scan — the
+# exact F-212 failure this file's docstring opens with. A vendor that truly
+# has no models.dev row must be listed here, so the decision is explicit.
+EMPTY_MAPPING_RE = re.compile(
+    r"\b(?:emptyList|emptySet|emptyArray|listOf|setOf|arrayOf)\s*"
+    r"(?:<[^<>]*>\s*)?\(\s*\)")
+ALLOW_EMPTY_MAPPINGS = frozenset()
+# [wide-1024] The derived key set must still carry the displayName keys: the
+# add surfaces (`provider.models.add`, AddCustomModelScreen,
+# ModelsCollection.add) persist `ProviderType.displayName`, and for
+# Gemini / xAI / KimiCode that string differs from both `name` and the
+# legacy names, so dropping it is 1026-D all over again.
+DERIVED_KEYS_RE = re.compile(r"\.\s*(?:map|mapNotNull|associate)\s*\{")
+BOUND_IDS_RE = re.compile(r"\bval\s+(\w+)\s*=\s*[\w.]*\.?\s*modelsDevProviderIds\b")
 # Historical literal keys that must survive inside the mapOf(...) body.
 BASE_KEYS = ("Anthropic", "Google", "OpenAI", "OpenRouter", "Antigravity",
              "xAI", "Kimi", "Google Gemini", "xAI (Grok)", "Kimi Code")
@@ -137,6 +154,45 @@ def when_body(src, prop):
     return None if end < 0 else src[brace + 1:end]
 
 
+BRANCH_RE = re.compile(r"(?:ProviderType\s*\.\s*)?([A-Za-z_]\w*)\s*->")
+
+
+def branch_texts(body):
+    """{constant: branch body} for a `when` body.
+
+    A branch runs from its `->` to the next branch arrow. Bodies in this file
+    are single expressions, so arrow-to-arrow slicing is enough; a nested
+    lambda arrow shows up as an extra (never consulted) key.
+    """
+    out = {}
+    matches = list(BRANCH_RE.finditer(body))
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
+        name = m.group(1)
+        if name in out:          # first occurrence wins (later one is nested)
+            continue
+        out[name] = body[m.end():end]
+    return out
+
+
+def derived_body(src):
+    """Body of the `.flatMap { … }` that iterates the enum inside
+    `providerKeyMap`, or None when the derivation is gone."""
+    code = code_only(src)
+    i = code.find("providerKeyMap")
+    if i < 0:
+        return None
+    iter_m = ENUM_ITER_RE.search(code, i)
+    if not iter_m:
+        return None
+    fm = re.search(r"\.\s*(?:flatMap|map|mapNotNull)\s*\{", code[iter_m.end():])
+    if not fm:
+        return None
+    brace = iter_m.end() + fm.end() - 1
+    end = _balanced(code, brace, "{", "}")
+    return None if end < 0 else code[brace:end]
+
+
 def map_literal_text(src):
     """The `providerKeyMap = mapOf(...)` literal body (code-only)."""
     code = code_only(src)
@@ -186,6 +242,26 @@ def check_arm1(src, rel):
                             "`%s` does not cover ProviderType.%s — a new vendor "
                             "reached the enum without its models.dev mapping "
                             "(F-212 shape)" % (prop, c)))
+        # Arm 1e [wide-1024]: covering the constant is not enough — the branch
+        # must yield actual ids. `ProviderType.xAI -> emptyList()` keeps the
+        # `when` exhaustive and compiles, so every downstream lookup for that
+        # family returns nothing and grok-4.5 falls back to the relay scan.
+        branches = branch_texts(code)
+        for c in constants:
+            if c in ALLOW_EMPTY_MAPPINGS:
+                continue
+            text = branches.get(c)
+            if text is None:
+                continue  # already reported by 1d
+            if EMPTY_MAPPING_RE.search(code_only(text)):
+                out.append((rel, 0, "1e",
+                            "`%s` maps ProviderType.%s to an EMPTY list — the "
+                            "`when` stays exhaustive, so this compiles, and the "
+                            "family silently falls out of providerKeyMap (the "
+                            "F-212 / 1026 shape: grok-4.5 takes a relay's "
+                            "1,000,000 context). Give it its models.dev ids, or "
+                            "add it to ALLOW_EMPTY_MAPPINGS in this gate with a "
+                            "reason" % (prop, c)))
     return out
 
 
@@ -206,6 +282,48 @@ def check_arm2(src, rel):
         if token not in code:
             out.append((rel, 0, "2b",
                         "providerKeyMap merge is missing `%s`" % token))
+    # Arm 2d/2e [wide-1024]: the merge tokens can all be present while the
+    # derived table carries the wrong KEYS or the wrong VALUES — both are
+    # behaviourally identical to no derivation at all, so presence alone is not
+    # a judgement.
+    body = derived_body(src)
+    if body is None:
+        out.append((rel, 0, "2b",
+                    "the enum-iterating `.flatMap { … }` of providerKeyMap is "
+                    "missing — the derived table was dropped"))
+    else:
+        keys_m = DERIVED_KEYS_RE.search(body)
+        keys_expr = body[:keys_m.start()] if keys_m else body
+        if "displayName" not in keys_expr:
+            out.append((rel, 0, "2d",
+                        "the derived key set no longer includes "
+                        "`type.displayName` — every add surface persists "
+                        "displayName, so \"Google Gemini\" / \"xAI (Grok)\" / "
+                        "\"Kimi Code\" rows miss the map (1026-D)"))
+        if keys_m is None:
+            out.append((rel, 0, "2e",
+                        "the derived table never builds key→ids pairs "
+                        "(`.map { key -> … }` absent) — nothing is merged"))
+        else:
+            pair_body = body[keys_m.end():]
+            bound = BOUND_IDS_RE.findall(body)
+            pairs = re.findall(r"\bto\s+([^\n}]+)", pair_body)
+            if not pairs:
+                out.append((rel, 0, "2e",
+                            "the derived pair expression does not bind a value "
+                            "with `to` — the merge yields nothing usable"))
+            for value in pairs:
+                value = value.strip()
+                ok = ("modelsDevProviderIds" in value
+                      or value.split(".")[0] in bound)
+                if not ok:
+                    out.append((rel, 0, "2e",
+                                "the derived table maps every key to `%s` "
+                                "instead of the family's ids — `val ids = "
+                                "type.modelsDevProviderIds` becomes dead and all "
+                                "%d vendors fall out of the key map (the "
+                                "derivation is present but its result is "
+                                "discarded)" % (value, len(BASE_KEYS))))
     body = map_literal_text(src)
     if body is None:
         out.append((rel, 0, "2c",
@@ -354,6 +472,23 @@ object ModelsDevApi {''',
 FIX_MD_MISSING_KEY = FIX_MD_OK.replace(
     '        "Kimi" to listOf("moonshotai", "moonshotai-cn"),\n', "")
 
+# ── wide-1024 witnesses (the exact knives that used to walk through) ────────
+# W1 (Arm 1e, completeness): the `when` stays exhaustive but the family maps
+# to an EMPTY list — compiles, and the family silently falls out of the map.
+FIX_PC_EMPTY_MAPPING = FIX_PC_OK.replace(
+    '        ProviderType.kimiCode -> listOf("moonshotai", "moonshotai-cn")',
+    '        ProviderType.kimiCode -> emptyList()')
+
+# W2 (Arm 2d, completeness): the derived key set drops `type.displayName`.
+FIX_MD_NO_DISPLAYNAME = FIX_MD_OK.replace(
+    "(listOf(type.displayName, type.name) + type.legacyProviderNames)",
+    "(listOf(type.name) + type.legacyProviderNames)")
+
+# W3 (Arm 2e, dataflow): the derivation is present, its RESULT is discarded —
+# every key maps to `emptyList<String>()` and `val ids` goes unused.
+FIX_MD_EMPTY_VALUE = FIX_MD_OK.replace(
+    ".map { key -> key to ids }", ".map { key -> key to emptyList<String>() }")
+
 
 def _report(checks, fixture_name, label):
     if not checks:
@@ -454,6 +589,56 @@ def selftest():
                 ok = False
             else:
                 print("  [OK]   ROT control: missing files reported")
+
+        # ── wide-1024 witness arms ────────────────────────────────────────
+        # W1: exhaustive `when` + EMPTY mapping (the xAI knife) ⇒ arm1e alone.
+        write("pc", FIX_PC_EMPTY_MAPPING)
+        write("md", FIX_MD_OK)
+        checks = run_checks(tmp, rels)
+        a1e = [c for c in checks if c[2] == "1e"]
+        others = [c for c in checks if c[2] not in ("1e",)]
+        if len(a1e) != 1 or not all("kimiCode" in c[3] for c in a1e):
+            print("  [FAIL] empty-mapping witness: expected 1×arm1e(kimiCode), got %s"
+                  % [(c[2], c[3][:50]) for c in checks])
+            ok = False
+        elif others:
+            print("  [FAIL] empty-mapping witness tripped unrelated arms: %s"
+                  % [(c[2], c[3][:50]) for c in others])
+            ok = False
+        else:
+            print("  [OK]   empty-mapping witness trips arm1e alone")
+        write("pc", FIX_PC_OK)
+
+        # W2: derivation drops displayName ⇒ arm2d alone.
+        write("md", FIX_MD_NO_DISPLAYNAME)
+        checks = run_checks(tmp, rels)
+        a2d = [c for c in checks if c[2] == "2d"]
+        others = [c for c in checks if c[2] != "2d"]
+        if not a2d:
+            print("  [FAIL] no-displayName witness did not trip arm2d")
+            ok = False
+        elif others:
+            print("  [FAIL] no-displayName witness tripped unrelated arms: %s"
+                  % [(c[2], c[3][:50]) for c in others])
+            ok = False
+        else:
+            print("  [OK]   no-displayName witness trips arm2d alone")
+
+        # W3: derivation present, its value discarded ⇒ arm2e alone.
+        write("md", FIX_MD_EMPTY_VALUE)
+        checks = run_checks(tmp, rels)
+        a2e = [c for c in checks if c[2] == "2e"]
+        others = [c for c in checks if c[2] != "2e"]
+        if not a2e:
+            print("  [FAIL] discarded-value witness did not trip arm2e")
+            ok = False
+        elif others:
+            print("  [FAIL] discarded-value witness tripped unrelated arms: %s"
+                  % [(c[2], c[3][:50]) for c in others])
+            ok = False
+        else:
+            print("  [OK]   discarded-value witness trips arm2e alone")
+        write("md", FIX_MD_OK)
 
     print("PROVIDER_TYPE_REGISTRY_SELFTEST=%s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
