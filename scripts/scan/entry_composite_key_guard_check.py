@@ -47,6 +47,7 @@ Exit:  0 = clean, 1 = violation(s), 2 = usage/ROT
 """
 import argparse
 import os
+import re
 import sys
 import tempfile
 
@@ -218,13 +219,18 @@ def path_router_bodies(src):
     splitting the resolver across two functions keeps the union intact; only
     deleting the decision (no such function at all) makes the set empty, which
     the caller reports as gate ROT.
+
+    Returns [(body_code, src_offset)] — `code_only` preserves character offsets,
+    so an offset inside a body maps straight to a line in the original file and
+    findings stay clickable.
     """
     code = code_only(src)
-    bodies = []
+    out = []
     for _name, sig, body in kotlin_functions(code):
         if "path: String" in sig and "ConfigField?" in sig:
-            bodies.append(code_only(body))
-    return bodies
+            body_code = code_only(body)
+            out.append((body_code, code.find(body_code)))
+    return out
 
 
 def line_of(src, idx):
@@ -271,6 +277,109 @@ def check_absent(src, rel, header, arm, forbidden, what):
     return out
 
 
+def _expr_after(text, idx):
+    """The expression starting at `idx`, up to the end of that statement.
+
+    Statement end = a newline at bracket depth 0 whose next non-blank character
+    is not a continuation (`.`, `?:`, an operator…). This is what lets a
+    multi-line binding (`val childId = coll.childIds()\\n .filter { … }`) be read
+    as ONE expression rather than one line — the id table is spread over four
+    lines in the fixed shape.
+    """
+    depth = 0
+    i = idx
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch in "({[":
+            depth += 1
+        elif ch in ")}]":
+            depth -= 1
+            if depth < 0:
+                return text[idx:i]
+        elif ch == "\n" and depth == 0:
+            j = i + 1
+            while j < n and text[j] in " \t\n":
+                j += 1
+            if j < n and text[j] in ".?:+-*/&|":
+                i = j
+                continue
+            return text[idx:i]
+        i += 1
+    return text[idx:]
+
+
+# ── dot-truncation equivalence class. Every one of these produces "the part of
+# the remainder before the first dot", which is NOT where a composite id ends:
+# `<instanceId>/gpt-5.5` itself contains dots, so truncating the path text
+# yields `/gpt-5` and the child never resolves (deep-audit-1041 A-01).
+DOT_TRUNC = (
+    (r"""split\s*\(\s*["']\.["']""", "splits the remainder on '.'"),
+    (r"""substringBefore\s*\(\s*["']\.["']""", "cuts the remainder at the first '.'"),
+    (r"""substringBeforeLast\s*\(\s*["']\.["']""", "cuts the remainder at the last '.'"),
+    (r"""substringAfter\s*\(\s*["']\.["']""", "cuts the remainder at the first '.'"),
+    (r"""takeWhile\s*\{[^}]*!=\s*["']\.["']""", "truncates the remainder at '.'"),
+    (r"""indexOf\s*\(\s*["']\.["']""", "locates '.' and slices the remainder"),
+    (r"""lastIndexOf\s*\(\s*["']\.["']""", "locates '.' and slices the remainder"),
+)
+
+
+def _child_id_sources(whole):
+    """Every expression that PRODUCES the resolved child id.
+
+    Anchored on the consumption site (`fields(forId = …)`) and traced back to the
+    binding(s) that assign it, so the rule follows the DECISION instead of a
+    variable name: renaming `childId` keeps the gate working, while removing the
+    explicit id hand-off makes it fail closed.
+
+    Returns (sources, names) where each source is `(expr, from_id_table)`:
+    `expr` is the producing expression (None = traced but no visible producer),
+    and `from_id_table` records whether the collection's own id table was what
+    the value came out of — a `val` binding that calls `childIds()`, or a lambda
+    parameter of a `childIds().mapNotNull { id -> … }` chain.
+    """
+    sources = []
+    names = []
+    # Anchored on the CONSUMPTION site — the call that asks the collection for a
+    # child's fields. Both the named (`fields(forId = x)`) and positional
+    # (`fields(x)`) forms are accepted, so a signature that loses the parameter
+    # name does not turn the gate into a spelling checker.
+    for m in re.finditer(r"\.fields\s*\(", whole):
+        arg = _expr_after(whole, m.end())
+        cut = len(arg)
+        for ch in ",\n":
+            k = arg.find(ch)
+            if 0 <= k < cut:
+                cut = k
+        arg = arg[:cut].strip()
+        arg = re.sub(r"^forId\s*=\s*", "", arg).strip()
+        if not arg:
+            continue
+        if re.fullmatch(r"[A-Za-z_]\w*", arg):
+            names.append(arg)
+        else:
+            sources.append((arg, "childIds()" in arg))
+    for name in names:
+        found = False
+        for m in re.finditer(r"\b(?:val|var)\s+%s\s*=" % re.escape(name), whole):
+            expr = _expr_after(whole, m.end()).strip()
+            sources.append((expr, "childIds()" in expr))
+            found = True
+        if not found:
+            # Inline `it` / a lambda parameter: fall back to every place the name
+            # is bound, so a `let { id -> … }` cannot hide the derivation. The id
+            # table may sit on the RECEIVER of the lambda
+            # (`childIds().mapNotNull { id -> … }`), so the lookback counts.
+            for m in re.finditer(r"\b%s\s*->" % re.escape(name), whole):
+                expr = _expr_after(whole, m.end()).strip()
+                ctx = whole[max(0, m.start() - 300):m.start()]
+                sources.append((expr, "childIds()" in expr or "childIds()" in ctx))
+                found = True
+        if not found:
+            sources.append((None, False))  # traced name with no visible producer
+    return sources, names
+
+
 def check_resolver(src, rel):
     """Arms 6–9 — the collection-child path grammar in ConfigRegistry.
 
@@ -283,24 +392,75 @@ def check_resolver(src, rel):
     if not bodies:
         return [(rel, 0, "6",
                  "no `fun (path: String): ConfigField?` resolver found — gate ROT")]
-    whole = "\n".join(bodies)
-    lines = src.count("\n")
+    whole = "\n".join(b for b, _o in bodies)
+    # Offset map: a position in `whole` → the same character in `src`, so a
+    # finding reports a real line instead of "somewhere in the resolver".
+    seg = []
+    pos = 0
+    for body_code, src_off in bodies:
+        seg.append((pos, pos + len(body_code), src_off))
+        pos += len(body_code) + 1  # + the joining "\n"
+
+    def src_index(whole_idx):
+        for a, b, src_off in seg:
+            if a <= whole_idx < b:
+                return src_off + (whole_idx - a)
+        return None
+
     out = []
 
-    # Arm 6 — no dot-counting boundary. The pre-fix idiom truncated every
-    # dotted child id; any `split('.', limit = N)` reintroduces it (a "fast
-    # path" left in front of the id table is the realistic regression).
-    import re
-    dot_split = re.compile(r"split\(\s*['\"]\.['\"]\s*,\s*limit")
-    for m in dot_split.finditer(whole):
-        # line number from the original text (comment stripping removes
-        # newlines inside block comments, so positions are not comparable);
-        # 0 = found only in code we cannot map back, still a finding.
-        hit = dot_split.search(src)
-        out.append((rel, line_of(src, hit.start()) if hit else 0,
-                    "6", "resolver splits the path by counting dots "
-                         "(`%s…`) — a composite id containing '.' gets truncated"
-                         % m.group(0).strip()))
+    # Arm 6 — the id boundary must not be taken from the path TEXT.
+    #
+    # Judged as a POSITION rule rather than a call-spelling rule: inside the
+    # resolver, exactly one dot-truncation is legitimate — the one that derives
+    # the COLLECTION key (`collections[path.substringBefore('.')]`), because
+    # collection ids carry no dots by contract. Every other truncation at a dot
+    # is the id boundary being read off the text, whichever spelling or
+    # intermediate variable it takes:
+    #     split('.'), split(".", limit = N), substringBefore/After(Last)('.'),
+    #     takeWhile { it != '.' }, indexOf('.') + slicing, inline chains,
+    #     `val head = rest.substringBefore('.')` fed into a membership test…
+    #
+    # This is the arm the audited witness aimed at: `rest.substringBefore('.')`
+    # carrying a childIds() membership test satisfies arms 7/8/9, so only a rule
+    # about WHERE the boundary came from can see it.
+    dot_split = re.compile(r"""split\(\s*['"]\.['"]\s*,\s*limit""")
+    coll_index = [m.span() for m in re.finditer(r"collections\s*\[[^\]]*\]", whole)]
+    reported = set()
+    for pattern, _phrase in DOT_TRUNC:
+        for m in re.finditer(pattern, whole):
+            if any(a <= m.start() < b for a, b in coll_index):
+                continue  # the collection key: the only legitimate truncation
+            key = m.start()
+            if key in reported:
+                continue
+            reported.add(key)
+            idx = src_index(m.start())
+            # The pre-fix "fast path" is worth naming as such: counting dots is
+            # a different intent from cutting at one, and a reader should know
+            # which one came back.
+            counting = bool(dot_split.search(m.string[max(0, m.start() - 20):m.start() + 40]))
+            if counting:
+                msg = ("resolver splits the path by counting dots "
+                       "(`split('.' , limit …)`) — a composite id containing '.' gets truncated")
+            else:
+                msg = ("child id is derived by cutting the path remainder at a dot "
+                       "(`%s`) — a composite id containing '.' is truncated; the "
+                       "boundary must come from childIds()" % m.group(0).strip())
+            out.append((rel, line_of(src, idx) if idx is not None else 0, "6", msg))
+            if len(reported) >= 3:
+                break
+
+    sources, id_names = _child_id_sources(whole)
+    if not sources:
+        out.append((rel, 0, "6",
+                    "resolver never hands an explicit child id to `fields(forId = …)` "
+                    "— the id hand-off cannot be traced (fail-closed)"))
+    for expr, _from_table in sources:
+        if expr is None:
+            out.append((rel, 0, "6",
+                        "child id %s is produced nowhere visible — the derivation "
+                        "cannot be traced (fail-closed)" % (id_names or ["?"])[0]))
 
     # Arm 7 — the boundary comes from the collection's own id table.
     if "childIds()" not in whole:
@@ -314,6 +474,13 @@ def check_resolver(src, rel):
             out.append((rel, 0, "7",
                         "resolver reads childIds() but never prefix-tests it against the "
                         "remainder (`rest.startsWith(\"$id.\")`)"))
+        # POSITIVE criterion: the child id is a MEMBER of the id table, not just
+        # some string the resolver happened to pass on. Judged on the producing
+        # expression, so `childIds().contains(x)` counts but `x` alone does not.
+        elif not any(from_table for _expr, from_table in sources):
+            out.append((rel, 0, "7",
+                        "child id does not come from the collection's id table — no "
+                        "producing expression consults childIds()"))
 
     # Arm 8 — no per-child materialisation (building a field list for every
     # child id would make each lookup O(children × fields)).
@@ -504,13 +671,50 @@ FIX_REG_PREFIX_SHAPE = FIX_REG_OK.replace(
     val coll = collections[segments[0]] ?: return null
     return coll.fields(forId = segments[1]).firstOrNull { it.path == path }''')
 
-# Derived from the right-hand side only: no childIds() at all.
+# Derived from the right-hand side only: no childIds() at all. Deliberately
+# NOT a dot-truncation — the two decisions are separate arms (a fixture that
+# violates both cannot answer "which decision broke"), so the truncating
+# variants live in their own fixtures below.
 FIX_REG_NO_CHILDIDS = FIX_REG_OK.replace(
     '''    val childId = coll.childIds()
         .filter { rest.startsWith("$it.") }
         .maxByOrNull { it.length }
         ?: return null''',
-    '''    val childId = rest.substringBeforeLast('.', "")''')
+    '''    val childId = rest.takeIf { it.isNotBlank() }
+        ?: return null''')
+
+# ── the dot-truncation equivalence class (arm 6). Each of these produces
+# "everything before the first dot", which is not where a composite id ends.
+# Fixture 1 is the AUDITED WITNESS verbatim: it keeps a childIds() membership
+# test, a prefix test and the `.path == path` confirmation, so arms 7/8/9 are
+# all satisfied — only the boundary itself is wrong. That is exactly why the
+# old arm 6 (which only knew `split('.', limit)`) let it through.
+FIX_REG_SUBSTRING_BEFORE = FIX_REG_OK.replace(
+    '''    val childId = coll.childIds()
+        .filter { rest.startsWith("$it.") }
+        .maxByOrNull { it.length }
+        ?: return null''',
+    '''    val childId = rest.substringBefore('.')
+        .takeIf { id -> id in coll.childIds() && rest.startsWith("$id.") }
+        ?: return null''')
+
+FIX_REG_SPLIT_NO_LIMIT = FIX_REG_OK.replace(
+    '''    val childId = coll.childIds()
+        .filter { rest.startsWith("$it.") }
+        .maxByOrNull { it.length }
+        ?: return null''',
+    '''    val childId = rest.split(".").firstOrNull()
+        ?.takeIf { id -> id in coll.childIds() && rest.startsWith("$id.") }
+        ?: return null''')
+
+FIX_REG_SUBSTRING_BEFORE_LAST = FIX_REG_OK.replace(
+    '''    val childId = coll.childIds()
+        .filter { rest.startsWith("$it.") }
+        .maxByOrNull { it.length }
+        ?: return null''',
+    '''    val childId = rest.substringBeforeLast('.')
+        .takeIf { id -> id in coll.childIds() && rest.startsWith("$id.") }
+        ?: return null''')
 
 # Consults childIds() but without a prefix test (an id is `contains`ed).
 FIX_REG_NO_PREFIX = FIX_REG_OK.replace(
@@ -607,6 +811,11 @@ def selftest():
         # meaningless in CI).
         resolver_fixtures = [
             ("dot-split", FIX_REG_DOTSPLIT, "6", "resolver splits the path by counting dots"),
+            # ── the dot-truncation class: same defect, four spellings. The first
+            # is the AUDITED WITNESS (gate-green before this fix).
+            ("substringBefore", FIX_REG_SUBSTRING_BEFORE, "6", "cutting the path remainder at a dot"),
+            ("split-without-limit", FIX_REG_SPLIT_NO_LIMIT, "6", "cutting the path remainder at a dot"),
+            ("substringBeforeLast", FIX_REG_SUBSTRING_BEFORE_LAST, "6", "cutting the path remainder at a dot"),
             ("no-childIds", FIX_REG_NO_CHILDIDS, "7", "never consults childIds()"),
             ("no-prefix-test", FIX_REG_NO_PREFIX, "7", "never prefix-tests"),
             ("materialised", FIX_REG_MATERIALISE, "8", "materialises fields for every child id"),
