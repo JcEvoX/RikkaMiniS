@@ -623,7 +623,7 @@ def check(policy, engine, openai, anthropic, tool_executors, gemini, signals,
             if not callees:
                 problems.append((
                     "anthropic-tool-weights-single-source", ANTHROPIC,
-                    line_of(anth_code, "[RC2-truncated-detection]"),
+                    line_of(anth_code, C3_ANTHROPIC_GUARD),
                     "'%s' is fed by raw arithmetic instead of the pure weights in "
                     "AnthropicStreamSignals — the decision table is then untestable "
                     "and each arm can drift" % tool_counter))
@@ -633,14 +633,14 @@ def check(policy, engine, openai, anthropic, tool_executors, gemini, signals,
                 if missing:
                     problems.append((
                         "anthropic-tool-weights-single-source", ANTHROPIC,
-                        line_of(anth_code, "[RC2-truncated-detection]"),
+                        line_of(anth_code, C3_ANTHROPIC_GUARD),
                         "these weights are declared in AnthropicStreamSignals but never "
                         "fed into '%s': %s — a lifecycle arm lost its wire-up"
                         % (tool_counter, ", ".join(missing))))
                 if extra:
                     problems.append((
                         "anthropic-tool-weights-single-source", ANTHROPIC,
-                        line_of(anth_code, "[RC2-truncated-detection]"),
+                        line_of(anth_code, C3_ANTHROPIC_GUARD),
                         "'%s' is fed through functions that AnthropicStreamSignals does "
                         "not declare (%s) — the derivation is no longer single-source"
                         % (tool_counter, ", ".join(extra))))
