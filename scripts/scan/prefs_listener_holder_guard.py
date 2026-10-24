@@ -38,8 +38,19 @@ stored value while every context-free reader kept the startup value -- the same
 their own section below) require the re-priming listener to exist in the file
 that registers the config path, and to prime before it reads.
 
-`--selftest` runs six miniature-tree fixtures, each broken in exactly one way,
-and prints `PREFS_PRIMING_SELFTEST=PASS` when all six behave.
+Third concern ([dv29-a4]) -- a passive listener is not a delivery guarantee.
+On the device (app `1.0.0+2597`) `minis-config set background.overlay true`
+persisted and `minis-config get` read it back, while `AgentForegroundService`
+kept logging `enabled=false` in the SAME pid: the field wrote through one
+`SharedPreferences` handle and the consumer's refresh depended on that handle's
+change callback reaching it. Criteria C10a/C10b therefore require the write path
+itself to deliver -- every `Prefs*Field.write()` publishes to `PrefsWriteBus`,
+and every key that a `MutableStateFlow` snapshotted from prefs (i.e. the value
+that goes stale when the callback does not fire) is named by a
+`PrefsWriteBus.Sink` body.
+
+`--selftest` runs a miniature-tree fixture per criterion, each broken in exactly
+one way, and prints `PREFS_PRIMING_SELFTEST=PASS` when every one behaves.
 """
 import re
 import sys
@@ -889,6 +900,185 @@ def scan_batch_save_screens(root):
     return report, problems
 
 
+# ── [dv29-a4] write-through delivery for prefs-backed config fields ─────────
+#
+# Why (device evidence, app 1.0.0+2597 / main b82aa8dc): `minis-config set
+# background.overlay true` persisted — a follow-up `get` read `true` — while the
+# live consumer (`AgentForegroundService.applyOverlayState`) went on logging
+# `enabled=false` for minutes in the SAME pid. The only link between the two was
+# a SharedPreferences change listener, i.e. a passive callback whose delivery
+# nobody can prove. The fix lets the field writers hand the value to registered
+# consumers (`PrefsWriteBus`), and this criterion keeps both halves wired:
+#
+#  * no `Prefs*Field.write()` may bypass the bus (a new writer that only calls
+#    `apply()` reintroduces exactly the shape that failed on the device), and
+#  * every key a StateFlow snapshotted at construction time must be named by a
+#    `PrefsWriteBus.Sink` body — that snapshot is what goes stale when the
+#    callback does not fire.
+#
+# Both halves are derived from the tree (no member lists, no line numbers).
+
+_A4_FIELD_CLASS_RE = re.compile(r"\bclass\s+(Prefs\w*Field)\b")
+_A4_FIELD_REG_RE = re.compile(r"\bPrefs(?:Bool|Int|String|IntCodedEnum)Field\s*\(")
+# The key argument is often a multi-line dotted constant
+# (`key = com.…Repository\n    .KEY_BG_OVERLAY_ENABLED`), so capture the whole
+# expression up to the next comma and take its LAST identifier: taking the first
+# match instead yields the owner class name and silently drops the criterion.
+_A4_KEY_ARG_RE = re.compile(r"\bkey\s*=\s*([^,]*)")
+_A4_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+_A4_SNAPSHOT_RE = re.compile(r"\bMutableStateFlow\s*\(")
+_A4_SNAPSHOT_READ_RE = re.compile(
+    r"\bget(?:Boolean|Int|Long|Float|String)\s*\(\s*(?:[\w.]+\.)?([A-Za-z_]\w*)"
+)
+_A4_PUBLISH = "PrefsWriteBus.publish("
+_A4_SINK_RE = re.compile(r"\bPrefsWriteBus\.Sink\s*\{")
+_A4_WRITE_FUN_RE = re.compile(r"\boverride\s+fun\s+write\s*\(")
+_A4_FUN_RE = re.compile(r"\bfun\s+(?:<[^>]*>\s*)?([A-Za-z_]\w*)\s*\(")
+
+
+def _a4_line(clean, offset):
+    return clean.count("\n", 0, offset) + 1
+
+
+def scan_write_through(root):
+    """[dv29-a4] criteria C10. Returns (report lines, problems)."""
+    report = []
+    problems = []
+
+    registered = []  # (rel, line, key ident)
+    snapshots = []  # (rel, line, key ident)
+    sinks = []  # (rel, line, body)
+    writers = []  # (rel, line, class name, body)
+    fun_bodies = {}  # function name -> brace body (one-hop delegation support)
+
+    for path in _kt_files(root):
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        # Cheap pre-filter only: a registration site may live in a file that
+        # mentions neither the bus nor a StateFlow (e.g. ConfigBuiltins).
+        if "Prefs" not in raw and "MutableStateFlow" not in raw:
+            continue
+        clean = _strip_comments_and_strings(raw)
+        rel = str(path.relative_to(root))
+
+        # (1) prefs-backed field registrations -- skip the class declarations.
+        for m in _A4_FIELD_REG_RE.finditer(clean):
+            if re.search(r"\bclass\s+$", clean[max(0, m.start() - 40):m.start()]):
+                continue
+            span = _paren_span(clean, m.end() - 1)
+            if not span:
+                continue
+            km = _A4_KEY_ARG_RE.search(span)
+            if km:
+                idents = _A4_IDENT_RE.findall(km.group(1))
+                if idents:
+                    registered.append((rel, _a4_line(clean, m.start()), idents[-1]))
+
+        # (2) StateFlow values snapshotted from a prefs read.
+        for m in _A4_SNAPSHOT_RE.finditer(clean):
+            span = _paren_span(clean, m.end() - 1)
+            if not span:
+                continue
+            rm = _A4_SNAPSHOT_READ_RE.search(span)
+            if rm:
+                snapshots.append((rel, _a4_line(clean, m.start()), rm.group(1)))
+
+        # (2b) function bodies: a sink may legitimately delegate the key ->
+        # state mapping to one shared helper (BackgroundSettingsRepository's
+        # refreshFromWrite), so coverage follows one hop instead of forcing the
+        # `when (key)` to be inlined at the registration site.
+        for m in _A4_FUN_RE.finditer(clean):
+            span = _paren_span(clean, clean.find("(", m.end() - 1))
+            if span is None:
+                continue
+            brace = clean.find("{", clean.find("(", m.end() - 1) + len(span) + 2)
+            if brace < 0:
+                continue
+            body = _brace_body(clean, brace)
+            if body:
+                fun_bodies.setdefault(m.group(1), body)
+
+        # (3) declared write-through sinks.
+        for m in _A4_SINK_RE.finditer(clean):
+            sinks.append((rel, _a4_line(clean, m.start()), _brace_body(clean, m.end() - 1) or ""))
+
+        # (4) the writer bodies that must publish.
+        for m in _A4_FIELD_CLASS_RE.finditer(clean):
+            brace = clean.find("{", m.end())
+            if brace < 0:
+                continue
+            cls_body = _brace_body(clean, brace)
+            if not cls_body:
+                continue
+            wm = _A4_WRITE_FUN_RE.search(cls_body)
+            if not wm:
+                continue
+            open_idx = cls_body.find("{", wm.end())
+            write_body = _brace_body(cls_body, open_idx) if open_idx >= 0 else None
+            if write_body is None:
+                problems.append(
+                    f"{rel}:{_a4_line(clean, m.start())} {m.group(1)}.write() body could "
+                    f"not be read (unbalanced braces) -- fail-closed"
+                )
+                continue
+            writers.append((rel, _a4_line(clean, m.start()), m.group(1), write_body))
+
+    # C10a -- every writer publishes (catches a new variant that only applies()).
+    for rel, line, cls, body in writers:
+        if _A4_PUBLISH not in body:
+            problems.append(
+                f"{rel}:{line} {cls}.write() applies the value but never calls "
+                f"PrefsWriteBus.publish(..) -- an external write reaches only the "
+                f"change callback, which is the delivery that failed on the device "
+                f"(`minis-config set background.overlay` persisted, consumer stayed "
+                f"stale until restart)"
+            )
+
+    # C10b -- a snapshotted prefs key needs a sink that names it.
+    registered_keys = {key for _rel, _line, key in registered}
+    snap_of_registered = [s for s in snapshots if s[2] in registered_keys]
+    def _mentions(body, ident):
+        return re.search(r"(?<![\w])" + re.escape(ident) + r"(?![\w])", body) is not None
+
+    def _covers(body, ident):
+        if _mentions(body, ident):
+            return True
+        for called, called_body in fun_bodies.items():
+            if re.search(r"\b" + re.escape(called) + r"\s*\(", body) and _mentions(called_body, ident):
+                return True
+        return False
+
+    for rel, line, key in snap_of_registered:
+        covering = [s for s in sinks if _covers(s[2], key)]
+        if not covering:
+            problems.append(
+                f"{rel}:{line} StateFlow snapshots prefs key `{key}`, which "
+                f"ConfigRegistry also writes, but no PrefsWriteBus.Sink names that "
+                f"key -- the snapshot then only ever changes if the SharedPreferences "
+                f"callback fires, i.e. the exact staleness reported on the device"
+            )
+            continue
+        sink_rel, sink_line, _body = covering[0]
+        report.append(
+            f"{rel}:{line} `{key}` snapshot is delivered by the sink at {sink_rel}:{sink_line}"
+        )
+
+    # Drift detectors: silence here would mean the criterion lost its anchors.
+    if writers and not any(_A4_PUBLISH in w[3] for w in writers):
+        problems.append(
+            "no PrefsWriteBus.publish( call survives in any Prefs*Field.write() "
+            f"although {len(writers)} writer(s) exist -- the anchor was renamed/removed, "
+            "re-point this criterion"
+        )
+    if snap_of_registered and not sinks:
+        problems.append(
+            f"{len(snap_of_registered)} StateFlow snapshot(s) over registry-written prefs "
+            "keys but no PrefsWriteBus.Sink declaration anywhere -- the write-through "
+            "half of the fix is gone"
+        )
+
+    return report, problems
+
+
 def _selftest():
     """Fixture mode: each fixture is a miniature tree with exactly one defect."""
     import subprocess
@@ -1157,6 +1347,64 @@ def _selftest():
         "}\n"
     )
 
+    def wt_tree(sink=True, key_in_sink="KEY_BG_OVERLAY_ENABLED", publish=True,
+                registration=True, snapshot_key="KEY_BG_OVERLAY_ENABLED"):
+        """[dv29-a4] Miniature write-through pair: a field writer (optionally
+        publishing) + a StateFlow-snapshot consumer (optionally with a sink)
+        + the registry registration that ties the key to the config path."""
+        writer = (
+            "package cfg\n"
+            "import android.content.SharedPreferences\n"
+            "import com.rikkaminis.app.config.PrefsWriteBus\n"
+            "interface Field { fun write(value: Boolean) }\n"
+            "class PrefsBoolField(\n"
+            "    private val prefs: SharedPreferences,\n"
+            "    private val key: String,\n"
+            ") : Field {\n"
+            "    override fun write(value: Boolean) {\n"
+            "        prefs.edit().putBoolean(key, value).apply()\n"
+            + ("        PrefsWriteBus.publish(prefs, key)\n" if publish else "") +
+            "    }\n"
+            "}\n"
+        )
+        sink_src = (
+            "    private val writeSink = PrefsWriteBus.Sink { written, key ->\n"
+            "        when (key) {\n"
+            "            %s -> state.value = written.getBoolean(key, false)\n"
+            "        }\n"
+            "    }\n" % key_in_sink
+        ) if sink else ""
+        reg = "        PrefsWriteBus.register(writeSink)\n" if sink else ""
+        repo = HOLD + (
+            "object Repo {\n"
+            '    const val KEY_BG_OVERLAY_ENABLED = "backgroundOverlayEnabled"\n'
+            '    const val KEY_UNREGISTERED = "unregisteredKey"\n'
+            "    private val prefs = H.prefs\n"
+            "    private val prefsListener =\n"
+            "        SharedPreferences.OnSharedPreferenceChangeListener { _, key -> }\n"
+            "    private val state = MutableStateFlow(prefs.getBoolean(%s, false))\n" % snapshot_key
+            + sink_src +
+            "    init {\n"
+            "        prefs.registerOnSharedPreferenceChangeListener(prefsListener)\n"
+            + reg +
+            "    }\n"
+            "}\n"
+        )
+        reg_src = HOLD + (
+            "object BgCfg {\n"
+            "    fun register(r: Any, prefs: SharedPreferences) {\n"
+            "        r.register(PrefsBoolField(prefs = prefs, key = Repo.KEY_BG_OVERLAY_ENABLED))\n"
+            "    }\n"
+            "}\n"
+        )
+        files = {"Wt.kt": writer, "Repo.kt": repo,
+                 "Cfg.kt": cfg(), "Screen.kt": screen(), "Prefs.kt": self_sync_src()}
+        if registration:
+            # The clean trio above already defines `Cfg`; keep the field
+            # registration in its own file so the fixture stays one defect each.
+            files["BgCfg.kt"] = reg_src
+        return files
+
     fixtures = [
         # name, files, expected rc, fragment that must appear ("" = must be green)
         ("clean tree (precision control)",
@@ -1227,6 +1475,19 @@ def _selftest():
          {"Cfg.kt": cfg(), "Screen.kt": screen(), "Prefs.kt": self_sync_src(),
           "Pin.kt": single_key_screen},
          0, "self-syncs via"),
+        # [dv29-a4] write-through delivery for prefs-backed config fields.
+        ("write-through: field publishes + sink names the snapshotted key (C10 control)",
+         wt_tree(), 0, "is delivered by the sink at"),
+        ("write-through: sink missing for a registry-written snapshotted key (C10b)",
+         wt_tree(sink=False), 1, "no PrefsWriteBus.Sink names that key"),
+        ("write-through: sink names a misspelled key (C10b)",
+         wt_tree(key_in_sink="KEY_BG_OVERLAY_ENABLED_V2"), 1,
+         "no PrefsWriteBus.Sink names that key"),
+        ("write-through: field writer only applies, never publishes (C10a)",
+         wt_tree(publish=False), 1, "never calls PrefsWriteBus.publish("),
+        ("write-through: snapshot key is not registry-written (precision control)",
+         wt_tree(registration=False, snapshot_key="KEY_UNREGISTERED"), 0,
+         "write-through delivery green"),
     ]
 
     ok = True
@@ -1335,6 +1596,13 @@ if _arch02_report:
         print(_line)
     print("")
 
+_a4_report, _a4_problems = scan_write_through(ROOT)
+if _a4_report:
+    print("Write-through delivery ([dv29-a4] field writer -> PrefsWriteBus -> cached consumer):")
+    for _line in _a4_report:
+        print(_line)
+    print("")
+
 _b1_report, _b1_problems = scan_batch_save_screens(ROOT)
 if _b1_report:
     print("Batch-save screens ([dv22-b1] key-filtered listeners + snapshot Save):")
@@ -1385,10 +1653,19 @@ if _b1_problems:
     print("       locals BEFORE the first write -- apply() notifies the listener")
     print("       synchronously, so later write args read the RESET state otherwise.")
 
-if problems or _priming_problems or _arch02_problems or _b1_problems:
+if _a4_problems:
+    print("\nFAIL: a prefs-backed config write cannot reach its cached consumer ([dv29-a4])")
+    for p in _a4_problems:
+        print(f"  - {p}")
+    print("\n  Fix: end every Prefs*Field.write() with PrefsWriteBus.publish(prefs, key), and")
+    print("       give each StateFlow that snapshots a registry-written key a PrefsWriteBus.Sink")
+    print("       that reads from the handle it is handed (never from a handle it cached).")
+
+if problems or _priming_problems or _arch02_problems or _b1_problems or _a4_problems:
     sys.exit(1)
 
 print(f"\nOK: all {len(sites)} prefs listener registration(s) strongly held")
 print(f"OK: re-priming criteria green ({len(_priming_report)} re-priming site(s) verified)")
 print(f"OK: self-syncing primed caches ({len(_arch02_report)} cache(s) own their re-priming listener)")
 print(f"OK: batch-save screens green ({len(_b1_report)} [dv22-b1] verification line(s))")
+print(f"OK: write-through delivery green ({len(_a4_report)} [dv29-a4] delivery line(s))")
