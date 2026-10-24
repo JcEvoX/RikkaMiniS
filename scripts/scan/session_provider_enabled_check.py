@@ -48,6 +48,7 @@ LIFECYCLE_REL = (
 APP_DIR = "src/android/app/src/main/java/com/rikkaminis/app"
 ROUTING_REL = APP_DIR + "/ui/chat/ChatModelRouting.kt"
 PROMPT_TOOLS_REL = APP_DIR + "/ui/chat/ChatPromptAndTools.kt"
+DEBUG_DIR_REL = APP_DIR + "/debug"
 
 # [deep-audit-1044 B-03] Every `ProviderFactory.create(...)` in the chat layer
 # must hand over the ENRICHED model. The raw arguments below are each the
@@ -299,6 +300,21 @@ def run(root):
     violations += factory_v
     # [deep-audit-1047 B-04] group selection / member resolution sync
     violations += check_group_selection(texts)
+    # [dv29-A2] C-SEL-4: the debug/IPC binding write must use the same decision
+    debug_texts = {}
+    debug_dir = os.path.join(root, DEBUG_DIR_REL)
+    if os.path.isdir(debug_dir):
+        for name in sorted(os.listdir(debug_dir)):
+            if not name.endswith(".kt"):
+                continue
+            with open(os.path.join(debug_dir, name), "r", encoding="utf-8") as f:
+                debug_texts[DEBUG_DIR_REL + "/" + name] = f.read()
+    if not debug_texts:
+        violations.append(
+            "missing target %s/*.kt — C-SEL-4 cannot be judged (fail-closed)"
+            % DEBUG_DIR_REL)
+    else:
+        violations += check_binding_writes(debug_texts)
     if violations:
         for x in violations:
             print("session_provider_enabled_check: %s" % x)
@@ -653,6 +669,108 @@ internal fun ChatViewModel.restoreFromBinding(bindingJson: String?): Boolean {
 }
 '''
 
+# ── [dv29-A2] C-SEL-4: a session-model BINDING write must make the same
+# decision as the runtime gate ───────────────────────────────────────────────
+#
+# `session.primaryModel` (ConfigBuiltins) refuses a disabled or key-less
+# instance and refuses a group with no usable member. The debug/IPC twin —
+# `HeadlessChatRunner.applyModelOverride`, reached by `chat.model.select` and by
+# every headless send that carries a model override — checked only
+# `instance.isEnabled` on the entry branch and nothing at all on the group
+# branch:
+#   * a key-less instance wrote the binding, `restoreFromBinding` then refused it
+#     (same funnel, different opinion), the resident VM fell back to the default
+#     model, and the RPC still returned the refused model's display name — the
+#     caller believes a turn ran on a model it never touched;
+#   * the group branch wrote `memberEntryIds.first()` as `model_id`, which need
+#     not be a member the runtime would ever pick.
+# Both are the "two write entries, one decision" shape, so the judgement is
+# derived, not spelled:
+#   * WRITERS — functions that perform `updateSessionBinding(`;
+#   * ENTRIES — functions that call a writer (so a new binding entry is covered
+#     the day it is written);
+#   * and each entry must reach `decideSessionModelResolution(` (in its own body
+#     or within two hops) — the single decision this gate already pins elsewhere;
+#   * plus a positional group-member pick (`memberEntryIds.first()` & friends) is
+#     banned outright: it names a member nobody established as usable.
+BINDING_WRITE_CALL = "updateSessionBinding("
+FUNNEL_NAME = "decideSessionModelResolution"
+RE_BARE_MEMBER_PICK = re.compile(
+    r"memberEntryIds\s*(?:\.\s*(?:first|firstOrNull|last|lastOrNull|get|elementAt)\s*\("
+    r"|\[\s*\d+\s*\])"
+)
+
+
+def _all_funs(code):
+    """(name, body) for every `fun` in [code], any indentation."""
+    out = []
+    for m in re.finditer(r"\bfun\s+([A-Za-z_]\w*)\s*\(", code):
+        span = _fun_span(code, m.start())
+        if span is None:
+            continue
+        out.append((m.group(1), code[span[0]:span[1]]))
+    return out
+
+
+def _funnel_reachable(body, index, hops=2):
+    if FUNNEL_NAME + "(" in body:
+        return True
+    if hops <= 1:
+        return False
+    for m in re.finditer(r"\b(\w+)\s*\(", body):
+        for nested in index.get(m.group(1), ()):
+            if _funnel_reachable(nested, index, hops - 1):
+                return True
+    return False
+
+
+def check_binding_writes(texts):
+    """C-SEL-4 across `debug/*.kt`. Returns a list of violations."""
+    code_by_rel = {rel: _strip_line_comments(t) for rel, t in texts.items()}
+    index = {}
+    for code in code_by_rel.values():
+        for name, body in _all_funs(code):
+            index.setdefault(name, []).append(body)
+    writers = {
+        name
+        for name, bodies in index.items()
+        if any(BINDING_WRITE_CALL in body for body in bodies)
+    }
+    if not writers:
+        return [
+            "debug/*: no function performs `%s` — the binding write path cannot "
+            "be judged (fail-closed)" % BINDING_WRITE_CALL.rstrip("(")
+        ]
+    v = []
+    entries = 0
+    for rel, code in sorted(code_by_rel.items()):
+        for name, body in _all_funs(code):
+            if name in writers:
+                continue
+            if not any(writer + "(" in body for writer in writers):
+                continue
+            entries += 1
+            if not _funnel_reachable(body, index):
+                v.append(
+                    "%s: `%s` writes the session model binding without routing "
+                    "through %s — a disabled instance or a key-less one is "
+                    "persisted, the resident VM then refuses the same binding and "
+                    "falls back, and the caller is told the refused model was "
+                    "used (C-SEL-4)" % (rel, name, FUNNEL_NAME))
+            for m in RE_BARE_MEMBER_PICK.finditer(body):
+                v.append(
+                    "%s: `%s` picks a group member by POSITION (`%s`) when it "
+                    "writes `model_id` — that member need not be one the runtime "
+                    "would ever pick; take the first USABLE member through %s "
+                    "(C-SEL-4)" % (rel, name, m.group(0).strip(), FUNNEL_NAME))
+    if entries == 0:
+        v.append(
+            "debug/*: no session-model binding entry found (nothing calls a "
+            "`%s` writer) — the criterion is blind, refusing to pass "
+            "(fail-closed)" % BINDING_WRITE_CALL.rstrip("("))
+    return v
+
+
 # ── selftest fixtures ────────────────────────────────────────────────────────
 
 GOOD_FUNNEL = """internal fun decideSessionModelResolution(
@@ -802,6 +920,77 @@ FACTORY_UNENRICHED["lc"] = FACTORY_OK["lc"].replace(
     "apiKey, effectiveModel, context", "apiKey, entry.baseModel, context", 1)
 
 
+# [dv29-A2] C-SEL-4 fixtures: the debug-side binding write. Faithful to the
+# post-fix production shape (`applyModelOverride` -> `persistBinding`, decision
+# in the entry, usable member via the shared helper).
+BW_RUNNER_GOOD = """package com.rikkaminis.app.debug
+
+internal object HeadlessChatRunner {
+    private fun persistBinding(app: MinisApp, sessionId: String, bindingJson: String, modelId: String) {
+        app.chatRepository.updateSessionBinding(sessionId, bindingJson, modelId)
+    }
+
+    suspend fun applyModelOverride(app: MinisApp, sessionId: String): String? {
+        val cfg = app.providerRepository.config.value
+        when (target) {
+            is BindingTarget.Entry -> {
+                val entry = cfg.modelEntries.firstOrNull { it.id == target.entryId } ?: return null
+                val instance = app.providerRepository.instance(entry.providerInstanceId)
+                val decision = decideSessionModelResolution(
+                    entry, instance, instance?.let { app.providerRepository.loadApiKey(it.id) })
+                if (decision !is SessionModelResolution.Use) return null
+                persistBinding(app, sessionId, "", entry.baseModel.id)
+                entry.model.displayName
+            }
+            is BindingTarget.Group -> {
+                val members = group.memberEntryIds.mapNotNull { mid ->
+                    cfg.modelEntries.firstOrNull { it.id == mid }
+                }
+                val usable = firstUsableGroupEntry(members)
+                persistBinding(app, sessionId, "", usable.baseModel.id)
+                group.name
+            }
+            else -> null
+        }
+    }
+
+    internal fun firstUsableGroupEntry(members: List<ModelEntry>): ModelEntry? {
+        return members.firstOrNull { member ->
+            val instance = instanceOf(member.providerInstanceId)
+            decideSessionModelResolution(
+                member, instance, instance?.let { apiKeyOf(it.id) }) is SessionModelResolution.Use
+        }
+    }
+}
+"""
+
+# The pre-fix shape: the entry branch checks `isEnabled` only, the group branch
+# takes the head member by position.
+BW_RUNNER_PRE = BW_RUNNER_GOOD.replace(
+    """                val decision = decideSessionModelResolution(
+                    entry, instance, instance?.let { app.providerRepository.loadApiKey(it.id) })
+                if (decision !is SessionModelResolution.Use) return null""",
+    """                if (instance == null || !instance.isEnabled) return null""",
+).replace(
+    """                val members = group.memberEntryIds.mapNotNull { mid ->
+                    cfg.modelEntries.firstOrNull { it.id == mid }
+                }
+                val usable = firstUsableGroupEntry(members)""",
+    """                val usable = group.memberEntryIds.firstOrNull()""",
+)
+
+# The write moved out from under any decision: no funnel reachable at all.
+BW_RUNNER_NO_FUNNEL = BW_RUNNER_GOOD.replace(
+    "decideSessionModelResolution(", "someOtherResolver(").replace(
+    "                member, instance, instance?.let { apiKeyOf(it.id) }) is SessionModelResolution.Use",
+    "                member, instance, null) is SessionModelResolution.Use")
+
+# No writer at all -> the criterion must fail closed instead of passing blind.
+BW_RUNNER_NO_WRITER = BW_RUNNER_GOOD.replace(
+    "app.chatRepository.updateSessionBinding(sessionId, bindingJson, modelId)",
+    "app.chatRepository.touchSession(sessionId)")
+
+
 def _fixture(funnel, p2, entry, apply):
     return funnel + "\n" + p2 + "\n" + entry + "\n" + apply + "\n"
 
@@ -889,6 +1078,37 @@ def selftest():
         )
     print("selftest group selection     -> good=%d violation(s), pre=%d"
           % (len(good_sel), len(pre_sel)))
+
+    # [dv29-A2] C-SEL-4: the debug binding write
+    bw_good = check_binding_writes({DEBUG_DIR_REL + "/HeadlessChatRunner.kt": BW_RUNNER_GOOD})
+    expect(len(bw_good) == 0, "C-SEL-4 compliant fixture reported %r" % (bw_good,))
+
+    bw_pre = check_binding_writes({DEBUG_DIR_REL + "/HeadlessChatRunner.kt": BW_RUNNER_PRE})
+    expect(
+        any("without routing through" in x for x in bw_pre),
+        "C-SEL-4 pre-fix fixture produced no funnel-routing violation",
+    )
+    expect(
+        any("by POSITION" in x for x in bw_pre),
+        "C-SEL-4 pre-fix fixture produced no positional-pick violation",
+    )
+
+    bw_no_funnel = check_binding_writes(
+        {DEBUG_DIR_REL + "/HeadlessChatRunner.kt": BW_RUNNER_NO_FUNNEL})
+    expect(
+        any("without routing through" in x for x in bw_no_funnel),
+        "C-SEL-4 no-funnel fixture produced no violation",
+    )
+
+    bw_no_writer = check_binding_writes(
+        {DEBUG_DIR_REL + "/HeadlessChatRunner.kt": BW_RUNNER_NO_WRITER})
+    expect(
+        any("no function performs" in x for x in bw_no_writer),
+        "C-SEL-4 no-writer fixture did not fail closed",
+    )
+
+    print("selftest C-SEL-4 binding write -> good=%d pre=%d nofunnel=%d nowriter=%d"
+          % (len(bw_good), len(bw_pre), len(bw_no_funnel), len(bw_no_writer)))
 
     if failures or not all(factory_results):
         for f in failures:

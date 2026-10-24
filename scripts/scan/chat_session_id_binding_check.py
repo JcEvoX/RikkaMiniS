@@ -88,6 +88,9 @@ REL_ACTIVITY = "src/android/app/src/main/java/com/rikkaminis/app/MainActivity.kt
 # [deep-audit-1039 A-06] criterion 13 — optional, same stance as criterion 9:
 # the mini-tree fixtures that predate it write only the four files above.
 REL_RUNNER = "src/android/app/src/main/java/com/rikkaminis/app/debug/HeadlessChatRunner.kt"
+REL_CHAT_REPO = (
+    "src/android/app/src/main/java/com/rikkaminis/app/data/repository/ChatRepository.kt"
+)
 # [deep-audit-1043 A-05] criterion 14 derives its entry set from EVERY file in
 # the `debug` package, not just the runner: `ChatMutationMethods.uiPrompt`
 # obtains the screen-owned ViewModel and dispatches into it too.
@@ -605,18 +608,40 @@ def _apply_override_violations(code: str) -> "list[str]":
             "HeadlessChatRunner.kt: the override never reaches the Room write "
             "(`updateSessionBinding(`) — the row is the only cross-restart store"
         )
-    if not _reaches(code, body, APPLY_OVERRIDE_VM_PEEK):
-        errs.append(
-            "HeadlessChatRunner.kt: the override never reaches the resident "
-            "ChatViewModel through the non-creating lookup (`peekViewModel(`) — the "
-            "live chat keeps the OLD model while the row says the new one"
+    else:
+        # [dv29-A2] Both halves are judged on the derived WRITE path (the
+        # function that performs the `updateSessionBinding(` call), not on the
+        # entry at large: the entry now also peeks the resident VM to decide
+        # whether the session exists at all, and a peek that exists only to
+        # answer "does this session have a row?" must not stand in for the
+        # refresh that keeps the screen in sync with the row.
+        writers = [
+            code[start:end]
+            for _name, start, end in _member_spans(code)
+            if APPLY_OVERRIDE_ROW_WRITE.rstrip("(") + "(" in code[start:end]
+        ]
+        peeked = any(
+            APPLY_OVERRIDE_VM_PEEK in writer
+            or _reaches(code, writer, APPLY_OVERRIDE_VM_PEEK)
+            for writer in writers
         )
-    elif not any(_reaches(code, body, tok) for tok in APPLY_OVERRIDE_VM_REFRESH):
-        errs.append(
-            "HeadlessChatRunner.kt: the resident VM is peeked but never applied "
-            "(none of %s) — the screen keeps the previous binding"
-            % "/".join(APPLY_OVERRIDE_VM_REFRESH)
+        refreshed = any(
+            any(tok in writer for tok in APPLY_OVERRIDE_VM_REFRESH)
+            or any(_reaches(code, writer, tok) for tok in APPLY_OVERRIDE_VM_REFRESH)
+            for writer in writers
         )
+        if not peeked:
+            errs.append(
+                "HeadlessChatRunner.kt: the write path never reaches the resident "
+                "ChatViewModel through the non-creating lookup (`peekViewModel(`) — the "
+                "live chat keeps the OLD model while the row says the new one"
+            )
+        elif not refreshed:
+            errs.append(
+                "HeadlessChatRunner.kt: the resident VM is peeked but never applied "
+                "(none of %s) — the screen keeps the previous binding"
+                % "/".join(APPLY_OVERRIDE_VM_REFRESH)
+            )
     return errs
 
 # [deep-audit-1042 A-05] criterion 14 — the headless session-ready barrier.
@@ -1076,6 +1101,295 @@ def _turn_answer_violations(code: str) -> "list[str]":
     return errs
 
 
+# ── [dv29-A2] criterion 18: a send / bind entry must refuse a session that
+# does not exist, BEFORE it materialises the ViewModel ───────────────────────
+#
+# `messages.session_id` is a foreign key into `chat_sessions`, so a send into an
+# id with no row raises `FOREIGN KEY constraint failed (code 787)`: nothing
+# lands, and `nextSortOrder` answers 0. `ChatRepository.appendMessage` now tells
+# that apart from the sort_order race (criterion 19), but the autOMATION surface
+# still has to answer the caller. `minis-sessions-cli send --session <missing>`
+# reached appendMessage, the escaped exception was uncaught in a coroutine, and
+# ACRA killed the process (2026-10-24 12:57 ×2 — device logs crash-2026-10-24
+# _12-57-02.log: applyModelOverride warns "no persisted row" at :193, then
+# `appendMessage: enter session=00000000-…` at :202, then `constraint-retry
+# re-order=0 (original=0)` at :205, then the crash).
+#
+# Both halves are DERIVED, never spelled:
+#   * the ENTRY set — any member whose body can append a message or write a
+#     session binding (`sendMessage` / `retryFromMessage` / `rerunFromToolBlock`
+#     / `persistBinding`), so a new entry is covered the moment it is written;
+#   * the GUARD — the function whose body reads the session row
+#     (`getSession(`), peeks the resident ViewModel (`peekViewModel(`) and
+#     throws an RPC error. Renaming the helper stays green, inlining the same
+#     three facts into an entry stays green, and gutting any of them turns the
+#     entries that relied on it red.
+SEND_ENTRY_OPS = ("sendMessage", "retryFromMessage", "rerunFromToolBlock")
+RE_VM_APPEND_CALL = re.compile(r"\b(\w+)\s*\.\s*(\w+)\s*\(")
+BINDING_WRITE_CALL = "updateSessionBinding("
+SESSION_ROW_READ = "getSession("
+RESIDENT_VM_PEEK = "peekViewModel("
+RPC_THROW = "throw RPCException("
+
+
+def _existence_guards(code: str) -> "set[str]":
+    """Members whose body IS a session-existence gate (derived, not named)."""
+    names = set()
+    for name, start, end in _member_spans(code):
+        body = code[start:end]
+        if (
+            SESSION_ROW_READ in body
+            and RESIDENT_VM_PEEK in body
+            and RPC_THROW in body
+        ):
+            names.add(name)
+    return names
+
+
+def _binding_writers(code: str) -> "set[str]":
+    """Members that actually write the session's model binding."""
+    return {
+        name
+        for name, start, end in _member_spans(code)
+        if BINDING_WRITE_CALL in code[start:end]
+    }
+
+
+def _send_entries(code: str) -> "list[tuple[str, str]]":
+    """(name, body) for every member that can append a message or bind a model.
+
+    Two derived shapes, both receiver/callee-anchored so a dispatch table
+    (`"chat.x" -> ChatMutationMethods.x(...)`) or the writer's own declaration is
+    not mistaken for an entry:
+
+      * a turn-dispatching call on a receiver bound from a ChatViewModel
+        acquisition (`vm.sendMessage(…)`), the same derivation criterion 14 uses;
+      * a call to any member of this file that writes `updateSessionBinding(`.
+    """
+    writers = _binding_writers(code)
+    out = []
+    for name, start, end in _member_spans(code):
+        if name in writers:
+            continue
+        body = code[start:end]
+        recvs = _derived_vm_receivers(body)
+        hit = False
+        for m in RE_VM_APPEND_CALL.finditer(body):
+            if m.group(2) in SEND_ENTRY_OPS and m.group(1) in recvs:
+                hit = True
+                break
+        if not hit:
+            tail = body[body.find(")") :] if ")" in body else body
+            for writer in writers:
+                if writer + "(" in tail:
+                    hit = True
+                    break
+        if hit:
+            out.append((name, body))
+    return out
+
+
+def _reach_call(
+    body: str, targets: "set[str]", index: "dict[str, list[str]]", depth: int = 2
+) -> "bool":
+    """`body` calls one of `targets`, directly or within [depth] hops."""
+    if any(token + "(" in body for token in targets):
+        return True
+    if depth <= 1:
+        return False
+    for m in re.finditer(r"\b(\w+)\s*\(", body):
+        callee = m.group(1)
+        if callee in targets:
+            return True
+        for nested in index.get(callee, ()):
+            if _reach_call(nested, targets, index, depth - 1):
+                return True
+    return False
+
+
+def _package_fn_index(root: Path) -> "dict[str, list[str]]":
+    """name → every body with that name in the `debug` package (both styles)."""
+    index: "dict[str, list[str]]" = {}
+    for path in _debug_sources(root):
+        code = strip_comments(path.read_text(encoding="utf-8"))
+        for name, start, end in _member_spans(code):
+            index.setdefault(name, []).append(code[start:end])
+        for m in re.finditer(r"(?m)^(?:internal |private |public )?fun\s+(\w+)\s*\(", code):
+            body = _fn_body_after(
+                code, re.compile(r"\bfun\s+" + re.escape(m.group(1)) + r"\s*\(")
+            )
+            if body:
+                index.setdefault(m.group(1), []).append(body)
+    return index
+
+
+def _send_entry_violations_in(root: Path) -> "list[str]":
+    """Criterion 18 over the whole `debug` package (derived file set)."""
+    files = _debug_sources(root)
+    if not files:
+        return []
+    index = _package_fn_index(root)
+    guards: "set[str]" = set()
+    entries: "list[tuple[str, str, str]]" = []
+    for path in files:
+        try:
+            rel = str(path.relative_to(root))
+        except ValueError:
+            rel = path.name
+        code = strip_comments(path.read_text(encoding="utf-8"))
+        guards |= _existence_guards(code)
+        for name, body in _send_entries(code):
+            entries.append((rel, name, body))
+    if not entries:
+        return []
+    if not guards:
+        return [
+            "debug/*.kt: no session-existence guard anywhere in the package — "
+            "the function that reads `getSession(`, peeks `peekViewModel(` and "
+            "throws an RPC error is gone, so %d send/bind entr%s cannot be "
+            "proven to check that the session exists (re-anchor criterion 18, "
+            "do not drop it)"
+            % (len(entries), "y" if len(entries) == 1 else "ies")
+        ]
+    out: "list[str]" = []
+    for rel, name, body in entries:
+        if _reach_call(body, guards, index):
+            continue
+        # Legal alternative: the entry inlines the same two facts.
+        if SESSION_ROW_READ in body and RPC_THROW in body:
+            continue
+        out.append(
+            "%s: `%s` can append a message / write a session binding without "
+            "establishing that the session EXISTS — `messages.session_id` is a "
+            "foreign key, so a missing session turns the insert into a "
+            "FOREIGN KEY failure (code 787) that no retry can fix and that used "
+            "to escape as an uncaught coroutine exception (process kill, "
+            "2026-10-24 12:57 ×2: `applyModelOverride` warned 'no persisted row' "
+            "and carried on). Gate the entry on the row — call the derived guard "
+            "or inline the same check" % (rel, name)
+        )
+    return out
+
+
+def _debug_sources(root: Path) -> "list[Path]":
+    """`debug/*.kt` (or the single runner file in a legacy mini-tree fixture)."""
+    debug_dir = root / REL_DEBUG_DIR
+    files = sorted(debug_dir.glob("*.kt")) if debug_dir.is_dir() else []
+    if not files:
+        single = root / REL_RUNNER
+        files = [single] if single.is_file() else []
+    return files
+
+
+# ── [dv29-A2] criterion 19: the constraint retry applies to ONE constraint ──
+#
+# `appendMessage` caught `SQLiteConstraintException` and assumed the
+# `unique(session_id, sort_order)` race. Every other constraint — most
+# importantly the FK on `messages.session_id` (code 787) — was "retried" by
+# re-reading `nextSortOrder` (0 for a session that does not exist) and replaying
+# the identical row against the identical missing parent; the second throw left
+# the catch unclassified and killed the process. The retry is only correct for
+# the race, so it must be gated on a decision that names the constraint, and the
+# rejection branch must be reachable BEFORE the replay.
+INSERT_CONSTRAINT_CATCH = "catch (e: SQLiteConstraintException)"
+UNIQUE_CONSTRAINT_MARK = "UNIQUE constraint failed"
+FK_CONSTRAINT_MARK = "FOREIGN KEY constraint failed"
+REPLAY_CALL = "nextSortOrder("
+
+
+def _constraint_classifiers(code: str) -> "dict[str, str]":
+    """Functions that name a constraint wording (the classification candidates).
+
+    Derived from the tree, not from a name: anything that talks about
+    `UNIQUE constraint failed` is a candidate classifier, and criterion 19 then
+    requires the one the catch actually calls to name the FOREIGN KEY failure
+    too — that is the judgement, so a classifier that silently drops the FK
+    branch cannot pass by no longer looking like a classifier.
+    """
+    found = {}
+    for m in re.finditer(r"\bfun\s+([A-Za-z_]\w*)\s*\(", code):
+        body = _fn_body_after(code, re.compile(r"\bfun\s+" + re.escape(m.group(1)) + r"\s*\("))
+        if body is None:
+            continue
+        if UNIQUE_CONSTRAINT_MARK in body or FK_CONSTRAINT_MARK in body:
+            found[m.group(1)] = body
+    return found
+
+
+def _insert_retry_violations(code: str) -> "list[str]":
+    """Criterion 19 for one `data/repository/ChatRepository.kt`."""
+    body = _fn_body_after(code, re.compile(r"\bfun\s+appendMessage\s*\("))
+    if body is None:
+        return [
+            "ChatRepository.kt: `fun appendMessage(` block not found (renamed "
+            "or moved? re-anchor criterion 19, do not drop it)"
+        ]
+    at = body.find(INSERT_CONSTRAINT_CATCH)
+    if at < 0:
+        return [
+            "ChatRepository.kt: appendMessage no longer catches `%s` — the "
+            "sort_order retry policy cannot be judged (fail-closed)"
+            % INSERT_CONSTRAINT_CATCH
+        ]
+    brace = body.find("{", at)
+    end = _match_brace(body, brace) if brace != -1 else None
+    if end is None:
+        return [
+            "ChatRepository.kt: the constraint catch block in appendMessage is "
+            "unbalanced — the retry policy cannot be judged (fail-closed)"
+        ]
+    catch = body[brace : end + 1]
+    errs: "list[str]" = []
+
+    classifiers = _constraint_classifiers(code)
+    used = [name for name in classifiers if name + "(" in catch]
+    if not used and UNIQUE_CONSTRAINT_MARK not in catch:
+        errs.append(
+            "ChatRepository.kt: the constraint catch does not discriminate the "
+            "UNIQUE sort_order race from anything else — a FOREIGN KEY failure "
+            "(code 787: the session row is gone) is replayed with the SAME "
+            "parameters, fails again, and the second throw escapes unclassified "
+            "(process kill, dv29-A2)"
+        )
+    for name in used:
+        cbody = classifiers[name]
+        if FK_CONSTRAINT_MARK not in cbody:
+            errs.append(
+                "ChatRepository.kt: %s never names the FOREIGN KEY failure — a "
+                "missing session parent is still treated as the sort_order race "
+                "and replayed (dv29-A2)" % name
+            )
+        if UNIQUE_CONSTRAINT_MARK not in cbody or "sort_order" not in cbody:
+            errs.append(
+                "ChatRepository.kt: %s accepts any UNIQUE violation as the "
+                "sort_order race — a `messages.id` (PRIMARY KEY) collision would "
+                "be replayed with the same colliding id instead of reported "
+                "(dv29-A2)" % name
+            )
+    throw_at = catch.find("throw ")
+    replay_at = catch.find(REPLAY_CALL)
+    if throw_at < 0:
+        errs.append(
+            "ChatRepository.kt: the constraint catch has no non-retry exit "
+            "(`throw `) — every rejected insert is replayed once and a second "
+            "failure escapes as a raw constraint exception (dv29-A2)"
+        )
+    elif 0 <= replay_at < throw_at:
+        errs.append(
+            "ChatRepository.kt: the catch replays (`%s`) BEFORE deciding — the "
+            "rejection branch must be reachable without touching the DB again "
+            "(dv29-A2)" % REPLAY_CALL.rstrip("(")
+        )
+    return errs
+
+
+def _insert_retry_violations_in(root: Path) -> "list[str]":
+    path = root / REL_CHAT_REPO
+    if not path.is_file():
+        return []
+    return _insert_retry_violations(strip_comments(path.read_text(encoding="utf-8")))
+
+
 def check(root: Path) -> int:
     del errors[:]
     screen_path = root / REL_SCREEN
@@ -1464,6 +1778,15 @@ def check(root: Path) -> int:
         #     THIS turn, not to a role scan over the whole transcript. ---
         errors.extend(_turn_answer_violations(runner))
 
+    # --- 18. [dv29-A2] a send / bind entry must refuse a session that does
+    #     not exist. Files and entries are derived, and so is the guard. ---
+    errors.extend(_send_entry_violations_in(root))
+
+    # --- 19. [dv29-A2] the messages-insert retry applies to the sort_order
+    #     race only; a FK failure (missing session) is reported, never
+    #     replayed. ---
+    errors.extend(_insert_retry_violations_in(root))
+
     # --- 14. [deep-audit-1042 A-05 / 1043 A-05] every entry that mutates the
     #     ViewModel's in-memory turn state awaits the `sessionLoaded` latch
     #     BEFORE the mutation. Files, entries and receivers are all derived
@@ -1678,8 +2001,11 @@ def _prompt_entry(guard: str) -> str:
         "        wait: Boolean,\n"
         "        timeoutMs: Long,\n"
         "    ): PromptResult = withContext(Dispatchers.Main) {\n"
-        "        val vm = viewModel(context, sessionId)\n"
         "        val app = app(context)\n"
+        # criterion 18: the session-existence gate, BEFORE `viewModel(…)` hands
+        # out a VM for an id that may have no row at all.
+        "        requireSendableSession(app, sessionId)\n"
+        "        val vm = viewModel(context, sessionId)\n"
         # criterion 14: the dispatch must sit behind the sessionLoaded latch.
         "        val sessionReady = withContext(Dispatchers.Default) {\n"
         "            withTimeoutOrNull(5000L) { vm.sessionLoaded.first { it } }\n"
@@ -1733,6 +2059,8 @@ _R_OVERRIDE_ENTRY = (
     "        modelGroupId: String?,\n"
     "    ): String? = withContext(Dispatchers.IO) {\n"
     "        val app = app(context)\n"
+    # criterion 18: a binding write is an entry too.
+    "        requireSendableSession(app, sessionId)\n"
     "        val cfg = app.providerRepository.config.value\n"
     + _R_OVERRIDE_ROW_READ
     + "        persistBinding(app, sessionId, target)\n"
@@ -1752,6 +2080,130 @@ _R_OVERRIDE_ENTRY = (
 assert FIXTURE_RUNNER.endswith(_R_RUNNER_TAIL), "runner fixture tail moved"
 FIXTURE_RUNNER = (
     FIXTURE_RUNNER[: -len(_R_RUNNER_TAIL)] + _R_OVERRIDE_ENTRY + _R_RUNNER_TAIL
+)
+
+# --- criterion 18 [dv29-A2]: the session-existence gate ---------------------
+# Faithful to the production helper: row read, resident-VM peek, RPC throw. The
+# gate derives the guard from these THREE facts, so no arm below names it.
+_R_SESSION_GUARD_ENTRY = (
+    "\n"
+    "    private suspend fun requireSendableSession(app: MinisApp, sessionId: String) {\n"
+    "        val persisted = withContext(Dispatchers.IO) {\n"
+    "            app.chatRepository.dao.getSession(sessionId)\n"
+    "        } != null\n"
+    "        if (persisted) return\n"
+    "        val resident = withContext(Dispatchers.Main) {\n"
+    "            ChatViewModelStore.peekViewModel(sessionId)\n"
+    "        }\n"
+    "        if (resident != null) return\n"
+    "        throw RPCException(-32602, \"session_not_found: \" + sessionId)\n"
+    "    }\n"
+)
+assert FIXTURE_RUNNER.endswith(_R_RUNNER_TAIL), "runner fixture tail moved (criterion 18)"
+FIXTURE_RUNNER = (
+    FIXTURE_RUNNER[: -len(_R_RUNNER_TAIL)] + _R_SESSION_GUARD_ENTRY + _R_RUNNER_TAIL
+)
+
+# --- criterion 19 [dv29-A2]: the insert retry is for ONE constraint ---------
+# Faithful to the production shape: classify from the SQLite message, replay
+# only the sort_order race, and re-throw everything else as a classified
+# failure before the replay call.
+FIXTURE_CHAT_REPO = '''package com.rikkaminis.app.data.repository
+
+class ChatRepository(internal val dao: ChatDao) {
+    suspend fun appendMessage(sessionId: String, role: String): MessageEntity {
+        val message = MessageEntity()
+        val persisted: MessageEntity = try {
+            dao.insertMessage(message)
+            message
+        } catch (e: SQLiteConstraintException) {
+            val conflict = classifyMessageInsertConstraint(e.message)
+            if (conflict != MessageInsertConflict.SORT_ORDER &&
+                conflict != MessageInsertConflict.UNKNOWN
+            ) {
+                throw MessageInsertRejectedException(conflict, sessionId, e)
+            }
+            val retrySortOrder = dao.nextSortOrder(sessionId)
+            message.copy(sortOrder = retrySortOrder).also {
+                dao.insertMessage(it)
+            }
+        }
+        return persisted
+    }
+}
+
+internal enum class MessageInsertConflict { SORT_ORDER, SESSION_ROW_MISSING, OTHER, UNKNOWN }
+
+internal fun classifyMessageInsertConstraint(message: String?): MessageInsertConflict {
+    val text = message?.trim().orEmpty()
+    if (text.isEmpty()) return MessageInsertConflict.UNKNOWN
+    if (text.contains("FOREIGN KEY constraint failed", ignoreCase = true)) {
+        return MessageInsertConflict.SESSION_ROW_MISSING
+    }
+    if (text.contains("UNIQUE constraint failed", ignoreCase = true) &&
+        text.contains("sort_order", ignoreCase = true)
+    ) {
+        return MessageInsertConflict.SORT_ORDER
+    }
+    return MessageInsertConflict.OTHER
+}
+'''
+
+# Dirty shapes, one per decision point of criterion 19.
+_INSERT_RETRY_MUTATIONS = (
+    (
+        "the catch replays every constraint again (MUT-S1)",
+        FIXTURE_CHAT_REPO.replace(
+            "            val conflict = classifyMessageInsertConstraint(e.message)\n"
+            "            if (conflict != MessageInsertConflict.SORT_ORDER &&\n"
+            "                conflict != MessageInsertConflict.UNKNOWN\n"
+            "            ) {\n"
+            "                throw MessageInsertRejectedException(conflict, sessionId, e)\n"
+            "            }\n",
+            "",
+        ),
+        "does not discriminate the UNIQUE sort_order race",
+    ),
+    (
+        "the classifier forgets the foreign key (MUT-S2)",
+        FIXTURE_CHAT_REPO.replace(
+            '    if (text.contains("FOREIGN KEY constraint failed", ignoreCase = true)) {\n'
+            "        return MessageInsertConflict.SESSION_ROW_MISSING\n"
+            "    }\n",
+            "",
+        ),
+        "never names the FOREIGN KEY failure",
+    ),
+    (
+        "the classifier accepts any UNIQUE violation (MUT-S3)",
+        FIXTURE_CHAT_REPO.replace(
+            '    if (text.contains("UNIQUE constraint failed", ignoreCase = true) &&\n'
+            '        text.contains("sort_order", ignoreCase = true)\n'
+            "    ) {\n",
+            '    if (text.contains("UNIQUE constraint failed", ignoreCase = true)) {\n',
+        ),
+        "accepts any UNIQUE violation",
+    ),
+    (
+        "the rejection branch moved below the replay (MUT-S4)",
+        FIXTURE_CHAT_REPO.replace(
+            "            val conflict = classifyMessageInsertConstraint(e.message)\n"
+            "            if (conflict != MessageInsertConflict.SORT_ORDER &&\n"
+            "                conflict != MessageInsertConflict.UNKNOWN\n"
+            "            ) {\n"
+            "                throw MessageInsertRejectedException(conflict, sessionId, e)\n"
+            "            }\n"
+            "            val retrySortOrder = dao.nextSortOrder(sessionId)\n",
+            "            val retrySortOrder = dao.nextSortOrder(sessionId)\n"
+            "            val conflict = classifyMessageInsertConstraint(e.message)\n"
+            "            if (conflict != MessageInsertConflict.SORT_ORDER &&\n"
+            "                conflict != MessageInsertConflict.UNKNOWN\n"
+            "            ) {\n"
+            "                throw MessageInsertRejectedException(conflict, sessionId, e)\n"
+            "            }\n",
+        ),
+        "replays (`nextSortOrder`) BEFORE deciding",
+    ),
 )
 # Green arm, delegated spelling: the envelope literals live in a helper one hop
 # away, which the criterion must accept (it binds the decision, not the spelling).
@@ -1904,8 +2356,9 @@ _R_FOURTH_ENTRY = (
     "\n"
     "    suspend fun rerunAll(context: Context, sessionId: String): PromptResult "
     "= withContext(Dispatchers.Main) {\n"
-    "        val vm = viewModel(context, sessionId)\n"
     "        val app = app(context)\n"
+    "        requireSendableSession(app, sessionId)\n"
+    "        val vm = viewModel(context, sessionId)\n"
     "        vm.retryFromMessage(messageId)\n"
     "        val finished = withTimeoutOrNull(timeoutMs) {\n"
     "            if (vm.isStreaming.value) vm.isStreaming.first { !it }\n"
@@ -1964,6 +2417,7 @@ _R_BARRIER_ENTRY = (
     "\n"
     "    suspend fun retry(context: Context, sessionId: String): PromptResult "
     "= withContext(Dispatchers.Main) {\n"
+    "        requireSendableSession(app(context), sessionId)\n"
     "        val vm = viewModel(context, sessionId)\n"
     + _R_BARRIER_WAIT_BLOCK
     + _R_BARRIER_ERROR_BLOCK
@@ -2050,6 +2504,7 @@ internal object ChatMutationMethods {
 
     suspend fun uiPrompt(context: Context, text: String): JSONObject {
         val app = app(context)
+        HeadlessChatRunner.requireSendableSession(app, sessionId)
         val vm = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Main) {
             androidx.lifecycle.ViewModelProvider(
                 ChatViewModelStore.ownerFor(sessionId),
@@ -2306,7 +2761,8 @@ def selftest() -> int:
     def run_tree(screen: str, nav: str, move: str, store: str,
                  activity: "str | None" = None,
                  runner: "str | None" = None,
-                 mutation: "str | None" = None) -> "tuple[int, list[str]]":
+                 mutation: "str | None" = None,
+                 repo: "str | None" = None) -> "tuple[int, list[str]]":
         with tempfile.TemporaryDirectory() as td:
             tdp = Path(td)
             for rel in (REL_SCREEN, REL_NAV, REL_MOVE, REL_STORE):
@@ -2328,6 +2784,10 @@ def selftest() -> int:
                 f = tdp / REL_MUTATION_FILE
                 f.parent.mkdir(parents=True, exist_ok=True)
                 f.write_text(mutation, encoding="utf-8")
+            if repo is not None:
+                f = tdp / REL_CHAT_REPO
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text(repo, encoding="utf-8")
             rc = check(tdp)
             return rc, list(errors)
 
@@ -2613,6 +3073,83 @@ def selftest() -> int:
             print(
                 "selftest: criterion 14 a selectModel entry without the barrier "
                 f"(MUT-B8, selectEntry) -> RED ({len(errs)} violation(s)) OK")
+
+    # --- criteria 18/19 [dv29-A2]: the session-existence gate and the
+    #     single-constraint insert retry ---
+    # Backward compat: the repo file is optional, and every tree above omits it
+    # — criterion 19 is vacuously green there (drift-detector stance, same as
+    # criteria 9/13).
+    print("selftest: criterion 19 skipped when ChatRepository.kt absent (old fixtures) OK")
+
+    rc, errs = run_tree(
+        screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY, FIXTURE_RUNNER,
+        None, FIXTURE_CHAT_REPO)
+    if rc != 0:
+        failures.append(f"criteria 18/19 GREEN fixture unexpectedly red: {errs}")
+    else:
+        print("selftest: criteria 18/19 GREEN fixture passes")
+
+    for name, run_fixture, expect in (
+        (
+            "the send entry drops the existence gate (MUT-S1)",
+            FIXTURE_RUNNER.replace("        requireSendableSession(app, sessionId)\n", "", 1),
+            "can append a message / write a session binding",
+        ),
+        (
+            "the binding entry drops the existence gate (MUT-S2)",
+            FIXTURE_RUNNER.replace(
+                "        requireSendableSession(app, sessionId)\n"
+                "        val cfg = app.providerRepository.config.value\n",
+                "        val cfg = app.providerRepository.config.value\n"),
+            "can append a message / write a session binding",
+        ),
+        (
+            "the guard loses its RPC rejection (MUT-S3)",
+            FIXTURE_RUNNER.replace(
+                '        throw RPCException(-32602, "session_not_found: " + sessionId)\n',
+                '        println("session_not_found")\n'),
+            "no session-existence guard anywhere",
+        ),
+        (
+            "the guard stops peeking the resident VM (MUT-S4)",
+            FIXTURE_RUNNER.replace(
+                "        val resident = withContext(Dispatchers.Main) {\n"
+                "            ChatViewModelStore.peekViewModel(sessionId)\n"
+                "        }\n",
+                "        val resident: Any? = null\n"),
+            "no session-existence guard anywhere",
+        ),
+    ):
+        if run_fixture == FIXTURE_RUNNER:
+            failures.append(f"criterion 18 {name}: mutation is a no-op (anchor not found)")
+            continue
+        rc, errs = run_tree(
+            screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY, run_fixture)
+        if rc == 0 or not [e for e in errs if expect in e]:
+            failures.append(f"criterion 18 {name}: expected a `{expect}` violation, got {errs}")
+        else:
+            print(f"selftest: criterion 18 {name} -> RED ({len(errs)} violation(s)) OK")
+
+    for name, repo_fixture, expect in _INSERT_RETRY_MUTATIONS:
+        if repo_fixture == FIXTURE_CHAT_REPO:
+            failures.append(f"criterion 19 {name}: mutation is a no-op (anchor not found)")
+            continue
+        rc, errs = run_tree(
+            screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY, FIXTURE_RUNNER,
+            None, repo_fixture)
+        if rc == 0 or not [e for e in errs if expect in e]:
+            failures.append(f"criterion 19 {name}: expected a `{expect}` violation, got {errs}")
+        else:
+            print(f"selftest: criterion 19 {name} -> RED ({len(errs)} violation(s)) OK")
+
+    # fail-closed: renaming `appendMessage` must not read as green
+    rc, errs = run_tree(
+        screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY, FIXTURE_RUNNER,
+        None, FIXTURE_CHAT_REPO.replace("fun appendMessage(", "fun appendRow("))
+    if rc == 0:
+        failures.append("criterion 19 missing anchor: gate stayed GREEN (fail-closed violated)")
+    else:
+        print(f"selftest: criterion 19 missing anchor -> RED ({len(errs)} violation(s)) OK")
 
     if failures:
         print("\nselftest FAILURES:")
