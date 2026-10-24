@@ -132,12 +132,63 @@ def read(rel, root):
 # ----------------------------------------------------------------------
 # Arm 1 — merge must not return the temp uuid
 # ----------------------------------------------------------------------
+def _top_level_find(text, needle):
+    """Index of [needle] at zero ()/[]/{} depth (string-aware), or -1."""
+    depth, quote, i = 0, None, 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif depth == 0 and text.startswith(needle, i):
+            return i
+        i += 1
+    return -1
+
+
+def _statement(text, start):
+    """The expression starting at [start] up to a zero-depth newline / `;`."""
+    depth, quote, i = 0, None, start
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and ch in "\n;":
+            nxt = text[i + 1:].lstrip(" \t")
+            if not nxt.startswith((".", "?", ":", "&&", "||")):
+                break
+        i += 1
+    return text[start:i]
+
+
 def check_merge_requery(src, rel=PR_REL):
     body = function_text(src, "fun mergeImportInstanceJSON(")
     if body is None:
         return [(rel, 0, "1", "mergeImportInstanceJSON( not found — gate ROT")]
     code = code_only(body)
     add_idx = code.find("addEntry(entry)")
+    add_m = re.search(r"addEntry\(\s*([A-Za-z_]\w*)\s*\)", code)
     if add_idx < 0:
         return [(rel, 0, "1", "mergeImportInstanceJSON no longer calls addEntry(entry) — gate ROT")]
     # The run-block that follows addEntry must resolve the persisted id.
@@ -148,6 +199,57 @@ def check_merge_requery(src, rel=PR_REL):
                  "addEntry(entry) branch returns without re-querying the persisted id "
                  "(no firstOrNull re-query, no compositeEntryKey) — entryIdMap receives "
                  "a temp uuid that never existed on disk")]
+    # [wide-1024] The id must be PROJECTED OFF THE RE-QUERY RESULT, not read off
+    # the imported entry. The sweep's witness wrote
+    #   …firstOrNull { … }?.let { entry.uuid } ?: compositeEntryKey(…)
+    # — `ModelEntry.id` is `get() = uuid`, so the temp uuid came back through a
+    # different spelling while `firstOrNull`, `compositeEntryKey(` and the
+    # absence of a bare `entry.id` all stayed true.
+    left = tail
+    elvis = _top_level_find(tail, "?:")
+    problems = []
+    imported = add_m.group(1) if add_m else "entry"
+    if elvis < 0:
+        # No elvis: the branch may return the deterministic composite key
+        # straight away (`compositeEntryKey(existing.id, entry.baseModel.id)`),
+        # which is derived from STABLE inputs and needs no re-query. What it may
+        # not do is read the temp uuid/id off the imported entry.
+        whole = tail.strip()
+        if not re.search(r"\bcompositeEntryKey\s*\(", whole):
+            problems.append("the returned id is neither a re-query projection nor a "
+                            "deterministic compositeEntryKey(…) — fail-closed")
+        if re.search(r"(?<![.\w])%s\s*\.\s*(?:uuid|id)\b" % re.escape(imported), whole):
+            problems.append("it is read off the imported entry `%s` itself (a temp "
+                            "uuid/id that saveConfig canonicalizes away)" % imported)
+        left_txt = whole
+    else:
+        left_txt = tail[:elvis].strip()
+        rq = re.search(r"firstOrNull\s*\{|\.\s*find\s*\{|firstOrNull\s*\(|singleOrNull", left_txt)
+        if not rq:
+            problems.append("the returned id is not produced by a re-query of the persisted list")
+        else:
+            # The predicate lambda legitimately reads the imported entry (it
+            # matches on `entry.baseModel.id`); only the PROJECTION — what the
+            # expression evaluates to after the lambda closes — must not.
+            brace = left_txt.find("{", rq.start())
+            projection = left_txt
+            if brace >= 0:
+                close = _balanced(left_txt, brace, "{", "}")
+                if close > 0:
+                    projection = left_txt[close:]
+            projection = projection.strip()
+            if re.search(r"(?<![.\w])%s\s*\." % re.escape(imported), projection):
+                problems.append("it is read off the imported entry `%s` itself (a temp uuid / "
+                                "field that saveConfig canonicalized away)" % imported)
+            if not re.search(r"(?:\?\.\s*|\.\s*(?:let|run)\s*\{[^}]*\.\s*)"
+                             r"(?:id|uuid|key)\b\s*\}?\s*$", projection):
+                problems.append("it ends in no projection of the lookup result "
+                                "(`?.id` / `?.let { it.id }` / `?.key`) — fail-closed")
+    if problems:
+        return [(rel, line_of(src, src.find("fun mergeImportInstanceJSON(") + add_idx),
+                 "1",
+                 "mergeImportInstanceJSON's re-query result is not what it returns: %s"
+                 % "; ".join(problems))]
     m = BARE_ENTRY_ID.search(code)
     if m is not None:
         return [(rel, line_of(src, src.find("fun mergeImportInstanceJSON(") + m.start()), "1",
@@ -270,6 +372,32 @@ def check_merge_shares_instance_fields(src, rel=PR_REL):
                         "shared write face (readImportInstanceFields + applyImportInstanceFields) "
                         "— a same-(type,label) restore drops customBaseURL / appendV1Suffix / "
                         "useResponsesAPI / customUserAgent / the five run-config fields"))
+        # [wide-1024] The fields must be applied onto the value that is WRITTEN.
+        # The sweep's witness kept the shared read + apply in place and passed
+        # the UNTOUCHED `existing` to updateInstance — every decoded field was
+        # computed and then dropped, silently.
+        enriched = set(m.group(1) for m in re.finditer(
+            r"\b([A-Za-z_]\w*)\s*=\s*applyImportInstanceFields\s*\(", code))
+        if not enriched:
+            out.append((rel, line_of(src, src.find("fun mergeImportInstanceJSON(")), "6",
+                        "applyImportInstanceFields' result is discarded (no `val x = "
+                        "applyImportInstanceFields(…)` binding) — the decoded fields cannot "
+                        "reach the write face — fail-closed"))
+        else:
+            writes = re.findall(r"\bupdateInstance\s*\(\s*([A-Za-z_]\w*)\s*\)", code)
+            if not writes:
+                out.append((rel, line_of(src, src.find("fun mergeImportInstanceJSON(")), "6",
+                            "merge path never writes the applied instance back through "
+                            "updateInstance(<ident>) — the fields are decoded and dropped — "
+                            "fail-closed"))
+            else:
+                for w in writes:
+                    if w not in enriched:
+                        out.append((rel, line_of(src, src.find("fun mergeImportInstanceJSON(")), "6",
+                                    "updateInstance(%s) writes a value that did NOT come from "
+                                    "applyImportInstanceFields (expected one of %s) — the "
+                                    "decoded instance-config fields are silently dropped"
+                                    % (w, ", ".join(sorted(enriched)))))
     n = len(re.findall(r"fun\s+applyImportInstanceFields\s*\(", src))
     if n != 1:
         out.append((rel, 0, "6",
@@ -378,6 +506,38 @@ def check_save_persists_published(src, rel=PR_REL):
                     "saveConfig publishes %r but persists %r — the mirror + its stored "
                     "hash carry a different shape than the running store (canonicalize "
                     "runs on publish only)" % (published, persists)))
+        return out
+    # [wide-1024] Publishing the same NAME is not enough — the value it is built
+    # from matters. The sweep's witness kept `_config.value = published` and
+    # `persistToDbAndMirror(published)` intact while re-deriving `published` from
+    # the raw `config` argument: the canonicalization ran, its result was never
+    # used, and the mirror + DB kept the legacy uuid shape.
+    canon = set()
+    for m in re.finditer(r"\.\s*toSnapshot\s*\(", code):
+        decls = list(re.finditer(r"\bval\s+([A-Za-z_]\w*)\s*(?::[^=\n]*)?=\s*",
+                                 code[:m.start()]))
+        if decls:
+            canon.add(decls[-1].group(1))
+    if not canon:
+        out.append((rel, line_of(src, src.find("fun saveConfig(")), "8",
+                    "no `val x = …toSnapshot(…).toProviderConfig(…)` canonicalization in "
+                    "saveConfig — fail-closed, re-derive this criterion"))
+        return out
+    dm = re.search(r"\b(?:val|var)\s+%s\s*(?::[^=\n]*)?=\s*" % re.escape(published), code)
+    if dm is None:
+        out.append((rel, line_of(src, src.find("fun saveConfig(")), "8",
+                    "the published identifier %r has no readable declaration — fail-closed"
+                    % published))
+        return out
+    expr = _statement(code, dm.end()).strip()
+    root = re.match(r"([A-Za-z_]\w*)", expr)
+    root = root.group(1) if root else ""
+    if root not in canon:
+        out.append((rel, line_of(src, src.find("fun saveConfig(")), "8",
+                    "%s is derived from %r, not from the canonicalized value (%s) — the "
+                    "canonicalization runs and its result is discarded, so the published "
+                    "store and the mirror keep the pre-canonical id shape"
+                    % (published, expr[:60], ", ".join(sorted(canon)))))
     return out
 
 # ----------------------------------------------------------------------
@@ -744,6 +904,33 @@ def _body_line(src, body_start, code, idx):
     return line_of(src, body_start) + code.count("\n", 0, idx)
 
 
+_FAIL_TAIL_RE = re.compile(r"\.\s*(?:onFailure|getOrElse|recover|recoverCatching)\s*(?:\(|\{)")
+_CATCH_RE = re.compile(r"\bcatch\s*\(")
+
+
+def _failure_regions(code):
+    """[(start, end, label)] — bodies that run only when the surrounding write
+    FAILED (`.onFailure { … }`, `.getOrElse { … }`, `.recover{…}`, `catch (…) {…}`)."""
+    regions = []
+    for rx, label in ((_FAIL_TAIL_RE, "failure handler"), (_CATCH_RE, "catch block")):
+        for m in rx.finditer(code):
+            brace = code.find("{", m.start())
+            if brace < 0:
+                continue
+            end = _balanced(code, brace, "{", "}")
+            if end > 0:
+                regions.append((brace, end, "%s `%s`" % (label, m.group(0).strip())))
+    return regions
+
+
+def _failure_region_at(code, pos):
+    """Label of the failure-only region containing [pos], or None."""
+    for start, end, label in _failure_regions(code):
+        if start <= pos < end:
+            return label
+    return None
+
+
 def check_thinking_rule_publish_order(src, rel=PR_REL):
     """[fix/dv23-a1 A-01] Arm 12: publish-after-persist ordering.
 
@@ -781,6 +968,23 @@ def check_thinking_rule_publish_order(src, rel=PR_REL):
                         "non-null, so republishThinkingCache takes the 'persisted' "
                         "fast path and publishes rules that never reached "
                         "provider.db" % (name, var, DAO_RULE_WRITE)))
+        # [wide-1024] "After the DAO write" is necessary, not sufficient: the
+        # value must also exist ONLY on the success path. The sweep's witness
+        # added `persistedRules = listOf(rule)` inside `.onFailure { … }` — the
+        # ordering check still saw the in-block assignment first, but a failed
+        # write now hands a non-null list to the publisher (memory/disk split).
+        if not re.search(r"\bvar\s+%s\s*:[^=\n]*=\s*null\b" % re.escape(var), code):
+            out.append((rel, _body_line(src, start, code, first), "12",
+                        "%s is not initialised to null — the 'failed write ⇒ re-read the DB' "
+                        "fallback has no value to fall back to (fail-closed)" % var))
+        for a in assigns:
+            region = _failure_region_at(code, a)
+            if region:
+                out.append((rel, _body_line(src, start, code, a), "12",
+                            "%s assigns %s inside %s — that body runs only when the write "
+                            "FAILED, so the publisher receives a non-null rule set that "
+                            "never reached provider.db (memory/disk split until restart)"
+                            % (name, var, region)))
     if not seen:
         out.append((rel, 0, "12",
                     "no rule-publishing mutator found — gate ROT "
@@ -1539,9 +1743,42 @@ FIX_AGENT_LOOP_NO_LOCK_BAD = '\nfun addAgentLoopEntry(entryId: String) = synchro
 
 FIX_AGENT_LOOP_READ_BEFORE_LOCK_BAD = '\nfun addAgentLoopEntry(entryId: String) {\n    val cur = _config.value.agentLoopModelEntryIds.toList()\n    synchronized(configLock) {\n        ensureConfigLoaded()\n        if (entryId in cur) return@synchronized\n        setAgentLoopEntryIds(cur + entryId)\n    }\n}\n\nfun reorderAgentLoopEntries(newOrder: List<String>) = synchronized(configLock) {\n    ensureConfigLoaded()\n    val cur = _config.value.agentLoopModelEntryIds.toList()\n    val reordered = permuteById(cur, newOrder) { it } ?: return@synchronized\n    setAgentLoopEntryIds(reordered)\n}\n'
 
+# --- [wide-1024] the sweep's witnesses, frozen as arms ---------------------
+# Arm 1: the re-query still runs and the elvis fallback is intact, but the id
+# that comes back is read off the imported entry — `ModelEntry.id` IS `uuid`,
+# so the temp uuid returns through a different spelling.
+FIX_MERGE_ID_OFF_IMPORTED_BAD = FIX_MERGE_OK.replace(
+    "            }?.id ?: compositeEntryKey(existing.id, entry.baseModel.id)",
+    "            }?.let { entry.uuid } ?: compositeEntryKey(existing.id, entry.baseModel.id)")
+
+# Arm 6: the fields are decoded AND applied — then the UNMERGED instance is
+# written through updateInstance, so every decoded field is dropped.
+FIX_MERGE_WRITES_UNMERGED_BAD = FIX_MERGE_OK.replace(
+    "    if (updated != existing) updateInstance(updated)",
+    "    if (updated != existing) updateInstance(existing)")
+
+# Arm 8: the canonicalization still runs and `published` is still the single
+# object on both faces — but it is re-derived from the RAW config argument, so
+# the canonical value is computed and discarded.
+FIX_SAVE_PUBLISHED_FROM_RAW_BAD = FIX_SAVE_CANONICAL.replace(
+    "        val published = canonical.copy(",
+    "        val published = config.copy(")
+
+# Arm 12: the assignment is still after the DAO write, and the failure handler
+# now makes the published value non-null — a failed write publishes rules that
+# never reached provider.db.
+FIX_THINKING_ASSIGN_IN_FAILURE_BAD = FIX_THINKING_OK.replace(
+    """    }.onFailure { e ->
+        android.util.Log.e("ProviderRepo", "saveThinkingRule failed", e)""",
+    """    }.onFailure { e ->
+        persistedRules = listOf(rule)
+        android.util.Log.e("ProviderRepo", "saveThinkingRule failed", e)""")
+
+
 def build_fixture_tree(tmp, merge_src, export_src, parse_src, convert_src,
                        update_entry_src=None, persist_src=None, restore_src=None,
-                       thinking_src=None, agentloop_src=None):
+                       thinking_src=None, agentloop_src=None,
+                       save_src=None):
     os.makedirs(os.path.join(tmp, APP + "/data/repository"), exist_ok=True)
     os.makedirs(os.path.join(tmp, APP + "/backup"), exist_ok=True)
     os.makedirs(os.path.join(tmp, APP + "/data/model"), exist_ok=True)
@@ -1549,7 +1786,7 @@ def build_fixture_tree(tmp, merge_src, export_src, parse_src, convert_src,
         f.write(merge_src + "\n" + export_src + "\n" + parse_src + "\n" + FIX_HELPERS
                 + "\n" + FIX_IMPORT_OK + "\n" + FIX_MERGE_FIELDS_HELPER + "\n"
                 + (FIX_UPDATE_ENTRY_OK if update_entry_src is None else update_entry_src)
-                + "\n" + FIX_SAVE_CANONICAL
+                + "\n" + (FIX_SAVE_CANONICAL if save_src is None else save_src)
                 + "\n" + (FIX_PERSIST_OK if persist_src is None else persist_src)
                 + "\n" + (FIX_RESTORE_OK if restore_src is None else restore_src)
                 + "\n" + (FIX_THINKING_OK if thinking_src is None else thinking_src)
@@ -1638,6 +1875,32 @@ def selftest():
     # [fix/dv21-a3 A-03] Arm 9: a restore must not restamp userModifiedAt —
     # broken at the call site, inside the write face (decorative switch), by
     # dropping the switch entirely, and by removing the write face (ROT).
+    # [wide-1024] The sweep's four witnesses, one arm each: the named anchor
+    # stayed, the VALUE stopped flowing.
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_ID_OFF_IMPORTED_BAD, FIX_EXPORT_OK,
+                           FIX_PARSE_OK, FIX_CONVERT_OK)
+        got = _arm_set(tmp)
+        if got != ["1"]:
+            failures.append("merge-id-off-imported fixture arms=%r (want ['1'])" % (got,))
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_WRITES_UNMERGED_BAD, FIX_EXPORT_OK,
+                           FIX_PARSE_OK, FIX_CONVERT_OK)
+        got = _arm_set(tmp)
+        if got != ["6"]:
+            failures.append("merge-writes-unmerged fixture arms=%r (want ['6'])" % (got,))
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_OK, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK,
+                           save_src=FIX_SAVE_PUBLISHED_FROM_RAW_BAD)
+        got = _arm_set(tmp)
+        if got != ["8"]:
+            failures.append("save-published-from-raw fixture arms=%r (want ['8'])" % (got,))
+    with tempfile.TemporaryDirectory() as tmp:
+        build_fixture_tree(tmp, FIX_MERGE_OK, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK,
+                           thinking_src=FIX_THINKING_ASSIGN_IN_FAILURE_BAD)
+        got = _arm_set(tmp)
+        if got != ["12"]:
+            failures.append("thinking-assign-in-failure fixture arms=%r (want ['12'])" % (got,))
     with tempfile.TemporaryDirectory() as tmp:
         build_fixture_tree(tmp, FIX_MERGE_STAMP_BAD, FIX_EXPORT_OK, FIX_PARSE_OK, FIX_CONVERT_OK)
         got = _arm_set(tmp)
