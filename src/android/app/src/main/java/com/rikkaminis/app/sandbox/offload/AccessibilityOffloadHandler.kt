@@ -456,10 +456,18 @@ First-run: enable "RikkaMinis" under Settings → Accessibility, then `service p
         }
 
         val baos = java.io.ByteArrayOutputStream()
-        scaled.compress(Bitmap.CompressFormat.PNG, 100, baos)
+        // [deep-audit-1048 A-02] PNG encode failure is silent: `compress` returns
+        // false instead of throwing, and the old statement-position call shipped
+        // an EMPTY base64 image payload under `success`. Answer the handler's
+        // existing error shape instead — an image the model cannot see must not
+        // read as a successful screenshot.
+        val encoded = scaled.compress(Bitmap.CompressFormat.PNG, 100, baos)
         val outW = scaled.width
         val outH = scaled.height
         scaled.recycle()
+        if (!com.rikkaminis.app.util.saveOutcome(streamOpened = true, compressed = encoded)) {
+            return err(args, "ENCODE_FAILED", "PNG encoder wrote no bytes (compress returned false)")
+        }
         val pngBytes = baos.toByteArray()
 
         val data = JSONObject()

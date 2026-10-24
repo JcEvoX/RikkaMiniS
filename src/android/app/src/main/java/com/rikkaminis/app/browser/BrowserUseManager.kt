@@ -24,6 +24,7 @@ import androidx.core.content.FileProvider
 import com.rikkaminis.app.browser.SafeWebViewClient
 import com.rikkaminis.app.data.AgentRuntimeLimitsPrefs
 import com.rikkaminis.app.sandbox.PRootKernel
+import com.rikkaminis.app.util.saveOutcome
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -1204,7 +1205,10 @@ class BrowserUseManager(
             val bitmap = captureWebViewBitmap() ?: return result
             val file = saveBitmapToFile(bitmap, "snapshot", SNAPSHOT_QUALITY)
             bitmap.recycle()
-            result.copy(imageFilePath = file.absolutePath)
+            // [deep-audit-1048 A-02] A failed encode leaves no file to point at;
+            // the result keeps its text and simply carries no image (rather than
+            // a path to a 0-byte file).
+            if (file == null) result else result.copy(imageFilePath = file.absolutePath)
         } catch (e: Exception) {
             Log.w(TAG, "Auto-snapshot failed: ${e.message}")
             result
@@ -1419,16 +1423,31 @@ class BrowserUseManager(
         } ?: return BrowserActionResult.error("Failed to capture screenshot")
 
         val out = ByteArrayOutputStream()
-        bitmap.compress(Bitmap.CompressFormat.JPEG, AgentRuntimeLimitsPrefs.browserScreenshotQuality(), out)
+        // [deep-audit-1048 A-02] `compress` answers false when the JPEG encoder
+        // wrote nothing — no throw. Both channels below read that as success: the
+        // base64 handed to the model and the file whose path was published. The
+        // encode verdict is the only place that can differ, so it is answered
+        // once, before either channel is built.
+        val encoded = bitmap.compress(
+            Bitmap.CompressFormat.JPEG,
+            AgentRuntimeLimitsPrefs.browserScreenshotQuality(),
+            out,
+        )
         val jpegBytes = out.toByteArray()
+        if (!saveOutcome(streamOpened = true, compressed = encoded)) {
+            bitmap.recycle()
+            return BrowserActionResult.error("Failed to encode screenshot (JPEG encoder wrote no bytes)")
+        }
 
+        // null = the encoder refused the file write too; the caller must not be
+        // handed a path to a 0-byte file (see saveBitmapToFile).
         val file = saveBitmapToFile(bitmap, "screenshot")
         val base64 = Base64.encodeToString(jpegBytes, Base64.NO_WRAP)
 
         val w = bitmap.width; val h = bitmap.height
         bitmap.recycle()
 
-        Log.i(TAG, "Screenshot saved: ${file.absolutePath}, ${w}x$h, ${jpegBytes.size} bytes (full_page=$fullPage)")
+        Log.i(TAG, "Screenshot captured: ${file?.absolutePath ?: "<not saved>"}, ${w}x$h, ${jpegBytes.size} bytes (full_page=$fullPage)")
 
         val meta = viewportMetadata(
             imageW = w,
@@ -1440,7 +1459,7 @@ class BrowserUseManager(
         )
 
         return BrowserActionResult(
-            text = meta, base64Image = base64, imageFilePath = file.absolutePath
+            text = meta, base64Image = base64, imageFilePath = file?.absolutePath
         )
     }
 
@@ -1534,11 +1553,27 @@ class BrowserUseManager(
         }
     }
 
-    private fun saveBitmapToFile(bitmap: Bitmap, prefix: String, quality: Int = AgentRuntimeLimitsPrefs.browserScreenshotQuality()): File {
+    /**
+     * Encode [bitmap] to the screenshot cache. Returns **null** when the encoder
+     * wrote nothing — [Bitmap.compress] reports that by returning false, not by
+     * throwing, and a dropped verdict publishes a path to a 0-byte file that the
+     * agent (and the vision model) then treat as a real screenshot.
+     *
+     * [deep-audit-1048 A-02]
+     */
+    private fun saveBitmapToFile(bitmap: Bitmap, prefix: String, quality: Int = AgentRuntimeLimitsPrefs.browserScreenshotQuality()): File? {
         val filename = "${prefix}_${System.currentTimeMillis()}.jpg"
         val file = File(screenshotsDir, filename)
-        file.outputStream().use { out ->
+        val encoded = file.outputStream().use { out ->
             bitmap.compress(Bitmap.CompressFormat.JPEG, quality, out)
+        }
+        if (!saveOutcome(streamOpened = true, compressed = encoded)) {
+            // Do not leave the 0-byte artefact behind: the cache prune is
+            // age-based, so a failed encode would otherwise linger for days and
+            // any path that guessed the name would find it.
+            file.delete()
+            Log.w(TAG, "saveBitmapToFile: encoder wrote no bytes for $filename")
+            return null
         }
         // [T-android-screenshot-cache-cap] Bound the local cache after a
         // successful save (see pruneScreenshotCache for the rationale).
