@@ -491,8 +491,14 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
         isContextOnlySession = true
         _tabs.value.forEach { it.manager.minisSessionId = sessionId }
         if (decision.resetViewport) {
-            _sessionViewportWidth.value = 0
-            _sessionViewportHeight.value = 0
+            // [dv29-B4 B-04] Zeroing the flows is only half a reset: the tabs
+            // this pool keeps are the PREVIOUS session's tabs, and each one
+            // still carries that session's size in
+            // `BrowserUseManager.lastAppliedViewport`, which `navigate`,
+            // `minis://` injection and full-page capture replay verbatim. The
+            // collection point drops the stored override and re-applies the
+            // resolved one to those live tabs.
+            clearSessionViewportOverride()
         }
         Log.i(TAG, "Bound shared browser pool to session ${sessionId.take(12)}")
     }
@@ -1790,6 +1796,53 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
             (_customViewportWidth.value > 0 && _customViewportHeight.value > 0)
 
     /**
+     * [dv29-B4 B-04] Single collection point for "this pool no longer owns a
+     * session viewport override": zero both flows AND make the live tabs
+     * actually follow.
+     *
+     * The flows are only the pool's *intent*. Each tab's effective size lives
+     * in `BrowserUseManager.lastAppliedViewport`, which is replayed by every
+     * later `navigate`, `minis://` document injection and full-page capture.
+     * A path that zeroed the flows and stopped there therefore left the
+     * previous session's size applied to the surviving WebViews — the
+     * cross-session leak this function exists to close (session hand-off,
+     * restore-with-no-file, restore-without-override).
+     *
+     * Three properties the call sites rely on:
+     *  - idempotent: it writes the same two values and re-applies the same
+     *    resolved viewport, so a repeated clear does not rebuild WebViews
+     *    (the replay reloads; it never re-creates a tab);
+     *  - non-blocking: the replay is dispatched on `evictionScope`, because
+     *    callers are plain functions (WebView work must stay on Main);
+     *  - disposal-safe: [replayViewportToLiveTabs] refuses after [dispose].
+     */
+    private fun clearSessionViewportOverride() {
+        _sessionViewportWidth.value = 0
+        _sessionViewportHeight.value = 0
+        replayViewportToLiveTabs()
+    }
+
+    /**
+     * [dv29-B4 B-04] Re-assert the resolved viewport on the tabs that are
+     * already alive, without awaiting the reloads.
+     *
+     * `applyViewport(w, h)` is what overwrites `lastAppliedViewport`, so the
+     * replay is what actually retires a stale override — re-applying the
+     * *resolved* size is enough even when it is the UA default.
+     *
+     * `applyViewportToAllTabs` is suspend (it awaits the reloads), so the
+     * callers that cannot suspend hand it to [evictionScope] instead of
+     * blocking. Guarded twice: a disposed pool owns no tabs and its scopes are
+     * already cancelled, and an empty pool has nothing to replay — skipping the
+     * launch keeps the "zero live tabs ⇒ no extra coroutine" fast path.
+     */
+    private fun replayViewportToLiveTabs() {
+        if (isDisposed) return
+        if (_tabs.value.isEmpty()) return
+        evictionScope.launch { applyViewportToAllTabs() }
+    }
+
+    /**
      * Set the app-wide custom viewport. Persists to SharedPreferences so it
      * survives app restarts. Mirrors iOS `setGlobalViewport(width:height:)`.
      */
@@ -1972,8 +2025,10 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
                 // the override belongs to the session we are leaving, and this
                 // branch used to leave it applied, so the next session silently
                 // inherited a size it never set.
-                _sessionViewportWidth.value = 0
-                _sessionViewportHeight.value = 0
+                // [dv29-B4 B-04] Clearing the flows alone did not retire it
+                // either: the tabs that predate this load kept replaying the old
+                // size (see clearSessionViewportOverride).
+                clearSessionViewportOverride()
                 return
             }
             val json = JSONObject(file.readText())
@@ -2020,16 +2075,21 @@ class BrowserTabPool(private val context: Context) : ComponentCallbacks2 {
             val restoredViewport = BrowserSessionBinding.viewportForLoadedSession(w, h)
             _sessionViewportWidth.value = restoredViewport.width
             _sessionViewportHeight.value = restoredViewport.height
-            if (restoredViewport.hasOverride) {
-                // Re-apply to any live tabs that predate load (rare). At
-                // session-load time we're not in a suspend context and the
-                // usual case has zero live tabs, so fire-and-forget is
-                // adequate — the override is already stored and new tabs
-                // will pick it up via `resolvedViewportSize()`.
-                if (_tabs.value.isNotEmpty()) {
-                    evictionScope.launch { applyViewportToAllTabs() }
-                }
-            }
+            // [dv29-B4 B-04] Replay unconditionally — "restored a 0 × 0 (no
+            // override) session" is not "nothing to do". The old `hasOverride`
+            // gate only re-applied when the incoming session HAD an override, so
+            // moving from an override session to one without left every live tab
+            // on the old size. Re-applying the resolved size covers both
+            // directions: an override re-asserts itself, and "no override"
+            // re-asserts the global / UA default, which is what retires the
+            // stale `lastAppliedViewport`.
+            //
+            // Live tabs that predate this load are the rare case (the pool
+            // usually loads with zero tabs); at session-load time we are not in
+            // a suspend context, so the replay is fire-and-forget — the value is
+            // already stored, so tabs created later pick it up through
+            // `resolvedViewportSize()`.
+            replayViewportToLiveTabs()
         } catch (e: Exception) {
             Log.w(TAG, "Failed to load tab state: ${e.message}")
         }
