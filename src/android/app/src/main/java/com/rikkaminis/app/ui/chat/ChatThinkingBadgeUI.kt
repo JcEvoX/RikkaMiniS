@@ -38,6 +38,7 @@ import com.rikkaminis.app.data.model.ThinkingLevel
 import com.rikkaminis.app.data.repository.ChatRepository
 import com.rikkaminis.app.share.ChatExporter
 import com.rikkaminis.app.ui.theme.ChatColors
+import com.rikkaminis.app.util.ExternalIntent
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -232,11 +233,22 @@ internal fun exportCurrentChat(
                 putExtra(Intent.EXTRA_STREAM, uri)
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
             }
-            val chooser = Intent.createChooser(
+            // [deep-audit-1049 B-03] Through the shared launcher: the chooser
+            // is the intent that is actually started, and it does not inherit
+            // this intent's flags — the hand-rolled version added only the URI
+            // grant to it, so a non-Activity caller would have thrown
+            // AndroidRuntimeException instead of showing the share sheet.
+            ExternalIntent.share(
+                context,
                 intent,
                 context.getString(R.string.sessionlist_export),
-            ).apply { addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION) }
-            context.startActivity(chooser)
+            ) {
+                Toast.makeText(
+                    context,
+                    context.getString(R.string.export_progress_failed),
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
         } catch (t: Throwable) {
             Toast.makeText(
                 context,
