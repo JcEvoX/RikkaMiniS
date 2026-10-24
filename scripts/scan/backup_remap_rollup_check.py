@@ -124,6 +124,113 @@ DATE_PATTERN = 'Regex("\\\\d{4}-\\\\d{2}-\\\\d{2}")'
 HINT_DEF = "private fun dailyLogSizes("
 PICK_DEF = "private fun pickLargestEligibleDate("
 
+# ── [dv28-A3] ROLLUP CANDIDACY: the CONTENT dimension (dv28-A3) ──────────
+# The shared predicate promised to be the one口径 for "is this log worth
+# rolling up", but the CONTENT dimension ("does it still hold anything
+# distillable") lived only in the executor's picker. A log made entirely of
+# in-flight notes (>= 50 KB) was therefore named as the pending one by the
+# system prompt on every turn, and every memory_rollup answered
+# NOTHING_TO_DISTILL. The criterion below asserts that the transient filter
+# lives in exactly ONE place (inside the engine, reachable from the shared
+# predicate) and that BOTH sides reach it.
+#
+# Anchored on the DECISION, not on a spelling: the filter site is derived as
+# "a function that COMPARES against TRANSIENT" (not merely mentions it), the
+# reachability is derived from the call graph of the engine, and the hint's
+# reachability is derived from the call graph of the hint. Renaming the
+# classifier, the enum member or the helper does not blind it.
+TRANSIENT_TOKEN = "TRANSIENT"
+# A *filter* compares against the bucket; the classifier itself merely
+# RETURNS it (`return RollupClass.TRANSIENT`) — that is not a filter site.
+FILTER_EXPR = re.compile(
+    r"(?:==|!=)\s*[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\."
+    + TRANSIENT_TOKEN + r"\b"
+)
+
+def strip_kotlin_comments(text):
+    """Text with line AND block comments blanked out (newlines preserved).
+
+    KDoc mentioning `RollupClass.TRANSIENT` must not satisfy a criterion that
+    asks for a *filter*; blanking comments keeps presence checks about CODE.
+    """
+    out = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while j < n:
+                if text[j] == '\\':
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    j += 1
+                    break
+                j += 1
+            out.append(text[i:j])
+            i = j
+            continue
+        if c == '/' and i + 1 < n and text[i + 1] == '/':
+            j = text.find('\n', i)
+            j = n if j < 0 else j
+            out.append(' ' * (j - i))
+            i = j
+            continue
+        if c == '/' and i + 1 < n and text[i + 1] == '*':
+            j = text.find('*/', i + 2)
+            j = n if j < 0 else j + 2
+            out.append(''.join(ch if ch == '\n' else ' ' for ch in text[i:j]))
+            i = j
+            continue
+        out.append(c)
+        i += 1
+    return ''.join(out)
+
+def kotlin_fun_map(src):
+    """Map function name -> body text (comments blanked) for every `fun` decl."""
+    clean = strip_kotlin_comments(src)
+    out = {}
+    for m in re.finditer(r"\bfun\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", clean):
+        name = m.group(1)
+        brace = clean.find("{", m.end())
+        if brace < 0:
+            continue
+        end = _balanced(clean, brace, "{", "}")
+        if end < 0:
+            continue
+        out.setdefault(name, clean[brace:end])
+    return out
+
+def fun_closure(fns, roots):
+    """Names reachable from [roots] through calls between [fns] members."""
+    seen = set()
+    frontier = [r for r in roots if r in fns]
+    while frontier:
+        name = frontier.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        body = fns[name]
+        for m in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", body):
+            callee = m.group(1)
+            if callee in fns and callee not in seen:
+                frontier.append(callee)
+    return seen
+
+def filter_sites(fns):
+    """Functions whose body COMPARES against the transient bucket."""
+    return sorted(name for name, body in fns.items() if FILTER_EXPR.search(body))
+
+def engine_roots_called(body, eng_fns):
+    """Engine functions invoked from [body] (qualified or plain calls)."""
+    roots = set()
+    for m in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", body):
+        name = m.group(1)
+        if name in eng_fns:
+            roots.add(name)
+    return roots
+
 # ── [fix/dv18-4 A-07] GROUP RUN-CONFIG RESTORE (Stage 2 same-name merge) ──
 # A backup's groups[] entry carries five run-config fields (strategy /
 # fallbackStrategy / defaultThinkingLevel / contextLimitTokens /
@@ -466,6 +573,93 @@ def check_rollup_candidate_single_source(mem, eng, runner):
     return out
 
 
+def filter_occurrences(src):
+    """(line_number, that_line) for each transient-bucket COMPARISON in code.
+
+    [strip_kotlin_comments] blanks comments with spaces of equal length, so an
+    index found in the cleaned text addresses the same character in [src] —
+    which is what lets us report a real line number and read a marker on it.
+    """
+    clean = strip_kotlin_comments(src)
+    lines = src.split("\n")
+    out = []
+    for m in FILTER_EXPR.finditer(clean):
+        ln = line_of(src, m.start())
+        out.append((ln, lines[ln - 1] if ln - 1 < len(lines) else ""))
+    return out
+
+
+def check_rollup_content_dimension(mem, eng, runner):
+    """[dv28-A3] The transient ("nothing distillable") dimension must live in
+    the SINGLE shared decision, and BOTH sides must reach it.
+
+    Pre-fix, `isRollupCandidate` decided only date shape + not-yet-distilled
+    while the executor's picker additionally required a non-transient entry. A
+    pure-transient daily log (>= 50 KB) was then named by the system prompt on
+    every turn, and every memory_rollup answered NOTHING_TO_DISTILL.
+
+    Derived, not spelled: a *filter site* is a function that COMPARES against
+    TRANSIENT (the classifier merely RETURNS it, so it is not a filter site);
+    reachability comes from the engine's call graph; the hint's reachability
+    comes from the engine functions its body calls.
+    """
+    out = []
+    eng_fns = kotlin_fun_map(eng)
+    mem_fns = kotlin_fun_map(mem)
+    runner_fns = kotlin_fun_map(runner)
+
+    # C-R1 (ONE violation, so the PRE arm points at exactly one place): the
+    # content dimension must live in the shared predicate's closure and neither
+    # side may carry its own copy of it. Two reasons can feed it — a side-local
+    # copy (most precise location) and a predicate that cannot reach any filter.
+    # The escape hatch for a deliberate unreachable defence is a
+    # `// unreachable-defense:` marker on the offending line.
+    pred_closure = fun_closure(eng_fns, ["isRollupCandidate"])
+    eng_sites = filter_sites(eng_fns)
+    pred_reaches = [s for s in eng_sites if s in pred_closure]
+    c1_rel, c1_line, c1_reasons = None, 0, []
+    for src, rel in ((mem, MEM_REL), (runner, RUNNER_REL)):
+        stray = [(ln, ln_text) for ln, ln_text in filter_occurrences(src)
+                 if "unreachable-defense:" not in ln_text]
+        if stray:
+            if c1_rel is None:
+                c1_rel, c1_line = rel, stray[0][0]
+            c1_reasons.append(
+                rel + " re-implements the transient filter (%d site(s), first at "
+                "line %d)" % (len(stray), stray[0][0]))
+    if not pred_reaches:
+        if c1_rel is None:
+            c1_rel = ENGINE_REL
+            c1_line = (line_of(eng, eng.find(CANDIDATE_DEF))
+                       if CANDIDATE_DEF in eng else 0)
+        c1_reasons.append(
+            "the shared candidate predicate cannot reach any transient filter"
+            + (" (engine filter sites: " + ", ".join(eng_sites) + ")" if eng_sites else ""))
+    if c1_reasons:
+        out.append((c1_rel, c1_line,
+                    "; ".join(c1_reasons) +
+                    " — 'is there anything distillable' is not part of the ONE "
+                    "candidacy decision, so the prompt side and the executor can "
+                    "judge a log differently again"))
+
+    # C-R2: the prompt-side hint must reach the content dimension.
+    hint = function_text(mem, HINT_DEF)
+    if hint is None:
+        out.append((MEM_REL, 0, "dailyLogSizes( not found - gate ROT"))
+        return out
+    hint_roots = set()
+    for m in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", strip_kotlin_comments(hint)):
+        if m.group(1) in eng_fns:
+            hint_roots.add(m.group(1))
+    reached = fun_closure(eng_fns, hint_roots) if hint_roots else set()
+    if not [s for s in eng_sites if s in reached]:
+        out.append((MEM_REL, line_of(mem, mem.find(HINT_DEF)),
+                    "dailyLogSizes cannot reach the transient filter - the system "
+                    "prompt can still name a log the executor would answer with "
+                    "NOTHING_TO_DISTILL"))
+    return out
+
+
 def _import_body(src):
     body = function_text(src, "    suspend fun import(")
     if body is None:
@@ -585,6 +779,7 @@ def check(root, raw_cfg=None, raw_mem=None, raw_builtins=None, raw_engine=None,
     out += check_restore_writeback(raw_cfg)
     out += check_delete_guard(raw_mem)
     out += check_rollup_candidate_single_source(raw_mem, raw_engine, raw_runner)
+    out += check_rollup_content_dimension(raw_mem, raw_engine, raw_runner)
     out += check_group_run_config_merge(raw_cfg)
     out += check_group_run_config_single_decode(raw_cfg)
     return out
@@ -624,6 +819,12 @@ def selftest(root):
 
     def on_rollup(fn):
         return lambda c, m, b, e, r, _fn=fn: _fn(m, e, r)
+
+    def rollup_all(m, e, r):
+        """Both rollup criteria — an arm on one of them must not report the
+        other's violations as collateral."""
+        return (check_rollup_candidate_single_source(m, e, r)
+                + check_rollup_content_dimension(m, e, r))
 
     arms = []
 
@@ -759,26 +960,26 @@ def selftest(root):
     #     (the pre-fix shape: GLOBAL.md / MEMORY-ROLLUP.md / SOUL.md only).
     arm(
         "M12 hint drops the shared candidate predicate",
-        on_rollup(check_rollup_candidate_single_source),
+        on_rollup(rollup_all),
         mem=sub_once(mem, HINT_CALL, "isDailyLogForRollupLegacy("),
     )
     # 13. the shared predicate loses the already-distilled cutoff.
     arm(
         "M13 candidate predicate ignores the rollup file",
-        on_rollup(check_rollup_candidate_single_source),
+        on_rollup(rollup_all),
         eng=sub_once(eng, "hasRollupForDate(rollupContent,", "rollupIgnored("),
     )
     # 14. the past-log shape test loses the today/future boundary.
     arm(
         "M14 today boundary dropped",
-        on_rollup(check_rollup_candidate_single_source),
+        on_rollup(rollup_all),
         eng=sub_once(eng, "if (datePart >= todayStr) return false",
                      'if (datePart >= "9999-99-99") return false'),
     )
     # 15. the executor re-spells the date pattern instead of sourcing it.
     arm(
         "M15 executor re-spells the date pattern",
-        on_rollup(check_rollup_candidate_single_source),
+        on_rollup(rollup_all),
         runner=sub_once(
             runner,
             'private const val TAG = "MemoryRollupRunner"',
@@ -789,11 +990,11 @@ def selftest(root):
     # 16. the executor's picker bypasses the shared predicate.
     arm(
         "M16 executor picker bypasses the shared predicate",
-        on_rollup(check_rollup_candidate_single_source),
+        on_rollup(rollup_all),
         runner=sub_once(
             runner,
-            "if (!MemoryRollupEngine.isRollupCandidate(f.name, f.length(), todayStr, rollupContent)) {",
-            "if (!isDailyLogLegacy(f.name)) {",
+            "MemoryRollupEngine.isRollupCandidate(",
+            "isDailyLogLegacy(",
         ),
     )
 
@@ -846,6 +1047,64 @@ def selftest(root):
             value = enumOrDefault(g.optString("fallbackStrategy"), FallbackStrategy.default),
         ),""",
             "        fallbackStrategy = BackupField(present = false, value = FallbackStrategy.default),",
+        ),
+    )
+
+    # ── [dv28-A3] arms 21-23: the transient ("nothing distillable") dimension
+    #    must live in the ONE candidacy decision, reached by BOTH sides.
+    # 21. the shape the defect had: the shared predicate judges only date
+    #     shape + not-yet-distilled, and the executor carries its own filter.
+    #     ⇒ C-R1 (two reasons: side copy + predicate cannot reach) and C-R2.
+    arm(
+        "M21 content dimension removed from the shared predicate",
+        on_rollup(rollup_all),
+        eng=sub_once(
+            eng,
+            "        entries.filter { classify(it) != RollupClass.TRANSIENT }",
+            "        entries",
+        ),
+        runner=sub_once(
+            runner,
+            "                f to f.name.removeSuffix(\".md\")",
+            "                val legacy = MemoryRollupEngine.extractEntries(\"\").none {\n"
+            "                    MemoryRollupEngine.classify(it) !=\n"
+            "                        MemoryRollupEngine.RollupClass.TRANSIENT\n"
+            "                }\n"
+            "                f to f.name.removeSuffix(\".md\")",
+        ),
+    )
+    # 22. the filter is pushed BACK into the executor's body while the engine
+    #     keeps its own copy ⇒ C-R1 only (a second label of the same decision;
+    #     the hint still reaches the engine's copy, so C-R2 stays green).
+    arm(
+        "M22 transient filter duplicated in the executor",
+        on_rollup(rollup_all),
+        runner=sub_once(
+            runner,
+            "                f to f.name.removeSuffix(\".md\")",
+            "                val legacy = MemoryRollupEngine.extractEntries(\"\").none {\n"
+            "                    MemoryRollupEngine.classify(it) !=\n"
+            "                        MemoryRollupEngine.RollupClass.TRANSIENT\n"
+            "                }\n"
+            "                f to f.name.removeSuffix(\".md\")",
+        ),
+    )
+    # 23. the hint grows its own transient filter next to the shared predicate
+    #     ⇒ C-R1 (a side-local copy of the decision; the reachability itself is
+    #     untouched, so C-R2 stays green — the two criteria bite separately).
+    arm(
+        "M23 hint grows its own transient filter",
+        on_rollup(rollup_all),
+        mem=sub_once(
+            mem,
+            "        return memoryDir.listFiles()",
+            "        // gate fixture: a second copy of the transient decision\n"
+            "        val _legacy = com.rikkaminis.app.workspace.MemoryRollupEngine\n"
+            "            .extractEntries(\"\").none { e2 ->\n"
+            "                com.rikkaminis.app.workspace.MemoryRollupEngine.classify(e2) !=\n"
+            "                    com.rikkaminis.app.workspace.MemoryRollupEngine.RollupClass.TRANSIENT\n"
+            "            }\n"
+            "        return memoryDir.listFiles()",
         ),
     )
 
