@@ -284,6 +284,11 @@ internal fun ChatViewModel.switchModelAndRerun(label: String) {
     if (streamJob?.isActive == true) {
         traceObserver.t7Reduce(AgentRunEvent.UserCancelled("switch_model"))
     }
+    // [dv29-B01] Also kill the predecessor's SETUP shell: sendMessage/resume
+    // hold their whole setup in sendShellJob, and only `streamJob?.cancel()`
+    // was called here — the old shell could survive this claim and reach its
+    // own `streamJob = launch`, i.e. two live streams under one _isStreaming.
+    sendShellJob?.cancel()
     streamJob?.cancel()
     flushAllStreamingDeltas()
     ExecutionCoordinator.stopCurrentCommand(activeSessionId)
@@ -297,69 +302,85 @@ internal fun ChatViewModel.switchModelAndRerun(label: String) {
     // ── Phase 2: roll back the incomplete assistant turn in UI + history ──
     rollbackIncompleteTurn()
 
-    // ── Phase 3: re-sync DB + agentHistory to the last committed user
-    // message, then restart the loop on the (already-switched) provider. ──
+    // ── Phase 3: claim synchronously, then re-sync DB + agentHistory to the
+    // last committed user message and restart the loop on the (already
+    // switched) provider. ──
     val provider = currentProvider ?: run {
         AppLogger.warning(ChatViewModel.TAG, "switchModelAndRerun: no currentProvider after switch — aborting restart")
         return
     }
-    viewModelScope.launch(Dispatchers.IO) {
-        try {
-            val sid = realSessionId.takeIf { it.isNotEmpty() } ?: sessionId
-            val dbMessages = chatRepository.loadMessages(sid)
-            val lastUserSortOrder = dbMessages.findLast { it.role == "user" }?.sortOrder
-            if (lastUserSortOrder != null) {
-                chatRepository.deleteMessagesAfter(sid, lastUserSortOrder + 1)
-            }
-            // Rebuild agentHistory from the trimmed DB so the retried loop
-            // starts from committed context only (defense in depth against
-            // any partial tool_result / assistant rows the cancelled loop
-            // may have persisted).
-            val remaining = chatRepository.loadMessages(sid)
-            agentHistory.clear()
-            toolLoopDetector.reset()
-            for (entity in remaining) agentHistory.add(entity.toLLMMessage())
-            // Drop stream-flush side-channel state for messages the rollback
-            // removed, so no stale delta can resurrect on a kept bubble
-            // (mirrors rerunFromToolBlock).
-            val keptIds = _messages.value.mapTo(mutableSetOf()) { it.id }
-            retainStreamFlushStates(keptIds)
-            if (_streamingById.value.isNotEmpty()) {
-                _streamingById.value = _streamingById.value.filterKeys { it in keptIds }
-            }
-        } catch (e: Exception) {
-            // [audit-0917] Fail-closed: the re-sync half-applied (the DB trim
-            // and/or the history rebuild may be partial). Restarting the loop on a
-            // half-synced history would silently answer the CURRENT user message
-            // with wrong or empty context - surface the failure and leave the turn
-            // unanswered instead of guessing.
-            Log.w(ChatViewModel.TAG, "switchModelAndRerun: DB re-sync failed: ${e.message}")
-            _error.value = "Model switch failed: ${e.message}"
-            return@launch
-        }
-        // Restart the loop on the switched provider (mirrors retryFromMessage).
-        _error.value = null
-        _canResume.value = false
-        AppLogger.info(ChatViewModel.TAG_STREAM, "$label _isStreaming=true (sync, sid=$activeSessionId)")
-        // [T-claim-token-vs-stale-finally] Mint the claim token BEFORE the flag
-        // flips. This path is the one that failed in the field (2026-10-12
-        // 14:40:12): the cancel() above unwinds the predecessor while this
-        // claim is still running, and the epoch snapshot below lands too late
-        // to stop it. The token lands first and makes that finally a no-op.
-        streamingClaimToken = Any()
-        _isStreaming.value = true
-        streamEpoch++
-        // [T-stale-finally-vs-new-claim] Publish the claim SYNCHRONOUSLY
-        // here (not inside runRerunStreamTail, which runs after the
-        // system-prompt build): the epoch gate must already cover the whole
-        // claim window starting at _isStreaming=true.
-        streamingClaimEpoch = streamEpoch
+    // [dv29-B01] The claim is published HERE, before any suspension point: it
+    // used to be written inside the coroutine below, i.e. only after three
+    // DB round-trips. During that window `_isStreaming` read false (the
+    // cancelled predecessor's finally had already cleared it), so the entry
+    // guards of send/retry let a second turn in, and cancelStream() had no
+    // handle to stop this one: the user's Stop was a no-op and the turn came
+    // back to life once the DB work finished.
+    //
+    // [T-claim-token-vs-stale-finally] Mint the claim token BEFORE the flag
+    // flips. This path is the one that failed in the field (2026-10-12
+    // 14:40:12): the cancel() above unwinds the predecessor while this
+    // claim is still running, and the epoch snapshot below lands too late
+    // to stop it. The token lands first and makes that finally a no-op.
+    streamingClaimToken = Any()
+    _isStreaming.value = true
+    streamEpoch++
+    // [T-stale-finally-vs-new-claim] Publish the claim SYNCHRONOUSLY here
+    // (not inside runRerunStreamTail, which runs after the system-prompt
+    // build): the epoch gate must already cover the whole claim window
+    // starting at _isStreaming=true.
+    streamingClaimEpoch = streamEpoch
+    val switchEpoch = streamingClaimEpoch
+    val claimToken = streamingClaimToken
+    AppLogger.info(ChatViewModel.TAG_STREAM, "$label _isStreaming=true (sync, sid=$activeSessionId)")
+    _canResume.value = false
+
+    // [dv29-B01] Hold the setup shell in sendShellJob so cancelStream() can
+    // kill the DB re-sync window (before this, Stop reached only `streamJob`,
+    // which is still null here).
+    sendShellJob = viewModelScope.launch(Dispatchers.IO) {
         var streamLaunched = false
-        val switchEpoch = streamingClaimEpoch
-        val claimToken = streamingClaimToken
         try {
-            streamLaunched = runRerunStreamTail(provider, label)
+            try {
+                val sid = realSessionId.takeIf { it.isNotEmpty() } ?: sessionId
+                val dbMessages = chatRepository.loadMessages(sid)
+                val lastUserSortOrder = dbMessages.findLast { it.role == "user" }?.sortOrder
+                if (lastUserSortOrder != null) {
+                    chatRepository.deleteMessagesAfter(sid, lastUserSortOrder + 1)
+                }
+                // Rebuild agentHistory from the trimmed DB so the retried loop
+                // starts from committed context only (defense in depth against
+                // any partial tool_result / assistant rows the cancelled loop
+                // may have persisted).
+                val remaining = chatRepository.loadMessages(sid)
+                agentHistory.clear()
+                toolLoopDetector.reset()
+                for (entity in remaining) agentHistory.add(entity.toLLMMessage())
+                // Drop stream-flush side-channel state for messages the rollback
+                // removed, so no stale delta can resurrect on a kept bubble
+                // (mirrors rerunFromToolBlock).
+                val keptIds = _messages.value.mapTo(mutableSetOf()) { it.id }
+                retainStreamFlushStates(keptIds)
+                if (_streamingById.value.isNotEmpty()) {
+                    _streamingById.value = _streamingById.value.filterKeys { it in keptIds }
+                }
+            } catch (e: Exception) {
+                // [audit-0917] Fail-closed: the re-sync half-applied (the DB trim
+                // and/or the history rebuild may be partial). Restarting the loop on a
+                // half-synced history would silently answer the CURRENT user message
+                // with wrong or empty context - surface the failure and leave the turn
+                // unanswered instead of guessing.
+                Log.w(ChatViewModel.TAG, "switchModelAndRerun: DB re-sync failed: ${e.message}")
+                _error.value = "Model switch failed: ${e.message}"
+                return@launch
+            }
+            // Restart the loop on the switched provider (mirrors retryFromMessage).
+            _error.value = null
+            streamLaunched = runRerunStreamTail(provider, label, switchEpoch, claimToken)
         } finally {
+            // [dv29-B01] The claim moved out of this coroutine, so every early
+            // return above (re-sync failure) must release it — otherwise
+            // _isStreaming stays true forever and every later send is refused.
             if (!streamLaunched) {
                 // [T-stale-finally-vs-new-claim] Only clear under our own claim.
                 if (switchEpoch == streamingClaimEpoch && claimToken === streamingClaimToken) {

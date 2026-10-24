@@ -8,6 +8,7 @@ package com.rikkaminis.app.ui.chat
 
 import android.util.Log
 import kotlin.coroutines.coroutineContext
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import androidx.lifecycle.viewModelScope
 import com.rikkaminis.app.tools.AgentTraceRecorder
@@ -56,7 +57,12 @@ internal fun ChatViewModel.retryLast() {
         val sendEpoch = streamingClaimEpoch
         val claimToken = streamingClaimToken
 
-        viewModelScope.launch(Dispatchers.IO) {
+        // [dv29-B01] Hold the setup shell in sendShellJob — same shape/rationale
+        // as sendMessage / resume. Before this, a Stop during the DB cleanup
+        // below cancelled nothing (cancelStream() reached only `streamJob`,
+        // which is still the PREVIOUS turn's job here) and the shell went on to
+        // start a stream for a turn the user had just stopped.
+        sendShellJob = viewModelScope.launch(Dispatchers.IO) {
             var streamLaunched = false
             try {
             val sid = realSessionId.takeIf { it.isNotEmpty() } ?: sessionId
@@ -93,6 +99,18 @@ internal fun ChatViewModel.retryLast() {
             val systemPrompt = baseSystemPrompt
 
             // _isStreaming was already set synchronously at the top.
+            // [dv29-B01] Claim-revocation guard before the stream launch: Stop
+            // (cancelStream) revokes the claim (epoch → stale, token → fresh)
+            // while this shell was doing DB work; never start a stream for a
+            // stopped turn (same guard shape as resume()'s shell).
+            if (!isActive ||
+                !_isStreaming.value ||
+                sendEpoch != streamingClaimEpoch ||
+                claimToken !== streamingClaimToken
+            ) {
+                AppLogger.info(ChatViewModel.TAG_STREAM, "retryLast shell aborted before stream (claim revoked; sid=$activeSessionId)")
+                return@launch
+            }
             streamLaunched = true
             streamJob = launch(Dispatchers.IO) {
                 AppLogger.info(ChatViewModel.TAG_STREAM, "retryLast streamJob ENTER sid=$activeSessionId")

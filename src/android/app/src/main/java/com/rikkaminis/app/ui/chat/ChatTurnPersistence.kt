@@ -367,6 +367,8 @@ internal fun ChatViewModel.rollbackIncompleteTurn(): Boolean? {
 internal suspend fun ChatViewModel.runRerunStreamTail(
     initialProvider: LLMProvider,
     label: String,
+    sendEpoch: Long,
+    claimToken: Any,
 ): Boolean {
     var provider = initialProvider
 
@@ -374,15 +376,23 @@ internal suspend fun ChatViewModel.runRerunStreamTail(
     val systemPrompt = baseSystemPrompt
 
     // _isStreaming was already set synchronously by the caller.
-    // [T-stale-finally-vs-new-claim] The caller already published the claim
-    // epoch right after its synchronous _isStreaming=true (covering the full
-    // claim window including the system-prompt build before this call);
-    // capture it here for the finally-block gate.
-    val launchEpoch = streamingClaimEpoch
-    // [T-claim-token-vs-stale-finally] Capture the claim identity this job was
-    // launched under; only that turn may clear the flag or tear down run-state.
-    val claimToken = streamingClaimToken
+    // [dv29-B01] The claim identity is a PARAMETER, not a re-read of
+    // [streamingClaimEpoch] / [streamingClaimToken] here: reading the fields
+    // after this function's own suspensions (the system-prompt build above)
+    // compares the current value with itself — a tautology that can never
+    // catch a Stop. The caller captures both at claim time and passes them in.
+    val launchEpoch = sendEpoch
     val launchedProvider = provider
+    // [dv29-B01] Revocation guard: Stop (cancelStream) or a newer turn revokes
+    // this claim while the prompt build above runs. Never start a stream for a
+    // turn nobody owns any more.
+    if (sendEpoch != streamingClaimEpoch || claimToken !== streamingClaimToken) {
+        AppLogger.info(
+            ChatViewModel.TAG_STREAM,
+            "$label tail aborted before stream (claim revoked; sendEpoch=$sendEpoch claimEpoch=$streamingClaimEpoch)",
+        )
+        return false
+    }
     streamJob = viewModelScope.launch(Dispatchers.IO) {
         AppLogger.info(ChatViewModel.TAG_STREAM, "$label streamJob ENTER sid=$activeSessionId")
         try {
