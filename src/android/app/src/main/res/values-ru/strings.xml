@@ -1612,4 +1612,23 @@
     <!-- Text-to-speech: spoken link phrases (VoiceTextSanitizer). -->
     <string name="tts_spoken_link_to_host">Ссылка на %1$s</string>
     <string name="tts_spoken_bare_link">Ссылка</string>
+
+    <!-- Auto-approve mode (config write skip + tool level lift + runtime batch grant) -->
+    <string name="perm_section_auto_approve">Автоодобрение</string>
+    <string name="perm_auto_approve_title">Режим автоодобрения</string>
+    <string name="perm_auto_approve_desc">Применять обычные изменения настроек без запроса. Чувствительные и разрушительные изменения могут по-прежнему требовать подтверждения.</string>
+    <string name="perm_auto_approve_sensitive">Включить чувствительные настройки</string>
+    <string name="perm_auto_approve_sensitive_desc">Также применять учётные данные провайдеров (API-ключи, базовые URL) без запроса. Агент может незаметно их перенаправить.</string>
+    <string name="perm_auto_approve_privileged">Разрешить привилегированные инструменты</string>
+    <string name="perm_auto_approve_privileged_desc">Разрешить агенту использовать командные строки специальных возможностей и Shizuku (они управляют другими приложениями и читают экран).</string>
+    <string name="perm_auto_approve_footer">По умолчанию выключено. При включении обычные записи больше не показывают диалог подтверждения, а запросы разрешений инструментов прекращаются. Все изменения по-прежнему записываются в Журнал → Изменения конфигурации.</string>
+    <string name="perm_auto_approve_confirm_title">Включить автоодобрение?</string>
+    <string name="perm_auto_approve_confirm_text">Обычные изменения настроек будут применяться без запроса, запросы разрешений инструментов прекратятся. Чувствительные настройки (API-ключи провайдеров) и разрушительные изменения по-прежнему требуют подтверждения. Можно отключить в любой момент.</string>
+    <string name="perm_auto_approve_confirm_on">Включить</string>
+    <string name="perm_section_runtime_batch">Системные разрешения</string>
+    <string name="perm_runtime_batch_desc">Android запрашивает их по одному при использовании каждой функции. Выдайте все сразу, чтобы они не прерывали позже.</string>
+    <string name="perm_runtime_batch_title">Выдать все системные разрешения</string>
+    <string name="perm_runtime_batch_sub">Календарь, контакты, местоположение, фото, микрофон, камера, уведомления</string>
+    <string name="perm_runtime_batch_all_granted">Все системные разрешения уже выданы.</string>
+    <string name="perm_runtime_batch_partial">Ещё %1$d разрешений не выдано — Android отклонил или вы пропустили.</string>
 </resources>

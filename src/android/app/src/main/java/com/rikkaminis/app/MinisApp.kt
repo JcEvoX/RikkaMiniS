@@ -575,6 +575,10 @@ class MinisApp : Application(), ImageLoaderFactory {
         // ConfigRegistry.get() is safe from any thread for the rest of
         // the process. Mirrors iOS ConfigRegistry.shared.registerBuiltinsIfNeeded().
         com.rikkaminis.app.config.MinisConfigPermissionStore.init(this)
+        // [auto-approve] The user's opt-in "免确认模式" (routine writes skip the
+        // dialog; ASK_ONCE tool permissions behave as BYPASS). Read on hot paths
+        // in ConfigBridge / OffloadPermissionManager, so initialise eagerly.
+        com.rikkaminis.app.config.AutoApproveStore.init(this)
         com.rikkaminis.app.config.ConfigRegistry.init(
             this, providerRepository, envVarRepository, chatRepository,
             // [T8-2] Config layer no longer imports service/UI classes —

@@ -2,6 +2,12 @@ package com.rikkaminis.app.ui.settings
 
 import android.app.Activity
 import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
@@ -30,8 +36,10 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.rikkaminis.app.R
 import com.rikkaminis.app.accessibility.RestrictedSettingsManager
+import com.rikkaminis.app.config.AutoApproveStore
 import com.rikkaminis.app.logging.AppLogger
 import com.rikkaminis.app.offload.OffloadPermissionManager
+import com.rikkaminis.app.offload.RuntimePermissionBatch
 import com.rikkaminis.app.offload.ShizukuManager
 import com.rikkaminis.app.power.PowerOptimizationManager
 import com.rikkaminis.app.ui.components.MinisMenu
@@ -60,7 +68,45 @@ fun OffloadPermissionScreen(
 
     val configEnabled by com.rikkaminis.app.config.MinisConfigPermissionStore.enabled.collectAsState()
 
+    // [auto-approve] User's opt-in "免确认模式": routine config writes skip the
+    // dialog, and ASK_ONCE tool permissions behave as BYPASS. All three flags
+    // are UI-only (not reachable through minis-config).
+    val autoApproveEnabled by AutoApproveStore.enabled.collectAsState()
+    val autoApproveSensitive by AutoApproveStore.sensitiveEnabled.collectAsState()
+    val autoApprovePrivileged by AutoApproveStore.privilegedToolsEnabled.collectAsState()
+    // Turning the master switch ON is the one action with a blast radius the
+    // user can't infer from a toggle, so it goes through an explicit dialog
+    // that lists what stops being asked. Turning it OFF is one tap.
+    var showAutoApproveConfirm by remember { mutableStateOf(false) }
+
     val context = LocalContext.current
+
+    // [auto-approve] One-shot batch grant for the runtime permissions the
+    // android-* handlers check at call time. Android has no "remember my
+    // answer" API for a batch, so this can only reduce the number of separate
+    // moments the system asks — never eliminate the system dialog itself.
+    //
+    // The launcher's result map is not trusted on its own (several Android
+    // versions return an empty map for already-granted entries); the toast
+    // re-queries the live state, which is what actually matters.
+    val runtimePermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions(),
+    ) {
+        val all = RuntimePermissionBatch.permissionsFor(Build.VERSION.SDK_INT)
+        val missing = all.count {
+            ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED
+        }
+        val message = if (missing == 0) {
+            context.getString(R.string.perm_runtime_batch_all_granted)
+        } else {
+            context.getString(R.string.perm_runtime_batch_partial, missing)
+        }
+        Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+        AppLogger.info(
+            "PermissionsScreen",
+            "runtime permission batch finished: granted=${all.size - missing} missing=$missing",
+        )
+    }
 
     // [dv15-B2 / B-08] One classification drives all three a11y states (see
     // A11yStatus). "Ready" now means the service is actually bound, so a
@@ -106,6 +152,75 @@ fun OffloadPermissionScreen(
             }
         },
     ) {
+        // [auto-approve] Mode first: it changes how every row below behaves.
+        SettingsSection(
+            header = stringResource(R.string.perm_section_auto_approve),
+            footer = stringResource(R.string.perm_auto_approve_footer),
+        ) {
+            SettingsSwitchRow(
+                title = stringResource(R.string.perm_auto_approve_title),
+                subtitle = stringResource(R.string.perm_auto_approve_desc),
+                checked = autoApproveEnabled,
+                onCheckedChange = { enabled ->
+                    if (enabled) {
+                        // Enabling asks once, explicitly; disabling is instant
+                        // and also clears the two sub-flags (see disableAll).
+                        showAutoApproveConfirm = true
+                    } else {
+                        AutoApproveStore.disableAll()
+                    }
+                },
+                showDivider = autoApproveEnabled,
+            )
+            if (autoApproveEnabled) {
+                SettingsSwitchRow(
+                    title = stringResource(R.string.perm_auto_approve_sensitive),
+                    subtitle = stringResource(R.string.perm_auto_approve_sensitive_desc),
+                    checked = autoApproveSensitive,
+                    onCheckedChange = { AutoApproveStore.setSensitiveEnabled(it) },
+                )
+                SettingsSwitchRow(
+                    title = stringResource(R.string.perm_auto_approve_privileged),
+                    subtitle = stringResource(R.string.perm_auto_approve_privileged_desc),
+                    checked = autoApprovePrivileged,
+                    onCheckedChange = { AutoApproveStore.setPrivilegedToolsEnabled(it) },
+                    showDivider = false,
+                )
+            }
+        }
+
+        // [auto-approve] Platform-level counterpart: Android cannot be told
+        // "always allow" in advance, so the best available reduction is asking
+        // for every runtime permission in one sitting instead of one capability
+        // at a time mid-task.
+        SettingsSection(
+            header = stringResource(R.string.perm_section_runtime_batch),
+            footer = stringResource(R.string.perm_runtime_batch_desc),
+        ) {
+            SettingsRow(
+                icon = Icons.Outlined.LockOpen,
+                title = stringResource(R.string.perm_runtime_batch_title),
+                subtitle = stringResource(R.string.perm_runtime_batch_sub),
+                onClick = {
+                    val all = RuntimePermissionBatch.permissionsFor(Build.VERSION.SDK_INT)
+                    val notGranted = all.filter {
+                        ContextCompat.checkSelfPermission(context, it) !=
+                            PackageManager.PERMISSION_GRANTED
+                    }
+                    if (notGranted.isEmpty()) {
+                        Toast.makeText(
+                            context,
+                            context.getString(R.string.perm_runtime_batch_all_granted),
+                            Toast.LENGTH_SHORT,
+                        ).show()
+                    } else {
+                        runtimePermissionLauncher.launch(notGranted.toTypedArray())
+                    }
+                },
+                showDivider = false,
+            )
+        }
+
         // T-config: master switch for the minis-config CLI surface.
         SettingsSection(
             header = stringResource(R.string.perm_section_config_tool),
@@ -246,6 +361,28 @@ fun OffloadPermissionScreen(
         )
 
         Spacer(Modifier.height(16.dp))
+    }
+
+    if (showAutoApproveConfirm) {
+        AlertDialog(
+            onDismissRequest = { showAutoApproveConfirm = false },
+            title = { Text(stringResource(R.string.perm_auto_approve_confirm_title)) },
+            text = { Text(stringResource(R.string.perm_auto_approve_confirm_text)) },
+            confirmButton = {
+                MinisTextButton(onClick = {
+                    showAutoApproveConfirm = false
+                    AutoApproveStore.setEnabled(true)
+                    AppLogger.info("PermissionsScreen", "auto-approve mode enabled by user")
+                }) {
+                    Text(stringResource(R.string.perm_auto_approve_confirm_on))
+                }
+            },
+            dismissButton = {
+                MinisTextButton(onClick = { showAutoApproveConfirm = false }) {
+                    Text(stringResource(R.string.common_cancel))
+                }
+            },
+        )
     }
 
     if (showResetConfirm) {

@@ -1659,4 +1659,23 @@
     <!-- Text-to-speech: spoken link phrases (VoiceTextSanitizer). -->
     <string name="tts_spoken_link_to_host">Link zu %1$s</string>
     <string name="tts_spoken_bare_link">Link</string>
+
+    <!-- Auto-approve mode (config write skip + tool level lift + runtime batch grant) -->
+    <string name="perm_section_auto_approve">Auto-Genehmigung</string>
+    <string name="perm_auto_approve_title">Auto-Genehmigungsmodus</string>
+    <string name="perm_auto_approve_desc">Übliche Einstellungsänderungen ohne Nachfrage anwenden. Sensible und destruktive Änderungen können weiterhin bestätigt werden.</string>
+    <string name="perm_auto_approve_sensitive">Sensible Einstellungen einschließen</string>
+    <string name="perm_auto_approve_sensitive_desc">Auch Anbieter-Zugangsdaten (API-Schlüssel, Basis-URLs) ohne Nachfrage anwenden. Der Agent könnte sie stillschweigend umleiten.</string>
+    <string name="perm_auto_approve_privileged">Privilegierte Tools erlauben</string>
+    <string name="perm_auto_approve_privileged_desc">Dem Agenten die Bedienung der Bedienungshilfen- und Shizuku-Kommandozeilen erlauben (sie steuern andere Apps und lesen den Bildschirm).</string>
+    <string name="perm_auto_approve_footer">Standardmäßig aus. Wenn aktiviert, erscheint für normale Schreibvorgänge kein Bestätigungsdialog mehr, und Tool-Berechtigungsabfragen entfallen. Alle Änderungen werden weiterhin unter Protokolle → Konfigurationsänderungen protokolliert.</string>
+    <string name="perm_auto_approve_confirm_title">Auto-Genehmigung aktivieren?</string>
+    <string name="perm_auto_approve_confirm_text">Übliche Einstellungsänderungen werden ohne Nachfrage angewendet, und Tool-Berechtigungsabfragen entfallen. Sensible Einstellungen (Anbieter-API-Schlüssel) und destruktive Änderungen werden weiterhin bestätigt. Jederzeit deaktivierbar.</string>
+    <string name="perm_auto_approve_confirm_on">Aktivieren</string>
+    <string name="perm_section_runtime_batch">Systemberechtigungen</string>
+    <string name="perm_runtime_batch_desc">Android fragt diese Berechtigungen einzeln bei der Nutzung ab. Jetzt alle auf einmal gewähren, damit sie später nicht stören.</string>
+    <string name="perm_runtime_batch_title">Alle Systemberechtigungen gewähren</string>
+    <string name="perm_runtime_batch_sub">Kalender, Kontakte, Standort, Fotos, Mikrofon, Kamera, Benachrichtigungen</string>
+    <string name="perm_runtime_batch_all_granted">Alle Systemberechtigungen sind bereits gewährt.</string>
+    <string name="perm_runtime_batch_partial">%1$d Berechtigung(en) noch nicht gewährt — Android hat abgelehnt oder du hast übersprungen.</string>
 </resources>
