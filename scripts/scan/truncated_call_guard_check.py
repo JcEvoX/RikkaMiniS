@@ -58,6 +58,7 @@ OPENAI = MAIN + "/provider/openai/OpenAIProvider.kt"
 ANTHROPIC = MAIN + "/provider/anthropic/AnthropicProvider.kt"
 TOOL_EXECUTORS = MAIN + "/ui/chat/ChatToolExecutors.kt"
 GEMINI = MAIN + "/provider/gemini/GeminiProvider.kt"
+SIGNALS = MAIN + "/provider/openai/OpenAiStreamSignals.kt"
 
 C1_SIGNATURE = ("fun rejectionReason(toolName: String, finishReason: String?, "
                 "turnTruncated: Boolean = false): String?")
@@ -88,6 +89,33 @@ C6_GEMINI_SEND = "send(LLMStreamChunk.Finished(terminal.stopReason, truncated = 
 C6_GEMINI_PURE_DECL = "internal fun geminiEofTerminal("
 C6_GEMINI_PURE_ELSE = "GeminiEofTerminal(stopReason = lastFinishReason, truncated = false)"
 C7_FABRICATED = "lastFinishReason ?:"
+
+# [deep-audit-1048 A-01 / A-08] The two criteria below are DERIVED, not pinned
+# by name: the counter variable is read out of the pinned EOF guard, the two
+# streaming flavours are told apart by the branch that selects them, and the
+# error-mapping function is discovered from the call sites. Renaming anything
+# must not blind the gate.
+C8_COUNTER_VISIBILITY = 2       # distinct feed sites of the guard's counter
+C8_ERROR_STATUS_TOKEN = "429"   # the family the status derivation must produce
+C8_ERROR_TRANSIENT_TOKEN = "500"
+
+# Structural anchors for the selftest arms below. They name the SHAPE of the
+# fix, so a rewrite of the fix must update them — that is deliberate: an arm
+# that silently stops mutating anything would report a false green.
+CHAT_FEED = "toolCallEventCount += chatCompletionsToolCallEventWeight(toolCalls.length())"
+RESPONSES_FEED = """toolCallEventCount += responsesToolCallEventWeight(
+                        eventType = type,
+                        itemType = event.optJSONObject("item")?.optString("type"),
+                        argsDeltaLen = event.optString("delta", "").length,
+                    )"""
+CHAT_INLINE_STATUS = """openAiStreamErrorStatus(
+                                inlineError.optString("code", ""),
+                                inlineError.optString("type", ""),
+                            )"""
+RESPONSES_STATUS_CALL = """mapHttpError(
+                                openAiStreamErrorStatus(code, err?.optString("type", "") ?: ""),
+                                err?.toString() ?: event.toString(),
+                            )"""
 
 ESCAPE = "truncated-guard-ok:"
 SELFTEST_MARK = "TRUNCATED_CALL_GUARD_SELFTEST=PASS"
@@ -124,8 +152,47 @@ def line_of(text, needle):
     return text.count("\n", 0, idx) + 1 if idx >= 0 else 0
 
 
+def strip_kotlin_comments_keep(text):
+    return strip_kotlin_comments(text)
+
+
+_TOP_FUN = re.compile(r"internal fun (\w+)\s*\(")
+
+
+def top_level_int_funs(text):
+    """Every `internal fun NAME(` in the pure module, with the parameter list
+    that follows it. Prose never counts — comments are stripped first."""
+    code = strip_kotlin_comments(text)
+    out = {}
+    for m in _TOP_FUN.finditer(code):
+        close = code.find(")", m.end())
+        if close < 0:
+            continue
+        out[m.group(1)] = code[m.end():close]
+    return out
+
+
+_MAP_CALL = re.compile(r"mapHttpError\(\s*(?:(\w+)\s*\(|([^,\n]+))")
+
+
+def map_http_first_args(text):
+    """(callee, raw) for the first argument of every mapHttpError( call.
+    callee is set only when the argument is itself a CALL — that is the shape
+    the single-source criterion requires."""
+    code = strip_kotlin_comments(text)
+    out = []
+    for m in _MAP_CALL.finditer(code):
+        out.append((m.group(1), (m.group(2) or "").strip()))
+    return out
+
+
+def line_of_regex(text, pattern):
+    m = re.search(pattern, text)
+    return text.count("\n", 0, m.start()) + 1 if m else 0
+
+
 def load(root):
-    paths = [POLICY, ENGINE, OPENAI, ANTHROPIC, TOOL_EXECUTORS, GEMINI]
+    paths = [POLICY, ENGINE, OPENAI, ANTHROPIC, TOOL_EXECUTORS, GEMINI, SIGNALS]
     texts = []
     for rel in paths:
         path = os.path.join(root, rel)
@@ -150,7 +217,7 @@ def escaped_segment(text, needle):
     return False
 
 
-def check(policy, engine, openai, anthropic, tool_executors, gemini):
+def check(policy, engine, openai, anthropic, tool_executors, gemini, signals):
     """Return [(criterion, file, line, message)] — empty list means wired."""
     problems = []
 
@@ -261,6 +328,126 @@ def check(policy, engine, openai, anthropic, tool_executors, gemini):
                          "a clean finish; the else arm must stay '%s'"
                          % (C7_FABRICATED, C6_GEMINI_PURE_ELSE)))
 
+
+    # ------------------------------------------------------------------
+    # C8/C9 — [dv28 A-01 / A-08] the OpenAI stream's two flavours must BOTH
+    # be visible to the EOF guard, and every in-stream error must reach the
+    # ONE status derivation.
+    #
+    # Both criteria are DERIVED from structure, never from a symbol name:
+    #   * the counter is whatever identifier the pinned guard compares to 0;
+    #   * the "weight" derivations are every pure Int function in the signals
+    #     module MINUS the status derivation;
+    #   * the status derivation is whatever function is passed as the first
+    #     argument of a mapHttpError( call.
+    # Renaming any of them keeps the gate working; deleting a wire-up does not.
+    # ------------------------------------------------------------------
+    ok_code = strip_kotlin_comments(openai)
+    sig_code = strip_kotlin_comments(signals)
+    escapable = ESCAPE in sig_code
+
+    status_fns = sorted({callee for callee, _raw in map_http_first_args(openai)
+                         if callee})
+    declared = top_level_int_funs(signals)
+    # A "weight" is a derivation the PROVIDER must call: a declared function that
+    # the signals module does not itself call (an internal helper like the family
+    # table is reachable only through the status derivation).
+    weight_fns = sorted({
+        name for name in declared
+        if name not in status_fns
+        and len(re.findall(r"\b%s\s*\(" % re.escape(name), sig_code)) <= 1
+    })
+
+    guard_counters = re.findall(r"([A-Za-z_]\w*)\s*>\s*0\b", C3_OPENAI_GUARD)
+    feeds = {}
+    for name in guard_counters:
+        feeds[name] = re.findall(r"\b%s\s*\+=\s*([A-Za-z_]\w*)\s*\(" % name, ok_code)
+    call_fed = {name: callees for name, callees in feeds.items() if callees}
+    wired_counter = None
+    for name, callees in sorted(call_fed.items()):
+        if len(callees) >= C8_COUNTER_VISIBILITY and set(callees) <= set(declared):
+            wired_counter = name
+            break
+
+    if not escapable:
+        if wired_counter is None:
+            problems.append((
+                "openai-count-covers-both-flavours", OPENAI,
+                line_of(openai, "[RC2-truncated-detection]"),
+                "the EOF guard's counters (%s) are not fed from %d+ sites through the "
+                "shared pure derivations in OpenAiStreamSignals — a flavour that stops "
+                "feeding the counter silently loses the truncated-turn signal "
+                "(found: %s)"
+                % (", ".join(guard_counters), C8_COUNTER_VISIBILITY,
+                   {k: v for k, v in feeds.items()})))
+        else:
+            callees = set(feeds[wired_counter])
+            missing = sorted(set(weight_fns) - callees)
+            extra = sorted(callees - set(weight_fns))
+            if missing:
+                problems.append((
+                    "openai-count-covers-both-flavours", OPENAI,
+                    line_of(openai, "[RC2-truncated-detection]"),
+                    "these pure weight derivations are declared in the signals module but "
+                    "never fed into '%s': %s — a flavour lost its wire-up"
+                    % (wired_counter, ", ".join(missing))))
+            if extra:
+                problems.append((
+                    "openai-count-covers-both-flavours", OPENAI,
+                    line_of(openai, "[RC2-truncated-detection]"),
+                    "'%s' is fed through functions that are not declared in "
+                    "OpenAiStreamSignals (%s) — the derivation is no longer single-source"
+                    % (wired_counter, ", ".join(extra))))
+
+        # C9 — one status derivation, reachable from both in-stream error arms.
+        if len(status_fns) != 1:
+            problems.append((
+                "openai-stream-error-single-source", OPENAI,
+                line_of(openai, "mapHttpError("),
+                "expected exactly one status derivation passed to mapHttpError(, found %s — "
+                "an in-stream error path is deciding its own family"
+                % (status_fns or "none")))
+        elif status_fns[0] not in declared:
+            problems.append((
+                "openai-stream-error-single-source", OPENAI,
+                line_of(openai, "mapHttpError("),
+                "%s is not a pure top-level function of the signals module" % status_fns[0]))
+        else:
+            fn = status_fns[0]
+            body_start = sig_code.find("internal fun %s(" % fn)
+            body = sig_code[body_start:]
+            for token, why in ((C8_ERROR_STATUS_TOKEN, "the rate-limit family"),
+                               (C8_ERROR_TRANSIENT_TOKEN, "the transient family")):
+                if token not in body:
+                    problems.append((
+                        "openai-stream-error-single-source", SIGNALS,
+                        line_of(signals, "internal fun %s(" % fn),
+                        "%s does not map %s (%s)" % (fn, token, why)))
+            uses = len(re.findall(r"\b%s\s*\(" % re.escape(fn), ok_code))
+            if uses < 2:
+                problems.append((
+                    "openai-stream-error-single-source", OPENAI,
+                    line_of(openai, "mapHttpError("),
+                    "%s is referenced %d time(s) in the provider — both in-stream error "
+                    "arms (chat-completions inline error AND response.failed) must use it"
+                    % (fn, uses)))
+            failed_arm = ok_code.find('"response.failed" ->')
+            if failed_arm >= 0:
+                arm = ok_code[failed_arm:failed_arm + 4000]
+                close = arm.find("\n                        type ==")
+                arm = arm[:close] if close > 0 else arm
+                if fn not in arm:
+                    problems.append((
+                        "openai-stream-error-single-source", OPENAI,
+                        line_of(openai, '"response.failed" ->'),
+                        "the response.failed arm does not route through %s — a symbolic "
+                        "rate-limit code must not be hand-classified into TransientError"
+                        % fn))
+            elif ok_code.count('"response.failed"') < 1:
+                problems.append((
+                    "openai-stream-error-single-source", OPENAI, 0,
+                    "the Responses terminal-failure arm is gone"))
+
     return problems
 
 
@@ -268,25 +455,17 @@ def selftest(root):
     files = load(root)
     if files is None:
         return 1
-    policy, engine, openai, anthropic, tool_executors, gemini = files
+    policy, engine, openai, anthropic, tool_executors, gemini, signals = files
 
-    def on_policy(fn):
-        return lambda p, e, o, a, t, g: (fn(p), e, o, a, t, g)
-
-    def on_engine(fn):
-        return lambda p, e, o, a, t, g: (p, fn(e), o, a, t, g)
-
-    def on_openai(fn):
-        return lambda p, e, o, a, t, g: (p, e, fn(o), a, t, g)
-
-    def on_anthropic(fn):
-        return lambda p, e, o, a, t, g: (p, e, o, fn(a), t, g)
-
-    def on_tool_executors(fn):
-        return lambda p, e, o, a, t, g: (p, e, o, a, fn(t), g)
-
-    def on_gemini(fn):
-        return lambda p, e, o, a, t, g: (p, e, o, a, t, fn(g))
+    def on(i, fn):
+        # Positional mutator: load() returns 7 texts, and the arms must keep
+        # addressing them by position so adding a file cannot silently shift
+        # which mutation targets which file.
+        def wrapper(*args):
+            out = list(args)
+            out[i] = fn(out[i])
+            return tuple(out)
+        return wrapper
 
     def strip_guard_from_error_branch(s):
         # delete the FIRST guard call (the error-shaped site) → count drops to 1
@@ -303,45 +482,63 @@ def selftest(root):
 
     arms = [
         ("policy loses the flag parameter", "policy-flag-signature",
-         on_policy(lambda s: s.replace(C1_SIGNATURE,
+         on(0, lambda s: s.replace(C1_SIGNATURE,
                                        "fun rejectionReason(toolName: String, finishReason: String?): String?", 1))),
         ("policy ignores the flag", "policy-flag-condition",
-         on_policy(lambda s: s.replace(C1_CONDITION, "if (!isTruncatedFinish(finishReason)) return null", 1))),
+         on(0, lambda s: s.replace(C1_CONDITION, "if (!isTruncatedFinish(finishReason)) return null", 1))),
         ("engine passes a false constant", "engine-feeds-flag",
-         on_engine(lambda s: s.replace(C2_ENGINE_CALL,
+         on(1, lambda s: s.replace(C2_ENGINE_CALL,
                                        "TruncatedToolCallPolicy.rejectionReason(name, turnFinishReason, false)", 1))),
         ("openai eof guard forgets tool calls", "openai-eof-counts-toolcalls",
-         on_openai(lambda s: s.replace(C3_OPENAI_GUARD,
+         on(2, lambda s: s.replace(C3_OPENAI_GUARD,
                                        "if (!finishedSent && (contentLen > 0 || reasoningLen > 0)) {", 1))),
         ("anthropic sibling guard regresses", "anthropic-sibling-pin",
-         on_anthropic(lambda s: s.replace(C3_ANTHROPIC_GUARD,
+         on(3, lambda s: s.replace(C3_ANTHROPIC_GUARD,
                                           "if (!sawClearFinish && (contentChars > 0)) {", 1))),
         ("subagent loop drops the refusal gate", "subagent-refusal-gate",
-         on_tool_executors(drop_subagent_refusal)),
+         on(4, drop_subagent_refusal)),
         ("subagent loop skips the policy", "subagent-refusal-wired",
-         on_tool_executors(lambda s: s.replace(C4_POLICY_CALL, "TruncatedToolCallPolicy.isTruncatedFinish(", 1))),
+         on(4, lambda s: s.replace(C4_POLICY_CALL, "TruncatedToolCallPolicy.isTruncatedFinish(", 1))),
         ("subagent loop hand-writes the wording", "subagent-single-source",
-         on_tool_executors(lambda s: s.replace(
+         on(4, lambda s: s.replace(
              "log(\"[Subagent] turn=$turns truncated tool call REFUSED",
              "log(\"[TRUNCATED] " + "\"[Subagent] turn=$turns truncated tool call REFUSED", 1))),
         ("subagent refusal breaks the pairing", "subagent-refusal-pairing",
-         on_tool_executors(lambda s: s.replace(C4_PAIRING,
+         on(4, lambda s: s.replace(C4_PAIRING,
                                                "content = truncatedRefusal, isError = false", 1))),
         ("error-shaped branch loses the stacking guard", "stack-guard-shared",
-         on_engine(strip_guard_from_error_branch)),
+         on(1, strip_guard_from_error_branch)),
         ("gemini EOF reverts to the fabricated end_turn",
          "gemini-eof-terminal-pure+gemini-eof-passthrough",
-         on_gemini(lambda s: s.replace(C6_GEMINI_SEND,
+         on(5, lambda s: s.replace(C6_GEMINI_SEND,
                                        'send(LLMStreamChunk.Finished(lastFinishReason ?: "end_turn"))', 1))),
         ("gemini pure verdict invents a stop reason", "gemini-eof-passthrough",
-         on_gemini(lambda s: s.replace(
+         on(5, lambda s: s.replace(
              C6_GEMINI_PURE_ELSE,
              'GeminiEofTerminal(stopReason = lastFinishReason ?: "end_turn", truncated = false)', 1))),
         ("eof-stub branch back to an inline predicate", "stack-guard-no-inline-twin",
-         on_engine(lambda s: s.replace(
+         on(1, lambda s: s.replace(
              "                        if (EofStubReminderStackGuard.isStaleEofStubReminder(prevTail)) {",
              "                        val tailIsEofStubReminder = prevTail != null &&\n"
              "                        if (EofStubReminderStackGuard.isStaleEofStubReminder(prevTail)) {", 1))),
+        # ---- [dv28 A-01 / A-08] derived criteria arms -------------------
+        ("responses arm stops feeding the EOF counter",
+         "openai-count-covers-both-flavours",
+         on(2, lambda s: s.replace(RESPONSES_FEED, "", 1))),
+        ("chat arm stops feeding the EOF counter",
+         "openai-count-covers-both-flavours",
+         on(2, lambda s: s.replace(CHAT_FEED, "", 1))),
+        ("chat inline error coerces the symbolic code to 0",
+         "openai-stream-error-single-source",
+         on(2, lambda s: s.replace(CHAT_INLINE_STATUS, "inlineError.optInt(\"code\", 0)", 1))),
+        ("responses rate limit hand-classified as transient",
+         "openai-stream-error-single-source",
+         on(2, lambda s: s.replace(
+             RESPONSES_STATUS_CALL,
+             'if (code == "server_error" || code == "rate_limit_exceeded") {\n'
+             '                                throw LLMError.TransientError("[$code] $message")\n'
+             '                            }\n'
+             '                            throw LLMError.ProviderError("[$code] $message")', 1))),
     ]
 
     failed = []
