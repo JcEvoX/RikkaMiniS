@@ -322,8 +322,12 @@ private fun TextPreview(item: FileItem) {
     var error by remember(item.file) { mutableStateOf<String?>(null) }
 
     LaunchedEffect(item.file) {
-        withContext(Dispatchers.IO) {
-            try {
+        // [deep-audit-1048 B-01] IO computes, Main publishes: the capped read +
+        // decode stay on Dispatchers.IO; only the RESULT crosses back, and the
+        // Compose state is assigned after `withContext` returns (on the
+        // composition's dispatcher) instead of from inside the IO block.
+        val loaded = withContext(Dispatchers.IO) {
+            runCatching {
                 // [rv1014-E1] was item.file.readBytes() — the full file was
                 // read into memory before any cap applied, so a 2 GB log file
                 // OOMed the preview. readCapped reads at most MAX+1 bytes and
@@ -331,12 +335,18 @@ private fun TextPreview(item: FileItem) {
                 // briefly readNBytes(MAX+1) — API 33+, an uncatchable
                 // NoSuchMethodError on Android 8–12.)
                 val capped = readCapped(item.file, MAX_TEXT_PREVIEW_BYTES)
-                content = decodeUtf8Capped(capped)
-                truncated = capped.size > MAX_TEXT_PREVIEW_BYTES
-            } catch (e: Exception) {
-                error = e.message ?: context.getString(R.string.filepreview_file_read_error)
+                decodeUtf8Capped(capped) to (capped.size > MAX_TEXT_PREVIEW_BYTES)
             }
         }
+        loaded.fold(
+            onSuccess = { (text, clipped) ->
+                content = text
+                truncated = clipped
+            },
+            onFailure = { e ->
+                error = e.message ?: context.getString(R.string.filepreview_file_read_error)
+            },
+        )
     }
 
     when {
@@ -411,16 +421,21 @@ private fun MarkdownPreview(item: FileItem) {
     var error by remember(item.file) { mutableStateOf<String?>(null) }
 
     LaunchedEffect(item.file) {
-        withContext(Dispatchers.IO) {
-            try {
+        // [deep-audit-1048 B-01] IO computes, Main publishes (see TextPreview).
+        val loaded = withContext(Dispatchers.IO) {
+            runCatching {
                 // [rv1014-E1] capped read via readCapped — see TextPreview above.
                 val capped = readCapped(item.file, MAX_TEXT_PREVIEW_BYTES)
-                content = decodeUtf8Capped(capped)
-            } catch (e: Exception) {
-                error = e.message ?: context.getString(R.string.filepreview_file_read_error)
-                AppLogger.warning("FilePreview", "markdown read failed for ${item.name}: ${e.message}")
+                decodeUtf8Capped(capped)
             }
         }
+        loaded.fold(
+            onSuccess = { text -> content = text },
+            onFailure = { e ->
+                error = e.message ?: context.getString(R.string.filepreview_file_read_error)
+                AppLogger.warning("FilePreview", "markdown read failed for ${item.name}: ${e.message}")
+            },
+        )
     }
 
     when {
@@ -604,18 +619,25 @@ private fun PdfPreview(item: FileItem) {
     }
 
     LaunchedEffect(item.file) {
-        withContext(Dispatchers.IO) {
-            try {
+        // [deep-audit-1048 B-01] IO computes, Main publishes: `renderer.open`
+        // (page indexing + first decode) stays on Dispatchers.IO; the page
+        // count and the failure banner are published after it returns.
+        val opened = withContext(Dispatchers.IO) {
+            runCatching {
                 // Render at (about) the on-screen width instead of a fixed
                 // 1600px: same readability on a phone, a third of the
                 // memory per page.
                 val width = context.resources.displayMetrics.widthPixels.coerceIn(720, 1600)
-                pageCount = renderer.open(item.file, width)
-            } catch (e: Exception) {
-                AppLogger.warning("FilePreview", "PdfRenderer failed for ${item.name}: ${e.message}")
-                error = e.message ?: context.getString(R.string.filepreview_pdf_render_failed_fallback)
+                renderer.open(item.file, width)
             }
         }
+        opened.fold(
+            onSuccess = { count -> pageCount = count },
+            onFailure = { e ->
+                AppLogger.warning("FilePreview", "PdfRenderer failed for ${item.name}: ${e.message}")
+                error = e.message ?: context.getString(R.string.filepreview_pdf_render_failed_fallback)
+            },
+        )
     }
 
     // -1 = not loaded yet; 0 = empty document. Keeping the count non-null
@@ -817,21 +839,27 @@ private fun CsvPreview(item: FileItem) {
     var error by remember(item.file) { mutableStateOf<String?>(null) }
 
     LaunchedEffect(item.file) {
-        withContext(Dispatchers.IO) {
-            try {
+        // [deep-audit-1048 B-01] IO computes, Main publishes (see TextPreview).
+        val loaded = withContext(Dispatchers.IO) {
+            runCatching {
                 val sep = if (item.file.extension.equals("tsv", true)) '\t' else ','
                 // [da1026-F] was a bare `item.file.bufferedReader(...)` +
                 // readLine() loop with only a ROW cap — see
                 // [readCsvPreviewSlice] for why the row cap did not bound
                 // memory.
-                val slice = readCsvPreviewSlice(item.file, sep, MAX_CSV_PREVIEW_ROWS)
+                readCsvPreviewSlice(item.file, sep, MAX_CSV_PREVIEW_ROWS)
+            }
+        }
+        loaded.fold(
+            onSuccess = { slice ->
                 rows = slice.rows
                 byteTruncated = slice.byteTruncated
                 rowTruncated = slice.rowTruncated
-            } catch (e: Exception) {
+            },
+            onFailure = { e ->
                 error = e.message ?: context.getString(R.string.filepreview_csv_parse_error)
-            }
-        }
+            },
+        )
     }
 
     when {
@@ -998,23 +1026,32 @@ private fun JsonPreview(item: FileItem) {
     var error by remember(item.file) { mutableStateOf<String?>(null) }
 
     LaunchedEffect(item.file) {
-        withContext(Dispatchers.IO) {
-            try {
+        // [deep-audit-1048 B-01] IO computes, Main publishes (see TextPreview).
+        val loaded = withContext(Dispatchers.IO) {
+            runCatching {
                 // [rv1014-E1] capped read via readCapped — see TextPreview above.
                 val capped = readCapped(item.file, MAX_TEXT_PREVIEW_BYTES)
-                truncated = capped.size > MAX_TEXT_PREVIEW_BYTES
+                val clipped = capped.size > MAX_TEXT_PREVIEW_BYTES
                 val raw = decodeUtf8Capped(capped)
-                pretty = try {
+                val formatted = try {
                     when (raw.trimStart().firstOrNull()) {
                         '{' -> org.json.JSONObject(raw).toString(2)
                         '[' -> org.json.JSONArray(raw).toString(2)
                         else -> raw
                     }
                 } catch (_: Exception) { raw }
-            } catch (e: Exception) {
-                error = e.message ?: context.getString(R.string.filepreview_file_read_error)
+                formatted to clipped
             }
         }
+        loaded.fold(
+            onSuccess = { (formatted, clipped) ->
+                pretty = formatted
+                truncated = clipped
+            },
+            onFailure = { e ->
+                error = e.message ?: context.getString(R.string.filepreview_file_read_error)
+            },
+        )
     }
 
     when {
@@ -1070,8 +1107,11 @@ private fun ArchivePreview(item: FileItem) {
     var error by remember(item.file) { mutableStateOf<String?>(null) }
 
     LaunchedEffect(item.file) {
-        withContext(Dispatchers.IO) {
-            try {
+        // [deep-audit-1048 B-01] IO computes, Main publishes (see TextPreview):
+        // the zip walk returns the sorted entry list; the state is assigned
+        // after `withContext` returns.
+        val loaded = withContext(Dispatchers.IO) {
+            runCatching {
                 val out = mutableListOf<Entry>()
                 java.util.zip.ZipFile(item.file).use { zf ->
                     val it = zf.entries()
@@ -1081,11 +1121,15 @@ private fun ArchivePreview(item: FileItem) {
                         if (out.size >= 2000) break
                     }
                 }
-                entries = out.sortedBy { it.name }
-            } catch (e: Exception) {
-                error = e.message ?: context.getString(R.string.filepreview_archive_read_error)
+                out.sortedBy { it.name }
             }
         }
+        loaded.fold(
+            onSuccess = { list -> entries = list },
+            onFailure = { e ->
+                error = e.message ?: context.getString(R.string.filepreview_archive_read_error)
+            },
+        )
     }
 
     when {
