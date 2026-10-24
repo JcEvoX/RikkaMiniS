@@ -301,7 +301,18 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
                 "android-calendar list: invalid or missing date range. Use --today, --days N, or --start/--end (ISO 8601 or YYYY-MM-DD).\n",
             )
         // --limit is the apple-calendar name; --max kept as alias.
-        val limit = args.getInt("limit") ?: args.getInt("max") ?: DEFAULT_LIMIT
+        // [dv29-A3 A-05] Resolved through the shared contract: a spelled page
+        // size the handler cannot honour is a usage error, not a default. The
+        // old `getInt("limit") ?: getInt("max") ?: DEFAULT_LIMIT` answered
+        // `--limit -5` with exit 0, `"events": []` and a `_warning` claiming
+        // "-5 of 0 total records" were returned — `total > limit` is true for
+        // ANY total once the limit is negative, so an empty window was
+        // announced as truncated.
+        val limit = when (val size = PageSizeOutcome.resolve(args, OffloadPageSize.CALENDAR)) {
+            is PageSizeOutcome.Ok -> size.value
+            is PageSizeOutcome.Invalid ->
+                return NativeOffloadResult(2, "android-calendar list: ${size.message}\n")
+        }
         // [da1034-A4] ISSUE-07: `list --calendar NAME` is a FILTER, not a target
         // selection — "matches nothing" is a legitimate empty answer (below),
         // so the write paths' new calendar_not_found refusal deliberately does
@@ -1233,7 +1244,7 @@ class CalendarOffloadHandler(private val context: Context) : NativeOffloadHandle
 
     companion object {
         private const val TAG = "CalendarOffload"
-        private const val DEFAULT_LIMIT = 50
+
 
         // [da1016c-F F-B] A date-only input: exactly "YYYY-MM-DD" (no time, no
         // zone suffix, not a relative shorthand). Only this form gets the

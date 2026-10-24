@@ -556,7 +556,15 @@ class NotificationOffloadHandler(private val context: Context) : NativeOffloadHa
                     ) + "\n",
                 )
 
-        val max = args.get("max")?.toIntOrNull()?.coerceAtLeast(1) ?: 50
+        // [dv29-A3 A-05] Shared page-size contract. The old
+        // `args.get("max")?.toIntOrNull()?.coerceAtLeast(1) ?: 50` answered
+        // `--max 0` with 1 of 11 active notifications and `--max abc` with all
+        // of them, both at exit 0 — a silently wrong `count` either way.
+        val max = when (val size = PageSizeOutcome.resolve(args, OffloadPageSize.NOTIFICATION)) {
+            is PageSizeOutcome.Ok -> size.value
+            is PageSizeOutcome.Invalid ->
+                return NativeOffloadResult(2, "android-notification list: ${size.message}\n")
+        }
         val pm = context.packageManager
         val appNameCache = mutableMapOf<String, String>()
 

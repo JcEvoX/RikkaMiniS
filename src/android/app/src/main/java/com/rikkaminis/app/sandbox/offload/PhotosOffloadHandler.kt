@@ -118,6 +118,9 @@ internal fun albumSelectorRefusal(selector: AlbumSelector.Unreadable): String =
  * Backwards compatibility:
  *   - `near <lat> <lon>` legacy positional form still works.
  *   - `--max` is accepted as an alias for `--limit`.
+ *   - A `--limit` that is not an integer, or is outside the subcommand's
+ *     documented range (list/near 1..100, album 1..200), is a usage error
+ *     (exit 2): it is never clamped and never replaced by the default.
  */
 class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler {
     // [sweep1014-B22b] SimpleDateFormat is not thread-safe (its internal
@@ -176,7 +179,13 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
     // ── list (T59: + --type, --start, --end, --days, --limit) ────────────
 
     private fun handleList(args: OffloadArgs): NativeOffloadResult {
-        val limit = (args.getInt("limit") ?: args.getInt("max") ?: 20).coerceIn(1, 100)
+        // [dv29-A3 A-05] Shared page-size contract: `--limit 0` used to be
+        // clamped to 1 row and `--limit abc` to the default 20, both at exit 0.
+        val limit = when (val size = PageSizeOutcome.resolve(args, OffloadPageSize.PHOTOS)) {
+            is PageSizeOutcome.Ok -> size.value
+            is PageSizeOutcome.Invalid ->
+                return NativeOffloadResult(2, "android-photos list: ${size.message}\n")
+        }
         val type = (args.get("type") ?: "all").lowercase()
         if (type !in setOf("photo", "video", "all")) {
             return NativeOffloadResult(2, "android-photos list: --type must be photo|video|all\n")
@@ -280,7 +289,13 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
         }
         ensureMediaLocationPermission(args)?.let { return it }
         val radius = args.getDouble("radius") ?: 1.0
-        val max = (args.getInt("limit") ?: args.getInt("max") ?: 20).coerceIn(1, 100)
+        // [dv29-A3 A-05] Same contract as `list` — an empty "near" page used to
+        // be indistinguishable from "no photos around this point".
+        val max = when (val size = PageSizeOutcome.resolve(args, OffloadPageSize.PHOTOS)) {
+            is PageSizeOutcome.Ok -> size.value
+            is PageSizeOutcome.Invalid ->
+                return NativeOffloadResult(2, "android-photos near: ${size.message}\n")
+        }
         AppLogger.info(TAG, "near: lat=$lat lon=$lon radius=${radius}km max=$max")
         return NativeOffloadResult(0, OffloadOutput.formatBody(nearPhotos(lat, lon, radius, max), args) + "\n")
     }
@@ -530,7 +545,11 @@ class PhotosOffloadHandler(private val context: Context) : NativeOffloadHandler 
                 "android-photos album: --id <bucket_id> or --name <bucket_name> is required\n",
             )
         }
-        val limit = (args.getInt("limit") ?: args.getInt("max") ?: 50).coerceIn(1, 200)
+        val limit = when (val size = PageSizeOutcome.resolve(args, OffloadPageSize.PHOTOS_ALBUM)) {
+            is PageSizeOutcome.Ok -> size.value
+            is PageSizeOutcome.Invalid ->
+                return NativeOffloadResult(2, "android-photos album: ${size.message}\n")
+        }
         // [sweep1014-B22a-parity] Query photos and videos independently (each
         // capped at [limit]) and merge with the shared mergeMediaLimit, same
         // shape as handleList. The old shared-quota form (photos fill the
