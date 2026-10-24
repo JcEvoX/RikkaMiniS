@@ -170,7 +170,7 @@ class MessageInsertRetryGateTest {
      * [message]; when [failFirstOnly] the second attempt lands.
      */
     private class ThrowingDao(
-        private val message: String,
+        private val constraintMessage: String,
         private val failFirstOnly: Boolean = false,
     ) : InertChatDao() {
         var insertAttempts = 0
@@ -188,7 +188,11 @@ class MessageInsertRetryGateTest {
                 inserted.add(message)
                 return
             }
-            throw SQLiteConstraintException(message)
+            // Named `constraintMessage`, not `message`: the parameter of
+            // `insertMessage(message: MessageEntity)` shadows a property called
+            // `message`, and the mismatch only surfaces in the test compile
+            // (dv29-A2 run 40070578165 failed exactly there).
+            throw SQLiteConstraintException(constraintMessage)
         }
     }
 }
