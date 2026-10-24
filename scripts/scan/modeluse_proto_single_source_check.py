@@ -231,6 +231,57 @@ def _named_arg(args, name):
     return None
 
 
+def _call_end(text, open_idx):
+    """Index of the ')' closing the '(' at [open_idx], or -1 (fail-closed)."""
+    depth = 0
+    i = open_idx
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            i += 1
+            while i < len(text) and text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+# What may follow the enrichment call and still be "the enriched value":
+# closing delimiters of enclosing scopes and plain member reads. Anything else
+# (a combinator, an elvis, another call) hands over something derived from it.
+_PASSTHROUGH_TAIL_RE = re.compile(r"^[)\]\}]*(?:\s*\.\s*[A-Za-z_]\w*)*$")
+
+
+def _alias_discards(expr):
+    """(True, tail) when the `val x = … effectiveModel(…) …` binding keeps only
+    a DERIVED value.
+
+    [wide-1024 Rule 7] The alias name was collected from the whole line, so
+    `val effectiveModel = ModelsDevApi.effectiveModel(entry).let { entry.model }`
+    registered `effectiveModel` as an enrichment outlet while the value bound
+    to it is the raw entry again (type-compatible, so nothing complains) and
+    every models.dev capability field dies at the process boundary again.
+    """
+    m = ENRICH_CALL_RE.search(expr)
+    if not m:
+        return False, ""
+    paren = expr.find("(", m.end() - 1)
+    if paren < 0:
+        return True, "the enrichment call has no argument list"
+    end = _call_end(expr, paren)
+    if end < 0:
+        return True, "the enrichment call could not be delimited (fail-closed)"
+    tail = expr[end + 1:].strip()
+    if _PASSTHROUGH_TAIL_RE.match(tail):
+        return False, ""
+    return True, tail
+
+
 def check_enriched_dispatch(root):
     """[dv23-A03] Every `buildRequestJson(` hand-off resolves the enriched model.
 
@@ -245,7 +296,21 @@ def check_enriched_dispatch(root):
         return ["%s: NOT FOUND at %s — cannot verify the dispatched model" % (name, path)]
     src = code_only(open(path, encoding="utf-8").read())
 
-    aliases = set(m.group(1) for m in ALIAS_RE.finditer(src))
+    aliases = set()
+    for m in ALIAS_RE.finditer(src):
+        aliases.add(m.group(1))
+        line = src.count("\n", 0, m.start()) + 1
+        rest = src[m.end():]
+        line_end = rest.find("\n")
+        binding = src[m.start():m.end() + (line_end if line_end >= 0 else len(rest))]
+        discards, tail = _alias_discards(binding)
+        if discards:
+            v.append(
+                "%s:%d: `val %s = …%s` binds a DERIVED value, not the enriched model "
+                "(`%s`) — the hand-off looks enriched and every models.dev capability "
+                "field is dropped at the process boundary"
+                % (name, line, m.group(1), binding.strip()[:60], tail[:40])
+            )
     if not aliases:
         v.append(
             "%s: no `val … = …effectiveModel(` binding — the enriched model is never "
@@ -412,10 +477,64 @@ def _named_args(args):
             out[m.group(1)] = m.group(2).strip()
     return out
 
+LEVEL_CONST_RE = re.compile(r"\bThinkingLevel\s*\.\s*[A-Za-z_]\w*")
+# Value-returning combinators: what the block hands back is what the caller
+# gets, so a block that ignores its receiver (or returns a constant) has
+# replaced the traced value.
+VALUE_COMBINATOR_RE = re.compile(r"\.\s*(let|run|takeIf)\s*\{")
+
+
+def _block_at(text, open_idx):
+    """`{...}` starting at [open_idx] (brace-balanced, string literals skipped)."""
+    depth = 0
+    i = open_idx
+    while i < len(text):
+        c = text[i]
+        if c == '"':
+            i += 1
+            while i < len(text) and text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx:i + 1]
+        i += 1
+    return None
+
+
+def _post_process_override(expr):
+    """(True, why) when [expr] REPLACES the value it post-processes.
+
+    [wide-1024 C2] Finding the wire read inside the expression only proves the
+    read is MENTIONED. `thinkingLevelFromWire(req.optString("thinking_level",
+    "")).let { ThinkingLevel.OFF }` keeps the read textually while the value
+    handed to the provider is a constant — every non-streamed offloaded turn
+    would ask the vendor not to reason, which is exactly the defect C2 exists
+    for. A value combinator whose block returns a hard-coded level, or ignores
+    its receiver entirely, discards the trace (fail-closed when the block
+    cannot be delimited).
+    """
+    for m in VALUE_COMBINATOR_RE.finditer(expr):
+        brace = expr.find("{", m.end() - 1)
+        blk = _block_at(expr, brace) if brace >= 0 else None
+        if blk is None:
+            return True, "a `.%s {` block could not be delimited (fail-closed)" % m.group(1)
+        inner = blk[1:-1]
+        if LEVEL_CONST_RE.search(inner):
+            return True, "the `.%s {` block returns a hard-coded level" % m.group(1)
+        declares = re.search(r"^\s*([A-Za-z_]\w*)\s*->", inner)
+        recv = declares.group(1) if declares else "it"
+        if not re.search(r"\b%s\b" % re.escape(recv), inner):
+            return True, "the `.%s {` block ignores its receiver" % m.group(1)
+    return False, ""
+
+
 def _traces_to_level(value, body, svc):
     """True when [value] is, or is bound in [body] to, a read of `thinking_level`."""
     if LEVEL_READ_RE.search(value):
-        return True
+        return not _post_process_override(value)[0]
     ident = value.strip()
     if not IDENT_RE.match(ident):
         return False
@@ -423,6 +542,8 @@ def _traces_to_level(value, body, svc):
     if not m:
         return False
     rhs = m.group(1)
+    if _post_process_override(rhs)[0]:
+        return False
     if LEVEL_READ_RE.search(rhs):
         return True
     # one helper hop: `val x = helper(…)` where helper() reads the key
@@ -581,14 +702,69 @@ def find_defs(src):
     return out
 
 
-def is_delegate_def(src, decl_line):
-    """A caller-file definition is legal only if the declaration and the next
-    two lines form a one-line delegate into ModelUseProtocol (expression body
-    or `{ return ModelUseProtocol.parse... }` up to a brace that closes within
-    these lines)."""
-    lines = src.split("\n")
-    window = "\n".join(lines[decl_line - 1 : decl_line + 2])
-    return PREFIX in window
+def _decl_body(src, fn, decl_line):
+    """The body of `fun <fn>(` declared on [decl_line]: brace body, else the
+    expression body (up to the following blank line or declaration)."""
+    for m in re.finditer(r"\bfun\s+%s\s*\(" % re.escape(fn), src):
+        if src.count("\n", 0, m.start()) + 1 != decl_line:
+            continue
+        rp = _call_end(src, m.end() - 1)
+        if rp < 0:
+            return None
+        k = rp + 1
+        while k < len(src) and src[k] in " \t\r\n":
+            k += 1
+        if k < len(src) and src[k] == ":":
+            while k < len(src) and src[k] not in "={":
+                k += 1
+        if k >= len(src):
+            return None
+        if src[k] == "{":
+            end = _brace_end(src, k)
+            return src[k:end + 1] if end > k else None
+        stops = []
+        blank = src.find("\n\n", k)
+        if blank >= 0:
+            stops.append(blank)
+        nxt = re.search(r"\n\s*(?:private |internal |public )?fun\s", src[k:])
+        if nxt:
+            stops.append(k + nxt.start())
+        stop = min(stops) if stops else len(src)
+        return src[k + 1:stop]
+    return None
+
+
+def is_delegate_def(src, decl_line, fn=None):
+    """A caller-file definition is legal only when its BODY is one delegating
+    expression into ModelUseProtocol.
+
+    [wide-1024 Rule 1] The old anchor was a 3-line window containing
+    `ModelUseProtocol.` and no `for (`/`while (` — so appending a fallback
+    (`…parseCustomEndpointPath(inputJson) ?: JSONObject(inputJson)
+    .optString("endpoint")`) stayed inside the window and read as a delegate
+    while it re-implemented the dialect decision at the call site: a symbolic
+    mode like `chat` would be written into `provider.absoluteEndpointOverride`
+    again. The body is now delimited and must be exactly one call (member reads
+    on the result are allowed, nothing else).
+    """
+    fn = fn or next((f for f in FUNCS if re.search(
+        r"\bfun\s+%s\s*\(" % re.escape(f), "\n".join(src.split("\n")[decl_line - 1:decl_line]))), None)
+    if fn is None:
+        return False
+    body = _decl_body(src, fn, decl_line)
+    if body is None:
+        return False
+    token = PREFIX + fn + "("
+    if body.count(token) != 1:
+        return False
+    at = body.find(token)
+    end = _call_end(body, at + len(token) - 1)
+    if end < 0:
+        return False
+    head = body[:at].strip()
+    if head not in ("", "return"):
+        return False
+    return _PASSTHROUGH_TAIL_RE.match(body[end + 1:].strip()) is not None
 
 
 def check(root):
@@ -625,7 +801,7 @@ def check(root):
         defs = find_defs(src)
         for f, decls in defs.items():
             for n in decls:
-                if not is_delegate_def(src, n):
+                if not is_delegate_def(src, n, f):
                     v.append(
                         "%s:%d: 'fun %s(' is NOT a one-line delegate into "
                         "ModelUseProtocol — a second implementation body is "
@@ -845,6 +1021,24 @@ GOOD_CALLER_NO_DISPATCH = GOOD_CALLER.replace(
 ).replace(
     "ModelExecutionDispatcher.buildRequestJson(",
     "ModelExecutionDispatcher.buildBodyJson(",
+)
+
+# [wide-1024] Rule 7 witness: the alias is bound to a DERIVED value
+# (`.let { entry.model }` hands the raw entry back, type-compatible).
+GOOD_CALLER_DISCARDED_ALIAS = GOOD_CALLER.replace(
+    "        val effectiveModel = com.rikkaminis.app.provider.ModelsDevApi.effectiveModel(entry)",
+    "        val effectiveModel = "
+    "com.rikkaminis.app.provider.ModelsDevApi.effectiveModel(entry).let { entry.model }",
+)
+
+# [wide-1024] Rule 1 witness: the delegate keeps its `ModelUseProtocol.` call
+# and re-decides with an elvis fallback on the same line.
+GOOD_CALLER_FALLBACK_DELEGATE = GOOD_CALLER.replace(
+    "    private fun parseCustomEndpointPath(inputJson: String): String? =\n"
+    "        ModelUseProtocol.parseCustomEndpointPath(inputJson)\n",
+    "    private fun parseCustomEndpointPath(inputJson: String): String? =\n"
+    "        ModelUseProtocol.parseCustomEndpointPath(inputJson) ?: "
+    "JSONObject(inputJson).optString(\"endpoint\").ifEmpty { null }\n",
 )
 
 GOOD_CALLER_TWO_MATCHERS = GOOD_CALLER.replace(
@@ -1088,6 +1282,23 @@ class C {
         GOOD_CALLER_NO_DISPATCH,
         "no 'buildRequestJson(' call site",
     )
+    # [wide-1024] Rule 7 witness: the alias line keeps `effectiveModel(` but
+    # binds a derived value, so the hand-off looks enriched and is not.
+    dispatch_arm(
+        "an alias bound to a derived value (.let { entry.model })",
+        GOOD_CALLER_DISCARDED_ALIAS,
+        "binds a DERIVED value",
+    )
+
+    # [wide-1024] Rule 1 witness: the delegate re-decides with an elvis.
+    with tempfile.TemporaryDirectory() as root:
+        write(root, PROTO_REL, GOOD_PROTO)
+        write(root, CALLER_RELS[0], GOOD_CALLER_FALLBACK_DELEGATE)
+        write(root, CALLER_RELS[1], GOOD_CALLER)
+        bad = run(root)
+        if not any("NOT a one-line delegate" in b for b in bad):
+            ok = False
+            print("SELFTEST-FAIL a delegate with an elvis fallback must be caught:", bad)
 
     # [dv27-A02] fixtures 16-20: thinking_level must reach BOTH provider calls,
     # and every key the dispatcher writes must have a reader.
@@ -1128,6 +1339,19 @@ class C {
         wiring_dispatch(),
         "is not derived from reading 'thinking_level'",
     )
+    # [wide-1024] C2 witness: the wire read stays inside the binding and the
+    # value handed to the provider is a constant.
+    wiring_arm(
+        "the parsed level is replaced after the read (.let { ThinkingLevel.OFF })",
+        wiring_service(
+            parse_line='        val thinkingLevel = '
+                       'thinkingLevelFromWire(req.optString("thinking_level", ""))'
+                       '.let { ThinkingLevel.OFF }\n',
+        ),
+        wiring_dispatch(),
+        "is not derived from reading 'thinking_level'",
+    )
+
     wiring_arm(
         "the dispatcher writes a key no worker site reads",
         wiring_service(),
