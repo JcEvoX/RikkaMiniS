@@ -91,6 +91,215 @@ def block_after(src: str, anchor: str):
     return None, at
 
 
+IF_RE = re.compile(r"(?<![\w.])if\s*\(")
+BACKFILL = re.compile(r"copy\(\s*dbMessageId\s*=\s*([^)\n]+)\)")
+IDX_GUARD = re.compile(r"^\s*[A-Za-z_]\w*\s*(?:>=\s*0|>\s*-1|!=\s*-1)\s*$")
+ADVANCE_TO_SIZE = "loopState.unpersistedBlockStart = loopState.allToolBlocks.size"
+ASSIGN_INDEX = re.compile(r"loopState\.unpersistedBlockStart\s*(\+=|-=|=)\s*([^\n]*)")
+VAL_DECL = re.compile(r"(?m)^[ \t]*(?:val|var)\s+([A-Za-z_]\w*)\s*(?::[^=\n]+)?=\s*([^\n]*)")
+
+
+def mask(src):
+    """Blank comment bodies and string literal contents, offsets preserved.
+
+    Every criterion below is a dataflow statement about CODE; a `//` comment or
+    a log string that happens to contain the same tokens must not satisfy it.
+    Strings are scanned before comments, so `"video/*"` cannot open a block
+    comment.
+    """
+    out = list(src)
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == '"':
+            if src.startswith('"""', i):
+                j = i + 3
+                while j < n and not src.startswith('"""', j):
+                    if src[j] != "\n":
+                        out[j] = " "
+                    j += 1
+                i = j + 3
+                continue
+            j = i + 1
+            while j < n:
+                if src[j] == "\\":
+                    out[j] = " "
+                    if j + 1 < n and src[j + 1] != "\n":
+                        out[j + 1] = " "
+                    j += 2
+                    continue
+                if src[j] == '"':
+                    break
+                if src[j] != "\n":
+                    out[j] = " "
+                j += 1
+            i = j + 1
+            continue
+        if c == "'":
+            m = re.match(r"'(?:\\.|[^'\\\n])'", src[i:])
+            if m:
+                for k in range(i, i + m.end()):
+                    out[k] = " "
+                i += m.end()
+                continue
+            i += 1
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            j = i
+            while j < n and src[j] != "\n":
+                out[j] = " "
+                j += 1
+            i = j
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "*":
+            j = i
+            while j < n and not (src[j] == "*" and j + 1 < n and src[j + 1] == "/"):
+                if src[j] != "\n":
+                    out[j] = " "
+                j += 1
+            for k in range(j, min(j + 2, n)):
+                if src[k] != "\n":
+                    out[k] = " "
+            i = j + 2
+            continue
+        i += 1
+    return "".join(out)
+
+
+def brace_span(text, open_idx):
+    depth = 0
+    for k in range(open_idx, len(text)):
+        if text[k] == "{":
+            depth += 1
+        elif text[k] == "}":
+            depth -= 1
+            if depth == 0:
+                return open_idx, k + 1
+    return None
+
+
+def guards(text):
+    """[(cond, body_start, body_end)] for every `if (…)` with a bounded body."""
+    out = []
+    for m in IF_RE.finditer(text):
+        i = text.find("(", m.end() - 1)
+        if i < 0:
+            continue
+        depth = 0
+        j = i
+        while j < len(text):
+            if text[j] == "(":
+                depth += 1
+            elif text[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        cond = text[i + 1:j]
+        k = j + 1
+        while k < len(text) and text[k] in " \t\r\n":
+            k += 1
+        if k < len(text) and text[k] == "{":
+            sp = brace_span(text, k)
+            if sp is None:
+                continue
+            out.append((cond, sp[0], sp[1]))
+        else:
+            depth2 = 0
+            end = len(text)
+            for k2 in range(k, len(text)):
+                ch = text[k2]
+                if ch in "([{":
+                    depth2 += 1
+                elif ch in ")]}":
+                    if depth2 == 0:
+                        end = k2
+                        break
+                    depth2 -= 1
+                elif ch == "\n" and depth2 == 0:
+                    end = k2
+                    break
+            out.append((cond, k, end))
+    return out
+
+
+def enclosing(gs, pos):
+    return [g for g in gs if g[1] <= pos < g[2]]
+
+
+def local_domains(code):
+    """Integer domains implied by a local's initializer.
+
+    `indexOfLast` / `indexOf` / `lastIndexOf` return -1 when absent, so the
+    variable is >= -1; `.size` is >= 0. Used to prove a guard is REACHABLE
+    instead of accepting any comparison against any literal.
+    """
+    d = {}
+    for m in VAL_DECL.finditer(code):
+        name, expr = m.group(1), m.group(2)
+        if "indexOfLast" in expr or "indexOf" in expr or "lastIndexOf" in expr:
+            d[name] = (-1, None)
+        elif ".size" in expr:
+            d[name] = (0, None)
+    return d
+
+
+def _max_lo(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return max(a, b)
+
+
+def _min_hi(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return min(a, b)
+
+
+FLIP = {"==": "==", "!=": "!=", "<": ">", ">": "<", "<=": ">=", ">=": "<="}
+
+
+def feasible(cond, domains):
+    """False only when the condition can never hold given the known domains."""
+    c = cond.strip()
+    if c in ("false", "!true"):
+        return False
+    m = re.fullmatch(r"(-?\d+)\s*(==|!=|<|>|<=|>=)\s*(-?\d+)", c)
+    if m:
+        a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
+        return {"==": a == b, "!=": a != b, "<": a < b,
+                ">": a > b, "<=": a <= b, ">=": a >= b}[op]
+    m = re.fullmatch(r"([A-Za-z_]\w*)\s*(==|!=|<|>|<=|>=)\s*(-?\d+)", c)
+    if m:
+        name, op, num = m.group(1), m.group(2), int(m.group(3))
+    else:
+        m = re.fullmatch(r"(-?\d+)\s*(==|!=|<|>|<=|>=)\s*([A-Za-z_]\w*)", c)
+        if not m:
+            return True
+        num, op, name = int(m.group(1)), FLIP[m.group(2)], m.group(3)
+    if name not in domains:
+        return True
+    lo, hi = domains[name]
+    if op == ">=":
+        slo, shi = num, None
+    elif op == ">":
+        slo, shi = num + 1, None
+    elif op == "<=":
+        slo, shi = None, num
+    elif op == "<":
+        slo, shi = None, num - 1
+    elif op == "==":
+        slo, shi = num, num
+    else:  # !=
+        return not (lo is not None and hi is not None and lo == hi == num)
+    nlo, nhi = _max_lo(lo, slo), _min_hi(hi, shi)
+    return not (nlo is not None and nhi is not None and nlo > nhi)
+
+
 def check_source(engine: str, state: str, label: str):
     bad = []
 
@@ -172,6 +381,68 @@ def check_source(engine: str, state: str, label: str):
     if FIELD not in state:
         bad.append("%s:1: AgentLoopState does not declare '%s'" % (state.split("/")[-1], FIELD))
 
+    # ── R8: the run-scoped index may only be reset or advanced to the count ─
+    # [wide-1024 W1] `loopState.unpersistedBlockStart = turnStartBlockIndex`
+    # re-collapses the two indices this whole gate exists to keep apart: R1 only
+    # inspected the argument text of buildTurnParts, R4 only matched the advance
+    # shape, so a tainted assignment walked straight through both.
+    code = mask(engine)
+    for m in ASSIGN_INDEX.finditer(code):
+        op, rhs = m.group(1), m.group(2).strip().rstrip(";").strip()
+        line = line_of(engine, m.start())
+        if op != "=":
+            bad.append("%s:%d: the unpersisted index is adjusted with '%s' — it is set to 0 "
+                       "(reset) or to loopState.allToolBlocks.size (advance), never "
+                       "arithmetically" % (label, line, op))
+        elif rhs not in ("0", "loopState.allToolBlocks.size"):
+            bad.append("%s:%d: the unpersisted index is set to '%s' — only 0 (reset) or "
+                       "loopState.allToolBlocks.size (advance) may feed it; anything derived "
+                       "from the per-turn start re-collapses the two indices and cuts the blocks "
+                       "a continuation branch already streamed out of the next persist"
+                       % (label, line, rhs))
+
+    # ── R9: every advance must sit inside a success (null-id) guard ───────
+    # [wide-1024 W2] A second, unconditional advance hoisted ABOVE
+    # `if (persistedRowId != null)` leaves the guarded copy intact and still
+    # moves the index past blocks that never reached the DB.
+    gs = guards(code)
+    for m in re.finditer(re.escape(ADVANCE_TO_SIZE), code):
+        line = line_of(engine, m.start())
+        encl = enclosing(gs, m.start())
+        if not any(re.fullmatch(r"^[A-Za-z_][\w.]*\s*!=\s*null$", c.strip())
+                   for c, _a, _b in encl):
+            bad.append("%s:%d: the unpersisted index advances OUTSIDE a success guard "
+                       "(`if (persistedRowId != null)` / `if (assistantDbId != null)`) — when the "
+                       "insert returns null the range is still marked durable and a retry can "
+                       "never re-cover it" % (label, line))
+
+    # ── R10: the dbId backfill must be REACHABLE ─────────────────────────
+    # [wide-1024 W3] `if (lastAssistantIdx >= 0)` flipped to `< -1` is a
+    # forever-false guard: indexOfLast returns >= -1, so the backfill never runs
+    # while its text (`copy(dbMessageId = persistedRowId)`) stays in place.
+    domains = local_domains(code)
+    for m in BACKFILL.finditer(code):
+        line = line_of(engine, m.start())
+        val = m.group(1).strip()
+        if not re.fullmatch(r"[A-Za-z_]\w*", val) or val == "null":
+            bad.append("%s:%d: dbMessageId is backfilled from '%s' — it must be the row id "
+                       "returned by the persist call" % (label, line, val))
+        encl = enclosing(gs, m.start())
+        if not encl:
+            bad.append("%s:%d: the dbMessageId backfill is unguarded — indexOfLast returns -1 "
+                       "when no assistant row is pending" % (label, line))
+            continue
+        for cond, _a, _b in encl:
+            if not feasible(cond, domains):
+                bad.append("%s:%d: the dbMessageId backfill sits behind the unreachable guard "
+                           "`if (%s)` — the guarded value's domain makes the condition "
+                           "impossible, so the backfill can never run"
+                           % (label, line, cond.strip()))
+        if not any(IDX_GUARD.match(c) for c, _a, _b in encl):
+            bad.append("%s:%d: the dbMessageId backfill is not guarded by an index-presence "
+                       "check (`if (<index> >= 0)`) — a -1 index would rewrite the last message"
+                       % (label, line))
+
     return bad
 
 
@@ -244,6 +515,30 @@ BAD_NO_BACKFILL = GOOD_ENGINE.replace(
     "",
 )
 
+# ── wide-1024 witnesses (each one passed this gate unchanged) ───────────────
+
+# W1 (dataflow): the run-scoped index re-tainted from the per-turn start.
+BAD_TAINTED_ADVANCE = GOOD_ENGINE.replace(
+    "                val turnParts = host.buildTurnParts(loopState.allToolBlocks, loopState.unpersistedBlockStart, toolInputMap)\n",
+    "                loopState.unpersistedBlockStart = turnStartBlockIndex\n"
+    "                val turnParts = host.buildTurnParts(loopState.allToolBlocks, loopState.unpersistedBlockStart, toolInputMap)\n",
+)
+
+# W2 (order): a second advance hoisted ABOVE the success guard.
+BAD_HOISTED_ADVANCE = GOOD_ENGINE.replace(
+    """                if (persistedRowId != null) {
+                    loopState.unpersistedBlockStart = loopState.allToolBlocks.size""",
+    """                loopState.unpersistedBlockStart = loopState.allToolBlocks.size
+                if (persistedRowId != null) {
+                    loopState.unpersistedBlockStart = loopState.allToolBlocks.size""",
+)
+
+# W3 (dataflow): the inner index guard flipped to a forever-false comparison.
+BAD_UNREACHABLE_BACKFILL = GOOD_ENGINE.replace(
+    "                    if (idx >= 0) host.agentHistory[idx]",
+    "                    if (idx < -1) host.agentHistory[idx]",
+)
+
 GOOD_STATE = "    var unpersistedBlockStart: Int = 0\n"
 BAD_STATE = "    var somethingElse: Int = 0\n"
 
@@ -275,6 +570,18 @@ def selftest() -> int:
     if not any("does not backfill dbMessageId" in b for b in bad_backfill):
         failures.append("missing-backfill fixture did not trip R5b (got %s)" % bad_backfill)
 
+    bad_taint = check_source(BAD_TAINTED_ADVANCE, GOOD_STATE, "bad_taint.kt")
+    if not any("is set to 'turnStartBlockIndex'" in b for b in bad_taint):
+        failures.append("W1 tainted-advance fixture did not trip R8 (got %s)" % bad_taint)
+
+    bad_hoist = check_source(BAD_HOISTED_ADVANCE, GOOD_STATE, "bad_hoist.kt")
+    if not any("advances OUTSIDE a success guard" in b for b in bad_hoist):
+        failures.append("W2 hoisted-advance fixture did not trip R9 (got %s)" % bad_hoist)
+
+    bad_unreach = check_source(BAD_UNREACHABLE_BACKFILL, GOOD_STATE, "bad_unreach.kt")
+    if not any("unreachable guard" in b for b in bad_unreach):
+        failures.append("W3 unreachable-backfill fixture did not trip R10 (got %s)" % bad_unreach)
+
     bad_state = check_source(GOOD_ENGINE, BAD_STATE, "bad_state.kt")
     if not any("does not declare" in b for b in bad_state):
         failures.append("missing-field fixture did not trip R7 (got %s)" % bad_state)
@@ -285,6 +592,9 @@ def selftest() -> int:
     print("selftest over-broad-rollback     -> %d violation(s)" % len(bad_rb))
     print("selftest clear-without-reset     -> %d violation(s)" % len(bad_clear))
     print("selftest missing-backfill fixture-> %d violation(s)" % len(bad_backfill))
+    print("selftest tainted-advance       -> %d violation(s)" % len(bad_taint))
+    print("selftest hoisted-advance       -> %d violation(s)" % len(bad_hoist))
+    print("selftest unreachable-backfill  -> %d violation(s)" % len(bad_unreach))
     print("selftest missing-field fixture   -> %d violation(s)" % len(bad_state))
 
     if failures:

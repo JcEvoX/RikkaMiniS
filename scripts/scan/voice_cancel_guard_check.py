@@ -58,28 +58,56 @@ XUNFEI_TRANSCRIPT_GUARD = re.compile(
 
 
 def strip_comments(src):
-    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
-    out = []
-    for line in src.split("\n"):
-        cut = None
-        in_str = False
-        i = 0
-        while i < len(line):
-            ch = line[i]
-            if in_str:
-                if ch == "\\":
-                    i += 2
+    """Blank comment bodies, offsets preserved; string literals kept INTACT.
+
+    Literal-aware on purpose: a `"video/*"` or `"https://…"` literal must not be
+    cut as a comment or open a block comment (that once blanked 67 real lines of
+    a handler for a sibling gate). Literal CONTENTS stay readable because this
+    gate matches on contract strings (the Parse messages, the `"ws"` frame).
+    """
+    out = list(src)
+    i, n = 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == '"':
+            if src.startswith('"""', i):
+                j = src.find('"""', i + 3)
+                i = n if j < 0 else j + 3
+                continue
+            j = i + 1
+            while j < n:
+                if src[j] == "\\":
+                    j += 2
                     continue
-                if ch == '"':
-                    in_str = False
-            elif ch == '"':
-                in_str = True
-            elif ch == "/" and i + 1 < len(line) and line[i + 1] == "/":
-                cut = i
-                break
-            i += 1
-        out.append(line if cut is None else line[:cut])
-    return "\n".join(out)
+                if src[j] == '"':
+                    break
+                j += 1
+            i = j + 1
+            continue
+        if c == "'":
+            m = re.match(r"'(?:\\.|[^'\\\n])'", src[i:])
+            i += m.end() if m else 1
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "/":
+            j = i
+            while j < n and src[j] != "\n":
+                out[j] = " "
+                j += 1
+            i = j
+            continue
+        if c == "/" and i + 1 < n and src[i + 1] == "*":
+            j = i
+            while j < n and not (src[j] == "*" and j + 1 < n and src[j + 1] == "/"):
+                if src[j] != "\n":
+                    out[j] = " "
+                j += 1
+            for k in range(j, min(j + 2, n)):
+                if src[k] != "\n":
+                    out[k] = " "
+            i = j + 2
+            continue
+        i += 1
+    return "".join(out)
 
 
 def balanced_block(src, anchor):
@@ -98,6 +126,80 @@ def balanced_block(src, anchor):
             if depth == 0:
                 return src[i:k + 1]
     return None
+
+
+IF_RE = re.compile(r"(?<![\w.])if\s*\(")
+
+
+def paren_inner(text, open_idx):
+    j = text.find("(", open_idx)
+    if j < 0:
+        return None, None
+    depth = 0
+    for k in range(j, len(text)):
+        if text[k] == "(":
+            depth += 1
+        elif text[k] == ")":
+            depth -= 1
+            if depth == 0:
+                return text[j + 1:k], k + 1
+    return None, None
+
+
+def guards(text):
+    """[(cond, body_start, body_end)] for every `if (…)` with a bounded body."""
+    out = []
+    for m in IF_RE.finditer(text):
+        cond, after = paren_inner(text, m.end() - 1)
+        if cond is None:
+            continue
+        k = after
+        while k < len(text) and text[k] in " \t\r\n":
+            k += 1
+        if k < len(text) and text[k] == "{":
+            blk = brace_block(text, k)
+            if blk is None:
+                continue
+            out.append((cond, k, k + len(blk)))
+        else:
+            depth = 0
+            end = len(text)
+            for k2 in range(k, len(text)):
+                ch = text[k2]
+                if ch in "([{":
+                    depth += 1
+                elif ch in ")]}":
+                    if depth == 0:
+                        end = k2
+                        break
+                    depth -= 1
+                elif ch == "\n" and depth == 0:
+                    end = k2
+                    break
+            out.append((cond, k, end))
+    return out
+
+
+def enclosing(gs, pos):
+    return [g for g in gs if g[1] <= pos < g[2]]
+
+
+def dead_condition(cond):
+    """True when a condition is a constant that can never hold on the guard path.
+
+    `if (false)` / `if (1 == 2)` keep every substring a text-matching gate looks
+    for while the guarded statement never runs — the exact shape of the
+    wide-1024 voice witnesses.
+    """
+    c = cond.strip()
+    if c in ("false", "!true"):
+        return True
+    m = re.fullmatch(r"(-?\d+)\s*(==|!=|<|>|<=|>=)\s*(-?\d+)", c)
+    if m:
+        a, op, b = int(m.group(1)), m.group(2), int(m.group(3))
+        return not {"==": a == b, "!=": a != b, "<": a < b,
+                    ">": a > b, "<=": a <= b, ">=": a >= b}[op]
+    return False
 
 
 def check_voiceprovider(src):
@@ -125,6 +227,30 @@ def check_voiceprovider(src):
     if "call.cancel()" not in body:
         v.append("VoiceProvider.kt: watcher hook no longer cancels the Call "
                  "(call.cancel() missing)")
+    # wide-1024 W1 — the hook must CANCEL, not merely spell `call.cancel()`:
+    # `if (false) call.cancel()` keeps every substring and cancels nothing.
+    hook = re.search(r"invokeOnCompletion\s*\{", body)
+    if hook is None:
+        v.append("VoiceProvider.kt: no `invokeOnCompletion { … }` watcher hook found in "
+                 "executeRequest (fail-closed: the cancel path cannot be graded)")
+    else:
+        lam = brace_block(body, hook.end() - 1)
+        if lam is None:
+            v.append("VoiceProvider.kt: the invokeOnCompletion hook body could not be parsed "
+                     "(fail-closed)")
+        else:
+            pos = lam.find("call.cancel()")
+            if pos < 0:
+                v.append("VoiceProvider.kt: the watcher hook does not cancel the Call "
+                         "(call.cancel() missing from the invokeOnCompletion lambda)")
+            else:
+                for cond, _b0, _b1 in enclosing(guards(lam), pos):
+                    if dead_condition(cond):
+                        v.append("VoiceProvider.kt: call.cancel() sits behind the dead guard "
+                                 "`if (%s)` — the hook fires and cancels nothing, so a cancelled "
+                                 "coroutine holds the blocking body read until the 120s "
+                                 "readTimeout (da1020 ISSUE-05 A)" % cond.strip())
+                        break
     if "watchDisposable.dispose()" not in body:
         v.append("VoiceProvider.kt: watcher hook is no longer disposed on the "
                  "success path (every completed request would cancel its Call)")
@@ -146,6 +272,25 @@ def check_voiceprovider(src):
         v.append("VoiceProvider.kt: transcribeChatBased no longer routes "
                  "through parseChatAsrTranscript (a second inline parse would "
                  "re-open the empty-transcript hole)")
+    else:
+        if re.search(r'text\s*=\s*""\s*\)', tcb):
+            # wide-1024 W2 — the parse result must reach the returned text.
+            v.append("VoiceProvider.kt: transcribeChatBased returns a hard-coded empty transcript "
+                     "(text = \"\") — the ASR result is thrown away, so the consumer reports "
+                     "NO_MATCH (\"heard nothing\") for every input and fail-over never advances")
+        for m in re.finditer(r"parseChatAsrTranscript\s*\(", tcb):
+            head = tcb[:m.start()].rstrip()
+            assign = re.search(r"([A-Za-z_]\w*)\s*=\s*$", head)
+            if assign and assign.group(1) == "text":
+                continue
+            bound = re.search(r"(?:val|var)\s+([A-Za-z_]\w*)\s*(?::[^=\n]+)?=\s*$", head)
+            if bound and re.search(r"text\s*=\s*%s\b" % re.escape(bound.group(1)),
+                                   tcb[m.end():]):
+                continue
+            v.append("VoiceProvider.kt: the parseChatAsrTranscript( … ) result is DISCARDED — it "
+                     "must be the value of VoiceInputResponse(text = …); a bare call next to an "
+                     "empty literal parses the transcript and hands back text=\"\" "
+                     "(da1020 ISSUE-05 B)")
     return v
 
 
@@ -157,27 +302,52 @@ def check_openrouter(src):
         v.append("OpenRouterModelsApi.kt: response try envelope not found "
                  "(da1020 ISSUE-05: executeOrCancel must sit inside a try)")
         return v
-    j = code.find("\n        try {", i)
-    if j < 0:
-        v.append("OpenRouterModelsApi.kt: envelope end not found")
+    try_blk = brace_block(code, i + len("val response = try "))
+    if try_blk is None:
+        v.append("OpenRouterModelsApi.kt: the `try { … }` envelope could not be parsed "
+                 "(fail-closed: the cancel/fallback split cannot be graded)")
         return v
-    envelope = code[i:j]
-    try_part = envelope.split("} catch", 1)[0]
-    if "executeOrCancel()" not in try_part:
+    if "executeOrCancel()" not in try_blk:
         v.append("OpenRouterModelsApi.kt: executeOrCancel() is back OUTSIDE the "
                  "try (da1020 ISSUE-05: an IOException would propagate out of "
                  "fetchModels instead of returning the empty fallback)")
-    if "kotlinx.coroutines.CancellationException" not in envelope:
+    rest = code[code.find(try_blk, i) + len(try_blk):]
+
+    # ── CancellationException catch: a LIVE rethrow, never a fallback ─────
+    ce = re.search(r"catch\s*\(\s*e\s*:\s*kotlinx\.coroutines\.CancellationException\s*\)\s*\{",
+                   rest)
+    if ce is None:
         v.append("OpenRouterModelsApi.kt: CancellationException catch missing "
                  "(a cancelled fetch must unwind, not fall back)")
-    if "throw e" not in envelope:
-        v.append("OpenRouterModelsApi.kt: cancellation rethrow (throw e) missing")
-    parts = envelope.split("catch (e: Exception)")
-    if len(parts) < 2:
+    else:
+        blk = brace_block(rest, ce.end() - 1)
+        if blk is None:
+            v.append("OpenRouterModelsApi.kt: the CancellationException catch body could not be "
+                     "parsed (fail-closed)")
+        else:
+            pos = blk.find("throw e")
+            if pos < 0:
+                v.append("OpenRouterModelsApi.kt: cancellation rethrow (throw e) missing")
+            else:
+                for cond, _a, _b in enclosing(guards(blk), pos):
+                    if dead_condition(cond):
+                        v.append("OpenRouterModelsApi.kt: `throw e` sits behind the dead guard "
+                                 "`if (%s)` — a cancelled fetch is swallowed instead of unwinding "
+                                 "(da1020 ISSUE-05 D)" % cond.strip())
+                        break
+            if re.search(r"return@withContext\s+emptyList\(\)", blk):
+                v.append("OpenRouterModelsApi.kt: the CancellationException catch returns the "
+                         "empty fallback — a cancelled fetch masquerades as \"no models\" and the "
+                         "caller's cancellation never propagates (da1020 ISSUE-05 D)")
+
+    ex = re.search(r"catch\s*\(\s*e\s*:\s*Exception\s*\)\s*\{", rest)
+    if ex is None:
         v.append("OpenRouterModelsApi.kt: Exception catch missing")
-    elif "return@withContext emptyList()" not in parts[1]:
-        v.append("OpenRouterModelsApi.kt: Exception catch must return the "
-                 "empty fallback (return@withContext emptyList())")
+    else:
+        blk = brace_block(rest, ex.end() - 1)
+        if blk is None or "return@withContext emptyList()" not in blk:
+            v.append("OpenRouterModelsApi.kt: Exception catch must return the "
+                     "empty fallback (return@withContext emptyList())")
     return v
 
 
@@ -369,6 +539,29 @@ object OpenRouterModelsApi {
 }
 '''
 
+# ── wide-1024 witnesses (each one used to pass this gate unchanged) ──────────
+
+# W1/A: the cancel hook is dead-guarded — every required substring survives.
+BAD_VP_DEAD_CANCEL = GOOD_VP.replace(
+    "val watchDisposable = watchJob.invokeOnCompletion { _ -> call.cancel() }",
+    "val watchDisposable = watchJob.invokeOnCompletion { _ -> if (false) call.cancel() }")
+
+# W2/B: the transcript is parsed and thrown away, an empty literal is returned.
+BAD_VP_DISCARD_PARSE = GOOD_VP.replace(
+    """        val data = executeRequest(request.toRequest())
+        return VoiceInputResponse(text = parseChatAsrTranscript(data))""",
+    """        val data = executeRequest(request.toRequest())
+        if (false) parseChatAsrTranscript(data)
+        return VoiceInputResponse(text = "")""")
+
+# W3/D: cancellation swallowed by a dead rethrow + an empty fallback.
+BAD_OR_DEAD_RETHROW = GOOD_OR.replace(
+    """        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e""",
+    """        } catch (e: kotlinx.coroutines.CancellationException) {
+            if (false) throw e
+            return@withContext emptyList()""")
+
 BAD_OR_OUTSIDE_TRY = GOOD_OR.replace(
     """        val response = try {
             client.newCall(request).executeOrCancel()
@@ -471,6 +664,16 @@ def selftest():
     expect_clean("compliant OpenRouter fixture", good_or)
 
     bad_exec = check_voiceprovider(BAD_VP_BARE_EXECUTE)
+    # ── wide-1024: each witness must red EXACTLY its own criterion ─────────
+    bad_dead_cancel = check_voiceprovider(BAD_VP_DEAD_CANCEL)
+    expect_trip("dead cancel hook fixture", bad_dead_cancel, "dead guard")
+    bad_discard = check_voiceprovider(BAD_VP_DISCARD_PARSE)
+    expect_trip("discarded parse fixture", bad_discard, "DISCARDED")
+    expect_trip("discarded parse fixture", bad_discard, "hard-coded empty transcript")
+    bad_or_dead = check_openrouter(BAD_OR_DEAD_RETHROW)
+    expect_trip("dead rethrow fixture", bad_or_dead, "dead guard")
+    expect_trip("dead rethrow fixture", bad_or_dead, "returns the empty fallback")
+
     expect_trip("bare-execute fixture", bad_exec, ".execute()")
 
     bad_watcher = check_voiceprovider(BAD_VP_NO_WATCHER)
@@ -506,6 +709,9 @@ def selftest():
     print("selftest compliant VoiceProvider    -> %d violation(s)" % len(good_vp))
     print("selftest compliant OpenRouter       -> %d violation(s)" % len(good_or))
     print("selftest compliant Xunfei transcript-> %d violation(s)" % len(good_vend))
+    print("selftest dead-cancel-hook           -> %d violation(s)" % len(bad_dead_cancel))
+    print("selftest discarded-parse-result      -> %d violation(s)" % len(bad_discard))
+    print("selftest dead-rethrow                -> %d violation(s)" % len(bad_or_dead))
     print("selftest bare-execute               -> %d violation(s)" % len(bad_exec))
     print("selftest no-watcher                 -> %d violation(s)" % len(bad_watcher))
     print("selftest no-empty-guard             -> %d violation(s)" % len(bad_guard))
