@@ -149,8 +149,37 @@ class MemoryRollupRunnerTest {
         assertFalse(File(memoryDir, ROLLUP_FILE).exists())
     }
 
-    // ─── Source log invariants ────────────────────────────────────────
+    // ─── [dv28-A3] candidacy parity: content dimension ────────────────
+    // The prompt-side hint used to judge "date shape + not yet distilled"
+    // only, while this picker also required a non-transient entry. Both sides
+    // now share one predicate, so a big transient-only log is skipped by BOTH.
 
+    @Test fun pureTransientLargerLog_isSkippedForSmallerDistillableOne() {
+        memoryDir.mkdirs()
+        val yesterday = yesterdayFile()
+        val oldDate = dateFmt.format(Date(fixedNow.time - 3 * dayMs))
+        // Bigger + older, but every entry is 待办 (strong-unfinished) ⇒ nothing
+        // to distill.
+        File(memoryDir, "$oldDate.md").writeText(
+            "<!-- 2026-08-09 09:00:00 -->\n待办：" + "还差联调\n".repeat(2_000),
+        )
+        File(memoryDir, yesterday).writeText("## 纪律\n必须使用分支")
+
+        val outcome = MemoryRollupRunner(memoryDir, clock = fixedClock).runOnce()
+
+        assertEquals(Outcome.ROLLED_UP, outcome)
+        val content = File(memoryDir, ROLLUP_FILE).readText()
+        assertTrue(
+            "the small distillable log must be the one distilled",
+            content.contains(yesterdayRollupHeader()),
+        )
+        assertFalse(
+            "a transient-only log is not a candidate — it must not be rolled up",
+            content.contains("## Rollup $oldDate"),
+        )
+    }
+
+    // ─── Source log invariants ────────────────────────────────────────
     @Test fun sourceLog_neverModified_afterRollup() {
         memoryDir.mkdirs()
         val log = "<!-- 2026-08-11 08:00:00 -->\n## 规则\n必须使用分支\n"
