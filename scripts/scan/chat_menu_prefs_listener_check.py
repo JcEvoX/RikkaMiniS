@@ -66,6 +66,13 @@ KEY_A = "topBar.inputHistory.visible"
 KEY_B = "composer.modelPickerButton.visible"
 
 ORDER_READS = ("resolveOrder(", "settingsPinOrder(", "resolveAttachOrder(")
+# wide-1024 (dataflow axis): the read must land in the State it exists to
+# refresh -- "called the right pref API" is not the property arm 2/3 guard.
+ORDER_TARGETS = {
+    "resolveOrder(": "menuOrder",
+    "settingsPinOrder(": "footerOrder",
+    "resolveAttachOrder(": "attachOrder",
+}
 
 
 def strip_comments_and_strings(text: str) -> str:
@@ -121,8 +128,58 @@ def listener_body(screen_text: str):
     return "", ""
 
 
+def _stmt_start(text: str, idx: int) -> int:
+    """Offset where the statement containing `idx` begins.
+
+    Scans backwards to the nearest statement boundary at bracket depth 0: an
+    opening/closing brace, `;`, or a newline outside brackets. Kotlin almost
+    never uses semicolons, so the depth-0 newline is load-bearing -- without
+    it a multi-line chain swallows the previous statement (the M1 shape:
+    judging the statement head is only sound when the head really starts the
+    statement).
+    """
+    depth = 0
+    i = idx - 1
+    while i >= 0:
+        ch = text[i]
+        if ch in ")]":
+            depth += 1
+        elif ch in "([":
+            depth -= 1
+        elif depth <= 0 and ch in "{};":
+            return i + 1
+        elif depth <= 0 and ch == "\n":
+            return i + 1
+        i -= 1
+    return 0
+
+
+def result_consumed(body: str, read: str, target: str) -> bool:
+    """True when the value returned by `ChatMenuPrefs.<read>` is actually used.
+
+    Two accepted shapes: the call is the right-hand side of an assignment to
+    the order State (`menuOrder = ChatMenuPrefs.resolveOrder(prefs)`, chains
+    allowed), or the call is bound to a local that the same block later
+    assigns to that State (`val o = ChatMenuPrefs.resolveOrder(prefs)` …
+    `menuOrder = o`) -- the one-hop delegation a legitimate refactor uses.
+    """
+    idx = body.find(read)
+    while idx >= 0:
+        head = body[_stmt_start(body, idx):idx]
+        if re.search(r"\b" + target + r"\s*=(?!=)", head):
+            return True
+        local = re.search(r"\bva[lr]\s+(\w+)\s*=\s*(?:[\w.]+\.)?$", head)
+        if local and re.search(
+            r"\b" + target + r"\s*=\s*" + re.escape(local.group(1)) + r"\b", body
+        ):
+            return True
+        idx = body.find(read, idx + 1)
+    return False
+
+
 def guarded_reads(body: str) -> bool:
-    """All three order reads sit inside the `draggingEntry == null` guard."""
+    """All three order reads sit inside the `draggingEntry == null` guard AND
+    each result is assigned to its State from inside that block."""
     first_read = min((body.find(r) for r in ORDER_READS if body.find(r) >= 0), default=-1)
     if first_read < 0:
         return False
@@ -140,8 +197,13 @@ def guarded_reads(body: str) -> bool:
         elif body[i] == "}":
             depth -= 1
         i += 1
+    if depth:  # unbalanced guard block -> fail-closed
+        return False
     inner = body[brace:i]
-    return all(r in inner for r in ORDER_READS)
+    return all(
+        r in inner and result_consumed(inner, r, ORDER_TARGETS[r])
+        for r in ORDER_READS
+    )
 
 
 def brace_body(clean: str, header_re: str) -> str:
@@ -161,6 +223,58 @@ def brace_body(clean: str, header_re: str) -> str:
             depth -= 1
         i += 1
     return clean[brace:i]
+
+
+def _rhs_text(body: str, start: int) -> str:
+    """Right-hand side of an assignment starting at `start`, cut at a `;` or a
+    depth-0 newline / closing brace."""
+    depth = 0
+    i, n = start, len(body)
+    while i < n:
+        ch = body[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                break
+            depth -= 1
+        elif depth == 0 and ch in ";\n":
+            break
+        i += 1
+    return body[start:i]
+
+
+# a value that is the same read of the same counter, possibly wrapped in a
+# no-op scope function -- rewriting it changes nothing, so nothing emits.
+_NOOP_SELF_RE = re.compile(
+    r"(?:_writeVersion\.value|writeVersion|_writeVersion)"
+    r"(?:\s*\.\s*(?:also|apply|let|run|takeIf|takeUnless)\s*\{[^{}]*\})*\s*$"
+)
+
+
+def bumps_write_version(body: str) -> bool:
+    """True when the body actually CHANGES `_writeVersion`.
+
+    Counter-property of the spelling hole (wide-1024): the old test was
+    `_writeVersion\\.value\\s*(?:\\+=|=\\s*[^=])`, which a self-assignment
+    `_writeVersion.value = _writeVersion.value` satisfies while the StateFlow
+    stays at the same value and emits nothing -- every keyed reload sleeps.
+    So the RHS is read, not just matched.
+    """
+    if re.search(r"_writeVersion\.value\s*(?:\+=|-=|\*=|/=)", body):
+        return True
+    if re.search(r"_writeVersion\.value\s*(?:\+\+|--)", body):
+        return True
+    if re.search(r"(?:\+\+|--)\s*_writeVersion\.value", body):
+        return True
+    for m in re.finditer(r"_writeVersion\.value\s*=(?!=)", body):
+        rhs = _rhs_text(body, m.end()).strip()
+        if not rhs:
+            continue
+        if _NOOP_SELF_RE.match(rhs):
+            continue
+        return True
+    return False
 
 
 def check_stale_write_arms(soul_store_text: str, soul_screen_text: str,
@@ -183,7 +297,7 @@ def check_stale_write_arms(soul_store_text: str, soul_screen_text: str,
             problems.append(
                 "arm5: SoulStore.save(…) body not found -- re-point this guard"
             )
-        elif not re.search(r"_writeVersion\.value\s*(\+=\s*1|\+\+|=\s*[^=])", save_body):
+        elif not bumps_write_version(save_body):
             problems.append(
                 "arm5: SoulStore.save(…) no longer bumps _writeVersion -- every "
                 "external write becomes invisible to the Soul editors, so the "
@@ -194,7 +308,7 @@ def check_stale_write_arms(soul_store_text: str, soul_screen_text: str,
             problems.append(
                 "arm6: SoulStore.refreshCache(…) body not found -- re-point this guard"
             )
-        elif not re.search(r"_writeVersion\.value\s*(\+=\s*1|\+\+|=\s*[^=])", refresh_body):
+        elif not bumps_write_version(refresh_body):
             problems.append(
                 "arm6: SoulStore.refreshCache(…) no longer bumps _writeVersion -- "
                 "the documented \"rewritten outside save()\" path (the chat memory "
@@ -236,6 +350,21 @@ def check_stale_write_arms(soul_store_text: str, soul_screen_text: str,
                     "(no SoulStore.load( inside it) -- re-point this guard if the "
                     "reload moved into a helper"
                 )
+            else:
+                # dataflow: the reload has to RUN on every key change. An exit
+                # before the load turns LaunchedEffect(writeVersion) into
+                # LaunchedEffect(Unit) -- the effect restarts, returns, and the
+                # editor keeps the snapshot it read when the screen opened.
+                load_at = body.find("SoulStore.load(")
+                early = [m for m in re.finditer(r"\breturn\s*@LaunchedEffect\b", body)
+                         if m.start() < load_at]
+                if early:
+                    problems.append(
+                        "arm7: the writeVersion-keyed effect returns before "
+                        "re-reading the file (`return@LaunchedEffect` ahead of "
+                        "SoulStore.load) -- it degenerates into a one-shot load, so "
+                        "every external write stays invisible to the editor"
+                    )
 
     # ---- arm 8: the Logs screen listener ---------------------------------
     body, raw_body = listener_body(log_screen_text)
@@ -304,13 +433,24 @@ def check_arms(screen_text: str, prefs_text: str,
             + " -- the `chatMenu.` prefix alone never fires for external writes"
         )
 
-    # arm 2: all three order re-reads present in the listener body
+    # arm 2: all three order re-reads present in the listener body ...
     missing = [r for r in ORDER_READS if r not in body]
     if missing:
         problems.append(
             "arm2: listener body does not re-read the order state(s): "
             + ", ".join(missing)
             + " -- an external restore of chatMenu.*Order leaves the lists stale"
+        )
+    # ... AND each re-read's result lands in the State it refreshes
+    discarded = [r for r in ORDER_READS
+                 if r in body and not result_consumed(body, r, ORDER_TARGETS[r])]
+    if discarded:
+        problems.append(
+            "arm2: listener body calls the order re-read(s) "
+            + ", ".join(discarded)
+            + " but discards the result (no assignment back to "
+            + ", ".join(ORDER_TARGETS[r] for r in discarded)
+            + ") -- the calls fire, the States stay stale (called != consumed)"
         )
 
     # arm 3: re-reads inside the draggingEntry == null guard
@@ -512,6 +652,57 @@ fun LogManagementScreen(context: Context) {
     ok &= arm("arm8c listener block absent (fail-closed)", 1,
               COMPLIANT_STORE, COMPLIANT_SOUL_SCREEN, S8C_SCREEN.replace(
                   "DisposableEffect(context) {", "if (true) {"))
+
+    # ── wide-1024 witnesses: the three shapes that defeated this gate ──────
+    # (each is the find→replace from the wide-sweep report, replayed verbatim)
+    W2_SCREEN = COMPLIANT_SCREEN.replace(
+        '''menuOrder = ChatMenuPrefs.resolveOrder(prefs)
+                            .filter { ChatActionCatalog.spec(it)?.defaultMenuVisible != false }
+                        footerOrder = ChatMenuPrefs.settingsPinOrder(prefs)
+                        attachOrder = ChatMenuPrefs.resolveAttachOrder(prefs)''',
+        '''ChatMenuPrefs.resolveOrder(prefs)
+                        ChatMenuPrefs.settingsPinOrder(prefs)
+                        ChatMenuPrefs.resolveAttachOrder(prefs)''')
+    W5_STORE = COMPLIANT_STORE.replace(
+        """        _cachedMetadata.value = parsed?.metadata ?: SoulMetadata.DEFAULT
+        _writeVersion.value += 1""",
+        """        _cachedMetadata.value = parsed?.metadata ?: SoulMetadata.DEFAULT
+        _writeVersion.value = _writeVersion.value""")
+    W7_SCREEN = COMPLIANT_SOUL_SCREEN.replace(
+        "    LaunchedEffect(writeVersion) {\n",
+        "    LaunchedEffect(writeVersion) {\n        if (loaded) return@LaunchedEffect\n")
+    # clean counter-arms: legitimate refactors must stay green
+    L2_SCREEN = COMPLIANT_SCREEN.replace(
+        '''menuOrder = ChatMenuPrefs.resolveOrder(prefs)
+                            .filter { ChatActionCatalog.spec(it)?.defaultMenuVisible != false }''',
+        '''val resolvedOrder = ChatMenuPrefs.resolveOrder(prefs)
+                        menuOrder = resolvedOrder.filter {
+                            ChatActionCatalog.spec(it)?.defaultMenuVisible != false
+                        }''')
+    W5_OK_STORE = COMPLIANT_STORE.replace(
+        "_writeVersion.value += 1",
+        "_writeVersion.value = _writeVersion.value + 1")
+
+    for name, screen, prefs, want_red in (
+        ("W2 order re-reads discard their results", W2_SCREEN, COMPLIANT_PREFS, 1),
+        ("L2 local-then-assign still consumed", L2_SCREEN, COMPLIANT_PREFS, 0),
+    ):
+        problems, _ = check_arms(screen, prefs)
+        red = len(problems) > 0
+        mark = "ok" if red == bool(want_red) else "FAIL"
+        if mark == "FAIL":
+            ok = False
+        print(f"  selftest wide {name}: {'RED' if red else 'GREEN'} "
+              f"(expect {'RED' if want_red else 'GREEN'}) {mark}")
+        for p in problems:
+            print(f"      - {p}")
+
+    ok &= arm("W5 refreshCache self-assigns writeVersion (spelling)", 1,
+              W5_STORE, COMPLIANT_SOUL_SCREEN, COMPLIANT_LOG_SCREEN)
+    ok &= arm("W5ok writeVersion = writeVersion + 1 still bumps", 0,
+              W5_OK_STORE, COMPLIANT_SOUL_SCREEN, COMPLIANT_LOG_SCREEN)
+    ok &= arm("W7 soul effect exits before re-reading (dataflow)", 1,
+              COMPLIANT_STORE, W7_SCREEN, COMPLIANT_LOG_SCREEN)
     return ok
 
 
