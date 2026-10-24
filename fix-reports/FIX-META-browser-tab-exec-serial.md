@@ -115,7 +115,17 @@ python3 scripts/scan/test_scan.py → ✅ ALL 344 CASES PASS
 
 ## §6 CI
 
-（提交后追加 run 号 / `head_sha` / 判读结论）
+| 项 | 值 |
+|---|---|
+| run | **40102170254**（https://github.com/logicflow-GYW/RikkaMinis/actions/runs/40102170254） |
+| job | `120896393210`（build），attempt 1，`conclusion=success` |
+| `head_sha` | **`0fcb8505541b3fb0e41218033d9b1ed98bcbefd6`** — 与本地 `git rev-parse HEAD` 逐字符一致 |
+| 26 步 | `bad=[]`，唯一 `skipped` = 步骤 23 `Publish to Releases`（main 门控，分支上应跳） |
+| 门禁 | 门头 `[1/112] … [112/112]`，恰一条 `Summary: 112 passed, 0 failed`（其余 Summary 行是各门内部小计） |
+| 夹具 | 恰一条 `ALL 344 CASES PASS` |
+| 编译错 | ` e: ` 计数 **0**，游离 `FAILED` 0 条 |
+| 本支两门 | `PASS browser_tab_exec_serial (…)` / `✅ browser_tab_exec_serial_check selftest has teeth` / `✅ … real tree green`；`✅ file_provider_paths_coverage_check selftest has teeth (FILE_PROVIDER_PATHS_SELFTEST=PASS)` / `✅ … real tree green` |
+| 日志 | 1,483,218 B（判读脚本：`grep -c` 三条 + jobs API 取步骤结论） |
 
 ## §7 残留登记（不动手）
 
