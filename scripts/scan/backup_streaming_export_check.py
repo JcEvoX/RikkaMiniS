@@ -155,16 +155,135 @@ def read_stripped(root, rel):
     return strip_comments(src)
 
 
+DEAD_COND_PAT = re.compile(
+    r"\bif\s*\(\s*(?:false\b|!\s*true\b|0\s*!=\s*0\b|1\s*==\s*0\b|true\s*==\s*false\b)")
+
+
+def brace_block_span(text, pos):
+    """(start, end) of the SMALLEST `{ … }` block containing `pos`."""
+    depth = 0
+    i = pos - 1
+    while i >= 0:
+        c = text[i]
+        if c == "}":
+            depth += 1
+        elif c == "{":
+            if depth == 0:
+                d = 0
+                for j in range(i, len(text)):
+                    if text[j] == "{":
+                        d += 1
+                    elif text[j] == "}":
+                        d -= 1
+                        if d == 0:
+                            return i, j + 1
+                return i, len(text)
+            depth -= 1
+        i -= 1
+    return 0, len(text)
+
+
+def fun_span(code, name):
+    """(start, end) of `fun <name>( … ) { … }`, or None."""
+    m = re.search(r"\bfun\s+%s\s*\(" % re.escape(name), code)
+    if m is None:
+        return None
+    brace = code.find("{", m.end())
+    if brace < 0:
+        return None
+    start, end = brace_block_span(code, brace + 1)
+    return start, end
+
+
+def dead_guarded(code, pos):
+    """True when `pos` can never execute: its own statement is gated on a
+    constant that is false, or an enclosing block is (`if (false) { … }`).
+
+    `if (false) rotateLocalAutoBackups(app)` keeps the call, the helper and
+    every other anchor of arm 1 — the rotation simply never runs."""
+    line_start = code.rfind("\n", 0, pos) + 1
+    if DEAD_COND_PAT.search(code[line_start:pos]):
+        return True
+    # A guard on the previous line / on a wrapped statement: `if (false)\n call()`.
+    j = pos - 1
+    while j >= 0 and code[j] in " \t\r\n":
+        j -= 1
+    if j >= 0 and code[j] == ")":
+        depth = 0
+        i = j
+        while i >= 0:
+            if code[i] == ")":
+                depth += 1
+            elif code[i] == "(":
+                depth -= 1
+                if depth == 0:
+                    break
+            i -= 1
+        if re.search(r"\bif\s*$", code[max(0, i - 40):i]) and DEAD_COND_PAT.search(code[i:j + 1]):
+            return True
+    # Enclosing blocks: walk out through every `{ … }` that contains `pos`.
+    probe = pos
+    while True:
+        start, end = brace_block_span(code, probe)
+        if start == 0 and end == len(code):
+            break
+        head = code[max(0, start - 90):start]
+        if DEAD_COND_PAT.search(head):
+            return True
+        if start <= 0:
+            break
+        probe = start
+    return False
+
+
+def paren_block(code, open_idx):
+    """The balanced `( … )` starting at `open_idx`, or None."""
+    depth = 0
+    for i in range(open_idx, len(code)):
+        if code[i] == "(":
+            depth += 1
+        elif code[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return code[open_idx:i + 1]
+    return None
+
+
+def assign_target(code, pos):
+    """The variable `val X =` / `X =` whose value starts at `pos`, or None."""
+    head = code[max(0, pos - 240):pos]
+    m = re.search(r"(?:val\s+|var\s+)?([A-Za-z_]\w*)\s*(?::\s*[\w<>?,. ]+)?=\s*$", head)
+    return m.group(1) if m else None
+
+
 def check_arm1(auto_code):
-    """AutoBackupManager: streaming export + shared rotation."""
+    """AutoBackupManager: streaming export + shared rotation, and the rotation
+    must be REACHABLE.
+
+    wide-1024: the old criterion was a whole-file substring match, so
+    `if (false) rotateLocalAutoBackups(app)` read exactly like the real call —
+    `filesDir/backup-autos` then grows without bound until the device is full,
+    which is the defect [deep-audit-1027 B-04] closed. The check is now scoped
+    to runLocked's body and the call site is checked for a dead guard.
+    """
     if auto_code is None:
         return "AutoBackupManager.kt not found"
-    if "ConfigBackup.exportToWriter(" not in auto_code:
+    span = fun_span(auto_code, "runLocked")
+    if span is None:
+        return ("AutoBackupManager.runLocked not found (anchor drift) — re-point arm 1 "
+                "at the renamed writer; do not delete it")
+    region = auto_code[span[0]:span[1]]
+    if "ConfigBackup.exportToWriter(" not in region:
         return "runLocked must stream via ConfigBackup.exportToWriter( (no full-document String)"
-    if "ConfigBackup.export(" in auto_code:
+    if "ConfigBackup.export(" in region:
         return "runLocked must not assemble the whole document via ConfigBackup.export("
-    if "rotateLocalAutoBackups(app)" not in auto_code:
+    pos = region.find("rotateLocalAutoBackups(app)")
+    if pos < 0:
         return "runLocked must rotate through the shared rotateLocalAutoBackups(app) helper"
+    if dead_guarded(region, pos):
+        return ("runLocked's shared rotation is DEAD-GUARDED (a constant condition can "
+                "never hold) — the call is there, the rotation never runs, and "
+                "filesDir/backup-autos grows without bound until the device is full")
     return None
 
 
@@ -179,14 +298,74 @@ def check_arm2(sync_code):
     return None
 
 
+SANITIZE_CALL = "WebDavSync.sanitizeAutoBackupStamp"
+
+
 def check_arm3(screen_code):
-    """Fetch-to-local path: sanitize + shared rotation."""
+    """Fetch-to-local path: sanitize, and USE what the sanitizer returned.
+
+    wide-1024: the old criterion proved only that the call appears somewhere in
+    the screen. Deleting the null-guard and building the destination from the
+    RAW remote display name keeps the call — while writing a
+    remote-controlled path (`../../../…`, absolute `/data/…`) into
+    `filesDir/backup-autos`, i.e. the path-traversal / overwrite defect
+    [deep-audit-1031 A-07] re-opened with one line.
+
+    Criterion (per call site, on its enclosing block):
+      1. the result is BOUND to a variable (not discarded);
+      2. the sanitizer's null result is REJECTED (guard or `?:`) — the whole
+         point of the reducer is that it can say "no";
+      3. the destination `File(…)` is built from the sanitized value (or a
+         variable assigned from it), never from the raw token alone.
+    An unparseable call site fail-closes.
+    """
     if screen_code is None:
         return "BackupSettingsScreen.kt not found"
-    if "WebDavSync.sanitizeAutoBackupStamp(" not in screen_code:
+    if SANITIZE_CALL + "(" not in screen_code:
         return "fetch-to-local must sanitize the remote display name via WebDavSync.sanitizeAutoBackupStamp("
     if "rotateLocalAutoBackups(context)" not in screen_code:
         return "fetch-to-local must join the shared local rotation via rotateLocalAutoBackups(context)"
+    for m in re.finditer(re.escape(SANITIZE_CALL), screen_code):
+        if re.search(r"fun\s+$", screen_code[max(0, m.start() - 40):m.start()]):
+            continue  # the declaration itself
+        op = screen_code.find("(", m.end() - 1)
+        block = paren_block(screen_code, op) if op >= 0 else None
+        if block is None:
+            return ("WebDavSync.sanitizeAutoBackupStamp( … ) does not balance at offset %d "
+                    "(fail-closed)" % m.start())
+        call_end = op + len(block)
+        var = assign_target(screen_code, m.start())
+        if not var:
+            return ("the sanitized remote name is DISCARDED at offset %d (result not bound "
+                    "to a variable) — the file name is still derived from the raw, "
+                    "remote-controlled display name (path traversal / overwrite into "
+                    "filesDir/backup-autos)" % m.start())
+        start, end = brace_block_span(screen_code, m.start())
+        after = screen_code[call_end:end]
+        guarded = (re.match(r"\s*\?:", after) is not None
+                   or re.search(r"\b%s\s*==\s*null\b" % re.escape(var), after) is not None
+                   or re.search(r"\bnull\s*==\s*%s\b" % re.escape(var), after) is not None
+                   or re.search(r"requireNotNull\s*\(\s*%s\b" % re.escape(var), after) is not None)
+        if not guarded:
+            return ("the sanitizer's rejection is IGNORED (`%s` is never null-checked) — a "
+                    "remote display name that the reducer refuses is then written as-is "
+                    "into filesDir/backup-autos" % var)
+        uses = [x for x in re.finditer(r"\b%s\b" % re.escape(var), after)]
+        if not uses:
+            return ("`%s` (the sanitized result) is never read — the destination path is "
+                    "built from something else, so sanitising the name changed nothing" % var)
+        aliases = {var}
+        for a in re.finditer(r"\b([A-Za-z_]\w*)\s*=\s*%s\b" % re.escape(var), after):
+            aliases.add(a.group(1))
+        region = screen_code[start:end]
+        dests = [paren_block(region, d.end() - 1)
+                 for d in re.finditer(r"\bFile\s*\(", region)]
+        dests = [d for d in dests if d]
+        if dests and not any(any(re.search(r"\b%s\b" % re.escape(a), d) for a in aliases)
+                             for d in dests):
+            return ("the destination `File(…)` is not built from the sanitized value "
+                    "(none of %s appears in it) — the guard protects a value the writer "
+                    "never uses" % ", ".join(sorted("`%s`" % a for a in aliases)))
     return None
 
 
@@ -316,10 +495,20 @@ def check_arm6(screen_code):
             "exit path (no `finally` in the handler region)"
         )
     finally_region = _braced_region(region, finally_i) or ""
-    if "operationBusy = false" not in finally_region:
+    # wide-1024 (order axis): a release that is followed by another claim is
+    # not a release — the LAST write in the exit path is the one that survives.
+    writes = re.findall(r"operationBusy\s*=\s*(true|false)", finally_region)
+    if not writes:
         return (
             "fetch-to-local must release the shared operationBusy gate inside "
             "its `finally` (a release on the happy path only leaks the gate)"
+        )
+    if writes[-1] != "false":
+        return (
+            "fetch-to-local's `finally` ends with `operationBusy = %s` — the last write "
+            "on the exit path wins, so the shared gate stays CLAIMED after the fetch "
+            "finishes and Run Now / Restore / Export are dead until the screen is "
+            "recreated (a release followed by a re-claim is not a release)" % writes[-1]
         )
     refresh_i = region.find("openAutoRemoteList(")
     window = region[max(0, refresh_i - 200) : refresh_i]
@@ -539,6 +728,40 @@ VIOLATION_FETCH_HANDLER_RENAMED = COMPLIANT_SCREEN.replace(
     "fun pullRemote(entry: WebDavSync.AutoBackupEntry) {",
 )
 
+# ── wide-1024 witnesses (mechanically reproduced on the real tree: pre-fix
+# rc=0, post-fix rc=1) ────────────────────────────────────────────────────
+
+# W1 (dataflow): the call and the helper both survive — the call can never run,
+# so the rotation is dead and filesDir/backup-autos grows unbounded.
+VIOLATION_ROTATION_DEAD_GUARD = COMPLIANT_AUTO.replace(
+    "        rotateLocalAutoBackups(app)",
+    "        if (false) rotateLocalAutoBackups(app)",
+)
+
+# W2 (dataflow, spelling→effect): the sanitizer's rejection is dropped and the
+# path is built from the raw, remote-controlled display name.
+VIOLATION_FETCH_SANITIZER_DEAD = COMPLIANT_SCREEN.replace(
+    '                val stamp = WebDavSync.sanitizeAutoBackupStamp(entry.item.displayName) ?: return\n'
+    '                val local = File(dir, AutoBackupManager.LOCAL_FILE_PREFIX + stamp + ".json")',
+    '                val stamp = WebDavSync.sanitizeAutoBackupStamp(entry.item.displayName)\n'
+    '                val local = File(dir, AutoBackupManager.LOCAL_FILE_PREFIX'
+    ' + entry.item.displayName + ".json")',
+)
+
+# W2b: the guard is kept, the writer ignores the guarded value.
+VIOLATION_FETCH_RAW_PATH = COMPLIANT_SCREEN.replace(
+    'AutoBackupManager.LOCAL_FILE_PREFIX + stamp + ".json"',
+    'AutoBackupManager.LOCAL_FILE_PREFIX + entry.item.displayName + ".json"',
+)
+
+# W3 (order): the release is followed by a re-claim — last write wins, the gate
+# is left claimed.
+VIOLATION_FETCH_GATE_RECLAIM = COMPLIANT_SCREEN.replace(
+    '                autoRemoteLoading = false\n                operationBusy = false\n',
+    '                autoRemoteLoading = false\n                operationBusy = false\n'
+    '                operationBusy = true\n',
+)
+
 
 def write_tree(tmp, auto=None, sync=None, screen=None):
     for rel, content in (
@@ -554,7 +777,9 @@ def write_tree(tmp, auto=None, sync=None, screen=None):
             f.write(content)
 
 
-def run_fixture(name, expect_ok, auto=None, sync=None, screen=None):
+def run_fixture(name, expect_ok, auto=None, sync=None, screen=None, contains=None):
+    """`contains` pins WHICH criterion fired — a dirty fixture that goes red on
+    an unrelated arm must not count as evidence for the arm under test."""
     with tempfile.TemporaryDirectory() as tmp:
         write_tree(
             tmp,
@@ -563,10 +788,12 @@ def run_fixture(name, expect_ok, auto=None, sync=None, screen=None):
             screen=screen if screen is not None else COMPLIANT_SCREEN,
         )
         failures = check_all(tmp)
-        ok = not failures
-        status = "PASS" if ok == expect_ok else "FAIL"
+        ok = (not failures) == expect_ok
+        if ok and contains is not None:
+            ok = any(contains in f for f in failures)
+        status = "PASS" if ok else "FAIL"
         print(f"  [{status}] fixture {name}: failures={failures}")
-        return status == "PASS"
+        return ok
 
 
 def selftest():
@@ -588,6 +815,15 @@ def selftest():
     ok &= run_fixture("violation-fetch-no-busy-release", expect_ok=False, screen=VIOLATION_FETCH_NO_BUSY_RELEASE)
     ok &= run_fixture("violation-fetch-unguarded-refresh", expect_ok=False, screen=VIOLATION_FETCH_UNGUARDED_REFRESH)
     ok &= run_fixture("violation-fetch-handler-renamed", expect_ok=False, screen=VIOLATION_FETCH_HANDLER_RENAMED)
+    # wide-1024: each witness must trip the arm it was written against.
+    ok &= run_fixture("violation-rotation-dead-guard", expect_ok=False,
+                      auto=VIOLATION_ROTATION_DEAD_GUARD, contains="DEAD-GUARDED")
+    ok &= run_fixture("violation-fetch-sanitizer-dead", expect_ok=False,
+                      screen=VIOLATION_FETCH_SANITIZER_DEAD, contains="rejection is IGNORED")
+    ok &= run_fixture("violation-fetch-raw-path", expect_ok=False,
+                      screen=VIOLATION_FETCH_RAW_PATH, contains="never read")
+    ok &= run_fixture("violation-fetch-gate-reclaim", expect_ok=False,
+                      screen=VIOLATION_FETCH_GATE_RECLAIM, contains="last write")
     print("BACKUP_STREAMING_EXPORT_SELFTEST=" + ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 
