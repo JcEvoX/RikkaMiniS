@@ -157,10 +157,12 @@ def string_mask(src):
 def statement_start(src, mask, idx):
     """Start offset of the statement containing `idx`.
 
-    Backwards scan that treats `{`/`}`/`;` at nesting depth 0 as statement
-    boundaries and any unbalanced opener as "we walked out of the enclosing
-    expression". Never returns -1: on an unattributable call the head simply
-    will not look like a consumer, which is the fail-closed direction.
+    Backwards scan that treats `{`/`}`/`;` — AND a newline at nesting depth 0
+    (Kotlin statements are newline-delimited) — as statement boundaries; any
+    unbalanced opener ends the walk. Newlines INSIDE parens/braces (a wrapped
+    argument list) are not boundaries. Never returns -1: on an unattributable
+    call the head simply will not look like a consumer, which is the
+    fail-closed direction.
     """
     depth = 0
     i = idx - 1
@@ -169,7 +171,7 @@ def statement_start(src, mask, idx):
             i -= 1
             continue
         c = src[i]
-        if depth == 0 and c in ";{}":
+        if depth == 0 and c in ";\n{}":
             return i + 1
         if c in ")]}":
             depth += 1
@@ -338,6 +340,20 @@ ARMS = {
              "        )\n        return resolvedLevel\n    }\n\n    fun setLevel"),
         ],
     ),
+    # Regression arm for a false GREEN found by the fixer's own probe: a
+    # discarded resolve() followed by `return <other local>` must be RED. It is
+    # red only if the statement scan stops at the depth-0 newline — walking
+    # further back swallows the previous `val stored = …` line and reads its
+    # name as "the bound value that is returned".
+    "getlevel_discard_return_other_val": (
+        PERM_MANAGER,
+        [
+            ("        return OffloadPermissionLevelPolicy.resolve(",
+             "        OffloadPermissionLevelPolicy.resolve("),
+            ("        )\n    }\n\n    fun setLevel",
+             "        )\n        return stored ?: info.defaultLevel\n    }\n\n    fun setLevel"),
+        ],
+    ),
 }
 
 SELFTEST_TAGS = {
@@ -348,6 +364,7 @@ SELFTEST_TAGS = {
     "registry_exposure": "AUTO_APPROVE_BYPASS_SELFTEST registry_exposure arm: OK",
     "getlevel_result_discarded": "AUTO_APPROVE_BYPASS_SELFTEST getlevel_result_discarded arm: OK",
     "getlevel_via_local_val": "AUTO_APPROVE_BYPASS_SELFTEST getlevel_via_local_val arm: OK",
+    "getlevel_discard_return_other_val": "AUTO_APPROVE_BYPASS_SELFTEST getlevel_discard_return_other_val arm: OK",
 }
 
 
@@ -392,6 +409,7 @@ def main():
                 ("registry_exposure", 1),
                 ("getlevel_result_discarded", 1),
                 ("getlevel_via_local_val", 0),
+                ("getlevel_discard_return_other_val", 1),
             ]:
                 failures = run_arm(tmp, arm_name)
                 tag = SELFTEST_TAGS[arm_name]
