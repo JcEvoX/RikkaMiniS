@@ -165,6 +165,63 @@ def slice_balanced_body(code, header_marker):
     return "\n".join(buf)
 
 
+def block_from(text, open_idx):
+    """Balanced `{ … }` starting at [open_idx], or None when unterminated."""
+    depth = 0
+    quote = None
+    for j in range(open_idx, len(text)):
+        c = text[j]
+        if quote is not None:
+            if c == quote:
+                quote = None
+            continue
+        if c in ('"', "'"):
+            quote = c
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_idx:j + 1]
+    return None
+
+
+def enclosing_heads(src, idx):
+    """Heads of every `{ … }` block enclosing [idx], innermost first. The head
+    is the text on the line before the brace (`if (…)`, `x.also`, `?.let`)."""
+    heads = []
+    depth = 0
+    i = idx
+    while i >= 0:
+        c = src[i]
+        if c == "}":
+            depth += 1
+        elif c == "{":
+            if depth == 0:
+                j = i - 1
+                while j >= 0 and src[j] in " \t\n":
+                    j -= 1
+                end = j + 1
+                while j >= 0 and src[j] not in "\n;{}":
+                    j -= 1
+                heads.append(src[j + 1:end].strip())
+            else:
+                depth -= 1
+        i -= 1
+    return heads
+
+
+def in_discarded_lambda(src, idx):
+    """True when the expression at [idx] sits inside a `.also { … }` /
+    `.apply { … }` lambda — those return their RECEIVER, so the value computed
+    inside is thrown away. [wide-1024] `url.also { fromAssetLoaderUrl(url, root) }`
+    is exactly how the reverse mapping got called and discarded at once."""
+    for head in enclosing_heads(src, idx):
+        if head.endswith(".also") or head.endswith(".apply"):
+            return True
+    return False
+
+
 def window_after(code, marker, size):
     """Bounded text window starting at `marker` (first match) — for pinning
     expression-bodied declarations whose body has no braces to slice."""
@@ -243,11 +300,22 @@ def analyse(holder_code, sheet_code, gallery_code=None, filepreview_code=None,
                         % len(assigns), None))
     else:
         line_no, rhs = assigns[0]
-        ok = ("fromAssetLoaderUrl(" in rhs and "url" in rhs
-              and "assetRootDir" in rhs)
+        # [wide-1024 W1] "calls the mapper" is not "publishes the mapped value".
+        # `url.also { fromAssetLoaderUrl(url, assetRootDir) }` calls it, throws
+        # the result away and publishes the raw asset-loader URL — the exact
+        # three-consumer breakage this gate exists for.
+        pos = rhs.find("fromAssetLoaderUrl(")
+        discarded = pos >= 0 and in_discarded_lambda(rhs, pos)
+        ok = (pos >= 0 and "url" in rhs and "assetRootDir" in rhs
+              and "?:" in rhs and not discarded)
+        detail = "RHS = %r" % rhs
+        if discarded:
+            detail += (" — the mapper is called inside .also/.apply, so the published "
+                       "value is the receiver (the raw webview URL), not the mapped "
+                       "file:// URL")
         results.append(("W1 onPageStarted publishes via fromAssetLoaderUrl(url, assetRootDir)",
                         ok,
-                        "RHS = %r" % rhs, line_no + 1))
+                        detail, line_no + 1))
 
     # --- W2: the load path uses the forward mapper (single source) ---
     ok2 = "toAssetLoaderUrl(currentUrl) ?: currentUrl" in code
@@ -320,6 +388,38 @@ def analyse(holder_code, sheet_code, gallery_code=None, filepreview_code=None,
                             neg is None,
                             "negated assignment (%r) inverts the mobile viewport "
                             "again" % (neg.group(0) if neg else ""), None))
+            # [wide-1024 W5] the mobile branch must COPY the policy's field, not
+            # derive a new predicate from another one: `mobile.initialScale > 0`
+            # is false (initialScale is 0) and silently turns BOTH flags off,
+            # which is the polarity revert the gate exists for, spelled so that
+            # `= false` never appears.
+            mobile_branch = None
+            m_else = re.search(r"\belse\s*\{", body)
+            if m_else:
+                # slice from the else's OWN brace: the `}` that closes the
+                # desktop branch sits before it and would make a
+                # header-marker slicer return just the header line (a silently
+                # vacuous arm — measured on the DESKTOP_FALSE fixture).
+                mobile_branch = block_from(body, body.find("{", m_else.start()))
+            policy_local = re.search(r"val\s+([A-Za-z_]\w*)\s*=\s*mobileViewportSettings\s*\(\s*\)",
+                                     body)
+            recv = [re.escape(policy_local.group(1))] if policy_local else []
+            recv.append(r"mobileViewportSettings\s*\(\s*\)")
+            recv_re = "(?:" + "|".join(recv) + ")"
+            if mobile_branch:
+                for field in ("useWideViewPort", "loadWithOverviewMode"):
+                    assigned = [a.strip() for a in re.findall(
+                        r"\.\s*" + field + r"\s*=\s*([^\n]+)", mobile_branch)]
+                    bad = [a for a in assigned
+                           if not re.fullmatch(r"!?\s*\(?\s*" + recv_re
+                                               + r"\s*\.\s*" + field + r"\s*\)?", a)]
+                    results.append((
+                        "W5f mobile branch copies the policy's own %s field" % field,
+                        not bad,
+                        "assigned %r -- the mobile branch must copy the policy field "
+                        "(a derived predicate such as `mobile.initialScale > 0` flips "
+                        "the viewport off because initialScale is 0)"
+                        % (bad[0] if bad else ""), None))
 
     # --- W6: gallery window contract (dv14-B1) ---
     if gallery_code is not None:
@@ -337,6 +437,33 @@ def analyse(holder_code, sheet_code, gallery_code=None, filepreview_code=None,
             results.append(("W6b outer effect must not call findDialogWindow(view)", ok_no_walk,
                             "findDialogWindow(view) on the host view walks a chain "
                             "with no DialogWindowProvider (always null)", None))
+        # [wide-1024 W6] the window local may be correct while the controller is
+        # built from something else: `(null as android.view.Window?)?.let { … }`
+        # keeps every token (the cast, the constructor) and yields a null
+        # controller, so immersive mode silently stops hiding the system bars.
+        win_local = re.search(
+            r"\bval\s+([A-Za-z_]\w*)\s*=\s*[^\n]*as\?\s+android\.app\.Activity[^\n]*",
+            outer)
+        # the prefix must belong to THIS binding: stop the search at any other
+        # declaration, otherwise a correct `val window = …` above satisfies it
+        ctl = re.search(
+            r"\bval\s+([A-Za-z_]\w*)\s*=\s*"
+            r"((?:(?!\n\s*(?:val|var|fun|internal|private|public)\b)[\s\S])*?)"
+            r"WindowInsetsControllerCompat\s*\(", outer)
+        ok_ctl = False
+        ctl_detail = "controller binding not found"
+        if win_local is None:
+            ctl_detail = "the host-activity window is not bound to a local"
+        elif ctl is None:
+            ctl_detail = "no `val <controller> = …WindowInsetsControllerCompat(…)` binding"
+        else:
+            ctl_detail = ("`%s` is built from `%s`, not from the window local `%s`"
+                          % (ctl.group(1), " ".join(ctl.group(2).split())[:70],
+                             win_local.group(1)))
+            ok_ctl = re.search(r"\b" + re.escape(win_local.group(1)) + r"\b",
+                               ctl.group(2)) is not None
+        results.append(("W6e gallery outer effect builds the controller from that window",
+                        ok_ctl, ctl_detail, None))
         inner = slice_balanced_body(gallery_stripped, "DisposableEffect(dialogView)")
         if inner is None:
             results.append(("W6 gallery inner DisposableEffect(dialogView) sliceable", False,
@@ -702,7 +829,7 @@ def selftest():
     for c, ok in dfalse.items():
         if c == "W5a toggleDesktopMode never turns the mobile viewport off":
             expect(not ok, "desktop false fixture: %s must be RED" % c)
-        elif c.startswith("W5") and "W5d" not in c:
+        elif c.startswith("W5") and "W5d" not in c and not c.startswith("W5f"):
             expect(ok, "desktop false fixture: %s must stay OK" % c)
 
     # bad: policy values flipped to false — W5c RED, wiring still OK
@@ -738,14 +865,15 @@ def selftest():
     # ---- dv14-B1: W6 fixtures ----
     dgal = analyse(GOOD_HOLDER, GOOD_SHEET, GALLERY_GOOD)
     w6 = [(c, ok) for c, ok, _, _ in dgal if c.startswith("W6")]
-    expect(len(w6) == 4, "gallery fixture should emit 4 W6 criteria, got %d" % len(w6))
+    expect(len(w6) == 5, "gallery fixture should emit 5 W6 criteria, got %d" % len(w6))
     for c, ok in w6:
         expect(ok, "gallery good fixture must pass %s" % c)
 
     dwalk = dict((c, ok) for c, ok, _, _ in analyse(GOOD_HOLDER, GOOD_SHEET, GALLERY_WALKER_REVERT))
     for c, ok in dwalk.items():
         if c in ("W6a gallery outer effect takes the HOST Activity window",
-                 "W6b outer effect must not call findDialogWindow(view)"):
+                 "W6b outer effect must not call findDialogWindow(view)",
+                 "W6e gallery outer effect builds the controller from that window"):
             expect(not ok, "walker revert fixture: %s must be RED" % c)
         elif c.startswith("W6"):
             expect(ok, "walker revert fixture: %s must stay OK" % c)
@@ -793,6 +921,52 @@ def selftest():
         others = sorted(c for c, ok in d.items() if not c.startswith("W7") and not ok)
         expect(not others, "W7 fixture must not disturb other criteria: %s" % others)
 
+    # ---- wide-1024 witnesses ---------------------------------------------
+    # Each fixture is the auditor's patch verbatim: the gate used to stay green
+    # on it. It must now red EXACTLY the criterion that owns it.
+    W1_ALSO_HOLDER = GOOD_HOLDER.replace(
+        "currentUrl = fromAssetLoaderUrl(url, assetRootDir) ?: url",
+        "currentUrl = url.also { fromAssetLoaderUrl(url, assetRootDir) }")
+    d = dict((c, ok) for c, ok, _, _ in analyse(W1_ALSO_HOLDER, GOOD_SHEET))
+    for c, ok in d.items():
+        if c.startswith("W1"):
+            expect(not ok, "wide-1024 W1 witness: %s must be RED" % c)
+        else:
+            expect(ok, "wide-1024 W1 witness must not disturb %s" % c)
+
+    # equivalent spelling that must stay GREEN: parenthesised elvis
+    paren = GOOD_HOLDER.replace(
+        "currentUrl = fromAssetLoaderUrl(url, assetRootDir) ?: url",
+        "currentUrl = (fromAssetLoaderUrl(url, assetRootDir) ?: url)")
+    d = dict((c, ok) for c, ok, _, _ in analyse(paren, GOOD_SHEET))
+    for c, ok in d.items():
+        if c.startswith("W1"):
+            expect(ok, "parenthesised elvis must stay GREEN on %s" % c)
+
+    DESKTOP_DERIVED_HOLDER = DESKTOP_GOOD_HOLDER.replace(
+        "webView.settings.useWideViewPort = mobile.useWideViewPort",
+        "webView.settings.useWideViewPort = mobile.initialScale > 0").replace(
+        "webView.settings.loadWithOverviewMode = mobile.loadWithOverviewMode",
+        "webView.settings.loadWithOverviewMode = mobile.initialScale > 0")
+    d = dict((c, ok) for c, ok, _, _ in analyse(DESKTOP_DERIVED_HOLDER, GOOD_SHEET))
+    for c, ok in d.items():
+        if c.startswith("W5f"):
+            expect(not ok, "wide-1024 W5 witness: %s must be RED" % c)
+        elif c.startswith("W5"):
+            expect(ok, "wide-1024 W5 witness must not disturb %s" % c)
+
+    GALLERY_NULL_CONTROLLER = GALLERY_GOOD.replace(
+        "val controller = window?.let { WindowInsetsControllerCompat(it, view) }",
+        "val controller = (null as android.view.Window?)?.let { "
+        "WindowInsetsControllerCompat(it, view) }")
+    d = dict((c, ok) for c, ok, _, _ in analyse(GOOD_HOLDER, GOOD_SHEET,
+                                               GALLERY_NULL_CONTROLLER))
+    for c, ok in d.items():
+        if c == "W6e gallery outer effect builds the controller from that window":
+            expect(not ok, "wide-1024 W6 witness: %s must be RED" % c)
+        elif c.startswith("W6"):
+            expect(ok, "wide-1024 W6 witness must not disturb %s" % c)
+
     if failures:
         print("SELFTEST FAIL:")
         for f in failures:
@@ -802,7 +976,8 @@ def selftest():
           "downstream rewrite=RED, desktop viewport false revert=RED, "
           "policy flip=RED, restore delete=RED, gallery walker revert=RED, "
           "gallery flags missing=RED, androidview key removed=RED (4 sites), "
-          "androidview rendererEpoch dropped=RED")
+          "androidview rendererEpoch dropped=RED, mapper discarded via .also=RED, "
+          "viewport derived from initialScale=RED, controller built from null window=RED")
     return 0
 
 
