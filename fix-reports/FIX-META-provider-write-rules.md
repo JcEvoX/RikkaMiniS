@@ -122,8 +122,17 @@ python3 /var/minis/skills/meta-audit-witness/scripts/verify_witness.py <report-A
 `scripts/**` 不在 `build-apk.yml` 的 `paths` 里，push 不触发，必须 dispatch。
 `head_sha` 三方核对（本地 / `branches` API / `run.head_sha`）逐字符一致。
 
-- run：**见回报行**（`fix/meta-audit-m4-anchor-body`）
-- 判据：`conclusion=success` + `Summary: 112 passed, 0 failed` 恰一条 + `ALL 344 CASES PASS` + `skipped` 仅 Publish（main 门控）。
+- run：**40100764322**（job `120892255460`，`event=workflow_dispatch`）→ `conclusion=success`
+- `head_sha = 95a46f5b6656d18843742aaca63bec108d656aa4`，与本地 HEAD **逐字符一致**
+- 判据（判读 1,483,573 B 日志）：
+  - `Summary: 112 passed, 0 failed` 恰 **1** 条（门总数不变）
+  - 门头 `[N/112]` 共 112 条、`1..112` 连续无缺无重
+  - `ALL 344 CASES PASS` 恰 1 条（夹具总数不变）
+  - `PROVIDER_WRITE_RULES_SELFTEST=PASS` 在册（W10 的 4 条新臂在 CI 里真跑）
+  - 26 步中唯一非 success = `Publish to Releases` **skipped**（main 门控，预期）
+  - 游离 `FAILED` 行 **0**（不含 PASSED 子串者），编译错 `e: ` **0**
+- 报告提交 `c1e0c423` 在 CI 之后：`git diff --name-only 95a46f5b HEAD -- . ':(exclude)fix-reports'` → **0 行**
+  ⇒ 源码树与 CI 验过的树逐字节一致，绿结论对当前树成立。
 
 ## 7. 残留登记（不在本支动手）
 
