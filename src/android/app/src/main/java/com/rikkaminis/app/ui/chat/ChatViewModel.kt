@@ -98,6 +98,7 @@ import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
@@ -4195,6 +4196,31 @@ class ChatViewModel(
         // behind the input bar.
         _forceScrollToBottom.tryEmit(Unit)
 
+        // [B-08 deep-audit-1048] Claim _isStreaming SYNCHRONOUSLY, before any
+        // coroutine starts — the same discipline sendMessage / retryFromMessage
+        // / rerunFromToolBlock already follow. This used to be minted INSIDE
+        // the setup coroutine, after systemPromptForSession() had already hit
+        // disk (SoulStore / memory / skill dirs), which opened two windows:
+        //   · every entry guard (`if (_isStreaming.value)` in sendMessage /
+        //     retryFromMessage / rerunFromToolBlock) still read false, so a
+        //     second turn could start while this one was still preparing;
+        //   · cancelStream() only had the previous streamJob to cancel — the
+        //     setup coroutine owned no handle, survived the Stop, and started a
+        //     stream the user had already stopped ("Stop 后诈尸").
+        AppLogger.info(TAG_STREAM, "resume _isStreaming=true (sync, sid=$activeSessionId)")
+        // [T-claim-token-vs-stale-finally] Mint the claim token BEFORE the flag
+        // flips, so a predecessor's finally landing anywhere during this claim
+        // is a no-op instead of a flip that hides the new turn's Stop button.
+        // See streamingClaimToken KDoc.
+        streamingClaimToken = Any()
+        _isStreaming.value = true
+        streamEpoch++
+        // [T-stale-finally-vs-new-claim] Publish the claim so an older job's
+        // finally can't flip _isStreaming off during the setup window.
+        streamingClaimEpoch = streamEpoch
+        val sendEpoch = streamingClaimEpoch
+        val claimToken = streamingClaimToken
+
         // If history ends with assistant (Case 2: text-cancel committed a
         // partial assistant turn), append a continue reminder as a user
         // message. If it ends with user tool_result (Case 1), it's already
@@ -4218,101 +4244,124 @@ class ChatViewModel(
             }
         }
 
-        viewModelScope.launch(Dispatchers.IO) {
-            val baseSystemPrompt = systemPromptForSession()
-            val systemPrompt = baseSystemPrompt
+        // [B-08 deep-audit-1048] Hold the setup shell in sendShellJob so
+        // cancelStream() can kill the whole turn (same rationale + shape as the
+        // send path's shell): during the prompt build below `streamJob` is still
+        // null, so `streamJob?.cancel()` alone reaches nothing and the shell
+        // would go on to start a stream after the user pressed Stop.
+        sendShellJob = viewModelScope.launch(Dispatchers.IO) {
+            var streamLaunched = false
+            try {
+                val baseSystemPrompt = systemPromptForSession()
+                val systemPrompt = baseSystemPrompt
 
-            AppLogger.info(TAG_STREAM, "resume _isStreaming=true (sid=$activeSessionId)")
-            streamingClaimToken = Any()
-            _isStreaming.value = true
-            streamEpoch++
-            // [T-stale-finally-vs-new-claim] Publish the claim so an older
-            // job's finally can't flip _isStreaming off during setup.
-            streamingClaimEpoch = streamEpoch
-            val sendEpoch = streamingClaimEpoch
-            val claimToken = streamingClaimToken
-            streamJob = launch(Dispatchers.IO) {
-                AppLogger.info(TAG_STREAM, "resume streamJob ENTER sid=$activeSessionId")
-                try {
-                    SessionConcurrencyManager.acquireSlot(activeSessionId)
-                    AppLogger.debug(TAG_STREAM, "resume streamJob slot acquired")
+                // [B-08 deep-audit-1048] The claim published above can be
+                // revoked while the prompt build runs: cancelStream() clears
+                // _isStreaming under this same epoch, and a newer turn mints a
+                // fresh claim token. Never start a stream for a stopped turn.
+                if (!isActive ||
+                    !_isStreaming.value ||
+                    sendEpoch != streamingClaimEpoch ||
+                    claimToken !== streamingClaimToken
+                ) {
+                    AppLogger.info(TAG_STREAM, "resume shell aborted before stream (claim revoked; sid=$activeSessionId)")
+                    return@launch
+                }
 
+                streamLaunched = true
+                streamJob = launch(Dispatchers.IO) {
+                    AppLogger.info(TAG_STREAM, "resume streamJob ENTER sid=$activeSessionId")
                     try {
-                        // [audit-0920] Guarded region widened — same fix and
-                        // same rationale as the send path above (and the
-                        // [audit-0917] template in ChatTurnPersistence):
-                        // setActive / strategy / fallback-build must be inside
-                        // the try that owns the releaseSlot finally, or a
-                        // non-CE throw from any of them leaks the concurrency
-                        // slot and escapes the coroutine.
-                        SessionActivityTracker.setActive(activeSessionId, onStop = { cancelStream() })
-                        val activeFallbackStrategy = run {
-                            val groupId = _selectedGroupId.value
-                            groupId?.let {
-                                providerRepository.config.value.modelGroups.find { g -> g.id == it }?.fallbackStrategy
-                            } ?: com.rikkaminis.app.data.model.FallbackStrategy.default
+                        SessionConcurrencyManager.acquireSlot(activeSessionId)
+                        AppLogger.debug(TAG_STREAM, "resume streamJob slot acquired")
+
+                        try {
+                            // [audit-0920] Guarded region widened — same fix and
+                            // same rationale as the send path above (and the
+                            // [audit-0917] template in ChatTurnPersistence):
+                            // setActive / strategy / fallback-build must be inside
+                            // the try that owns the releaseSlot finally, or a
+                            // non-CE throw from any of them leaks the concurrency
+                            // slot and escapes the coroutine.
+                            SessionActivityTracker.setActive(activeSessionId, onStop = { cancelStream() })
+                            val activeFallbackStrategy = run {
+                                val groupId = _selectedGroupId.value
+                                groupId?.let {
+                                    providerRepository.config.value.modelGroups.find { g -> g.id == it }?.fallbackStrategy
+                                } ?: com.rikkaminis.app.data.model.FallbackStrategy.default
+                            }
+                            val fallbackProviders = buildFallbackProviders(provider)
+                            AppLogger.info(TAG_STREAM, "resume runAgentLoop CALL")
+                            runAgentLoop(
+                                provider = provider,
+                                systemPrompt = systemPrompt,
+                                fallbackProviders = fallbackProviders,
+                                fallbackStrategy = activeFallbackStrategy,
+                            )
+                            AppLogger.info(TAG_STREAM, "resume runAgentLoop RETURN normal")
+                            drainQueuedPrompts(provider, systemPrompt, activeFallbackStrategy)
+                            AppLogger.info(TAG_STREAM, "resume drainQueuedPrompts RETURN")
+                        } catch (e: CancellationException) {
+                            AppLogger.info(TAG_STREAM, "resume runAgentLoop CANCELLED")
+                            Log.d(TAG, "Agent loop cancelled (resume)")
+                        } catch (e: Exception) {
+                            AppLogger.error(TAG_STREAM, "resume runAgentLoop EXCEPTION ${e.javaClass.simpleName}: ${e.message}")
+                            Log.e(TAG, "Agent loop error (resume)", e)
+                            reportAgentLoopError(e)
+                            // [fix/da1015-sched-errorprop] Flag the run as failed for
+                            // the same reason the send / retryLast boundaries do: this
+                            // finally unwinds through setInactive, and a resumed run
+                            // that dies must not settle as a clean completion.
+                            SessionActivityTracker.markStreamError(activeSessionId)
+                        } finally {
+                            AppLogger.info(TAG_STREAM, "resume streamJob FINALLY enter")
+                            // [T-claim-token-vs-stale-finally] Only the current turn
+                            // may tear down run-state — see the send path's finally.
+                            if (claimToken === streamingClaimToken) {
+                                // [audit-0907 B2] Reset queue-position state — same
+                                // rationale as the send path's finally: whatever the
+                                // worker reported while queued must not leak into the
+                                // next run's typing indicator.
+                                resetQueueWaitingAhead()
+                                // [fix/zero-chunk-cancel] Same rationale for the network-wait clock.
+                                resetAwaitingResponseSince()
+                                // [T-android-overlay-reply-status-34599] Surface
+                                // the assistant's most recent reply text to the
+                                // overlay BEFORE setInactive so the post-completion
+                                // overlay state (no-running, has-outcome) carries a
+                                // non-null excerpt. Reading _messages here is safe:
+                                // we're in the finally block of the agent loop and
+                                // the stream has already flushed its last delta.
+                                publishOverlayReplyExcerpt(activeSessionId)
+                                SessionActivityTracker.setInactive(activeSessionId)
+                            }
+                            SessionConcurrencyManager.releaseSlot(activeSessionId)
+                            AppLogger.info(TAG_STREAM, "resume streamJob FINALLY exit")
                         }
-                        val fallbackProviders = buildFallbackProviders(provider)
-                        AppLogger.info(TAG_STREAM, "resume runAgentLoop CALL")
-                        runAgentLoop(
-                            provider = provider,
-                            systemPrompt = systemPrompt,
-                            fallbackProviders = fallbackProviders,
-                            fallbackStrategy = activeFallbackStrategy,
-                        )
-                        AppLogger.info(TAG_STREAM, "resume runAgentLoop RETURN normal")
-                        drainQueuedPrompts(provider, systemPrompt, activeFallbackStrategy)
-                        AppLogger.info(TAG_STREAM, "resume drainQueuedPrompts RETURN")
                     } catch (e: CancellationException) {
-                        AppLogger.info(TAG_STREAM, "resume runAgentLoop CANCELLED")
-                        Log.d(TAG, "Agent loop cancelled (resume)")
-                    } catch (e: Exception) {
-                        AppLogger.error(TAG_STREAM, "resume runAgentLoop EXCEPTION ${e.javaClass.simpleName}: ${e.message}")
-                        Log.e(TAG, "Agent loop error (resume)", e)
-                        reportAgentLoopError(e)
-                        // [fix/da1015-sched-errorprop] Flag the run as failed for
-                        // the same reason the send / retryLast boundaries do: this
-                        // finally unwinds through setInactive, and a resumed run
-                        // that dies must not settle as a clean completion.
-                        SessionActivityTracker.markStreamError(activeSessionId)
-                    } finally {
-                        AppLogger.info(TAG_STREAM, "resume streamJob FINALLY enter")
-                        // [T-claim-token-vs-stale-finally] Only the current turn
-                        // may tear down run-state — see the send path's finally.
-                        if (claimToken === streamingClaimToken) {
-                            // [audit-0907 B2] Reset queue-position state — same
-                            // rationale as the send path's finally: whatever the
-                            // worker reported while queued must not leak into the
-                            // next run's typing indicator.
-                            resetQueueWaitingAhead()
-                            // [fix/zero-chunk-cancel] Same rationale for the network-wait clock.
-                            resetAwaitingResponseSince()
-                            // [T-android-overlay-reply-status-34599] Surface
-                            // the assistant's most recent reply text to the
-                            // overlay BEFORE setInactive so the post-completion
-                            // overlay state (no-running, has-outcome) carries a
-                            // non-null excerpt. Reading _messages here is safe:
-                            // we're in the finally block of the agent loop and
-                            // the stream has already flushed its last delta.
-                            publishOverlayReplyExcerpt(activeSessionId)
-                            SessionActivityTracker.setInactive(activeSessionId)
-                        }
-                        SessionConcurrencyManager.releaseSlot(activeSessionId)
-                        AppLogger.info(TAG_STREAM, "resume streamJob FINALLY exit")
+                        AppLogger.info(TAG_STREAM, "resume streamJob CANCELLED waiting for slot")
+                        Log.d(TAG, "Cancelled while waiting for concurrency slot (resume)")
                     }
-                } catch (e: CancellationException) {
-                    AppLogger.info(TAG_STREAM, "resume streamJob CANCELLED waiting for slot")
-                    Log.d(TAG, "Cancelled while waiting for concurrency slot (resume)")
+                    // [T-android-stale-streamjob-clears-isstreaming] guard +
+                    // epoch gate (see runRerunStreamTail).
+                    if (streamJob === coroutineContext[Job] && sendEpoch == streamingClaimEpoch && claimToken === streamingClaimToken) {
+                        AppLogger.info(TAG_STREAM, "resume _isStreaming=false (about to set)")
+                        _isStreaming.value = false
+                    } else {
+                        AppLogger.info(TAG_STREAM, "resume _isStreaming SKIPPED (stale job; sendEpoch=$sendEpoch claimEpoch=$streamingClaimEpoch claimSuperseded=${claimToken !== streamingClaimToken})")
+                    }
+                    AppLogger.info(TAG_STREAM, "resume streamJob EXIT")
                 }
-                // [T-android-stale-streamjob-clears-isstreaming] guard +
-                // epoch gate (see runRerunStreamTail).
-                if (streamJob === coroutineContext[Job] && sendEpoch == streamingClaimEpoch && claimToken === streamingClaimToken) {
-                    AppLogger.info(TAG_STREAM, "resume _isStreaming=false (about to set)")
-                    _isStreaming.value = false
-                } else {
-                    AppLogger.info(TAG_STREAM, "resume _isStreaming SKIPPED (stale job; sendEpoch=$sendEpoch claimEpoch=$streamingClaimEpoch claimSuperseded=${claimToken !== streamingClaimToken})")
+            } finally {
+                if (!streamLaunched) {
+                    // [T-stale-finally-vs-new-claim] Only clear under our own claim.
+                    if (sendEpoch == streamingClaimEpoch && claimToken === streamingClaimToken) {
+                        AppLogger.info(TAG_STREAM, "resume _isStreaming=false (setup aborted)")
+                        _isStreaming.value = false
+                    } else {
+                        AppLogger.info(TAG_STREAM, "resume _isStreaming=false SKIPPED (superseded; sendEpoch=$sendEpoch claimEpoch=$streamingClaimEpoch)")
+                    }
                 }
-                AppLogger.info(TAG_STREAM, "resume streamJob EXIT")
             }
         }
     }

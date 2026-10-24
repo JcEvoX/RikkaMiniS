@@ -386,8 +386,8 @@ class SessionActivityStreamErrorTest {
                 "if (false) {",
             ),
             "cancel-is-not-error" to chatViewModelSource().replace(
-                "catch (e: Exception) {\n                        AppLogger.error(TAG_STREAM, \"resume runAgentLoop EXCEPTION",
-                "catch (e: CancellationException) {\n                        AppLogger.error(TAG_STREAM, \"resume runAgentLoop EXCEPTION",
+                "catch (e: Exception) {\n                            AppLogger.error(TAG_STREAM, \"resume runAgentLoop EXCEPTION",
+                "catch (e: CancellationException) {\n                            AppLogger.error(TAG_STREAM, \"resume runAgentLoop EXCEPTION",
             ),
             "engine funnel" to engineSource().replace(
                 "host.setInlineError(host.string(R.string.error_content_filtered))",
