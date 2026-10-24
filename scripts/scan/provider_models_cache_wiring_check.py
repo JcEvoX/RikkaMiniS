@@ -40,6 +40,91 @@ def strip_comments(src):
     return src
 
 
+# [wide-1024] Presence is not a judgement: a body that keeps the call but makes
+# it unreachable (`if (true) return null` / `if (true) return`) satisfies every
+# substring criterion while the cache chain is exactly as inert as before the
+# fix. Same for a local that shadows a parameter: the identifier is still
+# spelled `context`, the value it forwards is not the caller's.
+DEAD_GUARD_RE = re.compile(r"\b(?:if|while)\s*\(\s*!?\s*(?:true|false)\b")
+READ_CALLS = ("readText(", "readBytes(", "readString(", "decodeFromString", "inputStream(")
+WRITE_CALLS = ("writeText(", "writeBytes(", "outputStream(", "renameTo(")
+
+
+def fn_block(text, header):
+    """Balanced `{ … }` body of the first declaration starting with [header].
+
+    Returns the body text (braces excluded) or None — None is fail-closed at
+    every call site: a function we cannot locate is a function we cannot
+    vouch for.
+    """
+    i = text.find(header)
+    if i < 0:
+        return None
+    j = text.find("(", i)
+    if j < 0:
+        return None
+    depth = 0
+    k = j
+    while k < len(text):
+        if text[k] == "(":
+            depth += 1
+        elif text[k] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        k += 1
+    brace = text.find("{", k)
+    if brace < 0:
+        return None
+    d = 0
+    end = brace
+    while end < len(text):
+        c = text[end]
+        if c == "{":
+            d += 1
+        elif c == "}":
+            d -= 1
+            if d == 0:
+                return text[brace + 1:end]
+        end += 1
+    return None
+
+
+def decl_slice(text, header, limit=400):
+    """The declaration starting at [header], up to the next `fun`/blank line.
+
+    Works for both `= expression` and `{ … }` bodies (the cache-dir helper is
+    expression-bodied in production)."""
+    i = text.find(header)
+    if i < 0:
+        return None
+    seg = text[i:i + limit]
+    m = re.search(r"\n[ \t]*(?:private |internal |public )?fun\s", seg[1:])
+    if m:
+        seg = seg[:m.start() + 1]
+    return seg
+
+
+def dead_body_reason(body, anchor):
+    """Why the body's [anchor] call cannot run, or None when it can.
+
+    `anchor` is the call that must be REACHED (e.g. `keyFile(`), so a legitimate
+    `if (!file.isFile) return null` *after* it stays green.
+    """
+    if body is None:
+        return "function body not found (fail-closed)"
+    if DEAD_GUARD_RE.search(body):
+        return ("a constant-condition guard (`if (true)` / `if (false)`) makes "
+                "the rest of the body dead")
+    m = re.search(re.escape(anchor), body)
+    if m is None:
+        return "`%s` is absent" % anchor
+    if re.search(r"\b(?:return|throw)\b", body[:m.start()]):
+        return ("an unconditional return/throw short-circuits the body before "
+                "`%s`" % anchor)
+    return None
+
+
 def call_args(text, anchor, start=0):
     """Argument list of the FIRST call matching `anchor` at/after `start`.
 
@@ -133,6 +218,22 @@ def analyse(repo, registry, adapters, cache):
         REGISTRY_REL,
         clean.count("\n", 0, clean.find("context:")) + 1 if "context:" in clean else 0,
     ))
+    # [wide-1024] The forwarder must hand over the PARAMETER, not a same-named
+    # local. `val context: Context? = null` as the first statement keeps every
+    # `context` spelling in place and forwards null to all five fetchers, which
+    # every *ModelsApi turns into "no cache" (they all short-circuit on
+    # `context != null`) — deep-audit-1020 ISSUE-01 verbatim.
+    reg_fn = fn_block(clean, "suspend fun fetchModels(")
+    shadow = re.search(r"\b(?:val|var)\s+context\b", reg_fn or "")
+    res.append((
+        "Registry fetchModels forwards the caller's `context` parameter "
+        "(nothing shadows it)",
+        shadow is None and reg_fn is not None,
+        "shadowing declaration `%s`" % shadow.group(0).strip() if shadow else
+        ("body not found (fail-closed)" if reg_fn is None else "no shadowing local"),
+        REGISTRY_REL,
+        0,
+    ))
     fwd = 0
     fwd_sites = 0
     pos = 0
@@ -183,20 +284,60 @@ def analyse(repo, registry, adapters, cache):
     ))
 
     # ── 4. the disk-cache classes must keep their surface ──
+    cache_code = strip_comments(cache)
     for needle, crit in (
         ("fun load(", "ProviderModelsCache.load reachable"),
         ("fun save(", "ProviderModelsCache.save reachable"),
         ("fun invalidate(", "ProviderModelsCache.invalidate reachable"),
         ("fun cacheDir(context", "cache dir is context-scoped (cacheDir(context...))"),
     ):
-        i = strip_comments(cache).find(needle)
+        i = cache_code.find(needle)
         res.append((
             crit,
             i >= 0,
             needle,
             CACHE_REL,
-            strip_comments(cache).count("\n", 0, i) + 1 if i >= 0 else 0,
+            cache_code.count("\n", 0, i) + 1 if i >= 0 else 0,
         ))
+
+    # ── 4b. …and the three cache operations must actually DO their job ──
+    # [wide-1024] The docstring's point is that load / save / invalidate were
+    # "100% inert"; a body whose first line is `if (true) return` keeps all
+    # three names, all three call sites and the whole wiring green while the
+    # chain is inert again — 7-day cache never read, 401/403 never swept.
+    for fn, crit, calls, verb in (
+        ("fun load(", "ProviderModelsCache.load actually reads the cached file",
+         READ_CALLS, "read"),
+        ("fun save(", "ProviderModelsCache.save actually writes the cache file",
+         WRITE_CALLS, "write"),
+        ("fun invalidate(", "ProviderModelsCache.invalidate actually deletes the cache file",
+         (".delete(",), "delete"),
+    ):
+        body = fn_block(cache_code, fn)
+        reason = dead_body_reason(body, "keyFile(")
+        if reason is None and not any(tok in body for tok in calls):
+            reason = "the body never %ss anything (`%s` absent)" % (
+                verb, "` / `".join(calls))
+        if reason is None and "keyFile(context," not in body:
+            reason = ("the cache file is not keyed under the caller's context "
+                      "(`keyFile(context, …)` absent)")
+        res.append((
+            crit,
+            reason is None,
+            reason or "%s path reached" % verb,
+            CACHE_REL,
+            0,
+        ))
+
+    cachedir = decl_slice(cache_code, "fun cacheDir(")
+    res.append((
+        "cache dir is built from `context.cacheDir`",
+        cachedir is not None and "context.cacheDir" in cachedir,
+        "declaration `%s`" % ("not found (fail-closed)" if cachedir is None else
+                              cachedir.strip()[:70]),
+        CACHE_REL,
+        0,
+    ))
 
     return res
 
@@ -247,11 +388,21 @@ COMPLIANT_CACHE = '''package probe
 class ProviderModelsCache(private val namespace: String) {
     private fun cacheDir(context: android.content.Context) = java.io.File(context.cacheDir, "models-cache/$namespace")
 
-    fun load(context: android.content.Context, key: String): List<Any>? = null
+    private fun keyFile(context: android.content.Context, key: String) = java.io.File(cacheDir(context), "$key.json")
 
-    fun save(context: android.content.Context, key: String, models: List<Any>) {}
+    fun load(context: android.content.Context, key: String): List<Any>? {
+        val file = keyFile(context, key)
+        if (!file.isFile) return null
+        return runCatching { file.readText() }.getOrNull()
+    }
 
-    fun invalidate(context: android.content.Context, key: String) {}
+    fun save(context: android.content.Context, key: String, models: List<Any>) {
+        keyFile(context, key).writeText(models.toString())
+    }
+
+    fun invalidate(context: android.content.Context, key: String) {
+        runCatching { keyFile(context, key).delete() }
+    }
 }
 '''
 
@@ -274,7 +425,7 @@ _breaker(1, "repo", [("forceRefresh, context)", "forceRefresh)")],
 _breaker(2, "adapters", [("context = context)", "context = null)")],
          "every caching adapter passes `context = context` to its ModelsApi")
 # B3: the cache loses its invalidate surface (defeats the 401/403 path)
-_breaker(3, "cache", [("fun invalidate(context: android.content.Context, key: String) {}", "")],
+_breaker(3, "cache", [("    fun invalidate(context: android.content.Context, key: String) {\n        runCatching { keyFile(context, key).delete() }\n    }\n", "")],
          "ProviderModelsCache.invalidate reachable")
 # B4: the cache dir stops being context-scoped
 _breaker(4, "cache", [('private fun cacheDir(context: android.content.Context) = java.io.File(context.cacheDir, "models-cache/$namespace")',
@@ -283,6 +434,25 @@ _breaker(4, "cache", [('private fun cacheDir(context: android.content.Context) =
 # B5: the Registry loses its context parameter (whole chain collapses)
 _breaker(5, "registry", [("        context: android.content.Context? = null,\n", "")],
          "Registry fetchModels keeps a `context: Context?` parameter")
+
+# ── wide-1024 witnesses: the exact knives that used to walk through ──────────
+# W1 (dataflow): a same-named local shadows the forwarding parameter — every
+# `context` spelling survives, the value forwarded does not.
+_breaker(6, "registry", [(
+    "    ): List<Any> {\n",
+    "    ): List<Any> {\n        val context: android.content.Context? = null\n")],
+         "Registry fetchModels forwards the caller's `context` parameter "
+         "(nothing shadows it)")
+# W2 (dataflow): load keeps its name and its call site, and always misses.
+_breaker(7, "cache", [(
+    "    fun load(context: android.content.Context, key: String): List<Any>? {\n",
+    "    fun load(context: android.content.Context, key: String): List<Any>? {\n        if (true) return null\n")],
+         "ProviderModelsCache.load actually reads the cached file")
+# W3 (dataflow): invalidate keeps its name and deletes nothing.
+_breaker(8, "cache", [(
+    "    fun invalidate(context: android.content.Context, key: String) {\n",
+    "    fun invalidate(context: android.content.Context, key: String) {\n        if (true) return\n")],
+         "ProviderModelsCache.invalidate actually deletes the cache file")
 
 
 def selftest():
