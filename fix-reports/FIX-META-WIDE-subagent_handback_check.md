@@ -65,8 +65,15 @@
 
 
 ## 6. CI
-（分支 CI 见本目录 `FIX-META-WIDE-INDEX.md` 的 run 表；`head_sha` 与 `git rev-parse HEAD`
-逐字符一致才认绿。）
+- run **40134937808**（#2634，attempt 1）`conclusion=success`，job `120994351104`
+- `head_sha = 64582201877c1849ca878a1a6e712c4e3d5549d5` —— 与绿时的本地 `git rev-parse HEAD` 逐字符一致
+- 判读（1,484,201 B job 日志逐条核过）：
+  - `Summary: 112 passed, 0 failed` **恰一条**；其余 7 条 `Summary:` 是子套件（28/5/14/36/10/22/10 passed）
+  - `ALL 344 CASES PASS` 恰一条（= 本支六门的新增臂全部在 CI 里被 `test_scan.py` 断言）
+  - 编译错误 ` e: ` = 0
+  - 26 步里唯一 `skipped` = `Publish to Releases`（main 门控）
+  - 本门在 CI 里的门头：`[31/112] Sub-agent turn hand-back guard`
+
 
 ## 7. 残留
 - **R1** 「空/字面量」判据把 `text.ifEmpty { "…" }` 之类表达式当作非空（它确实带了 turn 文本，
