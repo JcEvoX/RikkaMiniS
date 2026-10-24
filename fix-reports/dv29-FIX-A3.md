@@ -7,7 +7,7 @@
 | 基线 main | `b82aa8dc`（worktree `git rev-parse --short HEAD` 逐字符一致） |
 | 分支 | `fix/dv29-a3-offload-page-size` |
 | worktree | `/var/minis/shared/work/deep-audit-1049/a3` |
-| 提交序列 | 见 §5 末尾（生产 → 测试 → 门 → 报告） |
+| 提交序列 | `db7c1dff` 生产 → `0ee8dc6d` 测试 → `39886a34` 门 → `7a7a40a3` 报告（**CI 绿于此**）→ 报告回填（仅 `fix-reports/`） |
 | 门/夹具计数 | **111 门 / 342 夹具不变**（0 新建门，只扩 `offload_cli_args_check.py`；`scan.sh` / `test_scan.py` 零触碰） |
 | 改动面 | 生产 6（1 新建 `OffloadPageSize.kt`）· 测试 2（新建）· 门 1 · 报告 1 |
 
@@ -79,9 +79,13 @@
   - **m3** market 解析回到"缺分隔符返回 receiver"（`return null` → `return url`）→ **1 failing**（`market://search?q=foo` 期望 null 实得整串）。
 - 切片一致性：`marketPackageOf` 由脚本从真文件按花括号匹配切出（382 B，脚本内断言与源逐字节同源），PASS 是对**出厂代码**的陈述。
 
-### L4 分支 CI
+### L4 分支 CI —— **run `40069595695` / job `120799966638` success（attempt 1）**
 
-见回报（`gh_ci_wait.sh --expect <sha>`，判据：`Summary: 111 passed, 0 failed` 恰一条且其余 Summary 行 failed 全 0、`ALL 342 CASES PASS`、门头 1..111 唯一、唯一 skipped = `Publish to Releases`（main 门控，只能从 steps API 判）、` e: ` 0、警告逐条核对、游离 FAILED 判行尾、新测试类逐条 PASSED）。
+- 身份三方逐字符一致：本地 HEAD = `ls-remote` = `run.head_sha` = **`7a7a40a3ffbf9aa9a3788fd913678de14e007688`**。
+- 26 步全部 success，**唯一 skipped = `Publish to Releases`**（main 门控；从 steps API 判，日志里查不到 —— skipped 步骤没有任何输出行）。
+- 日志 1,463,221 B 判读（`probe/l3/judge_ci.py`，14 项全 OK）：`Summary: 111 passed, 0 failed` 恰一条且其余 7 条步骤级 Summary 全 `0 failed` · `ALL 342 CASES PASS` 恰一条 · 门头 `[1/111]..[111/111]` 共 111 且唯一有序 · ` e: ` 0 · 游离 `FAILED` 0 · `OffloadPageSizeTest` / `MarketUrlFallbackTest` 无失败行且逐条在册。
+- **警告对比**：本支触碰过的 9 个文件里只有 **1 类**警告 —— `PhotosOffloadHandler.kt:1241 getLatLong(FloatArray) is deprecated`（×3）。判定为**既有**：`git diff b82aa8dc..HEAD -- PhotosOffloadHandler.kt | grep -c getLatLong` = **0**，而 `git show b82aa8dc:…PhotosOffloadHandler.kt | grep -c getLatLong` = **1**（基线即有，只是行号被本支前移 9 行）。
+- **报告回填后的源码树等价**：本报告与 §1 的提交序列之后的 `docs(offload)` 提交只动 `fix-reports/*.md`（不在 `build-apk.yml` 的 paths 内），`git diff --name-only 7a7a40a3 HEAD -- . ':(exclude)fix-reports'` 若输出为空即证明 CI 结论对当前代码树成立。
 
 ## 6 残留（每条带触发条件 + 触发后方案）
 
