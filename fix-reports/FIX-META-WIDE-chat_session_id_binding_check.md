@@ -42,7 +42,17 @@
 
 ## 5. CI run
 
-dispatch 后回填（CI run id / conclusion / head_sha 与本地 HEAD 逐字符比对）。
+- run `40134913784`（job `120994279978`）/ `fix/meta-wide-05-chat-session` / attempt 1 / **conclusion=success**
+- `head_sha = 4677e42804b837920633457ba659b0eea0b30b5b` 与本地 `git rev-parse HEAD` 逐字符一致（本地 / API run / job 所属提交三方）
+- 26 步：唯一 skipped = `Publish to Releases`（main 门控），其余 25 步 success，`not_ok = []`
+- 日志判读（job log 1,484,366 B）：
+  - `Summary: 112 passed, 0 failed`（带框线前缀）**恰 1 条**；另有 7 条子套件 Summary（28/5/14/36/10/22/10 passed）不是总账
+  - `ALL 344 CASES PASS` 恰 1 处（夹具全过）
+  - 门头 `━━━ [N/112]` 112 行、112 个互异显示名（门数未变）
+  - ` e: ` 0 处（无编译诊断）
+  - 含 `FAILED` 的 6 行逐条确认全是 **PASSED 用例名子串**（如 `slot denied produces FAILED without calling provider PASSED`），不是失败
+  - 本门 marker `CHAT_SESSION_ID_BINDING_SELFTEST=PASS` 在日志中恰 1 次 ⇒ 本门 `--selftest`（含本次新增的抗见证臂）在 CI 里真的被执行
+- 说明：本地全量 `scan.sh` 受沙箱 S28（壳内 ENOSYS）限制未能一次跑完（分段 36 门全绿 + 崩溃门逐门直跑复核 rc=0）；`scan.sh` 与 `test_scan.py` 的全量证据以上述 CI 读数为准（CI 本就执行这两条命令）。
 
 ## 6. 残留（三件）
 
