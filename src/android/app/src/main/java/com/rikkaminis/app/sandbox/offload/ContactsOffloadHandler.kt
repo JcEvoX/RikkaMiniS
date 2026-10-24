@@ -491,8 +491,13 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
          * than a clamp — [OffloadArgs.getBool] documents the same
          * refuse-instead-of-guess posture, and a clamped page would report
          * success for a request the handler silently did not honour.
+         *
+         * [dv29-A3 A-05] Read from the registry rather than repeated: the
+         * bound is declared in ONE place ([OffloadPageSize.CONTACTS]) now that
+         * four sibling handlers share the contract, so this name cannot drift
+         * away from the number the resolver actually refuses above.
          */
-        internal const val MAX_PAGE_SIZE = 500
+        internal val MAX_PAGE_SIZE: Int = requireNotNull(OffloadPageSize.CONTACTS.max)
 
         /**
          * [da1019-J] The parsed shape of one `android-contacts` invocation
@@ -583,9 +588,11 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
         }
 
         /**
-         * [dv28-A6 A-06] The ONE page-size resolver — `list` takes the default
-         * 50, `search` passes its documented 20. Three outcomes, one per
-         * spelling:
+         * [dv28-A6 A-06] The contacts page-size entry point — `list` takes the
+         * default 50, `search` passes its documented 20. Three outcomes, one
+         * per spelling (the parse itself lives in [PageSizeOutcome.resolve]
+         * since [dv29-A3 A-05] — this function owns only the spelling rules
+         * below, which are contacts-specific):
          *
          *  - `--max N` / `--max=N`: the named value [OffloadArgs] consumed,
          *    read as the RAW string. `getInt("max")` is what collapsed
@@ -604,34 +611,17 @@ class ContactsOffloadHandler(private val context: Context) : NativeOffloadHandle
          * empty page a zero produced was indistinguishable from "no contacts".
          * Pure — no Context, no I/O — so every arm stays testable off-device.
          */
-        internal fun resolvePageSize(parsedArgs: OffloadArgs, default: Int = DEFAULT_LIST_MAX): PageSize {
-            parsedArgs.get("max")?.let { raw -> return pageSizeOf(raw, "--max") }
-            if (parsedArgs.hasFlag("max")) {
-                // `--max` with no follower: OffloadArgs files the key as a
-                // boolean flag, so "spelled" is still visible here.
-                return PageSize.Invalid("--max expects an integer between 1 and $MAX_PAGE_SIZE")
+        internal fun resolvePageSize(parsedArgs: OffloadArgs, default: Int = DEFAULT_LIST_MAX): PageSize =
+            // [dv29-A3 A-05] The parse + range check moved to the shared
+            // [PageSizeOutcome.resolve] so the four sibling paginating handlers
+            // answer the same contract instead of each clamping its own way.
+            // The `PageSize` face stays: it is this handler's public outcome
+            // type, and the alias rewrite above (`-n` → `--max`) is still the
+            // only thing that decides what "spelled" means here.
+            when (val outcome = PageSizeOutcome.resolve(parsedArgs, OffloadPageSize.CONTACTS, default)) {
+                is PageSizeOutcome.Ok -> PageSize.Ok(outcome.value)
+                is PageSizeOutcome.Invalid -> PageSize.Invalid(outcome.message)
             }
-            if (parsedArgs.hasFlag("n")) {
-                return PageSize.Invalid(
-                    "-n expects an integer between 1 and $MAX_PAGE_SIZE (short form of --max)",
-                )
-            }
-            return PageSize.Ok(default)
-        }
-
-        /** Parse + range-check one spelled page size. Pure. */
-        private fun pageSizeOf(raw: String, spelled: String): PageSize {
-            val value = raw.toIntOrNull()
-                ?: return PageSize.Invalid(
-                    "$spelled expects an integer between 1 and $MAX_PAGE_SIZE, got '$raw'",
-                )
-            if (value < 1 || value > MAX_PAGE_SIZE) {
-                return PageSize.Invalid(
-                    "$spelled expects an integer between 1 and $MAX_PAGE_SIZE, got $value",
-                )
-            }
-            return PageSize.Ok(value)
-        }
 
         /**
          * [dv28-A6 A-06] Usage-error result (exit 2, the code the other
