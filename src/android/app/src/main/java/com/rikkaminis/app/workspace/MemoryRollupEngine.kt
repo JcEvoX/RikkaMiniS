@@ -83,19 +83,35 @@ object MemoryRollupEngine {
 
     /**
      * Whether [fileName] is a log the rollup would actually select right now: a
-     * past, non-empty daily log that no existing rollup section covers yet.
+     * past, non-empty daily log that no existing rollup section covers yet *and
+     * that still holds at least one entry worth distilling*.
+     *
      * A candidate for both sides — the executor's picker and the prompt-side
      * size hint — so the hint can only ever name a file the executor would not
-     * answer with SKIPPED_ALREADY.
+     * answer with SKIPPED_ALREADY / NOTHING_TO_DISTILL.
+     *
+     * [readContent] supplies the file's text; it is only invoked once the two
+     * cheap dimensions (date shape + already-distilled) pass, so callers pay
+     * the read for plausible logs only. `null` means "unreadable" and is *not*
+     * a candidate — the executor cannot distill a file it cannot read.
+     *
+     * [dv28-A3] The content dimension lives HERE, not at the call site. It used
+     * to live inside the executor's picker only, while this predicate promised
+     * to be the shared口径: a log made entirely of in-flight notes (>= 50 KB)
+     * was then named by the system prompt every turn and every memory_rollup
+     * call answered NOTHING_TO_DISTILL. (deep-audit-1048 A-03)
      */
     fun isRollupCandidate(
         fileName: String,
         byteSize: Long,
         todayStr: String,
         rollupContent: String,
+        readContent: () -> String?,
     ): Boolean {
         if (!isPastDailyLog(fileName, byteSize, todayStr)) return false
-        return !hasRollupForDate(rollupContent, fileName.removeSuffix(".md"))
+        if (hasRollupForDate(rollupContent, fileName.removeSuffix(".md"))) return false
+        val text = readContent() ?: return false
+        return distillableEntries(extractEntries(text)).isNotEmpty()
     }
 
     private val TIMESTAMP_MARKER = Regex("""<!-- (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) -->\s*\n?""")
@@ -227,6 +243,19 @@ object MemoryRollupEngine {
         return RollupClass.TRANSIENT
     }
 
+    /**
+     * The entries a rollup would actually render: everything that is not
+     * [RollupClass.TRANSIENT].
+     *
+     * The single place that answers "is there anything worth distilling", used
+     * by BOTH the candidacy predicate ([isRollupCandidate], i.e. "does this log
+     * qualify at all") and the document builder ([buildRollupText], i.e. "what
+     * goes into the section") — so the "distillable"口径 cannot fork into a
+     * second, drifting copy. [dv28-A3] (deep-audit-1048 A-03)
+     */
+    fun distillableEntries(entries: List<Entry>): List<Entry> =
+        entries.filter { classify(it) != RollupClass.TRANSIENT }
+
     // ── Dedup ────────────────────────────────────────────────────────────
 
     /**
@@ -296,8 +325,7 @@ object MemoryRollupEngine {
         entries: List<Entry>,
         generatedAt: String = "auto",
     ): String {
-        val distilled = dedupeEntries(entries)
-            .filter { classify(it) != RollupClass.TRANSIENT }
+        val distilled = distillableEntries(dedupeEntries(entries))
 
         if (distilled.isEmpty()) return ""
 

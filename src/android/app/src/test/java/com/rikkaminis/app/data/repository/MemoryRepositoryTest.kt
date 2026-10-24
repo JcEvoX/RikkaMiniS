@@ -431,6 +431,41 @@ class MemoryRepositoryTest {
         assertEquals("no pending log → 0L", 0L, repo.largestDailyLogBytes())
     }
 
+    // ── [dv28-A3] the content dimension belongs to the shared口径 ────────────
+    // The hint used to stop at "date shape + not yet distilled" while the
+    // executor additionally required a non-transient entry, so a big log of
+    // in-flight notes was named as the pending one every turn and every
+    // memory_rollup answered NOTHING_TO_DISTILL. (deep-audit-1048 A-03)
+
+    @Test
+    fun dailyLogSizes_excludesPureTransientLog() {
+        memoryDir.mkdirs()
+        // 60 KB of 待办 notes — every entry is strong-unfinished ⇒ TRANSIENT, so
+        // the executor answers NOTHING_TO_DISTILL for this file.
+        val transient = "<!-- 2026-10-12 09:00:00 -->\n待办：" + "还差联调\n".repeat(12_000)
+        File(memoryDir, "2026-10-12.md").writeText(transient)
+        File(memoryDir, "2026-10-13.md").writeText("## 稳定规则\n必须使用分支\n")
+
+        val repo = MemoryRepository(memoryDir)
+        val summary = repo.dailyLogSizeSummary()
+
+        assertTrue("fixture must stay above the 50 KB hint threshold", transient.length > 50_000)
+        assertNotNull(summary)
+        assertTrue(
+            "the hint must name a log the executor would actually roll up",
+            summary!!.contains("2026-10-13.md"),
+        )
+        assertFalse(
+            "a log with nothing distillable is not a candidate",
+            summary.contains("2026-10-12.md"),
+        )
+        assertEquals(
+            "largest PENDING log is the small distillable one, not the 60 KB transient one",
+            File(memoryDir, "2026-10-13.md").length(),
+            repo.largestDailyLogBytes(),
+        )
+    }
+
     @Test
     fun dailyLogSizes_isReadOnly() {
         memoryDir.mkdirs()

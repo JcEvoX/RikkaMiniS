@@ -143,8 +143,15 @@ class MemoryRepository(private val memoryDir: File) {
         // dropped three file-name literals, so an ALREADY-DISTILLED log stayed
         // the "largest daily log" forever: every turn the system prompt
         // re-suggested memory_rollup for it and the agent got SKIPPED_ALREADY
-        // back. Reading MEMORY-ROLLUP.md here is the price of judging candidacy
-        // the same way the executor does; the statistics stay read-only.
+        // back.
+        // [dv28-A3] That predicate now also owns the content dimension ("does
+        // the log still hold anything distillable"), which used to live only in
+        // the executor — so a 60 KB log made entirely of in-flight notes was
+        // named as the pending one and every memory_rollup answered
+        // NOTHING_TO_DISTILL. The read below is the price of judging exactly
+        // what the executor would do; it happens only for logs that already
+        // passed the cheap dimensions (date shape / not yet distilled), and the
+        // statistics stay read-only.
         val todayStr = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
         val rollupContent = File(memoryDir, ROLLUP_FILE)
             .takeIf { it.isFile }
@@ -158,7 +165,7 @@ class MemoryRepository(private val memoryDir: File) {
                     it.length(),
                     todayStr,
                     rollupContent,
-                )
+                ) { runCatching { it.readText() }.getOrNull() }
             }
             ?.map { it.name to it.length() }
             ?.sortedByDescending { it.second }
