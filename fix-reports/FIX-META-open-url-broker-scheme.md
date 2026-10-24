@@ -99,7 +99,7 @@ python3 /var/minis/skills/meta-audit-witness/scripts/verify_witness.py \
 ```
 
 → `open_url_broker_scheme_check.py`：`gate rc=1 → ❌ 门抓住了（见证无效）  restore=True`，
-即 **GATE_CAUGHT_WITNESS**（其余门的输出行不属本支，忽略）。
+即 **GATE_CAUGHT_WITNESS**（**在最终树 HEAD 上重跑**，非中间树：两门均 `rc=1 → 门抓住了`+`restore=True` ⇒ `GATE_CAUGHT_WITNESS`，`sha256` 还原校验通过。）（其余门的输出行不属本支，忽略）。
 
 **L3 全量回归（冻结面未动）**
 
