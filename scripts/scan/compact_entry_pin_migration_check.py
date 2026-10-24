@@ -75,6 +75,7 @@ Usage: python3 scripts/scan/compact_entry_pin_migration_check.py [ROOT]
 Exit:  0 = green, 1 = violation(s) (file:line printed) / selftest failure.
 """
 import os
+import re
 import sys
 
 REPO_REL = "src/android/app/src/main/java/com/rikkaminis/app/data/repository/ProviderRepository.kt"
@@ -199,6 +200,84 @@ def line_of(src, idx):
     return src.count("\n", 0, idx) + 1
 
 
+# ── wide-1024: shared shape predicates for the body-level arms ────────────
+# A body that is one of these is a DECISION that was replaced by a constant.
+CONST_BODY_RE = re.compile(
+    r"^(?:null|true|false|0|-1|\"\"|''|"
+    r"(?:empty(?:List|Set|Map|Sequence)|listOf|setOf|mapOf|arrayOf)"
+    r"\s*(?:<[^()]*>)?\s*\(\s*\))$")
+# A condition that can never be true — the branch is dead code.
+DEAD_COND_RE = re.compile(r"(?<![\w.])false\b|!\s*true\b|\b0\s*!=\s*0\b|\b1\s*==\s*0\b|"
+                          r"\btrue\s*==\s*false\b")
+EMPTY_OR_CONST_COLL_RE = re.compile(
+    r"^(?:empty(?:List|Set|Sequence|Array)\s*(?:<[^()]*>)?\s*\(\s*\)|"
+    r"(?:listOf|setOf|arrayListOf|mutableListOf|sequenceOf)"
+    r"\s*(?:<[^()]*>)?\s*\(\s*\))$")
+# Any collection DERIVATION — the set is computed from something.
+DERIVE_CALL_RE = re.compile(
+    r"\.\s*(?:map|mapNotNull|filter|filterNot|asSequence|asIterable|drop|take|"
+    r"sortedBy|sortedByDescending|sortedWith|toList|toSet|distinct|plus|minus)\b")
+
+
+def _stmt_end(text, start):
+    """Index of the newline ending the statement at `start` (bracket depth
+    aware, so a lambda inside the expression does not cut it short)."""
+    depth = 0
+    i, n = start, len(text)
+    while i < n:
+        c = text[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "\n" and depth <= 0:
+            # A chained call (`val x = list\n  .filter { … }\n  .map { … }`)
+            # continues on the next line — a naive newline cut would read the
+            # derivation as the bare receiver and lose every `.map`/`.filter`.
+            j = i + 1
+            while j < n and text[j] in " \t":
+                j += 1
+            if text[j:j + 1] == "." or text[start:i].rstrip().endswith(
+                    ("?:", "=", "&&", "||", ",", "+", "(")):
+                i += 1
+                continue
+            return i
+        i += 1
+    return n
+
+
+def decl_body(src, header):
+    """(body_text, parameter_names) for the declaration at `header`.
+
+    Handles both shapes this file uses: an expression body (`… = if (x) a else
+    b`, possibly starting on the next line) and a block body (`…) { … }`).
+    Returns (None, params) when neither can be read — callers fail closed."""
+    i = src.find(header)
+    if i < 0:
+        return None, []
+    op = src.find("(", i)
+    if op < 0:
+        return None, []
+    cp = _balanced(src, op, "(", ")")
+    if cp < 0:
+        return None, []
+    inner = src[op + 1:cp - 1]
+    params = re.findall(r"([A-Za-z_]\w*)\s*:", inner)
+    k = cp
+    while k < len(src):
+        c = src[k]
+        if c == "{":
+            end = _balanced(src, k, "{", "}")
+            return (src[k:end] if end > k else None), params
+        if c == "=" and src[k + 1:k + 2] != "=":
+            start = k + 1
+            while start < len(src) and src[start] in " \t\r\n":
+                start += 1
+            return src[start:_stmt_end(src, start)], params
+        k += 1
+    return None, params
+
+
 def check_body(src, rel, header, arm, anchors, what):
     body = function_text(src, header)
     if body is None:
@@ -290,6 +369,121 @@ def check_inside_else_of(src, rel, header, arm, guard, needles, what):
             for n in needles if n not in block]
 
 
+def check_helper_bodies(src, rel):
+    """arm 4 (dataflow): the decision helpers must still DECIDE.
+
+    The pre-fix criterion only proved the three `internal fun decide…(`
+    declarations exist. Gutting the body — `= null` on
+    decideCompactPinMigration, `= false` on the two cleanups — keeps every
+    declaration, keeps all nine call sites, and silently disables all nine
+    cascades: the pin and the three per-device references dangle forever.
+
+    Criterion: each helper's BODY must be a real expression (not a constant)
+    and must read every parameter it declares (a body that ignores
+    `removedEntryIds` cannot be deciding on it). Unparseable body fail-closes."""
+    out = []
+    for header in HELPER_ARM + (DECIDE_STALE_ARM,):
+        body, params = decl_body(src, header)
+        name = header.split("fun ", 1)[-1].rstrip("(")
+        if body is None:
+            out.append((rel, 0, "4", "helper `%s` has no body this gate can read "
+                                   "(fail-closed: re-point arm 4)" % name))
+            continue
+        flat = re.sub(r"\s+", " ", body).strip()
+        if CONST_BODY_RE.match(flat):
+            out.append((rel, line_of(src, src.find(header)), "4",
+                        "helper `%s` returns a CONSTANT (`%s`) — the decision is gone "
+                        "while every call site still calls it" % (name, flat)))
+            continue
+        missing = [p for p in params if not re.search(r"(?<![.\w])%s(?![\w])" % re.escape(p), body)]
+        if missing:
+            out.append((rel, line_of(src, src.find(header)), "4",
+                        "helper `%s` never reads %s — a parameter it declares cannot "
+                        "influence the decision (fail-closed)"
+                        % (name, ", ".join("`%s`" % p for p in missing))))
+    return out
+
+
+def check_clear_applier(src, rel):
+    """arm 7 (dataflow, second half): the applier's branches must be LIVE.
+
+    The pre-fix criterion matched six substrings in the body — the three
+    `decideStaleRefCleanup(<ref>` calls and the three `= null` writes. Wrapping
+    each condition in `false && …` (`if (false && decideStaleRefCleanup(
+    lastUsedEntryId, …))`) keeps every substring, and turns the single
+    convergence point that arms 2 / 3 / 5 / 6 funnel through into a no-op:
+    after a provider delete, `lastUsedEntryId` and both voice overrides keep
+    pointing at entry ids that no longer exist.
+
+    Criterion: every `if` condition in the body that mentions a cleanup
+    predicate must not be a dead constant, and each reference must actually be
+    assigned `null` somewhere in the body."""
+    out = []
+    body = function_text(src, CLEAR_HEADER)
+    if body is None:
+        return [(rel, 0, "7", CLEAR_HEADER + " not found — gate ROT")]
+    code = code_only(body)
+    base = src.find(CLEAR_HEADER)
+    for m in re.finditer(r"\bif\s*\(", code):
+        op = m.end() - 1
+        close = _balanced(code, op, "(", ")")
+        if close < 0:
+            out.append((rel, line_of(src, base), "7",
+                        "clearStaleSecondaryRefs: an `if (` condition does not balance "
+                        "(fail-closed)"))
+            continue
+        cond = code[op:close]
+        if DEAD_COND_RE.search(cond):
+            out.append((rel, line_of(src, base + m.start()), "7",
+                        "clearStaleSecondaryRefs gates a cleanup on a DEAD condition "
+                        "(`%s`) — the branch can never run, so the reference survives "
+                        "the delete it was meant to heal"
+                        % re.sub(r"\s+", " ", cond)[:90]))
+    for ref in ("lastUsedEntryId", "voiceInputOverrideEntryId", "voiceOutputOverrideEntryId"):
+        if not re.search(r"(?<![.\w])%s\s*=\s*null\b" % re.escape(ref), code):
+            out.append((rel, line_of(src, base), "7",
+                        "clearStaleSecondaryRefs never clears `%s` — the reference "
+                        "outlives the entries it points at" % ref))
+    return out
+
+
+def check_stale_entry_ids(src, rel):
+    """arm 6 (dataflow): the stale-entry-id set must be DERIVED from the tree.
+
+    The pre-fix criterion matched the `val staleEntryIds` declaration and the
+    three consumers. Assigning `emptyList<String>()` keeps all four anchors and
+    makes the whole cascade a no-op: the seeds are dissolved from
+    `config.modelEntries`, but the pin / group members / agent-loop pins are
+    told that nothing was removed.
+
+    Criterion: the declaration is read as an EXPRESSION — it must compute the
+    set (a collection-derivation call) and must not be a constant."""
+    out = []
+    body = function_text(src, "fun ensureVoiceTemplateModels(")
+    if body is None:
+        return [(rel, 0, "6", "fun ensureVoiceTemplateModels( not found — gate ROT")]
+    code = code_only(body)
+    base = src.find("fun ensureVoiceTemplateModels(")
+    m = re.search(r"\bval\s+staleEntryIds\s*=\s*", code)
+    if m is None:
+        return out  # the anchor loop already reports the missing declaration
+    end = _stmt_end(code, m.end())
+    expr = code[m.end():end]
+    flat = re.sub(r"\s+", " ", expr).strip()
+    if EMPTY_OR_CONST_COLL_RE.match(flat):
+        out.append((rel, line_of(src, base + m.start()), "6",
+                    "`val staleEntryIds` is a CONSTANT (`%s`) — the cascade is told "
+                    "that nothing was removed while the seed entries are still "
+                    "dissolved, so pin / group members / agent-loop pins / per-device "
+                    "refs all dangle" % flat[:70]))
+    elif not DERIVE_CALL_RE.search(flat):
+        out.append((rel, line_of(src, base + m.start()), "6",
+                    "`val staleEntryIds` no longer derives the set from the entry list "
+                    "(`%s`) — fail-closed: re-point this arm at the new derivation"
+                    % flat[:70]))
+    return out
+
+
 def run_checks(root, rel=REPO_REL):
     path = os.path.join(root, rel)
     if not os.path.isfile(path):
@@ -309,13 +503,22 @@ def run_checks(root, rel=REPO_REL):
     for a in HELPER_ARM:
         if a not in body_all:
             out.append((rel, 0, "4", "helper missing: `%s`" % a))
+    # arm 4 (dataflow): the helpers must still DECIDE — a gutted body keeps
+    # every declaration and call site while disabling all nine cascades.
+    out += check_helper_bodies(src, rel)
     # ── [da1024-C] ──
     out += check_inside_else_of(src, rel, "fun replaceEntries(", "5",
                                 REPLACE_SHRINK_GUARD, REPLACE_ARM, "replaceEntries prune branch")
     for needle in VOICE_ARM:
         out += check_inside(src, rel, "fun ensureVoiceTemplateModels(", "6", VOICE_GUARD,
                             needle, "ensureVoiceTemplateModels stale-seed branch")
+    # arm 6 (dataflow): the set must be DERIVED — `emptyList<String>()` keeps
+    # every anchor above and turns the cascade into a no-op.
+    out += check_stale_entry_ids(src, rel)
     out += check_body(src, rel, CLEAR_HEADER, "7", CLEAR_ARM, "clearStaleSecondaryRefs")
+    # arm 7 (dataflow): the applier's branches must be LIVE (`false && …` keeps
+    # all six anchors and disables the single convergence point).
+    out += check_clear_applier(src, rel)
     if DECIDE_STALE_ARM not in body_all:
         out.append((rel, 0, "7", "helper missing: `%s`" % DECIDE_STALE_ARM))
     for needle in VOICE_RENAME_ARM:
@@ -451,11 +654,14 @@ PR_OK = """class ProviderRepository(private val context: Context) {
     }
 }
 
-internal fun decideCompactPinMigration(pinEntryId: String, oldKey: String, newKey: String): String? = TODO()
+internal fun decideCompactPinMigration(pinEntryId: String, oldKey: String, newKey: String): String? =
+    if (pinEntryId.isNotEmpty() && pinEntryId == oldKey && oldKey != newKey) newKey else null
 
-internal fun decideCompactPinCleanup(pinEntryId: String, removedEntryIds: Collection<String>): Boolean = TODO()
+internal fun decideCompactPinCleanup(pinEntryId: String, removedEntryIds: Collection<String>): Boolean =
+    pinEntryId.isNotEmpty() && removedEntryIds.contains(pinEntryId)
 
-internal fun decideStaleRefCleanup(ref: String?, removedEntryIds: Collection<String>): Boolean = TODO()
+internal fun decideStaleRefCleanup(ref: String?, removedEntryIds: Collection<String>): Boolean =
+    ref != null && removedEntryIds.contains(ref)
 """
 
 UI_OK = """package com.rikkaminis.app.ui.settings
@@ -603,6 +809,35 @@ _APPLIER_BODY = """        if (decideStaleRefCleanup(lastUsedEntryId, removedEnt
 """
 PR_BAD_EMPTY_APPLIER = PR_OK.replace(_APPLIER_BODY, "")
 
+# ── wide-1024 witnesses (each mechanically reproduced on the real tree:
+# pre-fix rc=0, post-fix rc=1) ────────────────────────────────────────────
+
+_MIGRATION_BODY = """internal fun decideCompactPinMigration(pinEntryId: String, oldKey: String, newKey: String): String? =
+    if (pinEntryId.isNotEmpty() && pinEntryId == oldKey && oldKey != newKey) newKey else null"""
+
+# W1 (dataflow): the helper is still declared and still called — its body is
+# now a constant, so all nine cascades are no-ops.
+PR_W_BAD_HELPER_CONST = PR_OK.replace(
+    _MIGRATION_BODY,
+    """internal fun decideCompactPinMigration(pinEntryId: String, oldKey: String, newKey: String): String? =
+    null""")
+
+# W2 (dataflow): every anchor and every `= null` write stays put; each branch
+# is simply dead.
+PR_W_BAD_DEAD_GUARD = PR_OK.replace(
+    "if (decideStaleRefCleanup(",
+    "if (false && decideStaleRefCleanup(")
+
+# W3 (dataflow): the declaration survives, the three consumers survive, the
+# set is a constant — the cascade is told nothing was removed.
+_STALE_IDS_DECL = """            val staleEntryIds = instanceEntries
+                .filter { it.baseModel.isVoiceTemplateSeedShape }
+                .filter { it.baseModel.id !in templateById }
+                .map { it.id }
+"""
+PR_W_BAD_EMPTY_STALE_IDS = PR_OK.replace(
+    _STALE_IDS_DECL, "            val staleEntryIds = emptyList<String>()\n")
+
 # Regression shape I: inline lambda listener — no strong holder (exactly the
 # hazard prefs_listener_holder_guard exists for) and nothing unregisters it.
 _LISTENER_DECL = """        val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
@@ -737,6 +972,21 @@ def selftest():
         write(PR_BAD_VOICE_RENAME_OUTSIDE)
         ok &= _report("voice-rename-outside", "arm 9", run_all(tmp), ("9",),
                       contains="must sit INSIDE")
+
+        # 18) [wide-1024 W1] helper gutted to a constant → arm 4 fires.
+        write(PR_W_BAD_HELPER_CONST)
+        ok &= _report("helper-constant-body", "arm 4", run_all(tmp), ("4",),
+                      contains="returns a CONSTANT")
+
+        # 19) [wide-1024 W2] applier branches dead-guarded → arm 7 fires.
+        write(PR_W_BAD_DEAD_GUARD)
+        ok &= _report("applier-dead-guard", "arm 7", run_all(tmp), ("7",),
+                      contains="DEAD condition")
+
+        # 20) [wide-1024 W3] stale id set replaced by a constant → arm 6.
+        write(PR_W_BAD_EMPTY_STALE_IDS)
+        ok &= _report("stale-ids-constant", "arm 6", run_all(tmp), ("6",),
+                      contains="is a CONSTANT")
 
         # 17) ROT control (LAST: it wipes the fixture tree): both files missing
         # must be reported, never silently green (one finding per file, so a
