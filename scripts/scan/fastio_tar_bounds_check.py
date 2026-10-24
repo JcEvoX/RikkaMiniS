@@ -202,6 +202,47 @@ def check_archive_open_guard(src):
 # extend these checks onto it. The refill token matches `writeZeros(` or an
 # inlined `sink.write(`; a refactor that renames the helper is a deliberate
 # edit to this gate, not a silent pass.
+def _close_paren(text, open_idx):
+    depth = 0
+    for j in range(open_idx, len(text)):
+        if text[j] == "(":
+            depth += 1
+        elif text[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return j
+    return -1
+
+
+def _close_brace(text, open_idx):
+    depth = 0
+    for j in range(open_idx, len(text)):
+        if text[j] == "{":
+            depth += 1
+        elif text[j] == "}":
+            depth -= 1
+            if depth == 0:
+                return j
+    return -1
+
+
+def _enclosing_guard_cond(text, idx):
+    """Condition of the innermost `if (…)` whose condition CONTAINS idx.
+
+    None when the guard token does not sit inside an if/when condition (a
+    subject-less `when { … }` branch, for instance) — the caller then judges
+    only the position, not the liveness.
+    """
+    best = None
+    for m in re.finditer(r"\b(?:if|while)\s*\(", text[:idx]):
+        p = text.find("(", m.start())
+        q = _close_paren(text, p)
+        if q < 0 or q < idx:
+            continue
+        best = text[p + 1:q]
+    return best
+
+
 def tar_fun_body(src, name):
     start = src.find("fun %s(" % name)
     if start < 0:
@@ -243,8 +284,26 @@ def check_write_regular(src):
     has_refill = "writeZeros(" in catch_seg or "sink.write(" in catch_seg
     if not has_refill:
         v.append("the copy-failure catch must zero-fill the short payload back to the declared size")
-    elif "runCatching" not in catch_seg:
-        v.append("the copy-failure refill must be guarded so a failing sink cannot mask the read error")
+    else:
+        # [wide-1024] HOW MUCH matters, not just that a fill exists. The header
+        # already declared `size`, so the stream owes `size - written` bytes plus
+        # the 512-byte boundary; a constant fill (`writeZeros(sink, 0L)`) restores
+        # neither and every later member is swallowed as this entry's payload.
+        if not re.search(r"\bsize\s*-\s*written\b", catch_seg):
+            v.append(
+                "the copy-failure refill must restore the UNDELIVERED payload "
+                "(`writeZeros(sink, size - written)`) - a constant fill (e.g. "
+                "`writeZeros(sink, 0L)`) leaves the stream short of the size the header "
+                "already declared, so every later member is read as payload"
+            )
+        if "boundaryPad(" not in catch_seg:
+            v.append(
+                "the copy-failure refill must also restore the 512-byte boundary "
+                "(`writeZeros(sink, boundaryPad(size).toLong())`) - without it the next "
+                "member's header starts mid-block and the archive is unreadable"
+            )
+        if "runCatching" not in catch_seg:
+            v.append("the copy-failure refill must be guarded so a failing sink cannot mask the read error")
     return v
 
 
@@ -416,6 +475,23 @@ def check_toplevel_roots(src):
                 "and the remaining roots must NOT be archived"
             )
             break
+        # [wide-1024] Consuming the boolean is not obeying it: `if (!writeTree(…))
+        # Unit` keeps the `!` and the parens while dropping the only thing the
+        # caller could do about it, so the remaining roots are still archived.
+        seg_start = body.rfind("\n", 0, m.start()) + 1
+        seg_end = body.find("\n", m.start())
+        seg = body[seg_start: seg_end if seg_end > 0 else len(body)]
+        if seg.rstrip().endswith("{"):
+            cb = _close_brace(body, body.find("{", m.start()))
+            if cb > 0:
+                seg = body[seg_start: cb]
+        if not re.search(r"\b(break|return)\b", seg):
+            v.append(
+                "tarCreate consumes writeTree's return value but does not STOP on it — "
+                "`if (!writeTree(…)) Unit` keeps the check and archives the remaining roots "
+                "after the budget is gone"
+            )
+            break
 
     # (c) a top-level non-directory is only read when it IS a regular file.
     regular_at = body.find(TOPLEVEL_REGULAR_GATE)
@@ -512,6 +588,8 @@ SPECIAL_OPEN_CALLS = {
 #   "in-argument" - the TYPE handed to `consider(`, because find never opens
 #                   anything: its whole defect is the label it passes on.
 SPECIAL_GUARD_POSITION = {"grepTree": "before", "findTree": "in-argument", "copyTree": "before"}
+# [wide-1024] A literal in front of the decision makes the guard dead code.
+SPECIAL_DEAD_GUARD_RE = re.compile(r"\bfalse\s*&&|\btrue\s*\|\|")
 
 
 def kotlin_top_member(src, name):
@@ -574,8 +652,9 @@ def check_special_file_guards(search_src, copy_src):
         anywhere = min((block.find(t) for t in SPECIAL_GUARD_TOKENS if block.find(t) >= 0),
                        default=-1)
         scope = block[:open_at] if mode == "before" else block[open_at:]
-        guard_at = min((scope.find(t) for t in SPECIAL_GUARD_TOKENS if scope.find(t) >= 0),
-                       default=-1)
+        tok_idx = min((scope.find(t) for t in SPECIAL_GUARD_TOKENS if scope.find(t) >= 0),
+                      default=-1)
+        guard_at = tok_idx
         if guard_at < 0 and mode == "before" and anywhere >= 0:
             v.append("%s: %s: the regular-file test sits AFTER the call that touches the entry - "
                      "it cannot prevent the open" % (fname, engine))
@@ -588,6 +667,17 @@ def check_special_file_guards(search_src, copy_src):
                 "open(2) forever and kills an offload worker thread"
             )
             v.append("%s: %s: %s %s" % (fname, engine, why, tail))
+        else:
+            # [wide-1024] Position and spelling are not the decision: a guard
+            # condition with a literal in front (`if (false && !attrs.isRegularFile)`)
+            # sits in exactly the right place and never decides anything.
+            cond = _enclosing_guard_cond(scope, tok_idx)
+            if cond is not None and SPECIAL_DEAD_GUARD_RE.search(cond):
+                v.append(
+                    "%s: %s: the regular-file guard is short-circuited (%r) — the condition "
+                    "keeps the token and decides nothing, so a writer-less FIFO still reaches "
+                    "open(2) and blocks an offload worker thread" % (fname, engine, cond.strip()[:60])
+                )
     return v
 
 
@@ -767,6 +857,15 @@ internal fun writeRegular(sink: OutputStream, name: String, file: Path, out: Tar
 # half-fix: open-before-header restored, but the copy-failure catch swallows
 # without refilling the declared payload — the archive after this member is
 # still garbage to a real reader.
+# [wide-1024] refill present, amount constant: the header declared `size`, the
+# catch writes a fixed 0 bytes, and every later member is read as payload.
+BAD_REGULAR_CONST_REFILL = GOOD_REGULAR.replace(
+    "                writeZeros(sink, size - written)\n"
+    "                writeZeros(sink, boundaryPad(size).toLong())\n",
+    "                writeZeros(sink, 0L)\n",
+)
+assert BAD_REGULAR_CONST_REFILL != GOOD_REGULAR
+
 BAD_REGULAR_NO_REFILL = GOOD_REGULAR.replace(
     """            runCatching {
                 writeZeros(sink, size - written)
@@ -898,6 +997,12 @@ private fun writeTree(sink: OutputStream, dir: Path): Boolean = true
 
 # pre-fix shape (§1042-A-02): no gate at all — roots are written past the budget.
 BAD_TOPLEVEL_NO_GATE = GOOD_TOPLEVEL.replace(GATE_BLOCK, "")
+
+# [wide-1024] the return value is consumed with the right polarity and then
+# thrown away: `if (!writeTree(…)) Unit` keeps the check, drops the stop.
+BAD_TOPLEVEL_UNIT_BRANCH = GOOD_TOPLEVEL.replace(
+    "if (!writeTree(sink, path, name, path, maxEntries, out)) break",
+    "if (!writeTree(sink, path, name, path, maxEntries, out)) Unit")
 
 # half-fix: the gate exists but reports nothing.
 BAD_TOPLEVEL_NO_TRUNCATED = GOOD_TOPLEVEL.replace(
@@ -1074,6 +1179,13 @@ BAD_SEARCH_FIND_LABEL = GOOD_SEARCH_FIX.replace(
 )
 # (c) cp: the guard is gone — Files.copy opens the pipe.
 BAD_COPY_NO_GUARD = GOOD_COPY_FIX.replace(COPY_GUARD, "")
+
+# [wide-1024] the guard keeps its position and its tokens, and is dead: every
+# FIFO falls through to Files.copy, which blocks in open(2) forever.
+BAD_COPY_DEAD_GUARD = GOOD_COPY_FIX.replace(
+    "if (!attrs.isRegularFile && !attrs.isSymbolicLink) {",
+    "if (false && !attrs.isRegularFile && !attrs.isSymbolicLink) {")
+assert BAD_COPY_DEAD_GUARD != GOOD_COPY_FIX
 # (d) the guard exists but AFTER the open: it cannot prevent anything.
 BAD_SEARCH_GUARD_AFTER_OPEN = GOOD_SEARCH_FIX.replace(
     GREP_GUARD + "                    grepFile(",
@@ -1195,6 +1307,12 @@ def selftest():
         bad_regular_silent,
         "must still record out.errors",
     )
+    bad_regular_const = check_write_regular(BAD_REGULAR_CONST_REFILL)
+    expect_trip(
+        "constant-refill fixture (wide-1024)",
+        bad_regular_const,
+        "UNDELIVERED payload",
+    )
     bad_regular_missing = check_write_regular("object FastioTar { }")
     expect_trip(
         "missing-writeRegular fixture (dv14-A2)",
@@ -1238,6 +1356,8 @@ def selftest():
     bad_top_unchecked = check_toplevel_roots(BAD_TOPLEVEL_UNCHECKED_SPECIAL)
     expect_trip("unchecked-special fixture (dv22-A2)", bad_top_unchecked,
                 "without checking Files.isRegularFile")
+    bad_top_unit = check_toplevel_roots(BAD_TOPLEVEL_UNIT_BRANCH)
+    expect_trip("unit-branch fixture (wide-1024)", bad_top_unit, "does not STOP on it")
     bad_top_missing = check_toplevel_roots("object FastioTar { }")
     expect_trip("missing-tarCreate fixture (dv22-A2)", bad_top_missing, "required function missing")
 
@@ -1264,6 +1384,8 @@ def selftest():
     expect_only("copy guard removed (dv23-A6)", bad_cp, "copyTree copies every non-link entry")
     bad_late = check_special_file_guards(BAD_SEARCH_GUARD_AFTER_OPEN, GOOD_COPY_FIX)
     expect_only("guard-after-open (dv23-A6)", bad_late, "sits AFTER the call")
+    bad_cp_dead = check_special_file_guards(GOOD_SEARCH_FIX, BAD_COPY_DEAD_GUARD)
+    expect_only("short-circuited copy guard (wide-1024)", bad_cp_dead, "short-circuited")
     bad_prose = check_special_file_guards(BAD_SEARCH_COMMENT_ONLY, GOOD_COPY_FIX)
     expect_only("comment-only guard (dv23-A6)", bad_prose, "grepTree opens every non-link entry")
     bad_renamed = check_special_file_guards(BAD_SEARCH_RENAMED, GOOD_COPY_FIX)

@@ -104,6 +104,12 @@ SHARE_FILES = (PROVIDER_REL, MCP_REL, LOG_SCREEN)
 
 CHOOSER_CALL = re.compile(r"Intent\s*\.\s*createChooser\s*\(")
 START_CALL = re.compile(r"\bstartActivity\s*\(")
+# [wide-1024] What a `runCatching { startActivity(...) }` result has to be
+# consumed by for the function to hand back a verdict. `.let { true }` / a bare
+# statement are not on the list: both keep the call and throw the failure away.
+VERDICT_CONSUME_RE = re.compile(
+    r"\s*(?:\?:\s*|\.\s*(?:isSuccess|isFailure|fold|getOrElse|getOrNull|exceptionOrNull|"
+    r"onSuccess|onFailure)\b)")
 FEEDBACK_TOKENS = ("Toast.makeText(", "snackbarHostState", "SnackbarHost(", "AppLogger.")
 
 # Covers cacheDir/share (plural writers) and cacheDir/shared, for ANY receiver
@@ -160,6 +166,41 @@ def strip_comments(src):
             out.append(src[i])
             i += 1
     return "".join(out)
+
+
+def split_call_args(text, open_idx):
+    """Top-level comma-separated arguments of the call whose `(` is at open_idx.
+
+    None when the parentheses are unbalanced — callers report that as a
+    fail-closed violation instead of guessing what was passed.
+    """
+    depth, j = 0, open_idx
+    while j < len(text):
+        c = text[j]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    else:
+        return None
+    inner = text[open_idx + 1: j]
+    parts, depth, cur = [], 0, ""
+    for ch in inner:
+        if ch in "([{<":
+            depth += 1
+        elif ch in ")]}>":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        parts.append(cur)
+    return [p.strip() for p in parts]
 
 
 def check_arm1(root):
@@ -240,6 +281,22 @@ def check_arm2(root):
     # mkdirs must ride the same IO block: it appears on the share-dir line.
     if "mkdirs()" not in fn[dir_idx:prune_idx]:
         return "share-dir mkdirs() must stay inside the IO block (with pruneShareDir)"
+    # [wide-1024] …and the pruned directory must BE the one just built.
+    # `pruneShareDir(File(context.cacheDir, "noop"))` keeps the call, keeps the
+    # ordering and reclaims nothing, so cacheDir/share grows for the life of the
+    # install (dataflow, not spelling: the argument is the subject here).
+    m_dir = re.search(r"\bval\s+(\w+)\s*=\s*File\(context\.cacheDir,\s*\"share\"\)", fn)
+    args = split_call_args(fn, prune_idx + len("pruneShareDir"))
+    if args is None:
+        return "stagedShareUri: cannot read the pruneShareDir(...) arguments (fail-closed)"
+    arg = args[0] if args else ""
+    if m_dir is None:
+        return ("stagedShareUri lost the `val <name> = File(context.cacheDir, \"share\")` "
+                "binding — the prune target can no longer be identified (fail-closed)")
+    dir_var = m_dir.group(1)
+    if arg != dir_var and 'File(context.cacheDir, "share")' not in arg:
+        return ("stagedShareUri prunes %r instead of the share dir it just built (%r) — the "
+                "cacheDir/share copies are then never reclaimed" % (arg, dir_var))
     return None
 
 
@@ -419,6 +476,28 @@ PRUNE_WRITE_POINTS = (
 PRUNER_CALL = "pruneShareDir("
 # the second hand-rolled copy of the 24h loop; must not come back
 PRUNE_LOOP_ANCHORS = ("listFiles()", "lastModified() < cutoff")
+# [wide-1024] A named constant is the only acceptable TTL override: the shared
+# default is what makes the sweep bounded, and `maxAgeMs = Long.MAX_VALUE` turns
+# it into a no-op (`cutoff = now - maxAgeMs` never postdates any file).
+PRUNE_TTL_CONST_RE = re.compile(r"[A-Z][A-Z0-9_]*$")
+
+
+def prune_ttl_problem(fn, where):
+    """None when every pruneShareDir call inside `fn` keeps a bounded TTL."""
+    for m in re.finditer(r"\bpruneShareDir\s*\(", fn):
+        args = split_call_args(fn, m.end() - 1)
+        if args is None:
+            return "%s: cannot read the pruneShareDir(...) arguments (fail-closed)" % where
+        for a in args[1:]:
+            val = a.split("=", 1)[1].strip() if "=" in a else a
+            if not PRUNE_TTL_CONST_RE.fullmatch(val):
+                return (
+                    "%s: the prune call overrides the TTL with %r — an unbounded TTL makes the "
+                    "sweep a no-op (`cutoff = now - maxAgeMs` never postdates a file); pass the "
+                    "named constant or drop the argument" % (where, val)
+                )
+    return None
+
 
 def check_arm5(root):
     """[da1028-C] filesDir/externalFilesDir staging dirs must be pruned too."""
@@ -439,6 +518,10 @@ def check_arm5(root):
                 f"{rel}: the {label} write point does not call the shared "
                 f"`{PRUNER_CALL}` pruner — that dir lives outside cacheDir, so nothing "
                 "else can reclaim it and it grows for the life of the install")
+            continue
+        ttl = prune_ttl_problem(fn, f"{rel} ({label})")
+        if ttl:
+            problems.append(ttl)
     code = _read_stripped(root, MUTATION_REL)
     if code is None:
         problems.append(f"{MUTATION_REL}: file missing (was it renamed/moved?)")
@@ -459,6 +542,11 @@ def check_arm5(root):
                         f"{MUTATION_REL}: pruneStaleAttachments still carries a hand-rolled "
                         f"24h loop (`{anchor}`) alongside the shared pruner — two TTL copies "
                         "drift apart silently")
+            # [wide-1024] delegating is not enough: the delegation must keep the
+            # shared TTL (`maxAgeMs = Long.MAX_VALUE` is a call that prunes nothing).
+            ttl = prune_ttl_problem(fn, MUTATION_REL)
+            if ttl:
+                problems.append(ttl)
     definer = _read_stripped(root, DEFINER_REL)
     if definer is None:
         problems.append(f"{DEFINER_REL}: file missing (was it renamed/moved?)")
@@ -493,6 +581,14 @@ class WebAppActivity {
 """
 
 VIOLATION_NO_PRUNE = COMPLIANT.replace("                pruneShareDir(shareDir)\n", "")
+
+# [wide-1024] The call survives, the ordering survives, the TARGET is wrong:
+# `pruneShareDir(File(context.cacheDir, "noop"))` reclaims nothing while reading
+# exactly like the compliant shape.
+VIOLATION_WRONG_PRUNE_DIR = COMPLIANT.replace(
+    "pruneShareDir(shareDir)",
+    'pruneShareDir(File(context.cacheDir, "noop"))')
+assert VIOLATION_WRONG_PRUNE_DIR != COMPLIANT
 
 VIOLATION_MAIN_THREAD = """package com.rikkaminis.app.webapp
 
@@ -682,6 +778,25 @@ def check_handoff_src(rel, text):
                 problems.append("[C-SILENT] %s: startActivity in %s() is not wrapped in "
                                 "runCatching/try — a missing handler crashes the caller"
                                 % (rel, name))
+        # [wide-1024] …and the verdict the caller receives must be DERIVED from
+        # the launch. `return runCatching { context.startActivity(chooser) }
+        # .let { true }` catches the failure and then reports success anyway.
+        for rc in re.finditer(r"\brunCatching\s*\{", body):
+            ob = rc.end() - 1
+            end = _brace_end(body, ob)
+            if end is None:
+                problems.append("[C-SILENT] %s: unparsable runCatching block in %s() — "
+                                "fail-closed" % (rel, name))
+                continue
+            if not START_CALL.search(body[ob:end]):
+                continue
+            tail = body[end + 1: end + 80]
+            if not VERDICT_CONSUME_RE.match(tail):
+                problems.append(
+                    "[C-SILENT] %s: %s() does not derive its verdict from the launch "
+                    "(`runCatching { startActivity(...) }%s`) — the failure it just caught is "
+                    "discarded, so a missing share target still reports success"
+                    % (rel, name, tail.split("\n")[0][:40]))
         for c in re.finditer(r"\b%s\s*\(" % re.escape(name), code):
             if re.search(r"fun\s+$", code[max(0, c.start() - 6): c.start()]):
                 continue  # the declaration itself
@@ -1152,6 +1267,16 @@ class ChatMutationMethods {
 """
 
 # the PRE-FIX shape: hand-rolled copy of the very same 24h loop
+# [wide-1024] delegation kept, TTL made unbounded: `maxAgeMs = Long.MAX_VALUE`
+# means `cutoff = now - maxAgeMs` never postdates a file, so the sweep is a no-op.
+MUTATION_TTL_UNBOUNDED = MUTATION_OK.replace(
+    "pruneShareDir(dir)",
+    "pruneShareDir(dir, maxAgeMs = Long.MAX_VALUE)")
+
+CAMERA_TTL_UNBOUNDED = CAMERA_OK.replace(
+    "pruneShareDir(dir)",
+    "pruneShareDir(dir, maxAgeMs = Long.MAX_VALUE)")
+
 MUTATION_SELF_LOOP = """package com.rikkaminis.app.debug
 
 class ChatMutationMethods {
@@ -1244,6 +1369,8 @@ def selftest():
         print(f"  [{'PASS' if v else 'FAIL'}] arm1 exemption falls back when marker gone: {v}")
     ok &= run_fixture("compliant", COMPLIANT, expect_ok=True)
     ok &= run_fixture("violation-no-prune", VIOLATION_NO_PRUNE, expect_ok=False)
+    # [wide-1024] dataflow: the pruner must get the share dir, not just any dir.
+    ok &= run_fixture("violation-wrong-prune-dir", VIOLATION_WRONG_PRUNE_DIR, expect_ok=False)
     ok &= run_fixture("violation-main-thread", VIOLATION_MAIN_THREAD, expect_ok=False)
     # arm1 tooth for the "shared" pattern (the N+1 this batch closed): a
     # `cacheDir/shared` producer with no pruner must be caught, while the
@@ -1360,6 +1487,17 @@ def selftest():
         expect_ok=False,
     )
     # fail-closed: a renamed write point must RED, not silently retire the arm
+    # [wide-1024] the TTL override that keeps the call and kills the sweep.
+    ok5 &= run_arm5_fixture(
+        "arm5-unbounded-ttl-at-mutation",
+        {MUTATION_REL: MUTATION_TTL_UNBOUNDED},
+        expect_ok=False,
+    )
+    ok5 &= run_arm5_fixture(
+        "arm5-unbounded-ttl-at-writer",
+        {CAMERA_REL: CAMERA_TTL_UNBOUNDED},
+        expect_ok=False,
+    )
     ok5 &= run_arm5_fixture(
         "arm5-failclosed-camera-anchor-missing",
         {CAMERA_REL: "package com.rikkaminis.app.ui.chat\n\nfun unrelated() {}\n"},
@@ -1423,6 +1561,14 @@ def selftest():
         "            Toast.makeText(context, \"Share failed\", Toast.LENGTH_SHORT).show()\n"
         "        }\n",
         "        shareThing(context, file)\n")
+    # V6 [wide-1024]: the verdict is replaced by a constant — `runCatching` still
+    # catches, `.let { true }` still returns a Boolean, and success is reported
+    # for a share that threw ActivityNotFoundException.
+    bad_handoff_fake_ok = good_handoff.replace(
+        "    return runCatching { context.startActivity(chooser) }.isSuccess",
+        "    return runCatching { context.startActivity(chooser) }.let { true }")
+    assert bad_handoff_fake_ok != good_handoff
+
     # V5: verdict consumed but nothing is shown.
     bad_handoff_silent = good_handoff.replace(
         "            Toast.makeText(context, \"Share failed\", Toast.LENGTH_SHORT).show()\n",
@@ -1433,6 +1579,7 @@ def selftest():
         ("b04-unit-return + bare exits", bad_handoff_unit),
         ("b04-chooser without NEW_TASK", bad_handoff_flag),
         ("b04-startActivity not contained", bad_handoff_crash),
+        ("b04-verdict replaced by a constant", bad_handoff_fake_ok),
         ("b04-verdict discarded at the call site", bad_handoff_ignored),
         ("b04-failure never shown", bad_handoff_silent),
     ):
