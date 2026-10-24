@@ -977,6 +977,65 @@ def _brace_block(text: str, marker: str):
     return None
 
 
+def _paren_close(text: str, open_idx: int, opener: str = "(", closer: str = ")"):
+    """Index of the [closer] matching text[open_idx], or -1 (fail-closed)."""
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == opener:
+            depth += 1
+        elif text[i] == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def _dead_condition(cond: str) -> bool:
+    """Is this `if` condition constant-folded false (`false`, `!true`, `X && false`)?"""
+    c = cond.strip()
+    if re.match(r"^false\b", c) or re.match(r"^!\s*true\b", c):
+        return True
+    return any(part.strip() == "false" for part in c.split("&&"))
+
+
+def _if_site(text: str, cond_re: str):
+    """(condition, body) of the first `if (<cond matching cond_re>) …`, or None.
+
+    [wide-1024] The rules used to ask "does the body mention X?" — a substring in
+    a condition or a branch. This answers the question the rule actually means:
+    where is the DECISION, and does the branch it guards terminate?
+    """
+    for m in re.finditer(r"\bif\s*\(", text):
+        close = _paren_close(text, m.end() - 1)
+        if close < 0:
+            continue
+        cond = text[m.end():close]
+        if not re.search(cond_re, cond):
+            continue
+        j = close + 1
+        while j < len(text) and text[j] in " \t\n":
+            j += 1
+        if j < len(text) and text[j] == "{":
+            end = _paren_close(text, j, "{", "}")
+            body = text[j:end + 1] if end > 0 else text[j:]
+        else:
+            end, depth = j, 0
+            while end < len(text):
+                c = text[end]
+                if c in "([{":
+                    depth += 1
+                elif c in ")]}":
+                    if depth == 0:
+                        break
+                    depth -= 1
+                elif c == "\n" and depth == 0:
+                    break
+                end += 1
+            body = text[j:end]
+        return cond, body
+    return None
+
+
 def check_fastio_search(fastio_search_src: str) -> list:
     findings = []
     src = code_only(fastio_search_src)
@@ -998,6 +1057,31 @@ def check_fastio_search(fastio_search_src: str) -> list:
         findings.append(
             ("S1", "missing",
              "the non-positive-budget branch must answer out.matchesCapped = true"))
+    else:
+        # [wide-1024 S1] …and the guard must actually STOP the walk. The old rule
+        # read two substrings out of the head (`limit <= 0`, `matchesCapped =
+        # true`), both of which survive `if (limit <= 0 && false) { … }` — a
+        # condition folded to false by the compiler, with the `return` deleted.
+        # The budget is then spent walking and reading the whole tree.
+        site = _if_site(head, r"limit\s*<=\s*0")
+        if site is None:
+            findings.append(
+                ("S1", "missing",
+                 "the non-positive-budget check is not an `if (…)` guard the gate can "
+                 "read (fail-closed) — a guard it cannot see is not a guard"))
+        else:
+            cond, guard_body = site
+            if _dead_condition(cond):
+                findings.append(
+                    ("S1", "dead",
+                     "the non-positive-budget guard is constant-folded false (`%s`) — the "
+                     "walk runs anyway and reads every file under the root" % cond.strip()))
+            elif not re.search(r"\b(return|throw)\b", guard_body):
+                findings.append(
+                    ("S1", "missing",
+                     "the non-positive-budget branch only sets matchesCapped and falls "
+                     "through — it must return BEFORE Files.walkFileTree(, or limit = 0 "
+                     "walks (and reads) the whole root"))
 
     pre = _brace_block(tree, "override fun preVisitDirectory")
     if pre is None:
@@ -1076,6 +1160,23 @@ def check_photos_album(photos_src: str) -> list:
 #       the empty item right back even on Q+
 FOREGROUND_Q_RE = r"!isAppForeground\(\)\s*&&\s*Build\.VERSION\.SDK_INT\s*>=\s*Build\.VERSION_CODES\.Q"
 BARE_FOREGROUND_RE = r"!isAppForeground\(\)(?!\s*&&\s*Build\.VERSION\.SDK_INT\s*>=\s*Build\.VERSION_CODES\.Q)"
+SDK_Q_PREDICATE_RE = re.compile(
+    r"Build\s*\.\s*VERSION\s*\.\s*SDK_INT\s*>=\s*Build\s*\.\s*VERSION_CODES\s*\.\s*Q")
+
+
+def _is_sdk_q_decision(arg: str, code: str) -> bool:
+    """Is this argument the API-29 predicate (or a local bound to it)?
+
+    [wide-1024 L2] `clearAction(false)` compiles clean, keeps the platform call in
+    the tree, and silently routes every Android 10+ device to the empty-string
+    arm — a clear that leaves an item behind."""
+    if SDK_Q_PREDICATE_RE.search(arg):
+        return True
+    if re.fullmatch(r"\w+", arg.strip()):
+        return re.search(r"(?:val|var)\s+" + re.escape(arg.strip()) +
+                         r"\b[^\n]*SDK_INT\s*>=\s*Build\s*\.\s*VERSION_CODES\s*\.\s*Q",
+                         code) is not None
+    return False
 
 def check_clipboard_clear(clipboard_src: str) -> list:
     """[dv22-A6 A-06] the L1–L4 rules above."""
@@ -1090,6 +1191,22 @@ def check_clipboard_clear(clipboard_src: str) -> list:
         findings.append(("L2", "missing",
                          "clear must reach the platform clearPrimaryClip() — an empty "
                          "string write leaves itemCount = 1 and status answers has_content = true"))
+    else:
+        # [wide-1024 L2] reaching the call in the SOURCE is not reaching it at
+        # RUNTIME. `clearAction(false)` — a Boolean the pure function accepts
+        # without a warning — sends every API 29+ device down the empty-string
+        # arm: the platform clear is never called, an empty item is written
+        # instead (system "copied" banner, hasPrimaryClip() still true).
+        i = body.find("clearAction(")
+        if i >= 0:
+            arg = _first_call_arg(body, i + len("clearAction")).strip()
+            if not _is_sdk_q_decision(arg, code):
+                findings.append((
+                    "L2", "unreachable",
+                    "clearAction() is fed `%s` instead of "
+                    "`Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q` — on API 29+ the "
+                    "platform clearPrimaryClip() is never reached and `clear` writes an "
+                    "empty item (itemCount stays 1)" % (arg or "<missing>")))
     if re.search(BARE_FOREGROUND_RE, code):
         findings.append(("L3", "regressed",
                          "an isAppForeground() guard dropped its `&& SDK_INT >= Q` half "
@@ -1288,6 +1405,27 @@ def check_sessions_send_status(sessions_src: str) -> list:
         findings.append(("S2", "missing",
                          "cmdSend must consult the success set (`sendSucceeded(…)`) — "
                          "only Completed/Running are deliveries"))
+    else:
+        # [wide-1024 S2] consulting is not deciding. The rule read the substring;
+        # `if (false && !sendSucceeded(status))` keeps it, folds the condition to
+        # false at compile time, and lets a dropped send fall through to
+        # `emit("send", …)` at exit 0 — the caller believes the message landed.
+        site = _if_site(body, r"sendSucceeded\s*\(")
+        if site is None:
+            findings.append(("S2", "missing",
+                             "sendSucceeded(…) is called but no branch is decided by it — "
+                             "the success payload would leave whatever the status says"))
+        else:
+            cond, guard_body = site
+            if _dead_condition(cond):
+                findings.append(("S2", "dead",
+                                 "the success-set decision is constant-folded false (`%s`) — "
+                                 "a refused send takes the success path and exits 0"
+                                 % cond.strip()))
+            elif not re.search(r"\b(return|throw)\b", guard_body):
+                findings.append(("S2", "missing",
+                                 "the refusal branch falls through instead of terminating — "
+                                 "control reaches `emit(\"send\"…)` on a failed send"))
     if "errorEnvelope(" not in body:
         findings.append(("S3", "missing",
                          "a refusal must go through the existing `errorEnvelope(` funnel — "
@@ -3641,6 +3779,17 @@ def selftest() -> int:
         ("the success set is never consulted",
          GREEN_SESSIONS_SEND.replace("if (!sendSucceeded(status)) {", "if (false) {"),
          {"S2", "S5"}),
+        # [wide-1024] the same site, one token different: the call is still there,
+        # the condition is folded false, the refusal never happens.
+        ("the success check is dead-collapsed (`false && !sendSucceeded(status)`)",
+         GREEN_SESSIONS_SEND.replace("if (!sendSucceeded(status)) {",
+                                     "if (false && !sendSucceeded(status)) {"),
+         {"S2"}),
+        ("the refusal branch falls through instead of returning",
+         GREEN_SESSIONS_SEND.replace(
+             "            return NativeOffloadResult(\n                sendExitFor(status),",
+             "            NativeOffloadResult(\n                sendExitFor(status),"),
+         {"S2"}),
         ("the refusal skips the shared error funnel",
          GREEN_SESSIONS_SEND.replace('val err = errorEnvelope(', 'val err = errorShape('),
          {"S3"}),
@@ -4159,6 +4308,13 @@ def selftest() -> int:
                                        "    private fun doClear(cm: ClipboardManager, args: OffloadArgs): NativeOffloadResult {\n"
                                        "        if (!isAppForeground()) {\n"),
          {"L3"}),
+        # [wide-1024] the platform call stays in the tree while the decision is
+        # pinned to a literal: API 29+ never reaches clearPrimaryClip().
+        ("clipboard: clearAction is fed a constant instead of the SDK predicate",
+         GREEN_CLIPBOARD_CLEAR.replace(
+             "clearAction(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)",
+             "clearAction(false)"),
+         {"L2"}),
         ("clipboard: always clearPrimaryClip — the pre-Q fallback is deleted",
          GREEN_CLIPBOARD_CLEAR.replace(CLEAR_WHEN_BLOCK, "        cm.clearPrimaryClip()\n"),
          {"L4"}),
@@ -4200,6 +4356,17 @@ def selftest() -> int:
         ("grep entry: the short circuit forgets to call it capped",
          GREEN_FASTIO_SEARCH.replace(
              "        out.matchesCapped = true\n        return\n", "        return\n"),
+         {"S1"}),
+        # [wide-1024] both substrings survive; the guard is dead / falls through.
+        ("grep entry: the short circuit is dead-collapsed (`limit <= 0 && false`)",
+         GREEN_FASTIO_SEARCH.replace(
+             "    if (limit <= 0) {\n        out.matchesCapped = true\n        return\n    }",
+             "    if (limit <= 0 && false) {\n        out.matchesCapped = true\n    }"),
+         {"S1"}),
+        ("grep entry: the guard sets the flag and falls into the walk",
+         GREEN_FASTIO_SEARCH.replace(
+             "        out.matchesCapped = true\n        return\n",
+             "        out.matchesCapped = true\n"),
          {"S1"}),
         ("grep walk: a directory is entered after the budget is spent",
          GREEN_FASTIO_SEARCH.replace(

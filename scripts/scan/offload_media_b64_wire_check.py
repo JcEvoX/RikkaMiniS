@@ -175,6 +175,67 @@ def guarded_spans(masked):
     return spans
 
 
+def find_close(text, open_idx, opener, closer):
+    """Index of the [closer] matching text[open_idx], or -1."""
+    depth = 0
+    for i in range(open_idx, len(text)):
+        if text[i] == opener:
+            depth += 1
+        elif text[i] == closer:
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
+def split_args(text, open_idx):
+    """Top-level arguments of the call whose `(` sits at [open_idx] (None if the
+    parenthesis never closes — fail-closed callers report that)."""
+    close = find_close(text, open_idx, "(", ")")
+    if close < 0:
+        return None
+    args, depth, start = [], 0, open_idx + 1
+    for i in range(open_idx + 1, close):
+        c = text[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        elif c == "," and depth == 0:
+            args.append(text[start:i])
+            start = i + 1
+    args.append(text[start:close])
+    return args
+
+
+def flag_tokens(arg):
+    """The base64 modifier names in one flag expression, qualified or not:
+    `android.util.Base64.NO_WRAP or Base64.URL_SAFE` -> ['NO_WRAP','URL_SAFE']."""
+    out = []
+    for part in re.split(r"\bor\b", arg):
+        token = re.sub(r"[\s()]", "", part).split(".")[-1]
+        if token:
+            out.append(token)
+    return out
+
+
+def statement_tail(text, start, limit=600):
+    """Text from [start] to the end of the statement carrying it — a top-level
+    `,` / `;` / newline, or a closing bracket that ends the enclosing expression."""
+    depth = 0
+    for i in range(start, min(len(text), start + limit)):
+        c = text[i]
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            if depth == 0:
+                return text[start:i]
+            depth -= 1
+        elif c in ",;\n" and depth == 0:
+            return text[start:i]
+    return text[start:start + limit]
+
+
 def read(rel):
     with open(rel, "r", encoding="utf-8") as f:
         return f.read()
@@ -218,6 +279,21 @@ def check_consumers(root, failures):
                 "payload throws out of the run (route it through %s or wrap it "
                 "in try/runCatching)" % (label, line, HELPER_CALL.rstrip("(")))
 
+        # C4b [wide-1024] — the chunk reader's miss path is a FALLBACK, never an
+        # abort. `?: throw …` (or `!!`) reads the same two substrings the old rule
+        # wanted while turning one empty/malformed b64 block into a dead stream.
+        if rel == JSONL_REL:
+            for s in re.finditer(re.escape(HELPER_CALL), masked):
+                close = find_close(masked, s.end() - 1, "(", ")")
+                tail = statement_tail(masked, close + 1 if close > 0 else s.end())
+                if re.search(r"\bthrow\b", tail) or "!!" in tail:
+                    line = masked[: s.start()].count("\n") + 1
+                    failures.append(
+                        "ChatStreamJsonl.kt:%d aborts on a decode miss (throw / !!) — "
+                        "`OffloadWireBase64.decode(b64)` answers null for an empty or "
+                        "truncated payload, and the chunk reader must fall back "
+                        "(?: ByteArray(0)) instead of ending the stream" % line)
+
 
 def check_helper(root, failures):
     """C5 — the shared decode entry exists and cannot throw."""
@@ -235,6 +311,24 @@ def check_helper(root, failures):
                 "tolerant (MIME) and non-throwing" % anchor)
     if STRICT_DECODER in masked:
         failures.append("OffloadWireBase64.kt: uses the strict %s" % STRICT_DECODER)
+    # C5 dataflow [wide-1024] — `runCatching` only helps if the failure stays a
+    # value. `.getOrThrow()` keeps both substrings the old rule looked for
+    # (`getMimeDecoder().decode(` and `runCatching`) while re-raising exactly the
+    # IllegalArgumentException this entry exists to absorb: one truncated block
+    # escapes into every caller's coroutine.
+    for bad_re, what in ((r"\bgetOrThrow\s*\(", "`getOrThrow()`"),
+                         (r"!!", "`!!`"),
+                         (r"\.\s*get\s*\(\s*\)", "`get()`")):
+        if re.search(bad_re, masked):
+            failures.append(
+                "OffloadWireBase64.kt: the guard ends in %s — the shared decode entry "
+                "must never throw; a truncated / mis-padded payload has to come back "
+                "as null" % what)
+    if re.search(r"getOrNull\s*\(", masked) is None:
+        failures.append(
+            "OffloadWireBase64.kt: the decode guard is not consumed through "
+            "`getOrNull()` (fail-closed) — the shared entry's contract is `null` on a "
+            "bad payload, and only a null-returning accessor implements it")
 
 
 def check_tree(root):
@@ -253,24 +347,76 @@ def check_tree(root):
     if STRICT_DECODER in gw_code:
         failures.append("gateway uses strict %s (throws on wrapped payload); "
                         "use java.util.Base64.getMimeDecoder()" % STRICT_DECODER)
-    if MIME_DECODER not in gw_code:
+    # 1b) [wide-1024 C1] …and it must actually DECODE with it. `runCatching {
+    #     java.util.Base64.getMimeDecoder(); ByteArray(0) }` satisfies every
+    #     substring the old rule wanted while carrying zero decoded bytes: the
+    #     decoder is constructed, never consumed. Dataflow, not spelling: the
+    #     decoder must feed `.decode(`, and the bytes it returns must be what
+    #     leaves the guard (a `;` between the decode and the guard's end discards
+    #     them just as silently).
+    gw_masked = mask_code(read(gw_path))
+    gw_spans = guarded_spans(gw_masked)
+    mime_sites = list(re.finditer(re.escape(MIME_DECODER), gw_masked))
+    if not mime_sites:
         failures.append("gateway does not use java.util.Base64.getMimeDecoder() "
                         "(MIME decoder required for RFC 2045 wrapped input)")
+    for m in mime_sites:
+        line = gw_masked[: m.start()].count("\n") + 1
+        chain = re.match(r"\s*\.\s*decode\s*\(", gw_masked[m.end():])
+        if chain is None:
+            failures.append(
+                "ProviderExecutionGateway.kt:%d constructs the MIME decoder but never "
+                "decodes with it — the media payload must be produced by "
+                "`getMimeDecoder().decode(b64)`, not by a literal next to it" % line)
+            continue
+        close = find_close(gw_masked, m.end() + chain.end() - 1, "(", ")")
+        if close < 0:
+            failures.append("ProviderExecutionGateway.kt:%d: unbalanced "
+                            ".decode( … ) on the media wire (fail-closed)" % line)
+            continue
+        guard = [s for s in gw_spans if s[0] <= m.start() < s[1]]
+        if guard:
+            block_end = min(guard, key=lambda s: s[1] - s[0])[1]
+            if gw_masked[close + 1:block_end - 1].strip():
+                failures.append(
+                    "ProviderExecutionGateway.kt:%d decodes the payload then drops it "
+                    "before the guard ends (the assignment gets something else) — every "
+                    "generated image/audio would land as a zero-byte file" % line)
 
-    # 2) Producer side: the media_files encode sites must use NO_WRAP.
-    svc_lines = strip_comments(read(svc_path)).splitlines()
+    # 2) Producer side: the media_files encode sites must use NO_WRAP — and the
+    #    flag expression must be exactly that. [wide-1024 C2] `NO_WRAP or
+    #    URL_SAFE` used to pass both substring tests while rewriting the alphabet
+    #    to `-`/`_`, which the consumer's MIME decoder silently DISCARDS (not an
+    #    error: a quiet bit shift in every generated image/audio).
+    svc_code = strip_comments(read(svc_path))
+    svc_masked = mask_code(read(svc_path))
+    svc_lines = svc_code.splitlines()
     sites = [(i + 1, ln) for i, ln in enumerate(svc_lines)
              if MEDIA_ENCODE_ANCHOR in ln]
     if len(sites) == 0:
         failures.append("no media encode sites found (anchor %r missing) — "
                         "gate is stale, update the anchor" % MEDIA_ENCODE_ANCHOR)
-    for lineno, ln in sites:
-        if "Base64.DEFAULT" in ln:
-            failures.append("ModelExecutionService.kt:%d uses Base64.DEFAULT on "
-                            "the media wire (wraps at 76 chars + newline); use NO_WRAP" % lineno)
-        elif "NO_WRAP" not in ln:
-            failures.append("ModelExecutionService.kt:%d media encode uses neither "
-                            "NO_WRAP nor DEFAULT — verify the flag" % lineno)
+    encode_sites = list(re.finditer(r"\bBase64\s*\.\s*encodeToString\s*\(", svc_masked))
+    if encode_sites is None or not encode_sites:
+        failures.append("ModelExecutionService.kt: no Base64.encodeToString( call site "
+                        "found (fail-closed) — the media wire producer is unreadable")
+    for m in encode_sites:
+        lineno = svc_masked[: m.start()].count("\n") + 1
+        args = split_args(svc_masked, m.end() - 1)
+        if not args or len(args) < 2:
+            failures.append("ModelExecutionService.kt:%d: encodeToString has no flag "
+                            "argument (fail-closed) — NO_WRAP is a wire contract" % lineno)
+            continue
+        flags = flag_tokens(args[-1])
+        bad = [t for t in flags if t != "NO_WRAP"]
+        if not flags or bad:
+            detail = ("Base64.DEFAULT wraps at 76 chars + a newline" if "DEFAULT" in bad
+                      else "a non-NO_WRAP modifier rewrites the base64 alphabet, and the "
+                           "consumer's MIME decoder silently drops those characters")
+            failures.append(
+                "ModelExecutionService.kt:%d media encode flags are %r — the flag "
+                "expression must be exactly NO_WRAP (%s)"
+                % (lineno, " or ".join(flags) or args[-1].strip(), detail))
 
     # 3-5) [dv21-A06] the other consumers of the same wire.
     check_consumers(root, failures)
@@ -464,10 +610,47 @@ def selftest():
         "    fun decode(b64: String): ByteArray? = java.util.Base64.getDecoder().decode(b64)\n"
         "}\n"
     )), False, "selftest: C5 helper without MIME/runCatching rejected")
+    # ── [wide-1024] 门瞎实锤 → 固化臂（每条 = 一份外部模型的见证，原样） ──────
+    # C1: the MIME decoder is CONSTRUCTED but nothing is decoded with it.
+    ok &= run_fixture(fixture(GATEWAY=(
+        "class G {\n"
+        "    val data = runCatching { java.util.Base64.getMimeDecoder(); ByteArray(0) }.getOrNull()\n"
+        "        ?: return@mapNotNull null\n"
+        "}\n"
+    )), False, "selftest: C1 MIME decoder constructed but never consumed (wide-1024)")
+    # C1: the decoder IS consumed, but the bytes are dropped before the guard ends.
+    ok &= run_fixture(fixture(GATEWAY=(
+        "class G {\n"
+        "    val data = runCatching { java.util.Base64.getMimeDecoder().decode(b64); ByteArray(0) }\n"
+        "        .getOrNull() ?: return@mapNotNull null\n"
+        "}\n"
+    )), False, "selftest: C1 decoded bytes discarded inside the guard (wide-1024)")
+    # C2: NO_WRAP or URL_SAFE — both substrings the old scan wanted, wrong alphabet.
+    ok &= run_fixture(fixture(SERVICE=(
+        "class S {\n"
+        '    put("data", android.util.Base64.encodeToString(m.data, android.util.Base64.NO_WRAP or android.util.Base64.URL_SAFE))\n'
+        '    put("data", android.util.Base64.encodeToString(m.data, android.util.Base64.NO_WRAP))\n'
+        "    val a = OffloadWireBase64.decode(x) ?: ByteArray(0)\n"
+        "    val b = OffloadWireBase64.decode(y) ?: ByteArray(0)\n"
+        "}\n"
+    )), False, "selftest: C2 NO_WRAP or URL_SAFE rejected (alphabet rewrite, wide-1024)")
+    # C5: the shared entry re-raises instead of answering null.
+    ok &= run_fixture(fixture(HELPER=(
+        "object OffloadWireBase64 {\n"
+        "    fun decode(b64: String): ByteArray? =\n"
+        "        if (b64.isEmpty()) null\n"
+        "        else runCatching { java.util.Base64.getMimeDecoder().decode(b64) }.getOrThrow()\n"
+        "}\n"
+    )), False, "selftest: C5 shared entry re-raises (getOrThrow, wide-1024)")
+    # C4: the chunk reader turns one decode miss into a dead stream.
+    ok &= run_fixture(fixture(JSONL=(
+        "class J {\n"
+        '    val data = (OffloadWireBase64.decode(b64) ?: throw IllegalArgumentException("bad b64")),\n'
+        "}\n"
+    )), False, "selftest: C4 ChatStreamJsonl throws on a decode miss (wide-1024)")
     if ok:
         print("OFFLOAD_MEDIA_B64_SELFTEST=PASS")
     return 0 if ok else 1
-
 
 def main():
     args = sys.argv[1:]
