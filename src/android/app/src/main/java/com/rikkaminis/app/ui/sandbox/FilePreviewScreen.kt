@@ -1097,13 +1097,16 @@ private fun JsonPreview(item: FileItem) {
 
 // ==================== Archive (ZIP/JAR/APK) ====================
 
+/** One zip entry row. File-private (not a local class) so the type also
+ *  crosses the `withContext(Dispatchers.IO)` boundary in the loader. */
+private data class ArchiveEntry(val name: String, val size: Long, val isDir: Boolean)
+
 @Composable
 private fun ArchivePreview(item: FileItem) {
     // [fix/render-ui F-276] Error fallbacks below are user-visible; resolve
     // them through resources like the rest of this screen.
     val context = androidx.compose.ui.platform.LocalContext.current
-    data class Entry(val name: String, val size: Long, val isDir: Boolean)
-    var entries by remember(item.file) { mutableStateOf<List<Entry>?>(null) }
+    var entries by remember(item.file) { mutableStateOf<List<ArchiveEntry>?>(null) }
     var error by remember(item.file) { mutableStateOf<String?>(null) }
 
     LaunchedEffect(item.file) {
@@ -1112,12 +1115,12 @@ private fun ArchivePreview(item: FileItem) {
         // after `withContext` returns.
         val loaded = withContext(Dispatchers.IO) {
             runCatching {
-                val out = mutableListOf<Entry>()
+                val out = mutableListOf<ArchiveEntry>()
                 java.util.zip.ZipFile(item.file).use { zf ->
                     val it = zf.entries()
                     while (it.hasMoreElements()) {
                         val e = it.nextElement()
-                        out.add(Entry(e.name, e.size, e.isDirectory))
+                        out.add(ArchiveEntry(e.name, e.size, e.isDirectory))
                         if (out.size >= 2000) break
                     }
                 }
