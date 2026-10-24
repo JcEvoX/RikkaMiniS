@@ -51,7 +51,9 @@ class OffMainComposeStateWriteTest {
      *  root — walk up until the path resolves (same idiom as
      *  `B3RenderInputShapeTest.repoFile`). */
     private fun repoFile(rel: String): File {
-        var dir: File? = File(System.getProperty("user.dir"))
+        // `?: "."` keeps the platform type out of `File(...)`: the JVM always
+        // defines `user.dir`, and the fallback keeps this warning-free.
+        var dir: File? = File(System.getProperty("user.dir") ?: ".")
         while (dir != null) {
             val f = File(dir, rel)
             if (f.exists()) return f
