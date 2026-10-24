@@ -133,7 +133,15 @@
 - **m3（publish 挪到 apply 之前）**：恰好 1 红 = `consumerRecoversEvenWhenItsOwnHandleIsStale`（sink 在回调时读到旧值）。
 - 附：结构改造后「repository 把 `prefs` 而不是 `written` 传下去」这个变异**已无法表达**（cache 不持有自己的句柄），这是本轮最值钱的一步。
 
-**L4 CI**：见 §7 身份链。
+**L4 CI**（分支 dispatch，`workflow_dispatch`，attempt 1）：run **`40072215333`** / job **`120807918366`** → **success**。
+
+- **三方 sha 逐字符一致**：本地 HEAD = `ls-remote` = `run.head_sha` = **`03840e3ff8020cdbab9d8ffbf460ee603b4198b2`**（绿的那棵树就是本报告所在提交的父提交；报告回填提交只动 `fix-reports/`）。
+- 步骤：26 步中**唯一非 success = 第 23 步 `Publish to Releases`（skipped，main 门控）**。
+- 门：门头 `[1/111] … [111/111]` 共 **111 条且唯一**；`Summary: 111 passed, 0 failed` 恰 1 条，其余 7 条步骤级 Summary 全 `0 failed`；`ALL 342 CASES PASS` 恰 1 条。
+- 本支新增输出在册：`OK: write-through delivery green (2 [dv29-a4] delivery line(s))` + 两行送达明细（`BackgroundSettingsRepository.kt:142 KEY_TASK_NOTIFICATIONS` / `:149 KEY_BG_OVERLAY_ENABLED` → sink `:177`）。
+- 新用例 15 条逐条 PASSED（PrefsWriteBusTest 6 / BackgroundToggleCacheTest 6 / BackgroundToggleKeyTest 3）。
+- 编译错 ` e: ` **0**；含 `FAILED` 的行 **0 条不以 PASSED 结尾**（游离 0）；本支五个文件**零编译警告**。
+- 日志 1,470,334 B（`/tmp/a4probe/ci/0_build.txt` 判读）。
 
 ---
 
@@ -152,7 +160,7 @@
 
 ## 8 身份链与复盘
 
-**身份链**：基线 main `b82aa8dc` → 分支 `fix/dv29-a4-prefs-write-through` → 提交见 `git log --oneline b82aa8dc..HEAD` → 分支 CI（run 编号与 `head_sha` 见回报）。
+**身份链**：基线 main `b82aa8dc` → 4 提交（`4d41f8d5` 生产 · `686de04f` 测试 · `b073e894` 门 · `03840e3f` 报告）→ 分支 `fix/dv29-a4-prefs-write-through` → **CI run `40072215333` / job `120807918366` success @ `03840e3f`** → 报告回填提交只动 `fix-reports/`（`git diff --name-only 03840e3f HEAD -- . ':(exclude)fix-reports'` 为空 ⇒ 源码树与绿 sha 逐字节等价）。
 
 **本轮可复用的三条**：
 1. **「同一实例」是假设，不是事实** —— 只要送达依赖「A 写的回调能到 B」，就必须让 A 把值交给 B，而不是让 B 去读它自己的缓存。`config/SessionConfigWriteThrough.kt` 是同一形状的第一次（Room 行 ↔ 驻留 VM），这次是第二次（prefs ↔ 缓存 StateFlow）。同族第二次 ⇒ 修在共享层（阶梯纪律），所以落在 `PrefsFields` 而不是 `BackgroundSettingsRepository` 里打补丁。
