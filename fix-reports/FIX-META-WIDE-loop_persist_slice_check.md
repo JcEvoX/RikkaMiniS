@@ -85,18 +85,16 @@ W1 之所以能过旧门：R1 只看 buildTurnParts 的两个实参文本（第�
 
 | 项 | 值 |
 |---|---|
-| run | `40135353367`（#2636） |
-| job | `120995610275` / build |
+| run | `40137671947`（#2642） |
+| job | `121002546481` / build |
 | conclusion | success（attempt 1） |
-| head_sha | `f6d9dc84bb8e79c695ac0edde57571bb08e2f7fa` == 本地 HEAD |
+| head_sha | `98a65e7bf3df82da26feeee4d294a042c2a95f71` == 本地 HEAD |
 | steps | 26 步，`not_ok=[]`，唯一 skipped = `Publish to Releases`（main 门控） |
 | 门读数 | `Summary: 112 passed, 0 failed`；门头 112 个互异编号 |
 | 夹具读数 | `ALL 344 CASES PASS` |
 | Kotlin 错误 | ` e: ` 出现 0 次 |
-| 含 FAILED 的行 | 12 条，逐条核对全部是 PASSED 用例名子串（0 条真失败） |
+| 含 FAILED 的行 | 6 条，逐条核对全部是 PASSED 用例名子串（0 条真失败） |
 
-判读注意：该 run 的日志归档里同一份 step 日志存在两份（门头出现 224 次、互异 112；
-`Summary` 与 `ALL 344` 各 2 行），所以「恰一条」在这里表现为「同一行两份副本」，不是两次执行。
 
 ## §7 残留（三条，各带三件）
 

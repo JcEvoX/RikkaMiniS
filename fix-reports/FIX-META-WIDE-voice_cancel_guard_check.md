@@ -59,10 +59,10 @@
 
 ## §6 CI run
 
-run `40135353367`（#2636）/ job `120995610275` / **success**（attempt 1）/
-head_sha `f6d9dc84bb8e79c695ac0edde57571bb08e2f7fa` == 本地 HEAD / 26 步 `not_ok=[]`、
+run `40137671947`（#2642）/ job `121002546481` / **success**（attempt 1）/
+head_sha `98a65e7bf3df82da26feeee4d294a042c2a95f71` == 本地 HEAD / 26 步 `not_ok=[]`、
 唯一 skipped = `Publish to Releases`（main 门控）/ `Summary: 112 passed, 0 failed` /
-`ALL 344 CASES PASS` / ` e: ` 0 / 含 FAILED 的 12 行全是 PASSED 用例名子串。
+`ALL 344 CASES PASS` / ` e: ` 0 / 含 FAILED 的 6 行全是 PASSED 用例名子串。
 
 ## §7 残留（三条，各带三件）
 
