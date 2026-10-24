@@ -944,6 +944,138 @@ def _holder_spans(code: str) -> "list[tuple[int, int]]":
     return spans
 
 
+# ---------------------------------------------------------------------------
+# criterion 17 [deep-audit-1048 A-07] — a settled turn reports ITS OWN answer.
+#
+# `isStreaming` flipping back to false only says "no stream is running". A turn
+# can settle WITHOUT writing an assistant row (provider error / cancel / an
+# empty completion that `persistAssistantTurn` skips on an empty part list), and
+# the pre-fix drain then scanned the transcript for the LAST `assistant` row and
+# settled `Completed` with the PREVIOUS turn's text: `chat.prompt` and
+# `minis-sessions send` accepted a stale reply as this request's answer.
+#
+# Derived, not spelled:
+#   · entries  = every member whose body waits on `isStreaming.first { !it }`,
+#                so a new settled entry is covered without touching the gate;
+#   · identity = every local `val X = <call>(…)` bound BEFORE the last
+#                `recv.call(` that precedes the wait (that is the dispatch);
+#   · the answer pick AFTER the wait must consume one of those bindings;
+#   · the settled status must distinguish "no answer of its own".
+# A role scan (`lastOrNull { … "assistant" … }`) without an id test is RED on
+# its own: that is exactly the pre-fix shape.
+# ---------------------------------------------------------------------------
+RE_SETTLE_WAIT = re.compile(r"\bisStreaming\.first\s*\{\s*!\s*it\s*\}")
+RE_ANSWER_SCAN = re.compile(r"\.\s*(?:lastOrNull|last)\s*\{")
+RE_ID_DIFF = re.compile(r"\.\s*id\s*(?:!in|not\s+in)\s+\w+|\w+\.contains\(\s*\w+\.id\s*\)")
+RE_RECV_CALL = re.compile(r"\b\w+\.\w+\s*\(")
+RE_LOCAL_CALL_BIND = re.compile(r"\bval\s+(\w+)\s*=\s*[^\n=]*?\b(\w+)\s*\(")
+RE_ABSENCE_TEST = re.compile(r"(?:!=\s*null|==\s*null|\.isNotEmpty\(\)|\.isEmpty\(\))")
+
+
+def _call_args_at(code: str, open_paren: int) -> "list[str]":
+    """Top-level arguments of the call whose `(` sits at [open_paren]."""
+    depth = 0
+    i = open_paren
+    n = len(code)
+    args: "list[str]" = []
+    cur: "list[str]" = []
+    while i < n:
+        c = code[i]
+        if c == '"' or c == "'":
+            j = _skip_string_literal(code, i)
+            cur.append(code[i:j])
+            i = j
+            continue
+        if c in "([{":
+            depth += 1
+            if depth == 1 and c == "(":
+                i += 1
+                continue
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                args.append("".join(cur).strip())
+                return [a for a in args if a]
+        elif c == "," and depth == 1:
+            args.append("".join(cur).strip())
+            cur = []
+            i += 1
+            continue
+        cur.append(c)
+        i += 1
+    return []
+
+
+def _turn_answer_violations(code: str) -> "list[str]":
+    """Criterion 17 for one `debug/HeadlessChatRunner.kt` (comments stripped)."""
+    entries = []
+    for name, start, end in _member_spans(code):
+        body = code[start:end]
+        m = RE_SETTLE_WAIT.search(body)
+        if m is not None:
+            entries.append((name, body, m.start()))
+    if not entries:
+        return [
+            "HeadlessChatRunner.kt: no member waits on `isStreaming.first { !it }` — the "
+            "settled-turn derivation found nothing, so criterion 17 cannot decide anything "
+            "(re-anchor it, do not drop it)"
+        ]
+    errs = []
+    for name, body, wait_at in entries:
+        dispatch_at = -1
+        for m in RE_RECV_CALL.finditer(body, 0, wait_at):
+            dispatch_at = m.start()
+        prior = {}
+        for m in RE_LOCAL_CALL_BIND.finditer(body, 0, max(dispatch_at, 0)):
+            prior[m.group(1)] = m.group(2)
+        bare = 0
+        for m in RE_ANSWER_SCAN.finditer(body):
+            brace = body.find("{", m.start())
+            if brace == -1:
+                continue
+            end = _match_brace(body, brace)
+            if end is None:
+                continue
+            lam = body[brace:end + 1]
+            if '"assistant"' not in lam or RE_ID_DIFF.search(lam):
+                continue
+            bare += 1
+            errs.append(
+                "HeadlessChatRunner.kt: %s() settles its answer by scanning for the last "
+                "`assistant` row WITHOUT an id test — a turn that ends without an assistant "
+                "row (provider error / cancel / empty completion) then reports the PREVIOUS "
+                "turn's text as `Completed` (deep-audit-1048 A-07)" % name
+            )
+        if bare:
+            continue
+        consumed = False
+        for m in re.finditer(r"\b(\w+)\s*\(", body):
+            if m.start() <= wait_at:
+                continue
+            args = _call_args_at(body, m.end() - 1)
+            if len(args) < 2:
+                continue
+            if any(a.strip() in prior for a in args):
+                consumed = True
+                break
+        if not consumed:
+            errs.append(
+                "HeadlessChatRunner.kt: %s() never feeds this turn's identity into the answer "
+                "pick — no `val` bound before the dispatch call is consumed after the wait, so "
+                "the settled answer cannot be attributed to this turn (deep-audit-1048 A-07)"
+                % name
+            )
+            continue
+        if not RE_ABSENCE_TEST.search(body[wait_at:]):
+            errs.append(
+                "HeadlessChatRunner.kt: %s() derives its settled status from the wait alone "
+                "(`Completed` whenever the wait finished) — a settled turn with no answer of "
+                "its own must report the structured `no_answer_this_turn` error instead "
+                "(deep-audit-1048 A-07)" % name
+            )
+    return errs
+
+
 def check(root: Path) -> int:
     del errors[:]
     screen_path = root / REL_SCREEN
@@ -1328,6 +1460,10 @@ def check(root: Path) -> int:
         #     session, and its write must reach the live chat. ---
         errors.extend(_apply_override_violations(runner))
 
+        # --- 17. [deep-audit-1048 A-07] the settled answer must belong to
+        #     THIS turn, not to a role scan over the whole transcript. ---
+        errors.extend(_turn_answer_violations(runner))
+
     # --- 14. [deep-audit-1042 A-05 / 1043 A-05] every entry that mutates the
     #     ViewModel's in-memory turn state awaits the `sessionLoaded` latch
     #     BEFORE the mutation. Files, entries and receivers are all derived
@@ -1504,6 +1640,16 @@ _R_PROMPT_HELPER_DECL = (
     "        timedOut = false,\n"
     "    )\n"
 )
+# criterion 17's answer pick, kept as its own constant so the dirty arms can
+# swap exactly this shape (a role scan without an id test is the pre-fix form).
+_R_PROMPT_PICK = (
+    "        val answerIdx = turnAnswerIndex(msgs.map { TurnAnswerRow(it.id, it.role) }, "
+    "priorAnswerIds)\n"
+    "        val answer = if (answerIdx >= 0) msgs[answerIdx] else null\n"
+)
+_R_PROMPT_SETTLE = (
+    "        val settled = settleTurn(finished, answer != null)\n"
+)
 _R_PROMPT_DRAIN = (
     "        val finished = withTimeoutOrNull(timeoutMs) {\n"
     "            if (vm.isStreaming.value) {\n"
@@ -1512,10 +1658,11 @@ _R_PROMPT_DRAIN = (
     "            true\n"
     "        } ?: false\n"
     "        val msgs = app.chatRepository.loadMessages(sessionId)\n"
-    "        val lastAssistant = msgs.lastOrNull { it.role == \"assistant\" }\n"
-    "        PromptResult(\n"
-    "            status = if (finished) \"Completed\" else \"Timeout\",\n"
-    "            responseText = lastAssistant?.id,\n"
+    + _R_PROMPT_PICK
+    + _R_PROMPT_SETTLE
+    + "        PromptResult(\n"
+    "            status = settled.status,\n"
+    "            responseText = answer?.id,\n"
     "            timedOut = !finished,\n"
     "        )\n"
     "    }\n"
@@ -1532,6 +1679,14 @@ def _prompt_entry(guard: str) -> str:
         "        timeoutMs: Long,\n"
         "    ): PromptResult = withContext(Dispatchers.Main) {\n"
         "        val vm = viewModel(context, sessionId)\n"
+        "        val app = app(context)\n"
+        # criterion 14: the dispatch must sit behind the sessionLoaded latch.
+        "        val sessionReady = withContext(Dispatchers.Default) {\n"
+        "            withTimeoutOrNull(5000L) { vm.sessionLoaded.first { it } }\n"
+        "        }\n"
+        # criterion 17: the identity of "before this turn", taken before the send.
+        "        val priorAnswerIds = turnAnswerSnapshot(app, sessionId)\n"
+        "        vm.sendMessage(text)\n"
         "        val started = vm.isStreaming.value\n"
         "        if (!wait) {\n"
         "            return@withContext if (started) {\n"
@@ -1727,6 +1882,67 @@ _OVERRIDE_MUTATIONS = (
      FIXTURE_RUNNER_NO_DEFAULT_GROUP, "dropped the default primary group"),
     ("the pre-fix unconditional default group (MUT-O6)",
      FIXTURE_RUNNER_BASELINE_OVERRIDE, "never reads the session's persisted binding"),
+)
+
+# --- criterion 17 [deep-audit-1048 A-07]: the answer belongs to THIS turn ----
+# Every fixture above already carries the fixed prompt(), so the green arms of
+# criteria 13/15/16 double as criterion 17's happy path. These are the dirty
+# shapes, one per decision point of the criterion.
+_R_ANSWER_SCAN_BARE = (
+    "        val answer = msgs.lastOrNull { it.role = \"assistant\" }\n")
+assert _R_PROMPT_PICK in FIXTURE_RUNNER, "criterion 17 pick anchor moved"
+assert _R_PROMPT_SETTLE in FIXTURE_RUNNER, "criterion 17 settle anchor moved"
+assert _R_PROMPT_DRAIN.endswith("    }\n"), "prompt drain tail moved"
+
+_R_SNAPSHOT_LINE = "        val priorAnswerIds = turnAnswerSnapshot(app, sessionId)\n"
+_R_DISPATCH_LINE = "        vm.sendMessage(text)\n"
+assert _R_SNAPSHOT_LINE + _R_DISPATCH_LINE in FIXTURE_RUNNER, "snapshot anchor moved"
+
+# A FOURTH settled entry: criterion 17 derives its entry set from
+# `isStreaming.first { !it }`, so this must be caught without touching the gate.
+_R_FOURTH_ENTRY = (
+    "\n"
+    "    suspend fun rerunAll(context: Context, sessionId: String): PromptResult "
+    "= withContext(Dispatchers.Main) {\n"
+    "        val vm = viewModel(context, sessionId)\n"
+    "        val app = app(context)\n"
+    "        vm.retryFromMessage(messageId)\n"
+    "        val finished = withTimeoutOrNull(timeoutMs) {\n"
+    "            if (vm.isStreaming.value) vm.isStreaming.first { !it }\n"
+    "            true\n"
+    "        } ?: false\n"
+    "        val msgs = app.chatRepository.loadMessages(sessionId)\n"
+    "        val answer = msgs.lastOrNull { it.role = \"assistant\" }\n"
+    "        PromptResult(status = \"Completed\", responseText = answer?.id)\n"
+    "    }\n"
+)
+
+_CRIT17_MUTATIONS = (
+    (
+        "the answer pick back to a bare role scan (MUT-H1)",
+        FIXTURE_RUNNER.replace(_R_PROMPT_PICK, _R_ANSWER_SCAN_BARE),
+        "WITHOUT an id test",
+    ),
+    (
+        "the identity snapshot taken AFTER the dispatch (MUT-H2)",
+        FIXTURE_RUNNER.replace(
+            _R_SNAPSHOT_LINE + _R_DISPATCH_LINE, _R_DISPATCH_LINE + _R_SNAPSHOT_LINE),
+        "never feeds this turn's identity",
+    ),
+    (
+        "the settled status derived from the wait alone (MUT-H3)",
+        FIXTURE_RUNNER.replace(
+            _R_PROMPT_SETTLE + '        PromptResult(\n'
+            '            status = settled.status,\n',
+            '        PromptResult(\n'
+            '            status = if (finished) \"Completed\" else \"Timeout\",\n'),
+        "derives its settled status from the wait alone",
+    ),
+    (
+        "a fourth settled entry with a bare role scan (MUT-H4)",
+        FIXTURE_RUNNER[: -len("}\n")] + _R_FOURTH_ENTRY + "}\n",
+        "rerunAll() settles its answer",
+    ),
 )
 
 # --- criterion 14 [deep-audit-1042 A-05]: the session-ready barrier ----------
@@ -2318,6 +2534,21 @@ def selftest() -> int:
                 f"criterion 16 {name}: expected a `{expect}` violation, got {errs}")
         else:
             print(f"selftest: criterion 16 {name} -> RED ({len(errs)} violation(s)) OK")
+
+    # --- criterion 17 [deep-audit-1048 A-07]: the answer belongs to THIS turn ---
+    # The green arms of criteria 13/15/16 above already prove the happy path
+    # (every runner fixture carries the fixed prompt()).
+    print("selftest: criterion 17 GREEN fixture passes (fixed prompt() in every runner fixture)")
+    for name, run_fixture, expect in _CRIT17_MUTATIONS:
+        if run_fixture == FIXTURE_RUNNER:
+            failures.append(f"criterion 17 {name}: mutation is a no-op (anchor not found)")
+            continue
+        rc, errs = run_tree(screen, nav, move, FIXTURE_STORE, FIXTURE_ACTIVITY, run_fixture)
+        if rc == 0 or not [e for e in errs if expect in e]:
+            failures.append(
+                f"criterion 17 {name}: expected a `{expect}` violation, got {errs}")
+        else:
+            print(f"selftest: criterion 17 {name} -> RED ({len(errs)} violation(s)) OK")
 
     # --- criterion 14 [deep-audit-1042 A-05]: the session-ready barrier ---
     # Backward compat: the fixture above (no mutator calls) proves the
