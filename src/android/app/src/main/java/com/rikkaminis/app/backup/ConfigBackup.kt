@@ -1412,6 +1412,17 @@ object ConfigBackup {
 
         // -- Stage 7: MCP servers --
         val mcpArr = root.optJSONArray("mcpServers")
+        // [dv28-a5 A-05] Stage 9 ALSO restores `mcp/servers.json` out of the
+        // artifact archive, and that copy is verbatim (whole-file overwrite,
+        // ArtifactArchiver.extractZipByPrefix). When this stage merged the
+        // backup's server list, the archive entry landing afterwards rewrote
+        // servers.json with the BACKUP's list: every server this device has but
+        // the backup does not was silently erased, and the in-memory merge
+        // survived only until the next cold start re-read the file. Derived from
+        // the same two operands that gate the merge below, so a backup WITHOUT
+        // an `mcpServers` section (archive-only, hand-crafted) still restores
+        // its list raw — skipping there would lose it entirely.
+        val serverListMergedInStage7 = mcpRepo != null && mcpArr != null && mcpArr.length() > 0
         if (mcpArr != null && mcpRepo != null) {
             var needsReauth = 0
             for (i in 0 until mcpArr.length()) {
@@ -1523,10 +1534,28 @@ object ConfigBackup {
                         // filter is the restore-side second wall.
                         val filtered = java.io.File.createTempFile("artifact-restore-", ".zip")
                         try {
-                            val oauthDropped = stripMcpOAuthEntries(tmp, filtered)
-                            if (oauthDropped > 0) {
+                            // [dv28-a5 A-05] The filter has a second job besides
+                            // the credential wall: Stage 7 already merged the
+                            // backup's server list (MCPRepository.importJSON keeps
+                            // this device's entries), and a verbatim copy of
+                            // `mcp/servers.json` would overwrite that merged file
+                            // with the backup's list. Skipped only when the merge
+                            // actually ran — see serverListMergedInStage7.
+                            val filterResult = stripMcpOAuthEntries(
+                                tmp,
+                                filtered,
+                                dropPrestagedServerList = serverListMergedInStage7,
+                            )
+                            if (filterResult.oauthDropped > 0) {
                                 skipped.add(
-                                    "artifacts: skipped $oauthDropped oauth bridge entries"
+                                    "artifacts: skipped ${filterResult.oauthDropped} " +
+                                        "oauth bridge entries"
+                                )
+                            }
+                            if (filterResult.prestagedDropped > 0) {
+                                skipped.add(
+                                    "artifacts: servers.json restored via Stage 7 merge " +
+                                        "(skipped raw copy)"
                                 )
                             }
                             artifactFilesImported =
@@ -1770,12 +1799,28 @@ object ConfigBackup {
      * /var/minis/mcp-servers/oauth). Pre-fix archives carry it verbatim
      * (`includeSecrets=false` never gated this zip), so a restore would
      * overwrite this device's live token bridge with whatever the source
-     * device had. Returns the number of dropped entries (0 for a clean
-     * archive — the exporter no longer writes them in the first place).
+     * device had. Returns the number of dropped entries per kind (0 for a
+     * clean archive — the exporter no longer writes them in the first place).
      * Pure JVM; a write failure propagates to the Stage 9 catch which reports
      * it through `skipped` instead of half-restoring.
+     *
+     * [dv28-a5 A-05] Same pass, second drop: when [dropPrestagedServerList] is
+     * set, the MCP server list (`mcp/servers.json`) is dropped too, because
+     * Stage 7 already MERGED the backup's copy into this device's list through
+     * [MCPRepository.importJSON] (merge = this device's other servers survive).
+     * The extraction that follows writes entries verbatim, so letting that one
+     * entry through would replace the merged file with the backup's list and
+     * erase every server the backup did not carry — silently, since the merge
+     * only lived in memory until the next cold start re-read the file. The
+     * caller passes `false` when the merge did not run (no `mcpServers` section:
+     * an archive-only backup), where the raw copy is the only way to restore
+     * the list at all.
      */
-    internal fun stripMcpOAuthEntries(src: java.io.File, dst: java.io.File): Int {
+    internal fun stripMcpOAuthEntries(
+        src: java.io.File,
+        dst: java.io.File,
+        dropPrestagedServerList: Boolean = false,
+    ): RestoreEntryFilterResult {
         // [da1034-A1] Both operands are private temp files this process just
         // created, so this refusal is unreachable today — it is here because
         // the repo's write contract (`readonly_mount_write_guard`) applies to
@@ -1787,7 +1832,8 @@ object ConfigBackup {
                 "refusing to write the oauth-filtered archive under a read-only mount"
             )
         }
-        var dropped = 0
+        var oauthDropped = 0
+        var prestagedDropped = 0
         java.io.FileOutputStream(dst).use { fos ->
             java.util.zip.ZipOutputStream(fos.buffered()).use { zos ->
                 java.util.zip.ZipFile(src).use { zf ->
@@ -1795,7 +1841,11 @@ object ConfigBackup {
                     while (entries.hasMoreElements()) {
                         val entry = entries.nextElement()
                         if (isMcpOAuthEntryName(entry.name)) {
-                            dropped++
+                            oauthDropped++
+                            continue
+                        }
+                        if (dropPrestagedServerList && isMcpServerListEntryName(entry.name)) {
+                            prestagedDropped++
                             continue
                         }
                         zos.putNextEntry(java.util.zip.ZipEntry(entry.name))
@@ -1805,7 +1855,39 @@ object ConfigBackup {
                 }
             }
         }
-        return dropped
+        return RestoreEntryFilterResult(oauthDropped, prestagedDropped)
+    }
+
+    /**
+     * [dv28-a5 A-05] What [stripMcpOAuthEntries] removed while copying the
+     * artifact archive. Two counters, not one: the two drops mean different
+     * things to the user — a credential guard ([da1034-A1]) versus "this file
+     * was already restored by Stage 7's merge" — and each gets its own
+     * `skipped` sentence.
+     */
+    internal data class RestoreEntryFilterResult(
+        val oauthDropped: Int,
+        val prestagedDropped: Int,
+    ) {
+        val dropped: Int get() = oauthDropped + prestagedDropped
+    }
+
+    /**
+     * [dv28-a5 A-05] True for the MCP server list as Stage 9 routes it —
+     * exactly "mcp/servers.json" (`MCPRepository` writes that name at the mcp
+     * root). Compared segment-wise with empty and "." segments collapsed, the
+     * same normalisation [isMcpOAuthEntryName] uses, so "mcp//servers.json" and
+     * "mcp/./servers.json" — all landing on the same file — are recognised
+     * too. Only the one file name is excluded: the rest of the `mcp/` prefix
+     * (custom data the agent wrote) still restores.
+     */
+    internal fun isMcpServerListEntryName(name: String): Boolean {
+        val segs = ArrayList<String>(4)
+        for (seg in name.split('/')) {
+            if (seg.isEmpty() || seg == ".") continue
+            segs.add(seg)
+        }
+        return segs.size == 2 && segs[0] == "mcp" && segs[1] == "servers.json"
     }
 
     /**

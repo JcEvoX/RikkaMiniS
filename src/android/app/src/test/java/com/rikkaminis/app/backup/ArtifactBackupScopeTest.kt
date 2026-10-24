@@ -367,7 +367,7 @@ class ArtifactBackupScopeTest {
 
                 liveBridge.writeText("LIVE")
                 File(mcpRoot, "oauth/linear.secret").delete()
-                assertEquals(2, ConfigBackup.stripMcpOAuthEntries(zip, filtered))
+                assertEquals(2, ConfigBackup.stripMcpOAuthEntries(zip, filtered).oauthDropped)
                 assertEquals(2, ArtifactArchiver.extractZipByPrefix(filtered, dests))
 
                 assertEquals("LIVE", liveBridge.readText())
@@ -383,7 +383,7 @@ class ArtifactBackupScopeTest {
                         zos.putNextEntry(java.util.zip.ZipEntry("mcp/servers.json"))
                         zos.write("S".toByteArray()); zos.closeEntry()
                     }
-                    assertEquals(0, ConfigBackup.stripMcpOAuthEntries(clean, cleanOut))
+                    assertEquals(0, ConfigBackup.stripMcpOAuthEntries(clean, cleanOut).dropped)
                 } finally {
                     clean.delete(); cleanOut.delete()
                 }
@@ -391,6 +391,83 @@ class ArtifactBackupScopeTest {
                 zip.delete(); filtered.delete()
             }
         } finally {
+            mcpRoot.deleteRecursively(); sharedRoot.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun serverListEntryNamePinsOnlyTheOneFileUnderTheMcpRoot() {
+        // The drop must be per-file, not per-prefix: everything else the agent
+        // wrote under mcp/ still restores.
+        assertTrue(ConfigBackup.isMcpServerListEntryName("mcp/servers.json"))
+        assertTrue(ConfigBackup.isMcpServerListEntryName("mcp//servers.json"))
+        assertTrue(ConfigBackup.isMcpServerListEntryName("mcp/./servers.json"))
+        assertFalse(ConfigBackup.isMcpServerListEntryName("./mcp/servers.json/x"))
+        assertFalse(ConfigBackup.isMcpServerListEntryName("mcp/other.json"))
+        assertFalse(ConfigBackup.isMcpServerListEntryName("mcp/servers/oauth.json"))
+        assertFalse(ConfigBackup.isMcpServerListEntryName("mcp/oauth/servers.json"))
+        assertFalse(ConfigBackup.isMcpServerListEntryName("shared/servers.json"))
+        assertFalse(ConfigBackup.isMcpServerListEntryName("servers.json"))
+    }
+
+    /**
+     * [dv28-a5 A-05] Stage 7 merges the backup's `mcpServers` into this
+     * device's list; Stage 9 then restored `mcp/servers.json` verbatim, so the
+     * merged file was replaced by the backup's list and every server the backup
+     * did not carry vanished (on disk — the in-memory merge hid it until the
+     * next cold start). The flag is Stage 7's answer to "did the merge run?".
+     */
+    @Test
+    fun stage9SkipsTheServerListOnlyWhenStage7MergedIt() {
+        val mcpRoot = File.createTempFile("stage9b-mcp", "").apply { delete(); mkdirs() }
+        val sharedRoot = File.createTempFile("stage9b-shared", "").apply { delete(); mkdirs() }
+        val zip = File.createTempFile("stage9b-zip", ".zip").apply { delete() }
+        try {
+            // this device's merged servers.json (Stage 7 already wrote it)
+            File(mcpRoot, "servers.json").writeText("MERGED")
+            val dests = mapOf("mcp" to mcpRoot, "shared" to sharedRoot)
+            java.util.zip.ZipOutputStream(zip.outputStream()).use { zos ->
+                zos.putNextEntry(java.util.zip.ZipEntry("mcp/servers.json"))
+                zos.write("BACKUP".toByteArray()); zos.closeEntry()
+                zos.putNextEntry(java.util.zip.ZipEntry("mcp/notes.md"))
+                zos.write("N".toByteArray()); zos.closeEntry()
+                zos.putNextEntry(java.util.zip.ZipEntry("mcp/oauth/linear.json"))
+                zos.write("STALE".toByteArray()); zos.closeEntry()
+                zos.putNextEntry(java.util.zip.ZipEntry("shared/report.md"))
+                zos.write("R".toByteArray()); zos.closeEntry()
+            }
+
+            // Stage 7 merged ⇒ the raw copy must not land.
+            val merged = File.createTempFile("stage9b-merged", ".zip").apply { delete() }
+            try {
+                val res = ConfigBackup.stripMcpOAuthEntries(zip, merged, dropPrestagedServerList = true)
+                assertEquals(1, res.oauthDropped)
+                assertEquals(1, res.prestagedDropped)
+                assertEquals(2, res.dropped)
+                assertEquals(2, ArtifactArchiver.extractZipByPrefix(merged, dests))
+                assertEquals("MERGED", File(mcpRoot, "servers.json").readText())
+                assertEquals("N", File(mcpRoot, "notes.md").readText())
+                assertEquals("R", File(sharedRoot, "report.md").readText())
+                assertFalse(File(mcpRoot, "oauth/linear.json").exists())
+            } finally {
+                merged.delete()
+            }
+
+            // no `mcpServers` section in the backup ⇒ Stage 7 never merged, and
+            // the archive is the only carrier of the list: restore it.
+            val raw = File.createTempFile("stage9b-raw", ".zip").apply { delete() }
+            try {
+                val res = ConfigBackup.stripMcpOAuthEntries(zip, raw)
+                assertEquals(0, res.prestagedDropped)
+                assertEquals(1, res.oauthDropped)
+                assertEquals("MERGED", File(mcpRoot, "servers.json").readText())
+                assertEquals(3, ArtifactArchiver.extractZipByPrefix(raw, dests))
+                assertEquals("BACKUP", File(mcpRoot, "servers.json").readText())
+            } finally {
+                raw.delete()
+            }
+        } finally {
+            zip.delete()
             mcpRoot.deleteRecursively(); sharedRoot.deleteRecursively()
         }
     }

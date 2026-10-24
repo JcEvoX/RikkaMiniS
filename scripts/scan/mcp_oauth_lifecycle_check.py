@@ -117,6 +117,34 @@ backup surface — the artifact archive is NOT gated by `includeSecrets`:
       overwrite this device's LIVE token bridge — fixing the exporter cannot
       protect archives that already exist.
 
+[dv28-a5 A-05] Two more criteria extend the SAME artifact stage to a second
+credential-free file that was written twice. Stage 7 merges the backup's
+`mcpServers` into this device's list (`MCPRepository.importJSON` keeps the
+rows the backup does not carry, then saves); Stage 9 then restored
+`mcp/servers.json` out of the archive VERBATIM, replacing the merged file with
+the backup's list. Every server the target device had and the backup did not
+was erased on disk — the in-memory merge hid it until the next cold start
+re-read the file (`ConfigBackup` only reloads `skillRepo`).
+
+  C-ST9  `import` must not copy `mcp/servers.json` when Stage 7 merged the
+      list. Derived, not enumerated: the operands of the `if (…)` that gates
+      the Stage 7 merge call are the operands the skip has to be derived from,
+      so the filter call carries a third argument — an identifier computed in
+      `import` from at least two of them. `true` (or a flag that ignores the
+      repository) is not a decision: an unconditional drop loses the list from
+      an archive-only backup (no `mcpServers` section), an unconditional copy
+      erases the merged one. The predicate must pin the ONE entry name
+      ("mcp" + "servers.json", segments collapsed) and the filter must consult
+      it only behind that switch; the `mcp` prefix must stay an extraction
+      destination so the rest of the MCP data still restores.
+  C-ST9b Two legal shapes, whitelisted so the criterion cannot lock one
+      implementation: (a) re-import after extraction and call
+      `reloadFromDisk()` after it, or (b) skip the entry and say so — a
+      `skipped` literal naming the file and the stage that restored it.
+      A comment cannot satisfy either (strings are masked for the structural
+      half; the literal half reads the scoped source, and the arm that only
+      comments the drop out is still red on C-ST9).
+
 [dv25-A1] The PARSE side of the same credential invariant (deep-audit-1045
 A-01). The in-guest CLI writes camelCase oauth keys (`clientId`,
 `authorizationEndpoint`, `tokenEndpoint`, `redirectURI` — main.py), this app
@@ -1322,10 +1350,16 @@ def check_backup_import(scoped, masked):
         # above are blind to the operand (caught by mutation m2 in
         # probe-a1/mut/mutations.log).
         if f >= 0 and x >= 0:
+            # [dv28-a5 A-05] The call grew a third, named argument (the "Stage 7
+            # already merged the server list" switch). The output is still the
+            # SECOND positional/`dst`-named one, so tolerating exactly one
+            # trailing `name = <expr>` keeps this criterion's teeth: the archive
+            # that reaches the extraction is still pinned by name.
             m_strip = re.search(
                 re.escape(OAUTH_STRIP_HELPER)
                 + r"\s*\(\s*(?:[A-Za-z_]\w*\s*=\s*)?[\w.]+\s*,\s*"
-                + r"(?:[A-Za-z_]\w*\s*=\s*)?([A-Za-z_]\w*)\s*\)",
+                + r"(?:[A-Za-z_]\w*\s*=\s*)?([A-Za-z_]\w*)\s*"
+                + r"(?:,\s*[A-Za-z_]\w*\s*=\s*[^,()]+\s*,?\s*)?\)",
                 imp,
             )
             if m_strip is None:
@@ -1369,6 +1403,222 @@ def argument_text(code, call_start):
             if depth == 0:
                 return code[lp:j + 1]
     return code[lp:]
+
+
+# [dv28-a5 A-05] One file, two restore stages. Stage 7 merges the backup's
+# server list into the live one (`MCPRepository.importJSON` keeps the rows the
+# backup does not carry); Stage 9 then wrote `mcp/servers.json` out of the
+# artifact archive verbatim, replacing the merged file with the backup's list.
+# The target device's own servers disappeared from DISK — the in-memory merge
+# hid it until the next cold start re-read servers.json.
+STAGE7_MERGE_CALL = "mcpRepo.importJSON("
+SERVER_LIST_ENTRY_LITERAL = "servers.json"
+STAGE9_SKIP_DECL = "Stage 7 merge"
+STANDALONE_RELOAD = "reloadFromDisk("
+# Tokens that carry no decision — dropped before comparing the "which operands
+# gate the merge" sets, so `mcpRepo != null` cannot be satisfied by `null`
+# appearing on both sides.
+KOTLIN_NOISE_TOKENS = frozenset((
+    "true", "false", "null", "is", "as", "in", "if", "else", "return", "it",
+    "this", "length", "size", "isEmpty", "isNotEmpty", "optJSONArray",
+))
+
+
+def _match_paren(code, lp):
+    """Index of the `)` that closes the `(` at [lp], or -1."""
+    depth = 0
+    for j in range(lp, len(code)):
+        if code[j] == "(":
+            depth += 1
+        elif code[j] == ")":
+            depth -= 1
+            if depth == 0:
+                return j
+    return -1
+
+
+def _top_level_args(call_text):
+    """Top-level arguments of a parenthesised call text, or []."""
+    if not call_text.startswith("(") or not call_text.endswith(")"):
+        return []
+    inner = call_text[1:-1]
+    args, depth, cur = [], 0, []
+    for ch in inner:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            args.append("".join(cur).strip())
+            cur = []
+            continue
+        cur.append(ch)
+    tail = "".join(cur).strip()
+    if tail:
+        args.append(tail)
+    return args
+
+
+def _enclosing_guard_identifiers(body, pos):
+    """Identifiers of the innermost `if (…)` whose braces span [pos].
+
+    Derived, never enumerated: whatever expression the Stage 7 merge is gated
+    on is exactly the set of operands the Stage 9 skip has to be derived from.
+    "Enclosing" means the condition closes before [pos] AND the `{…}` block that
+    follows it still contains [pos] — a later `if` whose condition happens to end
+    after [pos] gates nothing here.
+    """
+    best = set()
+    for m in re.finditer(r"\bif\s*\(", body):
+        lp = body.find("(", m.start())
+        if lp < 0 or lp > pos:
+            continue
+        rp = _match_paren(body, lp)
+        if rp < 0 or rp > pos:
+            continue
+        brace = body.find("{", rp)
+        if brace < 0:
+            continue
+        block = brace_block(body, brace)
+        if block is None:
+            continue
+        if not rp < brace < pos < brace + len(block):
+            continue
+        inner = body[lp + 1:rp]
+        best = set(re.findall(r"[A-Za-z_]\w*", inner)) - KOTLIN_NOISE_TOKENS
+    return best
+
+
+def check_stage9_premerged(scoped, masked):
+    """[dv28-a5 A-05] The server list must not be written by two stages.
+
+    Derived axes (no line numbers, no member lists):
+      * Stage 7's merge call exists in `import` AND is gated by an `if (…)` —
+        the identifiers of that guard are the operands Stage 9 has to consult.
+      * the pre-extraction filter call carries a THIRD argument whose value is
+        an identifier computed inside `import` from (at least two of) those
+        same operands — `true`, or a flag that ignores `mcpRepo`, is not a
+        decision: dropping unconditionally loses the list from an archive-only
+        backup, copying unconditionally erases the merged one.
+      * a predicate in the same file drops that ONE entry name (segments
+        collapsed), and the filter consults it only behind that switch.
+      * the `mcp` prefix must remain an extraction destination (the other MCP
+        data files still restore — exclude the file, not the prefix).
+      * C-ST9b, two legal shapes, whitelisted: either a re-import + standalone
+        `reloadFromDisk()` after extraction, or a `skipped` literal naming the
+        file and the stage that restored it.
+    """
+    v = []
+    imp = body_of(masked, "import")
+    imp_scoped = body_of(scoped, "import")
+    if imp is None or imp_scoped is None:
+        return v  # [da1034-A1] A2 already reports the missing body
+    merge_pos = imp.find(STAGE7_MERGE_CALL)
+    extract_pos = imp.find(OAUTH_EXTRACT_CALL)
+    strip_pos = imp.find(OAUTH_STRIP_HELPER)
+    if merge_pos < 0 or extract_pos < 0 or strip_pos < 0:
+        # No merge stage (or no artifact stage, or A2's "never filtered"):
+        # there is no second writer to reason about, and A2 owns those arms.
+        return v
+
+    args = _top_level_args(argument_text(imp, strip_pos))
+    if len(args) < 3:
+        v.append(
+            "ConfigBackup.kt: `" + OAUTH_STRIP_HELPER + "(` does not learn that Stage 7 "
+            "already merged this backup's server list — the archive's `"
+            + SERVER_LIST_ENTRY_LITERAL + "` is still written verbatim over the merged "
+            "file, so every server this device has and the backup does not is erased "
+            "(on disk; invisible until the next cold start re-reads it)")
+        return v
+
+    m_named = re.match(r"([A-Za-z_]\w*)\s*=\s*([\s\S]+)$", args[2])
+    expr = (m_named.group(2) if m_named else args[2]).strip()
+    guard_ids = _enclosing_guard_identifiers(imp, merge_pos)
+    if expr in ("true", "false") or not re.fullmatch(r"[A-Za-z_]\w*", expr):
+        v.append(
+            "ConfigBackup.kt: the Stage 9 server-list switch is passed as `" + expr
+            + "` — a literal is not a decision. An unconditional drop loses the list "
+            "from an archive-only backup (no `mcpServers` section: Stage 7 never ran); "
+            "an unconditional copy erases the merged one. Derive it from the operands "
+            "that gate the Stage 7 merge"
+            + (" (" + ", ".join(sorted(guard_ids)) + ")" if guard_ids else ""))
+    else:
+        decls = re.findall(
+            r"\b(?:val|var)\s+" + re.escape(expr)
+            + r"\s*(?::\s*[A-Za-z_.]\w*\s*)?=\s*([^\n]+)",
+            imp,
+        )
+        if not decls:
+            v.append(
+                "ConfigBackup.kt: `" + expr + "` is never computed inside `import` — the "
+                "Stage 9 skip cannot be traced back to whether Stage 7 merged the list")
+        else:
+            ids = set(re.findall(r"[A-Za-z_]\w*", "\n".join(decls))) - KOTLIN_NOISE_TOKENS
+            if len(ids & guard_ids) < 2:
+                v.append(
+                    "ConfigBackup.kt: `" + expr + "` is not derived from the operands that "
+                    "gate the Stage 7 merge"
+                    + (" (" + ", ".join(sorted(guard_ids)) + ")" if guard_ids else "")
+                    + " — need at least two of them (both the repository and the backup "
+                    "section decide whether a merge happened)")
+
+    helper = body_of(scoped, OAUTH_STRIP_HELPER)
+    sig = re.search(r"\bfun\s+" + re.escape(OAUTH_STRIP_HELPER) + r"\s*\(", scoped)
+    params = []
+    if sig is not None:
+        params = re.findall(r"([A-Za-z_]\w*)\s*:", argument_text(scoped, sig.start()))
+    predicates = [
+        (name, body, line) for (name, body, line) in functions(scoped)
+        if body and ('"' + SERVER_LIST_ENTRY_LITERAL + '"') in body and '"mcp"' in body
+    ]
+    if not predicates:
+        v.append(
+            "ConfigBackup.kt: no predicate pins `mcp/" + SERVER_LIST_ENTRY_LITERAL
+            + "` — nothing drops the entry Stage 7 already merged, so the verbatim "
+            "copy overwrites the merged list")
+    elif helper is not None:
+        pname = predicates[0][0]
+        if len(params) < 3:
+            v.append(
+                "ConfigBackup.kt: `" + OAUTH_STRIP_HELPER + "` takes no switch for the "
+                "pre-merged server list — the drop would run unconditionally and an "
+                "archive-only backup (no `mcpServers` section) would lose its list")
+        elif not re.search(
+            re.escape(params[2]) + r"[\s\S]{0,200}?\b" + re.escape(pname) + r"\s*\(", helper
+        ):
+            v.append(
+                "ConfigBackup.kt: `" + OAUTH_STRIP_HELPER + "` calls `" + pname + "(` "
+                "without the `" + params[2] + "` switch in the same condition — the "
+                "server-list entry is dropped unconditionally")
+
+    if '"mcp"' not in imp_scoped:
+        v.append(
+            "ConfigBackup.kt: the `mcp` prefix is no longer an extraction destination — "
+            "excluding the whole prefix is not the fix: every other MCP data file the "
+            "agent wrote under mcp/ is lost too. Exclude the ONE file, not the prefix")
+
+    if imp.find(STANDALONE_RELOAD, extract_pos) >= 0 and imp.find(
+        STAGE7_MERGE_CALL, extract_pos
+    ) >= 0:
+        # Legal shape B: merge again from the restored file + re-read disk. The
+        # reload/import must come AFTER the extraction — an earlier one (Stage
+        # 5's `skillRepo.reloadFromDisk()`) says nothing about the artifact stage.
+        if imp.find(STANDALONE_RELOAD, extract_pos) < imp.find(STAGE7_MERGE_CALL, extract_pos):
+            v.append(
+                "ConfigBackup.kt: the post-extraction `" + STANDALONE_RELOAD + "()` runs "
+                "BEFORE the re-import — it would publish the pre-extraction list")
+    else:
+        literals = re.findall(r'"((?:[^"\\]|\\.)*)"', imp_scoped)
+        if not any(
+            SERVER_LIST_ENTRY_LITERAL in s and STAGE9_SKIP_DECL in s for s in literals
+        ):
+            v.append(
+                "ConfigBackup.kt: the skipped server-list copy is not declared — either "
+                "re-import after extraction and call `" + STANDALONE_RELOAD + "()`, or "
+                "report it through `skipped` with a literal naming the file and the stage "
+                "that restored it (e.g. \"artifacts: " + SERVER_LIST_ENTRY_LITERAL
+                + " restored via " + STAGE9_SKIP_DECL + " (skipped raw copy)\")")
+    return v
 
 
 def check_artifact_redaction(scoped, masked, archiver_masked):
@@ -1561,6 +1811,9 @@ def run(root):
     else:
         violations += check_backup_scope(mask_comments(scope_raw))
         violations += check_backup_import(mask_comments(backup_raw), mask(backup_raw))
+        # [dv28-a5 A-05] the same artifact stage must not write the file Stage 7
+        # merged (the server list) a second time.
+        violations += check_stage9_premerged(mask_comments(backup_raw), mask(backup_raw))
         v_pack, v_rule, v_arch = check_artifact_redaction(
             mask_comments(backup_raw), mask(backup_raw), mask(archiver_raw))
         violations += v_pack + v_rule + v_arch
@@ -1585,7 +1838,8 @@ def run(root):
         "PASS mcp_oauth_lifecycle_check (one reconcile point; add/update/import "
         "all wired; no secret-only cleanup path; edit sheet edits the live entry; "
         "oauth bridge never archived and never restored; mcp servers.json redacted "
-        "on a credentials-free export; every CLI-written oauth key readable by "
+        "on a credentials-free export; the server list Stage 7 merged is never "
+        "re-copied over by the artifact stage; every CLI-written oauth key readable by "
         "fromJson with snake_case primary first and the disk format unchanged; "
         "a token the in-guest CLI refreshed is read back, promoted and persisted "
         "before the bridge is re-materialized%s)"
@@ -2064,7 +2318,12 @@ BAD_SCOPE_COMMENT_ONLY = GOOD_SCOPE.replace(DENY_VAL, "// DENIED_DIRS was here\n
 
 GOOD_BACKUP = """
 object ConfigBackup {
-    suspend fun import(tmp: java.io.File, artifactRoots: List<java.io.File>?, skipped: ArrayList<String>) {
+    suspend fun import(tmp: java.io.File, artifactRoots: List<java.io.File>?, skipped: ArrayList<String>, root: JSONObject, mcpRepo: MCPRepository?) {
+        val mcpArr = root.optJSONArray("mcpServers")
+        val serverListMergedInStage7 = mcpRepo != null && mcpArr != null && mcpArr.length() > 0
+        if (mcpArr != null && mcpRepo != null) {
+            mcpRepo.importJSON(mcpArr.toString())
+        }
         val destByPrefix = HashMap<String, java.io.File>()
         for (root in artifactRoots!!) {
             val prefix = if (root.name == "mcp-servers") "mcp" else "shared"
@@ -2072,9 +2331,16 @@ object ConfigBackup {
         }
         val filtered = java.io.File.createTempFile("artifact-restore-", ".zip")
         try {
-            val oauthDropped = stripMcpOAuthEntries(tmp, filtered)
-            if (oauthDropped > 0) {
-                skipped.add("artifacts: skipped $oauthDropped oauth bridge entries")
+            val filterResult = stripMcpOAuthEntries(
+                tmp,
+                filtered,
+                dropPrestagedServerList = serverListMergedInStage7,
+            )
+            if (filterResult.oauthDropped > 0) {
+                skipped.add("artifacts: skipped ${filterResult.oauthDropped} oauth bridge entries")
+            }
+            if (filterResult.prestagedDropped > 0) {
+                skipped.add("artifacts: servers.json restored via Stage 7 merge (skipped raw copy)")
             }
             artifactFilesImported = ArtifactArchiver.extractZipByPrefix(filtered, destByPrefix)
         } finally {
@@ -2082,9 +2348,15 @@ object ConfigBackup {
         }
     }
 
-    internal fun stripMcpOAuthEntries(src: java.io.File, dst: java.io.File): Int {
-        if (isMcpOAuthEntryName(src.name)) return 0
-        return 1
+    internal fun stripMcpOAuthEntries(
+        src: java.io.File,
+        dst: java.io.File,
+        dropPrestagedServerList: Boolean = false,
+    ): Int {
+        var dropped = 0
+        if (isMcpOAuthEntryName(src.name)) dropped++
+        if (dropPrestagedServerList && isMcpServerListEntryName(src.name)) dropped++
+        return dropped
     }
 
     internal fun isMcpOAuthEntryName(name: String): Boolean {
@@ -2095,29 +2367,86 @@ object ConfigBackup {
         }
         return segs.size >= 2 && segs[0] == "mcp" && segs[1] == "oauth"
     }
+
+    internal fun isMcpServerListEntryName(name: String): Boolean {
+        val segs = ArrayList<String>(4)
+        for (seg in name.split('/')) {
+            if (seg.isEmpty() || seg == ".") continue
+            segs.add(seg)
+        }
+        return segs.size == 2 && segs[0] == "mcp" && segs[1] == "servers.json"
+    }
 }
 """
-WIRED = """            val oauthDropped = stripMcpOAuthEntries(tmp, filtered)
-            if (oauthDropped > 0) {
-                skipped.add("artifacts: skipped $oauthDropped oauth bridge entries")
+WIRED = """            val filterResult = stripMcpOAuthEntries(
+                tmp,
+                filtered,
+                dropPrestagedServerList = serverListMergedInStage7,
+            )
+            if (filterResult.oauthDropped > 0) {
+                skipped.add("artifacts: skipped ${filterResult.oauthDropped} oauth bridge entries")
+            }
+            if (filterResult.prestagedDropped > 0) {
+                skipped.add("artifacts: servers.json restored via Stage 7 merge (skipped raw copy)")
             }
             artifactFilesImported = ArtifactArchiver.extractZipByPrefix(filtered, destByPrefix)"""
 BAD_BACKUP_NO_WIRING = GOOD_BACKUP.replace(WIRED, "            artifactFilesImported = ArtifactArchiver.extractZipByPrefix(tmp, destByPrefix)")
 BAD_BACKUP_AFTER_EXTRACT = GOOD_BACKUP.replace(
     WIRED,
     """            artifactFilesImported = ArtifactArchiver.extractZipByPrefix(filtered, destByPrefix)
-            val oauthDropped = stripMcpOAuthEntries(tmp, filtered)
-            if (oauthDropped > 0) {
-                skipped.add("artifacts: skipped $oauthDropped oauth bridge entries")
+            val filterResult = stripMcpOAuthEntries(
+                tmp,
+                filtered,
+                dropPrestagedServerList = serverListMergedInStage7,
+            )
+            if (filterResult.oauthDropped > 0) {
+                skipped.add("artifacts: skipped ${filterResult.oauthDropped} oauth bridge entries")
+            }
+            if (filterResult.prestagedDropped > 0) {
+                skipped.add("artifacts: servers.json restored via Stage 7 merge (skipped raw copy)")
             }""")
 BAD_BACKUP_HOLLOW_PREDICATE = GOOD_BACKUP.replace(
     'segs[0] == "mcp" && segs[1] == "oauth"', 'segs[0] == "mcp" && segs[1] == "nope"')
 BAD_BACKUP_NO_REPORT = GOOD_BACKUP.replace(
-    '                skipped.add("artifacts: skipped $oauthDropped oauth bridge entries")\n', "")
+    '            if (filterResult.oauthDropped > 0) {\n'
+    '                skipped.add("artifacts: skipped ${filterResult.oauthDropped} oauth bridge entries")\n'
+    '            }\n', "")
 # [da1034-A1] 变异 m2 的形状：filter 仍在、顺序也对，但抽取吃的是原始 tmp。
 BAD_BACKUP_EXTRACT_RAW = GOOD_BACKUP.replace(
     "ArtifactArchiver.extractZipByPrefix(filtered, destByPrefix)",
     "ArtifactArchiver.extractZipByPrefix(tmp, destByPrefix)")
+
+# -- [dv28-a5 A-05] pre-merged server list fixtures --------------------------
+
+STAGE9_PREDICATE_BRANCH = (
+    "        if (dropPrestagedServerList && isMcpServerListEntryName(src.name)) dropped++\n")
+# the drop is gone entirely (a restore overwrites what Stage 7 merged)
+BAD_STAGE9_NO_DROP = GOOD_BACKUP.replace(STAGE9_PREDICATE_BRANCH, "")
+# the skip is only DESCRIBED — a comment cannot satisfy a criterion
+BAD_STAGE9_COMMENT_ONLY = GOOD_BACKUP.replace(
+    STAGE9_PREDICATE_BRANCH,
+    "        // mcp/servers.json is skipped here — Stage 7 already merged it\n")
+# the switch is a literal: unconditional drop loses an archive-only backup's list
+BAD_STAGE9_UNCONDITIONAL = GOOD_BACKUP.replace(
+    "dropPrestagedServerList = serverListMergedInStage7,",
+    "dropPrestagedServerList = true,")
+# the flag exists but ignores whether a merge happened
+BAD_STAGE9_NO_OPERAND = GOOD_BACKUP.replace(
+    "val serverListMergedInStage7 = mcpRepo != null && mcpArr != null && mcpArr.length() > 0",
+    "val serverListMergedInStage7 = true")
+# the predicate pins a name that is not the server list
+BAD_STAGE9_HOLLOW_PREDICATE = GOOD_BACKUP.replace(
+    'segs.size == 2 && segs[0] == "mcp" && segs[1] == "servers.json"',
+    'segs.size == 2 && segs[0] == "mcp" && segs[1] == "other.json"')
+# "fix" by never routing the mcp prefix: every other MCP data file is lost too
+BAD_STAGE9_WHOLE_PREFIX = GOOD_BACKUP.replace(
+    'val prefix = if (root.name == "mcp-servers") "mcp" else "shared"',
+    'val prefix = "shared"')
+# nothing tells the user the entry was skipped
+BAD_STAGE9_NO_DECL = GOOD_BACKUP.replace(
+    '            if (filterResult.prestagedDropped > 0) {\n'
+    '                skipped.add("artifacts: servers.json restored via Stage 7 merge (skipped raw copy)")\n'
+    '            }\n', "")
 
 # -- [dv20-a1 A-01] artifact-face fixtures -----------------------------------
 
@@ -2483,6 +2812,38 @@ def selftest():
     expect_trip("extraction consuming the raw archive", b_raw,
                 "extracts something other than the filtered archive")
 
+    # [dv28-a5 A-05] the same Stage 9 pass must not re-write what Stage 7 merged
+    def stage9(fixture):
+        return check_stage9_premerged(mask_comments(fixture), mask(fixture))
+
+    expect_clean("compliant pre-merged server-list fixture", stage9(GOOD_BACKUP))
+
+    s9_nodrop = stage9(BAD_STAGE9_NO_DROP)
+    expect_trip("filter that keeps the pre-merged server list", s9_nodrop,
+                "without the `dropPrestagedServerList` switch")
+
+    s9_comment = stage9(BAD_STAGE9_COMMENT_ONLY)
+    expect_trip("skip that is only a comment", s9_comment,
+                "without the `dropPrestagedServerList` switch")
+
+    s9_uncond = stage9(BAD_STAGE9_UNCONDITIONAL)
+    expect_trip("unconditional server-list drop", s9_uncond,
+                "a literal is not a decision")
+
+    s9_noop = stage9(BAD_STAGE9_NO_OPERAND)
+    expect_trip("flag that ignores the merge operands", s9_noop,
+                "is not derived from the operands")
+
+    s9_hollow = stage9(BAD_STAGE9_HOLLOW_PREDICATE)
+    expect_trip("predicate pinning the wrong file", s9_hollow, "no predicate pins")
+
+    s9_prefix = stage9(BAD_STAGE9_WHOLE_PREFIX)
+    expect_trip("whole mcp prefix dropped", s9_prefix,
+                "no longer an extraction destination")
+
+    s9_decl = stage9(BAD_STAGE9_NO_DECL)
+    expect_trip("undeclared server-list skip", s9_decl, "not declared")
+
     # [da1029-E] UI arms
     good_ui, good_ui_keyed = check_ui(mask(GOOD_UI))
     expect_clean("compliant live-edit UI fixture", good_ui)
@@ -2554,6 +2915,11 @@ def selftest():
     print("selftest oauth-backup arms (deny-set/dead-deny/comment-only/no-wiring/after-extract/hollow-pred/silent-drop/extract-raw) -> %d/%d/%d/%d/%d/%d/%d/%d violation(s)"
           % (len(b_nodeny), len(b_dead), len(b_comment), len(b_nowire), len(b_after),
              len(b_hollow), len(b_noreport), len(b_raw)))
+    print("selftest dv28-a5 stage9 arms (no-drop/comment-only/unconditional/"
+          "flag-ignores-guard/hollow-pred/whole-prefix/undeclared) -> "
+          "%d/%d/%d/%d/%d/%d/%d violation(s)"
+          % (len(s9_nodrop), len(s9_comment), len(s9_uncond), len(s9_noop),
+             len(s9_hollow), len(s9_prefix), len(s9_decl)))
 
     # [dv20-a1 A-01] artifact-face arms: each fixture must red exactly one group
     def expect_only(name, groups, gi, needle):
