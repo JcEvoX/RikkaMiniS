@@ -277,6 +277,7 @@ internal object HeadlessChatRunner {
         timeoutMs: Long,
     ): PromptResult = withContext(Dispatchers.Main) {
         val vm = viewModel(context, sessionId)
+        val app = app(context)
         // Apply per-call thinking override BEFORE sendMessage so streamMessage
         // picks up the new level. Caller passes null to keep the VM's existing
         // setting (default OFF for a fresh VM, last user-set value otherwise).
@@ -353,6 +354,16 @@ internal object HeadlessChatRunner {
                 "sessionLoaded not observed in 5s for $sessionId — proceeding with dispatch (pre-fix behavior)",
             )
         }
+        // [deep-audit-1048 A-07] Identity of "before this turn". `isStreaming`
+        // flipping back to false below says "no stream is running", NOT "this
+        // turn wrote an assistant message": a turn that ends without one
+        // (provider error / cancel / empty completion) left the drain scanning
+        // for the LAST assistant row in the whole transcript and reporting the
+        // PREVIOUS turn as `Completed`. Snapshot the rows that already exist
+        // BEFORE the send goes out; the drain accepts only a row that appeared
+        // after that snapshot. Set-of-ids, not a position: it must survive the
+        // transcript truncation retry/rerun perform.
+        val priorAnswerIds = turnAnswerSnapshot(app, sessionId)
         for (att in attachments) vm.addAttachment(att)
         vm.sendMessage(text)
         // [da1016 B-7b] `sendMessage` claims `_isStreaming` SYNCHRONOUSLY and
@@ -421,15 +432,18 @@ internal object HeadlessChatRunner {
             true
         } ?: false
 
-        // Best-effort: read the last assistant text from the DB so we don't
+        // Best-effort: read this turn's assistant text from the DB so we don't
         // depend on the in-memory UI list (which may not have flushed yet).
-        val app = app(context)
+        // [deep-audit-1048 A-07] `answerIdx` is -1 when the turn wrote no
+        // assistant row of its own — settleTurn turns that into a structured
+        // error instead of replaying an earlier turn.
         val msgs = app.chatRepository.loadMessages(sessionId)
-        val lastAssistant = msgs.lastOrNull { it.role == "assistant" }
-        val responseText = lastAssistant?.let { extractText(it.partsJson) }
+        val answerIdx = turnAnswerIndex(msgs.map { TurnAnswerRow(it.id, it.role) }, priorAnswerIds)
+        val answer = if (answerIdx >= 0) msgs[answerIdx] else null
+        val settled = settleTurn(finished, answer != null)
         PromptResult(
-            status = if (finished) "Completed" else "Timeout",
-            responseText = responseText,
+            status = settled.status,
+            responseText = settled.reason ?: answer?.let { extractText(it.partsJson) },
             timedOut = !finished,
         )
     }
@@ -497,6 +511,11 @@ internal object HeadlessChatRunner {
                 retriedMessageId = targetMsgId,
             )
         }
+        // [deep-audit-1048 A-07] Same turn identity as prompt() — and the
+        // reason the snapshot is a SET of row ids rather than a position: this
+        // entry truncates `deletedCount` rows before re-running, so a boundary
+        // index (or "not the previous answer's id") would drift with the turn.
+        val priorAnswerIds = turnAnswerSnapshot(app, sessionId)
         vm.retryFromMessage(targetMsgId)
         // `retryFromMessage` claims `_isStreaming` SYNCHRONOUSLY (T145) after
         // every drop gate (already streaming / not a retryable user message /
@@ -542,11 +561,12 @@ internal object HeadlessChatRunner {
             true
         } ?: false
         val msgs = app.chatRepository.loadMessages(sessionId)
-        val lastAssistant = msgs.lastOrNull { it.role == "assistant" }
-        val responseText = lastAssistant?.let { extractText(it.partsJson) }
+        val answerIdx = turnAnswerIndex(msgs.map { TurnAnswerRow(it.id, it.role) }, priorAnswerIds)
+        val answer = if (answerIdx >= 0) msgs[answerIdx] else null
+        val settled = settleTurn(finished, answer != null)
         PromptResult(
-            status = if (finished) "Completed" else "Timeout",
-            responseText = responseText,
+            status = settled.status,
+            responseText = settled.reason ?: answer?.let { extractText(it.partsJson) },
             timedOut = !finished,
             deletedMessageCount = deletedCount,
             retriedMessageId = targetMsgId,
@@ -610,6 +630,10 @@ internal object HeadlessChatRunner {
         // Resolve the live bubble that owns this tool block; fall back to the
         // caller-supplied id (covers a freshly-reloaded session whose bubble id
         // IS the DB row id).
+        // [deep-audit-1048 A-07] Same turn identity as prompt()/retry(): this
+        // entry also truncates the transcript (block-boundary cut), so only a
+        // row absent from this snapshot is the re-run's own answer.
+        val priorAnswerIds = turnAnswerSnapshot(app, sessionId)
         val liveAssistantId = vm.assistantMessageIdForToolBlock(blockId) ?: assistantMessageId
         val accepted = vm.rerunFromToolBlock(liveAssistantId, blockId)
         if (!accepted) {
@@ -661,10 +685,12 @@ internal object HeadlessChatRunner {
             true
         } ?: false
         val msgs = app.chatRepository.loadMessages(sessionId)
-        val lastAssistant = msgs.lastOrNull { it.role == "assistant" }
+        val answerIdx = turnAnswerIndex(msgs.map { TurnAnswerRow(it.id, it.role) }, priorAnswerIds)
+        val answer = if (answerIdx >= 0) msgs[answerIdx] else null
+        val settled = settleTurn(finished, answer != null)
         PromptResult(
-            status = if (finished) "Completed" else "Timeout",
-            responseText = lastAssistant?.let { extractText(it.partsJson) },
+            status = settled.status,
+            responseText = settled.reason ?: answer?.let { extractText(it.partsJson) },
             timedOut = !finished,
             deletedMessageCount = (before - msgs.size).coerceAtLeast(0),
             retriedMessageId = assistantMessageId,
@@ -937,6 +963,22 @@ internal object HeadlessChatRunner {
     @Synchronized
     fun forget(sessionId: String) {
         providers.remove(sessionId)
+    }
+
+    /**
+     * [deep-audit-1048 A-07] The identity of "before this turn": the ids of the
+     * assistant rows already persisted for [sessionId].
+     *
+     * Snapshot BEFORE the turn is dispatched — that is the whole point: a row
+     * that is already there belongs to an earlier turn, a row that is missing
+     * from the snapshot was written during this one.
+     */
+    private suspend fun turnAnswerSnapshot(
+        app: MinisApp,
+        sessionId: String,
+    ): Set<String> {
+        val rows = app.chatRepository.loadMessages(sessionId)
+        return assistantIdsOf(rows.map { TurnAnswerRow(it.id, it.role) })
     }
 
     private fun extractText(partsJson: String): String? {
